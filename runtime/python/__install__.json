@@ -1,0 +1,82 @@
+{
+  "schema": 1,
+  "id": "pythonembed-3.14-64",
+  "sort-version": "3.14.3",
+  "company": "PythonEmbed",
+  "tag": "3.14-64",
+  "install-for": [
+    "3.14.3-64",
+    "3.14-64",
+    "3-64",
+    "3.14-dev-64",
+    "3-dev-64"
+  ],
+  "run-for": [
+    {
+      "target": "python.exe",
+      "tag": "3.14.3-64"
+    },
+    {
+      "target": "python.exe",
+      "tag": "3.14-dev-64"
+    },
+    {
+      "target": "python.exe",
+      "tag": "3-dev-64"
+    },
+    {
+      "target": "python.exe",
+      "tag": "3.14-64"
+    },
+    {
+      "target": "python.exe",
+      "tag": "3-64"
+    }
+  ],
+  "alias": [],
+  "shortcuts": [
+    {
+      "kind": "pep514",
+      "Key": "PythonEmbed\\3.14",
+      "DisplayName": "Python 3.14.3 (embeddable)",
+      "SupportUrl": "https://www.python.org/",
+      "SysArchitecture": "64bit",
+      "SysVersion": "3.14",
+      "Version": "3.14.3",
+      "InstallPath": {
+        "_": "%PREFIX%",
+        "ExecutablePath": "%PREFIX%python.exe"
+      },
+      "Help": {
+        "Online Python Documentation": {
+          "_": "https://docs.python.org/3.14/"
+        }
+      }
+    },
+    {
+      "kind": "start",
+      "Name": "Python 3.14 (embeddable)",
+      "Items": [
+        {
+          "Name": "Python 3.14 (embeddable)",
+          "Target": "%PREFIX%python.exe",
+          "Icon": "%PREFIX%python.exe"
+        },
+        {
+          "Name": "Python 3.14 Online Documentation",
+          "Icon": "%SystemRoot%\\System32\\SHELL32.dll",
+          "IconIndex": 13,
+          "Target": "https://docs.python.org/3.14/"
+        }
+      ]
+    },
+    {
+      "kind": "uninstall",
+      "Publisher": "Python Software Foundation",
+      "HelpLink": "https://docs.python.org/3.14/"
+    }
+  ],
+  "display-name": "Python 3.14.3 (embeddable)",
+  "executable": ".\\python.exe",
+  "url": "https://www.python.org/ftp/python/3.14.3/python-3.14.3-embeddable-amd64.zip"
+}

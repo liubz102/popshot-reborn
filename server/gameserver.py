@@ -1,0 +1,2815 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+gameserver.py —— 假游戏服（阶段 5 里程碑 B），监听 127.0.0.1:27799
+
+和认证服（47611 / NMCO / nmconew.dll）完全是两套协议。这一层是游戏自有的：
+
+整条 TCP 流被 SimpleCipher 逐字节加密（见 server/simple.py），**先解密再分帧**。
+
+握手：
+    1. 客户端连上后立刻发 4 字节 int32 = 311（版本号，硬编码 0x54d98f）
+    2. 服务端回一个 0xFE 控制帧，载荷 = int32 结果码（0 = 版本 OK）
+       客户端 ServerConnection 虚表槽12 (0x54dbf6) 处理：
+           读 int32；==0 → 0x54d67c（上报 Dump\\LastCrashReport.txt，没有就跳过）
+                            → 槽15 0x54d520 组 opcode 0x0100 登录包发出
+                      !=0 → 再读一个字符串，走升级/报错分支
+    3. 之后双向都是 0xFF 游戏帧
+
+帧格式（两种，客户端在 0x5bcb19 的接收循环里按首字节区分）：
+    0xFE 控制帧（4 字节头）
+        [0]     0xFE
+        [1]     未用
+        [2..3]  u16 LE 载荷长度
+        [4..]   载荷           → 交给虚表槽12
+    0xFF 游戏帧（10 字节头）
+        [0]     0xFF
+        [1]     未用
+        [2..3]  u16 LE 载荷长度（= 总长 - 10）
+        [4..5]  u16 = 0
+        [6..7]  u16 = 0        （TcpConnection::Send 0x5bc9c1 固定传 0）
+        [8..9]  u16 = opcode   ★ RawPacket::SetType 0x5bba0a 写这里
+        [10..]  载荷           → 交给虚表槽13
+
+载荷里的基本类型（RawPacket 的读写函数）：
+    int32   4 字节小端
+    string  u16 字符数 + UTF-16LE
+
+用法：
+    python server/gameserver.py                 # 回版本 OK，然后只收不回并解码日志
+    python server/gameserver.py --hold          # 连版本都不回，纯抓包
+    python server/gameserver.py --version-result 1
+"""
+import argparse
+import datetime
+import os
+import socket
+import struct
+import sys
+import threading
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from simple import SimpleCipher
+from account_store import (AccountStore, display_name, experience_bounds,
+                           player_character, player_experience, player_level,
+                           player_money, tutorial_state)
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOGDIR = os.path.join(ROOT, "logs")
+os.makedirs(LOGDIR, exist_ok=True)
+
+CLIENT_VERSION = 311        # 0x137，硬编码在 0x54d98f
+
+MAGIC_CTRL = 0xFE
+MAGIC_GAME = 0xFF
+
+OP_REP_LOGIN = 0x0100
+OP_LEAVE_SESSION = 0x0203
+OP_MOVE_CHANNEL_BY_GAME_TYPE = 0x020b
+OP_SESSION_MEMBERS = 0x0300
+#: 单个座位的变更事件。两个方向都用这个号但**载荷不同**：服务端方向多一个
+#: 开头的 action 字节（`0x40648d`），客户端方向没有（`0x558dcb`）。
+OP_SESSION_MEMBER_UPDATE = 0x0301
+OP_CHANGE_SESSION = 0x0302
+OP_UPDATE_SESSION = 0x0303
+OP_REQ_FIRST_USER_RESULT = 0x030f
+OP_REP_MONEY = 0x0600
+OP_PREPARE_GAME = 0x0400
+OP_TRIGGER_COUNT_GAME = 0x0401
+OP_COUNT_GAME_READY = 0x0402
+OP_LOADING_DONE = 0x0403
+#: 客户端方向 0x0406（32 字节）= **`gcpCreateItem`「我要在这里生成一个掉落物」**。
+#:
+#: ⚠ **这是对 §108/§109「位置同步」那个记法的勘误**（会话 17，§112）。
+#: `RawPacket::SetType(0x406)` 在整个镜像里**只有一个**调用点 `0x493a57`
+#: （`GameContext::SendCreateItem`，序列化 `0x48c84f`），而它写的正是
+#: 「物件 id + 坐标 + 速度」这 8 个字段 —— 实测载荷逐字段对得上。
+#: 客户端发完就**等服务端回 `0x0404 gspCreatedItem`**，不回就什么都不出现。
+OP_CREATE_ITEM = 0x0406
+#: 服务端方向 0x0404 = `gspCreatedItem`（处理器 `0x551a11`，分发链 `0x54e0a5`
+#: 的 `cmp eax,0x404 / je 0x54e300` 那一格）。**掉落物真正出现在地上靠它**。
+OP_CREATED_ITEM = 0x0404
+OP_REP_GAME_RESULT = 0x0309
+#: 客户端在结算界面上停留约 9 秒后发的空包（会话 11 实测）。当成「结算看完了」，
+#: 服务端据此把它切回房间。服务端方向的同号包是另一回事，见 handle 分支的注释。
+OP_LEAVE_RESULT = 0x0405
+
+#: 客户端方向 0x0407（8 字节）= **`gcpGetItem`「我踩到这件掉落物了，能捡吗」**
+#: （会话 18，§115）。发送点 `GameContext::SendGetItem`（`0x493a99`，序列化
+#: `0x558e9a` 写两个 int32），唯一调用方是 `Character::CheckItemPickup`
+#: （`0x5154d3`）—— 它遍历 World 的物件表，碰撞成立就发这个包，
+#: **然后把 `[item+0x2a8]` 置 1 防止重发**。
+#:
+#: ★★ 所以服务端不回的后果不是「这一次没捡到」，而是**这件东西从此再也捡不起来**
+#: —— 用户报的「走过去捡不起武器和金币」就是这个。
+OP_GET_ITEM = 0x0407
+
+#: 服务端方向 0x0405 = **拾取放行**（处理器 `0x551d35`，跳表 `0x54e5ae` 的第 0 格）。
+#: 读两个 int32：`座位号 -> [LobbyStage + 座位*4 + 0x1d0]` 取角色对象、
+#: `实例句柄 -> World::Find(0x474225)` 取物件，再 `dynamic_cast<Item*>` 成功后调
+#: `Item::vf_d4`（`0x51f447`）= 「结算这次拾取」：先 `vf_11c` 生效（金币加钱、
+#: 红心回血、武器换枪），再 `vf_20` 把物件从世界里删掉。
+#:
+#: ★ **和客户端方向的 `rawLeaveGameResult` 同号**（D028 的又一例）。
+#: 客户端发的那一发是**空载荷**、意思是「结算界面看完了」，两者只能靠方向区分。
+OP_PICKED_ITEM = 0x0405
+OP_END_QUEST = 0x040f
+OP_UPDATE_QUEST_SCORE = 0x0410
+OP_END_GAME = 0x0411
+OP_MARK_QUEST_SUCCESS = 0x0417
+OP_RESPAWN_CHARACTER = 0x0419
+
+#: 客户端方向 0x0408（18 字节）= **「某个角色 HP 归零了」上报**（会话 15，§108）。
+#: 发送点 `Character::OnHpZero` 0x4ffab0 -> `GameContext::ReportDeath` 0x493855
+#: -> 序列化 `0x558f16`（`push 0x408`）。**不是遥测，是死亡判定的请求**。
+OP_REPORT_HP_ZERO = 0x0408
+
+#: 客户端方向 0x0413 = `gcpRespawnCharacter`（发送点 `0x553e48`，4 个 int32）。
+#: 角色死后 5 秒由 `0x4fe78f` 发出，等服务端回 `0x0419` 才真的重生。
+OP_REQ_RESPAWN = 0x0413
+
+#: 服务端方向 0x0415 = `gspUpdateQuestScore`（处理器 `0x4a3efe`，两个 int32：
+#: 座位 + **累计**分数）。它把分数写进 `[GameContextQuest + 座位*4 + 0x3b8]`，
+#: 也就是右上角战绩面板「分数」那一列的唯一数据源（`0x4a4a86` 读它）。
+#: 不回这个包，战绩面板的分数永远显示 0（§109）。
+OP_REP_QUEST_SCORE = 0x0415
+
+#: 服务端方向 0x0406 = **死亡广播**（和客户端方向的 `gcpCreateItem` 同号、
+#: 语义完全不同，D028）。处理器 `0x4938d2`（`GameContext::vf_e0` 的分发表
+#: `0x493808` 里 `0x406` 那一格），读 `u32 句柄 + u8 座位 + u8 参数 + u32`，
+#: 然后调 `Character::Die()`。
+OP_BROADCAST_DEATH = 0x0406
+
+#: `gspRespawnCharacter` 的兜底重生坐标。取自实测 0x0406 包里的
+#: float 3225.0 / 635.0（线上是 int32，客户端 fild 转 float）。
+#: 正常路径**不用它** —— 重生坐标由客户端在 `0x0413` 里自报，服务端原样回显。
+#: 只有调试控制通道 `gs_ctl.py respawn` 在没有任何位置记录时才会落到这里。
+DEFAULT_RESPAWN_X = 3225
+DEFAULT_RESPAWN_Y = 635
+
+#: 调试控制通道的默认端口（`tools/gs_ctl.py` 连它）。0 = 关闭。
+CONTROL_PORT = 27800
+OP_REP_COUNT_DOWN = 0x0412
+OP_LADDER_START_GAME = 0x0416
+OP_REP_MOVE_INTO = 0x0701
+
+# ---------------------------------------------------------------------------
+# 关卡内换图（走到地图最右边 -> 传送到下一张地图），FINDINGS §111。
+#
+# ★ 这四个号里有三个和别的**服务端方向**包同号，别记混（D028 的老规律）：
+#     0x0411  客户端方向 = gcpReqChangeToNextMap  / 服务端方向 = gspEndGame
+#     0x0417  服务端方向 = gspRepChangeToNextMap  / 客户端方向 = gcpMarkQuestSuccess
+#     0x0412  客户端方向 = 换图加载完成轮询       / 服务端方向 = gspRepCountDown
+#
+# 完整链路（每一步的地址见 FINDINGS §111）：
+#     地图脚本喊 `nextmap` (0x4e65a5)
+#       -> LobbyStage::ReqChangeToNextMap 0x4083e1
+#          客户端**自己**从地图目录 [0x72e3d8] 查出下一张地图名，
+#          发 0x0411 带着这个名字，并置 [LobbyStage+0x3f9]=1（= 鼠标沙漏）
+#       ────── 服务端必须回 0x0417（原样回显地图名）──────
+#       -> 处理器 0x408526 清 0x3f9/0x3fa、存地图名，调 0x47900a 真正换图
+#       -> 0x47900a 起后台线程加载新地图，主线程进「加载中」循环：
+#          加载完成后每 5 秒发一次 0x0412，直到 [LobbyStage+0x3fa] != 0
+#       ────── 服务端必须回 0x0418（空包）──────
+#       -> 0x406302 置 [LobbyStage+0x3fa]=1 -> 循环退出 -> 新地图开打
+OP_REQ_CHANGE_TO_NEXT_MAP = 0x0411   # 客户端 -> 服务端
+OP_REP_CHANGE_TO_NEXT_MAP = 0x0417   # 服务端 -> 客户端
+OP_MAP_LOADING_DONE = 0x0412         # 客户端 -> 服务端（加载完成后的轮询）
+OP_MAP_CHANGE_READY = 0x0418         # 服务端 -> 客户端（放行）
+
+# 客户端 -> 服务端 opcode（从 RawPacket::SetType 0x5bba0a 的 109 个调用点静态提取，
+# 类名由附近的 vftable 赋值对上；完整表见 .claude/FINDINGS.md §45）
+GCP_NAMES = {
+    0x0100: "gcpReqLogin",
+    0x0104: "gcpRepPing",
+    0x0105: "gcpStopPing",
+    0x0106: "gcpReportHack",
+    0x0109: "gcpReqDbgLogin",
+    0x010a: "gcpRepDbgLoginId",
+    0x0200: "gcpReqListSession",
+    0x0201: "gcpReqCreateSession",
+    0x0205: "gcpReqQuickJoinSession",
+    0x0208: "gcpReqMaster",
+    0x020b: "gcpReqMoveChannelByGameType",
+    0x020d: "gcpReqUserList",
+    0x020e: "gcpReqNotAcceptWhisper",
+    0x0302: "gcpChangeSession",
+    0x0305: "gcpSendChatMsg",
+    0x030b: "gcpKickOut",
+    0x030f: "gcpReqFirstUserResult",
+    0x0310: "gcpStartTcpRelay",
+    0x0311: "gcpReqQuestRecord",
+    # These are constructed as RawPacket instances, so no matching gcp RTTI
+    # class exists in the client image.
+    0x0400: "rawCountDownFinished",
+    0x0402: "rawCountGameReady",
+    0x0403: "rawLoadingDone",
+    0x0405: "rawLeaveGameResult",
+    # 拾取请求。RawPacket（8 字节 = 座位号 + 物件实例句柄），唯一发送点
+    # 0x558e9a，只被 GameContext::SendGetItem(0x493a99) 调用（FINDINGS §115）。
+    0x0407: "gcpGetItem",
+    0x040f: "gcpEndQuest",
+    0x0410: "gcpUpdateQuestScore",
+    0x0411: "gcpReqChangeToNextMap",
+    # 换图加载完成后的轮询。RawPacket（空载荷），唯一发送点 0x4084e1，
+    # 只被换图流程 0x47900a 的加载循环调用（FINDINGS §111）。
+    0x0412: "rawMapLoadingDone",
+    0x0413: "gcpRespawnCharacter",
+    0x0414: "gcpRepFirstAidBox",
+    0x0416: "rawLadderStartGame",
+    0x0417: "gcpMarkQuestSuccess",
+    0x0505: "gcpAccumulatedWeaponDamage",
+    0x0606: "gcpReqComposeItem",
+    0x0607: "gcpReqGiftList",
+    0x0609: "gcpReqGiftAction",
+    0x0705: "gcpReqMyInfo",
+    0x0800: "gcpReqMoveChannel",
+    0x0802: "gcpMoveChannelTest",
+    0x0803: "gcpReqChannelList",
+    0x0900: "gcpReqUserInfo",
+    0x0901: "gcpInviteCancel",
+    0x0902: "gcpReqInvite",
+    0x0903: "gcpReqInviteStart",
+    0x0a01: "gcpNoticeAllServer",
+    0x0b01: "gcpRepGameGuard",
+    0x0b02: "gspReqHackShieldCheck",
+}
+
+
+# ----------------------------------------------------------------------------
+# 组帧 / 拆帧
+# ----------------------------------------------------------------------------
+def build_ctrl(payload):
+    """0xFE 控制帧"""
+    return bytes([MAGIC_CTRL, 0]) + struct.pack("<H", len(payload)) + payload
+
+
+def build_game(opcode, payload=b""):
+    """0xFF 游戏帧"""
+    return (bytes([MAGIC_GAME, 0]) + struct.pack("<HHHH", len(payload), 0, 0, opcode)
+            + payload)
+
+
+def take_frame(buf):
+    """从已解密的缓冲里取一帧。返回 (kind, opcode, payload, 消费字节数) 或 None。
+    kind = 'ctrl' / 'game'。与客户端 0x5bcb19 的判定顺序保持一致。"""
+    if len(buf) >= 4 and buf[0] == MAGIC_CTRL:
+        n = struct.unpack_from("<H", buf, 2)[0] + 4
+        if len(buf) < n:
+            return None
+        return ("ctrl", None, bytes(buf[4:n]), n)
+    if len(buf) >= 10 and buf[0] == MAGIC_GAME:
+        n = struct.unpack_from("<H", buf, 2)[0] + 10
+        if len(buf) < n:
+            return None
+        op = struct.unpack_from("<H", buf, 8)[0]
+        return ("game", op, bytes(buf[10:n]), n)
+    return None
+
+
+# ----------------------------------------------------------------------------
+# 载荷里的基本类型
+# ----------------------------------------------------------------------------
+class Reader:
+    def __init__(self, data):
+        self.d = data
+        self.p = 0
+
+    def left(self):
+        return len(self.d) - self.p
+
+    def take(self, n):
+        if n < 0 or self.p + n > len(self.d):
+            raise ValueError(
+                f"payload truncated at offset {self.p}: need {n}, have {self.left()}"
+            )
+        value = self.d[self.p:self.p + n]
+        self.p += n
+        return value
+
+    def i32(self):
+        return struct.unpack("<i", self.take(4))[0]
+
+    def u16(self):
+        return struct.unpack("<H", self.take(2))[0]
+
+    def wstr(self):
+        n = self.u16()
+        return self.take(n * 2).decode("utf-16le", "replace")
+
+
+def w_i32(v):
+    return struct.pack("<i", v)
+
+
+def w_u8(v):
+    return struct.pack("<B", 1 if v else 0)
+
+
+def w_wstr(s):
+    b = s.encode("utf-16le")
+    return struct.pack("<H", len(s)) + b
+
+
+# ----------------------------------------------------------------------------
+# 服务端 -> 客户端的包体
+# ----------------------------------------------------------------------------
+def build_gsp_rep_login(result=0, account=None, channel_code=0, channel_index=0):
+    """opcode 0x0100 —— Packet_gspRepLogin
+
+    字段顺序直接读自 `Packet_gspRepLogin::Deserialize`（vft 0x6915d8 槽1 = 0x54c35c）：
+        int32  结果码      → 0=成功 / 1 / 2 / 3=断开
+        string             (+0x08)
+        string             (+0x0c)
+        int32 ×8           (+0x10 .. +0x2c)，其中第 1 个(+0x10) 是玩家等级、
+                          第 7 个(+0x28) 是新手教程状态（>=3 已完成）
+        string             (+0x30)
+        int32              (+0x34)
+        byte               (+0x38)
+        byte               (+0x39)
+    结果码 0 走 0x54f4af：置 [conn+0x898]=2 并 new(0x4a8) 建大厅对象存进全局 0x72e29c。
+
+    ★ 8 个业务 int32 的落位全部查明了（处理器 `0x54f2cc`，FINDINGS §95）——
+    它把包对象的字段逐条搬进连接和全局，一条不落：
+
+        [0] +0x10 -> 0x72e338     玩家等级（§63）
+        [1] +0x14 -> [conn+0x89c] 频道码
+        [2] +0x18 -> [conn+0x8a0] 频道序号
+        [3] +0x1c -> 0x72e33c     ★ 总经验
+        [4] +0x20 -> 0x72e340     ★ 本级起始总经验
+        [5] +0x24 -> 0x72e344     ★ 下一级所需总经验
+        [6] +0x28 -> [0x72e2a4]+0x64  新手教程状态（§54）
+        [7] +0x2c -> 0x72e378     语义未查，按 D019 填 0
+
+    经验三件套和 `gspEndGame` 用的是同一组全局，所以编码规则也一样：三个都是
+    **绝对累计值**，右上角数据栏自己做减法（§94）。
+
+    ★ **金币不在这个包里** —— `0x54f2cc` 全程没碰 `0x72e330`。它只能由
+    `0x0600 gspRepMoney` 下发，见 `build_rep_money`。
+
+    等级不能留 0：「建立房间(任务)」的四个下拉框都按 `等级 >= 条目要求等级`
+    过滤（`0x436833` 起），闯关关卡记录的要求等级是 1，等级 0 会让任务
+    下拉框整个空掉，房也就建不成。
+    """
+    account = account or {}
+    experience = player_experience(account)
+    level_start_exp, next_level_exp = experience_bounds(experience)
+    login_ints = [
+        player_level(account),
+        channel_code,
+        channel_index,
+        experience,
+        level_start_exp,
+        next_level_exp,
+        tutorial_state(account),
+        0,
+    ]
+    return (w_i32(result)
+            + w_wstr("") + w_wstr("")
+            + b"".join(w_i32(v) for v in login_ints)
+            + w_wstr("")
+            + w_i32(0)
+            + w_u8(0) + w_u8(0))
+
+
+def build_rep_money(money=0, experience=0, level_start_exp=0, next_level_exp=0,
+                    level=1, unknown_04=0, unknown_1c=0, unknown_20=0):
+    """opcode 0x0600 —— `Packet_gspRepMoney`（vft `0x69185c`）。整份玩家数据栏。
+
+    **这是唯一能下发金币的包**（FINDINGS §95）。登录包 `gspRepLogin` 一路写到
+    `0x72e378` 都没碰 `0x72e330`，所以以前每次重登金币都回到 0。
+
+    反序列化 `0x54c7c3`（vft 槽 1）读 7 个 int32 + 1 个 u16，共 **30 字节**；
+    处理器 `0x553855` 紧接着把它们逐条搬进全局，一条不落：
+
+        +0x04  int32  -> 0x72e334   语义未查（另一种货币？）
+        +0x08  int32  -> 0x72e330   ★ 金币
+        +0x0c  int32  -> 0x72e33c   ★ 总经验
+        +0x10  int32  -> 0x72e340   ★ 本级起始总经验
+        +0x14  int32  -> 0x72e344   ★ 下一级所需总经验
+        +0x18  u16    -> 0x72e338   ★ 等级（`0x5d59f1` 读 **2 字节**，movsx 扩展）
+        +0x1c  int32  -> 0x72e390   语义未查（全镜像只有这一处写，没有读）
+        +0x20  int32  -> 0x72e394   同上
+
+    ★ 等级那一格是 **u16**，别当成 int32 写 —— 后面两个 int32 会整体错位 2 字节。
+
+    这些正是 `gspEndGame` 结算时更新的同一组全局，所以经验三件套的编码规则
+    一样：三个都是**绝对累计值**，UI 自己做减法（§94）。金币这里是**绝对总额**
+    （直接 `mov`），和 `gspEndGame` 里那个 `+=` 的本局所得不是一回事。
+
+    分发树 `0x54e40c` 的 `sub eax,0x507 / sub eax,0xf9 / je` 链把 0x0600 定位到
+    `0x553855`；同一条链上 0x0601 -> `0x55420e`、0x0507 -> `0x553dc9`。
+    """
+    return (w_i32(unknown_04)
+            + w_i32(money)
+            + w_i32(experience)
+            + w_i32(level_start_exp)
+            + w_i32(next_level_exp)
+            + struct.pack("<H", max(0, int(level)) & 0xFFFF)
+            + w_i32(unknown_1c)
+            + w_i32(unknown_20))
+
+
+def build_rep_money_for(account):
+    """按账号存档组一份 `gspRepMoney`。经验三件套与 `send_end_game` 同源。"""
+    experience = player_experience(account)
+    level_start_exp, next_level_exp = experience_bounds(experience)
+    return build_rep_money(
+        money=player_money(account),
+        experience=experience,
+        level_start_exp=level_start_exp,
+        next_level_exp=next_level_exp,
+        level=player_level(account),
+    )
+
+
+def parse_first_user_result(payload):
+    """opcode 0x030f `gcpReqFirstUserResult`（客户端 -> 服务端）—— 教程进度上报。
+
+    序列化 `0x404ee8` 只写包对象 `+0x04` 一个 int32（`0x5d591f` 写 4 字节），
+    所以载荷就是 **4 字节**。
+
+    ★ 它的唯一发送点 `0x4f22c1` 把「教程完成」这件事写死在了三条指令里：
+
+        004f22d4  call 0x40e47f          ; edx=4 -> 切回 stage 4（大厅）
+        004f22df  mov [eax+0x64], esi    ; ★ eax = [0x72e2a4]，+0x64 就是大厅
+                                         ;   0x43b354 拿去 `cmp 3 / jge` 的那个
+                                         ;   新手教程状态（§54）
+        004f22e2  call 0x5538f2          ; ★ 把同一个 esi 发上来
+
+    也就是说**客户端先自己记下新状态，再把它原样告诉服务端**，我们只要存下来
+    就行，不用推断也不用换算。三个调用点传的值：`0x4f3aa1` 推 **5**，
+    `0x4f41c9` / `0x4f41fd` 推 **4**。都 >= 3，都算完成。
+
+    服务端方向的同号包有处理器 `0x4089c3`（大厅跳表），但它**不读包体**，
+    只是清 `[LobbyStage+0x49c]`、置 `[LobbyStage+4]=2` 再加载两份 UI 资源。
+    客户端自己已经切回大厅了，所以按 D028 不回显 —— 只记账。
+    """
+    reader = Reader(payload)
+    progress = reader.i32()
+    if reader.left():
+        raise ValueError(
+            f"first-user-result payload has {reader.left()} trailing bytes")
+    return progress
+
+
+def build_rep_list_session():
+    """opcode 0x0200 —— 房间列表（空）
+
+    反序列化 `0x559009`：
+        u16 房间数 n           n <= 0 就整个跳过循环（0x559023 的 jle）
+        n 次 { ... }           每项 new(0x30)，我们发 0 项
+        u16                    循环之后还读一个，存到 [ebx+0x38]
+    """
+    return struct.pack("<HH", 0, 0)
+
+
+def build_rep_leave_session(result=0):
+    """opcode 0x0203 —— 离开房间的应答（FINDINGS §101）
+
+    客户端处理器 `0x54fffe` 只读**一个 int32**（`0x5d5984`）：
+
+        == 0  -> `0x552943`：`LobbyStage::ResetSession` 0x4054fa，
+                 再按当前 stage（5 房间 / 7 游戏）`ChangeStage(4)` 切回大厅
+        != 0  -> 弹韩文错误框「퇴장 실패 / 방에서 나갈수 없습니다.」
+
+    ★ 不回这个包，客户端就**永远留在房间里**：请求方 `0x406191` 发完就等，
+    没有超时、没有本地兜底。90 秒挂机提示框正是这么堆起来的（§101）。
+    """
+    return w_i32(result)
+
+
+def build_rep_create_session(session_id=1):
+    """opcode 0x0201 —— 建房结果（最小成功应答）
+
+    反序列化 `0x5590bb` 只读两个 int32。处理器 `0x54f6fb` 把第一个当
+    结果码：非 0 走错误弹窗，0 才创建/切换到 RoomStage；第二个写入
+    LobbyStage+0x1c8，作为新建 session 的 id。
+    """
+    return w_i32(0) + w_i32(session_id)
+
+
+SESSION_TYPE_NAMES = {
+    1: "normal",
+    2: "quest",
+    5: "ladder",
+}
+
+#: `SessionDescriptor::Serialize`（0x557374）按房间类型写几个 int32 参数。
+#: 解析客户端**发来**的描述符用这张表。
+DESCRIPTOR_SENT_ARGUMENT_COUNTS = {0: 1, 1: 3, 2: 2, 3: 1, 4: 1, 5: 3, 6: 3}
+
+#: `SessionDescriptor::Deserialize`（0x557401）按房间类型读几个 int32 参数。
+#: 组服务端**下发**的描述符用这张表。
+#:
+#: 类型 3 / 4 两侧不对称：序列化只写 1 个参数，反序列化却读 2 个，而且读的
+#: 第一个还写回 `+0x04`（也就是把 type 字段自己覆盖掉）。这是客户端自己的
+#: bug，所以这两种类型不放进本表 —— 服务端不下发它们。
+DESCRIPTOR_READ_ARGUMENT_COUNTS = {0: 1, 1: 3, 2: 2, 5: 3, 6: 3}
+
+
+def read_session_descriptor(reader):
+    """从 `reader` 里读一个客户端序列化出来的 `SessionDescriptor`。
+
+    返回 `(类型, 参数元组)`。客户端的写入侧是 `0x557374`，所以参数个数按
+    `DESCRIPTOR_SENT_ARGUMENT_COUNTS` 取。0x0201 和 0x0302 都以它结尾。
+    """
+    session_type = reader.i32()
+    if session_type not in DESCRIPTOR_SENT_ARGUMENT_COUNTS:
+        raise ValueError(f"unsupported session descriptor type {session_type}")
+    arguments = tuple(
+        reader.i32()
+        for _ in range(DESCRIPTOR_SENT_ARGUMENT_COUNTS[session_type]))
+    return session_type, arguments
+
+
+def build_session_descriptor(session_type, arguments):
+    """`SessionDescriptor` 的线格式：int32 类型 + 按类型定数量的 int32 参数。
+
+    客户端的 `SessionDescriptor::Deserialize`（0x557401）先读 int32 类型，
+    再按类型跳分支读参数：类型 0 读 1 个（写 +0x08）、类型 2 读 2 个
+    （+0x08 / +0x0c）、类型 1 / 5 / 6 读 3 个（+0x08 / +0x0c / +0x10）。
+    参数个数发错会让后面的字段整体错位。
+    """
+    expected = DESCRIPTOR_READ_ARGUMENT_COUNTS.get(session_type)
+    if expected is None:
+        raise ValueError(
+            f"session descriptor type {session_type} is not safe to send")
+    if len(arguments) != expected:
+        raise ValueError(
+            f"session descriptor type {session_type} needs {expected} "
+            f"arguments, got {len(arguments)}")
+    return w_i32(session_type) + b"".join(w_i32(value) for value in arguments)
+
+
+#: `Session+0x04` = 房间状态。**2 = 待机中**，其余值一律是「游戏中」。
+#:
+#: 判据在房间列表的渲染里，`0x43e5de` 一句 `cmp [session+4], 2`：
+#: 相等推 `0x665700`（'대기중' = 待机中），不等推 `0x6656f8`（'게임중' = 游戏中）。
+#:
+#: ★ **它同时决定房间里建哪个 3D 场景**，这是「待机房间背景纯黑」的真凶
+#: （FINDINGS §102）。`RoomStage` 构造函数 `0x466979` 在 `0x466a88` 用
+#: `(状态, 描述符, 地图名)` 调游戏上下文工厂 `0x494509`，工厂开头就是：
+#:
+#:     00494526  cmp [ebp+8], 2 -> je 0x4948c2      ; 状态 2/5/6
+#:     0049453c  cmp [ebp+8], 5 -> je 0x4948c2      ;   -> new GameContextWaitingRoom
+#:     00494546  cmp [ebp+8], 6 -> je 0x4948c2      ;      = 待机房间场景
+#:     0049454c  否则按 descriptor.type 建**战斗**上下文（闯关房就是
+#:               GameContextQuest03），而战斗上下文要靠 stage 6 的加载流程
+#:               才能把场景铺起来 —— 直接在房间里建出来就是一片黑。
+#:
+#: `GameContextWaitingRoom::Init`（`0x494b9f`）加载的是固定地图
+#: `Maps/ReadyRoom.map`（实机解析成 `room-06`），和房间选的关卡地图无关。
+#: 服务端方向的 `0x0403`（结算完回房间）在 `0x551904` 硬写 `[LobbyStage+4]=2`,
+#: 所以打完一关回来的房间是对的 —— 只有建房那一路是黑的。
+SESSION_STATUS_WAITING = 2
+
+
+def build_update_session(session_type, arguments, title="", map_name="",
+                         status=SESSION_STATUS_WAITING):
+    """opcode 0x0303 —— 把整个 `Session` 灌进客户端的 `LobbyStage`
+
+    大厅分发器 `0x4061e2` 的跳表 `@0x406332` 索引 3 → `0x406258` →
+    `0x406756`，后者直接把包体反序列化进 `LobbyStage`（`0x556ed1`）：
+
+        int32              -> +0x04   ★ 房间状态，见 SESSION_STATUS_WAITING
+        string             -> +0x08   房间标题
+        int32              -> +0x0c   语义未知
+        string             -> +0x10   ★ 地图名，见下面的警告
+        int32              -> +0x14   读 4 字节存成 1 字节，语义未知
+        SessionDescriptor  -> +0x18   ★ 房间类型 + 参数
+        u16                -> +0x3c   语义未知
+
+    未查明的字段按 D019 一律填 0 / 空串。
+
+    ★ `map_name` 默认且**必须**是空串。建房应答处理器 `0x54f747` 在
+    `0x54f82e` 拿 `LobbyStage+0x10` 和 `L""` 比一次（`0x4040f5` 相等回 0），
+    `jne 0x54fb0c` 直接跳到函数的 `ret` —— 地图名一旦非空，客户端收到
+    `gspRepCreateSession` 后就什么都不做，房间面板根本不会建起来。
+    地图名是后续由客户端的 `0x0302 gcpChangeSession` 提交、再由服务端下发的。
+    """
+    return (w_i32(status)
+            + w_wstr(title)
+            + w_i32(0)
+            + w_wstr(map_name)
+            + w_i32(0)
+            + build_session_descriptor(session_type, arguments)
+            + struct.pack("<H", 0))
+
+
+def parse_create_session_request(payload):
+    """Decode opcode 0x0201 ``Packet_gcpReqCreateSession``.
+
+    Its serializer at 0x43abc1 writes three strings, one int32, then a
+    variable-width session descriptor through vft 0x65e09c / 0x557374.
+    The descriptor's first int32 is the session type. Wire types 0, 3 and 4
+    carry one argument; type 2 carries two; types 1, 5 and 6 carry three.
+
+    The three create dialogs construct descriptor type 1 for normal rooms,
+    type 2 for quest rooms, and type 5 for ladder rooms. Field meanings after
+    the type differ by mode, so keep neutral names until each is proven.
+    """
+    reader = Reader(payload)
+    text_fields = tuple(reader.wstr() for _ in range(3))
+    option = reader.i32()
+    session_type, arguments = read_session_descriptor(reader)
+    if reader.left():
+        raise ValueError(f"create-session payload has {reader.left()} trailing bytes")
+    return {
+        "texts": text_fields,
+        "option": option,
+        "session_type": session_type,
+        "session_type_name": SESSION_TYPE_NAMES.get(session_type, "unknown"),
+        "arguments": arguments,
+    }
+
+
+def parse_change_session_request(payload):
+    """Decode opcode 0x0302 ``Packet_gcpChangeSession``.
+
+    The client sends this right after it has processed a successful
+    ``gspRepCreateSession``: handler 0x54f747 ends at 0x54fae9 by calling the
+    send helper 0x54e5e9, which stamps type 0x0302 at 0x54e639.
+
+    Its serializer 0x54c18c writes, in order::
+
+        int32              (+0x04)   自由座位数（来自 0x556f40）
+        string             (+0x08)   回显 LobbyStage+0x08 的房间标题
+        string             (+0x0c)   模式名，查表自 0x40b6a2
+        int32              (+0x10)   由 1 字节零扩展而来
+        int32              (+0x11)   同上
+        SessionDescriptor  (+0x14)   房间类型 + 参数
+
+    两个 1 字节字段都是经 0x5d5a4c 零扩展后按 4 字节写出去的，所以线上是
+    int32。语义未确认，先原样记录。
+    """
+    reader = Reader(payload)
+    free_slots = reader.i32()
+    text_fields = (reader.wstr(), reader.wstr())
+    flags = (reader.i32(), reader.i32())
+    session_type, arguments = read_session_descriptor(reader)
+    if reader.left():
+        raise ValueError(f"change-session payload has {reader.left()} trailing bytes")
+    return {
+        "free_slots": free_slots,
+        "texts": text_fields,
+        "flags": flags,
+        "session_type": session_type,
+        "session_type_name": SESSION_TYPE_NAMES.get(session_type, "unknown"),
+        "arguments": arguments,
+    }
+
+
+#: 客户端把频道码翻译成游戏类型的表，逐分支抄自 `0x5545ec`。
+#: 负数和表外的码都会被翻译成 -1，客户端认为「当前不在任何可玩频道」。
+CHANNEL_CODE_GAME_TYPES = {0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 6: 1, 7: 2, 9: 5, 10: 1}
+
+#: 反向表：每种游戏类型挑一个规范频道码。普通用 0，与登录包保持一致。
+GAME_TYPE_CHANNEL_CODES = {1: 0, 2: 7, 5: 9}
+
+#: 大厅标签页索引 -> 游戏类型，抄自 `0x43b61a`。标签 3 的类型 6 没有任何
+#: 频道码能映射回来，所以服务端无法把客户端移进去。
+LOBBY_TAB_GAME_TYPES = {0: 1, 1: 2, 2: 5, 3: 6}
+
+GAME_TYPE_NAMES = {1: "normal", 2: "quest", 5: "ladder", 6: "practice"}
+
+
+def parse_move_channel_by_game_type(payload):
+    """Decode opcode 0x020b ``gcpReqMoveChannelByGameType``.
+
+    The sender at 0x55395a writes a single int32 holding the game type the
+    lobby tab asks for. 0x43b61a maps tab 0/1/2 to game type 1/2/5, so the
+    quest tab always arrives here as 2.
+    """
+    reader = Reader(payload)
+    game_type = reader.i32()
+    if reader.left():
+        raise ValueError(
+            f"move-channel payload has {reader.left()} trailing bytes")
+    return game_type
+
+
+def build_rep_move_into(ok=True, channel_code=0, channel_index=0):
+    """opcode 0x0701 —— Packet_gspRepMoveInto（vft 0x6915c0）
+
+    这是 0x020b 的**成功**应答。同号的 0x020b 服务端包只用来报失败
+    （客户端 0x54fbfa 的两条分支都是韩文原版的「移动到能玩该游戏的
+    频道失败」提示），所以切频道成功时绝对不能回 0x020b。
+
+    反序列化 `0x54c891` 依次读三个 4 字节字段：
+        int32 ok            非 0 才走成功路径（0x5d59de 读 4 字节再折成 bool）
+        int32 channel_code  写入 [conn+0x89c]
+        int32 channel_index 写入 [conn+0x8a0]
+    处理器 `0x552b47` 随后把 [conn+0x898] 置 2，用 `0x5545ec` 把频道码
+    翻成游戏类型，再调 `0x43b63b` 切换大厅标签页。
+    """
+    return w_i32(1 if ok else 0) + w_i32(channel_code) + w_i32(channel_index)
+
+
+#: 房间座位数。`LobbyStage+0x40` 起，每项 0x3c 字节，固定 6 项
+#: —— `0x556eec` 的循环写死 `cmp [ebp-4], 6`，`0x404d42` 的取值器也拒收
+#: 越界下标（`cmp ecx,6 / jge`）。
+ROOM_SEAT_COUNT = 6
+
+
+def build_session_slot(occupied=False, nickname="", unknown_u8=0,
+                       character_id=0, item_ids=(), unknown_28=0,
+                       unknown_2c=0, level=0, unknown_2e=False,
+                       unknown_12=0, unknown_text="", unknown_34=False,
+                       closed=False):
+    """房间里一个座位（`SessionSlot`）的线格式。
+
+    反序列化在 `0x556d9d`（`this` = 座位指针，`eax` = 流）。它先读占用标记，
+    只有占用时才继续读后面的字段，最后**无论占用与否**都再读一个标记：
+
+        int32(bool) 占用       -> +0x00   0x5d5956 读 4 字节折成 bool
+        占用时:
+            string  昵称       -> +0x04   0x5d5b3a = u16 字符数 + UTF-16LE
+            u8      ?          -> +0x08   ★ 0x5d5942 读**1 字节**，不是 4
+            int32   角色 id    -> +0x0c   0x0301 的 action 4 拿它去 0x557128 查名字
+            int32×n + int32 0  -> +0x1c   0 结尾的 int32 列表（0x556de1 起的循环）
+            int32   ?          -> +0x28
+            u16     ?          -> +0x2c
+            u16     ★ 等级     -> +0x10
+            int32(bool) ?      -> +0x2e
+            u16     ?          -> +0x12
+            string  ?          -> +0x30
+            int32(bool) ?      -> +0x34
+        不占用时:
+            （无字段，客户端调 0x556c55 把整个座位清零）
+        int32(bool) 关闭       -> +0x01   0x556f40 数 `+0x41 == 0` 的座位当空位
+
+    `level`（+0x10）是**里程碑 C 的关键字段**：房间里按「F5 游戏开始」时，
+    `0x468242` 起的检查拿**房主座位**的这个 u16 去和关卡要求等级比：
+
+        00468242  mov edi, [esi+0x34]      ; 房主座位号
+        00468256  call 0x404d42            ; -> 座位指针
+        00468277  movzx ecx, word [edi+0x10]   ; ★ 座位里的等级
+        0046827b  cmp ecx, eax             ; eax = 0x464848() = 关卡要求等级
+        0046827d  jge 0x468316             ; 够 -> 放行
+                                           ; 不够 -> 弹 0x66a7fc
+                                           ;   '레벨이 낮아서 퀘스트를 선택할 수 없습니다'
+                                           ;   （中文本地化 = 「等级太低，无法选择任务。」）
+
+    它和 `gspRepLogin` 下发、存在全局 `0x72e338` 的那个等级**是两回事**：
+    后者只管大厅 UI 和下拉框过滤，这里只认座位里的值。等级 30 照样弹框
+    就是因为服务端从来没发过任何房间成员包（FINDINGS §75）。
+
+    未查明语义的字段按 D019 一律填 0 / 空串。
+    """
+    if not occupied:
+        return w_i32(0) + w_i32(1 if closed else 0)
+    return (w_i32(1)
+            + w_wstr(nickname)
+            + struct.pack("<B", unknown_u8 & 0xFF)
+            + w_i32(character_id)
+            + b"".join(w_i32(v) for v in item_ids) + w_i32(0)
+            + w_i32(unknown_28)
+            + struct.pack("<H", unknown_2c)
+            + struct.pack("<H", level)
+            + w_i32(1 if unknown_2e else 0)
+            + struct.pack("<H", unknown_12)
+            + w_wstr(unknown_text)
+            + w_i32(1 if unknown_34 else 0)
+            + w_i32(1 if closed else 0))
+
+
+def build_session_members(host_seat=0, seats=()):
+    """opcode 0x0300 —— 整个房间的座位快照。
+
+    大厅分发器 `0x4061e2` 的跳表 `@0x406332` 索引 0 → `0x406232` →
+    `0x40637a`，后者把包体交给 `0x556eec`（`this` = `LobbyStage`）：
+
+        int32   房主座位号   -> LobbyStage+0x34
+        int32   ?            -> LobbyStage+0x38
+        SessionSlot × 6      -> LobbyStage+0x40 起，每项 0x3c 字节
+
+    处理器随后置 `[LobbyStage+0x1c4] = 1`、把「我」的座位 IP 写成
+    `0x0100007f`（127.0.0.1）、调 `0x405a74` 刷新房间 UI。结尾那段拼
+    `"Slot %d : %s, open/closed"` 的循环是死调试代码，字符串建完就析构掉了。
+
+    **必须排在 `0x0201` 建房应答之后**：`0x54f747` 在 `0x54f815` 会把
+    `[LobbyStage+0x4c]`（= 座位 0 的 +0x0c，角色 id）清零，先发就被冲掉。
+    """
+    if len(seats) != ROOM_SEAT_COUNT:
+        raise ValueError(
+            f"room snapshot needs exactly {ROOM_SEAT_COUNT} seats, "
+            f"got {len(seats)}")
+    if not 0 <= host_seat < ROOM_SEAT_COUNT:
+        raise ValueError(f"host seat {host_seat} is out of range")
+    return (w_i32(host_seat) + w_i32(0)
+            + b"".join(build_session_slot(**seat) for seat in seats))
+
+
+#: `0x0301` 的 action 码 —— 客户端 `0x4064f7` 起按它分支，每个码的副作用差别很大。
+#: 0 是唯一会**建**座位角色对象的（`0x405e1c` + `0x406f42`）。
+SEAT_ACTION_JOIN = 0
+SEAT_ACTION_LEAVE = 3
+#: 换角色。客户端点房间右下角「人物选择」的头像时先把整个座位用
+#: **客户端方向的 `0x0301`** 报上来，然后**什么都不做地等**；只有服务端把这个
+#: action 广播回来，`0x406520` 才播「%s님이 %s 캐릭터로 선택되었습니다.」
+#: 并走到 `0x406628` 重建座位的角色对象 —— 中下那个 3D 预览就是这时才换的。
+#: 不回这一发，点头像就是完全没反应（FINDINGS §103）。
+SEAT_ACTION_CHANGE_CHARACTER = 4
+
+
+def build_session_member_update(seat_index, action=SEAT_ACTION_JOIN, **seat):
+    """opcode 0x0301 —— 单个座位的变更事件。
+
+    大厅跳表 `@0x406332` 索引 1 → `0x40623f` → **`0x40648d`**，载荷：
+
+        u8      action     ★ 0x5d5942 读 1 字节（不是 4）
+        int32   座位号     客户端校验 0 <= n < 6，越界直接丢包
+        SessionSlot        与 0x0300 里的每一项同格式，见 build_session_slot
+
+    action 分支（`0x4064f7` 起）：
+
+        0 → 0x406691  进房：清 IP/端口，**`0x405e1c` 建座位的角色对象**、
+                      `0x406f42`、`0x4089fa`，最后 `0x405a74` 刷 UI
+        1/2 → 0x406676 清 IP/端口 + `0x405f8f`（**销毁**角色对象并把
+                      `[LobbyStage+0x1d0+i*4]` 清 0）—— 服务端不要发
+        3 → 0x406628  离开/踢出
+        4 → 0x406520  换角色：用 `seat+0x0c` 查角色名，播
+                      `'%s님이 %s 캐릭터로 선택되었습니다.'`
+
+    ★ action 0 会把 `seat[+0x14]`（对端 IP）和 `seat[+0x18]`（端口）清 0。
+    `0x0300` 的处理器会把「我」的座位 IP 写成 `0x0100007f`，所以两个包同时发时
+    **`0x0301` 要排在 `0x0300` 前面**，否则 IP 又被清掉。
+    """
+    if not 0 <= seat_index < ROOM_SEAT_COUNT:
+        raise ValueError(f"seat index {seat_index} is out of range")
+    if action in (1, 2):
+        raise ValueError(
+            f"seat action {action} destroys the seat's character object "
+            f"(0x405f8f); the fake backend must not send it")
+    return (struct.pack("<B", action & 0xFF)
+            + w_i32(seat_index)
+            + build_session_slot(**seat))
+
+
+def parse_session_slot(reader):
+    """读一个客户端序列化出来的 `SessionSlot`（`0x556ccc`），字段见 build_session_slot。
+
+    收发两侧是同一份布局，唯一要小心的还是那两个非 4 字节的原语：
+    `+0x08` 是 1 字节、`+0x2c` / `+0x10`（等级）/ `+0x12` 是 u16。
+    """
+    occupied = bool(reader.i32())
+    slot = {"occupied": occupied}
+    if occupied:
+        slot["nickname"] = reader.wstr()
+        slot["unknown_u8"] = reader.take(1)[0]
+        slot["character_id"] = reader.i32()
+        item_ids = []
+        while True:
+            value = reader.i32()
+            if value == 0:
+                break
+            item_ids.append(value)
+        slot["item_ids"] = tuple(item_ids)
+        slot["unknown_28"] = reader.i32()
+        slot["unknown_2c"] = reader.u16()
+        slot["level"] = reader.u16()
+        slot["unknown_2e"] = bool(reader.i32())
+        slot["unknown_12"] = reader.u16()
+        slot["unknown_text"] = reader.wstr()
+        slot["unknown_34"] = bool(reader.i32())
+    slot["closed"] = bool(reader.i32())
+    return slot
+
+
+def parse_seat_change_request(payload):
+    """解客户端方向的 `0x0301`（房间里点「人物选择」的头像时发的）。
+
+    序列化点 `0x558dcb` 只写两样东西：
+
+        push 0x301               ; opcode
+        call 0x5bba0a
+        push [esi]  / 0x5d591f   ; int32 座位号
+        esi = [esi+4] / 0x556ccc ; SessionSlot（与 0x0300 里的每一项同格式）
+
+    **注意它没有 action 字节** —— 服务端方向的同号包才有（`0x40648d` 先读
+    1 字节 action 再读座位号）。实机 59 字节载荷逐字段解对：
+    `seat=0, occupied=1, nickname='testuser', character_id=0/1/2, level=1`，
+    连点三个头像时只有 `character_id` 在变（FINDINGS §103）。
+    """
+    reader = Reader(payload)
+    seat_index = reader.i32()
+    slot = parse_session_slot(reader)
+    if reader.left():
+        raise ValueError(f"seat change payload has {reader.left()} trailing bytes")
+    if not 0 <= seat_index < ROOM_SEAT_COUNT:
+        raise ValueError(f"seat index {seat_index} is out of range")
+    return seat_index, slot
+
+
+def build_rep_quest_record_in_pvp(records=None):
+    """opcode 0x0311 —— 六种游戏类型的任务/PvP 记录。
+
+    大厅分发器 `0x4061e2` 把 0x0311 交给 `0x408a1c`。后者构造
+    `Packet_gspRepQuestRecordInPvp`（vft 0x65e14c），其反序列化函数
+    `0x404fb9` 经 `0x408fc9` 读取：
+
+        int32 n
+        int32 records[n]
+
+    处理器随后按固定下标 0..5 访问该数组，因此最小安全包必须有六项；
+    未查明各项业务语义前按 D019 全部填 0。
+    """
+    if records is None:
+        records = (0, 0, 0, 0, 0, 0)
+    if len(records) != 6:
+        raise ValueError("quest record response requires exactly 6 entries")
+    return w_i32(len(records)) + b"".join(w_i32(v) for v in records)
+
+
+def build_trigger_count_game(result=0):
+    """opcode 0x0401 -- Packet_gspTriggerCountGame.
+
+    The lobby dispatcher at 0x4061e2 constructs this class in handler
+    0x4074de. Its payload is one int32. Values 2 and 3 select ladder
+    maintenance errors; 0 enters the normal start-confirmation path.
+    """
+    return w_i32(result)
+
+
+def build_rep_count_down(state=0):
+    """opcode 0x0412 -- Packet_gspRepCountDown.
+
+    Handler 0x493755 reads one int32 and passes it to 0x468e78: value 0
+    starts the roughly six-second client countdown, while 1 stops it.
+    """
+    return w_i32(state)
+
+
+def build_prepare_game(seed=0):
+    """opcode 0x0400 -- Packet_gspPrepareGame.
+
+    The 0x0400 branch of dispatcher 0x54e036 enters handler 0x551605.
+    Its sole int32 is the shared random seed used by map/spawn selection,
+    so the single-player fake backend can safely use deterministic seed 0.
+    """
+    return w_i32(seed)
+
+
+#: `gspEndGame` 的业务字段个数（`pkt+0x0c` .. `pkt+0x38`）。
+#: 反序列化 `0x54cea3` 一共读 14 个 4 字节字段，前两个是座位号和成功标志。
+END_GAME_VALUE_COUNT = 12
+
+#: 12 个业务值里已查明语义的下标（FINDINGS §94），其余按 D019 填 0。
+END_GAME_EXPERIENCE = 1        # pkt+0x10 -> [0x72e33c]  玩家的总经验值
+END_GAME_NEXT_LEVEL_EXP = 2    # pkt+0x14 -> [0x72e344]  升到下一级所需的总经验
+END_GAME_LEVEL_START_EXP = 3   # pkt+0x18 -> [0x72e340]  当前等级的起始总经验
+END_GAME_MONEY_GAINED = 4      # pkt+0x1c -> [0x72e330]  ★ 金币，客户端是 `+=`
+
+#: 结算界面「分数 / 生命」那一行的**分数**（会话 18，§116）。
+#:
+#: `0x0411` 的处理器 `0x551804` 把包里的字段搬成一张 13 个 dword 的结算表
+#: （`0x5518af call 0x4a4096` -> `[GameContextQuest + 座位*0x34 + 0x3ec]`），
+#: 结算界面画玩家槽的 `0x4a4af5` 把这张表整个搬到栈上，然后在 `0x4a4e40`：
+#:
+#:     ecx = 表[7] + 表[6] + 表[5]        ; 三格相加
+#:     "%d / %d" % (ecx * 系数, 剩余生命)  ; 0x668114 @ (0x12d, 0xa1)
+#:
+#: 表[5]/表[6]/表[7] 分别来自 `pkt+0x20` / `pkt+0x24` / `pkt+0x28`
+#: = 业务值下标 5 / 6 / 7。**界面显示的是三者之和**，所以原版多半是
+#: 「击杀分 / 时间分 / 收集分」之类的拆分；单机把本局总分全放进第一格就够了。
+END_GAME_SCORE_PARTS = (5, 6, 7)
+
+
+def build_end_game_values(experience=0, next_level_exp=0, level_start_exp=0,
+                          money_gained=0, score=0):
+    """按 §94 / §116 的语义组 `gspEndGame` 的 12 个业务值。
+
+    右上角玩家数据栏那三个显示全是客户端自己做的减法：
+
+        当前经验 = 总经验     - 本级起点
+        升级所需 = 下一级所需 - 本级起点
+        进度条   = 前者 / 后者
+
+    会话 10 发 `endgame-probe`（101..112）时画面显示 `经验值: -2/-1`、`200%`、
+    `金币: 105`，与 `102-104` / `103-104` / `105` 逐项吻合。所以这三个必须是
+    **绝对累计值** —— 填「本级内的差值」会让进度条错乱。
+
+    ★ `money_gained` 在客户端是 `[0x72e330] +=`（`0x5518c0`），
+    发的是**本局所得**，不是账号总额。
+
+    `score` 落进 `END_GAME_SCORE_PARTS` 的第一格 = 结算界面「分数 / 生命」
+    那一行的分数（另外两格保持 0，界面显示的是三格之和）。
+    """
+    values = [0] * END_GAME_VALUE_COUNT
+    values[END_GAME_EXPERIENCE] = int(experience)
+    values[END_GAME_NEXT_LEVEL_EXP] = int(next_level_exp)
+    values[END_GAME_LEVEL_START_EXP] = int(level_start_exp)
+    values[END_GAME_MONEY_GAINED] = int(money_gained)
+    values[END_GAME_SCORE_PARTS[0]] = int(score)
+    return values
+
+
+def build_end_game(seat_id=0, success=True, values=None):
+    """opcode 0x0411 —— `Packet_gspEndGame`（vft `0x691874`）。关卡结束 + 结算。
+
+    反序列化 `0x54cea3` 读 **14 个 4 字节字段**（全部走 `0x5d59ff`/`0x5d59de`）：
+
+        int32   -> +0x04   ★ 座位号
+        bool32  -> +0x08   （`0x5d59de` 读 4 字节折成 bool）成功/失败
+        int32   -> +0x0c .. +0x38    12 个业务值
+
+    处理器 `0x551804`（分发树 `0x54e39d` → 这里）：
+
+        0x55189f  push 0xd / rep movsd        ; 把 +0x0c 起的 13 个 dword 搬成一个结构
+        0x5518af  call 0x4a4096               ; eax = +0x04(座位号)，交给结算 UI
+        0x5518b4  call 0x409f7d / cmp ebx,eax ; ★ 座位号 == 我的座位才更新下面四个全局
+        0x5518c0  [0x72e330] += pkt+0x1c      ; ★ 累加（疑似经验或金钱）
+        0x5518c9  [0x72e33c]  = pkt+0x10
+        0x5518d1  [0x72e340]  = pkt+0x18
+        0x5518d9  [0x72e344]  = pkt+0x14
+        0x5518e4  call 0x4913fc               ; 结算界面
+        0x5518ef  call 0x4087f0
+
+    12 个业务值的语义还没查（只知道 `+0x1c` 是累加的、`+0x10/+0x14/+0x18` 各自落位），
+    按 D019 一律填 0。**注意 `+0x1c` 是 `+=`**，所以填 0 最安全 —— 填别的值会把
+    玩家数据越加越多。
+
+    `seat_id` 必须等于客户端认为的自己的座位号（`[LobbyStage+0x1cc]`，建房时是 0），
+    否则那四个全局不会更新；但结算界面 `0x4913fc` 无论如何都会弹
+    （`0x55184e` 的 `je 0x5518de` 只跳过搬运那一段）。
+    """
+    values = list(values if values is not None else [0] * END_GAME_VALUE_COUNT)
+    if len(values) != END_GAME_VALUE_COUNT:
+        raise ValueError(
+            f"gspEndGame needs exactly {END_GAME_VALUE_COUNT} trailing values, "
+            f"got {len(values)}")
+    return (w_i32(seat_id)
+            + w_i32(1 if success else 0)
+            + b"".join(w_i32(v) for v in values))
+
+
+#: `gspRepGameResult` 里座位号之后的业务字段个数（反序列化 `0x54c6b4`）。
+GAME_RESULT_VALUE_COUNT = 12
+
+#: 尾部数组的最小长度。`0x5521d2` 的循环**无条件**读 6 个 dword 搬到
+#: `[GameContext+0x184]`，数组更短就会读到 vector 边界外，为空更是直接读 NULL。
+GAME_RESULT_TAIL_COUNT = 6
+
+#: 尾部数组第 i 项填这个值 = 「第 i 号座位通关了」。
+#:
+#: ★★ 这就是结算界面那个「未完成」标签的开关（会话 17，§112）。
+#: 尾部数组落进 `[GameContext + 座位*4 + 0x184]`，读它的是
+#: `GameContext::vf_10c`（`0x48c9ff`，整个函数只有
+#: `mov eax,[ecx+eax*4+0x184] / ret 4`）。结算界面画玩家槽的
+#: `0x4a4af5` 在 `0x4a4ba9` 处判
+#:
+#:     vf_10c(座位) == 1  且  vf_a4(座位) > 0（= 剩余生命 > 0）
+#:
+#: 两条都成立才画「完成」那一帧，否则画「未完成」。我们一直发全 0，
+#: 所以哪怕真通关也永远是「未完成」。`0x0411 gspEndGame` 的 `success`
+#: 字段跟这个标签没关系（§99 实测 `success=True` 照样写「未完成」）。
+GAME_RESULT_CLEARED = 1
+
+#: 12 个业务值里已查明语义的下标（会话 18，§116）。
+#:
+#: 客户端的**内存**布局不是 12 个 dword —— 反序列化 `0x54c6b4` 里 `+0x24`
+#: 和 `+0x25` 是两个挨着的 bool（`0x5d59de` 线上读 4 字节、只存 1 字节），
+#: 所以「线上第 k 个业务值」和「结构体偏移」差了 6 字节。下面这三个下标是
+#: 按线序数出来的，别拿结构体偏移去推。
+#:
+#: 处理器 `0x55210d` 把它们搬进 GameContext，结算界面的基类画法
+#: `GameContext::vf_44`（`0x48db6c`）再读出来画成三行「+%d」：
+#:
+#:     值 9  -> [ctx + 座位*4 + 0x2c]  读于 0x48e239  画在 y=0x15b  「经验值」
+#:     值 10 -> [ctx + 座位*4 + 0x5c]  读于 0x48e4e7  画在 y=0x1b8  「金币」  (PIXEL)
+#:     值 11 -> [ctx + 座位*4 + 0x44]  读于 0x48e3e6  画在 y=0x189  「竞技场分数」(LADDER POINT)
+#:
+#: 三行的顺序按 y 坐标排是 经验值 -> 竞技场分数 -> 金币，和截图一致；
+#: 标签串 `LADDER POINT`(`0x670f2c`) / `PIXEL`(`0x660848`) 就写在各自的画法旁边。
+GAME_RESULT_EXPERIENCE = 9      # 「经验值 +N」
+GAME_RESULT_MONEY = 10          # 「金币 +N」
+GAME_RESULT_LADDER_POINT = 11   # 「竞技场分数 +N」（闯关模式没有天梯分，发 0）
+
+#: 剩下 9 个值一律 0。⚠ **别一次全填** —— `gameresult-probe` 把 12 个值填成
+#: 201..212 时客户端 20 毫秒内主动断链（§100），至今没查出是哪一格干的。
+#: 这三个是逐格验过的，其余保持 D019 的「不懂就填 0」。
+
+
+def build_game_result_values(experience=0, money=0, ladder_point=0):
+    """按 §116 的语义组 `gspRepGameResult` 的 12 个业务值（其余全 0）。
+
+    三个都是**本局增量**（界面上就写成 `+%d`），不是账号总额 ——
+    和 `0x0411 gspEndGame` 那三个「绝对累计值」正好相反，别搞混。
+    """
+    values = [0] * GAME_RESULT_VALUE_COUNT
+    values[GAME_RESULT_EXPERIENCE] = int(experience)
+    values[GAME_RESULT_MONEY] = int(money)
+    values[GAME_RESULT_LADDER_POINT] = int(ladder_point)
+    return values
+
+
+def build_game_result_tail(seat_id=0, cleared=False):
+    """组 `gspRepGameResult` 的尾部数组：只有通关时把自己那一格置 1。
+
+    其余座位留 0（单机只有一个人在座位 0）。见 `GAME_RESULT_CLEARED`。
+    """
+    tail = [0] * GAME_RESULT_TAIL_COUNT
+    if cleared and 0 <= seat_id < GAME_RESULT_TAIL_COUNT:
+        tail[seat_id] = GAME_RESULT_CLEARED
+    return tail
+
+
+def build_rep_game_result(seat_id=0, values=None, tail=None):
+    """opcode 0x0309 —— `Packet_gspRepGameResult`（vft `0x691898`）。结算界面的数据源。
+
+    ★ **它必须排在 `0x0411 gspEndGame` 之前**（FINDINGS §99）。两个包分工不同：
+
+        0x0411  -> 右上角玩家数据栏的四个全局，发的是**绝对累计值**
+        0x0309  -> GameContext 里的结算表 -> **结算界面**，发的是**本局增量**
+
+    只发 `0x0411` 的话结算界面构造得出来却没有数据，于是画面上什么都不显示 ——
+    §93 观察到的「`[GameContext+4]==1` 但看不见界面」就是这个原因。
+
+    反序列化 `0x54c6b4` 依次读 13 个 4 字节字段再读一个 int32 数组。**两个 bool
+    字段在线上也是 4 字节**（`0x5d59de` 读 4 字节再折成 1 字节存），别写成 1 字节
+    —— 但它们在**结构体里**只占 1 字节且挨在一起（`+0x24` / `+0x25`），
+    所以从这两个字段之后，「线序」比「结构体偏移」少 6 字节（§116）。
+
+    处理器 `0x55210d` 的落位（`ebx` = `[0x72e2dc]` = GameContext）：
+
+        pkt+0x04  座位号   ← 先过 `0x4045f9` 的座位有效性检查，不合法整包丢弃
+        pkt+0x0c  bool     -> [GameContext + seat + 0x164]   （值 1）
+        pkt+0x18  非 0 时走 `0x552170` 的提示分支             （值 4）
+        pkt+0x25  bool     -> `0x493dd4` 的第 2 个参数        （值 8）
+        pkt+0x28           -> [GameContext + seat*4 + 0x2c]  （值 9  = 经验值）
+        pkt+0x2c           -> [GameContext + seat*4 + 0x5c]  （值 10 = 金币）
+        pkt+0x30           -> [GameContext + seat*4 + 0x44]  （值 11 = 竞技场分数）
+        pkt+0x34  数组     -> 前 6 个 dword 搬进 [GameContext+0x184]
+                             ★ **这就是「完成 / 未完成」标签**，见
+                               `GAME_RESULT_CLEARED` / `build_game_result_tail`
+        之后 `0x552242` 按 `[LobbyStage+0x1c] == 2`（闯关）分支选胜/负文本
+
+    ★ **`0x0309` 只能在战斗中发**：`0x55210d` 直接解引用 GameContext，
+    关卡一结束它就变 0（§93 实测），那时再发就是空指针崩溃。
+
+    12 个业务值里查明了三个（会话 18，§116，见 `build_game_result_values`）——
+    结算界面「经验值 / 金币 / 竞技场分数」三行；剩下 9 个按 D019 保持 0。
+    **通关标签不在这 12 个里，在尾部数组里**（会话 17 查明，§112）；
+    **「分数 / 生命」那一行也不在这个包里，在 `0x0411` 里**（§116）。
+    """
+    values = list(values if values is not None else [0] * GAME_RESULT_VALUE_COUNT)
+    if len(values) != GAME_RESULT_VALUE_COUNT:
+        raise ValueError(
+            f"gspRepGameResult needs exactly {GAME_RESULT_VALUE_COUNT} values "
+            f"after the seat id, got {len(values)}")
+    tail = list(tail if tail is not None else [0] * GAME_RESULT_TAIL_COUNT)
+    if len(tail) < GAME_RESULT_TAIL_COUNT:
+        raise ValueError(
+            f"gspRepGameResult 的尾部数组至少要 {GAME_RESULT_TAIL_COUNT} 项"
+            f"（0x5521d2 无条件读 6 个 dword），只给了 {len(tail)} 项")
+    return (w_i32(seat_id)
+            + b"".join(w_i32(v) for v in values)
+            + w_i32(len(tail))
+            + b"".join(w_i32(v) for v in tail))
+
+
+#: `0x513278 ObjectFactory` 认得的物件 id（跳表 `0x513b2a` + `0x5134cd` 起的
+#: 大 id 比较链，类名按构造函数里写的 vftable 反查 `re/vftables.json` 得到）。
+#: 只列关卡里会掉的那些；101..111 / 200..210 是地图编辑器摆的场景物件。
+ITEM_NAMES = {
+    10000: "ItemBox 宝箱",
+    10001: "LuckBag 幸运袋",
+    10100: "HeartItem 心（回血）",
+    10101: "CoinItem1 金币×1",
+    10102: "CoinItem5 金币×5",
+    10103: "ItemCard 称号卡片",
+    10104: "ItemEventFruit 活动果实",
+    10200: "NukeLauncherItem 核弹发射器",
+    10201: "FireThrowerItem 火焰喷射器",
+    10202: "WaterCannonItem 水炮",
+    10300: "ShieldItem 护盾",
+    10301: "SpeedUpItem 加速",
+}
+
+#: `gcpCreateItem`(0x0406，客户端 -> 服务端) 的线格式，序列化 `0x48c84f`。
+#: 8 个字段紧凑排列 = 32 字节。
+CREATE_ITEM_FORMAT = "<iffffiii"
+CREATE_ITEM_SIZE = struct.calcsize(CREATE_ITEM_FORMAT)
+
+#: 掉落物实例句柄的起点。句柄落进 `[obj+0xd0]`，`World::Add`(`0x473e7c`)
+#: 拿它当 map 的 key，撞了就会覆盖已有物件。关卡自己的物件句柄实测在
+#: `0x0010c9xx` 一带（死亡上报包里的 handle 就是同一个字段），
+#: 起点拉到 `0x40000000` 谁也够不着，而且还是正 int32、不等于 -1。
+ITEM_HANDLE_BASE = 0x40000000
+
+
+def parse_create_item(payload):
+    """opcode 0x0406（客户端 -> 服务端，32 字节）—— `gcpCreateItem`。
+
+    ⚠ **这个包以前被记成「位置同步」（§108/§109），是错的**（§112 勘误）。
+    整个镜像里 `push 0x406 / call 0x5bba0a`（`RawPacket::SetType`）**只有
+    `0x493a57` 一个调用点**，就在 `GameContext::SendCreateItem`
+    （`0x4939c0`）里，序列化器 `0x48c84f` 写的字段是：
+
+        +0x00  int32  物件 id（见 ITEM_NAMES；10101 = 金币、10103 = 称号卡片…）
+        +0x04  float  X
+        +0x08  float  Y
+        +0x0c  float  速度 X
+        +0x10  float  速度 Y
+        +0x14  int32  实测恒为 3
+        +0x18  int32  实测恒为 -1
+        +0x1c  int32  实测恒为 -1
+
+    实测一条（怪物死后 62 毫秒）：
+
+        da 27 00 00 | 00 60 19 45 | 00 80 97 43 | 0 | 0 | 03 | -1 | -1
+        └ 10202 水炮 └ x=2454.0    └ y=303.0
+
+    「位置同步」那个旧读法之所以看起来能用，是因为第 2、3 个 dword 恰好
+    真的是**坐标**（掉落点就在角色/怪物附近），拿去当重生兜底坐标不会出事。
+
+    客户端发完这个包就干等 `0x0404 gspCreatedItem`，**服务端不回就什么都不
+    掉落** —— 和 §108 血量归零、§111 换图是同一类病。
+
+    返回 8 个字段的元组；长度不够就抛 ValueError。
+    """
+    if len(payload) < CREATE_ITEM_SIZE:
+        raise ValueError(
+            f"gcpCreateItem 只有 {len(payload)} 字节，要 {CREATE_ITEM_SIZE}")
+    return struct.unpack_from(CREATE_ITEM_FORMAT, payload, 0)
+
+
+def build_created_item(instance_id, fields):
+    """opcode 0x0404 —— `Packet_gspCreatedItem`（vft `0x69188c`）。掉落物落地。
+
+    反序列化 `0x54c523` 读 **9** 个 4 字节字段（`0x5d59ff`），处理器
+    `0x551a11` 的用法：
+
+        +0x00  int32  ★ 实例句柄 -> 物件对象的 `[obj+0xd0]`，World 拿它当 map key
+        +0x04  int32  物件 id -> `0x513278 ObjectFactory` 的分支选择
+        +0x08  float  X ┐ 会先按地图记录的地面高度 `[map+0x50]` 夹一次，
+        +0x0c  float  Y ┘ 再用 `0x473969` 找一个不卡在地形里的落点
+        +0x10  float  速度 X -> `[obj+0x120]`
+        +0x14  float  速度 Y -> `[obj+0x124]`
+        +0x18  int32  == 1 时走「宠物捡到」的音效/特效分支（客户端发的是 3，不进）
+        +0x1c  int32  座位号 0..5，配合上一格用；客户端发的是 -1
+        +0x20  int32  **处理器整个函数都没读过它**（客户端那 8 个字段的最后一个
+                      正好落在这里，实测是 -1）
+
+    也就是说：**在客户端自报的 8 个字段前面插一个服务端分配的实例句柄**，
+    9 个字段 36 字节，就是一发合法的应答。服务端不需要知道任何物件数据 ——
+    掉什么、掉在哪、初速多少全是关卡脚本算好了报上来的（同 D046 的理由）。
+    """
+    fields = tuple(fields)
+    if len(fields) != 8:
+        raise ValueError(f"gspCreatedItem 要 8 个来自客户端的字段，给了 {len(fields)}")
+    return w_i32(instance_id) + struct.pack(CREATE_ITEM_FORMAT, *fields)
+
+
+#: `0x0407 gcpGetItem` / `0x0405`（服务端方向）共用的线格式：两个 int32。
+#: 序列化 `0x558e9a` 写 `[esi]` / `[esi+4]`，反序列化 `0x5590bb` 读回同样两个，
+#: **收发完全对称**，所以服务端原样回显就是合法应答（同 D046）。
+GET_ITEM_FORMAT = "<ii"
+GET_ITEM_SIZE = struct.calcsize(GET_ITEM_FORMAT)
+
+
+def parse_get_item(payload):
+    """opcode 0x0407（客户端 -> 服务端，8 字节）—— `gcpGetItem`「我要捡这件」。
+
+    调用链（全静态定位，FINDINGS §115）：
+
+        Character::CheckItemPickup 0x5154d3
+            if [char+0x2b4] != 0: return          ; 只有本地操控的角色才检测
+            遍历 World 的物件表 [World+0xdc]
+              item = dynamic_cast<Item*>(节点)     ; 0x515516 推的类型描述符
+              if [item+0x2a8] != 0: continue      ; ★ 这件已经报过一次了
+              if [item+0x2aa] == 0: continue      ; 「可拾取」标志
+              if !碰撞(0x50f410): continue
+              GameContext::SendGetItem(0x493a99)( [char+0x2ac], [item+0xd0] )
+              [item+0x2a8] = 1                    ; ★ 防重发，一件只报一次
+
+    线格式：
+
+        +0x00  int32  座位号   （= `[Character+0x2ac]`，单机固定 0）
+        +0x04  int32  实例句柄 （= `[Item+0xd0]`，就是我们在 `0x0404` 里发的那个）
+
+    实测两发（会话 18 的日志，句柄正是本局第 4 / 第 7 件金币）：
+
+        00 00 00 00 | 03 00 00 40      座位 0，句柄 0x40000003
+        00 00 00 00 | 06 00 00 40      座位 0，句柄 0x40000006
+
+    ★★ **`[item+0x2a8] = 1` 是关键**：客户端发完就把这件标记成「已上报」，
+    服务端不回的话它既不生效也不会再报第二次 —— 东西就永远躺在地上。
+    这不是「偶尔捡不到」，是**彻底捡不起来**。
+
+    返回 `(座位号, 实例句柄)`；长度不够就抛 ValueError。
+    """
+    if len(payload) < GET_ITEM_SIZE:
+        raise ValueError(
+            f"gcpGetItem 只有 {len(payload)} 字节，要 {GET_ITEM_SIZE}")
+    return struct.unpack_from(GET_ITEM_FORMAT, payload, 0)
+
+
+def build_picked_item(seat_id, instance_id):
+    """opcode 0x0405（服务端方向）—— 拾取放行。**原样回显客户端那两个字段**。
+
+    处理器 `0x551d35`：
+
+        0x5590bb  读两个 int32
+        0x404ff6  座位号 -> [LobbyStage + 座位*4 + 0x1d0] = 角色对象（越界返回 0）
+        0x474225  实例句柄 -> World::Find -> dynamic_cast<Item*>（`0x6e2328`）
+        0x551d89  两个都非空才 item->vf_d4(角色)
+
+    `Item::vf_d4`（`0x51f447`）：
+
+        if [item+0x2a9] == 0: vf_11c(角色)   ; 生效（CoinItem1 加钱、HeartItem 回血…）
+        vf_20()                              ; 从世界里删掉物件
+
+    服务端不需要知道这件是什么、值多少 —— 效果全在客户端本地算（§113 已经
+    确认拾取本身不再发任何包）。这里唯一的职责是**放行**。
+    """
+    return struct.pack(GET_ITEM_FORMAT, int(seat_id), int(instance_id))
+
+
+#: `0x0408`（客户端方向）/ `0x0406`（服务端方向）的**线上**布局。
+#:
+#: ★★ **和客户端栈对象的字段偏移不是一回事。** 序列化器 `0x558f16` 是逐字段
+#: 紧凑写的，所以线上是 `u32 句柄 | u8 座位 | u8 凶手 | i32 死亡次数 | f32 X | f32 Y`
+#: = 4+1+1+4+4+4 = 18 字节，**死亡次数在线偏移 6**；而客户端结构体里它在 `+0x08`
+#: （中间那两个字节是编译器的对齐填充）。
+#:
+#: 会话 15 在这里踩过一次：按 `+0x08` 去就地改包，实际改到了「死亡次数的高半边 +
+#: X 的低半边」，死亡次数变成六万多，客户端左下角状态面板算出的
+#: `剩余生命 = 最大生命 - 死亡次数` 成了大负数，`0x472527` 拿它当数组下标
+#: （`[心形数组 + esi*4] = 0`）当场越界 C0000005。
+#: **所以收发一律用这同一个格式串重新打包，不要手算偏移。**
+DEATH_REPORT_FORMAT = "<IBBiff"
+DEATH_REPORT_SIZE = struct.calcsize(DEATH_REPORT_FORMAT)
+
+
+def parse_report_hp_zero(payload):
+    """opcode 0x0408（客户端 -> 服务端，18 字节）—— 「某个角色 HP 归零了」。
+
+    **这是死亡链的第一环，不是遥测**（FINDINGS §108 推翻了「0x0408 语义未查明
+    但纯遥测」的旧记法）。整条链是：
+
+        HP<=0 (`0x50f778`)
+          -> `Character::OnHpZero` vft+0xd8 = `0x4ffab0`
+          -> `GameContext::vf_1c()` = `0x46e188` **恒返回 0**（闯关/对战/房间都是）
+             所以客户端**不会自己判死**，
+          -> `GameContext::ReportDeath` `0x493855` -> `0x558f16` 发本包
+          -> 等服务端回 `0x0406`（服务端方向 = 死亡广播）才真的倒下。
+
+    ★★ **线偏移和客户端结构体偏移不是一回事**，见 `DEATH_REPORT_FORMAT`：
+
+        线 +0x00  int32  角色对象句柄（[char+0xd0]），World::Find 用它找对象
+        线 +0x04  u8     座位号（[char+0x2ac]）；怪物是 0xff = -1
+        线 +0x05  u8     传给 `Character::Die()` 的参数（[char+0x158]，凶手 id；
+                         实测怪物打死是 0xff，掉岩浆/自杀是 0x00）
+        线 +0x06  int32  ★ **死亡次数**：`Character::vf_c0()` = `[char+0x600]`，
+                         也就是「我死之前已经死过几次」。见 build_broadcast_death
+        线 +0x0a  float  X
+        线 +0x0e  float  Y
+
+    返回一个 dict。长度不够就抛 ValueError。
+    """
+    if len(payload) < DEATH_REPORT_SIZE:
+        raise ValueError(f"0x0408 只有 {len(payload)} 字节，"
+                         f"至少要 {DEATH_REPORT_SIZE}")
+    # 句柄是不透明 id，按无符号读，日志里才好和探针读到的 [char+0xd0] 对上。
+    handle, seat, arg, deaths, x, y = struct.unpack_from(DEATH_REPORT_FORMAT,
+                                                         payload, 0)
+    return {"handle": handle, "seat": seat if seat < 0x80 else seat - 0x100,
+            "arg": arg, "deaths": deaths, "x": x, "y": y}
+
+
+def build_broadcast_death(handle=0, seat=0, arg=0, death_count=1):
+    """opcode 0x0406（服务端 -> 客户端）—— 死亡广播。
+
+    处理器 `0x4938d2`（由 `GameContext` 的包分发表 `0x493808` 在 opcode 0x406
+    这一格调过去；`ServerConnection::OnPacket` `0x54e036` 一进门就先问
+    `GameContext::vf_e0`，所以战斗中这个分发表优先于大厅/游戏跳表）：
+
+        u32 -> World::Find(句柄) 拿到角色对象，找不到就整包丢掉
+        u8  -> 座位号；0<=座位<6 时给 `[ctx+0x384]` 的战绩表记一次死亡（`0x48c942`）
+        u8  -> `Character::Die()` 的参数
+        u32 -> ★ `Character::vf_c4(n)` = `0x4ff1fd`：`[char+0x600] = n`
+
+    ★★ **`[char+0x600]` 就是 HUD 上那排心形的数据源**（§109）。
+    战绩面板 `0x4a49a4` 起画心形的公式是：
+
+        实心心形数 = GameContext::vf_a0(座位)      // = 最大生命，构造时填 3
+                   - Character::vf_c0()            // = [char+0x600]
+
+    所以**这个字段必须是「新的死亡次数」，也就是客户端报上来的值 +1**。
+    照抄回去（我们一开始就是这么干的）等于告诉客户端「你的死亡次数没变」，
+    心形就永远是 3 颗 —— 而 `[ctx+0x384]` 那份战绩表是 `0x48c942` **本地**加的，
+    所以「死 3 次判负」照常生效，只有显示不动。用户报的正是这个组合。
+
+    ★ 读侧只读 **10 字节**，写侧的 0x0408 是 18 字节。实际下发时我们把收到的
+    18 字节里这一格 +1 之后原样发回（多出来的 X/Y 客户端不读）。
+    """
+    return struct.pack("<IBBi", handle & 0xFFFFFFFF, seat & 0xFF, arg & 0xFF,
+                       death_count)
+
+
+def build_rep_quest_score(seat=0, score=0):
+    """opcode 0x0415 `gspUpdateQuestScore`（服务端 -> 客户端）—— 战绩面板的分数。
+
+    处理器 `0x4a3efe`（`GameContextQuest::vf_e0` 在基类不认时自己接的那一个）：
+
+        int32 座位  int32 分数
+        -> [GameContextQuest + 座位*4 + 0x3b8] = 分数     （面板读这里）
+        -> [QuestVictoryCondition + 座位*0x2c + 0x7c] = 分数
+        -> 0x55c2c8（刷新）
+
+    ★ **分数是累计值，不是增量。** 客户端侧 `0x4a414a` 先算
+    `[ctx+0x3b4] + 增量`，再把**新的累计值**交给 `0x4a40f8` 发 `0x0410`
+    （500 毫秒节流，节流掉的那次增量不会丢，下一发带着最新累计值）。
+    所以服务端把收到的数原样带座位发回去就对。
+    """
+    return w_i32(seat) + w_i32(score)
+
+
+def parse_req_change_to_next_map(payload):
+    """opcode 0x0411 `gcpReqChangeToNextMap`（客户端 -> 服务端）—— 换图请求。
+
+    载荷只有一个字段：**下一张地图的名字**（`u16 字符数 + UTF-16LE`，
+    序列化 `0x404f49` -> `0x5d5a5a`，和别处的 wstring 完全同一套编码）。
+
+    ★ **地图名是客户端自己查出来的**，服务端不需要（也没有）地图数据：
+    地图脚本喊 `nextmap` 时传的是空串，`LobbyStage::ReqChangeToNextMap`
+    (`0x4083e1`) 见到空串就走 `0x40841e`：先用 `0x405669` 取当前地图名
+    （`[LobbyStage+0x3fc]` 非空则用它，否则用 `Session` 里的 `[+0x10]`），
+    再用 `0x40b595` 在全局地图目录 `[0x72e3d8]` 里按名字查记录，
+    取 `记录+0x0c` = 下一张地图名填进包里。查不到就**根本不发包**。
+
+    所以服务端**原样回显这个名字**就是对的（同 D046 的思路）。
+    """
+    name = Reader(payload).wstr()
+    if not name:
+        # 客户端只在查到下一张地图时才发包，空名字说明我们把包读错了。
+        raise ValueError("0x0411 的地图名是空的")
+    return name
+
+
+def build_rep_change_to_next_map(map_name):
+    """opcode 0x0417 `gspRepChangeToNextMap`（服务端 -> 客户端）—— 放行换图。
+
+    处理器 `0x408526`（大厅分发链 `0x4062cd` 的 `0x0417` 那一格）：
+
+        反序列化 `0x419388` -> `0x5d5b3a`，一个 wstring = 新地图名
+        -> [LobbyStage+0x3f9] = 0     ★ 解除「等服务端」状态（鼠标沙漏消失）
+        -> [LobbyStage+0x3fa] = 0
+        -> 0x4083c9: [LobbyStage+0x3fc] = 地图名; [LobbyStage+0x400] += 1
+        -> 0x47900a: 卸掉六个座位的角色对象、起后台线程加载新地图
+
+    ⚠ **绝不能回显客户端的 `0x0411`** —— 服务端方向的同号包是
+    `gspEndGame`（结算），回显等于在关卡中途把玩家踢进结算界面。
+    """
+    return w_wstr(map_name)
+
+
+def parse_respawn_request(payload):
+    """opcode 0x0413 `gcpRespawnCharacter`（客户端 -> 服务端，16 字节）。
+
+    发送点 `0x553e48`，和服务端方向的 `0x0419` **共用同一个反序列化器**
+    `0x54c5d0`，所以线格式逐字相同：
+
+        int32 -> +0x00   角色 id（[char+0x2ac]）
+        int32 -> +0x04   X（客户端已用 ftol 把 float 截成整数）
+        int32 -> +0x08   Y
+        int32 -> +0x0c   重生点索引（[char+0x2b0]）
+
+    ★ **坐标由客户端自己算好报上来**（`0x4fe70e` 选的重生点），所以服务端
+    原样回显就一定落在本场景的合法位置 —— 会话 09 那次「写死 3225/635 把角色
+    传到地图边缘、23 毫秒后收到 `0x0106 gcpReportHack`」的坑（§88）从根上没了。
+    """
+    if len(payload) < 16:
+        raise ValueError(f"0x0413 只有 {len(payload)} 字节，至少要 16")
+    character_id, x, y, spawn_index = struct.unpack_from("<iiii", payload, 0)
+    return {"character_id": character_id, "x": x, "y": y,
+            "spawn_index": spawn_index}
+
+
+def build_respawn_character(character_id=0, x=DEFAULT_RESPAWN_X,
+                            y=DEFAULT_RESPAWN_Y, unknown=0):
+    """opcode 0x0419 —— `Packet_gspRespawnCharacter`（vft `0x6916b0`）。让角色重生。
+
+    反序列化 `0x54c5d0` 读 **4 个 int32**（全部 `0x5d59ff`）：
+
+        int32 -> +0x04   角色 / 座位 id
+        int32 -> +0x08   ★ X 坐标
+        int32 -> +0x0c   ★ Y 坐标
+        int32 -> +0x10   语义未查
+
+    处理器 `0x553ecc`（分发树 `0x54e3f6` → 这里）读完直接调
+    `[stage_vft+0xd4](id, (float)X, (float)Y, +0x10)`。
+
+    ★ **坐标在线上是整数**：客户端用 `fild` 把它们转成 float
+    （`0x553ee4` / `0x553ef5`），所以这里写 int32 而不是 IEEE754 float。
+    """
+    return w_i32(character_id) + w_i32(x) + w_i32(y) + w_i32(unknown)
+
+
+class StartGameHandshake:
+    """闯关房「F5 游戏开始」之后的开局握手（单客户端）。
+
+    返回值是一串 ``(opcode, payload)``，按顺序下发。
+
+    ## 这两个 opcode 都是「命令客户端换 stage」，不是普通应答
+
+    房间/游戏分发器 `0x54e036` 里：
+
+        0x0400 gspPrepareGame -> 0x551605
+            闯关（descriptor.type == 2）不走前面那段只对 type 1/5 生效的逻辑，
+            直接落到 `0x5517a3`：
+                inc [LobbyStage+0x3c] / mov [LobbyStage+4], 4 / call 0x407678
+                push 6 / pop edx / call 0x40e47f      ← ★ 切到 stage 6（准备/加载）
+        0x0402 -> 0x5517d0
+            记时间戳到 [LobbyStage+0x3dc]、清 [0x72e2cc]+0xf7c 的倒计时状态，然后
+                push 7 / pop edx / jmp 0x40e47f       ← ★ 切到 stage 7（游戏）
+
+    `0x40e47f` 就是 `0x54f820` 建房时用来切 RoomStage(5) 的那个函数。
+
+    ## 所以顺序是硬约束：先 6 后 7，一次只推一个 stage
+
+    会话 09 实测：第二个 0x0402 一到就回 `0x0402` + `0x0412`，客户端被直接踢进
+    stage 7，房间的座位角色对象（`[LobbyStage+0x1d0+i*4]`）随之销毁，而开局数据
+    从没下发，渲染路径解引用那个已经变成 NULL 的指针 -> `C0000005 @ 0x50a368`
+    （FINDINGS §82，探针 `logs/probe_s09b_seats.txt` 拍到对象从 0x20144020 变 0）。
+
+    现在改成第二个 0x0402 只回 **`0x0400`**，让客户端先进 stage 6 把关卡加载起来，
+    stage 7 等它加载完自己开口要（观测到下一批请求再决定发什么）。
+
+    ## 不发 `0x0412`
+
+    `0x0412` 在 `0x54e036` 的 `0x0405..0x0413` 跳表（`@0x54e5ae`）里映射到
+    `0x54e546` = **未处理**，客户端收到就丢。`build_rep_count_down` 先留着，
+    等确认它属于哪个 stage 的分发器再说。
+    """
+
+    WAIT_START = "wait_start"
+    WAIT_CONFIRM = "wait_confirm"
+    PREPARING = "preparing"
+    IN_GAME = "in_game"
+
+    def __init__(self, seed=0):
+        self.seed = seed
+        self.state = self.WAIT_START
+
+    def reset(self):
+        self.state = self.WAIT_START
+
+    def on_client_packet(self, opcode, payload):
+        if payload:
+            return []
+
+        if opcode == OP_COUNT_GAME_READY:
+            if self.state == self.WAIT_START:
+                self.state = self.WAIT_CONFIRM
+                return [(OP_TRIGGER_COUNT_GAME, build_trigger_count_game(0))]
+            if self.state == self.WAIT_CONFIRM:
+                self.state = self.PREPARING
+                return [(OP_PREPARE_GAME, build_prepare_game(self.seed))]
+            return []
+
+        # 客户端在 stage 6 把关卡加载到 100% 之后，每 5 秒发一次空 0x0403
+        # 轮询「可以开始了吗」（会话 09 实测：00:21:17 起每 5.02 秒一发）。
+        # 这时候才轮到 0x0402 —— 它把客户端切进 stage 7（游戏本体）。
+        # 只回第一发：客户端 0x5517f9 有 `cmp [stage+0x54], 7 / je` 的幂等保护，
+        # 重复发不会出错，但没必要。
+        if opcode == OP_LOADING_DONE and self.state == self.PREPARING:
+            self.state = self.IN_GAME
+            return [(OP_COUNT_GAME_READY, b"")]
+
+        return []
+
+
+def build_rep_user_list():
+    """opcode 0x020d —— 频道用户列表（空）
+
+    反序列化 `0x54d0d3`：int32 / string / string / int32(当 bool 用)
+    第一个 int32 == 0 时 `0x553c80` 的 je 会跳过后面整段列表处理。
+    """
+    return w_i32(0) + w_wstr("") + w_wstr("") + w_i32(0)
+
+
+# ----------------------------------------------------------------------------
+#: 详细日志开关（`--verbose`）。关掉时不打逐包 hexdump、不打「试解」、
+#: 不打下面 NOISY_OPCODES 里的高频战斗包。
+#:
+#: 为什么默认关（会话 14）：战斗中 `0x0406` 位置同步每秒好几发，每条都要
+#: hexdump + `print(flush=True)` + 文件 `flush()`。协议已经解完了，日常游玩
+#: 这些行没人看，只是在跟游戏抢磁盘 I/O、把日志撑到几十 MB。
+#: 排查协议问题时加 `--verbose` 就回到原来的全量行为。
+VERBOSE = False
+
+#: 战斗中每秒多发、且语义早已查明的包。非 verbose 时只在**第一次**出现时记一行，
+#: 之后静音（完全不记会让「客户端到底还在不在发」这种判断失去依据）。
+NOISY_OPCODES = {
+    0x0406,   # gcpCreateItem 掉落物请求（§105 之前是日志量最大的来源）。
+              #   ★ 静音的只是通用那行；on_create_item() 会另打「本局第一件」。
+              #   通关后的金币雨每 300 毫秒一发，真要逐件看得开 --verbose
+    0x0408,   # HP 归零上报。★ 静音的只是这行「★ 游戏包 …」通用行；
+              #   on_report_hp_zero() 每次都会另打两行可读的死亡日志（§108）
+    0x0407,   # gcpGetItem 拾取请求。★ 静音的只是通用那行；
+              #   on_get_item() 会另打「本局第一件」
+    0x0410,   # gcpUpdateQuestScore
+    0x0104,   # gcpRepPing
+}
+
+
+def ts():
+    return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+
+def hexdump(b, maxlen=512):
+    out = []
+    d = b[:maxlen]
+    for i in range(0, len(d), 16):
+        row = d[i:i + 16]
+        hx = " ".join(f"{x:02x}" for x in row)
+        asc = "".join(chr(x) if 0x20 <= x < 0x7F else "." for x in row)
+        out.append(f"    {i:04x}  {hx:<47}  |{asc}|")
+    if len(b) > maxlen:
+        out.append(f"    ... 还有 {len(b) - maxlen} 字节")
+    return "\n".join(out)
+
+
+_seq = 0
+_lock = threading.Lock()
+
+# ----------------------------------------------------------------------------
+# 调试控制通道
+# ----------------------------------------------------------------------------
+#: 活动连接表，最新的排在最后。控制通道默认操作最后一个（= 当前客户端）。
+_conns = []
+_conns_lock = threading.Lock()
+
+
+def register_conn(conn):
+    with _conns_lock:
+        _conns.append(conn)
+
+
+def unregister_conn(conn):
+    with _conns_lock:
+        if conn in _conns:
+            _conns.remove(conn)
+
+
+def latest_conn():
+    with _conns_lock:
+        return _conns[-1] if _conns else None
+
+
+class Conn:
+    def __init__(self, sock, addr, args):
+        global _seq
+        with _lock:
+            _seq += 1
+            self.seq = _seq
+        self.sock = sock
+        self.addr = addr
+        self.args = args
+        # 服务端视角：收 = 客户端的发送流，发 = 客户端的接收流
+        self.cin = SimpleCipher.client_to_server()
+        self.cout = SimpleCipher.server_to_client()
+        self.buf = bytearray()
+        self.got_version = False
+        self.accounts = AccountStore(args.accounts)
+        self.account_name = None
+        self.account = None
+        self.start_game = StartGameHandshake(seed=0)
+        # 我的座位号。建房时客户端把自己放在座位 0（0x54f807，FINDINGS §75）。
+        self.my_seat = 0
+        # gcpUpdateQuestScore(0x0410) 报上来的累计分数，结算时用。
+        self.quest_score = 0
+        # 本局是不是通关了。唯一来源是客户端的 0x0417 gcpMarkQuestSuccess ——
+        # 打死关底时关卡脚本调 GameContextQuest::vf_e4(1) 发出（0x4a3faa），
+        # 实测比 0x040f 早 30 秒到，所以结算时这个标志一定已经就位。
+        # 反过来「时间到 / 生命耗尽」那条路是 EndQuest() 之后才 vf_e4(0)
+        # （0x4a3dac -> 0x4a3dbd），到不了这里，正好也就是「未完成」。
+        self.quest_success = False
+        # 本局结算包是否已下发。只有发过之后收到的 0x0405 才当「结算看完了」。
+        self.settled = False
+        self.last_packet_at = time.time()
+        # 本局回了几次 0x0406 死亡广播 / 几次 0x0419 重生（只用来打日志编号）。
+        self.deaths_broadcast = 0
+        self.respawn_sent = 0
+        # 最近一次解析成功的建房请求（0x0201），下发 0x0303 时原样回显。
+        self.room = None
+        # 登录包第 2 个业务 int32 就是频道码，当前发 0（普通频道 0），
+        # 所以客户端一进大厅就停在「对战」标签页上。
+        self.channel_code = 0
+        self.channel_index = 0
+        # 战斗中客户端 0x0406 gcpCreateItem 自报的最后一个掉落点（float）。
+        # 掉落点就在角色/怪物脚下，所以拿它当控制通道 respawn 的兜底坐标是
+        # 合适的；正式重生走 0x0413 -> 0x0419 的回显，用不着它（§112 勘误：
+        # 这个包不是「位置同步」，只是它的第 2、3 个 dword 确实是坐标）。
+        self.last_position = None
+        # 掉落物实例句柄的分配器（gspCreatedItem 的第 1 个字段 -> [obj+0xd0]，
+        # World 拿它当 map 的 key）。关卡自己的物件句柄实测在 0x0010c9xx 一带，
+        # 起点拉到 0x40000000 就绝不会撞上。
+        self.next_item_handle = ITEM_HANDLE_BASE
+        self.items_created = 0
+        # 本局回了几次 0x0405 拾取放行（客户端每踩到一件掉落物发一发 0x0407）。
+        self.items_picked = 0
+        # 关卡内换图（§111）：已放行的地图名列表，和「当前是否有一次换图在飞」。
+        # pending 只用于日志和「0x0412 是不是我们预期的那一发」的判断。
+        self.maps_entered = []
+        self.map_change_pending = False
+        # 已经报过一次的高频 opcode（见 NOISY_OPCODES）。
+        self.noisy_seen = set()
+        self.ft = open(os.path.join(LOGDIR, f"game_{self.seq:03d}_27799.txt"),
+                       "w", encoding="utf-8")
+        # 抓包落盘只在 --verbose 下开：非 verbose 时连空文件都不建，
+        # 免得每跑一次游戏就在 logs/ 里多两个 0 字节文件。
+        if VERBOSE:
+            self.fb_raw = open(os.path.join(LOGDIR, f"game_{self.seq:03d}_27799.raw.bin"), "wb")
+            self.fb_dec = open(os.path.join(LOGDIR, f"game_{self.seq:03d}_27799.dec.bin"), "wb")
+        else:
+            self.fb_raw = self.fb_dec = None
+        # 控制通道的线程会从另一个线程调 send()，加密流是有状态的，必须串行化。
+        self.send_lock = threading.Lock()
+        register_conn(self)
+
+    def log(self, msg):
+        line = f"[{ts()}] #{self.seq} {msg}"
+        print(line, flush=True)
+        self.ft.write(line + "\n")
+        self.ft.flush()
+
+    def vlog(self, msg):
+        """逐包细节（hexdump / 字段试解）。只在 `--verbose` 时落盘。"""
+        if VERBOSE:
+            self.log(msg)
+
+    def send(self, plain):
+        # SimpleCipher 是逐字节推进的流密码：两个线程交错加密会让整条流错位，
+        # 客户端从此再也解不回来。控制通道存在之后这不再是理论风险。
+        with self.send_lock:
+            self.vlog(f"→ 发出 {len(plain)} 字节明文\n{hexdump(plain)}")
+            self.sock.sendall(self.cout.encrypt(plain))
+
+    def send_update_session(self, map_name=""):
+        """把当前房间的 `Session` 下发给客户端（opcode 0x0303）。
+
+        没解出建房请求就不发：这个包的唯一作用就是把请求里那份描述符原样
+        灌回客户端，凭空编一个类型只会让客户端进错房间面板。
+
+        `map_name` 只有在**回应 0x0302** 时才填。建房那一次必须留空，
+        理由见 `build_update_session` 的文档。
+        """
+        if self.room is None:
+            self.log("   没有已解析的建房请求; 不下发 0x0303")
+            return
+        try:
+            payload = build_update_session(
+                self.room["session_type"],
+                self.room["arguments"],
+                title=self.room["texts"][0],
+                map_name=map_name,
+            )
+        except ValueError as error:
+            self.log(f"   无法下发 0x0303: {error}")
+            return
+        self.log(
+            f"← 回 0x0303 Session(type={self.room['session_type']} "
+            f"({self.room['session_type_name']}) args={self.room['arguments']} "
+            f"title={self.room['texts'][0]!r} map={map_name!r})")
+        self.send(build_game(OP_UPDATE_SESSION, payload))
+
+    def send_session_members(self, host_seat=0):
+        """把房间座位快照下发给客户端（opcode 0x0300）。
+
+        客户端建房时只自己写了「座位 0 已占用」和房主座位号，昵称/等级等
+        字段一个都没填（`0x54f807` 起的三条指令）。房间里按「F5 游戏开始」
+        时的准入检查读的正是**房主座位里的等级**，所以不发这个包就一定弹
+        「等级太低，无法选择任务。」——与 `gspRepLogin` 下发的账号等级无关
+        （FINDINGS §75、§77）。
+
+        目前只有本机一个玩家，固定占座位 0；其余五个座位发「空且未关闭」，
+        这样 `0x556f40` 数出来的空位数与客户端 `0x0302` 自报的 6 一致。
+        """
+        level = player_level(self.account)
+        nickname = display_name(self.account) or (self.account_name or "")
+        character = player_character(self.account)
+        seats = [{"occupied": False}] * ROOM_SEAT_COUNT
+        seats[host_seat] = {
+            "occupied": True,
+            "nickname": nickname,
+            "level": level,
+            "character_id": character,
+        }
+        self.log(f"← 回 0x0300 房间座位快照(host_seat={host_seat} "
+                 f"nickname={nickname!r} level={level} 角色={character})")
+        self.send(build_game(OP_SESSION_MEMBERS,
+                             build_session_members(host_seat, seats)))
+
+    def on_seat_change(self, payload):
+        """客户端方向的 `0x0301` —— 房间里点「人物选择」换角色。
+
+        客户端把改好的整个座位报上来之后**自己不动**，等服务端广播。
+        服务端存下角色 id，再用 action 4 把同一个座位发回去，客户端才会
+        换掉中下那个 3D 预览并播一行聊天（FINDINGS §103）。
+
+        座位里除角色 id 以外的字段以服务端为准（昵称/等级来自存档），
+        免得客户端自报的旧值把数据栏刷回去。
+        """
+        try:
+            seat_index, slot = parse_seat_change_request(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   换角色请求解析失败: {error}; 不回包")
+            return
+        character = slot.get("character_id", 0)
+        self.log(f"   换角色: 座位 {seat_index} -> 角色 id {character} "
+                 f"(昵称={slot.get('nickname')!r} 等级={slot.get('level')})")
+        if not slot.get("occupied"):
+            self.log("   座位未占用; 不回包")
+            return
+        if self.account_name:
+            try:
+                self.account = self.accounts.set_character(self.account_name,
+                                                           character)
+            except KeyError:
+                self.log(f"   存档里没有账号 {self.account_name!r}; 只广播不记账")
+        # 单客户端后台里，这是唯一一个「客户端主动告诉服务端自己坐在几号位」
+        # 的包，顺手校准一下（建房时客户端固定把自己放在座位 0，§75）。
+        self.my_seat = seat_index
+        self.log(f"← 回 0x0301 座位变更(action=4 换角色, 座位={seat_index}, "
+                 f"角色={player_character(self.account)})")
+        self.send(build_game(OP_SESSION_MEMBER_UPDATE, build_session_member_update(
+            seat_index,
+            SEAT_ACTION_CHANGE_CHARACTER,
+            occupied=True,
+            nickname=display_name(self.account) or (self.account_name or ""),
+            level=player_level(self.account),
+            character_id=player_character(self.account),
+        )))
+
+    def reload_account(self):
+        """从盘上重读当前账号。用户手改 accounts.json 之后不必重登游戏。"""
+        if not self.account_name:
+            return
+        name, account = self.accounts.get_account(self.account_name)
+        if account is not None:
+            self.account_name, self.account = name, account
+
+    def send_rep_money(self, reason=""):
+        """把存档里的金币/经验/等级下发（opcode 0x0600）。
+
+        登录包带不动金币（`0x54f2cc` 不写 `0x72e330`），所以每次要让右上角
+        玩家数据栏和存档对齐，都得补这一发。
+        """
+        experience = player_experience(self.account)
+        level_start_exp, next_level_exp = experience_bounds(experience)
+        self.log(f"← 回 gspRepMoney(金币={player_money(self.account)} "
+                 f"经验={experience} 本级 {level_start_exp}..{next_level_exp} "
+                 f"等级={player_level(self.account)}){reason}")
+        self.send(build_game(OP_REP_MONEY, build_rep_money_for(self.account)))
+
+    def on_first_user_result(self, payload):
+        """客户端跑完新手教程后上报的进度值，落盘到 accounts.json。"""
+        try:
+            progress = parse_first_user_result(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   教程进度上报解析失败: {error}; 不记账")
+            return
+        if not self.account_name:
+            self.log(f"   教程进度 {progress} 无账号可记")
+            return
+        try:
+            self.account = self.accounts.set_tutorial_progress(
+                self.account_name, progress)
+        except KeyError:
+            self.log(f"   存档里没有账号 {self.account_name!r}；教程进度未记账")
+            return
+        self.log(f"   ★ 教程完成上报 progress={progress} -> 存档 "
+                 f"tutorial_completed={self.account['tutorial_completed']} "
+                 f"(下次登录下发状态 {tutorial_state(self.account)})")
+
+    def respawn_position(self):
+        """重生用的整数坐标。优先用客户端最近一次 `0x0406` 报的位置。
+
+        `gspRespawnCharacter` 的坐标在线上是 int32（客户端 `fild` 转 float），
+        而 `0x0406` 报的是 float，所以这里要截成整数。
+        """
+        if self.last_position is None:
+            return (DEFAULT_RESPAWN_X, DEFAULT_RESPAWN_Y)
+        x, y = self.last_position
+        return (int(x), int(y))
+
+    def on_report_hp_zero(self, payload):
+        """0x0408「我 HP 归零了」-> 回 0x0406 死亡广播，角色这才真的倒下。
+
+        ★ **这是「血量归零后角色不死、卡住不能操作」的根治点**（§108）。
+        在此之前服务端从来没回过这个包，`Character::OnHpZero` 报完就一直等，
+        `[char+0x2b4]`（死亡标记）永远是 0，于是既不播死亡动画、也不进 5 秒
+        重生倒计时，角色就冻在原地 —— 掉进岩浆同理（岩浆只是另一种伤害源）。
+
+        回显策略：**把收到的 18 字节里的「死亡次数」那一格 +1，其余原样发回**。
+        真服务器在这里是广播给房间里所有人（自己也收得到），而死亡次数是由
+        服务端定的权威值 —— 客户端报的是「我死之前死过几次」，服务端回的是
+        「你现在死了几次」。**这一格就是 HUD 心形的数据源**（§109），
+        照抄回去心形就永远不减少。
+        """
+        if getattr(self.args, "no_death_reply", False):
+            self.log("   [no-death-reply] 收到 0x0408 但不回死亡广播")
+            return
+        try:
+            info = parse_report_hp_zero(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   0x0408 解析失败: {error}；不回死亡广播")
+            return
+        seat = info["seat"]
+        who = f"玩家座位 {seat}" if 0 <= seat < 6 else f"NPC/怪物 (座位={seat})"
+        deaths = info["deaths"] + 1
+        # ★ 用**和解析同一个格式串**重新打包，别去手算「死亡次数在第几字节」——
+        #   线上是紧凑的（死亡次数在偏移 6），客户端结构体里却在 +0x08，
+        #   按后者去改包会写坏 X 并把死亡次数冲成六万多，客户端当场越界崩溃。
+        reply = struct.pack(DEATH_REPORT_FORMAT, info["handle"],
+                            info["seat"] & 0xFF, info["arg"], deaths,
+                            info["x"], info["y"])
+        self.deaths_broadcast += 1
+        self.log(f"   HP 归零上报: {who} 句柄=0x{info['handle']:08x} "
+                 f"凶手={info['arg']} 死亡次数={info['deaths']} "
+                 f"位置=({info['x']:.0f}, {info['y']:.0f})")
+        self.log(f"← 回 0x0406 死亡广播（第 {self.deaths_broadcast} 次）"
+                 f" 死亡次数 -> {deaths}"
+                 f" —— 客户端收到才会调 Character::Die()，心形也靠它减")
+        self.send(build_game(OP_BROADCAST_DEATH, reply))
+
+    def on_respawn_request(self, payload):
+        """0x0413 gcpRespawnCharacter -> 原样回 0x0419，角色在自报的位置复活。
+
+        角色倒下 5 秒后（`Die()` 在 `0x5019a8` 写 `[char+0x2d8] = now + 5000`），
+        每帧的 `0x4fe78f` 走到 `0x4fe8d7` 发这个包。**坐标是客户端自己选好的
+        重生点**（`0x4fe70e` -> `[char+0x2b0]`），所以原样回显一定合法，
+        不会再出现 §88 那种「传送到地图边缘 + 0x0106 gcpReportHack」。
+        """
+        try:
+            info = parse_respawn_request(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   0x0413 解析失败: {error}；不回重生包")
+            return
+        self.respawn_sent += 1
+        self.log(f"   重生请求: id={info['character_id']} "
+                 f"坐标=({info['x']}, {info['y']}) "
+                 f"重生点索引={info['spawn_index']}")
+        self.log(f"← 回 gspRespawnCharacter(0x0419) 原样回显"
+                 f"（第 {self.respawn_sent} 次）")
+        self.send(build_game(OP_RESPAWN_CHARACTER, build_respawn_character(
+            info["character_id"], info["x"], info["y"], info["spawn_index"])))
+
+    def on_req_change_to_next_map(self, payload):
+        """0x0411「我要去下一张地图」-> 原样回 0x0417，客户端这才开始换图。
+
+        ★ **这是「走到地图最右边角色卡住、鼠标变沙漏」的根治点**（§111）。
+        在此之前服务端从来没回过这个包：客户端 `0x4083e1` 发完请求就把
+        `[LobbyStage+0x3f9]` 置 1 表示「等服务端」，然后什么都不做地等 ——
+        角色不能操作、光标停在等待状态，和「血量归零不死」是同一类病
+        （§108：客户端把判定交给服务端，而我们没接）。
+
+        回显策略：**把客户端自报的地图名原样发回去**。下一张地图叫什么
+        只有客户端的地图目录知道（服务端手上没有任何地图数据），
+        这和死亡/重生用的是同一条理由（D046）。
+        """
+        try:
+            map_name = parse_req_change_to_next_map(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   0x0411 解析失败: {error}；不回换图应答")
+            return
+        self.maps_entered.append(map_name)
+        self.map_change_pending = True
+        self.log(f"   换图请求: 下一张地图 = {map_name!r}"
+                 f"（本局第 {len(self.maps_entered)} 次换图）")
+        self.log("← 回 gspRepChangeToNextMap(0x0417) 原样回显 —— "
+                 "客户端收到才会卸场景、加载新地图")
+        self.send(build_game(OP_REP_CHANGE_TO_NEXT_MAP,
+                             build_rep_change_to_next_map(map_name)))
+
+    def on_map_loading_done(self):
+        """0x0412「新地图加载完了」-> 回 0x0418，客户端才从加载画面里出来。
+
+        换图流程 `0x47900a` 起一个后台线程去加载地图，主线程在
+        `0x47928d..0x479628` 的加载循环里泵消息、画进度，**加载完成之后**
+        每 5 秒发一次这个空包，直到 `[LobbyStage+0x3fa] != 0` 才退出循环。
+        那个标志位只有服务端方向的 `0x0418`（处理器 `0x406302`）会置。
+
+        ★ **必须等这一发轮询到了再放行，不能在 0x0417 后面顺手把 0x0418
+        一起发出去**：加载循环是 `do-while` 的**前置**判断（`0x47961d`），
+        标志位要是在进循环前就被置 1，客户端会直接跳过整段加载等待，
+        而后台加载线程还在跑 —— 这正是 D035「一次只推一个 stage、
+        且必须等客户端报到」要防的那类事故。
+        """
+        if not self.map_change_pending:
+            # 没有换图在飞时收到它，说明我们对触发条件的理解有偏差。照样放行
+            # （这个包只是置一个在换图期间才有意义的标志），但把它记下来。
+            self.log("   收到 0x0412 但本地没有记录在飞的换图；仍然放行")
+        self.map_change_pending = False
+        self.log("← 回 0x0418（空包）—— 置 [LobbyStage+0x3fa]=1，"
+                 "客户端退出换图加载循环")
+        self.send(build_game(OP_MAP_CHANGE_READY))
+
+    def on_create_item(self, payload):
+        """0x0406 `gcpCreateItem`「在这里生成一个掉落物」-> 回 0x0404，它才落地。
+
+        ★ 这条链和 §108（血量归零不死）、§111（换图卡住）是同一个形状：
+        **闯关模式的物件生成判定也在服务端**，客户端把「掉什么、掉在哪、
+        初速多少」算好报上来就干等，我们从来没接过 —— 所以打死怪不掉东西、
+        通关后也没有那阵金币雨。
+
+        修法同 D046：**原样回显 + 补一个服务端分配的实例句柄**。
+        服务端手上没有、也不需要有任何物件数据。
+        """
+        try:
+            fields = parse_create_item(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   0x0406 gcpCreateItem 解析失败: {error}；不回掉落应答")
+            return
+        item_id, x, y = fields[0], fields[1], fields[2]
+        # 掉落点在角色/怪物脚下，拿来当 respawn 的兜底坐标是合适的。
+        self.last_position = (x, y)
+        handle = self.next_item_handle
+        self.next_item_handle += 1
+        self.items_created += 1
+        name = ITEM_NAMES.get(item_id, "未知物件")
+        self.vlog(f"   掉落请求: {item_id} {name} @ ({x:.0f}, {y:.0f}) "
+                  f"速度=({fields[3]:.0f}, {fields[4]:.0f})")
+        if self.items_created == 1 or VERBOSE:
+            self.log(f"← 回 gspCreatedItem(0x0404) 句柄=0x{handle:08x} "
+                     f"物件={item_id} {name} @ ({x:.0f}, {y:.0f})"
+                     + ("" if VERBOSE else "（本局第一件，后续同类静音）"))
+        self.send(build_game(OP_CREATED_ITEM, build_created_item(handle, fields)))
+
+    def on_get_item(self, payload):
+        """0x0407 `gcpGetItem`「我踩到这件了」-> 回 0x0405，客户端才真的捡起来。
+
+        ★ 这是 §108（血量归零不死）、§111（换图卡住）、§113（打死怪不掉东西）
+        之后的**第四条同形状的链**：判定在服务端，客户端报完就等着。
+        掉落物在会话 17 已经能掉出来了，但走上去捡不起来 —— 缺的就是这一环。
+
+        比前三条更难忍的地方在于 `Character::CheckItemPickup`（`0x5154d3`）
+        发完包就把 `[item+0x2a8]` 置 1，**同一件东西一局只报一次**。
+        所以服务端漏回不是「这次没捡到，再走一遍」，而是那件东西作废了。
+
+        修法同 D046：**原样回显**。服务端不查距离、不判归属、不算效果 ——
+        碰撞是客户端算的，物品效果也是客户端算的（§113 已经确认拾取不再发包）。
+        """
+        try:
+            seat_id, handle = parse_get_item(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   0x0407 gcpGetItem 解析失败: {error}；不回拾取放行")
+            return
+        self.items_picked += 1
+        if self.items_picked == 1 or VERBOSE:
+            self.log(f"← 回拾取放行(0x0405) 座位={seat_id} "
+                     f"句柄=0x{handle & 0xffffffff:08x}"
+                     + ("" if VERBOSE else "（本局第一件，后续静音）"))
+        self.send(build_game(OP_PICKED_ITEM, build_picked_item(seat_id, handle)))
+
+    def on_mark_quest_success(self, payload):
+        """0x0417 `gcpMarkQuestSuccess`「这一关我打通了」—— 只记，不回。
+
+        关卡脚本打死关底时调 `GameContextQuest::vf_e4(1)`（`0x4a3faa`），
+        载荷是一个 bool（线上 4 字节）。发送点有 `[ctx+0x558]` 保证一局只发一次。
+
+        实测（岩浆巨龙真通关）：boss 倒下后 43 毫秒就到，比 `0x040f gcpEndQuest`
+        **早整整 30 秒**（中间是金币雨），所以结算时这个标志一定已经就位。
+        「时间到 / 生命耗尽」那条路相反 —— `0x4a3dac` 先 `EndQuest()` 再
+        `vf_e4(0)`，赶不上结算，于是自然就是「未完成」。两条路都对。
+
+        ★ 服务端方向的同号包是 `gspRepChangeToNextMap`（换图放行），
+        **绝对不能回显**，否则会在关卡结束时触发一次换图（D028）。
+        """
+        try:
+            self.quest_success = bool(Reader(payload).i32())
+        except ValueError:
+            # 载荷形状不对时保守当作没通关，别把「未完成」误报成「完成」。
+            self.log("   0x0417 载荷解析失败；本局按未通关处理")
+            return
+        self.log(f"   客户端报 gcpMarkQuestSuccess({self.quest_success}) —— "
+                 f"结算界面的「完成 / 未完成」标签认这个")
+
+    def send_end_game(self, success=None):
+        """结算这一局：把所得记进存档，再把新的经验/金币下发（0x0411）。
+
+        奖励取客户端 `0x0410 gcpUpdateQuestScore` 报上来的**累计分数**
+        （实测一局 4→12→…→64）。真服务器怎么换算不可知，这里 1 分 = 1 点经验
+        = 1 金币，够让「打一局有长进」这件事成立；要调直接改这里。
+
+        存档写在下发**之前**：客户端拿到的必须是已经入账的总经验，
+        否则重登一次就退回去了（D024，JSON 是真源）。
+
+        ★ 先发 `0x0309 gspRepGameResult` 再发 `0x0411`（§99）。前者把本局增量
+        写进 GameContext 供结算界面显示，后者结束关卡并更新数据栏。顺序反了
+        或者漏掉前者，结算界面就构造得出来却不显示。
+
+        `success` 默认取本局的 `quest_success`（客户端 `0x0417` 报的），
+        它同时决定 `0x0309` 尾部数组里自己那一格填不填 1 ——
+        **结算界面的「完成 / 未完成」只认那一格**（§112）。
+        """
+        if success is None:
+            success = self.quest_success
+        score = max(0, int(self.quest_score))
+        if self.account_name:
+            try:
+                self.account = self.accounts.add_quest_reward(
+                    self.account_name, experience=score, money=score)
+            except KeyError:
+                self.log(f"   存档里没有账号 {self.account_name!r}；奖励未入账")
+        experience = int((self.account or {}).get("experience", 0))
+        level_start_exp, next_level_exp = experience_bounds(experience)
+        values = build_end_game_values(
+            experience=experience,
+            next_level_exp=next_level_exp,
+            level_start_exp=level_start_exp,
+            money_gained=score,
+            score=score,
+        )
+        # 结算界面的数据源，必须排在 0x0411 之前，且只能在 GameContext 还活着
+        # 的时候发（§99）。
+        #   · 业务值 9/10/11 = 界面上「经验值 / 金币 / 竞技场分数」三行的 +N
+        #     （§116）。闯关模式没有天梯分，第三格发 0。其余 9 个仍按 D019 填 0
+        #     —— §100 那次「12 个值一次全填」会让客户端 20 毫秒内断链。
+        #   · 尾部数组自己那一格 = 1 才写「完成」（§112）。
+        result_values = build_game_result_values(experience=score, money=score)
+        tail = build_game_result_tail(self.my_seat, success)
+        self.log(f"← 回 gspRepGameResult(seat={self.my_seat}, "
+                 f"{'完成' if success else '未完成'}) —— 结算界面数据源"
+                 f"（经验值 +{score} / 金币 +{score} / 竞技场分数 +0）")
+        self.send(build_game(OP_REP_GAME_RESULT,
+                             build_rep_game_result(self.my_seat,
+                                                   values=result_values,
+                                                   tail=tail)))
+        self.log(f"← 回 gspEndGame(seat={self.my_seat}, success={success}, "
+                 f"本局分数={score} -> 总经验={experience} "
+                 f"(本级 {level_start_exp}..{next_level_exp}) 本局金币={score})")
+        self.send(build_game(OP_END_GAME,
+                             build_end_game(self.my_seat, success, values)))
+        self.settled = True
+
+    def leave_session(self):
+        """离开房间：回 `0x0203 result=0`，客户端自己切回大厅（FINDINGS §101）。
+
+        `0x0203`（客户端方向）只有一个发送点 `0x406191`，四个调用方共用：
+
+        * `0x46739c` —— RoomStage 的「90 秒没动作」提示框弹完顺手发的
+        * `0x4a50f4` / `0x4a5a85` —— 房间里的退出/ESC
+        * `0x54be4c` —— 网络层的状态处理
+
+        也就是说**「挂机踢出」和「玩家自己退房」发的是同一个空包**，
+        服务端无法区分，也不需要区分：两种情况都该让客户端回大厅。
+
+        不回的后果（会话 12 实测）：客户端留在房间里，`RoomStage::Update`
+        每 90 秒重新弹一次提示框，弹出来的框一个摞一个 ——
+        用户看到的就是「点确认没反应、关不掉」。
+        """
+        self.log("← 回 gspRepLeaveSession(result=0) —— 离开房间，客户端切回大厅")
+        self.send(build_game(OP_LEAVE_SESSION, build_rep_leave_session(0)))
+        # 房间没了，跟房间绑定的状态全部作废，否则下次建房会带着上一局的残留。
+        self.room = None
+        self.reset_quest_state()
+        self.start_game.reset()
+
+    def leave_game_result(self):
+        """结算界面看完了：切回房间，再把玩家数据栏刷成存档里的值。
+
+        ★ **回房间后金币会变成 0**（会话 11 实测，§100）—— 经验和等级都还在，
+        唯独金币这一格被清掉。补一发 `0x0600` 就好了，顺带也让经验/等级和存档
+        重新对齐一次。
+        """
+        self.log("← 回 0x0403（结算看完 -> 切回 stage 5 房间）")
+        self.send(build_game(OP_LOADING_DONE, b""))
+        self.send_rep_money(reason="（回房间后金币会被清 0，重新同步）")
+        # 回到房间就可以再开一局，把开局状态机和本局的关卡状态复位。
+        self.reset_quest_state()
+        self.start_game.reset()
+
+    def reset_quest_state(self):
+        """把「跟这一局关卡绑定」的状态全部清掉，准备下一局。
+
+        ★ `quest_success` 一定要清：不清的话打通一次之后，后面每一局
+        （哪怕是被时间耗光的）结算界面都会挂着「完成」。
+        `items_created` / `items_picked` 只影响日志的「本局第一件」判断。
+        """
+        self.settled = False
+        self.quest_success = False
+        self.quest_score = 0
+        self.maps_entered = []
+        self.map_change_pending = False
+        self.items_created = 0
+        self.items_picked = 0
+
+    # -- 帧处理 ------------------------------------------------------------
+    def on_game_packet(self, opcode, payload):
+        self.last_packet_at = time.time()
+        name = GCP_NAMES.get(opcode, "?")
+        # 高频包非 verbose 时只报第一次，之后静音 —— 应答逻辑照常走，只是不记。
+        noisy = opcode in NOISY_OPCODES and not VERBOSE
+        if not noisy or opcode not in self.noisy_seen:
+            self.log(f"★ 游戏包 opcode=0x{opcode:04x} ({name}) 载荷 {len(payload)} 字节"
+                     + (f"\n{hexdump(payload)}" if VERBOSE else
+                        "（高频包，后续同号静音；--verbose 可全记）" if noisy else ""))
+        self.noisy_seen.add(opcode)
+        # 试着按 "string + int32*" 解一下（gcpReqLogin 0x0100 就是这个形状）
+        try:
+            r = Reader(payload)
+            s = r.wstr()
+            ints = []
+            while r.left() >= 4:
+                ints.append(r.i32())
+            self.vlog(f"   试解: str={s!r} ints={ints} 剩余={r.left()}")
+        except Exception as e:
+            self.vlog(f"   试解失败: {e}")
+
+        if self.args.hold_lobby:
+            self.log("   [hold-lobby] 不回应答")
+            return
+        if opcode == 0x0100:
+            try:
+                ticket = Reader(payload).wstr()
+            except Exception:
+                ticket = ""
+            self.account_name, self.account = self.accounts.resolve_game_login(ticket)
+            if self.account is None:
+                # 正常启动顺序里认证服一定先写 active_account；保底仍允许本地进入。
+                self.account_name = "local"
+                self.account = self.accounts.login(self.account_name, "")
+            state = tutorial_state(self.account)
+            self.log(f"← 回 gspRepLogin(result={self.args.login_result}) "
+                     f"账号={self.account_name!r} stored_level={self.account.get('level', 1)} "
+                     f"经验={player_experience(self.account)} "
+                     f"金币={player_money(self.account)} "
+                     f"tutorial_completed={self.account.get('tutorial_completed', False)} "
+                     f"(客户端状态={state})")
+            payload = build_gsp_rep_login(self.args.login_result, self.account,
+                                          self.channel_code, self.channel_index)
+            self.send(build_game(OP_REP_LOGIN, payload))
+            # 登录包带得动等级和经验，唯独带不动金币（`0x54f2cc` 不写 0x72e330）。
+            # 补一发 0x0600，右上角数据栏才和存档完全一致。
+            self.send_rep_money(reason="（登录后补发，登录包没有金币字段）")
+        elif opcode == 0x0200:
+            self.log("← 回 gspRepListSession（空房间列表）")
+            self.send(build_game(0x0200, build_rep_list_session()))
+        elif opcode == 0x0201:
+            self.start_game.reset()
+            self.room = None
+            self.reset_quest_state()
+            try:
+                self.room = parse_create_session_request(payload)
+                self.log(
+                    "   建房参数: "
+                    f"type={self.room['session_type']} "
+                    f"({self.room['session_type_name']}) "
+                    f"texts={self.room['texts']!r} option={self.room['option']} "
+                    f"args={self.room['arguments']}; 开局状态机已重置"
+                )
+            except ValueError as error:
+                # Keep the minimal successful reply while logging an exact
+                # diagnostic. This preserves compatibility with an unobserved
+                # regional packet variant without hiding the mismatch.
+                self.log(f"   建房参数解析失败: {error}; 开局状态机仍已重置")
+            # ★ 顺序是硬约束：0x0303 必须排在 0x0201 应答**之前**。
+            # 建房应答处理器 0x54f747 在 0x54f875 处直接读 [LobbyStage+0x1c]
+            # 决定建哪个房间面板；`LobbyStage` 构造函数 0x4052ff 把它初始化成
+            # -1，客户端自己永远不会填。先回 0x0201 的话，那一刻描述符还是
+            # -1，客户端就会建 PvP 面板，其每帧刷新拿 -1 去索引模式名表读到
+            # 空指针，约 5 秒后 C0000005 崩溃（FINDINGS §64 / §65）。
+            self.send_update_session()
+            self.log("← 回 gspRepCreateSession(result=0, session_id=1)")
+            self.send(build_game(0x0201, build_rep_create_session(1)))
+            # 反过来，座位快照必须排在 0x0201 **之后**：0x54f815 会把座位 0
+            # 的角色 id 清零，先发就被冲掉。
+            self.send_session_members()
+        elif opcode == OP_SESSION_MEMBER_UPDATE:
+            self.on_seat_change(payload)
+        elif opcode == OP_LEAVE_SESSION:
+            self.leave_session()
+        elif opcode == OP_CHANGE_SESSION:
+            try:
+                request = parse_change_session_request(payload)
+            except ValueError as error:
+                self.log(f"   换房请求解析失败: {error}; 不回包")
+                return
+            self.log(
+                "   换房参数: "
+                f"type={request['session_type']} "
+                f"({request['session_type_name']}) "
+                f"texts={request['texts']!r} args={request['arguments']} "
+                f"free_slots={request['free_slots']} flags={request['flags']}"
+            )
+            # 客户端在这里把它选定的地图名提交上来，服务端把整份 Session
+            # 广播回去，房间的「选择地图」面板才会显示出关卡。此时地图名
+            # 必须非空 —— 建房那一次留空的约束只针对 0x0201 那一步。
+            if self.room is None:
+                self.log("   没有已解析的建房请求; 不回 0x0303")
+                return
+            self.room = dict(self.room,
+                             session_type=request["session_type"],
+                             arguments=request["arguments"])
+            self.send_update_session(map_name=request["texts"][1])
+        elif opcode == OP_MOVE_CHANNEL_BY_GAME_TYPE:
+            try:
+                game_type = parse_move_channel_by_game_type(payload)
+            except ValueError as error:
+                self.log(f"   切频道请求解析失败: {error}; 不回包")
+                return
+            name = GAME_TYPE_NAMES.get(game_type, "unknown")
+            channel_code = GAME_TYPE_CHANNEL_CODES.get(game_type)
+            if channel_code is None:
+                # 类型 6（练习标签）没有任何频道码能映射回来，服务端无法
+                # 把客户端移进去。回失败包只会弹原版韩文错误框，不如不回。
+                self.log(f"   请求游戏类型 {game_type} ({name}) 没有对应频道码; 不回包")
+                return
+            self.channel_code = channel_code
+            self.log(f"   请求游戏类型 {game_type} ({name}) -> 频道码 {channel_code}")
+            self.log(f"← 回 gspRepMoveInto(ok=1, channel_code={channel_code}, "
+                     f"channel_index={self.channel_index})")
+            self.send(build_game(
+                OP_REP_MOVE_INTO,
+                build_rep_move_into(True, channel_code, self.channel_index)))
+        elif opcode == 0x020d:
+            self.log("← 回 0x020d（空用户列表）")
+            self.send(build_game(0x020d, build_rep_user_list()))
+        elif opcode == OP_REQ_FIRST_USER_RESULT:
+            # 教程跑完了。客户端自己已经切回大厅并更新了本地状态，服务端只负责
+            # 把它记进存档，这样下次登录就不会再被强制拉去教学（见 parse_ 的注释）。
+            self.on_first_user_result(payload)
+        elif opcode == 0x0311:
+            self.log("← 回 gspRepQuestRecordInPvp（6 项空记录）")
+            self.send(build_game(0x0311, build_rep_quest_record_in_pvp()))
+        elif opcode == OP_END_QUEST:
+            # 关卡结束（倒计时归零或通关）。客户端只把事件报上来就等着，
+            # 服务端不回 0x0411 的话关卡永远停在原地不进结算页（FINDINGS §86）。
+            # 绝不能回显 0x040f —— 它的服务端方向在 0x54e5ae 跳表里是未处理。
+            self.send_end_game()
+        elif opcode == OP_LEAVE_RESULT:
+            # 客户端在结算界面上停留约 9 秒后发这个空包（会话 11 实测：0x0411
+            # 之后 9 秒整）。只有结算包已经发过时才当「看完了」——服务端方向的
+            # 同号 0x0405 是另一回事（`0x551d35` 读两个 int32 再调角色对象的
+            # vft+0xd4），别把这里的判断放宽。
+            if self.settled:
+                self.leave_game_result()
+            else:
+                self.log("   收到 0x0405 但本局还没结算过；不动作")
+        elif opcode == OP_CREATE_ITEM:
+            # 客户端方向的 0x0406 = gcpCreateItem（掉落物请求，§112）。
+            # ★ 回的是 **0x0404 gspCreatedItem**，绝不能回显同号 ——
+            # 服务端方向的 0x0406 是死亡广播，回显等于随机杀角色（D028）。
+            self.on_create_item(payload)
+        elif opcode == OP_GET_ITEM:
+            # 客户端方向的 0x0407 = gcpGetItem（拾取请求，§115）。
+            # 回的是 **服务端方向的 0x0405**（和 rawLeaveGameResult 同号，
+            # 但那是客户端方向的空包，两者只靠方向区分）。
+            # 不回 = 那件掉落物作废，因为客户端已经把它标成「已上报」了。
+            self.on_get_item(payload)
+        elif opcode == OP_MARK_QUEST_SUCCESS:
+            # 「这一关打通了」。只记不回：服务端方向的同号 0x0417 是换图放行。
+            self.on_mark_quest_success(payload)
+        elif opcode == OP_REQ_CHANGE_TO_NEXT_MAP:
+            # 关卡内换图。★ 服务端方向的同号包是 gspEndGame（结算），
+            # 千万别回显 —— 那会在关卡中途把玩家踢进结算界面（§111）。
+            self.on_req_change_to_next_map(payload)
+        elif opcode == OP_MAP_LOADING_DONE:
+            self.on_map_loading_done()
+        elif opcode == OP_REPORT_HP_ZERO:
+            self.on_report_hp_zero(payload)
+        elif opcode == OP_REQ_RESPAWN:
+            self.on_respawn_request(payload)
+        elif opcode == OP_UPDATE_QUEST_SCORE:
+            # 客户端每次加分都发一次，载荷是**累计**分数（客户端侧 0x4a414a
+            # 先加到 [ctx+0x3b4] 再发，500ms 节流）。记下来给结算用，
+            # 并回一发 0x0415 —— 右上角战绩面板的「分数」列只认那个包（§109）。
+            try:
+                self.quest_score = Reader(payload).i32()
+            except ValueError:
+                pass
+            else:
+                self.send(build_game(OP_REP_QUEST_SCORE,
+                                     build_rep_quest_score(self.my_seat,
+                                                           self.quest_score)))
+        elif opcode in (OP_PREPARE_GAME, OP_COUNT_GAME_READY, OP_LOADING_DONE):
+            old_state = self.start_game.state
+            replies = self.start_game.on_client_packet(opcode, payload)
+            self.log(f"   开局握手: {old_state} -> {self.start_game.state}; "
+                     f"待下发 {len(replies)} 包")
+            for reply_opcode, reply_payload in replies:
+                self.log(f"← 回开局握手 opcode=0x{reply_opcode:04x} "
+                         f"payload={reply_payload.hex() or '<empty>'}")
+                self.send(build_game(reply_opcode, reply_payload))
+
+    def on_ctrl_packet(self, payload):
+        self.log(f"★ 控制包(0xFE) 载荷 {len(payload)} 字节\n{hexdump(payload)}")
+
+    def feed(self, data):
+        # 原始/明文流落盘只对协议逆向有用。战斗中每个 0x0406 都要 write+flush
+        # 两个文件，日常游玩纯属跟游戏抢 I/O，所以跟着 --verbose 走。
+        plain = self.cin.decrypt(data)
+        if VERBOSE:
+            self.fb_raw.write(data)
+            self.fb_raw.flush()
+            self.fb_dec.write(plain)
+            self.fb_dec.flush()
+        self.buf += plain
+
+        if not self.got_version:
+            if len(self.buf) < 4:
+                return
+            ver = struct.unpack_from("<i", self.buf, 0)[0]
+            del self.buf[:4]
+            self.got_version = True
+            ok = (ver == CLIENT_VERSION)
+            self.log(f"★★ 握手：客户端版本 = {ver} (0x{ver:x}) "
+                     f"{'✓ 与预期 311 一致' if ok else '✗ 预期 311'}")
+            if self.args.hold:
+                self.log("[hold] 不回版本应答")
+            else:
+                res = self.args.version_result
+                self.log(f"回 0xFE 控制帧，结果码 = {res}"
+                         f"{'（0 = 版本通过）' if res == 0 else ''}")
+                self.send(build_ctrl(w_i32(res)))
+
+        while True:
+            got = take_frame(self.buf)
+            if got is None:
+                if self.buf:
+                    # 首字节既不是 FE 也不是 FF = 解密流对不上，立刻报出来
+                    if self.buf[0] not in (MAGIC_CTRL, MAGIC_GAME):
+                        self.log(f"!! 缓冲首字节 0x{self.buf[0]:02x} 不是 FE/FF —— "
+                                 f"解密流可能已错位\n{hexdump(bytes(self.buf))}")
+                        self.buf.clear()
+                break
+            kind, op, payload, n = got
+            del self.buf[:n]
+            if kind == "ctrl":
+                self.on_ctrl_packet(payload)
+            else:
+                self.on_game_packet(op, payload)
+
+    def run(self):
+        self.log(f"+++ 连接来自 {self.addr[0]}:{self.addr[1]}")
+        # 超时只是为了让 recv 别永久阻塞（收工时线程能退），不代表连接有问题。
+        self.sock.settimeout(1.0)
+        try:
+            while True:
+                try:
+                    data = self.sock.recv(8192)
+                except socket.timeout:
+                    continue
+                if not data:
+                    self.log("对端关闭")
+                    break
+                self.feed(data)
+        except ConnectionResetError:
+            self.log("被对端重置")
+        except Exception as e:
+            self.log(f"异常: {e!r}")
+        finally:
+            unregister_conn(self)
+            self.log("--- 连接结束")
+            for f in (self.ft, self.fb_raw, self.fb_dec):
+                if f is None:      # 非 verbose 时抓包文件根本没开
+                    continue
+                try:
+                    f.close()
+                except Exception:
+                    pass
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+
+# ----------------------------------------------------------------------------
+# 调试控制通道：一行一命令的纯文本协议
+# ----------------------------------------------------------------------------
+CONTROL_HELP = """命令（一行一条，大小写不敏感）：
+  status                          当前连接 / 开局状态 / 座位 / 分数 / 最后坐标
+  raw <op> [payload-hex]          发任意游戏包，op 是十六进制（例：raw 0411 ...）
+  endgame                         按存档真结算一局（记经验+金币再发 0x0411），
+                                  和客户端打完关卡发 0x040f 走同一条路
+  endgame <seat> <success> [v0..v11]
+                                  发原始 0x0411，自己指定每个字段（协议试探用）。
+                                  success 用 0/1，业务值不足 12 个的补 0
+  endgame-probe [base]            发 0x0411，12 个业务值填 base+0..base+11
+                                  （默认 101..112），用来看结算界面哪格显示什么
+  gameresult [seat] [v0..v11]     发 0x0309 gspRepGameResult（结算界面的数据源）。
+                                  ★ 只能在战斗中发，且必须排在 0x0411 之前
+  gameresult-probe [base]         发 0x0309，12 个业务值填 base+0..base+11
+                                  （默认 201..212），尾部数组填 base+100..+105，
+                                  用来看结算界面哪格显示什么
+  kill <handle> [seat] [deaths] [killer]
+                                  发 0x0406 死亡广播，让指定角色立刻倒下。
+                                  handle = 角色对象句柄（[char+0xd0]，十六进制），
+                                  用 tools/probe_death.py 读得到。
+                                  deaths = 下发的**新死亡次数**（默认 1），HUD 心形
+                                  数 = 最大生命 - 它，所以手动推第 2 次要写 2。
+                                  ★ 正常游玩不用它 —— 客户端自己会用 0x0408
+                                  报上来，服务端按「报上来的值 +1」自动回
+  respawn [id] [x] [y] [unk]      发 0x0419 gspRespawnCharacter；
+                                  x/y 省略时用客户端 0x0406 自报的最后坐标。
+                                  ★ 正常路径是回显客户端的 0x0413，这条只给试探用
+  nextmap <地图名>                发 0x0417 gspRepChangeToNextMap 直接换图。
+                                  ★ 正常路径是回显客户端的 0x0411（§111），
+                                  这条只给试探用；地图名要写客户端认识的，
+                                  写错了会加载失败卡在加载画面
+  map-ready                       发 0x0418（空包）= 放行换图加载循环。
+                                  正常路径由客户端的 0x0412 轮询自动触发
+  drop [物件id] [x] [y] [vx] [vy] 发 0x0404 gspCreatedItem，在指定坐标凭空掉一件。
+                                  物件 id 默认 10101（金币×1），可用的见
+                                  gameserver.py 的 ITEM_NAMES；坐标省略时用
+                                  客户端最近一次 0x0406 报的掉落点。
+                                  ★ 正常路径是回显客户端的 0x0406（§112），
+                                  这条只给试探用（比如试某个 id 长什么样）
+  pickup <句柄> [座位]            发服务端方向的 0x0405 = 「放行拾取」，
+                                  让指定座位捡起指定句柄的掉落物。
+                                  ★ 正常路径是回显客户端的 0x0407（§115），
+                                  这条只给试探用；句柄看日志里 gspCreatedItem
+                                  那行（drop 出来的从 0x40000000 起往上数）
+  back-to-room                    发 0x0403（服务端方向 = 切回 stage 5 房间）
+  sync-account                    重读 accounts.json 并发 0x0600 gspRepMoney，
+                                  把右上角数据栏刷成存档里的金币/经验/等级
+  help                            这段
+"""
+
+
+def _control_status(conn):
+    position = ("未知" if conn.last_position is None
+                else f"({conn.last_position[0]:.1f}, {conn.last_position[1]:.1f})")
+    account = getattr(conn, "account", None)
+    return (f"conn=#{conn.seq} account={conn.account_name!r} "
+            f"level={player_level(account)} exp={player_experience(account)} "
+            f"money={player_money(account)} "
+            f"tutorial={tutorial_state(account)} "
+            f"start_game={conn.start_game.state} my_seat={conn.my_seat} "
+            f"quest_score={conn.quest_score} "
+            f"quest_success={getattr(conn, 'quest_success', False)} "
+            f"items_created={getattr(conn, 'items_created', 0)} "
+            f"items_picked={getattr(conn, 'items_picked', 0)} "
+            f"last_position={position} "
+            f"maps_entered={getattr(conn, 'maps_entered', [])} "
+            f"map_change_pending={getattr(conn, 'map_change_pending', False)} "
+            f"room_type={(conn.room or {}).get('session_type')}")
+
+
+def _control_ints(words, count, default=0):
+    """把剩余的词按 int 解析并补齐到 count 个。支持 0x 前缀。"""
+    values = [int(w, 0) for w in words]
+    if len(values) > count:
+        raise ValueError(f"最多 {count} 个数，给了 {len(values)} 个")
+    return values + [default] * (count - len(values))
+
+
+def handle_control_command(line):
+    """解析并执行一条控制命令，返回要回给控制台的一行文本。
+
+    **这个通道存在的理由**：`0x0411 gspEndGame` 只有在客户端真把关打完/打输
+    时才会被 `0x040f gcpEndQuest` 触发，而闯关模式有强制推进机制
+    （「15秒内没有向前移动将强制退出」，§88），挂机等 12:30 这条路走不通。
+    会话 09 因此始终没能实机验证结算包。有了这个通道，就能在战斗中任意时刻
+    主动把包推给客户端，把「验证一个战斗应答」的成本从「打完一整关」降到一行命令。
+
+    参数写错（多给一个数、hex 打错）是调试时的常态，一律翻成 `err ...` 一行
+    带回去 —— 控制台崩掉会连带把游戏服务端的调试线程也带走。
+    """
+    try:
+        return _dispatch_control_command(line)
+    except Exception as error:
+        return f"err {error}"
+
+
+def _dispatch_control_command(line):
+    words = line.split()
+    if not words:
+        return "ok"
+    cmd = words[0].lower()
+    if cmd == "help":
+        return CONTROL_HELP.strip()
+
+    conn = latest_conn()
+    if conn is None:
+        return "err 当前没有活动连接"
+
+    if cmd == "status":
+        return "ok " + _control_status(conn)
+
+    if cmd == "raw":
+        if len(words) < 2:
+            return "err 用法: raw <op-hex> [payload-hex]"
+        opcode = int(words[1], 16)
+        payload = bytes.fromhex("".join(words[2:]))
+        conn.log(f"[ctl] ← 手动发 opcode=0x{opcode:04x} "
+                 f"payload={payload.hex() or '<empty>'}")
+        conn.send(build_game(opcode, payload))
+        return f"ok 已发 0x{opcode:04x} ({len(payload)} 字节载荷)"
+
+    if cmd == "endgame" and len(words) == 1:
+        # 不带参数 = 走真正的结算路径（记账 + 按存档下发），和客户端自己
+        # 打完关卡发 0x040f 时完全一样。带参数的形式是给协议试探用的。
+        conn.log("[ctl] ← 手动触发结算（与 0x040f 同一条路径）")
+        conn.send_end_game()
+        return "ok 已按存档结算并发 0x0411"
+
+    if cmd in ("endgame", "endgame-probe"):
+        if cmd == "endgame-probe":
+            base = int(words[1], 0) if len(words) > 1 else 101
+            seat, success = conn.my_seat, 1
+            values = [base + i for i in range(END_GAME_VALUE_COUNT)]
+        else:
+            seat = int(words[1], 0) if len(words) > 1 else conn.my_seat
+            success = int(words[2], 0) if len(words) > 2 else 1
+            values = _control_ints(words[3:], END_GAME_VALUE_COUNT)
+        conn.log(f"[ctl] ← 手动发 gspEndGame(seat={seat}, "
+                 f"success={bool(success)}, values={values})")
+        conn.send(build_game(OP_END_GAME,
+                             build_end_game(seat, bool(success), values)))
+        return f"ok 已发 0x0411 seat={seat} success={bool(success)} values={values}"
+
+    if cmd in ("gameresult", "gameresult-probe"):
+        if cmd == "gameresult-probe":
+            base = int(words[1], 0) if len(words) > 1 else 201
+            seat = conn.my_seat
+            values = [base + i for i in range(GAME_RESULT_VALUE_COUNT)]
+            tail = [base + 100 + i for i in range(GAME_RESULT_TAIL_COUNT)]
+        else:
+            seat = int(words[1], 0) if len(words) > 1 else conn.my_seat
+            values = _control_ints(words[2:], GAME_RESULT_VALUE_COUNT)
+            tail = None
+        conn.log(f"[ctl] ← 手动发 gspRepGameResult(seat={seat}, values={values}, "
+                 f"tail={tail})")
+        conn.send(build_game(OP_REP_GAME_RESULT,
+                             build_rep_game_result(seat, values, tail)))
+        return f"ok 已发 0x0309 seat={seat} values={values} tail={tail}"
+
+    if cmd == "kill":
+        if len(words) < 2:
+            return "err 用法: kill <handle-hex> [seat] [deaths] [killer]"
+        handle = int(words[1], 16)
+        seat = int(words[2], 0) if len(words) > 2 else conn.my_seat
+        # 死亡次数是权威值，手动推的时候要自己数（正常路径由 0x0408 的值 +1 得到）。
+        deaths = int(words[3], 0) if len(words) > 3 else 1
+        killer = int(words[4], 0) if len(words) > 4 else 0xFF
+        conn.log(f"[ctl] ← 手动发 0x0406 死亡广播(handle=0x{handle:08x}, "
+                 f"seat={seat}, 死亡次数={deaths}, 凶手={killer})")
+        conn.send(build_game(OP_BROADCAST_DEATH,
+                             build_broadcast_death(handle, seat, killer, deaths)))
+        return (f"ok 已发 0x0406 死亡广播 handle=0x{handle:08x} "
+                f"seat={seat} 死亡次数={deaths}")
+
+    if cmd == "respawn":
+        character_id = int(words[1], 0) if len(words) > 1 else conn.my_seat
+        if len(words) > 3:
+            x, y = int(words[2], 0), int(words[3], 0)
+        else:
+            x, y = conn.respawn_position()
+        unknown = int(words[4], 0) if len(words) > 4 else 0
+        conn.log(f"[ctl] ← 手动发 gspRespawnCharacter(id={character_id}, "
+                 f"x={x}, y={y}, unk={unknown})")
+        conn.send(build_game(OP_RESPAWN_CHARACTER,
+                             build_respawn_character(character_id, x, y, unknown)))
+        return f"ok 已发 0x0419 id={character_id} x={x} y={y}"
+
+    if cmd == "nextmap":
+        if len(words) < 2:
+            return "err 用法: nextmap <地图名>"
+        map_name = words[1]
+        conn.log(f"[ctl] ← 手动发 gspRepChangeToNextMap(0x0417) 地图={map_name!r}")
+        conn.map_change_pending = True
+        conn.maps_entered.append(map_name)
+        conn.send(build_game(OP_REP_CHANGE_TO_NEXT_MAP,
+                             build_rep_change_to_next_map(map_name)))
+        return f"ok 已发 0x0417 地图={map_name}"
+
+    if cmd == "map-ready":
+        conn.log("[ctl] ← 手动发 0x0418（放行换图加载循环）")
+        conn.map_change_pending = False
+        conn.send(build_game(OP_MAP_CHANGE_READY))
+        return "ok 已发 0x0418"
+
+    if cmd == "drop":
+        item_id = int(words[1], 0) if len(words) > 1 else 10101
+        if len(words) > 3:
+            x, y = float(words[2]), float(words[3])
+        elif conn.last_position is not None:
+            x, y = conn.last_position
+        else:
+            return "err 客户端还没报过任何掉落点；请写全坐标: drop <id> <x> <y>"
+        vx = float(words[4]) if len(words) > 4 else 0.0
+        vy = float(words[5]) if len(words) > 5 else 0.0
+        # 后三个字段照客户端自己发的填（3 / -1 / -1）：3 不是「宠物掉落」，
+        # -1 不是任何座位，正好让处理器跳过那段音效/特效分支。
+        fields = (item_id, x, y, vx, vy, 3, -1, -1)
+        handle = conn.next_item_handle
+        conn.next_item_handle += 1
+        name = ITEM_NAMES.get(item_id, "未知物件")
+        conn.log(f"[ctl] ← 手动发 gspCreatedItem(0x0404) 句柄=0x{handle:08x} "
+                 f"物件={item_id} {name} @ ({x:.0f}, {y:.0f})")
+        conn.send(build_game(OP_CREATED_ITEM, build_created_item(handle, fields)))
+        return f"ok 已发 0x0404 物件={item_id} {name} @ ({x:.0f}, {y:.0f})"
+
+    if cmd == "pickup":
+        if len(words) < 2:
+            return "err 用法: pickup <句柄> [座位]"
+        handle = int(words[1], 0)
+        seat_id = int(words[2], 0) if len(words) > 2 else conn.my_seat
+        conn.log(f"[ctl] ← 手动发拾取放行(0x0405) 座位={seat_id} "
+                 f"句柄=0x{handle & 0xffffffff:08x}")
+        conn.send(build_game(OP_PICKED_ITEM, build_picked_item(seat_id, handle)))
+        return f"ok 已发 0x0405 座位={seat_id} 句柄=0x{handle & 0xffffffff:08x}"
+
+    if cmd == "back-to-room":
+        # 0x0403 的服务端方向处理器 0x5518fb 是
+        #   mov [LobbyStage+4], 2 / push 5 / call 0x40e47f  = 切回 stage 5
+        # 也就是看完结算之后回房间那一步（§87 末）。
+        conn.log("[ctl] ← 手动发 0x0403（服务端方向 = 切回 stage 5 房间）")
+        conn.send(build_game(OP_LOADING_DONE, b""))
+        return "ok 已发 0x0403"
+
+    if cmd == "sync-account":
+        # 直接改了 accounts.json 之后不用重登游戏，一条命令就能让画面跟上。
+        conn.reload_account()
+        conn.send_rep_money(reason="（sync-account）")
+        return "ok 已重读存档并发 0x0600 " + _control_status(conn)
+
+    return f"err 未知命令 {cmd!r}；用 help 看命令表"
+
+
+def serve_control(port):
+    """控制通道监听线程。一行一命令，一行一应答，处理完就断。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", port))
+    except OSError as error:
+        print(f"[{ts()}] !! 控制端口 {port} 绑定失败: {error}", flush=True)
+        return
+    s.listen(4)
+    print(f"[{ts()}] [gameserver] 控制通道监听 127.0.0.1:{port}", flush=True)
+    while True:
+        sock, _ = s.accept()
+        try:
+            sock.settimeout(5.0)
+            line = sock.makefile("r", encoding="utf-8").readline().strip()
+            reply = handle_control_command(line)
+            print(f"[{ts()}] [ctl] {line!r} -> {reply.splitlines()[0]}", flush=True)
+            sock.sendall((reply + "\n").encode("utf-8"))
+        except Exception as error:
+            print(f"[{ts()}] [ctl] 控制连接异常: {error!r}", flush=True)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=27799)
+    ap.add_argument("--hold", action="store_true", help="连版本应答都不回，纯抓包")
+    ap.add_argument("--version-result", type=int, default=0,
+                    help="0xFE 控制帧里的结果码，0 = 版本通过")
+    ap.add_argument("--hold-lobby", action="store_true",
+                    help="握手照回，但游戏包一律不应答（纯抓包）")
+    ap.add_argument("--login-result", type=int, default=0,
+                    help="gspRepLogin 的结果码，0 = 成功")
+    ap.add_argument("--accounts", default=None,
+                    help="账号 JSON 路径（默认 server/data/accounts.json）")
+    ap.add_argument("--no-death-reply", action="store_true",
+                    help="收到 0x0408 也不回死亡广播（回到会话 14 及以前的行为，"
+                         "角色血量归零后不死不重生）。只在对比排查时用。")
+    ap.add_argument("--control-port", type=int, default=CONTROL_PORT,
+                    help="调试控制通道端口（tools/gs_ctl.py 连它）；0 = 关闭")
+    ap.add_argument("--verbose", action="store_true",
+                    help="逐包 hexdump + 字段试解 + 抓包落盘 + 不静音高频战斗包。"
+                         "协议逆向时开；日常游玩别开（会跟游戏抢 I/O）")
+    args = ap.parse_args()
+
+    global VERBOSE
+    VERBOSE = args.verbose
+
+    if args.control_port:
+        threading.Thread(target=serve_control, args=(args.control_port,),
+                         daemon=True).start()
+
+    print(f"[{ts()}] [gameserver] 监听 127.0.0.1:{args.port} "
+          f"{'(hold)' if args.hold else f'version_result={args.version_result}'} "
+          f"日志={'详细（逐包 dump）' if VERBOSE else '精简（--verbose 开全量）'}",
+          flush=True)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # 不开 SO_REUSEADDR：旧进程没退干净时宁可绑定失败，也不要两个进程抢同一端口
+    try:
+        s.bind(("127.0.0.1", args.port))
+    except OSError as e:
+        print(f"!! 端口 {args.port} 绑定失败（旧进程没退？）: {e}", flush=True)
+        return
+    s.listen(8)
+    while True:
+        conn, addr = s.accept()
+        threading.Thread(target=Conn(conn, addr, args).run, daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,223 @@
+
+
+
+==================   logged at 08/06/26, 19:38:47    ==========================
+
+Version: 311
+Dump File Name: D:\work\popshot\game_patched\Dump\BigShotV0311N001.mdmp
+Exception code: C0000005 ACCESS_VIOLATION
+Fault address:  0040197F 01:0000097F D:\work\popshot\game_patched\BigShot.exe
+
+Registers:
+EAX:00000000
+EBX:00000001
+ECX:0019FC1C
+EDX:00000000
+ESI:FFFFFFFF
+EDI:3BFF5380
+CS:EIP:0023:0040197F
+SS:ESP:002B:0019FC14  EBP:0019FC28
+DS:002B  ES:002B  FS:0053  GS:002B
+Flags:00010246
+
+Call stack:
+Address   Frame
+0040197F  0019FC28  0001:0000097F D:\work\popshot\game_patched\BigShot.exe
+004655FA  0019FC98  0001:000645FA D:\work\popshot\game_patched\BigShot.exe
+00465234  0019FCDC  0001:00064234 D:\work\popshot\game_patched\BigShot.exe
+00466F69  0019FD3C  0001:00065F69 D:\work\popshot\game_patched\BigShot.exe
+0040BD09  0019FD58  0001:0000AD09 D:\work\popshot\game_patched\BigShot.exe
+00426742  0019FE24  0001:00025742 D:\work\popshot\game_patched\BigShot.exe
+0040A6B9  0019FE48  0001:000096B9 D:\work\popshot\game_patched\BigShot.exe
+005F7B9E  0019FF70  0001:001F6B9E D:\work\popshot\game_patched\BigShot.exe
+7702FCC9  0019FF80  BaseThreadInitThunk+19
+773F82AE  0019FFDC  RtlGetAppContainerNamedObjectPath+11E
+773F827E  0019FFEC  RtlGetAppContainerNamedObjectPath+EE
+
+
+
+==================   logged at 08/06/26, 19:55:06    ==========================
+
+Version: 311
+Dump File Name: D:\work\popshot\game_patched\Dump\BigShotV0311N002.mdmp
+Exception code: C0000005 ACCESS_VIOLATION
+Fault address:  0040197F 01:0000097F D:\work\popshot\game_patched\BigShot.exe
+
+Registers:
+EAX:00000000
+EBX:00000001
+ECX:0019FC1C
+EDX:00000000
+ESI:FFFFFFFF
+EDI:3C05FCF8
+CS:EIP:0023:0040197F
+SS:ESP:002B:0019FC14  EBP:0019FC28
+DS:002B  ES:002B  FS:0053  GS:002B
+Flags:00010246
+
+Call stack:
+Address   Frame
+0040197F  0019FC28  0001:0000097F D:\work\popshot\game_patched\BigShot.exe
+004655FA  0019FC98  0001:000645FA D:\work\popshot\game_patched\BigShot.exe
+00465234  0019FCDC  0001:00064234 D:\work\popshot\game_patched\BigShot.exe
+00466F69  0019FD3C  0001:00065F69 D:\work\popshot\game_patched\BigShot.exe
+0040BD09  0019FD58  0001:0000AD09 D:\work\popshot\game_patched\BigShot.exe
+00426742  0019FE24  0001:00025742 D:\work\popshot\game_patched\BigShot.exe
+0040A6B9  0019FE48  0001:000096B9 D:\work\popshot\game_patched\BigShot.exe
+005F7B9E  0019FF70  0001:001F6B9E D:\work\popshot\game_patched\BigShot.exe
+7702FCC9  0019FF80  BaseThreadInitThunk+19
+773F82AE  0019FFDC  RtlGetAppContainerNamedObjectPath+11E
+773F827E  0019FFEC  RtlGetAppContainerNamedObjectPath+EE
+
+
+
+==================   logged at 08/06/26, 22:16:27    ==========================
+
+Version: 311
+Dump File Name: D:\work\popshot\game_patched\Dump\BigShotV0311N003.mdmp
+Exception code: C0000005 ACCESS_VIOLATION
+Fault address:  0050A368 01:00109368 D:\work\popshot\game_patched\BigShot.exe
+
+Registers:
+EAX:00000000
+EBX:00000000
+ECX:1FAE5A80
+EDX:006935DC
+ESI:0019FC5C
+EDI:1FAE5A80
+CS:EIP:0023:0050A368
+SS:ESP:002B:0019FB98  EBP:0019FBE8
+DS:002B  ES:002B  FS:0053  GS:002B
+Flags:00010202
+
+Call stack:
+Address   Frame
+0050A368  0019FBE8  0001:00109368 D:\work\popshot\game_patched\BigShot.exe
+00496F84  0019FC08  0001:00095F84 D:\work\popshot\game_patched\BigShot.exe
+00497040  0019FC1C  0001:00096040 D:\work\popshot\game_patched\BigShot.exe
+00490F31  0019FC94  0001:0008FF31 D:\work\popshot\game_patched\BigShot.exe
+00424F18  0019FCB8  0001:00023F18 D:\work\popshot\game_patched\BigShot.exe
+0042B5B7  0019FCF0  0001:0002A5B7 D:\work\popshot\game_patched\BigShot.exe
+0042647B  0019FD30  0001:0002547B D:\work\popshot\game_patched\BigShot.exe
+0040E6C4  0019FD78  0001:0000D6C4 D:\work\popshot\game_patched\BigShot.exe
+0040DF96  0019FE24  0001:0000CF96 D:\work\popshot\game_patched\BigShot.exe
+0040A6B9  0019FE48  0001:000096B9 D:\work\popshot\game_patched\BigShot.exe
+005F7B9E  0019FF70  0001:001F6B9E D:\work\popshot\game_patched\BigShot.exe
+7702FCC9  0019FF80  BaseThreadInitThunk+19
+773F82AE  0019FFDC  RtlGetAppContainerNamedObjectPath+11E
+773F827E  0019FFEC  RtlGetAppContainerNamedObjectPath+EE
+
+
+
+==================   logged at 08/07/26, 00:12:15    ==========================
+
+Version: 311
+Dump File Name: D:\work\popshot\game_patched\Dump\BigShotV0311N004.mdmp
+Exception code: C0000005 ACCESS_VIOLATION
+Fault address:  0050A368 01:00109368 D:\work\popshot\game_patched\BigShot.exe
+
+Registers:
+EAX:00000000
+EBX:00000000
+ECX:1FB00720
+EDX:006935DC
+ESI:0019FC5C
+EDI:1FB00720
+CS:EIP:0023:0050A368
+SS:ESP:002B:0019FB98  EBP:0019FBE8
+DS:002B  ES:002B  FS:0053  GS:002B
+Flags:00010202
+
+Call stack:
+Address   Frame
+0050A368  0019FBE8  0001:00109368 D:\work\popshot\game_patched\BigShot.exe
+00496F84  0019FC08  0001:00095F84 D:\work\popshot\game_patched\BigShot.exe
+00497040  0019FC1C  0001:00096040 D:\work\popshot\game_patched\BigShot.exe
+00490F31  0019FC94  0001:0008FF31 D:\work\popshot\game_patched\BigShot.exe
+00424F18  0019FCB8  0001:00023F18 D:\work\popshot\game_patched\BigShot.exe
+0042B5B7  0019FCF0  0001:0002A5B7 D:\work\popshot\game_patched\BigShot.exe
+0042647B  0019FD30  0001:0002547B D:\work\popshot\game_patched\BigShot.exe
+0040E6C4  0019FD78  0001:0000D6C4 D:\work\popshot\game_patched\BigShot.exe
+0040DF96  0019FE24  0001:0000CF96 D:\work\popshot\game_patched\BigShot.exe
+0040A6B9  0019FE48  0001:000096B9 D:\work\popshot\game_patched\BigShot.exe
+005F7B9E  0019FF70  0001:001F6B9E D:\work\popshot\game_patched\BigShot.exe
+7702FCC9  0019FF80  BaseThreadInitThunk+19
+773F82AE  0019FFDC  RtlGetAppContainerNamedObjectPath+11E
+773F827E  0019FFEC  RtlGetAppContainerNamedObjectPath+EE
+
+
+
+==================   logged at 08/07/26, 16:01:25    ==========================
+
+Version: 311
+Dump File Name: D:\work\popshot\game_patched\Dump\BigShotV0311N005.mdmp
+Exception code: C0000005 ACCESS_VIOLATION
+Fault address:  005CCF29 01:001CBF29 D:\work\popshot\game_patched\BigShot.exe
+
+Registers:
+EAX:00000000
+EBX:00000090
+ECX:3C9FCAF0
+EDX:0073304C
+ESI:3CC32BD8
+EDI:3C562C60
+CS:EIP:0023:005CCF29
+SS:ESP:002B:0019FB68  EBP:0019FB6C
+DS:002B  ES:002B  FS:0053  GS:002B
+Flags:00010246
+
+Call stack:
+Address   Frame
+005CCF29  0019FB6C  0001:001CBF29 D:\work\popshot\game_patched\BigShot.exe
+00472897  0019FB9C  0001:00071897 D:\work\popshot\game_patched\BigShot.exe
+00472064  0019FBCC  0001:00071064 D:\work\popshot\game_patched\BigShot.exe
+004A4344  0019FC24  0001:000A3344 D:\work\popshot\game_patched\BigShot.exe
+004781FE  0019FC94  0001:000771FE D:\work\popshot\game_patched\BigShot.exe
+00424F18  0019FCB8  0001:00023F18 D:\work\popshot\game_patched\BigShot.exe
+0042B5B7  0019FCF0  0001:0002A5B7 D:\work\popshot\game_patched\BigShot.exe
+0042647B  0019FD30  0001:0002547B D:\work\popshot\game_patched\BigShot.exe
+0040E6C4  0019FD78  0001:0000D6C4 D:\work\popshot\game_patched\BigShot.exe
+0040DF96  0019FE24  0001:0000CF96 D:\work\popshot\game_patched\BigShot.exe
+0040A6B9  0019FE48  0001:000096B9 D:\work\popshot\game_patched\BigShot.exe
+005F7B9E  0019FF70  0001:001F6B9E D:\work\popshot\game_patched\BigShot.exe
+75ECFCC9  0019FF80  BaseThreadInitThunk+19
+772B82AE  0019FFDC  RtlGetAppContainerNamedObjectPath+11E
+772B827E  0019FFEC  RtlGetAppContainerNamedObjectPath+EE
+
+
+
+==================   logged at 08/07/26, 16:10:58    ==========================
+
+Version: 311
+Dump File Name: D:\work\popshot\game_patched\Dump\BigShotV0311N006.mdmp
+Exception code: C0000005 ACCESS_VIOLATION
+Fault address:  0047252D 01:0007152D D:\work\popshot\game_patched\BigShot.exe
+
+Registers:
+EAX:3ADBF468
+EBX:00000000
+ECX:1FC8C538
+EDX:006935DC
+ESI:FFFF1AE6
+EDI:1FCDF0C8
+CS:EIP:0023:0047252D
+SS:ESP:002B:0019FB4C  EBP:0019FB98
+DS:002B  ES:002B  FS:0053  GS:002B
+Flags:00010286
+
+Call stack:
+Address   Frame
+0047252D  0019FB98  0001:0007152D D:\work\popshot\game_patched\BigShot.exe
+00472033  0019FBCC  0001:00071033 D:\work\popshot\game_patched\BigShot.exe
+004A4344  0019FC24  0001:000A3344 D:\work\popshot\game_patched\BigShot.exe
+004781FE  0019FC94  0001:000771FE D:\work\popshot\game_patched\BigShot.exe
+00424F18  0019FCB8  0001:00023F18 D:\work\popshot\game_patched\BigShot.exe
+0042B5B7  0019FCF0  0001:0002A5B7 D:\work\popshot\game_patched\BigShot.exe
+0042647B  0019FD30  0001:0002547B D:\work\popshot\game_patched\BigShot.exe
+0040E6C4  0019FD78  0001:0000D6C4 D:\work\popshot\game_patched\BigShot.exe
+0040DF96  0019FE24  0001:0000CF96 D:\work\popshot\game_patched\BigShot.exe
+0040A6B9  0019FE48  0001:000096B9 D:\work\popshot\game_patched\BigShot.exe
+005F7B9E  0019FF70  0001:001F6B9E D:\work\popshot\game_patched\BigShot.exe
+75ECFCC9  0019FF80  BaseThreadInitThunk+19
+772B82AE  0019FFDC  RtlGetAppContainerNamedObjectPath+11E
+772B827E  0019FFEC  RtlGetAppContainerNamedObjectPath+EE
