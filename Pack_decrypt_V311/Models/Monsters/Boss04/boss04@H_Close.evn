@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="ks_c_5601-1987"?>
+<ArrayOfEvent xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>10</StartTick>
+    <ResourcePath>Boss04@H_Close.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>12</StartTick>
+    <ResourcePath>Boss04@H_Close.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>14</StartTick>
+    <ResourcePath>Boss04@H_Close.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>16</StartTick>
+    <ResourcePath>Boss04@H_Close.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>18</StartTick>
+    <ResourcePath>Boss04@H_Close.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>20</StartTick>
+    <ResourcePath>Boss04@H_Close.ogg</ResourcePath>
+  </Event>
+</ArrayOfEvent>

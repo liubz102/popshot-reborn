@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="ks_c_5601-1987"?>
+<ArrayOfEvent xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Event>
+    <Type>CustomEvent</Type>
+    <StartTick>78</StartTick>
+    <ResourcePath />
+    <TypeIdx>2</TypeIdx>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <StartTick>18</StartTick>
+    <ResourcePath>Boss00@StandUp.ogg</ResourcePath>
+    <TypeIdx>0</TypeIdx>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <StartTick>48</StartTick>
+    <ResourcePath>Boss00@StandUp.ogg</ResourcePath>
+    <TypeIdx>0</TypeIdx>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <StartTick>67</StartTick>
+    <ResourcePath>Boss00@Jump.ogg</ResourcePath>
+    <TypeIdx>0</TypeIdx>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <StartTick>81</StartTick>
+    <ResourcePath>Boss00@Land.ogg</ResourcePath>
+    <TypeIdx>0</TypeIdx>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <StartTick>1</StartTick>
+    <ResourcePath>FrogBoss/Efx/FrogBoss_StandUp.efx</ResourcePath>
+    <TypeIdx>1</TypeIdx>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <StartTick>1</StartTick>
+    <ResourcePath>FrogBoss/Efx/FrogBoss_StandUpSmoke.efx</ResourcePath>
+    <TypeIdx>1</TypeIdx>
+  </Event>
+</ArrayOfEvent>

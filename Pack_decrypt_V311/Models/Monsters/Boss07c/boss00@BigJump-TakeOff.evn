@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="ks_c_5601-1987"?>
+<ArrayOfEvent xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Event>
+    <Type>CustomEvent</Type>
+    <TypeIdx>2</TypeIdx>
+    <StartTick>33</StartTick>
+    <ResourcePath />
+  </Event>
+  <Event>
+    <Type>CustomEvent</Type>
+    <TypeIdx>2</TypeIdx>
+    <StartTick>62</StartTick>
+    <ResourcePath />
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>33</StartTick>
+    <ResourcePath>Boss00@BigJump-takeoff.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>60</StartTick>
+    <ResourcePath>Boss00@BigJump-takeoff.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>100</StartTick>
+    <ResourcePath>Boss00@Jump.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <TypeIdx>1</TypeIdx>
+    <StartTick>1</StartTick>
+    <ResourcePath>Quest07c/Efx/Boss07c_BigJumpTakeOff.efx</ResourcePath>
+  </Event>
+</ArrayOfEvent>

@@ -1,0 +1,44 @@
+#Clear,,,,,,,,,,,,,,,,,
+#연출,문자,,사운드,이미지,,,,,,,,,대기,,연출 관련,,
+#,화자,대화 내용,화일명,위치,머리말,몸체,눈1,눈2,입1,입2,머리,연출,방법,시간,시간,감마,컬러
+$setIntroPanelFilePath,,Mutu/MutuQuestHeadline.smf,,,,,,,,,,,,,,,
+$setTutorialHelpFilePath,,Mutu/MutuQuestSubTitle.smf,,,,,,,,,,,,,,,
+$playBgm,,BGM-Game-Quest03-Forest,,,,,,,,,,,,,,,
+$showIntro,엘리어스,0,,1,AliasBody00,,_FlickerEye00,_FlickerEye01,_TalkMouth00,_TalkMouth01,_Hair,,wait,,,,
+#인트로,,,,,,,,,,,,,,,,,
+$speech,엘리어스,Mutu/00.png,,1,AliasBody00,,_FlickerEye00,_FlickerEye01,_TalkMouth01,_TalkMouth01,_Hair,,wait,,,,
+#달리기 교습,,,,,,,,,,,,,,,,,
+$showIntro,엘리어스,1,,1,AliasBody00,,_FlickerEye00,_FlickerEye01,_TalkMouth00,_TalkMouth01,_Hair,,wait,,,,
+$speech,엘리어스,Mutu/01.png,,1,AliasBody00,,_FlickerEye00,_FlickerEye01,_TalkMouth01,_TalkMouth01,_Hair,,wait,,,,
+$showControl,엘리어스,2000,,1,AliasBody00,,_FlickerEye00,_FlickerEye01,_TalkMouth01,_TalkMouth01,_Hair,,wait,,,,
+$tutorial-run,,7,,,,,,,,,,,,,,,
+#SP충전 교습,,,,,,,,,,,,,,,,,
+$speech,엘리어스,Mutu/02.png,,1,AliasBody00,,_FlickerEye00,_FlickerEye01,_TalkMouth01,_TalkMouth01,_Hair,,wait,,,,
+$tutorial-chargeSp,,8,,,,,,,,,,,
+$speech,엘리어스,Mutu/03.png,,1,AliasBody00,,_FlickerEye00,_FlickerEye01,_TalkMouth01,_TalkMouth01,_Hair,,wait
+$gomark,,,,,,,,,,,,,
+$completeSector,,phaseRun,,,,,,,,,,,
+$tutorial-moveToCommand,,,,,,,,,,,,,
+#기본기 교습,,,,,,,,,,,,,
+$showIntro,엘리어스,2,,1,AliasBody00,,_FlickerEye00,_FlickerEye01,_TalkMouth00,_TalkMouth01,_Hair,,wait
+$speech,엘리어스,Mutu/04.png,,1,AliasBody00,,_FlickerEye00,_FlickerEye01,_TalkMouth01,_TalkMouth01,_Hair,,wait
+$tutorial-jab,,0,,,,,,,,,,,
+$tutorial-jab2,,1,,,,,,,,,,,
+$tutorial-kick,,2,,,,,,,,,,,
+$tutorial-kick2,,3,,,,,,,,,,,
+$tutorial-guard,,4,,,,,,,,,,,
+$tutorial-jumpingKick,,5,,,,,,,,,,,
+$tutorial-dash,,6,,,,,,,,,,,
+$speech,엘리어스,Mutu/05.png,,1,AliasBody00,,_FlickerEye00,_FlickerEye01,_TalkMouth01,_TalkMouth01,_Hair,,wait
+$gomark,,,,,,,,,,,,,,,,,
+$completeSector,,phaseCommand,,,,,,,,,,,,,,,
+$tutorial-moveToPractice,,,,,,,,,,,,,,,,,
+#무투전 실습,,,,,,,,,,,,,,,,,
+$speech,엘리어스,Mutu/06.png,,1,AliasBody00,,_FlickerEye00,_FlickerEye01,_TalkMouth01,_TalkMouth01,_Hair,,wait,,,,
+$tutorial-practice,,,,,,,,,,,,,,,,,
+$speech,엘리어스,Mutu/07.png,,1,AliasBody00,,_SmileEye,_FlickerEye01,_SmileMouth,_TalkMouth01,_Hair,,wait,,,,
+$tutorial-quit,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,wait,,,,
+,,,,,,,,,,,,,,,1000,1,FF000000
+
+,,,,,,,,,,,,,,,2000,1,FF000000

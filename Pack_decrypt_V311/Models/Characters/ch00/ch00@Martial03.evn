@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="ks_c_5601-1987"?>
+<ArrayOfEvent xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Event>
+    <Type>PlaySound</Type>
+    <StartTick>1</StartTick>
+    <ResourcePath>ch00@Martial03.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <StartTick>1</StartTick>
+    <ResourcePath>CH00/WP00/Efx/CH00_WpS01_DashAttack00.efx</ResourcePath>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <StartTick>1</StartTick>
+    <ResourcePath>CH00/WP00/Efx/CH00_WpS00_DashDust00.efx</ResourcePath>
+  </Event>
+</ArrayOfEvent>

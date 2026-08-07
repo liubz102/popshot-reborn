@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="ks_c_5601-1987"?>
+<ArrayOfEvent xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Event>
+    <Type>PlaySound</Type>
+    <StartTick>5</StartTick>
+    <ResourcePath>Boss00@Crane-Open.ogg</ResourcePath>
+    <TypeIdx>0</TypeIdx>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <StartTick>9</StartTick>
+    <ResourcePath>Boss00@Crane-Steps.ogg</ResourcePath>
+    <TypeIdx>0</TypeIdx>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <StartTick>17</StartTick>
+    <ResourcePath>Boss00@Crane-Steps.ogg</ResourcePath>
+    <TypeIdx>0</TypeIdx>
+  </Event>
+</ArrayOfEvent>

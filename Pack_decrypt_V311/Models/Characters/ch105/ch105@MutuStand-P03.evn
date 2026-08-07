@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="ks_c_5601-1987"?>
+<ArrayOfEvent xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>8</StartTick>
+    <ResourcePath>ch102@MutuStand-P03.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>10</StartTick>
+    <ResourcePath>ch102@MutuStand-P02.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <TypeIdx>1</TypeIdx>
+    <StartTick>1</StartTick>
+    <ResourcePath>CH105/WP00/Efx/CH105_MutuStand-P03.efx</ResourcePath>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <TypeIdx>1</TypeIdx>
+    <StartTick>1</StartTick>
+    <ResourcePath>CH105/WP00/Efx/CH105_MutuDust00.efx</ResourcePath>
+  </Event>
+</ArrayOfEvent>

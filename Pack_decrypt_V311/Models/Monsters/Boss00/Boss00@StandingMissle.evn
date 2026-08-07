@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="ks_c_5601-1987"?>
+<ArrayOfEvent xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Event>
+    <Type>RenderEffect</Type>
+    <StartTick>1</StartTick>
+    <ResourcePath>Monster/Boss00/Efx/Boss00_Missile00_LSpark00.efx</ResourcePath>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <StartTick>1</StartTick>
+    <ResourcePath>Monster/Boss00/Efx/Boss00_Missile00_RSpark00.efx</ResourcePath>
+  </Event>
+</ArrayOfEvent>

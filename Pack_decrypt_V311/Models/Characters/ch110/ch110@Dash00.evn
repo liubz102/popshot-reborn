@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="ks_c_5601-1987"?>
+<ArrayOfEvent xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>2</StartTick>
+    <ResourcePath>FX/char/KR/char/ch110/ch110@Dash00.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <TypeIdx>1</TypeIdx>
+    <StartTick>1</StartTick>
+    <ResourcePath>CH110/WP00/Efx/CH110_DashAttack00.efx</ResourcePath>
+  </Event>
+</ArrayOfEvent>

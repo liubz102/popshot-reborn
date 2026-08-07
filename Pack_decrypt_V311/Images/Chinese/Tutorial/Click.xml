@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<SpriteSet>
+  <Version>2</Version>
+  <Count>0</Count>
+  <Sprite>
+    <Index>0</Index>
+    <Rectangle>
+      <X>1</X>
+      <Y>1</Y>
+      <Width>51</Width>
+      <Height>64</Height>
+    </Rectangle>
+    <HotSpot>
+      <X>9</X>
+      <Y>50</Y>
+    </HotSpot>
+    <LinkSpot>
+      <X>9</X>
+      <Y>50</Y>
+    </LinkSpot>
+  </Sprite>
+</SpriteSet>

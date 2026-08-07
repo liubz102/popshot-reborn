@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="ks_c_5601-1987"?>
+<ArrayOfEvent xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>30</StartTick>
+    <ResourcePath>ch105@Reload02.ogg</ResourcePath>
+  </Event>
+</ArrayOfEvent>

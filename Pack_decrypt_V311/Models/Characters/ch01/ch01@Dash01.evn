@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="ks_c_5601-1987"?>
+<ArrayOfEvent xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>1</StartTick>
+    <ResourcePath>ch01@Martial03.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>1</StartTick>
+    <ResourcePath>FX/char/KR/voice/ch01_Casil/ch01@Dash_voice_01.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <TypeIdx>1</TypeIdx>
+    <StartTick>1</StartTick>
+    <ResourcePath>CH01/WP00/Efx/CH01_DashAttack01.efx</ResourcePath>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <TypeIdx>1</TypeIdx>
+    <StartTick>1</StartTick>
+    <ResourcePath>CH01/WP00/Efx/CH01_DashDust00.efx</ResourcePath>
+  </Event>
+</ArrayOfEvent>

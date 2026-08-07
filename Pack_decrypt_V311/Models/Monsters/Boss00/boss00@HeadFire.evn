@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="ks_c_5601-1987"?>
+<ArrayOfEvent xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Event>
+    <Type>PlaySound</Type>
+    <StartTick>10</StartTick>
+    <ResourcePath>Boss00@Scream03.ogg</ResourcePath>
+    <TypeIdx>0</TypeIdx>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <StartTick>35</StartTick>
+    <ResourcePath>Boss00@HeadFire.ogg</ResourcePath>
+    <TypeIdx>0</TypeIdx>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <StartTick>46</StartTick>
+    <ResourcePath>Boss00@HeadFire.ogg</ResourcePath>
+    <TypeIdx>0</TypeIdx>
+  </Event>
+  <Event>
+    <Type>PlaySound</Type>
+    <StartTick>58</StartTick>
+    <ResourcePath>Boss00@HeadFire.ogg</ResourcePath>
+    <TypeIdx>0</TypeIdx>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <StartTick>1</StartTick>
+    <ResourcePath>FrogBoss/Efx/FrogBoss_HeadFire.efx</ResourcePath>
+    <TypeIdx>1</TypeIdx>
+  </Event>
+</ArrayOfEvent>

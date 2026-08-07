@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="ks_c_5601-1987"?>
+<ArrayOfEvent xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Event>
+    <Type>PlaySound</Type>
+    <TypeIdx>0</TypeIdx>
+    <StartTick>15</StartTick>
+    <ResourcePath>FX/char/KR/voice/ch105_Valkyrie/ch102@ILoveYou.ogg</ResourcePath>
+  </Event>
+  <Event>
+    <Type>RenderEffect</Type>
+    <TypeIdx>1</TypeIdx>
+    <StartTick>1</StartTick>
+    <ResourcePath>Emotion/Efx/CH102_ILoveYou00.efx</ResourcePath>
+  </Event>
+</ArrayOfEvent>
