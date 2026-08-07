@@ -65,12 +65,11 @@ start.bat
 日常运行服务端不需要第三方 Python 包。部分逆向辅助脚本需要 `capstone`；Ghidra、
 x64dbg、Sysinternals 等工具只在继续逆向时需要，正常玩游戏不需要。
 
-当前脚本包含两处本机路径约定：
+当前脚本包含本机路径约定：
 
-- `tools/launch.ps1` 默认使用 `C:\Python314\python.exe`
 - `hook/build.bat` 默认使用 Visual Studio 2017 Build Tools 的 `vcvars32.bat`
 
-如果安装位置不同，请先修改这两个脚本中的对应变量。
+如果安装位置不同，请先修改脚本中的对应变量。
 
 
 ## 启动与关闭
@@ -119,14 +118,12 @@ python tools/gs_ctl.py help
 ```
 
 它可以手动触发结算、掉落、死亡、换图和回房间等包，用于快速验证协议，不是正常游玩
-流程的一部分。完整命令和注意事项见 [PROGRESS.md](.claude/PROGRESS.md)。
+流程的一部分。
 
 ## 目录结构
 
 | 路径 | 内容 |
 |---|---|
-| `CLAUDE.md` | AI 接手入口和工程铁律 |
-| `.claude/` | 计划、进度、结论、决策和会话记录 |
 | `hook/` | 注入 DLL、启动器源码及构建脚本 |
 | `server/` | 本地认证服、游戏服、协议和测试 |
 | `tools/` | 自写逆向、探针、截图和自动化脚本 |
@@ -134,13 +131,6 @@ python tools/gs_ctl.py help
 | `game_patched/` | 实际运行的客户端工作副本 |
 | `logs/` | 抓包、运行日志和临时截图 |
 
-`.claude/` 不是可以删除的编辑器缓存。它保存了跨会话继续这项逆向工程所需的事实、
-失败路线和设计理由，因此被有意纳入版本控制。新接手者建议依次阅读：
-
-1. [PROGRESS.md](.claude/PROGRESS.md)
-2. [FINDINGS.md](.claude/FINDINGS.md)
-3. [DECISIONS.md](.claude/DECISIONS.md)
-4. [PLAN.md](.claude/PLAN.md)
 
 ## 常见问题
 
