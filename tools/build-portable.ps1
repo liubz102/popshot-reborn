@@ -64,6 +64,7 @@ try {
 
     Copy-RequiredDirectory 'runtime'
     Copy-RequiredDirectory 'hook\bin'
+    Copy-RequiredDirectory 'readmeResource'
 
     foreach ($file in @(
         'tools\launch.ps1',
