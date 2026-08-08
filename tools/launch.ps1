@@ -112,11 +112,12 @@ if ($running -and $lastMode -eq $Mode) {
     }
     Stop-ListenerOn @($AuthPort, $GamePort, 27800)
 
-    $gameArgs = @((Join-Path $Root 'server\gameserver.py'))
+    # Start-Process 不会替 -ArgumentList 中的绝对路径补引号；相对路径可兼容带空格的项目目录。
+    $gameArgs = @('server\gameserver.py')
     if ($DebugLog) { $gameArgs += '--verbose' }
 
     Start-Process -FilePath $Python -WorkingDirectory $Root `
-        -ArgumentList @((Join-Path $Root 'server\authserver.py'), '--port', "$AuthPort", '--reply', 'login') `
+        -ArgumentList @('server\authserver.py', '--port', "$AuthPort", '--reply', 'login') `
         -RedirectStandardOutput (Join-Path $LogDir 'authserver.out') `
         -RedirectStandardError  (Join-Path $LogDir 'authserver.err') `
         -WindowStyle Hidden | Out-Null
