@@ -48,6 +48,9 @@
 /server/data/accounts.json
 /server/data/accounts.json.*.tmp
 
+/game_patched/Debug/
+/game_patched/GameGuard/*.erl
+
 # ---------------------------------------------------------------------------
 # Python 缓存、测试缓存和本地虚拟环境
 # ---------------------------------------------------------------------------
