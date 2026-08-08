@@ -41,6 +41,7 @@ gameserver.py —— 假游戏服（阶段 5 里程碑 B），监听 127.0.0.1:2
     python server/gameserver.py --version-result 1
 """
 import argparse
+import contextlib
 import datetime
 import os
 import socket
@@ -1845,7 +1846,12 @@ class Conn:
         else:
             self.fb_raw = self.fb_dec = None
         # 控制通道的线程会从另一个线程调 send()，加密流是有状态的，必须串行化。
-        self.send_lock = threading.Lock()
+        # 用 RLock：send_batch() 会先拿锁再在同一个线程里反复调 send()。
+        self.send_lock = threading.RLock()
+        # send_batch() 期间攒着的明文包；非 None 时 send() 只入队不发。
+        self.send_queue = None
+        # 只给 `--room-burst-delay` 用：每发完一个包故意等这么久，复现 §120。
+        self.batch_delay_ms = 0
         register_conn(self)
 
     def log(self, msg):
@@ -1864,7 +1870,63 @@ class Conn:
         # 客户端从此再也解不回来。控制通道存在之后这不再是理论风险。
         with self.send_lock:
             self.vlog(f"→ 发出 {len(plain)} 字节明文\n{hexdump(plain)}")
+            if self.send_queue is not None:
+                self.send_queue.append(plain)
+                return
             self.sock.sendall(self.cout.encrypt(plain))
+            if self.batch_delay_ms:
+                time.sleep(self.batch_delay_ms / 1000.0)
+
+    @contextlib.contextmanager
+    def send_batch(self, reason=""):
+        """把块内所有 `send()` 攒成**一次** `sendall`。
+
+        ★ 这不是性能优化，是**修一个时序 bug**（FINDINGS §120）。
+
+        客户端是「每帧 recv 一次 → 把收到的包全部分发完 → 下一帧才真正
+        构造新 stage」。`ChangeStage`(`0x40e47f`) 只记下工厂函数，
+        `RoomStage` 构造函数 `0x466979` 要到下一帧才跑，它在
+        `0x466ea3` 处**一次性**建出「人物选择」的头像按钮，之后除了拖滚动条
+        再也不会重建。
+
+        所以只要 `0x0201`（触发 ChangeStage）和 `0x030b`（角色清单）落在
+        **同一帧的那一次 recv 里**就万事大吉；一旦客户端的 recv 恰好插进
+        两次 `sendall` 之间，房间就用一份空清单建 UI —— 头像缩回 3 个，
+        而且这一局再也回不来。实测两次 sendall 之间隔着一次 `log()`
+        （约 1 ms），客户端一帧 16 ms，所以是「小概率、时有时无」。
+
+        攒成一次写之后，四个包要么一起进客户端的接收缓冲、要么一起不进,
+        这个窗口就没有了。SimpleCipher 是逐字节流密码，
+        `encrypt(a+b) == encrypt(a)+encrypt(b)`，下发字节一个都没变。
+        """
+        delay_ms = getattr(self.args, "room_burst_delay", 0) or 0
+        if delay_ms > 0:
+            # --room-burst-delay：故意退回「一包一次 sendall」并拉开间隔，
+            # 用来复现这个 bug（同 D047 的思路：留一个能一键回到坏行为的开关）。
+            self.log(f"   （--room-burst-delay {delay_ms}ms：不合并，"
+                     f"逐包发送{reason}）")
+            with self.send_lock:
+                self.batch_delay_ms = delay_ms
+                try:
+                    yield
+                finally:
+                    self.batch_delay_ms = 0
+            return
+        with self.send_lock:
+            if self.send_queue is not None:
+                # 已经在批里了，不嵌套（内层 with 结束就把整批发出去会破坏语义）。
+                yield
+                return
+            self.send_queue = []
+            try:
+                yield
+            finally:
+                packets, self.send_queue = self.send_queue, None
+                if packets:
+                    plain = b"".join(packets)
+                    self.log(f"   （{len(packets)} 个包 {len(plain)} 字节"
+                             f"合并成一次发送{reason}）")
+                    self.sock.sendall(self.cout.encrypt(plain))
 
     def send_update_session(self, map_name=""):
         """把当前房间的 `Session` 下发给客户端（opcode 0x0303）。
@@ -2383,11 +2445,16 @@ class Conn:
         没有逐条读到底。实测走「关卡 → 结算 → 回房间」这条路清单**没被清**，
         但重发一次是幂等的整份替换，成本一个包，比漏了让「人物选择」
         缩回 3 个头像划算（§119）。
+
+        ★ 三个包必须一起进客户端的同一次 recv：`0x0403` 的处理器 `0x551904`
+        最后就是 `ChangeStage(5)`，房间 UI 会在**下一帧**重建「人物选择」
+        的头像按钮。晚一帧到的 `0x030b` 就白发了（§120，和建房那一处同因）。
         """
-        self.log("← 回 0x0403（结算看完 -> 切回 stage 5 房间）")
-        self.send(build_game(OP_LOADING_DONE, b""))
-        self.send_rep_money(reason="（回房间后金币会被清 0，重新同步）")
-        self.send_slot_equipped_list(reason="（回房间后清单会被重建，重新同步）")
+        with self.send_batch("；回房间三连发不能被客户端的 recv 切开"):
+            self.log("← 回 0x0403（结算看完 -> 切回 stage 5 房间）")
+            self.send(build_game(OP_LOADING_DONE, b""))
+            self.send_rep_money(reason="（回房间后金币会被清 0，重新同步）")
+            self.send_slot_equipped_list(reason="（回房间后清单会被重建，重新同步）")
         # 回到房间就可以再开一局，把开局状态机和本局的关卡状态复位。
         self.reset_quest_state()
         self.start_game.reset()
@@ -2479,21 +2546,25 @@ class Conn:
                 # diagnostic. This preserves compatibility with an unobserved
                 # regional packet variant without hiding the mismatch.
                 self.log(f"   建房参数解析失败: {error}; 开局状态机仍已重置")
+            # ★ 这四个包必须一起进客户端的**同一次 recv**，否则「人物选择」
+            #   会小概率缩回 3 个头像 —— 房间 UI 只在构造时建一次按钮，
+            #   而 0x0201 一被分发就排好了 ChangeStage（§120）。
             # ★ 顺序是硬约束：0x0303 必须排在 0x0201 应答**之前**。
             # 建房应答处理器 0x54f747 在 0x54f875 处直接读 [LobbyStage+0x1c]
             # 决定建哪个房间面板；`LobbyStage` 构造函数 0x4052ff 把它初始化成
             # -1，客户端自己永远不会填。先回 0x0201 的话，那一刻描述符还是
             # -1，客户端就会建 PvP 面板，其每帧刷新拿 -1 去索引模式名表读到
             # 空指针，约 5 秒后 C0000005 崩溃（FINDINGS §64 / §65）。
-            self.send_update_session()
-            self.log("← 回 gspRepCreateSession(result=0, session_id=1)")
-            self.send(build_game(0x0201, build_rep_create_session(1)))
-            # 反过来，座位快照必须排在 0x0201 **之后**：0x54f815 会把座位 0
-            # 的角色 id 清零，先发就被冲掉。
-            self.send_session_members()
-            # 再补一发座位的物品清单。它决定「人物选择」里有几个头像，
-            # 而且必须排在 0x0300 之后（持有判定要先看座位已占用，§119）。
-            self.send_slot_equipped_list(reason="（建房后下发）")
+            with self.send_batch("；建房四连发不能被客户端的 recv 切开"):
+                self.send_update_session()
+                self.log("← 回 gspRepCreateSession(result=0, session_id=1)")
+                self.send(build_game(0x0201, build_rep_create_session(1)))
+                # 反过来，座位快照必须排在 0x0201 **之后**：0x54f815 会把座位 0
+                # 的角色 id 清零，先发就被冲掉。
+                self.send_session_members()
+                # 再补一发座位的物品清单。它决定「人物选择」里有几个头像，
+                # 而且必须排在 0x0300 之后（持有判定要先看座位已占用，§119）。
+                self.send_slot_equipped_list(reason="（建房后下发）")
         elif opcode == OP_SESSION_MEMBER_UPDATE:
             self.on_seat_change(payload)
         elif opcode == OP_LEAVE_SESSION:
@@ -3042,6 +3113,11 @@ def main():
     ap.add_argument("--no-death-reply", action="store_true",
                     help="收到 0x0408 也不回死亡广播（回到会话 14 及以前的行为，"
                          "角色血量归零后不死不重生）。只在对比排查时用。")
+    ap.add_argument("--room-burst-delay", type=int, default=0, metavar="毫秒",
+                    help="建房/回房间的那一串包不合并，并且每个之间等这么久"
+                         "（回到会话 21 及以前的行为）。用来**复现**「进房间只剩"
+                         "3 个角色」：客户端只要在这个缝里 recv 一次，房间就用"
+                         "空清单建 UI。0 = 合并成一次发送（默认，§120）。")
     ap.add_argument("--control-port", type=int, default=CONTROL_PORT,
                     help="调试控制通道端口（tools/gs_ctl.py 连它）；0 = 关闭")
     ap.add_argument("--verbose", action="store_true",

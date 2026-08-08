@@ -734,9 +734,27 @@ static int try_patch_afk_timer(void)
 /*   （角色 3 아이린 要的 0x1a/0x1b 同样越界，但它被 `0x4f58f1` 显式跳过，    */
 /*     根本不会建按钮，不用管。）                                             */
 /*                                                                            */
+/*   ── 第四处：待机房间里「关卡 ◀ ▶」按钮的关卡环 ──                        */
+/*                                                                            */
+/*   上面两处只管**地图目录**和**建房对话框的下拉框**。进了待机房间之后，     */
+/*   右侧 `DlgSelectQuestMap` 的 `stageLBtn` / `stageRBtn` 用的是**另一张**   */
+/*   表 —— `DlgSelectQuestMap::OnEvent`（`0x466264`）当场按地区**写死**       */
+/*   一个关卡 id 的环形数组（`0x466727` 是 push_back）：                      */
+/*       locale 0 韩 / 1 日  -> 0x466364: [3,2,1,4,5,6,7,3]                   */
+/*       locale 2 中         -> 0x466329: [3,2,1,4,3]        ★ 只有 4 关     */
+/*   （首元素 3 在末尾重复一次，两个方向才都能绕回去。）                      */
+/*   它和 map.ini / OpenLocale **一点关系都没有**，所以会话 21 的两个 patch  */
+/*   管不到它 —— 表现就是「新关卡只能在建房界面选，进房间就换不过去」。       */
+/*   实测日志里房间按 ◀ ▶ 发出的 0x0302 正好循环 3→2→1→4→3。                 */
+/*                                                                            */
+/*   改法：`0x46631d` 的 `je 0x466364`(74 45) -> `jmp`(EB 45)，2 字节换       */
+/*   2 字节，让中国区也走韩/日那条 7 关的分支。中国区专属的 4 关分支          */
+/*   （`0x46631f`..`0x466362`）就此变成死代码，别的地区判定一个不动 ——       */
+/*   尤其**不碰** `0x466309` 那句「中国版难度上限 3 档」。                    */
+/*                                                                            */
 /*   设环境变量 BSHOOK_KEEP_REGION_LOCK=1 可以整组保留原版行为。              */
 /* -------------------------------------------------------------------------- */
-#define REGION_PATCH_COUNT 3
+#define REGION_PATCH_COUNT 4
 /* 每处都验一段上下文再动手：2 字节的特征太短，光比 `8B 08` 容易撞上密文。 */
 static const struct {
     unsigned int va;          /* 特征串起始 VA                    */
@@ -762,6 +780,11 @@ static const struct {
                              "\x6A\x18\x58\x6A\x19\xEB\x1A",
       (const unsigned char *)"\x6A\x10\x58\x6A\x11", /* push 0x10 / pop eax / push 0x11 */
       "角色 110 战斗内图标（0x18/0x19 越界 -> 借用 106 的 0x10/0x11）" },
+    { 0x00466318u, 17, 5, 2,
+      (const unsigned char *)"\x2B\xC1\x88\x5D\xFC\x74\x45\x48\x74\x42"
+                             "\x48\x0F\x85\xC3\x00\x00\x00",
+      (const unsigned char *)"\xEB\x45",          /* je -> jmp（永远走韩/日分支）*/
+      "房间「关卡 ◀ ▶」的关卡环（4 关 -> 7 关）" },
 };
 static volatile LONG g_region_patched = 0;
 
@@ -1290,7 +1313,8 @@ static DWORD WINAPI patch_thread(LPVOID param)
         }
         if (!g_region_patched)
             bslog("PATCH   !! 超时未能 patch 地区差异"
-                  "（0x40b419 / 0x4368cf / 0x4f67d1 的特征串一直对不上）");
+                  "（0x40b419 / 0x4368cf / 0x4f67d1 / 0x46631d "
+                  "的特征串一直对不上）");
     }
 
     if (!afk_kick_disabled()) {

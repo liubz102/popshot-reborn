@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import struct
+import threading
 import unittest
 
 from gameserver import (
@@ -89,11 +90,13 @@ from gameserver import (
     parse_req_change_to_next_map,
     EQUIPPED_SLOT_MASK_COUNT,
     OP_SLOT_EQUIPPED_LIST,
+    build_rep_list_session,
     build_slot_equipped_list,
     take_frame,
     w_i32,
     w_wstr,
 )
+from simple import SimpleCipher
 from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_PER_LEVEL,
                            PREMIUM_CHARACTER_IDS, QUEST_DIFFICULTY_MAX,
                            QUEST_ID_TABLE, character_item_id,
@@ -739,6 +742,12 @@ class LeaveSessionTests(unittest.TestCase):
         conn.noisy_seen = set()
         conn.log = conn.logged.append
         conn.send = conn.sent.append
+        # send_batch() 只管「这些包合成一次 sendall」，对逐包断言透明：
+        # send 被换成 append 之后 send_queue 永远是空的，退出时什么都不发。
+        # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
+        conn.send_lock = threading.RLock()
+        conn.send_queue = None
+        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = True
         conn.quest_score = 64
@@ -976,6 +985,12 @@ class NoisyPacketLoggingTests(unittest.TestCase):
         conn.last_position = None
         conn.log = conn.logged.append
         conn.send = conn.sent.append
+        # send_batch() 只管「这些包合成一次 sendall」，对逐包断言透明：
+        # send 被换成 append 之后 send_queue 永远是空的，退出时什么都不发。
+        # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
+        conn.send_lock = threading.RLock()
+        conn.send_queue = None
+        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 0
@@ -1062,6 +1077,12 @@ class DeathAndRespawnTests(unittest.TestCase):
         conn.respawn_sent = 0
         conn.log = conn.logged.append
         conn.send = conn.sent.append
+        # send_batch() 只管「这些包合成一次 sendall」，对逐包断言透明：
+        # send 被换成 append 之后 send_queue 永远是空的，退出时什么都不发。
+        # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
+        conn.send_lock = threading.RLock()
+        conn.send_queue = None
+        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 0
@@ -1250,6 +1271,12 @@ class QuestScoreTests(unittest.TestCase):
         conn.last_position = None
         conn.log = conn.logged.append
         conn.send = conn.sent.append
+        # send_batch() 只管「这些包合成一次 sendall」，对逐包断言透明：
+        # send 被换成 append 之后 send_queue 永远是空的，退出时什么都不发。
+        # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
+        conn.send_lock = threading.RLock()
+        conn.send_queue = None
+        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 0
@@ -1312,6 +1339,12 @@ class MapTransitionTests(unittest.TestCase):
         conn.last_position = None
         conn.log = conn.logged.append
         conn.send = conn.sent.append
+        # send_batch() 只管「这些包合成一次 sendall」，对逐包断言透明：
+        # send 被换成 append 之后 send_queue 永远是空的，退出时什么都不发。
+        # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
+        conn.send_lock = threading.RLock()
+        conn.send_queue = None
+        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 0
@@ -1462,6 +1495,12 @@ class ItemDropTests(unittest.TestCase):
         conn.last_position = None
         conn.log = conn.logged.append
         conn.send = conn.sent.append
+        # send_batch() 只管「这些包合成一次 sendall」，对逐包断言透明：
+        # send 被换成 append 之后 send_queue 永远是空的，退出时什么都不发。
+        # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
+        conn.send_lock = threading.RLock()
+        conn.send_queue = None
+        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 0
@@ -1567,6 +1606,12 @@ class QuestClearFlagTests(unittest.TestCase):
         conn.last_position = None
         conn.log = conn.logged.append
         conn.send = conn.sent.append
+        # send_batch() 只管「这些包合成一次 sendall」，对逐包断言透明：
+        # send 被换成 append 之后 send_queue 永远是空的，退出时什么都不发。
+        # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
+        conn.send_lock = threading.RLock()
+        conn.send_queue = None
+        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 100
@@ -1688,6 +1733,12 @@ class ItemPickupTests(unittest.TestCase):
         conn.last_position = None
         conn.log = conn.logged.append
         conn.send = conn.sent.append
+        # send_batch() 只管「这些包合成一次 sendall」，对逐包断言透明：
+        # send 被换成 append 之后 send_queue 永远是空的，退出时什么都不发。
+        # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
+        conn.send_lock = threading.RLock()
+        conn.send_queue = None
+        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 0
@@ -1812,6 +1863,12 @@ class ResultScreenNumbersTests(unittest.TestCase):
         conn.last_position = None
         conn.log = conn.logged.append
         conn.send = conn.sent.append
+        # send_batch() 只管「这些包合成一次 sendall」，对逐包断言透明：
+        # send 被换成 append 之后 send_queue 永远是空的，退出时什么都不发。
+        # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
+        conn.send_lock = threading.RLock()
+        conn.send_queue = None
+        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = score
@@ -1958,6 +2015,12 @@ class QuestDifficultyTests(unittest.TestCase):
         conn.last_position = None
         conn.log = conn.logged.append
         conn.send = conn.sent.append
+        # send_batch() 只管「这些包合成一次 sendall」，对逐包断言透明：
+        # send 被换成 append 之后 send_queue 永远是空的，退出时什么都不发。
+        # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
+        conn.send_lock = threading.RLock()
+        conn.send_queue = None
+        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2, "arguments": quest}
         conn.settled = False
         conn.quest_score = 10
@@ -2155,6 +2218,12 @@ class CharacterUnlockTests(unittest.TestCase):
         conn.noisy_seen = set()
         conn.log = conn.logged.append
         conn.send = conn.sent.append
+        # send_batch() 只管「这些包合成一次 sendall」，对逐包断言透明：
+        # send 被换成 append 之后 send_queue 永远是空的，退出时什么都不发。
+        # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
+        conn.send_lock = threading.RLock()
+        conn.send_queue = None
+        conn.batch_delay_ms = 0
         conn.my_seat = 0
         conn.account_name = "tester"
         conn.account = account if account is not None else {
@@ -2332,6 +2401,169 @@ class CharacterUnlockTests(unittest.TestCase):
         self.addCleanup(lambda: gameserver._conns.__setitem__(slice(None), saved))
         gameserver.handle_control_command("equipped 0")
         self.assertEqual([], self.parse_equipped(conn.sent[0])[2])
+
+
+class SendBatchTests(unittest.TestCase):
+    """`send_batch()`：把一组包合成**一次** `sendall`（会话 22，§120）。
+
+    这不是性能优化。客户端每帧 recv 一次、把收到的包全分发完，
+    `ChangeStage` 只是记下工厂函数，`RoomStage` 构造函数下一帧才跑，
+    它**一次性**建出「人物选择」的头像按钮、之后不会重建。
+    所以 `0x0201`（触发换 stage）和 `0x030b`（角色清单）一旦被客户端的
+    recv 切成两帧，房间就用空清单建 UI —— 头像缩回 3 个，这一局回不来。
+
+    这里用真的 `Conn.send` / `Conn.send_batch` + 一个记账用的假 socket，
+    因为要测的正好是「落到 socket 上的是几次写、字节是什么」。
+    """
+
+    class FakeSocket:
+        def __init__(self):
+            self.writes = []
+
+        def sendall(self, data):
+            self.writes.append(bytes(data))
+
+    class Args:
+        hold_lobby = False
+        accounts = None
+        login_result = 0
+        room_burst_delay = 0
+
+    def make_conn(self):
+        conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.args = self.Args()
+        conn.sock = self.FakeSocket()
+        conn.cout = SimpleCipher.server_to_client()
+        conn.send_lock = threading.RLock()
+        conn.send_queue = None
+        conn.batch_delay_ms = 0
+        conn.logged = []
+        conn.log = conn.logged.append
+        conn.vlog = lambda _msg: None
+        conn.last_packet_at = 0.0
+        conn.noisy_seen = set()
+        conn.my_seat = 0
+        conn.room = None
+        conn.start_game = StartGameHandshake()
+        conn.accounts = None
+        conn.account_name = "tester"
+        conn.account = {"level": 1, "experience": 0, "money": 0, "character": 0}
+        return conn
+
+    @staticmethod
+    def frames_of(blob):
+        """把一段明文里的帧全部取出来，返回 opcode 列表。"""
+        opcodes, rest = [], bytearray(blob)
+        while rest:
+            _, opcode, _, consumed = take_frame(rest)
+            opcodes.append(opcode)
+            del rest[:consumed]
+        return opcodes
+
+    def decrypted(self, conn):
+        """把假 socket 上的所有写按顺序解回明文。"""
+        cin = SimpleCipher.server_to_client()
+        return cin.decrypt(b"".join(conn.sock.writes))
+
+    def test_a_batch_leaves_the_socket_as_exactly_one_write(self):
+        conn = self.make_conn()
+        with gameserver.Conn.send_batch(conn):
+            conn.send(build_game(0x0200, build_rep_list_session()))
+            conn.send(build_game(0x0201, build_rep_create_session(1)))
+        self.assertEqual(1, len(conn.sock.writes))
+        self.assertEqual([0x0200, 0x0201], self.frames_of(self.decrypted(conn)))
+
+    def test_batching_does_not_change_a_single_byte_on_the_wire(self):
+        # SimpleCipher 是逐字节推进的流密码，encrypt(a+b) == encrypt(a)+encrypt(b)。
+        # 合并只改变「写了几次」，不改变写出去的字节 —— 这条必须钉死，
+        # 否则客户端的解密流会从这里开始永久错位。
+        packets = [build_game(0x0200, build_rep_list_session()),
+                   build_game(0x0201, build_rep_create_session(1)),
+                   build_game(OP_SLOT_EQUIPPED_LIST,
+                              build_slot_equipped_list(0, [101400001]))]
+        one_by_one = self.make_conn()
+        for packet in packets:
+            one_by_one.send(packet)
+        batched = self.make_conn()
+        with gameserver.Conn.send_batch(batched):
+            for packet in packets:
+                batched.send(packet)
+        self.assertEqual(3, len(one_by_one.sock.writes))
+        self.assertEqual(1, len(batched.sock.writes))
+        self.assertEqual(b"".join(one_by_one.sock.writes),
+                         b"".join(batched.sock.writes))
+
+    def test_an_empty_batch_writes_nothing(self):
+        conn = self.make_conn()
+        with gameserver.Conn.send_batch(conn):
+            pass
+        self.assertEqual([], conn.sock.writes)
+
+    def test_the_batch_is_flushed_even_if_the_block_raises(self):
+        # 中途抛异常也要把已经攒下的字节发出去：漏发比早发危险得多
+        # （客户端会一直等那个应答）。
+        conn = self.make_conn()
+        with self.assertRaises(RuntimeError):
+            with gameserver.Conn.send_batch(conn):
+                conn.send(build_game(0x0200, build_rep_list_session()))
+                raise RuntimeError("boom")
+        self.assertEqual(1, len(conn.sock.writes))
+        self.assertEqual([0x0200], self.frames_of(self.decrypted(conn)))
+
+    def test_a_nested_batch_does_not_flush_early(self):
+        conn = self.make_conn()
+        with gameserver.Conn.send_batch(conn):
+            conn.send(build_game(0x0200, build_rep_list_session()))
+            with gameserver.Conn.send_batch(conn):
+                conn.send(build_game(0x0201, build_rep_create_session(1)))
+            self.assertEqual([], conn.sock.writes)
+        self.assertEqual(1, len(conn.sock.writes))
+        self.assertEqual([0x0200, 0x0201], self.frames_of(self.decrypted(conn)))
+
+    def test_a_plain_send_outside_a_batch_still_goes_out_immediately(self):
+        conn = self.make_conn()
+        conn.send(build_game(0x0200, build_rep_list_session()))
+        self.assertEqual(1, len(conn.sock.writes))
+
+    def test_room_burst_delay_puts_the_broken_behaviour_back(self):
+        # `--room-burst-delay` 是复现开关（同 D047）：退回一包一次 sendall，
+        # 客户端的 recv 就又能插进缝里了。字节仍然一个不差。
+        conn = self.make_conn()
+        conn.args.room_burst_delay = 1
+        with gameserver.Conn.send_batch(conn):
+            conn.send(build_game(0x0200, build_rep_list_session()))
+            conn.send(build_game(0x0201, build_rep_create_session(1)))
+        self.assertEqual(2, len(conn.sock.writes))
+        self.assertEqual([0x0200, 0x0201], self.frames_of(self.decrypted(conn)))
+
+    # -- 真正要保住的两条链 -------------------------------------------------
+    def test_the_whole_room_burst_goes_out_in_one_write(self):
+        # ★ 这就是「进房间偶尔只剩 3 个角色」的修法本体。
+        conn = self.make_conn()
+        request = (w_wstr("想和做朋友吗?") + w_wstr("") + w_wstr("")
+                   + w_i32(0) + w_i32(2) + w_i32(3) + w_i32(1))
+        gameserver.Conn.on_game_packet(conn, 0x0201, request)
+        self.assertEqual(1, len(conn.sock.writes))
+        self.assertEqual([OP_UPDATE_SESSION, 0x0201,
+                          OP_SESSION_MEMBERS, OP_SLOT_EQUIPPED_LIST],
+                         self.frames_of(self.decrypted(conn)))
+
+    def test_returning_to_the_room_also_goes_out_in_one_write(self):
+        # 结算看完回房间同样会重建 RoomStage，同一个竞态。
+        conn = self.make_conn()
+        conn.quest_score = 0
+        conn.quest_success = False
+        conn.settled = False
+        conn.items_created = 0
+        conn.items_picked = 0
+        conn.next_item_handle = ITEM_HANDLE_BASE
+        conn.maps_entered = []
+        conn.map_change_pending = False
+        gameserver.Conn.leave_game_result(conn)
+        self.assertEqual(1, len(conn.sock.writes))
+        opcodes = self.frames_of(self.decrypted(conn))
+        self.assertEqual(gameserver.OP_LOADING_DONE, opcodes[0])
+        self.assertEqual(OP_SLOT_EQUIPPED_LIST, opcodes[-1])
 
 
 if __name__ == "__main__":
