@@ -51,9 +51,15 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from simple import SimpleCipher
-from account_store import (AccountStore, display_name, experience_bounds,
+from account_store import (AccountStore, BASE_CHARACTER_IDS,
+                           PREMIUM_CHARACTER_IDS, QUEST_DIFFICULTY_MAX,
+                           character_item_id, character_item_ids,
+                           character_unlock_all, display_name,
+                           experience_bounds, owned_characters,
                            player_character, player_experience, player_level,
-                           player_money, tutorial_state)
+                           player_money, quest_cleared_difficulty,
+                           quest_difficulty_records, quest_unlock_all,
+                           tutorial_state)
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -71,12 +77,21 @@ MAGIC_GAME = 0xFF
 OP_REP_LOGIN = 0x0100
 OP_LEAVE_SESSION = 0x0203
 OP_MOVE_CHANNEL_BY_GAME_TYPE = 0x020b
+#: 服务端方向：`gspQuestReachedDifficulty` = 「每一关你打到第几个难度了」的
+#: 全量快照。客户端处理器 `0x5539c2` 先把 map `[0x72e35c]` 清空再逐条灌进去。
+#: 不发这个包，那张 map 永远是空的 —— 每一关就只有「简单」能开局（§118）。
+#: 客户端方向没有这个 opcode。
+OP_QUEST_REACHED_DIFFICULTY = 0x020c
 OP_SESSION_MEMBERS = 0x0300
 #: 单个座位的变更事件。两个方向都用这个号但**载荷不同**：服务端方向多一个
 #: 开头的 action 字节（`0x40648d`），客户端方向没有（`0x558dcb`）。
 OP_SESSION_MEMBER_UPDATE = 0x0301
 OP_CHANGE_SESSION = 0x0302
 OP_UPDATE_SESSION = 0x0303
+#: `Packet_gspSlotEquippedList`（vft `0x65e0f8`）—— 某个座位的背包/装备清单。
+#: ★ **这是「人物选择里有几个头像」的唯一开关**（FINDINGS §119）。
+#: 客户端方向没有这个 opcode。
+OP_SLOT_EQUIPPED_LIST = 0x030b
 OP_REQ_FIRST_USER_RESULT = 0x030f
 OP_REP_MONEY = 0x0600
 OP_PREPARE_GAME = 0x0400
@@ -500,6 +515,10 @@ SESSION_TYPE_NAMES = {
     5: "ladder",
 }
 
+#: 闯关房。描述符的两个参数是 `(关卡 id, 难度)`（§68），准入校验
+#: `0x4683ba` 拿它俩去查「已达成难度」（§118）。
+SESSION_TYPE_QUEST = 2
+
 #: `SessionDescriptor::Serialize`（0x557374）按房间类型写几个 int32 参数。
 #: 解析客户端**发来**的描述符用这张表。
 DESCRIPTOR_SENT_ARGUMENT_COUNTS = {0: 1, 1: 3, 2: 2, 3: 1, 4: 1, 5: 3, 6: 3}
@@ -711,6 +730,40 @@ def build_rep_move_into(ok=True, channel_code=0, channel_index=0):
     return w_i32(1 if ok else 0) + w_i32(channel_code) + w_i32(channel_index)
 
 
+def build_quest_reached_difficulty(records):
+    """opcode 0x020c —— Packet_gspQuestReachedDifficulty（vft 0x691608）
+
+    ★ **这是「普通 / 困难难度能不能开局」的唯一开关**（FINDINGS §118）。
+
+    反序列化 `0x54cf4a → 0x555315` 读的是一个 `vector<pair<int32,int32>>`：
+
+        int32                        条目数（`0x5d5984`）
+        条目数 × { int32 关卡 id, int32 已达成难度 }   （`0x5558f2` 读两个 int32）
+
+    处理器 `0x5539c2` 先 `0x401312` 把全局 map `[0x72e35c]` **清空**，
+    再逐条 `0x47197a` 插进去 —— 所以这个包是**全量快照**，重发一次就是
+    整张表的新版本，不需要考虑增量。
+
+    客户端开局准入校验 `0x468176` 在闯关分支 `0x4683ba` 里：
+
+        reached = map[关卡 id]              ; 查不到就是 0
+        allowed = min(reached + 1, 4)
+        if 房间选的难度 > allowed:  错误码 5
+            -> 弹 0x66a758「플레이할 수 없는 난이도 입니다. 난이도를 낮춰주세요」
+               （中文本地化 =「无法进行的难度，请降低难度」）
+
+    也就是说服务端一直不发这个包 == map 恒空 == `allowed` 恒为 1 ==
+    每一关都只有「简单」能开。
+    """
+    items = sorted((int(quest_id), int(difficulty))
+                   for quest_id, difficulty in dict(records).items())
+    payload = [w_i32(len(items))]
+    for quest_id, difficulty in items:
+        payload.append(w_i32(quest_id))
+        payload.append(w_i32(difficulty))
+    return b"".join(payload)
+
+
 #: 房间座位数。`LobbyStage+0x40` 起，每项 0x3c 字节，固定 6 项
 #: —— `0x556eec` 的循环写死 `cmp [ebp-4], 6`，`0x404d42` 的取值器也拒收
 #: 越界下标（`cmp ecx,6 / jge`）。
@@ -804,6 +857,65 @@ def build_session_members(host_seat=0, seats=()):
         raise ValueError(f"host seat {host_seat} is out of range")
     return (w_i32(host_seat) + w_i32(0)
             + b"".join(build_session_slot(**seat) for seat in seats))
+
+
+#: 装备清单开头那 12 个字节 = 3 个 int32 位掩码（「哪几个装备槽被占了」）。
+#: 客户端只在**自己往清单里加/删物品**时才碰它们（`0x5583ab` 或进 `0x558423`
+#: 出），下发全 0 就等于「一个槽都没占」，正是我们要的初始状态。
+EQUIPPED_SLOT_MASK_COUNT = 3
+
+
+def build_slot_equipped_list(seat_index, item_ids=(), slot_masks=(0, 0, 0)):
+    """opcode 0x030b —— 某个座位的背包/装备物品清单。
+
+    ★ **这是「房间『人物选择』里能出现几个头像」的唯一开关**（FINDINGS §119）。
+
+    大厅分发器 `0x4061e2` 的跳表 `@0x406332` 索引 0x0b → `0x40628a` →
+    `0x406ea1`。处理器把包体反序列化成一个临时清单对象，再拿它**整体替换**
+    `[LobbyStage + 座位*4 + 0x250]`（先 `vf+8` 删旧的，再 `0x5f399e` 分配
+    0x50 字节新的、`0x414d95` 拷进去），最后 `0x406f42` 把清单套到该座位的
+    角色对象上。
+
+    线格式（`Packet_gspSlotEquippedList::Deserialize 0x404f1e`
+    → 清单自己的 `0x404c3f`）：
+
+        int32       座位号            -> 包 +0x04（处理器拿它算 0x250 的下标）
+        12 字节     槽位掩码 ×3       -> 清单 +0x0c（`0x5d59c1` 原样读 12 字节）
+        int32       物品数            -> `0x5d5984`
+        物品数 × int32  物品 id       -> 清单 +0x18 的 `vector<int32>`
+
+    角色选择怎么用它（`CharacterChanger` 建按钮时，`0x4f586c`）：
+
+        0x40713a(LobbyStage, 0)   数出按钮个数
+            for id in 100..110:  0x4070c2(id) 为真就 +1
+            return 计数 + 3                      ★ 0/1/2 三个基础角色白送
+        0x4070c2(id) = 我的座位(`+0x1cc`)已占用
+                       且 `[LobbyStage + 我的座位*4 + 0x250]` 非空
+                       且 0x55853c(清单, id)
+        0x55853c(清单, id):  id < 3 -> true
+                             否则在 `vector<int32>` 里找落在
+                             `[(id+1)*1e6, (id+2)*1e6)` 区间的物品
+
+    所以「只有 3 个角色可选」不是等级不够也不是资源缺失 —— 是这一发从来
+    没发过，清单恒空，11 个商城角色一个都过不了持有判定。
+
+    ⚠ 按钮是在**房间 UI 构造时**一次性建出来的（`0x40bd3b → 0x4776a3 →
+    0x4f586c`），后面再发这个包也不会重建。而 `ChangeStage`（`0x40e47f`）
+    只是记下工厂函数、下一帧才真的建 —— 所以只要和 `0x0300` 一起在建房应答
+    之后发出去，就赶得上（座位的「已占用」标记也正是 `0x0300` 写的）。
+    """
+    if not 0 <= seat_index < ROOM_SEAT_COUNT:
+        raise ValueError(f"seat {seat_index} is out of range")
+    masks = tuple(slot_masks)
+    if len(masks) != EQUIPPED_SLOT_MASK_COUNT:
+        raise ValueError(
+            f"equipped list needs exactly {EQUIPPED_SLOT_MASK_COUNT} slot "
+            f"masks, got {len(masks)}")
+    items = [int(item_id) for item_id in item_ids]
+    return (w_i32(seat_index)
+            + b"".join(w_i32(mask) for mask in masks)
+            + w_i32(len(items))
+            + b"".join(w_i32(item_id) for item_id in items))
 
 
 #: `0x0301` 的 action 码 —— 客户端 `0x4064f7` 起按它分支，每个码的副作用差别很大。
@@ -1809,6 +1921,30 @@ class Conn:
         self.send(build_game(OP_SESSION_MEMBERS,
                              build_session_members(host_seat, seats)))
 
+    def send_slot_equipped_list(self, seat_index=None, reason=""):
+        """把「这个座位持有哪些物品」下发给客户端（opcode 0x030b）。
+
+        ★ 不发这一发，房间右下角的「人物选择」永远只有 3 个基础角色 ——
+        11 个商城角色全部卡在客户端的持有判定上（FINDINGS §119）。
+
+        **必须排在 `0x0300` 之后**：持有判定 `0x4070da` 第一步就是
+        `0x4045f9` 查「我的座位已占用吗」，那个标记只有 `0x0300` 会写。
+        """
+        if seat_index is None:
+            seat_index = self.my_seat
+        item_ids = character_item_ids(self.account)
+        characters = owned_characters(self.account)
+        self.log(f"← 回 0x030b 座位 {seat_index} 物品清单("
+                 f"{len(item_ids)} 件; 商城角色 {characters}"
+                 f"{'，全开' if character_unlock_all(self.account) else '，按存档'}"
+                 f"){reason}")
+        try:
+            payload = build_slot_equipped_list(seat_index, item_ids)
+        except ValueError as error:
+            self.log(f"   无法下发 0x030b: {error}")
+            return
+        self.send(build_game(OP_SLOT_EQUIPPED_LIST, payload))
+
     def on_seat_change(self, payload):
         """客户端方向的 `0x0301` —— 房间里点「人物选择」换角色。
 
@@ -1870,6 +2006,61 @@ class Conn:
                  f"经验={experience} 本级 {level_start_exp}..{next_level_exp} "
                  f"等级={player_level(self.account)}){reason}")
         self.send(build_game(OP_REP_MONEY, build_rep_money_for(self.account)))
+
+    def send_quest_reached_difficulty(self, reason=""):
+        """把每一关「已达成难度」的全量快照下发（opcode 0x020c）。
+
+        ★ 不发这一发，房间里选「普通 / 困难」按开始就弹「无法进行的难度，
+        请降低难度」—— 客户端那张 map 只有服务端能填（FINDINGS §118）。
+        """
+        records = quest_difficulty_records(self.account)
+        self.log(f"← 回 gspQuestReachedDifficulty({len(records)} 关: "
+                 f"{ {qid: lv for qid, lv in sorted(records.items())} }"
+                 f"{'，全开' if quest_unlock_all(self.account) else '，逐级解锁'}"
+                 f"){reason}")
+        self.send(build_game(OP_QUEST_REACHED_DIFFICULTY,
+                             build_quest_reached_difficulty(records)))
+
+    def current_quest(self):
+        """当前房间的 `(关卡 id, 难度)`；不是闯关房或参数不全就返回 None。
+
+        闯关房的描述符是 type=2 + 两个参数 `(关卡 id, 难度)`（§68），
+        建房时由客户端发上来、我们原样存进 `self.room`。
+        """
+        room = self.room or {}
+        if room.get("session_type") != SESSION_TYPE_QUEST:
+            return None
+        arguments = room.get("arguments") or ()
+        if len(arguments) < 2:
+            return None
+        try:
+            return int(arguments[0]), int(arguments[1])
+        except (TypeError, ValueError):
+            return None
+
+    def record_quest_clear(self):
+        """通关入账：把「这一关的这个难度打通了」记进存档并重发 0x020c。
+
+        只有通关（客户端 `0x0417` 报 True）才调。记完如果解锁的难度真的往上
+        走了一格，就立刻重发一次全量快照 —— 结算完回房间就能直接选新难度，
+        不用重登。
+        """
+        quest = self.current_quest()
+        if quest is None or not self.account_name:
+            return
+        quest_id, difficulty = quest
+        if difficulty <= quest_cleared_difficulty(self.account, quest_id):
+            return
+        try:
+            self.account = self.accounts.set_quest_cleared(
+                self.account_name, quest_id, difficulty)
+        except KeyError:
+            self.log(f"   存档里没有账号 {self.account_name!r}；通关难度未记账")
+            return
+        unlocked = min(difficulty + 1, QUEST_DIFFICULTY_MAX)
+        self.log(f"   ★ 关卡 {quest_id} 难度 {difficulty} 通关入账 "
+                 f"-> 可选难度上限 {unlocked}")
+        self.send_quest_reached_difficulty(reason="（通关解锁新难度）")
 
     def on_first_user_result(self, payload):
         """客户端跑完新手教程后上报的进度值，落盘到 accounts.json。"""
@@ -2114,6 +2305,10 @@ class Conn:
         """
         if success is None:
             success = self.quest_success
+        if success:
+            # 通关了才解锁下一个难度。放在奖励入账之前，两者互不依赖，
+            # 但这样日志里「解锁」那行紧挨着「完成」标签，好对时序。
+            self.record_quest_clear()
         score = max(0, int(self.quest_score))
         if self.account_name:
             try:
@@ -2181,10 +2376,18 @@ class Conn:
         ★ **回房间后金币会变成 0**（会话 11 实测，§100）—— 经验和等级都还在，
         唯独金币这一格被清掉。补一发 `0x0600` 就好了，顺带也让经验/等级和存档
         重新对齐一次。
+
+        座位的物品清单也顺手补一发 `0x030b`。这一发是**防御性**的：
+        `0x406e4e`（把某个座位的清单重建成空的）有五个调用点，其中
+        `0x40f55c` / `0x40f619` / `0x40f7b9` 都在切 stage 的路上，
+        没有逐条读到底。实测走「关卡 → 结算 → 回房间」这条路清单**没被清**，
+        但重发一次是幂等的整份替换，成本一个包，比漏了让「人物选择」
+        缩回 3 个头像划算（§119）。
         """
         self.log("← 回 0x0403（结算看完 -> 切回 stage 5 房间）")
         self.send(build_game(OP_LOADING_DONE, b""))
         self.send_rep_money(reason="（回房间后金币会被清 0，重新同步）")
+        self.send_slot_equipped_list(reason="（回房间后清单会被重建，重新同步）")
         # 回到房间就可以再开一局，把开局状态机和本局的关卡状态复位。
         self.reset_quest_state()
         self.start_game.reset()
@@ -2252,6 +2455,9 @@ class Conn:
             # 登录包带得动等级和经验，唯独带不动金币（`0x54f2cc` 不写 0x72e330）。
             # 补一发 0x0600，右上角数据栏才和存档完全一致。
             self.send_rep_money(reason="（登录后补发，登录包没有金币字段）")
+            # 每一关的「已达成难度」。这张 map 只有服务端能填，不发就等于
+            # 全部关卡只有「简单」能开局（§118）。
+            self.send_quest_reached_difficulty(reason="（登录后下发）")
         elif opcode == 0x0200:
             self.log("← 回 gspRepListSession（空房间列表）")
             self.send(build_game(0x0200, build_rep_list_session()))
@@ -2285,6 +2491,9 @@ class Conn:
             # 反过来，座位快照必须排在 0x0201 **之后**：0x54f815 会把座位 0
             # 的角色 id 清零，先发就被冲掉。
             self.send_session_members()
+            # 再补一发座位的物品清单。它决定「人物选择」里有几个头像，
+            # 而且必须排在 0x0300 之后（持有判定要先看座位已占用，§119）。
+            self.send_slot_equipped_list(reason="（建房后下发）")
         elif opcode == OP_SESSION_MEMBER_UPDATE:
             self.on_seat_change(payload)
         elif opcode == OP_LEAVE_SESSION:
@@ -2531,8 +2740,20 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
                                   这条只给试探用；句柄看日志里 gspCreatedItem
                                   那行（drop 出来的从 0x40000000 起往上数）
   back-to-room                    发 0x0403（服务端方向 = 切回 stage 5 房间）
-  sync-account                    重读 accounts.json 并发 0x0600 gspRepMoney，
-                                  把右上角数据栏刷成存档里的金币/经验/等级
+  sync-account                    重读 accounts.json 并发 0x0600 gspRepMoney
+                                  + 0x020c gspQuestReachedDifficulty
+                                  + 0x030b gspSlotEquippedList，
+                                  把数据栏、难度解锁和角色解锁刷成存档里的样子
+  quest-difficulty [id 难度 ...]  发 0x020c 全量快照 = 「每关打到第几个难度」。
+                                  不带参数就按存档发（和登录时那一发一样）；
+                                  带参数就发指定的表（协议试探用），例如
+                                  `quest-difficulty 3 0` 把关卡 3 锁回只剩简单。
+                                  ★ 客户端只放行「已达成难度 + 1」以内的难度
+  equipped [座位 物品id ...]      发 0x030b 座位物品清单 = 「人物选择里有几个
+                                  头像」。不带参数就按存档发；`equipped 0`
+                                  把座位 0 的清单清空，复现只有 3 个角色的
+                                  原始状态。★ 要在房间里发才看得出效果，
+                                  而且按钮只在进房间那一刻建一次
   help                            这段
 """
 
@@ -2553,7 +2774,13 @@ def _control_status(conn):
             f"last_position={position} "
             f"maps_entered={getattr(conn, 'maps_entered', [])} "
             f"map_change_pending={getattr(conn, 'map_change_pending', False)} "
-            f"room_type={(conn.room or {}).get('session_type')}")
+            f"room_type={(conn.room or {}).get('session_type')} "
+            f"quest={conn.current_quest()} "
+            f"quest_unlock_all={quest_unlock_all(account)} "
+            f"quest_difficulty={ {qid: lv for qid, lv in sorted(quest_difficulty_records(account).items())} } "
+            f"character={player_character(account)} "
+            f"character_unlock_all={character_unlock_all(account)} "
+            f"owned_characters={owned_characters(account)}")
 
 
 def _control_ints(words, count, default=0):
@@ -2729,11 +2956,46 @@ def _dispatch_control_command(line):
         conn.send(build_game(OP_LOADING_DONE, b""))
         return "ok 已发 0x0403"
 
+    if cmd == "quest-difficulty":
+        if len(words) == 1:
+            conn.reload_account()
+            conn.send_quest_reached_difficulty(reason="（ctl）")
+            return "ok 已按存档发 0x020c " + _control_status(conn)
+        numbers = [int(word, 0) for word in words[1:]]
+        if len(numbers) % 2:
+            return "err 用法: quest-difficulty [关卡id 难度 ...]（成对给）"
+        records = dict(zip(numbers[0::2], numbers[1::2]))
+        conn.log(f"[ctl] ← 手动发 0x020c gspQuestReachedDifficulty({records})")
+        conn.send(build_game(OP_QUEST_REACHED_DIFFICULTY,
+                             build_quest_reached_difficulty(records)))
+        return f"ok 已发 0x020c {records}"
+
+    if cmd == "equipped":
+        # 不带参数 = 按存档重发；带参数 = 发指定的物品 id 表（协议试探用），
+        # 例如 `equipped 0` 把清单清空，复现「只有 3 个角色」的原始状态。
+        seat = conn.my_seat
+        if len(words) == 1:
+            conn.reload_account()
+            conn.send_slot_equipped_list(seat, reason="（ctl）")
+            return "ok 已按存档发 0x030b " + _control_status(conn)
+        seat = int(words[1], 0)
+        item_ids = [int(word, 0) for word in words[2:]]
+        conn.log(f"[ctl] ← 手动发 0x030b gspSlotEquippedList(座位={seat}, "
+                 f"{len(item_ids)} 件: {item_ids})")
+        try:
+            payload = build_slot_equipped_list(seat, item_ids)
+        except ValueError as error:
+            return f"err {error}"
+        conn.send(build_game(OP_SLOT_EQUIPPED_LIST, payload))
+        return f"ok 已发 0x030b 座位={seat} {len(item_ids)} 件 {item_ids}"
+
     if cmd == "sync-account":
         # 直接改了 accounts.json 之后不用重登游戏，一条命令就能让画面跟上。
         conn.reload_account()
         conn.send_rep_money(reason="（sync-account）")
-        return "ok 已重读存档并发 0x0600 " + _control_status(conn)
+        conn.send_quest_reached_difficulty(reason="（sync-account）")
+        conn.send_slot_equipped_list(reason="（sync-account）")
+        return "ok 已重读存档并发 0x0600 + 0x020c + 0x030b " + _control_status(conn)
 
     return f"err 未知命令 {cmd!r}；用 help 看命令表"
 

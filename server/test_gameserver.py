@@ -21,6 +21,7 @@ from gameserver import (
     OP_END_GAME,
     OP_LOADING_DONE,
     OP_MOVE_CHANNEL_BY_GAME_TYPE,
+    OP_QUEST_REACHED_DIFFICULTY,
     OP_RESPAWN_CHARACTER,
     OP_PREPARE_GAME,
     OP_SESSION_MEMBERS,
@@ -34,6 +35,7 @@ from gameserver import (
     build_rep_count_down,
     build_rep_create_session,
     build_rep_move_into,
+    build_quest_reached_difficulty,
     build_end_game,
     build_end_game_values,
     build_rep_quest_record_in_pvp,
@@ -85,12 +87,20 @@ from gameserver import (
     OP_MAP_CHANGE_READY,
     build_rep_change_to_next_map,
     parse_req_change_to_next_map,
+    EQUIPPED_SLOT_MASK_COUNT,
+    OP_SLOT_EQUIPPED_LIST,
+    build_slot_equipped_list,
     take_frame,
     w_i32,
     w_wstr,
 )
-from account_store import (EXPERIENCE_PER_LEVEL, experience_bounds,
-                           level_for_experience)
+from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_PER_LEVEL,
+                           PREMIUM_CHARACTER_IDS, QUEST_DIFFICULTY_MAX,
+                           QUEST_ID_TABLE, character_item_id,
+                           character_item_ids, character_unlock_all,
+                           experience_bounds, level_for_experience,
+                           owned_characters, quest_cleared_difficulty,
+                           quest_difficulty_records)
 import gameserver
 
 
@@ -780,10 +790,12 @@ class ControlChannelTests(unittest.TestCase):
                             "tutorial_completed": True}
             self.reloaded = 0
             self.money_sent = 0
+            self.difficulty_sent = 0
+            self.equipped_sent = 0
             self.my_seat = 0
             self.quest_score = 64
             self.last_position = (3225.0, 635.0)
-            self.room = {"session_type": 2}
+            self.room = {"session_type": 2, "arguments": (3, 1)}
             self.start_game = StartGameHandshake()
 
         def log(self, message):
@@ -800,6 +812,15 @@ class ControlChannelTests(unittest.TestCase):
 
         def send_rep_money(self, reason=""):
             self.money_sent += 1
+
+        def send_quest_reached_difficulty(self, reason=""):
+            self.difficulty_sent += 1
+
+        def send_slot_equipped_list(self, seat_index=None, reason=""):
+            self.equipped_sent += 1
+
+        def current_quest(self):
+            return gameserver.Conn.current_quest(self)
 
         def respawn_position(self):
             x, y = self.last_position
@@ -875,9 +896,31 @@ class ControlChannelTests(unittest.TestCase):
 
     def test_sync_account_rereads_the_store_before_sending(self):
         # 顺序要紧：先重读盘上的存档，再按它下发，否则发的还是旧值。
+        # 数据栏（0x0600）、难度解锁表（0x020c）和角色解锁表（0x030b）
+        # 都要跟着刷。
         reply = gameserver.handle_control_command("sync-account")
         self.assertTrue(reply.startswith("ok"))
-        self.assertEqual((1, 1), (self.conn.reloaded, self.conn.money_sent))
+        self.assertEqual((1, 1, 1, 1),
+                         (self.conn.reloaded, self.conn.money_sent,
+                          self.conn.difficulty_sent, self.conn.equipped_sent))
+
+    def test_quest_difficulty_without_arguments_follows_the_save(self):
+        reply = gameserver.handle_control_command("quest-difficulty")
+        self.assertTrue(reply.startswith("ok"), reply)
+        self.assertEqual((1, 1), (self.conn.reloaded, self.conn.difficulty_sent))
+        self.assertEqual([], self.conn.sent)
+
+    def test_quest_difficulty_with_arguments_sends_that_exact_table(self):
+        reply = gameserver.handle_control_command("quest-difficulty 3 0 1 2")
+        self.assertTrue(reply.startswith("ok"), reply)
+        kind, opcode, payload, _ = self.only_frame()
+        self.assertEqual(("game", OP_QUEST_REACHED_DIFFICULTY), (kind, opcode))
+        self.assertEqual((2, 1, 2, 3, 0), struct.unpack("<5i", payload))
+
+    def test_quest_difficulty_rejects_an_odd_argument_count(self):
+        reply = gameserver.handle_control_command("quest-difficulty 3")
+        self.assertTrue(reply.startswith("err"), reply)
+        self.assertEqual([], self.conn.sent)
 
     def test_status_reports_the_account_figures(self):
         reply = gameserver.handle_control_command("status")
@@ -1871,6 +1914,424 @@ class ResultScreenNumbersTests(unittest.TestCase):
         values = self.end_game_values(self.sent_with(conn, OP_END_GAME))
         self.assertEqual(4983, values[gameserver.END_GAME_EXPERIENCE])
         self.assertEqual(40, values[gameserver.END_GAME_MONEY_GAINED])
+
+
+class QuestDifficultyTests(unittest.TestCase):
+    """难度解锁：`0x020c gspQuestReachedDifficulty`（会话 20，§118）。
+
+    房间里选「普通 / 困难」按开始，客户端弹「无法进行的难度，请降低难度」
+    （韩文原串 `0x66a758`）。准入校验 `0x468176` 的闯关分支 `0x4683ba` 拿
+    `min(map[关卡 id] + 1, 4)` 当上限，而那张 map（`[0x72e35c]`）**只有
+    服务端的 `0x020c` / `0x0416` 能写**。我们一个都没发过，所以它恒空、
+    上限恒为 1 —— 只有「简单」能开局。
+    """
+
+    class Args:
+        hold_lobby = False
+        accounts = None
+
+    class FakeStore:
+        """只实现本组测试要用到的两个方法，行为跟 AccountStore 一致。"""
+
+        def __init__(self, account):
+            self.account = account
+            self.calls = []
+
+        def set_quest_cleared(self, username, quest_id, difficulty):
+            self.calls.append((username, quest_id, difficulty))
+            records = dict(self.account.get("quest_difficulty") or {})
+            if difficulty > int(records.get(str(quest_id), 0)):
+                records[str(quest_id)] = difficulty
+            self.account = dict(self.account, quest_difficulty=records)
+            return self.account
+
+        def add_quest_reward(self, username, experience=0, money=0):
+            return self.account
+
+    def make_conn(self, quest=(3, 1), account=None):
+        conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.args = self.Args()
+        conn.sent = []
+        conn.logged = []
+        conn.last_packet_at = 0.0
+        conn.noisy_seen = set()
+        conn.last_position = None
+        conn.log = conn.logged.append
+        conn.send = conn.sent.append
+        conn.room = {"session_type": 2, "arguments": quest}
+        conn.settled = False
+        conn.quest_score = 10
+        conn.quest_success = False
+        conn.next_item_handle = ITEM_HANDLE_BASE
+        conn.items_created = 0
+        conn.items_picked = 0
+        conn.my_seat = 0
+        conn.maps_entered = []
+        conn.map_change_pending = False
+        conn.account_name = "tester"
+        conn.account = account if account is not None else {
+            "experience": 0, "money": 0, "level": 1,
+            "quest_difficulty": {}, "quest_unlock_all": False,
+        }
+        conn.accounts = self.FakeStore(conn.account)
+        conn.start_game = StartGameHandshake()
+        return conn
+
+    @staticmethod
+    def parse_records(frame):
+        """把一发 0x020c 帧解回 `{关卡 id: 已达成难度}`。"""
+        opcode, body = take_frame(bytearray(frame))[1:3]
+        assert opcode == OP_QUEST_REACHED_DIFFICULTY, hex(opcode)
+        count = struct.unpack_from("<i", body, 0)[0]
+        pairs = struct.unpack_from(f"<{count * 2}i", body, 4)
+        assert len(body) == 4 + count * 8, len(body)
+        return dict(zip(pairs[0::2], pairs[1::2]))
+
+    def sent_with(self, conn, opcode):
+        return [f for f in conn.sent if take_frame(bytearray(f))[1] == opcode]
+
+    # -- 线格式 ------------------------------------------------------------
+    def test_wire_format_is_a_counted_vector_of_pairs(self):
+        payload = build_quest_reached_difficulty({3: 2, 1: 1})
+        self.assertEqual(4 + 2 * 8, len(payload))
+        self.assertEqual(2, struct.unpack_from("<i", payload, 0)[0])
+        self.assertEqual((1, 1, 3, 2),
+                         struct.unpack_from("<4i", payload, 4))
+
+    def test_an_empty_table_is_still_a_valid_packet(self):
+        # 客户端处理器先清空 map 再灌，条目数 0 是合法的「全部锁死」。
+        self.assertEqual(w_i32(0), build_quest_reached_difficulty({}))
+
+    # -- 存档 -> 下发 ------------------------------------------------------
+    def test_unlock_all_fills_every_quest_in_the_client_table(self):
+        records = quest_difficulty_records({"quest_unlock_all": True})
+        self.assertEqual(set(QUEST_ID_TABLE), set(records))
+        self.assertEqual({QUEST_DIFFICULTY_MAX}, set(records.values()))
+
+    def test_unlock_all_off_only_sends_what_was_actually_cleared(self):
+        account = {"quest_unlock_all": False, "quest_difficulty": {"3": 2}}
+        self.assertEqual({3: 2}, quest_difficulty_records(account))
+
+    def test_a_dirty_save_entry_never_kills_the_whole_table(self):
+        # 存档是给人手改的：一条垃圾不能让整张表发不出去。
+        account = {"quest_unlock_all": False,
+                   "quest_difficulty": {"3": 2, "oops": "x", "4": None}}
+        self.assertEqual({3: 2}, quest_difficulty_records(account))
+
+    def test_recorded_difficulty_is_clamped_to_the_client_ceiling(self):
+        # 客户端把「已达成 + 1」夹到 4，发再大的数也没有额外含义。
+        account = {"quest_unlock_all": False, "quest_difficulty": {"3": 99}}
+        self.assertEqual({3: QUEST_DIFFICULTY_MAX},
+                         quest_difficulty_records(account))
+
+    # -- 登录时下发 --------------------------------------------------------
+    def test_login_sends_the_difficulty_table(self):
+        conn = self.make_conn()
+        conn.channel_code = 0
+        conn.channel_index = 0
+        conn.accounts = self.FakeStore(conn.account)
+        conn.accounts.resolve_game_login = lambda ticket="": ("tester", conn.account)
+        conn.args.login_result = 0
+        gameserver.Conn.on_game_packet(conn, 0x0100, w_wstr("tester"))
+        frames = self.sent_with(conn, OP_QUEST_REACHED_DIFFICULTY)
+        self.assertEqual(1, len(frames))
+
+    def test_login_table_comes_after_the_login_reply(self):
+        conn = self.make_conn(account={
+            "experience": 0, "money": 0, "level": 1,
+            "quest_difficulty": {"3": 2}, "quest_unlock_all": False})
+        conn.channel_code = 0
+        conn.channel_index = 0
+        conn.accounts = self.FakeStore(conn.account)
+        conn.accounts.resolve_game_login = lambda ticket="": ("tester", conn.account)
+        conn.args.login_result = 0
+        gameserver.Conn.on_game_packet(conn, 0x0100, w_wstr("tester"))
+        opcodes = [take_frame(bytearray(f))[1] for f in conn.sent]
+        self.assertLess(opcodes.index(gameserver.OP_REP_LOGIN),
+                        opcodes.index(OP_QUEST_REACHED_DIFFICULTY))
+        self.assertEqual({3: 2}, self.parse_records(
+            self.sent_with(conn, OP_QUEST_REACHED_DIFFICULTY)[0]))
+
+    # -- 通关解锁 ----------------------------------------------------------
+    def test_clearing_a_quest_records_the_difficulty(self):
+        conn = self.make_conn(quest=(3, 1))
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_MARK_QUEST_SUCCESS,
+                                       w_i32(1))
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_END_QUEST, b"")
+        self.assertEqual([("tester", 3, 1)], conn.accounts.calls)
+        self.assertEqual({3: 1}, self.parse_records(
+            self.sent_with(conn, OP_QUEST_REACHED_DIFFICULTY)[0]))
+
+    def test_the_new_table_is_pushed_before_the_settlement_packets(self):
+        # 结算完客户端直接回房间，那时的 map 必须已经是新的，否则玩家看到
+        # 「完成」却还是选不了下一个难度。
+        conn = self.make_conn(quest=(3, 1))
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_MARK_QUEST_SUCCESS,
+                                       w_i32(1))
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_END_QUEST, b"")
+        opcodes = [take_frame(bytearray(f))[1] for f in conn.sent]
+        self.assertLess(opcodes.index(OP_QUEST_REACHED_DIFFICULTY),
+                        opcodes.index(OP_REP_GAME_RESULT))
+
+    def test_dying_out_unlocks_nothing(self):
+        conn = self.make_conn(quest=(3, 1))
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_END_QUEST, b"")
+        self.assertEqual([], conn.accounts.calls)
+        self.assertEqual([], self.sent_with(conn, OP_QUEST_REACHED_DIFFICULTY))
+
+    def test_replaying_an_easier_difficulty_does_not_lock_anything_back(self):
+        conn = self.make_conn(quest=(3, 1), account={
+            "experience": 0, "money": 0, "level": 1,
+            "quest_difficulty": {"3": 3}, "quest_unlock_all": False})
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_MARK_QUEST_SUCCESS,
+                                       w_i32(1))
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_END_QUEST, b"")
+        self.assertEqual([], conn.accounts.calls)
+        self.assertEqual([], self.sent_with(conn, OP_QUEST_REACHED_DIFFICULTY))
+
+    def test_a_normal_room_never_records_a_quest_clear(self):
+        # 描述符 type=1 的普通房参数是三个，头两个不是 (关卡 id, 难度)。
+        conn = self.make_conn()
+        conn.room = {"session_type": 1, "arguments": (1, 2, 3)}
+        self.assertIsNone(gameserver.Conn.current_quest(conn))
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_MARK_QUEST_SUCCESS,
+                                       w_i32(1))
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_END_QUEST, b"")
+        self.assertEqual([], conn.accounts.calls)
+
+    def test_a_half_parsed_room_does_not_crash_the_settlement(self):
+        conn = self.make_conn()
+        conn.room = {"session_type": 2}
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_MARK_QUEST_SUCCESS,
+                                       w_i32(1))
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_END_QUEST, b"")
+        self.assertEqual([], conn.accounts.calls)
+        self.assertTrue(self.sent_with(conn, OP_REP_GAME_RESULT))
+
+    def test_unlock_all_saves_the_clear_but_keeps_sending_the_full_table(self):
+        conn = self.make_conn(quest=(3, 1), account={
+            "experience": 0, "money": 0, "level": 1,
+            "quest_difficulty": {}, "quest_unlock_all": True})
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_MARK_QUEST_SUCCESS,
+                                       w_i32(1))
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_END_QUEST, b"")
+        self.assertEqual([("tester", 3, 1)], conn.accounts.calls)
+        records = self.parse_records(
+            self.sent_with(conn, OP_QUEST_REACHED_DIFFICULTY)[0])
+        self.assertEqual(set(QUEST_ID_TABLE), set(records))
+
+    # -- 别的包没被碰坏 ----------------------------------------------------
+    def test_the_settlement_packets_are_unchanged(self):
+        conn = self.make_conn(quest=(3, 1))
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_MARK_QUEST_SUCCESS,
+                                       w_i32(1))
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_END_QUEST, b"")
+        opcodes = [take_frame(bytearray(f))[1] for f in conn.sent]
+        self.assertLess(opcodes.index(OP_REP_GAME_RESULT),
+                        opcodes.index(OP_END_GAME))
+
+
+class CharacterUnlockTests(unittest.TestCase):
+    """角色解锁：`0x030b gspSlotEquippedList`（会话 21，§119）。
+
+    房间右下角的「人物选择」原本只有 3 个头像，而 `Data/ChrProps.ini` 里
+    有 14 个可玩角色、`Models/Characters/` 里 15 套模型。缺的不是资源：
+    客户端 `0x40713a` 数按钮时对 100..110 逐个问 `0x4070c2`，最终落到
+    `0x55853c` 去背包 `vector<int32>` 里找 `(角色 id + 1) * 1000000` 起的
+    那一段物品 —— 而那份背包只有 `0x030b` 能填，我们从来没发过。
+    """
+
+    class Args:
+        hold_lobby = False
+        accounts = None
+        login_result = 0
+
+    def make_conn(self, account=None):
+        conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.args = self.Args()
+        conn.sent = []
+        conn.logged = []
+        conn.last_packet_at = 0.0
+        conn.noisy_seen = set()
+        conn.log = conn.logged.append
+        conn.send = conn.sent.append
+        conn.my_seat = 0
+        conn.account_name = "tester"
+        conn.account = account if account is not None else {
+            "level": 1, "experience": 0, "money": 0, "character": 0,
+        }
+        return conn
+
+    @staticmethod
+    def parse_equipped(frame):
+        """把一发 0x030b 帧解回 `(座位, 掩码三元组, [物品 id])`。"""
+        opcode, body = take_frame(bytearray(frame))[1:3]
+        assert opcode == OP_SLOT_EQUIPPED_LIST, hex(opcode)
+        head = struct.unpack_from(f"<{1 + EQUIPPED_SLOT_MASK_COUNT}i", body, 0)
+        offset = 4 * (1 + EQUIPPED_SLOT_MASK_COUNT)
+        count = struct.unpack_from("<i", body, offset)[0]
+        items = list(struct.unpack_from(f"<{count}i", body, offset + 4))
+        assert len(body) == offset + 4 + count * 4, len(body)
+        return head[0], tuple(head[1:]), items
+
+    def sent_with(self, conn, opcode):
+        return [f for f in conn.sent if take_frame(bytearray(f))[1] == opcode]
+
+    # -- 物品 id ------------------------------------------------------------
+    def test_item_ids_match_the_real_shop_entries(self):
+        # ShopItem.ini 的 [Item-101400001] … [Item-111400001] 就是这 11 个。
+        self.assertEqual(101400001, character_item_id(100))
+        self.assertEqual(111400001, character_item_id(110))
+
+    def test_item_id_lands_inside_the_range_the_client_accepts(self):
+        # 客户端 0x55851f 认的是 [(id+1)*1e6, (id+2)*1e6) 这个左闭右开区间。
+        for character_id in PREMIUM_CHARACTER_IDS:
+            item_id = character_item_id(character_id)
+            low = (character_id + 1) * 1000000
+            self.assertTrue(low <= item_id < low + 1000000, item_id)
+
+    def test_base_characters_are_never_shipped_as_items(self):
+        # 0/1/2 在 0x55853c 里 `cmp eax,3 / jl -> return true`，白送。
+        self.assertEqual((0, 1, 2), BASE_CHARACTER_IDS)
+        self.assertEqual(set(), set(BASE_CHARACTER_IDS)
+                         & set(owned_characters({"character_unlock_all": True})))
+
+    # -- 存档 -> 下发 -------------------------------------------------------
+    def test_unlock_all_is_the_default(self):
+        self.assertTrue(character_unlock_all({}))
+        self.assertEqual(list(PREMIUM_CHARACTER_IDS), owned_characters({}))
+        self.assertEqual(11, len(character_item_ids({})))
+
+    def test_unlock_all_off_only_ships_what_the_save_lists(self):
+        account = {"character_unlock_all": False, "owned_characters": [102, 100]}
+        self.assertEqual([100, 102], owned_characters(account))
+        self.assertEqual([character_item_id(100), character_item_id(102)],
+                         character_item_ids(account))
+
+    def test_a_dirty_save_entry_never_kills_the_whole_list(self):
+        account = {"character_unlock_all": False,
+                   "owned_characters": [100, "oops", None, 100, 7, 999]}
+        self.assertEqual([100], owned_characters(account))
+
+    def test_unlock_all_off_with_nothing_owned_ships_an_empty_list(self):
+        account = {"character_unlock_all": False, "owned_characters": []}
+        self.assertEqual([], character_item_ids(account))
+
+    # -- 线格式 -------------------------------------------------------------
+    def test_wire_format_is_seat_masks_then_a_counted_vector(self):
+        payload = build_slot_equipped_list(2, [101400001, 111400001])
+        self.assertEqual(4 + 12 + 4 + 2 * 4, len(payload))
+        self.assertEqual((2, 0, 0, 0, 2, 101400001, 111400001),
+                         struct.unpack_from("<7i", payload, 0))
+
+    def test_an_empty_list_is_still_a_valid_packet(self):
+        # 空清单 = 原版「只有 3 个角色」的状态，客户端照样收得下。
+        payload = build_slot_equipped_list(0, [])
+        self.assertEqual(4 + 12 + 4, len(payload))
+        self.assertEqual(0, struct.unpack_from("<i", payload, 16)[0])
+
+    def test_slot_masks_default_to_all_zero(self):
+        # 那 12 个字节是「哪几个装备槽被占了」，下发全 0 = 一个槽都没占。
+        payload = build_slot_equipped_list(0, [])
+        self.assertEqual((0,) * EQUIPPED_SLOT_MASK_COUNT,
+                         struct.unpack_from("<3i", payload, 4))
+
+    def test_an_out_of_range_seat_is_refused(self):
+        with self.assertRaises(ValueError):
+            build_slot_equipped_list(ROOM_SEAT_COUNT, [])
+        with self.assertRaises(ValueError):
+            build_slot_equipped_list(-1, [])
+
+    def test_a_wrong_number_of_masks_is_refused(self):
+        with self.assertRaises(ValueError):
+            build_slot_equipped_list(0, [], slot_masks=(0, 0))
+
+    # -- 建房时下发 ---------------------------------------------------------
+    def test_creating_a_room_ships_the_equipped_list(self):
+        conn = self.make_conn()
+        gameserver.Conn.send_slot_equipped_list(conn)
+        frames = self.sent_with(conn, OP_SLOT_EQUIPPED_LIST)
+        self.assertEqual(1, len(frames))
+        seat, masks, items = self.parse_equipped(frames[0])
+        self.assertEqual((0, (0, 0, 0)), (seat, masks))
+        self.assertEqual([character_item_id(c) for c in PREMIUM_CHARACTER_IDS],
+                         items)
+
+    def test_the_equipped_list_follows_my_seat(self):
+        conn = self.make_conn()
+        conn.my_seat = 3
+        gameserver.Conn.send_slot_equipped_list(conn)
+        self.assertEqual(3, self.parse_equipped(conn.sent[0])[0])
+
+    def test_the_equipped_list_comes_after_the_seat_snapshot(self):
+        # ★ 顺序是硬约束：持有判定 0x4070da 第一步查「我的座位已占用吗」，
+        # 那个标记只有 0x0300 会写。反过来发，11 个角色一个都出不来。
+        conn = self.make_conn()
+        conn.room = None
+        conn.start_game = StartGameHandshake()
+        conn.accounts = None
+        gameserver.Conn.on_game_packet(conn, 0x0201, b"")
+        opcodes = [take_frame(bytearray(f))[1] for f in conn.sent]
+        self.assertIn(OP_SESSION_MEMBERS, opcodes)
+        self.assertIn(OP_SLOT_EQUIPPED_LIST, opcodes)
+        self.assertLess(opcodes.index(OP_SESSION_MEMBERS),
+                        opcodes.index(OP_SLOT_EQUIPPED_LIST))
+
+    def test_the_room_packets_are_otherwise_unchanged(self):
+        conn = self.make_conn()
+        conn.room = None
+        conn.start_game = StartGameHandshake()
+        conn.accounts = None
+        gameserver.Conn.on_game_packet(conn, 0x0201, b"")
+        opcodes = [take_frame(bytearray(f))[1] for f in conn.sent]
+        self.assertEqual([0x0201, OP_SESSION_MEMBERS, OP_SLOT_EQUIPPED_LIST],
+                         opcodes)
+
+    # -- 控制通道 -----------------------------------------------------------
+    def test_control_command_can_ship_an_explicit_list(self):
+        conn = self.make_conn()
+        saved = list(gameserver._conns)
+        gameserver._conns[:] = [conn]
+        self.addCleanup(lambda: gameserver._conns.__setitem__(slice(None), saved))
+        reply = gameserver.handle_control_command("equipped 1 101400001")
+        self.assertTrue(reply.startswith("ok"), reply)
+        self.assertEqual((1, (0, 0, 0), [101400001]),
+                         self.parse_equipped(conn.sent[0]))
+
+    def test_returning_from_the_result_screen_reships_the_list(self):
+        # 防御性重发：`0x406e4e`（把座位清单重建成空的）有三个调用点在切
+        # stage 的路上，没有逐条读到底。实测这条路清单没被清，但整份替换是
+        # 幂等的，漏了的代价是「人物选择」缩回 3 个头像。
+        conn = self.make_conn()
+        conn.quest_score = 0
+        conn.quest_success = False
+        conn.settled = False
+        conn.items_created = 0
+        conn.items_picked = 0
+        conn.next_item_handle = ITEM_HANDLE_BASE
+        conn.maps_entered = []
+        conn.map_change_pending = False
+        conn.room = None
+        conn.start_game = StartGameHandshake()
+        conn.accounts = None
+        gameserver.Conn.leave_game_result(conn)
+        opcodes = [take_frame(bytearray(f))[1] for f in conn.sent]
+        self.assertIn(OP_SLOT_EQUIPPED_LIST, opcodes)
+        self.assertLess(opcodes.index(gameserver.OP_LOADING_DONE),
+                        opcodes.index(OP_SLOT_EQUIPPED_LIST))
+        seat, _, items = self.parse_equipped(
+            self.sent_with(conn, OP_SLOT_EQUIPPED_LIST)[0])
+        self.assertEqual(0, seat)
+        self.assertEqual(len(PREMIUM_CHARACTER_IDS), len(items))
+
+    def test_control_command_can_empty_the_list(self):
+        # 复现「只有 3 个角色」的原始状态用。
+        conn = self.make_conn()
+        saved = list(gameserver._conns)
+        gameserver._conns[:] = [conn]
+        self.addCleanup(lambda: gameserver._conns.__setitem__(slice(None), saved))
+        gameserver.handle_control_command("equipped 0")
+        self.assertEqual([], self.parse_equipped(conn.sent[0])[2])
 
 
 if __name__ == "__main__":

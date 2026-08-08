@@ -19,6 +19,10 @@ gs_ctl.py —— 假游戏服（server/gameserver.py）的调试控制台
                                                     # tools/probe_death.py 的 handle）
     python tools/gs_ctl.py respawn                  # 用客户端自报的最后坐标
     python tools/gs_ctl.py sync-account             # 改完 accounts.json 后刷数据栏
+    python tools/gs_ctl.py quest-difficulty         # 按存档重发难度解锁表（0x020c）
+    python tools/gs_ctl.py quest-difficulty 3 0     # 把关卡 3 锁回只剩「简单」
+    python tools/gs_ctl.py equipped                 # 按存档重发角色解锁表（0x030b）
+    python tools/gs_ctl.py equipped 0               # 把座位 0 的物品清单清空
     python tools/gs_ctl.py raw 0411 00000000 ...
     python tools/gs_ctl.py help
 

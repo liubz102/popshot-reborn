@@ -6,8 +6,11 @@ import struct
 import tempfile
 import unittest
 
-from account_store import (EXPERIENCE_PER_LEVEL, AccountStore, player_character,
-                           player_level, tutorial_state)
+from account_store import (EXPERIENCE_PER_LEVEL, QUEST_DIFFICULTY_MAX,
+                           QUEST_ID_TABLE, AccountStore, player_character,
+                           player_level, quest_cleared_difficulty,
+                           quest_difficulty_records, quest_unlock_all,
+                           tutorial_state)
 from gameserver import build_gsp_rep_login
 
 
@@ -150,6 +153,48 @@ class AccountStoreTests(unittest.TestCase):
     def test_selected_character_rejects_unknown_account(self):
         with self.assertRaises(KeyError):
             self.store.set_character("nobody", 1)
+
+    # -- 难度解锁（会话 20，§118）-------------------------------------------
+    def test_new_account_can_pick_every_difficulty(self):
+        # 「只能选简单」是因为服务端从来没下发过这张表，不是玩家没打通。
+        account = self.store.login("alice", "pw")
+        self.assertTrue(quest_unlock_all(account))
+        records = quest_difficulty_records(account)
+        self.assertEqual(set(QUEST_ID_TABLE), set(records))
+        self.assertEqual({QUEST_DIFFICULTY_MAX}, set(records.values()))
+
+    def test_quest_clear_persists_and_only_moves_up(self):
+        self.store.login("alice", "pw")
+        account = self.store.set_quest_cleared("alice", 3, 2)
+        self.assertEqual(2, quest_cleared_difficulty(account, 3))
+        # 再用简单打一遍，不该把已经解锁的普通锁回去。
+        account = self.store.set_quest_cleared("alice", 3, 1)
+        self.assertEqual(2, quest_cleared_difficulty(account, 3))
+        _, reloaded = self.store.get_account("alice")
+        self.assertEqual(2, quest_cleared_difficulty(reloaded, 3))
+
+    def test_quest_clear_is_written_with_string_keys(self):
+        # JSON 的对象键只能是字符串；写成数字键会在下次读盘时变形。
+        self.store.login("alice", "pw")
+        self.store.set_quest_cleared("alice", 3, 2)
+        with open(self.path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual({"3": 2},
+                         saved["accounts"]["alice"]["quest_difficulty"])
+
+    def test_progression_mode_only_unlocks_one_step_ahead(self):
+        # quest_unlock_all=False 就是原版行为：通关简单才解锁普通。
+        self.store.login("alice", "pw")
+        self.store.set_tutorial_completed("alice", True)
+        _, account = self.store.get_account("alice")
+        account = dict(account, quest_unlock_all=False)
+        self.assertEqual({}, quest_difficulty_records(account))
+        account["quest_difficulty"] = {"3": 1}
+        self.assertEqual({3: 1}, quest_difficulty_records(account))
+
+    def test_quest_clear_rejects_unknown_account(self):
+        with self.assertRaises(KeyError):
+            self.store.set_quest_cleared("nobody", 1, 1)
 
 
 if __name__ == "__main__":

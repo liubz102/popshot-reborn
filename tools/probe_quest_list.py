@@ -36,6 +36,8 @@ PROCESS_QUERY_INFORMATION = 0x0400
 CATALOG = 0x72E3D8
 STATE_MACHINE = 0x72E320
 QUEST_IDS = (3, 2, 1, 4, 5, 6, 7)      # 静态表 0x6dc52c
+#: 下拉框里那句 `mov ecx,[ecx]`（取地区序号），bshook 会把它 patch 成 `xor ecx,ecx`
+LOCALE_TEST_VA = 0x4368D5
 
 
 class Mem:
@@ -103,6 +105,15 @@ def main():
     locale = mem.u32(state) if state else None
     print(f"[0x{STATE_MACHINE:08x}] = {state and hex(state)}  首字段(掩码位) = {locale}")
 
+    # bshook 的地区差异 patch 把下拉框那一处的 `mov ecx,[ecx]`（8B 09）换成了
+    # `xor ecx,ecx`（33 C9），也就是**按韩国区(0)算掩码**。不看这一格的话，
+    # 下面「掩码通过」会照 2(中国) 算，把刚解锁的第 5/6/7 关误报成不通过。
+    patched = mem.read(LOCALE_TEST_VA, 2) == b"\x33\xc9"
+    effective = 0 if patched else locale
+    print(f"[0x{LOCALE_TEST_VA:08x}] 下拉框的地区判定 = "
+          f"{'已 patch（按韩国区 0 算）' if patched else '原版'}"
+          f" -> 生效掩码位 = {effective}")
+
     head = mem.u32(CATALOG)
     print(f"[0x{CATALOG:08x}] = {head and hex(head)}")
     if not head:
@@ -125,7 +136,8 @@ def main():
     print(f"目录里共 {total} 条记录，其中名字含 'Quest' 的 {len(quests)} 条：")
     for name, qid, minplayers, mask in quests:
         ok = qid in QUEST_IDS
-        bit = None if locale is None or mask is None else bool(mask & (1 << locale))
+        bit = (None if effective is None or mask is None
+               else bool(mask & (1 << effective)))
         print(f"   {name:38s} id={qid:<5} 最少人数={minplayers:<4} "
               f"掩码={mask if mask is None else hex(mask)}  "
               f"在下拉表={'是' if ok else '否'} 掩码通过={bit}")

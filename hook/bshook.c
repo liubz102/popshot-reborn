@@ -686,6 +686,130 @@ static int try_patch_afk_timer(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* 单机化 patch —— 解锁被「地区掩码」关掉的关卡（神秘岛以外的第 5/6/7 关）    */
+/*                                                                            */
+/*   Data/map.ini 里每张地图都有一行 OpenLocale（注释写着                     */
+/*   `1 - 한국, 2 - 일본, 4 - 중국`，按位或）。中国版跑起来时全局             */
+/*   `[[0x72e320]]` = 2，客户端两处都拿 `1 << 2 = 4` 去和这个掩码 test：      */
+/*                                                                            */
+/*     0x40b419  地图目录加载（`0x40b2a1`，启动时读 map.ini）                 */
+/*               掩码不匹配 -> 0x40b47a 把记录直接 delete 掉                  */
+/*     0x4368cf  「建立房间(任务)」对话框填「任务」下拉框（`0x4365e1`）        */
+/*               掩码不匹配 -> 跳过这一条                                     */
+/*                                                                            */
+/*   而 map.ini 里：                                                          */
+/*     QuestId 1 불프로그 / 2 드라카 / 3 비밀의 섬 / 4 자미로건쉽  OpenLocale=7 */
+/*     QuestId 5 다크나이트 / 6 브레그마 / 7 자미로 비밀 연구소     OpenLocale=3 */
+/*     QuestId 8 푸른 하늘                                        OpenLocale=0 */
+/*   —— **4 个关卡不是资源缺失，是中国版当年没上线**（地图文件全都在）。      */
+/*                                                                            */
+/*   改法：把这两处的「地区序号」当成 0（韩国）来算，也就是                   */
+/*   `mov ecx,[...]` -> `xor ecx,ecx`，2 字节换 2 字节。                      */
+/*   这样掩码里带 bit0 的都放行（7 / 3 / 1），掩码为 0 的仍然被挡住 ——        */
+/*   Quest08 和一堆没写 OpenLocale 的条目（含缺文件的 Festivalm01）           */
+/*   照样进不来。比直接 NOP 掉判定保守。                                      */
+/*                                                                            */
+/*   时机：两处都要**早于**启动时的 map.ini 加载。patch 线程在 +2.5s 打，      */
+/*   那时资源加载还没开始（见 patch_thread 里 SnowCipher 那段的说明）。       */
+/*                                                                            */
+/*   ── 第三处：시리아 마스（角色 110）的战斗内换人图标 ──                    */
+/*                                                                            */
+/*   服务端把 11 个商城角色全放出来之后，**进关卡瞬间必崩**                   */
+/*   （C0000005 @ 0x430857，调用链 0x40bd40 -> 0x477bab -> 0x4f5970           */
+/*    -> 0x4f682a -> 0x430857）。战斗内的 `CharacterChanger` 给每个可选角色   */
+/*   建一个按钮，图标取自 `Images/NewUI2/BigChrIcons.smf`，                    */
+/*   下标由 `0x4f676e` 起的 switch 按角色 id 硬编码：                         */
+/*       0/1/2 -> (id*2, id*2+1)   100 -> (6,7)    101 -> (8,9)               */
+/*       103 -> (0x0a,0x0b)  102 -> (0x0c,0x0d)  104 -> (0x0c,0x0e)           */
+/*       105 -> (0x0c,0x0f)  106 -> (0x10,0x11)  107 -> (0x12,0x13)           */
+/*       108 -> (0x14,0x15)  109 -> (0x16,0x17)                               */
+/*       110 -> (0x18,0x19)  3 -> (0x1a,0x1b)                                 */
+/*   而这张图集是**按地区换的**（`0x558916` 把路径映射到                      */
+/*   `Images/Chinese/BigChrIcons_CN.smf`），中国版那份只有 **24** 帧          */
+/*   （0..23），韩国版 28 帧。下标 0x18/0x19 越界，`0x430854` 就从图集数组外  */
+/*   取到垃圾指针。—— 图是真没有，不是判定挡住的。                            */
+/*                                                                            */
+/*   改法：把 110 的图标对改成 106 시리아 的 (0x10,0x11)，5 字节换 5 字节。    */
+/*   战斗内换人条上它会显示成「시리아」的头像，模型/名字/数值都不受影响。      */
+/*   （角色 3 아이린 要的 0x1a/0x1b 同样越界，但它被 `0x4f58f1` 显式跳过，    */
+/*     根本不会建按钮，不用管。）                                             */
+/*                                                                            */
+/*   设环境变量 BSHOOK_KEEP_REGION_LOCK=1 可以整组保留原版行为。              */
+/* -------------------------------------------------------------------------- */
+#define REGION_PATCH_COUNT 3
+/* 每处都验一段上下文再动手：2 字节的特征太短，光比 `8B 08` 容易撞上密文。 */
+static const struct {
+    unsigned int va;          /* 特征串起始 VA                    */
+    unsigned int len;         /* 特征串长度                       */
+    unsigned int off;         /* 要改的字节在特征串里的偏移        */
+    unsigned int n;           /* 要改几个字节                     */
+    const unsigned char *sig; /* 原始字节                         */
+    const unsigned char *fix; /* 替换字节                         */
+    const char *what;
+} REGION_SITES[REGION_PATCH_COUNT] = {
+    { 0x0040b419u, 19, 5, 2,
+      (const unsigned char *)"\xA1\x20\xE3\x72\x00\x8B\x08\x8B\x53\x48"
+                             "\x33\xC0\x40\xD3\xE0\x85\xC2\x74\x16",
+      (const unsigned char *)"\x33\xC9",          /* xor ecx,ecx */
+      "地图目录加载（地区序号 2 中国 -> 0 韩国）" },
+    { 0x004368cfu, 20, 6, 2,
+      (const unsigned char *)"\x8B\x0D\x20\xE3\x72\x00\x8B\x09\x8B\x70"
+                             "\x48\x33\xD2\x42\xD3\xE2\x85\xD6\x74\x1A",
+      (const unsigned char *)"\x33\xC9",          /* xor ecx,ecx */
+      "建房「任务」下拉框（地区序号 2 中国 -> 0 韩国）" },
+    { 0x004f67d1u, 15, 8, 5,
+      (const unsigned char *)"\x8D\x04\x3F\x8D\x48\x01\xEB\x22"
+                             "\x6A\x18\x58\x6A\x19\xEB\x1A",
+      (const unsigned char *)"\x6A\x10\x58\x6A\x11", /* push 0x10 / pop eax / push 0x11 */
+      "角色 110 战斗内图标（0x18/0x19 越界 -> 借用 106 的 0x10/0x11）" },
+};
+static volatile LONG g_region_patched = 0;
+
+static int region_lock_disabled(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_REGION_LOCK", buf, sizeof(buf));
+    return !(n > 0 && n < sizeof(buf) && buf[0] != '0');
+}
+
+/* 返回 1 表示三处都已就位（本轮打的或之前就打过）。 */
+static int try_patch_region_lock(void)
+{
+    int i, done = 0;
+
+    if (g_region_patched) return 1;
+    for (i = 0; i < REGION_PATCH_COUNT; i++) {
+        unsigned char *base = (unsigned char *)REGION_SITES[i].va;
+        unsigned char *p = base + REGION_SITES[i].off;
+        unsigned int n = REGION_SITES[i].n;
+        DWORD oldp;
+
+        if (IsBadReadPtr(base, REGION_SITES[i].len)) continue;
+        if (memcmp(p, REGION_SITES[i].fix, n) == 0) { done++; continue; }
+        if (memcmp(base, REGION_SITES[i].sig, REGION_SITES[i].len) != 0)
+            continue;                            /* 还没解壳到这里，继续等 */
+
+        if (!VirtualProtect(p, n, PAGE_EXECUTE_READWRITE, &oldp)) {
+            bslog("PATCH   地区差异(%s): VirtualProtect 失败 err=%lu",
+                  REGION_SITES[i].what, (unsigned long)GetLastError());
+            continue;
+        }
+        memcpy(p, REGION_SITES[i].fix, n);
+        VirtualProtect(p, n, oldp, &oldp);
+        FlushInstructionCache(GetCurrentProcess(), p, n);
+        bslog("PATCH   ★地区差异 @ %08X: %s",
+              (unsigned)(REGION_SITES[i].va + REGION_SITES[i].off),
+              REGION_SITES[i].what);
+        done++;
+    }
+    if (done == REGION_PATCH_COUNT) {
+        InterlockedExchange(&g_region_patched, 1);
+        return 1;
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
 /* 阶段4 观测 —— SnowCipher（包加密，SNOW 2.0）                                */
 /*                                                                            */
 /*   0x5dc7bc  loadkey(key, keysize, iv0..iv3)   ecx=state   ret 0x18         */
@@ -1149,8 +1273,26 @@ static DWORD WINAPI patch_thread(LPVOID param)
     if (!g_gg_patched)
         bslog("PATCH   !! 超时未能 patch（0x54b0fc 一直不是预期字节）");
 
-    /* 挂机踢出 patch 跟在 GameGuard 之后：同一个「解壳已完成、完整性校验窗口
-       已过」的时机，而 0x4082ae 第一次被执行要等到进大厅（远在其后）。 */
+    /* 剩下两处 patch 打在同一个窗口里（解壳已完成、完整性校验窗口已过）。
+       ★ **地区锁排在挂机计时器前面，因为只有它是有时限的**：
+       0x40b419 属于启动时的 map.ini 加载，一旦跑完地图目录就已经建好，
+       再 patch 也补不回被 delete 掉的记录。+2.5s 时资源加载还没开始
+       （见下面 SnowCipher 那段的说明），所以来得及 —— 但要是先去死等
+       0x4082ae 那 4 秒，就可能刚好错过。挂机计时器反过来完全不急，
+       它第一次被执行要等到进大厅。 */
+    if (!region_lock_disabled()) {
+        bslog("PATCH   BSHOOK_KEEP_REGION_LOCK 已设，保留原版地区差异"
+              "（任务只剩 4 关；★ 这时服务端也必须把角色 110 关掉，否则进关卡会崩）");
+    } else {
+        for (ticks = 0; !g_stop && !g_region_patched && ticks < 2000; ticks++) {
+            if (try_patch_region_lock()) break;
+            Sleep(2);
+        }
+        if (!g_region_patched)
+            bslog("PATCH   !! 超时未能 patch 地区差异"
+                  "（0x40b419 / 0x4368cf / 0x4f67d1 的特征串一直对不上）");
+    }
+
     if (!afk_kick_disabled()) {
         bslog("PATCH   BSHOOK_KEEP_AFK_KICK 已设，保留原版 90 秒挂机踢出");
     } else {
