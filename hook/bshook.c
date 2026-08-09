@@ -7,7 +7,7 @@
  *   - 轮询顶层窗口 + 子控件文字，把 GameGuard 错误框的**完整原文**抓下来
  *   - 记录 ASProtect 解壳完成的时机（用 .text 首字节是否变化判断）
  *
- * 阶段 2：在这里加 GameGuard 初始化调用点的内存 patch
+ * 阶段 2：GameGuard 校验点使用 DR0 + VEH，在执行瞬间改寄存器，不改游戏代码
  * 阶段 3：在这里加 ws2_32 hook（connect/send/recv 重定向到 127.0.0.1 + 落盘）
  *
  * 注入方式见 bsloader.c：CREATE_SUSPENDED + QueueUserAPC(LoadLibraryA)，
@@ -22,6 +22,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <intrin.h>
+#include "gg_bypass.h"
 #pragma intrinsic(_ReturnAddress)
 
 /* -------------------------------------------------------------------------- */
@@ -585,45 +586,177 @@ static void poll_unpack(void)
 }
 
 /* -------------------------------------------------------------------------- */
-/* 阶段2 patch —— 让 GameGuard 校验取到成功码 0x755                            */
+/* 阶段2 —— GameGuard 校验用 DR0 + VEH 在执行瞬间绕过                          */
 /*                                                                            */
-/*   校验点 va=0x54b0fc:  call 0x5611d0 (E8 CF 60 01 00)                       */
-/*   patch 成:            mov eax, 0x755 (B8 55 07 00 00)                      */
-/*   → 校验函数 0x54b042 走成功路径返回 al=1，nProtect 状态取值器被跳过。      */
+/*   校验点 va=0x54b0fc: call 0x5611d0 (E8 CF 60 01 00)                        */
+/*   DR0 在该指令执行前触发 EXCEPTION_SINGLE_STEP；处理器把 EAX 设成 0x755，  */
+/*   EIP 前移 5 字节，等价于执行 `mov eax,0x755`。代码页一个字节都不改，      */
+/*   因此 ASProtect 的后台 CRC 无论早晚运行都看不到变化。                      */
 /*                                                                            */
-/*   时机：必须等 ASProtect 把该区域解壳出来（字节变成 E8 CF 60 01 00）后再写。*/
-/*   由独立 patch 线程 5ms 一轮紧盯，命中即写，远早于 ~5s 的校验执行。         */
+/*   DLL 内部线程等注入 APC 完全返回后设置 DR0，再向 bsloader 发“已武装”握手。*/
 /* -------------------------------------------------------------------------- */
-#define GG_CHECK_VA 0x0054b0fcu
-#define GG_PATCH_DELAY_MS 2500       /* 见 patch_thread 里的时机说明 */
-static const unsigned char GG_ORIG[5]  = { 0xE8, 0xCF, 0x60, 0x01, 0x00 }; /* call 0x5611d0 */
-static const unsigned char GG_PATCH[5] = { 0xB8, 0x55, 0x07, 0x00, 0x00 }; /* mov eax,0x755 */
-static volatile LONG g_gg_patched = 0;
+static const unsigned char GG_ORIG[POPSHOT_GG_CHECK_INSN_LEN] =
+    { 0xE8, 0xCF, 0x60, 0x01, 0x00 }; /* call 0x5611d0 */
+static const unsigned char GG_OLD_PATCH[POPSHOT_GG_CHECK_INSN_LEN] =
+    { 0xB8, 0x55, 0x07, 0x00, 0x00 }; /* 兼容旧版内存 patch */
 
-static int try_patch_gameguard(void)
+static PVOID         g_gg_veh = NULL;
+static volatile LONG g_gg_break_state = 0;    /* 1=成功，2=旧 patch，-1=字节不符 */
+static volatile LONG g_gg_break_reported = 0;
+static DWORD         g_main_thread_id = 0;
+
+static void clear_dr0(CONTEXT *ctx)
 {
-    unsigned char *p = (unsigned char *)GG_CHECK_VA;
-    DWORD oldp;
+    ctx->Dr0 = 0;
+    ctx->Dr6 = 0;
+    ctx->Dr7 &= ~(DWORD)POPSHOT_DR0_CONTROL_MASK;
+}
 
-    if (g_gg_patched) return 1;
-    if (IsBadReadPtr(p, 5)) return 0;
-    if (memcmp(p, GG_PATCH, 5) == 0) {          /* 已是 patch 后的样子 */
-        InterlockedExchange(&g_gg_patched, 1);
+static LONG CALLBACK gameguard_veh(EXCEPTION_POINTERS *ep)
+{
+#if defined(_M_IX86)
+    CONTEXT *ctx;
+    const unsigned char *code;
+
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    ctx = ep->ContextRecord;
+    if (ctx->Eip != (DWORD)POPSHOT_GG_CHECK_VA) return EXCEPTION_CONTINUE_SEARCH;
+
+    /* 无论签名是否匹配都先撤掉本断点，避免异常风暴。字节不符时让原指令执行，
+       后台线程会写出明确诊断；绝不在未知版本上盲目改 EIP。 */
+    clear_dr0(ctx);
+    code = (const unsigned char *)POPSHOT_GG_CHECK_VA;
+
+    if (memcmp(code, GG_ORIG, POPSHOT_GG_CHECK_INSN_LEN) == 0) {
+        ctx->Eax = (DWORD)POPSHOT_GG_SUCCESS_CODE;
+        ctx->Eip += (DWORD)POPSHOT_GG_CHECK_INSN_LEN;
+        InterlockedExchange(&g_gg_break_state, 1);
+    } else if (memcmp(code, GG_OLD_PATCH, POPSHOT_GG_CHECK_INSN_LEN) == 0) {
+        /* 已经是旧版 `mov eax,0x755`：撤断点后从原 EIP 正常执行即可。 */
+        InterlockedExchange(&g_gg_break_state, 2);
+    } else {
+        InterlockedExchange(&g_gg_break_state, -1);
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+#else
+    (void)ep;
+    return EXCEPTION_CONTINUE_SEARCH;
+#endif
+}
+
+static void report_gameguard_breakpoint(void)
+{
+    LONG state = InterlockedCompareExchange(&g_gg_break_state, 0, 0);
+    if (!state || InterlockedExchange(&g_gg_break_reported, 1)) return;
+
+    if (state == 1) {
+        bslog("HWBP    ★GameGuard 校验 @ %08X：DR0 命中，EAX=0x755，跳过状态取值调用",
+              (unsigned)POPSHOT_GG_CHECK_VA);
+    } else if (state == 2) {
+        bslog("HWBP    GameGuard 校验 @ %08X 已是旧版内存 patch，撤掉 DR0 后继续",
+              (unsigned)POPSHOT_GG_CHECK_VA);
+    } else {
+        bslog("HWBP    !! GameGuard 校验 @ %08X 已执行但指令签名不符，未绕过",
+              (unsigned)POPSHOT_GG_CHECK_VA);
+    }
+}
+
+static int address_in_module(DWORD address, HMODULE module)
+{
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS *nt;
+    DWORD base;
+    DWORD size;
+
+    if (!module) return 0;
+    dos = (IMAGE_DOS_HEADER *)module;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    nt = (IMAGE_NT_HEADERS *)((BYTE *)module + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    base = (DWORD)(UINT_PTR)module;
+    size = nt->OptionalHeader.SizeOfImage;
+    return address >= base && address < base + size;
+}
+
+/* LoadLibraryA 是 APC 投递的。DllMain 里的握手若立刻让外部设置 DR0，
+   KiUserApcDispatcher 随后 NtContinue 恢复旧 CONTEXT 时会把 DR0 清回 0。
+   本线程只按“主线程 EIP 已离开 APC 涉及的系统模块/DLL”这个状态判断，
+   不使用毫秒数推测。 */
+static int main_thread_left_injection_apc(DWORD eip)
+{
+    if (address_in_module(eip, GetModuleHandleA("ntdll.dll"))) return 0;
+    if (address_in_module(eip, GetModuleHandleA("kernel32.dll"))) return 0;
+    if (address_in_module(eip, GetModuleHandleA("kernelbase.dll"))) return 0;
+    if (address_in_module(eip, GetModuleHandleA("bshook.dll"))) return 0;
+    return 1;
+}
+
+static DWORD WINAPI arm_gameguard_breakpoint_thread(LPVOID param)
+{
+    HANDLE ready_event = (HANDLE)param;
+    HANDLE main_thread;
+    CONTEXT ctx;
+    DWORD suspend_count;
+    DWORD ticks;
+    DWORD armed_eip = 0;
+
+    main_thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                             THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
+                             FALSE, g_main_thread_id);
+    if (!main_thread) {
+        bslog("HWBP    !! OpenThread(main tid=%lu) 失败 err=%lu",
+              (unsigned long)g_main_thread_id, (unsigned long)GetLastError());
+        CloseHandle(ready_event);
         return 1;
     }
-    if (memcmp(p, GG_ORIG, 5) != 0) return 0;   /* 还没解壳到这里，继续等 */
 
-    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldp)) {
-        bslog("PATCH   GameGuard: VirtualProtect 失败 err=%lu", (unsigned long)GetLastError());
-        return 0;
+    for (ticks = 0; !g_stop && ticks < POPSHOT_BSHOOK_READY_TIMEOUT; ticks++) {
+        suspend_count = SuspendThread(main_thread);
+        if (suspend_count == (DWORD)-1) break;
+
+        ZeroMemory(&ctx, sizeof(ctx));
+        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
+        if (!GetThreadContext(main_thread, &ctx)) {
+            ResumeThread(main_thread);
+            break;
+        }
+
+        if (main_thread_left_injection_apc(ctx.Eip)) {
+            ctx.Dr0 = (DWORD)POPSHOT_GG_CHECK_VA;
+            ctx.Dr6 = 0;
+            ctx.Dr7 &= ~(DWORD)POPSHOT_DR0_CONTROL_MASK;
+            ctx.Dr7 |= (DWORD)POPSHOT_DR0_LOCAL_ENABLE;
+            if (!SetThreadContext(main_thread, &ctx)) {
+                ResumeThread(main_thread);
+                break;
+            }
+            armed_eip = ctx.Eip;
+            ResumeThread(main_thread);
+            break;
+        }
+
+        ResumeThread(main_thread);
+        Sleep(1);
     }
-    memcpy(p, GG_PATCH, 5);
-    VirtualProtect(p, 5, oldp, &oldp);
-    FlushInstructionCache(GetCurrentProcess(), p, 5);
-    InterlockedExchange(&g_gg_patched, 1);
-    bslog("PATCH   ★GameGuard 校验 @ %08X: call 0x5611d0 -> mov eax,0x755 (成功码 0x755)",
-          (unsigned)GG_CHECK_VA);
-    return 1;
+
+    if (armed_eip) {
+        bslog("HWBP    主线程已离开注入 APC（EIP=%08X），DR0=%08X 已武装",
+              (unsigned)armed_eip, (unsigned)POPSHOT_GG_CHECK_VA);
+        if (!SetEvent(ready_event)) {
+            bslog("HWBP    !! SetEvent(bsloader ready) 失败 err=%lu",
+                  (unsigned long)GetLastError());
+        }
+    } else {
+        bslog("HWBP    !! 未能在主线程离开注入 APC 后设置 DR0，err=%lu",
+              (unsigned long)GetLastError());
+    }
+
+    CloseHandle(main_thread);
+    CloseHandle(ready_event);
+    return armed_eip ? 0 : 1;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1274,27 +1407,17 @@ static int try_hook_render_init(void)
     return 1;
 }
 
+#define CODE_PATCH_DELAY_MS 2500
+
 static DWORD WINAPI patch_thread(LPVOID param)
 {
     int ticks = 0;
     (void)param;
-    /* ★ 时机是这里唯一重要的事，实测结论（会话03）：
-       ASProtect 在启动早期（约 +1.5s）跑一次代码完整性校验，命中就弹
-       「Protection Error / Error: 15」并卡在模态框上。
-       所以 patch 必须**晚于**那次校验、又必须**早于** GameGuard 校验点
-       0x40d034 的执行（约 +5s，见 FINDINGS §9）。中间这段就是唯一的窗口。
-       早打（+0.7s）实测只有 1/4 概率蒙混过关，延后到 +2.5s 才稳。 */
-    for (ticks = 0; !g_stop && ticks < GG_PATCH_DELAY_MS / 20; ticks++) Sleep(20);
-    ticks = 0;
-    while (!g_stop && !g_gg_patched && ticks < 2000) {
-        if (try_patch_gameguard()) break;
-        Sleep(2);
-        ticks++;
-    }
-    bslog("PATCH   patch 线程：延迟 %d ms 后盯了 %d 轮（目标 %08X）",
-          GG_PATCH_DELAY_MS, ticks, (unsigned)GG_CHECK_VA);
-    if (!g_gg_patched)
-        bslog("PATCH   !! 超时未能 patch（0x54b0fc 一直不是预期字节）");
+    /* GameGuard 已由 DR0 + VEH 在执行瞬间处理，不经过本线程，也不修改代码。
+       下面仍有地区锁、挂机计时器和诊断 detour 会改游戏代码；它们必须晚于
+       ASProtect 启动早期的后台完整性校验，因此暂时保留经本机验证的 2.5 秒门槛。 */
+    for (ticks = 0; !g_stop && ticks < CODE_PATCH_DELAY_MS / 20; ticks++) Sleep(20);
+    bslog("PATCH   非 GameGuard 代码补丁：延迟 %d ms 后开始", CODE_PATCH_DELAY_MS);
 
     /* 剩下两处 patch 打在同一个窗口里（解壳已完成、完整性校验窗口已过）。
        ★ **地区锁排在挂机计时器前面，因为只有它是有时限的**：
@@ -1329,8 +1452,8 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x4082ae 一直不是 68 90 5F 01 00）");
     }
 
-    /* SnowCipher hook 紧跟在 GameGuard patch 之后装：
-       此时已过了 ASProtect 的完整性校验窗口（+2.5s 那次 patch 实测 5/5 安全），
+    /* SnowCipher hook 紧跟在其它代码 patch 之后装：
+       此时已过了 ASProtect 的完整性校验窗口（+2.5s 实测安全），
        而资源加载(Pack\*.pkn)和登录连接都还没开始，能完整观测到全部加解密。
 
        ★ 精简模式**根本不装**：这三个 detour 每次加解密都要格式化 + 写日志，
@@ -1365,6 +1488,7 @@ static DWORD WINAPI watch_thread(LPVOID param)
     install_hooks();   /* user32 此时必已加载；失败会自动重置标志下一轮重试 */
     while (!g_stop) {
         if (!g_hooks_installed) install_hooks();
+        report_gameguard_breakpoint();
         poll_modules();
         EnumWindows(dump_window, 0);
         poll_unpack();
@@ -1428,24 +1552,59 @@ static void banner(void)
                                      : "精简（只记关键事件；调试时设 BSHOOK_VERBOSE_LOG=1）");
 }
 
+static HANDLE open_loader_ready_event(void)
+{
+    char name[128];
+    DWORD n = GetEnvironmentVariableA(POPSHOT_BSHOOK_READY_ENV, name, sizeof(name));
+    if (n == 0 || n >= sizeof(name)) return NULL;
+    return OpenEventA(EVENT_MODIFY_STATE, FALSE, name);
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     HANDLE th;
+    HANDLE ready_event;
     (void)reserved;
 
     switch (reason) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(inst);
         InitializeCriticalSection(&g_cs);
-        /* 读环境变量是纯用户态查表，微秒级，不会挤占下面 patch 线程的时间窗；
-           但它必须排在 patch 线程之前 —— 那个线程会按级别决定装不装 cipher hook。 */
+        g_main_thread_id = GetCurrentThreadId(); /* LoadLibrary APC 正在这条主线程上执行 */
         read_log_level();
-        /* ★ patch 线程必须第一个起：它要和 ASProtect 的 CRC 基准计算抢时间，
-           晚 0.6s（等 open_log 建完文件）就会输，弹 Protection Error。 */
-        th = CreateThread(NULL, 0, patch_thread, NULL, 0, NULL);
-        if (th) CloseHandle(th);
         open_log();
         banner();
+
+        ready_event = open_loader_ready_event();
+        if (!ready_event) {
+            bslog("HWBP    !! 找不到 bsloader 就绪事件，拒绝在没有 DR0 握手的情况下继续");
+            return FALSE;
+        }
+
+        g_gg_veh = AddVectoredExceptionHandler(1, gameguard_veh);
+        if (!g_gg_veh) {
+            bslog("HWBP    !! AddVectoredExceptionHandler 失败 err=%lu",
+                  (unsigned long)GetLastError());
+            CloseHandle(ready_event);
+            return FALSE;
+        }
+        bslog("HWBP    GameGuard VEH 已安装，等待 DR0 命中 %08X",
+              (unsigned)POPSHOT_GG_CHECK_VA);
+
+        /* 线程入口要等 DllMain 返回后才会运行。它观察主线程真正离开 APC 恢复路径，
+           然后设置 DR0 并通知 bsloader；ready_event 的所有权一并交给它。 */
+        th = CreateThread(NULL, 0, arm_gameguard_breakpoint_thread, ready_event, 0, NULL);
+        if (!th) {
+            bslog("HWBP    !! 创建 DR0 武装线程失败 err=%lu", (unsigned long)GetLastError());
+            CloseHandle(ready_event);
+            RemoveVectoredExceptionHandler(g_gg_veh);
+            g_gg_veh = NULL;
+            return FALSE;
+        }
+        CloseHandle(th);
+
+        th = CreateThread(NULL, 0, patch_thread, NULL, 0, NULL);
+        if (th) CloseHandle(th);
         /* TODO 阶段3: install_ws2_hooks(); */
         th = CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
         if (th) CloseHandle(th);
@@ -1453,6 +1612,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 
     case DLL_PROCESS_DETACH:
         g_stop = 1;
+        if (g_gg_veh) {
+            RemoveVectoredExceptionHandler(g_gg_veh);
+            g_gg_veh = NULL;
+        }
         bslog("================ process detach ================");
         break;
     }

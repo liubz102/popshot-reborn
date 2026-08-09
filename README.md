@@ -44,12 +44,14 @@ start.bat
        └─ hook/bin/bsloader.exe
             └─ game_patched/BigShot.exe
                  └─ 注入 hook/bin/bshook.dll
-                      ├─ 延迟执行 GameGuard 状态补丁
+                      ├─ VEH + 主线程 DR0，在校验执行瞬间返回 GameGuard 成功码
                       ├─ 将网络连接重定向到 localhost
                       └─ 可选记录解密后的协议数据
 ```
 
 `bshook.dll` 不修改磁盘上的 `BigShot.exe`，补丁只在客户端解壳完成后写入进程内存。
+启动器与 DLL 先完成握手，主线程真正执行到状态校验点时由硬件断点和 VEH 直接调整
+寄存器；角色及地图等单机化补丁写入运行中的进程内存。
 本地服务端使用 Python 标准库实现认证、协议编解码和游戏状态机，账号状态保存在
 `server/data/accounts.json`。
 

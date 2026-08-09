@@ -11,6 +11,10 @@
  *   这时挂起的 APC 就被投递执行。于是 bshook.dll 的加载时机正好卡在
  *   「静态导入全部就绪」和「ASProtect 壳开始跑」之间 —— 这正是我们要的。
  *
+ * GameGuard 绕过不用固定延时改代码：bshook.dll 先注册 VEH，再由内部线程
+ * 等主线程离开注入 APC 后设置 DR0，最后通过命名事件回报“已武装”。主线程
+ * 真正执行到状态读取指令时，VEH 直接改 EAX/EIP；游戏代码字节始终不变。
+ *
  * 用法：
  *   bsloader.exe                    用默认目标 <项目根>\game_patched\BigShot.exe
  *   bsloader.exe <exe> [args...]    指定目标
@@ -24,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "gg_bypass.h"
 
 static void die(const char *what)
 {
@@ -48,6 +53,16 @@ static void parent_dir(char *path)
     if (p) *p = 0;
 }
 
+static void abort_child(PROCESS_INFORMATION *pi, const char *what, DWORD error)
+{
+    TerminateProcess(pi->hProcess, 1);
+    WaitForSingleObject(pi->hProcess, 2000);
+    CloseHandle(pi->hThread);
+    CloseHandle(pi->hProcess);
+    SetLastError(error);
+    die(what);
+}
+
 int main(int argc, char **argv)
 {
     char dlldir[MAX_PATH], dllpath[MAX_PATH];
@@ -59,6 +74,14 @@ int main(int argc, char **argv)
     FARPROC pLoadLibraryA;
     LPVOID remote;
     SIZE_T len;
+    HANDLE ready_event;
+    HANDLE waits[2];
+    DWORD wait_result;
+    DWORD error;
+    char ready_event_name[128];
+    char previous_ready_event[128];
+    DWORD previous_ready_event_len;
+    int had_previous_ready_event;
     char *p;
     int i;
 
@@ -104,14 +127,39 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    _snprintf(ready_event_name, sizeof(ready_event_name),
+              "Local\\PopShotBshookReady_%lu_%lu",
+              (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount());
+    ready_event = CreateEventA(NULL, TRUE, FALSE, ready_event_name);
+    if (!ready_event) die("CreateEvent(bshook ready)");
+
+    previous_ready_event_len = GetEnvironmentVariableA(
+        POPSHOT_BSHOOK_READY_ENV, previous_ready_event, sizeof(previous_ready_event));
+    had_previous_ready_event = previous_ready_event_len > 0 &&
+                               previous_ready_event_len < sizeof(previous_ready_event);
+    if (!SetEnvironmentVariableA(POPSHOT_BSHOOK_READY_ENV, ready_event_name))
+        die("SetEnvironmentVariable(bshook ready)");
+
     /* --- 挂起启动 -------------------------------------------------------- */
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
     if (!CreateProcessA(target, cmdline, NULL, NULL, FALSE,
-                        CREATE_SUSPENDED, NULL, workdir, &si, &pi))
+                        CREATE_SUSPENDED, NULL, workdir, &si, &pi)) {
+        error = GetLastError();
+        if (had_previous_ready_event)
+            SetEnvironmentVariableA(POPSHOT_BSHOOK_READY_ENV, previous_ready_event);
+        else
+            SetEnvironmentVariableA(POPSHOT_BSHOOK_READY_ENV, NULL);
+        CloseHandle(ready_event);
+        SetLastError(error);
         die("CreateProcess");
+    }
+    if (had_previous_ready_event)
+        SetEnvironmentVariableA(POPSHOT_BSHOOK_READY_ENV, previous_ready_event);
+    else
+        SetEnvironmentVariableA(POPSHOT_BSHOOK_READY_ENV, NULL);
 
     printf("[bsloader] pid=%lu tid=%lu (挂起中)\n",
            (unsigned long)pi.dwProcessId, (unsigned long)pi.dwThreadId);
@@ -135,6 +183,26 @@ int main(int argc, char **argv)
     printf("[bsloader] APC 已挂载，恢复主线程\n");
 
     if (ResumeThread(pi.hThread) == (DWORD)-1) die("ResumeThread");
+
+    /* DLL 内的专用线程会等主线程离开 LoadLibrary APC 的恢复路径，再设置 DR0；
+       否则 APC 返回时恢复旧 CONTEXT，会把过早设置的调试寄存器覆盖掉。
+       等待的是“断点已经武装”的握手，不是游戏运行到某个固定毫秒数。 */
+    waits[0] = ready_event;
+    waits[1] = pi.hProcess;
+    wait_result = WaitForMultipleObjects(2, waits, FALSE, POPSHOT_BSHOOK_READY_TIMEOUT);
+    if (wait_result == WAIT_OBJECT_0 + 1) {
+        CloseHandle(ready_event);
+        abort_child(&pi, "bshook.dll 初始化前游戏已经退出", ERROR_DLL_INIT_FAILED);
+    }
+    if (wait_result != WAIT_OBJECT_0) {
+        error = (wait_result == WAIT_TIMEOUT) ? ERROR_TIMEOUT : GetLastError();
+        CloseHandle(ready_event);
+        abort_child(&pi, "等待 bshook.dll 初始化握手", error);
+    }
+    CloseHandle(ready_event);
+
+    printf("[bsloader] bshook 已就绪，GameGuard 执行断点 DR0=%08lX\n",
+           (unsigned long)POPSHOT_GG_CHECK_VA);
 
     printf("[bsloader] 已启动，等待游戏退出…（日志在 %s\\logs\\）\n", root);
     WaitForSingleObject(pi.hProcess, INFINITE);
