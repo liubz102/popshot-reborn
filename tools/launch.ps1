@@ -84,8 +84,20 @@ if (Test-Path $gg) {
 #   唯一放行标准就是下面这行 `hr=00000000`（会话 09 实测确立）。
 $probe = Join-Path $Root 'tools\d3d9_probe.exe'
 if (Test-Path $probe) {
-    $out = & $probe 2>&1 | Out-String
-    if ($out -notmatch 'CheckDeviceType HAL/X8R8G8B8/windowed hr=00000000') {
+    # 输入法、显卡覆盖层等注入到 GUI 进程的组件可能往 stderr 写无害警告。
+    # Windows PowerShell 5.1 会把原生程序的 stderr 包装成 ErrorRecord；若沿用
+    # 全局的 Stop 策略，即使探针成功也会在这里终止整个启动脚本。
+    $savedErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $probeOutput = @(& $probe 2>&1)
+        $probeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+    $out = ($probeOutput | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+    if ($probeExitCode -ne 0 -or
+        $out -notmatch 'CheckDeviceType HAL/X8R8G8B8/windowed hr=00000000') {
         Say '!! D3D9 HAL 当前不可用 —— 画面多半出不来。' 'Red'
         Say '   最常见的原因是有串流会话正在进行（Sunshine/Moonlight），断开即恢复。' 'Red'
         Say "   自己看一眼：$probe" 'Red'
