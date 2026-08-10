@@ -46,7 +46,7 @@
 | F.3 | `account_store`：`register` / `verify`（三态）/ `export_account` / `import_account`；删掉 `active_account` | 重名拒绝、密码错拒绝、导入时缺字段重置为默认值 |
 | F.4 | 认证服校验密码并签发一次性票据，塞进 `CULoginReplyPacket` 的字符串字段 | 游戏服 `gcpReqLogin` 收到的 wstring 能查回账号 |
 | F.5 | 游戏服按票据绑账号；多连接表按账号索引；`gs_ctl.py` 加 `--user` | 两个连接各自的存档互不干扰 |
-| F.6 | 登录失败在画面上说清楚（未注册 / 密码错） | 客户端弹出的框文案正确 |
+| F.6 | 登录失败在画面上说清楚（未注册 / 密码错） | ✅ 回 NMCO 错误码 20025 / 20026，客户端自己弹「不存在的帐号」/「密码错误」（§128，不用改 bshook）|
 | F.7 | `tools/launch.ps1` 改成只起 `server/app.py` 一个进程 | `start.bat` 照常进游戏 |
 
 **验收**：现有 228 项测试不许断；新增测试全绿；
@@ -169,17 +169,36 @@ V0.1 §44            gcpReqLogin 载荷里带着客户端的**内网 IP** → �
 
 ```text
 PopShot-server/
-├─ start.bat / stop.bat        Windows（CRLF + UTF-8 无 BOM）
-├─ start.sh  / stop.sh         Linux（LF，可执行）
+├─ start.bat / start-debug.bat / stop.bat    Windows（CRLF + UTF-8 无 BOM）
+├─ start.sh  / start-debug.sh  / stop.sh     Linux（LF，可执行）
 ├─ server.config              只需注册页端口，带中文注释
 ├─ server/                    和客户端包同一份代码
 ├─ runtime-win/python/        Windows 独立运行时
 ├─ runtime-linux/python/      Linux 独立运行时（python-build-standalone，记 SHA-256）
 ├─ data/accounts.json         空存档
+├─ logs/                      server.out / server.err / online.log
 └─ README.md                  部署说明 + 要开哪几个端口
 ```
 
 控制通道在服务端包里默认关闭；要开也只绑 `127.0.0.1`。
+
+#### ★ 启动脚本必须是**两套**（用户要求，2026-08-11）
+
+| 脚本 | 命令行 | 给谁用 |
+|---|---|---|
+| `start.bat` / `start.sh` | `app.py --no-control` | **日常开服。** 精简日志：只有启动横幅、连接事件（`[online]`）、登录失败原因、错误 |
+| `start-debug.bat` / `start-debug.sh` | `app.py --no-control --verbose` | **排查。** 逐包 hexdump + 每条连接一对抓包文件，日志量按 MB 涨，别长期开 |
+
+两套脚本**只差一个 `--verbose`**，别为「详细模式」另开代码分支
+（CLAUDE.md 铁律 8 的同一个道理）。`stop` 脚本共用一个。
+
+**两套都要保证连接事件日志在**：`logs/online.log` 记「谁连上、谁断开、
+从哪个 IP、在线多久」，由 `server/eventlog.py` 落盘，**和 `--verbose` 无关**
+（§133）。精简模式下这份流水就是唯一的排查依据，所以：
+
+- `start.sh` 里 `server.out` 用**覆盖**重定向没问题，`online.log` 由服务端自己
+  **追加**打开，重启不会把历史冲掉；
+- README 里要写明「玩家说进不去，先看 `logs/online.log`」。
 
 **⏳ 用户操作**：把服务端包丢到干净机器（或云主机）解压直接跑，
 另一台电脑改 `server.config` 后选「联机」能注册、登录、进房间。

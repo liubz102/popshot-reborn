@@ -8,7 +8,10 @@
 #define POPSHOT_GG_CHECK_INSN_LEN    5u
 
 #define POPSHOT_BSHOOK_READY_ENV     "BSHOOK_READY_EVENT"
-#define POPSHOT_BSHOOK_READY_TIMEOUT 10000u
+/* bsloader 等「DR0 已武装」握手的毫秒数。DLL 那边的武装循环用它减 2000 当上限，
+ * 好在 bsloader 判超时之前先把失败原因写进日志（bshook.c 的 §124 注释）。
+ * 机器忙的时候 ASProtect 解壳本身就要好几秒，10 秒偏紧。 */
+#define POPSHOT_BSHOOK_READY_TIMEOUT 15000u
 
 /* DR0：L0/G0 + RW0/LEN0 对应的位。执行断点要求 RW0=00、LEN0=00。 */
 #define POPSHOT_DR0_CONTROL_MASK     0x000F0003u

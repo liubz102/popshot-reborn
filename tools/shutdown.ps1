@@ -13,7 +13,25 @@ $ErrorActionPreference = 'Stop'
 $Root     = Split-Path -Parent $PSScriptRoot
 $LogDir   = Join-Path $Root 'logs'
 $ModeFile = Join-Path $LogDir '.server_mode'
-$Ports    = @(47611, 27799, 27800)   # 认证服 / 游戏服 / 调试控制通道
+$RelayStamp = Join-Path $LogDir '.relay_target'
+# 认证服 / 游戏服 / 调试控制通道 / 注册页 / 中继两个口。
+# 注册页端口可配，所以从 server.config 里读；读不到就用默认的 27810。
+$Ports    = @(47611, 27799, 27800, 47621, 27809)
+$ConfigPath = Join-Path $Root 'server.config'
+$webPort = 27810
+if (Test-Path -LiteralPath $ConfigPath) {
+    foreach ($line in (Get-Content -LiteralPath $ConfigPath -Encoding UTF8)) {
+        $text = $line.Trim()
+        if (-not $text -or $text.StartsWith('#') -or $text.StartsWith(';')) { continue }
+        $split = $text.IndexOf('=')
+        if ($split -lt 1) { continue }
+        if ($text.Substring(0, $split).Trim().ToLowerInvariant() -eq 'local_register_port') {
+            $parsed = 0
+            if ([int]::TryParse($text.Substring($split + 1).Trim(), [ref]$parsed)) { $webPort = $parsed }
+        }
+    }
+}
+$Ports += $webPort
 
 function Say([string]$msg, [string]$color = 'Gray') {
     Write-Host $msg -ForegroundColor $color
@@ -56,7 +74,9 @@ foreach ($id in $byPid.Keys) {
     }
 }
 
-if (Test-Path $ModeFile) { Remove-Item $ModeFile -Force -ErrorAction SilentlyContinue }
+foreach ($stamp in @($ModeFile, $RelayStamp)) {
+    if (Test-Path $stamp) { Remove-Item $stamp -Force -ErrorAction SilentlyContinue }
+}
 
 # --- 3. 复核 ----------------------------------------------------------------
 Start-Sleep -Milliseconds 500

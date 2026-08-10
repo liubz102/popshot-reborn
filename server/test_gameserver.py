@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import struct
 import threading
+import time
 import unittest
 
 from gameserver import (
@@ -735,6 +736,9 @@ class LeaveSessionTests(unittest.TestCase):
 
     def make_conn(self):
         conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.addr = ("::ffff:127.0.0.1", 40000)
+        conn.connected_at = time.monotonic()
+        conn.online = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -977,6 +981,9 @@ class NoisyPacketLoggingTests(unittest.TestCase):
 
     def make_conn(self):
         conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.addr = ("::ffff:127.0.0.1", 40000)
+        conn.connected_at = time.monotonic()
+        conn.online = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1067,6 +1074,9 @@ class DeathAndRespawnTests(unittest.TestCase):
 
     def make_conn(self):
         conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.addr = ("::ffff:127.0.0.1", 40000)
+        conn.connected_at = time.monotonic()
+        conn.online = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1263,6 +1273,9 @@ class QuestScoreTests(unittest.TestCase):
 
     def make_conn(self):
         conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.addr = ("::ffff:127.0.0.1", 40000)
+        conn.connected_at = time.monotonic()
+        conn.online = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1331,6 +1344,9 @@ class MapTransitionTests(unittest.TestCase):
 
     def make_conn(self):
         conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.addr = ("::ffff:127.0.0.1", 40000)
+        conn.connected_at = time.monotonic()
+        conn.online = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1487,6 +1503,9 @@ class ItemDropTests(unittest.TestCase):
 
     def make_conn(self):
         conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.addr = ("::ffff:127.0.0.1", 40000)
+        conn.connected_at = time.monotonic()
+        conn.online = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1598,6 +1617,9 @@ class QuestClearFlagTests(unittest.TestCase):
 
     def make_conn(self):
         conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.addr = ("::ffff:127.0.0.1", 40000)
+        conn.connected_at = time.monotonic()
+        conn.online = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1725,6 +1747,9 @@ class ItemPickupTests(unittest.TestCase):
 
     def make_conn(self):
         conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.addr = ("::ffff:127.0.0.1", 40000)
+        conn.connected_at = time.monotonic()
+        conn.online = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1855,6 +1880,9 @@ class ResultScreenNumbersTests(unittest.TestCase):
 
     def make_conn(self, score=0):
         conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.addr = ("::ffff:127.0.0.1", 40000)
+        conn.connected_at = time.monotonic()
+        conn.online = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -2005,8 +2033,23 @@ class QuestDifficultyTests(unittest.TestCase):
         def add_quest_reward(self, username, experience=0, money=0):
             return self.account
 
+        def get_account(self, username):
+            return username, self.account
+
+    class FakeTickets:
+        """把任意票据认成同一个账号。真实实现见 `server/tickets.py`。"""
+
+        def __init__(self, username="tester"):
+            self.username = username
+
+        def resolve(self, ticket):
+            return self.username if ticket else None
+
     def make_conn(self, quest=(3, 1), account=None):
         conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.addr = ("::ffff:127.0.0.1", 40000)
+        conn.connected_at = time.monotonic()
+        conn.online = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -2037,6 +2080,7 @@ class QuestDifficultyTests(unittest.TestCase):
             "quest_difficulty": {}, "quest_unlock_all": False,
         }
         conn.accounts = self.FakeStore(conn.account)
+        conn.tickets = self.FakeTickets(conn.account_name)
         conn.start_game = StartGameHandshake()
         return conn
 
@@ -2093,7 +2137,6 @@ class QuestDifficultyTests(unittest.TestCase):
         conn.channel_code = 0
         conn.channel_index = 0
         conn.accounts = self.FakeStore(conn.account)
-        conn.accounts.resolve_game_login = lambda ticket="": ("tester", conn.account)
         conn.args.login_result = 0
         gameserver.Conn.on_game_packet(conn, 0x0100, w_wstr("tester"))
         frames = self.sent_with(conn, OP_QUEST_REACHED_DIFFICULTY)
@@ -2106,7 +2149,6 @@ class QuestDifficultyTests(unittest.TestCase):
         conn.channel_code = 0
         conn.channel_index = 0
         conn.accounts = self.FakeStore(conn.account)
-        conn.accounts.resolve_game_login = lambda ticket="": ("tester", conn.account)
         conn.args.login_result = 0
         gameserver.Conn.on_game_packet(conn, 0x0100, w_wstr("tester"))
         opcodes = [take_frame(bytearray(f))[1] for f in conn.sent]
@@ -2211,6 +2253,9 @@ class CharacterUnlockTests(unittest.TestCase):
 
     def make_conn(self, account=None):
         conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.addr = ("::ffff:127.0.0.1", 40000)
+        conn.connected_at = time.monotonic()
+        conn.online = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -2431,6 +2476,9 @@ class SendBatchTests(unittest.TestCase):
 
     def make_conn(self):
         conn = gameserver.Conn.__new__(gameserver.Conn)
+        conn.addr = ("::ffff:127.0.0.1", 40000)
+        conn.connected_at = time.monotonic()
+        conn.online = lambda _msg: None
         conn.args = self.Args()
         conn.sock = self.FakeSocket()
         conn.cout = SimpleCipher.server_to_client()

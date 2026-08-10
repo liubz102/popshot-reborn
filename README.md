@@ -24,8 +24,16 @@
 - 结算结束后自动回到房间
 - 隐藏地图、角色全解锁
 
-当前单机核心功能可玩，但仍有一些bug需要修复。
-联机，商店等功能目前还没有，未来可能会加。
+联机功能正在开发中（V0.2）。已经完成的部分：
+
+- 多账号：网页注册、明文密码校验、账号之间数据隔离
+- 登录界面可自选「单机游玩」或「联机」，联机服务器地址写在 `server.config`（IPv4 / IPv6 / 域名都支持）
+- 服务端认证、游戏、注册页合并为一个进程，监听 `::`（IPv4 / IPv6 都能连）
+- 「存档转移助手」：把存档从一台服务器导出、导入到另一台
+- 默认解除多人对战的等级限制
+
+**还没做**：房间列表 / 加入房间 / 房间内聊天 / 多人战斗同步。
+商店等功能目前还没有，未来可能会加。
 
 ## 实机画面
 
@@ -38,16 +46,25 @@
 ```text
 start.bat
   └─ tools/launch.ps1
-       ├─ server/authserver.py      127.0.0.1:47611
-       ├─ server/gameserver.py      127.0.0.1:27799
-       │    └─ 调试控制通道         127.0.0.1:27800
+       ├─ server/app.py                      认证 [::]:47611
+       │                                     游戏 [::]:27799
+       │                                     注册页 [::]:27810（可在 server.config 改）
+       │                                     调试控制通道 127.0.0.1:27800
+       ├─ server/relay.py                    联机模式的本机中继
+       │                                     127.0.0.1:47621 → <server_address>:47611
+       │                                     127.0.0.1:27809 → <server_address>:27799
        └─ hook/bin/bsloader.exe
             └─ game_patched/BigShot.exe
                  └─ 注入 hook/bin/bshook.dll
                       ├─ VEH + 主线程 DR0，在校验执行瞬间返回 GameGuard 成功码
-                      ├─ 将网络连接重定向到 localhost
+                      ├─ 把登录框的分区改成「单机游玩 / 联机」，并按选择决定
+                      │  连本机服务端还是连中继
+                      ├─ 把「注册成为世纪天成用户」换成我们自己的注册页
                       └─ 可选记录解密后的协议数据
 ```
+
+客户端是 2007 年的 32 位程序，`connect` 只认 IPv4 地址，所以联机时先连本机中继，
+由中继用 `getaddrinfo` 解析 `server.config` 里填的 IPv4 / IPv6 / 域名再转发出去。
 
 `bshook.dll` 不修改磁盘上的 `BigShot.exe`，补丁只在客户端解壳完成后写入进程内存。
 启动器与 DLL 先完成握手，主线程真正执行到状态校验点时由硬件断点和 VEH 直接调整
@@ -95,8 +112,31 @@ start-debug.bat
 stop.bat
 ```
 
-登录时可以使用任意测试用户名和密码；本地认证服不校验密码，首次登录会自动创建账号。
-请勿使用真实网站或其他服务的密码——本地账号文件和调试日志会以明文记录它。
+### 首次使用：先注册账号
+
+登录界面下方有一条「在服务器 … 上注册用户」的链接，点它会打开注册页面
+（单机是 `http://127.0.0.1:27810/`，联机是 `server.config` 里配置的那台服务器）。
+注册后就能在登录界面用这个账号密码登录。**服务端会校验密码**，
+账号不存在或密码不对都会被拒绝。
+
+> **账号和密码是明文传输、明文保存的。**
+> 请勿使用真实网站或其他服务的密码 —— `server/data/accounts.json` 会以明文保存它。
+
+### 单机还是联机
+
+登录界面的「选择分区」现在是两项：
+
+| 选项 | 连哪儿 |
+|---|---|
+| 单机游玩 | 本机的服务端，一个人玩，存档在本机 |
+| 联机(服务器地址请改:server.config) | `server.config` 里 `server_address` 指向的那台服务器 |
+
+`server.config` 就在 `start.bat` 旁边，用记事本打开即可，里面有中文注释和
+IPv4 / IPv6 / 域名三种写法的示例。改完重新运行 `start.bat` 生效。
+
+> 服务端监听 `::`，也就是说**玩单机时本机的 47611 / 27799 / 27810 三个端口
+> 对局域网是开放的**。好处是想开黑时不用另外部署服务端，让朋友填你的内网 IP 就能连；
+> 代价是同一个局域网里的人能看到这几个端口。
 
 正常模式只记录关键事件。调试模式会记录逐包 hexdump 和解密后的协议数据，日志体积会
 快速增长，文件保存在 `logs/`，且不会提交到 Git。
@@ -106,9 +146,13 @@ stop.bat
 服务端测试使用 Python 自带的 `unittest`：
 
 ```powershell
-Set-Location server
-python -m unittest test_account_store test_gameserver
+runtime\python\python.exe server\run_tests.py
 ```
+
+内置的便携 Python 带着 `python314._pth`，其中的 `.` 指的是 python.exe 所在目录而不是
+当前工作目录，所以直接 `-m unittest test_gameserver` 会找不到模块 —— `run_tests.py`
+就是为这件事准备的。用系统 Python 的话 `cd server; python -m unittest test_account_store
+test_gameserver test_online` 也可以。
 
 
 ## 调试控制通道
@@ -128,7 +172,8 @@ python tools/gs_ctl.py help
 | 路径 | 内容 |
 |---|---|
 | `hook/` | 注入 DLL、启动器源码及构建脚本 |
-| `server/` | 本地认证服、游戏服、协议和测试 |
+| `server/` | 服务端：认证、游戏、注册页、中继、协议和测试（单机和云端共用同一套代码）|
+| `server.config` | 联机服务器地址和注册页端口 |
 | `tools/` | 自写逆向、探针、截图和自动化脚本 |
 | `re/` | RTTI、虚表、包记录和映射文本等分析成果 |
 | `game_patched/` | 实际运行的客户端工作副本 |
@@ -154,7 +199,8 @@ D3D9 HAL。串流程序进程存在不一定有问题，关键是当前是否有
 ```text
 game_patched/Dump/LastCrashReport.txt
 logs/bshook_*.log
-logs/gameserver.err
+logs/server.err
+logs/relay.err
 ```
 
 ### 关卡中 15 秒不向前移动就被退出

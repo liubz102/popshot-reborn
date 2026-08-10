@@ -20,7 +20,9 @@
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #include <intrin.h>
 #include "gg_bypass.h"
 #pragma intrinsic(_ReturnAddress)
@@ -264,9 +266,14 @@ static void log_ebp_chain(const char *tag)
 }
 
 /* -------------------------------------------------------------------------- */
-/* 阶段2 观测：hook MessageBoxW/A —— GameGuard 失败时弹的「公告」框走这里。     */
-/* 目的：抓到「谁调用了错误框」= 失败分支地址，再据此静态定位校验条件并 patch。 */
-/* 自动化无人点框，故直接返回 IDOK 抑制（= 等价于用户点确定，见 FINDINGS §18）。*/
+/* hook MessageBoxW/A —— 只**观测并放行**，绝不再抑制。                        */
+/*                                                                            */
+/* ⚠ V0.1 阶段2 这两个 detour 是直接 `return IDOK`（不真正弹框）的：那时要抓的  */
+/* 是「谁调用了 GameGuard 的错误框」，而且自动化跑起来没人点确定。             */
+/* **那个抑制一直留到了 V0.2，把登录失败的提示框也一起吞了** ——               */
+/* 用户输错密码时游戏「一点反应都没有」，日志里却明明白白写着                  */
+/* `cap="登录失败" text="认证服务器失败 (20000)"`（FINDINGS §128）。            */
+/* 现在 GameGuard 早就绕过了，没有任何框需要被吞掉：一律转发给真的 MessageBox。 */
 /* -------------------------------------------------------------------------- */
 typedef int (WINAPI *MsgBoxW_t)(HWND, LPCWSTR, LPCWSTR, UINT);
 typedef int (WINAPI *MsgBoxA_t)(HWND, LPCSTR, LPCSTR, UINT);
@@ -282,7 +289,8 @@ static int WINAPI det_MessageBoxW(HWND hWnd, LPCWSTR text, LPCWSTR cap, UINT typ
           (unsigned)(UINT_PTR)ra, type, w2u8(cap, u8c, sizeof(u8c)));
     bslog("         text=\"%s\"", w2u8(text, u8t, sizeof(u8t)));
     log_ebp_chain("★MSGBOXW");
-    return IDOK; /* 抑制，不真正弹框 */
+    if (!s_MessageBoxW) return IDOK;            /* 理论上不会发生 */
+    return s_MessageBoxW(hWnd, text, cap, type);
 }
 
 static int WINAPI det_MessageBoxA(HWND hWnd, LPCSTR text, LPCSTR cap, UINT type)
@@ -291,7 +299,393 @@ static int WINAPI det_MessageBoxA(HWND hWnd, LPCSTR text, LPCSTR cap, UINT type)
     bslog("★MSGBOXA caller=%08X type=%08x cap=\"%s\" text=\"%s\"",
           (unsigned)(UINT_PTR)ra, type, cap ? cap : "(null)", text ? text : "(null)");
     log_ebp_chain("★MSGBOXA");
-    return IDOK;
+    if (!s_MessageBoxA) return IDOK;
+    return s_MessageBoxA(hWnd, text, cap, type);
+}
+
+/* ========================================================================== */
+/* V0.2 登录框改造：单机 / 联机分区 + 指向我们自己的注册页                     */
+/*                                                                            */
+/* 登录框是 #32770 标题 "PopShot"，控件 id 实测（tools\gui_probe.py enum）：   */
+/*   1004 用户名 Edit      1005 密码 Edit        1006 「开始」                */
+/*   1011 单选钮「炮火连天(电信)」  1012 单选钮「枪林弹雨(网通)」             */
+/*   1010 Static「注册成为世纪天成用户」= 那条蓝色链接                        */
+/*   1014 Static「选择分区:」        1017/1018/1019 底部说明文字              */
+/* 对话框客户区 530x527；1011/1012 在 (98,310) / (98,331)，都是 126x18。      */
+/*                                                                            */
+/* 配置从**环境变量**来（tools\launch.ps1 解析 server.config 后设进来），      */
+/* 这样 C 这边不用碰 UTF-8 配置文件的解析和编码（决策 D065）。                */
+/* ========================================================================== */
+#define IDC_RADIO_LOCAL    1011
+#define IDC_RADIO_ONLINE   1012
+#define IDC_REGISTER_LINK  1010
+
+#ifndef BS_MULTILINE
+#define BS_MULTILINE 0x00002000L
+#endif
+
+static wchar_t  g_server_addr[256]    = L"127.0.0.1";
+static unsigned g_server_reg_port     = 27810;
+static unsigned g_local_reg_port      = 27810;
+static unsigned g_relay_auth_port     = 47621;
+static unsigned g_relay_game_port     = 27809;
+/* 客户端写死的两个端口（V0.1 §24 / §40），只作为「要不要映射」的判据。 */
+static unsigned g_auth_port           = 47611;
+static unsigned g_game_port           = 27799;
+
+static HWND         g_login_dlg   = NULL;
+static int          g_dlg_styled  = 0;      /* 文案 / 尺寸只改一次 */
+static volatile LONG g_online     = 0;      /* 1 = 选了「联机」 */
+static wchar_t      g_link_text[512] = L"";
+/* 被我们子类化的那条注册链接（实现在下面「注册链接的点击」一段）。 */
+static HWND         s_link_hwnd   = NULL;
+
+static unsigned env_uint(const char *name, unsigned fallback)
+{
+    char buf[32];
+    DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+    unsigned value;
+    if (n == 0 || n >= sizeof(buf)) return fallback;
+    value = (unsigned)strtoul(buf, NULL, 10);
+    return (value >= 1 && value <= 65535) ? value : fallback;
+}
+
+static void read_online_config(void)
+{
+    wchar_t buf[256];
+    DWORD n = GetEnvironmentVariableW(L"POPSHOT_SERVER_ADDRESS", buf,
+                                      sizeof(buf) / sizeof(buf[0]));
+    char u8[768];
+    if (n > 0 && n < sizeof(buf) / sizeof(buf[0])) {
+        /* IPv6 可能被写成 [2001:db8::1]，去方括号；拼 URL 时再加回去。 */
+        wchar_t *start = buf;
+        size_t len;
+        while (*start == L' ') start++;
+        len = wcslen(start);
+        while (len && start[len - 1] == L' ') start[--len] = 0;
+        if (len >= 2 && start[0] == L'[' && start[len - 1] == L']') {
+            start[len - 1] = 0;
+            start++;
+        }
+        if (*start) wcsncpy(g_server_addr, start, 255), g_server_addr[255] = 0;
+    }
+    g_server_reg_port = env_uint("POPSHOT_SERVER_REG_PORT", g_server_reg_port);
+    g_local_reg_port  = env_uint("POPSHOT_LOCAL_REG_PORT",  g_local_reg_port);
+    g_relay_auth_port = env_uint("POPSHOT_RELAY_AUTH_PORT", g_relay_auth_port);
+    g_relay_game_port = env_uint("POPSHOT_RELAY_GAME_PORT", g_relay_game_port);
+    bslog("CFG     联机服务器=%s 注册页端口 远端=%u 本机=%u；中继端口 %u/%u",
+          w2u8(g_server_addr, u8, sizeof(u8)),
+          g_server_reg_port, g_local_reg_port,
+          g_relay_auth_port, g_relay_game_port);
+}
+
+/* 当前该显示 / 打开哪台服务器：单机固定 localhost，联机用配置里的地址。 */
+static const wchar_t *current_reg_host(void)
+{
+    return g_online ? g_server_addr : L"localhost";
+}
+
+static unsigned current_reg_port(void)
+{
+    return g_online ? g_server_reg_port : g_local_reg_port;
+}
+
+/* 拼注册页 URL。IPv6 字面量要加方括号，否则冒号会被当成端口分隔符。 */
+static void build_register_url(wchar_t *out, int cch)
+{
+    const wchar_t *host = current_reg_host();
+    if (wcschr(host, L':'))
+        _snwprintf(out, cch, L"http://[%s]:%u/", host, current_reg_port());
+    else
+        _snwprintf(out, cch, L"http://%s:%u/", host, current_reg_port());
+    out[cch - 1] = 0;
+}
+
+int popshot_online_mode(void)
+{
+    return (int)InterlockedCompareExchange(&g_online, 0, 0);
+}
+
+unsigned popshot_map_port(unsigned port)
+{
+    if (!popshot_online_mode()) return port;
+    if (port == g_auth_port) return g_relay_auth_port;
+    if (port == g_game_port) return g_relay_game_port;
+    return port;
+}
+
+static BOOL CALLBACK find_login_dlg(HWND h, LPARAM lp)
+{
+    DWORD pid = 0;
+    wchar_t cls[32], title[64];
+    (void)lp;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    cls[0] = title[0] = 0;
+    GetClassNameW(h, cls, 32);
+    if (wcscmp(cls, L"#32770") != 0) return TRUE;
+    GetWindowTextW(h, title, 64);
+    if (wcscmp(title, L"PopShot") != 0) return TRUE;
+    /* 必须有那两个单选钮，才是登录框而不是别的对话框（比如错误提示）。 */
+    if (!GetDlgItem(h, IDC_RADIO_LOCAL) || !GetDlgItem(h, IDC_RADIO_ONLINE))
+        return TRUE;
+    g_login_dlg = h;
+    return FALSE;
+}
+
+/* 把控件挪成指定的宽 / 高，位置不动。 */
+static void resize_ctrl(HWND dlg, int id, int cx, int cy)
+{
+    HWND h = GetDlgItem(dlg, id);
+    RECT r;
+    POINT pt;
+    if (!h || !GetWindowRect(h, &r)) return;
+    pt.x = r.left; pt.y = r.top;
+    ScreenToClient(dlg, &pt);
+    SetWindowPos(h, NULL, pt.x, pt.y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
+    InvalidateRect(h, NULL, TRUE);
+}
+
+/* 定义在下面「注册链接的点击」一段。 */
+static void hook_register_link(HWND dlg);
+
+static void style_login_dialog(HWND dlg)
+{
+    HWND online = GetDlgItem(dlg, IDC_RADIO_ONLINE);
+
+    SetDlgItemTextW(dlg, IDC_RADIO_LOCAL, L"单机游玩");
+    SetDlgItemTextW(dlg, IDC_RADIO_ONLINE, L"联机(服务器地址请改:server.config)");
+
+    /* 「联机(服务器地址请改:server.config)」比原来的「枪林弹雨(网通)」长一倍多，
+       126 像素的原控件会把它裁掉。右边 x=245 起就是「用户名:」，横着加宽会压上去，
+       所以改成**两行**：加 BS_MULTILINE 再把控件放高。
+       左边这一列从 y=349 到 y=415（「您还没有注册…」那行）之间是空的，放得下。 */
+    if (online) {
+        LONG style = GetWindowLongW(online, GWL_STYLE);
+        SetWindowLongW(online, GWL_STYLE, style | BS_MULTILINE);
+        resize_ctrl(dlg, IDC_RADIO_ONLINE, 200, 36);
+    }
+
+    /* 注册链接那条 Static 原来只有 152 像素（刚好装下「注册成为世纪天成用户」）。
+       换成「在服务器 xxx 上注册用户」之后 xxx 可能是个长域名，直接加宽到底。 */
+    resize_ctrl(dlg, IDC_REGISTER_LINK, 460, 18);
+    hook_register_link(dlg);
+
+    bslog("LOGIN   登录框已改造：分区单选钮 -> 单机 / 联机，注册链接指向我们自己的服务器");
+}
+
+/* 每 100 毫秒跑一次：跟住单选钮的选择，并让链接文字跟着变。 */
+static void poll_login_dialog(void)
+{
+    wchar_t want[512];
+    char u8[1536];
+    LONG online;
+
+    if (g_login_dlg && !IsWindow(g_login_dlg)) {
+        /* 登录成功后对话框被销毁。**保留最后一次的模式** —— 之后连游戏服
+           时还要用它决定连本机还是连中继。 */
+        g_login_dlg = NULL;
+        g_dlg_styled = 0;
+        s_link_hwnd = NULL;      /* 对话框重建时要重新子类化那条链接 */
+        return;
+    }
+    if (!g_login_dlg) {
+        EnumWindows(find_login_dlg, 0);
+        if (!g_login_dlg) return;
+    }
+    if (!g_dlg_styled) {
+        style_login_dialog(g_login_dlg);
+        g_dlg_styled = 1;
+        g_link_text[0] = 0;
+    }
+
+    /* ★ 客户端在第一次点「开始」之后就把两个分区单选钮**永久禁用**了
+       （原版的想法是「服务器选定了就不许再换」）。登录失败时它不会解禁，
+       于是玩家想从「单机」改成「联机」只能重启游戏。对话框还在 = 还没登录成功，
+       这时候允许换分区没有任何副作用，所以我们每一轮都把它解禁回来。 */
+    {
+        HWND local = GetDlgItem(g_login_dlg, IDC_RADIO_LOCAL);
+        HWND remote = GetDlgItem(g_login_dlg, IDC_RADIO_ONLINE);
+        if ((local && !IsWindowEnabled(local)) ||
+            (remote && !IsWindowEnabled(remote))) {
+            if (local) EnableWindow(local, TRUE);
+            if (remote) EnableWindow(remote, TRUE);
+            bslog("LOGIN   分区单选钮被客户端禁用了，已解禁（登录失败后还要能换分区）");
+        }
+    }
+
+    online = IsDlgButtonChecked(g_login_dlg, IDC_RADIO_ONLINE) ? 1 : 0;
+    if (InterlockedExchange(&g_online, online) != online)
+        bslog("LOGIN   分区切换 -> %s", online ? "联机" : "单机游玩");
+
+    _snwprintf(want, 512, L"在服务器 %s 上注册用户", current_reg_host());
+    want[511] = 0;
+    if (wcscmp(want, g_link_text) != 0) {
+        wcscpy(g_link_text, want);
+        SetDlgItemTextW(g_login_dlg, IDC_REGISTER_LINK, want);
+        bslog("LOGIN   注册链接 -> \"%s\"", w2u8(want, u8, sizeof(u8)));
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* 注册链接：把已经停机的世纪天成注册页换成我们自己的                          */
+/*                                                                            */
+/* 原 URL = http://member.tiancity.com/Registration/PopshotReg.aspx（V0.1 §14）*/
+/* 只认「注册」那一条，不碰「您忘记密码了吗?」——那是另一个链接，另一件事。   */
+/* -------------------------------------------------------------------------- */
+typedef HINSTANCE (WINAPI *ShellExecuteW_t)(HWND, LPCWSTR, LPCWSTR, LPCWSTR,
+                                            LPCWSTR, INT);
+typedef HINSTANCE (WINAPI *ShellExecuteA_t)(HWND, LPCSTR, LPCSTR, LPCSTR,
+                                            LPCSTR, INT);
+static ShellExecuteW_t s_ShellExecuteW = NULL;
+static ShellExecuteA_t s_ShellExecuteA = NULL;
+
+static int is_register_url_w(const wchar_t *s)
+{
+    if (!s) return 0;
+    return (wcsstr(s, L"PopshotReg") || wcsstr(s, L"Registration") ||
+            wcsstr(s, L"popshotreg") || wcsstr(s, L"registration")) ? 1 : 0;
+}
+
+static HINSTANCE WINAPI det_ShellExecuteW(HWND hwnd, LPCWSTR verb, LPCWSTR file,
+                                          LPCWSTR params, LPCWSTR dir, INT show)
+{
+    char u8[1536];
+    wchar_t url[512];
+    bslog("★SHELL ShellExecuteW(\"%s\")", w2u8(file ? file : L"(null)", u8, sizeof(u8)));
+    if (is_register_url_w(file)) {
+        build_register_url(url, 512);
+        bslog("★SHELL 注册链接改写 -> \"%s\"", w2u8(url, u8, sizeof(u8)));
+        return s_ShellExecuteW(hwnd, verb, url, params, dir, show);
+    }
+    return s_ShellExecuteW(hwnd, verb, file, params, dir, show);
+}
+
+static HINSTANCE WINAPI det_ShellExecuteA(HWND hwnd, LPCSTR verb, LPCSTR file,
+                                          LPCSTR params, LPCSTR dir, INT show)
+{
+    wchar_t wide[512], url[512];
+    char u8[1536];
+    bslog("★SHELL ShellExecuteA(\"%s\")", file ? file : "(null)");
+    if (file) {
+        MultiByteToWideChar(CP_ACP, 0, file, -1, wide, 512);
+        wide[511] = 0;
+        if (is_register_url_w(wide)) {
+            build_register_url(url, 512);
+            bslog("★SHELL 注册链接改写 -> \"%s\"", w2u8(url, u8, sizeof(u8)));
+            /* 我们的 URL 全是 ASCII，直接用宽字符版打开最省事。 */
+            if (s_ShellExecuteW)
+                return s_ShellExecuteW(hwnd, NULL, url, NULL, NULL, show);
+        }
+    }
+    return s_ShellExecuteA(hwnd, verb, file, params, dir, show);
+}
+
+/* 直接指向 shell32!ShellExecuteW 的入口（不是蹦床）。我们自己开注册页时用它 ——
+   走一遍自己的 detour 也无所谓：我们的 URL 不含 "Registration"，不会被再改写。 */
+static ShellExecuteW_t s_ShellExecuteW_raw = NULL;
+
+/* ★ 只用 `GetModuleHandleA`，**绝不在这里 LoadLibrary**。
+   本 DLL 是在 EXE 入口点之前用 APC 注入的，`watch_thread` 跑起来时主线程还在
+   ntdll 的 loader 里；从旁边的线程调 `LoadLibrary` 会卡在 loader 锁上，
+   实测让 `bsloader` 等不到「DR0 已武装」握手而超时退出
+   （`bsloader.err: 等待 bshook.dll 初始化握手 (GetLastError=1460)`）——
+   而且是**时有时无**的，第一次跑还成功过。
+   shell32 没加载就下一轮再来（`watch_thread` 每 100 毫秒调一次）；
+   真到用户点链接那一刻还没有，再当场加载也来得及（进程早就起完了）。 */
+static void install_shell_hooks(void)
+{
+    HMODULE sh;
+    if (s_ShellExecuteW_raw) return;             /* 已装 */
+    sh = GetModuleHandleA("shell32.dll");
+    if (!sh) return;                             /* 还没加载，下一轮再看 */
+    s_ShellExecuteW_raw =
+        (ShellExecuteW_t)GetProcAddress(sh, "ShellExecuteW");
+    s_ShellExecuteW = (ShellExecuteW_t)install_inline_hook(
+        (void *)GetProcAddress(sh, "ShellExecuteW"),
+        (void *)det_ShellExecuteW, "ShellExecuteW");
+    s_ShellExecuteA = (ShellExecuteA_t)install_inline_hook(
+        (void *)GetProcAddress(sh, "ShellExecuteA"),
+        (void *)det_ShellExecuteA, "ShellExecuteA");
+}
+
+/* -------------------------------------------------------------------------- */
+/* 注册链接的点击：**客户端自己根本处理不了**，我们接管                        */
+/*                                                                            */
+/* 实测（V0.2 里程碑 H）：id=1010 那条 Static **没有 SS_NOTIFY** ——           */
+/* 没有这个样式的 Static 对 WM_NCHITTEST 返回 HTTRANSPARENT，鼠标消息压根到不了 */
+/* 它身上（`WindowFromPoint` 在链接位置返回的是它下面那个分组 Button）。       */
+/* 真点上去什么都不发生，也没有任何 ShellExecute 调用。                        */
+/*                                                                            */
+/* 所以不去猜原版怎么处理的，直接：给它加上 SS_NOTIFY + 子类化窗口过程，       */
+/* 自己在 WM_LBUTTONUP 里打开我们的注册页。顺手把鼠标指针换成手型。            */
+/* -------------------------------------------------------------------------- */
+#ifndef SS_NOTIFY
+#define SS_NOTIFY 0x00000100L
+#endif
+
+static WNDPROC s_link_oldproc = NULL;
+
+static LRESULT CALLBACK link_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    wchar_t url[512];
+    char u8[1536];
+
+    switch (msg) {
+    /* ★ 按下这一半**必须自己吃掉，不能交给原来的 Static 窗口过程**：
+       加了 SS_NOTIFY 之后，Static 的默认处理会在 **WM_LBUTTONDOWN** 那一刻
+       给对话框发 `WM_COMMAND/STN_CLICKED`，而客户端的对话框过程里**真的有**
+       这条链接的处理器 —— 它去开那个早就停机的 member.tiancity.com。
+       于是一次点击弹出两个网页：先是它的死链接，再是我们的注册页（§129）。
+       双击 / 非客户区按下一并吃掉，堵住同一条路的其它入口。 */
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+    case WM_NCLBUTTONDOWN:
+        return 0;
+    case WM_LBUTTONUP:
+        build_register_url(url, 512);
+        bslog("LOGIN   点了注册链接 -> \"%s\"", w2u8(url, u8, sizeof(u8)));
+        if (!s_ShellExecuteW_raw) {
+            /* 启动期不敢 LoadLibrary（见 install_shell_hooks 的说明），
+               但用户点下去这一刻进程早就起完了，现加载是安全的。 */
+            HMODULE sh = LoadLibraryA("shell32.dll");
+            if (sh) s_ShellExecuteW_raw =
+                (ShellExecuteW_t)GetProcAddress(sh, "ShellExecuteW");
+        }
+        if (s_ShellExecuteW_raw)
+            s_ShellExecuteW_raw(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
+        else
+            bslog("LOGIN   !! 没拿到 ShellExecuteW，打不开注册页");
+        return 0;
+    case WM_SETCURSOR:
+        /* 本文件按 ANSI 编译，`IDC_HAND` 展开成 MAKEINTRESOURCEA，
+           传给宽字符版会类型不符 —— 显式用 MAKEINTRESOURCEW。 */
+        SetCursor(LoadCursorW(NULL, MAKEINTRESOURCEW(32649)));
+        return TRUE;
+    default:
+        break;
+    }
+    return CallWindowProcW(s_link_oldproc, h, msg, wp, lp);
+}
+
+static void hook_register_link(HWND dlg)
+{
+    HWND link = GetDlgItem(dlg, IDC_REGISTER_LINK);
+    LONG style;
+    if (!link || link == s_link_hwnd) return;
+    style = GetWindowLongW(link, GWL_STYLE);
+    SetWindowLongW(link, GWL_STYLE, style | SS_NOTIFY);
+    /* ★ 光加 SS_NOTIFY 还不够：那条 Static 在 z 序上**压在分组框下面**
+       （EnumChildWindows 按 z 序返回，分组 Button 排在所有 Static 前面），
+       点上去 `WindowFromPoint` 拿到的是分组框，鼠标消息到不了链接。
+       把它提到最上面才真的可点。 */
+    SetWindowPos(link, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    s_link_oldproc = (WNDPROC)SetWindowLongPtrW(link, GWLP_WNDPROC,
+                                                (LONG_PTR)link_wndproc);
+    s_link_hwnd = link;
+    bslog("LOGIN   注册链接已接管（原版这条 Static 没有 SS_NOTIFY 且被分组框压住，"
+          "点了没反应）");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -336,17 +730,35 @@ static void log_sockaddr(const char *api, SOCKET_T s, const struct sockaddr_min 
     }
 }
 
-/* 阶段3：把游戏 TCP 连接重定向到 127.0.0.1（端口不变）。原始目标已在 log_sockaddr 记下。
+/* 阶段3：把游戏 TCP 连接重定向到 127.0.0.1。原始目标已在 log_sockaddr 记下。
    置 0 则纯观测不改写。 */
 static int g_redirect = 1;
 
-/* 若是 IPv4 且开启重定向：把地址改成 127.0.0.1，返回 1 并填好 out；否则返回 0。 */
+/* V0.2：登录框里选了「联机」。定义在下面的「登录框改造」一段。 */
+int  popshot_online_mode(void);
+unsigned popshot_map_port(unsigned port);
+
+/* 若是 IPv4 且开启重定向：地址改成 127.0.0.1，端口按当前模式映射。
+   返回 1 并填好 out；否则返回 0。
+
+   ★ 单机 / 联机的区分就在这里，靠**端口**而不是靠别处传状态（决策 D066）：
+       单机（单选钮 1011）-> 127.0.0.1:47611 / 27799  = 本机服务端
+       联机（单选钮 1012）-> 127.0.0.1:47621 / 27809  = 本机中继，它再连远端
+   `connect` 发生在用户点「开始」之后，那一刻单选钮的状态是确定的，判定没有竞态。 */
 static int make_localhost(const struct sockaddr_min *name, int namelen, struct sockaddr_in_min *out)
 {
+    unsigned port, mapped;
     if (!g_redirect || !name || namelen < 16 || name->sa_family != AF_INET_MIN) return 0;
     memcpy(out, name, sizeof(*out));
+    port = ((unsigned)out->sin_port[0] << 8) | out->sin_port[1];
+    mapped = popshot_map_port(port);
+    if (mapped != port) {
+        out->sin_port[0] = (unsigned char)((mapped >> 8) & 0xff);
+        out->sin_port[1] = (unsigned char)(mapped & 0xff);
+    }
     out->sin_addr[0] = 127; out->sin_addr[1] = 0; out->sin_addr[2] = 0; out->sin_addr[3] = 1;
-    bslog("★WS2 重定向 -> 127.0.0.1:%u", ((unsigned)out->sin_port[0] << 8) | out->sin_port[1]);
+    bslog("★WS2 重定向 -> 127.0.0.1:%u  (原端口 %u, 模式=%s)", mapped, port,
+          popshot_online_mode() ? "联机" : "单机");
     return 1;
 }
 
@@ -433,7 +845,8 @@ static void install_hooks(void)
     s_MessageBoxA = (MsgBoxA_t)install_inline_hook(
         (void *)GetProcAddress(u32, "MessageBoxA"), (void *)det_MessageBoxA, "MessageBoxA");
 
-    install_ws2_hooks();  /* ws2_32 是静态导入, 此时已加载 */
+    install_ws2_hooks();    /* ws2_32 是静态导入, 此时已加载 */
+    install_shell_hooks();  /* 注册链接改写（V0.2 里程碑 H）*/
 }
 
 /* 十六进制 dump，阶段 3 抓包会大量用到。
@@ -593,7 +1006,8 @@ static void poll_unpack(void)
 /*   EIP 前移 5 字节，等价于执行 `mov eax,0x755`。代码页一个字节都不改，      */
 /*   因此 ASProtect 的后台 CRC 无论早晚运行都看不到变化。                      */
 /*                                                                            */
-/*   DLL 内部线程等注入 APC 完全返回后设置 DR0，再向 bsloader 发“已武装”握手。*/
+/*   DLL 内部线程等**目标指令真的解壳**后设置 DR0，再向 bsloader 发“已武装”     */
+/*   握手；命中前每 10ms 复查一次 DR0，被壳/安全软件清掉就补回去（§134）。      */
 /* -------------------------------------------------------------------------- */
 static const unsigned char GG_ORIG[POPSHOT_GG_CHECK_INSN_LEN] =
     { 0xE8, 0xCF, 0x60, 0x01, 0x00 }; /* call 0x5611d0 */
@@ -604,6 +1018,10 @@ static PVOID         g_gg_veh = NULL;
 static volatile LONG g_gg_break_state = 0;    /* 1=成功，2=旧 patch，-1=字节不符 */
 static volatile LONG g_gg_break_reported = 0;
 static DWORD         g_main_thread_id = 0;
+
+/* 命中之前每隔这么久复查一次 DR0 还在不在。10ms 足够快（从解壳到执行到
+   0x54b0fc 有好几秒），而每轮只是挂起-读-恢复主线程一次，开销可以忽略。 */
+#define GG_BREAKPOINT_WATCHDOG_MS 10u
 
 static void clear_dr0(CONTEXT *ctx)
 {
@@ -664,47 +1082,116 @@ static void report_gameguard_breakpoint(void)
     }
 }
 
-static int address_in_module(DWORD address, HMODULE module)
+/* 0x54b0fc 这 5 个字节能不能安全读？ASProtect 解壳前那一段可能还没提交，
+   或者带着 PAGE_GUARD。VirtualQuery 只问页属性，不碰内容 —— 不像
+   IsBadReadPtr 那样会真去踩一脚，把壳的 guard page 异常吃掉。 */
+static int gameguard_code_readable(void)
 {
-    IMAGE_DOS_HEADER *dos;
-    IMAGE_NT_HEADERS *nt;
-    DWORD base;
-    DWORD size;
+    MEMORY_BASIC_INFORMATION mbi;
+    const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                           PAGE_EXECUTE_WRITECOPY;
 
-    if (!module) return 0;
-    dos = (IMAGE_DOS_HEADER *)module;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    nt = (IMAGE_NT_HEADERS *)((BYTE *)module + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
-    base = (DWORD)(UINT_PTR)module;
-    size = nt->OptionalHeader.SizeOfImage;
-    return address >= base && address < base + size;
+    if (!VirtualQuery((LPCVOID)POPSHOT_GG_CHECK_VA, &mbi, sizeof(mbi)))
+        return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return 0;
+    if (!(mbi.Protect & readable)) return 0;
+    /* 这条指令不能跨到下一页去（跨了就得再查一次；实际不会，留个保险）。 */
+    if ((BYTE *)POPSHOT_GG_CHECK_VA + POPSHOT_GG_CHECK_INSN_LEN >
+        (BYTE *)mbi.BaseAddress + mbi.RegionSize) return 0;
+    return 1;
 }
 
-/* LoadLibraryA 是 APC 投递的。DllMain 里的握手若立刻让外部设置 DR0，
-   KiUserApcDispatcher 随后 NtContinue 恢复旧 CONTEXT 时会把 DR0 清回 0。
-   本线程只按“主线程 EIP 已离开 APC 涉及的系统模块/DLL”这个状态判断，
-   不使用毫秒数推测。 */
-static int main_thread_left_injection_apc(DWORD eip)
+/* 目标指令解壳了吗？1 = 原版 call，2 = 兼容的旧内存 patch，0 = 还是密文/未知。 */
+static int gameguard_instruction_state(void)
 {
-    if (address_in_module(eip, GetModuleHandleA("ntdll.dll"))) return 0;
-    if (address_in_module(eip, GetModuleHandleA("kernel32.dll"))) return 0;
-    if (address_in_module(eip, GetModuleHandleA("kernelbase.dll"))) return 0;
-    if (address_in_module(eip, GetModuleHandleA("bshook.dll"))) return 0;
-    return 1;
+    const unsigned char *code = (const unsigned char *)POPSHOT_GG_CHECK_VA;
+
+    if (!gameguard_code_readable()) return 0;
+    if (memcmp(code, GG_ORIG, POPSHOT_GG_CHECK_INSN_LEN) == 0) return 1;
+    if (memcmp(code, GG_OLD_PATCH, POPSHOT_GG_CHECK_INSN_LEN) == 0) return 2;
+    return 0;
+}
+
+/* 在主线程上保证 DR0 == 目标执行断点。
+   返回 1 = 这次写进去/补回去了，2 = 本来就对，3 = 断点已经命中，0 = API 失败。
+   ★ 挂起期间**绝不能调 bslog** —— 主线程可能正拿着日志的锁，那是死锁。 */
+static int ensure_gameguard_breakpoint(HANDLE main_thread, DWORD *eip_out,
+                                       DWORD *old_dr0_out, DWORD *old_dr7_out,
+                                       DWORD *error_out)
+{
+    CONTEXT ctx;
+    int changed = 0;
+
+    if (error_out) *error_out = ERROR_SUCCESS;
+    if (SuspendThread(main_thread) == (DWORD)-1) {
+        if (error_out) *error_out = GetLastError();
+        return 0;
+    }
+
+    /* 挂起之后再查一次：VEH 可能就在这一瞬间命中并撤掉了 DR0，
+       此时再武装一遍就等于在同一个地址上放了个永远不会被撤的断点。 */
+    if (InterlockedCompareExchange(&g_gg_break_state, 0, 0) != 0) {
+        ResumeThread(main_thread);
+        return 3;
+    }
+
+    ZeroMemory(&ctx, sizeof(ctx));
+    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(main_thread, &ctx)) {
+        if (error_out) *error_out = GetLastError();
+        ResumeThread(main_thread);
+        return 0;
+    }
+
+    if (eip_out) *eip_out = ctx.Eip;
+    if (old_dr0_out) *old_dr0_out = ctx.Dr0;
+    if (old_dr7_out) *old_dr7_out = ctx.Dr7;
+
+    if (ctx.Dr0 != (DWORD)POPSHOT_GG_CHECK_VA ||
+        (ctx.Dr7 & (DWORD)POPSHOT_DR0_CONTROL_MASK) !=
+            (DWORD)POPSHOT_DR0_LOCAL_ENABLE) {
+        ctx.Dr0 = (DWORD)POPSHOT_GG_CHECK_VA;
+        ctx.Dr6 = 0;
+        ctx.Dr7 &= ~(DWORD)POPSHOT_DR0_CONTROL_MASK;
+        ctx.Dr7 |= (DWORD)POPSHOT_DR0_LOCAL_ENABLE;
+        if (!SetThreadContext(main_thread, &ctx)) {
+            if (error_out) *error_out = GetLastError();
+            ResumeThread(main_thread);
+            return 0;
+        }
+        changed = 1;
+    }
+
+    if (ResumeThread(main_thread) == (DWORD)-1) {
+        if (error_out) *error_out = GetLastError();
+        return 0;
+    }
+    return changed ? 1 : 2;
 }
 
 static DWORD WINAPI arm_gameguard_breakpoint_thread(LPVOID param)
 {
     HANDLE ready_event = (HANDLE)param;
     HANDLE main_thread;
-    CONTEXT ctx;
-    DWORD suspend_count;
+    DWORD budget;
+    DWORD started;
+    DWORD elapsed;
     DWORD ticks;
     DWORD armed_eip = 0;
+    DWORD old_dr0 = 0;
+    DWORD old_dr7 = 0;
+    DWORD error = ERROR_SUCCESS;
+    DWORD repair_count = 0;
+    int instruction_state = 0;
+    int arm_result = 0;
 
+    /* SYNCHRONIZE 是为了 WaitForSingleObject(main_thread, 0) —— 主线程没了
+       就别再空转到超时。 */
     main_thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                             THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
+                             THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION |
+                             SYNCHRONIZE,
                              FALSE, g_main_thread_id);
     if (!main_thread) {
         bslog("HWBP    !! OpenThread(main tid=%lu) 失败 err=%lu",
@@ -713,50 +1200,111 @@ static DWORD WINAPI arm_gameguard_breakpoint_thread(LPVOID param)
         return 1;
     }
 
-    for (ticks = 0; !g_stop && ticks < POPSHOT_BSHOOK_READY_TIMEOUT; ticks++) {
-        suspend_count = SuspendThread(main_thread);
-        if (suspend_count == (DWORD)-1) break;
+    /* ★★ 什么时候才能武装 DR0 —— 踩过两个坑（§124 + §134）：
 
-        ZeroMemory(&ctx, sizeof(ctx));
-        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
-        if (!GetThreadContext(main_thread, &ctx)) {
-            ResumeThread(main_thread);
-            break;
+       坑一（V0.2 会话 01 修，§124）：循环上限按**次数**算，把毫秒常量当成了
+       循环次数。`Sleep(1)` 按系统定时器精度取整（默认 15.6ms），于是
+       10000「毫秒」实际上是 10000 次 × 最多 15.6ms；反过来 bsloader 只等
+       10 秒就判超时。表现是**时有时无的启动失败**
+       （`bsloader.err: 等待 bshook.dll 初始化握手 (GetLastError=1460)`）。
+       所以上限必须按 `GetTickCount()` 算，并留 2 秒余量让 DLL 先写下
+       失败原因，再轮到 bsloader 报超时。
+
+       坑二（V0.2 会话 03 修，§134）：判据是「主线程 EIP 已经不在
+       ntdll/kernel32/kernelbase/bshook 里」—— 这根本证明不了 APC 已经收尾。
+       别人的机器上主线程一注入完就回到了**主模块自己的 ASProtect 壳**
+       （EIP=0x007b27xx，5 毫秒就满足条件），DR0 在壳还在跑的时候就写下去，
+       随后壳 NtContinue 恢复旧 CONTEXT 把 Dr0 清回 0。日志上写着「已武装」，
+       断点却永远不命中，游戏弹「Game guard文件不存在或已变更」。
+       我这台机器只是碰巧慢了 720ms，采样时壳已经跑完 —— 纯运气。
+
+       现在换成一个**因果性**的判据：0x54b0fc 那 5 个字节变成已知明文
+       （原版 call 或旧 patch）。ASProtect 解壳是整段一次性做完的
+       （UNPACK 日志里 base+0x1000 一步从密文变明文），字节对上就说明壳
+       已经真的跑过了。再加一条 10ms 的守护回合，被清掉就补回去。 */
+    budget = POPSHOT_BSHOOK_READY_TIMEOUT - 2000u;
+    started = GetTickCount();
+    for (ticks = 0; !g_stop; ticks++) {
+        if ((DWORD)(GetTickCount() - started) >= budget) break;
+        instruction_state = gameguard_instruction_state();
+        if (instruction_state != 0) {
+            arm_result = ensure_gameguard_breakpoint(main_thread, &armed_eip,
+                                                     &old_dr0, &old_dr7, &error);
+            if (arm_result != 0 && arm_result != 3) break;
         }
-
-        if (main_thread_left_injection_apc(ctx.Eip)) {
-            ctx.Dr0 = (DWORD)POPSHOT_GG_CHECK_VA;
-            ctx.Dr6 = 0;
-            ctx.Dr7 &= ~(DWORD)POPSHOT_DR0_CONTROL_MASK;
-            ctx.Dr7 |= (DWORD)POPSHOT_DR0_LOCAL_ENABLE;
-            if (!SetThreadContext(main_thread, &ctx)) {
-                ResumeThread(main_thread);
-                break;
-            }
-            armed_eip = ctx.Eip;
-            ResumeThread(main_thread);
-            break;
-        }
-
-        ResumeThread(main_thread);
+        if (WaitForSingleObject(main_thread, 0) == WAIT_OBJECT_0) break;
         Sleep(1);
     }
+    elapsed = (DWORD)(GetTickCount() - started);
+    if (arm_result != 1 && arm_result != 2 && error == ERROR_SUCCESS) {
+        error = (WaitForSingleObject(main_thread, 0) == WAIT_OBJECT_0)
+                    ? ERROR_PROCESS_ABORTED : ERROR_TIMEOUT;
+    }
 
-    if (armed_eip) {
-        bslog("HWBP    主线程已离开注入 APC（EIP=%08X），DR0=%08X 已武装",
+    if (arm_result == 1 || arm_result == 2) {
+        bslog("HWBP    目标指令已解壳（%lu ms / %lu 轮，%s），"
+              "主线程 EIP=%08X，DR0=%08X 已武装",
+              (unsigned long)elapsed, (unsigned long)ticks,
+              instruction_state == 1 ? "原始 call" : "旧 patch",
               (unsigned)armed_eip, (unsigned)POPSHOT_GG_CHECK_VA);
         if (!SetEvent(ready_event)) {
             bslog("HWBP    !! SetEvent(bsloader ready) 失败 err=%lu",
                   (unsigned long)GetLastError());
         }
     } else {
-        bslog("HWBP    !! 未能在主线程离开注入 APC 后设置 DR0，err=%lu",
-              (unsigned long)GetLastError());
+        /* ★ 兜底：等不到已知签名也要**照样武装**，绝不能比改之前更差。
+           「一直等不到」的可能原因是别人手里的 exe 被别的东西改过 5 个字节，
+           或者这台机器上解壳走了另一条路。这时退回旧行为（直接武装 + 守护）
+           至少还有机会命中；命中后 VEH 自己会做签名判定，对不上就只撤断点、
+           让原指令正常执行，不会瞎改 EIP。 */
+        bslog("HWBP    !! 等不到目标指令解出已知签名"
+              "（%lu ms / %lu 轮，指令状态=%d，err=%lu）——"
+              "仍然武装 DR0 并守护，靠 VEH 的签名判定兜底",
+              (unsigned long)elapsed, (unsigned long)ticks,
+              instruction_state, (unsigned long)error);
+        arm_result = ensure_gameguard_breakpoint(main_thread, &armed_eip,
+                                                 &old_dr0, &old_dr7, &error);
+        if (arm_result != 1 && arm_result != 2) {
+            bslog("HWBP    !! 兜底武装也失败了 err=%lu", (unsigned long)error);
+            CloseHandle(main_thread);
+            CloseHandle(ready_event);
+            return 1;
+        }
+        bslog("HWBP    兜底已武装 DR0=%08X（主线程 EIP=%08X）",
+              (unsigned)POPSHOT_GG_CHECK_VA, (unsigned)armed_eip);
+        if (!SetEvent(ready_event)) {
+            bslog("HWBP    !! SetEvent(bsloader ready) 失败 err=%lu",
+                  (unsigned long)GetLastError());
+        }
+    }
+
+    CloseHandle(ready_event);
+
+    /* 命中之前一直守着。某些 Windows / 驱动 / 安全软件组合会在
+       SetThreadContext 成功之后再恢复一份旧 CONTEXT；只写一次的话日志上
+       是「已武装」，断点却永不命中（§134 就是这么炸的）。
+       从解壳到执行到 0x54b0fc 只有几秒，命中后立刻退出，开销可以忽略。 */
+    while (!g_stop && InterlockedCompareExchange(&g_gg_break_state, 0, 0) == 0) {
+        Sleep(GG_BREAKPOINT_WATCHDOG_MS);
+        if (WaitForSingleObject(main_thread, 0) == WAIT_OBJECT_0) break;
+
+        arm_result = ensure_gameguard_breakpoint(main_thread, &armed_eip,
+                                                 &old_dr0, &old_dr7, &error);
+        if (arm_result == 1) {
+            repair_count++;
+            bslog("HWBP    !! DR0 被清掉了（原 Dr0=%08X Dr7=%08X），已补回"
+                  "（第 %lu 次）",
+                  (unsigned)old_dr0, (unsigned)old_dr7,
+                  (unsigned long)repair_count);
+        } else if (arm_result == 0) {
+            bslog("HWBP    !! 守护 DR0 时线程上下文操作失败 err=%lu",
+                  (unsigned long)error);
+            break;
+        }
     }
 
     CloseHandle(main_thread);
-    CloseHandle(ready_event);
-    return armed_eip ? 0 : 1;
+    return 0;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1488,9 +2036,11 @@ static DWORD WINAPI watch_thread(LPVOID param)
     install_hooks();   /* user32 此时必已加载；失败会自动重置标志下一轮重试 */
     while (!g_stop) {
         if (!g_hooks_installed) install_hooks();
+        install_shell_hooks();   /* shell32 是后加载的，装上为止每轮试一次 */
         report_gameguard_breakpoint();
         poll_modules();
         EnumWindows(dump_window, 0);
+        poll_login_dialog();   /* V0.2：分区单选钮 + 注册链接（里程碑 H）*/
         poll_unpack();
         Sleep(100);
         if (++ticks % 300 == 0) bslog("--- still alive (%d s) ---", ticks / 10);
@@ -1574,6 +2124,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         read_log_level();
         open_log();
         banner();
+        read_online_config();   /* V0.2：server.config 经环境变量传进来 */
 
         ready_event = open_loader_ready_event();
         if (!ready_event) {

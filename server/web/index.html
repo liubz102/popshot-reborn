@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>炮炮火枪手 · 用户注册</title>
+<style>
+  :root {
+    --bg: #f4f1e8;
+    --card: #fffdf7;
+    --ink: #2f2a22;
+    --muted: #6f675a;
+    --line: #d9d2c2;
+    --accent: #b4531f;
+    --accent-ink: #fff;
+    --warn-bg: #fff4e2;
+    --warn-line: #e0b070;
+    --ok-bg: #e7f4e4;
+    --ok-line: #7fae72;
+    --err-bg: #fdeaea;
+    --err-line: #d08b8b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px 48px;
+    background: var(--bg); color: var(--ink);
+    font: 15px/1.7 "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", sans-serif;
+  }
+  .wrap { max-width: 620px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: 1px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 20px; margin-bottom: 18px;
+  }
+  .warn {
+    background: var(--warn-bg); border: 1px solid var(--warn-line);
+    border-radius: 8px; padding: 12px 14px; margin: 0 0 18px; font-size: 13.5px;
+  }
+  .warn b { color: var(--accent); }
+  label { display: block; margin: 14px 0 4px; font-size: 13.5px; color: var(--muted); }
+  input[type=text], input[type=password], input[type=file] {
+    width: 100%; padding: 9px 10px; font-size: 15px; color: var(--ink);
+    background: #fff; border: 1px solid var(--line); border-radius: 6px;
+    font-family: inherit;
+  }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button {
+    margin-top: 18px; padding: 10px 22px; font-size: 15px; font-family: inherit;
+    color: var(--accent-ink); background: var(--accent);
+    border: 0; border-radius: 6px; cursor: pointer;
+  }
+  button.ghost {
+    background: transparent; color: var(--accent);
+    border: 1px solid var(--accent);
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  .hint { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+  .msg { margin-top: 16px; padding: 10px 12px; border-radius: 6px; font-size: 14px; }
+  .msg.ok { background: var(--ok-bg); border: 1px solid var(--ok-line); }
+  .msg.err { background: var(--err-bg); border: 1px solid var(--err-line); }
+  .msg:empty { display: none; }
+
+  .mask {
+    position: fixed; inset: 0; background: rgba(30, 26, 20, .55);
+    display: none; align-items: center; justify-content: center; padding: 16px;
+  }
+  .mask.open { display: flex; }
+  .popup {
+    background: var(--card); border-radius: 10px; width: 100%; max-width: 560px;
+    max-height: 90vh; overflow: auto; padding: 20px;
+  }
+  .popup h2 { font-size: 18px; margin: 0 0 14px; }
+  .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--line); }
+  .tabs button {
+    margin: 0; padding: 8px 16px; border-radius: 6px 6px 0 0;
+    background: transparent; color: var(--muted); border: 1px solid transparent;
+    border-bottom: 0;
+  }
+  .tabs button.on {
+    background: var(--bg); color: var(--ink);
+    border-color: var(--line);
+  }
+  .pane { display: none; padding-top: 8px; }
+  .pane.on { display: block; }
+  .close { float: right; margin: 0; padding: 4px 12px; background: transparent; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>炮炮火枪手 · 用户注册</h1>
+  <p class="sub">服务器 __SERVER_ADDRESS__</p>
+
+  <div class="warn">
+    当前注册的服务器地址为 <b>__SERVER_ADDRESS__</b>，输入的用户名和密码将<b>明文传输并明文保存</b>在目标服务器上，请注意隐私安全，不要输入其他网站用过的密码。
+  </div>
+
+  <div class="card">
+    <form id="reg" autocomplete="off">
+      <label for="u">用户名</label>
+      <input id="u" type="text" maxlength="16" autocomplete="off">
+      <div class="hint">__USERNAME_RULE__</div>
+
+      <label for="p1">密码</label>
+      <input id="p1" type="password" maxlength="32" autocomplete="new-password">
+
+      <label for="p2">确认密码</label>
+      <input id="p2" type="password" maxlength="32" autocomplete="new-password">
+
+      <button type="submit" id="regBtn">注册</button>
+      <div class="msg" id="regMsg"></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <button type="button" class="ghost" id="openTransfer" style="margin-top:0">存档转移助手</button>
+    <div class="hint">把你在某台服务器上的存档下载下来，再上传到另一台服务器。</div>
+  </div>
+</div>
+
+<div class="mask" id="mask">
+  <div class="popup">
+    <button type="button" class="close" id="closeTransfer">关闭</button>
+    <h2>存档转移助手</h2>
+
+    <div class="tabs">
+      <button type="button" class="on" data-pane="down">存档下载</button>
+      <button type="button" data-pane="up">存档上传</button>
+    </div>
+
+    <div class="pane on" id="pane-down">
+      <form id="dl" autocomplete="off">
+        <label for="du">用户名</label>
+        <input id="du" type="text" maxlength="16" autocomplete="off">
+        <label for="dp">密码</label>
+        <input id="dp" type="password" maxlength="32" autocomplete="off">
+        <button type="submit">存档导出</button>
+        <div class="msg" id="dlMsg"></div>
+      </form>
+    </div>
+
+    <div class="pane" id="pane-up">
+      <form id="ul" autocomplete="off">
+        <label for="uf">存档文件</label>
+        <input id="uf" type="file" accept=".json,application/json">
+
+        <label for="uu">用户名</label>
+        <input id="uu" type="text" maxlength="16" autocomplete="off">
+        <label for="up">密码</label>
+        <input id="up" type="password" maxlength="32" autocomplete="off">
+        <div class="hint">更新服务器上已有的存档时需要填入正确的用户名密码。若本服务器上没有保存过你的账号，则不需要填入。</div>
+        <div class="hint">手改存档时注意：等级由经验推算，把 <code>level</code> 改大会自动把 <code>experience</code> 补到那一级；想降级请把 <code>experience</code> 一起改小。</div>
+
+        <button type="submit">存档上传</button>
+        <div class="msg" id="ulMsg"></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+function show(id, text, ok) {
+  var box = document.getElementById(id);
+  box.textContent = text;
+  box.className = "msg " + (ok ? "ok" : "err");
+}
+
+function post(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body)
+  }).then(function (res) {
+    return res.json().then(function (data) { return {status: res.status, data: data}; });
+  });
+}
+
+document.getElementById("reg").addEventListener("submit", function (event) {
+  event.preventDefault();
+  var username = document.getElementById("u").value.trim();
+  var p1 = document.getElementById("p1").value;
+  var p2 = document.getElementById("p2").value;
+  if (p1 !== p2) { show("regMsg", "两次输入的密码不一致，请重新输入。", false); return; }
+  var button = document.getElementById("regBtn");
+  button.disabled = true;
+  post("/api/register", {username: username, password: p1, password2: p2})
+    .then(function (r) { show("regMsg", r.data.message, r.data.ok); })
+    .catch(function () { show("regMsg", "连不上服务器，请确认服务端还在运行。", false); })
+    .then(function () { button.disabled = false; });
+});
+
+var mask = document.getElementById("mask");
+document.getElementById("openTransfer").addEventListener("click", function () {
+  mask.classList.add("open");
+});
+document.getElementById("closeTransfer").addEventListener("click", function () {
+  mask.classList.remove("open");
+});
+// ★ 点变暗的背景**不关闭**弹窗：这里面填着用户名密码、选好的存档文件，
+// 手一滑点到旁边就全没了。只认右上角那个「关闭」。
+
+var tabs = document.querySelectorAll(".tabs button");
+for (var i = 0; i < tabs.length; i++) {
+  tabs[i].addEventListener("click", function (event) {
+    var want = event.target.getAttribute("data-pane");
+    for (var j = 0; j < tabs.length; j++) {
+      tabs[j].classList.toggle("on", tabs[j] === event.target);
+    }
+    document.getElementById("pane-down").classList.toggle("on", want === "down");
+    document.getElementById("pane-up").classList.toggle("on", want === "up");
+  });
+}
+
+document.getElementById("dl").addEventListener("submit", function (event) {
+  event.preventDefault();
+  var username = document.getElementById("du").value.trim();
+  post("/api/export", {username: username, password: document.getElementById("dp").value})
+    .then(function (r) {
+      if (!r.data.ok) { show("dlMsg", r.data.message, false); return; }
+      var blob = new Blob([JSON.stringify(r.data.save, null, 2)],
+                          {type: "application/json"});
+      var link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "popshot-save-" + username + ".json";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(link.href);
+      show("dlMsg", r.data.message, true);
+    })
+    .catch(function () { show("dlMsg", "连不上服务器，请确认服务端还在运行。", false); });
+});
+
+document.getElementById("ul").addEventListener("submit", function (event) {
+  event.preventDefault();
+  var picked = document.getElementById("uf").files[0];
+  if (!picked) { show("ulMsg", "请先选择一个存档文件。", false); return; }
+  var reader = new FileReader();
+  reader.onerror = function () { show("ulMsg", "读不了这个文件，请重新选择。", false); };
+  reader.onload = function () {
+    var save;
+    try { save = JSON.parse(reader.result); }
+    catch (error) { show("ulMsg", "这不是一个有效的 JSON 存档文件。", false); return; }
+    post("/api/import", {
+      username: document.getElementById("uu").value.trim(),
+      password: document.getElementById("up").value,
+      save: save
+    })
+      .then(function (r) { show("ulMsg", r.data.message, r.data.ok); })
+      .catch(function () { show("ulMsg", "连不上服务器，请确认服务端还在运行。", false); });
+  };
+  reader.readAsText(picked, "utf-8");
+});
+</script>
+</body>
+</html>

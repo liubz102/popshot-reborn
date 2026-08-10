@@ -61,6 +61,9 @@ from account_store import (AccountStore, BASE_CHARACTER_IDS,
                            player_money, quest_cleared_difficulty,
                            quest_difficulty_records, quest_unlock_all,
                            tutorial_state)
+import eventlog
+from netlisten import create_listener, describe as describe_listen
+from tickets import TicketStore, short as short_ticket
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -76,6 +79,15 @@ MAGIC_CTRL = 0xFE
 MAGIC_GAME = 0xFF
 
 OP_REP_LOGIN = 0x0100
+#: `gspRepLogin` 的结果码 3 = 客户端 `0x54f3cf`「断开」（V0.1 §44）。
+#: 票据无效时用它，让客户端干净地退回登录框，而不是留在半登录状态。
+#: 弹的框是 `Data\Chinese.ini` 里的「在无法连接的地方尝试了连接。」（§132）。
+LOGIN_RESULT_BAD_TICKET = 3
+#: 结果码 2 = 客户端 `0x54f416`，和结果码 3 的分支**一模一样**（都是
+#: `[conn+0x898]=0` → `0x5bc415` 断开 → 弹框），只有文案不同：
+#: 「现有连接已断开。请重新尝试连接。」—— 正是「被别人顶号」该说的话。
+#: 被顶掉的客户端会自动重连并重放已作废的旧票据，就用这个码回它（§132 / D071）。
+LOGIN_RESULT_SUPERSEDED = 2
 OP_LEAVE_SESSION = 0x0203
 OP_MOVE_CHANNEL_BY_GAME_TYPE = 0x020b
 #: 服务端方向：`gspQuestReachedDifficulty` = 「每一关你打到第几个难度了」的
@@ -1757,7 +1769,10 @@ _lock = threading.Lock()
 # ----------------------------------------------------------------------------
 # 调试控制通道
 # ----------------------------------------------------------------------------
-#: 活动连接表，最新的排在最后。控制通道默认操作最后一个（= 当前客户端）。
+#: 活动连接表，最新的排在最后。控制通道不指定账号时操作最后一个。
+#:
+#: V0.2 起同时可能有好几个玩家在线，所以「最后一个」只是**默认值**，
+#: `tools/gs_ctl.py --user <账号>` 可以指定操作谁（多于一个连接时必须指定）。
 _conns = []
 _conns_lock = threading.Lock()
 
@@ -1778,8 +1793,36 @@ def latest_conn():
         return _conns[-1] if _conns else None
 
 
+def all_conns():
+    with _conns_lock:
+        return list(_conns)
+
+
+def conns_for_user(username):
+    """某个账号当前的全部连接（正常只会有一条）。"""
+    username = str(username or "")
+    with _conns_lock:
+        return [c for c in _conns if c.account_name == username]
+
+
+def pick_conn(username=""):
+    """控制通道用：按账号名挑一条连接。
+
+    不给账号名时：只有一条就用它；有多条就返回 ``None`` 并让调用方报错，
+    **绝不猜** —— 拿错连接会把包发给别的玩家。
+    """
+    username = str(username or "").strip()
+    if username:
+        found = conns_for_user(username)
+        return found[-1] if found else None
+    conns = all_conns()
+    if len(conns) == 1:
+        return conns[0]
+    return None
+
+
 class Conn:
-    def __init__(self, sock, addr, args):
+    def __init__(self, sock, addr, args, accounts=None, tickets=None):
         global _seq
         with _lock:
             _seq += 1
@@ -1792,7 +1835,11 @@ class Conn:
         self.cout = SimpleCipher.server_to_client()
         self.buf = bytearray()
         self.got_version = False
-        self.accounts = AccountStore(args.accounts)
+        # ★ 账号存储和票据表由 `server/app.py` 建好后传进来，全进程共用一份
+        #   —— 票据是认证服签发的，游戏服要能查到它（D064）。
+        #   单独跑 gameserver.py 做协议试探时各自新建，行为退化成 V0.1 的样子。
+        self.accounts = accounts if accounts is not None else AccountStore(args.accounts)
+        self.tickets = tickets if tickets is not None else TicketStore()
         self.account_name = None
         self.account = None
         self.start_game = StartGameHandshake(seed=0)
@@ -1852,6 +1899,8 @@ class Conn:
         self.send_queue = None
         # 只给 `--room-burst-delay` 用：每发完一个包故意等这么久，复现 §120。
         self.batch_delay_ms = 0
+        #: 连上来的时刻，断开时用来算在线时长（连接事件日志用）。
+        self.connected_at = time.monotonic()
         register_conn(self)
 
     def log(self, msg):
@@ -1859,6 +1908,14 @@ class Conn:
         print(line, flush=True)
         self.ft.write(line + "\n")
         self.ft.flush()
+
+    def peer(self):
+        """本连接对端的 ``ip:port``（v4-mapped 前缀已剥掉）。"""
+        return eventlog.peer(self.addr)
+
+    def online(self, msg):
+        """连接事件（上线 / 下线 / 顶号）。**精简模式下也照打**，见 eventlog.py。"""
+        eventlog.online(f"游戏服 #{self.seq} {msg}")
 
     def vlog(self, msg):
         """逐包细节（hexdump / 字段试解）。只在 `--verbose` 时落盘。"""
@@ -2047,6 +2104,93 @@ class Conn:
             level=player_level(self.account),
             character_id=player_character(self.account),
         )))
+
+    def on_game_login(self, payload):
+        """`0x0100 gcpReqLogin` —— 用认证服签发的票据认人，然后回 `gspRepLogin`。
+
+        载荷第一个字段就是票据（认证服放进 `CULoginReplyPacket` 的字符串字段，
+        客户端原样转发，FINDINGS §123）。V0.1 靠 `accounts.json` 里的
+        `active_account` 认人，那只在「全世界只有一个玩家」时成立。
+
+        ★ 票据查不到就**拒绝登录**（`result=3` 让客户端断开），绝不回退到
+        「随便给个本地账号」—— 那等于谁都能顶别人的名字进来。
+        """
+        try:
+            ticket = Reader(payload).wstr()
+        except Exception:
+            ticket = ""
+        username = self.tickets.resolve(ticket)
+        if username is None:
+            # 先问一句「这张票是不是被顶掉的」。被顶号的客户端断线后会**自动
+            # 重连**并原样重放旧票据（§132）—— 这条路每次顶号必走一遍，
+            # 回 result=3 的话玩家看到的是「在无法连接的地方尝试了连接。」。
+            revoked = self.tickets.revoked_reason(ticket)
+            if revoked is not None:
+                revoked_user = revoked[0]
+                self.log(f"✗ gcpReqLogin 的票据已被顶号作废"
+                         f"（{short_ticket(ticket)}，账号={revoked_user!r}）；"
+                         f"回 gspRepLogin(result={LOGIN_RESULT_SUPERSEDED}) "
+                         f"→ 客户端提示「现有连接已断开。请重新尝试连接。」")
+                self.online(f"✗ 登录被拒 账号={revoked_user!r} ip={self.peer()} "
+                            f"原因=账号已在别处登录")
+                self.send(build_game(OP_REP_LOGIN,
+                                     build_gsp_rep_login(LOGIN_RESULT_SUPERSEDED)))
+                return
+            self.log(f"✗ gcpReqLogin 的票据无效或已过期（{short_ticket(ticket)}）；"
+                     f"回 gspRepLogin(result={LOGIN_RESULT_BAD_TICKET}) 断开")
+            self.online(f"✗ 登录被拒 账号=? ip={self.peer()} 原因=票据无效或已过期")
+            self.send(build_game(OP_REP_LOGIN,
+                                 build_gsp_rep_login(LOGIN_RESULT_BAD_TICKET)))
+            return
+        name, account = self.accounts.get_account(username)
+        if account is None:
+            # 票据有效但账号在这期间被删了（存档转移助手可能改过 JSON）。
+            self.log(f"✗ 票据 {short_ticket(ticket)} 指向的账号 {username!r} 已不存在；"
+                     f"回 gspRepLogin(result={LOGIN_RESULT_BAD_TICKET}) 断开")
+            self.online(f"✗ 登录被拒 账号={username!r} ip={self.peer()} 原因=账号已不存在")
+            self.send(build_game(OP_REP_LOGIN,
+                                 build_gsp_rep_login(LOGIN_RESULT_BAD_TICKET)))
+            return
+        # 同一个账号在别处已经连着：把旧连接踢掉。不这么做的话两条连接会
+        # 同时往同一份存档里写，谁最后写谁赢。
+        for other in conns_for_user(name):
+            if other is not self:
+                other.log(f"⚠ 账号 {name!r} 在别处重新登录，本连接被顶掉")
+                other.online(f"⚠ 被顶号 账号={name!r} ip={other.peer()} "
+                             f"顶它的是 ip={self.peer()}")
+                other.close_now()
+        self.account_name, self.account = name, account
+        self.online(f"✓ 登录 账号={name!r} ip={self.peer()} "
+                    f"等级={player_level(account)} 金币={player_money(account)}")
+        state = tutorial_state(self.account)
+        self.log(f"← 回 gspRepLogin(result={self.args.login_result}) "
+                 f"账号={self.account_name!r} 票据={short_ticket(ticket)} "
+                 f"stored_level={self.account.get('level', 1)} "
+                 f"下发等级={player_level(self.account)} "
+                 f"经验={player_experience(self.account)} "
+                 f"金币={player_money(self.account)} "
+                 f"tutorial_completed={self.account.get('tutorial_completed', False)} "
+                 f"(客户端状态={state})")
+        self.send(build_game(OP_REP_LOGIN, build_gsp_rep_login(
+            self.args.login_result, self.account,
+            self.channel_code, self.channel_index)))
+        # 登录包带得动等级和经验，唯独带不动金币（`0x54f2cc` 不写 0x72e330）。
+        # 补一发 0x0600，右上角数据栏才和存档完全一致。
+        self.send_rep_money(reason="（登录后补发，登录包没有金币字段）")
+        # 每一关的「已达成难度」。这张 map 只有服务端能填，不发就等于
+        # 全部关卡只有「简单」能开局（§118）。
+        self.send_quest_reached_difficulty(reason="（登录后下发）")
+
+    def close_now(self):
+        """立刻切断这条连接（被顶号、被踢时用）。`run()` 的收包循环会自己收尾。"""
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
     def reload_account(self):
         """从盘上重读当前账号。用户手改 accounts.json 之后不必重登游戏。"""
@@ -2500,31 +2644,7 @@ class Conn:
             self.log("   [hold-lobby] 不回应答")
             return
         if opcode == 0x0100:
-            try:
-                ticket = Reader(payload).wstr()
-            except Exception:
-                ticket = ""
-            self.account_name, self.account = self.accounts.resolve_game_login(ticket)
-            if self.account is None:
-                # 正常启动顺序里认证服一定先写 active_account；保底仍允许本地进入。
-                self.account_name = "local"
-                self.account = self.accounts.login(self.account_name, "")
-            state = tutorial_state(self.account)
-            self.log(f"← 回 gspRepLogin(result={self.args.login_result}) "
-                     f"账号={self.account_name!r} stored_level={self.account.get('level', 1)} "
-                     f"经验={player_experience(self.account)} "
-                     f"金币={player_money(self.account)} "
-                     f"tutorial_completed={self.account.get('tutorial_completed', False)} "
-                     f"(客户端状态={state})")
-            payload = build_gsp_rep_login(self.args.login_result, self.account,
-                                          self.channel_code, self.channel_index)
-            self.send(build_game(OP_REP_LOGIN, payload))
-            # 登录包带得动等级和经验，唯独带不动金币（`0x54f2cc` 不写 0x72e330）。
-            # 补一发 0x0600，右上角数据栏才和存档完全一致。
-            self.send_rep_money(reason="（登录后补发，登录包没有金币字段）")
-            # 每一关的「已达成难度」。这张 map 只有服务端能填，不发就等于
-            # 全部关卡只有「简单」能开局（§118）。
-            self.send_quest_reached_difficulty(reason="（登录后下发）")
+            self.on_game_login(payload)
         elif opcode == 0x0200:
             self.log("← 回 gspRepListSession（空房间列表）")
             self.send(build_game(0x0200, build_rep_list_session()))
@@ -2732,6 +2852,7 @@ class Conn:
 
     def run(self):
         self.log(f"+++ 连接来自 {self.addr[0]}:{self.addr[1]}")
+        self.online(f"+ 连上游戏服 ip={self.peer()}（还没报票据）")
         # 超时只是为了让 recv 别永久阻塞（收工时线程能退），不代表连接有问题。
         self.sock.settimeout(1.0)
         try:
@@ -2751,6 +2872,9 @@ class Conn:
         finally:
             unregister_conn(self)
             self.log("--- 连接结束")
+            who = repr(self.account_name) if self.account_name else "?（没登录成功）"
+            self.online(f"- 断开 账号={who} ip={self.peer()} "
+                        f"在线 {eventlog.duration(time.monotonic() - self.connected_at)}")
             for f in (self.ft, self.fb_raw, self.fb_dec):
                 if f is None:      # 非 verbose 时抓包文件根本没开
                     continue
@@ -2768,6 +2892,10 @@ class Conn:
 # 调试控制通道：一行一命令的纯文本协议
 # ----------------------------------------------------------------------------
 CONTROL_HELP = """命令（一行一条，大小写不敏感）：
+  --user <账号>                   ★ 可加在任何命令里，指定操作哪个玩家的连接。
+                                  只有一条连接时可以省略；有多条时**必须**指定，
+                                  服务端不会替你猜（猜错就把包发给别人了）
+  who                             列出当前所有活动连接和它们的账号
   status                          当前连接 / 开局状态 / 座位 / 分数 / 最后坐标
   raw <op> [payload-hex]          发任意游戏包，op 是十六进制（例：raw 0411 ...）
   endgame                         按存档真结算一局（记经验+金币再发 0x0411），
@@ -2884,12 +3012,34 @@ def _dispatch_control_command(line):
     words = line.split()
     if not words:
         return "ok"
+    # `--user <账号>` 可以出现在任何位置：V0.2 起同时可能有好几个玩家在线，
+    # 不指定就只在「刚好只有一条连接」时才继续 —— 拿错连接会把包发给别人。
+    username = ""
+    if "--user" in words:
+        index = words.index("--user")
+        if index + 1 >= len(words):
+            return "err --user 后面要跟账号名"
+        username = words[index + 1]
+        words = words[:index] + words[index + 2:]
+    if not words:
+        return "ok"
     cmd = words[0].lower()
     if cmd == "help":
         return CONTROL_HELP.strip()
+    if cmd == "who":
+        conns = all_conns()
+        if not conns:
+            return "ok 当前没有活动连接"
+        return "ok " + "; ".join(
+            f"#{c.seq} {c.account_name or '(未登录)'}" for c in conns)
 
-    conn = latest_conn()
+    conn = pick_conn(username)
     if conn is None:
+        if username:
+            return f"err 账号 {username!r} 当前没有活动连接（用 who 看在线的）"
+        if all_conns():
+            return ("err 当前有多条活动连接，请用 --user <账号> 指定操作谁"
+                    "（用 who 看在线的）")
         return "err 当前没有活动连接"
 
     if cmd == "status":
@@ -3101,6 +3251,7 @@ def serve_control(port):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=27799)
+    ap.add_argument("--host", default="::", help="监听地址，默认 :: （双栈）")
     ap.add_argument("--hold", action="store_true", help="连版本应答都不回，纯抓包")
     ap.add_argument("--version-result", type=int, default=0,
                     help="0xFE 控制帧里的结果码，0 = 版本通过")
@@ -3132,21 +3283,31 @@ def main():
         threading.Thread(target=serve_control, args=(args.control_port,),
                          daemon=True).start()
 
-    print(f"[{ts()}] [gameserver] 监听 127.0.0.1:{args.port} "
+    print(f"[{ts()}] [gameserver] 监听 {describe_listen(args.host, args.port)} "
           f"{'(hold)' if args.hold else f'version_result={args.version_result}'} "
           f"日志={'详细（逐包 dump）' if VERBOSE else '精简（--verbose 开全量）'}",
           flush=True)
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # 不开 SO_REUSEADDR：旧进程没退干净时宁可绑定失败，也不要两个进程抢同一端口
     try:
-        s.bind(("127.0.0.1", args.port))
+        serve(args.port, args, host=args.host)
     except OSError as e:
         print(f"!! 端口 {args.port} 绑定失败（旧进程没退？）: {e}", flush=True)
-        return
-    s.listen(8)
+
+
+def listen(port, host="::"):
+    """建一个监听 socket。默认 `::` 双栈，IPv4 和 IPv6 都能连进来（D063）。"""
+    return create_listener(host, port)
+
+
+def serve(port, args, accounts=None, tickets=None, host="::", ready=None):
+    """在 `port` 上接受游戏连接（阻塞）。`app.py` 会把它丢进一个线程。"""
+    s = listen(port, host)
+    if ready is not None:
+        ready.set()
     while True:
         conn, addr = s.accept()
-        threading.Thread(target=Conn(conn, addr, args).run, daemon=True).start()
+        threading.Thread(
+            target=Conn(conn, addr, args, accounts, tickets).run,
+            daemon=True).start()
 
 
 if __name__ == "__main__":

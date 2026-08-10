@@ -12,8 +12,8 @@
  *   「静态导入全部就绪」和「ASProtect 壳开始跑」之间 —— 这正是我们要的。
  *
  * GameGuard 绕过不用固定延时改代码：bshook.dll 先注册 VEH，再由内部线程
- * 等主线程离开注入 APC 后设置 DR0，最后通过命名事件回报“已武装”。主线程
- * 真正执行到状态读取指令时，VEH 直接改 EAX/EIP；游戏代码字节始终不变。
+ * 等目标校验指令**真正解壳**后设置并守护 DR0，最后通过命名事件回报“已武装”。
+ * 主线程执行到状态读取指令时，VEH 直接改 EAX/EIP；游戏代码字节始终不变。
  *
  * 用法：
  *   bsloader.exe                    用默认目标 <项目根>\game_patched\BigShot.exe
@@ -184,9 +184,10 @@ int main(int argc, char **argv)
 
     if (ResumeThread(pi.hThread) == (DWORD)-1) die("ResumeThread");
 
-    /* DLL 内的专用线程会等主线程离开 LoadLibrary APC 的恢复路径，再设置 DR0；
-       否则 APC 返回时恢复旧 CONTEXT，会把过早设置的调试寄存器覆盖掉。
-       等待的是“断点已经武装”的握手，不是游戏运行到某个固定毫秒数。 */
+    /* DLL 内的专用线程会等目标校验指令真正解壳，再设置并持续守护 DR0 ——
+       壳（和某些安全软件）恢复旧 CONTEXT 时会把过早设置的调试寄存器清掉，
+       只写一次会「日志说已武装、断点却永不命中」（§134）。
+       等待的是“目标已解壳且断点已武装”的握手，不是固定毫秒数。 */
     waits[0] = ready_event;
     waits[1] = pi.hProcess;
     wait_result = WaitForMultipleObjects(2, waits, FALSE, POPSHOT_BSHOOK_READY_TIMEOUT);
@@ -201,7 +202,7 @@ int main(int argc, char **argv)
     }
     CloseHandle(ready_event);
 
-    printf("[bsloader] bshook 已就绪，GameGuard 执行断点 DR0=%08lX\n",
+    printf("[bsloader] bshook 已就绪，GameGuard 目标已解壳，执行断点 DR0=%08lX\n",
            (unsigned long)POPSHOT_GG_CHECK_VA);
 
     printf("[bsloader] 已启动，等待游戏退出…（日志在 %s\\logs\\）\n", root);

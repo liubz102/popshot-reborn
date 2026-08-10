@@ -1,22 +1,25 @@
 ﻿<#
-    launch.ps1 —— 一键启动：假服务端 + 注入启动客户端
+    launch.ps1 —— 一键启动：服务端 + 本机中继 + 注入启动客户端
 
     被 start.bat（正常游玩）和 start-debug.bat（调试）调用，两者只差 -DebugLog。
 
     做的事，按顺序：
       1. 环境自检（GameGuard.des 已改名 / bshook.dll 存在 / 串流是否在跑）
-      2. 服务端：**已经在跑就不重复启动**（按端口的 OwningProcess 判断）
-      3. 残留的 BigShot.exe 一律先杀（单实例互斥体 BigShot_Assa，见 FINDINGS §9）
-      4. 按日志级别设好环境变量，再拉起 bsloader.exe
+      2. 服务端：`server\app.py` 一个进程带起认证 47611 + 游戏 27799 + 注册页
+         **已经在跑就不重复启动**（按端口的 OwningProcess 判断）
+      3. 读 server.config，起本机中继（联机模式下客户端经它连远端）
+      4. 把配置经**环境变量**交给 bshook（登录框文案 / 注册页 URL 都要用）
+      5. 残留的 BigShot.exe 一律先杀（单实例互斥体 BigShot_Assa，见 V0.1 §9）
+      6. 按日志级别设好环境变量，再拉起 bsloader.exe
 
     参数名用 -DebugLog 而不是 -Verbose：后者是 PowerShell 的公共参数，会被吞掉。
 #>
 [CmdletBinding()]
 param(
     # 打开全量调试日志：客户端逐包 dump + 服务端逐包 hexdump。
-    # 速度和精简模式几乎一样（§105），代价是日志 4 MB 起、关键行淹在 hexdump 里。
+    # 速度和精简模式几乎一样（V0.1 §105），代价是日志 4 MB 起、关键行淹在 hexdump 里。
     [switch]$DebugLog,
-    # 只起服务端，不拉游戏。
+    # 只起服务端和中继，不拉游戏。
     [switch]$NoGame
 )
 
@@ -25,8 +28,12 @@ $Root       = Split-Path -Parent $PSScriptRoot
 $Python     = Join-Path $Root 'runtime\python\python.exe'
 $LogDir     = Join-Path $Root 'logs'
 $ModeFile   = Join-Path $LogDir '.server_mode'
-$AuthPort   = 47611
-$GamePort   = 27799
+$ConfigPath = Join-Path $Root 'server.config'
+$AuthPort   = 47611     # 认证服（客户端写死）
+$GamePort   = 27799     # 游戏服（客户端写死）
+$CtrlPort   = 27800     # 调试控制通道（只绑 127.0.0.1）
+$RelayAuth  = 47621     # 联机模式：客户端 -> 中继 -> 远端 47611
+$RelayGame  = 27809     # 联机模式：客户端 -> 中继 -> 远端 27799
 $Mode       = if ($DebugLog) { 'debug' } else { 'normal' }
 
 function Say([string]$msg, [string]$color = 'Gray') {
@@ -42,7 +49,7 @@ function Get-ListenerPid([int]$port) {
 
 function Stop-ListenerOn([int[]]$ports) {
     # ★ 只停「占着这些端口的进程」。绝不 Get-Process python | Stop-Process ——
-    #   用户机器上还有别的 Python 活儿，误伤过一次就够了（PROGRESS「测试前必读」）。
+    #   用户机器上还有别的 Python 活儿，误伤过一次就够了。
     $ids = @()
     foreach ($p in $ports) {
         $found = Get-ListenerPid $p
@@ -52,6 +59,33 @@ function Stop-ListenerOn([int[]]$ports) {
         try { Stop-Process -Id $id -Force -ErrorAction Stop } catch {}
     }
     if ($ids) { Start-Sleep -Milliseconds 700 }
+}
+
+# 读 server.config。解析规则和 server\config.py 保持一致：
+# key = value、# 或 ; 起头是注释、认不出的键忽略、缺键用默认值。
+function Read-ServerConfig([string]$path) {
+    $cfg = @{
+        server_address       = '127.0.0.1'
+        server_register_port = '27810'
+        local_register_port  = '27810'
+    }
+    if (-not (Test-Path -LiteralPath $path)) { return $cfg }
+    foreach ($line in (Get-Content -LiteralPath $path -Encoding UTF8)) {
+        $text = $line.Trim()
+        if (-not $text) { continue }
+        if ($text.StartsWith('#') -or $text.StartsWith(';')) { continue }
+        $split = $text.IndexOf('=')
+        if ($split -lt 1) { continue }
+        $key = $text.Substring(0, $split).Trim().ToLowerInvariant()
+        $value = $text.Substring($split + 1).Trim()
+        if ($cfg.ContainsKey($key) -and $value) { $cfg[$key] = $value }
+    }
+    # IPv6 可能被写成 [2001:db8::1]，去掉方括号（拼 URL 时再加回去）。
+    $addr = $cfg['server_address']
+    if ($addr.StartsWith('[') -and $addr.EndsWith(']')) {
+        $cfg['server_address'] = $addr.Substring(1, $addr.Length - 2).Trim()
+    }
+    return $cfg
 }
 
 Say ''
@@ -77,11 +111,10 @@ if (Test-Path $gg) {
     throw "game_patched\GameGuard.des 还在原位！必须改名（见 CLAUDE.md 铁律 2）后再启动。"
 }
 
-# 串流**会话进行中**会让 D3D9 HAL 整体不可用，画面出不来（FINDINGS §61）。
+# 串流**会话进行中**会让 D3D9 HAL 整体不可用，画面出不来（V0.1 §61）。
 #
 # ★ 判据是探针，不是进程名。`sunshine.exe` 在这台机器上是常驻后台服务，
 #   进程在 ≠ 正在串流 —— 而用户可能正靠它远程连着这台机器，更不能去杀它。
-#   唯一放行标准就是下面这行 `hr=00000000`（会话 09 实测确立）。
 $probe = Join-Path $Root 'tools\d3d9_probe.exe'
 if (Test-Path $probe) {
     # 输入法、显卡覆盖层等注入到 GUI 进程的组件可能往 stderr 写无害警告。
@@ -108,35 +141,31 @@ if (Test-Path $probe) {
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
 
 # --- 2. 服务端：已在跑就复用 ------------------------------------------------
+# V0.2 起认证服和游戏服合并成一个进程（决策 D064）：认证服签发的票据要让
+# 游戏服查得到，跨进程就得再造一套 IPC。
 $authPid = Get-ListenerPid $AuthPort
 $gamePid = Get-ListenerPid $GamePort
-$running = ($authPid -and $gamePid)
+$running = ($authPid -and $gamePid -and $authPid -eq $gamePid)
 $lastMode = ''
 if (Test-Path $ModeFile) { $lastMode = (Get-Content $ModeFile -Raw).Trim() }
 
 if ($running -and $lastMode -eq $Mode) {
-    Say "[服务端] 已在运行，跳过启动（认证 pid=$authPid / 游戏 pid=$gamePid，模式=$Mode）" 'Green'
+    Say "[服务端] 已在运行，跳过启动（pid=$authPid，模式=$Mode）" 'Green'
 } else {
     if ($running) {
         Say "[服务端] 已在运行，但模式是 '$lastMode'，本次要 '$Mode' —— 重启它" 'Yellow'
     } elseif ($authPid -or $gamePid) {
-        Say '[服务端] 只有一半在跑（上次没关干净），全部重启' 'Yellow'
+        Say '[服务端] 上次没关干净（端口只占了一半），全部重启' 'Yellow'
     }
-    Stop-ListenerOn @($AuthPort, $GamePort, 27800)
+    Stop-ListenerOn @($AuthPort, $GamePort, $CtrlPort)
 
-    $gameArgs = @((Join-Path $Root 'server\gameserver.py'))
-    if ($DebugLog) { $gameArgs += '--verbose' }
-
-    Start-Process -FilePath $Python -WorkingDirectory $Root `
-        -ArgumentList @((Join-Path $Root 'server\authserver.py'), '--port', "$AuthPort", '--reply', 'login') `
-        -RedirectStandardOutput (Join-Path $LogDir 'authserver.out') `
-        -RedirectStandardError  (Join-Path $LogDir 'authserver.err') `
-        -WindowStyle Hidden | Out-Null
+    $appArgs = @((Join-Path $Root 'server\app.py'))
+    if ($DebugLog) { $appArgs += '--verbose' }
 
     Start-Process -FilePath $Python -WorkingDirectory $Root `
-        -ArgumentList $gameArgs `
-        -RedirectStandardOutput (Join-Path $LogDir 'gameserver.out') `
-        -RedirectStandardError  (Join-Path $LogDir 'gameserver.err') `
+        -ArgumentList $appArgs `
+        -RedirectStandardOutput (Join-Path $LogDir 'server.out') `
+        -RedirectStandardError  (Join-Path $LogDir 'server.err') `
         -WindowStyle Hidden | Out-Null
 
     # 等端口真的起来再往下走，别用固定 Sleep 赌。
@@ -146,19 +175,65 @@ if ($running -and $lastMode -eq $Mode) {
         if ((Get-ListenerPid $AuthPort) -and (Get-ListenerPid $GamePort)) { $ok = $true; break }
     }
     if (-not $ok) {
-        Say '!! 服务端端口没起来，看 logs\gameserver.err / authserver.err' 'Red'
-        Get-Content (Join-Path $LogDir 'gameserver.err') -Tail 20 -ErrorAction SilentlyContinue
+        Say '!! 服务端端口没起来，看 logs\server.err' 'Red'
+        Get-Content (Join-Path $LogDir 'server.err') -Tail 20 -ErrorAction SilentlyContinue
         exit 1
     }
     Set-Content -Path $ModeFile -Value $Mode -Encoding utf8
-    Say "[服务端] 已启动（认证 $AuthPort pid=$(Get-ListenerPid $AuthPort) / 游戏 $GamePort pid=$(Get-ListenerPid $GamePort)）" 'Green'
+    Say "[服务端] 已启动（认证 $AuthPort / 游戏 $GamePort，pid=$(Get-ListenerPid $AuthPort)）" 'Green'
+}
+
+# --- 3. 读配置 + 起本机中继 -------------------------------------------------
+# server.config 由服务端在启动时按模板生成，所以到这里一定已经存在。
+$cfg      = Read-ServerConfig $ConfigPath
+$remote   = $cfg['server_address']
+$remoteReg = $cfg['server_register_port']
+$localReg  = $cfg['local_register_port']
+$remoteUrlHost = if ($remote -like '*:*') { "[$remote]" } else { $remote }
+
+# 中继的目标地址变了就要重起（否则还连着上一个服务器）。
+$relayStamp = Join-Path $LogDir '.relay_target'
+$lastTarget = ''
+if (Test-Path $relayStamp) { $lastTarget = (Get-Content $relayStamp -Raw).Trim() }
+$relayPid = Get-ListenerPid $RelayAuth
+if ($relayPid -and $lastTarget -eq $remote) {
+    Say "[中继]   已在运行（pid=$relayPid，目标 $remoteUrlHost）" 'Green'
+} else {
+    if ($relayPid) { Say "[中继]   目标从 '$lastTarget' 改成 '$remote' —— 重启它" 'Yellow' }
+    Stop-ListenerOn @($RelayAuth, $RelayGame)
+    Start-Process -FilePath $Python -WorkingDirectory $Root `
+        -ArgumentList @((Join-Path $Root 'server\relay.py')) `
+        -RedirectStandardOutput (Join-Path $LogDir 'relay.out') `
+        -RedirectStandardError  (Join-Path $LogDir 'relay.err') `
+        -WindowStyle Hidden | Out-Null
+    $ok = $false
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 250
+        if ((Get-ListenerPid $RelayAuth) -and (Get-ListenerPid $RelayGame)) { $ok = $true; break }
+    }
+    if ($ok) {
+        Set-Content -Path $relayStamp -Value $remote -Encoding utf8
+        Say "[中继]   已启动（联机时经 127.0.0.1:$RelayAuth / $RelayGame 转发到 $remoteUrlHost）" 'Green'
+    } else {
+        Say '!! 中继没起来，联机模式会连不上；单机游玩不受影响。看 logs\relay.err' 'Red'
+        Get-Content (Join-Path $LogDir 'relay.err') -Tail 20 -ErrorAction SilentlyContinue
+    }
 }
 
 if ($NoGame) { Say ''; Say '（-NoGame：不启动客户端）' 'Gray'; exit 0 }
 
-# --- 3. 残留客户端 ----------------------------------------------------------
+# --- 4. 把配置交给 bshook ---------------------------------------------------
+# ★ 走环境变量而不是让 C 去解析 UTF-8 配置文件：bsloader.exe 本来就把环境
+#   继承给客户端进程，省掉一整套解析和编码处理（决策 D065）。
+$env:POPSHOT_SERVER_ADDRESS    = $remote
+$env:POPSHOT_SERVER_REG_PORT   = $remoteReg
+$env:POPSHOT_LOCAL_REG_PORT    = $localReg
+$env:POPSHOT_RELAY_AUTH_PORT   = "$RelayAuth"
+$env:POPSHOT_RELAY_GAME_PORT   = "$RelayGame"
+
+# --- 5. 残留客户端 ----------------------------------------------------------
 # 互斥体 BigShot_Assa 决定了同时只能有一个实例，残留的会让新实例秒退，
-# 而那个现象非常像「注入被检测」—— 骗过我们一次了（FINDINGS §9）。
+# 而那个现象非常像「注入被检测」—— 骗过我们一次了（V0.1 §9）。
 $old = Get-Process BigShot -ErrorAction SilentlyContinue
 if ($old) {
     Say "[客户端] 先清掉残留实例 pid=$($old.Id -join ',')" 'Yellow'
@@ -166,7 +241,7 @@ if ($old) {
     Start-Sleep -Milliseconds 500
 }
 
-# --- 4. 拉起客户端 ----------------------------------------------------------
+# --- 6. 拉起客户端 ----------------------------------------------------------
 if ($DebugLog) { $env:BSHOOK_VERBOSE_LOG = '1' } else { $env:BSHOOK_VERBOSE_LOG = '0' }
 
 Start-Process -FilePath $loader -WorkingDirectory $Root `
@@ -176,8 +251,16 @@ Start-Process -FilePath $loader -WorkingDirectory $Root `
 
 Say '[客户端] bsloader 已启动，游戏窗口马上出来' 'Green'
 Say ''
-Say '登录任意账号密码即可（假服务端不校验）。关闭请跑 stop.bat。' 'Cyan'
+Say '--- 登录界面上可以自己选服务器 ---' 'Cyan'
+Say '  「单机游玩」            连本机，一个人玩，存档在本机' 'Cyan'
+Say "  「联机」                连 $remoteUrlHost（改 server.config 换服务器）" 'Cyan'
+Say ''
+Say "  联机服务器地址配置在：  $ConfigPath" 'Cyan'
+Say '  首次使用请先注册账号：  点登录框下方的「在服务器…上注册用户」链接' 'Cyan'
+Say "                          单机注册页 http://127.0.0.1:$localReg/" 'Cyan'
+Say ''
+Say '关闭游戏和服务端请运行 stop.bat。' 'Cyan'
 if ($DebugLog) {
-    Say "调试日志：logs\bshook_*.log（客户端）、logs\gameserver.out（服务端）" 'Cyan'
+    Say "调试日志：logs\bshook_*.log（客户端）、logs\server.out（服务端）" 'Cyan'
 }
 exit 0

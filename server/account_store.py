@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""本地假后台的 JSON 账号存档。
+"""JSON 账号存档（单机假服务器和云端服务端共用）。
 
-认证服和游戏服是两个独立进程。认证服收到账号密码后把 ``active_account``
-写进同一份 JSON；游戏服处理 gcpReqLogin 时重新读取它。当前项目只支持一个
-localhost 客户端，因此单一活动账号足够；将来若支持并发客户端，应改成票据映射。
+**V0.2 的改动**：V0.1 里认证服和游戏服是两个进程，靠往 JSON 里写 ``active_account``
+传递「当前是谁在玩」，密码根本不校验 —— 那只在「全世界只有一个玩家」时成立。
+现在两个服务合并进 ``server/app.py`` 一个进程（D064），账号身份靠**票据**传递
+（认证服签发 -> `CULoginReplyPacket` -> 客户端 `gcpReqLogin`），
+``active_account`` 已废弃，本模块只负责**存**和**校验**。
+
+几十人规模、按需求用 JSON 不用 DB；密码按需求**明文保存**（D067）——
+但日志里只打用户名和票据，不打密码。
 """
 from __future__ import annotations
 
 import copy
 import json
 import os
+import re
 import threading
 
 
@@ -47,6 +53,75 @@ NEW_ACCOUNT_DEFAULTS = {
 
 #: 客户端认为「教程已完成」的最小值。大厅 `0x43b357` 是 `cmp eax,3 / jge`（§54）。
 TUTORIAL_DONE_STATE = 3
+
+#: ★ 账号等级的下限 = **2**，这就是「解除对战等级限制」的实现。
+#:
+#: 客户端大厅点「对战」标签时判的是全局 `[0x72e338] == 1`（**恰好等于 1**，不是 `< 2`），
+#: 命中就弹「不符合等级要求，无法连接」（V0.1 §83）。房间里点开始时的
+#: 「等级太低，无法选择任务」读的是房主座位里的 u16 等级（V0.1 §77），同一个数。
+#: 所以只要让服务端认定的等级永远 >= 2，两道门就都开了。
+#:
+#: 用户已授权这个方案（「可以采用在用户注册时服务端自动将用户等级提升至满足要求的等级」）。
+#: 经验值仍然如实累计，只是换算成等级时不许低于这个数。
+MINIMUM_PLAYER_LEVEL = 2
+
+#: 用户名规则：2~16 个 ASCII 字母 / 数字 / 下划线 / 连字符。
+#:
+#: 为什么不放开中文：用户名同时是 **JSON 的对象键**、注册页 URL 的参数、
+#: 房间座位里的显示名，还要经客户端的 UTF-16 登录包往返。2007 年的客户端
+#: 在这条链上从没被非 ASCII 名字验证过，先收紧，将来要放开只改这一个正则。
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{2,16}$")
+USERNAME_RULE_TEXT = "用户名只能用 2~16 个英文字母、数字、下划线或连字符"
+
+#: 密码规则：1~32 个可打印字符，不许有控制字符（会把登录包和 JSON 弄坏）。
+PASSWORD_MAX_LENGTH = 32
+PASSWORD_RULE_TEXT = "密码长度需为 1~32 个字符，且不能包含控制字符"
+
+#: `verify()` 的三态。
+AUTH_OK = "ok"
+AUTH_NO_SUCH_USER = "no_such_user"
+AUTH_BAD_PASSWORD = "bad_password"
+
+#: 给玩家看的中文说明。认证服和注册页都用这一份，两处文案不会走样。
+AUTH_MESSAGES = {
+    AUTH_OK: "登录成功",
+    AUTH_NO_SUCH_USER: "该用户尚未注册，请先在注册页面注册",
+    AUTH_BAD_PASSWORD: "密码错误，请重新输入",
+}
+
+#: 导出的存档文件里的格式标记。导入时用它认一眼，避免用户传错文件。
+SAVE_FORMAT_KEY = "popshot_save"
+SAVE_FORMAT_VERSION = 1
+
+#: 存档文件的 schema 版本。1 = V0.1（带 `active_account`）；2 = V0.2（票据制）。
+SCHEMA_VERSION = 2
+
+
+class AccountError(Exception):
+    """账号操作失败。``code`` 供调用方分支，``args[0]`` 是给玩家看的中文。"""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def check_username(username):
+    """校验并规范化用户名。不合规就抛 `AccountError`。"""
+    username = str(username or "").strip()
+    if not USERNAME_PATTERN.match(username):
+        raise AccountError("invalid_username", USERNAME_RULE_TEXT)
+    return username
+
+
+def check_password(password):
+    """校验密码。不合规就抛 `AccountError`。**不做任何变换**（首尾空格也是密码）。"""
+    password = str(password if password is not None else "")
+    if not 1 <= len(password) <= PASSWORD_MAX_LENGTH:
+        raise AccountError("invalid_password", PASSWORD_RULE_TEXT)
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in password):
+        raise AccountError("invalid_password", PASSWORD_RULE_TEXT)
+    return password
 
 #: 客户端 `0x6dc52c` 的关卡 id 表（建房对话框的「任务」下拉框按这个顺序填）。
 #: 「全开」时给这几个 id 都发满难度；目录里没有记录的 id 发了也无害，
@@ -137,7 +212,7 @@ class AccountStore:
 
     @staticmethod
     def _empty():
-        return {"schema_version": 1, "active_account": None, "accounts": {}}
+        return {"schema_version": SCHEMA_VERSION, "accounts": {}}
 
     def _read_unlocked(self):
         try:
@@ -147,8 +222,10 @@ class AccountStore:
             return self._empty()
         if not isinstance(data, dict):
             raise ValueError(f"账号文件根节点必须是对象: {self.path}")
-        data.setdefault("schema_version", 1)
-        data.setdefault("active_account", None)
+        # V0.1 的存档带 `active_account`（单活动账号的遗物）。读得进来，
+        # 但下次写盘就把它丢掉 —— 身份现在由票据传递（D064）。
+        data.pop("active_account", None)
+        data["schema_version"] = SCHEMA_VERSION
         accounts = data.setdefault("accounts", {})
         if not isinstance(accounts, dict):
             raise ValueError(f"accounts 必须是对象: {self.path}")
@@ -185,42 +262,173 @@ class AccountStore:
         if isinstance(raw, dict):
             account.update(raw)
         account["display_name"] = account.get("display_name") or username
+        # 等级由经验推出（D024）。每次读都校一次，手工编辑过存档也不会让
+        # JSON 里的等级和经验各说各话；`MINIMUM_PLAYER_LEVEL` 的下限也在这里生效。
+        account["level"] = level_for_experience(player_experience(account))
         return account
 
-    def login(self, username, password):
-        """记录本地登录并自动创建未知账号；当前假后台不校验密码。"""
-        username = str(username or "local").strip() or "local"
-        password = str(password or "")
+    # ------------------------------------------------------------------ 注册
+    def register(self, username, password, display_name=""):
+        """注册新账号。重名或格式不合规抛 `AccountError`，成功返回账号字典。
+
+        查重和写入在**同一把锁**里完成 —— 注册页可能被两个人同时提交，
+        「先查再写」如果拆成两步就会让后一个人静默覆盖前一个人。
+        """
+        username = check_username(username)
+        password = check_password(password)
         with self._lock:
             data = self._read_unlocked()
-            raw = data["accounts"].get(username)
-            account = self._merged_account(username, raw)
-            if raw is None:
-                account["password"] = password
-            # 等级由经验推出（D024）。手工编辑过存档的话，这里把它校回自洽，
-            # 免得 JSON 里的等级和经验各说各话。
-            account["level"] = level_for_experience(player_experience(account))
+            if username in data["accounts"]:
+                raise AccountError(
+                    "duplicate", "该用户名已存在，请在登录界面直接登录")
+            account = self._merged_account(username, None)
+            account["password"] = password
+            account["display_name"] = str(display_name or "").strip() or username
             data["accounts"][username] = account
-            data["active_account"] = username
             self._write_unlocked(data)
             return copy.deepcopy(account)
 
-    def get_account(self, username=None):
+    # ------------------------------------------------------------------ 校验
+    def verify(self, username, password):
+        """校验用户名密码，返回 ``(状态, 账号或 None)``。
+
+        状态是 `AUTH_OK` / `AUTH_NO_SUCH_USER` / `AUTH_BAD_PASSWORD` 三态之一 ——
+        需求要求「不存在」和「密码错」在画面上分开提示，所以这里不能合并成布尔。
+
+        ★ 这里**不做**「未知账号自动建号」。V0.1 的假后台那么干是因为只有一个玩家；
+        联机之后自动建号等于谁都能顶别人的名字进来。
+        """
+        username = str(username or "").strip()
+        password = str(password if password is not None else "")
         with self._lock:
             data = self._read_unlocked()
-            username = username or data.get("active_account")
+            raw = data["accounts"].get(username)
+            if raw is None:
+                return AUTH_NO_SUCH_USER, None
+            account = self._merged_account(username, raw)
+            if str(account.get("password", "")) != password:
+                return AUTH_BAD_PASSWORD, None
+            return AUTH_OK, account
+
+    def get_account(self, username):
+        """按名字取账号，返回 ``(名字, 账号)``；不存在时返回 ``(None, None)``。"""
+        username = str(username or "").strip()
+        with self._lock:
+            data = self._read_unlocked()
             if not username or username not in data["accounts"]:
                 return None, None
             return username, self._merged_account(username, data["accounts"][username])
 
-    def resolve_game_login(self, ticket=""):
-        """优先把非空游戏票据当账号名；现阶段通常回退到活动账号。"""
-        ticket = str(ticket or "").strip()
-        if ticket:
-            name, account = self.get_account(ticket)
-            if account is not None:
-                return name, account
-        return self.get_account()
+    def has_account(self, username):
+        name, _ = self.get_account(username)
+        return name is not None
+
+    def usernames(self):
+        with self._lock:
+            return sorted(self._read_unlocked()["accounts"])
+
+    # -------------------------------------------------------------- 存档转移
+    def export_account(self, username):
+        """导出一个账号，返回可直接下载的 JSON 字典。
+
+        **包含明文密码** —— 导入到另一台服务器时那边可能还没有这个账号，
+        没有密码就没法建。注册页上已经写明这一点。
+        """
+        name, account = self.get_account(username)
+        if name is None:
+            raise AccountError("no_such_user", AUTH_MESSAGES[AUTH_NO_SUCH_USER])
+        return {
+            SAVE_FORMAT_KEY: SAVE_FORMAT_VERSION,
+            "username": name,
+            "account": account,
+        }
+
+    @staticmethod
+    def parse_save(payload):
+        """把上传的 JSON 拆成 ``(用户名, 账号字段字典)``。格式不对抛 `AccountError`。
+
+        既吃 `export_account` 的完整形状，也吃「直接一个账号对象 + 里面带 username」
+        这种被人手改过的形状 —— 玩家会用记事本改存档，别为了格式洁癖把人挡在外面。
+        """
+        if not isinstance(payload, dict):
+            raise AccountError("bad_save", "存档文件的内容必须是一个 JSON 对象")
+        raw = payload.get("account")
+        username = payload.get("username")
+        if not isinstance(raw, dict):
+            # 退化形状：整个文件就是账号本身。
+            raw = payload
+            username = username or payload.get("display_name")
+        if not isinstance(raw, dict):
+            raise AccountError("bad_save", "存档文件里找不到账号数据")
+        try:
+            username = check_username(username)
+        except AccountError:
+            raise AccountError(
+                "bad_save",
+                f"存档文件里没有可用的用户名（{USERNAME_RULE_TEXT}）") from None
+        fields = {key: value for key, value in raw.items()
+                  if key in NEW_ACCOUNT_DEFAULTS}
+        return username, fields
+
+    def import_account(self, payload, auth_username="", auth_password=""):
+        """导入存档。返回 ``(用户名, 是新建还是覆盖)``。
+
+        判定顺序（需求原文）：
+
+        1. 服务器上**没有**这个用户 -> 直接新增，不要求填用户名密码；
+           密码取存档里的，存档没带就要求表单里填。
+        2. 服务器上**有** -> 必须用表单里的用户名密码校验通过才覆盖。
+        3. **覆盖时，存档里没有的字段一律重置为默认值** —— 这是「导入」不是「合并」，
+           留着旧值会让两台服务器的存档永远对不齐。
+        4. 密码不对 -> 拒绝并提示。
+
+        整个判定和写入在同一把锁里，避免「查的时候没有、写的时候有了」。
+        """
+        username, fields = self.parse_save(payload)
+        auth_username = str(auth_username or "").strip()
+        auth_password = str(auth_password if auth_password is not None else "")
+        with self._lock:
+            data = self._read_unlocked()
+            existing = data["accounts"].get(username)
+            if existing is not None:
+                # ★ 「一个字都没填」和「填了但不对」要分开说：前者是提示他去填，
+                #   后者是明确告诉他填错了。合成一句「请填入用户名和密码」的话，
+                #   打错密码的人会以为自己没填，对着已经填好的框发呆。
+                if not auth_username and not auth_password:
+                    raise AccountError(
+                        "auth_required",
+                        f"服务器上已经有账号「{username}」了，"
+                        "请在上面填入该账号的用户名和密码后再上传")
+                current = self._merged_account(username, existing)
+                if (auth_username != username
+                        or str(current.get("password", "")) != auth_password):
+                    raise AccountError(
+                        "bad_password",
+                        f"用户名或密码错误：这份存档属于账号「{username}」，"
+                        "请填入该账号的用户名和密码")
+            # ★ 从默认值起手，只把存档里有的字段盖上去 = 缺的字段自动回默认值。
+            account = self._merged_account(username, None)
+            account.update(fields)
+            account["display_name"] = (str(account.get("display_name") or "").strip()
+                                       or username)
+            password = str(account.get("password", ""))
+            if not password:
+                # 存档里没带密码：新建时用表单里填的；覆盖时沿用服务器上的旧密码。
+                password = auth_password if existing is None else str(
+                    self._merged_account(username, existing).get("password", ""))
+            try:
+                account["password"] = check_password(password)
+            except AccountError:
+                raise AccountError(
+                    "password_required",
+                    "存档文件里没有密码，请在上面的密码框里填一个（"
+                    + PASSWORD_RULE_TEXT + "）") from None
+            # ★ 手改的等级要真的生效，见 `experience_for_import` 的说明。
+            account["experience"] = experience_for_import(account)
+            account["level"] = level_for_experience(account["experience"])
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return username, ("created" if existing is None else "replaced")
 
     def set_tutorial_completed(self, username, completed=True):
         with self._lock:
@@ -329,8 +537,44 @@ EXPERIENCE_PER_LEVEL = 100
 
 
 def level_for_experience(experience):
-    """总经验 -> 等级（1 起步）。"""
-    return max(1, int(experience) // EXPERIENCE_PER_LEVEL + 1)
+    """总经验 -> 等级（1 起步）。
+
+    ★ 这里**不加** `MINIMUM_PLAYER_LEVEL` 的下限：存档里记的是真实等级，
+    `experience_bounds()` 还要拿它算经验条的两端。抬等级只发生在
+    「往客户端发」的那一刻，见 `player_level()`。
+    """
+    try:
+        experience = max(0, int(experience))
+    except (TypeError, ValueError):
+        experience = 0
+    return max(1, experience // EXPERIENCE_PER_LEVEL + 1)
+
+
+def experience_for_import(account):
+    """导入存档时该存多少总经验 —— 让**手改的 `level` 真的生效**。
+
+    背景：等级在服务端是由经验推出来的（D024，`_merged_account` 每次读都重算一遍），
+    存档里的 `level` 只是个派生字段。所以玩家把导出的 JSON 里的 `level` 从 1 改成 5
+    再传上来，什么都不会发生 —— 经验还是 0，一读回来等级又变回 1。
+
+    规则（只在导入这一刻生效）：
+
+    * 存档里的等级**高于**经验推出来的等级 -> 认为玩家是在手改等级，
+      把经验补到那一级的起点，等级就真的变成他写的那个数；
+    * 否则以**经验**为准（改经验不改等级是另一种常见改法，
+      这时候拿旧的 `level` 去覆盖经验反而会把他的改动抹掉）。
+
+    也就是说：**想降级得连经验一起改小**。这是刻意的取舍 ——
+    两个字段互相矛盾时没法猜出玩家改的是哪一个，只能挑一个方向认。
+    """
+    experience = player_experience(account)
+    try:
+        wanted = int(account.get("level", 0))
+    except (TypeError, ValueError):
+        return experience
+    if wanted <= level_for_experience(experience):
+        return experience
+    return (wanted - 1) * EXPERIENCE_PER_LEVEL
 
 
 def experience_bounds(experience):
@@ -371,18 +615,29 @@ def display_name(account):
 
 
 def player_level(account):
-    """账号等级，供 gspRepLogin 的第 1 个业务 int32 使用（FINDINGS §63）。
+    """**下发给客户端**的账号等级，供 gspRepLogin 的第 1 个业务 int32 使用（§63）。
 
     客户端把它存进全局 `0x72e338`，用来过滤「建立房间」里四个下拉框的条目
     （`0x436833` 起）以及天梯标签页的等级门槛（`0x43b676` 要求 >=6）。
     闯关关卡记录的要求等级是 1，所以等级 0 会让任务下拉框整个空掉。
+
+    ★ **这里把等级抬到 `MINIMUM_PLAYER_LEVEL`（=2）以上 = 解除对战等级限制。**
+    大厅点「对战」判的是 `[0x72e338] == 1`（恰好等于 1，V0.1 §83），
+    房间里点开始判的是房主座位里的同一个数（V0.1 §77）。存档里仍是真实等级，
+    只有下发这一刻抬高 —— 这样经验曲线和经验条两端（`experience_bounds`）都不受影响。
+
+    等级 0（没有账号 / 存档字段坏了）仍然照实返回 0：那是「取不到账号」的信号，
+    不该被下限悄悄改成 2。
     """
     if not account:
         return 0
     try:
-        return max(0, int(account.get("level", 0)))
+        level = int(account.get("level", 0))
     except (TypeError, ValueError):
         return 0
+    if level <= 0:
+        return 0
+    return max(MINIMUM_PLAYER_LEVEL, level)
 
 
 def _non_negative(account, field):

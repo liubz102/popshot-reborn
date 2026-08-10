@@ -30,6 +30,13 @@ u32.SendMessageW.argtypes = [W.HWND, C.c_uint, W.WPARAM, W.LPARAM]
 u32.SendMessageW.restype = C.c_long
 u32.GetWindowThreadProcessId.argtypes = [W.HWND, C.POINTER(W.DWORD)]
 
+class POINT(C.Structure):
+    _fields_ = [("x", C.c_long), ("y", C.c_long)]
+
+u32.GetWindowRect.argtypes = [W.HWND, C.POINTER(W.RECT)]
+u32.GetClientRect.argtypes = [W.HWND, C.POINTER(W.RECT)]
+u32.ScreenToClient.argtypes = [W.HWND, C.POINTER(POINT)]
+
 WM_SETTEXT = 0x000C
 BM_CLICK   = 0x00F5
 
@@ -59,15 +66,33 @@ def children(h):
     u32.EnumChildWindows(h, EnumWindowsProc(cb), 0)
     return out
 
+def rect_in_parent(child, parent):
+    """子控件相对父窗口客户区的 (左, 上, 宽, 高)。
+
+    改登录框文案时要知道每个控件占多宽：换成更长的中文会被裁掉，
+    到底要不要连带把控件加宽，得看它右边还有没有空地（V0.2 里程碑 H）。
+    """
+    r = W.RECT()
+    if not u32.GetWindowRect(child, C.byref(r)):
+        return None
+    pt = POINT(r.left, r.top)
+    u32.ScreenToClient(parent, C.byref(pt))
+    return (pt.x, pt.y, r.right - r.left, r.bottom - r.top)
+
 def cmd_enum(pid):
     dlgs = find_dialogs(pid)
     if not dlgs:
         print("没找到 #32770 对话框（pid=%d）" % pid); return
     for d in dlgs:
-        print("== 对话框 hwnd=0x%X visible=%d title=%r ==" %
-              (d, bool(u32.IsWindowVisible(d)), txt(d)))
+        r = W.RECT()
+        u32.GetClientRect(d, C.byref(r))
+        print("== 对话框 hwnd=0x%X visible=%d 客户区=%dx%d title=%r ==" %
+              (d, bool(u32.IsWindowVisible(d)), r.right, r.bottom, txt(d)))
         for hh, c, i, t in children(d):
-            print("   hwnd=0x%08X id=%-6d class=%-16s text=%r" % (hh, i, c, t))
+            box = rect_in_parent(hh, d)
+            where = ("x=%-4d y=%-4d w=%-4d h=%-3d" % box) if box else "(取不到位置)"
+            print("   hwnd=0x%08X id=%-6d class=%-16s %s text=%r"
+                  % (hh, i, c, where, t))
 
 def cmd_login(pid, user, pw):
     dlgs = find_dialogs(pid)
