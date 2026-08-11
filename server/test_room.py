@@ -110,11 +110,9 @@ def make_conn(username):
     conn.settled = False
     conn.quest_score = 0
     conn.quest_success = False
-    conn.maps_entered = []
-    conn.map_change_pending = False
     conn.items_created = 0
     conn.items_picked = 0
-    conn.next_item_handle = gameserver.ITEM_HANDLE_BASE
+    conn.solo_quest = gameserver.RoomQuest()
     conn.start_game = StartGameHandshake()
     conn.peer_relay_on = False
     conn.peer_data_dumped = False

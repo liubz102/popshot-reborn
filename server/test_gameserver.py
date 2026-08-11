@@ -767,7 +767,7 @@ class LeaveSessionTests(unittest.TestCase):
         conn.settled = True
         conn.quest_score = 64
         conn.quest_success = True
-        conn.next_item_handle = gameserver.ITEM_HANDLE_BASE
+        conn.solo_quest = gameserver.RoomQuest()
         conn.items_created = 0
         conn.items_picked = 0
         conn.my_seat = 0
@@ -821,6 +821,16 @@ class ControlChannelTests(unittest.TestCase):
             self.last_position = (3225.0, 635.0)
             self.room = {"session_type": 2, "arguments": (3, 1)}
             self.start_game = StartGameHandshake()
+            # 控制通道的几条命令会走到 `Conn.quest_state()` / `current_quest()`，
+            # 两者第一件事都是问「我在哪个大厅房间里」。控制通道推的是单人
+            # 协议试探，答案固定是「不在任何房间」。
+            self.solo_quest = gameserver.RoomQuest()
+
+        def lobby_room(self):
+            return None
+
+        def quest_state(self):
+            return self.solo_quest
 
         def log(self, message):
             self.logged.append(message)
@@ -1013,7 +1023,7 @@ class NoisyPacketLoggingTests(unittest.TestCase):
         conn.settled = False
         conn.quest_score = 0
         conn.quest_success = False
-        conn.next_item_handle = gameserver.ITEM_HANDLE_BASE
+        conn.solo_quest = gameserver.RoomQuest()
         conn.items_created = 0
         conn.items_picked = 0
         conn.my_seat = 0
@@ -1108,7 +1118,7 @@ class DeathAndRespawnTests(unittest.TestCase):
         conn.settled = False
         conn.quest_score = 0
         conn.quest_success = False
-        conn.next_item_handle = gameserver.ITEM_HANDLE_BASE
+        conn.solo_quest = gameserver.RoomQuest()
         conn.items_created = 0
         conn.items_picked = 0
         conn.my_seat = 0
@@ -1305,7 +1315,7 @@ class QuestScoreTests(unittest.TestCase):
         conn.settled = False
         conn.quest_score = 0
         conn.quest_success = False
-        conn.next_item_handle = gameserver.ITEM_HANDLE_BASE
+        conn.solo_quest = gameserver.RoomQuest()
         conn.items_created = 0
         conn.items_picked = 0
         conn.my_seat = 0
@@ -1376,12 +1386,10 @@ class MapTransitionTests(unittest.TestCase):
         conn.settled = False
         conn.quest_score = 0
         conn.quest_success = False
-        conn.next_item_handle = gameserver.ITEM_HANDLE_BASE
+        conn.solo_quest = gameserver.RoomQuest()
         conn.items_created = 0
         conn.items_picked = 0
         conn.my_seat = 0
-        conn.maps_entered = []
-        conn.map_change_pending = False
         conn.start_game = StartGameHandshake()
         return conn
 
@@ -1535,12 +1543,10 @@ class ItemDropTests(unittest.TestCase):
         conn.settled = False
         conn.quest_score = 0
         conn.quest_success = False
-        conn.next_item_handle = ITEM_HANDLE_BASE
+        conn.solo_quest = gameserver.RoomQuest()
         conn.items_created = 0
         conn.items_picked = 0
         conn.my_seat = 0
-        conn.maps_entered = []
-        conn.map_change_pending = False
         conn.start_game = StartGameHandshake()
         return conn
 
@@ -1649,12 +1655,10 @@ class QuestClearFlagTests(unittest.TestCase):
         conn.settled = False
         conn.quest_score = 100
         conn.quest_success = False
-        conn.next_item_handle = ITEM_HANDLE_BASE
+        conn.solo_quest = gameserver.RoomQuest()
         conn.items_created = 0
         conn.items_picked = 0
         conn.my_seat = 0
-        conn.maps_entered = []
-        conn.map_change_pending = False
         conn.account_name = None
         conn.account = {"experience": 0, "money": 0, "level": 1}
         conn.start_game = StartGameHandshake()
@@ -1779,12 +1783,10 @@ class ItemPickupTests(unittest.TestCase):
         conn.settled = False
         conn.quest_score = 0
         conn.quest_success = False
-        conn.next_item_handle = ITEM_HANDLE_BASE
+        conn.solo_quest = gameserver.RoomQuest()
         conn.items_created = 0
         conn.items_picked = 0
         conn.my_seat = 0
-        conn.maps_entered = []
-        conn.map_change_pending = False
         conn.start_game = StartGameHandshake()
         return conn
 
@@ -1912,12 +1914,10 @@ class ResultScreenNumbersTests(unittest.TestCase):
         conn.settled = False
         conn.quest_score = score
         conn.quest_success = False
-        conn.next_item_handle = ITEM_HANDLE_BASE
+        conn.solo_quest = gameserver.RoomQuest()
         conn.items_created = 0
         conn.items_picked = 0
         conn.my_seat = 0
-        conn.maps_entered = []
-        conn.map_change_pending = False
         conn.account_name = None
         conn.account = {"experience": 0, "money": 0, "level": 1}
         conn.start_game = StartGameHandshake()
@@ -2079,12 +2079,10 @@ class QuestDifficultyTests(unittest.TestCase):
         conn.settled = False
         conn.quest_score = 10
         conn.quest_success = False
-        conn.next_item_handle = ITEM_HANDLE_BASE
+        conn.solo_quest = gameserver.RoomQuest()
         conn.items_created = 0
         conn.items_picked = 0
         conn.my_seat = 0
-        conn.maps_entered = []
-        conn.map_change_pending = False
         conn.account_name = "tester"
         conn.account = account if account is not None else {
             "experience": 0, "money": 0, "level": 1,
@@ -2433,9 +2431,7 @@ class CharacterUnlockTests(unittest.TestCase):
         conn.settled = False
         conn.items_created = 0
         conn.items_picked = 0
-        conn.next_item_handle = ITEM_HANDLE_BASE
-        conn.maps_entered = []
-        conn.map_change_pending = False
+        conn.solo_quest = gameserver.RoomQuest()
         conn.room = None
         conn.start_game = StartGameHandshake()
         conn.accounts = None
@@ -2615,9 +2611,7 @@ class SendBatchTests(unittest.TestCase):
         conn.settled = False
         conn.items_created = 0
         conn.items_picked = 0
-        conn.next_item_handle = ITEM_HANDLE_BASE
-        conn.maps_entered = []
-        conn.map_change_pending = False
+        conn.solo_quest = gameserver.RoomQuest()
         gameserver.Conn.leave_game_result(conn)
         self.assertEqual(1, len(conn.sock.writes))
         opcodes = self.frames_of(self.decrypted(conn))

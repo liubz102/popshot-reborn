@@ -11,7 +11,10 @@ fakeclient.py —— 用 Python 冒充第二个游戏客户端（大厅部分）
     真客户端能看到它进房 / 说话 / 离开 / 被踢（用 tools/screenshot.py 看）
     它也能把服务端广播给它的包逐字节打出来（真客户端那边看不见字节）
 
-它**不渲染任何东西**，只管收发包，所以战斗类的包一概不接（收到就打一行日志）。
+它**不渲染任何东西**，只管收发包。战斗类的包也能发（`ready` / `loaded` /
+`die` / `respawn` / `drop` / `pickup` / `score` / `endquest`），但它没有关卡、
+没有角色，只是把字节发出去 —— 用来验**服务端的广播和仲裁**对不对
+（J.3：一件东西只能被一个人捡到、死亡广播给全房间、结算每座位一份）。
 
 用法（命令是一串 token，从左往右顺序执行）：
 
@@ -30,6 +33,21 @@ fakeclient.py —— 用 Python 冒充第二个游戏客户端（大厅部分）
                       3 字节 body，§149~§151）。用来验服务端有没有原样转成 0x040f
     rpeer [序列号]    同上，但走**原版 TCP 中继**（rcp opcode 3）。要先连上中继
     waitrelay [秒]    等中继连上（服务端回 0x0210 之后才会有），超时就报错退出
+
+  ── 战斗（J.3）。全部按「真客户端会发的线格式」组包 ──
+    ready             发 0x0402（房主按 F5 开局；连发两次走完握手）
+    loaded            发 0x0403「关卡加载完了」（所有人都报了才一起进 stage 7）
+    die [次数]        发 0x0408「我 HP 归零了」，句柄按 座位*100000+100001 算
+    respawn           发 0x0413「我要重生」
+    drop [物件id]     发 0x0406 gcpCreateItem，等服务端回 0x0404 派句柄
+    pickup <句柄>     发 0x0407 gcpGetItem「我踩到这件了」（十六进制也行）
+    score <分数>      发 0x0410 gcpUpdateQuestScore（**累计**分数）
+    cleared           发 0x0417 gcpMarkQuestSuccess(1)「这一关打通了」
+    nextmap <名字>    发 0x0411 gcpReqChangeToNextMap
+    maploaded         发 0x0412「新图加载完了」
+    endquest          发 0x040f gcpEndQuest（触发结算）
+    resultdone        发 0x0405「结算看完了」（回房间）
+
     sleep <秒>        原地等（收包线程照常在跑）
     hold <秒>         同 sleep，语义上表示「挂在这儿让人看」
     shot <pid> <png>  调 tools/screenshot.py 抓一张**真客户端**的截图
@@ -58,14 +76,29 @@ import protocol as P                                     # noqa: E402
 import relayserver as R                                  # noqa: E402
 from simple import SimpleCipher                          # noqa: E402
 from gameserver import (                                 # noqa: E402
-    CLIENT_VERSION, DESCRIPTOR_SENT_ARGUMENT_COUNTS,
-    GCP_NAMES, MAGIC_CTRL, MAGIC_GAME, OP_CHAT,
-    OP_JOIN_RELAY, OP_LEAVE_RELAY, OP_START_TCP_RELAY,
+    CLIENT_VERSION, CREATE_ITEM_FORMAT, DEATH_REPORT_FORMAT,
+    DESCRIPTOR_SENT_ARGUMENT_COUNTS,
+    GCP_NAMES, MAGIC_CTRL, MAGIC_GAME, OP_CHAT, OP_COUNT_GAME_READY,
+    OP_CREATED_ITEM, OP_CREATE_ITEM, OP_END_QUEST, OP_GET_ITEM,
+    OP_JOIN_RELAY, OP_LEAVE_RELAY, OP_LEAVE_RESULT, OP_LOADING_DONE,
+    OP_MAP_LOADING_DONE, OP_MARK_QUEST_SUCCESS, OP_PICKED_ITEM,
+    OP_REP_GAME_RESULT, OP_REP_QUEST_SCORE, OP_REPORT_HP_ZERO,
+    OP_REQ_CHANGE_TO_NEXT_MAP, OP_REQ_RESPAWN, OP_START_TCP_RELAY,
     OP_LEAVE_SESSION, OP_MOVE_INTO_SESSION, OP_PEER_DATA_DOWN,
     OP_PEER_DATA_UP, OP_SESSION_MEMBER_UPDATE, OP_SESSION_MEMBERS,
-    OP_TOGGLE_PEER_RELAY, Reader, build_game, describe_peer_header,
-    take_frame, w_i32, w_wstr,
+    OP_TOGGLE_PEER_RELAY, OP_UPDATE_QUEST_SCORE, Reader, build_game,
+    describe_peer_header, take_frame, w_i32, w_wstr,
 )
+
+#: 玩家角色的对象句柄 = **座位 × 100000 + 100001**（客户端 `0x405f02`
+#: 写死的公式，§161）。`0x0408` 死亡上报里的那个句柄就是它，六台机器上
+#: 算出来的值一模一样 —— 假客户端也照这个公式算，服务端才认得出是谁死了。
+CHARACTER_HANDLE_STEP = 100000
+CHARACTER_HANDLE_BASE = 100001
+
+
+def character_handle(seat):
+    return seat * CHARACTER_HANDLE_STEP + CHARACTER_HANDLE_BASE
 
 AUTH_PORT = 47611
 GAME_PORT = 27799
@@ -309,6 +342,35 @@ def describe(opcode, payload):
                     f"（{'开，之后要发 0x040e' if on else '关'}）")
         if opcode == OP_PEER_DATA_DOWN:
             return "  ★ 转发来的玩家数据\n" + describe_peer_header(payload)
+        # ---- 战斗（J.3）：广播回来的每一发都解成一行，好逐字节对广播行为 ----
+        if opcode == 0x0406 and len(payload) >= 10:
+            handle, seat, arg, deaths = struct.unpack_from("<IBBi", payload)
+            who = (f"座位 {seat}" if seat < 6 else f"怪物(座位={seat - 256})")
+            return (f"  ★ 死亡广播 {who} 句柄=0x{handle:08x} "
+                    f"凶手={arg} 死亡次数 -> {deaths}")
+        if opcode == 0x0419 and len(payload) >= 16:
+            cid, x, y, spawn = struct.unpack_from("<iiii", payload)
+            return f"  ★ 重生 座位={cid} 坐标=({x}, {y}) 重生点={spawn}"
+        if opcode == OP_CREATED_ITEM and len(payload) >= 36:
+            handle = struct.unpack_from("<I", payload)[0]
+            item_id, x, y = struct.unpack_from("<iff", payload, 4)
+            return (f"  ★ 掉落物落地 句柄=0x{handle:08x} 物件={item_id} "
+                    f"@ ({x:.0f}, {y:.0f})")
+        if opcode == OP_PICKED_ITEM and len(payload) >= 8:
+            seat, handle = struct.unpack_from("<iI", payload)
+            return f"  ★ 拾取放行 座位={seat} 句柄=0x{handle:08x}"
+        if opcode == OP_REP_QUEST_SCORE and len(payload) >= 8:
+            seat, score = struct.unpack_from("<ii", payload)
+            return f"  ★ 分数 座位={seat} -> {score}"
+        if opcode == OP_REP_GAME_RESULT and len(payload) >= 56:
+            seat = struct.unpack_from("<i", payload)[0]
+            count = struct.unpack_from("<i", payload, 52)[0]
+            tail = list(struct.unpack_from(f"<{count}i", payload, 56))
+            return (f"  ★ 结算数据 座位={seat} 名次表={tail}"
+                    f"（1=完成/胜 0=未完成 -1=负）")
+        if opcode == 0x0411 and len(payload) >= 8:
+            seat, ok = struct.unpack_from("<ii", payload)
+            return f"  ★ 关卡结束 座位={seat} success={ok}"
     except Exception:                      # 解不动就算了，别把收包线程搞死
         pass
     return ""
@@ -393,6 +455,45 @@ def run_script(client, tokens):
         elif cmd == "chat":
             text = tokens.pop(0)
             client.send_game(OP_CHAT, bytes([0]) + w_wstr(text))
+        # ---- 战斗（J.3）------------------------------------------------
+        elif cmd == "ready":
+            client.send_game(OP_COUNT_GAME_READY)
+        elif cmd == "loaded":
+            client.send_game(OP_LOADING_DONE)
+        elif cmd == "die":
+            deaths = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 0
+            seat = client.my_seat if client.my_seat is not None else 0
+            # 18 字节，紧凑，死亡次数在**线偏移 6**（客户端结构体里在 +0x08，
+            # 按后者组包会写坏 X 并让客户端越界崩，V0.1 §108）。
+            client.send_game(OP_REPORT_HP_ZERO,
+                             struct.pack(DEATH_REPORT_FORMAT,
+                                         character_handle(seat), seat & 0xFF,
+                                         0xFF, deaths, 100.0, 200.0))
+        elif cmd == "respawn":
+            seat = client.my_seat if client.my_seat is not None else 0
+            client.send_game(OP_REQ_RESPAWN,
+                             w_i32(seat) + w_i32(100) + w_i32(200) + w_i32(1))
+        elif cmd == "drop":
+            item_id = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 10101
+            client.send_game(OP_CREATE_ITEM,
+                             struct.pack(CREATE_ITEM_FORMAT, item_id,
+                                         100.0, 200.0, 0.0, 0.0, 3, -1, -1))
+        elif cmd == "pickup":
+            handle = int(tokens.pop(0), 0)
+            seat = client.my_seat if client.my_seat is not None else 0
+            client.send_game(OP_GET_ITEM, w_i32(seat) + w_i32(handle))
+        elif cmd == "score":
+            client.send_game(OP_UPDATE_QUEST_SCORE, w_i32(int(tokens.pop(0))))
+        elif cmd == "cleared":
+            client.send_game(OP_MARK_QUEST_SUCCESS, w_i32(1))
+        elif cmd == "nextmap":
+            client.send_game(OP_REQ_CHANGE_TO_NEXT_MAP, w_wstr(tokens.pop(0)))
+        elif cmd == "maploaded":
+            client.send_game(OP_MAP_LOADING_DONE)
+        elif cmd == "endquest":
+            client.send_game(OP_END_QUEST)
+        elif cmd == "resultdone":
+            client.send_game(OP_LEAVE_RESULT)
         elif cmd in ("sleep", "hold"):
             seconds = float(tokens.pop(0))
             log(f"等 {seconds} 秒")

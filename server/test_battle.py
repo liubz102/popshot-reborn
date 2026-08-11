@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""里程碑 J.3 的**战斗逻辑**测试 —— 房间广播、服务端仲裁、结算、对战胜负。
+
+分工：
+
+* `test_room.py` 测大厅和**开局链**（怎么把一局开起来）；
+* 这里测「开起来之后」：死亡 / 重生 / 掉落 / 拾取 / 分数 / 换图的广播，
+  一件东西只能被一个人捡到的仲裁，以及每座位一份的结算。
+
+V0.1 的单人行为由 `test_gameserver.py` 钉着（那些用例一条都不许变红）——
+这里只测**多了一个人之后**多出来的事。
+
+依据：`.claude/FINDINGS.md` §161（每个包为什么广播出去是安全的、
+客户端拿什么 id 找目标）、§112 / §116（结算界面那几格的来源）。
+"""
+import os
+import struct
+import sys
+import threading
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import gameserver                                              # noqa: E402
+from gameserver import (                                       # noqa: E402
+    DEATH_REPORT_FORMAT, GAME_RESULT_CLEARED, GAME_RESULT_DEFEATED,
+    GAME_RESULT_TAIL_COUNT, ITEM_HANDLE_BASE,
+    OP_BROADCAST_DEATH, OP_COUNT_GAME_READY, OP_CREATED_ITEM, OP_CREATE_ITEM,
+    OP_END_GAME, OP_END_QUEST, OP_GET_ITEM, OP_LEAVE_SESSION, OP_LOADING_DONE,
+    OP_MAP_CHANGE_READY, OP_MAP_LOADING_DONE, OP_MARK_QUEST_SUCCESS,
+    OP_MOVE_INTO_SESSION, OP_PICKED_ITEM, OP_REP_CHANGE_TO_NEXT_MAP,
+    OP_REP_GAME_RESULT, OP_REP_QUEST_SCORE, OP_REPORT_HP_ZERO,
+    OP_REQ_CHANGE_TO_NEXT_MAP, OP_REQ_RESPAWN, OP_RESPAWN_CHARACTER,
+    OP_UPDATE_QUEST_SCORE, RoomQuest, SESSION_STATUS_PLAYING,
+    SESSION_STATUS_WAITING, StartGameHandshake,
+    build_game, take_frame, w_i32, w_wstr,
+)
+from lobby import Lobby, MOVE_INTO_ALREADY_PLAYING                  # noqa: E402
+import relayserver                                                  # noqa: E402
+
+
+# ----------------------------------------------------------------------------
+# 夹具
+# ----------------------------------------------------------------------------
+def frames(blob):
+    out = []
+    rest = blob
+    while rest:
+        kind, opcode, payload, consumed = take_frame(rest)
+        if kind is None:
+            raise AssertionError(f"拆帧失败，剩余 {len(rest)} 字节: {rest[:32]!r}")
+        out.append((kind, opcode, payload))
+        rest = rest[consumed:]
+    return out
+
+
+def opcodes(conn):
+    """某条连接收到的全部 opcode，按顺序（跨批次拉平）。"""
+    return [op for blob in conn.sent for _, op, _ in frames(blob)]
+
+
+def bodies(conn, opcode):
+    """某条连接收到的某个 opcode 的全部载荷，按顺序。"""
+    return [payload for blob in conn.sent for _, op, payload in frames(blob)
+            if op == opcode]
+
+
+class Args:
+    hold_lobby = False
+    room_burst_delay = 0
+    login_result = 0
+    no_death_reply = False
+
+
+ACCOUNTS = {
+    "alice": {"display_name": "Alice", "level": 3, "experience": 200,
+              "money": 10, "character": 0},
+    "bob": {"display_name": "Bob", "level": 5, "experience": 400,
+            "money": 20, "character": 1},
+    "carol": {"display_name": "Carol", "level": 7, "experience": 600,
+              "money": 30, "character": 2},
+}
+
+
+class FakeAccounts:
+    """只实现结算真正会调的那两个方法。
+
+    奖励要**真的加进去**：结算下发的是「已经入账的总经验」（D024），
+    只有真加了才能测出「每个人各按自己的分数入账、互不串账」。
+    """
+
+    def __init__(self, conns):
+        self.saved = {name: dict(data) for name, data in ACCOUNTS.items()}
+        self.conns = conns
+        self.cleared = []
+
+    def add_quest_reward(self, username, experience=0, money=0):
+        account = self.saved[username]
+        account["experience"] = int(account["experience"]) + int(experience)
+        account["money"] = int(account["money"]) + int(money)
+        return dict(account)
+
+    def set_quest_cleared(self, username, quest_id, difficulty):
+        self.cleared.append((username, quest_id, difficulty))
+        return dict(self.saved[username])
+
+
+def make_conn(username, accounts=None):
+    """一条只把发出去的字节攒进 `sent` 的假连接（同 `test_room.make_conn`）。"""
+    conn = gameserver.Conn.__new__(gameserver.Conn)
+    conn.addr = ("::ffff:127.0.0.1", 40000)
+    conn.args = Args()
+    conn.sent = []
+    conn.logged = []
+    conn.log = conn.logged.append
+    conn.online = lambda _msg: None
+    conn.vlog = lambda _msg: None
+    conn.send = conn.sent.append
+    conn.send_lock = threading.RLock()
+    conn.send_queue = None
+    conn.batch_delay_ms = 0
+    conn.last_packet_at = 0.0
+    conn.noisy_seen = set()
+    conn.account_name = username
+    conn.account = dict(ACCOUNTS[username])
+    conn.accounts = accounts
+    conn.room = None
+    conn.my_seat = 0
+    conn.settled = False
+    conn.quest_score = 0
+    conn.quest_success = False
+    conn.solo_quest = RoomQuest()
+    conn.items_created = 0
+    conn.items_picked = 0
+    conn.deaths_broadcast = 0
+    conn.respawn_sent = 0
+    conn.last_position = None
+    conn.start_game = StartGameHandshake()
+    conn.peer_relay_on = False
+    conn.peer_data_dumped = False
+    conn.peer_data_in = 0
+    conn.peer_data_out = 0
+    return conn
+
+
+def create_session_payload(title="来玩", session_type=2, arguments=None):
+    """客户端方向的 `0x0201` 载荷：三个字符串 + int32 + 描述符。
+
+    ★ 参数个数由房间类型决定（`DESCRIPTOR_SENT_ARGUMENT_COUNTS`）——
+    闯关（2）是 `(关卡 id, 难度)` 两个，对战（1）是三个。给错个数的话
+    描述符解析失败，房间根本登记不进大厅。
+    """
+    if arguments is None:
+        arguments = (3, 1) if session_type == 2 else (0, 0, 0)
+    return (w_wstr(title) + w_wstr("") + w_wstr("")
+            + w_i32(0)
+            + w_i32(session_type)
+            + b"".join(w_i32(v) for v in arguments))
+
+
+def move_into_payload(room_id, password="", flag=0):
+    return w_i32(room_id) + w_wstr(password) + w_i32(flag)
+
+
+def hp_zero_payload(handle=0x000186A1, seat=0, arg=0xFF, deaths=0,
+                    x=100.0, y=200.0):
+    """客户端方向的 `0x0408`（18 字节，紧凑，死亡次数在线偏移 6）。"""
+    return struct.pack(DEATH_REPORT_FORMAT, handle, seat & 0xFF, arg, deaths,
+                       x, y)
+
+
+def respawn_payload(character_id=0, x=100, y=200, spawn_index=1):
+    """客户端方向的 `0x0413`（16 字节，和服务端方向的 `0x0419` 同一份结构）。"""
+    return (w_i32(character_id) + w_i32(x) + w_i32(y) + w_i32(spawn_index))
+
+
+def create_item_payload(item_id=10101, x=100.0, y=200.0):
+    """客户端方向的 `0x0406 gcpCreateItem`（32 字节）。"""
+    return struct.pack(gameserver.CREATE_ITEM_FORMAT,
+                       item_id, x, y, 0.0, 0.0, 3, -1, -1)
+
+
+def get_item_payload(seat_id=0, handle=ITEM_HANDLE_BASE):
+    """客户端方向的 `0x0407 gcpGetItem`（两个 int32）。"""
+    return w_i32(seat_id) + w_i32(handle)
+
+
+class BattleRoom(unittest.TestCase):
+    """alice（房主，座位 0）+ bob（座位 1），已经一起进了关卡。
+
+    每个用例一张干净的大厅表 —— `LOBBY` 是模块级单例（同 `test_room`）。
+    """
+
+    session_type = 2        # 2 = 闯关；对战的用例自己覆盖
+
+    def setUp(self):
+        self._saved_lobby = gameserver.LOBBY
+        gameserver.LOBBY = Lobby()
+        self.lobby = gameserver.LOBBY
+        self._saved_relay = gameserver.PEER_RELAY
+        gameserver.PEER_RELAY = relayserver.RelayServer(
+            members_of=gameserver._relay_room_members,
+            fallback=gameserver._relay_fallback)
+        self._saved_relay_enabled = gameserver.TCP_RELAY_ENABLED
+        gameserver.TCP_RELAY_ENABLED = False
+
+        self.accounts = FakeAccounts(None)
+        self.alice = make_conn("alice", self.accounts)
+        self.bob = make_conn("bob", self.accounts)
+        gameserver.Conn.on_game_packet(
+            self.alice, 0x0201,
+            create_session_payload(session_type=self.session_type))
+        self.room = self.lobby.room_of(self.alice)
+        gameserver.Conn.on_game_packet(self.bob, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        self.start_battle()
+        self.clear()
+
+    def tearDown(self):
+        gameserver.LOBBY = self._saved_lobby
+        gameserver.PEER_RELAY = self._saved_relay
+        gameserver.TCP_RELAY_ENABLED = self._saved_relay_enabled
+
+    def start_battle(self):
+        """走完真正的开局链，让两个人都进 stage 7。"""
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_LOADING_DONE, b"")
+        gameserver.Conn.on_game_packet(self.bob, OP_LOADING_DONE, b"")
+
+    def clear(self):
+        self.alice.sent.clear()
+        self.bob.sent.clear()
+
+    @property
+    def quest(self):
+        return self.room.quest
+
+
+# ----------------------------------------------------------------------------
+# 死亡 / 重生
+# ----------------------------------------------------------------------------
+class DeathBroadcastTests(BattleRoom):
+    """`0x0408 -> 0x0406`。§161：读侧按 `World::Find(句柄)` 找角色，
+    而玩家角色的句柄 = 座位×100000+100001（`0x405f02`），跨机器一致。"""
+
+    def test_a_death_reaches_everyone_in_the_room(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO,
+                                       hp_zero_payload(seat=0, deaths=0))
+        self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.alice))
+        self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.bob))
+
+    def test_the_broadcast_is_byte_identical_for_everyone(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO,
+                                       hp_zero_payload(seat=0, deaths=1))
+        self.assertEqual(bodies(self.alice, OP_BROADCAST_DEATH),
+                         bodies(self.bob, OP_BROADCAST_DEATH))
+
+    def test_the_same_death_reported_twice_is_only_broadcast_once(self):
+        # 两台机器各自模拟同一只怪，同一次死亡会被报两遍。广播两遍等于
+        # 战绩表（0x48c942）多记一次死亡。
+        payload = hp_zero_payload(handle=0x0010C8FB, seat=0xFF, deaths=0)
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO, payload)
+        self.clear()
+        gameserver.Conn.on_game_packet(self.bob, OP_REPORT_HP_ZERO, payload)
+        self.assertEqual([], opcodes(self.alice))
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_dying_again_is_a_different_event(self):
+        # ★ 去重的键里必须带死亡次数：同一个角色会死很多次，只按句柄去重
+        #   第二次死就被吃掉了（那一格是 [char+0x600]，只由我们广播的
+        #   0x0406 写，所以重复上报的两发一定同值、真的第二次死一定更大）。
+        for reported in (0, 1, 2):
+            self.clear()
+            gameserver.Conn.on_game_packet(
+                self.alice, OP_REPORT_HP_ZERO, hp_zero_payload(deaths=reported))
+            self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.bob),
+                             f"第 {reported + 1} 次死亡没广播")
+
+    def test_a_map_change_forgets_the_dedup_table(self):
+        # 换图会把六个座位的角色和场景物件全部卸掉重建（0x47900a），
+        # 旧句柄作废 —— 不清的话新图里同号的东西会被当成「已经报过了」。
+        payload = hp_zero_payload(handle=0x0010C8FB, seat=0xFF, deaths=0)
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO, payload)
+        self.quest.begin_map_change("Quest03_2")
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO, payload)
+        self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.bob))
+
+    def test_the_death_count_is_still_the_reported_value_plus_one(self):
+        # V0.1 §109 的契约不许变：HUD 心形 = 最大生命 - 这一格。
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO,
+                                       hp_zero_payload(seat=1, deaths=1))
+        body = bodies(self.bob, OP_BROADCAST_DEATH)[0]
+        self.assertEqual(2, struct.unpack_from("<i", body, 6)[0])
+
+    def test_a_respawn_reaches_everyone(self):
+        # 不广播的话别人屏幕上你就一直躺着（读侧 0x4931c2 按座位取角色）。
+        gameserver.Conn.on_game_packet(self.bob, OP_REQ_RESPAWN,
+                                       respawn_payload(character_id=1))
+        self.assertEqual([OP_RESPAWN_CHARACTER], opcodes(self.alice))
+        self.assertEqual([OP_RESPAWN_CHARACTER], opcodes(self.bob))
+        self.assertEqual(bodies(self.alice, OP_RESPAWN_CHARACTER),
+                         bodies(self.bob, OP_RESPAWN_CHARACTER))
+
+
+# ----------------------------------------------------------------------------
+# 掉落物 / 拾取
+# ----------------------------------------------------------------------------
+class ItemTests(BattleRoom):
+    """`0x0406 -> 0x0404` 和 `0x0407 -> 0x0405`。"""
+
+    def test_a_drop_reaches_everyone(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_CREATE_ITEM,
+                                       create_item_payload())
+        self.assertEqual([OP_CREATED_ITEM], opcodes(self.alice))
+        self.assertEqual([OP_CREATED_ITEM], opcodes(self.bob))
+        self.assertEqual(bodies(self.alice, OP_CREATED_ITEM),
+                         bodies(self.bob, OP_CREATED_ITEM))
+
+    def test_handles_are_allocated_per_room_not_per_connection(self):
+        # ★ 句柄进客户端 World 的 map 当 key（0x473e7c）。每条连接各自从
+        #   ITEM_HANDLE_BASE 数的话，alice 的第 1 件和 bob 的第 1 件同号，
+        #   后到的会覆盖先到的。
+        gameserver.Conn.on_game_packet(self.alice, OP_CREATE_ITEM,
+                                       create_item_payload())
+        gameserver.Conn.on_game_packet(self.bob, OP_CREATE_ITEM,
+                                       create_item_payload())
+        handles = [struct.unpack_from("<I", body, 0)[0]
+                   for body in bodies(self.alice, OP_CREATED_ITEM)]
+        self.assertEqual([ITEM_HANDLE_BASE, ITEM_HANDLE_BASE + 1], handles)
+
+    def test_a_pickup_reaches_everyone(self):
+        gameserver.Conn.on_game_packet(self.bob, OP_GET_ITEM,
+                                       get_item_payload(seat_id=1))
+        self.assertEqual([OP_PICKED_ITEM], opcodes(self.alice))
+        self.assertEqual([OP_PICKED_ITEM], opcodes(self.bob))
+
+    def test_one_item_can_only_be_picked_up_once(self):
+        # ★ 这一条是服务端仲裁的全部意义：两个人几乎同时踩到同一件东西，
+        #   两台机器都会判「我碰到了」并各发一发 0x0407。
+        payload = get_item_payload(seat_id=0, handle=ITEM_HANDLE_BASE + 7)
+        gameserver.Conn.on_game_packet(self.alice, OP_GET_ITEM, payload)
+        self.clear()
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_GET_ITEM,
+            get_item_payload(seat_id=1, handle=ITEM_HANDLE_BASE + 7))
+        self.assertEqual([], opcodes(self.alice))
+        self.assertEqual([], opcodes(self.bob), "晚到的那一发绝不能回包")
+
+    def test_the_winner_is_whoever_asked_first(self):
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_GET_ITEM,
+            get_item_payload(seat_id=1, handle=ITEM_HANDLE_BASE + 7))
+        body = bodies(self.alice, OP_PICKED_ITEM)[0]
+        self.assertEqual(1, struct.unpack_from("<i", body, 0)[0])
+        self.assertEqual({ITEM_HANDLE_BASE + 7: 1}, self.quest.items_taken)
+
+    def test_different_items_are_all_granted(self):
+        for i in range(3):
+            gameserver.Conn.on_game_packet(
+                self.alice, OP_GET_ITEM,
+                get_item_payload(handle=ITEM_HANDLE_BASE + i))
+        self.assertEqual(3, opcodes(self.bob).count(OP_PICKED_ITEM))
+
+
+# ----------------------------------------------------------------------------
+# 分数
+# ----------------------------------------------------------------------------
+class ScoreTests(BattleRoom):
+    """`0x0410 -> 0x0415`。处理器 `0x4a3efe` 写
+    `[GameContextQuest + 座位*4 + 0x3b8]`，按座位索引，所以广播是对的。"""
+
+    def test_a_score_update_reaches_everyone_with_the_right_seat(self):
+        self.bob.my_seat = 1
+        gameserver.Conn.on_game_packet(self.bob, OP_UPDATE_QUEST_SCORE,
+                                       w_i32(64))
+        for conn in (self.alice, self.bob):
+            body = bodies(conn, OP_REP_QUEST_SCORE)[0]
+            self.assertEqual((1, 64), struct.unpack_from("<ii", body, 0))
+
+
+# ----------------------------------------------------------------------------
+# 换图
+# ----------------------------------------------------------------------------
+class MapChangeTests(BattleRoom):
+    """`0x0411 -> 0x0417` 广播、`0x0412 -> 0x0418` **等所有人**。"""
+
+    def request(self, conn, name="Quest03_2"):
+        gameserver.Conn.on_game_packet(conn, OP_REQ_CHANGE_TO_NEXT_MAP,
+                                       w_wstr(name))
+
+    def done(self, conn):
+        gameserver.Conn.on_game_packet(conn, OP_MAP_LOADING_DONE, b"")
+
+    def test_the_whole_room_changes_map_together(self):
+        self.request(self.alice)
+        self.assertEqual([OP_REP_CHANGE_TO_NEXT_MAP], opcodes(self.alice))
+        self.assertEqual([OP_REP_CHANGE_TO_NEXT_MAP], opcodes(self.bob))
+
+    def test_a_second_request_for_the_same_map_is_not_rebroadcast(self):
+        # 两个人同时走到地图边缘会各发一发。再广播一次的话，先收到的人
+        # 会被要求再卸一次场景。
+        self.request(self.alice)
+        self.clear()
+        self.request(self.bob)
+        self.assertEqual([], opcodes(self.alice))
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_nobody_is_released_until_everyone_has_loaded(self):
+        self.request(self.alice)
+        self.clear()
+        self.done(self.alice)
+        self.assertEqual([], opcodes(self.alice), "先加载完的不能提前放行")
+        self.assertEqual([], opcodes(self.bob))
+        self.done(self.bob)
+        self.assertEqual([OP_MAP_CHANGE_READY], opcodes(self.alice))
+        self.assertEqual([OP_MAP_CHANGE_READY], opcodes(self.bob))
+
+    def test_leaving_mid_load_releases_the_rest(self):
+        # ★ 走的人可能正是没加载完的那一个 —— 不重新算一次的话，
+        #   剩下的人永远卡在换图的加载画面里。
+        self.request(self.alice)
+        self.done(self.alice)
+        self.clear()
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.assertIn(OP_MAP_CHANGE_READY, opcodes(self.alice))
+
+    def test_a_map_change_clears_the_pickup_table(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_GET_ITEM,
+                                       get_item_payload())
+        self.request(self.alice)
+        self.assertEqual({}, self.quest.items_taken)
+
+
+# ----------------------------------------------------------------------------
+# 结算
+# ----------------------------------------------------------------------------
+def result_seat(body):
+    return struct.unpack_from("<i", body, 0)[0]
+
+
+def result_tail(body):
+    """`0x0309` 尾部数组（座位 + 12 个业务值之后是 count + count 个 int32）。"""
+    offset = 4 + 12 * 4
+    count = struct.unpack_from("<i", body, offset)[0]
+    return list(struct.unpack_from(f"<{count}i", body, offset + 4))
+
+
+def end_game_seat(body):
+    return struct.unpack_from("<i", body, 0)[0]
+
+
+class QuestSettlementTests(BattleRoom):
+    """闯关（合作）的结算：每座位一份 `0x0309`，每人自己那份 `0x0411`。"""
+
+    def score(self, conn, seat, value):
+        conn.my_seat = seat
+        gameserver.Conn.on_game_packet(conn, OP_UPDATE_QUEST_SCORE,
+                                       w_i32(value))
+
+    def clear_quest(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_MARK_QUEST_SUCCESS,
+                                       w_i32(1))
+
+    def end(self, conn=None):
+        gameserver.Conn.on_game_packet(conn or self.alice, OP_END_QUEST, b"")
+
+    def test_everyone_gets_one_result_per_occupied_seat(self):
+        self.score(self.alice, 0, 40)
+        self.score(self.bob, 1, 25)
+        self.clear()
+        self.end()
+        for conn in (self.alice, self.bob):
+            seats = [result_seat(b) for b in bodies(conn, OP_REP_GAME_RESULT)]
+            self.assertEqual([0, 1], seats)
+
+    def test_each_client_only_gets_its_own_end_game(self):
+        # 0x0411 的处理器 0x551804 只在「包里的座位 == 我的座位」时才把
+        # 经验/金币写进右上角数据栏的四个全局；一人一份就够，多发几份
+        # 只会让客户端每份都回一发 0x0505 遥测（0x4087f0）。
+        self.score(self.alice, 0, 40)
+        self.score(self.bob, 1, 25)
+        self.clear()
+        self.end()
+        self.assertEqual([0], [end_game_seat(b)
+                               for b in bodies(self.alice, OP_END_GAME)])
+        self.assertEqual([1], [end_game_seat(b)
+                               for b in bodies(self.bob, OP_END_GAME)])
+
+    def test_the_result_packets_still_precede_the_end_game(self):
+        # §99：0x0309 要在 GameContext 还活着时发，0x0411 才结束关卡。
+        self.end()
+        for conn in (self.alice, self.bob):
+            ops = [op for op in opcodes(conn)
+                   if op in (OP_REP_GAME_RESULT, OP_END_GAME)]
+            self.assertEqual(OP_END_GAME, ops[-1])
+            self.assertNotIn(OP_END_GAME, ops[:-1])
+
+    def test_the_room_only_settles_once(self):
+        # 房里每个人的客户端都会发一发 0x040f。不挡的话一局入账好几次。
+        self.score(self.alice, 0, 40)
+        self.clear()
+        self.end(self.alice)
+        self.clear()
+        self.end(self.bob)
+        self.assertEqual([], opcodes(self.alice))
+        self.assertEqual([], opcodes(self.bob))
+        self.assertEqual(240, self.accounts.saved["alice"]["experience"])
+
+    def test_each_player_is_paid_their_own_score(self):
+        self.score(self.alice, 0, 40)
+        self.score(self.bob, 1, 25)
+        self.end()
+        self.assertEqual(200 + 40, self.accounts.saved["alice"]["experience"])
+        self.assertEqual(400 + 25, self.accounts.saved["bob"]["experience"])
+        self.assertEqual(10 + 40, self.accounts.saved["alice"]["money"])
+        self.assertEqual(20 + 25, self.accounts.saved["bob"]["money"])
+
+    def test_clearing_the_quest_marks_everyone_as_cleared(self):
+        # 合作：关底是大家一起打的，脚本只在某一台机器上喊到也算全房间通关。
+        self.score(self.alice, 0, 40)
+        self.score(self.bob, 1, 25)
+        self.clear_quest()
+        self.clear()
+        self.end()
+        expected = [GAME_RESULT_CLEARED, GAME_RESULT_CLEARED] + [0] * 4
+        for conn in (self.alice, self.bob):
+            for body in bodies(conn, OP_REP_GAME_RESULT):
+                self.assertEqual(expected, result_tail(body))
+
+    def test_a_failed_quest_never_writes_minus_one(self):
+        # 0 和 -1 是两个档：`0x55223f` 的 setge 用 >= 0 选胜利 BGM。
+        # V0.1 单机没通关时发的就是 0，改成 -1 会让失败开始放失败曲。
+        self.end()
+        body = bodies(self.alice, OP_REP_GAME_RESULT)[0]
+        self.assertEqual([0] * GAME_RESULT_TAIL_COUNT, result_tail(body))
+
+    def test_everyone_who_cleared_unlocks_the_next_difficulty(self):
+        # ★ 客人手上没有 `self.room`（那是房主解析 0x0201 得到的），
+        #   `current_quest()` 要能从大厅那一份读出关卡 id / 难度。
+        self.clear_quest()
+        self.end()
+        self.assertEqual({("alice", 3, 1), ("bob", 3, 1)},
+                         set(self.accounts.cleared))
+
+
+class PvpSettlementTests(BattleRoom):
+    """对战（房间类型 != 2）：按本局分数判胜负。"""
+
+    session_type = 1
+
+    def score(self, conn, seat, value):
+        conn.my_seat = seat
+        gameserver.Conn.on_game_packet(conn, OP_UPDATE_QUEST_SCORE,
+                                       w_i32(value))
+
+    def test_the_higher_score_wins_and_the_other_loses(self):
+        self.score(self.alice, 0, 40)
+        self.score(self.bob, 1, 25)
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        expected = [GAME_RESULT_CLEARED, GAME_RESULT_DEFEATED] + [0] * 4
+        for conn in (self.alice, self.bob):
+            for body in bodies(conn, OP_REP_GAME_RESULT):
+                self.assertEqual(expected, result_tail(body))
+
+    def test_a_draw_makes_everyone_a_winner(self):
+        self.score(self.alice, 0, 30)
+        self.score(self.bob, 1, 30)
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        expected = [GAME_RESULT_CLEARED, GAME_RESULT_CLEARED] + [0] * 4
+        body = bodies(self.alice, OP_REP_GAME_RESULT)[0]
+        self.assertEqual(expected, result_tail(body))
+
+    def test_a_scoreless_round_judges_nobody(self):
+        # 没打就散了。判谁输都是瞎判，两边都放失败曲更难看。
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        body = bodies(self.alice, OP_REP_GAME_RESULT)[0]
+        self.assertEqual([0] * GAME_RESULT_TAIL_COUNT, result_tail(body))
+
+    def test_a_pvp_round_never_records_a_quest_clear(self):
+        self.score(self.alice, 0, 40)
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        self.assertEqual([], self.accounts.cleared)
+
+
+# ----------------------------------------------------------------------------
+# 房间生命周期
+# ----------------------------------------------------------------------------
+class RoomLifecycleTests(BattleRoom):
+    """开局挡人、结算完回房间复位、第二局能再开起来。"""
+
+    def test_the_room_is_marked_playing_once_everyone_is_in(self):
+        self.assertEqual(SESSION_STATUS_PLAYING, self.room.status)
+
+    def test_nobody_can_join_a_room_that_is_playing(self):
+        # 关卡是开局那一刻按座位表加载的，中途多一个人两边就对不上了。
+        carol = make_conn("carol", self.accounts)
+        result, _, _ = self.lobby.join(carol, self.room.room_id)
+        self.assertEqual(MOVE_INTO_ALREADY_PLAYING, result)
+
+    def test_returning_from_the_result_screen_reopens_the_room(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        gameserver.Conn.leave_game_result(self.alice)
+        self.assertEqual(SESSION_STATUS_WAITING, self.room.status)
+        self.assertIsNone(self.room.quest)
+        self.assertEqual(StartGameHandshake.WAIT_START, self.room.battle.state)
+
+    def test_a_second_round_can_be_started(self):
+        # ★ 不复位 `room.battle` 的话它停在 IN_GAME，房主再按 F5 发来的
+        #   0x0402 会被 StartGameHandshake 当成「已经在游戏里了」直接丢掉。
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        gameserver.Conn.leave_game_result(self.alice)
+        gameserver.Conn.leave_game_result(self.bob)
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        self.assertEqual([gameserver.OP_TRIGGER_COUNT_GAME], opcodes(self.bob))
+
+    def test_the_second_round_starts_with_a_fresh_quest_state(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_CREATE_ITEM,
+                                       create_item_payload())
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        gameserver.Conn.leave_game_result(self.alice)
+        self.start_battle()
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_CREATE_ITEM,
+                                       create_item_payload())
+        handle = struct.unpack_from(
+            "<I", bodies(self.alice, OP_CREATED_ITEM)[0], 0)[0]
+        self.assertEqual(ITEM_HANDLE_BASE, handle)
+
+
+# ----------------------------------------------------------------------------
+# RoomQuest 本身（不碰协议，纯模型）
+# ----------------------------------------------------------------------------
+class RoomQuestTests(unittest.TestCase):
+
+    def test_ranking_in_quest_mode_is_all_or_nothing(self):
+        quest = RoomQuest()
+        self.assertEqual([0] * 6, quest.ranking({0: 10, 2: 5}, True))
+        quest.mark_success(True)
+        self.assertEqual([1, 0, 1, 0, 0, 0], quest.ranking({0: 10, 2: 5}, True))
+
+    def test_mark_success_never_goes_back_to_false(self):
+        quest = RoomQuest()
+        quest.mark_success(True)
+        self.assertTrue(quest.mark_success(False))
+
+    def test_ranking_ignores_seats_out_of_range(self):
+        quest = RoomQuest()
+        self.assertEqual([0] * 6, quest.ranking({-1: 10, 9: 20}, False))
+
+    def test_claim_item_is_first_come_first_served(self):
+        quest = RoomQuest()
+        self.assertTrue(quest.claim_item(0x40000000, 0))
+        self.assertFalse(quest.claim_item(0x40000000, 1))
+
+    def test_item_handles_never_repeat(self):
+        quest = RoomQuest()
+        handles = [quest.allocate_item() for _ in range(5)]
+        self.assertEqual(len(handles), len(set(handles)))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -637,6 +637,11 @@ SESSION_TYPE_NAMES = {
 
 #: 闯关房。描述符的两个参数是 `(关卡 id, 难度)`（§68），准入校验
 #: `0x4683ba` 拿它俩去查「已达成难度」（§118）。
+#:
+#: ★ 结算时也靠它分「合作」还是「对战」：客户端自己判的就是
+#: `[LobbyStage+0x1c] == 2` —— `0x4a4b4c`（结算界面写「完成/未完成」还是
+#: 「CLEAR/FAILED」）和 `0x552242`（选 `BGM-StageClear` 还是 `BGM-Victory`）
+#: 两处（§161）。其余类型（0/1 对战、5 天梯、6 练习）走对战那一支。
 SESSION_TYPE_QUEST = 2
 
 #: `SessionDescriptor::Serialize`（0x557374）按房间类型写几个 int32 参数。
@@ -707,6 +712,13 @@ def build_session_descriptor(session_type, arguments):
 #: 服务端方向的 `0x0403`（结算完回房间）在 `0x551904` 硬写 `[LobbyStage+4]=2`,
 #: 所以打完一关回来的房间是对的 —— 只有建房那一路是黑的。
 SESSION_STATUS_WAITING = 2
+
+#: 「游戏中」。客户端只判「是不是 2」，别的值一律当游戏中，所以填几都行；
+#: 3 是为了和 `lobby.SESSION_STATUS_PLAYING` 一致。
+#: 开局时把房间切到这个状态，大厅列表就写「游戏中」，`Lobby.join` 也会用
+#: `MOVE_INTO_ALREADY_PLAYING`（「此房间已开始游戏。」）挡住半路想进来的人 ——
+#: 不挡的话新人会坐进一个正在打的房间，而关卡是开局那一刻按座位表加载的。
+SESSION_STATUS_PLAYING = 3
 
 
 def build_session(status, session_type, arguments, title="", map_name="",
@@ -1295,7 +1307,7 @@ def parse_seat_change_request(payload):
 
 
 def build_rep_quest_record_in_pvp(records=None):
-    """opcode 0x0311 —— 六种游戏类型的任务/PvP 记录。
+    """opcode 0x0311 —— 房间里**每个座位**一项的任务/PvP 记录。
 
     大厅分发器 `0x4061e2` 把 0x0311 交给 `0x408a1c`。后者构造
     `Packet_gspRepQuestRecordInPvp`（vft 0x65e14c），其反序列化函数
@@ -1304,8 +1316,16 @@ def build_rep_quest_record_in_pvp(records=None):
         int32 n
         int32 records[n]
 
-    处理器随后按固定下标 0..5 访问该数组，因此最小安全包必须有六项；
-    未查明各项业务语义前按 D019 全部填 0。
+    ★ 六项是**六个座位**，不是「六种游戏类型」（V0.2 会话 08 查明，§161）——
+    处理器就是一个 `for (i = 0; i < 6; i++)`：
+
+        if (!seatOccupied(i)) continue;              ; 0x4045f9
+        [LobbyStage + i*4 + 0x1ac] = records[i];     ; 0x408a66
+        0x4089fa(LobbyStage)                          ; 拿它去调座位对象的 0x50b6a1
+
+    全镜像里 `[LobbyStage + 座位*4 + 0x1ac]` 只有这一处写、只有 `0x4089fa`
+    一处读，而后者只是把值交给座位对象 —— 纯表现层（多半是头顶的段位标记）。
+    **具体是什么数仍未查明**，所以按 D019 继续全填 0：回空表客户端照常工作。
     """
     if records is None:
         records = (0, 0, 0, 0, 0, 0)
@@ -1457,6 +1477,16 @@ GAME_RESULT_TAIL_COUNT = 6
 #: 所以哪怕真通关也永远是「未完成」。`0x0411 gspEndGame` 的 `success`
 #: 字段跟这个标签没关系（§99 实测 `success=True` 照样写「未完成」）。
 GAME_RESULT_CLEARED = 1
+
+#: 尾部数组第 i 项填这个值 = 「第 i 号座位**输了**」（对战的败方，§161）。
+#:
+#: 同一格还被 `0x55223f` 拿去 `setge` 选结算 BGM：**`>= 0` 放胜利曲**
+#: （闯关 `BGM-StageClear` / 对战 `BGM-Victory`），负数才放失败曲
+#: （`BGM-Failed` / `BGM-Lose`，串在 `0x672434` / `0x691d0c`）。
+#: 所以「没通关」的 0 和「输了」的 -1 是两个不同的档，别合并：
+#: V0.1 单机没通关时发的就是 0，改成 -1 会让单机的失败也开始放失败曲，
+#: 那是没验过的行为变更。
+GAME_RESULT_DEFEATED = -1
 
 #: 12 个业务值里已查明语义的下标（会话 18，§116）。
 #:
@@ -2030,6 +2060,190 @@ class RoomStartGame:
         return [m for m in members if m not in self.loaded]
 
 
+class RoomQuest:
+    """**房间级**的一局关卡状态 —— J.3 的战斗逻辑。
+
+    V0.1 的战斗应答全是「原样回显给发包的那一个人」，多人时那样做等于
+    六个人各打各的。这个类把「一局」里必须由服务端**仲裁**或者**广播**的
+    东西集中起来。挂在 `lobby.Room.quest` 上，回房间时整个丢掉。
+
+    ## 为什么这些包广播出去是安全的（逐个查过反汇编，§161）
+
+    客户端解这几个包时用的都是**跨机器一致的 id**，不是本机指针：
+
+    | 包 | 客户端怎么找到目标 |
+    |---|---|
+    | `0x0406` 死亡广播 | `World::Find(句柄)`；玩家角色的句柄 = **座位×100000+100001**（`0x405f02` 写死的公式），六台机器上一模一样 |
+    | `0x0419` 重生 | `GameContext::vf_d4(座位…)` -> `[GameSession+座位*4+0x1d0]` |
+    | `0x0404` 掉落物落地 | 句柄是**服务端分配**的，我们发给谁谁就用这个号建对象 |
+    | `0x0405` 拾取放行 | 座位 -> 角色（`0x404ff6`）、句柄 -> 物件（`World::Find`），两个都查得到才生效 |
+    | `0x0415` 分数 | `[GameContextQuest + 座位*4 + 0x3b8]` |
+    | `0x0309` 结算 | 全部按 `pkt+0x04` 的座位号索引 |
+
+    找不到就整包丢掉（`0x493914` / `0x551d7c` 都有 `test/je`），**不会崩**。
+
+    ## 服务端在这里必须仲裁的两件事
+
+    1. **一件掉落物只能被一个人捡到。** 客户端 `Character::CheckItemPickup`
+       （`0x5154d3`）发完 `0x0407` 就把 `[item+0x2a8]` 置 1，它自己不会再问
+       第二次；谁先到我们这儿谁拿走，晚到的那一发**不回任何包**。
+    2. **同一个角色的死亡只广播一次。** 多台机器各自模拟怪物，同一只怪
+       可能被两台机器同时报 `0x0408`；广播两遍等于战绩表多记一次死亡。
+
+    ## 句柄分配器为什么必须是房间级的
+
+    `0x0404` 的句柄进客户端的 `World` 当 map 的 key（`0x473e7c`）。六个人
+    各自从 `ITEM_HANDLE_BASE` 开始分配的话，A 的第 1 件和 B 的第 1 件是同一个
+    号，后到的那件会**覆盖**先到的那件。
+    """
+
+    def __init__(self, item_handle_base=ITEM_HANDLE_BASE):
+        #: 掉落物句柄分配器（房间级，见类注释）。
+        self.next_item_handle = int(item_handle_base)
+        #: 已经被谁捡走的掉落物句柄 -> 座位号。仲裁靠它。
+        self.items_taken = {}
+        #: 已经广播过的死亡事件，键是 **(句柄, 客户端报的死亡次数)**（去重）。
+        #: 为什么键里要带死亡次数：同一个角色会死很多次，只按句柄去重的话
+        #: 第二次死就被吃掉了。而重复上报（两台机器同时判同一只怪死了）
+        #: **两发的死亡次数一定相同** —— 那一格是 `[char+0x600]`，只由我们
+        #: 广播的 `0x0406` 写，所有机器上是同一个值。真正的第二次死亡则会
+        #: 带着更大的数上来，键自然不同。
+        self.dead_events = set()
+        #: 每个座位死了几次。**这是权威值** —— HUD 上那排心形读的就是它
+        #: （§109：`[char+0x600]`，由我们在 `0x0406` 里下发）。
+        self.deaths = [0] * ROOM_SEAT_COUNT
+        #: 本局是否通关。任何人报了 `0x0417 gcpMarkQuestSuccess(1)` 就算 ——
+        #: 合作模式里关底是大家一起打的，谁的脚本先喊到不重要。
+        self.success = False
+        #: 正在换的那张地图名（`0x0411` -> `0x0417`），没有换图在飞时是 None。
+        self.pending_map = None
+        #: 已经报过 `0x0412`（新图加载完）的连接。
+        self.map_loaded = set()
+        #: 本局已经结算过了。★ 房间级，不是连接级 —— 六个人会各发一发
+        #: `0x040f gcpEndQuest`，只有第一发能触发结算。
+        self.settled = False
+        #: 已放行的地图名（只给日志和调试通道看）。
+        self.maps_entered = []
+
+    # -- 掉落物 -------------------------------------------------------------
+    def allocate_item(self):
+        """给一件新的掉落物分配句柄。"""
+        handle = self.next_item_handle
+        self.next_item_handle += 1
+        return handle
+
+    def claim_item(self, handle, seat_id):
+        """拾取仲裁。第一个来的返回 True，之后一律 False。
+
+        返回 False 时**什么包都不要回** —— 回 `0x0405` 就等于同一件东西
+        被两个人捡走了。
+        """
+        handle &= 0xFFFFFFFF
+        if handle in self.items_taken:
+            return False
+        self.items_taken[handle] = int(seat_id)
+        return True
+
+    # -- 死亡 / 重生 --------------------------------------------------------
+    def record_death(self, handle, seat, reported):
+        """记一次死亡。返回 `(要下发的死亡次数, 这一发要不要广播)`。
+
+        ★ **下发的死亡次数是「客户端报的值 + 1」，不是服务端自己数的。**
+        看着像是服务端该当权威，其实两者永远相等，而「报的值 +1」是 V0.1
+        实机验过的（§109，包括跨换图那一段）：`[char+0x600]` 这一格**只由
+        我们广播的 `0x0406` 写**，所以每台机器上的值都是我们上一次发下去的
+        那个。自己另起一份计数只会多一个可能对不上的真源。
+
+        每座位的 `deaths` 只用来记账 / 打日志，不参与下发。
+        """
+        key = (handle & 0xFFFFFFFF, int(reported))
+        first = key not in self.dead_events
+        self.dead_events.add(key)
+        if first and 0 <= seat < ROOM_SEAT_COUNT:
+            self.deaths[seat] += 1
+        return int(reported) + 1, first
+
+    # -- 换图 ---------------------------------------------------------------
+    def begin_map_change(self, map_name):
+        """开一次换图。已经在换同一张图时返回 False（别广播第二遍）。
+
+        两个玩家同时走到地图边缘就会各发一发 `0x0411`。第二发再广播一次
+        `0x0417` 的话，先收到的人会被要求**再卸一次场景**。
+        """
+        if self.pending_map == map_name:
+            return False
+        self.pending_map = map_name
+        self.map_loaded.clear()
+        self.maps_entered.append(map_name)
+        # 换图会把六个座位的角色对象和场景里的物件全部卸掉重建（`0x47900a`），
+        # 旧句柄随之作废 —— 去重表和拾取表必须跟着清，否则新图里的物件
+        # 会被当成「已经捡过了」。
+        self.items_taken.clear()
+        self.dead_events.clear()
+        return True
+
+    def map_done(self, conn, members):
+        """某条连接报了 `0x0412`。所有人都报到了才返回 True（放行 `0x0418`）。
+
+        `conn=None` = 只重新算一次（有人中途退房时用），和
+        `RoomStartGame.on_loaded` 是同一个套路：等的人走了就别再等他。
+        """
+        if conn is not None:
+            self.map_loaded.add(conn)
+        return not [m for m in members if m not in self.map_loaded]
+
+    def finish_map_change(self):
+        self.pending_map = None
+        self.map_loaded.clear()
+
+    def waiting_for_map(self, members):
+        """还在等谁把新图加载完（只给日志用）。"""
+        return [m for m in members if m not in self.map_loaded]
+
+    # -- 通关 / 胜负 --------------------------------------------------------
+    def mark_success(self, ok):
+        """`0x0417 gcpMarkQuestSuccess`。只会从 False 变 True，不会被冲回去。"""
+        if ok:
+            self.success = True
+        return self.success
+
+    def ranking(self, scores, quest_mode):
+        """算每个座位在 `0x0309` 尾部数组里的那一格。
+
+        `scores` = `{座位号: 本局分数}`，只包含**有人的**座位。
+
+        尾部数组落进 `[GameContext + 座位*4 + 0x184]`，客户端读它的地方有两处
+        （§112 + 本轮补的 §161）：
+
+            结算界面标签 `0x4a4ba9`：== 1  且 剩余生命 > 0  -> 「完成」/「CLEAR」
+            结算 BGM     `0x55223f`：>= 0（`setge`）        -> 胜利曲，否则失败曲
+
+        所以三个档：**1 = 赢**、**0 = 没赢但不放失败曲**（V0.1 单机没通关时
+        就是这一档，保持不变）、**-1 = 输**（对战的败方）。
+
+        `quest_mode` 为真（房间类型 2 = 闯关）时是**合作**：通关了大家一起 1。
+        对战按本局分数排名，最高分（含并列）1、其余 -1；**全场 0 分**时
+        谁都不判 —— 那多半是没打就散了。
+        """
+        tail = [0] * GAME_RESULT_TAIL_COUNT
+        scores = {int(seat): int(score) for seat, score in dict(scores).items()
+                  if 0 <= int(seat) < GAME_RESULT_TAIL_COUNT}
+        if not scores:
+            return tail
+        if quest_mode:
+            if self.success:
+                for seat in scores:
+                    tail[seat] = GAME_RESULT_CLEARED
+            return tail
+        best = max(scores.values())
+        if best <= 0:
+            return tail
+        for seat, score in scores.items():
+            tail[seat] = (GAME_RESULT_CLEARED if score == best
+                          else GAME_RESULT_DEFEATED)
+        return tail
+
+
 def build_rep_user_list():
     """opcode 0x020d —— 频道用户列表（空）
 
@@ -2265,17 +2479,12 @@ class Conn:
         # 合适的；正式重生走 0x0413 -> 0x0419 的回显，用不着它（§112 勘误：
         # 这个包不是「位置同步」，只是它的第 2、3 个 dword 确实是坐标）。
         self.last_position = None
-        # 掉落物实例句柄的分配器（gspCreatedItem 的第 1 个字段 -> [obj+0xd0]，
-        # World 拿它当 map 的 key）。关卡自己的物件句柄实测在 0x0010c9xx 一带，
-        # 起点拉到 0x40000000 就绝不会撞上。
-        self.next_item_handle = ITEM_HANDLE_BASE
+        # 本局关卡的状态**不在房间里时**用的那一份（协议试探 / 控制通道手搓包）。
+        # 在房间里时用的是 `lobby.Room.quest`，见 `quest_state()`。
+        self.solo_quest = RoomQuest()
         self.items_created = 0
         # 本局回了几次 0x0405 拾取放行（客户端每踩到一件掉落物发一发 0x0407）。
         self.items_picked = 0
-        # 关卡内换图（§111）：已放行的地图名列表，和「当前是否有一次换图在飞」。
-        # pending 只用于日志和「0x0412 是不是我们预期的那一发」的判断。
-        self.maps_entered = []
-        self.map_change_pending = False
         # 已经报过一次的高频 opcode（见 NOISY_OPCODES）。
         self.noisy_seen = set()
         self.ft = open(os.path.join(LOGDIR, f"game_{self.seq:03d}_27799.txt"),
@@ -2384,6 +2593,80 @@ class Conn:
     def lobby_room(self):
         """本连接当前所在的房间（`lobby.Room`），不在房间里就是 ``None``。"""
         return LOBBY.room_of(self)
+
+    # ---- 战斗逻辑的三个共用取数口（J.3）------------------------------------
+    #
+    # ★ **战斗处理器只许有一条代码路径。** 不在房间里（协议试探、控制通道
+    #   手搓包）时用连接自带的 `self.solo_quest` 和「房里只有我一个人」的
+    #   成员表顶上，行为就退化成 V0.1 的单连接回显 —— 一个字节都不差。
+    #   写成 `if room is None: 老逻辑 else: 新逻辑` 的话，单机那一支永远没人
+    #   测，迟早和联机那一支长歪（同 CLAUDE.md 铁律 8 的道理）。
+
+    def quest_state(self):
+        """本局关卡的战斗状态（`RoomQuest`）。在房间里就是房间那一份。"""
+        room = self.lobby_room()
+        if room is None:
+            return self.solo_quest
+        if room.quest is None:
+            room.quest = RoomQuest()
+        return room.quest
+
+    def battle_members(self):
+        """要收到战斗广播的连接（**含自己**）。不在房间里就只有自己。"""
+        room = self.lobby_room()
+        if room is None:
+            return [self]
+        members = room.members(exclude=None)
+        return members if self in members else members + [self]
+
+    def battle_seats(self):
+        """本局有人的座位号（升序）。不在房间里就只有自己那一个。"""
+        room = self.lobby_room()
+        if room is None:
+            return [self.my_seat]
+        return [i for i, seat in enumerate(room.seats) if seat is not None]
+
+    @property
+    def maps_entered(self):
+        """本局已放行的地图名（房间级，见 `RoomQuest`）。只读。"""
+        return self.quest_state().maps_entered
+
+    @property
+    def map_change_pending(self):
+        """有没有一次换图正在飞（房间级）。只读。"""
+        return self.quest_state().pending_map is not None
+
+    def quest_mode(self):
+        """这一局是不是**闯关**（房间描述符 type == 2，见 SESSION_TYPE_QUEST）。"""
+        room = self.lobby_room()
+        if room is not None:
+            return room.session_type == SESSION_TYPE_QUEST
+        # 没有大厅房间时看自己解析到的建房请求；再没有就按闯关算
+        # （V0.1 的单机主线就是闯关，保持老行为）。
+        return int((self.room or {}).get("session_type",
+                                         SESSION_TYPE_QUEST)) == SESSION_TYPE_QUEST
+
+    def battle_broadcast(self, plain, reason="", exclude=None):
+        """把一个已经组好帧的战斗包发给房里**每一个人（含自己）**。
+
+        和 `broadcast()` 的区别就是「含自己」：死亡 / 重生 / 掉落 / 拾取 /
+        分数这几条，发包的那个人自己也必须收到应答才会动作（V0.1 §108 起
+        的四条链），所以不能沿用大厅那个默认排除自己的广播。
+
+        返回实际发出去的份数。
+        """
+        sent = 0
+        for member in self.battle_members():
+            if member is exclude:
+                continue
+            try:
+                member.send(plain)
+                sent += 1
+            except OSError as error:
+                member.log(f"   战斗广播发送失败（{error!r}），忽略")
+        if reason and sent > 1:
+            self.log(f"   → 广播给房里 {sent} 人{reason}")
+        return sent
 
     def seat_snapshot(self):
         """按存档给自己做一个座位快照（昵称 / 等级 / 角色）。
@@ -2721,7 +3004,23 @@ class Conn:
 
         闯关房的描述符是 type=2 + 两个参数 `(关卡 id, 难度)`（§68），
         建房时由客户端发上来、我们原样存进 `self.room`。
+
+        ★ `self.room` 只有**房主**有（它是 `0x0201` 建房请求的解析结果）。
+        后进房的人手上没有，所以先看大厅里那一份 —— 建房和 `0x0302` 选地图
+        都会把描述符同步进去，房里每个人读到的都一样。不这么做的话，
+        「客人打通了关卡但难度没解锁」（J.3 多人才会暴露的坑）。
         """
+        lobby_room = self.lobby_room()
+        if lobby_room is not None:
+            if lobby_room.session_type != SESSION_TYPE_QUEST:
+                return None
+            arguments = lobby_room.arguments or ()
+            if len(arguments) >= 2:
+                try:
+                    return int(arguments[0]), int(arguments[1])
+                except (TypeError, ValueError):
+                    return None
+            # 大厅那份参数不全（老路径/调试造的房）时退回自己解析的那一份。
         room = self.room or {}
         if room.get("session_type") != SESSION_TYPE_QUEST:
             return None
@@ -2796,11 +3095,20 @@ class Conn:
         `[char+0x2b4]`（死亡标记）永远是 0，于是既不播死亡动画、也不进 5 秒
         重生倒计时，角色就冻在原地 —— 掉进岩浆同理（岩浆只是另一种伤害源）。
 
-        回显策略：**把收到的 18 字节里的「死亡次数」那一格 +1，其余原样发回**。
-        真服务器在这里是广播给房间里所有人（自己也收得到），而死亡次数是由
-        服务端定的权威值 —— 客户端报的是「我死之前死过几次」，服务端回的是
+        回显策略：**把收到的 18 字节里的「死亡次数」那一格换成服务端的权威值，
+        其余原样发回，并广播给房间里所有人（自己也收得到）**。
+        死亡次数是服务端定的 —— 客户端报的是「我死之前死过几次」，服务端回的是
         「你现在死了几次」。**这一格就是 HUD 心形的数据源**（§109），
         照抄回去心形就永远不减少。
+
+        ## 多人（J.3）
+
+        - **广播出去是安全的**：读侧 `0x4938d2` 用 `World::Find(句柄)` 找角色，
+          而玩家角色的句柄 = **座位 × 100000 + 100001**（`0x405f02` 写死的公式，
+          §161），六台机器上完全一致；找不到就整包丢掉（`0x493914` 的 `je`），
+          不会崩。所以「A 死了」这件事在 B 那边也能正确落到 A 的角色上。
+        - **同一个句柄只广播一次**：怪物是各台机器各自模拟的，同一只怪可能被
+          两个客户端同时报上来。广播两遍等于战绩表（`0x48c942`）多记一次死亡。
         """
         if getattr(self.args, "no_death_reply", False):
             self.log("   [no-death-reply] 收到 0x0408 但不回死亡广播")
@@ -2812,7 +3120,16 @@ class Conn:
             return
         seat = info["seat"]
         who = f"玩家座位 {seat}" if 0 <= seat < 6 else f"NPC/怪物 (座位={seat})"
-        deaths = info["deaths"] + 1
+        quest = self.quest_state()
+        deaths, first = quest.record_death(info["handle"], seat, info["deaths"])
+        self.log(f"   HP 归零上报: {who} 句柄=0x{info['handle']:08x} "
+                 f"凶手={info['arg']} 死亡次数={info['deaths']} "
+                 f"位置=({info['x']:.0f}, {info['y']:.0f})")
+        if not first:
+            # 别人已经替这个句柄报过了。再广播一次就多记一次死亡。
+            self.vlog(f"   句柄 0x{info['handle']:08x} 的死亡已经广播过；"
+                      f"这一发忽略（多台机器各自模拟同一只怪，§161）")
+            return
         # ★ 用**和解析同一个格式串**重新打包，别去手算「死亡次数在第几字节」——
         #   线上是紧凑的（死亡次数在偏移 6），客户端结构体里却在 +0x08，
         #   按后者去改包会写坏 X 并把死亡次数冲成六万多，客户端当场越界崩溃。
@@ -2820,13 +3137,11 @@ class Conn:
                             info["seat"] & 0xFF, info["arg"], deaths,
                             info["x"], info["y"])
         self.deaths_broadcast += 1
-        self.log(f"   HP 归零上报: {who} 句柄=0x{info['handle']:08x} "
-                 f"凶手={info['arg']} 死亡次数={info['deaths']} "
-                 f"位置=({info['x']:.0f}, {info['y']:.0f})")
         self.log(f"← 回 0x0406 死亡广播（第 {self.deaths_broadcast} 次）"
                  f" 死亡次数 -> {deaths}"
                  f" —— 客户端收到才会调 Character::Die()，心形也靠它减")
-        self.send(build_game(OP_BROADCAST_DEATH, reply))
+        self.battle_broadcast(build_game(OP_BROADCAST_DEATH, reply),
+                              reason="：死亡广播")
 
     def on_respawn_request(self, payload):
         """0x0413 gcpRespawnCharacter -> 原样回 0x0419，角色在自报的位置复活。
@@ -2835,6 +3150,15 @@ class Conn:
         每帧的 `0x4fe78f` 走到 `0x4fe8d7` 发这个包。**坐标是客户端自己选好的
         重生点**（`0x4fe70e` -> `[char+0x2b0]`），所以原样回显一定合法，
         不会再出现 §88 那种「传送到地图边缘 + 0x0106 gcpReportHack」。
+
+        ## 多人（J.3）：广播给全房间
+
+        - **只有本人会请求**：`0x4fe70e` 有 `[char+0x2ac] != [LobbyStage+0x1cc]`
+          这条判据，别人的角色不会替你发 `0x0413`。所以不需要去重。
+        - **广播出去是安全的**：读侧 `0x553ecc` -> `GameContext::vf_d4`
+          （`0x4931c2`）第一件事就是 `0x404ff6(座位)` = `[GameSession+座位*4+0x1d0]`
+          按座位取角色，座位号跨机器一致；空座位直接 return（§161）。
+          不广播的话，别人屏幕上你就一直躺着。
         """
         try:
             info = parse_respawn_request(payload)
@@ -2847,8 +3171,11 @@ class Conn:
                  f"重生点索引={info['spawn_index']}")
         self.log(f"← 回 gspRespawnCharacter(0x0419) 原样回显"
                  f"（第 {self.respawn_sent} 次）")
-        self.send(build_game(OP_RESPAWN_CHARACTER, build_respawn_character(
-            info["character_id"], info["x"], info["y"], info["spawn_index"])))
+        self.battle_broadcast(
+            build_game(OP_RESPAWN_CHARACTER, build_respawn_character(
+                info["character_id"], info["x"], info["y"],
+                info["spawn_index"])),
+            reason="：重生")
 
     def on_req_change_to_next_map(self, payload):
         """0x0411「我要去下一张地图」-> 原样回 0x0417，客户端这才开始换图。
@@ -2862,20 +3189,34 @@ class Conn:
         回显策略：**把客户端自报的地图名原样发回去**。下一张地图叫什么
         只有客户端的地图目录知道（服务端手上没有任何地图数据），
         这和死亡/重生用的是同一条理由（D046）。
+
+        ## 多人（J.3）：**全房间一起换图**
+
+        走到地图最右边的只有一个人，但换图必须是全房间的事 —— 不广播的话
+        他一个人进了新图，其余人还留在旧图，两边的场景对不上，之后所有
+        按句柄/座位定位的包（掉落物、死亡）就都对不上号了。
+
+        两个人同时走到边缘会各发一发 `0x0411`。第二发不再广播
+        （`RoomQuest.begin_map_change` 判重），否则先收到的人会被要求
+        **再卸一次场景**。
         """
         try:
             map_name = parse_req_change_to_next_map(payload)
         except (ValueError, struct.error) as error:
             self.log(f"   0x0411 解析失败: {error}；不回换图应答")
             return
-        self.maps_entered.append(map_name)
-        self.map_change_pending = True
+        quest = self.quest_state()
+        if not quest.begin_map_change(map_name):
+            self.log(f"   换图请求: {map_name!r} 已经在换了；不重复广播 0x0417")
+            return
         self.log(f"   换图请求: 下一张地图 = {map_name!r}"
-                 f"（本局第 {len(self.maps_entered)} 次换图）")
+                 f"（本局第 {len(quest.maps_entered)} 次换图）")
         self.log("← 回 gspRepChangeToNextMap(0x0417) 原样回显 —— "
                  "客户端收到才会卸场景、加载新地图")
-        self.send(build_game(OP_REP_CHANGE_TO_NEXT_MAP,
-                             build_rep_change_to_next_map(map_name)))
+        self.battle_broadcast(
+            build_game(OP_REP_CHANGE_TO_NEXT_MAP,
+                       build_rep_change_to_next_map(map_name)),
+            reason="：换图")
 
     def on_map_loading_done(self):
         """0x0412「新地图加载完了」-> 回 0x0418，客户端才从加载画面里出来。
@@ -2890,15 +3231,34 @@ class Conn:
         标志位要是在进循环前就被置 1，客户端会直接跳过整段加载等待，
         而后台加载线程还在跑 —— 这正是 D035「一次只推一个 stage、
         且必须等客户端报到」要防的那类事故。
+
+        ## 多人（J.3）：**等所有人都把新图加载完才放行**
+
+        和开局链的 `0x0403` 完全同一个套路（`RoomStartGame.on_loaded`）：
+        每个客户端加载完之后每 5 秒轮询一发，收齐了才一起放行。
+        先放行快的那一个人的话，他已经在新图里跑了，慢的还在加载画面 ——
+        中间这段时间两边的世界是错开的。
+
+        谁没加载完就先晾着它继续轮询；**它自己那一发轮询也不回**，
+        所以不会出现「放行了一半」的状态。
         """
-        if not self.map_change_pending:
+        quest = self.quest_state()
+        if quest.pending_map is None:
             # 没有换图在飞时收到它，说明我们对触发条件的理解有偏差。照样放行
             # （这个包只是置一个在换图期间才有意义的标志），但把它记下来。
             self.log("   收到 0x0412 但本地没有记录在飞的换图；仍然放行")
-        self.map_change_pending = False
+            self.send(build_game(OP_MAP_CHANGE_READY))
+            return
+        members = self.battle_members()
+        if not quest.map_done(self, members):
+            still = quest.waiting_for_map(members)
+            self.log(f"   新图加载完了；还在等 {len(still)} 人，先不放行 0x0418")
+            return
+        quest.finish_map_change()
         self.log("← 回 0x0418（空包）—— 置 [LobbyStage+0x3fa]=1，"
                  "客户端退出换图加载循环")
-        self.send(build_game(OP_MAP_CHANGE_READY))
+        self.battle_broadcast(build_game(OP_MAP_CHANGE_READY),
+                              reason="：换图放行")
 
     def on_create_item(self, payload):
         """0x0406 `gcpCreateItem`「在这里生成一个掉落物」-> 回 0x0404，它才落地。
@@ -2910,6 +3270,17 @@ class Conn:
 
         修法同 D046：**原样回显 + 补一个服务端分配的实例句柄**。
         服务端手上没有、也不需要有任何物件数据。
+
+        ## 多人（J.3）：广播 + **房间级**句柄分配
+
+        - **句柄必须由房间分配**：它进客户端 `World` 的 map 当 key
+          （`0x473e7c`）。每条连接各自从 `ITEM_HANDLE_BASE` 数的话，
+          A 的第 1 件和 B 的第 1 件同号，后到的会**覆盖**先到的。
+        - **广播出去**：不广播的话这件东西只在掉它的那个人屏幕上存在，
+          别人走过去什么都没有 —— 而拾取 `0x0405` 又是按句柄找物件的。
+        - 客户端**只在事件属于自己时才发这个包**（`0x508cbb` 和 `0x4faa94`
+          两个掉落点都有 `[char+0x2ac] == 我的座位` 这条判据，§161），
+          所以不需要去重。
         """
         try:
             fields = parse_create_item(payload)
@@ -2919,8 +3290,7 @@ class Conn:
         item_id, x, y = fields[0], fields[1], fields[2]
         # 掉落点在角色/怪物脚下，拿来当 respawn 的兜底坐标是合适的。
         self.last_position = (x, y)
-        handle = self.next_item_handle
-        self.next_item_handle += 1
+        handle = self.quest_state().allocate_item()
         self.items_created += 1
         name = ITEM_NAMES.get(item_id, "未知物件")
         self.vlog(f"   掉落请求: {item_id} {name} @ ({x:.0f}, {y:.0f}) "
@@ -2929,7 +3299,8 @@ class Conn:
             self.log(f"← 回 gspCreatedItem(0x0404) 句柄=0x{handle:08x} "
                      f"物件={item_id} {name} @ ({x:.0f}, {y:.0f})"
                      + ("" if VERBOSE else "（本局第一件，后续同类静音）"))
-        self.send(build_game(OP_CREATED_ITEM, build_created_item(handle, fields)))
+        self.battle_broadcast(
+            build_game(OP_CREATED_ITEM, build_created_item(handle, fields)))
 
     def on_get_item(self, payload):
         """0x0407 `gcpGetItem`「我踩到这件了」-> 回 0x0405，客户端才真的捡起来。
@@ -2942,20 +3313,39 @@ class Conn:
         发完包就把 `[item+0x2a8]` 置 1，**同一件东西一局只报一次**。
         所以服务端漏回不是「这次没捡到，再走一遍」，而是那件东西作废了。
 
-        修法同 D046：**原样回显**。服务端不查距离、不判归属、不算效果 ——
+        修法同 D046：**原样回显**。服务端不查距离、不算效果 ——
         碰撞是客户端算的，物品效果也是客户端算的（§113 已经确认拾取不再发包）。
+
+        ## 多人（J.3）：★ **一件东西只能被一个人捡到，这一条必须服务端仲裁**
+
+        两个人几乎同时踩到同一件东西时，两台机器**各自**都会判「我碰到了」
+        并发 `0x0407`。谁的包先到我们这儿谁拿走，晚到的那一发
+        **什么包都不回** —— 那件东西对他就是没捡到（客户端已经把
+        `[item+0x2a8]` 置 1，本来也不会再问第二次）。
+
+        放行则**广播给全房间**：读侧 `0x551d35` 用
+        座位 -> 角色（`0x404ff6`）+ 句柄 -> 物件（`World::Find`）两把钥匙，
+        两个都查得到才调 `item->vft[0xd4](角色)`，所以别人机器上会看到
+        「东西没了、是那个人拿走的」。不广播的话东西只在捡的人那边消失。
         """
         try:
             seat_id, handle = parse_get_item(payload)
         except (ValueError, struct.error) as error:
             self.log(f"   0x0407 gcpGetItem 解析失败: {error}；不回拾取放行")
             return
+        quest = self.quest_state()
+        if not quest.claim_item(handle, seat_id):
+            winner = quest.items_taken.get(handle & 0xFFFFFFFF)
+            self.log(f"   拾取被拒: 句柄=0x{handle & 0xffffffff:08x} "
+                     f"已经被座位 {winner} 捡走了；座位 {seat_id} 这一发不回包")
+            return
         self.items_picked += 1
         if self.items_picked == 1 or VERBOSE:
             self.log(f"← 回拾取放行(0x0405) 座位={seat_id} "
                      f"句柄=0x{handle & 0xffffffff:08x}"
                      + ("" if VERBOSE else "（本局第一件，后续静音）"))
-        self.send(build_game(OP_PICKED_ITEM, build_picked_item(seat_id, handle)))
+        self.battle_broadcast(
+            build_game(OP_PICKED_ITEM, build_picked_item(seat_id, handle)))
 
     def on_mark_quest_success(self, payload):
         """0x0417 `gcpMarkQuestSuccess`「这一关我打通了」—— 只记，不回。
@@ -2970,15 +3360,41 @@ class Conn:
 
         ★ 服务端方向的同号包是 `gspRepChangeToNextMap`（换图放行），
         **绝对不能回显**，否则会在关卡结束时触发一次换图（D028）。
+
+        ## 多人（J.3）：**记在房间上，谁报到都算**
+
+        合作模式的关底是大家一起打的，关卡脚本在每台机器上都会喊
+        `vf_e4(1)`，但 `[ctx+0x558]` 只保证「一台机器一局只发一次」。
+        通关是全房间的事，所以只要有一个人报了 1，这一局就算通关 ——
+        `RoomQuest.mark_success` 只会从 False 变 True，不会被后到的 0 冲掉。
         """
         try:
-            self.quest_success = bool(Reader(payload).i32())
+            cleared = bool(Reader(payload).i32())
         except ValueError:
             # 载荷形状不对时保守当作没通关，别把「未完成」误报成「完成」。
             self.log("   0x0417 载荷解析失败；本局按未通关处理")
             return
-        self.log(f"   客户端报 gcpMarkQuestSuccess({self.quest_success}) —— "
-                 f"结算界面的「完成 / 未完成」标签认这个")
+        self.quest_success = self.quest_state().mark_success(cleared)
+        self.log(f"   客户端报 gcpMarkQuestSuccess({cleared}) —— "
+                 f"结算界面的「完成 / 未完成」标签认这个"
+                 f"（本局通关标志 = {self.quest_success}）")
+
+    def settlement_seats(self):
+        """`{座位号: 连接}` —— 本局要结算的每一个人。
+
+        不在大厅房间里（协议试探 / 控制通道）时就只有自己那一个座位，
+        于是整条结算路径退化成 V0.1 的单人版本，一个字节都不差。
+        """
+        room = self.lobby_room()
+        if room is None:
+            return {self.my_seat: self}
+        found = {}
+        for index, seat in enumerate(room.seats):
+            if seat is not None and seat.conn is not None:
+                found[index] = seat.conn
+        # 大厅表里没有我（不该发生，但控制通道能造出来）时也别把自己漏掉。
+        found.setdefault(self.my_seat, self)
+        return found
 
     def send_end_game(self, success=None):
         """结算这一局：把所得记进存档，再把新的经验/金币下发（0x0411）。
@@ -2994,53 +3410,109 @@ class Conn:
         写进 GameContext 供结算界面显示，后者结束关卡并更新数据栏。顺序反了
         或者漏掉前者，结算界面就构造得出来却不显示。
 
-        `success` 默认取本局的 `quest_success`（客户端 `0x0417` 报的），
-        它同时决定 `0x0309` 尾部数组里自己那一格填不填 1 ——
-        **结算界面的「完成 / 未完成」只认那一格**（§112）。
+        `success` 显式传入时会**盖住**本局的通关标志（控制通道的
+        `endgame 1/0` 用），不传就用 `0x0417 gcpMarkQuestSuccess` 报上来的。
+
+        ## 多人（J.3）：每座位一份 `0x0309`，每人一份自己的 `0x0411`
+
+        - **结算只做一次**：房里每个人的客户端都会发一发 `0x040f gcpEndQuest`，
+          第一发触发结算，之后的直接忽略（`RoomQuest.settled`）。
+          不挡的话六个人打完一局要入账六次。
+        - **`0x0309` 每个在座座位各发一份给每一个人**：处理器 `0x55210d`
+          全程按 `pkt+0x04` 的座位号索引（`[ctx+座位*4+0x2c/0x44/0x5c]` 三行数值、
+          `[ctx+0x184]` 名次表），六份下去结算界面上每个人那一行才有数。
+          只发自己那一份的话，队友那几行全是 0。
+        - **`0x0411` 每人只发自己那一份**：处理器 `0x551804` 在
+          `0x5518b4` 处 `cmp 包里的座位, 我的座位`，只有相等时才把
+          经验/金币写进右上角数据栏的四个全局。多发几份不会串账，
+          但每一份都会让客户端再回一发 `0x0505` 遥测（`0x4087f0`），
+          没有 RE 依据说重复调它是安全的 —— 所以按「一人一份」发。
+          ⚠ 代价：队友那一行的「分数 / 生命」（来自
+          `[ctx+0x3ec+座位*0x34]`，只有 `0x0411` 会写）会是 0。
+          等两台真机验完再决定要不要补发，见 PROGRESS 的 ⏳ 区。
         """
-        if success is None:
-            success = self.quest_success
-        if success:
-            # 通关了才解锁下一个难度。放在奖励入账之前，两者互不依赖，
-            # 但这样日志里「解锁」那行紧挨着「完成」标签，好对时序。
-            self.record_quest_clear()
-        score = max(0, int(self.quest_score))
-        if self.account_name:
+        quest = self.quest_state()
+        if quest.settled:
+            self.log("   本局已经结算过了；忽略（房里每个人都会发一发 0x040f）")
+            return
+        quest.settled = True
+        if success is not None:
+            quest.success = bool(success)
+        cleared = quest.success
+        seats = self.settlement_seats()
+        quest_mode = self.quest_mode()
+        scores = {seat: max(0, int(conn.quest_score))
+                  for seat, conn in seats.items()}
+        # 尾部数组 = 每座位的「完成 / 输赢」。闯关是合作（通关了大家一起 1），
+        # 对战按本局分数排名（§161，见 `RoomQuest.ranking`）。
+        tail = quest.ranking(scores, quest_mode)
+        if not quest_mode:
+            self.log(f"   对战胜负: 分数 {scores} -> 尾部数组 {tail}"
+                     f"（1=胜 / -1=负 / 0=不判）")
+
+        # ---- ① 每个人先入账，并把「他那一份 0x0309 / 0x0411」备好 --------
+        results = {}     # 座位 -> 0x0309 的载荷
+        end_games = {}   # 座位 -> (0x0411 的载荷, 日志用的数)
+        for seat, conn in sorted(seats.items()):
+            score = scores[seat]
+            # `0x0411` 的 success 跟着尾部数组走，两个包才不会自相矛盾。
+            seat_cleared = (tail[seat] == GAME_RESULT_CLEARED
+                            if 0 <= seat < GAME_RESULT_TAIL_COUNT else cleared)
+            if quest_mode and cleared:
+                # 通关了才解锁下一个难度。★ 每个人的存档各解各的。
+                conn.record_quest_clear()
+            if conn.account_name:
+                try:
+                    conn.account = conn.accounts.add_quest_reward(
+                        conn.account_name, experience=score, money=score)
+                except KeyError:
+                    conn.log(f"   存档里没有账号 {conn.account_name!r}；奖励未入账")
+            experience = int((conn.account or {}).get("experience", 0))
+            level_start_exp, next_level_exp = experience_bounds(experience)
+            #   · 业务值 9/10/11 = 界面上「经验值 / 金币 / 竞技场分数」三行的 +N
+            #     （§116）。闯关模式没有天梯分，第三格发 0。其余 9 个仍按 D019 填 0
+            #     —— §100 那次「12 个值一次全填」会让客户端 20 毫秒内断链。
+            results[seat] = build_rep_game_result(
+                seat,
+                values=build_game_result_values(experience=score, money=score),
+                tail=tail)
+            end_games[seat] = (
+                build_end_game(seat, seat_cleared, build_end_game_values(
+                    experience=experience,
+                    next_level_exp=next_level_exp,
+                    level_start_exp=level_start_exp,
+                    money_gained=score,
+                    score=score,
+                )),
+                (score, experience, level_start_exp, next_level_exp),
+            )
+            conn.log(f"   结算 座位{seat}: 分数={score} "
+                     f"{'完成/胜' if seat_cleared else '未完成'} "
+                     f"-> 总经验={experience} (本级 {level_start_exp}..{next_level_exp}) "
+                     f"本局金币={score}")
+
+        # ---- ② 再逐个连接下发 --------------------------------------------
+        # ★ 不合并成一次 sendall：V0.1 单人时这两个包就是分开发的，实机验过
+        #   （§99）。合并只在「包会触发 ChangeStage 且客户端要在同一帧内看到
+        #   后续包」时才是必须的（§120），结算这两个包不属于那一类。
+        for seat, conn in sorted(seats.items()):
             try:
-                self.account = self.accounts.add_quest_reward(
-                    self.account_name, experience=score, money=score)
-            except KeyError:
-                self.log(f"   存档里没有账号 {self.account_name!r}；奖励未入账")
-        experience = int((self.account or {}).get("experience", 0))
-        level_start_exp, next_level_exp = experience_bounds(experience)
-        values = build_end_game_values(
-            experience=experience,
-            next_level_exp=next_level_exp,
-            level_start_exp=level_start_exp,
-            money_gained=score,
-            score=score,
-        )
-        # 结算界面的数据源，必须排在 0x0411 之前，且只能在 GameContext 还活着
-        # 的时候发（§99）。
-        #   · 业务值 9/10/11 = 界面上「经验值 / 金币 / 竞技场分数」三行的 +N
-        #     （§116）。闯关模式没有天梯分，第三格发 0。其余 9 个仍按 D019 填 0
-        #     —— §100 那次「12 个值一次全填」会让客户端 20 毫秒内断链。
-        #   · 尾部数组自己那一格 = 1 才写「完成」（§112）。
-        result_values = build_game_result_values(experience=score, money=score)
-        tail = build_game_result_tail(self.my_seat, success)
-        self.log(f"← 回 gspRepGameResult(seat={self.my_seat}, "
-                 f"{'完成' if success else '未完成'}) —— 结算界面数据源"
-                 f"（经验值 +{score} / 金币 +{score} / 竞技场分数 +0）")
-        self.send(build_game(OP_REP_GAME_RESULT,
-                             build_rep_game_result(self.my_seat,
-                                                   values=result_values,
-                                                   tail=tail)))
-        self.log(f"← 回 gspEndGame(seat={self.my_seat}, success={success}, "
-                 f"本局分数={score} -> 总经验={experience} "
-                 f"(本级 {level_start_exp}..{next_level_exp}) 本局金币={score})")
-        self.send(build_game(OP_END_GAME,
-                             build_end_game(self.my_seat, success, values)))
-        self.settled = True
+                # 结算界面的数据源，必须排在 0x0411 之前，且只能在 GameContext
+                # 还活着的时候发（§99）。每个在座座位一份。
+                for other_seat in sorted(results):
+                    conn.send(build_game(OP_REP_GAME_RESULT,
+                                         results[other_seat]))
+                payload, _ = end_games[seat]
+                conn.send(build_game(OP_END_GAME, payload))
+            except OSError as error:
+                conn.log(f"   结算下发失败（{error!r}），忽略")
+                continue
+            conn.settled = True
+            conn.quest_success = cleared
+        self.log(f"← 已结算本局：{len(seats)} 个座位各一份 gspRepGameResult(0x0309)"
+                 f" + 每人自己那份 gspEndGame(0x0411)"
+                 f"（{'闯关' if quest_mode else '对战'}，"
+                 f"{'通关' if cleared else '未通关'}）")
 
     # -- 里程碑 I：大厅联机 ---------------------------------------------------
     def on_list_session(self, payload):
@@ -3196,7 +3668,10 @@ class Conn:
         self.sync_peer_relay(room, reason="（有人进房）")
         # 有新人进来，上一轮的开局握手作废（不清的话新人不在 `loaded` 里，
         # 房主再按开始时会等一个从没收到过 0x0400 的人）。
+        # 上一局的战斗状态一并作废：新人进得来说明房间是待机中的，
+        # 那一局早结束了，留着只会让下一局带上旧的掉落物句柄和 `settled`。
         room.battle = None
+        room.quest = None
 
     def register_room(self):
         """把刚建好的房间登记进大厅（`0x0201` 解析成功之后立刻调）。
@@ -3250,6 +3725,22 @@ class Conn:
         packets = " ".join(f"0x{op:04x}" for op, _ in replies)
         self.log(f"← 广播开局握手 {packets} 给房里 "
                  f"{len(room.members(exclude=None))} 人（{why}）")
+        # 真进了关卡（所有人都加载完、一起进 stage 7）才把房间标成「游戏中」：
+        # 大厅列表跟着变，`Lobby.join` 也会用 MOVE_INTO_ALREADY_PLAYING
+        # 把半路想进来的人挡在外面 —— 关卡是开局那一刻按座位表加载的，
+        # 中途多一个人进来两边就对不上。
+        #
+        # ★ 挡人的时机是 IN_GAME，**不是倒计时刚开始**：还在倒计时/加载的
+        #   阶段进来一个人，走的是「新人进房 -> 上一轮握手作废」那条路
+        #   （`finish_join` 会把 `room.battle` 清掉重来），那是对的，
+        #   提前挡住反而把这条路废了。
+        if (room.battle.state == StartGameHandshake.IN_GAME
+                and room.status != SESSION_STATUS_PLAYING):
+            LOBBY.update_room(room, status=SESSION_STATUS_PLAYING)
+            # 这一局的战斗状态重新起一份（上一局的掉落物句柄/死亡表全作废）。
+            room.quest = RoomQuest()
+            self.log(f"   房间 #{room.room_id} -> 游戏中"
+                     f"（大厅列表和「加入房间」都会跟着挡人）")
 
     def on_start_game_packet(self, opcode, payload):
         """`0x0400` / `0x0402` / `0x0403` —— 开局链（多人，J.3）。
@@ -3560,12 +4051,24 @@ class Conn:
         self.sync_peer_relay(room, reason="（有人离开房间）")
         # ★ 走的人可能正是「还没加载完」的那一个 —— 不重新算一次的话，
         #   剩下的人会永远卡在加载界面等一个已经不在房里的人。
+        members = room.members(exclude=None)
         if room.battle is not None:
-            members = room.members(exclude=None)
             replies = room.battle.on_loaded(None, members) if members else []
             if replies:
                 self.log("   开局握手: 等的人走了，剩下的已经全加载完 -> 放行")
                 self.broadcast_start_game(room, replies, "等的人走了，放行")
+        # 同一个道理，换图也别等一个已经走了的人（`0x0412` 那条链）。
+        quest = room.quest
+        if (quest is not None and members and quest.pending_map is not None
+                and quest.map_done(None, members)):
+            quest.finish_map_change()
+            self.log("   换图: 等的人走了，剩下的已经全加载完 -> 放行 0x0418")
+            packet = build_game(OP_MAP_CHANGE_READY)
+            for other in members:
+                try:
+                    other.send(packet)
+                except OSError as error:
+                    other.log(f"   0x0418 发送失败（{error!r}），忽略")
 
     def leave_room(self, system_text=""):
         """把自己从大厅房间里摘掉并广播。退房 / 断线 / 被顶号共用。"""
@@ -3631,8 +4134,35 @@ class Conn:
             self.send_rep_money(reason="（回房间后金币会被清 0，重新同步）")
             self.send_slot_equipped_list(reason="（回房间后清单会被重建，重新同步）")
         # 回到房间就可以再开一局，把开局状态机和本局的关卡状态复位。
+        self.reset_room_for_next_round()
         self.reset_quest_state()
         self.start_game.reset()
+
+    def reset_room_for_next_round(self):
+        """结算看完回到房间：把**房间**复位，好让房主能再开一局。
+
+        ★ 三件事缺一不可：
+
+        1. `room.status` 回「待机中」—— 不回的话大厅列表永远写「游戏中」，
+           而且 `Lobby.join` 会一直用「此房间已开始游戏。」把新人挡在门外。
+        2. `room.battle.reset()` —— 开局握手的状态机停在 `IN_GAME`，
+           房主再按一次 F5 发来的 `0x0402` 会被 `StartGameHandshake`
+           当成「已经在游戏里了」直接丢掉，**第二局根本开不起来**。
+        3. `room.quest = None` —— 上一局的掉落物句柄、拾取表、死亡去重表、
+           `settled` 标志全部作废。
+
+        幂等：房里每个人看完结算都会走这一条，谁先到谁做，后面的再做一遍
+        也是同样的结果。
+        """
+        room = self.lobby_room()
+        if room is None:
+            return
+        if room.status != SESSION_STATUS_WAITING:
+            LOBBY.update_room(room, status=SESSION_STATUS_WAITING)
+            self.log(f"   房间 #{room.room_id} -> 待机中（本局结束，可以再开一局）")
+        if room.battle is not None:
+            room.battle.reset()
+        room.quest = None
 
     def reset_quest_state(self):
         """把「跟这一局关卡绑定」的状态全部清掉，准备下一局。
@@ -3640,12 +4170,15 @@ class Conn:
         ★ `quest_success` 一定要清：不清的话打通一次之后，后面每一局
         （哪怕是被时间耗光的）结算界面都会挂着「完成」。
         `items_created` / `items_picked` 只影响日志的「本局第一件」判断。
+
+        ★ 房间级那一份（掉落物句柄 / 拾取表 / 换图等谁）由
+        `reset_room_for_next_round()` 负责；这里只清连接自己的，外加
+        「不在房间里时」用的那份 `solo_quest`。
         """
         self.settled = False
         self.quest_success = False
         self.quest_score = 0
-        self.maps_entered = []
-        self.map_change_pending = False
+        self.solo_quest = RoomQuest()
         self.items_created = 0
         self.items_picked = 0
 
@@ -3850,14 +4383,20 @@ class Conn:
             # 客户端每次加分都发一次，载荷是**累计**分数（客户端侧 0x4a414a
             # 先加到 [ctx+0x3b4] 再发，500ms 节流）。记下来给结算用，
             # 并回一发 0x0415 —— 右上角战绩面板的「分数」列只认那个包（§109）。
+            #
+            # ★ 多人：**广播给全房间**。处理器 `0x4a3efe` 写的是
+            #   `[GameContextQuest + 座位*4 + 0x3b8]`，按座位索引，所以别人
+            #   机器上就是「那个座位的分数变了」。不广播的话战绩面板上
+            #   队友那一行永远是 0，对战模式更是压根看不到对手的分。
             try:
                 self.quest_score = Reader(payload).i32()
             except ValueError:
                 pass
             else:
-                self.send(build_game(OP_REP_QUEST_SCORE,
-                                     build_rep_quest_score(self.my_seat,
-                                                           self.quest_score)))
+                self.battle_broadcast(
+                    build_game(OP_REP_QUEST_SCORE,
+                               build_rep_quest_score(self.my_seat,
+                                                     self.quest_score)))
         elif opcode in (OP_PREPARE_GAME, OP_COUNT_GAME_READY, OP_LOADING_DONE):
             self.on_start_game_packet(opcode, payload)
 
@@ -4232,15 +4771,16 @@ def _dispatch_control_command(line):
             return "err 用法: nextmap <地图名>"
         map_name = words[1]
         conn.log(f"[ctl] ← 手动发 gspRepChangeToNextMap(0x0417) 地图={map_name!r}")
-        conn.map_change_pending = True
-        conn.maps_entered.append(map_name)
+        # ★ 走和真客户端同一份房间级状态（`RoomQuest`），不然手动推的换图
+        #   和 `0x0412` 那条等人链会各说各话。
+        conn.quest_state().begin_map_change(map_name)
         conn.send(build_game(OP_REP_CHANGE_TO_NEXT_MAP,
                              build_rep_change_to_next_map(map_name)))
         return f"ok 已发 0x0417 地图={map_name}"
 
     if cmd == "map-ready":
         conn.log("[ctl] ← 手动发 0x0418（放行换图加载循环）")
-        conn.map_change_pending = False
+        conn.quest_state().finish_map_change()
         conn.send(build_game(OP_MAP_CHANGE_READY))
         return "ok 已发 0x0418"
 
@@ -4257,8 +4797,7 @@ def _dispatch_control_command(line):
         # 后三个字段照客户端自己发的填（3 / -1 / -1）：3 不是「宠物掉落」，
         # -1 不是任何座位，正好让处理器跳过那段音效/特效分支。
         fields = (item_id, x, y, vx, vy, 3, -1, -1)
-        handle = conn.next_item_handle
-        conn.next_item_handle += 1
+        handle = conn.quest_state().allocate_item()
         name = ITEM_NAMES.get(item_id, "未知物件")
         conn.log(f"[ctl] ← 手动发 gspCreatedItem(0x0404) 句柄=0x{handle:08x} "
                  f"物件={item_id} {name} @ ({x:.0f}, {y:.0f})")
