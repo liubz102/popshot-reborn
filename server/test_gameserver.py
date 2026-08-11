@@ -9,6 +9,7 @@ from gameserver import (
     ROOM_SEAT_COUNT,
     SEAT_ACTION_CHANGE_CHARACTER,
     SEAT_ACTION_JOIN,
+    SEAT_ACTION_LEAVE,
     SESSION_STATUS_WAITING,
     OP_SESSION_MEMBER_UPDATE,
     parse_seat_change_request,
@@ -501,9 +502,19 @@ class GameServerPacketTests(unittest.TestCase):
         self.assertEqual(("game", OP_SESSION_MEMBER_UPDATE, payload, len(frame)),
                          take_frame(frame))
 
-    def test_session_member_update_rejects_destructive_actions(self):
-        # action 1/2 会走 0x405f8f 销毁座位的角色对象，服务端绝不能发。
-        for action in (1, 2):
+    def test_leave_action_is_the_one_that_destroys_the_seat_model(self):
+        # action 1/2 走 0x406676 -> 0x405f8f 销毁座位的角色对象 ——
+        # 有人离开/被踢时**正需要**它，否则模型留在房间里（§147）。
+        self.assertIn(SEAT_ACTION_LEAVE, (1, 2))
+        payload = build_session_member_update(1, SEAT_ACTION_LEAVE,
+                                              occupied=False)
+        self.assertEqual(bytes([SEAT_ACTION_LEAVE]) + struct.pack("<i", 1),
+                         payload[:5])
+        self.assertEqual(build_session_slot(occupied=False), payload[5:])
+
+    def test_session_member_update_rejects_unknown_actions(self):
+        # 跳表 0x4064f7 只认 0~4，别的码客户端直接丢包 —— 发了等于没发。
+        for action in (5, 9, 255):
             with self.subTest(action=action):
                 with self.assertRaises(ValueError):
                     build_session_member_update(0, action)

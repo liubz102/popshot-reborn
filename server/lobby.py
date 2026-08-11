@@ -98,6 +98,10 @@ class Room:
         #: V0.1 §75），房主走人之后转给还在的最小座位号。
         self.host_seat = 0
         self.host_conn = host_conn
+        #: 本房间的开局/战斗状态（`gameserver.RoomStartGame`）。
+        #: ★ `lobby.py` **只管模型不碰协议**，所以这里只留一个空槽，
+        #: 建和用都在 `gameserver.py` 里 —— 这样 `lobby.py` 仍然能单独测。
+        self.battle = None
 
     # -- 查询 ---------------------------------------------------------------
     @property

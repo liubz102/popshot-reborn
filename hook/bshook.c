@@ -329,9 +329,15 @@ static unsigned g_server_reg_port     = 27810;
 static unsigned g_local_reg_port      = 27810;
 static unsigned g_relay_auth_port     = 47621;
 static unsigned g_relay_game_port     = 27809;
+static unsigned g_relay_peer_port     = 27808;
 /* 客户端写死的两个端口（V0.1 §24 / §40），只作为「要不要映射」的判据。 */
 static unsigned g_auth_port           = 47611;
 static unsigned g_game_port           = 27799;
+/* 原版 TCP 中继的端口（里程碑 J.3 / D078 / D079）。
+   前两个是客户端写死的，这个不是 —— 客户端连哪儿完全由服务端在
+   `0x0210 gspJoinRelay` 里给的地址说了算，我们让服务端固定填
+   `127.0.0.1:27798`，再在这里按模式把它映射出去，和上面两个一个套路。 */
+static unsigned g_peer_relay_port     = 27798;
 
 static HWND         g_login_dlg   = NULL;
 static int          g_dlg_styled  = 0;      /* 文案 / 尺寸只改一次 */
@@ -373,10 +379,12 @@ static void read_online_config(void)
     g_local_reg_port  = env_uint("POPSHOT_LOCAL_REG_PORT",  g_local_reg_port);
     g_relay_auth_port = env_uint("POPSHOT_RELAY_AUTH_PORT", g_relay_auth_port);
     g_relay_game_port = env_uint("POPSHOT_RELAY_GAME_PORT", g_relay_game_port);
-    bslog("CFG     联机服务器=%s 注册页端口 远端=%u 本机=%u；中继端口 %u/%u",
+    g_relay_peer_port = env_uint("POPSHOT_RELAY_PEER_PORT", g_relay_peer_port);
+    g_peer_relay_port = env_uint("POPSHOT_PEER_RELAY_PORT", g_peer_relay_port);
+    bslog("CFG     联机服务器=%s 注册页端口 远端=%u 本机=%u；中继端口 %u/%u/%u",
           w2u8(g_server_addr, u8, sizeof(u8)),
           g_server_reg_port, g_local_reg_port,
-          g_relay_auth_port, g_relay_game_port);
+          g_relay_auth_port, g_relay_game_port, g_relay_peer_port);
 }
 
 /* 当前该显示 / 打开哪台服务器：单机固定 localhost，联机用配置里的地址。 */
@@ -411,6 +419,12 @@ unsigned popshot_map_port(unsigned port)
     if (!popshot_online_mode()) return port;
     if (port == g_auth_port) return g_relay_auth_port;
     if (port == g_game_port) return g_relay_game_port;
+    /* 原版 TCP 中继（D078 / D079）。前两条是客户端写死的端口，这一条不是：
+       连哪儿由服务端在 `0x0210` 里说，我们让它固定说 `127.0.0.1:27798`，
+       单机时那就是本机服务端的中继口、联机时在这里换成本机中继的 27808。
+       ★ 单机走的是「不映射」那条路，所以这行只在联机模式下生效，
+         和上面两条完全同构。 */
+    if (port == g_peer_relay_port) return g_relay_peer_port;
     return port;
 }
 

@@ -76,6 +76,14 @@ def build_arg_parser():
     ap.add_argument("--no-web", action="store_true", help="不启动注册页")
     ap.add_argument("--no-control", action="store_true",
                     help="不启动调试控制通道（部署到公网服务器时建议加）")
+    ap.add_argument("--no-tcp-relay", action="store_true",
+                    help="不启动原版 TCP 中继，也不回 0x0210。"
+                         "客户端会自动退回 0x040e 那条（同样是原版的）"
+                         "回退路径 —— 中继出问题时的应急开关（D078 / FINDINGS §158）")
+    ap.add_argument("--relay-port", type=int,
+                    default=server_config.PEER_RELAY_PORT,
+                    help=f"原版 TCP 中继的端口（默认 {server_config.PEER_RELAY_PORT}）。"
+                         "改了的话客户端包里 bshook 的映射表也要跟着改")
     ap.add_argument("--control-port", type=int,
                     default=server_config.CONTROL_PORT,
                     help="调试控制通道端口，只绑 127.0.0.1")
@@ -183,6 +191,18 @@ def main(argv=None):
                    "accounts": accounts, "tickets": tickets,
                    "host": args.host})
     log(f"游戏服   {describe_listen(args.host, args.game_port)}")
+
+    # 原版 TCP 中继（D078）。它和游戏服是同一个进程里的两个监听器 ——
+    # 中继要按「谁和谁同房间」投递，那份状态就在 `gameserver.LOBBY` 里。
+    gameserver.TCP_RELAY_ENABLED = not args.no_tcp_relay
+    if args.no_tcp_relay:
+        log("中继服   已关闭（--no-tcp-relay）；玩家间同步走 0x040e 回退路径")
+    else:
+        gameserver.PEER_RELAY.port = args.relay_port
+        _start("relay", gameserver.PEER_RELAY.serve,
+               kwargs={"host": args.host})
+        log(f"中继服   {describe_listen(args.host, args.relay_port)}"
+            f" —— 原版 rcp 协议，战斗内同步走它")
 
     if not args.no_web:
         # 延迟 import：注册页是纯标准库的，但没必要在 --no-web 时也加载。

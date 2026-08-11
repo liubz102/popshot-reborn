@@ -8,8 +8,8 @@ relay.py —— 本机 TCP 中继，只出现在**客户端包**里。
 
 ```text
 BigShot.exe --(IPv4)--> 127.0.0.1:47621 ┐                    ┌─> <server_address>:47611
-                                        ├── server/relay.py ─┤
-BigShot.exe --(IPv4)--> 127.0.0.1:27809 ┘   getaddrinfo 解析  └─> <server_address>:27799
+BigShot.exe --(IPv4)--> 127.0.0.1:27809 ┼── server/relay.py ─┼─> <server_address>:27799
+BigShot.exe --(IPv4)--> 127.0.0.1:27808 ┘   getaddrinfo 解析  └─> <server_address>:27798
 ```
 
 **为什么非有它不可**（决策 D065）：客户端是 2007 年的 32 位程序，
@@ -48,9 +48,15 @@ for _stream in (sys.stdout, sys.stderr):
 LISTEN_HOST = "127.0.0.1"
 
 #: 本地端口 -> 远端端口。见 `server/config.py` 的常量说明。
+#:
+#: 第三条是**原版 TCP 中继**（里程碑 J.3 / D078 / D079）。它和前两条唯一的
+#: 不同是「谁发起」：认证/游戏那两条是客户端自己去连写死的端口，中继这条是
+#: 服务端在 `0x0210 gspJoinRelay` 里告诉客户端「连 127.0.0.1:27798」，
+#: 再由 `bshook` 按单机 / 联机把 27798 映射成 27808 走到这里（§157）。
 PORT_MAP = (
     (server_config.RELAY_AUTH_PORT, server_config.AUTH_PORT, "认证"),
     (server_config.RELAY_GAME_PORT, server_config.GAME_PORT, "游戏"),
+    (server_config.RELAY_PEER_PORT, server_config.PEER_RELAY_PORT, "中继"),
 )
 
 #: 连远端的超时。原版客户端自己等 10 秒才弹「认证服务器失败」，
@@ -108,7 +114,13 @@ def handle(client, addr, target_host, target_port, label):
         # 连不上就把本地连接干脆关掉，让客户端弹它自己的「认证服务器失败」框。
         log(f"#{seq} ✗ {label}服连不上 {shown}:{target_port} —— {error}")
         log(f"      检查：server.config 里的地址对不对？对方防火墙开了 "
-            f"{server_config.AUTH_PORT} 和 {server_config.GAME_PORT} 吗？服务端起了吗？")
+            f"{server_config.AUTH_PORT} / {server_config.GAME_PORT} / "
+            f"{server_config.PEER_RELAY_PORT} 吗？服务端起了吗？")
+        if target_port == server_config.PEER_RELAY_PORT:
+            # 中继连不上不只是「这条没通」——客户端的 RelayConnection 一失败就
+            # 会把玩家踢出房间（FINDINGS §158）。让日志把话说明白。
+            log("      ⚠ 中继连不上会让客户端自己退出房间。"
+                "服务端加 --no-tcp-relay 可以先绕过（同步退回 0x040e 那条路）。")
         client.close()
         return
     log(f"#{seq} ✓ {label}服 {addr[0]}:{addr[1]} → {shown}:{target_port}")

@@ -44,6 +44,8 @@ $GamePort   = 27799     # 游戏服（客户端写死）
 $CtrlPort   = 27800     # 调试控制通道（只绑 127.0.0.1）
 $RelayAuth  = 47621     # 联机模式：客户端 -> 中继 -> 远端 47611
 $RelayGame  = 27809     # 联机模式：客户端 -> 中继 -> 远端 27799
+$PeerRelay  = 27798     # 原版 TCP 中继（服务端；地址由 0x0210 下发，D078/D079）
+$RelayPeer  = 27808     # 联机模式：客户端 -> 中继 -> 远端 27798
 $Mode       = if ($DebugLog) { 'debug' } else { 'normal' }
 
 function Say([string]$msg, [string]$color = 'Gray') {
@@ -213,7 +215,7 @@ if ($relayPid -and $lastTarget -eq $remote) {
     Say "[中继]   已在运行（pid=$relayPid，目标 $remoteUrlHost）" 'Green'
 } else {
     if ($relayPid) { Say "[中继]   目标从 '$lastTarget' 改成 '$remote' —— 重启它" 'Yellow' }
-    Stop-ListenerOn @($RelayAuth, $RelayGame)
+    Stop-ListenerOn @($RelayAuth, $RelayGame, $RelayPeer)
     $relayScript = Join-Path $Root 'server\relay.py'
     Start-Process -FilePath $Python -WorkingDirectory $Root `
         -ArgumentList @("`"$relayScript`"") `
@@ -223,11 +225,12 @@ if ($relayPid -and $lastTarget -eq $remote) {
     $ok = $false
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 250
-        if ((Get-ListenerPid $RelayAuth) -and (Get-ListenerPid $RelayGame)) { $ok = $true; break }
+        if ((Get-ListenerPid $RelayAuth) -and (Get-ListenerPid $RelayGame) -and
+            (Get-ListenerPid $RelayPeer)) { $ok = $true; break }
     }
     if ($ok) {
         Set-Content -Path $relayStamp -Value $remote -Encoding utf8
-        Say "[中继]   已启动（联机时经 127.0.0.1:$RelayAuth / $RelayGame 转发到 $remoteUrlHost）" 'Green'
+        Say "[中继]   已启动（联机时经 127.0.0.1:$RelayAuth / $RelayGame / $RelayPeer 转发到 $remoteUrlHost）" 'Green'
     } else {
         Say '!! 中继没起来，联机模式会连不上；单机游玩不受影响。看 logs\relay.err' 'Red'
         Get-Content (Join-Path $LogDir 'relay.err') -Tail 20 -ErrorAction SilentlyContinue
@@ -244,6 +247,8 @@ $env:POPSHOT_SERVER_REG_PORT   = $remoteReg
 $env:POPSHOT_LOCAL_REG_PORT    = $localReg
 $env:POPSHOT_RELAY_AUTH_PORT   = "$RelayAuth"
 $env:POPSHOT_RELAY_GAME_PORT   = "$RelayGame"
+$env:POPSHOT_RELAY_PEER_PORT   = "$RelayPeer"
+$env:POPSHOT_PEER_RELAY_PORT   = "$PeerRelay"
 
 # --- 5. 残留客户端 ----------------------------------------------------------
 # 互斥体 BigShot_Assa 决定了同时只能有一个实例，残留的会让新实例秒退，

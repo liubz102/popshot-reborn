@@ -69,6 +69,7 @@ from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
                    MOVE_INTO_BAD_PASSWORD, MOVE_INTO_FULL,
                    MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_OK)
 from netlisten import create_listener, describe as describe_listen
+import relayserver
 from tickets import TicketStore, short as short_ticket
 
 for _stream in (sys.stdout, sys.stderr):
@@ -173,7 +174,29 @@ OP_GET_ITEM = 0x0407
 OP_PICKED_ITEM = 0x0405
 OP_END_QUEST = 0x040f
 OP_UPDATE_QUEST_SCORE = 0x0410
+
+#: ★★★ 战斗内联机的三个包（FINDINGS §149 / §150 / §151）。
+#:
+#: 客户端把「玩家之间」的同步数据装在一个 `UdpPacket`（12 字节头）里，
+#: 有两条并行的通道送出去：
+#:   通道 B  UDP 直连对方上报的**内网 IP**（客户端自己开的，服务端管不着）
+#:   通道 A  `0x040e` 塞进**已有的游戏服连接**（`0x408619`）—— 我们用的就是这条
+#: 通道 A 有一个总开关 `[GameSession+0x3e4]`，默认 0、**每次退房都会被清回 0**，
+#: 由服务端发 `0x0410`（int32 1）打开。开关一开客户端立刻开始发 `0x040e`。
+#:
+#: ★ 这三个 opcode 的**客户端方向**另有含义（`0x040f gcpEndQuest`、
+#: `0x0410 gcpUpdateQuestScore`），gcp / gsp 是两套独立编号，别混。
+OP_PEER_DATA_UP = 0x040e        # 客户端 -> 服务端：包裹好的 UdpPacket
+OP_PEER_DATA_DOWN = 0x040f      # 服务端 -> 客户端：**原样**转给同房间的其他人
+OP_TOGGLE_PEER_RELAY = 0x0410   # 服务端 -> 客户端：gspToggleUdpClientCommunication
 OP_END_GAME = 0x0411
+
+#: 原版 TCP 中继那一路（里程碑 J.3 / D078 / §157）。
+#: `0x0310` 是客户端要中继，`0x0210` 是我们把「连哪儿 + 拿什么认人」告诉它，
+#: `0x0211` 是唯一安全的拆连接方式（走析构，不触发 `OnDisconnected`，§158）。
+OP_START_TCP_RELAY = 0x0310     # 客户端 -> 服务端：gcpStartTcpRelay（8 字节）
+OP_JOIN_RELAY = 0x0210          # 服务端 -> 客户端：gspJoinRelay（18 字节）
+OP_LEAVE_RELAY = 0x0211         # 服务端 -> 客户端：拆掉中继连接（载荷被无视）
 OP_MARK_QUEST_SUCCESS = 0x0417
 OP_RESPAWN_CHARACTER = 0x0419
 
@@ -266,6 +289,8 @@ GCP_NAMES = {
     # 拾取请求。RawPacket（8 字节 = 座位号 + 物件实例句柄），唯一发送点
     # 0x558e9a，只被 GameContext::SendGetItem(0x493a99) 调用（FINDINGS §115）。
     0x0407: "gcpGetItem",
+    # 玩家之间的同步数据，外面包一层送到游戏服（§149）。RawPacket，没有 gcp 类名。
+    0x040e: "rawPeerData",
     0x040f: "gcpEndQuest",
     0x0410: "gcpUpdateQuestScore",
     0x0411: "gcpReqChangeToNextMap",
@@ -1051,7 +1076,16 @@ def build_slot_equipped_list(seat_index, item_ids=(), slot_masks=(0, 0, 0)):
 #: `0x0301` 的 action 码 —— 客户端 `0x4064f7` 起按它分支，每个码的副作用差别很大。
 #: 0 是唯一会**建**座位角色对象的（`0x405e1c` + `0x406f42`）。
 SEAT_ACTION_JOIN = 0
-SEAT_ACTION_LEAVE = 3
+#: 有人离开 / 被踢：**必须发 1（或 2），不能发 3**。
+#: 只有 1/2 会走到 `0x406676 → 0x405f8f` —— 那是唯一会把座位的 3D 角色对象
+#: **销毁**并把 `[LobbyStage+0x1d0+i*4]` 清 0 的分支。3 走的是 `0x406628`
+#: （「把模型同步到座位数据」，只重建不销毁），发 3 的话玩家列表里的名字没了、
+#: 上面蓝天白云那块的模型却还杵着（§147，用户实机报的缺陷）。
+SEAT_ACTION_LEAVE = 1
+#: 3 = 「按座位数据重建模型」，不是「离开」。action 4（换角色）处理完消息之后
+#: 就是落到这条路上重建模型的。服务端目前没有单独发 3 的场景，留着是为了
+#: 让「3 不销毁模型」这条结论有个名字，别再有人望文生义地拿它当离开用。
+SEAT_ACTION_RESYNC = 3
 #: 换角色。客户端点房间右下角「人物选择」的头像时先把整个座位用
 #: **客户端方向的 `0x0301`** 报上来，然后**什么都不做地等**；只有服务端把这个
 #: action 广播回来，`0x406520` 才播「%s님이 %s 캐릭터로 선택되었습니다.」
@@ -1069,15 +1103,19 @@ def build_session_member_update(seat_index, action=SEAT_ACTION_JOIN, **seat):
         int32   座位号     客户端校验 0 <= n < 6，越界直接丢包
         SessionSlot        与 0x0300 里的每一项同格式，见 build_session_slot
 
-    action 分支（`0x4064f7` 起）：
+    action 分支（`0x4064f7` 起）。★ **所有分支都先把包里的 SessionSlot 反序列化
+    进座位**（`0x4064d6 → 0x556d9d`），action 只决定「模型怎么动」：
 
         0 → 0x406691  进房：清 IP/端口，**`0x405e1c` 建座位的角色对象**、
                       `0x406f42`、`0x4089fa`，最后 `0x405a74` 刷 UI
         1/2 → 0x406676 清 IP/端口 + `0x405f8f`（**销毁**角色对象并把
-                      `[LobbyStage+0x1d0+i*4]` 清 0）—— 服务端不要发
-        3 → 0x406628  离开/踢出
+                      `[LobbyStage+0x1d0+i*4]` 清 0）+ 刷 UI
+                      —— **离开 / 被踢走这条**，两个码在客户端里完全等价
+        3 → 0x406628  按座位数据**重建**模型（占用且模型在 → `0x405fba`
+                      对齐角色 id；不占用 → 什么都不做地返回）。
+                      ★ 它**不销毁**模型，拿它当「离开」用会留下鬼影（§147）
         4 → 0x406520  换角色：用 `seat+0x0c` 查角色名，播
-                      `'%s님이 %s 캐릭터로 선택되었습니다.'`
+                      `'%s님이 %s 캐릭터로 선택되었습니다.'`，然后落到 0x406628
 
     ★ action 0 会把 `seat[+0x14]`（对端 IP）和 `seat[+0x18]`（端口）清 0。
     `0x0300` 的处理器会把「我」的座位 IP 写成 `0x0100007f`，所以两个包同时发时
@@ -1085,10 +1123,11 @@ def build_session_member_update(seat_index, action=SEAT_ACTION_JOIN, **seat):
     """
     if not 0 <= seat_index < ROOM_SEAT_COUNT:
         raise ValueError(f"seat index {seat_index} is out of range")
-    if action in (1, 2):
+    if action not in (SEAT_ACTION_JOIN, SEAT_ACTION_LEAVE, 2,
+                      SEAT_ACTION_RESYNC, SEAT_ACTION_CHANGE_CHARACTER):
         raise ValueError(
-            f"seat action {action} destroys the seat's character object "
-            f"(0x405f8f); the fake backend must not send it")
+            f"seat action {action} is not one of the codes the client "
+            f"dispatches at 0x4064f7 (0/1/2/3/4); it would be dropped")
     return (struct.pack("<B", action & 0xFF)
             + w_i32(seat_index)
             + build_session_slot(**seat))
@@ -1935,6 +1974,62 @@ class StartGameHandshake:
         return []
 
 
+class RoomStartGame:
+    """**房间级**开局握手 —— 里程碑 J.3 的第一块（多人开局链）。
+
+    单人时的包序列和 V0.1 一模一样（下面的 `host` 就是原来那台状态机，
+    一个字节都没改），多人时多做两件事：
+
+    1. **房主的应答广播给全房间** —— `0x0401`（倒计时）和 `0x0400`（准备开局，
+       **同一个 seed**）如果只发给房主，别人根本不会去加载关卡；
+    2. **所有人都加载完才放行** —— `0x0403` 是每个客户端加载到 100% 之后
+       每 5 秒一发的轮询（V0.1 会话 09 实测）。收齐所有人的之后才发那一发
+       `0x0402` 把大家一起推进 stage 7。谁没加载完就先晾着它继续轮询。
+
+    ★ 只认**房主**发的 `0x0402`。非房主的 `0x0402` 一律忽略：
+      开局是房主的权力，认了就等于谁都能替房主开局。
+    """
+
+    def __init__(self, seed=0):
+        #: 房主那条状态机。**原样复用**，别在这里重写它的状态迁移。
+        self.host = StartGameHandshake(seed)
+        #: 已经报过 `0x0403`（关卡加载完）的连接。
+        self.loaded = set()
+
+    @property
+    def state(self):
+        return self.host.state
+
+    def reset(self):
+        self.host.reset()
+        self.loaded.clear()
+
+    def on_host_ready(self, opcode, payload):
+        """房主发来的 `0x0402` —— 返回要**广播给全房间**的包。"""
+        return self.host.on_client_packet(opcode, payload)
+
+    def on_loaded(self, conn, members):
+        """某条连接报了 `0x0403`。收齐了就返回要广播的放行包，否则空列表。
+
+        `conn=None` = 没有新的报告，只是**重新算一次**（有人退房时用）。
+
+        `members` 是**调用时**房间里的连接快照 —— 有人中途退房时靠它自动缩小
+        「要等谁」的集合，不然剩下的人会永远卡在加载界面。
+        """
+        if self.host.state != StartGameHandshake.PREPARING:
+            return []
+        if conn is not None:
+            self.loaded.add(conn)
+        waiting = [m for m in members if m not in self.loaded]
+        if waiting:
+            return []
+        return self.host.on_client_packet(OP_LOADING_DONE, b"")
+
+    def waiting_for(self, members):
+        """还在等谁加载完（只给日志用）。"""
+        return [m for m in members if m not in self.loaded]
+
+
 def build_rep_user_list():
     """opcode 0x020d —— 频道用户列表（空）
 
@@ -1954,6 +2049,14 @@ def build_rep_user_list():
 #: 排查协议问题时加 `--verbose` 就回到原来的全量行为。
 VERBOSE = False
 
+#: 回不回 `0x0210 gspJoinRelay`，也就是原版 TCP 中继那条路开不开（D078）。
+#: **默认开** —— 用户拍板要「原版的连接方式全部原样还原」。
+#:
+#: ★ 这就是 D078 写的那个反悔开关：中继一断，客户端会自己退出房间（§158），
+#:   真在实机上撞见这类坑，`app.py --no-tcp-relay` 一关，客户端立刻退回
+#:   `0x040e` 那条**同样是原版的**回退路径，其余一个字都不用改。
+TCP_RELAY_ENABLED = True
+
 #: 战斗中每秒多发、且语义早已查明的包。非 verbose 时只在**第一次**出现时记一行，
 #: 之后静音（完全不记会让「客户端到底还在不在发」这种判断失去依据）。
 NOISY_OPCODES = {
@@ -1966,6 +2069,9 @@ NOISY_OPCODES = {
               #   on_get_item() 会另打「本局第一件」
     0x0410,   # gcpUpdateQuestScore
     0x0104,   # gcpRepPing
+    0x040e,   # ★ 玩家间同步数据（§149）。开关一开就是 ~8 Hz，一局能有上万发。
+              #   静音的只是这行通用行；on_peer_data() 每个房间**第一发**会另打
+              #   一行带 hexdump 的，够看清 UdpPacket 的 12 字节头了
 }
 
 
@@ -1986,6 +2092,28 @@ def hexdump(b, maxlen=512):
     return "\n".join(out)
 
 
+#: `UdpPacket` 的头长度（§151）。`RawPacket` 是 10 字节，这个是 12。
+PEER_HEADER_SIZE = 12
+
+
+def describe_peer_header(payload):
+    """把 `0x040e` 载荷开头那 12 字节的 `UdpPacket` 头解成一行人话（§151）。
+
+    只给日志看。**转发时一个字节都不解析、不改写** —— 这里解错了也不会
+    影响转发的正确性。
+    """
+    if len(payload) < PEER_HEADER_SIZE:
+        return f"    （只有 {len(payload)} 字节，装不下 12 字节的 UdpPacket 头）"
+    magic, sender, target, unknown3 = struct.unpack_from("<BbbB", payload, 0)
+    game_id, checksum, sequence, inner = struct.unpack_from("<HHHH", payload, 4)
+    return ("    UdpPacket 头: magic=0x%02x 发送方座位=%d 目标座位=%s ?[3]=%d "
+            "局号=%d 校验和=0x%04x 序列号=%d 内层opcode=0x%04x body=%d 字节"
+            % (magic, sender,
+               "广播" if target == -1 else str(target),
+               unknown3, game_id, checksum, sequence, inner,
+               len(payload) - PEER_HEADER_SIZE))
+
+
 _seq = 0
 _lock = threading.Lock()
 
@@ -2004,6 +2132,35 @@ _conns_lock = threading.Lock()
 #: 在同一个进程里（D064）。测试里的 `Conn` 夹具是 `__new__` 出来的、不进任何
 #: 房间，所以 `LOBBY.leave(conn)` 对它们是无害的空操作。
 LOBBY = Lobby()
+
+
+def _relay_room_members(game_conn):
+    """中继投递时用：和这条连接同房间的**其他**连接。"""
+    room = LOBBY.room_of(game_conn)
+    if room is None:
+        return []
+    return room.members(exclude=game_conn)
+
+
+def _relay_fallback(member, udp_packet):
+    """对方还没接上中继时的退路：走它自己的游戏服连接发 `0x040f`。
+
+    这不是权宜之计 —— `0x408619` 在「没有中继连接」时走的就是这条
+    （§149 / D078）。中继连接是异步建的，进房之后必然有一小段
+    「有人还没连上中继」的窗口，那几秒里同步不能断。
+    """
+    member.send(build_game(OP_PEER_DATA_DOWN, udp_packet))
+
+
+#: 全进程唯一的原版 TCP 中继（里程碑 J.3 / D078）。和 `LOBBY` 同一个理由做成
+#: 模块级单例：中继连接是**跨连接**的共享状态。
+#: ★ `relayserver` 不 import 本模块（反过来才对），查房间成员和回退投递
+#: 两件事都靠这里注入的回调完成。
+PEER_RELAY = relayserver.RelayServer(
+    members_of=_relay_room_members,
+    fallback=_relay_fallback,
+    logger=lambda msg: print(f"[{ts()}] [relay] {msg}", flush=True),
+)
 
 
 def register_conn(conn):
@@ -2085,6 +2242,15 @@ class Conn:
         # 本局结算包是否已下发。只有发过之后收到的 0x0405 才当「结算看完了」。
         self.settled = False
         self.last_packet_at = time.time()
+        # 通道 A（`0x040e`/`0x040f` 玩家间同步）的开关状态，见 §149 / §150。
+        # 客户端那边默认就是关的，所以初值 False。★ 客户端**退房时会自己把
+        # 开关清 0**（`0x406191`），所以我们也必须在离开房间时跟着清回 False，
+        # 否则下次进房 `send_toggle_peer_relay()` 会以为「已经开着」而不重发。
+        self.peer_relay_on = False
+        # 这条连接**进当前这个房间之后**转发的第一发 `0x040e` 打不打 hexdump。
+        self.peer_data_dumped = False
+        self.peer_data_in = 0
+        self.peer_data_out = 0
         # 本局回了几次 0x0406 死亡广播 / 几次 0x0419 重生（只用来打日志编号）。
         self.deaths_broadcast = 0
         self.respawn_sent = 0
@@ -2928,6 +3094,8 @@ class Conn:
         }
         self.start_game.reset()
         self.reset_quest_state()
+        # 上一个房间的开关记录作废（客户端离开时已经自己清 0 了）。
+        self.forget_peer_relay()
         with self.send_batch("；进房四连发不能被客户端的 recv 切开"):
             self.send_update_session(map_name=room.map_name)
             self.log(f"← 回 gspRepMoveInto(result=0, 房间 #{room.room_id}, "
@@ -3024,6 +3192,11 @@ class Conn:
         self.announce_join(room, seat_index)
         self.broadcast_system_chat(
             f"{display_name(self.account) or self.account_name} 进入了房间。")
+        # ★ 必须排在四连发**之后**（§150）：房里够两个人了就把玩家间同步打开。
+        self.sync_peer_relay(room, reason="（有人进房）")
+        # 有新人进来，上一轮的开局握手作废（不清的话新人不在 `loaded` 里，
+        # 房主再按开始时会等一个从没收到过 0x0400 的人）。
+        room.battle = None
 
     def register_room(self):
         """把刚建好的房间登记进大厅（`0x0201` 解析成功之后立刻调）。
@@ -3047,6 +3220,220 @@ class Conn:
         self.my_seat = 0
         self.online(f"房间 + 建房 账号={self.account_name!r} {room.describe()}")
         return room
+
+    # ---- 开局链（多人）------------------------------------------------------
+
+    def room_battle(self, room):
+        """取（必要时建）房间的开局状态机。"""
+        if room.battle is None:
+            room.battle = RoomStartGame(seed=self.start_game.seed)
+        return room.battle
+
+    def broadcast_start_game(self, room, replies, why):
+        """把开局握手的应答发给**房间里每一个人**（含自己）。
+
+        为什么必须广播：`0x0400 gspPrepareGame` 是「切到 stage 6 去加载关卡」
+        的命令，只发给房主的话别人连关卡都不会加载，自然也永远等不到他们的
+        `0x0403`。**seed 也必须是同一个**，否则各人生成的关卡不一样。
+        """
+        if not replies:
+            return
+        for member in room.members(exclude=None):
+            try:
+                with member.send_batch(f"；{why}"):
+                    for reply_opcode, reply_payload in replies:
+                        member.send(build_game(reply_opcode, reply_payload))
+            except OSError as error:
+                member.log(f"   开局握手发送失败（{error!r}），忽略")
+            # 每条连接自己的状态机跟着走一格，`status` 才不会说瞎话。
+            member.start_game.state = room.battle.state
+        packets = " ".join(f"0x{op:04x}" for op, _ in replies)
+        self.log(f"← 广播开局握手 {packets} 给房里 "
+                 f"{len(room.members(exclude=None))} 人（{why}）")
+
+    def on_start_game_packet(self, opcode, payload):
+        """`0x0400` / `0x0402` / `0x0403` —— 开局链（多人，J.3）。
+
+        不在房间里时退回 V0.1 的单连接行为（理论上到不了这儿：开局只能在
+        房间里按，但协议试探时会手搓包，别让它炸）。
+        """
+        room = self.lobby_room()
+        if room is None:
+            old = self.start_game.state
+            replies = self.start_game.on_client_packet(opcode, payload)
+            self.log(f"   开局握手(无房间): {old} -> {self.start_game.state}; "
+                     f"待下发 {len(replies)} 包")
+            for reply_opcode, reply_payload in replies:
+                self.send(build_game(reply_opcode, reply_payload))
+            return
+
+        battle = self.room_battle(room)
+        members = room.members(exclude=None)
+        old = battle.state
+
+        if opcode == OP_LOADING_DONE:
+            replies = battle.on_loaded(self, members)
+            still = battle.waiting_for(members)
+            if replies:
+                self.log(f"   开局握手: 全部 {len(members)} 人都加载完了 -> 放行")
+                self.broadcast_start_game(room, replies, "所有人加载完成，一起进 stage 7")
+            else:
+                # 客户端每 5 秒轮询一发，别每发都记一行。
+                if self not in battle.loaded or still:
+                    self.log(f"   开局握手: 我加载完了；还在等 {len(still)} 人")
+            return
+
+        # 0x0402（以及协议试探用的 0x0400）——**只认房主的**。
+        if self is not room.host_conn:
+            self.log("   开局握手: 不是房主发的，忽略（开局是房主的权力）")
+            return
+        replies = battle.on_host_ready(opcode, payload)
+        self.log(f"   开局握手: {old} -> {battle.state}; 待广播 {len(replies)} 包")
+        self.broadcast_start_game(room, replies, "房主开局")
+
+    # ---- 战斗内联机：玩家之间的同步数据（§149 / §150 / §151）----------------
+
+    def forget_peer_relay(self):
+        """离开房间时跟着客户端把通道 A 的开关记录清回「关」。
+
+        客户端在 `0x406191`（发 `0x0203` 离开房间）里自己就把
+        `[GameSession+0x3e4]` 清 0 了。我们不跟着清的话，下次进房
+        `send_toggle_peer_relay()` 会以为开关还开着而不重发 `0x0410`，
+        结果就是「第二次进房之后再也同步不上」。
+        """
+        self.peer_relay_on = False
+        self.peer_data_dumped = False
+
+    def send_toggle_peer_relay(self, enabled):
+        """发 `0x0410 gspToggleUdpClientCommunication`（载荷 = int32 0/1）。
+
+        客户端处理器 `0x408703` 做两件事：把 `[GameSession+0x3e4]` 设成这个值、
+        再给游戏服的 socket 设一次 `TCP_NODELAY`。开关一开客户端立刻开始
+        往我们这儿发 `0x040e`（实测约 8 Hz），关掉就立刻停。
+        """
+        enabled = bool(enabled)
+        if self.peer_relay_on == enabled:
+            return
+        self.peer_relay_on = enabled
+        self.log(f"← 回 0x0410 gspToggleUdpClientCommunication({int(enabled)})"
+                 f" —— 玩家间同步{'走本服转发' if enabled else '关闭'}")
+        self.send(build_game(OP_TOGGLE_PEER_RELAY, w_i32(int(enabled))))
+
+    def sync_peer_relay(self, room=None, reason=""):
+        """按「房里现在有几个人」给房间里每个人开 / 关通道 A。
+
+        一个人的房间不用开 —— 开了客户端也只是每 128 毫秒往我们这儿丢一发
+        没人要的包。第二个人进来才开，掉回一个人再关掉。
+
+        ★ 必须在**进房四连发之后**调（`0x0410` 绝不能挤进那一次合并的
+        `sendall` 里，V0.1 §120 / D058）。
+        """
+        if room is None:
+            room = self.lobby_room()
+        if room is None:
+            return
+        # 按「有几条**连接**」判，不是按 player_count()（它把 `fakeroom` 造的
+        # 无连接假座位也算进去，白让真客户端每秒发 8 发没人收的包，§145 同因）。
+        members = room.members(exclude=None)
+        wanted = len(members) >= 2
+        for member in members:
+            try:
+                member.send_toggle_peer_relay(wanted)
+            except OSError as error:
+                member.log(f"   0x0410 发送失败（{error!r}），忽略")
+        if reason:
+            self.log(f"   玩家间同步开关 -> {int(wanted)}{reason}")
+
+    def maybe_join_relay(self):
+        """回一发 `0x0210 gspJoinRelay`，让客户端接上原版的 TCP 中继（D078）。
+
+        ★★ **一条游戏连接只回一次。** 客户端收到就无条件 `new RelayConnection`
+        并覆盖全局指针 `[0x72e290]`，旧对象既不释放也不关 socket ——
+        等它哪天收到 FD_CLOSE，`OnDisconnected` 照样触发，
+        把**新**连接的指针清成 0 再发一发 `0x0203` 把玩家踢出房间（§158 / §159）。
+        而客户端的 `0x0310` 是**每个别人坐着的座位每 10 秒一发**，
+        重复请求是常态，去重责任 100% 在服务端 —— `RelayServer.issue()` 挡着。
+
+        地址固定填 `127.0.0.1:<中继端口>`：客户端的 `connect` 参数是纯 IPv4 的
+        `sockaddr_in`，服务端又不知道自己的公网地址（和注册页同一个老问题），
+        所以沿用 47611 / 27799 那一套 —— 由客户端包的 `bshook` 按单机 / 联机
+        把这个端口转出去（D065 / D066 / D079）。
+        """
+        if not TCP_RELAY_ENABLED:
+            return False
+        room = self.lobby_room()
+        if room is None:
+            return False
+        seat_index = room.seat_index_of(self)
+        if seat_index is None:
+            return False
+        auth = PEER_RELAY.issue(self, room.room_id, seat_index)
+        if auth is None:            # 已经回过了，绝不重发
+            return False
+        self.log(f"← 回 0x0210 gspJoinRelay 127.0.0.1:{PEER_RELAY.port} "
+                 f"认证={auth} —— 客户端这就去连原版中继")
+        self.send(build_game(OP_JOIN_RELAY, relayserver.build_join_relay(
+            "127.0.0.1", PEER_RELAY.port, auth)))
+        return True
+
+    def leave_relay(self, reason=""):
+        """发 `0x0211` 让客户端**干净地**拆掉中继连接。
+
+        ★ 这是唯一安全的拆法：`0x55437b` 走的是析构（`0x54bcb3`），
+        **不经过 `OnDisconnected`** —— 而后者会让客户端自己发 `0x0203`
+        退出房间（§158）。所以任何时候都别去关中继的 socket，要拆就发这个包。
+        """
+        if not PEER_RELAY.has_issued(self):
+            return False
+        PEER_RELAY.forget(self)
+        self.log(f"← 回 0x0211 拆掉中继连接{reason}")
+        try:
+            self.send(build_game(OP_LEAVE_RELAY))
+        except OSError as error:
+            self.log(f"   0x0211 发送失败（{error!r}），忽略")
+        return True
+
+    def on_start_tcp_relay(self, payload):
+        """`0x0310 gcpStartTcpRelay`（8 字节 = 我的座位 + 对方座位，§152）。
+
+        客户端在要一条到对方的中继通道，房里每个「别人坐着的座位」每 10 秒一发。
+        两件事：确认通道 A 的总开关是开的（走中继也要它，§157 末尾），
+        再看要不要回 `0x0210`。
+        """
+        if len(payload) >= 8:
+            mine, other = struct.unpack_from("<ii", payload, 0)
+            self.vlog(f"   要中继通道: 我={mine} 对方={other}")
+        self.sync_peer_relay(reason="（收到 0x0310 要中继）")
+        self.maybe_join_relay()
+
+    def on_peer_data(self, payload):
+        """`0x040e` —— 把玩家之间的同步数据转给同房间的其他人（§149）。
+
+        载荷是**一个完整的 `UdpPacket`**（12 字节头 + body，见 §151），
+        我们**一个字节都不改**地放进 `0x040f` 再发出去 —— 客户端收到后
+        `0x4086b5` 剥掉外层 10 字节头，剩下的就还原成原来那个 `UdpPacket`，
+        和 UDP 直连收到的走同一个入口 `0x407869`。
+
+        ★ 为什么可以无脑广播：三个发送点（`0x4058cc` / `0x4077db` /
+        `0x408257`）在调 `0x408619` 之前都把头里的**目标座位写成 0xff**
+        （广播），这条通道上不存在单播。
+        ★ 为什么重复投递无害：客户端按头里的 u16 序列号在
+        `PktQueue::Insert`（`0x54bb8c`）里去重，同一号收两次会被丢掉 ——
+        所以局域网里 UDP 那一路也送到了也不会双重结算（§151）。
+        """
+        self.peer_data_in += 1
+        room = self.lobby_room()
+        if room is None:
+            return
+        if not self.peer_data_dumped:
+            self.peer_data_dumped = True
+            self.log(f"   玩家间同步：本房间第一发 {len(payload)} 字节\n"
+                     f"{hexdump(payload)}\n"
+                     f"{describe_peer_header(payload)}")
+        # ★ 走 `PEER_RELAY.deliver` 而不是直接广播 `0x040f`：房里可能有人已经
+        #   接上原版中继了，那些人要走中继收（原版路径），剩下的才走 `0x040f`。
+        #   两条路在客户端进的是同一个入口 `0x407869`，谁收哪条都一样。
+        self.peer_data_out += PEER_RELAY.deliver(self, payload)
 
     def broadcast_system_chat(self, text):
         """房间里的一行系统提示（没有「谁 : 」前缀，§141）。"""
@@ -3130,6 +3517,7 @@ class Conn:
             victim.log(f"   踢出通知发送失败（{error!r}）")
         victim.room = None
         victim.my_seat = 0
+        victim.forget_peer_relay()
         victim.reset_quest_state()
         victim.start_game.reset()
         self.after_someone_left(result, f"{victim_seat.nickname} 被房主请出了房间。")
@@ -3137,8 +3525,13 @@ class Conn:
     def after_someone_left(self, result, system_text=""):
         """有人离开房间之后，给**还留着的人**补广播。
 
-        三件事：座位变更（action 3）、房主换人了就再补一发座位快照、
+        三件事：座位变更（`0x0301` **action 1**）、房主换人了就再补一发座位快照、
         一行系统提示。房间已经解散就什么都不用发。
+
+        ★ action 必须是 1（`SEAT_ACTION_LEAVE`），不能是 3 —— 只有 1/2 会走
+        `0x405f8f` 把座位的 3D 模型销毁掉。发 3 的话「玩家列表」里的名字确实没了
+        （那是座位数据被反序列化冲掉的效果），但房间上方那块天空里的角色模型
+        会一直杵着不走（§147）。
         """
         if result is None or result.closed:
             return
@@ -3163,6 +3556,16 @@ class Conn:
                 other.log(f"   离开广播发送失败（{error!r}），忽略")
         if result.new_host_seat is not None:
             self.log(f"   房主转移到座位 {result.new_host_seat}")
+        # 掉回一个人就把玩家间同步关掉，省得客户端对着空房间每秒发 8 发。
+        self.sync_peer_relay(room, reason="（有人离开房间）")
+        # ★ 走的人可能正是「还没加载完」的那一个 —— 不重新算一次的话，
+        #   剩下的人会永远卡在加载界面等一个已经不在房里的人。
+        if room.battle is not None:
+            members = room.members(exclude=None)
+            replies = room.battle.on_loaded(None, members) if members else []
+            if replies:
+                self.log("   开局握手: 等的人走了，剩下的已经全加载完 -> 放行")
+                self.broadcast_start_game(room, replies, "等的人走了，放行")
 
     def leave_room(self, system_text=""):
         """把自己从大厅房间里摘掉并广播。退房 / 断线 / 被顶号共用。"""
@@ -3198,6 +3601,7 @@ class Conn:
         # 房间没了，跟房间绑定的状态全部作废，否则下次建房会带着上一局的残留。
         self.room = None
         self.my_seat = 0
+        self.forget_peer_relay()
         self.reset_quest_state()
         self.start_game.reset()
         # 大厅那边也要摘掉，并把「谁走了 / 房主换成谁」广播给还留着的人。
@@ -3283,6 +3687,7 @@ class Conn:
         elif opcode == 0x0201:
             self.start_game.reset()
             self.room = None
+            self.forget_peer_relay()
             self.reset_quest_state()
             # 建新房之前先从旧房间里出来（并广播），否则旧房间会留一个幽灵座位。
             self.leave_room()
@@ -3433,6 +3838,14 @@ class Conn:
             self.on_report_hp_zero(payload)
         elif opcode == OP_REQ_RESPAWN:
             self.on_respawn_request(payload)
+        elif opcode == OP_PEER_DATA_UP:
+            self.on_peer_data(payload)
+        elif opcode == OP_START_TCP_RELAY:
+            # gcpStartTcpRelay：客户端要一条到对方的中继通道。
+            # D078 起我们**真的回 0x0210** 把原版那条路接上；`--no-tcp-relay`
+            # 关掉之后客户端的 [0x72e290] 一直是 NULL，同步数据自然退回
+            # `0x040e` 那条 else 分支（§149）—— 那也是原版的回退路径。
+            self.on_start_tcp_relay(payload)
         elif opcode == OP_UPDATE_QUEST_SCORE:
             # 客户端每次加分都发一次，载荷是**累计**分数（客户端侧 0x4a414a
             # 先加到 [ctx+0x3b4] 再发，500ms 节流）。记下来给结算用，
@@ -3446,14 +3859,7 @@ class Conn:
                                      build_rep_quest_score(self.my_seat,
                                                            self.quest_score)))
         elif opcode in (OP_PREPARE_GAME, OP_COUNT_GAME_READY, OP_LOADING_DONE):
-            old_state = self.start_game.state
-            replies = self.start_game.on_client_packet(opcode, payload)
-            self.log(f"   开局握手: {old_state} -> {self.start_game.state}; "
-                     f"待下发 {len(replies)} 包")
-            for reply_opcode, reply_payload in replies:
-                self.log(f"← 回开局握手 opcode=0x{reply_opcode:04x} "
-                         f"payload={reply_payload.hex() or '<empty>'}")
-                self.send(build_game(reply_opcode, reply_payload))
+            self.on_start_game_packet(opcode, payload)
 
     def on_ctrl_packet(self, payload):
         self.log(f"★ 控制包(0xFE) 载荷 {len(payload)} 字节\n{hexdump(payload)}")
@@ -3524,6 +3930,10 @@ class Conn:
             self.log(f"异常: {e!r}")
         finally:
             unregister_conn(self)
+            # 中继票据跟着游戏连接一起作废。**不去关中继 socket** ——
+            # 游戏连接一断，客户端那条中继连接自己也会走掉；而主动关别人的
+            # 中继连接会触发 `OnDisconnected`，那是把玩家踢出房间（§158）。
+            PEER_RELAY.forget(self)
             # ★ 断线也要把座位腾出来并广播，否则房间里会留一个永远不动的
             #   幽灵玩家，而且房主要是他，那个房间就再也开不了局。
             try:
