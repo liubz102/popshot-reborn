@@ -24,6 +24,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ★ 所有中文提示都在这里打，start.bat 保持纯 ASCII（chcp 65001 下 cmd 会因为
+#   多字节字符把后面的命令行拦腰截断，见 FINDINGS §135）。失败路径也一样，
+#   所以这里要自己把「[启动失败]」说出来，bat 不再负责这句。
+trap {
+    Write-Host ''
+    Write-Host "[启动失败] $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+
 $Root       = Split-Path -Parent $PSScriptRoot
 $Python     = Join-Path $Root 'runtime\python\python.exe'
 $LogDir     = Join-Path $Root 'logs'
@@ -159,7 +169,10 @@ if ($running -and $lastMode -eq $Mode) {
     }
     Stop-ListenerOn @($AuthPort, $GamePort, $CtrlPort)
 
-    $appArgs = @((Join-Path $Root 'server\app.py'))
+    # Windows PowerShell 5.1 会把 -ArgumentList 数组直接用空格拼成命令行，
+    # 不会替单个参数补引号。脚本路径必须显式引用，否则目录名里的空格会截断路径。
+    $appScript = Join-Path $Root 'server\app.py'
+    $appArgs = @("`"$appScript`"")
     if ($DebugLog) { $appArgs += '--verbose' }
 
     Start-Process -FilePath $Python -WorkingDirectory $Root `
@@ -175,7 +188,7 @@ if ($running -and $lastMode -eq $Mode) {
         if ((Get-ListenerPid $AuthPort) -and (Get-ListenerPid $GamePort)) { $ok = $true; break }
     }
     if (-not $ok) {
-        Say '!! 服务端端口没起来，看 logs\server.err' 'Red'
+        Say '[启动失败] 服务端端口没起来，下面是 logs\server.err 的末尾：' 'Red'
         Get-Content (Join-Path $LogDir 'server.err') -Tail 20 -ErrorAction SilentlyContinue
         exit 1
     }
@@ -201,8 +214,9 @@ if ($relayPid -and $lastTarget -eq $remote) {
 } else {
     if ($relayPid) { Say "[中继]   目标从 '$lastTarget' 改成 '$remote' —— 重启它" 'Yellow' }
     Stop-ListenerOn @($RelayAuth, $RelayGame)
+    $relayScript = Join-Path $Root 'server\relay.py'
     Start-Process -FilePath $Python -WorkingDirectory $Root `
-        -ArgumentList @((Join-Path $Root 'server\relay.py')) `
+        -ArgumentList @("`"$relayScript`"") `
         -RedirectStandardOutput (Join-Path $LogDir 'relay.out') `
         -RedirectStandardError  (Join-Path $LogDir 'relay.err') `
         -WindowStyle Hidden | Out-Null
@@ -259,8 +273,8 @@ Say "  联机服务器地址配置在：  $ConfigPath" 'Cyan'
 Say '  首次使用请先注册账号：  点登录框下方的「在服务器…上注册用户」链接' 'Cyan'
 Say "                          单机注册页 http://127.0.0.1:$localReg/" 'Cyan'
 Say ''
-Say '关闭游戏和服务端请运行 stop.bat。' 'Cyan'
 if ($DebugLog) {
     Say "调试日志：logs\bshook_*.log（客户端）、logs\server.out（服务端）" 'Cyan'
 }
+Say '这个窗口可以关掉，游戏会继续跑。关闭游戏和服务端请运行 stop.bat。' 'Cyan'
 exit 0

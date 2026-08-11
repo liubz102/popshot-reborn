@@ -256,3 +256,35 @@ Address   Frame
 75ECFCC9  0019FF80  BaseThreadInitThunk+19
 772B82AE  0019FFDC  RtlGetAppContainerNamedObjectPath+11E
 772B827E  0019FFEC  RtlGetAppContainerNamedObjectPath+EE
+
+
+
+==================   logged at 08/11/26, 00:37:50    ==========================
+
+Version: 311
+Dump File Name: D:\work\popshot\game_patched\Dump\BigShotV0311N008.mdmp
+Exception code: C0000005 ACCESS_VIOLATION
+Fault address:  0040F4EF 01:0000E4EF D:\work\popshot\game_patched\BigShot.exe
+
+Registers:
+EAX:00000000
+EBX:00000001
+ECX:3A3E4818
+EDX:0065F4E4
+ESI:00000001
+EDI:FFFFFFFF
+CS:EIP:0023:0040F4EF
+SS:ESP:002B:0019F204  EBP:0019F214
+DS:002B  ES:002B  FS:0053  GS:002B
+Flags:00010286
+
+Call stack:
+Address   Frame
+0040F4EF  0019F214  0001:0000E4EF D:\work\popshot\game_patched\BigShot.exe
+0043B46A  0019FD78  0001:0003A46A D:\work\popshot\game_patched\BigShot.exe
+0040DECB  0019FE24  0001:0000CECB D:\work\popshot\game_patched\BigShot.exe
+0040A6B9  0019FE48  0001:000096B9 D:\work\popshot\game_patched\BigShot.exe
+005F7B9E  0019FF70  0001:001F6B9E D:\work\popshot\game_patched\BigShot.exe
+75ECFCC9  0019FF80  BaseThreadInitThunk+19
+772B82AE  0019FFDC  RtlGetAppContainerNamedObjectPath+11E
+772B827E  0019FFEC  RtlGetAppContainerNamedObjectPath+EE

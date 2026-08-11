@@ -18,7 +18,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-MODULES = ("test_account_store", "test_gameserver", "test_online")
+MODULES = ("test_account_store", "test_gameserver", "test_online",
+           "test_lobby", "test_room")
 
 
 def main():

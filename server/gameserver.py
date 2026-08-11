@@ -62,6 +62,12 @@ from account_store import (AccountStore, BASE_CHARACTER_IDS,
                            quest_difficulty_records, quest_unlock_all,
                            tutorial_state)
 import eventlog
+# ★ `SESSION_STATUS_WAITING` 不从 lobby 导入：本模块下面有一份带完整考据的
+#   同名常量（V0.1 §102），两处值必须一样，import 进来只会让人以为它只有一处定义。
+from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
+                   MOVE_INTO_ALREADY_PLAYING,
+                   MOVE_INTO_BAD_PASSWORD, MOVE_INTO_FULL,
+                   MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_OK)
 from netlisten import create_listener, describe as describe_listen
 from tickets import TicketStore, short as short_ticket
 
@@ -88,7 +94,18 @@ LOGIN_RESULT_BAD_TICKET = 3
 #: 「现有连接已断开。请重新尝试连接。」—— 正是「被别人顶号」该说的话。
 #: 被顶掉的客户端会自动重连并重放已作废的旧票据，就用这个码回它（§132 / D071）。
 LOGIN_RESULT_SUPERSEDED = 2
+#: 房间列表。两个方向同号：客户端方向是请求（12 字节，§139），
+#: 服务端方向是列表（§138）。
+OP_LIST_SESSION = 0x0200
+#: 加入房间。客户端方向 `gcpReqMoveInto`（int32 房间号 + 密码 + int32），
+#: 服务端方向是 4 个 int32 的结果（§140）。
+#: ★ **快速加入 `0x0205` 成功时也回这个号** —— `0x0205` 的服务端方向只是
+#: 「拿一个本地化 key 弹提示框」（处理器 `0x55027d`），进不了房间。
+OP_MOVE_INTO_SESSION = 0x0202
 OP_LEAVE_SESSION = 0x0203
+#: 快速加入。客户端方向的载荷就是一个 `SessionDescriptor`
+#: （序列化 `0x404f59` 直接转发给内嵌的描述符）。
+OP_QUICK_JOIN_SESSION = 0x0205
 OP_MOVE_CHANNEL_BY_GAME_TYPE = 0x020b
 #: 服务端方向：`gspQuestReachedDifficulty` = 「每一关你打到第几个难度了」的
 #: 全量快照。客户端处理器 `0x5539c2` 先把 map `[0x72e35c]` 清空再逐条灌进去。
@@ -101,10 +118,18 @@ OP_SESSION_MEMBERS = 0x0300
 OP_SESSION_MEMBER_UPDATE = 0x0301
 OP_CHANGE_SESSION = 0x0302
 OP_UPDATE_SESSION = 0x0303
+#: 聊天。客户端方向 `gcpSendChatMsg`（u8 类型 + 正文），服务端方向
+#: `gspReceiveChatMsg`（u16 座位号 + 显示名 + 正文 + int32 类型），见 §141。
+OP_CHAT = 0x0305
 #: `Packet_gspSlotEquippedList`（vft `0x65e0f8`）—— 某个座位的背包/装备清单。
 #: ★ **这是「人物选择里有几个头像」的唯一开关**（FINDINGS §119）。
 #: 客户端方向没有这个 opcode。
 OP_SLOT_EQUIPPED_LIST = 0x030b
+#: **同号反向**：客户端方向的 `0x030b` 是 `Packet_gcpKickOut`（vft `0x66ae20`，
+#: 序列化 `0x46ba38`）—— 房主在房间里踢人。载荷是
+#: `int32 座位号 + int32（由 1 字节零扩展）`。
+#: 和上面的座位物品清单**只靠方向区分**，回显它等于把角色清单发成踢人。
+OP_KICK_OUT = 0x030b
 OP_REQ_FIRST_USER_RESULT = 0x030f
 OP_REP_MONEY = 0x0600
 OP_PREPARE_GAME = 0x0400
@@ -486,15 +511,72 @@ def parse_first_user_result(payload):
     return progress
 
 
-def build_rep_list_session():
-    """opcode 0x0200 —— 房间列表（空）
+#: 房间列表里每项的最后一个字段（`int32` 当 bool 用，进包对象 +0x24 的 vector）。
+#: **列表 UI 里还没找到读它的地方**（§138），按 D019 填 0。
+SESSION_LIST_UNKNOWN_FLAG = 0
+
+
+def build_session_entry(room, player_count=None, max_players=None):
+    """房间列表里的**一项**：`Session` + u16 房间号 + u8 + int32(bool)（§138）。
+
+    `Session` 本身的线格式见 `build_session()` / §137 —— 和 `0x0303` 的载荷
+    是同一份布局，只是列表里的每一项**没有**结尾那个 u16（那个是 `0x556ed1`
+    比 `0x556e80` 多读的，只有 `0x0303` 才有）。
+    """
+    if player_count is None:
+        player_count = room.player_count()
+    if max_players is None:
+        max_players = ROOM_SEAT_COUNT
+    return (build_session(room.status, room.session_type, room.arguments,
+                          title=room.title, map_name=room.map_name,
+                          player_count=player_count)
+            + struct.pack("<H", room.room_id & 0xFFFF)
+            + struct.pack("<B", max_players & 0xFF)
+            + w_i32(SESSION_LIST_UNKNOWN_FLAG))
+
+
+def build_rep_list_session(rooms=(), total=None):
+    """opcode 0x0200 —— 房间列表（§138）
 
     反序列化 `0x559009`：
         u16 房间数 n           n <= 0 就整个跳过循环（0x559023 的 jle）
-        n 次 { ... }           每项 new(0x30)，我们发 0 项
-        u16                    循环之后还读一个，存到 [ebx+0x38]
+        n 次 { Session + u16 房间号 + u8 + int32(bool) }
+        u16                    循环之后还读一个，存到 [ebx+0x38]（-> 模型 +0x44）
+
+    `rooms` 为空时退化成 V0.1 那 4 个字节 `00 00 00 00`（实测客户端接受）。
+    `total` 不给就取 `len(rooms)`。
     """
-    return struct.pack("<HH", 0, 0)
+    rooms = list(rooms)
+    if total is None:
+        total = len(rooms)
+    out = [struct.pack("<H", len(rooms) & 0xFFFF)]
+    out.extend(build_session_entry(room) for room in rooms)
+    out.append(struct.pack("<H", total & 0xFFFF))
+    return b"".join(out)
+
+
+def parse_list_session_request(payload):
+    """解客户端方向的 `0x0200`（12 字节，序列化 `0x54c0e2`，§139）。
+
+    只有最后那个 int32（游戏类型）对服务端有用：大厅四个标签页各自只该看到
+    自己那一类的房间。前五个字段的语义还没逐个确认，原样记下来给日志。
+    """
+    reader = Reader(payload)
+    start_room = reader.u16()
+    unknown_06 = reader.u16()
+    unknown_08 = reader.u16()
+    unknown_0a = reader.take(1)[0]
+    unknown_0b = reader.take(1)[0]
+    game_type = reader.i32()
+    if reader.left():
+        raise ValueError(
+            f"list-session payload has {reader.left()} trailing bytes")
+    return {
+        "start_room": start_room,
+        "game_type": game_type,
+        "game_type_name": GAME_TYPE_NAMES.get(game_type, "unknown"),
+        "unknown": (unknown_06, unknown_08, unknown_0a, unknown_0b),
+    }
 
 
 def build_rep_leave_session(result=0):
@@ -602,8 +684,33 @@ def build_session_descriptor(session_type, arguments):
 SESSION_STATUS_WAITING = 2
 
 
+def build_session(status, session_type, arguments, title="", map_name="",
+                  player_count=0, unknown_14=0):
+    """`Session` 对象的线格式（0x30 字节，反序列化 `0x556e80`，FINDINGS §137）。
+
+        int32              -> +0x04   房间状态，见 SESSION_STATUS_WAITING
+        string             -> +0x08   房间标题
+        int32              -> +0x0c   ★ 房间列表里 `%s(%d/%d)` 的**第一个** %d
+        string             -> +0x10   地图名
+        int32（存 1 字节）  -> +0x14   语义未知
+        SessionDescriptor  -> +0x18   房间类型 + 参数
+
+    两个地方用同一份布局：`0x0303`（后面多一个 u16）和 `0x0200` 房间列表的
+    每一项（后面跟 u16 房间号 + u8 + int32）。未查明的字段按 D019 填 0 / 空串。
+
+    ⚠ `(%d/%d)` 两个数**谁是当前人数、谁是上限还没实机确认**（§138）：
+    这里按「+0x0c = 当前人数、列表项的 u8 = 上限」实现，一眼看反就把两处对调。
+    """
+    return (w_i32(status)
+            + w_wstr(title)
+            + w_i32(player_count)
+            + w_wstr(map_name)
+            + w_i32(unknown_14)
+            + build_session_descriptor(session_type, arguments))
+
+
 def build_update_session(session_type, arguments, title="", map_name="",
-                         status=SESSION_STATUS_WAITING):
+                         status=SESSION_STATUS_WAITING, player_count=0):
     """opcode 0x0303 —— 把整个 `Session` 灌进客户端的 `LobbyStage`
 
     大厅分发器 `0x4061e2` 的跳表 `@0x406332` 索引 3 → `0x406258` →
@@ -625,12 +732,8 @@ def build_update_session(session_type, arguments, title="", map_name="",
     `gspRepCreateSession` 后就什么都不做，房间面板根本不会建起来。
     地图名是后续由客户端的 `0x0302 gcpChangeSession` 提交、再由服务端下发的。
     """
-    return (w_i32(status)
-            + w_wstr(title)
-            + w_i32(0)
-            + w_wstr(map_name)
-            + w_i32(0)
-            + build_session_descriptor(session_type, arguments)
+    return (build_session(status, session_type, arguments, title=title,
+                          map_name=map_name, player_count=player_count)
             + struct.pack("<H", 0))
 
 
@@ -709,6 +812,20 @@ GAME_TYPE_CHANNEL_CODES = {1: 0, 2: 7, 5: 9}
 LOBBY_TAB_GAME_TYPES = {0: 1, 1: 2, 2: 5, 3: 6}
 
 GAME_TYPE_NAMES = {1: "normal", 2: "quest", 5: "ladder", 6: "practice"}
+
+#: `0x0202` 失败码 -> 日志里的人话。**和客户端弹出来的那句话保持一致**，
+#: 这样玩家报「我看到 XXX」时日志能一秒对上（文案见 §140）。
+MOVE_INTO_REASONS = {
+    MOVE_INTO_ALREADY_PLAYING: "此房间已开始游戏",
+    MOVE_INTO_FULL: "已超出人数限制的房间",
+    MOVE_INTO_NO_SUCH_ROOM: "没有符合条件的房间",
+    MOVE_INTO_BAD_PASSWORD: "密码错误",
+}
+
+
+def lobby_game_type(session_type):
+    """房间描述符类型 -> 大厅游戏类型（房间列表按它过滤，§139）。"""
+    return SESSION_TYPE_GAME_TYPES.get(int(session_type), 1)
 
 
 def parse_move_channel_by_game_type(payload):
@@ -975,6 +1092,112 @@ def build_session_member_update(seat_index, action=SEAT_ACTION_JOIN, **seat):
     return (struct.pack("<B", action & 0xFF)
             + w_i32(seat_index)
             + build_session_slot(**seat))
+
+
+def parse_move_into_request(payload):
+    """解客户端方向的 `0x0202 gcpReqMoveInto`（序列化 `0x558d9d`，§140）。
+
+        int32   房间号
+        string  密码
+        int32（由 1 字节零扩展）  ?   —— 输过密码那条路（`0x5501d4`）填 1
+
+    双击房间列表和「输密码后重试」走的是同一个包，服务端不需要区分。
+    """
+    reader = Reader(payload)
+    room_id = reader.i32()
+    password = reader.wstr()
+    flag = reader.i32()
+    if reader.left():
+        raise ValueError(f"move-into payload has {reader.left()} trailing bytes")
+    return {"room_id": room_id, "password": password, "flag": flag}
+
+
+def build_rep_move_into_session(result=MOVE_INTO_OK, room_id=0, seat_index=0):
+    """opcode 0x0202 —— 加入房间的结果（反序列化 `0x5590d5` = 4 个 int32）。
+
+    处理器 `0x54fd07` 按第一个 int32 分支（§140）：
+
+        0 -> 成功：房间号写 `LobbyStage+0x1c8`、座位号经 `0x405a1f` 写 +0x1cc，
+             座位标成已占用、角色 id 清 0，然后 `ChangeStage(5)` 进房间
+        1 -> 「进入失败 / 此房间已开始游戏。」
+        2 -> 「进入失败 / 已超出人数限制的房间。」
+        3 -> 「进入失败 / 没有符合条件的房间。」
+        4 -> 「进入失败 / 密码错误。」
+        5 -> 先清座位 0/1/2 的 +0x14 再走成功分支（疑似观战席）
+        其它 -> 「进入失败 / 无法进入房间。」
+
+    ★ 失败时**必须回对码**：全都回 3 的话密码错也会被说成「没有符合条件的
+    房间」，那是在撒谎，排查时会把人往错误方向带（同 D071 的道理）。
+
+    第 4 个 int32 成功分支没读，按 D019 填 0。
+    """
+    return (w_i32(result) + w_i32(room_id) + w_i32(seat_index) + w_i32(0))
+
+
+def parse_quick_join_request(payload):
+    """解客户端方向的 `0x0205 gcpReqQuickJoinSession`。
+
+    序列化 `0x404f59` 只有三条指令 —— `add ecx,4` 之后直接 `jmp` 到内嵌
+    `SessionDescriptor` 的 Serialize，所以**载荷就是一个描述符**，
+    没有别的字段。返回 `(类型, 参数元组)`。
+    """
+    reader = Reader(payload)
+    session_type, arguments = read_session_descriptor(reader)
+    if reader.left():
+        raise ValueError(f"quick-join payload has {reader.left()} trailing bytes")
+    return session_type, arguments
+
+
+#: `gspReceiveChatMsg` 的座位号字段。房间外（大厅/系统消息）没有座位，
+#: 发一个越界值让客户端的 `0x4045f9` 判定落空即可 —— 它只用这个号去查
+#: 「点名字」用的昵称，查不到就跳过，不影响正文显示（§141）。
+CHAT_NO_SEAT = 0xFFFF
+
+
+def parse_chat_message(payload):
+    """解客户端方向的 `0x0305 gcpSendChatMsg`（序列化 `0x54c26c`，§141）。
+
+        u8      聊天类型
+        string  正文
+    """
+    reader = Reader(payload)
+    chat_type = reader.take(1)[0]
+    text = reader.wstr()
+    if reader.left():
+        raise ValueError(f"chat payload has {reader.left()} trailing bytes")
+    return chat_type, text
+
+
+def build_receive_chat(text, sender="", seat_index=CHAT_NO_SEAT, chat_type=0):
+    """opcode 0x0305 —— `gspReceiveChatMsg`（序列化 `0x404e3b`，§141）。
+
+        u16     发言者座位号   0..5；客户端拿它去座位里查昵称（点名字用）
+        string  发言者显示名   ★ 非空 -> 渲染成 '%s : %s'；空 -> 只显示正文
+        string  正文
+        int32   聊天类型       传给 0x40605d 决定颜色
+
+    所以**系统提示把 `sender` 留空**就能得到一行没有「XXX : 」前缀的白话。
+    """
+    return (struct.pack("<H", seat_index & 0xFFFF)
+            + w_wstr(sender)
+            + w_wstr(text)
+            + w_i32(chat_type))
+
+
+def parse_kick_out_request(payload):
+    """解客户端方向的 `0x030b gcpKickOut`（vft `0x66ae20`，序列化 `0x46ba38`）。
+
+        int32   被踢的座位号   来自 `[RoomStage+0x170]`
+        int32（由 1 字节零扩展）  `[LobbyStage+0x3da]`（观战标记）
+
+    ⚠ 同号反向：服务端方向的 `0x030b` 是座位物品清单（§119）。
+    """
+    reader = Reader(payload)
+    seat_index = reader.i32()
+    flag = reader.i32()
+    if reader.left():
+        raise ValueError(f"kick-out payload has {reader.left()} trailing bytes")
+    return seat_index, flag
 
 
 def parse_session_slot(reader):
@@ -1776,6 +1999,12 @@ _lock = threading.Lock()
 _conns = []
 _conns_lock = threading.Lock()
 
+#: 全进程唯一的大厅房间表（里程碑 I）。做成模块级单例而不是 `Conn` 的属性，
+#: 理由和 `_conns` 一样：房间是**跨连接**的共享状态，认证服和游戏服又本来就
+#: 在同一个进程里（D064）。测试里的 `Conn` 夹具是 `__new__` 出来的、不进任何
+#: 房间，所以 `LOBBY.leave(conn)` 对它们是无害的空操作。
+LOBBY = Lobby()
+
 
 def register_conn(conn):
     with _conns_lock:
@@ -1985,24 +2214,88 @@ class Conn:
                              f"合并成一次发送{reason}）")
                     self.sock.sendall(self.cout.encrypt(plain))
 
-    def send_update_session(self, map_name=""):
+    # -- 大厅 / 房间 ---------------------------------------------------------
+    def lobby_room(self):
+        """本连接当前所在的房间（`lobby.Room`），不在房间里就是 ``None``。"""
+        return LOBBY.room_of(self)
+
+    def seat_snapshot(self):
+        """按存档给自己做一个座位快照（昵称 / 等级 / 角色）。
+
+        房间里别人的连接查不到我的存档，所以进房间的那一刻就把这三样存进
+        `lobby.Seat`，后面广播直接读它。
+        """
+        return Seat(self,
+                    username=self.account_name or "",
+                    nickname=(display_name(self.account)
+                              or (self.account_name or "")),
+                    level=player_level(self.account),
+                    character_id=player_character(self.account))
+
+    def refresh_seat(self):
+        """把大厅里我这个座位的昵称/等级/角色刷成存档里的当前值。"""
+        room = self.lobby_room()
+        if room is None:
+            return None
+        seat = room.seat_of(self)
+        if seat is not None:
+            seat.update(nickname=(display_name(self.account)
+                                  or (self.account_name or "")),
+                        level=player_level(self.account),
+                        character_id=player_character(self.account))
+        return seat
+
+    def broadcast(self, plain, exclude_self=True, reason=""):
+        """把一个已经组好帧的包发给同房间的其他人。
+
+        ★ 广播时**每个连接各自合并一次**，绝不跨连接攒（V0.1 §120 / D058）。
+        这里一个包一次 `send()`，多包合并由调用方在**每个目标连接上**分别用
+        `send_batch()` 完成。
+
+        发送前先把目标列表取成快照 —— `send()` 会阻塞在 socket 上，
+        绝不能拿着大厅锁去阻塞。
+        """
+        room = self.lobby_room()
+        if room is None:
+            return 0
+        targets = room.members(exclude=self if exclude_self else None)
+        sent = 0
+        for other in targets:
+            try:
+                other.send(plain)
+                sent += 1
+            except OSError as error:
+                other.log(f"   广播发送失败（{error!r}），忽略")
+        if sent and reason:
+            self.log(f"   → 广播给房里另外 {sent} 人{reason}")
+        return sent
+
+    def send_update_session(self, map_name=None):
         """把当前房间的 `Session` 下发给客户端（opcode 0x0303）。
 
         没解出建房请求就不发：这个包的唯一作用就是把请求里那份描述符原样
         灌回客户端，凭空编一个类型只会让客户端进错房间面板。
 
         `map_name` 只有在**回应 0x0302** 时才填。建房那一次必须留空，
-        理由见 `build_update_session` 的文档。
+        理由见 `build_update_session` 的文档。加入别人的房间时要填**房间当前
+        的地图名**，否则进去看到的是「还没选关卡」。
         """
         if self.room is None:
             self.log("   没有已解析的建房请求; 不下发 0x0303")
             return
+        room = self.lobby_room()
+        if map_name is None:
+            map_name = "" if room is None else room.map_name
+        player_count = 1 if room is None else room.player_count()
+        status = SESSION_STATUS_WAITING if room is None else room.status
         try:
             payload = build_update_session(
                 self.room["session_type"],
                 self.room["arguments"],
                 title=self.room["texts"][0],
                 map_name=map_name,
+                status=status,
+                player_count=player_count,
             )
         except ValueError as error:
             self.log(f"   无法下发 0x0303: {error}")
@@ -2010,10 +2303,11 @@ class Conn:
         self.log(
             f"← 回 0x0303 Session(type={self.room['session_type']} "
             f"({self.room['session_type_name']}) args={self.room['arguments']} "
-            f"title={self.room['texts'][0]!r} map={map_name!r})")
+            f"title={self.room['texts'][0]!r} map={map_name!r} "
+            f"人数={player_count})")
         self.send(build_game(OP_UPDATE_SESSION, payload))
 
-    def send_session_members(self, host_seat=0):
+    def send_session_members(self, host_seat=None):
         """把房间座位快照下发给客户端（opcode 0x0300）。
 
         客户端建房时只自己写了「座位 0 已占用」和房主座位号，昵称/等级等
@@ -2022,21 +2316,37 @@ class Conn:
         「等级太低，无法选择任务。」——与 `gspRepLogin` 下发的账号等级无关
         （FINDINGS §75、§77）。
 
-        目前只有本机一个玩家，固定占座位 0；其余五个座位发「空且未关闭」，
-        这样 `0x556f40` 数出来的空位数与客户端 `0x0302` 自报的 6 一致。
+        座位数据取自大厅房间表（里程碑 I）；还没进大厅房间的场合（协议试探、
+        控制通道）退回 V0.1 的行为：自己占 `host_seat`，其余五个空着。
+        空座位发「未关闭」，这样 `0x556f40` 数出来的空位数和客户端
+        `0x0302` 自报的一致。
         """
-        level = player_level(self.account)
-        nickname = display_name(self.account) or (self.account_name or "")
-        character = player_character(self.account)
-        seats = [{"occupied": False}] * ROOM_SEAT_COUNT
-        seats[host_seat] = {
-            "occupied": True,
-            "nickname": nickname,
-            "level": level,
-            "character_id": character,
-        }
-        self.log(f"← 回 0x0300 房间座位快照(host_seat={host_seat} "
-                 f"nickname={nickname!r} level={level} 角色={character})")
+        room = self.lobby_room()
+        if room is not None:
+            self.refresh_seat()
+            if host_seat is None:
+                host_seat = room.host_seat
+            seats = room.seat_snapshots()
+            who = ", ".join(
+                f"{i}:{s['nickname']}" for i, s in enumerate(seats)
+                if s.get("occupied"))
+            self.log(f"← 回 0x0300 房间座位快照(房间 #{room.room_id} "
+                     f"host_seat={host_seat} 座位: {who})")
+        else:
+            if host_seat is None:
+                host_seat = self.my_seat if 0 <= self.my_seat < ROOM_SEAT_COUNT else 0
+            level = player_level(self.account)
+            nickname = display_name(self.account) or (self.account_name or "")
+            character = player_character(self.account)
+            seats = [{"occupied": False}] * ROOM_SEAT_COUNT
+            seats[host_seat] = {
+                "occupied": True,
+                "nickname": nickname,
+                "level": level,
+                "character_id": character,
+            }
+            self.log(f"← 回 0x0300 房间座位快照(host_seat={host_seat} "
+                     f"nickname={nickname!r} level={level} 角色={character})")
         self.send(build_game(OP_SESSION_MEMBERS,
                              build_session_members(host_seat, seats)))
 
@@ -2091,19 +2401,32 @@ class Conn:
                                                            character)
             except KeyError:
                 self.log(f"   存档里没有账号 {self.account_name!r}; 只广播不记账")
-        # 单客户端后台里，这是唯一一个「客户端主动告诉服务端自己坐在几号位」
-        # 的包，顺手校准一下（建房时客户端固定把自己放在座位 0，§75）。
+        # 这是唯一一个「客户端主动告诉服务端自己坐在几号位」的包，顺手校准一下
+        # （建房时客户端固定把自己放在座位 0，§75）。★ 但**以大厅里的实际座位
+        # 为准** —— 进别人房间时客户端报的是它自己那份可能还没更新的座位号，
+        # 信它会让广播打到别人的位置上。
+        room = self.lobby_room()
+        if room is not None:
+            actual = room.seat_index_of(self)
+            if actual is not None and actual != seat_index:
+                self.log(f"   客户端自报座位 {seat_index}，"
+                         f"以大厅里的实际座位 {actual} 为准")
+                seat_index = actual
         self.my_seat = seat_index
+        self.refresh_seat()
         self.log(f"← 回 0x0301 座位变更(action=4 换角色, 座位={seat_index}, "
                  f"角色={player_character(self.account)})")
-        self.send(build_game(OP_SESSION_MEMBER_UPDATE, build_session_member_update(
+        packet = build_game(OP_SESSION_MEMBER_UPDATE, build_session_member_update(
             seat_index,
             SEAT_ACTION_CHANGE_CHARACTER,
             occupied=True,
             nickname=display_name(self.account) or (self.account_name or ""),
             level=player_level(self.account),
             character_id=player_character(self.account),
-        )))
+        ))
+        self.send(packet)
+        # 房里其他人也要看到这次换角色（中下那个 3D 预览就是靠这一发换的，§103）。
+        self.broadcast(packet, reason="：换角色")
 
     def on_game_login(self, payload):
         """`0x0100 gcpReqLogin` —— 用认证服签发的票据认人，然后回 `gspRepLogin`。
@@ -2553,6 +2876,307 @@ class Conn:
                              build_end_game(self.my_seat, success, values)))
         self.settled = True
 
+    # -- 里程碑 I：大厅联机 ---------------------------------------------------
+    def on_list_session(self, payload):
+        """`0x0200 gcpReqListSession` —— 回真实房间列表（§138 / §139）。
+
+        大厅四个标签页各看各的：请求里那个 int32 是游戏类型，按它过滤。
+        解析失败就退回「不过滤」，宁可多列几个房间，也不要让列表整个空掉
+        （空列表和「服务端挂了」在玩家眼里长得一模一样）。
+        """
+        game_type = None
+        try:
+            request = parse_list_session_request(payload)
+        except (ValueError, struct.error, IndexError) as error:
+            self.log(f"   房间列表请求解析失败: {error}; 不按类型过滤")
+        else:
+            game_type = request["game_type"]
+            self.vlog(f"   房间列表请求: 游戏类型={game_type} "
+                      f"({request['game_type_name']}) "
+                      f"起始房间号={request['start_room']} "
+                      f"未定字段={request['unknown']}")
+        rooms = LOBBY.rooms(game_type)
+        if rooms:
+            self.log(f"← 回 gspRepListSession（{len(rooms)} 个房间："
+                     + "；".join(r.describe() for r in rooms) + "）")
+        else:
+            self.vlog("← 回 gspRepListSession（空房间列表）")
+        self.send(build_game(OP_LIST_SESSION, build_rep_list_session(rooms)))
+
+    def enter_room(self, room, seat_index, reason=""):
+        """进房间之后要发的一整串包（自己收的那份）。
+
+        顺序是硬约束，和建房那一路同因（§140 / V0.1 §119 / §120）：
+
+            0x0303 Session   -> RoomStage 构造时读的就是它（状态/描述符/地图名）
+            0x0202 应答      -> 处理器最后一句是 ChangeStage(5)
+            0x0300 座位快照  -> 必须在 0x0202 **之后**（0x54f815 会清座位 0 的角色 id）
+            0x030b 物品清单  -> 必须在 0x0300 **之后**（持有判定先查座位已占用）
+
+        四个包**合并成一次 sendall**，否则「人物选择」会小概率缩回 3 个头像。
+        """
+        self.my_seat = seat_index
+        # `self.room` 是「下发 0x0303 用的那份描述符」，进别人的房间时要按
+        # 房间的当前参数重建 —— 它原本只在自己建房时才有。
+        self.room = {
+            "texts": (room.title, room.map_name, ""),
+            "option": 0,
+            "session_type": room.session_type,
+            "session_type_name": SESSION_TYPE_NAMES.get(room.session_type,
+                                                        "unknown"),
+            "arguments": room.arguments,
+        }
+        self.start_game.reset()
+        self.reset_quest_state()
+        with self.send_batch("；进房四连发不能被客户端的 recv 切开"):
+            self.send_update_session(map_name=room.map_name)
+            self.log(f"← 回 gspRepMoveInto(result=0, 房间 #{room.room_id}, "
+                     f"座位={seat_index}){reason}")
+            self.send(build_game(
+                OP_MOVE_INTO_SESSION,
+                build_rep_move_into_session(MOVE_INTO_OK, room.room_id,
+                                            seat_index)))
+            self.send_session_members()
+            self.send_slot_equipped_list(reason="（进房后下发）")
+
+    def announce_join(self, room, seat_index):
+        """把「有人进来了」广播给房里的其他人（`0x0301` action 0）。
+
+        ★ action 0 会把座位的对端 IP / 端口清 0，而 `0x0300` 的处理器会把
+        「我」的座位 IP 写成 127.0.0.1 —— 两个包同时发时 `0x0301` 必须排在
+        `0x0300` **前面**。这里只发 `0x0301`，房里其他人的 `0x0300` 不用重发
+        （他们的座位表由这一发增量更新）。
+        """
+        seat = room.seats[seat_index]
+        if seat is None:
+            return
+        packet = build_game(OP_SESSION_MEMBER_UPDATE, build_session_member_update(
+            seat_index, SEAT_ACTION_JOIN, **seat.snapshot()))
+        self.broadcast(packet, reason=f"：座位 {seat_index} 加入")
+
+    def on_move_into_session(self, payload):
+        """`0x0202 gcpReqMoveInto` —— 加入指定房间（§140）。"""
+        try:
+            request = parse_move_into_request(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   加入房间请求解析失败: {error}; 回 result=3")
+            self.send(build_game(OP_MOVE_INTO_SESSION,
+                                 build_rep_move_into_session(
+                                     MOVE_INTO_NO_SUCH_ROOM)))
+            return
+        self.log(f"   加入房间请求: 房间 #{request['room_id']} "
+                 f"密码={'有' if request['password'] else '无'} "
+                 f"flag={request['flag']}")
+        self.join_room(request["room_id"], request["password"])
+
+    def on_quick_join_session(self, payload):
+        """`0x0205 gcpReqQuickJoinSession` —— 随便找个房间进。
+
+        ★ 成功时回的是 **`0x0202`**，不是 `0x0205`：`0x0205` 的服务端方向
+        （处理器 `0x55027d`）只会拿包里那个字符串去本地化表查一次然后弹提示框，
+        进不了房间。失败也回 `0x0202 result=3`，客户端弹的正好是
+        「没有符合条件的房间。」，文案不用我们写（同 D069）。
+        """
+        game_type = None
+        try:
+            session_type, arguments = parse_quick_join_request(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   快速加入请求解析失败: {error}; 不按类型过滤")
+        else:
+            game_type = lobby_game_type(session_type)
+            self.log(f"   快速加入请求: 描述符 type={session_type} "
+                     f"args={arguments} -> 游戏类型 {game_type}")
+        result, room, seat_index = LOBBY.quick_join(
+            self, game_type, seat=self.seat_snapshot())
+        if result != MOVE_INTO_OK:
+            self.log("← 回 gspRepMoveInto(result=3) —— 没有可进的房间")
+            self.send(build_game(OP_MOVE_INTO_SESSION,
+                                 build_rep_move_into_session(
+                                     MOVE_INTO_NO_SUCH_ROOM)))
+            return
+        self.finish_join(room, seat_index, "（快速加入）")
+
+    def join_room(self, room_id, password=""):
+        """`0x0202` / 控制通道共用的进房逻辑。"""
+        result, room, seat_index = LOBBY.join(self, room_id, password,
+                                              seat=self.seat_snapshot())
+        if result != MOVE_INTO_OK:
+            why = MOVE_INTO_REASONS.get(result, "无法进入房间")
+            self.log(f"← 回 gspRepMoveInto(result={result}) —— {why}")
+            self.online(f"房间 ✗ 加入失败 账号={self.account_name!r} "
+                        f"房间 #{room_id} 原因={why}")
+            self.send(build_game(OP_MOVE_INTO_SESSION,
+                                 build_rep_move_into_session(result)))
+            return False
+        self.finish_join(room, seat_index)
+        return True
+
+    def finish_join(self, room, seat_index, reason=""):
+        """进房成功之后：先给自己发四连发，再广播给房里其他人。
+
+        顺序不能反 —— 广播会阻塞在别人的 socket 上，先把自己的那份发出去，
+        进房的人才不会觉得卡。
+        """
+        self.online(f"房间 ✓ 加入 账号={self.account_name!r} "
+                    f"房间 #{room.room_id}「{room.title}」座位={seat_index} "
+                    f"（房里现在 {room.player_count()} 人）")
+        self.enter_room(room, seat_index, reason)
+        self.announce_join(room, seat_index)
+        self.broadcast_system_chat(
+            f"{display_name(self.account) or self.account_name} 进入了房间。")
+
+    def register_room(self):
+        """把刚建好的房间登记进大厅（`0x0201` 解析成功之后立刻调）。
+
+        建房的三个字符串里第一个是标题（V0.1 §69），第二个是地图名 ——
+        但**建房那一刻地图名必须是空的**（`0x54f82e` 的相等判断，见
+        `build_update_session`），真正的地图名要等客户端的 `0x0302` 才来。
+        所以这里只登记标题，地图名留空。
+        """
+        if self.room is None:
+            return None
+        texts = self.room.get("texts") or ("",)
+        room = LOBBY.create_room(
+            self,
+            title=texts[0] if texts else "",
+            map_name="",
+            session_type=self.room["session_type"],
+            arguments=self.room["arguments"],
+            seat=self.seat_snapshot(),
+        )
+        self.my_seat = 0
+        self.online(f"房间 + 建房 账号={self.account_name!r} {room.describe()}")
+        return room
+
+    def broadcast_system_chat(self, text):
+        """房间里的一行系统提示（没有「谁 : 」前缀，§141）。"""
+        if not text:
+            return
+        self.broadcast(build_game(OP_CHAT, build_receive_chat(text)),
+                       reason="：系统提示")
+
+    def on_chat(self, payload):
+        """`0x0305 gcpSendChatMsg` -> `gspReceiveChatMsg` 广播（§141）。
+
+        **不持久化**（里程碑 I 的要求）。房间里就发给房里的人；不在房间里
+        （大厅）暂时只回给自己 —— 频道聊天要先有频道用户表，那是 `0x020d`
+        那条线的事，还没做。
+        """
+        try:
+            chat_type, text = parse_chat_message(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   聊天包解析失败: {error}; 不回包")
+            return
+        text = text.strip()
+        if not text:
+            return
+        sender = display_name(self.account) or (self.account_name or "")
+        room = self.lobby_room()
+        seat_index = CHAT_NO_SEAT
+        if room is not None:
+            index = room.seat_index_of(self)
+            if index is not None:
+                seat_index = index
+        packet = build_game(OP_CHAT, build_receive_chat(
+            text, sender=sender, seat_index=seat_index, chat_type=chat_type))
+        # ★ 发言的人自己也要收到一份 —— 客户端发完 0x0305 什么都不做，
+        #   本地不回显（和换角色 §103 是同一个套路）。
+        self.log(f"   聊天(type={chat_type}) {sender!r}: {text!r} "
+                 f"座位={seat_index if seat_index != CHAT_NO_SEAT else '-'}")
+        self.send(packet)
+        if room is not None:
+            self.broadcast(packet, reason="：聊天")
+
+    def on_kick_out(self, payload):
+        """客户端方向的 `0x030b gcpKickOut` —— 房主踢人。
+
+        ⚠ 同号反向：服务端方向的 `0x030b` 是座位物品清单。
+        """
+        try:
+            seat_index, flag = parse_kick_out_request(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   踢人请求解析失败: {error}; 不动作")
+            return
+        room = self.lobby_room()
+        if room is None:
+            self.log("   不在任何房间里，忽略踢人请求")
+            return
+        my_seat = room.seat_index_of(self)
+        if my_seat != room.host_seat:
+            # 只有房主能踢。客户端 UI 本来就只给房主那个按钮，但服务端不能
+            # 因此就信它 —— 这是一条改包就能滥用的路。
+            self.log(f"   座位 {my_seat} 不是房主（房主 {room.host_seat}），"
+                     f"拒绝踢人")
+            return
+        if seat_index == my_seat:
+            self.log("   房主想踢自己，忽略")
+            return
+        victim_seat = room.seats[seat_index] if 0 <= seat_index < ROOM_SEAT_COUNT else None
+        victim = victim_seat.conn if victim_seat is not None else None
+        self.log(f"   踢人: 座位 {seat_index}"
+                 f"（{victim_seat.nickname if victim_seat else '空位'}）flag={flag}")
+        if victim is None:
+            return
+        result = LOBBY.kick(room, seat_index)
+        if result is None:
+            return
+        self.online(f"房间 ⚠ 踢出 房间 #{room.room_id} "
+                    f"被踢={victim.account_name!r} 房主={self.account_name!r}")
+        # 被踢的人：回一发 0x0203，客户端自己切回大厅（§101）。
+        victim.log("← 回 gspRepLeaveSession(result=0) —— 被房主踢出")
+        try:
+            victim.send(build_game(OP_LEAVE_SESSION, build_rep_leave_session(0)))
+        except OSError as error:
+            victim.log(f"   踢出通知发送失败（{error!r}）")
+        victim.room = None
+        victim.my_seat = 0
+        victim.reset_quest_state()
+        victim.start_game.reset()
+        self.after_someone_left(result, f"{victim_seat.nickname} 被房主请出了房间。")
+
+    def after_someone_left(self, result, system_text=""):
+        """有人离开房间之后，给**还留着的人**补广播。
+
+        三件事：座位变更（action 3）、房主换人了就再补一发座位快照、
+        一行系统提示。房间已经解散就什么都不用发。
+        """
+        if result is None or result.closed:
+            return
+        room = result.room
+        leave_packet = build_game(OP_SESSION_MEMBER_UPDATE,
+                                  build_session_member_update(
+                                      result.seat_index, SEAT_ACTION_LEAVE,
+                                      occupied=False))
+        chat_packet = (build_game(OP_CHAT, build_receive_chat(system_text))
+                       if system_text else b"")
+        for other in result.remaining:
+            try:
+                with other.send_batch("；离开广播合并"):
+                    other.send(leave_packet)
+                    if result.new_host_seat is not None:
+                        # 房主换人了：整份座位快照重发一次最稳
+                        # ——「谁是房主」只有 0x0300 的第一个 int32 说了算。
+                        other.send_session_members()
+                    if chat_packet:
+                        other.send(chat_packet)
+            except OSError as error:
+                other.log(f"   离开广播发送失败（{error!r}），忽略")
+        if result.new_host_seat is not None:
+            self.log(f"   房主转移到座位 {result.new_host_seat}")
+
+    def leave_room(self, system_text=""):
+        """把自己从大厅房间里摘掉并广播。退房 / 断线 / 被顶号共用。"""
+        result = LOBBY.leave(self)
+        if result is None:
+            return None
+        who = display_name(self.account) or (self.account_name or "?")
+        self.online(f"房间 - 离开 账号={self.account_name!r} "
+                    f"房间 #{result.room.room_id} 座位={result.seat_index} "
+                    + ("房间已解散" if result.closed
+                       else f"房里还剩 {len(result.remaining)} 人"))
+        self.after_someone_left(result, system_text or f"{who} 离开了房间。")
+        return result
+
     def leave_session(self):
         """离开房间：回 `0x0203 result=0`，客户端自己切回大厅（FINDINGS §101）。
 
@@ -2573,8 +3197,11 @@ class Conn:
         self.send(build_game(OP_LEAVE_SESSION, build_rep_leave_session(0)))
         # 房间没了，跟房间绑定的状态全部作废，否则下次建房会带着上一局的残留。
         self.room = None
+        self.my_seat = 0
         self.reset_quest_state()
         self.start_game.reset()
+        # 大厅那边也要摘掉，并把「谁走了 / 房主换成谁」广播给还留着的人。
+        self.leave_room()
 
     def leave_game_result(self):
         """结算界面看完了：切回房间，再把玩家数据栏刷成存档里的值。
@@ -2645,13 +3272,20 @@ class Conn:
             return
         if opcode == 0x0100:
             self.on_game_login(payload)
-        elif opcode == 0x0200:
-            self.log("← 回 gspRepListSession（空房间列表）")
-            self.send(build_game(0x0200, build_rep_list_session()))
+        elif opcode == OP_LIST_SESSION:
+            self.on_list_session(payload)
+        elif opcode == OP_MOVE_INTO_SESSION:
+            self.on_move_into_session(payload)
+        elif opcode == OP_QUICK_JOIN_SESSION:
+            self.on_quick_join_session(payload)
+        elif opcode == OP_CHAT:
+            self.on_chat(payload)
         elif opcode == 0x0201:
             self.start_game.reset()
             self.room = None
             self.reset_quest_state()
+            # 建新房之前先从旧房间里出来（并广播），否则旧房间会留一个幽灵座位。
+            self.leave_room()
             try:
                 self.room = parse_create_session_request(payload)
                 self.log(
@@ -2661,6 +3295,7 @@ class Conn:
                     f"texts={self.room['texts']!r} option={self.room['option']} "
                     f"args={self.room['arguments']}; 开局状态机已重置"
                 )
+                self.register_room()
             except ValueError as error:
                 # Keep the minimal successful reply while logging an exact
                 # diagnostic. This preserves compatibility with an unobserved
@@ -2687,6 +3322,9 @@ class Conn:
                 self.send_slot_equipped_list(reason="（建房后下发）")
         elif opcode == OP_SESSION_MEMBER_UPDATE:
             self.on_seat_change(payload)
+        elif opcode == OP_KICK_OUT:
+            # ⚠ 同号反向：0x030b 服务端方向是座位物品清单，客户端方向是踢人。
+            self.on_kick_out(payload)
         elif opcode == OP_LEAVE_SESSION:
             self.leave_session()
         elif opcode == OP_CHANGE_SESSION:
@@ -2711,7 +3349,22 @@ class Conn:
             self.room = dict(self.room,
                              session_type=request["session_type"],
                              arguments=request["arguments"])
+            # 房间在大厅里也要跟着改：房间列表和后进来的人读的是大厅那一份。
+            room = self.lobby_room()
+            if room is not None:
+                LOBBY.update_room(room,
+                                  title=request["texts"][0] or room.title,
+                                  map_name=request["texts"][1],
+                                  session_type=request["session_type"],
+                                  arguments=request["arguments"])
             self.send_update_session(map_name=request["texts"][1])
+            # 房里其他人也要看到新地图 —— 不然他们的「选择地图」面板还停在旧的。
+            if room is not None and room.player_count() > 1:
+                others = build_game(OP_UPDATE_SESSION, build_update_session(
+                    room.session_type, room.arguments, title=room.title,
+                    map_name=room.map_name, status=room.status,
+                    player_count=room.player_count()))
+                self.broadcast(others, reason="：房间参数变更")
         elif opcode == OP_MOVE_CHANNEL_BY_GAME_TYPE:
             try:
                 game_type = parse_move_channel_by_game_type(payload)
@@ -2871,6 +3524,13 @@ class Conn:
             self.log(f"异常: {e!r}")
         finally:
             unregister_conn(self)
+            # ★ 断线也要把座位腾出来并广播，否则房间里会留一个永远不动的
+            #   幽灵玩家，而且房主要是他，那个房间就再也开不了局。
+            try:
+                who = display_name(self.account) or (self.account_name or "?")
+                self.leave_room(f"{who} 断线了。")
+            except Exception as error:      # 收尾路径上绝不能再抛
+                self.log(f"   离开房间时出错（忽略）: {error!r}")
             self.log("--- 连接结束")
             who = repr(self.account_name) if self.account_name else "?（没登录成功）"
             self.online(f"- 断开 账号={who} ip={self.peer()} "
@@ -2896,6 +3556,11 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
                                   只有一条连接时可以省略；有多条时**必须**指定，
                                   服务端不会替你猜（猜错就把包发给别人了）
   who                             列出当前所有活动连接和它们的账号
+  rooms                           列出大厅里现在有哪些房间
+  fakeroom [标题] [类型] [人数]   造一个**没有玩家**的假房间（默认「测试房间」/
+                                  类型 2 闯关 / 1 人）。只为在单机上验证房间列表
+                                  的线格式：(%d/%d) 哪个数是人数、房间号显示成几号
+  delroom <房间号>                强行解散一个房间
   status                          当前连接 / 开局状态 / 座位 / 分数 / 最后坐标
   raw <op> [payload-hex]          发任意游戏包，op 是十六进制（例：raw 0411 ...）
   endgame                         按存档真结算一局（记经验+金币再发 0x0411），
@@ -3032,6 +3697,37 @@ def _dispatch_control_command(line):
             return "ok 当前没有活动连接"
         return "ok " + "; ".join(
             f"#{c.seq} {c.account_name or '(未登录)'}" for c in conns)
+
+    # -- 房间（里程碑 I）：这几条不需要连接，放在 pick_conn 之前 ------------
+    if cmd == "rooms":
+        found = LOBBY.rooms()
+        if not found:
+            return "ok 当前没有房间"
+        return "ok " + "; ".join(r.describe() for r in found)
+
+    if cmd == "fakeroom":
+        # 造一个**没有连接**的房间，专门用来在只有一个客户端的机器上验证
+        # 房间列表的线格式（`(%d/%d)` 哪个数是人数、房间号显示成几号）。
+        # 座位的 conn 是 None，广播时会被 `Room.members()` 过滤掉。
+        title = words[1] if len(words) > 1 else "测试房间"
+        session_type = _control_ints(words[2:3], 1, 2)[0]
+        players = max(1, min(ROOM_SEAT_COUNT, _control_ints(words[3:4], 1, 1)[0]))
+        room = LOBBY.create_room(None, title=title, map_name="",
+                                 session_type=session_type,
+                                 arguments=(3, 1) if session_type == 2 else (1, 2, 3),
+                                 seat=Seat(None, nickname="测试玩家1", level=9))
+        for index in range(1, players):
+            room.seats[index] = Seat(None, nickname=f"测试玩家{index + 1}",
+                                     level=9)
+        return f"ok 已建 {room.describe()}"
+
+    if cmd == "delroom":
+        if len(words) < 2:
+            return "err 用法: delroom <房间号>"
+        room = LOBBY.close_room(int(words[1]))
+        if room is None:
+            return f"err 没有房间 #{words[1]}"
+        return f"ok 已删房间 #{room.room_id}"
 
     conn = pick_conn(username)
     if conn is None:
