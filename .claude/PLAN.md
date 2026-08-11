@@ -175,27 +175,46 @@ J.1 的实测把选项变了三个（见 FINDINGS §149~§156）。
 
 ## 里程碑 K — 两个发布包
 
+> ✅ **会话 09 已完成**。下面是实际做出来的形状（和最初的设想有两处出入，
+> 已标出）。入口是 **`tools\build.bat`**（双击有菜单，命令行也能用）。
+
 ### K.1 客户端包
 
-`tools/build-portable.ps1` 增加 `server.config` / `server/config.py` / `server/app.py` /
-`server/relay.py` / `server/web/`；启停脚本仍是 **3 个**，**不加服务端启动脚本**。
+`tools/build-portable.ps1` **重写**：`server\` 的文件清单改成
+「默认全收，只剔掉测试和开发工具」（D086），根目录带上 `server.config`。
+启停脚本仍是 **3 个**，**不加服务端启动脚本**。
 
 ### K.2 服务端包
 
-新增 `tools/build-server-package.ps1`：
+新增 `tools/build-server-package.ps1`，模板在 `tools/server-package/`：
 
 ```text
 PopShot-server/
-├─ start.bat / start-debug.bat / stop.bat    Windows（CRLF + UTF-8 无 BOM）
-├─ start.sh  / start-debug.sh  / stop.sh     Linux（LF，可执行）
+├─ start.bat / start-debug.bat / stop.bat    Windows（CRLF + UTF-8 无 BOM，纯 ASCII）
+├─ start.sh  / start-debug.sh  / stop.sh     Linux（LF）
+├─ tools/serverctl.ps1                       Windows 启停实现（中文都在这里，D074）
+├─ tools/serverctl.sh                        Linux 启停实现
 ├─ server.config              只需注册页端口，带中文注释
-├─ server/                    和客户端包同一份代码
+├─ server/                    和客户端包同一份代码（+ 空的 data/）
 ├─ runtime-win/python/        Windows 独立运行时
-├─ runtime-linux/python/      Linux 独立运行时（python-build-standalone，记 SHA-256）
-├─ data/accounts.json         空存档
+├─ runtime-linux/*.tar.gz     Linux 独立运行时，★ 未解压（D088），首次启动时自解
 ├─ logs/                      server.out / server.err / online.log
+├─ BUILD.txt                  批次号 + 共用服务端代码哈希（D089）
 └─ README.md                  部署说明 + 要开哪几个端口
 ```
+
+**和最初设想的两处出入**：
+
+1. `runtime-linux/` 里是**没解开的 `.tar.gz`**，不是解好的 `python/`
+   —— 打包在 Windows 上做，解开会丢符号链接和可执行位（D088）；
+2. 账号存档放 `server/data/accounts.json`（和客户端包同构），不是顶层 `data/`
+   —— `server/config.py` 的 `PACKAGE_ROOT` 就是这么算的，改了要动代码。
+
+**另外加的**（PLAN 原本没写，但值得留着）：
+
+- **每次打包都用包内 Python 跑一遍包内服务端做冒烟自检**（D087）；
+- `BUILD.txt` 的批次号 + 代码哈希，让「客户端包和服务端包是不是配套的」
+  变成收包人也能核对的事实（D089，配合 D079）。
 
 控制通道在服务端包里默认关闭；要开也只绑 `127.0.0.1`。
 

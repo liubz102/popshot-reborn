@@ -1608,3 +1608,206 @@ cdq / idiv 100000 / add eax, 10           ; 否则类别 = 10 + (句柄-100000)/
 ⚠ **还没验的**：这一切都是假客户端收到的**字节**。
 「真客户端收到之后会不会照做」（别人的角色真的倒下 / 掉落物真的出现在两边 /
 结算界面真的显示两行）**必须两台真机在同一局里**才能证，见 PROGRESS 的 ⏳ 区第 7 条。
+
+---
+
+## 163. ★★★ 打包（里程碑 K）踩到的硬事实
+
+会话 09 重写打包脚本时查明的，都实测过（标了「未实测」的那条除外）。
+
+### 163.1 上一版打包脚本打出来的客户端包**起不了服务端**
+
+`tools\build-portable.ps1`（V0.1 留下的）用**手写白名单**列 `server\` 要拷哪些
+文件，只有 `authserver / gameserver / account_store / protocol / simple / snow`
+六个。V0.2 新增的 **`app.py`、`config.py`、`relay.py`、`relayserver.py`、
+`lobby.py`、`tickets.py`、`eventlog.py`、`netlisten.py`、`web\`** 一个都没进包，
+根目录的 `server.config` 也没有。
+
+而 `tools\launch.ps1` 启的正是 `server\app.py` —— 也就是说
+**这个包在任何一台不是开发机的电脑上都跑不起来**。
+本机看不出来的原因：本机永远能从项目目录直接跑。
+
+→ 修法见 D086（反向排除）+ D087（冒烟自检）。
+
+### 163.2 `app.py` 的四个端口全部可以命令行覆盖 —— 这是冒烟自检的前提
+
+`--auth-port / --game-port / --relay-port / --web-port`，再配上
+`--accounts <临时路径>`（`AccountStore.__init__` 会自己把文件建出来）和
+`--no-online-log`，就能**在开发服务端正在跑的情况下**把包里的服务端
+另起一份验一遍，且不往包里写任何文件。
+
+实测：自检用 47711 / 27899 / 27898 / 27910 四个口，和 47611 / 27799 / 27798 /
+27810 完全不打架。
+
+### 163.3 ★ Git for Windows 的 `tar` 会把 `D:\...` 当成远程主机
+
+`Get-Command tar` 在装了 Git 的机器上（或从 Bash 里调起来时）可能拿到
+MSYS 的 `/usr/bin/tar`，它把 `D:\work\...` 解释成「主机 D 上的路径」：
+
+```text
+tar (child): Cannot connect to D: resolve failed
+tar: Child returned status 128
+```
+
+必须**写死** `%SystemRoot%\System32\tar.exe`（Windows 10 1803+ 自带
+bsdtar 3.5.2，本机 19045 有）。同类陷阱：`find`、`sort` 也有 MSYS 版。
+
+### 163.4 `.bat` 的真正约束是「纯 ASCII」，**不是「不许 chcp 65001」**
+
+`start.bat` / `stop.bat` / `start-debug.bat` 三个都带着 `chcp 65001 >nul`
+且工作正常（§135 / D074 说的是**文件里的多字节字符**会让 cmd 的字节偏移漂移）。
+所以新的 `tools\build.bat` 也加了 `chcp 65001` —— 加了之后管道里的中文
+才是 UTF-8，不加的话输出被按 CP936 编码，在 UTF-8 终端里全是乱码。
+**文件本身仍然必须纯 ASCII**（打包脚本里有 `Test-AsciiOnly` 在每次打包时检查）。
+
+### 163.5 `logs\server.out` 是 UTF-8，PowerShell 读它要显式 `-Encoding UTF8`
+
+`app.py` 开头把 stdout/stderr `reconfigure(encoding="utf-8")` 了，所以落盘的是
+UTF-8。Windows PowerShell 5.1 的 `Get-Content` 默认按系统 ANSI（中文机器 =
+CP936）读，会得到「璐﹀彿瀛樻。」这类乱码 —— **文件本身没问题**。
+记事本 / VSCode 打开正常。让测试的人把日志发回来时不用担心这一条。
+
+### 163.6 体积和耗时（本机 RTX3070 / SSD 实测）
+
+| 产物 | 目录 | 压缩后 | 工具 |
+|---|---|---|---|
+| 客户端包 | 391.4 MiB | 365.4 MiB（zip） | 7-Zip `-mx=5`，约 1 分钟 |
+| 服务端包 | 22.2 MiB | 11.2 MiB（zip）/ 11.4 MiB（tar.gz） | 7-Zip / bsdtar，秒级 |
+
+客户端包压不动是因为 `game_patched\Pack\*.pkn` 本来就是压缩过的。
+`Compress-Archive` 压同样的东西要好几分钟，所以打包脚本优先找 7-Zip。
+
+### 163.7 Linux 独立 Python 的包里**真的有符号链接和可执行位**
+
+`tar -tvzf` 列 python-build-standalone 的 `install_only_stripped` 包，逐条实证：
+
+```text
+lrwxrwxrwx  python/bin/python3       -> python3.14
+lrwxrwxrwx  python/bin/python        -> python3.14
+lrwxrwxrwx  python/bin/pydoc3        -> pydoc3.14
+-rwxrwxr-x  python/bin/pip3.14
+```
+
+**符号链接和可执行位都在**，而 Windows 上解开这两样都保不住。
+（严格说：「保不住」这一步没有真机验证 —— 手上没有 Linux 环境去跑解出来的东西；
+但「链接和权限位确实存在」是实测的。）
+所以服务端包里放的是**没解开的 `.tar.gz`**，由 `tools/serverctl.sh`
+第一次启动时在 Linux 上自己解（D088）。
+
+---
+
+## 164. ★★★★ `Invoke-WebRequest -UseBasicParsing` 的 `.Content` 对二进制响应是 `Byte[]`，不是字符串
+
+会话 09 实测。**这个坑会伪装成「上游少了文件」**，很难往回猜。
+
+### 现象
+
+`build-server-package.ps1 -LinuxRuntime download` 下完 35 MiB 的运行时后报：
+
+```text
+[失败] SHA256SUMS 里没有 cpython-3.15.0rc1+...-install_only_stripped.tar.gz 这一条
+```
+
+看起来像上游漏发了校验和。**实际上那一条一直都在。**
+
+### 根因
+
+GitHub 的 release 资产以 `Content-Type: application/octet-stream` 下发，
+而 Windows PowerShell 5.1 的 `Invoke-WebRequest -UseBasicParsing` 在这种
+Content-Type 下把 `.Content` 给成 **`System.Byte[]`**（不是 `String`）。
+
+于是这一句：
+
+```powershell
+foreach ($line in ($sumText -split "`n")) { ... }
+```
+
+是在对**字节数组**做 `-split`：PowerShell 先把每个 byte 各自转成字符串，
+得到 **122082 个单字节字符串**（正好等于文件的字节数 —— 这就是识别这个坑的
+特征：「行数」和「字节数」一模一样），一行完整的文件名当然永远匹配不上。
+
+```text
+$resp.Content.GetType()  ->  System.Byte[]
+($resp.Content -split "`n").Count   ->  122082   # = 文件字节数
+([Text.Encoding]::UTF8.GetString($resp.Content) -split "`n").Count  ->  853  # 真行数
+```
+
+### 做法
+
+取文本一律走 `build-common.ps1` 的 `Get-WebText`，它按类型分流：
+
+```powershell
+if ($resp.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($resp.Content) }
+```
+
+JSON 接口（`api.github.com`）返回 `application/json`，`.Content` 本来就是字符串，
+但也一并走这个函数 —— 免得以后有人复制这段代码去取别的东西。
+
+### 同一次暴露出来的另外两条
+
+1. **上游一个 release 里同时挂着 3.10 ~ 3.15，其中 3.15 是 `0rc1`（预发布）。**
+   按名字倒序排会挑中 rc，不能拿去开服。现在按「`<系列>.<纯数字>`」匹配，
+   `0rc1+` 过不了 `\d+\+`，**预发布天然被挡掉**；默认系列 `3.14`，
+   和包里的 Windows 运行时（CPython 3.14.3）同一个大版本。
+2. **校验失败的那次把 35 MiB 的文件留在了 `tools\_dl\` 里**（`throw` 排在
+   `Remove-Item` 前面），下一次 `-LinuxRuntime auto` 会把这份**没验过**的东西
+   直接打进发布包。现在：任何校验失败都删文件；校验通过则在旁边写一份
+   `<文件>.sha256`，`auto` 模式**只认带旁证且哈希对得上的缓存**，
+   否则打印「忽略未校验的缓存文件」当没有。
+
+### `Sort-Object { $Matches[1] }` 也是错的（顺带修掉）
+
+`$Matches` 是上一次 `-match` 留下的。`Sort-Object` 在整条管道过滤完之后才跑，
+那时 `$Matches` 只剩最后一个元素的结果，所有元素会拿到同一个排序键。
+排序脚本块里必须**自己再 match 一次**。
+
+---
+
+## 165. ★★★ `.gitignore` **不支持行尾注释**，写了规则就废
+
+会话 09 实测。写 `.gitignore` 时给规则加了中文说明：
+
+```gitignore
+/game_patched/Dump/                 # 崩溃转储，一个 32 MB
+/game_patched/Debug/                # 客户端自己的调试日志
+/game_patched/BigShot.rpt           # 崩溃报告
+/game_patched/GameGuard/*.erl       # GameGuard 的运行日志
+/game_patched/UserConfig.ini        # 本机设置
+```
+
+**五条全部不生效**。gitignore 只认**整行注释**（`#` 在行首），
+行尾的 `#` 不是注释起始符 —— 整行连同后面那串中文一起被当成 pattern，
+自然匹配不上任何真实路径。
+
+★ **最阴的地方**：`Dump/` 那条**看起来是生效的** —— 因为文件是 `*.mdmp`，
+被另一条通用规则兜住了。只验一条会得出「规则没问题」的错误结论。
+
+### 怎么验
+
+不要靠读，造一个镜像仓库用 `git check-ignore` 挨个问：
+
+```bash
+mkdir /tmp/t && cd /tmp/t && git init -q .
+cp <项目>/.gitignore .
+# 按真实相对路径造一批空文件
+mkdir -p game_patched/Dump && : > game_patched/Dump/x.mdmp
+git check-ignore -q game_patched/Debug/2026-08-11.txt && echo 忽略 || echo 会提交
+```
+
+`git check-ignore -v <路径>` 还会打出是**哪一行**规则命中的，
+排「为什么这个文件没被忽略」时比读文件快得多。
+
+### 顺带两条
+
+- 目录被忽略之后，git **不会再走进去**，所以 `!` 例外规则**救不回**
+  被忽略目录里的文件。要留例外就别忽略它的父目录。
+- ★ **「每次运行都会变」不是「可以不提交」的判据** —— 真正的判据是
+  「缺了它构建产物还对不对」。本次差点栽在 `game_patched/UserConfig.ini` 上：
+  它每次退出都被改写，看着就是本机杂项，其实是 **V0.1 §49 的修复本身**
+  （`FullScreen=1` + `ColorDepth=1`）。客户端登录成功那一刻才写出它，
+  所以新 clone 打出来的包里没有它 -> 玩家用内置默认值「全屏 + 16 位色」->
+  D3D 模式枚举下溢 -> **开局卡死约 40 分钟，且没有任何报错**。
+  `build-portable.ps1` 现在有一道闸：文件不在、或 `ColorDepth≠1` 就中止打包
+  （三种情况都实测过）。
+- `.gitignore` 里的非 ASCII 路径（本项目有 `原版安装包/`）是可以用的，
+  前提是文件本身存成 **UTF-8 无 BOM** —— 带 BOM 的话第一条规则会被 BOM 污染。
