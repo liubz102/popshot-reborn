@@ -1534,6 +1534,24 @@ def build_end_game(seat_id=0, success=True, values=None):
             + b"".join(w_i32(v) for v in values))
 
 
+def end_game_order(my_seat, seats):
+    """结算时 `0x0411` 发给某一个人的顺序：**自己那份在最前**，其余升序。
+
+    为什么自己必须是第一发（§178）：`0x551804` 处理**每一发** `0x0411` 都会走到
+    `0x5518e4 call 0x4913fc`（弹结算界面），而那个函数第一句就是
+    `cmp byte [esi+4], 0 / jne 尾部` —— 真正把界面建出来的是**第一发**。
+    只有座位号 == 自己时才更新的那四个全局（右上角数据栏）在 `0x4913fc`
+    **之前**写，所以「自己那份排第一」= 界面弹出来的那一刻，
+    自己的经验/金币已经是新值，和 V0.1 实机验过的单人时序逐字一致。
+
+    队友那几行是界面弹出来之后补进去的，照样显示得出来：结算界面画每一行时
+    （`0x4a4b42`）是**当场**从 `[GameContextQuest + 座位*0x34 + 0x3ec]`
+    拷 13 个 dword，不是弹窗时快照的。
+    """
+    return ([my_seat] if my_seat in seats else []) + \
+           sorted(s for s in seats if s != my_seat)
+
+
 #: `gspRepGameResult` 里座位号之后的业务字段个数（反序列化 `0x54c6b4`）。
 GAME_RESULT_VALUE_COUNT = 12
 
@@ -3924,14 +3942,24 @@ class Conn:
           全程按 `pkt+0x04` 的座位号索引（`[ctx+座位*4+0x2c/0x44/0x5c]` 三行数值、
           `[ctx+0x184]` 名次表），六份下去结算界面上每个人那一行才有数。
           只发自己那一份的话，队友那几行全是 0。
-        - **`0x0411` 每人只发自己那一份**：处理器 `0x551804` 在
-          `0x5518b4` 处 `cmp 包里的座位, 我的座位`，只有相等时才把
-          经验/金币写进右上角数据栏的四个全局。多发几份不会串账，
-          但每一份都会让客户端再回一发 `0x0505` 遥测（`0x4087f0`），
-          没有 RE 依据说重复调它是安全的 —— 所以按「一人一份」发。
-          ⚠ 代价：队友那一行的「分数 / 生命」（来自
-          `[ctx+0x3ec+座位*0x34]`，只有 `0x0411` 会写）会是 0。
-          等两台真机验完再决定要不要补发，见 PROGRESS 的 ⏳ 区。
+        - **`0x0411` 也每座位一份**（会话 15 改，D101 / §178）：那 13 个 dword
+          由 `0x4a4096` 写进 `[GameContextQuest + 座位*0x34 + 0x3ec]`，
+          **只有 `0x0411` 会写**，所以不每座位发一份的话，结算界面上
+          队友那一行的「分数 / 生命」是 0 —— 两个人看到的数还对不上。
+          三处「重复投递安不安全」现在都读到底了：
+          · `0x4a4096` 纯按座位号索引写 13 个 dword，各写各的；
+          · `0x5518b9 cmp 包里的座位, 我的座位` 只护着右上角数据栏那四个全局
+            （`+0x1c` 是 `+=`），别人那份走不到，钱不会串；
+          · `0x4913fc`（弹结算界面）第一句就是 `cmp byte [esi+4], 0 / jne 尾部`，
+            第二发起整个函数是空转；
+          · `0x4087f0` 是 `0x0505 gcpAccumulatedWeaponDamage` 的**排空式**上报：
+            `0x55bc5f` 把 `GameSession+0x404` 的累计伤害和一个刚构造的空对象
+            **swap**（`mov [esi],edx / mov [eax+esi],ecx`）再发、再析构，
+            所以第二发起送的是空表，既不重复计数也不改别的状态。
+        - **自己那一份排在最前面**：`0x4913fc` 在处理**每一发** `0x0411` 的
+          末尾都会被调到，弹界面的是第一发。把自己那份放第一发，
+          「先更新四个全局、再弹界面」的时序和 V0.1 实机验过的单人版一模一样，
+          队友那几行只是在界面弹出来之后补进去的额外信息。
         """
         quest = self.quest_state()
         if quest.settled:
@@ -4010,15 +4038,19 @@ class Conn:
                 for other_seat in sorted(results):
                     conn.send(build_game(OP_REP_GAME_RESULT,
                                          results[other_seat]))
-                payload, _ = end_games[seat]
-                conn.send(build_game(OP_END_GAME, payload))
+                # 0x0411 也是每座位一份，但**自己那份必须是第一发**
+                # （弹结算界面的是第一发，见上面的注释）。
+                for other_seat in end_game_order(seat, end_games):
+                    payload, _ = end_games[other_seat]
+                    conn.send(build_game(OP_END_GAME, payload))
             except OSError as error:
                 conn.log(f"   结算下发失败（{error!r}），忽略")
                 continue
             conn.settled = True
             conn.quest_success = cleared
-        self.log(f"← 已结算本局：{len(seats)} 个座位各一份 gspRepGameResult(0x0309)"
-                 f" + 每人自己那份 gspEndGame(0x0411)"
+        self.log(f"← 已结算本局：每人各收到 {len(results)} 份"
+                 f" gspRepGameResult(0x0309) + {len(end_games)} 份"
+                 f" gspEndGame(0x0411)（自己那份在最前）"
                  f"（{'闯关' if quest_mode else '对战'}，"
                  f"{'通关' if cleared else '未通关'}）")
 

@@ -95,7 +95,8 @@
 /logs/
 /server/data/accounts.json
 /server/data/accounts.json.*.tmp
-# tickets.json 是活着的登录凭证（断线重连要用，§171 / D096），跟着机器走，不进仓库。
+# tickets.json：会话 12 中途试过把票据落盘，用户拍板改回纯内存（D097），
+# 现在**不会再生成**这个文件。留着这两行只为挡住那阵子留下的残留文件。
 /server/data/tickets.json
 /server/data/tickets.json.*.tmp
 

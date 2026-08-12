@@ -23,11 +23,31 @@ static HANDLE        g_cleared_event = NULL;
 static DWORD         g_main_thread_id = 0;
 static volatile LONG g_cleared = 0;
 
+/* 等 bshook.dll 自己那条武装线程报「已武装」。
+   ★ 为什么必须等（V0.2 会话 15）：bsloader 现在也会从进程外武装 DR0 并守护，
+   一直守到收到这个握手为止。不等的话，被清掉的 DR0 可能是**bsloader**补回来的，
+   本夹具就测不到「DLL 内的守护线程」这件事了。 */
+static void wait_for_dll_armed(void)
+{
+    char name[128];
+    DWORD n = GetEnvironmentVariableA(POPSHOT_BSHOOK_READY_ENV, name, sizeof(name));
+    HANDLE ready;
+
+    if (n == 0 || n >= sizeof(name)) return;
+    ready = OpenEventA(SYNCHRONIZE, FALSE, name);
+    if (!ready) return;
+    WaitForSingleObject(ready, 5000);
+    CloseHandle(ready);
+}
+
 static DWORD WINAPI clear_breakpoint_once(LPVOID unused)
 {
     HANDLE main_thread;
-    DWORD started = GetTickCount();
+    DWORD started;
     (void)unused;
+
+    wait_for_dll_armed();
+    started = GetTickCount();
 
     main_thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
                              THREAD_SET_CONTEXT, FALSE, g_main_thread_id);

@@ -281,14 +281,59 @@ static MsgBoxW_t s_MessageBoxW = NULL;
 static MsgBoxA_t s_MessageBoxA = NULL;
 static volatile LONG g_hooks_installed = 0;
 
+static void signal_gameguard_failed(void);
+static int  gameguard_already_hit(void);
+static int  gameguard_retry_allowed(void);
+
+/* 这个框是不是「Game guard文件不存在或已变更，请重新安装Game guard。」？
+   中文部分在不同版本里可能变，`Game guard` / `GameGuard` 这半截是拉丁字母，
+   直接在 UTF-8 里按大小写不敏感找子串最稳。 */
+static int looks_like_gameguard_error(const char *u8)
+{
+    const char *p;
+
+    if (!u8) return 0;
+    for (p = u8; *p; p++) {
+        if ((p[0] == 'g' || p[0] == 'G') &&
+            _strnicmp(p, "game", 4) == 0) {
+            const char *q = p + 4;
+            while (*q == ' ') q++;
+            if (_strnicmp(q, "guard", 5) == 0) return 1;
+        }
+    }
+    return 0;
+}
+
+/* GameGuard 那个错误框 = 绕过失败的硬证据。报给 bsloader，让它自己重来一次。
+   返回 1 表示「这一次别真弹给玩家看」（还能重来），0 表示照常弹。 */
+static int handle_gameguard_error_box(const char *u8text, const char *u8cap)
+{
+    if (gameguard_already_hit()) return 0;   /* 已经绕过了，那就是别的框 */
+    if (!looks_like_gameguard_error(u8text) &&
+        !looks_like_gameguard_error(u8cap)) return 0;
+
+    bslog("HWBP    ★★ GameGuard 绕过失败：客户端弹出了「%s」——"
+          " DR0 从头到尾没命中过（§179）", u8text ? u8text : "");
+    signal_gameguard_failed();
+    if (!gameguard_retry_allowed()) {
+        bslog("HWBP    已经是最后一次尝试，错误框照常弹给玩家看");
+        return 0;
+    }
+    bslog("HWBP    先吃掉这个框，bsloader 会自动重来一次");
+    return 1;
+}
+
 static int WINAPI det_MessageBoxW(HWND hWnd, LPCWSTR text, LPCWSTR cap, UINT type)
 {
     void *ra = _ReturnAddress();
     char u8t[3072], u8c[512];
+    w2u8(cap, u8c, sizeof(u8c));
+    w2u8(text, u8t, sizeof(u8t));
     bslog("★MSGBOXW caller=%08X type=%08x cap=\"%s\"",
-          (unsigned)(UINT_PTR)ra, type, w2u8(cap, u8c, sizeof(u8c)));
-    bslog("         text=\"%s\"", w2u8(text, u8t, sizeof(u8t)));
+          (unsigned)(UINT_PTR)ra, type, u8c);
+    bslog("         text=\"%s\"", u8t);
     log_ebp_chain("★MSGBOXW");
+    if (handle_gameguard_error_box(u8t, u8c)) return IDOK;
     if (!s_MessageBoxW) return IDOK;            /* 理论上不会发生 */
     return s_MessageBoxW(hWnd, text, cap, type);
 }
@@ -299,6 +344,7 @@ static int WINAPI det_MessageBoxA(HWND hWnd, LPCSTR text, LPCSTR cap, UINT type)
     bslog("★MSGBOXA caller=%08X type=%08x cap=\"%s\" text=\"%s\"",
           (unsigned)(UINT_PTR)ra, type, cap ? cap : "(null)", text ? text : "(null)");
     log_ebp_chain("★MSGBOXA");
+    if (handle_gameguard_error_box(text, cap)) return IDOK;
     if (!s_MessageBoxA) return IDOK;
     return s_MessageBoxA(hWnd, text, cap, type);
 }
@@ -1072,14 +1118,48 @@ static void poll_unpack(void)
 /*   握手；命中前每 10ms 复查一次 DR0，被壳/安全软件清掉就补回去（§134）。      */
 /* -------------------------------------------------------------------------- */
 static const unsigned char GG_ORIG[POPSHOT_GG_CHECK_INSN_LEN] =
-    { 0xE8, 0xCF, 0x60, 0x01, 0x00 }; /* call 0x5611d0 */
+    POPSHOT_GG_ORIG_BYTES;
 static const unsigned char GG_OLD_PATCH[POPSHOT_GG_CHECK_INSN_LEN] =
-    { 0xB8, 0x55, 0x07, 0x00, 0x00 }; /* 兼容旧版内存 patch */
+    POPSHOT_GG_OLD_PATCH_BYTES;
 
 static PVOID         g_gg_veh = NULL;
 static volatile LONG g_gg_break_state = 0;    /* 1=成功，2=旧 patch，-1=字节不符 */
 static volatile LONG g_gg_break_reported = 0;
 static DWORD         g_main_thread_id = 0;
+/* DllMain 跑到哪一刻的 tick。武装线程用它算「我被加载器锁压了多久」（§179）。 */
+static DWORD         g_dllmain_tick = 0;
+
+/* 回报给 bsloader 的两个结果事件（DllMain 里打开，进程活多久就留多久）。 */
+static HANDLE        g_gg_hit_event = NULL;
+static HANDLE        g_gg_failed_event = NULL;
+static volatile LONG g_gg_hit_signaled = 0;
+static volatile LONG g_gg_failed_signaled = 0;
+/* "1" = bsloader 还能再重来一次，那就别把 GameGuard 的错误框弹给玩家看。 */
+static volatile LONG g_gg_retry_allowed = 0;
+
+static int gameguard_already_hit(void)
+{
+    return InterlockedCompareExchange(&g_gg_break_state, 0, 0) > 0;
+}
+
+static int gameguard_retry_allowed(void)
+{
+    return InterlockedCompareExchange(&g_gg_retry_allowed, 0, 0) != 0;
+}
+
+/* 「DR0 命中过」—— 绕过成功的唯一硬证据，只报一次。 */
+static void signal_gameguard_hit(void)
+{
+    if (InterlockedExchange(&g_gg_hit_signaled, 1)) return;
+    if (g_gg_hit_event) SetEvent(g_gg_hit_event);
+}
+
+/* 「客户端弹了 GameGuard 的错误框」—— 绕过失败的硬证据，只报一次。 */
+static void signal_gameguard_failed(void)
+{
+    if (InterlockedExchange(&g_gg_failed_signaled, 1)) return;
+    if (g_gg_failed_event) SetEvent(g_gg_failed_event);
+}
 
 /* 命中之前每隔这么久复查一次 DR0 还在不在。10ms 足够快（从解壳到执行到
    0x54b0fc 有好几秒），而每轮只是挂起-读-恢复主线程一次，开销可以忽略。 */
@@ -1110,14 +1190,22 @@ static LONG CALLBACK gameguard_veh(EXCEPTION_POINTERS *ep)
     clear_dr0(ctx);
     code = (const unsigned char *)POPSHOT_GG_CHECK_VA;
 
+    /* ★ 两条成功分支都就地告诉 bsloader「绕过成功」，它才好立刻停掉外部的
+       补武装（§179）—— 别指望 watch_thread 去报，那条线程可能还被加载器锁
+       压着。这里只有一次 InterlockedExchange + NtSetEvent，不分配、不取锁，
+       在 VEH 里做是安全的；而且只有 EIP 正好等于校验点时才会走到。 */
     if (memcmp(code, GG_ORIG, POPSHOT_GG_CHECK_INSN_LEN) == 0) {
         ctx->Eax = (DWORD)POPSHOT_GG_SUCCESS_CODE;
         ctx->Eip += (DWORD)POPSHOT_GG_CHECK_INSN_LEN;
         InterlockedExchange(&g_gg_break_state, 1);
+        signal_gameguard_hit();
     } else if (memcmp(code, GG_OLD_PATCH, POPSHOT_GG_CHECK_INSN_LEN) == 0) {
         /* 已经是旧版 `mov eax,0x755`：撤断点后从原 EIP 正常执行即可。 */
         InterlockedExchange(&g_gg_break_state, 2);
+        signal_gameguard_hit();
     } else {
+        /* 字节签名不认识 —— 这不算绕过成功，**不要**报 HIT，
+           让 bsloader 按「失败」处理（多半会重来一次）。 */
         InterlockedExchange(&g_gg_break_state, -1);
     }
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -1133,9 +1221,11 @@ static void report_gameguard_breakpoint(void)
     if (!state || InterlockedExchange(&g_gg_break_reported, 1)) return;
 
     if (state == 1) {
+        signal_gameguard_hit();
         bslog("HWBP    ★GameGuard 校验 @ %08X：DR0 命中，EAX=0x755，跳过状态取值调用",
               (unsigned)POPSHOT_GG_CHECK_VA);
     } else if (state == 2) {
+        signal_gameguard_hit();   /* 旧 patch 也算绕过成功，别让 bsloader 白重来 */
         bslog("HWBP    GameGuard 校验 @ %08X 已是旧版内存 patch，撤掉 DR0 后继续",
               (unsigned)POPSHOT_GG_CHECK_VA);
     } else {
@@ -1283,7 +1373,20 @@ static DWORD WINAPI arm_gameguard_breakpoint_thread(LPVOID param)
        现在换成一个**因果性**的判据：0x54b0fc 那 5 个字节变成已知明文
        （原版 call 或旧 patch）。ASProtect 解壳是整段一次性做完的
        （UNPACK 日志里 base+0x1000 一步从密文变明文），字节对上就说明壳
-       已经真的跑过了。再加一条 10ms 的守护回合，被清掉就补回去。 */
+       已经真的跑过了。再加一条 10ms 的守护回合，被清掉就补回去。
+
+       坑三（V0.2 会话 15，§179）：**这条线程自己就可能好几秒才被调度到。**
+       它是在 DllMain 里 CreateThread 出来的，线程入口要等加载器锁放开才跑；
+       用户那台机器的日志里，本线程和另外两条观测线程的第一行日志都卡在
+       注入后 **3.3 秒**（三条同一毫秒一起解冻），而 GameGuard 校验在那之后
+       只有 2.2 秒就执行了。余量全看别人机器的加载器锁攥多久 —— 这就是
+       「有概率启动报错」的race。所以现在 **bsloader 从进程外也武装一遍**
+       （它不受加载器锁约束），本线程只要一跑起来就接管守护；
+       等它跑起来时断点可能**已经命中过了**（下面 arm_result == 3 那一支）。 */
+    bslog("HWBP    武装线程开始运行（DllMain 之后 %lu ms），指令状态=%d",
+          (unsigned long)(GetTickCount() - g_dllmain_tick),
+          gameguard_instruction_state());
+
     budget = POPSHOT_BSHOOK_READY_TIMEOUT - 2000u;
     started = GetTickCount();
     for (ticks = 0; !g_stop; ticks++) {
@@ -1292,23 +1395,40 @@ static DWORD WINAPI arm_gameguard_breakpoint_thread(LPVOID param)
         if (instruction_state != 0) {
             arm_result = ensure_gameguard_breakpoint(main_thread, &armed_eip,
                                                      &old_dr0, &old_dr7, &error);
-            if (arm_result != 0 && arm_result != 3) break;
+            if (arm_result != 0) break;
         }
         if (WaitForSingleObject(main_thread, 0) == WAIT_OBJECT_0) break;
         Sleep(1);
     }
     elapsed = (DWORD)(GetTickCount() - started);
-    if (arm_result != 1 && arm_result != 2 && error == ERROR_SUCCESS) {
+    if (arm_result != 1 && arm_result != 2 && arm_result != 3 &&
+        error == ERROR_SUCCESS) {
         error = (WaitForSingleObject(main_thread, 0) == WAIT_OBJECT_0)
                     ? ERROR_PROCESS_ABORTED : ERROR_TIMEOUT;
     }
 
+    if (arm_result == 3) {
+        /* bsloader 抢在前面武装了，而且断点在本线程被调度到之前就命中了。
+           这是正常且理想的路径 —— 别再武装一次（那会留下一个永不撤销的
+           断点），直接回报就绪。 */
+        signal_gameguard_hit();
+        bslog("HWBP    断点在武装线程启动前就已命中（bsloader 已从外部武装）");
+        if (!SetEvent(ready_event)) {
+            bslog("HWBP    !! SetEvent(bsloader ready) 失败 err=%lu",
+                  (unsigned long)GetLastError());
+        }
+        CloseHandle(ready_event);
+        CloseHandle(main_thread);
+        return 0;
+    }
+
     if (arm_result == 1 || arm_result == 2) {
         bslog("HWBP    目标指令已解壳（%lu ms / %lu 轮，%s），"
-              "主线程 EIP=%08X，DR0=%08X 已武装",
+              "主线程 EIP=%08X，DR0=%08X 已武装%s",
               (unsigned long)elapsed, (unsigned long)ticks,
               instruction_state == 1 ? "原始 call" : "旧 patch",
-              (unsigned)armed_eip, (unsigned)POPSHOT_GG_CHECK_VA);
+              (unsigned)armed_eip, (unsigned)POPSHOT_GG_CHECK_VA,
+              arm_result == 2 ? "（bsloader 已提前武装，这里只是接管守护）" : "");
         if (!SetEvent(ready_event)) {
             bslog("HWBP    !! SetEvent(bsloader ready) 失败 err=%lu",
                   (unsigned long)GetLastError());
@@ -1364,6 +1484,10 @@ static DWORD WINAPI arm_gameguard_breakpoint_thread(LPVOID param)
             break;
         }
     }
+    /* ★ 命中的回报不能只挂在 watch_thread 上（它同样可能被加载器锁压着）。
+       这里是「守护到命中为止」的唯一出口，就近报一次最保险。 */
+    if (InterlockedCompareExchange(&g_gg_break_state, 0, 0) > 0)
+        signal_gameguard_hit();
 
     CloseHandle(main_thread);
     return 0;
@@ -2164,18 +2288,29 @@ static void banner(void)
                                      : "精简（只记关键事件；调试时设 BSHOOK_VERBOSE_LOG=1）");
 }
 
-static HANDLE open_loader_ready_event(void)
+/* 按环境变量里的名字打开 bsloader 建好的那个事件。名字没传 = 老版本
+   bsloader（或手工注入），返回 NULL，调用方各自决定要不要当致命错误。 */
+static HANDLE open_loader_event(const char *env_name)
 {
     char name[128];
-    DWORD n = GetEnvironmentVariableA(POPSHOT_BSHOOK_READY_ENV, name, sizeof(name));
+    DWORD n = GetEnvironmentVariableA(env_name, name, sizeof(name));
     if (n == 0 || n >= sizeof(name)) return NULL;
     return OpenEventA(EVENT_MODIFY_STATE, FALSE, name);
+}
+
+static void read_gg_retry_flag(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA(POPSHOT_BSHOOK_RETRY_ENV, buf, sizeof(buf));
+    InterlockedExchange(&g_gg_retry_allowed,
+                        (n > 0 && n < sizeof(buf) && buf[0] != '0') ? 1 : 0);
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     HANDLE th;
     HANDLE ready_event;
+    HANDLE injected_event;
     (void)reserved;
 
     switch (reason) {
@@ -2183,16 +2318,21 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         DisableThreadLibraryCalls(inst);
         InitializeCriticalSection(&g_cs);
         g_main_thread_id = GetCurrentThreadId(); /* LoadLibrary APC 正在这条主线程上执行 */
+        g_dllmain_tick = GetTickCount();
         read_log_level();
         open_log();
         banner();
         read_online_config();   /* V0.2：server.config 经环境变量传进来 */
+        read_gg_retry_flag();
 
-        ready_event = open_loader_ready_event();
+        ready_event = open_loader_event(POPSHOT_BSHOOK_READY_ENV);
         if (!ready_event) {
             bslog("HWBP    !! 找不到 bsloader 就绪事件，拒绝在没有 DR0 握手的情况下继续");
             return FALSE;
         }
+        /* 这两个只是回报结果用的，老版本 bsloader 没有也照跑。 */
+        g_gg_hit_event = open_loader_event(POPSHOT_BSHOOK_HIT_ENV);
+        g_gg_failed_event = open_loader_event(POPSHOT_BSHOOK_FAILED_ENV);
 
         g_gg_veh = AddVectoredExceptionHandler(1, gameguard_veh);
         if (!g_gg_veh) {
@@ -2201,8 +2341,20 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             CloseHandle(ready_event);
             return FALSE;
         }
-        bslog("HWBP    GameGuard VEH 已安装，等待 DR0 命中 %08X",
-              (unsigned)POPSHOT_GG_CHECK_VA);
+        bslog("HWBP    GameGuard VEH 已安装，等待 DR0 命中 %08X"
+              "（本次%s允许自动重来）",
+              (unsigned)POPSHOT_GG_CHECK_VA,
+              gameguard_retry_allowed() ? "" : "不");
+
+        /* ★ 在这里、而不是等武装线程跑起来才告诉 bsloader「VEH 装好了」：
+           它收到这一发就可以从进程外武装 DR0，不必等加载器锁放开（§179）。
+           顺序是硬约束 —— 必须在 AddVectoredExceptionHandler 成功之后置位，
+           否则 bsloader 可能在没人处理单步异常时就把断点摆上去。 */
+        injected_event = open_loader_event(POPSHOT_BSHOOK_INJECTED_ENV);
+        if (injected_event) {
+            SetEvent(injected_event);
+            CloseHandle(injected_event);
+        }
 
         /* 线程入口要等 DllMain 返回后才会运行。它观察主线程真正离开 APC 恢复路径，
            然后设置 DR0 并通知 bsloader；ready_event 的所有权一并交给它。 */

@@ -130,7 +130,7 @@ stop.bat
 | 选项 | 连哪儿 |
 |---|---|
 | 本机服务器 | 本机的服务端，一个人玩，存档在本机 |
-| 远程服务器<br>(地址请改:server.config) | `server.config` 里 `server_address` 指向的那台服务器 |
+| 远程服务器<br>(IP设置:server.config) | `server.config` 里 `server_address` 指向的那台服务器 |
 
 `server.config` 就在 `start.bat` 旁边，用记事本打开即可，里面有中文注释和
 IPv4 / IPv6 / 域名三种写法的示例。改完重新运行 `start.bat` 生效。

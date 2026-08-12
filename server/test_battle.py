@@ -455,8 +455,15 @@ def end_game_seat(body):
     return struct.unpack_from("<i", body, 0)[0]
 
 
+def end_game_score(body):
+    """`0x0411` 里结算界面「分数」那一格（座位 + success 之后的 12 个业务值）。"""
+    values = struct.unpack_from(
+        f"<{gameserver.END_GAME_VALUE_COUNT}i", body, 8)
+    return sum(values[i] for i in gameserver.END_GAME_SCORE_PARTS)
+
+
 class QuestSettlementTests(BattleRoom):
-    """闯关（合作）的结算：每座位一份 `0x0309`，每人自己那份 `0x0411`。"""
+    """闯关（合作）的结算：`0x0309` 和 `0x0411` 都是每座位一份（自己那份在最前）。"""
 
     def score(self, conn, seat, value):
         conn.my_seat = seat
@@ -479,18 +486,40 @@ class QuestSettlementTests(BattleRoom):
             seats = [result_seat(b) for b in bodies(conn, OP_REP_GAME_RESULT)]
             self.assertEqual([0, 1], seats)
 
-    def test_each_client_only_gets_its_own_end_game(self):
-        # 0x0411 的处理器 0x551804 只在「包里的座位 == 我的座位」时才把
-        # 经验/金币写进右上角数据栏的四个全局；一人一份就够，多发几份
-        # 只会让客户端每份都回一发 0x0505 遥测（0x4087f0）。
+    def test_everyone_gets_one_end_game_per_occupied_seat(self):
+        # §178 / D101：那 13 个 dword（结算界面「分数」那一行）只有 0x0411 会写，
+        # 而且是按包里的座位号索引写的。不每座位发一份，队友那一行就是 0，
+        # 于是两个人看到的结算界面对不上。
         self.score(self.alice, 0, 40)
         self.score(self.bob, 1, 25)
         self.clear()
         self.end()
-        self.assertEqual([0], [end_game_seat(b)
-                               for b in bodies(self.alice, OP_END_GAME)])
-        self.assertEqual([1], [end_game_seat(b)
-                               for b in bodies(self.bob, OP_END_GAME)])
+        for conn in (self.alice, self.bob):
+            seats = [end_game_seat(b) for b in bodies(conn, OP_END_GAME)]
+            self.assertEqual({0, 1}, set(seats))
+            self.assertEqual(2, len(seats))
+
+    def test_the_end_game_for_my_own_seat_comes_first(self):
+        # 弹结算界面的是**第一发** 0x0411（0x4913fc 有重入保护），而右上角
+        # 数据栏那四个全局只有自己那一份会写 —— 自己排第一，界面弹出来的
+        # 那一刻数据栏就是新值，时序和 V0.1 单人版一致。
+        self.score(self.alice, 0, 40)
+        self.score(self.bob, 1, 25)
+        self.clear()
+        self.end()
+        self.assertEqual(0, end_game_seat(bodies(self.alice, OP_END_GAME)[0]))
+        self.assertEqual(1, end_game_seat(bodies(self.bob, OP_END_GAME)[0]))
+
+    def test_each_end_game_carries_that_seats_own_numbers(self):
+        # 队友那一行要显示的是**他自己**的分数，不是收包这个人的分数。
+        self.score(self.alice, 0, 40)
+        self.score(self.bob, 1, 25)
+        self.clear()
+        self.end()
+        for conn in (self.alice, self.bob):
+            scores = {end_game_seat(b): end_game_score(b)
+                      for b in bodies(conn, OP_END_GAME)}
+            self.assertEqual({0: 40, 1: 25}, scores)
 
     def test_the_result_packets_still_precede_the_end_game(self):
         # §99：0x0309 要在 GameContext 还活着时发，0x0411 才结束关卡。
@@ -498,8 +527,8 @@ class QuestSettlementTests(BattleRoom):
         for conn in (self.alice, self.bob):
             ops = [op for op in opcodes(conn)
                    if op in (OP_REP_GAME_RESULT, OP_END_GAME)]
-            self.assertEqual(OP_END_GAME, ops[-1])
-            self.assertNotIn(OP_END_GAME, ops[:-1])
+            first_end = ops.index(OP_END_GAME)
+            self.assertNotIn(OP_REP_GAME_RESULT, ops[first_end:])
 
     def test_the_room_only_settles_once(self):
         # 房里每个人的客户端都会发一发 0x040f。不挡的话一局入账好几次。
@@ -674,7 +703,10 @@ class PvpFinishTests(BattleRoom):
     def test_the_round_is_only_settled_once(self):
         for i in range(6):
             self.kill(0, 1, deaths=i)
-        self.assertEqual(1, len(bodies(self.alice, OP_END_GAME)))
+        # 每座位一份（§178），所以两个人的房间正好两发；结算了两次就是四发。
+        self.assertEqual([0, 1],
+                         sorted(end_game_seat(b)
+                                for b in bodies(self.alice, OP_END_GAME)))
 
     def test_score_limits_match_the_client(self):
         # `0x55be71`：个人战看人数，组队战看「人数 // 2」；表外一律 5。
