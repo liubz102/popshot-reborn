@@ -51,8 +51,13 @@ DEFAULT_REGISTER_PORT = 27810
 #: 配置文件名。放在包根目录（= `start.bat` 同目录 = `server/` 的上一级）。
 CONFIG_FILENAME = "server.config"
 
+#: ★ `server_address` 的默认值是一个**局域网示例地址**，不是 `127.0.0.1`。
+#: 填 `127.0.0.1` 的话「远程服务器」和「本机服务器」连的是同一台机器，
+#: 这个选项就等于没有 —— 玩家看到 `192.168.1.100` 才知道这里该填别人的地址。
+#: ⚠ 改这里就要同步改下面 `DEFAULT_CONFIG_TEXT` 里的那一行
+#: （`test_the_shipped_template_parses_to_the_defaults` 会钉住这一点）。
 DEFAULTS = {
-    "server_address": "127.0.0.1",
+    "server_address": "192.168.1.100",
     "server_register_port": DEFAULT_REGISTER_PORT,
     "local_register_port": DEFAULT_REGISTER_PORT,
 }
@@ -179,8 +184,11 @@ DEFAULT_CONFIG_TEXT = """\
 #   server_address = 192.168.1.100          <- 局域网里的另一台电脑（IPv4）
 #   server_address = 2001:db8::1            <- IPv6（方括号加不加都行）
 #   server_address = popshot.example.com    <- 域名
+#
+# ★ 下面这个 192.168.1.100 只是【示例地址】，多半不是你要连的那台机器。
+#   在登录界面选「远程服务器」之前，请把它改成开服那台电脑真正的地址。
 # ---------------------------------------------------------------------------
-server_address = 127.0.0.1
+server_address = 192.168.1.100
 
 # ---------------------------------------------------------------------------
 # 远程服务器上「用户注册页」的端口号。

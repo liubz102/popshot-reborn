@@ -6,9 +6,18 @@ screenshot.py —— 抓某个进程主窗口（或整屏）的截图，存 PNG
 用法：
     python tools/screenshot.py <pid> <输出png>       # 抓该进程的可见顶层窗口
     python tools/screenshot.py screen <输出png>      # 抓整个屏幕
+    python tools/screenshot.py dlg <pid> <输出png>   # 抓 #32770 对话框（登录框）
 
 实现：BitBlt 屏幕 DC 到内存位图，再手工写最小 PNG（zlib + struct，无外部依赖）。
 不用 PrintWindow —— D3D9 独占绘制的窗口 PrintWindow 会抓到全黑。
+
+★ `dlg` 模式走的是 **`GetWindowDC(那个窗口)`**，不碰屏幕（§174）：
+  串流 / 远程桌面会话里桌面根本不渲染，屏幕 DC 抓出来是**全黑**的
+  （V0.2 会话 12 就是这么卡住的），而 DWM 给每个窗口留着自己的重定向表面，
+  普通 GDI 对话框从那里照样读得到真实像素。
+  也**不会触发重绘** —— 所以「被兄弟控件擦掉的字」在这里也是缺的，
+  正好用来验登录框的布局问题（§173）。
+  ⚠ 只对 GDI 窗口有效；游戏主窗口那种 D3D9 独占绘制的照样是黑的。
 """
 import ctypes as C
 import struct
@@ -111,6 +120,63 @@ def grab(x, y, w, h):
     return bytes(buf)
 
 
+def grab_window(hwnd):
+    """读某个窗口自己的 DC（不经过屏幕），返回 ``(w, h, BGRA bytes)``。
+
+    见文件开头 `dlg` 模式那段说明：串流会话下屏幕 DC 全黑，这条路照样有内容。
+    """
+    SRCCOPY = 0x00CC0020
+    r = W.RECT()
+    u32.GetWindowRect(W.HWND(hwnd), C.byref(r))
+    w, h = r.right - r.left, r.bottom - r.top
+    src = u32.GetWindowDC(W.HWND(hwnd))
+    mem = gdi.CreateCompatibleDC(src)
+    bmp = gdi.CreateCompatibleBitmap(src, w, h)
+    gdi.SelectObject(mem, bmp)
+    gdi.BitBlt(mem, 0, 0, w, h, src, 0, 0, SRCCOPY)
+
+    class BITMAPINFOHEADER(C.Structure):
+        _fields_ = [("biSize", W.DWORD), ("biWidth", C.c_long), ("biHeight", C.c_long),
+                    ("biPlanes", W.WORD), ("biBitCount", W.WORD),
+                    ("biCompression", W.DWORD), ("biSizeImage", W.DWORD),
+                    ("biXPelsPerMeter", C.c_long), ("biYPelsPerMeter", C.c_long),
+                    ("biClrUsed", W.DWORD), ("biClrImportant", W.DWORD)]
+
+    bi = BITMAPINFOHEADER()
+    bi.biSize = C.sizeof(bi)
+    bi.biWidth = w
+    bi.biHeight = -h
+    bi.biPlanes = 1
+    bi.biBitCount = 32
+    buf = C.create_string_buffer(w * h * 4)
+    gdi.GetDIBits(mem, bmp, 0, h, buf, C.byref(bi), 0)
+    gdi.DeleteObject(bmp)
+    gdi.DeleteDC(mem)
+    u32.ReleaseDC(W.HWND(hwnd), src)
+    return w, h, bytes(buf)
+
+
+def find_dialogs(pid, title="PopShot"):
+    """该进程里可见的 `#32770` 对话框。标题传 None 就不挑标题。"""
+    out = []
+
+    def cb(h, _):
+        p = W.DWORD()
+        u32.GetWindowThreadProcessId(h, C.byref(p))
+        if p.value != pid or not u32.IsWindowVisible(h):
+            return True
+        cn = C.create_unicode_buffer(64)
+        u32.GetClassNameW(h, cn, 64)
+        tb = C.create_unicode_buffer(256)
+        u32.GetWindowTextW(h, tb, 256)
+        if cn.value == "#32770" and (title is None or tb.value == title):
+            out.append((h, tb.value))
+        return True
+
+    u32.EnumWindows(EnumWindowsProc(cb), 0)
+    return out
+
+
 def write_png(path, w, h, bgra):
     raw = bytearray()
     for y in range(h):
@@ -135,6 +201,20 @@ def main():
         print(__doc__)
         return
     target, out = sys.argv[1], sys.argv[2]
+    if target == "dlg":
+        if len(sys.argv) < 4:
+            print(__doc__)
+            return
+        pid, out = int(sys.argv[2]), sys.argv[3]
+        found = find_dialogs(pid) or find_dialogs(pid, None)
+        if not found:
+            print(f"pid {pid} 没有可见的 #32770 对话框")
+            return
+        hwnd, title = found[0]
+        w, h, bgra = grab_window(hwnd)
+        write_png(out, w, h, bgra)
+        print(f"已抓对话框 hwnd={hwnd:#x} {title!r} {w}x{h} -> {out}")
+        return
     if target == "screen":
         w = u32.GetSystemMetrics(0)
         h = u32.GetSystemMetrics(1)

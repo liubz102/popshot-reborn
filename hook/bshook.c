@@ -311,6 +311,7 @@ static int WINAPI det_MessageBoxA(HWND hWnd, LPCSTR text, LPCSTR cap, UINT type)
 /*   1011 单选钮「炮火连天(电信)」  1012 单选钮「枪林弹雨(网通)」             */
 /*   1010 Static「注册成为世纪天成用户」= 那条蓝色链接                        */
 /*   1014 Static「选择分区:」        1017/1018/1019 底部说明文字              */
+/*   1015 Static「用户名:」(245,310) 1016 Static「密码:」(245,338)，都是 49x14 */
 /* 对话框客户区 530x527；1011/1012 在 (98,310) / (98,331)，都是 126x18。      */
 /*                                                                            */
 /* 配置从**环境变量**来（tools\launch.ps1 解析 server.config 后设进来），      */
@@ -319,6 +320,20 @@ static int WINAPI det_MessageBoxA(HWND hWnd, LPCSTR text, LPCSTR cap, UINT type)
 #define IDC_RADIO_LOCAL    1011
 #define IDC_RADIO_ONLINE   1012
 #define IDC_REGISTER_LINK  1010
+
+/* ★★ 「远程服务器」单选钮 1012 的宽度**上限**，位置一律不动（D098）。       */
+/*                                                                            */
+/* 为什么有这么个上限（§173）：1012 的右边 x=245 起就是「密码:」那条 Static   */
+/* （x=[245,294] y=[338,352]）。1012 一旦加宽加高到把它包进去，两边又都没有   */
+/* WS_CLIPSIBLINGS、1012 的 z 序还更靠上 —— 玩家点一次「开始」（客户端禁用    */
+/* 单选钮、我们再解禁，1012 重绘两次）就会把「密码:」的字擦掉，而 Static      */
+/* 不知道自己被擦，从此不再重画。用户 2026-08-12 报的就是这个。               */
+/* 「用户名:」在 y=[310,324]，落在 1012 上面，所以它不受影响 —— 和现象一致。  */
+/*                                                                            */
+/* 98 + 145 = 243 < 245 ⇒ 两个矩形不相交，纵向再高也压不到它。               */
+/* ⚠ 加控件高度是安全的（下面到 y=415 的 1017 之前都是空的），**加宽度不是**。 */
+#define RADIO_ONLINE_W     145
+#define RADIO_ONLINE_H     36
 
 #ifndef BS_MULTILINE
 #define BS_MULTILINE 0x00002000L
@@ -461,6 +476,24 @@ static void resize_ctrl(HWND dlg, int id, int cx, int cy)
     InvalidateRect(h, NULL, TRUE);
 }
 
+/* 把某个控件占的那块**连同压在下面的兄弟控件**一起重画。
+   `InvalidateRect(子控件)` 只让它自己重画；被它盖住的兄弟收不到通知，
+   所以要对父窗口的那块矩形来一发带 RDW_ALLCHILDREN 的 RedrawWindow。 */
+static void redraw_area_of(HWND dlg, int id)
+{
+    HWND h = GetDlgItem(dlg, id);
+    RECT r;
+    POINT tl, br;
+    if (!h || !GetWindowRect(h, &r)) return;
+    tl.x = r.left;  tl.y = r.top;
+    br.x = r.right; br.y = r.bottom;
+    ScreenToClient(dlg, &tl);
+    ScreenToClient(dlg, &br);
+    r.left = tl.x; r.top = tl.y; r.right = br.x; r.bottom = br.y;
+    RedrawWindow(dlg, &r, NULL,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
 /* 定义在下面「注册链接的点击」一段。 */
 static void hook_register_link(HWND dlg);
 
@@ -470,17 +503,22 @@ static void style_login_dialog(HWND dlg)
 
     SetDlgItemTextW(dlg, IDC_RADIO_LOCAL, L"本机服务器");
     SetDlgItemTextW(dlg, IDC_RADIO_ONLINE,
-                    L"远程服务器\n(地址请改:server.config)");
+                    L"远程服务器\n(IP设置:server.config)");
 
-    /* 「远程服务器(地址请改:server.config)」比原来的「枪林弹雨(网通)」长一倍多，
-       126 像素的原控件会把它裁掉。右边 x=245 起就是「用户名:」，横着加宽会压上去，
-       所以改成**两行**：加 BS_MULTILINE 再把控件放高，文案里那个换行符
-       就是断行处（按钮的 DrawText 带 DT_WORDBREAK，认 \n）。
-       左边这一列从 y=349 到 y=415（「您还没有注册…」那行）之间是空的，放得下。 */
+    /* 「远程服务器(IP设置:server.config)」比原来的「枪林弹雨(网通)」长得多，
+       126 像素的原控件会把它裁掉，所以改成**两行**：加 BS_MULTILINE 再把控件
+       放高，文案里那个换行符就是断行处（按钮的 DrawText 带 DT_WORDBREAK，认 \n）。
+
+       ★ 宽度只能到 RADIO_ONLINE_W（145），**位置一个像素都不动**（D098）：
+       右边 x=245 起就是「密码:」那条 Static，压上去就会把它的字擦掉（§173）。
+       145 宽刚好放得下这两行 —— 实机 PrintWindow 抓图逐字核对过，
+       第二行的右括号完整。⚠ 以后改文案要**先在真控件上试排版再定**，
+       别用 GetTextExtentPoint32W 算：那条路上 ctypes 的默认 restype 会把
+       64 位 HFONT 截断，量到的其实是系统默认字体，结果偏大三成（§175）。 */
     if (online) {
         LONG style = GetWindowLongW(online, GWL_STYLE);
         SetWindowLongW(online, GWL_STYLE, style | BS_MULTILINE);
-        resize_ctrl(dlg, IDC_RADIO_ONLINE, 200, 36);
+        resize_ctrl(dlg, IDC_RADIO_ONLINE, RADIO_ONLINE_W, RADIO_ONLINE_H);
     }
 
     /* 注册链接那条 Static 原来只有 152 像素（刚好装下「注册成为世纪天成用户」）。
@@ -527,6 +565,13 @@ static void poll_login_dialog(void)
             (remote && !IsWindowEnabled(remote))) {
             if (local) EnableWindow(local, TRUE);
             if (remote) EnableWindow(remote, TRUE);
+            /* ★ 兜底重画：禁用 + 解禁让两个单选钮各重绘了一次，被它们盖住的
+               兄弟控件（Static 不会自己知道字被擦了）要跟着补一发。
+               几何上现在已经不重叠了（RADIO_ONLINE_W / §173），这一发是
+               为了别的机器上字体或 DPI 不同、控件尺寸和实测对不上的情况。
+               只在真的检测到被禁用时跑，一次登录失败最多一发，不会闪。 */
+            redraw_area_of(g_login_dlg, IDC_RADIO_LOCAL);
+            redraw_area_of(g_login_dlg, IDC_RADIO_ONLINE);
             bslog("LOGIN   分区单选钮被客户端禁用了，已解禁（登录失败后还要能换分区）");
         }
     }
