@@ -6,6 +6,7 @@
 差异只体现在「哪一边读哪几个键」上：
 
     客户端包  server_address / server_register_port  -> 选「远程服务器」时连谁、注册页在哪
+              proxy_*                                -> 远程 TCP 连接是否经代理
               local_register_port                    -> 「本机服务器」的注册页监听哪个端口
     服务端包  local_register_port                    -> 注册页监听哪个端口
 
@@ -60,10 +61,16 @@ DEFAULTS = {
     "server_address": "192.168.1.100",
     "server_register_port": DEFAULT_REGISTER_PORT,
     "local_register_port": DEFAULT_REGISTER_PORT,
+    # 地址为空就是关闭。旧版 server.config 没有这些键时也因此保持直连。
+    "proxy_type": "socks5",
+    "proxy_address": "",
+    "proxy_port": 1080,
+    "proxy_username": "",
+    "proxy_password": "",
 }
 
 #: 值要按整数解析的键。
-_INT_KEYS = ("server_register_port", "local_register_port")
+_INT_KEYS = ("server_register_port", "local_register_port", "proxy_port")
 
 
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -115,6 +122,9 @@ def parse_text(text: str):
             values[key] = value
     values["server_address"] = normalize_host(values["server_address"]) or \
         DEFAULTS["server_address"]
+    # proxy_address 和 server_address 的关键区别：前者为空代表明确关闭，
+    # 绝不能像后者一样补默认主机名。
+    values["proxy_address"] = normalize_host(values["proxy_address"])
     return values, warnings
 
 
@@ -174,7 +184,7 @@ DEFAULT_CONFIG_TEXT = """\
 # ============================================================================
 #  炮炮火枪手 —— 服务器配置
 #
-#  只有在登录界面选择「远程服务器」时才会用到 server_address / server_register_port；
+#  只有在登录界面选择「远程服务器」时才会用到 server_address / server_register_port / proxy_*；
 #  选「本机服务器」时只用 local_register_port。
 # ============================================================================
 
@@ -195,6 +205,34 @@ server_address = 192.168.1.100
 # 要和那台服务器自己的 server.config 里的 local_register_port 一致。
 # ---------------------------------------------------------------------------
 server_register_port = 27810
+
+# ---------------------------------------------------------------------------
+# 远程服务器代理（可选）。代理地址留空、删掉 proxy_address 这一行，或沿用没有
+# proxy_* 的旧配置文件时，都会【直接连接】，不使用代理。
+#
+# 代理只影响登录界面选择「远程服务器」后的三条游戏 TCP 连接（认证 / 游戏 /
+# 战斗中继），不影响「本机服务器」。注册链接由浏览器打开，是否走代理由浏览器或
+# 系统自己的代理设置决定。
+#
+# proxy_type 支持 socks5 和 http（HTTP CONNECT）；代理地址支持 IPv4 / IPv6 / 域名。
+# IPv6 地址请写成 proxy_address = 2001:db8::2 或 [2001:db8::2]。
+# 代理需要账号密码时填写最后两项；不需要时保持为空。日志不会打印代理密码。
+#
+# 示例（SOCKS5）：
+#   proxy_type = socks5
+#   proxy_address = 127.0.0.1
+#   proxy_port = 1080
+#
+# 示例（HTTP CONNECT）：
+#   proxy_type = http
+#   proxy_address = proxy.example.com
+#   proxy_port = 8080
+# ---------------------------------------------------------------------------
+proxy_type = socks5
+proxy_address =
+proxy_port = 1080
+proxy_username =
+proxy_password =
 
 # ---------------------------------------------------------------------------
 # 本机「用户注册页」监听的端口号。

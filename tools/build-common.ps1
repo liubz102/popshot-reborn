@@ -282,6 +282,30 @@ function Get-FreeTcpPort([int]$Preferred) {
     throw "$Preferred 起连着 60 个端口都被占用了，找不到空闲端口做自检"
 }
 
+function Test-TcpPortOpen([int]$Port, [int]$TimeoutMs = 250) {
+    <# 主动连一次端口，而不是只查 Get-NetTCPConnection。
+
+       某些受限运行环境里服务端已经 bind/listen、客户端也能连，但系统网络表对当前
+       进程不可见，Get-NetTCPConnection 会静默返回空表。冒烟测试关心的是「包里的
+       服务真的可连接」，主动探测正好是更直接的验收。 #>
+    $client = New-Object System.Net.Sockets.TcpClient
+    $wait = $null
+    try {
+        $async = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+        $wait = $async.AsyncWaitHandle
+        if (-not $wait.WaitOne($TimeoutMs)) { return $false }
+        try {
+            $client.EndConnect($async)
+            return $true
+        } catch {
+            return $false
+        }
+    } finally {
+        if ($wait) { $wait.Close() }
+        $client.Close()
+    }
+}
+
 function Invoke-ServerSmokeTest {
     <# 用**包里那份** Python 跑**包里那份** server\app.py，确认：
          1. 四个监听器都能起来（认证 / 游戏 / 中继 / 注册页）
@@ -337,10 +361,7 @@ function Invoke-ServerSmokeTest {
             if ($proc.HasExited) { break }
             $listening = 0
             foreach ($p in $ports) {
-                $c = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue
-                if ($c -and (@($c | Select-Object -ExpandProperty OwningProcess -Unique) -contains $proc.Id)) {
-                    $listening++
-                }
+                if (Test-TcpPortOpen $p) { $listening++ }
             }
             if ($listening -eq $ports.Count) { $up = $true; break }
         }

@@ -77,9 +77,14 @@ function Stop-ListenerOn([int[]]$ports) {
 # key = value、# 或 ; 起头是注释、认不出的键忽略、缺键用默认值。
 function Read-ServerConfig([string]$path) {
     $cfg = @{
-        server_address       = '127.0.0.1'
+        server_address       = '192.168.1.100'
         server_register_port = '27810'
         local_register_port  = '27810'
+        proxy_type           = 'socks5'
+        proxy_address        = ''
+        proxy_port           = '1080'
+        proxy_username       = ''
+        proxy_password       = ''
     }
     if (-not (Test-Path -LiteralPath $path)) { return $cfg }
     foreach ($line in (Get-Content -LiteralPath $path -Encoding UTF8)) {
@@ -97,7 +102,21 @@ function Read-ServerConfig([string]$path) {
     if ($addr.StartsWith('[') -and $addr.EndsWith(']')) {
         $cfg['server_address'] = $addr.Substring(1, $addr.Length - 2).Trim()
     }
+    $proxyAddr = $cfg['proxy_address']
+    if ($proxyAddr.StartsWith('[') -and $proxyAddr.EndsWith(']')) {
+        $cfg['proxy_address'] = $proxyAddr.Substring(1, $proxyAddr.Length - 2).Trim()
+    }
     return $cfg
+}
+
+function Get-TextSha256([string]$text) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+        return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
 }
 
 Say ''
@@ -206,15 +225,25 @@ $remoteReg = $cfg['server_register_port']
 $localReg  = $cfg['local_register_port']
 $remoteUrlHost = if ($remote -like '*:*') { "[$remote]" } else { $remote }
 
-# 中继的目标地址变了就要重起（否则还连着上一个服务器）。
+# 目标或任一代理字段变了都要重起。签名里会算账号密码，但磁盘只落 SHA-256，
+# 不把第二份明文凭据写进 logs\.relay_target。
+$relayConfigText = @(
+    $remote,
+    $cfg['proxy_type'],
+    $cfg['proxy_address'],
+    $cfg['proxy_port'],
+    $cfg['proxy_username'],
+    $cfg['proxy_password']
+) -join "`n"
+$relaySignature = Get-TextSha256 $relayConfigText
 $relayStamp = Join-Path $LogDir '.relay_target'
-$lastTarget = ''
-if (Test-Path $relayStamp) { $lastTarget = (Get-Content $relayStamp -Raw).Trim() }
+$lastSignature = ''
+if (Test-Path $relayStamp) { $lastSignature = (Get-Content $relayStamp -Raw).Trim() }
 $relayPid = Get-ListenerPid $RelayAuth
-if ($relayPid -and $lastTarget -eq $remote) {
+if ($relayPid -and $lastSignature -eq $relaySignature) {
     Say "[中继]   已在运行（pid=$relayPid，目标 $remoteUrlHost）" 'Green'
 } else {
-    if ($relayPid) { Say "[中继]   目标从 '$lastTarget' 改成 '$remote' —— 重启它" 'Yellow' }
+    if ($relayPid) { Say '[中继]   远程连接配置已改变 —— 重启它' 'Yellow' }
     Stop-ListenerOn @($RelayAuth, $RelayGame, $RelayPeer)
     $relayScript = Join-Path $Root 'server\relay.py'
     Start-Process -FilePath $Python -WorkingDirectory $Root `
@@ -229,7 +258,7 @@ if ($relayPid -and $lastTarget -eq $remote) {
             (Get-ListenerPid $RelayPeer)) { $ok = $true; break }
     }
     if ($ok) {
-        Set-Content -Path $relayStamp -Value $remote -Encoding utf8
+        Set-Content -Path $relayStamp -Value $relaySignature -Encoding ascii
         Say "[中继]   已启动（选「远程服务器」时经 127.0.0.1:$RelayAuth / $RelayGame / $RelayPeer 转发到 $remoteUrlHost）" 'Green'
     } else {
         Say '!! 中继没起来，「远程服务器」会连不上；「本机服务器」不受影响。看 logs\relay.err' 'Red'
