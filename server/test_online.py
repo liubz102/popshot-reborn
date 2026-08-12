@@ -144,9 +144,12 @@ class TicketStoreTests(unittest.TestCase):
         self.assertNotIn(short(ticket), (ticket,))
         self.assertLessEqual(len(short(ticket)), 9)
 
-    # -- 断线重连（§171 / D096）------------------------------------------
+    # -- 断线重连（§171 / D096 / D097）------------------------------------
+    #
+    # ★ 票据**只在内存里**（D097）：这一组盯的是「同一个服务端进程活着，
+    #   但网断了一阵子」这一种情况 —— 服务端重启后作废是设计，不测。
     def test_resolving_slides_the_expiry(self):
-        # 玩一局超过 TTL 再断线，重连时那张票据必须还认得。
+        # 玩一局超过 TTL 再掉线，重连时那张票据必须还认得。
         ticket = self.tickets.issue("alice")
         for _ in range(10):
             self.now += 59
@@ -159,65 +162,13 @@ class TicketStoreTests(unittest.TestCase):
         self.assertTrue(self.tickets.bind(used))
         self.assertTrue(self.tickets.is_bound(used))
         self.assertFalse(self.tickets.is_bound(unused))
-        self.now += 3600            # 一小时后（服务端挂了一小时才被拉起来）
+        self.now += 3600            # 网络断了一小时才恢复
         self.assertEqual("alice", self.tickets.resolve(used))
         self.assertIsNone(self.tickets.resolve(unused))
 
     def test_binding_an_unknown_ticket_is_a_no_op(self):
         self.assertFalse(self.tickets.bind("deadbeef"))
         self.assertFalse(self.tickets.bind(""))
-
-
-class TicketFileTests(unittest.TestCase):
-    """票据表落盘 —— 服务端重启后客户端手里那张票必须还认得（§171 / D096）。"""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.path = os.path.join(self.tmp.name, "sub", "tickets.json")
-        self.wall = 5_000.0
-
-    def store(self, now=1000.0):
-        return TicketStore(ttl_seconds=60, bound_ttl_seconds=3600,
-                           clock=lambda: now, wall_clock=lambda: self.wall,
-                           path=self.path)
-
-    def test_a_bound_ticket_survives_a_restart(self):
-        first = self.store()
-        ticket = first.issue("alice")
-        first.bind(ticket)
-        self.wall += 600                      # 服务端停机 10 分钟
-        again = self.store(now=1.0)           # 新进程，monotonic 从头开始
-        self.assertEqual("alice", again.resolve(ticket))
-
-    def test_an_unused_ticket_does_not_survive_a_long_outage(self):
-        first = self.store()
-        ticket = first.issue("alice")         # 没 bind：只有 60 秒
-        self.wall += 600
-        self.assertIsNone(self.store(now=1.0).resolve(ticket))
-
-    def test_a_superseded_ticket_stays_superseded_after_a_restart(self):
-        # 不然被顶号的人重启后看到的又是「在无法连接的地方尝试了连接。」（§132）
-        first = self.store()
-        old = first.issue("alice")
-        first.issue("alice")
-        again = self.store()
-        self.assertIsNone(again.resolve(old))
-        self.assertEqual(("alice", "superseded"), again.revoked_reason(old))
-
-    def test_a_corrupt_file_is_treated_as_empty_and_warns(self):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as f:
-            f.write("{ not json")
-        said = []
-        store = TicketStore(path=self.path, on_warning=said.append)
-        self.assertEqual(0, len(store))
-        self.assertTrue(said)
-
-    def test_nothing_is_written_without_a_path(self):
-        store = TicketStore(ttl_seconds=60)
-        store.bind(store.issue("alice"))
-        self.assertFalse(os.path.exists(self.path))
 
 
 class AuthServiceTests(unittest.TestCase):
@@ -383,7 +334,9 @@ class GameLoginTests(unittest.TestCase):
         self.login(conn, "not-a-real-ticket")
         self.assertIsNone(conn.account_name)
         payload = self.decode_first_login_reply(conn)
-        self.assertEqual(gameserver.LOGIN_RESULT_BAD_TICKET,
+        # 认不出来的票据一律回 2（「现有连接已断开。请重新尝试连接。」，D097）——
+        # 服务端重启后客户端拿旧票据来重连，走的就是这一路。
+        self.assertEqual(gameserver.LOGIN_RESULT_SUPERSEDED,
                          struct.unpack_from("<i", payload, 0)[0])
 
     def test_an_empty_ticket_is_refused(self):
@@ -411,11 +364,12 @@ class GameLoginTests(unittest.TestCase):
         self.login(conn, ticket)
         self.assertFalse([line for line in conn.logged if ticket in line])
 
-    # -- 被顶号之后那次自动重连（§132）--------------------------------------
+    # -- 断线自动重连（§132 顶号 / §171 网络故障 / D097 服务端重启）----------
     #
-    # 被踢的客户端不会安静地退回登录框，它**立刻自动重连**并重放已经作废的
-    # 旧票据。回 result=3 的话玩家看到的是「在无法连接的地方尝试了连接。」，
-    # 回 result=2 才是「现有连接已断开。请重新尝试连接。」。
+    # 客户端断线后不会安静地退回登录框，它**立刻自动重连**并重放手里那张票据。
+    # 回 result=3 的话玩家看到的是「在无法连接的地方尝试了连接。」（像被封 IP），
+    # 回 result=2 才是「现有连接已断开。请重新尝试连接。」——
+    # 所以**所有认不出票据的情况都回 2**（D097）。
 
     def test_replaying_a_superseded_ticket_says_you_were_kicked(self):
         old_ticket = self.tickets.issue("alice")
@@ -429,11 +383,19 @@ class GameLoginTests(unittest.TestCase):
         self.assertEqual(gameserver.LOGIN_RESULT_SUPERSEDED,
                          struct.unpack_from("<i", payload, 0)[0])
 
-    def test_a_never_issued_ticket_still_says_bad_ticket(self):
-        # 「被顶号」和「压根没见过这张票」必须分得开，否则乱码票据也会被说成
-        # 「你的账号在别处登录了」。
+    def test_a_ticket_the_server_never_issued_also_says_reconnect(self):
+        # 服务端重启过之后，客户端手里那张票据在新进程看来就是「没见过」——
+        # 这是最常见的一路，必须和顶号一样回 2（D097）。
         conn = self.make_conn()
         self.login(conn, "deadbeef" * 4)
+        payload = self.decode_first_login_reply(conn)
+        self.assertEqual(gameserver.LOGIN_RESULT_SUPERSEDED,
+                         struct.unpack_from("<i", payload, 0)[0])
+
+    def test_a_login_without_any_ticket_still_says_bad_ticket(self):
+        # 空票据不是重连，是协议级错误（手搓包 / 试探），保留 result=3。
+        conn = self.make_conn()
+        self.login(conn, "")
         payload = self.decode_first_login_reply(conn)
         self.assertEqual(gameserver.LOGIN_RESULT_BAD_TICKET,
                          struct.unpack_from("<i", payload, 0)[0])

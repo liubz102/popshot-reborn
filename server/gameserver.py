@@ -90,13 +90,19 @@ MAGIC_GAME = 0xFF
 
 OP_REP_LOGIN = 0x0100
 #: `gspRepLogin` 的结果码 3 = 客户端 `0x54f3cf`「断开」（V0.1 §44）。
-#: 票据无效时用它，让客户端干净地退回登录框，而不是留在半登录状态。
 #: 弹的框是 `Data\Chinese.ini` 里的「在无法连接的地方尝试了连接。」（§132）。
+#:
+#: ★ **只留给「压根没带票据」这种协议级错误**（空字符串 / 解不出来）。
+#:   一张认不出来的票据**不再**回它 —— 见 `LOGIN_RESULT_SUPERSEDED` 和 D097。
 LOGIN_RESULT_BAD_TICKET = 3
 #: 结果码 2 = 客户端 `0x54f416`，和结果码 3 的分支**一模一样**（都是
 #: `[conn+0x898]=0` → `0x5bc415` 断开 → 弹框），只有文案不同：
-#: 「现有连接已断开。请重新尝试连接。」—— 正是「被别人顶号」该说的话。
-#: 被顶掉的客户端会自动重连并重放已作废的旧票据，就用这个码回它（§132 / D071）。
+#: 「现有连接已断开。请重新尝试连接。」
+#:
+#: ★★ **所有「票据认不出来」的情况都回这个码**（D097）：被顶号（§132 / D071）、
+#:   过期、以及**服务端重启后客户端拿旧票据来重连**（票据只在内存里，D097）。
+#:   三种情况玩家该做的事完全一样 —— 重新登录一次 —— 而这句话正是这个意思；
+#:   回 3 那句「在无法连接的地方尝试了连接。」只会让人以为是被封 IP 或走错服务器。
 LOGIN_RESULT_SUPERSEDED = 2
 #: 房间列表。两个方向同号：客户端方向是请求（12 字节，§139），
 #: 服务端方向是列表（§138）。
@@ -3278,35 +3284,48 @@ class Conn:
         客户端原样转发，FINDINGS §123）。V0.1 靠 `accounts.json` 里的
         `active_account` 认人，那只在「全世界只有一个玩家」时成立。
 
-        ★ 票据查不到就**拒绝登录**（`result=3` 让客户端断开），绝不回退到
-        「随便给个本地账号」—— 那等于谁都能顶别人的名字进来。
+        ★ 票据查不到就**拒绝登录**，绝不回退到「随便给个本地账号」——
+        那等于谁都能顶别人的名字进来。
+
+        ★★ **认不出来的票据回 `result=2`，不是 3**（D097）。三种情况都会走到这里，
+        而玩家该做的事完全一样（重新登录一次）：
+
+        | 情况 | 什么时候发生 |
+        |---|---|
+        | 被顶号 | 同一个账号在别处登录，旧客户端自动重连重放旧票据（§132）|
+        | 过期 | 票据签发后一直没用，或网络断得太久（超过 `BOUND_TTL_SECONDS`）|
+        | **服务端重启过** | 票据只在内存里（D097），重启后全部作废，而客户端会拿旧票据来重连（§171）|
+
+        `result=2` 的客户端文案是「现有连接已断开。请重新尝试连接。」，
+        三种情况都说得通；`result=3` 那句「在无法连接的地方尝试了连接。」
+        只会让人以为是被封 IP / 连错服务器。**只有「压根没带票据」才回 3。**
         """
         try:
             ticket = Reader(payload).wstr()
         except Exception:
             ticket = ""
-        username = self.tickets.resolve(ticket)
-        if username is None:
-            # 先问一句「这张票是不是被顶掉的」。被顶号的客户端断线后会**自动
-            # 重连**并原样重放旧票据（§132）—— 这条路每次顶号必走一遍，
-            # 回 result=3 的话玩家看到的是「在无法连接的地方尝试了连接。」。
-            revoked = self.tickets.revoked_reason(ticket)
-            if revoked is not None:
-                revoked_user = revoked[0]
-                self.log(f"✗ gcpReqLogin 的票据已被顶号作废"
-                         f"（{short_ticket(ticket)}，账号={revoked_user!r}）；"
-                         f"回 gspRepLogin(result={LOGIN_RESULT_SUPERSEDED}) "
-                         f"→ 客户端提示「现有连接已断开。请重新尝试连接。」")
-                self.online(f"✗ 登录被拒 账号={revoked_user!r} ip={self.peer()} "
-                            f"原因=账号已在别处登录")
-                self.send(build_game(OP_REP_LOGIN,
-                                     build_gsp_rep_login(LOGIN_RESULT_SUPERSEDED)))
-                return
-            self.log(f"✗ gcpReqLogin 的票据无效或已过期（{short_ticket(ticket)}）；"
+        if not str(ticket or "").strip():
+            # 连票据字段都是空的：这不是重连，是协议级错误（手搓包 / 试探）。
+            self.log(f"✗ gcpReqLogin 没带票据；"
                      f"回 gspRepLogin(result={LOGIN_RESULT_BAD_TICKET}) 断开")
-            self.online(f"✗ 登录被拒 账号=? ip={self.peer()} 原因=票据无效或已过期")
+            self.online(f"✗ 登录被拒 账号=? ip={self.peer()} 原因=没带票据")
             self.send(build_game(OP_REP_LOGIN,
                                  build_gsp_rep_login(LOGIN_RESULT_BAD_TICKET)))
+            return
+        username = self.tickets.resolve(ticket)
+        if username is None:
+            # 顶号那一路能报出账号名（`_revoked` 表里记着），日志里说清楚是谁；
+            # 其余（过期 / 服务端重启过）报不出账号，但回给客户端的码一样。
+            revoked = self.tickets.revoked_reason(ticket)
+            who = f"账号={revoked[0]!r}" if revoked else "账号=?"
+            why = ("账号已在别处登录" if revoked
+                   else "票据已过期或服务端重启过（票据只在内存里）")
+            self.log(f"✗ gcpReqLogin 的票据认不出来（{short_ticket(ticket)}，{why}）；"
+                     f"回 gspRepLogin(result={LOGIN_RESULT_SUPERSEDED}) "
+                     f"→ 客户端提示「现有连接已断开。请重新尝试连接。」")
+            self.online(f"✗ 登录被拒 {who} ip={self.peer()} 原因={why}")
+            self.send(build_game(OP_REP_LOGIN,
+                                 build_gsp_rep_login(LOGIN_RESULT_SUPERSEDED)))
             return
         name, account = self.accounts.get_account(username)
         if account is None:

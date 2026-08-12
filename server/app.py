@@ -36,7 +36,7 @@ import eventlog
 import gameserver
 from account_store import AccountStore
 from netlisten import describe as describe_listen
-from tickets import TicketStore, DEFAULT_PATH as DEFAULT_TICKET_PATH
+from tickets import TicketStore
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -89,13 +89,6 @@ def build_arg_parser():
                     help="调试控制通道端口，只绑 127.0.0.1")
     ap.add_argument("--accounts", default=None,
                     help="账号 JSON 路径（默认 server/data/accounts.json）")
-    ap.add_argument("--tickets", default=None,
-                    help="票据表落盘路径（默认 server/data/tickets.json）。"
-                         "落盘是为了让服务端重启之后，正在玩的客户端能靠手里"
-                         "那张票据自动重连回来（§171 / D096）")
-    ap.add_argument("--no-ticket-file", action="store_true",
-                    help="票据只放内存，不落盘。服务端一重启，所有人都要"
-                         "重新登录（客户端会卡在「在无法连接的地方尝试了连接。」）")
     ap.add_argument("--config", default=None,
                     help="server.config 路径（默认包根目录下的那个）")
     ap.add_argument("--ticket-field", choices=("s1", "s2"), default="s2",
@@ -170,18 +163,12 @@ def main(argv=None):
     web_port = args.web_port or cfg["local_register_port"]
 
     accounts = AccountStore(args.accounts)
-    ticket_path = (None if args.no_ticket_file
-                   else (args.tickets or DEFAULT_TICKET_PATH))
-    tickets = TicketStore(path=ticket_path,
-                          on_warning=lambda msg: log(f"票据表: {msg}"))
+    # 票据**只在内存里**（D097）：断线重连靠它，服务端重启则一律作废 ——
+    # 重启后玩家（和客户端）都要重新登录。故意不落盘，见 tickets.py 开头。
+    tickets = TicketStore()
     service = authserver.AuthService(accounts, tickets)
 
     log(f"账号存档: {accounts.path}（当前 {len(accounts.usernames())} 个账号）")
-    if tickets.path:
-        log(f"票据表  : {tickets.path}"
-            f"（当前 {len(tickets)} 张有效；断线重连和服务端重启都靠它）")
-    else:
-        log("票据表  : 只在内存里（--no-ticket-file）—— 重启后所有人要重新登录")
     log(f"配置文件: {config_path}")
     # 上下线流水另存一份：`server.out` 每次启动都会被覆盖，连接记录不该跟着没。
     if args.no_online_log:
