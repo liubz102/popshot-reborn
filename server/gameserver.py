@@ -253,6 +253,32 @@ OP_BROADCAST_DEATH = 0x0406
 DEFAULT_RESPAWN_X = 3225
 DEFAULT_RESPAWN_Y = 635
 
+# ---------------------------------------------------------------------------
+# 控制权交接（`0x0414 gspChangeControllerSlot`，§180 / D103）
+#
+# ★★ 这个游戏的**怪 / Boss / 刷怪点全部只由「控制者」那一台客户端模拟**。
+#    谁是控制者由 `[GameContext + 0x244 + 句柄类别*4]` 那张表说了算
+#    （`GameContext::IsControlledByMe` = `0x491225`，102 个调用点）。
+#    表的初值是客户端在 `GameContext::StartGame` 里按「开局那一刻在座的座位」
+#    轮转算出来的，**客户端自己永远不会因为「有人走了」重算它**。
+#
+#    闯关里的怪都落在**类别 20**（§180：句柄 1,100,027 -> 类别 20），
+#    控制者恒等于座位号最小的在座玩家 = 通常的房主。房主中途退出之后，
+#    那一格指着一个已经空了的座位 -> 每台机器都算出「不是我」 ->
+#    没有人刷怪、没有人跑怪 AI -> 关卡的闸门再也不开 ->
+#    玩家看到的就是「走到屏幕最右边被屏幕挡住」。
+#
+#    服务端补一发这个包就能把控制权交给还在的人。
+#
+# ⚠ 又是一对同号反向（D028 的老规律）：**客户端**方向的 `0x0414` 是
+#   `gcpRepFirstAidBox`（见上面的 `GCP_NAMES`），和这个包毫无关系。
+OP_CHANGE_CONTROLLER_SLOT = 0x0414
+
+#: 客户端处理器 `0x493780` 只改**类别 20~25** 这 6 格（`add eax, 0x294` 起，
+#: 6 轮）。类别 10~15（六个玩家自己的角色）它不碰 —— 那本来就该归各人自己。
+CONTROLLER_CATEGORY_FIRST = 20
+CONTROLLER_SLOT_COUNT = 6
+
 #: 调试控制通道的默认端口（`tools/gs_ctl.py` 连它）。0 = 关闭。
 CONTROL_PORT = 27800
 OP_REP_COUNT_DOWN = 0x0412
@@ -1945,6 +1971,29 @@ def build_rep_quest_score(seat=0, score=0):
     return w_i32(seat) + w_i32(score)
 
 
+def build_change_controller_slot(old_seat=0, new_seat=0):
+    """opcode 0x0414 `gspChangeControllerSlot`（服务端 -> 客户端，8 字节）。
+
+    载荷 = **两个 int32**（反序列化 `0x54cfbf` = 两发 `0x5d59ff`，§180）：
+
+        int32 old   把控制者表里等于这个座位号的格子…
+        int32 new   …全部改成这个座位号
+
+    处理器 `0x493780`（`GameContext` 的战斗包分发表 `0x493808` 里
+    `0x0414` 那一格）做两件事：
+
+        1. `[GameContext + 0x294 + i*4]`（= 句柄类别 20~25）6 格里
+           凡是等于 `old` 的都换成 `new`；
+        2. 遍历 `World` 的对象表，逐个调 `GameObject::vf_E8()` ——
+           怪 / Boss / 刷怪点在那里重新问一次「这只归不归我」，
+           归自己的就当场接管（刷怪点还会把刷怪计时重置到当前时刻）。
+
+    `vf_E8` 在基类是 `ret`，不是控制者的对象整个 no-op，所以这个包
+    **发给谁都安全**、重复发也只是让已经属于自己的怪重起一次 AI。
+    """
+    return w_i32(old_seat) + w_i32(new_seat)
+
+
 def parse_req_change_to_next_map(payload):
     """opcode 0x0411 `gcpReqChangeToNextMap`（客户端 -> 服务端）—— 换图请求。
 
@@ -2121,6 +2170,14 @@ class RoomStartGame:
         self.host = StartGameHandshake(seed)
         #: 已经报过 `0x0403`（关卡加载完）的连接。
         self.loaded = set()
+        #: ★ **在「关卡还在加载」这段里走掉的座位号**（§180 / D103）。
+        #: 客户端的控制者表是它自己建的，我们不知道它到底在
+        #: 「stage 6 加载完」还是「进 stage 7」那一刻建 —— 如果它建得比
+        #: 那个人走掉更早，表里就留了一个已经空了的座位，那一局的怪从一开始
+        #: 就没人模拟。所以这段时间走掉的人记下来，等真进了关卡（IN_GAME）
+        #: 立刻各补一发交接包。客户端那边如果表是后建的（里面本来就没有他），
+        #: 那一发就什么都不匹配 = 无害的空操作。
+        self.left_while_loading = []
 
     @property
     def state(self):
@@ -2129,6 +2186,22 @@ class RoomStartGame:
     def reset(self):
         self.host.reset()
         self.loaded.clear()
+        self.left_while_loading.clear()
+
+    def note_left_while_loading(self, seat_index):
+        """加载途中有人走了。返回 True = 真记下了（这时确实在加载）。
+
+        「加载中」= `PREPARING`：`0x0400 gspPrepareGame` 已经发出去了
+        （那一发就是「切到 stage 6 去加载关卡」的命令），但还没收齐
+        所有人的 `0x0403`。倒计时（`WAIT_CONFIRM`）那一段还没有人开始
+        加载关卡，谁在那时候走都轮不到控制者表的事。
+        """
+        if self.state != StartGameHandshake.PREPARING:
+            return False
+        seat = int(seat_index)
+        if seat not in self.left_while_loading:
+            self.left_while_loading.append(seat)
+        return True
 
     def on_host_ready(self, opcode, payload):
         """房主发来的 `0x0402` —— 返回要**广播给全房间**的包。"""
@@ -2225,7 +2298,7 @@ class RoomQuest:
     号，后到的那件会**覆盖**先到的那件。
     """
 
-    def __init__(self, item_handle_base=ITEM_HANDLE_BASE):
+    def __init__(self, item_handle_base=ITEM_HANDLE_BASE, seats=()):
         #: 掉落物句柄分配器（房间级，见类注释）。
         self.next_item_handle = int(item_handle_base)
         #: 已经被谁捡走的掉落物句柄 -> 座位号。仲裁靠它。
@@ -2260,6 +2333,65 @@ class RoomQuest:
         self.kills = [0] * ROOM_SEAT_COUNT
         #: 对战已经判过胜负了（只判一次，日志里也只写一行）。
         self.pvp_reason = None
+        #: ★ 客户端那张控制者表（句柄类别 20~25 那 6 格）的**镜像**，§180 / D103。
+        #: 值是座位号。**权威在客户端** —— 它自己算初值、自己应用我们发的替换。
+        #: 这份镜像只用来回答两个问题：「走的人到底欠着控制权吗」、
+        #: 「交给谁最划算」。哪怕它和客户端错开，我们挑出来的接管者仍然是一个
+        #: 在座的座位，客户端照样接得过去 —— 错开的代价只是负载不均。
+        #: **不要拿它当权威去做别的判断。**
+        self.controllers = [0] * CONTROLLER_SLOT_COUNT
+        self.assign_controllers(seats)
+
+    # -- 控制权（怪 / 刷怪点归谁模拟，§180）----------------------------------
+    def assign_controllers(self, seats):
+        """按客户端 `GameContext::StartGame` 的公式算初值（§180）。
+
+            for (i = 0; i < 6; i++)
+                [ctx+0x294+i*4] = 在座座位[i % 在座人数]     // 一个人都没有 -> 0
+
+        `seats` = 开局那一刻**在座的座位号**（升序，和客户端的
+        `0x4045f9` 扫 0..5 同一个口径）。
+        """
+        seats = [int(s) for s in seats if 0 <= int(s) < ROOM_SEAT_COUNT]
+        if not seats:
+            self.controllers = [0] * CONTROLLER_SLOT_COUNT
+            return list(self.controllers)
+        self.controllers = [seats[i % len(seats)]
+                            for i in range(CONTROLLER_SLOT_COUNT)]
+        return list(self.controllers)
+
+    def controller_load(self, seats=None):
+        """每个座位现在扛着几格控制权。`seats` 给了就只统计这些座位。"""
+        load = {int(s): 0 for s in (seats if seats is not None else [])}
+        for owner in self.controllers:
+            if seats is None or owner in load:
+                load[owner] = load.get(owner, 0) + 1
+        return load
+
+    def handover_controller(self, leaver_seat, survivors, force=False):
+        """走的人那几格控制权交给还在的人。返回接管者座位号，没事干就 ``None``。
+
+        接管者 = 还在座的人里**当前扛得最少**的那个，并列取座位号最小的
+        （D103：六人房里房主走了之后，把他那几格全压给新房主等于让新房主
+        一台机器跑两倍的怪）。
+
+        走的人一格都不占（或者没人接得住）时返回 ``None`` —— 这时**一个包都
+        不该发**，客户端那张表本来就是对的。
+
+        `force=True` 只给「关卡加载途中走的人」用：**镜像里必然没有他**
+        （这一局的镜像是他走之后才建的），可客户端那张表**可能有** ——
+        那时必须照发，让客户端自己去匹配（匹配不上就是无害的空操作）。
+        """
+        leaver = int(leaver_seat)
+        survivors = sorted({int(s) for s in survivors
+                            if 0 <= int(s) < ROOM_SEAT_COUNT} - {leaver})
+        if not survivors or (leaver not in self.controllers and not force):
+            return None
+        load = self.controller_load(survivors)
+        heir = min(survivors, key=lambda seat: (load[seat], seat))
+        self.controllers = [heir if owner == leaver else owner
+                            for owner in self.controllers]
+        return heir
 
     # -- 掉落物 -------------------------------------------------------------
     def allocate_item(self):
@@ -2925,7 +3057,9 @@ class Conn:
         if room is None:
             return self.solo_quest
         if room.quest is None:
-            room.quest = RoomQuest()
+            # 正常开局走 `broadcast_start_game`（那里带着在座座位建），
+            # 这条懒惰分支只有「协议试探 / 控制通道手搓包」会走到。
+            room.quest = RoomQuest(seats=self.battle_seats())
         return room.quest
 
     def battle_members(self):
@@ -4287,12 +4421,24 @@ class Conn:
                 and room.status != SESSION_STATUS_PLAYING):
             LOBBY.update_room(room, status=SESSION_STATUS_PLAYING)
             # 这一局的战斗状态重新起一份（上一局的掉落物句柄/死亡表全作废）。
-            room.quest = RoomQuest()
+            # ★ 控制者表要按**这一刻在座的座位**算，和客户端
+            #   `GameContext::StartGame` 同一个口径（§180）——
+            #   客户端就是在进 stage 7 的路上建它的。
+            room.quest = RoomQuest(seats=[i for i, seat in enumerate(room.seats)
+                                          if seat is not None])
             # 「准备好了」跟着客户端一起清 —— 它进 stage 6 时自己清了一遍
             # （`LoadingStage` 构造函数，§165）。不跟着清就会两边不一致。
             room.clear_ready()
             self.log(f"   房间 #{room.room_id} -> 游戏中"
                      f"（大厅列表和「加入房间」都会跟着挡人）")
+            # ★ 关卡加载途中走掉的人，现在补交接（§180 / D103）——
+            #   客户端可能在他走之前就把控制者表建好了。**必须排在
+            #   那一发 `0x0402` 之后**（上面的循环已经发完了）：客户端要先
+            #   进 stage 7 把 GameContext 建起来，才有表可改。
+            for seat in list(room.battle.left_while_loading):
+                self.handover_controller_slots(
+                    room, seat, why="（关卡加载途中走的）", force=True)
+            room.battle.left_while_loading.clear()
 
     def on_start_game_packet(self, opcode, payload):
         """`0x0400` / `0x0402` / `0x0403` —— 开局链（多人，J.3）。
@@ -4386,6 +4532,59 @@ class Conn:
                 member.log(f"   0x0410 发送失败（{error!r}），忽略")
         if reason:
             self.log(f"   玩家间同步开关 -> {int(wanted)}{reason}")
+
+    def handover_controller_slots(self, room, leaver_seat, why="", force=False):
+        """有人离开**正在打的一局** -> 把他扛的控制权交给还在的人（§180 / D103）。
+
+        发 `0x0414 gspChangeControllerSlot(走的人的座位, 接管者的座位)`
+        给还留着的每一个人。客户端收到就把类别 20~25 里等于第一个座位号的
+        格子全换成第二个，再让世界里每只怪 / 每个刷怪点重问一次
+        「这只归不归我」，归自己的当场接管。
+
+        三种情况**一个包都不发**：
+
+        * 房间不在「游戏中」—— 等待房里没有怪，发了没有意义（D103）。
+          ★ 例外：关卡**正在加载**（`PREPARING`）时走的人要记下来，
+          等真进了关卡再补发 —— 客户端可能已经把他算进控制者表了；
+        * 这一局的状态已经丢了（`room.quest is None`）；
+        * 走的人一格控制权都不占（那张表本来就是对的）。
+
+        返回接管者的座位号，没发包就是 ``None``。
+        """
+        if room is None:
+            return None
+        if room.status != SESSION_STATUS_PLAYING:
+            if (room.battle is not None
+                    and room.battle.note_left_while_loading(leaver_seat)):
+                self.log(f"   控制权: 座位 {leaver_seat} 在关卡加载途中走了，"
+                         f"等进了关卡再补一发交接")
+            return None
+        quest = room.quest
+        if quest is None:
+            return None
+        members = room.members(exclude=None)
+        if not members:
+            return None
+        survivors = [i for i, seat in enumerate(room.seats) if seat is not None]
+        heir = quest.handover_controller(leaver_seat, survivors, force=force)
+        if heir is None:
+            self.log(f"   控制权: 座位 {leaver_seat} 没扛着任何一格，"
+                     f"不用交接{why}")
+            return None
+        packet = build_game(OP_CHANGE_CONTROLLER_SLOT,
+                            build_change_controller_slot(leaver_seat, heir))
+        sent = 0
+        for member in members:
+            try:
+                member.send(packet)
+                sent += 1
+            except OSError as error:
+                member.log(f"   0x0414 发送失败（{error!r}），忽略")
+        self.log(f"← 广播 0x0414 gspChangeControllerSlot("
+                 f"座位 {leaver_seat} -> {heir}) 给 {sent} 人{why}"
+                 f" —— 怪 / 刷怪点改由座位 {heir} 模拟"
+                 f"（现在的表 {quest.controllers}）")
+        return heir
 
     def maybe_join_relay(self):
         """回一发 `0x0210 gspJoinRelay`，让客户端接上原版的 TCP 中继（D078）。
@@ -4604,6 +4803,9 @@ class Conn:
             self.log(f"   房主转移到座位 {result.new_host_seat}")
         # 掉回一个人就把玩家间同步关掉，省得客户端对着空房间每秒发 8 发。
         self.sync_peer_relay(room, reason="（有人离开房间）")
+        # ★ 走的人可能正扛着「怪 / 刷怪点由谁模拟」的控制权 —— 不交接的话
+        #   剩下的人再也刷不出怪、关卡的闸门永远不开（§180 / D103）。
+        self.handover_controller_slots(room, result.seat_index)
         # ★ 走的人可能正是「还没加载完」的那一个 —— 不重新算一次的话，
         #   剩下的人会永远卡在加载界面等一个已经不在房里的人。
         members = room.members(exclude=None)

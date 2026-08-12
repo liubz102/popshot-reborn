@@ -28,7 +28,9 @@ import gameserver                                              # noqa: E402
 from gameserver import (                                       # noqa: E402
     DEATH_REPORT_FORMAT, GAME_RESULT_CLEARED, GAME_RESULT_DEFEATED,
     GAME_RESULT_TAIL_COUNT, ITEM_HANDLE_BASE,
-    OP_BROADCAST_DEATH, OP_COUNT_GAME_READY, OP_CREATED_ITEM, OP_CREATE_ITEM,
+    CONTROLLER_SLOT_COUNT,
+    OP_BROADCAST_DEATH, OP_CHANGE_CONTROLLER_SLOT,
+    OP_COUNT_GAME_READY, OP_CREATED_ITEM, OP_CREATE_ITEM,
     OP_END_GAME, OP_END_QUEST, OP_GET_ITEM, OP_LEAVE_SESSION, OP_LOADING_DONE,
     OP_MAP_CHANGE_READY, OP_MAP_LOADING_DONE, OP_MARK_QUEST_SUCCESS,
     OP_MOVE_INTO_SESSION, OP_PEER_DATA_UP, OP_PICKED_ITEM,
@@ -37,7 +39,7 @@ from gameserver import (                                       # noqa: E402
     OP_REQ_CHANGE_TO_NEXT_MAP, OP_REQ_RESPAWN, OP_RESPAWN_CHARACTER,
     OP_UPDATE_QUEST_SCORE, RoomQuest, SESSION_STATUS_PLAYING,
     SESSION_STATUS_WAITING, StartGameHandshake,
-    build_game, take_frame, w_i32, w_wstr,
+    build_change_controller_slot, build_game, take_frame, w_i32, w_wstr,
 )
 from lobby import Lobby, MOVE_INTO_ALREADY_PLAYING                  # noqa: E402
 import relayserver                                                  # noqa: E402
@@ -768,6 +770,195 @@ class RoomLifecycleTests(BattleRoom):
 
 
 # ----------------------------------------------------------------------------
+# 控制权交接（有人中途退出，§180 / D103）
+# ----------------------------------------------------------------------------
+def controller_handover(body):
+    """`0x0414` 的载荷 -> `(走的人的座位, 接管者的座位)`。"""
+    return struct.unpack("<ii", body)
+
+
+class ControllerHandoverTests(BattleRoom):
+    """房主中途退出之后，怪 / 刷怪点的模拟权必须交给还在的人。
+
+    不交接的话每台客户端都算出「类别 20 不归我」（表里指着一个空座位），
+    于是没人刷怪、关卡的闸门再也不开 —— 用户报的
+    「走到屏幕最右边被屏幕挡住」（§180）。
+    """
+
+    def test_the_table_starts_out_round_robin_like_the_client(self):
+        # 客户端 GameContext::StartGame：[ctx+0x294+i*4] = 在座座位[i % n]
+        self.assertEqual([0, 1, 0, 1, 0, 1], self.quest.controllers)
+
+    def test_the_host_leaving_hands_the_monsters_to_whoever_is_left(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_LEAVE_SESSION, b"")
+        bodies_ = bodies(self.bob, OP_CHANGE_CONTROLLER_SLOT)
+        self.assertEqual(1, len(bodies_))
+        self.assertEqual((0, 1), controller_handover(bodies_[0]))
+        self.assertEqual([1] * CONTROLLER_SLOT_COUNT, self.quest.controllers)
+
+    def test_a_dropped_connection_hands_over_too(self):
+        # 「强制退出」走的是断线那条路（连接直接断，没有 0x0203）。
+        gameserver.Conn.leave_room(self.alice, "Alice 断线了。")
+        self.assertEqual([(0, 1)],
+                         [controller_handover(b) for b in
+                          bodies(self.bob, OP_CHANGE_CONTROLLER_SLOT)])
+
+    def test_a_guest_leaving_also_hands_over_its_share(self):
+        # 两人房里客人也扛着三格（21/23/25），走了同样要交接。
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.assertEqual([(1, 0)],
+                         [controller_handover(b) for b in
+                          bodies(self.alice, OP_CHANGE_CONTROLLER_SLOT)])
+        self.assertEqual([0] * CONTROLLER_SLOT_COUNT, self.quest.controllers)
+
+    def test_the_kicked_player_hands_over_its_share(self):
+        gameserver.Conn.on_game_packet(self.alice, gameserver.OP_KICK_OUT,
+                                       w_i32(1) + w_i32(0))
+        self.assertEqual([(1, 0)],
+                         [controller_handover(b) for b in
+                          bodies(self.alice, OP_CHANGE_CONTROLLER_SLOT)])
+
+    def test_the_one_who_left_is_not_sent_anything(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_LEAVE_SESSION, b"")
+        self.assertNotIn(OP_CHANGE_CONTROLLER_SLOT, opcodes(self.alice))
+
+    def test_the_handover_does_not_fire_after_the_round_is_over(self):
+        # 结算看完回到房间 -> 房间标回「待机中」、quest 丢掉。等待房里没有怪，
+        # 这时再有人走就不该发这个包（D103）。
+        for conn in (self.alice, self.bob):
+            gameserver.Conn.leave_game_result(conn)
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_LEAVE_SESSION, b"")
+        self.assertNotIn(OP_CHANGE_CONTROLLER_SLOT, opcodes(self.bob))
+
+
+class ControllerHandoverInRoomTests(BattleRoom):
+    """还没开局（房间「待机中」）时离开 —— 一个 `0x0414` 都不该发。"""
+
+    def start_battle(self):
+        pass
+
+    def test_leaving_a_waiting_room_sends_no_handover(self):
+        self.assertEqual(SESSION_STATUS_WAITING, self.room.status)
+        gameserver.Conn.on_game_packet(self.alice, OP_LEAVE_SESSION, b"")
+        self.assertNotIn(OP_CHANGE_CONTROLLER_SLOT, opcodes(self.bob))
+
+
+class ControllerHandoverWhileLoadingTests(BattleRoom):
+    """★ 关卡**正在加载**（`0x0400` 发了、还没收齐 `0x0403`）时有人走。
+
+    客户端那张控制者表是它自己建的，我们不知道它到底建在「stage 6 加载完」
+    还是「进 stage 7」那一刻 —— 万一建得比那个人走掉更早，表里就留着一个
+    已经空了的座位，那一局的怪从第一秒起就没人模拟。所以这段时间走掉的人
+    要记下来，等真进了关卡立刻补一发（§180 / D103）。
+    """
+
+    def start_battle(self):
+        self.carol = make_conn("carol", self.accounts)
+        gameserver.Conn.on_game_packet(self.carol, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        # 只走到「大家开始加载关卡」这一步（房主两发 0x0402 -> 0x0401 + 0x0400）。
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+
+    def clear(self):
+        super().clear()
+        self.carol.sent.clear()
+
+    def test_the_departure_is_remembered_and_replayed_after_loading(self):
+        self.assertEqual(StartGameHandshake.PREPARING, self.room.battle.state)
+        gameserver.Conn.on_game_packet(self.carol, OP_LEAVE_SESSION, b"")
+        # 加载途中不发（客户端可能还没建表），只记下来
+        self.assertNotIn(OP_CHANGE_CONTROLLER_SLOT, opcodes(self.bob))
+        self.assertEqual([2], self.room.battle.left_while_loading)
+        self.clear()
+        # 剩下两个人加载完 -> 一起进 stage 7 -> 这时才补发
+        for conn in (self.alice, self.bob):
+            gameserver.Conn.on_game_packet(conn, OP_LOADING_DONE, b"")
+        self.assertEqual([(2, 0)],
+                         [controller_handover(b) for b in
+                          bodies(self.bob, OP_CHANGE_CONTROLLER_SLOT)])
+        self.assertEqual([], self.room.battle.left_while_loading)
+
+    def test_the_replay_comes_after_the_stage_7_release(self):
+        # ★ 顺序是硬约束：客户端要先收到 0x0402 进 stage 7 把 GameContext
+        #   建起来，才有表可改。
+        gameserver.Conn.on_game_packet(self.carol, OP_LEAVE_SESSION, b"")
+        self.clear()
+        for conn in (self.alice, self.bob):
+            gameserver.Conn.on_game_packet(conn, OP_LOADING_DONE, b"")
+        seen = opcodes(self.bob)
+        self.assertLess(seen.index(OP_COUNT_GAME_READY),
+                        seen.index(OP_CHANGE_CONTROLLER_SLOT))
+
+    def test_nothing_is_replayed_when_nobody_left(self):
+        for conn in (self.alice, self.bob, self.carol):
+            gameserver.Conn.on_game_packet(conn, OP_LOADING_DONE, b"")
+        self.assertNotIn(OP_CHANGE_CONTROLLER_SLOT, opcodes(self.bob))
+
+    def test_a_second_round_forgets_the_old_departure(self):
+        gameserver.Conn.on_game_packet(self.carol, OP_LEAVE_SESSION, b"")
+        for conn in (self.alice, self.bob):
+            gameserver.Conn.on_game_packet(conn, OP_LOADING_DONE, b"")
+        for conn in (self.alice, self.bob):
+            gameserver.Conn.leave_game_result(conn)
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        for conn in (self.alice, self.bob):
+            gameserver.Conn.on_game_packet(conn, OP_LOADING_DONE, b"")
+        self.assertNotIn(OP_CHANGE_CONTROLLER_SLOT, opcodes(self.bob))
+
+
+class ControllerHandoverThreeWayTests(BattleRoom):
+    """三个人一起打的一局，验「交给最闲的那个」和连着走两个人。"""
+
+    def start_battle(self):
+        self.carol = make_conn("carol", self.accounts)
+        gameserver.Conn.on_game_packet(self.carol, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        for conn in (self.alice, self.bob, self.carol):
+            gameserver.Conn.on_game_packet(conn, OP_LOADING_DONE, b"")
+
+    def clear(self):
+        super().clear()
+        self.carol.sent.clear()
+
+    def test_three_players_split_the_table(self):
+        self.assertEqual([0, 1, 2, 0, 1, 2], self.quest.controllers)
+
+    def test_everyone_left_behind_gets_the_same_handover(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_LEAVE_SESSION, b"")
+        for conn in (self.bob, self.carol):
+            self.assertEqual([(0, 1)],
+                             [controller_handover(b) for b in
+                              bodies(conn, OP_CHANGE_CONTROLLER_SLOT)],
+                             f"{conn.account_name} 那边没收到（或者收错了）")
+        self.assertEqual([1, 1, 2, 1, 1, 2], self.quest.controllers)
+
+    def test_a_second_departure_converges_on_the_last_one_standing(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_LEAVE_SESSION, b"")
+        self.clear()
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.assertEqual([(1, 2)],
+                         [controller_handover(b) for b in
+                          bodies(self.carol, OP_CHANGE_CONTROLLER_SLOT)])
+        self.assertEqual([2] * CONTROLLER_SLOT_COUNT, self.quest.controllers)
+
+    def test_the_heir_is_the_least_loaded_survivor(self):
+        # 手动摆一张不均的表：座位 1 扛 4 格、座位 2 扛 1 格。
+        # 座位 0 走的时候应当交给 2（最闲），不是「新房主」1。
+        self.quest.controllers = [0, 1, 1, 1, 1, 2]
+        gameserver.Conn.on_game_packet(self.alice, OP_LEAVE_SESSION, b"")
+        self.assertEqual([(0, 2)],
+                         [controller_handover(b) for b in
+                          bodies(self.bob, OP_CHANGE_CONTROLLER_SLOT)])
+        self.assertEqual([2, 1, 1, 1, 1, 2], self.quest.controllers)
+
+
+# ----------------------------------------------------------------------------
 # RoomQuest 本身（不碰协议，纯模型）
 # ----------------------------------------------------------------------------
 class RoomQuestTests(unittest.TestCase):
@@ -796,6 +987,61 @@ class RoomQuestTests(unittest.TestCase):
         quest = RoomQuest()
         handles = [quest.allocate_item() for _ in range(5)]
         self.assertEqual(len(handles), len(set(handles)))
+
+    # -- 控制者表（§180）---------------------------------------------------
+    def test_the_wire_format_is_two_int32(self):
+        # 反序列化 0x54cfbf = 两发 0x5d59ff，就这 8 个字节。
+        self.assertEqual(b"\x02\x00\x00\x00\x05\x00\x00\x00",
+                         build_change_controller_slot(2, 5))
+
+    def test_assign_controllers_matches_the_client_formula(self):
+        quest = RoomQuest(seats=[1, 4])
+        self.assertEqual([1, 4, 1, 4, 1, 4], quest.controllers)
+        self.assertEqual([3] * CONTROLLER_SLOT_COUNT,
+                         RoomQuest(seats=[3]).controllers)
+
+    def test_an_empty_room_leaves_the_table_at_zero(self):
+        # 客户端在 vec 为空时也是填 0（`mov [edi], ebx`）。
+        self.assertEqual([0] * CONTROLLER_SLOT_COUNT,
+                         RoomQuest(seats=[]).controllers)
+
+    def test_assign_controllers_ignores_seats_out_of_range(self):
+        self.assertEqual([2] * CONTROLLER_SLOT_COUNT,
+                         RoomQuest(seats=[-1, 2, 99]).controllers)
+
+    def test_handover_replaces_every_slot_the_leaver_held(self):
+        quest = RoomQuest(seats=[0, 1])
+        self.assertEqual(1, quest.handover_controller(0, [1]))
+        self.assertEqual([1] * CONTROLLER_SLOT_COUNT, quest.controllers)
+
+    def test_handover_does_nothing_when_the_leaver_held_nothing(self):
+        quest = RoomQuest(seats=[0, 1])
+        before = list(quest.controllers)
+        self.assertIsNone(quest.handover_controller(5, [0, 1]))
+        self.assertEqual(before, quest.controllers)
+
+    def test_handover_does_nothing_without_a_survivor(self):
+        quest = RoomQuest(seats=[0])
+        self.assertIsNone(quest.handover_controller(0, []))
+        self.assertIsNone(quest.handover_controller(0, [0]))
+
+    def test_handover_picks_the_least_loaded_survivor(self):
+        quest = RoomQuest(seats=[0, 1, 2])       # [0, 1, 2, 0, 1, 2]
+        quest.controllers = [0, 1, 1, 1, 2, 0]   # 1 扛 3 格、2 扛 1 格
+        self.assertEqual(2, quest.handover_controller(0, [1, 2]))
+        self.assertEqual([2, 1, 1, 1, 2, 2], quest.controllers)
+
+    def test_handover_breaks_ties_on_the_lowest_seat(self):
+        quest = RoomQuest(seats=[0, 1, 2])
+        self.assertEqual(1, quest.handover_controller(0, [2, 1]))
+
+    def test_forced_handover_fires_even_when_the_mirror_is_clean(self):
+        # 「关卡加载途中走的人」：镜像里必然没有他（镜像是他走之后才建的），
+        # 但客户端那张表可能有 —— 那时必须照发。
+        quest = RoomQuest(seats=[0, 1])
+        self.assertIsNone(quest.handover_controller(2, [0, 1]))
+        self.assertEqual(0, quest.handover_controller(2, [0, 1], force=True))
+        self.assertEqual([0, 1, 0, 1, 0, 1], quest.controllers)
 
 
 if __name__ == "__main__":
