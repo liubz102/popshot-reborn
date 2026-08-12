@@ -345,12 +345,19 @@ class Lobby:
         with self._lock:
             return self._by_conn.get(conn)
 
-    def rooms(self, game_type=None):
-        """房间列表快照。`game_type` 非 None 时只留匹配的（§139）。"""
+    def rooms(self, game_type=None, waiting_only=False):
+        """房间列表快照。
+
+        - `game_type` 非 None 时只留匹配的（§139）；
+        - `waiting_only=True` 时只留**待机中**的房间 —— 大厅左下角
+          「全部 / 待机」那对按钮就是它（§170）。
+        """
         with self._lock:
             found = [r for r in self._rooms.values() if not r.is_empty()]
         if game_type is not None:
             found = [r for r in found if r.game_type == int(game_type)]
+        if waiting_only:
+            found = [r for r in found if not r.is_playing()]
         found.sort(key=lambda r: r.room_id)
         return found
 

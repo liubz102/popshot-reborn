@@ -602,17 +602,31 @@ def build_rep_list_session(rooms=(), total=None):
     return b"".join(out)
 
 
-def parse_list_session_request(payload):
-    """解客户端方向的 `0x0200`（12 字节，序列化 `0x54c0e2`，§139）。
+#: 房间列表的过滤开关（`0x0200` 请求的第 4 个字段，一个 u8，§170）。
+#: 大厅左下那两个按钮：`[frame+0x11c]`「全部」发 0，`[frame+0x118]`「待机」发 1。
+#: **进大厅时客户端自己发的是 1**（`0x44057a` 初始化 `[frame+0xcc]=1`）。
+SESSION_LIST_FILTER_ALL = 0
+SESSION_LIST_FILTER_WAITING = 1
 
-    只有最后那个 int32（游戏类型）对服务端有用：大厅四个标签页各自只该看到
-    自己那一类的房间。前五个字段的语义还没逐个确认，原样记下来给日志。
+
+def parse_list_session_request(payload):
+    """解客户端方向的 `0x0200`（12 字节，序列化 `0x54c0e2`，§139 / §170）。
+
+        u16   起始房间号   分页锚点（列表里 index 0 的房间号）
+        u16   ?            恒 0
+        u16   每页几个     客户端写死 10（`0x44056c`，大厅一页正好 10 格）
+        u8    过滤开关     0 = 全部房间，1 = 只看待机房间（**默认**，§170）
+        u8    ?            恒 0
+        int32 游戏类型     由频道码翻译：7->2 8->6 9->5 其余->1
+
+    第 4 个字节就是大厅左下角「全部 / 待机」那对按钮的状态（§170）——
+    以前当成「未定字段」原样丢掉，于是那两个按钮怎么点都没反应。
     """
     reader = Reader(payload)
     start_room = reader.u16()
     unknown_06 = reader.u16()
-    unknown_08 = reader.u16()
-    unknown_0a = reader.take(1)[0]
+    page_size = reader.u16()
+    waiting_only = reader.take(1)[0]
     unknown_0b = reader.take(1)[0]
     game_type = reader.i32()
     if reader.left():
@@ -620,9 +634,12 @@ def parse_list_session_request(payload):
             f"list-session payload has {reader.left()} trailing bytes")
     return {
         "start_room": start_room,
+        "page_size": page_size,
+        "filter": waiting_only,
+        "waiting_only": waiting_only != SESSION_LIST_FILTER_ALL,
         "game_type": game_type,
         "game_type_name": GAME_TYPE_NAMES.get(game_type, "unknown"),
-        "unknown": (unknown_06, unknown_08, unknown_0a, unknown_0b),
+        "unknown": (unknown_06, unknown_0b),
     }
 
 
@@ -2401,14 +2418,27 @@ def build_rep_user_list():
     return w_i32(0) + w_wstr("") + w_wstr("") + w_i32(0)
 
 
+#: 玩家列表的过滤开关（`0x020d` 请求的第 5 个字节，§169）。
+#: 大厅右侧那两个按钮 `[frame+0xe0]` / `[frame+0xe4]` 各自对应一个值：
+#: **进大厅时客户端自己发的是 1**（`0x441bf7` 初始化 `[frame+0xcc]=1`）。
+USER_LIST_FILTER_RECOMMENDED = 0   # 「추천상대 / 推荐对手」按钮（`0x442122`）
+USER_LIST_FILTER_WAITING = 1       # 「대기유저 / 待机玩家」按钮（`0x442139`），默认
+
+#: `UserSnap` 第三个 int32 = 竞技场（래더）等级，客户端拿 `20 - 它` 去
+#: `Images/General/LadderMark.smf`（20 帧）里取图，越界一律取第 0 帧（§169）。
+#: 存档里**没有**竞技场等级这项数据，统一发「最低档 20」——
+#: 和发 0 画出来是同一张图，但线上的值落在合法区间里。
+LADDER_GRADE_UNRANKED = 20
+
+
 def parse_user_list_request(payload):
-    """解客户端方向的 `0x020d gcpReqUserList`（5 字节，§166）。
+    """解客户端方向的 `0x020d gcpReqUserList`（5 字节，§166 / §169）。
 
     发送点 `0x554513`（由 `0x43d0c9` 调），线格式和应答的头三个字段一样：
 
         u16   页号        从 0 起
         u16   每页几条    客户端写死 0x12 = 18（`0x441bed` / `0x44215c`）
-        u8    过滤开关    1 = 全部，0 = 只看「推荐对手」（`0x665c30 추천상대`）
+        u8    过滤开关    1 = 只看待机玩家（**默认**），0 = 推荐对手（§169）
 
     客户端每 10 秒重发一次（`0x43d0c9` 里的 0x2710 节流）。
     """
@@ -2421,7 +2451,8 @@ def parse_user_list_request(payload):
     return {"page": page, "page_size": page_size, "flag": flag}
 
 
-def build_rep_user_list_page(page=0, page_size=18, flag=1, users=()):
+def build_rep_user_list_page(page=0, page_size=18,
+                             flag=USER_LIST_FILTER_WAITING, users=()):
     """opcode **`0x0212`** —— `Packet_gspRepUserList`（vft `0x6918d4`，§166）。
 
     ★★ **这才是大厅右侧那张「유저리스트 / 玩家列表」的数据源。**
@@ -2436,10 +2467,21 @@ def build_rep_user_list_page(page=0, page_size=18, flag=1, users=()):
         u16     每页几条    -> pkt+0x06   同上
         u8      过滤开关    -> pkt+0x08   `0x5d59d0` 读 1 字节
         int32   条目数
-        条目 × { string 昵称, int32 a, int32 b, int32 c }   每项 0x14 字节
+        条目 × { string 昵称, int32 在打游戏, int32 等级, int32 竞技场等级 }
 
     每一项是一个 `UserSnap`（vft `0x665374`），反序列化 `0x43cf5c`：
-    先一个字符串（`0x5d5b3a`）再三个 int32（`0x5d59ff`）。
+    先一个字符串（`0x5d5b3a`）再三个 int32（`0x5d59ff`），共 0x14 字节。
+
+    ★ **三个 int32 的含义已查明**（§169，渲染函数 `0x441df5`）：
+
+    | 位置 | 落到 | 客户端拿它干什么 |
+    |---|---|---|
+    | 第 1 个 | `UserSnap+0x08` | `!= 0` 画 `P`（游戏中）、`== 0` 画 `W`（待机）|
+    | 第 2 个 | `UserSnap+0x0c` | 等级图标：`LevelMark.smf` 第 `等级-1` 帧（60 帧）|
+    | 第 3 个 | `UserSnap+0x10` | 竞技场等级：`LadderMark.smf` 第 `20-它` 帧（20 帧）|
+
+    上一版把**等级填进了第 1 个**，于是每一行都是「P + 1 级」——
+    这就是用户报的「所有玩家显示的一样，分不清谁是谁」（§169）。
 
     处理器把头三个字段原样塞进列表管理器 `[0x72e674]` 的
     `+0x14` / `+0x18` / `+0x1c`，也就是**服务端要把请求里的页号 / 每页几条 /
@@ -2601,26 +2643,50 @@ def all_conns():
         return list(_conns)
 
 
-def online_user_snapshots():
-    """现在在线的每个玩家一项 `(昵称, 等级, 0, 0)`，喂给 `0x0212`（§166）。
+def conn_is_playing(conn):
+    """这条连接现在是不是**在打游戏**（而不是待在大厅/房间里）。
+
+    判据就是大厅那份房间状态：所有人一起进 stage 7 时房间被标成
+    `SESSION_STATUS_PLAYING`（`on_start_game_packet`），结算完回房间又标回
+    待机。坐在「待机中」的房间里等人**算待机** —— 房间列表也是这么显示的，
+    两边口径一致。
+    """
+    room = LOBBY.room_of(conn)
+    return room is not None and room.status == SESSION_STATUS_PLAYING
+
+
+def online_user_snapshots(viewer=None, waiting_only=False):
+    """在线玩家列表，喂给 `0x0212`（§166 / §169）。
+
+    每项 `(昵称, 在打游戏 0/1, 等级, 竞技场等级)` —— 顺序就是线上的顺序，
+    别再把等级放到第一格（那一格是 `P`/`W` 徽章，§169）。
+
+    - `viewer` 是发请求的那条连接：**它自己不进列表**。客户端那张列表
+      没有任何「这是你」的标记（渲染函数 `0x441df5` 从头到尾不比昵称），
+      所以只能靠不列自己来消除歧义（D095）。
+    - `waiting_only=True`（客户端默认的「待机玩家」档）只留没在打游戏的人。
 
     ★ 按账号去重：同一个账号同一时刻只该有一条连接（顶号会关掉旧的），
     但断线重连的窗口里可能短暂有两条，列表里出现两个同名很难看。
     没登录成功（还没认出账号）的连接不进列表。
-
-    ⚠ 每项后面三个 int32 的**业务含义还没查明**（`UserSnap+0x08/0x0c/0x10`，
-    §166）。先按 D019 只填一个等级、其余给 0 —— 列表里能看见人是第一位的。
     """
     out = []
     seen = set()
+    viewer_name = (getattr(viewer, "account_name", "") or "") if viewer else ""
     for conn in all_conns():
         name = getattr(conn, "account_name", "") or ""
         if not name or name in seen:
             continue
+        if viewer_name and name == viewer_name:
+            continue
         seen.add(name)
         account = getattr(conn, "account", None) or {}
         nickname = display_name(account) or name
-        out.append((nickname, player_level(account), 0, 0))
+        playing = 1 if conn_is_playing(conn) else 0
+        if waiting_only and playing:
+            continue
+        out.append((nickname, playing, player_level(account),
+                    LADDER_GRADE_UNRANKED))
     out.sort(key=lambda item: item[0])
     return out
 
@@ -3260,6 +3326,10 @@ class Conn:
                              f"顶它的是 ip={self.peer()}")
                 other.close_now()
         self.account_name, self.account = name, account
+        # ★ 这张票据从现在起也是这个玩家的**重连凭证**：服务端一断，客户端会
+        #   自己反复重连并原样重放它（§171），全程不回认证服。所以要把它标成
+        #   「已登进游戏服」换一个长得多的有效期，并落盘扛住服务端重启（D096）。
+        self.tickets.bind(ticket)
         self.online(f"✓ 登录 账号={name!r} ip={self.peer()} "
                     f"等级={player_level(account)} 金币={player_money(account)}")
         state = tutorial_state(self.account)
@@ -3447,22 +3517,42 @@ class Conn:
         「大厅右侧玩家列表看不见其他人」就是这么来的。
 
         页号 / 每页几条 / 过滤开关**原样回显**，客户端翻页全靠它。
+
+        ★ 过滤开关（第 5 个字节）**要真的过滤**（§169 / D095）：
+
+        | 值 | 大厅右下那两个按钮 | 我们回什么 |
+        |---|---|---|
+        | 1（客户端默认）| 「待机玩家」| 只有**没在打游戏**的人 |
+        | 0 | 「推荐对手」| 全部在线的人，按**等级和我接近**排前面 |
+
+        两档都**不含自己**（D095）。
         """
         try:
             request = parse_user_list_request(payload)
         except (ValueError, struct.error, IndexError) as error:
             self.log(f"   用户列表请求解析失败: {error}; 按默认参数回一页")
-            request = {"page": 0, "page_size": 18, "flag": 1}
+            request = {"page": 0, "page_size": 18,
+                       "flag": USER_LIST_FILTER_WAITING}
         page = max(0, int(request["page"]))
         page_size = int(request["page_size"]) or 18
-        everyone = online_user_snapshots()
+        flag = int(request["flag"])
+        waiting_only = (flag != USER_LIST_FILTER_RECOMMENDED)
+        everyone = online_user_snapshots(viewer=self, waiting_only=waiting_only)
+        if not waiting_only:
+            # 「推荐对手」：原版服务端怎么挑对手已经无从得知（D095），
+            # 拿「等级和我最接近」排序 —— 名单不会因此少一个人，只是顺序变了。
+            my_level = player_level(self.account or {})
+            everyone.sort(key=lambda item: (abs(item[2] - my_level), item[0]))
         start = page * page_size
         chunk = everyone[start:start + page_size]
-        self.log(f"← 回 0x0212 gspRepUserList(第 {page} 页 每页 {page_size} 条; "
-                 f"在线 {len(everyone)} 人，本页 {len(chunk)} 人: "
-                 + "、".join(u[0] for u in chunk) + ")")
+        mode = "待机玩家" if waiting_only else "推荐对手"
+        self.log(f"← 回 0x0212 gspRepUserList({mode}; 第 {page} 页 "
+                 f"每页 {page_size} 条; 能看见 {len(everyone)} 人，"
+                 f"本页 {len(chunk)} 人: "
+                 + "、".join(f"{u[0]}({'游戏中' if u[1] else '待机'}"
+                             f" Lv.{u[2]})" for u in chunk) + ")")
         self.send(build_game(OP_REP_USER_LIST, build_rep_user_list_page(
-            page, page_size, request["flag"], chunk)))
+            page, page_size, flag, chunk)))
 
     def respawn_position(self):
         """重生用的整数坐标。优先用客户端最近一次 `0x0406` 报的位置。
@@ -3918,23 +4008,32 @@ class Conn:
         """`0x0200 gcpReqListSession` —— 回真实房间列表（§138 / §139）。
 
         大厅四个标签页各看各的：请求里那个 int32 是游戏类型，按它过滤。
+        第 4 个字节是左下角「全部 / 待机」那对按钮，选「待机」就只回
+        待机中的房间（§170）。
         解析失败就退回「不过滤」，宁可多列几个房间，也不要让列表整个空掉
         （空列表和「服务端挂了」在玩家眼里长得一模一样）。
         """
         game_type = None
+        waiting_only = False
         try:
             request = parse_list_session_request(payload)
         except (ValueError, struct.error, IndexError) as error:
-            self.log(f"   房间列表请求解析失败: {error}; 不按类型过滤")
+            self.log(f"   房间列表请求解析失败: {error}; 不按类型/状态过滤")
         else:
             game_type = request["game_type"]
+            waiting_only = request["waiting_only"]
             self.vlog(f"   房间列表请求: 游戏类型={game_type} "
                       f"({request['game_type_name']}) "
                       f"起始房间号={request['start_room']} "
-                      f"未定字段={request['unknown']}")
-        rooms = LOBBY.rooms(game_type)
+                      f"每页={request['page_size']} "
+                      f"过滤={request['filter']}"
+                      f"（{'只看待机' if waiting_only else '全部'}）"
+                      f" 未定字段={request['unknown']}")
+        rooms = LOBBY.rooms(game_type, waiting_only=waiting_only)
         if rooms:
-            self.log(f"← 回 gspRepListSession（{len(rooms)} 个房间："
+            self.log(f"← 回 gspRepListSession"
+                     f"（{'只看待机；' if waiting_only else ''}"
+                     f"{len(rooms)} 个房间："
                      + "；".join(r.describe() for r in rooms) + "）")
         else:
             self.vlog("← 回 gspRepListSession（空房间列表）")
@@ -4249,8 +4348,8 @@ class Conn:
 
         地址固定填 `127.0.0.1:<中继端口>`：客户端的 `connect` 参数是纯 IPv4 的
         `sockaddr_in`，服务端又不知道自己的公网地址（和注册页同一个老问题），
-        所以沿用 47611 / 27799 那一套 —— 由客户端包的 `bshook` 按单机 / 联机
-        把这个端口转出去（D065 / D066 / D079）。
+        所以沿用 47611 / 27799 那一套 —— 由客户端包的 `bshook` 按「本机服务器 /
+        远程服务器」把这个端口转出去（D065 / D066 / D079）。
         """
         if not TCP_RELAY_ENABLED:
             return False

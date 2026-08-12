@@ -2052,9 +2052,15 @@ class QuestDifficultyTests(unittest.TestCase):
 
         def __init__(self, username="tester"):
             self.username = username
+            self.bound = []
 
         def resolve(self, ticket):
             return self.username if ticket else None
+
+        def bind(self, ticket):
+            """登录成功后游戏服会调它（重连凭证，§171 / D096）。"""
+            self.bound.append(ticket)
+            return bool(ticket)
 
     def make_conn(self, quest=(3, 1), account=None):
         conn = gameserver.Conn.__new__(gameserver.Conn)

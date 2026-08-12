@@ -144,6 +144,81 @@ class TicketStoreTests(unittest.TestCase):
         self.assertNotIn(short(ticket), (ticket,))
         self.assertLessEqual(len(short(ticket)), 9)
 
+    # -- 断线重连（§171 / D096）------------------------------------------
+    def test_resolving_slides_the_expiry(self):
+        # 玩一局超过 TTL 再断线，重连时那张票据必须还认得。
+        ticket = self.tickets.issue("alice")
+        for _ in range(10):
+            self.now += 59
+            self.assertEqual("alice", self.tickets.resolve(ticket))
+        self.now += 61
+        self.assertIsNone(self.tickets.resolve(ticket))
+
+    def test_a_bound_ticket_lives_much_longer_than_an_unused_one(self):
+        used, unused = self.tickets.issue("alice"), self.tickets.issue("bob")
+        self.assertTrue(self.tickets.bind(used))
+        self.assertTrue(self.tickets.is_bound(used))
+        self.assertFalse(self.tickets.is_bound(unused))
+        self.now += 3600            # 一小时后（服务端挂了一小时才被拉起来）
+        self.assertEqual("alice", self.tickets.resolve(used))
+        self.assertIsNone(self.tickets.resolve(unused))
+
+    def test_binding_an_unknown_ticket_is_a_no_op(self):
+        self.assertFalse(self.tickets.bind("deadbeef"))
+        self.assertFalse(self.tickets.bind(""))
+
+
+class TicketFileTests(unittest.TestCase):
+    """票据表落盘 —— 服务端重启后客户端手里那张票必须还认得（§171 / D096）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "sub", "tickets.json")
+        self.wall = 5_000.0
+
+    def store(self, now=1000.0):
+        return TicketStore(ttl_seconds=60, bound_ttl_seconds=3600,
+                           clock=lambda: now, wall_clock=lambda: self.wall,
+                           path=self.path)
+
+    def test_a_bound_ticket_survives_a_restart(self):
+        first = self.store()
+        ticket = first.issue("alice")
+        first.bind(ticket)
+        self.wall += 600                      # 服务端停机 10 分钟
+        again = self.store(now=1.0)           # 新进程，monotonic 从头开始
+        self.assertEqual("alice", again.resolve(ticket))
+
+    def test_an_unused_ticket_does_not_survive_a_long_outage(self):
+        first = self.store()
+        ticket = first.issue("alice")         # 没 bind：只有 60 秒
+        self.wall += 600
+        self.assertIsNone(self.store(now=1.0).resolve(ticket))
+
+    def test_a_superseded_ticket_stays_superseded_after_a_restart(self):
+        # 不然被顶号的人重启后看到的又是「在无法连接的地方尝试了连接。」（§132）
+        first = self.store()
+        old = first.issue("alice")
+        first.issue("alice")
+        again = self.store()
+        self.assertIsNone(again.resolve(old))
+        self.assertEqual(("alice", "superseded"), again.revoked_reason(old))
+
+    def test_a_corrupt_file_is_treated_as_empty_and_warns(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("{ not json")
+        said = []
+        store = TicketStore(path=self.path, on_warning=said.append)
+        self.assertEqual(0, len(store))
+        self.assertTrue(said)
+
+    def test_nothing_is_written_without_a_path(self):
+        store = TicketStore(ttl_seconds=60)
+        store.bind(store.issue("alice"))
+        self.assertFalse(os.path.exists(self.path))
+
 
 class AuthServiceTests(unittest.TestCase):
     def setUp(self):

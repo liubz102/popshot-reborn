@@ -313,6 +313,9 @@ function Invoke-ServerSmokeTest {
     $work = Join-Path ([System.IO.Path]::GetTempPath()) ("popshot-smoke-" + [System.Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $work -Force | Out-Null
     $accounts = Join-Path $work 'accounts.json'
+    # 票据表也指到临时目录：默认路径在包里（server\data\tickets.json），
+    # 自检写进去就会被打进发布包 —— 那是别人机器上的登录凭证，绝不能随包发。
+    $tickets  = Join-Path $work 'tickets.json'
     $outFile  = Join-Path $work 'smoke.out'
     $errFile  = Join-Path $work 'smoke.err'
 
@@ -322,7 +325,8 @@ function Invoke-ServerSmokeTest {
         '--game-port',  "$gamePort",
         '--relay-port', "$relayPort",
         '--web-port',   "$webPort",
-        '--accounts',   "`"$accounts`""
+        '--accounts',   "`"$accounts`"",
+        '--tickets',    "`"$tickets`""
     )
 
     $proc = $null

@@ -304,7 +304,7 @@ static int WINAPI det_MessageBoxA(HWND hWnd, LPCSTR text, LPCSTR cap, UINT type)
 }
 
 /* ========================================================================== */
-/* V0.2 登录框改造：单机 / 联机分区 + 指向我们自己的注册页                     */
+/* V0.2 登录框改造：本机服务器 / 远程服务器 + 指向我们自己的注册页             */
 /*                                                                            */
 /* 登录框是 #32770 标题 "PopShot"，控件 id 实测（tools\gui_probe.py enum）：   */
 /*   1004 用户名 Edit      1005 密码 Edit        1006 「开始」                */
@@ -341,7 +341,7 @@ static unsigned g_peer_relay_port     = 27798;
 
 static HWND         g_login_dlg   = NULL;
 static int          g_dlg_styled  = 0;      /* 文案 / 尺寸只改一次 */
-static volatile LONG g_online     = 0;      /* 1 = 选了「联机」 */
+static volatile LONG g_online     = 0;      /* 1 = 选了「远程服务器」 */
 static wchar_t      g_link_text[512] = L"";
 /* 被我们子类化的那条注册链接（实现在下面「注册链接的点击」一段）。 */
 static HWND         s_link_hwnd   = NULL;
@@ -381,13 +381,13 @@ static void read_online_config(void)
     g_relay_game_port = env_uint("POPSHOT_RELAY_GAME_PORT", g_relay_game_port);
     g_relay_peer_port = env_uint("POPSHOT_RELAY_PEER_PORT", g_relay_peer_port);
     g_peer_relay_port = env_uint("POPSHOT_PEER_RELAY_PORT", g_peer_relay_port);
-    bslog("CFG     联机服务器=%s 注册页端口 远端=%u 本机=%u；中继端口 %u/%u/%u",
+    bslog("CFG     远程服务器=%s 注册页端口 远端=%u 本机=%u；中继端口 %u/%u/%u",
           w2u8(g_server_addr, u8, sizeof(u8)),
           g_server_reg_port, g_local_reg_port,
           g_relay_auth_port, g_relay_game_port, g_relay_peer_port);
 }
 
-/* 当前该显示 / 打开哪台服务器：单机固定 localhost，联机用配置里的地址。 */
+/* 当前该显示 / 打开哪台服务器：本机固定 localhost，远程用配置里的地址。 */
 static const wchar_t *current_reg_host(void)
 {
     return g_online ? g_server_addr : L"localhost";
@@ -421,8 +421,9 @@ unsigned popshot_map_port(unsigned port)
     if (port == g_game_port) return g_relay_game_port;
     /* 原版 TCP 中继（D078 / D079）。前两条是客户端写死的端口，这一条不是：
        连哪儿由服务端在 `0x0210` 里说，我们让它固定说 `127.0.0.1:27798`，
-       单机时那就是本机服务端的中继口、联机时在这里换成本机中继的 27808。
-       ★ 单机走的是「不映射」那条路，所以这行只在联机模式下生效，
+       选本机服务器时那就是本机服务端的中继口、选远程服务器时在这里换成
+       本机中继的 27808。
+       ★ 本机服务器走的是「不映射」那条路，所以这行只在远程模式下生效，
          和上面两条完全同构。 */
     if (port == g_peer_relay_port) return g_relay_peer_port;
     return port;
@@ -467,12 +468,14 @@ static void style_login_dialog(HWND dlg)
 {
     HWND online = GetDlgItem(dlg, IDC_RADIO_ONLINE);
 
-    SetDlgItemTextW(dlg, IDC_RADIO_LOCAL, L"单机游玩");
-    SetDlgItemTextW(dlg, IDC_RADIO_ONLINE, L"联机(服务器地址请改:server.config)");
+    SetDlgItemTextW(dlg, IDC_RADIO_LOCAL, L"本机服务器");
+    SetDlgItemTextW(dlg, IDC_RADIO_ONLINE,
+                    L"远程服务器\n(地址请改:server.config)");
 
-    /* 「联机(服务器地址请改:server.config)」比原来的「枪林弹雨(网通)」长一倍多，
+    /* 「远程服务器(地址请改:server.config)」比原来的「枪林弹雨(网通)」长一倍多，
        126 像素的原控件会把它裁掉。右边 x=245 起就是「用户名:」，横着加宽会压上去，
-       所以改成**两行**：加 BS_MULTILINE 再把控件放高。
+       所以改成**两行**：加 BS_MULTILINE 再把控件放高，文案里那个换行符
+       就是断行处（按钮的 DrawText 带 DT_WORDBREAK，认 \n）。
        左边这一列从 y=349 到 y=415（「您还没有注册…」那行）之间是空的，放得下。 */
     if (online) {
         LONG style = GetWindowLongW(online, GWL_STYLE);
@@ -485,7 +488,7 @@ static void style_login_dialog(HWND dlg)
     resize_ctrl(dlg, IDC_REGISTER_LINK, 460, 18);
     hook_register_link(dlg);
 
-    bslog("LOGIN   登录框已改造：分区单选钮 -> 单机 / 联机，注册链接指向我们自己的服务器");
+    bslog("LOGIN   登录框已改造：分区单选钮 -> 本机服务器 / 远程服务器，注册链接指向我们自己的服务器");
 }
 
 /* 每 100 毫秒跑一次：跟住单选钮的选择，并让链接文字跟着变。 */
@@ -515,7 +518,7 @@ static void poll_login_dialog(void)
 
     /* ★ 客户端在第一次点「开始」之后就把两个分区单选钮**永久禁用**了
        （原版的想法是「服务器选定了就不许再换」）。登录失败时它不会解禁，
-       于是玩家想从「单机」改成「联机」只能重启游戏。对话框还在 = 还没登录成功，
+       于是玩家想从「本机服务器」改成「远程服务器」只能重启游戏。对话框还在 = 还没登录成功，
        这时候允许换分区没有任何副作用，所以我们每一轮都把它解禁回来。 */
     {
         HWND local = GetDlgItem(g_login_dlg, IDC_RADIO_LOCAL);
@@ -530,7 +533,7 @@ static void poll_login_dialog(void)
 
     online = IsDlgButtonChecked(g_login_dlg, IDC_RADIO_ONLINE) ? 1 : 0;
     if (InterlockedExchange(&g_online, online) != online)
-        bslog("LOGIN   分区切换 -> %s", online ? "联机" : "单机游玩");
+        bslog("LOGIN   分区切换 -> %s", online ? "远程服务器" : "本机服务器");
 
     _snwprintf(want, 512, L"在服务器 %s 上注册用户", current_reg_host());
     want[511] = 0;
@@ -748,16 +751,16 @@ static void log_sockaddr(const char *api, SOCKET_T s, const struct sockaddr_min 
    置 0 则纯观测不改写。 */
 static int g_redirect = 1;
 
-/* V0.2：登录框里选了「联机」。定义在下面的「登录框改造」一段。 */
+/* V0.2：登录框里选了「远程服务器」。定义在下面的「登录框改造」一段。 */
 int  popshot_online_mode(void);
 unsigned popshot_map_port(unsigned port);
 
 /* 若是 IPv4 且开启重定向：地址改成 127.0.0.1，端口按当前模式映射。
    返回 1 并填好 out；否则返回 0。
 
-   ★ 单机 / 联机的区分就在这里，靠**端口**而不是靠别处传状态（决策 D066）：
-       单机（单选钮 1011）-> 127.0.0.1:47611 / 27799  = 本机服务端
-       联机（单选钮 1012）-> 127.0.0.1:47621 / 27809  = 本机中继，它再连远端
+   ★ 本机服务器 / 远程服务器的区分就在这里，靠**端口**而不是靠别处传状态（决策 D066）：
+       本机服务器（单选钮 1011）-> 127.0.0.1:47611 / 27799 = 本机服务端
+       远程服务器（单选钮 1012）-> 127.0.0.1:47621 / 27809 = 本机中继，它再连远端
    `connect` 发生在用户点「开始」之后，那一刻单选钮的状态是确定的，判定没有竞态。 */
 static int make_localhost(const struct sockaddr_min *name, int namelen, struct sockaddr_in_min *out)
 {
@@ -772,7 +775,7 @@ static int make_localhost(const struct sockaddr_min *name, int namelen, struct s
     }
     out->sin_addr[0] = 127; out->sin_addr[1] = 0; out->sin_addr[2] = 0; out->sin_addr[3] = 1;
     bslog("★WS2 重定向 -> 127.0.0.1:%u  (原端口 %u, 模式=%s)", mapped, port,
-          popshot_online_mode() ? "联机" : "单机");
+          popshot_online_mode() ? "远程服务器" : "本机服务器");
     return 1;
 }
 

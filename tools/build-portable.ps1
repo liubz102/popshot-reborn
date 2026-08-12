@@ -160,7 +160,7 @@ try {
         "bsloader.exe $ldrHash",
         '',
         '怎么用：整个目录拷到目标电脑，双击 start.bat。',
-        '联机：登录界面选「联机」，服务器地址改 server.config 的 server_address。',
+        '联机：登录界面选「远程服务器」，地址改 server.config 的 server_address。',
         '首次使用先点登录框下方的注册链接注册账号。'
     )
 

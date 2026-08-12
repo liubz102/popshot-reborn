@@ -134,10 +134,13 @@ def create_session_payload(title="来玩", session_type=2, arguments=(3, 1)):
             + b"".join(w_i32(v) for v in arguments))
 
 
-def list_request(game_type=2, start_room=0):
-    """客户端方向的 `0x0200` 载荷（12 字节，§139）。"""
-    return (struct.pack("<HHH", start_room, 0, 0)
-            + struct.pack("<BB", 0, 0)
+def list_request(game_type=2, start_room=0, waiting_only=0, page_size=10):
+    """客户端方向的 `0x0200` 载荷（12 字节，§139 / §170）。
+
+    `waiting_only` 就是第 4 个字段：大厅左下角「全部」发 0、「待机」发 1。
+    """
+    return (struct.pack("<HHH", start_room, 0, page_size)
+            + struct.pack("<BB", waiting_only, 0)
             + w_i32(game_type))
 
 
@@ -244,6 +247,15 @@ class ListSessionWireTests(LobbyIsolated):
         self.assertEqual("quest", request["game_type_name"])
         self.assertEqual(7, request["start_room"])
 
+    def test_parse_list_request_reads_the_waiting_only_switch(self):
+        # 第 4 个字节 = 左下角「全部 / 待机」（§170）。以前当「未定字段」丢掉了。
+        self.assertFalse(parse_list_session_request(
+            list_request(waiting_only=0))["waiting_only"])
+        self.assertTrue(parse_list_session_request(
+            list_request(waiting_only=1))["waiting_only"])
+        self.assertEqual(10, parse_list_session_request(
+            list_request())["page_size"])
+
     def test_parse_list_request_rejects_trailing_bytes(self):
         with self.assertRaises(ValueError):
             parse_list_session_request(list_request() + b"\x00")
@@ -262,6 +274,37 @@ class ListSessionWireTests(LobbyIsolated):
         payload = [p for blob in carol.sent for _, op, p in frames(blob)
                    if op == OP_LIST_SESSION][-1]
         self.assertEqual(1, Reader(payload).u16())
+
+    def test_the_waiting_tab_hides_rooms_that_are_playing(self):
+        alice, bob = make_conn("alice"), make_conn("bob")
+        gameserver.Conn.on_game_packet(alice, 0x0201,
+                                       create_session_payload("打着呢",
+                                                              session_type=2))
+        gameserver.Conn.on_game_packet(bob, 0x0201,
+                                       create_session_payload("等人",
+                                                              session_type=2))
+        self.lobby.room_of(alice).status = gameserver.SESSION_STATUS_PLAYING
+        carol = make_conn("carol")
+
+        def titles(waiting_only):
+            carol.sent.clear()
+            gameserver.Conn.on_game_packet(
+                carol, OP_LIST_SESSION,
+                list_request(game_type=2, waiting_only=waiting_only))
+            payload = [p for blob in carol.sent for _, op, p in frames(blob)
+                       if op == OP_LIST_SESSION][-1]
+            reader = Reader(payload)
+            out = []
+            for _ in range(reader.u16()):
+                reader.i32()                      # 状态
+                out.append(reader.wstr())         # 标题
+                reader.i32(), reader.wstr(), reader.i32()
+                read_session_descriptor(reader)
+                reader.u16(), reader.take(1), reader.i32()
+            return out
+
+        self.assertEqual(["打着呢", "等人"], titles(0))   # 「全部」
+        self.assertEqual(["等人"], titles(1))             # 「待机」
 
     def test_list_reply_is_empty_when_no_room_matches(self):
         carol = make_conn("carol")
@@ -919,10 +962,15 @@ class TeamAndReadyTests(LobbyIsolated):
 
 
 class UserListTests(LobbyIsolated):
-    """大厅右侧「玩家列表」= `0x020d` 请求 -> **`0x0212`** 应答（§166）。
+    """大厅右侧「玩家列表」= `0x020d` 请求 -> **`0x0212`** 应答（§166 / §169）。
 
     用户 2026-08-12 报的「大厅右侧玩家列表看不见其他人」：以前一直回同号的
     `0x020d`，而那个包的服务端方向是个弹窗（`0x553c5f`），列表永远是空的。
+
+    同一天报的另外两条（§169 / D095）：
+    ① 每行长得一模一样、分不清哪个是自己 —— 等级填进了第一个 int32，
+       而那一格是 `P`/`W` 徽章；且自己也在列表里；
+    ② 已经进游戏的人还留在「待机玩家」档里 —— 过滤开关被丢掉了。
     """
 
     def setUp(self):
@@ -947,27 +995,65 @@ class UserListTests(LobbyIsolated):
         blobs = [(op, p) for blob in conn.sent for _, op, p in frames(blob)]
         return [p for op, p in blobs if op == OP_REP_USER_LIST]
 
+    def ask(self, conn, **kw):
+        """发一次请求，把应答解成 `(头三个字段, [(昵称, 在打游戏, 等级, 天梯)])`。"""
+        conn.sent.clear()
+        gameserver.Conn.on_game_packet(conn, OP_REQ_USER_LIST,
+                                       self.request(**kw))
+        reader = Reader(self.reply_of(conn)[0])
+        head = (reader.u16(), reader.u16(), reader.take(1)[0])
+        rows = [(reader.wstr(), reader.i32(), reader.i32(), reader.i32())
+                for _ in range(reader.i32())]
+        self.assertEqual(0, reader.left())
+        return head, rows
+
+    def put_in_a_running_game(self, conn):
+        """把这条连接塞进一间「游戏中」的房间。"""
+        room = self.lobby.create_room(conn, title="打着呢", session_type=2)
+        room.status = gameserver.SESSION_STATUS_PLAYING
+        return room
+
     def test_the_request_is_five_bytes(self):
         parsed = parse_user_list_request(self.request(2, 18, 1))
         self.assertEqual({"page": 2, "page_size": 18, "flag": 1}, parsed)
 
-    def test_everyone_online_is_listed(self):
-        gameserver.Conn.on_game_packet(self.alice, OP_REQ_USER_LIST,
-                                       self.request())
-        payload = self.reply_of(self.alice)[0]
-        reader = Reader(payload)
-        page, page_size = reader.u16(), reader.u16()
-        flag = reader.take(1)[0]
-        count = reader.i32()
-        self.assertEqual((0, 18, 1), (page, page_size, flag))
-        self.assertEqual(2, count)
-        found = []
-        for _ in range(count):
-            found.append((reader.wstr(), reader.i32(), reader.i32(),
-                          reader.i32()))
-        self.assertEqual(["Alice", "Bob"], [f[0] for f in found])
-        self.assertEqual([3, 5], [f[1] for f in found])   # 等级
-        self.assertEqual(0, reader.left())
+    def test_the_other_players_are_listed(self):
+        head, rows = self.ask(self.alice)
+        self.assertEqual((0, 18, 1), head)          # 头三个字段原样回显
+        self.assertEqual([("Bob", 0, 5, 20)], rows)
+
+    def test_you_are_never_in_your_own_list(self):
+        # ★ 客户端那张列表没有任何「这是你」的标记（渲染函数 0x441df5 从头到尾
+        #   不比昵称），所以只能靠不列自己来消歧义（D095）。
+        self.assertNotIn("Alice", [r[0] for r in self.ask(self.alice)[1]])
+        self.assertNotIn("Bob", [r[0] for r in self.ask(self.bob)[1]])
+
+    def test_the_level_goes_in_the_second_int32_not_the_first(self):
+        # 第 1 个 int32 是 P/W 徽章，把等级填进去等于每行都是「游戏中」（§169）。
+        _, rows = self.ask(self.alice)
+        self.assertEqual(0, rows[0][1])             # 待机 -> W
+        self.assertEqual(5, rows[0][2])             # 等级 -> LevelMark
+
+    def test_a_player_in_a_running_game_is_flagged_and_hidden_from_waiting(self):
+        self.put_in_a_running_game(self.bob)
+        # 「待机玩家」档（客户端默认发 1）：看不见他
+        self.assertEqual([], self.ask(self.alice, flag=1)[1])
+        # 「推荐对手」档（flag 0）：看得见，而且徽章是「游戏中」
+        self.assertEqual([("Bob", 1, 5, 20)], self.ask(self.alice, flag=0)[1])
+
+    def test_sitting_in_a_waiting_room_still_counts_as_waiting(self):
+        # 房间列表把它显示成「待机中」，玩家列表的口径要一致。
+        self.lobby.create_room(self.bob, title="等人", session_type=2)
+        self.assertEqual([("Bob", 0, 5, 20)], self.ask(self.alice, flag=1)[1])
+
+    def test_recommended_puts_the_closest_level_first(self):
+        carol = make_conn("carol")            # Lv.7；alice 是 Lv.3、bob 是 Lv.5
+        gameserver.register_conn(carol)
+        self.assertEqual(["Bob", "Carol"],
+                         [r[0] for r in self.ask(self.alice, flag=0)[1]])
+        # bob 站在 Lv.5：alice(3) 和 carol(7) 一样近，同距按昵称排
+        self.assertEqual(["Alice", "Carol"],
+                         [r[0] for r in self.ask(self.bob, flag=0)[1]])
 
     def test_the_reply_is_0x0212_not_0x020d(self):
         # ★ 回同号的 0x020d 只会喂给弹窗处理器，列表永远空着。
@@ -976,33 +1062,20 @@ class UserListTests(LobbyIsolated):
         self.assertEqual([OP_REP_USER_LIST], opcodes(self.alice))
 
     def test_paging_is_echoed_back_and_honoured(self):
-        gameserver.Conn.on_game_packet(self.alice, OP_REQ_USER_LIST,
-                                       self.request(page=1, page_size=1))
-        payload = self.reply_of(self.alice)[0]
-        reader = Reader(payload)
-        self.assertEqual((1, 1), (reader.u16(), reader.u16()))
-        reader.take(1)
-        self.assertEqual(1, reader.i32())
-        self.assertEqual("Bob", reader.wstr())      # 第 1 页第 1 条
+        carol = make_conn("carol")
+        gameserver.register_conn(carol)
+        head, rows = self.ask(self.alice, page=1, page_size=1)
+        self.assertEqual((1, 1), head[:2])
+        self.assertEqual(["Carol"], [r[0] for r in rows])   # 第 1 页第 1 条
 
     def test_a_page_past_the_end_is_empty_not_an_error(self):
-        gameserver.Conn.on_game_packet(self.alice, OP_REQ_USER_LIST,
-                                       self.request(page=9))
-        payload = self.reply_of(self.alice)[0]
-        reader = Reader(payload)
-        reader.u16(), reader.u16(), reader.take(1)
-        self.assertEqual(0, reader.i32())
+        self.assertEqual([], self.ask(self.alice, page=9)[1])
 
     def test_a_connection_without_an_account_is_not_listed(self):
         ghost = make_conn("carol")
         ghost.account_name = ""
         gameserver.register_conn(ghost)
-        gameserver.Conn.on_game_packet(self.alice, OP_REQ_USER_LIST,
-                                       self.request())
-        payload = self.reply_of(self.alice)[0]
-        reader = Reader(payload)
-        reader.u16(), reader.u16(), reader.take(1)
-        self.assertEqual(2, reader.i32())
+        self.assertEqual(["Bob"], [r[0] for r in self.ask(self.alice)[1]])
 
     def test_a_garbled_request_still_gets_a_reply(self):
         gameserver.Conn.on_game_packet(self.alice, OP_REQ_USER_LIST, b"\x00")

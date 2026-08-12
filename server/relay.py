@@ -3,7 +3,7 @@
 """
 relay.py —— 本机 TCP 中继，只出现在**客户端包**里。
 
-选「联机」时，`bshook` 把客户端的 `connect` 改写到本机的中继端口，
+选「远程服务器」时，`bshook` 把客户端的 `connect` 改写到本机的中继端口，
 中继再按 `server.config` 里的地址转发出去：
 
 ```text
@@ -52,7 +52,7 @@ LISTEN_HOST = "127.0.0.1"
 #: 第三条是**原版 TCP 中继**（里程碑 J.3 / D078 / D079）。它和前两条唯一的
 #: 不同是「谁发起」：认证/游戏那两条是客户端自己去连写死的端口，中继这条是
 #: 服务端在 `0x0210 gspJoinRelay` 里告诉客户端「连 127.0.0.1:27798」，
-#: 再由 `bshook` 按单机 / 联机把 27798 映射成 27808 走到这里（§157）。
+#: 再由 `bshook` 按「本机 / 远程」把 27798 映射成 27808 走到这里（§157）。
 PORT_MAP = (
     (server_config.RELAY_AUTH_PORT, server_config.AUTH_PORT, "认证"),
     (server_config.RELAY_GAME_PORT, server_config.GAME_PORT, "游戏"),

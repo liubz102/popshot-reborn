@@ -29,6 +29,16 @@ fakeclient.py —— 用 Python 冒充第二个游戏客户端（大厅部分）
     join <房间号>     发 0x0202 gcpReqMoveInto，并等应答（打印 result / 座位号）
     leave             发 0x0203 gcpReqLeaveSession
     chat <文本>       发 0x0305 gcpSendChatMsg
+    team <1|2> [座位] 「变更队伍」：改一份座位副本的队伍号再发 0x0301（§165）。
+                      不给座位号就改自己那一格（房主才动得了别人的）
+    roomready [0|1]   「游戏准备 / READY」：发 0x030e（§165）。
+                      ★ 和下面那个 `ready`（0x0402 开局握手）不是一回事
+    seats             把服务端最后一次告诉我的六个座位打出来（含队伍/准备状态）
+    rooms [0|1] [类型] 发 0x0200 要房间列表。第一个参数 = 大厅左下角那对按钮：
+                      **1 = 只看待机（客户端进大厅时发的就是 1）**、0 = 全部（§170）
+    users [0|1] [页]  发 0x020d 要大厅右侧玩家列表。**1 = 待机玩家（默认）**、
+                      0 = 推荐对手（§169）。收到的 0x0212 会解成「谁 / P还是W /
+                      等级 / 天梯」
     peer [序列号]     发一发 0x040e = 玩家间同步数据（12 字节 UdpPacket 头 +
                       3 字节 body，§149~§151）。用来验服务端有没有原样转成 0x040f
     rpeer [序列号]    同上，但走**原版 TCP 中继**（rcp opcode 3）。要先连上中继
@@ -85,9 +95,10 @@ from gameserver import (                                 # noqa: E402
     OP_REP_GAME_RESULT, OP_REP_QUEST_SCORE, OP_REPORT_HP_ZERO,
     OP_REQ_CHANGE_TO_NEXT_MAP, OP_REQ_RESPAWN, OP_START_TCP_RELAY,
     OP_LEAVE_SESSION, OP_MOVE_INTO_SESSION, OP_PEER_DATA_DOWN,
-    OP_PEER_DATA_UP, OP_SESSION_MEMBER_UPDATE, OP_SESSION_MEMBERS,
-    OP_TOGGLE_PEER_RELAY, OP_UPDATE_QUEST_SCORE, Reader, build_game,
-    describe_peer_header, take_frame, w_i32, w_wstr,
+    OP_PEER_DATA_UP, OP_SEAT_READY, OP_SESSION_MEMBER_UPDATE,
+    OP_SESSION_MEMBERS, OP_TOGGLE_PEER_RELAY, OP_UPDATE_QUEST_SCORE,
+    ROOM_SEAT_COUNT, Reader, build_game, build_session_slot,
+    describe_peer_header, parse_session_slot, take_frame, w_i32, w_wstr,
 )
 
 #: 玩家角色的对象句柄 = **座位 × 100000 + 100001**（客户端 `0x405f02`
@@ -231,6 +242,10 @@ class FakeClient:
         self.alive = True
         self.my_seat = None
         self.room_id = None
+        #: 服务端最后一次告诉我的六个座位（`0x0300` 全量 / `0x0301` 增量解出来）。
+        #: `team` 命令要把**没变的字段原样发回去**，不然服务端会把它当成换角色
+        #: （§165 的判据就是「角色 id 没变、队伍变了」）。
+        self.seats = [None] * ROOM_SEAT_COUNT
         self.relay = None                             # RelayLink（收到 0x0210 才有）
         self.lock = threading.Lock()
         self.reader = threading.Thread(target=self._recv_loop, daemon=True)
@@ -281,6 +296,10 @@ class FakeClient:
             result, room_id, seat = struct.unpack_from("<iii", payload)
             if result == 0:
                 self.room_id, self.my_seat = room_id, seat
+        elif opcode == OP_SESSION_MEMBERS:
+            self._remember_snapshot(payload)
+        elif opcode == OP_SESSION_MEMBER_UPDATE:
+            self._remember_seat_update(payload)
         elif opcode == OP_JOIN_RELAY and len(payload) >= 18:
             self._join_relay(payload)
         elif opcode == OP_LEAVE_RELAY:
@@ -288,6 +307,44 @@ class FakeClient:
                 log("[中继] 收到 0x0211 —— 拆掉中继连接（走析构，不是断线）")
                 self.relay.close()
                 self.relay = None
+
+    # -- 座位表（`team` / `roomready` 要用）--------------------------------
+    def _remember_snapshot(self, payload):
+        """`0x0300` 全量座位快照 -> `self.seats`。"""
+        try:
+            reader = Reader(payload)
+            reader.i32()                                 # 房主座位号
+            reader.i32()                                 # ?
+            seats = [parse_session_slot(reader) for _ in range(ROOM_SEAT_COUNT)]
+        except Exception as error:                       # noqa: BLE001
+            log(f"  （0x0300 解不开：{error}）")
+            return
+        self.seats = seats
+        log("  座位表：" + self.describe_seats())
+
+    def _remember_seat_update(self, payload):
+        """`0x0301` 增量 -> 更新一格。"""
+        try:
+            reader = Reader(payload[1:])                 # 跳过 action 那一字节
+            seat_index = reader.i32()
+            slot = parse_session_slot(reader)
+        except Exception as error:                       # noqa: BLE001
+            log(f"  （0x0301 解不开：{error}）")
+            return
+        if 0 <= seat_index < ROOM_SEAT_COUNT:
+            self.seats[seat_index] = slot
+            log(f"  座位 {seat_index} -> {describe_slot(slot)}")
+
+    def describe_seats(self):
+        return " | ".join(
+            f"{i}:{describe_slot(s)}"
+            for i, s in enumerate(self.seats)
+            if s is not None and s.get("occupied"))
+
+    def my_slot(self):
+        if self.my_seat is None or self.seats[self.my_seat] is None:
+            return None
+        return self.seats[self.my_seat]
 
     def _join_relay(self, payload):
         import socket
@@ -317,6 +374,16 @@ class FakeClient:
             pass
 
 
+def describe_slot(slot):
+    """一个座位的一行人话（队伍 / 准备状态是 §165 之后才有名字的）。"""
+    if not slot or not slot.get("occupied"):
+        return "空"
+    return (f"{slot.get('nickname')!r} Lv.{slot.get('level')} "
+            f"角色={slot.get('character_id')} "
+            f"队伍={slot.get('team')}"
+            f"{' 已准备' if slot.get('ready') else ''}")
+
+
 def describe(opcode, payload):
     """把最关心的几个包解出人能读的一行 —— 其余的只报长度。"""
     try:
@@ -324,13 +391,54 @@ def describe(opcode, payload):
             action = payload[0]
             seat = struct.unpack_from("<i", payload, 1)[0]
             what = {0: "加入(建模型)", 1: "离开(销毁模型)", 2: "离开(销毁模型)",
-                    3: "重建模型", 4: "换角色"}.get(action, "未知")
+                    3: "重建模型（换队伍/准备状态走这条）", 4: "换角色"}.get(
+                        action, "未知")
             return f"  ★ 座位变更 action={action}（{what}）座位={seat}"
         if opcode == OP_SESSION_MEMBERS and len(payload) >= 8:
             return f"  房主座位={struct.unpack_from('<i', payload)[0]}"
         if opcode == OP_MOVE_INTO_SESSION and len(payload) >= 12:
             result, room_id, seat = struct.unpack_from("<iii", payload)
             return f"  加入结果={result} 房间={room_id} 我的座位={seat}"
+        if opcode == 0x0100 and len(payload) >= 4:
+            result = struct.unpack_from("<i", payload)[0]
+            what = {0: "成功",
+                    1: "客户端弹「请重新确认帐号和密码。」",
+                    2: "客户端弹「现有连接已断开。请重新尝试连接。」",
+                    3: "客户端弹「在无法连接的地方尝试了连接。」"}.get(
+                        result, "客户端不认识这个码")
+            return f"  ★ gspRepLogin result={result}（{what}）"
+        if opcode == 0x0200:
+            reader = Reader(payload)
+            rooms = []
+            for _ in range(reader.u16()):
+                status = reader.i32()
+                title = reader.wstr()
+                here = reader.i32()
+                reader.wstr(), reader.i32()          # 地图名 / option
+                session_type = reader.i32()
+                reader.take(4 * DESCRIPTOR_SENT_ARGUMENT_COUNTS.get(
+                    session_type, 3))
+                room_id = reader.u16()
+                cap = reader.take(1)[0]
+                reader.i32()
+                rooms.append(f"#{room_id} {title!r} "
+                             f"{'游戏中' if status != 2 else '待机中'} "
+                             f"({here}/{cap}) type={session_type}")
+            return "  ★ 房间列表：" + ("；".join(rooms) if rooms else "（空）")
+        if opcode == 0x0212:
+            reader = Reader(payload)
+            page, page_size = reader.u16(), reader.u16()
+            flag = reader.take(1)[0]
+            users = []
+            for _ in range(reader.i32()):
+                name = reader.wstr()
+                playing, level, ladder = (reader.i32(), reader.i32(),
+                                          reader.i32())
+                users.append(f"{name}({'游戏中 P' if playing else '待机 W'} "
+                             f"Lv.{level} 天梯{ladder})")
+            return (f"  ★ 玩家列表（第 {page} 页 每页 {page_size} "
+                    f"过滤={flag}{'=待机玩家' if flag else '=推荐对手'}）："
+                    + ("、".join(users) if users else "（空）"))
         if opcode == OP_CHAT:
             reader = Reader(payload)
             reader.u16()
@@ -403,6 +511,27 @@ def run_script(client, tokens):
             client.my_seat, client.room_id = 0, None
             time.sleep(0.5)
             log(f"已建房「{title}」type={session_type}（我是房主，座位 0）")
+        elif cmd == "rooms":
+            # 0x0200 房间列表请求（12 字节，§139 / §170）。第 4 个字段就是
+            # 大厅左下角「全部 / 待机」那对按钮：0 = 全部，1 = 只看待机。
+            waiting = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 1
+            game_type = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 2
+            client.send_game(0x0200,
+                             struct.pack("<HHH", 0, 0, 10)
+                             + struct.pack("<BB", waiting, 0)
+                             + w_i32(game_type))
+            log(f"已发 0x0200 房间列表请求"
+                f"（{'只看待机' if waiting else '全部'}，游戏类型={game_type}）")
+            time.sleep(0.4)
+        elif cmd == "users":
+            # 0x020d 玩家列表请求（5 字节，§166 / §169）。过滤开关：
+            # 1 = 待机玩家（客户端进大厅时发的就是这个），0 = 推荐对手。
+            flag = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 1
+            page = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 0
+            client.send_game(0x020d, struct.pack("<HHB", page, 18, flag))
+            log(f"已发 0x020d 玩家列表请求"
+                f"（{'待机玩家' if flag else '推荐对手'}，第 {page} 页）")
+            time.sleep(0.4)
         elif cmd == "peer":
             sequence = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 1
             seat = client.my_seat if client.my_seat is not None else 0
@@ -455,6 +584,28 @@ def run_script(client, tokens):
         elif cmd == "chat":
             text = tokens.pop(0)
             client.send_game(OP_CHAT, bytes([0]) + w_wstr(text))
+        elif cmd == "team":
+            # 「变更队伍」：把自己（或指定座位）那一格的**实况副本**改掉队伍号
+            # 再发客户端方向的 0x0301 —— 和真客户端 0x469f95 一模一样。
+            new_team = int(tokens.pop(0))
+            seat = (int(tokens.pop(0)) if tokens and tokens[0].isdigit()
+                    else client.my_seat)
+            slot = (client.seats[seat]
+                    if seat is not None and 0 <= seat < ROOM_SEAT_COUNT
+                    else None)
+            if slot is None:
+                log("!! 还不知道这个座位长什么样（先 join，等 0x0300）")
+            else:
+                changed = dict(slot, team=new_team)
+                client.send_game(OP_SESSION_MEMBER_UPDATE,
+                                 w_i32(seat) + build_session_slot(**changed))
+        elif cmd == "roomready":
+            # 「游戏准备 / READY」：0x030e，载荷就一个 int32（§165）。
+            # ★ 和 `ready`（0x0402 房主开局握手）**不是**一回事。
+            value = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 1
+            client.send_game(OP_SEAT_READY, w_i32(value))
+        elif cmd == "seats":
+            log("座位表：" + (client.describe_seats() or "（还不知道）"))
         # ---- 战斗（J.3）------------------------------------------------
         elif cmd == "ready":
             client.send_game(OP_COUNT_GAME_READY)
@@ -517,11 +668,23 @@ def main(argv):
         return 2
     host = "127.0.0.1"
     argv = list(argv)
-    if argv[0] == "--host":
-        argv.pop(0)
-        host = argv.pop(0)
+    replay = None
+    while argv and argv[0] in ("--host", "--ticket"):
+        if argv.pop(0) == "--host":
+            host = argv.pop(0)
+        else:
+            # ★ 拿一张**现成的**票据直接连游戏服，跳过认证服 —— 这正是真客户端
+            #   断线重连时干的事（§171）：它反复重放手里那张旧票据，从不回认证服。
+            replay = argv.pop(0)
+    if len(argv) < 2:
+        print(__doc__)
+        return 2
     user, password, tokens = argv[0], argv[1], argv[2:]
-    ticket = get_ticket(host, user, password)
+    if replay:
+        log(f"重放已有票据 {replay[:8]}…（不走认证服，模拟断线重连）")
+        ticket = replay
+    else:
+        ticket = get_ticket(host, user, password)
     client = FakeClient(host, ticket)
     try:
         run_script(client, tokens)

@@ -95,6 +95,9 @@
 /logs/
 /server/data/accounts.json
 /server/data/accounts.json.*.tmp
+# tickets.json 是活着的登录凭证（断线重连要用，§171 / D096），跟着机器走，不进仓库。
+/server/data/tickets.json
+/server/data/tickets.json.*.tmp
 
 # 根目录的 server.config 是**本机玩家自己填的**联机服务器地址（可能是内网 IP 或
 # 私人域名），不进仓库。模板在 server/config.py 的 DEFAULT_CONFIG_TEXT 里：

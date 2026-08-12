@@ -230,9 +230,9 @@ if ($relayPid -and $lastTarget -eq $remote) {
     }
     if ($ok) {
         Set-Content -Path $relayStamp -Value $remote -Encoding utf8
-        Say "[中继]   已启动（联机时经 127.0.0.1:$RelayAuth / $RelayGame / $RelayPeer 转发到 $remoteUrlHost）" 'Green'
+        Say "[中继]   已启动（选「远程服务器」时经 127.0.0.1:$RelayAuth / $RelayGame / $RelayPeer 转发到 $remoteUrlHost）" 'Green'
     } else {
-        Say '!! 中继没起来，联机模式会连不上；单机游玩不受影响。看 logs\relay.err' 'Red'
+        Say '!! 中继没起来，「远程服务器」会连不上；「本机服务器」不受影响。看 logs\relay.err' 'Red'
         Get-Content (Join-Path $LogDir 'relay.err') -Tail 20 -ErrorAction SilentlyContinue
     }
 }
@@ -271,12 +271,12 @@ Start-Process -FilePath $loader -WorkingDirectory $Root `
 Say '[客户端] bsloader 已启动，游戏窗口马上出来' 'Green'
 Say ''
 Say '--- 登录界面上可以自己选服务器 ---' 'Cyan'
-Say '  「单机游玩」            连本机，一个人玩，存档在本机' 'Cyan'
-Say "  「联机」                连 $remoteUrlHost（改 server.config 换服务器）" 'Cyan'
+Say '  「本机服务器」          连本机，一个人玩，存档在本机' 'Cyan'
+Say "  「远程服务器」          连 $remoteUrlHost（改 server.config 换服务器）" 'Cyan'
 Say ''
-Say "  联机服务器地址配置在：  $ConfigPath" 'Cyan'
+Say "  远程服务器地址配置在：  $ConfigPath" 'Cyan'
 Say '  首次使用请先注册账号：  点登录框下方的「在服务器…上注册用户」链接' 'Cyan'
-Say "                          单机注册页 http://127.0.0.1:$localReg/" 'Cyan'
+Say "                          本机服务器的注册页 http://127.0.0.1:$localReg/" 'Cyan'
 Say ''
 if ($DebugLog) {
     Say "调试日志：logs\bshook_*.log（客户端）、logs\server.out（服务端）" 'Cyan'
