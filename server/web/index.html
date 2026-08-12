@@ -56,6 +56,12 @@
   }
   button:disabled { opacity: .55; cursor: default; }
   .hint { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+  /* 勾选框那一行：label 默认是 block（上面那条规则），直接套会把文字挤到下一行。 */
+  label.check {
+    display: flex; align-items: center; gap: 8px;
+    margin: 18px 0 0; color: var(--ink); font-size: 14px; cursor: pointer;
+  }
+  label.check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
   .msg { margin-top: 16px; padding: 10px 12px; border-radius: 6px; font-size: 14px; }
   .msg.ok { background: var(--ok-bg); border: 1px solid var(--ok-line); }
   .msg.err { background: var(--err-bg); border: 1px solid var(--err-line); }
@@ -106,6 +112,12 @@
 
       <label for="p2">确认密码</label>
       <input id="p2" type="password" maxlength="32" autocomplete="new-password">
+
+      <label class="check" for="skipTut">
+        <input id="skipTut" type="checkbox" checked>
+        跳过新手教程
+      </label>
+      <div class="hint">勾上就直接进大厅；取消勾选则和原版一样，首次登录先走一遍新手教学关。注册后仍可在「存档转移助手」里改 <code>tutorial_completed</code> 重新开关。</div>
 
       <button type="submit" id="regBtn">注册</button>
       <div class="msg" id="regMsg"></div>
@@ -183,7 +195,10 @@ document.getElementById("reg").addEventListener("submit", function (event) {
   if (p1 !== p2) { show("regMsg", "两次输入的密码不一致，请重新输入。", false); return; }
   var button = document.getElementById("regBtn");
   button.disabled = true;
-  post("/api/register", {username: username, password: p1, password2: p2})
+  post("/api/register", {
+    username: username, password: p1, password2: p2,
+    skip_tutorial: document.getElementById("skipTut").checked
+  })
     .then(function (r) { show("regMsg", r.data.message, r.data.ok); })
     .catch(function () { show("regMsg", "连不上服务器，请确认服务端还在运行。", false); })
     .then(function () { button.disabled = false; });

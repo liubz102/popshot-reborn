@@ -41,6 +41,20 @@ class AccountStoreTests(unittest.TestCase):
         self.assertNotIn("active_account", saved)
         self.assertEqual("pw", saved["accounts"]["alice"]["password"])
 
+    def test_register_can_skip_the_tutorial(self):
+        # 注册页那个默认勾着的框走的就是这条路（D094）。
+        account = self.store.register("bob", "pw", skip_tutorial=True)
+        self.assertTrue(account["tutorial_completed"])
+        self.assertEqual(3, tutorial_state(account))
+        # 进度值是「客户端上报过什么」的保真记录，不许被我们编一个出来。
+        self.assertEqual(0, account["tutorial_progress"])
+        self.assertTrue(self.store.get_account("bob")[1]["tutorial_completed"])
+
+    def test_register_without_skipping_keeps_the_tutorial(self):
+        account = self.store.register("bob", "pw", skip_tutorial=False)
+        self.assertFalse(account["tutorial_completed"])
+        self.assertEqual(0, tutorial_state(account))
+
     def test_tutorial_flag_persists(self):
         self.account()
         self.store.set_tutorial_completed("alice", True)

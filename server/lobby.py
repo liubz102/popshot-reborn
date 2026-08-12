@@ -38,31 +38,93 @@ MOVE_INTO_BAD_PASSWORD = 4      #: 「密码错误。」
 #: `DESCRIPTOR_READ_ARGUMENT_COUNTS` 的注释），所以这里也不列。
 SESSION_TYPE_GAME_TYPES = {0: 1, 1: 1, 2: 2, 5: 5, 6: 6}
 
+#: 队伍编号。客户端的「变更队伍」按钮在 1 和 2 之间来回切
+#: （`0x469f95` / `0x46deaa`：`cmp byte[slot+8],1 / sete al / inc al`），
+#: 0 = 还没分队。详见 FINDINGS §165。
+TEAM_NONE = 0
+TEAM_A = 1
+TEAM_B = 2
+
+#: 一个房间怎么分队。★ **队伍号不只是好看** —— 客户端在
+#: `Character::vf(+0xb8)`（`0x4fedfc` / `0x4ffec3`）里比双方的队伍号，
+#: **相同就直接不结算伤害**，而且这一处**不分游戏模式**。
+#: 所以「所有人都填 0」（V0.2 会话 10 之前的行为）等于全场互相免疫。
+#:
+#: `TEAMS` 组队战：座位号奇偶交替 1 / 2。客户端自己填 Dummy 座位就是这条
+#:        （`0x468952`：`idiv 2 ; inc dl ; mov [slot+8], dl`）。
+#:        ⚠ 这个模式下客户端**要求两队人数相等**才让开局
+#:        （`0x468495` 数 1 队和 2 队，不等就回错误码 3 ->「两组人数不相同。
+#:        请调整人数。」），所以 3 人 / 5 人的组队战本来就开不起来。
+#: `FREE` 个人战：每人一队（座位号 + 1），否则谁都打不动谁。
+#: `COOP` 闯关等：全在 1 队 —— 队友之间不该有伤害。
+TEAM_LAYOUT_TEAMS = "teams"
+TEAM_LAYOUT_FREE = "free"
+TEAM_LAYOUT_COOP = "coop"
+
+#: 房间描述符 type == 1（普通对战）时，`arguments[0] == 1` = 组队战。
+#: 客户端的 `0x409df1` 对 type 1 返回的就是 `arguments[0]`，全部「要不要
+#: 分队」的判断（房间里的站位、名牌颜色、队伍人数检查）都读它。
+SESSION_TYPE_NORMAL = 1
+NORMAL_ARGUMENT_TEAM_MODE = 1
+
+
+def team_layout_of(session_type, arguments):
+    """这个房间该按哪种口径分队。见 `TEAM_LAYOUT_*`。"""
+    if int(session_type) != SESSION_TYPE_NORMAL:
+        return TEAM_LAYOUT_COOP
+    first = arguments[0] if arguments else 0
+    return (TEAM_LAYOUT_TEAMS if int(first) == NORMAL_ARGUMENT_TEAM_MODE
+            else TEAM_LAYOUT_FREE)
+
+
+def default_team(seat_index, layout=TEAM_LAYOUT_TEAMS):
+    """一个座位在某种口径下默认属于哪一队。"""
+    index = int(seat_index)
+    if layout == TEAM_LAYOUT_TEAMS:
+        return (index % 2) + 1
+    if layout == TEAM_LAYOUT_FREE:
+        return index + 1
+    return TEAM_A
+
 
 class Seat:
     """房间里的一个座位。
 
-    昵称 / 等级 / 角色 id 存的是**快照**：`0x0300` 和 `0x0301` 要把它们发给
-    房里每一个人，而别人的连接查不到你的存档。换角色（`0x0301` action 4）
-    和重新登录时由 `gameserver` 调 `update()` 刷新。
+    昵称 / 等级 / 角色 id / 队伍 / 准备状态存的是**快照**：`0x0300` 和 `0x0301`
+    要把它们发给房里每一个人，而别人的连接查不到你的存档。换角色
+    （`0x0301` action 4）、变更队伍、按「游戏准备」和重新登录时由 `gameserver`
+    调 `update()` 刷新。
     """
 
-    __slots__ = ("conn", "username", "nickname", "level", "character_id")
+    __slots__ = ("conn", "username", "nickname", "level", "character_id",
+                 "team", "ready")
 
-    def __init__(self, conn, username="", nickname="", level=1, character_id=0):
+    def __init__(self, conn, username="", nickname="", level=1, character_id=0,
+                 team=TEAM_NONE, ready=False):
         self.conn = conn
         self.username = username
         self.nickname = nickname
         self.level = int(level)
         self.character_id = int(character_id)
+        #: 队伍（`SessionSlot+0x08`）。只有组队模式（描述符 `arguments[0] == 1`）
+        #: 的客户端会读它 —— 房间里的站位、战斗里的友军伤害判定都靠它。
+        self.team = int(team)
+        #: 准备好了没有（`SessionSlot+0x2e`）。房主那一格客户端**不看**
+        #: （`0x4696f8` 直接把房主算成已准备），非房主必须靠服务端广播。
+        self.ready = bool(ready)
 
-    def update(self, nickname=None, level=None, character_id=None):
+    def update(self, nickname=None, level=None, character_id=None,
+               team=None, ready=None):
         if nickname is not None:
             self.nickname = nickname
         if level is not None:
             self.level = int(level)
         if character_id is not None:
             self.character_id = int(character_id)
+        if team is not None:
+            self.team = int(team)
+        if ready is not None:
+            self.ready = bool(ready)
 
     def snapshot(self):
         """给 `build_session_slot(**...)` 直接展开用的 kwargs。"""
@@ -71,6 +133,8 @@ class Seat:
             "nickname": self.nickname,
             "level": self.level,
             "character_id": self.character_id,
+            "team": self.team,
+            "ready": self.ready,
         }
 
 
@@ -152,6 +216,45 @@ class Room:
         return [seat.snapshot() if seat is not None else {"occupied": False}
                 for seat in self.seats]
 
+    # -- 分队 ---------------------------------------------------------------
+    def team_layout(self):
+        """本房间按哪种口径分队（`TEAM_LAYOUT_*`）。"""
+        return team_layout_of(self.session_type, self.arguments)
+
+    def default_team_for(self, seat_index):
+        """新人坐进 `seat_index` 时默认分到哪一队。"""
+        return default_team(seat_index, self.team_layout())
+
+    def reassign_teams(self):
+        """按当前模式把**所有**在座座位的队伍重排一遍，返回变了的座位号。
+
+        ★ 只在**模式变了**（房主在房间里点了「组队战 / 个人战」，`0x0302`）
+        的时候用。有人进房时**不能**用它 —— 那会把别人手动选的队伍冲掉。
+        """
+        layout = self.team_layout()
+        changed = []
+        for index, seat in enumerate(self.seats):
+            if seat is None:
+                continue
+            want = default_team(index, layout)
+            if seat.team != want:
+                seat.team = want
+                changed.append(index)
+        return changed
+
+    def clear_ready(self):
+        """把所有座位的「准备好了」清掉。开一局和回房间时各调一次。
+
+        ★ 这是**跟着客户端来的**，不是我们的发明：客户端进「加载中」那一格
+        （stage 6，`LoadingStage` 构造函数 `0x46fc0f` 起的六次循环）会自己把
+        `[座位+0x2e]` 全清 0（FINDINGS §165）。服务端不跟着清，下一局回到
+        房间时它记的准备状态就和客户端不一样了 —— 而且没有任何包能让人
+        看出来是哪边错了。
+        """
+        for seat in self.seats:
+            if seat is not None:
+                seat.ready = False
+
     def describe(self):
         """一行人话，给日志用。"""
         return (f"房间 #{self.room_id}「{self.title}」"
@@ -210,6 +313,9 @@ class Lobby:
                         password=password)
             room.seats[0] = seat if seat is not None else Seat(conn)
             room.seats[0].conn = conn
+            # 队伍按座位号 + 房间模式定（§165）。建房的人固定坐 0 号。
+            room.seats[0].team = room.default_team_for(0)
+            room.seats[0].ready = False
             room.host_seat = 0
             self._rooms[room_id] = room
             # ★ `conn=None` 是调试通道造的「假房间」（只为在单机上验证房间列表
@@ -281,6 +387,11 @@ class Lobby:
             self._leave_unlocked(conn)
             new_seat = seat if seat is not None else Seat(conn)
             new_seat.conn = conn
+            # 进哪个座位就属于哪一队（§165）。★ 只定**新人这一格**，
+            # 绝不重排整个房间 —— 那会把别人手动选的队伍冲掉。
+            # 新人一律「未准备」：客户端那边这个字节也是 0，一开始就得对上。
+            new_seat.team = room.default_team_for(index)
+            new_seat.ready = False
             room.seats[index] = new_seat
             self._by_conn[conn] = room
             return MOVE_INTO_OK, room, index

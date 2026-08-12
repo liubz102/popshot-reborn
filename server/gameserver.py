@@ -67,7 +67,10 @@ import eventlog
 from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
                    MOVE_INTO_ALREADY_PLAYING,
                    MOVE_INTO_BAD_PASSWORD, MOVE_INTO_FULL,
-                   MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_OK)
+                   MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_OK,
+                   TEAM_A, TEAM_B, TEAM_NONE, TEAM_LAYOUT_COOP,
+                   TEAM_LAYOUT_FREE, TEAM_LAYOUT_TEAMS, default_team,
+                   team_layout_of)
 from netlisten import create_listener, describe as describe_listen
 import relayserver
 from tickets import TicketStore, short as short_ticket
@@ -108,6 +111,13 @@ OP_LEAVE_SESSION = 0x0203
 #: （序列化 `0x404f59` 直接转发给内嵌的描述符）。
 OP_QUICK_JOIN_SESSION = 0x0205
 OP_MOVE_CHANNEL_BY_GAME_TYPE = 0x020b
+#: 客户端方向：大厅右侧「玩家列表」面板要一页在线玩家（`0x554513`，每 10 秒
+#: 一发）。★ **服务端方向的同号包不是列表**（`0x553c5f` 只是个弹窗），
+#: 真正的应答是 `0x0212`，见 §166。
+OP_REQ_USER_LIST = 0x020d
+#: 服务端方向：`gspRepUserList`（vft `0x6918d4`，处理器 `0x55458b`）——
+#: 大厅右侧那张玩家列表的**唯一**数据源（§166）。
+OP_REP_USER_LIST = 0x0212
 #: 服务端方向：`gspQuestReachedDifficulty` = 「每一关你打到第几个难度了」的
 #: 全量快照。客户端处理器 `0x5539c2` 先把 map `[0x72e35c]` 清空再逐条灌进去。
 #: 不发这个包，那张 map 永远是空的 —— 每一关就只有「简单」能开局（§118）。
@@ -131,6 +141,15 @@ OP_SLOT_EQUIPPED_LIST = 0x030b
 #: `int32 座位号 + int32（由 1 字节零扩展）`。
 #: 和上面的座位物品清单**只靠方向区分**，回显它等于把角色清单发成踢人。
 OP_KICK_OUT = 0x030b
+#: 客户端方向：房间里按「游戏准备 / READY」（或 F5）。载荷是**一个 int32**
+#: （由 1 字节零扩展，序列化 `0x558e78`）= 切换之后的准备状态，**不带座位号**
+#: —— 谁发的就是谁，服务端按连接认人。
+#:
+#: ★ 客户端**自己先把 `[座位+0x2e]` 改掉再发**（`0x468e12` 起
+#: `cmp/sete/mov`），所以按下去自己那格立刻显示「准备中」；
+#: 房里其他人要看到，只能靠服务端把这个座位广播回去（§165）。
+#: 服务端方向的同号包是另一回事（`0x40899a`，组队匹配完成的提示框），不要回。
+OP_SEAT_READY = 0x030e
 OP_REQ_FIRST_USER_RESULT = 0x030f
 OP_REP_MONEY = 0x0600
 OP_PREPARE_GAME = 0x0400
@@ -277,6 +296,9 @@ GCP_NAMES = {
     0x0302: "gcpChangeSession",
     0x0305: "gcpSendChatMsg",
     0x030b: "gcpKickOut",
+    # 「游戏准备」按钮。RawPacket（没有 gcp 类名），唯一发送点 0x558e78，
+    # 只被 0x468de2（切换自己座位的准备状态）调用（FINDINGS §165）。
+    0x030e: "rawToggleReady",
     0x030f: "gcpReqFirstUserResult",
     0x0310: "gcpStartTcpRelay",
     0x0311: "gcpReqQuestRecord",
@@ -937,9 +959,9 @@ def build_quest_reached_difficulty(records):
 ROOM_SEAT_COUNT = 6
 
 
-def build_session_slot(occupied=False, nickname="", unknown_u8=0,
+def build_session_slot(occupied=False, nickname="", team=0,
                        character_id=0, item_ids=(), unknown_28=0,
-                       unknown_2c=0, level=0, unknown_2e=False,
+                       unknown_2c=0, level=0, ready=False,
                        unknown_12=0, unknown_text="", unknown_34=False,
                        closed=False):
     """房间里一个座位（`SessionSlot`）的线格式。
@@ -950,19 +972,39 @@ def build_session_slot(occupied=False, nickname="", unknown_u8=0,
         int32(bool) 占用       -> +0x00   0x5d5956 读 4 字节折成 bool
         占用时:
             string  昵称       -> +0x04   0x5d5b3a = u16 字符数 + UTF-16LE
-            u8      ?          -> +0x08   ★ 0x5d5942 读**1 字节**，不是 4
+            u8      ★ 队伍     -> +0x08   ★ 0x5d5942 读**1 字节**，不是 4
             int32   角色 id    -> +0x0c   0x0301 的 action 4 拿它去 0x557128 查名字
             int32×n + int32 0  -> +0x1c   0 结尾的 int32 列表（0x556de1 起的循环）
             int32   ?          -> +0x28
             u16     ?          -> +0x2c
             u16     ★ 等级     -> +0x10
-            int32(bool) ?      -> +0x2e
+            int32(bool) ★ 准备 -> +0x2e
             u16     ?          -> +0x12
             string  ?          -> +0x30
             int32(bool) ?      -> +0x34
         不占用时:
             （无字段，客户端调 0x556c55 把整个座位清零）
         int32(bool) 关闭       -> +0x01   0x556f40 数 `+0x41 == 0` 的座位当空位
+
+    ★ **`team`（+0x08）和 `ready`（+0x2e）在 V0.2 会话 10 查明**（§165）。
+    在这之前它们叫 `unknown_u8` / `unknown_2e`，服务端一直发 0，
+    于是「变更队伍」和「游戏准备」两个按钮在联机时都不工作。
+
+    `team`（`LobbyStage + 座位*0x3c + 0x48`，取值器 `0x40462c`）：
+
+        - 房间里角色模型站哪边：`0x405e5d` 把它当分组号交给 `0x473cb2`；
+        - 战斗里的友军伤害：`0x4fedfc` / `0x4ffec3` 比两边的队伍号，
+          相同就**不结算伤害**；
+        - **只有组队模式才读**：三处读它之前都先 `0x409df1(描述符) == 1`
+          （描述符 type==1 时返回 `arguments[0]`，type==5 恒为 1）。
+        - 取值 1 / 2；0 = 没分队。客户端的「变更队伍」只会在 1 和 2 之间切。
+
+    `ready`（`+0x2e`，客户端按 1 字节读写）：
+
+        - 房间里玩家名字旁边那行「준비중 / 准备中」：`0x46c330`；
+        - 房主能不能按「开始」：`0x4696cd` 数「已准备的人」，
+          **房主自己那格无条件算已准备**（`0x4696f8`）；
+        - 非房主的按钮在自己已准备时变灰（`0x46b5f9`）。
 
     `level`（+0x10）是**里程碑 C 的关键字段**：房间里按「F5 游戏开始」时，
     `0x468242` 起的检查拿**房主座位**的这个 u16 去和关卡要求等级比：
@@ -986,13 +1028,13 @@ def build_session_slot(occupied=False, nickname="", unknown_u8=0,
         return w_i32(0) + w_i32(1 if closed else 0)
     return (w_i32(1)
             + w_wstr(nickname)
-            + struct.pack("<B", unknown_u8 & 0xFF)
+            + struct.pack("<B", team & 0xFF)
             + w_i32(character_id)
             + b"".join(w_i32(v) for v in item_ids) + w_i32(0)
             + w_i32(unknown_28)
             + struct.pack("<H", unknown_2c)
             + struct.pack("<H", level)
-            + w_i32(1 if unknown_2e else 0)
+            + w_i32(1 if ready else 0)
             + struct.pack("<H", unknown_12)
             + w_wstr(unknown_text)
             + w_i32(1 if unknown_34 else 0)
@@ -1255,13 +1297,16 @@ def parse_session_slot(reader):
     """读一个客户端序列化出来的 `SessionSlot`（`0x556ccc`），字段见 build_session_slot。
 
     收发两侧是同一份布局，唯一要小心的还是那两个非 4 字节的原语：
-    `+0x08` 是 1 字节、`+0x2c` / `+0x10`（等级）/ `+0x12` 是 u16。
+    `+0x08`（队伍）是 1 字节、`+0x2c` / `+0x10`（等级）/ `+0x12` 是 u16。
+
+    ★ 客户端方向的 `0x0301` 有**两种**用途，靠这里解出来的字段差异区分：
+    角色 id 变了 = 换角色，`team` 变了 = 变更队伍（§165）。
     """
     occupied = bool(reader.i32())
     slot = {"occupied": occupied}
     if occupied:
         slot["nickname"] = reader.wstr()
-        slot["unknown_u8"] = reader.take(1)[0]
+        slot["team"] = reader.take(1)[0]
         slot["character_id"] = reader.i32()
         item_ids = []
         while True:
@@ -1273,7 +1318,7 @@ def parse_session_slot(reader):
         slot["unknown_28"] = reader.i32()
         slot["unknown_2c"] = reader.u16()
         slot["level"] = reader.u16()
-        slot["unknown_2e"] = bool(reader.i32())
+        slot["ready"] = bool(reader.i32())
         slot["unknown_12"] = reader.u16()
         slot["unknown_text"] = reader.wstr()
         slot["unknown_34"] = bool(reader.i32())
@@ -1282,7 +1327,7 @@ def parse_session_slot(reader):
 
 
 def parse_seat_change_request(payload):
-    """解客户端方向的 `0x0301`（房间里点「人物选择」的头像时发的）。
+    """解客户端方向的 `0x0301`（房间里改自己那个座位的某个字段时发的）。
 
     序列化点 `0x558dcb` 只写两样东西：
 
@@ -1295,6 +1340,16 @@ def parse_seat_change_request(payload):
     1 字节 action 再读座位号）。实机 59 字节载荷逐字段解对：
     `seat=0, occupied=1, nickname='testuser', character_id=0/1/2, level=1`，
     连点三个头像时只有 `character_id` 在变（FINDINGS §103）。
+
+    ★ **这个包有两个来源**（§165），载荷形状完全一样，服务端只能靠
+    「哪个字段变了」区分：
+
+        换角色    `0x467050` / `0x4692d0` 起 —— `character_id` 变
+        变更队伍  `0x469f95` / `0x46deaa` —— `team`（+0x08）在 1 / 2 之间翻
+
+    两条路客户端都是**改一份座位的副本就发出来，自己一动不动**，
+    等服务端广播回来才真的生效。回错 action 的后果是用户报的那两条：
+    变更队伍会播一行换角色的韩文提示，而队伍其实没变。
     """
     reader = Reader(payload)
     seat_index = reader.i32()
@@ -2060,6 +2115,38 @@ class RoomStartGame:
         return [m for m in members if m not in self.loaded]
 
 
+#: ★★ 对战（房间描述符 type 1）**必须由服务端判胜负并结束**（§167）。
+#:
+#: 客户端自带的那套（`GameContextQuest::CheckMatchOver` `0x4a3cf7` ->
+#: `IVictoryCondition::vf8` -> 6 秒后发 `0x040f gcpEndQuest`）在对战里
+#: **永远跑不起来**：它第一行就是 `cmp [this+0x3b0], 2`，而全镜像里唯一把这个
+#: 状态设成 2 的地方（`0x4f7164`）要求 `0x4e71c0([0x72e260]) == 3`，也就是
+#: 「地图带剧本」。对战地图没有剧本 -> 状态停在 1 -> 这一局永远不结束。
+#: 用户 2026-08-12 报的「分出胜负后无法退出返回房间、死的人无法复活、
+#: 倒计时结束也不退出」就是这个 —— 实机日志里整局**一发 `0x040f` 都没有**。
+#:
+#: 下面这些数抄的是客户端 `DeathMatchVictoryCondition`，判据要和它一致。
+#:
+#: 时间上限：工厂 `0x55e0de` 对「type 1 + arguments[1] == 3」这一路在
+#: `0x55e133` 处 `mov esi, 0x3a980` = 240000 ms，然后 `vf(+0x18)` 存进
+#: `[victory+0x188]`。
+PVP_TIME_LIMIT_MS = 240000
+
+#: 分数（= 杀敌数）上限 `[victory+0x198]`，由 `0x55be71` 按人数定：
+#: 组队战看「人数 // 2」，个人战直接看人数；表里没有的一律 5（构造时的默认值）。
+PVP_SCORE_LIMIT_DEFAULT = 5
+PVP_SCORE_LIMIT_TEAM = {1: 4, 2: 6, 3: 8}
+PVP_SCORE_LIMIT_FREE = {2: 4, 3: 6, 4: 8, 5: 9, 6: 10}
+
+
+def pvp_score_limit(player_count, team_mode):
+    """这一局要拿几分（几个人头）才算赢。抄自 `0x55be71`（§167）。"""
+    count = int(player_count)
+    if team_mode:
+        return PVP_SCORE_LIMIT_TEAM.get(count // 2, PVP_SCORE_LIMIT_DEFAULT)
+    return PVP_SCORE_LIMIT_FREE.get(count, PVP_SCORE_LIMIT_DEFAULT)
+
+
 class RoomQuest:
     """**房间级**的一局关卡状态 —— J.3 的战斗逻辑。
 
@@ -2124,6 +2211,14 @@ class RoomQuest:
         self.settled = False
         #: 已放行的地图名（只给日志和调试通道看）。
         self.maps_entered = []
+        #: 本局开打的时刻（`time.monotonic()`）。对战的时间上限从这里算（§167）。
+        self.started_at = time.monotonic()
+        #: 每个座位杀了几个人。`0x0408` 里的「凶手」字段就是杀人者的座位号
+        #: （`[char+0x158]`，由 `0x4fedee` 写成开火者的座位），所以服务端不用
+        #: 客户端另外上报分数就能数出对战成绩（§167）。
+        self.kills = [0] * ROOM_SEAT_COUNT
+        #: 对战已经判过胜负了（只判一次，日志里也只写一行）。
+        self.pvp_reason = None
 
     # -- 掉落物 -------------------------------------------------------------
     def allocate_item(self):
@@ -2162,6 +2257,54 @@ class RoomQuest:
         if first and 0 <= seat < ROOM_SEAT_COUNT:
             self.deaths[seat] += 1
         return int(reported) + 1, first
+
+    def record_kill(self, killer_seat, victim_seat):
+        """给凶手记一分（对战的「分数」就是杀敌数，§167）。
+
+        `killer_seat` 来自 `0x0408` 的第二个字节（`[char+0x158]`）：
+        **开火者的座位号**（`0x4fedee` 写的），怪物 / 环境是 0xff，
+        自杀是自己的座位号。座位越界、打死自己、打死队友都不记分。
+        """
+        killer = int(killer_seat)
+        victim = int(victim_seat)
+        if not 0 <= killer < ROOM_SEAT_COUNT or killer == victim:
+            return False
+        if not 0 <= victim < ROOM_SEAT_COUNT:
+            return False
+        self.kills[killer] += 1
+        return True
+
+    def pvp_finished(self, seats, teams, score_limit,
+                     time_limit_ms=PVP_TIME_LIMIT_MS, now=None):
+        """对战这一局该不该结束了？结束就返回一句人话，否则 ``None``。
+
+        ★ **这三条是照抄客户端 `DeathMatchVictoryCondition::vf8`（`0x55bf20`）**
+        （§167）—— 客户端自己那套永远跑不起来（它要求
+        `GameContextQuest.state == 2`，而那个状态只有剧本关才会进），
+        所以判胜负这件事只能由服务端做，判据必须和客户端的口径一致，
+        不然玩家看到的「差一个人头」和服务端算的对不上。
+
+            ① 打到时间上限（对战默认 4 分钟 = 240000 ms，
+               来自工厂 `0x55e133` 里的 `mov esi, 0x3a980`）
+            ② 有人的杀敌数 >= 分数上限（`[victory+0x198]`，见 `pvp_score_limit`）
+            ③ 只剩一边了（`0x55c594`：组队模式下在座的人全是同一队，
+               非组队模式下在座不足两人）
+
+        `seats` = 有人的座位号列表，`teams` = `{座位号: 队伍号}`。
+        """
+        if not seats:
+            return None
+        now = time.monotonic() if now is None else now
+        elapsed_ms = (now - self.started_at) * 1000.0
+        if elapsed_ms > time_limit_ms:
+            return f"时间到（{elapsed_ms / 1000:.0f} 秒 > {time_limit_ms / 1000:.0f} 秒）"
+        for seat in seats:
+            if 0 <= seat < ROOM_SEAT_COUNT and self.kills[seat] >= score_limit:
+                return f"座位 {seat} 拿到 {self.kills[seat]} 分，达到上限 {score_limit}"
+        sides = {teams.get(seat, TEAM_NONE) for seat in seats}
+        if len(seats) < 2 or len(sides) < 2:
+            return "只剩一边了"
+        return None
 
     # -- 换图 ---------------------------------------------------------------
     def begin_map_change(self, map_name):
@@ -2249,8 +2392,68 @@ def build_rep_user_list():
 
     反序列化 `0x54d0d3`：int32 / string / string / int32(当 bool 用)
     第一个 int32 == 0 时 `0x553c80` 的 je 会跳过后面整段列表处理。
+
+    ⚠ **这个包不是大厅右侧那张「玩家列表」**（§166）。它的处理器
+    `0x553c5f` 只是把两个字符串塞进一个弹窗对象；真正的列表走 `0x0212`，
+    见 `build_rep_user_list_page()`。留着它是因为客户端确实会发
+    客户端方向的 `0x020d`，回一个空的最省事。
     """
     return w_i32(0) + w_wstr("") + w_wstr("") + w_i32(0)
+
+
+def parse_user_list_request(payload):
+    """解客户端方向的 `0x020d gcpReqUserList`（5 字节，§166）。
+
+    发送点 `0x554513`（由 `0x43d0c9` 调），线格式和应答的头三个字段一样：
+
+        u16   页号        从 0 起
+        u16   每页几条    客户端写死 0x12 = 18（`0x441bed` / `0x44215c`）
+        u8    过滤开关    1 = 全部，0 = 只看「推荐对手」（`0x665c30 추천상대`）
+
+    客户端每 10 秒重发一次（`0x43d0c9` 里的 0x2710 节流）。
+    """
+    reader = Reader(payload)
+    page = reader.u16()
+    page_size = reader.u16()
+    flag = reader.take(1)[0]
+    if reader.left():
+        raise ValueError(f"user-list request has {reader.left()} trailing bytes")
+    return {"page": page, "page_size": page_size, "flag": flag}
+
+
+def build_rep_user_list_page(page=0, page_size=18, flag=1, users=()):
+    """opcode **`0x0212`** —— `Packet_gspRepUserList`（vft `0x6918d4`，§166）。
+
+    ★★ **这才是大厅右侧那张「유저리스트 / 玩家列表」的数据源。**
+    以前一直以为是 `0x020d`（PROGRESS 里留了「数据源还没找到」的待办），
+    实际上 `0x020d` 的服务端方向是个弹窗（`0x553c5f`）。
+    分发跳表 `@0x54e58a`（索引 = opcode - 0x020e）第 4 格 -> `0x54e276`
+    -> 处理器 `0x55458b`。
+
+    反序列化 `0x54d343`：
+
+        u16     页号        -> pkt+0x04   `0x5d59f1` 读 2 字节
+        u16     每页几条    -> pkt+0x06   同上
+        u8      过滤开关    -> pkt+0x08   `0x5d59d0` 读 1 字节
+        int32   条目数
+        条目 × { string 昵称, int32 a, int32 b, int32 c }   每项 0x14 字节
+
+    每一项是一个 `UserSnap`（vft `0x665374`），反序列化 `0x43cf5c`：
+    先一个字符串（`0x5d5b3a`）再三个 int32（`0x5d59ff`）。
+
+    处理器把头三个字段原样塞进列表管理器 `[0x72e674]` 的
+    `+0x14` / `+0x18` / `+0x1c`，也就是**服务端要把请求里的页号 / 每页几条 /
+    开关原样回显**，客户端翻页全靠它。
+    """
+    payload = [struct.pack("<HH", page & 0xFFFF, page_size & 0xFFFF),
+               struct.pack("<B", flag & 0xFF),
+               w_i32(len(users))]
+    for entry in users:
+        nickname = entry[0]
+        values = tuple(entry[1:]) + (0, 0, 0)
+        payload.append(w_wstr(nickname))
+        payload.extend(w_i32(v) for v in values[:3])
+    return b"".join(payload)
 
 
 # ----------------------------------------------------------------------------
@@ -2396,6 +2599,30 @@ def latest_conn():
 def all_conns():
     with _conns_lock:
         return list(_conns)
+
+
+def online_user_snapshots():
+    """现在在线的每个玩家一项 `(昵称, 等级, 0, 0)`，喂给 `0x0212`（§166）。
+
+    ★ 按账号去重：同一个账号同一时刻只该有一条连接（顶号会关掉旧的），
+    但断线重连的窗口里可能短暂有两条，列表里出现两个同名很难看。
+    没登录成功（还没认出账号）的连接不进列表。
+
+    ⚠ 每项后面三个 int32 的**业务含义还没查明**（`UserSnap+0x08/0x0c/0x10`，
+    §166）。先按 D019 只填一个等级、其余给 0 —— 列表里能看见人是第一位的。
+    """
+    out = []
+    seen = set()
+    for conn in all_conns():
+        name = getattr(conn, "account_name", "") or ""
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        account = getattr(conn, "account", None) or {}
+        nickname = display_name(account) or name
+        out.append((nickname, player_level(account), 0, 0))
+    out.sort(key=lambda item: item[0])
+    return out
 
 
 def conns_for_user(username):
@@ -2793,6 +3020,9 @@ class Conn:
                 "nickname": nickname,
                 "level": level,
                 "character_id": character,
+                # 没有大厅房间（协议试探 / 控制通道）时只有「我」一个座位，
+                # 分不分队都无所谓，给 1 队即可。
+                "team": TEAM_A,
             }
             self.log(f"← 回 0x0300 房间座位快照(host_seat={host_seat} "
                      f"nickname={nickname!r} level={level} 角色={character})")
@@ -2823,27 +3053,87 @@ class Conn:
             return
         self.send(build_game(OP_SLOT_EQUIPPED_LIST, payload))
 
+    def broadcast_seat_slot(self, room, seat_index, action, reason):
+        """把某个座位**当前的服务端快照**用 `0x0301` 发给房里每一个人（含自己）。
+
+        「含自己」是必须的：换角色和变更队伍两条路，客户端都是改一份副本
+        就发出来、自己一动不动，等的就是这一发（§103 / §165）。
+        """
+        seat = room.seats[seat_index]
+        if seat is None:
+            return
+        packet = build_game(OP_SESSION_MEMBER_UPDATE,
+                            build_session_member_update(seat_index, action,
+                                                        **seat.snapshot()))
+        self.send(packet)
+        self.broadcast(packet, reason=reason)
+
     def on_seat_change(self, payload):
-        """客户端方向的 `0x0301` —— 房间里点「人物选择」换角色。
+        """客户端方向的 `0x0301` —— 房间里换角色，**或者变更队伍**。
 
         客户端把改好的整个座位报上来之后**自己不动**，等服务端广播。
-        服务端存下角色 id，再用 action 4 把同一个座位发回去，客户端才会
-        换掉中下那个 3D 预览并播一行聊天（FINDINGS §103）。
+        服务端存下新值，再把同一个座位发回去，客户端才会真的动
+        （FINDINGS §103 / §165）。
 
-        座位里除角色 id 以外的字段以服务端为准（昵称/等级来自存档），
+        ★ **两条路载荷形状完全一样，只能靠「哪个字段变了」区分**：
+
+            `team`（+0x08）和服务端存的不一样  -> 变更队伍，回 **action 3**
+            其余                               -> 换角色，  回 **action 4**
+
+        action 4 会播一行「%s님이 %s 캐릭터로 선택되었습니다.」（`0x406520`），
+        所以变更队伍**绝不能**用它 —— 用户报的「点变更队伍冒出一条和换角色
+        一样的韩文」就是这么来的。action 3 走 `0x406628`：把包里的座位数据
+        灌进去、重建模型、刷房间 UI，一个字都不播，正是我们要的。
+
+        座位里除「变了的那一样」以外的字段以服务端为准（昵称/等级来自存档），
         免得客户端自报的旧值把数据栏刷回去。
         """
         try:
             seat_index, slot = parse_seat_change_request(payload)
         except (ValueError, struct.error) as error:
-            self.log(f"   换角色请求解析失败: {error}; 不回包")
+            self.log(f"   座位变更请求解析失败: {error}; 不回包")
             return
-        character = slot.get("character_id", 0)
-        self.log(f"   换角色: 座位 {seat_index} -> 角色 id {character} "
-                 f"(昵称={slot.get('nickname')!r} 等级={slot.get('level')})")
         if not slot.get("occupied"):
             self.log("   座位未占用; 不回包")
             return
+        character = slot.get("character_id", 0)
+        team = slot.get("team", 0)
+        room = self.lobby_room()
+        my_seat = None if room is None else room.seat_index_of(self)
+
+        # ---- 是变更队伍吗？----------------------------------------------
+        # 判据：**角色 id 没变、而队伍那一格变了**。两条路发的都是座位的实况
+        # 副本，所以「没动的字段」必然等于服务端上一次发下去的值。
+        # ★ 角色优先：两样都对不上时按换角色算（V0.1 起就只有这一条路，
+        #   而队伍判错的代价是玩家换不了角色）。
+        target_seat = None
+        if room is not None and 0 <= seat_index < ROOM_SEAT_COUNT:
+            target_seat = room.seats[seat_index]
+        if (target_seat is not None
+                and int(team) != int(target_seat.team)
+                and int(character) == int(target_seat.character_id)):
+            # 客户端自己也判过一次「不是房主就只能改自己那格」（`0x469f4f`），
+            # 服务端再判一次 —— 客户端的判定不是安全边界。
+            if seat_index != my_seat and room.host_seat != my_seat:
+                self.log(f"   变更队伍: 座位 {seat_index} 不是自己的"
+                         f"（我在 {my_seat}）且我不是房主; 不回包")
+                return
+            if int(team) not in (TEAM_A, TEAM_B):
+                self.log(f"   变更队伍: 队伍号 {team} 不是 1 / 2; 不回包")
+                return
+            old = target_seat.team
+            target_seat.update(team=team)
+            self.log(f"   变更队伍: 座位 {seat_index} 队伍 {old} -> {team}"
+                     f"（{target_seat.nickname!r}）")
+            self.log(f"← 回 0x0301 座位变更(action=3 重建, 座位={seat_index}, "
+                     f"队伍={team}) —— 变更队伍不能用 action 4，那会播换角色的提示")
+            self.broadcast_seat_slot(room, seat_index, SEAT_ACTION_RESYNC,
+                                     reason="：变更队伍")
+            return
+
+        # ---- 剩下的都当换角色 --------------------------------------------
+        self.log(f"   换角色: 座位 {seat_index} -> 角色 id {character} "
+                 f"(昵称={slot.get('nickname')!r} 等级={slot.get('level')})")
         if self.account_name:
             try:
                 self.account = self.accounts.set_character(self.account_name,
@@ -2854,17 +3144,20 @@ class Conn:
         # （建房时客户端固定把自己放在座位 0，§75）。★ 但**以大厅里的实际座位
         # 为准** —— 进别人房间时客户端报的是它自己那份可能还没更新的座位号，
         # 信它会让广播打到别人的位置上。
-        room = self.lobby_room()
-        if room is not None:
-            actual = room.seat_index_of(self)
-            if actual is not None and actual != seat_index:
-                self.log(f"   客户端自报座位 {seat_index}，"
-                         f"以大厅里的实际座位 {actual} 为准")
-                seat_index = actual
+        if my_seat is not None and my_seat != seat_index:
+            self.log(f"   客户端自报座位 {seat_index}，"
+                     f"以大厅里的实际座位 {my_seat} 为准")
+            seat_index = my_seat
         self.my_seat = seat_index
-        self.refresh_seat()
+        seat = self.refresh_seat()
         self.log(f"← 回 0x0301 座位变更(action=4 换角色, 座位={seat_index}, "
                  f"角色={player_character(self.account)})")
+        if room is not None and seat is not None:
+            # 队伍 / 准备状态要跟着一起发回去，否则这一发会把它们抹成 0。
+            self.broadcast_seat_slot(room, seat_index,
+                                     SEAT_ACTION_CHANGE_CHARACTER,
+                                     reason="：换角色")
+            return
         packet = build_game(OP_SESSION_MEMBER_UPDATE, build_session_member_update(
             seat_index,
             SEAT_ACTION_CHANGE_CHARACTER,
@@ -2876,6 +3169,41 @@ class Conn:
         self.send(packet)
         # 房里其他人也要看到这次换角色（中下那个 3D 预览就是靠这一发换的，§103）。
         self.broadcast(packet, reason="：换角色")
+
+    def on_toggle_ready(self, payload):
+        """客户端方向的 `0x030e` —— 房间里按「游戏准备 / READY」（§165）。
+
+        载荷只有一个 int32（新的准备状态），**不带座位号** —— 谁发的就是谁。
+        客户端**自己已经把 `[座位+0x2e]` 改好了**，所以按的人立刻能看到
+        自己那行「准备中」；房里其他人要看到，只能靠服务端把这个座位广播
+        回去（用户报的第 2 条就是缺了这一发）。
+
+        ★ 顺带这也是「房主为什么按不动开始」的原因：房主的客户端在
+        `0x4696cd` 里数的是**它本地那份座位数据**，服务端不广播，
+        它就永远只数得到自己一个人，于是弹「半数以上玩家处于准备状态下才可
+        开始游戏」。
+        """
+        try:
+            reader = Reader(payload)
+            ready = bool(reader.i32())
+            if reader.left():
+                raise ValueError(f"ready payload has {reader.left()} trailing bytes")
+        except (ValueError, struct.error) as error:
+            self.log(f"   准备状态请求解析失败: {error}; 不回包")
+            return
+        room = self.lobby_room()
+        seat_index = None if room is None else room.seat_index_of(self)
+        if room is None or seat_index is None:
+            self.log(f"   准备状态 -> {ready}，但不在任何房间里; 不回包")
+            return
+        seat = room.seats[seat_index]
+        seat.update(ready=ready)
+        self.log(f"   游戏准备: 座位 {seat_index}（{seat.nickname!r}）"
+                 f"-> {'已准备' if ready else '取消准备'}")
+        self.log(f"← 回 0x0301 座位变更(action=3 重建, 座位={seat_index}, "
+                 f"准备={ready}) —— 房里其他人的「准备中」标记靠这一发")
+        self.broadcast_seat_slot(room, seat_index, SEAT_ACTION_RESYNC,
+                                 reason="：游戏准备")
 
     def on_game_login(self, payload):
         """`0x0100 gcpReqLogin` —— 用认证服签发的票据认人，然后回 `gspRepLogin`。
@@ -3076,6 +3404,66 @@ class Conn:
                  f"tutorial_completed={self.account['tutorial_completed']} "
                  f"(下次登录下发状态 {tutorial_state(self.account)})")
 
+    def check_pvp_finished(self, now=None):
+        """对战这一局打完了没有？打完了就**由服务端**结算（§167）。
+
+        ★ 为什么非服务端不可：客户端自带的结束链在对战里跑不到
+        （`GameContextQuest.state` 永远不是 2，见 `PVP_TIME_LIMIT_MS` 的注释），
+        所以整局既不会发 `0x040f`，也不会自己进结算界面 —— 用户报的
+        「分出胜负后无法退出返回房间」。
+
+        闯关（type 2）不走这里：那一路客户端会自己发 `0x040f`，V0.1 起就跑通了。
+
+        调用点有三处，都很便宜：死亡广播之后、每收到一发 `0x040e`
+        （约 8 Hz，用来盯时间上限）、以及有人中途退房之后。
+        """
+        room = self.lobby_room()
+        if room is None or room.status != SESSION_STATUS_PLAYING:
+            return False
+        if self.quest_mode():
+            return False
+        quest = self.quest_state()
+        if quest.settled or quest.pvp_reason is not None:
+            return False
+        seats = self.battle_seats()
+        teams = {i: seat.team for i, seat in enumerate(room.seats)
+                 if seat is not None}
+        limit = pvp_score_limit(len(seats),
+                                room.team_layout() == TEAM_LAYOUT_TEAMS)
+        reason = quest.pvp_finished(seats, teams, limit, now=now)
+        if reason is None:
+            return False
+        quest.pvp_reason = reason
+        self.log(f"   ★ 对战结束：{reason}；杀敌数 {quest.kills} "
+                 f"—— 服务端主动结算（客户端在对战里不会自己发 0x040f，§167）")
+        self.send_end_game()
+        return True
+
+    def on_req_user_list(self, payload):
+        """`0x020d gcpReqUserList` —— 大厅右侧「玩家列表」要一页在线玩家。
+
+        ★ **应答是 `0x0212`，不是同号回显**（§166）。回 `0x020d` 只会喂给
+        `0x553c5f` 那个弹窗对象，列表永远是空的 —— 用户报的
+        「大厅右侧玩家列表看不见其他人」就是这么来的。
+
+        页号 / 每页几条 / 过滤开关**原样回显**，客户端翻页全靠它。
+        """
+        try:
+            request = parse_user_list_request(payload)
+        except (ValueError, struct.error, IndexError) as error:
+            self.log(f"   用户列表请求解析失败: {error}; 按默认参数回一页")
+            request = {"page": 0, "page_size": 18, "flag": 1}
+        page = max(0, int(request["page"]))
+        page_size = int(request["page_size"]) or 18
+        everyone = online_user_snapshots()
+        start = page * page_size
+        chunk = everyone[start:start + page_size]
+        self.log(f"← 回 0x0212 gspRepUserList(第 {page} 页 每页 {page_size} 条; "
+                 f"在线 {len(everyone)} 人，本页 {len(chunk)} 人: "
+                 + "、".join(u[0] for u in chunk) + ")")
+        self.send(build_game(OP_REP_USER_LIST, build_rep_user_list_page(
+            page, page_size, request["flag"], chunk)))
+
     def respawn_position(self):
         """重生用的整数坐标。优先用客户端最近一次 `0x0406` 报的位置。
 
@@ -3142,6 +3530,11 @@ class Conn:
                  f" —— 客户端收到才会调 Character::Die()，心形也靠它减")
         self.battle_broadcast(build_game(OP_BROADCAST_DEATH, reply),
                               reason="：死亡广播")
+        # 对战里「杀敌数」就是分数：凶手那一格是开火者的座位号（§167）。
+        if quest.record_kill(info["arg"], seat):
+            self.log(f"   对战计分: 座位 {info['arg']} 杀敌数 -> "
+                     f"{quest.kills[info['arg']]}")
+        self.check_pvp_finished()
 
     def on_respawn_request(self, payload):
         """0x0413 gcpRespawnCharacter -> 原样回 0x0419，角色在自报的位置复活。
@@ -3441,7 +3834,13 @@ class Conn:
         cleared = quest.success
         seats = self.settlement_seats()
         quest_mode = self.quest_mode()
-        scores = {seat: max(0, int(conn.quest_score))
+        # ★ 对战里客户端**从不发 `0x0410 gcpUpdateQuestScore`**（实机整局日志里
+        #   一发都没有），所以 `quest_score` 恒为 0，光靠它排名会永远判成
+        #   「全场 0 分不判」。对战的分数就是杀敌数，服务端自己从 `0x0408`
+        #   的凶手字段数出来（§167）。取两者较大的，闯关那一路一个字不变。
+        scores = {seat: max(0, int(conn.quest_score),
+                            0 if quest_mode else quest.kills[seat]
+                            if 0 <= seat < ROOM_SEAT_COUNT else 0)
                   for seat, conn in seats.items()}
         # 尾部数组 = 每座位的「完成 / 输赢」。闯关是合作（通关了大家一起 1），
         # 对战按本局分数排名（§161，见 `RoomQuest.ranking`）。
@@ -3739,6 +4138,9 @@ class Conn:
             LOBBY.update_room(room, status=SESSION_STATUS_PLAYING)
             # 这一局的战斗状态重新起一份（上一局的掉落物句柄/死亡表全作废）。
             room.quest = RoomQuest()
+            # 「准备好了」跟着客户端一起清 —— 它进 stage 6 时自己清了一遍
+            # （`LoadingStage` 构造函数，§165）。不跟着清就会两边不一致。
+            room.clear_ready()
             self.log(f"   房间 #{room.room_id} -> 游戏中"
                      f"（大厅列表和「加入房间」都会跟着挡人）")
 
@@ -3925,6 +4327,9 @@ class Conn:
         #   接上原版中继了，那些人要走中继收（原版路径），剩下的才走 `0x040f`。
         #   两条路在客户端进的是同一个入口 `0x407869`，谁收哪条都一样。
         self.peer_data_out += PEER_RELAY.deliver(self, payload)
+        # ★ 对战的时间上限盯在这里：这条包约 8 Hz，比另起一个定时器线程省事，
+        #   而且没人发包时也不需要判（房里没人动 = 没人在等结算）。
+        self.check_pvp_finished()
 
     def broadcast_system_chat(self, text):
         """房间里的一行系统提示（没有「谁 : 」前缀，§141）。"""
@@ -4069,6 +4474,11 @@ class Conn:
                     other.send(packet)
                 except OSError as error:
                     other.log(f"   0x0418 发送失败（{error!r}），忽略")
+        # ★ 走的人可能是对战里的最后一个对手 —— 「只剩一边了」这一条要立刻
+        #   重新判一次，否则剩下的人会一直站在空地图上等（§167）。
+        #   自己已经不在房里了，所以要让**留下的人**去判。
+        if members:
+            members[0].check_pvp_finished()
 
     def leave_room(self, system_text=""):
         """把自己从大厅房间里摘掉并广播。退房 / 断线 / 被顶号共用。"""
@@ -4150,6 +4560,7 @@ class Conn:
            当成「已经在游戏里了」直接丢掉，**第二局根本开不起来**。
         3. `room.quest = None` —— 上一局的掉落物句柄、拾取表、死亡去重表、
            `settled` 标志全部作废。
+        4. `room.clear_ready()` —— 准备状态跟客户端一起清（§165）。
 
         幂等：房里每个人看完结算都会走这一条，谁先到谁做，后面的再做一遍
         也是同样的结果。
@@ -4163,6 +4574,9 @@ class Conn:
         if room.battle is not None:
             room.battle.reset()
         room.quest = None
+        # 4. 准备状态清掉。客户端在进「加载中」那一格时已经自己清过一遍
+        #    （§165），这里跟上，免得下一局两边对不上。
+        room.clear_ready()
 
     def reset_quest_state(self):
         """把「跟这一局关卡绑定」的状态全部清掉，准备下一局。
@@ -4260,6 +4674,8 @@ class Conn:
                 self.send_slot_equipped_list(reason="（建房后下发）")
         elif opcode == OP_SESSION_MEMBER_UPDATE:
             self.on_seat_change(payload)
+        elif opcode == OP_SEAT_READY:
+            self.on_toggle_ready(payload)
         elif opcode == OP_KICK_OUT:
             # ⚠ 同号反向：0x030b 服务端方向是座位物品清单，客户端方向是踢人。
             self.on_kick_out(payload)
@@ -4289,12 +4705,26 @@ class Conn:
                              arguments=request["arguments"])
             # 房间在大厅里也要跟着改：房间列表和后进来的人读的是大厅那一份。
             room = self.lobby_room()
+            regrouped = []
             if room is not None:
+                old_layout = room.team_layout()
                 LOBBY.update_room(room,
                                   title=request["texts"][0] or room.title,
                                   map_name=request["texts"][1],
                                   session_type=request["session_type"],
                                   arguments=request["arguments"])
+                # ★ 房主在房间里点了「组队战 / 个人战」就会走到这儿，而分队
+                #   口径是跟着模式走的（§165）：组队战按座位奇偶分两队、
+                #   个人战每人一队、闯关全在一队。**只在口径真的变了时重排** ——
+                #   否则会把别人手动选的队伍冲掉。
+                if room.team_layout() != old_layout:
+                    regrouped = room.reassign_teams()
+                    if regrouped:
+                        self.log(f"   模式变了（{old_layout} -> "
+                                 f"{room.team_layout()}），重排队伍: "
+                                 + "、".join(
+                                     f"座位 {i}->{room.seats[i].team}"
+                                     for i in regrouped))
             self.send_update_session(map_name=request["texts"][1])
             # 房里其他人也要看到新地图 —— 不然他们的「选择地图」面板还停在旧的。
             if room is not None and room.player_count() > 1:
@@ -4303,6 +4733,11 @@ class Conn:
                     map_name=room.map_name, status=room.status,
                     player_count=room.player_count()))
                 self.broadcast(others, reason="：房间参数变更")
+            # 重排过的座位要挨个广播出去（action 3 = 灌数据 + 重建模型 +
+            # 刷 UI，不播任何提示），否则名牌颜色和站位还停在旧模式上。
+            for index in regrouped:
+                self.broadcast_seat_slot(room, index, SEAT_ACTION_RESYNC,
+                                         reason=f"：座位 {index} 改队伍（模式变了）")
         elif opcode == OP_MOVE_CHANNEL_BY_GAME_TYPE:
             try:
                 game_type = parse_move_channel_by_game_type(payload)
@@ -4323,9 +4758,8 @@ class Conn:
             self.send(build_game(
                 OP_REP_MOVE_INTO,
                 build_rep_move_into(True, channel_code, self.channel_index)))
-        elif opcode == 0x020d:
-            self.log("← 回 0x020d（空用户列表）")
-            self.send(build_game(0x020d, build_rep_user_list()))
+        elif opcode == OP_REQ_USER_LIST:
+            self.on_req_user_list(payload)
         elif opcode == OP_REQ_FIRST_USER_RESULT:
             # 教程跑完了。客户端自己已经切回大厅并更新了本地状态，服务端只负责
             # 把它记进存档，这样下次登录就不会再被强制拉去教学（见 parse_ 的注释）。

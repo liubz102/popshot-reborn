@@ -8,7 +8,8 @@
 路由：
 
     GET  /                页面本身（`index.html`，把服务器地址替换进去）
-    POST /api/register    {username, password, password2} -> {ok, message}
+    POST /api/register    {username, password, password2, skip_tutorial}
+                                                          -> {ok, message}
     POST /api/export      {username, password}            -> {ok, message, save}
     POST /api/import      {username, password, save}      -> {ok, message}
 
@@ -26,6 +27,13 @@ import json
 import os
 import socket
 import socketserver
+import sys
+
+if __name__ == "__main__":
+    # 直接 `python server/web/server.py` 跑（只调注册页时很方便）时，`server/`
+    # 不在 sys.path 上。★ 这一段必须在下面那些 import 之前 —— 放在文件末尾的
+    # `__main__` 块里是没用的，模块级 import 早就先执行过了。
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from account_store import (AUTH_MESSAGES, AUTH_OK, USERNAME_RULE_TEXT,
                            AccountError, AccountStore)
@@ -100,6 +108,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.rfile.read(length)
 
     @staticmethod
+    def _as_bool(value, default=False):
+        """把 JSON 里传来的开关值收成布尔。
+
+        页面发的是真正的 `true`/`false`，但手搓请求的人很容易发字符串
+        `"false"` —— 而 `bool("false")` 是 `True`，那种「勾都没勾却跳过了教程」
+        的误会最难查。字段缺失时回 `default`。
+        """
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() not in ("", "0", "false", "no", "off")
+        return bool(value)
+
+    @staticmethod
     def _parse_json(raw):
         if not raw:
             return {}
@@ -162,13 +184,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         username = data.get("username", "")
         password = data.get("password", "")
         password2 = data.get("password2", password)
+        # 缺字段 = 维持原版行为（走教程）。页面上那个框默认勾着，但它每次都显式发。
+        skip_tutorial = self._as_bool(data.get("skip_tutorial"), False)
         if password != password2:
             self._reply(False, "两次输入的密码不一致，请重新输入。")
             return
-        account = self.accounts.register(username, password)
-        self.log_message("注册成功: %s", account["display_name"])
-        eventlog.online(f"注册页 ✓ 新账号 账号={username!r} ip={eventlog.peer(self.client_address)}")
-        self._reply(True, f"注册成功！现在可以在游戏登录界面用「{username}」登录了。")
+        account = self.accounts.register(username, password,
+                                         skip_tutorial=skip_tutorial)
+        self.log_message("注册成功: %s (跳过新手教程=%s)",
+                         account["display_name"], skip_tutorial)
+        eventlog.online(f"注册页 ✓ 新账号 账号={username!r} "
+                        f"ip={eventlog.peer(self.client_address)} "
+                        f"跳过新手教程={'是' if skip_tutorial else '否'}")
+        tail = ("首次登录会直接进大厅，不再强制新手教程。" if skip_tutorial
+                else "首次登录会先带你走一遍新手教程。")
+        self._reply(True, f"注册成功！现在可以在游戏登录界面用「{username}」登录了。{tail}")
 
     def _api_export(self, data):
         username = str(data.get("username", "")).strip()
@@ -241,6 +271,13 @@ def serve(port, accounts, host="::", ready=None):
 
 def main():
     import argparse
+    # 和 `app.py` 一样把 stdout/stderr 掰成 UTF-8。默认编码在中文 Windows 上是
+    # GBK，日志里那个 `✓` 会当场抛 UnicodeEncodeError 并**打断正在处理的请求**
+    # （实际踩过：注册成功了，但回包没发出去，浏览器重试后看到「用户名已存在」）。
+    # 走 `app.py` 时它已经掰过了，这里只管独立跑的情形。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     ap = argparse.ArgumentParser(description="只跑注册页（调试用）")
     ap.add_argument("--port", type=int, default=27810)
     ap.add_argument("--host", default="::")
@@ -251,6 +288,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, os.path.dirname(HERE))
-    main()
+    main()          # sys.path 已经在文件开头补过了

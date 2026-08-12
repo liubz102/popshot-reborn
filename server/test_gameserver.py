@@ -384,7 +384,7 @@ class GameServerPacketTests(unittest.TestCase):
 
     def test_occupied_session_slot_field_order(self):
         payload = build_session_slot(occupied=True, nickname="ab", level=7,
-                                     unknown_u8=0, character_id=3,
+                                     team=0, character_id=3,
                                      item_ids=(11, 22))
         expected = (
             struct.pack("<i", 1)                       # +0x00 占用
@@ -468,7 +468,7 @@ class GameServerPacketTests(unittest.TestCase):
 
     def test_seat_change_round_trips_through_build_session_slot(self):
         # 收发两侧是同一份 SessionSlot 布局，解出来再组回去必须逐字节相同。
-        slot = dict(occupied=True, nickname="测试", unknown_u8=0,
+        slot = dict(occupied=True, nickname="测试", team=0,
                     character_id=2, item_ids=(11, 22), level=7)
         payload = w_i32(3) + build_session_slot(**slot)
         seat_index, parsed = parse_seat_change_request(payload)

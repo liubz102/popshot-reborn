@@ -23,21 +23,26 @@ from gameserver import (                                       # noqa: E402
     OP_COUNT_GAME_READY, OP_LOADING_DONE,
     OP_JOIN_RELAY, OP_LEAVE_RELAY, OP_START_TCP_RELAY,
     OP_MOVE_INTO_SESSION, OP_PEER_DATA_DOWN, OP_PEER_DATA_UP,
-    OP_PREPARE_GAME, OP_SESSION_MEMBERS, OP_SESSION_MEMBER_UPDATE,
-    OP_TRIGGER_COUNT_GAME,
+    OP_REQ_USER_LIST, OP_REP_USER_LIST,
+    OP_PREPARE_GAME, OP_SEAT_READY, OP_SESSION_MEMBERS,
+    OP_SESSION_MEMBER_UPDATE, OP_TRIGGER_COUNT_GAME,
     OP_SLOT_EQUIPPED_LIST, OP_TOGGLE_PEER_RELAY, OP_UPDATE_SESSION,
     ROOM_SEAT_COUNT,
     SEAT_ACTION_CHANGE_CHARACTER, SEAT_ACTION_JOIN, SEAT_ACTION_LEAVE,
+    SEAT_ACTION_RESYNC,
     SESSION_STATUS_WAITING, StartGameHandshake,
     Reader, build_game, build_rep_list_session, build_receive_chat,
-    build_rep_move_into_session, build_session, build_update_session,
+    build_rep_move_into_session, build_session, build_session_slot,
+    build_update_session,
     lobby_game_type, parse_chat_message, parse_kick_out_request,
     parse_list_session_request, parse_move_into_request,
-    parse_quick_join_request, read_session_descriptor, take_frame, w_i32,
-    w_wstr,
+    parse_quick_join_request, parse_session_slot, parse_user_list_request,
+    read_session_descriptor,
+    take_frame, w_i32, w_wstr,
 )
 from lobby import (Lobby, MOVE_INTO_BAD_PASSWORD, MOVE_INTO_FULL,   # noqa: E402
-                   MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_OK)
+                   MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_OK,
+                   TEAM_A, TEAM_B, TEAM_LAYOUT_FREE)
 import relayserver                                                  # noqa: E402
 from simple import SimpleCipher                                     # noqa: E402
 
@@ -138,6 +143,15 @@ def list_request(game_type=2, start_room=0):
 
 def move_into_payload(room_id, password="", flag=0):
     return w_i32(room_id) + w_wstr(password) + w_i32(flag)
+
+
+def change_session_payload(session_type=1, arguments=(1, 3, 0), title="来玩",
+                           map_name="Festival00:NewPvp"):
+    """客户端方向的 `0x0302 gcpChangeSession` 载荷（见 parse_change_session_request）。"""
+    return (w_i32(0) + w_wstr(title) + w_wstr(map_name)
+            + w_i32(0) + w_i32(0)
+            + w_i32(session_type)
+            + b"".join(w_i32(v) for v in arguments))
 
 
 class LobbyIsolated(unittest.TestCase):
@@ -661,6 +675,338 @@ class CharacterChangeTests(LobbyIsolated):
         payload = [p for blob in self.alice.sent for _, _op, p in frames(blob)][0]
         self.assertEqual(1, Reader(payload[1:]).i32())
         self.assertEqual(1, self.bob.my_seat)
+
+
+class TeamAndReadyTests(LobbyIsolated):
+    """「变更队伍」和「游戏准备」（FINDINGS §165）。
+
+    两条都是用户 2026-08-12 实机报回来的缺陷：
+      1. 点「变更队伍」队伍没变，还冒出一条**换角色**的韩文提示
+         （服务端不分青红皂白一律回 action 4）；
+      2. 非房主按「游戏准备」只有自己看得见，房主也按不动「开始」
+         （服务端根本不认 `0x030e`，没人广播）。
+    """
+
+    #: 「组队战」房间：描述符 type 1 + `arguments[0] == 1`
+    #: （客户端的 `0x409df1` 读的就是这一格）。
+    TEAM_ROOM = dict(session_type=1, arguments=(1, 3, 0))
+
+    def setUp(self):
+        super().setUp()
+        self.alice = make_conn("alice")
+        gameserver.Conn.on_game_packet(
+            self.alice, 0x0201, create_session_payload(**self.TEAM_ROOM))
+        self.room = self.lobby.room_of(self.alice)
+        self.bob = make_conn("bob")
+        gameserver.Conn.on_game_packet(self.bob, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        # 换角色要写存档，给一个真的能记账的假存储。
+        for conn in (self.alice, self.bob):
+            conn.accounts = CharacterChangeTests.FakeAccounts(conn)
+            conn.sent.clear()
+
+    # -- 座位默认值 --------------------------------------------------------
+    def test_seats_are_assigned_alternating_teams(self):
+        # 客户端自己填 Dummy 座位就是 `座位号 % 2 + 1`（0x468952）。
+        self.assertEqual(TEAM_A, self.room.seats[0].team)
+        self.assertEqual(TEAM_B, self.room.seats[1].team)
+        self.assertFalse(self.room.seats[0].ready)
+        self.assertFalse(self.room.seats[1].ready)
+
+    def test_quest_room_puts_everyone_on_one_team(self):
+        # ★ 闯关是合作：队伍号一样 = 打不到队友（`0x4fedfc` 比队伍号，
+        #   相同就不结算伤害，而且那一处不分模式）。
+        carol = make_conn("carol")
+        gameserver.Conn.on_game_packet(carol, 0x0201,
+                                       create_session_payload(session_type=2,
+                                                              arguments=(3, 1)))
+        room = self.lobby.room_of(carol)
+        dave = make_conn("alice")
+        gameserver.Conn.on_game_packet(dave, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(room.room_id))
+        self.assertEqual([TEAM_A, TEAM_A],
+                         [room.seats[0].team, room.seats[1].team])
+
+    def test_free_for_all_gives_everyone_their_own_team(self):
+        # 个人战：队伍号必须互不相同，否则谁都打不动谁。
+        carol = make_conn("carol")
+        gameserver.Conn.on_game_packet(
+            carol, 0x0201,
+            create_session_payload(session_type=1, arguments=(0, 3, 0)))
+        room = self.lobby.room_of(carol)
+        dave = make_conn("alice")
+        gameserver.Conn.on_game_packet(dave, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(room.room_id))
+        self.assertEqual([1, 2], [room.seats[0].team, room.seats[1].team])
+        self.assertNotEqual(room.seats[0].team, room.seats[1].team)
+
+    def test_switching_the_room_mode_regroups_and_broadcasts(self):
+        # 房主在房间里点「个人战」-> 分队口径变了 -> 重排 + 每个变了的座位
+        # 补一发 action 3。★ 要三个人才看得出来：前两个座位在两种口径下
+        # 恰好都是 1 / 2，第三个才分叉（组队战 1，个人战 3）。
+        carol = make_conn("carol")
+        gameserver.Conn.on_game_packet(carol, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        self.assertEqual(TEAM_A, self.room.seats[2].team)
+        for conn in (self.alice, self.bob, carol):
+            conn.sent.clear()
+        gameserver.Conn.on_game_packet(
+            self.alice, gameserver.OP_CHANGE_SESSION,
+            change_session_payload(session_type=1, arguments=(0, 3, 0)))
+        self.assertEqual(TEAM_LAYOUT_FREE, self.room.team_layout())
+        self.assertEqual([1, 2, 3], [s.team for s in self.room.seats[:3]])
+        # 变了的只有座位 2，所以别人只该收到那一发
+        self.assertIn(OP_SESSION_MEMBER_UPDATE, opcodes(self.bob))
+        payload = [p for blob in self.bob.sent for _, op, p in frames(blob)
+                   if op == OP_SESSION_MEMBER_UPDATE][0]
+        self.assertEqual(SEAT_ACTION_RESYNC, payload[0])
+        self.assertEqual(2, Reader(payload[1:]).i32())
+
+    def test_a_manual_team_choice_survives_someone_joining(self):
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_SESSION_MEMBER_UPDATE,
+            self.seat_slot_payload(1, character=1, team=TEAM_A))
+        carol = make_conn("carol")
+        gameserver.Conn.on_game_packet(carol, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        self.assertEqual(TEAM_A, self.room.seats[1].team)   # 没被冲掉
+        self.assertEqual(TEAM_A, self.room.seats[2].team)   # 新人按座位号
+
+    def test_team_and_ready_land_on_the_right_bytes(self):
+        # 队伍是 **1 字节**（`0x5d5942`），准备是 int32（`0x5d5956`）——
+        # 写错宽度后面所有字段全串位。
+        payload = build_session_slot(occupied=True, nickname="ab", team=2,
+                                     level=7, ready=True)
+        expected = (
+            struct.pack("<i", 1)                              # 占用
+            + struct.pack("<H", 2) + "ab".encode("utf-16le")  # 昵称
+            + struct.pack("<B", 2)                            # ★ 队伍，1 字节
+            + struct.pack("<i", 0)                            # 角色 id
+            + struct.pack("<i", 0)                            # 物品列表的 0 结尾
+            + struct.pack("<i", 0)                            # +0x28
+            + struct.pack("<H", 0)                            # +0x2c
+            + struct.pack("<H", 7)                            # 等级
+            + struct.pack("<i", 1)                            # ★ 准备，int32
+            + struct.pack("<H", 0)                            # +0x12
+            + struct.pack("<H", 0)                            # 空串
+            + struct.pack("<i", 0)                            # +0x34
+            + struct.pack("<i", 0)                            # 关闭
+        )
+        self.assertEqual(expected, payload)
+
+    # -- 变更队伍 ----------------------------------------------------------
+    def seat_slot_payload(self, seat_index, *, character, team, nickname="Bob",
+                          level=5, ready=False):
+        """客户端方向的 `0x0301`：座位号 + 一整个 SessionSlot。"""
+        return w_i32(seat_index) + build_session_slot(
+            occupied=True, nickname=nickname, team=team,
+            character_id=character, level=level, ready=ready)
+
+    def test_team_change_uses_action_3_and_is_broadcast(self):
+        # bob 坐 1 号位（默认 2 队），把自己切到 1 队。
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_SESSION_MEMBER_UPDATE,
+            self.seat_slot_payload(1, character=1, team=TEAM_A))
+        self.assertEqual(TEAM_A, self.room.seats[1].team)
+        for conn in (self.bob, self.alice):
+            self.assertEqual([OP_SESSION_MEMBER_UPDATE], opcodes(conn))
+            payload = [p for blob in conn.sent for _, _op, p in frames(blob)][0]
+            # ★ action 3，不是 4 —— 4 会播「%s님이 %s 캐릭터로…」
+            self.assertEqual(SEAT_ACTION_RESYNC, payload[0])
+            self.assertEqual(1, Reader(payload[1:]).i32())
+            slot = parse_session_slot(Reader(payload[5:]))
+            self.assertEqual(TEAM_A, slot["team"])
+
+    def test_team_change_does_not_touch_the_character(self):
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_SESSION_MEMBER_UPDATE,
+            self.seat_slot_payload(1, character=1, team=TEAM_A))
+        self.assertEqual(1, self.room.seats[1].character_id)
+
+    def test_character_change_still_uses_action_4(self):
+        # 角色变了就是换角色，哪怕队伍那一格也对不上（角色优先）。
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_SESSION_MEMBER_UPDATE,
+            self.seat_slot_payload(1, character=2, team=TEAM_A))
+        payload = [p for blob in self.alice.sent
+                   for _, _op, p in frames(blob)][0]
+        self.assertEqual(SEAT_ACTION_CHANGE_CHARACTER, payload[0])
+        self.assertEqual(TEAM_B, self.room.seats[1].team)   # 队伍没被改掉
+
+    def test_character_change_keeps_team_and_ready_on_the_wire(self):
+        # 换角色那一发**也要带上队伍和准备状态**，否则会把它们抹成 0。
+        self.room.seats[1].ready = True
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_SESSION_MEMBER_UPDATE,
+            self.seat_slot_payload(1, character=2, team=TEAM_B, ready=True))
+        payload = [p for blob in self.alice.sent
+                   for _, _op, p in frames(blob)][0]
+        slot = parse_session_slot(Reader(payload[5:]))
+        self.assertEqual(TEAM_B, slot["team"])
+        self.assertTrue(slot["ready"])
+
+    def test_host_may_change_someone_elses_team(self):
+        # 客户端 0x469f4f 自己就是这么判的：房主动谁都行。
+        gameserver.Conn.on_game_packet(
+            self.alice, OP_SESSION_MEMBER_UPDATE,
+            self.seat_slot_payload(1, character=1, team=TEAM_A))
+        self.assertEqual(TEAM_A, self.room.seats[1].team)
+
+    def test_a_guest_may_not_change_someone_elses_team(self):
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_SESSION_MEMBER_UPDATE,
+            self.seat_slot_payload(0, character=0, team=TEAM_B,
+                                   nickname="Alice", level=3))
+        self.assertEqual(TEAM_A, self.room.seats[0].team)
+        self.assertEqual([], opcodes(self.alice))
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_a_bogus_team_number_is_refused(self):
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_SESSION_MEMBER_UPDATE,
+            self.seat_slot_payload(1, character=1, team=7))
+        self.assertEqual(TEAM_B, self.room.seats[1].team)
+        self.assertEqual([], opcodes(self.alice))
+
+    # -- 游戏准备 ----------------------------------------------------------
+    def test_ready_is_broadcast_to_everyone(self):
+        gameserver.Conn.on_game_packet(self.bob, OP_SEAT_READY, w_i32(1))
+        self.assertTrue(self.room.seats[1].ready)
+        for conn in (self.bob, self.alice):
+            self.assertEqual([OP_SESSION_MEMBER_UPDATE], opcodes(conn))
+            payload = [p for blob in conn.sent for _, _op, p in frames(blob)][0]
+            self.assertEqual(SEAT_ACTION_RESYNC, payload[0])
+            self.assertEqual(1, Reader(payload[1:]).i32())
+            slot = parse_session_slot(Reader(payload[5:]))
+            self.assertTrue(slot["ready"])
+
+    def test_ready_can_be_taken_back(self):
+        gameserver.Conn.on_game_packet(self.bob, OP_SEAT_READY, w_i32(1))
+        gameserver.Conn.on_game_packet(self.bob, OP_SEAT_READY, w_i32(0))
+        self.assertFalse(self.room.seats[1].ready)
+        payload = [p for blob in self.alice.sent
+                   for _, _op, p in frames(blob)][-1]
+        slot = parse_session_slot(Reader(payload[5:]))
+        self.assertFalse(slot["ready"])
+
+    def test_ready_outside_a_room_is_ignored(self):
+        loner = make_conn("carol")
+        gameserver.Conn.on_game_packet(loner, OP_SEAT_READY, w_i32(1))
+        self.assertEqual([], opcodes(loner))
+
+    def test_ready_survives_a_later_full_snapshot(self):
+        # 后进来的人靠 0x0300 拿到全量座位表，准备状态必须在里面。
+        gameserver.Conn.on_game_packet(self.bob, OP_SEAT_READY, w_i32(1))
+        carol = make_conn("carol")
+        gameserver.Conn.on_game_packet(carol, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        snapshot = [p for blob in carol.sent for _, op, p in frames(blob)
+                    if op == OP_SESSION_MEMBERS][0]
+        reader = Reader(snapshot)
+        reader.i32()                     # 房主座位号
+        reader.i32()                     # ?
+        slots = [parse_session_slot(reader) for _ in range(ROOM_SEAT_COUNT)]
+        self.assertTrue(slots[1]["ready"])
+        self.assertEqual(TEAM_A, slots[0]["team"])
+        self.assertEqual(TEAM_B, slots[1]["team"])
+
+    def test_ready_is_cleared_when_the_round_starts(self):
+        # 客户端进 stage 6 时自己把六个座位的 +0x2e 全清 0（0x46fc0f）。
+        gameserver.Conn.on_game_packet(self.bob, OP_SEAT_READY, w_i32(1))
+        self.room.status = gameserver.SESSION_STATUS_PLAYING
+        self.room.clear_ready()
+        self.assertFalse(self.room.seats[1].ready)
+
+
+class UserListTests(LobbyIsolated):
+    """大厅右侧「玩家列表」= `0x020d` 请求 -> **`0x0212`** 应答（§166）。
+
+    用户 2026-08-12 报的「大厅右侧玩家列表看不见其他人」：以前一直回同号的
+    `0x020d`，而那个包的服务端方向是个弹窗（`0x553c5f`），列表永远是空的。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._saved_conns = list(gameserver._conns)
+        gameserver._conns.clear()
+        self.alice = make_conn("alice")
+        self.bob = make_conn("bob")
+        for conn in (self.alice, self.bob):
+            gameserver.register_conn(conn)
+            conn.sent.clear()
+
+    def tearDown(self):
+        gameserver._conns.clear()
+        gameserver._conns.extend(self._saved_conns)
+        super().tearDown()
+
+    def request(self, page=0, page_size=18, flag=1):
+        return struct.pack("<HHB", page, page_size, flag)
+
+    def reply_of(self, conn):
+        blobs = [(op, p) for blob in conn.sent for _, op, p in frames(blob)]
+        return [p for op, p in blobs if op == OP_REP_USER_LIST]
+
+    def test_the_request_is_five_bytes(self):
+        parsed = parse_user_list_request(self.request(2, 18, 1))
+        self.assertEqual({"page": 2, "page_size": 18, "flag": 1}, parsed)
+
+    def test_everyone_online_is_listed(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_REQ_USER_LIST,
+                                       self.request())
+        payload = self.reply_of(self.alice)[0]
+        reader = Reader(payload)
+        page, page_size = reader.u16(), reader.u16()
+        flag = reader.take(1)[0]
+        count = reader.i32()
+        self.assertEqual((0, 18, 1), (page, page_size, flag))
+        self.assertEqual(2, count)
+        found = []
+        for _ in range(count):
+            found.append((reader.wstr(), reader.i32(), reader.i32(),
+                          reader.i32()))
+        self.assertEqual(["Alice", "Bob"], [f[0] for f in found])
+        self.assertEqual([3, 5], [f[1] for f in found])   # 等级
+        self.assertEqual(0, reader.left())
+
+    def test_the_reply_is_0x0212_not_0x020d(self):
+        # ★ 回同号的 0x020d 只会喂给弹窗处理器，列表永远空着。
+        gameserver.Conn.on_game_packet(self.alice, OP_REQ_USER_LIST,
+                                       self.request())
+        self.assertEqual([OP_REP_USER_LIST], opcodes(self.alice))
+
+    def test_paging_is_echoed_back_and_honoured(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_REQ_USER_LIST,
+                                       self.request(page=1, page_size=1))
+        payload = self.reply_of(self.alice)[0]
+        reader = Reader(payload)
+        self.assertEqual((1, 1), (reader.u16(), reader.u16()))
+        reader.take(1)
+        self.assertEqual(1, reader.i32())
+        self.assertEqual("Bob", reader.wstr())      # 第 1 页第 1 条
+
+    def test_a_page_past_the_end_is_empty_not_an_error(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_REQ_USER_LIST,
+                                       self.request(page=9))
+        payload = self.reply_of(self.alice)[0]
+        reader = Reader(payload)
+        reader.u16(), reader.u16(), reader.take(1)
+        self.assertEqual(0, reader.i32())
+
+    def test_a_connection_without_an_account_is_not_listed(self):
+        ghost = make_conn("carol")
+        ghost.account_name = ""
+        gameserver.register_conn(ghost)
+        gameserver.Conn.on_game_packet(self.alice, OP_REQ_USER_LIST,
+                                       self.request())
+        payload = self.reply_of(self.alice)[0]
+        reader = Reader(payload)
+        reader.u16(), reader.u16(), reader.take(1)
+        self.assertEqual(2, reader.i32())
+
+    def test_a_garbled_request_still_gets_a_reply(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_REQ_USER_LIST, b"\x00")
+        self.assertEqual([OP_REP_USER_LIST], opcodes(self.alice))
 
 
 class PeerRelayTests(LobbyIsolated):

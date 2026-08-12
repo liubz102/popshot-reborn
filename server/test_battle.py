@@ -31,7 +31,8 @@ from gameserver import (                                       # noqa: E402
     OP_BROADCAST_DEATH, OP_COUNT_GAME_READY, OP_CREATED_ITEM, OP_CREATE_ITEM,
     OP_END_GAME, OP_END_QUEST, OP_GET_ITEM, OP_LEAVE_SESSION, OP_LOADING_DONE,
     OP_MAP_CHANGE_READY, OP_MAP_LOADING_DONE, OP_MARK_QUEST_SUCCESS,
-    OP_MOVE_INTO_SESSION, OP_PICKED_ITEM, OP_REP_CHANGE_TO_NEXT_MAP,
+    OP_MOVE_INTO_SESSION, OP_PEER_DATA_UP, OP_PICKED_ITEM,
+    OP_REP_CHANGE_TO_NEXT_MAP,
     OP_REP_GAME_RESULT, OP_REP_QUEST_SCORE, OP_REPORT_HP_ZERO,
     OP_REQ_CHANGE_TO_NEXT_MAP, OP_REQ_RESPAWN, OP_RESPAWN_CHARACTER,
     OP_UPDATE_QUEST_SCORE, RoomQuest, SESSION_STATUS_PLAYING,
@@ -587,6 +588,105 @@ class PvpSettlementTests(BattleRoom):
         self.score(self.alice, 0, 40)
         gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
         self.assertEqual([], self.accounts.cleared)
+
+
+class PvpFinishTests(BattleRoom):
+    """★ 对战必须由**服务端**判胜负并结算（§167）。
+
+    用户 2026-08-12 实机报的：「对战模式分出胜负后无法退出返回房间，
+    胜利的人还可以动，死的人无法复活，倒计时结束也不退出」。
+    根因：客户端自带的结束链 `0x4a3cf7` 第一行就是 `cmp [this+0x3b0], 2`，
+    而那个状态只有剧本关才会进 —— 对战地图里它永远是 1，
+    所以整局**一发 `0x040f` 都不会发**（实机日志逐包对过）。
+    """
+
+    session_type = 1
+
+    def kill(self, killer_seat, victim_seat, deaths=0):
+        """让 `killer_seat` 打死 `victim_seat` 一次。
+
+        `0x0408` 里的「凶手」字段就是开火者的座位号（`[char+0x158]`，
+        由 `0x4fedee` 写），服务端的对战计分靠它。
+        """
+        gameserver.Conn.on_game_packet(
+            self.alice, OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=victim_seat * 100000 + 100001,
+                            seat=victim_seat, arg=killer_seat, deaths=deaths))
+
+    def test_kills_are_credited_to_the_shooter(self):
+        self.kill(0, 1, deaths=0)
+        self.kill(0, 1, deaths=1)
+        self.assertEqual(2, self.quest.kills[0])
+        self.assertEqual(0, self.quest.kills[1])
+
+    def test_a_suicide_scores_nothing(self):
+        self.kill(1, 1)
+        self.assertEqual([0] * 6, self.quest.kills)
+
+    def test_a_monster_kill_scores_nothing(self):
+        # 怪物 / 环境的凶手字段是 0xff（线上就是这个字节）。
+        self.kill(0xFF, 1)
+        self.assertEqual([0] * 6, self.quest.kills)
+
+    def test_reaching_the_score_limit_ends_the_round(self):
+        # 2 人个人战的上限是 4（`0x55be71` 的表）。
+        for i in range(4):
+            self.kill(0, 1, deaths=i)
+        self.assertTrue(self.quest.settled)
+        self.assertIn("达到上限", self.quest.pvp_reason)
+        for conn in (self.alice, self.bob):
+            self.assertIn(OP_REP_GAME_RESULT, opcodes(conn))
+            self.assertIn(OP_END_GAME, opcodes(conn))
+
+    def test_the_round_does_not_end_one_kill_early(self):
+        for i in range(3):
+            self.kill(0, 1, deaths=i)
+        self.assertFalse(self.quest.settled)
+        self.assertIsNone(self.quest.pvp_reason)
+
+    def test_the_winner_is_the_one_with_the_kills(self):
+        for i in range(4):
+            self.kill(0, 1, deaths=i)
+        expected = [GAME_RESULT_CLEARED, GAME_RESULT_DEFEATED] + [0] * 4
+        body = bodies(self.alice, OP_REP_GAME_RESULT)[0]
+        self.assertEqual(expected, result_tail(body))
+
+    def test_the_time_limit_ends_the_round(self):
+        self.quest.started_at -= gameserver.PVP_TIME_LIMIT_MS / 1000.0 + 1
+        gameserver.Conn.on_game_packet(self.alice, OP_PEER_DATA_UP,
+                                       b"\xff\x00\xff\x00" + b"\x00" * 8)
+        self.assertTrue(self.quest.settled)
+        self.assertIn("时间到", self.quest.pvp_reason)
+
+    def test_the_last_one_standing_ends_the_round(self):
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.assertTrue(self.quest.settled)
+        self.assertEqual("只剩一边了", self.quest.pvp_reason)
+
+    def test_a_quest_round_is_never_ended_by_the_server(self):
+        # 闯关那一路客户端会自己发 0x040f，服务端绝不能抢在前面结算。
+        room = gameserver.Conn.lobby_room(self.alice)
+        room.session_type = 2
+        self.quest.started_at -= gameserver.PVP_TIME_LIMIT_MS / 1000.0 + 1
+        self.assertFalse(gameserver.Conn.check_pvp_finished(self.alice))
+        self.assertFalse(self.quest.settled)
+
+    def test_the_round_is_only_settled_once(self):
+        for i in range(6):
+            self.kill(0, 1, deaths=i)
+        self.assertEqual(1, len(bodies(self.alice, OP_END_GAME)))
+
+    def test_score_limits_match_the_client(self):
+        # `0x55be71`：个人战看人数，组队战看「人数 // 2」；表外一律 5。
+        self.assertEqual(4, gameserver.pvp_score_limit(2, False))
+        self.assertEqual(6, gameserver.pvp_score_limit(3, False))
+        self.assertEqual(8, gameserver.pvp_score_limit(4, False))
+        self.assertEqual(9, gameserver.pvp_score_limit(5, False))
+        self.assertEqual(10, gameserver.pvp_score_limit(6, False))
+        self.assertEqual(4, gameserver.pvp_score_limit(2, True))
+        self.assertEqual(6, gameserver.pvp_score_limit(4, True))
+        self.assertEqual(8, gameserver.pvp_score_limit(6, True))
+        self.assertEqual(5, gameserver.pvp_score_limit(1, False))
 
 
 # ----------------------------------------------------------------------------

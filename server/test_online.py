@@ -21,7 +21,7 @@ import config as server_config
 import eventlog
 import gameserver
 import relay
-from account_store import AUTH_OK, AccountStore
+from account_store import AUTH_OK, AccountStore, tutorial_state
 from simple import SimpleCipher
 from tickets import TicketStore, short
 from web import server as web_server
@@ -500,9 +500,15 @@ class RegisterWebTests(unittest.TestCase):
         cls.httpd.server_close()
         cls.tmp.cleanup()
 
+    #: 账号名的去重计数器。用户名最长 16 个字符，光靠截断用例名是不够的 ——
+    #: `test_register_*` 这一串截到前 12 个字符会**全部撞在一起**（踩过）。
+    counter = 0
+
     def setUp(self):
         # 每个用例用自己的账号名，免得互相干扰（类级别只建一次服务器）。
-        self.who = f"u{self.id().rsplit('.', 1)[-1][:12]}"
+        # 名字里那截用例名只是给日志留线索，唯一性由计数器保证。
+        type(self).counter += 1
+        self.who = f"u{self.counter}_{self.id().rsplit('.', 1)[-1][5:14]}"
 
     def url(self, path):
         return f"http://127.0.0.1:{self.port}{path}"
@@ -543,6 +549,50 @@ class RegisterWebTests(unittest.TestCase):
                            "password2": "pw"})
         self.assertFalse(again["ok"])
         self.assertIn("该用户名已存在，请在登录界面直接登录", again["message"])
+
+    def test_the_page_ships_the_skip_tutorial_box_checked(self):
+        with urllib.request.urlopen(self.url("/"), timeout=10) as response:
+            html = response.read().decode("utf-8")
+        self.assertIn("跳过新手教程", html)
+        # 需求：进注册页时这个框默认**勾着**。
+        self.assertIn('<input id="skipTut" type="checkbox" checked>', html)
+        self.assertIn("skip_tutorial:", html)
+
+    def test_register_with_skip_tutorial_marks_the_save_completed(self):
+        reply = self.post("/api/register",
+                          {"username": self.who, "password": "pw",
+                           "password2": "pw", "skip_tutorial": True})
+        self.assertTrue(reply["ok"], reply)
+        account = self.accounts.get_account(self.who)[1]
+        self.assertTrue(account["tutorial_completed"])
+        self.assertEqual(3, tutorial_state(account))
+
+    def test_register_without_skip_tutorial_keeps_the_original_flow(self):
+        reply = self.post("/api/register",
+                          {"username": self.who, "password": "pw",
+                           "password2": "pw", "skip_tutorial": False})
+        self.assertTrue(reply["ok"], reply)
+        account = self.accounts.get_account(self.who)[1]
+        self.assertFalse(account["tutorial_completed"])
+        self.assertEqual(0, tutorial_state(account))
+
+    def test_register_defaults_to_the_original_flow_when_the_field_is_absent(self):
+        # 直接调接口的人不说，就维持原版行为 —— 页面每次都会显式发这个字段。
+        reply = self.post("/api/register",
+                          {"username": self.who, "password": "pw",
+                           "password2": "pw"})
+        self.assertTrue(reply["ok"], reply)
+        self.assertFalse(
+            self.accounts.get_account(self.who)[1]["tutorial_completed"])
+
+    def test_register_does_not_take_the_string_false_for_yes(self):
+        # bool("false") 是 True —— 手搓请求的人栽在这上面会非常难查。
+        reply = self.post("/api/register",
+                          {"username": self.who, "password": "pw",
+                           "password2": "pw", "skip_tutorial": "false"})
+        self.assertTrue(reply["ok"], reply)
+        self.assertFalse(
+            self.accounts.get_account(self.who)[1]["tutorial_completed"])
 
     def test_register_rejects_a_mismatched_confirmation(self):
         reply = self.post("/api/register",

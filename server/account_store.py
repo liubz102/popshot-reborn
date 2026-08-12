@@ -268,11 +268,20 @@ class AccountStore:
         return account
 
     # ------------------------------------------------------------------ 注册
-    def register(self, username, password, display_name=""):
+    def register(self, username, password, display_name="", skip_tutorial=False):
         """注册新账号。重名或格式不合规抛 `AccountError`，成功返回账号字典。
 
         查重和写入在**同一把锁**里完成 —— 注册页可能被两个人同时提交，
         「先查再写」如果拆成两步就会让后一个人静默覆盖前一个人。
+
+        `skip_tutorial=True` 就把新存档的 `tutorial_completed` 直接置上，
+        于是首次登录时 `tutorial_state()` 回 3，客户端不再把人拉进强制教学关
+        （§54）。`tutorial_progress` **保持 0** —— 它是「客户端自己上报过什么」
+        的保真记录，我们没跑过教程就不该往里编一个值（D094）。
+
+        ★ 这里的默认是 **False**（= 原版行为）。注册页上那个勾选框默认**勾着**，
+        但它每次都会把 `skip_tutorial` 显式发上来；默认值只影响直接调 API 的人，
+        对他们来说「不说就不改行为」才是对的。
         """
         username = check_username(username)
         password = check_password(password)
@@ -284,6 +293,7 @@ class AccountStore:
             account = self._merged_account(username, None)
             account["password"] = password
             account["display_name"] = str(display_name or "").strip() or username
+            account["tutorial_completed"] = bool(skip_tutorial)
             data["accounts"][username] = account
             self._write_unlocked(data)
             return copy.deepcopy(account)
