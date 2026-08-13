@@ -402,6 +402,9 @@ static unsigned g_peer_relay_port     = 27798;
 
 static HWND         g_login_dlg   = NULL;
 static int          g_dlg_styled  = 0;      /* 文案 / 尺寸只改一次 */
+/* 双击 A/D 出近身攻击的判定窗口（毫秒）。来自 server.config 的 double_tap_ms，
+   250 = 原版。实现和依据都在下面「手感 patch」那一段。 */
+static unsigned      g_double_tap_ms = 500;
 static volatile LONG g_online     = 0;      /* 1 = 选了「远程服务器」 */
 static wchar_t      g_link_text[512] = L"";
 /* 被我们子类化的那条注册链接（实现在下面「注册链接的点击」一段）。 */
@@ -442,10 +445,13 @@ static void read_online_config(void)
     g_relay_game_port = env_uint("POPSHOT_RELAY_GAME_PORT", g_relay_game_port);
     g_relay_peer_port = env_uint("POPSHOT_RELAY_PEER_PORT", g_relay_peer_port);
     g_peer_relay_port = env_uint("POPSHOT_PEER_RELAY_PORT", g_peer_relay_port);
-    bslog("CFG     远程服务器=%s 注册页端口 远端=%u 本机=%u；中继端口 %u/%u/%u",
+    g_double_tap_ms   = env_uint("POPSHOT_DOUBLE_TAP_MS",   g_double_tap_ms);
+    bslog("CFG     远程服务器=%s 注册页端口 远端=%u 本机=%u；中继端口 %u/%u/%u；"
+          "双击窗口 %u ms",
           w2u8(g_server_addr, u8, sizeof(u8)),
           g_server_reg_port, g_local_reg_port,
-          g_relay_auth_port, g_relay_game_port, g_relay_peer_port);
+          g_relay_auth_port, g_relay_game_port, g_relay_peer_port,
+          g_double_tap_ms);
 }
 
 /* 当前该显示 / 打开哪台服务器：本机固定 localhost，远程用配置里的地址。 */
@@ -1553,6 +1559,100 @@ static int try_patch_afk_timer(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* 手感 patch —— 双击 A/D 出近身攻击的判定窗口 250ms -> 可配置（默认 500ms）  */
+/*                                                                            */
+/*   用户实机反馈：「双击 A 或 D 的近身攻击有时按得再快也发不出，有时不用那么 */
+/*   快反而能发出来」。会话 17 在真客户端上用消息注入 + 外部内存探针量到了     */
+/*   全过程（FINDINGS §183，tools/probe_input.py）：                          */
+/*                                                                            */
+/*     · 每一次按键客户端都正确记下了（InputSystem 的 +0x305 计数器 0→1→0），  */
+/*       **不是漏按键**；                                                     */
+/*     · 出一次招之后角色进入 **893 毫秒的动作锁定**（[char+0x5c4] 非 0），    */
+/*       这期间 0x515af9 的 `test bl,bl; je` 把整块判定跳过 ——                */
+/*       **连「这次点按」都不记**（[char+0x748] 冻结）；                       */
+/*     · 锁一解开，原版要求你再干净地点两下、且相隔 < 250ms（0xfa）才出招。    */
+/*   连按时点按几乎全落在锁定期里，于是「按得越快越发不出」。                  */
+/*   实测：慢速双击 6 下出招 2~3 次；60ms 连按 16 下 2 次；25ms 狂按 21 下 1 次。*/
+/*                                                                            */
+/*   改法：只把那个 250ms 的窗口常量放宽。**攻击频率上限一点没动** ——         */
+/*   893ms 动作锁定和 0x515abc 的 600ms 冷却都原样保留，近身攻击仍然大约       */
+/*   一秒一次。改的只是「你的点按算不算数」：锁一解开客户端会立刻把当前这一下  */
+/*   记进 [char+0x748]，窗口放宽之后你接下来那一下就能配对成功。               */
+/*                                                                            */
+/*     0x515b1d  cmp ecx, 0xfa    左（A / ← / Q）                             */
+/*     0x515b84  cmp ecx, 0xfa    右（D / → / E）                             */
+/*                                                                            */
+/*   窗口值来自 server.config 的 double_tap_ms，经 launch.ps1 放进环境变量     */
+/*   POPSHOT_DOUBLE_TAP_MS。填 250 就完全回到原版行为（也就是关掉这个 patch）。*/
+/* -------------------------------------------------------------------------- */
+#define DOUBLE_TAP_SITE_COUNT 2
+#define DOUBLE_TAP_ORIG_MS    250u
+/* 窗口再大也不该盖过 893ms 的动作锁定 + 一次点按，2000ms 以上纯属误触发机器。 */
+#define DOUBLE_TAP_MAX_MS     2000u
+static const unsigned DOUBLE_TAP_SITES[DOUBLE_TAP_SITE_COUNT] = {
+    0x00515b1du,   /* 左 */
+    0x00515b84u,   /* 右 */
+};
+/* `81 F9 <imm32>` = cmp ecx, imm32。前两个字节是特征，后四个字节是窗口值。 */
+static const unsigned char DOUBLE_TAP_SIG[2] = { 0x81, 0xF9 };
+static volatile LONG g_double_tap_patched = 0;
+
+/* 返回 0 表示「保持原版」（配置填了 250，或填了看不懂的值）。 */
+static unsigned double_tap_window(void)
+{
+    unsigned ms = g_double_tap_ms;
+    if (ms == DOUBLE_TAP_ORIG_MS) return 0;
+    if (ms < DOUBLE_TAP_ORIG_MS || ms > DOUBLE_TAP_MAX_MS) {
+        bslog("PATCH   double_tap_ms=%u 超出 %u..%u，按原版 %u 处理",
+              ms, DOUBLE_TAP_ORIG_MS, DOUBLE_TAP_MAX_MS, DOUBLE_TAP_ORIG_MS);
+        return 0;
+    }
+    return ms;
+}
+
+static int try_patch_double_tap(unsigned ms)
+{
+    int i, done = 0;
+
+    if (g_double_tap_patched) return 1;
+    for (i = 0; i < DOUBLE_TAP_SITE_COUNT; i++) {
+        unsigned char *p = (unsigned char *)DOUBLE_TAP_SITES[i];
+        unsigned current;
+        DWORD oldp;
+
+        if (IsBadReadPtr(p, 6)) continue;
+        if (memcmp(p, DOUBLE_TAP_SIG, 2) != 0)
+            continue;                            /* 还没解壳到这里，继续等 */
+        memcpy(&current, p + 2, 4);
+        if (current == ms) { done++; continue; } /* 已经是要的值 */
+        if (current != DOUBLE_TAP_ORIG_MS) {
+            /* 既不是原版 250 也不是我们要写的值 —— 这条指令不是我们以为的
+               那一条，**绝不盲写**。 */
+            bslog("PATCH   双击窗口 @ %08X: 现值 %u 不是原版 %u，跳过（不敢写）",
+                  DOUBLE_TAP_SITES[i], current, DOUBLE_TAP_ORIG_MS);
+            continue;
+        }
+        if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &oldp)) {
+            bslog("PATCH   双击窗口 @ %08X: VirtualProtect 失败 err=%lu",
+                  DOUBLE_TAP_SITES[i], (unsigned long)GetLastError());
+            continue;
+        }
+        memcpy(p + 2, &ms, 4);
+        VirtualProtect(p, 6, oldp, &oldp);
+        FlushInstructionCache(GetCurrentProcess(), p, 6);
+        bslog("PATCH   ★双击近身攻击判定窗口 @ %08X: %u ms -> %u ms（%s）",
+              DOUBLE_TAP_SITES[i], DOUBLE_TAP_ORIG_MS, ms,
+              i == 0 ? "左 A/←/Q" : "右 D/→/E");
+        done++;
+    }
+    if (done == DOUBLE_TAP_SITE_COUNT) {
+        InterlockedExchange(&g_double_tap_patched, 1);
+        return 1;
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
 /* 单机化 patch —— 解锁被「地区掩码」关掉的关卡（神秘岛以外的第 5/6/7 关）    */
 /*                                                                            */
 /*   Data/map.ini 里每张地图都有一行 OpenLocale（注释写着                     */
@@ -2184,6 +2284,24 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_afk_patched)
             bslog("PATCH   !! 超时未能 patch 挂机计时器"
                   "（0x4082ae 一直不是 68 90 5F 01 00）");
+    }
+
+    /* 双击判定窗口。和上面两处一样：等解壳、校验原始字节、写 4 个字节。
+       它第一次被执行要等到进房间/关卡，完全不急。 */
+    {
+        unsigned ms = double_tap_window();
+        if (!ms) {
+            bslog("PATCH   double_tap_ms=%u：保持原版双击判定窗口",
+                  DOUBLE_TAP_ORIG_MS);
+        } else {
+            for (ticks = 0; !g_stop && !g_double_tap_patched && ticks < 2000; ticks++) {
+                if (try_patch_double_tap(ms)) break;
+                Sleep(2);
+            }
+            if (!g_double_tap_patched)
+                bslog("PATCH   !! 超时未能 patch 双击判定窗口"
+                      "（0x515b1d / 0x515b84 一直不是 81 F9 FA 00 00 00）");
+        }
     }
 
     /* SnowCipher hook 紧跟在其它代码 patch 之后装：

@@ -123,6 +123,10 @@ def make_conn(username):
     conn.peer_data_dumped = False
     conn.peer_data_in = 0
     conn.peer_data_out = 0
+    conn.peer_forward_ms = gameserver.relayserver.RttStats()
+    conn.peer_gap_ms = gameserver.relayserver.RttStats()
+    conn.peer_last_at = None
+    conn.peer_report_at = 0.0
     return conn
 
 

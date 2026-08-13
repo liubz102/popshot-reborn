@@ -71,7 +71,7 @@ from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
                    TEAM_A, TEAM_B, TEAM_NONE, TEAM_LAYOUT_COOP,
                    TEAM_LAYOUT_FREE, TEAM_LAYOUT_TEAMS, default_team,
                    team_layout_of)
-from netlisten import create_listener, describe as describe_listen
+from netlisten import create_listener, describe as describe_listen, tune_stream
 import relayserver
 from tickets import TicketStore, short as short_ticket
 
@@ -224,6 +224,20 @@ OP_JOIN_RELAY = 0x0210          # 服务端 -> 客户端：gspJoinRelay（18 字
 OP_LEAVE_RELAY = 0x0211         # 服务端 -> 客户端：拆掉中继连接（载荷被无视）
 OP_MARK_QUEST_SUCCESS = 0x0417
 OP_RESPAWN_CHARACTER = 0x0419
+
+#: 客户端方向 `0x0106 gcpReportHack` —— **客户端自己觉得"这个玩家不对劲"时的上报**。
+#: V0.1 §88 拿它当过免费的正确性检查器（服务端把人传送到地图边缘，23 毫秒后
+#: 就收到一发）。**只记不回**：客户端发完就继续玩，没有任何应答需求。
+#:
+#: 载荷是一个 wstring，正文由发现问题的那一处自己拼。已知的一种（§183）：
+#:
+#:     (FastFire) wpnIdx=%d,lastFireTime=%d,currFireTime=%d,Interval=%d/%d
+#:
+#: 判据在 `0x51540a`（调用点 `0x5153fb`）：两次开火间隔 < `武器间隔/2` 就计数，
+#: 攒到 **5 次**发一发。也就是说**客户端确实有"输入太快就当异常"的逻辑** ——
+#: 所以把这行解成人话打进 `[online]`，"连按 A/D 会不会撞上同类判据"就变成了
+#: 用户跑一次就能看见的事实，而不用靠猜。
+OP_REPORT_HACK = 0x0106
 
 #: 客户端方向 0x0408（18 字节）= **「某个角色 HP 归零了」上报**（会话 15，§108）。
 #: 发送点 `Character::OnHpZero` 0x4ffab0 -> `GameContext::ReportDeath` 0x493855
@@ -1234,6 +1248,24 @@ def build_session_member_update(seat_index, action=SEAT_ACTION_JOIN, **seat):
     return (struct.pack("<B", action & 0xFF)
             + w_i32(seat_index)
             + build_session_slot(**seat))
+
+
+def parse_report_hack(payload):
+    """解 `0x0106 gcpReportHack` 的载荷 -> 一行正文。
+
+    形状是**一个 wstring**（`0x5d5b3a` = u16 字符数 + UTF-16LE）。
+    解不动就退回 hexdump 的可打印形式 —— 这个包**纯粹是给人看的**，
+    绝不能因为格式没猜准就抛异常把连接带崩（它在战斗中随时可能来）。
+    """
+    try:
+        reader = Reader(payload)
+        text = reader.wstr()
+        if reader.left():
+            text += f"（另有 {reader.left()} 字节未解）"
+        return text
+    except (ValueError, struct.error, UnicodeDecodeError):
+        printable = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in payload)
+        return f"<解不出 wstring，{len(payload)} 字节: {printable[:120]}>"
 
 
 def parse_move_into_request(payload):
@@ -2710,6 +2742,9 @@ def hexdump(b, maxlen=512):
 #: `UdpPacket` 的头长度（§151）。`RawPacket` 是 10 字节，这个是 12。
 PEER_HEADER_SIZE = 12
 
+#: 多久往 `[online]` 汇总一次同步数据的转发耗时（秒）。见 `report_peer_timing`。
+PEER_TIMING_REPORT_INTERVAL = 30.0
+
 
 def describe_peer_header(payload):
     """把 `0x040e` 载荷开头那 12 字节的 `UdpPacket` 头解成一行人话（§151）。
@@ -2914,6 +2949,13 @@ class Conn:
         self.peer_data_dumped = False
         self.peer_data_in = 0
         self.peer_data_out = 0
+        # 同步数据的转发耗时 / 到达间隔（都按毫秒），每 30 秒汇总一行。
+        # 存在的意义是**排除嫌疑**：实机还嫌卡时，这两个数字能立刻说清
+        # 「不是服务端转发慢」，省掉一整轮猜（§182）。
+        self.peer_forward_ms = relayserver.RttStats()
+        self.peer_gap_ms = relayserver.RttStats()
+        self.peer_last_at = None
+        self.peer_report_at = time.monotonic()
         # 本局回了几次 0x0406 死亡广播 / 几次 0x0419 重生（只用来打日志编号）。
         self.deaths_broadcast = 0
         self.respawn_sent = 0
@@ -4648,6 +4690,16 @@ class Conn:
         self.sync_peer_relay(reason="（收到 0x0310 要中继）")
         self.maybe_join_relay()
 
+    def on_report_hack(self, payload):
+        """`0x0106 gcpReportHack` —— 客户端自己觉得不对劲时的上报。**只记不回**。
+
+        走 `[online]`（精简模式也可见）：这一行现在是「连按 A/D 会不会被客户端
+        当成异常输入」的取证口，见 `OP_REPORT_HACK` 的说明和 §183。
+        """
+        text = parse_report_hack(payload)
+        who = self.account_name or "?"
+        self.online(f"⚠ 客户端上报异常 账号={who!r} ip={self.peer()} 正文={text}")
+
     def on_peer_data(self, payload):
         """`0x040e` —— 把玩家之间的同步数据转给同房间的其他人（§149）。
 
@@ -4672,13 +4724,39 @@ class Conn:
             self.log(f"   玩家间同步：本房间第一发 {len(payload)} 字节\n"
                      f"{hexdump(payload)}\n"
                      f"{describe_peer_header(payload)}")
+        started = time.monotonic()
+        if self.peer_last_at is not None:
+            self.peer_gap_ms.add((started - self.peer_last_at) * 1000.0)
+        self.peer_last_at = started
         # ★ 走 `PEER_RELAY.deliver` 而不是直接广播 `0x040f`：房里可能有人已经
         #   接上原版中继了，那些人要走中继收（原版路径），剩下的才走 `0x040f`。
         #   两条路在客户端进的是同一个入口 `0x407869`，谁收哪条都一样。
         self.peer_data_out += PEER_RELAY.deliver(self, payload)
+        self.peer_forward_ms.add((time.monotonic() - started) * 1000.0)
+        self.report_peer_timing(started)
         # ★ 对战的时间上限盯在这里：这条包约 8 Hz，比另起一个定时器线程省事，
         #   而且没人发包时也不需要判（房里没人动 = 没人在等结算）。
         self.check_pvp_finished()
+
+    def report_peer_timing(self, now=None, force=False):
+        """每 `PEER_TIMING_REPORT_INTERVAL` 秒往 `[online]` 汇总一行转发耗时。
+
+        **不是逐包打** —— 逐包正是 §182 之前那种「跟游戏抢磁盘 I/O」的老毛病，
+        NOISY_OPCODES 就是为它存在的。
+        """
+        now = time.monotonic() if now is None else now
+        if not force and now - self.peer_report_at < PEER_TIMING_REPORT_INTERVAL:
+            return
+        self.peer_report_at = now
+        forward = self.peer_forward_ms.summary()
+        if forward is None:
+            return
+        gap = self.peer_gap_ms.summary()
+        who = self.account_name or "?"
+        self.online(f"同步转发 账号={who!r} 转发耗时 {forward}"
+                    + (f"；到达间隔 {gap}" if gap else ""))
+        self.peer_forward_ms.reset()
+        self.peer_gap_ms.reset()
 
     def broadcast_system_chat(self, text):
         """房间里的一行系统提示（没有「谁 : 」前缀，§141）。"""
@@ -5157,6 +5235,8 @@ class Conn:
             self.on_report_hp_zero(payload)
         elif opcode == OP_REQ_RESPAWN:
             self.on_respawn_request(payload)
+        elif opcode == OP_REPORT_HACK:
+            self.on_report_hack(payload)
         elif opcode == OP_PEER_DATA_UP:
             self.on_peer_data(payload)
         elif opcode == OP_START_TCP_RELAY:
@@ -5254,6 +5334,11 @@ class Conn:
         except Exception as e:
             self.log(f"异常: {e!r}")
         finally:
+            # 窗口里没打完的样本也要有个去处，不然短局一个数字都留不下。
+            try:
+                self.report_peer_timing(force=True)
+            except Exception:                # 收尾路径上绝不能再抛
+                pass
             unregister_conn(self)
             # 中继票据跟着游戏连接一起作废。**不去关中继 socket** ——
             # 游戏连接一断，客户端那条中继连接自己也会走掉；而主动关别人的
@@ -5736,6 +5821,8 @@ def serve(port, args, accounts=None, tickets=None, host="::", ready=None):
         ready.set()
     while True:
         conn, addr = s.accept()
+        # 关 Nagle。`0x040f`（同步数据的回退路径）走的就是这条连接，见 D104。
+        tune_stream(conn)
         threading.Thread(
             target=Conn(conn, addr, args, accounts, tickets).run,
             daemon=True).start()

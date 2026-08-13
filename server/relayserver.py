@@ -62,7 +62,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config as server_config
-from netlisten import create_listener
+import eventlog
+from netlisten import create_listener, tune_stream
 from simple import SimpleCipher
 
 #: `RawPacket` 的魔数。和游戏服那层同一个字节（`0x5bb9e7` 写死的）。
@@ -86,9 +87,22 @@ AUTH_SIZE = 12
 #: 真实的 `UdpPacket` 是几十字节，超出这个数量级说明流已经错位了。
 MAX_PAYLOAD = 0xFFFF
 
-#: 多久给每条已注册的连接发一发 ping（秒）。**只为留个活性记录** ——
-#: 收不到回应也**不会**断开（铁律 1）。
-PING_INTERVAL = 10.0
+#: 多久给每条已注册的连接发一发 ping（秒）。
+#:
+#: ★ 除了「活性记录」，它现在还是**唯一一把量真实延迟的尺子**：这条连接就是
+#: 战斗数据走的那条（客户端 → 本机中继 → 这里），所以 ping 的往返时间就是玩家
+#: 真正感受到的那个延迟。10 秒一发采不出统计量，改成 1 秒（一帧 10 字节）。
+#:
+#: ⚠ **收不到回应也绝不断开**（铁律 1：中继一断客户端会自己退出房间，§158）。
+PING_INTERVAL = 1.0
+
+#: 一发 ping 等多久还没回就当它丢了。rcp 的 ping 载荷是空的、没有 id 可配对，
+#: 所以**同一时刻只允许一发在飞** —— 这样每个 pong 归属哪一发都是确定的，
+#: 量出来的数字才可信。超时只是把「在飞」标记清掉，**不动连接**。
+PING_TIMEOUT = 5.0
+
+#: 多久往 `[online]` 汇总一次 RTT（秒）。逐发打会把日志淹掉。
+RTT_REPORT_INTERVAL = 30.0
 
 #: 签发出去还没被用掉的票据能活多久（秒）。客户端拿到 `0x0210` 之后
 #: 一个 RTT 就连上来了，给足 60 秒纯属宽容。
@@ -147,6 +161,63 @@ def build_join_relay(host, port, auth):
             + struct.pack("<iii", int(a), int(b), int(c)))
 
 
+class RttStats:
+    """一串 RTT 样本的统计量（毫秒）。
+
+    做成独立的小类是为了**能单独测**：喂假的毫秒数进去就能验 min/avg/p95，
+    不用真的起 socket。
+
+    `p95` 算在**最近 `cap` 个**样本上（1 Hz 下 4096 个 ≈ 68 分钟，一局绰绰有余）；
+    `count / min / max / avg` 是全量的，不受 `cap` 影响。
+    """
+
+    __slots__ = ("cap", "count", "total", "lo", "hi", "recent")
+
+    def __init__(self, cap=4096):
+        self.cap = int(cap)
+        self.reset()
+
+    def reset(self):
+        self.count = 0
+        self.total = 0.0
+        self.lo = None
+        self.hi = None
+        self.recent = []
+
+    def add(self, ms):
+        ms = float(ms)
+        self.count += 1
+        self.total += ms
+        if self.lo is None or ms < self.lo:
+            self.lo = ms
+        if self.hi is None or ms > self.hi:
+            self.hi = ms
+        self.recent.append(ms)
+        if len(self.recent) > self.cap:
+            # 一次砍掉一半，别每来一个样本就 pop(0)（那是 O(n)）。
+            del self.recent[:len(self.recent) - self.cap]
+
+    @property
+    def avg(self):
+        return None if not self.count else self.total / self.count
+
+    @property
+    def p95(self):
+        """第 95 百分位（最近邻取法，样本少时退化成最大值）。"""
+        if not self.recent:
+            return None
+        ordered = sorted(self.recent)
+        index = int(round(0.95 * (len(ordered) - 1)))
+        return ordered[index]
+
+    def summary(self):
+        """给日志的一行。没有样本时返回 ``None``（调用方据此不打这一行）。"""
+        if not self.count:
+            return None
+        return (f"样本={self.count} min={self.lo:.1f}ms "
+                f"avg={self.avg:.1f}ms p95={self.p95:.1f}ms max={self.hi:.1f}ms")
+
+
 class _Ticket:
     """一张签发出去、还没被 `rcpRegister` 兑换的票据。"""
 
@@ -178,8 +249,16 @@ class RelayConn:
         self.data_out = 0
         self.pings_out = 0
         self.pongs_in = 0
+        self.pings_lost = 0
         self.opened_at = time.time()
         self.last_ping_at = self.opened_at
+        #: 正在飞的那一发 ping 的发出时刻；`None` = 现在没有在飞的。
+        self.ping_sent_at = None
+        #: 本汇总窗口的 RTT（每 `RTT_REPORT_INTERVAL` 打一行然后清零）。
+        self.rtt_window = RttStats()
+        #: 整条连接的 RTT（断开时打一行）。
+        self.rtt_total = RttStats()
+        self.last_rtt_report_at = self.opened_at
         self.closed = False
 
     # -- 基本信息 -----------------------------------------------------------
@@ -233,6 +312,11 @@ class RelayConn:
                 if not data:
                     break
                 self.feed(data)
+                # ★ 战斗中数据是连续的，上面那个 `recv` **永远不会超时** ——
+                #   不在这里也调一次的话，一局打下来一发 ping 都不会发出去，
+                #   偏偏那正是最需要量延迟的时候（FINDINGS §182）。
+                #   `tick()` 自己按 PING_INTERVAL 节流，多调不会多发。
+                self.tick()
         except ConnectionResetError:
             pass
         except ValueError as error:
@@ -243,16 +327,63 @@ class RelayConn:
         finally:
             self.close()
 
-    def tick(self):
-        """每秒钟一次的心跳窗口。已注册的连接按 `PING_INTERVAL` 发 ping。"""
+    def tick(self, now=None):
+        """心跳窗口：按 `PING_INTERVAL` 发 ping，并按 `RTT_REPORT_INTERVAL` 汇总。
+
+        `run()` 在**收到数据之后**和**recv 超时时**各调一次，所以战斗中也照走
+        （见 `run()` 里的注释）。`now` 只给测试注入用。
+
+        ⚠ 全程**不关连接** —— ping 丢光了也只是把计数加一（铁律 1 / §158）。
+        """
         if self.game_conn is None:
             return
-        now = time.time()
+        now = time.time() if now is None else now
+        self.report_rtt(now)
+        if self.ping_sent_at is not None:
+            # 上一发还在飞。等它回来或超时，**期间不再发第二发** ——
+            # rcp 的 ping 没有 id，两发同时在飞就分不清 pong 是谁的了。
+            if now - self.ping_sent_at >= PING_TIMEOUT:
+                self.ping_sent_at = None
+                self.pings_lost += 1
+            return
         if now - self.last_ping_at < PING_INTERVAL:
             return
         self.last_ping_at = now
+        self.ping_sent_at = now
         if self.send_frame(RCP_PING):
             self.pings_out += 1
+        else:
+            self.ping_sent_at = None
+
+    def on_pong(self, now=None):
+        """收到 `rcpRepPing`：把这一发的往返时间记下来。"""
+        self.pongs_in += 1
+        sent, self.ping_sent_at = self.ping_sent_at, None
+        if sent is None:
+            # 没有在飞的 ping 却收到 pong（超时之后才回来的那一发）。
+            # 算不出可信的 RTT，丢掉这个样本比记一个错的强。
+            return
+        now = time.time() if now is None else now
+        rtt_ms = max(0.0, (now - sent) * 1000.0)
+        self.rtt_window.add(rtt_ms)
+        self.rtt_total.add(rtt_ms)
+
+    def report_rtt(self, now=None, force=False):
+        """够 `RTT_REPORT_INTERVAL` 就往 `[online]` 打一行汇总，然后清窗口。
+
+        走 `eventlog` 而不是 `self.log()`：**精简模式下也要看得见**，
+        它是玩家报「卡」时唯一能对质的数字（同 §133 的道理）。
+        """
+        now = time.time() if now is None else now
+        if not force and now - self.last_rtt_report_at < RTT_REPORT_INTERVAL:
+            return
+        self.last_rtt_report_at = now
+        summary = self.rtt_window.summary()
+        if summary is None:
+            return
+        lost = f" 丢={self.pings_lost}" if self.pings_lost else ""
+        eventlog.online(f"中继 RTT [{self.who()}] {summary}{lost}")
+        self.rtt_window.reset()
 
     def feed(self, data):
         self.buf += self.cin.decrypt(data)
@@ -269,7 +400,7 @@ class RelayConn:
         if opcode == RCP_REGISTER:
             self.on_register(payload)
         elif opcode == RCP_REP_PING:
-            self.pongs_in += 1
+            self.on_pong()
         elif opcode == RCP_DATA_UP:
             self.on_data(payload)
         else:
@@ -314,11 +445,16 @@ class RelayConn:
             self.sock.close()
         except OSError:
             pass
+        # 窗口里没打完的那些样本也要有个去处，不然短连接一个数字都留不下。
+        self.report_rtt(force=True)
+        rtt = self.rtt_total.summary()
         self.server.log(
             f"- 中继连接结束 [{self.who()}] 在线 {time.time() - self.opened_at:.1f} 秒"
             f"（帧 收 {self.frames_in} / 发 {self.frames_out}；"
             f"数据 收 {self.data_in} / 发 {self.data_out}；"
-            f"ping {self.pings_out} 回 {self.pongs_in}）")
+            f"ping {self.pings_out} 回 {self.pongs_in} 丢 {self.pings_lost}）")
+        if rtt is not None:
+            eventlog.online(f"中继 RTT 汇总 [{self.who()}] {rtt}")
 
 
 class RelayServer:
@@ -468,6 +604,8 @@ class RelayServer:
                 if self.stopping:
                     break
                 raise
+            # ★ 战斗数据的**主路**就是这条连接，关 Nagle 的收益全在这儿（D104）。
+            tune_stream(sock)
             conn = RelayConn(self, sock, addr)
             threading.Thread(target=conn.run, daemon=True,
                              name=f"relay-{addr[0]}:{addr[1]}").start()
@@ -483,8 +621,13 @@ class RelayServer:
     def status(self):
         """一行给控制通道 / 日志用的现状。"""
         with self._lock:
-            live = len(self._conns)
+            conns = list(self._conns.values())
             pending = len(self._tickets)
-        return (f"中继：在线 {live} 条，待兑票据 {pending} 张，"
+        line = (f"中继：在线 {len(conns)} 条，待兑票据 {pending} 张，"
                 f"累计注册 {self.registered_total} 次；"
                 f"投递 中继 {self.delivered_relay} / 回退 {self.delivered_fallback}")
+        for conn in conns:
+            rtt = conn.rtt_total.summary()
+            if rtt is not None:
+                line += f"\n    RTT [{conn.who()}] {rtt}"
+        return line

@@ -45,7 +45,7 @@ from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as server_config
-from netlisten import create_listener
+from netlisten import create_listener, tune_stream
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -292,6 +292,8 @@ def connect_remote(target_host, target_port, proxy=None):
     """
     endpoint = (target_host, target_port) if proxy is None else (proxy.host, proxy.port)
     sock = socket.create_connection(endpoint, timeout=CONNECT_TIMEOUT)
+    # 关 Nagle。走代理时同样要关 —— 隧道里跑的还是那几十字节的小包（D104）。
+    tune_stream(sock)
     if proxy is None:
         return sock
     try:
@@ -367,6 +369,10 @@ def handle(client, addr, target_host, target_port, label, proxy=None):
     log(f"#{seq} ✓ {label}服 {addr[0]}:{addr[1]} → {shown}:{target_port}（{route}）")
     remote.settimeout(None)
     client.settimeout(None)
+    # 两个方向都要关 Nagle：`remote` 在 connect_remote 里已经关过，这里补上
+    # 面向 BigShot.exe 的那条（下行同步数据全从它出去）。见 D104。
+    tune_stream(client)
+    tune_stream(remote)
     up, down = [0], [0]
     thread = threading.Thread(target=_pump,
                               args=(client, remote, f"#{seq} 上行", up),

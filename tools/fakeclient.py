@@ -111,8 +111,12 @@ CHARACTER_HANDLE_BASE = 100001
 def character_handle(seat):
     return seat * CHARACTER_HANDLE_STEP + CHARACTER_HANDLE_BASE
 
-AUTH_PORT = 47611
-GAME_PORT = 27799
+#: 连哪几个端口。默认就是客户端写死的那两个；环境变量 `POPSHOT_AUTH_PORT` /
+#: `POPSHOT_GAME_PORT` 可以改，**专门是为了「不去动用户自己那份正在跑的服务端」**
+#: —— 验证时另起一套端口（例如 47811 / 27999 / 27998）就不会撞车。
+#: 中继端口不用在这里配：它是服务端在 `0x0210` 里现告诉我们的。
+AUTH_PORT = int(os.environ.get("POPSHOT_AUTH_PORT") or 47611)
+GAME_PORT = int(os.environ.get("POPSHOT_GAME_PORT") or 27799)
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -479,6 +483,11 @@ def describe(opcode, payload):
         if opcode == 0x0411 and len(payload) >= 8:
             seat, ok = struct.unpack_from("<ii", payload)
             return f"  ★ 关卡结束 座位={seat} success={ok}"
+        if opcode == 0x0414 and len(payload) >= 8:
+            # gspChangeControllerSlot（§180）：怪 / 刷怪点的模拟权换人。
+            old, new = struct.unpack_from("<ii", payload)
+            return (f"  ★ 控制权交接 座位 {old} -> 座位 {new}"
+                    f"（怪 / 刷怪点改由座位 {new} 那台模拟）")
     except Exception:                      # 解不动就算了，别把收包线程搞死
         pass
     return ""

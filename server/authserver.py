@@ -36,7 +36,7 @@ import protocol as P
 from account_store import (AUTH_BAD_PASSWORD, AUTH_MESSAGES, AUTH_NO_SUCH_USER,
                            AUTH_OK, AccountStore)
 import eventlog
-from netlisten import create_listener
+from netlisten import create_listener, tune_stream
 from tickets import TicketStore, short as short_ticket
 
 for _stream in (sys.stdout, sys.stderr):
@@ -255,6 +255,8 @@ def serve(port, args, service, host="::", ready=None):
         ready.set()
     while True:
         conn, addr = s.accept()
+        # 认证服的包也小、也是一问一答，关 Nagle 只会让登录更快（D104）。
+        tune_stream(conn)
         threading.Thread(target=handle, args=(conn, addr, args, port, service),
                          daemon=True).start()
 
