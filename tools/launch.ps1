@@ -300,7 +300,7 @@ Start-Process -FilePath $loader -WorkingDirectory $Root `
     -RedirectStandardError  (Join-Path $LogDir 'bsloader.err') `
     -WindowStyle Hidden | Out-Null
 
-Say '[客户端] bsloader 已启动，游戏窗口马上出来' 'Green'
+Say '[客户端] bsloader 已启动，游戏登录窗口稍后出来，请耐心等待十几秒......' 'Green'
 Say ''
 Say '--- 登录界面上可以自己选服务器 ---' 'Cyan'
 Say '  「本机服务器」          连本机，一个人玩，存档在本机' 'Cyan'
