@@ -88,6 +88,8 @@ OFF_AXIS_UP = 0x2BC
 OFF_AXIS_RIGHT = 0x2C0
 OFF_AXIS_DOWN = 0x2C4
 OFF_BUSY = 0x5C4                 # [char+0x5c0] 那个容器的 +4；非 0 = 忙
+OFF_GAUGE = 0x2A4                # ★ 判据⑦ 拿它和一个按角色查出来的阈值比（0x515a8c）
+OFF_KIND = 0x2B0                 # 查那个阈值用的角色/类型下标（0x515a5a）
 OFF_DASHING = 0x5D4              # 冲刺还没收尾
 OFF_LAST_DASH = 0x744            # 上一次冲刺的时刻（冷却起点）
 OFF_LAST_TAP_L = 0x748
@@ -130,6 +132,14 @@ def i32(handle, addr):
 def u8(handle, addr):
     raw = read(handle, addr, 1)
     return None if raw is None else raw[0]
+
+
+def f32(handle, addr):
+    raw = read(handle, addr, 4)
+    if raw is None:
+        return None
+    return C.cast(C.pointer(C.c_uint32(int.from_bytes(raw, "little"))),
+                  C.POINTER(C.c_float)).contents.value
 
 
 def game_clock(handle):
@@ -187,6 +197,8 @@ def sample(handle):
         snap["axis"]["左"] = i32(handle, char + OFF_AXIS_LEFT)
         snap["axis"]["右"] = i32(handle, char + OFF_AXIS_RIGHT)
         snap["busy"] = u32(handle, char + OFF_BUSY)
+        snap["gauge"] = f32(handle, char + OFF_GAUGE)
+        snap["kind"] = i32(handle, char + OFF_KIND)
         snap["dashing"] = u8(handle, char + OFF_DASHING)
         snap["last_dash"] = i32(handle, char + OFF_LAST_DASH)
         snap["last_tap_L"] = i32(handle, char + OFF_LAST_TAP_L)
@@ -211,6 +223,10 @@ def gate_report(snap, axis):
                    f"[+0x5d4]={snap.get('dashing')}"))
     checks.append(("⑤状态=0x33", snap["axis"].get(axis) == 0x33,
                    f"轴={STATE_NAMES.get(snap['axis'].get(axis), snap['axis'].get(axis))}"))
+    # ⑦ 只能报数值：阈值要调 0x4716c7(角色下标) 才算得出来，从进程外算不了。
+    # 但只要看「成功那几次 vs 失败那几次」的数值差，阈值自己就浮出来了。
+    if snap.get("gauge") is not None:
+        checks.append(("⑦槽位", True, f"[+0x2a4]={snap['gauge']:.2f}"))
     if now is not None and last_tap is not None:
         gap = now - last_tap if last_tap else None
         checks.append(("⑥250ms内", gap is not None and 0 < gap < DOUBLE_TAP_MS,
@@ -296,8 +312,10 @@ def main():
                 print(f"[{stamp:8.1f}ms]   {label} {was} → {now_value}")
                 if field == "last_dash":
                     dashes += 1
+                    gauge = snap.get("gauge")
                     print(f"[{stamp:8.1f}ms] ★★ 冲刺出招了（第 {dashes} 次）"
-                          f" —— 接下来 {DASH_COOLDOWN_MS} ms 是冷却期，"
+                          + (f"  [+0x2a4]={gauge:.2f}" if gauge is not None else "")
+                          + f" —— 接下来 {DASH_COOLDOWN_MS} ms 是冷却期，"
                           f"期间的点按**全部不记**")
 
         previous = snap

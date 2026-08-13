@@ -85,8 +85,6 @@ function Read-ServerConfig([string]$path) {
         proxy_port           = '1080'
         proxy_username       = ''
         proxy_password       = ''
-        # 双击 A/D 出近身攻击的判定窗口（毫秒）。250 = 原版，见 FINDINGS §183。
-        double_tap_ms        = '500'
     }
     if (-not (Test-Path -LiteralPath $path)) { return $cfg }
     foreach ($line in (Get-Content -LiteralPath $path -Encoding UTF8)) {
@@ -280,7 +278,6 @@ $env:POPSHOT_RELAY_AUTH_PORT   = "$RelayAuth"
 $env:POPSHOT_RELAY_GAME_PORT   = "$RelayGame"
 $env:POPSHOT_RELAY_PEER_PORT   = "$RelayPeer"
 $env:POPSHOT_PEER_RELAY_PORT   = "$PeerRelay"
-$env:POPSHOT_DOUBLE_TAP_MS     = $cfg['double_tap_ms']
 
 # --- 5. 残留客户端 ----------------------------------------------------------
 # 互斥体 BigShot_Assa 决定了同时只能有一个实例，残留的会让新实例秒退，
