@@ -49,6 +49,15 @@ RELAY_PEER_PORT = 27808
 #: 注册网页的默认端口。
 DEFAULT_REGISTER_PORT = 27810
 
+#: 一次成功注册之后，**同一个客户端 IP** 要等多久才能再注册（秒）。
+#: 前台按钮的倒计时和后台的 IP 限制**共用这一个值**（需求明确要求一致）。
+#: `0` = 完全不限制。
+DEFAULT_REGISTER_COOLDOWN_SECONDS = 60
+
+#: 冷却时间的上限。24 小时已经远超「防批量注册」需要的量级，
+#: 再大多半是把毫秒填进来了 —— 与其让整台服务器一天不能注册，不如当填错处理。
+MAX_REGISTER_COOLDOWN_SECONDS = 86400
+
 #: 配置文件名。放在包根目录（= `start.bat` 同目录 = `server/` 的上一级）。
 CONFIG_FILENAME = "server.config"
 
@@ -67,10 +76,15 @@ DEFAULTS = {
     "proxy_port": 1080,
     "proxy_username": "",
     "proxy_password": "",
+    "register_cooldown_seconds": DEFAULT_REGISTER_COOLDOWN_SECONDS,
 }
 
-#: 值要按整数解析的键。
-_INT_KEYS = ("server_register_port", "local_register_port", "proxy_port")
+#: 值要按**端口**解析的键（1~65535）。
+_PORT_KEYS = ("server_register_port", "local_register_port", "proxy_port")
+
+#: 值要按**秒数**解析的键（0 ~ MAX_REGISTER_COOLDOWN_SECONDS，0 = 关闭）。
+#: 和端口分开是因为两者的合法区间不一样：秒数允许 0，端口不允许。
+_SECOND_KEYS = ("register_cooldown_seconds",)
 
 
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +106,20 @@ def _clean_port(value, key, warnings):
         warnings.append(f"{key} 超出 1~65535（{port}），改用默认值 {DEFAULTS[key]}")
         return DEFAULTS[key]
     return port
+
+
+def _clean_seconds(value, key, warnings):
+    """秒数：允许 0（= 关掉这项限制），但不接受负数和离谱的大数。"""
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        warnings.append(f"{key} 不是数字（{value!r}），改用默认值 {DEFAULTS[key]}")
+        return DEFAULTS[key]
+    if not (0 <= seconds <= MAX_REGISTER_COOLDOWN_SECONDS):
+        warnings.append(f"{key} 超出 0~{MAX_REGISTER_COOLDOWN_SECONDS}"
+                        f"（{seconds}），改用默认值 {DEFAULTS[key]}")
+        return DEFAULTS[key]
+    return seconds
 
 
 def parse_text(text: str):
@@ -116,8 +144,10 @@ def parse_text(text: str):
         if key not in DEFAULTS:
             warnings.append(f"第 {lineno} 行是不认识的配置项 {key!r}，已忽略")
             continue
-        if key in _INT_KEYS:
+        if key in _PORT_KEYS:
             values[key] = _clean_port(value, key, warnings)
+        elif key in _SECOND_KEYS:
+            values[key] = _clean_seconds(value, key, warnings)
         else:
             values[key] = value
     values["server_address"] = normalize_host(values["server_address"]) or \
@@ -240,6 +270,19 @@ proxy_password =
 # 端口被别的程序占用时改这里。
 # ---------------------------------------------------------------------------
 local_register_port = 27810
+
+# ---------------------------------------------------------------------------
+# 注册冷却时间（秒）—— 防止有人拿脚本批量注册。
+#
+# 一次注册【成功】之后：
+#   * 注册页上的「注册」按钮会锁住并倒计时这么多秒（刷新页面也一样锁着）；
+#   * 服务器也会记住这个 IP，这段时间里它再来注册一律拒绝。
+# 两边用的是同一个数字，改这里就都改了。
+#
+# 注册【失败】（用户名重复、两次密码不一致等）不算，按钮会立刻恢复可点。
+# 填 0 = 完全不限制。IP 记录只放在内存里，服务端一重启就清空。
+# ---------------------------------------------------------------------------
+register_cooldown_seconds = 20
 
 # ---------------------------------------------------------------------------
 # 说明：

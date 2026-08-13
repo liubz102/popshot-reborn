@@ -74,6 +74,9 @@ def build_arg_parser():
     ap.add_argument("--web-port", type=int, default=None,
                     help="注册页端口。默认读 server.config 的 local_register_port")
     ap.add_argument("--no-web", action="store_true", help="不启动注册页")
+    ap.add_argument("--register-cooldown", type=int, default=None, metavar="秒",
+                    help="一次注册成功后同一个 IP 要等多久才能再注册（0 = 不限）。"
+                         "默认读 server.config 的 register_cooldown_seconds")
     ap.add_argument("--no-control", action="store_true",
                     help="不启动调试控制通道（部署到公网服务器时建议加）")
     ap.add_argument("--no-tcp-relay", action="store_true",
@@ -209,11 +212,16 @@ def main(argv=None):
     if not args.no_web:
         # 延迟 import：注册页是纯标准库的，但没必要在 --no-web 时也加载。
         from web import server as web_server
+        cooldown = (args.register_cooldown if args.register_cooldown is not None
+                    else cfg["register_cooldown_seconds"])
         _start("web", web_server.serve,
                kwargs={"port": web_port, "accounts": accounts,
-                       "host": args.host})
+                       "host": args.host, "cooldown": cooldown})
         log(f"注册页   {describe_listen(args.host, web_port)}"
             f" —— 本机打开 http://127.0.0.1:{web_port}/")
+        log("注册冷却 " + (f"{cooldown} 秒（同一 IP 注册成功后要等这么久；"
+                          f"注册页上的按钮也锁这么久）" if cooldown
+                          else "已关闭（register_cooldown_seconds = 0）"))
     else:
         log("注册页   已关闭（--no-web）")
 

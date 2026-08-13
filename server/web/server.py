@@ -23,11 +23,15 @@
 from __future__ import annotations
 
 import http.server
+import ipaddress
 import json
+import math
 import os
 import socket
 import socketserver
 import sys
+import threading
+import time
 
 if __name__ == "__main__":
     # 直接 `python server/web/server.py` 跑（只调注册页时很方便）时，`server/`
@@ -37,6 +41,7 @@ if __name__ == "__main__":
 
 from account_store import (AUTH_MESSAGES, AUTH_OK, USERNAME_RULE_TEXT,
                            AccountError, AccountStore)
+import config as server_config
 import eventlog
 from netlisten import create_listener
 
@@ -48,12 +53,149 @@ INDEX_PATH = os.path.join(HERE, "index.html")
 MAX_BODY_BYTES = 1 << 20
 
 
-def render_index(server_address):
+def _as_ip(text):
+    """一段文本 -> `ipaddress` 对象；不像 IP 就回 `None`。
+
+    顺手处理三种真实会遇到的写法：`[2001:db8::1]`（带方括号）、
+    `1.2.3.4:5678`（有些代理会带端口）、`::ffff:1.2.3.4`（v4-mapped，
+    必须还原成 IPv4，否则和名单里的 `127.0.0.1` 对不上）。
+    """
+    text = str(text or "").strip()
+    if text.startswith("[") and "]" in text:
+        text = text[1:text.index("]")]
+    elif text.count(":") == 1:              # 只有一个冒号 ⇒ IPv4:port
+        text = text.split(":", 1)[0]
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    return ip.ipv4_mapped or ip if ip.version == 6 else ip
+
+
+def _is_infrastructure(ip):
+    """这个地址是不是「只可能是我们自己那一跳」的地址。
+
+    环回 / 私网（10、172.16-31、192.168）/ 链路本地 / 未指定 —— 这些地址
+    **不可能是从公网直接连过来的客户端**，所以对端是它们时，前面多半真的
+    有一层反向代理（frp / nginx / docker 网桥都落在这几段里）。
+    """
+    return ip is not None and (ip.is_loopback or ip.is_private
+                               or ip.is_link_local or ip.is_unspecified)
+
+
+def resolve_client_ip(peer_addr, headers):
+    """真实客户端 IP -> ``(IP 字符串, 是不是从转发头里取的)``。
+
+    优先级（**不需要任何配置**）：
+
+    1. ``X-Forwarded-For``
+    2. ``X-Real-IP``
+    3. TCP 对端（`self.client_address`，也就是 Node 那边的
+       `connection.remoteAddress` / `socket.remoteAddress`）
+
+    —— 但 1 和 2 **只在 TCP 对端是环回/私网地址时才看**，这一条是整个函数的
+    要害，不能省：
+
+    * `X-Forwarded-For` 是**客户端自己就能写**的普通 HTTP 头。无条件采信它，
+      一行 `curl -H "X-Forwarded-For: 随便一个IP"` 就能每次换一个限流桶，
+      按 IP 的限制直接变成摆设 —— 而这恰恰是它要防的那种脚本。
+    * 但如果对端是 `127.0.0.1` / `192.168.x` 这类地址，那**根本不可能**是
+      从公网直接连过来的人，只可能是我们自己前面那层 frp / nginx / docker。
+      这时候的转发头是那一跳写的，可以信。
+    * 于是：公网直连 ⇒ 只认 TCP 对端（伪造无效）；藏在代理后面 ⇒ 认转发头
+      （拿到真实玩家 IP）。两种部署各自都是对的，**一个配置项都不用填**。
+
+    ⚠ 代价说清楚：服务器**直接**开在局域网里给同一个网段的人玩时，那些人的
+    对端也是私网地址 ⇒ 他们伪造的 `X-Forwarded-For` 会被采信。那是「同一个
+    局域网里的熟人绕过 60 秒冷却」，和这条限制要防的「公网上的批量注册脚本」
+    不是一回事，接受。
+
+    ★ `X-Forwarded-For` 里**从右往左**找第一个公网地址。方向不能反：
+    每一跳代理都是把「它看到的对端」**追加**到链尾（nginx 的
+    `$proxy_add_x_forwarded_for` 就是这么干的），所以链的右边是我们自己人
+    写的、左边才是客户端能塞进去的。从左往右取（最常见的写法）等于直接
+    采信客户端伪造的那一截 —— 客户端只要先塞一个假 IP 进来就赢了。
+    """
+    direct = eventlog.host(peer_addr)
+    if not _is_infrastructure(_as_ip(direct)):
+        return direct, False            # 公网直连：转发头一律不看
+    chain = []
+    for value in headers.get_all("X-Forwarded-For") or ():
+        chain.extend(str(value).split(","))
+    parsed = [ip for ip in (_as_ip(part) for part in chain) if ip is not None]
+    for ip in reversed(parsed):
+        if not _is_infrastructure(ip):
+            return str(ip), True
+    real = _as_ip(headers.get("X-Real-IP"))
+    if real is not None and not _is_infrastructure(real):
+        return str(real), True
+    # 链上全是内网地址（代理漏配了转发头 / 代理和客户端都在内网）。
+    # 有解析出来的就用最左边那个，否则退回 TCP 对端。
+    if parsed:
+        return str(parsed[0]), True
+    return direct, False
+
+
+class RegisterRateLimiter:
+    """按客户端 IP 限制注册频率 —— 防止有人拿脚本批量注册。
+
+    ★ **只在内存里**（用户明确要求不落盘）：一个 `{IP: 解禁时刻}` 的字典，
+    服务端一重启就全清。表只会在 `_prune` 里变小，长期开服不会一直涨。
+
+    ★ **只有注册成功才记一笔。** 重名、两次密码不一致、用户名不合法这些
+    失败**不锁人** —— 打错一个字就要罚等一分钟，会把正常玩家挡在门外，
+    而批量注册的脚本要的是**成功**，锁成功那一侧就够了。
+
+    冷却秒数和前台按钮倒计时是**同一个值**（`server.config` 的
+    `register_cooldown_seconds`），`0` = 关掉这项限制。
+
+    `clock` 只为测试留：默认 `time.monotonic`（不受系统改时间影响）。
+    """
+
+    def __init__(self, cooldown=server_config.DEFAULT_REGISTER_COOLDOWN_SECONDS,
+                 clock=time.monotonic):
+        self.cooldown = max(0, int(cooldown))
+        self._clock = clock
+        self._until = {}
+        self._lock = threading.Lock()
+
+    def retry_after(self, host):
+        """这个 IP 还要等几秒才能再注册。`0` = 现在就可以。"""
+        if self.cooldown <= 0:
+            return 0
+        now = self._clock()
+        with self._lock:
+            self._prune(now)
+            deadline = self._until.get(host)
+        if deadline is None:
+            return 0
+        # 向上取整：还剩 0.2 秒时说「还需 1 秒」，别说「还需 0 秒」却仍然拒绝。
+        return max(0, int(math.ceil(deadline - now)))
+
+    def mark(self, host):
+        """记下「这个 IP 刚成功注册过」，返回它要等的秒数。"""
+        if self.cooldown <= 0:
+            return 0
+        now = self._clock()
+        with self._lock:
+            self._prune(now)
+            self._until[host] = now + self.cooldown
+        return self.cooldown
+
+    def _prune(self, now):
+        """清掉已经到期的条目。**调用方持锁。**"""
+        for key in [k for k, deadline in self._until.items() if deadline <= now]:
+            del self._until[key]
+
+
+def render_index(server_address, cooldown=0):
     with open(INDEX_PATH, "r", encoding="utf-8") as f:
         html = f.read()
     return (html
             .replace("__SERVER_ADDRESS__", _escape(server_address))
-            .replace("__USERNAME_RULE__", _escape(USERNAME_RULE_TEXT)))
+            .replace("__USERNAME_RULE__", _escape(USERNAME_RULE_TEXT))
+            # 页面上的倒计时长度。整数，直接进 JS 字面量，不用转义也转不出花来。
+            .replace("__REGISTER_COOLDOWN__", str(max(0, int(cooldown)))))
 
 
 def _escape(text):
@@ -69,6 +211,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     #: 由 `serve()` 塞进来的共享账号存储。
     accounts: AccountStore = None
+
+    #: 注册频率限制器（按 IP，只在内存里）。同样由 `make_server` 塞进来。
+    limiter: RegisterRateLimiter = None
+
+    # ------------------------------------------------------------ 客户端身份
+    def client_ip(self):
+        """这次请求真正的客户端 IP（挂在 frp / nginx 后面也对）。
+
+        ★ 限流和日志**必须共用这一个** —— 两边口径不一样的话，
+        日志里写着一个 IP、实际按另一个 IP 限流，出问题根本查不动。
+        """
+        return resolve_client_ip(self.client_address, self.headers)[0]
+
+    def client_label(self):
+        """日志用的一段：直连写 `ip:port`，经代理写 `真实IP（经 代理IP）`。"""
+        ip, forwarded = resolve_client_ip(self.client_address, self.headers)
+        if not forwarded:
+            return eventlog.peer(self.client_address)
+        return f"{ip}（经 {eventlog.host(self.client_address)}）"
 
     # -------------------------------------------------------------- 工具
     def _send(self, status, body, content_type="application/json; charset=utf-8"):
@@ -141,7 +302,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             host = self.headers.get("Host") or "localhost"
-            self._send(200, render_index(host),
+            self._send(200, render_index(host, self.limiter.cooldown),
                        "text/html; charset=utf-8")
             return
         if path == "/favicon.ico":
@@ -181,6 +342,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # -------------------------------------------------------------- 接口
     def _api_register(self, data):
+        # ★ 频率限制放在**最前面**：被限住的 IP 连「这个用户名存不存在」
+        #   都不该问得出来，否则限流就成了一个免费的账号枚举接口。
+        client_ip = self.client_ip()
+        wait = self.limiter.retry_after(client_ip)
+        if wait > 0:
+            eventlog.online(f"注册页 ✗ 注册被拦下（同一 IP 刚注册过）"
+                            f" ip={client_ip} 还需 {wait} 秒")
+            self._reply(False,
+                        f"这个 IP 刚注册过账号，请等 {wait} 秒后再试。",
+                        retry_after=wait)
+            return
         username = data.get("username", "")
         password = data.get("password", "")
         password2 = data.get("password2", password)
@@ -191,14 +363,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         account = self.accounts.register(username, password,
                                          skip_tutorial=skip_tutorial)
+        # 只有真的建成了才开始计时（上面那些失败路径都不会走到这里）。
+        cooldown = self.limiter.mark(client_ip)
         self.log_message("注册成功: %s (跳过新手教程=%s)",
                          account["display_name"], skip_tutorial)
         eventlog.online(f"注册页 ✓ 新账号 账号={username!r} "
-                        f"ip={eventlog.peer(self.client_address)} "
-                        f"跳过新手教程={'是' if skip_tutorial else '否'}")
+                        f"ip={self.client_label()} "
+                        f"跳过新手教程={'是' if skip_tutorial else '否'}"
+                        + (f" 该 IP 冷却 {cooldown} 秒" if cooldown else ""))
         tail = ("首次登录会直接进大厅，不再强制新手教程。" if skip_tutorial
                 else "首次登录会先带你走一遍新手教程。")
-        self._reply(True, f"注册成功！现在可以在游戏登录界面用「{username}」登录了。{tail}")
+        self._reply(True,
+                    f"注册成功！现在可以在游戏登录界面用「{username}」登录了。{tail}",
+                    retry_after=cooldown)
 
     def _api_export(self, data):
         username = str(data.get("username", "")).strip()
@@ -216,7 +393,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         username, action = self.accounts.import_account(
             save, data.get("username", ""), data.get("password", ""))
         self.log_message("导入存档: %s (%s)", username, action)
-        eventlog.online(f"注册页 ✓ 上传存档 账号={username!r} ip={eventlog.peer(self.client_address)} 结果={action}")
+        eventlog.online(f"注册页 ✓ 上传存档 账号={username!r} "
+                        f"ip={self.client_label()} 结果={action}")
         # ★ 把服务器上**真正存下来的**数值回给他看一眼。
         #   「提示上传成功、结果服务器上的等级没变」这种事只能靠这个当场发现。
         _name, account = self.accounts.get_account(username)
@@ -255,15 +433,23 @@ class _PreboundHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         pass
 
 
-def make_server(port, accounts, host="::"):
-    """建好 HTTP 服务器但不开始服务，方便测试拿到真实端口。"""
-    handler = type("BoundHandler", (Handler,), {"accounts": accounts})
+def make_server(port, accounts, host="::",
+                cooldown=server_config.DEFAULT_REGISTER_COOLDOWN_SECONDS):
+    """建好 HTTP 服务器但不开始服务，方便测试拿到真实端口。
+
+    `cooldown` = 注册冷却秒数（`server.config` 的 `register_cooldown_seconds`）。
+    默认值就是「开着」—— 漏传参数时应当**多限一点**而不是不限。
+    """
+    handler = type("BoundHandler", (Handler,),
+                   {"accounts": accounts,
+                    "limiter": RegisterRateLimiter(cooldown)})
     return _PreboundHTTPServer(create_listener(host, port), handler)
 
 
-def serve(port, accounts, host="::", ready=None):
+def serve(port, accounts, host="::", ready=None,
+          cooldown=server_config.DEFAULT_REGISTER_COOLDOWN_SECONDS):
     """阻塞地提供注册页服务。`app.py` 会把它丢进一个线程。"""
-    httpd = make_server(port, accounts, host)
+    httpd = make_server(port, accounts, host, cooldown)
     if ready is not None:
         ready.set()
     httpd.serve_forever()
@@ -282,9 +468,16 @@ def main():
     ap.add_argument("--port", type=int, default=27810)
     ap.add_argument("--host", default="::")
     ap.add_argument("--accounts", default=None)
+    ap.add_argument("--register-cooldown", type=int, default=None,
+                    help="注册冷却秒数。默认读 server.config 的 "
+                         "register_cooldown_seconds；0 = 不限制")
     args = ap.parse_args()
-    print(f"注册页 http://127.0.0.1:{args.port}/", flush=True)
-    serve(args.port, AccountStore(args.accounts), args.host)
+    cooldown = args.register_cooldown
+    if cooldown is None:
+        cooldown = server_config.load()[0]["register_cooldown_seconds"]
+    note = f"注册冷却 {cooldown} 秒" if cooldown else "注册冷却已关闭"
+    print(f"注册页 http://127.0.0.1:{args.port}/（{note}）", flush=True)
+    serve(args.port, AccountStore(args.accounts), args.host, cooldown=cooldown)
 
 
 if __name__ == "__main__":

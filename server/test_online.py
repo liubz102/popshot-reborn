@@ -5,6 +5,7 @@
 单机时代那套「认证服写 active_account、游戏服读它」的做法在多账号下直接失效，
 所以这一组测试盯的都是**身份不会串**这件事。
 """
+import email.message
 import json
 import os
 import socket
@@ -71,6 +72,29 @@ class ConfigTests(unittest.TestCase):
         values, _ = server_config.parse_text("server_register_port = 99999")
         self.assertEqual(server_config.DEFAULT_REGISTER_PORT,
                          values["server_register_port"])
+
+    def test_register_cooldown_parses(self):
+        values, warnings = server_config.parse_text(
+            "register_cooldown_seconds = 90")
+        self.assertEqual(90, values["register_cooldown_seconds"])
+        self.assertEqual([], warnings)
+
+    def test_register_cooldown_accepts_zero(self):
+        # ★ 秒数和端口的合法区间不一样：0 在这里是「关掉限制」，不是错值。
+        values, warnings = server_config.parse_text(
+            "register_cooldown_seconds = 0")
+        self.assertEqual(0, values["register_cooldown_seconds"])
+        self.assertEqual([], warnings)
+
+    def test_a_bad_register_cooldown_falls_back_to_the_default(self):
+        for text in ("register_cooldown_seconds = -1",
+                     "register_cooldown_seconds = 一分钟",
+                     "register_cooldown_seconds = 999999"):
+            values, warnings = server_config.parse_text(text)
+            self.assertEqual(
+                server_config.DEFAULT_REGISTER_COOLDOWN_SECONDS,
+                values["register_cooldown_seconds"], text)
+            self.assertEqual(1, len(warnings), text)
 
     def test_register_url_brackets_ipv6_only(self):
         self.assertEqual("http://127.0.0.1:27810/",
@@ -526,7 +550,11 @@ class RegisterWebTests(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.accounts = AccountStore(os.path.join(cls.tmp.name, "accounts.json"))
-        cls.httpd = web_server.make_server(0, cls.accounts, "127.0.0.1")
+        # ★ 这一组用例要连着注册好几个账号，而它们全部来自 127.0.0.1 ——
+        #   冷却开着的话第二个用例起就会被自己的限流挡住。限流本身由下面
+        #   `RegisterCooldownTests` 单独验，这里 0 = 关掉。
+        cls.httpd = web_server.make_server(0, cls.accounts, "127.0.0.1",
+                                           cooldown=0)
         cls.port = cls.httpd.server_address[1]
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
@@ -698,6 +726,290 @@ class RegisterWebTests(unittest.TestCase):
                           {"username": self.who, "password": "pw",
                            "password2": "pw"})
         self.assertTrue(reply["ok"], reply)
+
+
+class RegisterRateLimiterTests(unittest.TestCase):
+    """按 IP 的注册限流本身（不走 HTTP，时钟是假的，跑得快也不会 flaky）。"""
+
+    def setUp(self):
+        self.now = 1000.0
+        self.limiter = web_server.RegisterRateLimiter(
+            60, clock=lambda: self.now)
+
+    def test_a_fresh_ip_is_never_blocked(self):
+        self.assertEqual(0, self.limiter.retry_after("1.2.3.4"))
+
+    def test_a_successful_registration_locks_that_ip(self):
+        self.assertEqual(60, self.limiter.mark("1.2.3.4"))
+        self.assertEqual(60, self.limiter.retry_after("1.2.3.4"))
+
+    def test_other_ips_are_untouched(self):
+        # 一个人注册完，不能把整台服务器锁上一分钟。
+        self.limiter.mark("1.2.3.4")
+        self.assertEqual(0, self.limiter.retry_after("5.6.7.8"))
+
+    def test_the_remaining_time_counts_down_and_rounds_up(self):
+        self.limiter.mark("1.2.3.4")
+        self.now += 30
+        self.assertEqual(30, self.limiter.retry_after("1.2.3.4"))
+        # 还剩 0.5 秒时要说「还需 1 秒」——「还需 0 秒」却仍然拒绝最气人。
+        self.now += 29.5
+        self.assertEqual(1, self.limiter.retry_after("1.2.3.4"))
+
+    def test_the_lock_expires_and_the_entry_is_pruned(self):
+        self.limiter.mark("1.2.3.4")
+        self.now += 60
+        self.assertEqual(0, self.limiter.retry_after("1.2.3.4"))
+        # 表必须真的变小 —— 只放内存不落盘（用户要求），长期开服不能一直涨。
+        self.assertEqual({}, self.limiter._until)
+
+    def test_marking_again_restarts_the_clock(self):
+        self.limiter.mark("1.2.3.4")
+        self.now += 59
+        self.limiter.mark("1.2.3.4")
+        self.assertEqual(60, self.limiter.retry_after("1.2.3.4"))
+
+    def test_zero_turns_the_whole_thing_off(self):
+        off = web_server.RegisterRateLimiter(0, clock=lambda: self.now)
+        self.assertEqual(0, off.mark("1.2.3.4"))
+        self.assertEqual(0, off.retry_after("1.2.3.4"))
+        self.assertEqual({}, off._until)
+
+    def test_v4_mapped_and_plain_ipv4_are_the_same_client(self):
+        # `::` 双栈监听下 IPv4 客户端的 peer 是 `::ffff:1.2.3.4`（D063）。
+        # 两种写法必须收敛成同一个键，否则限流会被写法差异漏掉。
+        self.assertEqual("1.2.3.4", eventlog.host(("::ffff:1.2.3.4", 5000)))
+        self.assertEqual("1.2.3.4", eventlog.host(("1.2.3.4", 5000)))
+        self.assertEqual("2001:db8::1", eventlog.host(("2001:db8::1", 5000)))
+
+
+class ClientIpBehindProxyTests(unittest.TestCase):
+    """挂在 frp / nginx / CDN 后面时，限流看的到底是谁的 IP。
+
+    ★ 这一组的每一条都在防同一个坑：`client_address` 是**上一跳**的地址。
+    反向代理后面它永远是代理自己 ⇒ 全服玩家被算成同一个 IP ⇒ 限制从
+    「每人 60 秒一个号」变成「整台服务器 60 秒一个号」。
+    """
+
+    @staticmethod
+    def headers(**fields):
+        message = email.message.Message()
+        for name, value in fields.items():
+            message[name.replace("_", "-")] = value
+        return message
+
+    #: ⚠ **这一组不能用 203.0.113.x / 198.51.100.x / 192.0.2.x 当「公网地址」。**
+    #: 那三段是 RFC 文档示例段，而 Python 的 `ipaddress` 把它们算成
+    #: `is_private == True` —— 拿它们当公网客户端写用例，测的就全是反的
+    #: （踩过：五条用例一起红）。所以这里用真正会被路由的地址。
+    PUBLIC_A = "9.9.9.9"
+    PUBLIC_B = "8.8.4.4"
+
+    def resolve(self, peer, **headers):
+        return web_server.resolve_client_ip((peer, 12345),
+                                            self.headers(**headers))
+
+    # -- 公网直连：转发头一律不看 --------------------------------------------
+    def test_a_public_peer_cannot_forge_its_ip(self):
+        # ★ 这条是整个设计的要害。X-Forwarded-For 是客户端自己就能写的普通头，
+        #   无条件采信 = `curl -H "X-Forwarded-For: 随便一个IP"` 每次换一个桶
+        #   = 按 IP 的限制彻底变成摆设。公网对端 ⇒ 只认 TCP 对端。
+        ip, forwarded = self.resolve(self.PUBLIC_A,
+                                     X_Forwarded_For=self.PUBLIC_B)
+        self.assertEqual(self.PUBLIC_A, ip)
+        self.assertFalse(forwarded)
+
+    def test_a_public_peer_cannot_forge_via_x_real_ip_either(self):
+        ip, forwarded = self.resolve(self.PUBLIC_A, X_Real_IP=self.PUBLIC_B)
+        self.assertEqual(self.PUBLIC_A, ip)
+        self.assertFalse(forwarded)
+
+    # -- 藏在 frp / nginx 后面：认转发头 --------------------------------------
+    def test_a_loopback_peer_means_a_local_reverse_proxy(self):
+        ip, forwarded = self.resolve("127.0.0.1",
+                                     X_Forwarded_For=self.PUBLIC_A)
+        self.assertEqual(self.PUBLIC_A, ip)
+        self.assertTrue(forwarded)
+
+    def test_a_lan_or_docker_peer_counts_as_a_proxy_too(self):
+        for peer in ("192.168.1.2", "10.0.0.5", "172.17.0.1"):
+            ip, forwarded = self.resolve(peer, X_Forwarded_For=self.PUBLIC_A)
+            self.assertEqual(self.PUBLIC_A, ip, peer)
+            self.assertTrue(forwarded, peer)
+
+    def test_the_chain_is_walked_from_the_right(self):
+        # ★ 方向不能反：每一跳代理都是把「它看到的对端」**追加**到链尾
+        #   （nginx 的 $proxy_add_x_forwarded_for 就是这么干的）。
+        #   客户端自己先塞一个假 IP 进来，从左往右取就会把它当成真实 IP。
+        ip, _ = self.resolve(
+            "127.0.0.1", X_Forwarded_For=f"{self.PUBLIC_B}, {self.PUBLIC_A}")
+        self.assertEqual(self.PUBLIC_A, ip)
+
+    def test_internal_hops_in_the_chain_are_skipped(self):
+        # 链路里夹着内网地址时，要的是最右边那个**公网**地址。
+        ip, _ = self.resolve("127.0.0.1",
+                             X_Forwarded_For=f"{self.PUBLIC_A}, 192.168.1.2")
+        self.assertEqual(self.PUBLIC_A, ip)
+
+    def test_multiple_forwarded_for_headers_are_concatenated(self):
+        # 有些代理会发多个同名头，而不是拼进一个。两种都要认。
+        message = email.message.Message()
+        message["X-Forwarded-For"] = self.PUBLIC_B
+        message["X-Forwarded-For"] = self.PUBLIC_A
+        ip, _ = web_server.resolve_client_ip(("127.0.0.1", 12345), message)
+        self.assertEqual(self.PUBLIC_A, ip)
+
+    def test_x_real_ip_is_the_fallback_when_forwarded_for_is_absent(self):
+        ip, forwarded = self.resolve("127.0.0.1", X_Real_IP=self.PUBLIC_A)
+        self.assertEqual(self.PUBLIC_A, ip)
+        self.assertTrue(forwarded)
+
+    def test_forwarded_for_wins_over_x_real_ip(self):
+        ip, _ = self.resolve("127.0.0.1", X_Forwarded_For=self.PUBLIC_A,
+                             X_Real_IP=self.PUBLIC_B)
+        self.assertEqual(self.PUBLIC_A, ip)
+
+    def test_a_proxy_that_forgets_the_headers_falls_back_to_the_peer(self):
+        ip, forwarded = self.resolve("127.0.0.1")
+        self.assertEqual("127.0.0.1", ip)
+        self.assertFalse(forwarded)
+
+    def test_an_all_internal_chain_still_separates_lan_clients(self):
+        # 纯内网部署（代理和玩家都在局域网里）：没有公网地址可挑，
+        # 取最左边那个 —— 至少还能把不同的内网玩家分开。
+        ip, forwarded = self.resolve("127.0.0.1",
+                                     X_Forwarded_For="192.168.1.50")
+        self.assertEqual("192.168.1.50", ip)
+        self.assertTrue(forwarded)
+
+    def test_garbage_in_the_header_is_skipped(self):
+        ip, _ = self.resolve(
+            "127.0.0.1", X_Forwarded_For=f"unknown, {self.PUBLIC_A}, bogus")
+        self.assertEqual(self.PUBLIC_A, ip)
+
+    # -- 写法上的坑 ----------------------------------------------------------
+    def test_a_v4_mapped_peer_is_recognised_as_loopback(self):
+        # `::` 双栈监听下本机代理来的连接是 `::ffff:127.0.0.1`（D063）。
+        # 不还原成 IPv4 的话 `is_loopback` 判不出来，代理场景会静默失效。
+        ip, forwarded = self.resolve("::ffff:127.0.0.1",
+                                     X_Forwarded_For=self.PUBLIC_A)
+        self.assertEqual(self.PUBLIC_A, ip)
+        self.assertTrue(forwarded)
+
+    def test_brackets_and_ports_in_the_header_are_tolerated(self):
+        self.assertEqual(
+            "2001:4860:4860::8888",
+            self.resolve("127.0.0.1",
+                         X_Forwarded_For="[2001:4860:4860::8888]")[0])
+        self.assertEqual(
+            self.PUBLIC_A,
+            self.resolve("127.0.0.1",
+                         X_Forwarded_For=f"{self.PUBLIC_A}:44321")[0])
+
+    def test_the_config_has_no_proxy_knob(self):
+        # 用户明确要求：不要为这件事增加配置项。
+        self.assertNotIn("register_trusted_proxies", server_config.DEFAULTS)
+
+
+class RegisterCooldownTests(unittest.TestCase):
+    """注册冷却走真的 HTTP：一次成功之后同一个 IP 要被挡住。
+
+    冷却设成很大的数（而不是 sleep 等它过期）——「过期之后又能注册了」
+    由上面那组用例用假时钟验，这里只验「拦得住 / 拦对了谁」。
+    """
+
+    COOLDOWN = 3600
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.accounts = AccountStore(os.path.join(cls.tmp.name, "accounts.json"))
+        cls.httpd = web_server.make_server(0, cls.accounts, "127.0.0.1",
+                                           cooldown=cls.COOLDOWN)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        # 每个用例从干净的限流表开始 —— 类级别只建一次服务器。
+        self.httpd.RequestHandlerClass.limiter = \
+            web_server.RegisterRateLimiter(self.COOLDOWN)
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def post(self, path, payload):
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            self.url(path), data=body,
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def register(self, who, **extra):
+        return self.post("/api/register",
+                         dict(username=who, password="pw", password2="pw",
+                              **extra))
+
+    def test_the_second_registration_from_the_same_ip_is_refused(self):
+        first = self.register("cool1")
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(self.COOLDOWN, first["retry_after"])
+
+        second = self.register("cool2")
+        self.assertFalse(second["ok"], second)
+        self.assertIn("秒后再试", second["message"])
+        self.assertGreater(second["retry_after"], 0)
+        # ★ 真的没建号 —— 只回一句话但账号还是进去了，等于没限。
+        self.assertFalse(self.accounts.has_account("cool2"))
+
+    def test_a_blocked_ip_cannot_probe_whether_a_username_exists(self):
+        # 限流必须排在**所有**业务判断之前，否则它就成了免费的账号枚举接口：
+        # 「重名」和「频率超限」两种回话不一样，一个个试就能问出谁注册过。
+        self.assertTrue(self.register("cool3")["ok"])
+        blocked = self.register("cool3")          # 同一个名字，本该回「已存在」
+        self.assertFalse(blocked["ok"])
+        self.assertIn("秒后再试", blocked["message"])
+        self.assertNotIn("已存在", blocked["message"])
+
+    def test_a_failed_registration_does_not_start_the_cooldown(self):
+        # 打错一个字就罚等一分钟，会把正常玩家挡在门外。
+        bad = self.post("/api/register",
+                        {"username": "cool4", "password": "pw",
+                         "password2": "typo"})
+        self.assertFalse(bad["ok"])
+        self.assertNotIn("retry_after", bad)
+        good = self.register("cool4")
+        self.assertTrue(good["ok"], good)
+
+    def test_a_duplicate_name_does_not_start_the_cooldown_either(self):
+        limiter = self.httpd.RequestHandlerClass.limiter
+        self.accounts.register("taken", "pw")
+        dup = self.register("taken")
+        self.assertFalse(dup["ok"])
+        self.assertEqual(0, limiter.retry_after("127.0.0.1"))
+
+    def test_the_cooldown_only_covers_registration(self):
+        # 存档导出 / 上传不该被注册的冷却连坐。
+        self.assertTrue(self.register("cool5")["ok"])
+        export = self.post("/api/export", {"username": "cool5",
+                                           "password": "pw"})
+        self.assertTrue(export["ok"], export)
+
+    def test_the_page_carries_the_configured_cooldown(self):
+        with urllib.request.urlopen(self.url("/"), timeout=10) as response:
+            html = response.read().decode("utf-8")
+        # 占位符必须被替换掉，否则前台 parseInt 拿到 NaN、倒计时静默失效。
+        self.assertNotIn("__REGISTER_COOLDOWN__", html)
+        self.assertIn(f'parseInt("{self.COOLDOWN}", 10)', html)
+        self.assertIn("popshot.register.unlockAt", html)
 
 
 class RelayTests(unittest.TestCase):

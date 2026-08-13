@@ -81,22 +81,31 @@ def online(msg):
                 pass
 
 
-def peer(addr):
-    """`socket` 的 `addr` 元组 -> 人看的 ``ip:port``。
+def host(addr):
+    """`socket` 的 `addr` 元组 -> 裸 IP（不带端口、不带方括号）。
 
     `::` 双栈监听收到 IPv4 连接时，`getpeername` 给的是
-    ``::ffff:192.168.11.79`` 这种 v4-mapped 形式（D063）。日志里直接写
-    ``192.168.11.79`` —— 玩家报 IP 时说的就是这个，前缀留着只会对不上。
+    ``::ffff:192.168.11.79`` 这种 v4-mapped 形式（D063）。这里一律剥成
+    ``192.168.11.79`` —— 同一台机器**必须**收敛成同一个键，
+    否则「按 IP 限流」会因为写法不同而漏掉（注册页限流用的就是这个）。
     """
     if not addr:
         return "?"
-    host = str(addr[0])
-    if host.lower().startswith("::ffff:") and "." in host:
-        host = host[len("::ffff:"):]
+    value = str(addr[0])
+    if value.lower().startswith("::ffff:") and "." in value:
+        value = value[len("::ffff:"):]
+    return value
+
+
+def peer(addr):
+    """`socket` 的 `addr` 元组 -> 人看的 ``ip:port``。"""
+    if not addr:
+        return "?"
+    text = host(addr)
     port = addr[1] if len(addr) > 1 else None
-    if ":" in host:                       # 真 IPv6：加方括号才分得清端口
-        host = f"[{host}]"
-    return f"{host}:{port}" if port is not None else host
+    if ":" in text:                       # 真 IPv6：加方括号才分得清端口
+        text = f"[{text}]"
+    return f"{text}:{port}" if port is not None else text
 
 
 def duration(seconds):

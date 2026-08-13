@@ -3021,7 +3021,12 @@ class Conn:
         # SimpleCipher 是逐字节推进的流密码：两个线程交错加密会让整条流错位，
         # 客户端从此再也解不回来。控制通道存在之后这不再是理论风险。
         with self.send_lock:
-            self.vlog(f"→ 发出 {len(plain)} 字节明文\n{hexdump(plain)}")
+            # ★ 这个 `if` 不是多余的：`vlog` 自己也判 VERBOSE，但 f-string 和
+            #   `hexdump()` 是**在调用之前**就求值的，非 verbose 时白算再丢掉。
+            #   实测 53 字节的包要 18.4 µs，而战斗中每份同步数据都要走这里
+            #   （§187）。延迟上不值一提，但白烧的 CPU 没有理由留着。
+            if VERBOSE:
+                self.vlog(f"→ 发出 {len(plain)} 字节明文\n{hexdump(plain)}")
             if self.send_queue is not None:
                 self.send_queue.append(plain)
                 return
@@ -5037,16 +5042,19 @@ class Conn:
                      + (f"\n{hexdump(payload)}" if VERBOSE else
                         "（高频包，后续同号静音；--verbose 可全记）" if noisy else ""))
         self.noisy_seen.add(opcode)
-        # 试着按 "string + int32*" 解一下（gcpReqLogin 0x0100 就是这个形状）
-        try:
-            r = Reader(payload)
-            s = r.wstr()
-            ints = []
-            while r.left() >= 4:
-                ints.append(r.i32())
-            self.vlog(f"   试解: str={s!r} ints={ints} 剩余={r.left()}")
-        except Exception as e:
-            self.vlog(f"   试解失败: {e}")
+        # 试着按 "string + int32*" 解一下（gcpReqLogin 0x0100 就是这个形状）。
+        # ★ 整段夹在 VERBOSE 里：这个试解**只为日志**，非 verbose 时结果直接丢掉，
+        #   而战斗中每发 0x040e 都会走到这里（而且每次都以抛异常收场，§187）。
+        if VERBOSE:
+            try:
+                r = Reader(payload)
+                s = r.wstr()
+                ints = []
+                while r.left() >= 4:
+                    ints.append(r.i32())
+                self.vlog(f"   试解: str={s!r} ints={ints} 剩余={r.left()}")
+            except Exception as e:
+                self.vlog(f"   试解失败: {e}")
 
         if self.args.hold_lobby:
             self.log("   [hold-lobby] 不回应答")

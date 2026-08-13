@@ -120,6 +120,7 @@
       <div class="hint">勾上就直接进大厅；取消勾选则和原版一样，首次登录先走一遍新手教学关。注册后仍可在「存档转移助手」里改 <code>tutorial_completed</code> 重新开关。</div>
 
       <button type="submit" id="regBtn">注册</button>
+      <div class="hint" id="regCooldownHint"></div>
       <div class="msg" id="regMsg"></div>
     </form>
   </div>
@@ -187,21 +188,102 @@ function post(path, body) {
   });
 }
 
+/* ---------------------------------------------------------------------------
+ * 注册按钮的冷却
+ *
+ * 服务端把 server.config 里的 register_cooldown_seconds 直接渲染进下面这个数。
+ * 规则（和后台的 IP 限制用的是同一个秒数）：
+ *   点「注册」          -> 立刻锁住，等服务器回话
+ *   服务器说失败        -> 马上解锁（打错一个字不该罚等）
+ *   服务器说成功        -> 继续锁住并倒计时，到点自动解锁
+ *   刷新页面           -> 锁定状态从 localStorage 里读回来，接着倒计时
+ *
+ * ★ 这里只是「不让人手滑连点」，真正拦批量注册的是服务端那份按 IP 的限制 ——
+ *   浏览器里的任何东西都是能被绕开的。
+ * ------------------------------------------------------------------------- */
+var REG_COOLDOWN = parseInt("__REGISTER_COOLDOWN__", 10) || 0;
+var REG_LOCK_KEY = "popshot.register.unlockAt";   /* localStorage 天然按站点隔离 */
+var regBtn = document.getElementById("regBtn");
+var regHint = document.getElementById("regCooldownHint");
+var regLabel = regBtn.textContent;
+var regTimer = null;
+
+/* localStorage 在无痕模式 / 禁用 Cookie 时会直接抛异常，别让它带崩整个页面。 */
+function lockRead() {
+  try { return parseInt(window.localStorage.getItem(REG_LOCK_KEY), 10) || 0; }
+  catch (e) { return 0; }
+}
+function lockWrite(at) {
+  try {
+    if (at) { window.localStorage.setItem(REG_LOCK_KEY, String(at)); }
+    else { window.localStorage.removeItem(REG_LOCK_KEY); }
+  } catch (e) { /* 存不下就只锁这一次页面浏览，功能照常 */ }
+}
+
+function regSetBusy(text) {
+  regBtn.disabled = true;
+  regBtn.textContent = text;
+  regHint.textContent = "";
+}
+
+function regUnlock() {
+  if (regTimer) { clearInterval(regTimer); regTimer = null; }
+  lockWrite(0);
+  regBtn.disabled = false;
+  regBtn.textContent = regLabel;
+  regHint.textContent = "";
+}
+
+function regTick() {
+  var left = Math.ceil((lockRead() - Date.now()) / 1000);
+  if (!(left > 0)) { regUnlock(); return; }
+  regBtn.disabled = true;
+  regBtn.textContent = regLabel + "（还需 " + left + " 秒）";
+  regHint.textContent = "为防止批量注册，同一个 IP 注册成功后要等 "
+    + REG_COOLDOWN + " 秒才能再注册。";
+}
+
+/* seconds 由服务器给：注册成功时是完整冷却，被后台拦下时是「还剩多少」。 */
+function regArm(seconds) {
+  if (!(seconds > 0)) { regUnlock(); return; }
+  lockWrite(Date.now() + seconds * 1000);
+  if (regTimer) { clearInterval(regTimer); }
+  regTimer = setInterval(regTick, 250);
+  regTick();
+}
+
+/* 进页面时先把上次留下的锁读回来。★ 必须夹一次上限：配置调小了、或者
+   系统时间被往后拨过，存着的解禁时刻可能远在天边，那就永远解不开了。 */
+(function restoreRegLock() {
+  if (REG_COOLDOWN <= 0) { lockWrite(0); return; }   /* 配置关掉了就别再锁着 */
+  var left = Math.ceil((lockRead() - Date.now()) / 1000);
+  if (left > 0) { regArm(Math.min(left, REG_COOLDOWN)); }
+  else { lockWrite(0); }
+})();
+
 document.getElementById("reg").addEventListener("submit", function (event) {
   event.preventDefault();
+  /* 按钮 disabled 挡不住在输入框里敲回车提交，所以这里再挡一次。 */
+  if (regBtn.disabled) { return; }
   var username = document.getElementById("u").value.trim();
   var p1 = document.getElementById("p1").value;
   var p2 = document.getElementById("p2").value;
   if (p1 !== p2) { show("regMsg", "两次输入的密码不一致，请重新输入。", false); return; }
-  var button = document.getElementById("regBtn");
-  button.disabled = true;
+  regSetBusy("注册中…");
   post("/api/register", {
     username: username, password: p1, password2: p2,
     skip_tutorial: document.getElementById("skipTut").checked
   })
-    .then(function (r) { show("regMsg", r.data.message, r.data.ok); })
-    .catch(function () { show("regMsg", "连不上服务器，请确认服务端还在运行。", false); })
-    .then(function () { button.disabled = false; });
+    .then(function (r) {
+      show("regMsg", r.data.message, r.data.ok);
+      /* 成功 -> 服务器回完整冷却；被 IP 限制拦下 -> 回还剩多少秒；
+         其余失败 -> 没有这个字段，立刻解锁。 */
+      regArm(Number(r.data.retry_after) || 0);
+    })
+    .catch(function () {
+      show("regMsg", "连不上服务器，请确认服务端还在运行。", false);
+      regUnlock();
+    });
 });
 
 var mask = document.getElementById("mask");
