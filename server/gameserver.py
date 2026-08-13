@@ -44,6 +44,7 @@ import argparse
 import contextlib
 import datetime
 import os
+import random
 import socket
 import struct
 import sys
@@ -62,6 +63,7 @@ from account_store import (AccountStore, BASE_CHARACTER_IDS,
                            quest_difficulty_records, quest_unlock_all,
                            tutorial_state)
 import eventlog
+import lobby as lobby_module
 # ★ `SESSION_STATUS_WAITING` 不从 lobby 导入：本模块下面有一份带完整考据的
 #   同名常量（V0.1 §102），两处值必须一样，import 进来只会让人以为它只有一处定义。
 from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
@@ -70,7 +72,7 @@ from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
                    MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_OK,
                    TEAM_A, TEAM_B, TEAM_NONE, TEAM_LAYOUT_COOP,
                    TEAM_LAYOUT_FREE, TEAM_LAYOUT_TEAMS, default_team,
-                   team_layout_of)
+                   item_mode_of, team_layout_of)
 from netlisten import create_listener, describe as describe_listen, tune_stream
 import relayserver
 from tickets import TicketStore, short as short_ticket
@@ -774,6 +776,28 @@ def build_session_descriptor(session_type, arguments):
             f"session descriptor type {session_type} needs {expected} "
             f"arguments, got {len(arguments)}")
     return w_i32(session_type) + b"".join(w_i32(value) for value in arguments)
+
+
+def describe_room_arguments(session_type, arguments):
+    """把房间描述符的参数翻成人话，只给日志用（§190）。
+
+    `type == 1` 的三个参数分别是 `(组队, 游戏模式, 道具模式)`，客户端的三个
+    取值器 `0x409df1` / `0x409e0a` / `0x409dd9` 读的就是它们。
+
+    ★ 玩家报「道具模式下地图里找不到道具」时，第一件要看的事就是这一行里的
+      `道具模式=是` 到底有没有出现 —— 没有就说明房间压根没进道具模式，
+      和服务端刷不刷道具无关。
+    """
+    arguments = tuple(arguments)
+    if int(session_type) != lobby_module.SESSION_TYPE_NORMAL:
+        return ""
+    parts = []
+    if arguments:
+        parts.append("组队战" if int(arguments[0]) == 1 else "个人战")
+    if len(arguments) > 1:
+        parts.append(f"游戏模式={arguments[1]}")
+    parts.append("道具模式=" + ("是" if item_mode_of(session_type, arguments) else "否"))
+    return "[" + " ".join(parts) + "]"
 
 
 #: `Session+0x04` = 房间状态。**2 = 待机中**，其余值一律是「游戏中」。
@@ -1761,7 +1785,63 @@ ITEM_NAMES = {
     10202: "WaterCannonItem 水炮",
     10300: "ShieldItem 护盾",
     10301: "SpeedUpItem 加速",
+    10302: "SpUpItem SP 上升",
+    10303: "ReflectItem 反射",
+    10304: "SizeDownItem 迷你",
+    10306: "TripleShotItem 三连射",
+    10307: "PowerShotItem 强力射击",
+    10308: "HpChargeItem HP 回复剂",
+    10309: "SpChargeItem SP 回复剂",
+    10310: "FreezerItem 冰冻",
+    10311: "HudDevilItem 幽灵",
+    10312: "CloakingItem 隐身",
+    10313: "TeamHpChargeItem 全队 HP 回复剂",
+    10314: "TeamReflectItem 全队反射",
+    10400: "SlowMineItem 胶水",
+    10401: "SmokeItem 烟雾弹",
+    10500: "BulletPoisonItem 毒",
+    10603: "SlowMineObject 减速地雷",
 }
+
+#: ★ **道具模式下服务端往地图上刷的道具**（§191）。
+#:
+#: 这 17 个类的构造函数都 push `Game/ItemBox`，所以玩家看到的都是一个箱子；
+#: 捡起来进角色的 4 个道具槽（`[Character+0x764..0x770]`），按 Ctrl 使用。
+#:
+#: ⚠ **10305（FastShot）不在里面**：`Item.ini` 有这一条，但工厂 `0x513278`
+#: 的跳表 `0x513b56` 里 10305 那一格指的是 default 分支（§191）——
+#: 发下去客户端建不出对象，绝对不要加回来。
+#: ⚠ 10000 `ItemBox` / 10001 `LuckBag` / 10100~10202 是**闯关**的掉落物，
+#: 不是 PvP 道具，别混进来。
+PVP_ITEM_IDS = (10300, 10301, 10302, 10303, 10304, 10306, 10307, 10308,
+                10309, 10310, 10311, 10312, 10400, 10401, 10500)
+
+#: 只在组队模式下刷的两件（效果作用于「全队」，个人战里等于只对自己生效，
+#: 摆出来只会让人以为捡错了）。
+PVP_TEAM_ITEM_IDS = (10313, 10314)
+
+#: 开局之后多久刷第一件、之后每隔多久刷一件、地图上最多同时躺几件。
+#:
+#: ★ **原版的数值已经无从考证**（服务端 15 年前就没了），这三个是我们定的
+#: （D109）。想调就在这里改，改完**必须重启服务端**（铁律 7）。
+ITEM_SPAWN_FIRST_DELAY = 5.0
+ITEM_SPAWN_INTERVAL = 10.0
+ITEM_SPAWN_MAX_ALIVE = 8
+
+#: 刷新点的坐标范围。**服务端不需要知道地图几何**（§192）：客户端收到
+#: `0x0404` 会先 `fmod` 进地图（`X % World.width` / `Y % World.height`），
+#: 再把埋在地形里的物件以 5 像素为步长顶到 300 像素内的空位上。
+#: 所以这里给的是「比任何一张图都大的一个范围」，取模之后自然铺满整张图：
+#: 实测最宽的图 11400、最高的 2048。
+#: Y 取靠下的一段（Y 向下增大，§192）—— 落在地形里正好被顶到地面上，
+#: 悬在半空的概率小得多。
+ITEM_SPAWN_X_RANGE = (0.0, 11400.0)
+ITEM_SPAWN_Y_RANGE = (0.0, 2048.0)
+
+#: `0x0404` 后三个字段：客户端自己掉东西时发的就是 `3, -1, -1`
+#: （`+0x18 == 1` 才走「宠物捡到」的特效分支，`+0x1c` 是配套的座位号）。
+#: 服务端刷的道具照抄这一组，客户端那条路径就和原版掉落完全一致。
+ITEM_SPAWN_TAIL = (3, -1, -1)
 
 #: `gcpCreateItem`(0x0406，客户端 -> 服务端) 的线格式，序列化 `0x48c84f`。
 #: 8 个字段紧凑排列 = 32 字节。
@@ -2335,6 +2415,9 @@ class RoomQuest:
         self.next_item_handle = int(item_handle_base)
         #: 已经被谁捡走的掉落物句柄 -> 座位号。仲裁靠它。
         self.items_taken = {}
+        #: ★ **道具模式**：服务端刷在地图上、还没被人捡走的道具句柄（§191）。
+        #: 只用来卡「地图上最多同时躺几件」，捡走了就从这里去掉。
+        self.items_on_map = set()
         #: 已经广播过的死亡事件，键是 **(句柄, 客户端报的死亡次数)**（去重）。
         #: 为什么键里要带死亡次数：同一个角色会死很多次，只按句柄去重的话
         #: 第二次死就被吃掉了。而重复上报（两台机器同时判同一只怪死了）
@@ -2359,6 +2442,8 @@ class RoomQuest:
         self.maps_entered = []
         #: 本局开打的时刻（`time.monotonic()`）。对战的时间上限从这里算（§167）。
         self.started_at = time.monotonic()
+        #: 下一次该往地图上刷道具的时刻（道具模式才用，见 `due_item_spawn`）。
+        self.next_item_spawn_at = self.started_at + ITEM_SPAWN_FIRST_DELAY
         #: 每个座位杀了几个人。`0x0408` 里的「凶手」字段就是杀人者的座位号
         #: （`[char+0x158]`，由 `0x4fedee` 写成开火者的座位），所以服务端不用
         #: 客户端另外上报分数就能数出对战成绩（§167）。
@@ -2442,7 +2527,38 @@ class RoomQuest:
         if handle in self.items_taken:
             return False
         self.items_taken[handle] = int(seat_id)
+        # 服务端刷的那件被人捡走了，地图上就少一件（配额腾出来）。
+        self.items_on_map.discard(handle)
         return True
+
+    # -- 道具模式：往地图上刷道具（§191 / D109）------------------------------
+    def due_item_spawn(self, now=None, team_mode=False, random_source=None):
+        """现在该不该刷一件道具？该刷就返回 `(句柄, 物件 id, X, Y)`，否则 ``None``。
+
+        ★ **调用点是每收到一发 `0x040e` 就问一次**（约 8 Hz，和
+        `check_pvp_finished` 同一个套路）—— 服务端没有定时器线程，
+        而「房里没人发包」正好等于「没人在打」，那时也不需要刷。
+        房间级状态，所以六条连接抢着问也只会刷出一件。
+
+        坐标是随便给的正数：客户端会 `fmod` 进地图、再把埋在地形里的物件
+        顶到地面上（§192），服务端不需要任何地图几何数据。
+        """
+        now = time.monotonic() if now is None else now
+        if now < self.next_item_spawn_at:
+            return None
+        # 先把下一次的时刻推掉，再决定这一次刷不刷 —— 配额满的时候
+        # 也要正常走时钟，不然配额一空就会连着补刷一堆。
+        self.next_item_spawn_at = now + ITEM_SPAWN_INTERVAL
+        if len(self.items_on_map) >= ITEM_SPAWN_MAX_ALIVE:
+            return None
+        rng = random_source if random_source is not None else random
+        pool = PVP_ITEM_IDS + (PVP_TEAM_ITEM_IDS if team_mode else ())
+        item_id = rng.choice(pool)
+        x = rng.uniform(*ITEM_SPAWN_X_RANGE)
+        y = rng.uniform(*ITEM_SPAWN_Y_RANGE)
+        handle = self.allocate_item() & 0xFFFFFFFF
+        self.items_on_map.add(handle)
+        return handle, item_id, x, y
 
     # -- 死亡 / 重生 --------------------------------------------------------
     def record_death(self, handle, seat, reported):
@@ -2802,13 +2918,31 @@ def _relay_fallback(member, udp_packet):
     member.send(build_game(OP_PEER_DATA_DOWN, udp_packet))
 
 
+def _relay_battle_tick(game_conn):
+    """每转发一份同步数据就跑一次的房间级判断。
+
+    ★ **必须挂在 `RelayServer.deliver` 上，不能挂在 `Conn.on_peer_data` 上**：
+    原版中继一旦建起来，整局连一发 `0x040e` 都不会再有（§160），
+    而 `deliver()` 是两条通道唯一的汇合点。
+
+    这里放的两件事都是「到点了就动一下」，本身带房间级去重：
+
+    - `check_pvp_finished()` —— 对战的 240 秒时间上限（§167）。挂在这儿之前
+      它只在有人死的时候才会被问到，中继模式下一局不死人就永远不结算。
+    - `maybe_spawn_item()` —— 道具模式往地图上刷道具（§191 / D109）。
+    """
+    game_conn.check_pvp_finished()
+    game_conn.maybe_spawn_item()
+
+
 #: 全进程唯一的原版 TCP 中继（里程碑 J.3 / D078）。和 `LOBBY` 同一个理由做成
 #: 模块级单例：中继连接是**跨连接**的共享状态。
-#: ★ `relayserver` 不 import 本模块（反过来才对），查房间成员和回退投递
-#: 两件事都靠这里注入的回调完成。
+#: ★ `relayserver` 不 import 本模块（反过来才对），查房间成员、回退投递和
+#: 战斗节拍三件事都靠这里注入的回调完成。
 PEER_RELAY = relayserver.RelayServer(
     members_of=_relay_room_members,
     fallback=_relay_fallback,
+    on_traffic=_relay_battle_tick,
     logger=lambda msg: print(f"[{ts()}] [relay] {msg}", flush=True),
 )
 
@@ -3143,6 +3277,57 @@ class Conn:
         # （V0.1 的单机主线就是闯关，保持老行为）。
         return int((self.room or {}).get("session_type",
                                          SESSION_TYPE_QUEST)) == SESSION_TYPE_QUEST
+
+    def item_mode(self):
+        """这一局是不是**道具模式**（아이템전，§190）。
+
+        判据全在 `lobby.item_mode_of` 里，和客户端 `0x409dd9` 同一个口径。
+        不在房间里（协议试探 / 控制通道手搓包）时按自己解析到的建房请求算，
+        解析不到就是「不是」—— 单机闯关那条老路一个字节都不受影响。
+        """
+        room = self.lobby_room()
+        if room is not None:
+            return room.item_mode()
+        request = self.room or {}
+        return item_mode_of(request.get("session_type", SESSION_TYPE_QUEST),
+                            request.get("arguments", ()))
+
+    def maybe_spawn_item(self, now=None):
+        """道具模式：到点了就往地图上刷一件道具，并广播给全房间（§191 / D109）。
+
+        ★ **原版服务端的活儿**：地图上的道具没有任何客户端来源 ——
+        `.map` 文件里一件都没放，客户端也没有任何一处会自己请求生成
+        （唯一能传任意物件 id 的口子是关卡脚本的 lua 绑定，而 PvP 图没有脚本）。
+        服务端不发，玩家就「找不到道具」。
+
+        用的是 `0x0404 gspCreatedItem` 而**不是** `0x0413 gspCreateObject`
+        （D109）：前者客户端会先把坐标取模进地图、再把埋进地形的物件顶到
+        空地上，所以服务端不需要知道任何地图几何。
+
+        返回真的刷出来了没有。
+        """
+        room = self.lobby_room()
+        if room is None or room.status != SESSION_STATUS_PLAYING:
+            return False
+        if not self.item_mode():
+            return False
+        quest = self.quest_state()
+        if quest.settled or quest.pvp_reason is not None:
+            return False
+        spawn = quest.due_item_spawn(
+            now=now, team_mode=room.team_layout() == TEAM_LAYOUT_TEAMS)
+        if spawn is None:
+            return False
+        handle, item_id, x, y = spawn
+        fields = (item_id, x, y, 0.0, 0.0) + ITEM_SPAWN_TAIL
+        self.log(f"← 刷道具 gspCreatedItem(0x0404) 句柄=0x{handle:08x} "
+                 f"物件={item_id} {ITEM_NAMES.get(item_id, '未知物件')} "
+                 f"@ ({x:.0f}, {y:.0f})；地图上现有 "
+                 f"{len(quest.items_on_map)}/{ITEM_SPAWN_MAX_ALIVE} 件")
+        self.battle_broadcast(
+            build_game(OP_CREATED_ITEM, build_created_item(handle, fields)),
+            reason="：道具模式刷新")
+        return True
 
     def battle_broadcast(self, plain, reason="", exclude=None):
         """把一个已经组好帧的战斗包发给房里**每一个人（含自己）**。
@@ -4739,9 +4924,10 @@ class Conn:
         self.peer_data_out += PEER_RELAY.deliver(self, payload)
         self.peer_forward_ms.add((time.monotonic() - started) * 1000.0)
         self.report_peer_timing(started)
-        # ★ 对战的时间上限盯在这里：这条包约 8 Hz，比另起一个定时器线程省事，
-        #   而且没人发包时也不需要判（房里没人动 = 没人在等结算）。
-        self.check_pvp_finished()
+        # ★ 「每帧问一次」的房间级判断（对战时间上限、道具模式刷道具）**不在
+        #   这里**，在 `_relay_battle_tick` 里 —— 上面那发 `deliver()` 会调它。
+        #   原因见那个函数：中继一建起来，`0x040e` 整局就不再出现了（§160），
+        #   挂在本函数上等于在中继模式下彻底失效。
 
     def report_peer_timing(self, now=None, force=False):
         """每 `PEER_TIMING_REPORT_INTERVAL` 秒往 `[online]` 汇总一行转发耗时。
@@ -5083,7 +5269,9 @@ class Conn:
                     f"type={self.room['session_type']} "
                     f"({self.room['session_type_name']}) "
                     f"texts={self.room['texts']!r} option={self.room['option']} "
-                    f"args={self.room['arguments']}; 开局状态机已重置"
+                    f"args={self.room['arguments']} "
+                    f"{describe_room_arguments(self.room['session_type'], self.room['arguments'])}"
+                    "; 开局状态机已重置"
                 )
                 self.register_room()
             except ValueError as error:
@@ -5130,6 +5318,7 @@ class Conn:
                 f"type={request['session_type']} "
                 f"({request['session_type_name']}) "
                 f"texts={request['texts']!r} args={request['arguments']} "
+                f"{describe_room_arguments(request['session_type'], request['arguments'])} "
                 f"free_slots={request['free_slots']} flags={request['flags']}"
             )
             # 客户端在这里把它选定的地图名提交上来，服务端把整份 Session

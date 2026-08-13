@@ -67,6 +67,17 @@ TEAM_LAYOUT_COOP = "coop"
 SESSION_TYPE_NORMAL = 1
 NORMAL_ARGUMENT_TEAM_MODE = 1
 
+#: 描述符 type == 1 时 `arguments[2]` = **道具模式**（1 = 아이템전 / 道具模式，
+#: 0 = 노템전 / 普通模式）。客户端的 `0x409dd9` 对 type 1 返回的就是它，
+#: 对别的 type 恒返回 0 / -1 —— 也就是说**只有普通对战房才有道具模式**（§190）。
+NORMAL_ARGUMENT_ITEM_MODE_INDEX = 2
+
+#: 游戏模式（`arguments[1]`，客户端的 `0x409e0a`）== 2 时，客户端在房间面板里
+#: **强制**把道具标志清 0（`0x465be2`）。服务端跟着它判，免得出现
+#: 「房间面板显示노템전、服务端却在刷道具」。
+NORMAL_ARGUMENT_MODE_INDEX = 1
+MODE_WITHOUT_ITEMS = 2
+
 
 def team_layout_of(session_type, arguments):
     """这个房间该按哪种口径分队。见 `TEAM_LAYOUT_*`。"""
@@ -75,6 +86,26 @@ def team_layout_of(session_type, arguments):
     first = arguments[0] if arguments else 0
     return (TEAM_LAYOUT_TEAMS if int(first) == NORMAL_ARGUMENT_TEAM_MODE
             else TEAM_LAYOUT_FREE)
+
+
+def item_mode_of(session_type, arguments):
+    """这个房间是不是**道具模式**（아이템전）。见 §190。
+
+    判据和客户端一模一样：
+    ① 只有 `type == 1`（普通对战）才有道具模式 —— `0x409dd9` 对别的 type
+       返回 0（天梯）或 -1（闯关等），客户端自己也不会显示那个开关；
+    ② `arguments[1] == 2` 那个游戏模式下客户端强制无道具（`0x465be2`）；
+    ③ 其余情况看 `arguments[2]`。
+    """
+    if int(session_type) != SESSION_TYPE_NORMAL:
+        return False
+    arguments = tuple(arguments)
+    if len(arguments) > NORMAL_ARGUMENT_MODE_INDEX and \
+            int(arguments[NORMAL_ARGUMENT_MODE_INDEX]) == MODE_WITHOUT_ITEMS:
+        return False
+    if len(arguments) <= NORMAL_ARGUMENT_ITEM_MODE_INDEX:
+        return False
+    return int(arguments[NORMAL_ARGUMENT_ITEM_MODE_INDEX]) == 1
 
 
 def default_team(seat_index, layout=TEAM_LAYOUT_TEAMS):
@@ -220,6 +251,10 @@ class Room:
     def team_layout(self):
         """本房间按哪种口径分队（`TEAM_LAYOUT_*`）。"""
         return team_layout_of(self.session_type, self.arguments)
+
+    def item_mode(self):
+        """本房间是不是道具模式（아이템전）。见 `item_mode_of` / §190。"""
+        return item_mode_of(self.session_type, self.arguments)
 
     def default_team_for(self, seat_index):
         """新人坐进 `seat_index` 时默认分到哪一队。"""

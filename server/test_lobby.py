@@ -17,7 +17,7 @@ from lobby import (                                            # noqa: E402
     Lobby, Room, Seat, ROOM_SEAT_COUNT,
     SESSION_STATUS_WAITING, SESSION_STATUS_PLAYING,
     MOVE_INTO_OK, MOVE_INTO_ALREADY_PLAYING, MOVE_INTO_FULL,
-    MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_BAD_PASSWORD,
+    MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_BAD_PASSWORD, item_mode_of,
 )
 
 
@@ -297,6 +297,43 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertTrue(all(r == MOVE_INTO_FULL
                             for r, _, _ in results if r != MOVE_INTO_OK))
         self.assertEqual(ROOM_SEAT_COUNT, room.player_count())
+
+
+class ItemModeTests(unittest.TestCase):
+    """道具模式（아이템전）的判据，和客户端 `0x409dd9` 同一个口径（§190）。"""
+
+    def test_the_third_argument_of_a_normal_room_is_the_switch(self):
+        self.assertTrue(item_mode_of(1, (0, 0, 1)))
+        self.assertFalse(item_mode_of(1, (0, 0, 0)))
+
+    def test_the_team_flag_does_not_matter(self):
+        self.assertTrue(item_mode_of(1, (1, 3, 1)))
+
+    def test_only_a_normal_room_can_have_items(self):
+        # 0x409dd9：type 5（天梯）恒返回 0，别的 type 恒返回 -1。
+        for session_type in (0, 2, 3, 4, 5, 6):
+            self.assertFalse(item_mode_of(session_type, (1, 1, 1)),
+                             f"type {session_type} 不该有道具模式")
+
+    def test_game_mode_two_forces_no_items(self):
+        # 客户端 0x465be2 在这个模式下强制把道具标志清 0。
+        self.assertFalse(item_mode_of(1, (0, 2, 1)))
+
+    def test_a_short_descriptor_is_not_item_mode(self):
+        self.assertFalse(item_mode_of(1, ()))
+        self.assertFalse(item_mode_of(1, (0,)))
+        self.assertFalse(item_mode_of(1, (0, 0)))
+
+    def test_only_exactly_one_counts(self):
+        # 客户端拿 `== 1` 判（0x48c794 / 0x499120），别的值一律不是道具模式。
+        self.assertFalse(item_mode_of(1, (0, 0, -1)))
+        self.assertFalse(item_mode_of(1, (0, 0, 2)))
+
+    def test_the_room_follows_its_descriptor(self):
+        room = Room(0, FakeConn("alice"), session_type=1, arguments=(0, 0, 1))
+        self.assertTrue(room.item_mode())
+        room.arguments = (0, 0, 0)
+        self.assertFalse(room.item_mode())
 
 
 if __name__ == "__main__":

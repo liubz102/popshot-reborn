@@ -25,7 +25,11 @@ fakeclient.py —— 用 Python 冒充第二个游戏客户端（大厅部分）
 
 命令表：
 
-    create [标题] [类型]  发 0x0201 建一个房间（自己当房主，座位 0）
+    create [标题] [类型] [参数,参数,参数]
+                      发 0x0201 建一个房间（自己当房主，座位 0）。
+                      参数不给就用默认；type 1（普通对战）的三个参数是
+                      **组队 / 游戏模式 / 道具模式**（§190），
+                      所以 `create 房间 1 0,0,1` = 个人战 + **道具模式**
     join <房间号>     发 0x0202 gcpReqMoveInto，并等应答（打印 result / 座位号）
     leave             发 0x0203 gcpReqLeaveSession
     chat <文本>       发 0x0305 gcpSendChatMsg
@@ -513,13 +517,23 @@ def run_script(client, tokens):
             # ★ 描述符的参数**个数按类型定**（type 2 是 2 个、type 1/5/6 是
             #   3 个），个数发错服务端解不出来，房间根本建不起来。
             count = DESCRIPTOR_SENT_ARGUMENT_COUNTS[session_type]
+            # 描述符参数可以显式给：`create 房间 1 0,0,1` = 个人战 + 道具模式
+            # （type 1 的三个参数是「组队 / 游戏模式 / 道具模式」，§190）。
+            if tokens and "," in tokens[0]:
+                arguments = tuple(int(v) for v in tokens.pop(0).split(","))
+            else:
+                arguments = (3, 1, 0)[:count]
+            if len(arguments) != count:
+                raise SystemExit(f"type {session_type} 的描述符要 {count} 个参数，"
+                                 f"给了 {len(arguments)} 个")
             client.send_game(0x0201,
                              w_wstr(title) + w_wstr("") + w_wstr("")
                              + w_i32(0) + w_i32(session_type)
-                             + b"".join(w_i32(v) for v in (3, 1, 0)[:count]))
+                             + b"".join(w_i32(v) for v in arguments))
             client.my_seat, client.room_id = 0, None
             time.sleep(0.5)
-            log(f"已建房「{title}」type={session_type}（我是房主，座位 0）")
+            log(f"已建房「{title}」type={session_type} args={arguments}"
+                "（我是房主，座位 0）")
         elif cmd == "rooms":
             # 0x0200 房间列表请求（12 字节，§139 / §170）。第 4 个字段就是
             # 大厅左下角「全部 / 待机」那对按钮：0 = 全部，1 = 只看待机。

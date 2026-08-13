@@ -466,11 +466,19 @@ class RelayServer:
     """
 
     def __init__(self, *, members_of=None, fallback=None, logger=None,
-                 port=None):
+                 port=None, on_traffic=None):
         #: `members_of(game_conn) -> [同房间的其他游戏连接]`
         self._members_of = members_of or (lambda conn: [])
         #: `fallback(game_conn, udp_packet) -> None`，走 `0x040f`
         self._fallback = fallback
+        #: `on_traffic(sender_game_conn) -> None`，**每投递一份同步数据调一次**。
+        #:
+        #: ★ 为什么挂在这里：`deliver()` 是**两条传输通道唯一的汇合点** ——
+        #: `0x040e` 走 `Conn.on_peer_data` 调它，原版中继走 `RelayConn.on_data`
+        #: 也调它。中继一旦建起来，`0x040e` 整局就不再出现一发了（§160），
+        #: 所以任何「每帧要问一次」的房间级判断（对战判胜负、道具模式刷道具）
+        #: 都必须挂在这儿，挂在 `on_peer_data` 上会在中继模式下彻底不触发。
+        self._on_traffic = on_traffic
         self._logger = logger
         self.port = int(port if port is not None
                         else server_config.PEER_RELAY_PORT)
@@ -590,6 +598,14 @@ class RelayServer:
                     continue
                 sent += 1
                 self.delivered_fallback += 1
+        # 房间级的「每帧问一次」挂在这儿（见 `_on_traffic` 的说明）。
+        # ★ 排在转发**之后**，而且绝不许让它把同步数据带崩 —— 中继连接一断
+        #   客户端会自己退房（§158），转发这条路必须比任何附加逻辑更硬。
+        if self._on_traffic is not None:
+            try:
+                self._on_traffic(sender_game_conn)
+            except Exception as error:      # noqa: BLE001 —— 主路优先
+                self.log(f"!! 战斗节拍回调抛了 {error!r}，已忽略")
         return sent
 
     # -- 监听 ---------------------------------------------------------------

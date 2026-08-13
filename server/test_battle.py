@@ -202,6 +202,9 @@ class BattleRoom(unittest.TestCase):
     """
 
     session_type = 2        # 2 = 闯关；对战的用例自己覆盖
+    #: 房间描述符的参数。``None`` = 用 `create_session_payload` 的默认值。
+    #: 对战房是 `(组队, 游戏模式, 道具模式)`，道具模式的用例靠它开关（§190）。
+    arguments = None
 
     def setUp(self):
         self._saved_lobby = gameserver.LOBBY
@@ -210,7 +213,8 @@ class BattleRoom(unittest.TestCase):
         self._saved_relay = gameserver.PEER_RELAY
         gameserver.PEER_RELAY = relayserver.RelayServer(
             members_of=gameserver._relay_room_members,
-            fallback=gameserver._relay_fallback)
+            fallback=gameserver._relay_fallback,
+            on_traffic=gameserver._relay_battle_tick)
         self._saved_relay_enabled = gameserver.TCP_RELAY_ENABLED
         gameserver.TCP_RELAY_ENABLED = False
 
@@ -219,7 +223,8 @@ class BattleRoom(unittest.TestCase):
         self.bob = make_conn("bob", self.accounts)
         gameserver.Conn.on_game_packet(
             self.alice, 0x0201,
-            create_session_payload(session_type=self.session_type))
+            create_session_payload(session_type=self.session_type,
+                                   arguments=self.arguments))
         self.room = self.lobby.room_of(self.alice)
         gameserver.Conn.on_game_packet(self.bob, OP_MOVE_INTO_SESSION,
                                        move_into_payload(self.room.room_id))
@@ -372,6 +377,267 @@ class ItemTests(BattleRoom):
                 self.alice, OP_GET_ITEM,
                 get_item_payload(handle=ITEM_HANDLE_BASE + i))
         self.assertEqual(3, opcodes(self.bob).count(OP_PICKED_ITEM))
+
+
+# ----------------------------------------------------------------------------
+# 道具模式：服务端往地图上刷道具（§191 / D109）
+# ----------------------------------------------------------------------------
+class ItemSpawnBase(BattleRoom):
+    """用户实机报的「道具模式下地图里找不到道具」。
+
+    根因（§191）：地图文件里一件道具都没放，客户端也没有任何一处会自己请求
+    生成 —— **只有服务端能把道具放到地图上**，而我们从来没发过。
+    """
+
+    session_type = 1
+    arguments = (0, 0, 1)       # 个人战 + 道具模式
+
+    def tick(self, conn=None):
+        """走一发同步数据，让 `_relay_battle_tick` 跑一次。"""
+        gameserver.Conn.on_peer_data(conn or self.alice, b"\x00" * 43)
+
+    def due_now(self):
+        """把「下一次刷新」的时刻拨到现在。"""
+        self.quest.next_item_spawn_at = 0.0
+
+    def spawned(self, conn=None):
+        """某条连接收到的刷新包，解成 `(句柄, 物件 id, X, Y)` 列表。"""
+        out = []
+        for body in bodies(conn or self.alice, OP_CREATED_ITEM):
+            handle = struct.unpack_from("<I", body, 0)[0]
+            item_id, x, y = struct.unpack_from("<iff", body, 4)
+            out.append((handle, item_id, x, y))
+        return out
+
+    def spawn_many(self, count):
+        for _ in range(count):
+            self.due_now()
+            self.tick()
+
+    def spawn_and_take(self, count):
+        """刷 `count` 件，每刷一件就当场捡走 —— 否则会撞上「同时最多几件」的上限。"""
+        for _ in range(count):
+            self.due_now()
+            self.tick()
+            for handle in list(self.quest.items_on_map):
+                self.quest.claim_item(handle, 0)
+
+
+class ItemSpawnTests(ItemSpawnBase):
+
+    def test_nothing_is_spawned_before_the_first_delay(self):
+        # 开局那一刻就往地上扔东西太怪；先给玩家几秒钟落地。
+        self.tick()
+        self.assertEqual([], opcodes(self.alice))
+
+    def test_an_item_appears_once_the_timer_is_due(self):
+        self.due_now()
+        self.tick()
+        self.assertEqual([OP_CREATED_ITEM], opcodes(self.alice))
+        # bob 那边还会先收到一发转发过来的同步数据（0x040f），只看刷新包。
+        self.assertEqual(1, opcodes(self.bob).count(OP_CREATED_ITEM),
+                         "★ 不广播的话道具只在一个人屏幕上存在")
+        self.assertEqual(bodies(self.alice, OP_CREATED_ITEM),
+                         bodies(self.bob, OP_CREATED_ITEM))
+
+    def test_the_next_one_waits_for_the_interval(self):
+        self.due_now()
+        self.tick()
+        self.clear()
+        self.tick()
+        self.assertEqual([], opcodes(self.alice))
+
+    def test_the_spawned_id_is_always_one_the_client_can_build(self):
+        # ★ 工厂 0x513278 认不出的 id 会走 default 分支 —— 10305 就是这样一个
+        #   「Item.ini 里有、工厂里没有」的坑（§191）。
+        self.spawn_and_take(40)
+        ids = {item_id for _, item_id, _, _ in self.spawned()}
+        self.assertTrue(ids)
+        self.assertTrue(ids <= set(gameserver.PVP_ITEM_IDS))
+        self.assertNotIn(10305, ids)
+        for item_id in ids:
+            self.assertIn(item_id, gameserver.ITEM_NAMES)
+
+    def test_the_handles_are_unique_and_room_level(self):
+        self.spawn_many(5)
+        handles = [handle for handle, _, _, _ in self.spawned()]
+        self.assertEqual(len(handles), len(set(handles)))
+        self.assertEqual(handles, sorted(handles))
+        self.assertGreaterEqual(min(handles), ITEM_HANDLE_BASE)
+
+    def test_a_client_drop_and_a_server_spawn_never_share_a_handle(self):
+        self.due_now()
+        self.tick()
+        gameserver.Conn.on_game_packet(self.alice, OP_CREATE_ITEM,
+                                       create_item_payload())
+        handles = [handle for handle, _, _, _ in self.spawned()]
+        self.assertEqual(len(handles), len(set(handles)))
+
+    def test_the_coordinates_are_positive(self):
+        # 客户端会 `fmod` 进地图（§192），负数取模出来还是负数 = 图外。
+        self.spawn_many(20)
+        for _, _, x, y in self.spawned():
+            self.assertGreaterEqual(x, 0.0)
+            self.assertGreaterEqual(y, 0.0)
+
+    def test_the_map_holds_at_most_the_cap(self):
+        self.spawn_many(gameserver.ITEM_SPAWN_MAX_ALIVE + 5)
+        self.assertEqual(gameserver.ITEM_SPAWN_MAX_ALIVE, len(self.spawned()))
+
+    def test_picking_one_up_frees_a_slot(self):
+        self.spawn_many(gameserver.ITEM_SPAWN_MAX_ALIVE)
+        taken = self.spawned()[0][0]
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_GET_ITEM, get_item_payload(seat_id=1, handle=taken))
+        self.clear()
+        self.due_now()
+        self.tick()
+        self.assertEqual([OP_CREATED_ITEM], opcodes(self.alice))
+
+    def test_the_pickup_arbitration_covers_server_spawned_items(self):
+        self.due_now()
+        self.tick()
+        handle = self.spawned()[0][0]
+        gameserver.Conn.on_game_packet(
+            self.alice, OP_GET_ITEM, get_item_payload(seat_id=0, handle=handle))
+        self.clear()
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_GET_ITEM, get_item_payload(seat_id=1, handle=handle))
+        self.assertEqual([], opcodes(self.bob), "晚到的那一发绝不能回包")
+
+    def test_nothing_is_spawned_after_the_round_is_over(self):
+        self.quest.pvp_reason = "时间到"
+        self.due_now()
+        self.tick()
+        self.assertEqual([], opcodes(self.alice))
+
+    def test_a_second_round_starts_spawning_again(self):
+        # `room.quest` 回房间时整个丢掉，刷新时钟跟着重来。
+        self.due_now()
+        self.tick()
+        first = self.quest
+        self.room.quest = None
+        self.assertIsNot(first, self.alice.quest_state())
+        self.clear()
+        self.tick()
+        self.assertEqual([], opcodes(self.alice), "新的一局也要先等第一次延迟")
+
+    def test_the_tick_runs_on_the_relay_path_too(self):
+        # ★ 中继一建起来，整局连一发 0x040e 都不会再有（§160）——
+        #   所以节拍必须挂在 `deliver()` 上，不能挂在 `on_peer_data` 上。
+        self.due_now()
+        gameserver.PEER_RELAY.deliver(self.alice, b"\x00" * 43)
+        self.assertEqual(1, opcodes(self.bob).count(OP_CREATED_ITEM))
+
+    def test_a_broken_tick_never_breaks_the_sync_forwarding(self):
+        # 中继连接一断客户端会自己退房（§158），转发必须比附加逻辑更硬。
+        def boom(_conn):
+            raise RuntimeError("坏了")
+
+        relay = relayserver.RelayServer(
+            members_of=gameserver._relay_room_members,
+            fallback=gameserver._relay_fallback, on_traffic=boom)
+        self.assertEqual(1, relay.deliver(self.alice, b"\x00" * 43))
+        self.assertEqual([gameserver.OP_PEER_DATA_DOWN], opcodes(self.bob))
+
+
+class ItemPoolTests(unittest.TestCase):
+    """道具池本身 —— 不走协议，所以可以钉死（随机数注进去）。"""
+
+    class Recorder:
+        """记下 `due_item_spawn` 到底从哪个池子里挑的。"""
+
+        def __init__(self):
+            self.pools = []
+
+        def choice(self, pool):
+            self.pools.append(tuple(pool))
+            return pool[0]
+
+        def uniform(self, low, _high):
+            return low
+
+    def pool_for(self, team_mode):
+        quest = RoomQuest()
+        quest.next_item_spawn_at = 0.0
+        recorder = self.Recorder()
+        quest.due_item_spawn(now=1.0, team_mode=team_mode,
+                             random_source=recorder)
+        return recorder.pools[0]
+
+    def test_a_free_for_all_pool_has_no_team_items(self):
+        self.assertEqual(gameserver.PVP_ITEM_IDS, self.pool_for(False))
+
+    def test_a_team_round_adds_the_team_items(self):
+        self.assertEqual(
+            gameserver.PVP_ITEM_IDS + gameserver.PVP_TEAM_ITEM_IDS,
+            self.pool_for(True))
+
+    def test_every_id_in_the_pool_can_actually_be_built(self):
+        # ★ 10305（FastShot）在 `Item.ini` 里有，但工厂 0x513278 的跳表
+        #   `0x513b56` 那一格指的是 default —— 发下去客户端建不出对象（§191）。
+        for pool in (gameserver.PVP_ITEM_IDS, gameserver.PVP_TEAM_ITEM_IDS):
+            self.assertNotIn(10305, pool)
+            for item_id in pool:
+                self.assertIn(item_id, gameserver.ITEM_NAMES)
+                self.assertTrue(10300 <= item_id <= 10500,
+                                f"{item_id} 不是 PvP 道具的 id 段")
+
+    def test_the_pools_do_not_overlap(self):
+        self.assertFalse(set(gameserver.PVP_ITEM_IDS)
+                         & set(gameserver.PVP_TEAM_ITEM_IDS))
+
+
+class ItemSpawnTeamModeTests(ItemSpawnBase):
+    """组队战才刷「全队」道具（端到端那一半）。"""
+
+    arguments = (1, 0, 1)       # 组队战 + 道具模式
+
+    def test_the_room_is_in_item_mode_and_in_team_layout(self):
+        self.assertTrue(self.room.item_mode())
+        self.spawn_and_take(30)
+        ids = {item_id for _, item_id, _, _ in self.spawned()}
+        self.assertTrue(
+            ids <= set(gameserver.PVP_ITEM_IDS + gameserver.PVP_TEAM_ITEM_IDS))
+
+
+class ItemSpawnFreeForAllTests(ItemSpawnBase):
+
+    def test_team_items_stay_out_of_a_free_for_all(self):
+        self.spawn_and_take(60)
+        ids = {item_id for _, item_id, _, _ in self.spawned()}
+        self.assertFalse(ids & set(gameserver.PVP_TEAM_ITEM_IDS))
+
+
+class NoItemModeTests(ItemSpawnBase):
+    """노템전（普通模式）—— 一件都不许刷。"""
+
+    arguments = (0, 0, 0)
+
+    def test_nothing_is_spawned(self):
+        self.spawn_many(5)
+        self.assertEqual([], opcodes(self.alice))
+
+
+class ItemModeOffByGameModeTests(ItemSpawnBase):
+    """游戏模式 2 下客户端**强制**无道具（`0x465be2`），服务端跟着它判。"""
+
+    arguments = (0, 2, 1)
+
+    def test_nothing_is_spawned(self):
+        self.spawn_many(5)
+        self.assertEqual([], opcodes(self.alice))
+
+
+class QuestRoomItemSpawnTests(ItemSpawnBase):
+    """闯关房没有道具模式（`0x409dd9` 对 type != 1 恒返回 -1）。"""
+
+    session_type = 2
+    arguments = (3, 1)
+
+    def test_nothing_is_spawned(self):
+        self.spawn_many(5)
+        self.assertEqual([], opcodes(self.alice))
 
 
 # ----------------------------------------------------------------------------

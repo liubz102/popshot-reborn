@@ -175,7 +175,8 @@ class LobbyIsolated(unittest.TestCase):
         self._saved_relay = gameserver.PEER_RELAY
         gameserver.PEER_RELAY = relayserver.RelayServer(
             members_of=gameserver._relay_room_members,
-            fallback=gameserver._relay_fallback)
+            fallback=gameserver._relay_fallback,
+            on_traffic=gameserver._relay_battle_tick)
         self.relay = gameserver.PEER_RELAY
         self._saved_relay_enabled = gameserver.TCP_RELAY_ENABLED
 
