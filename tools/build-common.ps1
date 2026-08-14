@@ -306,6 +306,24 @@ function Test-TcpPortOpen([int]$Port, [int]$TimeoutMs = 250) {
     }
 }
 
+function Repair-ProcessPathCaseCollision {
+    <# PowerShell 5.1 的 Start-Process 会把当前进程环境复制进一个不区分大小写的
+       Dictionary。某些自动化宿主却能传进同时含 `Path` 和 `PATH` 的原始 Windows
+       环境块；复制时就会在目标程序启动前报 duplicate key。普通 Windows 会话只有
+       一个键，本函数直接不做任何事；有重复时保留规范的 `Path` 值，删净同名键后
+       只写回一个 `Path`。见 FINDINGS §207。 #>
+    $vars = [System.Environment]::GetEnvironmentVariables('Process')
+    $keys = @($vars.Keys | Where-Object { [string]$_ -ieq 'Path' })
+    if ($keys.Count -le 1) { return }
+
+    $canonical = @($keys | Where-Object { [string]$_ -ceq 'Path' } | Select-Object -First 1)
+    $keep = if ($canonical.Count) { [string]$vars[$canonical[0]] } else { [string]$vars[$keys[0]] }
+    foreach ($key in $keys) {
+        [System.Environment]::SetEnvironmentVariable([string]$key, $null, 'Process')
+    }
+    [System.Environment]::SetEnvironmentVariable('Path', $keep, 'Process')
+}
+
 function Invoke-ServerSmokeTest {
     <# 用**包里那份** Python 跑**包里那份** server\app.py，确认：
          1. 四个监听器都能起来（认证 / 游戏 / 中继 / 注册页）
@@ -353,6 +371,7 @@ function Invoke-ServerSmokeTest {
 
     $proc = $null
     try {
+        Repair-ProcessPathCaseCollision
         $proc = Start-Process -FilePath $py -WorkingDirectory $PackageRoot `
             -ArgumentList $argList -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile

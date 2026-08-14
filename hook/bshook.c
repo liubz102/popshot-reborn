@@ -1553,6 +1553,66 @@ static int try_patch_afk_timer(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* 道具视觉同步 patch —— 让远端角色也创建反射盾牌特效                         */
+/*                                                                            */
+/*   服务端的 0x040a 已经把 10303「反射」和 10314「全队反射」广播给房内所有人；*/
+/*   远端客户端也确实把 attr=3 加进角色属性表，所以子弹碰撞会正常反射。        */
+/*                                                                            */
+/*   问题在 Character::AddAttrVisual(0x508e88) 的 attr=3 分支：               */
+/*     0x5090e2  call GetMySeat                                               */
+/*     0x5090e7  cmp  [esi+0x2ac], eax       ; 特效目标座位 vs 本机座位       */
+/*     0x5090ed  jne  0x5097cd              ; 远端目标直接返回                */
+/*     0x5090f3  push "Item/Reflect/Efx/ReflectMark00.efx"                    */
+/*                                                                            */
+/*   把这条 6 字节 near JNE 换成 NOP，保留前面的座位查询/比较，仅取消返回。    */
+/*   普通反射与全队反射最终都走 attr=3，因此一处修复同时覆盖两种道具。        */
+/*   完整结论及同类道具审计见 FINDINGS §206、DECISIONS D123。                 */
+/* -------------------------------------------------------------------------- */
+#define REFLECT_VISUAL_SIG_VA     0x005090e2u
+#define REFLECT_VISUAL_PATCH_OFF  11
+#define REFLECT_VISUAL_PATCH_LEN  6
+static const unsigned char REFLECT_VISUAL_SIG[22] = {
+    0xE8,0x96,0x0E,0xF0,0xFF,             /* call GetMySeat */
+    0x39,0x86,0xAC,0x02,0x00,0x00,        /* cmp [esi+0x2ac],eax */
+    0x0F,0x85,0xDA,0x06,0x00,0x00,        /* jne 0x5097cd */
+    0x68,0x68,0x4B,0x68,0x00              /* push ReflectMark00.efx */
+};
+static const unsigned char REFLECT_VISUAL_PATCH[REFLECT_VISUAL_PATCH_LEN] = {
+    0x90,0x90,0x90,0x90,0x90,0x90
+};
+static volatile LONG g_reflect_visual_patched = 0;
+
+static int try_patch_reflect_visual(void)
+{
+    unsigned char *base = (unsigned char *)REFLECT_VISUAL_SIG_VA;
+    unsigned char *p = base + REFLECT_VISUAL_PATCH_OFF;
+    DWORD oldp;
+
+    if (g_reflect_visual_patched) return 1;
+    if (IsBadReadPtr(base, sizeof(REFLECT_VISUAL_SIG))) return 0;
+    if (memcmp(p, REFLECT_VISUAL_PATCH, REFLECT_VISUAL_PATCH_LEN) == 0) {
+        InterlockedExchange(&g_reflect_visual_patched, 1);
+        return 1;
+    }
+    if (memcmp(base, REFLECT_VISUAL_SIG, sizeof(REFLECT_VISUAL_SIG)) != 0)
+        return 0;                               /* 还没解壳，或并非已确认的客户端版本 */
+
+    if (!VirtualProtect(p, REFLECT_VISUAL_PATCH_LEN, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   反射道具视觉: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    memcpy(p, REFLECT_VISUAL_PATCH, REFLECT_VISUAL_PATCH_LEN);
+    VirtualProtect(p, REFLECT_VISUAL_PATCH_LEN, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, REFLECT_VISUAL_PATCH_LEN);
+    InterlockedExchange(&g_reflect_visual_patched, 1);
+    bslog("PATCH   ★反射道具视觉 @ %08X: 远端角色也创建 ReflectMark00.efx"
+          "（普通反射 10303 + 全队反射 10314）",
+          (unsigned)(REFLECT_VISUAL_SIG_VA + REFLECT_VISUAL_PATCH_OFF));
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* 单机化 patch —— 解锁被「地区掩码」关掉的关卡（神秘岛以外的第 5/6/7 关）    */
 /*                                                                            */
 /*   Data/map.ini 里每张地图都有一行 OpenLocale（注释写着                     */
@@ -2153,7 +2213,7 @@ static DWORD WINAPI patch_thread(LPVOID param)
     for (ticks = 0; !g_stop && ticks < CODE_PATCH_DELAY_MS / 20; ticks++) Sleep(20);
     bslog("PATCH   非 GameGuard 代码补丁：延迟 %d ms 后开始", CODE_PATCH_DELAY_MS);
 
-    /* 剩下两处 patch 打在同一个窗口里（解壳已完成、完整性校验窗口已过）。
+    /* 其余 patch 打在同一个窗口里（解壳已完成、完整性校验窗口已过）。
        ★ **地区锁排在挂机计时器前面，因为只有它是有时限的**：
        0x40b419 属于启动时的 map.ini 加载，一旦跑完地图目录就已经建好，
        再 patch 也补不回被 delete 掉的记录。+2.5s 时资源加载还没开始
@@ -2173,6 +2233,14 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x40b419 / 0x4368cf / 0x4f67d1 / 0x46631d "
                   "的特征串一直对不上）");
     }
+
+    for (ticks = 0; !g_stop && !g_reflect_visual_patched && ticks < 2000; ticks++) {
+        if (try_patch_reflect_visual()) break;
+        Sleep(2);
+    }
+    if (!g_reflect_visual_patched)
+        bslog("PATCH   !! 超时未能 patch 反射道具视觉"
+              "（0x5090e2 的特征串一直对不上）");
 
     if (!afk_kick_disabled()) {
         bslog("PATCH   BSHOOK_KEEP_AFK_KICK 已设，保留原版 90 秒挂机踢出");
