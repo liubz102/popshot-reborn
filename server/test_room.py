@@ -101,6 +101,7 @@ def make_conn(username):
     conn.logged = []
     conn.log = conn.logged.append
     conn.online = lambda _msg: None
+    conn.online_debug = lambda _msg: None
     conn.vlog = lambda _msg: None
     conn.send = conn.sent.append
     conn.send_lock = threading.RLock()

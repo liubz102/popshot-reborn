@@ -335,9 +335,9 @@ class PingTimingTests(unittest.TestCase):
     def test_the_summary_line_is_emitted_once_per_window_then_reset(self):
         conn = self.make_conn()
         lines = []
-        original = relayserver.eventlog.online
-        relayserver.eventlog.online = lines.append
-        self.addCleanup(setattr, relayserver.eventlog, "online", original)
+        original = relayserver.eventlog.debug
+        relayserver.eventlog.debug = lines.append
+        self.addCleanup(setattr, relayserver.eventlog, "debug", original)
         conn.rtt_window.add(1.0)
         conn.report_rtt(now=1.0)               # 还不到 30 秒
         self.assertEqual([], lines)
@@ -350,9 +350,9 @@ class PingTimingTests(unittest.TestCase):
     def test_an_empty_window_prints_nothing(self):
         conn = self.make_conn()
         lines = []
-        original = relayserver.eventlog.online
-        relayserver.eventlog.online = lines.append
-        self.addCleanup(setattr, relayserver.eventlog, "online", original)
+        original = relayserver.eventlog.debug
+        relayserver.eventlog.debug = lines.append
+        self.addCleanup(setattr, relayserver.eventlog, "debug", original)
         conn.report_rtt(now=relayserver.RTT_REPORT_INTERVAL + 1.0, force=True)
         self.assertEqual([], lines)
 

@@ -118,6 +118,78 @@ class AccountStoreTests(unittest.TestCase):
                 self.store.register("bob", bad)
             self.assertEqual("invalid_password", ctx.exception.code)
 
+    # -- 显示昵称（会话 21）--------------------------------------------------
+    def test_nickname_defaults_to_the_username(self):
+        # 需求原文：「留空时默认昵称为用户名」。空串、全空白、根本不传，三种都算留空。
+        for i, blank in enumerate(("", "   ", None)):
+            name = f"user{i}"
+            account = self.store.register(name, "pw", display_name=blank)
+            self.assertEqual(name, account["display_name"])
+        self.assertEqual("bob", self.store.register("bob", "pw")["display_name"])
+
+    def test_nickname_is_stored_and_trimmed(self):
+        account = self.store.register("alice", "pw", display_name="  炮炮  ")
+        self.assertEqual("炮炮", account["display_name"])
+        self.assertEqual("炮炮",
+                         self.store.get_account("alice")[1]["display_name"])
+
+    def test_nickname_rejects_what_would_corrupt_the_wire_format(self):
+        # ★ 补充平面字符（emoji）在 UTF-16 里占两个码元，而 `w_wstr` 写的长度
+        #   是 Python 的字符数 —— 放进去客户端从那个包起整条流都解错位。
+        for bad in ("a" * 17, "emoji🎮", "tab\there", "nul\x00"):
+            with self.assertRaises(AccountError, msg=bad) as ctx:
+                self.store.register("bob", "pw", display_name=bad)
+            self.assertEqual("invalid_nickname", ctx.exception.code)
+        self.assertFalse(self.store.has_account("bob"), "失败不该留下半个账号")
+
+    def test_duplicate_nickname_is_reported_separately_from_duplicate_username(self):
+        # 需求原文：「用户名重复和昵称重复需要分别单独 check」。
+        self.store.register("alice", "pw", display_name="炮炮")
+        with self.assertRaises(AccountError) as ctx:
+            self.store.register("bob", "pw", display_name="炮炮")
+        self.assertEqual("duplicate_nickname", ctx.exception.code)
+        self.assertIn("昵称", ctx.exception.message)
+        self.assertFalse(self.store.has_account("bob"))
+        # 用户名撞车仍然是另一条路、另一句话。
+        with self.assertRaises(AccountError) as ctx:
+            self.store.register("alice", "pw", display_name="别的昵称")
+        self.assertEqual("duplicate", ctx.exception.code)
+        # 换个昵称就能注册。
+        self.assertEqual("轰轰",
+                         self.store.register("bob", "pw",
+                                             display_name="轰轰")["display_name"])
+
+    def test_duplicate_nickname_ignores_case_and_padding(self):
+        self.store.register("alice", "pw", display_name="Boom")
+        for same in ("boom", "BOOM", "  Boom  "):
+            with self.assertRaises(AccountError, msg=same) as ctx:
+                self.store.register("bob", "pw", display_name=same)
+            self.assertEqual("duplicate_nickname", ctx.exception.code)
+
+    def test_a_blank_nickname_can_still_collide_via_the_username(self):
+        # 昵称留空 = 用用户名，所以「叫 bob 的昵称」会挡住用户名 bob 的注册。
+        self.store.register("alice", "pw", display_name="bob")
+        with self.assertRaises(AccountError) as ctx:
+            self.store.register("bob", "pw")
+        self.assertEqual("duplicate_nickname", ctx.exception.code)
+
+    def test_an_old_account_without_a_nickname_still_owns_its_username(self):
+        # 老存档里 display_name 可能是空的，那时用户名自己就是昵称。
+        self.store.register("alice", "pw")
+        raw = json.load(open(self.path, encoding="utf-8"))
+        raw["accounts"]["alice"]["display_name"] = ""
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(raw, f, ensure_ascii=False)
+        self.assertEqual("alice", self.store.nickname_owner("alice"))
+        with self.assertRaises(AccountError) as ctx:
+            self.store.register("bob", "pw", display_name="alice")
+        self.assertEqual("duplicate_nickname", ctx.exception.code)
+
+    def test_nickname_owner_says_none_when_nobody_has_it(self):
+        self.store.register("alice", "pw", display_name="炮炮")
+        self.assertIsNone(self.store.nickname_owner("没人用过"))
+        self.assertIsNone(self.store.nickname_owner(""))
+
     def test_verify_tells_the_three_cases_apart(self):
         # 需求：不存在要提示注册，密码错要如实报错 —— 不能合并成一个布尔。
         self.store.register("alice", "pw")

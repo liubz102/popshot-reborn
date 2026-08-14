@@ -3332,15 +3332,18 @@ class Conn:
         self.items_picked = 0
         # 已经报过一次的高频 opcode（见 NOISY_OPCODES）。
         self.noisy_seen = set()
-        self.ft = open(os.path.join(LOGDIR, f"game_{self.seq:03d}_27799.txt"),
-                       "w", encoding="utf-8")
-        # 抓包落盘只在 --verbose 下开：非 verbose 时连空文件都不建，
-        # 免得每跑一次游戏就在 logs/ 里多两个 0 字节文件。
+        # ★ 逐连接的三个文件**全部只在 --verbose 下建**（D112）。
+        #   非 verbose 时 `self.log()` 照样打到 stdout（= `logs/server.out`），
+        #   一行都不会少 —— 少的只是「每条连接一个文件」。
+        #   以前那份 .txt 是无条件建的，于是玩一次就多一个文件、清也没人清：
+        #   这台开发机的 logs/ 里攒了 1076 份（用户 2026-08-14 报的正是这件事）。
         if VERBOSE:
+            self.ft = open(os.path.join(LOGDIR, f"game_{self.seq:03d}_27799.txt"),
+                           "w", encoding="utf-8")
             self.fb_raw = open(os.path.join(LOGDIR, f"game_{self.seq:03d}_27799.raw.bin"), "wb")
             self.fb_dec = open(os.path.join(LOGDIR, f"game_{self.seq:03d}_27799.dec.bin"), "wb")
         else:
-            self.fb_raw = self.fb_dec = None
+            self.ft = self.fb_raw = self.fb_dec = None
         # 控制通道的线程会从另一个线程调 send()，加密流是有状态的，必须串行化。
         # 用 RLock：send_batch() 会先拿锁再在同一个线程里反复调 send()。
         self.send_lock = threading.RLock()
@@ -3355,8 +3358,11 @@ class Conn:
     def log(self, msg):
         line = f"[{ts()}] #{self.seq} {msg}"
         print(line, flush=True)
-        self.ft.write(line + "\n")
-        self.ft.flush()
+        # `self.ft` 只在 --verbose 下存在（见构造函数）。stdout 那一份一直都在，
+        # 被启动脚本重定向进 `logs/server.out`。
+        if self.ft is not None:
+            self.ft.write(line + "\n")
+            self.ft.flush()
 
     def peer(self):
         """本连接对端的 ``ip:port``（v4-mapped 前缀已剥掉）。"""
@@ -3365,6 +3371,14 @@ class Conn:
     def online(self, msg):
         """连接事件（上线 / 下线 / 顶号）。**精简模式下也照打**，见 eventlog.py。"""
         eventlog.online(f"游戏服 #{self.seq} {msg}")
+
+    def online_debug(self, msg):
+        """遥测 / 客户端噪声（转发耗时、异常上报）。**只有 --verbose 才落盘**。
+
+        判据见 eventlog.py 开头那张表：频率由**定时器**决定的都归这一档，
+        频率由**玩家动作**决定的才留在 `online()`（D112）。
+        """
+        eventlog.debug(f"游戏服 #{self.seq} {msg}")
 
     def vlog(self, msg):
         """逐包细节（hexdump / 字段试解）。只在 `--verbose` 时落盘。"""
@@ -5215,12 +5229,14 @@ class Conn:
     def on_report_hack(self, payload):
         """`0x0106 gcpReportHack` —— 客户端自己觉得不对劲时的上报。**只记不回**。
 
-        走 `[online]`（精简模式也可见）：这一行现在是「连按 A/D 会不会被客户端
-        当成异常输入」的取证口，见 `OP_REPORT_HACK` 的说明和 §183。
+        ★ **调试级**（D112）。它当初是「连按 A/D 会不会被客户端当成异常输入」
+        的取证口（§183），而那件事已经结案（§186 / D106）。客户端自带的
+        `(FastFire)` 判据只看按键频率，玩家一激动就连报几十上百行 ——
+        典型的「频率由客户端决定」的噪声，不该占着运营流水。
         """
         text = parse_report_hack(payload)
         who = self.account_name or "?"
-        self.online(f"⚠ 客户端上报异常 账号={who!r} ip={self.peer()} 正文={text}")
+        self.online_debug(f"⚠ 客户端上报异常 账号={who!r} ip={self.peer()} 正文={text}")
 
     def on_peer_data(self, payload):
         """`0x040e` —— 把玩家之间的同步数据转给同房间的其他人（§149）。
@@ -5276,8 +5292,11 @@ class Conn:
             return
         gap = self.peer_gap_ms.summary()
         who = self.account_name or "?"
-        self.online(f"同步转发 账号={who!r} 转发耗时 {forward}"
-                    + (f"；到达间隔 {gap}" if gap else ""))
+        # ★ 这一行是**调试级**（D112）：它每 30 秒一发、每条连接各一份，
+        #   一局下来能把 online.log 撑得比运营事件多一个数量级，
+        #   而它只在专门查延迟的那几天有用（§187 那一轮就是靠它量出来的）。
+        self.online_debug(f"同步转发 账号={who!r} 转发耗时 {forward}"
+                          + (f"；到达间隔 {gap}" if gap else ""))
         self.peer_forward_ms.reset()
         self.peer_gap_ms.reset()
 

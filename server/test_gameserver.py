@@ -750,6 +750,7 @@ class LeaveSessionTests(unittest.TestCase):
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
         conn.online = lambda _msg: None
+        conn.online_debug = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1005,6 +1006,7 @@ class NoisyPacketLoggingTests(unittest.TestCase):
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
         conn.online = lambda _msg: None
+        conn.online_debug = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1098,6 +1100,7 @@ class DeathAndRespawnTests(unittest.TestCase):
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
         conn.online = lambda _msg: None
+        conn.online_debug = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1297,6 +1300,7 @@ class QuestScoreTests(unittest.TestCase):
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
         conn.online = lambda _msg: None
+        conn.online_debug = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1368,6 +1372,7 @@ class MapTransitionTests(unittest.TestCase):
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
         conn.online = lambda _msg: None
+        conn.online_debug = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1525,6 +1530,7 @@ class ItemDropTests(unittest.TestCase):
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
         conn.online = lambda _msg: None
+        conn.online_debug = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1637,6 +1643,7 @@ class QuestClearFlagTests(unittest.TestCase):
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
         conn.online = lambda _msg: None
+        conn.online_debug = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1765,6 +1772,7 @@ class ItemPickupTests(unittest.TestCase):
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
         conn.online = lambda _msg: None
+        conn.online_debug = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -1896,6 +1904,7 @@ class ResultScreenNumbersTests(unittest.TestCase):
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
         conn.online = lambda _msg: None
+        conn.online_debug = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -2067,6 +2076,7 @@ class QuestDifficultyTests(unittest.TestCase):
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
         conn.online = lambda _msg: None
+        conn.online_debug = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -2271,6 +2281,7 @@ class CharacterUnlockTests(unittest.TestCase):
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
         conn.online = lambda _msg: None
+        conn.online_debug = lambda _msg: None
         conn.args = self.Args()
         conn.sent = []
         conn.logged = []
@@ -2492,6 +2503,7 @@ class SendBatchTests(unittest.TestCase):
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
         conn.online = lambda _msg: None
+        conn.online_debug = lambda _msg: None
         conn.args = self.Args()
         conn.sock = self.FakeSocket()
         conn.cout = SimpleCipher.server_to_client()

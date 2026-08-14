@@ -77,6 +77,17 @@ USERNAME_RULE_TEXT = "用户名只能用 2~16 个英文字母、数字、下划�
 PASSWORD_MAX_LENGTH = 32
 PASSWORD_RULE_TEXT = "密码长度需为 1~32 个字符，且不能包含控制字符"
 
+#: 显示昵称规则：1~16 个字符，中文 / 韩文 / 英文都行，但**只限基本多文种平面**。
+#:
+#: ★ 「不许有 emoji」不是洁癖，是协议硬约束：`w_wstr()` 写的长度字段是
+#: **Python 的字符数**，正文却是 UTF-16LE。BMP 内的字符（含全部汉字）
+#: 一个字符恰好两字节，两者对得上；而 emoji 这类补充平面字符在 UTF-16 里
+#: 占**两个**码元 —— 长度字段会少算，客户端从这个包往后**整条流都解错位**。
+#: 与其在每个组包点去数码元，不如在入口把它们挡掉。
+NICKNAME_MAX_LENGTH = 16
+NICKNAME_RULE_TEXT = ("显示昵称最多 16 个字符，可以用中文，"
+                      "但不能包含表情符号或控制字符")
+
 #: `verify()` 的三态。
 AUTH_OK = "ok"
 AUTH_NO_SUCH_USER = "no_such_user"
@@ -112,6 +123,37 @@ def check_username(username):
     if not USERNAME_PATTERN.match(username):
         raise AccountError("invalid_username", USERNAME_RULE_TEXT)
     return username
+
+
+def check_nickname(nickname, username=""):
+    """校验并规范化**显示昵称**，返回真正要存的那个字符串。
+
+    留空 = 用用户名当昵称（需求原文：「留空时默认昵称为用户名」）。
+    首尾空白一律剃掉 —— 游戏里看不出来，却会让「看着一样的两个昵称」
+    绕过查重。
+    """
+    nickname = str(nickname or "").strip()
+    if not nickname:
+        return str(username or "").strip()
+    if len(nickname) > NICKNAME_MAX_LENGTH:
+        raise AccountError("invalid_nickname", NICKNAME_RULE_TEXT)
+    for ch in nickname:
+        # 控制字符会把包和 JSON 弄坏；补充平面字符会让 w_wstr 的长度字段
+        # 少算（见 NICKNAME_RULE_TEXT 上面那段），两类都必须挡在门外。
+        if ord(ch) < 0x20 or ord(ch) == 0x7f or ord(ch) > 0xffff:
+            raise AccountError("invalid_nickname", NICKNAME_RULE_TEXT)
+        if 0xd800 <= ord(ch) <= 0xdfff:          # 落单的代理项，同样解不回来
+            raise AccountError("invalid_nickname", NICKNAME_RULE_TEXT)
+    return nickname
+
+
+def nickname_key(nickname):
+    """昵称查重用的键。
+
+    大小写不敏感（`Alice` 和 `alice` 在屏幕上是两个人、在记忆里是一个人），
+    首尾空白已经在 `check_nickname` 里剃过，这里再剃一次防止直接调用。
+    """
+    return str(nickname or "").strip().casefold()
 
 
 def check_password(password):
@@ -268,11 +310,33 @@ class AccountStore:
         return account
 
     # ------------------------------------------------------------------ 注册
+    def nickname_owner(self, nickname, data=None):
+        """谁在用这个显示昵称？返回它的用户名，没人用就返回 `None`。
+
+        `data` 是已经读出来的存档字典（调用方持锁时传进来，避免重复读盘）。
+        """
+        key = nickname_key(nickname)
+        if not key:
+            return None
+        if data is None:
+            with self._lock:
+                data = self._read_unlocked()
+        for name, raw in data["accounts"].items():
+            # ★ 必须走 `_merged_account`：老存档里 `display_name` 可能是空的，
+            #   那时**用户名自己就是昵称**（`_merged_account` 会补上）。
+            #   直接读原始字段的话，「叫 bob 的老账号」挡不住新人把昵称起成 bob。
+            current = self._merged_account(name, raw)
+            if nickname_key(current.get("display_name")) == key:
+                return name
+        return None
+
     def register(self, username, password, display_name="", skip_tutorial=False):
         """注册新账号。重名或格式不合规抛 `AccountError`，成功返回账号字典。
 
         查重和写入在**同一把锁**里完成 —— 注册页可能被两个人同时提交，
         「先查再写」如果拆成两步就会让后一个人静默覆盖前一个人。
+        **用户名和显示昵称各查各的**，两条路的提示分开说（需求原文：
+        「用户名重复和昵称重复需要分别单独 check」）。
 
         `skip_tutorial=True` 就把新存档的 `tutorial_completed` 直接置上，
         于是首次登录时 `tutorial_state()` 回 3，客户端不再把人拉进强制教学关
@@ -285,14 +349,26 @@ class AccountStore:
         """
         username = check_username(username)
         password = check_password(password)
+        # 格式先于查重：昵称写得不合法时不该让人以为是「被别人占了」。
+        nickname = check_nickname(display_name, username)
         with self._lock:
             data = self._read_unlocked()
             if username in data["accounts"]:
                 raise AccountError(
                     "duplicate", "该用户名已存在，请在登录界面直接登录")
+            owner = self.nickname_owner(nickname, data)
+            if owner is not None:
+                # ★ 不告诉他是**谁**占的（那等于一个免费的账号枚举接口），
+                #   但要说清是昵称重了、不是用户名重了。
+                raise AccountError(
+                    "duplicate_nickname",
+                    f"显示昵称「{nickname}」已经被别人用了，请换一个"
+                    + ("。（昵称留空时默认用用户名，这里正是用户名撞上了别人的昵称）"
+                       if nickname == username and not str(display_name or "").strip()
+                       else "。"))
             account = self._merged_account(username, None)
             account["password"] = password
-            account["display_name"] = str(display_name or "").strip() or username
+            account["display_name"] = nickname
             account["tutorial_completed"] = bool(skip_tutorial)
             data["accounts"][username] = account
             self._write_unlocked(data)

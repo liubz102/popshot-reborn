@@ -340,8 +340,10 @@ function Invoke-ServerSmokeTest {
     $outFile  = Join-Path $work 'smoke.out'
     $errFile  = Join-Path $work 'smoke.err'
 
+    # --no-log-cleanup：自检不是「一次真的开服」，绝不该顺手把打包机
+    # logs\ 里的东西删掉（D113 的清理是挂在服务端启动路径上的）。
     $argList = @(
-        "`"$app`"", '--no-control', '--no-online-log',
+        "`"$app`"", '--no-control', '--no-online-log', '--no-log-cleanup',
         '--auth-port',  "$authPort",
         '--game-port',  "$gamePort",
         '--relay-port', "$relayPort",

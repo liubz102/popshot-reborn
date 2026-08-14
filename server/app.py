@@ -34,6 +34,7 @@ import authserver
 import config as server_config
 import eventlog
 import gameserver
+import logcleanup
 from account_store import AccountStore
 from netlisten import describe as describe_listen
 from tickets import TicketStore
@@ -104,6 +105,11 @@ def build_arg_parser():
                     help="逐包 hexdump + 抓包落盘。逆协议时开，日常别开")
     ap.add_argument("--no-online-log", action="store_true",
                     help="连接事件只打到屏幕，不写 logs/online.log")
+    ap.add_argument("--log-retention-days", type=int, default=None, metavar="天",
+                    help="logs/ 里超过这么多天没动过的日志文件会被删掉（0 = 不清理）。"
+                         "默认读 server.config 的 log_retention_days")
+    ap.add_argument("--no-log-cleanup", action="store_true",
+                    help="这次启动完全不清理日志（等价于 --log-retention-days 0）")
     # 游戏服那边的排查开关，原样透传。
     ap.add_argument("--hold-lobby", action="store_true",
                     help="游戏包一律不应答（纯抓包）")
@@ -174,11 +180,29 @@ def main(argv=None):
     log(f"账号存档: {accounts.path}（当前 {len(accounts.usernames())} 个账号）")
     log(f"配置文件: {config_path}")
     # 上下线流水另存一份：`server.out` 每次启动都会被覆盖，连接记录不该跟着没。
+    # `--verbose` 时另外放行 `eventlog.debug()`（转发耗时 / 中继 RTT 这类遥测，D112）。
     if args.no_online_log:
-        eventlog.configure(to_file=False)
+        eventlog.configure(to_file=False, verbose=args.verbose)
         log("连接日志: 只打到屏幕（--no-online-log）")
     else:
+        eventlog.configure(verbose=args.verbose)
         log(f"连接日志: {eventlog.path()}（谁连上、谁断开、从哪个 IP；精简模式也照记）")
+    if args.verbose:
+        log("调试日志: 已放行 [online-debug]（转发耗时 / 中继 RTT / 客户端异常上报）")
+
+    # 日志清理（D113）。**只在服务端真的启动时跑这一次** —— 启动脚本发现
+    # 服务端已在运行而跳过启动时，这里根本不会被执行到，正合需求。
+    # 之后每天凌晨 4 点再清一次（云主机常年开机，等不到下一次启动）。
+    retention = args.log_retention_days
+    if retention is None:
+        retention = cfg["log_retention_days"]
+    if args.no_log_cleanup:
+        retention = 0
+    if retention > 0:
+        log(f"日志清理 保留最近 {retention} 天（启动时清一次，之后每天 "
+            f"{logcleanup.DAILY_HOUR} 点清一次；后台线程，不挡游戏）")
+    # 关掉时那句「已关闭」由 `logcleanup.start` 自己说，免得打两遍。
+    logcleanup.start(days=retention, log=log)
 
     auth_args = _AuthArgs(accounts=args.accounts, verbose=args.verbose,
                           ticket_field=args.ticket_field,

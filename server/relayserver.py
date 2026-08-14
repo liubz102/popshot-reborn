@@ -369,10 +369,14 @@ class RelayConn:
         self.rtt_total.add(rtt_ms)
 
     def report_rtt(self, now=None, force=False):
-        """够 `RTT_REPORT_INTERVAL` 就往 `[online]` 打一行汇总，然后清窗口。
+        """够 `RTT_REPORT_INTERVAL` 就往 `[online-debug]` 打一行汇总，然后清窗口。
 
-        走 `eventlog` 而不是 `self.log()`：**精简模式下也要看得见**，
-        它是玩家报「卡」时唯一能对质的数字（同 §133 的道理）。
+        走 `eventlog` 而不是 `self.log()`：它是**跨连接**的一条时间线，
+        和逐包 dump 混在一起就没法一眼看完。
+
+        ★ **调试级**（D112）：每 30 秒一行 × 每条中继连接，是「频率由定时器
+        决定」的遥测，和转发耗时同一档。要量延迟就用 `start-debug.bat`
+        —— §187 那一轮本来也是这么跑的。
         """
         now = time.time() if now is None else now
         if not force and now - self.last_rtt_report_at < RTT_REPORT_INTERVAL:
@@ -382,7 +386,7 @@ class RelayConn:
         if summary is None:
             return
         lost = f" 丢={self.pings_lost}" if self.pings_lost else ""
-        eventlog.online(f"中继 RTT [{self.who()}] {summary}{lost}")
+        eventlog.debug(f"中继 RTT [{self.who()}] {summary}{lost}")
         self.rtt_window.reset()
 
     def feed(self, data):
@@ -454,7 +458,7 @@ class RelayConn:
             f"数据 收 {self.data_in} / 发 {self.data_out}；"
             f"ping {self.pings_out} 回 {self.pongs_in} 丢 {self.pings_lost}）")
         if rtt is not None:
-            eventlog.online(f"中继 RTT 汇总 [{self.who()}] {rtt}")
+            eventlog.debug(f"中继 RTT 汇总 [{self.who()}] {rtt}")
 
 
 class RelayServer:

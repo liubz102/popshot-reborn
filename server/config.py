@@ -52,11 +52,21 @@ DEFAULT_REGISTER_PORT = 27810
 #: 一次成功注册之后，**同一个客户端 IP** 要等多久才能再注册（秒）。
 #: 前台按钮的倒计时和后台的 IP 限制**共用这一个值**（需求明确要求一致）。
 #: `0` = 完全不限制。
-DEFAULT_REGISTER_COOLDOWN_SECONDS = 60
+#: ★ 2026-08-14 由 60 改成 20（用户拍板，D111）：60 秒挡住脚本的效果和 20 秒
+#: 差不多，而「一家人轮流注册」这种正常场景等 60 秒太难受。
+DEFAULT_REGISTER_COOLDOWN_SECONDS = 20
 
 #: 冷却时间的上限。24 小时已经远超「防批量注册」需要的量级，
 #: 再大多半是把毫秒填进来了 —— 与其让整台服务器一天不能注册，不如当填错处理。
 MAX_REGISTER_COOLDOWN_SECONDS = 86400
+
+#: 日志自动清理：`logs/` 里超过这么多天没动过的日志文件会被删掉。
+#: `0` = 不清理。触发时机见 `logcleanup.py`（服务端每次**真的启动**时一次 +
+#: 每天凌晨 4 点一次）。
+DEFAULT_LOG_RETENTION_DAYS = 3
+
+#: 保留天数的上限。10 年 —— 再大就等于「不清理」，那该填 0 而不是填 99999。
+MAX_LOG_RETENTION_DAYS = 3650
 
 #: 配置文件名。放在包根目录（= `start.bat` 同目录 = `server/` 的上一级）。
 CONFIG_FILENAME = "server.config"
@@ -77,6 +87,7 @@ DEFAULTS = {
     "proxy_username": "",
     "proxy_password": "",
     "register_cooldown_seconds": DEFAULT_REGISTER_COOLDOWN_SECONDS,
+    "log_retention_days": DEFAULT_LOG_RETENTION_DAYS,
 }
 
 #: 值要按**端口**解析的键（1~65535）。
@@ -85,6 +96,9 @@ _PORT_KEYS = ("server_register_port", "local_register_port", "proxy_port")
 #: 值要按**秒数**解析的键（0 ~ MAX_REGISTER_COOLDOWN_SECONDS，0 = 关闭）。
 #: 和端口分开是因为两者的合法区间不一样：秒数允许 0，端口不允许。
 _SECOND_KEYS = ("register_cooldown_seconds",)
+
+#: 值要按**天数**解析的键（0 ~ MAX_LOG_RETENTION_DAYS，0 = 关闭）。
+_DAY_KEYS = ("log_retention_days",)
 
 
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -108,18 +122,21 @@ def _clean_port(value, key, warnings):
     return port
 
 
-def _clean_seconds(value, key, warnings):
-    """秒数：允许 0（= 关掉这项限制），但不接受负数和离谱的大数。"""
+def _clean_count(value, key, warnings, maximum):
+    """「0 = 关掉这项功能」的计数值：允许 0，但不接受负数和离谱的大数。
+
+    秒数（注册冷却）和天数（日志保留）用的是同一套规则，只有上限不同。
+    """
     try:
-        seconds = int(str(value).strip())
+        count = int(str(value).strip())
     except (TypeError, ValueError):
         warnings.append(f"{key} 不是数字（{value!r}），改用默认值 {DEFAULTS[key]}")
         return DEFAULTS[key]
-    if not (0 <= seconds <= MAX_REGISTER_COOLDOWN_SECONDS):
-        warnings.append(f"{key} 超出 0~{MAX_REGISTER_COOLDOWN_SECONDS}"
-                        f"（{seconds}），改用默认值 {DEFAULTS[key]}")
+    if not (0 <= count <= maximum):
+        warnings.append(f"{key} 超出 0~{maximum}"
+                        f"（{count}），改用默认值 {DEFAULTS[key]}")
         return DEFAULTS[key]
-    return seconds
+    return count
 
 
 def parse_text(text: str):
@@ -147,7 +164,11 @@ def parse_text(text: str):
         if key in _PORT_KEYS:
             values[key] = _clean_port(value, key, warnings)
         elif key in _SECOND_KEYS:
-            values[key] = _clean_seconds(value, key, warnings)
+            values[key] = _clean_count(value, key, warnings,
+                                       MAX_REGISTER_COOLDOWN_SECONDS)
+        elif key in _DAY_KEYS:
+            values[key] = _clean_count(value, key, warnings,
+                                       MAX_LOG_RETENTION_DAYS)
         else:
             values[key] = value
     values["server_address"] = normalize_host(values["server_address"]) or \
@@ -279,10 +300,25 @@ local_register_port = 27810
 #   * 服务器也会记住这个 IP，这段时间里它再来注册一律拒绝。
 # 两边用的是同一个数字，改这里就都改了。
 #
-# 注册【失败】（用户名重复、两次密码不一致等）不算，按钮会立刻恢复可点。
+# 注册【失败】（用户名重复、昵称重复、两次密码不一致等）不算，按钮会立刻恢复可点。
 # 填 0 = 完全不限制。IP 记录只放在内存里，服务端一重启就清空。
 # ---------------------------------------------------------------------------
 register_cooldown_seconds = 20
+
+# ---------------------------------------------------------------------------
+# 日志自动清理 —— logs\ 目录里超过这么多天没再写过的日志文件会被删掉。
+#
+# 清理时机有两个：
+#   * 服务端【每次真正启动】时一次（本机游玩经常开关，覆盖这种场景）；
+#     启动脚本发现服务端已经在跑而跳过启动时，清理也跟着跳过。
+#   * 每天【凌晨 4 点】一次（云服务器常年开机，覆盖这种场景）。
+# 两次都在后台线程里做，不会影响正在进行的游戏。
+#
+# 清的是 logs\ 里的日志文件（*.log / *.out / *.err / game_* / auth_* / conn_*），
+# 判据是文件最后修改时间；正在写的日志因此不会被删。
+# 填 0 = 不清理。
+# ---------------------------------------------------------------------------
+log_retention_days = 3
 
 # ---------------------------------------------------------------------------
 # 说明：

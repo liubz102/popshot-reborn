@@ -105,7 +105,12 @@
     <form id="reg" autocomplete="off">
       <label for="u">用户名</label>
       <input id="u" type="text" maxlength="16" autocomplete="off">
-      <div class="hint">__USERNAME_RULE__</div>
+      <div class="hint">__USERNAME_RULE__。<b>用户名是登录游戏时输入的账号</b>，注册后不能改。</div>
+
+      <label for="nick">显示昵称</label>
+      <input id="nick" type="text" maxlength="16" autocomplete="off" placeholder="留空则和用户名一样">
+      <div class="hint"><b>显示昵称是游戏里别人看到的名字</b>（房间座位、聊天、玩家列表）。__NICKNAME_RULE__。<b>留空时默认和用户名一样。</b></div>
+      <!-- <div class="hint">用户名和显示昵称都不能和别人重复，两者会分别检查。</div> -->
 
       <label for="p1">密码</label>
       <input id="p1" type="password" maxlength="32" autocomplete="new-password">
@@ -272,6 +277,9 @@ document.getElementById("reg").addEventListener("submit", function (event) {
   regSetBusy("注册中…");
   post("/api/register", {
     username: username, password: p1, password2: p2,
+    /* 留空就交给服务端去补成用户名 —— 前后台各补一次的话，
+       将来改规则必然只改一边。 */
+    display_name: document.getElementById("nick").value.trim(),
     skip_tutorial: document.getElementById("skipTut").checked
   })
     .then(function (r) {

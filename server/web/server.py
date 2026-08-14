@@ -8,8 +8,8 @@
 路由：
 
     GET  /                页面本身（`index.html`，把服务器地址替换进去）
-    POST /api/register    {username, password, password2, skip_tutorial}
-                                                          -> {ok, message}
+    POST /api/register    {username, password, password2, display_name,
+                           skip_tutorial}                 -> {ok, message}
     POST /api/export      {username, password}            -> {ok, message, save}
     POST /api/import      {username, password, save}      -> {ok, message}
 
@@ -39,8 +39,8 @@ if __name__ == "__main__":
     # `__main__` 块里是没用的，模块级 import 早就先执行过了。
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from account_store import (AUTH_MESSAGES, AUTH_OK, USERNAME_RULE_TEXT,
-                           AccountError, AccountStore)
+from account_store import (AUTH_MESSAGES, AUTH_OK, NICKNAME_RULE_TEXT,
+                           USERNAME_RULE_TEXT, AccountError, AccountStore)
 import config as server_config
 import eventlog
 from netlisten import create_listener
@@ -194,6 +194,7 @@ def render_index(server_address, cooldown=0):
     return (html
             .replace("__SERVER_ADDRESS__", _escape(server_address))
             .replace("__USERNAME_RULE__", _escape(USERNAME_RULE_TEXT))
+            .replace("__NICKNAME_RULE__", _escape(NICKNAME_RULE_TEXT))
             # 页面上的倒计时长度。整数，直接进 JS 字面量，不用转义也转不出花来。
             .replace("__REGISTER_COOLDOWN__", str(max(0, int(cooldown)))))
 
@@ -356,25 +357,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
         username = data.get("username", "")
         password = data.get("password", "")
         password2 = data.get("password2", password)
+        # 显示昵称：留空 = 用用户名。用户名重复和昵称重复由 `register()`
+        # 分别检查、分别报错（需求要求两条路的提示能分得开）。
+        display_name = data.get("display_name", "")
         # 缺字段 = 维持原版行为（走教程）。页面上那个框默认勾着，但它每次都显式发。
         skip_tutorial = self._as_bool(data.get("skip_tutorial"), False)
         if password != password2:
             self._reply(False, "两次输入的密码不一致，请重新输入。")
             return
         account = self.accounts.register(username, password,
+                                         display_name=display_name,
                                          skip_tutorial=skip_tutorial)
+        nickname = account["display_name"]
         # 只有真的建成了才开始计时（上面那些失败路径都不会走到这里）。
         cooldown = self.limiter.mark(client_ip)
-        self.log_message("注册成功: %s (跳过新手教程=%s)",
-                         account["display_name"], skip_tutorial)
-        eventlog.online(f"注册页 ✓ 新账号 账号={username!r} "
+        self.log_message("注册成功: %s (昵称=%s, 跳过新手教程=%s)",
+                         username, nickname, skip_tutorial)
+        eventlog.online(f"注册页 ✓ 新账号 账号={username!r} 昵称={nickname!r} "
                         f"ip={self.client_label()} "
                         f"跳过新手教程={'是' if skip_tutorial else '否'}"
                         + (f" 该 IP 冷却 {cooldown} 秒" if cooldown else ""))
         tail = ("首次登录会直接进大厅，不再强制新手教程。" if skip_tutorial
                 else "首次登录会先带你走一遍新手教程。")
         self._reply(True,
-                    f"注册成功！现在可以在游戏登录界面用「{username}」登录了。{tail}",
+                    f"注册成功！现在可以在游戏登录界面用「{username}」登录了，"
+                    f"游戏里显示的昵称是「{nickname}」。{tail}",
                     retry_after=cooldown)
 
     def _api_export(self, data):

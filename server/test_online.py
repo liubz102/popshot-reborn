@@ -312,6 +312,9 @@ class GameLoginTests(unittest.TestCase):
         # 连接事件日志：测试里只收进列表，不落盘也不打屏幕。
         conn.online_events = []
         conn.online = conn.online_events.append
+        # 调试级那一档单独收，免得和运营事件混在一起（D112）。
+        conn.online_debug_events = []
+        conn.online_debug = conn.online_debug_events.append
         conn.vlog = lambda _msg: None
         conn.last_packet_at = 0.0
         conn.noisy_seen = set()
@@ -614,6 +617,67 @@ class RegisterWebTests(unittest.TestCase):
                            "password2": "pw"})
         self.assertFalse(again["ok"])
         self.assertIn("该用户名已存在，请在登录界面直接登录", again["message"])
+
+    # -- 显示昵称（会话 21）--------------------------------------------------
+    def test_the_page_has_a_nickname_box_that_explains_itself(self):
+        with urllib.request.urlopen(self.url("/"), timeout=10) as response:
+            html = response.read().decode("utf-8")
+        self.assertIn('<input id="nick"', html)
+        self.assertIn("display_name:", html)
+        # 需求：页面上要有小字说清「用户名用来登录，昵称是游戏里显示的」。
+        self.assertIn("用户名是登录游戏时输入的账号", html)
+        self.assertIn("显示昵称是游戏里别人看到的名字", html)
+        self.assertIn("留空时默认和用户名一样", html)
+        # 占位符必须被替换掉，别把 __NICKNAME_RULE__ 原样发到玩家脸上。
+        self.assertNotIn("__NICKNAME_RULE__", html)
+        self.assertIn("表情符号", html)          # 昵称规则本身也要显示出来
+
+    def test_register_stores_the_nickname(self):
+        reply = self.post("/api/register",
+                          {"username": self.who, "password": "pw",
+                           "password2": "pw", "display_name": "炮炮火枪手"})
+        self.assertTrue(reply["ok"], reply)
+        self.assertIn("炮炮火枪手", reply["message"])
+        self.assertEqual("炮炮火枪手",
+                         self.accounts.get_account(self.who)[1]["display_name"])
+
+    def test_register_without_a_nickname_falls_back_to_the_username(self):
+        reply = self.post("/api/register",
+                          {"username": self.who, "password": "pw",
+                           "password2": "pw", "display_name": "   "})
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(self.who,
+                         self.accounts.get_account(self.who)[1]["display_name"])
+
+    def test_a_duplicate_nickname_says_so_in_its_own_words(self):
+        # ★ 昵称上限 16 个字符，别拿 `self.who` 再拼一截 —— 会超长，
+        #   那时失败的原因是「格式不合法」而不是「重名」，用例就白测了。
+        taken = f"nick{self.counter}"
+        first = self.post("/api/register",
+                          {"username": self.who, "password": "pw",
+                           "password2": "pw", "display_name": taken})
+        self.assertTrue(first["ok"], first)
+        reply = self.post("/api/register",
+                          {"username": f"{self.who}b", "password": "pw",
+                           "password2": "pw", "display_name": taken})
+        self.assertFalse(reply["ok"])
+        self.assertIn("显示昵称", reply["message"])
+        self.assertNotIn("用户名已存在", reply["message"])
+        self.assertFalse(self.accounts.has_account(f"{self.who}b"))
+        # ★ 重名不该触发冷却（和 D107 一致），但这一组的冷却本来就是 0，
+        #   所以这里只验「换个昵称立刻就能注册成功」。
+        ok = self.post("/api/register",
+                       {"username": f"{self.who}b", "password": "pw",
+                        "password2": "pw", "display_name": f"{taken}2"})
+        self.assertTrue(ok["ok"], ok)
+
+    def test_a_bad_nickname_is_reported_in_chinese(self):
+        reply = self.post("/api/register",
+                          {"username": self.who, "password": "pw",
+                           "password2": "pw", "display_name": "太长了" * 6})
+        self.assertFalse(reply["ok"])
+        self.assertIn("显示昵称", reply["message"])
+        self.assertFalse(self.accounts.has_account(self.who))
 
     def test_the_page_ships_the_skip_tutorial_box_checked(self):
         with urllib.request.urlopen(self.url("/"), timeout=10) as response:
