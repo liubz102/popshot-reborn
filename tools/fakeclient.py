@@ -55,6 +55,9 @@ fakeclient.py —— 用 Python 冒充第二个游戏客户端（大厅部分）
     respawn           发 0x0413「我要重生」
     drop [物件id]     发 0x0406 gcpCreateItem，等服务端回 0x0404 派句柄
     pickup <句柄>     发 0x0407 gcpGetItem「我踩到这件了」（十六进制也行）
+    useitem [槽位]    发 0x040c「按 Ctrl 用道具」（真客户端**恒发 0**，§194）。
+                      服务端应当回一发 0x040c（只给自己，扣掉那一格）+
+                      广播一发 0x040a（道具效果作用到那个座位）
     score <分数>      发 0x0410 gcpUpdateQuestScore（**累计**分数）
     cleared           发 0x0417 gcpMarkQuestSuccess(1)「这一关打通了」
     nextmap <名字>    发 0x0411 gcpReqChangeToNextMap
@@ -94,6 +97,7 @@ from gameserver import (                                 # noqa: E402
     DESCRIPTOR_SENT_ARGUMENT_COUNTS,
     GCP_NAMES, MAGIC_CTRL, MAGIC_GAME, OP_CHAT, OP_COUNT_GAME_READY,
     OP_CREATED_ITEM, OP_CREATE_ITEM, OP_END_QUEST, OP_GET_ITEM,
+    OP_GRANT_ITEM, OP_ITEM_EFFECT, OP_USE_ITEM, ITEM_NAMES,
     OP_JOIN_RELAY, OP_LEAVE_RELAY, OP_LEAVE_RESULT, OP_LOADING_DONE,
     OP_MAP_LOADING_DONE, OP_MARK_QUEST_SUCCESS, OP_PICKED_ITEM,
     OP_REP_GAME_RESULT, OP_REP_QUEST_SCORE, OP_REPORT_HP_ZERO,
@@ -475,6 +479,19 @@ def describe(opcode, payload):
         if opcode == OP_PICKED_ITEM and len(payload) >= 8:
             seat, handle = struct.unpack_from("<iI", payload)
             return f"  ★ 拾取放行 座位={seat} 句柄=0x{handle:08x}"
+        if opcode == OP_GRANT_ITEM and len(payload) >= 4:
+            # 0x040b：往**收包这台机器上的本地玩家**的道具槽里塞一件（§194）。
+            item_id = struct.unpack_from("<i", payload)[0]
+            return (f"  ★ 进我的道具槽 物件={item_id} "
+                    f"{ITEM_NAMES.get(item_id, '未知物件')}")
+        if opcode == OP_USE_ITEM and len(payload) >= 4:
+            slot = struct.unpack_from("<i", payload)[0]
+            return f"  ★ 我的道具槽第 {slot} 格被拿掉（用掉了）"
+        if opcode == OP_ITEM_EFFECT and len(payload) >= 16:
+            seat, arg3, item_id, arg2 = struct.unpack_from("<iiii", payload)
+            return (f"  ★ 道具效果 座位={seat} 物件={item_id} "
+                    f"{ITEM_NAMES.get(item_id, '未知物件')} "
+                    f"(arg2={arg2} arg3={arg3})")
         if opcode == OP_REP_QUEST_SCORE and len(payload) >= 8:
             seat, score = struct.unpack_from("<ii", payload)
             return f"  ★ 分数 座位={seat} -> {score}"
@@ -656,6 +673,9 @@ def run_script(client, tokens):
             handle = int(tokens.pop(0), 0)
             seat = client.my_seat if client.my_seat is not None else 0
             client.send_game(OP_GET_ITEM, w_i32(seat) + w_i32(handle))
+        elif cmd == "useitem":
+            slot = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 0
+            client.send_game(OP_USE_ITEM, w_i32(slot))
         elif cmd == "score":
             client.send_game(OP_UPDATE_QUEST_SCORE, w_i32(int(tokens.pop(0))))
         elif cmd == "cleared":

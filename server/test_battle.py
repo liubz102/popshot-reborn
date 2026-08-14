@@ -31,9 +31,10 @@ from gameserver import (                                       # noqa: E402
     CONTROLLER_SLOT_COUNT,
     OP_BROADCAST_DEATH, OP_CHANGE_CONTROLLER_SLOT,
     OP_COUNT_GAME_READY, OP_CREATED_ITEM, OP_CREATE_ITEM,
-    OP_END_GAME, OP_END_QUEST, OP_GET_ITEM, OP_LEAVE_SESSION, OP_LOADING_DONE,
+    OP_END_GAME, OP_END_QUEST, OP_GET_ITEM, OP_GRANT_ITEM, OP_ITEM_EFFECT,
+    OP_LEAVE_SESSION, OP_LOADING_DONE,
     OP_MAP_CHANGE_READY, OP_MAP_LOADING_DONE, OP_MARK_QUEST_SUCCESS,
-    OP_MOVE_INTO_SESSION, OP_PEER_DATA_UP, OP_PICKED_ITEM,
+    OP_MOVE_INTO_SESSION, OP_PEER_DATA_UP, OP_PICKED_ITEM, OP_USE_ITEM,
     OP_REP_CHANGE_TO_NEXT_MAP,
     OP_REP_GAME_RESULT, OP_REP_QUEST_SCORE, OP_REPORT_HP_ZERO,
     OP_REQ_CHANGE_TO_NEXT_MAP, OP_REQ_RESPAWN, OP_RESPAWN_CHARACTER,
@@ -638,6 +639,219 @@ class QuestRoomItemSpawnTests(ItemSpawnBase):
     def test_nothing_is_spawned(self):
         self.spawn_many(5)
         self.assertEqual([], opcodes(self.alice))
+
+
+# ----------------------------------------------------------------------------
+# 道具槽：捡到之后进不进得了道具栏、按 Ctrl 用不用得出去（§194 / D110）
+#
+# 用户实机报的：「走过去有捡起的动画和音效，道具也会消失，但是道具栏不会
+# 显示新捡的道具，也无法使用」。
+#
+# 根因：`0x0405` 拾取放行对 PvP 道具**只把箱子抹掉 + 放特效**。道具进槽只有
+# `0x040b`、离开槽只有 `0x040c`、效果生效只有 `0x040a` —— 三个包在客户端里
+# 各自只有一个调用点，全都得服务端发。
+# ----------------------------------------------------------------------------
+class ItemSlotBase(ItemSpawnBase):
+    """道具模式的房间，且带上「刷一件 -> 捡走」的两个夹具。"""
+
+    def spawn_one(self):
+        """刷一件道具，返回 `(句柄, 物件 id)`。"""
+        self.due_now()
+        self.tick()
+        handle, item_id, _x, _y = self.spawned()[-1]
+        return handle, item_id
+
+    def pick(self, conn, seat_id, handle):
+        gameserver.Conn.on_game_packet(conn, OP_GET_ITEM,
+                                       get_item_payload(seat_id, handle))
+
+    def spawn_and_pick(self, conn=None, seat_id=0):
+        """刷一件并让某个座位捡走，返回物件 id。"""
+        conn = conn or self.alice
+        handle, item_id = self.spawn_one()
+        self.clear()
+        self.pick(conn, seat_id, handle)
+        return item_id
+
+    def use(self, conn, slot_index=0):
+        gameserver.Conn.on_game_packet(conn, OP_USE_ITEM,
+                                       w_i32(slot_index))
+
+    def effects(self, conn):
+        """某条连接收到的 `0x040a`，解成 `(座位, arg3, 物件 id, arg2)`。"""
+        return [struct.unpack(gameserver.ITEM_EFFECT_FORMAT, body)
+                for body in bodies(conn, OP_ITEM_EFFECT)]
+
+
+class ItemGrantTests(ItemSlotBase):
+
+    def test_picking_up_a_pvp_item_also_grants_it(self):
+        # ★ 这就是用户报的那条：没有这一发，箱子没了但道具栏是空的。
+        self.spawn_and_pick()
+        self.assertIn(OP_GRANT_ITEM, opcodes(self.alice))
+
+    def test_the_grant_carries_the_id_that_was_on_the_ground(self):
+        item_id = self.spawn_and_pick()
+        self.assertEqual([w_i32(item_id)], bodies(self.alice, OP_GRANT_ITEM))
+
+    def test_the_grant_goes_only_to_the_one_who_picked_it_up(self):
+        # ★★ `0x040b` 的处理器（`0x55206b`）用的是 `0x409f39`
+        #    = **收包这台机器上的本地玩家**，包里根本没有座位号。
+        #    广播出去就是「一个箱子人手一件」。
+        self.spawn_and_pick()
+        self.assertNotIn(OP_GRANT_ITEM, opcodes(self.bob))
+
+    def test_the_grant_follows_the_seat_in_the_request_not_the_sender(self):
+        # 收件人由 `0x0407` 里的座位号决定（那一格是 `[Character+0x2ac]`）。
+        handle, _item_id = self.spawn_one()
+        self.clear()
+        self.pick(self.alice, 1, handle)          # 座位 1 = bob
+        self.assertIn(OP_GRANT_ITEM, opcodes(self.bob))
+        self.assertNotIn(OP_GRANT_ITEM, opcodes(self.alice))
+
+    def test_the_pickup_broadcast_still_reaches_everyone(self):
+        # 补发 `0x040b` 不能把原来那一发 `0x0405` 挤掉 —— 别人屏幕上的
+        # 箱子还得靠它消失。
+        self.spawn_and_pick()
+        self.assertIn(OP_PICKED_ITEM, opcodes(self.alice))
+        self.assertIn(OP_PICKED_ITEM, opcodes(self.bob))
+
+    def test_the_grant_comes_after_the_pickup(self):
+        # 先放行再给道具：反过来的话客户端会在物件还在世界里时就多一件。
+        self.spawn_and_pick()
+        seq = [op for op in opcodes(self.alice)
+               if op in (OP_PICKED_ITEM, OP_GRANT_ITEM)]
+        self.assertEqual([OP_PICKED_ITEM, OP_GRANT_ITEM], seq)
+
+    def test_a_coin_is_never_granted(self):
+        # ★ 金币 / 红心的 `[item+0x2a9]` 是 0，拾取当场就生效了
+        #   （`Item::vf_d4` 那条 `vf_11c` 分支）。再发一发 `0x040b`
+        #   等于凭空往道具栏里塞一件根本不存在的东西。
+        gameserver.Conn.on_game_packet(self.alice, OP_CREATE_ITEM,
+                                       create_item_payload(item_id=10101))
+        handle = struct.unpack_from("<I", bodies(self.alice,
+                                                 OP_CREATED_ITEM)[0], 0)[0]
+        self.clear()
+        self.pick(self.alice, 0, handle)
+        self.assertEqual([OP_PICKED_ITEM], opcodes(self.alice))
+        self.assertEqual([], self.quest.item_slots[0])
+
+    def test_an_unknown_handle_is_not_granted(self):
+        # 协议试探 / 控制通道手搓出来的句柄我们没记过类型，宁可不发。
+        self.clear()
+        self.pick(self.alice, 0, ITEM_HANDLE_BASE + 999)
+        self.assertEqual([OP_PICKED_ITEM], opcodes(self.alice))
+
+    def test_the_mirror_follows_what_was_granted(self):
+        first = self.spawn_and_pick()
+        second = self.spawn_and_pick()
+        self.assertEqual([first, second], self.quest.item_slots[0])
+        self.assertEqual([], self.quest.item_slots[1])
+
+    def test_a_full_slot_stops_granting(self):
+        # ★ 客户端 `AddItem` 扫不到空格就**整个函数什么都不做**。我们这边
+        #   要是照记不误，之后按 Ctrl 就会用出一件客户端没有的道具。
+        for _ in range(gameserver.ITEM_SLOT_COUNT):
+            self.spawn_and_pick()
+        self.assertEqual(gameserver.ITEM_SLOT_COUNT,
+                         len(self.quest.item_slots[0]))
+        self.clear()
+        self.spawn_and_pick()
+        self.assertEqual([OP_PICKED_ITEM], opcodes(self.alice),
+                         "满了就只放行拾取，不再发 0x040b")
+        self.assertEqual(gameserver.ITEM_SLOT_COUNT,
+                         len(self.quest.item_slots[0]))
+
+
+class ItemUseTests(ItemSlotBase):
+
+    def test_using_an_item_takes_it_out_of_the_slot(self):
+        self.spawn_and_pick()
+        self.clear()
+        self.use(self.alice)
+        self.assertIn(OP_USE_ITEM, opcodes(self.alice))
+        self.assertEqual([], self.quest.item_slots[0])
+
+    def test_the_removal_goes_only_to_the_one_who_used_it(self):
+        # `0x040c` 的处理器同样按「收包机器上的本地玩家」认人。
+        self.spawn_and_pick()
+        self.clear()
+        self.use(self.alice)
+        self.assertNotIn(OP_USE_ITEM, opcodes(self.bob))
+
+    def test_the_removal_echoes_the_slot_index(self):
+        self.spawn_and_pick()
+        self.spawn_and_pick()
+        self.clear()
+        self.use(self.alice, slot_index=1)
+        self.assertEqual([w_i32(1)], bodies(self.alice, OP_USE_ITEM))
+
+    def test_the_effect_reaches_everyone(self):
+        # ★ 不广播的话别人屏幕上你既不加速也不亮护盾，而伤害是各机器各算的。
+        self.spawn_and_pick()
+        self.clear()
+        self.use(self.alice)
+        self.assertIn(OP_ITEM_EFFECT, opcodes(self.alice))
+        self.assertIn(OP_ITEM_EFFECT, opcodes(self.bob))
+        self.assertEqual(bodies(self.alice, OP_ITEM_EFFECT),
+                         bodies(self.bob, OP_ITEM_EFFECT))
+
+    def test_the_effect_carries_the_seat_and_the_item_id(self):
+        item_id = self.spawn_and_pick()
+        self.clear()
+        self.use(self.alice)
+        self.assertEqual(
+            [(0, gameserver.ITEM_EFFECT_ARG3, item_id,
+              gameserver.ITEM_EFFECT_ARG2)],
+            self.effects(self.bob))
+
+    def test_the_effect_names_the_user_not_the_receiver(self):
+        handle, item_id = self.spawn_one()
+        self.clear()
+        self.pick(self.bob, 1, handle)
+        self.use(self.bob)
+        self.assertEqual([(1, gameserver.ITEM_EFFECT_ARG3, item_id,
+                           gameserver.ITEM_EFFECT_ARG2)],
+                         self.effects(self.alice))
+
+    def test_items_are_used_first_in_first_out(self):
+        first = self.spawn_and_pick()
+        second = self.spawn_and_pick()
+        self.clear()
+        self.use(self.alice)
+        self.use(self.alice)
+        self.assertEqual([first, second],
+                         [eff[2] for eff in self.effects(self.bob)])
+
+    def test_using_an_empty_slot_replies_nothing(self):
+        # 没捡过就按 Ctrl（或者连按两下）—— 一个包都不回，同拾取被拒的处置。
+        self.clear()
+        self.use(self.alice)
+        self.assertEqual([], opcodes(self.alice))
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_using_twice_only_works_once(self):
+        self.spawn_and_pick()
+        self.use(self.alice)
+        self.clear()
+        self.use(self.alice)
+        self.assertEqual([], opcodes(self.alice))
+
+    def test_a_short_payload_is_ignored(self):
+        self.spawn_and_pick()
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_USE_ITEM, b"\x00")
+        self.assertEqual([], opcodes(self.alice))
+        self.assertEqual(1, len(self.quest.item_slots[0]),
+                         "解析失败绝不能把道具吃掉")
+
+    def test_one_players_items_are_not_the_others(self):
+        handle, _ = self.spawn_one()
+        self.pick(self.alice, 0, handle)
+        self.clear()
+        self.use(self.bob)                       # bob 手上什么都没有
+        self.assertEqual([], opcodes(self.bob))
+        self.assertEqual(1, len(self.quest.item_slots[0]))
 
 
 # ----------------------------------------------------------------------------
@@ -1257,6 +1471,77 @@ class RoomQuestTests(unittest.TestCase):
         quest = RoomQuest()
         handles = [quest.allocate_item() for _ in range(5)]
         self.assertEqual(len(handles), len(set(handles)))
+
+    # -- 道具槽（§194）------------------------------------------------------
+    def test_the_slot_wire_format_is_one_int32(self):
+        # ⚠ §193 初记的「u16」是错的：两个处理器读字段用的是 `0x5d5984`
+        #   = `Read(&buf, 4)`。u16 那个原语是 `0x5d5942`。
+        self.assertEqual(b"\x63\x28\x00\x00",
+                         gameserver.build_grant_item(10339))
+        self.assertEqual(b"\x02\x00\x00\x00", gameserver.build_use_item(2))
+        self.assertEqual(2, gameserver.parse_use_item(b"\x02\x00\x00\x00"))
+
+    def test_parse_use_item_rejects_a_short_payload(self):
+        with self.assertRaises(ValueError):
+            gameserver.parse_use_item(b"\x00\x00")
+
+    def test_the_effect_wire_format_puts_the_item_id_third(self):
+        # 处理器 `0x551d95` 的 push 顺序是 F1 / F3 / F2 ->
+        # `UseItemEffect(F2, F3, F1)`，所以**道具 id 落在第 3 个字段**。
+        # 抄的是客户端自己那条 `PvpItem::vf_11c`：`(id, 0, -1)`。
+        self.assertEqual(
+            struct.pack("<iiii", 4, -1, 10300, 0),
+            gameserver.build_item_effect(4, 10300))
+
+    def test_remember_item_is_what_makes_a_pickup_grantable(self):
+        quest = RoomQuest()
+        self.assertIsNone(quest.item_id_of(0x40000000))
+        quest.remember_item(0x40000000, 10301)
+        self.assertEqual(10301, quest.item_id_of(0x40000000))
+
+    def test_grant_item_stops_at_four(self):
+        quest = RoomQuest()
+        for i in range(gameserver.ITEM_SLOT_COUNT):
+            self.assertTrue(quest.grant_item(0, 10300 + i))
+        self.assertFalse(quest.grant_item(0, 10307),
+                         "客户端 AddItem 满了就什么都不做，镜像必须跟着停")
+        self.assertEqual(gameserver.ITEM_SLOT_COUNT,
+                         len(quest.item_slots[0]))
+
+    def test_grant_item_ignores_seats_out_of_range(self):
+        quest = RoomQuest()
+        self.assertFalse(quest.grant_item(-1, 10300))
+        self.assertFalse(quest.grant_item(99, 10300))
+
+    def test_use_item_pops_and_shifts(self):
+        quest = RoomQuest()
+        for item_id in (10300, 10301, 10302):
+            quest.grant_item(1, item_id)
+        self.assertEqual(10301, quest.use_item(1, 1))
+        self.assertEqual([10300, 10302], quest.item_slots[1])
+        # 挪完之后「下一件」永远在第 0 格 —— 客户端也正是恒发 0。
+        self.assertEqual(10300, quest.use_item(1, 0))
+        self.assertEqual([10302], quest.item_slots[1])
+
+    def test_use_item_on_an_empty_slot_is_none(self):
+        quest = RoomQuest()
+        self.assertIsNone(quest.use_item(0, 0))
+        quest.grant_item(0, 10300)
+        self.assertIsNone(quest.use_item(0, 1))
+        self.assertIsNone(quest.use_item(9, 0))
+        self.assertIsNone(quest.use_item(0, -1))
+
+    def test_every_spawnable_item_is_grantable(self):
+        # 服务端刷什么就得能进槽 —— 刷了一件进不了槽的东西，
+        # 玩家看到的又是「捡了没用」。
+        for item_id in gameserver.PVP_ITEM_IDS + gameserver.PVP_TEAM_ITEM_IDS:
+            self.assertIn(item_id, gameserver.GRANTABLE_ITEM_IDS)
+
+    def test_quest_drops_are_not_grantable(self):
+        # 金币 / 红心 / 武器拾取当场生效（`[item+0x2a9] == 0`），不进槽。
+        for item_id in (10000, 10001, 10100, 10101, 10102, 10103,
+                        10200, 10201, 10202, 10603):
+            self.assertNotIn(item_id, gameserver.GRANTABLE_ITEM_IDS)
 
     # -- 控制者表（§180）---------------------------------------------------
     def test_the_wire_format_is_two_int32(self):

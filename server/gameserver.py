@@ -199,6 +199,34 @@ OP_GET_ITEM = 0x0407
 #: ★ **和客户端方向的 `rawLeaveGameResult` 同号**（D028 的又一例）。
 #: 客户端发的那一发是**空载荷**、意思是「结算界面看完了」，两者只能靠方向区分。
 OP_PICKED_ITEM = 0x0405
+
+# ---------------------------------------------------------------------------
+# ★★★ 道具槽那三个包（§194）—— 「捡到了但道具栏不显示、也用不了」的根因。
+#
+# `0x0405` 拾取放行只做两件事：把物件从世界里删掉 + 放拾取特效和音效
+# （PvP 道具的 `vf_d4` = `0x5224fe`，它调完基类 `0x51f447` 就只剩特效了）。
+# **它一个字都没往角色的道具槽里写。**  17 个 PvP 道具建构时第 4 个参数是 1
+# （`[item+0x2a9]`），所以基类那条 `if ([+0x2a9]==0) vf_11c()` 的「当场生效」
+# 分支对它们**恒不成立** —— 金币 / 红心走的才是那条。
+#
+# 逐个查过调用点，PvP 一局里这三件事各自**只有一条**通路，全在服务端手上：
+#
+#   | 要发生的事 | 客户端里唯一的入口 | 谁能触发 |
+#   |---|---|---|
+#   | 道具进 4 个槽 `[Character+0x764..0x770]` | `Character::AddItem` `0x517037` | **服务端发 `0x040b`**（`0x55206b`）|
+#   | 道具离开槽 | `Character::RemoveItem` `0x5170b4` | **服务端发 `0x040c`**（`0x552089`）|
+#   | 道具效果生效 | `Character::UseItemEffect` `0x508441` | **服务端发 `0x040a`**（`0x551d95`）|
+#
+# `AddItem` 的另一个调用点（`0x493ff3`）是换角色时从 `GameContext` 的备份里
+# 恢复，不是新道具；`RemoveItem` 和 `UseItemEffect` 则**各自只有那一个**
+# 调用点。按 Ctrl 时客户端做的全部事情就是发一发 `0x040c`（槽位恒 0，
+# `0x516335` 那段）再放一声音效 —— 效果、扣道具**都等服务端**。
+#
+# ⇒ 这是 V0.1 §108 / §111 / §113 / §115 和 V0.2 §191 之后**同一个形状的第六条链**。
+OP_ITEM_EFFECT = 0x040a       # 服务端 -> 客户端：让某个座位吃到某件道具的效果
+OP_GRANT_ITEM = 0x040b        # 服务端 -> 客户端：往**收包这个人**的道具槽里塞一件
+OP_USE_ITEM = 0x040c          # 两个方向同号：客户端「我要用第 N 格」/ 服务端「把第 N 格拿掉」
+
 OP_END_QUEST = 0x040f
 OP_UPDATE_QUEST_SCORE = 0x0410
 
@@ -359,6 +387,9 @@ GCP_NAMES = {
     # 拾取请求。RawPacket（8 字节 = 座位号 + 物件实例句柄），唯一发送点
     # 0x558e9a，只被 GameContext::SendGetItem(0x493a99) 调用（FINDINGS §115）。
     0x0407: "gcpGetItem",
+    # 「按 Ctrl 用道具」。RawPacket（一个 int32 = 道具槽序号，客户端恒发 0），
+    # 唯一发送点 0x559205，只被 Character 的输入处理 0x516367 调用（§194）。
+    0x040c: "rawUseItem",
     # 玩家之间的同步数据，外面包一层送到游戏服（§149）。RawPacket，没有 gcp 类名。
     0x040e: "rawPeerData",
     0x040f: "gcpEndQuest",
@@ -1820,6 +1851,31 @@ PVP_ITEM_IDS = (10300, 10301, 10302, 10303, 10304, 10306, 10307, 10308,
 #: 摆出来只会让人以为捡错了）。
 PVP_TEAM_ITEM_IDS = (10313, 10314)
 
+#: ★ 捡到之后**要进道具槽**的物件 id（§194）。
+#:
+#: 判据不是「谁刷的」而是**物件本身的类型**：这 17 个类构造时基类第 4 个参数
+#: 是 1（写进 `[item+0x2a9]`），于是 `Item::vf_d4`（`0x51f447`）那条
+#: 「当场生效」的分支对它们恒不成立 —— 它们必须先进槽、再按 Ctrl 用。
+#: 金币（10101/10102）、红心（10100）、武器（10200~10202）那些参数是 0，
+#: 拾取当场就生效，**绝不能**给它们发 `0x040b`（客户端会凭空多出一件道具）。
+GRANTABLE_ITEM_IDS = frozenset(PVP_ITEM_IDS + PVP_TEAM_ITEM_IDS)
+
+#: 角色身上的道具槽格数 —— `Character::AddItem`（`0x517037`）扫
+#: `[Character+0x764]` 起的 **4** 格找空位，满了就**整个函数什么都不做**。
+#: 服务端的镜像必须用同一个上限，否则「服务端以为你有 5 件」。
+ITEM_SLOT_COUNT = 4
+
+#: `0x040a` 里那两个跟着道具 id 一起下发的参数。
+#:
+#: 抄的是客户端自己那条路：`PvpItem::vf_11c`（`0x5225fb`）调
+#: `Character::UseItemEffect(道具id, 0, -1, "")`。`0x040a` 的处理器
+#: （`0x551d95`）做的就是把包里三个字段填进同一个调用，所以照抄这一组
+#: = 和客户端本地生效**逐参数一致**。两个参数在 `0x508441` 里都只被当作
+#: 局部变量重写，没有一条分支把它们当输入读，所以填什么其实都一样 ——
+#: 但保真项目里没有理由不照抄（D110）。
+ITEM_EFFECT_ARG2 = 0
+ITEM_EFFECT_ARG3 = -1
+
 #: 开局之后多久刷第一件、之后每隔多久刷一件、地图上最多同时躺几件。
 #:
 #: ★ **原版的数值已经无从考证**（服务端 15 年前就没了），这三个是我们定的
@@ -1977,10 +2033,115 @@ def build_picked_item(seat_id, instance_id):
         if [item+0x2a9] == 0: vf_11c(角色)   ; 生效（CoinItem1 加钱、HeartItem 回血…）
         vf_20()                              ; 从世界里删掉物件
 
-    服务端不需要知道这件是什么、值多少 —— 效果全在客户端本地算（§113 已经
-    确认拾取本身不再发任何包）。这里唯一的职责是**放行**。
+    ★★ **对 PvP 道具来说，这一发只是「把箱子从地上抹掉 + 放特效」。**
+    17 个 PvP 道具类的 `vf_d4` 是重写过的 `0x5224fe`：它调完基类
+    `0x51f447` 之后只剩「放拾取特效 / 音效 / 冒一行提示」，而基类那条
+    `if ([item+0x2a9] == 0) vf_11c()`（当场生效）对它们**恒不成立**
+    —— 参数是 1。所以拾取放行**不会**让道具进道具槽，那要另发
+    `0x040b`（`build_grant_item`，§194）。金币 / 红心 / 武器的
+    `[+0x2a9]` 是 0，走的才是当场生效那条，不需要 `0x040b`。
     """
     return struct.pack(GET_ITEM_FORMAT, int(seat_id), int(instance_id))
+
+
+#: `0x040b`（服务端方向）/ `0x040c`（两个方向）的线格式：**一个 int32**。
+#:
+#: ⚠ §193 初记的「u16」是错的：两个处理器读字段用的都是 `0x5d5984`，
+#: 而它是 `Read(&buf, 4)`（`0x5d598a` 那句 `push 4`）—— 读一个 int32。
+#: u16 的那个原语是 `0x5d5942`（`push 1` 是 u8）。已在 §194 更正。
+ITEM_SLOT_FORMAT = "<i"
+ITEM_SLOT_SIZE = struct.calcsize(ITEM_SLOT_FORMAT)
+
+
+def build_grant_item(item_id):
+    """opcode 0x040b（服务端 -> 客户端，4 字节）—— 「往你的道具槽里塞一件」。
+
+    处理器 `0x55206b`：
+
+        0x5d5984  读一个 int32 = 物件 id
+        0x409f39  取**本机玩家自己**的角色（`[GameSession]` -> `0x409e20`）
+        0x517037  Character::AddItem(id, 播提示=1)
+
+    ★★ **它认的是「收包的这台机器上的本地玩家」，包里没有座位号** ——
+    所以这一发**只能发给捡到东西的那个人**，广播出去等于人手一件。
+
+    `AddItem` 做三件事：把 id 写进第一个空槽 `[Character+0x764+i*4]`、
+    用 `ObjectFactory`（句柄 -1，不进 World）建一个图标对象存进
+    `[+0x778+i*4]` 和 `[+0x798]`、再起一个 3000 毫秒的提示计时器
+    （`[+0x788]`）。**4 格满了就整个函数什么都不做**，所以服务端要自己
+    卡住 `ITEM_SLOT_COUNT`，否则两边的槽会错位。
+    """
+    return struct.pack(ITEM_SLOT_FORMAT, int(item_id))
+
+
+def parse_use_item(payload):
+    """opcode 0x040c（客户端 -> 服务端，4 字节）—— 「我要用道具槽第 N 格」。
+
+    发送点 `0x516335`（`Character` 的输入处理）：按住 / 按下那个键
+    （输入状态 `[0x72e2bc]` 的 `+0x3a7` / `+0x3a5`）就
+
+        [栈上的字段] = 0            ; ★ 客户端**恒发 0**
+        序列化 0x559205（push 0x40c，写一个 int32）
+        发出去
+        放一声音效（id 0xd）
+
+    —— **然后什么都不做，等服务端**。效果和扣道具都在服务端手上（§194）。
+
+    恒发 0 是因为 `RemoveItem` 拿掉一格之后会把后面的往前挪，
+    所以「下一件要用的」永远在第 0 格。服务端照着包里的序号取，
+    不要自作主张改成别的 —— 万一将来客户端真发了别的值，跟着走才是对的。
+
+    返回槽位序号；长度不够就抛 ValueError。
+    """
+    if len(payload) < ITEM_SLOT_SIZE:
+        raise ValueError(
+            f"rawUseItem 只有 {len(payload)} 字节，要 {ITEM_SLOT_SIZE}")
+    return struct.unpack_from(ITEM_SLOT_FORMAT, payload, 0)[0]
+
+
+def build_use_item(slot_index):
+    """opcode 0x040c（服务端 -> 客户端，4 字节）—— 「把你的第 N 格拿掉」。
+
+    处理器 `0x552089`：读一个 int32 -> 取**本机**角色 -> `Character::RemoveItem`
+    （`0x5170b4`）：销毁那一格的图标对象、把后面的往前挪、末格清空。
+
+    ★ 和 `0x040b` 一样按「收包的本地玩家」认人，**只发给用道具的那个人**。
+    ★ `RemoveItem` 在整个客户端里**只有这一个调用点** —— 不回这一发，
+      道具就永远卡在槽里，玩家会觉得「按了没反应」。
+    """
+    return struct.pack(ITEM_SLOT_FORMAT, int(slot_index))
+
+
+#: `0x040a`（服务端方向）的线格式：4 个 int32，反序列化 `0x5590d5`。
+#:
+#:     +0x00  int32  座位号 -> [LobbyStage + 座位*4 + 0x1d0] 取角色（`0x404ff6`）
+#:     +0x04  int32  ┐ 处理器把这三个原样填进
+#:     +0x08  int32  │ `Character::UseItemEffect(第 0x08 个, 第 0x0c 个, 第 0x04 个, "")`
+#:     +0x0c  int32  ┘ （`0x551dc7`~`0x551dd2` 的 push 顺序）
+#:
+#: 也就是说**道具 id 在第 3 个字段**，不是第 2 个。顺序看着别扭，
+#: 但那正是客户端读的顺序，别按直觉重排。
+ITEM_EFFECT_FORMAT = "<iiii"
+ITEM_EFFECT_SIZE = struct.calcsize(ITEM_EFFECT_FORMAT)
+
+
+def build_item_effect(seat_id, item_id,
+                      arg2=ITEM_EFFECT_ARG2, arg3=ITEM_EFFECT_ARG3):
+    """opcode 0x040a（服务端 -> 客户端，16 字节）—— 「某个座位吃到某件道具的效果」。
+
+    处理器 `0x551d95` 把包里的座位号换成角色对象，再调
+    `Character::UseItemEffect`（`0x508441`）。那个函数先按 id 去
+    `Item.ini` 的记录表（`0x72e7f0`）里查这件道具的数据，查不到直接返回；
+    查到了就按 id 分支（全队道具 10313/10314 会在那里被换成 10308/10303
+    并对六个座位各来一遍），其余落到通用分支 `0x508de6` 按记录里的
+    数值加 buff。**服务端因此一点道具数值都不需要知道**（同 D046 的理由）。
+
+    ★★ **这一发要广播给全房间**：处理器按包里的**座位号**找角色，
+    每台机器上算出来的是同一个人。不广播的话别人屏幕上你既不会加速、
+    也不会亮护盾 —— 而伤害结算是各机器各算的，那就直接对不上了。
+    """
+    return struct.pack(ITEM_EFFECT_FORMAT,
+                       int(seat_id), int(arg3), int(item_id), int(arg2))
 
 
 #: `0x0408`（客户端方向）/ `0x0406`（服务端方向）的**线上**布局。
@@ -2418,6 +2579,16 @@ class RoomQuest:
         #: ★ **道具模式**：服务端刷在地图上、还没被人捡走的道具句柄（§191）。
         #: 只用来卡「地图上最多同时躺几件」，捡走了就从这里去掉。
         self.items_on_map = set()
+        #: 本局下发过的每一件 `0x0404` 的「句柄 -> 物件 id」（服务端刷的和
+        #: 客户端掉的都记）。★ 拾取放行时**只有靠它才知道捡到的是什么** ——
+        #: `0x0407` 只带句柄，而要不要补一发 `0x040b` 完全取决于物件类型（§194）。
+        self.item_handles = {}
+        #: 每个座位手上的道具 id（FIFO，最多 `ITEM_SLOT_COUNT` 件）。
+        #: 这是客户端 `[Character+0x764..0x770]` 那 4 格的**镜像**：
+        #: 是我们发 `0x040b` 把它填进去的，也只有我们发 `0x040c` 能拿掉，
+        #: 所以两边天然同步。按 Ctrl 的 `0x040c` 只带槽位序号不带 id，
+        #: **要发 `0x040a` 就必须靠这份镜像把 id 找回来**。
+        self.item_slots = [[] for _ in range(ROOM_SEAT_COUNT)]
         #: 已经广播过的死亡事件，键是 **(句柄, 客户端报的死亡次数)**（去重）。
         #: 为什么键里要带死亡次数：同一个角色会死很多次，只按句柄去重的话
         #: 第二次死就被吃掉了。而重复上报（两台机器同时判同一只怪死了）
@@ -2517,6 +2688,18 @@ class RoomQuest:
         self.next_item_handle += 1
         return handle
 
+    def remember_item(self, handle, item_id):
+        """记下「这个句柄上躺的是哪件东西」（§194）。
+
+        服务端刷的道具和客户端掉的金币**都要记** —— 拾取请求 `0x0407`
+        只带句柄，捡到之后要不要补一发 `0x040b` 全靠这张表反查物件类型。
+        """
+        self.item_handles[handle & 0xFFFFFFFF] = int(item_id)
+
+    def item_id_of(self, handle):
+        """这个句柄上是哪件东西？没记过就是 ``None``（当成不进道具槽处理）。"""
+        return self.item_handles.get(handle & 0xFFFFFFFF)
+
     def claim_item(self, handle, seat_id):
         """拾取仲裁。第一个来的返回 True，之后一律 False。
 
@@ -2530,6 +2713,39 @@ class RoomQuest:
         # 服务端刷的那件被人捡走了，地图上就少一件（配额腾出来）。
         self.items_on_map.discard(handle)
         return True
+
+    # -- 道具槽（§194）------------------------------------------------------
+    def grant_item(self, seat_id, item_id):
+        """把一件道具记进这个座位的槽。放得下返回 True，满了返回 False。
+
+        满了要返回 False 是**硬要求**：客户端 `AddItem`（`0x517037`）扫不到
+        空槽就**整个函数什么都不做**，我们这边却记上了的话，之后按 Ctrl
+        就会用出一件客户端根本没有的道具（效果照样生效，但那是凭空变的）。
+        """
+        seat = int(seat_id)
+        if not 0 <= seat < ROOM_SEAT_COUNT:
+            return False
+        slots = self.item_slots[seat]
+        if len(slots) >= ITEM_SLOT_COUNT:
+            return False
+        slots.append(int(item_id))
+        return True
+
+    def use_item(self, seat_id, slot_index):
+        """用掉这个座位第 N 格的道具。返回物件 id；那一格是空的就 ``None``。
+
+        取走之后后面的往前挪 —— 和客户端 `RemoveItem`（`0x5170b4`）里那段
+        「`[eax] = [eax+4]` 挪三次、末格清 0」是同一个语义，所以下一件
+        永远在第 0 格（客户端也正是恒发 0）。
+        """
+        seat = int(seat_id)
+        if not 0 <= seat < ROOM_SEAT_COUNT:
+            return None
+        slots = self.item_slots[seat]
+        index = int(slot_index)
+        if not 0 <= index < len(slots):
+            return None
+        return slots.pop(index)
 
     # -- 道具模式：往地图上刷道具（§191 / D109）------------------------------
     def due_item_spawn(self, now=None, team_mode=False, random_source=None):
@@ -2558,6 +2774,10 @@ class RoomQuest:
         y = rng.uniform(*ITEM_SPAWN_Y_RANGE)
         handle = self.allocate_item() & 0xFFFFFFFF
         self.items_on_map.add(handle)
+        # ★ 记进「句柄 -> 物件 id」表：捡起来之后要靠它才知道该不该补
+        # 一发 `0x040b` 把道具塞进槽（§194）。记在这里而不是调用方，
+        # 是为了「刷了一件却忘了记」这种漂移压根发生不了。
+        self.remember_item(handle, item_id)
         return handle, item_id, x, y
 
     # -- 死亡 / 重生 --------------------------------------------------------
@@ -4176,7 +4396,11 @@ class Conn:
         item_id, x, y = fields[0], fields[1], fields[2]
         # 掉落点在角色/怪物脚下，拿来当 respawn 的兜底坐标是合适的。
         self.last_position = (x, y)
-        handle = self.quest_state().allocate_item()
+        quest = self.quest_state()
+        handle = quest.allocate_item()
+        # 客户端掉的东西也要记类型：金币 / 红心不进道具槽，但关卡脚本
+        # 万一掉出一件 PvP 道具，捡起来照样要补 `0x040b`（§194）。
+        quest.remember_item(handle, item_id)
         self.items_created += 1
         name = ITEM_NAMES.get(item_id, "未知物件")
         self.vlog(f"   掉落请求: {item_id} {name} @ ({x:.0f}, {y:.0f}) "
@@ -4213,6 +4437,18 @@ class Conn:
         座位 -> 角色（`0x404ff6`）+ 句柄 -> 物件（`World::Find`）两把钥匙，
         两个都查得到才调 `item->vft[0xd4](角色)`，所以别人机器上会看到
         「东西没了、是那个人拿走的」。不广播的话东西只在捡的人那边消失。
+
+        ## ★★ PvP 道具还要再补一发 `0x040b`（§194）
+
+        `0x0405` 对 PvP 道具**只是把箱子抹掉 + 放特效**（它们的 `vf_d4`
+        重写成了 `0x5224fe`，基类那条「当场生效」的分支恒不成立）。
+        道具真正进 4 个槽只有一条路：服务端发 `0x040b` ->
+        `Character::AddItem`。用户报的「有捡起动画、箱子也没了，
+        但道具栏里没东西、也用不了」就是缺这一发。
+
+        它按「收包的本地玩家」认人（包里没有座位号），所以**只发给捡到的
+        那个人**，而且只发给 `GRANTABLE_ITEM_IDS` 里的物件 —— 金币 / 红心
+        走的是当场生效那条，多发一发等于凭空多一件道具。
         """
         try:
             seat_id, handle = parse_get_item(payload)
@@ -4232,6 +4468,102 @@ class Conn:
                      + ("" if VERBOSE else "（本局第一件，后续静音）"))
         self.battle_broadcast(
             build_game(OP_PICKED_ITEM, build_picked_item(seat_id, handle)))
+        self.grant_picked_item(seat_id, handle, quest)
+
+    def grant_picked_item(self, seat_id, handle, quest):
+        """拾取放行之后，如果捡到的是 PvP 道具就补一发 `0x040b`（§194）。
+
+        返回真的发出去了没有。发不出去的三种情况都不该有任何包：
+
+        - 捡到的不是道具（金币 / 红心 / 武器 —— 它们拾取当场就生效了）；
+        - 这个句柄我们没记过（协议试探造的假句柄）；
+        - 那个人 4 格已经满了 —— 客户端 `AddItem` 在这种情况下**什么都不做**，
+          我们跟着不发才对得上（发了它也不收，镜像却会多一件）。
+        """
+        item_id = quest.item_id_of(handle)
+        if item_id is None or item_id not in GRANTABLE_ITEM_IDS:
+            return False
+        target = self.seat_conn(seat_id)
+        if target is None:
+            self.log(f"   ⚠ 座位 {seat_id} 找不到对应连接；"
+                     f"物件 {item_id} 这一发 0x040b 不发")
+            return False
+        if not quest.grant_item(seat_id, item_id):
+            self.log(f"   座位 {seat_id} 的道具槽已满 "
+                     f"({ITEM_SLOT_COUNT}/{ITEM_SLOT_COUNT})；"
+                     f"物件 {item_id} 不进槽（客户端 AddItem 同样会丢掉）")
+            return False
+        held = quest.item_slots[seat_id]
+        self.log(f"← 发道具 gspGiveItem(0x040b) 给座位 {seat_id} "
+                 f"物件={item_id} {ITEM_NAMES.get(item_id, '未知物件')}"
+                 f"；他手上现在 {len(held)}/{ITEM_SLOT_COUNT} 件 {held}")
+        try:
+            target.send(build_game(OP_GRANT_ITEM, build_grant_item(item_id)))
+        except OSError as error:
+            self.log(f"   0x040b 发送失败（{error!r}），忽略")
+        return True
+
+    def seat_conn(self, seat_id):
+        """座位号 -> 那个座位上的连接。找不到就是 ``None``。
+
+        ★ 只在「这个包必须发给某一个特定的人」时才用（`0x040b` / `0x040c`
+        都按收包方的本地玩家认人，广播出去就错了）。不在房间里时退化成
+        「只有我自己」，和 `battle_members()` 同一个口径（D084）。
+        """
+        seat = int(seat_id)
+        room = self.lobby_room()
+        if room is None:
+            return self if seat == self.my_seat else None
+        if not 0 <= seat < len(room.seats):
+            return None
+        entry = room.seats[seat]
+        return None if entry is None else entry.conn
+
+    def on_use_item(self, payload):
+        """0x040c（客户端方向）「我按 Ctrl 要用第 N 格的道具」（§194）。
+
+        客户端按下那一刻做的全部事情就是发这一发（槽位恒 0）再放一声音效
+        —— **效果和扣道具都在服务端**。所以要回两个包：
+
+        | 包 | 发给谁 | 客户端做什么 |
+        |---|---|---|
+        | `0x040c`（同号回显）| **只发给他自己** | `RemoveItem` 把那一格拿掉、后面的往前挪 |
+        | `0x040a` | **广播全房间** | `UseItemEffect(道具id, …)` 让那个座位吃到效果 |
+
+        两个包在客户端里各自**只有一个**调用点，缺哪个都是残的：
+        不回 `0x040c` 道具永远卡在槽里（玩家：按了没反应）；
+        不回 `0x040a` 则道具没了但什么也没发生（玩家：用了个寂寞）。
+
+        道具 id 只能从服务端自己那份槽镜像里查 —— 包里只有槽位序号。
+        槽是空的（没捡过就按、或者连着按两下）就**一个包都不回**，
+        和拾取仲裁被拒时同一个处置。
+        """
+        try:
+            slot_index = parse_use_item(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   0x040c rawUseItem 解析失败: {error}；不回包")
+            return
+        quest = self.quest_state()
+        seat_id = self.my_seat
+        item_id = quest.use_item(seat_id, slot_index)
+        if item_id is None:
+            held = (quest.item_slots[seat_id]
+                    if 0 <= seat_id < ROOM_SEAT_COUNT else [])
+            self.log(f"   座位 {seat_id} 按了「用道具」但第 {slot_index} 格是空的"
+                     f"（手上 {held}）；一个包都不回")
+            return
+        held = quest.item_slots[seat_id]
+        self.log(f"★ 座位 {seat_id} 用道具: 第 {slot_index} 格 "
+                 f"物件={item_id} {ITEM_NAMES.get(item_id, '未知物件')}"
+                 f"；他手上还剩 {len(held)}/{ITEM_SLOT_COUNT} 件 {held}")
+        self.log(f"← 回 0x040c（把第 {slot_index} 格拿掉）只发给他自己")
+        try:
+            self.send(build_game(OP_USE_ITEM, build_use_item(slot_index)))
+        except OSError as error:
+            self.log(f"   0x040c 发送失败（{error!r}），忽略")
+        self.battle_broadcast(
+            build_game(OP_ITEM_EFFECT, build_item_effect(seat_id, item_id)),
+            reason=f"：道具效果 {item_id} 作用于座位 {seat_id}")
 
     def on_mark_quest_success(self, payload):
         """0x0417 `gcpMarkQuestSuccess`「这一关我打通了」—— 只记，不回。
@@ -5419,6 +5751,12 @@ class Conn:
             # 但那是客户端方向的空包，两者只靠方向区分）。
             # 不回 = 那件掉落物作废，因为客户端已经把它标成「已上报」了。
             self.on_get_item(payload)
+        elif opcode == OP_USE_ITEM:
+            # 客户端方向的 0x040c = 「按 Ctrl 用道具槽第 N 格」（§194）。
+            # 回两个包：0x040c 同号回显（**只给他自己**，扣掉那一格）+
+            # 0x040a 广播（让全房间都算上那个效果）。
+            # 不回的话玩家会觉得「捡了道具但按了没反应」。
+            self.on_use_item(payload)
         elif opcode == OP_MARK_QUEST_SUCCESS:
             # 「这一关打通了」。只记不回：服务端方向的同号 0x0417 是换图放行。
             self.on_mark_quest_success(payload)
