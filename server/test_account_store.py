@@ -294,12 +294,16 @@ class AccountStoreTests(unittest.TestCase):
             self.assertNotIn("active_account", json.load(f))
 
     # -- 对战等级限制（需求：默认解除）---------------------------------------
-    def test_reported_level_never_equals_one(self):
-        # 客户端判的是 [0x72e338] == 1（恰好等于 1）就弹「不符合等级要求」（§83）。
+    def test_reported_level_unlocks_survival_mode(self):
+        # 房主在中国区房间里选生存模式时，0x465a2c 会把
+        # [0x72e338] < 4 的模式强制改回夺分（§203）。
         account = self.account()
         self.assertEqual(1, account["level"])            # 存档里是真实等级
+        self.assertEqual(4, MINIMUM_PLAYER_LEVEL)
         self.assertEqual(MINIMUM_PLAYER_LEVEL, player_level(account))
-        self.assertGreater(player_level(account), 1)
+        self.assertGreaterEqual(player_level(account), 4)
+        values = struct.unpack_from("<8i", build_gsp_rep_login(account=account), 8)
+        self.assertEqual(4, values[0])                     # 登录全局 0x72e338
 
     def test_the_level_floor_does_not_distort_the_experience_bar(self):
         # 经验条两端由 experience_bounds 算，必须按真实等级来，
@@ -500,7 +504,7 @@ class AccountStoreTests(unittest.TestCase):
         account = self.store.add_quest_reward("alice",
                                               experience=EXPERIENCE_PER_LEVEL)
         self.assertEqual(2, account["level"])
-        self.assertEqual(2, player_level(account))
+        self.assertEqual(MINIMUM_PLAYER_LEVEL, player_level(account))
 
     def test_quest_reward_rejects_unknown_account(self):
         with self.assertRaises(KeyError):

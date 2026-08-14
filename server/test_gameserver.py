@@ -657,7 +657,7 @@ class GameServerPacketTests(unittest.TestCase):
                                        level_start_exp=start)
         self.assertEqual(64, money)
         self.assertEqual((250, 200, 300), (values[1], values[3], values[2]))
-        self.assertEqual(3, struct.unpack_from("<H", payload, 20)[0])
+        self.assertEqual(4, struct.unpack_from("<H", payload, 20)[0])
 
     def test_rep_money_clamps_the_level_into_a_u16(self):
         payload = build_rep_money(level=-1)
@@ -959,7 +959,7 @@ class ControlChannelTests(unittest.TestCase):
 
     def test_status_reports_the_account_figures(self):
         reply = gameserver.handle_control_command("status")
-        self.assertIn("level=3", reply)
+        self.assertIn("level=4", reply)  # 给旧客户端看的兼容等级；真实经验仍为 250
         self.assertIn("exp=250", reply)
         self.assertIn("money=64", reply)
         self.assertIn("tutorial=3", reply)

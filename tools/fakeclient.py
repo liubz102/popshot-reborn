@@ -58,6 +58,8 @@ fakeclient.py —— 用 Python 冒充第二个游戏客户端（大厅部分）
     useitem [槽位]    发 0x040c「按 Ctrl 用道具」（真客户端**恒发 0**，§194）。
                       服务端应当回一发 0x040c（只给自己，扣掉那一格）+
                       广播一发 0x040a（道具效果作用到那个座位）
+    endattr [属性号]  发 0x040d「我身上这个效果结束了」（默认 6 = 三重射击，§200）。
+                      服务端应当把它转给房里**其他人**（自己不该收到）
     score <分数>      发 0x0410 gcpUpdateQuestScore（**累计**分数）
     cleared           发 0x0417 gcpMarkQuestSuccess(1)「这一关打通了」
     nextmap <名字>    发 0x0411 gcpReqChangeToNextMap
@@ -95,9 +97,11 @@ from simple import SimpleCipher                          # noqa: E402
 from gameserver import (                                 # noqa: E402
     CLIENT_VERSION, CREATE_ITEM_FORMAT, DEATH_REPORT_FORMAT,
     DESCRIPTOR_SENT_ARGUMENT_COUNTS,
+    CHAR_ATTR_NAMES,
     GCP_NAMES, MAGIC_CTRL, MAGIC_GAME, OP_CHAT, OP_COUNT_GAME_READY,
     OP_CREATED_ITEM, OP_CREATE_ITEM, OP_END_QUEST, OP_GET_ITEM,
-    OP_GRANT_ITEM, OP_ITEM_EFFECT, OP_USE_ITEM, ITEM_NAMES,
+    OP_GRANT_ITEM, OP_ITEM_EFFECT, OP_REMOVE_CHAR_ATTR, OP_USE_ITEM,
+    ITEM_NAMES,
     OP_JOIN_RELAY, OP_LEAVE_RELAY, OP_LEAVE_RESULT, OP_LOADING_DONE,
     OP_MAP_LOADING_DONE, OP_MARK_QUEST_SUCCESS, OP_PICKED_ITEM,
     OP_REP_GAME_RESULT, OP_REP_QUEST_SCORE, OP_REPORT_HP_ZERO,
@@ -487,6 +491,12 @@ def describe(opcode, payload):
         if opcode == OP_USE_ITEM and len(payload) >= 4:
             slot = struct.unpack_from("<i", payload)[0]
             return f"  ★ 我的道具槽第 {slot} 格被拿掉（用掉了）"
+        if opcode == OP_REMOVE_CHAR_ATTR and len(payload) >= 8:
+            # 0x040d：某个座位身上的道具效果结束了（§200）。真客户端收到
+            # 会拆掉那个属性对应的模型 / 特效；自己那一发它直接丢掉。
+            seat, attr = struct.unpack_from("<ii", payload)
+            return (f"  ★ 效果结束 座位={seat} 属性={attr} "
+                    f"{CHAR_ATTR_NAMES.get(attr, '未知属性')}")
         if opcode == OP_ITEM_EFFECT and len(payload) >= 16:
             seat, arg3, item_id, arg2 = struct.unpack_from("<iiii", payload)
             return (f"  ★ 道具效果 座位={seat} 物件={item_id} "
@@ -676,6 +686,12 @@ def run_script(client, tokens):
         elif cmd == "useitem":
             slot = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 0
             client.send_game(OP_USE_ITEM, w_i32(slot))
+        elif cmd == "endattr":
+            # 0x040d「我身上这个效果结束了」。真客户端在
+            # Character::RemoveAttrEffect 里发，只发自己的座位（§200）。
+            attr = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 6
+            seat = client.my_seat if client.my_seat is not None else 0
+            client.send_game(OP_REMOVE_CHAR_ATTR, w_i32(seat) + w_i32(attr))
         elif cmd == "score":
             client.send_game(OP_UPDATE_QUEST_SCORE, w_i32(int(tokens.pop(0))))
         elif cmd == "cleared":

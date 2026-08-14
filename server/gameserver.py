@@ -227,6 +227,34 @@ OP_ITEM_EFFECT = 0x040a       # 服务端 -> 客户端：让某个座位吃到�
 OP_GRANT_ITEM = 0x040b        # 服务端 -> 客户端：往**收包这个人**的道具槽里塞一件
 OP_USE_ITEM = 0x040c          # 两个方向同号：客户端「我要用第 N 格」/ 服务端「把第 N 格拿掉」
 
+# ---------------------------------------------------------------------------
+# ★★★ 第四个道具包：`0x040d`「某个座位的道具效果结束了」（§200）
+#
+# `0x040a` 只管**开始**。效果**结束**是另一条独立的链，而且它天生只有
+# 一台机器知道：
+#
+#   Character::RemoveAttrEffect  `0x50982e`
+#     if ([char+0x2ac] == 我的座位)          ← 只有本机玩家自己的角色才发
+#         SendRemoveCharAttr(座位, 属性号)   ← `0x54ec50` -> 序列化 `0x558f8e` -> 0x040d
+#     ...按属性号拆掉对应的模型 / 特效...
+#
+# 收侧 `0x551dfb`（派发表 `0x54e5ae` 第 8 项，基址 0x405）：
+#
+#   读两个 int32（`0x5590bb`）= (座位, 属性号)
+#   if (座位 == 我的座位) return;            ← ★ 自己那一发直接丢掉
+#   角色 = 座位 -> 角色（`0x404ff6`）
+#   Character::RemoveAttrEffect(属性号)      拆模型 / 特效
+#   AttrList::Remove(属性号)                 `[char+0x6a0]`
+#
+# ⇒ **服务端不转发的话，别人屏幕上那个效果永远不会结束。**
+#
+# 为什么用户只在「三重射击 / 毒药 / 致命射击」上看得见这个 bug：
+# 这三件的 `Status.ini` 记录**没有 `Time`、只有 `Magazine=3`**（§201），
+# 于是 `UseItemEffect` 给的 duration 是 **-1（无限）**，真正的结束条件是
+# 「本机玩家打完 3 发」—— 只有他自己那台机器数得出来。有 `Time` 的那些
+# （护盾 8 秒、加速 8 秒、隐身 10 秒…）每台机器各自倒计时，所以看起来正常。
+OP_REMOVE_CHAR_ATTR = 0x040d  # 两个方向同号：客户端「我这个效果结束了」/ 服务端「某座位的效果结束了」
+
 OP_END_QUEST = 0x040f
 OP_UPDATE_QUEST_SCORE = 0x0410
 
@@ -390,6 +418,10 @@ GCP_NAMES = {
     # 「按 Ctrl 用道具」。RawPacket（一个 int32 = 道具槽序号，客户端恒发 0），
     # 唯一发送点 0x559205，只被 Character 的输入处理 0x516367 调用（§194）。
     0x040c: "rawUseItem",
+    # 「我身上那个道具效果结束了」。RawPacket（两个 int32 = 座位 + 属性号），
+    # 唯一发送点 0x558f8e，只被 Character::RemoveAttrEffect(0x50982e) 调用，
+    # 而且只在那个角色是本机玩家自己时才发（§200）。
+    0x040d: "rawRemoveCharAttr",
     # 玩家之间的同步数据，外面包一层送到游戏服（§149）。RawPacket，没有 gcp 类名。
     0x040e: "rawPeerData",
     0x040f: "gcpEndQuest",
@@ -1834,17 +1866,44 @@ ITEM_NAMES = {
     10603: "SlowMineObject 减速地雷",
 }
 
+#: ★★ **`Data/Item.ini` 里真的有记录的物件 id**（§201）。
+#:
+#: `Character::UseItemEffect`（`0x508441`）**第一件事**就是拿物件 id 去
+#: 记录表（`0x72e7f0`，哈希表，查找 `0x4157bf`）里取记录，
+#: **取不到就直接 return，一个字节都不做**：
+#:
+#:     lea esi, [ebp+8]          ; &物件id
+#:     mov eax, 0x72e7f0
+#:     call 0x417a76             ; 查不到会插一个空槽再返回它的地址
+#:     mov eax, [eax]
+#:     cmp eax, 0
+#:     je  0x508dc6              ; ★ 没记录 -> 什么都不发生
+#:
+#: 而那张表的唯一数据源就是 `Item.ini`（记录里 `+8` 那一格 = `CharAttr`，
+#: 全客户端只有 `Item.ini` 把 `ItemId` 和 `CharAttr` 配在一起）。
+#: ⇒ **不在这张表里的物件，哪怕工厂建得出箱子、捡得起来、进得了道具槽，
+#: 按 Ctrl 也永远不会有任何效果。**
+ITEM_INI_ITEM_IDS = frozenset({
+    10300, 10301, 10303, 10304, 10305, 10306, 10307, 10308, 10309,
+    10310, 10311, 10312, 10313, 10314, 10315, 10316,
+    10400, 10401, 10500, 10600, 10601, 10602, 10603, 10604,
+})
+
 #: ★ **道具模式下服务端往地图上刷的道具**（§191）。
 #:
-#: 这 17 个类的构造函数都 push `Game/ItemBox`，所以玩家看到的都是一个箱子；
+#: 这些类的构造函数都 push `Game/ItemBox`，所以玩家看到的都是一个箱子；
 #: 捡起来进角色的 4 个道具槽（`[Character+0x764..0x770]`），按 Ctrl 使用。
 #:
 #: ⚠ **10305（FastShot）不在里面**：`Item.ini` 有这一条，但工厂 `0x513278`
 #: 的跳表 `0x513b56` 里 10305 那一格指的是 default 分支（§191）——
 #: 发下去客户端建不出对象，绝对不要加回来。
+#: ⚠ **10302（SpUpItem）也不在里面**，理由**正好相反**（§201）：工厂建得出
+#: 箱子、`UseItemEffect` 里甚至还有它专门的分支（`0x50891a`），但这一版的
+#: `Item.ini` **压根没有 `[SpUp]` 这一节** —— 于是上面那条 `je 0x508dc6`
+#: 恒成立，玩家捡到「SP 上升」按 Ctrl 是**彻底没反应**（道具还白扣一格）。
 #: ⚠ 10000 `ItemBox` / 10001 `LuckBag` / 10100~10202 是**闯关**的掉落物，
 #: 不是 PvP 道具，别混进来。
-PVP_ITEM_IDS = (10300, 10301, 10302, 10303, 10304, 10306, 10307, 10308,
+PVP_ITEM_IDS = (10300, 10301, 10303, 10304, 10306, 10307, 10308,
                 10309, 10310, 10311, 10312, 10400, 10401, 10500)
 
 #: 只在组队模式下刷的两件（效果作用于「全队」，个人战里等于只对自己生效，
@@ -2142,6 +2201,76 @@ def build_item_effect(seat_id, item_id,
     """
     return struct.pack(ITEM_EFFECT_FORMAT,
                        int(seat_id), int(arg3), int(item_id), int(arg2))
+
+
+#: 角色属性号（`Data/Status.ini` 的小节名）-> 人话。**只给日志用**。
+#:
+#: 属性号不是道具 id：`Item.ini` 每件道具有一格 `CharAttr`，
+#: `UseItemEffect` 就是拿它当索引去 `Status.ini` 取时长 / 弹数（§201）。
+#: `0x040d` 的载荷里带的是**属性号**，所以要靠这张表才看得懂日志。
+CHAR_ATTR_NAMES = {
+    0: "基本状态",
+    1: "护盾",
+    2: "加速",
+    3: "反射",
+    4: "迷你",
+    5: "快速射击",
+    6: "三重射击",
+    7: "致命射击（双倍伤害）",
+    8: "HP 回复中",
+    9: "SP 回复中",
+    10: "毒弹",
+    11: "中毒",
+    12: "冰冻",
+    13: "幽灵缠身",
+    14: "减速",
+    15: "无法射击",
+    16: "无法移动",
+    17: "隐身",
+    18: "SP 消耗减半",
+    19: "复活无敌",
+    20: "任务主状态",
+}
+
+#: `Status.ini` 一共 21 个小节（0~20），`Character::AddAttrVisual` 的跳表
+#: （`0x5097de`）也正好 20 项（属性号 1~20）。越界的属性号客户端会
+#: `ja` 到 return，转发出去无害，但我们照样挡掉 —— 没有合法来源。
+CHAR_ATTR_MAX = 20
+
+#: `0x040d` 两个方向的线格式：**两个 int32**（序列化 `0x558f8e`、
+#: 反序列化 `0x5590bb`，都是 4 字节读写），共 8 字节。
+REMOVE_CHAR_ATTR_FORMAT = "<ii"
+REMOVE_CHAR_ATTR_SIZE = struct.calcsize(REMOVE_CHAR_ATTR_FORMAT)
+
+
+def parse_remove_char_attr(payload):
+    """opcode 0x040d（客户端 -> 服务端，8 字节）—— 「我这个道具效果结束了」。
+
+        +0x00  int32  座位号（发送点 `0x509858` 推的是 `[char+0x2ac]`，
+                      而那一条分支的前置判据就是「== 我的座位」，
+                      所以**只可能是发包人自己**）
+        +0x04  int32  属性号（`Status.ini` 的小节号，见 `CHAR_ATTR_NAMES`）
+
+    返回 `(座位号, 属性号)`；长度不够抛 ValueError。
+    """
+    if len(payload) < REMOVE_CHAR_ATTR_SIZE:
+        raise ValueError(
+            f"rawRemoveCharAttr 只有 {len(payload)} 字节，"
+            f"要 {REMOVE_CHAR_ATTR_SIZE}")
+    return struct.unpack_from(REMOVE_CHAR_ATTR_FORMAT, payload, 0)
+
+
+def build_remove_char_attr(seat_id, attr_id):
+    """opcode 0x040d（服务端 -> 客户端，8 字节）—— 「某个座位的效果结束了」。
+
+    处理器 `0x551dfb` 拿座位号找角色，调 `Character::RemoveAttrEffect`
+    （`0x50982e`，拆模型 / 特效）+ `AttrList::Remove`（`[char+0x6a0]`）。
+
+    ★★ **广播，但可以不发给上报的那个人**：他自己那台机器早就拆完了，
+    而且 `0x551dfb` 开头那句 `if (座位 == 我的座位) return` 会把回给他的
+    那一发直接丢掉 —— 发了也只是白费字节。
+    """
+    return struct.pack(REMOVE_CHAR_ATTR_FORMAT, int(seat_id), int(attr_id))
 
 
 #: `0x0408`（客户端方向）/ `0x0406`（服务端方向）的**线上**布局。
@@ -2502,7 +2631,7 @@ class RoomStartGame:
         return [m for m in members if m not in self.loaded]
 
 
-#: ★★ 对战（房间描述符 type 1）**必须由服务端判胜负并结束**（§167）。
+#: ★★ 对战（房间描述符 type 1）**必须由服务端判胜负并结束**（§167 / §204）。
 #:
 #: 客户端自带的那套（`GameContextQuest::CheckMatchOver` `0x4a3cf7` ->
 #: `IVictoryCondition::vf8` -> 6 秒后发 `0x040f gcpEndQuest`）在对战里
@@ -2512,6 +2641,20 @@ class RoomStartGame:
 #: 用户 2026-08-12 报的「分出胜负后无法退出返回房间、死的人无法复活、
 #: 倒计时结束也不退出」就是这个 —— 实机日志里整局**一发 `0x040f` 都没有**。
 #:
+#: 游戏模式是房间描述符的 `arguments[1]`（客户端 `0x409e0a`）。工厂
+#: `0x55e0de` 的原版分流是：0 / 2 -> `SurvivalVictoryCondition`，
+#: 1 -> `TimeAttackVictoryCondition`，3 -> `DeathMatchVictoryCondition`。
+PVP_MODE_SURVIVAL = 0
+PVP_MODE_TIME_ATTACK = 1
+PVP_MODE_FIGHT = 2
+PVP_MODE_DEATHMATCH = 3
+
+#: 生存类构造函数 `0x55e018` 给每个在座角色写死三条命；模式 0 的时限是
+#: 240000 ms，模式 2 复用同一个胜负类但时限是 300000 ms（`0x55e2da`）。
+PVP_SURVIVAL_LIVES = 3
+PVP_SURVIVAL_TIME_LIMIT_MS = 240000
+PVP_FIGHT_TIME_LIMIT_MS = 300000
+
 #: 下面这些数抄的是客户端 `DeathMatchVictoryCondition`，判据要和它一致。
 #:
 #: 时间上限：工厂 `0x55e0de` 对「type 1 + arguments[1] == 3」这一路在
@@ -2790,14 +2933,17 @@ class RoomQuest:
         我们广播的 `0x0406` 写**，所以每台机器上的值都是我们上一次发下去的
         那个。自己另起一份计数只会多一个可能对不上的真源。
 
-        每座位的 `deaths` 只用来记账 / 打日志，不参与下发。
+        每座位的 `deaths` 镜像成**这一发实际下发的次数**；生存模式拿它算
+        `3 - deaths`。用 ``max`` 而不是自己 ``+1``，这样即使服务端是在玩家
+        已经死过两次后才接手，也不会把第三条命错算成第一条。
         """
         key = (handle & 0xFFFFFFFF, int(reported))
         first = key not in self.dead_events
         self.dead_events.add(key)
+        deaths = int(reported) + 1
         if first and 0 <= seat < ROOM_SEAT_COUNT:
-            self.deaths[seat] += 1
-        return int(reported) + 1, first
+            self.deaths[seat] = max(self.deaths[seat], deaths)
+        return deaths, first
 
     def record_kill(self, killer_seat, victim_seat):
         """给凶手记一分（对战的「分数」就是杀敌数，§167）。
@@ -2817,7 +2963,7 @@ class RoomQuest:
 
     def pvp_finished(self, seats, teams, score_limit,
                      time_limit_ms=PVP_TIME_LIMIT_MS, now=None):
-        """对战这一局该不该结束了？结束就返回一句人话，否则 ``None``。
+        """夺分模式这一局该不该结束了？结束就返回一句人话，否则 ``None``。
 
         ★ **这三条是照抄客户端 `DeathMatchVictoryCondition::vf8`（`0x55bf20`）**
         （§167）—— 客户端自己那套永远跑不起来（它要求
@@ -2846,6 +2992,94 @@ class RoomQuest:
         if len(seats) < 2 or len(sides) < 2:
             return "只剩一边了"
         return None
+
+    def remaining_lives(self, seat, max_lives=PVP_SURVIVAL_LIVES):
+        """生存模式里这个座位还剩几条命；死亡数超出上限也只返回 0。"""
+        seat = int(seat)
+        if not 0 <= seat < ROOM_SEAT_COUNT:
+            return 0
+        return max(0, int(max_lives) - int(self.deaths[seat]))
+
+    def survival_finished(self, seats, teams, *, team_mode,
+                          time_limit_ms=PVP_SURVIVAL_TIME_LIMIT_MS, now=None):
+        """照原版 `SurvivalVictoryCondition::vf8`（`0x55db6f`）判结束。
+
+        组队战逐队看：队里**任意**一名成员还有生命，这队就还活着；两队中
+        至多只剩一队时结束。个人战则在至多只剩一名玩家有生命时结束。
+        两条都先判淘汰、再判时间，和原函数的分支顺序一致（§204）。
+        """
+        seats = [int(seat) for seat in seats
+                 if 0 <= int(seat) < ROOM_SEAT_COUNT]
+        if not seats:
+            return None
+
+        if team_mode:
+            living_teams = []
+            eliminated_teams = []
+            for team in (TEAM_A, TEAM_B):
+                members = [seat for seat in seats
+                           if int(teams.get(seat, TEAM_NONE)) == team]
+                if not members:
+                    continue
+                if any(self.remaining_lives(seat) > 0 for seat in members):
+                    living_teams.append(team)
+                else:
+                    eliminated_teams.append(team)
+            if len(living_teams) <= 1:
+                if len(eliminated_teams) == 1:
+                    team = eliminated_teams[0]
+                    return (f"队伍 {team} 所有成员的 {PVP_SURVIVAL_LIVES} 条"
+                            "生命都用完了")
+                if len(eliminated_teams) > 1:
+                    return "两队所有成员的生命都用完了"
+                if living_teams:
+                    return f"只剩队伍 {living_teams[0]} 还有生命"
+                return "已经没有存活队伍了"
+        else:
+            living = [seat for seat in seats if self.remaining_lives(seat) > 0]
+            if len(living) <= 1:
+                if living:
+                    return f"只剩座位 {living[0]} 还有生命"
+                return "所有玩家的生命都用完了"
+
+        now = time.monotonic() if now is None else now
+        elapsed_ms = (now - self.started_at) * 1000.0
+        if elapsed_ms > time_limit_ms:
+            return f"时间到（{elapsed_ms / 1000:.0f} 秒 > {time_limit_ms / 1000:.0f} 秒）"
+        return None
+
+    def survival_ranking(self, seats, teams, *, team_mode):
+        """生存模式的 `0x0309` 胜负尾数组，按剩余生命而不是杀敌数算。"""
+        tail = [0] * GAME_RESULT_TAIL_COUNT
+        seats = [int(seat) for seat in seats
+                 if 0 <= int(seat) < GAME_RESULT_TAIL_COUNT]
+        if not seats:
+            return tail
+
+        if not team_mode:
+            # 原版 `0x55de78`：还有生命就是 +1，耗尽就是 -1。
+            for seat in seats:
+                tail[seat] = (GAME_RESULT_CLEARED
+                              if self.remaining_lives(seat) > 0
+                              else GAME_RESULT_DEFEATED)
+            return tail
+
+        totals = {}
+        for team in (TEAM_A, TEAM_B):
+            members = [seat for seat in seats
+                       if int(teams.get(seat, TEAM_NONE)) == team]
+            if members:
+                totals[team] = sum(self.remaining_lives(seat) for seat in members)
+        if not totals:
+            return tail
+        for seat in seats:
+            team = int(teams.get(seat, TEAM_NONE))
+            if team in totals:
+                # 原版 `0x55de5d` -> `0x498ef0`：本队总剩余生命 > 0
+                # 就是 +1，否则 -1。时间到时两队都还有命 = 双方都是 +1。
+                tail[seat] = (GAME_RESULT_CLEARED if totals[team] > 0
+                              else GAME_RESULT_DEFEATED)
+        return tail
 
     # -- 换图 ---------------------------------------------------------------
     def begin_map_change(self, map_name):
@@ -3330,6 +3564,9 @@ class Conn:
         self.items_created = 0
         # 本局回了几次 0x0405 拾取放行（客户端每踩到一件掉落物发一发 0x0407）。
         self.items_picked = 0
+        # 本局转发过几发 0x040d「效果结束」（§200）。死后每 5 秒就有一发
+        # `(座位, 属性 0)`，非 verbose 时只报第一条，免得刷屏。
+        self.attrs_removed = 0
         # 已经报过一次的高频 opcode（见 NOISY_OPCODES）。
         self.noisy_seen = set()
         # ★ 逐连接的三个文件**全部只在 --verbose 下建**（D112）。
@@ -3511,6 +3748,24 @@ class Conn:
         # （V0.1 的单机主线就是闯关，保持老行为）。
         return int((self.room or {}).get("session_type",
                                          SESSION_TYPE_QUEST)) == SESSION_TYPE_QUEST
+
+    def pvp_game_mode(self):
+        """普通对战房的游戏模式号（描述符 `arguments[1]`）。
+
+        参数缺失 / 损坏的调试路径退回夺分模式，保持会话 25 以前的老行为；
+        正常客户端建的 type 1 房固定有三个参数，不会走这个兜底。
+        """
+        room = self.lobby_room()
+        if room is not None:
+            arguments = room.arguments or ()
+        else:
+            arguments = (self.room or {}).get("arguments") or ()
+        if len(arguments) <= 1:
+            return PVP_MODE_DEATHMATCH
+        try:
+            return int(arguments[1])
+        except (TypeError, ValueError):
+            return PVP_MODE_DEATHMATCH
 
     def item_mode(self):
         """这一局是不是**道具模式**（아이템전，§190）。
@@ -4135,13 +4390,29 @@ class Conn:
         seats = self.battle_seats()
         teams = {i: seat.team for i, seat in enumerate(room.seats)
                  if seat is not None}
-        limit = pvp_score_limit(len(seats),
-                                room.team_layout() == TEAM_LAYOUT_TEAMS)
-        reason = quest.pvp_finished(seats, teams, limit, now=now)
+        team_mode = room.team_layout() == TEAM_LAYOUT_TEAMS
+        game_mode = self.pvp_game_mode()
+        if game_mode in (PVP_MODE_SURVIVAL, PVP_MODE_FIGHT):
+            time_limit = (PVP_FIGHT_TIME_LIMIT_MS
+                          if game_mode == PVP_MODE_FIGHT
+                          else PVP_SURVIVAL_TIME_LIMIT_MS)
+            reason = quest.survival_finished(
+                seats, teams, team_mode=team_mode,
+                time_limit_ms=time_limit, now=now)
+            detail = ("剩余生命 "
+                      f"{ {seat: quest.remaining_lives(seat) for seat in seats} }")
+            rule = "生存"
+        else:
+            # 当前中文客户端房间列表可见的另一项是模式 3（夺分）。模式 1
+            # 的 TimeAttack 仍沿用旧兜底；它在这版 UI 中不可选，另案再还原。
+            limit = pvp_score_limit(len(seats), team_mode)
+            reason = quest.pvp_finished(seats, teams, limit, now=now)
+            detail = f"杀敌数 {quest.kills}"
+            rule = "夺分"
         if reason is None:
             return False
         quest.pvp_reason = reason
-        self.log(f"   ★ 对战结束：{reason}；杀敌数 {quest.kills} "
+        self.log(f"   ★ {rule}模式结束：{reason}；{detail} "
                  f"—— 服务端主动结算（客户端在对战里不会自己发 0x040f，§167）")
         self.send_end_game()
         return True
@@ -4579,6 +4850,49 @@ class Conn:
             build_game(OP_ITEM_EFFECT, build_item_effect(seat_id, item_id)),
             reason=f"：道具效果 {item_id} 作用于座位 {seat_id}")
 
+    def on_remove_char_attr(self, payload):
+        """0x040d（客户端方向）「我身上那个道具效果结束了」（§200）。
+
+        `0x040a` 只管效果**开始**，结束是另一条链，而且天生只有一台机器
+        知道 —— 弹数型的道具（三重射击 / 致命射击 / 毒弹，`Status.ini` 里
+        只有 `Magazine` 没有 `Time`）的 duration 是 **-1（无限）**，真正的
+        终止条件是「本机玩家把那 3 发打完了」。
+
+        所以这一发**必须原样广播给房里其他人**，否则别人屏幕上那把三连射
+        的枪 / 那圈毒雾永远不会变回去（用户报的「自己看得到模型恢复了，
+        别人看不到」就是这个）。
+
+        两条口径：
+
+        - **座位号以发包的连接为准**，不信包里那个。客户端的发送点
+          （`0x509843`）本来就只会填自己的座位，重填一次等于把「谁能替谁
+          撤效果」这件事钉死在服务端；
+        - **不发给上报的人自己** —— 他那台机器早就拆完了，而且客户端
+          `0x551dfb` 第一句就是 `if (座位 == 我的座位) return`。
+        """
+        try:
+            reported_seat, attr_id = parse_remove_char_attr(payload)
+        except (ValueError, struct.error) as error:
+            self.log(f"   0x040d rawRemoveCharAttr 解析失败: {error}；不转发")
+            return
+        if not 0 <= attr_id <= CHAR_ATTR_MAX:
+            self.log(f"   0x040d 属性号 {attr_id} 超出 0~{CHAR_ATTR_MAX}；不转发")
+            return
+        seat_id = self.my_seat
+        if reported_seat != seat_id:
+            self.log(f"   ⚠ 0x040d 报的是座位 {reported_seat}，"
+                     f"但这条连接坐的是 {seat_id}；按 {seat_id} 转发")
+        name = CHAR_ATTR_NAMES.get(attr_id, "未知属性")
+        sent = self.battle_broadcast(
+            build_game(OP_REMOVE_CHAR_ATTR,
+                       build_remove_char_attr(seat_id, attr_id)),
+            exclude=self)
+        self.attrs_removed += 1
+        if self.attrs_removed == 1 or VERBOSE:
+            self.log(f"★ 座位 {seat_id} 的属性 {attr_id} {name} 结束了 —— "
+                     f"0x040d 转给房里另外 {sent} 人"
+                     + ("" if VERBOSE else "（本局第一条，后续静音）"))
+
     def on_mark_quest_success(self, payload):
         """0x0417 `gcpMarkQuestSuccess`「这一关我打通了」—— 只记，不回。
 
@@ -4683,6 +4997,7 @@ class Conn:
         cleared = quest.success
         seats = self.settlement_seats()
         quest_mode = self.quest_mode()
+        pvp_mode = None if quest_mode else self.pvp_game_mode()
         # ★ 对战里客户端**从不发 `0x0410 gcpUpdateQuestScore`**（实机整局日志里
         #   一发都没有），所以 `quest_score` 恒为 0，光靠它排名会永远判成
         #   「全场 0 分不判」。对战的分数就是杀敌数，服务端自己从 `0x0408`
@@ -4691,12 +5006,26 @@ class Conn:
                             0 if quest_mode else quest.kills[seat]
                             if 0 <= seat < ROOM_SEAT_COUNT else 0)
                   for seat, conn in seats.items()}
-        # 尾部数组 = 每座位的「完成 / 输赢」。闯关是合作（通关了大家一起 1），
-        # 对战按本局分数排名（§161，见 `RoomQuest.ranking`）。
-        tail = quest.ranking(scores, quest_mode)
+        # 尾部数组 = 每座位的「完成 / 输赢」。闯关是合作（通关了大家一起 1）；
+        # 生存按剩余生命 / 队伍判，夺分才按杀敌数排名（§161 / §204）。
+        if pvp_mode in (PVP_MODE_SURVIVAL, PVP_MODE_FIGHT):
+            room = self.lobby_room()
+            teams = ({i: seat.team for i, seat in enumerate(room.seats)
+                      if seat is not None} if room is not None else {})
+            team_mode = (room is not None and
+                         room.team_layout() == TEAM_LAYOUT_TEAMS)
+            tail = quest.survival_ranking(
+                seats, teams, team_mode=team_mode)
+        else:
+            tail = quest.ranking(scores, quest_mode)
         if not quest_mode:
-            self.log(f"   对战胜负: 分数 {scores} -> 尾部数组 {tail}"
-                     f"（1=胜 / -1=负 / 0=不判）")
+            if pvp_mode in (PVP_MODE_SURVIVAL, PVP_MODE_FIGHT):
+                remaining = {seat: quest.remaining_lives(seat) for seat in seats}
+                self.log(f"   生存胜负: 剩余生命 {remaining} -> 尾部数组 {tail}"
+                          f"（1=胜 / -1=负 / 0=不判）")
+            else:
+                self.log(f"   对战胜负: 分数 {scores} -> 尾部数组 {tail}"
+                          f"（1=胜 / -1=负 / 0=不判）")
 
         # ---- ① 每个人先入账，并把「他那一份 0x0309 / 0x0411」备好 --------
         results = {}     # 座位 -> 0x0309 的载荷
@@ -5567,6 +5896,7 @@ class Conn:
         self.solo_quest = RoomQuest()
         self.items_created = 0
         self.items_picked = 0
+        self.attrs_removed = 0
 
     # -- 帧处理 ------------------------------------------------------------
     def on_game_packet(self, opcode, payload):
@@ -5776,6 +6106,12 @@ class Conn:
             # 0x040a 广播（让全房间都算上那个效果）。
             # 不回的话玩家会觉得「捡了道具但按了没反应」。
             self.on_use_item(payload)
+        elif opcode == OP_REMOVE_CHAR_ATTR:
+            # 客户端方向的 0x040d = 「我身上那个效果结束了」（§200）。
+            # 原样广播给房里其他人（发包的人自己不用收）——
+            # 不转发的话弹数型道具（三重射击 / 致命射击 / 毒弹）的模型
+            # 在别人屏幕上永远变不回去。
+            self.on_remove_char_attr(payload)
         elif opcode == OP_MARK_QUEST_SUCCESS:
             # 「这一关打通了」。只记不回：服务端方向的同号 0x0417 是换图放行。
             self.on_mark_quest_success(payload)

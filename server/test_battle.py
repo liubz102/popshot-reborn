@@ -589,6 +589,22 @@ class ItemPoolTests(unittest.TestCase):
         self.assertFalse(set(gameserver.PVP_ITEM_IDS)
                          & set(gameserver.PVP_TEAM_ITEM_IDS))
 
+    def test_every_id_in_the_pool_has_an_item_ini_record(self):
+        # ★★ `UseItemEffect` 第一件事就是查 `Item.ini` 的记录表，查不到
+        #    **直接 return**（§201）。所以「工厂建得出箱子」还不够 ——
+        #    没记录的道具捡起来能进槽，按 Ctrl 却彻底没反应。
+        for pool in (gameserver.PVP_ITEM_IDS, gameserver.PVP_TEAM_ITEM_IDS):
+            for item_id in pool:
+                self.assertIn(item_id, gameserver.ITEM_INI_ITEM_IDS,
+                              f"{item_id} 在 Item.ini 里没有记录，用了不会有效果")
+
+    def test_the_sp_up_item_stays_out_of_the_pool(self):
+        # 10302 是「工厂建得出、但 Item.ini 没这一节」的那一个（§201）。
+        # 它和 10305 正好是两种相反的坏法，两条都要钉住。
+        self.assertNotIn(10302, gameserver.PVP_ITEM_IDS)
+        self.assertNotIn(10302, gameserver.PVP_TEAM_ITEM_IDS)
+        self.assertNotIn(10302, gameserver.ITEM_INI_ITEM_IDS)
+
 
 class ItemSpawnTeamModeTests(ItemSpawnBase):
     """组队战才刷「全队」道具（端到端那一半）。"""
@@ -856,6 +872,78 @@ class ItemUseTests(ItemSlotBase):
 
 
 # ----------------------------------------------------------------------------
+# 道具效果**结束**：`0x040d`（§200）
+#
+# 用户实机报的：「三重射击和毒药道具效果时间过了之后，自己能看到模型恢复了，
+# 但是别人看不到模型恢复」。
+#
+# 根因：`0x040a` 只管开始。弹数型道具（`Status.ini` 里只有 `Magazine`
+# 没有 `Time`）的 duration 是 -1，唯一的终止条件是「本机玩家把那几发打完」——
+# 只有他自己那台机器知道，于是客户端发 `0x040d(座位, 属性号)` 上来。
+# 服务端不转发的话，别人屏幕上那把枪永远变不回去。
+# ----------------------------------------------------------------------------
+def remove_attr_payload(seat_id, attr_id):
+    """客户端方向的 `0x040d rawRemoveCharAttr`（两个 int32）。"""
+    return w_i32(seat_id) + w_i32(attr_id)
+
+
+class AttrRemovalTests(BattleRoom):
+
+    OP = gameserver.OP_REMOVE_CHAR_ATTR
+    ATTR_TRIPLE_SHOT = 6
+
+    def end_attr(self, conn, seat_id=None, attr_id=None):
+        seat_id = conn.my_seat if seat_id is None else seat_id
+        attr_id = self.ATTR_TRIPLE_SHOT if attr_id is None else attr_id
+        gameserver.Conn.on_game_packet(
+            conn, self.OP, remove_attr_payload(seat_id, attr_id))
+
+    def test_the_end_of_an_effect_reaches_the_others(self):
+        # ★ 这就是用户报的那条：没有这一发，队友屏幕上三连射的枪永远不变回去。
+        self.end_attr(self.alice)
+        self.assertIn(self.OP, opcodes(self.bob))
+
+    def test_the_reporter_does_not_get_it_back(self):
+        # 客户端 `0x551dfb` 第一句就是 `if (座位 == 我的座位) return`，
+        # 回给他等于白费字节。
+        self.end_attr(self.alice)
+        self.assertNotIn(self.OP, opcodes(self.alice))
+
+    def test_the_payload_is_seat_then_attr(self):
+        self.end_attr(self.alice, attr_id=self.ATTR_TRIPLE_SHOT)
+        self.assertEqual([remove_attr_payload(0, self.ATTR_TRIPLE_SHOT)],
+                         bodies(self.bob, self.OP))
+
+    def test_the_seat_comes_from_the_connection_not_the_packet(self):
+        # 谁的效果结束了只能由服务端说了算，否则一个人就能替别人撤护盾。
+        self.bob.my_seat = 1
+        self.end_attr(self.bob, seat_id=0)
+        self.assertEqual([remove_attr_payload(1, self.ATTR_TRIPLE_SHOT)],
+                         bodies(self.alice, self.OP))
+
+    def test_a_short_payload_is_dropped(self):
+        gameserver.Conn.on_game_packet(self.alice, self.OP, b"\x06\x00\x00")
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_an_out_of_range_attr_is_dropped(self):
+        # `Status.ini` 只有 0~20，`AddAttrVisual` 的跳表也只有 20 项。
+        self.end_attr(self.alice, attr_id=gameserver.CHAR_ATTR_MAX + 1)
+        self.end_attr(self.alice, attr_id=-1)
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_the_base_state_attr_is_forwarded_too(self):
+        # 死后每 5 秒一发 `(座位, 0)`（§167 实测），照转不误 ——
+        # 那是原版协议的一部分，客户端自己会判要不要动作。
+        self.end_attr(self.alice, attr_id=0)
+        self.assertEqual([remove_attr_payload(0, 0)],
+                         bodies(self.bob, self.OP))
+
+    def test_every_attr_id_in_the_table_is_named(self):
+        for attr_id in range(gameserver.CHAR_ATTR_MAX + 1):
+            self.assertIn(attr_id, gameserver.CHAR_ATTR_NAMES)
+
+
+# ----------------------------------------------------------------------------
 # 分数
 # ----------------------------------------------------------------------------
 class ScoreTests(BattleRoom):
@@ -1066,9 +1154,10 @@ class QuestSettlementTests(BattleRoom):
 
 
 class PvpSettlementTests(BattleRoom):
-    """对战（房间类型 != 2）：按本局分数判胜负。"""
+    """夺分模式（arguments[1] == 3）：按本局分数判胜负。"""
 
     session_type = 1
+    arguments = (0, 3, 0)
 
     def score(self, conn, seat, value):
         conn.my_seat = seat
@@ -1117,6 +1206,7 @@ class PvpFinishTests(BattleRoom):
     """
 
     session_type = 1
+    arguments = (0, 3, 0)
 
     def kill(self, killer_seat, victim_seat, deaths=0):
         """让 `killer_seat` 打死 `victim_seat` 一次。
@@ -1206,6 +1296,45 @@ class PvpFinishTests(BattleRoom):
         self.assertEqual(6, gameserver.pvp_score_limit(4, True))
         self.assertEqual(8, gameserver.pvp_score_limit(6, True))
         self.assertEqual(5, gameserver.pvp_score_limit(1, False))
+
+
+class SurvivalFinishTests(BattleRoom):
+    """生存模式（arguments[1] == 0）：每人固定三条命。"""
+
+    session_type = 1
+    arguments = (1, 0, 0)       # 组队战 + 生存模式 + 普通模式
+
+    def die(self, victim_seat, deaths):
+        """环境击杀，不给任何座位加杀敌分，避免误靠夺分规则结算。"""
+        gameserver.Conn.on_game_packet(
+            self.alice, OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=victim_seat * 100000 + 100001,
+                            seat=victim_seat, arg=0xFF, deaths=deaths))
+
+    def test_two_deaths_do_not_end_the_round(self):
+        self.die(0, 0)
+        self.die(0, 1)
+        self.assertFalse(self.quest.settled)
+        self.assertIsNone(self.quest.pvp_reason)
+
+    def test_the_third_death_ends_the_round_and_the_other_team_wins(self):
+        for deaths in range(3):
+            self.die(0, deaths)
+
+        self.assertTrue(self.quest.settled)
+        self.assertIn("生命都用完", self.quest.pvp_reason)
+        self.assertEqual([0] * 6, self.quest.kills,
+                         "这条回归必须证明不是误靠夺分规则结束")
+        expected = [GAME_RESULT_DEFEATED, GAME_RESULT_CLEARED] + [0] * 4
+        for conn in (self.alice, self.bob):
+            self.assertIn(OP_END_GAME, opcodes(conn))
+            body = bodies(conn, OP_REP_GAME_RESULT)[0]
+            self.assertEqual(expected, result_tail(body))
+
+    def test_kill_score_limit_is_ignored_in_survival_mode(self):
+        self.quest.kills[0] = gameserver.pvp_score_limit(2, True)
+        self.assertFalse(gameserver.Conn.check_pvp_finished(self.alice))
+        self.assertFalse(self.quest.settled)
 
 
 # ----------------------------------------------------------------------------
@@ -1462,6 +1591,38 @@ class RoomQuestTests(unittest.TestCase):
     def test_ranking_ignores_seats_out_of_range(self):
         quest = RoomQuest()
         self.assertEqual([0] * 6, quest.ranking({-1: 10, 9: 20}, False))
+
+    def test_team_survival_waits_until_every_member_is_out_of_lives(self):
+        quest = RoomQuest()
+        seats = [0, 1, 2, 3]
+        teams = {0: 1, 1: 2, 2: 1, 3: 2}
+        quest.deaths[0] = gameserver.PVP_SURVIVAL_LIVES
+        quest.deaths[2] = gameserver.PVP_SURVIVAL_LIVES - 1
+        self.assertIsNone(quest.survival_finished(
+            seats, teams, team_mode=True, now=quest.started_at))
+
+        quest.deaths[2] += 1
+        reason = quest.survival_finished(
+            seats, teams, team_mode=True, now=quest.started_at)
+        self.assertIn("队伍 1", reason)
+        self.assertIn("生命都用完", reason)
+        self.assertEqual([-1, 1, -1, 1, 0, 0],
+                         quest.survival_ranking(
+                             seats, teams, team_mode=True))
+
+    def test_free_survival_ends_when_only_one_player_has_lives(self):
+        quest = RoomQuest()
+        quest.deaths[0] = gameserver.PVP_SURVIVAL_LIVES
+        self.assertIsNotNone(quest.survival_finished(
+            [0, 1], {0: 1, 1: 2}, team_mode=False,
+            now=quest.started_at))
+
+    def test_survival_uses_the_death_count_that_was_broadcast(self):
+        quest = RoomQuest()
+        deaths, first = quest.record_death(100001, 0, 2)
+        self.assertTrue(first)
+        self.assertEqual(3, deaths)
+        self.assertEqual(0, quest.remaining_lives(0))
 
     def test_claim_item_is_first_come_first_served(self):
         quest = RoomQuest()
