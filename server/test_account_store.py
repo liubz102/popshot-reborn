@@ -190,6 +190,77 @@ class AccountStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.nickname_owner("没人用过"))
         self.assertIsNone(self.store.nickname_owner(""))
 
+    # -- 修改密码 / 修改昵称（会话 22）----------------------------------------
+    def test_change_password_requires_the_old_password_and_preserves_the_save(self):
+        self.store.register("alice", "oldpw", display_name="炮炮")
+        self.store.add_quest_reward("alice", experience=250, money=70)
+        with self.assertRaises(AccountError) as ctx:
+            self.store.change_password("alice", "wrong", "newpw")
+        self.assertEqual("bad_password", ctx.exception.code)
+        self.assertEqual(AUTH_OK, self.store.verify("alice", "oldpw")[0])
+
+        changed = self.store.change_password("alice", "oldpw", "newpw")
+        self.assertEqual("newpw", changed["password"])
+        self.assertEqual((250, 70), (changed["experience"], changed["money"]))
+        self.assertEqual("炮炮", changed["display_name"])
+        self.assertEqual(AUTH_BAD_PASSWORD, self.store.verify("alice", "oldpw")[0])
+        self.assertEqual(AUTH_OK, self.store.verify("alice", "newpw")[0])
+
+    def test_change_password_reuses_the_registration_rules(self):
+        self.store.register("alice", "oldpw")
+        for bad in ("", "x" * 33, "tab\there"):
+            with self.assertRaises(AccountError, msg=bad) as ctx:
+                self.store.change_password("alice", "oldpw", bad)
+            self.assertEqual("invalid_password", ctx.exception.code)
+            self.assertEqual(AUTH_OK, self.store.verify("alice", "oldpw")[0])
+
+    def test_account_changes_verify_the_old_password_before_new_value_rules(self):
+        self.store.register("alice", "oldpw")
+        with self.assertRaises(AccountError) as ctx:
+            self.store.change_password("alice", "wrong", "")
+        self.assertEqual("bad_password", ctx.exception.code)
+        with self.assertRaises(AccountError) as ctx:
+            self.store.change_nickname("alice", "wrong", "emoji🎮")
+        self.assertEqual("bad_password", ctx.exception.code)
+
+    def test_change_nickname_requires_the_password_and_persists_a_trimmed_name(self):
+        self.store.register("alice", "pw", display_name="旧昵称")
+        with self.assertRaises(AccountError) as ctx:
+            self.store.change_nickname("alice", "wrong", "新昵称")
+        self.assertEqual("bad_password", ctx.exception.code)
+        self.assertEqual("旧昵称", self.store.get_account("alice")[1]["display_name"])
+
+        changed = self.store.change_nickname("alice", "pw", "  新昵称  ")
+        self.assertEqual("新昵称", changed["display_name"])
+        self.assertEqual("新昵称", self.store.get_account("alice")[1]["display_name"])
+        self.assertEqual(AUTH_OK, self.store.verify("alice", "pw")[0])
+
+    def test_change_nickname_rejects_another_users_name_but_allows_its_own(self):
+        self.store.register("alice", "pw", display_name="Boom")
+        self.store.register("bob", "pw", display_name="Bob昵称")
+        with self.assertRaises(AccountError) as ctx:
+            self.store.change_nickname("bob", "pw", " boom ")
+        self.assertEqual("duplicate_nickname", ctx.exception.code)
+        self.assertEqual("Bob昵称", self.store.get_account("bob")[1]["display_name"])
+
+        # 大小写不同但 owner 仍是自己：这是合法的幂等修改，不应被查重挡住。
+        changed = self.store.change_nickname("alice", "pw", " BOOM ")
+        self.assertEqual("BOOM", changed["display_name"])
+
+    def test_change_nickname_can_fall_back_to_the_username(self):
+        self.store.register("alice", "pw", display_name="旧昵称")
+        changed = self.store.change_nickname("alice", "pw", "   ")
+        self.assertEqual("alice", changed["display_name"])
+
+    def test_account_changes_report_an_unknown_user_without_creating_one(self):
+        for operation in (
+                lambda: self.store.change_password("ghost", "pw", "newpw"),
+                lambda: self.store.change_nickname("ghost", "pw", "新昵称")):
+            with self.assertRaises(AccountError) as ctx:
+                operation()
+            self.assertEqual("no_such_user", ctx.exception.code)
+        self.assertEqual([], self.store.usernames())
+
     def test_verify_tells_the_three_cases_apart(self):
         # 需求：不存在要提示注册，密码错要如实报错 —— 不能合并成一个布尔。
         self.store.register("alice", "pw")

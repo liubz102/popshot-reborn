@@ -374,6 +374,60 @@ class AccountStore:
             self._write_unlocked(data)
             return copy.deepcopy(account)
 
+    # ------------------------------------------------------------ 账号资料修改
+    def _require_password_unlocked(self, data, username, password):
+        """在调用方已经持有 ``_lock`` 时校验账号密码，失败就抛 ``AccountError``。
+
+        修改密码 / 昵称必须把「验证旧密码」和「写回新值」放在同一个临界区里；
+        若先调一次 ``verify()``、再另起一次写盘，两个并发请求可能都拿旧密码通过，
+        后写入的那一个还会静默覆盖先写入的结果。
+        """
+        username = str(username or "").strip()
+        password = str(password if password is not None else "")
+        raw = data["accounts"].get(username)
+        if raw is None:
+            raise AccountError("no_such_user", AUTH_MESSAGES[AUTH_NO_SUCH_USER])
+        account = self._merged_account(username, raw)
+        if str(account.get("password", "")) != password:
+            raise AccountError("bad_password", AUTH_MESSAGES[AUTH_BAD_PASSWORD])
+        return username, account
+
+    def change_password(self, username, old_password, new_password):
+        """验证旧密码后修改密码，返回更新后的账号副本。
+
+        新密码沿用注册时的同一套规则；不强制它必须和旧密码不同，避免凭空增加
+        用户没有要求的限制。校验和写盘在同一把锁里完成。
+        """
+        with self._lock:
+            data = self._read_unlocked()
+            username, account = self._require_password_unlocked(
+                data, username, old_password)
+            account["password"] = check_password(new_password)
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return copy.deepcopy(account)
+
+    def change_nickname(self, username, old_password, display_name):
+        """验证密码后修改显示昵称，返回更新后的账号副本。
+
+        昵称规则和注册时完全一致：剃首尾空白、留空退回用户名、只限 BMP，
+        并按大小写不敏感的口径查重。改回自己当前的昵称属于合法的幂等操作。
+        """
+        with self._lock:
+            data = self._read_unlocked()
+            username, account = self._require_password_unlocked(
+                data, username, old_password)
+            nickname = check_nickname(display_name, username)
+            owner = self.nickname_owner(nickname, data)
+            if owner is not None and owner != username:
+                raise AccountError(
+                    "duplicate_nickname",
+                    f"显示昵称「{nickname}」已经被别人用了，请换一个。")
+            account["display_name"] = nickname
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return copy.deepcopy(account)
+
     # ------------------------------------------------------------------ 校验
     def verify(self, username, password):
         """校验用户名密码，返回 ``(状态, 账号或 None)``。
@@ -815,4 +869,3 @@ def player_money(account):
     这就是为什么以前一重登金币就归零（FINDINGS §95）。
     """
     return _non_negative(account, "money")
-

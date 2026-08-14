@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""注册网页 —— 用户注册 + 存档转移助手。
+"""注册网页 —— 用户注册 + 账号资料修改 + 存档转移助手。
 
 纯标准库（`http.server`），零第三方依赖，页面在 `index.html` 里。
 和认证服 / 游戏服跑在同一个进程、共用同一个 `AccountStore`（D064）。
@@ -10,6 +10,12 @@
     GET  /                页面本身（`index.html`，把服务器地址替换进去）
     POST /api/register    {username, password, password2, display_name,
                            skip_tutorial}                 -> {ok, message}
+    POST /api/change-password
+                          {username, old_password, new_password,
+                           new_password2}                 -> {ok, message}
+    POST /api/change-nickname
+                          {username, old_password, display_name}
+                                                            -> {ok, message}
     POST /api/export      {username, password}            -> {ok, message, save}
     POST /api/import      {username, password, save}      -> {ok, message}
 
@@ -321,6 +327,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         route = {
             "/api/register": self._api_register,
+            "/api/change-password": self._api_change_password,
+            "/api/change-nickname": self._api_change_nickname,
             "/api/export": self._api_export,
             "/api/import": self._api_import,
         }.get(path)
@@ -383,6 +391,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     f"注册成功！现在可以在游戏登录界面用「{username}」登录了，"
                     f"游戏里显示的昵称是「{nickname}」。{tail}",
                     retry_after=cooldown)
+
+    def _api_change_password(self, data):
+        username = str(data.get("username", "")).strip()
+        old_password = data.get("old_password", "")
+        new_password = data.get("new_password", "")
+        new_password2 = data.get("new_password2", "")
+        if new_password != new_password2:
+            self._reply(False, "两次输入的新密码不一致，请重新输入。")
+            return
+        # ★ 用户明确要求：账号资料修改**不走注册频率限制**。这里不查询也不标记
+        #   self.limiter；只做旧密码校验和账号存档的原子更新。
+        self.accounts.change_password(username, old_password, new_password)
+        self.log_message("修改密码成功: %s", username)
+        eventlog.online(f"注册页 ✓ 修改密码 账号={username!r} "
+                        f"ip={self.client_label()}")
+        self._reply(True, "密码修改成功！下次登录请使用新密码。")
+
+    def _api_change_nickname(self, data):
+        username = str(data.get("username", "")).strip()
+        old_password = data.get("old_password", "")
+        display_name = data.get("display_name", "")
+        # 同上：不碰 RegisterRateLimiter。昵称合法性和重名检查由 AccountStore
+        # 在旧密码验证通过之后、同一把锁里完成。
+        account = self.accounts.change_nickname(
+            username, old_password, display_name)
+        nickname = account["display_name"]
+        self.log_message("修改昵称成功: %s (昵称=%s)", username, nickname)
+        eventlog.online(f"注册页 ✓ 修改昵称 账号={username!r} 昵称={nickname!r} "
+                        f"ip={self.client_label()}")
+        self._reply(True,
+                    f"昵称修改成功！游戏里将显示为「{nickname}」，重新登录后生效。")
 
     def _api_export(self, data):
         username = str(data.get("username", "")).strip()

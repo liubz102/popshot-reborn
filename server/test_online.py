@@ -547,7 +547,7 @@ class ControlChannelUserPickingTests(unittest.TestCase):
 
 
 class RegisterWebTests(unittest.TestCase):
-    """注册页的四条路径：注册 / 重名 / 导出 / 导入。走真的 HTTP。"""
+    """注册页的注册 / 资料修改 / 存档转移路径。全部走真的 HTTP。"""
 
     @classmethod
     def setUpClass(cls):
@@ -632,6 +632,34 @@ class RegisterWebTests(unittest.TestCase):
         self.assertNotIn("__NICKNAME_RULE__", html)
         self.assertIn("表情符号", html)          # 昵称规则本身也要显示出来
 
+    def test_the_page_has_two_account_buttons_above_the_transfer_assistant(self):
+        with urllib.request.urlopen(self.url("/"), timeout=10) as response:
+            html = response.read().decode("utf-8")
+        row_start = html.index('<div class="account-actions">')
+        row_end = html.index("</div>", row_start)
+        row = html[row_start:row_end]
+        self.assertIn('id="openChangePassword">修改密码</button>', row)
+        self.assertIn('id="openChangeNickname">修改昵称</button>', row)
+        self.assertLess(row_end, html.index('id="openTransfer"'))
+        # 同一行由 flex 固定，不随按钮文字长度各占一行。
+        self.assertIn(".account-actions { display: flex;", html)
+
+    def test_account_change_popups_have_the_required_fields_and_only_close_buttons(self):
+        with urllib.request.urlopen(self.url("/"), timeout=10) as response:
+            html = response.read().decode("utf-8")
+        for required in (
+                'id="changePasswordMask"', 'id="closeChangePassword"',
+                'id="cpu"', 'id="cpOld"', 'id="cpNew1"', 'id="cpNew2"',
+                'id="changeNicknameMask"', 'id="closeChangeNickname"',
+                'id="cnu"', 'id="cnOld"', 'id="cnNew"'):
+            self.assertIn(required, html)
+        self.assertIn('post("/api/change-password"', html)
+        self.assertIn('post("/api/change-nickname"', html)
+        # 三个遮罩只通过 bindPopup 里的 closeId 关闭；背景自身和 Escape 都没监听。
+        self.assertNotIn('popupMask.addEventListener("click"', html)
+        self.assertNotIn('addEventListener("keydown"', html)
+        self.assertIn("三个 popup 都只能用右上角", html)
+
     def test_register_stores_the_nickname(self):
         reply = self.post("/api/register",
                           {"username": self.who, "password": "pw",
@@ -678,6 +706,75 @@ class RegisterWebTests(unittest.TestCase):
         self.assertFalse(reply["ok"])
         self.assertIn("显示昵称", reply["message"])
         self.assertFalse(self.accounts.has_account(self.who))
+
+    # -- 修改密码 / 修改昵称（会话 22）----------------------------------------
+    def test_change_password_checks_the_old_password_and_both_new_copies(self):
+        self.assertTrue(self.post(
+            "/api/register", {"username": self.who, "password": "oldpw",
+                              "password2": "oldpw"})["ok"])
+        wrong = self.post(
+            "/api/change-password", {"username": self.who,
+                                     "old_password": "wrong",
+                                     "new_password": "newpw",
+                                     "new_password2": "newpw"})
+        self.assertFalse(wrong["ok"])
+        self.assertIn("密码错误", wrong["message"])
+
+        mismatch = self.post(
+            "/api/change-password", {"username": self.who,
+                                     "old_password": "oldpw",
+                                     "new_password": "newpw",
+                                     "new_password2": "typo"})
+        self.assertFalse(mismatch["ok"])
+        self.assertIn("两次输入的新密码不一致", mismatch["message"])
+        self.assertEqual(AUTH_OK, self.accounts.verify(self.who, "oldpw")[0])
+
+        changed = self.post(
+            "/api/change-password", {"username": self.who,
+                                     "old_password": "oldpw",
+                                     "new_password": "newpw",
+                                     "new_password2": "newpw"})
+        self.assertTrue(changed["ok"], changed)
+        self.assertEqual(AUTH_OK, self.accounts.verify(self.who, "newpw")[0])
+
+    def test_change_nickname_checks_the_password_and_reports_the_saved_name(self):
+        self.assertTrue(self.post(
+            "/api/register", {"username": self.who, "password": "pw",
+                              "password2": "pw", "display_name": "旧昵称"})["ok"])
+        wrong = self.post(
+            "/api/change-nickname", {"username": self.who,
+                                     "old_password": "wrong",
+                                     "display_name": "新昵称"})
+        self.assertFalse(wrong["ok"])
+        self.assertEqual("旧昵称",
+                         self.accounts.get_account(self.who)[1]["display_name"])
+
+        changed = self.post(
+            "/api/change-nickname", {"username": self.who,
+                                     "old_password": "pw",
+                                     "display_name": "  新昵称  "})
+        self.assertTrue(changed["ok"], changed)
+        self.assertIn("新昵称", changed["message"])
+        self.assertIn("重新登录后生效", changed["message"])
+        self.assertEqual("新昵称",
+                         self.accounts.get_account(self.who)[1]["display_name"])
+
+    def test_change_nickname_rejects_a_name_owned_by_someone_else(self):
+        taken = f"改名占用{self.counter}"
+        self.assertTrue(self.post(
+            "/api/register", {"username": self.who, "password": "pw",
+                              "password2": "pw", "display_name": taken})["ok"])
+        other = f"{self.who}b"
+        self.assertTrue(self.post(
+            "/api/register", {"username": other, "password": "pw",
+                              "password2": "pw", "display_name": f"原名{self.counter}"})["ok"])
+        reply = self.post(
+            "/api/change-nickname", {"username": other,
+                                     "old_password": "pw",
+                                     "display_name": taken})
+        self.assertFalse(reply["ok"])
+        self.assertIn("显示昵称", reply["message"])
+        self.assertNotIn("用户名已存在", reply["message"])
 
     def test_the_page_ships_the_skip_tutorial_box_checked(self):
         with urllib.request.urlopen(self.url("/"), timeout=10) as response:
@@ -1061,10 +1158,19 @@ class RegisterCooldownTests(unittest.TestCase):
         self.assertEqual(0, limiter.retry_after("127.0.0.1"))
 
     def test_the_cooldown_only_covers_registration(self):
-        # 存档导出 / 上传不该被注册的冷却连坐。
+        # 存档导出 / 上传、修改密码 / 昵称都不该被注册的冷却连坐。
         self.assertTrue(self.register("cool5")["ok"])
+        nickname = self.post("/api/change-nickname",
+                             {"username": "cool5", "old_password": "pw",
+                              "display_name": "冷却外昵称"})
+        self.assertTrue(nickname["ok"], nickname)
+        password = self.post("/api/change-password",
+                             {"username": "cool5", "old_password": "pw",
+                              "new_password": "newpw",
+                              "new_password2": "newpw"})
+        self.assertTrue(password["ok"], password)
         export = self.post("/api/export", {"username": "cool5",
-                                           "password": "pw"})
+                                           "password": "newpw"})
         self.assertTrue(export["ok"], export)
 
     def test_the_page_carries_the_configured_cooldown(self):

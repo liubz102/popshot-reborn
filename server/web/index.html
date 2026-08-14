@@ -66,10 +66,14 @@
   .msg.ok { background: var(--ok-bg); border: 1px solid var(--ok-line); }
   .msg.err { background: var(--err-bg); border: 1px solid var(--err-line); }
   .msg:empty { display: none; }
+  .account-actions { display: flex; gap: 10px; }
+  .account-actions button { flex: 1 1 0; min-width: 0; margin-top: 0; }
+  button.full { display: block; width: 100%; margin-top: 12px; }
 
   .mask {
     position: fixed; inset: 0; background: rgba(30, 26, 20, .55);
     display: none; align-items: center; justify-content: center; padding: 16px;
+    z-index: 10;
   }
   .mask.open { display: flex; }
   .popup {
@@ -131,15 +135,65 @@
   </div>
 
   <div class="card">
-    <button type="button" class="ghost" id="openTransfer" style="margin-top:0">存档转移助手</button>
+    <div class="account-actions">
+      <button type="button" class="ghost" id="openChangePassword">修改密码</button>
+      <button type="button" class="ghost" id="openChangeNickname">修改昵称</button>
+    </div>
+    <button type="button" class="ghost full" id="openTransfer">存档转移助手</button>
     <div class="hint">把你在某台服务器上的存档下载下来，再上传到另一台服务器。</div>
   </div>
 </div>
 
-<div class="mask" id="mask">
-  <div class="popup">
+<div class="mask" id="changePasswordMask">
+  <div class="popup" role="dialog" aria-modal="true" aria-labelledby="changePasswordTitle">
+    <button type="button" class="close" id="closeChangePassword">关闭</button>
+    <h2 id="changePasswordTitle">修改密码</h2>
+
+    <form id="changePasswordForm" autocomplete="off">
+      <label for="cpu">用户名</label>
+      <input id="cpu" type="text" maxlength="16" autocomplete="username">
+
+      <label for="cpOld">旧密码</label>
+      <input id="cpOld" type="password" maxlength="32" autocomplete="current-password">
+
+      <label for="cpNew1">新密码</label>
+      <input id="cpNew1" type="password" maxlength="32" autocomplete="new-password">
+
+      <label for="cpNew2">再次输入新密码</label>
+      <input id="cpNew2" type="password" maxlength="32" autocomplete="new-password">
+
+      <button type="submit">确认修改密码</button>
+      <div class="msg" id="changePasswordMsg"></div>
+    </form>
+  </div>
+</div>
+
+<div class="mask" id="changeNicknameMask">
+  <div class="popup" role="dialog" aria-modal="true" aria-labelledby="changeNicknameTitle">
+    <button type="button" class="close" id="closeChangeNickname">关闭</button>
+    <h2 id="changeNicknameTitle">修改昵称</h2>
+
+    <form id="changeNicknameForm" autocomplete="off">
+      <label for="cnu">用户名</label>
+      <input id="cnu" type="text" maxlength="16" autocomplete="username">
+
+      <label for="cnOld">旧密码</label>
+      <input id="cnOld" type="password" maxlength="32" autocomplete="current-password">
+
+      <label for="cnNew">新昵称</label>
+      <input id="cnNew" type="text" maxlength="16" autocomplete="off" placeholder="留空则改回用户名">
+      <div class="hint">__NICKNAME_RULE__。留空时使用用户名；修改成功后重新登录游戏生效。</div>
+
+      <button type="submit">确认修改昵称</button>
+      <div class="msg" id="changeNicknameMsg"></div>
+    </form>
+  </div>
+</div>
+
+<div class="mask" id="transferMask">
+  <div class="popup" role="dialog" aria-modal="true" aria-labelledby="transferTitle">
     <button type="button" class="close" id="closeTransfer">关闭</button>
-    <h2>存档转移助手</h2>
+    <h2 id="transferTitle">存档转移助手</h2>
 
     <div class="tabs">
       <button type="button" class="on" data-pane="down">存档下载</button>
@@ -294,15 +348,59 @@ document.getElementById("reg").addEventListener("submit", function (event) {
     });
 });
 
-var mask = document.getElementById("mask");
-document.getElementById("openTransfer").addEventListener("click", function () {
-  mask.classList.add("open");
+function bindPopup(openId, maskId, closeId, firstInputId) {
+  var popupMask = document.getElementById(maskId);
+  document.getElementById(openId).addEventListener("click", function () {
+    popupMask.classList.add("open");
+    document.getElementById(firstInputId).focus();
+  });
+  document.getElementById(closeId).addEventListener("click", function () {
+    popupMask.classList.remove("open");
+  });
+  // ★ 不给 mask 本身绑定 click，也不监听 Escape：三个 popup 都只能用右上角
+  // 「关闭」按钮关掉。这样误点变暗背景不会丢掉已经填写的账号、密码或文件。
+}
+
+bindPopup("openChangePassword", "changePasswordMask", "closeChangePassword", "cpu");
+bindPopup("openChangeNickname", "changeNicknameMask", "closeChangeNickname", "cnu");
+bindPopup("openTransfer", "transferMask", "closeTransfer", "du");
+
+document.getElementById("changePasswordForm").addEventListener("submit", function (event) {
+  event.preventDefault();
+  var newPassword = document.getElementById("cpNew1").value;
+  var confirmation = document.getElementById("cpNew2").value;
+  if (newPassword !== confirmation) {
+    show("changePasswordMsg", "两次输入的新密码不一致，请重新输入。", false);
+    return;
+  }
+  post("/api/change-password", {
+    username: document.getElementById("cpu").value.trim(),
+    old_password: document.getElementById("cpOld").value,
+    new_password: newPassword,
+    new_password2: confirmation
+  })
+    .then(function (r) {
+      show("changePasswordMsg", r.data.message, r.data.ok);
+    })
+    .catch(function () {
+      show("changePasswordMsg", "连不上服务器，请确认服务端还在运行。", false);
+    });
 });
-document.getElementById("closeTransfer").addEventListener("click", function () {
-  mask.classList.remove("open");
+
+document.getElementById("changeNicknameForm").addEventListener("submit", function (event) {
+  event.preventDefault();
+  post("/api/change-nickname", {
+    username: document.getElementById("cnu").value.trim(),
+    old_password: document.getElementById("cnOld").value,
+    display_name: document.getElementById("cnNew").value.trim()
+  })
+    .then(function (r) {
+      show("changeNicknameMsg", r.data.message, r.data.ok);
+    })
+    .catch(function () {
+      show("changeNicknameMsg", "连不上服务器，请确认服务端还在运行。", false);
+    });
 });
-// ★ 点变暗的背景**不关闭**弹窗：这里面填着用户名密码、选好的存档文件，
-// 手一滑点到旁边就全没了。只认右上角那个「关闭」。
 
 var tabs = document.querySelectorAll(".tabs button");
 for (var i = 0; i < tabs.length; i++) {
