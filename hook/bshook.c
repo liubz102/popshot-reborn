@@ -366,6 +366,7 @@ static int WINAPI det_MessageBoxA(HWND hWnd, LPCSTR text, LPCSTR cap, UINT type)
 #define IDC_RADIO_LOCAL    1011
 #define IDC_RADIO_ONLINE   1012
 #define IDC_REGISTER_LINK  1010
+#define IDC_LOGIN_START    1006
 
 /* ★★ 「远程服务器」单选钮 1012 的宽度**上限**，位置一律不动（D098）。       */
 /*                                                                            */
@@ -402,8 +403,17 @@ static unsigned g_peer_relay_port     = 27798;
 
 static HWND         g_login_dlg   = NULL;
 static int          g_dlg_styled  = 0;      /* 文案 / 尺寸只改一次 */
-static volatile LONG g_online     = 0;      /* 1 = 选了「远程服务器」 */
+static volatile LONG g_online     = 0;      /* 界面当前选择：1 =「远程服务器」 */
+/* 玩家点「开始」时把界面选择冻结成这一轮登录的路由。认证服、游戏服和
+   战斗中继必须一直用同一份快照，不能被原客户端后续清空单选状态所影响。 */
+static volatile LONG g_route_online = 0;
+static volatile LONG g_route_locked = 0;
 static wchar_t      g_link_text[512] = L"";
+/* 登录框本身也要子类化：只在玩家真的点单选钮时更新 g_online。
+   原客户端点「开始」后会临时清掉单选状态；若继续每 100ms 从控件反推模式，
+   认证刚走完远程服，游戏服就会被误切回本机（票据因此不属于同一台服务器）。 */
+static HWND         s_login_hwnd   = NULL;
+static WNDPROC      s_login_oldproc = NULL;
 /* 被我们子类化的那条注册链接（实现在下面「注册链接的点击」一段）。 */
 static HWND         s_link_hwnd   = NULL;
 
@@ -448,15 +458,20 @@ static void read_online_config(void)
           g_relay_auth_port, g_relay_game_port, g_relay_peer_port);
 }
 
+static int selected_online_mode(void)
+{
+    return (int)InterlockedCompareExchange(&g_online, 0, 0);
+}
+
 /* 当前该显示 / 打开哪台服务器：本机固定 localhost，远程用配置里的地址。 */
 static const wchar_t *current_reg_host(void)
 {
-    return g_online ? g_server_addr : L"localhost";
+    return selected_online_mode() ? g_server_addr : L"localhost";
 }
 
 static unsigned current_reg_port(void)
 {
-    return g_online ? g_server_reg_port : g_local_reg_port;
+    return selected_online_mode() ? g_server_reg_port : g_local_reg_port;
 }
 
 /* 拼注册页 URL。IPv6 字面量要加方括号，否则冒号会被当成端口分隔符。 */
@@ -472,11 +487,33 @@ static void build_register_url(wchar_t *out, int cch)
 
 int popshot_online_mode(void)
 {
-    return (int)InterlockedCompareExchange(&g_online, 0, 0);
+    if (InterlockedCompareExchange(&g_route_locked, 0, 0))
+        return (int)InterlockedCompareExchange(&g_route_online, 0, 0);
+    return selected_online_mode();
+}
+
+static void set_online_mode(int online)
+{
+    LONG value = online ? 1 : 0;
+    if (InterlockedExchange(&g_online, value) != value)
+        bslog("LOGIN   分区切换 -> %s", value ? "远程服务器" : "本机服务器");
+}
+
+static void lock_online_mode(void)
+{
+    LONG online = selected_online_mode();
+    InterlockedExchange(&g_route_online, online);
+    InterlockedExchange(&g_route_locked, 1);
+    bslog("LOGIN   本轮登录路由锁定 -> %s",
+          online ? "远程服务器" : "本机服务器");
 }
 
 unsigned popshot_map_port(unsigned port)
 {
+    /* 正常路径在「开始」按钮的 BN_CLICKED 中锁定；这一层兜底保证即便登录框
+       子类化失败，第一次认证连接也会冻结选择，后面的游戏连接不会换服务器。 */
+    if (port == g_auth_port && !InterlockedCompareExchange(&g_route_locked, 0, 0))
+        lock_online_mode();
     if (!popshot_online_mode()) return port;
     if (port == g_auth_port) return g_relay_auth_port;
     if (port == g_game_port) return g_relay_game_port;
@@ -540,6 +577,55 @@ static void redraw_area_of(HWND dlg, int id)
                  RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 
+/* 单选钮的 BN_CLICKED 会送到父对话框。只认这个明确的用户选择事件，不能在
+   登录进行中继续轮询 BM_GETCHECK：原客户端会禁用并清掉这两个按钮的勾选，
+   那是界面内部状态，不代表玩家把「远程服务器」改回了「本机服务器」。 */
+static LRESULT CALLBACK login_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    WNDPROC oldproc = s_login_oldproc;
+    LRESULT result;
+
+    if (msg == WM_COMMAND && HIWORD(wp) == BN_CLICKED) {
+        int id = LOWORD(wp);
+        if (id == IDC_RADIO_LOCAL)
+            set_online_mode(0);
+        else if (id == IDC_RADIO_ONLINE)
+            set_online_mode(1);
+        else if (id == IDC_LOGIN_START)
+            lock_online_mode();
+    }
+
+    result = CallWindowProcW(oldproc, h, msg, wp, lp);
+    if (msg == WM_NCDESTROY && h == s_login_hwnd) {
+        s_login_hwnd = NULL;
+        s_login_oldproc = NULL;
+    }
+    return result;
+}
+
+static void hook_login_dialog(HWND dlg)
+{
+    UINT local_checked, online_checked;
+
+    if (!dlg || dlg == s_login_hwnd) return;
+    s_login_oldproc = (WNDPROC)SetWindowLongPtrW(
+        dlg, GWLP_WNDPROC, (LONG_PTR)login_wndproc);
+    if (!s_login_oldproc) {
+        bslog("LOGIN   !! 登录框子类化失败，分区选择无法可靠锁定");
+        return;
+    }
+    s_login_hwnd = dlg;
+
+    /* 补住极小的启动窗口：如果玩家在子类化完成前已经选过一次，就从当前
+       控件状态初始化；只有恰好一个按钮被选中时才采信，两个都没选时保留模式。 */
+    local_checked = IsDlgButtonChecked(dlg, IDC_RADIO_LOCAL);
+    online_checked = IsDlgButtonChecked(dlg, IDC_RADIO_ONLINE);
+    if (online_checked == BST_CHECKED && local_checked != BST_CHECKED)
+        set_online_mode(1);
+    else if (local_checked == BST_CHECKED && online_checked != BST_CHECKED)
+        set_online_mode(0);
+}
+
 /* 定义在下面「注册链接的点击」一段。 */
 static void hook_register_link(HWND dlg);
 
@@ -571,22 +657,25 @@ static void style_login_dialog(HWND dlg)
        换成「在服务器 xxx 上注册用户」之后 xxx 可能是个长域名，直接加宽到底。 */
     resize_ctrl(dlg, IDC_REGISTER_LINK, 460, 18);
     hook_register_link(dlg);
+    hook_login_dialog(dlg);
 
     bslog("LOGIN   登录框已改造：分区单选钮 -> 本机服务器 / 远程服务器，注册链接指向我们自己的服务器");
 }
 
-/* 每 100 毫秒跑一次：跟住单选钮的选择，并让链接文字跟着变。 */
+/* 每 100 毫秒跑一次：发现 / 修饰登录框、解禁单选钮并更新链接文字。
+   分区选择本身由 login_wndproc 的 BN_CLICKED 跟踪，不能在这里轮询覆盖。 */
 static void poll_login_dialog(void)
 {
     wchar_t want[512];
     char u8[1536];
-    LONG online;
 
     if (g_login_dlg && !IsWindow(g_login_dlg)) {
         /* 登录成功后对话框被销毁。**保留最后一次的模式** —— 之后连游戏服
            时还要用它决定连本机还是连中继。 */
         g_login_dlg = NULL;
         g_dlg_styled = 0;
+        s_login_hwnd = NULL;
+        s_login_oldproc = NULL;
         s_link_hwnd = NULL;      /* 对话框重建时要重新子类化那条链接 */
         return;
     }
@@ -621,10 +710,6 @@ static void poll_login_dialog(void)
             bslog("LOGIN   分区单选钮被客户端禁用了，已解禁（登录失败后还要能换分区）");
         }
     }
-
-    online = IsDlgButtonChecked(g_login_dlg, IDC_RADIO_ONLINE) ? 1 : 0;
-    if (InterlockedExchange(&g_online, online) != online)
-        bslog("LOGIN   分区切换 -> %s", online ? "远程服务器" : "本机服务器");
 
     _snwprintf(want, 512, L"在服务器 %s 上注册用户", current_reg_host());
     want[511] = 0;
@@ -852,7 +937,8 @@ unsigned popshot_map_port(unsigned port);
    ★ 本机服务器 / 远程服务器的区分就在这里，靠**端口**而不是靠别处传状态（决策 D066）：
        本机服务器（单选钮 1011）-> 127.0.0.1:47611 / 27799 = 本机服务端
        远程服务器（单选钮 1012）-> 127.0.0.1:47621 / 27809 = 本机中继，它再连远端
-   `connect` 发生在用户点「开始」之后，那一刻单选钮的状态是确定的，判定没有竞态。 */
+   玩家点「开始」时会冻结一次模式；这一轮后续所有 `connect` 都使用同一份快照，
+   不再读取会被原客户端清空的单选钮状态。 */
 static int make_localhost(const struct sockaddr_min *name, int namelen, struct sockaddr_in_min *out)
 {
     unsigned port, mapped;
