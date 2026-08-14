@@ -13,6 +13,9 @@
     POST /api/change-password
                           {username, old_password, new_password,
                            new_password2}                 -> {ok, message}
+    POST /api/current-nickname
+                          {username}                      -> {ok, message,
+                                                             found, display_name?}
     POST /api/change-nickname
                           {username, old_password, display_name}
                                                             -> {ok, message}
@@ -328,6 +331,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         route = {
             "/api/register": self._api_register,
             "/api/change-password": self._api_change_password,
+            "/api/current-nickname": self._api_current_nickname,
             "/api/change-nickname": self._api_change_nickname,
             "/api/export": self._api_export,
             "/api/import": self._api_import,
@@ -407,6 +411,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         eventlog.online(f"注册页 ✓ 修改密码 账号={username!r} "
                         f"ip={self.client_label()}")
         self._reply(True, "密码修改成功！下次登录请使用新密码。")
+
+    def _api_current_nickname(self, data):
+        username = str(data.get("username", "")).strip()
+        _name, account = self.accounts.get_account(username)
+        # 这是修改昵称框失焦时的只读查询：不校验密码，也不碰注册限流器。
+        # `found` 单独表达是否存在，`ok` 则表示这次查询本身正常完成。
+        if account is None:
+            self._reply(True, "未查询到当前用户", found=False)
+            return
+        nickname = str(account.get("display_name") or username)
+        self._reply(True, f"当前昵称: {nickname}",
+                    found=True, display_name=nickname)
 
     def _api_change_nickname(self, data):
         username = str(data.get("username", "")).strip()

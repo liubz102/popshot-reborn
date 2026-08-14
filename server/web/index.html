@@ -176,8 +176,9 @@
     <form id="changeNicknameForm" autocomplete="off">
       <label for="cnu">用户名</label>
       <input id="cnu" type="text" maxlength="16" autocomplete="username">
+      <div class="hint" id="currentNickname" aria-live="polite" aria-atomic="true"></div>
 
-      <label for="cnOld">旧密码</label>
+      <label for="cnOld">密码</label>
       <input id="cnOld" type="password" maxlength="32" autocomplete="current-password">
 
       <label for="cnNew">新昵称</label>
@@ -365,6 +366,42 @@ bindPopup("openChangePassword", "changePasswordMask", "closeChangePassword", "cp
 bindPopup("openChangeNickname", "changeNicknameMask", "closeChangeNickname", "cnu");
 bindPopup("openTransfer", "transferMask", "closeTransfer", "du");
 
+var nicknameUsername = document.getElementById("cnu");
+var currentNickname = document.getElementById("currentNickname");
+var nicknameLookupSerial = 0;
+
+function lookupCurrentNickname() {
+  var username = nicknameUsername.value.trim();
+  var serial = ++nicknameLookupSerial;
+  if (!username) {
+    currentNickname.textContent = "未查询到当前用户";
+    return;
+  }
+  currentNickname.textContent = "查询中…";
+  post("/api/current-nickname", {username: username})
+    .then(function (r) {
+      // 用户可能已改过输入又触发了下一次查询；旧响应不能覆盖新用户名的结果。
+      if (serial !== nicknameLookupSerial || nicknameUsername.value.trim() !== username) {
+        return;
+      }
+      currentNickname.textContent = r.data.found
+        ? "当前昵称: " + r.data.display_name
+        : "未查询到当前用户";
+    })
+    .catch(function () {
+      if (serial === nicknameLookupSerial && nicknameUsername.value.trim() === username) {
+        currentNickname.textContent = "查询当前昵称失败，请稍后重试。";
+      }
+    });
+}
+
+nicknameUsername.addEventListener("input", function () {
+  // 输入已变化时，马上撤掉上一用户名的结果，并让在途响应失效。
+  nicknameLookupSerial += 1;
+  currentNickname.textContent = "";
+});
+nicknameUsername.addEventListener("blur", lookupCurrentNickname);
+
 document.getElementById("changePasswordForm").addEventListener("submit", function (event) {
   event.preventDefault();
   var newPassword = document.getElementById("cpNew1").value;
@@ -396,6 +433,7 @@ document.getElementById("changeNicknameForm").addEventListener("submit", functio
   })
     .then(function (r) {
       show("changeNicknameMsg", r.data.message, r.data.ok);
+      if (r.data.ok) { lookupCurrentNickname(); }
     })
     .catch(function () {
       show("changeNicknameMsg", "连不上服务器，请确认服务端还在运行。", false);

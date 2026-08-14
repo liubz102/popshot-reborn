@@ -660,6 +660,21 @@ class RegisterWebTests(unittest.TestCase):
         self.assertNotIn('addEventListener("keydown"', html)
         self.assertIn("三个 popup 都只能用右上角", html)
 
+    def test_change_nickname_username_blur_shows_the_current_nickname_below_it(self):
+        with urllib.request.urlopen(self.url("/"), timeout=10) as response:
+            html = response.read().decode("utf-8")
+        username_at = html.index('id="cnu"')
+        result_at = html.index('id="currentNickname"')
+        password_at = html.index('for="cnOld"')
+        self.assertLess(username_at, result_at)
+        self.assertLess(result_at, password_at)
+        self.assertIn('post("/api/current-nickname"', html)
+        self.assertIn('addEventListener("blur", lookupCurrentNickname)', html)
+        self.assertIn('"当前昵称: " + r.data.display_name', html)
+        self.assertIn('"未查询到当前用户"', html)
+        # 快速改用户名时，先回来的旧请求不能覆盖后来一次查询的文字。
+        self.assertIn("nicknameLookupSerial", html)
+
     def test_register_stores_the_nickname(self):
         reply = self.post("/api/register",
                           {"username": self.who, "password": "pw",
@@ -775,6 +790,21 @@ class RegisterWebTests(unittest.TestCase):
         self.assertFalse(reply["ok"])
         self.assertIn("显示昵称", reply["message"])
         self.assertNotIn("用户名已存在", reply["message"])
+
+    def test_current_nickname_lookup_returns_the_saved_display_name(self):
+        self.accounts.register(self.who, "pw", display_name="现在的昵称")
+        reply = self.post("/api/current-nickname", {"username": self.who})
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(reply["found"])
+        self.assertEqual("现在的昵称", reply["display_name"])
+        self.assertEqual("当前昵称: 现在的昵称", reply["message"])
+
+    def test_current_nickname_lookup_reports_an_unknown_user(self):
+        reply = self.post("/api/current-nickname", {"username": self.who})
+        self.assertTrue(reply["ok"], reply)
+        self.assertFalse(reply["found"])
+        self.assertNotIn("display_name", reply)
+        self.assertEqual("未查询到当前用户", reply["message"])
 
     def test_the_page_ships_the_skip_tutorial_box_checked(self):
         with urllib.request.urlopen(self.url("/"), timeout=10) as response:
@@ -1158,8 +1188,11 @@ class RegisterCooldownTests(unittest.TestCase):
         self.assertEqual(0, limiter.retry_after("127.0.0.1"))
 
     def test_the_cooldown_only_covers_registration(self):
-        # 存档导出 / 上传、修改密码 / 昵称都不该被注册的冷却连坐。
+        # 昵称查询、存档导出 / 上传、修改密码 / 昵称都不该被注册的冷却连坐。
         self.assertTrue(self.register("cool5")["ok"])
+        lookup = self.post("/api/current-nickname", {"username": "cool5"})
+        self.assertTrue(lookup["ok"], lookup)
+        self.assertTrue(lookup["found"])
         nickname = self.post("/api/change-nickname",
                              {"username": "cool5", "old_password": "pw",
                               "display_name": "冷却外昵称"})
