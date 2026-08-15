@@ -30,7 +30,7 @@ from gameserver import (                                       # noqa: E402
     ROOM_SEAT_COUNT,
     SEAT_ACTION_CHANGE_CHARACTER, SEAT_ACTION_JOIN, SEAT_ACTION_LEAVE,
     SEAT_ACTION_RESYNC,
-    SESSION_STATUS_WAITING, StartGameHandshake,
+    SESSION_STATUS_PLAYING, SESSION_STATUS_WAITING, StartGameHandshake,
     Reader, build_game, build_rep_list_session, build_receive_chat,
     build_rep_move_into_session, build_session, build_session_slot,
     build_update_session,
@@ -40,8 +40,8 @@ from gameserver import (                                       # noqa: E402
     read_session_descriptor,
     take_frame, w_i32, w_wstr,
 )
-from lobby import (Lobby, MOVE_INTO_BAD_PASSWORD, MOVE_INTO_FULL,   # noqa: E402
-                   MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_OK,
+from lobby import (Lobby, MOVE_INTO_ALREADY_PLAYING, MOVE_INTO_BAD_PASSWORD,
+                   MOVE_INTO_FULL, MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_OK,
                    TEAM_A, TEAM_B, TEAM_LAYOUT_FREE)
 import relayserver                                                  # noqa: E402
 from simple import SimpleCipher                                     # noqa: E402
@@ -1366,6 +1366,45 @@ class StartGameRoomTests(LobbyIsolated):
         gameserver.Conn.on_game_packet(carol, OP_MOVE_INTO_SESSION,
                                        move_into_payload(self.room.room_id))
         self.assertIsNone(self.room.battle)
+
+    def test_a_joiner_during_loading_is_blocked(self):
+        """★ 回归 bug调查/1：加载途中进房会把开局握手作废成死锁。
+
+        0x0400 发出去（PREPARING，全员困在加载界面没法重新按「开始」）
+        之后放进新人，`finish_join` 把 `room.battle` 作废，剩下的人
+        永远等不齐 0x0403 —— 8-14 晚 dk 在 6 人加载途中进房，全员
+        「还在等 6 人」直到散伙。
+        """
+        self.ready(self.alice); self.ready(self.alice)    # 0x0401 + 0x0400
+        self.assertEqual(self.room.battle.state,
+                         StartGameHandshake.PREPARING)
+        self.assertEqual(self.room.status, SESSION_STATUS_PLAYING)
+        carol = make_conn("carol")
+        gameserver.Conn.on_game_packet(carol, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        self.assertEqual([p for b in carol.sent for _, op, p in frames(b)
+                          if op == OP_MOVE_INTO_SESSION],
+                         [build_rep_move_into_session(MOVE_INTO_ALREADY_PLAYING)])
+        self.assertIsNone(self.lobby.room_of(carol))      # 确实没进来
+        self.assertIsNotNone(self.room.battle)            # 这一轮的握手没被作废
+        # 房里两人的加载流程照常走完：收齐 0x0403 就放行。
+        self.alice.sent.clear(); self.bob.sent.clear()
+        self.loaded(self.alice); self.loaded(self.bob)
+        self.assertIn(OP_COUNT_GAME_READY, opcodes(self.alice))
+
+    def test_leaving_mid_load_is_still_noted_for_handover(self):
+        """★ 加载期房间已提前标「游戏中」，但退房的人仍要记进补交接名单。
+
+        给 `room_in_battle()` 的回归：挡人用的 `room.status` 和「真开打了」
+        是两回事，控制权交接若误判成战斗中，`left_while_loading` 就没人记，
+        那一局的怪从开局起就没人模拟（§180 / D103）。
+        """
+        self.ready(self.alice); self.ready(self.alice)
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.assertEqual(self.room.battle.left_while_loading, [1])
+        self.loaded(self.alice)                           # 剩下的人照常放行
+        self.assertIn(OP_COUNT_GAME_READY, opcodes(self.alice))
+        self.assertEqual(self.room.battle.left_while_loading, [])
 
 
 class PeerHeaderTests(unittest.TestCase):

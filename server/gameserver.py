@@ -3434,6 +3434,23 @@ def conn_is_playing(conn):
     return room is not None and room.status == SESSION_STATUS_PLAYING
 
 
+def room_in_battle(room):
+    """这一局是不是**真开打了**（全员加载完、一起进 stage 7）。
+
+    加载期（`PREPARING`）房间就已经标「游戏中」挡人了（bug调查/1 的
+    死锁修复，见 `broadcast_start_game`），但那一局还没开打：战斗状态
+    `room.quest` 要等收齐所有人的 `0x0403` 才按在座座位建。刷道具 /
+    判胜负 / 控制权交接这些「战斗内」逻辑必须用这个判，别直接看
+    `room.status` —— 否则加载期一有人退房就会把 `quest_state()` 的
+    懒惰分支踩出来，提前建一份座位不对的战斗状态，真进关卡时反而
+    不重建了。
+    """
+    return (room is not None
+            and room.status == SESSION_STATUS_PLAYING
+            and room.battle is not None
+            and room.battle.state == StartGameHandshake.IN_GAME)
+
+
 def online_user_snapshots(viewer=None, waiting_only=False):
     """在线玩家列表，喂给 `0x0212`（§166 / §169）。
 
@@ -3796,7 +3813,7 @@ class Conn:
         返回真的刷出来了没有。
         """
         room = self.lobby_room()
-        if room is None or room.status != SESSION_STATUS_PLAYING:
+        if not room_in_battle(room):
             return False
         if not self.item_mode():
             return False
@@ -4380,7 +4397,7 @@ class Conn:
         （约 8 Hz，用来盯时间上限）、以及有人中途退房之后。
         """
         room = self.lobby_room()
-        if room is None or room.status != SESSION_STATUS_PLAYING:
+        if not room_in_battle(room):
             return False
         if self.quest_mode():
             return False
@@ -5258,6 +5275,9 @@ class Conn:
         self.sync_peer_relay(room, reason="（有人进房）")
         # 有新人进来，上一轮的开局握手作废（不清的话新人不在 `loaded` 里，
         # 房主再按开始时会等一个从没收到过 0x0400 的人）。
+        # ★ 这条只在待机/倒计时阶段走得通：加载中（PREPARING）的房间在
+        #   `broadcast_start_game` 里已提前标「游戏中」挡人 —— 加载中的
+        #   客户端没法重新按「开始」，把握手作废就等于死锁（bug调查/1）。
         # 上一局的战斗状态一并作废：新人进得来说明房间是待机中的，
         # 那一局早结束了，留着只会让下一局带上旧的掉落物句柄和 `settled`。
         room.battle = None
@@ -5315,18 +5335,28 @@ class Conn:
         packets = " ".join(f"0x{op:04x}" for op, _ in replies)
         self.log(f"← 广播开局握手 {packets} 给房里 "
                  f"{len(room.members(exclude=None))} 人（{why}）")
-        # 真进了关卡（所有人都加载完、一起进 stage 7）才把房间标成「游戏中」：
-        # 大厅列表跟着变，`Lobby.join` 也会用 MOVE_INTO_ALREADY_PLAYING
-        # 把半路想进来的人挡在外面 —— 关卡是开局那一刻按座位表加载的，
-        # 中途多一个人进来两边就对不上。
+        # 房间什么时候标「游戏中」（大厅列表跟着变，`Lobby.join` 也会用
+        # MOVE_INTO_ALREADY_PLAYING 把半路想进来的人挡在外面 —— 关卡是
+        # 开局那一刻按座位表加载的，中途多一个人进来两边就对不上）：
         #
-        # ★ 挡人的时机是 IN_GAME，**不是倒计时刚开始**：还在倒计时/加载的
-        #   阶段进来一个人，走的是「新人进房 -> 上一轮握手作废」那条路
-        #   （`finish_join` 会把 `room.battle` 清掉重来），那是对的，
-        #   提前挡住反而把这条路废了。
-        if (room.battle.state == StartGameHandshake.IN_GAME
+        # ★ 从 0x0400 发出（PREPARING，全员开始加载关卡）就挡，不是等
+        #   真进关卡（IN_GAME）：加载中的客户端困在加载界面，**没法重新
+        #   按「开始」**。这时放进新人，`finish_join` 会把 `room.battle`
+        #   作废，之后每一发 0x0403 轮询都会新建一个停在 WAIT_START 的
+        #   状态机 —— 剩下的人永远等不齐（bug调查/1 事故：dk 在 6 人
+        #   加载途中进房，全员「还在等 6 人」一直等到散伙）。
+        #   倒计时（WAIT_CONFIRM）阶段不挡：那时大家都还在房间界面，
+        #   房主可以重新按 F5，「作废 -> 重来」这条路是通的。
+        if (room.battle.state == StartGameHandshake.PREPARING
                 and room.status != SESSION_STATUS_PLAYING):
             LOBBY.update_room(room, status=SESSION_STATUS_PLAYING)
+            self.log(f"   房间 #{room.room_id} -> 游戏中"
+                     f"（0x0400 已发、全员加载中 —— 这时进房只会把开局"
+                     f"握手作废成死锁，提前挡人）")
+
+        # 真进了关卡（所有人都加载完、一起进 stage 7）之后的收尾。
+        if (room.battle.state == StartGameHandshake.IN_GAME
+                and room.quest is None):
             # 这一局的战斗状态重新起一份（上一局的掉落物句柄/死亡表全作废）。
             # ★ 控制者表要按**这一刻在座的座位**算，和客户端
             #   `GameContext::StartGame` 同一个口径（§180）——
@@ -5336,12 +5366,10 @@ class Conn:
             # 「准备好了」跟着客户端一起清 —— 它进 stage 6 时自己清了一遍
             # （`LoadingStage` 构造函数，§165）。不跟着清就会两边不一致。
             room.clear_ready()
-            self.log(f"   房间 #{room.room_id} -> 游戏中"
-                     f"（大厅列表和「加入房间」都会跟着挡人）")
             # ★ 关卡加载途中走掉的人，现在补交接（§180 / D103）——
-            #   客户端可能在他走之前就把控制者表建好了。**必须排在
-            #   那一发 `0x0402` 之后**（上面的循环已经发完了）：客户端要先
-            #   进 stage 7 把 GameContext 建起来，才有表可改。
+            # 客户端可能在他走之前就把控制者表建好了。**必须排在
+            # 那一发 `0x0402` 之后**（上面的循环已经发完了）：客户端要先
+            # 进 stage 7 把 GameContext 建起来，才有表可改。
             for seat in list(room.battle.left_while_loading):
                 self.handover_controller_slots(
                     room, seat, why="（关卡加载途中走的）", force=True)
@@ -5460,7 +5488,7 @@ class Conn:
         """
         if room is None:
             return None
-        if room.status != SESSION_STATUS_PLAYING:
+        if not room_in_battle(room):
             if (room.battle is not None
                     and room.battle.note_left_while_loading(leaver_seat)):
                 self.log(f"   控制权: 座位 {leaver_seat} 在关卡加载途中走了，"

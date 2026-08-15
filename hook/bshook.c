@@ -145,6 +145,7 @@ static int insn_len(const unsigned char *p)
     case 0xEB:                                       /* jmp rel8 */
         return 2;
     case 0x8B: case 0x89:                            /* mov r/m32,r32 / mov r32,r/m32 */
+    case 0x33: case 0x85:                            /* xor r/m32,r32 / test r/m32,r32 */
     {
         unsigned char modrm = p[1];
         unsigned char mod = modrm >> 6, rm = modrm & 7;
@@ -1699,6 +1700,163 @@ static int try_patch_reflect_visual(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* 联机闪退修复 —— 中文输入法（IME）候选窗在 stage 切换后踩已释放的聊天输入框  */
+/*                                                                            */
+/*   实测（bug调查/3，12 份 mdmp 全部同一现场）：收到 0x0402「全员加载完成，   */
+/*   一起进 stage 7」后 ~1 秒内 C0000005 @ 0x42516A，坏指针 = 0xFFFFFF00       */
+/*   （9 份）或已复用的随机堆垃圾（3 份）。逐层还原（脱壳镜像 + dump 现场）：  */
+/*                                                                            */
+/*     · 0x42515E SumRect(head=edx, out=eax)：沿 +0x28 父指针链累加每层的     */
+/*       +0x10/+0x14（宽/高），子控件坐标 -> 屏幕坐标；                        */
+/*     · UiImeCandidates（输入法候选窗）的布局方法 0x430102（vtable+0xC）在   */
+/*       候选窗可见时（正在打拼音）读 [UI根+0x10] 当 head —— 那一格是          */
+/*       「当前活动编辑框」：聊天输入 UiEdit 激活（0x42F0DE）时登记，          */
+/*       正常关闭（0x42F12B）时清空；                                           */
+/*     · 0x0402 切 stage 7 拆 UI 时把聊天输入框**直接销毁**。控件析构里的      */
+/*       根缓存清理 0x4269AB 清了 +0xC/+0x18/+0x14/+0x1C 四个缓存，           */
+/*       ★ 唯独漏了 +0x10 —— [UI根+0x10] 从此指着已释放内存；                  */
+/*     · 下一帧候选窗布局沿坏指针读 [0xFFFFFF00+0x10] -> 崩。                  */
+/*   只有 IME 候选窗还亮着（打字中/刚打完）的客户端中招，所以同房有人崩有人   */
+/*   不崩；也所以 8-14（旧服）与 8-15（GPT 改版服）两代服务器崩得一模一样     */
+/*   —— 纯客户端 UI bug，和服务端时序无关。                                    */
+/*                                                                            */
+/*   两处配套 patch：                                                          */
+/*   A) 0x4269AB 头 5 字节（push esi; mov esi,ecx; xor ecx,ecx —— 正好 5 字节）*/
+/*      换成 E9 跳 detour：补上「将亡控件 == [根+0x10] 时把它清空」，其余      */
+/*      原样（跳回 0x4269B0 继续原有的四个缓存清理）。修的正是原版漏掉的      */
+/*      那一次缓存失效。                                                       */
+/*   B) 0x42515E 头部 inline hook：head 为空/野值（<0x10000）时输出全零矩形    */
+/*      返回。★ 必须配 A：A 生效后 head=0 成为合法状态，而原版对 head=0       */
+/*      会走 je 0x425177 去读 [edx+0x1C] —— 0x425177 那两条根本不判空。       */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_IME_CRASH=1 可保留原版行为（闪退复现/对照用）。           */
+/* -------------------------------------------------------------------------- */
+#define UI_ROOT_CACHE_CLEAR_VA  0x004269ABu  /* 控件析构时的根缓存清理        */
+#define UI_ROOT_CACHE_SIG_LEN   8
+static const unsigned char UI_ROOT_CACHE_SIG[UI_ROOT_CACHE_SIG_LEN] = {
+    0x56, 0x8B, 0xF1,                   /* push esi; mov esi, ecx            */
+    0x33, 0xC9,                         /* xor ecx, ecx                      */
+    0x39, 0x46, 0x0C                    /* cmp [esi+0xC], eax                */
+};
+
+#define SUM_RECT_VA             0x0042515Eu  /* SumRect：子->屏幕坐标换算    */
+#define SUM_RECT_SIG_LEN        8
+static const unsigned char SUM_RECT_SIG[SUM_RECT_SIG_LEN] = {
+    0x56, 0x57,                         /* push esi; push edi                */
+    0x33, 0xF6, 0x33, 0xFF,             /* xor esi, esi; xor edi, edi        */
+    0x85, 0xD2                          /* test edx, edx                     */
+};
+
+/* detour 里要用的立即数不带后缀（MSVC 内联汇编不吃 0x…u 这种写法） */
+#define UI_ROOT_CACHE_RETURN_TO 0x004269B0
+
+static __declspec(naked) void ui_root_cache_clear_detour(void)
+{
+    __asm {
+        push esi                            /* 被偷走的原指令，逐条补回 */
+        mov  esi, ecx
+        xor  ecx, ecx
+        cmp  dword ptr [esi + 0x10], eax    /* ★原版漏掉的：活动编辑框缓存 */
+        jne  uicc_keep
+        mov  dword ptr [esi + 0x10], ecx    /* 将亡控件正是它 -> 清空 */
+    uicc_keep:
+        push UI_ROOT_CACHE_RETURN_TO        /* 回原函数继续清 +0xC/+0x18/+0x14/+0x1C */
+        ret
+    }
+}
+
+static void *g_sum_rect_trampoline = NULL;
+
+static __declspec(naked) void sum_rect_guard_detour(void)
+{
+    __asm {
+        cmp  edx, 0x10000                   /* head 为空/野值：别去碰 */
+        jae  srg_ok
+        mov  dword ptr [eax], 0             /* 输出全零矩形（原版会去读 [edx+0x1C] 崩） */
+        mov  dword ptr [eax + 4], 0
+        mov  dword ptr [eax + 8], 0
+        mov  dword ptr [eax + 0xC], 0
+        ret
+    srg_ok:
+        jmp  dword ptr [g_sum_rect_trampoline]
+    }
+}
+
+static volatile LONG g_ime_cache_patched  = 0;
+static volatile LONG g_ime_sumrect_patched = 0;
+
+static int ime_crash_fix_keep_original(void)
+{
+    /* BSHOOK_KEEP_IME_CRASH=1 → 保留原版（闪退复现/对照用）。
+       注意别照抄 afk/region 那两个 *_disabled() 的写法：它们的返回值
+       语义是反的（未设置返回 TRUE），抄了必翻车 —— 冒烟测试抓到过。 */
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_IME_CRASH", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_patch_ime_cache_clear(void)
+{
+    unsigned char *p = (unsigned char *)UI_ROOT_CACHE_CLEAR_VA;
+    DWORD oldp;
+
+    if (g_ime_cache_patched) return 1;
+    if (IsBadReadPtr(p, UI_ROOT_CACHE_SIG_LEN)) return 0;
+    {
+        /* 幂等：已打过就是「E9 <跳到我们 detour 的 rel32>」 */
+        if (p[0] == 0xE9
+            && (DWORD)(*(int *)(p + 1))
+                   == (DWORD)((UINT_PTR)&ui_root_cache_clear_detour
+                              - (UINT_PTR)(p + 5))) {
+            InterlockedExchange(&g_ime_cache_patched, 1);
+            return 1;
+        }
+    }
+    if (memcmp(p, UI_ROOT_CACHE_SIG, UI_ROOT_CACHE_SIG_LEN) != 0)
+        return 0;                          /* 还没解壳到这里，或不是已确认的版本 */
+
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   IME 缓存清理: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    p[0] = 0xE9;
+    *(DWORD *)(p + 1) = (DWORD)((UINT_PTR)&ui_root_cache_clear_detour
+                                - (UINT_PTR)(p + 5));
+    VirtualProtect(p, 5, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    InterlockedExchange(&g_ime_cache_patched, 1);
+    bslog("PATCH   ★IME 闪退修复1/2 @ %08X: 控件销毁时把 [UI根+0x10]"
+          "（活动编辑框）一并清掉 —— 原版只清 +0xC/+0x18/+0x14/+0x1C",
+          (unsigned)UI_ROOT_CACHE_CLEAR_VA);
+    return 1;
+}
+
+static int try_patch_sum_rect_guard(void)
+{
+    unsigned char *p = (unsigned char *)SUM_RECT_VA;
+
+    if (g_ime_sumrect_patched) return 1;
+    if (IsBadReadPtr(p, SUM_RECT_SIG_LEN)) return 0;
+    if (g_sum_rect_trampoline == NULL) {
+        if (memcmp(p, SUM_RECT_SIG, SUM_RECT_SIG_LEN) != 0)
+            return 0;                      /* 还没解壳到这里，或不是已确认的版本 */
+        g_sum_rect_trampoline = install_inline_hook((void *)SUM_RECT_VA,
+                                                    sum_rect_guard_detour,
+                                                    "SumRect 空头防护");
+        if (!g_sum_rect_trampoline) {
+            g_sum_rect_trampoline = NULL;
+            return 0;
+        }
+    }
+    InterlockedExchange(&g_ime_sumrect_patched, 1);
+    bslog("PATCH   ★IME 闪退修复2/2 @ %08X: 坐标换算头指针为空/野值时输出"
+          "全零矩形（修复1/2 生效后 head=0 合法，原版这里会读 [0+0x1C]）",
+          (unsigned)SUM_RECT_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* 单机化 patch —— 解锁被「地区掩码」关掉的关卡（神秘岛以外的第 5/6/7 关）    */
 /*                                                                            */
 /*   Data/map.ini 里每张地图都有一行 OpenLocale（注释写着                     */
@@ -2327,6 +2485,20 @@ static DWORD WINAPI patch_thread(LPVOID param)
     if (!g_reflect_visual_patched)
         bslog("PATCH   !! 超时未能 patch 反射道具视觉"
               "（0x5090e2 的特征串一直对不上）");
+
+    /* IME 闪退修复（联机主崩溃，bug调查/3）：两处配套，缺一不可。
+       不赶时机（解壳后随时可打），但和其它 patch 一样要等特征串出现。 */
+    if (ime_crash_fix_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_IME_CRASH 已设，保留原版 IME 闪退行为");
+    } else {
+        for (ticks = 0; !g_stop && ticks < 2000; ticks++) {
+            if (try_patch_ime_cache_clear() && try_patch_sum_rect_guard()) break;
+            Sleep(2);
+        }
+        if (!g_ime_cache_patched || !g_ime_sumrect_patched)
+            bslog("PATCH   !! 超时未能 patch IME 闪退修复"
+                  "（0x4269AB / 0x42515E 特征串一直对不上）");
+    }
 
     if (!afk_kick_disabled()) {
         bslog("PATCH   BSHOOK_KEEP_AFK_KICK 已设，保留原版 90 秒挂机踢出");
