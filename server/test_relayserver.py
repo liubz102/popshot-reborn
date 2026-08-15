@@ -270,6 +270,53 @@ class LiveRelayTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual([b"\xaa\xbb"], alice.fallback_got)
 
+    def test_a_send_broken_relay_falls_back_to_0x040f(self):
+        """★ 回归 bug调查/4：中继的发送流一旦超时错位（SimpleCipher 流密码，
+        半发送之后对面永远解不开），这条连接对**投递**来说就等于没有 ——
+        `conn_for()` 绕开它，数据自动回退 `0x040f` 走游戏服连接。
+
+        ★ 不关它的 socket（铁律 1）：客户端那条 TCP 的入站方向可能还是
+        好的（我们还能收它的数据），只是上游废了。
+        """
+        alice, bob = FakeGameConn("alice"), FakeGameConn("bob")
+        self.rooms = {alice: [bob], bob: [alice]}
+        a = self.register(alice, 0, 0)
+        b = self.register(bob, 0, 1)
+        relay_a = self.server.conn_for(alice)
+        relay_a.send_broken = True            # 模拟一次发送超时之后的状态
+        self.assertIsNone(self.server.conn_for(alice))
+        b.send(RCP_DATA_UP, b"\xcc\xdd")
+        for _ in range(200):
+            if alice.fallback_got:
+                break
+            time.sleep(0.01)
+        self.assertEqual([b"\xcc\xdd"], alice.fallback_got)
+        # 连接本体还活着（没被关），客户端发上来的数据照收。
+        a.send(RCP_REP_PING)
+        time.sleep(0.2)
+        self.assertFalse(relay_a.closed)
+
+    def test_a_stalled_connection_is_reported(self):
+        """`stalled()`：注册着但 `STALL_AFTER_S` 秒没有任何入站 = 半死。
+
+        gameserver 的自愈路径（`recover_peer_relay`）靠它判定要不要
+        给客户端换一条新中继。
+        """
+        alice = FakeGameConn("alice")
+        self.rooms = {alice: []}
+        client = self.register(alice, 0, 0)
+        relay = self.server.conn_for(alice)
+        self.assertFalse(self.server.stalled(alice))
+        relay.last_inbound_at -= relayserver.STALL_AFTER_S + 1
+        self.assertTrue(self.server.stalled(alice))
+        # 客户端一发 pong 就不算半死了。
+        client.send(RCP_REP_PING)
+        for _ in range(200):
+            if not self.server.stalled(alice):
+                break
+            time.sleep(0.01)
+        self.assertFalse(self.server.stalled(alice))
+
     def test_data_before_register_is_answered_with_who_are_you(self):
         # 原版的 opcode 2 就是干这个的：客户端收到会重发 rcpRegister。
         client = self.connect()

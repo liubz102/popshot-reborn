@@ -1857,6 +1857,95 @@ static int try_patch_sum_rect_guard(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* IME 闪退修复 3/3 —— 候选窗布局 0x430102 里 SumRect 之后还有一处裸解引用    */
+/*                                                                            */
+/*   bug调查/5：6 份 mdmp 全部 C0000005 @ 0x4301BD，读 0x110。0x430102 是      */
+/*   UiImeCandidates 的布局方法（修复 1/2 注释里的同一函数）：                 */
+/*                                                                            */
+/*     0x43019B  mov eax,[0x72e2b4]        ; UI 根                            */
+/*     0x4301A0  mov esi,[eax+0x10]        ; 活动编辑框（修复1/2 后可为 0）    */
+/*     0x4301A8  call SumRect              ; ← 修复 2/2 已护住，返回全零矩形   */
+/*     0x4301B3  add esi,0x110                                               */
+/*     0x4301B9  lea edi,[ebp-0x14]                                          */
+/*     0x4301BC  movsd ×5                  ; ★ 拷 [编辑框+0x110] 起 20 字节   */
+/*               ……（后面还拿拷出的第 5 个 dword 当 this 连发方法调用）        */
+/*                                                                            */
+/*   修复 1/2 只护住了 SumRect：编辑框销毁后 [+0x10]=0，SumRect 平安返回，     */
+/*   movsd 却照样去读 [0x110] —— 崩溃点从 0x42516A 挪到了 0x4301BD。          */
+/*   零填充拷贝不够：第 5 个 dword 会被当 this 用，必须整段跳过。              */
+/*   跳到 0x4301FE（函数自己的「候选窗不可见」早退尾部，esi 需先还原成 this，  */
+/*   [ebp-4] 此刻存的就是它）—— 候选窗保持原位，等下一帧再布局。               */
+/* -------------------------------------------------------------------------- */
+#define IME_CAND_LAYOUT_COPY_VA 0x004301B3u /* add esi,0x110; lea edi,[ebp-0x14] */
+#define IME_CAND_SIG_LEN        11
+static const unsigned char IME_CAND_SIG[IME_CAND_SIG_LEN] = {
+    0x81, 0xC6, 0x10, 0x01, 0x00, 0x00,   /* add esi, 0x110                    */
+    0x8D, 0x7D, 0xEC,                     /* lea edi, [ebp-0x14]               */
+    0xA5, 0xA5,                           /* movsd; movsd                      */
+};
+
+#define IME_CAND_COPY_RESUME    0x004301BC  /* 回到 5 个 movsd                  */
+#define IME_CAND_EARLY_OUT      0x004301FE  /* 函数自己的「不可见」早退尾部      */
+
+static __declspec(naked) void ime_cand_layout_guard_detour(void)
+{
+    __asm {
+        cmp  esi, 0x10000                   /* 活动编辑框为空/野值：别去拷 */
+        jae  iclg_have_edit
+        mov  esi, [ebp - 4]                 /* 还原 this（UiImeCandidates） */
+        push IME_CAND_EARLY_OUT             /* 走函数自己的早退尾部 */
+        ret
+    iclg_have_edit:
+        add  esi, 0x110                     /* 被偷走的原指令，逐条补回 */
+        lea  edi, [ebp - 0x14]
+        push IME_CAND_COPY_RESUME
+        ret
+    }
+}
+
+static volatile LONG g_ime_cand_patched = 0;
+
+static int try_patch_ime_cand_layout_guard(void)
+{
+    unsigned char *p = (unsigned char *)IME_CAND_LAYOUT_COPY_VA;
+    DWORD oldp;
+
+    if (g_ime_cand_patched) return 1;
+    if (IsBadReadPtr(p, IME_CAND_SIG_LEN)) return 0;
+    {
+        /* 幂等：已打过就是「E9 <跳到我们 detour 的 rel32>」+ 4 个 NOP */
+        if (p[0] == 0xE9
+            && (DWORD)(*(int *)(p + 1))
+                   == (DWORD)((UINT_PTR)&ime_cand_layout_guard_detour
+                              - (UINT_PTR)(p + 5))) {
+            InterlockedExchange(&g_ime_cand_patched, 1);
+            return 1;
+        }
+    }
+    if (memcmp(p, IME_CAND_SIG, IME_CAND_SIG_LEN) != 0)
+        return 0;                          /* 还没解壳到这里，或不是已确认的版本 */
+
+    /* 覆盖 add esi,0x110(6B)+lea edi(3B) 共 9 字节：E9 rel32 + 4×NOP */
+    if (!VirtualProtect(p, 9, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   IME 候选窗布局: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    p[0] = 0xE9;
+    *(DWORD *)(p + 1) = (DWORD)((UINT_PTR)&ime_cand_layout_guard_detour
+                                - (UINT_PTR)(p + 5));
+    p[5] = 0x90; p[6] = 0x90; p[7] = 0x90; p[8] = 0x90;
+    VirtualProtect(p, 9, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, 9);
+    InterlockedExchange(&g_ime_cand_patched, 1);
+    bslog("PATCH   ★IME 闪退修复3/3 @ %08X: 候选窗布局时活动编辑框为空"
+          "则整段跳过定位（修复1/2 生效后 [编辑框]=0 合法，原版这里"
+          "会拷 [0+0x110] 崩 —— bug调查/5 的 6 连崩点）",
+          (unsigned)IME_CAND_LAYOUT_COPY_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* 单机化 patch —— 解锁被「地区掩码」关掉的关卡（神秘岛以外的第 5/6/7 关）    */
 /*                                                                            */
 /*   Data/map.ini 里每张地图都有一行 OpenLocale（注释写着                     */
@@ -2486,18 +2575,20 @@ static DWORD WINAPI patch_thread(LPVOID param)
         bslog("PATCH   !! 超时未能 patch 反射道具视觉"
               "（0x5090e2 的特征串一直对不上）");
 
-    /* IME 闪退修复（联机主崩溃，bug调查/3）：两处配套，缺一不可。
+    /* IME 闪退修复（联机主崩溃，bug调查/3 + bug调查/5）：三处配套，缺一不可。
        不赶时机（解壳后随时可打），但和其它 patch 一样要等特征串出现。 */
     if (ime_crash_fix_keep_original()) {
         bslog("PATCH   BSHOOK_KEEP_IME_CRASH 已设，保留原版 IME 闪退行为");
     } else {
         for (ticks = 0; !g_stop && ticks < 2000; ticks++) {
-            if (try_patch_ime_cache_clear() && try_patch_sum_rect_guard()) break;
+            if (try_patch_ime_cache_clear() && try_patch_sum_rect_guard()
+                && try_patch_ime_cand_layout_guard()) break;
             Sleep(2);
         }
-        if (!g_ime_cache_patched || !g_ime_sumrect_patched)
+        if (!g_ime_cache_patched || !g_ime_sumrect_patched
+            || !g_ime_cand_patched)
             bslog("PATCH   !! 超时未能 patch IME 闪退修复"
-                  "（0x4269AB / 0x42515E 特征串一直对不上）");
+                  "（0x4269AB / 0x42515E / 0x4301B3 特征串一直对不上）");
     }
 
     if (!afk_kick_disabled()) {

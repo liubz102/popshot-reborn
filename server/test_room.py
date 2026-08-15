@@ -11,6 +11,7 @@ import os
 import struct
 import sys
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1238,6 +1239,60 @@ class PeerRelayTests(LobbyIsolated):
             gameserver.Conn.on_game_packet(self.bob, OP_START_TCP_RELAY,
                                            w_i32(1) + w_i32(0))
         self.assertEqual(1, opcodes(self.bob).count(OP_JOIN_RELAY))
+        # 票据还在兑现宽限期内（客户端可能正在连），也不能拆（0x0211）。
+        self.assertNotIn(OP_LEAVE_RELAY, opcodes(self.bob))
+
+    def test_a_dead_relay_connection_is_replaced_on_the_next_0310(self):
+        """★ 回归 bug调查/4：中继 TCP 死了之后 `0x0310` 要能换来新通道。
+
+        客户端那边中继半死（NAT 超时收不到 FIN）时会一边继续玩一边每
+        10 秒发 `0x0310` 讨通道；服务端这边连接已经没了的话，必须先
+        `0x0211` 让客户端干净拆旧对象（不走 `OnDisconnected`，不会被踢
+        出房间），再发一张新票据 —— 「他自己能动、别人看他一动不动」
+        的自愈路径。铁律 2 防的「两张活票据并存」在这里不成立：
+        重发前 `leave_relay()` 已把旧票据作废。
+        """
+        self.join_bob()
+        gameserver.Conn.on_game_packet(self.bob, OP_START_TCP_RELAY,
+                                       w_i32(1) + w_i32(0))
+        self.assertEqual(1, opcodes(self.bob).count(OP_JOIN_RELAY))
+        # 模拟：票据已兑过（客户端连过中继），后来那条连接没了。
+        nonce = self.relay._issued[self.bob]
+        self.assertIsNotNone(self.relay.redeem((0, 0, nonce)))
+        self.assertIsNone(self.relay.conn_for(self.bob))
+        self.bob.sent.clear()
+        gameserver.Conn.on_game_packet(self.bob, OP_START_TCP_RELAY,
+                                       w_i32(1) + w_i32(0))
+        got = opcodes(self.bob)
+        self.assertIn(OP_LEAVE_RELAY, got)          # 先干净拆旧
+        self.assertEqual(1, got.count(OP_JOIN_RELAY))   # 再发一张新票据
+        # 换出去的必须是能兑的新票，而且兑完 dedup 表里还是同一条游戏连接。
+        auth = [p for b in self.bob.sent for _, op, p in frames(b)
+                if op == OP_JOIN_RELAY][0]
+        new_nonce = struct.unpack_from("<i", auth, 14)[0]
+        self.assertIsNotNone(self.relay.redeem((0, 0, new_nonce)))
+
+    def test_a_stalled_relay_connection_is_replaced_too(self):
+        """注册着但长时间没有任何入站（数据/pong 都没有）= 半死，同样换新。
+
+        这是「客户端收不到 FIN 还以为一切正常」的形态 —— 战斗数据
+        ~8 Hz、ping 1 Hz，20 秒什么入站都没有只可能是对端方向断了。
+        """
+        self.join_bob()
+        gameserver.Conn.on_game_packet(self.bob, OP_START_TCP_RELAY,
+                                       w_i32(1) + w_i32(0))
+        fake = relayserver.RelayConn.__new__(relayserver.RelayConn)
+        fake.closed = False
+        fake.send_broken = False
+        fake.game_conn = self.bob
+        fake.last_inbound_at = time.time() - relayserver.STALL_AFTER_S - 5
+        self.relay.bind(fake)
+        self.bob.sent.clear()
+        gameserver.Conn.on_game_packet(self.bob, OP_START_TCP_RELAY,
+                                       w_i32(1) + w_i32(0))
+        got = opcodes(self.bob)
+        self.assertIn(OP_LEAVE_RELAY, got)
+        self.assertEqual(1, got.count(OP_JOIN_RELAY))
 
     def test_the_switch_still_goes_out_when_the_relay_is_used(self):
         """走中继也照样要先发 `0x0410` —— `0x408619` 的第一句就是那个开关。"""
@@ -1340,8 +1395,27 @@ class StartGameRoomTests(LobbyIsolated):
         self.assertEqual([], opcodes(self.alice))
         self.assertEqual([], opcodes(self.bob))
         self.loaded(self.bob)                   # 收齐了
-        self.assertEqual([OP_COUNT_GAME_READY], opcodes(self.alice))
-        self.assertEqual([OP_COUNT_GAME_READY], opcodes(self.bob))
+        # ★ 进 stage 7 后每人还会补一发 0x0410（客户端退房 / 中继断开都会
+        #   自己把通道 A 清回 0，服务端缓存的「已开」不可信，见 bug调查/4）。
+        self.assertEqual([OP_COUNT_GAME_READY, OP_TOGGLE_PEER_RELAY],
+                         opcodes(self.alice))
+        self.assertEqual([OP_COUNT_GAME_READY, OP_TOGGLE_PEER_RELAY],
+                         opcodes(self.bob))
+
+    def test_the_battle_start_reasserts_the_peer_relay_switch(self):
+        """★ 回归 bug调查/4：第二局开始有人「自己能动、别人看他不动」。
+
+        客户端在两局之间可能把通道 A 自己清回 0（退房 / 中继断开都会清），
+        服务端若信缓存的「已经开着」就永远不重发 `0x0410` —— 那个人的
+        战斗同步从此一个包都不发。开局链必须在进 stage 7 后**无条件**重发。
+        """
+        self.alice.peer_relay_on = True         # 模拟「上一局已经开过」
+        self.bob.peer_relay_on = True
+        self.ready(self.alice); self.ready(self.alice)
+        self.alice.sent.clear(); self.bob.sent.clear()
+        self.loaded(self.alice); self.loaded(self.bob)
+        self.assertIn(OP_TOGGLE_PEER_RELAY, opcodes(self.alice))
+        self.assertIn(OP_TOGGLE_PEER_RELAY, opcodes(self.bob))
 
     def test_a_lone_player_still_starts_exactly_like_before(self):
         # 单人房的包序列必须和 V0.1 一模一样，别为了多人把单机弄坏了。

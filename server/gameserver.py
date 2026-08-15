@@ -45,6 +45,7 @@ import contextlib
 import datetime
 import os
 import random
+import select
 import socket
 import struct
 import sys
@@ -89,6 +90,12 @@ CLIENT_VERSION = 311        # 0x137，硬编码在 0x54d98f
 
 MAGIC_CTRL = 0xFE
 MAGIC_GAME = 0xFF
+
+#: 游戏服方向的发送截止时间（秒）。战斗包只有几十字节，正常客户端一帧
+#: （16 ms）内就收走了；超过这个数还不收包的客户端要么已经崩了卡在
+#: 写 dump / WER 弹窗上，要么网络半死 —— 再等只会把所有往它广播的线程
+#: 一起拖死（见 `send_all_bounded` 的注释）。
+GAME_SEND_DEADLINE_S = 8.0
 
 OP_REP_LOGIN = 0x0100
 #: `gspRepLogin` 的结果码 3 = 客户端 `0x54f3cf`「断开」（V0.1 §44）。
@@ -481,6 +488,38 @@ def take_frame(buf):
         op = struct.unpack_from("<H", buf, 8)[0]
         return ("game", op, bytes(buf[10:n]), n)
     return None
+
+
+def send_all_bounded(sock, data, deadline):
+    """带截止时间的 sendall（socket 自身的 timeout 对跨线程的收发是共享的，
+    不能拿来当发送上限用，这里用 select 自己掐表）。
+
+    ★ 为什么必须有它：`SimpleCipher` 是逐字节推进的流密码，调用方总是先
+    `encrypt()` 再发送 —— 一旦发送中途超时 / 半发送，密码状态已经前进而
+    字节没送到，**这条流从此对端再也解不开**。所以：
+      * 发送必须有一个明确的截止时间，不能永远堵着（一个不收包的客户端
+        会把所有往它广播的线程一起冻住 —— bug调查/4 最后一局「三个人
+        全员躺着不能复活、请求石沉大海」的形态）；
+      * 超时 / 失败后由调用方把连接拆掉（流已经废了，留着只会更糟）。
+    """
+    deadline = float(deadline)
+    if not isinstance(sock, socket.socket):
+        # 测试里的假 socket（只实现了 sendall）—— 没法 select，按老路走。
+        sock.sendall(data)
+        return
+    end = time.monotonic() + deadline
+    view = memoryview(data)
+    while view:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout(
+                f"send deadline {deadline:.1f}s exceeded, "
+                f"{len(view)} bytes unsent")
+        _, writable, _ = select.select([], [sock], [], remaining)
+        if not writable:
+            continue
+        sent = sock.send(view)
+        view = view[sent:]
 
 
 # ----------------------------------------------------------------------------
@@ -3511,6 +3550,11 @@ def pick_conn(username=""):
 
 
 class Conn:
+    # ★ 类级默认值：`Conn.__new__` 造的测试实例不走 `__init__`，
+    #   这两个标志必须在类上也有一份默认，否则新代码一碰就 AttributeError。
+    send_broken = False
+    last_relay_reissue_at = 0.0
+
     def __init__(self, sock, addr, args, accounts=None, tickets=None):
         global _seq
         with _lock:
@@ -3550,6 +3594,11 @@ class Conn:
         # 开关清 0**（`0x406191`），所以我们也必须在离开房间时跟着清回 False，
         # 否则下次进房 `send_toggle_peer_relay()` 会以为「已经开着」而不重发。
         self.peer_relay_on = False
+        # 发送流是否已经废了（见 `send_all_bounded` 的注释：一次发送超时/
+        # 半发送之后密码流错位，这条连接对客户端来说已经不可读，只能拆）。
+        self.send_broken = False
+        # 上一次因为「要不到中继」而重发 0x0211+0x0210 的时刻（节流用）。
+        self.last_relay_reissue_at = 0.0
         # 这条连接**进当前这个房间之后**转发的第一发 `0x040e` 打不打 hexdump。
         self.peer_data_dumped = False
         self.peer_data_in = 0
@@ -3639,10 +3688,37 @@ class Conn:
         if VERBOSE:
             self.log(msg)
 
+    def kill_stream(self, why):
+        """发送流已废：直接拆 socket，让客户端走重连。
+
+        ★ 只在「密码流已经错位」时调用（发送超时/半发送之后）。这种连接
+        留着只会变成「客户端能发、我们也能收、但它永远解不开我们发的任何
+        包」的半死连接 —— 玩家躺在地上等一枚永远不来的 0x0419
+        （bug调查/4 最后一局的形态）。拆掉 socket，客户端会像崩溃恢复那样
+        自动回登录重连，比无声卡死好。
+        """
+        if self.send_broken:
+            return
+        self.send_broken = True
+        try:
+            self.log(f"!! 发送流已损坏（{why}），拆除连接让客户端重连")
+        except Exception:                    # 日志绝不能挡拆连接
+            pass
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
     def send(self, plain):
         # SimpleCipher 是逐字节推进的流密码：两个线程交错加密会让整条流错位，
         # 客户端从此再也解不回来。控制通道存在之后这不再是理论风险。
         with self.send_lock:
+            if self.send_broken:
+                return                       # 流已废，发了也只是垃圾
             # ★ 这个 `if` 不是多余的：`vlog` 自己也判 VERBOSE，但 f-string 和
             #   `hexdump()` 是**在调用之前**就求值的，非 verbose 时白算再丢掉。
             #   实测 53 字节的包要 18.4 µs，而战斗中每份同步数据都要走这里
@@ -3652,7 +3728,12 @@ class Conn:
             if self.send_queue is not None:
                 self.send_queue.append(plain)
                 return
-            self.sock.sendall(self.cout.encrypt(plain))
+            wire = self.cout.encrypt(plain)
+            try:
+                send_all_bounded(self.sock, wire, GAME_SEND_DEADLINE_S)
+            except OSError as error:
+                self.kill_stream(f"send: {error!r}")
+                raise
             if self.batch_delay_ms:
                 time.sleep(self.batch_delay_ms / 1000.0)
 
@@ -3705,7 +3786,12 @@ class Conn:
                     plain = b"".join(packets)
                     self.log(f"   （{len(packets)} 个包 {len(plain)} 字节"
                              f"合并成一次发送{reason}）")
-                    self.sock.sendall(self.cout.encrypt(plain))
+                    wire = self.cout.encrypt(plain)
+                    try:
+                        send_all_bounded(self.sock, wire, GAME_SEND_DEADLINE_S)
+                    except OSError as error:
+                        self.kill_stream(f"send_batch: {error!r}")
+                        raise
 
     # -- 大厅 / 房间 ---------------------------------------------------------
     def lobby_room(self):
@@ -3848,6 +3934,8 @@ class Conn:
         for member in self.battle_members():
             if member is exclude:
                 continue
+            if getattr(member, "send_broken", False):
+                continue            # 发送流已废（等它的读线程收尾拆连接）
             try:
                 member.send(plain)
                 sent += 1
@@ -3899,6 +3987,8 @@ class Conn:
         targets = room.members(exclude=self if exclude_self else None)
         sent = 0
         for other in targets:
+            if getattr(other, "send_broken", False):
+                continue            # 发送流已废（等它的读线程收尾拆连接）
             try:
                 other.send(plain)
                 sent += 1
@@ -5359,13 +5449,20 @@ class Conn:
                 and room.quest is None):
             # 这一局的战斗状态重新起一份（上一局的掉落物句柄/死亡表全作废）。
             # ★ 控制者表要按**这一刻在座的座位**算，和客户端
-            #   `GameContext::StartGame` 同一个口径（§180）——
-            #   客户端就是在进 stage 7 的路上建它的。
+            # `GameContext::StartGame` 同一个口径（§180）——
+            # 客户端就是在进 stage 7 的路上建它的。
             room.quest = RoomQuest(seats=[i for i, seat in enumerate(room.seats)
                                           if seat is not None])
             # 「准备好了」跟着客户端一起清 —— 它进 stage 6 时自己清了一遍
             # （`LoadingStage` 构造函数，§165）。不跟着清就会两边不一致。
             room.clear_ready()
+            # ★ 每局开始都无条件重发一次 0x0410（§150：客户端退房 / 中继断开
+            #   都会把通道 A 的开关自己清回 0，服务端缓存的「已经开着」不可信。
+            #   bug调查/4：第一局正常、第二局开始有人「自己能动但别人看他
+            #   一动不动」，且他的客户端一直每 10 秒发 0x0310 讨通道 —— 就是
+            #   开关被清了而服务端以为还开着，一直没重发）。
+            self.sync_peer_relay(room, reason="（新一局开始，无条件重发）",
+                                 force=True)
             # ★ 关卡加载途中走掉的人，现在补交接（§180 / D103）——
             # 客户端可能在他走之前就把控制者表建好了。**必须排在
             # 那一发 `0x0402` 之后**（上面的循环已经发完了）：客户端要先
@@ -5428,22 +5525,33 @@ class Conn:
         self.peer_relay_on = False
         self.peer_data_dumped = False
 
-    def send_toggle_peer_relay(self, enabled):
+    def send_toggle_peer_relay(self, enabled, force=False):
         """发 `0x0410 gspToggleUdpClientCommunication`（载荷 = int32 0/1）。
 
         客户端处理器 `0x408703` 做两件事：把 `[GameSession+0x3e4]` 设成这个值、
         再给游戏服的 socket 设一次 `TCP_NODELAY`。开关一开客户端立刻开始
         往我们这儿发 `0x040e`（实测约 8 Hz），关掉就立刻停。
+
+        ★ **发送失败必须把标志滚回去**，否则这一发永远不会再试 —— 客户端
+        的通道 A 从此关着，表现为「他自己玩得好好的，别人看他一动不动」
+        （bug调查/4 最后一局：第一局正常、第二局开始有人静止，且他的客户端
+        一直每 10 秒发 `0x0310` 讨通道）。`force=True` 供开局链无条件重发
+        （§150：客户端退房 / 中继断开都会自己把开关清回 0，服务端缓存的
+        「已经开过」不可信）。
         """
         enabled = bool(enabled)
-        if self.peer_relay_on == enabled:
+        if not force and self.peer_relay_on == enabled:
             return
         self.peer_relay_on = enabled
         self.log(f"← 回 0x0410 gspToggleUdpClientCommunication({int(enabled)})"
                  f" —— 玩家间同步{'走本服转发' if enabled else '关闭'}")
-        self.send(build_game(OP_TOGGLE_PEER_RELAY, w_i32(int(enabled))))
+        try:
+            self.send(build_game(OP_TOGGLE_PEER_RELAY, w_i32(int(enabled))))
+        except OSError as error:
+            self.log(f"   0x0410 发送失败（{error!r}），标志滚回去等下次重试")
+            self.peer_relay_on = not enabled
 
-    def sync_peer_relay(self, room=None, reason=""):
+    def sync_peer_relay(self, room=None, reason="", force=False):
         """按「房里现在有几个人」给房间里每个人开 / 关通道 A。
 
         一个人的房间不用开 —— 开了客户端也只是每 128 毫秒往我们这儿丢一发
@@ -5451,6 +5559,10 @@ class Conn:
 
         ★ 必须在**进房四连发之后**调（`0x0410` 绝不能挤进那一次合并的
         `sendall` 里，V0.1 §120 / D058）。
+
+        `force=True`：不看缓存状态，每人无条件重发一次。开局链在全员进
+        stage 7 之后用它 —— 客户端可能在两局之间自己把开关清了（退房 /
+        中继断开都会清，§150 / §158），服务端缓存的「已经开着」不可信。
         """
         if room is None:
             room = self.lobby_room()
@@ -5461,8 +5573,15 @@ class Conn:
         members = room.members(exclude=None)
         wanted = len(members) >= 2
         for member in members:
+            # ★ 想关（wanted=False）时不看 force：从没开过的连接一发都不多发，
+            #   单人房的包序列保持和 V0.1 逐字节一致（test_room 的既定不变量）；
+            #   只有「缓存说还开着」的才补一发关。想开（wanted=True）才吃
+            #   force —— 开局链靠它无条件重发。
+            if not wanted and not member.peer_relay_on:
+                continue
             try:
-                member.send_toggle_peer_relay(wanted)
+                member.send_toggle_peer_relay(wanted,
+                                              force=force and wanted)
             except OSError as error:
                 member.log(f"   0x0410 发送失败（{error!r}），忽略")
         if reason:
@@ -5576,12 +5695,57 @@ class Conn:
         客户端在要一条到对方的中继通道，房里每个「别人坐着的座位」每 10 秒一发。
         两件事：确认通道 A 的总开关是开的（走中继也要它，§157 末尾），
         再看要不要回 `0x0210`。
+
+        ★ 自愈（bug调查/4）：客户端反复发 `0x0310` 本身就是「它那边通道断了」
+        的信号 —— 中继 TCP 半死（NAT 超时 / 网络抖动）时客户端收不到 FIN，
+        会一边继续玩一边每 10 秒讨一次通道。以前服务端因为「一条游戏连接
+        只回一次 0x0210」的铁律永远不理它。现在：只要服务端这边**确实**没有
+        一条活着的中继连接（没注册过 / 掉了 / 发送流已废 / 长时间没有任何
+        入站），就先 `0x0211` 让客户端干净拆掉旧对象（不走 `OnDisconnected`，
+        不会被踢出房间），再发一张**新票据**让它重连 —— 中断的几秒里同步
+        自动走 `0x040e/0x040f` 回退路径，不断流。铁律 2 防的「两张活票据
+        并存」在这里不成立：重发前 `leave_relay()` 已经把旧票据作废。
         """
         if len(payload) >= 8:
             mine, other = struct.unpack_from("<ii", payload, 0)
             self.vlog(f"   要中继通道: 我={mine} 对方={other}")
         self.sync_peer_relay(reason="（收到 0x0310 要中继）")
         self.maybe_join_relay()
+        self.recover_peer_relay()
+
+    def recover_peer_relay(self, min_interval=15.0, redeem_grace=10.0):
+        """中继连接已经不在了（或半死了）就重发一轮 `0x0211` + 新 `0x0210`。
+
+        `min_interval` 节流：客户端一秒钟可以来好几发 `0x0310`（每个座位
+        每 10 秒一发），重发一轮就够了，别把它刷成闪烁。
+        `redeem_grace`：票据刚签发的这几秒里客户端可能正在连（异步的），
+        这时它还没注册上来是**正常**的，不能当成「连接已死」去重发。
+        """
+        if not TCP_RELAY_ENABLED:
+            return False
+        if self.lobby_room() is None:
+            return False
+        now = time.monotonic()
+        if now - self.last_relay_reissue_at < min_interval:
+            return False
+        relay = PEER_RELAY.conn_for(self)
+        if relay is not None and not PEER_RELAY.stalled(self):
+            return False                    # 通道活着，不用动
+        # 走到这：要么压根没有连接（票据已兑过 → 曾经有过），要么连接半死。
+        if relay is None:
+            if not PEER_RELAY.has_issued(self):
+                return False                # 从没发过票据，maybe_join_relay 管
+            issued_at = PEER_RELAY.issued_at(self)
+            if (issued_at is not None
+                    and time.time() - issued_at < redeem_grace):
+                return False                # 票才发出去，先给客户端连接的窗口
+        self.last_relay_reissue_at = now
+        why = "连接半死（长时间无入站）" if relay is not None else "连接已不在"
+        self.log(f"   ★ 客户端在讨中继通道而服务端这边的{why}："
+                 f"重发 0x0211 拆旧 + 新票据 0x0210 让它重连")
+        self.leave_relay(reason="（自愈：中继连接已废）")
+        self.maybe_join_relay()
+        return True
 
     def on_report_hack(self, payload):
         """`0x0106 gcpReportHack` —— 客户端自己觉得不对劲时的上报。**只记不回**。
@@ -6227,10 +6391,19 @@ class Conn:
                 break
             kind, op, payload, n = got
             del self.buf[:n]
-            if kind == "ctrl":
-                self.on_ctrl_packet(payload)
-            else:
-                self.on_game_packet(op, payload)
+            # ★ 单个包的处理异常绝不能把整条连接带走：`run()` 的兜底会退出
+            #   读循环（= 玩家被断线）。战斗正打到一半时，一枚坏包换一次
+            #   断线太亏 —— 记下来，跳过这发，继续服务（bug调查/4 的教训）。
+            try:
+                if kind == "ctrl":
+                    self.on_ctrl_packet(payload)
+                else:
+                    self.on_game_packet(op, payload)
+            except OSError:
+                raise                      # 发送类错误按老路走（可能拆连接）
+            except Exception as error:      # noqa: BLE001 —— 单包隔离
+                self.log(f"!! 处理 0x{op:04x} 时抛了 {error!r}，"
+                         f"跳过这发继续服务")
 
     def run(self):
         self.log(f"+++ 连接来自 {self.addr[0]}:{self.addr[1]}")

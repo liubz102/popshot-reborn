@@ -53,6 +53,7 @@ opcode（`0x54bce1` 分发）：
 from __future__ import annotations
 
 import os
+import select
 import socket
 import struct
 import sys
@@ -108,12 +109,27 @@ RTT_REPORT_INTERVAL = 30.0
 #: 一个 RTT 就连上来了，给足 60 秒纯属宽容。
 TICKET_TTL = 60.0
 
+#: 中继方向的发送截止时间（秒）。战斗数据 ~8 Hz、每份几十字节，正常客户端
+#: 毫秒级就收走了；超过 2 秒还不收包，这条流后面的字节它多半也解不开了
+#: （SimpleCipher 是逐字节流密码，发送中途超时后密码状态已经错位）。
+#: ★ 所以超时后**不再往这条连接发任何东西**（`send_broken`），投递自动
+#:   回退到 `0x040f` 走游戏服连接 —— 玩家的画面靠回退路径恢复，不用断线。
+#:   （bug调查/4：中继流一旦错位，客户端表现为「别人一动不动」，而它自己
+#:   玩得好好的。）按铁律 1 的精神**不主动关 socket**，只是绕开它。
+RELAY_SEND_DEADLINE_S = 2.0
+
+#: 一条已注册的中继连接多久没有任何入站（数据帧或 pong）就算「半死」。
+#: 战斗中数据 ~8 Hz、ping 1 Hz 一来一回，20 秒什么都没有 = 对端到我们的
+#: 方向已经断了（NAT 超时 / 网络半开），客户端却收不到 FIN 还在傻等。
+#: `gameserver.recover_peer_relay()` 拿这个判定要不要重发 `0x0211`+`0x0210`。
+STALL_AFTER_S = 20.0
+
 
 def build_rcp(opcode, payload=b""):
     """一帧 rcp。**和 `gameserver.build_game` 是同一串字节**（§156）。
 
     两处各写一份是故意的：`relayserver` 不 import `gameserver`（那边要 import
-    这边），而这个格式已经被 `0x5bb9e7` 钉死了，不会变。
+    这边），而这个格式已经被 `0x5bcb19` 钉死了，不会变。
     `test_relayserver.py` 里有一条用例把两者逐字节对住，防止哪天单边漂了。
     """
     payload = bytes(payload)
@@ -121,6 +137,29 @@ def build_rcp(opcode, payload=b""):
         raise ValueError(f"rcp 载荷 {len(payload)} 字节超过 u16 上限")
     return (bytes([MAGIC, 0]) + struct.pack("<HHHH", len(payload), 0, 0, opcode)
             + payload)
+
+
+def send_all_bounded(sock, data, deadline):
+    """带截止时间的发送（和 `gameserver.send_all_bounded` 同款，这里按
+    「不 import gameserver」的老规矩各自留一份）。超时抛 `socket.timeout`。"""
+    deadline = float(deadline)
+    if not isinstance(sock, socket.socket):
+        # 测试里的假 socket（只实现了 sendall）—— 没法 select，按老路走。
+        sock.sendall(data)
+        return
+    end = time.monotonic() + deadline
+    view = memoryview(data)
+    while view:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout(
+                f"send deadline {deadline:.1f}s exceeded, "
+                f"{len(view)} bytes unsent")
+        _, writable, _ = select.select([], [sock], [], remaining)
+        if not writable:
+            continue
+        sent = sock.send(view)
+        view = view[sent:]
 
 
 def take_rcp(buf):
@@ -233,6 +272,11 @@ class _Ticket:
 class RelayConn:
     """一条中继 TCP 连接。注册成功后就绑定到一条**游戏连接**上，直到断开。"""
 
+    # ★ 类级默认值：`RelayConn.__new__` 造的测试实例（test_latency）不走
+    #   `__init__`，这两个标志必须在类上也有一份默认。
+    send_broken = False
+    last_inbound_at = 0.0
+
     def __init__(self, server, sock, addr):
         self.server = server
         self.sock = sock
@@ -252,6 +296,12 @@ class RelayConn:
         self.pings_lost = 0
         self.opened_at = time.time()
         self.last_ping_at = self.opened_at
+        #: 最近一次收到任何入站（数据帧或 pong）的时刻 —— `stalled()` 的依据。
+        self.last_inbound_at = self.opened_at
+        #: 发送流已废（发送超时后密码流错位，这条 TCP 上游方向不能再用了）。
+        #: ★ 不关 socket（铁律 1），只是 `conn_for()` 从此绕开它，
+        #:   投递回退到 `0x040f` 走游戏服连接。
+        self.send_broken = False
         #: 正在飞的那一发 ping 的发出时刻；`None` = 现在没有在飞的。
         self.ping_sent_at = None
         #: 本汇总窗口的 RTT（每 `RTT_REPORT_INTERVAL` 打一行然后清零）。
@@ -276,17 +326,28 @@ class RelayConn:
 
     # -- 发送 ---------------------------------------------------------------
     def send_frame(self, opcode, payload=b""):
-        """发一帧。**失败只记录不抛** —— 上层绝不能因为发送失败去关连接（铁律 1）。"""
-        if self.closed:
+        """发一帧。**失败只记录不抛** —— 上层绝不能因为发送失败去关连接（铁律 1）。
+
+        发送带 `RELAY_SEND_DEADLINE_S` 的截止时间：一个不收包的客户端
+        （崩溃后在写 dump / 卡在 WER 弹窗 / 网络半开）不能把往它投递的
+        别人的线程一起拖死。超时后标记 `send_broken`：这条流对客户端来说
+        已经解不开了（SimpleCipher 流密码错位），继续发只是垃圾 ——
+        `conn_for()` 会绕开它，投递自动回退 `0x040f`。
+        """
+        if self.closed or self.send_broken:
             return False
         frame = build_rcp(opcode, payload)
         try:
-            # 流密码是有状态的，加密和 sendall 必须在同一把锁里，
+            # 流密码是有状态的，加密和发送必须锁在一起，
             # 否则两个线程各加密一半、交错发出去，客户端整条流就废了。
             with self.send_lock:
-                self.sock.sendall(self.cout.encrypt(frame))
+                wire = self.cout.encrypt(frame)
+                send_all_bounded(self.sock, wire, RELAY_SEND_DEADLINE_S)
         except OSError as error:
-            self.log(f"中继发送失败（{error!r}）")
+            if not self.send_broken:
+                self.send_broken = True
+                self.log(f"!! 中继发送失败（{error!r}）—— 这条流已错位，"
+                         f"投递改走 0x040f 回退（不关连接，铁律 1）")
             return False
         self.frames_out += 1
         return True
@@ -337,6 +398,8 @@ class RelayConn:
         """
         if self.game_conn is None:
             return
+        if self.send_broken:
+            return                     # 上游方向已废，ping 也别再发了
         now = time.time() if now is None else now
         self.report_rtt(now)
         if self.ping_sent_at is not None:
@@ -358,6 +421,7 @@ class RelayConn:
     def on_pong(self, now=None):
         """收到 `rcpRepPing`：把这一发的往返时间记下来。"""
         self.pongs_in += 1
+        self.last_inbound_at = time.time()
         sent, self.ping_sent_at = self.ping_sent_at, None
         if sent is None:
             # 没有在飞的 ping 却收到 pong（超时之后才回来的那一发）。
@@ -391,6 +455,7 @@ class RelayConn:
 
     def feed(self, data):
         self.buf += self.cin.decrypt(data)
+        self.last_inbound_at = time.time()
         while True:
             got = take_rcp(self.buf)
             if got is None:
@@ -399,6 +464,11 @@ class RelayConn:
             del self.buf[:size]
             self.frames_in += 1
             self.on_frame(opcode, payload)
+
+    def inbound_idle(self, now=None):
+        """距最近一次入站（数据帧或 pong）过了多少秒。"""
+        now = time.time() if now is None else now
+        return now - self.last_inbound_at
 
     def on_frame(self, opcode, payload):
         if opcode == RCP_REGISTER:
@@ -527,6 +597,17 @@ class RelayServer:
         with self._lock:
             return game_conn in self._issued
 
+    def issued_at(self, game_conn):
+        """当前那张未作废票据的签发时刻；已兑过（票据被取走）返回 ``0.0``，
+        从没签发过返回 ``None``。`recover_peer_relay()` 用它区分
+        「票据才发出去、客户端还在连」和「早就该连上却没连上」。"""
+        with self._lock:
+            nonce = self._issued.get(game_conn)
+            if nonce is None:
+                return None
+            ticket = self._tickets.get(nonce)
+            return ticket.issued_at if ticket is not None else 0.0
+
     def redeem(self, auth):
         """`rcpRegister` 拿三个 int32 来兑换。认不出返回 ``None``。"""
         with self._lock:
@@ -562,9 +643,32 @@ class RelayServer:
                 self._conns.pop(relay_conn.game_conn, None)
 
     def conn_for(self, game_conn):
+        """这条游戏连接现在可用的中继连接；没有 / 已关 / 发送流已废都算没有。
+
+        ★ `send_broken` 的连接在这里返回 `None`，`deliver()` 就会自动把
+        同步数据回退到 `0x040f` 走游戏服连接 —— 客户端的画面靠回退恢复，
+        不用断线重连（这条 TCP 的上游方向废了，但它的入站方向还可能是好的，
+        读线程照常收它的数据）。
+        """
         with self._lock:
             relay = self._conns.get(game_conn)
-        return None if relay is None or relay.closed else relay
+        if relay is None or relay.closed or relay.send_broken:
+            return None
+        return relay
+
+    def stalled(self, game_conn, threshold=STALL_AFTER_S):
+        """这条游戏连接的中继连接是不是「半死」（长时间没有任何入站）。
+
+        战斗中数据 ~8 Hz、ping 1 Hz，`threshold` 秒什么入站都没有说明
+        客户端到我们的方向已经断了（NAT 超时 / 网络半开），而客户端收不到
+        FIN 还以为一切正常 —— 表现为「他自己玩得好好的，别人看他一动不动」。
+        `gameserver.recover_peer_relay()` 据此重发 `0x0211`+新 `0x0210`。
+        """
+        with self._lock:
+            relay = self._conns.get(game_conn)
+        if relay is None or relay.closed:
+            return False
+        return relay.inbound_idle() > threshold
 
     def forget(self, game_conn):
         """游戏连接没了：作废它的票据、松开去重表。
