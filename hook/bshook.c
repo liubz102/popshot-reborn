@@ -1880,10 +1880,18 @@ static int try_patch_sum_rect_guard(void)
 /*   原位，等下一帧再布局。                                                    */
 /*                                                                            */
 /*   ★ bug调查/6：本补丁此前的三个地址整体错位了 1 个字节（特征码锚在          */
-/*   0x4301B3 / 恢复点 0x4301BC / 早退 0x4301FE），而 0x4301B3 实际是           */
-/*   mov edx,[ebp-0x20] 的最后一个字节 —— 特征串在任何机器上都永远对不上        */
-/*   （玩家与开发机的日志同样是「超时未能 patch」），补丁从未生效，             */
-/*   玩家端两份新 mdmp 仍崩在 0x4301BD 读 0x110。已按 dump 实测字节校正。      */
+/*     0x4301B3 / 恢复点 0x4301BC / 早退 0x4301FE），而 0x4301B3 实际是           */
+/*     mov edx,[ebp-0x20] 的最后一个字节 —— 特征串在任何机器上都永远对不上        */
+/*     （玩家与开发机的日志同样是「超时未能 patch」），补丁从未生效，             */
+/*     玩家端两份新 mdmp 仍崩在 0x4301BD 读 0x110。已按 dump 实测字节校正。      */
+/*                                                                            */
+/*   ★ bug调查/7：6 的校正把早退地址也跟着 +1 到 0x4301FF —— 错了。0x4301FE    */
+/*     才是 xor ebx,ebx 的指令边界（函数自己的两处早退 0x430120 / 0x430132      */
+/*     跳的正是它），0x4301FF 落在指令中间。实测后果：打字玩家的聊天框随        */
+/*     0x0402 拆 UI 被清（修复1/2 生效），detour 走早退支路跳到 0x4301FF，      */
+/*     CPU 从那里解码出 6 字节 FPU 指令 db 8b c6 e8 e7 4e（fisttp              */
+/*     [ebx+0x4EE7E8C6]，凑巧可读不fault），下一条正落在 0x430205 的 ff ff      */
+/*     上 —— C000001D 非法指令，三份 mdmp 同一现场。改回 0x4301FE。             */
 /* -------------------------------------------------------------------------- */
 #define IME_CAND_LAYOUT_COPY_VA 0x004301B4u /* add esi,0x110; lea edi,[ebp-0x14] */
 #define IME_CAND_SIG_LEN        11
@@ -1894,7 +1902,7 @@ static const unsigned char IME_CAND_SIG[IME_CAND_SIG_LEN] = {
 };
 
 #define IME_CAND_COPY_RESUME    0x004301BD  /* 回到 5 个 movsd                  */
-#define IME_CAND_EARLY_OUT      0x004301FF  /* 函数自己的「不可见」早退尾部      */
+#define IME_CAND_EARLY_OUT      0x004301FE  /* 函数自己的「不可见」早退尾部      */
 
 static __declspec(naked) void ime_cand_layout_guard_detour(void)
 {
