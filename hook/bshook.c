@@ -1862,21 +1862,30 @@ static int try_patch_sum_rect_guard(void)
 /*   bug调查/5：6 份 mdmp 全部 C0000005 @ 0x4301BD，读 0x110。0x430102 是      */
 /*   UiImeCandidates 的布局方法（修复 1/2 注释里的同一函数）：                 */
 /*                                                                            */
-/*     0x43019B  mov eax,[0x72e2b4]        ; UI 根                            */
-/*     0x4301A0  mov esi,[eax+0x10]        ; 活动编辑框（修复1/2 后可为 0）    */
-/*     0x4301A8  call SumRect              ; ← 修复 2/2 已护住，返回全零矩形   */
-/*     0x4301B3  add esi,0x110                                               */
-/*     0x4301B9  lea edi,[ebp-0x14]                                          */
-/*     0x4301BC  movsd ×5                  ; ★ 拷 [编辑框+0x110] 起 20 字节   */
+/*     0x43019C  mov eax,[0x72e2b4]        ; UI 根                            */
+/*     0x4301A1  mov esi,[eax+0x10]        ; 活动编辑框（修复1/2 后可为 0）    */
+/*     0x4301A9  call SumRect              ; ← 修复 2/2 已护住，返回全零矩形   */
+/*     0x4301AE  mov eax,[ebp-0x24]        ; SumRect 输出                     */
+/*     0x4301B1  mov edx,[ebp-0x20]                                           */
+/*     0x4301B4  add esi,0x110                                               */
+/*     0x4301BA  lea edi,[ebp-0x14]                                          */
+/*     0x4301BD  movsd ×5                  ; ★ 拷 [编辑框+0x110] 起 20 字节   */
 /*               ……（后面还拿拷出的第 5 个 dword 当 this 连发方法调用）        */
 /*                                                                            */
 /*   修复 1/2 只护住了 SumRect：编辑框销毁后 [+0x10]=0，SumRect 平安返回，     */
 /*   movsd 却照样去读 [0x110] —— 崩溃点从 0x42516A 挪到了 0x4301BD。          */
 /*   零填充拷贝不够：第 5 个 dword 会被当 this 用，必须整段跳过。              */
-/*   跳到 0x4301FE（函数自己的「候选窗不可见」早退尾部，esi 需先还原成 this，  */
-/*   [ebp-4] 此刻存的就是它）—— 候选窗保持原位，等下一帧再布局。               */
+/*   跳到 0x4301FF（函数自己的「候选窗不可见」早退尾部，esi 需先还原成 this，  */
+/*   [ebp-4] 此刻存的就是它，0x4301C8 的 mov esi,[ebp-4] 可证）—— 候选窗保持   */
+/*   原位，等下一帧再布局。                                                    */
+/*                                                                            */
+/*   ★ bug调查/6：本补丁此前的三个地址整体错位了 1 个字节（特征码锚在          */
+/*   0x4301B3 / 恢复点 0x4301BC / 早退 0x4301FE），而 0x4301B3 实际是           */
+/*   mov edx,[ebp-0x20] 的最后一个字节 —— 特征串在任何机器上都永远对不上        */
+/*   （玩家与开发机的日志同样是「超时未能 patch」），补丁从未生效，             */
+/*   玩家端两份新 mdmp 仍崩在 0x4301BD 读 0x110。已按 dump 实测字节校正。      */
 /* -------------------------------------------------------------------------- */
-#define IME_CAND_LAYOUT_COPY_VA 0x004301B3u /* add esi,0x110; lea edi,[ebp-0x14] */
+#define IME_CAND_LAYOUT_COPY_VA 0x004301B4u /* add esi,0x110; lea edi,[ebp-0x14] */
 #define IME_CAND_SIG_LEN        11
 static const unsigned char IME_CAND_SIG[IME_CAND_SIG_LEN] = {
     0x81, 0xC6, 0x10, 0x01, 0x00, 0x00,   /* add esi, 0x110                    */
@@ -1884,8 +1893,8 @@ static const unsigned char IME_CAND_SIG[IME_CAND_SIG_LEN] = {
     0xA5, 0xA5,                           /* movsd; movsd                      */
 };
 
-#define IME_CAND_COPY_RESUME    0x004301BC  /* 回到 5 个 movsd                  */
-#define IME_CAND_EARLY_OUT      0x004301FE  /* 函数自己的「不可见」早退尾部      */
+#define IME_CAND_COPY_RESUME    0x004301BD  /* 回到 5 个 movsd                  */
+#define IME_CAND_EARLY_OUT      0x004301FF  /* 函数自己的「不可见」早退尾部      */
 
 static __declspec(naked) void ime_cand_layout_guard_detour(void)
 {
@@ -2588,7 +2597,7 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_ime_cache_patched || !g_ime_sumrect_patched
             || !g_ime_cand_patched)
             bslog("PATCH   !! 超时未能 patch IME 闪退修复"
-                  "（0x4269AB / 0x42515E / 0x4301B3 特征串一直对不上）");
+                  "（0x4269AB / 0x42515E / 0x4301B4 特征串一直对不上）");
     }
 
     if (!afk_kick_disabled()) {
