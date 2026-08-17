@@ -43,15 +43,21 @@ fakeclient.py —— 用 Python 冒充第二个游戏客户端（大厅部分）
     users [0|1] [页]  发 0x020d 要大厅右侧玩家列表。**1 = 待机玩家（默认）**、
                       0 = 推荐对手（§169）。收到的 0x0212 会解成「谁 / P还是W /
                       等级 / 天梯」
-    peer [序列号]     发一发 0x040e = 玩家间同步数据（12 字节 UdpPacket 头 +
-                      3 字节 body，§149~§151）。用来验服务端有没有原样转成 0x040f
-    rpeer [序列号]    同上，但走**原版 TCP 中继**（rcp opcode 3）。要先连上中继
+    peer [序列号] [局号]
+                      发一发 0x040e = 玩家间同步数据（12 字节 UdpPacket 头 +
+                      3 字节 body，§149~§151）。用来验服务端有没有原样转成 0x040f。
+                      ★ 第二个参数给**别人不一样的局号**，就能验服务端有没有
+                      按收件人的号重新盖章（bug调查/8_2「其他人都不会动」）
+    rpeer [序列号] [局号]
+                      同上，但走**原版 TCP 中继**（rcp opcode 3）。要先连上中继
     waitrelay [秒]    等中继连上（服务端回 0x0210 之后才会有），超时就报错退出
 
   ── 战斗（J.3）。全部按「真客户端会发的线格式」组包 ──
     ready             发 0x0402（房主按 F5 开局；连发两次走完握手）
     loaded            发 0x0403「关卡加载完了」（所有人都报了才一起进 stage 7）
-    die [次数]        发 0x0408「我 HP 归零了」，句柄按 座位*100000+100001 算
+    die [次数] [座位] 发 0x0408「我 HP 归零了」，句柄按 座位*100000+100001 算。
+                      ★ 第二个参数给**别人的**座位 = 造一发「幽灵死亡上报」
+                      （替别人报死，bug调查/8）；服务端应当不广播
     respawn           发 0x0413「我要重生」
     drop [物件id]     发 0x0406 gcpCreateItem，等服务端回 0x0404 派句柄
     pickup <句柄>     发 0x0407 gcpGetItem「我踩到这件了」（十六进制也行）
@@ -122,6 +128,22 @@ CHARACTER_HANDLE_BASE = 100001
 
 def character_handle(seat):
     return seat * CHARACTER_HANDLE_STEP + CHARACTER_HANDLE_BASE
+
+
+def build_udp_packet(seat, sequence=1, game_id=0, body=b"\xde\xad\xbe"):
+    """一份 `UdpPacket`：12 字节头 + body（§151）。
+
+    头 = magic / 发送方座位 / 目标座位（0xff 广播）/ ? / **局号** /
+    校验和 / 序列号 / 内层 opcode。
+
+    ★ `game_id`（头 `+4`）是真客户端**每台自己数的**那个计数器，收方拿它
+    和自己的 `[GameSession+0x3c]` 比，不等就整包丢掉（`0x4078c4`）。
+    在同一个房间里多打一局就会分叉 —— 这就是 bug调查/8_2「其他人都不会动」。
+    服务端现在转发时会按收件人自己的号重新盖章，拿这个参数就能验。
+    """
+    return (struct.pack("<BbbB", 0xFF, seat, -1, 0)
+            + struct.pack("<HHHH", int(game_id), 0x1234, int(sequence), 0x0102)
+            + bytes(body))
 
 #: 连哪几个端口。默认就是客户端写死的那两个；环境变量 `POPSHOT_AUTH_PORT` /
 #: `POPSHOT_GAME_PORT` 可以改，**专门是为了「不去动用户自己那份正在跑的服务端」**
@@ -584,24 +606,20 @@ def run_script(client, tokens):
             time.sleep(0.4)
         elif cmd == "peer":
             sequence = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 1
+            game_id = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 0
             seat = client.my_seat if client.my_seat is not None else 0
-            # 12 字节 UdpPacket 头：magic / 发送方座位 / 目标座位(0xff 广播) /
-            # ? / 局号 / 校验和 / 序列号 / 内层 opcode（§151）
-            blob = (struct.pack("<BbbB", 0xFF, seat, -1, 0)
-                    + struct.pack("<HHHH", 0, 0x1234, sequence, 0x0102)
-                    + b"\xde\xad\xbe")
-            log(f"   要发的字节: {blob.hex(' ')}")
+            blob = build_udp_packet(seat, sequence, game_id)
+            log(f"   要发的字节: {blob.hex(' ')}（局号={game_id}）")
             client.send_game(OP_PEER_DATA_UP, blob)
         elif cmd == "rpeer":
             sequence = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 1
+            game_id = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 0
             if client.relay is None:
                 raise SystemExit("还没连上中继（服务端得先回 0x0210）；"
                                  "先用 waitrelay 等一等")
             seat = client.my_seat if client.my_seat is not None else 0
-            blob = (struct.pack("<BbbB", 0xFF, seat, -1, 0)
-                    + struct.pack("<HHHH", 0, 0x1234, sequence, 0x0102)
-                    + b"\xde\xad\xbe")
-            log(f"   要发的字节: {blob.hex(' ')}")
+            blob = build_udp_packet(seat, sequence, game_id)
+            log(f"   要发的字节: {blob.hex(' ')}（局号={game_id}）")
             client.relay.send_peer(blob)
         elif cmd == "waitrelay":
             seconds = float(tokens.pop(0)) if tokens and _isnum(tokens[0]) else 15.0
@@ -663,7 +681,11 @@ def run_script(client, tokens):
             client.send_game(OP_LOADING_DONE)
         elif cmd == "die":
             deaths = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 0
-            seat = client.my_seat if client.my_seat is not None else 0
+            mine = client.my_seat if client.my_seat is not None else 0
+            # ★ 第二个参数 = **受害者座位**，用来造「替别人报死亡」的幽灵上报
+            #   （bug调查/8）：真客户端每台都模拟全场伤害，射手那台算「炸死了
+            #   他」时就会发这么一发。服务端应当只认本人那发、把这发丢掉。
+            seat = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else mine
             # 18 字节，紧凑，死亡次数在**线偏移 6**（客户端结构体里在 +0x08，
             # 按后者组包会写坏 X 并让客户端越界崩，V0.1 §108）。
             client.send_game(OP_REPORT_HP_ZERO,

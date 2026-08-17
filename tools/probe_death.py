@@ -155,25 +155,39 @@ def snapshot(h):
     rule = u32(h, ctx + 0x384) if ctx else None
     s["rule"] = rule
     s["rule_cls"] = cls_of(h, rule) if rule else "NULL(=> vf_a4 返回 0x7fffffff)"
-    # `QuestVictoryCondition` 的每座位战绩表。布局从 0x48c942 / 0x55e095 / 0x4a3f34 读出：
-    #   [rule + seat*0x2c + 0x5c] 分数   [+0x60] 死亡次数   [+0x70] 队伍号+1
+    # `QuestVictoryCondition` 的每座位战绩表。布局从构造函数 0x55e018 和
+    # 剩余生命函数 0x55e0a3 逐指令读出，**六个座位、步长 0x2c**：
+    #   [rule + seat*0x2c + 0x54] 座位有人（byte）  [+0x5c] 分数  [+0x60] 死亡次数
+    #   [rule + seat*0x2c + 0x64] 最大生命（构造时给有人的座位填 3）
+    #   [rule + seat*0x2c + 0x70] 队伍号（0 = 没分队）
     #   [rule + seat*0x2c + 0x7c] 0x0415 下发的分数
-    #   [rule + seat*4    + 0x198] 最大生命（构造时填 3）
-    # 剩余生命 = vf10 = 最大生命 - 死亡次数（0x55e0a3），下界 0。
+    #
+    # ★ 会话 31 这里写的是 `[rule + seat*4 + 0x198]`，**错的** —— 那是
+    #   `DeathMatchVictoryCondition` 的「分数上限」标量（`0x55be71`），
+    #   在生存局里读出来是一堆垃圾，害得 bug调查/8_2 第一轮判断跑偏。
+    #
+    # 剩余生命 = vf10（`0x55e0a3`）= vf_c(座位) - 死亡次数，下界 0。
+    # 生存模式的 vf_c 是 `0x55db69`：`push 3 / pop eax / ret 4` ——
+    # **恒等于 3，根本不读 +0x64**。所以判「还有没有命」只能看死亡次数。
     s["stats"] = []
     if rule:
+        survival = s["rule_cls"].startswith("Survival")
         for i in range(SEAT_COUNT):
             rec = rule + i * 0x2C
             deaths = i32(h, rec + 0x60)
-            maxlives = i32(h, rule + i * 4 + 0x198)
+            maxlives = i32(h, rec + 0x64)
+            occupied = u8(h, rec + 0x54)
             if deaths is None or maxlives is None:
                 continue
-            if not maxlives and not deaths:
+            if not occupied and not maxlives and not deaths:
                 continue
+            effective = 3 if survival else maxlives
             s["stats"].append({
                 "seat": i, "score": i32(h, rec + 0x5C), "deaths": deaths,
                 "team": i32(h, rec + 0x70), "score415": i32(h, rec + 0x7C),
-                "max_lives": maxlives, "lives": max(0, maxlives - deaths),
+                "occupied": occupied,
+                "max_lives": maxlives, "effective_max": effective,
+                "lives": max(0, effective - deaths),
             })
     # GameContextQuest 的每座位分数（只有 0x0415 下发时才会被写，0x4a3f1e）
     # ★ 只有 GameContextQuest* 才有这个字段；别的上下文那个偏移是别的东西，
@@ -225,6 +239,21 @@ def key(s):
 def verdict(s):
     """按 0x4fe70e 的判据逐条给结论。"""
     out = []
+    # ★ 先看最要命的那条（bug调查/8_2 §212）：队伍号 > 2 会让客户端把队伍
+    #   记账写进别人的战绩，死亡次数被越写越大 -> 剩余生命归零 ->
+    #   活着被切进观战、死了 respawn_at = -1 永不重生。
+    bad_team = [t for t in s["stats"] if t["team"] > 2]
+    if bad_team:
+        seats = ", ".join(f"座位{t['seat']}=队伍{t['team']}" for t in bad_team)
+        out.append(f"✗✗ 队伍号越界：{seats} —— 服务端发了 >= 3 的队伍号，"
+                   "客户端 vf34(0x55c696) 会踩掉别人的战绩记录"
+                   "（bug调查/8_2 §212；修好的服务端个人战一律发 0）")
+    dead_broke = [t for t in s["stats"] if t["occupied"] and t["lives"] <= 0]
+    if dead_broke:
+        seats = ", ".join(f"座位{t['seat']}(死亡{t['deaths']}次)"
+                          for t in dead_broke)
+        out.append(f"· 剩余生命已归零：{seats} —— 这些座位不会再重生"
+                   "（生存模式恒定三条命，`0x55db69`）")
     if s["lobby_3da"]:
         out.append(f"✗ [LobbyStage+0x3da]={s['lobby_3da']} != 0 -> 0x4fe70e 直接返回")
     if s["ctx_04"]:
@@ -238,11 +267,24 @@ def verdict(s):
             out.append(f"· 座位 {c['seat']} 还活着 (HP={c['hp']})")
             continue
         out.append(f"★ 座位 {c['seat']} 处于死亡态 (HP={c['hp']}, +0x2b4=1)")
+        if c["f614"]:
+            # bug调查/8 记的那道守卫：`0x4fe78f` 的发送链上有一处
+            # `[char+0x614] != 0 -> 不发 0x0413`（`0x0419` 复活时会清零）。
+            # **还没在现场确认过**，所以这里只把值亮出来，不下断言。
+            out.append(f"  ? [char+0x614]={c['f614']} 非 0"
+                       f"（bug调查/8 记的那道守卫，待现场坐实）")
         if c["respawn_at"] is None:
             continue
         if c["respawn_at"] < 0:
+            mine = [t for t in s["stats"] if t["seat"] == c["seat"]]
+            why = ""
+            if mine and mine[0]["lives"] <= 0:
+                why = (f"；本座位死亡次数={mine[0]['deaths']} >= "
+                       f"{mine[0]['effective_max']} 条命 —— 就是这条"
+                       "（`0x501976` 的 `ctx->vf_a4(charId) == 0`）")
             out.append("  ✗ respawn_at = -1 -> 永不重生"
-                       "（Die() 判定 type==0 或生命耗尽，或已经发过一次重生）")
+                       "（Die() 判定 type==0 或生命耗尽，或已经发过一次重生）"
+                       + why)
         elif s["now"] is not None:
             left = c["respawn_at"] - s["now"]
             out.append(f"  · respawn_at={c['respawn_at']} now={s['now']} "
@@ -267,9 +309,14 @@ def dump(s):
               f"spawn_idx={c['spawn_idx']} respawn_at={c['respawn_at']} "
               f"+0x614={c['f614']} pos=({c['x']:.0f},{c['y']:.0f})")
     for t in s["stats"]:
+        # 队伍号 > 2 = 服务端发了越界的队伍号，客户端 vf34（0x55c696）会拿
+        # `this + 40*(队伍号-1)` 写出两格的队伍数组、踩进别人的战绩记录
+        # —— bug调查/8_2 §212 的现场判据，一眼就能认出来。
+        flag = "  ★队伍号越界(>2)：会踩别人的战绩" if t["team"] > 2 else ""
         print(f"  战绩[{t['seat']}] 分数={t['score']:<6} 死亡={t['deaths']} "
-              f"最大生命={t['max_lives']} -> 剩余生命={t['lives']}  "
-              f"队伍={t['team']} 0x0415分数={t['score415']}")
+              f"最大生命={t['effective_max']}(存={t['max_lives']}) "
+              f"-> 剩余生命={t['lives']}  "
+              f"队伍={t['team']} 0x0415分数={t['score415']}{flag}")
     if any(s["ctx_scores"]):
         print(f"  GameContext+0x3b8 每座位分数（只有 0x0415 会写）= {s['ctx_scores']}")
     for line in verdict(s):

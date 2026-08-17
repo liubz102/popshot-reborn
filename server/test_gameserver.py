@@ -1173,9 +1173,11 @@ class DeathAndRespawnTests(unittest.TestCase):
         # 并把死亡次数冲成六万多，客户端左下角状态面板拿
         # `剩余生命 = 最大生命 - 死亡次数` 当数组下标，负数直接越界崩。
         # 把回包重新解析一遍，就能钉死「除了死亡次数，别的字段一个都没动」。
+        # ★ 死亡次数从 0 报起：bug调查/8 之后下发值取自服务端权威计数，
+        #   头一次广播就是 1，不再跟着客户端报的「之前死过几次」跳。
         conn = self.make_conn()
         payload = self.hp_zero_payload(handle=0x0010C8FB, seat=3, arg=0xFF,
-                                       deaths=1, x=-1500.5, y=820.25)
+                                       deaths=0, x=-1500.5, y=820.25)
         gameserver.Conn.on_game_packet(conn, gameserver.OP_REPORT_HP_ZERO, payload)
         body = take_frame(bytearray(conn.sent[0]))[2]
         sent, got = parse_report_hp_zero(payload), parse_report_hp_zero(body)

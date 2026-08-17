@@ -43,7 +43,8 @@ from gameserver import (                                       # noqa: E402
 )
 from lobby import (Lobby, MOVE_INTO_ALREADY_PLAYING, MOVE_INTO_BAD_PASSWORD,
                    MOVE_INTO_FULL, MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_OK,
-                   TEAM_A, TEAM_B, TEAM_LAYOUT_FREE)
+                   TEAM_A, TEAM_B, TEAM_LAYOUT_COOP, TEAM_LAYOUT_FREE,
+                   TEAM_LAYOUT_TEAMS, TEAM_NONE, default_team)
 import relayserver                                                  # noqa: E402
 from simple import SimpleCipher                                     # noqa: E402
 
@@ -777,23 +778,43 @@ class TeamAndReadyTests(LobbyIsolated):
         self.assertEqual([TEAM_A, TEAM_A],
                          [room.seats[0].team, room.seats[1].team])
 
-    def test_free_for_all_gives_everyone_their_own_team(self):
-        # 个人战：队伍号必须互不相同，否则谁都打不动谁。
+    def test_free_for_all_leaves_everyone_unteamed(self):
+        # 个人战：**人人 0 = 没分队**。以前发「座位号 + 1」，3 人以上就会让
+        # 客户端 `vf34`（`0x55c696`）按 `this + 40*(队伍号-1)` 写出两格的
+        # 队伍数组、踩进别人的战绩记录 —— 死亡次数被越写越大，剩余生命
+        # `max(0, 3 - 死亡次数)` 归零，于是「活着进观战」+「死了不复活」。
+        # 见 lobby.TEAM_LAYOUT_* 的说明（bug调查/8_2 §212）。
         carol = make_conn("carol")
         gameserver.Conn.on_game_packet(
             carol, 0x0201,
             create_session_payload(session_type=1, arguments=(0, 3, 0)))
         room = self.lobby.room_of(carol)
-        dave = make_conn("alice")
-        gameserver.Conn.on_game_packet(dave, OP_MOVE_INTO_SESSION,
-                                       move_into_payload(room.room_id))
-        self.assertEqual([1, 2], [room.seats[0].team, room.seats[1].team])
-        self.assertNotEqual(room.seats[0].team, room.seats[1].team)
+        # ★ 三人以上才是出事的量级（两人局队伍号 1/2 不越界），所以这里
+        #   一定要坐满三个以上。
+        for name in ("alice", "bob", "carol"):
+            other = make_conn(name)
+            gameserver.Conn.on_game_packet(other, OP_MOVE_INTO_SESSION,
+                                           move_into_payload(room.room_id))
+        self.assertEqual([TEAM_NONE] * 4,
+                         [room.seats[i].team for i in range(4)])
+
+    def test_no_room_layout_ever_sends_a_team_above_two(self):
+        # ★ 铁律：线上出去的队伍号只能是 0 / 1 / 2。客户端的队伍记录数组
+        #   只有两格，>= 3 就是越界写。三种口径 × 六个座位全查一遍。
+        for layout in (TEAM_LAYOUT_TEAMS, TEAM_LAYOUT_FREE, TEAM_LAYOUT_COOP):
+            for seat in range(6):
+                team = default_team(seat, layout)
+                self.assertIn(team, (TEAM_NONE, TEAM_A, TEAM_B),
+                              f"{layout} 座位 {seat} 发了队伍号 {team}")
+
+    def test_session_slot_clamps_an_out_of_range_team(self):
+        # 线格式那一处也设了闸：万一哪天有别的路径塞进 3，也不会发出去。
+        payload = build_session_slot(occupied=True, nickname="ab", team=3)
+        self.assertEqual(0, payload[4 + 2 + 4])     # i32(1) + u16 长度 + "ab"
 
     def test_switching_the_room_mode_regroups_and_broadcasts(self):
         # 房主在房间里点「个人战」-> 分队口径变了 -> 重排 + 每个变了的座位
-        # 补一发 action 3。★ 要三个人才看得出来：前两个座位在两种口径下
-        # 恰好都是 1 / 2，第三个才分叉（组队战 1，个人战 3）。
+        # 补一发 action 3。组队战是 1/2/1，个人战全 0，所以三个座位都变。
         carol = make_conn("carol")
         gameserver.Conn.on_game_packet(carol, OP_MOVE_INTO_SESSION,
                                        move_into_payload(self.room.room_id))
@@ -804,13 +825,16 @@ class TeamAndReadyTests(LobbyIsolated):
             self.alice, gameserver.OP_CHANGE_SESSION,
             change_session_payload(session_type=1, arguments=(0, 3, 0)))
         self.assertEqual(TEAM_LAYOUT_FREE, self.room.team_layout())
-        self.assertEqual([1, 2, 3], [s.team for s in self.room.seats[:3]])
-        # 变了的只有座位 2，所以别人只该收到那一发
+        self.assertEqual([TEAM_NONE] * 3, [s.team for s in self.room.seats[:3]])
+        # 三个座位都变了，所以别人该收到三发 action 3
         self.assertIn(OP_SESSION_MEMBER_UPDATE, opcodes(self.bob))
-        payload = [p for blob in self.bob.sent for _, op, p in frames(blob)
-                   if op == OP_SESSION_MEMBER_UPDATE][0]
-        self.assertEqual(SEAT_ACTION_RESYNC, payload[0])
-        self.assertEqual(2, Reader(payload[1:]).i32())
+        payloads = [p for blob in self.bob.sent for _, op, p in frames(blob)
+                    if op == OP_SESSION_MEMBER_UPDATE]
+        self.assertEqual(3, len(payloads))
+        self.assertEqual({0, 1, 2},
+                         {Reader(p[1:]).i32() for p in payloads})
+        for payload in payloads:
+            self.assertEqual(SEAT_ACTION_RESYNC, payload[0])
 
     def test_a_manual_team_choice_survives_someone_joining(self):
         gameserver.Conn.on_game_packet(

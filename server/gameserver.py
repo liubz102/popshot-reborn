@@ -1215,6 +1215,14 @@ def build_session_slot(occupied=False, nickname="", team=0,
     """
     if not occupied:
         return w_i32(0) + w_i32(1 if closed else 0)
+    # ★ 队伍号在这里**夹到 0..2**（bug调查/8_2 §212）。客户端的队伍记录数组
+    #   只有两格，`vf34`（`0x55c696`）按 `this + 40*(队伍号-1)` 写、没有上界
+    #   检查，发出去 >= 3 就会踩掉别人的每座位战绩（死亡次数被越写越大 ->
+    #   剩余生命归零 -> 活着进观战 / 死了永不重生）。线格式这一处是所有
+    #   `0x0300` / `0x0301` 的必经之路，闸设在这里就漏不掉。
+    team = int(team)
+    if not 0 <= team <= 2:
+        team = 0
     return (w_i32(1)
             + w_wstr(nickname)
             + struct.pack("<B", team & 0xFF)
@@ -2707,6 +2715,27 @@ PVP_SCORE_LIMIT_DEFAULT = 5
 PVP_SCORE_LIMIT_TEAM = {1: 4, 2: 6, 3: 8}
 PVP_SCORE_LIMIT_FREE = {2: 4, 3: 6, 4: 8, 5: 9, 6: 10}
 
+#: 同一只**怪**的两发死亡上报隔多久才算「真的又死了一次」（bug调查/8）。
+#:
+#: 怪是每台机器各自模拟的，同一次死亡会被好几台几乎同时报上来（实测同一只
+#: 怪 76 毫秒内来了两发，而且两发报的「之前死过几次」**不一样** —— 句柄按
+#: 控制者座位分段复用，同号对象未必是同一只，`[obj+0x600]` 跨对象残留就差 1，
+#: `(句柄, 报的次数)` 那把键当场失效）。怪的重生周期远长于 3 秒，所以这扇窗
+#: 只吃重复、不吃真的下一次。
+#:
+#: ★ **只对怪生效**。玩家的死亡从 bug调查/8 起只认本人上报（`on_report_hp_zero`），
+#: 一次死亡天然只有一发，用不着时间窗；而给玩家也套一扇窗只会多一种
+#: 「真死亡被吃掉」的可能（服务端补重生之后 3 秒内又死是完全可能的）。
+MONSTER_DEATH_DEDUP_WINDOW_S = 3.0
+
+#: 广播完死亡之后，最多等本人的 `0x0413 gcpRespawnCharacter` 多久（秒）；
+#: 超时服务端自己补一发 `0x0419` 把人拉起来（bug调查/8「死了不复活」）。
+#:
+#: 客户端是死后 5 秒发（`0x5019a8` 写 `[char+0x2d8] = now + 5000`），所以这个
+#: 值必须**明显大于 5 秒**，不然会抢在正常重生前面；又不能太大，不然玩家
+#: 干瞪眼太久。8 秒 = 5 秒倒计时 + 一个 RTT + 掉帧余量。
+RESPAWN_WATCHDOG_S = 8.0
+
 
 def pvp_score_limit(player_count, team_mode):
     """这一局要拿几分（几个人头）才算赢。抄自 `0x55be71`（§167）。"""
@@ -2774,10 +2803,31 @@ class RoomQuest:
         #: 已经广播过的死亡事件，键是 **(句柄, 客户端报的死亡次数)**（去重）。
         #: 为什么键里要带死亡次数：同一个角色会死很多次，只按句柄去重的话
         #: 第二次死就被吃掉了。而重复上报（两台机器同时判同一只怪死了）
-        #: **两发的死亡次数一定相同** —— 那一格是 `[char+0x600]`，只由我们
-        #: 广播的 `0x0406` 写，所有机器上是同一个值。真正的第二次死亡则会
-        #: 带着更大的数上来，键自然不同。
+        #: 两发的死亡次数**通常**相同 —— 那一格是 `[char+0x600]`，只由我们
+        #: 广播的 `0x0406` 写。真正的第二次死亡则会带着更大的数上来。
+        #:
+        #: ★ bug调查/8 之后这张表只是最便宜的第一道闸：实测同一只怪的两发
+        #: 上报**次数可以不一样**（句柄分段复用，见 `MONSTER_DEATH_DEDUP_WINDOW_S`），
+        #: 那种情况靠下面的权威计数 + 时间窗拦。
         self.dead_events = set()
+        #: 每个句柄**服务端权威**的已广播死亡次数。下发值以它为准，不再直接
+        #: 用客户端报的「之前死过几次」+1 —— 正常路径两者恒等（`[char+0x600]`
+        #: 只由我们的广播写），不等就是句柄撞号 / 跨对象残留，这时候跟着客户端
+        #: 跳会把心形一次扣好几颗。
+        self.death_counts = {}
+        #: 每个句柄最后一次广播死亡的时刻（`time.monotonic()`），
+        #: 给 `MONSTER_DEATH_DEDUP_WINDOW_S` 那扇窗用。
+        self.last_death_broadcast_at = {}
+        #: ★ 重生看门狗（bug调查/8）：座位 -> `(到点时刻, 兜底坐标)`。
+        #: 广播死亡时上闩，收到本人的 `0x0413` 就撤闩；到点还没撤说明客户端
+        #: 那条「5 秒后自己发 0x0413」的链断了，服务端自己补一发 `0x0419`。
+        self.respawn_due = {}
+        #: 客户端自报过的重生点：座位 -> `(x, y, 重生点索引)`。看门狗补重生时
+        #: 优先用本人上次用过的那个点，其次用**任何人**在这张图上用过的点。
+        #: 换图必须清 —— 换了图重生点表整个换了。
+        self.respawn_hints = {}
+        #: 这张图上最近一次有人自报的重生点（座位不限），看门狗的第二顺位。
+        self.last_respawn_hint = None
         #: 每个座位死了几次。**这是权威值** —— HUD 上那排心形读的就是它
         #: （§109：`[char+0x600]`，由我们在 `0x0406` 里下发）。
         self.deaths = [0] * ROOM_SEAT_COUNT
@@ -2963,26 +3013,107 @@ class RoomQuest:
         return handle, item_id, x, y
 
     # -- 死亡 / 重生 --------------------------------------------------------
-    def record_death(self, handle, seat, reported):
+    def record_death(self, handle, seat, reported, now=None):
         """记一次死亡。返回 `(要下发的死亡次数, 这一发要不要广播)`。
 
-        ★ **下发的死亡次数是「客户端报的值 + 1」，不是服务端自己数的。**
-        看着像是服务端该当权威，其实两者永远相等，而「报的值 +1」是 V0.1
-        实机验过的（§109，包括跨换图那一段）：`[char+0x600]` 这一格**只由
-        我们广播的 `0x0406` 写**，所以每台机器上的值都是我们上一次发下去的
-        那个。自己另起一份计数只会多一个可能对不上的真源。
+        ## 判重三层（bug调查/8 重写）
+
+        1. `(句柄, 报的次数)` 见过了 —— 最便宜的一条，挡住「同一发重复上报」
+           和「换图瞬间还在飞的旧上报」。
+        2. **权威计数**：`报的值 + 1 <= 这个句柄已经广播过的次数` 一律不广播。
+           重复上报、以及那台机器计数落后（句柄撞号 / 跨对象残留）都长这样。
+        3. **时间窗**（`MONSTER_DEATH_DEDUP_WINDOW_S`，★ **只对怪**）：
+           怪由每台机器各自模拟，同一次死亡会被几台几乎同时报上来，而且
+           两发报的次数**可以不一样**，前两层都拦不住。玩家不走这一层 ——
+           玩家的死亡只认本人上报（`Conn.on_report_hp_zero`），一次死亡天然
+           只有一发，加窗只会平白吃掉真死亡。
+
+        ★ **下发的死亡次数以服务端权威计数为准。** V0.1 §109 的契约不变：
+        `[char+0x600]` 只由我们广播的 `0x0406` 写，所以正常路径下权威计数
+        恒等于「客户端报的值 + 1」。两者不等时**以我们的为准** —— 客户端
+        报的值更大只可能是句柄撞号，跟着跳会把 HUD 心形一次扣好几颗。
 
         每座位的 `deaths` 镜像成**这一发实际下发的次数**；生存模式拿它算
-        `3 - deaths`。用 ``max`` 而不是自己 ``+1``，这样即使服务端是在玩家
-        已经死过两次后才接手，也不会把第三条命错算成第一条。
+        `3 - deaths`。用 ``max`` 而不是直接赋值，是为了跨换图：换图会把
+        `death_counts` 清掉（新角色对象的 `[char+0x600]` 从 0 开始），
+        而「这一局死了几条命」不能跟着清。
         """
-        key = (handle & 0xFFFFFFFF, int(reported))
-        first = key not in self.dead_events
+        handle = int(handle) & 0xFFFFFFFF
+        reported = int(reported)
+        seat = int(seat)
+        now = time.monotonic() if now is None else now
+        is_player = 0 <= seat < ROOM_SEAT_COUNT
+        count = self.death_counts.get(handle, 0)
+        key = (handle, reported)
+        if key in self.dead_events:
+            return count, False
+        if reported + 1 <= count:
+            return count, False
+        if not is_player:
+            last = self.last_death_broadcast_at.get(handle)
+            if last is not None and now - last < MONSTER_DEATH_DEDUP_WINDOW_S:
+                return count, False
+        count += 1
+        self.death_counts[handle] = count
+        self.last_death_broadcast_at[handle] = now
         self.dead_events.add(key)
-        deaths = int(reported) + 1
-        if first and 0 <= seat < ROOM_SEAT_COUNT:
-            self.deaths[seat] = max(self.deaths[seat], deaths)
-        return deaths, first
+        if is_player:
+            self.deaths[seat] = max(self.deaths[seat], count)
+        return count, True
+
+    # -- 重生看门狗（bug调查/8）---------------------------------------------
+    def arm_respawn_watchdog(self, seat, position, now=None, after=None):
+        """广播了 `seat` 的死亡 -> 上闩，等他自己的 `0x0413`。
+
+        `position` = 死亡地点（`0x0408` 自报的 float 坐标），实在找不到重生点
+        时拿它当兜底 —— 原地站起来虽然不是原版行为，但比一直躺着强。
+        `after` = 等多少秒（`--respawn-watchdog`）；**<= 0 就是不上闩**，
+        整个兜底关掉，回到 bug调查/8 之前的行为（留取证窗口用）。
+        """
+        after = RESPAWN_WATCHDOG_S if after is None else float(after)
+        if after <= 0 or not 0 <= int(seat) < ROOM_SEAT_COUNT:
+            return False
+        now = time.monotonic() if now is None else now
+        x, y = position
+        self.respawn_due[int(seat)] = (now + after, (int(x), int(y)))
+        return True
+
+    def disarm_respawn_watchdog(self, seat):
+        """本人的 `0x0413` 到了（或者他走了 / 这局结束了）-> 撤闩。"""
+        return self.respawn_due.pop(int(seat), None) is not None
+
+    def remember_respawn_point(self, seat, x, y, spawn_index):
+        """记下客户端自报的重生点，给看门狗补包时用。"""
+        point = (int(x), int(y), int(spawn_index))
+        if 0 <= int(seat) < ROOM_SEAT_COUNT:
+            self.respawn_hints[int(seat)] = point
+        self.last_respawn_hint = point
+        return point
+
+    def respawn_point_for(self, seat, fallback):
+        """看门狗要发的 `0x0419` 用哪个坐标。
+
+        优先级：本人上次用过的重生点 -> 这张图上任何人用过的 -> 死亡地点。
+        前两者都是客户端自己算出来的合法重生点（`0x4fe70e` 选的
+        `[char+0x2b0]`），重生点表是**整张图共用**的，所以借别人的那个
+        一样落在地图内、不会触发 §88 那种「传送到地图边缘 + 0x0106」。
+        """
+        point = self.respawn_hints.get(int(seat)) or self.last_respawn_hint
+        if point is not None:
+            return point
+        x, y = fallback
+        return (int(x), int(y), 0)
+
+    def due_respawns(self, now=None):
+        """到点还没等到 `0x0413` 的座位，按座位号升序返回 `(座位, 兜底坐标)`。
+
+        ★ **只报，不撤闩** —— 撤闩交给调用方，它还要看这个座位到底该不该
+        重生（生存模式命用完了就不该）。
+        """
+        now = time.monotonic() if now is None else now
+        return [(seat, position)
+                for seat, (deadline, position) in sorted(self.respawn_due.items())
+                if now >= deadline]
 
     def record_kill(self, killer_seat, victim_seat):
         """给凶手记一分（对战的「分数」就是杀敌数，§167）。
@@ -3000,7 +3131,7 @@ class RoomQuest:
         self.kills[killer] += 1
         return True
 
-    def pvp_finished(self, seats, teams, score_limit,
+    def pvp_finished(self, seats, teams, score_limit, *, team_mode=True,
                      time_limit_ms=PVP_TIME_LIMIT_MS, now=None):
         """夺分模式这一局该不该结束了？结束就返回一句人话，否则 ``None``。
 
@@ -3017,6 +3148,13 @@ class RoomQuest:
                非组队模式下在座不足两人）
 
         `seats` = 有人的座位号列表，`teams` = `{座位号: 队伍号}`。
+
+        ★ `team_mode=False` 时**不看队伍号**，只看在座人数 —— 和客户端
+        `0x55c594` 一致：那个函数开头 `0x409df1(描述符) == 1` 不成立就直接
+        跳到非组队分支（`0x55c5d1`），一格队伍号都不读。以前个人战靠
+        「每人一队」让 `sides` 天然 >= 2 才没露馅，而个人战现在按
+        `lobby.default_team` 一律发 0（那里说明了为什么必须这样），
+        再不分模式就会一开局就判「只剩一边」。
         """
         if not seats:
             return None
@@ -3027,9 +3165,12 @@ class RoomQuest:
         for seat in seats:
             if 0 <= seat < ROOM_SEAT_COUNT and self.kills[seat] >= score_limit:
                 return f"座位 {seat} 拿到 {self.kills[seat]} 分，达到上限 {score_limit}"
-        sides = {teams.get(seat, TEAM_NONE) for seat in seats}
-        if len(seats) < 2 or len(sides) < 2:
+        if len(seats) < 2:
             return "只剩一边了"
+        if team_mode:
+            sides = {teams.get(seat, TEAM_NONE) for seat in seats}
+            if len(sides) < 2:
+                return "只剩一边了"
         return None
 
     def remaining_lives(self, seat, max_lives=PVP_SURVIVAL_LIVES):
@@ -3134,9 +3275,16 @@ class RoomQuest:
         self.maps_entered.append(map_name)
         # 换图会把六个座位的角色对象和场景里的物件全部卸掉重建（`0x47900a`），
         # 旧句柄随之作废 —— 去重表和拾取表必须跟着清，否则新图里的物件
-        # 会被当成「已经捡过了」。
+        # 会被当成「已经捡过了」。死亡计数同理：新角色的 `[char+0x600]` 从 0
+        # 起，不清就会把新图里的第一次死亡当成「过期上报」吃掉。
+        # 重生点表也必须清 —— 换了图，旧坐标就是别的地方了。
         self.items_taken.clear()
         self.dead_events.clear()
+        self.death_counts.clear()
+        self.last_death_broadcast_at.clear()
+        self.respawn_due.clear()
+        self.respawn_hints.clear()
+        self.last_respawn_hint = None
         return True
 
     def map_done(self, conn, members):
@@ -3358,8 +3506,8 @@ PEER_TIMING_REPORT_INTERVAL = 30.0
 def describe_peer_header(payload):
     """把 `0x040e` 载荷开头那 12 字节的 `UdpPacket` 头解成一行人话（§151）。
 
-    只给日志看。**转发时一个字节都不解析、不改写** —— 这里解错了也不会
-    影响转发的正确性。
+    只给日志看。转发路径上只动头里的局号（`+4`，见
+    `relayserver.restamp_peer_game_id`），这个函数解错了也不会影响转发。
     """
     if len(payload) < PEER_HEADER_SIZE:
         return f"    （只有 {len(payload)} 字节，装不下 12 字节的 UdpPacket 头）"
@@ -3423,9 +3571,16 @@ def _relay_battle_tick(game_conn):
     - `check_pvp_finished()` —— 对战的 240 秒时间上限（§167）。挂在这儿之前
       它只在有人死的时候才会被问到，中继模式下一局不死人就永远不结算。
     - `maybe_spawn_item()` —— 道具模式往地图上刷道具（§191 / D109）。
+    - `check_respawn_watchdog()` —— 死了 8 秒还没发 `0x0413` 的人由服务端
+      补一发 `0x0419`（bug调查/8「死了不复活」）。同步数据战斗中恒定 ~8 Hz，
+      拿它当心跳的精度绰绰有余。
+
+    ★ 排在最后的两件事都**不许**把同步转发带崩：`deliver()` 已经把本函数
+    整个包在 try 里（见 `RelayServer.deliver`），这里不再另加一层。
     """
     game_conn.check_pvp_finished()
     game_conn.maybe_spawn_item()
+    game_conn.check_respawn_watchdog()
 
 
 #: 全进程唯一的原版 TCP 中继（里程碑 J.3 / D078）。和 `LOBBY` 同一个理由做成
@@ -3603,6 +3758,10 @@ class Conn:
         self.peer_data_dumped = False
         self.peer_data_in = 0
         self.peer_data_out = 0
+        # 这台客户端**自己认哪个局号**（`UdpPacket` 头 +4）。它自报一次我们
+        # 就记一次，转发给它的包按这个号重新盖章 —— 依据全在
+        # `relayserver.peer_game_id` 的注释里（bug调查/8_2「别人一动不动」）。
+        self.peer_game_id = None
         # 同步数据的转发耗时 / 到达间隔（都按毫秒），每 30 秒汇总一行。
         # 存在的意义是**排除嫌疑**：实机还嫌卡时，这两个数字能立刻说清
         # 「不是服务端转发慢」，省掉一整轮猜（§182）。
@@ -4513,7 +4672,8 @@ class Conn:
             # 当前中文客户端房间列表可见的另一项是模式 3（夺分）。模式 1
             # 的 TimeAttack 仍沿用旧兜底；它在这版 UI 中不可选，另案再还原。
             limit = pvp_score_limit(len(seats), team_mode)
-            reason = quest.pvp_finished(seats, teams, limit, now=now)
+            reason = quest.pvp_finished(seats, teams, limit,
+                                        team_mode=team_mode, now=now)
             detail = f"杀敌数 {quest.kills}"
             rule = "夺分"
         if reason is None:
@@ -4580,6 +4740,18 @@ class Conn:
         x, y = self.last_position
         return (int(x), int(y))
 
+    def battle_seat_index(self):
+        """这条连接在房里坐哪个座位；不在房间 / 没入座返回 ``None``。
+
+        和 `self.my_seat` 的区别：`my_seat` 是连接自己记的一份镜像，房间外的
+        协议试探路径上也有值（默认 0）。要判「这一发是不是本人报的」必须用
+        **大厅那份权威座位表**，不然房间外的调试路径会被误判成座位 0。
+        """
+        room = self.lobby_room()
+        if room is None:
+            return None
+        return room.seat_index_of(self)
+
     def on_report_hp_zero(self, payload):
         """0x0408「我 HP 归零了」-> 回 0x0406 死亡广播，角色这才真的倒下。
 
@@ -4602,6 +4774,27 @@ class Conn:
           不会崩。所以「A 死了」这件事在 B 那边也能正确落到 A 的角色上。
         - **同一个句柄只广播一次**：怪物是各台机器各自模拟的，同一只怪可能被
           两个客户端同时报上来。广播两遍等于战绩表（`0x48c942`）多记一次死亡。
+
+        ## ★★ 玩家的死亡只认**本人**上报（bug调查/8）
+
+        每台客户端各自模拟全场的伤害。射手那台算「我的火箭溅射炸死了他」、
+        受害者自己那台算「我躲过去了」的分歧是**必然**的（弹道和溅射各算各的）。
+        旧逻辑对 `0x0408` 来者不拒、先到先广播，于是受害者的客户端会对
+        **活着的自己**执行 `Die()` —— 用户报的「人还活着，画面却突然进了观战
+        模式、左键变切视角」就是这个。实测一天的线上日志里 613 发玩家死亡广播
+        有 46 发**受害者本人从头到尾没报过**（他那台机器上他压根没死）。
+
+        谁死没死只有本人的 HP 模拟说了算，所以玩家座位（0..5）的上报**只接受
+        「上报的连接就坐在那个座位」**的那一发；别人替报的一律忽略。
+        真死了的话本人那发最多晚一个 RTT（TCP 可靠，实测同一次死亡各机相隔
+        十几到几十毫秒），不会丢。**凶手那一格也跟着变准**：改由受害者本机
+        `[char+0x158]` 提供，而不是自称打中了的那台。
+
+        怪 / NPC（座位 0xff）**不受这条限制** —— 怪由控制者那台模拟，谁都
+        可能替它报，去重仍然由 `RoomQuest.record_death` 负责。
+
+        ★ 房间外的调试 / 协议试探路径（`battle_seat_index()` 返回 ``None``）
+        保持老行为，不然手搓包那一路全被挡掉。
         """
         if getattr(self.args, "no_death_reply", False):
             self.log("   [no-death-reply] 收到 0x0408 但不回死亡广播")
@@ -4613,13 +4806,18 @@ class Conn:
             return
         seat = info["seat"]
         who = f"玩家座位 {seat}" if 0 <= seat < 6 else f"NPC/怪物 (座位={seat})"
+        reporter = self.battle_seat_index()
+        if 0 <= seat < ROOM_SEAT_COUNT and reporter is not None and reporter != seat:
+            self.log(f"   ✗ 幽灵死亡上报：{who} 是座位 {reporter} 替报的 —— "
+                     f"本人那台机器上他没死，不广播（bug调查/8）")
+            return
         quest = self.quest_state()
         deaths, first = quest.record_death(info["handle"], seat, info["deaths"])
         self.log(f"   HP 归零上报: {who} 句柄=0x{info['handle']:08x} "
                  f"凶手={info['arg']} 死亡次数={info['deaths']} "
                  f"位置=({info['x']:.0f}, {info['y']:.0f})")
         if not first:
-            # 别人已经替这个句柄报过了。再广播一次就多记一次死亡。
+            # 已经替这个句柄报过了。再广播一次就多记一次死亡。
             self.vlog(f"   句柄 0x{info['handle']:08x} 的死亡已经广播过；"
                       f"这一发忽略（多台机器各自模拟同一只怪，§161）")
             return
@@ -4635,6 +4833,10 @@ class Conn:
                  f" —— 客户端收到才会调 Character::Die()，心形也靠它减")
         self.battle_broadcast(build_game(OP_BROADCAST_DEATH, reply),
                               reason="：死亡广播")
+        # ★ 上闩等他自己的 0x0413；到点没等到就由 `check_respawn_watchdog()`
+        #   补一发 0x0419（bug调查/8「死了不复活」）。
+        quest.arm_respawn_watchdog(seat, (info["x"], info["y"]),
+                                   after=self.respawn_watchdog_seconds())
         # 对战里「杀敌数」就是分数：凶手那一格是开火者的座位号（§167）。
         if quest.record_kill(info["arg"], seat):
             self.log(f"   对战计分: 座位 {info['arg']} 杀敌数 -> "
@@ -4667,6 +4869,15 @@ class Conn:
         self.log(f"   重生请求: id={info['character_id']} "
                  f"坐标=({info['x']}, {info['y']}) "
                  f"重生点索引={info['spawn_index']}")
+        # 本人的 0x0413 到了 -> 撤看门狗的闩，并把这个重生点记下来
+        # （bug调查/8：以后要替别人补 0x0419 时就用它）。
+        quest = self.quest_state()
+        seat = self.battle_seat_index()
+        if seat is None:
+            seat = info["character_id"]
+        quest.disarm_respawn_watchdog(seat)
+        quest.remember_respawn_point(seat, info["x"], info["y"],
+                                     info["spawn_index"])
         self.log(f"← 回 gspRespawnCharacter(0x0419) 原样回显"
                  f"（第 {self.respawn_sent} 次）")
         self.battle_broadcast(
@@ -4674,6 +4885,76 @@ class Conn:
                 info["character_id"], info["x"], info["y"],
                 info["spawn_index"])),
             reason="：重生")
+
+    def respawn_watchdog_seconds(self):
+        """看门狗等多久（秒）。`--respawn-watchdog 0` = 整个兜底关掉。"""
+        value = getattr(self.args, "respawn_watchdog", None)
+        return RESPAWN_WATCHDOG_S if value is None else float(value)
+
+    def check_respawn_watchdog(self, now=None):
+        """★ 死了 8 秒还没发 `0x0413` 的人，由服务端补一发 `0x0419` 拉起来。
+
+        ## 为什么需要它（bug调查/8）
+
+        用户报的「3 人以上对战，有时人死了就再也不复活」。线上日志实锤：
+        服务端**正确**广播了 `0x0406`，全房间的客户端也都收到了，可受害者
+        那台从此**再没发过 `0x0413`** —— 他自己屏幕上是观战画面、还能聊天
+        （实测有人一边卡着一边打字「我又观战了」「不能复活了」），别人屏幕上
+        他就一直躺在地上，直到这一局结束。一天的日志里 15 次，全部集中在
+        3 人以上的局。
+
+        客户端那条链是 `Die()`（`0x5019a8` 写 `[char+0x2d8] = now + 5000`）
+        -> 每帧 `0x4fe78f` -> `0x4fe8d7` 发包，中间还有几道守卫
+        （`[LobbyStage+0x1c]`、剩余生命、`[char+0x614]`）。**到底是哪一道
+        卡住的还没查实**（会话 30 的注入实验把「凶手=自己」和「移动污染
+        0x614」两个假设都证伪了），但那条链的**出口**是确定的：客户端只是
+        在等一发 `0x0419`，而 `0x0419` 完全由服务端说了算。所以不管客户端
+        卡在哪一道守卫上，服务端主动补这一发都能把人拉起来 —— 而且
+        `0x0419` 本身就会清掉 `[char+0x614]`，等于顺手把死锁解开。
+
+        ## 判据
+
+        - 只在**真开打了**的局里跑（`room_in_battle`），结算完就不管了。
+        - 座位上得有人：中途退房的不补。
+        - 生存类模式（0 / 2）要**还有命**才补 —— 三条命用完就该躺着，
+          那是原版规则（§204），补了反而是作弊。夺分 / 闯关没有命数上限。
+        - 坐标优先用本人上次自报的重生点，其次是这张图上任何人用过的，
+          最后才退回死亡地点（见 `RoomQuest.respawn_point_for`）。
+
+        正常路径下这个函数永远什么都不做：客户端 5 秒就发 `0x0413` 了，
+        闩早在第 5 秒就被 `on_respawn_request` 撤掉。
+        """
+        room = self.lobby_room()
+        if not room_in_battle(room):
+            return 0
+        quest = self.quest_state()
+        if quest.settled or quest.pvp_reason is not None:
+            return 0
+        due = quest.due_respawns(now)
+        if not due:
+            return 0
+        survival = (not self.quest_mode()
+                    and self.pvp_game_mode() in (PVP_MODE_SURVIVAL,
+                                                 PVP_MODE_FIGHT))
+        sent = 0
+        for seat, position in due:
+            quest.disarm_respawn_watchdog(seat)
+            if not (0 <= seat < len(room.seats)) or room.seats[seat] is None:
+                continue                    # 人走了，没什么好复活的
+            if survival and quest.remaining_lives(seat) <= 0:
+                self.vlog(f"   [重生看门狗] 座位 {seat} 三条命用完了，不补重生")
+                continue
+            x, y, spawn_index = quest.respawn_point_for(seat, position)
+            self.log(f"★ [重生看门狗] 座位 {seat} 死了 {RESPAWN_WATCHDOG_S:.0f} 秒"
+                     f"还没发 0x0413 —— 服务端补一发 gspRespawnCharacter(0x0419) "
+                     f"坐标=({x}, {y}) 重生点索引={spawn_index}"
+                     f"（bug调查/8「死了不复活」）")
+            self.battle_broadcast(
+                build_game(OP_RESPAWN_CHARACTER,
+                           build_respawn_character(seat, x, y, spawn_index)),
+                reason="：看门狗补重生")
+            sent += 1
+        return sent
 
     def on_req_change_to_next_map(self, payload):
         """0x0411「我要去下一张地图」-> 原样回 0x0417，客户端这才开始换图。
@@ -5763,7 +6044,8 @@ class Conn:
         """`0x040e` —— 把玩家之间的同步数据转给同房间的其他人（§149）。
 
         载荷是**一个完整的 `UdpPacket`**（12 字节头 + body，见 §151），
-        我们**一个字节都不改**地放进 `0x040f` 再发出去 —— 客户端收到后
+        除了头里那个局号（`+4`，见 `relayserver.peer_game_id`）之外
+        **一个字节都不改**地放进 `0x040f` 再发出去 —— 客户端收到后
         `0x4086b5` 剥掉外层 10 字节头，剩下的就还原成原来那个 `UdpPacket`，
         和 UDP 直连收到的走同一个入口 `0x407869`。
 
@@ -6871,6 +7153,12 @@ def main():
     ap.add_argument("--no-death-reply", action="store_true",
                     help="收到 0x0408 也不回死亡广播（回到会话 14 及以前的行为，"
                          "角色血量归零后不死不重生）。只在对比排查时用。")
+    ap.add_argument("--respawn-watchdog", type=float, default=None, metavar="秒",
+                    help="死了多少秒还没等到客户端的 0x0413，服务端就自己补一发 "
+                         "0x0419 把人拉起来（bug调查/8「死了不复活」的兜底）。"
+                         f"默认 {RESPAWN_WATCHDOG_S:.0f} 秒；**0 = 关掉兜底**。"
+                         "调大或关掉是为了留出取证窗口 —— 兜底一开，卡住的人 8 秒"
+                         "就被捞起来了，来不及在他那台跑 probe-death.bat。")
     ap.add_argument("--room-burst-delay", type=int, default=0, metavar="毫秒",
                     help="建房/回房间的那一串包不合并，并且每个之间等这么久"
                          "（回到会话 21 及以前的行为）。用来**复现**「进房间只剩"

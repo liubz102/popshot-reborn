@@ -117,6 +117,10 @@ def build_arg_parser():
                     help="收到 0x0408 也不回死亡广播（对比排查用）")
     ap.add_argument("--room-burst-delay", type=int, default=0, metavar="毫秒",
                     help="建房/回房间的那串包不合并（复现 §120 用）")
+    ap.add_argument("--respawn-watchdog", type=float, default=None, metavar="秒",
+                    help="死了多少秒还没等到客户端的 0x0413 就由服务端补发 0x0419"
+                         "（bug调查/8「死了不复活」的兜底）。0 = 关掉兜底，"
+                         "留出在玩家机器上跑 probe-death.bat 的取证窗口")
     return ap
 
 
@@ -132,6 +136,7 @@ def _game_args(args):
     ns.accounts = args.accounts
     ns.no_death_reply = args.no_death_reply
     ns.room_burst_delay = args.room_burst_delay
+    ns.respawn_watchdog = args.respawn_watchdog
     ns.control_port = 0 if args.no_control else args.control_port
     ns.verbose = args.verbose
     return ns

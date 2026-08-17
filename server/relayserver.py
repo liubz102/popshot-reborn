@@ -84,6 +84,11 @@ RCP_WHO_ARE_YOU = 2
 #: `rcpRegister` 的载荷长度：`RelayAuthData` 三个 int32（`0x54c453`）。
 AUTH_SIZE = 12
 
+#: `UdpPacket` 头长度（§151）。转发的载荷就是一整个 `UdpPacket`。
+PEER_HEADER_SIZE = 12
+#: 头里「会话/局号」那个 u16 的偏移（§151 的 `+4`）。
+PEER_GAME_ID_OFFSET = 4
+
 #: 单帧载荷上限。头里的长度是 u16，所以协议上限就是 65535；
 #: 真实的 `UdpPacket` 是几十字节，超出这个数量级说明流已经错位了。
 MAX_PAYLOAD = 0xFFFF
@@ -123,6 +128,50 @@ RELAY_SEND_DEADLINE_S = 2.0
 #: 方向已经断了（NAT 超时 / 网络半开），客户端却收不到 FIN 还在傻等。
 #: `gameserver.recover_peer_relay()` 拿这个判定要不要重发 `0x0211`+`0x0210`。
 STALL_AFTER_S = 20.0
+
+
+def peer_game_id(udp_packet):
+    """读 `UdpPacket` 头 `+4` 的「会话/局号」。不像一个 `UdpPacket` 就返回 None。
+
+    ## 这个字段为什么要管（bug调查/8_2 §213）
+
+    收包入口 `0x4078c4` 拿它和**自己的** `[GameSession+0x3c]` 比，
+    **不等就整包丢掉**（唯一豁免是描述符 type==5，普通房间用不上）。
+    而那个计数器是**纯客户端本地**的：只有 `0x5517a3` / `0x551900` 两处
+    `inc [GameSession+0x3c]`，分别跟着 `[GameSession+4] = 4 / 2` 两次
+    阶段切换，**服务端没有任何包能设定它**，进房之后也永不归零。
+
+    于是「在同一个房间里多打一局」就会分叉：先来的人每打完一局 +2，
+    中途进来的人从 0 起步。线上实测（`bug调查/8_2`，房 #69 第二局）
+    受害者发的是**局号 3**，另外三个人发的都是**局号 1**——
+    双向所有同步包互相全丢，症状就是用户报的**「其他人都不会动，
+    但对局在正常进行」**（还听得见死亡音效，因为那走的是游戏服 `0x0406`）。
+
+    ## 为什么可以改写
+
+    校验和（头 `+6`）由 `0x5bbdc1` 算，**只覆盖 `+0x0c` 之后的 body**
+    （`lea esi,[edx+0xc]`，种子 0x17），不含头里的局号。所以转发时把
+    `+4` 换成收件人自己的局号，其余一个字节不动，校验和照样对得上。
+    """
+    packet = bytes(udp_packet)
+    if len(packet) < PEER_HEADER_SIZE or packet[0] != MAGIC:
+        return None
+    return int.from_bytes(
+        packet[PEER_GAME_ID_OFFSET:PEER_GAME_ID_OFFSET + 2], "little")
+
+
+def restamp_peer_game_id(udp_packet, game_id):
+    """把 `UdpPacket` 头里的局号换成 `game_id`，其余字节原样返回。
+
+    不是 `UdpPacket`（或 `game_id` 为 None）就原样返回，绝不抛 ——
+    转发这条路上任何异常都会让同步断流（铁律 1）。
+    """
+    packet = bytes(udp_packet)
+    if game_id is None or len(packet) < PEER_HEADER_SIZE or packet[0] != MAGIC:
+        return packet
+    head = PEER_GAME_ID_OFFSET
+    return (packet[:head] + struct.pack("<H", int(game_id) & 0xFFFF)
+            + packet[head + 2:])
 
 
 def build_rcp(opcode, payload=b""):
@@ -567,11 +616,32 @@ class RelayServer:
         self.registered_total = 0
         self.delivered_relay = 0
         self.delivered_fallback = 0
+        #: 改写过局号的包数，和「已经报过哪几对分叉」（去重用，见
+        #: `_note_game_id_gap`）。战斗中一秒几十发，逐发打日志会把盘写满。
+        self.restamped_total = 0
+        self._game_id_gaps = set()
 
     # -- 日志 ---------------------------------------------------------------
     def log(self, msg):
         if self._logger is not None:
             self._logger(msg)
+
+    def _note_game_id_gap(self, sender, receiver, sender_id, receiver_id):
+        """局号分叉：**每对 (发送方, 收件人, 两个号) 只报一行**。
+
+        这条不是错误 —— 改写之后同步照常。留一行是因为它是「这个房间里
+        有人多打了一局」的唯一可见信号，排查时能一眼看出来。
+        """
+        self.restamped_total += 1
+        key = (id(sender), id(receiver), sender_id, receiver_id)
+        if key in self._game_id_gaps:
+            return
+        self._game_id_gaps.add(key)
+        from_who = getattr(sender, "account_name", None) or "?"
+        to_who = getattr(receiver, "account_name", None) or "?"
+        self.log(f"局号分叉：{from_who} 发的是 {sender_id}，"
+                 f"{to_who} 认的是 {receiver_id} —— 转发时改写头里的 "
+                 f"+4，否则收件人会整包丢掉（bug调查/8_2「别人一动不动」）")
 
     # -- 票据 ---------------------------------------------------------------
     def issue(self, game_conn, room_id, seat_index):
@@ -690,18 +760,37 @@ class RelayServer:
         对方接上中继了就走中继（原版路径），没接上就退回 `0x040f`
         —— 中继连接是异步建的，进房那几秒里必然有一个「有人还没接上」的窗口，
         那几秒里不能让同步断掉。
+
+        ★ 转发时**改写头里的局号**（`peer_game_id` 里写了整套依据）：那个
+        计数器是每台客户端自己 +1 的，同一个房间里多打一局就会分叉，
+        对不上的包被收件人整包丢掉 -> 「别人一动不动」。这里按**收件人
+        自己最近一次发上来的局号**重新盖章，两边就都认了。
+        校验和只覆盖 body，改这两个字节不用重算。
         """
         sent = 0
+        # 发送方每发一发都自报一次自己的局号（战斗中 ~8 Hz），拿最新的那个
+        # 当这条连接的「现在认哪个号」。
+        game_id = peer_game_id(udp_packet)
+        if game_id is not None:
+            try:
+                sender_game_conn.peer_game_id = game_id
+            except AttributeError:      # 测试里的假连接，不影响转发
+                pass
         for member in self._members_of(sender_game_conn):
             if member is sender_game_conn:
                 continue
+            packet = udp_packet
+            want = getattr(member, "peer_game_id", None)
+            if want is not None and game_id is not None and want != game_id:
+                packet = restamp_peer_game_id(udp_packet, want)
+                self._note_game_id_gap(sender_game_conn, member, game_id, want)
             relay = self.conn_for(member)
             if relay is not None:
-                sent += relay.send_data(udp_packet)
+                sent += relay.send_data(packet)
                 self.delivered_relay += 1
             elif self._fallback is not None:
                 try:
-                    self._fallback(member, udp_packet)
+                    self._fallback(member, packet)
                 except OSError:
                     continue
                 sent += 1
@@ -749,7 +838,8 @@ class RelayServer:
             pending = len(self._tickets)
         line = (f"中继：在线 {len(conns)} 条，待兑票据 {pending} 张，"
                 f"累计注册 {self.registered_total} 次；"
-                f"投递 中继 {self.delivered_relay} / 回退 {self.delivered_fallback}")
+                f"投递 中继 {self.delivered_relay} / 回退 {self.delivered_fallback}"
+                f"；改写局号 {self.restamped_total} 发")
         for conn in conns:
             rtt = conn.rtt_total.summary()
             if rtt is not None:

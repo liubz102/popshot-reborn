@@ -392,5 +392,77 @@ class LiveRelayTests(unittest.TestCase):
         self.assertEqual([b"\x07\x08"], alice.fallback_got)
 
 
+# ----------------------------------------------------------------------------
+# 局号（`UdpPacket` 头 +4）—— bug调查/8_2「其他人都不会动」
+# ----------------------------------------------------------------------------
+def udp_packet(sender=0, game_id=0, sequence=0, inner=0x4001,
+               body=b"\x11\x22\x33\x44\x55\x66\x77\x88"):
+    """一份 `UdpPacket`（§151 的 12 字节头 + body）。"""
+    return (struct.pack("<BbbB", 0xFF, sender, -1, 0)
+            + struct.pack("<HHHH", game_id, 0xBEEF, sequence, inner) + body)
+
+
+class PeerGameIdTests(unittest.TestCase):
+    """收包入口 `0x4078c4` 拿头里的局号和自己的 `[GameSession+0x3c]` 比，
+    **不等就整包丢掉**，而那个计数器纯客户端本地、服务端设不了。
+    同一个房间里多打一局就会分叉（线上实测：老玩家 3、新进来的 1），
+    于是双向同步全被丢，症状就是「别人一动不动」。转发时按收件人自己
+    最近自报的号重新盖章即可 —— 校验和只覆盖 body，改这两字节不用重算。
+    """
+
+    def setUp(self):
+        self.rooms = {}
+        self.server = RelayServer(
+            members_of=lambda conn: self.rooms.get(conn, []),
+            fallback=lambda conn, packet: conn.fallback_got.append(packet),
+            logger=lambda msg: self.logged.append(msg))
+        self.logged = []
+        self.alice, self.bob = FakeGameConn("alice"), FakeGameConn("bob")
+        self.rooms = {self.alice: [self.bob], self.bob: [self.alice]}
+
+    def test_the_receiver_gets_the_packet_stamped_with_its_own_game_id(self):
+        # bob 先自报一次「我认 1」，alice 再发一发「我是 3」。
+        self.server.deliver(self.bob, udp_packet(sender=1, game_id=1))
+        self.alice.fallback_got.clear()
+        self.server.deliver(self.alice, udp_packet(sender=0, game_id=3))
+        got, = self.bob.fallback_got
+        self.assertEqual(1, relayserver.peer_game_id(got))
+        # 除了那两个字节，其余**逐字节相同** —— 校验和 / 序列号 / body 都没动
+        original = udp_packet(sender=0, game_id=3)
+        self.assertEqual(original[:4] + b"\x01\x00" + original[6:], got)
+
+    def test_matching_game_ids_are_forwarded_untouched(self):
+        self.server.deliver(self.bob, udp_packet(sender=1, game_id=7))
+        self.alice.fallback_got.clear()
+        packet = udp_packet(sender=0, game_id=7)
+        self.server.deliver(self.alice, packet)
+        self.assertEqual([packet], self.bob.fallback_got)
+        self.assertEqual(0, self.server.restamped_total)
+
+    def test_a_receiver_that_never_spoke_gets_the_packet_verbatim(self):
+        # bob 一发都没发过 -> 不知道他认哪个号 -> 只能原样转（尽力而为）
+        packet = udp_packet(sender=0, game_id=3)
+        self.server.deliver(self.alice, packet)
+        self.assertEqual([packet], self.bob.fallback_got)
+
+    def test_the_gap_is_logged_once_not_once_per_packet(self):
+        self.server.deliver(self.bob, udp_packet(sender=1, game_id=1))
+        for seq in range(50):
+            self.server.deliver(self.alice,
+                                udp_packet(sender=0, game_id=3, sequence=seq))
+        gaps = [line for line in self.logged if "局号分叉" in line]
+        self.assertEqual(1, len(gaps))
+        self.assertEqual(50, self.server.restamped_total)
+
+    def test_a_payload_that_is_not_a_udp_packet_is_never_rewritten(self):
+        # 太短、或者魔数不对 —— 两个都原样返回，绝不抛（铁律 1）
+        for junk in (b"", b"\xff\x00\x01", bytes(20)):
+            self.assertIsNone(relayserver.peer_game_id(junk))
+            self.assertEqual(bytes(junk),
+                             relayserver.restamp_peer_game_id(junk, 5))
+        packet = udp_packet(game_id=2)
+        self.assertEqual(packet, relayserver.restamp_peer_game_id(packet, None))
+
+
 if __name__ == "__main__":
     unittest.main()

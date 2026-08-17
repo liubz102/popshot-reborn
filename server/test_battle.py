@@ -294,6 +294,30 @@ class DeathBroadcastTests(BattleRoom):
             self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.bob),
                              f"第 {reported + 1} 次死亡没广播")
 
+    def test_someone_elses_report_of_my_death_is_ignored(self):
+        # ★★ bug调查/8「人还活着却进了观战模式」：每台机器各自模拟全场伤害，
+        #    射手那台算「炸死了他」、受害者那台算「躲过去了」的分歧是必然的。
+        #    照单广播就是让客户端对活人执行 Die()。谁死没死只有本人说了算。
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO,
+                                       hp_zero_payload(seat=1, arg=0, deaths=0))
+        self.assertEqual([], opcodes(self.alice))
+        self.assertEqual([], opcodes(self.bob))
+        self.assertEqual([0] * gameserver.ROOM_SEAT_COUNT, self.quest.deaths)
+
+    def test_my_own_report_of_my_death_still_broadcasts(self):
+        gameserver.Conn.on_game_packet(self.bob, OP_REPORT_HP_ZERO,
+                                       hp_zero_payload(seat=1, arg=0, deaths=0))
+        self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.alice))
+        self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.bob))
+
+    def test_monster_reports_are_not_gated_by_seat(self):
+        # 怪由控制者那台模拟，谁都可能替它报 —— 不能套「只认本人」那道门，
+        # 去重仍然归 RoomQuest.record_death 管。
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=0x0010C8FB, seat=0xFF, deaths=0))
+        self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.alice))
+
     def test_a_map_change_forgets_the_dedup_table(self):
         # 换图会把六个座位的角色和场景物件全部卸掉重建（0x47900a），
         # 旧句柄作废 —— 不清的话新图里同号的东西会被当成「已经报过了」。
@@ -306,10 +330,24 @@ class DeathBroadcastTests(BattleRoom):
 
     def test_the_death_count_is_still_the_reported_value_plus_one(self):
         # V0.1 §109 的契约不许变：HUD 心形 = 最大生命 - 这一格。
-        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO,
+        # ★ bug调查/8 起下发值取自服务端权威计数，但正常路径上两者恒等 ——
+        #   `[char+0x600]` 只由我们的广播写，所以「先死一次，再报 1」正是
+        #   客户端会做的事，下发的就该是 2。上报方必须是本人（座位 1 = bob）。
+        gameserver.Conn.on_game_packet(self.bob, OP_REPORT_HP_ZERO,
+                                       hp_zero_payload(seat=1, deaths=0))
+        gameserver.Conn.on_game_packet(self.bob, OP_REPORT_HP_ZERO,
                                        hp_zero_payload(seat=1, deaths=1))
-        body = bodies(self.bob, OP_BROADCAST_DEATH)[0]
+        body = bodies(self.bob, OP_BROADCAST_DEATH)[1]
         self.assertEqual(2, struct.unpack_from("<i", body, 6)[0])
+
+    def test_a_bogus_report_cannot_push_the_death_count_up(self):
+        # ★ bug调查/8：客户端报的次数比服务端已经广播的多，只可能是句柄撞号 /
+        #   跨对象残留。跟着跳会让 HUD 心形一次扣好几颗，所以以我们的为准。
+        gameserver.Conn.on_game_packet(self.bob, OP_REPORT_HP_ZERO,
+                                       hp_zero_payload(seat=1, deaths=7))
+        body = bodies(self.bob, OP_BROADCAST_DEATH)[0]
+        self.assertEqual(1, struct.unpack_from("<i", body, 6)[0])
+        self.assertEqual(1, self.quest.deaths[1])
 
     def test_a_respawn_reaches_everyone(self):
         # 不广播的话别人屏幕上你就一直躺着（读侧 0x4931c2 按座位取角色）。
@@ -319,6 +357,158 @@ class DeathBroadcastTests(BattleRoom):
         self.assertEqual([OP_RESPAWN_CHARACTER], opcodes(self.bob))
         self.assertEqual(bodies(self.alice, OP_RESPAWN_CHARACTER),
                          bodies(self.bob, OP_RESPAWN_CHARACTER))
+
+
+class RespawnWatchdogTests(BattleRoom):
+    """★ bug调查/8「人死了不复活」：客户端那条「死后 5 秒自己发 `0x0413`」的链
+    有时候断掉（线上一天 15 次，全在 3 人以上的局），受害者从此躺在地上到本局
+    结束。客户端只是在等一发 `0x0419`，而 `0x0419` 由服务端说了算 —— 所以
+    不管它卡在哪一道守卫上，服务端到点补一发就能把人拉起来。"""
+
+    session_type = 1
+    arguments = (0, 3, 0)      # 个人战 / 夺分（没有命数上限）
+
+    def die(self, conn, seat, deaths=0, x=1500.0, y=820.0):
+        gameserver.Conn.on_game_packet(
+            conn, OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=seat * 100000 + 100001, seat=seat,
+                            arg=0xFF, deaths=deaths, x=x, y=y))
+
+    def later(self, conn=None, extra=1.0):
+        """把时钟拨到看门狗到点之后，跑一次心跳。"""
+        conn = conn or self.alice
+        return gameserver.Conn.check_respawn_watchdog(
+            conn, now=gameserver.time.monotonic()
+            + gameserver.RESPAWN_WATCHDOG_S + extra)
+
+    def test_a_client_that_never_asks_gets_respawned_anyway(self):
+        self.die(self.bob, 1)
+        self.clear()
+        self.assertEqual(1, self.later())
+        for conn in (self.alice, self.bob):
+            self.assertEqual([OP_RESPAWN_CHARACTER], opcodes(conn),
+                             "看门狗补的 0x0419 必须全房间都收到")
+        body = bodies(self.bob, OP_RESPAWN_CHARACTER)[0]
+        self.assertEqual(1, struct.unpack_from("<i", body, 0)[0], "座位号")
+
+    def test_a_normal_respawn_disarms_the_watchdog(self):
+        self.die(self.bob, 1)
+        gameserver.Conn.on_game_packet(self.bob, OP_REQ_RESPAWN,
+                                       respawn_payload(character_id=1))
+        self.clear()
+        self.assertEqual(0, self.later())
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_the_watchdog_waits_for_the_client_first(self):
+        # 客户端写死 5 秒，看门狗必须明显晚于它，不然会抢在正常重生前面。
+        self.die(self.bob, 1)
+        self.clear()
+        self.assertEqual(0, gameserver.Conn.check_respawn_watchdog(
+            self.alice, now=gameserver.time.monotonic() + 5.5))
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_it_reuses_the_spawn_point_the_client_picked_last_time(self):
+        # 坐标只有客户端知道（`0x4fe70e` 选的 `[char+0x2b0]`）。它自己报过
+        # 一次，服务端就记住了 —— 补包时照着发，不会把人扔到地图边缘。
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_REQ_RESPAWN,
+            respawn_payload(character_id=1, x=777, y=888, spawn_index=3))
+        self.die(self.bob, 1, deaths=1)
+        self.clear()
+        self.later()
+        body = bodies(self.bob, OP_RESPAWN_CHARACTER)[0]
+        self.assertEqual((1, 777, 888, 3), struct.unpack_from("<4i", body, 0))
+
+    def test_it_borrows_someone_elses_spawn_point(self):
+        # 重生点表是整张图共用的，借队友用过的那个一样落在地图内。
+        gameserver.Conn.on_game_packet(
+            self.alice, OP_REQ_RESPAWN,
+            respawn_payload(character_id=0, x=123, y=456, spawn_index=2))
+        self.die(self.bob, 1)
+        self.clear()
+        self.later()
+        body = bodies(self.bob, OP_RESPAWN_CHARACTER)[0]
+        self.assertEqual((1, 123, 456, 2), struct.unpack_from("<4i", body, 0))
+
+    def test_it_falls_back_to_where_he_died(self):
+        # 一个重生点都没见过（本局第一次死）：原地站起来不是原版行为，
+        # 但比一直躺着强，而且那个坐标一定在地图内 —— 他刚站在那儿。
+        self.die(self.bob, 1, x=1500.5, y=820.25)
+        self.clear()
+        self.later()
+        body = bodies(self.bob, OP_RESPAWN_CHARACTER)[0]
+        self.assertEqual((1, 1500, 820, 0), struct.unpack_from("<4i", body, 0))
+
+    def test_a_map_change_forgets_the_pending_watchdog(self):
+        # 换图会把角色对象全部卸掉重建，旧闩和旧重生点都作废。
+        self.die(self.bob, 1)
+        self.quest.begin_map_change("Quest03_2")
+        self.clear()
+        self.assertEqual(0, self.later())
+
+    def test_a_settled_round_does_not_respawn_anyone(self):
+        self.die(self.bob, 1)
+        self.quest.settled = True
+        self.clear()
+        self.assertEqual(0, self.later())
+
+    def test_someone_who_left_is_not_respawned(self):
+        self.die(self.bob, 1)
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.clear()
+        self.assertEqual(0, self.later())
+
+    def test_the_watchdog_can_be_switched_off(self):
+        # `--respawn-watchdog 0`：留取证窗口用（bug调查/8）——兜底一开，卡住的人
+        # 8 秒就被捞起来了，来不及在他那台跑 probe-death.bat。
+        self.bob.args.respawn_watchdog = 0
+        try:
+            self.die(self.bob, 1)
+            self.clear()
+            self.assertEqual(0, self.later())
+            self.assertEqual([], opcodes(self.bob))
+        finally:
+            self.bob.args.respawn_watchdog = None
+
+    def test_the_battle_heartbeat_drives_the_watchdog(self):
+        # ★ 看门狗挂在 `_relay_battle_tick` 上（同步数据战斗中恒定 ~8 Hz，
+        #   两条通道都会走到它）。这条钉的就是那根线，别哪天被拆了没人发现。
+        self.bob.args.respawn_watchdog = 0.01
+        try:
+            self.die(self.bob, 1)
+            self.clear()
+            gameserver.time.sleep(0.05)   # 让那 10 毫秒的闩到点
+            gameserver.Conn.on_game_packet(self.alice, OP_PEER_DATA_UP,
+                                           b"\xff\x00\xff\x00" + b"\x00" * 8)
+        finally:
+            self.bob.args.respawn_watchdog = None
+        self.assertIn(OP_RESPAWN_CHARACTER, opcodes(self.bob))
+
+
+class SurvivalRespawnWatchdogTests(RespawnWatchdogTests):
+    """生存模式：三条命用完就该躺着（§204），看门狗不许把人捞回来。"""
+
+    arguments = (0, 0, 0)      # 个人战 / 生存
+
+    def test_the_last_life_is_still_the_last_life(self):
+        # 3 人以上的个人战里，一个人命用完了这局还在打（用户报的正是那种局）。
+        # 那种时候躺着是**原版规则**，看门狗不许把他捞回来。
+        # 这里两个人的局第三条命一没就判负结算了，所以把结算标志按回去，
+        # 单独把「剩余生命」这一道门露出来。
+        for deaths in range(gameserver.PVP_SURVIVAL_LIVES):
+            self.die(self.bob, 1, deaths=deaths)
+        self.assertEqual(0, self.quest.remaining_lives(1))
+        self.quest.settled = False
+        self.quest.pvp_reason = None
+        self.clear()
+        self.assertEqual(0, self.later())
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_a_life_that_is_left_still_gets_the_watchdog(self):
+        self.die(self.bob, 1, deaths=0)
+        self.assertEqual(2, self.quest.remaining_lives(1))
+        self.clear()
+        self.assertEqual(1, self.later())
 
 
 # ----------------------------------------------------------------------------
@@ -1213,9 +1403,12 @@ class PvpFinishTests(BattleRoom):
 
         `0x0408` 里的「凶手」字段就是开火者的座位号（`[char+0x158]`，
         由 `0x4fedee` 写），服务端的对战计分靠它。
+
+        ★ 发这一包的必须是**受害者本人**（bug调查/8）：玩家的死亡只认本人
+        上报，凶手那一格也随之改由受害者本机提供 —— 计分反而更准了。
         """
         gameserver.Conn.on_game_packet(
-            self.alice, OP_REPORT_HP_ZERO,
+            (self.alice, self.bob)[victim_seat], OP_REPORT_HP_ZERO,
             hp_zero_payload(handle=victim_seat * 100000 + 100001,
                             seat=victim_seat, arg=killer_seat, deaths=deaths))
 
@@ -1284,6 +1477,30 @@ class PvpFinishTests(BattleRoom):
         self.assertEqual([0, 1],
                          sorted(end_game_seat(b)
                                 for b in bodies(self.alice, OP_END_GAME)))
+
+    def test_free_for_all_never_ends_on_teams(self):
+        """★ 个人战判「只剩一边」**只看在座人数**，不看队伍号。
+
+        客户端 `0x55c594` 开头就是 `0x409df1(描述符) == 1` 不成立直接跳到
+        非组队分支，一格队伍号都不读。个人战现在人人发 0（越界修复，
+        见 `lobby.TEAM_LAYOUT_*`），要是还按 `sides` 判就会一开局判结束。
+        """
+        quest = gameserver.RoomQuest()
+        seats = [0, 1, 2]
+        teams = {0: 0, 1: 0, 2: 0}          # 个人战：人人「没分队」
+        self.assertIsNone(quest.pvp_finished(seats, teams, 99,
+                                             team_mode=False))
+        # 掉到一个人才算完
+        self.assertEqual("只剩一边了",
+                         quest.pvp_finished([1], teams, 99, team_mode=False))
+
+    def test_team_mode_still_ends_when_one_side_is_left(self):
+        quest = gameserver.RoomQuest()
+        self.assertEqual(
+            "只剩一边了",
+            quest.pvp_finished([0, 2], {0: 1, 2: 1}, 99, team_mode=True))
+        self.assertIsNone(
+            quest.pvp_finished([0, 1], {0: 1, 1: 2}, 99, team_mode=True))
 
     def test_score_limits_match_the_client(self):
         # `0x55be71`：个人战看人数，组队战看「人数 // 2」；表外一律 5。
@@ -1618,11 +1835,31 @@ class RoomQuestTests(unittest.TestCase):
             now=quest.started_at))
 
     def test_survival_uses_the_death_count_that_was_broadcast(self):
+        # ★ bug调查/8：下发值 = 服务端权威计数，所以要真死三次才没命。
+        #   （以前直接信客户端报的「之前死过几次」，一发就能把命清零。）
         quest = RoomQuest()
-        deaths, first = quest.record_death(100001, 0, 2)
-        self.assertTrue(first)
-        self.assertEqual(3, deaths)
+        for expected in (1, 2, 3):
+            deaths, first = quest.record_death(100001, 0, expected - 1)
+            self.assertTrue(first)
+            self.assertEqual(expected, deaths)
         self.assertEqual(0, quest.remaining_lives(0))
+
+    def test_a_monster_reported_twice_with_different_counts_is_eaten(self):
+        # ★ bug调查/8 实测：同一只怪 76 毫秒内被两台机器报了 count=0 和 count=1
+        #   （句柄按控制者座位分段复用，`[obj+0x600]` 跨对象残留就差 1），
+        #   `(句柄, 次数)` 那把键当场失效 —— 时间窗才拦得住。
+        quest = RoomQuest()
+        self.assertEqual((1, True), quest.record_death(0x201, 0xFF, 0, now=100.0))
+        self.assertEqual((1, False), quest.record_death(0x201, 0xFF, 1, now=100.076))
+        # 窗过了才算真的又死一次。
+        self.assertEqual((2, True), quest.record_death(0x201, 0xFF, 1, now=110.0))
+
+    def test_the_dedup_window_does_not_apply_to_players(self):
+        # 玩家只有本人会上报，一次死亡天然只有一发；给玩家也加窗只会平白
+        # 吃掉真死亡（服务端补重生之后 3 秒内又死是完全可能的）。
+        quest = RoomQuest()
+        self.assertEqual((1, True), quest.record_death(100001, 0, 0, now=100.0))
+        self.assertEqual((2, True), quest.record_death(100001, 0, 1, now=100.5))
 
     def test_claim_item_is_first_come_first_served(self):
         quest = RoomQuest()
