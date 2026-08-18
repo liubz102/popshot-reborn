@@ -34,8 +34,18 @@ trap {
     exit 1
 }
 
-$Root       = Split-Path -Parent $PSScriptRoot
-$Python     = Join-Path $Root 'runtime\python\python.exe'
+# ★ 不用 $PSScriptRoot：它在 PowerShell 2.0（Win7 SP1 出厂自带）的**脚本**里
+#   是空的，`Split-Path -Parent ''` 会直接报错。改用 $MyInvocation 求本脚本
+#   所在目录 —— 这一句必须自己写死，不能调垫片里的函数（垫片还没点源进来）。
+$ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Definition
+. (Join-Path $ScriptDir 'wincompat.ps1')
+
+$Root       = Split-Path -Parent $ScriptDir
+# Win10 及以上用 runtime\（3.14），更老的系统用 runtime-win7\（3.8.10）——
+# 3.14 在 Win7 上会弹模态框卡死，只能提前按系统版本选，不能「跑跑试试」。
+$PyChoice   = Select-PythonRuntime -Modern (Join-Path $Root 'runtime\python\python.exe') `
+                                   -Legacy (Join-Path $Root 'runtime-win7\python\python.exe')
+$Python     = $PyChoice.Path
 $LogDir     = Join-Path $Root 'logs'
 $ModeFile   = Join-Path $LogDir '.server_mode'
 $ConfigPath = Join-Path $Root 'server.config'
@@ -46,18 +56,17 @@ $RelayAuth  = 47621     # 联机模式：客户端 -> 中继 -> 远端 47611
 $RelayGame  = 27809     # 联机模式：客户端 -> 中继 -> 远端 27799
 $PeerRelay  = 27798     # 原版 TCP 中继（服务端；地址由 0x0210 下发，D078/D079）
 $RelayPeer  = 27808     # 联机模式：客户端 -> 中继 -> 远端 27798
-$Mode       = if ($DebugLog) { 'debug' } else { 'normal' }
+# ★ `$x = if (...) {...} else {...}` 换成显式赋值：老 PowerShell 上这种
+#   「把语句当表达式赋值」的写法不保险，一行的事，不冒这个险。
+$Mode       = 'normal'
+if ($DebugLog) { $Mode = 'debug' }
 
 function Say([string]$msg, [string]$color = 'Gray') {
     Write-Host $msg -ForegroundColor $color
 }
 
-# 返回监听指定端口的进程 id（没有则返回 $null）。
-function Get-ListenerPid([int]$port) {
-    $c = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
-    if ($c) { return ($c | Select-Object -ExpandProperty OwningProcess -Unique) }
-    return $null
-}
+# `Get-ListenerPid`（端口 -> 占用它的进程 id）由 wincompat.ps1 提供：
+# 新系统走 Get-NetTCPConnection，Win7 这类没有 NetTCPIP 模块的走 netstat。
 
 function Stop-ListenerOn([int[]]$ports) {
     # ★ 只停「占着这些端口的进程」。绝不 Get-Process python | Stop-Process ——
@@ -70,7 +79,12 @@ function Stop-ListenerOn([int[]]$ports) {
     foreach ($id in ($ids | Select-Object -Unique)) {
         try { Stop-Process -Id $id -Force -ErrorAction Stop } catch {}
     }
-    if ($ids) { Start-Sleep -Milliseconds 700 }
+    if ($ids) {
+        Start-Sleep -Milliseconds 700
+        # netstat 那条路会缓存快照，杀完必须让它作废，否则下一次查询
+        # 还看得见刚被杀掉的进程。
+        Reset-ListenerCache
+    }
 }
 
 # 读 server.config。解析规则和 server\config.py 保持一致：
@@ -110,12 +124,15 @@ function Read-ServerConfig([string]$path) {
 }
 
 function Get-TextSha256([string]$text) {
-    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $sha = New-Object System.Security.Cryptography.SHA256Managed
     try {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
         return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
     } finally {
-        $sha.Dispose()
+        # ★ 用 Clear() 不用 Dispose()：.NET 3.5（PowerShell 2.0 的运行时）里
+        #   HashAlgorithm.Dispose 是**显式接口实现**，PowerShell 调不到它，
+        #   会在 finally 里抛「找不到 Dispose 方法」。Clear() 各版本都是 public。
+        $sha.Clear()
     }
 }
 
@@ -125,6 +142,15 @@ if ($DebugLog) {
     Say '    调试模式：客户端和服务端都会逐包 dump（日志 4 MB 起）。' 'Yellow'
     Say '    速度和 start.bat 差不多，但关键行会淹在 hexdump 里 —— 平时玩用 start.bat。' 'Yellow'
 }
+
+# 老系统（Win7 这类）走的是兼容路径，说一声，免得用户以为哪里不对。
+$compatNote = Get-CompatBanner
+if ($compatNote) { Say $compatNote 'Yellow' }
+# 选了哪份 Python（老系统上会改用 runtime-win7 的 3.8）。
+$pyColor = 'Yellow'
+if (-not $PyChoice.IsLegacy) { $pyColor = 'Red' }   # 该用老运行时却没带 = 红字警告
+foreach ($line in $PyChoice.Notes) { Say $line $pyColor }
+
 Say ''
 
 # --- 1. 环境自检 -----------------------------------------------------------
@@ -177,8 +203,7 @@ if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out
 $authPid = Get-ListenerPid $AuthPort
 $gamePid = Get-ListenerPid $GamePort
 $running = ($authPid -and $gamePid -and $authPid -eq $gamePid)
-$lastMode = ''
-if (Test-Path $ModeFile) { $lastMode = (Get-Content $ModeFile -Raw).Trim() }
+$lastMode = (Read-TextFileRaw $ModeFile).Trim()
 
 if ($running -and $lastMode -eq $Mode) {
     Say "[服务端] 已在运行，跳过启动（pid=$authPid，模式=$Mode）" 'Green'
@@ -210,7 +235,7 @@ if ($running -and $lastMode -eq $Mode) {
     }
     if (-not $ok) {
         Say '[启动失败] 服务端端口没起来，下面是 logs\server.err 的末尾：' 'Red'
-        Get-Content (Join-Path $LogDir 'server.err') -Tail 20 -ErrorAction SilentlyContinue
+        Get-FileTailLines (Join-Path $LogDir 'server.err') 20
         exit 1
     }
     Set-Content -Path $ModeFile -Value $Mode -Encoding utf8
@@ -223,7 +248,8 @@ $cfg      = Read-ServerConfig $ConfigPath
 $remote   = $cfg['server_address']
 $remoteReg = $cfg['server_register_port']
 $localReg  = $cfg['local_register_port']
-$remoteUrlHost = if ($remote -like '*:*') { "[$remote]" } else { $remote }
+$remoteUrlHost = $remote
+if ($remote -like '*:*') { $remoteUrlHost = "[$remote]" }   # IPv6 拼 URL 要加方括号
 
 # 目标或任一代理字段变了都要重起。签名里会算账号密码，但磁盘只落 SHA-256，
 # 不把第二份明文凭据写进 logs\.relay_target。
@@ -237,8 +263,7 @@ $relayConfigText = @(
 ) -join "`n"
 $relaySignature = Get-TextSha256 $relayConfigText
 $relayStamp = Join-Path $LogDir '.relay_target'
-$lastSignature = ''
-if (Test-Path $relayStamp) { $lastSignature = (Get-Content $relayStamp -Raw).Trim() }
+$lastSignature = (Read-TextFileRaw $relayStamp).Trim()
 $relayPid = Get-ListenerPid $RelayAuth
 if ($relayPid -and $lastSignature -eq $relaySignature) {
     Say "[中继]   已在运行（pid=$relayPid，目标 $remoteUrlHost）" 'Green'
@@ -262,7 +287,7 @@ if ($relayPid -and $lastSignature -eq $relaySignature) {
         Say "[中继]   已启动（选「远程服务器」时经 127.0.0.1:$RelayAuth / $RelayGame / $RelayPeer 转发到 $remoteUrlHost）" 'Green'
     } else {
         Say '!! 中继没起来，「远程服务器」会连不上；「本机服务器」不受影响。看 logs\relay.err' 'Red'
-        Get-Content (Join-Path $LogDir 'relay.err') -Tail 20 -ErrorAction SilentlyContinue
+        Get-FileTailLines (Join-Path $LogDir 'relay.err') 20
     }
 }
 
@@ -284,7 +309,9 @@ $env:POPSHOT_PEER_RELAY_PORT   = "$PeerRelay"
 # 而那个现象非常像「注入被检测」—— 骗过我们一次了（V0.1 §9）。
 $old = Get-Process BigShot -ErrorAction SilentlyContinue
 if ($old) {
-    Say "[客户端] 先清掉残留实例 pid=$($old.Id -join ',')" 'Yellow'
+    # ★ 别写 `$old.Id -join ','`：数组的成员枚举是 PowerShell 3.0 才有的，
+    #   2.0 上 `$数组.Id` 是 $null，日志里 pid 会变成空。
+    Say "[客户端] 先清掉残留实例 pid=$(Get-ProcessIdListText $old)" 'Yellow'
     $old | Stop-Process -Force
     Start-Sleep -Milliseconds 500
 }

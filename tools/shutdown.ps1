@@ -10,7 +10,13 @@
 param()
 
 $ErrorActionPreference = 'Stop'
-$Root     = Split-Path -Parent $PSScriptRoot
+
+# ★ 不用 $PSScriptRoot（PowerShell 2.0 的脚本里是空的，Win7 SP1 出厂就是 2.0）。
+#   点源兼容垫片，端口查询等等由它按系统能力自动挑实现。
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+. (Join-Path $ScriptDir 'wincompat.ps1')
+
+$Root     = Split-Path -Parent $ScriptDir
 $LogDir   = Join-Path $Root 'logs'
 $ModeFile = Join-Path $LogDir '.server_mode'
 $RelayStamp = Join-Path $LogDir '.relay_target'
@@ -39,6 +45,8 @@ function Say([string]$msg, [string]$color = 'Gray') {
 
 Say ''
 Say '=== 炮炮火枪手 —— 关闭 ===' 'Cyan'
+$compatNote = Get-CompatBanner
+if ($compatNote) { Say $compatNote 'Yellow' }
 Say ''
 
 $stopped = 0
@@ -47,7 +55,8 @@ $stopped = 0
 foreach ($name in @('BigShot', 'bsloader')) {
     $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
     if ($procs) {
-        Say "[客户端] 停止 $name pid=$($procs.Id -join ',')" 'Yellow'
+        # ★ 别写 `$procs.Id -join ','`（数组成员枚举是 PowerShell 3.0 才有的）。
+        Say "[客户端] 停止 $name pid=$(Get-ProcessIdListText $procs)" 'Yellow'
         $procs | Stop-Process -Force -ErrorAction SilentlyContinue
         $stopped += @($procs).Count
     }
@@ -58,16 +67,19 @@ foreach ($name in @('BigShot', 'bsloader')) {
 #   27799 和 27800，边遍历边杀的话第二个端口会撞上「找不到进程」的假错误。
 $byPid = @{}
 foreach ($port in $Ports) {
-    $conn = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
-    if (-not $conn) { continue }
-    foreach ($id in ($conn | Select-Object -ExpandProperty OwningProcess -Unique)) {
+    # Get-ListenerPid 来自 wincompat.ps1：新系统走 Get-NetTCPConnection，
+    # Win7 这类没有 NetTCPIP 模块的走 netstat，语义一样。
+    $owners = Get-ListenerPid $port
+    if (-not $owners) { continue }
+    foreach ($id in @($owners)) {
         if (-not $byPid.ContainsKey($id)) { $byPid[$id] = @() }
         $byPid[$id] += $port
     }
 }
 foreach ($id in $byPid.Keys) {
     $p = Get-Process -Id $id -ErrorAction SilentlyContinue
-    $who = if ($p) { $p.ProcessName } else { '?' }
+    $who = '?'
+    if ($p) { $who = $p.ProcessName }
     Say "[服务端] 停止 pid=$id ($who)，占用端口 $($byPid[$id] -join ', ')" 'Yellow'
     try { Stop-Process -Id $id -Force -ErrorAction Stop; $stopped++ } catch {
         Say "         停不掉 pid=$id : $($_.Exception.Message)" 'Red'
@@ -80,11 +92,10 @@ foreach ($stamp in @($ModeFile, $RelayStamp)) {
 
 # --- 3. 复核 ----------------------------------------------------------------
 Start-Sleep -Milliseconds 500
+Reset-ListenerCache          # netstat 那条路有短缓存，复核前必须作废
 $left = @()
 foreach ($port in $Ports) {
-    if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) {
-        $left += $port
-    }
+    if (Get-ListenerPid $port) { $left += $port }
 }
 if (Get-Process BigShot -ErrorAction SilentlyContinue) { $left += 'BigShot.exe' }
 

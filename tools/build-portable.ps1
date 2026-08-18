@@ -119,13 +119,29 @@ try {
     }
 
     # --- 2. 运行时 / 注入件 / 探针 ------------------------------------------
-    Write-Host '  [2/6] runtime + hook\bin + tools'
+    Write-Host '  [2/6] runtime + runtime-win7 + hook\bin + tools'
     Copy-TreeFiltered -Source (Join-Path $Root 'runtime') -Target (Join-Path $OutputDirectory 'runtime')
+    # ★ Win7 兼容运行时（CPython 3.8.10 win32）。主力那份 3.14 官方只支持
+    #   Win10+，在 Win7 上会弹模态框卡死；`tools\wincompat.ps1` 按系统版本挑。
+    #   漏了它，Win7 玩家一键启动就变成「去装 Python」—— 见 runtime-win7\README.md。
+    Copy-TreeFiltered -Source (Join-Path $Root 'runtime-win7') -Target (Join-Path $OutputDirectory 'runtime-win7')
+    foreach ($must in @('python.exe', '_socket.pyd', 'ucrtbase.dll')) {
+        # ★ 除了 python.exe，还要点名查一个 .pyd 和 UCRT：
+        #   `.gitignore` 的 `*.py[cod]` 会吃掉 .pyd（靠 !/runtime-win7/python/*.pyd 放行），
+        #   哪天那条白名单被删掉，新 clone 出来的包会「有 python.exe 但 import 不了 socket」
+        #   —— 那种包发出去才发现，比在这里 throw 贵得多（§215）。
+        if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory "runtime-win7\python\$must") -PathType Leaf)) {
+            throw "runtime-win7\python\$must 没拷进去（Win7 那条路会瘸）"
+        }
+    }
     Copy-TreeFiltered -Source (Join-Path $Root 'hook\bin') -Target (Join-Path $OutputDirectory 'hook\bin')
     Copy-TreeFiltered -Source (Join-Path $Root 'readmeResource') -Target (Join-Path $OutputDirectory 'readmeResource')
-    # ★ 只带启停要用的三个：launch.ps1 / shutdown.ps1 / d3d9_probe.exe。
-    #   fakeclient.py、gs_ctl.py、各种 probe_*.py 都是开发工具，不进发布包。
-    foreach ($file in @('tools\launch.ps1', 'tools\shutdown.ps1')) {
+    # ★ 只带启停要用的四个：launch.ps1 / shutdown.ps1 / wincompat.ps1 /
+    #   d3d9_probe.exe。fakeclient.py、gs_ctl.py、各种 probe_*.py 都是开发
+    #   工具，不进发布包。
+    #   ★ wincompat.ps1 是前两个点源的兼容垫片（Win7 / PowerShell 2.0），
+    #     漏了它两个脚本都会在第一行就报「找不到文件」—— 别从这个列表里删。
+    foreach ($file in @('tools\launch.ps1', 'tools\shutdown.ps1', 'tools\wincompat.ps1')) {
         Copy-TextFile -Source (Join-Path $Root $file) -Target (Join-Path $OutputDirectory $file) -Kind 'ps1'
     }
     Copy-One (Join-Path $Root 'tools\d3d9_probe.exe') (Join-Path $OutputDirectory 'tools\d3d9_probe.exe')

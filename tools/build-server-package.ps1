@@ -230,6 +230,11 @@ try {
     }
     Copy-TextFile -Source (Join-Path $Template 'serverctl.ps1') `
                   -Target (Join-Path $OutputDirectory 'tools\serverctl.ps1') -Kind 'ps1'
+    # ★ serverctl.ps1 点源的兼容垫片（Win7 / PowerShell 2.0）。它不在
+    #   $Template 下，而是和客户端包共用 tools\wincompat.ps1 那一份。
+    #   漏了它 serverctl.ps1 会在开头就报「找不到文件」—— 别删这两行。
+    Copy-TextFile -Source (Join-Path $Root 'tools\wincompat.ps1') `
+                  -Target (Join-Path $OutputDirectory 'tools\wincompat.ps1') -Kind 'ps1'
     Copy-TextFile -Source (Join-Path $Template 'serverctl.sh') `
                   -Target (Join-Path $OutputDirectory 'tools\serverctl.sh') -Kind 'unix'
     Copy-TextFile -Source (Join-Path $Template 'server.config') `
@@ -248,6 +253,10 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory 'runtime-win\python\python.exe') -PathType Leaf)) {
         throw 'runtime-win\python\python.exe 没拷进去'
     }
+    # ★ **服务端包不带 `runtime-win7\`**（用户 2026-08-18 拍板，D133）：
+    #   Win7 兼容运行时只是为了让个别 Win7 玩家能**启动游戏**，
+    #   架服务端这件事不考虑老系统。少带 16 MB。
+    #   —— 想改主意的话，抄 `build-portable.ps1` 里那段 Copy + 三个文件的检查。
 
     # --- 4. Linux 运行时（可选）---------------------------------------------
     if ($linuxArchive) {

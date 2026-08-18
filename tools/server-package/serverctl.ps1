@@ -23,7 +23,21 @@ trap {
     exit 1
 }
 
-$Root    = Split-Path -Parent $PSScriptRoot
+# ★ 不用 $PSScriptRoot（PowerShell 2.0 的脚本里是空的，Win7 SP1 出厂就是 2.0）。
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+
+# 兼容垫片。包里它和本文件同在 tools\ 下；开发目录里本文件在
+# tools\server-package\ 下，往上一级找得到 —— 两边都能点源。
+$compat = Join-Path $ScriptDir 'wincompat.ps1'
+if (-not (Test-Path -LiteralPath $compat)) {
+    $compat = Join-Path (Split-Path -Parent $ScriptDir) 'wincompat.ps1'
+}
+. $compat
+
+$Root    = Split-Path -Parent $ScriptDir
+# ★ 服务端包**只有一份运行时**：`runtime-win\`（CPython 3.14）。
+#   客户端包里那份 Win7 兼容运行时（`runtime-win7\`，3.8.10）**故意不带** ——
+#   它是为了让个别 Win7 玩家能启动游戏，架服务端不考虑老系统（D133）。
 $Python  = Join-Path $Root 'runtime-win\python\python.exe'
 $AppPy   = Join-Path $Root 'server\app.py'
 $LogDir  = Join-Path $Root 'logs'
@@ -35,11 +49,8 @@ $RelayPort = 27798      # 原版 TCP 中继（战斗内同步走它）
 
 function Say([string]$msg, [string]$color = 'Gray') { Write-Host $msg -ForegroundColor $color }
 
-function Get-ListenerPid([int]$port) {
-    $c = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
-    if ($c) { return ($c | Select-Object -ExpandProperty OwningProcess -Unique) }
-    return $null
-}
+# `Get-ListenerPid`（端口 -> 占用它的进程 id）由 wincompat.ps1 提供：
+# 新系统走 Get-NetTCPConnection，Win7 这类没有 NetTCPIP 模块的走 netstat。
 
 # 注册页端口写在 server.config 里，解析规则和 server\config.py 一致。
 function Get-WebPort {
@@ -72,9 +83,9 @@ if ($Action -eq 'stop') {
     #   —— 这台机器上可能还有别人的 Python 在跑。
     $byPid = @{}
     foreach ($port in $Ports) {
-        $conn = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
-        if (-not $conn) { continue }
-        foreach ($id in ($conn | Select-Object -ExpandProperty OwningProcess -Unique)) {
+        $owners = Get-ListenerPid $port
+        if (-not $owners) { continue }
+        foreach ($id in @($owners)) {
             if (-not $byPid.ContainsKey($id)) { $byPid[$id] = @() }
             $byPid[$id] += $port
         }
@@ -90,6 +101,7 @@ if ($Action -eq 'stop') {
         }
     }
     Start-Sleep -Milliseconds 500
+    Reset-ListenerCache          # netstat 那条路有短缓存，复核前必须作废
     $left = @()
     foreach ($port in $Ports) {
         if (Get-ListenerPid $port) { $left += $port }
@@ -118,6 +130,18 @@ Say "=== 炮炮火枪手服务端 —— 启动（日志模式：$mode）===" 'C
 if ($DebugLog) {
     Say '    调试模式：逐包 hexdump + 每条连接一对抓包文件，日志按 MB 涨。' 'Yellow'
     Say '    排查完请换回 start.bat，别长期开着。' 'Yellow'
+}
+$compatNote = Get-CompatBanner
+if ($compatNote) { Say $compatNote 'Yellow' }
+# ★ 服务端包要求 Win10 及以上：`runtime-win\` 是 Python 3.14，官方只支持
+#   Win10+，在更老的系统上会弹「缺少 api-ms-win-core-path-l1-1-0.dll」的
+#   **模态框**把脚本卡死。先把话说清楚，别让人对着英文弹窗猜（§215）。
+if ((Get-WindowsBuildMajor) -lt 10) {
+    Say '!! 这台电脑的 Windows 版本低于 Windows 10 —— 服务端包不支持这么老的系统。' 'Red'
+    Say '   包内的 Python 3.14 只支持 Win10 及以上，接下来多半会弹' 'Red'
+    Say '   「缺少 api-ms-win-core-path-l1-1-0.dll」并卡住。' 'Red'
+    Say '   请换一台 Win10 及以上的机器架服务端（Linux 也行，用 start.sh）。' 'Red'
+    Say '   ★ 客户端那边不受影响：客户端包自带 Win7 运行时，Win7 玩家照样能进游戏。' 'Yellow'
 }
 Say ''
 
@@ -162,8 +186,8 @@ for ($i = 0; $i -lt 60; $i++) {
 }
 if (-not $ok) {
     Say '[启动失败] 端口没起全，下面是 logs\server.err 的末尾：' 'Red'
-    Get-Content (Join-Path $LogDir 'server.err') -Tail 20 -ErrorAction SilentlyContinue
-    Get-Content (Join-Path $LogDir 'server.out') -Tail 20 -ErrorAction SilentlyContinue
+    Get-FileTailLines (Join-Path $LogDir 'server.err') 20
+    Get-FileTailLines (Join-Path $LogDir 'server.out') 20
     exit 1
 }
 
@@ -177,12 +201,9 @@ Say "    $WebPort   用户注册页  ->  http://127.0.0.1:$WebPort/"
 Say ''
 
 # 把本机地址列出来：玩家要把它填进自己那份 server.config 的 server_address。
-$addrs = @()
-try {
-    $addrs = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' } |
-        Select-Object -ExpandProperty IPAddress -Unique)
-} catch {}
+# Get-LocalIPv4List 来自 wincompat.ps1：有 NetTCPIP 就走 Get-NetIPAddress，
+# Win7 这类没有的退回 .NET 2.0 就有的 DNS 查询。
+$addrs = @(Get-LocalIPv4List)
 if ($addrs.Count -gt 0) {
     Say '  玩家那边 server.config 里填这个地址（局域网）：' 'Cyan'
     foreach ($a in $addrs) { Say "    server_address = $a" }

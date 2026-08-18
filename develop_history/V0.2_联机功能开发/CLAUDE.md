@@ -87,6 +87,7 @@ develop_history/V0.1_基础单机功能开发/.claude/sessions/        ← 会�
 | `hook/` | MSVC x86 工程：`bshook.dll`（注入）+ `bsloader.exe`（启动器） |
 | `server/` | Python 服务端（**单机假服务器和云端服务端是同一套代码**） |
 | `runtime/python/` | 内置 CPython 3.14.3 x64 embeddable（目标机不需要装 Python） |
+| `runtime-win7/python/` | **Win7 兼容运行时** CPython 3.8.10 win32 + app-local UCRT。**只进客户端包**（让个别 Win7 玩家能启动游戏；服务端包不带，架服务端不考虑老系统），Win10 以下由 `launch.ps1` 自动启用（§215 / D133）。★ 改服务端代码后顺手 `runtime-win7\python\python.exe server\run_tests.py` 跑一遍，别把 3.8 兼容性弄丢 |
 | `runtime-linux/` | 服务端包发给 Linux 的那份 CPython 3.14.7，**故意不解压**（D088/D090）。打包时直接 copy，不联网 |
 | `logs/` | 抓包 / 调试日志 |
 | `dist/` | 打包产物（**客户端包 + 服务端包，两个**） |

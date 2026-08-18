@@ -523,6 +523,20 @@ function New-PackageTarGz {
 #  BUILD.txt
 # ---------------------------------------------------------------------------
 
+function Get-Win7RuntimeNote {
+    <# 客户端包里带没带 Win7 兼容运行时（CPython 3.8.10 win32）。
+
+       主力运行时是 3.14，官方只支持 Win10+；没有这一份，Win7 玩家一键启动
+       会卡在「缺少 api-ms-win-core-path-l1-1-0.dll」的模态框上（§215）。
+
+       ★ 只给**客户端包**用（调用方 `Write-BuildInfo` 已按 `$Kind` 过滤）：
+         服务端包故意不带这份运行时，架服务端不考虑老系统（D133）。 #>
+    param([Parameter(Mandatory = $true)][string]$PackageRoot)
+    $py = Join-Path $PackageRoot 'runtime-win7\python\python.exe'
+    if (Test-Path -LiteralPath $py) { return '已包含（CPython 3.8.10 win32，Win10 以下自动启用）' }
+    return '未包含（Windows 10 以下跑不起来）'
+}
+
 function Write-BuildInfo {
     <# 包里放一份「这是什么包、什么时候打的、代码哈希是多少」。
        测试的人把问题发回来时，第一句就能问「你那份 BUILD.txt 贴一下」。
@@ -542,6 +556,13 @@ function Write-BuildInfo {
         "打包机器    $env:COMPUTERNAME",
         "共用服务端代码 $(Get-ServerCodeHash $PackageRoot)"
     )
+    # ★ 只有**客户端包**写这一行：Win7 兼容运行时是为了让个别 Win7 玩家能启动
+    #   游戏，**服务端包故意不带**（架服务端不考虑老系统，D133）。服务端包也印
+    #   这一行的话，会让人以为服务端本该支持 Win7，白白引出一轮误会。
+    #   措辞要和 `wincompat.ps1` 里那句红字警告对齐 —— 玩家是照着它来核对的。
+    if ($Kind -like '*客户端*') {
+        $lines += "Win7 运行时  $(Get-Win7RuntimeNote $PackageRoot)"
+    }
     $lines += $ExtraLines
     $lines += @(
         '',

@@ -4517,3 +4517,114 @@ vf_c = 0x55db69: push 3 / pop eax / ret 4      ★ 恒等于 3，根本不读 +0
 ★ 这条**也解释了 §211 里那些「幽灵死亡」**的一部分：局号分叉之后，
 受害者根本收不到别人的位置更新，两边模拟的战况必然越走越远，
 「射手那台算炸死了、受害者那台算躲过去了」的分歧被放大到极致。
+
+## 214. ★★★★ Windows 7 上启动脚本直接报错 —— 四样 Win8 / PowerShell 3.0 才有的东西
+
+用户 2026-08-17 反馈：把客户端包发给一台 **Windows 7** 的电脑，`start.bat` 报错跑不起来。
+
+**Win7 SP1 出厂只带 PowerShell 2.0，也没有 NetTCPIP 模块**，而启停脚本里用了：
+
+| 用法 | 出现在 | 最低要求 | Win7 上的表现 |
+|---|---|---|---|
+| `Get-NetTCPConnection` | launch / shutdown / serverctl | Win8、Server 2012 | 「无法识别为 cmdlet」 |
+| `Get-NetIPAddress` | serverctl | 同上 | 同上 |
+| `$PSScriptRoot`（**脚本**里） | 三个都有 | PowerShell 3.0 | 为空 → `Split-Path -Parent ''` 报错，`$Root` 直接错 |
+| `Get-Content -Raw` / `-Tail` | launch / serverctl | PowerShell 3.0 | 参数不存在 |
+
+★ **最要命的一条**：`-ErrorAction SilentlyContinue` **压不住「命令找不到」**
+（那是 `CommandNotFoundException`，不是普通的非终止错误）。三个脚本开头都写着
+`$ErrorActionPreference = 'Stop'`，所以第一句 `Get-NetTCPConnection` 就把整个脚本
+终止掉了 —— 表现就是用户看到的「一按 start.bat 就报错退出」。
+
+顺带查出来的另外三处（不致命，但在 PowerShell 2.0 上行为不对）：
+
+- `$数组.属性` 的**成员枚举是 PowerShell 3.0 才有的**，2.0 上 `$procs.Id` 返回 `$null`
+  —— 日志里的 `pid=...` 会变成空。
+- `HashAlgorithm.Dispose()` 在 .NET 3.5（PowerShell 2.0 的运行时）里是**显式接口实现**，
+  PowerShell 调不到，会在 `finally` 里抛「找不到 Dispose 方法」。`Clear()` 各版本都是 public。
+- `.bat` 开头的 `chcp 65001` 在 Win7 的 cmd.exe 上本身就是已知雷（截断批处理文件），
+  而且 Win7 控制台没有 UTF-8 字体回退 —— 中文 Win7 保持出厂的 936 反而显示得好好的。
+
+### ★★ Python 3.14 在 Win7 上根本跑不起来 —— 已另配 3.8 运行时（§215）
+
+包内主力运行时 `runtime\python\` 是 **CPython 3.14.3**。Python 官方
+**从 3.9 起不再支持 Win7、从 3.13 起不再支持 Win8.1**，3.14 要求 Windows 10。
+在 Win7 上它一跑就弹「缺少 api-ms-win-core-path-l1-1-0.dll」，而且是**模态框**会把
+脚本卡住 —— 所以**不能「先跑跑试试」再回退**，只能提前按系统版本决定用哪份。
+
+→ 已解决，见 **§215**：随包再带一份 CPython 3.8.10，启动脚本自动挑。
+
+### 怎么在 Win10 上验 Win7 那条路
+
+`tools\wincompat.ps1` 认 `POPSHOT_FORCE_LEGACY=1`：设了就强行走老路
+（假装没有 NetTCPIP）。手上没有 Win7 机器时这是唯一能真跑一遍兼容分支的办法。
+本次三条链（`launch.ps1 -NoGame` / `shutdown.ps1` / `serverctl.ps1 -Action start|stop`）
+都在强制老路下实跑通过，端口 → pid 的结果和 `Get-NetTCPConnection` **逐个对住**。
+
+### netstat 那条路的两个坑（都已经踩过并绕开）
+
+1. **别按「状态」那一列的文字判监听** —— 那一列在部分语言版本里会被翻译。
+   改看「外部地址」是不是 `0.0.0.0:0` / `[::]:0`，这个判据不随语言变。
+2. **缓存 TTL 不能写死 200 ms** —— 本机实测 `netstat -a -n -o` 要 **191 ms**，
+   缓存刚存进去就快过期了，等端口的循环几乎每次查询都在重跑 netstat，
+   冷启动被拖成几十秒。现在 TTL 取 `max(200 ms, 上一次实测耗时)`，
+   且快照时刻按 netstat **跑完**算。改完冷启动 1.8 秒、关闭 1.3 秒。
+
+## 215. ★★★★ Win7 一键启动补完 —— 随包带一份 CPython 3.8.10，启动脚本按系统挑
+
+§214 修好了脚本本身，但 Win7 还卡在「包内 Python 3.14 不支持 Win10 以下」。
+本次把这条路补通了。
+
+### 运行时
+
+★ **只进客户端包。** 这份运行时的唯一目的是让**个别 Win7 玩家能一键启动游戏**
+（客户端要在本机跑假服务端和本地中继，都要 Python，没它连单机都玩不了）。
+**服务端包故意不带** —— 架服务端不考虑老系统（用户 2026-08-18 拍板，D133）；
+有人拿 Win7 当服务端主机时 `serverctl.ps1` 直接说「不支持，请换台机器」。
+
+`runtime-win7\python\` = **CPython 3.8.10 `embed-win32`**
+（**最后一个支持 Win7 的 Python**；官方 MD5 `659adf421e90fba0f56a9631f79e70fb`，
+下载后逐字节核对过。详见 `runtime-win7\README.md`）。
+
+- **为什么是 32 位**：不知道对方是 32 位还是 64 位 Win7，而 win32 的 Python
+  在两种机器上都能跑。服务端是纯 socket，用不着 64 位。
+- **★ 为什么还塞了 41 个 `api-ms-win-*.dll` + `ucrtbase.dll`**：python.org 的
+  embeddable 包**不含 Universal CRT**。Win10 的 UCRT 在系统里，Win7 要靠
+  **KB2999226**，而 Win7 早停更了 —— 没打这个补丁的机器上 `python.exe` 直接弹
+  模态框，「一键启动」当场变成「让玩家去找补丁」。按微软文档允许的
+  **app-local 部署**方式，把 Windows 10 SDK `Redist\ucrt\DLLs\x86\` 里那 41 个
+  DLL 和 `python.exe` 放同一目录，玩家什么都不用装。`vcruntime140.dll` 上游自带。
+
+### ★ 服务端代码本来就是 3.8 兼容的（这点事先没底，实测才敢说）
+
+- 全部 `server/*.py` 用 3.8.10 `compileall` **通过**；
+- **`run_tests.py` 的 797 项在 3.8.10 下全绿**（和 3.14 上同样是 797 OK）；
+- 真跑：用 3.8 起服务端 + 中继 → 注册页 HTTP 200 → `tools\fakeclient.py`
+  走真 TCP + 真认证 + 真票据，**建房 / 座位表 / 聊天广播 / 退房全通**。
+
+唯一需要留神的是 `str | None` 这种 PEP 604 注解（3.10+ 语法），它出现在
+`account_store.py` / `config.py` / `logcleanup.py`，但这三个文件都有
+`from __future__ import annotations`，注解是**惰性字符串**、运行时从不求值，
+所以 3.8 上没事。**以后往这三个文件之外的地方写 `X | Y` 注解，或者哪天有人
+调了 `typing.get_type_hints()`，Win7 那条路就会当场断** —— 这是本条的反悔条件。
+
+### 怎么挑
+
+`tools\wincompat.ps1` 的 `Select-PythonRuntime`：判据是 **kernel32.dll 的文件版本**
+（`Get-WindowsBuildMajor`，不受进程清单影响），`< 10` 就换 `runtime-win7\`。
+**绝不能靠「跑一下 3.14 看报不报错」来回退** —— 它的失败是模态框，会把脚本挂死。
+
+返回的是**哈希表** `@{Path; IsLegacy; Notes}`：PowerShell 的管道会拆数组，
+要一次带回三样东西只能用哈希表（和 §214 里 `Get-NetstatListenerMap` 同一个理由）。
+
+包里没带 `runtime-win7\` 却又该用它时，打红字让玩家去核对 `BUILD.txt` 的
+**「Win7 运行时」**那一行（`build-common.ps1` 的 `Get-Win7RuntimeNote` 生成，
+两边措辞是对齐的）。
+
+### ★ .gitignore 的坑（差点中招）
+
+仓库里有一条 `*.py[cod]`，**它会把 `.pyd` 一起吃掉**。`runtime\` 早就靠
+`!/runtime/python/*.pyd` 放行，新加的 `runtime-win7\` 一开始没有对应白名单
+—— 那样 clone 下来的包会「有 `python.exe` 但 `import socket` 就崩」，
+而且只有别人重新 clone 才暴露。已补 `!/runtime-win7/python/*.pyd`，
+并在两个打包脚本里点名检查 `python.exe` / `_socket.pyd` / `ucrtbase.dll` 三个文件。
