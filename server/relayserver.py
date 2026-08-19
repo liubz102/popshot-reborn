@@ -129,6 +129,37 @@ RELAY_SEND_DEADLINE_S = 2.0
 #: `gameserver.recover_peer_relay()` 拿这个判定要不要重发 `0x0211`+`0x0210`。
 STALL_AFTER_S = 20.0
 
+#: ★★ 「还没进过任何一局」的局号（§218）。客户端 `GameSession` 的构造
+#: （`0x4050f8`）和 `GameSession::Reset`（`0x4054fa`）的第一句都是
+#: `or dword [this+0x3c], 0xffffffff` —— 也就是 **-1**。
+#:
+#: 盖进 `UdpPacket` 头是 `0xFFFF`，而收包侧 `0x4078c4` 是
+#: `movzx eax, word [pkt+4]` / `cmp eax, [GameSession+0x3c]` —— 一个 u16
+#: 和 `0xFFFFFFFF` 比**永远不等** ⇒ 这个状态下客户端一发同步包都不收。
+#: 下一次换代 `inc` 之后才是 0。
+EPOCH_UNSET = -1
+
+#: 每条连接留多少条「局号值 -> 代号」的历史（§218 / D137）。
+#:
+#: 换代那一刹那客户端手里还有用**旧值**发出的包（现场实测最多晚 426 ms），
+#: 留着历史才能把它们正确地归到**上一代**，而不是当成「不认识的值」。
+#: 开局前的强制对齐（D138）一次会连推好几格，所以不能只留一格。
+EPOCH_HISTORY = 16
+
+#: 代号发号器。代号本身没有语义，只用来判断两条连接**是不是处在同一代**
+#: （同一次 `ResetQueues` 之后）。全进程自增而不是每个房间从 0 数，
+#: 是为了让「换了房间」也不会和别人的号撞上。
+_generation_lock = threading.Lock()
+_generation_seq = 0
+
+
+def next_generation():
+    """发一个全进程唯一的「代号」。"""
+    global _generation_seq
+    with _generation_lock:
+        _generation_seq += 1
+        return _generation_seq
+
 
 def peer_game_id(udp_packet):
     """读 `UdpPacket` 头 `+4` 的「会话/局号」。不像一个 `UdpPacket` 就返回 None。
@@ -137,12 +168,16 @@ def peer_game_id(udp_packet):
 
     收包入口 `0x4078c4` 拿它和**自己的** `[GameSession+0x3c]` 比，
     **不等就整包丢掉**（唯一豁免是描述符 type==5，普通房间用不上）。
-    而那个计数器是**纯客户端本地**的：只有 `0x5517a3` / `0x551900` 两处
-    `inc [GameSession+0x3c]`，分别跟着 `[GameSession+4] = 4 / 2` 两次
-    阶段切换，**服务端没有任何包能设定它**，进房之后也永不归零。
+
+    ⚠ §213 当时写的「服务端没有任何包能设定它」**是错的**，漏了
+    `GameSession::Reset`（`0x4054fa`）那条 `or dword [this+0x3c], -1`。
+    完整的真相见 §218 和 `PeerEpoch` 的注释：这个号的**每一次**变化都是
+    服务端发的某一发包造成的（`0x0400`/`0x0403` 各 +1，登录成功 /
+    `0x0203` / `0x030a` 归 -1），客户端自己不会动它。它不是客户端的私有
+    计数器，是**只有服务端能推动的换代号**。
 
     于是「在同一个房间里多打一局」就会分叉：先来的人每打完一局 +2，
-    中途进来的人从 0 起步。线上实测（`bug调查/8_2`，房 #69 第二局）
+    中途进来的人从头数起。线上实测（`bug调查/8_2`，房 #69 第二局）
     受害者发的是**局号 3**，另外三个人发的都是**局号 1**——
     双向所有同步包互相全丢，症状就是用户报的**「其他人都不会动，
     但对局在正常进行」**（还听得见死亡音效，因为那走的是游戏服 `0x0406`）。
@@ -160,6 +195,22 @@ def peer_game_id(udp_packet):
         packet[PEER_GAME_ID_OFFSET:PEER_GAME_ID_OFFSET + 2], "little")
 
 
+def as_signed_epoch(game_id):
+    """把头里那个 u16 还原成**带符号**的局号（§218）。
+
+    客户端那个字段是 dword，`GameSession::Reset`（`0x4054fa`）把它置成
+    **-1**（`or ..., 0xffffffff`），而盖进 `UdpPacket` 头的是
+    `mov ax, word [GameSession+0x3c]` —— 也就是低 16 位 `0xFFFF`。
+    服务端的模型里存的是 -1，所以读回来必须转回去，否则「还没进过任何一局」
+    的那些包会被当成「不认识的号 65535」。
+
+    （`0x0303` 那个字段客户端也是按 `movsx` 读的 int16，两边口径一致。）
+    """
+    if game_id is None:
+        return None
+    return game_id - 0x10000 if game_id >= 0x8000 else game_id
+
+
 def restamp_peer_game_id(udp_packet, game_id):
     """把 `UdpPacket` 头里的局号换成 `game_id`，其余字节原样返回。
 
@@ -172,6 +223,145 @@ def restamp_peer_game_id(udp_packet, game_id):
     head = PEER_GAME_ID_OFFSET
     return (packet[:head] + struct.pack("<H", int(game_id) & 0xFFFF)
             + packet[head + 2:])
+
+
+class PeerEpoch:
+    """一条游戏连接的**换代状态**（§218 / D137）。
+
+    ## 为什么服务端能、而且必须自己维护它
+
+    客户端那个局号 `[GameSession+0x3c]` 的每一次变化，**全部**由服务端发出的
+    某一发包造成 —— 全镜像里改动它的只有三条指令，没有任何一处是客户端自发的：
+
+    | 服务端 -> 客户端 | 客户端处理器 | 对局号 | 同时做的事 |
+    |---|---|---|---|
+    | `0x0100 gspRepLogin`（成功）| `0x54f2cc` -> 新建 `GameSession` -> `0x4050f8` | **= -1** | 六条队列清零 |
+    | `0x0203 gspRepLeaveSession(result=0)` | `0x54fffe` -> `0x550092` -> `0x552943` -> `0x4054fa` | **= -1** | 队列清零、回大厅 |
+    | `0x030a`（被踢 / 房间没了）| `0x552880` -> `0x552930` -> `0x552943` -> `0x4054fa` | **= -1** | 同上 |
+    | ★ `0x0303 gspSession` | `0x406258` -> `0x406756` -> `0x556ed1` | **= 包尾那个 u16** | 顺带整份会话状态 |
+    | `0x0400 gspPrepareGame` | `0x551605` -> `0x5517a3` | **+1** | `ResetQueues`、切 stage 6 |
+    | `0x0403`（结算看完回房间）| `0x5518fb` -> `0x551900` | **+1** | `ResetQueues`、切 stage 5 |
+
+    ★★ **`0x0303` 那一行是原版留给服务端的「直接设定」入口**：反序列化
+    `0x556ed1` 最后两句是 `movsx eax, ax` / `mov [this+0x3c], eax` ——
+    服务端说几就是几（int16，负数也能下发）。中途进房的人就是靠这一发和
+    全房间对齐的（进房本来就要发它），不需要「补发若干发换代包」那种花招。
+
+    `0x0400` / `0x0403` 这两条都紧跟着 `GameSession::ResetQueues`（`0x407678`）
+    —— 所以这个号的职责是**给每座位收包队列打纪元戳**，不让上一代的包掉进
+    刚清空的队列。它不是会话 id、也不是房间号，**是代号**。
+
+    ## 两个来源，分工明确
+
+    - **「代」（`gen`）永远来自我们自己发出去的字节** —— 换代是我们造成的，
+      所以「谁在第几代」是硬事实，不猜、也不接受推翻；
+    - **「值」（`value`）以模型为准、以客户端自报为校准** —— 只有它可能对不上
+      （客户端出现我们不理解的状态），对不上时**值听客户端的、代仍按事件流走**。
+
+    ★ 任何情况下都**不回退**到「无条件改写」（D131）或「原样转发让客户端自己
+    丢」（D134）：前者会把跨代的心跳放行、钉死收件人的队列基线（bug调查/9），
+    后者在「收件人的号正好和发送方的旧号撞上」时是**误收**，同一个死法。
+    """
+
+    __slots__ = ("value", "gen", "gen_of", "_order", "pending", "confused")
+
+    def __init__(self):
+        #: 我们认为客户端现在的局号。-1 = 还没进过任何一局。
+        self.value = EPOCH_UNSET
+        #: 现在属于哪一代（`next_generation()` 发的号）。None = 还没锚定。
+        self.gen = None
+        #: {局号值 -> 代号}，最近 `EPOCH_HISTORY` 条。在途的旧值包靠它归代。
+        self.gen_of = {}
+        self._order = []
+        #: 最近一次换代还没被客户端自报确认。这段窗口里**绝不放行**任何
+        #: 认不出来的值 —— 它就是 bug调查/9 那一发毒心跳所在的窗口。
+        self.pending = False
+        #: 自报值和模型对不上、被迫重锚的次数（只给 `status` / 日志看）。
+        self.confused = 0
+
+    def _remember(self, value, gen):
+        if value not in self.gen_of:
+            self._order.append(value)
+            while len(self._order) > EPOCH_HISTORY:
+                self.gen_of.pop(self._order.pop(0), None)
+        self.gen_of[value] = gen
+
+    def reset(self):
+        """客户端把 `GameSession` 重建/复位了（登录成功 / `0x0203` / `0x030a`）。
+
+        局号回到 -1、六条队列清空、人回到大厅 —— 旧的代号历史全部作废。
+        """
+        self.value = EPOCH_UNSET
+        self.gen = None
+        self.gen_of.clear()
+        del self._order[:]
+        self.pending = False
+
+    def advance(self, gen):
+        """我们刚给它发了一发 `0x0400` / `0x0403`：局号 +1，进入 `gen` 这一代。"""
+        self.value += 1
+        self.gen = gen
+        self._remember(self.value, gen)
+        self.pending = True
+
+    def assign(self, value, gen):
+        """我们刚用 `0x0303 gspSession` **直接把局号设成** `value`。
+
+        这是原版给服务端留的入口（`0x556ed1`），也是「中途进房的人怎么和
+        全房间对上」的正解 —— 进房本来就要发这一发。
+        """
+        self.value = int(value)
+        self.gen = gen
+        self._remember(self.value, gen)
+        self.pending = True
+
+    def anchor(self, gen):
+        """进房 / 建房：它当前这个值就属于房间当前这一代。"""
+        self.gen = gen
+        self._remember(self.value, gen)
+
+    def generation_of(self, value):
+        """这个自报值属于哪一代；认不出来返回 ``None``（= 不许投递）。"""
+        return self.gen_of.get(value)
+
+    def observe(self, value):
+        """客户端自报了一次局号（每发同步数据都带）。返回一个判词：
+
+        * ``"ok"``       —— 和模型一致，换代确认；
+        * ``"old"``      —— 是历史里的旧值 = 换代那一刹那还在途的上一代包；
+        * ``"stale"``    —— 换代还没确认、又认不出这个值 ⇒ 当陈旧包处理（丢）。
+          **这是最危险的窗口，宁可丢也不放行**；
+        * ``"reanchor"`` —— 没有待确认的换代却对不上 ⇒ 客户端出现了我们不理解的
+          状态：把**值**重锚到自报值（代不动），之后照常按代判定。自愈、不降级。
+        """
+        if value == self.value:
+            self.pending = False
+            return "ok"
+        if value in self.gen_of:
+            return "old"
+        if self.pending:
+            return "stale"
+        self.value = value
+        self._remember(value, self.gen)
+        self.confused += 1
+        return "reanchor"
+
+
+def epoch_state(conn):
+    """取（必要时建）这条连接的换代状态。
+
+    和 `peer_game_id` 同一个理由挂在连接对象上：`relayserver` 不 import
+    `gameserver`，状态跟着连接走，测试里拿个假连接就能单测。
+    """
+    state = getattr(conn, "peer_epoch", None)
+    if state is None:
+        state = PeerEpoch()
+        try:
+            conn.peer_epoch = state
+        except AttributeError:      # 只读的假对象：退化成一次性状态
+            pass
+    return state
+
 
 
 def build_rcp(opcode, payload=b""):
@@ -589,7 +779,7 @@ class RelayServer:
     """
 
     def __init__(self, *, members_of=None, fallback=None, logger=None,
-                 port=None, on_traffic=None):
+                 port=None, on_traffic=None, generation_of=None):
         #: `members_of(game_conn) -> [同房间的其他游戏连接]`
         self._members_of = members_of or (lambda conn: [])
         #: `fallback(game_conn, udp_packet) -> None`，走 `0x040f`
@@ -602,6 +792,11 @@ class RelayServer:
         #: 所以任何「每帧要问一次」的房间级判断（对战判胜负、道具模式刷道具）
         #: 都必须挂在这儿，挂在 `on_peer_data` 上会在中继模式下彻底不触发。
         self._on_traffic = on_traffic
+        #: `generation_of(game_conn) -> 代号 | None`，**只用来补锚**：
+        #: 正常路径上每条连接在建房 / 进房时就锚定了（`PeerEpoch.anchor`），
+        #: 这个回调是防御性的第二道 —— 万一哪条路径漏了锚定，这里按它当前
+        #: 房间补一次，而不是让它的同步数据被当成「跨代」全丢掉。
+        self._generation_of = generation_of
         self._logger = logger
         self.port = int(port if port is not None
                         else server_config.PEER_RELAY_PORT)
@@ -616,32 +811,91 @@ class RelayServer:
         self.registered_total = 0
         self.delivered_relay = 0
         self.delivered_fallback = 0
-        #: 改写过局号的包数，和「已经报过哪几对分叉」（去重用，见
-        #: `_note_game_id_gap`）。战斗中一秒几十发，逐发打日志会把盘写满。
+        #: 因为「同一代里两台的局号编号不同」而改写过局号的包数（D131 的那条路，
+        #: 有人中途进房才会有）。开局前的强制对齐（D138）正常工作时这个数**应该
+        #: 恒为 0** —— 不为 0 就说明对齐没顶平，值得看一眼日志。
         self.restamped_total = 0
-        self._game_id_gaps = set()
+        self._restamped_pairs = set()
+        #: **跨代丢弃**的包数：发送方那一发属于的代和收件人现在这一代不是同一代
+        #: （换代那几百毫秒的竞态，或者有人还卡在结算界面）。这些包无论改写与否
+        #: 都不该进收件人的队列 —— 改写会钉死它的基线（bug调查/9），
+        #: 原样转发则可能撞号误收。直接丢是唯一安全的处置。
+        self.cross_gen_dropped = 0
+        self._cross_gen_pairs = set()
+        #: 客户端自报的局号和模型对不上、被迫重锚的次数（`PeerEpoch.observe`）。
+        #: 正常情况下恒为 0；不为 0 说明有一条我们还不知道的换代路径。
+        self.epoch_confused = 0
+        self._confused_conns = set()
 
     # -- 日志 ---------------------------------------------------------------
     def log(self, msg):
         if self._logger is not None:
             self._logger(msg)
 
-    def _note_game_id_gap(self, sender, receiver, sender_id, receiver_id):
-        """局号分叉：**每对 (发送方, 收件人, 两个号) 只报一行**。
+    def _epoch_of(self, conn):
+        """这条连接的换代状态；还没锚定就用 `generation_of` 回调补一次。"""
+        state = epoch_state(conn)
+        if state.gen is None and self._generation_of is not None:
+            gen = self._generation_of(conn)
+            if gen is not None:
+                state.anchor(gen)
+                who = getattr(conn, "account_name", None) or "?"
+                self.log(f"换代锚定：{who} 之前没锚过，按它当前房间补成 "
+                         f"代 {gen}（局号 {state.value}）")
+        return state
 
-        这条不是错误 —— 改写之后同步照常。留一行是因为它是「这个房间里
-        有人多打了一局」的唯一可见信号，排查时能一眼看出来。
+    def _note_restamp(self, sender, receiver, sender_id, receiver_id):
+        """同一代里两台的局号编号不同 —— 改写。**每对只报一行**。
+
+        这条不是错误：有人中途进房时，两台客户端从不同的起点开始数
+        （局号是「进房之后收到过几发 `0x0400`/`0x0403`」，§218），
+        所以同一代里编号本来就会错开。改写之后同步照常。
+
+        ★ 但开局前的强制对齐（D138）会把全房间顶平，正常情况下这一行
+        **一次都不该出现** —— 出现了就说明对齐那一步没生效，照着查。
         """
         self.restamped_total += 1
         key = (id(sender), id(receiver), sender_id, receiver_id)
-        if key in self._game_id_gaps:
+        if key in self._restamped_pairs:
             return
-        self._game_id_gaps.add(key)
+        self._restamped_pairs.add(key)
         from_who = getattr(sender, "account_name", None) or "?"
         to_who = getattr(receiver, "account_name", None) or "?"
-        self.log(f"局号分叉：{from_who} 发的是 {sender_id}，"
-                 f"{to_who} 认的是 {receiver_id} —— 转发时改写头里的 "
-                 f"+4，否则收件人会整包丢掉（bug调查/8_2「别人一动不动」）")
+        self.log(f"同代改写局号：{from_who} 发的是 {sender_id}，"
+                 f"{to_who} 认的是 {receiver_id}（同一代，编号起点不同）"
+                 f"—— 不改写收件人会整包丢掉（bug调查/8_2「别人一动不动」）；"
+                 f"★ 开局前的强制对齐正常时不该出现这一行")
+
+    def _note_cross_gen(self, sender, receiver, sender_id, send_gen, want):
+        """跨代的包：**丢掉**，不投递。每对（两个代号）只报一行。
+
+        这条也不是错误 —— 它恰恰是正确行为：换代和 `ResetQueues` 是同一件事，
+        上一代的包进了刚清空的队列就会把基线钉死（bug调查/9「打不死人」）。
+        「过渡期」= 从服务端发出换代包，到这条连接自报的局号变成新值为止，
+        一毫秒不多不少，不需要任何时间阈值。
+        """
+        self.cross_gen_dropped += 1
+        key = (id(sender), id(receiver), send_gen, want.gen)
+        if key in self._cross_gen_pairs:
+            return
+        self._cross_gen_pairs.add(key)
+        from_who = getattr(sender, "account_name", None) or "?"
+        to_who = getattr(receiver, "account_name", None) or "?"
+        self.log(f"跨代丢弃：{from_who} 那一发局号 {sender_id} 属于 "
+                 f"代 {send_gen}，{to_who} 已经在代 {want.gen}"
+                 f"（局号 {want.value}）—— 丢掉，不投递也不改写"
+                 f"（改写会钉死它的收包队列基线，bug调查/9）")
+
+    def _note_confused(self, conn, value):
+        """自报值对不上模型、已经重锚。每条连接只报一行（后面只累加计数）。"""
+        self.epoch_confused += 1
+        if id(conn) in self._confused_conns:
+            return
+        self._confused_conns.add(id(conn))
+        who = getattr(conn, "account_name", None) or "?"
+        self.log(f"!! 换代模型失准（已重锚）：{who} 自报局号 {value}，"
+                 f"既不是模型里的值也不在历史里 —— 说明有一条我们还不知道的"
+                 f"换代路径。值已按自报值重锚，代不动，转发继续按代判定。")
 
     # -- 票据 ---------------------------------------------------------------
     def issue(self, game_conn, room_id, seat_index):
@@ -755,23 +1009,41 @@ class RelayServer:
 
     # -- 投递 ---------------------------------------------------------------
     def deliver(self, sender_game_conn, udp_packet, via=None):
-        """把一份同步数据发给同房间的其他人。返回送到了几个人。
+        """把一份同步数据发给同房间的其他人。返回**真的送到了**几个人。
 
         对方接上中继了就走中继（原版路径），没接上就退回 `0x040f`
         —— 中继连接是异步建的，进房那几秒里必然有一个「有人还没接上」的窗口，
         那几秒里不能让同步断掉。
 
-        ★ 转发时**改写头里的局号**（`peer_game_id` 里写了整套依据）：那个
-        计数器是每台客户端自己 +1 的，同一个房间里多打一局就会分叉，
-        对不上的包被收件人整包丢掉 -> 「别人一动不动」。这里按**收件人
-        自己最近一次发上来的局号**重新盖章，两边就都认了。
-        校验和只覆盖 body，改这两个字节不用重算。
+        ## 局号怎么处置：**按代判定，只有两条出口**（§218 / D137）
+
+        头 `+4` 的局号是客户端**每座位收包队列的纪元号**，它的每一次变化都是
+        我们某一发 `0x0400`/`0x0403`/`0x0203`/登录包造成的（`PeerEpoch` 的注释里
+        有那张表），所以服务端手里本来就有「谁在第几代」这个硬事实：
+
+        * **同一代** -> 按收件人自己的编号盖章（相同则一个字节不动）。
+          同一代里编号会不同，是因为有人中途进房、起点不一样（bug调查/8_2）。
+        * **不同代** -> ★ **丢掉，不投递**。改写会把上一代的心跳放进刚清空的
+          队列、把 `base` 钉死（bug调查/9「第二局打不死人」）；原样转发也不安全
+          —— 收件人的号可能正好和发送方的旧号撞上，那就是误收。
+
+        没有第三条出口，也没有任何时间阈值：「过渡期」恰好等于「从我们发出
+        换代包，到这条连接自报的局号变成新值为止」。
+
+        校验和（头 `+6`）从 `+0x0c` 起算、不覆盖局号，所以改写这两个字节
+        不用重算（`peer_game_id` 的注释里有逐指令依据）。
         """
         sent = 0
-        # 发送方每发一发都自报一次自己的局号（战斗中 ~8 Hz），拿最新的那个
-        # 当这条连接的「现在认哪个号」。
-        game_id = peer_game_id(udp_packet)
+        # ★ 转成带符号：客户端「还没进过任何一局」时盖的是 0xFFFF = -1。
+        game_id = as_signed_epoch(peer_game_id(udp_packet))
+        send_gen = None
         if game_id is not None:
+            # 发送方每发一发都自报一次自己的局号（战斗中 ~8 Hz）：拿它确认
+            # 我们的模型、并判定这一发属于哪一代。
+            sender = self._epoch_of(sender_game_conn)
+            if sender.observe(game_id) == "reanchor":
+                self._note_confused(sender_game_conn, game_id)
+            send_gen = sender.generation_of(game_id)
             try:
                 sender_game_conn.peer_game_id = game_id
             except AttributeError:      # 测试里的假连接，不影响转发
@@ -780,10 +1052,16 @@ class RelayServer:
             if member is sender_game_conn:
                 continue
             packet = udp_packet
-            want = getattr(member, "peer_game_id", None)
-            if want is not None and game_id is not None and want != game_id:
-                packet = restamp_peer_game_id(udp_packet, want)
-                self._note_game_id_gap(sender_game_conn, member, game_id, want)
+            if game_id is not None:
+                want = self._epoch_of(member)
+                if send_gen is None or want.gen is None or send_gen != want.gen:
+                    self._note_cross_gen(sender_game_conn, member,
+                                         game_id, send_gen, want)
+                    continue
+                if want.value != game_id:
+                    packet = restamp_peer_game_id(udp_packet, want.value)
+                    self._note_restamp(sender_game_conn, member,
+                                       game_id, want.value)
             relay = self.conn_for(member)
             if relay is not None:
                 sent += relay.send_data(packet)
@@ -839,7 +1117,9 @@ class RelayServer:
         line = (f"中继：在线 {len(conns)} 条，待兑票据 {pending} 张，"
                 f"累计注册 {self.registered_total} 次；"
                 f"投递 中继 {self.delivered_relay} / 回退 {self.delivered_fallback}"
-                f"；改写局号 {self.restamped_total} 发")
+                f"；同代改写局号 {self.restamped_total} 发"
+                f"，跨代丢弃 {self.cross_gen_dropped} 发"
+                f"，模型失准 {self.epoch_confused} 次")
         for conn in conns:
             rtt = conn.rtt_total.summary()
             if rtt is not None:

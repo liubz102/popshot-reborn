@@ -123,7 +123,14 @@ def make_conn(username, accounts=None):
     conn.online = lambda _msg: None
     conn.online_debug = lambda _msg: None
     conn.vlog = lambda _msg: None
-    conn.send = conn.sent.append
+    # ★ 走**真的**换代钩子：换代模型的唯一迁移点就在 `Conn.send()` 里
+    #   （§218 / D137）。假连接直接把 `send` 换成 `sent.append` 的话，
+    #   开局链发出去的 0x0400 / 0x0403 就不会推进模型，测的就不是真接线了。
+    def _send(plain):
+        gameserver.Conn.note_epoch_from_frame(conn, plain)
+        conn.sent.append(plain)
+
+    conn.send = _send
     conn.send_lock = threading.RLock()
     conn.send_queue = None
     conn.batch_delay_ms = 0

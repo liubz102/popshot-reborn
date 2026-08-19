@@ -171,6 +171,35 @@ OP_PREPARE_GAME = 0x0400
 OP_TRIGGER_COUNT_GAME = 0x0401
 OP_COUNT_GAME_READY = 0x0402
 OP_LOADING_DONE = 0x0403
+
+#: ★★ 服务端方向的这两发包会让客户端的局号（`[GameSession+0x3c]`）**+1**，
+#: 同时 `GameSession::ResetQueues`（`0x407678`）把六条收包队列全部清空
+#: —— 也就是「换一代」（§218 / D137）。值是这一代的**种类**，
+#: 传给 `lobby.Room.advance_generation()`：
+#:
+#:   `0x0400 gspPrepareGame` -> `0x551605` -> `0x5517a3`：`inc` / 阶段 4 / 切 stage 6
+#:   `0x0403`（结算看完）    -> `0x5518fb` -> `0x551900`：`inc` / 阶段 2 / 切 stage 5
+EPOCH_ADVANCING_OPS = {
+    OP_PREPARE_GAME: "battle",
+    OP_LOADING_DONE: "room",
+}
+
+#: ★★ 而这一发是**直接设定**：`0x0303 gspSession` 的包尾 u16 就是局号
+#: （`0x406258` -> `0x406756` -> `0x556ed1`，最后两句 `movsx eax, ax` /
+#: `mov [LobbyStage+0x3c], eax`）。客户端自己只会 `inc` 和「复位成 -1」，
+#: **这是原版留给服务端的唯一一个「说几就是几」的入口** ——
+#: 中途进房的人靠它和全房间对齐（D138）。
+EPOCH_ASSIGNING_OP = 0x0303
+
+#: ★★ 这两发（**而且业务结果码为 0** 时）会让客户端把 `GameSession` 重建或复位，
+#: 局号回到 **-1**、六条队列清空（§218）：
+#:
+#:   `0x0100 gspRepLogin`(0)          -> `0x54f2cc` 新建 `GameSession`（`0x4050f8` 里复位）
+#:   `0x0203 gspRepLeaveSession`(0)   -> `0x54fffe` -> `0x550092` -> `0x552943` -> `0x4054fa`
+#:
+#: 结果码非 0 时客户端只弹一个错误框，什么都不复位，所以必须验第一个 int32。
+#: （还有一发 `0x030a` 也走 `0x4054fa`，我们不发，留个名字在这里备查。）
+EPOCH_RESETTING_OPS = frozenset((0x0100, 0x0203))
 #: 客户端方向 0x0406（32 字节）= **`gcpCreateItem`「我要在这里生成一个掉落物」**。
 #:
 #: ⚠ **这是对 §108/§109「位置同步」那个记法的勘误**（会话 17，§112）。
@@ -465,6 +494,16 @@ GCP_NAMES = {
 def build_ctrl(payload):
     """0xFE 控制帧"""
     return bytes([MAGIC_CTRL, 0]) + struct.pack("<H", len(payload)) + payload
+
+
+def _frame_result_ok(plain):
+    """一帧游戏包的第一个业务 int32 是不是 0（= 成功）。
+
+    `0x0100 gspRepLogin` 和 `0x0203 gspRepLeaveSession` 的第一个 int32 都是
+    结果码，而且**只有 0 那一条**会让客户端重建 / 复位 `GameSession`
+    （局号归 -1，§218）；非 0 只弹一个错误框。载荷不足 4 字节按「不是」算。
+    """
+    return len(plain) >= 14 and int.from_bytes(plain[10:14], "little") == 0
 
 
 def build_game(opcode, payload=b""):
@@ -958,7 +997,8 @@ def build_session(status, session_type, arguments, title="", map_name="",
 
 
 def build_update_session(session_type, arguments, title="", map_name="",
-                         status=SESSION_STATUS_WAITING, player_count=0):
+                         status=SESSION_STATUS_WAITING, player_count=0,
+                         game_id=0):
     """opcode 0x0303 —— 把整个 `Session` 灌进客户端的 `LobbyStage`
 
     大厅分发器 `0x4061e2` 的跳表 `@0x406332` 索引 3 → `0x406258` →
@@ -970,9 +1010,18 @@ def build_update_session(session_type, arguments, title="", map_name="",
         string             -> +0x10   ★ 地图名，见下面的警告
         int32              -> +0x14   读 4 字节存成 1 字节，语义未知
         SessionDescriptor  -> +0x18   ★ 房间类型 + 参数
-        u16                -> +0x3c   语义未知
+        u16                -> +0x3c   ★★ **局号**（= 每座位收包队列的纪元号）
 
-    未查明的字段按 D019 一律填 0 / 空串。
+    ★★ 最后那个 u16 **不是「语义未知」** —— 反序列化 `0x556ed1` 的最后两句是
+
+        005d596f 读一个 u16 -> movsx eax, ax -> mov [LobbyStage+0x3c], eax
+
+    而 `[GameSession+0x3c]` 就是 `UdpPacket` 头 `+4` 那个局号（§213 / §218）：
+    客户端拿它和收到的每一发同步包硬比，不等整包丢。**它是原版留给服务端的
+    「直接设定」入口**（客户端自己只会 `inc` 和「复位成 -1」），
+    中途进房的人就是靠这一发和全房间对上号的 —— 详见 D138。
+
+    其余未查明的字段按 D019 一律填 0 / 空串。
 
     ★ `map_name` 默认且**必须**是空串。建房应答处理器 `0x54f747` 在
     `0x54f82e` 拿 `LobbyStage+0x10` 和 `L""` 比一次（`0x4040f5` 相等回 0），
@@ -982,7 +1031,7 @@ def build_update_session(session_type, arguments, title="", map_name="",
     """
     return (build_session(status, session_type, arguments, title=title,
                           map_name=map_name, player_count=player_count)
-            + struct.pack("<H", 0))
+            + struct.pack("<H", int(game_id) & 0xFFFF))
 
 
 def parse_create_session_request(payload):
@@ -3503,6 +3552,24 @@ PEER_HEADER_SIZE = 12
 PEER_TIMING_REPORT_INTERVAL = 30.0
 
 
+#: 内层 opcode 的名字。`< 0x4000` 那批是从 `GameSession::ProcessReliableQueue`
+#: （`0x407c84`）里那张 switch 表的宽字符串字面量逐个读出来的；`>= 0x4000`
+#: 那批按 `0x407956` 的分发表编号（§216）。
+#:
+#: ★ 排查「打不死人」这类同步问题时，能一眼看出**丢的是哪一发**全靠这张表：
+#: `rpChangeWeapon` / `rpFire` 掉一发，收件人那台的对象句柄分配器就永久错位，
+#: 之后 `rpExplode` 里的句柄全对不上 => 整局零伤害（§216）。
+PEER_INNER_NAMES = {
+    0x0001: "rpChangeWeapon", 0x0002: "rpFire", 0x0003: "rpExplode",
+    0x0004: "rpSplashDamaged", 0x0005: "rpSetOnFire", 0x0006: "rpJump",
+    0x0007: "rpDash", 0x000B: "rpCrouch", 0x000C: "rpRespawn",
+    0x000D: "rpReqState", 0x000E: "rpRepState", 0x000F: "rpReqDie",
+    0x0011: "rpAiMsg", 0x0018: "rpGuard", 0x001B: "rpCreateTotem",
+    0x4001: "心跳（body 头 2 字节 = 发送方下一个事件序号 N）",
+    0x4002: "讨重传", 0x4003: "重传应答", 0x4004: "?", 0x4005: "读图心跳",
+}
+
+
 def describe_peer_header(payload):
     """把 `0x040e` 载荷开头那 12 字节的 `UdpPacket` 头解成一行人话（§151）。
 
@@ -3513,12 +3580,19 @@ def describe_peer_header(payload):
         return f"    （只有 {len(payload)} 字节，装不下 12 字节的 UdpPacket 头）"
     magic, sender, target, unknown3 = struct.unpack_from("<BbbB", payload, 0)
     game_id, checksum, sequence, inner = struct.unpack_from("<HHHH", payload, 4)
-    return ("    UdpPacket 头: magic=0x%02x 发送方座位=%d 目标座位=%s ?[3]=%d "
-            "局号=%d 校验和=0x%04x 序列号=%d 内层opcode=0x%04x body=%d 字节"
+    name = PEER_INNER_NAMES.get(inner, "?")
+    line = ("    UdpPacket 头: magic=0x%02x 发送方座位=%d 目标座位=%s ?[3]=%d "
+            "局号=%d 校验和=0x%04x 序列号=%d 内层opcode=0x%04x (%s) body=%d 字节"
             % (magic, sender,
                "广播" if target == -1 else str(target),
-               unknown3, game_id, checksum, sequence, inner,
+               unknown3, game_id, checksum, sequence, inner, name,
                len(payload) - PEER_HEADER_SIZE))
+    # ★ 心跳里那个 N 是「收包队列基线」的唯一来源（`FlushTo`，§216），
+    #   排查跨纪元中毒时要的就是它，所以顺手解出来。
+    if inner == 0x4001 and len(payload) >= PEER_HEADER_SIZE + 2:
+        nxt, = struct.unpack_from("<H", payload, PEER_HEADER_SIZE)
+        line += " N=%d" % nxt
+    return line
 
 
 _seq = 0
@@ -3547,6 +3621,27 @@ def _relay_room_members(game_conn):
     if room is None:
         return []
     return room.members(exclude=game_conn)
+
+
+def room_generation(room, kind=None):
+    """房间当前的**代号**；给了 `kind` 就按它推进（同 kind 幂等，§218 / D137）。
+
+    `kind=None` = 「只要号，别改变代」——**锚定**时用的就是这一种：
+    刚建出来的房间还没有号，给它补一个「房间代」；已经有号的原样返回。
+    这样锚定永远不会把一个正在打的房间倒回「房间代」去。
+    """
+    if kind is None:
+        kind = room.epoch_kind or "room"
+    return room.advance_generation(kind, relayserver.next_generation)
+
+
+def _relay_generation_of(game_conn):
+    """`RelayServer` 的补锚回调：这条连接当前房间的代号（不在房间里就 None）。
+
+    正常路径上每条连接在建房 / 进房时就锚定过了，这是防御性的第二道。
+    """
+    room = LOBBY.room_of(game_conn)
+    return None if room is None else room_generation(room)
 
 
 def _relay_fallback(member, udp_packet):
@@ -3591,6 +3686,7 @@ PEER_RELAY = relayserver.RelayServer(
     members_of=_relay_room_members,
     fallback=_relay_fallback,
     on_traffic=_relay_battle_tick,
+    generation_of=_relay_generation_of,
     logger=lambda msg: print(f"[{ts()}] [relay] {msg}", flush=True),
 )
 
@@ -3758,10 +3854,16 @@ class Conn:
         self.peer_data_dumped = False
         self.peer_data_in = 0
         self.peer_data_out = 0
-        # 这台客户端**自己认哪个局号**（`UdpPacket` 头 +4）。它自报一次我们
-        # 就记一次，转发给它的包按这个号重新盖章 —— 依据全在
-        # `relayserver.peer_game_id` 的注释里（bug调查/8_2「别人一动不动」）。
+        # 这台客户端**最近一次自报的局号**（`UdpPacket` 头 +4）。只给日志和
+        # 探针看；转发的判定用的是下面那份换代模型。
         self.peer_game_id = None
+        # ★★ 这条连接的**换代状态**（`relayserver.PeerEpoch`，§218 / D137）。
+        #
+        # 局号不是客户端的私有计数器，是**只有服务端能推动的换代号**：
+        # `0x0400`/`0x0403` 各 +1，登录成功 / `0x0203` 归 -1，每一次都同时
+        # 清空六条收包队列。所以这份模型由 `send()` 认出那几发包自己维护
+        # （见 `note_epoch_from_frame`），转发时按「代」判定能不能投递。
+        self.peer_epoch = relayserver.PeerEpoch()
         # 同步数据的转发耗时 / 到达间隔（都按毫秒），每 30 秒汇总一行。
         # 存在的意义是**排除嫌疑**：实机还嫌卡时，这两个数字能立刻说清
         # 「不是服务端转发慢」，省掉一整轮猜（§182）。
@@ -3872,12 +3974,74 @@ class Conn:
         except OSError:
             pass
 
+    def room_generation(self, kind=None):
+        """本连接当前房间在 `kind` 这一代的代号（`kind=None` = 只要当前那个）。
+
+        不在房间里就单开一代。
+
+        「不在房间里」= 协议试探 / 单机那条路（`on_start_game_packet` 里
+        `room is None` 的分支）—— 那时根本没有别人，单开一代最安全：
+        它和谁都不同代，谁的同步数据也不会串进来。
+        """
+        room = self.lobby_room()
+        if room is None:
+            return relayserver.next_generation()
+        return room_generation(room, kind)
+
+    def anchor_epoch(self, room, why=""):
+        """建房 / 进房：把这条连接的当前局号锚定到房间**当前**这一代。
+
+        局号本身不会因为进房而变（客户端只在 `0x0400`/`0x0403`/复位那三种
+        包上动它，§218），所以进房要做的只是「记下它现在属于哪一代」。
+        中途进房的人和老玩家的**编号起点不同**（一个从 -1 数起、一个已经
+        数了好几局），但只要在同一代里，转发时按收件人的编号盖章就能互通。
+        """
+        gen = room_generation(room)
+        state = relayserver.epoch_state(self)
+        state.anchor(gen)
+        self.log(f"   换代锚定：代 {gen}，我的局号 {state.value}{why}")
+
+    def note_epoch_from_frame(self, plain):
+        """认出「会让客户端换代的那几发包」，把换代模型跟着推一格（§218 / D137）。
+
+        三种迁移，上面那三张表列全了：
+        `EPOCH_ADVANCING_OPS`（`0x0400`/`0x0403` 各 +1）、
+        `EPOCH_ASSIGNING_OP`（`0x0303` 直接设成包尾那个 u16）、
+        `EPOCH_RESETTING_OPS`（登录成功 / `0x0203` 归 -1）。
+
+        ★ **为什么挂在 `send()` 而不是各个业务分支上**：客户端局号的每一次
+        变化都是这几发字节造成的，把状态迁移挂在**字节离开的地方**，
+        就没有哪个发送点能漏登记 —— 进房四连发、结算回房间、房间参数变更的
+        广播、控制通道的 `back-to-room`、将来新增的路径，全都自动被覆盖。
+
+        代价只有几百纳秒（一次首字节判定 + 一次 u16 解包 + 一次字典查），
+        相对客户端自己那 100 ms 的心跳（§187）可以忽略。
+        """
+        if len(plain) < 10 or plain[0] != MAGIC_GAME:
+            return
+        opcode = int.from_bytes(plain[8:10], "little")
+        kind = EPOCH_ADVANCING_OPS.get(opcode)
+        if kind is not None:
+            relayserver.epoch_state(self).advance(self.room_generation(kind))
+            return
+        if opcode == EPOCH_ASSIGNING_OP and len(plain) >= 12:
+            # 包尾那个 u16 就是我们要它认的局号（`build_update_session`）。
+            said = relayserver.as_signed_epoch(
+                int.from_bytes(plain[-2:], "little"))    # 客户端按 int16 读
+            relayserver.epoch_state(self).assign(said, self.room_generation())
+            return
+        if opcode in EPOCH_RESETTING_OPS and _frame_result_ok(plain):
+            # 结果码 0 才复位；非 0 客户端只弹个错误框，什么都不动。
+            relayserver.epoch_state(self).reset()
+
     def send(self, plain):
         # SimpleCipher 是逐字节推进的流密码：两个线程交错加密会让整条流错位，
         # 客户端从此再也解不回来。控制通道存在之后这不再是理论风险。
         with self.send_lock:
             if self.send_broken:
                 return                       # 流已废，发了也只是垃圾
+            # ★ 换代模型的**唯一**迁移点，见 `note_epoch_from_frame`。
+            self.note_epoch_from_frame(plain)
             # ★ 这个 `if` 不是多余的：`vlog` 自己也判 VERBOSE，但 f-string 和
             #   `hexdump()` 是**在调用之前**就求值的，非 verbose 时白算再丢掉。
             #   实测 53 字节的包要 18.4 µs，而战斗中每份同步数据都要走这里
@@ -4175,6 +4339,10 @@ class Conn:
             map_name = "" if room is None else room.map_name
         player_count = 1 if room is None else room.player_count()
         status = SESSION_STATUS_WAITING if room is None else room.status
+        # ★★ 局号：房里所有人共用一个数（§218 / D138）。中途进房的人就是靠
+        #    这一发和全房间对上的 —— 客户端拿它和每一发同步包硬比，不等整包丢。
+        game_id = (relayserver.EPOCH_UNSET if room is None
+                   else room.epoch_value)
         try:
             payload = build_update_session(
                 self.room["session_type"],
@@ -4183,6 +4351,7 @@ class Conn:
                 map_name=map_name,
                 status=status,
                 player_count=player_count,
+                game_id=game_id,
             )
         except ValueError as error:
             self.log(f"   无法下发 0x0303: {error}")
@@ -4191,7 +4360,7 @@ class Conn:
             f"← 回 0x0303 Session(type={self.room['session_type']} "
             f"({self.room['session_type_name']}) args={self.room['arguments']} "
             f"title={self.room['texts'][0]!r} map={map_name!r} "
-            f"人数={player_count})")
+            f"人数={player_count} 局号={game_id})")
         self.send(build_game(OP_UPDATE_SESSION, payload))
 
     def send_session_members(self, host_seat=None):
@@ -5546,6 +5715,8 @@ class Conn:
         self.reset_quest_state()
         # 上一个房间的开关记录作废（客户端离开时已经自己清 0 了）。
         self.forget_peer_relay()
+        # 换代：进房不会改变客户端的局号，但要记下「它现在属于哪一代」。
+        self.anchor_epoch(room, "（进房）")
         with self.send_batch("；进房四连发不能被客户端的 recv 切开"):
             self.send_update_session(map_name=room.map_name)
             self.log(f"← 回 gspRepMoveInto(result=0, 房间 #{room.room_id}, "
@@ -5674,6 +5845,7 @@ class Conn:
             seat=self.seat_snapshot(),
         )
         self.my_seat = 0
+        self.anchor_epoch(room, "（建房）")
         self.online(f"房间 + 建房 账号={self.account_name!r} {room.describe()}")
         return room
 
@@ -5691,10 +5863,16 @@ class Conn:
         为什么必须广播：`0x0400 gspPrepareGame` 是「切到 stage 6 去加载关卡」
         的命令，只发给房主的话别人连关卡都不会加载，自然也永远等不到他们的
         `0x0403`。**seed 也必须是同一个**，否则各人生成的关卡不一样。
+
+        ★ 换代：这一发 `0x0400` 会让房里每个人的局号 +1，房间也跟着进
+        「战斗代」—— 全在 `Conn.send()` 的 `note_epoch_from_frame` 里自动完成。
+        大家的号本来就是一样的（进房那一发 `0x0303` 已经对齐过，D138），
+        所以 +1 之后仍然一样。
         """
         if not replies:
             return
-        for member in room.members(exclude=None):
+        members = room.members(exclude=None)
+        for member in members:
             try:
                 with member.send_batch(f"；{why}"):
                     for reply_opcode, reply_payload in replies:
@@ -5704,8 +5882,7 @@ class Conn:
             # 每条连接自己的状态机跟着走一格，`status` 才不会说瞎话。
             member.start_game.state = room.battle.state
         packets = " ".join(f"0x{op:04x}" for op, _ in replies)
-        self.log(f"← 广播开局握手 {packets} 给房里 "
-                 f"{len(room.members(exclude=None))} 人（{why}）")
+        self.log(f"← 广播开局握手 {packets} 给房里 {len(members)} 人（{why}）")
         # 房间什么时候标「游戏中」（大厅列表跟着变，`Lobby.join` 也会用
         # MOVE_INTO_ALREADY_PLAYING 把半路想进来的人挡在外面 —— 关卡是
         # 开局那一刻按座位表加载的，中途多一个人进来两边就对不上）：
@@ -6386,7 +6563,12 @@ class Conn:
         # 试着按 "string + int32*" 解一下（gcpReqLogin 0x0100 就是这个形状）。
         # ★ 整段夹在 VERBOSE 里：这个试解**只为日志**，非 verbose 时结果直接丢掉，
         #   而战斗中每发 0x040e 都会走到这里（而且每次都以抛异常收场，§187）。
-        if VERBOSE:
+        if VERBOSE and opcode == 0x040e:
+            # ★ 同步包不是 "string + int32*" 那个形状，硬试必然抛（§187）。
+            #   verbose 下把 12 字节的 UdpPacket 头**逐发**解出来：出问题时
+            #   要对的就是「谁在哪个局号发到第几号、内层是什么」（§216）。
+            self.vlog(describe_peer_header(payload))
+        elif VERBOSE:
             try:
                 r = Reader(payload)
                 s = r.wstr()
@@ -6513,7 +6695,8 @@ class Conn:
                 others = build_game(OP_UPDATE_SESSION, build_update_session(
                     room.session_type, room.arguments, title=room.title,
                     map_name=room.map_name, status=room.status,
-                    player_count=room.player_count()))
+                    player_count=room.player_count(),
+                    game_id=room.epoch_value))
                 self.broadcast(others, reason="：房间参数变更")
             # 重排过的座位要挨个广播出去（action 3 = 灌数据 + 重建模型 +
             # 刷 UI，不播任何提示），否则名牌颜色和站位还停在旧模式上。

@@ -48,6 +48,11 @@ fakeclient.py —— 用 Python 冒充第二个游戏客户端（大厅部分）
                       3 字节 body，§149~§151）。用来验服务端有没有原样转成 0x040f。
                       ★ 第二个参数给**别人不一样的局号**，就能验服务端有没有
                       按收件人的号重新盖章（bug调查/8_2「其他人都不会动」）
+    beat <N> [局号]    发一发**内层 0x4001 心跳**（§216）。body 头 2 字节 = N =
+                      「我下一个事件包的序号」。收方队列还没激活时会拿它
+                      `FlushTo(N)`：`base = N` 且**只进不退**，之后 `seq < N`
+                      的事件包全被丢掉。**「打不死人」就是这么来的**，
+                      拿它 + `tools/probe_sync.py` 能在实机上单独打出这条链
     rpeer [序列号] [局号]
                       同上，但走**原版 TCP 中继**（rcp opcode 3）。要先连上中继
     waitrelay [秒]    等中继连上（服务端回 0x0210 之后才会有），超时就报错退出
@@ -130,6 +135,30 @@ def character_handle(seat):
     return seat * CHARACTER_HANDLE_STEP + CHARACTER_HANDLE_BASE
 
 
+def udp_checksum(body):
+    """`UdpPacket` 头 `+6` 的校验和（`0x5bbdc1`）。
+
+    ```asm
+    005bbdc8  push 0x17 / pop eax        ; 种子
+    005bbdcb  lea esi, [buf+0xc]         ; ★ 只覆盖 body，不含 12 字节头
+    005bbdd2  movsx dx, byte [esi]       ; ★ 逐字节**带符号**扩展
+    005bbdd6  imul eax, eax, 0x103
+    005bbddc  add  eax, edx
+    ```
+
+    比对在 `0x4078f0`（`cmp word [esi+6], ax`）——**只比低 16 位**，
+    所以整个算术都可以在 mod 2^16 里做。
+
+    ★ **不算它，真客户端会在收包入口就把包丢掉**，连队列都进不去。
+    以前 `fakeclient` 恒填 0x1234，因为过去只让假客户端之间对打
+    （它们互相不校验），一到真客户端面前就全被丢 —— 会话 34 实机踩到的。
+    """
+    acc = 0x17
+    for byte in bytes(body):
+        acc = (acc * 0x103 + (byte - 256 if byte >= 128 else byte)) & 0xFFFF
+    return acc
+
+
 def build_udp_packet(seat, sequence=1, game_id=0, body=b"\xde\xad\xbe"):
     """一份 `UdpPacket`：12 字节头 + body（§151）。
 
@@ -141,9 +170,30 @@ def build_udp_packet(seat, sequence=1, game_id=0, body=b"\xde\xad\xbe"):
     在同一个房间里多打一局就会分叉 —— 这就是 bug调查/8_2「其他人都不会动」。
     服务端现在转发时会按收件人自己的号重新盖章，拿这个参数就能验。
     """
+    body = bytes(body)
     return (struct.pack("<BbbB", 0xFF, seat, -1, 0)
-            + struct.pack("<HHHH", int(game_id), 0x1234, int(sequence), 0x0102)
-            + bytes(body))
+            + struct.pack("<HHHH", int(game_id), udp_checksum(body),
+                          int(sequence), 0x0102)
+            + body)
+
+
+def build_heartbeat(seat, next_sequence, game_id=0):
+    """一发**内层 `0x4001` 心跳**（§216）。body 头 2 字节 = 「我下一个事件包的
+    序号 N」。
+
+    ★ 它不是普通同步数据 —— 收方 `0x407b94` 拿这个 N 干两件事：
+    `Grow(N-1)` 把那个座位的收包队列撑到 N-1，然后**队列还没激活时**
+    `FlushTo(N)`：`base = N` 并把队列标成「已激活」。而 `base` **只进不退**
+    （`0x54bb1d` 开头 `n < base` 直接 return），`Insert` 又把 `seq < base`
+    的包全丢掉。所以**一发号很大的心跳就能把对方那条通道钉死**。
+
+    这个命令存在的意义就是**在实机上把这条链单独打出来**：
+    先看探针里 base 是多少，发一发 `beat 500`，再看 base 是不是跳到 500。
+    """
+    body = struct.pack("<H", int(next_sequence) & 0xFFFF) + bytes(29)
+    return (struct.pack("<BbbB", 0xFF, seat, -1, 0)
+            + struct.pack("<HHHH", int(game_id), udp_checksum(body), 0, 0x4001)
+            + body)
 
 #: 连哪几个端口。默认就是客户端写死的那两个；环境变量 `POPSHOT_AUTH_PORT` /
 #: `POPSHOT_GAME_PORT` 可以改，**专门是为了「不去动用户自己那份正在跑的服务端」**
@@ -610,6 +660,15 @@ def run_script(client, tokens):
             seat = client.my_seat if client.my_seat is not None else 0
             blob = build_udp_packet(seat, sequence, game_id)
             log(f"   要发的字节: {blob.hex(' ')}（局号={game_id}）")
+            client.send_game(OP_PEER_DATA_UP, blob)
+        elif cmd == "beat":
+            # 内层 0x4001 心跳。第一个参数 = 「我下一个事件包的序号 N」，
+            # 收方拿它定死那条队列的 base（§216）。第二个参数 = 局号。
+            nxt = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 0
+            game_id = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 0
+            seat = client.my_seat if client.my_seat is not None else 0
+            blob = build_heartbeat(seat, nxt, game_id)
+            log(f"   要发的心跳: N={nxt} 局号={game_id}  {blob.hex(' ')}")
             client.send_game(OP_PEER_DATA_UP, blob)
         elif cmd == "rpeer":
             sequence = int(tokens.pop(0)) if tokens and tokens[0].isdigit() else 1

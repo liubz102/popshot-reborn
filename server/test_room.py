@@ -105,7 +105,14 @@ def make_conn(username):
     conn.online = lambda _msg: None
     conn.online_debug = lambda _msg: None
     conn.vlog = lambda _msg: None
-    conn.send = conn.sent.append
+    # ★ 走**真的**换代钩子：换代模型的唯一迁移点就在 `Conn.send()` 里
+    #   （§218 / D137）。假连接直接把 `send` 换成 `sent.append` 的话，
+    #   开局链发出去的 0x0400 / 0x0403 就不会推进模型，测的就不是真接线了。
+    def _send(plain):
+        gameserver.Conn.note_epoch_from_frame(conn, plain)
+        conn.sent.append(plain)
+
+    conn.send = _send
     conn.send_lock = threading.RLock()
     conn.send_queue = None
     conn.batch_delay_ms = 0
@@ -1125,10 +1132,18 @@ class PeerRelayTests(LobbyIsolated):
         self.alice.sent.clear()          # 建房那四发和本组用例无关
         self.bob = make_conn("bob")
 
-    def peer_packet(self, sender_seat=1, sequence=7, body=b"\xaa\xbb\xcc"):
-        """一个像模像样的 12 字节 `UdpPacket` 头 + body（§151）。"""
+    def peer_packet(self, sender_seat=1, sequence=7, body=b"\xaa\xbb\xcc",
+                    game_id=None):
+        """一个像模像样的 12 字节 `UdpPacket` 头 + body（§151）。
+
+        局号默认取**房间当前那个号** —— 进房那一发 `0x0303` 就是这么设的
+        （§218 / D138：包尾 u16 -> `[GameSession+0x3c]`），所以真客户端盖的
+        就是这个数。全房间同代同号，转发时一个字节都不该动。
+        """
+        if game_id is None:
+            game_id = self.room.epoch_value & 0xFFFF
         return (struct.pack("<BbbB", 0xFF, sender_seat, -1, 0)
-                + struct.pack("<HHHH", 3, 0x1234, sequence, 0x0102)
+                + struct.pack("<HHHH", game_id, 0x1234, sequence, 0x0102)
                 + body)
 
     def join_bob(self):
@@ -1505,6 +1520,192 @@ class StartGameRoomTests(LobbyIsolated):
         self.assertEqual(self.room.battle.left_while_loading, [])
 
 
+# ----------------------------------------------------------------------------
+# 换代状态机（局号 = 每座位收包队列的纪元号）
+# ----------------------------------------------------------------------------
+class EpochGenerationTests(LobbyIsolated):
+    """换代状态机的房间侧接线（§218 / D137 / D138）。
+
+    客户端的局号 `[GameSession+0x3c]` 不是它自己的私有计数器 —— 每一次变化
+    都是服务端发的某一发包造成的：
+
+    * `0x0303 gspSession` 的**包尾 u16** -> 直接设成那个值（`0x556ed1`）；
+    * `0x0400` / `0x0403` -> 各 +1（`0x5517a3` / `0x551900`，同时清六条队列）；
+    * 登录成功 / `0x0203` -> 复位成 -1（`0x4054fa`）。
+
+    所以服务端能（也必须）自己把这张表维护起来：进房那一发 `0x0303` 就把
+    中途进来的人和全房间对齐，转发时再按「代」判定能不能投递。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.alice = make_conn("alice")                     # 房主，座位 0
+        gameserver.Conn.on_game_packet(self.alice, 0x0201,
+                                       create_session_payload())
+        self.room = self.lobby.room_of(self.alice)
+        self.bob = make_conn("bob")
+        gameserver.Conn.on_game_packet(self.bob, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        self.alice.sent.clear()
+        self.bob.sent.clear()
+
+    # -- 工具 -----------------------------------------------------------------
+    def epoch(self, conn):
+        return relayserver.epoch_state(conn)
+
+    def join(self, name):
+        conn = make_conn(name)
+        gameserver.Conn.on_game_packet(conn, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        return conn
+
+    def session_game_id(self, conn):
+        """这条连接收到的最后一发 `0x0303` 里带的局号（包尾 u16）。"""
+        payloads = [p for blob in conn.sent for _, op, p in frames(blob)
+                    if op == gameserver.OP_UPDATE_SESSION]
+        self.assertTrue(payloads, "没收到 0x0303")
+        return struct.unpack("<H", payloads[-1][-2:])[0]
+
+    def play_a_round(self, members):
+        """房主开局 -> 全员加载完 -> 每人各自看完结算回房间。"""
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        for conn in members:
+            gameserver.Conn.on_game_packet(conn, OP_LOADING_DONE, b"")
+        for conn in members:
+            gameserver.Conn.leave_game_result(conn)
+        for conn in members:
+            conn.sent.clear()
+
+    # -- 进房：0x0303 直接把局号设对 ------------------------------------------
+    def test_the_session_packet_carries_the_room_epoch(self):
+        """★ 这一发就是原版的对齐手段：包尾 u16 -> `[GameSession+0x3c]`。"""
+        carol = self.join("carol")
+        self.assertEqual(self.room.epoch_value, self.session_game_id(carol))
+        self.assertEqual(self.room.epoch_value, self.epoch(carol).value)
+
+    def test_everyone_in_the_room_shares_one_generation_and_one_number(self):
+        self.assertIsNotNone(self.epoch(self.alice).gen)
+        self.assertEqual(self.epoch(self.alice).gen, self.epoch(self.bob).gen)
+        self.assertEqual(self.room.epoch_gen, self.epoch(self.bob).gen)
+        self.assertEqual(0, self.epoch(self.alice).value)
+        self.assertEqual(0, self.epoch(self.bob).value)
+
+    # -- 换代：0x0400 / 0x0403 ------------------------------------------------
+    def test_prepare_game_moves_everyone_into_one_new_generation(self):
+        before = self.room.epoch_gen
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        self.assertNotEqual(before, self.room.epoch_gen)
+        self.assertEqual("battle", self.room.epoch_kind)
+        self.assertEqual(1, self.room.epoch_value)
+        for conn in (self.alice, self.bob):
+            self.assertEqual(self.room.epoch_gen, self.epoch(conn).gen)
+            self.assertEqual(1, self.epoch(conn).value)
+
+    def test_going_back_to_the_room_moves_everyone_on_again(self):
+        """★ `0x0403` 是**各人看完结算各自触发**的，前后可能差十几秒 ——
+        但必须落在**同一个代号**里，否则同一局的人会被判成互相跨代。"""
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        battle_gen = self.room.epoch_gen
+        gameserver.Conn.leave_game_result(self.alice)       # 快的那个先回房间
+        room_gen = self.room.epoch_gen
+        self.assertNotEqual(battle_gen, room_gen)
+        self.assertEqual("room", self.room.epoch_kind)
+        self.assertEqual(room_gen, self.epoch(self.alice).gen)
+        # 慢的那个还在结算界面 —— 还在上一代，这段时间双向都不该投递
+        self.assertEqual(battle_gen, self.epoch(self.bob).gen)
+        gameserver.Conn.leave_game_result(self.bob)
+        self.assertEqual(room_gen, self.epoch(self.bob).gen)
+        self.assertEqual(2, self.epoch(self.alice).value)
+        self.assertEqual(2, self.epoch(self.bob).value)
+        self.assertEqual(2, self.room.epoch_value)
+
+    def test_the_numbers_match_the_field_capture(self):
+        """★ 和 2026-08-19 现场（bug调查/9）逐格对住：
+        进房 0 -> 第一局 1 -> 回房 2 -> 第二局 3。"""
+        self.assertEqual(0, self.epoch(self.bob).value)
+        self.play_a_round([self.alice, self.bob])
+        self.assertEqual(2, self.epoch(self.bob).value)
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        self.assertEqual(3, self.epoch(self.bob).value)
+
+    # -- 复位 -----------------------------------------------------------------
+    def test_leaving_the_room_resets_the_model(self):
+        """`0x0203 result=0` -> 客户端 `GameSession::Reset`（`0x4054fa`）。"""
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        self.assertEqual(1, self.epoch(self.bob).value)
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.assertEqual(relayserver.EPOCH_UNSET, self.epoch(self.bob).value)
+        self.assertIsNone(self.epoch(self.bob).gen)
+
+    def test_a_failed_reply_does_not_reset(self):
+        """结果码非 0 时客户端只弹个错误框，什么都不复位。"""
+        state = self.epoch(self.alice)
+        state.value = 4
+        gameserver.Conn.note_epoch_from_frame(
+            self.alice, build_game(OP_LEAVE_SESSION, w_i32(1)))
+        self.assertEqual(4, state.value)
+        gameserver.Conn.note_epoch_from_frame(
+            self.alice, build_game(OP_LEAVE_SESSION, w_i32(0)))
+        self.assertEqual(relayserver.EPOCH_UNSET, state.value)
+
+    # -- 中途进房（D138 的正主）----------------------------------------------
+    def test_a_late_joiner_is_aligned_by_the_session_packet_alone(self):
+        """★ 打完一局之后进来的人：一发 `0x0303` 就和全房间对上，
+        **不需要任何补发**（这正是 D131 那套「转发时改写局号」要解决的场景）。
+        """
+        self.play_a_round([self.alice, self.bob])
+        self.assertEqual(2, self.room.epoch_value)
+        carol = self.join("carol")
+        self.assertEqual(2, self.session_game_id(carol))
+        self.assertEqual(2, self.epoch(carol).value)
+        self.assertEqual(self.room.epoch_gen, self.epoch(carol).gen)
+        # 进房的包序里**没有**任何 0x0400 / 0x0403（不靠补发换代包对齐）
+        self.assertNotIn(OP_PREPARE_GAME, opcodes(carol))
+        self.assertNotIn(OP_LOADING_DONE, opcodes(carol))
+
+        # 下一局开局：三个人一起 +1，仍然同代同号 -> 转发一发都不用改写
+        carol.sent.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        self.assertEqual([OP_TRIGGER_COUNT_GAME, OP_PREPARE_GAME],
+                         opcodes(carol))
+        gens = {self.epoch(c).gen for c in (self.alice, self.bob, carol)}
+        values = {self.epoch(c).value for c in (self.alice, self.bob, carol)}
+        self.assertEqual(1, len(gens))
+        self.assertEqual({3}, values)
+
+    def test_a_room_parameter_change_re_asserts_the_epoch(self):
+        """改地图 / 改模式那一发 `0x0303` 也带着局号 —— 幂等地再对一次。"""
+        self.play_a_round([self.alice, self.bob])
+        self.bob.sent.clear()
+        gameserver.Conn.on_game_packet(self.alice, 0x0302,
+                                       change_session_payload())
+        self.assertEqual(self.room.epoch_value, self.session_game_id(self.bob))
+
+    # -- 异常：中途掉线 -------------------------------------------------------
+    def test_a_member_leaving_during_loading_does_not_disturb_the_others(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        battle_gen = self.room.epoch_gen
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.assertEqual(battle_gen, self.epoch(self.alice).gen)
+        self.assertEqual(1, self.epoch(self.alice).value)
+        self.assertEqual(battle_gen, self.room.epoch_gen)
+
+    def test_a_reconnect_is_aligned_again_by_the_session_packet(self):
+        """掉线重连 = 新连接：登录成功归 -1，进房那一发 `0x0303` 再对齐。"""
+        self.play_a_round([self.alice, self.bob])
+        again = self.join("bob")
+        self.assertEqual(self.room.epoch_value, self.epoch(again).value)
+        self.assertEqual(self.room.epoch_gen, self.epoch(again).gen)
+
+
+
 class PeerHeaderTests(unittest.TestCase):
     """`describe_peer_header()` 只给日志用，但解错了会误导排查（§151）。"""
 
@@ -1526,6 +1727,29 @@ class PeerHeaderTests(unittest.TestCase):
     def test_a_too_short_payload_says_so_instead_of_crashing(self):
         self.assertIn("装不下", gameserver.describe_peer_header(b"\xff\x01"))
 
+
+    def test_the_inner_opcode_is_named(self):
+        """★ 排查同步问题时全靠这个名字看出「丢的是哪一发」（§216）。"""
+        blob = (struct.pack("<BbbB", 0xFF, 2, -1, 0)
+                + struct.pack("<HHHH", 1, 0, 0, 0x0001))
+        self.assertIn("rpChangeWeapon", gameserver.describe_peer_header(blob))
+        blob = (struct.pack("<BbbB", 0xFF, 2, -1, 0)
+                + struct.pack("<HHHH", 1, 0, 7, 0x0002))
+        self.assertIn("rpFire", gameserver.describe_peer_header(blob))
+
+    def test_the_heartbeat_next_sequence_is_decoded(self):
+        """心跳里那个 N 是收包队列基线的唯一来源，必须解出来（§216）。"""
+        blob = (struct.pack("<BbbB", 0xFF, 2, -1, 0)
+                + struct.pack("<HHHH", 1, 0, 0, 0x4001)
+                + struct.pack("<H", 31) + bytes(29))
+        line = gameserver.describe_peer_header(blob)
+        self.assertIn("内层opcode=0x4001", line)
+        self.assertIn("N=31", line)
+
+    def test_an_unknown_inner_opcode_is_shown_as_a_question_mark(self):
+        blob = (struct.pack("<BbbB", 0xFF, 0, -1, 0)
+                + struct.pack("<HHHH", 0, 0, 0, 0x0777))
+        self.assertIn("(?)", gameserver.describe_peer_header(blob))
 
 if __name__ == "__main__":
     unittest.main()
