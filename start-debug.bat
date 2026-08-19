@@ -17,6 +17,12 @@ rem  Turns on: per-packet SnowCipher dump in the client (BSHOOK_VERBOSE_LOG=1)
 rem            per-packet hexdump + capture files on the server
 rem            (server\app.py --verbose)
 rem
+rem  The peer-sync probe is NOT attached any more.  It existed for bug 9
+rem  ("second match, I hit them but they never die"), which is now fixed
+rem  at the root (server-side epoch bookkeeping, FINDINGS 218 / D137 / D138).
+rem  tools\probe-sync.bat is kept around: double-click it by hand to
+rem  attach the probe to a game that is already running.
+rem
 rem  Speed is about the same as start.bat (15.1 s vs 14.6 s to the lobby) --
 rem  V0.1 session 14 stopped flushing the debug log to disk (V0.1 105).
 rem  The cost is a 4 MB+ log where the interesting lines drown in hexdump,

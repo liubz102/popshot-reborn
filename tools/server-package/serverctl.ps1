@@ -20,6 +20,11 @@ $ErrorActionPreference = 'Stop'
 trap {
     Write-Host ''
     Write-Host "[失败] $($_.Exception.Message)" -ForegroundColor Red
+    # 出错位置 + 异常类型由垫片里的 Format-ErrorLocationText 拼好补上
+    # （和 launch.ps1 的 trap 同一个套路；Get-Command 兜住垫片还没点源的窗口期）。
+    if (Get-Command 'Format-ErrorLocationText' -ErrorAction SilentlyContinue) {
+        Write-Host (Format-ErrorLocationText $_) -ForegroundColor Red
+    }
     exit 1
 }
 

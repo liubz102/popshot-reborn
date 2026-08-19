@@ -258,6 +258,35 @@ function Get-ProcessIdListText {
     return ((@($Processes) | ForEach-Object { $_.Id }) -join ',')
 }
 
+function Format-ErrorLocationText {
+    <#
+        错误记录 -> 「位置 文件:行  语句」+「异常 类型」两行说明，给 launch.ps1 /
+        serverctl.ps1 的 trap 用。
+
+        ★ 为什么要有它：trap 里光打 `$_.Exception.Message` 时，「拒绝访问。」这种
+          三个字的消息没法远程定位（2026-08-19 Win7 玩家那次，只能靠逐条排除
+          才 narrowing 到 Start-Process）。带上文件、行号和出错语句，玩家截个
+          图就能看出炸在哪。
+
+        InvocationInfo 在 PowerShell 2.0 就有；但 .NET 直接抛、没有脚本上下文的
+        错它是空的 —— 那种就只剩「异常 类型」一行。
+    #>
+    param($ErrorRecord)
+    $lines = @()
+    $info = $ErrorRecord.InvocationInfo
+    if ($info -and $info.ScriptLineNumber -gt 0) {
+        # ScriptName 可能为空（-Command 方式运行的错不在任何文件里），
+        # Split-Path -Leaf '' 会炸，给个兜底标签。
+        $where = '（命令行）'
+        if ("$($info.ScriptName)") { $where = Split-Path -Leaf "$($info.ScriptName)" }
+        $stmt  = "$($info.Line)".Trim()
+        if ($stmt.Length -gt 100) { $stmt = $stmt.Substring(0, 100) + '…' }
+        $lines += "位置 ${where}:$($info.ScriptLineNumber)  $stmt"
+    }
+    $lines += "异常 $($ErrorRecord.Exception.GetType().Name)"
+    return ($lines -join [Environment]::NewLine)
+}
+
 function Get-WindowsBuildMajor {
     <#
         Windows 主版本号（Win7 = 6，Win10/11 = 10）。

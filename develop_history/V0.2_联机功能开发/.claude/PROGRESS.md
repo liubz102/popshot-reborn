@@ -12,7 +12,7 @@
 | 脚本 | 用途 |
 |---|---|
 | `start.bat` | **正常游玩。** 精简日志（只有运营事件 `[online]`）|
-| `start-debug.bat` | 逆协议 / 排查。逐包 dump + `[online-debug]` 遥测 + 逐连接日志文件（D112）<br>★ 会话 35 起**自动挂同步探针**，一直采到游戏退出 → `logs\probe_sync_<时间>.log`（`-NoProbe` 可关）|
+| `start-debug.bat` | 逆协议 / 排查。逐包 dump + `[online-debug]` 遥测 + 逐连接日志文件（D112）<br>★ 会话 37 起**不再自动挂同步探针**（那个 bug 已从根上修掉，§218 / D137）；要采证就手动双击 `tools\probe-sync.bat` 给已经在跑的游戏挂上 |
 | `stop.bat` | 关掉游戏 + 服务端（按端口精确停，不会误伤别的 Python） |
 | `tools\build.bat` | **打发布包**（双击有菜单）。默认第 5 项 = 客户端包 + 服务端包（含 Linux 运行时） |
 

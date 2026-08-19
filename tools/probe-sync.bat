@@ -1,14 +1,18 @@
 @echo off
 setlocal
-chcp 65001 >nul
+rem  Switch the console to UTF-8 only on Windows 8 and newer -- on Win7
+rem  `chcp 65001` is a known cmd.exe hazard and buys nothing there.
+rem  Same probe as start.bat: the NetTCPIP module folder (Win8+ only).
+if exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules\NetTCPIP" chcp 65001 >nul
 
 rem ==========================================================================
 rem  PopShot - peer-sync probe (bug 9: "I hit them but they never die").
 rem
-rem  *** You usually do NOT need this file. ***
-rem  start-debug.bat already attaches this probe on its own and keeps it
-rem  running until the game exits, so just play in debug mode and send back
-rem  logs\probe_sync_*.log after you hit the bug.
+rem  *** Archive: you normally do NOT need this file. ***
+rem  It was written for bug 9, which is now fixed at the root (the server
+rem  keeps the per-connection epoch itself -- FINDINGS 218 / D137 / D138),
+rem  so start-debug.bat does NOT attach the probe any more.  Kept around
+rem  in case the per-seat receive queues ever need looking at again.
 rem
 rem  Use this one only to attach to a game that is ALREADY running: it finds
 rem  BigShot.exe on its own (no pid to type), samples the per-seat receive

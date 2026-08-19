@@ -31,6 +31,12 @@ $ErrorActionPreference = 'Stop'
 trap {
     Write-Host ''
     Write-Host "[启动失败] $($_.Exception.Message)" -ForegroundColor Red
+    # 出错位置 + 异常类型由垫片里的 Format-ErrorLocationText 拼好补上 ——
+    # 光有「拒绝访问」这种消息没法远程定位（2026-08-19 Win7 玩家那次只能
+    # 靠逐条排除）。垫片点源之前出错的话函数还没在，Get-Command 兜住。
+    if (Get-Command 'Format-ErrorLocationText' -ErrorAction SilentlyContinue) {
+        Write-Host (Format-ErrorLocationText $_) -ForegroundColor Red
+    }
     exit 1
 }
 
@@ -325,6 +331,13 @@ Start-Process -FilePath $loader -WorkingDirectory $Root `
     -WindowStyle Hidden | Out-Null
 
 Say '[客户端] bsloader 已启动，游戏登录窗口稍后出来，请耐心等待十几秒......' 'Green'
+
+# 同步探针（tools\probe-sync.ps1）**不再自动挂**：它是给 bug调查/9
+# 「第二局打不死人」采证用的，而那个 bug 已经从根上修掉了
+# （§218 / D137 / D138：局号改成服务端权威的换代号）。
+# 脚本留在 tools 里存档 —— 以后真要采证，手动双击 tools\probe-sync.bat
+# 给**已经在跑**的游戏挂上即可。
+
 Say ''
 Say '--- 登录界面上可以自己选服务器 ---' 'Cyan'
 Say '  「本机服务器」          连本机，一个人玩，存档在本机' 'Cyan'

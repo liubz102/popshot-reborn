@@ -1,13 +1,11 @@
 ﻿<#
     probe-sync.ps1 —— 「我打不死人」现场取证（bug调查/9 / FINDINGS §216）
 
-    两条用法：
-
-      1. **自动挂**（推荐）：双击根目录的 start-debug.bat 就行 ——
-         launch.ps1 在调试模式下会自己带上这个探针（`-Background -WaitForGame`），
-         从开机一直采到游戏退出。玩家什么都不用做，遇到 bug 之后把
-         logs\probe_sync_*.log 发回来即可。
-      2. **手动挂**：双击 tools\probe-sync.bat。游戏已经在跑时用这条。
+    ★★ **存档件**：bug调查/9 已经从根上修掉了（§218 / D137 / D138：局号改成
+    服务端权威的换代号），所以 **start-debug.bat 不再自动挂它**。
+    留着是因为「每座位收包队列」这一侧只有它看得见 —— 以后真要再看，
+    手动双击 tools\probe-sync.bat，给**已经在跑**的游戏挂上。
+    （`-WaitForGame` / `-Background` 两个开关也留着，以后要重新自动挂就用它们。）
 
     和 probe-death 那一对的区别：**它要全程开着跑很多局**，不是卡住那一刻才采
     —— 要看的就是「第一局好好的，换到第二局之后某个座位的收包队列变成什么样」。
@@ -41,9 +39,9 @@ param(
     [double]$Stall = 15,
     # 单个日志上限（MB），超了滚动成 .1 / .2 / .3。
     [double]$MaxMB = 64,
-    # 游戏还没起来就等着（配合 start-debug.bat：探针先挂，客户端后到）。
+    # 游戏还没起来就等着（探针先挂、客户端后到）。
     [switch]$WaitForGame,
-    # 后台挂：起完就返回，不打进度点、不等它结束。launch.ps1 用的就是这条。
+    # 后台挂：起完就返回，不打进度点、不等它结束（留给「自动挂」那种用法）。
     [switch]$Background
 )
 
@@ -95,9 +93,10 @@ $targets = @(Get-Process -Name 'BigShot' -ErrorAction SilentlyContinue)
 if ($targets.Count -eq 0 -and -not $WaitForGame) {
     Write-Host '游戏没在跑（找不到 BigShot.exe）。' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host '两条路，挑一条：' -ForegroundColor Yellow
-    Write-Host '  A) 直接双击根目录的 start-debug.bat —— 探针会自动挂上，什么都不用管；'
-    Write-Host '  B) 先把游戏开起来、登录、进到房间里，再双击 probe-sync.bat。'
+    Write-Host '怎么用：' -ForegroundColor Yellow
+    Write-Host '  先把游戏开起来（start.bat / start-debug.bat）、登录、进到房间里，'
+    Write-Host '  再双击 tools\probe-sync.bat。'
+    Write-Host '  （要「探针先挂、游戏后到」就加 -WaitForGame。）'
     Write-Host ''
     exit 2
 }
