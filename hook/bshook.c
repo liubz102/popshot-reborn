@@ -1700,6 +1700,112 @@ static int try_patch_reflect_visual(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* 地图等级门槛 patch —— 选图 / 开局都不再看 MinLevel（§221 / D142）           */
+/*                                                                            */
+/*   等级门槛有两道，不在同一处：                                              */
+/*                                                                            */
+/*   【第一道：列表过滤】0x40b5d0 是全客户端唯一的「按模式/等级/人数上限过滤    */
+/*    地图列表」函数，调用方覆盖随机挑图（0x40b6e5，进房自动挑 + randomMapBtn）、*/
+/*    房间设定「地图」下拉框（0x46534e）、主题切换重填（0x464017）、建房候选    */
+/*    （0x463c4d）和天梯选图。它内部的等级检查：                                */
+/*                                                                            */
+/*     0x40b623  mov eax,[ebx+0x28]      ; 记录的 MinLevel                     */
+/*     0x40b626  cmp [ebp+0x10],eax      ; 参数里的玩家等级                    */
+/*     0x40b629  jl  0x40b65a            ; ★ 等级不够 -> 跳过这张图            */
+/*     0x40b62B  mov eax,[ebx+0x34]      ; MaxUser（人数上限）                 */
+/*     0x40b62E  cmp [ebp+0x1c],eax                                          */
+/*     0x40b631  jg  0x40b65a            ; 人数超上限 -> 跳过（保留）          */
+/*                                                                            */
+/*   把 0x40b629 的 jl NOP 掉：目录里全部地图对任何等级可见、可随机中出。       */
+/*                                                                            */
+/*   【第二道：开局校验】0x468176（返回 1 = 拦下并给一句话）在**开始游戏**时    */
+/*    拿「当前房间地图的 MinLevel」（0x464848）和「房主等级」（座位玩家       */
+/*    +0x10 的 u16）直接比，不经过 0x40b5d0 —— 只 patch 第一道时表现为：       */
+/*    下拉框里选得到，点「游戏开始」却弹「等级太低，无法选择地图。」           */
+/*    （Chinese.ini 键 레벨이 낮아서 맵을 선택할 수 없습니다，全客户端只有     */
+/*    0x4682b4 一处弹它；闯关的孪生消息 레벨이 낮아서 퀘스트를 … 在 0x4682d6）：*/
+/*                                                                            */
+/*     0x468277  movzx ecx,word [edi+0x10] ; 房主等级                          */
+/*     0x46827B  cmp  ecx,eax              ; vs 当前地图 MinLevel              */
+/*     0x46827D  jge  0x468316             ; ★ 够 -> 放行去人数上限检查        */
+/*     0x468283  ……弹「等级太低」并返回 1                                     */
+/*                                                                            */
+/*   把 jge（0F 8D 93 00 00 00）换成无条件 jmp（E9 94 00 00 00 90）：          */
+/*    永远走「放行」，紧随其后的人数上限检查（0x468316 起）原样保留。          */
+/*                                                                            */
+/*   两道的人数上限检查都**保留** —— 房间人数超过地图 MaxUser 时地图本来就     */
+/*   装不下（沙漠01/入口类是 4 人、카멜궁是 6 人），那是容量不是门槛。          */
+/*   用户参照「对战模式等级限制默认解除」（§203 / D120）拍板一并解除（D142）。  */
+/*                                                                            */
+/*   范围外：闯关建房「任务」下拉框另有自己的一道等级检查（0x4368ca）——         */
+/*   那边关卡记录的 MinLevel 在 map.ini 里全被注释掉（默认 1），本来就不拦。    */
+/*                                                                            */
+/*   设环境变量 BSHOOK_KEEP_MAP_LEVEL_LOCK=1 保留原版地图等级门槛。            */
+/* -------------------------------------------------------------------------- */
+#define MAP_LVL_SITE_COUNT 2
+static const struct {
+    unsigned int va;
+    unsigned int len;
+    unsigned int off;
+    unsigned int n;
+    const unsigned char *sig;
+    const unsigned char *fix;
+    const char *what;
+} MAP_LVL_SITES[MAP_LVL_SITE_COUNT] = {
+    { 0x0040b623u, 16, 6, 2,
+      (const unsigned char *)"\x8B\x43\x28\x39\x45\x10\x7C\x2F\x8B\x43\x34\x39\x45\x1C\x7F\x27",
+      (const unsigned char *)"\x90\x90",          /* NOP 掉 jl（等级不够不再跳过） */
+      "地图列表过滤 0x40b5d0（MinLevel 判定旁路）" },
+    { 0x00468277u, 12, 6, 6,
+      (const unsigned char *)"\x0F\xB7\x4F\x10\x3B\xC8\x0F\x8D\x93\x00\x00\x00",
+      (const unsigned char *)"\xE9\x94\x00\x00\x00\x90",  /* jge -> jmp（永远放行） */
+      "开局校验 0x468176（等级不够也放行，人数上限检查保留）" },
+};
+static volatile LONG g_map_lvl_patched = 0;
+
+static int map_level_lock_kept(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_MAP_LEVEL_LOCK", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_patch_map_level_gate(void)
+{
+    int i, done = 0;
+
+    if (g_map_lvl_patched) return 1;
+    for (i = 0; i < MAP_LVL_SITE_COUNT; i++) {
+        unsigned char *base = (unsigned char *)MAP_LVL_SITES[i].va;
+        unsigned char *p = base + MAP_LVL_SITES[i].off;
+        DWORD oldp;
+
+        if (IsBadReadPtr(base, MAP_LVL_SITES[i].len)) continue;
+        if (memcmp(p, MAP_LVL_SITES[i].fix, MAP_LVL_SITES[i].n) == 0) { done++; continue; }
+        if (memcmp(base, MAP_LVL_SITES[i].sig, MAP_LVL_SITES[i].len) != 0)
+            continue;                            /* 还没解壳到这里，继续等 */
+
+        if (!VirtualProtect(p, MAP_LVL_SITES[i].n, PAGE_EXECUTE_READWRITE, &oldp)) {
+            bslog("PATCH   地图等级门槛(%s): VirtualProtect 失败 err=%lu",
+                  MAP_LVL_SITES[i].what, (unsigned long)GetLastError());
+            continue;
+        }
+        memcpy(p, MAP_LVL_SITES[i].fix, MAP_LVL_SITES[i].n);
+        VirtualProtect(p, MAP_LVL_SITES[i].n, oldp, &oldp);
+        FlushInstructionCache(GetCurrentProcess(), p, MAP_LVL_SITES[i].n);
+        bslog("PATCH   ★地图等级门槛 @ %08X: %s",
+              (unsigned)(MAP_LVL_SITES[i].va + MAP_LVL_SITES[i].off),
+              MAP_LVL_SITES[i].what);
+        done++;
+    }
+    if (done == MAP_LVL_SITE_COUNT) {
+        InterlockedExchange(&g_map_lvl_patched, 1);
+        return 1;
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
 /* 联机闪退修复 —— 中文输入法（IME）候选窗在 stage 切换后踩已释放的聊天输入框  */
 /*                                                                            */
 /*   实测（bug调查/3，12 份 mdmp 全部同一现场）：收到 0x0402「全员加载完成，   */
@@ -1967,12 +2073,14 @@ static int try_patch_ime_cand_layout_guard(void)
 /*                                                                            */
 /*   Data/map.ini 里每张地图都有一行 OpenLocale（注释写着                     */
 /*   `1 - 한국, 2 - 일본, 4 - 중국`，按位或）。中国版跑起来时全局             */
-/*   `[[0x72e320]]` = 2，客户端两处都拿 `1 << 2 = 4` 去和这个掩码 test：      */
+/*   `[[0x72e320]]` = 2，客户端的掩码测试都拿 `1 << 2 = 4` 去和它 test：      */
 /*                                                                            */
 /*     0x40b419  地图目录加载（`0x40b2a1`，启动时读 map.ini）                 */
 /*               掩码不匹配 -> 0x40b47a 把记录直接 delete 掉                  */
 /*     0x4368cf  「建立房间(任务)」对话框填「任务」下拉框（`0x4365e1`）        */
 /*               掩码不匹配 -> 跳过这一条                                     */
+/*     0x4653a8  对战房间「设定」的「地图」下拉框填充（0x4652b3 里的循环）     */
+/*               掩码不匹配 -> 跳过这一条（第五处 patch，见下面）              */
 /*                                                                            */
 /*   而 map.ini 里：                                                          */
 /*     QuestId 1 불프로그 / 2 드라카 / 3 비밀의 섬 / 4 자미로건쉽  OpenLocale=7 */
@@ -1980,11 +2088,12 @@ static int try_patch_ime_cand_layout_guard(void)
 /*     QuestId 8 푸른 하늘                                        OpenLocale=0 */
 /*   —— **4 个关卡不是资源缺失，是中国版当年没上线**（地图文件全都在）。      */
 /*                                                                            */
-/*   改法：把这两处的「地区序号」当成 0（韩国）来算，也就是                   */
-/*   `mov ecx,[...]` -> `xor ecx,ecx`，2 字节换 2 字节。                      */
-/*   这样掩码里带 bit0 的都放行（7 / 3 / 1），掩码为 0 的仍然被挡住 ——        */
-/*   Quest08 和一堆没写 OpenLocale 的条目（含缺文件的 Festivalm01）           */
-/*   照样进不来。比直接 NOP 掉判定保守。                                      */
+/*   改法：第二处（任务下拉框）把「地区序号」当成 0（韩国）来算，             */
+/*   `mov ecx,[...]` -> `xor ecx,ecx`，掩码里带 bit0 的都放行（7 / 3 / 1）。   */
+/*   第一处（目录加载）会话 39 起升级为**把掩码判定整个旁路**（NOP 掉 je，     */
+/*   见下面「全部解锁」那段）—— 掩码为 0 的条目也保留；缺文件的 Quest08 /     */
+/*   Festivalm01 靠「任何列表都选不到」兜底（任务表没有 id 8、무투전模式       */
+/*   在中国区建房下拉里被隐藏）。                                             */
 /*                                                                            */
 /*   时机：两处都要**早于**启动时的 map.ini 加载。patch 线程在 +2.5s 打，      */
 /*   那时资源加载还没开始（见 patch_thread 里 SnowCipher 那段的说明）。       */
@@ -2030,8 +2139,42 @@ static int try_patch_ime_cand_layout_guard(void)
 /*   尤其**不碰** `0x466309` 那句「中国版难度上限 3 档」。                    */
 /*                                                                            */
 /*   设环境变量 BSHOOK_KEEP_REGION_LOCK=1 可以整组保留原版行为。              */
+/*   ── 第五处：对战房间「设定」里「地图」下拉框的地域掩码 ──                  */
+/*                                                                            */
+/*   前两处只管**地图目录**和「建房(任务)」的任务下拉框。对战房间是另一条路：    */
+/*                                                                            */
+/*     · 建房对话框（CreateRoomNewUI.ui）**根本没有地图控件** —— 对战房的       */
+/*       0x0201 建房请求里地图名恒为空串，地图是进房之后客户端自己挑的；         */
+/*     · 挑图走 0x468176 / 0x469c17（randomMapBtn「랜덤」按钮 / 进房自动挑）    */
+/*       -> 0x40b6e5：先 0x40b5d0 按模式/等级/人数上限过滤内存目录，            */
+/*       再拿随机数取一张 —— **这条链不看 OpenLocale**；                        */
+/*     · 而房间设定里「地图」下拉框（SelectPvpMap.ui 的 mapCB，                 */
+/*       [dlg+0x594]）的填充（0x4652b3 虚函数里 0x46534e 的循环）**单独再做     */
+/*       一次** `1 << 地区序号` 的掩码测试（0x4653a8），用的还是真实地区 2。     */
+/*                                                                            */
+/*   后果（用户实测报到）：第一处 patch 放进目录的 OpenLocale=1/3 地图          */
+/*   （韩服活动图 Festival 系列 + Iceria/Desert/Garden 等，.map 和 BGM 都在     */
+/*   包里、能正常玩）**偶尔会随机成为新房间的地图**，但在「地图」下拉列表里     */
+/*   永远找不到 —— 因为只有下拉框那一处还在按中国区过滤。                      */
+/*                                                                            */
+/*   ── 会话 39 复测后用户拍板「全部解锁」：第一处和第五处升级为               */
+/*   **把掩码判定整个旁路**（NOP 掉 je），不再只是「当成韩国区」：              */
+/*                                                                            */
+/*     · 第一处 0x40b42a `je 0x40b442`（74 16 -> 90 90）：不跳 = 走 0x40b42c   */
+/*       的「插入目录」分支；跳 = 0x40b442 的「析构 + 释放记录」（0x40b47a）。 */
+/*       NOP 之后 map.ini 里**没写 OpenLocale（掩码 0）的条目也保留** ——       */
+/*       沙漠（Desert01/02/03）、카멜궁 1~3층（Camel00/01/02）、                */
+/*       CamelCulvert02 这些「全世界都没开放」的图（文件都在包里）进目录；      */
+/*       连带进来的还有缺文件的 Festivalm01（Mutu 限定）和 Quest08/Quest08_1   */
+/*       （QuestId=8，不在建房任务表 0x6dc52c {3,2,1,4,5,6,7} 里）——           */
+/*       两者在对战/闯关的任何列表里都选不到，只会安静地躺在目录里。            */
+/*     · 第五处 0x4653be `je 0x4654b3`（0F 84 EF 00 00 00 -> 6×90）：不跳 =   */
+/*       加进「地图」下拉框。只把地区序号当 0 还挡掩码 0 的图，所以同样旁路。  */
+/*                                                                            */
+/*   等级门槛（MinLevel）后来也按用户要求一并解除了 —— 见下面独立的            */
+/*   「地图等级门槛 patch」（0x40b623，D142），不挂在本组、有单独的回退开关。   */
 /* -------------------------------------------------------------------------- */
-#define REGION_PATCH_COUNT 4
+#define REGION_PATCH_COUNT 5
 /* 每处都验一段上下文再动手：2 字节的特征太短，光比 `8B 08` 容易撞上密文。 */
 static const struct {
     unsigned int va;          /* 特征串起始 VA                    */
@@ -2042,11 +2185,11 @@ static const struct {
     const unsigned char *fix; /* 替换字节                         */
     const char *what;
 } REGION_SITES[REGION_PATCH_COUNT] = {
-    { 0x0040b419u, 19, 5, 2,
+    { 0x0040b419u, 19, 17, 2,
       (const unsigned char *)"\xA1\x20\xE3\x72\x00\x8B\x08\x8B\x53\x48"
                              "\x33\xC0\x40\xD3\xE0\x85\xC2\x74\x16",
-      (const unsigned char *)"\x33\xC9",          /* xor ecx,ecx */
-      "地图目录加载（地区序号 2 中国 -> 0 韩国）" },
+      (const unsigned char *)"\x90\x90",          /* NOP 掉 je：掩码不匹配也不删记录 */
+      "地图目录加载（掩码判定整个旁路 —— 全部解锁）" },
     { 0x004368cfu, 20, 6, 2,
       (const unsigned char *)"\x8B\x0D\x20\xE3\x72\x00\x8B\x09\x8B\x70"
                              "\x48\x33\xD2\x42\xD3\xE2\x85\xD6\x74\x1A",
@@ -2062,6 +2205,12 @@ static const struct {
                              "\x48\x0F\x85\xC3\x00\x00\x00",
       (const unsigned char *)"\xEB\x45",          /* je -> jmp（永远走韩/日分支）*/
       "房间「关卡 ◀ ▶」的关卡环（4 关 -> 7 关）" },
+    { 0x004653a8u, 28, 22, 6,
+      (const unsigned char *)"\xA1\x20\xE3\x72\x00\x8B\x08\x8B\x33\x8B\x56"
+                             "\x48\x33\xC0\x40\xD3\xE0\x83\xC3\x04\x85\xC2"
+                             "\x0F\x84\xEF\x00\x00\x00",
+      (const unsigned char *)"\x90\x90\x90\x90\x90\x90",  /* NOP 掉 je：掩码 0 也进列表 */
+      "对战房间「地图」下拉框（掩码判定整个旁路 —— 全部解锁）" },
 };
 static volatile LONG g_region_patched = 0;
 
@@ -2580,7 +2729,7 @@ static DWORD WINAPI patch_thread(LPVOID param)
         }
         if (!g_region_patched)
             bslog("PATCH   !! 超时未能 patch 地区差异"
-                  "（0x40b419 / 0x4368cf / 0x4f67d1 / 0x46631d "
+                  "（0x40b419 / 0x4368cf / 0x4f67d1 / 0x46631d / 0x4653a8 "
                   "的特征串一直对不上）");
     }
 
@@ -2591,6 +2740,20 @@ static DWORD WINAPI patch_thread(LPVOID param)
     if (!g_reflect_visual_patched)
         bslog("PATCH   !! 超时未能 patch 反射道具视觉"
               "（0x5090e2 的特征串一直对不上）");
+
+    /* 地图等级门槛（D142）：不赶时机 —— 0x40b5d0 第一次跑要到进房选图，
+       远晚于 +2.5s 的解壳窗口。 */
+    if (map_level_lock_kept()) {
+        bslog("PATCH   BSHOOK_KEEP_MAP_LEVEL_LOCK 已设，保留原版地图等级门槛");
+    } else {
+        for (ticks = 0; !g_stop && !g_map_lvl_patched && ticks < 2000; ticks++) {
+            if (try_patch_map_level_gate()) break;
+            Sleep(2);
+        }
+        if (!g_map_lvl_patched)
+            bslog("PATCH   !! 超时未能 patch 地图等级门槛"
+                  "（0x40b623 的特征串一直对不上）");
+    }
 
     /* IME 闪退修复（联机主崩溃，bug调查/3 + bug调查/5）：三处配套，缺一不可。
        不赶时机（解壳后随时可打），但和其它 patch 一样要等特征串出现。 */
