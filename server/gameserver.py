@@ -113,6 +113,23 @@ LOGIN_RESULT_BAD_TICKET = 3
 #:   三种情况玩家该做的事完全一样 —— 重新登录一次 —— 而这句话正是这个意思；
 #:   回 3 那句「在无法连接的地方尝试了连接。」只会让人以为是被封 IP 或走错服务器。
 LOGIN_RESULT_SUPERSEDED = 2
+#: ★★★ 服务端 -> 客户端：**告诉客户端「你自己叫什么」**（§222）。
+#:
+#: 分发 `0x54e036` 的 switch 把 0x0102 送到 `ServerConnection` 虚表**槽 17**
+#: （`0x54f23a`）。那个函数只做三件事：
+#:
+#:     读一个 wstring（`0x5d5b3a` = u16 字符数 + UTF-16LE）
+#:     -> `[0x72e2a4]+0x14`
+#:     -> ★ 全局 wstring **`0x72e328`** = 「本机玩家自己的名字」
+#:
+#: `0x72e328` 是**唯一**的来源：全镜像写它的只有这个函数体
+#: （另一条连接上的 `0x5568c1` 是它一模一样的副本），其余全是读。而读它的地方包括
+#: 建房对话框的默认房间名（`0x43616f`：`Format(dest, tr("%s님과 가볍게 한겜"),
+#: [0x72e328])`，`Chinese.ini` 译文是「与%s一起游戏吧!」）以及
+#: `0x422c5f` 那种「这条消息是不是我自己发的」比较。
+#:
+#: 不发这一发，那个 `%s` 就是空串 —— 用户看到的「与一起游戏吧」正是这个。
+OP_SET_PLAYER_NAME = 0x0102
 #: 房间列表。两个方向同号：客户端方向是请求（12 字节，§139），
 #: 服务端方向是列表（§138）。
 OP_LIST_SESSION = 0x0200
@@ -664,6 +681,17 @@ def build_gsp_rep_login(result=0, account=None, channel_code=0, channel_index=0)
             + w_wstr("")
             + w_i32(0)
             + w_u8(0) + w_u8(0))
+
+
+def build_set_player_name(nickname):
+    """opcode 0x0102 —— 「你自己叫什么」。载荷就是一个 wstring，没有别的字段。
+
+    处理器是 `ServerConnection` 虚表槽 17（`0x54f23a`）：读一个 wstring，
+    写进 `[0x72e2a4]+0x14` 和全局 `0x72e328`。**全镜像写 `0x72e328` 的只有
+    这个函数体**（`0x5568c1` 是它的副本），而建房对话框的默认房间名
+    （`0x43616f`）拿它当 `%s` —— 不发就是「与一起游戏吧」（§222）。
+    """
+    return w_wstr(str(nickname or ""))
 
 
 def build_rep_money(money=0, experience=0, level_start_exp=0, next_level_exp=0,
@@ -2006,6 +2034,32 @@ PVP_ITEM_IDS = (10300, 10301, 10303, 10304, 10306, 10307, 10308,
 #: 摆出来只会让人以为捡错了）。
 PVP_TEAM_ITEM_IDS = (10313, 10314)
 
+#: ★★★ **道具模式地图上的三把「捡了就换武器」的特殊武器**（§223）。
+#:
+#: 上面那 14 + 2 件外观全是一个 `Game/ItemBox` 箱子；**这三件不是** ——
+#: 它们的构造函数 push 的是角色武器网格，地上躺着的就是那把枪：
+#:
+#: | id | 类 | 模型 | `vf_11c` 给的武器（`weapon.ini`）|
+#: |---|---|---|---|
+#: | 10200 | `NukeLauncherItem` | `Ch00/ch00D0005.msh` | 1900020 `미니핵런처` 迷你核弹发射器 |
+#: | 10201 | `FireThrowerItem`  | `Ch00/ch00D0004.msh` | 1900000 `화염방사기` 火焰喷射器 |
+#: | 10202 | `WaterCannonItem`  | `Ch00/ch00D0004.msh` | 1900030 `물대포` 水炮 |
+#:
+#: ★ **绝不能进 `GRANTABLE_ITEM_IDS`**：它们建构时基类第 4 个参数是 **0**
+#: （`0x522240` 把它原样转给 `0x51f24a`，写进 `[item+0x2a9]`），所以
+#: `Item::vf_d4`（`0x51f447`）那条「当场生效」的分支对它们**成立** ——
+#: 拾取放行 `0x0405` 一到，客户端自己就调 `vf_11c` 换枪了（`0x5231de` /
+#: `0x521fad` / `0x5251a4`：`Character::GiveWeapon(0x517121)`）。
+#: 再补一发 `0x040b` 等于凭空往道具槽里多塞一件（§194 已经写死了这条规矩）。
+#:
+#: ⚠ `vf_11c` 里有一句 `cmp [character+0x2ac], 0x409f7d()` —— **只有那台机器上的
+#: 本地玩家换枪**。所以拾取放行必须**广播**（`on_get_item` 本来就是广播），
+#: 捡的人那台机器才轮得到换枪，别人那台只把枪从地上抹掉。
+#:
+#: ⚠ 它们**不在** `Item.ini` 里，也不该在 —— `Item.ini` 那张表是给
+#: `UseItemEffect`（按 Ctrl）用的，换武器根本不走那条路（§201 只约束进槽的道具）。
+PVP_WEAPON_ITEM_IDS = (10200, 10201, 10202)
+
 #: ★ 捡到之后**要进道具槽**的物件 id（§194）。
 #:
 #: 判据不是「谁刷的」而是**物件本身的类型**：这 17 个类构造时基类第 4 个参数
@@ -2039,6 +2093,14 @@ ITEM_SPAWN_FIRST_DELAY = 5.0
 ITEM_SPAWN_INTERVAL = 10.0
 ITEM_SPAWN_MAX_ALIVE = 8
 
+#: 一次刷新里，三把特殊武器（`PVP_WEAPON_ITEM_IDS`）各占几个签。
+#:
+#: 池子是「每个 id 一个签，`random.choice` 均匀抽」，所以这个数就是武器的
+#: 相对权重：1 = 和普通道具一样常见（个人战 3/17 ≈ 18% 的刷新是武器），
+#: 0 = 干脆不刷武器。★ **原版的比例同样无从考证**（D109 的老规矩），
+#: 这个数是我们定的，想调就在这里改，改完**必须重启服务端**（铁律 7）。
+PVP_WEAPON_SPAWN_WEIGHT = 1
+
 #: 刷新点的坐标范围。**服务端不需要知道地图几何**（§192）：客户端收到
 #: `0x0404` 会先 `fmod` 进地图（`X % World.width` / `Y % World.height`），
 #: 再把埋在地形里的物件以 5 像素为步长顶到 300 像素内的空位上。
@@ -2064,6 +2126,20 @@ CREATE_ITEM_SIZE = struct.calcsize(CREATE_ITEM_FORMAT)
 #: `0x0010c9xx` 一带（死亡上报包里的 handle 就是同一个字段），
 #: 起点拉到 `0x40000000` 谁也够不着，而且还是正 int32、不等于 -1。
 ITEM_HANDLE_BASE = 0x40000000
+
+
+def item_spawn_pool(team_mode=False):
+    """道具模式一次刷新可以抽到的全部物件 id（含重复 = 权重）。
+
+    三块：**箱子道具**（`PVP_ITEM_IDS`，捡了进 4 格道具槽）+
+    **特殊武器**（`PVP_WEAPON_ITEM_IDS`，捡了当场换枪，§223）+
+    组队战才加的**全队道具**（`PVP_TEAM_ITEM_IDS`）。
+
+    武器按 `PVP_WEAPON_SPAWN_WEIGHT` 重复几遍来配比例；填 0 就是不刷武器。
+    """
+    weapons = tuple(PVP_WEAPON_ITEM_IDS) * max(0, int(PVP_WEAPON_SPAWN_WEIGHT))
+    return (tuple(PVP_ITEM_IDS) + weapons
+            + (tuple(PVP_TEAM_ITEM_IDS) if team_mode else ()))
 
 
 def parse_create_item(payload):
@@ -3054,6 +3130,9 @@ class RoomQuest:
 
         坐标是随便给的正数：客户端会 `fmod` 进地图、再把埋在地形里的物件
         顶到地面上（§192），服务端不需要任何地图几何数据。
+
+        抽签的池子见 `item_spawn_pool()` —— 除了箱子道具，还有三把
+        **捡了当场换枪**的特殊武器（核弹发射器 / 火焰喷射器 / 水炮，§223）。
         """
         now = time.monotonic() if now is None else now
         if now < self.next_item_spawn_at:
@@ -3064,7 +3143,7 @@ class RoomQuest:
         if len(self.items_on_map) >= ITEM_SPAWN_MAX_ALIVE:
             return None
         rng = random_source if random_source is not None else random
-        pool = PVP_ITEM_IDS + (PVP_TEAM_ITEM_IDS if team_mode else ())
+        pool = item_spawn_pool(team_mode)
         item_id = rng.choice(pool)
         x = rng.uniform(*ITEM_SPAWN_X_RANGE)
         y = rng.uniform(*ITEM_SPAWN_Y_RANGE)
@@ -4709,6 +4788,9 @@ class Conn:
         self.send(build_game(OP_REP_LOGIN, build_gsp_rep_login(
             self.args.login_result, self.account,
             self.channel_code, self.channel_index)))
+        # 登录包三个字符串字段一个都没落到「我自己的名字」上（`0x54f2cc` 只把
+        # 第三个存进只写不读的 `0x72e37c`），所以要单独补一发 0x0102。
+        self.send_player_name(reason="（登录后下发）")
         # 登录包带得动等级和经验，唯独带不动金币（`0x54f2cc` 不写 0x72e330）。
         # 补一发 0x0600，右上角数据栏才和存档完全一致。
         self.send_rep_money(reason="（登录后补发，登录包没有金币字段）")
@@ -4734,6 +4816,23 @@ class Conn:
         name, account = self.accounts.get_account(self.account_name)
         if account is not None:
             self.account_name, self.account = name, account
+
+    def my_nickname(self):
+        """「我」在别人眼里叫什么。和座位里那一格（`build_session_slot`）同源。"""
+        return display_name(self.account) or (self.account_name or "")
+
+    def send_player_name(self, reason=""):
+        """把「你自己叫什么」下发给客户端（opcode 0x0102，§222）。
+
+        ★ 不发这一发，客户端全局 `0x72e328` 永远是空串，建房对话框的默认
+        房间名就变成「与一起游戏吧!」（格式串 `与%s一起游戏吧!` 的 `%s`
+        取的正是这个全局）。写它的只有 `0x54f23a`（= 收 0x0102）那个函数体。
+        """
+        nickname = self.my_nickname()
+        self.log(f"← 回 gspSetPlayerName(0x0102) 昵称={nickname!r}"
+                 f" —— 建房默认房名的那个 %s{reason}")
+        self.send(build_game(OP_SET_PLAYER_NAME,
+                             build_set_player_name(nickname)))
 
     def send_rep_money(self, reason=""):
         """把存档里的金币/经验/等级下发（opcode 0x0600）。

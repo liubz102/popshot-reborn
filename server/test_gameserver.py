@@ -2263,6 +2263,77 @@ class QuestDifficultyTests(unittest.TestCase):
                         opcodes.index(OP_END_GAME))
 
 
+class PlayerNameTests(unittest.TestCase):
+    """「你自己叫什么」：`0x0102`（§222）。
+
+    用户实机报的：**建房时默认房间名是「与一起游戏吧」，昵称没拼进去。**
+
+    格式串是 `Chinese.ini` 的 `与%s一起游戏吧!`，那个 `%s`（`0x43616f`）
+    取的是全局 wstring `0x72e328`。全镜像**只有**收 0x0102 的
+    `ServerConnection` 虚表槽 17（`0x54f23a`）写它 —— 我们从来没发过，
+    所以它恒是空串。
+    """
+
+    Args = QuestDifficultyTests.Args
+    FakeStore = QuestDifficultyTests.FakeStore
+    FakeTickets = QuestDifficultyTests.FakeTickets
+
+    def make_conn(self, account=None):
+        conn = QuestDifficultyTests.make_conn(self, account=account)
+        conn.channel_code = 0
+        conn.channel_index = 0
+        conn.args.login_result = 0
+        return conn
+
+    def login(self, account=None):
+        conn = self.make_conn(account=account)
+        gameserver.Conn.on_game_packet(conn, 0x0100, w_wstr("tester"))
+        return conn
+
+    @staticmethod
+    def names(conn):
+        """收到的每一发 0x0102 解回昵称。"""
+        out = []
+        for frame in conn.sent:
+            opcode, body = take_frame(bytearray(frame))[1:3]
+            if opcode == gameserver.OP_SET_PLAYER_NAME:
+                out.append(gameserver.Reader(body).wstr())
+        return out
+
+    # -- 线格式 ------------------------------------------------------------
+    def test_the_payload_is_just_one_wstring(self):
+        # `0x54f23a` 只调一次 `0x5d5b3a`（u16 字符数 + UTF-16LE），没有别的字段。
+        self.assertEqual(w_wstr("阿狗"),
+                         gameserver.build_set_player_name("阿狗"))
+
+    def test_an_empty_nickname_is_still_a_valid_packet(self):
+        self.assertEqual(w_wstr(""), gameserver.build_set_player_name(None))
+
+    # -- 登录时下发 --------------------------------------------------------
+    def test_login_sends_the_nickname(self):
+        conn = self.login(account={
+            "experience": 0, "money": 0, "level": 1,
+            "display_name": "阿狗"})
+        self.assertEqual(["阿狗"], self.names(conn))
+
+    def test_the_nickname_falls_back_to_the_account_name(self):
+        # 存档没填昵称时，座位里显示的也是用户名，两处必须同一个口径。
+        conn = self.login(account={"experience": 0, "money": 0, "level": 1})
+        self.assertEqual(["tester"], self.names(conn))
+
+    def test_it_comes_after_the_login_reply(self):
+        # `0x54f23a` 要写 `[0x72e2a4]+0x14`，那个全局在登录应答那一路才被填。
+        conn = self.login()
+        opcodes = [take_frame(bytearray(f))[1] for f in conn.sent]
+        self.assertLess(opcodes.index(gameserver.OP_REP_LOGIN),
+                        opcodes.index(gameserver.OP_SET_PLAYER_NAME))
+
+    def test_a_rejected_login_gets_no_nickname(self):
+        conn = self.make_conn()
+        gameserver.Conn.on_game_packet(conn, 0x0100, w_wstr(""))
+        self.assertEqual([], self.names(conn))
+
+
 class CharacterUnlockTests(unittest.TestCase):
     """角色解锁：`0x030b gspSlotEquippedList`（会话 21，§119）。
 

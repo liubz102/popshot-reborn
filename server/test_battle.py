@@ -652,7 +652,8 @@ class ItemSpawnTests(ItemSpawnBase):
         self.spawn_and_take(40)
         ids = {item_id for _, item_id, _, _ in self.spawned()}
         self.assertTrue(ids)
-        self.assertTrue(ids <= set(gameserver.PVP_ITEM_IDS))
+        self.assertTrue(ids <= set(gameserver.PVP_ITEM_IDS
+                                   + gameserver.PVP_WEAPON_ITEM_IDS))
         self.assertNotIn(10305, ids)
         for item_id in ids:
             self.assertIn(item_id, gameserver.ITEM_NAMES)
@@ -765,35 +766,61 @@ class ItemPoolTests(unittest.TestCase):
         return recorder.pools[0]
 
     def test_a_free_for_all_pool_has_no_team_items(self):
-        self.assertEqual(gameserver.PVP_ITEM_IDS, self.pool_for(False))
+        self.assertEqual(gameserver.PVP_ITEM_IDS
+                         + gameserver.PVP_WEAPON_ITEM_IDS,
+                         self.pool_for(False))
 
     def test_a_team_round_adds_the_team_items(self):
         self.assertEqual(
-            gameserver.PVP_ITEM_IDS + gameserver.PVP_TEAM_ITEM_IDS,
+            gameserver.PVP_ITEM_IDS + gameserver.PVP_WEAPON_ITEM_IDS
+            + gameserver.PVP_TEAM_ITEM_IDS,
             self.pool_for(True))
+
+    def test_the_three_special_weapons_are_in_the_pool(self):
+        # ★ 用户报的第二条：「道具模式只掉道具，从没见过武器」（§223）。
+        #   三把武器和箱子道具走同一发 0x0404，缺的只是没进池子。
+        pool = set(self.pool_for(False))
+        for item_id in (10200, 10201, 10202):
+            self.assertIn(item_id, pool)
 
     def test_every_id_in_the_pool_can_actually_be_built(self):
         # ★ 10305（FastShot）在 `Item.ini` 里有，但工厂 0x513278 的跳表
         #   `0x513b56` 那一格指的是 default —— 发下去客户端建不出对象（§191）。
-        for pool in (gameserver.PVP_ITEM_IDS, gameserver.PVP_TEAM_ITEM_IDS):
+        for pool in (gameserver.PVP_ITEM_IDS, gameserver.PVP_TEAM_ITEM_IDS,
+                     gameserver.PVP_WEAPON_ITEM_IDS):
             self.assertNotIn(10305, pool)
             for item_id in pool:
                 self.assertIn(item_id, gameserver.ITEM_NAMES)
-                self.assertTrue(10300 <= item_id <= 10500,
-                                f"{item_id} 不是 PvP 道具的 id 段")
+        for item_id in gameserver.PVP_ITEM_IDS + gameserver.PVP_TEAM_ITEM_IDS:
+            self.assertTrue(10300 <= item_id <= 10500,
+                            f"{item_id} 不是 PvP 道具的 id 段")
+        for item_id in gameserver.PVP_WEAPON_ITEM_IDS:
+            self.assertTrue(10200 <= item_id <= 10202,
+                            f"{item_id} 不是特殊武器的 id 段")
 
     def test_the_pools_do_not_overlap(self):
         self.assertFalse(set(gameserver.PVP_ITEM_IDS)
                          & set(gameserver.PVP_TEAM_ITEM_IDS))
+        self.assertFalse(set(gameserver.PVP_WEAPON_ITEM_IDS)
+                         & set(gameserver.PVP_ITEM_IDS
+                               + gameserver.PVP_TEAM_ITEM_IDS))
 
-    def test_every_id_in_the_pool_has_an_item_ini_record(self):
+    def test_every_boxed_item_in_the_pool_has_an_item_ini_record(self):
         # ★★ `UseItemEffect` 第一件事就是查 `Item.ini` 的记录表，查不到
         #    **直接 return**（§201）。所以「工厂建得出箱子」还不够 ——
         #    没记录的道具捡起来能进槽，按 Ctrl 却彻底没反应。
+        #    ⚠ 这条只管**进槽的箱子道具**：三把特殊武器捡起来当场换枪，
+        #    压根不走 `UseItemEffect`，`Item.ini` 里没有它们也是对的（§223）。
         for pool in (gameserver.PVP_ITEM_IDS, gameserver.PVP_TEAM_ITEM_IDS):
             for item_id in pool:
                 self.assertIn(item_id, gameserver.ITEM_INI_ITEM_IDS,
                               f"{item_id} 在 Item.ini 里没有记录，用了不会有效果")
+
+    def test_the_weapons_never_go_into_an_item_slot(self):
+        # 武器 `[item+0x2a9] == 0` -> 拾取当场生效；再补一发 0x040b
+        # 等于凭空多一件道具（§194 / §223）。
+        for item_id in gameserver.PVP_WEAPON_ITEM_IDS:
+            self.assertNotIn(item_id, gameserver.GRANTABLE_ITEM_IDS)
 
     def test_the_sp_up_item_stays_out_of_the_pool(self):
         # 10302 是「工厂建得出、但 Item.ini 没这一节」的那一个（§201）。
@@ -813,7 +840,9 @@ class ItemSpawnTeamModeTests(ItemSpawnBase):
         self.spawn_and_take(30)
         ids = {item_id for _, item_id, _, _ in self.spawned()}
         self.assertTrue(
-            ids <= set(gameserver.PVP_ITEM_IDS + gameserver.PVP_TEAM_ITEM_IDS))
+            ids <= set(gameserver.PVP_ITEM_IDS
+                       + gameserver.PVP_WEAPON_ITEM_IDS
+                       + gameserver.PVP_TEAM_ITEM_IDS))
 
 
 class ItemSpawnFreeForAllTests(ItemSpawnBase):
@@ -866,7 +895,20 @@ class QuestRoomItemSpawnTests(ItemSpawnBase):
 # 各自只有一个调用点，全都得服务端发。
 # ----------------------------------------------------------------------------
 class ItemSlotBase(ItemSpawnBase):
-    """道具模式的房间，且带上「刷一件 -> 捡走」的两个夹具。"""
+    """道具模式的房间，且带上「刷一件 -> 捡走」的两个夹具。
+
+    ★ 这一整组测的是**道具槽**，所以夹具把特殊武器的权重压成 0（§223）——
+    武器捡起来是当场换枪、根本不进槽，随机抽到一把就会让「捡了进槽」
+    这一类断言偶发地红。武器自己那条路由 `ItemPoolTests` 和
+    `test_quest_drops_are_not_grantable` 钉住。
+    """
+
+    def setUp(self):
+        super().setUp()
+        saved = gameserver.PVP_WEAPON_SPAWN_WEIGHT
+        gameserver.PVP_WEAPON_SPAWN_WEIGHT = 0
+        self.addCleanup(setattr, gameserver,
+                        "PVP_WEAPON_SPAWN_WEIGHT", saved)
 
     def spawn_one(self):
         """刷一件道具，返回 `(句柄, 物件 id)`。"""
@@ -2027,6 +2069,7 @@ class RoomQuestTests(unittest.TestCase):
     def test_every_spawnable_item_is_grantable(self):
         # 服务端刷什么就得能进槽 —— 刷了一件进不了槽的东西，
         # 玩家看到的又是「捡了没用」。
+        # ⚠ 三把特殊武器是例外（拾取当场换枪，见下一条）。
         for item_id in gameserver.PVP_ITEM_IDS + gameserver.PVP_TEAM_ITEM_IDS:
             self.assertIn(item_id, gameserver.GRANTABLE_ITEM_IDS)
 
