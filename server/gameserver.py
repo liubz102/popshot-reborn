@@ -2787,7 +2787,12 @@ RESPAWN_WATCHDOG_S = 8.0
 
 
 def pvp_score_limit(player_count, team_mode):
-    """这一局要拿几分（几个人头）才算赢。抄自 `0x55be71`（§167）。"""
+    """这一局要拿几分（几个人头）才算赢。抄自 `0x55be71`（§167）。
+
+    ★ `player_count` 必须是**开局那一刻**的人数，不是「现在还剩几个人」——
+    客户端只在建关卡时算一次（§220）。别直接调它，走
+    `RoomQuest.score_limit()`，那里替你拿的是开局快照。
+    """
     count = int(player_count)
     if team_mode:
         return PVP_SCORE_LIMIT_TEAM.get(count // 2, PVP_SCORE_LIMIT_DEFAULT)
@@ -2902,6 +2907,16 @@ class RoomQuest:
         self.kills = [0] * ROOM_SEAT_COUNT
         #: 对战已经判过胜负了（只判一次，日志里也只写一行）。
         self.pvp_reason = None
+        #: ★ **开局那一刻**在座的座位号（升序）。§220：客户端所有「按人数
+        #: 定死的常量」都在建 `GameContextQuest` 那一刻算一次就再也不动了 ——
+        #: 夺分模式右上角那个「MAX N」（胜利分数线 `[victory+0x198]`）
+        #: 全镜像里只有构造函数 `0x55be71` 写过，**没有任何包能改它**。
+        #: 所以中途有人掉线时服务端也必须继续用这份快照算胜利线，
+        #: 否则线悄悄下移、HUD 上那个数字却纹丝不动（D139）。
+        #:
+        #: 「只剩一边了」那一条**不**用它 —— 那条要的就是「现在还剩几个人」。
+        self.start_seats = sorted({int(seat) for seat in seats
+                                   if 0 <= int(seat) < ROOM_SEAT_COUNT})
         #: ★ 客户端那张控制者表（句柄类别 20~25 那 6 格）的**镜像**，§180 / D103。
         #: 值是座位号。**权威在客户端** —— 它自己算初值、自己应用我们发的替换。
         #: 这份镜像只用来回答两个问题：「走的人到底欠着控制权吗」、
@@ -3179,6 +3194,29 @@ class RoomQuest:
             return False
         self.kills[killer] += 1
         return True
+
+    def score_limit(self, seats, team_mode):
+        """夺分模式这一局要拿几分才算赢 —— **客户端右上角那个「MAX N」**。
+
+        ★ 按**开局那一刻**的人数算，不按「现在还剩几个人」（§220 / D139）。
+
+        客户端的 `DeathMatchVictoryCondition` 是建 `GameContextQuest` 时
+        一次性造出来的（`0x4a36af` 调工厂 `0x55e0de`），构造函数
+        `0x55be71` 当场扫一遍六个座位、把分数线写进 `[victory+0x198]`。
+        全镜像里写这一格的只有那个构造函数，`[quest+0x384]` 那个指针也只在
+        构造函数里赋值 —— **中途没有任何包能让客户端改这个数**，
+        而 HUD（`0x497dec` 走 vtable `+0x24` 取这一格，配 `0x671a48 "MAX"`
+        和 `0x65e0b0 "%d"`）每帧都照它画。
+
+        所以三人个人战开打后掉线一个，客户端仍然认 6 分；服务端要是跟着
+        `len(seats)` 掉到 2 人份的 4 分，就会在 HUD 写着「MAX 6」的时候
+        按 4 分结算 —— 用户报的正是这个。
+
+        `start_seats` 为空的只有「协议试探 / 控制通道手搓包」建出来的那份
+        （`RoomQuest()` 不带座位），那条路退回按现在的人数算，行为一个字节不变。
+        """
+        count = len(self.start_seats) or len(seats)
+        return pvp_score_limit(count, team_mode)
 
     def pvp_finished(self, seats, teams, score_limit, *, team_mode=True,
                      time_limit_ms=PVP_TIME_LIMIT_MS, now=None):
@@ -4840,10 +4878,14 @@ class Conn:
         else:
             # 当前中文客户端房间列表可见的另一项是模式 3（夺分）。模式 1
             # 的 TimeAttack 仍沿用旧兜底；它在这版 UI 中不可选，另案再还原。
-            limit = pvp_score_limit(len(seats), team_mode)
+            # ★ 胜利线按**开局那一刻**的人数算（§220 / D139）：客户端右上角
+            #   那个「MAX N」在建关卡时就定死了，中途掉线不会重算，
+            #   服务端跟着现在的人数往下调就会和 HUD 对不上。
+            limit = quest.score_limit(seats, team_mode)
             reason = quest.pvp_finished(seats, teams, limit,
                                         team_mode=team_mode, now=now)
-            detail = f"杀敌数 {quest.kills}"
+            detail = (f"杀敌数 {quest.kills}；胜利线 {limit} 分"
+                      f"（按开局 {len(quest.start_seats) or len(seats)} 人算）")
             rule = "夺分"
         if reason is None:
             return False

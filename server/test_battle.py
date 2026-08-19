@@ -1522,6 +1522,93 @@ class PvpFinishTests(BattleRoom):
         self.assertEqual(5, gameserver.pvp_score_limit(1, False))
 
 
+class PvpScoreLimitFrozenTests(BattleRoom):
+    """★ 夺分的胜利线按**开局那一刻**的人数定死，中途掉线不重算（§220 / D139）。
+
+    用户 2026-08-19 实机报的：三人个人战本来「杀 6 个赢」，打到一半掉线
+    一个，服务端就改按 4 个结算了 —— 可客户端右上角那个「MAX 6」纹丝不动。
+    根因是客户端的 `DeathMatchVictoryCondition` 只在建关卡时造一次，
+    分数线写进 `[victory+0x198]` 之后全镜像里再没有第二处写它，
+    **没有任何包能让那个数字变**。所以要对齐只能是服务端跟着冻结。
+    """
+
+    session_type = 1
+    arguments = (0, 3, 0)       # 个人战 + 夺分模式 + 普通模式
+
+    def start_battle(self):
+        self.carol = make_conn("carol", self.accounts)
+        gameserver.Conn.on_game_packet(self.carol, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        for conn in (self.alice, self.bob, self.carol):
+            gameserver.Conn.on_game_packet(conn, OP_LOADING_DONE, b"")
+
+    def clear(self):
+        super().clear()
+        self.carol.sent.clear()
+
+    def kill(self, killer_seat, victim_seat, deaths=0):
+        """`killer_seat` 打死 `victim_seat` 一次（由受害者本人上报，bug调查/8）。"""
+        victim = (self.alice, self.bob, self.carol)[victim_seat]
+        gameserver.Conn.on_game_packet(
+            victim, OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=victim_seat * 100000 + 100001,
+                            seat=victim_seat, arg=killer_seat, deaths=deaths))
+
+    def test_the_kickoff_seats_are_remembered(self):
+        self.assertEqual([0, 1, 2], self.quest.start_seats)
+        self.assertEqual(6, self.quest.score_limit([0, 1, 2], False))
+
+    def test_a_disconnect_does_not_lower_the_score_limit(self):
+        gameserver.Conn.on_game_packet(self.carol, OP_LEAVE_SESSION, b"")
+        self.assertEqual([0, 1], gameserver.Conn.battle_seats(self.alice))
+        # 三人份的 6 分，不是剩下两人份的 4 分。
+        self.assertEqual(6, self.quest.score_limit([0, 1], False))
+        for i in range(5):
+            self.kill(0, 1, deaths=i)
+        self.assertFalse(self.quest.settled,
+                         "掉线一个就按 4 分结算 = 用户报的那个 bug")
+        self.kill(0, 1, deaths=5)
+        self.assertTrue(self.quest.settled)
+        self.assertIn("达到上限 6", self.quest.pvp_reason)
+
+    def test_the_last_one_standing_still_ends_the_round(self):
+        # 冻的只是分数线；「只剩一边了」要的就是**现在**还剩几个人。
+        gameserver.Conn.on_game_packet(self.carol, OP_LEAVE_SESSION, b"")
+        self.assertFalse(self.quest.settled)
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.assertTrue(self.quest.settled)
+        self.assertEqual("只剩一边了", self.quest.pvp_reason)
+
+    def test_the_next_round_uses_the_new_player_count(self):
+        # 冻结只管这一局：走的人没回来，下一局客户端自己也只按 2 人建
+        # 胜负条件（那时它才重新造 GameContextQuest），两边一起变成 4 分。
+        gameserver.Conn.on_game_packet(self.carol, OP_LEAVE_SESSION, b"")
+        for i in range(6):
+            self.kill(0, 1, deaths=i)
+        self.assertTrue(self.quest.settled)
+        for conn in (self.alice, self.bob):
+            gameserver.Conn.leave_game_result(conn)
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        for conn in (self.alice, self.bob):
+            gameserver.Conn.on_game_packet(conn, OP_LOADING_DONE, b"")
+        self.assertEqual([0, 1], self.quest.start_seats)
+        self.assertEqual(4, self.quest.score_limit([0, 1], False))
+        for i in range(4):
+            self.kill(0, 1, deaths=i)
+        self.assertIn("达到上限 4", self.quest.pvp_reason)
+
+    def test_a_questless_room_falls_back_to_the_live_count(self):
+        # 协议试探 / 控制通道手搓包建出来的那份没有开局快照，
+        # 按现在的人数算 —— 老行为一个字节不变。
+        self.assertEqual([], gameserver.RoomQuest().start_seats)
+        self.assertEqual(4, gameserver.RoomQuest().score_limit([0, 1], False))
+        self.assertEqual(6, gameserver.RoomQuest().score_limit([0, 1, 2], False))
+
+
 class SurvivalFinishTests(BattleRoom):
     """生存模式（arguments[1] == 0）：每人固定三条命。"""
 
