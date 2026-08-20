@@ -3259,21 +3259,61 @@ class RoomQuest:
                 for seat, (deadline, position) in sorted(self.respawn_due.items())
                 if now >= deadline]
 
-    def record_kill(self, killer_seat, victim_seat):
-        """给凶手记一分（对战的「分数」就是杀敌数，§167）。
+    def record_kill(self, killer_seat, victim_seat, *,
+                    teams=None, team_mode=False):
+        """按客户端 `Character::Die` 的口径给凶手加分 / **扣分**（§224）。
+
+        返回这一发让凶手的分数**变了多少**（`+1` / `-1` / `0`）。
 
         `killer_seat` 来自 `0x0408` 的第二个字节（`[char+0x158]`）：
         **开火者的座位号**（`0x4fedee` 写的），怪物 / 环境是 0xff，
-        自杀是自己的座位号。座位越界、打死自己、打死队友都不记分。
+        自杀是自己的座位号。
+
+        ★★ **自杀和杀队友要扣一分，不是「不记分」**（§224）。这是照抄
+        `Character::Die`（`0x4ffbb7`）—— 那个函数拿凶手座位查角色
+        （`0x404ff6`，座位没人就是 NULL、一分不动），然后三选一：
+
+        | 情况 | 客户端 | 服务端必须一样 |
+        |---|---|---|
+        | 凶手座位 == 受害者座位（`0x4fff15`）| `OnSuicide`（`0x506eba`）| **-1** |
+        | 组队战且两人同队（`0x500165`：先问 `0x409df1(描述符+0x18)==1`，再比队伍号）| 同上 | **-1** |
+        | 其余 | `OnKill`（`0x506e8c`）| **+1** |
+
+        `OnKill` / `OnSuicide` 干的是同两件事：改 `[char+0x604]`（**HUD 上
+        那个杀敌数就是它**，`0x497536` 每帧读来画）和
+        `GameContext::AddScore(座位, ±1)`（虚表槽 `+0x100` -> `0x48c98f`，
+        写 `[victory + 座位*0x2c + 0x5c]` —— 夺分胜负线 `0x55bf20` 读的那一格）。
+        两个数是一起动的，所以**玩家看见的数字和胜负判据永远相等**。
+
+        ★ 扣分有下限：`0x506eba` 开头 `test ecx,ecx / jle` —— 杀敌数
+        已经是 0 就整个函数什么都不做（**AddScore 也不调**），所以
+        扣不出负数，两边一起停在 0。
+
+        `teams` / `team_mode` 不给（协议试探 / 控制通道手搓包那条路，
+        那时压根没有房间）就只判自杀，行为和 §224 之前一个字节不差。
         """
         killer = int(killer_seat)
         victim = int(victim_seat)
-        if not 0 <= killer < ROOM_SEAT_COUNT or killer == victim:
-            return False
+        if not 0 <= killer < ROOM_SEAT_COUNT:
+            # 怪 / 环境（0xff）。客户端 `0x404ff6` 查不到角色，一分不动。
+            return 0
         if not 0 <= victim < ROOM_SEAT_COUNT:
-            return False
+            return 0
+        if teams is not None and killer not in teams:
+            # 凶手已经退房了 —— 客户端那边 `0x4045f9` 判定这个座位没人，
+            # `0x404ff6` 返回 NULL，加分扣分都不会发生。
+            return 0
+        penalty = killer == victim
+        if not penalty and team_mode and teams is not None:
+            penalty = (int(teams.get(killer, TEAM_NONE)) ==
+                       int(teams.get(victim, TEAM_NONE)))
+        if penalty:
+            if self.kills[killer] <= 0:
+                return 0
+            self.kills[killer] -= 1
+            return -1
         self.kills[killer] += 1
-        return True
+        return 1
 
     def score_limit(self, seats, team_mode):
         """夺分模式这一局要拿几分才算赢 —— **客户端右上角那个「MAX N」**。
@@ -4987,6 +5027,23 @@ class Conn:
                  f"tutorial_completed={self.account['tutorial_completed']} "
                  f"(下次登录下发状态 {tutorial_state(self.account)})")
 
+    def battle_teams(self):
+        """`(队伍表, 是不是组队战)` —— 判胜负和记分都要的两样东西。
+
+        队伍表 = `{座位号: 队伍号}`，**只含还在座的座位**。客户端那边
+        `0x4045f9`（读描述符 `[desc + 座位*0x3c + 0x40]`）判定座位有没有人
+        用的是同一份快照，所以「谁还在」两边是一致的（§224）。
+
+        不在房间里（协议试探 / 控制通道手搓包）时返回 `(None, False)` ——
+        调用方据此退回「没有房间信息」的老行为，别拿空字典当「全都不在座」。
+        """
+        room = self.lobby_room()
+        if room is None:
+            return None, False
+        teams = {i: seat.team for i, seat in enumerate(room.seats)
+                 if seat is not None}
+        return teams, room.team_layout() == TEAM_LAYOUT_TEAMS
+
     def check_pvp_finished(self, now=None):
         """对战这一局打完了没有？打完了就**由服务端**结算（§167）。
 
@@ -5009,9 +5066,7 @@ class Conn:
         if quest.settled or quest.pvp_reason is not None:
             return False
         seats = self.battle_seats()
-        teams = {i: seat.team for i, seat in enumerate(room.seats)
-                 if seat is not None}
-        team_mode = room.team_layout() == TEAM_LAYOUT_TEAMS
+        teams, team_mode = self.battle_teams()
         game_mode = self.pvp_game_mode()
         if game_mode in (PVP_MODE_SURVIVAL, PVP_MODE_FIGHT):
             time_limit = (PVP_FIGHT_TIME_LIMIT_MS
@@ -5197,8 +5252,14 @@ class Conn:
         quest.arm_respawn_watchdog(seat, (info["x"], info["y"]),
                                    after=self.respawn_watchdog_seconds())
         # 对战里「杀敌数」就是分数：凶手那一格是开火者的座位号（§167）。
-        if quest.record_kill(info["arg"], seat):
-            self.log(f"   对战计分: 座位 {info['arg']} 杀敌数 -> "
+        # ★ 自杀 / 杀队友要**扣**一分 —— 客户端 `Character::Die` 就是这么算的，
+        #   服务端不扣就会「HUD 写着 5、服务端已经数到 6」（§224）。
+        teams, team_mode = self.battle_teams()
+        delta = quest.record_kill(info["arg"], seat,
+                                  teams=teams, team_mode=team_mode)
+        if delta:
+            change = "+1" if delta > 0 else "-1（自杀 / 杀队友要扣分，§224）"
+            self.log(f"   对战计分: 座位 {info['arg']} 杀敌数 {change} -> "
                      f"{quest.kills[info['arg']]}")
         self.check_pvp_finished()
 

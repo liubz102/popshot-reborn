@@ -42,7 +42,8 @@ from gameserver import (                                       # noqa: E402
     SESSION_STATUS_WAITING, StartGameHandshake,
     build_change_controller_slot, build_game, take_frame, w_i32, w_wstr,
 )
-from lobby import Lobby, MOVE_INTO_ALREADY_PLAYING                  # noqa: E402
+from lobby import (Lobby, MOVE_INTO_ALREADY_PLAYING,               # noqa: E402
+                   TEAM_LAYOUT_TEAMS)
 import relayserver                                                  # noqa: E402
 
 
@@ -1479,6 +1480,62 @@ class PvpFinishTests(BattleRoom):
         self.kill(1, 1)
         self.assertEqual([0] * 6, self.quest.kills)
 
+    def test_a_suicide_costs_the_killer_a_point(self):
+        """★ 自杀要**扣**一分，不是「不记分」（§224）。
+
+        客户端 `Character::Die` 在凶手座位 == 受害者座位时走
+        `Character::OnSuicide`（`0x506eba`）：`[char+0x604]--`（HUD 上那个
+        杀敌数）＋ `AddScore(座位, -1)`（夺分胜负线读的那一格）。
+        """
+        self.kill(0, 1, deaths=0)
+        self.kill(0, 1, deaths=1)
+        self.assertEqual(2, self.quest.kills[0])
+        self.kill(0, 0)                     # 自己把自己炸死
+        self.assertEqual(1, self.quest.kills[0])
+
+    def test_a_suicide_never_pushes_the_score_below_zero(self):
+        # `0x506eba` 开头 `test ecx,ecx / jle` —— 已经是 0 就整个函数不做事。
+        self.kill(0, 0)
+        self.assertEqual([0] * 6, self.quest.kills)
+
+    def test_a_free_for_all_kill_is_never_treated_as_a_team_kill(self):
+        """★ 个人战里人人的队伍号都是 0，**不许**因此被当成杀队友。
+
+        客户端 `0x500165` 先问 `0x409df1(描述符+0x18) == 1`，不是组队战
+        就直接走正常加分那一路，一格队伍号都不读。
+        """
+        room = gameserver.Conn.lobby_room(self.alice)
+        self.assertEqual(room.seats[0].team, room.seats[1].team)
+        self.kill(0, 1)
+        self.assertEqual(1, self.quest.kills[0])
+
+    def test_a_kill_by_someone_who_already_left_scores_nothing(self):
+        """凶手已经退房 —— 客户端 `0x404ff6` 查不到角色，两边都不该动分。"""
+        room = gameserver.Conn.lobby_room(self.alice)
+        self.quest.kills[0] = 2
+        room.seats[0] = None
+        self.assertEqual(0, self.quest.record_kill(
+            0, 1, teams={1: 0}, team_mode=False))
+        self.assertEqual(2, self.quest.kills[0])
+
+    def test_a_suicide_delays_the_end_by_one_kill(self):
+        """★ bug调查/10 的回归：HUD 写着 5，服务端却已经数到 6 就结算了。
+
+        2 人个人战的上限是 4。打死对手 3 次（HUD 3）之后自杀一次
+        （HUD 2），得再打死两次才到 4 —— 服务端不扣那一分的话，
+        第 4 次死亡就会在玩家看到「3」的时候提前结算。
+        """
+        for i in range(3):
+            self.kill(0, 1, deaths=i)
+        self.kill(0, 0)
+        self.assertEqual(2, self.quest.kills[0])
+        self.kill(0, 1, deaths=3)
+        self.assertEqual(3, self.quest.kills[0])
+        self.assertFalse(self.quest.settled, "扣掉那一分就不该在这里结算")
+        self.kill(0, 1, deaths=4)
+        self.assertEqual(4, self.quest.kills[0])
+        self.assertTrue(self.quest.settled)
+
     def test_a_monster_kill_scores_nothing(self):
         # 怪物 / 环境的凶手字段是 0xff（线上就是这个字节）。
         self.kill(0xFF, 1)
@@ -1657,6 +1714,47 @@ class PvpScoreLimitFrozenTests(BattleRoom):
         self.assertEqual([], gameserver.RoomQuest().start_seats)
         self.assertEqual(4, gameserver.RoomQuest().score_limit([0, 1], False))
         self.assertEqual(6, gameserver.RoomQuest().score_limit([0, 1, 2], False))
+
+
+class PvpTeamKillTests(BattleRoom):
+    """★ 组队战里杀队友和自杀一样**扣一分**（§224）。
+
+    客户端 `Character::Die`（`0x4ffbb7`）在 `0x500165` 先问
+    `0x409df1(描述符+0x18) == 1`（是不是组队战），再比双方的队伍号
+    （`0x40462c` 读 `[desc + 座位*0x3c + 0x48]`）—— 同队就走
+    `Character::OnSuicide`，和自己把自己炸死走的是同一个 -1。
+    """
+
+    session_type = 1
+    arguments = (1, 3, 0)       # 组队战 + 夺分模式 + 普通模式
+
+    def kill(self, killer_seat, victim_seat, deaths=0):
+        gameserver.Conn.on_game_packet(
+            (self.alice, self.bob)[victim_seat], OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=victim_seat * 100000 + 100001,
+                            seat=victim_seat, arg=killer_seat, deaths=deaths))
+
+    def test_the_room_really_is_in_team_mode(self):
+        room = gameserver.Conn.lobby_room(self.alice)
+        self.assertEqual(TEAM_LAYOUT_TEAMS, room.team_layout())
+        self.assertNotEqual(room.seats[0].team, room.seats[1].team)
+
+    def test_killing_an_opponent_still_scores(self):
+        self.kill(0, 1)
+        self.assertEqual(1, self.quest.kills[0])
+
+    def test_killing_a_team_mate_costs_a_point(self):
+        room = gameserver.Conn.lobby_room(self.alice)
+        self.quest.kills[0] = 2
+        room.seats[1].team = room.seats[0].team
+        self.kill(0, 1)
+        self.assertEqual(1, self.quest.kills[0])
+
+    def test_a_team_kill_never_pushes_the_score_below_zero(self):
+        room = gameserver.Conn.lobby_room(self.alice)
+        room.seats[1].team = room.seats[0].team
+        self.kill(0, 1)
+        self.assertEqual([0] * 6, self.quest.kills)
 
 
 class SurvivalFinishTests(BattleRoom):
