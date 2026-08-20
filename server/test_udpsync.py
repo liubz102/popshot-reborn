@@ -22,7 +22,8 @@ if HERE not in sys.path:
 
 import config as server_config                                # noqa: E402
 import udpsync                                                 # noqa: E402
-from udpsync import (ACK_BAD_TICKET, ACK_OK, HeartbeatOrder,   # noqa: E402
+from udpsync import (ACK_BAD_TICKET, ACK_NOT_LOGGED_IN,        # noqa: E402
+                     ACK_OK, HeartbeatOrder,
                      MSG_DATA, MSG_HELLO, MSG_HELLO_ACK, MSG_PING,
                      MSG_PONG, ProtocolError, UdpSyncServer,
                      as_broadcast, build_data, build_hello,
@@ -338,6 +339,43 @@ class ServerTests(unittest.TestCase):
         self.hello("nope")
         self.assertEqual(parse_hello_ack(self.replies[-1][0])[0], ACK_BAD_TICKET)
         self.assertIsNone(self.server.endpoint_for(self.conn))
+
+    def test_a_ticket_that_has_not_logged_in_yet_is_not_a_failure(self):
+        """★★ 「登录包还在路上」和「根本不认识这张票」必须分得开。
+
+        `bshook` 一看到 `0x0100` 就发 HELLO，而游戏服那边还没把
+        `login_ticket` 写到连接上 —— **每一次登录都必然经过这个窗口**。
+        服务端手里有票据表，分得清这两件事，所以就该由它明说，
+        而不是让中继去猜「头几发不算数」。
+        """
+        self.server.bind_lookup(ticket_known=lambda t: t == "issued")
+        self.hello("issued")
+        self.assertEqual(parse_hello_ack(self.replies[-1][0])[0],
+                         ACK_NOT_LOGGED_IN)
+        self.assertIsNone(self.server.endpoint_for(self.conn))
+        # 票据表也不认得的，照旧是「认不出票据」
+        self.hello("nope")
+        self.assertEqual(parse_hello_ack(self.replies[-1][0])[0], ACK_BAD_TICKET)
+
+    def test_without_the_ticket_table_the_old_answer_is_kept(self):
+        """没注入 `ticket_known`（单独跑 gameserver.py 做协议试探）就退化成
+        原来的行为 —— 一律 `ACK_BAD_TICKET`，不会因此漏答或答错。"""
+        self.hello("issued")
+        self.assertEqual(parse_hello_ack(self.replies[-1][0])[0], ACK_BAD_TICKET)
+
+    def test_a_throwing_ticket_table_falls_back_to_bad_ticket(self):
+        """查票据抛异常也不能把 HELLO 这条路带崩。"""
+        def boom(_ticket):
+            raise RuntimeError("票据表炸了")
+        self.server.bind_lookup(ticket_known=boom)
+        self.hello("issued")
+        self.assertEqual(parse_hello_ack(self.replies[-1][0])[0], ACK_BAD_TICKET)
+
+    def test_a_logged_in_ticket_still_wins_over_the_pending_answer(self):
+        """已经登进来的连接优先 —— `ticket_known` 只在查不到连接时才问。"""
+        self.server.bind_lookup(ticket_known=lambda t: True)
+        self.hello("good")
+        self.assertEqual(parse_hello_ack(self.replies[-1][0])[0], ACK_OK)
 
     def test_data_from_an_unknown_address_is_dropped_silently(self):
         """没 HELLO 过就发数据 = 丢掉。TCP 那份没停过，玩家察觉不到。"""
@@ -873,6 +911,158 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(self.conn.fed, [])
         with self.relay._lock:
             self.assertEqual(self.relay.recent, [])
+
+
+# ----------------------------------------------------------------------------
+# 本机中继那两行提示的**噪音**判据（§225 第六节）
+# ----------------------------------------------------------------------------
+class RelayNoticeTests(unittest.TestCase):
+    """`relay.py` 打给玩家看的两行提示：什么时候该打、什么时候闭嘴。
+
+    ★ 这两条都不影响游戏（TCP 那份从来没停过），但玩家和我们**就是靠它们**
+      判断「UDP 到底通没通」。`bug调查/udp验证` 里两条都失真了：
+      「⚠ 20 秒没等到服务器回应」在游戏刚连上的 0.4 秒内就打了出来、
+      紧接着才是 `✓ 已认出`；而票据过期那 90 秒里「认不出票据」刷了 45 行。
+      误报一次就等于把人引去查一个根本不存在的防火墙问题。
+
+    这里**不开 socket**：`_to_remote` 在 `self.remote is None` 时直接返回，
+    所以可以拿一个没 `start()` 过的中继对象直接喂报文。
+    """
+
+    def setUp(self):
+        import relay                                            # noqa: PLC0415
+        self.relay_module = relay
+        self.lines = []
+        real_log = relay.log
+        relay.log = self.lines.append
+        self.addCleanup(setattr, relay, "log", real_log)
+        self.relay = relay.UdpSyncRelay("127.0.0.1", target_port=1,
+                                        local_port=1)
+
+    def hook_hello(self, ticket="tkt", downlink=False):
+        """模拟 `bshook` 发来的 HELLO（登录时一发、UDP 口 bind 成功时一发）。"""
+        flags = udpsync.HELLO_FLAG_DOWNLINK if downlink else 0
+        self.relay._on_hook_datagram(build_hello(ticket, flags))
+
+    def server_says(self, result, note=""):
+        """模拟服务器回一发 HELLO_ACK。两个计数器都由 `_pump_remote` 负责加。"""
+        self.relay.received += 1
+        self.relay.replies += 1
+        self.relay._on_remote_datagram(build_hello_ack(result, note))
+
+    def refusals(self):
+        return [x for x in self.lines if "没接受这条通道" in x]
+
+    # -- 「认不出票据」：**按服务端给的事件分流，不按第几发** -------------
+    def test_the_login_race_is_silent_because_the_server_says_so(self):
+        """★ 每次登录都必然经过这个窗口：`bshook` 看到 `0x0100` 就发 HELLO，
+        比游戏服写下 `login_ticket` 早 0.1~0.2 秒。服务端此刻**明说**
+        「票据是真的、只是还没登进来」（`ACK_NOT_LOGGED_IN`），
+        中继据此安静等着 —— 判据是**事件**，不是「跳过头几发」。"""
+        self.hook_hello()
+        for _ in range(5):                    # 慢机器可能要等好几发，都不该出声
+            self.server_says(ACK_NOT_LOGGED_IN, "票据还没登进游戏服")
+        self.assertEqual([], self.refusals())
+        self.server_says(ACK_OK)
+        self.assertEqual([], self.refusals())
+        self.assertEqual(1, len([x for x in self.lines if "✓" in x]))
+
+    def test_a_real_refusal_is_reported_on_the_very_first_one(self):
+        """★ 反过来也要成立：服务端说的是「真不认识这张票」，
+        那就**第一发就报**，不用等第二发 —— 慢机器上等下一发要 2 秒。"""
+        self.hook_hello()
+        self.server_says(ACK_BAD_TICKET, "认不出票据")
+        self.assertEqual(1, len(self.refusals()))
+        self.assertIn("认不出票据", self.refusals()[0])
+
+    def test_a_ticket_that_stays_bad_is_logged_exactly_once(self):
+        """票据真过期时（玩家停在登录界面）`HELLO_RETRY_S` 每 2 秒重试一次 ——
+        不按状态去重就是 `bug调查/udp验证` 里那 45 行刷屏。"""
+        self.hook_hello()
+        for _ in range(20):
+            self.server_says(ACK_BAD_TICKET, "认不出票据")
+        self.assertEqual(1, len(self.refusals()))
+
+    def test_success_after_a_long_refusal_still_announces_itself(self):
+        self.hook_hello()
+        for _ in range(5):
+            self.server_says(ACK_BAD_TICKET, "认不出票据")
+        self.server_says(ACK_OK)
+        self.assertTrue(self.relay.acked)
+        self.assertIn("✓", self.lines[-1])
+
+    def test_a_channel_that_goes_bad_again_says_so_again(self):
+        """★ 通了之后**又**被拒 = 真正的状态翻转（服务端重启、票据没了），
+        该再说一次。和「下行 已就绪 / 未就绪」是同一个套路：只在状态变了时说话。"""
+        self.hook_hello()
+        self.server_says(ACK_OK)
+        for _ in range(10):
+            self.server_says(ACK_BAD_TICKET, "认不出票据")
+        self.assertEqual(1, len(self.refusals()))
+
+    def test_the_disabled_answer_is_reported_too(self):
+        """服务端把 UDP 同步整个关了（`--no-udp-sync`）也是一次真正的拒绝。"""
+        self.hook_hello()
+        for _ in range(3):
+            self.server_says(udpsync.ACK_DISABLED, "服务端关掉了 UDP 同步")
+        self.assertEqual(1, len(self.refusals()))
+
+    def test_a_new_game_connection_gets_a_fresh_account(self):
+        """★ 「说过了」这个状态要跟着**新的一条游戏连接**清掉，否则整个中继
+        进程只提示一次 —— 玩家换服务器 / 服务端重启之后就再也看不到提示了。"""
+        self.hook_hello("old")
+        for _ in range(5):
+            self.server_says(ACK_BAD_TICKET, "认不出票据")
+        self.assertEqual(1, len(self.refusals()))
+        self.hook_hello("new")                       # 换了票据 = 新的游戏连接
+        self.assertFalse(self.relay.refused_logged)
+        self.server_says(ACK_BAD_TICKET, "认不出票据")
+        self.assertEqual(2, len(self.refusals()))
+
+    # -- 「20 秒没等到服务器回应」-----------------------------------------
+    def test_the_quiet_warning_counts_from_the_first_hello(self):
+        """★ 从**第一发 HELLO** 起算，不是从中继进程启动起算。
+
+        中继随启动脚本先起来，玩家点开游戏、输账号、进大厅，到发出登录包时
+        早就过了 20 秒 —— 按进程启动算的话，这句话会在游戏刚连上的那一瞬
+        立刻打出来（`bug调查/udp验证` 的 `logs-client1` 14:41:50.716 就是）。
+        """
+        # 中继已经起来很久了，但一发 HELLO 都还没发过 -> 永远不提示
+        self.assertFalse(self.relay._quiet_warning_due(now=10_000.0))
+        self.hook_hello()
+        self.relay.first_hello_at = 100.0
+        self.assertFalse(self.relay._quiet_warning_due(now=100.0 + 19.0))
+        self.assertTrue(self.relay._quiet_warning_due(
+            now=100.0 + self.relay_module.UDP_QUIET_WARN_S + 1))
+
+    def test_no_quiet_warning_when_the_server_actually_answered(self):
+        """服务器回了「认不出票据」说明**路是通的**，只是票据不对。
+        再说一句「没等到服务器回应、多半是防火墙」会把人引到错的方向。"""
+        self.hook_hello()
+        self.relay.first_hello_at = 100.0
+        self.server_says(ACK_BAD_TICKET, "认不出票据")
+        self.assertFalse(self.relay._quiet_warning_due(now=100.0 + 600.0))
+
+    def test_the_quiet_warning_stops_once_the_channel_is_up(self):
+        self.hook_hello()
+        self.relay.first_hello_at = 100.0
+        self.server_says(ACK_OK)
+        self.assertFalse(self.relay._quiet_warning_due(now=100.0 + 600.0))
+
+    def test_a_later_connection_to_a_silent_server_still_warns(self):
+        """★ 「收到过回应」必须按**每条游戏连接**算，不能按进程累计算。
+
+        场景：先连一台好服务器（收到过 ACK），玩家再换到一台没放行 UDP 的
+        （或者服务端重启成了 `--no-udp-sync`）。按累计值判的话，
+        `received > 0` 会让提示永远哑掉。
+        """
+        self.hook_hello("first")
+        self.server_says(ACK_OK)
+        self.hook_hello("second")                    # 换服务器 = 新的游戏连接
+        self.relay.first_hello_at = 500.0
+        self.assertEqual(0, self.relay.replies)
+        self.assertTrue(self.relay._quiet_warning_due(
+            now=500.0 + self.relay_module.UDP_QUIET_WARN_S + 1))
 
 
 if __name__ == "__main__":

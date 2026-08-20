@@ -1151,9 +1151,13 @@ class RelayServer:
         with self._lock:
             conns = list(self._conns.values())
             pending = len(self._tickets)
+        # ★ 三条出路要一起报。`delivered_udp` 现在是**主路** —— `bug调查/udp验证`
+        #   那一局 50160 人次里有 97.6% 走的是它（§225），只报「中继 / 回退」
+        #   会让人以为位置数据还在走 TCP。顺序按 `deliver()` 里的判定顺序。
         line = (f"中继：在线 {len(conns)} 条，待兑票据 {pending} 张，"
                 f"累计注册 {self.registered_total} 次；"
-                f"投递 中继 {self.delivered_relay} / 回退 {self.delivered_fallback}"
+                f"投递 UDP {self.delivered_udp} / 中继 {self.delivered_relay}"
+                f" / 回退 {self.delivered_fallback}"
                 f"；同代改写局号 {self.restamped_total} 发"
                 f"，跨代丢弃 {self.cross_gen_dropped} 发"
                 f"，模型失准 {self.epoch_confused} 次")

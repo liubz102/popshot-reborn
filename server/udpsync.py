@@ -120,6 +120,27 @@ MSG_PONG = 5
 ACK_OK = 0
 ACK_BAD_TICKET = 1
 ACK_DISABLED = 2
+#: ★ 「这张票据是我们签发的、还没过期，**但还没有哪条游戏连接认领它**」。
+#:
+#: 这不是失败，是**时序**：`bshook` 一看到 `0x0100 gcpReqLogin` 从客户端发出去
+#: 就立刻发 `HELLO`，而这一刻游戏服那边才刚收到登录包、还没把
+#: `login_ticket` 写到连接上。两者之间那 0.1~0.2 秒里，票据表认得这张票，
+#: 连接表还查不到人 —— **每一次登录都必然经过这个窗口**。
+#:
+#: 把它和 `ACK_BAD_TICKET` 分开，中继才有**事件**可依据：
+#: 收到本码 = 「还没轮到，安静等下一发」，收到 `ACK_BAD_TICKET` = 「真不认识
+#: 这张票（服务端重启过 / 过期 / 被顶号），该告诉玩家一声」。
+#: 分不开的话就只能靠「跳过头几发」这种拍脑袋的次数，换台机器就不准。
+#:
+#: ⚠ 探测面：它比 `ACK_BAD_TICKET` 多泄露一个 bit（「这张票是真的」）。
+#: 票据是 128 bit 随机数（`tickets.py`），猜中的概率不值得考虑，而且同一个
+#: 区分在游戏服 TCP 登录那边本来就是公开的（认不出票据回 `result=2`）。
+ACK_NOT_LOGGED_IN = 3
+
+#: 老服务端不认识 `ACK_NOT_LOGGED_IN`，老中继也不认识它 —— 两个方向都安全：
+#: 老中继把它当成「不是 OK」，行为退回今天的样子；新中继连到老服务端时
+#: 收到的是 `ACK_BAD_TICKET`，也只是回到「登录时会多打一行」而已。
+#: **所以线格式的版本号（`MAGIC` 最后一字节）不用动。**
 
 #: 一组数据的定长部分：`u32 索引 + u16 长度`。
 CHUNK_HEADER = struct.Struct("<IH")
@@ -473,10 +494,14 @@ class UdpSyncServer:
     **不 import `gameserver`**，谁是谁、房里有谁全靠注入进来的回调回答。
     """
 
-    def __init__(self, *, conn_for_ticket=None, logger=None,
+    def __init__(self, *, conn_for_ticket=None, ticket_known=None, logger=None,
                  redundancy=2, enabled=True):
         #: `票据 -> 游戏连接`。由 `gameserver` 注入。
         self._conn_for_ticket = conn_for_ticket
+        #: `票据 -> 这张票是不是我们签发的且还没过期`（**不管有没有人认领**）。
+        #: 由 `app.py` 注入（票据表是它建的）。没注入时退化成「查不到连接
+        #: 就一律回 `ACK_BAD_TICKET`」= 本条改动之前的行为。
+        self._ticket_known = ticket_known
         self._log = logger or (lambda msg: None)
         self.redundancy = int(redundancy)
         self.enabled = bool(enabled)
@@ -493,11 +518,19 @@ class UdpSyncServer:
         self.unknown_in = 0
 
     # -- 注入 ---------------------------------------------------------------
-    def bind_lookup(self, conn_for_ticket, logger=None):
-        """注入「票据 -> 游戏连接」和日志出口（`gameserver` 在 import 时调一次）。"""
-        self._conn_for_ticket = conn_for_ticket
+    def bind_lookup(self, conn_for_ticket=None, logger=None,
+                    ticket_known=None):
+        """注入「票据 -> 游戏连接」和日志出口（`gameserver` 在 import 时调一次）。
+
+        `ticket_known`（可选，`app.py` 建好票据表之后再补一次）用来把
+        「还没登进游戏服」和「根本不认识这张票」分开，见 `ACK_NOT_LOGGED_IN`。
+        """
+        if conn_for_ticket is not None:
+            self._conn_for_ticket = conn_for_ticket
         if logger is not None:
             self._log = logger
+        if ticket_known is not None:
+            self._ticket_known = ticket_known
 
     def log(self, msg):
         try:
@@ -635,6 +668,24 @@ class UdpSyncServer:
                 self.log(f"!! 票据查连接抛了 {error!r}")
                 game_conn = None
         if game_conn is None:
+            # ★ 分两种，而且是按**事件**分的，不是按「第几发」分的：
+            #   * 票据表认得这张票 -> 登录包还在路上（`bshook` 发 HELLO 的时刻
+            #     必然早于游戏服写下 `login_ticket` 的时刻）。**这不是错误**，
+            #     回 `ACK_NOT_LOGGED_IN`，中继安静等下一发。
+            #   * 票据表也不认得 -> 服务端重启过 / 过期 / 被顶号。这才值得
+            #     告诉玩家一声。
+            #   没注入 `ticket_known` 时（单独跑 gameserver.py 做协议试探）
+            #   退化成原来的行为：一律 `ACK_BAD_TICKET`。
+            if self._ticket_known is not None:
+                try:
+                    pending = bool(self._ticket_known(ticket))
+                except Exception as error:     # noqa: BLE001 —— 查不到就是查不到
+                    self.log(f"!! 票据查有效性抛了 {error!r}")
+                    pending = False
+                if pending:
+                    self._reply(build_hello_ack(ACK_NOT_LOGGED_IN,
+                                                "票据还没登进游戏服"), addr)
+                    return
             # ★ 不说「票据不对」以外的任何细节：这个端口谁都能发包，
             #   多说一句就是多一个探测面。
             self._reply(build_hello_ack(ACK_BAD_TICKET, "认不出票据"), addr)

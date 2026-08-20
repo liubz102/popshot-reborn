@@ -265,6 +265,13 @@ def main(argv=None):
     #   没更新的客户端 —— 三种情况的表现完全一样：全部走 TCP，没人察觉。
     udp_on = bool(cfg["udp_sync"]) and not args.no_udp_sync
     udpsync.SERVER.enabled = udp_on
+    # ★ 把票据表接给 UDP 侧，让它分得清「登录包还在路上」和「根本不认识这张票」
+    #   （`udpsync.ACK_NOT_LOGGED_IN`）。前者是**每次登录都会经过**的时序窗口，
+    #   后者才值得在玩家的日志里说一句。`gameserver` 只注入了「票据 -> 连接」，
+    #   票据表是这里建的，所以这一半在这里补。
+    #   ★ 用 `is_live` 而不是 `resolve` —— 后者每次调用都给票据续期，
+    #     而这只是旁观者在问「这张票是不是真的」，不该延长任何东西的寿命。
+    udpsync.SERVER.bind_lookup(ticket_known=tickets.is_live)
     udpsync.SERVER.redundancy = cfg["udp_sync_redundancy"]
     # ★ 跟着 `--game-port` 走，不用自己那份常量 —— 「和游戏服同号」是这套东西
     #   对玩家承诺的唯一一句话（防火墙只要记一个号），改了游戏服端口而 UDP

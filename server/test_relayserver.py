@@ -1012,5 +1012,30 @@ class PktQueueModelTests(unittest.TestCase):
         self.assertEqual([(0, 0, 0x02)], self.client.dispatched)
 
 
+class StatusLineTests(unittest.TestCase):
+    """`status()` 那一行必须把**三条**出路都报出来（§225 第六节）。
+
+    ★ `delivered_udp` 现在是**主路**：`bug调查/udp验证` 那一局 50160 人次
+      投递里 97.6% 走的是位置数据的 UDP 旁路。只报「中继 / 回退」会让人
+      以为位置数据还在走 TCP，正好把排查引到反方向。
+    """
+
+    def test_the_status_line_reports_all_three_delivery_routes(self):
+        server = RelayServer()
+        server.delivered_udp = 7
+        server.delivered_relay = 3
+        server.delivered_fallback = 1
+        line = server.status()
+        self.assertIn("UDP 7", line)
+        self.assertIn("中继 3", line)
+        self.assertIn("回退 1", line)
+
+    def test_the_control_channel_can_actually_ask_for_it(self):
+        """★ 以前 `status()` **一个调用者都没有** —— 修好了也没人看得见。"""
+        reply = gameserver.handle_control_command("relay")
+        self.assertTrue(reply.startswith("ok "), reply)
+        self.assertIn("投递 UDP", reply)
+
+
 if __name__ == "__main__":
     unittest.main()

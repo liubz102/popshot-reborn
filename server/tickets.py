@@ -156,6 +156,23 @@ class TicketStore:
             entry = self._tickets.get(str(ticket or "").strip())
             return bool(entry and entry[2])
 
+    def is_live(self, ticket):
+        """这张票据现在还有效吗？**不续期**，也不管有没有 `bind()` 过。
+
+        和 `resolve()` 的区别就是那一句续期：`resolve()` 是「凭它进来」，
+        每次调用都代表一次真正的使用，所以续期是对的；本方法是**旁观者**
+        在问「这张票是不是真的」（位置 UDP 旁路靠它把「登录包还在路上」
+        和「根本不认识这张票」分开，见 `udpsync.ACK_NOT_LOGGED_IN`）。
+        旁观者要是也能续期，一个只会重发 HELLO 的客户端就能让一张
+        从没登录过的票永远不过期。
+        """
+        ticket = str(ticket or "").strip()
+        if not ticket:
+            return False
+        with self._lock:
+            self._purge_unlocked()
+            return ticket in self._tickets
+
     def revoked_reason(self, ticket):
         """这张票据是被**顶掉**的吗？是就返回 ``(用户名, 原因)``，否则 ``None``。
 

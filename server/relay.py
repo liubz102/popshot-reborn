@@ -447,6 +447,10 @@ KEEPALIVE_S = 10.0
 
 #: 收不到任何回应多久算这条路不通（秒）。到点只打一行日志 —— **不做任何降级**，
 #: 因为 TCP 那份从来没停过，UDP 不通对玩家就是「和以前一样」。
+#:
+#: ★ 从**本条游戏连接的第一发 HELLO** 起算（`first_hello_at`），不是从中继
+#: 进程启动起算；而且只在**一个回应都没收到**时才打。服务端回了「认不出票据」
+#: 属于「路是通的、票据不对」，那是 `refused_logged` 那条日志的事。
 UDP_QUIET_WARN_S = 20.0
 
 
@@ -485,10 +489,27 @@ class UdpSyncRelay:
         self.hook_addr = None
         self.ticket = ""
         self.acked = False
-        self.started_at = 0.0
+        #: ★ **本条游戏连接**的第一发 `HELLO` 的时刻（`0` = 还没发过）。
+        #: 「这条路好像不通」的提示必须从这里起算，**不能从中继进程启动的时刻起算**
+        #: —— 中继是随启动脚本先起来的，玩家点开游戏、输账号、进大厅，
+        #: 到发出登录包时早就过了 20 秒，于是那句吓人的警告会在游戏刚连上的
+        #: 0.4 秒内立刻打出来、紧接着才是 `✓ 已认出`（§225 第六节）。
+        self.first_hello_at = 0.0
         self.last_hello_at = 0.0
         self.last_keepalive_at = 0.0
         self.warned_quiet = False
+        #: 「服务器不认这条通道」这句话说过没有。**按状态翻转去重，不按次数**：
+        #: 说一次，直到通了（`ACK_OK`）或者换了一条游戏连接才重新允许说。
+        #:
+        #: ★ 「登录时那一发必然被拒」不靠这里挡 —— 那是服务端用
+        #: `ACK_NOT_LOGGED_IN` 明说的**事件**（票据是真的、只是还没登进来），
+        #: 见 `_on_remote_datagram`。靠「跳过头 N 发」挡的话，
+        #: 换台慢机器、换条慢线路，N 就不对了。
+        self.refused_logged = False
+        #: **本条游戏连接**收到过几发来自服务器的数据报（`received` 是整个
+        #: 进程的累计值，不能拿来判「这一条通不通」——玩家换个服务器 /
+        #: 服务端重启成没放行 UDP 的样子，累计值仍然大于 0，提示就哑了）。
+        self.replies = 0
         self.sent = 0
         self.received = 0
         self.injected = 0
@@ -525,7 +546,6 @@ class UdpSyncRelay:
                 f"（{error}）；位置数据继续走 TCP")
             self.close()
             return False
-        self.started_at = time.monotonic()
         for target, name in ((self._pump_local, "udpsync-local"),
                              (self._pump_remote, "udpsync-remote"),
                              (self._pump_timer, "udpsync-timer")):
@@ -588,6 +608,13 @@ class UdpSyncRelay:
                     self.recent.clear()
                     self.acked = False
                     self.downlink_high_water = -1
+                    # ★ 提示的账也跟着清：新的一条游戏连接要重新计时、
+                    #   重新允许打一次日志（否则整个中继进程里只会提示一次，
+                    #   玩家中途换服务器 / 服务端重启就再也看不到提示了）。
+                    self.first_hello_at = 0.0
+                    self.warned_quiet = False
+                    self.refused_logged = False
+                    self.replies = 0
                 changed = (downlink != self.downlink)
                 self.downlink = downlink
             if changed:
@@ -635,6 +662,8 @@ class UdpSyncRelay:
         if not self.ticket:
             return
         self.last_hello_at = time.monotonic()
+        if not self.first_hello_at:
+            self.first_hello_at = self.last_hello_at
         flags = udpsync.HELLO_FLAG_DOWNLINK if self.downlink else 0
         try:
             self._to_remote(udpsync.build_hello(self.ticket, flags))
@@ -670,6 +699,7 @@ class UdpSyncRelay:
                 # recvfrom 上，UDP 上这完全正常，继续收。
                 continue
             self.received += 1
+            self.replies += 1
             try:
                 self._on_remote_datagram(data)
             except Exception as error:      # noqa: BLE001
@@ -686,10 +716,27 @@ class UdpSyncRelay:
                 if not self.acked:
                     log("位置UDP  ✓ 服务器已认出这条 UDP 通道，位置数据开始走 UDP")
                 self.acked = True
-            else:
-                self.acked = False
+                # ★ 连通之后把「被拒」的账清掉：万一之后**又**被拒了
+                #   （服务端重启、票据在服务端那边没了），那是一次真正的
+                #   状态翻转，值得再打一行 —— 和「下行 已就绪 / 未就绪」
+                #   那一对提示是同一个套路：**只在状态变了的时候说话**。
+                self.refused_logged = False
+                return
+            self.acked = False
+            if result == udpsync.ACK_NOT_LOGGED_IN:
+                # ★ **不是失败，是时序**：`bshook` 一看到 `0x0100` 就发 HELLO，
+                #   而游戏服那边还没把 `login_ticket` 写到连接上。
+                #   服务端明说了「票据是真的，只是还没登进来」，那就安静等 ——
+                #   **每一次登录都必然经过这个窗口**，报出来纯属吓人。
+                #   ★ 判据是服务端给的**事件**，不是「跳过头几发」这种次数。
+                return
+            # 真被拒了（服务端重启过 / 票据过期 / 被顶号 / UDP 同步被关掉）。
+            # 只在**状态翻转**的那一次说话：票据真过期时 `HELLO_RETRY_S`
+            # 每 2 秒重试一发，逐发打就是 bug调查/udp验证 里那 45 行刷屏（§225）。
+            if not self.refused_logged:
+                self.refused_logged = True
                 log(f"位置UDP  服务器没接受这条通道（{note or result}）；"
-                    f"位置数据继续走 TCP")
+                    f"位置数据继续走 TCP（还会继续重试，通了会再打一行）")
             return
         if kind == udpsync.MSG_PONG:
             return
@@ -722,12 +769,31 @@ class UdpSyncRelay:
             if self.acked and now - self.last_keepalive_at >= KEEPALIVE_S:
                 self.last_keepalive_at = now
                 self._to_remote(udpsync.build_ping(udpsync.MSG_PING, 0))
-            if (not self.warned_quiet and self.ticket and not self.acked
-                    and now - self.started_at > UDP_QUIET_WARN_S):
+            if self._quiet_warning_due(now):
                 self.warned_quiet = True
                 log(f"位置UDP  ⚠ {UDP_QUIET_WARN_S:.0f} 秒没等到服务器回应 —— "
                     f"多半是服务器没放行 UDP {self.target_port}，"
                     f"或者服务端是旧版。**位置数据继续走 TCP，游戏一切正常**")
+
+    def _quiet_warning_due(self, now):
+        """「这条路好像不通」该不该提示。★ 三条**都**要成立（§225 第六节）：
+
+        1. 还没提示过、有票据、还没被确认；
+        2. 从**本条游戏连接的第一发 HELLO** 起算够 `UDP_QUIET_WARN_S` 了 ——
+           从中继进程启动起算的话，中继随启动脚本先起来、玩家还要点开游戏
+           输账号，等游戏真连上时早就过了 20 秒，这句吓人的话会在
+           **游戏刚连上的 0.4 秒内**打出来，紧接着才是 `✓ 已认出`；
+        3. **这条游戏连接一个回应都没收到**。服务端回了「认不出票据」说明
+           路是通的、只是票据不对，那是 `_on_remote_datagram` 里那条日志的事，
+           不该说成「没等到回应」。★ 判据用的是 `replies`（每条游戏连接清零）
+           而不是 `received`（整个进程的累计值）。
+
+        抽成一个纯判据是为了能单测 —— `_pump_timer` 是个死循环。
+        """
+        return (not self.warned_quiet and bool(self.ticket) and not self.acked
+                and bool(self.first_hello_at)
+                and now - self.first_hello_at > UDP_QUIET_WARN_S
+                and self.replies == 0)
 
 
 def main():

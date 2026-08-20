@@ -190,6 +190,29 @@ class TicketStoreTests(unittest.TestCase):
         self.assertEqual("alice", self.tickets.resolve(used))
         self.assertIsNone(self.tickets.resolve(unused))
 
+    # -- is_live：旁观者的问法（位置 UDP 旁路用，§225）---------------------
+    def test_is_live_sees_a_ticket_that_has_not_been_used_yet(self):
+        """★ 位置 UDP 旁路靠它把「登录包还在路上」和「根本不认识这张票」
+        分开（`udpsync.ACK_NOT_LOGGED_IN`）—— 那一刻票据还没 `bind()` 过。"""
+        ticket = self.tickets.issue("alice")
+        self.assertTrue(self.tickets.is_live(ticket))
+        self.assertFalse(self.tickets.is_bound(ticket))
+        self.assertFalse(self.tickets.is_live("deadbeef"))
+        self.assertFalse(self.tickets.is_live(""))
+
+    def test_is_live_does_not_slide_the_expiry(self):
+        """★★ 和 `resolve()` 的唯一区别，也是它存在的理由：**不续期**。
+
+        中继每 2 秒重发一次 HELLO。要是旁观者的一次查询也能续期，
+        一张从没登录过的票就能被一个只会重发 HELLO 的客户端养到天荒地老。
+        """
+        ticket = self.tickets.issue("alice")
+        for _ in range(10):
+            self.now += 30                       # TTL 是 60 秒
+            self.tickets.is_live(ticket)
+        self.assertFalse(self.tickets.is_live(ticket))
+        self.assertIsNone(self.tickets.resolve(ticket))
+
     def test_binding_an_unknown_ticket_is_a_no_op(self):
         self.assertFalse(self.tickets.bind("deadbeef"))
         self.assertFalse(self.tickets.bind(""))

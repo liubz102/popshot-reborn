@@ -7262,6 +7262,8 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
                                   类型 2 闯关 / 1 人）。只为在单机上验证房间列表
                                   的线格式：(%d/%d) 哪个数是人数、房间号显示成几号
   delroom <房间号>                强行解散一个房间
+  relay                           战斗数据三条出路各投了多少人次
+                                  （UDP 旁路 / 原版中继 / 0x040f 回退）+ 中继 RTT
   status                          当前连接 / 开局状态 / 座位 / 分数 / 最后坐标
   raw <op> [payload-hex]          发任意游戏包，op 是十六进制（例：raw 0411 ...）
   endgame                         按存档真结算一局（记经验+金币再发 0x0411），
@@ -7421,6 +7423,12 @@ def _dispatch_control_command(line):
             room.seats[index] = Seat(None, nickname=f"测试玩家{index + 1}",
                                      level=9)
         return f"ok 已建 {room.describe()}"
+
+    if cmd == "relay":
+        # 战斗数据三条出路各投了多少（UDP 旁路 / 原版中继 / 0x040f 回退）
+        # + 每条中继连接的 RTT。★ `RelayServer.status()` 以前**没有任何调用者**，
+        #   于是「UDP 下行到底投了多少」在服务端只能靠数日志（§225 第六节）。
+        return "ok " + PEER_RELAY.status()
 
     if cmd == "delroom":
         if len(words) < 2:
