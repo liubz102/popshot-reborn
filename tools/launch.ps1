@@ -351,6 +351,9 @@ if ($relayPid -and $lastSignature -eq $relaySignature) {
     if ($ok) {
         Set-Content -Path $relayStamp -Value $relaySignature -Encoding ascii
         Say "[中继]   已启动（选「远程服务器」时经 127.0.0.1:$RelayAuth / $RelayGame / $RelayPeer 转发到 $remoteUrlHost）" 'Green'
+        Say "         位置数据另走 UDP：127.0.0.1:$RelayUdpSync -> ${remoteUrlHost}:$GamePort/udp" 'Green'
+        Say "         游戏从 UDP $ClientUdpPort 收位置数据" 'Green'
+        Say '         ⚠ 服务器要放行 UDP —— 没放行会自动退回 TCP，网络不稳定时会比较卡。' 'Gray'
     } else {
         Say '!! 中继没起来，「远程服务器」会连不上；「本机服务器」不受影响。看 logs\relay.err' 'Red'
         Get-FileTailLines (Join-Path $LogDir 'relay.err') 20

@@ -22,6 +22,7 @@
 
 ```bat
 netsh advfirewall firewall add rule name=PopShot dir=in action=allow protocol=TCP localport=47611,27799,27798,27810
+netsh advfirewall firewall add rule name=PopShot-UDP dir=in action=allow protocol=UDP localport=27799
 ```
 
 ## Linux 上跑
@@ -54,7 +55,17 @@ Python 的挑选顺序：
 | `47611` | TCP | 认证服 | **不能**，客户端写死 |
 | `27799` | TCP | 游戏服 | **不能**，客户端写死 |
 | `27798` | TCP | 战斗同步中继 | 不建议，改了客户端包也要重编 |
+| **`27799`** | **UDP** | **位置同步** | **不能** —— 和游戏服 TCP 同号 |
 | `27810` | TCP | 用户注册网页 | 能，改 `server.config` 的 `local_register_port` |
+
+> ⚠ **UDP `27799` 那一条最容易漏**。它和游戏服 TCP 同号，但 TCP 和 UDP 是两套
+> 独立的端口空间，防火墙/安全组里**必须单独加一条 UDP 规则**。
+>
+> 战斗中的位置数据走它 —— 网络状况不好时提升连接稳定性
+> （TCP 丢包重传时的队头阻塞，实测每秒一次、每次停 0.43 秒）。
+> **漏了不会有任何报错**：服务端照常启动、玩家照常游戏，位置数据自动退回 TCP，
+> 只是等于这个功能没开。想确认它在不在干活，看 `logs/online.log` 里
+> `同步转发 …… UDP 抢先 x/y` 那一行。
 
 **云主机要开两道**：系统防火墙（ufw / firewalld）**和**云厂商控制台里的
 安全组 / 网络 ACL。只开一道是最常见的「本机能连、外面连不上」。
