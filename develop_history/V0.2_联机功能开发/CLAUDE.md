@@ -23,6 +23,17 @@
 
 总计划在 `.claude/PLAN.md`。
 
+### ★★ 动协议之前的第 4 个文件：`re/packet_api.md`
+
+**客户端 ⇄ 服务端通信包的参数 / 返回值手册**（按 opcode 排，每个字段带
+✅实测 / 🔍静态 / 🤔推测 / ❓未知 的可信度标记，并写明「这一发**必须回什么**」）。
+
+- 要**读**某个包的字段、要知道某个 opcode 不回会怎样 → **先查它**，别从头翻 FINDINGS；
+- 逆出**新**字段、或纠正旧结论 → ★ **写 FINDINGS 的同时把它一起改掉**（见「收工规则」）。
+
+它的三个上游别混：`re/packets.txt` = 包类名单、`re/vftables.json` = 类名 → vftable 地址
+（`tools/rtti_map.py` 机械生成，**别手改**）、`re/rtti_types.txt` = 全部 RTTI 类名。
+
 ### ★ V0.1 的结论在哪（**只读参考，不要重新推导**）
 
 ```text
@@ -50,6 +61,11 @@ develop_history/V0.1_基础单机功能开发/.claude/sessions/        ← 会�
 - **每完成一个可验证小步就立刻更新 `.claude/PROGRESS.md`**，不要攒到会话结束
   —— 上下文随时可能被打断，攒着就丢了。
 - 新查明的硬事实立刻追加进 `.claude/FINDINGS.md`（**失败的尝试也要记**）。
+- ★★ **只要新结论涉及「某个包的某个字段 / 某个 opcode 要回什么」，就必须同时更新
+  `re/packet_api.md`** —— 那是通信包参数与返回值的**唯一汇总表**（详见
+  `.claude/FINDINGS.md` 开头那一节）。补上新字段、把可信度标记从 ❓ 升成 ✅ / 🔍、
+  纠正旧结论时**显式写出分歧**。
+  **漏更新的代价**：下一个会话要么重复逆一遍已经查明的东西，要么照着过期结论写错包。
 - 做了方案选择就记进 `.claude/DECISIONS.md`（记「为什么」，不记「是什么」）。
 - 会话结束时在 `.claude/sessions/YYYY-MM-DD-NN.md` 写一份日志：做了什么、结果、遗留。
 - `FINDINGS.md` 记「是什么」，`DECISIONS.md` 记「为什么」，`PROGRESS.md` 只保留当前状态
@@ -83,7 +99,7 @@ develop_history/V0.1_基础单机功能开发/.claude/sessions/        ← 会�
 | `game_patched/` | 工作副本 —— 客户端实际跑这个，所有改动只碰它 |
 | `Pack_decrypt/` | **解开的 `Pack\*.pkn` 资源树，只读参考**（`Data/` 的 ini、`Maps/`、`Models/`、`Images/`）。没有回写工具，改资源只能靠运行时 patch |
 | `tools/` | 便携逆向工具（x64dbg / Scylla / Ghidra / Sysinternals）+ 自写探针、启停脚本、打包脚本 |
-| `re/` | 逆向产物：`BigShot_22524.exe`、`packets.txt`、`rtti_types.txt`、`vftables.json` |
+| `re/` | 逆向产物：`BigShot_22524.exe`、`packets.txt`（包类名单）、`rtti_types.txt`、`vftables.json`（类名 → vftable 地址，机械生成，**别手改**）、★ **`packet_api.md`（通信包的参数 / 返回值手册，改协议先查它、查完也要写回它）** |
 | `hook/` | MSVC x86 工程：`bshook.dll`（注入）+ `bsloader.exe`（启动器） |
 | `server/` | Python 服务端（**单机假服务器和云端服务端是同一套代码**） |
 | `runtime/python/` | 内置 CPython 3.14.3 x64 embeddable（目标机不需要装 Python） |
