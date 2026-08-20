@@ -136,6 +136,14 @@ def make_conn(username):
     conn.peer_forward_ms = gameserver.relayserver.RttStats()
     conn.peer_gap_ms = gameserver.relayserver.RttStats()
     conn.peer_last_at = None
+    conn.peer_out_gap_ms = gameserver.relayserver.RttStats()
+    conn.peer_out_last_at = None
+    # 位置数据 UDP 旁路的排序闸门（`udpsync` 铁律 2/3）。假连接也要有 ——
+    # `on_peer_data` 的第一件事就是过它。
+    conn.peer_order = gameserver.udpsync.HeartbeatOrder()
+    conn.peer_lock = threading.RLock()
+    conn.peer_order_epoch = None
+    conn.login_ticket = ""
     conn.peer_report_at = 0.0
     return conn
 

@@ -42,6 +42,7 @@
 # Get-Command 找不到命令时写的是**非终止**错误，SilentlyContinue 压得住，
 # 所以这里不会被 $ErrorActionPreference='Stop' 带走。
 $script:HasNetTcpCmdlet = [bool](Get-Command 'Get-NetTCPConnection' -ErrorAction SilentlyContinue)
+$script:HasNetUdpCmdlet = [bool](Get-Command 'Get-NetUDPEndpoint'   -ErrorAction SilentlyContinue)
 $script:HasNetIpCmdlet  = [bool](Get-Command 'Get-NetIPAddress'    -ErrorAction SilentlyContinue)
 $script:PsMajor = 2
 if ($PSVersionTable -and $PSVersionTable.PSVersion) {
@@ -54,6 +55,7 @@ if ($PSVersionTable -and $PSVersionTable.PSVersion) {
 #   用法：`set POPSHOT_FORCE_LEGACY=1` 之后照常双击 start.bat / stop.bat。
 if ($env:POPSHOT_FORCE_LEGACY -and $env:POPSHOT_FORCE_LEGACY -ne '0') {
     $script:HasNetTcpCmdlet = $false
+    $script:HasNetUdpCmdlet = $false
     $script:HasNetIpCmdlet  = $false
 }
 
@@ -90,12 +92,14 @@ function Get-CompatBanner {
 #   重跑 netstat，冷启动被拖成几十秒。让 TTL 跟着实际耗时走，最坏情况也只有
 #   一半时间花在 netstat 上，而快的机器照样保持 200 ms 的新鲜度。
 $script:NetstatMap     = $null
+$script:NetstatUdpMap  = $null
 $script:NetstatTakenAt = [DateTime]::MinValue
 $script:NetstatTtlMs   = 200
 
 function Reset-ListenerCache {
     # 刚杀完进程之类的场合，强制下一次查询重新跑 netstat。
     $script:NetstatMap = $null
+    $script:NetstatUdpMap = $null
     $script:NetstatTakenAt = [DateTime]::MinValue
 }
 
@@ -123,11 +127,28 @@ function Get-NetstatListenerMap {
     }
     $started = Get-Date
     $map = @{}
+    $udp = @{}
     try {
         foreach ($line in (& netstat.exe -a -n -o)) {
             $text = "$line".Trim()
-            if (-not $text.StartsWith('TCP')) { continue }
             $fields = @($text -split '\s+')
+            # ★ UDP 行没有「状态」那一列：`UDP  0.0.0.0:27799  *:*  1234`
+            #   —— 4 列，进程 id 在最后一列。它没有「监听」这个概念，
+            #   只要绑着就占着，所以不需要那套状态判据。
+            if ($text.StartsWith('UDP')) {
+                if ($fields.Count -lt 4) { continue }
+                $local = $fields[1]
+                $colon = $local.LastIndexOf(':')
+                if ($colon -lt 0) { continue }
+                $port = 0
+                if (-not [int]::TryParse($local.Substring($colon + 1), [ref]$port)) { continue }
+                $owner = 0
+                if (-not [int]::TryParse($fields[$fields.Count - 1], [ref]$owner)) { continue }
+                if (-not $udp.ContainsKey($port)) { $udp[$port] = @() }
+                if ($udp[$port] -notcontains $owner) { $udp[$port] += $owner }
+                continue
+            }
+            if (-not $text.StartsWith('TCP')) { continue }
             if ($fields.Count -lt 5) { continue }
             if (-not ($fields[2].EndsWith(':0') -or $fields[3] -eq 'LISTENING')) { continue }
             $local = $fields[1]
@@ -142,6 +163,7 @@ function Get-NetstatListenerMap {
         }
     } catch {
         $map = @{}
+        $udp = @{}
     }
     # 快照的时刻按 netstat **跑完**算：它自己那 190 ms 里的信息本来就是旧的，
     # 从开始时刻算会让缓存刚存进去就过期（见上面 TTL 那段注释）。
@@ -149,8 +171,82 @@ function Get-NetstatListenerMap {
     $costMs = ($finished - $started).TotalMilliseconds
     if ($costMs -gt $script:NetstatTtlMs) { $script:NetstatTtlMs = [int]$costMs }
     $script:NetstatMap = $map
+    $script:NetstatUdpMap = $udp
     $script:NetstatTakenAt = $finished
     return $map
+}
+
+function Get-NetstatUdpMap {
+    <# `@{ 端口 = @(进程id, ...) }`，UDP 版。和 TCP 那份共用**同一次** netstat。 #>
+    $null = Get-NetstatListenerMap        # 顺带把 UDP 那份也填好（或命中缓存）
+    if ($null -eq $script:NetstatUdpMap) { return @{} }
+    return $script:NetstatUdpMap
+}
+
+function Get-UdpListenerPid {
+    <#
+        绑着这个 UDP 端口的进程 id；没有就返回 $null。
+
+        ★ 返回值语义和 `Get-ListenerPid` 一致（标量 / 数组 / $null）。
+
+        ★ UDP 没有「监听状态」—— 一个 socket 只要 bind 了就占着这个端口，
+          所以判据比 TCP 简单：查得到就是有人占。
+    #>
+    param([Parameter(Mandatory = $true)][int]$Port)
+
+    if ($script:HasNetUdpCmdlet) {
+        $ep = Get-NetUDPEndpoint -LocalPort $Port -ErrorAction SilentlyContinue
+        if ($ep) { return ($ep | Select-Object -ExpandProperty OwningProcess -Unique) }
+        return $null
+    }
+    $map = Get-NetstatUdpMap
+    if (-not $map.ContainsKey($Port)) { return $null }
+    $ids = @($map[$Port])
+    if ($ids.Count -eq 0) { return $null }
+    return ($ids | Select-Object -Unique)
+}
+
+function Get-PortOwnerName {
+    <# 占用者的进程名，查不到就返回 '?'。只用来把报错说清楚。 #>
+    param($OwnerPid)
+    $first = @($OwnerPid)[0]
+    if (-not $first) { return '?' }
+    try {
+        $p = Get-Process -Id ([int]$first) -ErrorAction Stop
+        return $p.ProcessName
+    } catch {
+        return '?'
+    }
+}
+
+function Test-PortsFree {
+    <#
+        检查一组端口是否**全部空着**。返回值是「占用说明」的数组，
+        空数组 = 全空。
+
+        入参形如：
+            @( @{ Port = 27799; Proto = 'TCP'; Label = '游戏服' },
+               @{ Port = 27799; Proto = 'UDP'; Label = '位置同步' } )
+
+        ★ 为什么 TCP 和 UDP 要分开查：它们是两套独立的端口空间，
+          27799/tcp 空着完全不代表 27799/udp 空着。只查 TCP 的话，
+          位置数据那条 UDP 通道会在「端口被别的程序占了」时**静默失效** ——
+          而 UDP 没有回执，在外面根本看不出来。
+    #>
+    param([Parameter(Mandatory = $true)][object[]]$Specs)
+
+    $busy = @()
+    foreach ($spec in $Specs) {
+        $port = [int]$spec.Port
+        $proto = "$($spec.Proto)".ToUpper()
+        if ($proto -eq 'UDP') { $owner = Get-UdpListenerPid $port }
+        else { $owner = Get-ListenerPid $port }
+        if (-not $owner) { continue }
+        $name = Get-PortOwnerName $owner
+        $label = if ($spec.Label) { "（$($spec.Label)）" } else { '' }
+        $busy += "$proto $port$label 被 pid=$(@($owner) -join ',') ($name) 占用"
+    }
+    return $busy
 }
 
 function Get-ListenerPid {

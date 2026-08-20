@@ -25,6 +25,26 @@ if not exist "%VCVARS%" (
     exit /b 1
 )
 
+rem --------------------------------------------------------------------------
+rem  Regenerate hook\ports.h from server\config.py before compiling.
+rem
+rem  server\config.py is the ONE place port numbers are defined.  The C side
+rem  reads them through the generated ports.h, the PowerShell/sh launchers ask
+rem  `python server\config.py --ports`.  Keeping a second hand-written copy in
+rem  bshook.c used to be a "change one, forget the other" trap whose symptom is
+rem  a feature that silently stops working rather than an error.
+rem
+rem  ports.h is committed, so building without Python still works -- we only
+rem  warn in that case instead of failing.
+rem --------------------------------------------------------------------------
+set "GENPORTS=%SRC%..\tools\gen_ports_h.py"
+set "PYEXE=%SRC%..\runtime\python\python.exe"
+if not exist "%PYEXE%" set "PYEXE=python"
+"%PYEXE%" "%GENPORTS%"
+if errorlevel 1 (
+    echo [build] WARNING: could not regenerate ports.h; using the committed one
+)
+
 if not exist "%OUT%" mkdir "%OUT%"
 
 call "%VCVARS%" >nul

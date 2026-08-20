@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import errno
 import socket
 
 
@@ -47,10 +48,19 @@ def create_listener(host, port, backlog=16):
             return socket.create_server(
                 (bind_host, port), family=socket.AF_INET6,
                 dualstack_ipv6=True, reuse_port=False, backlog=backlog)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as error:
             if host not in ANY_HOSTS:
                 raise
-            # 这台机器没开 IPv6：退回全网 IPv4。
+            # ★★ 「端口已经被占用」**绝不能**退回 IPv4 再试一次。
+            #
+            # Windows 上实测：有人拿着双栈 `[::]:P` 时，`0.0.0.0:P` **还能绑上**
+            # （两个 socket 同时活着，进来的 IPv4 连接归谁完全看运气）。
+            # 于是这个回退会把「端口被别人占了」变成「悄悄起来了、但工作不正常」
+            # —— 正是最难查的那种故障。占用就要当场炸，让启动脚本把话说清楚。
+            #
+            # 回退本来只为一件事：**这台机器没开 IPv6**。那种失败不是 EADDRINUSE。
+            if isinstance(error, OSError) and error.errno == errno.EADDRINUSE:
+                raise
             family, bind_host = socket.AF_INET, "0.0.0.0"
     return socket.create_server((bind_host, port), family=family,
                                 reuse_port=False, backlog=backlog)

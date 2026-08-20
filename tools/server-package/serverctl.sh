@@ -24,9 +24,12 @@ PIDFILE="$LOGDIR/server.pid"
 APP="$ROOT/server/app.py"
 CONFIG="$ROOT/server.config"
 
-AUTH_PORT=47611     # 认证服（客户端写死）
-GAME_PORT=27799     # 游戏服（客户端写死）
-RELAY_PORT=27798    # 战斗同步中继
+# ★★ 端口号唯一的源是 server/config.py。这里先留占位，等下面确定了 $PY
+#    之后再向它要（read_ports）—— 以前这三个数字在四个文件里各有一份，
+#    那是一类「改了这边没改那边」的故障，而且症状通常不是报错。
+AUTH_PORT=47611     # 占位，read_ports 会覆盖
+GAME_PORT=27799     # 占位，read_ports 会覆盖
+RELAY_PORT=27798    # 占位，read_ports 会覆盖
 
 die() {
     echo ""
@@ -69,6 +72,21 @@ pick_python() {
     PY_KIND="系统自带"
 }
 
+# 端口号向 server/config.py 要（唯一的源）。读不出来就保留上面的占位值 ——
+# 那几个是客户端写死的常量，占位值和源里的一致，退一步也能跑。
+read_ports() {
+    table=$("$PY" "$ROOT/server/config.py" --ports 2>/dev/null) || return 0
+    for line in $table; do
+        key=${line%%=*}
+        value=${line#*=}
+        case "$key" in
+            AUTH_PORT)       AUTH_PORT="$value" ;;
+            GAME_PORT)       GAME_PORT="$value" ;;
+            PEER_RELAY_PORT) RELAY_PORT="$value" ;;
+        esac
+    done
+}
+
 # 注册页端口写在 server.config 里，解析规则和 server/config.py 一致。
 read_web_port() {
     WEB_PORT=27810
@@ -86,6 +104,18 @@ port_open() {
     "$PY" -c "import socket,sys
 s = socket.socket(); s.settimeout(0.5)
 sys.exit(0 if s.connect_ex(('127.0.0.1', $1)) == 0 else 1)" 2>/dev/null
+}
+
+# UDP 端口被占着没有？**只能用 bind 判**（UDP 没有连接，connect_ex 恒为 0）。
+# 位置数据走 UDP 27799 —— 和游戏服 TCP 同号，但那是两套独立的端口空间。
+udp_port_taken() {
+    "$PY" -c "import socket,sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.bind(('0.0.0.0', $1))
+except OSError:
+    sys.exit(0)
+sys.exit(1)" 2>/dev/null
 }
 
 running_pid() {
@@ -158,6 +188,7 @@ echo ""
 
 [ -f "$APP" ] || die "找不到 $APP —— 服务端包不完整。"
 pick_python
+read_ports
 read_web_port
 mkdir -p "$LOGDIR"
 
@@ -167,14 +198,23 @@ if [ -n "$pid" ]; then
     exit 1
 fi
 
+# 启动前把每一个要绑的端口都查一遍（TCP + UDP），有一个被占着就不启动。
+# ★ UDP 那条（位置数据）被占时不会有任何报错 —— 服务端照样起来、玩家照样
+#   能玩，只是位置数据全部投进黑洞。所以宁可现在就硬失败。
 for p in "$AUTH_PORT" "$GAME_PORT" "$RELAY_PORT" "$WEB_PORT"; do
     if port_open "$p"; then
-        echo "[提示] 端口 $p 已经有人在听。"
-        echo "       如果是上一次启动的服务端，先 sh stop.sh 再来；"
-        echo "       如果是别的程序占了 $WEB_PORT，改 server.config 的 local_register_port。"
+        echo "!! 端口 TCP $p 被占用，服务端无法启动。"
+        echo "   如果是上一次启动的服务端，先 sh stop.sh 再来；"
+        echo "   如果是别的程序占了 $WEB_PORT，改 server.config 的 local_register_port。"
         exit 1
     fi
 done
+if udp_port_taken "$GAME_PORT"; then
+    echo "!! 端口 UDP $GAME_PORT（位置同步）被占用，服务端无法启动。"
+    echo "   它和游戏服 TCP $GAME_PORT 同号，但这是两套独立的端口空间。"
+    echo "   查占用者： ss -lunp | grep $GAME_PORT   （或 lsof -iUDP:$GAME_PORT）"
+    exit 1
+fi
 
 # ★ --no-control：调试控制通道（27800）在服务端包里默认关闭。
 #   它能直接往任意连接推包，只该在开发机上开。

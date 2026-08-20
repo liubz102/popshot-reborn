@@ -48,9 +48,21 @@ $AppPy   = Join-Path $Root 'server\app.py'
 $LogDir  = Join-Path $Root 'logs'
 $Config  = Join-Path $Root 'server.config'
 
-$AuthPort  = 47611      # 认证服（客户端写死）
-$GamePort  = 27799      # 游戏服（客户端写死）
-$RelayPort = 27798      # 原版 TCP 中继（战斗内同步走它）
+# ★★ 端口号**唯一的源是 server\config.py**，这里向它要，不再各写一份。
+#    以前这三个数字在 config.py、bshook.c、launch.ps1、本文件里各有一份 ——
+#    那是一类「改了这边没改那边」的故障，而症状通常不是报错，是某个功能
+#    悄悄不工作。
+$portTable = @{}
+foreach ($line in (& $Python (Join-Path $Root 'server\config.py') --ports)) {
+    $pair = "$line".Trim() -split '=', 2
+    if ($pair.Count -eq 2) { $portTable[$pair[0]] = [int]$pair[1] }
+}
+if ($portTable.Count -lt 10) {
+    throw "读不出端口表（python server\config.py --ports）—— 服务端包不完整？"
+}
+$AuthPort  = $portTable['AUTH_PORT']
+$GamePort  = $portTable['GAME_PORT']
+$RelayPort = $portTable['PEER_RELAY_PORT']
 
 function Say([string]$msg, [string]$color = 'Gray') { Write-Host $msg -ForegroundColor $color }
 
@@ -76,6 +88,19 @@ function Get-WebPort {
 
 $WebPort = Get-WebPort
 $Ports = @($AuthPort, $GamePort, $RelayPort, $WebPort)
+
+# ★ 启动前要确认「全部空着」的端口。和上面 $Ports 的区别有两点：
+#   1. 多一条 **UDP** —— 位置数据走的是 UDP 27799（和游戏服 TCP 同号，
+#      但那是两套独立的端口空间，TCP 空着完全不代表 UDP 空着）；
+#   2. 它只用于启动前的检查，停服还是按 $Ports 找进程（服务端进程同时
+#      占着 TCP 和 UDP，按 TCP 找到的就是它）。
+$PortSpecs = @(
+    @{ Port = $AuthPort;  Proto = 'TCP'; Label = '认证服' },
+    @{ Port = $GamePort;  Proto = 'TCP'; Label = '游戏服' },
+    @{ Port = $GamePort;  Proto = 'UDP'; Label = '位置同步' },
+    @{ Port = $RelayPort; Proto = 'TCP'; Label = '战斗同步中继' },
+    @{ Port = $WebPort;   Proto = 'TCP'; Label = '注册页' }
+)
 
 # ---------------------------------------------------------------------------
 #  stop
@@ -158,16 +183,23 @@ if (-not (Test-Path -LiteralPath $AppPy)) {
 }
 if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
 
-# 已经在跑就别重复起：三个端口有任何一个被占着，都说清楚是谁占的。
-$busy = @()
-foreach ($port in $Ports) {
-    $owner = Get-ListenerPid $port
-    if ($owner) { $busy += "$port (pid=$owner)" }
-}
+# 启动前把每一个要绑的端口都查一遍（TCP + UDP），有一个被占着就不启动。
+#
+# ★ 为什么是硬失败而不是「警告一下继续」：端口被别人占着时受影响的功能会
+#   **静默**坏掉。TCP 那几个还能靠后面的「端口没起全」兜住；UDP 那条位置
+#   通道却完全没有回执 —— 服务端照样起来、玩家照样能玩，只是位置数据全部
+#   投进了黑洞，最后只能看到「别人卡」却查不出任何原因。宁可现在就说清楚。
+Reset-ListenerCache
+$busy = Test-PortsFree $PortSpecs
 if ($busy.Count -gt 0) {
-    Say "[提示] 这些端口已经有人在听：$($busy -join ', ')" 'Yellow'
-    Say '       如果是上一次启动的服务端，先运行 stop.bat 再来。' 'Yellow'
-    Say '       如果是别的程序占了 27810，改 server.config 的 local_register_port。' 'Yellow'
+    Say ''
+    Say '!! 端口被占用，服务端无法启动：' 'Red'
+    foreach ($line in $busy) { Say "     $line" 'Red' }
+    Say '   处理办法：' 'Yellow'
+    Say '     * 如果是上一次启动的服务端，先运行 stop.bat 再来；' 'Yellow'
+    Say "     * 如果是别的程序占了 $WebPort，改 server.config 的 local_register_port；" 'Yellow'
+    Say '     * 其余端口是客户端写死的，只能把占用它的程序关掉。' 'Yellow'
+    Say ''
     exit 1
 }
 
@@ -202,6 +234,7 @@ Say '  监听端口' 'Cyan'
 Say "    $AuthPort   认证服（客户端写死，不可改）"
 Say "    $GamePort   游戏服（客户端写死，不可改）"
 Say "    $RelayPort   战斗同步中继"
+Say "    $GamePort   位置同步（UDP，和游戏服同号但要单独放行）"
 Say "    $WebPort   用户注册页  ->  http://127.0.0.1:$WebPort/"
 Say ''
 
@@ -220,6 +253,7 @@ Say ''
 Say '  ★ 第一次启动时 Windows 防火墙会弹窗，必须点「允许访问」，' 'Yellow'
 Say '    否则别的电脑连不进来。已经点过「取消」的话，用管理员权限执行：' 'Yellow'
 Say "      netsh advfirewall firewall add rule name=PopShot dir=in action=allow protocol=TCP localport=$AuthPort,$GamePort,$RelayPort,$WebPort" 'Yellow'
+Say "      netsh advfirewall firewall add rule name=PopShot-UDP dir=in action=allow protocol=UDP localport=$GamePort" 'Yellow'
 Say ''
 Say '  日志' 'Cyan'
 Say '    logs\online.log   谁连上、谁断开、从哪个 IP、在线多久（精简模式也照记）'

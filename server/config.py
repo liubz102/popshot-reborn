@@ -38,6 +38,37 @@ CONTROL_PORT = 27800
 #: 端口表好记（27799 -> 27809 中继，27798 -> 27808 中继，同一套 +10 的规律）。
 PEER_RELAY_PORT = 27798
 
+#: ★ 位置同步的 **UDP** 通道（`server/udpsync.py`）。**故意和游戏服 TCP 同号** ——
+#: TCP 和 UDP 是两套独立的端口空间，27799/tcp 和 27799/udp 互不冲突，而玩家只要
+#: 记住「27799 两种协议都放行」，防火墙说明少一行、少一个记错的机会。
+#: 和 47611 / 27799 / 27798 一样**不做成配置项**：两端要对得上，可配等于多一种
+#: 「一边改了一边没改」的连不上（D063 的同一条理由）。
+UDP_SYNC_PORT = GAME_PORT
+
+#: 选「远程服务器」时本机 UDP 中继监听的端口（`bshook` 把位置数据镜像到这儿）。
+#: 同样和游戏服中继 27809 同号，理由同上。
+RELAY_UDP_SYNC_PORT = 27809
+
+#: 原版客户端 `UDPBinder` 写死要 bind 的端口（`0x5bba92(0x1e6c)` = 7788，
+#: FINDINGS §153）。**我们不用它** —— 见下面 `CLIENT_UDP_PORT`。
+GAME_ORIGINAL_UDP_PORT = 7788
+
+#: 客户端接收位置数据的 UDP 端口。`bshook` 钩住 `ws2_32!bind`，把原版那个
+#: 写死的 7788 改写成这个号。
+#:
+#: ★ **为什么非改不可**：下行要把数据投进这个口，而「这个口到底是不是游戏在听」
+#: 必须是确定的，不能靠猜。7788 是个谁都可能占的低位号（原版选它的年代没这个
+#: 顾虑），一旦被别的程序占着，位置数据就投进黑洞 —— 表现是**所有人在你屏幕上
+#: 定住**，比不开这个功能还糟。
+#:
+#: 换成我们自己的号之后判据变成硬的：**启动脚本先检查它空着**（占用就直接报错
+#: 不启动），然后由 `bshook` 让游戏去 bind 它，bind 成功再由 `bshook` 告诉本机
+#: 中继「可以往这儿投了」。三步都是确定的，没有一步靠推测。
+#:
+#: 收包回调 `0x407869` 和 `0x040f` 是同一个入口，所以走 UDP 送进去和走 TCP
+#: 送进去，客户端处理起来一个字节的差别都没有。
+CLIENT_UDP_PORT = 27807
+
 #: 选「远程服务器」时本机中继的监听端口。客户端的 `connect` 被 bshook 改写到这三个口，
 #: 由 `server/relay.py` 转发到 `server_address` 的 47611 / 27799 / 27798
 #: （D065 / D066 / D079）。
@@ -48,6 +79,41 @@ RELAY_PEER_PORT = 27808
 
 #: 注册网页的默认端口。
 DEFAULT_REGISTER_PORT = 27810
+
+#: ★★ **端口号的唯一来源就是上面这些常量。** 别的地方一律派生，不许再抄一份。
+#:
+#: 这个项目里要用到同一个端口号的地方有四类，语言各不相同：
+#:
+#: | 谁 | 怎么拿到 |
+#: |---|---|
+#: | Python（服务端 / 中继） | 直接 `import config` |
+#: | C（`hook/bshook.c`） | `hook/ports.h` —— 由 `tools/gen_ports_h.py` 从本文件生成 |
+#: | PowerShell（启动脚本） | `python server/config.py --ports` |
+#: | sh（Linux 启动脚本） | 同上 |
+#:
+#: 以前是各写各的（`bshook.c` 11 个、`launch.ps1` 9 个、`serverctl.*` 各 3 个），
+#: 靠环境变量在运行时对齐 —— 那既是重复劳动，也是一类**改一半**的故障：
+#: 改了这边没改那边，症状往往是「某个功能悄悄不工作」而不是报错。
+#: 现在改一处就够了，`test_ports.py` 会盯着 `ports.h` 有没有跟上。
+PORT_EXPORTS = (
+    "AUTH_PORT",
+    "GAME_PORT",
+    "CONTROL_PORT",
+    "PEER_RELAY_PORT",
+    "UDP_SYNC_PORT",
+    "RELAY_AUTH_PORT",
+    "RELAY_GAME_PORT",
+    "RELAY_PEER_PORT",
+    "RELAY_UDP_SYNC_PORT",
+    "GAME_ORIGINAL_UDP_PORT",
+    "CLIENT_UDP_PORT",
+    "DEFAULT_REGISTER_PORT",
+)
+
+
+def port_table():
+    """``{常量名: 端口号}``。给生成器和启动脚本用。"""
+    return {name: globals()[name] for name in PORT_EXPORTS}
 
 #: 一次成功注册之后，**同一个客户端 IP** 要等多久才能再注册（秒）。
 #: 前台按钮的倒计时和后台的 IP 限制**共用这一个值**（需求明确要求一致）。
@@ -67,6 +133,10 @@ DEFAULT_LOG_RETENTION_DAYS = 3
 
 #: 保留天数的上限。10 年 —— 再大就等于「不清理」，那该填 0 而不是填 99999。
 MAX_LOG_RETENTION_DAYS = 3650
+
+#: 每个 UDP 数据报最多捎带几份**历史**位置包（0 = 只发当前这一份）。
+#: 上限 4：位置包只有 43 字节，捎 4 份也才 ~250 字节/报，再多就纯属浪费上行了。
+MAX_UDP_SYNC_REDUNDANCY = 4
 
 #: 配置文件名。放在包根目录（= `start.bat` 同目录 = `server/` 的上一级）。
 CONFIG_FILENAME = "server.config"
@@ -88,6 +158,11 @@ DEFAULTS = {
     "proxy_password": "",
     "register_cooldown_seconds": DEFAULT_REGISTER_COOLDOWN_SECONDS,
     "log_retention_days": DEFAULT_LOG_RETENTION_DAYS,
+    # ★ 位置数据走 UDP 的总开关（1 = 开）。关掉就是 2026-08-19 之前的行为：
+    #   全部同步数据走 TCP。留着它主要是给**对照测试**用 —— 「开/关各打一局，
+    #   比 online.log 里的到达间隔」是判断这套东西到底有没有用的唯一办法。
+    "udp_sync": 1,
+    "udp_sync_redundancy": 2,
 }
 
 #: 值要按**端口**解析的键（1~65535）。
@@ -99,6 +174,12 @@ _SECOND_KEYS = ("register_cooldown_seconds",)
 
 #: 值要按**天数**解析的键（0 ~ MAX_LOG_RETENTION_DAYS，0 = 关闭）。
 _DAY_KEYS = ("log_retention_days",)
+
+#: 值要按**开关**解析的键（0/1；也认 on/off、true/false、yes/no）。
+_FLAG_KEYS = ("udp_sync",)
+
+#: 值要按**冗余份数**解析的键（0 ~ MAX_UDP_SYNC_REDUNDANCY，0 = 不捎带）。
+_REDUNDANCY_KEYS = ("udp_sync_redundancy",)
 
 
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -139,6 +220,23 @@ def _clean_count(value, key, warnings, maximum):
     return count
 
 
+#: 开关键认得的写法。玩家是用记事本改这个文件的，只认 `0`/`1` 太苛刻了。
+_TRUE_WORDS = frozenset(("1", "on", "true", "yes", "y", "开", "是"))
+_FALSE_WORDS = frozenset(("0", "off", "false", "no", "n", "关", "否"))
+
+
+def _clean_flag(value, key, warnings):
+    """开关键 -> `0` / `1`。认不出来的写法一律用默认值 + 一条警告。"""
+    word = str(value).strip().lower()
+    if word in _TRUE_WORDS:
+        return 1
+    if word in _FALSE_WORDS:
+        return 0
+    warnings.append(f"{key} 只认 1/0（或 on/off、true/false），"
+                    f"填的是 {value!r}，改用默认值 {DEFAULTS[key]}")
+    return DEFAULTS[key]
+
+
 def parse_text(text: str):
     """配置文本 -> ``(配置字典, 警告列表)``。
 
@@ -169,6 +267,11 @@ def parse_text(text: str):
         elif key in _DAY_KEYS:
             values[key] = _clean_count(value, key, warnings,
                                        MAX_LOG_RETENTION_DAYS)
+        elif key in _FLAG_KEYS:
+            values[key] = _clean_flag(value, key, warnings)
+        elif key in _REDUNDANCY_KEYS:
+            values[key] = _clean_count(value, key, warnings,
+                                       MAX_UDP_SYNC_REDUNDANCY)
         else:
             values[key] = value
     values["server_address"] = normalize_host(values["server_address"]) or \
@@ -306,7 +409,7 @@ local_register_port = 27810
 register_cooldown_seconds = 20
 
 # ---------------------------------------------------------------------------
-# 日志自动清理 —— logs\ 目录里超过这么多天没再写过的日志文件会被删掉。
+# 日志自动清理 —— logs\\ 目录里超过这么多天没再写过的日志文件会被删掉。
 #
 # 清理时机有两个：
 #   * 服务端【每次真正启动】时一次（本机游玩经常开关，覆盖这种场景）；
@@ -314,11 +417,39 @@ register_cooldown_seconds = 20
 #   * 每天【凌晨 4 点】一次（云服务器常年开机，覆盖这种场景）。
 # 两次都在后台线程里做，不会影响正在进行的游戏。
 #
-# 清的是 logs\ 里的日志文件（*.log / *.out / *.err / game_* / auth_* / conn_*），
+# 清的是 logs\\ 里的日志文件（*.log / *.out / *.err / game_* / auth_* / conn_*），
 # 判据是文件最后修改时间；正在写的日志因此不会被删。
 # 填 0 = 不清理。
 # ---------------------------------------------------------------------------
 log_retention_days = 3
+
+# ---------------------------------------------------------------------------
+# 位置数据走 UDP（udp_sync）
+#
+# 战斗中「谁站在哪」这种数据每秒发 8 次，丢一份下一份 0.13 秒后就补上了，
+# 本来不怕丢；怕的是 TCP 为了把丢的那一份重传回来，把后面已经到了的全都压在
+# 队列里等 —— 跨境线路上实测会造成【停 0.4 秒、然后 3 份一起到】，每秒一次，
+# 在别人屏幕上就是你的角色一跳一跳地瞬移。
+#
+# 开着（1）时：位置数据额外从 UDP 27799 走一份（上下行都走），谁先到用谁；
+#             UDP 不通就还是 TCP，玩家什么都感觉不到。开火、命中、伤害、死亡
+#             这些【不能丢】的数据任何时候都只走 TCP，不受这个开关影响。
+# 关掉（0）时：完全等同 2026-08-19 之前的行为，全部走 TCP。
+#
+# ⚠ 服务器要放行 UDP 27799（和游戏服 TCP 同一个号，但防火墙要单独加一条 UDP 规则）。
+#   没放行也不用改这里 —— 客户端探测不通会自己退回 TCP。
+# ---------------------------------------------------------------------------
+udp_sync = 1
+
+# ---------------------------------------------------------------------------
+# 每个 UDP 包捎带几份【历史】位置数据（0~4，0 = 不捎带）。
+#
+# 这不是为了画面更顺（位置是快照，新的自然覆盖旧的），而是为了在丢包时
+# 把位置包的编号序列一发不漏地补齐 —— 客户端拿开局后【第一份】位置数据给
+# 战斗事件队列定基线，那一份要是丢了，整局的开火判定都会错位。
+# 网络特别差可以调到 3~4；局域网里玩可以填 0 省点流量。
+# ---------------------------------------------------------------------------
+udp_sync_redundancy = 2
 
 # ---------------------------------------------------------------------------
 # 说明：
@@ -340,3 +471,19 @@ def ensure_exists(path: str | None = None, root: str | None = None) -> str:
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(DEFAULT_CONFIG_TEXT)
     return path
+
+
+if __name__ == "__main__":
+    # `python server/config.py --ports` -> 每行一个 `名字=端口号`。
+    #
+    # ★ 存在的理由只有一个：**PowerShell 和 sh 也要用这些端口号**（启动前的
+    #   端口占用检查、停服时找进程、启动横幅）。让它们来问这一份，就不用
+    #   在每个脚本里再抄一遍 —— 抄一遍就多一处「改了这边没改那边」。
+    import sys as _sys
+
+    if "--ports" in _sys.argv[1:]:
+        for _name, _port in port_table().items():
+            print(f"{_name}={_port}")
+    else:
+        print("用法: python config.py --ports", file=_sys.stderr)
+        raise SystemExit(2)

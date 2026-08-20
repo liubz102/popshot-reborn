@@ -23,6 +23,7 @@ app.py —— 服务端唯一入口。
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import sys
 import threading
@@ -35,6 +36,7 @@ import config as server_config
 import eventlog
 import gameserver
 import logcleanup
+import udpsync
 from account_store import AccountStore
 from netlisten import describe as describe_listen
 from tickets import TicketStore
@@ -88,6 +90,11 @@ def build_arg_parser():
                     default=server_config.PEER_RELAY_PORT,
                     help=f"原版 TCP 中继的端口（默认 {server_config.PEER_RELAY_PORT}）。"
                          "改了的话客户端包里 bshook 的映射表也要跟着改")
+    ap.add_argument("--no-udp-sync", action="store_true",
+                    help=f"不启动位置数据的 UDP 旁路（UDP "
+                         f"{server_config.UDP_SYNC_PORT}）。加了它就是 2026-08-19 "
+                         "之前的行为：全部同步数据走 TCP。老客户端本来就不发 "
+                         "UDP，所以这个开关只影响更新过的客户端")
     ap.add_argument("--control-port", type=int,
                     default=server_config.CONTROL_PORT,
                     help="调试控制通道端口，只绑 127.0.0.1")
@@ -142,8 +149,16 @@ def _game_args(args):
     return ns
 
 
-def _start(name, target, args=(), kwargs=None):
-    """起一个后台线程，并等它真的开始监听（或抛异常）。"""
+class PortBusy(RuntimeError):
+    """要绑的端口被别人占着。**不是**普通启动失败，要单独说清楚。"""
+
+
+def _start(name, target, args=(), kwargs=None, port=None, proto="TCP"):
+    """起一个后台线程，并等它真的开始监听（或抛异常）。
+
+    ★ 端口被占用时抛 `PortBusy`，`main()` 会把它变成一句人话再退出 ——
+    玩家看到的应该是「端口 27799 被占用」，不是一屏 traceback。
+    """
     ready = threading.Event()
     failure = []
     kwargs = dict(kwargs or {})
@@ -159,7 +174,11 @@ def _start(name, target, args=(), kwargs=None):
     threading.Thread(target=run, daemon=True, name=name).start()
     ready.wait(timeout=10)
     if failure:
-        raise RuntimeError(f"{name} 启动失败: {failure[0]}")
+        error = failure[0]
+        if isinstance(error, OSError) and error.errno == errno.EADDRINUSE:
+            where = f"{proto} {port}" if port else name
+            raise PortBusy(f"端口 {where}（{name}）被占用，无法启动")
+        raise RuntimeError(f"{name} 启动失败: {error}")
     return True
 
 
@@ -217,13 +236,15 @@ def main(argv=None):
 
     _start("auth", authserver.serve,
            kwargs={"port": args.auth_port, "args": auth_args,
-                   "service": service, "host": args.host})
+                   "service": service, "host": args.host},
+           port=args.auth_port)
     log(f"认证服   {describe_listen(args.host, args.auth_port)}")
 
     _start("game", gameserver.serve,
            kwargs={"port": args.game_port, "args": _game_args(args),
                    "accounts": accounts, "tickets": tickets,
-                   "host": args.host})
+                   "host": args.host},
+           port=args.game_port)
     log(f"游戏服   {describe_listen(args.host, args.game_port)}")
 
     # 原版 TCP 中继（D078）。它和游戏服是同一个进程里的两个监听器 ——
@@ -234,9 +255,32 @@ def main(argv=None):
     else:
         gameserver.PEER_RELAY.port = args.relay_port
         _start("relay", gameserver.PEER_RELAY.serve,
-               kwargs={"host": args.host})
+               kwargs={"host": args.host}, port=args.relay_port)
         log(f"中继服   {describe_listen(args.host, args.relay_port)}"
             f" —— 原版 rcp 协议，战斗内同步走它")
+
+    # ★ 位置数据的 UDP 旁路（bug调查/9）。和游戏服 TCP **同一个端口号**，
+    #   TCP/UDP 两套端口空间不冲突。开火/命中/伤害这些不能丢的东西照旧走 TCP。
+    #   `udp_sync = 0` 或 `--no-udp-sync` 关掉；关掉、没放行 UDP、玩家用的是
+    #   没更新的客户端 —— 三种情况的表现完全一样：全部走 TCP，没人察觉。
+    udp_on = bool(cfg["udp_sync"]) and not args.no_udp_sync
+    udpsync.SERVER.enabled = udp_on
+    udpsync.SERVER.redundancy = cfg["udp_sync_redundancy"]
+    # ★ 跟着 `--game-port` 走，不用自己那份常量 —— 「和游戏服同号」是这套东西
+    #   对玩家承诺的唯一一句话（防火墙只要记一个号），改了游戏服端口而 UDP
+    #   还钉在 27799 的话，这句话就不成立了。
+    udpsync.SERVER.port = args.game_port
+    if not udp_on:
+        why = "--no-udp-sync" if args.no_udp_sync else "server.config 的 udp_sync = 0"
+        log(f"同步UDP  已关闭（{why}）；位置数据和其它同步数据一样走 TCP")
+    else:
+        _start("udpsync", udpsync.SERVER.serve,
+               kwargs={"host": args.host}, port=args.game_port, proto="UDP")
+        log(f"同步UDP  {describe_listen(args.host, args.game_port)}/udp"
+            f" —— 只有位置数据走它（冗余 {cfg['udp_sync_redundancy']} 份），"
+            f"开火/伤害/死亡照旧走 TCP")
+        log(f"         ⚠ 防火墙要单独放行 UDP {args.game_port}"
+            f"（和游戏服 TCP 同号，但规则是两条）")
 
     if not args.no_web:
         # 延迟 import：注册页是纯标准库的，但没必要在 --no-web 时也加载。
@@ -245,7 +289,8 @@ def main(argv=None):
                     else cfg["register_cooldown_seconds"])
         _start("web", web_server.serve,
                kwargs={"port": web_port, "accounts": accounts,
-                       "host": args.host, "cooldown": cooldown})
+                       "host": args.host, "cooldown": cooldown},
+               port=web_port)
         log(f"注册页   {describe_listen(args.host, web_port)}"
             f" —— 本机打开 http://127.0.0.1:{web_port}/")
         log("注册冷却 " + (f"{cooldown} 秒（同一 IP 注册成功后要等这么久；"
@@ -270,4 +315,11 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    # 端口被占用是**最常见**的启动失败，而它的 traceback 对玩家毫无意义。
+    # 把它压成一句话 + 退出码 1，启动脚本据此把处理办法打出来。
+    try:
+        main()
+    except PortBusy as error:
+        log(f"!! {error}")
+        log("   处理办法：先关掉占用它的程序（或上一次没关干净的服务端），再重试。")
+        sys.exit(1)

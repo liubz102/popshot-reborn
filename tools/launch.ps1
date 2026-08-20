@@ -55,13 +55,9 @@ $Python     = $PyChoice.Path
 $LogDir     = Join-Path $Root 'logs'
 $ModeFile   = Join-Path $LogDir '.server_mode'
 $ConfigPath = Join-Path $Root 'server.config'
-$AuthPort   = 47611     # 认证服（客户端写死）
-$GamePort   = 27799     # 游戏服（客户端写死）
-$CtrlPort   = 27800     # 调试控制通道（只绑 127.0.0.1）
-$RelayAuth  = 47621     # 联机模式：客户端 -> 中继 -> 远端 47611
-$RelayGame  = 27809     # 联机模式：客户端 -> 中继 -> 远端 27799
-$PeerRelay  = 27798     # 原版 TCP 中继（服务端；地址由 0x0210 下发，D078/D079）
-$RelayPeer  = 27808     # 联机模式：客户端 -> 中继 -> 远端 27798
+# ★★ 端口号**不在这里写死**，见下面「端口表」那一段 —— 它向
+#    server/config.py 要，因为要用内置 Python 去读，所以排在
+#    「Python 在不在」那个检查之后。
 # ★ `$x = if (...) {...} else {...}` 换成显式赋值：老 PowerShell 上这种
 #   「把语句当表达式赋值」的写法不保险，一行的事，不冒这个险。
 $Mode       = 'normal'
@@ -73,6 +69,27 @@ function Say([string]$msg, [string]$color = 'Gray') {
 
 # `Get-ListenerPid`（端口 -> 占用它的进程 id）由 wincompat.ps1 提供：
 # 新系统走 Get-NetTCPConnection，Win7 这类没有 NetTCPIP 模块的走 netstat。
+
+function Assert-PortsFree([object[]]$specs, [string]$who) {
+    <#
+        这些端口必须全空，否则**直接报错退出**。
+
+        ★ 为什么是硬失败而不是「警告一下继续」：端口被别人占着时，受影响的
+          功能会**静默**坏掉 —— TCP 那几个还能靠「端口没起来」兜住，UDP 那条
+          位置通道却完全没有回执，玩家只会看到「别人卡」却查不出任何原因。
+          宁可开局就说清楚是哪个端口、被谁占着。
+    #>
+    $busy = Test-PortsFree $specs
+    if ($busy.Count -eq 0) { return }
+    Say ''
+    Say "!! 端口被占用，无法启动$who：" 'Red'
+    foreach ($line in $busy) { Say "     $line" 'Red' }
+    Say '   处理办法：' 'Yellow'
+    Say '     * 如果是上一次没关干净的本游戏，先运行 stop.bat；' 'Yellow'
+    Say '     * 如果是别的程序，关掉它，或在任务管理器里按上面的 pid 找到它。' 'Yellow'
+    Say ''
+    exit 1
+}
 
 function Stop-ListenerOn([int[]]$ports) {
     # ★ 只停「占着这些端口的进程」。绝不 Get-Process python | Stop-Process ——
@@ -168,6 +185,32 @@ if (-not (Test-Path $Python)) {
     throw "找不到内置 Python: $Python —— 请重新解压完整的便携版，不能只复制启动脚本。"
 }
 
+# --- 端口表：唯一的源是 server/config.py -----------------------------------
+# 以前这个脚本里有 9 个端口字面量，`hook/bshook.c` 里另有 11 个，两边靠一串
+# POPSHOT_*_PORT 环境变量在运行时对齐。那既是重复劳动，也是一类「改了这边
+# 没改那边」的故障 —— 症状通常不是报错，而是某个功能悄悄不工作（位置数据
+# 那条 UDP 通道尤其典型：端口对不上时它一点回声都没有）。
+#
+# 现在只有一个源：C 那边走生成的 hook/ports.h，这里走 config.py 的 --ports，
+# 两条路读的是同一份常量。
+$portTable = @{}
+foreach ($line in (& $Python (Join-Path $Root 'server\config.py') --ports)) {
+    $pair = "$line".Trim() -split '=', 2
+    if ($pair.Count -eq 2) { $portTable[$pair[0]] = [int]$pair[1] }
+}
+if ($portTable.Count -lt 10) {
+    throw "读不出端口表（python server\config.py --ports）—— 包不完整？"
+}
+$AuthPort      = $portTable['AUTH_PORT']
+$GamePort      = $portTable['GAME_PORT']
+$CtrlPort      = $portTable['CONTROL_PORT']
+$RelayAuth     = $portTable['RELAY_AUTH_PORT']
+$RelayGame     = $portTable['RELAY_GAME_PORT']
+$PeerRelay     = $portTable['PEER_RELAY_PORT']
+$RelayPeer     = $portTable['RELAY_PEER_PORT']
+$RelayUdpSync  = $portTable['RELAY_UDP_SYNC_PORT']
+$ClientUdpPort = $portTable['CLIENT_UDP_PORT']
+
 # 铁律 2：绝不让 2007 年的 GameGuard 真的跑起来（它会装内核驱动）。
 $gg = Join-Path $Root 'game_patched\GameGuard.des'
 if (Test-Path $gg) {
@@ -220,6 +263,16 @@ if ($running -and $lastMode -eq $Mode) {
         Say '[服务端] 上次没关干净（端口只占了一半），全部重启' 'Yellow'
     }
     Stop-ListenerOn @($AuthPort, $GamePort, $CtrlPort)
+    # ★ 清完自己的残留之后再查：这时候还占着的一定是**别的程序**。
+    #   TCP 27799 和 UDP 27799 是两套端口空间，必须分开查 —— 位置数据走的
+    #   是后者，只查 TCP 的话它会在被占时静默失效。
+    Reset-ListenerCache
+    Assert-PortsFree @(
+        @{ Port = $AuthPort; Proto = 'TCP'; Label = '认证服' },
+        @{ Port = $GamePort; Proto = 'TCP'; Label = '游戏服' },
+        @{ Port = $GamePort; Proto = 'UDP'; Label = '位置同步' },
+        @{ Port = $CtrlPort; Proto = 'TCP'; Label = '调试控制通道' }
+    ) '本机服务端'
 
     # Windows PowerShell 5.1 会把 -ArgumentList 数组直接用空格拼成命令行，
     # 不会替单个参数补引号。脚本路径必须显式引用，否则目录名里的空格会截断路径。
@@ -276,6 +329,13 @@ if ($relayPid -and $lastSignature -eq $relaySignature) {
 } else {
     if ($relayPid) { Say '[中继]   远程连接配置已改变 —— 重启它' 'Yellow' }
     Stop-ListenerOn @($RelayAuth, $RelayGame, $RelayPeer)
+    Reset-ListenerCache
+    Assert-PortsFree @(
+        @{ Port = $RelayAuth;    Proto = 'TCP'; Label = '认证中继' },
+        @{ Port = $RelayGame;    Proto = 'TCP'; Label = '游戏中继' },
+        @{ Port = $RelayPeer;    Proto = 'TCP'; Label = '战斗中继' },
+        @{ Port = $RelayUdpSync; Proto = 'UDP'; Label = '位置同步中继' }
+    ) '本机中继'
     $relayScript = Join-Path $Root 'server\relay.py'
     Start-Process -FilePath $Python -WorkingDirectory $Root `
         -ArgumentList @("`"$relayScript`"") `
@@ -305,10 +365,9 @@ if ($NoGame) { Say ''; Say '（-NoGame：不启动客户端）' 'Gray'; exit 0 }
 $env:POPSHOT_SERVER_ADDRESS    = $remote
 $env:POPSHOT_SERVER_REG_PORT   = $remoteReg
 $env:POPSHOT_LOCAL_REG_PORT    = $localReg
-$env:POPSHOT_RELAY_AUTH_PORT   = "$RelayAuth"
-$env:POPSHOT_RELAY_GAME_PORT   = "$RelayGame"
-$env:POPSHOT_RELAY_PEER_PORT   = "$RelayPeer"
-$env:POPSHOT_PEER_RELAY_PORT   = "$PeerRelay"
+# ★ 端口**不再传给 bshook**：它是编译期从 hook/ports.h 拿的，和上面那张表
+#   同源（server/config.py），运行时没有对不齐的余地。只有上面三个
+#   （服务器地址 + 两个注册页端口）真的来自玩家的 server.config。
 
 # --- 5. 残留客户端 ----------------------------------------------------------
 # 互斥体 BigShot_Assa 决定了同时只能有一个实例，残留的会让新实例秒退，
@@ -323,6 +382,15 @@ if ($old) {
 }
 
 # --- 6. 拉起客户端 ----------------------------------------------------------
+# ★ 游戏【接收】位置数据的那个 UDP 口必须空着：bshook 会让游戏去 bind 它，
+#   bind 成功之后才会告诉本机中继「可以往这儿投」。被别的程序占着的话游戏
+#   bind 会失败（原版会弹「…(Bind Fail)」），位置数据的下行就静默退回 TCP。
+#   残留的 BigShot.exe 上一步已经清掉了，所以这里占着的一定是别人。
+Reset-ListenerCache
+Assert-PortsFree @(
+    @{ Port = $ClientUdpPort; Proto = 'UDP'; Label = '游戏接收位置数据' }
+) '游戏客户端'
+
 if ($DebugLog) { $env:BSHOOK_VERBOSE_LOG = '1' } else { $env:BSHOOK_VERBOSE_LOG = '0' }
 
 Start-Process -FilePath $loader -WorkingDirectory $Root `

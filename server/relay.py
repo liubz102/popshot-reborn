@@ -41,10 +41,12 @@ import socket
 import struct
 import sys
 import threading
+import time
 from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as server_config
+import udpsync
 from netlisten import create_listener, tune_stream
 
 for _stream in (sys.stdout, sys.stderr):
@@ -401,6 +403,24 @@ def serve_one(local_port, target_host, target_port, label, ready=None, proxy=Non
                          daemon=True).start()
 
 
+def start_udp_sync(target_host, proxy=None, enabled=True, redundancy=2):
+    """把位置数据的 UDP 中继拉起来。返回 `UdpSyncRelay | None`。
+
+    **任何一种起不来的情况都只打一行日志、返回 `None`** —— 这条通道从头到尾
+    都是「TCP 之外多走一份」，没有它游戏完全正常。
+    """
+    if not enabled:
+        log("位置UDP  已关闭（server.config 的 udp_sync = 0）；位置数据走 TCP")
+        return None
+    if proxy is not None:
+        # SOCKS5 的 UDP ASSOCIATE 要另开通道且未必被代理支持，HTTP CONNECT
+        # 根本转不了 UDP。做半套不如不做 —— 走代理就保持今天的行为。
+        log("位置UDP  已启用代理，位置数据回退 TCP（代理转不了 UDP）")
+        return None
+    relay = UdpSyncRelay(target_host, redundancy=redundancy)
+    return relay if relay.start() else None
+
+
 def start(target_host, port_map=PORT_MAP, proxy=None):
     """把全部中继监听器丢进后台线程，返回线程列表。"""
     threads = []
@@ -415,6 +435,299 @@ def start(target_host, port_map=PORT_MAP, proxy=None):
             raise RuntimeError(f"中继端口 {local_port} 没起来（被占用了？）")
         threads.append(thread)
     return threads
+
+
+#: HELLO 还没被确认时多久重发一次（秒）。服务端重启过、UDP 包丢了、
+#: 玩家进游戏时服务端还没起来 —— 都靠它自己接回来。
+HELLO_RETRY_S = 2.0
+
+#: 确认之后多久发一发保活（秒）。家用路由器的 UDP 映射常见 30~60 秒超时，
+#: 10 秒足够撑住；战斗中本来就有 8 Hz 的数据，保活只在大厅里真的起作用。
+KEEPALIVE_S = 10.0
+
+#: 收不到任何回应多久算这条路不通（秒）。到点只打一行日志 —— **不做任何降级**，
+#: 因为 TCP 那份从来没停过，UDP 不通对玩家就是「和以前一样」。
+UDP_QUIET_WARN_S = 20.0
+
+
+class UdpSyncRelay:
+    """位置数据的本机 UDP 中继（`server/udpsync.py` 是它的对端）。
+
+    ```text
+    BigShot.exe --(bshook 镜像)--> 127.0.0.1:27809/udp ─┐
+                                                        ├─ 本类 ─> <server>:27799/udp
+    BigShot.exe:7788/udp <--(下行注入，阶段 2)-----------┘
+    ```
+
+    ★ **它不是「把 TCP 换成 UDP」，是在 TCP 之外多走一份。** 客户端那份
+    `0x040e` 照发不误，所以这条 UDP 通道**整条不通也没有任何后果** ——
+    服务端按索引去重，UDP 没到就用 TCP 那份。
+
+    ★ **代理开着时整条通道禁用**：SOCKS5 的 UDP ASSOCIATE 要另开一条通道、
+    还得代理服务器支持，HTTP CONNECT 根本转不了 UDP。与其做半套不如不做 ——
+    走代理的玩家保持今天的行为。
+    """
+
+    def __init__(self, target_host, target_port=None, local_port=None,
+                 redundancy=2):
+        self.target_host = target_host
+        self.target_port = target_port or server_config.UDP_SYNC_PORT
+        self.local_port = local_port or server_config.RELAY_UDP_SYNC_PORT
+        self.redundancy = max(0, int(redundancy))
+        #: 游戏那个「收位置数据的 UDP 口」bind 成功了没有。
+        #: ★ 这个值**不是我们判的，是 `bshook` 告诉我们的** —— 它在游戏进程里
+        #: 钩住 `bind`，亲眼看着那一次 bind 返回 0 才置位。所以它是权威的，
+        #: 不存在「口被别的程序占着而我们以为是游戏」那种假阳性。
+        self.downlink = False
+        self.local = None
+        self.remote = None
+        self.remote_addr = None
+        self.hook_addr = None
+        self.ticket = ""
+        self.acked = False
+        self.started_at = 0.0
+        self.last_hello_at = 0.0
+        self.last_keepalive_at = 0.0
+        self.warned_quiet = False
+        self.sent = 0
+        self.received = 0
+        self.injected = 0
+        #: 最近几份（含当前）：`[(索引, UdpPacket), …]`，冗余捎带用。
+        self.recent = []
+        #: 下行闸门：只准前进。**没有它，网络乱序或冗余补发会把角色拉回旧位置。**
+        self.downlink_high_water = -1
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+
+    # -- 建 socket ----------------------------------------------------------
+    def _resolve(self):
+        infos = socket.getaddrinfo(self.target_host, self.target_port,
+                                   type=socket.SOCK_DGRAM)
+        family, _, _, _, sockaddr = infos[0]
+        return family, sockaddr
+
+    def start(self):
+        """建好两条 socket 并把收发线程拉起来。失败时返回 `False`（不抛）。"""
+        try:
+            family, self.remote_addr = self._resolve()
+        except OSError as error:
+            log(f"位置UDP  ✗ 解析不了 {self.target_host}: {error}；"
+                f"位置数据继续走 TCP")
+            return False
+        try:
+            self.remote = socket.socket(family, socket.SOCK_DGRAM)
+            self.remote.settimeout(0.5)
+            self.local = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.local.bind((LISTEN_HOST, self.local_port))
+            self.local.settimeout(0.5)
+        except OSError as error:
+            log(f"位置UDP  ✗ 本机 {LISTEN_HOST}:{self.local_port}/udp 起不来"
+                f"（{error}）；位置数据继续走 TCP")
+            self.close()
+            return False
+        self.started_at = time.monotonic()
+        for target, name in ((self._pump_local, "udpsync-local"),
+                             (self._pump_remote, "udpsync-remote"),
+                             (self._pump_timer, "udpsync-timer")):
+            threading.Thread(target=target, daemon=True, name=name).start()
+        log(f"位置UDP  {LISTEN_HOST}:{self.local_port}/udp → "
+            f"{server_config.http_host(self.target_host)}:{self.target_port}/udp"
+            f"（冗余 {self.redundancy} 份；只走位置数据，其余照旧 TCP）")
+        return True
+
+    def close(self):
+        self._stop.set()
+        for sock in (self.local, self.remote):
+            try:
+                if sock is not None:
+                    sock.close()
+            except OSError:
+                pass
+
+    # -- bshook -> 我们 -> 服务器 -------------------------------------------
+    def _pump_local(self):
+        while not self._stop.is_set():
+            try:
+                data, addr = self.local.recvfrom(udpsync.MAX_DATAGRAM * 2)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    break
+                continue
+            self.hook_addr = addr
+            try:
+                self._on_hook_datagram(data)
+            except Exception as error:      # noqa: BLE001 —— 收包循环必须不死
+                vlog(f"位置UDP  处理 bshook 数据报出错（忽略）: {error!r}")
+
+    def _on_hook_datagram(self, data):
+        try:
+            kind, _ = udpsync.parse_header(data)
+        except udpsync.ProtocolError:
+            return
+        if kind == udpsync.MSG_HELLO:
+            # `bshook` 发来的 HELLO 有两种时机：
+            #   * 登录（发出 `0x0100`）—— 票据换了、索引从头数；
+            #   * 游戏成功 bind 了收位置数据的 UDP 口 —— 标志位置起来。
+            # 两种都原样把票据 + 标志位转告服务端。
+            try:
+                ticket, flags = udpsync.parse_hello_full(data)
+            except udpsync.ProtocolError:
+                return
+            downlink = bool(flags & udpsync.HELLO_FLAG_DOWNLINK)
+            with self._lock:
+                # ★ 「新的一条游戏连接」不能靠票据变没变来判 —— 断线重连时
+                #   客户端会**原样重放同一张票据**（§171）。判据是标志位从
+                #   「已绑」回到「没绑」：`bshook` 每发一次登录包就把它清一次。
+                restart = (ticket != self.ticket) or (self.downlink and not downlink)
+                self.ticket = ticket
+                if restart:
+                    # 索引、水位、确认状态全部从头来 —— 服务端那边是一条新的
+                    # `Conn`，计数器同样从 0 起，两边这才对得上。
+                    self.recent.clear()
+                    self.acked = False
+                    self.downlink_high_water = -1
+                changed = (downlink != self.downlink)
+                self.downlink = downlink
+            if changed:
+                log(f"位置UDP  下行 {'已就绪' if downlink else '未就绪'}"
+                    f"（游戏的 UDP {server_config.CLIENT_UDP_PORT} "
+                    f"{'已 bind' if downlink else '还没 bind'}）")
+            self._send_hello()
+            return
+        if kind != udpsync.MSG_DATA:
+            return
+        try:
+            chunks = udpsync.parse_data(data)
+        except udpsync.ProtocolError:
+            return
+        with self._lock:
+            added = 0
+            for index, packet in chunks:
+                # 铁律 1：只有位置心跳能走这条路。`bshook` 那边已经筛过一遍，
+                # 这里是纵深防御（也挡住手搓包往这个本地口乱发的情况）。
+                if not udpsync.is_heartbeat(packet):
+                    continue
+                self.recent.append((index, packet))
+                added += 1
+            # ★ 这一发里一份新的都没有就**什么都不发** —— 照旧发的话等于
+            #   把上一批原样重播一遍，纯属浪费上行（服务端那边会当成过期丢掉）。
+            if not added:
+                return
+            keep = self.redundancy + 1
+            if len(self.recent) > keep:
+                del self.recent[0:len(self.recent) - keep]
+            payload = udpsync.build_data(list(self.recent))
+        self._to_remote(payload)
+
+    def _to_remote(self, payload):
+        if self.remote is None:
+            return
+        try:
+            self.remote.sendto(payload, self.remote_addr)
+            self.sent += 1
+        except OSError:
+            # 发不出去就发不出去 —— TCP 那份照常在跑，玩家察觉不到。
+            pass
+
+    def _send_hello(self):
+        if not self.ticket:
+            return
+        self.last_hello_at = time.monotonic()
+        flags = udpsync.HELLO_FLAG_DOWNLINK if self.downlink else 0
+        try:
+            self._to_remote(udpsync.build_hello(self.ticket, flags))
+        except ValueError:
+            pass
+
+    def _inject(self, packet):
+        """把一份位置数据投进游戏自己的 UDP 口（`127.0.0.1:7788`）。
+
+        收方入口 `0x407869` 和 `0x040f` 走的是**同一个函数**（§149），
+        所以从这里进去和从游戏服连接进去，客户端处理起来一个字节的差别都没有。
+        """
+        if self.local is None:
+            return
+        try:
+            self.local.sendto(packet,
+                              (LISTEN_HOST, server_config.CLIENT_UDP_PORT))
+            self.injected += 1
+        except OSError:
+            pass
+
+    # -- 服务器 -> 我们 -> 游戏 ---------------------------------------------
+    def _pump_remote(self):
+        while not self._stop.is_set():
+            try:
+                data, _ = self.remote.recvfrom(udpsync.MAX_DATAGRAM * 2)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    break
+                # Windows 上对端没监听时会以 WSAECONNRESET 的形式报到**下一次**
+                # recvfrom 上，UDP 上这完全正常，继续收。
+                continue
+            self.received += 1
+            try:
+                self._on_remote_datagram(data)
+            except Exception as error:      # noqa: BLE001
+                vlog(f"位置UDP  处理服务器数据报出错（忽略）: {error!r}")
+
+    def _on_remote_datagram(self, data):
+        try:
+            kind, _ = udpsync.parse_header(data)
+        except udpsync.ProtocolError:
+            return
+        if kind == udpsync.MSG_HELLO_ACK:
+            result, note = udpsync.parse_hello_ack(data)
+            if result == udpsync.ACK_OK:
+                if not self.acked:
+                    log("位置UDP  ✓ 服务器已认出这条 UDP 通道，位置数据开始走 UDP")
+                self.acked = True
+            else:
+                self.acked = False
+                log(f"位置UDP  服务器没接受这条通道（{note or result}）；"
+                    f"位置数据继续走 TCP")
+            return
+        if kind == udpsync.MSG_PONG:
+            return
+        if kind != udpsync.MSG_DATA:
+            return
+        try:
+            chunks = udpsync.parse_data(data)
+        except udpsync.ProtocolError:
+            return
+        # ★★ 闸门：**只准前进**。
+        #   一个数据报里捎带了好几份（冗余），按索引升序逐个投；
+        #   已经投过的（索引 <= 水位）一律丢掉。
+        #   没有这一道，网络乱序或冗余补发会把别人的角色**拉回旧位置** ——
+        #   位置心跳没有任何可判新旧的原版字段（头 `+8` 的序列号对心跳恒为 0），
+        #   客户端自己拦不住，只能在这儿拦。
+        for index, packet in sorted(chunks, key=lambda item: item[0]):
+            if index <= self.downlink_high_water:
+                continue
+            if not udpsync.is_heartbeat(packet):
+                continue                    # 铁律 1：只有位置能走这条路
+            self.downlink_high_water = index
+            self._inject(packet)
+
+    def _pump_timer(self):
+        """重发 HELLO / 保活 / 一次性的「这条路好像不通」提示。"""
+        while not self._stop.wait(0.5):
+            now = time.monotonic()
+            if self.ticket and not self.acked and now - self.last_hello_at >= HELLO_RETRY_S:
+                self._send_hello()
+            if self.acked and now - self.last_keepalive_at >= KEEPALIVE_S:
+                self.last_keepalive_at = now
+                self._to_remote(udpsync.build_ping(udpsync.MSG_PING, 0))
+            if (not self.warned_quiet and self.ticket and not self.acked
+                    and now - self.started_at > UDP_QUIET_WARN_S):
+                self.warned_quiet = True
+                log(f"位置UDP  ⚠ {UDP_QUIET_WARN_S:.0f} 秒没等到服务器回应 —— "
+                    f"多半是服务器没放行 UDP {self.target_port}，"
+                    f"或者服务端是旧版。**位置数据继续走 TCP，游戏一切正常**")
 
 
 def main():
@@ -452,6 +765,8 @@ def main():
     except RuntimeError as error:
         log(f"!! {error}")
         return 1
+    start_udp_sync(target, proxy=proxy, enabled=bool(cfg["udp_sync"]),
+                   redundancy=cfg["udp_sync_redundancy"])
     try:
         threading.Event().wait()
     except KeyboardInterrupt:

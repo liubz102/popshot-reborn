@@ -77,6 +77,7 @@ from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
 from netlisten import create_listener, describe as describe_listen, tune_stream
 import relayserver
 from tickets import TicketStore, short as short_ticket
+import udpsync
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -3804,8 +3805,33 @@ PEER_RELAY = relayserver.RelayServer(
     fallback=_relay_fallback,
     on_traffic=_relay_battle_tick,
     generation_of=_relay_generation_of,
+    # 位置数据的 UDP 旁路（bug调查/9）。`deliver()` 里它是**优先级最高、
+    # 准入条件最窄**的那一条路：只有位置心跳、只有自证过能收的收件人、
+    # 而且只有 N 没变的那一发才走它。见 `udpsync.may_send_heartbeat`。
+    udp_sender=udpsync.SERVER,
     logger=lambda msg: print(f"[{ts()}] [relay] {msg}", flush=True),
 )
+
+
+def _conn_for_udp_ticket(ticket):
+    """`票据 -> 已登录的游戏连接`。`udpsync` 认 UDP 流时调它。
+
+    ★ 只认**已经登录成功**的连接（`login_ticket` 是在 `tickets.bind()` 旁边
+    才写上的），所以拿一张没用过的票据从 UDP 上来是查不到任何东西的。
+    """
+    ticket = str(ticket or "")
+    if not ticket:
+        return None
+    with _conns_lock:
+        for conn in _conns:
+            if conn.login_ticket and conn.login_ticket == ticket:
+                return conn
+    return None
+
+
+udpsync.SERVER.bind_lookup(
+    _conn_for_udp_ticket,
+    logger=lambda msg: print(f"[{ts()}] [udpsync] {msg}", flush=True))
 
 
 def register_conn(conn):
@@ -3988,6 +4014,26 @@ class Conn:
         self.peer_gap_ms = relayserver.RttStats()
         self.peer_last_at = None
         self.peer_report_at = time.monotonic()
+        # ★ **转发**间隔（两条路合流之后）。和上面那个 `peer_gap_ms`（TCP 到达
+        #   间隔）一起打进同一行日志，两个数字并排就是「UDP 到底救回了多少」：
+        #   bug调查/9 那一局 TCP 到达间隔 p95=432ms，转发间隔应该落到 ~130ms。
+        self.peer_out_gap_ms = relayserver.RttStats()
+        self.peer_out_last_at = None
+        # ★ 位置数据 UDP 旁路的**排序闸门**（`udpsync` 开头那四条铁律）。
+        #   上行是 UDP + TCP 双发，两条路的心跳在这里合成一条有序流；
+        #   事件包（内层 < 0x4000）只走 TCP，但要在这里记账 —— 铁律 3 靠它。
+        self.peer_order = udpsync.HeartbeatOrder()
+        # ★ 同步数据的上行现在有**三个**线程会走到：这条连接自己的线程
+        #   （`0x040e`）、原版中继连接的线程（rcp opcode 3）、以及 UDP 收包
+        #   线程（`udpsync`）。闸门、统计和转发必须串起来，否则两条路可能
+        #   同时判「该我转」而把同一发心跳投两次 —— 那正是铁律 4 要防的。
+        #   ⚠ 顺序永远是「先 peer_lock 再 send_lock」，反过来拿会死锁。
+        self.peer_lock = threading.RLock()
+        # 上一次看到的局号，用来判断「换代了，闸门要归零」。
+        self.peer_order_epoch = None
+        # 登录时那张票据。UDP 那条流靠它认人（`udpsync._on_hello`）——
+        # 票据本来就是重连凭证（`tickets.py`），不引入新的秘密。
+        self.login_ticket = ""
         # 本局回了几次 0x0406 死亡广播 / 几次 0x0419 重生（只用来打日志编号）。
         self.deaths_broadcast = 0
         self.respawn_sent = 0
@@ -4774,6 +4820,9 @@ class Conn:
         #   自己反复重连并原样重放它（§171），全程不回认证服。所以要把它标成
         #   「已登进游戏服」换一个长得多的有效期，并落盘扛住服务端重启（D096）。
         self.tickets.bind(ticket)
+        # UDP 同步那条流拿这张票据认人（`udpsync._on_hello`）。记在连接上，
+        # 这样「票据 -> 哪条游戏连接」不用再翻一遍 TicketStore。
+        self.login_ticket = ticket
         self.online(f"✓ 登录 账号={name!r} ip={self.peer()} "
                     f"等级={player_level(account)} 金币={player_money(account)}")
         state = tutorial_state(self.account)
@@ -6383,16 +6432,77 @@ class Conn:
             self.log(f"   玩家间同步：本房间第一发 {len(payload)} 字节\n"
                      f"{hexdump(payload)}\n"
                      f"{describe_peer_header(payload)}")
-        started = time.monotonic()
-        if self.peer_last_at is not None:
-            self.peer_gap_ms.add((started - self.peer_last_at) * 1000.0)
-        self.peer_last_at = started
+        # ★ 到达间隔量的是**这条 TCP 连接**上的到达节奏，和 UDP 那条路无关 ——
+        #   它是「客户端发得准不准 / 链路抖不抖」的尺子（bug调查/9 就是靠它定的案），
+        #   语义必须和历史日志保持一致，所以放在去重**之前**。
+        arrived = time.monotonic()
+        with self.peer_lock:
+            if self.peer_last_at is not None:
+                self.peer_gap_ms.add((arrived - self.peer_last_at) * 1000.0)
+            self.peer_last_at = arrived
+            self.sync_peer_epoch(payload)
+            if udpsync.is_heartbeat(payload):
+                if not self.peer_order.take_tcp(payload):
+                    # UDP 那一份已经先送到了，这一份是它的影子 —— 丢掉。
+                    # **绝不能两份都转**：心跳没有任何可判新旧的原版字段，
+                    # 后到的那份会把角色拉回旧位置（`udpsync` 铁律 4）。
+                    return
+            else:
+                # 事件包（内层 < 0x4000）永远走 TCP，这里只记账 ——
+                # 「已经转发到第几发事件」是放行 UDP 心跳的硬判据（铁律 3）。
+                self.peer_order.note_event(udpsync.peer_sequence(payload))
+            self.forward_peer_data(payload, arrived)
+
+    def sync_peer_epoch(self, payload):
+        """局号一变就把排序闸门里的**事件计数**归零（`udpsync` 铁律 3）。
+
+        发送方换代时 `ResetQueues` 会把自己的事件序号清回 0，我们这边的
+        「已转发几发事件」必须同步清，否则新一代的心跳（N 从 0 起）会被
+        上一代的旧账放行得太宽。索引那两个计数器**不清** —— `bshook` 那边
+        是按连接数的，两边要用同一个起点。
+        """
+        game_id = relayserver.peer_game_id(payload)
+        if game_id is None:
+            return
+        if self.peer_order_epoch is None:
+            self.peer_order_epoch = game_id
+            return
+        if game_id != self.peer_order_epoch:
+            self.peer_order_epoch = game_id
+            self.peer_order.new_epoch()
+
+    def feed_peer_udp(self, index, payload):
+        """UDP 那条路的入口 —— `udpsync` 收到位置数据后调它。
+
+        ★ 只有**位置心跳**能走到这儿（`udpsync._on_data` 已经把非心跳挡掉了），
+        这里再过一遍排序闸门：旧的不要、会越过还没转发的事件包的不要。
+        """
+        room = self.lobby_room()
+        if room is None:
+            return
+        with self.peer_lock:
+            self.sync_peer_epoch(payload)
+            if not self.peer_order.take_udp(index, payload):
+                return
+            self.peer_data_in += 1
+            self.forward_peer_data(payload, time.monotonic())
+
+    def forward_peer_data(self, payload, arrived):
+        """两条路合流之后**唯一**的转发出口。
+
+        ⚠ `PEER_RELAY.deliver()` 会顺带调 `_relay_battle_tick`（房间级的
+        「每帧问一次」），所以它**只能在去重之后被调一次** —— UDP 和 TCP
+        各调一次的话，对战计时和道具刷新都会变成两倍速。
+        """
         # ★ 走 `PEER_RELAY.deliver` 而不是直接广播 `0x040f`：房里可能有人已经
         #   接上原版中继了，那些人要走中继收（原版路径），剩下的才走 `0x040f`。
         #   两条路在客户端进的是同一个入口 `0x407869`，谁收哪条都一样。
         self.peer_data_out += PEER_RELAY.deliver(self, payload)
-        self.peer_forward_ms.add((time.monotonic() - started) * 1000.0)
-        self.report_peer_timing(started)
+        if self.peer_out_last_at is not None:
+            self.peer_out_gap_ms.add((arrived - self.peer_out_last_at) * 1000.0)
+        self.peer_out_last_at = arrived
+        self.peer_forward_ms.add((time.monotonic() - arrived) * 1000.0)
+        self.report_peer_timing(arrived)
         # ★ 「每帧问一次」的房间级判断（对战时间上限、道具模式刷道具）**不在
         #   这里**，在 `_relay_battle_tick` 里 —— 上面那发 `deliver()` 会调它。
         #   原因见那个函数：中继一建起来，`0x040e` 整局就不再出现了（§160），
@@ -6412,14 +6522,24 @@ class Conn:
         if forward is None:
             return
         gap = self.peer_gap_ms.summary()
+        out_gap = self.peer_out_gap_ms.summary()
+        udp = self.peer_order.summary()
         who = self.account_name or "?"
         # ★ 这一行是**调试级**（D112）：它每 30 秒一发、每条连接各一份，
         #   一局下来能把 online.log 撑得比运营事件多一个数量级，
         #   而它只在专门查延迟的那几天有用（§187 那一轮就是靠它量出来的）。
+        #
+        # ★★ 「到达间隔」和「转发间隔」要并排看：前者是这条 **TCP** 上的到达
+        #    节奏（跨境线路抖不抖），后者是**真正转给别人**的节奏（别人屏幕上
+        #    的流畅度）。UDP 旁路生效时，后者的 p95 会明显比前者小 ——
+        #    bug调查/9 那一局前者 p95=432ms，后者应该在 ~130ms。
         self.online_debug(f"同步转发 账号={who!r} 转发耗时 {forward}"
-                          + (f"；到达间隔 {gap}" if gap else ""))
+                          + (f"；到达间隔 {gap}" if gap else "")
+                          + (f"；转发间隔 {out_gap}" if out_gap else "")
+                          + (f"；{udp}" if udp else "；UDP 未启用"))
         self.peer_forward_ms.reset()
         self.peer_gap_ms.reset()
+        self.peer_out_gap_ms.reset()
 
     def broadcast_system_chat(self, text):
         """房间里的一行系统提示（没有「谁 : 」前缀，§141）。"""
@@ -7041,6 +7161,9 @@ class Conn:
             # 游戏连接一断，客户端那条中继连接自己也会走掉；而主动关别人的
             # 中继连接会触发 `OnDisconnected`，那是把玩家踢出房间（§158）。
             PEER_RELAY.forget(self)
+            # UDP 那条流也跟着作废。它是无连接的，不忘掉的话对端下次带着
+            # 同一个源地址上来会被认成还活着的旧连接。
+            udpsync.SERVER.forget(self)
             # ★ 断线也要把座位腾出来并广播，否则房间里会留一个永远不动的
             #   幽灵玩家，而且房主要是他，那个房间就再也开不了局。
             try:

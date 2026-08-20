@@ -25,6 +25,10 @@
 #include <wchar.h>
 #include <intrin.h>
 #include "gg_bypass.h"
+/* ★ 端口号**全部**来自这里，别在本文件里写死任何一个 ——
+   它由 tools/gen_ports_h.py 从 server/config.py 生成，build.bat 每次编译
+   前都会重新跑一遍。要改端口只改 server/config.py 一处。 */
+#include "ports.h"
 #pragma intrinsic(_ReturnAddress)
 
 /* -------------------------------------------------------------------------- */
@@ -388,19 +392,39 @@ static int WINAPI det_MessageBoxA(HWND hWnd, LPCSTR text, LPCSTR cap, UINT type)
 #endif
 
 static wchar_t  g_server_addr[256]    = L"127.0.0.1";
-static unsigned g_server_reg_port     = 27810;
-static unsigned g_local_reg_port      = 27810;
-static unsigned g_relay_auth_port     = 47621;
-static unsigned g_relay_game_port     = 27809;
-static unsigned g_relay_peer_port     = 27808;
+/* ★ 下面这些**不是**可配置项，只是「同一个常量在 C 这边的副本」，
+   源头全在 server/config.py（经 ports.h 生成）。以前它们各写一个字面量、
+   再靠 POPSHOT_*_PORT 环境变量在运行时对齐 —— 那既是重复劳动，也是一类
+   「改了这边没改那边」的故障：症状往往不是报错，而是某个功能悄悄不工作。
+
+   ⚠ 例外是下面两个注册页端口：那两个**真的**来自玩家的 server.config，
+     所以仍然由启动脚本用环境变量传进来，这里的值只是缺省。 */
+static unsigned g_server_reg_port     = POPSHOT_DEFAULT_REGISTER_PORT;
+static unsigned g_local_reg_port      = POPSHOT_DEFAULT_REGISTER_PORT;
+static unsigned g_relay_auth_port     = POPSHOT_RELAY_AUTH_PORT;
+static unsigned g_relay_game_port     = POPSHOT_RELAY_GAME_PORT;
+static unsigned g_relay_peer_port     = POPSHOT_RELAY_PEER_PORT;
+/* 位置数据 UDP 旁路的本机端口（`server/relay.py` 听这个口）。和游戏服中继
+   同号，理由见 `server/config.py` 的 `RELAY_UDP_SYNC_PORT`。 */
+static unsigned g_relay_udp_sync_port = POPSHOT_RELAY_UDP_SYNC_PORT;
+/* ★ 原版 `UDPBinder` 写死要 bind 的 UDP 端口（`0x5bba92(0x1e6c)`，§153），
+   和我们把它改写成的号。改写在 `det_bind` 里做。
+
+   为什么非改不可：下行的位置数据要投进这个口，而「这个口是不是游戏在听」
+   必须是**确定**的。7788 是个谁都可能占的低位号，被别的程序占着的话数据就
+   投进黑洞 —— 表现是「所有人在你屏幕上定住」，比不开这个功能还糟。
+   换成我们自己的号之后：启动脚本先确认它空着，再由游戏去 bind，
+   bind 成功由本函数告诉本机中继 —— 三步都是硬的。 */
+static unsigned g_game_udp_port       = POPSHOT_GAME_ORIGINAL_UDP_PORT;
+static unsigned g_client_udp_port     = POPSHOT_CLIENT_UDP_PORT;
 /* 客户端写死的两个端口（V0.1 §24 / §40），只作为「要不要映射」的判据。 */
-static unsigned g_auth_port           = 47611;
-static unsigned g_game_port           = 27799;
+static unsigned g_auth_port           = POPSHOT_AUTH_PORT;
+static unsigned g_game_port           = POPSHOT_GAME_PORT;
 /* 原版 TCP 中继的端口（里程碑 J.3 / D078 / D079）。
    前两个是客户端写死的，这个不是 —— 客户端连哪儿完全由服务端在
    `0x0210 gspJoinRelay` 里给的地址说了算，我们让服务端固定填
    `127.0.0.1:27798`，再在这里按模式把它映射出去，和上面两个一个套路。 */
-static unsigned g_peer_relay_port     = 27798;
+static unsigned g_peer_relay_port     = POPSHOT_PEER_RELAY_PORT;
 
 static HWND         g_login_dlg   = NULL;
 static int          g_dlg_styled  = 0;      /* 文案 / 尺寸只改一次 */
@@ -449,14 +473,15 @@ static void read_online_config(void)
     }
     g_server_reg_port = env_uint("POPSHOT_SERVER_REG_PORT", g_server_reg_port);
     g_local_reg_port  = env_uint("POPSHOT_LOCAL_REG_PORT",  g_local_reg_port);
-    g_relay_auth_port = env_uint("POPSHOT_RELAY_AUTH_PORT", g_relay_auth_port);
-    g_relay_game_port = env_uint("POPSHOT_RELAY_GAME_PORT", g_relay_game_port);
-    g_relay_peer_port = env_uint("POPSHOT_RELAY_PEER_PORT", g_relay_peer_port);
-    g_peer_relay_port = env_uint("POPSHOT_PEER_RELAY_PORT", g_peer_relay_port);
-    bslog("CFG     远程服务器=%s 注册页端口 远端=%u 本机=%u；中继端口 %u/%u/%u",
+    /* ★ 中继/同步那几个端口**不再读环境变量** —— 它们是编译期就定死的常量
+       （ports.h ← server/config.py），启动脚本读的是同一份，没有对不齐的余地。
+       只有下面两个注册页端口来自玩家的 server.config，才需要传进来。 */
+    bslog("CFG     远程服务器=%s 注册页端口 远端=%u 本机=%u；中继端口 %u/%u/%u"
+          "；位置 UDP 旁路 127.0.0.1:%u；游戏收位置的 UDP 口 %u（原版 %u）",
           w2u8(g_server_addr, u8, sizeof(u8)),
           g_server_reg_port, g_local_reg_port,
-          g_relay_auth_port, g_relay_game_port, g_relay_peer_port);
+          g_relay_auth_port, g_relay_game_port, g_relay_peer_port,
+          g_relay_udp_sync_port, g_client_udp_port, g_game_udp_port);
 }
 
 static int selected_online_mode(void)
@@ -897,12 +922,14 @@ struct sockaddr_in_min {                 /* 与 sockaddr_in 二进制一致(16�
 };
 #define AF_INET_MIN 2
 
+typedef int (WINAPI *bind_t)(SOCKET_T, const struct sockaddr_min *, int);
 typedef int (WINAPI *connect_t)(SOCKET_T, const struct sockaddr_min *, int);
 typedef int (WINAPI *WSAConnect_t)(SOCKET_T, const struct sockaddr_min *, int,
                                    void *, void *, void *, void *);
 typedef void *(WINAPI *gethostbyname_t)(const char *);
 typedef int (WINAPI *getaddrinfo_t)(const char *, const char *, const void *, void *);
 
+static bind_t          s_bind = NULL;
 static connect_t       s_connect = NULL;
 static WSAConnect_t    s_WSAConnect = NULL;
 static gethostbyname_t s_gethostbyname = NULL;
@@ -931,6 +958,10 @@ static int g_redirect = 1;
 /* V0.2：登录框里选了「远程服务器」。定义在下面的「登录框改造」一段。 */
 int  popshot_online_mode(void);
 unsigned popshot_map_port(unsigned port);
+
+/* 游戏成功 bind 了「收位置数据的 UDP 口」之后告诉本机中继。
+   定义在下面「位置数据的 UDP 旁路」一段。 */
+static void sync_on_udp_bound(void);
 
 /* 若是 IPv4 且开启重定向：地址改成 127.0.0.1，端口按当前模式映射。
    返回 1 并填好 out；否则返回 0。
@@ -961,6 +992,49 @@ static int make_localhost(const struct sockaddr_min *name, int namelen, struct s
    启动时加载 Pack\*.pkn 会把配额一次性烧光，网络阶段就什么都记不到了，
    所以每次 connect 都重开一个干净的记录窗口。 */
 void snow_log_reset(void);
+
+/* ★ 把原版写死的 UDP 7788 改写成我们自己的号（`g_client_udp_port`）。
+
+   原版 `GameSession` 构造时 `new UDPBinder` 之后就 bind 7788（§153），
+   下行的位置数据要投进的就是这个口。7788 是个谁都可能占的低位号 ——
+   被别人占着的话我们投进去的数据就石沉大海，而**在外面根本看不出来**
+   （UDP 没有连接、没有回执），表现是「所有人在你屏幕上定住」。
+
+   换成我们自己的号，「这个口是不是游戏在听」就变成三步硬判据：
+     1. 启动脚本先确认它空着（占用就直接报错不启动）；
+     2. 游戏在这里 bind 它；
+     3. bind **成功**之后由 `sync_on_udp_bound()` 告诉本机中继可以投了。
+
+   ⚠ 只改端口号 7788 这一个条件，其余 bind 一律原样放行 —— 客户端的 TCP
+     socket 不显式 bind，所以这个判据是唯一的。 */
+static int WINAPI det_bind(SOCKET_T s, const struct sockaddr_min *name, int namelen)
+{
+    struct sockaddr_in_min sa;
+    unsigned port;
+    int rc;
+
+    if (!name || namelen < 16 || name->sa_family != AF_INET_MIN)
+        return s_bind(s, name, namelen);
+    memcpy(&sa, name, sizeof(sa));
+    port = ((unsigned)sa.sin_port[0] << 8) | sa.sin_port[1];
+    if (port != g_game_udp_port)
+        return s_bind(s, name, namelen);
+
+    sa.sin_port[0] = (unsigned char)((g_client_udp_port >> 8) & 0xff);
+    sa.sin_port[1] = (unsigned char)(g_client_udp_port & 0xff);
+    rc = s_bind(s, (const struct sockaddr_min *)&sa, (int)sizeof(sa));
+    if (rc == 0) {
+        bslog("★WS2 bind %u -> %u（游戏收位置数据的 UDP 口，已改写）",
+              port, g_client_udp_port);
+        sync_on_udp_bound();
+    } else {
+        /* 到这一步还失败，说明启动脚本的端口检查之后又被人抢了。
+           原版会弹「…(Bind Fail)」，我们只多记一行 —— 下行照旧走 TCP。 */
+        bslog("★WS2 !! bind %u 失败，位置数据的下行继续走 TCP（不影响游戏）",
+              g_client_udp_port);
+    }
+    return rc;
+}
 
 static int WINAPI det_connect(SOCKET_T s, const struct sockaddr_min *name, int namelen)
 {
@@ -1004,6 +1078,8 @@ static void install_ws2_hooks(void)
     if (!ws2) { bslog("HOOK    ws2_32 尚未加载, 稍后重试"); return; }
     if (s_connect) return; /* 已装 */
 
+    s_bind = (bind_t)install_inline_hook(
+        (void *)GetProcAddress(ws2, "bind"), (void *)det_bind, "ws2:bind");
     s_connect = (connect_t)install_inline_hook(
         (void *)GetProcAddress(ws2, "connect"), (void *)det_connect, "ws2:connect");
     s_WSAConnect = (WSAConnect_t)install_inline_hook(
@@ -2286,6 +2362,259 @@ static LONG g_key_n = 0, g_enc_n = 0, g_dec_n = 0;
 
 static int try_hook_snow(void);
 
+/* -------------------------------------------------------------------------- */
+/* 位置数据的 UDP 旁路 —— 客户端这一侧（bug调查/9）。                          */
+/*                                                                            */
+/* ## 它解决什么                                                              */
+/*                                                                            */
+/* 实测：客户端**发**得非常准（间隔 p50=128ms / p95=130ms），但同一批包到跨境 */
+/* 服务器时变成 p95=432ms、33% 成串到达 —— 每秒一次「停 0.43 秒、3 发一起到」。*/
+/* 发 5405 收 5405，一发不丢，所以不是丢包，是 TCP 重传时的**队头阻塞**。      */
+/* 客户端不做插值也不回滚，于是这个抖动 100% 变成别人屏幕上的瞬移。            */
+/*                                                                            */
+/* ## 这里做的事（只有一件）                                                   */
+/*                                                                            */
+/* 在 `SimpleCipher::Encrypt` 的入口 —— 也就是**加密之前**，能看到明文帧的     */
+/* 唯一位置 —— 认出「内层 0x4001 位置心跳」，额外从一条自己的 UDP socket      */
+/* 发一份到本机中继（`server/relay.py`），由它转给服务器。                     */
+/*                                                                            */
+/* ★★ **原来那份 TCP 照发不误，一个字节都不改。** 这条 UDP 通道是「多走一份」，*/
+/*    不是「改走 UDP」。所以它整条不通（防火墙、NAT、服务端是旧版、中继没起来）*/
+/*    都**没有任何后果** —— 服务端按索引去重，UDP 没到就用 TCP 那份。          */
+/*    这就是全部的「回退逻辑」：没有回退逻辑。                                  */
+/*                                                                            */
+/* ★ **只镜像位置**。开火/命中/伤害（内层 < 0x4000）走的是客户端的可靠队列，   */
+/*   丢一发就整局错位（FINDINGS §217），它们任何时候都只走 TCP。               */
+/*                                                                            */
+/* ## 索引                                                                     */
+/*                                                                            */
+/* 每发心跳盖一个递增索引，服务端拿它和自己数的 TCP 发数对齐去重。            */
+/* **两边的起点都是「这条游戏连接的登录包」** —— 我们在看到 `0x0100`          */
+/* gcpReqLogin 时归零，服务端那边是一个新的 `Conn`，计数器同样从 0 起。        */
+/* -------------------------------------------------------------------------- */
+#define SYNC_MAGIC0 'P'
+#define SYNC_MAGIC1 'S'
+#define SYNC_MAGIC2 'U'
+#define SYNC_VERSION 1
+#define SYNC_MSG_HELLO 1
+#define SYNC_MSG_DATA  3
+/* HELLO 的标志位：「游戏这边收位置数据的 UDP 口已经 bind 成功，可以往这儿投」。
+   和 `server/udpsync.py` 的 `HELLO_FLAG_DOWNLINK` 是同一位。 */
+#define SYNC_FLAG_DOWNLINK 0x01
+/* 帧头 10 字节（RawPacket）：+0 魔数 0xff，+8 u16 opcode。§156。 */
+#define FRAME_HEADER 10
+/* UdpPacket 头 12 字节，内层 opcode 在 +10。§151。 */
+#define PEER_HEADER 12
+#define PEER_OPCODE_AT 10
+#define PEER_HEARTBEAT 0x4001
+/* 游戏帧 `0x040e`；接上原版 rcp 中继时通道 A 改走 rcp 帧 opcode 3（§149）。 */
+#define OP_PEER_DATA_UP 0x040e
+#define OP_RCP_DATA_UP  0x0003
+#define OP_REQ_LOGIN    0x0100
+
+/* 和上面那几个 ws2 typedef 同一套规矩：不含 winsock 头，手写签名 + WINAPI。 */
+typedef SOCKET_T (WINAPI *socket_t)(int, int, int);
+typedef int (WINAPI *sendto_t)(SOCKET_T, const char *, int, int,
+                               const struct sockaddr_min *, int);
+typedef int (WINAPI *ioctlsocket_t)(SOCKET_T, long, unsigned long *);
+
+static SOCKET_T g_sync_sock = (SOCKET_T)~(UINT_PTR)0;   /* INVALID_SOCKET */
+static socket_t s_ws2_socket = NULL;
+static sendto_t s_ws2_sendto = NULL;
+static struct sockaddr_in_min g_sync_target;
+static volatile LONG g_sync_index = 0;
+static volatile LONG g_sync_ready = 0;
+static volatile LONG g_sync_failed = 0;   /* 建不起来就永远放弃，别每帧重试 */
+static volatile LONG g_sync_sent = 0;
+/* 游戏那个收位置数据的 UDP 口 bind 成功了没有（`det_bind` 置 1）。
+   ★ 这是下行**唯一**的准入依据，而且是权威的 —— 不是「我 bind 不上所以
+     大概是游戏占着」那种间接推断。 */
+static volatile LONG g_sync_udp_bound = 0;
+static char g_sync_ticket[128];
+
+/* 建 socket。**非阻塞**，而且失败就永远放弃 —— 这是游戏的网络线程，
+   任何一点阻塞都会变成掉帧。 */
+static int sync_open(void)
+{
+    HMODULE ws2;
+    unsigned long nonblocking = 1;
+    ioctlsocket_t ioctl_fn;
+
+    if (InterlockedCompareExchange(&g_sync_ready, 0, 0)) return 1;
+    /* ★ 失败过一次就再也不试：这条路是「锦上添花」，而 sync_open 会走到
+       GetProcAddress + socket()，每帧重试一遍是实打实的掉帧。 */
+    if (InterlockedCompareExchange(&g_sync_failed, 0, 0)) return 0;
+    ws2 = GetModuleHandleA("ws2_32.dll");
+    if (!ws2) { InterlockedExchange(&g_sync_failed, 1); return 0; }
+    if (!s_ws2_socket) {
+        s_ws2_socket = (socket_t)GetProcAddress(ws2, "socket");
+        s_ws2_sendto = (sendto_t)GetProcAddress(ws2, "sendto");
+    }
+    ioctl_fn = (ioctlsocket_t)GetProcAddress(ws2, "ioctlsocket");
+    if (!s_ws2_socket || !s_ws2_sendto) {
+        InterlockedExchange(&g_sync_failed, 1);
+        return 0;
+    }
+    /* AF_INET=2, SOCK_DGRAM=2, IPPROTO_UDP=17 */
+    g_sync_sock = s_ws2_socket(2, 2, 17);
+    if (g_sync_sock == (SOCKET_T)~(UINT_PTR)0) {
+        InterlockedExchange(&g_sync_failed, 1);
+        bslog("SYNC    !! 建不了 UDP socket，位置数据继续走 TCP（不影响游戏）");
+        return 0;
+    }
+    /* FIONBIO = 0x8004667E。★ 非阻塞是硬要求：这是游戏的网络线程。 */
+    if (ioctl_fn) ioctl_fn(g_sync_sock, (long)0x8004667E, &nonblocking);
+
+    memset(&g_sync_target, 0, sizeof(g_sync_target));
+    g_sync_target.sin_family = AF_INET_MIN;
+    g_sync_target.sin_port[0] = (unsigned char)((g_relay_udp_sync_port >> 8) & 0xff);
+    g_sync_target.sin_port[1] = (unsigned char)(g_relay_udp_sync_port & 0xff);
+    g_sync_target.sin_addr[0] = 127;
+    g_sync_target.sin_addr[1] = 0;
+    g_sync_target.sin_addr[2] = 0;
+    g_sync_target.sin_addr[3] = 1;
+    InterlockedExchange(&g_sync_ready, 1);
+    bslog("SYNC    位置数据 UDP 旁路已就绪 -> 127.0.0.1:%u"
+          "（只镜像位置心跳；开火/伤害照旧走 TCP）", g_relay_udp_sync_port);
+    return 1;
+}
+
+static void sync_send_raw(const unsigned char *data, int len)
+{
+    if (!InterlockedCompareExchange(&g_sync_ready, 0, 0)) return;
+    /* 送不出去就算了。**绝不重试、绝不阻塞、绝不报错** —— TCP 那份在跑。 */
+    s_ws2_sendto(g_sync_sock, (const char *)data, len, 0,
+                 (const struct sockaddr_min *)&g_sync_target,
+                 (int)sizeof(g_sync_target));
+}
+
+static int sync_put_header(unsigned char *buf, int kind, int count)
+{
+    buf[0] = SYNC_MAGIC0; buf[1] = SYNC_MAGIC1; buf[2] = SYNC_MAGIC2;
+    buf[3] = SYNC_VERSION;
+    buf[4] = (unsigned char)kind;
+    buf[5] = (unsigned char)count;
+    buf[6] = 0; buf[7] = 0;
+    return 8;
+}
+
+/* 发一发 `HELLO`：票据 + 标志位。标志位现在只有一位 —— 「游戏那个收位置
+   数据的 UDP 口已经 bind 成功」。中继把它原样转告服务端，服务端据此决定
+   要不要给这个玩家发下行 UDP。 */
+static void sync_send_hello(void)
+{
+    unsigned char buf[8 + 2 + 128 + 1];
+    int n, chars = (int)strlen(g_sync_ticket);
+
+    if (chars <= 0 || chars > 126) return;
+    if (!sync_open()) return;
+    n = sync_put_header(buf, SYNC_MSG_HELLO, 0);
+    buf[n++] = (unsigned char)(chars & 0xff);
+    buf[n++] = (unsigned char)((chars >> 8) & 0xff);
+    memcpy(buf + n, g_sync_ticket, (size_t)chars);
+    n += chars;
+    buf[n++] = (unsigned char)(
+        InterlockedCompareExchange(&g_sync_udp_bound, 0, 0) ? SYNC_FLAG_DOWNLINK : 0);
+    sync_send_raw(buf, n);
+}
+
+/* 从 `0x0100 gcpReqLogin` 的载荷里取票据（首字段 wstring：u16 字符数 +
+   UTF-16LE，V0.1 §44），顺便把索引归零并发一发 HELLO。
+
+   ★ 索引归零点必须和服务端一致：那边是「新建一条 `Conn`」，这边是
+     「发出一发登录包」—— 一条游戏连接正好一发。 */
+static void sync_on_login(const unsigned char *payload, int len)
+{
+    int chars, i;
+
+    if (len < 2) return;
+    chars = payload[0] | (payload[1] << 8);
+    if (chars <= 0 || chars > 126 || len < 2 + chars * 2) return;
+    for (i = 0; i < chars; i++) {
+        unsigned short wc = (unsigned short)(payload[2 + i * 2] |
+                                             (payload[3 + i * 2] << 8));
+        if (wc == 0 || wc > 0x7f) return;      /* 票据是 32 个十六进制字符 */
+        g_sync_ticket[i] = (char)wc;
+    }
+    g_sync_ticket[chars] = 0;
+    InterlockedExchange(&g_sync_index, 0);
+    InterlockedExchange(&g_sync_sent, 0);
+    /* ★ 「那个 UDP 口已经绑好了」也要跟着清：这一发登录包意味着又要新建一个
+       `GameSession`，它会重新 bind 一次（§153/§154）。不清的话，在新的 bind
+       真的成功之前我们就告诉服务端「可以投了」—— 那段窗口里的位置数据白扔。
+       重连时客户端会**原样重放同一张票据**（§171），所以不能靠票据变没变来判。 */
+    InterlockedExchange(&g_sync_udp_bound, 0);
+    sync_send_hello();
+    bslog("SYNC    登录包已发出，位置数据 UDP 旁路重新开始计数（票据 %.8s…）",
+          g_sync_ticket);
+}
+
+/* 游戏成功 bind 了收位置数据的那个 UDP 口 —— 告诉本机中继可以往这儿投了。
+   （前向声明在上面 ws2 那一段；`det_bind` 调它。） */
+static void sync_on_udp_bound(void)
+{
+    if (InterlockedExchange(&g_sync_udp_bound, 1)) return;   /* 只报一次 */
+    if (!g_sync_ticket[0]) return;      /* 还没登录：下一发 HELLO 自会带上 */
+    sync_send_hello();
+    bslog("SYNC    ★ 下行已就绪：位置数据可以直接投进游戏的 UDP %u",
+          g_client_udp_port);
+}
+
+/* 一整个 `UdpPacket` -> 一个数据报。冗余捎带交给 `relay.py` 做，
+   这里保持最笨：一份就是一份。 */
+static void sync_mirror_peer(const unsigned char *udp, int len)
+{
+    unsigned char buf[8 + 6 + 512];
+    LONG index;
+    int n;
+
+    if (len < PEER_HEADER || len > 512) return;
+    if (!sync_open()) return;
+    index = InterlockedIncrement(&g_sync_index) - 1;
+    n = sync_put_header(buf, SYNC_MSG_DATA, 1);
+    buf[n++] = (unsigned char)(index & 0xff);
+    buf[n++] = (unsigned char)((index >> 8) & 0xff);
+    buf[n++] = (unsigned char)((index >> 16) & 0xff);
+    buf[n++] = (unsigned char)((index >> 24) & 0xff);
+    buf[n++] = (unsigned char)(len & 0xff);
+    buf[n++] = (unsigned char)((len >> 8) & 0xff);
+    memcpy(buf + n, udp, (size_t)len);
+    n += len;
+    sync_send_raw(buf, n);
+    if (InterlockedIncrement(&g_sync_sent) == 1)
+        bslog("SYNC    第一发位置数据已镜像到 UDP 旁路（索引 %ld，%d 字节）",
+              (long)index, len);
+}
+
+/* `SimpleCipher::Encrypt` 的入口钩子会把每一帧**明文**喂到这里。
+
+   ⚠ 这是游戏的网络线程，本函数必须便宜到可以忽略：正常情况下只读两个 u16
+     比一下就返回。 */
+static void sync_on_plain_frame(const unsigned char *frame, int len)
+{
+    unsigned opcode, inner;
+    const unsigned char *udp;
+    int udplen;
+
+    /* 只在「远程服务器」模式下做。本机 / 局域网走的是环回或局域网，
+       没有跨境那种丢包，多发一份纯属浪费。 */
+    if (!popshot_online_mode()) return;
+    if (len < FRAME_HEADER + 2 || frame[0] != 0xff) return;
+    opcode = (unsigned)(frame[8] | (frame[9] << 8));
+    if (opcode == OP_REQ_LOGIN) {
+        sync_on_login(frame + FRAME_HEADER, len - FRAME_HEADER);
+        return;
+    }
+    if (opcode != OP_PEER_DATA_UP && opcode != OP_RCP_DATA_UP) return;
+    udp = frame + FRAME_HEADER;
+    udplen = len - FRAME_HEADER;
+    if (udplen < PEER_HEADER || udp[0] != 0xff) return;
+    inner = (unsigned)(udp[PEER_OPCODE_AT] | (udp[PEER_OPCODE_AT + 1] << 8));
+    /* ★ 铁律：只有位置心跳能走 UDP。其余（开火/命中/伤害/讨重传）一律不碰。 */
+    if (inner != PEER_HEARTBEAT) return;
+    sync_mirror_peer(udp, udplen);
+}
+
 /* 连接建立之前一律**不落盘** —— 启动时加载 Pack\*.pkn 会产生上万次解密，
    每条日志都 FlushFileBuffers，光记日志就能把游戏拖到进不了登录界面。
    密钥则先进环形缓冲（网络用的 cipher 可能在 connect 之前就构造好了），
@@ -2375,6 +2704,18 @@ static void __stdcall on_crypt_out(int kind, void *buf, int len)
 
 static void __stdcall on_crypt(int kind, void *self, void *dst, void *src, int len)
 {
+    /* ★ 位置数据的 UDP 旁路（见本文件「位置数据的 UDP 旁路」一段）。
+       `kind == 2` 是 `SimpleCipher::Encrypt` —— **加密之前**，也是整个进程里
+       唯一能看到出站明文帧的地方。
+
+       ⚠ 它和日志无关：`BSHOOK_VERBOSE_LOG` 关着的时候这一句照样要走，
+         所以 `SimpleCipher::Encrypt` 这个钩子现在是**无条件安装**的
+         （另外那四个 cipher 钩子仍然只在详细日志模式下装，它们才是 §105
+         里「登录后等 100 秒」的元凶）。
+       ⚠ 正常路径的开销 = 读两个 u16 比一下就返回。 */
+    if (kind == 2 && len > 0 && !IsBadReadPtr(src, (UINT_PTR)len))
+        sync_on_plain_frame((const unsigned char *)src, len);
+
     if (!g_snow_log_on) {          /* 连接前只留头 8 次做算法基准 */
         LONG g = InterlockedIncrement(&g_gt_n);
         if (g <= 8) {
@@ -2520,6 +2861,25 @@ static __declspec(naked) void det_simple_dec(void)
     }
 }
 
+/* `SimpleCipher::Encrypt` 的钩子 —— **幂等**，两条路都可能来装它：
+
+   * 精简模式：`patch_thread` 为了位置数据的 UDP 旁路装它（只装这一个）；
+   * 详细模式：`try_hook_snow` 连同另外四个 cipher 钩子一起装。
+
+   ★ 它和另外四个的区别是**代价**：那四个每次加解密都要格式化 + 写日志，
+     是全部日志量的 99%，也是 §105 里「登录后等 100 秒进大厅」的元凶；
+     这一个在精简模式下只做「读两个 u16 比一下」，可以常驻。 */
+static int install_simple_enc_hook(void)
+{
+    if (s_simple_enc) return 1;
+    if (IsBadReadPtr((const void *)SIMPLE_ENC_VA, 6)) return 0;
+    if (memcmp((const void *)SIMPLE_ENC_VA, SIMPLE_SIG, 6) != 0) return 0;  /* 还没解壳 */
+    s_simple_enc = install_inline_hook((void *)SIMPLE_ENC_VA,
+                                       (void *)det_simple_enc,
+                                       "SimpleCipher::Encrypt");
+    return s_simple_enc != NULL;
+}
+
 static int try_hook_snow(void)
 {
     const unsigned char *a = (const unsigned char *)SNOW_LOADKEY_VA;
@@ -2535,9 +2895,7 @@ static int try_hook_snow(void)
     s_snow_loadkey = install_inline_hook((void *)SNOW_LOADKEY_VA, (void *)det_snow_loadkey, "SnowCipher::loadkey");
     s_snow_enc     = install_inline_hook((void *)SNOW_ENC_VA,     (void *)det_snow_enc,     "SnowCipher::Encrypt");
     s_snow_dec     = install_inline_hook((void *)SNOW_DEC_VA,     (void *)det_snow_dec,     "SnowCipher::Decrypt");
-    if (!IsBadReadPtr((const void *)SIMPLE_ENC_VA, 6) &&
-        memcmp((const void *)SIMPLE_ENC_VA, SIMPLE_SIG, 6) == 0)
-        s_simple_enc = install_inline_hook((void *)SIMPLE_ENC_VA, (void *)det_simple_enc, "SimpleCipher::Encrypt");
+    install_simple_enc_hook();
     if (!IsBadReadPtr((const void *)SIMPLE_DEC_VA, 6) &&
         memcmp((const void *)SIMPLE_DEC_VA, SIMPLE_SIG, 6) == 0)
         s_simple_dec = install_inline_hook((void *)SIMPLE_DEC_VA, (void *)det_simple_dec, "SimpleCipher::Decrypt");
@@ -2791,7 +3149,16 @@ static DWORD WINAPI patch_thread(LPVOID param)
        是全部日志量的 99%，也是启动慢 / 战斗卡的根因（FINDINGS §105）。
        协议早就解完了，日常游玩不需要它。 */
     if (!g_verbose) {
-        bslog("SNOW    精简日志模式：跳过 cipher hook（BSHOOK_VERBOSE_LOG=1 开启逐包 dump）");
+        /* ★ 精简模式仍然要装 `SimpleCipher::Encrypt` 这一个 —— 位置数据的
+           UDP 旁路靠它认出出站的位置心跳（见「位置数据的 UDP 旁路」一段）。
+           它不写任何日志，代价是每帧读两个 u16。
+           另外四个（Snow x3 + Simple::Decrypt）照旧只在详细模式下装。 */
+        for (ticks = 0; !g_stop && ticks < 200; ticks++) {
+            if (install_simple_enc_hook()) break;
+            Sleep(50);
+        }
+        bslog("SNOW    精简日志模式：只装 SimpleCipher::Encrypt（位置 UDP 旁路用，"
+              "不写日志）；逐包 dump 要 BSHOOK_VERBOSE_LOG=1");
     } else {
         for (ticks = 0; !g_stop && !g_snow_hooked && ticks < 200; ticks++) {
             if (try_hook_snow()) break;

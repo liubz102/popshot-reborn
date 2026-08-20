@@ -64,6 +64,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config as server_config
 import eventlog
+import udpsync
 from netlisten import create_listener, tune_stream
 from simple import SimpleCipher
 
@@ -746,7 +747,19 @@ class RelayConn:
             self.send_frame(RCP_WHO_ARE_YOU)
             return
         self.data_in += 1
-        self.server.deliver(self.game_conn, payload, via=self)
+        # ★ 走**游戏连接自己的上行入口**，和 `0x040e` 那条完全同一条路。
+        #   理由有两条：
+        #   1. 位置数据的 UDP 旁路把「UDP 那份」和「TCP 那份」合流的排序闸门
+        #      就装在那里（`udpsync` 铁律 2）—— 中继这条路绕过去的话，
+        #      同一发心跳会被投递两次，晚到的那份会把角色拉回旧位置；
+        #   2. 顺带把中继这条路也纳入转发耗时/到达间隔统计 —— §187 那一轮
+        #      「中继 RTT 一行都没有」正是因为这条路从来不记账。
+        #   没有这个方法的（`test_relayserver` 里的假连接）照旧直投。
+        uplink = getattr(self.game_conn, "on_peer_data", None)
+        if uplink is not None:
+            uplink(payload)
+        else:
+            self.server.deliver(self.game_conn, payload, via=self)
 
     # -- 收尾 ---------------------------------------------------------------
     def close(self):
@@ -779,7 +792,8 @@ class RelayServer:
     """
 
     def __init__(self, *, members_of=None, fallback=None, logger=None,
-                 port=None, on_traffic=None, generation_of=None):
+                 port=None, on_traffic=None, generation_of=None,
+                 udp_sender=None):
         #: `members_of(game_conn) -> [同房间的其他游戏连接]`
         self._members_of = members_of or (lambda conn: [])
         #: `fallback(game_conn, udp_packet) -> None`，走 `0x040f`
@@ -797,6 +811,9 @@ class RelayServer:
         #: 这个回调是防御性的第二道 —— 万一哪条路径漏了锚定，这里按它当前
         #: 房间补一次，而不是让它的同步数据被当成「跨代」全丢掉。
         self._generation_of = generation_of
+        #: 位置数据的 UDP 旁路（`udpsync.UdpSyncServer`）。`None` = 不启用，
+        #: 投递完全回到「中继 / `0x040f`」这两条原来的路上。
+        self._udp_sender = udp_sender
         self._logger = logger
         self.port = int(port if port is not None
                         else server_config.PEER_RELAY_PORT)
@@ -811,6 +828,7 @@ class RelayServer:
         self.registered_total = 0
         self.delivered_relay = 0
         self.delivered_fallback = 0
+        self.delivered_udp = 0
         #: 因为「同一代里两台的局号编号不同」而改写过局号的包数（D131 的那条路，
         #: 有人中途进房才会有）。开局前的强制对齐（D138）正常工作时这个数**应该
         #: 恒为 0** —— 不为 0 就说明对齐没顶平，值得看一眼日志。
@@ -1062,6 +1080,25 @@ class RelayServer:
                     packet = restamp_peer_game_id(udp_packet, want.value)
                     self._note_restamp(sender_game_conn, member,
                                        game_id, want.value)
+            # ★ 第三条路：位置数据的 UDP 旁路（`udpsync`，bug调查/9）。
+            #   排在最前面，但准入条件很窄 —— 三条**都**要成立：
+            #     1. 这一份是位置心跳（内层 0x4001）。开火/命中/伤害走的是
+            #        客户端的可靠队列，丢一发就整局错位（§217），永远走 TCP；
+            #     2. 收件人自证过它那边 7788 收得到，而且这条流还活着；
+            #     3. 这一发的 N 和上一发送给他的相同（`may_send_heartbeat`
+            #        里有完整推导：这一条让下行**可证明**不会造成队列错位）。
+            #   任何一条不成立就落到下面原来的两条路上，行为和今天一样。
+            #   ⚠ 绝不「两条都发」：心跳没有任何可判新旧的原版字段，
+            #     晚到的那份会把角色拉回旧位置。
+            if (self._udp_sender is not None
+                    and udpsync.is_heartbeat(packet)
+                    and self._udp_sender.ready_for(member)
+                    and self._udp_sender.may_send_heartbeat(
+                        member, sender_game_conn, packet)
+                    and self._udp_sender.send_to(member, packet)):
+                sent += 1
+                self.delivered_udp += 1
+                continue
             relay = self.conn_for(member)
             if relay is not None:
                 sent += relay.send_data(packet)
