@@ -208,6 +208,13 @@ class Room:
         self.room_id = int(room_id)
         self.title = title
         self.map_name = map_name
+        #: ★ 「随机地图」开关（`Session` 的第 5 个字段 -> `LobbyStage+0x14`）。
+        #: 房主在「选择地图」面板上点那颗「랜덤 / 随机」按钮时由 `0x0302` 报上来。
+        #: 打开之后，客户端在收到 `0x0400 gspPrepareGame` 时会用包里的 **seed**
+        #: 自己挑一张图（全房间同一个 seed = 同一张图），房主再回一发 `0x0302`
+        #: 把结果告诉我们。服务端**不需要**知道地图几何，只要把这个开关原样传回去
+        #: —— 不传的话客户端下一发 `0x0303` 就把它清成 0，按钮当场弹回（§228）。
+        self.random_map = False
         self.session_type = int(session_type)
         self.arguments = tuple(arguments)
         self.password = password or ""
@@ -580,13 +587,15 @@ class Lobby:
     # -- 房间状态 -----------------------------------------------------------
     def update_room(self, room, *, title=None, map_name=None,
                     session_type=None, arguments=None, password=None,
-                    status=None):
+                    status=None, random_map=None):
         """改房间参数（`0x0302 gcpChangeSession` 选完地图之后）。"""
         with self._lock:
             if title is not None:
                 room.title = title
             if map_name is not None:
                 room.map_name = map_name
+            if random_map is not None:
+                room.random_map = bool(random_map)
             if session_type is not None:
                 room.session_type = int(session_type)
             if arguments is not None:

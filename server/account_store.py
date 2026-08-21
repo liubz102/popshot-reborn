@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import copy
 import json
 import os
@@ -300,6 +301,52 @@ class AccountStore:
                 return
             self._write_unlocked(self._empty())
 
+    def realign_levels(self):
+        """把存档里所有账号的 `level` 按**当前**曲线重算一遍，返回被改动的清单。
+
+        为什么需要它：`level` 是派生字段（D024），`_merged_account()` 每次读都会
+        按当前曲线重算 —— 所以**逻辑上**换曲线之后一切自动正确。但**磁盘上**那个
+        数要等该账号下次被写才更新，在此之前 JSON 和实际行为各说各话，
+        人去看存档会被误导。V0.2 会话 43 把线性曲线换成二次曲线时，云服上
+        已经有一批号涨到了好几百级（§229 / D150），所以要在启动时扫一遍、
+        写回去、并**把改了谁说出来**。
+
+        返回 ``[{"username", "old", "new", "experience", "capped"}, ...]``，
+        按用户名排序。`capped` = 「按经验推出来本该更高，是被 `LEVEL_MAX` 钳住的」。
+
+        ★ **幂等**：没有任何账号需要改时不写盘、返回空表。所以每次启动都可以跑，
+        不需要 schema 版本号，以后有人手工丢一份旧 JSON 进来也会被自动纠正。
+        """
+        with self._lock:
+            data = self._read_unlocked()
+            changed = []
+            for username in sorted(data["accounts"]):
+                raw = data["accounts"][username]
+                if not isinstance(raw, dict):
+                    continue
+                # ★ 旧等级必须从**原始字典**里取。走 `_merged_account()` 的话
+                #   等级在读的那一刻就已经被重算掉了，永远看不出差异。
+                try:
+                    old = int(raw.get("level", 0))
+                except (TypeError, ValueError):
+                    old = 0
+                experience = player_experience(raw)
+                new_level = level_for_experience(experience)
+                if old == new_level:
+                    continue
+                raw["level"] = new_level
+                changed.append({
+                    "username": username,
+                    "old": old,
+                    "new": new_level,
+                    "experience": experience,
+                    # 「本该更高、被上限钳住」：只有经验真的够到 LEVEL_MAX 才算。
+                    "capped": experience >= experience_for_level(LEVEL_MAX),
+                })
+            if changed:
+                self._write_unlocked(data)
+            return changed
+
     @staticmethod
     def _merged_account(username, raw):
         account = copy.deepcopy(NEW_ACCOUNT_DEFAULTS)
@@ -566,7 +613,9 @@ class AccountStore:
                     "存档文件里没有密码，请在上面的密码框里填一个（"
                     + PASSWORD_RULE_TEXT + "）") from None
             # ★ 手改的等级要真的生效，见 `experience_for_import` 的说明。
-            account["experience"] = experience_for_import(account)
+            #   `fields` = 存档里**真正写了**的字段，用来分清「他想要 1 级」
+            #   和「他压根没写 level」。
+            account["experience"] = experience_for_import(account, fields)
             account["level"] = level_for_experience(account["experience"])
             data["accounts"][username] = account
             self._write_unlocked(data)
@@ -669,17 +718,52 @@ class AccountStore:
             return copy.deepcopy(account)
 
 
-#: 每升一级需要的经验。
+#: 升一级需要的经验 = `EXPERIENCE_STEP × 当前等级`（二次曲线）。
+#: 于是「到达 L 级的累计经验」= `EXPERIENCE_STEP · L · (L-1) / 2` = `50·L·(L-1)`。
 #:
-#: ★ **这条曲线是本地假后台自己定的，不是从客户端逆出来的。**
+#: ★ **这条曲线是我们自己定的，不是从客户端逆出来的。**
 #: 客户端只按 `gspEndGame` 下发的三个绝对值（总经验 / 下一级所需 / 本级起点）
 #: 做减法算进度条（FINDINGS §94），它不知道也不关心曲线长什么样，
-#: 所以这里怎么定都不会让客户端出错。想改难度直接改这个数。
-EXPERIENCE_PER_LEVEL = 100
+#: 所以这里怎么定都不会让客户端出错。
+#:
+#: V0.2 会话 43 之前是**线性**的（每级恒 100），配上「一局给几百上千经验」
+#: 一局能跳十几级 —— 用户实机报的问题（§229 / D150）。
+EXPERIENCE_STEP = 100
+
+#: 兼容别名。旧代码/旧测试把它当「等差」用过，留着只为不炸 import；
+#: **新代码一律用 `EXPERIENCE_STEP`**，因为曲线已经不是等差了。
+EXPERIENCE_PER_LEVEL = EXPERIENCE_STEP
+
+#: ★ 等级上限 = 徽章图 `Images/General/LevelMark.smf` 的帧数。
+#: 那张图头里写着 `frames = 0x3c = 60`（60 张 21×21 精灵），玩家列表的
+#: `UserSnap+0x0c` 取第 `等级-1` 帧，客户端在 `0x441fc0` 自己也钳到 1..60
+#: —— 超过 60 会取到别的图的像素。原版实际内容只铺到 21 级
+#: （`map.ini` 的 `MinLevel` 最高 21），60 是**物理上限**（§229）。
+LEVEL_MAX = 60
+
+
+def experience_for_level(level):
+    """到达 `level` 级所需的**累计**经验。1 级是 0。
+
+    钳在 `[1, LEVEL_MAX + 1]`：多出来的那一级是给 `experience_bounds()`
+    在满级时当分母用的（见那边的说明）。
+    """
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        level = 1
+    level = max(1, min(LEVEL_MAX + 1, level))
+    return EXPERIENCE_STEP * (level - 1) * level // 2
+
+
+#: 预计算的累计经验表，下标 = 等级（0 号位占位）。`bisect` 反查等级用它，
+#: 比每次现算稳，也让曲线只有一处定义。
+_LEVEL_THRESHOLDS = [0] + [experience_for_level(lv)
+                           for lv in range(1, LEVEL_MAX + 2)]
 
 
 def level_for_experience(experience):
-    """总经验 -> 等级（1 起步）。
+    """总经验 -> 等级（1 起步，**钳到 `LEVEL_MAX`**）。
 
     ★ 这里**不加** `MINIMUM_PLAYER_LEVEL` 的下限：存档里记的是真实等级，
     `experience_bounds()` 还要拿它算经验条的两端。抬等级只发生在
@@ -689,34 +773,55 @@ def level_for_experience(experience):
         experience = max(0, int(experience))
     except (TypeError, ValueError):
         experience = 0
-    return max(1, experience // EXPERIENCE_PER_LEVEL + 1)
+    # bisect_right - 1：找最后一个「累计经验 <= 当前经验」的等级。
+    # 表里 1 级门槛是 0，所以经验 0 也一定落在 1 级。
+    level = bisect.bisect_right(_LEVEL_THRESHOLDS, experience, 1,
+                                LEVEL_MAX + 1) - 1
+    return max(1, min(LEVEL_MAX, level))
 
 
-def experience_for_import(account):
-    """导入存档时该存多少总经验 —— 让**手改的 `level` 真的生效**。
+def experience_for_import(account, provided=None):
+    """导入存档时该存多少总经验 —— ★ **等级说了算**。
 
     背景：等级在服务端是由经验推出来的（D024，`_merged_account` 每次读都重算一遍），
     存档里的 `level` 只是个派生字段。所以玩家把导出的 JSON 里的 `level` 从 1 改成 5
-    再传上来，什么都不会发生 —— 经验还是 0，一读回来等级又变回 1。
+    再传上来，如果不做点什么，什么都不会发生 —— 经验还是 0，一读回来等级又变回 1。
 
-    规则（只在导入这一刻生效）：
+    规则（只在导入这一刻生效，D151）：
 
-    * 存档里的等级**高于**经验推出来的等级 -> 认为玩家是在手改等级，
-      把经验补到那一级的起点，等级就真的变成他写的那个数；
-    * 否则以**经验**为准（改经验不改等级是另一种常见改法，
-      这时候拿旧的 `level` 去覆盖经验反而会把他的改动抹掉）。
+    * `level` **没出现在存档文件里**（`provided` 里没有它）-> **以经验为准**。
+      ★ 这一条不能省：`import_account` 是「从默认值起手再把存档里有的字段盖上去」，
+      默认等级是 1 —— 少了这一条，一份只写了 `experience` 的手写存档会被当成
+      「他想要 1 级」，经验当场清零；
+    * `level` 读不出数（是字符串 / 是负数 / 是 0）-> 同上，**以经验为准**；
+    * `level` 和经验推出来的等级**一致** -> ★ **原样保留经验**；
+    * 两者**矛盾** -> 经验重算成 `experience_for_level(level)`，等级真的变成他写的那个数。
 
-    也就是说：**想降级得连经验一起改小**。这是刻意的取舍 ——
-    两个字段互相矛盾时没法猜出玩家改的是哪一个，只能挑一个方向认。
+    ★ 中间那条不是优化，是**必须**的：导出的存档里两个字段本来就自洽，
+    无条件按等级重算的话，一次「导出 → 原样导回」就会把玩家**本级内已经攒的
+    那部分经验**抹掉（5 级、总经验 1200 会被打回本级起点 1000，白丢 200）。
+    只有真的矛盾时才认 `level`。
+
+    `level` 先钳到 `[1, LEVEL_MAX]`：手写 `level: 999` 只会得到 60 级，
+    不会算出一个天文数字的经验。
+
+    `provided` = **存档文件里真正出现过的字段名**（`parse_save` 的第二个返回值）。
+    不传就退化成「假定 level 写了」，保持老调用方能用。
     """
     experience = player_experience(account)
+    if provided is not None and "level" not in provided:
+        return experience
     try:
         wanted = int(account.get("level", 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AttributeError):
         return experience
-    if wanted <= level_for_experience(experience):
+    if wanted <= 0:
+        # 0 / 负数 = 「这个字段坏了或者没填」，不是「想降到 0 级」。
         return experience
-    return (wanted - 1) * EXPERIENCE_PER_LEVEL
+    wanted = min(LEVEL_MAX, wanted)
+    if wanted == level_for_experience(experience):
+        return experience
+    return experience_for_level(wanted)
 
 
 def experience_bounds(experience):
@@ -725,9 +830,13 @@ def experience_bounds(experience):
     对应 `gspEndGame` 的 `pkt+0x18` 和 `pkt+0x14`。客户端算的是
     ``(总经验 - 本级起点) / (下一级所需 - 本级起点)``，所以这两个必须是
     **绝对累计值**，不是「本级内的差值」。
+
+    ★ **满级时给的是 `(total(60), total(61))`**，不是两个相等的数 ——
+    客户端那个除法的分母是「下一级 - 本级起点」，两个数一样就是除以 0，
+    那是没验过的行为。多留一级当分母，进度条只会停在某个位置不动。
     """
     level = level_for_experience(experience)
-    return (level - 1) * EXPERIENCE_PER_LEVEL, level * EXPERIENCE_PER_LEVEL
+    return experience_for_level(level), experience_for_level(level + 1)
 
 
 def tutorial_state(account):

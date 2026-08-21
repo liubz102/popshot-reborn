@@ -99,11 +99,12 @@ from gameserver import (
     w_wstr,
 )
 from simple import SimpleCipher
-from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_PER_LEVEL,
+from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_STEP, LEVEL_MAX,
                            PREMIUM_CHARACTER_IDS, QUEST_DIFFICULTY_MAX,
                            QUEST_ID_TABLE, character_item_id,
                            character_item_ids, character_unlock_all,
-                           experience_bounds, level_for_experience,
+                           experience_bounds, experience_for_level,
+                           level_for_experience,
                            owned_characters, quest_cleared_difficulty,
                            quest_difficulty_records)
 import gameserver
@@ -178,7 +179,8 @@ class GameServerPacketTests(unittest.TestCase):
         self.assertEqual(struct.pack("<i", 1234), build_prepare_game(1234))
 
     def test_single_client_start_game_handshake(self):
-        handshake = StartGameHandshake(seed=1234)
+        # ★ 种子现在是**每局重取一次**的（§228），注入一个常量发号器才好断言。
+        handshake = StartGameHandshake(seed_source=lambda: 1234)
 
         self.assertEqual(
             [(OP_TRIGGER_COUNT_GAME, struct.pack("<i", 0))],
@@ -361,6 +363,8 @@ class GameServerPacketTests(unittest.TestCase):
                 "free_slots": 6,
                 "texts": ("想和做朋友吗?", "任务"),
                 "flags": (1, 0),
+                # ★ 第 4 个字段 = 随机地图开关（§228）；第 5 个是栈垃圾。
+                "random_map": True,
                 "session_type": 2,
                 "session_type_name": "quest",
                 "arguments": (3, 1),
@@ -612,17 +616,38 @@ class GameServerPacketTests(unittest.TestCase):
 
     def test_experience_bounds_bracket_the_total(self):
         # 客户端要的是绝对累计值，不是本级内的差值。
-        for experience in (0, 1, 99, 100, 101, 250, 999):
+        for experience in (0, 1, 99, 100, 101, 250, 999, 21000, 176999):
             start, nxt = experience_bounds(experience)
             self.assertLessEqual(start, experience)
             self.assertLess(experience, nxt)
-            self.assertEqual(EXPERIENCE_PER_LEVEL, nxt - start)
+            # 曲线是二次的，每一级的跨度 = EXPERIENCE_STEP × 当前等级。
+            level = level_for_experience(experience)
+            self.assertEqual(EXPERIENCE_STEP * level, nxt - start)
+
+    def test_experience_bounds_never_divide_by_zero_at_the_cap(self):
+        # 满级之后客户端仍然要算 (总经验-起点)/(下一级-起点)，分母不能是 0。
+        for experience in (experience_for_level(LEVEL_MAX), 10 ** 9):
+            start, nxt = experience_bounds(experience)
+            self.assertEqual(experience_for_level(LEVEL_MAX), start)
+            self.assertGreater(nxt, start)
 
     def test_level_tracks_the_experience_curve(self):
+        # 升一级要 EXPERIENCE_STEP × 当前等级，累计 50·L·(L-1)。
         self.assertEqual(1, level_for_experience(0))
-        self.assertEqual(1, level_for_experience(EXPERIENCE_PER_LEVEL - 1))
-        self.assertEqual(2, level_for_experience(EXPERIENCE_PER_LEVEL))
-        self.assertEqual(3, level_for_experience(EXPERIENCE_PER_LEVEL * 2))
+        self.assertEqual(1, level_for_experience(EXPERIENCE_STEP - 1))
+        self.assertEqual(2, level_for_experience(EXPERIENCE_STEP))
+        self.assertEqual(2, level_for_experience(EXPERIENCE_STEP * 2))
+        self.assertEqual(3, level_for_experience(EXPERIENCE_STEP * 3))
+        self.assertEqual(10, level_for_experience(4500))
+        self.assertEqual(21, level_for_experience(21000))
+        # 旧线性曲线下 300 级的老存档，按新曲线是 24 级（§229 的迁移口径）。
+        self.assertEqual(24, level_for_experience(29900))
+
+    def test_level_is_clamped_to_the_badge_sprite_count(self):
+        # LevelMark.smf 只有 60 帧，超过就会取到别的图的像素。
+        self.assertEqual(LEVEL_MAX, level_for_experience(
+            experience_for_level(LEVEL_MAX)))
+        self.assertEqual(LEVEL_MAX, level_for_experience(10 ** 9))
 
     def test_rep_money_wire_layout(self):
         # 反序列化 0x54c7c3 读 5 个 int32 + 1 个 u16 + 2 个 int32 = 30 字节。
@@ -649,14 +674,15 @@ class GameServerPacketTests(unittest.TestCase):
     def test_rep_money_from_account_matches_the_end_game_encoding(self):
         # 同一份存档下，0x0600 和 0x0411 报出的经验三件套必须一致，
         # 否则结算完回大厅进度条会跳。
-        account = {"level": 3, "experience": 250, "money": 64}
+        # 二次曲线：250 点落在 2 级（本级 100 起、下一级 300）。
+        account = {"level": 2, "experience": 250, "money": 64}
         payload = build_rep_money_for(account)
         money, experience, start, nxt = struct.unpack_from("<4i", payload, 4)
         values = build_end_game_values(experience=experience,
                                        next_level_exp=nxt,
                                        level_start_exp=start)
         self.assertEqual(64, money)
-        self.assertEqual((250, 200, 300), (values[1], values[3], values[2]))
+        self.assertEqual((250, 100, 300), (values[1], values[3], values[2]))
         self.assertEqual(4, struct.unpack_from("<H", payload, 20)[0])
 
     def test_rep_money_clamps_the_level_into_a_u16(self):
@@ -1982,11 +2008,21 @@ class ResultScreenNumbersTests(unittest.TestCase):
         self.assertEqual(1289, sum(values[i] for i in END_GAME_SCORE_PARTS))
 
     def test_settlement_reports_experience_and_money_gains(self):
+        # ★★ 分数 / 经验 / 金币是**三件事**（§227）。以前这三个数一模一样
+        #    （都等于关卡分），玩家一眼就看出来不对。
         conn = self.make_conn(score=1289)
         gameserver.Conn.on_game_packet(conn, gameserver.OP_END_QUEST, b"")
         values = self.result_values(self.sent_with(conn, OP_REP_GAME_RESULT))
-        self.assertEqual(1289, values[GAME_RESULT_EXPERIENCE])
-        self.assertEqual(1289, values[GAME_RESULT_MONEY])
+        end_values = self.end_game_values(self.sent_with(conn, OP_END_GAME))
+        screen_score = sum(end_values[i] for i in END_GAME_SCORE_PARTS)
+        # `conn.room` 没带 arguments -> `current_quest()` 取不到 -> 按 1 级关卡、
+        # 难度 1 算；`quest_success` 是 False，所以基础奖励打 QUEST_FAILED_RATIO 折。
+        want_exp, want_money = gameserver.quest_reward(1, 1, 1289, False)
+        self.assertEqual(want_exp, values[GAME_RESULT_EXPERIENCE])
+        self.assertEqual(want_money, values[GAME_RESULT_MONEY])
+        self.assertEqual(1289, screen_score)
+        # 三个数互不相同 —— 这就是这条用例存在的理由。
+        self.assertEqual(3, len({want_exp, want_money, screen_score}))
 
     def test_quest_mode_never_awards_ladder_points(self):
         conn = self.make_conn(score=1289)
@@ -1994,11 +2030,22 @@ class ResultScreenNumbersTests(unittest.TestCase):
         values = self.result_values(self.sent_with(conn, OP_REP_GAME_RESULT))
         self.assertEqual(0, values[GAME_RESULT_LADDER_POINT])
 
-    def test_a_scoreless_run_still_sends_all_zeroes(self):
+    def test_a_scoreless_run_only_touches_the_three_known_slots(self):
+        # ⚠ §100：除了那三格，其余 9 个业务值**必须**保持 0，
+        #    12 个值一次全填非 0 会让客户端 20 毫秒内主动断链。
+        #    ★ 0 分不再等于 0 奖励：没通关也给基础奖励的 QUEST_FAILED_RATIO
+        #    那一份（§227），打了半天不能一无所获。
         conn = self.make_conn(score=0)
         gameserver.Conn.on_game_packet(conn, gameserver.OP_END_QUEST, b"")
         values = self.result_values(self.sent_with(conn, OP_REP_GAME_RESULT))
-        self.assertEqual([0] * GAME_RESULT_VALUE_COUNT, values)
+        want_exp, want_money = gameserver.quest_reward(1, 1, 0, False)
+        self.assertEqual(want_exp, values[GAME_RESULT_EXPERIENCE])
+        self.assertEqual(want_money, values[GAME_RESULT_MONEY])
+        self.assertEqual(0, values[GAME_RESULT_LADDER_POINT])
+        rest = [v for i, v in enumerate(values)
+                if i not in (GAME_RESULT_EXPERIENCE, GAME_RESULT_MONEY,
+                             GAME_RESULT_LADDER_POINT)]
+        self.assertEqual([0] * 9, rest)
 
     def test_the_clear_tail_still_rides_along(self):
         # 数值和「完成」标签在同一发包里，加了值不能把标签挤掉。
@@ -2020,7 +2067,9 @@ class ResultScreenNumbersTests(unittest.TestCase):
         gameserver.Conn.on_game_packet(conn, gameserver.OP_END_QUEST, b"")
         values = self.end_game_values(self.sent_with(conn, OP_END_GAME))
         self.assertEqual(4983, values[gameserver.END_GAME_EXPERIENCE])
-        self.assertEqual(40, values[gameserver.END_GAME_MONEY_GAINED])
+        # 金币那一格发的是**本局所得**（不是分数，§227）。
+        self.assertEqual(gameserver.quest_reward(1, 1, 40, False)[1],
+                         values[gameserver.END_GAME_MONEY_GAINED])
 
 
 class QuestDifficultyTests(unittest.TestCase):

@@ -31,6 +31,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import account_store
 import authserver
 import config as server_config
 import eventlog
@@ -182,6 +183,39 @@ def _start(name, target, args=(), kwargs=None, port=None, proto="TCP"):
     return True
 
 
+def _report_level_realign(accounts):
+    """把 `AccountStore.realign_levels()` 的结果说出来（屏幕 + 运营流水）。
+
+    ★ **按状态翻转说话**：没有任何账号需要改就一行都不打。跑过一次之后
+    每次启动都会是这样，日志里不会积累无意义的心跳。
+    """
+    try:
+        changed = accounts.realign_levels()
+    except Exception as error:              # noqa: BLE001 —— 存档坏了也不该拦住开服
+        log(f"⚠ 等级对齐失败（{error!r}）；存档没被改动，游戏照常起")
+        return
+    if not changed:
+        return
+    capped = [row for row in changed if row["capped"]]
+    head = (f"等级曲线换代: {len(changed)} 个账号的等级已按新曲线重算"
+            f"（上限 {account_store.LEVEL_MAX} 级"
+            f"，满级需要 {account_store.experience_for_level(account_store.LEVEL_MAX)} 点经验）")
+    log(head)
+    eventlog.online(head)
+    for row in changed:
+        line = (f"  {row['username']}: {row['old']} -> {row['new']} 级"
+                f"（总经验 {row['experience']}）"
+                + ("  ★ 经验已到顶，被等级上限钳住" if row["capped"] else ""))
+        log(line)
+        eventlog.online("等级重算 " + line.strip())
+    if capped:
+        names = "、".join(row["username"] for row in capped)
+        tail = (f"★ 其中 {len(capped)} 个账号的经验超过了满级线，"
+                f"等级被钳到 {account_store.LEVEL_MAX}: {names}")
+        log(tail)
+        eventlog.online(tail)
+
+
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
 
@@ -213,6 +247,12 @@ def main(argv=None):
         log(f"连接日志: {eventlog.path()}（谁连上、谁断开、从哪个 IP；精简模式也照记）")
     if args.verbose:
         log("调试日志: 已放行 [online-debug]（转发耗时 / 中继 RTT / 客户端异常上报）")
+
+    # 等级曲线换代后的存档对齐（§229 / D150）。**必须排在 `eventlog.configure`
+    # 之后** —— `server.out` 每次启动都会被覆盖，这份清单要留在不被覆盖的
+    # 那一份流水里，否则重启一次就再也查不到「谁从几级变成了几级」。
+    # 只在服务端真的启动时跑，那时没人在线；幂等，清单为空就一个字都不打。
+    _report_level_realign(accounts)
 
     # 日志清理（D113）。**只在服务端真的启动时跑这一次** —— 启动脚本发现
     # 服务端已在运行而跳过启动时，这里根本不会被执行到，正合需求。

@@ -171,10 +171,15 @@ def move_into_payload(room_id, password="", flag=0):
 
 
 def change_session_payload(session_type=1, arguments=(1, 3, 0), title="来玩",
-                           map_name="Festival00:NewPvp"):
-    """客户端方向的 `0x0302 gcpChangeSession` 载荷（见 parse_change_session_request）。"""
+                           map_name="Festival00:NewPvp", random_map=False,
+                           junk=0):
+    """客户端方向的 `0x0302 gcpChangeSession` 载荷（见 parse_change_session_request）。
+
+    `random_map` = 第 4 个字段（「随机」按钮，§228）；`junk` = 第 5 个字段，
+    客户端发送点从来没赋值过，线上是栈垃圾 —— 用例拿它证明我们不读它。
+    """
     return (w_i32(0) + w_wstr(title) + w_wstr(map_name)
-            + w_i32(0) + w_i32(0)
+            + w_i32(1 if random_map else 0) + w_i32(junk)
             + w_i32(session_type)
             + b"".join(w_i32(v) for v in arguments))
 
@@ -1430,6 +1435,22 @@ class StartGameRoomTests(LobbyIsolated):
                     if op == OP_PREPARE_GAME][0]
         self.assertEqual(prepare(self.alice), prepare(self.bob))
 
+    def test_every_round_gets_a_fresh_seed(self):
+        # ★ 以前 seed 恒为 0（§228），「随机地图」会永远随到同一张。
+        def start_once():
+            self.ready(self.alice)
+            self.ready(self.alice)
+            payload = [p for b in self.alice.sent for _, op, p in frames(b)
+                       if op == OP_PREPARE_GAME][0]
+            self.alice.sent.clear(); self.bob.sent.clear()
+            self.room.battle.reset()
+            return struct.unpack("<i", payload)[0]
+        seeds = [start_once() for _ in range(3)]
+        self.assertEqual(3, len(set(seeds)), f"三局拿到了重复的种子: {seeds}")
+        # -1 是客户端「改用本地随机源」的哨兵（0x40b737），发出去就各随各的图。
+        for seed in seeds:
+            self.assertGreaterEqual(seed, 1)
+
     def test_a_non_host_cannot_start_the_game(self):
         self.ready(self.bob)
         self.assertEqual([], opcodes(self.alice))
@@ -1531,6 +1552,107 @@ class StartGameRoomTests(LobbyIsolated):
 # ----------------------------------------------------------------------------
 # 换代状态机（局号 = 每座位收包队列的纪元号）
 # ----------------------------------------------------------------------------
+class RandomMapSwitchTests(LobbyIsolated):
+    """★★ 房间「选择地图」面板上那颗「随机」按钮（§228 / D149）。
+
+    用户实机报：点了之后自动取消、弹回原来的地图。根因是 `0x0302` 的第 4 个
+    字段（`Session` 的 `+0x14` -> 客户端 `[LobbyStage+0x14]`）被服务端丢掉了，
+    回的 `0x0303` 里恒是 0，客户端反序列化时把开关清掉、UI 当场弹回。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.alice = make_conn("alice")
+        gameserver.Conn.on_game_packet(self.alice, 0x0201,
+                                       create_session_payload(session_type=1,
+                                                              arguments=(0, 3, 0)))
+        self.room = self.lobby.room_of(self.alice)
+        self.bob = make_conn("bob")
+        gameserver.Conn.on_game_packet(self.bob, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        self.alice.sent.clear()
+        self.bob.sent.clear()
+
+    def change(self, conn=None, **kwargs):
+        kwargs.setdefault("session_type", 1)
+        kwargs.setdefault("arguments", (0, 3, 0))
+        gameserver.Conn.on_game_packet(conn or self.alice,
+                                       gameserver.OP_CHANGE_SESSION,
+                                       change_session_payload(**kwargs))
+
+    @staticmethod
+    def session_random_flag(payload):
+        """`0x0303` 载荷里 `Session` 的第 5 个字段。"""
+        reader = Reader(payload)
+        reader.i32()            # 状态
+        reader.wstr()           # 标题
+        reader.i32()            # 人数
+        reader.wstr()           # 地图名
+        return reader.i32()
+
+    def update_sessions(self, conn):
+        return [p for blob in conn.sent for _, op, p in frames(blob)
+                if op == gameserver.OP_UPDATE_SESSION]
+
+    def test_the_switch_is_echoed_back_instead_of_being_cleared(self):
+        self.change(random_map=True)
+        self.assertTrue(self.room.random_map)
+        payload = self.update_sessions(self.alice)[0]
+        self.assertEqual(1, self.session_random_flag(payload))
+
+    def test_the_switch_reaches_everyone_else_in_the_room(self):
+        self.change(random_map=True)
+        payload = self.update_sessions(self.bob)[0]
+        self.assertEqual(1, self.session_random_flag(payload))
+
+    def test_turning_it_off_goes_back_to_zero(self):
+        self.change(random_map=True)
+        self.alice.sent.clear()
+        self.change(random_map=False)
+        self.assertFalse(self.room.random_map)
+        self.assertEqual(0, self.session_random_flag(
+            self.update_sessions(self.alice)[0]))
+
+    def test_the_room_list_carries_the_switch_too(self):
+        # 房间列表项和 0x0303 用的是同一份 `Session` 布局。
+        self.change(random_map=True)
+        entry = gameserver.build_session_entry(self.room)
+        self.assertEqual(1, self.session_random_flag(entry))
+
+    def test_the_uninitialised_fifth_field_is_ignored(self):
+        # 客户端发送点从没写过 `[obj+0x11]`，线上是栈垃圾。读它就会随机翻车。
+        self.change(random_map=False, junk=0xFF)
+        self.assertFalse(self.room.random_map)
+        self.assertEqual(0, self.session_random_flag(
+            self.update_sessions(self.alice)[0]))
+
+    def test_the_map_report_after_the_start_is_only_recorded(self):
+        """★ 开局之后房主还会来一发 `0x0302` 报随机到的图 —— 只记账，零回包。
+
+        那一发是紧跟着 `0x0400` 的处理发出来的（`0x551799`），此刻全房间正在
+        stage 6 加载关卡。回一发 `0x0303` 会把 Session 的状态和局号重新灌进去，
+        是没验过的动作；而且全房间本来就用同一个 seed 各自算出同一张图。
+        """
+        self.change(random_map=True)
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        self.assertEqual(gameserver.StartGameHandshake.PREPARING,
+                         self.room.battle.state)
+        self.assertTrue(gameserver.room_started(self.room))
+        self.alice.sent.clear()
+        self.bob.sent.clear()
+        self.change(random_map=True, map_name="Iceria02:NewPvp")
+        self.assertEqual("Iceria02:NewPvp", self.room.map_name)
+        self.assertEqual([], opcodes(self.alice))
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_a_change_before_the_start_still_answers(self):
+        # 上一条的对照组：没开局时照常回 0x0303，别把正常路径一起挡掉。
+        self.assertFalse(gameserver.room_started(self.room))
+        self.change(random_map=True, map_name="Iceria02:NewPvp")
+        self.assertEqual([gameserver.OP_UPDATE_SESSION], opcodes(self.alice))
+
+
 class EpochGenerationTests(LobbyIsolated):
     """换代状态机的房间侧接线（§218 / D137 / D138）。
 

@@ -794,7 +794,8 @@ def build_session_entry(room, player_count=None, max_players=None):
         max_players = ROOM_SEAT_COUNT
     return (build_session(room.status, room.session_type, room.arguments,
                           title=room.title, map_name=room.map_name,
-                          player_count=player_count)
+                          player_count=player_count,
+                          random_map=getattr(room, "random_map", False))
             + struct.pack("<H", room.room_id & 0xFFFF)
             + struct.pack("<B", max_players & 0xFF)
             + w_i32(SESSION_LIST_UNKNOWN_FLAG))
@@ -1001,15 +1002,20 @@ SESSION_STATUS_PLAYING = 3
 
 
 def build_session(status, session_type, arguments, title="", map_name="",
-                  player_count=0, unknown_14=0):
+                  player_count=0, random_map=False):
     """`Session` 对象的线格式（0x30 字节，反序列化 `0x556e80`，FINDINGS §137）。
 
         int32              -> +0x04   房间状态，见 SESSION_STATUS_WAITING
         string             -> +0x08   房间标题
         int32              -> +0x0c   ★ 房间列表里 `%s(%d/%d)` 的**第一个** %d
         string             -> +0x10   地图名
-        int32（存 1 字节）  -> +0x14   语义未知
+        int32（存 1 字节）  -> +0x14   ★ **随机地图开关**（§228）
         SessionDescriptor  -> +0x18   房间类型 + 参数
+
+    ★ `+0x14` 不再是「语义未知」：客户端两处独立读它 —— 开局校验 `0x468176`
+    的 `mov al,[esi+0x14] / test / jz` 和 `0x0400 gspPrepareGame` 的处理器
+    `0x551605` 开头同一段。非 0 就走「按 seed 随机挑一张图」的分支。
+    **不回传它，客户端点了「随机」就会当场被这一发清成 0、按钮弹回原地图。**
 
     两个地方用同一份布局：`0x0303`（后面多一个 u16）和 `0x0200` 房间列表的
     每一项（后面跟 u16 房间号 + u8 + int32）。未查明的字段按 D019 填 0 / 空串。
@@ -1021,13 +1027,13 @@ def build_session(status, session_type, arguments, title="", map_name="",
             + w_wstr(title)
             + w_i32(player_count)
             + w_wstr(map_name)
-            + w_i32(unknown_14)
+            + w_i32(1 if random_map else 0)
             + build_session_descriptor(session_type, arguments))
 
 
 def build_update_session(session_type, arguments, title="", map_name="",
                          status=SESSION_STATUS_WAITING, player_count=0,
-                         game_id=0):
+                         game_id=0, random_map=False):
     """opcode 0x0303 —— 把整个 `Session` 灌进客户端的 `LobbyStage`
 
     大厅分发器 `0x4061e2` 的跳表 `@0x406332` 索引 3 → `0x406258` →
@@ -1037,7 +1043,7 @@ def build_update_session(session_type, arguments, title="", map_name="",
         string             -> +0x08   房间标题
         int32              -> +0x0c   语义未知
         string             -> +0x10   ★ 地图名，见下面的警告
-        int32              -> +0x14   读 4 字节存成 1 字节，语义未知
+        int32              -> +0x14   ★ **随机地图开关**（读 4 字节存 1 字节，§228）
         SessionDescriptor  -> +0x18   ★ 房间类型 + 参数
         u16                -> +0x3c   ★★ **局号**（= 每座位收包队列的纪元号）
 
@@ -1059,7 +1065,8 @@ def build_update_session(session_type, arguments, title="", map_name="",
     地图名是后续由客户端的 `0x0302 gcpChangeSession` 提交、再由服务端下发的。
     """
     return (build_session(status, session_type, arguments, title=title,
-                          map_name=map_name, player_count=player_count)
+                          map_name=map_name, player_count=player_count,
+                          random_map=random_map)
             + struct.pack("<H", int(game_id) & 0xFFFF))
 
 
@@ -1102,12 +1109,21 @@ def parse_change_session_request(payload):
         int32              (+0x04)   自由座位数（来自 0x556f40）
         string             (+0x08)   回显 LobbyStage+0x08 的房间标题
         string             (+0x0c)   模式名，查表自 0x40b6a2
-        int32              (+0x10)   由 1 字节零扩展而来
-        int32              (+0x11)   同上
+        int32              (+0x10)   ★ **随机地图开关**（1 字节零扩展）
+        int32              (+0x11)   ⚠ **发送点从来没赋值**，是栈垃圾，别读
         SessionDescriptor  (+0x14)   房间类型 + 参数
 
-    两个 1 字节字段都是经 0x5d5a4c 零扩展后按 4 字节写出去的，所以线上是
-    int32。语义未确认，先原样记录。
+    两个 1 字节字段都是经 0x5d5a4c 零扩展后按 4 字节写出去的，所以线上是 int32。
+
+    ★ **第一个是「随机地图」开关**（§228）：发送点 `0x54e5ea` 只推了 5 个参数
+    （自由座位数 / 标题 / 描述符 / 地图名 / **这个字节**），最后那个来自
+    `[LobbyStage+0x14]`（房间设定面板 `0x463fb7` 那一段：点的是 randomMapBtn
+    就取按钮状态，否则回显 LobbyStage 里的旧值）。
+
+    ⚠ **第二个字段没有语义**：`[obj+0x11]` 全镜像没有任何一处写它，构造函数也
+    不清它 —— 线上看到的是**未初始化的栈垃圾**。实机日志里第一个只出现过 0/1，
+    第二个出现过 200/250/121/248/255/72/54/18/15/224… 二十多种值
+    （`bug调查/6/server_logs/game_026_27799.txt`）。**永远不要读它。**
     """
     reader = Reader(payload)
     free_slots = reader.i32()
@@ -1119,7 +1135,9 @@ def parse_change_session_request(payload):
     return {
         "free_slots": free_slots,
         "texts": text_fields,
+        # `flags` 原样留着只为打日志（第二格是垃圾，看看就行）。
         "flags": flags,
+        "random_map": bool(flags[0]),
         "session_type": session_type,
         "session_type_name": SESSION_TYPE_NAMES.get(session_type, "unknown"),
         "arguments": arguments,
@@ -1879,6 +1897,90 @@ GAME_RESULT_LADDER_POINT = 11   # 「竞技场分数 +N」（闯关模式没有�
 #: 这三个是逐格验过的，其余保持 D019 的「不懂就填 0」。
 
 
+#: ═══ 一局打完给多少经验 / 金币（§227 / D148）════════════════════════════
+#:
+#: ★ **背景**：V0.2 会话 43 之前，`settle_quest` 里一个 `score` 变量同时当
+#: 「入账经验」「入账金币」「界面上的经验 +N」「界面上的金币 +N」和「分数」
+#: 五份用 —— 玩家看到的三行数一模一样，用户实机报的就是这个。
+#: 协议侧本来就是三个独立字段（`0x0309` 的值 9/10/11 和 `0x0411` 的 4 号位），
+#: 只是被喂了同一个数。
+#:
+#: ★ **数值从哪来**：原版的**每局**奖励是服务端算的，客户端包里没有。
+#: 能借的只有 `Pack_decrypt/Data/Promotion-chn.ini`（一次性**晋级任务**奖励，
+#: 132 条 `RewardN=类型,数值`：类型 0=金币 100~1000、2=经验 20~120）——
+#: 我们只借它的**量纲**，不照搬语义。
+#:
+#: 闯关基础奖励按关卡 id 递增：经验 20/30/…/80，金币 100/150/…/400。
+QUEST_BASE_EXPERIENCE = 20
+QUEST_BASE_EXPERIENCE_STEP = 10
+QUEST_BASE_MONEY = 100
+QUEST_BASE_MONEY_STEP = 50
+
+#: 难度加成。闯关房描述符的第二个参数就是难度（1=简单 / 2=普通 / 3=困难，§68）。
+#: 表外的难度按 1.0 处理（别为一个没见过的数把奖励算成 0）。
+QUEST_DIFFICULTY_BONUS = {1: 1.0, 2: 1.6, 3: 2.5}
+
+#: 没通关时基础奖励打几折。**不是 0** —— 打了半天不能一无所获，
+#: 而且客户端在「未完成」时照样弹结算界面。
+QUEST_FAILED_RATIO = 0.3
+
+#: 关卡分数换成**经验**的除数。分数常见几百~上千，按 1/20 折成经验 ——
+#: 打得好有回报，但主导项仍然是「打的是哪一关、什么难度」。
+QUEST_SCORE_PER_EXPERIENCE = 20
+
+#: 对战一局的奖励。经验：参战底薪 + 每杀 + 胜方加成；金币：只有底薪 + 胜方加成。
+#: 对战一局比闯关短得多，数值也就小一档。
+PVP_BASE_EXPERIENCE = 10
+PVP_EXPERIENCE_PER_KILL = 3
+PVP_WIN_EXPERIENCE = 15
+PVP_BASE_MONEY = 30
+PVP_WIN_MONEY = 50
+
+
+def quest_reward(quest_id, difficulty, score, cleared):
+    """闯关一局的 `(经验, 金币)`。纯函数，好单测。
+
+    `quest_id` / `difficulty` 来自 `Conn.current_quest()`（闯关房描述符的两个
+    参数）；拿不到（不是闯关房、参数不全）时按 1 级关卡、难度 1 算。
+
+    ★★ **金币不吃分数加成**（D152）：它 = 关卡固定奖励 × 难度系数，**就这些**。
+    本局在地上捡到的金币由 `settle_quest` 另加（`RoomQuest.coins`）——
+    「打得好」的回报走经验，「捡得勤」的回报走地上那些金币，两条线分开。
+    """
+    try:
+        quest_id = max(1, int(quest_id))
+    except (TypeError, ValueError):
+        quest_id = 1
+    try:
+        difficulty = int(difficulty)
+    except (TypeError, ValueError):
+        difficulty = 1
+    score = max(0, int(score))
+    bonus = QUEST_DIFFICULTY_BONUS.get(difficulty, 1.0)
+    ratio = bonus if cleared else bonus * QUEST_FAILED_RATIO
+    base_exp = QUEST_BASE_EXPERIENCE + QUEST_BASE_EXPERIENCE_STEP * (quest_id - 1)
+    base_money = QUEST_BASE_MONEY + QUEST_BASE_MONEY_STEP * (quest_id - 1)
+    experience = int(base_exp * ratio) + score // QUEST_SCORE_PER_EXPERIENCE
+    money = int(base_money * ratio)
+    return experience, money
+
+
+def pvp_reward(kills, won):
+    """对战一局的 `(经验, 金币)`。`won` 就是尾部数组里那一格 == 1。
+
+    ★ 输了也给底薪：对战的一局可能就几分钟，一分不给会逼人挂机刷闯关。
+
+    ★★ **金币不吃杀敌数**（D152，和闯关同一条口径）：杀敌数就是对战的分数，
+    所以金币只剩「参战底薪 + 胜方加成」这两个固定值，再由 `settle_quest`
+    加上本局捡到的金币。经验仍然按杀敌数走 —— 技术好照样有回报。
+    """
+    kills = max(0, int(kills))
+    experience = (PVP_BASE_EXPERIENCE + PVP_EXPERIENCE_PER_KILL * kills
+                  + (PVP_WIN_EXPERIENCE if won else 0))
+    money = PVP_BASE_MONEY + (PVP_WIN_MONEY if won else 0)
+    return experience, money
+
+
 def build_game_result_values(experience=0, money=0, ladder_point=0):
     """按 §116 的语义组 `gspRepGameResult` 的 12 个业务值（其余全 0）。
 
@@ -2068,6 +2170,40 @@ PVP_WEAPON_ITEM_IDS = (10200, 10201, 10202)
 #: 「当场生效」的分支对它们恒不成立 —— 它们必须先进槽、再按 Ctrl 用。
 #: 金币（10101/10102）、红心（10100）、武器（10200~10202）那些参数是 0，
 #: 拾取当场就生效，**绝不能**给它们发 `0x040b`（客户端会凭空多出一件道具）。
+#: ★★ **地上捡到的金币值多少钱**（§230 / §231 / D152）。
+#:
+#: 客户端**一分钱都不加**：`CoinItem1/5` 的 `vf_11c`（`0x52156f` / `0x521b2c`）
+#: 只播一个音效（`Item-EatCoin`）加一个特效，没有任何金额算术；全镜像里
+#: 引用金币全局 `[0x72e330]` 的 14 处**没有一处在战斗代码段**（都是大厅 UI
+#: 和 `0x0309`/`0x0411`/`0x0600` 三个包的处理器）。⇒ **金币的面额本来就是
+#: 服务端的活**，客户端只负责把箱子从地上抹掉（§230）。
+#:
+#: ★ **比例 1:5** 来自类名（`CoinItem1` / `CoinItem5`），是硬证据。
+#:
+#: ★★ **绝对值按原版的「掉几枚」反推出来**（§231 逆的两条掉落路径）：
+#:
+#:   · **通关金币雨**：`20 × 通关时还活着的玩家数` 枚**金币×1**，
+#:     撒 `(存活人数 + 5)` 秒，只有房主的客户端发。
+#:     ⇒ 枚数跟人数线性，所以**人均恒定 20 枚** —— 原版是按「每人一份」设计的。
+#:   · **可破坏场景物**被打碎：6% 概率掉 1 枚**金币×5**（对战和闯关都有，
+#:     这就是「对战里偶尔也掉金币」的来源）。
+#:
+#: 取 10 / 50 之后：**一局通关人均 20 枚 × 10 = 200 金币**。
+#: 对照关卡固定奖励（Quest1 简单 100 … Quest7 困难 1000），
+#: 金币雨在低级关卡能翻一倍、在高级关卡占两成 —— 「捡得勤有回报」成立，
+#: 又不会盖过「打的是哪一关」这个主导项。
+#:
+#: ⚠ 实际到手会比 200 少：撒币要 `(人数+5)` 秒，而客户端在通关 **6 秒后**
+#: 就发 `0x040f` 弹结算（§167），两人以上时尾巴那段撒出来的金币来不及捡。
+#: **这两个数按实机日志里 `捡到 N` 那一格再调**（待验证表第 49 条）。
+COIN_ITEM_VALUES = {10101: 10, 10102: 50}
+
+
+def coin_value(item_id):
+    """这件东西捡起来值几个金币？不是金币就是 0。"""
+    return COIN_ITEM_VALUES.get(item_id, 0)
+
+
 GRANTABLE_ITEM_IDS = frozenset(PVP_ITEM_IDS + PVP_TEAM_ITEM_IDS)
 
 #: 角色身上的道具槽格数 —— `Character::AddItem`（`0x517037`）扫
@@ -2650,6 +2786,19 @@ def build_respawn_character(character_id=0, x=DEFAULT_RESPAWN_X,
     return w_i32(character_id) + w_i32(x) + w_i32(y) + w_i32(unknown)
 
 
+#: ★ 开局种子的取值范围。**下界是 1，不能出 0 也不能出 -1**：
+#: `-1` 在客户端 `0x40b6e5` 里是「用线程本地随机源」的哨兵（`0x40b737` 的
+#: `cmp [ebp+0x18], -1`），一旦发出去房里每个人就会各随各的图；`0` 是我们
+#: V0.1 单机时代的固定值，留着只会让「随机地图」永远随到同一张（§228）。
+GAME_SEED_MIN = 1
+GAME_SEED_MAX = 2 ** 31 - 2
+
+
+def new_game_seed():
+    """开一局用的共享随机种子。房里每个人拿到的必须是**同一个**。"""
+    return random.randint(GAME_SEED_MIN, GAME_SEED_MAX)
+
+
 class StartGameHandshake:
     """闯关房「F5 游戏开始」之后的开局握手（单客户端）。
 
@@ -2692,12 +2841,26 @@ class StartGameHandshake:
     PREPARING = "preparing"
     IN_GAME = "in_game"
 
-    def __init__(self, seed=0):
+    def __init__(self, seed=0, seed_source=None):
         self.seed = seed
         self.state = self.WAIT_START
+        #: ★ **每局重取一次**的种子发号器（§228）。`0x0400` 里那个 int32 是
+        #: 客户端「按条件过滤地图目录 + 随机取一张」`0x40b6e5` 的第 5 个参数：
+        #: 不是 -1 就用它构造一个**确定性**随机源（`0x5d8cb6`），所以房里每个人
+        #: 算出来的是同一张图。以前这个数**恒为 0**，随机地图会永远随到同一张。
+        #: 注入点留着是为了单测能复现（传一个返回常量的函数即可）。
+        self.seed_source = seed_source or new_game_seed
 
     def reset(self):
         self.state = self.WAIT_START
+
+    def next_seed(self):
+        """要发 `0x0400` 了，取这一局的种子。取不出来就沿用上一局的。"""
+        try:
+            self.seed = int(self.seed_source())
+        except Exception as error:          # noqa: BLE001 —— 发号器坏了不该拦住开局
+            log(f"⚠ 取开局种子失败（{error!r}），沿用上一局的 {self.seed}")
+        return self.seed
 
     def on_client_packet(self, opcode, payload):
         if payload:
@@ -2709,7 +2872,10 @@ class StartGameHandshake:
                 return [(OP_TRIGGER_COUNT_GAME, build_trigger_count_game(0))]
             if self.state == self.WAIT_CONFIRM:
                 self.state = self.PREPARING
-                return [(OP_PREPARE_GAME, build_prepare_game(self.seed))]
+                # ★ 种子在**真要发 `0x0400` 的这一刻**重取 —— 而不是建房、
+                #   也不是 `reset()`。这样「这一局用哪个种子」和「这一局开始了」
+                #   是同一个事件，中途谁进谁出都不会让它变。
+                return [(OP_PREPARE_GAME, build_prepare_game(self.next_seed()))]
             return []
 
         # 客户端在 stage 6 把关卡加载到 100% 之后，每 5 秒发一次空 0x0403
@@ -2740,9 +2906,11 @@ class RoomStartGame:
       开局是房主的权力，认了就等于谁都能替房主开局。
     """
 
-    def __init__(self, seed=0):
+    def __init__(self, seed=0, seed_source=None):
         #: 房主那条状态机。**原样复用**，别在这里重写它的状态迁移。
-        self.host = StartGameHandshake(seed)
+        #: ★ 种子也在它手里（每局重取一次），房间级的广播直接读 `self.seed`
+        #: —— 全房间同一个数就是这么保证的。
+        self.host = StartGameHandshake(seed, seed_source)
         #: 已经报过 `0x0403`（关卡加载完）的连接。
         self.loaded = set()
         #: ★ **在「关卡还在加载」这段里走掉的座位号**（§180 / D103）。
@@ -2925,6 +3093,10 @@ class RoomQuest:
         #: 客户端掉的都记）。★ 拾取放行时**只有靠它才知道捡到的是什么** ——
         #: `0x0407` 只带句柄，而要不要补一发 `0x040b` 完全取决于物件类型（§194）。
         self.item_handles = {}
+        #: ★ 每个座位**本局在地上捡到的金币总额**（§230）。结算时原样加进
+        #: 「金币 +N」——闯关里怪和 boss 掉的、对战里偶尔掉的，都算这一份。
+        #: 每局随 `RoomQuest` 重建，换图不清零（一整轮算一份）。
+        self.coins = [0] * ROOM_SEAT_COUNT
         #: 每个座位手上的道具 id（FIFO，最多 `ITEM_SLOT_COUNT` 件）。
         #: 这是客户端 `[Character+0x764..0x770]` 那 4 格的**镜像**：
         #: 是我们发 `0x040b` 把它填进去的，也只有我们发 `0x040c` 能拿掉，
@@ -3085,7 +3257,24 @@ class RoomQuest:
         self.items_taken[handle] = int(seat_id)
         # 服务端刷的那件被人捡走了，地图上就少一件（配额腾出来）。
         self.items_on_map.discard(handle)
+        # ★ 金币在**这里**入账，不在 `grant_picked_item` 里 —— 那个函数只管
+        #   「要不要补一发 0x040b」，金币根本不进道具槽、会被它提前 return 掉。
+        #   仲裁这一步才是「这一件确定归这个座位了」的唯一判定点。
+        self.add_coins(seat_id, coin_value(self.item_id_of(handle)))
         return True
+
+    def add_coins(self, seat_id, amount):
+        """把捡到的金币记到这个座位头上。返回它本局的金币总额。"""
+        seat = int(seat_id)
+        if not 0 <= seat < ROOM_SEAT_COUNT or amount <= 0:
+            return 0
+        self.coins[seat] += int(amount)
+        return self.coins[seat]
+
+    def coins_of(self, seat_id):
+        """这个座位本局捡了多少金币。座位越界按 0 算。"""
+        seat = int(seat_id)
+        return self.coins[seat] if 0 <= seat < ROOM_SEAT_COUNT else 0
 
     # -- 道具槽（§194）------------------------------------------------------
     def grant_item(self, seat_id, item_id):
@@ -3519,13 +3708,15 @@ class RoomQuest:
             self.success = True
         return self.success
 
-    def ranking(self, scores, quest_mode):
+    def ranking(self, scores, quest_mode, teams=None, *, team_mode=False):
         """算每个座位在 `0x0309` 尾部数组里的那一格。
 
         `scores` = `{座位号: 本局分数}`，只包含**有人的**座位。
+        `teams`  = `{座位号: 队伍号}`（`lobby.TEAM_A` / `TEAM_B` / `TEAM_NONE`），
+        只在 `team_mode` 为真时用得上。
 
         尾部数组落进 `[GameContext + 座位*4 + 0x184]`，客户端读它的地方有两处
-        （§112 + 本轮补的 §161）：
+        （§112 + §161）：
 
             结算界面标签 `0x4a4ba9`：== 1  且 剩余生命 > 0  -> 「完成」/「CLEAR」
             结算 BGM     `0x55223f`：>= 0（`setge`）        -> 胜利曲，否则失败曲
@@ -3534,8 +3725,22 @@ class RoomQuest:
         就是这一档，保持不变）、**-1 = 输**（对战的败方）。
 
         `quest_mode` 为真（房间类型 2 = 闯关）时是**合作**：通关了大家一起 1。
-        对战按本局分数排名，最高分（含并列）1、其余 -1；**全场 0 分**时
-        谁都不判 —— 那多半是没打就散了。
+
+        ★ 对战这一路**照抄原版客户端** `DeathMatchVictoryCondition` 虚表槽 14
+        （`0x55bfda`，§226）—— 我们判胜负是因为客户端那套跑不到（§167），
+        但口径必须和它一致，否则玩家的直觉和屏幕对不上：
+
+            座位没人                                  -> 0
+            个人战：合成分 = (分数 + 1) * 1000 - 死亡数
+                    全员并列                          -> 0（谁都不判）
+                    合成分 == 最大（含并列）           -> +1，其余 -1
+            组队战：在座的人全同队（`0x55c594`）       -> +1（没有对手，全员胜）
+                    队伍合成分 = (队伍总分 + 1) * 100 - 队伍总死亡
+                    我队 > 敌队 -> +1；相等 -> 0；小于 -> -1
+
+        ⚠ 原版的队伍合成分还有一个更高优先级的项（`(c*100 + 总分 + 1)*100 - 总死亡`
+        里的 `c` = 队伍记录 `+0x0c`），夺分里它恒 0，我们不实现 —— 真要用到它的
+        玩法（回合制）本来就没上线。这里等价成「先比队伍总分，平了比谁死得少」。
         """
         tail = [0] * GAME_RESULT_TAIL_COUNT
         scores = {int(seat): int(score) for seat, score in dict(scores).items()
@@ -3547,11 +3752,70 @@ class RoomQuest:
                 for seat in scores:
                     tail[seat] = GAME_RESULT_CLEARED
             return tail
-        best = max(scores.values())
-        if best <= 0:
+        if team_mode:
+            return self._team_ranking(scores, teams or {}, tail)
+        return self._free_ranking(scores, tail)
+
+    def _seat_rank_value(self, seat, score):
+        """个人合成分，照抄 `0x55c072`：`(分数 + 1) * 1000 - 死亡数`。
+
+        死亡数只当**破平局**用（原版靠 ×1000 把它压在低位），所以「分数一样时
+        死得少的赢」，而不会让死亡数翻盘。
+        """
+        deaths = (self.deaths[seat]
+                  if 0 <= seat < ROOM_SEAT_COUNT else 0)
+        return (int(score) + 1) * 1000 - int(deaths)
+
+    def _free_ranking(self, scores, tail):
+        """个人战（含全场 0 分那种没打就散了的局）。"""
+        values = {seat: self._seat_rank_value(seat, score)
+                  for seat, score in scores.items()}
+        best = max(values.values())
+        # ★ 全员并列 -> 一个都不判（原版 `0x55c0bb cmp ebx, 在座人数 / je -> 0`）。
+        #   「全场 0 分」自然落进这一条，和旧实现的 `best <= 0` 结果相同。
+        if all(value == best for value in values.values()):
             return tail
+        for seat, value in values.items():
+            tail[seat] = (GAME_RESULT_CLEARED if value == best
+                          else GAME_RESULT_DEFEATED)
+        return tail
+
+    def team_rank_values(self, scores, teams):
+        """`{队伍号: (队伍总分, 队伍总死亡)}`，只含**有人**的队伍。日志也用它。"""
+        totals = {}
         for seat, score in scores.items():
-            tail[seat] = (GAME_RESULT_CLEARED if score == best
+            team = int(teams.get(seat, TEAM_NONE))
+            if team not in (TEAM_A, TEAM_B):
+                continue
+            score_sum, death_sum = totals.get(team, (0, 0))
+            deaths = self.deaths[seat] if 0 <= seat < ROOM_SEAT_COUNT else 0
+            totals[team] = (score_sum + int(score), death_sum + int(deaths))
+        return totals
+
+    def _team_ranking(self, scores, teams, tail):
+        """组队战，照抄 `0x55bfda` 的组队分支。"""
+        totals = self.team_rank_values(scores, teams)
+        if not totals:
+            # 一个人都没分到队（队伍号全是 TEAM_NONE）—— 退回个人口径，
+            # 总比全场判 0 有信息量。
+            return self._free_ranking(scores, tail)
+        if len(totals) == 1:
+            # `0x55c594`：在座的人全同队，没有对手 -> 全员胜。
+            for seat in scores:
+                if int(teams.get(seat, TEAM_NONE)) in totals:
+                    tail[seat] = GAME_RESULT_CLEARED
+            return tail
+        # 队伍合成分：先比总分，平了比谁死得少（原版是把两者packed进一个整数）。
+        ranked = {team: (score_sum, -death_sum)
+                  for team, (score_sum, death_sum) in totals.items()}
+        best = max(ranked.values())
+        if all(value == best for value in ranked.values()):
+            return tail            # 两队完全打平 -> 谁都不判（不放失败曲）
+        for seat in scores:
+            team = int(teams.get(seat, TEAM_NONE))
+            if team not in ranked:
+                continue
+            tail[seat] = (GAME_RESULT_CLEARED if ranked[team] == best
                           else GAME_RESULT_DEFEATED)
         return tail
 
@@ -3922,6 +4186,23 @@ def room_in_battle(room):
             and room.status == SESSION_STATUS_PLAYING
             and room.battle is not None
             and room.battle.state == StartGameHandshake.IN_GAME)
+
+
+def room_started(room):
+    """这一局的 `0x0400 gspPrepareGame` 已经发出去了吗？
+
+    ⚠ 和 `room_in_battle()` **不是一回事**，别混用：那个要求握手已经走到
+    `IN_GAME`（收齐所有人的 `0x0403`、发完 `0x0402`），是「战斗内逻辑」
+    （刷道具 / 判胜负 / 控制权交接）的判据；这个只问「关卡加载是不是已经
+    开始了」，因此把 `PREPARING`（stage 6 加载中）也算上。
+
+    随机地图模式下房主的那一发地图汇报 `0x0302` 恰恰落在 `PREPARING`
+    —— 它是紧跟着 `0x0400` 的处理发出来的（§228）。
+    """
+    return (room is not None
+            and room.battle is not None
+            and room.battle.state in (StartGameHandshake.PREPARING,
+                                      StartGameHandshake.IN_GAME))
 
 
 def online_user_snapshots(viewer=None, waiting_only=False):
@@ -4524,7 +4805,7 @@ class Conn:
             self.log(f"   → 广播给房里另外 {sent} 人{reason}")
         return sent
 
-    def send_update_session(self, map_name=None):
+    def send_update_session(self, map_name=None, random_map=None):
         """把当前房间的 `Session` 下发给客户端（opcode 0x0303）。
 
         没解出建房请求就不发：这个包的唯一作用就是把请求里那份描述符原样
@@ -4540,6 +4821,8 @@ class Conn:
         room = self.lobby_room()
         if map_name is None:
             map_name = "" if room is None else room.map_name
+        if random_map is None:
+            random_map = False if room is None else room.random_map
         player_count = 1 if room is None else room.player_count()
         status = SESSION_STATUS_WAITING if room is None else room.status
         # ★★ 局号：房里所有人共用一个数（§218 / D138）。中途进房的人就是靠
@@ -4555,6 +4838,7 @@ class Conn:
                 status=status,
                 player_count=player_count,
                 game_id=game_id,
+                random_map=random_map,
             )
         except ValueError as error:
             self.log(f"   无法下发 0x0303: {error}")
@@ -4563,6 +4847,7 @@ class Conn:
             f"← 回 0x0303 Session(type={self.room['session_type']} "
             f"({self.room['session_type_name']}) args={self.room['arguments']} "
             f"title={self.room['texts'][0]!r} map={map_name!r} "
+            f"随机图={'开' if random_map else '关'} "
             f"人数={player_count} 局号={game_id})")
         self.send(build_game(OP_UPDATE_SESSION, payload))
 
@@ -5814,23 +6099,33 @@ class Conn:
                             0 if quest_mode else quest.kills[seat]
                             if 0 <= seat < ROOM_SEAT_COUNT else 0)
                   for seat, conn in seats.items()}
+        # ★ 队伍表两条分支都要用（§226 修好之前只有生存那一路算它，
+        #   于是夺分的组队战里队友被逐个当成对手排名 —— 用户实机报的
+        #   「只有得分最高的一个人显示胜利」）。`battle_teams()` 是现成的。
+        teams, team_mode = self.battle_teams()
+        teams = teams or {}
         # 尾部数组 = 每座位的「完成 / 输赢」。闯关是合作（通关了大家一起 1）；
-        # 生存按剩余生命 / 队伍判，夺分才按杀敌数排名（§161 / §204）。
+        # 生存按剩余生命 / 队伍判，夺分按分数排名 —— 组队时按**队伍合成分**
+        # （§161 / §204 / §226）。
         if pvp_mode in (PVP_MODE_SURVIVAL, PVP_MODE_FIGHT):
-            room = self.lobby_room()
-            teams = ({i: seat.team for i, seat in enumerate(room.seats)
-                      if seat is not None} if room is not None else {})
-            team_mode = (room is not None and
-                         room.team_layout() == TEAM_LAYOUT_TEAMS)
             tail = quest.survival_ranking(
                 seats, teams, team_mode=team_mode)
         else:
-            tail = quest.ranking(scores, quest_mode)
+            tail = quest.ranking(scores, quest_mode,
+                                 teams, team_mode=team_mode)
         if not quest_mode:
             if pvp_mode in (PVP_MODE_SURVIVAL, PVP_MODE_FIGHT):
                 remaining = {seat: quest.remaining_lives(seat) for seat in seats}
                 self.log(f"   生存胜负: 剩余生命 {remaining} -> 尾部数组 {tail}"
                           f"（1=胜 / -1=负 / 0=不判）")
+            elif team_mode:
+                # 队伍汇总打出来，实机时能直接拿它和结算界面对。
+                totals = quest.team_rank_values(scores, teams)
+                detail = "、".join(
+                    f"队伍{team} {score} 分 / 死 {deaths}"
+                    for team, (score, deaths) in sorted(totals.items()))
+                self.log(f"   夺分胜负(组队): 个人分 {scores}；{detail}"
+                          f" -> 尾部数组 {tail}（1=胜 / -1=负 / 0=不判）")
             else:
                 self.log(f"   对战胜负: 分数 {scores} -> 尾部数组 {tail}"
                           f"（1=胜 / -1=负 / 0=不判）")
@@ -5838,6 +6133,9 @@ class Conn:
         # ---- ① 每个人先入账，并把「他那一份 0x0309 / 0x0411」备好 --------
         results = {}     # 座位 -> 0x0309 的载荷
         end_games = {}   # 座位 -> (0x0411 的载荷, 日志用的数)
+        # ★ 闯关的关卡 id / 难度：房里每个人读到的是同一份（`current_quest()`
+        #   先看大厅那一份），所以在循环外取一次就够。
+        quest_info = self.current_quest() if quest_mode else None
         for seat, conn in sorted(seats.items()):
             score = scores[seat]
             # `0x0411` 的 success 跟着尾部数组走，两个包才不会自相矛盾。
@@ -5846,10 +6144,26 @@ class Conn:
             if quest_mode and cleared:
                 # 通关了才解锁下一个难度。★ 每个人的存档各解各的。
                 conn.record_quest_clear()
+            # ★★ 分数 / 经验 / 金币是**三件事**（§227 / D148）。以前它们是同一个
+            #    `score`，于是结算界面三行数一模一样、而且一局能给上千经验。
+            #    分数栏仍然发本局分数，经验和金币各按自己的公式算。
+            if quest_mode:
+                quest_id, difficulty = quest_info or (1, 1)
+                gained_exp, gained_money = quest_reward(
+                    quest_id, difficulty, score, seat_cleared)
+            else:
+                gained_exp, gained_money = pvp_reward(score, seat_cleared)
+            # ★★ 再加上**本局在地上捡到的金币**（§230 / D152）。闯关里怪和 boss
+            #    掉的、对战里偶尔掉的，都在 `RoomQuest.claim_item()` 那一步按
+            #    座位记好了。★ 客户端捡金币时一分钱都不加（只播 `Item-EatCoin`
+            #    的音效），所以这里加进去**不会和客户端重复计数**。
+            picked_coins = quest.coins_of(seat)
+            gained_money += picked_coins
             if conn.account_name:
                 try:
                     conn.account = conn.accounts.add_quest_reward(
-                        conn.account_name, experience=score, money=score)
+                        conn.account_name,
+                        experience=gained_exp, money=gained_money)
                 except KeyError:
                     conn.log(f"   存档里没有账号 {conn.account_name!r}；奖励未入账")
             experience = int((conn.account or {}).get("experience", 0))
@@ -5859,22 +6173,25 @@ class Conn:
             #     —— §100 那次「12 个值一次全填」会让客户端 20 毫秒内断链。
             results[seat] = build_rep_game_result(
                 seat,
-                values=build_game_result_values(experience=score, money=score),
+                values=build_game_result_values(experience=gained_exp,
+                                                money=gained_money),
                 tail=tail)
             end_games[seat] = (
                 build_end_game(seat, seat_cleared, build_end_game_values(
                     experience=experience,
                     next_level_exp=next_level_exp,
                     level_start_exp=level_start_exp,
-                    money_gained=score,
+                    money_gained=gained_money,
                     score=score,
                 )),
                 (score, experience, level_start_exp, next_level_exp),
             )
             conn.log(f"   结算 座位{seat}: 分数={score} "
                      f"{'完成/胜' if seat_cleared else '未完成'} "
-                     f"-> 总经验={experience} (本级 {level_start_exp}..{next_level_exp}) "
-                     f"本局金币={score}")
+                     f"-> 本局经验+{gained_exp} "
+                     f"金币+{gained_money}"
+                     f"（固定 {gained_money - picked_coins} + 捡到 {picked_coins}）；"
+                     f"总经验={experience} (本级 {level_start_exp}..{next_level_exp})")
 
         # ---- ② 再逐个连接下发 --------------------------------------------
         # ★ 不合并成一次 sendall：V0.1 单人时这两个包就是分开发的，实机验过
@@ -6105,7 +6422,11 @@ class Conn:
     def room_battle(self, room):
         """取（必要时建）房间的开局状态机。"""
         if room.battle is None:
-            room.battle = RoomStartGame(seed=self.start_game.seed)
+            # ★ 发号器跟着连接走 —— 单测在 `conn.start_game` 上注入一个常量
+            #   发号器，房间这条也会用同一个，一处注入两边生效。
+            room.battle = RoomStartGame(
+                seed=self.start_game.seed,
+                seed_source=self.start_game.seed_source)
         return room.battle
 
     def broadcast_start_game(self, room, replies, why):
@@ -6978,7 +7299,9 @@ class Conn:
                 f"({request['session_type_name']}) "
                 f"texts={request['texts']!r} args={request['arguments']} "
                 f"{describe_room_arguments(request['session_type'], request['arguments'])} "
-                f"free_slots={request['free_slots']} flags={request['flags']}"
+                f"free_slots={request['free_slots']} "
+                f"随机图={'开' if request['random_map'] else '关'} "
+                f"flags={request['flags']}（第 2 格是栈垃圾，别读）"
             )
             # 客户端在这里把它选定的地图名提交上来，服务端把整份 Session
             # 广播回去，房间的「选择地图」面板才会显示出关卡。此时地图名
@@ -6986,11 +7309,26 @@ class Conn:
             if self.room is None:
                 self.log("   没有已解析的建房请求; 不回 0x0303")
                 return
+            room = self.lobby_room()
+            # ★★ 开局之后还会来一发：随机地图模式下，房主在处理
+            #    `0x0400 gspPrepareGame` 时自己挑好图（`0x551699` 用包里的 seed）、
+            #    写进 `[LobbyStage+0x10]`，**然后回发一发 `0x0302` 把结果报上来**
+            #    （`0x551774` 先比「我是不是房主」，`0x551799` 才发）。
+            #    这一发是**汇报**不是请求：全房间本来就用同一个 seed 各自算出
+            #    同一张图，不需要广播。而此刻大家正在 stage 6 加载关卡，
+            #    一发 `0x0303` 会把 Session 的状态字段和局号重新灌进去 ——
+            #    那是没验过的动作。所以只记账。
+            if room_started(room):
+                LOBBY.update_room(room, map_name=request["texts"][1],
+                                  random_map=request["random_map"])
+                self.log(f"   开局后的地图汇报: map={request['texts'][1]!r} "
+                         f"随机图={'开' if request['random_map'] else '关'}"
+                         f" —— 只记账，不回 0x0303")
+                return
             self.room = dict(self.room,
                              session_type=request["session_type"],
                              arguments=request["arguments"])
             # 房间在大厅里也要跟着改：房间列表和后进来的人读的是大厅那一份。
-            room = self.lobby_room()
             regrouped = []
             if room is not None:
                 old_layout = room.team_layout()
@@ -6998,7 +7336,8 @@ class Conn:
                                   title=request["texts"][0] or room.title,
                                   map_name=request["texts"][1],
                                   session_type=request["session_type"],
-                                  arguments=request["arguments"])
+                                  arguments=request["arguments"],
+                                  random_map=request["random_map"])
                 # ★ 房主在房间里点了「组队战 / 个人战」就会走到这儿，而分队
                 #   口径是跟着模式走的（§165）：组队战按座位奇偶分两队、
                 #   个人战每人一队、闯关全在一队。**只在口径真的变了时重排** ——
@@ -7011,14 +7350,16 @@ class Conn:
                                  + "、".join(
                                      f"座位 {i}->{room.seats[i].team}"
                                      for i in regrouped))
-            self.send_update_session(map_name=request["texts"][1])
+            self.send_update_session(map_name=request["texts"][1],
+                                     random_map=request["random_map"])
             # 房里其他人也要看到新地图 —— 不然他们的「选择地图」面板还停在旧的。
             if room is not None and room.player_count() > 1:
                 others = build_game(OP_UPDATE_SESSION, build_update_session(
                     room.session_type, room.arguments, title=room.title,
                     map_name=room.map_name, status=room.status,
                     player_count=room.player_count(),
-                    game_id=room.epoch_value))
+                    game_id=room.epoch_value,
+                    random_map=room.random_map))
                 self.broadcast(others, reason="：房间参数变更")
             # 重排过的座位要挨个广播出去（action 3 = 灌数据 + 重建模型 +
             # 刷 UI，不播任何提示），否则名牌颜色和站位还停在旧模式上。

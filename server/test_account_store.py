@@ -7,9 +7,12 @@ import tempfile
 import unittest
 
 from account_store import (AUTH_BAD_PASSWORD, AUTH_NO_SUCH_USER, AUTH_OK,
-                           EXPERIENCE_PER_LEVEL, MINIMUM_PLAYER_LEVEL,
+                           EXPERIENCE_PER_LEVEL, EXPERIENCE_STEP, LEVEL_MAX,
+                           MINIMUM_PLAYER_LEVEL,
                            NEW_ACCOUNT_DEFAULTS, QUEST_DIFFICULTY_MAX,
                            QUEST_ID_TABLE, AccountError, AccountStore,
+                           experience_bounds, experience_for_level,
+                           level_for_experience,
                            player_character, player_level,
                            quest_cleared_difficulty, quest_difficulty_records,
                            quest_unlock_all, tutorial_state)
@@ -74,8 +77,9 @@ class AccountStoreTests(unittest.TestCase):
         self.assertEqual(7, values[1])       # 频道码 -> [conn+0x89c]
         self.assertEqual(2, values[2])       # 频道序号 -> [conn+0x8a0]
         self.assertEqual(650, values[3])     # 总经验 -> 0x72e33c
+        # 二次曲线：650 点落在 4 级（本级 600 起、下一级 1000）。
         self.assertEqual(600, values[4])     # 本级起点 -> 0x72e340
-        self.assertEqual(700, values[5])     # 下一级所需 -> 0x72e344
+        self.assertEqual(1000, values[5])    # 下一级所需 -> 0x72e344
         self.assertEqual(3, values[6])       # 教程状态
         # 只剩 +0x2c 语义未查，按 D019 保持 0。
         self.assertEqual(0, values[7])
@@ -365,21 +369,72 @@ class AccountStoreTests(unittest.TestCase):
         self.store.import_account(payload, "alice", "pw")
         _, account = self.store.get_account("alice")
         self.assertEqual(5, account["level"])
-        self.assertEqual(EXPERIENCE_PER_LEVEL * 4, account["experience"])
+        self.assertEqual(experience_for_level(5), account["experience"])
         # 重新读一遍还得是 5：经验补上了，等级就不会再被算回去。
         self.assertEqual(5, AccountStore(self.path).get_account("alice")[1]["level"])
 
-    def test_import_prefers_the_experience_when_only_it_was_raised(self):
-        # 另一种常见改法：只改经验、level 留着不动。这时候拿旧的 level 去
-        # 覆盖经验会把玩家的改动抹掉，所以经验大的一方说了算。
+    def test_import_lets_the_level_win_when_the_two_fields_disagree(self):
+        # ★ D151：**等级说了算**。只改 experience、level 留着旧值时，
+        # 两个字段矛盾 -> 认 level，经验被重算回那一级的起点。
+        # 注册页上已经写明「只改 experience 没用」。
         self.store.register("alice", "pw")
         payload = {"popshot_save": 1, "username": "alice",
                    "account": {"password": "pw", "level": 1,
-                               "experience": EXPERIENCE_PER_LEVEL * 9}}
+                               "experience": 9999}}
         self.store.import_account(payload, "alice", "pw")
         _, account = self.store.get_account("alice")
-        self.assertEqual(EXPERIENCE_PER_LEVEL * 9, account["experience"])
-        self.assertEqual(10, account["level"])
+        self.assertEqual(1, account["level"])
+        self.assertEqual(experience_for_level(1), account["experience"])
+
+    def test_import_lets_the_level_go_down_too(self):
+        # 旧规则只能往上抬（「想降级得连经验一起改小」）；现在降级也生效。
+        self.store.register("alice", "pw")
+        self.store.add_quest_reward("alice", experience=29900)
+        payload = {"popshot_save": 1, "username": "alice",
+                   "account": {"password": "pw", "level": 3,
+                               "experience": 29900}}
+        self.store.import_account(payload, "alice", "pw")
+        _, account = self.store.get_account("alice")
+        self.assertEqual(3, account["level"])
+        self.assertEqual(experience_for_level(3), account["experience"])
+
+    def test_import_clamps_a_hand_written_level_to_the_cap(self):
+        # 手写 level: 999 只能得到 60 级，不会算出一个天文数字的经验。
+        self.store.register("alice", "pw")
+        payload = {"popshot_save": 1, "username": "alice",
+                   "account": {"password": "pw", "level": 999}}
+        self.store.import_account(payload, "alice", "pw")
+        _, account = self.store.get_account("alice")
+        self.assertEqual(LEVEL_MAX, account["level"])
+        self.assertEqual(experience_for_level(LEVEL_MAX), account["experience"])
+
+    def test_import_keeps_the_experience_when_the_two_fields_agree(self):
+        """★ 导出 -> 原样导回，**本级内攒的经验一分不丢**。
+
+        两个字段本来就自洽时不许按等级重算 —— 否则每次转存都会把玩家
+        打回本级起点（5 级、1200 点会被砍成 1000）。
+        """
+        self.store.register("alice", "pw")
+        self.store.add_quest_reward("alice", experience=1200, money=7)
+        payload = self.store.export_account("alice")
+        self.assertEqual(5, payload["account"]["level"])
+        self.assertEqual(1200, payload["account"]["experience"])
+        self.store.import_account(payload, "alice", "pw")
+        _, account = self.store.get_account("alice")
+        self.assertEqual(5, account["level"])
+        self.assertEqual(1200, account["experience"])
+
+    def test_import_survives_a_broken_level_field(self):
+        # level 缺失 / 是字符串 / 是负数 -> 以经验为准，不许抛异常。
+        for bad in ({}, {"level": "abc"}, {"level": -5}):
+            fields = {"password": "pw", "experience": 1200}
+            fields.update(bad)
+            self.store.import_account(
+                {"popshot_save": 1, "username": "alice", "account": fields},
+                "alice", "pw")
+            _, account = self.store.get_account("alice")
+            self.assertEqual(1200, account["experience"], bad)
+            self.assertEqual(5, account["level"], bad)
 
     def test_import_updates_every_field_of_an_existing_account(self):
         """导入要能改**每一个**字段，不是只改得动其中几个。"""
@@ -390,7 +445,9 @@ class AccountStoreTests(unittest.TestCase):
             "tutorial_completed": True,
             "tutorial_progress": 5,
             "level": 3,
-            "experience": EXPERIENCE_PER_LEVEL * 2 + 50,
+            # ★ D151「等级说了算」：level 和 experience 矛盾时经验按等级重算，
+            #   所以这里写自洽的那一对，这条用例才是在测「字段改得动」而不是曲线。
+            "experience": experience_for_level(3),
             "money": 777,
             "character": 7,
             "quest_difficulty": {"5": 2},
@@ -466,8 +523,7 @@ class AccountStoreTests(unittest.TestCase):
 
     def test_reading_realigns_a_hand_edited_level_with_the_experience(self):
         self.account()
-        self.store.add_quest_reward("alice",
-                                    experience=EXPERIENCE_PER_LEVEL * 3)
+        self.store.add_quest_reward("alice", experience=experience_for_level(4))
         # 手工把等级改乱，读的时候应该按经验校回来。
         with open(self.path, "r", encoding="utf-8") as f:
             saved = json.load(f)
@@ -475,6 +531,65 @@ class AccountStoreTests(unittest.TestCase):
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(saved, f)
         self.assertEqual(4, self.store.get_account("alice")[1]["level"])
+
+    # -- 换曲线之后的存档对齐（§229 / D150）----------------------------------
+    def write_raw(self, accounts):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"schema_version": 2, "accounts": accounts}, f)
+
+    def raw_levels(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            return {k: v["level"] for k, v in json.load(f)["accounts"].items()}
+
+    def test_realign_rewrites_levels_left_over_from_the_linear_curve(self):
+        # 云服上真实存在的局面：旧曲线（每级恒 100）把号刷到了好几百级。
+        self.write_raw({
+            "veteran": {"password": "p", "level": 300, "experience": 29900},
+            "midlevel": {"password": "p", "level": 60, "experience": 5900},
+            "fresh": {"password": "p", "level": 1, "experience": 0},
+        })
+        changed = AccountStore(self.path).realign_levels()
+        by_name = {row["username"]: row for row in changed}
+        self.assertEqual({"veteran", "midlevel"}, set(by_name))
+        self.assertEqual((300, 24), (by_name["veteran"]["old"],
+                                     by_name["veteran"]["new"]))
+        self.assertEqual((60, 11), (by_name["midlevel"]["old"],
+                                    by_name["midlevel"]["new"]))
+        # 经验一分不动 —— 这一版的迁移口径就是「按经验重算，该降就降」。
+        self.assertEqual(29900, by_name["veteran"]["experience"])
+        self.assertEqual({"veteran": 24, "midlevel": 11, "fresh": 1},
+                         self.raw_levels())
+
+    def test_realign_flags_the_accounts_pinned_at_the_cap(self):
+        self.write_raw({
+            "whale": {"password": "p", "level": 4000, "experience": 400000},
+            "normal": {"password": "p", "level": 9, "experience": 29900},
+        })
+        changed = {row["username"]: row for row in
+                   AccountStore(self.path).realign_levels()}
+        self.assertEqual(LEVEL_MAX, changed["whale"]["new"])
+        self.assertTrue(changed["whale"]["capped"])
+        self.assertFalse(changed["normal"]["capped"])
+
+    def test_realign_is_idempotent_and_does_not_rewrite_the_file(self):
+        self.write_raw({"veteran": {"password": "p", "level": 300,
+                                    "experience": 29900}})
+        store = AccountStore(self.path)
+        self.assertTrue(store.realign_levels())
+        mtime = os.path.getmtime(self.path)
+        # ★ 跑第二遍必须什么都不改、也不写盘 —— 它每次启动都会跑。
+        self.assertEqual([], store.realign_levels())
+        self.assertEqual(mtime, os.path.getmtime(self.path))
+
+    def test_realign_survives_a_broken_level_field(self):
+        self.write_raw({
+            "broken": {"password": "p", "level": "x", "experience": 1200},
+            "junk": "not a dict",
+        })
+        changed = {row["username"]: row for row in
+                   AccountStore(self.path).realign_levels()}
+        self.assertEqual(5, changed["broken"]["new"])
+        self.assertNotIn("junk", changed)
 
     def test_new_account_default_level_unlocks_the_quest_list(self):
         # 闯关关卡记录的要求等级是 1；等级 0 会让任务下拉框整个空掉。

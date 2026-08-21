@@ -222,7 +222,7 @@
         <label for="up">密码</label>
         <input id="up" type="password" maxlength="32" autocomplete="off">
         <div class="hint">更新服务器上已有的存档时需要填入正确的用户名密码。若本服务器上没有保存过你的账号，则不需要填入。</div>
-        <div class="hint">手改存档时注意：等级由经验推算，把 <code>level</code> 改大会自动把 <code>experience</code> 补到那一级；想降级请把 <code>experience</code> 一起改小。</div>
+        <div class="hint">手改存档时注意：<b>等级说了算</b>。改 <code>level</code>（可以调大也可以调小，上限 60 级）会自动把 <code>experience</code> 重算成对应的值；<b>只改 <code>experience</code> 不改 <code>level</code> 是没用的</b>，经验最终由服务端按等级算。两个字段本来就对得上时（比如直接把导出的存档原样传回来），经验一分不动。</div>
 
         <button type="submit">存档上传</button>
         <div class="msg" id="ulMsg"></div>

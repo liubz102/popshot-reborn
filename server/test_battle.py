@@ -43,7 +43,7 @@ from gameserver import (                                       # noqa: E402
     build_change_controller_slot, build_game, take_frame, w_i32, w_wstr,
 )
 from lobby import (Lobby, MOVE_INTO_ALREADY_PLAYING,               # noqa: E402
-                   TEAM_LAYOUT_TEAMS)
+                   TEAM_A, TEAM_B, TEAM_LAYOUT_TEAMS)
 import relayserver                                                  # noqa: E402
 
 
@@ -223,6 +223,9 @@ class BattleRoom(unittest.TestCase):
     #: 房间描述符的参数。``None`` = 用 `create_session_payload` 的默认值。
     #: 对战房是 `(组队, 游戏模式, 道具模式)`，道具模式的用例靠它开关（§190）。
     arguments = None
+    #: 还要拉几个人进来（用户名列表，按顺序坐 2 号起）。默认只有 alice + bob；
+    #: 「2 打 1 的队伍总分」这类局面需要第三个人才造得出来（§226）。
+    extra_players = ()
 
     def setUp(self):
         self._saved_lobby = gameserver.LOBBY
@@ -246,6 +249,13 @@ class BattleRoom(unittest.TestCase):
         self.room = self.lobby.room_of(self.alice)
         gameserver.Conn.on_game_packet(self.bob, OP_MOVE_INTO_SESSION,
                                        move_into_payload(self.room.room_id))
+        self.members = [self.alice, self.bob]
+        for name in self.extra_players:
+            member = make_conn(name, self.accounts)
+            gameserver.Conn.on_game_packet(member, OP_MOVE_INTO_SESSION,
+                                           move_into_payload(self.room.room_id))
+            setattr(self, name, member)
+            self.members.append(member)
         self.start_battle()
         self.clear()
 
@@ -255,15 +265,15 @@ class BattleRoom(unittest.TestCase):
         gameserver.TCP_RELAY_ENABLED = self._saved_relay_enabled
 
     def start_battle(self):
-        """走完真正的开局链，让两个人都进 stage 7。"""
+        """走完真正的开局链，让**房里每个人**都进 stage 7。"""
         gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
         gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
-        gameserver.Conn.on_game_packet(self.alice, OP_LOADING_DONE, b"")
-        gameserver.Conn.on_game_packet(self.bob, OP_LOADING_DONE, b"")
+        for member in self.members:
+            gameserver.Conn.on_game_packet(member, OP_LOADING_DONE, b"")
 
     def clear(self):
-        self.alice.sent.clear()
-        self.bob.sent.clear()
+        for member in self.members:
+            member.sent.clear()
 
     @property
     def quest(self):
@@ -585,6 +595,66 @@ class ItemTests(BattleRoom):
                 self.alice, OP_GET_ITEM,
                 get_item_payload(handle=ITEM_HANDLE_BASE + i))
         self.assertEqual(3, opcodes(self.bob).count(OP_PICKED_ITEM))
+
+
+class CoinPickupTests(BattleRoom):
+    """★★ 地上捡到的金币要进结算（§230 / D152）。
+
+    客户端捡金币时**一分钱都不加**（`CoinItem1/5` 的 `vf_11c` 只播
+    `Item-EatCoin` 的音效），所以这一份必须由服务端记账、结算时发下去。
+    """
+
+    def drop(self, conn, item_id):
+        """客户端报一次掉落，返回服务端分配的句柄。"""
+        gameserver.Conn.on_game_packet(conn, OP_CREATE_ITEM,
+                                       create_item_payload(item_id=item_id))
+        body = bodies(conn, OP_CREATED_ITEM)[-1]
+        return struct.unpack_from("<I", body, 0)[0]
+
+    def pick(self, conn, seat, handle):
+        gameserver.Conn.on_game_packet(conn, OP_GET_ITEM,
+                                       get_item_payload(seat_id=seat,
+                                                        handle=handle))
+
+    def test_a_coin_is_credited_to_whoever_picked_it_up(self):
+        handle = self.drop(self.alice, 10101)
+        self.pick(self.bob, 1, handle)
+        self.assertEqual(0, self.quest.coins_of(0))
+        self.assertEqual(gameserver.coin_value(10101), self.quest.coins_of(1))
+
+    def test_the_five_coin_is_worth_more_than_the_one_coin(self):
+        # 面额只有类名这一个证据（CoinItem1 / CoinItem5），比例 1:5。
+        self.pick(self.alice, 0, self.drop(self.alice, 10101))
+        self.pick(self.alice, 0, self.drop(self.alice, 10102))
+        self.assertEqual(gameserver.coin_value(10101)
+                         + gameserver.coin_value(10102),
+                         self.quest.coins_of(0))
+        self.assertGreater(gameserver.coin_value(10102),
+                           gameserver.coin_value(10101))
+
+    def test_a_boss_coin_shower_adds_up(self):
+        for _ in range(20):
+            self.pick(self.alice, 0, self.drop(self.alice, 10102))
+        self.assertEqual(20 * gameserver.coin_value(10102),
+                         self.quest.coins_of(0))
+
+    def test_the_loser_of_the_arbitration_is_not_credited(self):
+        # ★ 同一件东西两个人几乎同时踩到 —— 只有仲裁赢的那个记账。
+        handle = self.drop(self.alice, 10102)
+        self.pick(self.bob, 1, handle)
+        self.pick(self.alice, 0, handle)
+        self.assertEqual(0, self.quest.coins_of(0))
+        self.assertEqual(gameserver.coin_value(10102), self.quest.coins_of(1))
+
+    def test_items_that_are_not_coins_credit_nothing(self):
+        for item_id in (10100, 10300, 10200):      # 红心 / 护盾 / 武器
+            self.pick(self.alice, 0, self.drop(self.alice, item_id))
+        self.assertEqual(0, self.quest.coins_of(0))
+
+    def test_an_unknown_handle_credits_nothing(self):
+        # 协议试探造的假句柄：`item_id_of` 是 None，别当成金币。
+        self.pick(self.alice, 0, ITEM_HANDLE_BASE + 999)
+        self.assertEqual(0, self.quest.coins_of(0))
 
 
 # ----------------------------------------------------------------------------
@@ -1278,6 +1348,11 @@ def end_game_seat(body):
     return struct.unpack_from("<i", body, 0)[0]
 
 
+def end_game_success(body):
+    """`0x0411` 的 `bool32 成功`（座位号之后那一个 int32）。"""
+    return bool(struct.unpack_from("<i", body, 4)[0])
+
+
 def end_game_score(body):
     """`0x0411` 里结算界面「分数」那一格（座位 + success 之后的 12 个业务值）。"""
     values = struct.unpack_from(
@@ -1362,16 +1437,62 @@ class QuestSettlementTests(BattleRoom):
         self.end(self.bob)
         self.assertEqual([], opcodes(self.alice))
         self.assertEqual([], opcodes(self.bob))
-        self.assertEqual(240, self.accounts.saved["alice"]["experience"])
+        exp, _money = gameserver.quest_reward(3, 1, 40, False)
+        self.assertEqual(200 + exp, self.accounts.saved["alice"]["experience"])
 
     def test_each_player_is_paid_their_own_score(self):
+        # ★★ 经验和金币不再等于分数（§227）：按「关卡 id × 难度」给基础奖励，
+        #    分数只做小幅加成，两者**各有各的系数**。房间是 (关卡 3, 难度 1)，
+        #    没通关（本例不调 clear_quest），所以基础部分打 QUEST_FAILED_RATIO 折。
         self.score(self.alice, 0, 40)
         self.score(self.bob, 1, 25)
         self.end()
-        self.assertEqual(200 + 40, self.accounts.saved["alice"]["experience"])
-        self.assertEqual(400 + 25, self.accounts.saved["bob"]["experience"])
-        self.assertEqual(10 + 40, self.accounts.saved["alice"]["money"])
-        self.assertEqual(20 + 25, self.accounts.saved["bob"]["money"])
+        alice_exp, alice_money = gameserver.quest_reward(3, 1, 40, False)
+        bob_exp, bob_money = gameserver.quest_reward(3, 1, 25, False)
+        self.assertEqual(200 + alice_exp, self.accounts.saved["alice"]["experience"])
+        self.assertEqual(400 + bob_exp, self.accounts.saved["bob"]["experience"])
+        self.assertEqual(10 + alice_money, self.accounts.saved["alice"]["money"])
+        self.assertEqual(20 + bob_money, self.accounts.saved["bob"]["money"])
+        # 打得多的人拿得多，但经验和金币是两个不同的数。
+        self.assertGreater(alice_exp, bob_exp)
+        self.assertNotEqual(alice_exp, alice_money)
+
+    def test_picked_coins_land_in_the_settlement_money(self):
+        """★★ 地上捡到的金币要加进「金币 +N」（§230 / D152）。
+
+        客户端捡金币时一分钱都不加，所以不加这一份的话，怪和 boss 掉的金币
+        对玩家来说等于不存在。
+        """
+        self.score(self.alice, 0, 40)
+        quest = self.alice.quest_state()
+        quest.add_coins(0, 250)
+        quest.add_coins(1, 10)
+        self.end()
+        base_exp, base_money = gameserver.quest_reward(3, 1, 40, False)
+        self.assertEqual(10 + base_money + 250,
+                         self.accounts.saved["alice"]["money"])
+        self.assertEqual(20 + base_money + 10,
+                         self.accounts.saved["bob"]["money"])
+        # 经验不吃金币 —— 那是两条独立的线。
+        self.assertEqual(200 + base_exp, self.accounts.saved["alice"]["experience"])
+
+    def test_the_result_screen_shows_the_coins_too(self):
+        # `0x0309` 的值 10 就是界面上那一行「金币 +N」，必须含捡到的那一份。
+        self.alice.quest_state().add_coins(0, 250)
+        self.end()
+        body = [b for b in bodies(self.alice, OP_REP_GAME_RESULT)
+                if result_seat(b) == 0][0]
+        values = struct.unpack_from(
+            f"<{gameserver.GAME_RESULT_VALUE_COUNT}i", body, 4)
+        _exp, base_money = gameserver.quest_reward(3, 1, 0, False)
+        self.assertEqual(base_money + 250,
+                         values[gameserver.GAME_RESULT_MONEY])
+
+    def test_money_no_longer_scales_with_the_score(self):
+        # ★ D152：金币 = 固定值 + 捡到的金币，**不吃分数加成**。
+        low, high = gameserver.quest_reward(3, 1, 0, True),             gameserver.quest_reward(3, 1, 5000, True)
+        self.assertEqual(low[1], high[1], "金币不该跟着分数走")
+        self.assertLess(low[0], high[0], "经验仍然该跟着分数走")
 
     def test_clearing_the_quest_marks_everyone_as_cleared(self):
         # 合作：关底是大家一起打的，脚本只在某一台机器上喊到也算全房间通关。
@@ -1422,14 +1543,29 @@ class PvpSettlementTests(BattleRoom):
             for body in bodies(conn, OP_REP_GAME_RESULT):
                 self.assertEqual(expected, result_tail(body))
 
-    def test_a_draw_makes_everyone_a_winner(self):
+    def test_a_draw_judges_nobody(self):
+        # ★ 照抄原版 `0x55c0bb`：**全员并列就一个都不判**（尾数组全 0 =
+        #   标签「未完成」+ 胜利曲）。以前我们判成「大家都赢」，
+        #   那是自己发明的口径（§226）。
         self.score(self.alice, 0, 30)
         self.score(self.bob, 1, 30)
         self.clear()
         gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
-        expected = [GAME_RESULT_CLEARED, GAME_RESULT_CLEARED] + [0] * 4
         body = bodies(self.alice, OP_REP_GAME_RESULT)[0]
-        self.assertEqual(expected, result_tail(body))
+        self.assertEqual([0] * GAME_RESULT_TAIL_COUNT, result_tail(body))
+
+    def test_fewer_deaths_breaks_a_tie_on_score(self):
+        # 原版的个人合成分是 `(分数 + 1) * 1000 - 死亡数`：分数一样时
+        # 死得少的赢，但死亡数永远翻不了分数的盘。
+        self.score(self.alice, 0, 30)
+        self.score(self.bob, 1, 30)
+        quest = self.alice.quest_state()
+        quest.deaths[1] = 2
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        body = bodies(self.alice, OP_REP_GAME_RESULT)[0]
+        self.assertEqual([GAME_RESULT_CLEARED, GAME_RESULT_DEFEATED] + [0] * 4,
+                         result_tail(body))
 
     def test_a_scoreless_round_judges_nobody(self):
         # 没打就散了。判谁输都是瞎判，两边都放失败曲更难看。
@@ -1437,10 +1573,135 @@ class PvpSettlementTests(BattleRoom):
         body = bodies(self.alice, OP_REP_GAME_RESULT)[0]
         self.assertEqual([0] * GAME_RESULT_TAIL_COUNT, result_tail(body))
 
+    def test_pvp_money_is_flat_but_still_picks_up_coins(self):
+        # ★ D152：对战的金币也不吃杀敌数（杀敌数就是对战的分数），
+        #   只剩「参战底薪 + 胜方加成」两个固定值，再加上地上捡到的。
+        #   经验仍然按杀敌数走。
+        self.assertEqual(gameserver.pvp_reward(0, True)[1],
+                         gameserver.pvp_reward(40, True)[1])
+        self.assertLess(gameserver.pvp_reward(0, True)[0],
+                        gameserver.pvp_reward(40, True)[0])
+        self.score(self.alice, 0, 40)
+        self.alice.quest_state().add_coins(0, 17)
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        win_exp, win_money = gameserver.pvp_reward(40, True)
+        self.assertEqual(10 + win_money + 17, self.accounts.saved["alice"]["money"])
+        self.assertEqual(200 + win_exp, self.accounts.saved["alice"]["experience"])
+
     def test_a_pvp_round_never_records_a_quest_clear(self):
         self.score(self.alice, 0, 40)
         gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
         self.assertEqual([], self.accounts.cleared)
+
+    def test_a_pvp_round_pays_by_kills_and_by_the_verdict(self):
+        # ★★ 对战的经验和金币也拆开了（§227）：底薪 + 每杀 + 胜方加成，
+        #    而不是「经验 = 金币 = 杀敌数」。
+        self.score(self.alice, 0, 40)
+        self.score(self.bob, 1, 25)
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        win_exp, win_money = gameserver.pvp_reward(40, True)
+        lose_exp, lose_money = gameserver.pvp_reward(25, False)
+        self.assertEqual(200 + win_exp, self.accounts.saved["alice"]["experience"])
+        self.assertEqual(400 + lose_exp, self.accounts.saved["bob"]["experience"])
+        self.assertEqual(10 + win_money, self.accounts.saved["alice"]["money"])
+        self.assertEqual(20 + lose_money, self.accounts.saved["bob"]["money"])
+        self.assertNotEqual(win_exp, win_money)
+        # 输了也有底薪，不会一分不给。
+        self.assertGreater(lose_exp, 0)
+        self.assertGreater(lose_money, 0)
+
+
+class TeamDeathmatchSettlementTests(BattleRoom):
+    """★★ 组队 + 夺分：**赢的那一队整队都「胜利」**（§226 / D147）。
+
+    用户 2026-08-20 实机报：组队夺分打完，结算界面上只有得分最高的**那一个人**
+    写着「胜利」，同队队友全是「败北」。根因是 `RoomQuest.ranking()` 连
+    `teams` 参数都没有 —— 生存那一路早就按队伍判了，夺分这一路漏了。
+
+    照抄的是客户端 `DeathMatchVictoryCondition` 虚表槽 14（`0x55bfda`）的
+    组队分支：比两队的合成分，高的整队 +1、低的整队 -1、平了谁都不判。
+    """
+
+    session_type = 1
+    arguments = (1, 3, 0)       # 组队战 + 夺分
+    #: ★ 三个人才造得出「个人最高分在人少的那一队」的局面 —— 两个人的话
+    #: 队伍总分恒等于个人分，根本区分不出这两套口径。
+    extra_players = ("carol",)
+
+    def score(self, conn, seat, value):
+        conn.my_seat = seat
+        gameserver.Conn.on_game_packet(conn, OP_UPDATE_QUEST_SCORE,
+                                       w_i32(value))
+
+    def seat_teams(self, teams):
+        """直接摆队伍号（默认按座位奇偶分，这里要能造出 2v1 之类的局面）。"""
+        for seat, team in teams.items():
+            self.room.seats[seat].team = team
+
+    def tail(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        return result_tail(bodies(self.alice, OP_REP_GAME_RESULT)[0])
+
+    def test_the_room_really_is_in_team_layout(self):
+        # 这一组用例的前提。分队口径不对的话下面全是空转。
+        self.assertEqual(TEAM_LAYOUT_TEAMS, self.room.team_layout())
+
+    def test_the_whole_winning_team_is_marked_as_a_winner(self):
+        # A 队 = 座位 0 + 2，B 队 = 座位 1。个人最高分（9）在 B 队，
+        # 但 A 队总分 5 + 6 = 11 更高 —— 判的是**队伍总分**。
+        self.seat_teams({0: TEAM_A, 1: TEAM_B, 2: TEAM_A})
+        self.score(self.alice, 0, 5)
+        self.score(self.bob, 1, 9)
+        self.score(self.carol, 2, 6)
+        self.assertEqual([GAME_RESULT_CLEARED, GAME_RESULT_DEFEATED,
+                          GAME_RESULT_CLEARED, 0, 0, 0], self.tail())
+
+    def test_the_top_individual_does_not_carry_a_losing_team(self):
+        # 反过来：alice 个人分最高（9），可她那一队只有她一个人，
+        # B 队 5 + 6 = 11 更高，于是**她输**。这一条正是和「最高分者所在队
+        # 获胜」那套口径分道扬镳的地方。
+        self.seat_teams({0: TEAM_A, 1: TEAM_B, 2: TEAM_B})
+        self.score(self.alice, 0, 9)
+        self.score(self.bob, 1, 5)
+        self.score(self.carol, 2, 6)
+        self.assertEqual([GAME_RESULT_DEFEATED, GAME_RESULT_CLEARED,
+                          GAME_RESULT_CLEARED, 0, 0, 0], self.tail())
+
+    def test_a_team_draw_judges_nobody(self):
+        self.seat_teams({0: TEAM_A, 1: TEAM_B, 2: TEAM_B})
+        self.score(self.alice, 0, 7)
+        self.score(self.bob, 1, 4)
+        self.score(self.carol, 2, 3)
+        self.assertEqual([0] * GAME_RESULT_TAIL_COUNT, self.tail())
+
+    def test_fewer_team_deaths_breaks_a_team_draw(self):
+        self.seat_teams({0: TEAM_A, 1: TEAM_B, 2: TEAM_B})
+        self.score(self.alice, 0, 7)
+        self.score(self.bob, 1, 4)
+        self.score(self.carol, 2, 3)
+        self.alice.quest_state().deaths[1] = 3
+        self.assertEqual([GAME_RESULT_CLEARED, GAME_RESULT_DEFEATED,
+                          GAME_RESULT_DEFEATED, 0, 0, 0], self.tail())
+
+    def test_everyone_on_the_only_team_wins(self):
+        # `0x55c594`：在座的人全同队 -> 没有对手，全员胜。
+        self.seat_teams({0: TEAM_A, 1: TEAM_A, 2: TEAM_A})
+        self.score(self.alice, 0, 7)
+        self.score(self.bob, 1, 2)
+        self.score(self.carol, 2, 0)
+        self.assertEqual([GAME_RESULT_CLEARED] * 3 + [0] * 3, self.tail())
+
+    def test_the_end_game_success_flag_follows_the_team_verdict(self):
+        # `0x0411` 的 success 跟着尾数组走，两个包不能自相矛盾 ——
+        # 否则队友那份写「胜利」标签、却放失败曲。
+        self.seat_teams({0: TEAM_A, 1: TEAM_B, 2: TEAM_A})
+        self.score(self.alice, 0, 9)
+        self.score(self.bob, 1, 2)
+        self.score(self.carol, 2, 0)
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        flags = {end_game_seat(b): end_game_success(b)
+                 for b in bodies(self.alice, OP_END_GAME)}
+        self.assertEqual({0: True, 1: False, 2: True}, flags)
 
 
 class PvpFinishTests(BattleRoom):
