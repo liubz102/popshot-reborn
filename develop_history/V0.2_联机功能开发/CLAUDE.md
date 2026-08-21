@@ -107,7 +107,7 @@ develop_history/V0.1_基础单机功能开发/.claude/sessions/        ← 会�
 | `runtime-linux/` | 服务端包发给 Linux 的那份 CPython 3.14.7，**故意不解压**（D088/D090）。打包时直接 copy，不联网 |
 | `logs/` | 抓包 / 调试日志 |
 | `dist/` | 打包产物（**客户端包 + 服务端包，两个**） |
-| `develop_history/` | 历史版本的进度文档（只读） |
+| `develop_history/` | **项目的连续开发记录，不是只读归档。** 每次代码变更 / 新发现都要按上面的「收工规则」同步更新当前版本的 `PROGRESS` / `FINDINGS` / `DECISIONS` / `sessions`；已经结束的旧版本只作参考 |
 
 ## 铁律
 

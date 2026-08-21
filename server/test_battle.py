@@ -598,10 +598,10 @@ class ItemTests(BattleRoom):
 
 
 class CoinPickupTests(BattleRoom):
-    """★★ 地上捡到的金币要进结算（§230 / D152）。
+    """★★ 地上捡到的金币要按客户端的 1 / 5 面额进结算。
 
-    客户端捡金币时**一分钱都不加**（`CoinItem1/5` 的 `vf_11c` 只播
-    `Item-EatCoin` 的音效），所以这一份必须由服务端记账、结算时发下去。
+    客户端会维护每个座位的本局金币累计值并弹浮字，但不会直接改大厅账户金币，
+    所以这一份仍须由服务端同步记账、结算时发下去。
     """
 
     def drop(self, conn, item_id):
@@ -622,21 +622,19 @@ class CoinPickupTests(BattleRoom):
         self.assertEqual(0, self.quest.coins_of(0))
         self.assertEqual(gameserver.coin_value(10101), self.quest.coins_of(1))
 
-    def test_the_five_coin_is_worth_more_than_the_one_coin(self):
-        # 面额只有类名这一个证据（CoinItem1 / CoinItem5），比例 1:5。
+    def test_coin_denominations_match_the_client_arithmetic(self):
+        # 两个 `vf_11c` 直接把常数 1 / 5 传给本局金币累计函数 `0x493d96`。
+        self.assertEqual(1, gameserver.coin_value(10101))
+        self.assertEqual(5, gameserver.coin_value(10102))
         self.pick(self.alice, 0, self.drop(self.alice, 10101))
         self.pick(self.alice, 0, self.drop(self.alice, 10102))
-        self.assertEqual(gameserver.coin_value(10101)
-                         + gameserver.coin_value(10102),
-                         self.quest.coins_of(0))
-        self.assertGreater(gameserver.coin_value(10102),
-                           gameserver.coin_value(10101))
+        self.assertEqual(6, self.quest.coins_of(0))
 
     def test_a_boss_coin_shower_adds_up(self):
+        # 通关撒币点 `0x4a5552` 硬编码的是 10101（CoinItem1），不是 10102。
         for _ in range(20):
-            self.pick(self.alice, 0, self.drop(self.alice, 10102))
-        self.assertEqual(20 * gameserver.coin_value(10102),
-                         self.quest.coins_of(0))
+            self.pick(self.alice, 0, self.drop(self.alice, 10101))
+        self.assertEqual(20, self.quest.coins_of(0))
 
     def test_the_loser_of_the_arbitration_is_not_credited(self):
         # ★ 同一件东西两个人几乎同时踩到 —— 只有仲裁赢的那个记账。
@@ -1458,10 +1456,10 @@ class QuestSettlementTests(BattleRoom):
         self.assertNotEqual(alice_exp, alice_money)
 
     def test_picked_coins_land_in_the_settlement_money(self):
-        """★★ 地上捡到的金币要加进「金币 +N」（§230 / D152）。
+        """★★ 地上捡到的金币要加进「金币 +N」。
 
-        客户端捡金币时一分钱都不加，所以不加这一份的话，怪和 boss 掉的金币
-        对玩家来说等于不存在。
+        客户端只累加本局浮字计数，不直接写账户金币；不加这一份的话，怪和 boss
+        掉的金币仍不会持久到账。
         """
         self.score(self.alice, 0, 40)
         quest = self.alice.quest_state()
