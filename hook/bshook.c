@@ -2356,9 +2356,14 @@ static void *s_snow_dec     = NULL;
 static volatile LONG g_snow_hooked = 0;
 static LONG g_key_n = 0, g_enc_n = 0, g_dec_n = 0;
 
+/* SNOW_LOG_MAX_CRYPT：逐包日志的条数上限。
+ * ★ bug调查/11 的教训：8000 条只够 ~16 分钟战斗（8Hz×每次 2 行），那局
+ *   打到 22:47 加密日志就停了，最后两局（正是出问题的两局）客户端侧一片
+ *   空白。提到 80000（约 160 分钟战斗）；debug 模式的日志文件会到 ~110MB，
+ *   排障时这比丢证据便宜。 */
 #define SNOW_MAX_LOG_BYTES 256
 #define SNOW_LOG_MAX_KEYS  4000
-#define SNOW_LOG_MAX_CRYPT 8000
+#define SNOW_LOG_MAX_CRYPT 80000
 
 static int try_hook_snow(void);
 
