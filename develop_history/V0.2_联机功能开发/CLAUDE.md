@@ -135,8 +135,13 @@ develop_history/V0.1_基础单机功能开发/.claude/sessions/        ← 会�
    含 `pause` 的 bat 这样非交互验证：`cmd --% /c D:\work\popshot\x.bat <nul`
 4. **客户端是 32 位。** 编译注入 DLL 必须用 x86 工具链
    （`C:\Program Files (x86)\Microsoft Visual Studio\2017\BuildTools\VC\Auxiliary\Build\vcvars32.bat`）。
-5. **不启动 `NMService.exe` / `BsPatcherChn.exe`。** 那是 Nexon 通行证和补丁器，
-   连的是早已停机的 `platform.tiancity.com`，游戏本体不需要。
+5. **不启动 `NMService.exe`；`BsPatcherChn.exe` 已不是 NGM（2026-08-22 起）。**
+   NMService 是 Nexon 通行证，连的是早已停机的 `platform.tiancity.com`，游戏
+   本体不需要，继续别碰。`game_patched\BsPatcherChn.exe` 从会话 46 起被替换成
+   **自研更新引导器**（`tools/updater/updater.c` 的编译产物）：客户端升级分支
+   拉起它、触发自动更新是预期行为，不再属于禁用项。原版 NGM 链
+   （BsPatcherChn→NGMDll→platform.tiancity.com）整条废弃，包里的
+   `NGMDll.dll` / `NGMResource.dll` 无人调用，只是没删。
 6. **GameGuard 绕过必须使用配套构建的 `bsloader.exe` + `bshook.dll`。**
    DLL 注册 VEH，等主线程退出 `LoadLibrary` APC 后给它设置 DR0；执行到 `0x54b0fc`
    时令 `EAX=0x755 / EIP+=5`。这条链靠命名事件握手，**两个二进制不能只替换一个**。

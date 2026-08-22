@@ -6386,3 +6386,169 @@ COIN_ITEM_VALUES = {10101: 1, 10102: 5}
   引用同步改掉；
 - 两套运行时全量各 **1020 项**全绿；两个包试打 + 冒烟自检通过；
 - `re/packet_api.md` §1.2 已按「协议改动必须同步」铁律更新。
+
+## 234. ★★★★★ 自动更新：接管客户端升级分支（V0.2 会话 46 / D155）
+
+**起点**：用户真机触发版本门禁拒绝（§233），观察到客户端弹「运行需要管理者
+权限」→ 确定后 BsPatcherChn.exe（原版 NGM）跑起来 →「patch中出错」。弹窗
+来源确认：NGMResource.dll 的 `TEMPLATE_CONFIRMRUNADMIN`（NGMDll 的 NeedAdmin
+流程），报错来自死链 `platform.tiancity.com`。
+
+### 一、升级分支的完整事实链（零改动接管的地基）
+
+- 客户端 `0x54dbf6`（虚表槽12）收到非零结果码 → 读 wstring → 升级分支 →
+  `CNMExecuteNGMPatcherFunc`（vftable `0x68fd14`）按 locale 拉起
+  `game_patched\BsPatcherChn.exe`，命令行模板（镜像字符串区 `0x292600`）：
+  `%s -mode:patch -procid:'%d' -patchurl:'%s' -patchdir:'%s' -patchcmd:'%s' -patchimg:'http://gamepopshot.tiancity.com/...' -use_local_dll`
+- **接管方式 = 原地替换这个 exe**：客户端拉起逻辑一行不改、bshook 零新 hook、
+  NGM 的强制 UAC 弹窗整条消失。原版 exe 留在 git 历史；它的 sha256
+  （`eb9f6600359c997ffe7f9d744affa1d158072b35eb3c4ed672a27caf64b8ca14`）
+  成为打包闸「还是不是原版」的识别基准。
+- **否掉「hook 改 URL 走原版 NGM」**（D155）：① bshook 在 BigShot.exe 进程
+  里，管不到独立的 BsPatcherChn.exe（要另做子进程注入或改盘上 NGMDll.dll
+  二进制）；② NGM 私有补丁协议（NGMResource.xml / .nxgz / .delta）项目零
+  逆向，服务器侧要从头实现未知格式；③ 原版 NGM 无条件要管理员 —— 用户
+  看到的那个弹窗就是它，2007 年 IE 控件 UI 在新系统上本就跑不稳。
+
+### 二、引导器（tools/updater/updater.c，约 200 行 Win32）
+
+只做三件事然后**立即退出**：定位包根（exe 在 `<root>\game_patched\`，上跳
+一级）→ 按 `launch.ps1` 同一套规则挑包内 Python（**RtlGetVersion**，不是
+GetVersionEx —— 后者受兼容性清单影响谎报 6.2；`POPSHOT_FORCE_LEGACY` 同样
+认）→ `CREATE_NEW_CONSOLE` 拉起 `python tools\update_client.py`。
+
+**★ 拉起后绝不等待任何进程（spawn + exit）**：若客户端在等引导器句柄、
+引导器又等游戏（-procid 语义），就凑出环了。等待、下载、应用全在 python
+侧，进度显示在 python 自己的控制台窗口里。参数只透传 `-procid`（原版给它
+包单引号：`-procid:'1234'`），其余 NGM 参数全部忽略。
+
+### 三、探针 = 重演一次握手（机器读的协议）
+
+`update_client.probe_server`：连 `server_address:27799` → 发
+`SimpleCipher.client_to_server().encrypt(int32 本地wire)` → 收密文用
+`server_to_client()` 解出 0xFE 帧 → 结果码 0 = 已最新；非零则从 wstr 里按
+`[vV]数字.数字[.数字]` 抠「服务器要求的版本」。**服务器侧配合改动**：
+`gameserver.version_reject_message()` 运行时构造，带**服务器自身版本**
+（`versioning.load_own_version()` 读包根 BUILD.ver；JSON 解析 + bshook 式
+`"version"` 扫描兜底；mtime+size 缓存同 load_client_filter）。这句话因此
+是**协议的一部分**（packet_api.md §1.2 / test_update 钉住格式）：成对发布
+（D079）的客户端/服务器靠它对准批次 —— 第三方开旧批次服时，玩家不会被
+「更新过头」。探针连接会正常记进 online.log（和真实客户端一样）。
+★ 版本语义用户钉死（会话 46 补充确认）：文案带的是**服务器自身版本**，
+**不是**门禁最低版本 —— 例：服务器 0.2.15 / ClientFilter 最低 0.2.10 /
+客户端 0.2.7 被拒，解析到 0.2.15（升到与服务器同批次），test_update 的
+`test_own_version_not_filter_minimum` 用两份真实配置文件钉住这一点。
+
+### 四、应用与安全边界（update_client.py，仅 stdlib）
+
+- **BUILD.ver 最后写 = 提交点**：中途任何失败（断电/坏包/权限）BUILD.ver
+  不动，下次重跑按旧版本号重新走全流程，覆盖写天然幂等。
+- **自动停本机服务端/中继（会话 46 补充，用户要求）**：本机服务端
+  （app.py）和中继（relay.py）由启动脚本用 `<root>\runtime*\python\python.exe`
+  拉起 —— 不锁游戏文件，但**锁着 runtime 里的 python.exe 自己**，更新覆盖
+  runtime 时必被卡死。`stop_package_pythons()` 在等游戏退出后执行：按
+  「exe 完整路径 == 本包 runtime（runtime / runtime-win7 两份）」精确匹配
+  （`QueryFullProcessImageNameW` 取路径），taskkill 后等退出；别的 python
+  （其他游戏副本 / 开发环境）一个不碰 —— launch.ps1「绝不乱杀 python」的
+  同一条纪律。更新器自己也是从这份 python 跑的：排除自身 PID，自己脚下
+  的占用交给下面的改名大法。
+- **改名大法（会话 46 补充，修真 bug）**：正在运行的 exe 不许删/覆盖，但
+  **允许改名** —— `copy_with_retry` 对 PermissionError 重试几次不过后，把
+  旧文件改名为 `xxx.update_old` 让位、新文件落原名，旧进程继续从改名后的
+  映像跑完退出。最典型场景就是更新器自己脚下的 `runtime\python\python.exe`
+  （靠等是等不到的，进程要活到更新结束）。遗留的 `.update_old` 由下次
+  更新开头的 `sweep_update_old` 扫掉（logs/ 等保护目录不进）。
+- **玩家数据双层保护**：打包侧（build-portable 本来就不把 accounts/logs/
+  Dump/Debug/rpt 打进 zip）+ 应用侧 `PROTECTED_PATHS` 兜底（含
+  `server.config`、`UserConfig.ini` —— 用户拍板：打包带模板、更新不覆盖）。
+  注意生效时机：执行更新的是**旧包**的脚本，应用侧清单改动隔一代生效，
+  所以主保护必须在打包侧。
+- **提权**：下载完成**之后**才试探包根写权限，不可写才 `ShellExecuteW
+  (runas)` 自提权重跑（唯一一次 UAC），`--zip` 把已下的包传给提权进程，
+  不重复下 400MB；拒绝提权 → Release 页手动下载地址。依据：原版客户端
+  登录成功就要写 UserConfig.ini，目录不可写的玩家现在就已经玩不正常。
+- **单实例锁**（logs\update.lock，O_EXCL + 10 分钟陈旧抢占）、staging 建
+  在**包根同盘**（os.replace 跨盘报 WinError 17）、被占文件 20×0.25s 重试
+  （bsloader/bshook 在游戏退出后零点几秒才放句柄）。
+
+### 五、manifest 与发版（tools/update_manifest.py + update-manifest.json）
+
+- 固定入口 `releases/latest/download/manifest.json`（GitHub 最新正式
+  Release 的资产）；**全部历史版本都留在列表**（按服务器点名版本取包的
+  前提）。URL 规则（用户钉死）：tag **保留点号**（`V0.2.7`），文件名点转
+  横杠（`PopShot-portable-win64_V0-2-7.zip`）。
+- **幂等是硬要求**（开发期同版本反复重打包）：同版本**原位替换**（刷新
+  url/size/sha256/date，保留手写 notes），新版本前插。母本
+  `tools/update-manifest.json` 进 git，dist 放副本供直接上传。
+- 下载按 sha256 缓存复用（`%TEMP%\popshot-update-<版本>.zip`）：下到一半
+  断掉/提权重跑/再点一次，都接着用已完整校验过的那份。
+
+### 六、落地与验证
+
+- `server/test_update.py` 38 项：探针（**真 socket + 真 SimpleCipher 加密
+  流**，服务端看到的版本号解码正确）、拒绝文案锚点、manifest 结构/选目标/
+  幂等合并、下载校验（file:// 本地测，不碰网络）、玩家数据保护（伪装路径
+  也拦）、BUILD.ver 提交点（坏 zip/缺 BUILD.ver 均不动版本号）、提权参数、
+  单实例锁（含陈旧抢占）；
+- 两套运行时全量各 **1058 项**全绿（原 1020 + 38；会话 46 补丁又加 4 项：
+  版本语义钉死 / runtime 路径匹配 / 只读目标覆盖 / .update_old 清扫）；
+- 0.2.7 成对重打：buildId `20260822-162358` 两包一致、serverCodeHash 一致、
+  包内引导器 sha256 与 `game_patched` 相同（`9a509d87…`）、manifest 与新
+  zip 哈希核对、两包冒烟自检全过；
+- 文档同步：README「自动更新」一节、packet_api.md §1.2（拒绝文案/升级分支
+  补注）、两版 CLAUDE.md 铁律 5 改写（BsPatcherChn.exe 不再是禁用项）。
+
+### 七、已知边界
+
+- 0.2.6 及更早的包（BsPatcherChn.exe 还是原版 NGM）：无法自动更新，最后一次
+  手动下载（待验证表第 55 条）；
+- 下载 GitHub 直连在国内的速度看运气；`MANIFEST_URLS` 是有序列表常量，要加
+  ghproxy 类镜像前缀改一行代码即可（v1 未加）；
+- 不做断点续传/增量（用户拍板从简）。
+
+### 八、真机闪退排查与会话 46 补丁二（17:19 用户复测）
+
+- **证据链**：本机服务器 online.log 有 `✗ 版本门禁 拒绝 客户端版本=V0.2.6`；
+  bshook 日志到 `process detach` 为止、**无任何 ★SHELL / 弹框记录**；
+  `logs\updater.log` 一行都没有 ⇒ 客户端 CreateProcess 拉起引导器这一步
+  被系统拒绝（首跑新编译未签名 exe 被杀软拦 —— 排查者自己第一次从 bash
+  运行同样吃了 Permission denied，第二次放行）。客户端对失败不吭声直接
+  退出 = 玩家看到的「闪退无提示」。手动跑引导器则全链正常（日志齐全，
+  停在 404 错误提示等输入）。
+- **修复三层**：①update_client.py 全出口 `hold()` 留窗 + `__main__`
+  兜底捕获一切异常（traceback 上屏 + 写 update.log + 留窗）+ 导入失败
+  友好提示 + 全程打印正在连接的 URL；②updater.c 经
+  `cmd /s /c "title … & <python> <script> & pause"` 拉起 —— cmd 拥有
+  控制台，**任何退出方式窗口都停在 pause**，永不秒关；③bshook.c 钩
+  CreateProcessW/A + WinExec：★PROC 日志 + **拉 BsPatcher 失败时由游戏
+  进程弹框**（错误码 + 三条出路）—— 更新器被杀软拦时只有它能开口。
+- **构建侧备忘**：无控制台环境调 hook\build.bat 会对 bsloader.c 报
+  C4819/C4474（历史病症状），字节级核对产物无损 —— 噪音；新代码入包以
+  二进制探测为准（★PROC 等窄串直接搜字节、L"…" 宽串要按 UTF-16LE 搜）。
+
+### 九、UAC「安装程序检测」——闪退的最终根因与会话 46 补丁三
+
+- **根因（17:5x 用户复测 + 新 ★PROC 钩子弹框实锤）**：exe 文件名含
+  "Patcher"，命中 Windows UAC **安装程序检测启发式**——没有内嵌 manifest
+  声明 requestedExecutionLevel 的 exe 被当作安装器**自动要求管理员**：
+  客户端 CreateProcess 直接失败（ERROR_ELEVATION_REQUIRED → 玩家看到
+  「闪退无提示」），手动双击直接弹 UAC。原版 NGM 带 manifest 所以当年
+  没事。此前怀疑的「杀软首跑拦截」是伴生现象/误判，真凶是这个名字。
+- **修复 = 仿原版交互（用户拍板）**：
+  1. `updater.manifest`（asInvoker）+ `updater.rc`（VERSIONINFO 中文名
+     「炮炮火枪手 自动更新」，UAC 框/任务管理器显示用）嵌入 exe
+     （`/MANIFEST:EMBED /MANIFESTINPUT` + rc → .res；mt.exe
+     -inputresource 验证过 RT_MANIFEST #1 真在）→ UAC 启发式失效，
+     回到「静默启动、提权我们自己问」；
+  2. 引导器先弹「游戏需要更新。自动更新需要管理员权限，是否允许？」
+     （是 → runas **重跑自己**——UAC 显示的是带中文名的本程序而不是
+     「Windows 命令处理程序」；否 → 安静退出）；
+  3. UAC 上点「否」（ShellExecuteW 返回 5 = SE_ERR_ACCESSDENIED）也按
+     「取消 = 直接退出」处理，不再弹其它框；
+  4. 提权实例直接拉 cmd+python 工作进程（继承管理员），python 侧
+     root_is_writable 恒真 → 原 runas 二次提权路径成为纯兜底；
+  5. 重启游戏经 explorer.exe 转手**拿回普通权限**（提权进程直接
+     startfile 会把管理员传染给游戏；转不动则照原版 NGM 的做法直接
+     启动——原版那些年就是提权重启的）；
+  6. `POPSHOT_UPDATER_NOUI=1` 测试钩子：跳过询问与提权直接拉工作进程
+     （无头环境 MessageBox 会永远挂着）。

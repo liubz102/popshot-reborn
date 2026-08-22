@@ -829,6 +829,138 @@ static void install_shell_hooks(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* CreateProcess / WinExec 钩子（V0.2 自动更新）                               */
+/*                                                                            */
+/* 客户端的升级分支（0x54dbf6 收到拒绝后）拉起更新引导器                      */
+/* game_patched\BsPatcherChn.exe（我们的 updater.c，见 tools/updater.c）。     */
+/* 它的命令行模板是一整条字符串（"-mode:patch -procid:'%d' …"，V0.1 §14），  */
+/* 像是 CreateProcess / WinExec 的用法 —— 三个入口都挂上。                    */
+/*                                                                            */
+/* 2026-08-22 真机踩坑：新编译的未签名 exe 首次运行可能被杀软拦下，            */
+/* CreateProcess 直接失败 —— 客户端对失败一声不吭就退出，玩家看到的是         */
+/* 「点了登录、窗口全没了、什么提示都没有」。钩在这里做两件事：               */
+/*   1. ★PROC 日志：客户端起的每个进程都记下来（对逆向也有价值）；            */
+/*   2. 拉的是 BsPatcher 且失败时，由【游戏进程】自己弹框告诉玩家发生了       */
+/*      什么、该怎么办 —— 更新器自己被拦的时候没有机会开口。                  */
+/* 成功路径一个字节的行为都不改（原样调回真函数）。                           */
+/* -------------------------------------------------------------------------- */
+typedef BOOL (WINAPI *CreateProcessW_t)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
+                                        LPSECURITY_ATTRIBUTES, BOOL, DWORD,
+                                        LPVOID, LPCWSTR, LPSTARTUPINFOW,
+                                        LPPROCESS_INFORMATION);
+typedef BOOL (WINAPI *CreateProcessA_t)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES,
+                                        LPSECURITY_ATTRIBUTES, BOOL, DWORD,
+                                        LPVOID, LPCSTR, LPSTARTUPINFOA,
+                                        LPPROCESS_INFORMATION);
+typedef UINT (WINAPI *WinExec_t)(LPCSTR, UINT);
+static CreateProcessW_t s_CreateProcessW = NULL;
+static CreateProcessA_t s_CreateProcessA = NULL;
+static WinExec_t s_WinExec = NULL;
+
+static int is_patcher_w(const wchar_t *app, const wchar_t *cmd)
+{
+    if ((app && wcsstr(app, L"BsPatcher")) || (cmd && wcsstr(cmd, L"BsPatcher")))
+        return 1;
+    return 0;
+}
+
+static void warn_patcher_launch_failed(DWORD err)
+{
+    wchar_t text[1024];
+    _snwprintf(text, 1024,
+        L"自动更新程序启动失败（错误码 %lu，多半是杀毒软件把新更新的"
+        L" BsPatcherChn.exe 拦下了）。\n\n"
+        L"可以：\n"
+        L"  1. 手动双击 game_patched\\BsPatcherChn.exe 再试；\n"
+        L"  2. 把游戏目录加进杀毒软件白名单；\n"
+        L"  3. 或手动下载完整客户端(QQ群文件或Github)：\n"
+        L"https://github.com/liubz102/popshot-reborn/releases",
+        (unsigned long)err);
+    text[1023] = 0;
+    MessageBoxW(NULL, text, L"自动更新", MB_ICONWARNING | MB_OK);
+}
+
+static BOOL WINAPI det_CreateProcessW(LPCWSTR app, LPWSTR cmd,
+                                      LPSECURITY_ATTRIBUTES pa,
+                                      LPSECURITY_ATTRIBUTES ta, BOOL inherit,
+                                      DWORD flags, LPVOID env, LPCWSTR dir,
+                                      LPSTARTUPINFOW si,
+                                      LPPROCESS_INFORMATION pi)
+{
+    BOOL ok = s_CreateProcessW(app, cmd, pa, ta, inherit, flags, env,
+                               dir, si, pi);
+    char u8a[1536], u8c[1536];
+    bslog("★PROC CreateProcessW(app=\"%s\" cmd=\"%s\") -> %s",
+          w2u8(app ? app : L"(null)", u8a, sizeof(u8a)),
+          w2u8(cmd ? cmd : L"(null)", u8c, sizeof(u8c)),
+          ok ? "ok" : "FAIL");
+    if (!ok && is_patcher_w(app, cmd)) {
+        bslog("★PROC 更新引导器拉起失败（err=%lu）—— 弹框告知玩家",
+              (unsigned long)GetLastError());
+        warn_patcher_launch_failed(GetLastError());
+    }
+    return ok;
+}
+
+static BOOL WINAPI det_CreateProcessA(LPCSTR app, LPSTR cmd,
+                                      LPSECURITY_ATTRIBUTES pa,
+                                      LPSECURITY_ATTRIBUTES ta, BOOL inherit,
+                                      DWORD flags, LPVOID env, LPCSTR dir,
+                                      LPSTARTUPINFOA si,
+                                      LPPROCESS_INFORMATION pi)
+{
+    wchar_t wapp[512], wcmd[1024];
+    BOOL ok = s_CreateProcessA(app, cmd, pa, ta, inherit, flags, env,
+                               dir, si, pi);
+    bslog("★PROC CreateProcessA(app=\"%s\" cmd=\"%s\") -> %s",
+          app ? app : "(null)", cmd ? cmd : "(null)", ok ? "ok" : "FAIL");
+    if (app) { MultiByteToWideChar(CP_ACP, 0, app, -1, wapp, 512); wapp[511] = 0; }
+    else wapp[0] = 0;
+    if (cmd) { MultiByteToWideChar(CP_ACP, 0, cmd, -1, wcmd, 1024); wcmd[1023] = 0; }
+    else wcmd[0] = 0;
+    if (!ok && is_patcher_w(wapp, wcmd)) {
+        bslog("★PROC 更新引导器拉起失败（err=%lu）—— 弹框告知玩家",
+              (unsigned long)GetLastError());
+        warn_patcher_launch_failed(GetLastError());
+    }
+    return ok;
+}
+
+static UINT WINAPI det_WinExec(LPCSTR cmd, UINT show)
+{
+    UINT rc = s_WinExec(cmd, show);
+    bslog("★PROC WinExec(cmd=\"%s\") -> %u", cmd ? cmd : "(null)", rc);
+    if (rc < 32) {                              /* <32 = 失败（WinExec 语义） */
+        wchar_t wcmd[1024];
+        if (cmd) { MultiByteToWideChar(CP_ACP, 0, cmd, -1, wcmd, 1024); wcmd[1023] = 0; }
+        else wcmd[0] = 0;
+        if (is_patcher_w(NULL, wcmd)) {
+            bslog("★PROC 更新引导器拉起失败（WinExec rc=%u）—— 弹框告知玩家", rc);
+            warn_patcher_launch_failed(rc);
+        }
+    }
+    return rc;
+}
+
+/* kernel32 常驻必有（本 DLL 的所有 import 都靠它），不像 shell32 要等加载。 */
+static void install_process_hooks(void)
+{
+    HMODULE k32;
+    if (s_CreateProcessW) return;                /* 已装 */
+    k32 = GetModuleHandleA("kernel32.dll");
+    if (!k32) return;
+    s_CreateProcessW = (CreateProcessW_t)install_inline_hook(
+        (void *)GetProcAddress(k32, "CreateProcessW"),
+        (void *)det_CreateProcessW, "CreateProcessW");
+    s_CreateProcessA = (CreateProcessA_t)install_inline_hook(
+        (void *)GetProcAddress(k32, "CreateProcessA"),
+        (void *)det_CreateProcessA, "CreateProcessA");
+    s_WinExec = (WinExec_t)install_inline_hook(
+        (void *)GetProcAddress(k32, "WinExec"),
+        (void *)det_WinExec, "WinExec");
+}
+
+/* -------------------------------------------------------------------------- */
 /* 注册链接的点击：**客户端自己根本处理不了**，我们接管                        */
 /*                                                                            */
 /* 实测（V0.2 里程碑 H）：id=1010 那条 Static **没有 SS_NOTIFY** ——           */
@@ -3339,6 +3471,7 @@ static DWORD WINAPI watch_thread(LPVOID param)
     while (!g_stop) {
         if (!g_hooks_installed) install_hooks();
         install_shell_hooks();   /* shell32 是后加载的，装上为止每轮试一次 */
+        install_process_hooks(); /* CreateProcess/WinExec：升级分支拉起更新器 */
         report_gameguard_breakpoint();
         poll_modules();
         EnumWindows(dump_window, 0);

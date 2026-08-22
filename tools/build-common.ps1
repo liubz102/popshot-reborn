@@ -41,6 +41,43 @@ function New-BuildId {
     return (Get-Date -Format 'yyyyMMdd-HHmmss')
 }
 
+# ---------------------------------------------------------------------------
+#  自动更新引导器（game_patched\BsPatcherChn.exe）
+# ---------------------------------------------------------------------------
+
+# 原版 NGM 引导器（Nexon Game Manager bootstrap，整条链指向停机多年的
+# platform.tiancity.com）的 sha256。打包时用它识别「还是原版」——那种包
+# 发出去，旧客户端被版本门禁拒绝后只会看到 NGM 的死链报错。
+$script:OriginalNGMStubSha256 = 'EB9F6600359C997FFE7F9D744AFFA1D158072B35EB3C4ED672A27CAF64B8CA14'
+
+function Assert-UpdaterStub {
+    <# game_patched\BsPatcherChn.exe 必须是**我们的更新引导器**
+       （tools\updater\updater.c 的编译产物，客户端升级分支拉起的就是它，
+       由它转手拉起 tools\update_client.py 完成自动更新），不能还是原版 NGM。
+
+       判据 = sha256。还是原版时先现场重编一次（tools\updater\build.bat，
+       vcvars32 工具链同 hook），编不过 / 编完还是原版才 throw ——
+       编译机就是打包机，「忘了编」不配当打包失败的理由。 #>
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $exe = Join-Path $Root 'game_patched\BsPatcherChn.exe'
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        throw "缺少 game_patched\BsPatcherChn.exe —— 更新引导器（tools\updater）还没就位"
+    }
+    $sha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+    if ($sha -ne $script:OriginalNGMStubSha256) { return }    # 已是我们的
+
+    Write-Host '  game_patched\BsPatcherChn.exe 还是原版 NGM —— 现场重编更新引导器…' -ForegroundColor Yellow
+    & (Join-Path $Root 'tools\updater\build.bat')
+    if ($LASTEXITCODE -ne 0) {
+        throw "tools\updater\build.bat 编译失败 —— 客户端包必须带自研更新引导器（详见该脚本输出）"
+    }
+    $sha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+    if ($sha -eq $script:OriginalNGMStubSha256) {
+        throw "重编之后 BsPatcherChn.exe 仍是原版 NGM —— 查 tools\updater\build.bat 的拷贝步骤"
+    }
+    Write-Host '  更新引导器已重编并就位' -ForegroundColor Green
+}
+
 function Get-BuildVersion {
     <# 读 tools\build-ver.config 里的**复活项目版本号**（发版前手动改的那个文件）。
 

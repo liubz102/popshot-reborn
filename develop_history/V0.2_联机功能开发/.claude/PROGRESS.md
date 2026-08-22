@@ -28,6 +28,36 @@ Python 已内置在 `runtime\python`，目标电脑不需要安装 Python。
 
 ## 当前位置
 
+**会话 46（2026-08-22）—— 自动更新：接管升级分支，旧客户端被拒后全自动升级（§234 / D155）。
+动机：用户真机触发门禁拒绝，客户端拉起原版 BsPatcherChn.exe（NGM）连死链报「patch中出错」。**
+
+| 环节 | 文件 | 行为 |
+|---|---|---|
+| 接管 | `tools/updater/updater.c` + `build.bat` | **替换 `game_patched\BsPatcherChn.exe`** 为自研引导器（MSVC x86 同 hook 工具链）：定位包根→按系统版本挑包内 Python（同 launch.ps1 规则，认 POPSHOT_FORCE_LEGACY）→新控制台拉起 `tools\update_client.py` 后**立即退出**（不等待任何进程，防死锁）；产物入 git，原版 exe 留在 git 历史（sha256 `eb9f66…` 作识别基准，打包闸 Assert-UpdaterStub 用它拦「还是原版」） |
+| 主逻辑 | `tools/update_client.py` | ①探针：连 `server_address:27799` 重演握手（SimpleCipher 加密流真帧），从拒绝文案解析「服务器要求的版本」（成对发布对准批次；连不上→升 GitHub 最新）②取 `releases/latest/download/manifest.json` ③下载全量 zip（进度/速度/ETA，按 sha256 缓存复用）④等 BigShot.exe 退出（-procid+进程名快照，超时提示后 taskkill）⑤写权限试探，不行才 runas 提权重跑一次 UAC（--zip 传已下的包不重下）⑥解压覆盖（`PROTECTED_PATHS` 玩家数据永不覆盖：server.config/UserConfig.ini/accounts/日志/转储）⑦**BUILD.ver 最后写**（提交点，失败重跑幂等）⑧提示一键 start.bat 重启 |
+| 服务器 | `gameserver.py` + `versioning.py` | 拒绝文案改为运行时构造**携带服务器自身版本**（`versioning.load_own_version()` 读包根 BUILD.ver，JSON 解析+bshook 式扫描兜底，mtime 缓存）—— 这句话是**给机器读的协议**，探针按 `[vV]数字.数字[.数字]` 抠版本 |
+| manifest | `tools/update_manifest.py` + `tools/update-manifest.json` | 打包后幂等更新发版清单母本（**同版本原位替换**、保留手写 notes；新版本前插），dist 放 `manifest.json` 副本供挂 Release。URL 规则（用户钉死）：tag 带点 `V0.2.7`、文件名点转横杠 `V0-2-7` |
+| 打包 | `build-common.ps1` / `build-portable.ps1` | 环境闸加 Assert-UpdaterStub + update_client.py 必在；`-Zip` 后自动生成 manifest |
+
+**用户拍板（D155）**：只用 GitHub 托管；只做全量（约 410MB，不做增量）；
+**不做启动时检查**（只有「服务器拒绝→更新器」一条触发路径）；
+manifest 地址硬编码 `update_client.py` 常量（不加配置文件）；
+更新时跳过 `UserConfig.ini` 和 `server.config`（打包仍带模板）；
+随 0.2.7 重打（不升 0.2.8）。**否掉「原版 BsPatcherChn + hook 改 URL」**：
+bshook 管不到子进程、NGM 协议零逆向、原版本就强制 UAC。
+
+**验证**：两套运行时全量各 **1054 项**全绿（新增 test_update 34 项：探针真
+socket 加密握手 / manifest 幂等 / 玩家数据保护 / BUILD.ver 提交点 / 坏包
+中止）；0.2.7 两个包成对重打成功（buildId `20260822-162358`、serverCodeHash
+一致、冒烟自检全过、manifest 与 zip 哈希核对）。
+
+⇒ **下一步：⏳ 待验证表第 53~55 条**（真机：GitHub 传 Release 后整链自动
+更新 / 提权流程 / 0.2.6 旧包用户的手动下载引导）。**发版 checklist**：
+GitHub 建 Release（tag `V0.2.7`）挂 `PopShot-portable-win64_V0-2-7.zip` +
+`manifest.json` 两个资产 → 换服务器包 → 群公告让 0.2.6 旧包用户最后手动下一次。
+
+---
+
 **会话 45（2026-08-22）—— 版本号管理 + 最低客户端版本门禁（§233 / D154）。
 动机：拿到玩家 log 却不知道他跑的是哪个版本，问一圈才发现是旧包。**
 
@@ -1795,6 +1825,9 @@ J 原本是整个 V0.2 最大的风险（PLAN 写着「唯一有真实失败风�
 | 50 | ★★★ **版本上报 + 升级弹框（§233 / D154，要重打客户端包）**。① 用**新打的客户端包**（目录名带 `_V0-2-7`）正常登录进大厅；② 把客户端包根的 `BUILD.ver` 改名（如 `BUILD.ver.bak`）再启动一次，登录时用那台机器连**同一台服务器** | ① 客户端 `logs\bshook_*.log` 里有一行 `PATCH BUILD.ver 版本 V0.2.7 -> 握手版本号 2007` 和一行 `★握手版本号 @ 0054D98F: 311 -> 2007`；服务端 `logs\online.log` 里每次登录都有一行 `+ 版本上报 ip=… 客户端版本=V0.2.7`；② 改名后 bshook 日志打「没有可用的 BUILD.ver……按原版 311 上报」，登录时应被服务器拒绝并**弹出客户端自带的升级/报错提示框**，`online.log` 里是 `✗ 版本门禁 拒绝 ip=… 客户端版本=旧版(未上报版本) 最低要求=V0.2.7` | **待用户**。★ 服务端行为已被 8 条新回归钉死（拒绝/放行/兜底/热重载）；**没验的是真客户端那个「非零结果码 + 字符串」弹框分支长什么样** —— 逆向只到「再读一个 wstring + GetComputerName + 弹框」（packet_api.md §1.2），从未真机触发过。若弹框不出现或样子不对，把 bshook 日志发回来调文案/结果码；兜底层已保证旧客户端**一定进不了大厅** |
 | 51 | ★ **门禁热重载（§233 / D154）**。服务器跑着不动，把包根 `server-ClientFilter.config` 的 `0.2.7` 改成 `0`，再用第 50 条 ② 那个没有 BUILD.ver 的客户端登录 | **不用重启服务器**，下一条连接就放行了：`online.log` 出现 `+ 版本上报 … 客户端版本=旧版(未上报版本)` 且不再有 `✗ 版本门禁`；客户端正常进大厅。改回 `0.2.7` 再登一次，又会被拒 | **待用户**。行为已被 test_versioning 的热重载用例覆盖，这里只验「真服务器进程 + 真文件」场景 |
 | 52 | ★ **版本号进成果物名（§233 / D154）**。跑一次 `tools\build.bat`（菜单随便选一项），看 `dist\` | 产出目录和压缩包名都带版本后缀：`PopShot-portable-win64_V0-2-7(.zip)`、`PopShot-server_V0-2-7(.zip/.tar.gz)`；包根有 `BUILD.ver`（JSON，第一行 `"version": "V0.2.7"`）和 `server-ClientFilter.config`，**没有 BUILD.txt**；菜单开头先打一行「本次打包版本：V0.2.7」 | ✅ **agent 已试打两个包验证过**（2026-08-22，冒烟自检全过）；留这条给用户在真发版时顺手确认 |
+| 53 | ★★★ **自动更新整链（§234 / D155，要先把 0.2.7 传上 GitHub Release）**。前置：GitHub 建 Release（tag `V0.2.7`，资产挂 `PopShot-portable-win64_V0-2-7.zip` + `manifest.json`）+ 部署新服务端包。然后拿一个**旧版本客户端包**（或把新包根 `BUILD.ver` 的版本号改小）登录 | 被拒 → 客户端弹框 → 点确定后**不再出现** NGM 的「运行需要管理者权限」/「patch中出错」，而是我们更新器的黑控制台：本地版本→探针（服务器要求的版本）→下载进度（约 410MB，可看速度/ETA）→ 应用 → 提示重启 → start.bat 拉起后正常登录进大厅；`logs\updater.log` 有 start/spawn 两行、`logs\update.log` 有 run/probe/zip ready/applied 四行 | **待用户**。链路上机器可测的部分（探针加解密、manifest 幂等、玩家数据保护、坏包中止）已被 test_update 34 项钉死；**没验的是真机全链**：GitHub 直连下载速度、弹框实际长相（第 50 条同款未知）、重启后 BUILD.ver 新值上报 |
+| 54 | ★ **更新器提权流程（§234 / D155）**。把客户端包拷进一个无写权限的目录（如 `C:\Program Files\popshot`）再触发更新 | 控制台提示「没有写权限，请求管理员身份」→ **弹一次 UAC**（确定后新管理员窗口接着干活，不重复下载）→ 应用完成 → 用 start.bat 重启后游戏**不以管理员运行**；点「否」拒绝 UAC 则给出 GitHub Release 手动下载地址退出 | **待用户**。提权分支只在目录不可写时出现（正常目录全程无 UAC）；参数构造已被 test_update 钉住 |
+| 55 | ★ **0.2.6 旧包用户的引导（§234 / D155）**。拿 V0.2.6 旧包连新服务器 | 走的还是原版 NGM：弹「运行需要管理者权限」→「patch中出错」（死链，**预期内**，这批用户需要最后一次手动下载带更新器的 0.2.7；群公告 + 拒绝文案里的 Release 页地址）| **待用户**。旧包没有我们的引导器，帮不了；确认现象与预期一致即可 |
 
 ### ✅ J.2 已拍板：**原版的连接方式和回退方式全部原样还原**（D078）
 

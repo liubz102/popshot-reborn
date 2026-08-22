@@ -60,6 +60,15 @@ foreach ($must in @('hook\bin\bshook.dll', 'hook\bin\bsloader.exe',
         throw "缺少必需文件：$must"
     }
 }
+# 自动更新链的两端都要在：拉起端 = game_patched\BsPatcherChn.exe（我们的
+# 引导器，不能是原版 NGM），干活端 = tools\update_client.py。少了任何一端，
+# 玩家拿旧客户端连新服务器时就只会看到 NGM 的死链报错。
+Assert-UpdaterStub -Root $Root
+foreach ($must in @('tools\update_client.py')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $Root $must) -PathType Leaf)) {
+        throw "缺少必需文件：$must（自动更新主逻辑）"
+    }
+}
 
 # ★★★ UserConfig.ini 是**构建输入**，不是本机杂项（V0.1 §49 / D021）。
 #   客户端是「登录成功那一刻」才写出它的，所以全新环境第一次跑时它不存在；
@@ -148,6 +157,9 @@ try {
         Copy-TextFile -Source (Join-Path $Root $file) -Target (Join-Path $OutputDirectory $file) -Kind 'ps1'
     }
     Copy-One (Join-Path $Root 'tools\d3d9_probe.exe') (Join-Path $OutputDirectory 'tools\d3d9_probe.exe')
+    # ★ 自动更新主逻辑（game_patched\BsPatcherChn.exe 引导器拉起的就是它）。
+    #   开发工具都不进包，唯独这个进 —— 它就是「旧客户端自动升级」的干活的那个。
+    Copy-One (Join-Path $Root 'tools\update_client.py') (Join-Path $OutputDirectory 'tools\update_client.py')
 
     # --- 3. 服务端代码（和服务端包同一份，铁律 8）---------------------------
     Write-Host '  [3/6] server（单机假服务器 = 云端服务端的同一套代码）'
@@ -186,7 +198,8 @@ try {
             '怎么用：整个目录拷到目标电脑，双击 start.bat。',
             '联机：登录界面选「远程服务器」，地址改 server.config 的 server_address。',
             '首次使用先点登录框下方的注册链接注册账号。',
-            '客户端每次启动会把本文件里的 version 上报给服务器（bshook 读它补丁握手版本号）。'
+            '客户端每次启动会把本文件里的 version 上报给服务器（bshook 读它补丁握手版本号）。',
+            '版本过旧被服务器拒绝时会自动更新：game_patched\BsPatcherChn.exe 是自研更新引导器（tools\updater）。'
         )
     foreach ($must in @('BUILD.ver', 'server-ClientFilter.config')) {
         if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory $must) -PathType Leaf)) {
@@ -213,6 +226,19 @@ try {
         $tool = New-PackageZip -SourceDirectory $OutputDirectory -ZipPath $zipPath -Force:$Force
         $zipSize = (Get-Item -LiteralPath $zipPath).Length
         Write-Host ("ZIP 已生成：$zipPath（$(Format-Size $zipSize)，$tool）") -ForegroundColor Green
+
+        # --- 自动更新清单 --------------------------------------------------
+        # tools\update-manifest.json（进 git 的累积母本）：同版本**原位替换**、
+        # 新版本前插 —— 开发期同一版本反复重打包安全。dist\manifest.json 是
+        # 给发版人直接挂上 GitHub Release 的副本。manifest 描述的是 zip，
+        # 所以只在 -Zip 时生成。
+        Write-Host '正在生成更新清单 manifest.json…'
+        & (Join-Path $Root 'runtime\python\python.exe') `
+            (Join-Path $Root 'tools\update_manifest.py') `
+            --version $Version.Text --zip "$zipPath"
+        if ($LASTEXITCODE -ne 0) {
+            throw "生成 manifest.json 失败（tools\update_manifest.py —— 上面的输出）"
+        }
     } else {
         Show-StaleArchiveWarning -PackageDirectory $OutputDirectory -Extensions @('.zip')
     }

@@ -74,8 +74,13 @@
    验证：`[System.IO.File]::ReadAllBytes($p)[0..2]` 应是 `239,187,191`。
 4. **客户端是 32 位。** 编译注入 DLL 必须用 x86 工具链
    （`C:\Program Files (x86)\Microsoft Visual Studio\2017\BuildTools\VC\Auxiliary\Build\vcvars32.bat`）。
-5. **不启动 `NMService.exe` / `BsPatcherChn.exe`。** 那是 Nexon 通行证和补丁器，
-   连的是早已停机的 `platform.tiancity.com`，游戏本体不需要。
+5. **不启动 `NMService.exe`；`BsPatcherChn.exe` 已不是 NGM（2026-08-22 起）。**
+   NMService 是 Nexon 通行证，连的是早已停机的 `platform.tiancity.com`，游戏
+   本体不需要，继续别碰。`game_patched\BsPatcherChn.exe` 从 V0.2 会话 46 起
+   被替换成**自研更新引导器**（`tools/updater/updater.c` 的编译产物）：客户端
+   升级分支拉起它、触发自动更新是预期行为，不再属于禁用项。原版 NGM 链
+   （BsPatcherChn→NGMDll→platform.tiancity.com）整条废弃，包里的
+   `NGMDll.dll` / `NGMResource.dll` 无人调用，只是没删。
 6. **GameGuard 绕过必须使用配套构建的 `bsloader.exe` + `bshook.dll`。**
    会话 23 起不再于 +2.5 秒改 `0x54b0fc`：DLL 注册 VEH，等主线程退出
    `LoadLibrary` APC 后给它设置 DR0；执行到 `0x54b0fc` 时直接令

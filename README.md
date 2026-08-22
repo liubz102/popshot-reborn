@@ -205,16 +205,30 @@ python tools/gs_ctl.py help
 
 每个发布包都有自己的版本号（`V主.次.修订`，如 `V0.2.7`），一圈链路：
 
-- **发版**：改 `tools/build-ver.config` → 跑 `tools\build.bat`。包根会生成
-  `BUILD.ver`（JSON），成果物目录和压缩包名都带版本（如
-  `PopShot-portable-win64_V0-2-7.zip`，点转横杠）。客户端包和服务端包仍然
-  **必须成对使用**（BUILD.ver 里的 `buildId` / `serverCodeHash` 核对）。
+- **发版**：改 `tools/build-ver.config` → 跑 `tools\build.bat`。会自动打包并更新 `manifest.json`。
+  包根会生成`BUILD.ver`（JSON），成果物目录和压缩包名都带版本（如
+  `PopShot-portable-win64_V0-2-7.zip`，点转横杠）。
 - **上报**：客户端每次启动读包根 `BUILD.ver`，把版本号补丁进握手包上报
   （bshook 日志里有一行版本）。服务端把每条连接的版本记进 `logs/online.log` ——
   排查问题时先看这里就知道对方跑的是哪个版本。
 - **门禁**：服务器按 `server-ClientFilter.config` 里的最低版本拒绝太旧的客户端
   （客户端会收到「版本过旧，请更新」的提示）。改这个文件**不用重启服务器**，
   下一条连接就生效；填 `0` 完全不限制（含不上报版本的旧客户端）。
+- **自动更新**：客户端收到拒绝帧后会拉起原版的 `game_patcher\BsPatcherChn.exe`
+  走升级分支 —— 这个 exe 已被替换成自研更新引导器（`tools/updater/updater.c`，
+  原版 NGM 链整条废弃），由它转手拉起 `tools/update_client.py` 完成更新。
+- **update_client.py**：
+  - 1. 探测游戏服（`server.config` 的地址，27799）：重演一次握手，从拒绝文案里
+   解析「服务器要求的版本」（= 服务器自身版本，保证客户端与服务器同批次，
+   不是门禁的最低版本）。
+  - 2. 从 GitHub Release 取 `manifest.json`（`releases/latest/download/manifest.json`
+   固定地址，含全部历史版本的 sha256/大小/下载地址），下载全量 zip 并校验
+   （若找不到「服务器要求的版本」则下载最新版本）。
+  - 3. 等游戏进程退出，自动停掉本机服务端/中继（按「exe 路径 = 本包 runtime」
+   精确匹配，解除文件占用），解压覆盖（`server.config`、`UserConfig.ini`、账号、
+   日志等玩家数据**永不覆盖**）。
+  - 4. `BUILD.ver` 最后写（= 成功提交点，中途断电重跑即可），提示一键重启游戏
+   （start.bat 会把本机服务端一起拉回来）。
 - **日常发版不需要重新编译 hook**：版本号不编译进 bshook.dll，只随 BUILD.ver
   变化。
 

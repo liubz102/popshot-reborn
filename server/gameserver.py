@@ -91,13 +91,36 @@ os.makedirs(LOGDIR, exist_ok=True)
 CLIENT_VERSION = 311        # 0x137，硬编码在 0x54d98f
 
 #: 版本门禁拒绝时回给客户端的结果码。客户端只判「非 0」：非 0 就再读一个
-#: 字符串、走原版自带的「升级/报错」分支弹框（re/packet_api.md §1.2）。
+#: 字符串、走原版自带的「升级/报错」分支弹框（re/packet_api.md §1.2），
+#: 拉起 game_patched\BsPatcherChn.exe（= 我们自己的更新引导器）。
 #: 达标的正常连接永远回 0（`app.py` 固定 `version_result = 0`）。
 VERSION_REJECT_RESULT = 1
-#: 版本门禁拒绝时附带的提示文案。弹框对这段文字的渲染方式还没真机验证过
-#:（逆向只到「再读一个 wstring + GetComputerName + 弹框」这一层），
-#: 真机表现记录在 develop_history；要改提示语改这里。
+#: 版本门禁拒绝时附带的提示文案（兜底版：BUILD.ver 读不出服务器自身版本
+#: 时用它）。正常情况走 `version_reject_message()` —— 文案里**带上服务器
+#: 自己的版本号**，客户端更新器（tools/update_client.py 的探针）连上来
+#: 重演一次握手，从这句话里解析出该升到哪个版本，保证「成对发布」的
+#: 客户端 / 服务端批次对得上（D079）。改文案时必须保留版本号的格式
+#: ``V主.次.修订``（`versioning.format_version` 的输出）。
 VERSION_REJECT_MESSAGE = "客户端版本过旧，请下载最新版客户端后再连接。"
+
+
+def version_reject_message(root=None):
+    """拒绝文案：能读到服务器自身版本就带版本号，读不到用兜底文案。
+
+    ★ 带的是**服务器自己的版本**（包根 BUILD.ver），不是门禁的最低版本
+      （server-ClientFilter.config）—— 例：服务器 0.2.15 / 最低 0.2.10 /
+      客户端 0.2.7 被拒，文案说的是「请更新到 V0.2.15」：客户端要和服务器
+      **同批次**（成对发布，D079），而不是踩着最低线当个「半新不旧」的版本。
+    ★ 这句话是**给机器读的协议**，不只是给人看的：探针按
+      ``[vV]数字.数字[.数字]`` 的模式从文案里抠版本号。
+    """
+    own, warnings = versioning.load_own_version(root)
+    if own is not None:
+        return (f"客户端版本过旧，请更新到 {versioning.format_version(own)} "
+                f"后再连接。")
+    for warning in warnings:
+        print(f"[版本门禁] {warning}", file=sys.stderr)
+    return VERSION_REJECT_MESSAGE
 
 MAGIC_CTRL = 0xFE
 MAGIC_GAME = 0xFF
@@ -7561,8 +7584,10 @@ class Conn:
                 self.online(f"✗ 版本门禁 拒绝 ip={self.peer()} "
                             f"客户端版本={have} 最低要求={need}")
                 if not self.args.hold and self.args.version_result == 0:
+                    # 文案带服务器自身版本号：探针（tools/update_client.py）
+                    # 靠它知道该升到哪个版本（见 version_reject_message）。
                     self.send(build_ctrl(w_i32(VERSION_REJECT_RESULT)
-                                         + w_wstr(VERSION_REJECT_MESSAGE)))
+                                         + w_wstr(version_reject_message())))
                 return
             # ★ 上下线流水里必须能查到「这条连接跑的是哪个版本」——
             #   server.out 每次启动都被覆盖，版本号要进 online.log 才留得住

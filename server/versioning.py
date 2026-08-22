@@ -28,7 +28,9 @@ int32，见 `gameserver.CLIENT_VERSION` / re/packet_api.md §1.2），所有复�
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import threading
 
 import config
@@ -201,4 +203,72 @@ def load_client_filter(path=None, _reload=False):
         result = (version, [])
     with _lock:
         _filter_cache[path] = (stamp, result)
+    return result
+
+
+#: 包根 ``BUILD.ver`` 的文件名（客户端包和服务端包都有，打包脚本写入）。
+BUILD_VER_FILENAME = "BUILD.ver"
+
+#: ``{路径: (mtime, size, (版本元组或 None, 警告列表))}`` —— 同
+#: `load_client_filter` 的 mtime 热重载缓存。BUILD.ver 只在换包时变，
+#: 换包必然重启，但照抄同一套缓存模式最省心，测试也好写。
+_own_cache = {}
+
+#: ``"version"`` 键的兜底扫描模式（完整 JSON 解析失败时用，同 bshook 的
+#: ``read_build_ver``：只认第一个 ``"version"`` 键，不做完整解析）。
+_VERSION_KEY_RE = re.compile(r'"version"\s*:\s*"([^"]*)"')
+
+
+def load_own_version(root=None, _reload=False):
+    """读包根 ``BUILD.ver`` 的 ``version`` 字段 -> ``(版本元组或 None, 警告列表)``。
+
+    「这台服务器自己是哪个批次」——版本门禁的拒绝文案带上它，客户端更新器
+    （``tools/update_client.py`` 的探针）从文案里解析出该升到哪个版本，
+    成对发布（D079）的客户端 / 服务端靠这句话对上批次。
+
+    BUILD.ver 是我们自己脚本写的 JSON（``version`` 键永远第一个）。先做
+    完整 JSON 解析，失败再退回 bshook 同款的「扫第一个 ``version`` 键」，
+    两套都认不出才返回 ``None``（调用方有兜底文案，绝不因为这句话让
+    服务器起不来 —— fail-open，server.config 哲学）。
+    """
+    path = os.path.join(os.path.abspath(root or config.PACKAGE_ROOT),
+                        BUILD_VER_FILENAME)
+    try:
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        with _lock:
+            _own_cache.pop(path, None)
+        return None, [f"没有找到 {path}，读不出服务器自己的版本号"]
+
+    with _lock:
+        cached = _own_cache.get(path)
+    if cached and cached[0] == stamp and not _reload:
+        return cached[1]
+
+    version = None
+    warnings = []
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as error:
+        return None, [f"读不了 {path}（{error}）"]
+    text = data.decode("utf-8-sig", errors="replace")
+    value = None
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            value = obj.get("version")
+    except ValueError:
+        m = _VERSION_KEY_RE.search(text)     # bshook 同款兜底扫描
+        value = m.group(1) if m else None
+    if value is None:
+        warnings.append(f"{path} 里找不到 version 字段")
+    else:
+        version = parse_version_text(value)
+        if version is None:
+            warnings.append(f"{path} 的 version 值 {value!r} 认不出是版本号")
+    result = (version, warnings)
+    with _lock:
+        _own_cache[path] = (stamp, result)
     return result
