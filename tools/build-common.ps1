@@ -144,22 +144,23 @@ function Get-BuildVersion {
 }
 
 function Copy-ClientFilterConfig {
-    <# 把根目录的 server-ClientFilter.config（服务器允许的最低客户端版本，
-       手动维护）拷进包根。两个包都要带：客户端包里那份是「本机服务器」的
-       门禁，服务端包里那份是云端服务器的门禁 —— 同一份文件，行为才一致。
+    <# 把仓库根 config\server-ClientFilter.config（服务器允许的最低客户端版本，
+       手动维护）拷进包的 config\ 子目录。两个包都要带：客户端包里那份是
+       「本机服务器」的门禁，服务端包里那份是云端服务器的门禁 —— 同一份文件，
+       行为才一致。
 
-       根目录没有时**生成一个 0（不限制）**并黄字提醒，而不是打包失败：
+       仓库里没有时**生成一个 0（不限制）**并黄字提醒，而不是打包失败：
        这个文件缺了只影响「要不要拦旧客户端」，不影响包本身能不能跑。 #>
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)][string]$PackageRoot
     )
-    $src = Join-Path $Root 'server-ClientFilter.config'
-    $dst = Join-Path $PackageRoot 'server-ClientFilter.config'
+    $src = Join-Path $Root 'config\server-ClientFilter.config'
+    $dst = Join-Path $PackageRoot 'config\server-ClientFilter.config'
     if (Test-Path -LiteralPath $src -PathType Leaf) {
         Copy-TextFile -Source $src -Target $dst -Kind 'unix'
     } else {
-        Write-Host '        根目录没有 server-ClientFilter.config，包里生成 0（不限制客户端版本）' -ForegroundColor Yellow
+        Write-Host '        config\ 里没有 server-ClientFilter.config，包里生成 0（不限制客户端版本）' -ForegroundColor Yellow
         Write-TextFile -Path $dst -Kind 'unix' -Text "0`n"
     }
     if (-not (Test-Path -LiteralPath $dst -PathType Leaf)) {

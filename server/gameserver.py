@@ -8109,7 +8109,7 @@ def main():
                     help="允许的最低客户端版本（如 0.2.7 / v0.2.7），低于它的"
                          "连接按「版本过旧」拒绝；0 或不填 = 不限制。"
                          "app.py 统一入口不用这个参数 —— 它让每条连接直接热重载"
-                         " server-ClientFilter.config")
+                         " config\\server-ClientFilter.config")
     ap.add_argument("--hold-lobby", action="store_true",
                     help="握手照回，但游戏包一律不应答（纯抓包）")
     ap.add_argument("--login-result", type=int, default=0,

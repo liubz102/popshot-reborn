@@ -661,11 +661,13 @@ static void style_login_dialog(HWND dlg)
 
     SetDlgItemTextW(dlg, IDC_RADIO_LOCAL, L"本机服务器");
     SetDlgItemTextW(dlg, IDC_RADIO_ONLINE,
-                    L"远程服务器\n(IP设置:server.config)");
+                    L"远程服务器\n(IP设置:config目录)");
 
-    /* 「远程服务器(IP设置:server.config)」比原来的「枪林弹雨(网通)」长得多，
+    /* 「远程服务器(IP设置:config目录)」比原来的「枪林弹雨(网通)」长得多，
        126 像素的原控件会把它裁掉，所以改成**两行**：加 BS_MULTILINE 再把控件
        放高，文案里那个换行符就是断行处（按钮的 DrawText 带 DT_WORDBREAK，认 \n）。
+       （2026-08-23 前第二行是「(IP设置:server.config)」，配置文件挪进 config\
+       后改的；新文案比旧的还短几个像素，但下一条警告依然适用。）
 
        ★ 宽度只能到 RADIO_ONLINE_W（145），**位置一个像素都不动**（D098）：
        右边 x=245 起就是「密码:」那条 Static，压上去就会把它的字擦掉（§173）。

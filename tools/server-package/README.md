@@ -7,7 +7,7 @@
 **客户端包和服务端包必须成对使用**，两边 `BUILD.ver` 的 `buildId` 要一致 ——
 版本不配套时的典型症状是玩家一进房间就被弹回大厅。
 
-包根的 `server-ClientFilter.config` 记着**允许的最低客户端版本**（如 `0.2.7`，
+包根 `config/server-ClientFilter.config` 记着**允许的最低客户端版本**（如 `0.2.7`，
 填 `0` = 不限制）。低于它的客户端连上来会收到「版本过旧，请更新」的提示并被
 拒绝；改这个文件**不用重启服务器**，下一条连接就按新值判。
 
@@ -61,7 +61,7 @@ Python 的挑选顺序：
 | `27799` | TCP | 游戏服 | **不能**，客户端写死 |
 | `27798` | TCP | 战斗同步中继 | 不建议，改了客户端包也要重编 |
 | **`27799`** | **UDP** | **位置同步** | **不能** —— 和游戏服 TCP 同号 |
-| `27810` | TCP | 用户注册网页 | 能，改 `server.config` 的 `local_register_port` |
+| `27810` | TCP | 用户注册网页 | 能，改 `config/server.config` 的 `local_register_port` |
 
 > ⚠ **UDP `27799` 那一条最容易漏**。它和游戏服 TCP 同号，但 TCP 和 UDP 是两套
 > 独立的端口空间，防火墙/安全组里**必须单独加一条 UDP 规则**。
@@ -83,7 +83,7 @@ Python 的挑选顺序：
 ## 玩家那边怎么连
 
 1. 把**同一批次**的客户端包发给玩家；
-2. 玩家改自己那份 `server.config`：
+2. 玩家改自己那份 `config/server.config`：
 
    ```text
    server_address = 你这台服务器的 IP 或域名
@@ -107,7 +107,7 @@ Python 的挑选顺序：
 
 ### 防批量注册
 
-一次注册**成功**之后，同一个客户端 IP 在 `server.config` 的
+一次注册**成功**之后，同一个客户端 IP 在 `config/server.config` 的
 `register_cooldown_seconds`（默认 **20** 秒）内不能再注册；注册页上的「注册」
 按钮也会锁住并倒计时同样的秒数，玩家刷新页面也解不开。
 注册**失败**（用户名重名、显示昵称重名、两次密码不一致等）不触发冷却。
@@ -162,7 +162,7 @@ X-Forwarded-For  →  X-Real-IP  →  TCP 对端
 
 ### 日志会自动清理，不用管
 
-`logs/` 里**超过 `server.config` 的 `log_retention_days`（默认 3）天没再写过**的
+`logs/` 里**超过 `config/server.config` 的 `log_retention_days`（默认 3）天没再写过**的
 日志文件会被自动删掉。清理时机有两个：
 
 - **服务端每次真正启动时**一次（已经在跑而跳过启动时，清理也跟着跳过）；

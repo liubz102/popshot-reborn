@@ -203,7 +203,8 @@ static void manifest_tests(void)
 
 static void protected_tests(void)
 {
-    check(apply_is_protected(L"server.config"), "protected server.config");
+    check(apply_is_protected(L"config/server.config"),
+          "protected config/server.config");
     check(apply_is_protected(L"logs/online.log"), "protected logs/…");
     check(apply_is_protected(L"logs"), "protected logs itself");
     check(apply_is_protected(L"logs\\x\\y"), "protected logs\\… (backslash)");

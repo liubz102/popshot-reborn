@@ -3,10 +3,9 @@
 > 只保留**当前状态**。流水账进 `sessions/`。
 > **每完成一个可验证小步就立刻更新这里。**
 
-最后更新：2026-08-22 · V0.2 会话 47（**更新器 v3：全逻辑进 BsPatcherChn.exe**
-（updater\ 独立 C 工程）+ 原版 NGMResource 界面素材提取入工程复刻 572×473
-双进度条更新窗，渲染链 file:///→document.write→原生三段回退；python 完全退出
-更新链，.update_old 善后归启动脚本。§235 / D156）
+最后更新：2026-08-23 · V0.2 会话 49（**配置文件集中挪进 `config\` 子目录**
+（server.config + server-ClientFilter.config 一次性移动，无迁移逻辑；
+更新器保护清单同步改路径。D158））
 
 ---
 
@@ -26,6 +25,34 @@ Python 已内置在 `runtime\python`，目标电脑不需要安装 Python。
 ---
 
 ## 当前位置
+
+**会话 49（2026-08-23）—— 配置文件集中：`server.config` + `server-ClientFilter.config`
+从包根挪进 `config\` 子目录（D158）。用户动机：以后还要加别的 config，根目录
+不想越堆越多。用户钉死的前提：支持自动更新的版本还没发布过 → **一次性移动、
+代码直接引用新路径、不写任何配置迁移逻辑**；随 V0.2.7 重打、所有用户手动下载
+新版替换旧版；★ 更新器**保护清单必须跟着改**，玩家的 `config\server.config`
+依然不许被自动更新覆盖。**
+
+| 环节 | 改了哪 | 说明 |
+|---|---|---|
+| 路径源 | `server/config.py` + `server/versioning.py` | `config_path()` / `client_filter_path()` 统一落到 `<包根>\config\`；新增 `config.CONFIG_DIR`；`ensure_exists` 本来就会建父目录 |
+| 启停 | `tools\launch.ps1` / `shutdown.ps1` / `server-package\serverctl.ps1` / `serverctl.sh` | 各自的配置路径常量跟上（Linux 侧用正斜杠） |
+| 打包 | `build-portable.ps1` / `build-server-package.ps1` / `build-common.ps1` | 两个包都把 config 放进 `config\`；自检 must 清单升级为 `BUILD.ver + config\server.config + config\server-ClientFilter.config`；包内 README/BUILD.ver 提示文案同步 |
+| **更新器** | `updater\src\config.c`（探针读地址）+ `apply.c`（**保护清单 `config/server.config`**）+ `selftest.c` | 重编过 selftest 闸门 + 拷回 `game_patched\BsPatcherChn.exe`；e2e 沙箱布局同步，且**假更新包里现在真的带模板 config\server.config**（此前 zip 里没有它，保护断言是空转的） |
+| hook | `hook\bshook.c` | 登录框第二个单选钮文案 `(IP设置:server.config)` → `(IP设置:config目录)`（估宽 ~114px < 145px 上限，比旧文案还短）；DLL + bsloader 成对重编，test-watchdog PASS |
+| 仓库 | `.gitignore`（`/config/server.config` 忽略 + `!/config/server-ClientFilter.config` 放行）、根 `README.md`、`tools\server-package\README.md`、`tools\probe-death.ps1`、`tools\build-menu.ps1`、`stop.bat` 注释 | 文档与提示全部指到新路径；文件名本身没变（还是 server.config），只提名字不提位置的注释没动 |
+
+**验证**：两套运行时全量各 **1021 项**全绿；updater selftest（build 闸门）+ e2e
+端到端（`config/server.config preserved (protected)`、`skipped=1`）+ watchdog
+全过；`app.py` 真启动读的就是 `config\server.config`；两个包**成对重打**
+（批次 `20260823-004316`，包根 `config\` 布局核对、冒烟自检全过、manifest
+与 zip sha256 一致）。
+
+⇒ **下一步：⏳ 待验证表第 56 条**（真机看一眼登录框新文案排版）。发版 checklist
+不变（先挂 GitHub Release 再真机验 53~55）；**这次移动随 V0.2.7 发布**，
+0.2.6 及更早用户手动换包后配置就要去 `config\` 里改了。
+
+---
 
 **会话 47（2026-08-22）—— 更新器 v3：全逻辑进 exe + 原版界面复刻（§235 / D156）。
 动机：v2 更新器自己跑在包内 python 上锁着 runtime（覆盖只能改名让位）+ 黑控制台
@@ -1853,6 +1880,7 @@ J 原本是整个 V0.2 最大的风险（PLAN 写着「唯一有真实失败风�
 | 53 | ★★★ **自动更新整链（§235 / D156，要先把 0.2.7 传上 GitHub Release）**。前置：GitHub 建 Release（tag `V0.2.7`，资产挂 `PopShot-portable-win64_V0-2-7.zip` + `manifest.json`）+ 部署新服务端包。然后拿一个**旧版本客户端包**（或把新包根 `BUILD.ver` 的版本号改小）登录 | 被拒 → 客户端弹框 → 点确定后**不再出现** NGM 的「运行需要管理者权限」/「patch中出错」，而是弹**原版风格更新窗口**（572×473，世纪天成 logo + 宣传图 + 「目前/全部」双进度条）：探针（服务器要求的版本）→下载进度（约 410MB，速度/剩余时间）→ 停本机服务端 → 应用 → **提示手动重启**（不自动拉起）→ 玩家跑 start.bat 后正常登录；`logs\updater.log` 全程留痕（start/probe/target/download/zip ready/rename-dance/applied/FINISH-OK） | **待用户**。机器可测部分已钉死：selftest 45 项（密码/帧/manifest/sha256/资源）+ test_e2e 端到端（探针→下载→改名让位→提交点）+ 三段渲染链截图（logs\updater-ui-preview）；**没验的是真机全链**：GitHub 直连下载、真客户端弹框分支（第 50 条同款未知）、第二次自动更新（此时更新器已是 v3，python 可被安全停止） |
 | 54 | ★ **更新器提权流程（§235 / D156）**。把客户端包拷进一个无写权限的目录（如 `C:\Program Files\popshot`）再触发更新 | 主窗口先正常下载（不需要管理员），应用前弹**原版风格确认框**（440×163「继续运行需要 管理者权限」）→ 点确认后**弹一次 UAC**（显示「炮炮火枪手 自动更新」，新管理员窗口接着干活，不重复下载）→ 应用完成 → 提示手动重启；点取消/拒绝 UAC 则主窗口给出 GitHub Release 手动下载地址 | **待用户**。提权分支只在目录不可写时出现（正常目录全程无 UAC、无确认框） |
 | 55 | ★ **0.2.6 旧包用户的引导（§234 / D155）**。拿 V0.2.6 旧包连新服务器 | 走的还是原版 NGM：弹「运行需要管理者权限」→「patch中出错」（死链，**预期内**，这批用户需要最后一次手动下载带更新器的 0.2.7；群公告 + 拒绝文案里的 Release 页地址）| **待用户**。旧包没有我们的引导器，帮不了；确认现象与预期一致即可 |
+| 56 | ★ **登录框新文案排版（会话 49 / D158，要重打客户端包）**。双击 `start.bat` 到登录界面，看第二个单选钮 | 第一行「远程服务器」、第二行「**(IP设置:config目录)**」—— 两行都完整、右括号不被裁、不压到右边「密码:」那行（控件宽上限 145px，估宽 ~114px，比旧文案 `(IP设置:server.config)` 还短，但 §175 那条「先在真控件上试排版再定」的警告依然算数）；顺手确认 `config\` 目录在 `start.bat` 旁边、里面两份 config 都在 | **待用户**。agent 侧已验：DLL+bsloader 成对重编、test-watchdog PASS、两个包成对重打（批次 `20260823-004316`）；**没验的只有真登录框像素** |
 
 ### ✅ J.2 已拍板：**原版的连接方式和回退方式全部原样还原**（D078）
 

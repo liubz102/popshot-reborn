@@ -46,7 +46,7 @@ $Root    = Split-Path -Parent $ScriptDir
 $Python  = Join-Path $Root 'runtime-win\python\python.exe'
 $AppPy   = Join-Path $Root 'server\app.py'
 $LogDir  = Join-Path $Root 'logs'
-$Config  = Join-Path $Root 'server.config'
+$Config  = Join-Path $Root 'config\server.config'
 
 # ★★ 端口号**唯一的源是 server\config.py**，这里向它要，不再各写一份。
 #    以前这三个数字在 config.py、bshook.c、launch.ps1、本文件里各有一份 ——

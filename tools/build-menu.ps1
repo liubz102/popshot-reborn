@@ -111,7 +111,7 @@ function Build-Selected([bool]$DoClient, [bool]$DoServer, [bool]$DoZip,
     Write-Host '[完成]' -ForegroundColor Green
     if ($DoClient) {
         Write-Host '  客户端包：整个目录拷到对方电脑，双击里面的 start.bat。' -ForegroundColor Green
-        Write-Host '            联机时改 server.config 的 server_address 指向服务器。' -ForegroundColor Green
+        Write-Host '            联机时改 config\server.config 的 server_address 指向服务器。' -ForegroundColor Green
     }
     if ($DoServer) {
         Write-Host '  服务端包：Windows 双击 start.bat；Linux 解压后 chmod +x *.sh tools/*.sh 再 ./start.sh。' -ForegroundColor Green

@@ -47,7 +47,7 @@ int cfg_server_address(const wchar_t *root, wchar_t *out, size_t cap)
     wchar_t *line, *next;
     int found = 0;
 
-    path_join(path, MAX_PATH * 2, root, L"server.config");
+    path_join(path, MAX_PATH * 2, root, L"config/server.config");
     wcscpy(out, L"192.168.1.100");                       /* config.py 同款默认 */
     if (read_text_file(path, text, 4096) < 0) return 1;  /* 没有文件用默认 */
 

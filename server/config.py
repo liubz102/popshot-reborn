@@ -138,8 +138,12 @@ MAX_LOG_RETENTION_DAYS = 3650
 #: 上限 4：位置包只有 43 字节，捎 4 份也才 ~250 字节/报，再多就纯属浪费上行了。
 MAX_UDP_SYNC_REDUNDANCY = 4
 
-#: 配置文件名。放在包根目录（= `start.bat` 同目录 = `server/` 的上一级）。
+#: 配置文件名。放在包根的 `config\` 子目录里（和 server-ClientFilter.config
+#: 一起集中管理；目录名见 CONFIG_DIR）。
 CONFIG_FILENAME = "server.config"
+
+#: 包根下集中放配置文件的子目录名。
+CONFIG_DIR = "config"
 
 #: ★ `server_address` 的默认值是一个**局域网示例地址**，不是 `127.0.0.1`。
 #: 填 `127.0.0.1` 的话「远程服务器」和「本机服务器」连的是同一台机器，
@@ -187,8 +191,9 @@ PACKAGE_ROOT = os.path.dirname(SERVER_DIR)
 
 
 def config_path(root: str | None = None) -> str:
-    """``server.config`` 的完整路径（包根目录下）。"""
-    return os.path.join(os.path.abspath(root or PACKAGE_ROOT), CONFIG_FILENAME)
+    """``server.config`` 的完整路径（包根的 ``config`` 子目录下）。"""
+    return os.path.join(os.path.abspath(root or PACKAGE_ROOT),
+                        CONFIG_DIR, CONFIG_FILENAME)
 
 
 def _clean_port(value, key, warnings):

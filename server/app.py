@@ -103,7 +103,7 @@ def build_arg_parser():
     ap.add_argument("--accounts", default=None,
                     help="账号 JSON 路径（默认 server/data/accounts.json）")
     ap.add_argument("--config", default=None,
-                    help="server.config 路径（默认包根目录下的那个）")
+                    help="server.config 路径（默认包根 config\\server.config）")
     ap.add_argument("--ticket-field", choices=("s1", "s2"), default="s2",
                     help="票据放在 CULoginReplyPacket 的哪个字符串字段。"
                          "默认 s2 —— 实测客户端转发给 gcpReqLogin 的就是它"

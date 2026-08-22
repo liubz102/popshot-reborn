@@ -28,7 +28,7 @@
 
 - 游戏大厅 / 房间列表 / 加入房间 / 房间内聊天 / 多人对战 / 合作闯关。
 - 默认解除多人对战的等级限制
-- 客户端可连接任意服务器，登录界面可自选「本机服务器」或「远程服务器」，远程地址写在 `server.config`（IPv4 / IPv6 / 域名都支持，远程服务器支持配置代理）
+- 客户端可连接任意服务器，登录界面可自选「本机服务器」或「远程服务器」，远程地址写在 `config/server.config`（IPv4 / IPv6 / 域名都支持，远程服务器支持配置代理）
 - 任意客户端都可以作为服务器让别人的客户端远程连接（须防火墙开放端口：认证 **TCP** 47611，游戏 **TCP** 27799，位置同步 **UDP** 27799，战斗同步中继 **TCP** 27798，注册页 **TCP** 27810）
 - 注册页可自助修改密码和显示昵称，也可用「存档转移助手」把存档从一台服务器导出、导入到另一台
 - 多账号：网页注册、账号之间数据隔离
@@ -55,7 +55,7 @@ start.bat
        ├─ server/app.py                      认证 [::]:47611
        │                                     游戏 [::]:27799（TCP）
        │                                     位置 [::]:27799（UDP，只走位置数据）
-       │                                     注册页 [::]:27810（可在 server.config 改）
+       │                                     注册页 [::]:27810（可在 config/server.config 改）
        │                                     调试控制通道 127.0.0.1:27800
        ├─ server/relay.py                    联机模式的本机中继
        │                                     127.0.0.1:47621 → <server_address>:47611
@@ -74,7 +74,7 @@ start.bat
 ```
 
 客户端是 2007 年的 32 位程序，`connect` 只认 IPv4 地址，所以联机时先连本机中继，
-由中继用 `getaddrinfo` 解析 `server.config` 里填的 IPv4 / IPv6 / 域名再转发出去。
+由中继用 `getaddrinfo` 解析 `config/server.config` 里填的 IPv4 / IPv6 / 域名再转发出去。
 
 `bshook.dll` 不修改磁盘上的 `BigShot.exe`，补丁只在客户端解壳完成后写入进程内存。
 启动器与 DLL 先完成握手，主线程真正执行到状态校验点时由硬件断点和 VEH 直接调整
@@ -127,7 +127,7 @@ stop.bat
 转发耗时、中继 RTT、客户端异常上报）。日志体积会快速增长，文件保存在 `logs/`，且不会
 提交到 Git。
 
-`logs/` 会**自动清理**：超过 `server.config` 里 `log_retention_days`（默认 3）天没再
+`logs/` 会**自动清理**：超过 `config/server.config` 里 `log_retention_days`（默认 3）天没再
 写过的日志文件会被删掉。服务端每次真正启动时清一次，之后每天凌晨 4 点再清一次，都在
 后台线程里做，不影响正在进行的游戏；填 `0` 关掉。
 
@@ -135,7 +135,7 @@ stop.bat
 
 登录界面下方有一条「在服务器 … 上注册用户」的链接，点它会打开注册页面
 （选「本机服务器」时是 `http://127.0.0.1:27810/`，选「远程服务器」时是
-`server.config` 里配置的那台服务器）。
+`config/server.config` 里配置的那台服务器）。
 注册后就能在登录界面用这个账号密码登录。**服务端会校验密码**，
 账号不存在或密码不对都会被拒绝。
 
@@ -149,9 +149,9 @@ stop.bat
 | 选项 | 连哪儿 |
 |---|---|
 | 本机服务器 | 本机的服务端，一个人玩，存档在本机 |
-| 远程服务器<br>(IP设置:server.config) | `server.config` 里 `server_address` 指向的那台服务器 |
+| 远程服务器<br>(IP设置:config目录) | `config/server.config` 里 `server_address` 指向的那台服务器 |
 
-`server.config` 就在 `start.bat` 旁边，用记事本打开即可，里面有中文注释和
+`config/server.config` 就在 `start.bat` 旁边的 `config` 目录里，用记事本打开即可，里面有中文注释和
 IPv4 / IPv6 / 域名三种写法的示例。改完重新运行 `start.bat` 生效。
 
 > 服务端监听 `::`，也就是说**选「本机服务器」时本机的 47611 / 27799(TCP+UDP) / 27810
@@ -192,9 +192,9 @@ python tools/gs_ctl.py help
 | `hook/` | 注入 DLL、启动器源码及构建脚本 |
 | `server/` | 服务端：认证、游戏、注册页、中继、协议和测试（单机和云端共用同一套代码）|
 | `server/config.py` | ★ **端口号唯一的源**，以及 `server.config` 的解析器 |
-| `server.config` | 联机服务器地址和注册页端口 |
+| `config/server.config` | 联机服务器地址和注册页端口 |
 | `server/versioning.py` | 项目版本号的解析 / 编码 / 最低版本门禁（详见下面「版本号管理」）|
-| `server-ClientFilter.config` | 服务器允许的**最低客户端版本**（手动维护；`0` = 不限制）|
+| `config/server-ClientFilter.config` | 服务器允许的**最低客户端版本**（手动维护；`0` = 不限制）|
 | `tools/build-ver.config` | 下一次打包的**版本号**（手动维护，发版前改它）|
 | `tools/` | 自写逆向、探针、截图和自动化脚本 |
 | `re/` | RTTI、虚表、包记录和映射文本等分析成果 |
@@ -211,20 +211,20 @@ python tools/gs_ctl.py help
 - **上报**：客户端每次启动读包根 `BUILD.ver`，把版本号补丁进握手包上报
   （bshook 日志里有一行版本）。服务端把每条连接的版本记进 `logs/online.log` ——
   排查问题时先看这里就知道对方跑的是哪个版本。
-- **门禁**：服务器按 `server-ClientFilter.config` 里的最低版本拒绝太旧的客户端
+- **门禁**：服务器按 `config/server-ClientFilter.config` 里的最低版本拒绝太旧的客户端
   （客户端会收到「版本过旧，请更新」的提示）。改这个文件**不用重启服务器**，
   下一条连接就生效；填 `0` 完全不限制（含不上报版本的旧客户端）。
 - **自动更新**：客户端收到拒绝帧后会拉起原版的 `game_patcher\BsPatcherChn.exe`
   走升级分支 —— 这个 exe 已被替换成自研更新器（`updater\src\`，独立 C 工程，
   原版 NGM 链整条废弃）。更新器界面复刻原版 BsPatcherChn.exe。
-  - 1. 探测游戏服（`server.config` 的地址，27799）：重演一次握手，从拒绝文案里
+  - 1. 探测游戏服（`config/server.config` 的地址，27799）：重演一次握手，从拒绝文案里
    解析「服务器要求的版本」（= 服务器自身版本，保证客户端与服务器同批次，
    不是门禁的最低版本）。
   - 2. 从 GitHub Release 取 `manifest.json`（`releases/latest/download/manifest.json`
    固定地址，含全部历史版本的 sha256/大小/下载地址），WinHTTP 下载全量 zip
    边下边校验（若找不到「服务器要求的版本」则下载最新版本）。
   - 3. 等游戏进程退出，自动停掉本机服务端/中继（按「exe 路径 = 本包 runtime」
-   精确匹配，解除文件占用），解压覆盖（`server.config`、`UserConfig.ini`、账号、
+   精确匹配，解除文件占用），解压覆盖（`config/server.config`、`UserConfig.ini`、账号、
    日志等玩家数据**永不覆盖**）。
   - 4. `BUILD.ver` 最后写（= 成功提交点，中途断电重跑即可），提示**手动重启**
    （`start.bat` / `start-debug.bat`，由玩家自己选启动方式，不自动拉起）。
@@ -247,7 +247,7 @@ python tools/gs_ctl.py help
 转发耗时、中继 RTT、客户端异常上报）。日志体积会快速增长，文件保存在 `logs/`，且不会
 提交到 Git。
 
-`logs/` 会**自动清理**：超过 `server.config` 里 `log_retention_days`（默认 3）天没再
+`logs/` 会**自动清理**：超过 `config/server.config` 里 `log_retention_days`（默认 3）天没再
 写过的日志文件会被删掉。服务端每次真正启动时清一次，之后每天凌晨 4 点再清一次，都在
 后台线程里做，不影响正在进行的游戏；填 `0` 关掉。
 

@@ -14,7 +14,7 @@ rem ==========================================================================
 rem  PopShot dedicated server - stop.
 rem
 rem  Kills whatever process owns the server ports (47611 / 27799 / 27798 and
-rem  the register page port from server.config).  Targets are found through
+rem  the register page port from config/server.config).  Targets are found
 rem  the port's OwningProcess, so unrelated Python processes are never
 rem  touched.  Players currently online will be disconnected.
 rem

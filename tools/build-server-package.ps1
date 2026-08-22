@@ -8,8 +8,8 @@
         ├─ start.bat / start-debug.bat / stop.bat     Windows
         ├─ start.sh  / start-debug.sh  / stop.sh      Linux
         ├─ tools/serverctl.ps1  tools/serverctl.sh    启停实现（中文都在这里）
-        ├─ server.config                              只有注册页端口要改
-        ├─ server-ClientFilter.config                 允许的最低客户端版本（0=不限制）
+        ├─ config/server.config                      只有注册页端口要改
+        ├─ config/server-ClientFilter.config         允许的最低客户端版本（0=不限制）
         ├─ server/                    和客户端包【同一份】代码（铁律 8）
         ├─ runtime-win/python/        Windows 独立运行时
         ├─ runtime-linux/*.tar.gz     Linux 独立运行时（可选，第一次启动时自解）
@@ -241,7 +241,7 @@ try {
     Copy-TextFile -Source (Join-Path $Template 'serverctl.sh') `
                   -Target (Join-Path $OutputDirectory 'tools\serverctl.sh') -Kind 'unix'
     Copy-TextFile -Source (Join-Path $Template 'server.config') `
-                  -Target (Join-Path $OutputDirectory 'server.config') -Kind 'unix'
+                  -Target (Join-Path $OutputDirectory 'config\server.config') -Kind 'unix'
     Copy-TextFile -Source (Join-Path $Template 'README.md') `
                   -Target (Join-Path $OutputDirectory 'README.md') -Kind 'unix'
 
@@ -303,10 +303,11 @@ SHA-256   $sha
             'Windows：解压后双击 start.bat；停服 stop.bat。',
             'Linux：  解压后 chmod +x *.sh tools/*.sh，然后 ./start.sh；停服 ./stop.sh。',
             '要放行的 TCP 端口：47611 / 27799 / 27798 / 27810（注册页，可改）。',
-            'server-ClientFilter.config：允许的最低客户端版本（0 = 不限制），改完即生效。',
+            'config\server-ClientFilter.config：允许的最低客户端版本（0 = 不限制），改完即生效。',
             '详见 README.md。'
         )
-    foreach ($must in @('BUILD.ver', 'server-ClientFilter.config')) {
+    foreach ($must in @('BUILD.ver', 'config\server.config',
+                        'config\server-ClientFilter.config')) {
         if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory $must) -PathType Leaf)) {
             throw "自检失败：$must 没写进包根"
         }

@@ -115,7 +115,8 @@ foreach ($proc in $targets) {
     $header += "启动于    : $($proc.StartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
     $header += "采样      : $Seconds 秒 / 每 $Interval 秒一次（只在数值变化时记一行）"
     # 只摘**有效行**：server.config 里 90% 是注释，全抄进来会把日志淹了。
-    foreach ($extra in @('BUILD.ver', 'server-ClientFilter.config', 'server.config')) {
+    foreach ($extra in @('BUILD.ver', 'config\server-ClientFilter.config',
+                         'config\server.config')) {
         $path = Join-Path $Root $extra
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             $header += "--- $extra ---"

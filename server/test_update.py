@@ -119,8 +119,9 @@ class RejectMessageTests(unittest.TestCase):
             with open(os.path.join(tmp, versioning.BUILD_VER_FILENAME),
                       "wb") as f:
                 f.write(b'{"version": "V0.2.15", "buildId": "x"}')
-            with open(os.path.join(tmp,
-                                   versioning.CLIENT_FILTER_FILENAME),
+            os.makedirs(os.path.dirname(versioning.client_filter_path(tmp)),
+                        exist_ok=True)
+            with open(versioning.client_filter_path(tmp),
                       "w", encoding="utf-8") as f:
                 f.write("0.2.10\n")
             message = gameserver.version_reject_message(root=tmp)

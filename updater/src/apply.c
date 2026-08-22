@@ -15,7 +15,7 @@
    就没有这些；这是第二道纵深防御）。目录条目按前缀匹配。 */
 static const wchar_t *PROTECTED_PATHS[] = {
     L"server/data/accounts.json",
-    L"server.config",
+    L"config/server.config",
     L"game_patched/UserConfig.ini",
     L"game_patched/BigShot.rpt",
     L"logs",

@@ -112,12 +112,13 @@ try {
     # 所以新 clone 下来的仓库根本没有它 —— 那种情况下照 `server\config.py` 的
     # DEFAULT_CONFIG_TEXT 现生成一份，让「clone 完就能打包」成立。
     # 用 LF：Win10 1809 起记事本认 LF，模板本来也是 LF。
-    $cfgSrc = Join-Path $Root 'server.config'
-    $cfgDst = Join-Path $OutputDirectory 'server.config'
+    # 位置：包根 config\ 子目录（和 server-ClientFilter.config 集中放）。
+    $cfgSrc = Join-Path $Root 'config\server.config'
+    $cfgDst = Join-Path $OutputDirectory 'config\server.config'
     if (Test-Path -LiteralPath $cfgSrc -PathType Leaf) {
         Copy-TextFile -Source $cfgSrc -Target $cfgDst -Kind 'unix'
     } else {
-        Write-Host '        根目录没有 server.config，照 config.py 的模板生成一份' -ForegroundColor DarkGray
+        Write-Host '        config\ 里没有 server.config，照 config.py 的模板生成一份' -ForegroundColor DarkGray
         $serverDir = Join-Path $Root 'server'
         & (Join-Path $Root 'runtime\python\python.exe') -c `
             "import sys; sys.path.insert(0, r'$serverDir'); import config; config.ensure_exists(r'$cfgDst')"
@@ -191,12 +192,13 @@ try {
         } `
         -Notes @(
             '怎么用：整个目录拷到目标电脑，双击 start.bat。',
-            '联机：登录界面选「远程服务器」，地址改 server.config 的 server_address。',
+            '联机：登录界面选「远程服务器」，地址改 config\server.config 的 server_address。',
             '首次使用先点登录框下方的注册链接注册账号。',
             '客户端每次启动会把本文件里的 version 上报给服务器（bshook 读它补丁握手版本号）。',
             '版本过旧被服务器拒绝时会自动更新：game_patched\BsPatcherChn.exe 是自研更新器（updater\src，原版风格界面，全逻辑进 exe）。'
         )
-    foreach ($must in @('BUILD.ver', 'server-ClientFilter.config')) {
+    foreach ($must in @('BUILD.ver', 'config\server.config',
+                        'config\server-ClientFilter.config')) {
         if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory $must) -PathType Leaf)) {
             throw "自检失败：$must 没写进包根"
         }

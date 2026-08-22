@@ -48,7 +48,7 @@ WIRE_BASE = 1_000
 #: app.py（统一入口）用它；单跑 gameserver.py 或测试给具体值或 0。
 FOLLOW_FILE = "auto"
 
-#: 配置文件名。放在包根目录（= start.bat 同目录 = server/ 的上一级），
+#: 配置文件名。放在包根的 `config\` 子目录里（和 server.config 集中管理），
 #: 客户端包和服务端包里都要有（两边的服务端行为必须一致）。
 CLIENT_FILTER_FILENAME = "server-ClientFilter.config"
 
@@ -165,9 +165,9 @@ def decode_wire(wire):
 
 
 def client_filter_path(root=None):
-    """``server-ClientFilter.config`` 的完整路径（包根目录下）。"""
+    """``server-ClientFilter.config`` 的完整路径（包根的 ``config`` 子目录下）。"""
     return os.path.join(os.path.abspath(root or config.PACKAGE_ROOT),
-                        CLIENT_FILTER_FILENAME)
+                        config.CONFIG_DIR, CLIENT_FILTER_FILENAME)
 
 
 def load_client_filter(path=None, _reload=False):

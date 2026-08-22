@@ -3,7 +3,7 @@
 搭的东西：
     <tmp>\\popshot-e2e\\                    沙箱包根
         BUILD.ver                          V0.0.9（旧版本）
-        server.config                      server_address=127.0.0.1（连假门禁）
+        config\\server.config              server_address=127.0.0.1（连假门禁）
         game_patched\\BsPatcherChn.exe      新更新器（本工程产物）
         game_patched\\test.txt              旧内容
     <tmp>\\popshot-e2e-web\\                本地 http 服务目录
@@ -51,10 +51,12 @@ def die(msg):
 
 def build_sandbox(sandbox, web):
     os.makedirs(os.path.join(sandbox, "game_patched"), exist_ok=True)
+    os.makedirs(os.path.join(sandbox, "config"), exist_ok=True)
     with open(os.path.join(sandbox, "BUILD.ver"), "w", encoding="utf-8") as f:
         f.write('{"version": "V%s"}\n' % OLD_VERSION)
-    with open(os.path.join(sandbox, "server.config"), "w", encoding="utf-8") as f:
-        # 玩家本地的 server.config（受保护，更新不许覆盖）
+    with open(os.path.join(sandbox, "config", "server.config"),
+              "w", encoding="utf-8") as f:
+        # 玩家本地的 config\server.config（受保护，更新不许覆盖）
         f.write("# 测试配置\nserver_address = 127.0.0.1\n")
     with open(os.path.join(sandbox, "game_patched", "test.txt"), "w") as f:
         f.write("old content\n")
@@ -67,8 +69,14 @@ def build_sandbox(sandbox, web):
     if os.path.exists(staging):
         shutil.rmtree(staging)
     os.makedirs(os.path.join(staging, top, "game_patched"))
+    os.makedirs(os.path.join(staging, top, "config"))
     with open(os.path.join(staging, top, "BUILD.ver"), "w", encoding="utf-8") as f:
         f.write('{"version": "V%s"}\n' % TARGET_VERSION)
+    # 更新包里带一份模板 config\server.config —— 保护清单必须拦下它，
+    # 不许覆盖玩家自己填的那份（zip 里没有这份的话，保护断言就是空转）。
+    with open(os.path.join(staging, top, "config", "server.config"),
+              "w", encoding="utf-8") as f:
+        f.write("# 模板配置（更新不许覆盖玩家的）\nserver_address = 192.168.1.100\n")
     with open(os.path.join(staging, top, "game_patched", "test.txt"), "w") as f:
         f.write("new content after update\n")
     shutil.copyfile(os.path.join(ROOT, "updater", "bin", "BsPatcherChn.exe"),
@@ -213,10 +221,11 @@ def main():
         die("test.txt 没被新内容覆盖：%r" % body)
     print("test.txt updated")
 
-    cfg = open(os.path.join(sandbox, "server.config"), encoding="utf-8").read()
+    cfg = open(os.path.join(sandbox, "config", "server.config"),
+               encoding="utf-8").read()
     if "server_address = 127.0.0.1" not in cfg or "# 测试配置" not in cfg:
-        die("server.config 被覆盖了（保护清单失效）：%r" % cfg)
-    print("server.config preserved (protected)")
+        die("config/server.config 被覆盖了（保护清单失效）：%r" % cfg)
+    print("config/server.config preserved (protected)")
 
     old = os.path.join(sandbox, "game_patched", "BsPatcherChn.exe.update_old")
     new = os.path.join(sandbox, "game_patched", "BsPatcherChn.exe")

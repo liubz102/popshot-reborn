@@ -22,7 +22,7 @@ cd "$ROOT" || exit 1
 LOGDIR="$ROOT/logs"
 PIDFILE="$LOGDIR/server.pid"
 APP="$ROOT/server/app.py"
-CONFIG="$ROOT/server.config"
+CONFIG="$ROOT/config/server.config"
 
 # ★★ 端口号唯一的源是 server/config.py。这里先留占位，等下面确定了 $PY
 #    之后再向它要（read_ports）—— 以前这三个数字在四个文件里各有一份，
@@ -213,7 +213,7 @@ for p in "$AUTH_PORT" "$GAME_PORT" "$RELAY_PORT" "$WEB_PORT"; do
     if port_open "$p"; then
         echo "!! 端口 TCP $p 被占用，服务端无法启动。"
         echo "   如果是上一次启动的服务端，先 sh stop.sh 再来；"
-        echo "   如果是别的程序占了 $WEB_PORT，改 server.config 的 local_register_port。"
+        echo "   如果是别的程序占了 $WEB_PORT，改 config/server.config 的 local_register_port。"
         exit 1
     fi
 done
@@ -270,7 +270,7 @@ echo ""
 ADDRS=$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1]}')
 [ -n "$ADDRS" ] || ADDRS=$(hostname -I 2>/dev/null || true)
 if [ -n "$ADDRS" ]; then
-    echo "  玩家那边 server.config 里填这个地址："
+    echo "  玩家那边 config/server.config 里填这个地址："
     for a in $ADDRS; do echo "    server_address = $a"; done
     echo "  云主机请填【公网】IP 或域名，上面列出的多半是内网地址。"
 else

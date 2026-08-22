@@ -7,7 +7,7 @@
       1. 环境自检（GameGuard.des 已改名 / bshook.dll 存在 / 串流是否在跑）
       2. 服务端：`server\app.py` 一个进程带起认证 47611 + 游戏 27799 + 注册页
          **已经在跑就不重复启动**（按端口的 OwningProcess 判断）
-      3. 读 server.config，起本机中继（联机模式下客户端经它连远端）
+      3. 读 config\server.config，起本机中继（联机模式下客户端经它连远端）
       4. 把配置经**环境变量**交给 bshook（登录框文案 / 注册页 URL 都要用）
       5. 残留的 BigShot.exe 一律先杀（单实例互斥体 BigShot_Assa，见 V0.1 §9）
       6. 按日志级别设好环境变量，再拉起 bsloader.exe
@@ -54,7 +54,7 @@ $PyChoice   = Select-PythonRuntime -Modern (Join-Path $Root 'runtime\python\pyth
 $Python     = $PyChoice.Path
 $LogDir     = Join-Path $Root 'logs'
 $ModeFile   = Join-Path $LogDir '.server_mode'
-$ConfigPath = Join-Path $Root 'server.config'
+$ConfigPath = Join-Path $Root 'config\server.config'
 # ★★ 端口号**不在这里写死**，见下面「端口表」那一段 —— 它向
 #    server/config.py 要，因为要用内置 Python 去读，所以排在
 #    「Python 在不在」那个检查之后。
@@ -485,7 +485,7 @@ Say '[客户端] bsloader 已启动，游戏登录窗口稍后出来，请耐心
 Say ''
 Say '--- 登录界面上可以自己选服务器 ---' 'Cyan'
 Say '  「本机服务器」          连本机，一个人玩，存档在本机' 'Cyan'
-Say "  「远程服务器」          连 $remoteUrlHost（改 server.config 换服务器）" 'Cyan'
+Say "  「远程服务器」          连 $remoteUrlHost（改 config\server.config 换服务器）" 'Cyan'
 Say ''
 Say "  远程服务器地址配置在：  $ConfigPath" 'Cyan'
 Say '  首次使用请先注册账号：  点登录框下方的「在服务器…上注册用户」链接' 'Cyan'

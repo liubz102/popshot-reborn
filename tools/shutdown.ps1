@@ -21,9 +21,9 @@ $LogDir   = Join-Path $Root 'logs'
 $ModeFile = Join-Path $LogDir '.server_mode'
 $RelayStamp = Join-Path $LogDir '.relay_target'
 # 认证服 / 游戏服 / 调试控制通道 / 注册页 / 中继两个口。
-# 注册页端口可配，所以从 server.config 里读；读不到就用默认的 27810。
+# 注册页端口可配，所以从 config\server.config 里读；读不到就用默认的 27810。
 $Ports    = @(47611, 27799, 27798, 27800, 47621, 27809, 27808)
-$ConfigPath = Join-Path $Root 'server.config'
+$ConfigPath = Join-Path $Root 'config\server.config'
 $webPort = 27810
 if (Test-Path -LiteralPath $ConfigPath) {
     foreach ($line in (Get-Content -LiteralPath $ConfigPath -Encoding UTF8)) {
