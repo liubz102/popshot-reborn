@@ -166,6 +166,9 @@ env/
 !/tools/build-ver.config
 !/server-ClientFilter.config
 
+# 打包时的版本号，由打包脚本根据 /tools/build-ver.config 自动生成，不需要上传git
+/BUILD.ver
+
 # ---------------------------------------------------------------------------
 # 本机配置、凭据、编辑器和操作系统杂项
 # .claude 的计划、结论与会话记录要提交，只忽略 Claude 的本机权限配置。
