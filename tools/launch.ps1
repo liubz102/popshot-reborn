@@ -159,18 +159,32 @@ function Get-TextSha256([string]$text) {
     }
 }
 
-# --- 版本号：启动横幅要显示 + 开发机现场生成 BUILD.ver -----------------------
+# --- 版本号：启动横幅要显示 + 开发机缺 BUILD.ver 时才补生成 -----------------
 # 客户端上报的版本号来自包根 BUILD.ver（bshook 读它补丁握手版本号）：
-#   * 开发机（仓库里）：按 tools\build-ver.config 现场生成一份，让开发机上报
-#     的版本和「将来打出来的包」一致；
-#   * 发布包：BUILD.ver 由打包脚本写好（且不带 build-ver.config，版本号源
-#     文件不进包），直接读它的 "version" —— 启动窗口第一行就能对上版本，
-#     排查时不用再翻文件问。
+#   * BUILD.ver 已存在：一律不碰（发布包里由打包脚本写好；开发机上要么是
+#     上次启动生成的、要么是手改过的调试值）—— 手改它就能试版本门禁 /
+#     上报版本，启动脚本不会把它刷回去。横幅直接读它的 "version"（bshook
+#     读的也是这份文件），排查时不用再翻文件问。
+#   * 开发机（仓库里）缺 BUILD.ver：按 tools\build-ver.config 现场生成一份，
+#     让开发机上报的版本和「将来打出来的包」一致（版本号源文件不进包）。
 # 认不出版本号只黄字提醒不拦启动：缺了它客户端按原版 311 上报（= 旧版）。
 $BuildVerText = ''
 $verSrc = Join-Path $Root 'tools\build-ver.config'
 $verDst = Join-Path $Root 'BUILD.ver'
-if (Test-Path -LiteralPath $verSrc -PathType Leaf) {
+$verSrcExists = Test-Path -LiteralPath $verSrc -PathType Leaf
+if (Test-Path -LiteralPath $verDst -PathType Leaf) {
+    $m = [regex]::Match([System.IO.File]::ReadAllText($verDst), '"version"\s*:\s*"([^"]+)"')
+    if ($m.Success) {
+        $BuildVerText = $m.Groups[1].Value
+        if ($verSrcExists) {
+            Say ''
+            Say "BUILD.ver 已存在（版本 $($BuildVerText)），保持不动 —— 客户端握手会上报这个版本"
+        }
+    } elseif ($verSrcExists) {
+        Say ''
+        Say '!! BUILD.ver 已存在但认不出版本号，未改动 —— 客户端将按旧版(311)上报' 'Yellow'
+    }
+} elseif ($verSrcExists) {
     Say ''
     $verText = ''
     foreach ($line in ([System.IO.File]::ReadAllText($verSrc) -split "`r?`n")) {
@@ -193,10 +207,6 @@ if (Test-Path -LiteralPath $verSrc -PathType Leaf) {
     } else {
         Say '!! tools\build-ver.config 里认不出版本号，BUILD.ver 没生成 —— 客户端将按旧版(311)上报' 'Yellow'
     }
-} elseif (Test-Path -LiteralPath $verDst -PathType Leaf) {
-    # 发布包：静默读出版本给横幅用（bshook 读的也是这份文件）
-    $m = [regex]::Match([System.IO.File]::ReadAllText($verDst), '"version"\s*:\s*"([^"]+)"')
-    if ($m.Success) { $BuildVerText = $m.Groups[1].Value }
 } else {
     Say ''
     Say '!! 根目录没有 BUILD.ver —— 客户端将按旧版(311)上报，连开了版本门禁的服务器会被要求升级' 'Yellow'

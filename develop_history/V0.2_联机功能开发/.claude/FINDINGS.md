@@ -6362,6 +6362,9 @@ COIN_ITEM_VALUES = {10101: 1, 10102: 5}
 运行：bshook 每次启动读包根 BUILD.ver（DLL 目录上跳三级，同 open_log）→
       算 wire → patch 0x54d98f；读到/没读到都往 bshook 日志打一行版本
 开发：launch.ps1 启动时按 build-ver.config 现场生成根 BUILD.ver
+      ★ 会话 48 起改为**只在缺失时生成**：已存在就一个字节不碰，横幅版本
+      改从这份文件读（= bshook 实际上报口径）—— 手改 BUILD.ver 调门禁
+      不会被启动脚本刷掉；代价是 bump 版本后要手动删一次根 BUILD.ver（D157）
 门禁：服务端每条连接 mtime 缓存热重载 server-ClientFilter.config（0=不限制，
       含旧版可连）；改配置不用重启服务器
 ```
