@@ -97,7 +97,8 @@ static int copy_with_retry(const wchar_t *src, const wchar_t *dst,
 
 int apply_update(const wchar_t *zip_path, const wchar_t *root,
                  apply_progress_fn progress, void *user,
-                 int *moved_out, wchar_t *err, size_t err_cap)
+                 int *moved_out, int *zip_bad,
+                 wchar_t *err, size_t err_cap)
 {
     ZipFile z;
     wchar_t staging[MAX_PATH * 2];
@@ -107,7 +108,11 @@ int apply_update(const wchar_t *zip_path, const wchar_t *root,
     unsigned long pid = GetCurrentProcessId();
 
     *moved_out = 0;
-    if (!zip_open(&z, zip_path, err, err_cap)) return 0;
+    if (zip_bad) *zip_bad = 0;
+    if (!zip_open(&z, zip_path, err, err_cap)) {
+        if (zip_bad) *zip_bad = 1;
+        return 0;
+    }
 
     /* staging 建包根（同盘：MoveFileEx 搬运用，跨盘会失败；盘空间问题也
        在正确的盘上暴露）。目录名带 pid 防撞。 */
@@ -128,6 +133,7 @@ int apply_update(const wchar_t *zip_path, const wchar_t *root,
         if (apply_is_protected(z.rels[i])) { skipped++; continue; }
         if (wide_ieq(z.rels[i], L"BUILD.ver")) buildver_index = i;
         if (!zip_extract_to(&z, i, staging, err, err_cap)) {
+            if (zip_bad) *zip_bad = 1;
             delete_tree(staging);
             zip_close(&z);
             return 0;

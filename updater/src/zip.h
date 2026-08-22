@@ -12,8 +12,12 @@ typedef struct ZipFile {
     mz_zip_archive arc;
     int opened;
     /* 条目表（去掉目录项后的文件条目，rel = 剥掉顶层目录后的相对路径，
-       正斜杠统一改反斜杠方便直接拼 Windows 路径）。 */
+       正斜杠统一改反斜杠方便直接拼 Windows 路径）。
+       ★ mzidx = 每个接受条目在 zip 里的【原始】序号（含目录项）——
+       真实包带 18 个目录条目，两张表错位过一版：解压拿紧凑下标当原始
+       索引用，第一发就解到目录条目上报「zip 损坏」（§239）。 */
     int count;
+    int *mzidx;                           /* [count]：miniz 原始索引 */
     wchar_t (*names)[MAX_PATH * 2];      /* zip 内原始名（含顶层目录） */
     wchar_t (*rels)[MAX_PATH * 2];       /* 剥顶层后的路径（\ 分隔） */
 } ZipFile;

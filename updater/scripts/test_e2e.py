@@ -6,6 +6,8 @@
         config\\server.config              server_address=127.0.0.1（连假门禁）
         game_patched\\BsPatcherChn.exe      新更新器（本工程产物）
         game_patched\\test.txt              旧内容
+        runtime\\python\\python.exe         假「本机服务端」（sleep 挂着等被停）
+    <tmp>\\popshot-e2e-decoy\\python.exe    诱饵：与本包无关的 python.exe
     <tmp>\\popshot-e2e-web\\                本地 http 服务目录
         manifest.json                      目标 V0.0.10
         update.zip                         假客户端包（含新 BUILD.ver、新 exe、新 test.txt）
@@ -17,6 +19,8 @@
     3. 应用：BUILD.ver 最后写；保护文件不覆盖；运行中的更新器自己改名
        .update_old 让位（新 exe 落原名）
     4. 更新后本地版本 = V0.0.10
+    5. 停进程：包内 python 被树杀；诱饵 python 一个不碰且不引发
+       「服务端结束不了」误报（V0.2 会话 50 真机踩坑的回归）
 """
 
 import hashlib
@@ -44,9 +48,53 @@ OLD_VERSION = "0.2.7"
 OLD_WIRE = 2007          # 0.2.7 的线上编码（versioning.encode_wire）
 
 
+CLEANUP_PROCS = []       # 测试自己起的进程，收尾（无论成败）统一带走
+CLEANUP_PIDS = []        # 没有 Popen 句柄的（见 spawn_detached_sleeper）
+
+
 def die(msg):
     print("!! E2E FAIL:", msg)
+    for p in CLEANUP_PROCS:
+        try:
+            p.kill()
+        except OSError:
+            pass
+    for pid in CLEANUP_PIDS:
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                       capture_output=True)
     sys.exit(1)
+
+
+def pid_alive(pid):
+    """事后核验用。绝不能在更新器运行期间持有目标进程句柄 —— 测试一攥
+    句柄，杀掉的进程 pid 就一直可解析，「pid 失效被误判存活」的回归就
+    被掩盖了（§238，上一版 e2e 正是这么漏掉的）。"""
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "if (Get-Process -Id %d -ErrorAction SilentlyContinue) {'y'} "
+         "else {'n'}" % pid],
+        capture_output=True, text=True, timeout=120).stdout.strip()
+    return out == "y"
+
+
+def spawn_detached_sleeper(python_exe):
+    """复刻真实启动链：launch.ps1 用 Start-Process 起服务端后 powershell
+    随即退出 —— 服务端 python 的爹死透了，没人攥它的进程句柄。
+    返回 pid（不是 Popen，理由见 pid_alive）。"""
+    # ★ PS 5.1 的 -ArgumentList 不给含空格的参数补引号（launch.ps1 同款坑），
+    #   -c 的代码串必须自己内嵌双引号，否则 python 收到 `-c import` 就秒退。
+    cmd = ("$p = Start-Process -FilePath '%s' "
+           "-ArgumentList @('-c','\"import time; time.sleep(600)\"') "
+           "-WindowStyle Hidden -PassThru; Write-Output $p.Id" % python_exe)
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                         capture_output=True, text=True, timeout=120)
+    try:
+        pid = int(out.stdout.strip())
+    except ValueError:
+        die("沙箱假服务端没起来（powershell 输出 %r / %r）"
+            % (out.stdout, out.stderr))
+    CLEANUP_PIDS.append(pid)
+    return pid
 
 
 def build_sandbox(sandbox, web):
@@ -85,6 +133,13 @@ def build_sandbox(sandbox, web):
     if os.path.exists(zpath):
         os.remove(zpath)
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+        # ★ 先写目录条目 —— 真实发布包（打包脚本）里有 18 个；旧代码
+        #   的「紧凑下标当原始索引用」正是被「只有文件条目」的 zip 掩住
+        #   的（§239：真机第一发就解到目录条目上报 zip 损坏）。
+        for d in ("", "/game_patched", "/config"):
+            zi = zipfile.ZipInfo(top + d + "/")
+            zi.external_attr = 0x10            # 目录
+            zf.writestr(zi, "")
         for base, _dirs, files in os.walk(staging):
             for name in files:
                 full = os.path.join(base, name)
@@ -153,15 +208,61 @@ class Gate(threading.Thread):
             pass
 
 
+def spawn_sleeper(python_exe, extra_env=None):
+    """起一个挂着 sleep 的 python（模拟本机服务端 / 无关 python）。"""
+    env = dict(os.environ)
+    if extra_env:
+        env.update(extra_env)
+    # CREATE_NO_WINDOW：不闪控制台；DETACHED 会让 python 找不到控制台句柄。
+    proc = subprocess.Popen(
+        [python_exe, "-c", "import time; time.sleep(600)"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=env, creationflags=0x08000000)
+    CLEANUP_PROCS.append(proc)
+    return proc
+
+
+def setup_fake_pythons(sandbox, decoy_dir):
+    """沙箱里摆两个 python.exe：
+       - sandbox\\runtime\\python\\ = 假「本机服务端」（更新器该杀；
+         爹已退出、无人攥句柄 = 真实启动链形态，§238 回归）
+       - decoy_dir                = 诱饵（更新器绝不许碰）。
+       返回 (package_pid, decoy_proc)。"""
+    src_dir = os.path.join(ROOT, "runtime", "python")
+    py = os.path.join(src_dir, "python.exe")
+    if not os.path.exists(py):
+        die("找不到 runtime\\python\\python.exe：%s" % py)
+    for dst_dir in (os.path.join(sandbox, "runtime", "python"), decoy_dir):
+        os.makedirs(dst_dir, exist_ok=True)
+        # 嵌入式发行版：python.exe + 同目录 DLL 就能跑（time 是内建模块）。
+        shutil.copyfile(py, os.path.join(dst_dir, "python.exe"))
+        for dll in os.listdir(src_dir):
+            if dll.lower().endswith(".dll"):
+                shutil.copyfile(os.path.join(src_dir, dll),
+                                os.path.join(dst_dir, dll))
+    return (spawn_detached_sleeper(os.path.join(sandbox, "runtime", "python",
+                                                "python.exe")),
+            spawn_sleeper(os.path.join(decoy_dir, "python.exe")))
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="popshot-e2e-")
     sandbox = os.path.join(tmp, "sandbox")
     web = os.path.join(tmp, "web")
+    decoy_dir = os.path.join(tmp, "decoy")
     os.makedirs(sandbox)
     os.makedirs(web)
     print("sandbox:", sandbox)
 
     build_sandbox(sandbox, web)
+    pkg_pid, decoy_py = setup_fake_pythons(sandbox, decoy_dir)
+    # 给假服务端一点成形时间（慢机器上 image path 查询要进程已成形）。
+    time.sleep(1.5)
+    if not pid_alive(pkg_pid):
+        die("沙箱假服务端 python 没起来（pid=%d 查无此进程）" % pkg_pid)
+    if decoy_py.poll() is not None:
+        die("诱饵 python 没起来（exit=%r）" % decoy_py.returncode)
+    print("fake package python (orphaned parent, no handles) + decoy running")
 
     def handler_factory(*args, **kwargs):
         return SimpleHTTPRequestHandler(*args, directory=web, **kwargs)
@@ -200,6 +301,19 @@ def main():
     httpd.shutdown()
     if gate:
         gate.stop()
+
+    # ---- 停进程断言（§236/§238 回归：爹死透的服务端要真被停、诱饵不碰、
+    #      不误报「结束不了」） ------------------------------------------------
+    time.sleep(2)          # 杀掉的 pid 收尾有零点几秒
+    if pid_alive(pkg_pid):
+        die("沙箱假服务端 python 没被更新器停掉（pid=%d 还活着）" % pkg_pid)
+    print("package python terminated by updater (pid=%d, handle-free)" % pkg_pid)
+
+    if decoy_py.poll() is not None:
+        die("诱饵 python 被更新器误杀了（按路径精确匹配失效）")
+    print("decoy python untouched (still running) - no false 'cannot stop'")
+    decoy_py.kill()
+    decoy_py.wait(timeout=10)
 
     # ---- 断言 ------------------------------------------------------------
     if gate is not None:

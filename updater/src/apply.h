@@ -18,9 +18,12 @@ typedef void (*apply_progress_fn)(void *user, int done, int total);
 /* zip 里相对路径（\ 或 /）是否命中玩家数据排除清单。selftest 钉住。 */
 int apply_is_protected(const wchar_t *rel);
 
-/* 应用更新。返回 1 成功；err 收失败原因。 */
+/* 应用更新。返回 1 成功；err 收失败原因。
+   zip_bad（可 NULL）：1 = 失败在 zip 本身（打不开/解压/CRC），调用方
+   应丢弃下载缓存逼下次重下（毒缓存死循环，§239 真机踩坑）。 */
 int apply_update(const wchar_t *zip_path, const wchar_t *root,
                  apply_progress_fn progress, void *user,
-                 int *moved_out, wchar_t *err, size_t err_cap);
+                 int *moved_out, int *zip_bad,
+                 wchar_t *err, size_t err_cap);
 
 #endif /* UPDATER_APPLY_H */

@@ -274,13 +274,27 @@ static DWORD WINAPI preview_worker(LPVOID param)
     (void)param;
     ui_announce_version(L"V9.9.9");
     ui_status(L"（预览模式）正在演示更新进度……");
+    /* 口径同 main.c 的 PHASE_* 里程碑：「目前」=当前步骤，「全部」=全流程。
+       下载段 2→60，停进程 60→64，覆盖段 64→99，收尾 100。 */
+    ui_set_stage(UI_STAGE_DOWNLOAD);
     for (i = 0; i <= 100; i += 2) {
-        if (i < 70) ui_progress_total(i);
-        ui_progress_current(i * 100 / 70 > 100 ? 100 : i * 100 / 70);
+        ui_progress_current(i);
+        ui_progress_total(2 + 58 * i / 100);
         ui_remaining(L"已下载 123.4 MiB  5.6 MiB/s  剩余约 42 秒");
-        Sleep(80);
+        Sleep(30);
     }
     ui_remaining(NULL);
+    ui_progress_current(0);
+    ui_progress_total(62);
+    Sleep(400);
+    ui_progress_total(64);
+    Sleep(400);
+    ui_set_stage(UI_STAGE_APPLY);
+    for (i = 0; i <= 100; i += 2) {
+        ui_progress_current(i);
+        ui_progress_total(64 + 35 * i / 100);
+        Sleep(30);
+    }
     ui_progress_total(100);
     ui_progress_current(100);
     ui_set_stage(UI_STAGE_FINAL);

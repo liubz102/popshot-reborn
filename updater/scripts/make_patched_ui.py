@@ -65,8 +65,18 @@ DRAG = ('onmousedown="if((event.button==0||event.button==1)'
         'window.external.DragMove()"')
 
 LINEBOX_FIX = ('<style>img{display:block}iframe{display:block}'
-               '#BtmSec p.CurrentTxt{height:14px !important;'
-               'top:2px !important}</style>')
+               '#BtmSec div.Pos{height:32px !important}'
+               '#BtmSec p.CurrentTxt{height:28px !important;'
+               'top:2px !important;width:455px !important;'
+               'line-height:14px !important;white-space:normal !important;'
+               'word-break:break-all !important}</style>')
+# ★ 状态小字两行（2026-08-23 用户拍板）：下载期提示要放「网络不通可从
+#   QQ群文件手动下载」整句（约 580px），单行 450px 装不下 —— CurrentTxt
+#   放宽到 28px 两行、Pos 容器 18 -> 32 托住，窗体高度由 scrollHeight
+#   自适应跟着长。
+# ★ 宽度 455（2026-08-23 真机二轮修正）：底部内容列实际约 548px 宽
+#   （不是整窗 572），取消钮从 x≈492 起 —— 左 20+内衬 8+455=483，
+#   第一行才不会被按钮挡住（首版 485px 挡了，用户截图实锤）。
 
 PATCHES = {
     "TEMPLATE_PATCH.HTML": [

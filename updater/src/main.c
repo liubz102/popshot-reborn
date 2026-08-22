@@ -172,7 +172,29 @@ static const ReleaseEntry *pick_target(const Manifest *m, const Ver *wanted,
 }
 
 /* ------------------------------------------------------------------ */
-/*  下载（进度/速度/剩余时间 -> 双进度条的「全部」条 + 剩余时间行）         */
+/*  进度（用户拍板 V0.2 会话 50）：                                    */
+/*    「目前」= 当前步骤自己的进度（下载按字节、覆盖按文件数）；        */
+/*    「全部」= 整个更新流程的加权总进度（探针/清单→下载→等游戏退出→   */
+/*              停服务端→解压覆盖）。                                  */
+/* ------------------------------------------------------------------ */
+
+/* 「全部」条的分段里程碑（百分比）。 */
+#define PHASE_AFTER_MANIFEST  2    /* 探针 + 清单拿齐、目标已定 */
+#define PHASE_AFTER_DOWNLOAD  60   /* 下载 + sha256 校验完成 */
+#define PHASE_AFTER_GAMEEXIT  62   /* 游戏退出（等/强杀）完成 */
+#define PHASE_AFTER_STOPS     64   /* 本机服务端/中继停干净 */
+#define PHASE_AFTER_APPLY     99   /* staging 解压 + 覆盖完成（100=收尾） */
+
+/* 某步骤内 frac(0-100) 折算成「全部」条的读数。 */
+static void overall_from(int step_base, int step_end, int frac)
+{
+    int percent = step_base + (step_end - step_base) * frac / 100;
+    if (percent > 100) percent = 100;
+    ui_progress_total(percent);
+}
+
+/* ------------------------------------------------------------------ */
+/*  下载（进度/速度/剩余时间；「目前」=下载字节%、「全部」=全流程）      */
 /* ------------------------------------------------------------------ */
 
 /* 字节数 -> MiB 一位小数的宽串。 */
@@ -199,6 +221,7 @@ static void apply_progress_cb(void *user, int done, int total)
     if (total <= 0) return;
     percent = done * 100 / total;
     ui_progress_current(percent);
+    overall_from(PHASE_AFTER_STOPS, PHASE_AFTER_APPLY, percent);
     if (done % 400 == 0) {
         wchar_t text[96];
         _snwprintf(text, 96, L"正在写入文件……已完成 %d / %d", done, total);
@@ -226,7 +249,8 @@ static int download_progress(void *user, unsigned long long done,
         percent = (int)(done * 100 / total);
         if (percent != du->last_percent) {
             du->last_percent = percent;
-            ui_progress_total(percent);
+            ui_progress_current(percent);
+            overall_from(PHASE_AFTER_MANIFEST, PHASE_AFTER_DOWNLOAD, percent);
         }
         elapsed = now - du->started;
         if (elapsed > 800 && done) {
@@ -275,7 +299,7 @@ static int fetch_zip_cached(const ReleaseEntry *e, wchar_t *zip_out,
         DeleteFileW(zip_out);
     }
 
-    ui_status(L"正在下载完整客户端包（约 400 MiB），请耐心等待……");
+    ui_status(L"正在从 Github 下载客户端包（约 400 MB），如果网络不通或速度缓慢，可以从QQ群文件手动下载并更新。");
     log_line("download %ls", e->url);
     started = GetTickCount64();
     du.started = started;
@@ -329,6 +353,7 @@ static DWORD WINAPI worker_main(LPVOID param)
     const ReleaseEntry *target = NULL;
     wchar_t zip_path[MAX_PATH * 2];
     wchar_t ver_text[64];
+    int i;
 
     (void)param;
     wcscpy(zip_path, g_ctx.args.zip);       /* 提权重跑的直通参数 */
@@ -384,9 +409,11 @@ static DWORD WINAPI worker_main(LPVOID param)
         log_line("target %ls", ver_text);
         ui_announce_version(ver_text);
         ui_status(L"准备下载更新……");
+        ui_progress_total(PHASE_AFTER_MANIFEST);
 
         /* --- 下载 + 校验（在提权之前：临时目录不需要管理员） ---------- */
         ui_set_stage(UI_STAGE_DOWNLOAD);
+        ui_progress_current(0);
         if (!fetch_zip_cached(target, zip_path, MAX_PATH * 2, err, 512)) {
             if (wide_ieq(err, L"cancelled"))
                 finish_ok(L"已取消更新。可以关闭本窗口。");
@@ -394,6 +421,8 @@ static DWORD WINAPI worker_main(LPVOID param)
                 finish_fail(err);
             return 1;
         }
+        ui_progress_current(100);
+        ui_progress_total(PHASE_AFTER_DOWNLOAD);
     } else {
         /* --zip 直通：目标版本从参数/manifest 补齐（进度条目标）。 */
         if (g_ctx.args.target_version[0]) {
@@ -401,6 +430,7 @@ static DWORD WINAPI worker_main(LPVOID param)
             ver_text[63] = 0;
             ui_announce_version(ver_text);
         }
+        ui_progress_total(PHASE_AFTER_DOWNLOAD);   /* 包已就手，视同下载完成 */
     }
 
     if (ui_cancel_requested()) {
@@ -409,11 +439,17 @@ static DWORD WINAPI worker_main(LPVOID param)
     }
 
     /* --- 等游戏退出（game_patched 的文件都被它锁着） ----------------- */
+    ui_progress_current(0);
     {
         DWORD still[PROCS_MAX_PIDS];
         int still_count = 0;
-        int rc = procs_wait_game_exit(g_ctx.args.procid, still, &still_count);
-        int i;
+        int rc;
+        ui_status(L"正在等待游戏退出……");
+        rc = procs_wait_game_exit(g_ctx.args.procid, still, &still_count);
+        if (rc == 3) {
+            finish_ok(L"已取消更新。可以关闭本窗口。");
+            return 0;
+        }
         if (rc == 1) {
             int btn = ui_message_box(
                 L"更新需要关闭游戏。<br>点击「确认」将自动结束游戏进程。",
@@ -424,27 +460,42 @@ static DWORD WINAPI worker_main(LPVOID param)
             }
             for (i = 0; i < still_count; i++)
                 procs_tree_kill(still[i]);
-            if (procs_wait_gone(still, still_count, 20, 250) != 0) {
-                finish_fail(L"游戏进程结束不了，文件仍被占用。请手动关闭游戏后重试。");
-                return 1;
+            {
+                int gone = procs_wait_gone(still, still_count, 20, 250);
+                if (gone == -1) {
+                    finish_ok(L"已取消更新。可以关闭本窗口。");
+                    return 0;
+                }
+                if (gone != 0) {
+                    finish_fail(L"游戏进程结束不了，文件仍被占用。请手动关闭游戏后重试。");
+                    return 1;
+                }
             }
         } else if (rc == 2) {
             finish_fail(L"游戏进程结束不了，文件仍被占用。请手动关闭游戏后重试。");
             return 1;
         }
     }
+    ui_progress_total(PHASE_AFTER_GAMEEXIT);
 
     /* --- 停本机服务端/中继（锁着 runtime\python\python.exe） ---------- */
     {
         int ended = 0;
-        int stopped = procs_stop_package_pythons(g_ctx.root, &ended);
+        int stopped;
+        ui_status(L"正在停止本机服务端……");
+        stopped = procs_stop_package_pythons(g_ctx.root, &ended);
         if (stopped)
             log_line("stopped package pythons=%d", stopped);
+        if (ended == 2) {
+            finish_ok(L"已取消更新。可以关闭本窗口。");
+            return 0;
+        }
         if (ended) {
             finish_fail(L"本机服务端进程结束不了（runtime 仍被占用）。请手动关闭它的窗口后重试更新。");
             return 1;
         }
     }
+    ui_progress_total(PHASE_AFTER_STOPS);
 
     /* --- 写权限：平时零提权，写不进才弹原版 CONFIRMRUNADMIN 框 --------- */
     if (!g_ctx.args.elevated && !root_is_writable_or_ask()) {
@@ -466,11 +517,26 @@ static DWORD WINAPI worker_main(LPVOID param)
     /* --- 应用 -------------------------------------------------------- */
     ui_set_stage(UI_STAGE_APPLY);
     ui_remaining(NULL);
+    ui_progress_current(0);
     {
         int moved = 0;
+        int zip_bad = 0;
         ui_status(L"正在应用更新（写入文件）……");
         if (!apply_update(zip_path, g_ctx.root, apply_progress_cb, NULL,
-                          &moved, err, 512)) {
+                          &moved, &zip_bad, err, 512)) {
+            if (zip_bad) {
+                /* 缓存是按 sha256 复用的 —— sha 对但 zip 读不了时，
+                   不丢缓存每次都原地卡死（真机踩坑 §239）。丢了逼重下。
+                   ★ 手动下载地址不在这里重复：finish_fail 的公告页末尾
+                   本来就固定带「请手动下载完整客户端(QQ群文件或Github)：
+                   <Releases 地址>」区块（真机反馈：写两遍显得啰嗦）。 */
+                DeleteFileW(zip_path);
+                _snwprintf(err + wcslen(err), 512 - wcslen(err),
+                           L"\n已丢弃下载缓存，重新运行更新器会重新下载。"
+                           L"\n若反复失败请从QQ群文件或Github手动下载完整客户端"
+                           L"（下载地址见下方）。");
+                err[511] = 0;
+            }
             finish_fail(err);
             return 1;
         }
@@ -655,6 +721,7 @@ int WINAPI wWinMain(HINSTANCE me, HINSTANCE prev, PWSTR cmd, int show)
 
     /* --- UI + worker ---------------------------------------------------- */
     ui_init(root, args->ui_mode, args->noui || noui_env);
+    procs_set_cancel_probe(ui_cancel_requested);   /* 停进程等态可被取消打断 */
     if (!(args->noui || noui_env)) {
         if (!ui_window_create_patch()) {
             /* 窗口都建不起来（极端）——退无界面模式，更新照跑。 */

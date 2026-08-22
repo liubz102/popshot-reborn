@@ -40,6 +40,34 @@ typedef struct Sink {
     int cancelled;
 } Sink;
 
+/* 下载期取消节拍（用户拍板 0.5s 内）：WinHttpQueryDataAvailable 会一直
+   堵到有数据 —— 慢链路/断流时取消没机会被检查。试过把接收超时压到
+   0.5s，但 >0.5s 的正常到货间隙会把请求毒化（ReadData 回 12019），
+   慢速真下载直接报错 —— 弃。改为看门狗线程：每 200ms 查一次取消，
+   发现取消就主动 Close 请求句柄，把阻塞中的读解锁（<=0.5s 生效）。 */
+typedef struct NetWatch {
+    HANDLE thread;
+    HANDLE stop;                  /* net_fetch 收尾时叫停看门狗 */
+    HINTERNET req;                /* 取消时要撬开的句柄（可为 NULL） */
+    Sink *sink;                   /* 看门狗自己也按节拍跑进度回调 */
+    volatile LONG req_closed;     /* 1 = 句柄已被看门狗关掉，主人别再关 */
+} NetWatch;
+
+static DWORD WINAPI net_watch_dog(LPVOID param)
+{
+    NetWatch *w = (NetWatch *)param;
+    while (WaitForSingleObject(w->stop, 200) == WAIT_TIMEOUT) {
+        if (w->sink->progress &&
+            !w->sink->progress(w->sink->user, w->sink->done, w->sink->total)) {
+            w->sink->cancelled = 1;
+            InterlockedExchange(&w->req_closed, 1);
+            WinHttpCloseHandle(w->req);   /* 撬开阻塞中的读 */
+            return 0;
+        }
+    }
+    return 0;
+}
+
 static int sink_open_mem(Sink *s, char *buf, size_t cap)
 {
     memset(s, 0, sizeof(*s));
@@ -99,11 +127,14 @@ static int net_fetch(const wchar_t *url, Sink *s, unsigned long long *total_out,
     wchar_t host[256];
     wchar_t path[1024];
     HINTERNET hnet = NULL, hconn = NULL, hreq = NULL;
+    NetWatch watch;
     DWORD secure = 0;
     BOOL ok;
     DWORD status = 0, status_size = sizeof(status);
     unsigned long long total = 0;
     int result = 0;
+
+    memset(&watch, 0, sizeof(watch));
 
     *total_out = 0;
     memset(&uc, 0, sizeof(uc));
@@ -177,16 +208,36 @@ static int net_fetch(const wchar_t *url, Sink *s, unsigned long long *total_out,
     if (s->progress && total)
         s->progress(s->user, 0, total);       /* 先报一次总量，UI 能算百分比 */
 
+    /* 看门狗只陪「带进度回调的下载」（= 大文件、可取消）；manifest 这类
+       小取（progress == NULL）用不着。 */
+    if (s->progress) {
+        watch.stop = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (watch.stop) {
+            watch.req = hreq;
+            watch.sink = s;
+            watch.req_closed = 0;
+            watch.thread = CreateThread(NULL, 0, net_watch_dog, &watch, 0, NULL);
+        }
+    }
+
     for (;;) {
         DWORD got = 0;
         static unsigned char buf[1 << 20];
         if (!WinHttpQueryDataAvailable(hreq, &got)) {
+            if (s->cancelled) {
+                set_err(err_out, err_cap, L"cancelled");
+                goto done;
+            }
             set_err(err_out, err_cap, L"读取数据失败 (%lu)", GetLastError());
             goto done;
         }
         if (!got) break;                      /* 流结束 */
         if (got > sizeof(buf)) got = sizeof(buf);
         if (!WinHttpReadData(hreq, buf, got, &got)) {
+            if (s->cancelled) {
+                set_err(err_out, err_cap, L"cancelled");
+                goto done;
+            }
             set_err(err_out, err_cap, L"读取数据失败 (%lu)", GetLastError());
             goto done;
         }
@@ -206,7 +257,15 @@ static int net_fetch(const wchar_t *url, Sink *s, unsigned long long *total_out,
     result = 1;
 
 done:
-    if (hreq) WinHttpCloseHandle(hreq);
+    /* 先叫停看门狗并等它退场，再碰句柄 —— 它取消时关过 hreq，
+       这里按 req_closed 分工，避免双重 Close。 */
+    if (watch.thread) {
+        SetEvent(watch.stop);
+        WaitForSingleObject(watch.thread, 5000);
+        CloseHandle(watch.thread);
+    }
+    if (watch.stop) CloseHandle(watch.stop);
+    if (hreq && !watch.req_closed) WinHttpCloseHandle(hreq);
     if (hconn) WinHttpCloseHandle(hconn);
     if (hnet) WinHttpCloseHandle(hnet);
     return result;

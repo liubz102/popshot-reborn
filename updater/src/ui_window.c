@@ -676,7 +676,7 @@ static int write_error_announce_html(const wchar_t *detail)
         L"<body>\n"
         L"<p><b style=\"color:#FE0000\">自动更新没能完成</b></p>\n"
         L"<p>%s</p>\n"
-        L"<p>请手动下载完整客户端：</p>\n"
+        L"<p>请手动下载完整客户端(QQ群文件或Github)：</p>\n"
         L"<p><b>https://github.com/liubz102/popshot-reborn/releases</b></p>\n"
         L"</body></html>\n", esc);
     wbody[1599] = 0;
@@ -743,7 +743,7 @@ static int error_announce_data_uri(wchar_t *out, size_t cap,
         L"p{margin:10px 20px;line-height:170%%;text-align:left}"
         L"</style></head>"
         L"<body><p><b style=\"color:#FE0000\">自动更新没能完成</b></p>"
-        L"<p>%s</p><p>请手动下载完整客户端：</p>"
+        L"<p>%s</p><p>请手动下载完整客户端(QQ群文件或Github)：</p>"
         L"<p><b>https://github.com/liubz102/popshot-reborn/releases</b></p>"
         L"</body></html>", esc);
     wbody[1599] = 0;

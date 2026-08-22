@@ -6695,3 +6695,191 @@ staging 同盘整包解压 → PROTECTED_PATHS 跳过 → 逐文件 MoveFileEx �
      height:11px+overflow:hidden，字号却 12px，IE11 行盒 ~14px 必裁。
      注入 `#BtmSec p.CurrentTxt{height:14px !important;top:2px !important}`
      （容器 BtmSec 高 18px 容得下）；像素验证字形完整占 12 行、收尾行干净。
+
+## 236. ★★★★★ 停服务端「结束不了」误报的两层真因 + 双进度条口径重定义（V0.2 会话 50）
+
+用户把 V0.2.7 传上 GitHub Release、本地包版本改成 0.2.6 真机触发自动更新
+（`dist\PopShot-port able-win64_V0-2-7_带服务器设置`，2026-08-23 01:16），
+下载 376MB/37s 全部正常，随后报「本机服务端进程结束不了（runtime 仍被
+占用）」。updater.log 显示两个包内 python（服务端+中继）**都被找到且都执行
+了树杀**，5 秒后仍判失败 —— 杀是对的，**判定错了**。
+
+### 1. 误报第一层：等待名单混进了不相干的 python.exe
+
+`procs_stop_package_pythons` 的收尾检查（旧代码）把 `procs_by_name(
+"python.exe")` 搜到的**全部** pid 拿去做「还活着吗」判定和 wait_gone ——
+包括被路径核验**主动跳过**的那些。开发机/玩家机上只要有任何一个别的
+python.exe 存活（常驻工具、别的游戏服……），包内服务端明明杀干净了也会
+等满 5 秒然后误报失败。修法：另建 `mine[]` 名单，只装路径匹配本包两份
+runtime 的 pid；等待/补杀/失败判定全部只看这份名单。
+
+### 2. 误报第二层：进程树收养捡进 conhost.exe（保护进程，必杀不死）
+
+修掉第一层后 e2e 复跑**立刻**揭出第二层：`procs_collect_tree` 按 ppid 收
+树，而**带自己控制台的 python（`CREATE_NO_WINDOW` / `start` 新开窗口）会
+挂一个 conhost.exe 子进程**（实测 PowerShell Win32_Process 确认）。conhost
+是保护进程，`TerminateProcess` 必 ACCESS_DENIED，进等待名单就是等死的
+节奏 → 又是误报「结束不了」。真实玩家场景同样会踩：launch.ps1 给服务端
+新开控制台窗口时 conhost 就是 python 的子进程。修法：树收养的成员必须
+**再过一遍 exe 完整路径核验**（`image_is_package`）才进 `mine[]` ——
+conhost / 因 **PID 复用**被错收养的系统进程全部挡在名单外（树杀本身照旧
+全树 Terminate，杀不动的无害；python 死后 conhost 自行退出）。
+
+两层都修掉之后：e2e 沙箱里包内假服务端被停（exit=1）、**诱饵 python 全程
+存活不受碰**、更新全链走通。顺手加了一发 e2e 回归（`setup_fake_pythons`）：
+沙箱 runtime + 无关目录各摆一个睡眠 python，断言「该死的死、不该死的活、
+不误报」。
+
+### 3. 双进度条口径重定义（用户拍板）
+
+原实现把**下载百分比接在「全部」条**上、「目前」条只在覆盖阶段动 —— 用户
+真机截图反馈：下载时「目前」一直是空的。新口径（`main.c` 的
+`PHASE_*` 里程碑）：
+
+| 条 | 含义 | 数据源 |
+|---|---|---|
+| 目前 | **当前步骤**自己的进度 | 下载=字节%；覆盖=文件数%；步骤切换时归零 |
+| 全部 | **整个更新流程**加权总进度 | 探针/清单 0→2，下载 2→60，等游戏退出 60→62，停服务端 62→64，解压覆盖 64→99，收尾 100 |
+
+`--zip` 提权直通路径把「全部」直接置 60（包已就手视同下载完成）；
+`--preview` 演示模式同步改成新口径（截图核对用）。停进程两步各加了
+状态文案（「正在等待游戏退出……」「正在停止本机服务端……」），不再无声
+卡 5 秒。
+
+### 4. 遗留：GitHub 上的 V0.2.7 Release 资产里还是旧更新器
+
+修好的更新器只在本地（`updater\bin` + `game_patched` + 两份 dist 沙箱）。
+**V0.2.7 的 zip 是修复前打的**，玩家更新到 0.2.7 后盘上的更新器又变回旧版
+（运行中的新更新器通过改名让位把旧 exe 落回原名）。要让后续玩家拿到修复，
+要么重传 V0.2.7 资产（zip+manifest.json 同步换），要么随 V0.2.8 发 ——
+用户定。
+
+## 237. ★★★★ 更新器 vs 没关的 start.bat 窗口：不挡更新，只留一个旧窗口（V0.2 会话 50 追加）
+
+用户追问：自动更新结束旧进程时，玩家启动用的 start.bat 黑窗口没关
+（也从来不会自己关）怎么办。逐环节查清：
+
+### 1. 启动链各进程在更新时刻的存活状态
+
+| 进程 | 更新时还在吗 | 攥着什么 | 对更新的影响 |
+|---|---|---|---|
+| powershell（launch.ps1） | **早已退出**（起完服务端/中继/bsloader 就 exit 0，不等游戏） | — | 无 |
+| cmd（start.bat） | **在**：launch.ps1 返回后停在第 32 行无条件 `pause` | start.bat 的打开句柄 + 包根 CWD | 见 2，**不挡覆盖** |
+| python 服务端/中继 | 在（隐藏窗口） | runtime + 端口 | 更新器负责杀（§236） |
+| bsloader | 在（等游戏退出，`WaitForSingleObject(pi.hProcess, INFINITE)`） | hook\bin\bsloader.exe | 见 3，游戏死它自退 |
+| BigShot | 在 | game_patched\* | 更新器等退/询问后强杀 |
+
+### 2. ★ 实测：被运行中的 cmd 攥着的 .bat 可以直接覆盖
+
+Win10 19045 实测（隐藏 cmd 跑长批处理期间，另一进程调
+`MoveFileExW(REPLACE_EXISTING)`）：**成功，GLE=0**——cmd 打开批处理
+文件带 `FILE_SHARE_DELETE`，改名让位同理可行。所以停在 `pause` 的
+start.bat 窗口**不会卡住 apply**（start.bat 在更新包里）。
+Win7 未实测；即便那边 share 模式不同，apply 的兜底链是 20 次重试 →
+改名让位 → 明确报错（zip 已缓存，关窗重跑即可），风险可接受。
+被覆盖后按任意键，cmd 从**原句柄（已解链但数据完好）**继续执行剩余
+行 `exit /b`，干净退出，无副作用。
+
+### 3. bsloader 对「游戏被强杀」的分类：自退，不复活
+
+`run_attempt` 里游戏退出时看 `signaled(ev.hit)`：更新场景游戏早已过了
+GameGuard 绕过点（hit 早就置位）→ 判 `ATTEMPT_OK`、bsloader 自行退出。
+GG-RETRY 重试只在「DR0 命中**前**」退出才触发——那是启动头几秒的事，
+与更新器杀游戏不沾边，不存在「杀掉又被拉起来」的竞争。
+
+### 4. 结论与建议（未实施，等用户拍板）
+
+现状功能上没有洞：文件锁不挡（2）、bsloader 自退（3）、留下的只是
+一个停在 `pause` 的旧黑窗口（按任意键即消）。若想从下个版本起彻底
+不留这个窗口：把 start.bat / start-debug.bat / stop.bat 的无条件
+`pause` 改成**只在失败时停**（`if not "%RC%"=="0" pause`），成功路径
+窗口自动关——代价是玩家看不到启动横幅的回滚（内容 README 都有）。
+
+## 238. ★★★★★ 「进程结束不了」二连踩真因：pid 失效被当活着 + 取消三修复（V0.2 会话 50 第二轮）
+
+用户用修复版重测（新沙箱 `dist\PopShot-port able-win64_V0-2-7`）依旧报
+「本机服务端进程结束不了」，且下载中点取消无反应。日志显示两个包内
+python 被树杀后 10 秒等满才判死 —— **python 其实杀掉了**（事后系统里
+一个不剩）。
+
+### 1. 真因：`procs_pid_alive` 把 OpenProcess 的任何失败都当「活着」
+
+进程死后、最后一个句柄一关，pid 立即失效；再 `OpenProcess(SYNCHRONIZE)`
+报 **ERROR_INVALID_PARAMETER**（pid 不存在），旧代码一律 return 1（活着）
+→ 永远等不出去。launch.ps1 用 Start-Process 起服务端后 powershell 随即
+退出、无人攥句柄，所以真实场景必踩；而 e2e 一直绿是**假阴性**——测试
+脚本自己的 Popen 攥着句柄，pid 永远可解析。修复：
+
+* `procs_pid_alive`：OpenProcess 失败时只有 **ACCESS_DENIED**（存在但
+  动不了，如提权进程）才当活着，其余（含 INVALID_PARAMETER）= 死。
+* `procs_stop_package_pythons` 重构为 **KillTarget 持句柄等信号**：
+  `OpenProcess(SYNCHRONIZE|PROCESS_TERMINATE)` 攥住，`WaitForSingleObject`
+  等 signaled（= 死透），彻底绕开 pid 失效/复用歧义；denied 目标直接
+  认「停不掉」（那才是真没权限）。
+* e2e 假服务端改为 **spawn_detached_sleeper**（PowerShell Start-Process
+  后父进程退出、测试不攥句柄、用 Get-Post 事后核验）—— 复刻真实形态。
+  ★ 用旧 exe 跑新 e2e 确认会红（10.6s 等满 + FAIL），回归有效。
+
+### 2. 取消「没有用」的三个修复（用户拍板：纯计时器、不看数据）
+
+* **下载期**：`WinHttpQueryDataAvailable` 会一直堵到有数据，取消没机会
+  被检查。★ 走过的弯路（记录防重蹈）：把接收超时压到 500ms 让它定时
+  醒 —— 实测 **>0.5s 的正常到货间隙会把请求毒化**（后续 ReadData 回
+  12019 OPERATION_CANCELLED），慢速真下载直接报错，弃。终版
+  （`net_http.c`）：**看门狗线程每 200ms 无条件查一次取消**（用户：
+  「无论有没有等到数据，按 0.5s 的时间判断，单纯计时器」），发现取消
+  就 `WinHttpCloseHandle` 撬开阻塞中的读，取消 ≤0.5s 生效；收尾先
+  join 看门狗再关句柄（req_closed 分工防双 Close）。manifest 小取
+  （无进度回调）不陪跑。
+* **停进程两个等待期**（等游戏退出 15s / 停服务端 10s）：原先点取消
+  毫无反应 —— 用户所见「下载中点取消没用」的另一个嫌疑现场。加
+  `procs_set_cancel_probe(ui_cancel_requested)`，所有长等待每轮看一眼，
+  取消即提前散场（ended=2 / rc=3 → finish_ok「已取消更新」）。
+* **实测夹具** `updater\scripts\test_cancel_ui.py`（真窗口 + 慢速/断流
+  本地 http）：原生档（UIA 找按钮→真鼠标点）、IE 档（DOM 不投影进
+  UIA → 按模板 CSS 固定坐标双击）、断流档（服务器发 64KB 后挂死）。
+  三场景全绿；IE 档是首次端到端验证 onclick→external.OnButton 链路。
+
+### 3. 顺带查明（不改动）
+
+* 更新器被强杀会留 `logs\update.lock`，600s 内再启动只弹「已经有一个
+  更新程序在运行了」——python 版同款语义，暂不动。
+* `package_root` 按 **exe 路径**定位包根、不看工作目录 —— 测试驱动必须
+  用沙箱内拷贝的 exe，直接跑 `updater\bin` 的会把 updater\ 当包根串锁。
+
+## 239. ★★★★★ 「zip 损坏/CRC 不过」真因：目录条目致索引错位 + 毒缓存死循环（V0.2 会话 50 第三轮）
+
+用户三测（`dist\PopShot-port able-win64_V0-2-7 - 副本`，本地 0.2.5）：
+**停进程修复已生效**（日志 `stopped package pythons=2` 直接进应用），
+新失败点：`FAIL 解压失败（zip 损坏/CRC 不过）：BUILD.ver`；且第二次运行
+直接 `zip cache reuse` 后原地再失败 —— 用户指出毒缓存卡死问题。
+
+### 1. zip 根本没坏：7-Zip 全量校验 303 个文件 CRC 全过
+
+sha256 与 manifest 一致、7z t 全绿。真凶在 **zip.c 的下标错位**：
+条目表把 18 个目录条目剔除后**紧凑编号**（rels[0]=BUILD.ver），
+`zip_extract_to` 却把紧凑下标直接当 miniz 的**原始索引**传 ——
+原始索引 0 是顶层目录条目，miniz 拒绝把目录解成文件 → 报
+「解压失败（zip 损坏/CRC 不过）：BUILD.ver」（报的还是 rels 的名字，
+极具迷惑性）。**e2e 假阴性**：python zipfile 只写文件条目，两张表
+恰好对齐。修复：`ZipFile.mzidx[]` 记录每个接受条目的原始索引。
+
+### 2. 毒缓存死循环（用户指出的流程缺陷）
+
+缓存按「size+sha256 对 manifest」复用 —— sha 对但 zip 读不了时，
+每次重跑都复用坏缓存原地失败。修复：`apply_update` 加 `zip_bad`
+出参（zip_open / zip_extract 失败置位），worker 见之 **DeleteFileW
+缓存** + 公告区附「已丢弃缓存会重新下载；反复失败请手动下载 +
+Releases 地址」。
+
+### 3. 验证与回归
+
+* e2e 假 zip **补写目录条目**（顶层/game_patched/config 三条）；
+  用修复前 exe 跑必红（BUILD.ver 不更新）、修复后绿 —— 回归有效。
+* 新夹具 `updater\scripts\test_real_zip.py`：拿 dist 里**真实发布包**
+  （本地 http 直供原字节 + 正确 manifest）端到端：下载→停进程→
+  staging 解压 300 文件→覆盖→BUILD.ver 提交，8 秒全链 PASS。
+* 附带查明：GitHub 上托管的 0.2.7 zip 与 dist 现存 zip 是**两份不同
+  字节**（sha `587e86a1…` vs `d6fcfa8a…`，差 662 字节）—— 各自与
+  各自的 manifest 自洽，更新器按 manifest 校验不受影响。发版注意：
+  zip 和 manifest.json 必须**同批**上传替换。

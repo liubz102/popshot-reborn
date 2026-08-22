@@ -79,12 +79,16 @@ int zip_open(ZipFile *z, const wchar_t *path, wchar_t *err, size_t err_cap)
     z->rels = (wchar_t(*)[MAX_PATH * 2])HeapAlloc(
         GetProcessHeap(), HEAP_ZERO_MEMORY,
         (SIZE_T)files * MAX_PATH * 2 * sizeof(wchar_t));
-    if (!z->names || !z->rels) {
+    z->mzidx = (int *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                (SIZE_T)files * sizeof(int));
+    if (!z->names || !z->rels || !z->mzidx) {
         _snwprintf(err, err_cap, L"内存不足");
         goto fail;
     }
 
-    /* 第二遍：填 names/rels；rels 必须都落在同一顶层目录下。 */
+    /* 第二遍：填 names/rels/mzidx；rels 必须都落在同一顶层目录下。
+       mzidx 记的是 zip 里的原始序号（含目录项）—— 解压必须用它，
+       拿紧凑下标会在有目录条目时全体错位（§239 真机踩坑）。 */
     for (i = 0; i < total; i++) {
         char name[MAX_PATH * 2];
         wchar_t wname[MAX_PATH * 2];
@@ -108,6 +112,7 @@ int zip_open(ZipFile *z, const wchar_t *path, wchar_t *err, size_t err_cap)
         if (!*rel) continue;                        /* 顶层目录文件本身 */
         wcsncpy(z->names[z->count], wname, MAX_PATH * 2 - 1);
         wcsncpy(z->rels[z->count], rel, MAX_PATH * 2 - 1);
+        z->mzidx[z->count] = (int)i;
         if (wide_ieq(rel, L"BUILD.ver")) have_buildver = 1;
         z->count++;
     }
@@ -130,6 +135,7 @@ void zip_close(ZipFile *z)
     }
     if (z->names) { HeapFree(GetProcessHeap(), 0, z->names); z->names = NULL; }
     if (z->rels)  { HeapFree(GetProcessHeap(), 0, z->rels);  z->rels = NULL; }
+    if (z->mzidx) { HeapFree(GetProcessHeap(), 0, z->mzidx); z->mzidx = NULL; }
     z->count = 0;
 }
 
@@ -153,7 +159,9 @@ int zip_extract_to(ZipFile *z, int i, const wchar_t *dest_root,
     }
     WideCharToMultiByte(CP_UTF8, 0, dst, -1, dst_mb, sizeof(dst_mb),
                         NULL, NULL);
-    if (!mz_zip_reader_extract_to_file(&z->arc, (mz_uint)i, dst_mb, 0)) {
+    /* ★ 用原始索引（含目录项的序号），不是紧凑下标。 */
+    if (!mz_zip_reader_extract_to_file(&z->arc, (mz_uint)z->mzidx[i],
+                                       dst_mb, 0)) {
         _snwprintf(err, err_cap, L"解压失败（zip 损坏/CRC 不过）：%ls",
                    z->rels[i]);
         err[err_cap - 1] = 0;
