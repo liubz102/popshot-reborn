@@ -158,12 +158,21 @@ env/
 # 不会波及这一份 —— 但这里写明白，免得以后有人把它改成不锚定的。
 !/tools/server-package/server.config
 
+# 版本管理的两个源文件（V0.2 版本门禁）：
+#   * tools/build-ver.config      要打的版本号（发版前手动改；不进发布包）
+#   * server-ClientFilter.config  服务器允许的最低客户端版本（打进两个包）
+# 目前没有规则会忽略它们，这里显式写 ! 是防以后有人加 *.config 之类的
+# 宽泛规则把它们悄悄带走 —— 少了它们，clone 下来就打不出带版本号的包。
+!/tools/build-ver.config
+!/server-ClientFilter.config
+
 # ---------------------------------------------------------------------------
 # 本机配置、凭据、编辑器和操作系统杂项
 # .claude 的计划、结论与会话记录要提交，只忽略 Claude 的本机权限配置。
 # ---------------------------------------------------------------------------
 /.claude/settings.local.json
 /.claude/*.local.*
+/.zcode/
 .env
 .env.*
 !.env.example

@@ -38,6 +38,7 @@ import eventlog
 import gameserver
 import logcleanup
 import udpsync
+import versioning
 from account_store import AccountStore
 from netlisten import describe as describe_listen
 from tickets import TicketStore
@@ -139,6 +140,9 @@ def _game_args(args):
     ns.host = args.host
     ns.hold = False
     ns.version_result = 0
+    # 版本门禁跟着 server-ClientFilter.config 热重载（每条连接查一眼 mtime，
+    # 改配置不用重启服务器）。CLI 钉死值留给单跑 gameserver.py 和测试用。
+    ns.client_min_version = versioning.FOLLOW_FILE
     ns.hold_lobby = args.hold_lobby
     ns.login_result = 0
     ns.accounts = args.accounts
@@ -237,6 +241,17 @@ def main(argv=None):
 
     log(f"账号存档: {accounts.path}（当前 {len(accounts.usernames())} 个账号）")
     log(f"配置文件: {config_path}")
+    # 版本门禁的当前状态（每条连接还会热重载，这里只是启动时报一声）。
+    min_version, filter_warnings = versioning.load_client_filter()
+    if min_version is None:
+        log(f"版本门禁: 不限制（{versioning.client_filter_path()} 里填 0"
+            f" 或文件缺失/认不出时都是它，任何版本含旧版客户端都能连）")
+    else:
+        log(f"版本门禁: 仅允许 {versioning.format_version(min_version)} 及以上"
+            f"（低于它的连接会收到「版本过旧」提示；改 {versioning.CLIENT_FILTER_FILENAME}"
+            f" 不用重启，下一条连接就按新值判）")
+    for warning in filter_warnings:
+        log(f"⚠ 版本门禁: {warning}")
     # 上下线流水另存一份：`server.out` 每次启动都会被覆盖，连接记录不该跟着没。
     # `--verbose` 时另外放行 `eventlog.debug()`（转发耗时 / 中继 RTT 这类遥测，D112）。
     if args.no_online_log:

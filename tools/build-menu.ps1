@@ -35,9 +35,16 @@ foreach ($f in @($ClientBuilder, $ServerBuilder)) {
         exit 1
     }
 }
+. (Join-Path $PSScriptRoot 'build-common.ps1')
 
-$ClientDir = Join-Path $DistRoot 'PopShot-portable-win64'
-$ServerDir = Join-Path $DistRoot 'PopShot-server'
+# ★ 版本号第一件事就校验并展示：tools\build-ver.config 是手动维护的，
+#   写错了（认不出 / 撞原版 311）要在这里炸，不能等两个包都打完才发现。
+$BuildVersion = Get-BuildVersion -Root $Root
+Write-Host ''
+Write-Host "本次打包版本：$($BuildVersion.Text)（tools\build-ver.config；成果物名带 _V… 后缀）" -ForegroundColor Cyan
+
+$ClientDir = Join-Path $DistRoot ("PopShot-portable-win64_" + $BuildVersion.Suffix)
+$ServerDir = Join-Path $DistRoot ("PopShot-server_" + $BuildVersion.Suffix)
 
 function Invoke-Builder([string]$Script, [System.Collections.IDictionary]$BuilderArgs) {
     $shown = @()
@@ -82,7 +89,7 @@ function Clear-Stale([string[]]$Paths, [switch]$Ask) {
 function Build-Selected([bool]$DoClient, [bool]$DoServer, [bool]$DoZip,
                         [bool]$DoSave, [bool]$NoSmoke, [string]$Linux) {
     # ★ 两个包用同一个批次号：客户端包和服务端包必须成对使用（D079），
-    #   BUILD.txt 里的这个号就是事后核对的依据。
+    #   BUILD.ver 里的这个号就是事后核对的依据。
     $buildId = Get-Date -Format 'yyyyMMdd-HHmmss'
 
     if ($DoClient) {
@@ -111,7 +118,7 @@ function Build-Selected([bool]$DoClient, [bool]$DoServer, [bool]$DoZip,
     }
     if ($DoClient -and $DoServer) {
         Write-Host ''
-        Write-Host "  两个包的 BUILD.txt 里批次都是 $buildId —— 必须成对发（D079）。" -ForegroundColor Cyan
+        Write-Host "  两个包的 BUILD.ver 里版本都是 $($BuildVersion.Text)、批次都是 $buildId —— 必须成对发（D079）。" -ForegroundColor Cyan
     } elseif ($DoServer) {
         Write-Host ''
         Write-Host '  ⚠ 只打了服务端包。客户端包如果是旧批次的，玩家进房间会被弹回大厅' -ForegroundColor Yellow
@@ -144,10 +151,12 @@ Write-Host '====================================================================
 Write-Host ''
 Write-Host "  产物目录：$DistRoot"
 Write-Host ''
-Write-Host '  客户端包  PopShot-portable-win64   给玩的人：游戏本体 + 内置 Python +'
-Write-Host '                                     一份完整服务端（单机就连它）。约 390 MiB'
-Write-Host '  服务端包  PopShot-server           给开服的人：只有服务端，Windows / Linux'
-Write-Host '                                     两套启停脚本。约 25 MiB'
+Write-Host "  客户端包  PopShot-portable-win64_$($BuildVersion.Suffix)   给玩的人：游戏本体 + 内置"
+Write-Host '            Python + 一份完整服务端（单机就连它）。约 390 MiB'
+Write-Host "  服务端包  PopShot-server_$($BuildVersion.Suffix)   给开服的人：只有服务端，"
+Write-Host '            Windows / Linux 两套启停脚本。约 25 MiB'
+Write-Host ''
+Write-Host '  （目录名里的版本号取自 tools\build-ver.config，发版前手动改它。）' -ForegroundColor DarkGray
 Write-Host ''
 Write-Host '  [1] 客户端包（只生成目录）        最快，本机换个位置测试用'
 Write-Host '  [2] 客户端包 + ZIP                发给别人测试用这个'

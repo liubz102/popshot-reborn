@@ -3,9 +3,13 @@
 给「开服的人」用的包。解压就能跑，**目标机器不需要预装任何东西**
 （Windows 的 Python 运行时已经打进包里；Linux 见下面「Linux 上跑」一节）。
 
-打包信息在 `BUILD.txt` 里。**客户端包和服务端包必须成对使用**，
-两边 `BUILD.txt` 的「打包批次」要一致 —— 版本不配套时的典型症状是
-玩家一进房间就被弹回大厅。
+打包信息在 `BUILD.ver` 里（版本号 / 打包批次 / 代码哈希）。
+**客户端包和服务端包必须成对使用**，两边 `BUILD.ver` 的 `buildId` 要一致 ——
+版本不配套时的典型症状是玩家一进房间就被弹回大厅。
+
+包根的 `server-ClientFilter.config` 记着**允许的最低客户端版本**（如 `0.2.7`，
+填 `0` = 不限制）。低于它的客户端连上来会收到「版本过旧，请更新」的提示并被
+拒绝；改这个文件**不用重启服务器**，下一条连接就按新值判。
 
 ---
 
@@ -28,8 +32,9 @@ netsh advfirewall firewall add rule name=PopShot-UDP dir=in action=allow protoco
 ## Linux 上跑
 
 ```text
-unzip PopShot-server.zip        # 或 tar -xzf PopShot-server.tar.gz
-cd PopShot-server
+unzip PopShot-server_V0-2-7.zip  # 或 tar -xzf PopShot-server_V0-2-7.tar.gz
+                                 # （名字里的版本号随版本变）
+cd PopShot-server_V0-2-7
 chmod +x *.sh tools/*.sh        # ZIP 不保留可执行位，解压后补一下
 ./start.sh                      # 没 chmod 的话用 sh start.sh
 ./stop.sh

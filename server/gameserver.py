@@ -78,6 +78,7 @@ from netlisten import create_listener, describe as describe_listen, tune_stream
 import relayserver
 from tickets import TicketStore, short as short_ticket
 import udpsync
+import versioning
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -88,6 +89,15 @@ LOGDIR = os.path.join(ROOT, "logs")
 os.makedirs(LOGDIR, exist_ok=True)
 
 CLIENT_VERSION = 311        # 0x137，硬编码在 0x54d98f
+
+#: 版本门禁拒绝时回给客户端的结果码。客户端只判「非 0」：非 0 就再读一个
+#: 字符串、走原版自带的「升级/报错」分支弹框（re/packet_api.md §1.2）。
+#: 达标的正常连接永远回 0（`app.py` 固定 `version_result = 0`）。
+VERSION_REJECT_RESULT = 1
+#: 版本门禁拒绝时附带的提示文案。弹框对这段文字的渲染方式还没真机验证过
+#:（逆向只到「再读一个 wstring + GetComputerName + 弹框」这一层），
+#: 真机表现记录在 develop_history；要改提示语改这里。
+VERSION_REJECT_MESSAGE = "客户端版本过旧，请下载最新版客户端后再连接。"
 
 MAGIC_CTRL = 0xFE
 MAGIC_GAME = 0xFF
@@ -4258,6 +4268,9 @@ class Conn:
     #   这两个标志必须在类上也有一份默认，否则新代码一碰就 AttributeError。
     send_broken = False
     last_relay_reissue_at = 0.0
+    # 版本门禁的两个状态同理（见 __init__ 里的说明）。
+    client_version = None
+    version_rejected = False
 
     def __init__(self, sock, addr, args, accounts=None, tickets=None):
         global _seq
@@ -4272,6 +4285,12 @@ class Conn:
         self.cout = SimpleCipher.server_to_client()
         self.buf = bytearray()
         self.got_version = False
+        # 握手裸发版本号解码出的复活项目版本（元组）；None = 旧版客户端
+        #（没上报版本，含原版 311）。on_game_login 和断开日志都要带着它。
+        self.client_version = None
+        # 握手时被版本门禁拒过 —— 正常情况下客户端会弹升级提示框并停下，
+        # 万一它没停、把 0x0100 发过来了，on_game_login 靠这个标志兜底拦截。
+        self.version_rejected = False
         # ★ 账号存储和票据表由 `server/app.py` 建好后传进来，全进程共用一份
         #   —— 票据是认证服签发的，游戏服要能查到它（D064）。
         #   单独跑 gameserver.py 做协议试探时各自新建，行为退化成 V0.1 的样子。
@@ -5085,6 +5104,20 @@ class Conn:
         三种情况都说得通；`result=3` 那句「在无法连接的地方尝试了连接。」
         只会让人以为是被封 IP / 连错服务器。**只有「压根没带票据」才回 3。**
         """
+        if getattr(self, "version_rejected", False):
+            # 握手时已经被版本门禁拒了。正常情况下客户端收到非零结果码会走
+            # 原版自带的升级/报错分支弹框并停下；这一层是兜底 —— 万一它没停、
+            # 还是把 gcpReqLogin 发过来了，绝不放它进大厅。回 2（D097 同款
+            # 理由：三句固定文案里「请重新尝试连接」最不误导）。
+            self.log("✗ 版本门禁已拒，gcpReqLogin 兜底拦截：回 "
+                     f"gspRepLogin(result={LOGIN_RESULT_SUPERSEDED}) 并断开")
+            self.online(f"✗ 登录被拒 账号=? ip={self.peer()} "
+                        f"原因=客户端版本过旧（兜底拦截）")
+            if not self.args.hold:
+                self.send(build_game(OP_REP_LOGIN,
+                                     build_gsp_rep_login(LOGIN_RESULT_SUPERSEDED)))
+                self.close_now()
+            return
         try:
             ticket = Reader(payload).wstr()
         except Exception:
@@ -7468,6 +7501,23 @@ class Conn:
     def on_ctrl_packet(self, payload):
         self.log(f"★ 控制包(0xFE) 载荷 {len(payload)} 字节\n{hexdump(payload)}")
 
+    def resolve_min_client_version(self):
+        """这条握手该按哪个「最低客户端版本」判。返回元组或 None（不限制）。
+
+        * `versioning.FOLLOW_FILE`（app.py 统一入口用的哨兵）：每次握手都来
+          查 `server-ClientFilter.config`（按 mtime 缓存）—— 改配置**不用
+          重启服务器**，下一条连接就按新值判。
+        * 元组 / None：CLI `--client-min-version` 或测试直接给的值，钉死不动。
+        * 没这个属性（测试手搓的 Namespace）：不限制。
+        """
+        spec = getattr(self.args, "client_min_version", None)
+        if spec == versioning.FOLLOW_FILE:
+            min_version, warnings = versioning.load_client_filter()
+            for warning in warnings:
+                self.log(f"⚠ 版本门禁配置: {warning}")
+            return min_version
+        return spec
+
     def feed(self, data):
         # 原始/明文流落盘只对协议逆向有用。战斗中每个 0x0406 都要 write+flush
         # 两个文件，日常游玩纯属跟游戏抢 I/O，所以跟着 --verbose 走。
@@ -7485,9 +7535,39 @@ class Conn:
             ver = struct.unpack_from("<i", self.buf, 0)[0]
             del self.buf[:4]
             self.got_version = True
-            ok = (ver == CLIENT_VERSION)
-            self.log(f"★★ 握手：客户端版本 = {ver} (0x{ver:x}) "
-                     f"{'✓ 与预期 311 一致' if ok else '✗ 预期 311'}")
+            self.client_version = versioning.decode_wire(ver)
+            if self.client_version is not None:
+                self.log(f"★★ 握手：裸发版本号 = {ver} -> 复活项目版本 "
+                         f"{versioning.format_version(self.client_version)}")
+            else:
+                why = ("原版 311，未上报复活版本 = 旧版客户端"
+                       if ver == CLIENT_VERSION else "认不出的值，按旧版处理")
+                self.log(f"★★ 握手：客户端版本 = {ver} (0x{ver:x}) —— {why}")
+            have = (versioning.format_version(self.client_version)
+                    if self.client_version is not None else "旧版(未上报版本)")
+            min_version = self.resolve_min_client_version()
+            if (min_version is not None
+                    and (self.client_version is None
+                         or self.client_version < min_version)):
+                # 版本门禁：客户端没上报版本（旧版）或低于最低要求。
+                # 回非零结果码 + 提示文案，客户端走原版自带的升级/报错弹框
+                # 分支（packet_api.md §1.2）；不主动断开，等它自己停。
+                # 万一它没停继续发 0x0100，on_game_login 有兜底。
+                self.version_rejected = True
+                need = versioning.format_version(min_version)
+                self.log(f"✗ 版本门禁：客户端 {have} < 最低要求 {need}；"
+                         f"回 0xFE 控制帧（结果码 {VERSION_REJECT_RESULT}"
+                         f" + 提示文案）")
+                self.online(f"✗ 版本门禁 拒绝 ip={self.peer()} "
+                            f"客户端版本={have} 最低要求={need}")
+                if not self.args.hold and self.args.version_result == 0:
+                    self.send(build_ctrl(w_i32(VERSION_REJECT_RESULT)
+                                         + w_wstr(VERSION_REJECT_MESSAGE)))
+                return
+            # ★ 上下线流水里必须能查到「这条连接跑的是哪个版本」——
+            #   server.out 每次启动都被覆盖，版本号要进 online.log 才留得住
+            #   （这本来就是给「拿到 log 不知道对方版本」的排查场景用的）。
+            self.online(f"+ 版本上报 ip={self.peer()} 客户端版本={have}")
             if self.args.hold:
                 self.log("[hold] 不回版本应答")
             else:
@@ -7983,6 +8063,15 @@ def serve_control(port):
                 pass
 
 
+def _parse_min_version_arg(text):
+    """``--client-min-version`` 的取值：版本号文本 -> 元组；0 -> None（不限制）。"""
+    version = versioning.parse_version_text(text)
+    if version is None:
+        raise argparse.ArgumentTypeError(
+            f"认不出版本号 {text!r}（要形如 0.2.7 / v0.2.7）")
+    return None if version == (0, 0, 0) else version
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=27799)
@@ -7990,6 +8079,12 @@ def main():
     ap.add_argument("--hold", action="store_true", help="连版本应答都不回，纯抓包")
     ap.add_argument("--version-result", type=int, default=0,
                     help="0xFE 控制帧里的结果码，0 = 版本通过")
+    ap.add_argument("--client-min-version", default=None, metavar="版本",
+                    type=_parse_min_version_arg,
+                    help="允许的最低客户端版本（如 0.2.7 / v0.2.7），低于它的"
+                         "连接按「版本过旧」拒绝；0 或不填 = 不限制。"
+                         "app.py 统一入口不用这个参数 —— 它让每条连接直接热重载"
+                         " server-ClientFilter.config")
     ap.add_argument("--hold-lobby", action="store_true",
                     help="握手照回，但游戏包一律不应答（纯抓包）")
     ap.add_argument("--login-result", type=int, default=0,

@@ -6286,3 +6286,103 @@ COIN_ITEM_VALUES = {10101: 1, 10102: 5}
 - `re/packet_api.md`：`0x0405` 小节同步写入完整算术链并显式勘误 §230；
 - 两套运行时先跑金币 / 结算专项各 **19 项**，再跑全量各 **979 项**，全部通过；
 - 客户端二进制**没有修改**，普通金币雨仍显示原版的 1、2、3。
+
+---
+
+## 233. ★★★★★ 握手版本号 int32 的完整语义与复活项目的版本编码（V0.2 版本管理）
+
+**动机**：拿到玩家 log 却看不出他跑的是哪个版本的包，排查经常浪费在
+「原来你用的是旧包」上。决定给复活项目立自己的 `V主.次.修订`，全链路打通。
+
+### 一、0x54d98f 的字节级事实（本条的地基）
+
+`ServerConnection::OnConnect`（虚表槽 7，`0x54d965`）的序言，取自
+`re/BigShot_6852.img`（脱壳运行时镜像，两份镜像字节一致）：
+
+```asm
+0x54d976  6a 04              push 4                       ; 长度
+0x54d978  8d 55 f0           lea edx, [ebp-0x10]          ; 版本号缓冲
+0x54d97b  8d 8f 7c 08 00 00  lea ecx, [edi+0x87c]         ; 发送方向 cipher
+0x54d981  8b 01              mov eax, [ecx]
+0x54d983  52 52              push edx; push edx
+0x54d985  c7 87 98 08 00 00 01 00 00 00
+                             mov dword [edi+0x898], 1     ; 连接状态=已连接
+0x54d98f  c7 45 f0 37 01 00 00
+                             mov dword [ebp-0x10], 311    ; ★ 版本号立即数
+0x54d996  ff 50 08           call dword [eax+8]           ; SimpleCipher::Encrypt
+```
+
+- `[ebp-0x10]` 里的 4 字节就是**整条 SimpleCipher 加密流的前 4 个字节**
+  （`server/simple.py` 的基准向量 `37 01 00 00 ↔ 53 72 8f 7f`）；
+- **`c7 45 f0 37 01 00 00` 这 7 个字节在已脱壳镜像里全镜像唯一**（两份镜像
+  都扫过，只有 0x54d98f 一处）—— 补丁特征串可靠，不会误伤别处；
+- 补丁 = 把立即数 4 字节（0x54d992 起）换成编码值。**流长度、布局、加密
+  状态一个都不动**（SimpleCipher 是有状态流密码，往流里多插任何一个字节
+  都会让后面全部错位 —— 这就是不能「追加一个版本包」的原因）；
+- 中继（relay.py 纯字节转发）天然透明，远程/本机两种连法不用分别处理。
+
+### 二、编码：三处实现必须一字不差
+
+`wire = major*1_000_000 + minor*1_000 + patch`（0.2.7 → 2007）：
+
+| 实现 | 位置 |
+|---|---|
+| Python（服务端/测试的唯一语义源） | `server/versioning.py` 的 `encode_wire` / `decode_wire` |
+| C（bshook 读 BUILD.ver 后现算） | `hook/bshook.c` 的 `read_build_ver` |
+| PowerShell（打包校验 + 目录名） | `tools/build-common.ps1` 的 `Get-BuildVersion` |
+
+约束与保留值：`major<=2146、minor/patch<=999`（int32 装得下）；**311 保留**
+（0.0.311 编码后正好等于原版，打包直接报错）；**编码下限 1000**（原版客户端
+的版本号 310/311/312… 都在这以下，0.0.x 编出来分不清是复活版还是原版小版本）。
+
+服务端判定：`==311` → 旧版（没上报复活版本，含一切没打补丁的包）；
+`1000..2146999999` → 解码记 `online.log`；其余（负数等）按旧版处理并记原始值。
+
+### 三、拒绝链：两道闸
+
+1. **握手层**：`gameserver.feed()` 判版本不达标 → 回 0xFE 控制帧
+   `[int32 1 + wstr "客户端版本过旧，请下载最新版客户端后再连接。"]`。
+   客户端 0x54dbf6 对非零结果码的行为（V0.1 就逆出来了）：**再读一个
+   wstring，走「升级/报错」分支，GetComputerName + 弹框**。
+   ⚠ 这条分支从未真机触发过 —— 弹框长什么样、我们传的字符串显示不显示，
+   都要等待验证表第 50 条。所以不主动断开，等客户端自己停；
+2. **登录层兜底**：万一客户端没停在弹框上、还是把 `0x0100 gcpReqLogin`
+   发过来了，`on_game_login` 开头按 `version_rejected` 标志再拒一次
+   （`gspRepLogin result=2` + 断开，D097 的同款文案选择理由）。
+   **最坏情况也只是提示不显示，一定进不了大厅。**
+
+### 四、版本号的生命周期（谁都不用重编 hook）
+
+```text
+发版：手改 tools\build-ver.config → build.bat
+      → 包根 BUILD.ver {"version":"V0.2.7",…}（JSON，version 永远第一个键，
+        bshook 只扫第一个 "version"，不做完整 JSON 解析）
+      → 目录/压缩包名 PopShot-portable-win64_V0-2-7（点转横杠）
+      → server-ClientFilter.config 同时进两个包（本地服和云端服行为一致）
+运行：bshook 每次启动读包根 BUILD.ver（DLL 目录上跳三级，同 open_log）→
+      算 wire → patch 0x54d98f；读到/没读到都往 bshook 日志打一行版本
+开发：launch.ps1 启动时按 build-ver.config 现场生成根 BUILD.ver
+门禁：服务端每条连接 mtime 缓存热重载 server-ClientFilter.config（0=不限制，
+      含旧版可连）；改配置不用重启服务器
+```
+
+`hook\bin` 的二进制从此与具体版本号**解耦** —— 日常发版只换 BUILD.ver。
+
+### 五、落地与验证
+
+- `server/versioning.py`（解析容错：BOM/CRLF/UTF-16/空格/vV 大小写/注释行；
+  fail-open：配置认不出=不限制+警告，server.config 哲学）+ `test_versioning.py`
+  17 项；`test_online.py` `VersionGateTests` 8 项（拒绝/放行/兜底/FOLLOW_FILE
+  热重载全走加密流真 `feed()`，加密解密用两个独立 cipher 实例 —— 同一实例
+  先 encrypt 再 decrypt 会把状态推两次，解出来必是垃圾，第一次写测试就踩了）；
+- `gameserver.py`：握手解码 + `online.log` 版本行（`server.out` 每次启动被覆盖，
+  版本必须进 `eventlog` 才留得住）+ 兜底；`app.py` 启动横幅报门禁状态；
+- `bshook.c`：`read_build_ver` / `try_patch_handshake_version`（沿用 AFK 补丁的
+  VirtualProtect + 特征串 + 解壳重试模式），重编译并成对提交 `hook\bin`；
+- 打包脚本：`Get-BuildVersion`（fail-fast 校验）/ `Write-BuildVer`（JSON 取代
+  BUILD.txt，保留 buildId/serverCodeHash/成对警告 —— D079 的核对能力不丢）/
+  `Copy-ClientFilterConfig`（两个包都带）/ 目录名带版本；
+  `wincompat.ps1`、`probe-death.ps1`、`server-package\README.md` 的 BUILD.txt
+  引用同步改掉；
+- 两套运行时全量各 **1020 项**全绿；两个包试打 + 冒烟自检通过；
+- `re/packet_api.md` §1.2 已按「协议改动必须同步」铁律更新。

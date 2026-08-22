@@ -193,10 +193,30 @@ python tools/gs_ctl.py help
 | `server/` | 服务端：认证、游戏、注册页、中继、协议和测试（单机和云端共用同一套代码）|
 | `server/config.py` | ★ **端口号唯一的源**，以及 `server.config` 的解析器 |
 | `server.config` | 联机服务器地址和注册页端口 |
+| `server/versioning.py` | 项目版本号的解析 / 编码 / 最低版本门禁（详见下面「版本号管理」）|
+| `server-ClientFilter.config` | 服务器允许的**最低客户端版本**（手动维护；`0` = 不限制）|
+| `tools/build-ver.config` | 下一次打包的**版本号**（手动维护，发版前改它）|
 | `tools/` | 自写逆向、探针、截图和自动化脚本 |
 | `re/` | RTTI、虚表、包记录和映射文本等分析成果 |
 | `game_patched/` | 实际运行的客户端工作副本 |
 | `logs/` | 抓包、运行日志和临时截图 |
+
+## 版本号管理
+
+每个发布包都有自己的版本号（`V主.次.修订`，如 `V0.2.7`），一圈链路：
+
+- **发版**：改 `tools/build-ver.config` → 跑 `tools\build.bat`。包根会生成
+  `BUILD.ver`（JSON），成果物目录和压缩包名都带版本（如
+  `PopShot-portable-win64_V0-2-7.zip`，点转横杠）。客户端包和服务端包仍然
+  **必须成对使用**（BUILD.ver 里的 `buildId` / `serverCodeHash` 核对）。
+- **上报**：客户端每次启动读包根 `BUILD.ver`，把版本号补丁进握手包上报
+  （bshook 日志里有一行版本）。服务端把每条连接的版本记进 `logs/online.log` ——
+  排查问题时先看这里就知道对方跑的是哪个版本。
+- **门禁**：服务器按 `server-ClientFilter.config` 里的最低版本拒绝太旧的客户端
+  （客户端会收到「版本过旧，请更新」的提示）。改这个文件**不用重启服务器**，
+  下一条连接就生效；填 `0` 完全不限制（含不上报版本的旧客户端）。
+- **日常发版不需要重新编译 hook**：版本号不编译进 bshook.dll，只随 BUILD.ver
+  变化。
 
 ## 注意事项
 

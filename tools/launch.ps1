@@ -159,8 +159,55 @@ function Get-TextSha256([string]$text) {
     }
 }
 
+# --- 版本号：启动横幅要显示 + 开发机现场生成 BUILD.ver -----------------------
+# 客户端上报的版本号来自包根 BUILD.ver（bshook 读它补丁握手版本号）：
+#   * 开发机（仓库里）：按 tools\build-ver.config 现场生成一份，让开发机上报
+#     的版本和「将来打出来的包」一致；
+#   * 发布包：BUILD.ver 由打包脚本写好（且不带 build-ver.config，版本号源
+#     文件不进包），直接读它的 "version" —— 启动窗口第一行就能对上版本，
+#     排查时不用再翻文件问。
+# 认不出版本号只黄字提醒不拦启动：缺了它客户端按原版 311 上报（= 旧版）。
+$BuildVerText = ''
+$verSrc = Join-Path $Root 'tools\build-ver.config'
+$verDst = Join-Path $Root 'BUILD.ver'
+if (Test-Path -LiteralPath $verSrc -PathType Leaf) {
+    Say ''
+    $verText = ''
+    foreach ($line in ([System.IO.File]::ReadAllText($verSrc) -split "`r?`n")) {
+        $t = "$line".Trim()
+        if ($t.Length -gt 0 -and $t[0] -ne '#' -and $t[0] -ne ';') {
+            $verText = $t
+            break
+        }
+    }
+    if ($verText -ne '') {
+        if ($verText[0] -eq 'v' -or $verText[0] -eq 'V') { $verText = $verText.Substring(1).Trim() }
+    }
+    if ($verText -match '^\d+(\.\d+){0,2}$') {
+        while (($verText -split '\.').Count -lt 3) { $verText = "$($verText).0" }
+        $verText = "V$($verText)"
+        $json = "{`"version`": `"$($verText)`"}`n"
+        [System.IO.File]::WriteAllText($verDst, $json, (New-Object System.Text.UTF8Encoding($false)))
+        $BuildVerText = $verText
+        Say "BUILD.ver 已生成（版本 $($verText)）—— 客户端握手会上报这个版本"
+    } else {
+        Say '!! tools\build-ver.config 里认不出版本号，BUILD.ver 没生成 —— 客户端将按旧版(311)上报' 'Yellow'
+    }
+} elseif (Test-Path -LiteralPath $verDst -PathType Leaf) {
+    # 发布包：静默读出版本给横幅用（bshook 读的也是这份文件）
+    $m = [regex]::Match([System.IO.File]::ReadAllText($verDst), '"version"\s*:\s*"([^"]+)"')
+    if ($m.Success) { $BuildVerText = $m.Groups[1].Value }
+} else {
+    Say ''
+    Say '!! 根目录没有 BUILD.ver —— 客户端将按旧版(311)上报，连开了版本门禁的服务器会被要求升级' 'Yellow'
+}
+
 Say ''
-Say "=== 炮炮火枪手 —— 启动（日志模式：$Mode）===" 'Cyan'
+if ($BuildVerText -ne '') {
+    Say "=== 炮炮火枪手 $($BuildVerText) —— 启动（日志模式：$Mode）===" 'Cyan'
+} else {
+    Say "=== 炮炮火枪手 —— 启动（日志模式：$Mode）===" 'Cyan'
+}
 if ($DebugLog) {
     Say '    调试模式：客户端和服务端都会逐包 dump（日志 4 MB 起）。' 'Yellow'
     Say '    速度和 start.bat 差不多，但关键行会淹在 hexdump 里 —— 平时玩用 start.bat。' 'Yellow'

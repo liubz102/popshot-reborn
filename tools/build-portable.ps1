@@ -36,9 +36,12 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $DistRoot = [System.IO.Path]::GetFullPath((Join-Path $Root 'dist'))
 if ([string]::IsNullOrWhiteSpace($BuildId)) { $BuildId = New-BuildId }
+# ★ 版本号第一批就校验（tools\build-ver.config 手动维护）：
+#   写错了在这炸，好过打完几十分钟才发现。成果物文件夹名也带它（点转横杠）。
+$Version = Get-BuildVersion -Root $Root
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    $OutputDirectory = Join-Path $DistRoot 'PopShot-portable-win64'
+    $OutputDirectory = Join-Path $DistRoot ("PopShot-portable-win64_" + $Version.Suffix)
 }
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 Assert-InsideDist -Path $OutputDirectory -DistRoot $DistRoot
@@ -88,7 +91,7 @@ if ($userCfgText -notmatch '(?m)^\s*FullScreen\s*=\s*1\s*$') {
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 try {
     Write-Host ''
-    Write-Host "=== 客户端包（批次 $BuildId）===" -ForegroundColor Cyan
+    Write-Host "=== 客户端包（版本 $($Version.Text)，批次 $BuildId）===" -ForegroundColor Cyan
     Write-Host "    输出：$OutputDirectory"
     Write-Host ''
 
@@ -167,18 +170,29 @@ try {
     }
     New-Item -ItemType Directory -Path (Join-Path $OutputDirectory 'logs') -Force | Out-Null
 
-    # --- 5. BUILD.txt --------------------------------------------------------
-    Write-Host '  [5/6] BUILD.txt'
+    # --- 5. server-ClientFilter.config + BUILD.ver --------------------------
+    Write-Host '  [5/6] server-ClientFilter.config + BUILD.ver'
+    # 门禁配置：客户端包里的「本机服务器」也按同一份最低版本拦（和云端一致）。
+    Copy-ClientFilterConfig -Root $Root -PackageRoot $OutputDirectory | Out-Null
     $dllHash = (Get-FileHash -LiteralPath (Join-Path $OutputDirectory 'hook\bin\bshook.dll') -Algorithm SHA256).Hash
     $ldrHash = (Get-FileHash -LiteralPath (Join-Path $OutputDirectory 'hook\bin\bsloader.exe') -Algorithm SHA256).Hash
-    Write-BuildInfo -PackageRoot $OutputDirectory -Kind '客户端包' -BuildId $BuildId -ExtraLines @(
-        "bshook.dll  $dllHash",
-        "bsloader.exe $ldrHash",
-        '',
-        '怎么用：整个目录拷到目标电脑，双击 start.bat。',
-        '联机：登录界面选「远程服务器」，地址改 server.config 的 server_address。',
-        '首次使用先点登录框下方的注册链接注册账号。'
-    )
+    Write-BuildVer -PackageRoot $OutputDirectory -Kind '客户端包' -BuildId $BuildId -Version $Version `
+        -Extra @{
+            win7Runtime   = (Get-Win7RuntimeNote $OutputDirectory)
+            bshookHash    = $dllHash
+            bsloaderHash  = $ldrHash
+        } `
+        -Notes @(
+            '怎么用：整个目录拷到目标电脑，双击 start.bat。',
+            '联机：登录界面选「远程服务器」，地址改 server.config 的 server_address。',
+            '首次使用先点登录框下方的注册链接注册账号。',
+            '客户端每次启动会把本文件里的 version 上报给服务器（bshook 读它补丁握手版本号）。'
+        )
+    foreach ($must in @('BUILD.ver', 'server-ClientFilter.config')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory $must) -PathType Leaf)) {
+            throw "自检失败：$must 没写进包根"
+        }
+    }
 
     # --- 6. 自检 -------------------------------------------------------------
     if ($SkipSmokeTest) {

@@ -41,6 +41,95 @@ function New-BuildId {
     return (Get-Date -Format 'yyyyMMdd-HHmmss')
 }
 
+function Get-BuildVersion {
+    <# 读 tools\build-ver.config 里的**复活项目版本号**（发版前手动改的那个文件）。
+
+       返回：
+           Text    "V0.2.7"    规范显示（固定大写 V，日志/BUILD.ver 都用这个格式）
+           Parts    @(0,2,7)   三段数字
+           Suffix   "V0-2-7"   成果物文件夹名/压缩包名后缀（点转横杠）
+           Wire     2007       bshook 补丁 / 服务端解码共用的 int32 编码
+                                 （major*1000000 + minor*1000 + patch）
+
+       ★ 解析宽容（前后空格 / BOM / CRLF / v 或 V 前缀 / 1~3 段都收，
+         和 server\versioning.py 是同一套规则），**约束在这里拦**：
+         段超限（major>2146 或 minor/patch>999）、0.0.311（编码后正好是
+         原版客户端的 311）、低于 0.1.0（编码落在原版小版本区间里）一律
+         throw —— 打包要几十分钟，版本号写错必须在第 0 步就炸。 #>
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $path = Join-Path $Root 'tools\build-ver.config'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "缺少 $path —— 这个文件记着要打的版本号（如 0.2.7），发版前手动改它。"
+    }
+    # ReadAllText 默认认 UTF-8 / UTF-16 的 BOM，记事本怎么存都吃得下。
+    $raw = [System.IO.File]::ReadAllText($path)
+    $text = $null
+    foreach ($line in ($raw -split "`r?`n")) {
+        $t = $line.Trim()
+        if ($t.Length -eq 0 -or $t[0] -eq '#' -or $t[0] -eq ';') { continue }
+        $text = $t
+        break
+    }
+    if (-not $text) { throw "$path 里没有版本号（要形如 0.2.7 / v0.2.7，# 开头的行是注释）" }
+    if ($text[0] -eq 'v' -or $text[0] -eq 'V') { $text = $text.Substring(1).Trim() }
+
+    $segments = @($text -split '\.')
+    if ($segments.Count -lt 1 -or $segments.Count -gt 3) {
+        throw "$path 的版本号 $text 不是 1~3 段数字（形如 0.2.7 / 5.12 / 1）"
+    }
+    $parts = @()
+    foreach ($seg in $segments) {
+        if ($seg -notmatch '^\d+$') {
+            throw "$path 的版本号段 '$seg' 不是纯数字（整体是：$text）"
+        }
+        $parts += [int]$seg
+    }
+    while ($parts.Count -lt 3) { $parts += 0 }
+    $major, $minor, $patch = $parts
+    if ($major -gt 2146 -or $minor -gt 999 -or $patch -gt 999) {
+        throw "$path 的版本号 $text 段值超限（要求 major<=2146、minor/patch<=999）"
+    }
+    $wire = $major * 1000000 + $minor * 1000 + $patch
+    if ($wire -eq 311) {
+        throw "$path 的版本号 $text 编码后等于原版客户端保留值 311，换一个"
+    }
+    if ($wire -lt 1000) {
+        throw "$path 的版本号 $text 太低（< 0.1.0），编码后会与原版客户端版本号混淆"
+    }
+    return [pscustomobject]@{
+        Text   = 'V' + ($parts -join '.')
+        Parts  = $parts
+        Suffix = 'V' + ($parts -join '-')
+        Wire   = $wire
+    }
+}
+
+function Copy-ClientFilterConfig {
+    <# 把根目录的 server-ClientFilter.config（服务器允许的最低客户端版本，
+       手动维护）拷进包根。两个包都要带：客户端包里那份是「本机服务器」的
+       门禁，服务端包里那份是云端服务器的门禁 —— 同一份文件，行为才一致。
+
+       根目录没有时**生成一个 0（不限制）**并黄字提醒，而不是打包失败：
+       这个文件缺了只影响「要不要拦旧客户端」，不影响包本身能不能跑。 #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$PackageRoot
+    )
+    $src = Join-Path $Root 'server-ClientFilter.config'
+    $dst = Join-Path $PackageRoot 'server-ClientFilter.config'
+    if (Test-Path -LiteralPath $src -PathType Leaf) {
+        Copy-TextFile -Source $src -Target $dst -Kind 'unix'
+    } else {
+        Write-Host '        根目录没有 server-ClientFilter.config，包里生成 0（不限制客户端版本）' -ForegroundColor Yellow
+        Write-TextFile -Path $dst -Kind 'unix' -Text "0`n"
+    }
+    if (-not (Test-Path -LiteralPath $dst -PathType Leaf)) {
+        throw "server-ClientFilter.config 没进包：$dst"
+    }
+    return $dst
+}
+
 function Assert-EmptyTarget([string]$Path, [switch]$Force) {
     if (Test-Path -LiteralPath $Path) {
         if (-not $Force) {
@@ -140,7 +229,7 @@ function Get-ServerSourceFile([string]$Root) {
 
 function Copy-ServerCode {
     <# 把 server\ 拷进包：*.py（去掉测试和开发工具）+ web\ + 空的 data\。
-       返回拷了哪些文件（相对 server\ 的路径），给 BUILD.txt 用。 #>
+       返回拷了哪些文件（相对 server\ 的路径），给打包日志用。 #>
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)][string]$PackageRoot,
@@ -520,7 +609,7 @@ function New-PackageTarGz {
 }
 
 # ---------------------------------------------------------------------------
-#  BUILD.txt
+#  BUILD.ver（JSON）
 # ---------------------------------------------------------------------------
 
 function Get-Win7RuntimeNote {
@@ -529,7 +618,7 @@ function Get-Win7RuntimeNote {
        主力运行时是 3.14，官方只支持 Win10+；没有这一份，Win7 玩家一键启动
        会卡在「缺少 api-ms-win-core-path-l1-1-0.dll」的模态框上（§215）。
 
-       ★ 只给**客户端包**用（调用方 `Write-BuildInfo` 已按 `$Kind` 过滤）：
+       ★ 只给**客户端包**用（调用方 `Write-BuildVer` 已按字段过滤）：
          服务端包故意不带这份运行时，架服务端不考虑老系统（D133）。 #>
     param([Parameter(Mandatory = $true)][string]$PackageRoot)
     $py = Join-Path $PackageRoot 'runtime-win7\python\python.exe'
@@ -537,40 +626,43 @@ function Get-Win7RuntimeNote {
     return '未包含（Windows 10 以下跑不起来）'
 }
 
-function Write-BuildInfo {
-    <# 包里放一份「这是什么包、什么时候打的、代码哈希是多少」。
-       测试的人把问题发回来时，第一句就能问「你那份 BUILD.txt 贴一下」。
-       ★ 客户端包和服务端包**必须成对使用**（D079），靠这里的批次号核对。 #>
+function Write-BuildVer {
+    <# 包根放一份 BUILD.ver（JSON）：这个包是什么版本、什么时候打的、
+       代码哈希是多少。测试的人把问题发回来时，第一句就能问
+       「你那份 BUILD.ver 贴一下」—— 玩家的 bshook 日志里也会印同一版本号。
+
+       ★ version 字段必须放**第一个**且键名唯一：bshook 只会扫文件里
+         第一个 "version" 键取值（不做完整 JSON 解析）。
+       ★ 客户端包和服务端包**必须成对使用**（D079），靠 buildId /
+         serverCodeHash 核对 —— notes 里保留这句提醒。 #>
     param(
         [Parameter(Mandatory = $true)][string]$PackageRoot,
         [Parameter(Mandatory = $true)][string]$Kind,        # 客户端包 / 服务端包
         [Parameter(Mandatory = $true)][string]$BuildId,
-        [string[]]$ExtraLines = @()
+        # Get-BuildVersion 的返回值（Text/Wire/…）
+        [Parameter(Mandatory = $true)][pscustomobject]$Version,
+        # 各包特有字段（客户端包：win7Runtime / bshookHash / bsloaderHash；
+        # 服务端包：linuxRuntime）。进 JSON 顶层。
+        [hashtable]$Extra = @{},
+        # 人类可读的使用说明 / 警告，进 JSON 的 notes 数组。
+        [string[]]$Notes = @()
     )
-    $lines = @(
-        '炮炮火枪手 —— 打包信息',
-        '=======================',
-        "包类型      $Kind",
-        "打包批次    $BuildId",
-        "打包时间    $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
-        "打包机器    $env:COMPUTERNAME",
-        "共用服务端代码 $(Get-ServerCodeHash $PackageRoot)"
-    )
-    # ★ 只有**客户端包**写这一行：Win7 兼容运行时是为了让个别 Win7 玩家能启动
-    #   游戏，**服务端包故意不带**（架服务端不考虑老系统，D133）。服务端包也印
-    #   这一行的话，会让人以为服务端本该支持 Win7，白白引出一轮误会。
-    #   措辞要和 `wincompat.ps1` 里那句红字警告对齐 —— 玩家是照着它来核对的。
-    if ($Kind -like '*客户端*') {
-        $lines += "Win7 运行时  $(Get-Win7RuntimeNote $PackageRoot)"
+    $obj = [ordered]@{
+        version        = $Version.Text
+        versionWire    = $Version.Wire
+        kind           = $Kind
+        buildId        = $BuildId
+        time           = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        machine        = $env:COMPUTERNAME
+        serverCodeHash = Get-ServerCodeHash $PackageRoot
     }
-    $lines += $ExtraLines
-    $lines += @(
-        '',
-        '★ 客户端包和服务端包必须【成对】使用：两边的「打包批次」要一致，',
-        '  「共用服务端代码」这一行也要一模一样。批次对不上就先各自重新解压一份。',
+    foreach ($key in $Extra.Keys) { $obj[$key] = $Extra[$key] }
+    $obj['notes'] = @($Notes + @(
+        '★ 客户端包和服务端包必须【成对】使用：两边的 buildId 要一致，',
+        '  serverCodeHash 也要一模一样。批次对不上就先各自重新解压一份。',
         '  （原因：客户端里的端口映射表和服务端的中继端口是配套的，',
-        '   老客户端连新服务端会在进房间时被弹回大厅。）',
-        ''
-    )
-    Write-TextFile -Path (Join-Path $PackageRoot 'BUILD.txt') -Text ($lines -join "`n") -Kind 'unix'
+        '   老客户端连新服务端会在进房间时被弹回大厅，D079。）'
+    ))
+    $json = $obj | ConvertTo-Json
+    Write-TextFile -Path (Join-Path $PackageRoot 'BUILD.ver') -Text ($json + "`n") -Kind 'unix'
 }

@@ -454,7 +454,7 @@ function Select-PythonRuntime {
         '!! 这台电脑的 Windows 版本低于 Windows 10，而这个包里**没有** runtime-win7\。',
         '   主力运行时 Python 3.14 只支持 Win10 及以上，接下来多半会弹',
         '   「缺少 api-ms-win-core-path-l1-1-0.dll」并卡住 ——',
-        '   请换用带 runtime-win7\ 的新包（BUILD.txt 里会写「Win7 运行时：已包含」）。'
+        '   请换用带 runtime-win7\ 的新包（BUILD.ver 里 win7Runtime 会写「已包含」）。'
     )
     return $result
 }

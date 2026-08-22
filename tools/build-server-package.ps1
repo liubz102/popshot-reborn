@@ -4,16 +4,17 @@
     给「开服的人」的包：只有服务端，没有游戏本体、没有 hook。
     解压就能跑，目标机器不需要预装任何东西。
 
-        PopShot-server/
+        PopShot-server_V0-2-7/          （目录名带版本号，点转横杠）
         ├─ start.bat / start-debug.bat / stop.bat     Windows
         ├─ start.sh  / start-debug.sh  / stop.sh      Linux
         ├─ tools/serverctl.ps1  tools/serverctl.sh    启停实现（中文都在这里）
         ├─ server.config                              只有注册页端口要改
+        ├─ server-ClientFilter.config                 允许的最低客户端版本（0=不限制）
         ├─ server/                    和客户端包【同一份】代码（铁律 8）
         ├─ runtime-win/python/        Windows 独立运行时
         ├─ runtime-linux/*.tar.gz     Linux 独立运行时（可选，第一次启动时自解）
         ├─ logs/
-        ├─ BUILD.txt / README.md
+        ├─ BUILD.ver / README.md
 
     用法：
         build-server-package.ps1                       用项目里的 runtime-linux\（有就带）
@@ -60,9 +61,11 @@ $Template = Join-Path $PSScriptRoot 'server-package'
 #   打包时直接 copy。只有项目里没有的时候才需要联网下载一次。
 $LinuxRuntimeDir = Join-Path $Root 'runtime-linux'
 if ([string]::IsNullOrWhiteSpace($BuildId)) { $BuildId = New-BuildId }
+# ★ 版本号第一批就校验（tools\build-ver.config 手动维护）；成果物名带它。
+$Version = Get-BuildVersion -Root $Root
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    $OutputDirectory = Join-Path $DistRoot 'PopShot-server'
+    $OutputDirectory = Join-Path $DistRoot ("PopShot-server_" + $Version.Suffix)
 }
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 Assert-InsideDist -Path $OutputDirectory -DistRoot $DistRoot
@@ -215,7 +218,7 @@ switch -Regex ($LinuxRuntime) {
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 try {
     Write-Host ''
-    Write-Host "=== 服务端包（批次 $BuildId）===" -ForegroundColor Cyan
+    Write-Host "=== 服务端包（版本 $($Version.Text)，批次 $BuildId）===" -ForegroundColor Cyan
     Write-Host "    输出：$OutputDirectory"
     Write-Host ''
 
@@ -289,16 +292,25 @@ SHA-256   $sha
 
     New-Item -ItemType Directory -Path (Join-Path $OutputDirectory 'logs') -Force | Out-Null
 
-    # --- 5. BUILD.txt --------------------------------------------------------
-    Write-Host '  [5/6] BUILD.txt'
-    Write-BuildInfo -PackageRoot $OutputDirectory -Kind '服务端包' -BuildId $BuildId -ExtraLines @(
-        "Linux 运行时 $linuxNote",
-        '',
-        'Windows：解压后双击 start.bat；停服 stop.bat。',
-        'Linux：  解压后 chmod +x *.sh tools/*.sh，然后 ./start.sh；停服 ./stop.sh。',
-        '要放行的 TCP 端口：47611 / 27799 / 27798 / 27810（注册页，可改）。',
-        '详见 README.md。'
-    )
+    # --- 5. server-ClientFilter.config + BUILD.ver --------------------------
+    Write-Host '  [5/6] server-ClientFilter.config + BUILD.ver'
+    # 门禁配置：云服务器按这份「最低允许客户端版本」拦旧客户端（0 = 不限制）。
+    # 改它不用重启服务器 —— 每条连接进来都会热重读一次。
+    Copy-ClientFilterConfig -Root $Root -PackageRoot $OutputDirectory | Out-Null
+    Write-BuildVer -PackageRoot $OutputDirectory -Kind '服务端包' -BuildId $BuildId -Version $Version `
+        -Extra @{ linuxRuntime = $linuxNote } `
+        -Notes @(
+            'Windows：解压后双击 start.bat；停服 stop.bat。',
+            'Linux：  解压后 chmod +x *.sh tools/*.sh，然后 ./start.sh；停服 ./stop.sh。',
+            '要放行的 TCP 端口：47611 / 27799 / 27798 / 27810（注册页，可改）。',
+            'server-ClientFilter.config：允许的最低客户端版本（0 = 不限制），改完即生效。',
+            '详见 README.md。'
+        )
+    foreach ($must in @('BUILD.ver', 'server-ClientFilter.config')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory $must) -PathType Leaf)) {
+            throw "自检失败：$must 没写进包根"
+        }
+    }
 
     # --- 6. 自检 -------------------------------------------------------------
     if ($SkipSmokeTest) {

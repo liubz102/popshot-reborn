@@ -1716,6 +1716,133 @@ static int try_patch_afk_timer(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* 握手版本号补丁 —— 客户端连游戏服时裸发的 int32 版本号（V0.2 版本管理）     */
+/*                                                                            */
+/*   原版客户端在 ServerConnection::OnConnect(0x54d965) 里写死发 311：        */
+/*     0x54d98f  c7 45 f0 37 01 00 00    mov dword [ebp-0x10], 311            */
+/*   这 4 个字节（0x54d992 起）是整条 SimpleCipher 加密流的开头，服务端解开    */
+/*   后当版本号用。这里把它补丁成「BUILD.ver 里的版本号」的编码：            */
+/*     wire = major*1000000 + minor*1000 + patch   （server/versioning.py）   */
+/*   —— 仍是原样 4 个字节，流布局一个位都不动；服务端收到 311 就知道对面是    */
+/*   没上报版本的旧版客户端。指令特征串全镜像唯一（re/BigShot_*.img 核对过）。*/
+/*                                                                            */
+/*   ★ 版本号**不编译进本 DLL**：每次启动读 <root>\BUILD.ver（打包脚本写入， */
+/*     开发环境由 tools/launch.ps1 生成）。日常发版只换 BUILD.ver，不用重编。 */
+/* -------------------------------------------------------------------------- */
+
+#define HS_VER_VA 0x0054d98fu
+static const unsigned char HS_VER_ORIG[7] =
+    { 0xc7, 0x45, 0xf0, 0x37, 0x01, 0x00, 0x00 };
+static volatile LONG g_hsver_patched = 0;
+static long g_hsver_wire = 0;        /* 0 = 没读到 BUILD.ver，保持 311 上报 */
+static char g_hsver_text[40] = "";   /* 日志用，如 "V0.2.7" */
+
+/* 包根目录 = 本 DLL（<root>\hook\bin\bshook.dll）往上三级，算法同 open_log。 */
+static void package_root_dir(char *out, size_t cap)
+{
+    char *p;
+    GetModuleFileNameA(GetModuleHandleA("bshook.dll"), out, (DWORD)cap);
+    p = strrchr(out, '\\'); if (p) *p = 0;   /* -> <root>\hook\bin */
+    p = strrchr(out, '\\'); if (p) *p = 0;   /* -> <root>\hook     */
+    p = strrchr(out, '\\'); if (p) *p = 0;   /* -> <root>          */
+}
+
+/* 读 <root>\BUILD.ver 里的 "version":"Vx.y.z" -> 编码 wire。
+   返回 1 成功；0 = 文件不存在 / 认不出（调用方按「保持 311」处理）。
+   JSON 是我们自己脚本写的，只认 "version" 这一个键，不做完整解析。 */
+static int read_build_ver(void)
+{
+    char path[MAX_PATH * 2];
+    char buf[2048];
+    HANDLE f;
+    DWORD got = 0;
+    char *key, *val, *p;
+    unsigned seg[3], wire;
+    int i, digits;
+    size_t vlen;
+
+    package_root_dir(path, sizeof(path));
+    strcat(path, "\\BUILD.ver");
+    f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    if (!ReadFile(f, buf, sizeof(buf) - 1, &got, NULL)) got = 0;
+    CloseHandle(f);
+    buf[got] = 0;
+
+    key = strstr(buf, "\"version\"");
+    if (!key) return 0;
+    val = strchr(key + 9, '"');            /* 键结束后的下一个引号 = 值的开头 */
+    if (!val) return 0;
+    val++;
+    p = strchr(val, '"');                  /* 值的结尾 */
+    if (!p) return 0;
+    vlen = (size_t)(p - val);
+    if (vlen == 0 || vlen >= sizeof(g_hsver_text)) return 0;
+    memcpy(g_hsver_text, val, vlen);
+    g_hsver_text[vlen] = 0;
+
+    /* 解析 Vx.y.z / vx.y.z / x.y.z：前后空白、v/V 大小写都收（同服务端） */
+    p = g_hsver_text;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == 'v' || *p == 'V') p++;
+    for (i = 0; i < 3; i++) {
+        unsigned v = 0;
+        digits = 0;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10u + (unsigned)(*p - '0');
+            p++;
+            if (++digits > 4) return 0;
+        }
+        if (!digits) return 0;
+        seg[i] = v;
+        if (*p == '.') p++;
+        else break;
+    }
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p) return 0;                      /* 值后面还挂着别的东西 = 认不出 */
+    if (seg[0] > 2146u || seg[1] > 999u || seg[2] > 999u) return 0;
+    wire = seg[0] * 1000000u + seg[1] * 1000u + seg[2];
+    if (wire < 1000u || wire == 311u) return 0;   /* 撞原版保留值/小数字区间 */
+    g_hsver_wire = (long)wire;
+    return 1;
+}
+
+static int try_patch_handshake_version(void)
+{
+    unsigned char *p = (unsigned char *)HS_VER_VA;
+    unsigned char want[7];
+    DWORD oldp;
+
+    if (g_hsver_patched) return 1;
+    if (g_hsver_wire < 1000) return 1;     /* 没版本号可写：保持 311 */
+    if (IsBadReadPtr(p, 7)) return 0;
+    memcpy(want, HS_VER_ORIG, 7);
+    want[3] = (unsigned char)(g_hsver_wire         & 0xff);
+    want[4] = (unsigned char)((g_hsver_wire >> 8)  & 0xff);
+    want[5] = (unsigned char)((g_hsver_wire >> 16) & 0xff);
+    want[6] = (unsigned char)((g_hsver_wire >> 24) & 0xff);
+    if (memcmp(p, want, 7) == 0) {         /* 已是补丁后的样子 */
+        InterlockedExchange(&g_hsver_patched, 1);
+        return 1;
+    }
+    if (memcmp(p, HS_VER_ORIG, 7) != 0) return 0;   /* 还没解壳到这里，继续等 */
+
+    if (!VirtualProtect(p, 7, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   握手版本号: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    memcpy(p, want, 7);
+    VirtualProtect(p, 7, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, 7);
+    InterlockedExchange(&g_hsver_patched, 1);
+    bslog("PATCH   ★握手版本号 @ %08X: 311 -> %ld（BUILD.ver %s）",
+          (unsigned)HS_VER_VA, g_hsver_wire, g_hsver_text);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* 道具视觉同步 patch —— 让远端角色也创建反射盾牌特效                         */
 /*                                                                            */
 /*   服务端的 0x040a 已经把 10303「反射」和 10314「全队反射」广播给房内所有人；*/
@@ -3144,6 +3271,26 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_afk_patched)
             bslog("PATCH   !! 超时未能 patch 挂机计时器"
                   "（0x4082ae 一直不是 68 90 5F 01 00）");
+    }
+
+    /* 握手版本号（版本管理）：不赶时机 —— OnConnect 最早也要等玩家在登录
+       界面点「开始」才执行，远晚于解壳窗口；和其它 patch 一样等特征串。
+       ★ 无论补没补上都要在日志里留一行版本：拿到玩家 log 一眼看出版本，
+       这本来就是做版本管理的初衷。 */
+    if (read_build_ver()) {
+        bslog("PATCH   BUILD.ver 版本 %s -> 握手版本号 %ld"
+              "（服务端 online.log 里记的就是它）", g_hsver_text, g_hsver_wire);
+        for (ticks = 0; !g_stop && !g_hsver_patched && ticks < 2000; ticks++) {
+            if (try_patch_handshake_version()) break;
+            Sleep(2);
+        }
+        if (!g_hsver_patched)
+            bslog("PATCH   !! 超时未能 patch 握手版本号"
+                  "（0x54d98f 一直不是 c7 45 f0 37 01 00 00）"
+                  "—— 握手将按原版 311 上报");
+    } else {
+        bslog("PATCH   !! 包根目录没有可用的 BUILD.ver（缺文件或内容认不出），"
+              "握手按原版 311 上报 —— 服务端开了版本门禁时会按旧版客户端处理");
     }
 
     /* SnowCipher hook 紧跟在其它代码 patch 之后装：

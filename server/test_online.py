@@ -22,9 +22,11 @@ import config as server_config
 import eventlog
 import gameserver
 import relay
+import versioning
 from account_store import AUTH_OK, AccountStore, tutorial_state
 from simple import SimpleCipher
 from tickets import TicketStore, short
+from unittest import mock
 from web import server as web_server
 
 
@@ -524,6 +526,136 @@ class GameLoginTests(unittest.TestCase):
             if kind == "game" and opcode == gameserver.OP_REP_LOGIN:
                 return payload
         self.fail("没有发出 gspRepLogin")
+
+
+class VersionGateTests(GameLoginTests):
+    """版本门禁：握手裸发的 int32 里认出复活版本，低于最低要求就拒绝。
+
+    场景对应用户需求：bshook 把 BUILD.ver 里的版本号补丁进 0x54d98f 那 4 个
+    字节（versioning.encode_wire），没补丁过的旧客户端永远发 311。
+    """
+
+    class Args(GameLoginTests.Args):
+        hold = False
+        version_result = 0
+        # None = 不限制（也是测试手搓 Namespace 缺这个属性时的缺省）；
+        # 元组 = 钉死的最低版本；versioning.FOLLOW_FILE = 跟配置文件热重载。
+        client_min_version = None
+
+    def feed_handshake(self, conn, wire):
+        """把「客户端连上后裸发的 4 字节版本号」喂进 feed()（加密流）。
+
+        加密/解密必须是**两个**同初值的实例（真实链路两端各一个）——
+        同一个实例先 encrypt 再 decrypt，状态推进两次，解出来必然是垃圾。
+        """
+        conn.buf = bytearray()
+        conn.got_version = False
+        client_cipher = SimpleCipher.client_to_server()
+        conn.cin = SimpleCipher.client_to_server()
+        conn.feed(client_cipher.encrypt(struct.pack("<i", wire)))
+
+    def decode_frames(self, conn):
+        stream = SimpleCipher.server_to_client()
+        plain = bytearray()
+        for blob in conn.sock.writes:
+            plain += stream.decrypt(blob)
+        frames = []
+        buf = bytearray(plain)
+        while True:
+            got = gameserver.take_frame(buf)
+            if got is None:
+                break
+            kind, opcode, payload, n = got
+            del buf[:n]
+            frames.append((kind, opcode, payload))
+        return frames
+
+    def first_ctrl(self, conn):
+        for kind, _opcode, payload in self.decode_frames(conn):
+            if kind == "ctrl":
+                return payload
+        self.fail("没有发出 0xFE 控制帧")
+
+    def test_gate_off_accepts_the_legacy_handshake(self):
+        # 不限制（缺省）：旧版 311 照旧放行并回 0 —— 现有测试和纯抓包
+        # 模式的行为一个字节都不能变。
+        conn = self.make_conn()
+        self.feed_handshake(conn, 311)
+        self.assertFalse(conn.version_rejected)
+        self.assertEqual(0, gameserver.Reader(self.first_ctrl(conn)).i32())
+        self.assertTrue(any("旧版(未上报版本)" in e for e in conn.online_events))
+
+    def test_versioned_handshake_is_logged_in_the_online_stream(self):
+        # 达标连接也必须把版本写进上下线流水 —— 这是整套机制的初衷
+        #（拿到 log 就知道对方跑的是哪个版本）。
+        conn = self.make_conn()
+        self.feed_handshake(conn, versioning.encode_wire((0, 2, 7)))
+        self.assertEqual((0, 2, 7), conn.client_version)
+        self.assertTrue(any("客户端版本=V0.2.7" in e for e in conn.online_events))
+
+    def test_gate_rejects_legacy_clients_when_a_minimum_is_set(self):
+        # 旧版客户端（没上报版本）+ 有最低要求 -> 回非零结果码 + 提示文案，
+        # 客户端走原版自带的升级/报错弹框分支（packet_api.md §1.2）。
+        conn = self.make_conn()
+        conn.args.client_min_version = (0, 2, 7)
+        self.feed_handshake(conn, 311)
+        self.assertTrue(conn.version_rejected)
+        payload = self.first_ctrl(conn)
+        reader = gameserver.Reader(payload)
+        self.assertEqual(gameserver.VERSION_REJECT_RESULT, reader.i32())
+        self.assertIn("版本过旧", reader.wstr())
+        self.assertTrue(any("版本门禁" in e and "旧版" in e
+                            for e in conn.online_events))
+
+    def test_gate_rejects_versions_below_the_minimum(self):
+        conn = self.make_conn()
+        conn.args.client_min_version = (0, 2, 7)
+        self.feed_handshake(conn, versioning.encode_wire((0, 2, 6)))
+        self.assertTrue(conn.version_rejected)
+        self.assertEqual(gameserver.VERSION_REJECT_RESULT,
+                         gameserver.Reader(self.first_ctrl(conn)).i32())
+
+    def test_gate_accepts_the_minimum_and_above(self):
+        for version in ((0, 2, 7), (0, 3, 0), (1, 0, 0)):
+            conn = self.make_conn()
+            conn.args.client_min_version = (0, 2, 7)
+            self.feed_handshake(conn, versioning.encode_wire(version))
+            self.assertFalse(conn.version_rejected, str(version))
+            self.assertEqual(0, gameserver.Reader(self.first_ctrl(conn)).i32())
+
+    def test_a_rejected_connection_can_still_not_log_in(self):
+        # 兜底层：握手被拒后客户端万一没停在弹框上、还是把 gcpReqLogin 发
+        # 过来了，也绝不放它进大厅 —— 回 result=2 并拆连接。
+        conn = self.make_conn()
+        conn.args.client_min_version = (0, 2, 7)
+        self.feed_handshake(conn, 311)
+        self.login(conn, self.tickets.issue("alice"))
+        self.assertIsNone(conn.account_name)
+        replies = [payload for kind, opcode, payload in self.decode_frames(conn)
+                   if kind == "game" and opcode == gameserver.OP_REP_LOGIN]
+        self.assertEqual(1, len(replies))
+        self.assertEqual(gameserver.LOGIN_RESULT_SUPERSEDED,
+                         gameserver.Reader(replies[0]).i32())
+        self.assertTrue(conn.sock.closed)
+        self.assertTrue(any("版本过旧" in e for e in conn.online_events))
+
+    def test_follow_file_mode_consults_the_config_per_handshake(self):
+        # app.py 统一入口的模式：每条握手热重载 server-ClientFilter.config。
+        conn = self.make_conn()
+        conn.args.client_min_version = versioning.FOLLOW_FILE
+        with mock.patch.object(versioning, "load_client_filter",
+                               return_value=((0, 2, 7), [])):
+            self.feed_handshake(conn, versioning.encode_wire((0, 2, 7)))
+            self.assertFalse(conn.version_rejected)
+            self.feed_handshake(conn, 311)
+            self.assertTrue(conn.version_rejected)
+        # 配置改回「不限制」后，同一条连接参数下旧版又能进了（不用重启）
+        with mock.patch.object(versioning, "load_client_filter",
+                               return_value=(None, [])):
+            conn2 = self.make_conn()
+            conn2.args.client_min_version = versioning.FOLLOW_FILE
+            self.feed_handshake(conn2, 311)
+            self.assertFalse(conn2.version_rejected)
 
 
 class ControlChannelUserPickingTests(unittest.TestCase):

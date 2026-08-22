@@ -178,8 +178,16 @@ fi
 MODE="精简"
 [ "$VERBOSE" = "--verbose" ] && MODE="调试"
 
+# 版本号：包根 BUILD.ver（打包脚本写的）里的 "version"，横幅显示。
+VER_TEXT=""
+if [ -f "$ROOT/BUILD.ver" ]; then
+    _ver=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$ROOT/BUILD.ver" 2>/dev/null \
+           | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')
+    [ -n "$_ver" ] && VER_TEXT=" $_ver"
+fi
+
 echo ""
-echo "=== 炮炮火枪手服务端 —— 启动（日志模式：$MODE）==="
+echo "=== 炮炮火枪手服务端${VER_TEXT} —— 启动（日志模式：$MODE）==="
 if [ "$VERBOSE" = "--verbose" ]; then
     echo "    调试模式：逐包 hexdump + 每条连接一对抓包文件，日志按 MB 涨。"
     echo "    排查完请换回 start.sh，别长期开着。"

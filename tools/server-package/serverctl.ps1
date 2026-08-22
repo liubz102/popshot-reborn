@@ -155,8 +155,17 @@ if ($Action -eq 'stop') {
 $mode = 'normal'
 if ($DebugLog) { $mode = 'debug' }
 
+# 版本号：包根 BUILD.ver（打包脚本写的）里的 "version"。横幅显示 ——
+# 开服的人第一眼就能对上「跑的是哪个版本」，远程排查不用再翻文件问。
+$verTail = ''
+$verFile = Join-Path $Root 'BUILD.ver'
+if (Test-Path -LiteralPath $verFile -PathType Leaf) {
+    $m = [regex]::Match([System.IO.File]::ReadAllText($verFile), '"version"\s*:\s*"([^"]+)"')
+    if ($m.Success) { $verTail = " $($m.Groups[1].Value)" }
+}
+
 Say ''
-Say "=== 炮炮火枪手服务端 —— 启动（日志模式：$mode）===" 'Cyan'
+Say "=== 炮炮火枪手服务端$($verTail) —— 启动（日志模式：$mode）===" 'Cyan'
 if ($DebugLog) {
     Say '    调试模式：逐包 hexdump + 每条连接一对抓包文件，日志按 MB 涨。' 'Yellow'
     Say '    排查完请换回 start.bat，别长期开着。' 'Yellow'

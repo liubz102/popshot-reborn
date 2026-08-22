@@ -121,10 +121,36 @@ V0.1/V0.2 踩过的坑里有相当一部分就是「望文生义地按名字猜�
 **握手（只有 27799 有，中继没有）**：
 
 ```text
-客户端 connect 后裸发 4 字节 int32 = 311 (0x137)     ← ServerConnection::OnConnect 0x54d965
-服务端回 0xFE 控制帧，载荷 = int32 结果码             ← 槽12 = 0x54dbf6
+客户端 connect 后裸发 4 字节 int32 版本号                ← ServerConnection::OnConnect 0x54d965
+服务端回 0xFE 控制帧，载荷 = int32 结果码（+可选 wstr）   ← 槽12 = 0x54dbf6
         == 0  客户端接着发 0x0100 gcpReqLogin + 0x0103
         != 0  客户端再读一个字符串，走「升级 / 报错」分支并弹框
+```
+
+**版本号 int32 的两个取值来源（2026-08-22 起，V0.2 版本管理）**：
+
+```text
+原版客户端：   指令立即数写死 311 (0x137)
+              0x54d98f  c7 45 f0 37 01 00 00   mov dword [ebp-0x10], 311
+              （这 7 字节在整个已脱壳镜像里唯一，re/BigShot_*.img 核对过）
+
+复活客户端：   bshook 启动时读包根 BUILD.ver 的 "version"（如 "V0.2.7"），
+              把 0x54d98f 那条指令的立即数补丁成编码值 —— 仍是原样 4 字节，
+              流布局不动（SimpleCipher 是有状态流密码，多一个字节全错位）。
+
+编码（server/versioning.py 的 encode_wire/decode_wire，三处实现必须一致）：
+              wire = major*1_000_000 + minor*1_000 + patch
+              约束：major<=2146、minor/patch<=999；
+              保留值 311（=0.0.311，打包时直接拒绝）；
+              编码下限 1000（原版客户端版本号都在这个区间以下）。
+
+服务端判定：   == 311        → 旧版客户端（没上报复活版本）
+              1000..上限     → 解码出 V主.次.修订，记进 online.log
+              其他（负数等） → 按旧版处理（日志带原始值）
+门禁：         低于 server-ClientFilter.config（包根，热重载）里的最低版本、
+              或旧版客户端且门禁开着 → 回 [int32 1 + wstr 升级提示]（上面的
+              「升级/报错」分支），客户端不弹框也进不来：0x0100 gcpReqLogin
+              在 on_game_login 里还有第二道拦截（回 result=2 + 断开）。
 ```
 
 **0xFE 控制帧**：
