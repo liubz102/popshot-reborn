@@ -154,7 +154,7 @@ V0.1/V0.2 踩过的坑里有相当一部分就是「望文生义地按名字猜�
 
 拒绝文案：     带服务器自身版本（gameserver.version_reject_message，读包根
               BUILD.ver），形如「…请更新到 V0.2.7 后再连接。」。★ 这句话
-              是给机器读的协议：客户端更新器（tools/update_client.py 的
+              是给机器读的协议：客户端更新器（updater\src\probe.c 的
               探针）连 27799 重演一次握手，按 [vV]数字.数字[.数字] 从文案
               里解析目标版本 —— 成对发布（D079）的客户端/服务器靠它对准
               批次。文案里的版本号格式被 server/test_update.py 钉住。
@@ -163,7 +163,7 @@ V0.1/V0.2 踩过的坑里有相当一部分就是「望文生义地按名字猜�
               引导器（tools/updater/updater.c，2026-08-22 起）—— 原版 NGM
               链（BsPatcherChn→NGMDll→platform.tiancity.com，停机多年）
               整条废弃。引导器只透传 -procid，其余 NGM 参数忽略，转手拉起
-              tools/update_client.py 完成下载/校验/应用/重启；与本表协议
+              updater（BsPatcherChn.exe，C 实现）完成下载/校验/应用/提示重启；与本表协议
               的交集只有上面这次 0xFE 拒绝帧（探针重演的也是它）。
 ```
 

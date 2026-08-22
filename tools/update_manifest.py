@@ -3,7 +3,7 @@
 """update_manifest.py —— 打包时生成 / 更新自动更新的 manifest.json
 
 **manifest.json 是什么**：挂在每个 GitHub Release 上的发版清单，客户端
-更新器（tools/update_client.py）从 ``releases/latest/download/manifest.json``
+更新器（updater/src/manifest.c）从 ``releases/latest/download/manifest.json``
 这个固定 URL 取它，按里面的 sha256/url 下载对应版本的客户端整包。
 全部历史版本都留在列表里 —— 更新器优先装「服务器点名要的版本」（成对
 发布，D079），不是无脑最新，所以旧版本的条目不能丢。
@@ -35,7 +35,7 @@ import json
 import os
 import sys
 
-#: 与 tools/update_client.py 的 MANIFEST_URLS / updater.c 的 MANUAL_URL 同源。
+#: 与 updater/src/main.c 的 MANIFEST_URL / RELEASES_PAGE 同源。
 REPO_URL = "https://github.com/liubz102/popshot-reborn"
 
 #: 客户端整包的文件名前缀（dist 里的成果物名，打包脚本定的）。

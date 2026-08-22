@@ -1,0 +1,46 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+<head>
+ <meta http-equiv="Content-Type" content="text/html; charset=gb2312">
+	<title>Nexon Game Manager</title>
+	<link rel="stylesheet" type="text/css" href="global.css">	
+	<script language="javascript">
+	function ChangeContents(url)
+	{
+	}
+	function ChangeButton()
+	{
+		document.all.btnCancel.style.display = "none";
+		document.all.btnConfirm.style.display = "";
+	}
+	function SetProgressCurrent(percent)
+	{
+	}
+	function SetProgressTotal(percent)
+	{
+		document.all.ProgressTotal.width = ( percent * 300 ) / 100;
+	}
+	function ShowRemainingTime(type)
+	{
+	}
+	function ShowTextCurrent(type)
+	{
+	}
+	</script>
+</head>
+
+<body oncontextmenu="return false;" onselectstart="return false;" ondragover="return false;" ondrag="return false;">
+
+<!--380/105-->
+<div id="SProgWrapper">	
+	<h1><img id="TopLogo" src="BINARY/tiancity_logo2.gif" width="360" height="26" /></h1>						
+	<ul class="SProgBar">
+		<li class="Bar"><img id="ProgressTotal" src="BINARY/bg_bar_on.gif" width="1" height="16" /></li>
+		<li><img id="btnCancel" src="BINARY/bt_cancel_s.gif" width="55" height="18" alt="取消" style="display:"></li>
+		<li><img id="btnConfirm" src="BINARY/bt_cfm_s.gif" width="55" height="18" alt="确认" style="display:none"></li>
+	</ul>
+	<p id="TextHeader">进行patch中</p>	
+</div>
+                          
+</body>
+</html>

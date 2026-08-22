@@ -97,7 +97,7 @@ CLIENT_VERSION = 311        # 0x137，硬编码在 0x54d98f
 VERSION_REJECT_RESULT = 1
 #: 版本门禁拒绝时附带的提示文案（兜底版：BUILD.ver 读不出服务器自身版本
 #: 时用它）。正常情况走 `version_reject_message()` —— 文案里**带上服务器
-#: 自己的版本号**，客户端更新器（tools/update_client.py 的探针）连上来
+#: 自己的版本号**，客户端更新器（updater\src\probe.c 的探针）连上来
 #: 重演一次握手，从这句话里解析出该升到哪个版本，保证「成对发布」的
 #: 客户端 / 服务端批次对得上（D079）。改文案时必须保留版本号的格式
 #: ``V主.次.修订``（`versioning.format_version` 的输出）。
@@ -7584,7 +7584,7 @@ class Conn:
                 self.online(f"✗ 版本门禁 拒绝 ip={self.peer()} "
                             f"客户端版本={have} 最低要求={need}")
                 if not self.args.hold and self.args.version_result == 0:
-                    # 文案带服务器自身版本号：探针（tools/update_client.py）
+                    # 文案带服务器自身版本号：探针（updater\src\probe.c）
                     # 靠它知道该升到哪个版本（见 version_reject_message）。
                     self.send(build_ctrl(w_i32(VERSION_REJECT_RESULT)
                                          + w_wstr(version_reject_message())))

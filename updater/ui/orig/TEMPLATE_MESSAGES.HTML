@@ -1,0 +1,63 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+<head>
+ <meta http-equiv="Content-Type" content="text/html; charset=gb2312">
+	<title>Nexon Game Manager</title>
+	<link rel="stylesheet" type="text/css" href="global.css">
+	<script language="javascript">
+	function ChangeType( type )
+	{
+		if ( type == 0 )
+		{
+		}
+		else if ( type == 1 )
+		{
+			document.all.iconError.style.display = "";
+		}
+		else if ( type == 2 )
+		{
+			document.all.iconAlert.style.display = "";
+		}
+	}
+
+	function ShowBtnCancel()
+	{
+		document.all.btnCancel.style.display = "";
+	}
+	</script>
+</head>
+
+<body oncontextmenu="return false;" onselectstart="return false;" ondragover="return false;" ondrag="return false;">
+
+<!--283/153-->
+<div style="width:283px;" id="Container">
+	<div><img src="BINARY/round1_top4.gif" width="283" height="5" /></div> 
+	<table cellpadding="0" cellspacing="0" class="Wrapper">
+	<tr><td>
+			<div id="TopSec">
+				<h1 class="TopLogo"><img id="TopLogo" src="BINARY/tiancity_logo.gif" width="87" height="26" alt="世纪天成" /></h1>
+				<a href="#"><img src="BINARY/bt_close.gif" width="17" height="16" alt="关闭" class="BtClose" /></a>		
+			</div>
+			<div id="CntsSec">
+				<div><img src="BINARY/round2_top4.gif" width="271" height="4" /></div> 
+				<div id="Cnts1Wrap">
+					<div class="CfmSec">
+						<img id="iconError" src="BINARY/ico_caution.gif" width="42" height="42" class="IconPos" style="display:none" />
+						<img id="iconAlert" src="BINARY/ico_cancel.gif" width="42" height="42" class="IconPos" style="display:none"/>
+						<p id="Message" style="margin:22px 10px 0 58px;padding:0;line-height:130%;height:42px;">
+						</p>
+					</div>
+					<div id="BtmSec">
+						<a href="#"><img id="btnConfirm" src="BINARY/bt_cfm_s.gif" width="55" height="18" alt="确认" /></a>
+						<a href="#"><img id="btnCancel" src="BINARY/bt_cancel_s.gif" width="55" height="18" alt="取消" style="display:none" /></a>	
+					</div>	
+				</div>
+				<div><img src="BINARY/round2_btm4.gif" width="271" height="4" /></div> 		
+			</div>
+		</td></tr>
+	</table>		          
+	<div><img src="BINARY/round1_btm4.gif" width="283" height="5" /></div> 
+</div>
+                          
+</body>
+</html>

@@ -1,0 +1,102 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+<head>
+ <meta http-equiv="Content-Type" content="text/html; charset=gb2312">
+	<title>Nexon Game Manager</title>
+	<link rel="stylesheet" type="text/css" href="global.css">
+	<script language="javascript">
+	function ChangeContents(url)
+	{
+		document.all.CustomContents.src = url;
+	}
+	function ChangeButton()
+	{
+		document.all.btnCancel.style.display = "none";
+		document.all.btnConfirm.style.display = "";
+	}
+	function SetProgressCurrent(percent)
+	{
+		document.all.ProgressCurrent.width = ( percent * 440 ) / 100;
+	}
+	function SetProgressTotal(percent)
+	{
+		document.all.ProgressTotal.width = ( percent * 440 ) / 100;
+	}
+	function ShowRemainingTime(type)
+	{
+		if ( type == 0 )
+			document.all.TextRemainingTime.style.display="none";
+		else
+			document.all.TextRemainingTime.style.display="";
+	}
+	function ShowTextCurrent(type)
+	{
+		if ( type == 0 )
+			document.all.TextCurrent.style.display="none";
+		else
+			document.all.TextCurrent.style.display="";
+	}
+	</script>
+</head>
+
+<body oncontextmenu="return false;" onselectstart="return false;" ondragover="return false;" ondrag="return false;">
+
+<!--572/473-->
+<div style="width:572px;" id="Container">
+	<div><img src="BINARY/round1_top1.gif" width="572" height="5" /></div> 
+	<table cellpadding="0" cellspacing="0" class="Wrapper">
+	<tr><td>
+			<div id="TopSec">
+				<h1 class="TopLogo"><img id="TopLogo" src="BINARY/tiancity_logo.gif" width="87" height="26" alt="世纪天成" /></h1>
+				<a href="#"><img id="btnClose" src="BINARY/bt_close.gif" width="17" height="16" alt="关闭" class="BtClose" /></a>		
+			</div>
+			<div id="CntsSec">						
+				<div><img src="BINARY/round2_top1.gif" width="560" height="4" /></div> 
+				<div id="Cnts1Wrap">
+					<div style="border:1px solid #DCDCDC;margin-bottom:4px;">
+					<iframe id="CustomContents" frameborder="0" scrolling="auto" width="546" height="300" marginheight="0" marginwidth="0" style="overflow-y:auto;padding:0;" src=""></iframe>						
+					</div>					
+					<div><img src="BINARY/round3_top1.gif" width="548" height="2" /></div>
+					<div id="Cnts2Wrap">
+						<ul class="InstallInfo">
+							<li id="TextHeader" class="Header">目前进行状况</li>
+							<li id="TextRemainingTime" class="Time" style="display:none"><strong>正在计算剩余时间</strong></li>
+						</ul>
+						<div class="InstallProcess" style="border-bottom:1px solid #EBEBEB;">
+							<ul class="ProcBar">
+								<li class="Txt">目前</li>
+								<li class="Bar">
+									<div class="BarBox"><img id="ProgressCurrent" src="BINARY/bg_bar_on.gif" width="1" height="12" /></div>
+								</li>
+							</ul>
+						</div>
+						<div class="InstallProcess">
+							<ul class="ProcBar">
+								<li class="Txt">全部</li>
+								<li class="Bar">
+									<div class="BarBox"><img id="ProgressTotal" src="BINARY/bg_bar_on.gif" width="1" height="12" /></div>
+								</li>
+							</ul>
+						</div>
+					</div>
+					<div><img src="BINARY/round3_btm1.gif" width="548" height="2" /></div>			
+					<div id="BtmSec">
+						<div class="Pos">
+							<p id="TextCurrent" class="CurrentTxt" style="display:none"></p>
+							<a href="#"><img id="btnCancel" src="BINARY/bt_cancel_s.gif" width="55" height="18" alt="取消" class="BtCancelS" style="display:" /></a>
+							<a href="#"><img id="btnConfirm" src="BINARY/bt_cfm_s.gif" width="55" height="18" alt="确认" class="BtCancelS" style="display:none" /></a>
+						</div>
+					</div>						
+				</div>
+				<div><img src="BINARY/round2_btm1.gif" width="560" height="4" /></div> 
+			</div>
+		</td></tr>
+	</table>		          
+	<div><img src="BINARY/round1_btm1.gif" width="572" height="5" /></div> 
+</div>
+                          
+</body>
+</html>
+
+
+

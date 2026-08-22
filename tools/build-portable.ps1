@@ -60,15 +60,11 @@ foreach ($must in @('hook\bin\bshook.dll', 'hook\bin\bsloader.exe',
         throw "缺少必需文件：$must"
     }
 }
-# 自动更新链的两端都要在：拉起端 = game_patched\BsPatcherChn.exe（我们的
-# 引导器，不能是原版 NGM），干活端 = tools\update_client.py。少了任何一端，
-# 玩家拿旧客户端连新服务器时就只会看到 NGM 的死链报错。
+# 自动更新链整条都在 game_patched\BsPatcherChn.exe 里（自研更新器 v3：
+# 原版风格界面 + 探针/下载/应用全逻辑，updater\src\；python 完全退出
+# 更新链）。它不能还是原版 NGM —— 那种包发出去，旧客户端被版本门禁拒绝
+# 后只会看到 NGM 的死链报错。
 Assert-UpdaterStub -Root $Root
-foreach ($must in @('tools\update_client.py')) {
-    if (-not (Test-Path -LiteralPath (Join-Path $Root $must) -PathType Leaf)) {
-        throw "缺少必需文件：$must（自动更新主逻辑）"
-    }
-}
 
 # ★★★ UserConfig.ini 是**构建输入**，不是本机杂项（V0.1 §49 / D021）。
 #   客户端是「登录成功那一刻」才写出它的，所以全新环境第一次跑时它不存在；
@@ -157,9 +153,8 @@ try {
         Copy-TextFile -Source (Join-Path $Root $file) -Target (Join-Path $OutputDirectory $file) -Kind 'ps1'
     }
     Copy-One (Join-Path $Root 'tools\d3d9_probe.exe') (Join-Path $OutputDirectory 'tools\d3d9_probe.exe')
-    # ★ 自动更新主逻辑（game_patched\BsPatcherChn.exe 引导器拉起的就是它）。
-    #   开发工具都不进包，唯独这个进 —— 它就是「旧客户端自动升级」的干活的那个。
-    Copy-One (Join-Path $Root 'tools\update_client.py') (Join-Path $OutputDirectory 'tools\update_client.py')
+    # （v3 起自动更新全逻辑在 game_patched\BsPatcherChn.exe 里 —— python
+    #   完全退出更新链，tools 里不再有需要进包的更新脚本。）
 
     # --- 3. 服务端代码（和服务端包同一份，铁律 8）---------------------------
     Write-Host '  [3/6] server（单机假服务器 = 云端服务端的同一套代码）'
@@ -199,7 +194,7 @@ try {
             '联机：登录界面选「远程服务器」，地址改 server.config 的 server_address。',
             '首次使用先点登录框下方的注册链接注册账号。',
             '客户端每次启动会把本文件里的 version 上报给服务器（bshook 读它补丁握手版本号）。',
-            '版本过旧被服务器拒绝时会自动更新：game_patched\BsPatcherChn.exe 是自研更新引导器（tools\updater）。'
+            '版本过旧被服务器拒绝时会自动更新：game_patched\BsPatcherChn.exe 是自研更新器（updater\src，原版风格界面，全逻辑进 exe）。'
         )
     foreach ($must in @('BUILD.ver', 'server-ClientFilter.config')) {
         if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory $must) -PathType Leaf)) {

@@ -215,20 +215,21 @@ python tools/gs_ctl.py help
   （客户端会收到「版本过旧，请更新」的提示）。改这个文件**不用重启服务器**，
   下一条连接就生效；填 `0` 完全不限制（含不上报版本的旧客户端）。
 - **自动更新**：客户端收到拒绝帧后会拉起原版的 `game_patcher\BsPatcherChn.exe`
-  走升级分支 —— 这个 exe 已被替换成自研更新引导器（`tools/updater/updater.c`，
-  原版 NGM 链整条废弃），由它转手拉起 `tools/update_client.py` 完成更新。
-- **update_client.py**：
+  走升级分支 —— 这个 exe 已被替换成自研更新器（`updater\src\`，独立 C 工程，
+  原版 NGM 链整条废弃）。更新器界面复刻原版 BsPatcherChn.exe。
   - 1. 探测游戏服（`server.config` 的地址，27799）：重演一次握手，从拒绝文案里
    解析「服务器要求的版本」（= 服务器自身版本，保证客户端与服务器同批次，
    不是门禁的最低版本）。
   - 2. 从 GitHub Release 取 `manifest.json`（`releases/latest/download/manifest.json`
-   固定地址，含全部历史版本的 sha256/大小/下载地址），下载全量 zip 并校验
-   （若找不到「服务器要求的版本」则下载最新版本）。
+   固定地址，含全部历史版本的 sha256/大小/下载地址），WinHTTP 下载全量 zip
+   边下边校验（若找不到「服务器要求的版本」则下载最新版本）。
   - 3. 等游戏进程退出，自动停掉本机服务端/中继（按「exe 路径 = 本包 runtime」
    精确匹配，解除文件占用），解压覆盖（`server.config`、`UserConfig.ini`、账号、
    日志等玩家数据**永不覆盖**）。
-  - 4. `BUILD.ver` 最后写（= 成功提交点，中途断电重跑即可），提示一键重启游戏
-   （start.bat 会把本机服务端一起拉回来）。
+  - 4. `BUILD.ver` 最后写（= 成功提交点，中途断电重跑即可），提示**手动重启**
+   （`start.bat` / `start-debug.bat`，由玩家自己选启动方式，不自动拉起）。
+   更新器自己被覆盖时旧 exe 改名 `*.update_old` 让位，下次启动由启动脚本
+   静默清理。
 - **日常发版不需要重新编译 hook**：版本号不编译进 bshook.dll，只随 BUILD.ver
   变化。
 

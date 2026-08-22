@@ -1,0 +1,98 @@
+// updater.rc —— 版本信息 + 原版更新界面素材（全部 RCDATA 嵌入 exe）。
+//
+// 素材来源：game_patched\NGMResource.dll（2007 年原版资源 DLL），由
+// updater\scripts\extract_updater_ui.py 提取（orig\）、make_patched_ui.py
+// 打最小补丁（按钮 onclick / 标题栏拖动，见 ui\README.md）。
+// 运行时 ui_window.c 把它们解到 %TEMP% 后用 file:// 加载 —— 不走 res://。
+//
+// ★ 用 UTF-8 + code_page(65001)：rc.exe 默认按系统代码页读源文件，
+//   中文字符串会乱码；pragma 在前就能按 UTF-8 读。
+#pragma code_page(65001)
+
+#include <windows.h>
+
+#define VER_FILEVERSION         3,0,0,0
+#define VER_FILEVERSION_STR     "3.0.0.0"
+
+// ---------------------------------------------------------------- 窗口/exe 图标
+// 原版 NGM 的三尺寸图标（GROUP_ICON 109 = 16/32/48）。
+1 ICON "ui\\ICON_109.ico"
+
+// ---------------------------------------------------------------- 界面模板
+TEMPLATE_PATCH.HTML             RCDATA "ui\\TEMPLATE_PATCH.HTML"
+TEMPLATE_CONFIRMRUNADMIN.HTML   RCDATA "ui\\TEMPLATE_CONFIRMRUNADMIN.HTML"
+TEMPLATE_MESSAGEL.HTML          RCDATA "ui\\TEMPLATE_MESSAGEL.HTML"
+GLOBAL.CSS                      RCDATA "ui\\global.css"
+
+// ---------------------------------------------------------------- 图片（原资源名）
+// 模板按 BINARY/xxx.gif 相对路径引用；资源名保持 DLL 里的原大写，
+// ui_window.c 里的资源表与此处一一对应（selftest 会盯着）。
+BG_BAR.GIF                      RCDATA "ui\\BINARY\\BG_BAR.GIF"
+BG_BAR_ON.GIF                   RCDATA "ui\\BINARY\\BG_BAR_ON.GIF"
+BG_BODY.GIF                     RCDATA "ui\\BINARY\\BG_BODY.GIF"
+BG_SMALL_PROGRESS.GIF           RCDATA "ui\\BINARY\\BG_SMALL_PROGRESS.GIF"
+BG_TITLE.GIF                    RCDATA "ui\\BINARY\\BG_TITLE.GIF"
+BT_AGREE_NOT.GIF                RCDATA "ui\\BINARY\\BT_AGREE_NOT.GIF"
+BT_AGREE_STIP.GIF               RCDATA "ui\\BINARY\\BT_AGREE_STIP.GIF"
+BT_CANCEL.GIF                   RCDATA "ui\\BINARY\\BT_CANCEL.GIF"
+BT_CANCEL_S.GIF                 RCDATA "ui\\BINARY\\BT_CANCEL_S.GIF"
+BT_CFM_S.GIF                    RCDATA "ui\\BINARY\\BT_CFM_S.GIF"
+BT_CHANGE_FOLDER.GIF            RCDATA "ui\\BINARY\\BT_CHANGE_FOLDER.GIF"
+BT_CLOSE.GIF                    RCDATA "ui\\BINARY\\BT_CLOSE.GIF"
+BT_INSTALL.GIF                  RCDATA "ui\\BINARY\\BT_INSTALL.GIF"
+BUL_ARR_GR.GIF                  RCDATA "ui\\BINARY\\BUL_ARR_GR.GIF"
+BUL_CIRCLE_BL.GIF               RCDATA "ui\\BINARY\\BUL_CIRCLE_BL.GIF"
+BUL_DOT_GR.GIF                  RCDATA "ui\\BINARY\\BUL_DOT_GR.GIF"
+ICO_CANCEL.GIF                  RCDATA "ui\\BINARY\\ICO_CANCEL.GIF"
+ICO_CAUTION.GIF                 RCDATA "ui\\BINARY\\ICO_CAUTION.GIF"
+IMG_DEFAULT.JPG                 RCDATA "ui\\BINARY\\IMG_DEFAULT.JPG"
+LN_SPACE.GIF                    RCDATA "ui\\BINARY\\LN_SPACE.GIF"
+ROUND1_BTM1.GIF                 RCDATA "ui\\BINARY\\ROUND1_BTM1.GIF"
+ROUND1_BTM2.GIF                 RCDATA "ui\\BINARY\\ROUND1_BTM2.GIF"
+ROUND1_BTM3.GIF                 RCDATA "ui\\BINARY\\ROUND1_BTM3.GIF"
+ROUND1_BTM4.GIF                 RCDATA "ui\\BINARY\\ROUND1_BTM4.GIF"
+ROUND1_TOP1.GIF                 RCDATA "ui\\BINARY\\ROUND1_TOP1.GIF"
+ROUND1_TOP2.GIF                 RCDATA "ui\\BINARY\\ROUND1_TOP2.GIF"
+ROUND1_TOP3.GIF                 RCDATA "ui\\BINARY\\ROUND1_TOP3.GIF"
+ROUND1_TOP4.GIF                 RCDATA "ui\\BINARY\\ROUND1_TOP4.GIF"
+ROUND2_BTM1.GIF                 RCDATA "ui\\BINARY\\ROUND2_BTM1.GIF"
+ROUND2_BTM2.GIF                 RCDATA "ui\\BINARY\\ROUND2_BTM2.GIF"
+ROUND2_BTM3.GIF                 RCDATA "ui\\BINARY\\ROUND2_BTM3.GIF"
+ROUND2_BTM4.GIF                 RCDATA "ui\\BINARY\\ROUND2_BTM4.GIF"
+ROUND2_TOP1.GIF                 RCDATA "ui\\BINARY\\ROUND2_TOP1.GIF"
+ROUND2_TOP2.GIF                 RCDATA "ui\\BINARY\\ROUND2_TOP2.GIF"
+ROUND2_TOP3.GIF                 RCDATA "ui\\BINARY\\ROUND2_TOP3.GIF"
+ROUND2_TOP4.GIF                 RCDATA "ui\\BINARY\\ROUND2_TOP4.GIF"
+ROUND3_BTM1.GIF                 RCDATA "ui\\BINARY\\ROUND3_BTM1.GIF"
+ROUND3_BTM2.GIF                 RCDATA "ui\\BINARY\\ROUND3_BTM2.GIF"
+ROUND3_TOP1.GIF                 RCDATA "ui\\BINARY\\ROUND3_TOP1.GIF"
+ROUND3_TOP2.GIF                 RCDATA "ui\\BINARY\\ROUND3_TOP2.GIF"
+TIANCITY_LOGO.GIF               RCDATA "ui\\BINARY\\TIANCITY_LOGO.GIF"
+TIANCITY_LOGO2.GIF              RCDATA "ui\\BINARY\\TIANCITY_LOGO2.GIF"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    VER_FILEVERSION
+ PRODUCTVERSION VER_FILEVERSION
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0804 = 简体中文；04b0 = Unicode
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "FileDescription", "炮炮火枪手 自动更新"
+            VALUE "ProductName",     "炮炮火枪手 复活版"
+            VALUE "FileVersion",     VER_FILEVERSION_STR
+            VALUE "ProductVersion",  VER_FILEVERSION_STR
+            VALUE "OriginalFilename", "BsPatcherChn.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

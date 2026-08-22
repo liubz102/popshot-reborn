@@ -42,7 +42,7 @@ function New-BuildId {
 }
 
 # ---------------------------------------------------------------------------
-#  自动更新引导器（game_patched\BsPatcherChn.exe）
+#  自动更新器（game_patched\BsPatcherChn.exe）
 # ---------------------------------------------------------------------------
 
 # 原版 NGM 引导器（Nexon Game Manager bootstrap，整条链指向停机多年的
@@ -51,31 +51,32 @@ function New-BuildId {
 $script:OriginalNGMStubSha256 = 'EB9F6600359C997FFE7F9D744AFFA1D158072B35EB3C4ED672A27CAF64B8CA14'
 
 function Assert-UpdaterStub {
-    <# game_patched\BsPatcherChn.exe 必须是**我们的更新引导器**
-       （tools\updater\updater.c 的编译产物，客户端升级分支拉起的就是它，
-       由它转手拉起 tools\update_client.py 完成自动更新），不能还是原版 NGM。
+    <# game_patched\BsPatcherChn.exe 必须是**我们的更新器**
+       （updater\src 的编译产物：原版风格界面 + 探针/下载/应用全逻辑都在
+       这个 exe 里，python 完全退出更新链），不能还是原版 NGM。
 
-       判据 = sha256。还是原版时先现场重编一次（tools\updater\build.bat，
-       vcvars32 工具链同 hook），编不过 / 编完还是原版才 throw ——
+       判据 = sha256。还是原版时先现场重编一次（updater\build.bat，
+       vcvars32 工具链同 hook，编完还会跑 --selftest 回归闸门），
+       编不过 / 编完还是原版才 throw ——
        编译机就是打包机，「忘了编」不配当打包失败的理由。 #>
     param([Parameter(Mandatory = $true)][string]$Root)
     $exe = Join-Path $Root 'game_patched\BsPatcherChn.exe'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
-        throw "缺少 game_patched\BsPatcherChn.exe —— 更新引导器（tools\updater）还没就位"
+        throw "缺少 game_patched\BsPatcherChn.exe —— 更新器（updater\src）还没就位"
     }
     $sha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
     if ($sha -ne $script:OriginalNGMStubSha256) { return }    # 已是我们的
 
-    Write-Host '  game_patched\BsPatcherChn.exe 还是原版 NGM —— 现场重编更新引导器…' -ForegroundColor Yellow
-    & (Join-Path $Root 'tools\updater\build.bat')
+    Write-Host '  game_patched\BsPatcherChn.exe 还是原版 NGM —— 现场重编更新器…' -ForegroundColor Yellow
+    & (Join-Path $Root 'updater\build.bat')
     if ($LASTEXITCODE -ne 0) {
-        throw "tools\updater\build.bat 编译失败 —— 客户端包必须带自研更新引导器（详见该脚本输出）"
+        throw "updater\build.bat 编译失败 —— 客户端包必须带自研更新器（详见该脚本输出）"
     }
     $sha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
     if ($sha -eq $script:OriginalNGMStubSha256) {
-        throw "重编之后 BsPatcherChn.exe 仍是原版 NGM —— 查 tools\updater\build.bat 的拷贝步骤"
+        throw "重编之后 BsPatcherChn.exe 仍是原版 NGM —— 查 updater\build.bat 的拷贝步骤"
     }
-    Write-Host '  更新引导器已重编并就位' -ForegroundColor Green
+    Write-Host '  更新器已重编并就位' -ForegroundColor Green
 }
 
 function Get-BuildVersion {

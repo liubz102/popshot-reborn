@@ -223,7 +223,7 @@ def load_own_version(root=None, _reload=False):
     """读包根 ``BUILD.ver`` 的 ``version`` 字段 -> ``(版本元组或 None, 警告列表)``。
 
     「这台服务器自己是哪个批次」——版本门禁的拒绝文案带上它，客户端更新器
-    （``tools/update_client.py`` 的探针）从文案里解析出该升到哪个版本，
+    （``updater\src\probe.c`` 的探针）从文案里解析出该升到哪个版本，
     成对发布（D079）的客户端 / 服务端靠这句话对上批次。
 
     BUILD.ver 是我们自己脚本写的 JSON（``version`` 键永远第一个）。先做

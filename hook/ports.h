@@ -3,7 +3,8 @@
  *
  *  ★★ 【自动生成，不要手改】
  *      源头是 server/config.py，生成器是 tools/gen_ports_h.py。
- *      要改端口只改 server/config.py 一处，重新编译即可（build.bat 会自己重新生成）。
+ *      要改端口只改 server/config.py 一处，重新编译即可
+ *（build.bat 会自己重新生成）。
  *
  *  这里的每一个号在 Python 那边都有同名常量，两边分叉会被
  *  server/test_ports.py 当场抓住。

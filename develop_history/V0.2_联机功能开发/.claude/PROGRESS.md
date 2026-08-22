@@ -3,11 +3,10 @@
 > 只保留**当前状态**。流水账进 `sessions/`。
 > **每完成一个可验证小步就立刻更新这里。**
 
-最后更新：2026-08-22 · V0.2 会话 45（**版本号管理 + 最低客户端版本门禁**全链路落地：
-`tools\build-ver.config` 手动定版本 → 打包写 `BUILD.ver`（JSON）+ 成果物目录名带
-版本（点转横杠）→ bshook 启动读 BUILD.ver 补丁 `0x54d98f` 的握手版本号 →
-服务端解码记 `online.log` 并按 `server-ClientFilter.config` 热重载门禁拒绝旧客户端。
-§233 / D154）
+最后更新：2026-08-22 · V0.2 会话 47（**更新器 v3：全逻辑进 BsPatcherChn.exe**
+（updater\ 独立 C 工程）+ 原版 NGMResource 界面素材提取入工程复刻 572×473
+双进度条更新窗，渲染链 file:///→document.write→原生三段回退；python 完全退出
+更新链，.update_old 善后归启动脚本。§235 / D156）
 
 ---
 
@@ -28,8 +27,34 @@ Python 已内置在 `runtime\python`，目标电脑不需要安装 Python。
 
 ## 当前位置
 
+**会话 47（2026-08-22）—— 更新器 v3：全逻辑进 exe + 原版界面复刻（§235 / D156）。
+动机：v2 更新器自己跑在包内 python 上锁着 runtime（覆盖只能改名让位）+ 黑控制台
+界面不像原版；用户拍板整条重做（上一版尝试因 res:// 渲染失败被还原）。**
+
+| 环节 | 文件 | 行为 |
+|---|---|---|
+| 工程 | `updater\`（顶层独立工程） | src\ 按职责分 16 个 .c/.h（util/log/config/cipher/sha256[CNG]/manifest/net_http[WinHTTP]/probe/procs/zip[miniz]/apply/ui_window/ui_external/ui_native/main/selftest）+ vendor\miniz + ui\（原版素材）+ scripts\（extract_updater_ui.py 提取 / make_patched_ui.py 打补丁 / test_e2e.py 端到端）。**python 完全退出更新链**：`tools\update_client.py` 与 `tools\updater\`（v2）已删 |
+| 界面 | `updater\ui\` + `ui_window.c` | 原版 NGMResource.dll 素材一次性提取进工程（orig\ 原始字节 + 打补丁副本：注入 external 按钮回调/拖动/iframe about:blank），rc 嵌 exe，IE 控件渲染 **572×473 双进度条原版窗口**；渲染链 file:/// → document.write+data:URI → 原生控件三段回退（--ui-mode 强制档位，截图 logs\updater-ui-preview\）；CONFIRMRUNADMIN/MESSAGEL 原版模态 |
+| 流程 | `main.c` | 探针→manifest→WinHTTP 下载（sha256/进度/ETA/可取消）→等游戏退出（MESSAGEL 询问后强杀）→停本机服务端（路径精确匹配+树杀）→写权限试探后才弹原版确认框提权（--zip 传缓存）→staging 解压覆盖（保护清单/改名让位/BUILD.ver 最后写）→**只提示手动重启**（不自动拉起） |
+| 善后 | `tools\launch.ps1` | 启动成功后**静默递归删** `*.update_old`（不提示玩家；仍被占下次再删） |
+| 端口 | `tools\gen_ports_h.py` | 再产出 `updater\src\ports.h`（探针只认 server\config.py 的 GAME_PORT），test_ports.py 盯两份 |
+
+**验证**：selftest 45 项全绿（build.bat 闸门，编不过不出 bin）；三段渲染链截图
+核对；`test_e2e.py` 端到端（沙箱 V0.2.7→V0.2.8 + 假门禁 + 本地 http：探针编码/
+下载校验/保护清单/运行中 exe 改名让位/提交点全过）；两套运行时各 **1021 项**全绿
+（test_update.py 裁 38 项 python 内部测试、保留服务端契约）；完整打包 -Zip -Force
+闸门全过、包内无 update_client.py、manifest 幂等。
+
+⇒ **下一步：⏳ 待验证表第 53~55 条**（真机：GitHub 传 Release 后整链自动更新 /
+提权流程 / 0.2.6 旧包用户手动下载引导）。**注意**：真机验证前先把
+`dist\PopShot-portable-win64_V0-2-7.zip` + `dist\manifest.json` 挂上 GitHub
+Release（tag `V0.2.7`）；0.2.7 旧包（python 更新器）用户仍可自动更新到新更新器。
+
+---
+
 **会话 46（2026-08-22）—— 自动更新：接管升级分支，旧客户端被拒后全自动升级（§234 / D155）。
-动机：用户真机触发门禁拒绝，客户端拉起原版 BsPatcherChn.exe（NGM）连死链报「patch中出错」。**
+动机：用户真机触发门禁拒绝，客户端拉起原版 BsPatcherChn.exe（NGM）连死链报「patch中出错」。
+（★ 会话 47 起 v2 引导器 + update_client.py 已退役，由 updater\ 独立工程接管；此节留档）**
 
 | 环节 | 文件 | 行为 |
 |---|---|---|
@@ -1825,8 +1850,8 @@ J 原本是整个 V0.2 最大的风险（PLAN 写着「唯一有真实失败风�
 | 50 | ★★★ **版本上报 + 升级弹框（§233 / D154，要重打客户端包）**。① 用**新打的客户端包**（目录名带 `_V0-2-7`）正常登录进大厅；② 把客户端包根的 `BUILD.ver` 改名（如 `BUILD.ver.bak`）再启动一次，登录时用那台机器连**同一台服务器** | ① 客户端 `logs\bshook_*.log` 里有一行 `PATCH BUILD.ver 版本 V0.2.7 -> 握手版本号 2007` 和一行 `★握手版本号 @ 0054D98F: 311 -> 2007`；服务端 `logs\online.log` 里每次登录都有一行 `+ 版本上报 ip=… 客户端版本=V0.2.7`；② 改名后 bshook 日志打「没有可用的 BUILD.ver……按原版 311 上报」，登录时应被服务器拒绝并**弹出客户端自带的升级/报错提示框**，`online.log` 里是 `✗ 版本门禁 拒绝 ip=… 客户端版本=旧版(未上报版本) 最低要求=V0.2.7` | **待用户**。★ 服务端行为已被 8 条新回归钉死（拒绝/放行/兜底/热重载）；**没验的是真客户端那个「非零结果码 + 字符串」弹框分支长什么样** —— 逆向只到「再读一个 wstring + GetComputerName + 弹框」（packet_api.md §1.2），从未真机触发过。若弹框不出现或样子不对，把 bshook 日志发回来调文案/结果码；兜底层已保证旧客户端**一定进不了大厅** |
 | 51 | ★ **门禁热重载（§233 / D154）**。服务器跑着不动，把包根 `server-ClientFilter.config` 的 `0.2.7` 改成 `0`，再用第 50 条 ② 那个没有 BUILD.ver 的客户端登录 | **不用重启服务器**，下一条连接就放行了：`online.log` 出现 `+ 版本上报 … 客户端版本=旧版(未上报版本)` 且不再有 `✗ 版本门禁`；客户端正常进大厅。改回 `0.2.7` 再登一次，又会被拒 | **待用户**。行为已被 test_versioning 的热重载用例覆盖，这里只验「真服务器进程 + 真文件」场景 |
 | 52 | ★ **版本号进成果物名（§233 / D154）**。跑一次 `tools\build.bat`（菜单随便选一项），看 `dist\` | 产出目录和压缩包名都带版本后缀：`PopShot-portable-win64_V0-2-7(.zip)`、`PopShot-server_V0-2-7(.zip/.tar.gz)`；包根有 `BUILD.ver`（JSON，第一行 `"version": "V0.2.7"`）和 `server-ClientFilter.config`，**没有 BUILD.txt**；菜单开头先打一行「本次打包版本：V0.2.7」 | ✅ **agent 已试打两个包验证过**（2026-08-22，冒烟自检全过）；留这条给用户在真发版时顺手确认 |
-| 53 | ★★★ **自动更新整链（§234 / D155，要先把 0.2.7 传上 GitHub Release）**。前置：GitHub 建 Release（tag `V0.2.7`，资产挂 `PopShot-portable-win64_V0-2-7.zip` + `manifest.json`）+ 部署新服务端包。然后拿一个**旧版本客户端包**（或把新包根 `BUILD.ver` 的版本号改小）登录 | 被拒 → 客户端弹框 → 点确定后**不再出现** NGM 的「运行需要管理者权限」/「patch中出错」，而是我们更新器的黑控制台：本地版本→探针（服务器要求的版本）→下载进度（约 410MB，可看速度/ETA）→ 应用 → 提示重启 → start.bat 拉起后正常登录进大厅；`logs\updater.log` 有 start/spawn 两行、`logs\update.log` 有 run/probe/zip ready/applied 四行 | **待用户**。链路上机器可测的部分（探针加解密、manifest 幂等、玩家数据保护、坏包中止）已被 test_update 34 项钉死；**没验的是真机全链**：GitHub 直连下载速度、弹框实际长相（第 50 条同款未知）、重启后 BUILD.ver 新值上报 |
-| 54 | ★ **更新器提权流程（§234 / D155）**。把客户端包拷进一个无写权限的目录（如 `C:\Program Files\popshot`）再触发更新 | 控制台提示「没有写权限，请求管理员身份」→ **弹一次 UAC**（确定后新管理员窗口接着干活，不重复下载）→ 应用完成 → 用 start.bat 重启后游戏**不以管理员运行**；点「否」拒绝 UAC 则给出 GitHub Release 手动下载地址退出 | **待用户**。提权分支只在目录不可写时出现（正常目录全程无 UAC）；参数构造已被 test_update 钉住 |
+| 53 | ★★★ **自动更新整链（§235 / D156，要先把 0.2.7 传上 GitHub Release）**。前置：GitHub 建 Release（tag `V0.2.7`，资产挂 `PopShot-portable-win64_V0-2-7.zip` + `manifest.json`）+ 部署新服务端包。然后拿一个**旧版本客户端包**（或把新包根 `BUILD.ver` 的版本号改小）登录 | 被拒 → 客户端弹框 → 点确定后**不再出现** NGM 的「运行需要管理者权限」/「patch中出错」，而是弹**原版风格更新窗口**（572×473，世纪天成 logo + 宣传图 + 「目前/全部」双进度条）：探针（服务器要求的版本）→下载进度（约 410MB，速度/剩余时间）→ 停本机服务端 → 应用 → **提示手动重启**（不自动拉起）→ 玩家跑 start.bat 后正常登录；`logs\updater.log` 全程留痕（start/probe/target/download/zip ready/rename-dance/applied/FINISH-OK） | **待用户**。机器可测部分已钉死：selftest 45 项（密码/帧/manifest/sha256/资源）+ test_e2e 端到端（探针→下载→改名让位→提交点）+ 三段渲染链截图（logs\updater-ui-preview）；**没验的是真机全链**：GitHub 直连下载、真客户端弹框分支（第 50 条同款未知）、第二次自动更新（此时更新器已是 v3，python 可被安全停止） |
+| 54 | ★ **更新器提权流程（§235 / D156）**。把客户端包拷进一个无写权限的目录（如 `C:\Program Files\popshot`）再触发更新 | 主窗口先正常下载（不需要管理员），应用前弹**原版风格确认框**（440×163「继续运行需要 管理者权限」）→ 点确认后**弹一次 UAC**（显示「炮炮火枪手 自动更新」，新管理员窗口接着干活，不重复下载）→ 应用完成 → 提示手动重启；点取消/拒绝 UAC 则主窗口给出 GitHub Release 手动下载地址 | **待用户**。提权分支只在目录不可写时出现（正常目录全程无 UAC、无确认框） |
 | 55 | ★ **0.2.6 旧包用户的引导（§234 / D155）**。拿 V0.2.6 旧包连新服务器 | 走的还是原版 NGM：弹「运行需要管理者权限」→「patch中出错」（死链，**预期内**，这批用户需要最后一次手动下载带更新器的 0.2.7；群公告 + 拒绝文案里的 Release 页地址）| **待用户**。旧包没有我们的引导器，帮不了；确认现象与预期一致即可 |
 
 ### ✅ J.2 已拍板：**原版的连接方式和回退方式全部原样还原**（D078）

@@ -409,6 +409,22 @@ if ($relayPid -and $lastSignature -eq $relaySignature) {
 
 if ($NoGame) { Say ''; Say '（-NoGame：不启动客户端）' 'Gray'; exit 0 }
 
+# --- 更新善后：静默清掉历次更新「改名让位」的 .update_old ------------------
+# 自动更新器覆盖「正在运行的自己」时，会把旧 exe 改名成 *.update_old 让位
+# （Windows 不许覆盖运行中的 exe，但允许改名）。更新器进程退出后锁就没了，
+# 这里启动成功后顺手扫掉；仍被占用的极少数（更新器刚退出零点几秒内）静默
+# 跳过，下次启动再删。绝不弹提示（用户拍板）。
+try {
+    $oldFiles = @(Get-ChildItem -Path $Root -Recurse -Filter '*.update_old' -ErrorAction SilentlyContinue |
+                  Where-Object { -not $_.PSIsContainer })
+    foreach ($old in $oldFiles) {
+        Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
+    }
+    if ($oldFiles.Count -gt 0) {
+        Say ("[更新善后] 已清理上次更新遗留的旧文件 " + $oldFiles.Count + " 个") 'DarkGray'
+    }
+} catch { }
+
 # --- 4. 把配置交给 bshook ---------------------------------------------------
 # ★ 走环境变量而不是让 C 去解析 UTF-8 配置文件：bsloader.exe 本来就把环境
 #   继承给客户端进程，省掉一整套解析和编码处理（决策 D065）。

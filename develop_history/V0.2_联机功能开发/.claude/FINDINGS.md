@@ -6552,3 +6552,143 @@ GetVersionEx —— 后者受兼容性清单影响谎报 6.2；`POPSHOT_FORCE_LE
      启动——原版那些年就是提权重启的）；
   6. `POPSHOT_UPDATER_NOUI=1` 测试钩子：跳过询问与提权直接拉工作进程
      （无头环境 MessageBox 会永远挂着）。
+
+## 235. ★★★★★ 更新器 v3：全逻辑进 exe + 原版界面复刻（V0.2 会话 47 / D156）
+
+会话 46 的两段式（C 引导器 + `tools/update_client.py`）真机跑通后用户提出
+两个结构性问题：**① 更新器自己跑在包内 python 上**，锁着
+`runtime\python\python.exe`，覆盖 runtime 只能靠改名让位（`.update_old`），
+「更新器无法更新自己」；**② 黑控制台界面**不像原版 BsPatcherChn 的更新窗。
+用户拍板整条重做（上一版尝试因 res:// 渲染失败被还原，本版从头实现）。
+
+### 1. 原版界面素材（一次性提取进工程，用户拍板不依赖原版 DLL）
+
+`game_patched\NGMResource.dll`（2007 年纯资源 DLL）里的整套 UI 已提取：
+`updater\scripts\extract_updater_ui.py`（ctypes 枚举 UTF-16 名资源 →
+`updater\ui\orig\` 原始字节 + 目录清单 + gb2312 解码预览；顺手把
+GROUP_ICON 109 + RT_ICON 组装成三尺寸 `ICON_109.ico`）。关键事实：
+
+* 模板是 **HTML**（类型 HTML/23）：`TEMPLATE_PATCH.HTML`（572×473 主更新窗，
+  双进度条「目前/全部」各按 `percent*440/100` px 拉伸 `bg_bar_on.gif`、
+  公告 iframe `CustomContents` 546×300（**src 本来就是空的**，NGMDll 运行时
+  `ChangeContents()` 填）、`btnCancel/btnConfirm` 由 `ChangeButton()` 切换、
+  状态文字 `TextCurrent`/`TextRemainingTime`）、`TEMPLATE_CONFIRMRUNADMIN.HTML`
+  （440×163 管理员确认框：`btnContinue/btnStop`）、`TEMPLATE_MESSAGEL.HTML`
+  （440×133 消息框：`Message` 元素 + `ChangeType(icon)` + `ShowBtnCancel()`）。
+  JS API 全集：`SetProgressCurrent/SetProgressTotal/ShowRemainingTime/
+  ShowTextCurrent/ChangeContents/ChangeButton`。
+* 图片是类型 **BINARY**（字符串类型名）42 张，模板按 `BINARY/xxx.gif`
+  **相对路径**引用 —— 正是 res:// 的「类型/名字」URL 结构。
+  `IMG_DEFAULT.JPG` 正好 546×300 = 公告 iframe 原生尺寸。
+* **模板里没有任何 onclick**：原版 NGMDll 靠 COM 事件下沉接按钮点击。
+* `make_patched_ui.py` 生成工程副本：纯 ASCII 字节级注入
+  `onclick="window.external.OnButton('<id>')"（+return false）`、TopSec
+  `onmousedown → external.DragMove()`（无标题栏窗口的拖动，btnClose 上不
+  触发）、PATCH 公告 iframe `src="" → about:blank`（防空 src 自嵌套）。
+  差异集中在 PATCHES 表，ui\README.md 逐条注明，其余字节与 orig 逐字节一致。
+
+### 2. 渲染链（三段，吸取上一版 res:// 翻车教训）
+
+素材嵌 exe（updater.rc 全部 RCDATA，资源名 = 原 DLL 资源名大写；★ rc.exe
+会把**资源名的引号当成名字一部分**，名字不加引号），运行时解到
+`%TEMP%\popshot-ui-<pid>\`（`BINARY\` 子目录结构保留 → 相对引用天然解析）：
+
+1. **file:///**（主选）：`Navigate` 到 `file:///<dir>/TEMPLATE_PATCH.HTML`；
+2. **about:blank + document.write**（回退 1）：`BINARY/名` 全部替换成内嵌
+   `data:image/...;base64` URI、`<link global.css>` 换 `<style>` 内联；
+3. **原生 Win32**（回退 2，`ui_native.c`）：msctls_progress32 双进度条 +
+   按钮文字；CONFIRM/MESSAGE 模态退化为 MessageBox。**更新绝不因 UI 阻断**。
+
+三段都能用 `--ui-mode 1/2/3` 强制（截图验证留 `logs\updater-ui-preview\`）。
+宿主是纯 C 的 OLE 样板（IOleClientSite/IOleInPlaceSite/IOleInPlaceFrame/
+IOleControlSite/IDocHostUIHandler，**不用 ATL** —— BuildTools 不保证装了）。
+坑：**各接口 vtbl 槽位顺序必须照 SDK 头逐个核对**（IOleClientSite 有
+GetContainer/ShowObject、IDocHostUIHandler 有 OnFrameWindowActivate、
+IOleInPlaceFrame 的 TranslateAccelerator 在最后且 RemoveMenus 只有一个参数
+—— 全是照着 `%Windows Kits%\Include\*\um\*.h` 的 vtbl 定义核出来的）。
+
+### 3. python 完全退出更新链
+
+`tools/update_client.py` 与 `tools/updater\`（v2 引导器）删除；全部语义
+移植进 `updater\src\`（main/util/log/config/cipher/sha256(CNG bcrypt)/
+manifest/net_http(WinHTTP)/probe/procs/zip(miniz)/apply/ui_*）：
+探针握手（cipher 向量与 server\simple.py 对拍）→ manifest 手写解析
+（fail-open）→ WinHTTP 下载（TLS1.2 尽力开、流式 sha256、进度/速度/ETA）
+→ 等游戏退出 → 停本机服务端（exe 路径 == 本包 runtime\*.exe 精确匹配 +
+树杀，**不再需要选运行时的 RtlGetVersion** —— 两条路径都查）→ 写权限
+试探后才弹**原版 CONFIRMRUNADMIN 框**提权重跑（--zip 传缓存不重下）→
+staging 同盘整包解压 → PROTECTED_PATHS 跳过 → 逐文件 MoveFileEx 重试 +
+改名让位（改名前先删上次遗留的 .update_old 防挡道）→ **BUILD.ver 最后写**
+→ 完成态只提示手动重启（`start.bat`/`start-debug.bat`），不自动拉起。
+
+### 4. .update_old 的善后归启动脚本（用户拍板）
+
+改名让位的旧文件被更新器进程锁着删不掉；更新器退出后锁释放，玩家下次
+`start.bat` 时 `tools\launch.ps1`（服务端+中继启动成功后、拉游戏前）递归
+静默清 `*.update_old`（仍被占用的跳过下次再删，不提示）。更新器自身不再
+做启动清扫（省掉整个目录递归遍历）。
+
+### 5. 验证
+
+* `BsPatcherChn.exe --selftest`：45 项（cipher 向量/流连续性、版本号数学、
+  0xFE 帧解析、拒绝文案抠版本、manifest 解析、保护清单、sha256 标准向量、
+  gb2312 解码、base64、file URL 编码、嵌入资源逐个 FindResource）——
+  **build.bat 编完就跑，不过不许出 bin**。
+* `--preview`：真窗口假进度跑一圈（截图核对三段渲染链，见
+  `logs\updater-ui-preview\`：file:// 完美复刻原版布局/logo/宣传图/双进度条/
+  确认按钮/圆角边框；write 模式完整；原生可用）。
+* `updater\scripts\test_e2e.py` 端到端（不碰 GitHub）：沙箱低版本包
+  （V0.2.7）+ 本地 http 发 manifest/zip + **假门禁服务器**（127.0.0.1:27799
+  收 4 字节解密、回 0xFE 拒绝帧带 V0.2.8；27799 被真服务器占着时自动跳过
+  该断言）→ 断言：探针上报编码 2007、BUILD.ver→V0.2.8、保护文件原样、
+  **运行中的更新器自己改名 .update_old**、staging 清理。约 1 秒跑完。
+* 两套运行时 3.14 + Win7 3.8 各 **1021 项**全绿（test_update.py 裁掉 38 项
+  update_client 内部实现测试 —— 由 C selftest + E2E 接管，保留服务端契约；
+  test_ports.py 新增 updater\src\ports.h 盯梢）。
+* 完整打包（build-portable.ps1 -Zip -Force）：Assert-UpdaterStub 闸通过、
+  包内无 update_client.py、manifest 幂等更新（V0.2.7 原位替换）。
+
+### 6. 真机首测三修（2026-08-22 深夜，用户真机截图反馈）
+
+用户拿 GitHub 真链路首测（manifest 还没挂上 Release → 404），截图暴露三处：
+
+1. **公告区一打开是空白**：原设计等「选定目标版本」才 `ChangeContents`，
+   检查/失败阶段 iframe 停在 about:blank。修复：建窗渲染成功即写默认公告
+   （IMG_DEFAULT.JPG + 「正在检查更新，请稍候……」），目标版本确定后再换；
+   **失败详情也改走公告区**（红字标题 + 原因 + 手动下载地址 —— 原来挤在
+   底部 11px 单行小字里根本显示不全，`TextCurrent` 的 CSS 是
+   `height:11px;overflow:hidden` 只够一行），底部小字只留「详见上方说明」。
+2. **标题栏拖拽无效**：注入的 `onmousedown` 判 `event.button==0` ——
+   W3C 语义（0=左键），但 IE 传统事件模型（内联处理器里的 `window.event`）
+   左键是 **1**，条件永远为假，`DragMove` 从未被调。修复：`==0||==1` 两边
+   都认，并把拖拽区从 TopSec 扩到 `<body>`（排除 iframe/A/btn* 元素，
+   SendInput 模拟拖动实测窗口精确跟随移动）。
+3. **窗口底部圆角边框被裁一截**（两轮才修好）：
+   - 一修：模板装饰图（round*.gif，5px 高）是行内元素，IE11 行盒默认
+     ~14px，每张小图多占 ~9px、总高溢出 473 客户区（SCROLL_NO 挡掉滚动
+     直接裁）。注入 `<style>img{display:block}iframe{display:block}</style>`
+     消除行盒间隙。★ 当时用视觉模型核对裁剪条带判「已修好」——**误判**
+     （视觉模型把不存在的圆角边框"看"出来了）。
+   - 二修（用户再次反馈仍被裁，改用像素级分析坐实：全宽灰线只在窗口
+     第 0 行，底边整条在窗外）：`display:block` 后实际内容高度仍比模板
+     注释的设计值 473 高 ~7px（480 —— 现代 Trident + 字体回退与 2007 年
+     IE6 的排版差异不止行盒一处）。**真正的修复：页面就绪后量
+     body/documentElement 的 scrollHeight，内容更高就把窗口加高到内容
+     高**（设计值为下限、+100px 保险丝），对字体/显示缩放差异免疫。
+     实测窗口 473→480，像素级复核：顶边灰线在第 0 行、底边灰线在最后一行。
+   - 教训：**UI 核对必须像素级**（逐行数灰像素），视觉模型的「看起来
+     完整」不可信。
+   - **三修（同日第三轮真机反馈）**：①公告区滚动条——公告页放了整张
+     546×300 海报再加两行文字，内容高超出 iframe 的 300 → 垂直滚动条；
+     滚动条又占掉 ~17px 宽 → 水平滚动条跟着出。修复：海报等比缩成
+     485×267 居中 + 一行文字（总高 ~290），body 加 overflow:hidden 兜底
+     （校准用户截图的滚动条轨道色 (205,205,205) 做像素检测，修复后为 0）。
+     ★ 用户反馈缩图不可接受（右侧留白难看），终版拍板：**不缩图** ——
+     打补丁把公告 iframe 的 height 300 -> 332（海报原尺寸 546x300 + 一行
+     文字 ~28px），窗体高度由 scrollHeight 自适应长到 572x512。像素四项
+     复核：无滚动条 / 海报满宽 547px 未缩 / 底部圆角在最后一行 / 状态
+     文字 12 行完整。
+     ②底部状态小字被裁几像素——原版 CSS 给状态行定的盒子
+     height:11px+overflow:hidden，字号却 12px，IE11 行盒 ~14px 必裁。
+     注入 `#BtmSec p.CurrentTxt{height:14px !important;top:2px !important}`
+     （容器 BtmSec 高 18px 容得下）；像素验证字形完整占 12 行、收尾行干净。

@@ -10,9 +10,9 @@
 而是某个功能悄悄不工作**。位置数据那条 UDP 通道尤其典型 —— 端口对不上时
 它没有任何回执，服务端照常起、玩家照常玩，只是数据全投进黑洞。
 
-所以现在：`server/config.py` 是唯一的源，`hook/ports.h` 由
-`tools/gen_ports_h.py` 生成，PowerShell / sh 用 `python config.py --ports` 问。
-下面这几条把这个结构钉死。
+所以现在：`server/config.py` 是唯一的源，`hook/ports.h` 和
+`updater/src/ports.h` 由 `tools/gen_ports_h.py` 生成，PowerShell / sh 用
+`python config.py --ports` 问。下面这几条把这个结构钉死。
 
 ⚠ 这些用例依赖仓库布局（`hook/`、`tools/`），发布包里没有它们 ——
    而发布包里也没有 `test_*.py`（`tools/build-common.ps1` 会剔掉），所以不冲突。
@@ -32,6 +32,7 @@ import config as server_config                                  # noqa: E402
 ROOT = os.path.dirname(HERE)
 HEADER = os.path.join(ROOT, "hook", "ports.h")
 BSHOOK = os.path.join(ROOT, "hook", "bshook.c")
+UPDATER_HEADER = os.path.join(ROOT, "updater", "src", "ports.h")
 GENERATOR = os.path.join(ROOT, "tools", "gen_ports_h.py")
 
 
@@ -53,6 +54,17 @@ class GeneratedHeaderTests(unittest.TestCase):
         found = dict(re.findall(r"#define\s+POPSHOT_(\w+)\s+(\d+)", text))
         want = {k: str(v) for k, v in server_config.port_table().items()}
         self.assertEqual(found, want)
+
+    def test_updater_header_matches_config_py(self):
+        """★ `updater/src/ports.h`（更新器探针用的游戏服端口）也要一致。
+
+        更新器只需要 GAME_PORT 一个号，但一样只认 server/config.py 这个源
+        （分叉 = 探针连错端口 = 自动更新整条链失灵）。
+        """
+        text = repo_file(UPDATER_HEADER)
+        found = dict(re.findall(r"#define\s+POPSHOT_(\w+)\s+(\d+)", text))
+        self.assertEqual(found,
+                         {"GAME_PORT": str(server_config.GAME_PORT)})
 
     def test_the_generator_reports_it_is_up_to_date(self):
         """生成器自己的 `--check` 也要说「最新」（它是 build.bat 的守门人）。"""
