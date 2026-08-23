@@ -594,8 +594,15 @@ function New-PackageZip {
         if ($rc -ne 0) { throw "7z 打包失败（退出码 $rc）：$ZipPath" }
         return '7-Zip'
     }
-    Compress-Archive -LiteralPath $SourceDirectory -DestinationPath $ZipPath -CompressionLevel Optimal
-    return 'Compress-Archive'
+    # ★ 条目名强制 UTF-8（带标志位）：Compress-Archive 在中文系统上会把
+    #   非 ASCII 名写成 GBK 且不打标志位，跨语言/自研更新器都容易读成乱码
+    #   （§240 真机踩坑）。.NET 显式 UTF8 编码会正确打上 0x800 标志。
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::CreateFromDirectory(
+        $SourceDirectory, $ZipPath,
+        [System.IO.Compression.CompressionLevel]::Optimal, $true,
+        [System.Text.Encoding]::UTF8)
+    return 'CreateFromDirectory(UTF8)'
 }
 
 function Show-StaleArchiveWarning([string]$PackageDirectory, [string[]]$Extensions) {

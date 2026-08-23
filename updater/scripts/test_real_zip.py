@@ -21,6 +21,7 @@ import os
 import shutil
 import sys
 import tempfile
+import zipfile
 import threading
 import time
 
@@ -160,6 +161,31 @@ def main():
                encoding="utf-8").read()
     if "127.0.0.1" not in cfg:
         die("config/server.config 被覆盖了（保护清单失效）")
+
+    # §240 回归：zip 里的中文名条目（GBK 无 UTF-8 标志位，如
+    # 炮炮火枪手.url）必须以正确名字落盘，不许多不少不乱码。
+    with zipfile.ZipFile(zip_path) as zf:
+        url_entries = [zi for zi in zf.infolist()
+                       if zi.filename.lower().endswith(".url")]
+    if url_entries:
+        zi = url_entries[0]
+        if zi.flag_bits & 0x800:
+            expect_leaf = zi.filename.rsplit("/", 1)[-1]
+        else:
+            raw = zi.filename.encode("cp437", "replace")
+            expect_leaf = raw.decode("gbk", "replace").rsplit("/", 1)[-1]
+        urls_on_disk = [n for n in
+                        os.listdir(os.path.join(sandbox, "game_patched"))
+                        if n.lower().endswith(".url")]
+        print("url on disk:", [repr(n) for n in urls_on_disk],
+              "expect:", repr(expect_leaf))
+        if len(urls_on_disk) != len(url_entries):
+            die("game_patched 的 .url 数不对：zip %d 个 / 落盘 %r"
+                % (len(url_entries), urls_on_disk))
+        if urls_on_disk[0] != expect_leaf:
+            die("中文名条目落盘不对：%r != %r"
+                % (urls_on_disk[0], expect_leaf))
+        print("gbk-named entry ok:", urls_on_disk[0])
 
     shutil.rmtree(tmp, ignore_errors=True)
     print("==== REAL-ZIP PASS（真实发布包端到端：下载/解压/覆盖/提交全通）====")

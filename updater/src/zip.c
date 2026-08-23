@@ -10,10 +10,20 @@
 #include "zip.h"
 #include "util.h"
 
-/* zip 条目名（UTF-8/mbcs）-> 宽字符，顺手做安全检查。0 = 拒绝。 */
+/* zip 条目名（原始字节）-> 宽字符，顺手做安全检查。0 = 拒绝。
+   ★ 编码（§240 真机踩坑）：zip 文件名没有强制编码 —— 打了 UTF-8
+   标志位(0x800)的按 UTF-8；没打的多半是打包机系统 ANSI（资源管理器
+   压缩/部分工具写 GBK）。这版 miniz 的 file_stat 不暴露标志位，用等价
+   启发式：先严格 UTF-8（MB_ERR_INVALID_CHARS，非法序列即败），败了
+   退回 CP_ACP。纯 ASCII 两条路殊途同归；GBK 中文串几乎必含 UTF-8
+   非法序列。旧代码一律宽恕式 UTF-8 → GBK 字节解成乱码名，游戏目录
+   里凭空多出「文件名乱码的快捷方式」。 */
 static int entry_name_ok(const char *name, wchar_t *out, size_t cap)
 {
-    int n = MultiByteToWideChar(CP_UTF8, 0, name, -1, out, (int)cap);
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                name, -1, out, (int)cap);
+    if (n <= 0)
+        n = MultiByteToWideChar(CP_ACP, 0, name, -1, out, (int)cap);
     wchar_t *p;
     if (n <= 0) return 0;
     if (wcsstr(out, L"..")) return 0;               /* 穿越一律拒绝 */
@@ -139,12 +149,26 @@ void zip_close(ZipFile *z)
     z->count = 0;
 }
 
+/* miniz 只收 char* 目标名（fopen 按 ANSI 解释）—— 中文路径会被写坏
+   （§240 真机踩坑：UTF-8 字节经 fopen 落盘 = 乱码文件名）。改用
+   extract_to_callback + CreateFileW，全程宽字符。 */
+static size_t extract_write_cb(void *user, mz_uint64 ofs,
+                               const void *buf, size_t n)
+{
+    HANDLE h = *(HANDLE *)user;
+    DWORD wrote;
+    (void)ofs;                       /* 顺序写，文件指针自己在走 */
+    if (!WriteFile(h, buf, (DWORD)n, &wrote, NULL) || wrote != (DWORD)n)
+        return 0;
+    return n;
+}
+
 int zip_extract_to(ZipFile *z, int i, const wchar_t *dest_root,
                    wchar_t *err, size_t err_cap)
 {
     wchar_t dst[MAX_PATH * 2];
-    char dst_mb[MAX_PATH * 4];
     wchar_t *p;
+    HANDLE h;
 
     path_join(dst, MAX_PATH * 2, dest_root, z->rels[i]);
     /* 递归建父目录。 */
@@ -157,15 +181,22 @@ int zip_extract_to(ZipFile *z, int i, const wchar_t *dest_root,
         }
         *p = L'\\';
     }
-    WideCharToMultiByte(CP_UTF8, 0, dst, -1, dst_mb, sizeof(dst_mb),
-                        NULL, NULL);
-    /* ★ 用原始索引（含目录项的序号），不是紧凑下标。 */
-    if (!mz_zip_reader_extract_to_file(&z->arc, (mz_uint)z->mzidx[i],
-                                       dst_mb, 0)) {
+    h = CreateFileW(dst, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        _snwprintf(err, err_cap, L"建不了目标文件：%ls", dst);
+        return 0;
+    }
+    /* ★ 用原始索引（含目录项的序号），不是紧凑下标。miniz 自带 CRC 校验。 */
+    if (!mz_zip_reader_extract_to_callback(&z->arc, (mz_uint)z->mzidx[i],
+                                           extract_write_cb, &h, 0)) {
+        CloseHandle(h);
+        DeleteFileW(dst);
         _snwprintf(err, err_cap, L"解压失败（zip 损坏/CRC 不过）：%ls",
                    z->rels[i]);
         err[err_cap - 1] = 0;
         return 0;
     }
+    CloseHandle(h);
     return 1;
 }

@@ -6883,3 +6883,31 @@ Releases 地址」。
   字节**（sha `587e86a1…` vs `d6fcfa8a…`，差 662 字节）—— 各自与
   各自的 manifest 自洽，更新器按 manifest 校验不受影响。发版注意：
   zip 和 manifest.json 必须**同批**上传替换。
+
+## 240. ★★★★ 更新后 game_patched 多出乱码名快捷方式：zip 条目名编码（V0.2 会话 50 第六轮）
+
+用户真机：更新完成后 game_patched 里出现「炮炮火枪手.url」的乱码名副本
+（原名文件也还在）。诊断链条：
+
+* 该 .url 是**原版安装遗留**的 2007 官网快捷方式（内容
+  `URL=http://popshot.tiancity.com`，死链），一直在包里。
+* 发布 zip 里此条目的文件名是 **GBK 字节且未打 UTF-8 标志位**
+  （flag_bits=0x0；资源管理器压缩/部分打包工具在中文系统上的典型行为）。
+  7-Zip / 资源管理器按系统 ANSI 解读所以显示正常。
+* 更新器两处编码坑：
+  1. `entry_name_ok` 一律宽恕式 CP_UTF8 解码 —— GBK 字节解成乱码宽字符；
+  2. `zip_extract_to` 把目标路径转 **UTF-8** 字节交给 miniz 的 fopen
+     （fopen 按 ANSI 解释）—— 即使名字解对了，落盘也会再坏一次。
+* 修复：
+  1. 条目名解码改「严格 UTF-8（MB_ERR_INVALID_CHARS）失败退 CP_ACP」——
+     等价于标准的「有标志位按 UTF-8、无按 ANSI」规则（这版 miniz 的
+     file_stat 不暴露标志位，用启发式；纯 ASCII 殊途同归）。
+  2. 解压改 `mz_zip_reader_extract_to_callback` + `CreateFileW`，
+     全程宽字符，彻底绕开 fopen 的 ANSI 语义。
+  3. 打包侧：build-common.ps1 的 Compress-Archive 回退路径改为
+     .NET `CreateFromDirectory(..., Encoding.UTF8)`（正确打 0x800
+     标志位）；7z 主路径本来就是 UTF-8。
+* 回归：test_real_zip.py 加断言 —— 真实 zip 的 GBK 名条目必须以
+  「炮炮火枪手.url」原样落盘、数量一不多不少（实测 PASS）。
+* 遗留建议（未实施）：这个 .url 指向死链，可考虑从 game_patched 里
+  删掉（原版遗留垃圾，非游戏必需）—— 用户拍板。
