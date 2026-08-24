@@ -335,6 +335,19 @@ class Room:
                 if s is not None and not s.is_bot
                 and s.conn is not None and s.conn is not exclude]
 
+    def bot_members(self, exclude=None):
+        """房里 **bot** 的连接（`BotConn`，可排除一个）。
+
+        M2 那两处「bot 没有加载过程，收到广播的那一刻就算它加载完」（D4）
+        靠它拿人：开局的 `0x0400` 和换图的 `0x0417`。
+
+        ★ 判据是座位上的 `is_bot`，**不是** `isinstance(conn, BotConn)`
+        —— `lobby.py` 不认识 `bot.py`，导入方向是单向的（§14）。
+        """
+        return [s.conn for s in self.seats
+                if s is not None and s.is_bot
+                and s.conn is not None and s.conn is not exclude]
+
     def is_full(self):
         return self.free_seat() is None
 

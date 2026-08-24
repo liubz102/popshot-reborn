@@ -11,6 +11,7 @@
 """
 import os
 import sys
+import time
 import unicodedata
 import unittest
 import unittest.mock
@@ -22,13 +23,25 @@ if HERE not in sys.path:
 import bot                                                     # noqa: E402
 import gameserver                                              # noqa: E402
 from gameserver import (                                       # noqa: E402
-    OP_CHAT, OP_SESSION_MEMBER_UPDATE, ROOM_SEAT_COUNT,
+    OP_BROADCAST_DEATH, OP_CHANGE_CONTROLLER_SLOT, OP_CHAT,
+    OP_COUNT_GAME_READY, OP_END_GAME, OP_END_QUEST, OP_LEAVE_SESSION,
+    OP_LOADING_DONE, OP_MAP_CHANGE_READY, OP_MAP_LOADING_DONE,
+    OP_REP_CHANGE_TO_NEXT_MAP, OP_REP_GAME_RESULT, OP_REPORT_HP_ZERO,
+    OP_REQ_CHANGE_TO_NEXT_MAP, OP_RESPAWN_CHARACTER,
+    OP_SESSION_MEMBER_UPDATE, ROOM_SEAT_COUNT,
     SEAT_ACTION_CHANGE_CHARACTER, SEAT_ACTION_JOIN, SEAT_ACTION_LEAVE,
-    SEAT_ACTION_RESYNC, SESSION_STATUS_PLAYING,
-    Reader, parse_session_slot,
+    SEAT_ACTION_RESYNC, SESSION_STATUS_PLAYING, StartGameHandshake,
+    Reader, parse_session_slot, w_wstr,
 )
 from lobby import TEAM_A, TEAM_B                               # noqa: E402
 from test_room import LobbyIsolated, frames, make_conn         # noqa: E402
+# ★ M2 的战斗夹具直接借 `test_battle.BattleRoom`（真的走一遍开局链，
+#   而不是手工把 `room.battle.state` 拨到 IN_GAME）。同一个理由：测的必须
+#   是真接线，不然「bot 报没报到」这件事根本测不到。
+from test_battle import (                                      # noqa: E402
+    BattleRoom, bodies, hp_zero_payload, opcodes,
+)
+from test_relayserver import udp_packet                        # noqa: E402
 
 #: 组队战 / 个人战 / 闯关三种房间的建房参数（`lobby.team_layout_of` 的三条路）。
 TEAMS_ROOM = dict(session_type=1, arguments=(1, 3, 0))
@@ -497,6 +510,308 @@ class CharacterPanelTests(unittest.TestCase):
         seen = {bot.default_character_for(seat)
                 for seat in range(ROOM_SEAT_COUNT)}
         self.assertEqual({0, 1, 2}, seen)
+
+
+# ----------------------------------------------------------------------------
+# M2 · 开局链路
+# ----------------------------------------------------------------------------
+def player_handle(seat):
+    """玩家角色的对象句柄。`0x405f02` 写死的公式，六台机器上一模一样（§11）。"""
+    return seat * 100000 + 100001
+
+
+class BotStartChainTests(BattleRoom):
+    """开局链：bot 随 `0x0400` 一起报到（D4）。
+
+    ★ 这个夹具**故意不开局** —— 每个用例自己一步步走，好看清每一步的状态。
+    """
+
+    def start_battle(self):
+        bot.handle_command(self.alice, "/bot")
+        self.bot_seat = self.room.bot_seats()[0]
+        self.bot_conn = self.room.seats[self.bot_seat].conn
+
+    def ready(self, conn):
+        gameserver.Conn.on_game_packet(conn, OP_COUNT_GAME_READY, b"")
+
+    def loaded(self, conn):
+        gameserver.Conn.on_game_packet(conn, OP_LOADING_DONE, b"")
+
+    def test_the_bot_is_marked_loaded_the_moment_0x0400_goes_out(self):
+        # ★ 判据是「那一发广播出去了」这个事件本身，不是定时器（D4 / 铁律 10）。
+        self.ready(self.alice)                       # 0x0401 倒计时
+        self.assertNotIn(self.bot_conn, self.room.battle.loaded)
+        self.ready(self.alice)                       # 0x0400 准备开局
+        self.assertEqual(StartGameHandshake.PREPARING, self.room.battle.state)
+        self.assertIn(self.bot_conn, self.room.battle.loaded)
+        # 真人一个都还没报到 —— bot 那一发不该顺手把别人也放行了。
+        self.assertEqual([self.alice, self.bob],
+                         self.room.battle.waiting_for(self.room.members()))
+
+    def test_the_bot_does_not_hold_up_the_start(self):
+        """★ 这是 M2 的头号症状：不改的话全房间卡在加载界面。
+
+        服务端会一直等一发 bot 永远不会发的 `0x0403`。
+        """
+        self.ready(self.alice); self.ready(self.alice)
+        self.clear()
+        self.loaded(self.alice)
+        self.assertEqual([], opcodes(self.bob))      # 还差 bob
+        self.loaded(self.bob)                        # 只差这两个真人
+        self.assertIn(OP_COUNT_GAME_READY, opcodes(self.alice))
+        self.assertIn(OP_COUNT_GAME_READY, opcodes(self.bob))
+        self.assertEqual(StartGameHandshake.IN_GAME, self.room.battle.state)
+
+    def test_the_bot_is_marked_loaded_again_on_the_second_round(self):
+        """★ `room.battle.reset()` 清 `loaded`，第二局必须重新报一次。"""
+        self.ready(self.alice); self.ready(self.alice)
+        self.loaded(self.alice); self.loaded(self.bob)
+        for conn in (self.alice, self.bob):
+            gameserver.Conn.leave_game_result(conn)
+        self.assertNotIn(self.bot_conn, self.room.battle.loaded)
+        self.clear()
+        self.ready(self.alice); self.ready(self.alice)
+        self.assertIn(self.bot_conn, self.room.battle.loaded)
+        self.loaded(self.alice); self.loaded(self.bob)
+        self.assertEqual(StartGameHandshake.IN_GAME, self.room.battle.state)
+
+    def test_the_bot_seats_controller_slots_all_go_to_humans(self):
+        """★ §5：bot 分到的控制格没有任何机器在模拟，那批怪从开局就是死的。"""
+        self.ready(self.alice); self.ready(self.alice)
+        self.clear()
+        self.loaded(self.alice); self.loaded(self.bob)
+        self.assertNotIn(self.bot_seat, self.room.quest.controllers)
+        self.assertEqual({0, 1}, set(self.room.quest.controllers))
+        # 交接是**发包**完成的，客户端那张表在它自己手里（§180）。
+        for conn in (self.alice, self.bob):
+            self.assertIn(OP_CHANGE_CONTROLLER_SLOT, opcodes(conn))
+
+    def test_a_lone_human_takes_every_controller_slot(self):
+        """1 个真人 + 一堆 bot：六格全归他，一格都不能留在 bot 手上。"""
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.members = [self.alice]
+        for _ in range(4):                          # 夹具已经放了一个
+            bot.handle_command(self.alice, "/bot")
+        self.assertEqual([1, 2, 3, 4, 5], self.room.bot_seats())
+        self.ready(self.alice); self.ready(self.alice)
+        self.loaded(self.alice)
+        self.assertEqual([0] * 6, self.room.quest.controllers)
+
+
+class BotBattleRoom(BattleRoom):
+    """alice（房主，座位 0）+ bob（座位 1）+ 一个 bot（座位 2），已经进了关卡。"""
+
+    def start_battle(self):
+        bot.handle_command(self.alice, "/bot")
+        self.bot_seat = self.room.bot_seats()[0]
+        self.bot_conn = self.room.seats[self.bot_seat].conn
+        self.bot_handle = player_handle(self.bot_seat)
+        super().start_battle()
+        # `BattleRoom.setUp` 紧接着就 `clear()`，开局那一段的包留个底。
+        self.start_opcodes = {"alice": opcodes(self.alice),
+                              "bob": opcodes(self.bob)}
+
+
+class BotDeathTests(BotBattleRoom):
+    """§6 / D3：bot 没有本机，一发合法的 `0x0408` 都不会有 —— 不放宽就打不死。"""
+
+    def test_someone_else_can_report_a_bot_death(self):
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=self.bot_handle, seat=self.bot_seat,
+                            arg=1, deaths=0))
+        self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.alice))
+        self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.bob))
+        self.assertEqual(1, self.room.quest.deaths[self.bot_seat])
+
+    def test_a_real_players_death_reported_by_someone_else_is_still_ignored(self):
+        """★ 回归 bug调查/8：放宽**只限 bot 座位**，真人那条判据一个字不许动。
+
+        射手那台算「我炸死他了」、受害者那台算「我躲过去了」的分歧是必然的，
+        照单广播就是让客户端对**活着的自己**执行 `Die()`。
+        """
+        gameserver.Conn.on_game_packet(
+            self.alice, OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=player_handle(1), seat=1, arg=0, deaths=0))
+        self.assertEqual([], opcodes(self.alice))
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_two_machines_reporting_the_same_bot_death_broadcast_once(self):
+        """bot 和怪一样是被别人代报的，同一次死亡会被好几台同时报上来。"""
+        payload = hp_zero_payload(handle=self.bot_handle, seat=self.bot_seat,
+                                  arg=0, deaths=0)
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO, payload)
+        self.clear()
+        gameserver.Conn.on_game_packet(self.bob, OP_REPORT_HP_ZERO, payload)
+        self.assertEqual([], opcodes(self.alice))
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_a_kill_on_a_bot_still_scores(self):
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=self.bot_handle, seat=self.bot_seat,
+                            arg=1, deaths=0))
+        self.assertEqual(1, self.room.quest.kills[1])
+
+
+class BotRespawnTests(BotBattleRoom):
+    """bot 的重生：同一个闩、更短的期限（`BOT_RESPAWN_DELAY_S`）。"""
+
+    def kill_bot(self):
+        self.armed_at = time.monotonic()
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=self.bot_handle, seat=self.bot_seat,
+                            arg=1, deaths=0, x=300.0, y=400.0))
+        self.clear()
+
+    def test_the_bot_stands_up_after_the_client_respawn_countdown(self):
+        self.kill_bot()
+        # 5 秒还没到 —— 谁都不该动。
+        gameserver.Conn.check_respawn_watchdog(
+            self.alice, now=self.armed_at + gameserver.BOT_RESPAWN_DELAY_S - 0.5)
+        self.assertEqual([], opcodes(self.alice))
+        gameserver.Conn.check_respawn_watchdog(
+            self.alice, now=self.armed_at + gameserver.BOT_RESPAWN_DELAY_S + 0.5)
+        self.assertEqual([OP_RESPAWN_CHARACTER], opcodes(self.alice))
+        self.assertEqual([OP_RESPAWN_CHARACTER], opcodes(self.bob))
+
+    def test_a_real_player_still_waits_for_the_full_watchdog(self):
+        """★ 两条期限必须分开：真人那 8 秒是**兜底**，抢跑就会顶掉正常重生。"""
+        armed_at = time.monotonic()
+        gameserver.Conn.on_game_packet(
+            self.alice, OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=player_handle(0), seat=0, deaths=0))
+        self.clear()
+        gameserver.Conn.check_respawn_watchdog(
+            self.alice, now=armed_at + gameserver.BOT_RESPAWN_DELAY_S + 0.5)
+        self.assertEqual([], opcodes(self.alice))
+        gameserver.Conn.check_respawn_watchdog(
+            self.alice, now=armed_at + gameserver.RESPAWN_WATCHDOG_S + 0.5)
+        self.assertEqual([OP_RESPAWN_CHARACTER], opcodes(self.alice))
+
+    def test_the_bot_respawn_is_not_logged_as_a_watchdog_alarm(self):
+        """★ bot 每次死都走这条路 —— 按看门狗打★报警会把真正的告警淹掉。
+
+        「真人死了不复活」（bug调查/8）就是靠那行★日志抓的。
+        """
+        self.kill_bot()
+        self.alice.logged.clear()
+        gameserver.Conn.check_respawn_watchdog(
+            self.alice, now=self.armed_at + gameserver.BOT_RESPAWN_DELAY_S + 0.5)
+        text = "\n".join(self.alice.logged)
+        self.assertIn("0x0419", text)
+        self.assertNotIn("[重生看门狗]", text)
+
+    def test_the_bot_respawn_ignores_the_watchdog_kill_switch(self):
+        """`--respawn-watchdog 0` 是为了留取证窗口关掉**真人**的兜底 ——
+        关掉它不该顺手让 bot 从此躺在地上不起来。"""
+        self.alice.args.respawn_watchdog = 0
+        self.bob.args.respawn_watchdog = 0
+        self.kill_bot()
+        gameserver.Conn.check_respawn_watchdog(
+            self.alice, now=self.armed_at + gameserver.BOT_RESPAWN_DELAY_S + 0.5)
+        self.assertEqual([OP_RESPAWN_CHARACTER], opcodes(self.alice))
+
+
+class BotMapChangeTests(BotBattleRoom):
+    """换图（闯关）：bot 随 `0x0417` 一起算「新图加载完」（D4）。"""
+
+    def test_the_map_change_does_not_wait_for_the_bot(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_REQ_CHANGE_TO_NEXT_MAP,
+                                       w_wstr("Quest03_2"))
+        self.assertEqual([OP_REP_CHANGE_TO_NEXT_MAP], opcodes(self.alice))
+        self.assertIn(self.bot_conn, self.room.quest.map_loaded)
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_MAP_LOADING_DONE, b"")
+        self.assertEqual([], opcodes(self.bob))      # 还差 bob
+        gameserver.Conn.on_game_packet(self.bob, OP_MAP_LOADING_DONE, b"")
+        self.assertEqual([OP_MAP_CHANGE_READY], opcodes(self.alice))
+        self.assertEqual([OP_MAP_CHANGE_READY], opcodes(self.bob))
+
+    def test_the_bot_is_marked_again_for_the_next_map(self):
+        # `begin_map_change` 每次都清 `map_loaded` —— 第二次换图要重新报。
+        for name in ("Quest03_2", "Quest03_3"):
+            gameserver.Conn.on_game_packet(self.alice,
+                                           OP_REQ_CHANGE_TO_NEXT_MAP,
+                                           w_wstr(name))
+            self.assertIn(self.bot_conn, self.room.quest.map_loaded)
+            gameserver.Conn.on_game_packet(self.alice, OP_MAP_LOADING_DONE, b"")
+            gameserver.Conn.on_game_packet(self.bob, OP_MAP_LOADING_DONE, b"")
+            self.assertIsNone(self.room.quest.pending_map)
+
+
+class BotSettlementTests(BotBattleRoom):
+    """结算：bot 的座位 `account is None`，整条路必须走得下去。"""
+
+    def test_the_bot_gets_its_own_row_in_everyones_settlement(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        for conn in (self.alice, self.bob):
+            # 三个在座座位各一份 —— 少发一份，结算界面上那一行就是全 0。
+            self.assertEqual(3, len(bodies(conn, OP_REP_GAME_RESULT)))
+            self.assertEqual(3, len(bodies(conn, OP_END_GAME)))
+
+    def test_settlement_survives_a_seat_without_an_account(self):
+        # ★ 通关那一路会额外调 `record_quest_clear()` —— bot 的 `accounts`
+        #   是 None，这一条走不通的话整场结算当场炸在房主的线程上。
+        gameserver.Conn.on_game_packet(self.alice,
+                                       gameserver.OP_MARK_QUEST_SUCCESS,
+                                       gameserver.w_i32(1))
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        self.assertTrue(self.room.quest.settled)
+        self.assertTrue(self.bot_conn.settled)
+        self.assertIsNone(self.bot_conn.account)
+
+    def test_the_settlement_only_happens_once(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+        self.clear()
+        gameserver.Conn.on_game_packet(self.bob, OP_END_QUEST, b"")
+        self.assertEqual([], opcodes(self.alice))
+
+
+class BotPeerRelayTests(BotBattleRoom):
+    """★ 同步转发这条路上多了一个 bot 收件人，绝不能把真人的同步带崩。
+
+    `RelayServer.deliver()` 会对房里**每一个成员**动手（回退投递 / UDP 旁路
+    的准入判断都要读收件人的字段），bot 是靠 `BotConn.__init__` 那份
+    `Conn.__init__` 镜像撑住的 —— 漏一个字段这里就 `AttributeError`，
+    而炸的是**真人**那条线程（D1 说的正是这件事）。
+    """
+
+    def test_a_bot_in_the_room_does_not_break_peer_sync(self):
+        # 局号必须是**这一代**的那个数，否则 `deliver()` 会按「跨代」整包丢掉
+        # （§218 / D137），测出来的就不是 bot 的事了。
+        gameserver.Conn.on_game_packet(self.alice, gameserver.OP_PEER_DATA_UP,
+                                       udp_packet(game_id=self.room.epoch_value))
+        # 真人那一份照常转发过去；bot 的 `send()` 是空操作，收不到也不该炸。
+        self.assertIn(gameserver.OP_PEER_DATA_DOWN, opcodes(self.bob))
+
+    def test_the_peer_relay_switch_counts_the_bot_as_a_moving_seat(self):
+        """★ §13：1 真人 + N bot 时通道 A **不能**被当成「单人房」关掉。
+
+        `Room.members()` 的判据是 `seat.conn is not None`，D1 选了假连接，
+        所以 bot 天然被数成一个会动的座位 —— §7 那个坑因此不存在。
+        """
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.assertTrue(self.alice.peer_relay_on)
+
+
+class BotMidGameLeaveTests(BotBattleRoom):
+    """游戏中有人掉线 —— 房主迁移、控制权、房间解散三条都要跟着走。"""
+
+    def test_the_host_leaving_hands_the_room_to_a_human(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_LEAVE_SESSION, b"")
+        self.assertEqual(1, self.room.host_seat)
+        self.assertIs(self.bob, self.room.host_conn)
+        # 走的人扛的控制格必须落到**真人**头上，不能落到 bot 手里。
+        self.assertNotIn(self.bot_seat, self.room.quest.controllers)
+        self.assertNotIn(0, self.room.quest.controllers)
+
+    def test_the_last_human_leaving_disbands_the_room_and_its_bots(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_LEAVE_SESSION, b"")
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.assertEqual([], self.lobby.rooms())
+        self.assertIsNone(self.lobby.room_of(self.bot_conn))
 
 
 class ParseCommandTests(unittest.TestCase):

@@ -3064,6 +3064,16 @@ MONSTER_DEATH_DEDUP_WINDOW_S = 3.0
 #: 干瞪眼太久。8 秒 = 5 秒倒计时 + 一个 RTT + 掉帧余量。
 RESPAWN_WATCHDOG_S = 8.0
 
+#: ★ bot 死后多久自己站起来（秒）。走的是**同一个闩**（`arm_respawn_watchdog`），
+#: 只是期限不同 —— 对 bot 来说这不是兜底，是它唯一的重生路径。
+#:
+#: ★★ 这是 CLAUDE.md 铁律 10（「判据必须事件驱动」）的**明文例外**：
+#: 重生倒计时是客户端**自己数**的（`Character::Die` 在 `0x5019a8` 写
+#: `[char+0x2d8] = now + 5000`，数完才发 `0x0413`），bot 没有客户端，
+#: 服务端这边**根本没有事件可等**。所以只能照抄客户端那个常量 ——
+#: 取 5.0 而不是 8.0，bot 才和真人同一个节奏站起来。
+BOT_RESPAWN_DELAY_S = 5.0
+
 
 def pvp_score_limit(player_count, team_mode):
     """这一局要拿几分（几个人头）才算赢。抄自 `0x55be71`（§167）。
@@ -3385,8 +3395,14 @@ class RoomQuest:
         return handle, item_id, x, y
 
     # -- 死亡 / 重生 --------------------------------------------------------
-    def record_death(self, handle, seat, reported, now=None):
+    def record_death(self, handle, seat, reported, now=None, *,
+                     many_reporters=False):
         """记一次死亡。返回 `(要下发的死亡次数, 这一发要不要广播)`。
+
+        `many_reporters=True` = 「这个句柄会被**好几台机器**同时报上来」，
+        于是第 3 层时间窗也对它生效。怪天然如此；玩家座位里只有 **bot**
+        是这样（它没有本机，全靠别人代报，D3）。真人一次死亡只有一发，
+        给他加窗只会平白吃掉真死亡。
 
         ## 判重三层（bug调查/8 重写）
 
@@ -3394,11 +3410,14 @@ class RoomQuest:
            和「换图瞬间还在飞的旧上报」。
         2. **权威计数**：`报的值 + 1 <= 这个句柄已经广播过的次数` 一律不广播。
            重复上报、以及那台机器计数落后（句柄撞号 / 跨对象残留）都长这样。
-        3. **时间窗**（`MONSTER_DEATH_DEDUP_WINDOW_S`，★ **只对怪**）：
+        3. **时间窗**（`MONSTER_DEATH_DEDUP_WINDOW_S`，★ **只对怪和 bot**）：
            怪由每台机器各自模拟，同一次死亡会被几台几乎同时报上来，而且
-           两发报的次数**可以不一样**，前两层都拦不住。玩家不走这一层 ——
-           玩家的死亡只认本人上报（`Conn.on_report_hp_zero`），一次死亡天然
+           两发报的次数**可以不一样**，前两层都拦不住。真人不走这一层 ——
+           他的死亡只认本人上报（`Conn.on_report_hp_zero`），一次死亡天然
            只有一发，加窗只会平白吃掉真死亡。
+           **bot 走这一层**（`many_reporters=True`）：它和怪一样是被别人
+           代报的。吃掉真死亡的风险为零 —— 重生至少要 5 秒
+           （`BOT_RESPAWN_DELAY_S`），远长于这扇 3 秒的窗。
 
         ★ **下发的死亡次数以服务端权威计数为准。** V0.1 §109 的契约不变：
         `[char+0x600]` 只由我们广播的 `0x0406` 写，所以正常路径下权威计数
@@ -3424,7 +3443,7 @@ class RoomQuest:
             return count, False
         if reported + 1 <= count:
             return count, False
-        if not is_player:
+        if not is_player or many_reporters:
             last = self.last_death_broadcast_at.get(handle)
             if last is not None and now - last < MONSTER_DEATH_DEDUP_WINDOW_S:
                 return count, False
@@ -5532,6 +5551,22 @@ class Conn:
             return None
         return room.seat_index_of(self)
 
+    def is_bot_seat(self, seat):
+        """`seat` 这一格坐的是不是 bot。不在房间 / 座位空着都是 ``False``。
+
+        问的是**大厅那份权威座位表**，和 `battle_seat_index()` 同一个理由：
+        座位归属只有它说了算。
+        """
+        room = self.lobby_room()
+        try:
+            index = int(seat)
+        except (TypeError, ValueError):
+            return False
+        if room is None or not 0 <= index < ROOM_SEAT_COUNT:
+            return False
+        occupant = room.seats[index]
+        return occupant is not None and occupant.is_bot
+
     def on_report_hp_zero(self, payload):
         """0x0408「我 HP 归零了」-> 回 0x0406 死亡广播，角色这才真的倒下。
 
@@ -5585,14 +5620,24 @@ class Conn:
             self.log(f"   0x0408 解析失败: {error}；不回死亡广播")
             return
         seat = info["seat"]
-        who = f"玩家座位 {seat}" if 0 <= seat < 6 else f"NPC/怪物 (座位={seat})"
+        # ★ bot 座位不受「只认本人上报」那条限制（D3）：它没有本机，一发合法
+        #   的 `0x0408` 都不会有 —— 不放宽就**永远打不死**（§6）。
+        #   放宽只限 bot：真人那条判据一个字都不许动。
+        bot_seat = self.is_bot_seat(seat)
+        who = (f"bot 座位 {seat}" if bot_seat
+               else f"玩家座位 {seat}" if 0 <= seat < 6
+               else f"NPC/怪物 (座位={seat})")
         reporter = self.battle_seat_index()
-        if 0 <= seat < ROOM_SEAT_COUNT and reporter is not None and reporter != seat:
+        if (0 <= seat < ROOM_SEAT_COUNT and reporter is not None
+                and reporter != seat and not bot_seat):
             self.log(f"   ✗ 幽灵死亡上报：{who} 是座位 {reporter} 替报的 —— "
                      f"本人那台机器上他没死，不广播（bug调查/8）")
             return
         quest = self.quest_state()
-        deaths, first = quest.record_death(info["handle"], seat, info["deaths"])
+        # ★ bot 和怪一样，同一次死亡会被好几台机器几乎同时报上来 ——
+        #   去重要多走一层时间窗（D3）。
+        deaths, first = quest.record_death(info["handle"], seat, info["deaths"],
+                                           many_reporters=bot_seat)
         self.log(f"   HP 归零上报: {who} 句柄=0x{info['handle']:08x} "
                  f"凶手={info['arg']} 死亡次数={info['deaths']} "
                  f"位置=({info['x']:.0f}, {info['y']:.0f})")
@@ -5615,8 +5660,10 @@ class Conn:
                               reason="：死亡广播")
         # ★ 上闩等他自己的 0x0413；到点没等到就由 `check_respawn_watchdog()`
         #   补一发 0x0419（bug调查/8「死了不复活」）。
+        #   bot 走的是同一个闩、更短的期限 —— 它那发 `0x0413` 永远不会来，
+        #   所以对它来说这不是兜底而是**唯一**的重生路径（见 `respawn_delay_for`）。
         quest.arm_respawn_watchdog(seat, (info["x"], info["y"]),
-                                   after=self.respawn_watchdog_seconds())
+                                   after=self.respawn_delay_for(seat))
         # 对战里「杀敌数」就是分数：凶手那一格是开火者的座位号（§167）。
         # ★ 自杀 / 杀队友要**扣**一分 —— 客户端 `Character::Die` 就是这么算的，
         #   服务端不扣就会「HUD 写着 5、服务端已经数到 6」（§224）。
@@ -5677,6 +5724,23 @@ class Conn:
         value = getattr(self.args, "respawn_watchdog", None)
         return RESPAWN_WATCHDOG_S if value is None else float(value)
 
+    def respawn_delay_for(self, seat):
+        """这个座位死了之后多久该站起来（秒）。
+
+        - **真人**：`respawn_watchdog_seconds()`。那是**兜底** —— 正常路径上
+          本人 5 秒后自己发 `0x0413`，闩在第 5 秒就被 `on_respawn_request`
+          撤掉了，这个期限根本走不到。
+        - **bot**：`BOT_RESPAWN_DELAY_S`（5 秒，抄客户端 `0x5019a8`）。
+          它没有客户端，那发 `0x0413` 永远不会来，所以这条是它**唯一**的
+          重生路径，期限也就必须是真人的重生节奏而不是兜底期限。
+
+        ★ bot 那一路**故意不吃** `--respawn-watchdog 0`：那个开关是为了留
+        取证窗口、关掉「真人死了不复活」的兜底用的（bug调查/8），
+        关掉它不该顺手让 bot 从此躺在地上不起来。
+        """
+        return (BOT_RESPAWN_DELAY_S if self.is_bot_seat(seat)
+                else self.respawn_watchdog_seconds())
+
     def check_respawn_watchdog(self, now=None):
         """★ 死了 8 秒还没发 `0x0413` 的人，由服务端补一发 `0x0419` 拉起来。
 
@@ -5707,8 +5771,12 @@ class Conn:
         - 坐标优先用本人上次自报的重生点，其次是这张图上任何人用过的，
           最后才退回死亡地点（见 `RoomQuest.respawn_point_for`）。
 
-        正常路径下这个函数永远什么都不做：客户端 5 秒就发 `0x0413` 了，
-        闩早在第 5 秒就被 `on_respawn_request` 撤掉。
+        正常路径下这个函数对**真人**永远什么都不做：客户端 5 秒就发 `0x0413`
+        了，闩早在第 5 秒就被 `on_respawn_request` 撤掉。
+
+        ★ **bot 相反 —— 它每次死都要靠这里站起来**（V0.3 M2）：bot 没有客户端，
+        那发 `0x0413` 永远不会来。它的闩期限是 `BOT_RESPAWN_DELAY_S`（5 秒，
+        抄客户端自己的重生倒计时），走的是下面同一条路，只是日志不打★报警。
         """
         room = self.lobby_room()
         if not room_in_battle(room):
@@ -5731,10 +5799,21 @@ class Conn:
                 self.vlog(f"   [重生看门狗] 座位 {seat} 三条命用完了，不补重生")
                 continue
             x, y, spawn_index = quest.respawn_point_for(seat, position)
-            self.log(f"★ [重生看门狗] 座位 {seat} 死了 {RESPAWN_WATCHDOG_S:.0f} 秒"
-                     f"还没发 0x0413 —— 服务端补一发 gspRespawnCharacter(0x0419) "
-                     f"坐标=({x}, {y}) 重生点索引={spawn_index}"
-                     f"（bug调查/8「死了不复活」）")
+            if self.is_bot_seat(seat):
+                # ★ bot 走的是同一个闩，但它**不是异常**：这是 bot 唯一的重生
+                #   路径（`respawn_delay_for`）。按看门狗那样打★报警的话，
+                #   真正要靠这行日志抓的「真人死了不复活」就被淹了。
+                self.log(f"   bot 座位 {seat} 重生倒计时到"
+                         f"（{BOT_RESPAWN_DELAY_S:.0f} 秒，抄客户端 0x5019a8）"
+                         f" -> 发 gspRespawnCharacter(0x0419) "
+                         f"坐标=({x}, {y}) 重生点索引={spawn_index}")
+            else:
+                self.log(f"★ [重生看门狗] 座位 {seat} 死了 "
+                         f"{self.respawn_watchdog_seconds():.0f} 秒"
+                         f"还没发 0x0413 —— 服务端补一发 "
+                         f"gspRespawnCharacter(0x0419) "
+                         f"坐标=({x}, {y}) 重生点索引={spawn_index}"
+                         f"（bug调查/8「死了不复活」）")
             self.battle_broadcast(
                 build_game(OP_RESPAWN_CHARACTER,
                            build_respawn_character(seat, x, y, spawn_index)),
@@ -5782,6 +5861,20 @@ class Conn:
             build_game(OP_REP_CHANGE_TO_NEXT_MAP,
                        build_rep_change_to_next_map(map_name)),
             reason="：换图")
+        # ★ 和开局那一发 `0x0400` 同一个道理（D4）：bot 没有加载过程，`0x0417`
+        #   **广播出去的那一刻**就算它把新图加载完了。不报的话真人会卡在换图
+        #   的加载画面里，等一发 bot 永远不会发的 `0x0412`。
+        #   这里一定放行不了整局（所以不用管 `map_done` 的返回值）：
+        #   `begin_map_change` 刚把 `map_loaded` 清空，而房里至少有一个真人，
+        #   他的 `0x0412` 还在路上。
+        room = self.lobby_room()
+        bots = room.bot_members() if room is not None else []
+        if bots:
+            members = self.battle_members()
+            for machine in bots:
+                quest.map_done(machine, members)
+            self.log(f"   换图: {len(bots)} 个 bot 不用加载，"
+                     f"随 0x0417 一起标记为新图已加载完（D4）")
 
     def on_map_loading_done(self):
         """0x0412「新地图加载完了」-> 回 0x0418，客户端才从加载画面里出来。
@@ -6555,6 +6648,27 @@ class Conn:
                      f"（0x0400 已发、全员加载中 —— 这时进房只会把开局"
                      f"握手作废成死锁，提前挡人）")
 
+        # ★ bot 没有加载过程 —— `0x0400` **广播出去的那一刻**就算它加载完了
+        #   （D4）。触发点是「这一发已经发出去了」这个事件本身，不是定时器：
+        #   服务端自己就是广播 `0x0400` 的那一方，事件就在手上（铁律 10）。
+        #   不报的话，房里的真人会永远卡在加载界面，等一发 bot 永远不会发的
+        #   `0x0403`。
+        if room.battle.state == StartGameHandshake.PREPARING:
+            bots = room.bot_members()
+            bot_replies = []
+            for machine in bots:
+                bot_replies.extend(room.battle.on_loaded(machine, members))
+            if bots:
+                self.log(f"   开局握手: {len(bots)} 个 bot 不用加载关卡，"
+                         f"随 0x0400 一起标记为已加载完（D4）")
+            if bot_replies:
+                # 正常路径到不了这里 —— 房主是真人，他那发 `0x0403` 还没来，
+                # 而房里没有真人的话房间早就散了（`_leave_unlocked`）。留着是
+                # 因为「全房间都不用加载」一旦成立，不放行就是死锁。递归最多
+                # 一层：再进来时 state 已是 `IN_GAME`，这个分支不会再走。
+                self.broadcast_start_game(
+                    room, bot_replies, "全房间都不用加载，直接进 stage 7")
+
         # 真进了关卡（所有人都加载完、一起进 stage 7）之后的收尾。
         if (room.battle.state == StartGameHandshake.IN_GAME
                 and room.quest is None):
@@ -6582,6 +6696,15 @@ class Conn:
                 self.handover_controller_slots(
                     room, seat, why="（关卡加载途中走的）", force=True)
             room.battle.left_while_loading.clear()
+            # ★ bot 座位分到的控制格**没有任何机器在模拟**（§5）：客户端
+            #   `GameContext::StartGame` 是按「在座座位」轮流分的，它不知道
+            #   哪一格坐的是 bot。不交接的话，闯关模式里那一批怪和刷怪点
+            #   从开局就是死的。**必须排在那一发 `0x0402` 之后**（上面的循环
+            #   已经发完了）：客户端要先进 stage 7 把 GameContext 建起来，
+            #   才有表可改。
+            for seat in room.bot_seats():
+                self.handover_controller_slots(
+                    room, seat, why="（bot 座位没有机器在模拟，§5）")
 
     def on_start_game_packet(self, opcode, payload):
         """`0x0400` / `0x0402` / `0x0403` —— 开局链（多人，J.3）。
@@ -6730,7 +6853,11 @@ class Conn:
         members = room.members(exclude=None)
         if not members:
             return None
-        survivors = [i for i, seat in enumerate(room.seats) if seat is not None]
+        # ★ 接管者只能是**真人**（V0.3 §5）。控制格的意思是「这一批怪 / 刷怪点
+        #   由谁那台机器模拟」，而 bot 根本没有机器 —— 交给它等于没交，那批怪
+        #   照样不动，症状还和「压根没交接」一模一样，极难查。
+        #   没有 bot 的房间里 `human_seats()` 就是全部在座座位，行为不变。
+        survivors = room.human_seats()
         heir = quest.handover_controller(leaver_seat, survivors, force=force)
         if heir is None:
             self.log(f"   控制权: 座位 {leaver_seat} 没扛着任何一格，"

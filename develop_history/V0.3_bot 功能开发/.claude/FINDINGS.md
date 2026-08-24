@@ -501,3 +501,47 @@ alpha 不透明的那些像素的并集。**
 一条命令一行的排法不能要，改成**多条命令挤一行**、命令之间 `;` + 两个空格。
 （聊天历史本身能存 80 条，`0x40605d` 里 `cmp eax, 0x50` 满了才丢最老的 ——
 **存得下不等于看得见**，看得见的只有 4 行。）
+
+---
+
+## §21 ★ M2 里**不用改**的三处（已经查实，别再去动）
+
+做 M2 时逐条读到底、确认现成代码已经能处理 bot 的，省得下一个会话再查一遍：
+
+1. **结算整条路一行都不用改。** PLAN 写着「`settlement_seats()` /
+   `send_end_game()` / `build_rep_game_result()` 要能处理 `account is None`
+   的座位」—— 它们**本来就能**。`send_end_game()` 里三道守卫早就在：
+   入账那步是 `if conn.account_name:`（bot 的是 `None`）、
+   读总经验是 `(conn.account or {}).get(...)`、
+   `record_quest_clear()` 第一行就是 `if quest is None or not self.account_name: return`。
+   ⇒ bot 照常拿到自己那一行 `0x0309` / `0x0411`（**必须发**，少一份的话结算
+   界面上那一行是全 0，§178），奖励算完丢弃。
+
+2. **「游戏中掉线」三种情形现成的路都通。** 最后一个真人走 ->
+   `_leave_unlocked()` 按 `human_count() == 0` 摘光 bot、房间随之解散；
+   房主走 -> 迁移循环跳过 bot（D2）；等加载 / 等换图的人走 ->
+   `on_loaded(None, members)` / `map_done(None, members)` 重算时 bot 已经在
+   集合里了。M2 只补了单测，没改代码。
+
+3. **同步转发（`RelayServer.deliver`）不用为 bot 开分支。** 它对房里每个成员
+   都要读一批字段（`peer_epoch` / `peer_order` / `peer_game_id` …），
+   `BotConn.__init__` 那份 `Conn.__init__` 镜像全都补齐了；
+   投递到 bot 那一步落在 `BotConn.send()` 的空操作上。
+   ⇒ 这也是 D1（假连接）**第三次**兑现同一个收益（前两次见 §13）。
+
+---
+
+## §22 控制格的接管者**只能是真人**（§5 的补充）
+
+`Conn.handover_controller_slots()` 原来从「所有在座座位」里挑接管者。
+房里有 bot 之后这条就错了：**控制格的意思是「这批怪由谁那台机器模拟」，
+而 bot 没有机器** —— 交给它等于没交，那批怪照样不动，而且症状和「压根没
+交接」一模一样（怪杵着不动），从日志上完全看不出区别。
+
+⇒ 接管者池改成 `room.human_seats()`。**没有 bot 的房间行为零变化**
+（那时它就是全部在座座位），所以 V0.2 那批交接用例一条都没红。
+
+★ 相对的，`RoomQuest.assign_controllers()` 的**初值仍按全部在座座位算** ——
+它是客户端 `GameContext::StartGame` 那个公式的镜像，客户端不知道哪一格是
+bot，镜像跟着它错才是对的。bot 那几格是**开局后立刻交接掉**的，不是一开始
+就不分给它。两件事别搞混。
