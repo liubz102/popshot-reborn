@@ -19,9 +19,9 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 MODULES = ("test_account_store", "test_gameserver", "test_online",
-           "test_lobby", "test_room", "test_battle", "test_relayserver",
-           "test_proxy", "test_latency", "test_logs", "test_udpsync",
-           "test_ports", "test_versioning")
+           "test_lobby", "test_room", "test_battle", "test_bot",
+           "test_relayserver", "test_proxy", "test_latency", "test_logs",
+           "test_udpsync", "test_ports", "test_versioning")
 
 
 def main():

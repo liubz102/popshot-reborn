@@ -33,6 +33,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import account_store
 import authserver
+# ★ `bot` 在 `gameserver.on_chat()` 里是**惰性 import**（两个模块互相要对方，
+#   见 bot.py 开头「导入方向」）。那意味着 bot.py 缺失 / 语法坏掉时，服务端
+#   照样启动得起来，直到有人在房间里说第一句话才炸 —— 那时候炸的是玩家的
+#   连接。在这里显式 import 一次，把它变成**启动就炸**。
+import bot                                                     # noqa: F401
 import config as server_config
 import eventlog
 import gameserver

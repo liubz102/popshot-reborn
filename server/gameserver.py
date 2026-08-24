@@ -7005,11 +7005,53 @@ class Conn:
         self.peer_out_gap_ms.reset()
 
     def broadcast_system_chat(self, text):
-        """房间里的一行系统提示（没有「谁 : 」前缀，§141）。"""
+        """房间里的一行系统提示（没有「谁 : 」前缀，§141）。**不含自己。**"""
         if not text:
             return
         self.broadcast(build_game(OP_CHAT, build_receive_chat(text)),
                        reason="：系统提示")
+
+    def send_system_chat(self, text):
+        """**只发给自己**的一行系统提示。
+
+        命令回执用它：报错、用法、`/help` 那张表都只跟敲命令的人有关，
+        广播给全房间只是噪音（V0.3 M1）。
+        """
+        if not text:
+            return
+        try:
+            self.send(build_game(OP_CHAT, build_receive_chat(text)))
+        except OSError as error:
+            self.log(f"   系统提示发送失败（{error!r}），忽略")
+
+    def room_system_chat(self, text):
+        """房间里的一行系统提示，**含自己**。
+
+        「谁进来了 / 谁走了」这一类通告要让敲命令的房主自己也看见 ——
+        `broadcast_system_chat()` 排除自己（和大厅那套广播口径一致），
+        所以这里补一份给自己（同 `battle_broadcast` 和 `broadcast` 的关系）。
+        """
+        if not text:
+            return
+        self.send_system_chat(text)
+        self.broadcast_system_chat(text)
+
+    def broadcast_seat_leave(self, seat_index, reason=""):
+        """把「这个座位空了」发给房里每一个人（含自己），`0x0301` **action 1**。
+
+        和 `broadcast_seat_slot()` 是一对：那个发的是座位**现在的快照**
+        （座位还在），这个发的是「座位没了」——`build_session_member_update`
+        对 `occupied=False` 不带任何座位字段。
+
+        ★ action 必须是 1（或 2），不能是 3：只有 1/2 会走
+        `0x406676 → 0x405f8f` 把座位的 3D 模型**销毁**掉，发 3 的话玩家列表
+        里的名字没了、天上那块的模型却还杵着（§147）。
+        """
+        packet = build_game(OP_SESSION_MEMBER_UPDATE,
+                            build_session_member_update(
+                                seat_index, SEAT_ACTION_LEAVE, occupied=False))
+        self.send(packet)
+        self.broadcast(packet, reason=reason)
 
     def on_chat(self, payload):
         """`0x0305 gcpSendChatMsg` -> `gspReceiveChatMsg` 广播（§141）。
@@ -7025,6 +7067,16 @@ class Conn:
             return
         text = text.strip()
         if not text:
+            return
+        # ★ bot 命令层（V0.3 M1）。返回 True = 这行是命令、已经处理完了，
+        #   不再当聊天广播出去。
+        #
+        #   ★★ **惰性 import 是必须的**：`bot.py` 模块级 `import gameserver`
+        #   （`BotConn` 要拿 `Conn` 当基类），两边都写成模块级就是循环导入 ——
+        #   `class BotConn(gameserver.Conn)` 会在本模块才执行到 import 那一行、
+        #   `Conn` 还没定义的时候炸掉。第二次起就是一次 `sys.modules` 查表。
+        import bot as bot_module
+        if bot_module.handle_command(self, text):
             return
         sender = display_name(self.account) or (self.account_name or "")
         room = self.lobby_room()
@@ -7153,8 +7205,12 @@ class Conn:
         # ★ 走的人可能是对战里的最后一个对手 —— 「只剩一边了」这一条要立刻
         #   重新判一次，否则剩下的人会一直站在空地图上等（§167）。
         #   自己已经不在房里了，所以要让**留下的人**去判。
-        if members:
-            members[0].check_pvp_finished()
+        # ★★ 必须挑一个**真人**：`members[0]` 可能是 bot（房主走后座位 0 也能
+        #    坐 bot），而 `check_pvp_finished()` 会一路走到 `send_end_game()`
+        #    去替全场结算 —— 那件事不该由一个没有账号、没有屏幕的座位发起。
+        humans = room.human_members()
+        if humans:
+            humans[0].check_pvp_finished()
 
     def leave_room(self, system_text=""):
         """把自己从大厅房间里摘掉并广播。退房 / 断线 / 被顶号共用。"""
@@ -7165,7 +7221,9 @@ class Conn:
         self.online(f"房间 - 离开 账号={self.account_name!r} "
                     f"房间 #{result.room.room_id} 座位={result.seat_index} "
                     + ("房间已解散" if result.closed
-                       else f"房里还剩 {len(result.remaining)} 人"))
+                       else f"房里还剩 {len(result.remaining)} 人")
+                    + (f"，{len(result.dropped_bots)} 个 bot 跟着散了"
+                       if result.dropped_bots else ""))
         self.after_someone_left(result, system_text or f"{who} 离开了房间。")
         return result
 

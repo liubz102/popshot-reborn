@@ -189,7 +189,11 @@ D:\git\popshot-reborn\main\Pack_decrypt\Data\        ← ChrProps.ini / map.ini 
   和 `...\18\BuildTools`（MSVC 14.50）
 - Node `C:\SSD\Program\nodejs\node.exe`，Git `C:\SSD\Program\Git\cmd\git.exe`
 - Ghidra + JDK 在 `tools/ghidra` / `tools/jdk`
-- **没有** VS IDE、cmake、gcc/clang；pefile / capstone 未安装
+- **没有** VS IDE、cmake、gcc/clang；pefile 未安装
+- ★ **capstone 5.0.7 已装**（`C:\Python314\python.exe`）。想看某个地址的几条指令时，
+  不用开 Ghidra —— `re/BigShot_22524.img` 是拉平的内存镜像，
+  **文件偏移 = VA − 0x400000**，直接 `Cs(CS_ARCH_X86, CS_MODE_32).disasm(...)` 就行
+  （§19 就是这么当场逆出来的）。Pillow 12.1.1 也已装（M4 要用）
 
 ## 端口速查
 

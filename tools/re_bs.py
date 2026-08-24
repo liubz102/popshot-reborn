@@ -24,7 +24,19 @@ if os.path.isdir(_LOCAL_DEPS):
 import capstone
 
 BASE = 0x400000
-IMGP = r"D:\work\popshot\re\BigShot_22524.img"
+
+#: 脱壳镜像。★ 按**仓库相对路径**找，不要写死绝对路径。
+#:
+#: 这里原来写死的是 `D:\work\popshot\re\...`（本工程更早的一个位置）。
+#: 那份文件恰好还在，且和仓库里这份 sha256 完全一致，所以一直没暴露 ——
+#: 但它哪天被删掉，整个逆向工具箱就静默失效了。V0.3 会话 02 改成相对路径，
+#: 老位置留作兜底。
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+IMGP = os.path.join(_REPO, "re", "BigShot_22524.img")
+if not os.path.isfile(IMGP):
+    _FALLBACK = r"D:\work\popshot\re\BigShot_22524.img"
+    if os.path.isfile(_FALLBACK):
+        IMGP = _FALLBACK
 _img = None
 
 def img():

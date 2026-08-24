@@ -336,5 +336,109 @@ class ItemModeTests(unittest.TestCase):
         self.assertFalse(room.item_mode())
 
 
+class BotSeatTests(unittest.TestCase):
+    """bot 座位的**模型**部分（V0.3 M1）。命令层和广播在 `test_bot.py`。
+
+    这里一个 `gameserver` 都不 import —— bot 座位在大厅模型里就是「多了一个
+    `is_bot` 标记的普通座位」，这条性质必须能脱离协议单独验。
+    """
+
+    def setUp(self):
+        self.lobby = Lobby()
+        self.alice = FakeConn("alice")
+        self.bob = FakeConn("bob")
+        self.room = self.lobby.create_room(self.alice,
+                                           seat=seat_for(self.alice))
+
+    def add_bot(self, name="bot"):
+        machine = FakeConn(name)
+        return self.lobby.add_bot(self.room, Seat(machine, nickname=name)), machine
+
+    def test_a_bot_takes_the_lowest_free_seat(self):
+        index, machine = self.add_bot()
+        self.assertEqual(1, index)
+        self.assertTrue(self.room.seats[1].is_bot)
+        self.assertIs(machine, self.room.seats[1].conn)
+        # bot 也进 conn -> room 索引：一堆路径靠它找人（V0.3 D1）。
+        self.assertIs(self.room, self.lobby.room_of(machine))
+
+    def test_seats_are_not_bots_unless_told_so(self):
+        self.assertFalse(self.room.seats[0].is_bot)
+        self.assertEqual([0], self.room.human_seats())
+        self.assertEqual([], self.room.bot_seats())
+
+    def test_a_full_room_refuses_another_bot(self):
+        for _ in range(5):
+            self.assertIsNotNone(self.add_bot()[0])
+        self.assertIsNone(self.add_bot()[0])
+        self.assertEqual(ROOM_SEAT_COUNT, self.room.player_count())
+
+    def test_a_bot_occupied_room_blocks_a_real_player(self):
+        # ★ D7：真人**照常**被「房间已满」挡住，服务端绝不自动踢 bot 让位。
+        for _ in range(5):
+            self.add_bot()
+        result, room, index = self.lobby.join(self.bob, self.room.room_id)
+        self.assertEqual(MOVE_INTO_FULL, result)
+        self.assertIsNone(room)
+        self.assertIsNone(index)
+
+    def test_remove_bot_only_touches_bot_seats(self):
+        index, machine = self.add_bot()
+        self.lobby.join(self.bob, self.room.room_id, seat=seat_for(self.bob))
+        # 真人那格、空位、越界，三种都必须回 None（而不是悄悄删掉一个真人）。
+        self.assertIsNone(self.lobby.remove_bot(self.room, 2))
+        self.assertIsNone(self.lobby.remove_bot(self.room, 5))
+        self.assertIsNone(self.lobby.remove_bot(self.room, ROOM_SEAT_COUNT))
+        self.assertIsNone(self.lobby.remove_bot(self.room, -1))
+        self.assertIsNotNone(self.lobby.remove_bot(self.room, index))
+        self.assertIsNone(self.room.seats[index])
+        self.assertIsNone(self.lobby.room_of(machine))
+
+    def test_host_migration_skips_bot_seats(self):
+        # ★ D2：房主是唯一能开局、能敲 bot 命令的人，转给 bot = 房间死掉。
+        self.add_bot()                       # 座位 1
+        self.add_bot()                       # 座位 2
+        self.lobby.join(self.bob, self.room.room_id, seat=seat_for(self.bob))
+        result = self.lobby.leave(self.alice)
+        self.assertEqual(3, result.new_host_seat)
+        self.assertEqual(3, self.room.host_seat)
+        self.assertIs(self.bob, self.room.host_conn)
+
+    def test_the_last_human_leaving_dissolves_every_bot(self):
+        machines = [self.add_bot()[1] for _ in range(3)]
+        result = self.lobby.leave(self.alice)
+        self.assertTrue(result.closed)
+        self.assertEqual((1, 2, 3), result.dropped_bots)
+        self.assertTrue(self.room.is_empty())
+        self.assertEqual(0, self.lobby.count())
+        for machine in machines:
+            self.assertIsNone(self.lobby.room_of(machine))
+
+    def test_bots_stay_when_a_non_last_human_leaves(self):
+        self.add_bot()
+        self.lobby.join(self.bob, self.room.room_id, seat=seat_for(self.bob))
+        result = self.lobby.leave(self.bob)
+        self.assertFalse(result.closed)
+        self.assertEqual((), result.dropped_bots)
+        self.assertEqual([1], self.room.bot_seats())
+        self.assertEqual(1, self.room.human_count())
+
+    def test_human_members_leave_out_bots_but_members_keep_them(self):
+        _index, machine = self.add_bot()
+        self.assertEqual([self.alice, machine],
+                         self.room.members(exclude=None))
+        self.assertEqual([self.alice], self.room.human_members())
+        self.assertEqual([], self.room.human_members(exclude=self.alice))
+
+    def test_a_fake_room_with_no_connections_is_not_mistaken_for_bots(self):
+        # ★ D2 的判据必须是 `is_bot`，**不是** `conn is None` —— 调试通道造的
+        #   假房间座位 conn 也是 None，按 conn 判会把它们当 bot 全散掉。
+        fake = self.lobby.create_room(None, seat=Seat(None, nickname="假"))
+        fake.seats[1] = Seat(None, nickname="假2")
+        self.assertEqual([0, 1], fake.human_seats())
+        self.assertEqual(2, fake.human_count())
+        self.assertEqual([], fake.bot_seats())
+
+
 if __name__ == "__main__":
     unittest.main()

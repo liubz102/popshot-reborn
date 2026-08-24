@@ -152,10 +152,10 @@ class Seat:
     """
 
     __slots__ = ("conn", "username", "nickname", "level", "character_id",
-                 "team", "ready")
+                 "team", "ready", "is_bot")
 
     def __init__(self, conn, username="", nickname="", level=1, character_id=0,
-                 team=TEAM_NONE, ready=False):
+                 team=TEAM_NONE, ready=False, is_bot=False):
         self.conn = conn
         self.username = username
         self.nickname = nickname
@@ -167,6 +167,10 @@ class Seat:
         #: 准备好了没有（`SessionSlot+0x2e`）。房主那一格客户端**不看**
         #: （`0x4696f8` 直接把房主算成已准备），非房主必须靠服务端广播。
         self.ready = bool(ready)
+        #: ★ 这格坐的是 bot（V0.3）。判据放在**座位**上而不是「conn 是不是
+        #: None」：bot 的座位有一个假连接对象（`bot.BotConn`，V0.3 D1），
+        #: 而调试通道造的假房间座位 conn 才是 None —— 两者必须分得开（D2）。
+        self.is_bot = bool(is_bot)
 
     def update(self, nickname=None, level=None, character_id=None,
                team=None, ready=None):
@@ -292,10 +296,44 @@ class Room:
         return SESSION_TYPE_GAME_TYPES.get(self.session_type, 1)
 
     def player_count(self):
+        """坐了人的座位数，**bot 也算一个人**。
+
+        房间列表上的「3/6人」和客户端自己数出来的空位数（`0x556f40`）都按
+        座位算，所以这里不能把 bot 摘出去 —— 摘了两边就对不上。
+        """
         return sum(1 for s in self.seats if s is not None)
 
     def is_empty(self):
         return self.player_count() == 0
+
+    # -- bot（V0.3）---------------------------------------------------------
+    def bot_seats(self):
+        """坐着 bot 的座位号（升序）。"""
+        return [i for i, s in enumerate(self.seats)
+                if s is not None and s.is_bot]
+
+    def human_seats(self):
+        """坐着**真人**的座位号（升序）。"""
+        return [i for i, s in enumerate(self.seats)
+                if s is not None and not s.is_bot]
+
+    def human_count(self):
+        """房里还有几个真人。
+
+        ★ 「房间还有没有存在的意义」只能按这个数判：一屋子 bot 谁也开不了局、
+        谁也删不掉它们（命令只有房主能敲，而房主只会是真人，D2）。
+        """
+        return len(self.human_seats())
+
+    def human_members(self, exclude=None):
+        """房里**真人**的连接（可排除一个）。
+
+        要「找个人来跑一段战斗逻辑」时用它，别用 `members()[0]` ——
+        那一位可能是 bot，而 bot 没有账号、没有屏幕，不该替全场做判定。
+        """
+        return [s.conn for s in self.seats
+                if s is not None and not s.is_bot
+                and s.conn is not None and s.conn is not exclude]
 
     def is_full(self):
         return self.free_seat() is None
@@ -389,14 +427,19 @@ class LeaveResult:
     房间是不是空了（空了就从列表里摘掉）。
     """
 
-    __slots__ = ("room", "seat_index", "remaining", "new_host_seat", "closed")
+    __slots__ = ("room", "seat_index", "remaining", "new_host_seat", "closed",
+                 "dropped_bots")
 
-    def __init__(self, room, seat_index, remaining, new_host_seat, closed):
+    def __init__(self, room, seat_index, remaining, new_host_seat, closed,
+                 dropped_bots=()):
         self.room = room
         self.seat_index = seat_index
         self.remaining = remaining          #: 还留在房里的连接
         self.new_host_seat = new_host_seat  #: 房主换人了就是新座位号，否则 None
         self.closed = closed                #: 房间是不是被解散了
+        #: 跟着一起被摘掉的 bot 座位号（最后一个真人走时才非空）。只给日志用
+        #: —— 这时房间已经解散，没有任何人需要收到座位变更广播。
+        self.dropped_bots = tuple(dropped_bots)
 
 
 class Lobby:
@@ -552,6 +595,13 @@ class Lobby:
         if index is None:
             return None
         room.seats[index] = None
+        # ★ 最后一个**真人**走了 -> 把 bot 全摘掉，房间跟着解散（V0.3 M1）。
+        #   一屋子 bot 谁也开不了局、谁也删不掉它们（命令只有房主能敲，而
+        #   房主永远是真人，D2），留着就是一个永远不会消失的僵尸房间：
+        #   它还会挂在大厅列表上骗人进来。判据是**真人数**，不是座位数。
+        dropped_bots = ()
+        if room.human_count() == 0:
+            dropped_bots = self._drop_bots_unlocked(room)
         remaining = room.members()
         new_host_seat = None
         closed = False
@@ -564,15 +614,70 @@ class Lobby:
         elif room.host_seat == index:
             # 房主走了 -> 转给还在的最小座位号。不转的话房间里没人能按开始，
             # 而客户端只认「房主座位号」这一个字段（V0.1 §77）。
+            # ★ **跳过 bot 座**（V0.3 D2）：房主是唯一能开局、能敲 bot 命令的
+            #   人，转给 bot 等于房间彻底死掉。判据是「这格是不是 bot」，
+            #   **不是**「conn 是不是 None」—— 假房间的座位 conn 也是 None。
             for candidate, seat in enumerate(room.seats):
-                if seat is not None:
+                if seat is not None and not seat.is_bot:
                     new_host_seat = candidate
                     room.host_seat = candidate
                     room.host_conn = seat.conn
                     break
         if not want_result:
             return None
-        return LeaveResult(room, index, remaining, new_host_seat, closed)
+        return LeaveResult(room, index, remaining, new_host_seat, closed,
+                           dropped_bots)
+
+    def _drop_bots_unlocked(self, room):
+        """把房里所有 bot 座位摘掉，返回被摘掉的座位号。"""
+        dropped = []
+        for index, seat in enumerate(room.seats):
+            if seat is None or not seat.is_bot:
+                continue
+            room.seats[index] = None
+            if seat.conn is not None:
+                self._by_conn.pop(seat.conn, None)
+            dropped.append(index)
+        return tuple(dropped)
+
+    # -- bot（V0.3）---------------------------------------------------------
+    def add_bot(self, room, seat):
+        """把一个 bot 座位放进最小空座。返回座位号；满座返回 ``None``。
+
+        队伍按座位号 + 房间模式定，和真人进房走的是同一条 `default_team_for`
+        —— 组队房里座位号奇偶交替 1/2，所以「从最小空座往下填」天然保持
+        两队平衡（客户端要求两队人数相等才让开局，V0.3 §8）。
+        """
+        with self._lock:
+            index = room.free_seat()
+            if index is None:
+                return None
+            seat.is_bot = True
+            seat.team = room.default_team_for(index)
+            seat.ready = False
+            room.seats[index] = seat
+            # bot 也进 conn -> room 索引：`Conn.lobby_room()` / `battle_members()`
+            # 一大堆路径都靠它找人（D1 选了「假连接」而不是 `conn=None`）。
+            if seat.conn is not None:
+                self._by_conn[seat.conn] = room
+            return index
+
+    def remove_bot(self, room, seat_index):
+        """摘掉一个 bot 座位。返回被摘掉的 `Seat`；那格不是 bot 就返回 ``None``。
+
+        ★ 「那格不是 bot」包括「空着」和「坐着真人」两种，调用方要按 ``None``
+        给出具体原因 —— 悄悄成功地删掉一个真人是绝对不允许的。
+        """
+        with self._lock:
+            if not 0 <= int(seat_index) < ROOM_SEAT_COUNT:
+                return None
+            seat = room.seats[int(seat_index)]
+            if seat is None or not seat.is_bot:
+                return None
+            room.seats[int(seat_index)] = None
+            if seat.conn is not None:
+                self._by_conn.pop(seat.conn, None)
+            return seat
 
     def kick(self, room, seat_index):
         """房主踢人。返回被踢掉的 `LeaveResult`，座位空着就返回 ``None``。"""
