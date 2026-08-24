@@ -2671,13 +2671,25 @@ def build_broadcast_death(handle=0, seat=0, arg=0, death_count=1):
     ★★ **`[char+0x600]` 就是 HUD 上那排心形的数据源**（§109）。
     战绩面板 `0x4a49a4` 起画心形的公式是：
 
-        实心心形数 = GameContext::vf_a0(座位)      // = 最大生命，构造时填 3
+        实心心形数 = GameContext::vf_a0(座位)      // = 最大生命
                    - Character::vf_c0()            // = [char+0x600]
 
     所以**这个字段必须是「新的死亡次数」，也就是客户端报上来的值 +1**。
     照抄回去（我们一开始就是这么干的）等于告诉客户端「你的死亡次数没变」，
     心形就永远是 3 颗 —— 而 `[ctx+0x384]` 那份战绩表是 `0x48c942` **本地**加的，
     所以「死 3 次判负」照常生效，只有显示不动。用户报的正是这个组合。
+
+    ★★ **`[char+0x600]` 跨换图不清零**（bug调查/12 / §241）：`0x47900a` 把
+    六个座位的角色**原样挂回世界**（同一批指针），不是卸掉重建。所以服务端的
+    每句柄权威计数换图时只能清怪 / 物件那一份 —— 见 `RoomQuest.begin_map_change`。
+
+    ★★ 客户端其实有**两个**死亡计数器，都靠这一发喂，漏发一发两个都会歪：
+    `[char+0x600]`（本包这一格写，画心形）和 `[ctx+0x384]` 那份战绩表的
+    `[vc + 座位*0x2c + 0x60]`（`0x48c942` **每收到一发本包就 +1**，不看这一格
+    的值），后者决定还能不能重生 —— `Die()` 在 `0x501976` 读它，剩余生命为 0
+    就把 `[char+0x2d8]` 写成 -1，永不重生。**最大生命不是恒定的 3**：生存模式
+    是客户端写死的 3（`0x55db69`），闯关是 `[vc + 座位*4 + 0x198]`，来自关卡
+    脚本，服务端拿不到；夺分 / 计时是 `0x7fffffff`（无限命）。
 
     ★ 读侧只读 **10 字节**，写侧的 0x0408 是 18 字节。实际下发时我们把收到的
     18 字节里这一格 +1 之后原样发回（多出来的 X/Y 客户端不读）。
@@ -3143,6 +3155,11 @@ class RoomQuest:
         #: 每个句柄最后一次广播死亡的时刻（`time.monotonic()`），
         #: 给 `MONSTER_DEATH_DEDUP_WINDOW_S` 那扇窗用。
         self.last_death_broadcast_at = {}
+        #: 见过的**玩家**角色句柄 -> 座位。句柄的公式是「座位×100000+100001」
+        #: （`0x405f02`），但我们不去算它 —— 谁是玩家由 `0x0408` 里的座位号
+        #: 说了算，这样公式改了也不会跟着错。
+        #: 唯一的用处是换图时把玩家那几份死亡计数留下来（`begin_map_change`）。
+        self.player_handles = {}
         #: ★ 重生看门狗（bug调查/8）：座位 -> `(到点时刻, 兜底坐标)`。
         #: 广播死亡时上闩，收到本人的 `0x0413` 就撤闩；到点还没撤说明客户端
         #: 那条「5 秒后自己发 0x0413」的链断了，服务端自己补一发 `0x0419`。
@@ -3389,15 +3406,18 @@ class RoomQuest:
         报的值更大只可能是句柄撞号，跟着跳会把 HUD 心形一次扣好几颗。
 
         每座位的 `deaths` 镜像成**这一发实际下发的次数**；生存模式拿它算
-        `3 - deaths`。用 ``max`` 而不是直接赋值，是为了跨换图：换图会把
-        `death_counts` 清掉（新角色对象的 `[char+0x600]` 从 0 开始），
-        而「这一局死了几条命」不能跟着清。
+        `3 - deaths`。用 ``max`` 而不是直接赋值只是保险 —— 换图**不清**玩家
+        那几份计数（bug调查/12，见 `begin_map_change`），正常路径上两者同步。
         """
         handle = int(handle) & 0xFFFFFFFF
         reported = int(reported)
         seat = int(seat)
         now = time.monotonic() if now is None else now
         is_player = 0 <= seat < ROOM_SEAT_COUNT
+        if is_player:
+            # 换图要靠它认出「这个句柄是玩家的」（`begin_map_change`）。
+            # 记在判重之前 —— 被判重吃掉的那一发同样证明了句柄归属。
+            self.player_handles[handle] = seat
         count = self.death_counts.get(handle, 0)
         key = (handle, reported)
         if key in self.dead_events:
@@ -3691,15 +3711,31 @@ class RoomQuest:
         self.pending_map = map_name
         self.map_loaded.clear()
         self.maps_entered.append(map_name)
-        # 换图会把六个座位的角色对象和场景里的物件全部卸掉重建（`0x47900a`），
-        # 旧句柄随之作废 —— 去重表和拾取表必须跟着清，否则新图里的物件
-        # 会被当成「已经捡过了」。死亡计数同理：新角色的 `[char+0x600]` 从 0
-        # 起，不清就会把新图里的第一次死亡当成「过期上报」吃掉。
+        # 换图会把场景里的物件全部卸掉重建（`0x47900a`），旧句柄随之作废 ——
+        # 去重表和拾取表必须跟着清，否则新图里的物件会被当成「已经捡过了」。
         # 重生点表也必须清 —— 换了图，旧坐标就是别的地方了。
+        #
+        # ★★ **玩家那几份死亡计数不能清**（bug调查/12）。`0x47900a` 对六个座位
+        # 的角色**不是**卸掉重建：它先把 `0x404ff6(座位)` 拿到的指针存进栈上
+        # 的数组，卸完场景之后又把**同一批指针**原样挂回世界（`0x473e7c`），
+        # 连 `[[0x72e2d4]+0x3c]` 起的 30 个 dword 都是**按 `max` 合并**回去的
+        # （`0x4790fc`）—— 换图根本不是一次干净的重置。
+        # 所以 `[char+0x600]`（= HUD 心形的数据源）跨图**照旧累计** ——
+        # 心形本来就得跨图记账。跟着清的话服务端从 0 重新数，会连出两个 bug：
+        #   · 第二张图第一次死，客户端报「我死过 1 次」，服务端回「你死了
+        #     1 次」，心形原地不动（用户报的「换图后再死一次还是 2 颗心」）；
+        #   · 再死一次，客户端报的还是 1，`(句柄, 报的次数)` 撞上上一发的老键，
+        #     整发被当成重复上报吃掉 —— 死亡广播不发，客户端就永远不会调
+        #     `Character::Die()`，人躺在地上再也起不来（「被打死后无法复活」）。
+        keep = self.player_handles
         self.items_taken.clear()
-        self.dead_events.clear()
-        self.death_counts.clear()
-        self.last_death_broadcast_at.clear()
+        self.dead_events = {key for key in self.dead_events if key[0] in keep}
+        self.death_counts = {handle: count
+                             for handle, count in self.death_counts.items()
+                             if handle in keep}
+        self.last_death_broadcast_at = {
+            handle: at for handle, at in self.last_death_broadcast_at.items()
+            if handle in keep}
         self.respawn_due.clear()
         self.respawn_hints.clear()
         self.last_respawn_hint = None

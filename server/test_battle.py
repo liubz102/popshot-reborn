@@ -345,14 +345,60 @@ class DeathBroadcastTests(BattleRoom):
         self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.alice))
 
     def test_a_map_change_forgets_the_dedup_table(self):
-        # 换图会把六个座位的角色和场景物件全部卸掉重建（0x47900a），
-        # 旧句柄作废 —— 不清的话新图里同号的东西会被当成「已经报过了」。
+        # 换图会把场景物件全部卸掉重建（0x47900a），旧句柄作废 ——
+        # 不清的话新图里同号的东西会被当成「已经报过了」。
         payload = hp_zero_payload(handle=0x0010C8FB, seat=0xFF, deaths=0)
         gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO, payload)
         self.quest.begin_map_change("Quest03_2")
         self.clear()
         gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO, payload)
         self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.bob))
+
+    def test_a_map_change_keeps_the_players_own_death_count(self):
+        # ★★ bug调查/12「换图后再死一次，心形还是 2 颗」。
+        #    `0x47900a` 只卸场景，六个座位的角色对象是**原样挂回去**的
+        #    （同一批指针），`[char+0x600]` 跨图照旧累计 —— 心形本来就得
+        #    跨图记账。服务端跟着清就会把第二张图的第一次死亡又下发成 1。
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO,
+                                       hp_zero_payload(seat=0, deaths=0))
+        self.quest.begin_map_change("Quest02_2")
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO,
+                                       hp_zero_payload(seat=0, deaths=1))
+        body = bodies(self.bob, OP_BROADCAST_DEATH)[0]
+        self.assertEqual(2, struct.unpack_from("<i", body, 6)[0])
+        self.assertEqual(2, self.quest.deaths[0])
+
+    def test_the_third_death_still_broadcasts_after_a_map_change(self):
+        # ★★ bug调查/12「在 boss 房间被打死后无法复活」——「心形不减」的
+        #    第二段病。计数被换图清掉之后，第二、第三次死亡客户端报的都是 1，
+        #    `(句柄, 报的次数)` 撞上老键 -> 整发被当成重复上报吃掉 ->
+        #    死亡广播不发 -> 客户端永远不调 Character::Die()，人躺着起不来。
+        #    用户那份日志（12/logs/server.out）里 23:57:51 和 23:58:48 两发
+        #    上报的死亡次数都是 1，第二发一个包都没回。
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO,
+                                       hp_zero_payload(seat=0, deaths=0))
+        self.quest.begin_map_change("Quest02_2")
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO,
+                                       hp_zero_payload(seat=0, deaths=1))
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO,
+                                       hp_zero_payload(seat=0, deaths=2))
+        self.assertEqual([OP_BROADCAST_DEATH], opcodes(self.alice))
+        body = bodies(self.alice, OP_BROADCAST_DEATH)[0]
+        self.assertEqual(3, struct.unpack_from("<i", body, 6)[0])
+        self.assertEqual(0, self.quest.remaining_lives(0))
+
+    def test_a_map_change_still_forgets_the_players_stale_report(self):
+        # 留着玩家那份计数不等于放行重复上报：换图那一刻还在飞的旧上报
+        # （和上一发同号）照样要被吃掉，不然心形会白掉一颗。
+        payload = hp_zero_payload(seat=0, deaths=0)
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO, payload)
+        self.quest.begin_map_change("Quest02_2")
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO, payload)
+        self.assertEqual([], opcodes(self.bob))
+        self.assertEqual(1, self.quest.deaths[0])
 
     def test_the_death_count_is_still_the_reported_value_plus_one(self):
         # V0.1 §109 的契约不许变：HUD 心形 = 最大生命 - 这一格。
@@ -1326,6 +1372,44 @@ class MapChangeTests(BattleRoom):
                                        get_item_payload())
         self.request(self.alice)
         self.assertEqual({}, self.quest.items_taken)
+
+    def test_each_co_op_player_keeps_his_own_death_count(self):
+        # ★ bug调查/12 的合作闯关版：两个人各有各的句柄
+        #   （座位×100000+100001），换图之后两份计数都得原样接着数，
+        #   而且互不串。走的是真正的 0x0411 换图链，不是直接调
+        #   `begin_map_change`。
+        self.die(self.alice, 0, deaths=0)
+        self.die(self.bob, 1, deaths=0)
+        self.request(self.alice)
+        self.done(self.alice)
+        self.done(self.bob)
+        self.clear()
+        self.die(self.alice, 0, deaths=1)
+        self.die(self.bob, 1, deaths=1)
+        self.assertEqual(2, self.death_count(self.alice, 0))
+        self.assertEqual(2, self.death_count(self.bob, 1))
+        self.assertEqual([2, 2, 0, 0, 0, 0], self.quest.deaths)
+
+    def test_a_map_change_still_forgets_the_monsters(self):
+        # 怪 / 场景物件才是真的卸掉重建，旧句柄真的作废 —— 那一份照旧全清，
+        # 不然新图里同号的怪会被当成「已经报过了」。
+        payload = hp_zero_payload(handle=0x0010C8FB, seat=0xFF, deaths=0)
+        gameserver.Conn.on_game_packet(self.alice, OP_REPORT_HP_ZERO, payload)
+        self.request(self.alice)
+        self.assertEqual({}, self.quest.death_counts)
+        self.assertEqual(set(), self.quest.dead_events)
+
+    def die(self, conn, seat, deaths):
+        conn.my_seat = seat
+        gameserver.Conn.on_game_packet(
+            conn, OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=seat * 100000 + 100001, seat=seat,
+                            deaths=deaths))
+
+    def death_count(self, conn, seat):
+        """这个人最后收到的那一发 0x0406 里的死亡次数（线偏移 6）。"""
+        body = bodies(conn, OP_BROADCAST_DEATH)[-1]
+        return struct.unpack_from("<i", body, 6)[0]
 
 
 # ----------------------------------------------------------------------------
