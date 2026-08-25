@@ -1,0 +1,1280 @@
+{
+ "format": 1,
+ "count": 174,
+ "maps": {
+  "01test": {
+   "file": "01test.json",
+   "version": 18,
+   "width": 2848,
+   "height": 1524,
+   "surfaces": 4886
+  },
+  "Beginner": {
+   "file": "Beginner.json",
+   "version": 8,
+   "width": 1800,
+   "height": 800,
+   "surfaces": 3154
+  },
+  "Boss00#Easy": {
+   "file": "Boss00#Easy.json",
+   "version": 16,
+   "width": 1500,
+   "height": 950,
+   "surfaces": 1457
+  },
+  "Boss00#Extreme": {
+   "file": "Boss00#Extreme.json",
+   "version": 18,
+   "width": 1500,
+   "height": 950,
+   "surfaces": 1457
+  },
+  "Boss00#Hard": {
+   "file": "Boss00#Hard.json",
+   "version": 16,
+   "width": 1500,
+   "height": 950,
+   "surfaces": 1457
+  },
+  "Boss00#Normal": {
+   "file": "Boss00#Normal.json",
+   "version": 16,
+   "width": 1500,
+   "height": 950,
+   "surfaces": 1457
+  },
+  "Boss01": {
+   "file": "Boss01.json",
+   "version": 16,
+   "width": 1220,
+   "height": 800,
+   "surfaces": 991
+  },
+  "Boss_00Effect": {
+   "file": "Boss_00Effect.json",
+   "version": 9,
+   "width": 1500,
+   "height": 950,
+   "surfaces": 1500
+  },
+  "Boss_Airship_M00": {
+   "file": "Boss_Airship_M00.json",
+   "version": 16,
+   "width": 1024,
+   "height": 800,
+   "surfaces": 974
+  },
+  "Boss_Bregma_M00": {
+   "file": "Boss_Bregma_M00.json",
+   "version": 15,
+   "width": 1500,
+   "height": 1224,
+   "surfaces": 4996
+  },
+  "Boss_Bullfrog_M00": {
+   "file": "Boss_Bullfrog_M00.json",
+   "version": 16,
+   "width": 1000,
+   "height": 700,
+   "surfaces": 955
+  },
+  "Boss_Darknight_M00": {
+   "file": "Boss_Darknight_M00.json",
+   "version": 16,
+   "width": 1000,
+   "height": 900,
+   "surfaces": 963
+  },
+  "Boss_Draka_M00": {
+   "file": "Boss_Draka_M00.json",
+   "version": 16,
+   "width": 1020,
+   "height": 800,
+   "surfaces": 2077
+  },
+  "Boss_Island_M00": {
+   "file": "Boss_Island_M00.json",
+   "version": 18,
+   "width": 1000,
+   "height": 800,
+   "surfaces": 1204
+  },
+  "Camel00": {
+   "file": "Camel00.json",
+   "version": 18,
+   "width": 2000,
+   "height": 1500,
+   "surfaces": 4729
+  },
+  "Camel01": {
+   "file": "Camel01.json",
+   "version": 18,
+   "width": 2000,
+   "height": 1500,
+   "surfaces": 7028
+  },
+  "Camel01-2": {
+   "file": "Camel01-2.json",
+   "version": 18,
+   "width": 2000,
+   "height": 1500,
+   "surfaces": 7028
+  },
+  "Camel02": {
+   "file": "Camel02.json",
+   "version": 18,
+   "width": 2000,
+   "height": 1500,
+   "surfaces": 6845
+  },
+  "CamelCulvert00": {
+   "file": "CamelCulvert00.json",
+   "version": 18,
+   "width": 1490,
+   "height": 1324,
+   "surfaces": 3096
+  },
+  "CamelCulvert00m": {
+   "file": "CamelCulvert00m.json",
+   "version": 15,
+   "width": 2000,
+   "height": 1000,
+   "surfaces": 3665
+  },
+  "CamelCulvert01": {
+   "file": "CamelCulvert01.json",
+   "version": 18,
+   "width": 2090,
+   "height": 1324,
+   "surfaces": 4605
+  },
+  "CamelCulvert02": {
+   "file": "CamelCulvert02.json",
+   "version": 18,
+   "width": 1974,
+   "height": 1424,
+   "surfaces": 5822
+  },
+  "CamelCulvert03": {
+   "file": "CamelCulvert03.json",
+   "version": 18,
+   "width": 1400,
+   "height": 1000,
+   "surfaces": 3042
+  },
+  "CamelCulvert04": {
+   "file": "CamelCulvert04.json",
+   "version": 18,
+   "width": 2050,
+   "height": 1200,
+   "surfaces": 3688
+  },
+  "CamelCulvert_M00": {
+   "file": "CamelCulvert_M00.json",
+   "version": 16,
+   "width": 1200,
+   "height": 1000,
+   "surfaces": 2302
+  },
+  "CamelCulvert_br": {
+   "file": "CamelCulvert_br.json",
+   "version": 18,
+   "width": 1024,
+   "height": 800,
+   "surfaces": 2112
+  },
+  "CamelCulvert_br00": {
+   "file": "CamelCulvert_br00.json",
+   "version": 18,
+   "width": 980,
+   "height": 860,
+   "surfaces": 497
+  },
+  "CamelCulvert_br000": {
+   "file": "CamelCulvert_br000.json",
+   "version": 18,
+   "width": 980,
+   "height": 860,
+   "surfaces": 485
+  },
+  "CamelCulvert_br0000": {
+   "file": "CamelCulvert_br0000.json",
+   "version": 18,
+   "width": 1040,
+   "height": 860,
+   "surfaces": 1040
+  },
+  "CamelCulvert_br00000": {
+   "file": "CamelCulvert_br00000.json",
+   "version": 18,
+   "width": 1040,
+   "height": 960,
+   "surfaces": 1431
+  },
+  "CamelCulvert_br2": {
+   "file": "CamelCulvert_br2.json",
+   "version": 18,
+   "width": 1800,
+   "height": 1000,
+   "surfaces": 2316
+  },
+  "CamelCulvert_br3": {
+   "file": "CamelCulvert_br3.json",
+   "version": 18,
+   "width": 1800,
+   "height": 1000,
+   "surfaces": 1902
+  },
+  "CamelCulvert_br4": {
+   "file": "CamelCulvert_br4.json",
+   "version": 18,
+   "width": 1800,
+   "height": 1300,
+   "surfaces": 1894
+  },
+  "CamelCulvert_br5": {
+   "file": "CamelCulvert_br5.json",
+   "version": 18,
+   "width": 2050,
+   "height": 1200,
+   "surfaces": 3420
+  },
+  "Camel_M00": {
+   "file": "Camel_M00.json",
+   "version": 16,
+   "width": 1000,
+   "height": 600,
+   "surfaces": 960
+  },
+  "Desert01": {
+   "file": "Desert01.json",
+   "version": 18,
+   "width": 2024,
+   "height": 1624,
+   "surfaces": 6002
+  },
+  "Desert02": {
+   "file": "Desert02.json",
+   "version": 18,
+   "width": 1804,
+   "height": 1124,
+   "surfaces": 4294
+  },
+  "Desert03": {
+   "file": "Desert03.json",
+   "version": 18,
+   "width": 2004,
+   "height": 1124,
+   "surfaces": 5319
+  },
+  "Domir00": {
+   "file": "Domir00.json",
+   "version": 8,
+   "width": 2046,
+   "height": 1500,
+   "surfaces": 7751
+  },
+  "Domir00m": {
+   "file": "Domir00m.json",
+   "version": 8,
+   "width": 1200,
+   "height": 800,
+   "surfaces": 3111
+  },
+  "Domir03": {
+   "file": "Domir03.json",
+   "version": 8,
+   "width": 1900,
+   "height": 1500,
+   "surfaces": 6269
+  },
+  "Domir_M00": {
+   "file": "Domir_M00.json",
+   "version": 16,
+   "width": 1100,
+   "height": 800,
+   "surfaces": 2725
+  },
+  "Domir_Newbie": {
+   "file": "Domir_Newbie.json",
+   "version": 18,
+   "width": 1024,
+   "height": 768,
+   "surfaces": 2318
+  },
+  "Domir_b": {
+   "file": "Domir_b.json",
+   "version": 8,
+   "width": 1700,
+   "height": 940,
+   "surfaces": 3509
+  },
+  "Esperan00": {
+   "file": "Esperan00.json",
+   "version": 8,
+   "width": 2048,
+   "height": 2048,
+   "surfaces": 7082
+  },
+  "Esperan00m": {
+   "file": "Esperan00m.json",
+   "version": 8,
+   "width": 1600,
+   "height": 900,
+   "surfaces": 1682
+  },
+  "Esperan03": {
+   "file": "Esperan03.json",
+   "version": 8,
+   "width": 2048,
+   "height": 1200,
+   "surfaces": 5392
+  },
+  "Esperan04": {
+   "file": "Esperan04.json",
+   "version": 16,
+   "width": 2548,
+   "height": 1400,
+   "surfaces": 5699
+  },
+  "Esperan_M00": {
+   "file": "Esperan_M00.json",
+   "version": 15,
+   "width": 1200,
+   "height": 900,
+   "surfaces": 1326
+  },
+  "Esperan_b": {
+   "file": "Esperan_b.json",
+   "version": 8,
+   "width": 1600,
+   "height": 900,
+   "surfaces": 3196
+  },
+  "Festival00": {
+   "file": "Festival00.json",
+   "version": 18,
+   "width": 1900,
+   "height": 1000,
+   "surfaces": 3840
+  },
+  "Festival01": {
+   "file": "Festival01.json",
+   "version": 18,
+   "width": 2300,
+   "height": 1300,
+   "surfaces": 4638
+  },
+  "Festival02": {
+   "file": "Festival02.json",
+   "version": 18,
+   "width": 1800,
+   "height": 1370,
+   "surfaces": 4195
+  },
+  "Forest00": {
+   "file": "Forest00.json",
+   "version": 8,
+   "width": 2048,
+   "height": 1024,
+   "surfaces": 4861
+  },
+  "Forest00m": {
+   "file": "Forest00m.json",
+   "version": 16,
+   "width": 1600,
+   "height": 900,
+   "surfaces": 3796
+  },
+  "Forest02": {
+   "file": "Forest02.json",
+   "version": 8,
+   "width": 1700,
+   "height": 1400,
+   "surfaces": 4942
+  },
+  "Forest03": {
+   "file": "Forest03.json",
+   "version": 16,
+   "width": 1484,
+   "height": 1224,
+   "surfaces": 3750
+  },
+  "Forest_M00": {
+   "file": "Forest_M00.json",
+   "version": 16,
+   "width": 1200,
+   "height": 800,
+   "surfaces": 2360
+  },
+  "Forest_b": {
+   "file": "Forest_b.json",
+   "version": 8,
+   "width": 1800,
+   "height": 800,
+   "surfaces": 3154
+  },
+  "Garden00": {
+   "file": "Garden00.json",
+   "version": 13,
+   "width": 2000,
+   "height": 1100,
+   "surfaces": 5082
+  },
+  "Garden01": {
+   "file": "Garden01.json",
+   "version": 13,
+   "width": 1900,
+   "height": 1300,
+   "surfaces": 5801
+  },
+  "Garden_M00": {
+   "file": "Garden_M00.json",
+   "version": 16,
+   "width": 1000,
+   "height": 900,
+   "surfaces": 1316
+  },
+  "Iceria00": {
+   "file": "Iceria00.json",
+   "version": 18,
+   "width": 2600,
+   "height": 1300,
+   "surfaces": 7152
+  },
+  "Iceria00-1": {
+   "file": "Iceria00-1.json",
+   "version": 8,
+   "width": 2600,
+   "height": 1300,
+   "surfaces": 7152
+  },
+  "Iceria00m": {
+   "file": "Iceria00m.json",
+   "version": 8,
+   "width": 1600,
+   "height": 900,
+   "surfaces": 3266
+  },
+  "Iceria02": {
+   "file": "Iceria02.json",
+   "version": 8,
+   "width": 2600,
+   "height": 1300,
+   "surfaces": 6063
+  },
+  "Iceria03": {
+   "file": "Iceria03.json",
+   "version": 16,
+   "width": 1854,
+   "height": 1924,
+   "surfaces": 5679
+  },
+  "Iceria_M00": {
+   "file": "Iceria_M00.json",
+   "version": 16,
+   "width": 1100,
+   "height": 900,
+   "surfaces": 2216
+  },
+  "Iceria_b": {
+   "file": "Iceria_b.json",
+   "version": 8,
+   "width": 1800,
+   "height": 1000,
+   "surfaces": 3497
+  },
+  "Megatron00": {
+   "file": "Megatron00.json",
+   "version": 18,
+   "width": 2048,
+   "height": 2048,
+   "surfaces": 8664
+  },
+  "Megatron00_ch": {
+   "file": "Megatron00_ch.json",
+   "version": 18,
+   "width": 2048,
+   "height": 2048,
+   "surfaces": 8664
+  },
+  "Megatron00m": {
+   "file": "Megatron00m.json",
+   "version": 8,
+   "width": 1600,
+   "height": 900,
+   "surfaces": 2445
+  },
+  "Megatron00m_ch": {
+   "file": "Megatron00m_ch.json",
+   "version": 18,
+   "width": 1600,
+   "height": 900,
+   "surfaces": 2447
+  },
+  "Megatron01": {
+   "file": "Megatron01.json",
+   "version": 18,
+   "width": 1600,
+   "height": 2048,
+   "surfaces": 5929
+  },
+  "Megatron01_ch": {
+   "file": "Megatron01_ch.json",
+   "version": 18,
+   "width": 1600,
+   "height": 2048,
+   "surfaces": 5929
+  },
+  "Megatron_M00": {
+   "file": "Megatron_M00.json",
+   "version": 16,
+   "width": 1200,
+   "height": 900,
+   "surfaces": 2138
+  },
+  "Megatron_M00_ch": {
+   "file": "Megatron_M00_ch.json",
+   "version": 18,
+   "width": 1200,
+   "height": 900,
+   "surfaces": 2140
+  },
+  "Megatron_b": {
+   "file": "Megatron_b.json",
+   "version": 18,
+   "width": 2035,
+   "height": 1100,
+   "surfaces": 2793
+  },
+  "Megatron_b_ch": {
+   "file": "Megatron_b_ch.json",
+   "version": 18,
+   "width": 2035,
+   "height": 1100,
+   "surfaces": 2793
+  },
+  "Quest02_1#Easy": {
+   "file": "Quest02_1#Easy.json",
+   "version": 15,
+   "width": 9400,
+   "height": 768,
+   "surfaces": 12327
+  },
+  "Quest02_1#Extreme": {
+   "file": "Quest02_1#Extreme.json",
+   "version": 18,
+   "width": 9400,
+   "height": 768,
+   "surfaces": 11712
+  },
+  "Quest02_1#Hard": {
+   "file": "Quest02_1#Hard.json",
+   "version": 15,
+   "width": 9400,
+   "height": 768,
+   "surfaces": 11706
+  },
+  "Quest02_1#Normal": {
+   "file": "Quest02_1#Normal.json",
+   "version": 15,
+   "width": 9400,
+   "height": 768,
+   "surfaces": 11943
+  },
+  "Quest02_2#Easy": {
+   "file": "Quest02_2#Easy.json",
+   "version": 15,
+   "width": 1220,
+   "height": 800,
+   "surfaces": 1220
+  },
+  "Quest02_2#Extreme": {
+   "file": "Quest02_2#Extreme.json",
+   "version": 18,
+   "width": 1220,
+   "height": 800,
+   "surfaces": 168
+  },
+  "Quest02_2#Hard": {
+   "file": "Quest02_2#Hard.json",
+   "version": 15,
+   "width": 1220,
+   "height": 800,
+   "surfaces": 1220
+  },
+  "Quest02_2#Normal": {
+   "file": "Quest02_2#Normal.json",
+   "version": 15,
+   "width": 1220,
+   "height": 800,
+   "surfaces": 1220
+  },
+  "Quest03_1#Easy": {
+   "file": "Quest03_1#Easy.json",
+   "version": 15,
+   "width": 10600,
+   "height": 768,
+   "surfaces": 14013
+  },
+  "Quest03_1#Extreme": {
+   "file": "Quest03_1#Extreme.json",
+   "version": 18,
+   "width": 11350,
+   "height": 768,
+   "surfaces": 14906
+  },
+  "Quest03_1#Hard": {
+   "file": "Quest03_1#Hard.json",
+   "version": 15,
+   "width": 11350,
+   "height": 768,
+   "surfaces": 14742
+  },
+  "Quest03_1#Normal": {
+   "file": "Quest03_1#Normal.json",
+   "version": 18,
+   "width": 11400,
+   "height": 768,
+   "surfaces": 15029
+  },
+  "Quest03_2": {
+   "file": "Quest03_2.json",
+   "version": 15,
+   "width": 1024,
+   "height": 4500,
+   "surfaces": 0
+  },
+  "Quest03_3#Easy": {
+   "file": "Quest03_3#Easy.json",
+   "version": 15,
+   "width": 9400,
+   "height": 768,
+   "surfaces": 12327
+  },
+  "Quest03_3#Extreme": {
+   "file": "Quest03_3#Extreme.json",
+   "version": 15,
+   "width": 9400,
+   "height": 768,
+   "surfaces": 11706
+  },
+  "Quest03_3#Hard": {
+   "file": "Quest03_3#Hard.json",
+   "version": 15,
+   "width": 9400,
+   "height": 768,
+   "surfaces": 11706
+  },
+  "Quest03_3#Normal": {
+   "file": "Quest03_3#Normal.json",
+   "version": 15,
+   "width": 9400,
+   "height": 768,
+   "surfaces": 11943
+  },
+  "Quest03_5#Easy": {
+   "file": "Quest03_5#Easy.json",
+   "version": 15,
+   "width": 9450,
+   "height": 768,
+   "surfaces": 13192
+  },
+  "Quest03_5#Extreme": {
+   "file": "Quest03_5#Extreme.json",
+   "version": 15,
+   "width": 9450,
+   "height": 768,
+   "surfaces": 13192
+  },
+  "Quest03_5#Hard": {
+   "file": "Quest03_5#Hard.json",
+   "version": 15,
+   "width": 9450,
+   "height": 768,
+   "surfaces": 13192
+  },
+  "Quest03_5#Normal": {
+   "file": "Quest03_5#Normal.json",
+   "version": 15,
+   "width": 9450,
+   "height": 768,
+   "surfaces": 13192
+  },
+  "Quest03_6": {
+   "file": "Quest03_6.json",
+   "version": 15,
+   "width": 1600,
+   "height": 800,
+   "surfaces": 1600
+  },
+  "Quest03_TestCannon": {
+   "file": "Quest03_TestCannon.json",
+   "version": 15,
+   "width": 1600,
+   "height": 800,
+   "surfaces": 1600
+  },
+  "Quest03_TestCannonTower": {
+   "file": "Quest03_TestCannonTower.json",
+   "version": 15,
+   "width": 1600,
+   "height": 800,
+   "surfaces": 1600
+  },
+  "Quest03_TestDamageValue": {
+   "file": "Quest03_TestDamageValue.json",
+   "version": 15,
+   "width": 1600,
+   "height": 800,
+   "surfaces": 1600
+  },
+  "Quest04": {
+   "file": "Quest04.json",
+   "version": 15,
+   "width": 1324,
+   "height": 800,
+   "surfaces": 1325
+  },
+  "Quest05_boss": {
+   "file": "Quest05_boss.json",
+   "version": 15,
+   "width": 1500,
+   "height": 1000,
+   "surfaces": 1500
+  },
+  "Quest05_stage#Easy": {
+   "file": "Quest05_stage#Easy.json",
+   "version": 15,
+   "width": 7324,
+   "height": 1350,
+   "surfaces": 14326
+  },
+  "Quest05_stage#Extreme": {
+   "file": "Quest05_stage#Extreme.json",
+   "version": 18,
+   "width": 7324,
+   "height": 1350,
+   "surfaces": 14361
+  },
+  "Quest05_stage#Hard": {
+   "file": "Quest05_stage#Hard.json",
+   "version": 15,
+   "width": 7324,
+   "height": 1350,
+   "surfaces": 14326
+  },
+  "Quest05_stage#Normal": {
+   "file": "Quest05_stage#Normal.json",
+   "version": 15,
+   "width": 7324,
+   "height": 1350,
+   "surfaces": 14326
+  },
+  "Quest06_Stage#Easy": {
+   "file": "Quest06_Stage#Easy.json",
+   "version": 16,
+   "width": 8254,
+   "height": 850,
+   "surfaces": 9838
+  },
+  "Quest06_Stage#Extreme": {
+   "file": "Quest06_Stage#Extreme.json",
+   "version": 18,
+   "width": 8254,
+   "height": 850,
+   "surfaces": 10282
+  },
+  "Quest06_Stage#Hard": {
+   "file": "Quest06_Stage#Hard.json",
+   "version": 16,
+   "width": 8254,
+   "height": 850,
+   "surfaces": 10277
+  },
+  "Quest06_Stage#Normal": {
+   "file": "Quest06_Stage#Normal.json",
+   "version": 16,
+   "width": 8254,
+   "height": 850,
+   "surfaces": 9828
+  },
+  "Quest06_Stage_ch#Easy": {
+   "file": "Quest06_Stage_ch#Easy.json",
+   "version": 18,
+   "width": 8254,
+   "height": 850,
+   "surfaces": 9846
+  },
+  "Quest06_Stage_ch#Extreme": {
+   "file": "Quest06_Stage_ch#Extreme.json",
+   "version": 18,
+   "width": 8254,
+   "height": 850,
+   "surfaces": 10282
+  },
+  "Quest06_Stage_ch#Hard": {
+   "file": "Quest06_Stage_ch#Hard.json",
+   "version": 18,
+   "width": 8254,
+   "height": 850,
+   "surfaces": 10282
+  },
+  "Quest06_Stage_ch#Normal": {
+   "file": "Quest06_Stage_ch#Normal.json",
+   "version": 18,
+   "width": 8254,
+   "height": 850,
+   "surfaces": 9837
+  },
+  "Quest06_boss": {
+   "file": "Quest06_boss.json",
+   "version": 15,
+   "width": 1500,
+   "height": 1224,
+   "surfaces": 3851
+  },
+  "Quest07_1": {
+   "file": "Quest07_1.json",
+   "version": 18,
+   "width": 1500,
+   "height": 1000,
+   "surfaces": 1500
+  },
+  "Quest07_2": {
+   "file": "Quest07_2.json",
+   "version": 18,
+   "width": 1220,
+   "height": 800,
+   "surfaces": 1220
+  },
+  "Quest07_3": {
+   "file": "Quest07_3.json",
+   "version": 18,
+   "width": 1500,
+   "height": 950,
+   "surfaces": 1457
+  },
+  "Quest07_intro": {
+   "file": "Quest07_intro.json",
+   "version": 18,
+   "width": 1024,
+   "height": 768,
+   "surfaces": 0
+  },
+  "QuestLevel01": {
+   "file": "QuestLevel01.json",
+   "version": 18,
+   "width": 4024,
+   "height": 850,
+   "surfaces": 6843
+  },
+  "QuestLevel02": {
+   "file": "QuestLevel02.json",
+   "version": 18,
+   "width": 3024,
+   "height": 854,
+   "surfaces": 5212
+  },
+  "QuestLevel03": {
+   "file": "QuestLevel03.json",
+   "version": 18,
+   "width": 2924,
+   "height": 924,
+   "surfaces": 4393
+  },
+  "QuestLevel05": {
+   "file": "QuestLevel05.json",
+   "version": 18,
+   "width": 2924,
+   "height": 924,
+   "surfaces": 4393
+  },
+  "QuestLevel06": {
+   "file": "QuestLevel06.json",
+   "version": 18,
+   "width": 4004,
+   "height": 900,
+   "surfaces": 6142
+  },
+  "QuestLevel07": {
+   "file": "QuestLevel07.json",
+   "version": 18,
+   "width": 1024,
+   "height": 2024,
+   "surfaces": 5446
+  },
+  "QuestLevel11": {
+   "file": "QuestLevel11.json",
+   "version": 18,
+   "width": 5024,
+   "height": 850,
+   "surfaces": 7845
+  },
+  "Quest_level6": {
+   "file": "Quest_level6.json",
+   "version": 18,
+   "width": 2848,
+   "height": 1524,
+   "surfaces": 5386
+  },
+  "ReadyRoom": {
+   "file": "ReadyRoom.json",
+   "version": 15,
+   "width": 1024,
+   "height": 768,
+   "surfaces": 1629
+  },
+  "ReadyRoomCN": {
+   "file": "ReadyRoomCN.json",
+   "version": 18,
+   "width": 1024,
+   "height": 768,
+   "surfaces": 1629
+  },
+  "Room": {
+   "file": "Room.json",
+   "version": 7,
+   "width": 1024,
+   "height": 768,
+   "surfaces": 946
+  },
+  "Training_Grenade": {
+   "file": "Training_Grenade.json",
+   "version": 8,
+   "width": 1024,
+   "height": 768,
+   "surfaces": 2633
+  },
+  "Training_MovingShot": {
+   "file": "Training_MovingShot.json",
+   "version": 15,
+   "width": 1024,
+   "height": 768,
+   "surfaces": 1049
+  },
+  "Training_StandingShot": {
+   "file": "Training_StandingShot.json",
+   "version": 8,
+   "width": 1024,
+   "height": 768,
+   "surfaces": 0
+  },
+  "Tutorial_Basic": {
+   "file": "Tutorial_Basic.json",
+   "version": 18,
+   "width": 5000,
+   "height": 1024,
+   "surfaces": 8028
+  },
+  "Tutorial_Casil": {
+   "file": "Tutorial_Casil.json",
+   "version": 15,
+   "width": 4524,
+   "height": 800,
+   "surfaces": 5483
+  },
+  "Tutorial_Mutu": {
+   "file": "Tutorial_Mutu.json",
+   "version": 15,
+   "width": 4000,
+   "height": 1024,
+   "surfaces": 4118
+  },
+  "Tutorial_Proco": {
+   "file": "Tutorial_Proco.json",
+   "version": 15,
+   "width": 4524,
+   "height": 800,
+   "surfaces": 5180
+  },
+  "Tutorial_eli": {
+   "file": "Tutorial_eli.json",
+   "version": 15,
+   "width": 4524,
+   "height": 800,
+   "surfaces": 5225
+  },
+  "Tutorial_jin": {
+   "file": "Tutorial_jin.json",
+   "version": 15,
+   "width": 4524,
+   "height": 800,
+   "surfaces": 7125
+  },
+  "Tutorial_tai": {
+   "file": "Tutorial_tai.json",
+   "version": 15,
+   "width": 4524,
+   "height": 800,
+   "surfaces": 6461
+  },
+  "Untitled": {
+   "file": "Untitled.json",
+   "version": 18,
+   "width": 2500,
+   "height": 1300,
+   "surfaces": 7478
+  },
+  "Untitled01": {
+   "file": "Untitled01.json",
+   "version": 18,
+   "width": 2300,
+   "height": 1300,
+   "surfaces": 6493
+  },
+  "Untitled02": {
+   "file": "Untitled02.json",
+   "version": 18,
+   "width": 2000,
+   "height": 1500,
+   "surfaces": 6781
+  },
+  "Untitled03": {
+   "file": "Untitled03.json",
+   "version": 18,
+   "width": 2600,
+   "height": 1024,
+   "surfaces": 7303
+  },
+  "Untitled04": {
+   "file": "Untitled04.json",
+   "version": 18,
+   "width": 2200,
+   "height": 1200,
+   "surfaces": 6183
+  },
+  "Untitled05": {
+   "file": "Untitled05.json",
+   "version": 18,
+   "width": 2600,
+   "height": 1200,
+   "surfaces": 6976
+  },
+  "Untitled06": {
+   "file": "Untitled06.json",
+   "version": 18,
+   "width": 2000,
+   "height": 1300,
+   "surfaces": 3796
+  },
+  "Untitled07": {
+   "file": "Untitled07.json",
+   "version": 18,
+   "width": 2100,
+   "height": 1200,
+   "surfaces": 4669
+  },
+  "aitest": {
+   "file": "aitest.json",
+   "version": 18,
+   "width": 5200,
+   "height": 950,
+   "surfaces": 11492
+  },
+  "brtest_01": {
+   "file": "brtest_01.json",
+   "version": 18,
+   "width": 3000,
+   "height": 800,
+   "surfaces": 3000
+  },
+  "brtest_01-a": {
+   "file": "brtest_01-a.json",
+   "version": 18,
+   "width": 3000,
+   "height": 800,
+   "surfaces": 3004
+  },
+  "brtest_03": {
+   "file": "brtest_03.json",
+   "version": 18,
+   "width": 1024,
+   "height": 1024,
+   "surfaces": 2353
+  },
+  "brtest_04_es": {
+   "file": "brtest_04_es.json",
+   "version": 18,
+   "width": 2048,
+   "height": 1200,
+   "surfaces": 0
+  },
+  "brtest_04_es2": {
+   "file": "brtest_04_es2.json",
+   "version": 18,
+   "width": 2048,
+   "height": 1200,
+   "surfaces": 0
+  },
+  "brtest_05": {
+   "file": "brtest_05.json",
+   "version": 18,
+   "width": 1024,
+   "height": 1200,
+   "surfaces": 2323
+  },
+  "brtest_06": {
+   "file": "brtest_06.json",
+   "version": 18,
+   "width": 1024,
+   "height": 1200,
+   "surfaces": 1024
+  },
+  "brtest_07": {
+   "file": "brtest_07.json",
+   "version": 18,
+   "width": 1700,
+   "height": 800,
+   "surfaces": 3400
+  },
+  "brtest_08": {
+   "file": "brtest_08.json",
+   "version": 18,
+   "width": 1300,
+   "height": 2000,
+   "surfaces": 1097
+  },
+  "brtest_09": {
+   "file": "brtest_09.json",
+   "version": 18,
+   "width": 1484,
+   "height": 1600,
+   "surfaces": 1202
+  },
+  "ipkn": {
+   "file": "ipkn.json",
+   "version": 15,
+   "width": 1024,
+   "height": 1600,
+   "surfaces": 2550
+  },
+  "newbe": {
+   "file": "newbe.json",
+   "version": 18,
+   "width": 3500,
+   "height": 500,
+   "surfaces": 3728
+  },
+  "newbe2": {
+   "file": "newbe2.json",
+   "version": 18,
+   "width": 3500,
+   "height": 500,
+   "surfaces": 4195
+  },
+  "newbe2-1": {
+   "file": "newbe2-1.json",
+   "version": 18,
+   "width": 3500,
+   "height": 770,
+   "surfaces": 4195
+  },
+  "openroom": {
+   "file": "openroom.json",
+   "version": 18,
+   "width": 2500,
+   "height": 2000,
+   "surfaces": 13779
+  },
+  "s0000": {
+   "file": "s0000.json",
+   "version": 15,
+   "width": 3000,
+   "height": 1000,
+   "surfaces": 5391
+  },
+  "test": {
+   "file": "test.json",
+   "version": 16,
+   "width": 2524,
+   "height": 2524,
+   "surfaces": 8523
+  },
+  "test_a2": {
+   "file": "test_a2.json",
+   "version": 18,
+   "width": 1024,
+   "height": 768,
+   "surfaces": 1024
+  },
+  "test_a3": {
+   "file": "test_a3.json",
+   "version": 18,
+   "width": 1024,
+   "height": 768,
+   "surfaces": 1464
+  },
+  "test_a4": {
+   "file": "test_a4.json",
+   "version": 18,
+   "width": 1024,
+   "height": 768,
+   "surfaces": 1614
+  },
+  "testipkn": {
+   "file": "testipkn.json",
+   "version": 15,
+   "width": 1024,
+   "height": 1600,
+   "surfaces": 2550
+  }
+ },
+ "bases": {
+  "Boss00": [
+   "Boss00#Easy",
+   "Boss00#Extreme",
+   "Boss00#Hard",
+   "Boss00#Normal"
+  ],
+  "Quest02_1": [
+   "Quest02_1#Easy",
+   "Quest02_1#Extreme",
+   "Quest02_1#Hard",
+   "Quest02_1#Normal"
+  ],
+  "Quest02_2": [
+   "Quest02_2#Easy",
+   "Quest02_2#Extreme",
+   "Quest02_2#Hard",
+   "Quest02_2#Normal"
+  ],
+  "Quest03_1": [
+   "Quest03_1#Easy",
+   "Quest03_1#Extreme",
+   "Quest03_1#Hard",
+   "Quest03_1#Normal"
+  ],
+  "Quest03_3": [
+   "Quest03_3#Easy",
+   "Quest03_3#Extreme",
+   "Quest03_3#Hard",
+   "Quest03_3#Normal"
+  ],
+  "Quest03_5": [
+   "Quest03_5#Easy",
+   "Quest03_5#Extreme",
+   "Quest03_5#Hard",
+   "Quest03_5#Normal"
+  ],
+  "Quest05_stage": [
+   "Quest05_stage#Easy",
+   "Quest05_stage#Extreme",
+   "Quest05_stage#Hard",
+   "Quest05_stage#Normal"
+  ],
+  "Quest06_Stage": [
+   "Quest06_Stage#Easy",
+   "Quest06_Stage#Extreme",
+   "Quest06_Stage#Hard",
+   "Quest06_Stage#Normal"
+  ],
+  "Quest06_Stage_ch": [
+   "Quest06_Stage_ch#Easy",
+   "Quest06_Stage_ch#Extreme",
+   "Quest06_Stage_ch#Hard",
+   "Quest06_Stage_ch#Normal"
+  ]
+ }
+}

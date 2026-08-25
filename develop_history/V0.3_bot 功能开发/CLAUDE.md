@@ -112,7 +112,7 @@ V0.3 立三条硬规矩：
 | `re/` | 逆向产物：`BigShot_22524.exe`、`packets.txt`、`rtti_types.txt`、`vftables.json`（机械生成，**别手改**）、★ **`packet_api.md`** |
 | `hook/` | MSVC x86 工程：`bshook.dll`（注入）+ `bsloader.exe`（启动器） |
 | `updater/` | 自研更新器（C 工程），编译产物是 `game_patched\BsPatcherChn.exe` |
-| `server/` | Python 服务端（**单机假服务器和云端服务端是同一套代码**）。★ V0.3 新增 `bot.py` / `botsync.py` / `botai.py` 和 `data/mapdata/` |
+| `server/` | Python 服务端（**单机假服务器和云端服务端是同一套代码**）。★ V0.3 新增 `bot.py` / `botsync.py` / `mapdata.py` / `botai.py` 和 **`bot_mapdata/`**（地形数据产物，进 git、进两个包）。★ `server/data/` **只装用户数据**（`accounts.json` / `tickets.json`，都 `.gitignore`），别往里塞产物（D22） |
 | `runtime/python/` | 内置 CPython 3.14.3 x64 embeddable |
 | `runtime-win7/python/` | **Win7 兼容运行时** CPython 3.8.10 win32。★ 改服务端代码后顺手 `runtime-win7\python\python.exe server\run_tests.py`，别把 3.8 兼容性弄丢 |
 | `runtime-linux/` | 服务端包发给 Linux 的那份 CPython 3.14.7，**故意不解压** |

@@ -31,6 +31,9 @@ $script:ServerExcludePattern = @(
 # 任何地方都不拷的目录/文件名。
 $script:JunkNames = @('__pycache__', '.pytest_cache', '.mypy_cache')
 
+# 地形提取一次构建只跑一次（build-menu 会连着调两个 builder）。
+$script:MapDataUpdated = $false
+
 # ---------------------------------------------------------------------------
 #  基础工具
 # ---------------------------------------------------------------------------
@@ -260,7 +263,8 @@ function Get-ServerSourceFile([string]$Root) {
     foreach ($must in @('app.py', 'config.py', 'gameserver.py', 'authserver.py',
                         'account_store.py', 'netlisten.py', 'tickets.py',
                         'eventlog.py', 'lobby.py', 'relayserver.py', 'protocol.py',
-                        'simple.py', 'udpsync.py', 'bot.py', 'botsync.py')) {
+                        'simple.py', 'udpsync.py', 'bot.py', 'botsync.py',
+                        'mapdata.py')) {
         if ($files -notcontains $must) { throw "server\$must 没被选中，打包脚本的过滤规则坏了" }
     }
     return $files
@@ -301,8 +305,86 @@ function Copy-ServerCode {
         throw "客户端包必须带 server\relay.py（联机模式的本机中继），但它没被选中"
     }
 
+    # `data\` 里只装**用户数据**（accounts.json / tickets.json，运行时才生成），
+    # 所以包里只要一个空目录。地形数据在 `bot_mapdata\`，见下面。
     New-Item -ItemType Directory -Path (Join-Path $dstDir 'data') -Force | Out-Null
+
+    # 地图地形数据（V0.3 M4）：`server\mapdata.py` 读的就是这一堆。
+    # ★ 只拷 *.json —— 目录里如果混进了可视化 PNG 之类的开发产物，不进包。
+    $copied += (Copy-MapData -Root $Root -PackageRoot $PackageRoot)
     return $copied
+}
+
+function Copy-MapData {
+    <# 把 `server\bot_mapdata\` 拷进包（**两个包都要**），并**当场验收**。
+
+       ★ 它不在 `server\data\` 下面：那个目录只装用户数据（accounts.json /
+         tickets.json）。地形数据是随代码走的产物，和 *.py 一样对待。
+
+       ★ 缺了它 bot 就没有地图几何，只能靠回放真人轨迹走（D16）——
+         那是「能动」不是「会找路」。这种缺失在本机完全看不出来，
+         所以照 Get-ServerSourceFile 的风格：明显不对就炸，别打出半个包。 #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$PackageRoot
+    )
+    $srcDir = Join-Path $Root 'server\bot_mapdata'
+    $index  = Join-Path $srcDir 'index.json'
+    if (-not (Test-Path -LiteralPath $index -PathType Leaf)) {
+        throw "缺地图地形数据：$index 不存在。先跑 tools\update-mapdata.bat"
+    }
+    $files = @(Get-ChildItem -LiteralPath $srcDir -Filter '*.json' -File)
+    # 原版一共 174 张图。少一大截说明提取跑了一半或者产物被删过。
+    if ($files.Count -lt 150) {
+        throw "地图地形数据只有 $($files.Count) 个 .json，明显不对，中止打包"
+    }
+    $dstDir = Join-Path $PackageRoot 'server\bot_mapdata'
+    New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
+    $copied = @()
+    foreach ($f in $files) {
+        Copy-One $f.FullName (Join-Path $dstDir $f.Name)
+        $copied += "bot_mapdata\$($f.Name)"
+    }
+    return $copied
+}
+
+function Update-MapData {
+    <# 打包前重跑一次地形提取，让产物和原版 `.map` 保持一致。
+
+       ★ 素材 `Pack_decrypt\` 太大，没进本工作副本（只在 main worktree 里）。
+         **找不到素材不算失败** —— 产物本来就在仓库里，直接用它。
+         但素材在而解析失败，那就是产物要变脏了：**中止打包**。 #>
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    # build-menu 一次构建两个包，两个 builder 各调一次 —— 提取一次就够了。
+    if ($script:MapDataUpdated) { return }
+    $script:MapDataUpdated = $true
+
+    $py = 'C:\Python314\python.exe'
+    if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
+        $py = Join-Path $Root 'runtime\python\python.exe'
+    }
+    $script = Join-Path $Root 'tools\mapdata.py'
+    if (-not (Test-Path -LiteralPath $py -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $script -PathType Leaf)) {
+        Write-Host '        跳过地形提取：没有 Python 或 tools\mapdata.py' -ForegroundColor DarkGray
+        return
+    }
+    $probe = @(
+        (Join-Path $Root 'Pack_decrypt\Maps'),
+        (Join-Path $Root '..\..\main\Pack_decrypt\Maps')
+    )
+    $found = $false
+    foreach ($p in $probe) { if (Test-Path -LiteralPath $p -PathType Container) { $found = $true } }
+    if (-not $found) {
+        Write-Host '        跳过地形提取：这台机器上没有 Pack_decrypt\Maps，用仓库里现成的产物' -ForegroundColor DarkGray
+        return
+    }
+    & $py $script --quiet
+    if ($LASTEXITCODE -ne 0) {
+        throw "地形提取失败（tools\mapdata.py 退出码 $LASTEXITCODE），中止打包"
+    }
+    Write-Host '        地形数据已重新提取' -ForegroundColor DarkGray
 }
 
 function Get-ServerCodeHash([string]$PackageRoot) {

@@ -16,7 +16,7 @@
 | M2 | 开局链路 | bot 跟着进图（站着不动）、会被打死、会复活、进结算、能回房间 | 🟡 代码 + 单测完成，⏳ 等实机 |
 | M3a | bot 会动 | 逆 `UdpPacket` 内层 body，服务端合成心跳 / 跳跃 | 🟡 代码 + 单测完成，⏳ 等实机 |
 | M3b | bot 会开枪 | 逆 `rpFire` 收侧（伤害在哪台算）→ 接上开火 | ⬜ 未开始（D18） |
-| M4 | 地图地形数据 | 逆 `.map`、`tools/mapdata.py` + 一键 bat + 打包钩子 | ⬜ 未开始 |
+| M4 | 地图地形数据 | 逆 `.map`、`tools/mapdata.py` + 一键 bat + 打包钩子 | ✅ **完成**（实机核对通过） |
 | M5 | bot AI | 寻路、追敌 / 跟随、瞄准与遮挡判定、难度旋钮 | ⬜ 未开始 |
 | M6 | 测试 · 兼容 · 收尾 | 单测、Win7(3.8) 绿、文档、打包回归 | ⬜ 未开始 |
 
@@ -124,35 +124,34 @@ base 正常推进，无「打不死人」现象。
 
 ---
 
-## M4 · 地图地形数据（可与 M1~M3 并行）
+## M4 · 地图地形数据（可与 M1~M3 并行）　✅ 完成（会话 06，实机核对通过）
 
-★★ **2026-08-25 会话 02 改写**：原来写的「逆 `.map` 的 v8 / v18 两种布局、
-从里面提取碰撞段」**建立在两个错误前提上**，都已经查实推翻：
+★★ **2026-08-25 会话 06 再次改写**：会话 02 定的「合成地形 PNG 的 alpha」
+也不用做了 —— **`.map` 的尾部本来就烘着一份逐像素碰撞位图 `TerrainData`**
+（§27），客户端自己的碰撞查询读的就是它。M4 改成**直接搬那一份**（D19）。
 
-1. 版本不是 2 种是 **7 种**（v7/8/9/13/15/16/18，§9 已勘误）；
-2. ★ **`.map` 里根本没有碰撞几何**（§18）。一个 `TerrainObj` 只有
-   「位置 + 缩放 + 旋转 + **贴图路径**」，**形状在那张 PNG 的 alpha 通道里**。
+### 做完了什么
 
-**容器格式已经全部逆出来**（§17：19 类循环 + type→类名对照表，174 张全解通），
-所以 M4 剩下的是纯工程活：
+| 东西 | 说明 |
+|---|---|
+| `tools/mapdata.py` | 解 `.map` -> `TerrainData` -> `server/bot_mapdata/`。**只用标准库**（`--verify` 画预览才要 Pillow）。174/174 全解通，约 13 秒 |
+| `tools/update-mapdata.bat` | 一键重跑（提取 + 立刻跑一遍测试）。CRLF + UTF-8 无 BOM |
+| `server/mapdata.py` | 运行时加载器：`cell` / `is_solid`（挡人）/ `blocks_bullet`（挡子弹，★ 两者不同，§29）/ `is_one_way` / `surfaces` / `ground_below` / `line_blocked`，只用标准库，3.8 可跑 |
+| `server/test_mapdata.py` | 25 个用例（合成小图 19 + 真产物 6） |
+| 打包钩子 | `Update-MapData`（有素材必须重跑成功、没素材用仓库产物）+ `Copy-MapData`（产物缺失或少于 150 个就中止打包）—— D21 |
 
-- 解 `.map` -> `TerrainObj` 列表（贴图路径 + x/y + 缩放（负=镜像）+ 旋转）；
-- 读 PNG 的 alpha -> 实心掩码，按变换合成一张地图大小的位图；
-- 从位图里抽**站立面**（每列实心区的上沿）和**弹道遮挡体**。别贪多。
+**产物**：`server/bot_mapdata/index.json` + 每张图一个 `.json`，合计 **2.4 MB**。
+每张图里存：`cells`（原样的 2bit/像素位图，zlib+base64）、
+`ground_counts` / `ground_ys`（每一列的站立面 y）、`points`（出生 / 重生 / 刷怪区）。
 
-★ 开发机上 Pillow 已装，`tools/mapdata.py` 可以用；但**产物必须是纯数据**，
-服务端运行时绝不能依赖 Pillow（便携运行时里没有）。
-- `tools/mapdata.py`：批量解析 → `server/data/mapdata/`。
-  带 `--verify` 输出可视化 PNG，人工核对几张。
-- `tools/update-mapdata.bat`（**CRLF + UTF-8 无 BOM**）：一键重跑。
-- 打包接入：`tools/build-common.ps1` 的 `Copy-ServerCode` 加拷 `server/data/mapdata/`；
-  `build-menu.ps1` / `build-portable.ps1` / `build-server-package.ps1` 打包前自动跑一次，
-  **产物缺失或解析失败就中止打包**（照 `Get-ServerSourceFile`「明显不对就炸」的风格）。
+### 验收结果
 
-### 验收
-
-174 张全部解析成功；抽 3~5 张（含对战图和闯关图）导出可视化，地面线和游戏里目视一致；
-`tools/build.bat` 跑一遍，产物里有 mapdata。
+- ✅ **174 张全部解析成功**；
+- ✅ **可视化人工核对通过**（用户 2026-08-26：「像」）—— 坐标系 / 位序 / y 轴方向都对；
+- ✅ 值 1 的语义查清了：**单向平台**，挡人不挡子弹（§29）。
+  `server/mapdata.py` 拆成 `is_solid()` / `blocks_bullet()` 两个判据；
+- ⏳ **`tools\build.bat` 的整包回归还没跑**（打包函数已单独验过）—— 归 M6。
+- 🅿️ 破坏物碎掉之后网格会变，产物存的是初始态（D19 里写了为什么可接受）。
 
 ---
 
