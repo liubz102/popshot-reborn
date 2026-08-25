@@ -7,6 +7,7 @@
 
 依据全部在 `.claude/FINDINGS.md` §137~§142。
 """
+import collections
 import os
 import struct
 import sys
@@ -143,6 +144,9 @@ def make_conn(username):
     conn.peer_order = gameserver.udpsync.HeartbeatOrder()
     conn.peer_lock = threading.RLock()
     conn.peer_order_epoch = None
+    # 心跳里那个角色位置的采样轨迹（V0.3 M3）——`forward_peer_data` 每发都记。
+    conn.sync_trail = collections.deque(maxlen=gameserver.SYNC_TRAIL_POINTS)
+    conn.sync_jumped = 0
     conn.login_ticket = ""
     conn.peer_report_at = 0.0
     return conn

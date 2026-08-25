@@ -14,6 +14,7 @@ V0.1 的单人行为由 `test_gameserver.py` 钉着（那些用例一条都不�
 依据：`.claude/FINDINGS.md` §161（每个包为什么广播出去是安全的、
 客户端拿什么 id 找目标）、§112 / §116（结算界面那几格的来源）。
 """
+import collections
 import os
 import struct
 import sys
@@ -166,6 +167,9 @@ def make_conn(username, accounts=None):
     conn.peer_order = gameserver.udpsync.HeartbeatOrder()
     conn.peer_lock = threading.RLock()
     conn.peer_order_epoch = None
+    # 心跳里那个角色位置的采样轨迹（V0.3 M3）——`forward_peer_data` 每发都记。
+    conn.sync_trail = collections.deque(maxlen=gameserver.SYNC_TRAIL_POINTS)
+    conn.sync_jumped = 0
     conn.login_ticket = ""
     conn.peer_report_at = 0.0
     return conn

@@ -41,6 +41,7 @@ gameserver.py —— 假游戏服（阶段 5 里程碑 B），监听 127.0.0.1:2
     python server/gameserver.py --version-result 1
 """
 import argparse
+import collections
 import contextlib
 import datetime
 import os
@@ -3074,6 +3075,26 @@ RESPAWN_WATCHDOG_S = 8.0
 #: 取 5.0 而不是 8.0，bot 才和真人同一个节奏站起来。
 BOT_RESPAWN_DELAY_S = 5.0
 
+#: ★ 每条连接留几个**位置采样点**（`Conn.sync_trail` 的容量，V0.3 M3）。
+#:
+#: 位置只在心跳（内层 `0x4001`）的 body `+7..10` 里，战斗中 ~8 Hz。
+#: 64 个点 ≈ 8 秒的路径 —— 够房里 5 个 bot 各跟一段还有余量
+#: （bot 是**回放真人走过的点**来决定自己站哪的，V0.3 D16）。
+#: 这是个缓冲区容量，不是判据阈值。
+SYNC_TRAIL_POINTS = 64
+
+#: `UdpPacket` 的内层 `0x0006 rpJump`（body = 座位号 + 第几段跳，V0.3 §23）。
+#: 这里只用来把「他起跳了」记进位置轨迹，组包在 `botsync.py`。
+PEER_OP_JUMP = 0x0006
+
+#: ★ `bot.py` 在 import 时把 `bot.tick_room` 挂到这儿（§14 的导入方向：
+#: `gameserver` **不许** import `bot`，只能反过来）。
+#:
+#: `app.py` 启动时有一发显式 `import bot`，所以真服务端里它一定装上了；
+#: 没装（只 import 了 `gameserver` 的场合，比如某些老单测）时这里是 `None`，
+#: `_relay_battle_tick` 判空跳过，行为等同于「房里没有 bot」。
+BOT_ROOM_TICK = None
+
 
 def pvp_score_limit(player_count, team_mode):
     """这一局要拿几分（几个人头）才算赢。抄自 `0x55be71`（§167）。
@@ -4134,6 +4155,30 @@ def room_generation(room, kind=None):
     return room.advance_generation(kind, relayserver.next_generation)
 
 
+def reset_sync_trails(room, why):
+    """把房里每个人的位置轨迹作废（V0.3 M3）。
+
+    **换图和开新一局各调一次** —— 坐标只在一张图之内有意义，上一张图的点
+    放到新图上就是一个随机位置。bot 的落脚点是照着这条轨迹回放的（D16），
+    不清的话它换图后会先在墙里 / 图外闪一下。
+
+    ★ 顺手把 bot 自己那份帧状态也清掉：它上一张图的落脚点同样作废了。
+    """
+    for seat in room.seats:
+        conn = None if seat is None else seat.conn
+        if conn is None:
+            continue
+        trail = getattr(conn, "sync_trail", None)
+        if trail:
+            trail.clear()
+        conn.sync_jumped = 0
+        # bot 那一份（`bot.BotConn` 才有；真人身上没有这两个字段）。
+        if conn.is_bot_conn():
+            conn.battle_pos = None
+            conn.last_frame_at = None
+    return why
+
+
 def _relay_generation_of(game_conn):
     """`RelayServer` 的补锚回调：这条连接当前房间的代号（不在房间里就 None）。
 
@@ -4172,9 +4217,26 @@ def _relay_battle_tick(game_conn):
     ★ 排在最后的两件事都**不许**把同步转发带崩：`deliver()` 已经把本函数
     整个包在 try 里（见 `RelayServer.deliver`），这里不再另加一层。
     """
+    # ★★ bot 自己合成的那一发**不驱动这里的任何东西**（V0.3 M3 / D17）。
+    #
+    #   两个理由，缺一条都不行：
+    #   1. 再驱动一轮 bot 帧就是**无限递归**：
+    #      `tick_room` -> `deliver()` -> 本回调 -> `tick_room` -> …
+    #   2. 下面三件房间级判断本来就该由**真人的 8 Hz 同步流**驱动。让 bot
+    #      也来敲一遍，等于房里每多一个 bot 就多一倍的节拍 —— 它们眼下都是
+    #      按截止时间幂等的，但那是运气，不是设计。
+    #
+    #   判据是「这一发是谁发的」这个结构性事实，不是计数器、也不是时间窗。
+    if game_conn.is_bot_conn():
+        return
     game_conn.check_pvp_finished()
     game_conn.maybe_spawn_item()
     game_conn.check_respawn_watchdog()
+    # ★ 房里的 bot 各走一帧。**挂在这儿是有意的**：「真人正在打」这件事
+    #   本身就是一串 8 Hz 的事件流，服务端手上就有，不需要另起定时器线程
+    #   （铁律 10）。真人全卡住 / 全在加载时 bot 跟着停 —— 那正是想要的。
+    if BOT_ROOM_TICK is not None:
+        BOT_ROOM_TICK(game_conn)
 
 
 #: 全进程唯一的原版 TCP 中继（里程碑 J.3 / D078）。和 `LOBBY` 同一个理由做成
@@ -4349,6 +4411,12 @@ class Conn:
     # 版本门禁的两个状态同理（见 __init__ 里的说明）。
     client_version = None
     version_rejected = False
+    # ★ 位置轨迹同理，但它是**每条连接一份的可变对象** —— 类上放一个共享的
+    #   deque 会让所有实例往同一条轨迹里写。所以类级默认放一个空元组当哨兵，
+    #   `note_sync_position()` 碰到它时现建一个（只有 `Conn.__new__` 造的
+    #   测试夹具会走到这一步，正常连接在 `__init__` 里就建好了）。
+    sync_trail = ()
+    sync_jumped = 0
 
     def __init__(self, sock, addr, args, accounts=None, tickets=None):
         global _seq
@@ -4455,6 +4523,15 @@ class Conn:
         # 合适的；正式重生走 0x0413 -> 0x0419 的回显，用不着它（§112 勘误：
         # 这个包不是「位置同步」，只是它的第 2、3 个 dword 确实是坐标）。
         self.last_position = None
+        # ★ 心跳（内层 0x4001）里那个**角色位置**的采样轨迹（V0.3 M3）。
+        #   位置只在心跳 body `+7..10` 里，别的包都没有 —— 这是服务端唯一
+        #   知道「谁现在站在哪」的地方。bot 的落脚点靠它（服务端一点地图
+        #   几何都没有，真人刚站过的点一定是合法地面，V0.3 D16），
+        #   M5 的瞄准也要靠它。每项是 `(x, y, 这一段里起没起跳)`。
+        self.sync_trail = collections.deque(maxlen=SYNC_TRAIL_POINTS)
+        # 上一发心跳之后收到过的 rpJump 段数（0 = 没跳）。下一发心跳把它
+        # 记进轨迹点，bot 回放到那儿时就跟着跳一下。
+        self.sync_jumped = 0
         # 本局关卡的状态**不在房间里时**用的那一份（协议试探 / 控制通道手搓包）。
         # 在房间里时用的是 `lobby.Room.quest`，见 `quest_state()`。
         self.solo_quest = RoomQuest()
@@ -5551,6 +5628,18 @@ class Conn:
             return None
         return room.seat_index_of(self)
 
+    def is_bot_conn(self):
+        """这条连接**本身**是不是一个 bot 的假连接（`bot.BotConn` 覆盖成 True）。
+
+        ★ 为什么不是 `isinstance(conn, bot.BotConn)`：`gameserver` 不许
+        import `bot`（§14 的导入方向是单向的，反过来就是循环导入）。
+        问对象自己是这种情况下唯一干净的写法。
+
+        和 `is_bot_seat(seat)` 的分工：那个问的是**大厅座位表**里某一格
+        坐的是谁，这个问的是**手上这条连接**是什么。
+        """
+        return False
+
     def is_bot_seat(self, seat):
         """`seat` 这一格坐的是不是 bot。不在房间 / 座位空着都是 ``False``。
 
@@ -5868,6 +5957,12 @@ class Conn:
         #   `begin_map_change` 刚把 `map_loaded` 清空，而房里至少有一个真人，
         #   他的 `0x0412` 还在路上。
         room = self.lobby_room()
+        # ★★ 位置轨迹**必须跟着换图作废**（V0.3 M3）：上一张图的坐标放到
+        #   新图上就是一个随机点。不清的话 bot 换图后会先在墙里 / 图外闪一下，
+        #   直到轨迹被新图的采样点顶完为止。判据是「换图广播出去了」这个
+        #   事件本身，和 D4 同一处。
+        if room is not None:
+            reset_sync_trails(room, "换图")
         bots = room.bot_members() if room is not None else []
         if bots:
             members = self.battle_members()
@@ -6678,6 +6773,9 @@ class Conn:
             # 客户端就是在进 stage 7 的路上建它的。
             room.quest = RoomQuest(seats=[i for i, seat in enumerate(room.seats)
                                           if seat is not None])
+            # ★ 位置轨迹跟着新局作废 —— 上一局的坐标（可能还是另一张图上的）
+            #   放到这一局是个随机点，bot 会照着它站过去（V0.3 M3）。
+            reset_sync_trails(room, "新一局开始")
             # 「准备好了」跟着客户端一起清 —— 它进 stage 6 时自己清了一遍
             # （`LoadingStage` 构造函数，§165）。不跟着清就会两边不一致。
             room.clear_ready()
@@ -7043,6 +7141,34 @@ class Conn:
                 self.peer_order.note_event(udpsync.peer_sequence(payload))
             self.forward_peer_data(payload, arrived)
 
+    def note_sync_position(self, payload):
+        """把这一发同步数据里的**位置**记进轨迹（V0.3 M3）。
+
+        两种包各记一半：
+
+        * **心跳**（内层 `0x4001`）：body `+7..10` 就是角色坐标（两个 i16，
+          `0x5041e1` 把它们写回 `[char+0x34]` / `[char+0x38]`）。记一个点。
+        * **`rpJump`**（内层 `0x0006`）：它本身不带坐标，只说「起跳了，第几段」。
+          先攒着，下一发心跳把它记进那个点 —— bot 回放到那一段时就跟着跳，
+          跳跃的抛物线因此是**真人真跳出来的**，不用服务端算重力。
+
+        ★ 只记事实，不做判断。要不要跟、跟多远是 `bot.py` 的事。
+        """
+        opcode = udpsync.peer_opcode(payload)
+        if opcode == PEER_OP_JUMP:
+            if len(payload) >= udpsync.PEER_HEADER_SIZE + 2:
+                self.sync_jumped = payload[udpsync.PEER_HEADER_SIZE + 1]
+            return
+        position = udpsync.heartbeat_position(payload)
+        if position is None:
+            return
+        trail = self.sync_trail
+        if not isinstance(trail, collections.deque):    # 见类级默认值的说明
+            trail = self.sync_trail = collections.deque(
+                maxlen=SYNC_TRAIL_POINTS)
+        trail.append((position[0], position[1], self.sync_jumped))
+        self.sync_jumped = 0
+
     def sync_peer_epoch(self, payload):
         """局号一变就把排序闸门里的**事件计数**归零（`udpsync` 铁律 3）。
 
@@ -7084,6 +7210,11 @@ class Conn:
         「每帧问一次」），所以它**只能在去重之后被调一次** —— UDP 和 TCP
         各调一次的话，对战计时和道具刷新都会变成两倍速。
         """
+        # ★ 位置采样：**唯一**能知道「谁站在哪」的地方就是心跳 body `+7..10`
+        #   （V0.3 §24 / §25）。记一条短轨迹，bot 靠回放它决定自己站哪
+        #   （服务端没有任何地图几何，真人刚站过的点一定是合法地面，D16），
+        #   M5 的瞄准也要用它。开销 = 一次定长 unpack，可以忽略。
+        self.note_sync_position(payload)
         # ★ 走 `PEER_RELAY.deliver` 而不是直接广播 `0x040f`：房里可能有人已经
         #   接上原版中继了，那些人要走中继收（原版路径），剩下的才走 `0x040f`。
         #   两条路在客户端进的是同一个入口 `0x407869`，谁收哪条都一样。

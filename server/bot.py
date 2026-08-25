@@ -11,13 +11,26 @@
   `broadcast_seat_leave` / `send_system_chat` / `broadcast_system_chat`）。
   这里一个 `struct.pack` 都不写 —— 线格式的考据全在 `gameserver.py` 里，
   再抄一份迟早两边长歪（CLAUDE.md 铁律 8 的道理）。
+  战斗中那份同步数据的线格式在 `botsync.py`，同一个道理。
 - **bot 的每座位状态直接住在 `lobby.Seat` 里**（昵称 / 角色 / 队伍 / 准备
   + 新加的 `is_bot`），不另立一份 bot 座位表（D9）。
+  只属于「它那台机器」的状态（同步流、落脚点、朝向）住在 `BotConn` 上。
+
+## 战斗中（M3）
+
+`tick_room()` 是 bot 的**帧循环**，由房里真人的同步包到达驱动
+（`gameserver._relay_battle_tick` -> `BOT_ROOM_TICK`，D17）。
+每一帧算出落脚点，交给 `BotConn.sync`（`botsync.BotSyncStream`）合成
+`UdpPacket`，再走现成的 `relayserver.deliver()` 投出去。
+
+★ 落脚点是**回放真人走过的轨迹**（D16）：服务端一点地图几何都没有
+（M4 才有），真人刚站过的点一定是合法地面，连跳跃的抛物线都是现成的。
 
 ## 导入方向（★ 别反过来）
 
 `bot.py` **可以** `import gameserver`（`BotConn` 要拿 `Conn` 当基类）；
-`gameserver.py` 反过来只在 `on_chat()` 里**函数内**惰性 `import bot`。
+`gameserver.py` 反过来只在 `on_chat()` 里**函数内**惰性 `import bot`，
+战斗帧那条路则靠本模块 import 时把 `tick_room` 挂到 `gameserver.BOT_ROOM_TICK`。
 两边都写成模块级 import 就是循环导入 —— `class BotConn(gameserver.Conn)`
 会在 `gameserver` 才执行到一半、`Conn` 还没定义的时候炸掉。
 
@@ -26,16 +39,21 @@
 - D1 —— 为什么是「假连接对象」而不是 `Seat.conn = None`；
 - D2 —— 房主迁移为什么跳过 bot 座；
 - D6 —— `/char N M` 的 M 为什么是面板序号 1..14 而不是原始角色 id；
-- D7 —— bot 占座时真人为什么照常被「房间已满」挡住。
+- D7 —— bot 占座时真人为什么照常被「房间已满」挡住；
+- D16 —— bot 的落脚点为什么是「回放真人的轨迹」而不是自己算；
+- D17 —— bot 的帧为什么由真人的同步包驱动，而不是定时器线程。
 """
 from __future__ import annotations
 
+import collections
 import contextlib
+import math
 import threading
 import time
 
 from account_store import BASE_CHARACTER_IDS, MINIMUM_PLAYER_LEVEL, \
     PREMIUM_CHARACTER_IDS
+import botsync
 import gameserver
 import lobby as lobby_module
 import relayserver
@@ -193,6 +211,10 @@ class BotConn(gameserver.Conn):
         self.channel_code = 0
         self.channel_index = 0
         self.last_position = None
+        # bot 从来不发同步数据给我们，这两个恒空 —— 补上只是为了让 `Conn`
+        # 那边任何一个「所有成员都跑一遍」的循环碰到 bot 时不会 AttributeError。
+        self.sync_trail = collections.deque(maxlen=gameserver.SYNC_TRAIL_POINTS)
+        self.sync_jumped = 0
         self.solo_quest = gameserver.RoomQuest()
         self.items_created = 0
         self.items_picked = 0
@@ -203,6 +225,17 @@ class BotConn(gameserver.Conn):
         self.send_queue = None
         self.batch_delay_ms = 0
         self.connected_at = time.monotonic()
+        # -- 只属于 bot 的机器状态（D9）--------------------------------------
+        #: 这个 bot 的同步流（M3）：序号记账 + 组包，见 `botsync.py`。
+        self.sync = botsync.BotSyncStream(self)
+        #: 战斗中的落脚点 `(x, y)`，None = 还不知道自己站在哪。
+        #: ★ 服务端一点地图几何都没有（M4 才有），所以这个锚点是**跟着真人
+        #:   走**的 —— 真人此刻站着的地方一定是合法地面（D16）。
+        self.battle_pos = None
+        #: 现在朝哪走：`+1` 右 / `-1` 左。
+        self.heading = botsync.FACING_RIGHT
+        #: 上一帧的时刻（`time.monotonic()`），用来把位移算成 `速度 × dt`。
+        self.last_frame_at = None
         # ★ **不调 `register_conn()`**：`_conns` 是「在线的真人」表。
         #   进去的话 `latest_conn()`（控制通道不指定账号时的默认目标）
         #   随时可能变成一个 bot，`tools/gs_ctl.py` 就对着空气发命令了。
@@ -210,14 +243,28 @@ class BotConn(gameserver.Conn):
     def __repr__(self):
         return f"<BotConn {self.nickname} 座位 {self.my_seat}>"
 
+    def is_bot_conn(self):
+        """★ `gameserver` 认 bot 的**唯一**入口（它 import 不了本模块，§14）。"""
+        return True
+
     # -- 发送：全部空操作 ---------------------------------------------------
     def send(self, plain):
-        """空操作。bot 没有客户端，字节发出去也没人解。
+        """空操作 —— 只留下**换代模型**那一步。
 
         ★ 返回而不是抛异常：`battle_broadcast()` / `broadcast()` 会对房里
         每一个成员调它，抛异常等于让 bot 的存在弄坏真人的广播。
+
+        ★★ **但 `note_epoch_from_frame()` 必须照跑**（V0.3 §26）：
+        局号是收包队列的**纪元号**，`0x0400` / `0x0403` 每发出一次，房里
+        每个人的号就 +1。真人那一份是在 `Conn.send()` 里跟着字节走的
+        —— bot 收到的是**同一串字节**，所以在同一个地方跟一格，两边永远同代。
+
+        不跟的话：真人进了「战斗代」，bot 还停在「房间代」，
+        `relayserver.deliver()` 判成**跨代**，bot 的同步包一发都投不出去
+        —— 症状是「bot 在别人屏幕上一动不动」，和「包压根没合成出来」
+        长得一模一样。第二局尤其明显（第一局还能靠 `_epoch_of` 的补锚兜住）。
         """
-        return
+        self.note_epoch_from_frame(plain)
 
     @contextlib.contextmanager
     def send_batch(self, reason=""):
@@ -352,6 +399,22 @@ def _team_balance_warning(room):
     return f"⚠ 两队人数不等（{a} : {b}），客户端不会让开局，请再调整一下。"
 
 
+def _align_epoch(machine, room):
+    """把新 bot 的换代模型对齐到房间当前这一代（D138 对 bot 的等价物）。
+
+    真人是靠进房那一发 `0x0303 gspSession` 的包尾 u16 对上的
+    —— 那是原版留给服务端的唯一一个「说几就是几」的入口（`0x556ed1`）。
+    bot 收不到任何包，所以这里直接把模型设成同一个数。
+
+    ★ 不对齐会怎样：局号停在 -1，而房里真人已经是 `room.epoch_value`。
+    同一代里编号不同 `deliver()` 会按收件人重新盖章，功能上还能转发，
+    但每一对收发都会刷一行「同代改写局号 …… ★ 开局前的强制对齐正常时
+    不该出现这一行」的警告 —— 把一条真的诊断信道用成噪声，比多写三行贵。
+    """
+    relayserver.epoch_state(machine).assign(
+        room.epoch_value, gameserver.room_generation(room))
+
+
 def _cmd_bot(conn, room, args):
     """`/bot` —— 最小空座加一个 bot。"""
     index = room.free_seat()
@@ -362,6 +425,7 @@ def _cmd_bot(conn, room, args):
     index = gameserver.LOBBY.add_bot(room, seat)
     if index is None:                      # 拿锁那一刻被别人坐满了
         return "房间刚好被坐满了，没加上。"
+    _align_epoch(machine, room)
     conn.log(f"   /bot: 座位 {index} 加入 {seat.nickname}"
              f"（角色 {seat.character_id} 队伍 {seat.team}）")
     conn.online(f"房间 + bot 房间 #{room.room_id} 座位={index} "
@@ -508,6 +572,189 @@ COMMANDS = {
 #: 改房间状态的命令 —— 游戏中一律拒绝。`/help` 不在里面，随时能看。
 #: `team` 也不在里面：它只是一行「请改用 /tm」的提示，什么都不改。
 MUTATING_COMMANDS = ("bot", "del", "char", "tm", "ready")
+
+
+# ----------------------------------------------------------------------------
+# 战斗中：让 bot 在别人屏幕上动起来（M3）
+# ----------------------------------------------------------------------------
+#: 两发心跳之间隔多久（秒）。
+#:
+#: ★★ **这是铁律 10 的合法例外，理由和 D13（重生 5 秒）同一条**：位置采样率
+#: 是个**物理量**，服务端这边根本没有事件可等 —— bot 没有客户端，也就没有
+#: 帧循环会「到点了通知我们一声」。数也不是从某台机器上观测来的，是**抄真
+#: 客户端自己那个节奏**（V0.2 §187 实测战斗中 ~8 Hz）。
+#:
+#: ★ 发快了没有正确性问题（心跳可丢、无序号），只是白烧带宽；发慢了角色会
+#: 一顿一顿 —— 收方每收一发只把坐标插值 40%（`0x50422e`，见 `botsync`）。
+BOT_FRAME_INTERVAL_S = 0.125
+
+#: bot 跟在真人**多远**的后面（游戏内坐标单位）。
+#:
+#: 房里有多个 bot 时按座位次序排队（第 N 个 bot 跟 N 倍远），免得几个 bot
+#: 叠在同一个点上变成一个人。
+BOT_FOLLOW_DISTANCE = 120.0
+
+
+def _followable_humans(room):
+    """房里**报过位置**的真人。没有一个就返回空表。
+
+    ★ 判据是「他的心跳到过服务端」这个事实，不是「他在座」——
+    还在加载、或者中继刚断的人，位置是不可信的。
+    """
+    out = []
+    for index in room.human_seats():
+        seat = room.seats[index]
+        conn = None if seat is None else seat.conn
+        if conn is not None and getattr(conn, "sync_trail", None):
+            out.append(conn)
+    return out
+
+
+def _follow_target(room, machine):
+    """这个 bot 该跟谁：离它最近的真人；它还不知道自己在哪就跟座位号最小的。"""
+    humans = _followable_humans(room)
+    if not humans:
+        return None
+    if machine.battle_pos is None:
+        return humans[0]
+    x, y = machine.battle_pos
+
+    def distance(conn):
+        hx, hy = conn.sync_trail[-1][:2]
+        return (hx - x) ** 2 + (hy - y) ** 2
+
+    return min(humans, key=distance)
+
+
+def trail_point(trail, distance):
+    """沿着 `trail` 往回走 `distance`，返回落脚的那个采样点。
+
+    返回 `(x, y, 真人**在这一点**起没起跳)`。轨迹比 `distance` 短就返回最老
+    的那点（bot 刚进图、真人还没走几步时就是这种情况）。
+
+    ★ 为什么是「回放真人走过的点」而不是「自己算一条路」：服务端**一点地图
+    几何都没有**（M4 才有）。真人刚刚站过的地方一定是合法地面，照着踩就不会
+    掉进地形里、也不会飘在半空 —— 连跳跃的抛物线都是现成的（D16）。
+
+    ⚠ 起跳标记只看**落脚的那一点自己**，不把走过的那一段 OR 起来 ——
+    OR 的话真人一起跳、还在 120 之外的 bot 就立刻跟着跳，比它走到那儿早
+    一秒多。代价是 bot 一帧跨过两个采样点时会漏掉中间那一跳；两边都是
+    ~8 Hz，实际上是一帧一个点，漏掉也只是少播一次动画，位置仍然是对的。
+    """
+    points = list(trail)
+    if not points:
+        return None
+    walked = 0.0
+    index = len(points) - 1
+    while index > 0 and walked < distance:
+        x0, y0 = points[index - 1][0], points[index - 1][1]
+        x1, y1 = points[index][0], points[index][1]
+        walked += math.hypot(x1 - x0, y1 - y0)
+        index -= 1
+    x, y, jumped = points[index][0], points[index][1], points[index][2]
+    return (x, y, jumped)
+
+
+def _tick_bot(room, machine, seat_index, now):
+    """一个 bot 走一帧：算落脚点 -> 发心跳（必要时补一发 `rpJump`）。"""
+    if machine.sync.broken:
+        return
+    quest = room.quest
+    if quest is not None and seat_index in quest.respawn_due:
+        # 躺在地上等重生的这几秒里不发心跳 —— 真人死了也不发。
+        return
+    last = machine.last_frame_at
+    if last is not None and now - last < BOT_FRAME_INTERVAL_S:
+        # ★ 采样率限流，不是「等一等再说」的竞态阈值（见 BOT_FRAME_INTERVAL_S）。
+        return
+
+    leader = _follow_target(room, machine)
+    if leader is None:
+        # 房里还没有任何真人报过位置 ⇒ 我们**不知道**地图上哪里能站。
+        # 这时候一发都不发：与其把 bot 摆到一个可能在地形里 / 图外的点上，
+        # 不如让客户端按自己加载出来的出生点继续画着（D16）。
+        return
+    rank = room.bot_seats().index(seat_index) + 1
+    point = trail_point(leader.sync_trail, BOT_FOLLOW_DISTANCE * rank)
+    if point is None:
+        return
+    x, y, jumped = point
+
+    previous = machine.battle_pos
+    machine.battle_pos = (x, y)
+    machine.last_frame_at = now
+    step_x = step_y = 0.0
+    if previous is not None:
+        step_x, step_y = x - previous[0], y - previous[1]
+        if step_x:
+            machine.heading = (botsync.FACING_RIGHT if step_x > 0
+                               else botsync.FACING_LEFT)
+
+    # ★ 起跳**按状态翻转去重**：只有「这一帧真的踏上了一个新的采样点」才补
+    #   `rpJump`（铁律 10 说的那种去重口径）。不去重的话，真人跳完站着不动
+    #   期间轨迹不推进，bot 会每一帧都发一发 `rpJump` —— 那是**事件包**，
+    #   每发都要吃掉一个可靠序号，动画上还会一直抽。
+    landed_on_a_new_point = previous is not None and (x, y) != previous
+    try:
+        if jumped and landed_on_a_new_point:
+            # ★ 事件包（内层 < 0x4000）：序号必须严格连续，所以它和心跳里的
+            #   N 是同一本账，全在 `BotSyncStream` 里记（D5）。
+            _emit(machine, machine.sync.event(
+                botsync.OP_JUMP, botsync.jump_body(seat_index, jumped)))
+        state = botsync.character_state(
+            x, y,
+            vx=step_x / botsync.VELOCITY_PER_STEP,
+            vy=step_y / botsync.VELOCITY_PER_STEP,
+            facing=machine.heading)
+        _emit(machine, machine.sync.heartbeat(state))
+    except botsync.SyncInvariantError as error:
+        # ★ 不变式炸了：把**这一个 bot** 的流停掉，别的人一点不受影响（D1）。
+        #   继续发只会把收方的收包队列越弄越乱，而「bot 不动」是个看得见的故障。
+        machine.sync.broken = True
+        machine.log(f"   ★★ 同步流不变式被破坏，已停掉这个 bot 的同步: {error}")
+
+
+def _emit(machine, packet):
+    """把一份合成好的 `UdpPacket` 交给现成的投递路（**不新增第二条**）。"""
+    return machine.sync.deliver(packet, gameserver.PEER_RELAY.deliver)
+
+
+def tick_room(sender):
+    """房里每个 bot 走一帧。**由真人的同步包到达驱动**（D17）。
+
+    `sender` 是刚刚发来同步数据的那条真人连接 —— `gameserver` 在
+    `_relay_battle_tick()` 里调本函数，而那个回调挂在 `RelayServer.deliver()`
+    上，是原版中继和 `0x040f` 两条路唯一的汇合点（§160）。
+
+    ★ 为什么不起一个定时器线程：房间**只有在真人真的在打**的时候才需要 bot
+    动，而「真人在打」这件事本身就是一串 8 Hz 的事件流，服务端手上就有。
+    真人全都卡住 / 全都在加载时 bot 跟着停，这正是想要的行为。
+
+    ★ 抛出去的异常一律吞掉：本函数是在**真人的转发路径**上跑的，
+    bot 出问题不能连累真人的同步（D1）。
+    """
+    room = sender.lobby_room()
+    if room is None or not room.is_playing():
+        return
+    now = time.monotonic()
+    for index in room.bot_seats():
+        seat = room.seats[index]
+        machine = None if seat is None else seat.conn
+        if not isinstance(machine, BotConn):
+            continue
+        try:
+            _tick_bot(room, machine, index, now)
+        except Exception as error:          # noqa: BLE001 —— 见 docstring
+            machine.sync.broken = True
+            machine.log(f"   ⚠ bot 帧出错，已停掉它的同步: {error!r}")
+
+
+#: ★ 把驱动挂进 `gameserver`（§14 的导入方向：`gameserver` 不许 import 本模块）。
+#:
+#: `app.py` 启动时有一发显式 `import bot`，所以真服务端里这个钩子一定装上；
+#: 单测里 `import bot` 同样会装。没装（有人只 import 了 `gameserver`）时
+#: `_relay_battle_tick` 那边是 `None` 判空，行为退回「房里没有 bot」。
+gameserver.BOT_ROOM_TICK = tick_room
 
 
 def handle_command(conn, text):

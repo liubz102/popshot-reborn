@@ -161,6 +161,15 @@ PEER_SEQUENCE_OFFSET = 8
 #: 心跳的内层 opcode。**当前唯一允许走 UDP 的东西。**
 OPCODE_HEARTBEAT = 0x4001
 
+#: 心跳 body 里那 24 字节「角色状态结构」的起点（body `+7`，V0.3 §24）。
+PEER_HEARTBEAT_STATE_OFFSET = PEER_HEADER_SIZE + 7
+#: 角色位置（结构 `+0x00` / `+0x02`，两个 **i16**）= body `+7..10`。
+#:
+#: ⚠ 早先 V0.3 §3 猜的是 body `+25..28`，**那是错的**（§24 有两条独立证据：
+#: 反序列化器 `0x5041e1` 把结构 `+0`/`+2` 写进 `[char+0x34]`/`[char+0x38]`，
+#: 而 `+25..28` 是**准星的屏幕坐标**，写进 `[char+0x680]`/`[0x684]`，V0.3 §25）。
+PEER_HEARTBEAT_POS = struct.Struct("<hh")
+
 #: 一个 UDP 数据报最大多长。位置包 43 字节 + 我们 8 字节头 + 每份 6 字节，
 #: 捎带满 4 份也才 ~260 字节 —— 1400 是留给「以后想多带点」的余量，
 #: 同时保证永远不会被 IP 分片（分片一丢就是整报丢，等于白做冗余）。
@@ -343,6 +352,27 @@ def heartbeat_next_event_seq(udp_packet):
     if len(udp_packet) < end:
         return None
     return int.from_bytes(udp_packet[PEER_HEARTBEAT_N_OFFSET:end], "little")
+
+
+def heartbeat_position(udp_packet):
+    """心跳里那个**角色位置** `(x, y)`；不是心跳 / 太短就返回 ``None``。
+
+    这是服务端唯一能知道「谁现在站在哪」的地方 —— 位置只在这一发里，
+    别的包都没有（`0x0406` 那个是掉落点，只在打死东西时才有）。
+
+    ★ 拿它干什么：bot 的落脚点得是**地图上真实存在的地面**，而服务端一点
+    地图几何都没有（M4 才有）。真人此刻站着的位置一定合法，所以 bot 的
+    锚点直接跟着真人走（V0.3 D16）。M5 的瞄准也要靠它。
+
+    坐标是 i16（客户端 `0x5f895c` 从 f32 四舍五入来的），**不是** f32。
+    """
+    if not is_heartbeat(udp_packet):
+        return None
+    end = PEER_HEARTBEAT_STATE_OFFSET + PEER_HEARTBEAT_POS.size
+    if len(udp_packet) < end:
+        return None
+    return PEER_HEARTBEAT_POS.unpack_from(
+        udp_packet, PEER_HEARTBEAT_STATE_OFFSET)
 
 
 def as_broadcast(udp_packet):
