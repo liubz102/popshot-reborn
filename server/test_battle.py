@@ -201,9 +201,12 @@ def hp_zero_payload(handle=0x000186A1, seat=0, arg=0xFF, deaths=0,
                        x, y)
 
 
-def respawn_payload(character_id=0, x=100, y=200, spawn_index=1):
-    """客户端方向的 `0x0413`（16 字节，和服务端方向的 `0x0419` 同一份结构）。"""
-    return (w_i32(character_id) + w_i32(x) + w_i32(y) + w_i32(spawn_index))
+def respawn_payload(seat=0, x=100, y=200, character_id=1):
+    """客户端方向的 `0x0413`（16 字节，和服务端方向的 `0x0419` 同一份结构）。
+
+    ★ `+0x00` 是**座位**、`+0x0c` 是**角色 id**（V0.3 §33 的勘误）。
+    """
+    return (w_i32(seat) + w_i32(x) + w_i32(y) + w_i32(character_id))
 
 
 def create_item_payload(item_id=10101, x=100.0, y=200.0):
@@ -428,7 +431,7 @@ class DeathBroadcastTests(BattleRoom):
     def test_a_respawn_reaches_everyone(self):
         # 不广播的话别人屏幕上你就一直躺着（读侧 0x4931c2 按座位取角色）。
         gameserver.Conn.on_game_packet(self.bob, OP_REQ_RESPAWN,
-                                       respawn_payload(character_id=1))
+                                       respawn_payload(seat=1))
         self.assertEqual([OP_RESPAWN_CHARACTER], opcodes(self.alice))
         self.assertEqual([OP_RESPAWN_CHARACTER], opcodes(self.bob))
         self.assertEqual(bodies(self.alice, OP_RESPAWN_CHARACTER),
@@ -470,7 +473,7 @@ class RespawnWatchdogTests(BattleRoom):
     def test_a_normal_respawn_disarms_the_watchdog(self):
         self.die(self.bob, 1)
         gameserver.Conn.on_game_packet(self.bob, OP_REQ_RESPAWN,
-                                       respawn_payload(character_id=1))
+                                       respawn_payload(seat=1))
         self.clear()
         self.assertEqual(0, self.later())
         self.assertEqual([], opcodes(self.bob))
@@ -484,36 +487,44 @@ class RespawnWatchdogTests(BattleRoom):
         self.assertEqual([], opcodes(self.bob))
 
     def test_it_reuses_the_spawn_point_the_client_picked_last_time(self):
-        # 坐标只有客户端知道（`0x4fe70e` 选的 `[char+0x2b0]`）。它自己报过
-        # 一次，服务端就记住了 —— 补包时照着发，不会把人扔到地图边缘。
+        # 坐标只有客户端知道（`0x4fe70e` 选的重生点）。它自己报过一次，
+        # 服务端就记住了 —— 补包时照着发，不会把人扔到地图边缘。
+        # 角色 id 同理：他自己报过 3，之后补包就照着发 3。
         gameserver.Conn.on_game_packet(
             self.bob, OP_REQ_RESPAWN,
-            respawn_payload(character_id=1, x=777, y=888, spawn_index=3))
+            respawn_payload(seat=1, x=777, y=888, character_id=3))
         self.die(self.bob, 1, deaths=1)
         self.clear()
         self.later()
         body = bodies(self.bob, OP_RESPAWN_CHARACTER)[0]
         self.assertEqual((1, 777, 888, 3), struct.unpack_from("<4i", body, 0))
 
-    def test_it_borrows_someone_elses_spawn_point(self):
-        # 重生点表是整张图共用的，借队友用过的那个一样落在地图内。
+    def test_it_borrows_someone_elses_spawn_point_but_not_his_character(self):
+        """★ 坐标可以借，**角色 id 绝不能借**（V0.3 §33）。
+
+        重生点表是整张图共用的，借队友用过的那个坐标一样落在地图内；
+        可第 4 格填了队友的角色 id 的话，客户端 `0x4931c2` 会把这个人
+        **换成队友那个角色**（用户实机报的「bot 每次复活都换一个角色」）。
+        bob 座位上的角色是 1，补包就得填 1。
+        """
         gameserver.Conn.on_game_packet(
             self.alice, OP_REQ_RESPAWN,
-            respawn_payload(character_id=0, x=123, y=456, spawn_index=2))
+            respawn_payload(seat=0, x=123, y=456, character_id=2))
         self.die(self.bob, 1)
         self.clear()
         self.later()
         body = bodies(self.bob, OP_RESPAWN_CHARACTER)[0]
-        self.assertEqual((1, 123, 456, 2), struct.unpack_from("<4i", body, 0))
+        self.assertEqual((1, 123, 456, 1), struct.unpack_from("<4i", body, 0))
 
     def test_it_falls_back_to_where_he_died(self):
         # 一个重生点都没见过（本局第一次死）：原地站起来不是原版行为，
         # 但比一直躺着强，而且那个坐标一定在地图内 —— 他刚站在那儿。
+        # 角色 id 退回座位上那个（进房时选的）。
         self.die(self.bob, 1, x=1500.5, y=820.25)
         self.clear()
         self.later()
         body = bodies(self.bob, OP_RESPAWN_CHARACTER)[0]
-        self.assertEqual((1, 1500, 820, 0), struct.unpack_from("<4i", body, 0))
+        self.assertEqual((1, 1500, 820, 1), struct.unpack_from("<4i", body, 0))
 
     def test_a_map_change_forgets_the_pending_watchdog(self):
         # 换图会把角色对象全部卸掉重建，旧闩和旧重生点都作废。

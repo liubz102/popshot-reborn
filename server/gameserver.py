@@ -2785,10 +2785,16 @@ def parse_respawn_request(payload):
     发送点 `0x553e48`，和服务端方向的 `0x0419` **共用同一个反序列化器**
     `0x54c5d0`，所以线格式逐字相同：
 
-        int32 -> +0x00   角色 id（[char+0x2ac]）
+        int32 -> +0x00   ★ 座位号（[char+0x2ac]）
         int32 -> +0x04   X（客户端已用 ftol 把 float 截成整数）
         int32 -> +0x08   Y
-        int32 -> +0x0c   重生点索引（[char+0x2b0]）
+        int32 -> +0x0c   ★★ **角色 id**（[char+0x2b0]），不是「重生点索引」
+
+    ★★ **勘误（V0.3 §33）**：`+0x0c` 以前被当成「重生点索引」，**是错的**。
+    处理器 `0x4931c2` 拿它和 `[char+0x2b0]` 比，**不一样就换角色模型**
+    （`0x405e1c` 卸掉重建、写 `[GameSession+座位*0x3c+0x4c]`）并往聊天框播
+    一行 `%s님이 [ %s ] 캐릭터로 변경하였습니다`（`0x670c90`）。
+    填错的症状就是用户 2026-08-26 报的「bot 每次复活都换一个角色」。
 
     ★ **坐标由客户端自己算好报上来**（`0x4fe70e` 选的重生点），所以服务端
     原样回显就一定落在本场景的合法位置 —— 会话 09 那次「写死 3225/635 把角色
@@ -2796,29 +2802,33 @@ def parse_respawn_request(payload):
     """
     if len(payload) < 16:
         raise ValueError(f"0x0413 只有 {len(payload)} 字节，至少要 16")
-    character_id, x, y, spawn_index = struct.unpack_from("<iiii", payload, 0)
-    return {"character_id": character_id, "x": x, "y": y,
-            "spawn_index": spawn_index}
+    seat, x, y, character_id = struct.unpack_from("<iiii", payload, 0)
+    return {"seat": seat, "x": x, "y": y, "character_id": character_id}
 
 
-def build_respawn_character(character_id=0, x=DEFAULT_RESPAWN_X,
-                            y=DEFAULT_RESPAWN_Y, unknown=0):
+def build_respawn_character(seat=0, x=DEFAULT_RESPAWN_X,
+                            y=DEFAULT_RESPAWN_Y, character_id=0):
     """opcode 0x0419 —— `Packet_gspRespawnCharacter`（vft `0x6916b0`）。让角色重生。
 
     反序列化 `0x54c5d0` 读 **4 个 int32**（全部 `0x5d59ff`）：
 
-        int32 -> +0x04   角色 / 座位 id
+        int32 -> +0x04   ★ 座位号
         int32 -> +0x08   ★ X 坐标
         int32 -> +0x0c   ★ Y 坐标
-        int32 -> +0x10   语义未查
+        int32 -> +0x10   ★★ **角色 id**（见 `parse_respawn_request` 的勘误）
 
     处理器 `0x553ecc`（分发树 `0x54e3f6` → 这里）读完直接调
-    `[stage_vft+0xd4](id, (float)X, (float)Y, +0x10)`。
+    `[stage_vft+0xd4](座位, (float)X, (float)Y, 角色 id)` = `0x4931c2`，
+    那里先按座位取角色对象（`0x404ff6`，空座位直接 return），再拿第四个参数
+    和 `[char+0x2b0]` 比：**相等才是单纯的重生，不等就顺手把角色换掉**。
+    所以这一格必须填**这个座位当前的角色 id**，不能填别人的、也不能填 0。
+    （客户端自己发 `-1` 表示「维持现状」——`0x493208` 判 `== -1` 就把它
+    改写成当前值 —— 但我们手上有确切的角色 id，照实填更好查。）
 
     ★ **坐标在线上是整数**：客户端用 `fild` 把它们转成 float
     （`0x553ee4` / `0x553ef5`），所以这里写 int32 而不是 IEEE754 float。
     """
-    return w_i32(character_id) + w_i32(x) + w_i32(y) + w_i32(unknown)
+    return w_i32(seat) + w_i32(x) + w_i32(y) + w_i32(character_id)
 
 
 #: ★ 开局种子的取值范围。**下界是 1，不能出 0 也不能出 -1**：
@@ -3028,6 +3038,19 @@ PVP_MODE_DEATHMATCH = 3
 #: 生存类构造函数 `0x55e018` 给每个在座角色写死三条命；模式 0 的时限是
 #: 240000 ms，模式 2 复用同一个胜负类但时限是 300000 ms（`0x55e2da`）。
 PVP_SURVIVAL_LIVES = 3
+
+#: ★★ **闯关（任务）模式每人也是三条命**（V0.3 §34）。
+#:
+#: 以前这里写的是「闯关的最大生命来自关卡脚本，服务端拿不到」——**错的**。
+#: `QuestVictoryCondition` 的构造函数 `0x55e073` 就三条指令：
+#: `push 6/pop ecx ; push 3/pop eax ; lea edi,[esi+0x198] ; rep stosd`
+#: —— 六个座位**一律写死 3**，和关卡脚本没关系。全镜像里再没有第二处写
+#: `[vc + 座位*4 + 0x198]` 的地方（另外六条全在夺分模式的
+#: `DeathMatchVictoryCondition` 构造函数里，V0.2 §5145 已经查过）。
+#:
+#: 拿不到这个数的后果就是用户 2026-08-26 报的「任务模式 bot 三条命死完了
+#: 还能一直复活」：看门狗只在对战的 0 / 2 模式里查剩余生命。
+QUEST_LIVES = 3
 PVP_SURVIVAL_TIME_LIMIT_MS = 240000
 PVP_FIGHT_TIME_LIMIT_MS = 300000
 
@@ -3083,9 +3106,29 @@ BOT_RESPAWN_DELAY_S = 5.0
 #: 这是个缓冲区容量，不是判据阈值。
 SYNC_TRAIL_POINTS = 64
 
+#: 轨迹上的一个采样点 —— **一发真人心跳里所有 bot 回放要用的东西**。
+#:
+#: `jumped` = 这一点之前收到过的 `rpJump` 段号（0 = 没跳）。
+#: `on_ground` / `vx` / `vy` = 位域 bit2 和空中速度（V0.3 §35）：
+#: bot 走到这一段时**原样抄**，不自己算 —— 「真人在这儿是踩地还是腾空、
+#: 腾空时速度多少」是现成的事实，服务端手上就有（D16 的延伸）。
+#:
+#: ★ 做成 `namedtuple` 是为了**旧的下标写法照样能用**（`point[0]` / `[1]`
+#: / `[2]` 仍是 x / y / jumped），单测里的假轨迹不用全改。
+SyncTrailPoint = collections.namedtuple(
+    "SyncTrailPoint", "x y jumped on_ground vx vy")
+SyncTrailPoint.__new__.__defaults__ = (True, 0, 0)
+
 #: `UdpPacket` 的内层 `0x0006 rpJump`（body = 座位号 + 第几段跳，V0.3 §23）。
 #: 这里只用来把「他起跳了」记进位置轨迹，组包在 `botsync.py`。
 PEER_OP_JUMP = 0x0006
+
+#: `UdpPacket` 的内层 `0x4005` —— **加载进度**（body = 一个 int32，0..100，V0.3 §30）。
+#:
+#: ★ 服务端**不记**真人报的这个数了（D26：bot 的条一次性报满，不跟随真人）。
+#: 留着这个常量是因为 `note_sync_position()` 要认出它「不是位置心跳」——
+#: 组包在 `botsync.py`。
+PEER_OP_LOAD_PROGRESS = 0x4005
 
 #: ★ `bot.py` 在 import 时把 `bot.tick_room` 挂到这儿（§14 的导入方向：
 #: `gameserver` **不许** import `bot`，只能反过来）。
@@ -3094,6 +3137,18 @@ PEER_OP_JUMP = 0x0006
 #: 没装（只 import 了 `gameserver` 的场合，比如某些老单测）时这里是 `None`，
 #: `_relay_battle_tick` 判空跳过，行为等同于「房里没有 bot」。
 BOT_ROOM_TICK = None
+
+#: ★ 同上，`bot.report_bots_loaded` 挂这儿：房里每个 bot 广播一发
+#: `0x4005 = 100`「我这边已经加载完了」。签名 `(room, why)`。
+#:
+#: ★★ **bot 的进度条一开始就是满的**（D26，用户 2026-08-26 拍板）：bot 没有
+#: 客户端、没有一个字节的资源要读，它永远是房里加载最快的那个 —— D4 定的
+#: 就是「`0x0400` / `0x0417` 广播出去的那一刻它就算加载完了」，那一刻直接
+#: 报 100 才是**事实**。
+#:
+#: （之前那版「跟着真人报的百分比画」在 1v1 下几乎画不出东西：客户端
+#: `0x4005` 发侧有 1000 ms 节流，唯一的真人一两秒读完图只报一两发，V0.3 §38。）
+BOT_ROOM_LOADED = None
 
 
 def pvp_score_limit(player_count, team_mode):
@@ -3195,12 +3250,21 @@ class RoomQuest:
         #: 广播死亡时上闩，收到本人的 `0x0413` 就撤闩；到点还没撤说明客户端
         #: 那条「5 秒后自己发 0x0413」的链断了，服务端自己补一发 `0x0419`。
         self.respawn_due = {}
-        #: 客户端自报过的重生点：座位 -> `(x, y, 重生点索引)`。看门狗补重生时
+        #: 客户端自报过的重生**坐标**：座位 -> `(x, y)`。看门狗补重生时
         #: 优先用本人上次用过的那个点，其次用**任何人**在这张图上用过的点。
         #: 换图必须清 —— 换了图重生点表整个换了。
         self.respawn_hints = {}
         #: 这张图上最近一次有人自报的重生点（座位不限），看门狗的第二顺位。
         self.last_respawn_hint = None
+        #: 座位 -> **角色 id**（`0x0413` 里那个 `[char+0x2b0]`，V0.3 §33）。
+        #: ★ 和坐标分家、而且**换图不清**：借别人的坐标没事，借别人的角色
+        #: 就是把人换成别人（用户报的「bot 每次复活都换一个角色」）。
+        self.characters = {}
+        #: ★ 命用完了、这一局不该再站起来的座位（V0.3 §34）。
+        #: 真人靠客户端自己拦（`Die()` 在 `0x501976` 看剩余生命，为 0 就把
+        #: `[char+0x2d8]` 写成 -1、永不重生），bot 没有客户端，只能记在这儿
+        #: —— `bot.py` 读它决定还发不发心跳。
+        self.lives_spent = set()
         #: 每个座位死了几次。**这是权威值** —— HUD 上那排心形读的就是它
         #: （§109：`[char+0x600]`，由我们在 `0x0406` 里下发）。
         self.deaths = [0] * ROOM_SEAT_COUNT
@@ -3497,27 +3561,53 @@ class RoomQuest:
         """本人的 `0x0413` 到了（或者他走了 / 这局结束了）-> 撤闩。"""
         return self.respawn_due.pop(int(seat), None) is not None
 
-    def remember_respawn_point(self, seat, x, y, spawn_index):
-        """记下客户端自报的重生点，给看门狗补包时用。"""
-        point = (int(x), int(y), int(spawn_index))
+    def remember_respawn_point(self, seat, x, y, character_id=None):
+        """记下客户端自报的重生**坐标**，给看门狗补包时用。
+
+        ★★ **角色 id 走另一本账**（`remember_character`）：它和坐标的
+        「可不可以借别人的」正好相反 —— 坐标是整张图共用的重生点表，借谁的
+        都合法；角色 id 是**这个人是谁**，借了就把人换成别人（V0.3 §33）。
+        """
+        point = (int(x), int(y))
         if 0 <= int(seat) < ROOM_SEAT_COUNT:
             self.respawn_hints[int(seat)] = point
         self.last_respawn_hint = point
+        if character_id is not None:
+            self.remember_character(seat, character_id)
         return point
 
+    def remember_character(self, seat, character_id):
+        """记下这个座位**现在**用的角色 id（`0x0413` 自报的 `[char+0x2b0]`）。
+
+        ★ **跨换图不清**（`begin_map_change` 不碰这张表）：换图**不重建**角色
+        对象（`0x47900a` 把同一批指针原样挂回世界，V0.2 §241 / bug调查/12），
+        角色 id 当然也不变；清掉的话换图后看门狗就只能退回座位上那个
+        「进房时选的角色」，把局中换过角色的人换回去。
+        """
+        if 0 <= int(seat) < ROOM_SEAT_COUNT:
+            self.characters[int(seat)] = int(character_id)
+
     def respawn_point_for(self, seat, fallback):
-        """看门狗要发的 `0x0419` 用哪个坐标。
+        """看门狗要发的 `0x0419` 用哪个坐标（**只有坐标**）。
 
         优先级：本人上次用过的重生点 -> 这张图上任何人用过的 -> 死亡地点。
-        前两者都是客户端自己算出来的合法重生点（`0x4fe70e` 选的
-        `[char+0x2b0]`），重生点表是**整张图共用**的，所以借别人的那个
-        一样落在地图内、不会触发 §88 那种「传送到地图边缘 + 0x0106」。
+        前两者都是客户端自己算出来的合法重生点（`0x4fe70e` 选的），
+        重生点表是**整张图共用**的，所以借别人的那个一样落在地图内、
+        不会触发 §88 那种「传送到地图边缘 + 0x0106」。
         """
         point = self.respawn_hints.get(int(seat)) or self.last_respawn_hint
         if point is not None:
             return point
         x, y = fallback
-        return (int(x), int(y), 0)
+        return (int(x), int(y))
+
+    def character_for(self, seat, fallback=0):
+        """看门狗要发的 `0x0419` 里那个**角色 id**。
+
+        只认**本人**报过的那个；没报过（这一局他还没重生过）就用调用方给的
+        兜底 —— 座位上进房时选的角色。**绝不借别人的**（V0.3 §33）。
+        """
+        return self.characters.get(int(seat), int(fallback))
 
     def due_respawns(self, now=None):
         """到点还没等到 `0x0413` 的座位，按座位号升序返回 `(座位, 兜底坐标)`。
@@ -4172,10 +4262,9 @@ def reset_sync_trails(room, why):
         if trail:
             trail.clear()
         conn.sync_jumped = 0
-        # bot 那一份（`bot.BotConn` 才有；真人身上没有这两个字段）。
+        # bot 那一份（`bot.BotConn` 才有；真人身上没有这几个字段）。
         if conn.is_bot_conn():
-            conn.battle_pos = None
-            conn.last_frame_at = None
+            conn.reset_battle_frame()
     return why
 
 
@@ -4417,6 +4506,11 @@ class Conn:
     #   测试夹具会走到这一步，正常连接在 `__init__` 里就建好了）。
     sync_trail = ()
     sync_jumped = 0
+    # ★ 「这条连接报过几个位置点」。bot 的帧循环拿它当**事件**（V0.3 §32）：
+    #   号变了 = 这个真人报了一个新位置 = bot 该走一帧了。只增不减、不回绕
+    #   （Python 的 int 没有上限），换图 / 新一局都**不清** —— bot 那边存的
+    #   是「我上一帧消费到哪个号」，两边一起往前走就行。
+    sync_trail_seq = 0
 
     def __init__(self, sock, addr, args, accounts=None, tickets=None):
         global _seq
@@ -4532,6 +4626,8 @@ class Conn:
         # 上一发心跳之后收到过的 rpJump 段数（0 = 没跳）。下一发心跳把它
         # 记进轨迹点，bot 回放到那儿时就跟着跳一下。
         self.sync_jumped = 0
+        # 记了几个位置点（bot 的帧事件）。见类级默认值。
+        self.sync_trail_seq = 0
         # 本局关卡的状态**不在房间里时**用的那一份（协议试探 / 控制通道手搓包）。
         # 在房间里时用的是 `lobby.Room.quest`，见 `quest_state()`。
         self.solo_quest = RoomQuest()
@@ -5788,24 +5884,24 @@ class Conn:
             self.log(f"   0x0413 解析失败: {error}；不回重生包")
             return
         self.respawn_sent += 1
-        self.log(f"   重生请求: id={info['character_id']} "
+        self.log(f"   重生请求: 座位={info['seat']} "
                  f"坐标=({info['x']}, {info['y']}) "
-                 f"重生点索引={info['spawn_index']}")
-        # 本人的 0x0413 到了 -> 撤看门狗的闩，并把这个重生点记下来
-        # （bug调查/8：以后要替别人补 0x0419 时就用它）。
+                 f"角色 id={info['character_id']}")
+        # 本人的 0x0413 到了 -> 撤看门狗的闩，并把这个重生点 + 他现在用的
+        # 角色 id 记下来（bug调查/8：以后要替别人补 0x0419 时就用它们）。
         quest = self.quest_state()
         seat = self.battle_seat_index()
         if seat is None:
-            seat = info["character_id"]
+            seat = info["seat"]
         quest.disarm_respawn_watchdog(seat)
         quest.remember_respawn_point(seat, info["x"], info["y"],
-                                     info["spawn_index"])
+                                     info["character_id"])
         self.log(f"← 回 gspRespawnCharacter(0x0419) 原样回显"
                  f"（第 {self.respawn_sent} 次）")
         self.battle_broadcast(
             build_game(OP_RESPAWN_CHARACTER, build_respawn_character(
-                info["character_id"], info["x"], info["y"],
-                info["spawn_index"])),
+                info["seat"], info["x"], info["y"],
+                info["character_id"])),
             reason="：重生")
 
     def respawn_watchdog_seconds(self):
@@ -5855,10 +5951,14 @@ class Conn:
 
         - 只在**真开打了**的局里跑（`room_in_battle`），结算完就不管了。
         - 座位上得有人：中途退房的不补。
-        - 生存类模式（0 / 2）要**还有命**才补 —— 三条命用完就该躺着，
-          那是原版规则（§204），补了反而是作弊。夺分 / 闯关没有命数上限。
+        - **有命数上限的模式要还有命才补** —— 命用完就该躺着，那是原版规则，
+          补了反而是作弊。上限见 `max_lives_this_game()`：生存 / 混战 / **闯关**
+          都是 3，夺分和计时是无限（V0.3 §34 —— 闯关那条以前漏了，
+          用户 2026-08-26 实机报的「bot 三条命死完还能复活」就是它）。
         - 坐标优先用本人上次自报的重生点，其次是这张图上任何人用过的，
           最后才退回死亡地点（见 `RoomQuest.respawn_point_for`）。
+        - ★ **角色 id 只认本人的**，绝不借别人的（`RoomQuest.character_for`）
+          —— 借了就等于顺手把这个人换成别人（V0.3 §33）。
 
         正常路径下这个函数对**真人**永远什么都不做：客户端 5 秒就发 `0x0413`
         了，闩早在第 5 秒就被 `on_respawn_request` 撤掉。
@@ -5876,18 +5976,28 @@ class Conn:
         due = quest.due_respawns(now)
         if not due:
             return 0
-        survival = (not self.quest_mode()
-                    and self.pvp_game_mode() in (PVP_MODE_SURVIVAL,
-                                                 PVP_MODE_FIGHT))
+        max_lives = self.max_lives_this_game()
         sent = 0
         for seat, position in due:
             quest.disarm_respawn_watchdog(seat)
             if not (0 <= seat < len(room.seats)) or room.seats[seat] is None:
                 continue                    # 人走了，没什么好复活的
-            if survival and quest.remaining_lives(seat) <= 0:
-                self.vlog(f"   [重生看门狗] 座位 {seat} 三条命用完了，不补重生")
+            if (max_lives is not None
+                    and quest.remaining_lives(seat, max_lives) <= 0):
+                # ★ 记进 `lives_spent`：这一局他再也不站起来了。真人靠客户端
+                #   自己拦（`Die()` 读剩余生命），bot 没有客户端 —— `bot.py`
+                #   要读这张表才知道该躺下别动（V0.3 §34）。
+                quest.lives_spent.add(int(seat))
+                self.log(f"   座位 {seat} {max_lives} 条命用完了，不补重生"
+                         + ("（bot 从此躺着不动）" if self.is_bot_seat(seat)
+                            else ""))
                 continue
-            x, y, spawn_index = quest.respawn_point_for(seat, position)
+            x, y = quest.respawn_point_for(seat, position)
+            # ★★ 角色 id 必须是**他自己**的，不然客户端会当成「换角色」
+            #   （`0x4931c2`，V0.3 §33）。座位上那个是进房时选的，
+            #   局中换过角色的人以他自己 `0x0413` 报过的那个为准。
+            character_id = quest.character_for(
+                seat, getattr(room.seats[seat], "character_id", 0))
             if self.is_bot_seat(seat):
                 # ★ bot 走的是同一个闩，但它**不是异常**：这是 bot 唯一的重生
                 #   路径（`respawn_delay_for`）。按看门狗那样打★报警的话，
@@ -5895,20 +6005,40 @@ class Conn:
                 self.log(f"   bot 座位 {seat} 重生倒计时到"
                          f"（{BOT_RESPAWN_DELAY_S:.0f} 秒，抄客户端 0x5019a8）"
                          f" -> 发 gspRespawnCharacter(0x0419) "
-                         f"坐标=({x}, {y}) 重生点索引={spawn_index}")
+                         f"坐标=({x}, {y}) 角色 id={character_id}")
             else:
                 self.log(f"★ [重生看门狗] 座位 {seat} 死了 "
                          f"{self.respawn_watchdog_seconds():.0f} 秒"
                          f"还没发 0x0413 —— 服务端补一发 "
                          f"gspRespawnCharacter(0x0419) "
-                         f"坐标=({x}, {y}) 重生点索引={spawn_index}"
+                         f"坐标=({x}, {y}) 角色 id={character_id}"
                          f"（bug调查/8「死了不复活」）")
             self.battle_broadcast(
                 build_game(OP_RESPAWN_CHARACTER,
-                           build_respawn_character(seat, x, y, spawn_index)),
+                           build_respawn_character(seat, x, y, character_id)),
                 reason="：看门狗补重生")
             sent += 1
         return sent
+
+    def max_lives_this_game(self):
+        """这一局每人有几条命；`None` = **无限**（不查剩余生命）。
+
+        原版的三个胜负条件类各自写死（`IVictoryCondition::vf_0c`）：
+
+        | 模式 | 类 | 最大生命 |
+        |---|---|---|
+        | 闯关（房型 2） | `QuestVictoryCondition` | 构造函数 `0x55e073` `rep stosd` 六个座位**全写 3** |
+        | 生存 0 / 混战 2 | `SurvivalVictoryCondition` | 构造函数 `0x55e018` 同样是 3 |
+        | 夺分 3 / 计时 1 | `DeathMatch` / `TimeAttack` | `0x7fffffff` = 无限 |
+
+        ★ 闯关那一格以前被记成「来自关卡脚本、服务端拿不到」，**是错的**
+        （V0.3 §34）。
+        """
+        if self.quest_mode():
+            return QUEST_LIVES
+        if self.pvp_game_mode() in (PVP_MODE_SURVIVAL, PVP_MODE_FIGHT):
+            return PVP_SURVIVAL_LIVES
+        return None
 
     def on_req_change_to_next_map(self, payload):
         """0x0411「我要去下一张地图」-> 原样回 0x0417，客户端这才开始换图。
@@ -5970,6 +6100,11 @@ class Conn:
                 quest.map_done(machine, members)
             self.log(f"   换图: {len(bots)} 个 bot 不用加载，"
                      f"随 0x0417 一起标记为新图已加载完（D4）")
+            # ★ 换图的加载界面上也有那几根进度条 —— bot 那一格同样直接报满
+            #   （D26）。★ 必须排在 `reset_sync_trails` **之后**：那边刚把
+            #   `load_progress` 清成 None，排前面这一发会被去重挡掉。
+            if BOT_ROOM_LOADED is not None:
+                BOT_ROOM_LOADED(room, "换图")
 
     def on_map_loading_done(self):
         """0x0412「新地图加载完了」-> 回 0x0418，客户端才从加载画面里出来。
@@ -6710,8 +6845,6 @@ class Conn:
         大家的号本来就是一样的（进房那一发 `0x0303` 已经对齐过，D138），
         所以 +1 之后仍然一样。
         """
-        if not replies:
-            return
         members = room.members(exclude=None)
         for member in members:
             try:
@@ -6756,6 +6889,11 @@ class Conn:
             if bots:
                 self.log(f"   开局握手: {len(bots)} 个 bot 不用加载关卡，"
                          f"随 0x0400 一起标记为已加载完（D4）")
+                # ★ 进度条同一件事的另一半：`0x0400` 已经发出去了 ⇒ 大家都切到
+                #   stage 6、加载界面已经在画了。bot 那一格**直接报满**（D26）
+                #   —— 它本来就没有资源要读，这是事实不是演出。
+                if BOT_ROOM_LOADED is not None:
+                    BOT_ROOM_LOADED(room, "开局")
             if bot_replies:
                 # 正常路径到不了这里 —— 房主是真人，他那发 `0x0403` 还没来，
                 # 而房里没有真人的话房间早就散了（`_leave_unlocked`）。留着是
@@ -7144,13 +7282,22 @@ class Conn:
     def note_sync_position(self, payload):
         """把这一发同步数据里的**位置**记进轨迹（V0.3 M3）。
 
-        两种包各记一半：
+        三种包各记一半：
 
         * **心跳**（内层 `0x4001`）：body `+7..10` 就是角色坐标（两个 i16，
-          `0x5041e1` 把它们写回 `[char+0x34]` / `[char+0x38]`）。记一个点。
+          `0x5041e1` 把它们写回 `[char+0x34]` / `[char+0x38]`）。记一个点，
+          并把 `sync_trail_seq` **+1**。★ 同一发里的**地面标志和空中速度**
+          （位域 bit2 / body `+11..14`）也一起记 —— bot 回放这条轨迹时要
+          原样抄，抄错了就没有走路动画（V0.3 §35）。
         * **`rpJump`**（内层 `0x0006`）：它本身不带坐标，只说「起跳了，第几段」。
           先攒着，下一发心跳把它记进那个点 —— bot 回放到那一段时就跟着跳，
           跳跃的抛物线因此是**真人真跳出来的**，不用服务端算重力。
+        * **`0x4005` 加载进度**（V0.3 §30）：记下他报到百分之几了，
+          bot 靠它跟着画自己那根进度条（`bot.tick_room`）。
+
+        ★★ `sync_trail_seq` 就是 bot 帧循环的**那个事件**（V0.3 §32）：
+        「这个真人报了一个新位置」。bot 每见到它 +1 一次就走一帧 ——
+        节奏因此和真人**逐发对齐**，不是拿定时器去凑（铁律 10）。
 
         ★ 只记事实，不做判断。要不要跟、跟多远是 `bot.py` 的事。
         """
@@ -7159,14 +7306,19 @@ class Conn:
             if len(payload) >= udpsync.PEER_HEADER_SIZE + 2:
                 self.sync_jumped = payload[udpsync.PEER_HEADER_SIZE + 1]
             return
-        position = udpsync.heartbeat_position(payload)
-        if position is None:
+        if opcode == PEER_OP_LOAD_PROGRESS:
+            # 加载进度：不带坐标，也不再记（D26 之后没人读它了）。
             return
+        motion = udpsync.heartbeat_motion(payload)
+        if motion is None:
+            return
+        x, y, on_ground, vx, vy = motion
         trail = self.sync_trail
         if not isinstance(trail, collections.deque):    # 见类级默认值的说明
             trail = self.sync_trail = collections.deque(
                 maxlen=SYNC_TRAIL_POINTS)
-        trail.append((position[0], position[1], self.sync_jumped))
+        trail.append(SyncTrailPoint(x, y, self.sync_jumped, on_ground, vx, vy))
+        self.sync_trail_seq += 1
         self.sync_jumped = 0
 
     def sync_peer_epoch(self, payload):
@@ -8301,17 +8453,19 @@ def _dispatch_control_command(line):
                 f"seat={seat} 死亡次数={deaths}")
 
     if cmd == "respawn":
-        character_id = int(words[1], 0) if len(words) > 1 else conn.my_seat
+        seat = int(words[1], 0) if len(words) > 1 else conn.my_seat
         if len(words) > 3:
             x, y = int(words[2], 0), int(words[3], 0)
         else:
             x, y = conn.respawn_position()
-        unknown = int(words[4], 0) if len(words) > 4 else 0
-        conn.log(f"[ctl] ← 手动发 gspRespawnCharacter(id={character_id}, "
-                 f"x={x}, y={y}, unk={unknown})")
+        # 第 5 个参数是**角色 id**（V0.3 §33）。手搓时默认 -1 =「维持现状」
+        # （客户端 `0x493208` 判 -1 就改写成当前值），免得手一抖把人换掉。
+        character_id = int(words[4], 0) if len(words) > 4 else -1
+        conn.log(f"[ctl] ← 手动发 gspRespawnCharacter(座位={seat}, "
+                 f"x={x}, y={y}, 角色 id={character_id})")
         conn.send(build_game(OP_RESPAWN_CHARACTER,
-                             build_respawn_character(character_id, x, y, unknown)))
-        return f"ok 已发 0x0419 id={character_id} x={x} y={y}"
+                             build_respawn_character(seat, x, y, character_id)))
+        return f"ok 已发 0x0419 座位={seat} x={x} y={y}"
 
     if cmd == "nextmap":
         if len(words) < 2:

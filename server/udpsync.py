@@ -170,6 +170,22 @@ PEER_HEARTBEAT_STATE_OFFSET = PEER_HEADER_SIZE + 7
 #: 而 `+25..28` 是**准星的屏幕坐标**，写进 `[char+0x680]`/`[0x684]`，V0.3 §25）。
 PEER_HEARTBEAT_POS = struct.Struct("<hh")
 
+#: 角色状态结构 `+0x04` / `+0x06`（body `+11..14`）= ★ **空中的抛体速度**，
+#: 两个 i16（收方 `0x504274` 写进 `[char+0x120]` / `[char+0x124]`）。
+#:
+#: ★★ **它不是「走路速度」**（V0.3 §35 推翻了 §31）：角色**踩在地上**移动时
+#: 这两格恒 0 —— 语料里「位置变了且 bit2=1」的 20341 发里，速度非 0 的只有 9 发。
+#: 非 0 只出现在跳跃 / 被击飞 / 下落这种**离地**的帧上。
+PEER_HEARTBEAT_VELOCITY = struct.Struct("<hh")
+PEER_HEARTBEAT_VELOCITY_OFFSET = PEER_HEARTBEAT_STATE_OFFSET + 4
+
+#: 位域（结构 `+0x0c` = body `+19..22`）在包里的偏移，和它的 **bit2**。
+#:
+#: ★★ bit2（= `[char+0x128]`，收方 `0x5042b1` 写）是 **「我此刻踩在地面上」**，
+#: 不是「我静止着」（V0.3 §35）。判据见那一节的四格表。
+PEER_HEARTBEAT_FIELD_OFFSET = PEER_HEARTBEAT_STATE_OFFSET + 12
+PEER_HEARTBEAT_BIT_ONGROUND = 0x04
+
 #: 一个 UDP 数据报最大多长。位置包 43 字节 + 我们 8 字节头 + 每份 6 字节，
 #: 捎带满 4 份也才 ~260 字节 —— 1400 是留给「以后想多带点」的余量，
 #: 同时保证永远不会被 IP 分片（分片一丢就是整报丢，等于白做冗余）。
@@ -373,6 +389,37 @@ def heartbeat_position(udp_packet):
         return None
     return PEER_HEARTBEAT_POS.unpack_from(
         udp_packet, PEER_HEARTBEAT_STATE_OFFSET)
+
+
+def heartbeat_motion(udp_packet):
+    """心跳里的**整套运动状态** `(x, y, on_ground, vx, vy)`；不是心跳就 ``None``。
+
+    比 `heartbeat_position()` 多出来的三个量，是 bot **回放**这段轨迹时必须
+    原样抄的（V0.3 §35）：
+
+    * `on_ground` —— 位域 bit2。收方拿它分流位置更新（`0x504215`：上一发
+      离地、这一发落地 ⇒ **硬置**坐标，否则 0.6/0.4 插值），角色的**姿势**
+      也跟着它走。**报错了就没有走路动画。**
+    * `vx` / `vy` —— 空中的抛体速度。★ 踩在地上时它俩**必须是 0**：收方会
+      拿它自己往前推算，和心跳里的坐标一打架就是「走一步停一下」的抽搐
+      （用户 2026-08-26 第二轮实机报的那个症状）。
+
+    ★ 为什么是「抄真人的」而不是「服务端自己算」：bot 走的就是真人刚走过的
+    那条线（D16），真人在那一段是踩地还是腾空是**现成的事实**，服务端手上
+    就有。自己算就要连客户端的重力和碰撞一起复刻 —— 那正是 D16 要绕开的。
+    """
+    if not is_heartbeat(udp_packet):
+        return None
+    end = PEER_HEARTBEAT_FIELD_OFFSET + 4
+    if len(udp_packet) < end:
+        return None
+    x, y = PEER_HEARTBEAT_POS.unpack_from(
+        udp_packet, PEER_HEARTBEAT_STATE_OFFSET)
+    vx, vy = PEER_HEARTBEAT_VELOCITY.unpack_from(
+        udp_packet, PEER_HEARTBEAT_VELOCITY_OFFSET)
+    field = struct.unpack_from("<i", udp_packet,
+                               PEER_HEARTBEAT_FIELD_OFFSET)[0]
+    return (x, y, bool(field & PEER_HEARTBEAT_BIT_ONGROUND), vx, vy)
 
 
 def as_broadcast(udp_packet):

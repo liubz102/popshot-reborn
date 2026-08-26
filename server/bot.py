@@ -234,11 +234,30 @@ class BotConn(gameserver.Conn):
         self.battle_pos = None
         #: 现在朝哪走：`+1` 右 / `-1` 左。
         self.heading = botsync.FACING_RIGHT
-        #: 上一帧的时刻（`time.monotonic()`），用来把位移算成 `速度 × dt`。
-        self.last_frame_at = None
+        #: ★ 上一帧消费到的是**谁的第几个位置点**：`(座位号, sync_trail_seq)`。
+        #:   bot 的帧就是靠它对齐的 —— 号变了 = 真人报了新位置 = 走一帧
+        #:   （V0.3 §32，代替了原来那个 0.125 秒的采样率限流）。
+        self.last_trail_mark = None
+        #: 这一轮加载报过那一发 `0x4005` 了吗（D26）。
+        #: `None` = 还没报。报过之后恒为 100，拿它**按状态翻转去重**。
+        self.load_progress = None
         # ★ **不调 `register_conn()`**：`_conns` 是「在线的真人」表。
         #   进去的话 `latest_conn()`（控制通道不指定账号时的默认目标）
         #   随时可能变成一个 bot，`tools/gs_ctl.py` 就对着空气发命令了。
+
+    def reset_battle_frame(self):
+        """把「这一张图上的帧状态」清干净（换图 / 新一局各调一次）。
+
+        由 `gameserver.reset_sync_trails()` 调 —— 那边同时把真人的位置轨迹
+        清掉，两件事必须一起做：轨迹没了，上一张图的落脚点和「消费到第几个
+        点」也就都不作数了。
+
+        ★ 「进度条报过了」跟着一起清：本函数正好在**新一轮加载开始**
+        那一刻被调（`0x0400` / `0x0417` 广播），不清的话换图那一发会被去重挡掉。
+        """
+        self.battle_pos = None
+        self.last_trail_mark = None
+        self.load_progress = None
 
     def __repr__(self):
         return f"<BotConn {self.nickname} 座位 {self.my_seat}>"
@@ -577,17 +596,6 @@ MUTATING_COMMANDS = ("bot", "del", "char", "tm", "ready")
 # ----------------------------------------------------------------------------
 # 战斗中：让 bot 在别人屏幕上动起来（M3）
 # ----------------------------------------------------------------------------
-#: 两发心跳之间隔多久（秒）。
-#:
-#: ★★ **这是铁律 10 的合法例外，理由和 D13（重生 5 秒）同一条**：位置采样率
-#: 是个**物理量**，服务端这边根本没有事件可等 —— bot 没有客户端，也就没有
-#: 帧循环会「到点了通知我们一声」。数也不是从某台机器上观测来的，是**抄真
-#: 客户端自己那个节奏**（V0.2 §187 实测战斗中 ~8 Hz）。
-#:
-#: ★ 发快了没有正确性问题（心跳可丢、无序号），只是白烧带宽；发慢了角色会
-#: 一顿一顿 —— 收方每收一发只把坐标插值 40%（`0x50422e`，见 `botsync`）。
-BOT_FRAME_INTERVAL_S = 0.125
-
 #: bot 跟在真人**多远**的后面（游戏内坐标单位）。
 #:
 #: 房里有多个 bot 时按座位次序排队（第 N 个 bot 跟 N 倍远），免得几个 bot
@@ -627,19 +635,36 @@ def _follow_target(room, machine):
 
 
 def trail_point(trail, distance):
-    """沿着 `trail` 往回走 `distance`，返回落脚的那个采样点。
+    """沿着 `trail` 从最新那点往回走 `distance`，返回落脚点。
 
-    返回 `(x, y, 真人**在这一点**起没起跳)`。轨迹比 `distance` 短就返回最老
-    的那点（bot 刚进图、真人还没走几步时就是这种情况）。
+    返回 `(x, y, jumped, on_ground, vx, vy)`：坐标是插出来的，后四个是真人
+    **在这一段**的原样事实（起没起跳、踩地还是腾空、腾空时的速度）。
+    轨迹比 `distance` 短就返回最老的那点（bot 刚进图、真人还没走几步时
+    就是这种情况）。
+
+    ★★ 后三个（`on_ground` / `vx` / `vy`）**必须原样抄给心跳**，不能自己
+    从位移反推（V0.3 §35）：真人踩在地上走的时候速度两格是 **0**，反推出
+    一个非零速度会让收方拿它自己往前推算，和下一发心跳里的坐标打架 ——
+    就是「走一步停一下、像在抽搐」那个症状，而且走路动画根本不播。
 
     ★ 为什么是「回放真人走过的点」而不是「自己算一条路」：服务端**一点地图
     几何都没有**（M4 才有）。真人刚刚站过的地方一定是合法地面，照着踩就不会
     掉进地形里、也不会飘在半空 —— 连跳跃的抛物线都是现成的（D16）。
 
-    ⚠ 起跳标记只看**落脚的那一点自己**，不把走过的那一段 OR 起来 ——
-    OR 的话真人一起跳、还在 120 之外的 bot 就立刻跟着跳，比它走到那儿早
-    一秒多。代价是 bot 一帧跨过两个采样点时会漏掉中间那一跳；两边都是
-    ~8 Hz，实际上是一帧一个点，漏掉也只是少播一次动画，位置仍然是对的。
+    ★★ **落脚点在两个采样点之间插值，不吸附到采样点上**（V0.3 §32）。
+    吸附的那一版会一顿一顿：真人每报一个新点，「往回 120」落在哪个采样点上
+    是**跳变**的 —— 有时原地不动、有时一下跨两个点。插值之后 bot 每帧前进
+    的距离**恒等于真人这一帧前进的距离**（跟随距离是常数），节奏和真人一样。
+    插的那一段是真人 125 ms 内实际走过的直线，落在地形里的风险可以忽略
+    （跳跃抛物线的弦最多沉下去几个单位）。
+
+    ⚠ 起跳标记**和运动状态**都取**刚刚走过的那个采样点**（插值区间靠**老**
+    的那一端）：
+    bot 是沿着老 -> 新的方向重走这条路的，落脚点落在某一段里 = 它这一帧
+    正好越过了那一段的老端点。真人在更前面（更新）的点上跳，标记就还轮不到
+    ——「一起跳、还差 120 的 bot 立刻跟着跳」那种抽搐不会发生。
+    ★ 每一帧**恰好**越过一个采样点（bot 的滞后距离是常数，头往前挪多少
+    它就挪多少），所以同一个起跳标记不会被报两次。
     """
     points = list(trail)
     if not points:
@@ -649,23 +674,83 @@ def trail_point(trail, distance):
     while index > 0 and walked < distance:
         x0, y0 = points[index - 1][0], points[index - 1][1]
         x1, y1 = points[index][0], points[index][1]
-        walked += math.hypot(x1 - x0, y1 - y0)
+        step = math.hypot(x1 - x0, y1 - y0)
+        if walked + step >= distance and step > 0:
+            # 落脚点就在 `points[index-1] -> points[index]` 这一段里面。
+            # `ratio` = 从**新**的那一端往回退多少（1 = 正好落在 index-1 上）。
+            ratio = (distance - walked) / step
+            return (x1 + (x0 - x1) * ratio, y1 + (y0 - y1) * ratio,
+                    *_motion_of(points[index - 1]))
+        walked += step
         index -= 1
-    x, y, jumped = points[index][0], points[index][1], points[index][2]
-    return (x, y, jumped)
+    point = points[index]
+    return (float(point[0]), float(point[1]), *_motion_of(point))
 
 
-def _tick_bot(room, machine, seat_index, now):
-    """一个 bot 走一帧：算落脚点 -> 发心跳（必要时补一发 `rpJump`）。"""
+def _motion_of(point):
+    """一个轨迹点的 `(jumped, on_ground, vx, vy)`。
+
+    ★ 老式三元组（单测里手搓的假轨迹、以及本版之前落盘的那种）没有后三个
+    字段：那时候补上「踩在地上、速度 0」—— 那是**地面行走**，也正是
+    没有更多信息时唯一安全的假设（腾空却说踩地，最多少一段抛物线姿势；
+    反过来说腾空则会让收方拿一个假速度推算，直接抽搐）。
+    """
+    jumped = point[2] if len(point) > 2 else 0
+    if len(point) >= 6:
+        return jumped, bool(point[3]), point[4], point[5]
+    return jumped, True, 0, 0
+
+
+def _walk_direction(previous, x):
+    """这一帧 bot 往哪边走：`+1` 右 / `−1` 左 / `0` 没挪窝。
+
+    ★★ 比的是**线上那个 i16**，不是浮点落脚点（§39）。收方看得见的只有
+    包里那个截断过的坐标 —— 浮点上挪了 0.3、线上一动没动，却对它说
+    「我按着右键」，收方就会按走路速度把角色往前推，再被下一发心跳拉回来：
+    那正是 §35 那种「推一下拉一下」的抽搐。
+
+    ★ 这一格是 bot **自己这一帧的位移**，不是抄真人的。抄真人的按键在
+    「bot 还落后一大截、真人已经在走」的那几帧上会说谎（bot 明明站着不动，
+    却报「我在走」）—— 而 `on_ground` / 速度那三格必须抄真人是因为
+    **服务端没有地图几何**，按键这件事 bot 自己知道得最准。
+    """
+    if previous is None:
+        return 0
+    was, now = botsync.clamp_i16(previous[0]), botsync.clamp_i16(x)
+    if now > was:
+        return botsync.FACING_RIGHT
+    if now < was:
+        return botsync.FACING_LEFT
+    return 0
+
+
+def _lying_dead(room, seat_index):
+    """这个座位现在是不是「躺着」—— 等重生，或者命用完了这一局不再起来。
+
+    两种都不该发心跳：真人死了也不发。第二种是 V0.3 §34 —— 看门狗判完
+    「三条命用完」之后会把座位记进 `quest.lives_spent`，闩同时也撤掉了，
+    只看 `respawn_due` 的话 bot 会**以幽灵的姿态继续跑**。
+    """
+    quest = room.quest
+    if quest is None:
+        return False
+    return (seat_index in quest.respawn_due
+            or seat_index in getattr(quest, "lives_spent", ()))
+
+
+def _tick_bot(room, machine, seat_index):
+    """一个 bot 走一帧：算落脚点 -> 发心跳（必要时补一发 `rpJump`）。
+
+    ★★ **一帧 = 真人报了一个新位置**（V0.3 §32）。以前这里是「距上一帧不足
+    0.125 秒就跳过」，而驱动它的真人心跳恰好也是 ~8 Hz —— 两个同频的东西
+    撞在一起就是**拍频**：抖动让一半的帧落在阈值内被丢掉，bot 的实际帧率
+    掉到 4~6 Hz 而且忽快忽慢。用户报的「平移的时候一卡一卡、跳在空中尤其
+    一顿一顿」就是它。判据换成「`sync_trail_seq` 变了没有」之后，
+    bot 和它跟的那个真人**逐发同步**，一发不多一发不少（铁律 10）。
+    """
     if machine.sync.broken:
         return
-    quest = room.quest
-    if quest is not None and seat_index in quest.respawn_due:
-        # 躺在地上等重生的这几秒里不发心跳 —— 真人死了也不发。
-        return
-    last = machine.last_frame_at
-    if last is not None and now - last < BOT_FRAME_INTERVAL_S:
-        # ★ 采样率限流，不是「等一等再说」的竞态阈值（见 BOT_FRAME_INTERVAL_S）。
+    if _lying_dead(room, seat_index):
         return
 
     leader = _follow_target(room, machine)
@@ -674,44 +759,90 @@ def _tick_bot(room, machine, seat_index, now):
         # 这时候一发都不发：与其把 bot 摆到一个可能在地形里 / 图外的点上，
         # 不如让客户端按自己加载出来的出生点继续画着（D16）。
         return
+    mark = (room.seat_index_of(leader), leader.sync_trail_seq)
+    if mark == machine.last_trail_mark:
+        # 这一发不是位置心跳（开火 / 爆炸 / AI 消息也走同一条转发路），
+        # 或者是同一个位置点又被驱动了一次 —— 没有新事实，不动。
+        return
+    machine.last_trail_mark = mark
+
     rank = room.bot_seats().index(seat_index) + 1
     point = trail_point(leader.sync_trail, BOT_FOLLOW_DISTANCE * rank)
     if point is None:
         return
-    x, y, jumped = point
+    x, y, jumped, on_ground, vx, vy = point
 
     previous = machine.battle_pos
     machine.battle_pos = (x, y)
-    machine.last_frame_at = now
-    step_x = step_y = 0.0
-    if previous is not None:
-        step_x, step_y = x - previous[0], y - previous[1]
-        if step_x:
-            machine.heading = (botsync.FACING_RIGHT if step_x > 0
-                               else botsync.FACING_LEFT)
+    direction = _walk_direction(previous, x)
+    if direction:
+        machine.heading = direction
+    # ★ 只有**踩在地上**才说「我按着方向键」：腾空那一段的动画是 `Jump`
+    #   （不看掩码），而收方会拿按键覆写空中速度，把抄来的抛体速度冲掉（§39）。
+    keys = botsync.walk_keys(direction if on_ground else 0)
 
-    # ★ 起跳**按状态翻转去重**：只有「这一帧真的踏上了一个新的采样点」才补
-    #   `rpJump`（铁律 10 说的那种去重口径）。不去重的话，真人跳完站着不动
-    #   期间轨迹不推进，bot 会每一帧都发一发 `rpJump` —— 那是**事件包**，
-    #   每发都要吃掉一个可靠序号，动画上还会一直抽。
-    landed_on_a_new_point = previous is not None and (x, y) != previous
+    # ★ 起跳**按状态翻转去重**：只有「这一帧真的往前挪了」才补 `rpJump`
+    #   （铁律 10 说的那种去重口径）。不去重的话，真人跳完站着不动期间轨迹
+    #   不推进，bot 会每一帧都发一发 `rpJump` —— 那是**事件包**，每发都要
+    #   吃掉一个可靠序号，动画上还会一直抽。
+    moved = previous is not None and (x, y) != previous
     try:
-        if jumped and landed_on_a_new_point:
+        if jumped and moved:
             # ★ 事件包（内层 < 0x4000）：序号必须严格连续，所以它和心跳里的
             #   N 是同一本账，全在 `BotSyncStream` 里记（D5）。
             _emit(machine, machine.sync.event(
                 botsync.OP_JUMP, botsync.jump_body(seat_index, jumped)))
+        # ★★ 地面标志和速度**原样抄真人这一段的**（§35），不从位移反推：
+        #   踩在地上走的时候真人报的速度就是 0，反推出来的非零速度会让收方
+        #   拿它自己往前推算、和坐标打架 —— 那就是「一跳一跳像在抽搐」。
+        # ★★★ 按键掩码是**走路动画的开关**（§39）：填 0 的话收方画站姿、
+        #   而且不替它走，位置只被心跳一格一格地拉过去。
+        # ★ 准星不传 = 摆在自己正前方（`aim_point`），朝向位和角度跟着它
+        #   一起算（§36 / §37）。真人的身体朝向就是这么来的。
         state = botsync.character_state(
-            x, y,
-            vx=step_x / botsync.VELOCITY_PER_STEP,
-            vy=step_y / botsync.VELOCITY_PER_STEP,
-            facing=machine.heading)
+            x, y, vx=vx, vy=vy, on_ground=on_ground, facing=machine.heading,
+            keys=keys)
         _emit(machine, machine.sync.heartbeat(state))
     except botsync.SyncInvariantError as error:
         # ★ 不变式炸了：把**这一个 bot** 的流停掉，别的人一点不受影响（D1）。
         #   继续发只会把收方的收包队列越弄越乱，而「bot 不动」是个看得见的故障。
         machine.sync.broken = True
         machine.log(f"   ★★ 同步流不变式被破坏，已停掉这个 bot 的同步: {error}")
+
+
+def report_bots_loaded(room, why):
+    """房里每个 bot 广播一发 **`0x4005` = 100**「我这边已经加载完了」（D26）。
+
+    ★★ **bot 的进度条一开始就是满的，这不是偷懒，是事实**：bot 没有客户端、
+    没有一个字节的资源要读，它永远是房里加载最快的那个 —— D4 定的就是
+    「`0x0400` / `0x0417` **广播出去的那一刻**它就算加载完了」。
+    进度条那一格画的是 `0x4005` 的百分比（§30），所以那一刻直接报 100。
+
+    ★ 之前那版是「跟着真人报的百分比画」（D23）。它在 1v1 下几乎画不出东西
+    —— 客户端 `0x4005` 发侧有 **1000 ms 节流**（§38），房里唯一的真人一两秒
+    读完图就只报了一两发。用户 2026-08-26 拍板：**别演了，直接 100**。
+
+    调用点是两处**事件**，和 D4 那两处标记「bot 已加载完」的地方成对：
+    刚广播完 `0x0400`（开局）、刚广播完 `0x0417`（换图）。
+
+    ★ **按状态翻转去重**（铁律 10 的口径）：报过就不再报，直到
+    `reset_battle_frame()` 把它清掉 —— 那正好发生在下一轮加载开始的时候。
+    """
+    for index in room.bot_seats():
+        seat = room.seats[index]
+        machine = None if seat is None else seat.conn
+        if not isinstance(machine, BotConn) or machine.sync.broken:
+            continue
+        if machine.load_progress == botsync.LOAD_PROGRESS_MAX:
+            continue
+        try:
+            machine.load_progress = botsync.LOAD_PROGRESS_MAX
+            _emit(machine, machine.sync.volatile(
+                botsync.OP_LOAD_PROGRESS,
+                botsync.load_progress_body(botsync.LOAD_PROGRESS_MAX)))
+        except Exception as error:          # noqa: BLE001 —— 同 `tick_room`
+            machine.sync.broken = True
+            machine.log(f"   ⚠ bot 进度条出错（{why}），已停掉它的同步: {error!r}")
 
 
 def _emit(machine, packet):
@@ -730,20 +861,22 @@ def tick_room(sender):
     动，而「真人在打」这件事本身就是一串 8 Hz 的事件流，服务端手上就有。
     真人全都卡住 / 全都在加载时 bot 跟着停，这正是想要的行为。
 
+    ★ 加载阶段**不走这里**：bot 的进度条是在广播 `0x0400` / `0x0417` 那一刻
+    一次性报满的（`report_bots_loaded`，D26），不需要逐帧驱动。
+
     ★ 抛出去的异常一律吞掉：本函数是在**真人的转发路径**上跑的，
     bot 出问题不能连累真人的同步（D1）。
     """
     room = sender.lobby_room()
     if room is None or not room.is_playing():
         return
-    now = time.monotonic()
     for index in room.bot_seats():
         seat = room.seats[index]
         machine = None if seat is None else seat.conn
         if not isinstance(machine, BotConn):
             continue
         try:
-            _tick_bot(room, machine, index, now)
+            _tick_bot(room, machine, index)
         except Exception as error:          # noqa: BLE001 —— 见 docstring
             machine.sync.broken = True
             machine.log(f"   ⚠ bot 帧出错，已停掉它的同步: {error!r}")
@@ -755,6 +888,8 @@ def tick_room(sender):
 #: 单测里 `import bot` 同样会装。没装（有人只 import 了 `gameserver`）时
 #: `_relay_battle_tick` 那边是 `None` 判空，行为退回「房里没有 bot」。
 gameserver.BOT_ROOM_TICK = tick_room
+#: 同上：`0x0400` / `0x0417` 广播出去之后，bot 的进度条一次性报满（D26）。
+gameserver.BOT_ROOM_LOADED = report_bots_loaded
 
 
 def handle_command(conn, text):

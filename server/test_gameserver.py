@@ -542,8 +542,9 @@ class GameServerPacketTests(unittest.TestCase):
 
     def test_respawn_character_payload_is_four_int32(self):
         # 0x54c5d0 读 4 个 int32；坐标在线上是整数，客户端 fild 转 float。
-        payload = build_respawn_character(character_id=2, x=100, y=-50,
-                                          unknown=7)
+        # ★ 第 1 格是**座位**、第 4 格是**角色 id**（V0.3 §33）。
+        payload = build_respawn_character(seat=2, x=100, y=-50,
+                                          character_id=7)
         self.assertEqual((2, 100, -50, 7), struct.unpack("<iiii", payload))
 
     def test_battle_frames_round_trip(self):
@@ -923,10 +924,12 @@ class ControlChannelTests(unittest.TestCase):
 
     def test_respawn_without_coordinates_uses_the_reported_position(self):
         # 写死的坐标换了场景就非法，客户端 23ms 后就发 0x0106 告状（§88）。
+        # ★ 第 4 格默认 -1 =「角色维持现状」（`0x493208`）—— 手搓一发调试包
+        #   不该顺手把人换成别的角色（V0.3 §33）。
         gameserver.handle_control_command("respawn")
         kind, opcode, payload, _ = self.only_frame()
         self.assertEqual(("game", OP_RESPAWN_CHARACTER), (kind, opcode))
-        self.assertEqual((0, 3225, 635, 0), struct.unpack("<4i", payload))
+        self.assertEqual((0, 3225, 635, -1), struct.unpack("<4i", payload))
 
     def test_respawn_accepts_explicit_coordinates(self):
         gameserver.handle_control_command("respawn 2 -10 20 3")
@@ -1283,9 +1286,16 @@ class DeathAndRespawnTests(unittest.TestCase):
         self.assertEqual(payload, body)
 
     def test_respawn_request_layout(self):
+        """★ `+0x00` 是**座位**、`+0x0c` 是**角色 id**（V0.3 §33 的勘误）。
+
+        `+0x0c` 以前被当成「重生点索引」，回显时填了别人的值 —— 客户端
+        `0x4931c2` 拿它和 `[char+0x2b0]` 比，不一样就**换角色模型**并往
+        聊天框播一行「…캐릭터로 변경하였습니다」。用户实机报的「bot 每次
+        复活都换一个角色」就是这么来的。
+        """
         info = parse_respawn_request(struct.pack("<iiii", 3, -1500, 820, 2))
-        self.assertEqual({"character_id": 3, "x": -1500, "y": 820,
-                          "spawn_index": 2}, info)
+        self.assertEqual({"seat": 3, "x": -1500, "y": 820,
+                          "character_id": 2}, info)
 
     def test_respawn_request_rejects_short_payloads(self):
         with self.assertRaises(ValueError):

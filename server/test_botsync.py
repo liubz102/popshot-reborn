@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import struct
 import sys
@@ -196,15 +197,92 @@ class HeartbeatBodyTests(unittest.TestCase):
         self.assertEqual(1, struct.unpack_from("<i", right, 12)[0] & 0x03)
         self.assertEqual(3, struct.unpack_from("<i", left, 12)[0] & 0x03)
 
-    def test_bit_two_is_set_like_the_common_real_case(self):
-        """bit2 = `[char+0x128]`：它决定收方**插值**还是**硬置**坐标。
+    def test_bit_two_says_i_am_standing_on_the_ground(self):
+        """★★ bit2 = `[char+0x128]` = 「我踩在地面上」（§35，勘误 §31）。
 
-        真客户端绝大多数时候是 1（= 插值），我们照着来，别人看 bot 的观感
-        才和看真人一致。
+        它**不是**「我静止着」：语料 67186 发里有 **20341 发**「位置在变、
+        bit2=1、速度两格是 0」—— 那正是**在地上走**。反过来「位置在变、
+        bit2=1、速度非 0」只有 9 发。
         """
-        state = botsync.character_state(0, 0)
+        for on_ground in (True, False):
+            state = botsync.character_state(100, 200, on_ground=on_ground)
+            self.assertEqual(
+                on_ground,
+                bool(struct.unpack_from("<i", state, 12)[0]
+                     & botsync.HEARTBEAT_BIT_ONGROUND))
+
+    def test_walking_on_the_ground_reports_zero_speed(self):
+        """★★★ 踩在地上时速度两格**必须**是 0，哪怕角色正在走（§35）。
+
+        这是「走一步停一下、像在抽搐」那个症状的根因：地上走却报一个非 0
+        速度，收方会拿它自己往前推算，和下一发心跳里的坐标当场打架。
+        真人的包里从来没有这种组合（67186 发里只有 9 发）。
+        """
+        state = botsync.character_state(100, 200, vx=9, vy=-7, on_ground=True)
+        self.assertEqual((0, 0), struct.unpack_from("<hh", state, 4))
         self.assertTrue(struct.unpack_from("<i", state, 12)[0]
                         & botsync.HEARTBEAT_BIT_ONGROUND)
+
+    def test_in_the_air_the_speed_goes_out_as_given(self):
+        """腾空时速度原样上线 —— 那是真人这一段真跳出来的抛体速度。"""
+        state = botsync.character_state(100, 200, vx=9, vy=-7, on_ground=False)
+        self.assertEqual((9, -7), struct.unpack_from("<hh", state, 4))
+        self.assertFalse(struct.unpack_from("<i", state, 12)[0]
+                         & botsync.HEARTBEAT_BIT_ONGROUND)
+
+    def test_the_key_mask_lands_on_bytes_twenty_three_and_twenty_four(self):
+        """★★★ 六位掩码 = **方向键**，收方摊回 `[char+0x2b8+i*4]`（§39）。
+
+        结构 `+0x10`（= body `+23..24`）。bit0 = 左、bit1 = 上、bit2 = 右、
+        bit3 = 下 —— 序列化器 `0x5041b5` 读的是每一格的 **bit0**，
+        反序列化器 `0x504316` 置位写 `0x41`、未置写 `0x10`。
+        """
+        for keys in (0, botsync.KEY_LEFT, botsync.KEY_RIGHT,
+                     botsync.KEY_LEFT | botsync.KEY_UP):
+            state = botsync.character_state(0, 0, keys=keys)
+            self.assertEqual(keys, struct.unpack_from("<H", state, 16)[0])
+
+    def test_walk_keys_maps_the_direction_to_the_arrow_key(self):
+        """★★ 走路方向 -> 按键：右 -> bit2、左 -> bit0、不动 -> 一个都不按。
+
+        收方 `0x5073c2` 就是这么把按键翻成走路方向 `[char+0x4b4]` 的，
+        而 `0x507fb5` 拿走路方向选动画：`0` -> `Stand%02d`（站着）、
+        非 0 -> `Run-F/B%02d`（走）。**掩码填 0 = 收方画一个站着的人**。
+        """
+        self.assertEqual(botsync.KEY_RIGHT,
+                         botsync.walk_keys(botsync.FACING_RIGHT))
+        self.assertEqual(botsync.KEY_LEFT,
+                         botsync.walk_keys(botsync.FACING_LEFT))
+        self.assertEqual(0, botsync.walk_keys(0))
+
+    def test_a_real_client_packet_holds_no_key_while_standing(self):
+        """基准：真客户端站着不动那一发，掩码是 0（语料里 26744 : 2122）。"""
+        self.assertEqual(0, struct.unpack_from(
+            "<H", body_of(REAL_HEARTBEAT), 7 + 16)[0])
+
+    def test_the_aim_point_follows_the_facing(self):
+        """★ 准星是**世界坐标**（§36），不给就摆在自己正前方。
+
+        填死一个常数 = bot 永远瞄着地图左上角，身体也就永远朝那边 ——
+        用户 2026-08-26 实机报的「全是头看向屏幕这个方向」。
+        """
+        right = botsync.character_state(1000, 500, facing=botsync.FACING_RIGHT)
+        left = botsync.character_state(1000, 500, facing=botsync.FACING_LEFT)
+        self.assertGreater(struct.unpack_from("<h", right, 18)[0], 1000)
+        self.assertLess(struct.unpack_from("<h", left, 18)[0], 1000)
+
+    def test_facing_angle_and_cursor_stay_consistent(self):
+        """★ 三个字段说的是同一件事，必须一起算（§37）。
+
+        朝向位跟的是「准星在我哪一侧」（语料 97.8%），角度是**相对面朝
+        方向**的仰角（朝左时 x 分量取反）—— 所以朝左瞄斜上方时角度仍是
+        一个小的负数，不是 ±180 附近。
+        """
+        state = botsync.character_state(1000, 500, cursor=(500, 400))
+        field = struct.unpack_from("<i", state, 12)[0]
+        self.assertEqual(botsync.FACING_LEFT, ((field & 3) ^ 2) - 2)
+        angle = struct.unpack_from("<h", state, 10)[0]
+        self.assertEqual(round(math.degrees(math.atan2(-100, 500))), angle)
 
     def test_the_two_never_written_pads_are_zero(self):
         """结构 `+0x09` / `+0x16` 序列化器从没写过 —— 收方也不读，填 0。"""
@@ -373,29 +451,75 @@ class TrailPointTests(unittest.TestCase):
     """
 
     def trail(self, *points):
-        return [(x, y, jump) for x, y, jump in points]
+        """`(x, y, jumped)` 或 `(x, y, jumped, on_ground, vx, vy)` 都收。"""
+        return [gameserver.SyncTrailPoint(*point) for point in points]
+
+    def where(self, point):
+        """落脚点的 `(x, y, jumped)` —— 只关心走到哪儿的用例用它。"""
+        return (point[0], point[1], point[2])
 
     def test_an_empty_trail_gives_nothing(self):
         self.assertIsNone(bot.trail_point([], 100))
 
     def test_it_walks_back_along_the_path_by_the_requested_distance(self):
         trail = self.trail((0, 0, 0), (50, 0, 0), (100, 0, 0), (150, 0, 0))
-        self.assertEqual((100, 0, 0), bot.trail_point(trail, 50))
-        self.assertEqual((50, 0, 0), bot.trail_point(trail, 100))
+        self.assertEqual((100, 0, 0), self.where(bot.trail_point(trail, 50)))
+        self.assertEqual((50, 0, 0), self.where(bot.trail_point(trail, 100)))
 
     def test_a_short_trail_falls_back_to_its_oldest_point(self):
         """真人才刚进图、还没走几步时就是这种情况。"""
         trail = self.trail((10, 20, 0), (12, 20, 0))
-        self.assertEqual((10, 20, 0), bot.trail_point(trail, 9999))
+        self.assertEqual((10, 20, 0), self.where(bot.trail_point(trail, 9999)))
 
     def test_standing_still_keeps_the_bot_where_it_is(self):
         """真人站着不动 -> 轨迹上全是同一个点 -> bot 也停下。"""
         trail = self.trail(*[(7, 8, 0)] * 10)
-        self.assertEqual((7, 8, 0), bot.trail_point(trail, 120))
+        self.assertEqual((7, 8, 0), self.where(bot.trail_point(trail, 120)))
 
-    def test_the_jump_flag_comes_from_the_landing_point_itself(self):
+    def test_the_motion_facts_come_from_the_point_just_walked_past(self):
+        """★★ 「踩地还是腾空、腾空时速度多少」也照抄那一段（§35）。
+
+        和起跳标记同一个口径（插值区间**靠老**的那一端）：bot 是沿着
+        老 -> 新重走这条路的，落脚点落在某一段里 = 它这一帧正好越过了
+        那一段的老端点。自己从位移反推速度就是「一跳一跳」的根因。
+        """
+        trail = self.trail((0, 0, 0, True, 0, 0), (100, 0, 0, False, 9, -20),
+                           (200, 0, 0, True, 0, 0))
+        # 往回 50 -> 落在 (100,0) -> (200,0) 这一段里，靠老那一端是腾空的。
+        x, _, _, on_ground, vx, vy = bot.trail_point(trail, 50)
+        self.assertAlmostEqual(150.0, x)
+        self.assertFalse(on_ground)
+        self.assertEqual((9, -20), (vx, vy))
+        # 再往回一段 -> 越过的是第一个点，那儿是踩在地上的。
+        self.assertEqual((True, 0, 0), bot.trail_point(trail, 150)[3:])
+
+    def test_an_old_three_tuple_point_counts_as_walking_on_the_ground(self):
+        """没有运动信息的老式点：当成**踩在地上**（`_motion_of` 的兜底）。
+
+        反过来（当成腾空）会让收方拿一个假速度往前推算，直接抽搐；
+        说踩地最多是少一段抛物线姿势。
+        """
+        point = bot.trail_point(self.trail((0, 0, 0), (100, 0, 0)), 50)
+        self.assertEqual((True, 0, 0), point[3:])
+
+    def test_the_landing_point_is_interpolated_inside_the_segment(self):
+        """★ 落脚点在两个采样点**之间**，不吸附（V0.3 §32）。
+
+        吸附的那一版每帧前进 0 / 1 / 2 个采样点，看着一顿一顿；插值之后
+        bot 每帧前进的距离恒等于真人这一帧前进的距离。
+        """
+        trail = self.trail((0, 0, 0), (100, 0, 0), (200, 0, 0))
+        x, y = bot.trail_point(trail, 150)[:2]
+        self.assertAlmostEqual(50.0, x)
+        self.assertAlmostEqual(0.0, y)
+
+    def test_the_jump_flag_comes_from_the_point_just_walked_past(self):
+        """起跳标记取插值区间**靠老**的那一端 —— 那正是这一帧越过的点。"""
         trail = self.trail((0, 0, 0), (30, 40, 2), (60, 0, 0), (90, 0, 0))
-        self.assertEqual((30, 40, 2), bot.trail_point(trail, 60))
+        x, y, jumped = self.where(bot.trail_point(trail, 60))
+        self.assertEqual(2, jumped)
+        self.assertAlmostEqual(42.0, x)      # (30,40) -> (60,0) 上走了 40%
+        self.assertAlmostEqual(24.0, y)
 
     def test_a_jump_further_ahead_is_not_reported_early(self):
         """★ 真人一起跳、还在 120 之外的 bot 不能立刻跟着跳。
@@ -407,24 +531,33 @@ class TrailPointTests(unittest.TestCase):
 
     def test_diagonal_distance_counts_the_vertical_part_too(self):
         trail = self.trail((0, 0, 0), (0, 100, 0), (0, 200, 0))
-        self.assertEqual((0, 100, 0), bot.trail_point(trail, 100))
+        self.assertEqual((0, 100, 0), self.where(bot.trail_point(trail, 100)))
 
 
 # ---------------------------------------------------------------------------
 # 战斗帧（真房间）
 # ---------------------------------------------------------------------------
-def peer_frames(conn):
-    """这条连接收到的所有 `0x040f` 里那份 `UdpPacket`。"""
+def peer_frames_in(sent):
+    """一串已经发出去的帧里，所有 `0x040f` 携带的那份 `UdpPacket`。"""
     out = []
-    for plain in conn.sent:
+    for plain in sent:
         if len(plain) >= 10 and plain[0] == gameserver.MAGIC_GAME:
             if struct.unpack_from("<H", plain, 8)[0] == OP_PEER_DATA_DOWN:
                 out.append(plain[10:])
     return out
 
 
+def peer_frames(conn):
+    """这条连接收到的所有 `0x040f` 里那份 `UdpPacket`。"""
+    return peer_frames_in(conn.sent)
+
+
+def bot_frames_in(sent, seat):
+    return [p for p in peer_frames_in(sent) if header(p)["sender"] == seat]
+
+
 def bot_frames(conn, seat):
-    return [p for p in peer_frames(conn) if header(p)["sender"] == seat]
+    return bot_frames_in(conn.sent, seat)
 
 
 class BotFrameRoom(BotBattleRoom):
@@ -434,24 +567,30 @@ class BotFrameRoom(BotBattleRoom):
     不喂就一帧都不该有。
     """
 
-    def human_heartbeat(self, conn, x, y, jumped=0):
+    def human_heartbeat(self, conn, x, y, jumped=0, on_ground=True,
+                        velocity=(0, 0)):
         """让 `conn` 发一发带位置的心跳（走真的 `0x040e` 入口）。
 
-        ★ 先复位采样率闸门再喂 —— 用例要的是「每喂一发就看一帧」，
-        而 `BOT_FRAME_INTERVAL_S` 在真时钟下会把它们全挡掉。
+        ★ 不用再复位什么闸门：bot 的帧判据是「这个真人报了一个新位置」
+        （`sync_trail_seq` 变了），喂一发就走一帧（V0.3 §32）。
+
+        ★ 默认「踩在地上、速度 0」—— 那是真人**走路**时的样子（§35），
+        绝大多数用例要的就是它。跳跃的段落显式传 `on_ground=False`。
         """
-        self.tick_forward()
         if jumped:
             gameserver.Conn.on_game_packet(conn, OP_PEER_DATA_UP, self.jump(
                 conn, jumped))
-        gameserver.Conn.on_game_packet(conn, OP_PEER_DATA_UP,
-                                       self.beat(conn, x, y))
+        gameserver.Conn.on_game_packet(
+            conn, OP_PEER_DATA_UP,
+            self.beat(conn, x, y, on_ground=on_ground, velocity=velocity))
 
-    def beat(self, conn, x, y):
+    def beat(self, conn, x, y, on_ground=True, velocity=(0, 0)):
         seat = self.room.seat_index_of(conn)
+        state = botsync.character_state(x, y, vx=velocity[0], vy=velocity[1],
+                                        on_ground=on_ground)
         return botsync.build_peer_packet(
             seat, botsync.OP_HEARTBEAT,
-            botsync.heartbeat_body(0, seat, botsync.character_state(x, y)),
+            botsync.heartbeat_body(0, seat, state),
             game_id=self.room.epoch_value)
 
     def jump(self, conn, stage):
@@ -463,13 +602,6 @@ class BotFrameRoom(BotBattleRoom):
     def next_seq(self, conn):
         conn.test_seq = getattr(conn, "test_seq", 0) + 1
         return conn.test_seq - 1
-
-    def tick_forward(self):
-        """让**房里每个 bot** 的采样率限流不挡下一帧（`BOT_FRAME_INTERVAL_S`）。"""
-        for index in self.room.bot_seats():
-            seat = self.room.seats[index]
-            if seat is not None and seat.conn is not None:
-                seat.conn.last_frame_at = None
 
     def walk(self, conn, points):
         for point in points:
@@ -511,14 +643,25 @@ class BotHeartbeatTests(BotFrameRoom):
             self.assertEqual(header(frame)["checksum"],
                              botsync.udp_checksum(body_of(frame)))
 
-    def test_the_frame_rate_is_limited_between_two_human_packets(self):
-        """两个真人各 8 Hz 也不该让 bot 变成 16 Hz。"""
+    def test_only_the_human_it_follows_drives_a_frame(self):
+        """两个真人各 8 Hz 也不该让 bot 变成 16 Hz（V0.3 §32）。
+
+        判据是「**我跟的那个人**报了新位置」——别人报的位置和 bot 这一步
+        走到哪没有关系。老版本靠 0.125 秒的采样率限流去挡，那个数又恰好
+        和真人的心跳同频，抖一抖就丢帧 = 用户看到的「一卡一卡」。
+        """
         self.walk(self.alice, [(0, 0), (400, 0)])
         before = len(bot_frames(self.alice, self.bot_seat))
-        # ★ 故意**不**复位 `last_frame_at`：紧接着这一发应当被采样率挡住。
+        # bob 在很远的地方报一发：bot 跟的是 alice，这一发不该让它动。
         gameserver.Conn.on_game_packet(self.bob, OP_PEER_DATA_UP,
                                        self.beat(self.bob, 10, 10))
         self.assertEqual(before, len(bot_frames(self.alice, self.bot_seat)))
+
+    def test_every_position_report_of_the_leader_gives_exactly_one_frame(self):
+        """★ 逐发对齐：真人报几个位置，bot 就走几帧，一发不多一发不少。"""
+        before = len(bot_frames(self.bob, self.bot_seat))
+        self.walk(self.alice, [(0, 0), (60, 0), (120, 0), (180, 0), (240, 0)])
+        self.assertEqual(before + 5, len(bot_frames(self.bob, self.bot_seat)))
 
     def test_a_dead_bot_stops_moving(self):
         """躺在地上等重生的那几秒里不发心跳 —— 真人死了也不发。"""
@@ -528,6 +671,235 @@ class BotHeartbeatTests(BotFrameRoom):
         self.walk(self.alice, [(500, 0), (600, 0)])
         self.assertEqual(before, len(bot_frames(self.alice, self.bot_seat)))
 
+    def test_a_bot_out_of_lives_stays_on_the_ground(self):
+        """★ 命用完的 bot 不许继续跑（V0.3 §34）。
+
+        看门狗判完「三条命用完」之后**会把闩撤掉**，只看 `respawn_due` 的话
+        bot 从那一刻起就以幽灵的姿态继续跟着人走。
+        """
+        self.walk(self.alice, [(0, 0), (400, 0)])
+        self.room.quest.lives_spent.add(self.bot_seat)
+        before = len(bot_frames(self.alice, self.bot_seat))
+        self.walk(self.alice, [(500, 0), (600, 0)])
+        self.assertEqual(before, len(bot_frames(self.alice, self.bot_seat)))
+
+
+class BotWalkAnimationTests(BotFrameRoom):
+    """★ 「没有走路动画」的根因（V0.3 §35 —— 勘误 §31 —— 和 §32）。"""
+
+    def state_of(self, frame):
+        """一发心跳里那 24 字节角色状态结构拆成 `(vx, vy, 位域)`。"""
+        body = body_of(frame)
+        vx, vy = struct.unpack_from("<hh", body, 7 + 4)
+        return vx, vy, struct.unpack_from("<i", body, 7 + 12)[0]
+
+    def keys_of(self, frame):
+        """一发心跳里的**方向键掩码**（结构 `+0x10` = body `+23..24`）。"""
+        return struct.unpack_from("<H", body_of(frame), 7 + 16)[0]
+
+    def test_a_bot_walking_on_the_ground_reports_zero_speed(self):
+        """★★★ 在地上走的那几发：**速度 0、bit2 置起**（§35）。
+
+        这是真客户端的口径（20341 发「位置在变、bit2=1、速度 0」）。
+        会话 07 那版按位移反推速度、并把 bit2 清零，等于每一发都在说
+        「我在空中，速度 (9,0)」—— 收方拿那个速度自己往前推算，和坐标
+        当场打架，就是用户报的「走一下停一下、像在抽搐」，动画也不播。
+        """
+        self.walk(self.alice, [(0, 0), (200, 0), (400, 0), (600, 0)])
+        vx, vy, field = self.state_of(bot_frames(self.alice, self.bot_seat)[-1])
+        self.assertEqual((0, 0), (vx, vy))
+        self.assertTrue(field & botsync.HEARTBEAT_BIT_ONGROUND)
+
+    def test_a_bot_in_the_air_replays_the_humans_speed(self):
+        """★ 真人腾空的那一段，bot 原样抄他的 bit2 和速度。"""
+        self.walk(self.alice, [(0, 0), (200, 0)])
+        self.human_heartbeat(self.alice, 400, -50, on_ground=False,
+                             velocity=(9, -20))
+        self.human_heartbeat(self.alice, 600, -50, on_ground=False,
+                             velocity=(9, -20))
+        vx, vy, field = self.state_of(bot_frames(self.alice, self.bot_seat)[-1])
+        self.assertEqual((9, -20), (vx, vy))
+        self.assertFalse(field & botsync.HEARTBEAT_BIT_ONGROUND)
+
+    def test_a_standing_bot_stays_on_the_ground(self):
+        """真人停下 -> bot 停下 -> 仍然是「踩在地上、速度 0」。"""
+        self.walk(self.alice, [(0, 0), (200, 0), (400, 0)])
+        self.walk(self.alice, [(400, 0), (400, 0), (400, 0), (400, 0)])
+        vx, vy, field = self.state_of(bot_frames(self.alice, self.bot_seat)[-1])
+        self.assertEqual((0, 0), (vx, vy))
+        self.assertTrue(field & botsync.HEARTBEAT_BIT_ONGROUND)
+
+    def test_the_bot_aims_the_way_it_walks(self):
+        """★ 身体朝向跟着准星走（§36 / §37）—— 准星得跟着 bot 挪。
+
+        填死一个常数时，bot 在图上跑了几千个单位、准星还钉在 (512,384)：
+        它会「一边往右走、一边扭头看着地图左上角」。
+        """
+        self.walk(self.alice, [(2000, 500), (2200, 500), (2400, 500),
+                               (2600, 500)])
+        body = body_of(bot_frames(self.alice, self.bot_seat)[-1])
+        x = struct.unpack_from("<h", body, 7 + 0)[0]
+        cursor_x = struct.unpack_from("<h", body, 7 + 18)[0]
+        field = struct.unpack_from("<i", body, 7 + 12)[0]
+        self.assertGreater(cursor_x, x, "往右走 -> 准星应该在自己右边")
+        self.assertEqual(botsync.FACING_RIGHT, ((field & 3) ^ 2) - 2)
+
+    def test_a_bot_walking_right_holds_the_right_key(self):
+        """★★★ 走路动画的开关（§39）：往右走的那几发要按着**右键**。
+
+        掩码填 0 = 收方 `0x5073c2` 算出走路方向 0 = `0x507fb5` 选
+        `Stand%02d`，而且 `0x507660` 也不替它走 —— 位置只被心跳一格一格
+        拉过去。那就是用户 2026-08-26 第三轮实机报的
+        「还是没有走路动画，看起来是一格一格的平移」。
+        """
+        self.walk(self.alice, [(0, 0), (200, 0), (400, 0), (600, 0)])
+        self.assertEqual(botsync.KEY_RIGHT,
+                         self.keys_of(bot_frames(self.alice, self.bot_seat)[-1]))
+
+    def test_a_bot_walking_left_holds_the_left_key(self):
+        self.walk(self.alice, [(600, 0), (400, 0), (200, 0), (0, 0)])
+        self.assertEqual(botsync.KEY_LEFT,
+                         self.keys_of(bot_frames(self.alice, self.bot_seat)[-1]))
+
+    def test_a_standing_bot_holds_no_key(self):
+        """站住了就得**松开**按键，否则收方会一直把它往前推。"""
+        self.walk(self.alice, [(0, 0), (200, 0), (400, 0)])
+        self.walk(self.alice, [(400, 0)] * 4)
+        self.assertEqual(0,
+                         self.keys_of(bot_frames(self.alice, self.bot_seat)[-1]))
+
+    def test_a_bot_in_the_air_holds_no_key(self):
+        """★ 腾空那一段不按键（§39）：动画是 `Jump`（不看掩码），而收方
+        `0x507402` 会拿按键**覆写**空中速度，把抄来的抛体速度冲掉。"""
+        self.walk(self.alice, [(0, 0), (200, 0)])
+        self.human_heartbeat(self.alice, 400, -50, on_ground=False,
+                             velocity=(9, -20))
+        self.human_heartbeat(self.alice, 600, -50, on_ground=False,
+                             velocity=(9, -20))
+        self.assertEqual(0,
+                         self.keys_of(bot_frames(self.alice, self.bot_seat)[-1]))
+
+    def test_a_bot_that_has_not_moved_yet_holds_no_key(self):
+        """★★ 真人在走、bot 还杵在原地的那几帧，**不许**说自己在走。
+
+        轨迹总长还不到 `BOT_FOLLOW_DISTANCE` 时落脚点固定在最老那个采样点
+        —— bot 线上的坐标一动没动。这时候照抄真人的按键就会说谎：收方按
+        走路速度把它往前推、下一发心跳又把它拉回来，正是 §35 那种抽搐。
+        所以按键跟的是 **bot 自己这一帧的位移**，不是真人的。
+        """
+        self.walk(self.alice, [(0, 0), (10, 0), (20, 0), (30, 0)])
+        frames = bot_frames(self.alice, self.bot_seat)
+        self.assertTrue(frames)
+        self.assertEqual([0] * len(frames), [self.keys_of(f) for f in frames])
+
+    def test_the_bot_step_equals_the_humans_step_that_frame(self):
+        """★ bot 这一帧挪多远 = 真人这一帧挪多远（V0.3 §32）。
+
+        跟随距离是常数，所以头往前走多少、120 之后那个点就往前走多少 ——
+        **前提是落脚点在两个采样点之间插值**。吸附到采样点的老版本在真人
+        速度不匀时会出现 0 / 90 这种跳变，那正是「平移的时候一卡一卡」。
+        用例故意让真人 30 / 60 交替地走，匀速走是分不出两版的。
+        """
+        walk = [0, 30, 90, 120, 180, 210, 270, 300, 360, 420, 480, 540]
+        self.walk(self.alice, [(x, 0) for x in walk])
+        xs = [udpsync.heartbeat_position(f)[0]
+              for f in bot_frames(self.alice, self.bot_seat)]
+        self.assertEqual(len(walk), len(xs))
+        for index in range(len(walk) - 4, len(walk)):
+            human_step = walk[index] - walk[index - 1]
+            bot_step = xs[index] - xs[index - 1]
+            self.assertLessEqual(
+                abs(bot_step - human_step), 1,
+                f"第 {index} 帧：真人走了 {human_step}，bot 走了 {bot_step}"
+                f"（bot 的轨迹 {xs}）")
+
+
+def load_frames_in(sent, seat):
+    """一串帧里，由 `seat` 发出的 `0x4005` 携带的那个进度值。"""
+    return [struct.unpack_from("<i", body_of(p), 0)[0]
+            for p in bot_frames_in(sent, seat)
+            if udpsync.peer_opcode(p) == botsync.OP_LOAD_PROGRESS]
+
+
+def load_frames(conn, seat):
+    """这条连接收到的、由 `seat` 发出的 `0x4005` 里那个进度值。"""
+    return load_frames_in(conn.sent, seat)
+
+
+class BotLoadProgressTests(BotFrameRoom):
+    """★ 「点开始 bot 没有进度条」（V0.3 §30 / §38，做法见 D26）。
+
+    加载界面上那几根条画的是 `0x4005`（一个 int32，0..100）。
+    **bot 一进加载界面就报满** —— 它没有客户端、没有一个字节的资源要读，
+    永远是房里加载最快的那个（D4 已经定了「广播出去那一刻就算它加载完」）。
+    """
+
+    def test_the_bot_reports_a_full_bar_the_moment_loading_starts(self):
+        """★★ 开局：`0x0400` 广播完就是一发 100，不跟任何人的进度。"""
+        self.assertEqual([botsync.LOAD_PROGRESS_MAX],
+                         load_frames_in(self.start_sent["bob"], self.bot_seat))
+
+    def test_the_full_bar_goes_out_before_the_stage_seven_packet(self):
+        """★ 100% 得**赶在**把大家推进 stage 7 的那一发 `0x0402` 前面。
+
+        排在后面的话客户端已经切场景了，那一格白画。
+        """
+        frames = self.start_sent["bob"]
+        hundred = next(i for i, plain in enumerate(frames)
+                       if load_frames_in([plain], self.bot_seat) == [100])
+        stage_seven = next(
+            i for i, plain in enumerate(frames)
+            if len(plain) >= 10 and plain[0] == gameserver.MAGIC_GAME
+            and struct.unpack_from("<H", plain, 8)[0]
+            == gameserver.OP_COUNT_GAME_READY)
+        self.assertLess(hundred, stage_seven)
+
+    def test_every_bot_in_the_room_gets_its_own_full_bar(self):
+        for seat in self.room.bot_seats():
+            self.assertEqual([botsync.LOAD_PROGRESS_MAX],
+                             load_frames_in(self.start_sent["bob"], seat))
+
+    def test_it_is_reported_once_per_load_not_once_per_packet(self):
+        """★ 按**状态翻转**去重（铁律 10 的口径），不是每帧都发一发。"""
+        self.clear()
+        for _ in range(5):
+            gameserver._relay_battle_tick(self.alice)
+        self.assertEqual([], load_frames(self.bob, self.bot_seat))
+
+    def test_a_map_change_paints_the_bar_again(self):
+        """★ 换图的加载界面上也有那几根条 —— `0x0417` 广播完再报一次满。
+
+        `reset_sync_trails()` 正好在那一刻把「报过了」清掉，所以这一发
+        不会被去重挡住。
+        """
+        self.clear()
+        gameserver.Conn.on_game_packet(
+            self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
+            gameserver.w_wstr("Quest03_2"))
+        self.assertEqual([botsync.LOAD_PROGRESS_MAX],
+                         load_frames(self.bob, self.bot_seat))
+
+    def test_the_progress_packets_pass_the_clients_checksum(self):
+        for frame in bot_frames_in(self.start_sent["bob"], self.bot_seat):
+            self.assertEqual(header(frame)["checksum"],
+                             botsync.udp_checksum(body_of(frame)))
+
+    def test_the_full_bar_does_not_move_the_bot(self):
+        """`0x4005` 不带坐标 —— 它一发都不该驱动位置帧。"""
+        self.assertEqual([], [f for f in bot_frames_in(self.start_sent["bob"],
+                                                       self.bot_seat)
+                              if udpsync.is_heartbeat(f)])
+
+    def test_a_humans_progress_report_is_ignored(self):
+        """★ bot 不再镜像真人报的百分比（D23 -> D26）：条早就满了。"""
+        self.clear()
+        seat = self.room.seat_index_of(self.alice)
+        gameserver.Conn.on_game_packet(
+            self.alice, OP_PEER_DATA_UP,
+            botsync.build_peer_packet(seat, botsync.OP_LOAD_PROGRESS,
+                                      botsync.load_progress_body(42),
+                                      game_id=self.room.epoch_value))
+        self.assertEqual([], load_frames(self.bob, self.bot_seat))
 
 
 class TwoBotFrameRoom(BotFrameRoom):
@@ -635,7 +1007,6 @@ class BotEpochTests(BotFrameRoom):
         self.assertEqual(relayserver.epoch_state(self.alice).gen,
                          relayserver.epoch_state(self.bot_conn).gen)
         self.clear()
-        self.tick_forward()
         self.walk(self.alice, [(0, 0), (300, 0)])
         self.assertTrue(bot_frames(self.alice, self.bot_seat),
                         "第二局 bot 一帧都没发出去")
@@ -663,7 +1034,6 @@ class BotFrameSafetyTests(BotFrameRoom):
         for conn in (self.alice,):
             gameserver.Conn.leave_game_result(conn)
         self.clear()
-        self.tick_forward()
         gameserver.Conn.on_game_packet(self.alice, OP_PEER_DATA_UP,
                                        self.beat(self.alice, 10, 10))
         self.assertEqual([], bot_frames(self.alice, self.bot_seat))
@@ -684,13 +1054,29 @@ class SyncTrailTests(BotFrameRoom):
 
     def test_a_heartbeat_records_a_point(self):
         self.human_heartbeat(self.alice, 111, 222)
-        self.assertEqual((111, 222, 0), self.alice.sync_trail[-1])
+        self.assertEqual(
+            gameserver.SyncTrailPoint(111, 222, 0, True, 0, 0),
+            self.alice.sync_trail[-1])
+
+    def test_a_heartbeat_records_the_motion_facts_too(self):
+        """★ 「踩地还是腾空 / 腾空时速度多少」和坐标一起记（§35）。
+
+        bot 回放这条轨迹时**原样抄**这三个量 —— 服务端自己反推速度就是
+        「走一步停一下」那个抽搐。
+        """
+        self.human_heartbeat(self.alice, 111, 222, on_ground=False,
+                             velocity=(9, -20))
+        point = self.alice.sync_trail[-1]
+        self.assertFalse(point.on_ground)
+        self.assertEqual((9, -20), (point.vx, point.vy))
 
     def test_a_jump_is_attached_to_the_next_point(self):
         self.human_heartbeat(self.alice, 111, 222, jumped=2)
-        self.assertEqual((111, 222, 2), self.alice.sync_trail[-1])
+        self.assertEqual(2, self.alice.sync_trail[-1].jumped)
+        self.assertEqual((111, 222), self.alice.sync_trail[-1][:2])
         self.human_heartbeat(self.alice, 120, 200)
-        self.assertEqual((120, 200, 0), self.alice.sync_trail[-1])
+        self.assertEqual(0, self.alice.sync_trail[-1].jumped)
+        self.assertEqual((120, 200), self.alice.sync_trail[-1][:2])
 
     def test_a_non_heartbeat_does_not_record_anything(self):
         gameserver.Conn.on_game_packet(
@@ -725,7 +1111,6 @@ class SyncTrailTests(BotFrameRoom):
             self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
             gameserver.w_wstr("Stage02"))
         self.clear()
-        self.tick_forward()
         gameserver._relay_battle_tick(self.alice)
         self.assertEqual([], bot_frames(self.alice, self.bot_seat))
 

@@ -10,6 +10,7 @@
 补，迟早有一处漏掉 —— 那正是 CLAUDE.md 铁律 8 要防的。
 """
 import os
+import struct
 import sys
 import time
 import unicodedata
@@ -610,6 +611,10 @@ class BotBattleRoom(BattleRoom):
         # `BattleRoom.setUp` 紧接着就 `clear()`，开局那一段的包留个底。
         self.start_opcodes = {"alice": opcodes(self.alice),
                               "bob": opcodes(self.bob)}
+        # ★ 原始字节也留一份：bot 的进度条两头（`0x4005` 的 0 和 100）就发在
+        #   这一段里，`clear()` 之后再查是查不到的（V0.3 §38）。
+        self.start_sent = {"alice": list(self.alice.sent),
+                           "bob": list(self.bob.sent)}
 
 
 class BotDeathTests(BotBattleRoom):
@@ -713,6 +718,85 @@ class BotRespawnTests(BotBattleRoom):
             self.alice, now=self.armed_at + gameserver.BOT_RESPAWN_DELAY_S + 0.5)
         self.assertEqual([OP_RESPAWN_CHARACTER], opcodes(self.alice))
 
+    def respawn_body(self):
+        """刚刚那一发 `0x0419` 的 4 个 int32。"""
+        self.kill_bot()
+        gameserver.Conn.check_respawn_watchdog(
+            self.alice, now=self.armed_at + gameserver.BOT_RESPAWN_DELAY_S + 0.5)
+        body = bodies(self.alice, OP_RESPAWN_CHARACTER)[0]
+        return struct.unpack_from("<4i", body, 0)
+
+    def test_the_bot_keeps_its_own_character_when_it_stands_up(self):
+        """★★ 用户 2026-08-26 报的「bot 每次复活都换一个角色」（V0.3 §33）。
+
+        `0x0419` 的第 4 格是**角色 id**，不是「重生点索引」——
+        客户端 `0x4931c2` 拿它和 `[char+0x2b0]` 比，不一样就把这个座位的
+        角色**卸掉重建**成新的那个。以前那版填的是「这张图上最近一个人报的
+        重生点索引」，也就是**别人的角色 id**。
+        """
+        seat, _x, _y, character = self.respawn_body()
+        self.assertEqual(self.bot_seat, seat)
+        self.assertEqual(self.room.seats[self.bot_seat].character_id, character)
+
+    def test_a_teammates_respawn_does_not_reskin_the_bot(self):
+        """真人先复活过一次 —— 他报的角色 id 不许被借给 bot。"""
+        gameserver.Conn.on_game_packet(
+            self.bob, gameserver.OP_REQ_RESPAWN,
+            struct.pack("<4i", 1, 777, 888, 9))
+        self.clear()
+        _seat, x, y, character = self.respawn_body()
+        # 坐标可以借（重生点表整张图共用），角色 id 不行。
+        self.assertEqual((777, 888), (x, y))
+        self.assertEqual(self.room.seats[self.bot_seat].character_id, character)
+
+
+class BotQuestLivesTests(BotBattleRoom):
+    """★ 闯关模式每人 **3 条命**，用完就该躺着（V0.3 §34）。
+
+    用户 2026-08-26 实机报的「任务模式 bot 3 条命死完了还能继续复活」。
+    真人靠客户端自己拦（`Die()` 在 `0x501976` 读剩余生命，为 0 就把
+    `[char+0x2d8]` 写成 -1、永不重生），bot 没有客户端 —— 只能服务端拦。
+    """
+
+    def kill_and_wait(self, reported):
+        """打死 bot 一次，再把时钟拨过它的重生倒计时。返回这一轮的包。"""
+        # 两次死亡之间真实世界隔着 5 秒重生倒计时，远长于 bot / 怪那扇
+        # 3 秒的代报去重窗（`MONSTER_DEATH_DEDUP_WINDOW_S`）——
+        # 用例里直接把窗过掉，不然第二次死亡会被当成重复上报吃掉。
+        self.room.quest.last_death_broadcast_at.clear()
+        armed_at = time.monotonic()
+        gameserver.Conn.on_game_packet(
+            self.bob, OP_REPORT_HP_ZERO,
+            hp_zero_payload(handle=self.bot_handle, seat=self.bot_seat,
+                            arg=1, deaths=reported, x=300.0, y=400.0))
+        self.clear()
+        gameserver.Conn.check_respawn_watchdog(
+            self.alice, now=armed_at + gameserver.BOT_RESPAWN_DELAY_S + 0.5)
+        return opcodes(self.alice)
+
+    def test_quest_mode_gives_everyone_three_lives(self):
+        """`QuestVictoryCondition` 的构造函数 `0x55e073` 六个座位全写 3。"""
+        self.assertEqual(2, self.room.session_type)
+        self.assertEqual(gameserver.QUEST_LIVES,
+                         gameserver.Conn.max_lives_this_game(self.alice))
+
+    def test_the_bot_stops_respawning_once_its_lives_are_gone(self):
+        for reported in range(gameserver.QUEST_LIVES - 1):
+            self.assertEqual([OP_RESPAWN_CHARACTER],
+                             self.kill_and_wait(reported),
+                             f"第 {reported + 1} 次死亡应当照常重生")
+        # 第三条命：死亡广播照发（心形要减到 0），但**不再有 0x0419**。
+        self.assertEqual([], self.kill_and_wait(gameserver.QUEST_LIVES - 1))
+        self.assertEqual(gameserver.QUEST_LIVES,
+                         self.room.quest.deaths[self.bot_seat])
+        self.assertIn(self.bot_seat, self.room.quest.lives_spent)
+
+    def test_score_modes_still_have_no_life_limit(self):
+        """夺分 / 计时是 `0x7fffffff` 条命 —— 这一条不许被顺手改掉。"""
+        self.room.session_type = 1
+        self.room.arguments = (0, gameserver.PVP_MODE_DEATHMATCH, 0)
+        self.assertIsNone(gameserver.Conn.max_lives_this_game(self.alice))
+
 
 class BotMapChangeTests(BotBattleRoom):
     """换图（闯关）：bot 随 `0x0417` 一起算「新图加载完」（D4）。"""
@@ -720,7 +804,10 @@ class BotMapChangeTests(BotBattleRoom):
     def test_the_map_change_does_not_wait_for_the_bot(self):
         gameserver.Conn.on_game_packet(self.alice, OP_REQ_CHANGE_TO_NEXT_MAP,
                                        w_wstr("Quest03_2"))
-        self.assertEqual([OP_REP_CHANGE_TO_NEXT_MAP], opcodes(self.alice))
+        # ★ `0x040f` 是 bot 那一发「进度条满了」（D26）—— 换图的加载界面上
+        #   也有那几根条，和开局同一个道理。
+        self.assertEqual([OP_REP_CHANGE_TO_NEXT_MAP, gameserver.OP_PEER_DATA_DOWN],
+                         opcodes(self.alice))
         self.assertIn(self.bot_conn, self.room.quest.map_loaded)
         self.clear()
         gameserver.Conn.on_game_packet(self.alice, OP_MAP_LOADING_DONE, b"")
