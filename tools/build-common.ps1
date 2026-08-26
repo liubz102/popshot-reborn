@@ -264,7 +264,7 @@ function Get-ServerSourceFile([string]$Root) {
                         'account_store.py', 'netlisten.py', 'tickets.py',
                         'eventlog.py', 'lobby.py', 'relayserver.py', 'protocol.py',
                         'simple.py', 'udpsync.py', 'bot.py', 'botsync.py',
-                        'mapdata.py')) {
+                        'mapdata.py', 'weapondata.py', 'ballistics.py')) {
         if ($files -notcontains $must) { throw "server\$must 没被选中，打包脚本的过滤规则坏了" }
     }
     return $files
@@ -312,7 +312,73 @@ function Copy-ServerCode {
     # 地图地形数据（V0.3 M4）：`server\mapdata.py` 读的就是这一堆。
     # ★ 只拷 *.json —— 目录里如果混进了可视化 PNG 之类的开发产物，不进包。
     $copied += (Copy-MapData -Root $Root -PackageRoot $PackageRoot)
+    # 武器表（V0.3 M3b）：`server\weapondata.py` 读的就是它。
+    $copied += (Copy-WeaponData -Root $Root -PackageRoot $PackageRoot)
     return $copied
+}
+
+function Copy-WeaponData {
+    <# 把 `server\bot_weapons.json` 拷进包（**两个包都要**），并当场验收。
+
+       ★ 缺了它 bot **不开枪**（`weapondata` 找不到文件时返回空表，服务端照常
+         起得来）—— 而「bot 只跑不打」和「句柄算错了」在实机上长得一模一样，
+         查起来能烧掉一整轮实机时间。所以照 Copy-MapData 的风格：
+         明显不对就炸，别打出半个包。 #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$PackageRoot
+    )
+    $src = Join-Path $Root 'server\bot_weapons.json'
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+        throw "缺武器表：$src 不存在。先跑 tools\update-weapondata.bat"
+    }
+    # 原版 weapon.ini 有 228 把武器。少一大截说明提取跑了一半或者产物被删过。
+    $table = Get-Content -LiteralPath $src -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($table.count -lt 100) {
+        throw "武器表只有 $($table.count) 把武器，明显不对，中止打包"
+    }
+    if (@($table.usable).Count -lt 10) {
+        throw "武器表里 bot 能用的武器只有 $(@($table.usable).Count) 把，明显不对，中止打包"
+    }
+    Copy-One $src (Join-Path $PackageRoot 'server\bot_weapons.json')
+    return @('bot_weapons.json')
+}
+
+function Update-WeaponData {
+    <# 打包前重跑一次武器表提取（对称于 Update-MapData）。
+
+       素材 `Pack_decrypt\Data\weapon.ini` 不在本工作副本里 ——
+       **找不到不算失败**（产物在仓库里，直接用）；素材在而解析失败就中止打包。 #>
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    if ($script:WeaponDataUpdated) { return }
+    $script:WeaponDataUpdated = $true
+
+    $py = 'C:\Python314\python.exe'
+    if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
+        $py = Join-Path $Root 'runtime\python\python.exe'
+    }
+    $script = Join-Path $Root 'tools\weapondata.py'
+    if (-not (Test-Path -LiteralPath $py -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $script -PathType Leaf)) {
+        Write-Host '        跳过武器表提取：没有 Python 或 tools\weapondata.py' -ForegroundColor DarkGray
+        return
+    }
+    $probe = @(
+        (Join-Path $Root 'Pack_decrypt\Data\weapon.ini'),
+        (Join-Path $Root '..\..\main\Pack_decrypt\Data\weapon.ini')
+    )
+    $found = $false
+    foreach ($p in $probe) { if (Test-Path -LiteralPath $p -PathType Leaf) { $found = $true } }
+    if (-not $found) {
+        Write-Host '        跳过武器表提取：这台机器上没有 Pack_decrypt\Data\weapon.ini，用仓库里现成的产物' -ForegroundColor DarkGray
+        return
+    }
+    & $py $script --quiet
+    if ($LASTEXITCODE -ne 0) {
+        throw "武器表提取失败（tools\weapondata.py 退出码 $LASTEXITCODE），中止打包"
+    }
+    Write-Host '        武器表已重新提取' -ForegroundColor DarkGray
 }
 
 function Copy-MapData {

@@ -19,6 +19,7 @@ import math
 import os
 import struct
 import sys
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -30,10 +31,12 @@ import botsync                                                 # noqa: E402
 import gameserver                                              # noqa: E402
 import relayserver                                             # noqa: E402
 import udpsync                                                 # noqa: E402
+import weapondata                                              # noqa: E402
 from gameserver import OP_LEAVE_SESSION, OP_PEER_DATA_DOWN, \
     OP_PEER_DATA_UP                                            # noqa: E402
 from test_battle import opcodes                                # noqa: E402
-from test_bot import BotBattleRoom                             # noqa: E402
+from lobby import TEAM_A, TEAM_B                                # noqa: E402
+from test_bot import BotBattleRoom, chat_lines                 # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 真客户端发出来的三发包（`game_003_27799.dec.bin`，`0x040e` 的载荷）
@@ -358,6 +361,144 @@ class EventBodyTests(unittest.TestCase):
         body = botsync.change_weapon_body(2, 1002030)
         self.assertEqual(5, len(body))
         self.assertEqual((2, 1002030), struct.unpack_from("<Bi", body, 0))
+
+    def test_explode_damage_goes_into_the_last_float(self):
+        """★ `+24` **就是伤害**（§42）：收方朝零截断成 int 之后原样交给
+        `Character::OnHit`，不重算。"""
+        body = botsync.explode_body(100002, 200001, 1.0, 2.0,
+                                    hit_kind=botsync.HIT_CHARACTER, damage=18)
+        self.assertAlmostEqual(18.0, struct.unpack_from("<f", body, 24)[0])
+        self.assertEqual(botsync.HIT_CHARACTER,
+                         struct.unpack_from("<i", body, 16)[0])
+
+
+# ---------------------------------------------------------------------------
+# ★★★ 对象句柄（§42 / §43）—— M3b 的地基
+# ---------------------------------------------------------------------------
+class HandleTests(unittest.TestCase):
+    """句柄错了的后果是 `rpExplode` 被**静默丢弃**（`0x492750`），
+    表现是「子弹飞过去不炸、一滴血不掉」，一局之内不自愈。所以逐条钉住。"""
+
+    def test_character_handle_matches_the_client_formula(self):
+        """`0x405f02: imul ecx,seat,0x186a0; add ecx,0x186a1`。
+        语料里实测到的 `100001 / 200001 / 300001 / 400001` 就是座位 0~3。"""
+        self.assertEqual(100001, botsync.character_handle(0))
+        self.assertEqual(200001, botsync.character_handle(1))
+        self.assertEqual(300001, botsync.character_handle(2))
+        self.assertEqual(400001, botsync.character_handle(3))
+
+    def test_projectile_handles_start_at_base_plus_two(self):
+        """★ `ProjectileMgr::Reset` `0x473520` 把每格初值设成 `…002`。
+        语料 14 个文件里**自家弹体句柄的最小值恒等于它**，0 例外（§43）。"""
+        self.assertEqual(100002, botsync.projectile_handle(0, 0))
+        self.assertEqual(100003, botsync.projectile_handle(0, 1))
+        self.assertEqual(500002, botsync.projectile_handle(4, 0))
+
+    def test_projectile_handles_never_collide_with_the_character(self):
+        """角色占 `+1`、弹体从 `+2` 起 —— 撞上的话
+        `rpExplode` 会把「弹体」查成那个角色。"""
+        for seat in range(6):
+            self.assertNotEqual(botsync.character_handle(seat),
+                                botsync.projectile_handle(seat, 0))
+
+    def test_handle_owner_is_the_client_function(self):
+        """`0x473e65`：`h < 100000` 一律 20（怪 / 中立），否则
+        `(h−100000)/100000 + 10`。"""
+        self.assertEqual(10, botsync.handle_owner(100001))
+        self.assertEqual(10, botsync.handle_owner(100002))
+        self.assertEqual(11, botsync.handle_owner(200001))
+        self.assertEqual(14, botsync.handle_owner(500002))
+        self.assertEqual(botsync.OWNER_NEUTRAL, botsync.handle_owner(99999))
+        self.assertEqual(botsync.OWNER_NEUTRAL, botsync.handle_owner(0))
+
+    def test_owner_round_trips_for_every_seat(self):
+        """★ 这条是整套预测的地基：**每个 owner 一格计数器** ——
+        所以别人打多少枪都不动 bot 那一格。"""
+        for seat in range(6):
+            want = botsync.OWNER_SEAT_BASE + seat
+            self.assertEqual(want, botsync.handle_owner(
+                botsync.character_handle(seat)))
+            for shot in (0, 1, 500, 99000):
+                self.assertEqual(want, botsync.handle_owner(
+                    botsync.projectile_handle(seat, shot)))
+
+
+class FireBookkeepingTests(unittest.TestCase):
+    """`BotSyncStream.fire()`：组包和句柄记账必须**在一次加锁里**做完。"""
+
+    def setUp(self):
+        self.stream = botsync.BotSyncStream(FakeBot(seat=2))
+
+    def _fire(self, step=1):
+        return self.stream.fire(1002010, 10.0, 20.0, 0.1, 1.0,
+                                handle_step=step)
+
+    def test_handles_advance_one_per_shot(self):
+        first = self._fire()[1]
+        second = self._fire()[1]
+        self.assertEqual(botsync.projectile_handle(2, 0), first)
+        self.assertEqual(first + 1, second)
+
+    def test_splash_weapons_advance_two_per_shot(self):
+        """带 `SplashRange` 的武器爆炸时多创建一个溅射对象，多吃一个句柄
+        （语料实测：`1002030` / `1001030` 步进恒 2，§43）。"""
+        first = self._fire(step=2)[1]
+        self.assertEqual(first + 2, self._fire(step=2)[1])
+
+    def test_unknown_step_is_refused_on_the_spot(self):
+        """步进未知的武器**根本不该发** —— 猜错的后果是静默丢弃。"""
+        with self.assertRaises(botsync.SyncInvariantError):
+            self._fire(step=None)
+
+    def test_step_smaller_than_the_fragment_count_is_refused(self):
+        """★ 一发造 3 颗弹体却只记 2 格 = 下一发的句柄一定错位。"""
+        with self.assertRaises(botsync.SyncInvariantError):
+            self.stream.fire(1001010, 10.0, 20.0, 0.1, 1.0,
+                             handle_step=2, shots=3)
+
+    def test_fragment_handles_are_consecutive(self):
+        """★★ 散射武器一发造 `shots` 颗，句柄**连号**（§46）——
+        调用方按 `base + i` 逐颗发 `rpExplode`。"""
+        first = self.stream.fire(1001010, 10.0, 20.0, 0.1, 1.0,
+                                 handle_step=3, shots=3)[1]
+        second = self.stream.fire(1001010, 10.0, 20.0, 0.1, 1.0,
+                                  handle_step=3, shots=3)[1]
+        self.assertEqual(first + 3, second)
+
+    def test_the_shot_count_lands_in_the_packet(self):
+        """`rpFire +22` 必须是 `SpreadFrags`，不是恒 1（填小了收侧一颗都不造）。"""
+        packet = self.stream.fire(1001010, 10.0, 20.0, 0.1, 1.0,
+                                  handle_step=3, shots=3)[0]
+        body = packet[udpsync.PEER_HEADER_SIZE:]
+        self.assertEqual(3, struct.unpack_from("<i", body, 22)[0])
+
+    def test_too_many_shots_is_refused(self):
+        """收侧 `0x491f41` 把 `count >= 30` 的整包丢掉 —— 不许发出去。"""
+        with self.assertRaises(botsync.SyncInvariantError):
+            self.stream.fire(1001010, 10.0, 20.0, 0.1, 1.0,
+                             handle_step=60, shots=30)
+
+    def test_fire_also_consumes_one_reliable_sequence(self):
+        """`rpFire` 是事件包：句柄和序号是**两本**账，都得往前走。"""
+        self.assertEqual(0, self.stream.events)
+        self._fire()
+        self.assertEqual(1, self.stream.events)
+
+    def test_reset_projectiles_rewinds_to_the_first_handle(self):
+        """★ 换图 / 新一局：客户端把计数器清回 `座位×100000+100002`
+        （语料实测，§43 第 4 条）。两边必须一起清。"""
+        self._fire()
+        self._fire()
+        self.stream.reset_projectiles()
+        self.assertEqual(botsync.projectile_handle(2, 0), self._fire()[1])
+
+    def test_reset_projectiles_does_not_touch_the_event_sequence(self):
+        """两本账清零的**时机不一样**：事件序号跟换代走（`_sync_epoch`），
+        发弹数跟换图走。混在一起清就会有一边错。"""
+        self._fire()
+        events = self.stream.events
+        self.stream.reset_projectiles()
+        self.assertEqual(events, self.stream.events)
 
 
 # ---------------------------------------------------------------------------
@@ -1295,6 +1436,741 @@ class SyncTrailTests(BotFrameRoom):
             gameserver.Conn.on_game_packet(conn, gameserver.OP_LOADING_DONE,
                                            b"")
         self.assertEqual(0, len(self.alice.sync_trail))
+
+
+# ---------------------------------------------------------------------------
+# ★★★ 开火（M3b）
+# ---------------------------------------------------------------------------
+def fire_frames(conn, seat):
+    """这个座位发出去的 `rpFire`。"""
+    return [f for f in bot_frames(conn, seat)
+            if header(f)["opcode"] == botsync.OP_FIRE]
+
+
+def explode_frames(conn, seat):
+    return [f for f in bot_frames(conn, seat)
+            if header(f)["opcode"] == botsync.OP_EXPLODE]
+
+
+class BotFireRoom(BotFrameRoom):
+    """**个人战**房（`TEAM_LAYOUT_FREE`）—— 房里每个真人都是 bot 的敌人。
+
+    ★ `BotFrameRoom` 默认是闯关房（`session_type = 2` = `COOP`），那儿
+    大家是队友、bot 不开火 —— M3a 的那一大堆用例正好靠这一点不受影响。
+    """
+
+    session_type = 1
+    arguments = (0, 3, 0)       # 个人战 / 夺分
+
+    def approach(self, x=100.0, y=100.0, settle=True):
+        """把 alice 走到 `(x, y)`，让 bot 跟到它身后并进入射程。
+
+        `settle=True` 时顺手把在飞的子弹**结算掉**（见 `settle()`）——
+        绝大多数用例关心的是「打出去的那一发长什么样」，不是它飞了多久。
+        """
+        self.walk(self.alice, [(x, y), (x + 20, y), (x + 40, y)])
+        if settle:
+            self.settle()
+
+    def arrive(self):
+        """让在飞的子弹**立刻到点**（只动飞行时间，不碰别的闸门）。
+
+        ★ 单测里的一帧和一帧之间只差几微秒，而真实的 bot 帧是 ~125 ms ——
+        所以「飞到了没有」这个**物理**判据在单测里得手动拨。
+        另一个闸门（那一发 `rpFire` 报出去了没有，§50）**照旧生效**，
+        它才是「看得见弹体」的那一条。
+        """
+        machine = self.bot_conn
+        machine.pending_shots = [(0.0,) + tuple(rest)
+                                 for (_due, *rest) in machine.pending_shots]
+
+    def settle(self):
+        """让在飞的子弹**立刻到点**，再走一帧把 `rpExplode` 发出去。
+
+        ★ M3b-2 之后 `rpExplode` 不再紧跟着 `rpFire`，而是等子弹飞到
+        （`ballistics` 按 `Velocity` / `GravityFactor` 算出来的时间）。
+        单测不真的去等 —— 把到点时刻拨到过去，等价于「时间到了」。
+
+        ★ 结算这一帧**不许再开枪**：否则「几发 `rpFire` 对几发 `rpExplode`」
+        永远差一发，用例读起来会莫名其妙。
+        """
+        machine = self.bot_conn
+        if not machine.pending_shots:
+            return
+        self.arrive()
+        hold = machine.next_fire_at
+        machine.next_fire_at = time.monotonic() + 3600.0
+        try:
+            self.walk(self.alice, [tuple(self.alice.sync_trail[-1][:2])])
+        finally:
+            machine.next_fire_at = hold
+
+
+class BotFireTests(BotFireRoom):
+    """★★ 「射手那台机器」的活现在全在服务端（D28）。"""
+
+    def test_the_bot_shoots_at_a_hostile_human(self):
+        self.approach()
+        self.assertTrue(fire_frames(self.alice, self.bot_seat),
+                        "个人战里 bot 该朝真人开火")
+
+    def test_every_shot_is_followed_by_an_explode(self):
+        """★★★ 只发 `rpFire` 的话**没有一台机器**会替 bot 算爆炸
+        （守卫 `IsMine || IsNeutral` 在 `0x47eb4e`，§42）——
+        子弹一直飞、一滴血不掉。两发必须成对。"""
+        self.approach()
+        fires = fire_frames(self.alice, self.bot_seat)
+        explodes = explode_frames(self.alice, self.bot_seat)
+        self.assertTrue(fires)
+        self.assertEqual(len(fires), len(explodes))
+
+    def test_the_explode_carries_the_handle_the_client_will_hand_out(self):
+        """★★★ M3b 全靠这条：收方每收一发 `rpFire` 就从
+        `mgr[0x14+owner*4]` 取当前值当句柄再 `++`，初值
+        `座位×100000+100002`（§42 / §43）。对不上就**静默丢弃**。"""
+        self.approach()
+        explodes = explode_frames(self.alice, self.bot_seat)
+        self.assertTrue(explodes)
+        first = struct.unpack_from("<i", body_of(explodes[0]), 0)[0]
+        self.assertEqual(botsync.projectile_handle(self.bot_seat, 0), first)
+
+    def test_the_explode_targets_the_humans_character_handle(self):
+        """`rpExplode +4` = 「打中谁」，角色句柄是 `座位×100000+100001`。"""
+        self.approach()
+        explodes = explode_frames(self.alice, self.bot_seat)
+        target = struct.unpack_from("<i", body_of(explodes[0]), 4)[0]
+        alice_seat = self.room.seat_index_of(self.alice)
+        self.assertEqual(botsync.character_handle(alice_seat), target)
+
+    def test_the_damage_comes_from_the_weapon_table(self):
+        """★ 伤害是**射手算好写进包的**，收方照抄（§42）——
+        所以这一格必须是 `weapon.ini` 的 `Damage`，不能是我编的数。"""
+        self.approach()
+        weapon = self.bot_conn.weapon
+        self.assertIsNotNone(weapon)
+        damage = struct.unpack_from("<f", body_of(
+            explode_frames(self.alice, self.bot_seat)[0]), 24)[0]
+        self.assertAlmostEqual(float(weapon.damage), damage)
+
+    def test_the_fire_packet_says_ten_plus_the_bot_seat(self):
+        """`rpFire +0` 是 `10 + 座位号`，语料 7040 发和头 `+1` 100% 一致。"""
+        self.approach()
+        body = body_of(fire_frames(self.alice, self.bot_seat)[0])
+        self.assertEqual(botsync.FIRE_SOURCE_PLAYER_BASE + self.bot_seat,
+                         body[0])
+        self.assertEqual(self.bot_conn.weapon.id,
+                         struct.unpack_from("<i", body, 2)[0])
+
+    def test_handles_keep_advancing_across_shots(self):
+        """连打几发：句柄必须**严格连续**地往前走，一格都不许跳。"""
+        for _ in range(6):
+            self.bot_conn.next_fire_at = 0.0
+            self.approach()
+        explodes = explode_frames(self.alice, self.bot_seat)
+        self.assertGreater(len(explodes), 2)
+        step = self.bot_conn.weapon.handle_step
+        got = [struct.unpack_from("<i", body_of(f), 0)[0] for f in explodes]
+        want = [botsync.projectile_handle(self.bot_seat, i * step)
+                for i in range(len(got))]
+        self.assertEqual(want, got)
+
+    def test_the_cooling_time_holds_fire_between_shots(self):
+        """★ 开火间隔来自 `weapon.ini` 的 `CoolingTime`（D29）——
+        原版这把枪就是这个节奏，不是我拍脑袋的常量。"""
+        self.approach()
+        self.clear()
+        self.approach()          # 冷却还没过，这一轮不该有新的 rpFire
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+
+    def test_the_bot_aims_at_its_target(self):
+        """★ 准星摆在目标身上 ⇒ 朝向位 / 角度 / `Run-F` vs `Run-B`
+        全跟着走（§37 / §39）—— 这个游戏的朝向跟准星，不跟移动方向。"""
+        self.approach(x=400.0)
+        beats = [f for f in bot_frames(self.alice, self.bot_seat)
+                 if udpsync.is_heartbeat(f)]
+        cursor_x = struct.unpack_from("<h", body_of(beats[-1]),
+                                      7 + 0x12)[0]
+        bot_x = udpsync.heartbeat_position(beats[-1])[0]
+        alice_x = self.alice.sync_trail[-1][0]
+        # bot 跟在真人**后面**，所以准星应该指向前方（真人那一侧）。
+        self.assertGreater(cursor_x, bot_x)
+        self.assertLessEqual(abs(cursor_x - alice_x), 2)
+
+    def test_a_dead_human_is_not_shot_at(self):
+        """躺着等重生的人不该再挨枪 —— 打他一发只会让收方对着尸体算伤害。"""
+        self.approach()
+        # 和真人真的死掉时一样：广播死亡之后服务端给他上重生闩。
+        self.room.quest.arm_respawn_watchdog(
+            self.room.seat_index_of(self.alice), (100.0, 100.0))
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.approach()
+        self.assertEqual([], fire_frames(self.bob, self.bot_seat))
+
+    def test_a_bot_without_a_usable_weapon_never_fires(self):
+        """★ 角色一把可用武器都没有时 bot 只跑不打 ——
+        **不许随便挑一把凑合的**：步进猜错 = 子弹飞过去不炸，而且静默。
+
+        ★ 会话 14 之后 14 个玩家角色全都三个槽位齐活（§45 / §47），所以
+        这里拿一个**表里根本没有**的角色 id 来造这个局面（真实场景是
+        产物缺失 / 版本对不上，`weapondata` 那时整张表都是空的）。
+        """
+        self.bot_conn.character_id = 4242
+        self.assertIsNone(self.bot_conn.weapon)
+        self.approach()
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+
+    def test_firing_does_not_break_the_heartbeat_sequence(self):
+        """★ `rpFire` / `rpExplode` 都是事件包 —— 心跳里的 N 必须跟着涨，
+        否则收方 `FlushTo(N)` 会把它俩判死（D5 不变式 2）。"""
+        self.approach()
+        frames = bot_frames(self.alice, self.bot_seat)
+        events = sum(1 for f in frames if not udpsync.is_heartbeat(f))
+        self.assertEqual(events, self.bot_conn.sync.events)
+
+
+def change_weapon_frames(conn, seat):
+    return [f for f in bot_frames(conn, seat)
+            if header(f)["opcode"] == botsync.OP_CHANGE_WEAPON]
+
+
+class BotWeaponDeclarationTests(BotFireRoom):
+    """★ `rpChangeWeapon` —— 不发的话别人看到的枪和打出来的子弹对不上。
+
+    用户 2026-08-26 报的「bot 好像只会用 1 武器」看到的就是这个：
+    客户端建角色时给的是它自己的默认武器，而 bot 的 `rpFire` 里带的是
+    `weapondata` 挑的那把（角色 1 / 100 / 103 的首选是 **3 号槽**）。
+    """
+
+    def test_the_bot_announces_its_weapon_before_the_first_shot(self):
+        self.approach()
+        frames = bot_frames(self.alice, self.bot_seat)
+        changes = [i for i, f in enumerate(frames)
+                   if header(f)["opcode"] == botsync.OP_CHANGE_WEAPON]
+        fires = [i for i, f in enumerate(frames)
+                 if header(f)["opcode"] == botsync.OP_FIRE]
+        self.assertTrue(changes and fires)
+        self.assertLess(changes[0], fires[0], "声明必须排在第一发之前")
+
+    def test_the_announced_weapon_is_the_one_it_shoots(self):
+        self.approach()
+        body = body_of(change_weapon_frames(self.alice, self.bot_seat)[0])
+        seat, ammo = struct.unpack_from("<Bi", body, 0)
+        self.assertEqual(self.bot_seat, seat)
+        self.assertEqual(self.bot_conn.weapon.id, ammo)
+        fire_ammo = struct.unpack_from(
+            "<i", body_of(fire_frames(self.alice, self.bot_seat)[0]), 2)[0]
+        self.assertEqual(ammo, fire_ammo)
+
+    def test_it_is_announced_once_not_every_shot(self):
+        """★ 按状态翻转去重（铁律 10）：`rpChangeWeapon` 是**事件包**，
+        每发都声明会白吃可靠序号，动画上还会一直抽。"""
+        for _ in range(5):
+            self.bot_conn.next_fire_at = 0.0
+            self.approach()
+        self.assertEqual(1, len(change_weapon_frames(self.alice,
+                                                     self.bot_seat)))
+
+    def test_a_map_change_makes_it_announce_again(self):
+        """换图 / 新一局客户端重建角色，武器回默认 —— 两边的记账必须一起清
+        （和 `crouched` 同一个坑，§41）。"""
+        self.approach()
+        self.assertIsNotNone(self.bot_conn.declared_weapon)
+        gameserver.Conn.on_game_packet(
+            self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
+            gameserver.w_wstr("Stage02"))
+        self.assertIsNone(self.bot_conn.declared_weapon)
+        self.clear()
+        self.approach(x=300.0)
+        self.assertTrue(change_weapon_frames(self.alice, self.bot_seat))
+
+
+class BotGunCommandTests(BotFireRoom):
+    """`/gun N M` —— 房主手动换枪（自动换是 M5 的事，见 `_cmd_gun` 的注释）。"""
+
+    def gun(self, *args):
+        """敲一条 `/gun`，返回房主看到的那几行系统提示。"""
+        self.alice.sent.clear()
+        self.assertTrue(bot.handle_command(
+            self.alice, "/gun " + " ".join(map(str, args))))
+        return "".join(chat_lines(self.alice))
+
+    def test_listing_shows_the_usable_slots(self):
+        self.assertIn("可用武器槽", self.gun(self.bot_seat))
+
+    def test_switching_changes_the_ammo_and_the_handle_step(self):
+        """★ 换到步进 2 的武器之后，句柄必须**跟着每发走 2 格** ——
+        步进错了就是「子弹飞过去不炸」，而且静默（§42）。"""
+        choices = weapondata.usable_for(self.bot_conn.character_id)
+        heavy = [w for w in choices if w.handle_step == 2]
+        if not heavy:
+            self.skipTest("这个角色没有步进 2 的武器")
+        slot = heavy[0].raw["slot"]
+        self.gun(self.bot_seat, slot)
+        self.assertEqual(heavy[0].id, self.bot_conn.weapon.id)
+        self.clear()
+        for _ in range(3):
+            self.bot_conn.next_fire_at = 0.0
+            self.approach()
+        got = [struct.unpack_from("<i", body_of(f), 0)[0]
+               for f in explode_frames(self.alice, self.bot_seat)]
+        want = [botsync.projectile_handle(self.bot_seat, i * 2)
+                for i in range(len(got))]
+        self.assertEqual(want, got)
+
+    def test_an_unusable_slot_is_refused_with_the_choices(self):
+        self.assertIn("没有能用的 9 号武器槽", self.gun(self.bot_seat, 9))
+
+    def test_the_slot_survives_a_map_change(self):
+        """★ 房主的指令不是「一图之内的机器状态」，换图不该把它清掉。"""
+        choices = weapondata.usable_for(self.bot_conn.character_id)
+        slot = choices[-1].raw["slot"]
+        self.gun(self.bot_seat, slot)
+        gameserver.Conn.on_game_packet(
+            self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
+            gameserver.w_wstr("Stage02"))
+        self.assertEqual(slot, self.bot_conn.weapon_slot)
+
+    def test_switching_to_a_slot_the_new_character_lacks_falls_back(self):
+        """`/char` 换到一个没有那个槽位的角色 —— 退回首选，**不是**哑火。
+
+        角色 3（아이린，玩家选不到）的 3 号槽是 `TotemLauncher`，
+        `Damage=0` 打不动人 ⇒ 不在 `usable` 里，正好当这个局面的样本。
+        """
+        self.bot_conn.weapon_slot = 1
+        self.bot_conn.character_id = 3
+        self.assertIsNotNone(self.bot_conn.weapon)
+        self.bot_conn.weapon_slot = 3       # 角色 3 的 slot3 伤害 0，不可用
+        self.assertEqual(weapondata.preferred_for(3).id,
+                         self.bot_conn.weapon.id)
+
+
+class BotHoldCommandTests(BotFireRoom):
+    """`/hold N` —— 让 bot 站住，好测「隔着墙打不打得到」。"""
+
+    def hold(self, *args):
+        self.alice.sent.clear()
+        self.assertTrue(bot.handle_command(
+            self.alice, "/hold " + " ".join(map(str, args))))
+        return "".join(chat_lines(self.alice))
+
+    def test_holding_freezes_the_position_but_keeps_the_heartbeat(self):
+        """★ **照常发心跳** —— 真人站着不动时也一直在发，停发反而是异常。"""
+        self.approach()
+        self.hold()
+        self.assertTrue(self.bot_conn.holding)
+        frozen = self.bot_conn.battle_pos
+        self.clear()
+        self.walk(self.alice, [(600, 100), (700, 100), (800, 100)])
+        beats = [f for f in bot_frames(self.alice, self.bot_seat)
+                 if udpsync.is_heartbeat(f)]
+        self.assertTrue(beats, "站住之后心跳不能停")
+        self.assertEqual(frozen, self.bot_conn.battle_pos)
+
+    def test_holding_toggles_back(self):
+        self.approach()
+        self.hold()
+        self.hold()
+        self.assertFalse(self.bot_conn.holding)
+
+    def test_a_held_bot_stops_walking_in_the_heartbeat(self):
+        """站住 = 站姿：按键掩码清零，收方才画 `Stand`（§39）。"""
+        self.approach()
+        self.hold()
+        self.clear()
+        self.walk(self.alice, [(600, 100), (700, 100)])
+        beats = [f for f in bot_frames(self.alice, self.bot_seat)
+                 if udpsync.is_heartbeat(f)]
+        for frame in beats:
+            self.assertEqual(0, body_of(frame)[7 + 0x10])
+
+    def test_holding_still_lets_it_shoot(self):
+        """★ 站住正是为了让房主走开、绕到墙后 —— 开火那一段照跑。"""
+        self.approach()
+        self.hold()
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.walk(self.alice, [(120, 100), (130, 100)])
+        self.assertTrue(fire_frames(self.alice, self.bot_seat))
+
+
+class BotBallisticFireTests(BotFireRoom):
+    """★★ M3b-2：弹道 + **延后爆炸**（会话 14，§47 / §48）。"""
+
+    def gun(self, *args):
+        self.alice.sent.clear()
+        self.assertTrue(bot.handle_command(
+            self.alice, "/gun " + " ".join(map(str, args))))
+        return "".join(chat_lines(self.alice))
+
+    def test_the_explode_waits_for_the_bullet_to_arrive(self):
+        """★ `rpExplode` 不再紧跟着 `rpFire` —— 子弹得先飞到。
+
+        以前那版一出膛就炸，别人屏幕上子弹刚出枪口就爆。
+        """
+        self.approach(settle=False)
+        self.assertTrue(fire_frames(self.alice, self.bot_seat))
+        self.assertEqual([], explode_frames(self.alice, self.bot_seat))
+        self.assertTrue(self.bot_conn.pending_shots)
+        self.settle()
+        self.assertTrue(explode_frames(self.alice, self.bot_seat))
+        self.assertEqual([], self.bot_conn.pending_shots)
+
+    def test_the_flight_time_comes_from_the_weapon(self):
+        """等多久是 `ballistics` 按 `Velocity` 算的**物理量**，
+        不是「等 XX 毫秒再说」那种观测阈值（铁律 10 的例外）。"""
+        self.approach(settle=False)
+        due = self.bot_conn.pending_shots[0][0]
+        self.assertGreater(due, 0.0)
+        self.assertLess(due - time.monotonic(), 1.0)
+
+    def test_a_pending_explosion_still_goes_out_while_the_bot_is_dead(self):
+        """★★ **一发都不能漏**：句柄记账在开火那一刻就推进了，少发一发
+        收方那一格就永久错位（§42）。真人死了，他打出去的子弹也照样在飞。"""
+        self.approach(settle=False)
+        self.assertTrue(self.bot_conn.pending_shots)
+        self.room.quest.arm_respawn_watchdog(self.bot_seat, (10.0, 10.0))
+        self.clear()
+        self.settle()
+        self.assertTrue(explode_frames(self.alice, self.bot_seat),
+                        "bot 躺着也得把在飞的子弹炸掉")
+
+    def test_a_map_change_drops_the_bullets_in_flight(self):
+        """换图时收方的弹体表和句柄计数器整个复位 —— 补发只会拿一个
+        查不到的句柄去撞 `0x492750` 那个静默丢弃。"""
+        self.approach(settle=False)
+        self.assertTrue(self.bot_conn.pending_shots)
+        gameserver.Conn.on_game_packet(
+            self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
+            gameserver.w_wstr("Stage02"))
+        self.assertEqual([], self.bot_conn.pending_shots)
+
+    def test_the_explosion_lands_where_the_target_is_now(self):
+        """★ 子弹飞了几百毫秒，人早走开了 —— 照开火时的老坐标炸的话
+        别人会看见爆炸出现在空地上。"""
+        self.approach(settle=False)
+        self.walk(self.alice, [(900.0, 100.0)])
+        self.settle()
+        body = body_of(explode_frames(self.alice, self.bot_seat)[-1])
+        x = struct.unpack_from("<f", body, 8)[0]
+        self.assertAlmostEqual(self.alice.sync_trail[-1][0], x, places=3)
+
+    def test_the_bot_shoots_from_across_the_screen(self):
+        """★★★ 用户 2026-08-26 报的那条：「距离远了 bot 就不开枪，
+        站在身边才开枪」。射程口径从 `LockonRange`（80~120）换成语料量出来的
+        交战距离 1000 之后，隔半个屏幕也该开火（§48）。"""
+        self.approach()
+        bot.handle_command(self.alice, f"/hold {self.bot_seat}")
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        far = self.bot_conn.battle_pos[0] + 700.0
+        self.walk(self.alice, [(far, 100.0), (far + 5.0, 100.0)])
+        self.assertTrue(fire_frames(self.alice, self.bot_seat),
+                        "700 个单位是原版玩家常见的交战距离，必须开火")
+
+    def test_nothing_is_shot_at_beyond_the_engagement_range(self):
+        self.approach()
+        bot.handle_command(self.alice, f"/hold {self.bot_seat}")
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        far = self.bot_conn.battle_pos[0] + bot.BOT_ENGAGE_RANGE + 200.0
+        self.walk(self.alice, [(far, 100.0), (far + 5.0, 100.0)])
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+
+    def test_a_parabolic_weapon_aims_upwards_and_charges(self):
+        """★ 用户 2026-08-26 报的另一条：「绝大多数角色 2 号武器是抛物线
+        发射，鼠标长按蓄力，松开按抛物线扔出」。
+
+        ⇒ `rpFire` 的角度要**朝上**（y 往下增长，所以是负的），
+        `power` 也不能再是那个恒 1.0（蓄力武器靠它定初速，§47）。
+        """
+        self.approach()
+        self.gun(self.bot_seat, 2)
+        weapon = self.bot_conn.weapon
+        self.assertTrue(weapon.gravity, "2 号槽应该是抛物线武器")
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.walk(self.alice, [(300.0, 100.0), (310.0, 100.0)])
+        fires = fire_frames(self.alice, self.bot_seat)
+        self.assertTrue(fires, "抛物线武器也得打得出去")
+        body = body_of(fires[0])
+        angle, power = struct.unpack_from("<ff", body, 14)
+        self.assertLess(angle, 0.0, "打平地也要抬枪口")
+        self.assertNotEqual(botsync.FIRE_POWER_FIXED, power)
+        self.assertTrue(8.0 <= power <= 531.0, f"power={power} 超出语料区间")
+
+    def test_a_spread_weapon_explodes_every_fragment(self):
+        """★★ `SpreadFrags = N` 一发造 N 颗弹体、吃 N 个连号句柄（§46）。
+        少炸一颗，下一发的句柄就错位。"""
+        self.bot_conn.character_id = 1        # `CH01-01`：SpreadFrags = 3
+        weapon = weapondata.slot_for(1, 1)
+        self.assertEqual(3, weapon.shots)
+        self.bot_conn.weapon_slot = 1
+        self.approach()
+        fires = fire_frames(self.alice, self.bot_seat)
+        explodes = explode_frames(self.alice, self.bot_seat)
+        self.assertEqual(1, len(fires))
+        self.assertEqual(3, len(explodes))
+        handles = [struct.unpack_from("<i", body_of(f), 0)[0] for f in explodes]
+        base = botsync.projectile_handle(self.bot_seat, 0)
+        self.assertEqual([base, base + 1, base + 2], handles)
+        self.assertEqual(3, struct.unpack_from("<i", body_of(fires[0]), 22)[0])
+
+    def test_a_splash_weapon_holds_fire_until_its_bullet_exploded(self):
+        """★★ 溅射那多出来的一个句柄，到底是开火时分配的还是爆炸时分配的，
+        语料分不出来 —— 两种假设只有在「上一发炸完再开下一枪」时才同解。
+        所以这类武器有一道顺序闸门（`_may_fire`）。"""
+        splash = [w for w in weapondata.usable_for(self.bot_conn.character_id)
+                  if w.splash_range]
+        self.assertTrue(splash, "这个角色应该有带溅射的武器")
+        self.bot_conn.weapon_slot = splash[0].raw["slot"]
+        self.approach(settle=False)
+        self.assertTrue(self.bot_conn.pending_shots)
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0      # 冷却过了，但上一发还在飞
+        self.walk(self.alice, [(200.0, 100.0), (210.0, 100.0)])
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+
+    def test_a_plain_bullet_does_not_wait(self):
+        """★ 不带溅射的武器 `handle_step == shots`，分配全在开火那一刻 ——
+        怎么交错都对，**不设闸**，否则射速会白白掉一半。"""
+        plain = [w for w in weapondata.usable_for(self.bot_conn.character_id)
+                 if not w.splash_range]
+        self.assertTrue(plain)
+        self.bot_conn.weapon_slot = plain[0].raw["slot"]
+        self.approach(settle=False)
+        self.assertTrue(self.bot_conn.pending_shots)
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.walk(self.alice, [(200.0, 100.0), (210.0, 100.0)])
+        self.assertTrue(fire_frames(self.alice, self.bot_seat))
+
+
+class BotMagazineTests(BotFireRoom):
+    """★★ 弹匣：连打 `MagazineCount` 发，打空停 `ReloadTime`（会话 15）。
+
+    用户 2026-08-26：「2 号角色，1 号武器没有 CD，开枪太频繁了，
+    一会儿就把我秒死了。这个游戏里所有武器都有 CD 才对。」
+    """
+
+    def test_the_magazine_empties_then_reloads(self):
+        """`CH01-01`：`CoolingTime=200 / MagazineCount=2 / ReloadTime=1200`
+        ⇒ 打两发之后那一发的间隔必须是 **1200**，不是 200。"""
+        weapon = weapondata.slot_for(1, 1)
+        self.assertEqual(2, weapon.magazine)
+        machine = self.bot_conn
+        machine.rounds_left = None
+        first = bot._reload_after_shot(machine, weapon, 0.0)
+        self.assertAlmostEqual(weapon.cooling_ms / 1000.0, first)
+        self.assertEqual(1, machine.rounds_left)
+        second = bot._reload_after_shot(machine, weapon, 0.0)
+        self.assertAlmostEqual(weapon.reload_ms / 1000.0, second)
+        self.assertIsNone(machine.rounds_left, "换完弹匣要是满的")
+
+    def test_the_sustained_rate_matches_the_original(self):
+        """★ 一个完整循环 = `MagazineCount` 发 + 一次换弹。
+        只看 `CoolingTime` 的话角色 1 的 1 号枪快 5 倍（还是三连散弹）。"""
+        weapon = weapondata.slot_for(1, 1)
+        machine = self.bot_conn
+        machine.rounds_left = None
+        clock = 0.0
+        for _ in range(weapon.magazine):
+            clock = bot._reload_after_shot(machine, weapon, clock)
+        cycle = (weapon.cooling_ms * (weapon.magazine - 1)
+                 + weapon.reload_ms) / 1000.0
+        self.assertAlmostEqual(cycle, clock)
+
+    def test_a_weapon_without_a_magazine_keeps_the_old_rhythm(self):
+        """榴弹那一类打一发装一次 —— `fire_interval_ms` 本来就对。"""
+        weapon = weapondata.slot_for(0, 2)
+        self.assertIsNone(weapon.magazine)
+        gap = bot._reload_after_shot(self.bot_conn, weapon, 0.0)
+        self.assertAlmostEqual(weapon.fire_interval_ms / 1000.0, gap)
+
+    def test_switching_weapons_starts_from_a_full_magazine(self):
+        """换枪 = 换弹匣（真人切枪也是这样）。"""
+        self.approach()
+        self.bot_conn.rounds_left = 1
+        self.bot_conn.weapon_slot = 3
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.walk(self.alice, [(200.0, 100.0), (210.0, 100.0)])
+        self.assertNotEqual(1, self.bot_conn.rounds_left)
+
+    def test_a_map_change_reloads(self):
+        self.approach()
+        self.bot_conn.rounds_left = 1
+        gameserver.Conn.on_game_packet(
+            self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
+            gameserver.w_wstr("Stage02"))
+        self.assertIsNone(self.bot_conn.rounds_left)
+
+
+class BotVisibleBulletTests(BotFireRoom):
+    """★★★ 「看得见弹体」—— `rpExplode` 必须排在**下一个 N** 里（§50）。
+
+    用户 2026-08-26：「所有武器现在看不见弹体，bot 有开枪动画，
+    但是看不见子弹，过一会儿我就凭空被打中了。」
+
+    根因不在弹道，在**收方的可靠队列**：事件包要等一发带更大 N 的心跳
+    `FlushTo(N)` 才会被执行。`rpFire` 和 `rpExplode` 挤在同一个 N 里的话，
+    收方会在同一瞬间造出弹体又把它炸掉。
+    """
+
+    def fire_once(self):
+        """走一帧、正好打一发，返回那一发 `rpFire` 的事件序号。"""
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        before = self.bot_conn.sync.events
+        self.walk(self.alice, [(140.0, 100.0)])
+        self.assertTrue(fire_frames(self.alice, self.bot_seat), "这一帧该开火")
+        return before
+
+    def test_the_explode_waits_for_a_heartbeat_to_announce_the_fire(self):
+        self.approach()
+        fire_seq = self.fire_once()
+        # 到点了 —— 但那一发 rpFire 还没被任何一发心跳报出去。
+        self.bot_conn.pending_shots = [(0.0,) + tuple(rest)
+                                       for (_due, *rest)
+                                       in self.bot_conn.pending_shots]
+        self.assertLessEqual(self.bot_conn.sync.announced, fire_seq)
+        self.clear()
+        self.bot_conn.next_fire_at = time.monotonic() + 3600.0
+        self.walk(self.alice, [(150.0, 100.0)])
+        self.assertEqual([], explode_frames(self.alice, self.bot_seat),
+                         "开火那一发还没露面，这时候炸 = 别人看不见子弹")
+        # 这一帧的心跳把它报出去了，下一帧才轮到爆炸。
+        self.assertGreater(self.bot_conn.sync.announced, fire_seq)
+        self.clear()
+        self.walk(self.alice, [(160.0, 100.0)])
+        self.assertTrue(explode_frames(self.alice, self.bot_seat))
+
+    def test_the_fire_and_the_explode_never_share_one_flush(self):
+        """★★ 判据钉在**发出去的字节**上：每一发 `rpFire` 和它的 `rpExplode`
+        之间，必须夹着一发 **N > 开火序号** 的心跳。
+
+        那一发心跳就是收方 `FlushTo(N)` 造出弹体的那一刻；爆炸排在它后面，
+        弹体才有一整个心跳的寿命。夹不住 = 别人屏幕上看不见子弹。
+        """
+        self.approach()
+        self.clear()
+        x = 200.0
+        for _ in range(8):
+            self.bot_conn.next_fire_at = 0.0
+            x += 30.0
+            self.walk(self.alice, [(x, 100.0)])   # 这一帧开火
+            self.arrive()          # 子弹瞬间到点（单测不等真实时间）
+            for _step in range(2):                # 后面两帧才轮到爆炸
+                x += 30.0
+                self.walk(self.alice, [(x, 100.0)])
+        frames = bot_frames(self.alice, self.bot_seat)
+        fires = [i for i, f in enumerate(frames)
+                 if header(f)["opcode"] == botsync.OP_FIRE]
+        explodes = [i for i, f in enumerate(frames)
+                    if header(f)["opcode"] == botsync.OP_EXPLODE]
+        self.assertTrue(fires)
+        self.assertTrue(explodes)
+        for start in fires:
+            seq = header(frames[start])["sequence"]
+            after = [i for i in explodes if i > start]
+            if not after:
+                continue                       # 还在飞，这一局没炸完
+            beats = [i for i in range(start + 1, after[0])
+                     if udpsync.is_heartbeat(frames[i])
+                     and struct.unpack_from("<H", body_of(frames[i]), 0)[0] > seq]
+            self.assertTrue(beats,
+                            f"第 {seq} 号 rpFire 和它的爆炸之间没有心跳")
+
+
+class BotCoopNoFireTests(BotFrameRoom):
+    """闯关房（`TEAM_LAYOUT_COOP`）：**一枪都不许开**。
+
+    那儿真人是队友，该打的是怪 —— 而怪的句柄服务端手里没有（它们由
+    「控制者」那台机器模拟），要打得等 M5 把控制格那条路接起来。
+    """
+
+    def test_the_bot_never_shoots_its_teammates(self):
+        self.walk(self.alice, [(100, 100), (120, 100), (140, 100)])
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+        self.assertEqual([], explode_frames(self.alice, self.bot_seat))
+
+
+class BotTeamFireTests(BotFrameRoom):
+    """组队战（`TEAM_LAYOUT_TEAMS`）：只打**对面**那一队。"""
+
+    session_type = 1
+    arguments = (1, 0, 0)       # 组队战
+
+    def test_the_bot_holds_fire_against_its_own_team(self):
+        """把 bot 挪到和 alice 同一队 —— 一枪都不该有。"""
+        alice_seat = self.room.seat_index_of(self.alice)
+        self.room.seats[self.bot_seat].team = self.room.seats[alice_seat].team
+        self.walk(self.alice, [(100, 100), (120, 100), (140, 100)])
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+
+    def test_the_bot_shoots_the_other_team(self):
+        alice_seat = self.room.seat_index_of(self.alice)
+        alice_team = self.room.seats[alice_seat].team
+        self.room.seats[self.bot_seat].team = (
+            TEAM_B if alice_team == TEAM_A else TEAM_A)
+        self.walk(self.alice, [(100, 100), (120, 100), (140, 100)])
+        self.assertTrue(fire_frames(self.alice, self.bot_seat))
+
+
+class BotFireHandleResetTests(BotFireRoom):
+    """★★ 换图 / 新一局：客户端把弹体计数器清回 `座位×100000+100002`
+    （语料实测，§43 第 4 条）。两边不一起清，第二张图上全打不中。"""
+
+    def test_a_map_change_rewinds_the_projectile_counter(self):
+        for _ in range(4):
+            self.bot_conn.next_fire_at = 0.0
+            self.approach()
+        self.assertGreater(self.bot_conn.sync.projectiles, 0)
+        gameserver.Conn.on_game_packet(
+            self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
+            gameserver.w_wstr("Stage02"))
+        self.assertEqual(0, self.bot_conn.sync.projectiles)
+
+    def test_the_ctl_nextmap_command_takes_the_real_path(self):
+        """★★ `nextmap` 是**对战房里验换图的唯一手段**（原版只有闯关会换图，
+        而闯关里 bot 一枪不开）。所以它必须和客户端 `0x0411` 走同一段代码 ——
+        **全房间广播 + `reset_sync_trails()`**。
+
+        它要是只给自己发一发 `0x0417`（改之前就是那样），验出来的会是一个
+        **真实游戏里不存在**的故障：客户端那边的弹体计数器清了、服务端这边
+        没清，于是「换图后打不中」。工具本身成了陷阱。
+        """
+        for _ in range(3):
+            self.bot_conn.next_fire_at = 0.0
+            self.approach()
+        self.assertGreater(self.bot_conn.sync.projectiles, 0)
+        # 控制通道按账号找连接（`all_conns()`），而测试里的假连接不走
+        # `register_conn()` —— 这里临时挂进去，跑完摘掉。
+        gameserver.register_conn(self.alice)
+        self.addCleanup(gameserver.unregister_conn, self.alice)
+        reply = gameserver.handle_control_command(
+            "nextmap Stage02 --user " + self.alice.account_name)
+        self.assertTrue(reply.startswith("ok"), reply)
+        self.assertEqual(0, self.bot_conn.sync.projectiles)
+        self.assertEqual(0, len(self.alice.sync_trail))
+        self.assertIsNone(self.bot_conn.declared_weapon)
+        # ★ 广播到位：房里**每个人**都收到了 0x0417，不只发起的那一个。
+        self.assertIn(gameserver.OP_REP_CHANGE_TO_NEXT_MAP, opcodes(self.bob))
+
+    def test_the_first_shot_on_the_new_map_starts_from_the_base_handle(self):
+        for _ in range(3):
+            self.bot_conn.next_fire_at = 0.0
+            self.approach()
+        gameserver.Conn.on_game_packet(
+            self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
+            gameserver.w_wstr("Stage02"))
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.approach(x=300.0)
+        explodes = explode_frames(self.alice, self.bot_seat)
+        self.assertTrue(explodes)
+        self.assertEqual(botsync.projectile_handle(self.bot_seat, 0),
+                         struct.unpack_from("<i", body_of(explodes[0]), 0)[0])
 
 
 if __name__ == "__main__":

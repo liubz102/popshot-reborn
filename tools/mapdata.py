@@ -419,7 +419,10 @@ def main(argv=None):
         except MapFormatError as exc:
             raise SystemExit("解析 %s.map 失败：%s" % (name, exc))
         fname = name + ".json"
-        with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as fp:
+        # ★ `newline="\n"`：不写它的话 Windows 的文本模式会把 `\n` 转成
+        #   `\r\n`，而项目铁律 3 要求 `.json` 一律 **LF 无 BOM**。
+        with open(os.path.join(out_dir, fname), "w", encoding="utf-8",
+                  newline="\n") as fp:
             json.dump(record, fp, ensure_ascii=False, separators=(",", ":"))
             fp.write("\n")
         written.add(fname)
@@ -443,7 +446,8 @@ def main(argv=None):
     idx = collections.OrderedDict((
         ("format", FORMAT), ("count", len(index)),
         ("maps", index), ("bases", bases)))
-    with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8") as fp:
+    with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8",
+              newline="\n") as fp:
         json.dump(idx, fp, ensure_ascii=False, indent=1, sort_keys=False)
         fp.write("\n")
     written.add("index.json")

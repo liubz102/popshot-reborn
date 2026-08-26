@@ -347,11 +347,25 @@ class BotCommandTests(LobbyIsolated):
         self.assertEqual([1], room.bot_seats())
 
     def test_help_works_even_while_the_game_is_running(self):
+        """★ 战斗中给的是**另一套**（`BATTLE_HELP_LINES`）：房间里那几条
+        本来就会被 `MUTATING_COMMANDS` 挡掉，列出来只会占满聊天框那 4 行
+        的额度（§20）。"""
         room = self.open_room()
         room.status = SESSION_STATUS_PLAYING
         self.host.sent.clear()
         self.assertTrue(bot.handle_command(self.host, "/help"))
-        self.assertEqual(len(bot.HELP_LINES), len(chat_lines(self.host)))
+        lines = chat_lines(self.host)
+        self.assertEqual(len(bot.BATTLE_HELP_LINES), len(lines))
+        self.assertIn("/hold", "".join(lines))
+        self.assertIn("/gun", "".join(lines))
+
+    def test_help_in_the_room_lists_the_room_commands(self):
+        self.open_room()
+        self.host.sent.clear()
+        self.assertTrue(bot.handle_command(self.host, "/help"))
+        lines = chat_lines(self.host)
+        self.assertEqual(len(bot.HELP_LINES), len(lines))
+        self.assertIn("/bot", "".join(lines))
 
     def test_help_has_three_aliases(self):
         self.open_room()

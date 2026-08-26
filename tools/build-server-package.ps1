@@ -248,6 +248,7 @@ try {
     # --- 2. server 代码（和客户端包同一份，铁律 8）--------------------------
     Write-Host '  [2/6] server（和客户端包同一份代码）'
     Update-MapData -Root $Root
+    Update-WeaponData -Root $Root
     $serverFiles = Copy-ServerCode -Root $Root -PackageRoot $OutputDirectory
     Write-Host ("        $($serverFiles.Count) 个文件（不含 relay.py —— 那是客户端连远端用的本机一跳）") -ForegroundColor DarkGray
 

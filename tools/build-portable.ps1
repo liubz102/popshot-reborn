@@ -160,6 +160,7 @@ try {
     # --- 3. 服务端代码（和服务端包同一份，铁律 8）---------------------------
     Write-Host '  [3/6] server（单机假服务器 = 云端服务端的同一套代码）'
     Update-MapData -Root $Root
+    Update-WeaponData -Root $Root
     $serverFiles = Copy-ServerCode -Root $Root -PackageRoot $OutputDirectory -IncludeRelayClient
     Write-Host ("        $($serverFiles.Count) 个文件") -ForegroundColor DarkGray
     if ($IncludeSave) {

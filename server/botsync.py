@@ -110,6 +110,73 @@ LOAD_PROGRESS_MAX = 100
 #: 事件包（进 `PktQueue` 的那一类）的分界线。
 RELIABLE_OPCODE_MAX = 0x4000
 
+# ---------------------------------------------------------------------------
+# ★★★ 对象句柄（§42 / §43）—— M3b 的地基
+# ---------------------------------------------------------------------------
+#: 一个 owner 占多大一段句柄区间。客户端 `0x473e65`：
+#: `owner = (h − 100000) / 100000 + 10`，`h < 100000` 一律算 20（怪 / 中立）。
+HANDLE_SPAN = 100000
+
+#: 座位 0 的区间从这儿开始。`0x405f02: imul ecx,ecx,0x186a0; add ecx,0x186a1`
+HANDLE_BASE = 100000
+
+#: **角色**在自己区间里的位置：基址 `+1`。
+CHARACTER_HANDLE_OFFSET = 1
+
+#: **弹体**计数器的初值：基址 `+2`（角色占了 `+1`）。
+#: 出处 `ProjectileMgr::Reset` `0x47346f`：`0x473520 mov [ebp-8], 0x186a2`
+#: = 100002，每个 owner 一格、每格 `+= 0x186a0`，共 30 格（owner 10..39）。
+#: ★ 语料实证：14 个文件里**自家弹体句柄的最小值恒等于这个数**，0 例外（§43）。
+PROJECTILE_HANDLE_OFFSET = 2
+
+#: 怪 / 中立的 owner 编码（`HandleToOwner` 对 `h < 100000` 的返回值）。
+OWNER_NEUTRAL = 20
+
+#: owner 编码的起点：`10 + 座位号`。`rpFire` body `+0` 用的是同一套编码。
+OWNER_SEAT_BASE = 10
+
+
+def character_handle(seat):
+    """座位号 -> **角色**的对象句柄（`座位 × 100000 + 100001`）。
+
+    `rpExplode +4`「命中目标的句柄」填的就是它。语料里实测到的
+    `100001 / 200001 / 300001 / 400001` 正是座位 0/1/2/3（§23 / §43）。
+    """
+    return int(seat) * HANDLE_SPAN + HANDLE_BASE + CHARACTER_HANDLE_OFFSET
+
+
+def projectile_handle(seat, index):
+    """座位号 + **本图第几发** -> 那颗子弹会拿到的弹体句柄。
+
+    ★★ 这是 M3b 全靠的那条预测。收方每收到一发 `rpFire` 就从
+    `mgr[0x14 + owner*4]` 取当前值当句柄再 `++`（`0x484920` / `0x49172e`），
+    计数器在 `ForceReloadTerrain`（开局 / 换图）时重置成本函数的 `index=0`。
+
+    **每个 owner 一格计数器**，所以别人打多少枪都不动 bot 这一格 ——
+    只要 bot 自己的发弹数记对了，句柄就一定对（§43）。
+    """
+    return (int(seat) * HANDLE_SPAN + HANDLE_BASE
+            + PROJECTILE_HANDLE_OFFSET + int(index))
+
+
+def handle_owner(handle):
+    """对象句柄 -> owner 编码。**逐指令照抄 `0x473e65`**，别自己简化。
+
+    ```asm
+    00473e65  add eax, -0x186a0            ; h − 100000
+    00473e6a  jns 0x473e70                 ; ★ 结果 < 0 -> 直接返回 20
+    00473e6c  push 0x14 ; pop eax ; ret
+    00473e70  cdq ; mov ecx,0x186a0 ; idiv ecx ; add eax,0xa
+    ```
+
+    ★ `idiv` 是**朝零截断**的，负数上和 Python 的 `//` 不一样 ——
+    不过上面那道 `jns` 已经把负数挡掉了，所以这里用 `//` 是安全的。
+    """
+    value = int(handle) - HANDLE_BASE
+    if value < 0:
+        return OWNER_NEUTRAL
+    return value // HANDLE_SPAN + OWNER_SEAT_BASE
+
 
 class SyncInvariantError(AssertionError):
     """D5 的三条不变式被违反了。**继承 `AssertionError` 是故意的** ——
@@ -462,7 +529,17 @@ FIRE_SOURCE_PLAYER_BASE = 10
 FIRE_SLOT_DEFAULT = 1
 
 #: `rpFire` body `+22`：一次打几发。6975 : 45 : 20 = 1 : 2 : 3。
+#: ★ 收侧把它当**弹体总数**用：外层轮数 = `count / SpreadFrags`（整数除法），
+#: 每轮造 `SpreadFrags` 颗（§46）。填的比 `SpreadFrags` 小 = 一颗都造不出来。
 FIRE_SHOTS_DEFAULT = 1
+
+#: 上限：`0x491f41: cmp [ebp+0x20],0x1e; jge 退出` —— **≥ 30 的整包被丢弃**。
+FIRE_SHOTS_MAX = 29
+
+#: `rpFire` body `+18`：力度。`PowerControl=0` 的武器在语料里**恒 1.0**
+#: —— 那一格只对蓄力武器（`PowerControl=1 / 2`，8~531）有意义，
+#: 具体填多少由 `ballistics.power_for_speed()` 反解。
+FIRE_POWER_FIXED = 1.0
 
 _FIRE = struct.Struct("<BBiffffi")
 _EXPLODE = struct.Struct("<iiffiif")
@@ -487,15 +564,31 @@ def fire_body(seat, ammo_id, x, y, angle, power,
                       int(shots))
 
 
-def explode_body(handle, target_handle, x, y, hit_kind=0, flags=0, radius=3.0):
+#: `rpExplode +16` 命中类型。收侧只拿它做表现分流，扣血看的是 `+4` 的目标句柄。
+HIT_NONE = 0            # 什么都没打中（打到空气 / 飞出图外）
+HIT_OBJECT = 1          # 打中别的对象（破坏物之类）
+HIT_CHARACTER = 2       # ★ 打中角色
+HIT_CHARACTER_ALT = 5   # 也是打中角色（语料 248 发，和 2 联动的 `+20` 不同）
+
+
+def explode_body(handle, target_handle, x, y,
+                 hit_kind=HIT_NONE, flags=0, damage=3.0):
     """`0x0003 rpExplode`（28 字节）。
 
-    `handle` = 弹体句柄，`target_handle` = 命中目标的句柄（`0` = 没命中，
-    玩家是「座位 × 100000 + 100001」）。`hit_kind`：0 没命中 / 1 命中别的
-    对象 / 2·5 命中角色。`flags` 那一格（`+20`）语义仍是 ❓。
+    `handle` = 弹体句柄（`projectile_handle()` 算的那个），
+    `target_handle` = 命中目标的句柄（`0` = 没命中，角色用 `character_handle()`）。
+
+    ★★ `damage`（`+24`）**就是伤害值**（§42）：分发器 `0x491930` 把它
+    朝零截断成 int，原样交给目标角色的 `Character::OnHit`（`0x4ff27d`）——
+    **收方不重算**。所以这一格填多少，对面就掉多少血。
+    数值取自 `weapon.ini` 的 `Damage`（`server/weapondata.py`），别自己编。
+
+    ⚠ **两个句柄都必须对得上**：收侧 `0x492750` / `0x492856` 查不到就
+    **静默丢弃**（不报错、不重试、一局之内不自愈），表现是「子弹飞过去
+    不炸、一滴血不掉」。
     """
     return _EXPLODE.pack(int(handle), int(target_handle), float(x), float(y),
-                         int(hit_kind), int(flags), float(radius))
+                         int(hit_kind), int(flags), float(damage))
 
 
 def jump_body(seat, stage=1):
@@ -560,13 +653,26 @@ class BotSyncStream:
     """
 
     __slots__ = ("conn", "events", "_epoch_value", "_lock", "sent",
-                 "dropped", "broken")
+                 "dropped", "broken", "projectiles", "announced")
 
     def __init__(self, conn):
         #: 这条流属于哪个 `BotConn`（局号和座位号都从它身上问）。
         self.conn = conn
         #: 已经发出去的**事件包**数 = 下一个事件包的序号 = 心跳里的 N。
         self.events = 0
+        #: ★★ **本图已经发出去的弹体数** —— 收方那边的弹体句柄计数器
+        #: 就是按这个数往前走的（§42 / §43）。下一发子弹的句柄 =
+        #: `projectile_handle(座位, self.projectiles)`。
+        #:
+        #: ★ 清零时机**不是**换代，是**换图**（客户端那边叫
+        #: `ForceReloadTerrain`）—— `reset_projectiles()` 由
+        #: `BotConn.reset_battle_frame()` 调，那正好是开局 / 换图两处，
+        #: 和 `gameserver.reset_sync_trails()` 同一个口径（D28 的硬约束 2）。
+        self.projectiles = 0
+        #: ★★ **最近一发心跳报出去的 N**（§50）。收方拿 N 做 `FlushTo(N)`，
+        #: 所以「事件包 e 已经被交给收方的游戏逻辑」= `announced > e`。
+        #: 延后爆炸靠它判「那一发 `rpFire` 到底露面了没有」。
+        self.announced = 0
         #: 上一次组包时看到的局号，用来发现换代。
         self._epoch_value = None
         self._lock = threading.RLock()
@@ -596,12 +702,23 @@ class BotSyncStream:
         if value != self._epoch_value:
             self._epoch_value = value
             self.events = 0
+            # ★ 事件序号回 0 了，「报到第几个」也必须跟着回 0 ——
+            #   不清的话上一代那个大 N 会让新一代的事件包一发出去就被
+            #   当成「已经报过了」。
+            self.announced = 0
 
     # -- 组包 ---------------------------------------------------------------
     def heartbeat(self, state):
-        """一发心跳。**N 恒等于已发出的事件包数**（不变式 2）。"""
+        """一发心跳。**N 恒等于已发出的事件包数**（不变式 2）。
+
+        ★★ 顺手记下 `announced` = 这一发报出去的 N。收方拿它 `FlushTo(N)`，
+        所以「**事件包 e 已经被交给游戏逻辑了**」这个事实 = `announced > e`。
+        `bot.py` 的延后爆炸靠它分流（§50）—— 那是个**事件**判据，
+        不是「等 XX 毫秒」。
+        """
         with self._lock:
             self._sync_epoch()
+            self.announced = self.events
             body = heartbeat_body(self.events, self.conn.my_seat, state)
             # ★ 心跳的头 `+8` 恒 0（语料 67186 发只有这一个取值）——
             #   它没有任何可判新旧的原版字段，所以下行也绝不能双发。
@@ -633,6 +750,48 @@ class BotSyncStream:
                                        self.epoch_value(), sequence=sequence)
             self.events = sequence + 1
             return packet
+
+    # -- 弹体句柄（M3b）-----------------------------------------------------
+    def reset_projectiles(self):
+        """本图的发弹数清零 —— 对称于客户端的 `ForceReloadTerrain`。
+
+        由 `BotConn.reset_battle_frame()` 调（开局 / 换图各一次）。
+        **不要挂在换代上**：客户端重置弹体管理器看的是「重新加载地形」这件事，
+        和局号 `+1` 不是同一个事件（D28 的硬约束 2）。
+        """
+        with self._lock:
+            self.projectiles = 0
+
+    def fire(self, ammo_id, x, y, angle, power, handle_step, shots=1,
+             **kwargs):
+        """一发 `rpFire`，**同时把句柄记账推进**。返回 `(包, 头一颗弹体的句柄)`。
+
+        ★★ 组包和记账**必须在一次加锁里做完**：句柄是「收方按到达顺序自己
+        分配」的，服务端这边只要有两发交错，预测的号就和收方的错开 ——
+        而错开的后果是 `rpExplode` 被静默丢弃（§42），一局之内不自愈。
+
+        `shots` = 这一发造几颗弹体（`weapondata.Weapon.shots` = `SpreadFrags`）。
+        收侧 `OnFire` 在**开火那一刻**就把这几颗连着注册完（`0x49231e` 的
+        `call 0x473e7c` 在内层循环里，§46），所以它们的句柄是
+        `base + 0 … base + shots − 1`，调用方按这个序去发 `rpExplode`。
+
+        `handle_step` = 这一发**总共**吃掉几个句柄（`shots × (2 if 溅射 else 1)`）。
+        多出来的那些是爆炸时才创建的溅射对象，所以这个数只在
+        「本发的 `rpExplode` 全发完之前不开下一枪」的前提下成立 ——
+        闸门在 `bot.py`（`_pending_explosions`）。
+        """
+        shots = int(shots)
+        _require(1 <= shots <= FIRE_SHOTS_MAX,
+                 f"一发打 {shots} 颗不合法（收侧 0x491f41 丢弃 ≥ 30 的整包）")
+        _require(isinstance(handle_step, int) and handle_step >= shots,
+                 f"弹体句柄步进 {handle_step!r} 小于弹体数 {shots}，这把武器不能用")
+        with self._lock:
+            handle = projectile_handle(self.conn.my_seat, self.projectiles)
+            packet = self.event(OP_FIRE, fire_body(
+                self.conn.my_seat, ammo_id, x, y, angle, power,
+                shots=shots, **kwargs))
+            self.projectiles += int(handle_step)
+            return packet, handle
 
     # -- 投递 ---------------------------------------------------------------
     def deliver(self, packet, deliver_fn):

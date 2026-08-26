@@ -8249,10 +8249,11 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
   respawn [id] [x] [y] [unk]      发 0x0419 gspRespawnCharacter；
                                   x/y 省略时用客户端 0x0406 自报的最后坐标。
                                   ★ 正常路径是回显客户端的 0x0413，这条只给试探用
-  nextmap <地图名>                发 0x0417 gspRepChangeToNextMap 直接换图。
-                                  ★ 正常路径是回显客户端的 0x0411（§111），
-                                  这条只给试探用；地图名要写客户端认识的，
-                                  写错了会加载失败卡在加载画面
+  nextmap <地图名>                触发一次换图。★ 走的是**客户端 0x0411 的
+                                  那条真路径**（§111）：全房间广播 0x0417 +
+                                  清位置轨迹和 bot 的那一图状态。所以它可以
+                                  用来在**对战房**里验换图（原版只有闯关会换图）。
+                                  地图名要写客户端认识的，写错了会卡在加载画面
   map-ready                       发 0x0418（空包）= 放行换图加载循环。
                                   正常路径由客户端的 0x0412 轮询自动触发
   drop [物件id] [x] [y] [vx] [vy] 发 0x0404 gspCreatedItem，在指定坐标凭空掉一件。
@@ -8492,13 +8493,22 @@ def _dispatch_control_command(line):
         if len(words) < 2:
             return "err 用法: nextmap <地图名>"
         map_name = words[1]
-        conn.log(f"[ctl] ← 手动发 gspRepChangeToNextMap(0x0417) 地图={map_name!r}")
-        # ★ 走和真客户端同一份房间级状态（`RoomQuest`），不然手动推的换图
-        #   和 `0x0412` 那条等人链会各说各话。
-        conn.quest_state().begin_map_change(map_name)
-        conn.send(build_game(OP_REP_CHANGE_TO_NEXT_MAP,
-                             build_rep_change_to_next_map(map_name)))
-        return f"ok 已发 0x0417 地图={map_name}"
+        conn.log(f"[ctl] ← 手动触发换图 地图={map_name!r}")
+        # ★★ **直接走客户端那条路**（喂一发和 `0x0411` 逐字节一样的载荷），
+        #   不要自己另发一份 `0x0417`。
+        #
+        #   原来这里是「`begin_map_change` + 只给自己 `send()`」，漏掉了真路径
+        #   上的两件事：**全房间广播**、以及 `reset_sync_trails()`
+        #   （把每个人的位置轨迹和 bot 的那一图状态 —— 落脚点、蹲姿、
+        #   **弹体句柄记账** —— 全部清掉，§42 / D28 的硬约束 2）。
+        #   拿那样的换图去验 bot，验到的是一条**真实游戏里不存在**的路径：
+        #   客户端那边的计数器清了、服务端这边没清，于是「换图后打不中」——
+        #   一个纯粹由调试通道自己造出来的假故障。
+        #
+        #   调试通道存在的意义是「用一行命令替代打完一整关」，那它就必须和
+        #   那一整关**走同一段代码**，否则它是个陷阱而不是工具。
+        conn.on_req_change_to_next_map(w_wstr(map_name))
+        return f"ok 已按客户端 0x0411 的路径换图，地图={map_name}"
 
     if cmd == "map-ready":
         conn.log("[ctl] ← 手动发 0x0418（放行换图加载循环）")
