@@ -186,6 +186,14 @@ PEER_HEARTBEAT_VELOCITY_OFFSET = PEER_HEARTBEAT_STATE_OFFSET + 4
 PEER_HEARTBEAT_FIELD_OFFSET = PEER_HEARTBEAT_STATE_OFFSET + 12
 PEER_HEARTBEAT_BIT_ONGROUND = 0x04
 
+#: 同一个位域的 **bit3**（= `[char+0x4bc]`）= ★ **「我在冲刺」**（V0.3 §40）。
+#:
+#: 就是按住鼠标右键那个「耗能量、跑得快、脚下扬尘」的状态。收方拿它
+#: **把这个角色整帧的 `dt` 乘上 `FastRunRate`**（`0x507594`）—— 走路位移、
+#: 空中积分、动画播放速率全都跟着快。语料实测：置起时在地上每帧 `|dx|`
+#: 中位数 **33**，没置起是 **22**（正好 1.5 倍，即这一版配置的 `FastRunRate`）。
+PEER_HEARTBEAT_BIT_FASTRUN = 0x08
+
 #: 一个 UDP 数据报最大多长。位置包 43 字节 + 我们 8 字节头 + 每份 6 字节，
 #: 捎带满 4 份也才 ~260 字节 —— 1400 是留给「以后想多带点」的余量，
 #: 同时保证永远不会被 IP 分片（分片一丢就是整报丢，等于白做冗余）。
@@ -392,10 +400,11 @@ def heartbeat_position(udp_packet):
 
 
 def heartbeat_motion(udp_packet):
-    """心跳里的**整套运动状态** `(x, y, on_ground, vx, vy)`；不是心跳就 ``None``。
+    """心跳里的**整套运动状态** `(x, y, on_ground, vx, vy, fast_run)`；
+    不是心跳就 ``None``。
 
-    比 `heartbeat_position()` 多出来的三个量，是 bot **回放**这段轨迹时必须
-    原样抄的（V0.3 §35）：
+    比 `heartbeat_position()` 多出来的四个量，是 bot **回放**这段轨迹时必须
+    原样抄的（V0.3 §35 / §40）：
 
     * `on_ground` —— 位域 bit2。收方拿它分流位置更新（`0x504215`：上一发
       离地、这一发落地 ⇒ **硬置**坐标，否则 0.6/0.4 插值），角色的**姿势**
@@ -403,6 +412,10 @@ def heartbeat_motion(udp_packet):
     * `vx` / `vy` —— 空中的抛体速度。★ 踩在地上时它俩**必须是 0**：收方会
       拿它自己往前推算，和心跳里的坐标一打架就是「走一步停一下」的抽搐
       （用户 2026-08-26 第二轮实机报的那个症状）。
+    * `fast_run` —— 位域 bit3 = **冲刺**（§40）。真人按着右键跑的那一段，
+      bot 抄的坐标本来就是 1.5 倍步长的；不跟着报这一位，收方只会按普通
+      走速替它挪，心跳再一发发把它拽回来 —— 表现是「跟不上 + 拉扯」，
+      腿的动画速率也不对。
 
     ★ 为什么是「抄真人的」而不是「服务端自己算」：bot 走的就是真人刚走过的
     那条线（D16），真人在那一段是踩地还是腾空是**现成的事实**，服务端手上
@@ -419,7 +432,8 @@ def heartbeat_motion(udp_packet):
         udp_packet, PEER_HEARTBEAT_VELOCITY_OFFSET)
     field = struct.unpack_from("<i", udp_packet,
                                PEER_HEARTBEAT_FIELD_OFFSET)[0]
-    return (x, y, bool(field & PEER_HEARTBEAT_BIT_ONGROUND), vx, vy)
+    return (x, y, bool(field & PEER_HEARTBEAT_BIT_ONGROUND), vx, vy,
+            bool(field & PEER_HEARTBEAT_BIT_FASTRUN))
 
 
 def as_broadcast(udp_packet):

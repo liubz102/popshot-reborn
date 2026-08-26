@@ -86,6 +86,14 @@ OP_CHANGE_WEAPON = 0x0001
 OP_FIRE = 0x0002
 OP_EXPLODE = 0x0003
 OP_JUMP = 0x0006
+
+#: `0x000b rpCrouch` —— **蹲下 / 起立**（body 2 字节，§41）。
+#:
+#: ★ 蹲这件事**心跳里一个位都没有**：只有按下和松开那两下各发一发这个
+#: **事件包**，收方照着设 `[char+0x2b5]`。所以发漏了一发，那个角色就会在
+#: 别人屏幕上一直保持错的姿势 —— 它和 `rpJump` 一样是可靠有序的（D5）。
+OP_CROUCH = 0x000B
+
 OP_HEARTBEAT = udpsync.OPCODE_HEARTBEAT          # 0x4001
 
 #: `0x4005` —— **加载进度**（body = 一个 int32，取值 0..100，§30）。
@@ -189,6 +197,22 @@ FACING_LEFT = -1
 #: 且**这一发** bit2 == 1 才**硬置**坐标，否则 0.6/0.4 插值，常数
 #: `0x6937c4`/`0x6937c0`）—— 也就是「落地那一发精确归位、腾空时插值」。
 HEARTBEAT_BIT_ONGROUND = 0x04
+
+#: 位域 bit3 = `[char+0x4bc]` —— ★★ **「我在冲刺」**（按住鼠标右键，§40）。
+#:
+#: 收方拿它把**这个角色整帧的 `dt` 乘上 `FastRunRate`**（`0x507594`）：
+#: 走路位移、空中积分、动画播放速率（`0x508041` / `0x5080a9`）全都跟着快，
+#: 同时按 `FastRunSpCost` 扣能量（`[char+0x2a4]`），扣光了就地清掉这一位。
+#:
+#: 语料实测（在地上、按着方向键的帧）：置起时每帧 `|dx|` 中位数 **33**、
+#: 没置起 **22** —— 正好 1.5 倍，也就是这一版配置里的 `FastRunRate`。
+#: 1003 : 3 的比例说明它**只在真的在走的时候**出现（原版进冲刺的条件里
+#: 就有一条 `[char+0x4b4] != 0`，`0x515ced`）。
+#:
+#: ⚠ **扬尘特效（`CH_Common/efx/FastRun00.efx`）不归它管**：全镜像只有
+#: `0x515d29` 一处引用，在**本地输入处理**里 —— 别人在你屏幕上冲刺时原版
+#: 也没有扬尘（§40）。这一位管的是速度和腿的动画速率。
+HEARTBEAT_BIT_FASTRUN = 0x08
 
 # ---------------------------------------------------------------------------
 # ★★★ body `+23..24` 的六位掩码 = **方向键的按下状态**（§39）
@@ -304,6 +328,13 @@ def aim_point(x, y, facing, distance=AIM_DISTANCE):
 
     真人那个点是鼠标位置转出来的（§36），bot 没有鼠标 —— 就放在自己正前方
     `distance` 远、同高度的地方。够让身体朝向、上半身姿势和走的方向一致。
+
+    ★★ **M5 要把这个点换成「敌人 / 瞄准目标的世界坐标」**（用户 2026-08-26
+    提醒）：这个游戏的朝向跟的是准星、不是移动方向，所以「一边后退一边朝
+    身后开枪」是**合法且常见**的姿势 —— 收方那边就是 `Run-B%02d` 那条分支
+    （§39）。换掉这一个函数就够了，朝向位 / 角度 / 正走还是倒走都由
+    `aim_state()` 自动跟着变。**现在摆在正前方 = bot 永远朝前走**，
+    那是「还没有战斗目标」时的兜底，不是设计上的限制。
     """
     return (x + (AIM_DISTANCE if distance is None else distance)
             * (1 if int(facing) >= 0 else -1), y)
@@ -336,7 +367,8 @@ def aim_state(x, y, cursor, facing=None):
 
 def character_state(x, y, vx=0, vy=0, facing=FACING_RIGHT, on_ground=True,
                     angle_deg=HEARTBEAT_ANGLE_DEG, cursor=None,
-                    keys=0, state_byte=HEARTBEAT_STATE_BYTE):
+                    keys=0, fast_run=False,
+                    state_byte=HEARTBEAT_STATE_BYTE):
     """那 24 字节角色状态结构（心跳 body `+7..30`）。
 
     逐字段的收发两侧对照见 `FINDINGS.md` §24 / §25，四处勘误见 §35 ~ §37 + §39。
@@ -356,6 +388,13 @@ def character_state(x, y, vx=0, vy=0, facing=FACING_RIGHT, on_ground=True,
 
     ★ **腾空时调用方应当填 0**：那一段动画是 `Jump`（不看掩码），而收方
     `0x507402` 会拿按键**覆写**空中速度（`× 1.5`），把抄来的抛体速度冲掉。
+
+    ## ★★ `fast_run`：真人按着右键跑的那一段（§40）
+
+    收方拿它把这个角色的 `dt` 乘上 `FastRunRate`（这一版配置 = 1.5）——
+    **位移和腿的动画速率一起变快**。bot 抄的坐标本来就是 1.5 倍步长的，
+    不跟着报这一位，收方只按普通走速替它挪、心跳再一发发把它拽回来。
+    ★ 只有「在地上、真的在走」时才该置起（原版进冲刺就要求 `[0x4b4] != 0`）。
 
     ## ★★★ `on_ground` 和速度两格：调用方**必须一起给对**（§35）
 
@@ -381,6 +420,8 @@ def character_state(x, y, vx=0, vy=0, facing=FACING_RIGHT, on_ground=True,
     field = int(facing) & 0x03
     if on_ground:
         field |= HEARTBEAT_BIT_ONGROUND
+    if fast_run:
+        field |= HEARTBEAT_BIT_FASTRUN
     return _CHARACTER_STATE.pack(
         clamp_i16(x), clamp_i16(y),              # +0x00 / +0x02  位置
         packed_vx, packed_vy,                    # +0x04 / +0x06  空中速度
@@ -426,6 +467,7 @@ FIRE_SHOTS_DEFAULT = 1
 _FIRE = struct.Struct("<BBiffffi")
 _EXPLODE = struct.Struct("<iiffiif")
 _JUMP = struct.Struct("<BB")
+_CROUCH = struct.Struct("<BB")
 _CHANGE_WEAPON = struct.Struct("<Bi")
 
 
@@ -459,6 +501,19 @@ def explode_body(handle, target_handle, x, y, hit_kind=0, flags=0, radius=3.0):
 def jump_body(seat, stage=1):
     """`0x0006 rpJump`（2 字节）：座位号 + 第几段跳（1 / 2）。"""
     return _JUMP.pack(int(seat) & 0xFF, int(stage) & 0xFF)
+
+
+def crouch_body(seat, down=True):
+    """`0x000b rpCrouch`（2 字节）：座位号 + `1` 蹲下 / `0` 起立（§41）。
+
+    语料 394 发：`+0` 和 `UdpPacket` 头 `+1` 的发送方**100% 一致**，
+    `+1` 只有 0（181 发）和 1（213 发）两种取值。
+
+    收方 `0x492f5f` 拿它调 `0x5026e1` 设 `[char+0x2b5]`，那一位管三件事：
+    姿势换成 `Crouch*`、**移动速度 × 1/3**（`0x507607`）、
+    **体力恢复 × 2**（`0x507250`）。
+    """
+    return _CROUCH.pack(int(seat) & 0xFF, 1 if down else 0)
 
 
 def change_weapon_body(seat, weapon_id):

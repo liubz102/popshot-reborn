@@ -3109,19 +3109,26 @@ SYNC_TRAIL_POINTS = 64
 #: 轨迹上的一个采样点 —— **一发真人心跳里所有 bot 回放要用的东西**。
 #:
 #: `jumped` = 这一点之前收到过的 `rpJump` 段号（0 = 没跳）。
-#: `on_ground` / `vx` / `vy` = 位域 bit2 和空中速度（V0.3 §35）：
+#: `on_ground` / `vx` / `vy` = 位域 bit2 和空中速度（V0.3 §35）、
+#: `fast_run` = 位域 bit3 = 按着右键冲刺（V0.3 §40）、
+#: `crouch` = 最近一发 `rpCrouch` 说的蹲没蹲（V0.3 §41）：
 #: bot 走到这一段时**原样抄**，不自己算 —— 「真人在这儿是踩地还是腾空、
-#: 腾空时速度多少」是现成的事实，服务端手上就有（D16 的延伸）。
+#: 腾空时速度多少、是不是在冲刺」都是现成的事实，服务端手上就有（D16 的延伸）。
 #:
 #: ★ 做成 `namedtuple` 是为了**旧的下标写法照样能用**（`point[0]` / `[1]`
 #: / `[2]` 仍是 x / y / jumped），单测里的假轨迹不用全改。
 SyncTrailPoint = collections.namedtuple(
-    "SyncTrailPoint", "x y jumped on_ground vx vy")
-SyncTrailPoint.__new__.__defaults__ = (True, 0, 0)
+    "SyncTrailPoint", "x y jumped on_ground vx vy fast_run crouch")
+SyncTrailPoint.__new__.__defaults__ = (True, 0, 0, False, False)
 
 #: `UdpPacket` 的内层 `0x0006 rpJump`（body = 座位号 + 第几段跳，V0.3 §23）。
 #: 这里只用来把「他起跳了」记进位置轨迹，组包在 `botsync.py`。
 PEER_OP_JUMP = 0x0006
+
+#: `UdpPacket` 的内层 `0x000b rpCrouch`（body = 座位号 + `1` 蹲下 / `0` 起立，
+#: V0.3 §41）。蹲**不在心跳里**，只有这一发**事件包**说得着 —— 所以服务端
+#: 得自己把它记成状态，bot 回放到那一段时再补一发。组包在 `botsync.py`。
+PEER_OP_CROUCH = 0x000B
 
 #: `UdpPacket` 的内层 `0x4005` —— **加载进度**（body = 一个 int32，0..100，V0.3 §30）。
 #:
@@ -4262,6 +4269,9 @@ def reset_sync_trails(room, why):
         if trail:
             trail.clear()
         conn.sync_jumped = 0
+        # ★ 换图 / 新一局客户端会把角色重建，蹲的状态跟着归零（`0x4ffc4a`），
+        #   服务端这份记账也要一起清，否则 bot 会照着上一张图的姿势起步。
+        conn.sync_crouch = False
         # bot 那一份（`bot.BotConn` 才有；真人身上没有这几个字段）。
         if conn.is_bot_conn():
             conn.reset_battle_frame()
@@ -4506,6 +4516,7 @@ class Conn:
     #   测试夹具会走到这一步，正常连接在 `__init__` 里就建好了）。
     sync_trail = ()
     sync_jumped = 0
+    sync_crouch = False
     # ★ 「这条连接报过几个位置点」。bot 的帧循环拿它当**事件**（V0.3 §32）：
     #   号变了 = 这个真人报了一个新位置 = bot 该走一帧了。只增不减、不回绕
     #   （Python 的 int 没有上限），换图 / 新一局都**不清** —— bot 那边存的
@@ -4626,6 +4637,9 @@ class Conn:
         # 上一发心跳之后收到过的 rpJump 段数（0 = 没跳）。下一发心跳把它
         # 记进轨迹点，bot 回放到那儿时就跟着跳一下。
         self.sync_jumped = 0
+        # ★ 他现在蹲着没有。`rpCrouch`(0x000b) 只在按下 / 松开各来一发，
+        #   中间的每一发心跳都照这个状态记进轨迹点（V0.3 §41）。
+        self.sync_crouch = False
         # 记了几个位置点（bot 的帧事件）。见类级默认值。
         self.sync_trail_seq = 0
         # 本局关卡的状态**不在房间里时**用的那一份（协议试探 / 控制通道手搓包）。
@@ -7286,9 +7300,9 @@ class Conn:
 
         * **心跳**（内层 `0x4001`）：body `+7..10` 就是角色坐标（两个 i16，
           `0x5041e1` 把它们写回 `[char+0x34]` / `[char+0x38]`）。记一个点，
-          并把 `sync_trail_seq` **+1**。★ 同一发里的**地面标志和空中速度**
-          （位域 bit2 / body `+11..14`）也一起记 —— bot 回放这条轨迹时要
-          原样抄，抄错了就没有走路动画（V0.3 §35）。
+          并把 `sync_trail_seq` **+1**。★ 同一发里的**地面标志 / 空中速度 /
+          冲刺位**（位域 bit2 / body `+11..14` / 位域 bit3）也一起记 ——
+          bot 回放这条轨迹时要原样抄，抄错了就没有走路动画（V0.3 §35 / §40）。
         * **`rpJump`**（内层 `0x0006`）：它本身不带坐标，只说「起跳了，第几段」。
           先攒着，下一发心跳把它记进那个点 —— bot 回放到那一段时就跟着跳，
           跳跃的抛物线因此是**真人真跳出来的**，不用服务端算重力。
@@ -7306,18 +7320,25 @@ class Conn:
             if len(payload) >= udpsync.PEER_HEADER_SIZE + 2:
                 self.sync_jumped = payload[udpsync.PEER_HEADER_SIZE + 1]
             return
+        if opcode == PEER_OP_CROUCH:
+            # ★ 蹲是**状态**不是事件（和 rpJump 相反）：`rpCrouch` 只在按下 /
+            #   松开那一下各来一发，中间全靠这边记着（V0.3 §41）。
+            if len(payload) >= udpsync.PEER_HEADER_SIZE + 2:
+                self.sync_crouch = bool(payload[udpsync.PEER_HEADER_SIZE + 1])
+            return
         if opcode == PEER_OP_LOAD_PROGRESS:
             # 加载进度：不带坐标，也不再记（D26 之后没人读它了）。
             return
         motion = udpsync.heartbeat_motion(payload)
         if motion is None:
             return
-        x, y, on_ground, vx, vy = motion
+        x, y, on_ground, vx, vy, fast_run = motion
         trail = self.sync_trail
         if not isinstance(trail, collections.deque):    # 见类级默认值的说明
             trail = self.sync_trail = collections.deque(
                 maxlen=SYNC_TRAIL_POINTS)
-        trail.append(SyncTrailPoint(x, y, self.sync_jumped, on_ground, vx, vy))
+        trail.append(SyncTrailPoint(x, y, self.sync_jumped, on_ground, vx, vy,
+                                    fast_run, bool(self.sync_crouch)))
         self.sync_trail_seq += 1
         self.sync_jumped = 0
 

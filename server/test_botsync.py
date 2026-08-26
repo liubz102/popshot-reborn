@@ -242,6 +242,20 @@ class HeartbeatBodyTests(unittest.TestCase):
             state = botsync.character_state(0, 0, keys=keys)
             self.assertEqual(keys, struct.unpack_from("<H", state, 16)[0])
 
+    def test_the_fast_run_flag_lands_in_bit_three_of_the_bitfield(self):
+        """★★ 位域 bit3 = `[char+0x4bc]` = **冲刺**（§40）。
+
+        收方拿它把这个角色整帧的 `dt` 乘 `FastRunRate`（这一版 = 1.5）——
+        位移和腿的动画速率一起变快。语料实测：置起时在地上每帧 `|dx|`
+        中位数 33、没置起 22。
+        """
+        for fast_run in (False, True):
+            state = botsync.character_state(0, 0, fast_run=fast_run)
+            self.assertEqual(
+                fast_run,
+                bool(struct.unpack_from("<i", state, 12)[0]
+                     & botsync.HEARTBEAT_BIT_FASTRUN))
+
     def test_walk_keys_maps_the_direction_to_the_arrow_key(self):
         """★★ 走路方向 -> 按键：右 -> bit2、左 -> bit0、不动 -> 一个都不按。
 
@@ -330,6 +344,12 @@ class EventBodyTests(unittest.TestCase):
         body = botsync.explode_body(4242, 200001, 10.0, 20.0, hit_kind=2)
         self.assertEqual(28, len(body))
         self.assertEqual((4242, 200001), struct.unpack_from("<ii", body, 0))
+
+    def test_crouch_is_two_bytes_seat_then_down_flag(self):
+        """★ `rpCrouch`（`0x000b`）：语料 394 发，`+0` 和发送方座位 100% 一致、
+        `+1` 只有 0（181 发）/ 1（213 发）两种（§41）。"""
+        self.assertEqual(b"\x03\x01", botsync.crouch_body(3, True))
+        self.assertEqual(b"\x03\x00", botsync.crouch_body(3, False))
 
     def test_jump_is_two_bytes_seat_then_stage(self):
         self.assertEqual(b"\x05\x02", botsync.jump_body(5, 2))
@@ -486,12 +506,21 @@ class TrailPointTests(unittest.TestCase):
         trail = self.trail((0, 0, 0, True, 0, 0), (100, 0, 0, False, 9, -20),
                            (200, 0, 0, True, 0, 0))
         # 往回 50 -> 落在 (100,0) -> (200,0) 这一段里，靠老那一端是腾空的。
-        x, _, _, on_ground, vx, vy = bot.trail_point(trail, 50)
+        x, _, _, on_ground, vx, vy, _, _ = bot.trail_point(trail, 50)
         self.assertAlmostEqual(150.0, x)
         self.assertFalse(on_ground)
         self.assertEqual((9, -20), (vx, vy))
         # 再往回一段 -> 越过的是第一个点，那儿是踩在地上的。
-        self.assertEqual((True, 0, 0), bot.trail_point(trail, 150)[3:])
+        self.assertEqual((True, 0, 0, False, False),
+                         bot.trail_point(trail, 150)[3:])
+
+    def test_the_fast_run_flag_comes_from_that_same_point(self):
+        """★ 冲刺位（位域 bit3）和上面几格同一个口径（§40）。"""
+        trail = self.trail((0, 0, 0, True, 0, 0, False),
+                           (100, 0, 0, True, 0, 0, True),
+                           (200, 0, 0, True, 0, 0, False))
+        self.assertTrue(bot.trail_point(trail, 50)[6])
+        self.assertFalse(bot.trail_point(trail, 150)[6])
 
     def test_an_old_three_tuple_point_counts_as_walking_on_the_ground(self):
         """没有运动信息的老式点：当成**踩在地上**（`_motion_of` 的兜底）。
@@ -500,7 +529,7 @@ class TrailPointTests(unittest.TestCase):
         说踩地最多是少一段抛物线姿势。
         """
         point = bot.trail_point(self.trail((0, 0, 0), (100, 0, 0)), 50)
-        self.assertEqual((True, 0, 0), point[3:])
+        self.assertEqual((True, 0, 0, False, False), point[3:])
 
     def test_the_landing_point_is_interpolated_inside_the_segment(self):
         """★ 落脚点在两个采样点**之间**，不吸附（V0.3 §32）。
@@ -568,7 +597,7 @@ class BotFrameRoom(BotBattleRoom):
     """
 
     def human_heartbeat(self, conn, x, y, jumped=0, on_ground=True,
-                        velocity=(0, 0)):
+                        velocity=(0, 0), fast_run=False):
         """让 `conn` 发一发带位置的心跳（走真的 `0x040e` 入口）。
 
         ★ 不用再复位什么闸门：bot 的帧判据是「这个真人报了一个新位置」
@@ -582,12 +611,15 @@ class BotFrameRoom(BotBattleRoom):
                 conn, jumped))
         gameserver.Conn.on_game_packet(
             conn, OP_PEER_DATA_UP,
-            self.beat(conn, x, y, on_ground=on_ground, velocity=velocity))
+            self.beat(conn, x, y, on_ground=on_ground, velocity=velocity,
+                      fast_run=fast_run))
 
-    def beat(self, conn, x, y, on_ground=True, velocity=(0, 0)):
+    def beat(self, conn, x, y, on_ground=True, velocity=(0, 0),
+             fast_run=False):
         seat = self.room.seat_index_of(conn)
         state = botsync.character_state(x, y, vx=velocity[0], vy=velocity[1],
-                                        on_ground=on_ground)
+                                        on_ground=on_ground,
+                                        fast_run=fast_run)
         return botsync.build_peer_packet(
             seat, botsync.OP_HEARTBEAT,
             botsync.heartbeat_body(0, seat, state),
@@ -598,6 +630,19 @@ class BotFrameRoom(BotBattleRoom):
         return botsync.build_peer_packet(
             seat, botsync.OP_JUMP, botsync.jump_body(seat, stage),
             game_id=self.room.epoch_value, sequence=self.next_seq(conn))
+
+    def human_crouch(self, conn, down):
+        """真人按下 / 松开下蹲 —— 发一发 `rpCrouch`（§41）。
+
+        ★ 它是**事件包**，中间的心跳里一个位都没有，所以状态由服务端记着。
+        """
+        seat = self.room.seat_index_of(conn)
+        gameserver.Conn.on_game_packet(conn, OP_PEER_DATA_UP,
+                                       botsync.build_peer_packet(
+                                           seat, botsync.OP_CROUCH,
+                                           botsync.crouch_body(seat, down),
+                                           game_id=self.room.epoch_value,
+                                           sequence=self.next_seq(conn)))
 
     def next_seq(self, conn):
         conn.test_seq = getattr(conn, "test_seq", 0) + 1
@@ -792,6 +837,28 @@ class BotWalkAnimationTests(BotFrameRoom):
         self.assertTrue(frames)
         self.assertEqual([0] * len(frames), [self.keys_of(f) for f in frames])
 
+    def test_a_bot_following_a_dashing_human_dashes_too(self):
+        """★★ 真人按右键冲刺 -> bot 也报冲刺位（§40）。
+
+        不报的话：bot 抄来的坐标是 1.5 倍步长的，收方却只按普通走速替它挪，
+        每发心跳再把它拽回来 —— 跟不上 + 拉扯，腿的动画速率也不对。
+        """
+        self.walk(self.alice, [(0, 0), (200, 0)])
+        for x in (400, 600, 800):
+            self.human_heartbeat(self.alice, x, 0, fast_run=True)
+        _, _, field = self.state_of(bot_frames(self.alice, self.bot_seat)[-1])
+        self.assertTrue(field & botsync.HEARTBEAT_BIT_FASTRUN)
+
+    def test_a_standing_bot_never_claims_to_dash(self):
+        """★ 站着不能冲刺 —— 原版进冲刺就要求走路方向非 0（语料 1003 : 3）。"""
+        for _ in range(4):
+            self.human_heartbeat(self.alice, 400, 0, fast_run=True)
+        frames = bot_frames(self.alice, self.bot_seat)
+        self.assertTrue(frames)
+        for frame in frames:
+            _, _, field = self.state_of(frame)
+            self.assertFalse(field & botsync.HEARTBEAT_BIT_FASTRUN)
+
     def test_the_bot_step_equals_the_humans_step_that_frame(self):
         """★ bot 这一帧挪多远 = 真人这一帧挪多远（V0.3 §32）。
 
@@ -974,6 +1041,102 @@ class BotJumpReplayTests(BotFrameRoom):
                          udpsync.heartbeat_next_event_seq(beats[-1]))
 
 
+class BotCrouchTests(BotFrameRoom):
+    """★ 蹲下（`rpCrouch`，§41）—— 和 `rpJump` 一样是**事件包**回放，
+    但它是**状态**不是一次性动作：按下和松开各一发，中间全靠两边记着。
+
+    蹲这一位在收方管三件事：姿势换成 `Crouch*`、**移动速度 × 1/3**、
+    **体力恢复 × 2**。所以它必须和坐标的实际步长对上 —— 真人蹲着挪的是
+    1/3 步长，bot 抄了坐标却说自己站着，收方就会按 3 倍速度替它走。
+    """
+
+    def crouches(self):
+        """bot 发出去的 `rpCrouch` 里那个 0/1，按先后顺序。"""
+        return [body_of(f)[1] for f in bot_frames(self.alice, self.bot_seat)
+                if udpsync.peer_opcode(f) == botsync.OP_CROUCH]
+
+    def walk_past_the_follow_distance(self):
+        """再走够 `BOT_FOLLOW_DISTANCE`，让 bot 的落脚点越过刚才那一段。"""
+        self.walk(self.alice, [(400, 0), (600, 0), (800, 0)])
+
+    def test_the_bot_crouches_where_the_human_crouched(self):
+        self.walk(self.alice, [(0, 0), (200, 0)])
+        self.human_crouch(self.alice, True)
+        self.walk_past_the_follow_distance()
+        self.assertEqual([1], self.crouches())
+
+    def test_the_bot_stands_up_again(self):
+        self.walk(self.alice, [(0, 0), (200, 0)])
+        self.human_crouch(self.alice, True)
+        self.walk_past_the_follow_distance()
+        self.human_crouch(self.alice, False)
+        self.walk(self.alice, [(1000, 0), (1200, 0), (1400, 0)])
+        self.assertEqual([1, 0], self.crouches())
+
+    def test_it_is_sent_once_per_flip_not_once_per_frame(self):
+        """★ 去重按**状态翻转**（铁律 10）：蹲着走十帧也只有那一发。
+
+        每发都补的话，事件包的可靠序号会被白白吃掉一大串 —— 而那本账
+        和心跳里的 N 是同一本（D5）。
+        """
+        self.walk(self.alice, [(0, 0), (200, 0)])
+        self.human_crouch(self.alice, True)
+        self.walk_past_the_follow_distance()
+        for x in range(900, 1500, 60):
+            self.human_heartbeat(self.alice, x, 0)
+        self.assertEqual([1], self.crouches())
+
+    def test_a_bot_that_never_saw_a_crouch_says_nothing(self):
+        self.walk(self.alice, [(0, 0), (200, 0), (400, 0), (600, 0)])
+        self.assertEqual([], self.crouches())
+
+    def test_the_crouch_state_is_forgotten_on_a_new_map(self):
+        """★★ 换图 / 新一局客户端把角色重建、蹲的状态归零（`0x4ffc4a`）。
+
+        两边的记账必须一起清：不清的话 bot 以为自己还蹲着，于是**不发**
+        新图上那一发蹲下的 `rpCrouch`，姿势从此对不上。
+        """
+        self.walk(self.alice, [(0, 0), (200, 0)])
+        self.human_crouch(self.alice, True)
+        self.walk_past_the_follow_distance()
+        self.assertTrue(self.bot_conn.crouched)
+        gameserver.reset_sync_trails(self.room, "测试")
+        self.assertFalse(self.bot_conn.crouched)
+        self.assertFalse(self.alice.sync_crouch)
+
+    def test_dying_forgets_the_crouch_and_the_bot_crouches_again(self):
+        """★★ 客户端一死就把 `[char+0x2b5]` 清掉（死亡处理器 `0x4ffbb7`）。
+
+        服务端这边不跟着清，两边的记账就错开一轮：真人还蹲着 ⇒ bot 看不到
+        「翻转」⇒ 重生之后**不发**那一发蹲下，姿势一直是站着的。
+        """
+        self.walk(self.alice, [(0, 0), (200, 0)])
+        self.human_crouch(self.alice, True)
+        self.walk_past_the_follow_distance()
+        self.assertEqual([1], self.crouches())
+        # 死了：躺着等重生的那几帧
+        self.room.quest.arm_respawn_watchdog(self.bot_seat, (0, 0), after=5.0)
+        self.walk(self.alice, [(900, 0), (1000, 0)])
+        self.assertFalse(self.bot_conn.crouched)
+        # 重生：真人还蹲着 -> bot 必须**再发一发**
+        self.room.quest.respawn_due.pop(self.bot_seat, None)
+        self.walk(self.alice, [(1100, 0), (1200, 0), (1300, 0)])
+        self.assertEqual([1, 1], self.crouches())
+
+    def test_the_replayed_crouch_keeps_the_sequence_bookkeeping_straight(self):
+        """★ 事件包和心跳是同一本账（D5）：蹲完之后心跳的 N 要跟着 +1。"""
+        self.walk(self.alice, [(0, 0), (200, 0)])
+        self.human_crouch(self.alice, True)
+        self.walk_past_the_follow_distance()
+        frames = bot_frames(self.alice, self.bot_seat)
+        events = [f for f in frames if udpsync.peer_opcode(f) != 0x4001]
+        beats = [f for f in frames if udpsync.is_heartbeat(f)]
+        self.assertEqual(list(range(len(events))),
+                         [udpsync.peer_sequence(f) for f in events])
+        self.assertEqual(len(events),
+                         udpsync.heartbeat_next_event_seq(beats[-1]))
+
+
 class BotEpochTests(BotFrameRoom):
     """★★ bot 的换代模型必须和真人**同一串字节**推出来（§26）。
 
@@ -1055,7 +1218,7 @@ class SyncTrailTests(BotFrameRoom):
     def test_a_heartbeat_records_a_point(self):
         self.human_heartbeat(self.alice, 111, 222)
         self.assertEqual(
-            gameserver.SyncTrailPoint(111, 222, 0, True, 0, 0),
+            gameserver.SyncTrailPoint(111, 222, 0, True, 0, 0, False),
             self.alice.sync_trail[-1])
 
     def test_a_heartbeat_records_the_motion_facts_too(self):
@@ -1069,6 +1232,13 @@ class SyncTrailTests(BotFrameRoom):
         point = self.alice.sync_trail[-1]
         self.assertFalse(point.on_ground)
         self.assertEqual((9, -20), (point.vx, point.vy))
+
+    def test_a_heartbeat_records_the_fast_run_flag_too(self):
+        """★ 冲刺位（位域 bit3）也和坐标一起记（§40）。"""
+        self.human_heartbeat(self.alice, 111, 222, fast_run=True)
+        self.assertTrue(self.alice.sync_trail[-1].fast_run)
+        self.human_heartbeat(self.alice, 140, 222)
+        self.assertFalse(self.alice.sync_trail[-1].fast_run)
 
     def test_a_jump_is_attached_to_the_next_point(self):
         self.human_heartbeat(self.alice, 111, 222, jumped=2)

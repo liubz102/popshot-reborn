@@ -241,6 +241,9 @@ class BotConn(gameserver.Conn):
         #: 这一轮加载报过那一发 `0x4005` 了吗（D26）。
         #: `None` = 还没报。报过之后恒为 100，拿它**按状态翻转去重**。
         self.load_progress = None
+        #: ★ 现在蹲着没有（§41）。蹲**不在心跳里**，只有 `rpCrouch` 那一发
+        #:   事件包说得着，所以这边得自己记着状态、**只在翻转时发**。
+        self.crouched = False
         # ★ **不调 `register_conn()`**：`_conns` 是「在线的真人」表。
         #   进去的话 `latest_conn()`（控制通道不指定账号时的默认目标）
         #   随时可能变成一个 bot，`tools/gs_ctl.py` 就对着空气发命令了。
@@ -254,10 +257,15 @@ class BotConn(gameserver.Conn):
 
         ★ 「进度条报过了」跟着一起清：本函数正好在**新一轮加载开始**
         那一刻被调（`0x0400` / `0x0417` 广播），不清的话换图那一发会被去重挡掉。
+
+        ★★ 「蹲着没有」也一起清：换图 / 新一局客户端把角色重建，
+        `[char+0x2b5]` 跟着归零（`0x4ffc4a`）。这边不清的话两边就对不上了 ——
+        bot 以为自己还蹲着，于是**不发**那一发起立的 `rpCrouch`（§41）。
         """
         self.battle_pos = None
         self.last_trail_mark = None
         self.load_progress = None
+        self.crouched = False
 
     def __repr__(self):
         return f"<BotConn {self.nickname} 座位 {self.my_seat}>"
@@ -637,8 +645,9 @@ def _follow_target(room, machine):
 def trail_point(trail, distance):
     """沿着 `trail` 从最新那点往回走 `distance`，返回落脚点。
 
-    返回 `(x, y, jumped, on_ground, vx, vy)`：坐标是插出来的，后四个是真人
-    **在这一段**的原样事实（起没起跳、踩地还是腾空、腾空时的速度）。
+    返回 `(x, y, jumped, on_ground, vx, vy, fast_run, crouch)`：坐标是插出来
+    的，后六个是真人**在这一段**的原样事实（起没起跳、踩地还是腾空、腾空时
+    的速度、是不是按着右键冲刺、是不是蹲着）。
     轨迹比 `distance` 短就返回最老的那点（bot 刚进图、真人还没走几步时
     就是这种情况）。
 
@@ -688,17 +697,19 @@ def trail_point(trail, distance):
 
 
 def _motion_of(point):
-    """一个轨迹点的 `(jumped, on_ground, vx, vy)`。
+    """一个轨迹点的 `(jumped, on_ground, vx, vy, fast_run, crouch)`。
 
-    ★ 老式三元组（单测里手搓的假轨迹、以及本版之前落盘的那种）没有后三个
-    字段：那时候补上「踩在地上、速度 0」—— 那是**地面行走**，也正是
+    ★ 老式三元组（单测里手搓的假轨迹、以及本版之前落盘的那种）没有后面几个
+    字段：那时候补上「踩在地上、速度 0、不冲刺」—— 那是**地面行走**，也正是
     没有更多信息时唯一安全的假设（腾空却说踩地，最多少一段抛物线姿势；
     反过来说腾空则会让收方拿一个假速度推算，直接抽搐）。
     """
     jumped = point[2] if len(point) > 2 else 0
     if len(point) >= 6:
-        return jumped, bool(point[3]), point[4], point[5]
-    return jumped, True, 0, 0
+        fast_run = bool(point[6]) if len(point) >= 7 else False
+        crouch = bool(point[7]) if len(point) >= 8 else False
+        return jumped, bool(point[3]), point[4], point[5], fast_run, crouch
+    return jumped, True, 0, 0, False, False
 
 
 def _walk_direction(previous, x):
@@ -751,6 +762,11 @@ def _tick_bot(room, machine, seat_index):
     if machine.sync.broken:
         return
     if _lying_dead(room, seat_index):
+        # ★ 死亡处理器 `0x4ffbb7`（虚槽，`Character` / `MyCharacter` 同一格）
+        #   里有一句 `mov byte [ebx+0x2b5], 0` —— **客户端一死就把蹲的状态
+        #   清掉了**。这边不跟着清的话，两边的记账从此错开一轮：真人还蹲着
+        #   时 bot 看不到「翻转」，于是重生后**不发**那一发蹲下（§41）。
+        machine.crouched = False
         return
 
     leader = _follow_target(room, machine)
@@ -770,7 +786,7 @@ def _tick_bot(room, machine, seat_index):
     point = trail_point(leader.sync_trail, BOT_FOLLOW_DISTANCE * rank)
     if point is None:
         return
-    x, y, jumped, on_ground, vx, vy = point
+    x, y, jumped, on_ground, vx, vy, fast_run, crouch = point
 
     previous = machine.battle_pos
     machine.battle_pos = (x, y)
@@ -780,6 +796,12 @@ def _tick_bot(room, machine, seat_index):
     # ★ 只有**踩在地上**才说「我按着方向键」：腾空那一段的动画是 `Jump`
     #   （不看掩码），而收方会拿按键覆写空中速度，把抄来的抛体速度冲掉（§39）。
     keys = botsync.walk_keys(direction if on_ground else 0)
+    # ★★ 冲刺位抄真人这一段的（§40）—— 他按着右键跑，bot 抄来的坐标就是
+    #   1.5 倍步长，不报这一位收方只会按普通走速替它挪，然后被心跳一发发
+    #   拽回来。★ 和原版同一个前提：**在地上、真的在走**才算数
+    #   （`0x515ced` 进冲刺就要求走路方向非 0），否则会出现真客户端里不存在
+    #   的组合（站着冲刺 —— 语料 1003 : 3）。
+    fast_run = bool(fast_run) and bool(keys)
 
     # ★ 起跳**按状态翻转去重**：只有「这一帧真的往前挪了」才补 `rpJump`
     #   （铁律 10 说的那种去重口径）。不去重的话，真人跳完站着不动期间轨迹
@@ -792,6 +814,13 @@ def _tick_bot(room, machine, seat_index):
             #   N 是同一本账，全在 `BotSyncStream` 里记（D5）。
             _emit(machine, machine.sync.event(
                 botsync.OP_JUMP, botsync.jump_body(seat_index, jumped)))
+        # ★★ 蹲：心跳里没有这一位，只有 `rpCrouch` 这一发事件包说得着（§41）。
+        #   所以**按状态翻转发**（铁律 10 的口径）：和上一帧不一样才发一发，
+        #   一样就什么都不做。漏发一次那个姿势就一直错到下次翻转。
+        if bool(crouch) != bool(machine.crouched):
+            _emit(machine, machine.sync.event(
+                botsync.OP_CROUCH, botsync.crouch_body(seat_index, crouch)))
+            machine.crouched = bool(crouch)
         # ★★ 地面标志和速度**原样抄真人这一段的**（§35），不从位移反推：
         #   踩在地上走的时候真人报的速度就是 0，反推出来的非零速度会让收方
         #   拿它自己往前推算、和坐标打架 —— 那就是「一跳一跳像在抽搐」。
@@ -801,7 +830,7 @@ def _tick_bot(room, machine, seat_index):
         #   一起算（§36 / §37）。真人的身体朝向就是这么来的。
         state = botsync.character_state(
             x, y, vx=vx, vy=vy, on_ground=on_ground, facing=machine.heading,
-            keys=keys)
+            keys=keys, fast_run=fast_run)
         _emit(machine, machine.sync.heartbeat(state))
     except botsync.SyncInvariantError as error:
         # ★ 不变式炸了：把**这一个 bot** 的流停掉，别的人一点不受影响（D1）。
