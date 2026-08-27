@@ -2657,6 +2657,63 @@ class BotLobTests(BotFireRoom):
                              bot._lob_speed(weapon, 400.0, 0.0))
 
 
+class BotFuseTests(BotFireRoom):
+    """★★ **引信**（§72）—— 分裂类弹体到点会在每一台机器上自爆。
+
+    用户 2026-08-27：「用 gun 命令，很多角色都无法切换 2 号武器」。
+    §70 那一版把 `CreatingClass != GeneralBullet` 全剔了，10/16 个角色的
+    2 号槽因此消失。§72 把口径改对之后它们回来了，代价是要照顾引信：
+    `AppleGrenade` / `SeedBomb` / `SliceBullet` 的弹体在第 `fuse_ticks`
+    个 tick 上自爆（**不带伤害**），之后再发 `rpExplode` 会被收方按句柄
+    查不到而整包丢掉（§42 第 4 条）。
+    """
+
+    def test_the_fuse_comes_from_the_original_slice_time(self):
+        weapon = weapondata.get(1000020)          # ch00-02，SliceTime=1500
+        self.assertEqual("AppleGrenade", weapon.raw["creating_class"])
+        self.assertEqual(1500 // 32, weapon.fuse_ticks)
+
+    def test_a_shot_that_arrives_in_time_is_allowed(self):
+        weapon = weapondata.get(1000020)
+        shot = ballistics.solve(weapon, 400.0, 0.0,
+                                speed=bot._lob_speed(weapon, 400.0, 0.0))
+        self.assertLess(shot.ticks, weapon.fuse_ticks - 1)
+        self.assertFalse(bot._outlives_fuse(weapon, shot))
+
+    def test_a_shot_that_would_blow_up_on_the_way_is_refused(self):
+        """★ 「够不着」和「弹道解不出来」是同一类事实，不是新规则。"""
+        weapon = weapondata.get(1003020)          # ch03-02，SliceTime=1200
+        shot = ballistics.solve(weapon, 1000.0, 0.0,
+                                speed=bot._lob_speed(weapon, 1000.0, 0.0))
+        self.assertGreaterEqual(shot.ticks, weapon.fuse_ticks - 1)
+        self.assertTrue(bot._outlives_fuse(weapon, shot))
+
+    def test_the_shell_queue_never_outlives_the_fuse(self):
+        weapon = weapondata.get(1110030)          # ch110-03，SliceTime=500
+        shot = ballistics.solve(weapon, 300.0, 0.0)
+        self.assertEqual(weapon.fuse_ticks - 1,
+                         bot._shell_max_ticks(None, shot, weapon))
+
+    def test_a_weapon_without_a_fuse_is_untouched(self):
+        weapon = weapondata.get(1002010)          # ch02-01，普通直射枪
+        shot = ballistics.solve(weapon, 300.0, 0.0)
+        self.assertIsNone(weapon.fuse_ticks)
+        self.assertFalse(bot._outlives_fuse(weapon, shot))
+        self.assertEqual(bot._shell_max_ticks(None, shot),
+                         bot._shell_max_ticks(None, shot, weapon))
+
+    def test_a_grenade_character_can_still_shoot(self):
+        """★ 别修过头：角色 0 换到 2 号槽照样打得出 `rpFire`。"""
+        seat = self.room.seats[self.bot_seat]
+        seat.character_id = 0
+        self.bot_conn.character_id = 0
+        self.bot_conn.weapon_slot = 2
+        self.bot_conn.declared_weapon = None
+        self.assertEqual(1000020, self.bot_conn.weapon.id)
+        self.approach()
+        self.assertTrue(fire_frames(self.alice, self.bot_seat))
+
+
 def dash_frames(conn, seat):
     return [f for f in bot_frames(conn, seat)
             if header(f)["opcode"] == botsync.OP_DASH]
@@ -2819,6 +2876,65 @@ class BotTeamFireTests(BotFrameRoom):
             TEAM_B if alice_team == TEAM_A else TEAM_A)
         self.walk(self.alice, [(100, 100), (120, 100), (140, 100)])
         self.assertTrue(fire_frames(self.alice, self.bot_seat))
+
+
+class BotVersusBotTests(TwoBotFrameRoom):
+    """★★ **bot 也是敌人**（用户 2026-08-27 实机报的）。
+
+    他那一局是「真人 + 一个 bot 队友 vs 两个 bot 敌人」，看到的是
+    **只有敌方 bot 在打真人**：我方 bot 一枪不放，敌方 bot 也从不打我方 bot。
+    根因是 `_hostile_humans` 只扫 `room.human_seats()` —— 敌方全是 bot 的
+    那一边于是「没有敌人」。原版里座位上坐的是谁跟该不该打毫无关系。
+
+    这里把两个真人都放进 A 队，复现那个形状：我方 bot 的敌人**只剩**
+    对面那个 bot。
+    """
+
+    session_type = 1
+    arguments = (1, 0, 0)       # 组队战
+
+    def setUp(self):
+        super().setUp()
+        alice_seat = self.room.seat_index_of(self.alice)
+        bob_seat = self.room.seat_index_of(self.bob)
+        self.team_a = self.room.seats[alice_seat].team
+        self.room.seats[bob_seat].team = self.team_a
+        friends = [i for i in self.bot_seats
+                   if self.room.seats[i].team == self.team_a]
+        foes = [i for i in self.bot_seats if i not in friends]
+        self.assertTrue(friends and foes, "夹具没把两个 bot 分到两边")
+        self.friend_seat, self.foe_seat = friends[0], foes[0]
+        for index in self.bot_seats:
+            # ★ 同 `BotFireRoom`：这一批验的是开枪，近身会抢在前面（§64）。
+            self.room.seats[index].conn.melee = False
+
+    def test_a_friendly_bot_counts_the_enemy_bot_as_a_target(self):
+        self.walk(self.alice, [(100, 100), (120, 100), (140, 100)])
+        seats = [t[0] for t in bot._hostile_targets(self.room,
+                                                    self.friend_seat)]
+        self.assertIn(self.foe_seat, seats)
+
+    def test_an_enemy_bot_counts_the_friendly_bot_as_a_target(self):
+        self.walk(self.alice, [(100, 100), (120, 100), (140, 100)])
+        seats = [t[0] for t in bot._hostile_targets(self.room, self.foe_seat)]
+        self.assertIn(self.friend_seat, seats)
+
+    def test_a_bot_never_targets_its_own_team_or_itself(self):
+        self.walk(self.alice, [(100, 100), (120, 100), (140, 100)])
+        seats = [t[0] for t in bot._hostile_targets(self.room,
+                                                    self.friend_seat)]
+        self.assertNotIn(self.friend_seat, seats)
+        self.assertEqual([self.foe_seat], seats)
+
+    def test_the_friendly_bot_opens_fire_although_no_human_is_hostile(self):
+        """★ 这就是用户看到的那条：我方 bot 一枪不放。"""
+        self.walk(self.alice, [(100, 100), (120, 100), (140, 100)])
+        self.assertTrue(fire_frames(self.alice, self.friend_seat))
+
+    def test_a_dead_bot_is_not_a_target(self):
+        self.walk(self.alice, [(100, 100), (120, 100), (140, 100)])
+        self.room.quest.respawn_due[self.foe_seat] = time.monotonic() + 5.0
+        self.assertEqual([], bot._hostile_targets(self.room, self.friend_seat))
 
 
 class BotFireHandleResetTests(BotFireRoom):
@@ -3016,7 +3132,7 @@ class BotOwnMovementTests(TerrainMixin, BotFireRoom):
 
 class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
     """★ 闯关房**照旧回放真人的轨迹** —— 那儿要的就是「跟着推进」，
-    而怪的位置服务端手里没有（`_hostile_humans` 在闯关房恒为空）。"""
+    而怪的位置服务端手里没有（`_hostile_targets` 在闯关房恒为空）。"""
 
     def test_a_coop_bot_still_follows_the_trail(self):
         self.install_terrain(synth_terrain("flat"))

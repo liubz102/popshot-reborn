@@ -2307,9 +2307,9 @@ fld  [edi+0x4c4] ; fadd [edi+0x120] ; fstp [edi+0x120]   ; 重力积分
 弹体的爆炸处理 `0x47eb1f` 一进门就是这道守卫：
 
 ```asm
-0047eb3c  call 0x50d294   ; IsMine(弹体)   : HandleToOwner(句柄)==20，或
+0047eb3c  call 0x50d294   ; IsMine(弹体)   : HandleToOwner(句柄)==30(0x1e)，或
                           ;   ctx->seatOf[owner] == 我的座位号 [0x72e29c]+0x1cc
-0047eb47  call 0x50d2c6   ; IsNeutral(弹体): HandleToOwner(句柄)==20
+0047eb47  call 0x50d2c6   ; IsNeutral(弹体): HandleToOwner(句柄)==30(0x1e)
 0047eb4e  je  0x47ecfb    ; ★★ 都不成立 -> 整段跳过，SendExplode 根本不会被调用
 0047ecc2  call 0x492557   ; SendExplode（全镜像**唯一**调用点）
 ```
@@ -2318,6 +2318,12 @@ fld  [edi+0x4c4] ; fadd [edi+0x120] ; fstp [edi+0x120]   ; 重力积分
 ⇒ 一个**没有本机**的发射者（比如服务端合成的 bot），
 **只发 `rpFire` 的话没有任何一台会替它算爆炸** —— 子弹一直飞，一滴血也扣不掉。
 它的 `rpExplode` 必须由**造 `rpFire` 的那一方自己算好、自己发**。
+
+★★ **`IsMine` 这道门不止这一处**（V0.3 §72）：分裂弹 / 火墙 / 炮台的
+创建点也全在它里面（`0x47c96e` AppleGrenade、`0x4829c3` FlamingBottle、
+`0x48505b` SeedBomb、`0x4851f5` SliceBullet、`0x484d1d` RasTurret、
+`0x4847de` PlasmaCannon）。⇒ 自造包的弹体在**每一台**上都只是「一颗普通
+子弹在飞」，句柄消耗和 `GeneralBullet` 完全一样。
 
 ### 5.9 ★★★ 对象句柄的编码和分配（V0.3 §42）
 
@@ -2332,8 +2338,8 @@ fld  [edi+0x4c4] ; fadd [edi+0x120] ; fstp [edi+0x120]   ; 重力积分
 | 东西 | 值 | 出处 |
 |---|---|---|
 | **角色句柄** | `座位号 × 100000 + 100001` | `0x405f02: imul ecx,ecx,0x186a0; add ecx,0x186a1` |
-| **owner 编码** | `10 + 座位号`；怪 / 中立 = `20` | 和 `rpFire` body `+0` **同一套编码** |
-| **弹体句柄** | 从 `mgr[0x14 + owner*4]` **取当前值再 `++`** | `0x484920` / `0x49172e` |
+| **owner 编码** | `10 + 座位号`；怪 / 中立 = **`30`**（★ V0.3 §72 勘误：`IsMine`/`IsNeutral` 比的是 `0x1e`；上面那句 `h < 100000 -> 20` 是另一条兜底分支）| 和 `rpFire` body `+0` **同一套编码** |
+| **弹体句柄** | 从 `mgr[0x14 + owner*4]` **取当前值再 `++`** | `0x49172e`（网络路径）/ `0x484924`（**PlasmaCannon 自己的** `vft+0xa8`）—— 全镜像搜 `8b 08 8d 51 01 89 10`，弹体模块里只有这两处 |
 | **计数器初值** | **`座位号 × 100000 + 100002`** | `ProjectileMgr::Reset` `0x47346f`（`0x473509` 起点 = `mgr+0x3c` = owner 10 那一格，`0x473520` 初值 `0x186a2`，每格 `+= 0x186a0`，30 格 = owner 10..39）|
 | **重置时机** | **`ForceReloadTerrain`**（宽字符串 `0x66bfb0`，`0x4749fd`）| 开局 / 换图各一次 |
 
@@ -2347,9 +2353,24 @@ handle_step = SpreadFrags × (2 if 有 SplashRange else 1)
 ```
 
 - 造出来的 `SpreadFrags` 颗弹体各占一个**连号**句柄（`0x49231e` 在内层循环里）；
-- 带 `SplashRange` 的武器**每颗子弹再多吃 1 个** —— 爆炸时创建的那个
-  `SplashDamage` 对象（`0x484920` 拿父弹体 `[obj+0xd0]` 的 owner 再分配一个）。
+- 带 `SplashRange` 的武器**每颗子弹再多吃 1 个** —— 收方处理 `rpExplode` 时
+  创建的那个 `SplashDamage` 对象（`0x4924bd` 申请、`0x492532` 注册）。
   ★ 那一个**不会出现在任何 `rpExplode` 里**，它只是把计数器往前推。
+
+★★ **这条公式和 `CreatingClass` 无关**（V0.3 §72，★ 推翻了 §70）：
+分裂弹 / 火墙 / 炮台那些额外对象的创建点**全部**套在 `IsMine`
+（`0x50d294`）里 —— 自造包的一方（服务端 / bot）在**任何一台客户端**上
+`IsMine` 都是假的，所以那些对象一个都不会被造出来、句柄一个都不会多吃。
+语料里量到的 `AppleGrenade` +3 / `FlamingBottle` +9 那种残差是**射手
+自己那台机器**的行为，对自造包不适用。
+
+⚠ 但**引信**是在门外面的：`AppleGrenade` / `SeedBomb` / `SliceBullet` 的
+`Tick` 里 `[obj+0x338]`（初值 `SliceTime / 32`，`0x47c8d3`）每 tick 倒数，
+到 0 就自爆（`0x47c952` / `0x48503f` / `0x4851d9`）——
+**每一台机器上都会发生，而且不带伤害**。⇒ 自造包的 `rpExplode` 必须赶在
+第 `SliceTime/32` 个 tick 之前发出去，晚了就是「查不到弹体、整包丢弃」。
+（`weapon.ini` → `weapondef`：`SliceTime` `+0xa0` / `SliceCount` `+0xa4`
+/ `SliceId` `+0xa8`；每 tick 的毫秒数 `[0x6dc528]` = 32。）
 
 语料实证（「整局只打一种枪」的干净片段）：
 

@@ -28,7 +28,7 @@ bot 开火要用到的四件事**全在这一张表里**（§43）：
 
     weapons        {ammo_id(str): {字段…}}
     by_character   {角色id(str): [ammo_id, …]}   按武器序号排序
-    usable         [ammo_id, …]  ★ **句柄步进确定是 1** 的那些，bot 只准用这些
+    usable         [ammo_id, …]  ★ **句柄步进算得准**的那些，bot 只准用这些
 
 读它的是 `server/weapondata.py`（只用标准库，CPython 3.8 也能跑）。
 """
@@ -49,7 +49,9 @@ ROOT = os.path.dirname(HERE)
 #: 2（会话 14）：节名匹配改成**大小写不敏感**、加 `shots` 字段、
 #: `handle_step` 改成按弹体个数算、`usable` 放宽到抛物线和散射武器。
 #: ★ 3（会话 19）：`usable` **收紧**成只放行 `CreatingClass=GeneralBullet`（§70）。
-FORMAT = 3
+#: ★ 4（会话 21）：`usable` 按 `SAFE_CLASSES` 白名单放行（§72 推翻了 §70 的
+#:   收紧口径），新增 `slice_time` / `fuse_ticks` 两个字段。
+FORMAT = 4
 
 #: 节名 `chNNN-MM…`：NNN = 角色 id，MM = 武器序号。
 #: ★ 后面还可能跟 `SE` / `D1` / `R1` / `F1` / `a` / `Classic` 之类的后缀 ——
@@ -94,6 +96,10 @@ _FIELDS = (
     ("LockonRange",     "lockon_range",    float),
     ("LockonPrecision", "lockon_precision", float),
     ("Size",            "size",            float),
+    # ★ `SliceTime`：**引信**（毫秒）。分裂类弹体（`AppleGrenade` /
+    #   `SeedBomb` / `SliceBullet`）的 Tick 里有一个从 `SliceTime / 32`
+    #   倒数的计数器，数到 0 就**在每一台机器上自爆**（§72）。
+    ("SliceTime",       "slice_time",      int),
 )
 
 
@@ -227,6 +233,9 @@ def build_record(section, fields):
     interval = fire_interval_of(record)
     if interval is not None:
         record["fire_interval_ms"] = interval
+    fuse = fuse_ticks_of(record)
+    if fuse is not None:
+        record["fuse_ticks"] = fuse
     return record
 
 
@@ -280,10 +289,48 @@ def build_table(sections):
 #: 表里没有第四种，真出现了就说明这份 ini 不是我们逆过的那一版。
 KNOWN_POWER_MODES = (0, 1, 2)
 
-#: ★★★ **唯一放行的 `CreatingClass`**（§70）。
-#: 别的类在收方会额外创建对象（分裂弹 / 火墙 / 炮台），从**同一个**弹体句柄
-#: 计数器里取号 —— 服务端按 `GeneralBullet` 的公式记账就会永久错位。
-PLAIN_BULLET_CLASS = "GeneralBullet"
+#: 客户端一个逻辑步长多少毫秒（`[0x6dc528]` = 32，和 §47 的 `TICK_MS` 同源）。
+TICK_MS = 32
+
+#: ★★★ **放行的 `CreatingClass` 白名单**（§72 定的口径，推翻了 §70 的
+#: 「只放行 `GeneralBullet`」）。
+#:
+#: 判据是**「在别人那台机器上，它和 `GeneralBullet` 有没有区别」**：
+#:
+#: 1. 每个子类的 `Tick` 头一句都是 `call 0x47de6a`（基类 Tick）——
+#:    **飞行本身完全一样**，子类只加特效位置 / 引信 / 分裂；
+#: 2. 分裂弹 / 火墙 / 炮台那些**额外对象的创建点全都套在 `IsMine`
+#:    （`0x50d294`）里面** —— 而 bot 的弹体在**任何**一台客户端上
+#:    `IsMine` 都是假的（§42 第 3 条），所以那些对象**一个都不会造出来**，
+#:    句柄一个都不会多吃。§70 量到的残差是**射手自己那台**的行为，
+#:    对 bot 不成立。
+#:
+#: 剩下的都因为**飞行行为**被挡在外面，不是因为句柄：
+#:
+#: * `BounceBullet`（`ch106-02` / `ch110-02`）—— 改写了撞地形的响应
+#:   （vft `+0x94` / `+0x98`），会**弹墙**接着飞，服务端的落点算不对；
+#: * `RasTurret`（`ch107-02` / `ch108-02`）—— Tick 里有一段按
+#:   `SliceId` 那把武器的 `SliceCount` 计数、数满就自爆的逻辑，没逆清；
+#: * `PlasmaCannon`（`ch109-03`）—— 它的 `vft+0xa8`（`0x4848c9`）里
+#:   **自己 `++` 了一次句柄计数器**（`0x484924`），调用路径没证明是
+#:   `IsMine` 门内的，宁可不放；
+#: * `TotemLauncher`（`ch103-03`）—— 它那把 `Damage=0`，本来也过不了第 3 条。
+SAFE_CLASSES = (
+    "GeneralBullet",
+    # 带引信（`SliceTime`）：飞行和基类一样，但**到点会在每一台上自爆**，
+    # 所以还要过 `fuse_ticks` 那一关（见 `_is_usable` 第 7 条）。
+    "AppleGrenade",     # ch00-02 / ch98-02
+    "SeedBomb",         # ch03-02
+    "SliceBullet",      # ch110-03
+    # 不带引信：`Tick` 只多设了个特效位置，其余一模一样。
+    "FlamingBottle",    # ch01-02 / ch100-02 / ch103-02
+    "TimeBomb",         # ch101-02
+    "SpiralKnife",      # ch106-03
+)
+
+#: 有**引信**的那几类：`Tick` 里 `[obj+0x338]` 从 `SliceTime / 32` 倒数，
+#: 数到 0 就调 `vft+0x15c` 自爆（`0x47c952` / `0x48503f` / `0x4851d9`）。
+FUSE_CLASSES = ("AppleGrenade", "SeedBomb", "SliceBullet")
 
 
 def _is_usable(record):
@@ -306,40 +353,56 @@ def _is_usable(record):
        bot 不知道该隔多久打一发；
     5. **`PowerControl` 是我们逆过的三种模式之一** —— 初速公式按它分流，
        出现第四种就说明这份 ini 和逆向结论对不上，宁可不用；
-    6. ★★★ **`CreatingClass` 必须是 `GeneralBullet`**（会话 19 加，§70）。
+    6. ★★★ **`CreatingClass` 在 `SAFE_CLASSES` 白名单里**（会话 21 改，§72）；
+    7. ★ 白名单里**带引信**的那几类还得**算得出引信长度**（`fuse_ticks ≥ 2`）
+       —— 引信是 0 的话弹体第一个 tick 就自爆，那把枪根本用不了。
 
-    ## 为什么第 6 条非加不可（§70）
+    ## 第 6 条的来历（★ 会话 21 从「只放行 GeneralBullet」放宽，§72）
 
-    `handle_step = 弹体数 × (2 if 有溅射 else 1)`（§46）这条公式**只对
-    `GeneralBullet` 成立**。把 380 份语料按 `CreatingClass` 分桶，量
-    「上一发的基址 + handle_step」和下一发基址的残差：
+    会话 19 那一版（§70）是拿语料的**句柄残差**分桶定的：`AppleGrenade`
+    残差主峰在 +3、`FlamingBottle` 在 +9/+17 ⇒ 判它们「在收方多吃句柄」。
 
-    ```text
-    GeneralBullet   25914 样本   残差 = 0 占 88.4%   ← 基线
-    TimeBomb          901        95.8%
-    SpiralKnife       864        97.2%
-    BounceBullet      832        92.2%
-    ★ AppleGrenade   2101        39.9%   主峰在 **+3**（SliceCount=4，会分裂）
-    ★ FlamingBottle  1144        22.3%   主峰在 **+9 / +17**（爆炸后铺一道火墙）
-    ★ SliceBullet     558        46.6%
-    ★ RasTurret       151        57.0%   （放的是炮台，不是子弹）
-    ```
+    ★ **那份残差量的是「射手自己那台机器」**。逐指令读下来，分裂弹 /
+    火墙 / 炮台的创建点**全都在 `IsMine`（`0x50d294`）门里面**
+    （`0x47c96e` / `0x4829c3` / `0x48505b` / `0x4851f5` / `0x484d1d`
+    / `0x4847de`）—— 而 bot 的弹体在**任何一台客户端**上 `IsMine` 都是假的
+    （§42 第 3 条：没有一台机器认它是自己的）。⇒ **那些额外对象一个都不会
+    被造出来，句柄一个都不会多吃**，`GeneralBullet` 的公式照样成立。
 
-    带星的那几类在收方会**额外创建对象**（分裂弹、火墙、炮台），每一个都从
-    **同一个句柄计数器**里取号。服务端按 `GeneralBullet` 的公式记账 ⇒
-    从那一发起永久错位 ⇒ 后面每一发 `rpExplode` 都被静默丢弃 ——
-    「子弹照飞、一滴血不掉」，一局之内不自愈（§42）。
-
-    ⚠ `TimeBomb` / `SpiralKnife` / `BounceBullet` 的残差虽然和基线一样好，
-    **也不放行**：它们的**飞行**行为服务端没有模型（定时引爆、墙上反弹），
-    命中判定（§65）会算错落点。要放行得先把那几类的弹道逆出来。
+    挡在白名单外的那几类是因为**飞行**对不上，不是因为句柄，见 `SAFE_CLASSES`。
     """
-    return (record.get("character") is not None
+    if not (record.get("character") is not None
             and record.get("handle_step")
             and record.get("damage", 0) > 0
             and record.get("fire_interval_ms")
             and (record.get("power_control") or 0) in KNOWN_POWER_MODES
-            and record.get("creating_class") == PLAIN_BULLET_CLASS)
+            and record.get("creating_class") in SAFE_CLASSES):
+        return False
+    if record.get("creating_class") in FUSE_CLASSES:
+        return (record.get("fuse_ticks") or 0) >= 2
+    return True
+
+
+def fuse_ticks_of(fields):
+    """带引信的弹体**最多飞几个 tick**；没有引信返回 `None`。
+
+    收方的算法（`0x47c8bd`..`0x47c8d3`，AppleGrenade 的初始化）：
+
+        [obj+0x338] = SliceTime / [0x6dc528]      # 整数除，[0x6dc528] = 32
+
+    然后每个 Tick `dec` 一次，`<= 0` 就调 `vft+0x15c` 自爆
+    （`0x47c952`）。⇒ 它能**飞完** `N-1` 个 tick，第 `N` 个 tick 上炸掉，
+    `N = SliceTime // 32`。
+
+    ★ 这不是「等 XX 毫秒」的时序阈值（铁律 10）—— 它是**原版数据里写死的
+    弹体寿命**，服务端只是照抄。
+    """
+    if fields.get("creating_class") not in FUSE_CLASSES:
+        return None
+    slice_time = fields.get("slice_time")
+    if not slice_time:
+        return None
+    return int(slice_time) // TICK_MS
 
 
 def _preference(record):

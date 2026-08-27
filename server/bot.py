@@ -888,8 +888,13 @@ def _cmd_gun(conn, room, args):
     换枪这条链（`rpChangeWeapon` + 句柄步进跟着变）本身现在就能实机验。
 
     ★ 只列 / 只接受 `weapondata` 认可的武器（句柄步进算得出 + 有伤害 +
-    初速模式认得）：步进猜错的表现是「子弹飞过去不炸」，而且静默、
-    一局之内不自愈（§42）。会话 14 之后 14 个玩家角色**三个槽位全都能用**。
+    初速模式认得 + 弹体类服务端有飞行模型）：步进猜错的表现是「子弹飞过去
+    不炸」，而且静默、一局之内不自愈（§42）。
+
+    ★ 会话 21（§72）之后 16 个玩家角色里**10 个三个槽位全可用**；剩下
+    6 个各缺一个槽：106 / 110 的 2 号是**反弹弹**（会弹墙）、107 / 108 的
+    2 号是**炮台**、109 的 3 号是**等离子炮**（那几类的飞行服务端还没有
+    模型），角色 3 的 3 号是图腾发射器（`Damage=0`，打不动人）。
     """
     index, error = _seat_arg(args)
     if error:
@@ -1259,8 +1264,20 @@ def _battle_bodies(room, shooter_seat, group=None, include_self=False):
     return out
 
 
-def _hostile_humans(room, seat_index):
-    """这个 bot 该打谁 —— 房里**报过位置**、**活着**、而且和它不同队的真人。
+def _hostile_targets(room, seat_index):
+    """这个 bot 该打谁 —— 返回 `[(座位号, x, y, 蹲着没有)]`。
+
+    判据三条：**位置已知**、**活着**、**和它不同队**。
+
+    ★★ **别的 bot 也算敌人**（用户 2026-08-27 报的）：以前这里只扫
+    `room.human_seats()`，于是组队房里「真人 + bot 队友 vs 两个 bot 敌人」
+    会变成 —— bot 队友那边一个敌对**真人**都没有（敌方全是 bot）⇒ 它一枪
+    不放；敌方 bot 也看不见我方 bot ⇒ 它们只打真人。场上只有真人在挨打。
+    原版里座位上坐的是谁跟「该不该打」毫无关系，判据只有队伍。
+
+    位置一律走 `_seat_body()`（真人取心跳轨迹、bot 取 `battle_pos`），
+    这也是判命中时 `_battle_bodies()` 用的同一口径 —— **「挑得中的目标」和
+    「打得中的身体」必须是同一批人**，否则 bot 会瞄一个判命中时不存在的人。
 
     ★ **闯关房（`TEAM_LAYOUT_COOP`）一个都不返回**：那儿大家是队友，
     该打的是怪。怪的句柄服务端手里没有（它们由「控制者」那台机器模拟），
@@ -1272,19 +1289,20 @@ def _hostile_humans(room, seat_index):
     layout = room.team_layout()
     if layout == lobby_module.TEAM_LAYOUT_COOP:
         return []
-    seat = room.seats[seat_index]
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
     my_team = None if seat is None else seat.team
     out = []
-    for index in room.human_seats():
-        other = room.seats[index]
-        conn = None if other is None else other.conn
-        if conn is None or not getattr(conn, "sync_trail", None):
+    for index, other in enumerate(room.seats):
+        if other is None or index == seat_index:
             continue
         if layout == TEAM_LAYOUT_TEAMS and other.team == my_team:
             continue
         if _lying_dead(room, index):
             continue
-        out.append((index, conn))
+        body = _seat_body(room, index)
+        if body is None:
+            continue
+        out.append((index, body[0], body[1], body[2]))
     return out
 
 
@@ -1308,17 +1326,16 @@ def _character_of(machine):
 def _enemy_spot(room, machine, seat_index):
     """离自己最近的那个敌人此刻站在哪；没有敌人返回 `None`。
 
-    ★ 闯关房恒为 `None`（`_hostile_humans` 那边就是空的）—— 那儿该打的是
+    ★ 闯关房恒为 `None`（`_hostile_targets` 那边就是空的）—— 那儿该打的是
     怪，而怪的位置服务端手里没有，所以闯关仍然回放真人轨迹「跟着推进」。
     """
     if machine.body is None:
         return None
     best = None
-    for index, conn in _hostile_humans(room, seat_index):
-        point = conn.sync_trail[-1]
-        span = abs(point[0] - machine.body.x)
+    for _index, tx, ty, _crouched in _hostile_targets(room, seat_index):
+        span = abs(tx - machine.body.x)
         if best is None or span < best[0]:
-            best = (span, (float(point[0]), float(point[1])))
+            best = (span, (float(tx), float(ty)))
     return None if best is None else best[1]
 
 
@@ -1377,7 +1394,7 @@ def _own_step(room, machine, seat_index, terrain, target, now):
     """
     if terrain is None:
         return None
-    if not _hostile_humans(room, seat_index):
+    if not _hostile_targets(room, seat_index):
         return None
     who = _character_of(machine)
     if machine.body is None:
@@ -1498,6 +1515,25 @@ def _aim_point(room, seat_index, x, y, crouched):
     return character.center(x, y, crouched)
 
 
+def _outlives_fuse(weapon, shot):
+    """这一发在飞到目标之前会不会先被**引信**炸掉（§72）。
+
+    带引信的弹体（`AppleGrenade` / `SeedBomb` / `SliceBullet`）在第
+    `fuse_ticks` 个 tick 上自爆 —— 那一下**不带伤害**（伤害只来自射手发的
+    `rpExplode`），而且弹体从此不存在，之后再发 `rpExplode` 会被收方
+    按句柄查不到而整包丢掉（§42 第 4 条）。
+
+    ★ 判据是**原版数据**（`SliceTime`），不是我们定的超时（铁律 10）。
+    没有引信的武器恒为 `False`。
+    """
+    fuse = weapon.fuse_ticks
+    if not fuse:
+        return False
+    # ★ 收方能飞完 `fuse-1` 个 tick，第 `fuse` 个 tick 上就炸了 ——
+    #   所以「飞到目标」必须严格发生在第 `fuse` 个 tick 之前。
+    return shot.ticks >= fuse - 1
+
+
 def _fire_target(room, machine, seat_index, weapon):
     """挑一个能打的目标，返回 `(座位号, 瞄准点(x, y), Shot)`；没得打返回 `None`。
 
@@ -1506,8 +1542,12 @@ def _fire_target(room, machine, seat_index, weapon):
     1. **够得着** —— 直线距离在 `BOT_ENGAGE_RANGE` 之内（语料量的，见那条常量）；
     2. **弹道解得出来** —— 抛物线武器超出最大射程时 `ballistics.solve()`
        返回 `None`（判别式 < 0），那就是这把枪真的够不着；
-    3. **看得见** —— 弹道上没有挡子弹的地形（`_path_blocked`）；
-    4. 都满足的挑**最近**的。
+    3. ★ **飞得到引信之前** —— 带引信的弹体（`AppleGrenade` / `SeedBomb` /
+       `SliceBullet`）在 `fuse_ticks` 那一 tick 上**在每一台机器上自爆**，
+       弹体从此不存在（§72）。飞到目标要的 tick 数够不着引信，就是这把枪
+       在这个距离上**打不到**，和「弹道解不出来」是同一类事实；
+    4. **看得见** —— 弹道上没有挡子弹的地形（`_path_blocked`）；
+    5. 都满足的挑**最近**的。
 
     ⚠ 挑中了**不等于打得中** —— 命中由 `_advance_shells()` 逐 tick 真判
     （§65）。这里只回答「值不值得扣扳机」。
@@ -1522,10 +1562,8 @@ def _fire_target(room, machine, seat_index, weapon):
     x, y = machine.battle_pos
     terrain = mapdata.load(_current_map(room))
     best = None
-    for index, conn in _hostile_humans(room, seat_index):
-        point = conn.sync_trail[-1]
-        crouched = bool(point[7]) if len(point) > 7 else False
-        tx, ty = _aim_point(room, index, point[0], point[1], crouched)
+    for index, px, py, crouched in _hostile_targets(room, seat_index):
+        tx, ty = _aim_point(room, index, px, py, crouched)
         if BOT_DIAG_FIRE_ANYWHERE:
             # ★ 取证专用：真人站着不动时 `trail_point()` 会让 bot 贴到人身上
             #   （§52），距离 0 的话 `ballistics.solve()` 解不出弹道、一颗
@@ -1541,6 +1579,8 @@ def _fire_target(room, machine, seat_index, weapon):
         shot = ballistics.solve(weapon, tx - mx, ty - my,
                                 speed=_lob_speed(weapon, tx - mx, ty - my))
         if shot is None:
+            continue
+        if _outlives_fuse(weapon, shot):
             continue
         if (not BOT_DIAG_FIRE_ANYWHERE
                 and _path_blocked(terrain, mx, my, shot)):
@@ -1613,18 +1653,13 @@ def _diag_why_not_firing(room, machine, seat_index, weapon, target, now):
     elif machine.battle_pos is None:
         why = "没有 battle_pos（这一局还没被放进地图）"
     elif target is None:
-        hostiles = list(_hostile_humans(room, seat_index))
+        hostiles = list(_hostile_targets(room, seat_index))
         if not hostiles:
-            why = "没有敌对的真人（队伍分边？）"
+            why = "没有敌人（队伍分边？位置还不知道？）"
         else:
             spans = []
             x, y = machine.battle_pos
-            for index, conn in hostiles:
-                trail = getattr(conn, "sync_trail", None)
-                if not trail:
-                    spans.append(f"座位{index}=没有轨迹")
-                    continue
-                tx, ty = trail[-1][:2]
+            for index, tx, ty, _crouched in hostiles:
                 spans.append(f"座位{index}={math.hypot(tx - x, ty - y):.0f}")
             why = ("挑不出目标（弹道解不出来 / 被地形挡住）；"
                    f"我在 {x:.0f},{y:.0f} 距离 " + " ".join(spans))
@@ -1752,18 +1787,26 @@ class Shell(object):
                    self.ticks, self.max_ticks, self.x, self.y))
 
 
-def _shell_max_ticks(terrain, shot):
+def _shell_max_ticks(terrain, shot, weapon=None):
     """这颗子弹最多推进几个 tick —— 走完 `BOT_SHELL_MAX_TRAVEL` 就到头。
 
     ★ 循环上界，不是超时阈值：飞出图外的弹体客户端自己就销毁了，
     服务端这边也得有个头，否则一颗打空的直射弹会永远挂在「在飞」队列里，
     把带溅射武器的那道顺序闸门（`_may_fire`）永久卡死。
+
+    ★★ 带**引信**的武器另有一条更早的上界：收方在第 `fuse_ticks` 个 tick
+    上就把弹体炸掉了（§72），过了那一刻服务端再算下去也没有意义 ——
+    对面已经没有这个弹体了。
     """
     travel = BOT_SHELL_MAX_TRAVEL
     if terrain is not None:
         travel = math.hypot(terrain.width, terrain.height)
     speed = max(1e-3, shot.speed)
-    return max(1, int(math.ceil(travel / speed)))
+    ticks = max(1, int(math.ceil(travel / speed)))
+    fuse = None if weapon is None else weapon.fuse_ticks
+    if fuse:
+        ticks = min(ticks, max(1, fuse - 1))
+    return ticks
 
 
 def _segment_circle_t(ax, ay, bx, by, cx, cy, radius):
@@ -2125,7 +2168,7 @@ def _dash_target(room, machine, seat_index, move):
         return None
     x, y = machine.battle_pos
     group = _seat_group(room, seat_index)
-    hostile = set(index for index, _conn in _hostile_humans(room, seat_index))
+    hostile = set(t[0] for t in _hostile_targets(room, seat_index))
     bodies = [b for b in _battle_bodies(room, seat_index, group)
               if b[0] in hostile]
     if not bodies:
@@ -2264,7 +2307,7 @@ def _try_fire(room, machine, seat_index, weapon, target, now):
                     f"；头 {head.hex()} body({len(body)}) {body.hex()}")
     _emit(machine, packet)
     terrain = mapdata.load(_current_map(room))
-    max_ticks = _shell_max_ticks(terrain, shot)
+    max_ticks = _shell_max_ticks(terrain, shot, weapon)
     for offset in range(weapon.shots):
         machine.pending_shots.append(
             Shell(handle + offset, fire_seq, weapon, group,

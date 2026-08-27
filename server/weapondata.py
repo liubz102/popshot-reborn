@@ -33,7 +33,10 @@ import os
 #:   跟 `tools/weapondata.py` 的 `FORMAT` 必须一起动。
 #: ★ 3（会话 19）：`usable` 收紧成只放行 `CreatingClass=GeneralBullet`（§70）
 #:   —— 分裂弹 / 火墙 / 炮台那几类会在收方**多吃句柄**，按老口径记账会永久错位。
-FORMAT = 3
+#: ★ 4（会话 21）：**§70 那条口径是错的**（§72）：那些额外对象的创建点全在
+#:   `IsMine` 门里，bot 的弹体在任何一台上都不是「自己的」⇒ 一个都不会造出来。
+#:   `usable` 改成按 `SAFE_CLASSES` 白名单放行，新增 `slice_time` / `fuse_ticks`。
+FORMAT = 4
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "bot_weapons.json")
@@ -181,6 +184,22 @@ class Weapon(object):
     def splash_range(self):
         """溅射半径。有它就意味着**每颗子弹多吃一个弹体句柄**（§43）。"""
         return self.raw.get("splash_range")
+
+    @property
+    def fuse_ticks(self):
+        """★ **引信**：这颗弹体最多飞几个 tick，没有引信返回 `None`（§72）。
+
+        `AppleGrenade` / `SeedBomb` / `SliceBullet` 的 `Tick` 里有一个从
+        `SliceTime / 32` 倒数的计数器，数到 0 就**在每一台机器上自爆**
+        （`0x47c952` / `0x48503f` / `0x4851d9`）—— 那一下**不带伤害**
+        （伤害只来自射手发的 `rpExplode`），而且弹体从此不存在。
+
+        ⇒ 服务端的 `rpExplode` 必须**赶在它前面**发出去，否则收方按句柄
+        查不到弹体、整包静默丢弃（§42 第 4 条）。`bot._fire_target()` 因此
+        把「飞不到就别开枪」这条按引信也判一遍。
+        """
+        value = self.raw.get("fuse_ticks")
+        return None if not value else int(value)
 
     @property
     def lockon_range(self):

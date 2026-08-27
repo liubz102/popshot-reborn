@@ -187,11 +187,8 @@ class RealTableTests(unittest.TestCase):
         """★ 每个角色至少得有一把能用的枪，否则它的 bot 一枪都不放。
 
         ⚠ 会话 14 这一条曾经是「**三个槽位全可用**」（用户 2026-08-26 报的
-        「所有角色应该都有 3 个武器能用」）。会话 19 收紧了（§70）：
-        `CreatingClass != GeneralBullet` 的那些（分裂弹 / 火墙 / 炮台 /
-        反弹弹 / 定时炸弹）在收方会**额外创建对象、多吃弹体句柄**，
-        服务端按老公式记账就永久错位 —— 表现是「子弹照飞、一滴血不掉」，
-        而且静默。**宁可少几把枪，也不要一局打不出伤害。**
+        「所有角色应该都有 3 个武器能用」）。会话 19 收紧了（§70），
+        会话 21 又放宽回来（§72，见下面那条钉子）。
         """
         for character in self.PLAYABLE:
             slots = sorted(w.raw["slot"]
@@ -200,18 +197,57 @@ class RealTableTests(unittest.TestCase):
                 self.assertTrue(slots, f"角色 {character} 一把能用的枪都没有")
                 self.assertIn(1, slots, f"角色 {character} 连 1 号枪都不可用")
 
-    def test_only_plain_bullets_are_usable(self):
-        """★★★ §70 的回归钉子：只放行 `CreatingClass=GeneralBullet`。
+    def test_every_playable_character_has_a_second_slot(self):
+        """★★ 用户 2026-08-27 报的：「很多角色都无法切换 2 号武器」。
 
-        语料按类分桶量出来的「上一发基址 + handle_step」残差：
-        `GeneralBullet` 88.4% 命中（基线），而 `AppleGrenade` 只有 39.9%
-        （主峰 +3，`SliceCount=4` 会分裂）、`FlamingBottle` 22.3%
-        （主峰 +9/+17，爆炸后铺一道火墙）。
+        §70 那一版把 `CreatingClass != GeneralBullet` 全剔掉了，10/16 个
+        角色的 2 号槽因此消失。§72 把口径改对之后只剩**反弹弹**
+        （`BounceBullet`，角色 106 / 110）和**炮台**（`RasTurret`，
+        角色 107 / 108）还没回来 —— 那两类的**飞行**服务端确实没有模型。
         """
+        missing = [c for c in self.PLAYABLE
+                   if 2 not in [w.raw["slot"]
+                                for w in weapondata.usable_for(c)]]
+        self.assertEqual([106, 107, 108, 110], sorted(missing))
+
+    def test_only_classes_we_have_a_flight_model_for_are_usable(self):
+        """★★★ §72 的回归钉子：`CreatingClass` 必须在白名单里。
+
+        判据是「**在别人那台机器上它和 `GeneralBullet` 有没有区别**」：
+        每个子类的 `Tick` 都以 `call 0x47de6a`（基类 Tick）开头，飞行一样；
+        分裂 / 火墙 / 炮台的创建点全在 `IsMine`（`0x50d294`）门里，而 bot
+        的弹体在任何一台上都不是「自己的」⇒ 那些对象一个都不会造出来，
+        句柄一个都不会多吃（§72 推翻了 §70 的收紧口径）。
+
+        还在门外的是**飞行**对不上的那几类：`BounceBullet`（弹墙）、
+        `RasTurret`（放炮台）、`PlasmaCannon`（自己 `++` 了句柄计数器）。
+        """
+        allowed = {"GeneralBullet", "AppleGrenade", "SeedBomb", "SliceBullet",
+                   "FlamingBottle", "TimeBomb", "SpiralKnife"}
         for ammo in weapondata.usable():
             weapon = weapondata.get(ammo)
-            self.assertEqual("GeneralBullet", weapon.raw.get("creating_class"),
-                             f"{ammo}（{weapon.raw.get('section')}）不是普通弹体")
+            self.assertIn(weapon.raw.get("creating_class"), allowed,
+                          f"{ammo}（{weapon.raw.get('section')}）的弹体类"
+                          f"服务端没有飞行模型")
+
+    def test_fused_projectiles_carry_their_fuse(self):
+        """★ 带引信的那三类必须算得出 `fuse_ticks`（`SliceTime / 32`）。
+
+        引信到点时弹体**在每一台机器上自爆**且不带伤害（§72）——
+        算不出来的话服务端不知道该在哪一 tick 之前把 `rpExplode` 发出去。
+        """
+        fused = {"AppleGrenade", "SeedBomb", "SliceBullet"}
+        seen = set()
+        for ammo in weapondata.usable():
+            weapon = weapondata.get(ammo)
+            klass = weapon.raw.get("creating_class")
+            if klass not in fused:
+                self.assertIsNone(weapon.fuse_ticks, f"{ammo} 不该有引信")
+                continue
+            seen.add(klass)
+            self.assertGreaterEqual(weapon.fuse_ticks, 2, f"{ammo} 引信太短")
+            self.assertEqual(weapon.raw["slice_time"] // 32, weapon.fuse_ticks)
+        self.assertEqual(fused, seen)
 
     def test_the_uppercase_sections_are_not_dropped(self):
         """★ `[CH01-01]` / `[CH03-01]` 这两个大写节的回归钉子（§45）。"""
