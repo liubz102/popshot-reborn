@@ -75,6 +75,23 @@ POWER2_SCALE = 0.04
 #: `PowerControl=0` 的 `power` —— 语料里这一类**恒 1.0**（§43）。
 POWER0_FIXED = 1.0
 
+# ---------------------------------------------------------------------------
+# ★★★ `PowerControl=2` = **长按鼠标蓄力**（§73）
+# ---------------------------------------------------------------------------
+#: 蓄力计数器每个逻辑 tick 加多少（`0x516694: add [char+0x594], 2`）。
+POWER2_CHARGE_STEP = 2
+
+#: 蓄满的上限（`0x51669d: cmp [char+0x594], 0x50`）。
+POWER2_MAX = 80
+
+#: 松手时的下限（`0x5167f1: cmp [char+0x594], 0xf`）——
+#: 没蓄够就松手，收方按 15 算。
+POWER2_MIN = 15
+
+#: 按住的第一个 tick 就被抬到这里（`0x5166be: cmp …, 4` / `mov …, 4`），
+#: 所以蓄力值恒为**偶数**：4, 6, 8, … 80。
+POWER2_FLOOR = 4
+
 #: `rpFire +22` 的 `count` 上限：`0x491f41` 里 `>= 30` 整包被丢弃。
 MAX_SHOTS = 29
 
@@ -127,7 +144,12 @@ def max_speed(weapon):
 
     * 模式 0：`power` 恒 1.0 ⇒ 就是 `Velocity`（`MaxVelocity` 对它没用，
       `0x4920a7` 那一支根本不读那一格）；
-    * 模式 1 / 2：上限是 `MaxVelocity`（没填就退回 `Velocity`）。
+    * 模式 1：上限是 `MaxVelocity`（没填就退回 `Velocity`）；
+    * ★ 模式 2：上限是 **`power = 80`（蓄满）那一档**，`MaxVelocity`
+      **够不着**（§73）—— 蓄力计数器封顶在 80（`0x51669d`），
+      所以初速最大只有 `Velocity × ((80 + 15) × 0.04)` = `Velocity × 3.8`。
+      拿 `MaxVelocity` 当上限会让服务端以为这把枪打得比原版远：
+      `ch00-02` 的 `MaxVelocity` 是 60，而真正的上限是 `10 × 3.8 = 38`。
 
     ★ 模式 1 取到 `MaxVelocity` 为止是有讲究的：再往上收方会把速度按
     `MaxVelocity / |v|` 压回来，**同时把重力乘上那个比例的平方**
@@ -137,8 +159,44 @@ def max_speed(weapon):
     mode = weapon.power_control
     if mode == MODE_PLAIN:
         return weapon.velocity * POWER0_FIXED
+    if mode == MODE_CHARGE:
+        return speed_for_power(weapon, POWER2_MAX)
     top = weapon.max_velocity or weapon.velocity
     return float(top)
+
+
+def charge_power(weapon, speed):
+    """蓄力武器要扔出 `speed` 这么快，得蓄到几（返回**合法**的 `power`）。
+
+    合法值只有 `{15} ∪ {16, 18, …, 80}`（语料 3036 发 `PowerControl=2` 的
+    `rpFire` 里一个例外都没有，§73）：蓄力计数器每 tick `+2`、第一个 tick
+    被抬到 4、松手时再夹进 `[15, 80]`。
+
+    往**上**取整 —— 蓄不够就够不着，宁可多蓄一点点。
+    """
+    raw = power_for_speed(weapon, speed)
+    if raw <= POWER2_MIN:
+        return POWER2_MIN
+    power = int(math.ceil(raw))
+    if power % 2:
+        power += 1                     # 只能是偶数
+    return min(POWER2_MAX, max(POWER2_MIN, power))
+
+
+def charge_ticks(power):
+    """蓄到 `power` 要按住几个逻辑 tick（一个 tick = `TICK_MS`）。
+
+    收方的计数器：第 k 个 tick 上是 `max(4, 2k)`，松手时再夹到 `>= 15`。
+    ⇒ 蓄到偶数 `p >= 16` 要 `p / 2` 个 tick；`p = 15`（没蓄够就松手）
+    最少按 **1** 个 tick。
+
+    ★ 这不是我们定的节流阈值（铁律 10）—— 它是原版按键判定的直接换算，
+    真人扔一颗蓄满的手雷就得按住 `80 / 2 = 40` 个 tick = 1.28 秒。
+    """
+    power = int(power)
+    if power <= POWER2_MIN:
+        return 1
+    return power // POWER2_CHARGE_STEP
 
 
 def power_for_speed(weapon, speed):

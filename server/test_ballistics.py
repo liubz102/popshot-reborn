@@ -91,19 +91,46 @@ class PowerModeTests(unittest.TestCase):
         （`0x69381c` = 15.0、`0x693bb8` = 0.04）。`power = 10` 时恰好是 `Velocity`。"""
         weapon = FakeWeapon(velocity=10.0, power_control=2, max_velocity=60.0)
         self.assertAlmostEqual(10.0, ballistics.speed_for_power(weapon, 10.0))
-        self.assertEqual(60.0, ballistics.max_speed(weapon))
         power = ballistics.power_for_speed(weapon, 60.0)
         self.assertAlmostEqual(135.0, power)
         self.assertAlmostEqual(60.0, ballistics.speed_for_power(weapon, power))
 
-    def test_the_charge_power_stays_in_the_range_the_corpus_saw(self):
-        """★ 语料里蓄力武器的 `rpFire +18` 是 8~531（§43）——
-        算出来的 `power` 落在这个区间之外就说明公式反了。"""
-        for velocity, top in ((10.0, 60.0), (8.0, 60.0), (15.0, 40.0)):
-            weapon = FakeWeapon(velocity=velocity, power_control=2,
-                                max_velocity=top)
-            power = ballistics.power_for_speed(weapon, top)
-            self.assertTrue(8.0 <= power <= 531.0, f"power={power}")
+    def test_mode_two_tops_out_at_a_full_charge_not_at_max_velocity(self):
+        """★★ 蓄力封顶在 `power = 80`（`0x51669d`），**够不着 `MaxVelocity`**。
+
+        `speed = Velocity × ((80 + 15) × 0.04)` = `Velocity × 3.8`。
+        拿 `MaxVelocity` 当上限的话服务端会以为这把枪打得比原版远
+        —— `ch00-02` 的 `MaxVelocity` 是 60，真正的上限是 38（§73）。
+        """
+        weapon = FakeWeapon(velocity=10.0, power_control=2, max_velocity=60.0)
+        self.assertEqual(38.0, ballistics.max_speed(weapon))
+        self.assertAlmostEqual(
+            38.0, ballistics.speed_for_power(weapon, ballistics.POWER2_MAX))
+
+    def test_the_charge_power_is_one_of_the_values_the_corpus_saw(self):
+        """★★ 语料里 3036 发 `PowerControl=2` 的 `rpFire +18` 只有
+        `{15} ∪ {16, 18, …, 80}` 这些值（§73）—— 蓄力计数器每 tick `+2`、
+        松手时夹进 `[15, 80]`，一个例外都没有。"""
+        weapon = FakeWeapon(velocity=10.0, power_control=2, max_velocity=60.0)
+        for want in (1.0, 5.0, 12.0, 12.1, 20.0, 30.0, 37.9, 38.0, 99.0):
+            power = ballistics.charge_power(weapon, want)
+            self.assertTrue(
+                power == ballistics.POWER2_MIN
+                or (ballistics.POWER2_MIN < power <= ballistics.POWER2_MAX
+                    and power % 2 == 0),
+                f"speed={want} -> power={power}")
+            if want <= 38.0:
+                self.assertGreaterEqual(
+                    ballistics.speed_for_power(weapon, power) + 1e-9, want)
+
+    def test_the_charge_time_is_half_the_power_in_ticks(self):
+        """按住几个 tick：计数器第 k 个 tick 上是 `max(4, 2k)`（§73）。
+        ⇒ 蓄满（80）要 40 个 tick = 1.28 秒。"""
+        self.assertEqual(40, ballistics.charge_ticks(80))
+        self.assertEqual(20, ballistics.charge_ticks(40))
+        self.assertEqual(8, ballistics.charge_ticks(16))
+        # 没蓄够就松手：收方按 15 算，最少按一个 tick。
+        self.assertEqual(1, ballistics.charge_ticks(15))
 
 
 class DirectShotTests(unittest.TestCase):

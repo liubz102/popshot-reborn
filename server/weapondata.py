@@ -36,7 +36,8 @@ import os
 #: ★ 4（会话 21）：**§70 那条口径是错的**（§72）：那些额外对象的创建点全在
 #:   `IsMine` 门里，bot 的弹体在任何一台上都不是「自己的」⇒ 一个都不会造出来。
 #:   `usable` 改成按 `SAFE_CLASSES` 白名单放行，新增 `slice_time` / `fuse_ticks`。
-FORMAT = 4
+#: ★ 5（会话 22）：新增火墙那几格（`slice_id` / `spawn_count` / …，§75）。
+FORMAT = 5
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "bot_weapons.json")

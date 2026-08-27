@@ -209,10 +209,10 @@ class BotCommandTests(LobbyIsolated):
         room = self.open_room()
         bot.handle_command(self.host, "/bot")
         self.host.sent.clear()
-        self.assertTrue(bot.handle_command(self.host, "/char 1 7"))
-        # 面板 7 = 商城角色的第 4 个 = id 103（D6：1/2/3 -> 0/1/2；4..14 -> 100..110）
-        self.assertEqual(103, room.seats[1].character_id)
-        self.assertEqual(103, room.seats[1].conn.character_id)
+        self.assertTrue(bot.handle_command(self.host, "/char 1 3"))
+        # ★ 面板 1/2/3 -> id 0/1/2（D6）。商城角色不给 bot 用（D54）。
+        self.assertEqual(2, room.seats[1].character_id)
+        self.assertEqual(2, room.seats[1].conn.character_id)
 
     def test_char_uses_action_3_so_the_client_stays_quiet(self):
         # ★ action 4 会让客户端播一句韩文「…캐릭터로 선택되었습니다.」
@@ -243,7 +243,7 @@ class BotCommandTests(LobbyIsolated):
         bot.handle_command(self.host, "/bot")
         bot.handle_command(self.host, "/ready")
         self.host.sent.clear()
-        bot.handle_command(self.host, "/char 1 5")
+        bot.handle_command(self.host, "/char 1 3")
         _action, _seat_index, slot = seat_updates(self.host)[0]
         self.assertTrue(slot["ready"])
         self.assertEqual(room.seats[1].team, slot["team"])
@@ -514,11 +514,24 @@ class CharacterPanelTests(unittest.TestCase):
 
     def test_panel_index_round_trips(self):
         for panel in range(1, 15):
-            character = bot.character_for_panel(panel)
+            character = bot.character_for_panel(
+                panel, bot.CHARACTER_PANEL_IDS)
             self.assertEqual(panel, bot.panel_for_character(character))
 
+    def test_a_bot_can_only_take_the_three_starter_characters(self):
+        """★★ 用户 2026-08-27 拍板：商城角色不给 bot 用（D54）。
+
+        它们的 2/3 号武器里有反弹弹 / 炮台 / 等离子炮，服务端还没有那几类的
+        飞行模型（§72）—— 逐个适配的代价和收益不成比例。
+        """
+        self.assertEqual((0, 1, 2), bot.BOT_CHARACTER_PANEL_IDS)
+        for panel in (1, 2, 3):
+            self.assertEqual(panel - 1, bot.character_for_panel(panel))
+        for panel in (4, 8, 14):
+            self.assertIsNone(bot.character_for_panel(panel), panel)
+
     def test_out_of_range_and_junk_return_none(self):
-        for value in (0, 15, -1, "x", None, ""):
+        for value in (0, 4, -1, "x", None, ""):
             self.assertIsNone(bot.character_for_panel(value), value)
 
     def test_default_characters_rotate_so_bots_look_different(self):

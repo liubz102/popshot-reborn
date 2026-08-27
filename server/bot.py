@@ -87,7 +87,24 @@ BOT_LEVEL = MINIMUM_PLAYER_LEVEL
 #: 三个都放不出来，见 `account_store.PREMIUM_CHARACTER_IDS` 的注释）。
 #: 直接让玩家写原始 id 的话 `/char 3 5` 这种自然写法就是非法值 —— 所以命令里
 #: 用连续的面板序号，只在服务端换算一次（D6）。
+#:
+#: ★ 这张表是**真人**的选择面板，`panel_for_character()` 拿它显示序号。
 CHARACTER_PANEL_IDS = tuple(BASE_CHARACTER_IDS) + tuple(PREMIUM_CHARACTER_IDS)
+
+#: ★★★ **bot 只准用初期那三个角色**（`0 / 1 / 2`，用户 2026-08-27 拍板，D54）。
+#:
+#: 「每个角色的武器属性用法都不相同，每一个都按照角色特性来适配让 bot 会用，
+#: 这样感觉太费时间精力了。我改变主意了，bot 可以选择的只有初期的 3 个角色，
+#: 商城角色不可以选择作为 bot。」
+#:
+#: 商城角色的 11 把武器里有反弹弹、炮台、等离子炮这些服务端还没有飞行模型的
+#: 类（§72），逐个适配的代价和收益不成比例。三个基础角色的 **9 把武器
+#: 全部可用**，而且它们正好覆盖了这个游戏的三类玩法：
+#:
+#:     角色 0  手枪 / 分裂手雷 / 狙击枪
+#:     角色 1  双散弹 / 燃烧瓶 / 追踪火箭
+#:     角色 2  机枪 / 抛物线榴弹 / 火箭筒
+BOT_CHARACTER_PANEL_IDS = tuple(BASE_CHARACTER_IDS)
 
 #: 新 bot 的默认角色：按座位号在三个基础角色之间轮换。
 #:
@@ -120,15 +137,20 @@ def _next_bot_seq():
         return _bot_seq
 
 
-def character_for_panel(panel_index):
-    """面板序号 1..14 -> 原始角色 id。越界返回 ``None``（调用方要报错）。"""
+def character_for_panel(panel_index, table=None):
+    """面板序号 -> 原始角色 id。越界返回 ``None``（调用方要报错）。
+
+    ★ 默认查的是 **bot 能用的那张表**（`BOT_CHARACTER_PANEL_IDS`，只有 1~3）。
+    要查真人的完整面板就显式传 `CHARACTER_PANEL_IDS`。
+    """
+    table = BOT_CHARACTER_PANEL_IDS if table is None else table
     try:
         index = int(panel_index)
     except (TypeError, ValueError):
         return None
-    if not 1 <= index <= len(CHARACTER_PANEL_IDS):
+    if not 1 <= index <= len(table):
         return None
-    return CHARACTER_PANEL_IDS[index - 1]
+    return table[index - 1]
 
 
 def panel_for_character(character_id):
@@ -322,6 +344,21 @@ class BotConn(gameserver.Conn):
         #:   ⚠ 每一颗都**必须**恰好发一发：句柄记账在开火那一刻就推进了，
         #:   漏发一发，收方那一格计数器就和服务端错开，从此打不掉血（§42）。
         self.pending_shots = []
+        #: ★★ **进图 / 复活之后的封锁到点时刻**（`time.monotonic()` 的刻度）。
+        #:   `None` = 还没开始这一局。原版在 `Character::Respawn`（`0x502fca`）
+        #:   里给角色挂了一个 **2000 ms** 的状态 0（`0x5030a0`），而开火输入
+        #:   （`0x516471`）和近身输入（`0x515acc`）进门第一件事就是查它 ——
+        #:   这就是真人「预备 / 开始那两下没打完不能动手」「刚复活那两秒
+        #:   只能跑不能打」的来源（§74）。
+        self.act_lock_until = None
+        #: 上一帧「躺着没有」。拿它做**状态翻转**：躺着 -> 站起来 = 复活了，
+        #: 那一刻重新上锁（铁律 10 的口径，不看时间只看事实翻转）。
+        self.was_lying = False
+        #: ★★ **蓄力开始的时刻**（`PowerControl=2` 的武器，§73）。
+        #:   `None` = 手指没按着。真人扔手雷要长按鼠标左键蓄力，
+        #:   蓄力值每个逻辑 tick `+2`、封顶 80，松手才扔得出去 ——
+        #:   蓄得越久扔得越远。bot 现在也得老老实实按住。
+        self.charge_at = None
         # ★ **不调 `register_conn()`**：`_conns` 是「在线的真人」表。
         #   进去的话 `latest_conn()`（控制通道不指定账号时的默认目标）
         #   随时可能变成一个 bot，`tools/gs_ctl.py` 就对着空气发命令了。
@@ -370,6 +407,13 @@ class BotConn(gameserver.Conn):
         self.stamina = None
         self.stamina_at = 0.0
         self.dash_swing = None
+        # ★★ 封锁跟着清：新一局 / 换图之后客户端把角色重新放进图里，
+        #   那一刻 `Character::Respawn` 又挂一次 2000 ms 的状态 0（§74）。
+        #   清成 `None` = 「还没上过锁」，`_tick_bot` 的第一帧会补上。
+        self.act_lock_until = None
+        self.was_lying = False
+        # ★ 手指也松开：换图之后武器要重新声明，蓄力从零开始（§73）。
+        self.charge_at = None
         # ★ 换图 / 新一局客户端把角色重建，武器回到它自己的默认那把 ——
         #   这边不清的话 bot 以为「已经声明过了」，于是**不再发**
         #   `rpChangeWeapon`，别人看到的枪和它打出来的子弹从此对不上。
@@ -491,7 +535,7 @@ class BotConn(gameserver.Conn):
 HELP_LINES = (
     "bot 命令（房主专用，N = 座位号，/h 重看）：",
     "/bot 加一个;  /del N 删掉;  /ready 全部准备",
-    "/char N M 换角色（M=1~14）;  /tm N 换队（组队战）",
+    "/char N M 换角色（M=1~3）;  /tm N 换队（组队战）",
 )
 
 #: ★ **战斗中**的 `/h`。房间里那几条会被 `MUTATING_COMMANDS` 挡掉，列出来
@@ -628,16 +672,22 @@ def _cmd_del(conn, room, args):
 
 
 def _cmd_char(conn, room, args):
-    """`/char N M` —— 换 bot 的角色。M 是面板序号 1..14（D6）。"""
+    """`/char N M` —— 换 bot 的角色。M 是面板序号 **1~3**（D6 / D54）。
+
+    ★ 商城角色（面板 4~14）**不给 bot 用**：它们的 2/3 号武器里有反弹弹、
+    炮台、等离子炮这些服务端还没有飞行模型的类（§72），逐个适配代价太大
+    （用户 2026-08-27 拍板）。三个基础角色的 9 把武器全部可用。
+    """
+    span = len(BOT_CHARACTER_PANEL_IDS)
     index, error = _seat_arg(args)
     if error:
-        return f"/char 用法：/char <座位号> <角色序号 1~14>。{error}"
+        return f"/char 用法：/char <座位号> <角色序号 1~{span}>。{error}"
     if len(args) < 2:
-        return "/char 用法：/char <座位号> <角色序号 1~14>。少了角色序号。"
+        return f"/char 用法：/char <座位号> <角色序号 1~{span}>。少了角色序号。"
     character = character_for_panel(args[1])
     if character is None:
-        return (f"角色序号 {args[1]!r} 不对，只能是 1~{len(CHARACTER_PANEL_IDS)}"
-                f"（1~3 基础角色，4~14 商城角色）。")
+        return (f"角色序号 {args[1]!r} 不对，只能是 1~{span}"
+                f"（bot 只能用初期这三个角色，商城角色不给 bot 用）。")
     seat, error = _bot_seat(room, index)
     if error:
         return f"换不了角色：{error}"
@@ -1485,6 +1535,13 @@ def _lob_speed(weapon, dx, dy):
 
     直射武器（`GravityFactor = 0`）不走这条路 —— 它们没有蓄力，
     `power` 恒 1.0，速度就是 `Velocity`。
+
+    ## ★★ 蓄力武器只能取**离散**的档（§73）
+
+    `PowerControl=2` 的蓄力计数器每 tick `+2`、封顶 80，松手时夹进
+    `[15, 80]` ⇒ `power` 只可能是 `{15} ∪ {16, 18, …, 80}`
+    （语料 3036 发一个例外都没有）。所以算出来的连续速度要**往上**
+    snap 到最近的合法档 —— 蓄不够就够不着，而且蓄多久也是按这个数算的。
     """
     ceiling = ballistics.max_speed(weapon)
     gravity = ballistics.gravity_per_tick(weapon)
@@ -1497,9 +1554,18 @@ def _lob_speed(weapon, dx, dy):
         if speed >= ceiling:
             return ceiling
         if ballistics.solve(weapon, dx, dy, speed=speed) is not None:
-            return speed
+            return _snap_charge(weapon, speed, ceiling)
         speed *= BOT_LOB_MARGIN
     return ceiling
+
+
+def _snap_charge(weapon, speed, ceiling):
+    """把连续初速抬到蓄力武器**够得着的那一档**（§73）；别的武器原样返回。"""
+    if weapon.power_control != ballistics.MODE_CHARGE:
+        return speed
+    snapped = ballistics.speed_for_power(
+        weapon, ballistics.charge_power(weapon, speed))
+    return min(ceiling, max(speed, snapped))
 
 
 def _aim_point(room, seat_index, x, y, crouched):
@@ -1513,6 +1579,103 @@ def _aim_point(room, seat_index, x, y, crouched):
     seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
     character = chrprops.get(0 if seat is None else seat.character_id)
     return character.center(x, y, crouched)
+
+
+#: ★★ **进图 / 复活之后多久才能动手**（秒）。
+#:
+#: 原版 `Character::Respawn`（`0x502fca`）里：
+#:
+#:     0x5030a0  mov eax, 0x7d0            ; 2000 ms
+#:     0x5030a6  idiv [0x6dc528]           ; ÷ 32 ms = 62 个 tick
+#:     0x5030b9  call 0x401b0f             ; 给 [char+0x6a0] 挂上状态 0
+#:
+#: 而**开火输入**（`0x516471: push 0 … call 0x401c0c; jne 跳过`）和
+#: **近身输入**（`0x515acc`）进门第一件事就是查状态 0 在不在。
+#: ⇒ 真人在这 2 秒里只能跑、不能打。
+#:
+#: ★ 语料独立对上了：953 局里「房主发 `0x0402` 到本局第一发 `rpFire`」
+#: 最少隔 **15 发心跳**（15 × 128 ms = 1.92 秒），p05 = 17 —— 一条很硬的地板。
+#:
+#: ★ 这**不是**我们定的时序阈值（铁律 10）：它是原版写死的常量，
+#: 服务端只是照抄；起算点是**事实翻转**（进了 IN_GAME / 从躺着站起来），
+#: 不是定时器。
+BOT_ACTION_LOCK_S = 2.0
+
+
+def _note_action_lock(room, machine, seat_index, now):
+    """维护「现在能不能动手」这道锁 —— 按**状态翻转**上锁（§74）。
+
+    两个上锁点，都对应原版调 `Character::Respawn` 的那两处：
+
+    1. **这一局的第一帧**（`act_lock_until is None`）—— 客户端刚被
+       `0x0402` 推进 stage 7，角色放进图里，屏幕上正在放「预备 / 开始」；
+    2. **躺着 -> 站起来**（`_lying_dead()` 翻转）—— 重生广播刚发出去。
+    """
+    lying = _lying_dead(room, seat_index)
+    if machine.act_lock_until is None or (machine.was_lying and not lying):
+        machine.act_lock_until = now + BOT_ACTION_LOCK_S
+    machine.was_lying = lying
+
+
+def _may_act(machine, now):
+    """这一帧允许开枪 / 近身吗（`BOT_ACTION_LOCK_S` 那道锁）。"""
+    until = machine.act_lock_until
+    return until is None or now >= until
+
+
+def _charge_ready(machine, weapon, shot, now):
+    """蓄力武器：手指按够了吗（§73）。
+
+    非蓄力武器恒为 `True` —— 它们**点击即发**（`0x5164c8` 那个
+    `cmp [weapondef+0x18], 2` 的另一支）。
+
+    蓄力武器要按住 `ballistics.charge_ticks(power)` 个逻辑 tick。
+    这里只回答「按够了没有」，按下去那一刻由 `_hold_trigger()` 记。
+    """
+    if weapon.power_control != ballistics.MODE_CHARGE:
+        return True
+    if machine.charge_at is None:
+        return False
+    need = (ballistics.charge_ticks(shot.power)
+            * ballistics.TICK_MS / 1000.0)
+    return (now - machine.charge_at) >= need
+
+
+def _hold_trigger(machine, weapon, target, now):
+    """按住 / 松开鼠标左键的记账（蓄力武器专用，§73）。
+
+    * 有目标 + 是蓄力武器 -> 手指按着（第一次按下时记时刻）；
+    * 没目标 / 换成了非蓄力武器 -> 手松开，蓄力清零。
+
+    ⚠ **目标换人不清零**：真人是先按住蓄着、再挑往哪扔的，
+    中途改主意不会把力气泄掉。
+    """
+    if target is not None and weapon is not None \
+            and weapon.power_control == ballistics.MODE_CHARGE:
+        if machine.charge_at is None:
+            machine.charge_at = now
+    else:
+        machine.charge_at = None
+
+
+def _charge_value(machine, now):
+    """此刻手指按出来的**蓄力值**，填进心跳 `+15`（= `[char+0x594]`）。
+
+    收方那一格就是蓄力计数器（packet_api §5.5，语料 59117/67186 是 0 ——
+    因为绝大多数时候没人在蓄力）。报了它，别人屏幕上才看得见 bot 在
+    「攒力气」。没按着返回 0。
+
+    数值按收方的算法走（§73）：第 k 个 tick 上是 `max(4, 2k)`，封顶 80。
+    """
+    if machine.charge_at is None:
+        return 0
+    ticks = int(max(0.0, now - machine.charge_at)
+                * ballistics.TICKS_PER_SECOND)
+    if ticks <= 0:
+        return 0
+    return min(ballistics.POWER2_MAX,
+               max(ballistics.POWER2_FLOOR,
+                   ticks * ballistics.POWER2_CHARGE_STEP))
 
 
 def _outlives_fuse(weapon, shot):
@@ -1968,6 +2131,45 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region):
             botsync.splash_body(shell.handle,
                                 botsync.character_handle(seat_index),
                                 splash, where[0], where[1])))
+    _set_ground_on_fire(machine, weapon, point)
+
+
+def _fire_wall_of(weapon):
+    """这把武器炸完会不会在地上铺一道火墙；会的话返回那一节火焰的武器记录。
+
+    只有 `CreatingClass=FlamingBottle` 会（`0x4829b1` 那个 `IsMine` 门后面
+    那一发 `rpSetOnFire`，§75）。别的武器返回 `None`。
+    """
+    if weapon.raw.get("creating_class") != "FlamingBottle":
+        return None
+    slice_id = weapon.raw.get("slice_id")
+    return None if not slice_id else weapondata.get(slice_id)
+
+
+def _set_ground_on_fire(machine, weapon, point):
+    """★★ 火焰弹炸完补一发 `rpSetOnFire` —— 地上那道火墙（§75）。
+
+    用户 2026-08-27 实机报的：「2 号角色，2 号武器扔在地上是会持续燃烧
+    一会儿的，现在 bot 的没有燃烧。」
+
+    根子和 `rpExplode` 是同一个（§42 / §72）：原版这一发是**射手那台机器**
+    在 `IsMine` 门里发的，而 bot 的弹体在任何一台上都不是「自己的」
+    ⇒ 没有一台会替它铺火。
+
+    ⚠ **句柄记账必须跟着走**：这一发在收方吃掉 `2 × SpawnCount + 1` 个弹体
+    句柄（`sync.set_on_fire()` 在同一次加锁里推进）。漏掉的话之后每一发
+    `rpExplode` 都对不上号、被静默丢弃（§42）。
+    """
+    flame = _fire_wall_of(weapon)
+    if flame is None:
+        return
+    packet, step = machine.sync.set_on_fire(
+        point[0], point[1], flame.id, flame.raw.get("spawn_count"))
+    machine.log(f"   火墙: 在 ({point[0]:.1f}, {point[1]:.1f}) 点着 "
+                f"{flame.id}({flame.raw.get('section')}) "
+                f"{flame.raw.get('spawn_count')} 团火"
+                f"（★ 收方吃掉 {step} 个弹体句柄，§75）")
+    _emit(machine, packet)
 
 
 def _advance_shells(room, machine, now):
@@ -2313,6 +2515,9 @@ def _try_fire(room, machine, seat_index, weapon, target, now):
             Shell(handle + offset, fire_seq, weapon, group,
                   muzzle_x, muzzle_y, shot, now, max_ticks))
     machine.next_fire_at = _reload_after_shot(machine, weapon, now)
+    # ★ 松手 = 蓄力清零（`0x51685c: and [char+0x594], 0`，§73）。
+    #   下一颗手雷得从头按起。
+    machine.charge_at = None
     # ★★ 当场推一步：收方在**它的下一个 tick**（32 ms）就把弹体推进一格，
     #   而 bot 的下一帧要等 125 ms。贴脸那一发（枪口到人常常只有几十个
     #   单位）就在那一格里撞上了 —— 等到下一帧再结算的话，爆炸特效会比
@@ -2392,12 +2597,19 @@ def _tick_bot(room, machine, seat_index):
         machine.sync.broken = True
         machine.log(f"   ★★ 同步流不变式被破坏，已停掉这个 bot 的同步: {error}")
         return
+    # ★★ 「躺着没有」这件事**在死亡分支前面**记（§74）：那道 2 秒锁的
+    #   起算点是「躺着 -> 站起来」这个**翻转**，翻转的前一半发生在
+    #   bot 还躺着的时候。放到后面记的话 `was_lying` 永远是 False，
+    #   复活那一帧看不到翻转，锁也就永远不会重新挂上。
+    _note_action_lock(room, machine, seat_index, now)
     if _lying_dead(room, seat_index):
         # ★ 死亡处理器 `0x4ffbb7`（虚槽，`Character` / `MyCharacter` 同一格）
         #   里有一句 `mov byte [ebx+0x2b5], 0` —— **客户端一死就把蹲的状态
         #   清掉了**。这边不跟着清的话，两边的记账从此错开一轮：真人还蹲着
         #   时 bot 看不到「翻转」，于是重生后**不发**那一发蹲下（§41）。
         machine.crouched = False
+        # ★ 手指也松开：躺着的时候鼠标按下去没有任何意义（§73）。
+        machine.charge_at = None
         return
 
     leader = _follow_target(room, machine)
@@ -2483,6 +2695,12 @@ def _tick_bot(room, machine, seat_index):
         target = (None if weapon is None
                   else _fire_target(room, machine, seat_index, weapon))
         cursor = None if target is None else target[1]
+        # ★★ 手指按不按着，要在**组心跳之前**算好：心跳 `+15` 那一格就是
+        #   蓄力计数器（`[char+0x594]`，packet_api §5.5）—— 报了它，别人
+        #   屏幕上才看得见 bot 在攒力气（§73）。
+        #   ★ 锁着的那 2 秒里连按都不按（§74）：真人那两秒点鼠标没反应。
+        acting = _may_act(machine, now)
+        _hold_trigger(machine, weapon, target if acting else None, now)
         # ★★ 地面标志和速度**原样抄真人这一段的**（§35），不从位移反推：
         #   踩在地上走的时候真人报的速度就是 0，反推出来的非零速度会让收方
         #   拿它自己往前推算、和坐标打架 —— 那就是「一跳一跳像在抽搐」。
@@ -2492,7 +2710,8 @@ def _tick_bot(room, machine, seat_index):
         #   一起算（§36 / §37）。真人的身体朝向就是这么来的。
         state = botsync.character_state(
             x, y, vx=vx, vy=vy, on_ground=on_ground, facing=machine.heading,
-            keys=keys, fast_run=fast_run, cursor=cursor)
+            keys=keys, fast_run=fast_run, cursor=cursor,
+            state_byte=_charge_value(machine, now))
         _emit(machine, machine.sync.heartbeat(state))
         # ★ 开火排在心跳**后面**：`rpFire` 里带的是自己的枪口坐标，
         #   让收方先按这一帧的心跳把 bot 挪到位，弹道起点才对得上。
@@ -2503,10 +2722,12 @@ def _tick_bot(room, machine, seat_index):
         _regen_stamina(machine, now, crouched=bool(crouch), fast_run=fast_run)
         # ★★ **近身冲刺攻击优先于开枪**（§64）：原版这一下会占住整个角色
         #   （`TotalFrame` 那么多帧），真人也开不了枪。够得着就冲，够不着才打枪。
-        dashing = _try_dash(room, machine, seat_index, now, on_ground)
-        if (not dashing and machine.dash_swing is None
+        dashing = acting and _try_dash(room, machine, seat_index, now,
+                                       on_ground)
+        if (acting and not dashing and machine.dash_swing is None
                 and target is not None and now >= machine.next_fire_at
-                and _may_fire(machine, weapon)):
+                and _may_fire(machine, weapon)
+                and _charge_ready(machine, weapon, target[2], now)):
             _try_fire(room, machine, seat_index, weapon, target, now)
     except botsync.SyncInvariantError as error:
         # ★ 不变式炸了：把**这一个 bot** 的流停掉，别的人一点不受影响（D1）。

@@ -801,6 +801,29 @@ class BotFrameRoom(BotBattleRoom):
     不喂就一帧都不该有。
     """
 
+    #: ★★ 「进图 / 复活之后 2 秒不能动手」那道锁（§74）默认**放开**。
+    #:
+    #: 不放开的话这一大批用例全废：它们在几微秒里喂完整局心跳，而真实的
+    #: 2 秒锁会把每一发 `rpFire` 都挡掉。锁本身有 `BotActionLockTests`
+    #: 单独验（同 `BotFireRoom.melee` 的路数）。
+    action_lock = False
+
+    def setUp(self):
+        super().setUp()
+        if not self.action_lock:
+            self.unlock_bots()
+
+    def unlock_bots(self):
+        """把房里每个 bot 的那道 2 秒锁提前解掉。
+
+        ★ 直接写 `0.0` 而不是 `None`：`None` 的语义是「这一局还没上过锁」，
+        `_note_action_lock()` 下一帧会补上一把新的。
+        """
+        for index in self.room.bot_seats():
+            conn = self.room.seats[index].conn
+            if isinstance(conn, bot.BotConn):
+                conn.act_lock_until = 0.0
+
     def human_heartbeat(self, conn, x, y, jumped=0, on_ground=True,
                         velocity=(0, 0), fast_run=False):
         """让 `conn` 发一发带位置的心跳（走真的 `0x040e` 入口）。
@@ -810,7 +833,12 @@ class BotFrameRoom(BotBattleRoom):
 
         ★ 默认「踩在地上、速度 0」—— 那是真人**走路**时的样子（§35），
         绝大多数用例要的就是它。跳跃的段落显式传 `on_ground=False`。
+
+        ★ `action_lock = False` 时**每一发之前都放一次锁**：换图 / 复活
+        都会重新上锁（§74），逐发放开才不用在每个用例里记着这件事。
         """
+        if not self.action_lock:
+            self.unlock_bots()
         if jumped:
             gameserver.Conn.on_game_packet(conn, OP_PEER_DATA_UP, self.jump(
                 conn, jumped))
@@ -1575,6 +1603,18 @@ class BotFireRoom(BotFrameRoom):
                                (800.0, 100.0)])
         if settle:
             self.settle()
+
+    def charge(self):
+        """★ 把「手指按下去的那一刻」拨到很久以前 = 蓄力已经满了（§73）。
+
+        单测里一帧和一帧只差几微秒，而蓄力是按**真实流逝的时间**算的
+        （蓄满 80 要 1.28 秒）—— 不拨的话蓄力武器一发都打不出来。
+        ★ 只对 `PowerControl=2` 的武器有意义，别的武器点击即发。
+        """
+        for index in self.room.bot_seats():
+            conn = self.room.seats[index].conn
+            if isinstance(conn, bot.BotConn) and conn.charge_at is not None:
+                conn.charge_at -= 3600.0
 
     def arrive(self):
         """让在飞的子弹**把整条弹道跑完**（把出膛时刻拨到很久以前）。
@@ -2682,9 +2722,9 @@ class BotFuseTests(BotFireRoom):
 
     def test_a_shot_that_would_blow_up_on_the_way_is_refused(self):
         """★ 「够不着」和「弹道解不出来」是同一类事实，不是新规则。"""
-        weapon = weapondata.get(1003020)          # ch03-02，SliceTime=1200
-        shot = ballistics.solve(weapon, 1000.0, 0.0,
-                                speed=bot._lob_speed(weapon, 1000.0, 0.0))
+        weapon = weapondata.get(1110030)          # ch110-03，SliceTime=500
+        shot = ballistics.solve(weapon, 800.0, 0.0,
+                                speed=bot._lob_speed(weapon, 800.0, 0.0))
         self.assertGreaterEqual(shot.ticks, weapon.fuse_ticks - 1)
         self.assertTrue(bot._outlives_fuse(weapon, shot))
 
@@ -2703,7 +2743,7 @@ class BotFuseTests(BotFireRoom):
                          bot._shell_max_ticks(None, shot, weapon))
 
     def test_a_grenade_character_can_still_shoot(self):
-        """★ 别修过头：角色 0 换到 2 号槽照样打得出 `rpFire`。"""
+        """★ 别修过头：角色 0 换到 2 号槽照样打得出 `rpFire`（蓄够之后）。"""
         seat = self.room.seats[self.bot_seat]
         seat.character_id = 0
         self.bot_conn.character_id = 0
@@ -2711,6 +2751,260 @@ class BotFuseTests(BotFireRoom):
         self.bot_conn.declared_weapon = None
         self.assertEqual(1000020, self.bot_conn.weapon.id)
         self.approach()
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat),
+                         "手指才刚按下去，一发都不该有（§73）")
+        self.charge()
+        self.approach(x=120.0)
+        self.assertTrue(fire_frames(self.alice, self.bot_seat))
+
+
+def fire_wall_frames(conn, seat):
+    return [f for f in bot_frames(conn, seat)
+            if header(f)["opcode"] == botsync.OP_SET_ON_FIRE]
+
+
+class BotFireWallTests(BotFireRoom):
+    """★★ **地面燃烧**（`rpSetOnFire`，§75）—— 火焰弹炸在地上留下的火墙。
+
+    用户 2026-08-27：「2 号角色，2 号武器扔在地上是会持续燃烧一会儿的，
+    现在 bot 的没有燃烧。」
+
+    和 `rpExplode` 同一个根子（§42 / §72）：原版这一发是**射手那台机器**
+    在 `IsMine` 门里发的，bot 没有本机 ⇒ 没有一台会替它铺火。
+    """
+
+    def flame_thrower(self):
+        """把 bot 换成角色 1 的 2 号槽（화염탄，`CreatingClass=FlamingBottle`）。"""
+        self.room.seats[self.bot_seat].character_id = 1
+        self.bot_conn.character_id = 1
+        self.bot_conn.weapon_slot = 2
+        self.bot_conn.declared_weapon = None
+        weapon = self.bot_conn.weapon
+        self.assertEqual(1001020, weapon.id)
+        return weapon
+
+    def throw(self):
+        """蓄满 -> 扔一颗 -> 结算（火墙是**爆炸那一刻**才铺的）。"""
+        self.approach()
+        self.charge()
+        self.approach(x=120.0)
+        self.settle()
+
+    def test_a_flame_bottle_sets_the_ground_on_fire(self):
+        self.flame_thrower()
+        self.throw()
+        frames = fire_wall_frames(self.alice, self.bot_seat)
+        self.assertTrue(frames, "火焰弹炸完该补一发 rpSetOnFire")
+
+    def test_the_packet_says_the_flame_ammo_and_hits_everyone(self):
+        self.flame_thrower()
+        self.throw()
+        body = body_of(fire_wall_frames(self.alice, self.bot_seat)[0])
+        self.assertEqual(14, len(body))
+        self.assertEqual(botsync.FIRE_SOURCE_PLAYER_BASE + self.bot_seat,
+                         body[0])
+        # ★ `SplashTeam` 一个武器都没填 ⇒ 组恒为 255 = 撞所有人（§69）。
+        self.assertEqual(botsync.FIRE_GROUP_EVERYONE, body[1])
+        self.assertEqual(1001500, struct.unpack_from("<i", body, 10)[0])
+
+    def test_the_fire_wall_eats_two_n_plus_one_handles(self):
+        """★★★ `2 × SpawnCount + 1`（`0x4924a9`）—— 数错了之后每一发
+        `rpExplode` 都被静默丢弃（§42 / §75）。
+
+        `ch01-02a` 的 `SpawnCount` 是 4 ⇒ 9，正是 §70 量到的残差主峰。
+        """
+        self.assertEqual(9, botsync.fire_wall_handles(4))
+        self.assertEqual(17, botsync.fire_wall_handles(8))
+        self.flame_thrower()
+        before = self.bot_conn.sync.projectiles
+        self.throw()
+        step = self.bot_conn.weapon.handle_step
+        self.assertEqual(before + step + 9,
+                         self.bot_conn.sync.projectiles)
+
+    def test_the_next_shot_uses_the_handle_after_the_fire_wall(self):
+        """★ 下一颗手雷的句柄要把火墙那 9 个算进去。"""
+        self.flame_thrower()
+        self.throw()
+        want = botsync.projectile_handle(self.bot_seat,
+                                         self.bot_conn.sync.projectiles)
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.approach(x=140.0)
+        self.charge()
+        self.approach(x=160.0)
+        self.settle()
+        self.assertTrue(fire_frames(self.alice, self.bot_seat))
+        booms = explode_frames(self.alice, self.bot_seat)
+        self.assertTrue(booms)
+        self.assertEqual(want, struct.unpack_from("<i", body_of(booms[0]), 0)[0])
+
+    def test_a_plain_weapon_never_sets_anything_on_fire(self):
+        self.approach()
+        self.settle()
+        self.assertEqual([], fire_wall_frames(self.alice, self.bot_seat))
+
+
+class BotActionLockTests(BotFireRoom):
+    """★★ **进图 / 复活之后那 2 秒只能跑，不能动手**（§74）。
+
+    用户 2026-08-27 报的两条「抢跑」：
+
+    * 「正常进游戏后画面会显示『预备』『开始』，这两个词显示完之后真人才
+      可以行动，现在 bot 在显示这两个词的时候就开枪了」；
+    * 「真人被打死复活后有大概两三秒不能开枪，只能移动。但是 bot 在复活后
+      的一瞬间就开枪了」。
+
+    根子是同一个：原版 `Character::Respawn`（`0x502fca`）给刚放进图里的角色
+    挂了一个 **2000 ms** 的状态 0（`0x5030a0`），而开火输入（`0x516471`）和
+    近身输入（`0x515acc`）进门第一件事就是查它。
+    """
+
+    action_lock = True                 # ★ 这一批要的就是那道锁
+
+    def test_the_first_frame_arms_the_lock(self):
+        self.walk(self.alice, [(100, 100)])
+        left = self.bot_conn.act_lock_until - time.monotonic()
+        self.assertGreater(left, bot.BOT_ACTION_LOCK_S - 0.5)
+        self.assertLessEqual(left, bot.BOT_ACTION_LOCK_S)
+
+    def test_it_holds_fire_while_the_lock_is_on(self):
+        self.approach()
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+        self.assertEqual([], dash_frames(self.alice, self.bot_seat))
+
+    def test_it_still_moves_while_the_lock_is_on(self):
+        """★ 锁的是**动手**，不是走路 —— 真人那两秒照样能跑。"""
+        self.walk(self.alice, [(0, 100), (200, 100), (400, 100)])
+        self.assertTrue(bot_frames(self.alice, self.bot_seat))
+
+    def test_it_shoots_once_the_lock_expires(self):
+        self.approach()
+        self.unlock_bots()
+        self.approach(x=120.0)
+        self.assertTrue(fire_frames(self.alice, self.bot_seat))
+
+    def test_standing_up_from_the_dead_arms_it_again(self):
+        """★ 判据是**状态翻转**（躺着 -> 站起来），不是定时器（铁律 10）。"""
+        self.approach()
+        self.unlock_bots()
+        self.approach(x=120.0)
+        self.clear()
+        quest = self.room.quest
+        quest.respawn_due[self.bot_seat] = (time.monotonic() + 5.0, (0, 0))
+        self.walk(self.alice, [(140, 100)])          # 躺着这一帧
+        quest.respawn_due.pop(self.bot_seat)
+        self.walk(self.alice, [(160, 100)])          # 站起来的那一帧
+        self.assertGreater(self.bot_conn.act_lock_until, time.monotonic())
+        self.bot_conn.next_fire_at = 0.0
+        self.approach(x=180.0)
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat),
+                         "刚复活的两秒里不许开枪")
+
+    def test_a_map_change_arms_it_again(self):
+        self.unlock_bots()
+        self.approach()
+        gameserver.Conn.on_game_packet(
+            self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
+            gameserver.w_wstr("Stage02"))
+        self.assertIsNone(self.bot_conn.act_lock_until)
+        self.clear()
+        self.approach(x=300.0)
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+
+
+class BotChargeTests(BotFireRoom):
+    """★★ **蓄力**（`PowerControl=2`）—— 长按鼠标左键才扔得远（§73）。
+
+    用户 2026-08-27：「真人操作的时候，手雷是需要长按鼠标左键蓄力的……
+    现在 bot 的手雷仿佛不需要蓄力，直接就扔出去了，真人扔这么快的话，
+    相当于不蓄力直接扔，这种情况下真人扔不远的，几乎就是直接掉在自己脚下。」
+
+    蓄力计数器每个逻辑 tick `+2`、封顶 80（`0x516694` / `0x51669d`），
+    松手时夹进 `[15, 80]`（`0x5167f1` / `0x516802`）。
+    """
+
+    def grenade(self):
+        """把 bot 换成角色 0 的 2 号槽（苹果雷，`PowerControl=2`）。"""
+        self.room.seats[self.bot_seat].character_id = 0
+        self.bot_conn.character_id = 0
+        self.bot_conn.weapon_slot = 2
+        self.bot_conn.declared_weapon = None
+        return self.bot_conn.weapon
+
+    def test_the_finger_goes_down_when_there_is_a_target(self):
+        self.grenade()
+        self.approach()
+        self.assertIsNotNone(self.bot_conn.charge_at)
+
+    def test_it_does_not_throw_before_the_charge_is_ready(self):
+        self.grenade()
+        self.approach()
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+
+    def test_it_throws_once_the_charge_is_ready(self):
+        self.grenade()
+        self.approach()
+        self.charge()
+        self.approach(x=120.0)
+        self.assertTrue(fire_frames(self.alice, self.bot_seat))
+
+    def test_throwing_lets_go_of_the_button(self):
+        """`0x51685c: and [char+0x594], 0` —— 扔完蓄力清零，下一颗重按。"""
+        self.grenade()
+        self.approach()
+        self.charge()
+        self.approach(x=120.0)
+        self.assertTrue(fire_frames(self.alice, self.bot_seat))
+        self.clear()
+        # ★ 冷却拨掉，只留蓄力这一道闸：手指是从零重按的，所以还是打不出来。
+        self.bot_conn.next_fire_at = 0.0
+        self.approach(x=140.0)
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat),
+                         "第二颗手雷也得重新蓄力")
+
+    def test_the_power_is_one_of_the_values_a_human_can_produce(self):
+        self.grenade()
+        self.approach()
+        self.charge()
+        self.approach(x=120.0)
+        frames = fire_frames(self.alice, self.bot_seat)
+        self.assertTrue(frames)
+        power = struct.unpack_from("<f", body_of(frames[0]), 18)[0]
+        self.assertTrue(
+            power == ballistics.POWER2_MIN
+            or (ballistics.POWER2_MIN < power <= ballistics.POWER2_MAX
+                and int(power) % 2 == 0), f"power={power}")
+
+    def test_the_heartbeat_shows_the_charge_building_up(self):
+        """★ 心跳 `+15` 就是蓄力计数器（`[char+0x594]`，packet_api §5.5）——
+        报了它，别人屏幕上才看得见 bot 在攒力气。"""
+        self.grenade()
+        self.approach()
+        self.clear()
+        # 手指按下去一会儿了：下一发心跳该带着蓄力值。
+        self.bot_conn.charge_at -= 0.5
+        self.walk(self.alice, [(120, 100)])
+        beats = [f for f in bot_frames(self.alice, self.bot_seat)
+                 if udpsync.is_heartbeat(f)]
+        self.assertTrue(beats)
+        charge = body_of(beats[-1])[7 + 8]
+        self.assertTrue(ballistics.POWER2_FLOOR <= charge
+                        <= ballistics.POWER2_MAX, charge)
+        self.assertEqual(0, charge % 2, "蓄力值只会是偶数")
+
+    def test_a_click_to_fire_weapon_never_charges(self):
+        """★ 3 号角色的 2 号武器（`ch02-02`，`PowerControl=1`）**点击即发** ——
+        真人看得见它的弹道预测线，不用蓄力（`0x5164c8` 那个分岔）。"""
+        self.room.seats[self.bot_seat].character_id = 2
+        self.bot_conn.character_id = 2
+        self.bot_conn.weapon_slot = 2
+        self.bot_conn.declared_weapon = None
+        weapon = self.bot_conn.weapon
+        self.assertEqual(1002020, weapon.id)
+        self.assertEqual(ballistics.MODE_DIRECT_POWER, weapon.power_control)
+        self.approach()
+        self.assertIsNone(self.bot_conn.charge_at)
         self.assertTrue(fire_frames(self.alice, self.bot_seat))
 
 

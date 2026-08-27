@@ -51,7 +51,9 @@ ROOT = os.path.dirname(HERE)
 #: ★ 3（会话 19）：`usable` **收紧**成只放行 `CreatingClass=GeneralBullet`（§70）。
 #: ★ 4（会话 21）：`usable` 按 `SAFE_CLASSES` 白名单放行（§72 推翻了 §70 的
 #:   收紧口径），新增 `slice_time` / `fuse_ticks` 两个字段。
-FORMAT = 4
+#: ★ 5（会话 22）：新增火墙那几格（`slice_id` / `spawn_count` /
+#:   `spawn_life` / `spawn_interval` / `spawn_distance`，§75）。
+FORMAT = 5
 
 #: 节名 `chNNN-MM…`：NNN = 角色 id，MM = 武器序号。
 #: ★ 后面还可能跟 `SE` / `D1` / `R1` / `F1` / `a` / `Classic` 之类的后缀 ——
@@ -100,6 +102,17 @@ _FIELDS = (
     #   `SeedBomb` / `SliceBullet`）的 Tick 里有一个从 `SliceTime / 32`
     #   倒数的计数器，数到 0 就**在每一台机器上自爆**（§72）。
     ("SliceTime",       "slice_time",      int),
+    # ★★ `SliceId`：爆炸之后生出来的那一节武器的 id。`FlamingBottle` 拿它
+    #   当**火墙**（`rpSetOnFire` body `+10` 填的就是它，packet_api §5.4d）。
+    ("SliceId",         "slice_id",        int),
+    # ★★ `SpawnCount`：火墙铺几团火（`weapondef+0xb8`，`0x48990c`，默认 4）。
+    #   ★ 它决定 `rpSetOnFire` **在收方吃掉几个弹体句柄**：`2n+1`
+    #   （`0x4924a3` 读 `+0xb8`、`0x4924a9` 的 `lea eax,[eax+eax+1]`，§75）。
+    ("SpawnCount",      "spawn_count",     int),
+    # 火墙的一团火活多少个 tick / 隔几个 tick 生一团 / 每团间隔多少个单位。
+    ("SpawnLifeTime",   "spawn_life",      int),
+    ("SpawnInterval",   "spawn_interval",  int),
+    ("SpawnDistance",   "spawn_distance",  float),
 )
 
 

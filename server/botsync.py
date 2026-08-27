@@ -93,6 +93,14 @@ OP_EXPLODE = 0x0003
 #: 不补这一发，火箭 / 手雷炸在人脚边一滴血都不掉。
 OP_SPLASH_DAMAGED = 0x0004
 
+#: `0x0005 rpSetOnFire` —— **地面燃烧**（body 14 字节，§75 / packet_api §5.4d）。
+#:
+#: 火焰弹（`CreatingClass=FlamingBottle`）炸在地上之后铺的那道火墙。
+#: ★ 原版**只有射手那台机器**发这一发（创建点 `0x4829d0` 套在 `IsMine` 门里，
+#: §72）—— bot 没有本机，不补这一发就一点火都不着，用户 2026-08-27 报的
+#: 「2 号角色 2 号武器扔在地上会持续燃烧，现在 bot 的没有燃烧」就是它。
+OP_SET_ON_FIRE = 0x0005
+
 OP_JUMP = 0x0006
 
 #: `0x0007 rpDash` —— **双击左右方向键的近身攻击**（body 11 字节，§64）。
@@ -685,6 +693,49 @@ def splash_body(source_handle, target_handle, damage, x, y,
                         float(x), float(y), 0)
 
 
+_SET_ON_FIRE = struct.Struct("<BBffi")
+
+#: 火墙的碰撞排除组：`SplashTeam` 一个武器都没填 ⇒ 恒 **255 = 撞所有人**
+#: （§69 / packet_api §5.4d）。队友站上去照样烧。
+FIRE_GROUP_EVERYONE = 255
+
+
+def set_on_fire_body(seat, x, y, slice_id, group=FIRE_GROUP_EVERYONE):
+    """`0x0005 rpSetOnFire`（14 字节）：**在这儿铺一道火墙**（§75）。
+
+    ```
+    +0   u8   `10 + 座位号`（owner，和 rpFire body+0 同一套编码）
+    +1   u8   碰撞排除组 —— `SplashTeam` 没填就是 255（撞所有人）
+    +2   f32  X（着火点，`[char+0x34]` 那一族坐标）
+    +6   f32  Y
+    +10  i32  `SliceId` —— 火焰那一节的武器 id
+    ```
+
+    出处：组包点 `0x4923e2`、调用现场 `0x4829d0`（packet_api §5.4d）。
+    """
+    return _SET_ON_FIRE.pack(
+        FIRE_SOURCE_PLAYER_BASE + (int(seat) & 0xFF), int(group) & 0xFF,
+                             float(x), float(y), int(slice_id))
+
+
+def fire_wall_handles(spawn_count):
+    """★★ 一发 `rpSetOnFire` **在收方吃掉几个弹体句柄**（§75）。
+
+    收侧 `OnSetOnFire`（`0x492471`）：
+
+        0x4924a3  mov eax, [weapondef + 0xb8]   ; SpawnCount（缺省 4）
+        0x4924a9  lea eax, [eax + eax + 1]      ; ★ 2n + 1
+
+    语料两处独立对上：`ch01-02a` `SpawnCount=4` ⇒ 9，而 §70 量到
+    `FlamingBottle` 的句柄残差主峰正是 **+9**；`ch100-02a` / `ch103-02a`
+    `SpawnCount=8` ⇒ 17，对应残差的另一个峰 **+17**。
+
+    ⚠ 不跟着推进这个数的话，之后每一发 `rpExplode` 都会对不上号、被静默
+    丢弃 —— 「子弹照飞、一滴血不掉」，一局之内不自愈（§42）。
+    """
+    return 2 * int(spawn_count or 0) + 1
+
+
 #: 冲刺攻击的方向（body `+1`）。客户端 `0x515b32` 双击 ← 发 `-1`、
 #: `0x515b9a` 双击 → 发 `+1`。
 DASH_LEFT = -1
@@ -899,6 +950,23 @@ class BotSyncStream:
                 group=group, shots=shots, **kwargs))
             self.projectiles += int(handle_step)
             return packet, handle
+
+    def set_on_fire(self, x, y, slice_id, spawn_count):
+        """一发 `rpSetOnFire`（地面燃烧），**同时把句柄记账推进 `2n+1`**。
+
+        返回 `(包, 这道火墙吃掉的句柄数)`。
+
+        ★ 和 `dash()` 同一个道理：收方 `OnSetOnFire`（`0x492471`）会替这道
+        火墙创建一串对象，它们和弹体**共用同一个句柄计数器**。数错了之后
+        每一发 `rpExplode` 都会被静默丢弃（§42），所以组包和记账必须在
+        **同一次加锁**里做完。数目见 `fire_wall_handles()`（§75）。
+        """
+        with self._lock:
+            step = fire_wall_handles(spawn_count)
+            packet = self.event(OP_SET_ON_FIRE, set_on_fire_body(
+                self.conn.my_seat, x, y, slice_id))
+            self.projectiles += step
+            return packet, step
 
     def dash(self, direction, index, x, y):
         """一发 `rpDash`（近身冲刺攻击），**同时把句柄记账推进 1**。
