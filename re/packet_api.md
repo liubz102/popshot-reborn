@@ -2176,6 +2176,13 @@ V0.3 会话 12~17 五轮实机 + 三轮逆向查的就是这一个常量。
 ★ 原版**只有射手那台机器**发这一发（`0x4829b1` 里那道 `IsMine` 门，§72）
 —— 自己造包的一方不补，地上一点火都不着。
 
+★★ **火墙的伤害也得自己补**（V0.3 §78）：收方只把火画出来，算谁被烧的
+还是「射手那台」。每被烧一次发一发 `rpSplashDamaged`（§5.4c），
+间隔 **20 个 tick**（语料 102 次火烧量的，三种火焰一致），
+一道墙最多烧 `(SpawnLifeTime + SpawnCount × SpawnInterval) / 20` 次。
+伤害源句柄用火墙那一段的头一个 —— 查不到也不要紧（`0x492c6d` 只是跳过
+击退那一支，伤害照扣；**受害者**句柄才是必须查得到的，`0x492c42`）。
+
 数据链：`ch01-02`（화염탄，角色 1 的 2 号槽）`CreatingClass=FlamingBottle`、
 `SliceId=1001500` → `ch01-02a`（화염탄 화염벽）`CreatingClass=Flame`、
 `Size=30 Damage=10 SpawnCount=4 SpawnLifeTime=60 SpawnInterval=4

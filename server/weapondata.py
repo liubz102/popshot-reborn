@@ -37,7 +37,8 @@ import os
 #:   `IsMine` 门里，bot 的弹体在任何一台上都不是「自己的」⇒ 一个都不会造出来。
 #:   `usable` 改成按 `SAFE_CLASSES` 白名单放行，新增 `slice_time` / `fuse_ticks`。
 #: ★ 5（会话 22）：新增火墙那几格（`slice_id` / `spawn_count` / …，§75）。
-FORMAT = 5
+#: ★ 6（会话 23）：新增 `homing_angle`（追踪弹的转向速率，§77）。
+FORMAT = 6
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "bot_weapons.json")
@@ -201,6 +202,20 @@ class Weapon(object):
         """
         value = self.raw.get("fuse_ticks")
         return None if not value else int(value)
+
+    @property
+    def homing_range(self):
+        """追踪弹的**作用距离**（`HomingRange`）；没有返回 0。"""
+        return float(self.raw.get("homing_range") or 0.0)
+
+    @property
+    def homing_angle(self):
+        """★★ 追踪弹每 tick 最多转多少**度**的那个基数（`HomingAngle`，§77）。
+
+        真正的转角是 `HomingAngle / 7`（`0x47e53a` 的 `fmul [0x693c34]`）。
+        0 = 不追踪（`0x47e35a: cmp [weapondef+0x78], 0; je 出口`）。
+        """
+        return float(self.raw.get("homing_angle") or 0.0)
 
     @property
     def lockon_range(self):

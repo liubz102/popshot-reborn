@@ -344,6 +344,9 @@ class BotConn(gameserver.Conn):
         #:   ⚠ 每一颗都**必须**恰好发一发：句柄记账在开火那一刻就推进了，
         #:   漏发一发，收方那一格计数器就和服务端错开，从此打不掉血（§42）。
         self.pending_shots = []
+        #: ★★ **地上还在烧的火墙**（`FireWall`，§78）。收方只把火画出来，
+        #:   算谁被烧的还是「射手那台机器」—— bot 没有本机，所以归这边。
+        self.fires = []
         #: ★★ **进图 / 复活之后的封锁到点时刻**（`time.monotonic()` 的刻度）。
         #:   `None` = 还没开始这一局。原版在 `Character::Respawn`（`0x502fca`）
         #:   里给角色挂了一个 **2000 ms** 的状态 0（`0x5030a0`），而开火输入
@@ -397,6 +400,9 @@ class BotConn(gameserver.Conn):
         #   （`ForceReloadTerrain`），上一张图的弹体在那边已经不存在了 ——
         #   补发只会拿一个查不到的句柄去撞 `0x492750` 那个静默丢弃。
         self.pending_shots = []
+        # ★ 火墙跟着清：收方的弹体表这一刻整个复位，上一张图那几团火
+        #   在那边已经不存在了（同 `pending_shots`）。
+        self.fires = []
         self.next_fire_at = 0.0
         self.rounds_left = None
         self.fire_logged = set()
@@ -1487,9 +1493,26 @@ def _path_blocked(terrain, x0, y0, shot):
 
     ★ 没有地形数据时（这张图没提取到 / 产物缺失）返回 `False` = 「不知道
     有没有挡」，宁可 bot 偶尔打一发穿墙的，也不要让它一枪不放。
+
+    ## ★★★ 第一件事是查**枪口那一点自己**（§76）
+
+    `line_blocked()` 的两个端点都不采样（那边的注释写了为什么：枪口和目标
+    常常贴着地面）。可 bot 站在斜坡脚下往上打时，「脚 + 前 43 + 上 57」
+    这个枪口会**整个埋进山体里** —— 这时收方的弹体一出生就撞在地形上、
+    速度每帧对折反向、**位置一步不动**（客户端逐帧日志实测），
+    玩家**根本看不见这一发**；而服务端按闭式解一路飞下去，
+    十几个 tick 之后在别处炸开，还带着半径 100 的溅射。
+
+    用户 2026-08-28 报的「看不到扔出去的手雷，过一会儿在旁边出现了爆炸
+    动画和火焰」和「明明躲开了还是打到我身上」，是同一件事的两个面。
+
+    ⇒ 枪口埋在挡子弹的地形里 = **这一发打不出去**，和「中间被墙挡住」
+    是同一类事实，不是新规则。
     """
     if terrain is None:
         return False
+    if terrain.blocks_bullet(int(x0), int(y0)):
+        return True
     points = ballistics.path_points(x0, y0, shot)
     for (ax, ay), (bx, by) in zip(points, points[1:]):
         if terrain.line_blocked(ax, ay, bx, by, step=BOT_LINE_STEP):
@@ -1920,7 +1943,8 @@ class Shell(object):
     """
 
     __slots__ = ("handle", "fire_seq", "weapon", "group", "x0", "y0",
-                 "shot", "born", "ticks", "x", "y", "max_ticks")
+                 "shot", "born", "ticks", "x", "y", "max_ticks",
+                 "vx", "vy", "locked")
 
     def __init__(self, handle, fire_seq, weapon, group, x0, y0, shot, born,
                  max_ticks):
@@ -1940,6 +1964,14 @@ class Shell(object):
         self.x = float(x0)
         self.y = float(y0)
         self.max_ticks = int(max_ticks)
+        # ★★ **追踪弹**（`HomingAngle > 0`）走的是逐 tick 积分那条路（§77）：
+        #    弹道会拐弯，闭式解表达不了。这两格是**当前**速度矢量，
+        #    非追踪弹恒不用。
+        self.vx = math.cos(shot.angle) * shot.speed
+        self.vy = math.sin(shot.angle) * shot.speed
+        #: 锁上的目标座位；`None` = 还没锁上。★ 原版**锁上就不换**
+        #: （`[proj+0x328]` 一旦不是 −1 就直接跳过选目标那一段，`0x47e36b`）。
+        self.locked = None
 
     def position(self, ticks):
         return ballistics.position_at(self.x0, self.y0, self.shot, ticks)
@@ -2005,9 +2037,16 @@ def _terrain_stop_t(terrain, ax, ay, bx, by):
     """线段 A→B 上第一个**挡子弹**的采样点的参数 `t`；一路通畅返回 `None`。
 
     用 `blocks_bullet()` 那一路 —— 单向平台（值 1）挡人不挡子弹（§29）。
+
+    ★★ **起点本身也算**（返回 `0.0`）：和 `_segment_circle_t()`「起点就在
+    圆里返回 0.0」是同一个口径。弹体在地形里出生时收方是**原地卡住、
+    一步不动**的（§76 的客户端逐帧实测 —— 速度每帧对折还反向，位置一动
+    不动），服务端也得当场结算在那儿，不能当它飞走了。
     """
     if terrain is None:
         return None
+    if terrain.blocks_bullet(int(ax), int(ay)):
+        return 0.0
     dx = bx - ax
     dy = by - ay
     span = max(abs(dx), abs(dy))
@@ -2019,6 +2058,81 @@ def _terrain_stop_t(terrain, ax, ay, bx, by):
     return None
 
 
+#: ★★ 追踪弹每 tick 最多转多少 —— `HomingAngle × 1/7` **度**（§77）。
+#:
+#: 出处 `0x47e53a` 那三句：
+#:
+#:     fild [weapondef+0x78]     ; HomingAngle（`ch01-03` = 30）
+#:     fmul [0x693c34]           ; = 0.142857149 = 1/7
+#:     fmul [0x693778]           ; = π/180
+#:
+#: 客户端逐帧日志实测：`ch01-03` 的火箭锁上目标之后**每 tick 恒转 4.286°**，
+#: 而 `30 / 7 = 4.2857` —— 一位不差。
+HOMING_TURN_FACTOR = 1.0 / 7.0
+
+
+def _homing_target(room, shell, bodies):
+    """这一 tick 锁得上谁：`HomingRange` 之内**最近**的那个；没有返回 `None`。
+
+    ★ 原版锁上就不换（`0x47e36b`：`[proj+0x328]` 不是 −1 就跳过选目标）。
+    """
+    reach = shell.weapon.homing_range or 0.0
+    if reach <= 0.0:
+        return None
+    best = None
+    for seat_index, px, py, crouched, character_id in bodies:
+        cx, cy = chrprops.get(character_id).center(px, py, crouched)
+        span = math.hypot(cx - shell.x, cy - shell.y)
+        if span <= reach and (best is None or span < best[0]):
+            best = (span, seat_index)
+    return None if best is None else best[1]
+
+
+def _homing_step(room, shell, bodies):
+    """追踪弹的一个 tick：先转向、再前进，返回新的落点（§77）。
+
+    和普通弹体的区别只有「速度矢量会拐弯」—— 速度**大小不变**，方向每
+    tick 朝目标转最多 `HomingAngle / 7` 度。重力照加（追踪弹现在都是
+    `GravityFactor = 0`，加不加都一样，但别把这条漏了）。
+
+    用户 2026-08-28 报的「火箭的飞行轨迹和最终爆炸动画的地点不一样，
+    看着撞墙了却在墙的附近另一处爆炸」就是这条没建模：服务端按直线算，
+    收方却把它拐走了。
+    """
+    if shell.locked is None:
+        shell.locked = _homing_target(room, shell, bodies)
+    target = None
+    if shell.locked is not None:
+        for seat_index, px, py, crouched, character_id in bodies:
+            if seat_index == shell.locked:
+                target = chrprops.get(character_id).center(px, py, crouched)
+                break
+    if target is not None:
+        speed = math.hypot(shell.vx, shell.vy)
+        want = math.atan2(target[1] - shell.y, target[0] - shell.x)
+        have = math.atan2(shell.vy, shell.vx)
+        turn = math.radians(shell.weapon.homing_angle * HOMING_TURN_FACTOR)
+        delta = _wrap_angle(want - have)
+        if delta > turn:
+            delta = turn
+        elif delta < -turn:
+            delta = -turn
+        have += delta
+        shell.vx = math.cos(have) * speed
+        shell.vy = math.sin(have) * speed
+    shell.vy += shell.shot.gravity
+    return (shell.x + shell.vx, shell.y + shell.vy)
+
+
+def _wrap_angle(angle):
+    """把角度折回 `(-π, π]`。"""
+    while angle <= -math.pi:
+        angle += 2.0 * math.pi
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    return angle
+
+
 def _shell_step(room, shell, terrain, bodies):
     """把这颗子弹往前推**一个 tick**，返回 `(落点, 座位号或None, 部位或None)`。
 
@@ -2026,7 +2140,10 @@ def _shell_step(room, shell, terrain, bodies):
     同一段里既撞地形又撞人时，**参数 `t` 小的那个先发生**。
     """
     ax, ay = shell.x, shell.y
-    bx, by = shell.position(shell.ticks + 1)
+    if shell.weapon.homing_angle:
+        bx, by = _homing_step(room, shell, bodies)
+    else:
+        bx, by = shell.position(shell.ticks + 1)
     shell.ticks += 1
     best_t = None
     best = None
@@ -2131,7 +2248,7 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region):
             botsync.splash_body(shell.handle,
                                 botsync.character_handle(seat_index),
                                 splash, where[0], where[1])))
-    _set_ground_on_fire(machine, weapon, point)
+    _set_ground_on_fire(room, machine, weapon, point)
 
 
 def _fire_wall_of(weapon):
@@ -2146,7 +2263,142 @@ def _fire_wall_of(weapon):
     return None if not slice_id else weapondata.get(slice_id)
 
 
-def _set_ground_on_fire(machine, weapon, point):
+#: ★★ 同一个人**两次挨烧之间隔几个 tick**（§78，语料量的）。
+#:
+#: `weapon.ini` 里没有这一格。380 份语料里认出 102 次火烧
+#: （`rpSetOnFire` 之后、伤害正好等于火焰那一节 `Damage` 的
+#: `rpSplashDamaged`），同一个受害者两次之间的间隔：
+#:
+#:     ch01-02a（SpawnCount=4 LifeTime=60 Interval=4）  5 发心跳 ×35，6 发 ×4
+#:     ch100-02a（SpawnCount=8 LifeTime=18 Interval=2） 6 发心跳 ×5
+#:     ch103-02a（同上）                                5 发心跳 ×14
+#:
+#: 三种火焰、三套参数，间隔**都是 5 发心跳左右** ⇒ 它是个和武器参数无关的
+#: 常量。5 × 128 ms = 640 ms = **20 个 tick**。
+#:
+#: ★ 交叉验证：按这个间隔算，一道火墙最多能烧几次 =
+#: `(SpawnLifeTime + SpawnCount × SpawnInterval) / 20`，
+#: `ch01-02a` = 76/20 → **4 次**（语料实测最多正是 4 次），
+#: `ch100-02a` = 34/20 → **2 次**（语料实测最多 2 次）。两边都对上。
+BOT_FIRE_REBURN_TICKS = 20
+
+
+class FireWall(object):
+    """地上那一道**还在烧**的火（§75 / §78）—— 服务端这边的那一份。
+
+    收方那边是 `SpawnCount` 个 `Flame` 对象，`OnSetOnFire` 一次性造好；
+    但**算伤害的还是射手那台机器**（和弹体、溅射同一条守卫，§42），
+    bot 没有本机 ⇒ 不补 `rpSplashDamaged` 的话，火看得见、站上去不掉血
+    （用户 2026-08-28 报的就是这个）。
+    """
+
+    __slots__ = ("handle", "flame", "spots", "born", "ticks", "max_ticks",
+                 "burnt")
+
+    def __init__(self, handle, flame, spots, born, max_ticks):
+        #: 拿火墙那一段句柄的**头一个**当伤害源。★ 源句柄查不到也不要紧：
+        #: 收侧 `0x492c6d` 查不到只是跳过击退那一支，伤害照扣。
+        self.handle = int(handle)
+        self.flame = flame
+        #: 每一团火的落点。
+        self.spots = list(spots)
+        self.born = float(born)
+        self.ticks = 0
+        self.max_ticks = int(max_ticks)
+        #: 每个座位**上一次**被烧是第几个 tick（`BOT_FIRE_REBURN_TICKS` 的账）。
+        self.burnt = {}
+
+    def __repr__(self):
+        return ("<FireWall %d %d团 %d/%dtick>"
+                % (self.handle, len(self.spots), self.ticks, self.max_ticks))
+
+
+def _fire_wall_spots(terrain, flame, point):
+    """`SpawnCount` 团火摆在哪：以爆点为中心、左右各排开 `SpawnDistance`。
+
+    ★ 每一团都落到**那一列的地面**上（火是铺在地上的）；那一列没有
+    地面就退回爆点的高度。
+    """
+    count = int(flame.raw.get("spawn_count") or 4)
+    gap = float(flame.raw.get("spawn_distance") or 30.0)
+    spots = []
+    for index in range(count):
+        x = point[0] + (index - (count - 1) / 2.0) * gap
+        y = point[1]
+        if terrain is not None:
+            ground = terrain.ground_below(int(x), int(point[1]) - 1)
+            if ground is not None:
+                y = float(ground)
+        spots.append((x, y))
+    return spots
+
+
+def _fire_wall_ticks(flame):
+    """这道火墙一共活几个 tick。
+
+    最后一团火在第 `SpawnCount × SpawnInterval` 个 tick 上生出来，
+    再活 `SpawnLifeTime` 个 tick（三个数都是 `weapon.ini` 的）。
+    """
+    life = int(flame.raw.get("spawn_life") or 60)
+    count = int(flame.raw.get("spawn_count") or 4)
+    interval = int(flame.raw.get("spawn_interval") or 4)
+    return max(1, life + count * interval)
+
+
+def _advance_fires(room, machine, now):
+    """把所有还在烧的火墙推进到**此刻**，站在火上的人该掉血就掉（§78）。
+
+    和 `_advance_shells()` 同一套路数：按**真实流逝的时间**算该推到第几个
+    tick，每个 tick 问一次「谁站在火里」。
+
+    ★★ 名单**不按碰撞组过滤**：火墙的组是 255 = 撞所有人（§69 /
+    packet_api §5.4d），队友和 bot 自己都烧。
+    """
+    if not machine.fires:
+        return
+    still = []
+    for wall in machine.fires:
+        want = min(wall.max_ticks,
+                   int((now - wall.born) * ballistics.TICKS_PER_SECOND))
+        bodies = _battle_bodies(room, machine.my_seat, include_self=True)
+        radius = wall.flame.size
+        damage = wall.flame.damage
+        while wall.ticks < want:
+            wall.ticks += 1
+            for seat_index, px, py, crouched, character_id in bodies:
+                last = wall.burnt.get(seat_index)
+                if last is not None and \
+                        wall.ticks - last < BOT_FIRE_REBURN_TICKS:
+                    continue
+                character = chrprops.get(character_id)
+                spot = _fire_touch(character, px, py, crouched, wall.spots,
+                                   radius)
+                if spot is None:
+                    continue
+                wall.burnt[seat_index] = wall.ticks
+                machine.log(f"   火烧: 座位{seat_index} 在 "
+                            f"({spot[0]:.0f}, {spot[1]:.0f}) 挨了 {damage} 点"
+                            f"（第 {wall.ticks} tick，§78）")
+                _emit(machine, machine.sync.event(
+                    botsync.OP_SPLASH_DAMAGED,
+                    botsync.splash_body(wall.handle,
+                                        botsync.character_handle(seat_index),
+                                        damage, spot[0], spot[1])))
+        if wall.ticks < wall.max_ticks:
+            still.append(wall)
+    machine.fires = still
+
+
+def _fire_touch(character, px, py, crouched, spots, radius):
+    """这个人有没有踩在某一团火里；踩着了返回那一团的位置。"""
+    for cx, cy, r, _region in character.circles(px, py, crouched):
+        for sx, sy in spots:
+            if math.hypot(sx - cx, sy - cy) <= r + radius:
+                return (sx, sy)
+    return None
+
+
+def _set_ground_on_fire(room, machine, weapon, point):
     """★★ 火焰弹炸完补一发 `rpSetOnFire` —— 地上那道火墙（§75）。
 
     用户 2026-08-27 实机报的：「2 号角色，2 号武器扔在地上是会持续燃烧
@@ -2163,6 +2415,8 @@ def _set_ground_on_fire(machine, weapon, point):
     flame = _fire_wall_of(weapon)
     if flame is None:
         return
+    handle = botsync.projectile_handle(machine.my_seat,
+                                       machine.sync.projectiles)
     packet, step = machine.sync.set_on_fire(
         point[0], point[1], flame.id, flame.raw.get("spawn_count"))
     machine.log(f"   火墙: 在 ({point[0]:.1f}, {point[1]:.1f}) 点着 "
@@ -2170,6 +2424,11 @@ def _set_ground_on_fire(machine, weapon, point):
                 f"{flame.raw.get('spawn_count')} 团火"
                 f"（★ 收方吃掉 {step} 个弹体句柄，§75）")
     _emit(machine, packet)
+    # ★★ 伤害归服务端（§78）：收方只把火画出来，算谁被烧的还是「射手那台」。
+    terrain = mapdata.load(_current_map(room))
+    machine.fires.append(FireWall(
+        handle, flame, _fire_wall_spots(terrain, flame, point),
+        time.monotonic(), _fire_wall_ticks(flame)))
 
 
 def _advance_shells(room, machine, now):
@@ -2590,6 +2849,8 @@ def _tick_bot(room, machine, seat_index):
         #   注释）。bot 躺着、`/hold` 着、这一帧没有新位置点 —— 都不影响
         #   「上一发子弹该炸了」这个事实。
         _advance_shells(room, machine, now)
+        # ★ 地上的火同理：它烧不烧得到人，和 bot 躺没躺着无关（§78）。
+        _advance_fires(room, machine, now)
         # ★ 正在进行的那一下近身攻击同理：它的伤害判定是**物理**的
         #   （动作走到第几帧、圈里有没有人），和 bot 躺没躺着无关。
         _advance_dash(room, machine, now)

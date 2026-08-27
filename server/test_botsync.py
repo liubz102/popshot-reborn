@@ -2844,6 +2844,65 @@ class BotFireWallTests(BotFireRoom):
         self.settle()
         self.assertEqual([], fire_wall_frames(self.alice, self.bot_seat))
 
+    def test_standing_in_the_fire_hurts(self):
+        """★★ 用户 2026-08-28：「现在有火焰了，但是站在火焰上没有伤害。」
+
+        算伤害的还是「射手那台机器」（§42 的守卫），bot 没有本机 ⇒
+        不补 `rpSplashDamaged` 就一滴血都不掉（§78）。
+        """
+        self.flame_thrower()
+        self.throw()
+        self.assertTrue(self.bot_conn.fires, "该留下一道还在烧的火")
+        wall = self.bot_conn.fires[0]
+        # 把 alice 摆到第一团火上，再让时间往前走。
+        spot = wall.spots[0]
+        self.clear()
+        wall.born -= 3600.0
+        self.walk(self.alice, [(spot[0], spot[1])])
+        burns = [f for f in bot_frames(self.alice, self.bot_seat)
+                 if header(f)["opcode"] == botsync.OP_SPLASH_DAMAGED]
+        self.assertTrue(burns, "站在火上该掉血")
+        body = body_of(burns[0])
+        self.assertEqual(botsync.character_handle(
+            self.room.seat_index_of(self.alice)),
+            struct.unpack_from("<i", body, 4)[0])
+        self.assertAlmostEqual(weapondata.get(1001500).damage,
+                               struct.unpack_from("<f", body, 8)[0], places=3)
+
+    def test_the_same_person_is_not_burnt_every_tick(self):
+        """★ 两次挨烧之间至少隔 `BOT_FIRE_REBURN_TICKS` 个 tick（§78 语料量的）。
+
+        一道火墙活 `SpawnLifeTime + SpawnCount × SpawnInterval` = 76 个 tick，
+        除以 20 ⇒ 最多烧 **4 次** —— 和语料实测的上限一样。
+        """
+        flame = weapondata.get(1001500)
+        self.assertEqual(76, bot._fire_wall_ticks(flame))
+        alice_seat = self.room.seat_index_of(self.alice)
+        want = botsync.character_handle(alice_seat)
+        # ★ 现造一道火墙摆在 alice 脚下，起点干净（不掺 `throw()` 那几道）。
+        self.walk(self.alice, [(400, 100)])
+        spot = self.alice.sync_trail[-1][:2]
+        self.bot_conn.fires = [bot.FireWall(
+            botsync.projectile_handle(self.bot_seat, 0), flame,
+            [(float(spot[0]), float(spot[1]))],
+            time.monotonic() - 3600.0, bot._fire_wall_ticks(flame))]
+        self.clear()
+        self.walk(self.alice, [tuple(spot)])
+        burns = [f for f in bot_frames(self.alice, self.bot_seat)
+                 if header(f)["opcode"] == botsync.OP_SPLASH_DAMAGED
+                 and struct.unpack_from("<i", body_of(f), 4)[0] == want]
+        self.assertEqual(4, len(burns))
+
+    def test_the_fire_burns_teammates_and_the_bot_itself(self):
+        """★ 火墙的碰撞组是 255 = 撞所有人（§69）—— 不按碰撞组过滤。"""
+        self.flame_thrower()
+        self.throw()
+        wall = self.bot_conn.fires[0]
+        self.assertTrue(
+            bot._fire_touch(chrprops.get(1), wall.spots[0][0],
+                            wall.spots[0][1], False, wall.spots,
+                            wall.flame.size))
+
 
 class BotActionLockTests(BotFireRoom):
     """★★ **进图 / 复活之后那 2 秒只能跑，不能动手**（§74）。
@@ -3438,3 +3497,125 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class BotHomingTests(BotFireRoom):
+    """★★ **追踪火箭**（`ch01-03`，`HomingRange=200 HomingAngle=30`，§77）。
+
+    用户 2026-08-28：「角色 2 的 3 号武器，总感觉飞行轨迹和最终爆炸动画的
+    地点不一样，看着火箭飞着撞墙了，却在墙的附近另一处出现了爆炸动画。」
+
+    根因是服务端把它当直射弹算，而收方锁上目标之后每 tick 把速度矢量朝
+    目标转 `HomingAngle / 7` 度 —— 客户端逐帧日志实测**恒 4.286°**。
+    """
+
+    def rocket(self):
+        self.room.seats[self.bot_seat].character_id = 1
+        self.bot_conn.character_id = 1
+        self.bot_conn.weapon_slot = 3
+        self.bot_conn.declared_weapon = None
+        weapon = self.bot_conn.weapon
+        self.assertEqual(1001030, weapon.id)
+        return weapon
+
+    def shell(self, weapon, x, y, angle):
+        shot = ballistics.Shot(angle, 1.0, weapon.velocity, 0.0,
+                               ballistics.gravity_per_tick(weapon),
+                               ballistics.accel_per_tick(weapon),
+                               weapon.max_velocity or 0.0)
+        return bot.Shell(1, 0, weapon, 9, x, y, shot, 0.0, 200)
+
+    def test_the_turn_rate_is_the_homing_angle_over_seven(self):
+        """★ `0x47e53a` 的 `fmul [0x693c34]`（= 1/7）+ 客户端实测 4.286°。"""
+        weapon = self.rocket()
+        self.assertEqual(30.0, weapon.homing_angle)
+        shell = self.shell(weapon, 0.0, 0.0, 0.0)          # 朝右直飞
+        bodies = [(0, 0.0, -150.0, False, 0)]              # 正上方，射程内
+        before = math.atan2(shell.vy, shell.vx)
+        bot._homing_step(self.room, shell, bodies)
+        turned = math.degrees(abs(math.atan2(shell.vy, shell.vx) - before))
+        self.assertAlmostEqual(30.0 / 7.0, turned, places=3)
+
+    def test_it_does_not_lock_beyond_the_homing_range(self):
+        weapon = self.rocket()
+        shell = self.shell(weapon, 0.0, 0.0, 0.0)
+        bodies = [(0, 0.0, -900.0, False, 0)]              # 远在射程外
+        bot._homing_step(self.room, shell, bodies)
+        self.assertIsNone(shell.locked)
+        self.assertAlmostEqual(0.0, shell.vy, places=6)
+
+    def test_once_locked_it_stays_locked(self):
+        """★ 原版 `[proj+0x328]` 一旦不是 −1 就不再选目标（`0x47e36b`）。"""
+        weapon = self.rocket()
+        shell = self.shell(weapon, 0.0, 0.0, 0.0)
+        bot._homing_step(self.room, shell, [(3, 0.0, -100.0, False, 0)])
+        self.assertEqual(3, shell.locked)
+        # 换一个更近的进来也不该改锁。
+        bot._homing_step(self.room, shell, [(3, 0.0, -100.0, False, 0),
+                                            (4, 10.0, -10.0, False, 0)])
+        self.assertEqual(3, shell.locked)
+
+    def test_the_speed_never_changes_only_the_direction(self):
+        weapon = self.rocket()
+        shell = self.shell(weapon, 0.0, 0.0, 0.0)
+        bodies = [(0, -50.0, -120.0, False, 0)]
+        for _ in range(6):
+            bot._homing_step(self.room, shell, bodies)
+            self.assertAlmostEqual(weapon.velocity,
+                                   math.hypot(shell.vx, shell.vy), places=3)
+
+    def test_a_plain_rocket_flies_straight(self):
+        """★ 别改坏了：不带 `HomingAngle` 的武器一点不该拐弯。"""
+        weapon = weapondata.get(1002030)                   # ch02-03 바주카
+        self.assertEqual(0.0, weapon.homing_angle)
+        shell = self.shell(weapon, 0.0, 0.0, 0.0)
+        for tick in range(1, 5):
+            want = ballistics.position_at(0.0, 0.0, shell.shot, tick)
+            got = shell.position(tick)
+            self.assertAlmostEqual(want[0], got[0], places=6)
+
+
+class BotBuriedMuzzleTests(TerrainMixin, BotFireRoom):
+    """★★★ **枪口埋进地形里的那一发根本打不出去**（§76）。
+
+    用户 2026-08-28 实机报了两条，是同一件事的两个面：
+
+    * 「偶尔会看不到扔出去的手雷，但是过一会儿在旁边出现了爆炸动画和火焰」；
+    * 「明明看着自己躲开了，最终还是打到我身上了」。
+
+    客户端逐帧日志（`bshook` 的 `PROJ.`）把它钉死了：bot 站在斜坡脚下
+    往上打时枪口落在山体里，收方的弹体**位置一步不动**、速度每帧对折
+    反向 —— 玩家根本看不见；而服务端按闭式解一路飞下去，十几个 tick
+    之后在别处炸开，还带着半径 100 的溅射。
+    """
+
+    def test_a_muzzle_inside_terrain_counts_as_blocked(self):
+        terrain = synth_terrain("wallcol", floor=200, height=260,
+                                walls=((100, 300, 0),))
+        weapon = weapondata.get(1000020)
+        shot = ballistics.solve(weapon, 400.0, 0.0,
+                                speed=bot._lob_speed(weapon, 400.0, 0.0))
+        self.assertTrue(terrain.blocks_bullet(200, 100), "夹具没造对")
+        self.assertTrue(bot._path_blocked(terrain, 200, 100, shot),
+                        "枪口埋在墙里就该算被挡住")
+        self.assertFalse(bot._path_blocked(terrain, 500, 100, shot),
+                         "枪口在空地上、弹道又通，不该算被挡")
+
+    def test_a_shell_born_inside_terrain_resolves_on_the_spot(self):
+        """★ 收方是**原地卡住**的，服务端也得炸在那儿，不能当它飞走了。"""
+        terrain = synth_terrain("wallcol", floor=200, height=260,
+                                walls=((100, 300, 0),))
+        self.assertEqual(0.0, bot._terrain_stop_t(terrain, 200, 100,
+                                                  260, 60))
+        self.assertIsNone(bot._terrain_stop_t(terrain, 500, 100, 560, 60))
+
+    def test_it_will_not_fire_from_a_buried_muzzle(self):
+        """★ 端到端：枪口埋墙时一发 `rpFire` 都不该有。"""
+        self.install_terrain(synth_terrain(
+            "buried", floor=900, width=2000, height=1000,
+            walls=((0, 700, 0),)))
+        # 把 bot 摆在墙里（枪口 = 脚 + 前 43 + 上 57，整个都在墙里）。
+        self.bot_conn.battle_pos = (400.0, 880.0)
+        self.bot_conn.holding = True
+        self.walk(self.alice, [(900, 880), (920, 880), (940, 880)])
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat))

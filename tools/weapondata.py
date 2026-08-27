@@ -53,7 +53,8 @@ ROOT = os.path.dirname(HERE)
 #:   收紧口径），新增 `slice_time` / `fuse_ticks` 两个字段。
 #: ★ 5（会话 22）：新增火墙那几格（`slice_id` / `spawn_count` /
 #:   `spawn_life` / `spawn_interval` / `spawn_distance`，§75）。
-FORMAT = 5
+#: ★ 6（会话 23）：新增 `homing_angle`（追踪弹的转向速率，§77）。
+FORMAT = 6
 
 #: 节名 `chNNN-MM…`：NNN = 角色 id，MM = 武器序号。
 #: ★ 后面还可能跟 `SE` / `D1` / `R1` / `F1` / `a` / `Classic` 之类的后缀 ——
@@ -84,9 +85,12 @@ _FIELDS = (
     #   （`0x47de6a` = `BulletObj` 的 `vft+0x24`，§49）。7 把武器有它，
     #   不建模的话 `ch100-03`（初速才 3）飞 600 单位要 6.4 秒。
     ("Acceleration",    "acceleration",    float),
-    # `HomingRange` / `HomingAngle`：追踪弹。★ 服务端**不建模**追踪
-    #   （弹道会拐弯），只拿它标注「这一把的飞行时间是个近似」。
+    # ★★ `HomingRange` / `HomingAngle`：**追踪弹**（§77）。锁上
+    #   `HomingRange` 之内的目标之后，速度矢量每 tick 朝它转
+    #   `HomingAngle / 7` 度（`0x47e53a` 的 `fmul [0x693c34]` = 1/7）。
+    #   服务端逐 tick 积分复现（`bot._homing_step`）。
     ("HomingRange",     "homing_range",    float),
+    ("HomingAngle",     "homing_angle",    float),
     ("PowerControl",    "power_control",   int),
     ("CoolingTime",     "cooling_ms",      int),
     ("LoadingTime",     "loading_ms",      int),
