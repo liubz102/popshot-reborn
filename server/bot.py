@@ -55,7 +55,9 @@ import time
 from account_store import BASE_CHARACTER_IDS, MINIMUM_PLAYER_LEVEL, \
     PREMIUM_CHARACTER_IDS
 import ballistics
+import botmove
 import botsync
+import chrprops
 import gameserver
 import lobby as lobby_module
 import mapdata
@@ -236,6 +238,14 @@ class BotConn(gameserver.Conn):
         #: ★ 服务端一点地图几何都没有（M4 才有），所以这个锚点是**跟着真人
         #:   走**的 —— 真人此刻站着的地方一定是合法地面（D16）。
         self.battle_pos = None
+        #: ★★ **自己走路时的运动状态**（`botmove.Body`），`None` = 还没接管。
+        #:   对战房里第一帧先按 D16 从真人轨迹取一个合法落脚点当锚，
+        #:   之后就由 `botmove` 在地形上自己推（M5 / §71）。
+        #:   闯关房仍然回放真人轨迹（那边要的就是「跟着推进」）。
+        self.body = None
+        #: 上一次推运动状态的时刻（`time.monotonic()`）。按**真实流逝的
+        #: 时间**决定推几个 tick，和 `_advance_shells()` 一个口径。
+        self.move_at = 0.0
         #: ★ 临时诊断（会话 17）：上一次打过的「为什么不开枪」，用来做状态翻转
         #:   去重。跟 `BOT_DIAG_FIRE_ANYWHERE` 一起删。
         self.diag_last_why = ""
@@ -290,13 +300,26 @@ class BotConn(gameserver.Conn):
         #:   （用户 2026-08-26 报的「1 号武器没有 CD，一会儿就把我秒死了」）。
         #:   换枪 / 换图跟着清。
         self.rounds_left = None
-        #: ★★ **在飞的子弹**：
-        #:   `[(到点时刻, 那一发 rpFire 的事件序号, 弹体句柄, 目标座位, 伤害, 预定落点)]`。
-        #:   `rpExplode` 不再紧跟着 `rpFire` 发，而是等子弹**真的飞到**
-        #:   （`ballistics` 按 `Velocity` + `GravityFactor` 算出来的时间，
-        #:   M3b-2）。等待时间是**物理量**，不是观测阈值 —— 铁律 10 允许的
-        #:   那种例外，和重生倒计时同一类。
-        #:   ⚠ 每一发都**必须**发出去：句柄记账在开火那一刻就推进了，
+        #: ★★ **体力**（`GameProps.ini` 的 `SpMax` / `SpCharging`）。
+        #:   `None` = 还没开打（第一帧补满）。近身冲刺攻击花
+        #:   `DashNN-SpCost`，冲刺跑每 tick 花 `FastRunSpCost`，
+        #:   平时每 tick 回 `SpCharging`（蹲着 ×2）。
+        #:   ⚠ 收方**不替远端角色算体力**，这是 bot 自己给自己上的约束 ——
+        #:   不然它可以无限近身，那不是原版的玩法（§64）。
+        self.stamina = None
+        #: 上一次结算体力的时刻。
+        self.stamina_at = 0.0
+        #: 正在进行的那一下近身攻击（`DashSwing`）；`None` = 没在冲。
+        self.dash_swing = None
+        #: 让这个 bot 用近身攻击吗（`/dash` 开关，默认开）。
+        #: ★ 留这个开关是因为 `rpDash` 会**吃掉一个弹体句柄**（§64）——
+        #:   万一某个角色不是吃 1 个，表现会是「子弹照飞、一滴血不掉」。
+        #:   实机上真遇到就 `/dash` 关掉，能当场把这条支路排除掉。
+        self.melee = True
+        #: ★★ **在飞的子弹**：一串 `Shell`（服务端自己跑的那份弹道，§65）。
+        #:   每帧由 `_advance_shells()` 逐 tick 推进，撞到人 / 撞到地形 /
+        #:   飞出图外才发 `rpExplode`，炸在**真的撞上的那一点**。
+        #:   ⚠ 每一颗都**必须**恰好发一发：句柄记账在开火那一刻就推进了，
         #:   漏发一发，收方那一格计数器就和服务端错开，从此打不掉血（§42）。
         self.pending_shots = []
         # ★ **不调 `register_conn()`**：`_conns` 是「在线的真人」表。
@@ -325,6 +348,10 @@ class BotConn(gameserver.Conn):
         一滴血不掉**，而且一局之内不自愈（D28 的硬约束 2）。
         """
         self.battle_pos = None
+        # ★ 自己的运动状态跟着清：新一张图的地形、出生点全变了，
+        #   上一张图的落脚点和速度一个字都不作数（同 `battle_pos`）。
+        self.body = None
+        self.move_at = 0.0
         self.last_trail_mark = None
         self.load_progress = None
         self.crouched = False
@@ -337,6 +364,12 @@ class BotConn(gameserver.Conn):
         self.rounds_left = None
         self.fire_logged = set()
         self.explode_logged = set()
+        # ★ 体力和近身动作跟着一起清：换图 / 新一局客户端把角色重建，
+        #   `[char+0x2b5]` 那一套状态全归零（同 `crouched` 的道理，§41），
+        #   而正在进行的那一下的句柄在收方那边已经不存在了。
+        self.stamina = None
+        self.stamina_at = 0.0
+        self.dash_swing = None
         # ★ 换图 / 新一局客户端把角色重建，武器回到它自己的默认那把 ——
         #   这边不清的话 bot 以为「已经声明过了」，于是**不再发**
         #   `rpChangeWeapon`，别人看到的枪和它打出来的子弹从此对不上。
@@ -465,7 +498,7 @@ HELP_LINES = (
 #: 只会占满那 4 行的额度（§20），所以这里只放战斗中真能用的两条。
 BATTLE_HELP_LINES = (
     "战斗中：/hold N 让 bot 站住;  再敲一次恢复跟随",
-    "/gun N M 换 bot 的武器（M=1~3）;  /gun N 看有哪些",
+    "/gun N M 换武器（M=1~3）;  /dash 近身攻击开关",
     "查子弹: /noboom 只飞不炸;  /slow 降到 1/10 速",
 )
 
@@ -735,6 +768,44 @@ def _cmd_hold(conn, room, args):
     return None
 
 
+def _cmd_dash(conn, room, args):
+    """`/dash [N]` —— 让 bot **用不用近身冲刺攻击**（默认用，再敲一次关掉）。
+
+    真人双击左右方向键、消耗体力打出的那一下（§64）。bot 够得着就冲。
+
+    ★ 为什么留这个开关：`rpDash` 在收方会创建一个 `DashDamage` 对象，
+    **和弹体共用同一个句柄计数器**（`0x502229`）。语料量出来是「一发吃 1 个」，
+    但万一某个角色不是，表现会是**子弹照飞、一滴血不掉**（§42 那个静默丢弃）。
+    实机上真碰到，`/dash` 关掉就能当场把这条支路排除掉。
+
+    ★ 战斗中必须能用，所以它不在 `MUTATING_COMMANDS` 里。
+    """
+    seats, error = _battle_bots(room, args)
+    if error:
+        return f"/dash 用法：/dash [座位号]（不给就是全部）。{error}"
+    changed = []
+    for index in seats:
+        machine = room.seats[index].conn
+        if not isinstance(machine, BotConn):
+            continue
+        machine.melee = not machine.melee
+        if not machine.melee:
+            machine.dash_swing = None
+        changed.append((index, machine.melee))
+    if not changed:
+        return "没有可以操作的 bot。"
+    on = [str(i) for i, flag in changed if flag]
+    off = [str(i) for i, flag in changed if not flag]
+    parts = []
+    if on:
+        parts.append(f"座位 {'、'.join(on)} 的 bot 会用近身攻击了")
+    if off:
+        parts.append(f"座位 {'、'.join(off)} 的 bot 不再近身")
+    conn.log(f"   /dash: {changed}")
+    conn.room_system_chat("；".join(parts) + "。")
+    return None
+
+
 def _cmd_noboom(conn, room, args):
     """`/noboom [N]` —— 让 bot **只发 `rpFire`、不发 `rpExplode`**（再敲一次恢复）。
 
@@ -881,6 +952,7 @@ COMMANDS = {
     "ready": _cmd_ready,
     "hold": _cmd_hold,
     "gun": _cmd_gun,
+    "dash": _cmd_dash,
     "noboom": _cmd_noboom,
     "slow": _cmd_slow,
     "help": _cmd_help,
@@ -936,16 +1008,12 @@ BOT_ENGAGE_RANGE = 1000.0
 #: 和 `mapdata.line_blocked()` 的默认步长同口径。
 BOT_LINE_STEP = 4
 
-#: 瞄准点相对目标落脚点抬高多少 —— 轨迹里记的是**脚下**的坐标，
-#: 而子弹要打在身上。★ 这是**几何量**，不是时序阈值。
-#:
-#: ★★ 会话 18 从 20 抬到 `BOT_MUZZLE_HEIGHT`：20 是「角色多高的一半」的猜测，
-#: 而实测枪口就在脚下 **57** 个单位（§62）—— 按 20 瞄的话，bot 是端着肩膀
-#: 高的枪去打对方的小腿，平地上永远压着枪口打。两边都站在地上时，
-#: 「枪口对枪口」才是真人瞄的那条线。
-#: ★ 打不打得中和这个数**无关** —— 命中是服务端自己判的（D28），
-#: 瞄准点只决定角度、飞行时间和爆炸特效画在哪。
-BOT_AIM_HEIGHT = 57.0
+#: ★ 瞄准点**不再是一个常量**了（§65）：以前这里有个 `BOT_AIM_HEIGHT`
+#: （先是 20、会话 18 抬到 57），因为那时候命中是服务端硬判的 ——
+#: 瞄哪儿都打得中，那个数只决定爆炸特效画在哪。
+#: 现在命中是**真判**的，瞄准点必须落在对方的碰撞圆里，所以改成问
+#: `chrprops`：瞄**身体那个圆的圆心**（三个圆里最大的一个），
+#: 每个角色、蹲着还是站着都不一样。见 `_aim_point()`。
 
 #: ★★★ 枪口相对**自己落脚点**的偏移 —— 这两个数是**实测**出来的（§62）。
 #:
@@ -1124,6 +1192,73 @@ def _current_map(room):
     return room.map_name
 
 
+def _seat_group(room, seat_index):
+    """这个座位的**碰撞排除组**（`rpFire body+1`，§63）。
+
+    组队 / 闯关房是队伍号（1 / 2），个人战是座位 + 1。收方拿它决定
+    「这颗子弹撞不撞这个人」—— **相同就整个跳过碰撞**，所以它同时也是
+    服务端这边判命中的口径（两边必须是同一套，否则「客户端看着穿过去了、
+    服务端说打中了」）。
+    """
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    team = 0 if seat is None else seat.team
+    return botsync.fire_group(seat_index, team)
+
+
+def _seat_body(room, seat_index):
+    """这个座位此刻的**落脚点 + 姿势**：`(x, y, 蹲着没有)`；不知道返回 `None`。
+
+    真人的位置来自心跳轨迹（`sync_trail[-1]`），bot 的来自它自己的
+    `battle_pos` —— 两边都要，因为判命中时**别的 bot 也挡子弹**。
+    """
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    conn = None if seat is None else seat.conn
+    if conn is None:
+        return None
+    if getattr(seat, "is_bot", False):
+        position = getattr(conn, "battle_pos", None)
+        if position is None:
+            return None
+        return (position[0], position[1], bool(getattr(conn, "crouched", False)))
+    trail = getattr(conn, "sync_trail", None)
+    if not trail:
+        return None
+    point = trail[-1]
+    return (point[0], point[1], bool(point[7]) if len(point) > 7 else False)
+
+
+def _battle_bodies(room, shooter_seat, group=None, include_self=False):
+    """场上活着、位置已知的人：`[(座位号, x, y, 蹲着没有, 角色id)]`。
+
+    `group` 给了就按**碰撞排除组**过滤（和收方一模一样，§63）：组号相同的
+    跳过。**弹体**走这条 —— 队友因此天然被排除掉，个人战里则谁都撞得着，
+    这正是原版「组队战没有直接友军伤害」的实现方式。
+
+    ★★ `group=None` = **谁都算**（连自己）。**溅射和火墙走这条**（§69）：
+    收方给溅射对象设组的那一句 `0x48254a` 外面套着
+    `cmp byte [weapondef+0x54], 0`（= `SplashTeam`），而 **228 个武器节里
+    一个都没填 `SplashTeam`** ⇒ 溅射对象的组恒为 0 = 撞所有人。
+    语料也是这么说的：13160 发 `rpSplashDamaged` 里有 **1513 发是打到
+    射手自己**的。用户 2026-08-27 报的就是这条：「组队战不能直接伤害友军没错，
+    但溅射可以伤害友军」。
+    """
+    out = []
+    for index, seat in enumerate(room.seats):
+        if seat is None:
+            continue
+        if index == shooter_seat and not include_self:
+            continue
+        if group is not None and _seat_group(room, index) == group:
+            continue
+        if _lying_dead(room, index):
+            continue
+        body = _seat_body(room, index)
+        if body is None:
+            continue
+        out.append((index, body[0], body[1], body[2], seat.character_id))
+    return out
+
+
 def _hostile_humans(room, seat_index):
     """这个 bot 该打谁 —— 房里**报过位置**、**活着**、而且和它不同队的真人。
 
@@ -1153,6 +1288,127 @@ def _hostile_humans(room, seat_index):
     return out
 
 
+# ---------------------------------------------------------------------------
+# ★★★ 自己走位（M5）—— 不再只回放真人的轨迹
+# ---------------------------------------------------------------------------
+#: 一帧最多推几个 tick 的运动。
+#:
+#: ★ 它**不是**时序阈值（铁律 10），是一道 fail-safe：bot 的帧由真人的
+#: 心跳驱动（§32），两帧之间正常只隔一发心跳 = 4 个 tick（§71）。
+#: 真隔了很久（读图、中继断开、房里一时没人发心跳），那段时间 bot 在别人
+#: 屏幕上**根本没在动** —— 这时候按流逝时间一次推几百个 tick，表现就是
+#: 「唰」地闪到半张图外。宁可少走几步，也不要瞬移。
+BOT_MOVE_MAX_TICKS = botmove.TICKS_PER_BEAT * 4
+
+
+def _character_of(machine):
+    return chrprops.get(machine.character_id)
+
+
+def _enemy_spot(room, machine, seat_index):
+    """离自己最近的那个敌人此刻站在哪；没有敌人返回 `None`。
+
+    ★ 闯关房恒为 `None`（`_hostile_humans` 那边就是空的）—— 那儿该打的是
+    怪，而怪的位置服务端手里没有，所以闯关仍然回放真人轨迹「跟着推进」。
+    """
+    if machine.body is None:
+        return None
+    best = None
+    for index, conn in _hostile_humans(room, seat_index):
+        point = conn.sync_trail[-1]
+        span = abs(point[0] - machine.body.x)
+        if best is None or span < best[0]:
+            best = (span, (float(point[0]), float(point[1])))
+    return None if best is None else best[1]
+
+
+def _move_intent(room, machine, seat_index, terrain, target):
+    """这一帧往哪走 —— 返回 `(方向, 要不要起跳)`。
+
+    ## 规则只有两条，而且都不是我发明的（D50 的口径）
+
+    1. **打得到就打**：`_fire_target()` 挑出了目标 = 这一枪值得扣扳机，
+       那就站住打。语料里真人 39% 的心跳是站着不动的 —— 站着开枪是常态。
+    2. **打不到就走过去**：没得打的时候朝最近的敌人挪。出处是 §48 那份
+       距离分布 —— 真人打中人的距离 p10=264 / 中位 616 / p99=1015，
+       而地图宽 1500~2848 ⇒ **真人是主动靠过去的**，不会隔着半张图对望。
+
+    地形只回答「这一步走不走得成」，不添新规则：
+
+    * 前面是爬不上去的坎 → **跳**（跳得上去就上去，跳不上去就在那儿蹦，
+      真人卡在墙根时也是这样）；
+    * 前面是掉不到底的坑 → 先看**跳过去**行不行（`jump_lands`），
+      不行就不往里走。⚠ 这不是「保持距离」那种规矩，是「脚下有没有路」。
+
+    ⚠ 还没有的：绕路（真正的可达性搜索）、提前量、冲刺跑、蹲。
+    """
+    body = machine.body
+    if body is None or terrain is None:
+        return (0, False)
+    if target is not None:
+        return (0, False)
+    spot = _enemy_spot(room, machine, seat_index)
+    if spot is None:
+        return (0, False)
+    direction = 1 if spot[0] >= body.x else -1
+    who = _character_of(machine)
+    if not body.on_ground:
+        # ★ 空中照按方向键：收方也是拿按键算空中水平速度的（§39 / §71）。
+        return (direction, False)
+    if botmove.blocked(terrain, body, who, direction):
+        return (direction, True)
+    if botmove.drop_below(terrain, body, who, direction) is None:
+        # 脚下这一步是个掉不到底的坑：跳得过去就跳，跳不过去就别走。
+        landing = botmove.jump_lands(terrain, body, who, direction)
+        return (direction, True) if landing is not None else (0, False)
+    return (direction, False)
+
+
+def _own_step(room, machine, seat_index, terrain, target, now):
+    """自己走一帧，返回和 `trail_point()` 同格式的那个八元组；
+    还接管不了就返回 `None`（调用方退回回放真人轨迹）。
+
+    接管不了的情形有三种，都退回 D16 那条老路：
+
+    1. **没有地形数据**（这张图没提取到）—— 没有地面就没法自己走；
+    2. **还没有落脚点** —— 第一帧的锚仍然从真人轨迹上取（真人站过的点
+       一定是合法地面，D16），落下来之后才由这里接管；
+    3. **闯关房** —— 那儿的走位是「跟着真人推进」，不是自己找敌人。
+    """
+    if terrain is None:
+        return None
+    if not _hostile_humans(room, seat_index):
+        return None
+    who = _character_of(machine)
+    if machine.body is None:
+        if machine.battle_pos is None:
+            return None
+        # ★ 拿真人轨迹上那个点当锚，再让他落到地上 —— 真人可能正跳在
+        #   半空，直接当「站着」会让 bot 悬空。
+        anchor = botmove.Body(machine.battle_pos[0], machine.battle_pos[1],
+                              on_ground=False)
+        machine.body = botmove.settle(terrain, anchor, who)
+        machine.move_at = now
+    direction, want_jump = _move_intent(room, machine, seat_index,
+                                        terrain, target)
+    # ★★ 推几个 tick 按**真实流逝的时间**算（和 `_advance_shells()` 一个
+    #   口径），而且**余数留到下一帧**：一发心跳 125 ms = 3.9 个 tick，
+    #   每帧直接截断的话 bot 会稳定地比真人慢 23% —— 攒起来就不会。
+    ticks = int(max(0.0, now - machine.move_at) * botmove.TICKS_PER_SECOND)
+    if ticks > BOT_MOVE_MAX_TICKS:
+        ticks = BOT_MOVE_MAX_TICKS
+        machine.move_at = now          # 攒得太久（读图 / 断流）—— 丢掉，别瞬移
+    else:
+        machine.move_at += ticks * botmove.TICK_MS / 1000.0
+    before = machine.body
+    machine.body = botmove.advance(terrain, before, who, ticks,
+                                   direction=direction, want_jump=want_jump)
+    body = machine.body
+    jumped = 1 if (want_jump and before.on_ground and not body.on_ground) else 0
+    return (body.x, body.y, jumped, body.on_ground, body.vx, body.vy,
+            False, False)
+
+
 def _path_blocked(terrain, x0, y0, shot):
     """这条弹道中途会不会撞上地形。
 
@@ -1174,6 +1430,74 @@ def _path_blocked(terrain, x0, y0, shot):
     return False
 
 
+#: 解抛物线弹道时，在「刚好够得着」的初速上留多少余量。
+#:
+#: ★ 它**不是**观测阈值，是**数值余量**：`_lob_speed()` 用连续模型的
+#: 最小抛射初速 `sqrt(g(h + √(dx²+h²)))` 当起点，而收方跑的是离散递推
+#: （`v.y += a; pos += v`，比连续模型多掉 `a·n/2`），两者差一点点。
+#: 不留余量的话 `ballistics.solve()` 的判别式会卡在 0 附近解不出来。
+BOT_LOB_MARGIN = 1.06
+
+#: 找「够得着的最小初速」时最多往上试几档（每档 × `BOT_LOB_MARGIN`）。
+#: 到顶还解不出来就是这把枪真够不着 —— 循环上界，防死循环，不是时序阈值。
+BOT_LOB_STEPS = 24
+
+
+def _lob_speed(weapon, dx, dy):
+    """抛物线武器该用多大力气扔：**刚好够得着**的那一档（§66）。
+
+    ## 为什么不是「用最大力」
+
+    `ballistics.max_speed()` 给的是这把枪的**上限**，而 `solve()` 取的是
+    低抛解 —— 两个一叠加，手雷就成了「贴着地平线飞过去的直球」。
+    用户 2026-08-27 实机报的「手榴弹扔出去的速度太快了，真人对战时
+    手榴弹飞得很慢」说的就是它。
+
+    真人扔手雷是**蓄力**的（`PowerControl=1 / 2`，`rpFire +18` 那一格在
+    语料里 8~531 全谱都有），朝着几百个单位外的人不会拉满 —— 拉满是
+    留给极远距离的。「刚好够得着」这个口径给出的正是课本上那条
+    **最小能量抛射**：仰角 ~45°、飞得慢、弧线看得清，而且射程一到就自然
+    地拉满力气。
+
+    ## 怎么算
+
+    连续模型的最小初速是 `v² = g(h + √(dx² + h²))`（h = 抬升高度，
+    这里 `dy` 往下为正所以 `h = −dy`）。拿它当起点，逐档 × 余量往上试，
+    第一个 `solve()` 解得出来的就是答案；到 `max_speed()` 还解不出来
+    就返回 `None`（这把枪真的够不着）。
+
+    直射武器（`GravityFactor = 0`）不走这条路 —— 它们没有蓄力，
+    `power` 恒 1.0，速度就是 `Velocity`。
+    """
+    ceiling = ballistics.max_speed(weapon)
+    gravity = ballistics.gravity_per_tick(weapon)
+    if not gravity or ceiling <= 0:
+        return ceiling
+    lift = -float(dy)
+    speed = math.sqrt(max(1e-6, gravity * (lift + math.hypot(dx, lift))))
+    speed *= BOT_LOB_MARGIN
+    for _ in range(BOT_LOB_STEPS):
+        if speed >= ceiling:
+            return ceiling
+        if ballistics.solve(weapon, dx, dy, speed=speed) is not None:
+            return speed
+        speed *= BOT_LOB_MARGIN
+    return ceiling
+
+
+def _aim_point(room, seat_index, x, y, crouched):
+    """瞄这个人身上的哪一点 —— **身体那个圆的圆心**（`chrprops`）。
+
+    ★ 会话 18 把瞄准点抬到 `BOT_MUZZLE_HEIGHT`（脚上 57）是「枪口对枪口」，
+    那时候命中是服务端硬判的、瞄哪儿都打得中，所以怎么瞄都行。
+    现在命中是**真判**的（§65），瞄准点必须落在碰撞圆里 —— 而三个圆里
+    身体那个最大，也最不容易因为两人站位高低差几个单位就擦过去。
+    """
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    character = chrprops.get(0 if seat is None else seat.character_id)
+    return character.center(x, y, crouched)
+
+
 def _fire_target(room, machine, seat_index, weapon):
     """挑一个能打的目标，返回 `(座位号, 瞄准点(x, y), Shot)`；没得打返回 `None`。
 
@@ -1184,6 +1508,14 @@ def _fire_target(room, machine, seat_index, weapon):
        返回 `None`（判别式 < 0），那就是这把枪真的够不着；
     3. **看得见** —— 弹道上没有挡子弹的地形（`_path_blocked`）；
     4. 都满足的挑**最近**的。
+
+    ⚠ 挑中了**不等于打得中** —— 命中由 `_advance_shells()` 逐 tick 真判
+    （§65）。这里只回答「值不值得扣扳机」。
+
+    ★★ **这里没有「不往自己爆炸半径里开炮」这一条**（D50，别再加回来）。
+    溅射确实会炸到自己（§69），但真人对局里贴脸对射把自己一起炸死是**常态**
+    —— 真人是自己权衡「炸掉他值不值得挨这一下」，而不是守着一条「近了就
+    不许开」的禁令。这种权衡要等真 AI 来做，现在**不替它拍板**。
     """
     if machine.battle_pos is None:
         return None
@@ -1191,8 +1523,9 @@ def _fire_target(room, machine, seat_index, weapon):
     terrain = mapdata.load(_current_map(room))
     best = None
     for index, conn in _hostile_humans(room, seat_index):
-        tx, ty = conn.sync_trail[-1][:2]
-        ty -= BOT_AIM_HEIGHT
+        point = conn.sync_trail[-1]
+        crouched = bool(point[7]) if len(point) > 7 else False
+        tx, ty = _aim_point(room, index, point[0], point[1], crouched)
         if BOT_DIAG_FIRE_ANYWHERE:
             # ★ 取证专用：真人站着不动时 `trail_point()` 会让 bot 贴到人身上
             #   （§52），距离 0 的话 `ballistics.solve()` 解不出弹道、一颗
@@ -1205,7 +1538,8 @@ def _fire_target(room, machine, seat_index, weapon):
             continue
         if best is not None and span >= best[0]:
             continue                       # 已经有更近的了，弹道就别解了
-        shot = ballistics.solve(weapon, tx - mx, ty - my)
+        shot = ballistics.solve(weapon, tx - mx, ty - my,
+                                speed=_lob_speed(weapon, tx - mx, ty - my))
         if shot is None:
             continue
         if (not BOT_DIAG_FIRE_ANYWHERE
@@ -1355,8 +1689,503 @@ def _reload_after_shot(machine, weapon, now):
     return now + (weapon.cooling_ms or weapon.fire_interval_ms) / 1000.0
 
 
+# ---------------------------------------------------------------------------
+# ★★★ 命中判定（§65）—— 服务端自己把弹道跑一遍
+# ---------------------------------------------------------------------------
+#: 弹体最多飞多远（世界单位）就算「没了」。
+#:
+#: 有地形数据时用**这张图自己的对角线**（飞出图外客户端本来就销毁弹体）；
+#: 没有地形数据时退回这个数 —— 它比 174 张图里最大的那张（11400 × 4500）
+#: 的对角线还长。★ 这是**几何上界**（图有多大），不是「飞多久算超时」。
+BOT_SHELL_MAX_TRAVEL = 12288.0
+
+#: 判「这一 tick 有没有撞地形」时沿线段采样的步长（像素），同 `BOT_LINE_STEP`。
+BOT_SHELL_TERRAIN_STEP = BOT_LINE_STEP
+
+
+class Shell(object):
+    """一颗**在飞的**子弹 —— 服务端这边的那一份。
+
+    收方每个 tick（32 ms）把弹体推进一步、当场判碰撞（`0x47de6a` →
+    `0x480420`），撞上就把弹体标记成结束（`0x481178`）。但**算伤害、发
+    `rpExplode` 的只有射手那台机器**（`0x47eb4e` 的 `IsMine || IsNeutral`
+    守卫）—— bot 没有本机，所以那套判定归服务端（D28 / §42）。
+
+    ★★ 会话 18 之前这里根本没有判定：`_impact_point()` 一律把爆炸点搬到
+    「目标此刻站的地方」并报命中，于是**百发百中**、玩家明明躲开了照样
+    掉血，火箭飞到地上炸了爆炸特效却出现在玩家身上（用户 2026-08-27 报的
+    三条症状全是它）。现在这个类逐 tick 跑真弹道，撞到什么就是什么。
+
+    ⚠ **每一颗都必须恰好发一发 `rpExplode`**：句柄记账在开火那一刻就
+    推进了，少发一发收方那一格计数器就和服务端错开，从此打不掉血（§42）。
+    所以 `_advance_shells()` 里没有任何一条「算了这颗不管了」的路。
+    """
+
+    __slots__ = ("handle", "fire_seq", "weapon", "group", "x0", "y0",
+                 "shot", "born", "ticks", "x", "y", "max_ticks")
+
+    def __init__(self, handle, fire_seq, weapon, group, x0, y0, shot, born,
+                 max_ticks):
+        self.handle = int(handle)
+        #: 开火那一发 `rpFire` 的事件序号 —— 换代之后拿它认出「这是上一代的」。
+        self.fire_seq = int(fire_seq)
+        self.weapon = weapon
+        #: 碰撞排除组（§63）。判命中时和对方的组一比，相同就穿过去。
+        self.group = int(group)
+        #: 枪口（发射点），闭式解的原点。
+        self.x0 = float(x0)
+        self.y0 = float(y0)
+        self.shot = shot
+        self.born = float(born)
+        #: 已经推进了几个**收方 tick**（32 ms 一个）。
+        self.ticks = 0
+        self.x = float(x0)
+        self.y = float(y0)
+        self.max_ticks = int(max_ticks)
+
+    def position(self, ticks):
+        return ballistics.position_at(self.x0, self.y0, self.shot, ticks)
+
+    def __repr__(self):
+        return ("<Shell %d 武器%s 组%d %d/%dtick (%.0f, %.0f)>"
+                % (self.handle, getattr(self.weapon, "id", "?"), self.group,
+                   self.ticks, self.max_ticks, self.x, self.y))
+
+
+def _shell_max_ticks(terrain, shot):
+    """这颗子弹最多推进几个 tick —— 走完 `BOT_SHELL_MAX_TRAVEL` 就到头。
+
+    ★ 循环上界，不是超时阈值：飞出图外的弹体客户端自己就销毁了，
+    服务端这边也得有个头，否则一颗打空的直射弹会永远挂在「在飞」队列里，
+    把带溅射武器的那道顺序闸门（`_may_fire`）永久卡死。
+    """
+    travel = BOT_SHELL_MAX_TRAVEL
+    if terrain is not None:
+        travel = math.hypot(terrain.width, terrain.height)
+    speed = max(1e-3, shot.speed)
+    return max(1, int(math.ceil(travel / speed)))
+
+
+def _segment_circle_t(ax, ay, bx, by, cx, cy, radius):
+    """线段 A→B **第一次**进入圆 `(C, radius)` 的参数 `t ∈ [0, 1]`。
+
+    不相交返回 `None`；起点就在圆里返回 `0.0`。
+
+    ★ 为什么是**线段**而不是「这一 tick 的落点」：直射枪一个 tick 走 100
+    个单位，而人的身体圆直径才 26~36 —— 按落点采样的话子弹会**从人身上
+    穿过去**（隧穿）。原版的碰撞是「一串形状 × 一串形状」求交
+    （`0x50f410`），直射弹在画面上本来就是一条线（§45），所以扫掠段
+    才是对的模型。
+    """
+    dx = bx - ax
+    dy = by - ay
+    fx = ax - cx
+    fy = ay - cy
+    if fx * fx + fy * fy <= radius * radius:
+        return 0.0
+    a = dx * dx + dy * dy
+    if a <= 0.0:
+        return None
+    b = 2.0 * (fx * dx + fy * dy)
+    c = fx * fx + fy * fy - radius * radius
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0:
+        return None
+    t = (-b - math.sqrt(disc)) / (2.0 * a)
+    return t if 0.0 <= t <= 1.0 else None
+
+
+def _terrain_stop_t(terrain, ax, ay, bx, by):
+    """线段 A→B 上第一个**挡子弹**的采样点的参数 `t`；一路通畅返回 `None`。
+
+    用 `blocks_bullet()` 那一路 —— 单向平台（值 1）挡人不挡子弹（§29）。
+    """
+    if terrain is None:
+        return None
+    dx = bx - ax
+    dy = by - ay
+    span = max(abs(dx), abs(dy))
+    steps = max(1, int(span // BOT_SHELL_TERRAIN_STEP))
+    for i in range(1, steps + 1):
+        t = float(i) / steps
+        if terrain.blocks_bullet(int(ax + dx * t), int(ay + dy * t)):
+            return t
+    return None
+
+
+def _shell_step(room, shell, terrain, bodies):
+    """把这颗子弹往前推**一个 tick**，返回 `(落点, 座位号或None, 部位或None)`。
+
+    什么都没撞上返回 `None`（子弹继续飞，`shell.x/y` 已经更新）。
+    同一段里既撞地形又撞人时，**参数 `t` 小的那个先发生**。
+    """
+    ax, ay = shell.x, shell.y
+    bx, by = shell.position(shell.ticks + 1)
+    shell.ticks += 1
+    best_t = None
+    best = None
+    radius = shell.weapon.size
+    for seat_index, px, py, crouched, character_id in bodies:
+        character = chrprops.get(character_id)
+        for cx, cy, r, region in character.circles(px, py, crouched):
+            t = _segment_circle_t(ax, ay, bx, by, cx, cy, r + radius)
+            if t is None or (best_t is not None and t >= best_t):
+                continue
+            best_t = t
+            best = (seat_index, region)
+    ground_t = _terrain_stop_t(terrain, ax, ay, bx, by)
+    if ground_t is not None and (best_t is None or ground_t < best_t):
+        best_t = ground_t
+        best = (None, None)
+    shell.x, shell.y = bx, by
+    if best is None:
+        return None
+    point = (ax + (bx - ax) * best_t, ay + (by - ay) * best_t)
+    shell.x, shell.y = point
+    return (point, best[0], best[1])
+
+
+def _splash_targets(room, shell, point, victim_seat, bodies):
+    """爆炸溅到了谁：`[(座位号, 伤害, 受击点)]`。武器没有溅射就是空表。
+
+    原版 `weapon.ini` 的说明：`SplashRange` 是「以爆点为中心、单位像素的
+    一个半径，**离中心越远伤害越小**」。这里按线性衰减 ——
+    没有更细的出处，而「越远越小」这一条是 ini 自己写的。
+
+    ★★★ `bodies` 必须是**不按碰撞组过滤**的那一份（`_battle_bodies` 的
+    `group=None`）：溅射**分不清敌我**，队友和射手自己都吃（§69）。
+    过滤了的话组队房里 bot 的手雷炸在队友脚下一滴血都不掉，
+    和原版对不上。
+
+    ★ 直接命中的那个人**不重复算**（他已经吃过 `rpExplode` 那一档伤害了）。
+    """
+    weapon = shell.weapon
+    reach = float(weapon.splash_range or 0.0)
+    if reach <= 0.0:
+        return []
+    full = weapon.splash_damage
+    out = []
+    for seat_index, px, py, crouched, character_id in bodies:
+        if seat_index == victim_seat:
+            continue
+        character = chrprops.get(character_id)
+        cx, cy = character.center(px, py, crouched)
+        span = math.hypot(cx - point[0], cy - point[1])
+        if span > reach:
+            continue
+        damage = int(round(full * (1.0 - span / reach)))
+        if damage <= 0:
+            continue
+        out.append((seat_index, damage, (cx, cy)))
+    return out
+
+
+def _resolve_shell(room, machine, shell, point, victim_seat, region):
+    """这颗子弹到头了：发 `rpExplode`（+ 溅射的 `rpSplashDamaged`）。
+
+    `victim_seat is None` = 打在地形上 / 飞出图外 —— 照样要发，
+    **句柄记账不许漏**（§42）。
+    """
+    if machine.no_explode:
+        # ★ 诊断开关（`/noboom`）：到头了也不发爆炸，让弹体一直飞下去。
+        #   记录照样出队 —— 句柄是开火那一刻分配的，少发爆炸不影响记账（§43）。
+        return
+    weapon = shell.weapon
+    hit = victim_seat is not None
+    damage = weapon.damage_for(region) if hit else 0
+    packet = machine.sync.event(
+        botsync.OP_EXPLODE,
+        botsync.explode_body(
+            shell.handle,
+            botsync.character_handle(victim_seat) if hit else 0,
+            point[0], point[1],
+            hit_kind=(botsync.HIT_CHARACTER if hit else botsync.HIT_NONE),
+            damage=damage))
+    # ★ 诊断：命中 / 落空**各打一行**（按状态翻转去重，铁律 10）。M3b 收口后删。
+    if hit not in machine.explode_logged:
+        machine.explode_logged.add(hit)
+        head, body = packet[:12], packet[12:]
+        machine.log(f"   爆炸: 弹体句柄 {shell.handle} "
+                    f"目标 {'座位%d 的%s' % (victim_seat, region) if hit else '落空'} "
+                    f"爆炸点 ({point[0]:.1f}, {point[1]:.1f}) 伤害 {damage}"
+                    f"　飞了 {shell.ticks} tick"
+                    f"；头 {head.hex()} body({len(body)}) {body.hex()}")
+    _emit(machine, packet)
+    # ★★★ 溅射的名单和弹体**不是同一份**（§69）：弹体按碰撞排除组过滤
+    #   （队友撞不着），而溅射对象的组恒为 0 = **撞所有人** ——
+    #   队友、连射手自己都吃。所以这里重新问一次、不带组。
+    for seat_index, splash, where in _splash_targets(
+            room, shell, point, victim_seat,
+            _battle_bodies(room, machine.my_seat, include_self=True)):
+        # ★ 溅射伤害得**单独报**：收方处理 `rpExplode` 时确实会建一个
+        #   `SplashDamage` 对象（§54 那个多出来的句柄），但算伤害的是射手
+        #   那台机器 —— bot 没有本机，不补这一发就一滴血都不掉（§67）。
+        _emit(machine, machine.sync.event(
+            botsync.OP_SPLASH_DAMAGED,
+            botsync.splash_body(shell.handle,
+                                botsync.character_handle(seat_index),
+                                splash, where[0], where[1])))
+
+
+def _advance_shells(room, machine, now):
+    """把所有在飞的子弹推进到**此刻**，撞上什么就当场结算。
+
+    ## 为什么每帧推一次就够（铁律 10）
+
+    弹道本身是**闭式解**（`ballistics.position_at`），什么时候算都一样；
+    唯一会变的是**别人站在哪**，而那个只有真人的心跳到达时才会变 ——
+    这个函数正是挂在那一发心跳上的（`_tick_bot` 的第一件事）。
+    也就是说：两帧之间根本没有新事实，推早了也算不出别的结果。
+
+    ## 一发都不能漏
+
+    句柄记账在开火那一刻就推进了，少发一发 `rpExplode`，收方那一格计数器
+    就和服务端错开，从此每一发都对不上号 —— 打不掉血且一局之内不自愈
+    （§42）。所以这个函数排在 `_tick_bot` 的最前面，
+    **连「bot 这会儿正躺着」都不挡它**：真人死了，他打出去的子弹照样在飞。
+    """
+    if not machine.pending_shots:
+        return
+    # ★ 保险：事件序号只会往前走，除非换代把它清回 0（`_sync_epoch`）。
+    #   真发生了的话这些记录是上一代的，句柄早就作废了 —— 丢掉，别拿过期的
+    #   号去撞收方那个静默丢弃。
+    alive = [s for s in machine.pending_shots if s.fire_seq < machine.sync.events]
+    terrain = mapdata.load(_current_map(room))
+    bodies_cache = {}
+    still = []
+    for shell in alive:
+        bodies = bodies_cache.get(shell.group)
+        if bodies is None:
+            bodies = _battle_bodies(room, machine.my_seat, shell.group)
+            bodies_cache[shell.group] = bodies
+        # ★ 收方每 32 ms 推一步（`ballistics.TICK_MS`，§47）。这里按**真实
+        #   流逝的时间**算它该走到第几步 —— 服务端的帧率（跟着真人心跳走，
+        #   ~8 Hz）和它无关，所以帧掉几拍也不会让子弹变慢。
+        #   ★ 至少推一步：`_try_fire` 开完枪当场调一次，贴脸那一发
+        #     （枪口到人只有几十个单位）就在收方的第一步里结算掉，
+        #     不用等下一帧的 125 ms。
+        want = max(1, int((now - shell.born) * ballistics.TICKS_PER_SECOND))
+        want = min(want, shell.max_ticks)
+        landed = None
+        while shell.ticks < want:
+            landed = _shell_step(room, shell, terrain, bodies)
+            if landed is not None:
+                break
+        if landed is None and shell.ticks < shell.max_ticks:
+            still.append(shell)
+            continue
+        if landed is None:
+            # 飞到头了什么都没撞上（打空 / 飞出图外）—— 在最后那一点炸掉。
+            landed = ((shell.x, shell.y), None, None)
+        _resolve_shell(room, machine, shell, landed[0], landed[1], landed[2])
+    machine.pending_shots = still
+
+
+# ---------------------------------------------------------------------------
+# ★★ 近身冲刺攻击（§64）—— 真人双击左右方向键的那一下
+# ---------------------------------------------------------------------------
+#: 冲刺攻击的**第几式**。语料 4394 发 `rpDash` 的 `+2` **恒 0** ——
+#: 真人打出来的就只有第 0 式，bot 照抄。
+BOT_DASH_INDEX = 0
+
+#: 一帧动画多久 —— 按**收方的逻辑步长**（32 ms）算。
+#:
+#: ⚠ 这是**假设**：`ChrProps.ini` 的 `CastEndFrame` / `DamageEndFrame` /
+#: `TotalFrame` 是动画帧号，而那个动画一帧多久 ini 里没写、客户端那段也没逆。
+#: 取 `TICK_MS` 的依据是数量级对得上（角色 0 的 `TotalFrame=25` ⇒ 一下 0.8 秒）。
+#: ★ 它只影响**这一下打多久 / 什么时候判伤害**，不影响任何包的字节 ——
+#: 差一点点的后果是「近身这下的节奏偏快偏慢」，不是静默故障。
+BOT_DASH_FRAME_MS = ballistics.TICK_MS
+
+
+class DashSwing(object):
+    """一次**正在进行**的近身攻击。
+
+    `rpDash` 只说「我冲了」，**伤害不在那一发里** —— 和弹体一样，
+    判中和扣血是射手那台机器的活（D28），bot 没有本机 ⇒ 归服务端。
+    命中之后补一发 `rpSplashDamaged`（§67）。
+    """
+
+    __slots__ = ("handle", "born", "direction", "move", "character_id",
+                 "frames_done", "hit")
+
+    def __init__(self, handle, born, direction, move, character_id):
+        self.handle = int(handle)
+        self.born = float(born)
+        #: `+1` 左右：`-1` / `+1`。伤害圈的水平偏移跟着它翻。
+        self.direction = int(direction)
+        self.move = move
+        self.character_id = int(character_id)
+        #: 已经判过伤害的最后一帧。
+        self.frames_done = -1
+        #: 这一下已经打中过了吗（一下只打一次）。
+        self.hit = False
+
+    def frame_at(self, now):
+        return int((now - self.born) * 1000.0 / BOT_DASH_FRAME_MS)
+
+    def __repr__(self):
+        return ("<DashSwing %d 方向%+d 第%d帧%s>"
+                % (self.handle, self.direction, self.frames_done,
+                   "已命中" if self.hit else ""))
+
+
+def _stamina_props():
+    return chrprops.game()
+
+
+def _regen_stamina(machine, now, crouched=False, fast_run=False):
+    """按**真实流逝的时间**补体力（`GameProps.ini` 的 `SpCharging`）。
+
+    ★ 三个数全是原版的：每 tick 回 `SpCharging`（0.25），蹲下 **×2**
+    （`0x507250`，§41），冲刺跑每 tick 花 `FastRunSpCost`（1.5）。
+    没有一个是我拍脑袋的常量（铁律 10）。
+    """
+    props = _stamina_props()
+    if machine.stamina is None:
+        machine.stamina = props.sp_max
+        machine.stamina_at = now
+        return machine.stamina
+    ticks = max(0.0, (now - machine.stamina_at) * ballistics.TICKS_PER_SECOND)
+    machine.stamina_at = now
+    gain = props.sp_charging * (2.0 if crouched else 1.0)
+    if fast_run:
+        gain -= props.fast_run_sp_cost
+    machine.stamina = max(0.0, min(props.sp_max,
+                                   machine.stamina + gain * ticks))
+    return machine.stamina
+
+
+def _dash_hits(room, swing, x, y, frame, bodies):
+    """第 `frame` 帧时这一下打中了谁：`(座位号, 部位)`；没打中返回 `None`。
+
+    伤害圈的位置按 `ChrProps.ini` 自己写的那条公式算（见 `chrprops.Move`），
+    水平偏移跟着朝向翻。
+    """
+    offset = swing.move.offset(frame)
+    px = x + offset[0] * (1.0 if swing.direction >= 0 else -1.0)
+    py = y + offset[1]
+    radius = swing.move.radius
+    for seat_index, bx, by, crouched, character_id in bodies:
+        region = chrprops.get(character_id).hit_region(
+            bx, by, px, py, radius=radius, crouched=crouched)
+        if region is not None:
+            return (seat_index, region)
+    return None
+
+
+def _advance_dash(room, machine, now):
+    """推进**正在进行**的那一下近身攻击，打中了就补一发 `rpSplashDamaged`。
+
+    ★ 和子弹一样，判据是**物理**的：动作走到第几帧、那一帧的伤害圈在哪、
+    圈里有没有人。一下只打一次（真人也是）。
+    """
+    swing = machine.dash_swing
+    if swing is None:
+        return
+    if machine.battle_pos is None:
+        machine.dash_swing = None
+        return
+    frame = swing.frame_at(now)
+    if not swing.hit:
+        group = _seat_group(room, machine.my_seat)
+        bodies = _battle_bodies(room, machine.my_seat, group)
+        x, y = machine.battle_pos
+        first = max(swing.frames_done + 1, swing.move.cast_end)
+        for step in range(first, min(frame, swing.move.damage_end) + 1):
+            swing.frames_done = step
+            landed = _dash_hits(room, swing, x, y, step, bodies)
+            if landed is None:
+                continue
+            seat_index, region = landed
+            swing.hit = True
+            offset = swing.move.offset(step)
+            _emit(machine, machine.sync.event(
+                botsync.OP_SPLASH_DAMAGED,
+                botsync.splash_body(
+                    swing.handle, botsync.character_handle(seat_index),
+                    swing.move.damage,
+                    x + offset[0] * (1.0 if swing.direction >= 0 else -1.0),
+                    y + offset[1])))
+            machine.log(f"   近身: 冲刺打中 座位{seat_index} 的{region}"
+                        f" 伤害 {swing.move.damage} 第{step}帧"
+                        f" 句柄 {swing.handle}")
+            break
+    if frame >= swing.move.total_frame:
+        machine.dash_swing = None
+
+
+def _dash_target(room, machine, seat_index, move):
+    """够得着的敌人（最近的那个）；没有返回 `None`。
+
+    判据就是这一招**自己**的伤害圈：任何一个伤害帧的圈能盖住对方，
+    就算够得着。够不着一步都不冲 —— 原版真人也不会对着空气双击。
+    """
+    if machine.battle_pos is None:
+        return None
+    x, y = machine.battle_pos
+    group = _seat_group(room, seat_index)
+    hostile = set(index for index, _conn in _hostile_humans(room, seat_index))
+    bodies = [b for b in _battle_bodies(room, seat_index, group)
+              if b[0] in hostile]
+    if not bodies:
+        return None
+    best = None
+    for direction in (botsync.DASH_RIGHT, botsync.DASH_LEFT):
+        probe = DashSwing(0, 0.0, direction, move, machine.character_id)
+        for frame in move.frames():
+            landed = _dash_hits(room, probe, x, y, frame, bodies)
+            if landed is None:
+                continue
+            target = [b for b in bodies if b[0] == landed[0]][0]
+            span = abs(target[1] - x)
+            if best is None or span < best[0]:
+                best = (span, landed[0], direction)
+            break
+    return None if best is None else (best[1], best[2])
+
+
+def _try_dash(room, machine, seat_index, now, on_ground):
+    """够得着就来一下近身冲刺攻击（`rpDash`）。发了返回 `True`。
+
+    ## 三个前提
+
+    1. **踩在地上** —— 原版那一下是地面动作（`0x515b03` 那两段双击判定
+       都在地面输入处理里）；
+    2. **体力够** —— 花 `DashNN-SpCost`（角色 0 是 30，满体力 100）；
+    3. **上一下打完了** —— 一次只能有一个 `DashSwing`。
+
+    ⚠ 收方**不会**替远端角色扣体力（它只是播个动画），所以这里的体力是
+    bot 自己给自己上的约束 —— 用户 2026-08-27 说的「消耗体力触发」就是它。
+    """
+    if not machine.melee or machine.dash_swing is not None or not on_ground:
+        return False
+    if machine.holding:
+        return False                       # `/hold` 是「站住别动」，那就别冲
+    move = chrprops.get(machine.character_id).dash(BOT_DASH_INDEX)
+    if move is None or move.damage <= 0 or move.radius <= 0:
+        return False
+    if machine.stamina is None or machine.stamina < move.sp_cost:
+        return False
+    target = _dash_target(room, machine, seat_index, move)
+    if target is None:
+        return False
+    target_seat, direction = target
+    x, y = machine.battle_pos
+    packet, handle = machine.sync.dash(direction, BOT_DASH_INDEX, x, y)
+    machine.stamina -= move.sp_cost
+    machine.dash_swing = DashSwing(handle, now, direction, move,
+                                   machine.character_id)
+    machine.log(f"   近身: 冲刺 朝{'右' if direction > 0 else '左'} "
+                f"目标 座位{target_seat} {move!r} "
+                f"体力 {machine.stamina:.0f}/{_stamina_props().sp_max:.0f}"
+                f" 句柄 {handle}（★ 收方也吃掉一个弹体句柄，§64）")
+    _emit(machine, packet)
+    return True
+
+
 def _try_fire(room, machine, seat_index, weapon, target, now):
-    """打一发 `rpFire`，把对应的 `rpExplode` 排进「在飞的子弹」队列。
+    """打一发 `rpFire`，把造出来的弹体挂进「在飞的子弹」队列。
 
     ## 为什么爆炸也得服务端发（§42）
 
@@ -1371,23 +2200,23 @@ def _try_fire(room, machine, seat_index, weapon, target, now):
     否则 `rpExplode` 会被**静默丢弃**（`0x492750` 查不到弹体就整个 return），
     表现是「子弹飞过去不炸」，而且一局之内不自愈。
     散射武器（`SpreadFrags > 1`）一发造好几颗，句柄是连号的（§46），
-    所以每一颗都要排一发爆炸。
+    所以每一颗都要挂一颗 `Shell`。
 
-    ## 延后爆炸（M3b-2）
+    ## 什么时候炸（§65 换掉了原来那套）
 
-    飞行时间由 `ballistics` 按 `Velocity` / `GravityFactor` 算（§47），
-    到点了才由 `_flush_explosions()` 发 `rpExplode`。
-    ★ 这个等待是**物理量**，不是「等 XX 毫秒再说」那种观测阈值 ——
-    铁律 10 允许的例外，和重生倒计时同一类。
+    ★★ 会话 18 之前是「按弹道算个飞行时间，到点了把爆炸点搬到目标身上、
+    报命中」—— 那是**百发百中**，用户躲开了照样掉血、火箭炸在地上特效却
+    出现在人身上。现在改成 `_advance_shells()` 逐 tick 跑真弹道，
+    撞到人 / 撞到地形 / 飞出图外才炸，炸在**真的撞上的那一点**。
     """
     target_seat, point, shot = target
     x, y = machine.battle_pos
     # ★ 必须和 `_fire_target()` 解弹道时用的是**同一个**枪口（同一个 `point[0]`
-    #   算出来的朝向），否则包里的发射点和飞行时间对不上。
+    #   算出来的朝向），否则包里的发射点和弹道对不上。
     muzzle_x, muzzle_y = _muzzle(x, y, point[0])
     _declare_weapon(machine, seat_index, weapon)
-    # ★ 这一发 `rpFire` 会拿到的**事件序号** —— 延后爆炸要拿它判
-    #   「收方那边这一发露面了没有」（§50）。
+    # ★ 这一发 `rpFire` 会拿到的**事件序号** —— 换代之后拿它认出「这颗是
+    #   上一代的」（`_advance_shells` 开头那一道保险）。
     fire_seq = machine.sync.events
     # ★★ `/noboom` 开着时**句柄步进要跟着变小**（用户 2026-08-27 实机踩到）：
     #   带溅射的武器每发多吃一个句柄，而那一个是**爆炸那一刻**收方创建
@@ -1395,6 +2224,11 @@ def _try_fire(room, machine, seat_index, weapon, target, now):
     #   不发爆炸 ⇒ 收方少分配一个 ⇒ 服务端照旧 +2 就会永久错开，
     #   表现是「关掉 /noboom 之后再也打不中」。
     step = weapon.shots if machine.no_explode else weapon.handle_step
+    # ★★★ 碰撞排除组（§63）：**填错就是「明明躲开了还掉血」**。
+    #   收方把它写进弹体的 `[proj+0x15c]`，和角色的一比，相同就整个跳过
+    #   碰撞 —— 以前这一格被当成「武器槽」写死成 1，于是个人战里座位 0
+    #   那个人身上一发都撞不着，而服务端自己发的 `rpExplode` 照样扣血。
+    group = _seat_group(room, seat_index)
     # ★ 取证专用（`BOT_DIAG_FIRE_ANYWHERE`）：**每隔一发**把 `rpFire` 的
     #   owner 换成目标真人的座位。收方那边一发是「bot 打的」、下一发是
     #   「这个真人打的」，弹道完全一样、发射点完全一样 —— 屏幕上要是只看得见
@@ -1406,129 +2240,42 @@ def _try_fire(room, machine, seat_index, weapon, target, now):
             source_seat = target_seat
     packet, handle = machine.sync.fire(
         weapon.id, muzzle_x, muzzle_y, shot.angle, shot.power,
-        handle_step=step, shots=weapon.shots, source_seat=source_seat)
+        handle_step=step, shots=weapon.shots, source_seat=source_seat,
+        group=group)
     if source_seat is not None:
         machine.log(f"   ◆诊断 这一发用**座位 {source_seat}（真人）**的 owner 发出去")
     # ★ **每个距离档打一行**（按状态翻转去重，铁律 10 的口径；每发都打的话
     #   140 ms 一行会把日志刷爆）。句柄错位是整条链上**唯一**会静默失败的
     #   地方（`0x492750` 查不到弹体就整个 return），实机看到「子弹飞过去
     #   不炸」时，能对得上号的就只有这一行。
-    #   ★ 带上**完整包的十六进制**，好和 `gameserver.note_human_fire()` 打的
-    #     那行真人包并排逐字节比（§54 末尾）。
     mark = (weapon.id, int(shot.ticks))
     if mark not in machine.fire_logged:
         machine.fire_logged.add(mark)
         head, body = packet[:12], packet[12:]
         machine.log(f"   开火: 武器 {weapon.id}({weapon.section}) "
-                    f"伤害 {weapon.damage} 弹体 {weapon.shots} 步进 "
-                    f"{step}；节奏 弹匣 {weapon.magazine} 发 × "
-                    f"冷却 {weapon.cooling_ms}ms + 换弹 {weapon.reload_ms}ms"
+                    f"伤害 {weapon.damage}/头{weapon.head_damage}/腿"
+                    f"{weapon.legs_damage} 弹体 {weapon.shots} 半径 "
+                    f"{weapon.size} 溅射 {weapon.splash_range} 步进 {step}；"
+                    f"节奏 弹匣 {weapon.magazine} 发 × 冷却 "
+                    f"{weapon.cooling_ms}ms + 换弹 {weapon.reload_ms}ms"
                     f"（无弹匣的话按 {weapon.fire_interval_ms}ms 一发）；"
-                    f"弹道 {shot!r}；弹体句柄 {handle}；"
-                    f"目标 座位{target_seat} 角色句柄 "
-                    f"{botsync.character_handle(target_seat)}"
-                    f"；头 {head.hex()} body({len(body)}) {body.hex()}"
-                    f"　★ 打不掉血 = 收方分配的句柄和这个对不上（§42）")
+                    f"弹道 {shot!r}；弹体句柄 {handle}；碰撞组 {group}；"
+                    f"瞄 座位{target_seat} ({point[0]:.0f}, {point[1]:.0f})"
+                    f"；头 {head.hex()} body({len(body)}) {body.hex()}")
     _emit(machine, packet)
-    # ★★ 飞行时间**不足客户端一个 tick**（32 ms）的，当作和开火**同一瞬间**
-    #   到达（§52）。收方的弹体每 tick 才推进一步，连一步都走不完的距离上
-    #   它根本没有可见的行程；这时候把爆炸往后排，只会让弹体飞过目标几百个
-    #   单位才消失 —— 爆炸特效在目标身上、弹体在几百单位开外，两头对不上。
-    #   ★ 这是**物理量**（客户端弹道的逻辑步长），不是观测出来的毫秒阈值。
-    instant = shot.ticks < 1.0
-    due = now if instant else now + shot.seconds
+    terrain = mapdata.load(_current_map(room))
+    max_ticks = _shell_max_ticks(terrain, shot)
     for offset in range(weapon.shots):
         machine.pending_shots.append(
-            (due, fire_seq, handle + offset, target_seat, weapon.damage, point))
+            Shell(handle + offset, fire_seq, weapon, group,
+                  muzzle_x, muzzle_y, shot, now, max_ticks))
     machine.next_fire_at = _reload_after_shot(machine, weapon, now)
-    if instant:
-        # 排完就冲，别等下一帧（下一帧已经是 125 ms 之后了）。
-        _flush_explosions(room, machine, now)
+    # ★★ 当场推一步：收方在**它的下一个 tick**（32 ms）就把弹体推进一格，
+    #   而 bot 的下一帧要等 125 ms。贴脸那一发（枪口到人常常只有几十个
+    #   单位）就在那一格里撞上了 —— 等到下一帧再结算的话，爆炸特效会比
+    #   弹体晚上一大截。★ 这是**收方的逻辑步长**，不是观测出来的阈值。
+    _advance_shells(room, machine, now)
     return True
-
-
-def _impact_point(room, target_seat, fallback):
-    """子弹到点的这一刻，那个目标在哪 —— 返回 `((x, y), 打中了没有)`。
-
-    ★ 用**这一刻**的坐标而不是开火时的：子弹飞了几百毫秒，人早就走开了，
-    照着老坐标炸的话别人会看见爆炸出现在空地上。
-
-    ★ 目标这会儿已经躺下了（死了 / 命用完了）就当**没打中**：拿一个不在场的
-    角色句柄去撞 `0x492856` 那个静默丢弃没有意义，还不如老老实实报一发
-    落空的爆炸，别人屏幕上至少看得见子弹在哪没的。
-    """
-    seat = room.seats[target_seat] if 0 <= target_seat < len(room.seats) else None
-    conn = None if seat is None else seat.conn
-    trail = getattr(conn, "sync_trail", None) if conn is not None else None
-    if not trail or _lying_dead(room, target_seat):
-        return fallback, False
-    tx, ty = trail[-1][:2]
-    return (tx, ty - BOT_AIM_HEIGHT), True
-
-
-def _explosion_ready(shot, now):
-    """这一发该炸了吗 —— **飞到了就炸**，没有别的条件。
-
-    ⚠ 会话 15 在这里加过第二个闸门「那一发 `rpFire` 被心跳报出去过」
-    （`sync.announced > fire_seq`，旧 §50 / D37），**已经删掉**：那条结论是
-    错的。收方的事件包**每帧**都 flush（`0x405810` 在每帧的网络 tick 里），
-    而且包一入队就把队列上界抬到 `seq+1`（`0x54bb8c` → `0x54bb66`）——
-    **根本不需要等心跳**。心跳的 N 只是丢包时的兜底上界。
-    详见 **§52**（推翻 §50）。
-
-    多等一发心跳的实际后果是**反的**：弹体在收方每 tick 推进一步，白等
-    125 ms 就是白飞 390 个单位，爆炸特效在目标身上、弹体早飞到几百单位
-    开外 —— 越等越对不上。
-    """
-    return shot[0] <= now
-
-
-def _flush_explosions(room, machine, now):
-    """把**已经飞到、而且开火那一发已经露过面**的子弹炸掉（`rpExplode`）。
-
-    ⚠ **一发都不能漏**：句柄记账在开火那一刻就推进了，少发一发，收方那一格
-    计数器就和服务端错开，从此每一发都对不上号 —— 打不掉血且一局之内不自愈
-    （§42）。所以这个函数排在 `_tick_bot` 的最前面，
-    **连「bot 这会儿正躺着」都不挡它**：真人死了，他打出去的子弹照样在飞。
-    """
-    if not machine.pending_shots:
-        return
-    # ★ 保险：事件序号只会往前走，除非换代把它清回 0（`_sync_epoch`）。
-    #   真发生了的话这些记录是上一代的，句柄早就作废了 —— 丢掉，别拿过期的
-    #   号去撞收方那个静默丢弃（换代那一刻 `reset_battle_frame()` 本来就会把
-    #   整队清掉，这里只是兜住万一的顺序问题）。
-    machine.pending_shots = [s for s in machine.pending_shots
-                             if s[1] < machine.sync.events]
-    ready = [s for s in machine.pending_shots if _explosion_ready(s, now)]
-    if not ready:
-        return
-    machine.pending_shots = [s for s in machine.pending_shots
-                             if not _explosion_ready(s, now)]
-    if machine.no_explode:
-        # ★ 诊断开关（`/noboom`）：到点了也不发爆炸，让弹体一直飞下去。
-        #   记录照样出队 —— 句柄是开火那一刻分配的，少发爆炸不影响记账（§43）。
-        return
-    for _due, _seq, handle, target_seat, damage, fallback in ready:
-        (tx, ty), hit = _impact_point(room, target_seat, fallback)
-        packet = machine.sync.event(
-            botsync.OP_EXPLODE,
-            botsync.explode_body(
-                handle,
-                botsync.character_handle(target_seat) if hit else 0,
-                tx, ty,
-                hit_kind=(botsync.HIT_CHARACTER if hit else botsync.HIT_NONE),
-                damage=damage))
-        # ★ 诊断：命中 / 落空**各打一行**（按状态翻转去重，铁律 10），带完整
-        #   字节，好和 `note_human_fire()` 打的真人 `rpExplode` 并排比。
-        #   M3b 收口后删。
-        if hit not in machine.explode_logged:
-            machine.explode_logged.add(hit)
-            head, body = packet[:12], packet[12:]
-            machine.log(f"   爆炸: 弹体句柄 {handle} "
-                        f"目标 {'座位%d' % target_seat if hit else '落空'} "
-                        f"爆炸点 ({tx:.1f}, {ty:.1f}) 伤害 {damage}"
-                        f"；头 {head.hex()} body({len(body)}) {body.hex()}")
-        _emit(machine, packet)
 
 
 def _battle_started(room):
@@ -1571,7 +2318,7 @@ def _tick_bot(room, machine, seat_index):
     一顿一顿」就是它。判据换成「`sync_trail_seq` 变了没有」之后，
     bot 和它跟的那个真人**逐发同步**，一发不多一发不少（铁律 10）。
 
-    ★ **在飞的子弹另算**：`_flush_explosions()` 排在所有分支的最前面，
+    ★ **在飞的子弹另算**：`_advance_shells()` 排在所有分支的最前面，
     连「这一帧没有新位置点」「bot 正躺着」都不挡它 —— 那是句柄记账的硬要求
     （D34），漏一发就从此打不掉血。
     """
@@ -1594,7 +2341,10 @@ def _tick_bot(room, machine, seat_index):
         # ★★ **排在所有分支前面**：在飞的子弹一发都不能漏（见那个函数的
         #   注释）。bot 躺着、`/hold` 着、这一帧没有新位置点 —— 都不影响
         #   「上一发子弹该炸了」这个事实。
-        _flush_explosions(room, machine, now)
+        _advance_shells(room, machine, now)
+        # ★ 正在进行的那一下近身攻击同理：它的伤害判定是**物理**的
+        #   （动作走到第几帧、圈里有没有人），和 bot 躺没躺着无关。
+        _advance_dash(room, machine, now)
     except botsync.SyncInvariantError as error:
         machine.sync.broken = True
         machine.log(f"   ★★ 同步流不变式被破坏，已停掉这个 bot 的同步: {error}")
@@ -1628,9 +2378,23 @@ def _tick_bot(room, machine, seat_index):
         #     看 bot 隔着地形还打不打得到（`line_blocked`，§29）。
         x, y = machine.battle_pos
         jumped, on_ground, vx, vy, fast_run, crouch = 0, True, 0, 0, False, False
+        machine.move_at = now       # 站住期间不积欠时间，放开时才不会跨一大步
     else:
-        rank = room.bot_seats().index(seat_index) + 1
-        point = trail_point(leader.sync_trail, BOT_FOLLOW_DISTANCE * rank)
+        # ★★ **自己走位**（M5 / §71）：对战房里 bot 按地形自己挪，
+        #   闯关房和「还没落地」两种情形 `_own_step()` 会返回 None ——
+        #   那就退回 D16 那条老路，回放真人的轨迹。
+        terrain = mapdata.load(_current_map(room))
+        # ★ 先算一次「站在**现在**这个位置打不打得到」：走不走就看它
+        #   （`_move_intent` 的第 1 条）。移动之后下面还会再算一次，
+        #   那一次才是真正用来开枪的 —— 枪口坐标必须和这一帧的心跳一致（§62）。
+        standing_shot = (None if machine.weapon is None
+                         else _fire_target(room, machine, seat_index,
+                                           machine.weapon))
+        point = _own_step(room, machine, seat_index, terrain,
+                          standing_shot, now)
+        if point is None:
+            rank = room.bot_seats().index(seat_index) + 1
+            point = trail_point(leader.sync_trail, BOT_FOLLOW_DISTANCE * rank)
         if point is None:
             return
         x, y, jumped, on_ground, vx, vy, fast_run, crouch = point
@@ -1691,7 +2455,14 @@ def _tick_bot(room, machine, seat_index):
         #   让收方先按这一帧的心跳把 bot 挪到位，弹道起点才对得上。
         if BOT_DIAG_FIRE_ANYWHERE:
             _diag_why_not_firing(room, machine, seat_index, weapon, target, now)
-        if (target is not None and now >= machine.next_fire_at
+        # ★★ 体力：先按这一帧的姿势结算（蹲着回得快、冲刺跑要花），
+        #   再决定近身那一下打不打得起。三个速率全是 `GameProps.ini` 的。
+        _regen_stamina(machine, now, crouched=bool(crouch), fast_run=fast_run)
+        # ★★ **近身冲刺攻击优先于开枪**（§64）：原版这一下会占住整个角色
+        #   （`TotalFrame` 那么多帧），真人也开不了枪。够得着就冲，够不着才打枪。
+        dashing = _try_dash(room, machine, seat_index, now, on_ground)
+        if (not dashing and machine.dash_swing is None
+                and target is not None and now >= machine.next_fire_at
                 and _may_fire(machine, weapon)):
             _try_fire(room, machine, seat_index, weapon, target, now)
     except botsync.SyncInvariantError as error:

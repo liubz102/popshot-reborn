@@ -108,11 +108,11 @@ V0.3 立三条硬规矩：
 | `game_org/` | **原始安装结果，只读，永不修改**（不在本工作副本里，见下方「素材在哪」） |
 | `原版安装包/` | **原始安装包（368MB NSIS），只读** |
 | `Pack_decrypt/` | **解开的 `Pack\*.pkn` 资源树，只读参考**。★ V0.3 的地图地形数据就从 `Pack_decrypt/Maps/*.map` 提取 |
-| `tools/` | 便携逆向工具（x64dbg / Scylla / Ghidra / Sysinternals）+ 自写探针、启停脚本、打包脚本。★ V0.3 新增 `mapdata.py` + `update-mapdata.bat`、`weapondata.py` + `update-weapondata.bat`。★ 逆向工具箱是 **`re_bs.py`**（`xref` / `dis` / `func` / `str` / `callers`，capstone 直接读 `re/BigShot_22524.img`）|
+| `tools/` | 便携逆向工具（x64dbg / Scylla / Ghidra / Sysinternals）+ 自写探针、启停脚本、打包脚本。★ V0.3 新增 `mapdata.py` + `update-mapdata.bat`、`weapondata.py` + `update-weapondata.bat`、`chrprops.py` + `update-chrprops.bat`。★ 逆向工具箱是 **`re_bs.py`**（`xref` / `dis` / `func` / `str` / `callers`，capstone 直接读 `re/BigShot_22524.img`）|
 | `re/` | 逆向产物：`BigShot_22524.exe`、`packets.txt`、`rtti_types.txt`、`vftables.json`（机械生成，**别手改**）、★ **`packet_api.md`** |
 | `hook/` | MSVC x86 工程：`bshook.dll`（注入）+ `bsloader.exe`（启动器） |
 | `updater/` | 自研更新器（C 工程），编译产物是 `game_patched\BsPatcherChn.exe` |
-| `server/` | Python 服务端（**单机假服务器和云端服务端是同一套代码**）。★ V0.3 新增 `bot.py` / `botsync.py` / `mapdata.py` / `weapondata.py` / `botai.py`，以及两份产物 **`bot_mapdata/`**（地形）和 **`bot_weapons.json`**（武器表）—— 都进 git、进两个包。★ `server/data/` **只装用户数据**（`accounts.json` / `tickets.json`，都 `.gitignore`），别往里塞产物（D22） |
+| `server/` | Python 服务端（**单机假服务器和云端服务端是同一套代码**）。★ V0.3 新增 `bot.py` / `botsync.py` / `ballistics.py` / `mapdata.py` / `weapondata.py` / `chrprops.py`，以及三份产物 **`bot_mapdata/`**（地形）、**`bot_weapons.json`**（武器表）、**`bot_chrprops.json`**（角色碰撞圆 + 冲刺招式 + 体力常量）—— 都进 git、进两个包。★ `server/data/` **只装用户数据**（`accounts.json` / `tickets.json`，都 `.gitignore`），别往里塞产物（D22） |
 | `runtime/python/` | 内置 CPython 3.14.3 x64 embeddable |
 | `runtime-win7/python/` | **Win7 兼容运行时** CPython 3.8.10 win32。★ 改服务端代码后顺手 `runtime-win7\python\python.exe server\run_tests.py`，别把 3.8 兼容性弄丢 |
 | `runtime-linux/` | 服务端包发给 Linux 的那份 CPython 3.14.7，**故意不解压** |
@@ -177,6 +177,14 @@ D:\git\popshot-reborn\main\Pack_decrypt\Data\        ← ChrProps.ini / map.ini 
     全部按**收到那一发广播**触发，不许用定时器凑。
     唯一例外是物理上根本等不到事件的地方（重生倒计时、AI 反应延迟），
     这时要在注释里写清「这里为什么等不到事件」。
+11. ★ **V0.3 新增：bot 的行为规则只能来自原版，权衡留给 AI**（D50，已经犯过两次）。
+    来源只有两个：① 原版代码 / 数据里真实存在的机制（体力、冷却、射程、碰撞组）；
+    ② 语料里量得出来的真人打法。两个都没有的**不许自己发明**。
+    尤其不许这样推理：「这么做会吃亏 ⇒ 所以不许这么做」—— 吃亏是事实，
+    「不许」是**替玩家做的决定**。正确做法是**照做，并把代价如实结算**
+    （自伤要掉血），把「值不值得」留给以后真正的 AI 层。
+    定规则前先问一句：**真人对局的时候是什么样的？** 答不上来就是凭空造的。
+    （已经删掉的两条：D47「保持交战距离」、D50「不往自己爆炸半径开炮」。）
 
 ## 环境速查
 

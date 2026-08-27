@@ -85,7 +85,19 @@ _HEADER_TAIL = struct.Struct("<HHHH")
 OP_CHANGE_WEAPON = 0x0001
 OP_FIRE = 0x0002
 OP_EXPLODE = 0x0003
+#: `0x0004 rpSplashDamaged` —— **溅射伤到了谁**（body 33 字节，§67）。
+#:
+#: 收方在处理 `rpExplode` 时会替带 `SplashRange` 的武器创建一个
+#: `SplashDamage` 对象（§54 那个多出来的句柄），但**算伤害的还是射手那台
+#: 机器**（`0x47eb4e` 的 `IsMine || IsNeutral` 守卫）。bot 没有本机 ⇒
+#: 不补这一发，火箭 / 手雷炸在人脚边一滴血都不掉。
+OP_SPLASH_DAMAGED = 0x0004
+
 OP_JUMP = 0x0006
+
+#: `0x0007 rpDash` —— **双击左右方向键的近身攻击**（body 11 字节，§64）。
+#: 消耗体力（`ChrProps.ini` 的 `DashNN-SpCost`），伤害由射手那台机器自己判。
+OP_DASH = 0x0007
 
 #: `0x000b rpCrouch` —— **蹲下 / 起立**（body 2 字节，§41）。
 #:
@@ -524,9 +536,37 @@ def heartbeat_body(next_event_seq, seat, state):
 #: 发送方 100% 一致、0 例外。
 FIRE_SOURCE_PLAYER_BASE = 10
 
-#: `rpFire` body `+1`：武器槽 / 发射源。玩家 1~5、怪恒 8、道具 255。
-#: 语料里玩家发的绝大多数是 1。
-FIRE_SLOT_DEFAULT = 1
+#: ★★★ `rpFire` body `+1` = 发射者的**碰撞排除组**（§63）。**不是武器槽。**
+#:
+#: 收方把这一格原样写进弹体的 `[proj+0x15c]`（`0x4921ad` → `0x47d7ca`），
+#: 而三处碰撞判定 —— `0x47e01e`（该不该撞的谓词）、`0x48042e`（弹体逐对象
+#: 扫描）、`0x47e2cc`（火箭末段追踪选目标）—— 都拿它和对方的 `[char+0x15c]`
+#: 比：**相同就整个跳过这次碰撞**。`0` 是特例，撞所有人。
+#:
+#: 取值口径（65927 发语料 + `0x4fb848` 逐指令）：
+#:
+#:     组队战 / 闯关   队伍号 1 或 2      ← 队友之间不碰撞（友军伤害关掉）
+#:     个人战          座位号 + 1        ← 各是各的组，人人可打
+#:     怪              8
+#:     道具 / 陷阱     255
+#:
+#: 填错的后果是**静默**的：填成 1 的话，个人战里座位 0 那个人的身上
+#: 一发都撞不着（组号相同），弹体从他身体里穿过去 —— 而服务端自己发的
+#: `rpExplode` 照样扣血，于是「明明躲开了还掉血」。
+FIRE_GROUP_MONSTER = 8
+FIRE_GROUP_ITEM = 255
+
+
+def fire_group(seat_index, team=0):
+    """这个座位的弹体该盖哪个碰撞排除组（§63）。
+
+    `team` 就是 `lobby.Seat.team`（`TEAM_NONE` / `TEAM_A` / `TEAM_B`）——
+    组队和闯关房里它是 1 / 2，个人战里是 0。
+    """
+    team = int(team)
+    if team in (1, 2):
+        return team
+    return (int(seat_index) & 0xFF) + 1
 
 #: `rpFire` body `+22`：一次打几发。6975 : 45 : 20 = 1 : 2 : 3。
 #: ★ 收侧把它当**弹体总数**用：外层轮数 = `count / SpreadFrags`（整数除法），
@@ -545,21 +585,26 @@ _FIRE = struct.Struct("<BBiffffi")
 _EXPLODE = struct.Struct("<iiffiif")
 _JUMP = struct.Struct("<BB")
 _CROUCH = struct.Struct("<BB")
+_DASH = struct.Struct("<Bbbff")
 _CHANGE_WEAPON = struct.Struct("<Bi")
 
 
 def fire_body(seat, ammo_id, x, y, angle, power,
-              slot=FIRE_SLOT_DEFAULT, shots=FIRE_SHOTS_DEFAULT):
+              group=None, shots=FIRE_SHOTS_DEFAULT):
     """`0x0002 rpFire`（26 字节）。
 
     `angle` 是**弧度**（调用方 `atan2`，`0x4176bc`），`power` 实测 1~130。
+    `group` = 碰撞排除组（`fire_group()` 算的那个，§63）；不给就按
+    「个人战」当作 `座位 + 1` —— **别再填死 1 了**，那正是「躲开了还掉血」。
 
     ★ **包里没有弹体句柄** —— 收方按同样顺序自己分配。这就是「丢一发就
     永久错位、打不死人」的机制（V0.2 §216 / §217），也是 D5 那三条不变式
     存在的全部理由。
     """
+    if group is None:
+        group = fire_group(seat)
     return _FIRE.pack(FIRE_SOURCE_PLAYER_BASE + (int(seat) & 0xFF),
-                      int(slot) & 0xFF, int(ammo_id),
+                      int(group) & 0xFF, int(ammo_id),
                       float(x), float(y), float(angle), float(power),
                       int(shots))
 
@@ -607,6 +652,67 @@ def crouch_body(seat, down=True):
     **体力恢复 × 2**（`0x507250`）。
     """
     return _CROUCH.pack(int(seat) & 0xFF, 1 if down else 0)
+
+
+_SPLASH = struct.Struct("<iifBffffi")
+
+
+def splash_body(source_handle, target_handle, damage, x, y,
+                push_x=0.0, push_y=0.0):
+    """`0x0004 rpSplashDamaged`（33 字节）：**这个爆炸溅到了那个人**（§67）。
+
+    ```
+    +0   i32  伤害源的句柄（弹体 / 溅射对象 / 冲刺伤害对象）
+    +4   i32  ★ 受害者的**角色句柄**（`character_handle()`）
+    +8   f32  ★ 伤害值
+    +12  u8   语料 13160 发**恒 0**
+    +13  f32  击退向量 X（±15 / ±4 那一类）
+    +17  f32  击退向量 Y（观测多为负 = 往上顶）
+    +21  f32  受击点 X
+    +25  f32  受击点 Y
+    +29  i32  语料 13160 发**恒 0**
+    ```
+
+    出处：组包点 `0x492b83`（§23 已经量出长度 33 和字段宽度），字段含义是
+    从 13160 发真人语料反推的 —— `+4` 全部是 `座位×100000+100001` 那一族
+    角色句柄，`+8` 落在 0~23 的整数伤害上，`+21/+25` 是地图坐标。
+
+    ⚠ 这一发**不吃弹体句柄**（它不创建对象，只是报「谁被溅到了」），
+    但它是事件包，照样吃一个事件序号。
+    """
+    return _SPLASH.pack(int(source_handle), int(target_handle), float(damage),
+                        0, float(push_x), float(push_y),
+                        float(x), float(y), 0)
+
+
+#: 冲刺攻击的方向（body `+1`）。客户端 `0x515b32` 双击 ← 发 `-1`、
+#: `0x515b9a` 双击 → 发 `+1`。
+DASH_LEFT = -1
+DASH_RIGHT = 1
+
+
+def dash_body(seat, direction, index, x, y):
+    """`0x0007 rpDash`（11 字节）：**双击左右方向键的近身攻击**（§64）。
+
+    ```
+    +0  u8   座位号
+    +1  i8   方向：-1 左 / +1 右   ← `0x515b32` push -1 / `0x515b9a` push 1
+    +2  u8   第几式（`ChrProps.ini` 的 `DashNN`，0..5）← `[char+0x5d0]`
+    +3  f32  发起时的角色 X       ← `[char+0x34]`
+    +7  f32  发起时的角色 Y       ← `[char+0x38]`
+    ```
+
+    出处：组包点 `0x492d83`（三发 `0x5d5901` 一字节 + 两发 `0x5d591f` 四字节），
+    调用现场 `0x51515c`（`push [char+0x2ac]` = 座位号、`lea esi,[char+0x34]`
+    = 坐标），再往上就是 `0x515b03` / `0x515b6a` 那两段**双击判定**
+    （同一个方向键两次按下相隔 `< 0xfa` = 250 ms）。
+
+    ★ 伤害**不在这一发里** —— `ChrProps.ini` 的 `DashNN-Damage`
+    是射手那台机器自己算的，命中之后另发扣血包。bot 这边同理（`bot.py`）。
+    """
+    return _DASH.pack(int(seat) & 0xFF,
+                      DASH_RIGHT if int(direction) >= 0 else DASH_LEFT,
+                      int(index) & 0xFF, float(x), float(y))
 
 
 def change_weapon_body(seat, weapon_id):
@@ -754,7 +860,7 @@ class BotSyncStream:
             self.projectiles = 0
 
     def fire(self, ammo_id, x, y, angle, power, handle_step, shots=1,
-             source_seat=None, **kwargs):
+             source_seat=None, group=None, **kwargs):
         """一发 `rpFire`，**同时把句柄记账推进**。返回 `(包, 头一颗弹体的句柄)`。
 
         ★★ 组包和记账**必须在一次加锁里做完**：句柄是「收方按到达顺序自己
@@ -770,6 +876,10 @@ class BotSyncStream:
         多出来的那些是爆炸时才创建的溅射对象，所以这个数只在
         「本发的 `rpExplode` 全发完之前不开下一枪」的前提下成立 ——
         闸门在 `bot.py`（`_pending_explosions`）。
+
+        `group` = body `+1` 的**碰撞排除组**（§63）。不给就退成
+        「个人战」口径（座位 + 1）—— 组队房里调用方必须自己传队伍号，
+        否则 bot 的子弹会从队友身上穿过去 / 撞在本该无视的人身上。
         """
         shots = int(shots)
         _require(1 <= shots <= FIRE_SHOTS_MAX,
@@ -786,8 +896,33 @@ class BotSyncStream:
             packet = self.event(OP_FIRE, fire_body(
                 self.conn.my_seat if source_seat is None else int(source_seat),
                 ammo_id, x, y, angle, power,
-                shots=shots, **kwargs))
+                group=group, shots=shots, **kwargs))
             self.projectiles += int(handle_step)
+            return packet, handle
+
+    def dash(self, direction, index, x, y):
+        """一发 `rpDash`（近身冲刺攻击），**同时把句柄记账推进 1**。
+
+        返回 `(包, 这一下的伤害对象句柄)`。
+
+        ## ★★★ 为什么这里也要动句柄
+
+        收方处理 `rpDash` 时会创建一个 `DashDamage` 对象（`0x502229` 那一发
+        `ProjectileMgr::Add`），它和弹体**共用同一个句柄计数器** ——
+        也就是说**每发一次冲刺，收方那一格就往前走一格**。
+        服务端不跟着走，之后每一发 `rpExplode` 都会对不上号、被静默丢弃，
+        表现是「子弹照飞、一滴血不掉」，而且一局之内不自愈（§42）。
+
+        **消耗恰好 1 个**是从语料量出来的（§64）：按「上一发 `rpFire` 的
+        基址 + `handle_step`」预测下一发的基址，中间夹 0 / 1 / 2 / 3 发
+        `rpDash` 时残差分别是 0 / 1 / 2 / 3，占比和「不夹 dash」那一档的
+        基线噪声一样（2392/2640 对 27076/32838）。
+        """
+        with self._lock:
+            handle = projectile_handle(self.conn.my_seat, self.projectiles)
+            packet = self.event(OP_DASH, dash_body(
+                self.conn.my_seat, direction, index, x, y))
+            self.projectiles += 1
             return packet, handle
 
     # -- 投递 ---------------------------------------------------------------

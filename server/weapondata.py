@@ -31,7 +31,9 @@ import os
 #: 也不要按错的布局解出一把参数乱七八糟的武器。
 #: ★ 2（会话 14）：加了 `shots`，`handle_step` / `usable` 的口径也变了，
 #:   跟 `tools/weapondata.py` 的 `FORMAT` 必须一起动。
-FORMAT = 2
+#: ★ 3（会话 19）：`usable` 收紧成只放行 `CreatingClass=GeneralBullet`（§70）
+#:   —— 分裂弹 / 火墙 / 炮台那几类会在收方**多吃句柄**，按老口径记账会永久错位。
+FORMAT = 3
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "bot_weapons.json")
@@ -63,6 +65,45 @@ class Weapon(object):
     def damage(self):
         """`rpExplode +24` 要填的伤害。★ 收方原样拿去扣血，不会重算（§42）。"""
         return int(self.raw.get("damage", 0))
+
+    @property
+    def head_damage(self):
+        """打在**头**那个圆上的伤害（`HeadDamage`）。没填就退回 `Damage`。"""
+        value = self.raw.get("head_damage")
+        return self.damage if value is None else int(value)
+
+    @property
+    def legs_damage(self):
+        """打在**腿**那个圆上的伤害（`LegsDamage`）。没填就退回 `Damage`。"""
+        value = self.raw.get("legs_damage")
+        return self.damage if value is None else int(value)
+
+    def damage_for(self, region):
+        """按命中部位挑伤害档（`chrprops.REGION_*`）。
+
+        ★ 这三档是原版的（`weapon.ini` 开头写着
+        `Damage 상대방에게 가해지는 데미지값` / `HeadDamage 헤드샷일 경우` /
+        `LegsDamage 다리에 맞았을 때`），**收方不重算**，填多少掉多少（§42）。
+        """
+        if region == "head":
+            return self.head_damage
+        if region == "legs":
+            return self.legs_damage
+        return self.damage
+
+    @property
+    def size(self):
+        """弹体自己的碰撞半径（`weapon.ini` 的 `Size` = 「데미지 사이즈」）。
+
+        判命中时和角色那三个圆的半径相加。没填按 0 算（当成一个点）。
+        """
+        return float(self.raw.get("size") or 0.0)
+
+    @property
+    def splash_damage(self):
+        """溅射伤害（`SplashDamage`）。没有就退回 `Damage`。"""
+        value = self.raw.get("splash_damage")
+        return self.damage if value is None else int(value)
 
     @property
     def handle_step(self):

@@ -31,8 +31,13 @@ $script:ServerExcludePattern = @(
 # 任何地方都不拷的目录/文件名。
 $script:JunkNames = @('__pycache__', '.pytest_cache', '.mypy_cache')
 
-# 地形提取一次构建只跑一次（build-menu 会连着调两个 builder）。
+# 三份产物的提取一次构建只跑一次（build-menu 会连着调两个 builder）。
+# ★★ **必须在这里先声明**：本文件开头是 `Set-StrictMode -Version 2.0`，
+#    没赋过值的 `$script:Xxx` 读出来会直接抛 `VariableIsUndefined`
+#    —— `Update-WeaponData` 原来就漏了这一句（整包回归还没跑过，所以没暴露）。
 $script:MapDataUpdated = $false
+$script:WeaponDataUpdated = $false
+$script:ChrPropsUpdated = $false
 
 # ---------------------------------------------------------------------------
 #  基础工具
@@ -264,7 +269,8 @@ function Get-ServerSourceFile([string]$Root) {
                         'account_store.py', 'netlisten.py', 'tickets.py',
                         'eventlog.py', 'lobby.py', 'relayserver.py', 'protocol.py',
                         'simple.py', 'udpsync.py', 'bot.py', 'botsync.py',
-                        'mapdata.py', 'weapondata.py', 'ballistics.py')) {
+                        'botmove.py', 'mapdata.py', 'weapondata.py',
+                        'ballistics.py', 'chrprops.py')) {
         if ($files -notcontains $must) { throw "server\$must 没被选中，打包脚本的过滤规则坏了" }
     }
     return $files
@@ -314,6 +320,9 @@ function Copy-ServerCode {
     $copied += (Copy-MapData -Root $Root -PackageRoot $PackageRoot)
     # 武器表（V0.3 M3b）：`server\weapondata.py` 读的就是它。
     $copied += (Copy-WeaponData -Root $Root -PackageRoot $PackageRoot)
+    # 角色属性表（V0.3 M5）：`server\chrprops.py` 读的就是它 —— 命中判定
+    # 要知道「人有多大」（三个碰撞圆）。
+    $copied += (Copy-ChrProps -Root $Root -PackageRoot $PackageRoot)
     return $copied
 }
 
@@ -342,6 +351,67 @@ function Copy-WeaponData {
     }
     Copy-One $src (Join-Path $PackageRoot 'server\bot_weapons.json')
     return @('bot_weapons.json')
+}
+
+function Copy-ChrProps {
+    <# 把 `server\bot_chrprops.json` 拷进包（**两个包都要**），并当场验收。
+
+       ★ 缺了它命中判定会退回**一组默认尺寸**（`chrprops.DEFAULT_SIZES`）——
+         所有角色一样大。不会炸，但大个子（角色 2 / 107）会变得难打，
+         而这种「说不上哪儿不对」的偏差在实机上几乎查不出来。
+         所以照 Copy-WeaponData 的风格：明显不对就炸，别打出半个包。 #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$PackageRoot
+    )
+    $src = Join-Path $Root 'server\bot_chrprops.json'
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+        throw "缺角色属性表：$src 不存在。先跑 tools\update-chrprops.bat"
+    }
+    # 原版 ChrProps.ini 有 17 个角色。少一大截说明提取跑了一半。
+    $table = Get-Content -LiteralPath $src -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($table.count -lt 10) {
+        throw "角色属性表只有 $($table.count) 个角色，明显不对，中止打包"
+    }
+    Copy-One $src (Join-Path $PackageRoot 'server\bot_chrprops.json')
+    return @('bot_chrprops.json')
+}
+
+function Update-ChrProps {
+    <# 打包前重跑一次角色属性表提取（对称于 Update-WeaponData）。
+
+       素材 `Pack_decrypt\Data\ChrProps.ini` 不在本工作副本里 ——
+       **找不到不算失败**（产物在仓库里，直接用）；素材在而解析失败就中止打包。 #>
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    if ($script:ChrPropsUpdated) { return }
+    $script:ChrPropsUpdated = $true
+
+    $py = 'C:\Python314\python.exe'
+    if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
+        $py = Join-Path $Root 'runtime\python\python.exe'
+    }
+    $script = Join-Path $Root 'tools\chrprops.py'
+    if (-not (Test-Path -LiteralPath $py -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $script -PathType Leaf)) {
+        Write-Host '        跳过角色属性提取：没有 Python 或 tools\chrprops.py' -ForegroundColor DarkGray
+        return
+    }
+    $probe = @(
+        (Join-Path $Root 'Pack_decrypt\Data\ChrProps.ini'),
+        (Join-Path $Root '..\..\main\Pack_decrypt\Data\ChrProps.ini')
+    )
+    $found = $false
+    foreach ($p in $probe) { if (Test-Path -LiteralPath $p -PathType Leaf) { $found = $true } }
+    if (-not $found) {
+        Write-Host '        跳过角色属性提取：这台机器上没有 Pack_decrypt\Data\ChrProps.ini，用仓库里现成的产物' -ForegroundColor DarkGray
+        return
+    }
+    & $py $script --quiet
+    if ($LASTEXITCODE -ne 0) {
+        throw "角色属性提取失败（tools\chrprops.py 退出码 $LASTEXITCODE），中止打包"
+    }
+    Write-Host '        角色属性表已重新提取' -ForegroundColor DarkGray
 }
 
 function Update-WeaponData {

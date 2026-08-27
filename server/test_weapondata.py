@@ -183,19 +183,35 @@ class RealTableTests(unittest.TestCase):
                 self.assertTrue(weapon.fire_interval_ms)
                 self.assertIsNotNone(weapon.raw.get("character"))
 
-    def test_every_playable_character_has_all_three_slots(self):
-        """★★ 用户 2026-08-26 报的那条：「所有角色应该都有 3 个武器能用」。
+    def test_every_playable_character_has_at_least_one_usable_weapon(self):
+        """★ 每个角色至少得有一把能用的枪，否则它的 bot 一枪都不放。
 
-        会话 14 之前不成立，两个原因叠在一起：`weapon.ini` 里角色 1 / 3 的
-        1 号武器节名是**大写** `[CH01-01]`（正则漏了，§45），
-        而 2 号武器全是抛物线、当时的 `_is_usable()` 一律排除。
+        ⚠ 会话 14 这一条曾经是「**三个槽位全可用**」（用户 2026-08-26 报的
+        「所有角色应该都有 3 个武器能用」）。会话 19 收紧了（§70）：
+        `CreatingClass != GeneralBullet` 的那些（分裂弹 / 火墙 / 炮台 /
+        反弹弹 / 定时炸弹）在收方会**额外创建对象、多吃弹体句柄**，
+        服务端按老公式记账就永久错位 —— 表现是「子弹照飞、一滴血不掉」，
+        而且静默。**宁可少几把枪，也不要一局打不出伤害。**
         """
         for character in self.PLAYABLE:
             slots = sorted(w.raw["slot"]
                            for w in weapondata.usable_for(character))
             with self.subTest(character=character):
-                self.assertEqual([1, 2, 3], slots,
-                                 f"角色 {character} 的可用槽位是 {slots}")
+                self.assertTrue(slots, f"角色 {character} 一把能用的枪都没有")
+                self.assertIn(1, slots, f"角色 {character} 连 1 号枪都不可用")
+
+    def test_only_plain_bullets_are_usable(self):
+        """★★★ §70 的回归钉子：只放行 `CreatingClass=GeneralBullet`。
+
+        语料按类分桶量出来的「上一发基址 + handle_step」残差：
+        `GeneralBullet` 88.4% 命中（基线），而 `AppleGrenade` 只有 39.9%
+        （主峰 +3，`SliceCount=4` 会分裂）、`FlamingBottle` 22.3%
+        （主峰 +9/+17，爆炸后铺一道火墙）。
+        """
+        for ammo in weapondata.usable():
+            weapon = weapondata.get(ammo)
+            self.assertEqual("GeneralBullet", weapon.raw.get("creating_class"),
+                             f"{ammo}（{weapon.raw.get('section')}）不是普通弹体")
 
     def test_the_uppercase_sections_are_not_dropped(self):
         """★ `[CH01-01]` / `[CH03-01]` 这两个大写节的回归钉子（§45）。"""

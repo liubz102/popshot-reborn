@@ -48,7 +48,8 @@ ROOT = os.path.dirname(HERE)
 #:
 #: 2（会话 14）：节名匹配改成**大小写不敏感**、加 `shots` 字段、
 #: `handle_step` 改成按弹体个数算、`usable` 放宽到抛物线和散射武器。
-FORMAT = 2
+#: ★ 3（会话 19）：`usable` **收紧**成只放行 `CreatingClass=GeneralBullet`（§70）。
+FORMAT = 3
 
 #: 节名 `chNNN-MM…`：NNN = 角色 id，MM = 武器序号。
 #: ★ 后面还可能跟 `SE` / `D1` / `R1` / `F1` / `a` / `Classic` 之类的后缀 ——
@@ -279,6 +280,11 @@ def build_table(sections):
 #: 表里没有第四种，真出现了就说明这份 ini 不是我们逆过的那一版。
 KNOWN_POWER_MODES = (0, 1, 2)
 
+#: ★★★ **唯一放行的 `CreatingClass`**（§70）。
+#: 别的类在收方会额外创建对象（分裂弹 / 火墙 / 炮台），从**同一个**弹体句柄
+#: 计数器里取号 —— 服务端按 `GeneralBullet` 的公式记账就会永久错位。
+PLAIN_BULLET_CLASS = "GeneralBullet"
+
 
 def _is_usable(record):
     """bot 允许用这把武器吗。
@@ -299,13 +305,41 @@ def _is_usable(record):
     4. **算得出开火间隔** —— 没有 `CoolingTime` 也没有 `ReloadTime` 的话
        bot 不知道该隔多久打一发；
     5. **`PowerControl` 是我们逆过的三种模式之一** —— 初速公式按它分流，
-       出现第四种就说明这份 ini 和逆向结论对不上，宁可不用。
+       出现第四种就说明这份 ini 和逆向结论对不上，宁可不用；
+    6. ★★★ **`CreatingClass` 必须是 `GeneralBullet`**（会话 19 加，§70）。
+
+    ## 为什么第 6 条非加不可（§70）
+
+    `handle_step = 弹体数 × (2 if 有溅射 else 1)`（§46）这条公式**只对
+    `GeneralBullet` 成立**。把 380 份语料按 `CreatingClass` 分桶，量
+    「上一发的基址 + handle_step」和下一发基址的残差：
+
+    ```text
+    GeneralBullet   25914 样本   残差 = 0 占 88.4%   ← 基线
+    TimeBomb          901        95.8%
+    SpiralKnife       864        97.2%
+    BounceBullet      832        92.2%
+    ★ AppleGrenade   2101        39.9%   主峰在 **+3**（SliceCount=4，会分裂）
+    ★ FlamingBottle  1144        22.3%   主峰在 **+9 / +17**（爆炸后铺一道火墙）
+    ★ SliceBullet     558        46.6%
+    ★ RasTurret       151        57.0%   （放的是炮台，不是子弹）
+    ```
+
+    带星的那几类在收方会**额外创建对象**（分裂弹、火墙、炮台），每一个都从
+    **同一个句柄计数器**里取号。服务端按 `GeneralBullet` 的公式记账 ⇒
+    从那一发起永久错位 ⇒ 后面每一发 `rpExplode` 都被静默丢弃 ——
+    「子弹照飞、一滴血不掉」，一局之内不自愈（§42）。
+
+    ⚠ `TimeBomb` / `SpiralKnife` / `BounceBullet` 的残差虽然和基线一样好，
+    **也不放行**：它们的**飞行**行为服务端没有模型（定时引爆、墙上反弹），
+    命中判定（§65）会算错落点。要放行得先把那几类的弹道逆出来。
     """
     return (record.get("character") is not None
             and record.get("handle_step")
             and record.get("damage", 0) > 0
             and record.get("fire_interval_ms")
-            and (record.get("power_control") or 0) in KNOWN_POWER_MODES)
+            and (record.get("power_control") or 0) in KNOWN_POWER_MODES
+            and record.get("creating_class") == PLAIN_BULLET_CLASS)
 
 
 def _preference(record):
