@@ -653,7 +653,7 @@ class BotSyncStream:
     """
 
     __slots__ = ("conn", "events", "_epoch_value", "_lock", "sent",
-                 "dropped", "broken", "projectiles", "announced")
+                 "dropped", "broken", "projectiles")
 
     def __init__(self, conn):
         #: 这条流属于哪个 `BotConn`（局号和座位号都从它身上问）。
@@ -669,10 +669,6 @@ class BotSyncStream:
         #: `BotConn.reset_battle_frame()` 调，那正好是开局 / 换图两处，
         #: 和 `gameserver.reset_sync_trails()` 同一个口径（D28 的硬约束 2）。
         self.projectiles = 0
-        #: ★★ **最近一发心跳报出去的 N**（§50）。收方拿 N 做 `FlushTo(N)`，
-        #: 所以「事件包 e 已经被交给收方的游戏逻辑」= `announced > e`。
-        #: 延后爆炸靠它判「那一发 `rpFire` 到底露面了没有」。
-        self.announced = 0
         #: 上一次组包时看到的局号，用来发现换代。
         self._epoch_value = None
         self._lock = threading.RLock()
@@ -702,23 +698,18 @@ class BotSyncStream:
         if value != self._epoch_value:
             self._epoch_value = value
             self.events = 0
-            # ★ 事件序号回 0 了，「报到第几个」也必须跟着回 0 ——
-            #   不清的话上一代那个大 N 会让新一代的事件包一发出去就被
-            #   当成「已经报过了」。
-            self.announced = 0
 
     # -- 组包 ---------------------------------------------------------------
     def heartbeat(self, state):
         """一发心跳。**N 恒等于已发出的事件包数**（不变式 2）。
 
-        ★★ 顺手记下 `announced` = 这一发报出去的 N。收方拿它 `FlushTo(N)`，
-        所以「**事件包 e 已经被交给游戏逻辑了**」这个事实 = `announced > e`。
-        `bot.py` 的延后爆炸靠它分流（§50）—— 那是个**事件**判据，
-        不是「等 XX 毫秒」。
+        ⚠ 心跳的 N **不是**「收方什么时候执行事件包」的开关（旧 §50 是这么
+        以为的，错了 —— 见 §52）：收方每帧都 flush，事件包一入队就把队列上界
+        抬到 `seq+1`。N 的作用是**丢包时的兜底上界** —— 它比收到的最大序号
+        还大，就说明中间有空洞，收方据此发 `0x4002` 讨重传。
         """
         with self._lock:
             self._sync_epoch()
-            self.announced = self.events
             body = heartbeat_body(self.events, self.conn.my_seat, state)
             # ★ 心跳的头 `+8` 恒 0（语料 67186 发只有这一个取值）——
             #   它没有任何可判新旧的原版字段，所以下行也绝不能双发。
@@ -763,7 +754,7 @@ class BotSyncStream:
             self.projectiles = 0
 
     def fire(self, ammo_id, x, y, angle, power, handle_step, shots=1,
-             **kwargs):
+             source_seat=None, **kwargs):
         """一发 `rpFire`，**同时把句柄记账推进**。返回 `(包, 头一颗弹体的句柄)`。
 
         ★★ 组包和记账**必须在一次加锁里做完**：句柄是「收方按到达顺序自己
@@ -785,10 +776,16 @@ class BotSyncStream:
                  f"一发打 {shots} 颗不合法（收侧 0x491f41 丢弃 ≥ 30 的整包）")
         _require(isinstance(handle_step, int) and handle_step >= shots,
                  f"弹体句柄步进 {handle_step!r} 小于弹体数 {shots}，这把武器不能用")
+        # ★ `source_seat` 只有**取证**才会传（`bot.BOT_DIAG_FIRE_ANYWHERE`）：
+        #   把 body `+0` 的 owner 换成别人的座位，看收方画不画得出来。
+        #   包头 `+1` **不动** —— 那一格决定包进哪条收包队列，动了序号就乱了。
+        #   ⚠ 换了 owner 之后句柄记账必然和收方对不上（收方按 body 的 owner
+        #     分配），所以这条路**只能用来看画面，不能用来验命中**。
         with self._lock:
             handle = projectile_handle(self.conn.my_seat, self.projectiles)
             packet = self.event(OP_FIRE, fire_body(
-                self.conn.my_seat, ammo_id, x, y, angle, power,
+                self.conn.my_seat if source_seat is None else int(source_seat),
+                ammo_id, x, y, angle, power,
                 shots=shots, **kwargs))
             self.projectiles += int(handle_step)
             return packet, handle

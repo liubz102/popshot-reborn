@@ -3130,6 +3130,12 @@ PEER_OP_JUMP = 0x0006
 #: 得自己把它记成状态，bot 回放到那一段时再补一发。组包在 `botsync.py`。
 PEER_OP_CROUCH = 0x000B
 
+#: ★ 诊断用（`note_human_fire`）：真人的 `rpFire` / `rpExplode`。
+#: 组包在 `botsync.py`（`OP_FIRE` / `OP_EXPLODE`），这里只为了把**真人此时
+#: 此地发的那一发**原样打进日志，好和 bot 的并排比（§53）。M3b 收口后删。
+PEER_OP_FIRE = 0x0002
+PEER_OP_EXPLODE = 0x0003
+
 #: `UdpPacket` 的内层 `0x4005` —— **加载进度**（body = 一个 int32，0..100，V0.3 §30）。
 #:
 #: ★ 服务端**不记**真人报的这个数了（D26：bot 的条一次性报满，不跟随真人）。
@@ -4272,6 +4278,8 @@ def reset_sync_trails(room, why):
         # ★ 换图 / 新一局客户端会把角色重建，蹲的状态跟着归零（`0x4ffc4a`），
         #   服务端这份记账也要一起清，否则 bot 会照着上一张图的姿势起步。
         conn.sync_crouch = False
+        # ★ 诊断（`note_human_fire`）：换图 / 新一局重新打第一发。M3b 收口后删。
+        conn.human_fire_logged = set()
         # bot 那一份（`bot.BotConn` 才有；真人身上没有这几个字段）。
         if conn.is_bot_conn():
             conn.reset_battle_frame()
@@ -4522,6 +4530,8 @@ class Conn:
     #   （Python 的 int 没有上限），换图 / 新一局都**不清** —— bot 那边存的
     #   是「我上一帧消费到哪个号」，两边一起往前走就行。
     sync_trail_seq = 0
+    #: ★ 诊断（`note_human_fire`）的类级默认 —— 控制通道造的假连接也得有。
+    human_fire_logged = frozenset()
 
     def __init__(self, sock, addr, args, accounts=None, tickets=None):
         global _seq
@@ -4642,6 +4652,9 @@ class Conn:
         self.sync_crouch = False
         # 记了几个位置点（bot 的帧事件）。见类级默认值。
         self.sync_trail_seq = 0
+        # ★ 诊断（`note_human_fire`）：本图已经打过日志的内层 opcode。
+        #   按状态翻转去重（铁律 10），一张图每种包只打第一发。M3b 收口后删。
+        self.human_fire_logged = set()
         # 本局关卡的状态**不在房间里时**用的那一份（协议试探 / 控制通道手搓包）。
         # 在房间里时用的是 `lobby.Room.quest`，见 `quest_state()`。
         self.solo_quest = RoomQuest()
@@ -7293,6 +7306,47 @@ class Conn:
                 self.peer_order.note_event(udpsync.peer_sequence(payload))
             self.forward_peer_data(payload, arrived)
 
+    def note_human_fire(self, payload):
+        """★ 诊断：**真人本图第一发 `rpFire` / `rpExplode`** 原样打进日志。
+
+        用户 2026-08-27 报「bot 的子弹看不见，真人的看得见」，而 bot 发的包
+        和 15 年前的语料逐字段比过是一致的（§53）。剩下唯一能一锤定音的，
+        就是拿**同一局、同一张图、同一把武器**下真人自己发的那一发来比 ——
+        语料再像也不是此时此地这一局。
+
+        ★ 打的格式和 `bot.py` 那行 `开火:` **刻意一致**，好并排看。
+        ★ 按状态翻转去重（铁律 10）：一张图每种包只打第一发，不刷屏。
+        ★ M3b 收口后连同 `human_fire_logged` 一起删。
+        """
+        opcode = udpsync.peer_opcode(payload)
+        if opcode not in (PEER_OP_FIRE, PEER_OP_EXPLODE):
+            return
+        if opcode in self.human_fire_logged:
+            return
+        # ★ 不用 `.add()`：类级默认是 `frozenset`（`BotConn` 不跑 `__init__`，
+        #   D1），照着改会 `AttributeError` 炸到真人那条线程上。
+        self.human_fire_logged = set(self.human_fire_logged) | {opcode}
+        head = payload[:udpsync.PEER_HEADER_SIZE]
+        body = payload[udpsync.PEER_HEADER_SIZE:]
+        seat, target = struct.unpack_from("<bb", head, 1)
+        epoch, csum, seq, inner = struct.unpack_from("<HHHH", head, 4)
+        detail = ""
+        if opcode == PEER_OP_FIRE and len(body) >= 26:
+            src, slot, ammo, fx, fy, ang, power, count = struct.unpack_from(
+                "<BBiffffi", body, 0)
+            detail = (f"；source {src}(座位{src - 10}) slot {slot} "
+                      f"ammo {ammo} 发射点 ({fx:.1f}, {fy:.1f}) "
+                      f"角度 {ang:.4f}rad 力度 {power:g} count {count}")
+        elif opcode == PEER_OP_EXPLODE and len(body) >= 28:
+            proj, tgt, ex, ey, kind, flags, damage = struct.unpack_from(
+                "<iiffiif", body, 0)
+            detail = (f"；弹体句柄 {proj} 目标句柄 {tgt} "
+                      f"爆炸点 ({ex:.1f}, {ey:.1f}) hit {kind} "
+                      f"flags {flags} 伤害 {damage:g}")
+        name = "rpFire" if opcode == PEER_OP_FIRE else "rpExplode"
+        self.log(f"   ★真人{name}: 头 座位{seat} 目标{target} 局号{epoch} "
+                 f"序号{seq}；body({len(body)}) {body.hex()}{detail}")
+
     def note_sync_position(self, payload):
         """把这一发同步数据里的**位置**记进轨迹（V0.3 M3）。
 
@@ -7388,6 +7442,7 @@ class Conn:
         #   （服务端没有任何地图几何，真人刚站过的点一定是合法地面，D16），
         #   M5 的瞄准也要用它。开销 = 一次定长 unpack，可以忽略。
         self.note_sync_position(payload)
+        self.note_human_fire(payload)
         # ★ 走 `PEER_RELAY.deliver` 而不是直接广播 `0x040f`：房里可能有人已经
         #   接上原版中继了，那些人要走中继收（原版路径），剩下的才走 `0x040f`。
         #   两条路在客户端进的是同一个入口 `0x407869`，谁收哪条都一样。

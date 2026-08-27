@@ -48,6 +48,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import math
+import os
 import threading
 import time
 
@@ -235,6 +236,9 @@ class BotConn(gameserver.Conn):
         #: ★ 服务端一点地图几何都没有（M4 才有），所以这个锚点是**跟着真人
         #:   走**的 —— 真人此刻站着的地方一定是合法地面（D16）。
         self.battle_pos = None
+        #: ★ 临时诊断（会话 17）：上一次打过的「为什么不开枪」，用来做状态翻转
+        #:   去重。跟 `BOT_DIAG_FIRE_ANYWHERE` 一起删。
+        self.diag_last_why = ""
         #: 现在朝哪走：`+1` 右 / `-1` 左。
         self.heading = botsync.FACING_RIGHT
         #: ★ 上一帧消费到的是**谁的第几个位置点**：`(座位号, sync_trail_seq)`。
@@ -252,8 +256,13 @@ class BotConn(gameserver.Conn):
         #:   —— 原版这把枪就是这个节奏，不是我拿一台机器观测出来的常量
         #:   （铁律 10 / D29）。
         self.next_fire_at = 0.0
-        #: 这一图的第一发开火日志打过了吗（按状态翻转去重，铁律 10）。
-        self.fire_logged = False
+        #: 这一图**每个距离档**的开火日志打过了吗（按状态翻转去重，铁律 10）。
+        #: key = `(武器 id, 飞行 tick 取整)` —— 贴脸打一行、远距离再打一行，
+        #: 因为「看不见子弹」在两个距离上都出现过，两边的字节都得留证。
+        #: ★ 诊断口径，M3b 收口后收回成「本图第一发」。
+        self.fire_logged = set()
+        #: 这一图命中 / 落空的爆炸日志各打过了吗（同上，诊断口径）。
+        self.explode_logged = set()
         #: ★ 已经用 `rpChangeWeapon` 向别人**声明过**的武器 id。
         #:   `None` = 还没声明。收方拿它换武器模型 —— 不发的话别人看见的是
         #:   客户端自己给的默认枪，和 bot 打出来的子弹对不上（会话 13 修）。
@@ -266,6 +275,15 @@ class BotConn(gameserver.Conn):
         #:   站住的时候照常发心跳（真人站着不动也发），只是坐标不再前进 ——
         #:   这样才好测「隔着墙打不打得到」（用户 2026-08-26 要的测试手段）。
         self.holding = False
+        #: ★ 诊断开关 `/noboom`：只发 `rpFire`、不发 `rpExplode`
+        #:   ⇒ 弹体一直飞不消失、一滴血不掉（§42）。用来分清「看不见子弹」
+        #:   到底是**弹体没造出来**还是**爆炸发得太早**。跨图保持。
+        #:   ★ M3b 收口后连同 `_cmd_noboom` 一起删。
+        self.no_explode = False
+        #: ★ 诊断开关 `/slow`：初速降到 1/10，子弹慢慢飞。配合 `/noboom` 用 ——
+        #:   「慢 10 倍 + 永不消失」的弹体要是还看不见，那就是**根本没画**，
+        #:   而不是「太快没注意到」。跨图保持。M3b 收口后删。
+        self.slow_bullet = False
         #: ★★ **这个弹匣里还剩几发**（`weapon.ini` 的 `MagazineCount`）。
         #:   `None` = 还没开过枪 / 这把武器没有弹匣。打空了就停 `ReloadTime`
         #:   再装满 —— **原版就是这么打的**，不停的话持续输出会高出好几倍
@@ -317,7 +335,8 @@ class BotConn(gameserver.Conn):
         self.pending_shots = []
         self.next_fire_at = 0.0
         self.rounds_left = None
-        self.fire_logged = False
+        self.fire_logged = set()
+        self.explode_logged = set()
         # ★ 换图 / 新一局客户端把角色重建，武器回到它自己的默认那把 ——
         #   这边不清的话 bot 以为「已经声明过了」，于是**不再发**
         #   `rpChangeWeapon`，别人看到的枪和它打出来的子弹从此对不上。
@@ -447,6 +466,7 @@ HELP_LINES = (
 BATTLE_HELP_LINES = (
     "战斗中：/hold N 让 bot 站住;  再敲一次恢复跟随",
     "/gun N M 换 bot 的武器（M=1~3）;  /gun N 看有哪些",
+    "查子弹: /noboom 只飞不炸;  /slow 降到 1/10 速",
 )
 
 
@@ -715,6 +735,81 @@ def _cmd_hold(conn, room, args):
     return None
 
 
+def _cmd_noboom(conn, room, args):
+    """`/noboom [N]` —— 让 bot **只发 `rpFire`、不发 `rpExplode`**（再敲一次恢复）。
+
+    ★★ **这是一件诊断工具，不是玩法**（M3b 收口后删）。用户 2026-08-26 报
+    「看不见子弹」，而「弹体到底有没有被造出来」在服务端这边看不出来 ——
+    句柄是**收方自己**按顺序分配的，服务端只是预测。
+
+    §42 查实：**不发 `rpExplode` 的话弹体不会消失，一直飞下去**。所以：
+
+    * 开着 `/noboom` 能看见子弹飞（而且飞出屏幕也不消失、一滴血不掉）
+      ⇒ 弹体造得出来、也会动 ⇒ 问题在**爆炸发得太早**（时序）；
+    * 开着也**什么都看不见** ⇒ 弹体压根没造出来或者不动
+      ⇒ 问题在 `rpFire` 的内容，得回去逐字段对。
+
+    ★ **不影响句柄记账**：句柄是开火那一刻分配的（§43），少发爆炸只是少一次
+    「让它消失」，收方那一格计数器照样对得上 —— 关掉开关就能接着打死人。
+    """
+    seats, error = _battle_bots(room, args)
+    if error:
+        return f"/noboom 用法：/noboom [座位号]（不给就是全部）。{error}"
+    changed = []
+    for index in seats:
+        machine = room.seats[index].conn
+        if not isinstance(machine, BotConn):
+            continue
+        machine.no_explode = not machine.no_explode
+        changed.append((index, machine.no_explode))
+    if not changed:
+        return "没有可以操作的 bot。"
+    on = [str(i) for i, flag in changed if flag]
+    off = [str(i) for i, flag in changed if not flag]
+    parts = []
+    if on:
+        parts.append(f"座位 {'、'.join(on)} 的子弹只飞不炸（也不掉血）")
+    if off:
+        parts.append(f"座位 {'、'.join(off)} 恢复正常爆炸")
+    conn.log(f"   /noboom: {changed}")
+    conn.room_system_chat("；".join(parts) + "。")
+    return None
+
+
+def _cmd_slow(conn, room, args):
+    """`/slow [N]` —— 把 bot 的子弹初速降到 1/10（再敲一次恢复）。诊断用。
+
+    ★★ 它和 `/noboom` 配合起来回答一个问题：「看不见子弹」到底是
+    **弹体没被画出来**，还是**画了但太快没注意到**。
+    慢 10 倍 + 永不消失的弹体要是还看不见，那就是前者，铁证。
+
+    ⚠ 抛物线武器的落点会偏（角度没重解）—— 这个开关只用来看轨迹。
+    ★ M3b 收口后连同 `_slow_shot` 一起删。
+    """
+    seats, error = _battle_bots(room, args)
+    if error:
+        return f"/slow 用法：/slow [座位号]（不给就是全部）。{error}"
+    changed = []
+    for index in seats:
+        machine = room.seats[index].conn
+        if not isinstance(machine, BotConn):
+            continue
+        machine.slow_bullet = not machine.slow_bullet
+        changed.append((index, machine.slow_bullet))
+    if not changed:
+        return "没有可以操作的 bot。"
+    on = [str(i) for i, flag in changed if flag]
+    off = [str(i) for i, flag in changed if not flag]
+    parts = []
+    if on:
+        parts.append(f"座位 {'、'.join(on)} 的子弹降到 1/10 速")
+    if off:
+        parts.append(f"座位 {'、'.join(off)} 恢复原速")
+    conn.log(f"   /slow: {changed}")
+    conn.room_system_chat("；".join(parts) + "。")
+    return None
+
+
 def _cmd_gun(conn, room, args):
     """`/gun N [M]` —— 给 bot 换武器（M = 槽位 1/2/3）；不给 M 就列出有哪些。
 
@@ -753,6 +848,14 @@ def _cmd_gun(conn, room, args):
         ok = "、".join(str(w.raw["slot"]) for w in choices)
         return f"{seat.nickname} 没有能用的 {slot} 号武器槽。可选：{ok}。"
     machine.weapon_slot = slot
+    # ★ **当场把新枪声明出去**（用户 2026-08-27 报的）：不发的话别人手里那把
+    #   枪要等到 bot **下一次开火**才变（`_declare_weapon` 原来只挂在
+    #   `_try_fire` 上）—— 房主敲完命令盯着看，模型半天不动，
+    #   过一会儿突然跳变。换枪是**这条命令**造成的事实，就该在这儿报出去。
+    #   ★ 只在战斗中发得出去（房间里 bot 还没有同步流）。
+    if room.is_playing():
+        with contextlib.suppress(botsync.SyncInvariantError):
+            _declare_weapon(machine, index, machine.weapon)
     conn.log(f"   /gun: 座位 {index} 的 {seat.nickname} -> 槽位 {slot} "
              f"= {chosen.id}({chosen.section}) 伤害 {chosen.damage} "
              f"步进 {chosen.handle_step} 间隔 {chosen.fire_interval_ms}ms")
@@ -778,6 +881,8 @@ COMMANDS = {
     "ready": _cmd_ready,
     "hold": _cmd_hold,
     "gun": _cmd_gun,
+    "noboom": _cmd_noboom,
+    "slow": _cmd_slow,
     "help": _cmd_help,
     "h": _cmd_help,
     "?": _cmd_help,
@@ -832,8 +937,58 @@ BOT_ENGAGE_RANGE = 1000.0
 BOT_LINE_STEP = 4
 
 #: 瞄准点相对目标落脚点抬高多少 —— 轨迹里记的是**脚下**的坐标，
-#: 而子弹要打在身上。★ 这个数是「角色多高」的一半，不是时序阈值。
-BOT_AIM_HEIGHT = 20.0
+#: 而子弹要打在身上。★ 这是**几何量**，不是时序阈值。
+#:
+#: ★★ 会话 18 从 20 抬到 `BOT_MUZZLE_HEIGHT`：20 是「角色多高的一半」的猜测，
+#: 而实测枪口就在脚下 **57** 个单位（§62）—— 按 20 瞄的话，bot 是端着肩膀
+#: 高的枪去打对方的小腿，平地上永远压着枪口打。两边都站在地上时，
+#: 「枪口对枪口」才是真人瞄的那条线。
+#: ★ 打不打得中和这个数**无关** —— 命中是服务端自己判的（D28），
+#: 瞄准点只决定角度、飞行时间和爆炸特效画在哪。
+BOT_AIM_HEIGHT = 57.0
+
+#: ★★★ 枪口相对**自己落脚点**的偏移 —— 这两个数是**实测**出来的（§62）。
+#:
+#: 会话 18 在客户端 hook 里把真人自己那一发 `rpFire` 的发射点和他角色当时的
+#: 坐标（`[char+0x34]/[0x38]`）并排打出来，量到的是
+#: **前方 43、上方 57**（角色 0「泰尔」，1 号枪）—— 那就是枪管的位置。
+#:
+#: 原来这里复用 `BOT_AIM_HEIGHT`（20），意思是「角色多高的一半」，结果枪口落在
+#: **自己膝盖那一格**、而且还往身后缩了几个单位。它挨着自己和目标的碰撞盒，
+#: 弹体**第一次推进就撞掉**：实机日志里 bot 的每一颗弹体都只被推进 **1 帧**、
+#: 位置一步没动过就没了（同一局里真人自己的子弹连飞 5 帧以上）。
+#: 那正是「别人看不见 bot 的子弹」—— 它根本没有行程。
+#:
+#: ★ 这是**几何量**（枪管在模型上的位置），不是时序阈值，铁律 10 管不着它。
+#: ⚠ 严格说每个角色的骨骼位置略有不同，这里取实测的那一组当统一值 ——
+#: 差几个单位不影响「弹体在不在两个碰撞盒外面」这件事。
+BOT_MUZZLE_HEIGHT = 57.0
+BOT_MUZZLE_FORWARD = 43.0
+
+
+def _muzzle(x, y, toward_x):
+    """bot 站在 `(x, y)`（落脚点）、朝 `toward_x` 开枪时，枪口在哪。
+
+    ★ 横向偏移**跟着朝向翻**：角色永远面朝准星（§37），枪口就在身前。
+    往身后放的话弹体一出生就在自己的碰撞盒里。
+    """
+    forward = BOT_MUZZLE_FORWARD if toward_x >= x else -BOT_MUZZLE_FORWARD
+    return (x + forward, y - BOT_MUZZLE_HEIGHT)
+
+#: ★★ **临时诊断开关**（会话 17，M3b 收口后连同 `/noboom` `/slow` 一起删）：
+#: 环境变量 `BOT_DIAG_FIRE_ANYWHERE=1` 时，`_fire_target()` 无视
+#: **交战距离**和**地形遮挡**，隔多远、隔几堵墙都照样开枪。
+#:
+#: 只为一件事：把「bot 的弹体在收方长什么样」这一份客户端日志取到手（§58）。
+#: 取证的人操纵不了角色走位（游戏用 DirectInput 读键盘，`keybd_event`
+#: 注入的方向键只能让角色转身、走不动），没这个开关就凑不到 1000 单位以内。
+#: ⚠ **不要在正常游玩时打开** —— bot 会隔着整张图和墙壁乱开枪。
+BOT_DIAG_FIRE_ANYWHERE = os.environ.get(
+    "BOT_DIAG_FIRE_ANYWHERE", "") not in ("", "0")
+if BOT_DIAG_FIRE_ANYWHERE:
+    print("[bot] ★★ BOT_DIAG_FIRE_ANYWHERE 已开 —— bot 会无视交战距离和地形"
+          "遮挡开枪，并逐帧报「为什么不开枪」。这是取证用的临时开关，"
+          "正常游玩别开。")
 
 
 def _followable_humans(room):
@@ -1033,24 +1188,36 @@ def _fire_target(room, machine, seat_index, weapon):
     if machine.battle_pos is None:
         return None
     x, y = machine.battle_pos
-    muzzle_y = y - BOT_AIM_HEIGHT
     terrain = mapdata.load(_current_map(room))
     best = None
     for index, conn in _hostile_humans(room, seat_index):
         tx, ty = conn.sync_trail[-1][:2]
         ty -= BOT_AIM_HEIGHT
-        span = math.hypot(tx - x, ty - muzzle_y)
-        if span > BOT_ENGAGE_RANGE:
+        if BOT_DIAG_FIRE_ANYWHERE:
+            # ★ 取证专用：真人站着不动时 `trail_point()` 会让 bot 贴到人身上
+            #   （§52），距离 0 的话 `ballistics.solve()` 解不出弹道、一颗
+            #   弹体都造不出来。这里改成往旁边**空放**一发 —— 要的只是
+            #   「弹体在收方长什么样」，打不打得中无所谓。
+            tx, ty = x + 400.0, y - BOT_MUZZLE_HEIGHT - 50.0
+        mx, my = _muzzle(x, y, tx)
+        span = math.hypot(tx - mx, ty - my)
+        if span > BOT_ENGAGE_RANGE and not BOT_DIAG_FIRE_ANYWHERE:
             continue
         if best is not None and span >= best[0]:
             continue                       # 已经有更近的了，弹道就别解了
-        shot = ballistics.solve(weapon, tx - x, ty - muzzle_y)
+        shot = ballistics.solve(weapon, tx - mx, ty - my)
         if shot is None:
             continue
-        if _path_blocked(terrain, x, muzzle_y, shot):
+        if (not BOT_DIAG_FIRE_ANYWHERE
+                and _path_blocked(terrain, mx, my, shot)):
             continue
         best = (span, index, (tx, ty), shot)
-    return None if best is None else (best[1], best[2], best[3])
+    if best is None:
+        return None
+    shot = best[3]
+    if machine.slow_bullet:
+        shot = _slow_shot(weapon, shot)
+    return (best[1], best[2], shot)
 
 
 def _declare_weapon(machine, seat_index, weapon):
@@ -1077,6 +1244,67 @@ def _declare_weapon(machine, seat_index, weapon):
         botsync.OP_CHANGE_WEAPON,
         botsync.change_weapon_body(seat_index, weapon.id)))
     return True
+
+
+#: ★ 诊断（`/slow`）的降速倍率。收方的初速是 `power × Velocity`
+#: （`0x4920a7`，`PowerControl=0`），所以 `power` 直接当倍率用。
+BOT_SLOW_FACTOR = 0.1
+
+
+def _slow_shot(weapon, shot):
+    """把这一发降到 `BOT_SLOW_FACTOR` 倍初速（诊断用，`/slow`）。
+
+    ★ 抛物线武器的**落点会偏**（角度没跟着重解）—— 这个开关是拿来
+    **看轨迹**的，要配合 `/noboom` 用，不看命中。
+    """
+    factor = BOT_SLOW_FACTOR
+    speed = shot.speed * factor
+    if weapon.power_control == ballistics.MODE_PLAIN:
+        power = factor
+    else:
+        power = ballistics.power_for_speed(weapon, speed)
+    return ballistics.Shot(shot.angle, power, speed, shot.ticks / factor,
+                           shot.gravity, shot.accel, shot.cap)
+
+
+def _diag_why_not_firing(room, machine, seat_index, weapon, target, now):
+    """★★ **临时诊断**（会话 17，跟 `BOT_DIAG_FIRE_ANYWHERE` 一起删）：
+    这一帧 bot 为什么没开枪。
+
+    **按状态翻转去重**（铁律 10 的口径）：原因和上一次一样就什么都不打，
+    真的换了原因才打一行 —— 所以 8 Hz 的帧率不会把日志刷爆。
+    """
+    if weapon is None:
+        why = "没有武器（weapondata 没给它挑出一把）"
+    elif machine.battle_pos is None:
+        why = "没有 battle_pos（这一局还没被放进地图）"
+    elif target is None:
+        hostiles = list(_hostile_humans(room, seat_index))
+        if not hostiles:
+            why = "没有敌对的真人（队伍分边？）"
+        else:
+            spans = []
+            x, y = machine.battle_pos
+            for index, conn in hostiles:
+                trail = getattr(conn, "sync_trail", None)
+                if not trail:
+                    spans.append(f"座位{index}=没有轨迹")
+                    continue
+                tx, ty = trail[-1][:2]
+                spans.append(f"座位{index}={math.hypot(tx - x, ty - y):.0f}")
+            why = ("挑不出目标（弹道解不出来 / 被地形挡住）；"
+                   f"我在 {x:.0f},{y:.0f} 距离 " + " ".join(spans))
+    elif now < machine.next_fire_at:
+        why = f"还在冷却，差 {machine.next_fire_at - now:.2f}s"
+    elif not _may_fire(machine, weapon):
+        why = f"上一发的爆炸还没发完（在飞 {len(machine.pending_shots)} 颗）"
+    else:
+        why = None                      # 这一帧真的开了枪
+    if why == machine.diag_last_why:
+        return
+    machine.diag_last_why = why
+    if why is not None:
+        machine.log(f"   ◆诊断 不开枪：{why}")
 
 
 def _may_fire(machine, weapon):
@@ -1154,35 +1382,68 @@ def _try_fire(room, machine, seat_index, weapon, target, now):
     """
     target_seat, point, shot = target
     x, y = machine.battle_pos
-    muzzle_y = y - BOT_AIM_HEIGHT
+    # ★ 必须和 `_fire_target()` 解弹道时用的是**同一个**枪口（同一个 `point[0]`
+    #   算出来的朝向），否则包里的发射点和飞行时间对不上。
+    muzzle_x, muzzle_y = _muzzle(x, y, point[0])
     _declare_weapon(machine, seat_index, weapon)
     # ★ 这一发 `rpFire` 会拿到的**事件序号** —— 延后爆炸要拿它判
     #   「收方那边这一发露面了没有」（§50）。
     fire_seq = machine.sync.events
+    # ★★ `/noboom` 开着时**句柄步进要跟着变小**（用户 2026-08-27 实机踩到）：
+    #   带溅射的武器每发多吃一个句柄，而那一个是**爆炸那一刻**收方创建
+    #   `SplashDamage` 时分配的（§54 —— 这条实验正好把 §46 的悬案定死了）。
+    #   不发爆炸 ⇒ 收方少分配一个 ⇒ 服务端照旧 +2 就会永久错开，
+    #   表现是「关掉 /noboom 之后再也打不中」。
+    step = weapon.shots if machine.no_explode else weapon.handle_step
+    # ★ 取证专用（`BOT_DIAG_FIRE_ANYWHERE`）：**每隔一发**把 `rpFire` 的
+    #   owner 换成目标真人的座位。收方那边一发是「bot 打的」、下一发是
+    #   「这个真人打的」，弹道完全一样、发射点完全一样 —— 屏幕上要是只看得见
+    #   一半，那差别就锁死在 owner 上，和弹体、武器、时序全都无关。
+    source_seat = None
+    if BOT_DIAG_FIRE_ANYWHERE and 0 <= target_seat < len(room.seats):
+        machine.diag_alt_source = not getattr(machine, "diag_alt_source", False)
+        if machine.diag_alt_source:
+            source_seat = target_seat
     packet, handle = machine.sync.fire(
-        weapon.id, x, muzzle_y, shot.angle, shot.power,
-        handle_step=weapon.handle_step, shots=weapon.shots)
-    if not machine.fire_logged:
-        # ★ **本图第一发打一行**（按状态翻转去重，铁律 10 的口径；每发都打的话
-        #   140 ms 一行会把日志刷爆）。句柄错位是整条链上**唯一**会静默失败的
-        #   地方（`0x492750` 查不到弹体就整个 return），实机看到「子弹飞过去
-        #   不炸」时，能对得上号的就只有这一行。
-        machine.fire_logged = True
+        weapon.id, muzzle_x, muzzle_y, shot.angle, shot.power,
+        handle_step=step, shots=weapon.shots, source_seat=source_seat)
+    if source_seat is not None:
+        machine.log(f"   ◆诊断 这一发用**座位 {source_seat}（真人）**的 owner 发出去")
+    # ★ **每个距离档打一行**（按状态翻转去重，铁律 10 的口径；每发都打的话
+    #   140 ms 一行会把日志刷爆）。句柄错位是整条链上**唯一**会静默失败的
+    #   地方（`0x492750` 查不到弹体就整个 return），实机看到「子弹飞过去
+    #   不炸」时，能对得上号的就只有这一行。
+    #   ★ 带上**完整包的十六进制**，好和 `gameserver.note_human_fire()` 打的
+    #     那行真人包并排逐字节比（§54 末尾）。
+    mark = (weapon.id, int(shot.ticks))
+    if mark not in machine.fire_logged:
+        machine.fire_logged.add(mark)
+        head, body = packet[:12], packet[12:]
         machine.log(f"   开火: 武器 {weapon.id}({weapon.section}) "
                     f"伤害 {weapon.damage} 弹体 {weapon.shots} 步进 "
-                    f"{weapon.handle_step}；节奏 弹匣 {weapon.magazine} 发 × "
+                    f"{step}；节奏 弹匣 {weapon.magazine} 发 × "
                     f"冷却 {weapon.cooling_ms}ms + 换弹 {weapon.reload_ms}ms"
                     f"（无弹匣的话按 {weapon.fire_interval_ms}ms 一发）；"
-                    f"弹道 {shot!r}；本图第一发的弹体句柄 {handle}；"
+                    f"弹道 {shot!r}；弹体句柄 {handle}；"
                     f"目标 座位{target_seat} 角色句柄 "
                     f"{botsync.character_handle(target_seat)}"
+                    f"；头 {head.hex()} body({len(body)}) {body.hex()}"
                     f"　★ 打不掉血 = 收方分配的句柄和这个对不上（§42）")
     _emit(machine, packet)
-    due = now + shot.seconds
+    # ★★ 飞行时间**不足客户端一个 tick**（32 ms）的，当作和开火**同一瞬间**
+    #   到达（§52）。收方的弹体每 tick 才推进一步，连一步都走不完的距离上
+    #   它根本没有可见的行程；这时候把爆炸往后排，只会让弹体飞过目标几百个
+    #   单位才消失 —— 爆炸特效在目标身上、弹体在几百单位开外，两头对不上。
+    #   ★ 这是**物理量**（客户端弹道的逻辑步长），不是观测出来的毫秒阈值。
+    instant = shot.ticks < 1.0
+    due = now if instant else now + shot.seconds
     for offset in range(weapon.shots):
         machine.pending_shots.append(
             (due, fire_seq, handle + offset, target_seat, weapon.damage, point))
     machine.next_fire_at = _reload_after_shot(machine, weapon, now)
+    if instant:
+        # 排完就冲，别等下一帧（下一帧已经是 125 ms 之后了）。
+        _flush_explosions(room, machine, now)
     return True
 
 
@@ -1205,24 +1466,21 @@ def _impact_point(room, target_seat, fallback):
     return (tx, ty - BOT_AIM_HEIGHT), True
 
 
-def _explosion_ready(machine, shot, now):
-    """这一发该炸了吗 —— **两个条件都要满足**。
+def _explosion_ready(shot, now):
+    """这一发该炸了吗 —— **飞到了就炸**，没有别的条件。
 
-    1. **飞到了**：`ballistics` 算出来的飞行时间过了（物理量）；
-    2. ★★ **那一发 `rpFire` 已经在收方露面了**：`sync.announced > fire_seq`。
+    ⚠ 会话 15 在这里加过第二个闸门「那一发 `rpFire` 被心跳报出去过」
+    （`sync.announced > fire_seq`，旧 §50 / D37），**已经删掉**：那条结论是
+    错的。收方的事件包**每帧**都 flush（`0x405810` 在每帧的网络 tick 里），
+    而且包一入队就把队列上界抬到 `seq+1`（`0x54bb8c` → `0x54bb66`）——
+    **根本不需要等心跳**。心跳的 N 只是丢包时的兜底上界。
+    详见 **§52**（推翻 §50）。
 
-    第 2 条是「**看得见弹体**」的全部原因（§50）。事件包进收方的 `PktQueue`
-    之后并不会立刻执行 —— 要等一发**心跳**带着更大的 N 来做 `FlushTo(N)`。
-    所以只要 `rpFire` 和 `rpExplode` 挤在同一个 N 里，收方就会在**同一瞬间**
-    造出弹体又把它炸掉 ⇒ 别人屏幕上「有开枪动画、看不见子弹、凭空掉血」
-    （用户 2026-08-26 报的）。近距离尤其必然：bot 跟在真人身后 120 个单位，
-    基础枪飞过去只要 38 ms，远小于一发心跳的间隔。
-
-    ⇒ 等「那一发 `rpFire` 被心跳报出去过」这个**事件**发生（不是等固定毫秒，
-    铁律 10）。这样爆炸至少排在下一个 N 里，收方那边弹体就有一整个心跳的
-    寿命，肉眼看得见。
+    多等一发心跳的实际后果是**反的**：弹体在收方每 tick 推进一步，白等
+    125 ms 就是白飞 390 个单位，爆炸特效在目标身上、弹体早飞到几百单位
+    开外 —— 越等越对不上。
     """
-    return shot[0] <= now and machine.sync.announced > shot[1]
+    return shot[0] <= now
 
 
 def _flush_explosions(room, machine, now):
@@ -1236,26 +1494,57 @@ def _flush_explosions(room, machine, now):
     if not machine.pending_shots:
         return
     # ★ 保险：事件序号只会往前走，除非换代把它清回 0（`_sync_epoch`）。
-    #   真发生了的话这些记录是上一代的，等不到 `announced` 追上来 ——
-    #   丢掉，别让它们把队列永久卡住（换代那一刻 `reset_battle_frame()`
-    #   本来就会把整队清掉，这里只是兜住万一的顺序问题）。
+    #   真发生了的话这些记录是上一代的，句柄早就作废了 —— 丢掉，别拿过期的
+    #   号去撞收方那个静默丢弃（换代那一刻 `reset_battle_frame()` 本来就会把
+    #   整队清掉，这里只是兜住万一的顺序问题）。
     machine.pending_shots = [s for s in machine.pending_shots
                              if s[1] < machine.sync.events]
-    ready = [s for s in machine.pending_shots if _explosion_ready(machine, s, now)]
+    ready = [s for s in machine.pending_shots if _explosion_ready(s, now)]
     if not ready:
         return
     machine.pending_shots = [s for s in machine.pending_shots
-                             if not _explosion_ready(machine, s, now)]
+                             if not _explosion_ready(s, now)]
+    if machine.no_explode:
+        # ★ 诊断开关（`/noboom`）：到点了也不发爆炸，让弹体一直飞下去。
+        #   记录照样出队 —— 句柄是开火那一刻分配的，少发爆炸不影响记账（§43）。
+        return
     for _due, _seq, handle, target_seat, damage, fallback in ready:
         (tx, ty), hit = _impact_point(room, target_seat, fallback)
-        _emit(machine, machine.sync.event(
+        packet = machine.sync.event(
             botsync.OP_EXPLODE,
             botsync.explode_body(
                 handle,
                 botsync.character_handle(target_seat) if hit else 0,
                 tx, ty,
                 hit_kind=(botsync.HIT_CHARACTER if hit else botsync.HIT_NONE),
-                damage=damage)))
+                damage=damage))
+        # ★ 诊断：命中 / 落空**各打一行**（按状态翻转去重，铁律 10），带完整
+        #   字节，好和 `note_human_fire()` 打的真人 `rpExplode` 并排比。
+        #   M3b 收口后删。
+        if hit not in machine.explode_logged:
+            machine.explode_logged.add(hit)
+            head, body = packet[:12], packet[12:]
+            machine.log(f"   爆炸: 弹体句柄 {handle} "
+                        f"目标 {'座位%d' % target_seat if hit else '落空'} "
+                        f"爆炸点 ({tx:.1f}, {ty:.1f}) 伤害 {damage}"
+                        f"；头 {head.hex()} body({len(body)}) {body.hex()}")
+        _emit(machine, packet)
+
+
+def _battle_started(room):
+    """这一局的战斗**真的开始了吗**（全员加载完、进了 stage 7）。
+
+    `room.battle.state == IN_GAME` 由 `0x0402` 推进，而
+    `reset_sync_trails()`（清轨迹 + 清 bot 的战斗帧）就挂在同一处 ——
+    所以「进了 IN_GAME」等价于「这一局的状态已经重新起过一份」。
+    ★ 拿不到 `battle` 的场合（控制通道造的假房间）按**已开始**算，
+    别把那条测试路径挡死。
+    """
+    battle = getattr(room, "battle", None)
+    state = getattr(battle, "state", None)
+    if state is None:
+        return True
+    return state == gameserver.StartGameHandshake.IN_GAME
 
 
 def _lying_dead(room, seat_index):
@@ -1287,6 +1576,18 @@ def _tick_bot(room, machine, seat_index):
     （D34），漏一发就从此打不掉血。
     """
     if machine.sync.broken:
+        return
+    if not _battle_started(room):
+        # ★★ **`0x0400` 到 `0x0402` 之间一动不许动**（用户 2026-08-27 的日志
+        #   里抓到的）：`0x0400` 一广播 bot 就被标记成「加载完」（D4），
+        #   而**真人还在读图**，他这段时间照发心跳 ⇒ bot 的帧被驱动起来了。
+        #   可这时候 `reset_sync_trails()` **还没跑**（它挂在 `IN_GAME` 上，
+        #   要等 `0x0402`），于是 bot 拿着**上一局残留的轨迹和句柄计数器**
+        #   开枪 —— 实测开局 37 ms 就打出一发，弹体句柄还是上一局的 200062。
+        #   收方那边换图时 `ForceReloadTerrain` 已经把计数器清成 200002 了，
+        #   两边从此**对不上号**（§42 那个静默丢弃）。
+        #   ⇒ 判据是**房间真的进了 stage 7** 这个事件（`0x0402`），
+        #     不是定时器（铁律 10）。
         return
     now = time.monotonic()
     try:
@@ -1388,6 +1689,8 @@ def _tick_bot(room, machine, seat_index):
         _emit(machine, machine.sync.heartbeat(state))
         # ★ 开火排在心跳**后面**：`rpFire` 里带的是自己的枪口坐标，
         #   让收方先按这一帧的心跳把 bot 挪到位，弹道起点才对得上。
+        if BOT_DIAG_FIRE_ANYWHERE:
+            _diag_why_not_firing(room, machine, seat_index, weapon, target, now)
         if (target is not None and now >= machine.next_fire_at
                 and _may_fire(machine, weapon)):
             _try_fire(room, machine, seat_index, weapon, target, now)

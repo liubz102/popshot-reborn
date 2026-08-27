@@ -2299,6 +2299,352 @@ static int try_patch_sum_rect_guard(void)
     return 1;
 }
 
+/* ========================================================================== */
+/* ★ M3b 诊断：弹体全字段快照 —— 查「bot 的子弹别人看不见」（V0.3 §53~§56）   */
+/*                                                                            */
+/*   已知：bot 的弹体在收方**确实存在**（打得掉血、爆炸动画正常，而            */
+/*   `OnExplode` 查不到弹体句柄就整个 return），但**从来没被画出来**；         */
+/*   同一台客户端上真人的子弹和自己的子弹都看得见。逐指令读过收侧的            */
+/*   `OnFire`（0x491f12）→ 工厂 → `BulletObj::Init`（0x47d6a1）→              */
+/*   `ProjectileMgr::Add`（0x473e7c）→ 每帧 tick（0x47de6a），**一处按        */
+/*   owner / 座位分流的分支都没有** —— 所以差别一定落在弹体对象的某个字段上。  */
+/*                                                                            */
+/*   两个 hook 把那个字段直接抓出来，不用再猜：                                */
+/*                                                                            */
+/*     1. `ProjectileMgr::Add`  每颗弹体登记那一刻打一份**全字段快照**         */
+/*        —— 自己开的枪、真人开的枪、bot 开的枪走的是同一个函数，              */
+/*        三份快照并排一比，差在哪一格一目了然。                               */
+/*     2. `BulletObj` 每帧 tick  按**整数位置翻转**去重打点                    */
+/*        —— 弹体动没动、往哪飞、飞到哪没的，一条轨迹就出来了。               */
+/*        （不动的弹体只会打第一行，所以静止的子弹不会刷屏。）                 */
+/*                                                                            */
+/*   ★ 这是**临时诊断**，M3b 收口后连同两个 detour 一起删。                    */
+/*     用 BSHOOK_PROJ_DIAG=0 可以关掉（默认开）。                              */
+/* ========================================================================== */
+#define PROJ_ADD_VA   0x00473E7Cu   /* ProjectileMgr::Add(proj)  __thiscall   */
+#define PROJ_TICK_VA  0x0047DE6Au   /* BulletObj vft+0x24：每帧推进 __thiscall*/
+#define PROJ_FIRE_VA  0x00491F12u   /* GameContext::OnFire  __thiscall ret 20 */
+#define MYSEAT_PP     0x0072E29Cu   /* [[0x72e29c]+0x1cc] = 我的座位号        */
+
+/* 偷 5 字节落在指令边界上，而且偷到的都不是相对跳转（搬到蹦床上不会错位）：
+     0x473e7c  b8 4e 6b 62 00     mov eax, 0x626b4e     ← 正好 5 字节
+     0x491f12  b8 c4 aa 62 00     mov eax, 0x62aac4     ← 正好 5 字节
+     0x47de6a  55 / 8b ec / 83 ec 14                    ← 1+2+3 = 6 字节 */
+static const unsigned char PROJ_ADD_SIG[5]  = { 0xB8, 0x4E, 0x6B, 0x62, 0x00 };
+static const unsigned char PROJ_TICK_SIG[6] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14 };
+static const unsigned char PROJ_FIRE_SIG[5] = { 0xB8, 0xC4, 0xAA, 0x62, 0x00 };
+
+static void *g_proj_add_tramp  = NULL;
+static void *g_proj_tick_tramp = NULL;
+static void *g_proj_fire_tramp = NULL;
+static volatile LONG g_proj_diag_patched = 0;
+
+static int proj_diag_enabled(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_PROJ_DIAG", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return 1;     /* 没设 = 开 */
+    return buf[0] != '0';
+}
+
+static int proj_my_seat(void)
+{
+    UINT_PTR *pp = (UINT_PTR *)MYSEAT_PP;
+    UINT_PTR ctx;
+    if (IsBadReadPtr(pp, 4)) return -1;
+    ctx = *pp;
+    if (!ctx || IsBadReadPtr((void *)(ctx + 0x1CC), 4)) return -1;
+    return (int)*(int *)(ctx + 0x1CC);
+}
+
+/* 句柄 -> owner（0x473e65）：h < 100000 是怪/中立(20)，否则 10 + 座位号 */
+static int proj_owner_of(int handle)
+{
+    if (handle < 100000) return 20;
+    return (handle - 100000) / 100000 + 10;
+}
+
+#define PF(off) (*(float *)(p + (off)))
+#define PI(off) (*(int   *)(p + (off)))
+#define PU(off) ((unsigned)*(UINT_PTR *)(p + (off)))
+
+static void proj_track_add(void *proj, int handle);
+static int proj_is_bullet(unsigned char *p);
+
+/* 把一个小对象的前 n 个 dword 原样倒出来（一行装得下），带 vftable。
+   浮点那几格顺手按 float 也印一遍 —— 缩放 / alpha 之类都是 float。 */
+static void proj_dump_obj(const char *tag, void *obj, int n)
+{
+    char hex[320], flt[320];
+    int i, hx = 0, fx = 0;
+    unsigned *w = (unsigned *)obj;
+
+    if (!obj || IsBadReadPtr(obj, (UINT_PTR)n * 4)) {
+        bslog("            %s = %08X（空 / 读不了）", tag,
+              (unsigned)(UINT_PTR)obj);
+        return;
+    }
+    for (i = 0; i < n && hx < 280; i++) {
+        float f;
+        memcpy(&f, &w[i], 4);
+        hx += _snprintf(hex + hx, sizeof(hex) - hx - 1, "%08X ", w[i]);
+        if (f > -1e6f && f < 1e6f && (f > 1e-6f || f < -1e-6f))
+            fx += _snprintf(flt + fx, sizeof(flt) - fx - 1,
+                            "[%d]=%.3f ", i, f);
+    }
+    hex[hx] = 0;
+    flt[fx] = 0;
+    bslog("            %s @%08X: %s | %s", tag, (unsigned)(UINT_PTR)obj,
+          hex, flt);
+}
+
+static void __cdecl proj_add_log(void *proj)
+{
+    unsigned char *p = (unsigned char *)proj;
+    int handle;
+
+    if (!p || IsBadReadPtr(p, 0x340)) return;
+    handle = PI(0xD0);
+    if (!proj_is_bullet(p)) return;      /* 角色 / 地图物件也走 Add，跳过 */
+    proj_track_add(proj, handle);
+    bslog("PROJ+   弹体 %08X vft %08X 句柄 %d owner %d（我的座位 %d）"
+          " | 发方(+2f8) %d 槽(+15c) %d 武器(+304) %d 定义(+308) %08X",
+          (unsigned)(UINT_PTR)p, PU(0x00), handle, proj_owner_of(handle),
+          proj_my_seat(), PI(0x2F8), PI(0x15C), PI(0x304), PU(0x308));
+    bslog("        位置(+34,38) (%.2f, %.2f)  渲染位(+2c,30) (%.2f, %.2f)"
+          "  速度(+120,124) (%.3f, %.3f)  重力(+314) %.4f  状态(+54) %d",
+          PF(0x34), PF(0x38), PF(0x2C), PF(0x30),
+          PF(0x120), PF(0x124), PF(0x314), PI(0x54));
+    bslog("        ★视觉 模型(+e8) %08X  特效(+e4) %08X  弹道线(+30c) %08X"
+          "  拖尾(+310) %08X  碰撞型(+32c) %d  寿命(+318,4) %d"
+          "  绑定(+8c) %08X",
+          PU(0xE8), PU(0xE4), PU(0x30C), PU(0x310), PI(0x32C), PI(0x31C),
+          PU(0x8C));
+    /* ★ 光看「指针非 0」不够 —— bot 和真人的四个视觉指针全都非 0，
+       模式也一样，可屏幕上就是只有真人的看得见。所以把那两个对象**的内容**
+       原样倒出来，一格一格比。 */
+    proj_dump_obj("特效(+e4)", (void *)(UINT_PTR)PU(0xE4), 20);
+    proj_dump_obj("拖尾(+310)", (void *)(UINT_PTR)PU(0x310), 20);
+    proj_dump_obj("线(+30c)", (void *)(UINT_PTR)PU(0x30C), 20);
+}
+
+/* ★ 只跟踪「`Add` 认出来是子弹」的那些对象 —— `ProjectileMgr` 那张 map 里
+   还躺着角色和一堆地图物件（实测 vft 有十来种），全打就淹了。
+   判据：`+0x304` 是个像样的武器 id、`+0x308` 是个像样的指针。
+   表是环形的，满了覆盖最老的一格。 */
+#define PROJ_TRACK_N 64
+static struct { void *obj; int handle, ticks; } g_proj_track[PROJ_TRACK_N];
+static int g_proj_track_next = 0;
+
+static int proj_is_bullet(unsigned char *p)
+{
+    int ammo = PI(0x304);
+    return ammo >= 1000000 && ammo <= 9999999 && PU(0x308) > 0x10000u;
+}
+
+static void proj_track_add(void *proj, int handle)
+{
+    int i = g_proj_track_next;
+    g_proj_track_next = (g_proj_track_next + 1) % PROJ_TRACK_N;
+    g_proj_track[i].obj = proj;
+    g_proj_track[i].handle = handle;
+    g_proj_track[i].ticks = 0;
+}
+
+/* ★ **每一次 tick 都打**，不去重 —— 这一版要回答的正是「到底被推进了几次」。
+   上一版按位置翻转去重，结果每颗弹体只出现一行，分不清「不动」和「只跑了
+   一帧」。子弹寿命就几百毫秒，一颗最多几十行，刷不爆。 */
+static void __cdecl proj_tick_log(void *proj)
+{
+    unsigned char *p = (unsigned char *)proj;
+    int i;
+
+    if (!p || IsBadReadPtr(p, 0x340)) return;
+    for (i = 0; i < PROJ_TRACK_N; i++) {
+        if (g_proj_track[i].obj != proj) continue;
+        if (g_proj_track[i].handle != PI(0xD0)) return;   /* 地址被复用了 */
+        g_proj_track[i].ticks++;
+        bslog("PROJ.   弹体 %08X 句柄 %d owner %d 第%d帧 位置(+34,38)"
+              " (%.2f, %.2f) 渲染(+2c,30) (%.2f, %.2f) 速度 (%.2f, %.2f)"
+              " 状态 %d 线 %08X",
+              (unsigned)(UINT_PTR)p, g_proj_track[i].handle,
+              proj_owner_of(g_proj_track[i].handle), g_proj_track[i].ticks,
+              PF(0x34), PF(0x38), PF(0x2C), PF(0x30),
+              PF(0x120), PF(0x124), PI(0x54), PU(0x30C));
+        /* ★ 弹道线 / 拖尾**每帧的内容**：光看「指针非 0」证明不了它被画了
+           —— 要看它有没有跟着弹体动。真人和 bot 并排比这几行就够了。 */
+        if (PU(0x30C))
+            proj_dump_obj("线(+30c)", (void *)(UINT_PTR)PU(0x30C), 20);
+        if (PU(0x310))
+            proj_dump_obj("拖尾(+310)", (void *)(UINT_PTR)PU(0x310), 20);
+        return;
+    }
+}
+
+#undef PF
+#undef PI
+#undef PU
+
+/* Add 是 __thiscall(ecx=mgr, [esp+4]=proj)：
+   进 detour 时 [esp]=返回地址、[esp+4]=proj；
+   pushad(32) + pushfd(4) 之后就是 [esp+0x28]。 */
+static __declspec(naked) void proj_add_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push dword ptr [esp + 0x28]
+        call proj_add_log
+        add  esp, 4
+        popfd
+        popad
+        jmp  dword ptr [g_proj_add_tramp]
+    }
+}
+
+/* 每帧 tick 是 __thiscall(ecx=弹体)，没有栈参数。pushad 不动寄存器，
+   所以 ecx 在 pushfd 之后仍是原值，直接 push 就行。 */
+static __declspec(naked) void proj_tick_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push ecx
+        call proj_tick_log
+        add  esp, 4
+        popfd
+        popad
+        jmp  dword ptr [g_proj_tick_tramp]
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* `OnFire`（0x491f12）—— 收方**实际解析出来**的那 8 个参数                    */
+/*                                                                            */
+/*   服务端日志里已经有它发出去的字节了，这里要的是收方**读成了什么**，以及    */
+/*   `who` 换算出来的那个角色对象在不在 —— OnFire 里两处按它分流：             */
+/*     `esi == 0` 走怪/中立那条（补 EffFire + 按 ctx 的缩放）；                */
+/*     `esi != 0` 才播开火动画（`Character::vft+0x13c` = Attack%02d）。        */
+/*   另外打一行「这一发该造几颗弹体」的分子分母：外层轮数 = count/SpreadFrags  */
+/*   （`0x491fa5` 的整数除法），**商为 0 的话一颗都不造**（0x491fb1 直接跳过   */
+/*   整个创建循环），而开火动画照播 —— 那正好是「看得见开枪、看不见子弹」。   */
+/* -------------------------------------------------------------------------- */
+static void __cdecl proj_fire_log(void *ctx, int who, int slot, int weapon_id,
+                                  float *pos, unsigned angle_bits,
+                                  unsigned power_bits, int count,
+                                  int sender_seat)
+{
+    int seat = -1;
+    UINT_PTR ch = 0;
+    float ax, pw, px = 0.0f, py = 0.0f, cx = 0.0f, cy = 0.0f;
+    int has_pos = 0, has_char_pos = 0;
+
+    memcpy(&ax, &angle_bits, 4);
+    memcpy(&pw, &power_bits, 4);
+    if (pos && !IsBadReadPtr(pos, 8)) {
+        px = pos[0];
+        py = pos[1];
+        has_pos = 1;
+    }
+    if (ctx && who >= 0 && who < 64
+        && !IsBadReadPtr((unsigned char *)ctx + 0x244 + who * 4, 4)) {
+        UINT_PTR *pp = (UINT_PTR *)MYSEAT_PP;
+        seat = *(int *)((unsigned char *)ctx + 0x244 + who * 4);
+        if (!IsBadReadPtr(pp, 4) && *pp && seat >= 0 && seat < 8
+            && !IsBadReadPtr((void *)(*pp + 0x1D0 + seat * 4), 4))
+            ch = *(UINT_PTR *)(*pp + 0x1D0 + seat * 4);
+    }
+    /* ★★ 射手角色**这一刻**在收方的世界坐标（`[char+0x34]/[0x38]`，§5.6）。
+       包里的发射点是服务端算的，角色的位置是收方自己插值 / 积分出来的
+       —— 两者要是差得远，子弹就是从一个和角色对不上的地方飞出去的，
+       屏幕上当然「看不见 bot 的子弹」。真人自己那一发是同一条链路，
+       正好当参照。 */
+    if (ch && !IsBadReadPtr((void *)(ch + 0x34), 8)) {
+        cx = *(float *)(ch + 0x34);
+        cy = *(float *)(ch + 0x38);
+        has_char_pos = 1;
+    }
+    bslog("FIRE>   who %d(座位 %d, 角色 %08X) 发方 %d 槽 %d 武器 %d"
+          " 发射点 (%.2f, %.2f) 角度 %.4f 力度 %.3f 颗数(+22) %d"
+          "  ← 我的座位 %d",
+          who, seat, (unsigned)ch, sender_seat, slot, weapon_id,
+          px, py, ax, pw, count, proj_my_seat());
+    if (has_char_pos)
+        bslog("        ★射手角色位置(+34,38) (%.2f, %.2f)  发射点−角色 "
+              "(%+.2f, %+.2f)%s",
+              cx, cy, has_pos ? px - cx : 0.0f, has_pos ? py - cy : 0.0f,
+              has_pos ? "" : "（包里没有发射点）");
+    else
+        bslog("        ★射手角色位置 = 读不到（角色对象 %08X）", (unsigned)ch);
+}
+
+/* __thiscall(ecx=this) + 8 个栈参数。pushad(0x20)+pushfd(4) 之后
+   [esp+0x28] 是第 1 个参数、[esp+0x44] 是第 8 个；每 push 一次 esp 减 4，
+   要取的槽位也往上挪 4，所以下面 8 条 `[esp+0x44]` 的偏移**故意都一样**。 */
+static __declspec(naked) void proj_fire_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push dword ptr [esp + 0x44]     /* senderSeat */
+        push dword ptr [esp + 0x44]     /* count      */
+        push dword ptr [esp + 0x44]     /* power      */
+        push dword ptr [esp + 0x44]     /* angle      */
+        push dword ptr [esp + 0x44]     /* pos*       */
+        push dword ptr [esp + 0x44]     /* weaponId   */
+        push dword ptr [esp + 0x44]     /* slot       */
+        push dword ptr [esp + 0x44]     /* who        */
+        push ecx                        /* this       */
+        call proj_fire_log
+        add  esp, 0x24
+        popfd
+        popad
+        jmp  dword ptr [g_proj_fire_tramp]
+    }
+}
+
+static int try_patch_proj_diag(void)
+{
+    unsigned char *a = (unsigned char *)PROJ_ADD_VA;
+    unsigned char *t = (unsigned char *)PROJ_TICK_VA;
+
+    if (g_proj_diag_patched) return 1;
+    if (IsBadReadPtr(a, sizeof(PROJ_ADD_SIG))
+        || IsBadReadPtr(t, sizeof(PROJ_TICK_SIG))) return 0;
+    if (g_proj_add_tramp == NULL) {
+        if (memcmp(a, PROJ_ADD_SIG, sizeof(PROJ_ADD_SIG)) != 0)
+            return 0;                      /* 还没解壳到这里，或不是这个版本 */
+        g_proj_add_tramp = install_inline_hook((void *)PROJ_ADD_VA,
+                                               proj_add_detour,
+                                               "弹体登记诊断");
+        if (!g_proj_add_tramp) return 0;
+    }
+    if (g_proj_tick_tramp == NULL) {
+        if (memcmp(t, PROJ_TICK_SIG, sizeof(PROJ_TICK_SIG)) != 0)
+            return 0;
+        g_proj_tick_tramp = install_inline_hook((void *)PROJ_TICK_VA,
+                                                proj_tick_detour,
+                                                "弹体推进诊断");
+        if (!g_proj_tick_tramp) return 0;
+    }
+    if (g_proj_fire_tramp == NULL) {
+        unsigned char *f = (unsigned char *)PROJ_FIRE_VA;
+        if (IsBadReadPtr(f, sizeof(PROJ_FIRE_SIG))
+            || memcmp(f, PROJ_FIRE_SIG, sizeof(PROJ_FIRE_SIG)) != 0)
+            return 0;
+        g_proj_fire_tramp = install_inline_hook((void *)PROJ_FIRE_VA,
+                                                proj_fire_detour,
+                                                "OnFire 参数诊断");
+        if (!g_proj_fire_tramp) return 0;
+    }
+    InterlockedExchange(&g_proj_diag_patched, 1);
+    bslog("PATCH   ★弹体诊断已装 @ %08X / %08X / %08X：收到 rpFire 打一行"
+          "解析出来的参数，每颗弹体登记时打一份全字段快照，之后按整数位置"
+          "翻转打轨迹（BSHOOK_PROJ_DIAG=0 可关）",
+          (unsigned)PROJ_FIRE_VA, (unsigned)PROJ_ADD_VA, (unsigned)PROJ_TICK_VA);
+    return 1;
+}
+
 /* -------------------------------------------------------------------------- */
 /* IME 闪退修复 3/3 —— 候选窗布局 0x430102 里 SumRect 之后还有一处裸解引用    */
 /*                                                                            */
@@ -3393,6 +3739,20 @@ static DWORD WINAPI patch_thread(LPVOID param)
             || !g_ime_cand_patched)
             bslog("PATCH   !! 超时未能 patch IME 闪退修复"
                   "（0x4269AB / 0x42515E / 0x4301B4 特征串一直对不上）");
+    }
+
+    /* ★ M3b 诊断：弹体全字段快照（临时，查完「看不见 bot 的子弹」就删）。
+       两个 hook 的目标函数都在战斗里才第一次跑，远晚于解壳窗口。 */
+    if (!proj_diag_enabled()) {
+        bslog("PATCH   BSHOOK_PROJ_DIAG=0 已设，不装弹体诊断 hook");
+    } else {
+        for (ticks = 0; !g_stop && !g_proj_diag_patched && ticks < 2000; ticks++) {
+            if (try_patch_proj_diag()) break;
+            Sleep(2);
+        }
+        if (!g_proj_diag_patched)
+            bslog("PATCH   !! 超时未能装弹体诊断"
+                  "（0x473e7c / 0x47de6a 的特征串一直对不上）");
     }
 
     if (!afk_kick_disabled()) {
