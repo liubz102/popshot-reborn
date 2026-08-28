@@ -3054,7 +3054,9 @@ class BotFireWallTests(BotFireRoom):
         # 把 alice 摆到第一团火上，再让时间往前走。
         spot = wall.spots[0]
         self.clear()
-        wall.born -= 3600.0
+        # ★ 快进：几道墙现在共用一条**绝对** tick 轴（§85），所以往回拨的是
+        #   `born_tick`，不是 `born`。拨 20 个 tick = 这一帧要补烧 20 个 tick。
+        wall.born_tick -= bot.BOT_FIRE_REBURN_TICKS
         self.walk(self.alice, [(spot[0], spot[1])])
         burns = [f for f in bot_frames(self.alice, self.bot_seat)
                  if header(f)["opcode"] == botsync.OP_SPLASH_DAMAGED]
@@ -3079,12 +3081,16 @@ class BotFireWallTests(BotFireRoom):
         # ★ 现造一道火墙摆在 alice 脚下，起点干净（不掺 `throw()` 那几道）。
         self.walk(self.alice, [(400, 100)])
         spot = self.alice.sync_trail[-1][:2]
-        self.bot_conn.fires = [bot.FireWall(
+        life = bot._fire_wall_ticks(flame)
+        wall = bot.FireWall(
             botsync.projectile_handle(self.bot_seat, 0), flame,
             [bot.Flame(botsync.projectile_handle(self.bot_seat, 0),
-                       float(spot[0]), float(spot[1]), 0,
-                       bot._fire_wall_ticks(flame))],
-            time.monotonic() - 3600.0, bot._fire_wall_ticks(flame))]
+                       float(spot[0]), float(spot[1]), 0, life)],
+            time.monotonic(), life)
+        # ★ 快进整条命：绝对 tick 轴上把出生时刻往回拨 `life + 4` 个 tick，
+        #   这一帧就得把 1..life 全补完（§85）。
+        wall.born_tick -= life + 4
+        self.bot_conn.fires = [wall]
         self.clear()
         self.walk(self.alice, [tuple(spot)])
         burns = [f for f in bot_frames(self.alice, self.bot_seat)
@@ -3922,3 +3928,247 @@ class BotBuriedMuzzleTests(TerrainMixin, BotFireRoom):
         self.bot_conn.holding = True
         self.walk(self.alice, [(900, 880), (920, 880), (940, 880)])
         self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+
+
+class BotShellGirthTests(TerrainMixin, BotFireRoom):
+    """★★★ **弹体是有粗细的**（§83）——「擦到平台边」那一类穿模。
+
+    用户 2026-08-28：「bot 扔的手雷有几次是空中飞一半突然消失了，
+    过了一会儿在右边地图边缘出现了爆炸动画。」
+
+    实机对上的证据（客户端 `PROJ.` 逐帧日志，Forest_b）：句柄 200072 那一发
+    火焰弹在 `(1070, 369)` 就被收方停住了，而那一点离最近的实心格还有
+    **8.06** 个单位 —— 正好是 `ch01-02` 的 `Size = 8`。服务端那时候只查
+    圆心，一路放行，1.1 秒后在 `(1644.8, 582.3)` 才炸。
+    """
+
+    def ledge(self):
+        """一条平地 + 一段高台，高台的**左边沿**就在 x = 700。"""
+        return synth_terrain("girth", floor=400, width=1400, height=440,
+                             walls=((700, 1400, 300),))
+
+    def test_a_shell_grazing_a_ledge_stops_there(self):
+        """★ 圆心还在台子上方 8 个单位、边缘已经蹭上台子 = 撞上了。"""
+        terrain = self.ledge()
+        self.assertTrue(terrain.blocks_bullet(700, 300), "夹具没造对")
+        self.assertFalse(terrain.blocks_bullet(700, 293))
+        # 圆心从台子上方 7 个单位横着扫过去：只看圆心一路通畅，
+        # 半径 8 的圆盘会蹭上台子。
+        self.assertIsNone(
+            bot._terrain_stop_t(terrain, 600, 293, 800, 293),
+            "只看圆心的话这一条是通的（这就是老口径）")
+        self.assertIsNotNone(
+            bot._terrain_stop_t(terrain, 600, 293, 800, 293, 8.0),
+            "带上 Size = 8 就该蹭上台子边")
+
+    def test_the_contact_point_backs_off_one_sample(self):
+        """★ 反弹要用「撞上之前」那一点，否则弹体贴在地形里原地卡死。"""
+        terrain = self.ledge()
+        hit, free = bot._terrain_contact(terrain, 600, 293, 800, 293, 8.0)
+        self.assertIsNotNone(hit)
+        self.assertLess(free, hit)
+
+    def test_the_sky_above_the_map_never_blocks(self):
+        """★★ 图顶上面（`y < 0`）**不算实心**（§83 的实机反证）。
+
+        `TerrainData::Get` 对出界一律返回 2，可实机日志里弹体是从图顶
+        飞出去又落回来的（句柄 200048 第 36 帧在 `(1323.48, 0.68)`）。
+        算成实心的话高抛的手雷会在半空中被判撞墙，实测差了 400~495 个单位。
+        """
+        terrain = self.ledge()
+        self.assertIsNone(bot._terrain_stop_t(terrain, 100, 6, 300, 6, 8.0),
+                          "贴着图顶飞不该被判撞上")
+        self.assertIsNotNone(
+            bot._terrain_stop_t(terrain, 100, 200, 100, 420, 8.0),
+            "往下撞地板还是该撞上")
+
+    def test_the_left_and_right_edges_still_block(self):
+        """★ 左右两边照旧算实心 —— 实机那两发就停在图边内侧 7 个单位。"""
+        terrain = self.ledge()
+        self.assertIsNotNone(
+            bot._terrain_stop_t(terrain, 1360, 100, 1399, 100, 8.0))
+        self.assertIsNotNone(
+            bot._terrain_stop_t(terrain, 40, 100, 1, 100, 8.0))
+
+
+class BotHighLobTicksTests(BotFireRoom):
+    """★★★ 高抛的手雷不许在半空中被「飞到头了」结算掉（§83）。
+
+    `_shell_max_ticks()` 原来除的是**出膛**速度，而抛物线在顶点只剩水平
+    分量。实机那一发（句柄 200048）：`speed = 35.6`、上界算出 56 tick，
+    服务端在第 56 tick 把它炸在半空；客户端那时候还在第 57 帧继续往下飞。
+    """
+
+    def test_a_high_lob_gets_enough_ticks_to_come_back_down(self):
+        weapon = weapondata.get(1001020)
+        terrain = synth_terrain("lobticks", floor=700, width=1800, height=800)
+        shot = ballistics.launch(weapon, math.radians(-70.0),
+                                 ballistics.power_for_speed(weapon, 35.6))
+        # 抛物线回到出膛高度要 2·|vy| / g 个 tick。
+        vy = abs(shot.speed * math.sin(shot.angle))
+        need = int(math.ceil(2.0 * vy / shot.gravity))
+        self.assertGreater(need, 60, "夹具没造成高抛")
+        self.assertGreaterEqual(bot._shell_max_ticks(terrain, shot, weapon),
+                                need)
+
+    def test_a_flat_shot_is_still_bounded_by_the_map(self):
+        weapon = weapondata.get(1001010)
+        terrain = synth_terrain("lobticks", floor=700, width=1800, height=800)
+        shot = ballistics.launch(weapon, 0.0, 1.0)
+        self.assertLessEqual(bot._shell_max_ticks(terrain, shot, weapon),
+                             bot.BOT_SHELL_TICK_CEILING)
+
+
+class BotBounceTests(TerrainMixin, BotFireRoom):
+    """★★★ **带引信的弹体撞地形是弹开，不是当场炸**（§84）。
+
+    用户 2026-08-28：「真人对局时，苹果弹直接扔到地上会弹跳，
+    过一会儿之后才会炸开。炸开的碎片别人也能看到。」
+
+    语料对得上：2353 发苹果雷里「没打中角色」的那些，爆炸时刻压在
+    **11~13 发心跳**（p50 = 12 ≈ `SliceTime` 1500 ms ÷ 128 ms）——
+    撞地就炸的话这个分布该是散开的。火焰弹（没有 `SliceTime`）落空的
+    p50 只有 6 发心跳、分布很散，那才是「撞上什么炸在那儿」。
+    """
+
+    def flat(self):
+        return synth_terrain("bounce", floor=400, width=1600, height=440)
+
+    def shell(self, weapon, x, y, angle, speed):
+        shot = ballistics.launch(weapon, angle,
+                                 ballistics.power_for_speed(weapon, speed))
+        return bot.Shell(1, 0, weapon, 9, x, y, shot, 0.0,
+                         bot._shell_max_ticks(self.flat(), shot, weapon))
+
+    def test_the_apple_grenade_bounces_instead_of_exploding(self):
+        weapon = weapondata.get(1000020)
+        self.assertTrue(weapon.fuse_ticks, "苹果雷该有引信")
+        self.assertTrue(bot._bounces_off_terrain(weapon))
+        terrain = self.flat()
+        shell = self.shell(weapon, 200.0, 300.0, math.radians(-20.0), 25.0)
+        landed = None
+        while shell.ticks < shell.max_ticks and landed is None:
+            landed = bot._shell_step(self.room, shell, terrain, [])
+        self.assertIsNone(landed, "撞地形不该结算")
+        self.assertTrue(shell.bounced, "该弹起来过")
+        self.assertEqual(shell.max_ticks, shell.ticks,
+                         "一路飞到引信到期才算完")
+
+    def test_the_bounce_halves_the_speed(self):
+        """★ 客户端逐帧实测：撞上之后 `|v|` 正好是撞上之前的一半。"""
+        weapon = weapondata.get(1000020)
+        terrain = self.flat()
+        shell = self.shell(weapon, 200.0, 300.0, math.radians(-20.0), 25.0)
+        before = None
+        while shell.ticks < shell.max_ticks:
+            was = bot._shell_velocity(shell)
+            bot._shell_step(self.room, shell, terrain, [])
+            if shell.bounced:
+                before = (was[0], was[1] + shell.shot.gravity)
+                break
+        self.assertIsNotNone(before)
+        self.assertAlmostEqual(
+            0.5 * math.hypot(*before),
+            math.hypot(shell.vx, shell.vy), places=3)
+
+    def test_a_flat_floor_flips_the_vertical_component(self):
+        """★ 平地的法线朝上 ⇒ 竖直分量取反、水平分量不动，整体再减半。"""
+        weapon = weapondata.get(1000020)
+        terrain = self.flat()
+        shell = self.shell(weapon, 200.0, 300.0, math.radians(-20.0), 25.0)
+        while shell.ticks < shell.max_ticks and not shell.bounced:
+            bot._shell_step(self.room, shell, terrain, [])
+        self.assertTrue(shell.bounced)
+        self.assertGreater(shell.vx, 0.0, "还该往右走")
+        self.assertLess(shell.vy, 0.0, "该被地面弹起来（y 往上是负）")
+
+    def test_the_flame_bomb_still_explodes_on_contact(self):
+        """★ 没引信的照旧撞上什么炸在那儿 —— 别把火焰弹一起改了。"""
+        weapon = weapondata.get(1001020)
+        self.assertFalse(bot._bounces_off_terrain(weapon))
+        terrain = self.flat()
+        shell = self.shell(weapon, 200.0, 300.0, math.radians(-20.0), 25.0)
+        landed = None
+        while shell.ticks < shell.max_ticks and landed is None:
+            landed = bot._shell_step(self.room, shell, terrain, [])
+        self.assertIsNotNone(landed, "火焰弹撞地就该炸")
+        self.assertIsNone(landed[1], "撞的是地形，不是人")
+
+    def test_a_bounced_shell_still_hits_people(self):
+        """★ 弹起来之后照样撞人（碰撞判定不能只对没弹过的弹体有效）。"""
+        weapon = weapondata.get(1000020)
+        terrain = self.flat()
+        shell = self.shell(weapon, 200.0, 300.0, math.radians(-20.0), 25.0)
+        while shell.ticks < shell.max_ticks and not shell.bounced:
+            bot._shell_step(self.room, shell, terrain, [])
+        self.assertTrue(shell.bounced)
+        # 把一个人摆在弹体正前方一步远的地方。
+        target = (0, shell.x + shell.vx, shell.y + shell.vy, False, 0)
+        landed = bot._shell_step(self.room, shell, terrain, [target])
+        self.assertIsNotNone(landed)
+        self.assertEqual(0, landed[1])
+
+
+class BotFireProofTimeTests(BotFireRoom):
+    """★★★ 火烧的账记在**人**身上，几道墙共用一本（§85）。
+
+    用户 2026-08-28：「实机看下来燃烧弹的火焰伤害还是一直 10。」——
+    逐指令读下来**这就是对的**，会话 24 那句「每团火各记各的账」是错的：
+
+        Flame 的 [vft+0x140]（0x485e7a）把自己和 [flame+0x300] = 20
+        交给**受害者**的 [vft+0xcc]，最后落到 0x50f7a7：
+            add ecx, 0x160     ; 时刻戳记在角色身上，一个人只有一格
+            cmp eax, [ecx]     ; 没到点就不算这一发
+            add eax, [esp+8]   ; 到点了就顺延 20 个 tick
+
+    ⇒ 不管站在几团火里、几道墙叠在一起，一个人 20 个 tick 之内
+    **只会掉一次 `Damage`**，火伤永远是 10（`ch01-02a` 的 `Damage`）。
+    """
+
+    def wall_at(self, spot, handle):
+        flame = weapondata.get(1001500)
+        life = bot._fire_wall_ticks(flame)
+        wall = bot.FireWall(
+            handle, flame,
+            [bot.Flame(handle, float(spot[0]), float(spot[1]), 0, life)],
+            time.monotonic(), life)
+        wall.born_tick -= life + 4          # 快进整条命（绝对 tick 轴）
+        return wall
+
+    def burns(self):
+        want = botsync.character_handle(self.room.seat_index_of(self.alice))
+        return [f for f in bot_frames(self.alice, self.bot_seat)
+                if header(f)["opcode"] == botsync.OP_SPLASH_DAMAGED
+                and struct.unpack_from("<i", body_of(f), 4)[0] == want]
+
+    def test_two_overlapping_walls_do_not_double_burn(self):
+        """★★ 两道火墙叠在同一个人脚下，掉的血还是一份。"""
+        self.walk(self.alice, [(400, 100)])
+        spot = self.alice.sync_trail[-1][:2]
+        self.bot_conn.fires = [
+            self.wall_at(spot, botsync.projectile_handle(self.bot_seat, 0)),
+            self.wall_at(spot, botsync.projectile_handle(self.bot_seat, 40)),
+        ]
+        self.clear()
+        self.walk(self.alice, [tuple(spot)])
+        burns = self.burns()
+        self.assertEqual(4, len(burns), "一道墙烧 4 次，两道叠着也还是 4 次")
+        for frame in burns:
+            self.assertAlmostEqual(weapondata.get(1001500).damage,
+                                   struct.unpack_from("<f", body_of(frame), 8)[0],
+                                   places=3)
+
+    def test_the_burn_ledger_is_per_person_not_per_wall(self):
+        self.walk(self.alice, [(400, 100)])
+        spot = self.alice.sync_trail[-1][:2]
+        self.bot_conn.fires = [
+            self.wall_at(spot, botsync.projectile_handle(self.bot_seat, 0))]
+        self.clear()
+        self.walk(self.alice, [tuple(spot)])
+        self.assertIn(self.room.seat_index_of(self.alice), self.bot_conn.burnt)
+
+    def test_the_ledger_is_cleared_between_maps(self):
+        """★ 换图 / 新一局收方把角色重建，`[角色+0x160]` 跟着归零。"""
+        self.bot_conn.burnt[0] = 12345
+        self.bot_conn.reset_battle_frame()
+        self.assertEqual({}, self.bot_conn.burnt)
