@@ -1693,9 +1693,10 @@ class BotFireTests(BotFireRoom):
         self.assertIsNotNone(weapon)
         damage = struct.unpack_from("<f", body_of(
             explode_frames(self.alice, self.bot_seat)[0]), 24)[0]
-        # ★ 夺分模式（夹具默认 args[1] = 3）伤害 ×2（§87）。
-        self.assertAlmostEqual(float(weapon.damage) * bot._damage_scale(self.room),
-                               damage)
+        # ★ 夹具是夺分模式（args[1] = 3）：伤害 ×2（§87），再因为
+        #   「目标踩在地上」×0.75（§89）—— alice 的心跳默认 on_ground=True。
+        #   两个人贴在一起，所以没有「离得远」那一条。
+        self.assertAlmostEqual(int(int(weapon.damage) * 2 * 0.75), damage)
 
     def test_the_fire_packet_says_ten_plus_the_bot_seat(self):
         """`rpFire +0` 是 `10 + 座位号`，语料 7040 发和头 `+1` 100% 一致。"""
@@ -3627,10 +3628,12 @@ class BotFireHandleResetTests(BotFireRoom):
 _TERRAIN_CACHE = {}
 
 
-def synth_terrain(key, floor=150, width=1400, height=180, walls=(), pits=()):
+def synth_terrain(key, floor=150, width=1400, height=180, walls=(), pits=(),
+                  points=None):
     """造一张平地，可选地插几段**高台**和几段**无底洞**。
 
     `walls` / `pits` 都是 `(x0, x1, ...)` 的区间（左闭右开）。
+    `points` 是产物里那张**出生点表**（`{类型号: [(x, y), …]}`，§91）。
     """
     if key in _TERRAIN_CACHE:
         return _TERRAIN_CACHE[key]
@@ -3646,7 +3649,7 @@ def synth_terrain(key, floor=150, width=1400, height=180, walls=(), pits=()):
         rows.append("".join(
             "0" if (x in holes or y < heights[x]) else "2"
             for x in range(width)))
-    terrain = mapdata.MapTerrain(make_record(rows))
+    terrain = mapdata.MapTerrain(make_record(rows, points=points))
     _TERRAIN_CACHE[key] = terrain
     return terrain
 
@@ -3767,6 +3770,133 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
         self.assertIsNone(self.bot_conn.body, "闯关房不该接管走位")
         last = bot_frames(self.alice, self.bot_seat)[-1]
         self.assertEqual((120, 150), udpsync.heartbeat_position(last))
+
+
+#: 一张带出生点的合成图：101（1 队）两个点、102（2 队）两个点，
+#: 都挂在地面（y=150）上方，和原版 `.map` 一样（角色是掉下去站住的）。
+SPAWN_POINTS = {101: [(200, 40), (300, 40)], 102: [(900, 40), (1000, 40)]}
+
+
+class BotSpawnPointTests(TerrainMixin, BotFireRoom):
+    """★★★ **进图站哪、重生站哪**（§91）—— 和真人同一套规则。
+
+    进图那次是**确定的**（`0x405e1c` -> `0x473cb2`）：
+
+        表  = 组队 ? (队伍 1 -> type 101 / 队伍 2 -> type 102) : 101+102
+        名次 = 同队里座位号比我小、且有人的座位数
+        点  = 表[名次 % 表长]
+
+    重生那次是**随机的**（`0x4fe832` -> `0x473d2f`，队伍号传 0）：
+    101+102 拼起来的全表里抽一个。
+    """
+
+    def terrain(self):
+        return self.install_terrain(
+            synth_terrain("spawn", points=SPAWN_POINTS))
+
+    def test_a_free_for_all_bot_uses_both_lists(self):
+        """个人战（`arguments[0] != 1`）走的是 101+102 拼起来那张表。"""
+        terrain = self.terrain()
+        self.assertEqual(0, bot._spawn_team(self.room, self.bot_seat))
+        self.assertEqual([(200, 40), (300, 40), (900, 40), (1000, 40)],
+                         bot._spawn_points(terrain, 0))
+
+    def test_the_index_counts_occupied_seats_before_me(self):
+        """名次 = 座位号比我小、且**有人**的座位数（`0x405e6f` 那个循环）。"""
+        # 夹具：座位 0 = alice、1 = bob、2 = bot（`bot_seat`）。
+        self.assertEqual(2, bot._spawn_index(self.room, self.bot_seat))
+        self.assertEqual(0, bot._spawn_index(self.room, 0))
+        self.assertEqual(1, bot._spawn_index(self.room, 1))
+
+    def test_the_bot_spawns_on_a_map_point_not_next_to_the_human(self):
+        """★★★ 用户 2026-08-28 报的那条：bot 不该出生在真人身边。"""
+        self.terrain()
+        self.walk(self.alice, [(700.0, 150.0)])
+        self.assertIsNotNone(self.bot_conn.body)
+        # 名次 2 -> 全表第 3 个点 (900, 40)，掉到地面 y=150。
+        self.assertEqual(900.0, self.bot_conn.body.x)
+        self.assertEqual(150.0, self.bot_conn.body.y)
+        self.assertTrue(self.bot_conn.body.on_ground)
+
+    def test_a_map_without_spawn_points_falls_back_to_the_trail(self):
+        """★ 没有出生点对象的图退回 D16 —— 总比杵在地形里强。
+
+        ⚠ 这条路要**两帧**：第一帧 `battle_pos` 还是 `None`，只能先走
+        `trail_point()` 把锚定下来，第二帧才接管。有出生点的图不用等。
+        """
+        self.install_terrain(synth_terrain("flat"))
+        self.walk(self.alice, [(700.0, 150.0)])
+        self.assertIsNone(self.bot_conn.body)
+        self.walk(self.alice, [(700.0, 150.0)])
+        self.assertIsNotNone(self.bot_conn.body)
+        self.assertEqual(700.0, self.bot_conn.body.x)
+
+    def test_the_respawn_point_is_drawn_from_the_whole_table(self):
+        """重生**不看队伍**：全表随机抽一个（68 组语料两类点都落过）。"""
+        terrain = self.terrain()
+        picked = [bot.respawn_point(self.room, self.bot_seat, terrain,
+                                    roll=lambda n, i=i: i % n)
+                  for i in range(4)]
+        self.assertEqual([(200.0, 40.0), (300.0, 40.0),
+                          (900.0, 40.0), (1000.0, 40.0)], picked)
+
+    def test_picking_a_respawn_point_settles_it_and_arms_the_bot(self):
+        """★ 挑点这一发要**同时**做两件事：落到地面 + 记进 `pending_spawn`。"""
+        self.terrain()
+        self.bot_conn.roll = lambda n: 3
+        point = bot.pick_respawn_point(self.room, self.bot_seat)
+        self.assertEqual((1000.0, 150.0), point)
+        self.assertEqual((1000.0, 150.0), self.bot_conn.pending_spawn)
+
+    def test_the_next_frame_moves_the_body_to_the_respawn_point(self):
+        """★★ 站起来那一帧身体要跟着搬 —— 不搬就被心跳拽回死亡地点。"""
+        self.terrain()
+        self.walk(self.alice, [(700.0, 150.0)])
+        self.bot_conn.roll = lambda n: 0
+        bot.pick_respawn_point(self.room, self.bot_seat)
+        self.walk(self.alice, [(700.0, 150.0)])
+        self.assertIsNone(self.bot_conn.pending_spawn)
+        self.assertEqual((200.0, 150.0), self.bot_conn.battle_pos)
+        last = bot_frames(self.alice, self.bot_seat)[-1]
+        self.assertEqual((200, 150), udpsync.heartbeat_position(last))
+
+    def test_the_watchdog_sends_the_map_point_not_the_humans(self):
+        """★★ 端到端：看门狗补的那发 `0x0419` 填的是**地图出生点**。
+
+        旧行为是 `respawn_point_for()` —— 那本账里只有真人客户端自报过的
+        重生点，bot 借来用就是「在房主刚重生的地方站起来」。
+        """
+        self.terrain()
+        self.walk(self.alice, [(700.0, 150.0)])
+        self.bot_conn.roll = lambda n: 2                # -> (900, 40)
+        quest = self.room.quest
+        # 真人上一次在 (33, 44) 重生过 —— 旧代码会借这个点。
+        quest.remember_respawn_point(self.room.seat_index_of(self.alice),
+                                     33, 44)
+        armed = time.monotonic()
+        quest.arm_respawn_watchdog(self.bot_seat, (700.0, 150.0), now=armed,
+                                   after=1.0)
+        self.clear()
+        gameserver.Conn.check_respawn_watchdog(self.alice, now=armed + 2.0)
+        self.assertIn(gameserver.OP_RESPAWN_CHARACTER, opcodes(self.alice))
+        self.assertEqual((900.0, 150.0), self.bot_conn.pending_spawn)
+
+    def test_a_dead_human_no_longer_drags_the_bot_over(self):
+        """★★★ 用户 2026-08-28 报的「我一死 bot 就瞬移过来然后抽搐」。
+
+        真人一死，`_hostile_targets()` 就空了 —— 旧代码在那一刻退回
+        `trail_point(真人轨迹)`，bot 被拽到他身边。现在该**原地站着**。
+        """
+        self.terrain()
+        self.walk(self.alice, [(700.0, 150.0)])
+        here = self.bot_conn.battle_pos
+        self.assertIsNotNone(here)
+        # 真人躺下（服务端上闩 = `_lying_dead` 为真）
+        self.room.quest.arm_respawn_watchdog(
+            self.room.seat_index_of(self.alice), (700.0, 150.0), after=5.0)
+        self.assertEqual([], bot._hostile_targets(self.room, self.bot_seat))
+        self.walk(self.alice, [(700.0, 150.0), (700.0, 150.0)])
+        self.assertEqual(here, self.bot_conn.battle_pos)
 
 
 if __name__ == "__main__":
@@ -4377,11 +4507,17 @@ class BotGameModeDamageTests(BotFireRoom):
         return max(struct.unpack_from("<f", body_of(f), 24)[0] for f in booms)
 
     def test_a_direct_hit_doubles_in_deathmatch(self):
+        """★ 夺分是 ×2，**但紧接着还有一条 ×0.75**（目标踩在地上，§89）。
+
+        alice 的心跳默认 `on_ground=True`，所以这里量到的是
+        `int(int(生存值 × 2) × 0.75)`。
+        """
         self.set_mode(gameserver.PVP_MODE_SURVIVAL)
         plain = self.damage_of_one_shot()
         self.assertGreater(plain, 0.0)
         self.set_mode(gameserver.PVP_MODE_DEATHMATCH)
-        self.assertAlmostEqual(plain * 2.0, self.damage_of_one_shot(), places=3)
+        self.assertAlmostEqual(int(int(plain * 2) * 0.75),
+                               self.damage_of_one_shot(), places=3)
 
     def test_the_fire_wall_doubles_in_deathmatch(self):
         flame = weapondata.get(1001500)
@@ -4419,6 +4555,141 @@ class BotGameModeDamageTests(BotFireRoom):
         doubled = bot._splash_targets(self.room, shell, (0.0, 0.0), None, bodies)
         self.assertEqual(1, len(plain))
         self.assertEqual(1, len(doubled))
-        # ★ 倍率乘在**衰减之前**，所以只到取整误差为止（差 1 是四舍五入）。
-        self.assertLessEqual(abs(plain[0][1] * 2 - doubled[0][1]), 1)
-        self.assertGreater(doubled[0][1], plain[0][1])
+        # ★ 倍率乘在**衰减之后**（`0x480e52` 那一发 `[vft+0x128]` 排在
+        #   `[vft+0x134]` 后面，§90）—— 所以是**整整两倍**，没有取整误差。
+        self.assertEqual(plain[0][1] * 2, doubled[0][1])
+
+
+class BotDeathmatchPenaltyTests(BotFireRoom):
+    """★★★ 夺分模式**直接命中**独有的两条 ×0.75（§89）。
+
+    出处 `0x47e618`（`Projectile` 虚表槽 `+0x128`，`Projectile::OnHit`
+    在 `0x47ec5b` 调它）：
+
+        0047e66d  cmp eax, 3 ; jne 出口         ; 只有模式 3
+        0047e6cd  fild [视口+0x30]              ; = 1024
+        0047e6df  or [ebp+0xc], 8 ; fmul 0.75   ; 目标离得远
+        0047e6f5  cmp byte [目标+0x128], 0      ; 目标踩在地上
+        0047e700  or [ebp+0xc], 4 ; fmul 0.75
+
+    用户 2026-08-28 那一局的实机证据：他自己那发苹果弹的 `rpExplode` 是
+    `flags 4 伤害 30`（= 20 × 2 × 0.75），bot 打他是 40 —— 差的就是这一条。
+    """
+
+    def penalty_damage(self, region="body"):
+        weapon = weapondata.get(1000020)
+        return bot._direct_hit_damage(self.room, self.bot_conn, weapon,
+                                      region, self.alice_seat)
+
+    def setUp(self):
+        super().setUp()
+        self.alice_seat = self.room.seat_index_of(self.alice)
+        self.walk(self.alice, [(100.0, 100.0)])
+        self.bot_conn.battle_pos = (100.0, 100.0)
+
+    def test_a_grounded_target_takes_three_quarters(self):
+        """目标踩在地上 -> ×0.75（用户实机那一发就是这条）。"""
+        self.assertEqual(int(20 * 2 * 0.75), self.penalty_damage())
+
+    def test_an_airborne_target_takes_the_full_doubled_damage(self):
+        """腾空的目标**不减** —— `[char+0x128]` 是 0。"""
+        self.walk(self.alice, [(100.0, 100.0)], )
+        self.human_heartbeat(self.alice, 100.0, 60.0, on_ground=False,
+                             velocity=(0, -10))
+        self.assertEqual(20 * 2, self.penalty_damage())
+
+    def test_a_far_target_takes_another_three_quarters(self):
+        """超过**一个视口宽**（1024）再 ×0.75，两条累乘、各自截断。"""
+        self.bot_conn.battle_pos = (100.0 + bot.BOT_LONG_SHOT_RANGE + 1.0,
+                                    100.0)
+        self.assertEqual(int(int(20 * 2 * 0.75) * 0.75), self.penalty_damage())
+
+    def test_exactly_one_viewport_away_is_not_far(self):
+        """门槛是**严格大于**（`fcompp` + `jne`）—— 正好 1024 不减。"""
+        self.bot_conn.battle_pos = (100.0 + bot.BOT_LONG_SHOT_RANGE, 100.0)
+        self.assertEqual(int(20 * 2 * 0.75), self.penalty_damage())
+
+    def test_no_penalty_outside_deathmatch(self):
+        """★ 只有模式 3。模式 5 照样 ×2（§87），但**不减**。"""
+        for mode in (0, 1, 2, 4, 5):
+            args = list(self.room.arguments)
+            args[1] = mode
+            self.room.arguments = tuple(args)
+            scale = 2 if mode == 5 else 1
+            self.assertEqual(20 * scale, self.penalty_damage(),
+                             f"模式 {mode}")
+
+    def test_an_unknown_stance_never_gets_the_penalty(self):
+        """★ 读不出「踩没踩地」就**不减** —— 宁可少扣也不要凭空扣。"""
+        self.alice.sync_trail.clear()
+        self.assertEqual(20 * 2, self.penalty_damage())
+
+    def test_the_splash_has_no_such_penalty(self):
+        """★ 溅射走 `0x4806bf`，**不经过** `0x47e618` —— 一条都不减。"""
+        weapon = weapondata.get(1000020)
+        shell = bot.Shell(1, 0, weapon, 9, 0.0, 0.0,
+                          ballistics.launch(weapon, 0.0, 30.0), 0.0, 40)
+        # 贴着爆点 = 衰减那一项是 0，剩下的就是 `SplashDamage × 2`。
+        bodies = [(self.alice_seat, 0.0, 0.0, False, 0)]
+        hits = bot._splash_targets(self.room, shell, (0.0, -37.0), None, bodies)
+        self.assertEqual(1, len(hits))
+        self.assertEqual(int(weapon.splash_damage) * 2, hits[0][1])
+
+
+class BotSplashFalloffTests(BotFireRoom):
+    """★★★ 溅射的衰减公式（§90）—— `SplashDamage::vft+0x134`（`0x4857aa`）。
+
+        r = 距离 / (SplashRange + 35)      ; 35 = 角色的溅射半径，写死
+        r > 1                              -> 一点伤害都没有
+        伤害 = int((1 − r) × (SplashDamage − 1) + 1)   ; 朝零截断
+        ×2（夺分）在这之后
+
+    语料实证只看**自伤**（受害者就是射手，位置有他自己的心跳）：
+    `ch02-03` 5/5、`ch105-02` 3/3 一位不差。
+    """
+
+    def hits(self, weapon, span):
+        shell = bot.Shell(1, 0, weapon, 9, 0.0, 0.0,
+                          ballistics.launch(weapon, 0.0, 30.0), 0.0, 40)
+        # 身体圆心正好落在 `(span, 0)` 上：`center()` 把落脚点往上抬。
+        character = chrprops.get(0)
+        lift = 2.0 * character.size_legs + character.size_body
+        bodies = [(0, span, lift, False, 0)]
+        return bot._splash_targets(self.room, shell, (0.0, 0.0), None, bodies)
+
+    def test_the_edge_still_does_one_point_before_the_mode_scale(self):
+        """★ 公式的常数项是 **+1** —— 作用半径边缘上掉的是 1（夺分 2），
+        不是 0。旧的线性式在那儿是 0，整整少一档。"""
+        weapon = weapondata.get(1000020)
+        reach = weapon.splash_range + bot.SPLASH_BODY_RADIUS
+        hits = self.hits(weapon, reach - 0.5)
+        self.assertEqual(1, len(hits))
+        self.assertEqual(1 * bot._damage_scale(self.room), hits[0][1])
+
+    def test_the_reach_includes_the_targets_own_radius(self):
+        """★ 作用半径是 `SplashRange + 35`，不是 `SplashRange`。"""
+        weapon = weapondata.get(1000020)
+        # 只按 `SplashRange` 算的话这一点早就出圈了。
+        self.assertTrue(self.hits(weapon, weapon.splash_range + 10.0))
+        self.assertEqual(
+            [], self.hits(weapon,
+                          weapon.splash_range + bot.SPLASH_BODY_RADIUS + 1.0))
+
+    def test_the_curve_matches_the_reversed_formula(self):
+        """整条曲线逐点对：`int((1 − r)(D − 1) + 1) × 倍率`。"""
+        weapon = weapondata.get(1000020)
+        reach = weapon.splash_range + bot.SPLASH_BODY_RADIUS
+        scale = bot._damage_scale(self.room)
+        for span in (0.0, 20.0, 50.0, 90.0, 120.0):
+            want = int((1.0 - span / reach)
+                       * (int(weapon.splash_damage) - 1) + 1) * scale
+            hits = self.hits(weapon, span)
+            self.assertEqual(1, len(hits), f"距离 {span}")
+            self.assertEqual(want, hits[0][1], f"距离 {span}")
+
+    def test_the_centre_takes_the_full_splash_damage(self):
+        """爆点上是整整 `SplashDamage`（`(1−0)(D−1)+1 = D`）。"""
+        weapon = weapondata.get(1000020)
+        hits = self.hits(weapon, 0.0)
+        self.assertEqual(int(weapon.splash_damage) * bot._damage_scale(self.room),
+                         hits[0][1])

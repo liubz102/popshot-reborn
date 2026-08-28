@@ -3163,6 +3163,16 @@ BOT_ROOM_TICK = None
 #: `0x4005` 发侧有 1000 ms 节流，唯一的真人一两秒读完图只报一两发，V0.3 §38。）
 BOT_ROOM_LOADED = None
 
+#: ★★ 同上，`bot.pick_respawn_point` 挂这儿：**bot 该在哪重生**。
+#: 签名 `(room, seat) -> (x, y) | None`。
+#:
+#: 为什么不能沿用 `RoomQuest.respawn_point_for()`：那本账记的是**真人客户端
+#: 自报**的重生点（`0x0413`），bot 没有客户端 ⇒ 它只能借真人用过的那个，
+#: 于是每次死都在房主刚才重生的地方站起来（用户 2026-08-28 报的
+#: 「bot 出生在我身边」的后一半）。真正的出处是**地图自己的出生点表**，
+#: 那在 `bot.py`（它有 `mapdata`），所以做成钩子（V0.3 §91）。
+BOT_RESPAWN_POINT = None
+
 
 def pvp_score_limit(player_count, team_mode):
     """这一局要拿几分（几个人头）才算赢。抄自 `0x55be71`（§167）。
@@ -6020,6 +6030,15 @@ class Conn:
                             else ""))
                 continue
             x, y = quest.respawn_point_for(seat, position)
+            if self.is_bot_seat(seat) and BOT_RESPAWN_POINT is not None:
+                # ★★★ bot 走**地图自己的出生点表**（V0.3 §91）——
+                #   `respawn_point_for()` 那本账里只有真人客户端自报过的点，
+                #   借来用就是「bot 在房主刚才重生的地方站起来」。
+                #   ★ 这个钩子还会把选中的点记进 BotConn，`bot.py` 下一帧
+                #     把身体挪过去 —— 两边必须是**同一个**点。
+                picked = BOT_RESPAWN_POINT(room, seat)
+                if picked is not None:
+                    x, y = int(picked[0]), int(picked[1])
             # ★★ 角色 id 必须是**他自己**的，不然客户端会当成「换角色」
             #   （`0x4931c2`，V0.3 §33）。座位上那个是进房时选的，
             #   局中换过角色的人以他自己 `0x0413` 报过的那个为准。

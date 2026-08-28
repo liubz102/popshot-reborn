@@ -259,14 +259,23 @@ class BotConn(gameserver.Conn):
         #: 这个 bot 的同步流（M3）：序号记账 + 组包，见 `botsync.py`。
         self.sync = botsync.BotSyncStream(self)
         #: 战斗中的落脚点 `(x, y)`，None = 还不知道自己站在哪。
-        #: ★ 服务端一点地图几何都没有（M4 才有），所以这个锚点是**跟着真人
-        #:   走**的 —— 真人此刻站着的地方一定是合法地面（D16）。
+        #: ★ 对战房里第一帧从**地图出生点**取（§91，和真人同一套分配规则）；
+        #:   闯关房没有出生点可用时才退回「跟着真人走」那条老路（D16）。
         self.battle_pos = None
         #: ★★ **自己走路时的运动状态**（`botmove.Body`），`None` = 还没接管。
-        #:   对战房里第一帧先按 D16 从真人轨迹取一个合法落脚点当锚，
+        #:   对战房里第一帧的锚是**这个座位该用的地图出生点**（§91），
         #:   之后就由 `botmove` 在地形上自己推（M5 / §71）。
         #:   闯关房仍然回放真人轨迹（那边要的就是「跟着推进」）。
         self.body = None
+        #: ★ 上一帧心跳里报出去的**地面标志**（位域 bit2 = `[char+0x128]`）。
+        #:   `None` = 这一局还没报过。别人那台机器上 bot 的这一格就是它，
+        #:   而夺分模式的一条 ×0.75 正是按受害者这一格判的（§89）。
+        self.on_ground = None
+        #: ★★ **下一次站起来要落在哪**（`(x, y)`；`None` = 没有待定的重生）。
+        #:   服务端替 bot 补 `0x0419` 时把选好的重生点记在这儿（§91），
+        #:   `_tick_bot()` 看到「躺着 -> 站起来」的翻转就把身体挪过去 ——
+        #:   两边必须是同一个点，否则客户端把它放在 A、心跳把它拽到 B。
+        self.pending_spawn = None
         #: 上一次推运动状态的时刻（`time.monotonic()`）。按**真实流逝的
         #: 时间**决定推几个 tick，和 `_advance_shells()` 一个口径。
         self.move_at = 0.0
@@ -404,6 +413,9 @@ class BotConn(gameserver.Conn):
         # ★ 自己的运动状态跟着清：新一张图的地形、出生点全变了，
         #   上一张图的落脚点和速度一个字都不作数（同 `battle_pos`）。
         self.body = None
+        self.on_ground = None
+        # ★ 待定的重生点跟着清：新一张图的出生点表整个换了一份（§91）。
+        self.pending_spawn = None
         self.move_at = 0.0
         self.last_trail_mark = None
         self.load_progress = None
@@ -1343,6 +1355,70 @@ def _damage_scale(room):
     return 2 if _pvp_game_mode(room) in BOT_DOUBLE_DAMAGE_MODES else 1
 
 
+#: ★★★ **夺分模式独有的两条 ×0.75**（§89）——「只减，不加」，而且
+#: **只作用在直接命中上**。
+#:
+#: 出处 `0x47e618`（`Projectile` 虚表槽 `+0x128`，19 个弹体类全指向它），
+#: `Projectile::OnHit` 在 `0x47ec5b` 调它，紧接着 `0x4806bf` 那一发 ×2：
+#:
+#:     0047e66d  cmp eax, 3 ; jne 出口     ; ★ 只有模式 3（模式 5 **不减**）
+#:     0047e6c8  mov eax, [0x6e9b94]       ; 视口
+#:     0047e6cd  fild dword [eax+0x30]     ; ★ 视口宽度 = 1024
+#:     0047e6dd  jne 跳过                   ; 距离 <= 它 -> 不减
+#:     0047e6df  fild [ebx] ; or [ebp+0xc], 8 ; fmul [0x6938c8] ; ftol
+#:     0047e6f5  cmp byte [目标+0x128], 0  ; ★ 目标**踩在地上**
+#:     0047e700  or [ebp+0xc], 4 ; fmul [0x6938c8] ; ftol
+#:
+#: 两条各自 ×0.75、**各自朝零截断**，累乘（`0x6938c8` = 0.75）。
+#: 那两个 `or` 写的正是 `rpExplode +20` 的 flags —— 用户 2026-08-28 那一局
+#: 里他自己那发苹果弹的包就是 `flags 4 伤害 30`（= 20 × 2 × 0.75），
+#: 而 bot 打他是 40（没减）。
+#:
+#: ★ **溅射 / 地面燃烧 / 近身没有这两条**：`SplashDamage` / `Flame` 的
+#: 虚表槽 `+0x128` 直接指向 `0x4806bf`（只有 ×2），`DashDamage` 指向
+#: `0x481dfd`（×2 + 装备加成），三个都不经过 `0x47e618`。
+BOT_LONG_SHOT_MODES = (3,)
+
+#: ★ 「离得远」的那条门槛 = **视口宽度**，`ViewPort::Init(0, 0, 0x400, 0x300)`
+#: 把 `0x400` 写进 `[视口+0x30]`（`0x5cc80b`，全镜像只有这一处构造）。
+#:
+#: 语料实证（§89）：68 个夺分局的 5625 发直接命中里，按「射手心跳坐标 →
+#: 爆点」当距离，**1024 这个门槛只错分 35 发（0.62%）**，而最优门槛是
+#: 1040 —— 两者在噪声里分不开（爆点是打在碰撞圆上的那一点，不是目标原点）。
+BOT_LONG_SHOT_RANGE = 1024.0
+
+#: 那两条各自乘多少（`0x6938c8`）。
+BOT_DAMAGE_PENALTY = 0.75
+
+
+def _direct_hit_damage(room, machine, weapon, region, victim_seat):
+    """**直接命中**要填进 `rpExplode +24` 的伤害（§87 + §89）。
+
+    三步，顺序和 `0x47ec5b` 那条链一模一样：
+
+    1. 按部位取档（`Damage` / `HeadDamage` / `LegsDamage`）；
+    2. 夺分 / 模式 5 **×2**（`0x4806f1` 的 `shl`）；
+    3. ★ **只有模式 3**：目标离得比一个视口宽（1024）还远 ×0.75、
+       目标**踩在地上** ×0.75 —— 各自朝零截断，两条都成立就乘两次。
+
+    ⚠ 距离量的是**两个角色原点之间**（`vft+8` = `GetPos`，也就是脚下那点），
+    不是爆点到目标。踩没踩地读的是 `[char+0x128]`，服务端这边就是心跳
+    位域的 bit2（§5.6）—— 读不出来就**不减**，宁可少扣也不要凭空扣。
+    """
+    damage = weapon.damage_for(region) * _damage_scale(room)
+    if _pvp_game_mode(room) not in BOT_LONG_SHOT_MODES:
+        return damage
+    shooter = machine.battle_pos
+    victim = _seat_body(room, victim_seat)
+    if shooter is not None and victim is not None:
+        span = math.hypot(victim[0] - shooter[0], victim[1] - shooter[1])
+        if span > BOT_LONG_SHOT_RANGE:
+            damage = int(damage * BOT_DAMAGE_PENALTY)
+    if _seat_on_ground(room, victim_seat):
+        damage = int(damage * BOT_DAMAGE_PENALTY)
+    return damage
+
+
 def _seat_group(room, seat_index):
     """这个座位的**碰撞排除组**（`rpFire body+1`，§63）。
 
@@ -1376,6 +1452,28 @@ def _seat_body(room, seat_index):
         return None
     point = trail[-1]
     return (point[0], point[1], bool(point[7]) if len(point) > 7 else False)
+
+
+def _seat_on_ground(room, seat_index):
+    """这个座位此刻**踩没踩在地上**（`[char+0x128]`）；不知道返回 `None`。
+
+    这一格就是心跳位域的 **bit2**（packet_api §5.5 / §5.6，V0.3 §35）：
+    真人的从轨迹点上取（`SyncTrailPoint[3]`，收方写进 `[char+0x128]` 的
+    正是它），bot 的从它自己上一帧报出去的那一位取。
+
+    ★ 谁读它：`_direct_hit_damage()`（夺分模式的那条 ×0.75，§89）。
+    """
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    conn = None if seat is None else seat.conn
+    if conn is None:
+        return None
+    if getattr(seat, "is_bot", False):
+        return getattr(conn, "on_ground", None)
+    trail = getattr(conn, "sync_trail", None)
+    if not trail:
+        return None
+    point = trail[-1]
+    return bool(point[3]) if len(point) > 3 else None
 
 
 def _battle_bodies(room, shooter_seat, group=None, include_self=False):
@@ -1469,6 +1567,149 @@ def _character_of(machine):
     return chrprops.get(machine.character_id)
 
 
+# ---------------------------------------------------------------------------
+# ★★★ 出生点（§91）—— 和真人**同一套**分配规则
+# ---------------------------------------------------------------------------
+#: `.map` 里那两类出生点对象的 type（`tools/mapdata.py` 原样抄进产物的
+#: `points`）：**101 = 1 队、102 = 2 队**。
+SPAWN_TYPE_TEAM_A = 101
+SPAWN_TYPE_TEAM_B = 102
+
+
+def _spawn_points(terrain, team):
+    """`team` 能用的出生点表 —— 逐条照抄 `0x473ba8`。
+
+        dec ecx ; je  -> 队伍 1：只要 type 101
+        dec ecx ; je  -> 队伍 2：只要 type 102
+        否则          -> **101 接着 102 拼成一张表**（个人战 / 闯关都走这条）
+
+    返回 `[(x, y), …]`，顺序就是产物里的顺序（= `.map` 里的对象顺序）。
+    """
+    points = {} if terrain is None else (terrain.points or {})
+    first = list(points.get(SPAWN_TYPE_TEAM_A, ()))
+    second = list(points.get(SPAWN_TYPE_TEAM_B, ()))
+    if team == 1:
+        return first
+    if team == 2:
+        return second
+    return first + second
+
+
+def _spawn_team(room, seat_index):
+    """挑出生点时算的「我是几队」—— `0x405e4b` 那道门。
+
+    原版**只有组队模式才读座位的队伍号**（`0x409df1(描述符) == 1`，
+    也就是 `arguments[0] == 1`）；个人战和闯关一律按 **0** 算，
+    于是拿到的是 101+102 拼起来的那张全表。
+    """
+    if room.team_layout() != TEAM_LAYOUT_TEAMS:
+        return 0
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    try:
+        return int(getattr(seat, "team", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _spawn_index(room, seat_index):
+    """我在这张表里排第几个（0 基）—— 照抄 `0x405e6f` 那个循环：
+
+        for (i = 0; i < 我的座位号; i++)
+            if (座位 i 没人)                       continue
+            if (组队模式 && 座位 i 的队伍 != 我的)  continue
+            rank++
+
+    ⇒ **「同队里座位号比我小、且有人的座位数」**。所以 1 队的第一个人
+    永远落在 101 表的第 0 个点上，和真人一模一样。
+    """
+    team_mode = room.team_layout() == TEAM_LAYOUT_TEAMS
+    my_team = _spawn_team(room, seat_index)
+    rank = 0
+    for index in range(max(0, min(seat_index, len(room.seats)))):
+        other = room.seats[index]
+        if other is None:
+            continue
+        if team_mode and int(getattr(other, "team", 0) or 0) != my_team:
+            continue
+        rank += 1
+    return rank
+
+
+def _spawn_point(room, seat_index, terrain):
+    """这个座位**进图时**该站在哪（`0x405e1c` -> `0x473cb2`）；没有表就 `None`。
+
+    `点 = 表[我的名次 % 表长]` —— 取模是原版自己做的（`0x473cde` 那个
+    `idiv`），人比出生点多的时候就有人叠在一起，这也是原版行为。
+    """
+    points = _spawn_points(terrain, _spawn_team(room, seat_index))
+    if not points:
+        return None
+    point = points[_spawn_index(room, seat_index) % len(points)]
+    return (float(point[0]), float(point[1]))
+
+
+def respawn_point(room, seat_index, terrain=None, roll=None):
+    """这个座位**重生**落在哪；算不出来返回 `None`。
+
+    ★★ 和进图那次**不是同一条规则**：`0x4fe832` 调的是 `0x473d2f`，
+    而它传下去的队伍号是 **0** —— 也就是 **101+102 拼起来的全表里随机抽
+    一个**（`0x473d5f` 那发 `rand() % 表长`），和自己是几队无关。
+
+    语料实证（§91）：1360 发真人 `0x0413` 里，重生坐标的 x **中位差 0**
+    （和某个出生点的 x 完全相等），y 比对象低 55 左右（掉到地面上）；
+    而「同一条连接 + 同一张图 + 同一座位」的 126 组里有 **68 组两类点都
+    落过** —— 队伍过滤在重生这条路上确实不存在。
+
+    `roll` 是给单测钉死随机数用的（`roll(n) -> 0..n-1`），默认 `random`。
+    """
+    if terrain is None:
+        terrain = mapdata.load(_current_map(room))
+    points = _spawn_points(terrain, 0)
+    if not points:
+        return None
+    picker = random.randrange if roll is None else roll
+    point = points[picker(len(points))]
+    return (float(point[0]), float(point[1]))
+
+
+def _settle_spawn(terrain, machine, point):
+    """把出生点**放到地面上**：对象在编辑器里挂在半空，角色是掉下去站住的。
+
+    语料实证（§91）：真人报上来的重生 y 比对象的 y 低 **55**（中位），
+    p10/p90 是 −44 / 135 —— 正是「从对象那一点往下掉到最近的地面」。
+    """
+    body = botmove.Body(float(point[0]), float(point[1]), on_ground=False)
+    return botmove.settle(terrain, body, _character_of(machine))
+
+
+def pick_respawn_point(room, seat_index):
+    """★ 给 `gameserver` 的重生看门狗用：这个 bot 该在哪站起来（§91）。
+
+    挂在 `gameserver.BOT_RESPAWN_POINT` 上。做两件事，**必须一起做**：
+
+    1. 返回坐标 —— 看门狗把它填进 `0x0419`，客户端照着把模型放过去；
+    2. 把同一个坐标记进 `BotConn.pending_spawn` —— 下一帧 `_own_step()`
+       把身体挪过去。少做第 2 件的话，客户端把 bot 放在出生点，
+       而心跳还在报死亡地点，模型当场被拽回去。
+
+    算不出来（这张图没有出生点 / 座位上不是 bot）就返回 `None`，
+    看门狗退回它原来那套兜底。
+    """
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    machine = None if seat is None else seat.conn
+    if not isinstance(machine, BotConn):
+        return None
+    terrain = mapdata.load(_current_map(room))
+    point = respawn_point(room, seat_index, terrain, roll=machine.roll)
+    if point is None:
+        return None
+    if terrain is not None:
+        body = _settle_spawn(terrain, machine, point)
+        point = (body.x, body.y)
+    machine.pending_spawn = point
+    return point
+
+
 def _enemy_spot(room, machine, seat_index):
     """离自己最近的那个敌人此刻站在哪；没有敌人返回 `None`。
 
@@ -1531,26 +1772,39 @@ def _own_step(room, machine, seat_index, terrain, target, now):
     """自己走一帧，返回和 `trail_point()` 同格式的那个八元组；
     还接管不了就返回 `None`（调用方退回回放真人轨迹）。
 
-    接管不了的情形有三种，都退回 D16 那条老路：
+    接管不了的情形只剩两种，都退回 D16 那条老路：
 
     1. **没有地形数据**（这张图没提取到）—— 没有地面就没法自己走；
-    2. **还没有落脚点** —— 第一帧的锚仍然从真人轨迹上取（真人站过的点
-       一定是合法地面，D16），落下来之后才由这里接管；
-    3. **闯关房** —— 那儿的走位是「跟着真人推进」，不是自己找敌人。
+    2. **闯关房** —— 那儿的走位是「跟着真人推进」，不是自己找敌人。
+
+    ## ★★★ 「场上没有敌人」**不再**退回真人轨迹（§91）
+
+    这里原来的第一句是 `if not _hostile_targets(): return None`。
+    真人一死，`_lying_dead()` 把他从敌人表里剔掉 ⇒ 敌人表空 ⇒ bot 当场
+    退回 `trail_point(真人轨迹)`，**一瞬间被拽到真人身边**，然后每一帧
+    在「自己算的点」和「真人轨迹上的点」之间来回跳 —— 用户 2026-08-28 报的
+    「我被打死的一瞬间 bot 瞬移到我身边然后不停抽搐」就是这一句。
+
+    没有敌人是**很正常的一刻**（对面全躺着等重生），这时候 bot 该做的是
+    站在原地 —— `_move_intent()` 本来就会返回 `(0, False)`。
     """
     if terrain is None:
         return None
-    if not _hostile_targets(room, seat_index):
+    if room.team_layout() == lobby_module.TEAM_LAYOUT_COOP:
         return None
     who = _character_of(machine)
     if machine.body is None:
-        if machine.battle_pos is None:
-            return None
-        # ★ 拿真人轨迹上那个点当锚，再让他落到地上 —— 真人可能正跳在
-        #   半空，直接当「站着」会让 bot 悬空。
-        anchor = botmove.Body(machine.battle_pos[0], machine.battle_pos[1],
-                              on_ground=False)
-        machine.body = botmove.settle(terrain, anchor, who)
+        # ★★★ 第一帧的锚是**这个座位该用的地图出生点**（§91）——
+        #   和真人走同一套分配规则，所以客户端自己算出来的位置和这边一致，
+        #   第一发心跳不会把模型拽走。
+        anchor = _spawn_point(room, seat_index, terrain)
+        if anchor is None:
+            # 这张图没有出生点对象（产物里 `points` 是空的）—— 退回 D16：
+            # 真人站过的地方一定是合法地面。
+            if machine.battle_pos is None:
+                return None
+            anchor = machine.battle_pos
+        machine.body = _settle_spawn(terrain, machine, anchor)
         machine.move_at = now
     direction, want_jump = _move_intent(room, machine, seat_index,
                                         terrain, target)
@@ -2544,12 +2798,35 @@ def _shell_step(room, shell, terrain, bodies):
     return (point, best[0], best[1])
 
 
+#: ★★ **角色在溅射判定里的半径**：所有角色都是 **35**，写死在
+#: `Character` 虚表槽 `+0x7c`（`0x4fc229: fld [0x693758]`）。
+#:
+#: 它被加进溅射的**作用半径**里 —— 也就是说 `SplashRange` 量的是「爆点到
+#: 身体表面」，不是「爆点到身体中心」。
+SPLASH_BODY_RADIUS = 35.0
+
+
 def _splash_targets(room, shell, point, victim_seat, bodies):
     """爆炸溅到了谁：`[(座位号, 伤害, 受击点)]`。武器没有溅射就是空表。
 
-    原版 `weapon.ini` 的说明：`SplashRange` 是「以爆点为中心、单位像素的
-    一个半径，**离中心越远伤害越小**」。这里按线性衰减 ——
-    没有更细的出处，而「越远越小」这一条是 ini 自己写的。
+    ## ★★★ 衰减公式是**逆出来的**，不是猜的（§90）
+
+    `SplashDamage` 虚表槽 `+0x134`（`0x4857aa`）算的就是这一档：
+
+        0047e6..  r = |爆点 → 目标身体圆心| / (SplashRange + 35)
+        004857f0  fdivr / fcom 1.0 -> r > 1 就是**一点伤害都没有**
+        00485871  call 0x5ce3a0(r, 1.0)   ; = pow(r, 1/1.0) = r
+        00485886  (1 − r) × (SplashDamage − 1)
+        0048588b  + 1
+        00485891  call 0x5f895c           ; ★ 朝零截断
+
+    ⇒ `伤害 = int((1 − r) × (SplashDamage − 1) + 1)`，**边缘上是 1 不是 0**。
+    ×2（夺分）在这之后才乘（`0x480e52` 那一发 `[vft+0x128]` = `0x4806bf`）。
+
+    语料实证：只看**自伤**（受害者就是射手，位置有他自己的心跳）——
+    `ch02-03` 5/5、`ch105-02` 3/3、`ch101-02` 14 发里 10 发一位不差；
+    旧的「`round(SplashDamage × 倍率 × (1 − 距离/SplashRange))`」在同一批
+    样本上**系统性偏低**（合计误差 268 vs 32）。
 
     ★★★ `bodies` 必须是**不按碰撞组过滤**的那一份（`_battle_bodies` 的
     `group=None`）：溅射**分不清敌我**，队友和射手自己都吃（§69）。
@@ -2557,14 +2834,18 @@ def _splash_targets(room, shell, point, victim_seat, bodies):
     和原版对不上。
 
     ★ 直接命中的那个人**不重复算**（他已经吃过 `rpExplode` 那一档伤害了）。
+
+    ⚠ 这里**没有**夺分那两条 ×0.75（§89）—— 它们在 `0x47e618` 里，
+    只有直接命中那条路会过。
     """
     weapon = shell.weapon
-    reach = float(weapon.splash_range or 0.0)
-    if reach <= 0.0:
+    span_max = float(weapon.splash_range or 0.0)
+    if span_max <= 0.0:
         return []
-    # ★ 夺分模式 ×2（§87）。乘在**衰减之前**：先乘再取整，比「取完整数再乘」
-    #   多保住一位分辨率（后者会让两个不同距离的人掉一样多的血）。
-    full = weapon.splash_damage * _damage_scale(room)
+    # ★ 目标那 35 是加在**半径**上的（`0x485831` 把两边的 `vft+0x7c` 相加）。
+    reach = span_max + SPLASH_BODY_RADIUS
+    full = int(weapon.splash_damage)
+    scale = _damage_scale(room)
     out = []
     for seat_index, px, py, crouched, character_id in bodies:
         if seat_index == victim_seat:
@@ -2574,7 +2855,9 @@ def _splash_targets(room, shell, point, victim_seat, bodies):
         span = math.hypot(cx - point[0], cy - point[1])
         if span > reach:
             continue
-        damage = int(round(full * (1.0 - span / reach)))
+        # ★ 朝零截断（`0x5f895c` 是 `_ftol2`，等价于 C 的 `(int)`），
+        #   **然后**才乘模式倍率 —— 顺序和原版一致（§90）。
+        damage = int((1.0 - span / reach) * (full - 1) + 1) * scale
         if damage <= 0:
             continue
         out.append((seat_index, damage, (cx, cy)))
@@ -2594,9 +2877,11 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region):
         return
     weapon = shell.weapon
     hit = victim_seat is not None
-    # ★★ 夺分模式伤害翻倍（§87）—— 原版是射手那台机器在把数字塞进包之前
-    #   做的（`0x4806f1: shl dword ptr [eax], 1`）。
-    damage = weapon.damage_for(region) * _damage_scale(room) if hit else 0
+    # ★★ 夺分模式伤害翻倍（§87）+ 夺分独有的两条 ×0.75（§89）——
+    #   原版是射手那台机器在把数字塞进包之前做的
+    #   （`0x4806f1: shl` / `0x47e6df` / `0x47e6fe`）。
+    damage = (_direct_hit_damage(room, machine, weapon, region, victim_seat)
+              if hit else 0)
     # ★★★ 组包 + **爆炸对象的句柄记账**在同一次加锁里（§86）：收方处理这一
     #   发时会创建那个溅射对象，它和弹体共用同一个计数器。
     packet = machine.sync.explode(
@@ -3514,6 +3799,20 @@ def _tick_bot(room, machine, seat_index):
         return
     machine.last_trail_mark = mark
 
+    # ★★★ **重生：先把身体搬到服务端选好的那个出生点**（§91）。
+    #   看门狗补 `0x0419` 时已经把坐标记进 `pending_spawn` 并发给了客户端，
+    #   客户端那边模型已经站在那儿了 —— 这边不跟着搬，下一发心跳就把它
+    #   拽回死亡地点（用户 2026-08-28 报的「瞬移 + 抽搐」的另一半）。
+    #   ★ 那个点是**已经落过地**的（`pick_respawn_point` settle 过），
+    #     所以这里直接当「站在地上」建 `Body`，不用再查一次地形。
+    #   ★ 放在 `/s` 分支**前面**：钉住的 bot 也一样会死、一样要站起来。
+    spawn = machine.pending_spawn
+    if spawn is not None:
+        machine.pending_spawn = None
+        machine.battle_pos = (spawn[0], spawn[1])
+        machine.body = botmove.Body(spawn[0], spawn[1], on_ground=True)
+        machine.move_at = now
+
     if machine.holding and machine.battle_pos is not None:
         # ★ `/s`：站在原地不动（用户 2026-08-26 要的测试手段）。
         #   **照常发心跳** —— 真人站着不动时也一直在发，停发反而是异常状态。
@@ -3545,6 +3844,9 @@ def _tick_bot(room, machine, seat_index):
 
     previous = machine.battle_pos
     machine.battle_pos = (x, y)
+    # ★ 记下这一帧报出去的地面标志：别人那台机器上 bot 的 `[char+0x128]`
+    #   就是它，而夺分模式的一条 ×0.75 按受害者这一格判（§89）。
+    machine.on_ground = bool(on_ground)
     direction = _walk_direction(previous, x)
     if direction:
         machine.heading = direction
@@ -3705,6 +4007,8 @@ def tick_room(sender):
 gameserver.BOT_ROOM_TICK = tick_room
 #: 同上：`0x0400` / `0x0417` 广播出去之后，bot 的进度条一次性报满（D26）。
 gameserver.BOT_ROOM_LOADED = report_bots_loaded
+#: 同上：bot 该在哪重生（§91）。看门狗补 `0x0419` 之前问这一发。
+gameserver.BOT_RESPAWN_POINT = pick_respawn_point
 
 
 def handle_command(conn, text):
