@@ -368,6 +368,10 @@ class BotConn(gameserver.Conn):
         #:   ⚠ 每一颗都**必须**恰好发一发：句柄记账在开火那一刻就推进了，
         #:   漏发一发，收方那一格计数器就和服务端错开，从此打不掉血（§42）。
         self.pending_shots = []
+        #: ★★★ **上一帧判命中时用的那份身体快照**：`(时刻, {碰撞组: 身体表})`。
+        #:   `None` = 还没有上一帧。`_advance_shells()` 拿它和这一帧的快照
+        #:   **逐 tick 插值**出「那一 tick 人在哪」（§96）。
+        self.shell_bodies = None
         #: ★★ **地上还在烧的火墙**（`FireWall`，§78）。收方只把火画出来，
         #:   算谁被烧的还是「射手那台机器」—— bot 没有本机，所以归这边。
         self.fires = []
@@ -441,6 +445,9 @@ class BotConn(gameserver.Conn):
         #   （`ForceReloadTerrain`），上一张图的弹体在那边已经不存在了 ——
         #   补发只会拿一个查不到的句柄去撞 `0x492750` 那个静默丢弃。
         self.pending_shots = []
+        # ★ 身体快照跟着清：换图之后上一张图的坐标一个字都不作数，
+        #   拿它去插值只会插出一条横跨两张图的假轨迹。
+        self.shell_bodies = None
         # ★ 火墙跟着清：收方的弹体表这一刻整个复位，上一张图那几团火
         #   在那边已经不存在了（同 `pending_shots`）。
         self.fires = []
@@ -595,7 +602,7 @@ HELP_LINES = (
 #: 只会占满那 4 行的额度（§20），所以这里只放战斗中真能用的两条。
 BATTLE_HELP_LINES = (
     "战斗中：/s N 让 bot 站住;  再敲一次恢复跟随",
-    "/w N M 换武器（M=1~3）;  /dash 近身攻击开关",
+    "/w M 全换武器;  /w N M 换一个;  /dash 近身开关",
     "查子弹: /noboom 只飞不炸;  /slow 降到 1/10 速",
 )
 
@@ -1008,8 +1015,49 @@ def _cmd_slow(conn, room, args):
     return None
 
 
+def _apply_gun(conn, room, index, slot):
+    """把 `index` 号位那个 bot 换成 `slot` 号武器。返回 `(通告文案, 错误文案)`。"""
+    seat, error = _bot_seat(room, index)
+    if error:
+        return None, error
+    machine = seat.conn
+    if not isinstance(machine, BotConn):
+        return None, f"{index} 号位上不是 bot。"
+    choices = weapondata.usable_for(machine.character_id)
+    if not choices:
+        return None, f"{seat.nickname} 这个角色一把能用的武器都没有，它只跑不打。"
+    chosen = weapondata.slot_for(machine.character_id, slot)
+    if chosen is None:
+        ok = "、".join(str(w.raw["slot"]) for w in choices)
+        return None, f"{seat.nickname} 没有能用的 {slot} 号武器槽。可选：{ok}。"
+    machine.weapon_slot = slot
+    # ★ **当场把新枪声明出去**（用户 2026-08-27 报的）：不发的话别人手里那把
+    #   枪要等到 bot **下一次开火**才变（`_declare_weapon` 原来只挂在
+    #   `_try_fire` 上）—— 房主敲完命令盯着看，模型半天不动，
+    #   过一会儿突然跳变。换枪是**这条命令**造成的事实，就该在这儿报出去。
+    #   ★ 只在战斗中发得出去（房间里 bot 还没有同步流）。
+    if room.is_playing():
+        with contextlib.suppress(botsync.SyncInvariantError):
+            _declare_weapon(machine, index, machine.weapon)
+    conn.log(f"   /w: 座位 {index} 的 {seat.nickname} -> 槽位 {slot} "
+             f"= {chosen.id}({chosen.section}) 伤害 {chosen.damage} "
+             f"步进 {chosen.handle_step} 间隔 {chosen.fire_interval_ms}ms")
+    return (f"{seat.nickname} 换成了 {slot} 号武器（{chosen.damage} 点伤害）。",
+            None)
+
+
 def _cmd_gun(conn, room, args):
-    """`/w N [M]` —— 给 bot 换武器（M = 槽位 1/2/3）；不给 M 就列出有哪些。
+    """`/w [N] [M]` —— 给 bot 换武器（M = 槽位 1/2/3）。三种叫法：
+
+        /w        列出每个 bot 有哪些武器槽可用
+        /w M      ★ **全部** bot 一起换成 M 号武器（用户 2026-08-29 要的）
+        /w N M    只换 N 号位那一个
+
+    ★★ **一个参数为什么当武器槽、不当座位号**：房里通常只有一个 bot，
+    「给所有 bot 换枪」是最常敲的那一条；而「我想知道 N 号位有哪些枪」不带
+    参数一次全列出来更省事（聊天框一次只看得见 4 行，§20，所以列表本来就
+    得挤成一行）。⚠ 座位号和武器槽的取值范围是重叠的（0~5 vs 1~3），
+    两种叫法不可能靠数值区分 —— 这里是**按参数个数**分流，不是按数值猜。
 
     ★★ **为什么只有手动换，没有自动换**：「什么时候该换枪」是 AI 决策，归 M5。
     换枪这条链（`rpChangeWeapon` + 句柄步进跟着变）本身现在就能实机验。
@@ -1023,47 +1071,55 @@ def _cmd_gun(conn, room, args):
     2 号是**炮台**、109 的 3 号是**等离子炮**（那几类的飞行服务端还没有
     模型），角色 3 的 3 号是图腾发射器（`Damage=0`，打不动人）。
     """
+    # 不带参数：把每个 bot 有哪些槽列出来（挤成一行，§20）。
+    if not args:
+        seats = room.bot_seats()
+        if not seats:
+            return "房里没有 bot。"
+        lines = []
+        for index in seats:
+            machine = room.seats[index].conn
+            if not isinstance(machine, BotConn):
+                continue
+            choices = weapondata.usable_for(machine.character_id)
+            if not choices:
+                lines.append(f"{index}: 这个角色一把能用的武器都没有")
+                continue
+            lines.append(f"{index}: " + "；".join(
+                f"{w.raw['slot']}={w.damage}伤{'抛' if w.gravity else '直'}"
+                + ("（当前）" if machine.weapon is not None
+                   and w.id == machine.weapon.id else "")
+                for w in choices))
+        if not lines:
+            return "房里没有 bot。"
+        # ★ 尾巴要短：聊天框一次只看得见 4 行，长行折出来的行同样占额度（§20）。
+        return "  ".join(lines) + "  /w M 全换; /w N M 换一个"
+    try:
+        slot = int(str(args[-1]).strip())
+    except (TypeError, ValueError):
+        return f"武器槽 {args[-1]!r} 不是数字。"
+    # 只给一个参数 = 武器槽，**全部 bot 一起换**（用户 2026-08-29 要的）。
+    if len(args) == 1:
+        seats = room.bot_seats()
+        if not seats:
+            return "房里没有 bot。"
+        done, failed = [], []
+        for index in seats:
+            told, error = _apply_gun(conn, room, index, slot)
+            (failed if error else done).append(error or told)
+        if done:
+            conn.room_system_chat("；".join(done))
+        # ★ 换不了的（角色缺这个槽）单独回给房主，别刷全房间。
+        for error in failed:
+            conn.send_system_chat(f"换不了武器：{error}")
+        return None
     index, error = _seat_arg(args)
     if error:
-        return f"/w 用法：/w <座位号> [武器槽 1~3]。{error}"
-    seat, error = _bot_seat(room, index)
+        return f"/w 用法：/w [座位号] <武器槽 1~3>。{error}"
+    told, error = _apply_gun(conn, room, index, slot)
     if error:
         return f"换不了武器：{error}"
-    machine = seat.conn
-    if not isinstance(machine, BotConn):
-        return f"换不了武器：{index} 号位上不是 bot。"
-    choices = weapondata.usable_for(machine.character_id)
-    if not choices:
-        return (f"{seat.nickname} 这个角色一把能用的武器都没有，它只跑不打。")
-    if len(args) < 2:
-        listed = "；".join(
-            f"{w.raw['slot']}={w.damage}伤{'抛' if w.gravity else '直'}"
-            + ("（当前）" if machine.weapon is not None
-               and w.id == machine.weapon.id else "")
-            for w in choices)
-        return f"{seat.nickname} 可用武器槽：{listed}。敲 /w {index} <槽位> 换。"
-    try:
-        slot = int(str(args[1]).strip())
-    except (TypeError, ValueError):
-        return f"武器槽 {args[1]!r} 不是数字。"
-    chosen = weapondata.slot_for(machine.character_id, slot)
-    if chosen is None:
-        ok = "、".join(str(w.raw["slot"]) for w in choices)
-        return f"{seat.nickname} 没有能用的 {slot} 号武器槽。可选：{ok}。"
-    machine.weapon_slot = slot
-    # ★ **当场把新枪声明出去**（用户 2026-08-27 报的）：不发的话别人手里那把
-    #   枪要等到 bot **下一次开火**才变（`_declare_weapon` 原来只挂在
-    #   `_try_fire` 上）—— 房主敲完命令盯着看，模型半天不动，
-    #   过一会儿突然跳变。换枪是**这条命令**造成的事实，就该在这儿报出去。
-    #   ★ 只在战斗中发得出去（房间里 bot 还没有同步流）。
-    if room.is_playing():
-        with contextlib.suppress(botsync.SyncInvariantError):
-            _declare_weapon(machine, index, machine.weapon)
-    conn.log(f"   /w: 座位 {index} 的 {seat.nickname} -> 槽位 {slot} "
-             f"= {chosen.id}({chosen.section}) 伤害 {chosen.damage} "
-             f"步进 {chosen.handle_step} 间隔 {chosen.fire_interval_ms}ms")
-    conn.room_system_chat(
-        f"{seat.nickname} 换成了 {slot} 号武器（{chosen.damage} 点伤害）。")
+    conn.room_system_chat(told)
     return None
 
 
@@ -3794,6 +3850,42 @@ def _split_shell(room, machine, shell, point, victim_seat):
                     f"{slice_weapon.handle_step} 个句柄（§81）")
 
 
+def _interpolate_bodies(before, after, fraction):
+    """把两帧之间的身体表插值到 `fraction`（0 = 上一帧，1 = 这一帧）。
+
+    ★★★ **为什么要插值**（§96）：这个函数一帧要把弹体推 4 个 tick（收方
+    32 ms 一步、真人心跳 128 ms 一发），而 `_battle_bodies()` 给的是**这一帧
+    刚到的**那个位置 —— 于是「128 ms 前那一 tick 的弹体」被拿去撞「此刻的
+    人」。真人相邻两发心跳之间的位移**中位 12、p90 62、最大 245** 个单位
+    （2026-08-29 那一局 1054 发心跳量的），而碰撞圆最大半径才 13
+    —— 跳起来 / 被顶飞的那几发，判定用的人根本不在那儿。
+
+    原版没有这个问题：收方每 32 ms 也把**远端角色**推一步（心跳只是纠偏），
+    所以射手那台机器每一 tick 都拿得到「那一刻」的位置。服务端手上没有那套
+    推算，但**两端的心跳都已经收到了**，中间那几个 tick 直接插出来就行
+    —— 用的全是已经发生的事实，不是预测（铁律 10）。
+
+    只插位置。`蹲着没有` / `角色id` 取**这一帧**的：那两个是状态不是轨迹，
+    插一半没有意义。上一帧没有的座位（刚进场 / 刚复活）直接用这一帧的值。
+    """
+    if not before or fraction >= 1.0:
+        return after
+    if fraction <= 0.0:
+        fraction = 0.0
+    past = dict((row[0], row) for row in before)
+    out = []
+    for row in after:
+        old = past.get(row[0])
+        if old is None:
+            out.append(row)
+            continue
+        out.append((row[0],
+                    old[1] + (row[1] - old[1]) * fraction,
+                    old[2] + (row[2] - old[2]) * fraction,
+                    row[3], row[4]))
+    return out
+
+
 def _advance_shells(room, machine, now):
     """把所有在飞的子弹推进到**此刻**，撞上什么就当场结算。
 
@@ -3803,6 +3895,9 @@ def _advance_shells(room, machine, now):
     唯一会变的是**别人站在哪**，而那个只有真人的心跳到达时才会变 ——
     这个函数正是挂在那一发心跳上的（`_tick_bot` 的第一件事）。
     也就是说：两帧之间根本没有新事实，推早了也算不出别的结果。
+
+    ★★★ 但**这一帧要补的那 4 个 tick 各自发生在不同时刻**，判命中时得用
+    「那一 tick 人在哪」，不是「此刻人在哪」—— 见 `_interpolate_bodies()`。
 
     ## 一发都不能漏
 
@@ -3825,6 +3920,9 @@ def _advance_shells(room, machine, now):
     machine.pending_shots = []
     terrain = mapdata.load(_current_map(room))
     bodies_cache = {}
+    # ★★★ 上一帧那份快照 + 它的时刻 —— 逐 tick 插值的另一个端点（§96）。
+    was = machine.shell_bodies
+    span = 0.0 if was is None else (now - was[0])
     still = []
     for shell in alive:
         bodies = bodies_cache.get(shell.group)
@@ -3835,6 +3933,7 @@ def _advance_shells(room, machine, now):
                 room, machine.my_seat, shell.group,
                 include_self=(shell.group == botsync.FIRE_GROUP_EVERYONE))
             bodies_cache[shell.group] = bodies
+        before = None if was is None else was[1].get(shell.group)
         # ★ 收方每 32 ms 推一步（`ballistics.TICK_MS`，§47）。这里按**真实
         #   流逝的时间**算它该走到第几步 —— 服务端的帧率（跟着真人心跳走，
         #   ~8 Hz）和它无关，所以帧掉几拍也不会让子弹变慢。
@@ -3845,7 +3944,16 @@ def _advance_shells(room, machine, now):
         want = min(want, shell.max_ticks)
         landed = None
         while shell.ticks < want:
-            landed = _shell_step(room, shell, terrain, bodies)
+            # ★★★ 这一 tick 发生在什么时候 —— 拿它在两帧之间插出「那一刻
+            #   人在哪」（§96）。`span <= 0` = 没有上一帧（这一局第一发、
+            #   或者 `_try_fire` 刚刚才推过一次），那就只有这一帧的快照可用。
+            if span > 0.0 and before is not None:
+                moment = shell.born + (shell.ticks + 1) / ballistics.TICKS_PER_SECOND
+                at = _interpolate_bodies(
+                    before, bodies, (moment - was[0]) / span)
+            else:
+                at = bodies
+            landed = _shell_step(room, shell, terrain, at)
             if landed is not None:
                 break
         if landed is None and shell.ticks < shell.max_ticks:
@@ -3858,6 +3966,9 @@ def _advance_shells(room, machine, now):
     # ★ `still` 在前、这一轮新生的碎片在后 —— 顺序只影响下一帧的推进次序，
     #   不影响句柄（那个在 `sync.fire()` 里就定死了）。
     machine.pending_shots = still + machine.pending_shots
+    # ★★ 这一帧的快照留给下一帧当插值起点（§96）。只留真的取过的那几个组
+    #   —— 没取过的组下一帧自己会重新取，用不着占位。
+    machine.shell_bodies = (now, bodies_cache)
 
 
 # ---------------------------------------------------------------------------

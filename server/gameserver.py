@@ -1591,6 +1591,18 @@ def parse_quick_join_request(payload):
 #: 「点名字」用的昵称，查不到就跳过，不影响正文显示（§141）。
 CHAT_NO_SEAT = 0xFFFF
 
+#: ★★★ `gspReceiveChatMsg` 的第 4 个字段**就是文字颜色**（0xRRGGBB），不是
+#: 什么「聊天类型」枚举（V0.3 §97）。收方 `0x40605d` 把它原样存进聊天条目的
+#: `+4`，渲染时 `0x42b02f` 做 `(颜色 & 0xFFFFFF) | (淡出alpha << 24)` 再交给
+#: `0x5bcfdc` 设字色 —— 原版自己在 `0x406583` 那一路推的就是 `0xFFCCCCCC`。
+#:
+#: 以前这里回填的是客户端上行 `gcpSendChatMsg` 的那个 **u8**（0/1/2 之类），
+#: 于是颜色算出来是 `0x000000`~`0x000002` —— 黑到发蓝，在战斗背景上根本看不清。
+#: 用户 2026-08-29：「房间里和游戏过程中的对话……显示的字体都是深蓝色，比较暗」。
+#: ⚠ 一并的代价：**全体 / 队伍聊天的颜色区分没了**（原版靠这个字段区分）。
+#: 要分回来就把这里换成一张「上行 u8 -> 亮色」的表，别再把 u8 直接当颜色发。
+CHAT_TEXT_COLOR = 0xFFFFFF
+
 
 def parse_chat_message(payload):
     """解客户端方向的 `0x0305 gcpSendChatMsg`（序列化 `0x54c26c`，§141）。
@@ -1606,20 +1618,21 @@ def parse_chat_message(payload):
     return chat_type, text
 
 
-def build_receive_chat(text, sender="", seat_index=CHAT_NO_SEAT, chat_type=0):
+def build_receive_chat(text, sender="", seat_index=CHAT_NO_SEAT,
+                       color=CHAT_TEXT_COLOR):
     """opcode 0x0305 —— `gspReceiveChatMsg`（序列化 `0x404e3b`，§141）。
 
         u16     发言者座位号   0..5；客户端拿它去座位里查昵称（点名字用）
         string  发言者显示名   ★ 非空 -> 渲染成 '%s : %s'；空 -> 只显示正文
         string  正文
-        int32   聊天类型       传给 0x40605d 决定颜色
+        int32   ★ **文字颜色 0xRRGGBB**（V0.3 §97，见 `CHAT_TEXT_COLOR`）
 
     所以**系统提示把 `sender` 留空**就能得到一行没有「XXX : 」前缀的白话。
     """
     return (struct.pack("<H", seat_index & 0xFFFF)
             + w_wstr(sender)
             + w_wstr(text)
-            + w_i32(chat_type))
+            + w_i32(color))
 
 
 def parse_kick_out_request(payload):
@@ -7618,8 +7631,10 @@ class Conn:
             index = room.seat_index_of(self)
             if index is not None:
                 seat_index = index
+        # ★ 上行那个 `chat_type` **不能原样回填**：那一格在收方是**颜色**，
+        #   回一个 0/1/2 就是「近乎纯黑」（§97）。统一发白字。
         packet = build_game(OP_CHAT, build_receive_chat(
-            text, sender=sender, seat_index=seat_index, chat_type=chat_type))
+            text, sender=sender, seat_index=seat_index))
         # ★ 发言的人自己也要收到一份 —— 客户端发完 0x0305 什么都不做，
         #   本地不回显（和换角色 §103 是同一个套路）。
         self.log(f"   聊天(type={chat_type}) {sender!r}: {text!r} "

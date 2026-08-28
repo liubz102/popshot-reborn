@@ -1834,17 +1834,50 @@ class BotWeaponDeclarationTests(BotFireRoom):
 
 
 class BotGunCommandTests(BotFireRoom):
-    """`/w N M` —— 房主手动换枪（自动换是 M5 的事，见 `_cmd_gun` 的注释）。"""
+    """`/w [N] M` —— 房主手动换枪（自动换是 M5 的事，见 `_cmd_gun` 的注释）。"""
 
     def gun(self, *args):
         """敲一条 `/w`，返回房主看到的那几行系统提示。"""
         self.alice.sent.clear()
         self.assertTrue(bot.handle_command(
-            self.alice, "/w " + " ".join(map(str, args))))
+            self.alice, ("/w " + " ".join(map(str, args))).strip()))
         return "".join(chat_lines(self.alice))
 
     def test_listing_shows_the_usable_slots(self):
-        self.assertIn("可用武器槽", self.gun(self.bot_seat))
+        """★ 不带参数 = 列出每个 bot 的可用槽（一个参数已经改成「全换」）。"""
+        listed = self.gun()
+        self.assertIn(f"{self.bot_seat}: ", listed)
+        self.assertIn("（当前）", listed)
+
+    def test_one_argument_switches_every_bot(self):
+        """★ 用户 2026-08-29 要的：`/w 2` = 所有 bot 一起换成 2 号武器。"""
+        slots = sorted(w.raw["slot"] for w in
+                       weapondata.usable_for(self.bot_conn.character_id))
+        other = [s for s in slots if s != self.bot_conn.weapon.raw["slot"]]
+        self.assertTrue(other, "这个角色得有第二个可用槽，用例才有意义")
+        self.gun(other[0])
+        self.assertEqual(other[0], self.bot_conn.weapon_slot)
+        self.assertEqual(weapondata.slot_for(self.bot_conn.character_id,
+                                             other[0]).id,
+                         self.bot_conn.weapon.id)
+
+    def test_one_argument_reaches_every_bot_in_the_room(self):
+        """两个 bot 都得换 —— 「全换」的整个意义就在这儿。"""
+        # ★ `/a` 在战斗中会被 `MUTATING_COMMANDS` 挡掉，直接调底层加一个。
+        index, error = bot._add_one_bot(self.alice, self.room)
+        self.assertIsNotNone(index, error)
+        machines = [self.room.seats[i].conn for i in self.room.bot_seats()]
+        self.assertEqual(2, len(machines))
+        slot = sorted(w.raw["slot"] for w in
+                      weapondata.usable_for(machines[0].character_id))[-1]
+        self.gun(slot)
+        for machine in machines:
+            self.assertEqual(slot, machine.weapon_slot)
+
+    def test_one_argument_with_an_unusable_slot_is_refused(self):
+        before = self.bot_conn.weapon.id
+        self.assertIn("没有能用的 9 号武器槽", self.gun(9))
+        self.assertEqual(before, self.bot_conn.weapon.id)
 
     def test_switching_changes_the_ammo_and_the_handle_step(self):
         """★ 换到步进 2 的武器之后，句柄必须**跟着每发走 2 格** ——
@@ -4292,6 +4325,91 @@ class BotBuriedMuzzleTests(TerrainMixin, BotFireRoom):
         self.bot_conn.holding = True
         self.walk(self.alice, [(900, 880), (920, 880), (940, 880)])
         self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+
+
+class BotShellBodyLerpTests(BotFireRoom):
+    """★★★ 判命中要用「**那一 tick** 人在哪」，不是「此刻人在哪」（§96）。
+
+    用户 2026-08-29：「我跳起来看见苹果弹已经砸到我身上了，但是没有爆炸。」
+
+    一帧要把弹体推 4 个 tick（收方 32 ms 一步、真人心跳 128 ms 一发），
+    而 `_battle_bodies()` 给的是**这一帧刚到**的位置 —— 于是「128 ms 前那一
+    tick 的弹体」被拿去撞「此刻的人」。2026-08-29 那一局的 1054 发心跳里，
+    相邻两发之间的位移中位 12、p90 62、**最大 245** 个单位，而碰撞圆最大
+    半径才 13：跳起来 / 被顶飞的那几发，判定用的人根本不在那儿。
+    """
+
+    def lerp_setup(self, old_y, new_y):
+        """真人从 `old_y` 挪到 `new_y`，返回 `(时刻, 上一帧的身体表, 组)`。"""
+        self.walk(self.alice, [(500.0, new_y)])
+        self.settle()
+        self.clear()
+        group = bot._seat_group(self.room, self.bot_seat)
+        alice_seat = self.room.seat_index_of(self.alice)
+        old = [(alice_seat, 500.0, old_y, False,
+                self.room.seats[alice_seat].character_id)]
+        now = time.monotonic()
+        self.bot_conn.shell_bodies = (now - 1.0, {group: old})
+        return now, old, group
+
+    def shoot_through(self, now, group, y):
+        """从 `(0, y)` 横着打一发**极快**的弹（第 1 个 tick 就到 x=500）。
+
+        返回这一发有没有打中人。
+        """
+        weapon = self.bot_conn.weapon
+        shot = ballistics.Shot(0.0, 1.0, 500.0, 4, 0.0)
+        shell = bot.Shell(1, self.bot_conn.sync.events - 1, weapon, group,
+                          0.0, y, shot, now - 1.0, 4)
+        self.bot_conn.pending_shots = [shell]
+        bot._advance_shells(self.room, self.bot_conn, now)
+        frames = explode_frames(self.alice, self.bot_seat)
+        self.assertTrue(frames, "每一颗都必须恰好发一发 rpExplode（§42）")
+        return struct.unpack_from("<i", body_of(frames[0]), 4)[0] != 0
+
+    def body_center_at(self, foot_y):
+        return chrprops.get(
+            self.room.seats[self.room.seat_index_of(self.alice)].character_id
+        ).center(500.0, foot_y)[1]
+
+    def test_it_hits_where_the_target_was_during_that_tick(self):
+        """★ 弹体第 1 个 tick 发生在这一帧**刚开头** —— 那时人还在原地。"""
+        now, _old, group = self.lerp_setup(100.0, 900.0)
+        fraction = (1.0 / ballistics.TICKS_PER_SECOND) / 1.0
+        y = self.body_center_at(100.0 + (900.0 - 100.0) * fraction)
+        self.assertTrue(self.shoot_through(now, group, y),
+                        "插值后该打中「那一 tick 的人」")
+
+    def test_it_no_longer_hits_where_the_target_only_got_to_at_the_end(self):
+        """★ 反过来：人这一帧结束时才到的地方，不该被 128 ms 前的弹体打到。
+
+        改之前正是这一条错的 —— 2026-08-29 那一局 49 发苹果雷里有一发
+        （句柄 200088）就这么判成了命中，而玩家看到的弹体离身体还有 20 个单位。
+        """
+        now, _old, group = self.lerp_setup(100.0, 900.0)
+        self.assertFalse(self.shoot_through(now, group,
+                                            self.body_center_at(900.0)),
+                         "不该拿「这一帧末的人」去撞「这一帧初的弹」")
+
+    def test_without_a_previous_frame_it_falls_back_to_the_latest(self):
+        """★ 这一局第一发（没有上一帧可插）—— 老口径，别把它判空。"""
+        self.walk(self.alice, [(500.0, 900.0)])
+        self.settle()
+        self.clear()
+        self.bot_conn.shell_bodies = None
+        group = bot._seat_group(self.room, self.bot_seat)
+        self.assertTrue(self.shoot_through(time.monotonic(), group,
+                                           self.body_center_at(900.0)))
+
+    def test_interpolate_bodies_only_moves_the_position(self):
+        before = [(0, 0.0, 0.0, True, 7)]
+        after = [(0, 100.0, 200.0, False, 7), (1, 5.0, 5.0, False, 2)]
+        got = bot._interpolate_bodies(before, after, 0.25)
+        self.assertEqual((0, 25.0, 50.0, False, 7), got[0])
+        # 上一帧没有的座位（刚复活）原样用这一帧的。
+        self.assertEqual((1, 5.0, 5.0, False, 2), got[1])
+        self.assertEqual(after, bot._interpolate_bodies(before, after, 1.0))
+        self.assertEqual(after, bot._interpolate_bodies(None, after, 0.5))
 
 
 class BotShellGirthTests(TerrainMixin, BotFireRoom):

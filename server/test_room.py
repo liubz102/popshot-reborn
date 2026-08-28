@@ -394,12 +394,19 @@ class ChatWireTests(unittest.TestCase):
 
     def test_broadcast_chat_layout(self):
         reader = Reader(build_receive_chat("你好", sender="Alice",
-                                           seat_index=2, chat_type=1))
+                                           seat_index=2, color=0x123456))
         self.assertEqual(2, reader.u16())
         self.assertEqual("Alice", reader.wstr())
         self.assertEqual("你好", reader.wstr())
-        self.assertEqual(1, reader.i32())
+        self.assertEqual(0x123456, reader.i32())
         self.assertEqual(0, reader.left())
+
+    def test_chat_is_white_by_default(self):
+        # ★ 末尾那个 int32 在收方是**文字颜色**（§97）：回 0/1/2 就是黑到
+        #   发蓝、看不清。默认必须是白的。
+        reader = Reader(build_receive_chat("hi"))
+        reader.u16(), reader.wstr(), reader.wstr()
+        self.assertEqual(0xFFFFFF, reader.i32())
 
     def test_system_message_leaves_the_sender_empty(self):
         # 显示名为空时客户端只渲染 '%s'，不带「谁 : 」前缀（§141）。
