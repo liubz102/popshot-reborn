@@ -114,15 +114,35 @@ class Weapon(object):
 
     @property
     def handle_step(self):
-        """★★ 每发 `rpFire` 会让收方的弹体句柄计数器前进几格。
+        """★★ 一发 `rpFire` 从头到尾**总共**吃掉几个句柄。
 
         `shots × (2 if SplashRange else 1)`（§46）。`None` / 0 = 算不出来，
         这种武器 bot 不许用（现在的表里没有这种）。
 
-        ⚠ 它只在「**这一发的 `rpExplode` 全发完之前不开下一枪**」的前提下
-        成立，闸门在 `bot.py`（`_pending_explosions`）。
+        ⚠★★★ **这是个总数，不是「开火那一刻」的步进**（§86）。收方是
+        分两次记的：开火时每颗弹体 1 个（`fire_step`），爆炸时每个爆炸
+        对象 1 个（`explode_step`）。两者只有在「本发的 `rpExplode` 全发完
+        之前不开下一枪」时才等价 —— 而**分裂弹的 4 片碎片是同时在飞的**，
+        按总数记就会把它们的号排成 `base, base+2, base+4, base+6`，
+        而收方给的是 `base, base+1, base+2, base+3`（§86 实机对上）。
+        ⇒ 记账要用 `fire_step` / `explode_step`，这一格只留作校验和文档。
         """
         return self.raw.get("handle_step")
+
+    @property
+    def fire_step(self):
+        """**开火那一刻**吃掉几个句柄 = 造出来几颗弹体（§86）。"""
+        return self.shots
+
+    @property
+    def explode_step(self):
+        """**每颗弹体爆炸时**再吃几个句柄：带溅射的 1 个，不带的 0 个。
+
+        ★ 那一个是收方处理 `rpExplode` 时创建的溅射对象（§54 的 `/noboom`
+        实验把它钉死过：只发 `rpFire` 不发 `rpExplode`，多出来的那一格
+        就不会被分配）。
+        """
+        return 1 if self.raw.get("splash_range") else 0
 
     @property
     def shots(self):

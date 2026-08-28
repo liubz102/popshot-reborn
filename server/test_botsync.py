@@ -1693,7 +1693,9 @@ class BotFireTests(BotFireRoom):
         self.assertIsNotNone(weapon)
         damage = struct.unpack_from("<f", body_of(
             explode_frames(self.alice, self.bot_seat)[0]), 24)[0]
-        self.assertAlmostEqual(float(weapon.damage), damage)
+        # ★ 夺分模式（夹具默认 args[1] = 3）伤害 ×2（§87）。
+        self.assertAlmostEqual(float(weapon.damage) * bot._damage_scale(self.room),
+                               damage)
 
     def test_the_fire_packet_says_ten_plus_the_bot_seat(self):
         """`rpFire +0` 是 `10 + 座位号`，语料 7040 发和头 `+1` 100% 一致。"""
@@ -2599,7 +2601,9 @@ class BotSplashTests(BotFireRoom):
         seat, damage, _where = hits[0]
         self.assertEqual(0, seat)
         self.assertGreater(damage, 0)
-        self.assertLess(damage, shell.weapon.splash_damage,
+        # ★ 夺分模式（夹具默认 args[1] = 3）整条伤害 ×2（§87）。
+        self.assertLess(damage,
+                        shell.weapon.splash_damage * bot._damage_scale(self.room),
                         "离中心越远伤害越小（weapon.ini 自己写的）")
 
     def test_outside_the_radius_nobody_gets_splashed(self):
@@ -2794,9 +2798,9 @@ class BotSliceTests(BotFireRoom):
         frags = [f for f in fire_frames(self.alice, self.bot_seat)
                  if struct.unpack_from("<i", body_of(f), 2)[0] == 1000500]
         self.assertEqual(4, len(frags))
-        # 每片吃 `handle_step` 个句柄。
-        step = weapondata.get(1000500).handle_step
-        self.assertEqual(before + 4 * step, self.bot_conn.sync.projectiles)
+        # ★★★ 母弹的爆炸对象 1 个 + 四片各 1 个（§86）——
+        #   四片多出来的那一个是**各自爆炸时**才分配的，不在这儿。
+        self.assertEqual(before + 1 + 4, self.bot_conn.sync.projectiles)
 
     def test_the_fragments_hit_everyone_and_come_from_the_shooter(self):
         """★ 碰撞组恒 255（`0x47ca0f: or eax, 0xffffffff`），owner 是射手。
@@ -3065,8 +3069,9 @@ class BotFireWallTests(BotFireRoom):
         self.assertEqual(botsync.character_handle(
             self.room.seat_index_of(self.alice)),
             struct.unpack_from("<i", body, 4)[0])
-        self.assertAlmostEqual(weapondata.get(1001500).damage,
-                               struct.unpack_from("<f", body, 8)[0], places=3)
+        self.assertAlmostEqual(
+            weapondata.get(1001500).damage * bot._damage_scale(self.room),
+            struct.unpack_from("<f", body, 8)[0], places=3)
 
     def test_the_same_person_is_not_burnt_every_tick(self):
         """★ 两次挨烧之间至少隔 `BOT_FIRE_REBURN_TICKS` 个 tick（§78 语料量的）。
@@ -3408,7 +3413,9 @@ class BotDashTests(BotFireRoom):
         damage = struct.unpack_from("<f", body, 8)[0]
         self.assertEqual(botsync.character_handle(0), victim)
         move = chrprops.get(self.bot_conn.character_id).dash()
-        self.assertAlmostEqual(float(move.damage), damage, places=3)
+        # ★ 夺分模式（夹具默认 args[1] = 3）伤害 ×2（§87）。
+        self.assertAlmostEqual(float(move.damage) * bot._damage_scale(self.room),
+                               damage, places=3)
         self.assertEqual(handle, source, "伤害源就是这一下的句柄")
 
     def test_one_dash_damages_at_most_once(self):
@@ -4082,6 +4089,28 @@ class BotBounceTests(TerrainMixin, BotFireRoom):
         self.assertGreater(shell.vx, 0.0, "还该往右走")
         self.assertLess(shell.vy, 0.0, "该被地面弹起来（y 往上是负）")
 
+    def test_a_vertical_wall_flips_the_horizontal_component_exactly(self):
+        """★★ 竖直面是**唯一能对死**的一类（§88）：x 取反、y 不动、整体减半。
+
+        客户端实测三发（图边）：`v=(22.28, 12.50)` → `(-11.14, 6.25)`、
+        `v=(22.16, 13.42)` → `(-11.08, 6.71)`、
+        `v=(-26.76, -0.45)` → `(13.38, -0.23)` —— 一位不差。
+        """
+        weapon = weapondata.get(1000020)
+        terrain = self.flat()
+        # 贴着图的**右边界**平飞过去：图外算实心，那就是一面竖直的墙。
+        shell = self.shell(weapon, terrain.width - 60.0, 200.0, 0.0, 25.0)
+        vin = None
+        while shell.ticks < shell.max_ticks and not shell.bounced:
+            vin = bot._shell_velocity(shell)
+            bot._shell_step(self.room, shell, terrain, [])
+        self.assertTrue(shell.bounced, "该撞上图的右边界")
+        want = (vin[0], vin[1] + shell.shot.gravity)
+        self.assertAlmostEqual(-want[0] * bot.BOUNCE_RESTITUTION,
+                               shell.vx, places=2)
+        self.assertAlmostEqual(want[1] * bot.BOUNCE_RESTITUTION,
+                               shell.vy, places=2)
+
     def test_the_flame_bomb_still_explodes_on_contact(self):
         """★ 没引信的照旧撞上什么炸在那儿 —— 别把火焰弹一起改了。"""
         weapon = weapondata.get(1001020)
@@ -4154,9 +4183,9 @@ class BotFireProofTimeTests(BotFireRoom):
         burns = self.burns()
         self.assertEqual(4, len(burns), "一道墙烧 4 次，两道叠着也还是 4 次")
         for frame in burns:
-            self.assertAlmostEqual(weapondata.get(1001500).damage,
-                                   struct.unpack_from("<f", body_of(frame), 8)[0],
-                                   places=3)
+            self.assertAlmostEqual(
+                weapondata.get(1001500).damage * bot._damage_scale(self.room),
+                struct.unpack_from("<f", body_of(frame), 8)[0], places=3)
 
     def test_the_burn_ledger_is_per_person_not_per_wall(self):
         self.walk(self.alice, [(400, 100)])
@@ -4172,3 +4201,224 @@ class BotFireProofTimeTests(BotFireRoom):
         self.bot_conn.burnt[0] = 12345
         self.bot_conn.reset_battle_frame()
         self.assertEqual({}, self.bot_conn.burnt)
+
+
+class ReceiverLedger(object):
+    """★★★ 收方那本**弹体句柄账**的最小复刻（§42 / §86）。
+
+    收方只有一个计数器，谁创建对象谁 `++`：
+
+    * `rpFire`  —— 当场造 `shots` 颗弹体，各占 1 个（`0x49231e` 的内层循环）；
+    * `rpExplode` —— **句柄查得到**才处理；带溅射的武器会再造一个溅射对象，
+      又占 1 个（§54 的 `/noboom` 实验钉死的）。查不到就**静默丢弃**；
+    * `rpSetOnFire` —— 一道火墙 `2n+1` 团火（§75）；
+    * `rpDash` —— 1 个（§64）。
+
+    `dropped` 里只要有东西，实机上就是「子弹照飞、一滴血不掉，
+    换武器也救不回来」。
+    """
+
+    def __init__(self, seat, start=0):
+        self.seat = seat
+        self.counter = start
+        self.live = {}          # 句柄 -> 武器 id
+        self.dropped = []
+
+    def _take(self, n):
+        base = botsync.projectile_handle(self.seat, self.counter)
+        self.counter += n
+        return base
+
+    def feed(self, packet):
+        opcode = header(packet)["opcode"]
+        body = body_of(packet)
+        if opcode == botsync.OP_FIRE:
+            ammo = struct.unpack_from("<i", body, 2)[0]
+            shots = struct.unpack_from("<i", body, 22)[0]
+            base = self._take(shots)
+            for i in range(shots):
+                self.live[base + i] = ammo
+        elif opcode == botsync.OP_EXPLODE:
+            handle = struct.unpack_from("<i", body, 0)[0]
+            ammo = self.live.pop(handle, None)
+            if ammo is None:
+                self.dropped.append(handle)
+                return
+            self._take(weapondata.get(ammo).explode_step)
+        elif opcode == botsync.OP_SET_ON_FIRE:
+            slice_id = struct.unpack_from("<i", body, 10)[0]
+            self._take(botsync.fire_wall_handles(
+                weapondata.get(slice_id).raw.get("spawn_count")))
+        elif opcode == botsync.OP_DASH:
+            self._take(1)
+
+
+class BotHandleLedgerTests(BotSliceTests):
+    """★★★★★ 服务端预测的句柄和收方**实际**分配的必须一格不差（§86）。
+
+    用户 2026-08-28：「1 号角色，一开始打我有伤害，但是扔了几个手雷之后
+    他的子弹就没有伤害了……之后我再给他换成其他武器，也全都没伤害了。」
+
+    实机日志把它钉死了（最后一局，客户端 `PROJ+` 的句柄 vs 服务端 `开火:`）：
+
+    ```text
+    苹果雷 A   服务端 200020   收方 200020   ✓
+    苹果雷 B   服务端 200022   收方 200022   ✓   ← 第一次分裂就在这一发之后
+    苹果雷 C   服务端 200032   收方 200030   ✗ 差 2
+    苹果雷 D   服务端 200042   收方 200036   ✗ 差 6
+    苹果雷 E   服务端 200052   收方 200041   ✗ 差 11   ← 越差越多
+    ```
+
+    根因：`_split_shell()` 给每片碎片按 `handle_step`（**总数** 2）记账，
+    于是四片排成 `base, base+2, base+4, base+6`；而收方在开火那一刻每片
+    只分配 1 个（连号），另一个是**各自爆炸时**才创建的溅射对象。
+    """
+
+    def ledger_run(self, rounds=6):
+        """让 bot 连打几发苹果雷，把它发出去的每一帧喂给收方账本。"""
+        led = ReceiverLedger(self.bot_seat)
+        self.apple()
+        self.bot_conn.roll = lambda n: 0
+        self.bot_conn.holding = True
+        self.walk(self.alice, [(0.0, 100.0), (600.0, 100.0)])
+        self.settle()
+        seen = 0
+        for _ in range(rounds):
+            self.bot_conn.next_fire_at = 0.0
+            self.walk(self.alice, [(600.0, 100.0)])
+            self.charge()
+            self.walk(self.alice, [(600.0, 100.0)])
+            self.walk(self.alice, [(3000.0, 100.0)])   # 躲开 —— 让它落空分裂
+            for shell in self.bot_conn.pending_shots:
+                shell.max_ticks = min(shell.max_ticks, 20)
+            self.settle()
+            frames = bot_frames(self.alice, self.bot_seat)
+            for packet in frames[seen:]:
+                led.feed(packet)
+            seen = len(frames)
+        return led
+
+    def test_the_receiver_never_drops_an_explosion(self):
+        led = self.ledger_run()
+        self.assertEqual([], led.dropped,
+                         "收方查不到句柄 = 静默丢弃 = 从此打不掉血（§42）")
+
+    def test_the_server_and_the_receiver_agree_on_the_next_handle(self):
+        led = self.ledger_run()
+        self.assertEqual(botsync.projectile_handle(self.bot_seat,
+                                                   self.bot_conn.sync.projectiles),
+                         botsync.projectile_handle(self.bot_seat, led.counter))
+
+    def test_the_four_fragments_get_consecutive_handles(self):
+        """★ 四片必须是**连号** —— 这就是上面那条差 2 的直接来源。
+
+        收方在开火那一刻每片只造一颗弹体、只占 1 个句柄；多出来的那一个
+        是**各自爆炸时**创建的溅射对象（§54 / §86）。
+        """
+        weapon = self.apple()
+        self.bot_conn.roll = lambda n: 0
+        self.bot_conn.pending_shots = []
+        shell = bot.Shell(botsync.projectile_handle(self.bot_seat, 0), 0,
+                          weapon, 9, 100.0, 100.0,
+                          ballistics.launch(weapon, 0.0, 30.0), 0.0, 40)
+        bot._split_shell(self.room, self.bot_conn, shell, (100.0, 100.0), None)
+        frags = list(self.bot_conn.pending_shots)
+        self.assertEqual(4, len(frags), "该有四片碎片在飞")
+        handles = sorted(s.handle for s in frags)
+        self.assertEqual(list(range(handles[0], handles[0] + 4)), handles)
+
+
+class BotGameModeDamageTests(BotFireRoom):
+    """★★★★ **夺分模式伤害翻倍**（§87）。
+
+    用户 2026-08-28：「我用火焰自己烧自己试出结果了，生存模式就是正常的
+    10，夺分模式会变成 2 倍伤害，而 bot 扔的火焰无论什么模式都是 10。」
+
+    原版是射手那台机器在把数字塞进包之前做的，`0x4806bf` 开头三句：
+
+    ```asm
+    004806d8  call 0x409e0a          ; 游戏模式 = 房间描述符 arguments[1]
+    004806dd  cmp eax, 3 ; je        ; 夺分
+    004806e9  cmp eax, 5 ; jne
+    004806f1  shl dword ptr [eax], 1 ; ★ ×2
+    ```
+
+    这个函数是**所有伤害的必经之路**：直接命中（`0x47ec5b` 在
+    `Projectile::OnHit` 里）、溅射（`0x481dfd`）、地面燃烧（`0x480e52`）
+    都要过它。
+    """
+
+    def set_mode(self, mode):
+        args = list(self.room.arguments or (0, 0, 0))
+        while len(args) < 3:
+            args.append(0)
+        args[1] = mode
+        self.room.arguments = tuple(args)
+
+    def test_the_scale_is_two_only_in_deathmatch_and_mode_five(self):
+        for mode, want in ((0, 1), (1, 1), (2, 1), (3, 2), (4, 1), (5, 2)):
+            self.set_mode(mode)
+            self.assertEqual(want, bot._damage_scale(self.room),
+                             f"模式 {mode}")
+
+    def test_an_unreadable_room_never_doubles(self):
+        """★ 读不出模式一律**不翻倍** —— 闯关房的 `arguments` 不是这套含义。"""
+        self.room.arguments = ()
+        self.assertEqual(1, bot._damage_scale(self.room))
+        self.room.arguments = (1,)
+        self.assertEqual(1, bot._damage_scale(self.room))
+
+    def damage_of_one_shot(self):
+        self.bot_conn.next_fire_at = 0.0
+        self.clear()
+        self.approach()
+        booms = explode_frames(self.alice, self.bot_seat)
+        self.assertTrue(booms)
+        return max(struct.unpack_from("<f", body_of(f), 24)[0] for f in booms)
+
+    def test_a_direct_hit_doubles_in_deathmatch(self):
+        self.set_mode(gameserver.PVP_MODE_SURVIVAL)
+        plain = self.damage_of_one_shot()
+        self.assertGreater(plain, 0.0)
+        self.set_mode(gameserver.PVP_MODE_DEATHMATCH)
+        self.assertAlmostEqual(plain * 2.0, self.damage_of_one_shot(), places=3)
+
+    def test_the_fire_wall_doubles_in_deathmatch(self):
+        flame = weapondata.get(1001500)
+        for mode, want in ((gameserver.PVP_MODE_SURVIVAL, flame.damage),
+                           (gameserver.PVP_MODE_DEATHMATCH, flame.damage * 2)):
+            self.set_mode(mode)
+            self.bot_conn.burnt = {}
+            self.walk(self.alice, [(400, 100)])
+            spot = self.alice.sync_trail[-1][:2]
+            life = bot._fire_wall_ticks(flame)
+            wall = bot.FireWall(
+                botsync.projectile_handle(self.bot_seat, 0), flame,
+                [bot.Flame(botsync.projectile_handle(self.bot_seat, 0),
+                           float(spot[0]), float(spot[1]), 0, life)],
+                time.monotonic(), life)
+            wall.born_tick -= bot.BOT_FIRE_REBURN_TICKS
+            self.bot_conn.fires = [wall]
+            self.clear()
+            self.walk(self.alice, [tuple(spot)])
+            burns = [f for f in bot_frames(self.alice, self.bot_seat)
+                     if header(f)["opcode"] == botsync.OP_SPLASH_DAMAGED]
+            self.assertTrue(burns, f"模式 {mode} 该掉血")
+            self.assertAlmostEqual(
+                float(want), struct.unpack_from("<f", body_of(burns[0]), 8)[0],
+                places=3, msg=f"模式 {mode}")
+
+    def test_the_splash_doubles_in_deathmatch(self):
+        weapon = weapondata.get(1000020)
+        shell = bot.Shell(1, 0, weapon, 9, 0.0, 0.0,
+                          ballistics.launch(weapon, 0.0, 30.0), 0.0, 40)
+        bodies = [(0, weapon.splash_range * 0.5, 0.0, False, 0)]
+        self.set_mode(gameserver.PVP_MODE_SURVIVAL)
+        plain = bot._splash_targets(self.room, shell, (0.0, 0.0), None, bodies)
+        self.set_mode(gameserver.PVP_MODE_DEATHMATCH)
+        doubled = bot._splash_targets(self.room, shell, (0.0, 0.0), None, bodies)
+        self.assertEqual(1, len(plain))
+        self.assertEqual(1, len(doubled))
+        # ★ 倍率乘在**衰减之前**，所以只到取整误差为止（差 1 是四舍五入）。
+        self.assertLessEqual(abs(plain[0][1] * 2 - doubled[0][1]), 1)
+        self.assertGreater(doubled[0][1], plain[0][1])

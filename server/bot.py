@@ -1298,6 +1298,51 @@ def _current_map(room):
     return room.map_name
 
 
+#: ★★★ **伤害翻倍的那两个游戏模式**（§87）。
+#:
+#: 出处 `0x4806bf`（射手那台机器上，所有伤害的必经之路）开头三句：
+#:
+#:     004806d8  call 0x409e0a          ; 游戏模式 = 房间描述符 arguments[1]
+#:     004806dd  cmp eax, 3 ; je        ; ★ 夺分
+#:     004806e9  cmp eax, 5 ; jne       ; ★ 还有一个 5
+#:     004806f1  shl dword ptr [eax], 1 ; ★★ 伤害整数**左移一位 = ×2**
+#:
+#: 用户 2026-08-28 拿火焰自己烧自己实测：生存模式 10、夺分模式 20，
+#: 一位不差。★ 模式 5 我们的服务端造不出来（PvP 只有 0~3），照抄留着。
+BOT_DOUBLE_DAMAGE_MODES = (3, 5)
+
+
+def _pvp_game_mode(room):
+    """这一局的游戏模式号（房间描述符 `arguments[1]`）；读不出来返回 `None`。
+
+    ★ 读不出来一律当「不翻倍」——闯关房的 `arguments` 不是这套含义，
+    宁可少乘也不要凭空给怪加一倍伤害。
+    """
+    arguments = getattr(room, "arguments", None) or ()
+    if len(arguments) <= 1:
+        return None
+    try:
+        return int(arguments[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _damage_scale(room):
+    """这一局伤害要乘几（§87）。夺分（3）和模式 5 是 **2**，其余是 1。
+
+    ★★ 这一步在原版里是**射手那台机器**做的（`0x4806bf` 在
+    `IsMine` 门后面），改的是要塞进 `rpExplode +24` / `rpSplashDamaged +8`
+    的那个整数 —— 收方拿到多少就扣多少，不重算（§42）。
+    bot 没有本机 ⇒ 归服务端。
+
+    ⚠ 同一个函数后面还有一串**装备 / 附魔 / 宠物**的百分比加成
+    （`0x407014(角色, 属性号, -1)` 取百分比，`damage × (100+pct) × 0.01`，
+    属性号 1 / 7 / 8 / 2 …）。bot 是白板号，一个都没有 —— 真人身上有，
+    那部分归他们自己那台机器算，服务端不碰。
+    """
+    return 2 if _pvp_game_mode(room) in BOT_DOUBLE_DAMAGE_MODES else 1
+
+
 def _seat_group(room, seat_index):
     """这个座位的**碰撞排除组**（`rpFire body+1`，§63）。
 
@@ -2383,21 +2428,40 @@ def _shell_velocity(shell):
             speed * math.sin(shell.shot.angle) + shell.shot.gravity * shell.ticks)
 
 
+#: 量地形法线时往外看多远 —— 弹体半径的**两倍**（§88）。
+#:
+#: ★ 这是个**拟合值**，不是逆出来的：原版怎么算法线还没读出来，
+#: 只能拿实机的 57 次反弹（客户端逐帧日志，Forest_b）反推每一次的法线，
+#: 再看哪个采样半径最贴。出射方向的中位误差：
+#:
+#:     半径  9（= Size+1，会话 25 用的）  17.1°   ★ 还有 27 次根本量不出法线
+#:     半径 12                            10.2°
+#:     半径 16（= Size×2）                10.4°   p75 15.4°  p90 23.5°
+#:     半径 20                            10.8°
+#:
+#: 12~20 之间是平的，取 `Size × 2` 只是因为它是个跟着武器走的比例，
+#: 不是又一个魔数。⚠ 残差写在 §88 里，别把它当成对的。
+BOUNCE_NORMAL_REACH = 2.0
+
+
 def _terrain_normal(terrain, x, y, radius):
     """`(x, y)` 附近那片地形的法线（指向弹体这一侧），量不出来返回 `None`。
 
-    做法：把半径 `radius + 1` 之内所有挡子弹的格子拿出来，每个格子给一票
-    「从它指向圆心」的单位矢量，加起来再归一化。竖直的墙 / 水平的地面都
-    正好得到 `(±1, 0)` / `(0, ±1)`；斜坡得到坡的法线。
+    做法：把 `BOUNCE_NORMAL_REACH × radius` 之内所有挡子弹的格子拿出来，
+    每个格子投一票「从它指向圆心」的单位矢量，加起来再归一化。
+    竖直的墙 / 水平的地面正好得到 `(±1, 0)` / `(0, ±1)`；斜坡得到坡的法线。
 
-    ⚠ 这是**近似**：原版怎么算法线还没逆出来。能对死的只有图边那一类
-    竖直面 —— 客户端实测的两发（`v=(22.28, 12.50)` → `(-11.14, 6.25)`）
-    正好是「x 取反、y 不动」，这个模型给的就是它。斜坡上会有几度的偏差。
+    ★ 图顶上面（`y < 0`）和 `_disc_blocked()` 一个口径，不算实心（§83）。
+
+    ⚠ **近似**（§88）：原版怎么算法线没逆出来。能对死的只有图边那一类
+    竖直面 —— 客户端实测的三发（例如 `v=(-26.76, -0.45)` → `(13.38, -0.23)`）
+    正好是「x 取反、y 不动」，这个模型给的就是它；斜坡上中位差 10°。
     """
     cx, cy = int(x), int(y)
     nx = ny = 0.0
-    for ox, oy in _disc_offsets(max(1.0, radius) + 1.0):
-        if not terrain.blocks_bullet(cx + ox, cy + oy):
+    for ox, oy in _disc_offsets(max(1.0, radius) * BOUNCE_NORMAL_REACH):
+        yy = cy + oy
+        if yy < 0 or not terrain.blocks_bullet(cx + ox, yy):
             continue
         span = math.hypot(ox, oy)
         if span <= 0.0:
@@ -2498,7 +2562,9 @@ def _splash_targets(room, shell, point, victim_seat, bodies):
     reach = float(weapon.splash_range or 0.0)
     if reach <= 0.0:
         return []
-    full = weapon.splash_damage
+    # ★ 夺分模式 ×2（§87）。乘在**衰减之前**：先乘再取整，比「取完整数再乘」
+    #   多保住一位分辨率（后者会让两个不同距离的人掉一样多的血）。
+    full = weapon.splash_damage * _damage_scale(room)
     out = []
     for seat_index, px, py, crouched, character_id in bodies:
         if seat_index == victim_seat:
@@ -2523,19 +2589,22 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region):
     """
     if machine.no_explode:
         # ★ 诊断开关（`/noboom`）：到头了也不发爆炸，让弹体一直飞下去。
-        #   记录照样出队 —— 句柄是开火那一刻分配的，少发爆炸不影响记账（§43）。
+        #   记录照样出队 —— 收方没收到爆炸就不会创建溅射对象，
+        #   这边跟着一个都不记（§86），两边天然一致。
         return
     weapon = shell.weapon
     hit = victim_seat is not None
-    damage = weapon.damage_for(region) if hit else 0
-    packet = machine.sync.event(
-        botsync.OP_EXPLODE,
-        botsync.explode_body(
-            shell.handle,
-            botsync.character_handle(victim_seat) if hit else 0,
-            point[0], point[1],
-            hit_kind=(botsync.HIT_CHARACTER if hit else botsync.HIT_NONE),
-            damage=damage))
+    # ★★ 夺分模式伤害翻倍（§87）—— 原版是射手那台机器在把数字塞进包之前
+    #   做的（`0x4806f1: shl dword ptr [eax], 1`）。
+    damage = weapon.damage_for(region) * _damage_scale(room) if hit else 0
+    # ★★★ 组包 + **爆炸对象的句柄记账**在同一次加锁里（§86）：收方处理这一
+    #   发时会创建那个溅射对象，它和弹体共用同一个计数器。
+    packet = machine.sync.explode(
+        shell.handle,
+        botsync.character_handle(victim_seat) if hit else 0,
+        point[0], point[1],
+        hit_kind=(botsync.HIT_CHARACTER if hit else botsync.HIT_NONE),
+        damage=damage, spawns=weapon.explode_step)
     # ★ 诊断：命中 / 落空**各打一行**（按状态翻转去重，铁律 10）。M3b 收口后删。
     if hit not in machine.explode_logged:
         machine.explode_logged.add(hit)
@@ -2793,7 +2862,8 @@ def _advance_fires(room, machine, now):
                 continue
             wall.ticks = local
             radius = wall.flame.size
-            damage = wall.flame.damage
+            # ★ 夺分模式 ×2（§87）—— 用户拿火焰自己烧自己实测出来的那一条。
+            damage = wall.flame.damage * _damage_scale(room)
             for seat_index, px, py, crouched, character_id in bodies:
                 last = machine.burnt.get(seat_index)
                 if last is not None and tick - last < BOT_FIRE_REBURN_TICKS:
@@ -2947,9 +3017,15 @@ def _split_shell(room, machine, shell, point, victim_seat):
     power = float(slice_weapon.velocity or 0.0)
     for angle in _slice_angles(shell.weapon, slice_weapon, machine.roll):
         shot = ballistics.launch(slice_weapon, angle, power)
+        # ★★★ 每一片在**开火那一刻**只吃 `shots` 个句柄（§86）。
+        #   这里原来传的是 `handle_step`（总数 2），于是四片的号排成
+        #   `base, base+2, base+4, base+6`，而收方给的是**连号**
+        #   `base … base+3` —— 从第一次分裂起句柄就永久错开，
+        #   之后每一发 `rpExplode` 都被静默丢弃：子弹照飞、一滴血不掉，
+        #   换武器也救不回来（用户 2026-08-28 实机报的就是它）。
         packet, handle = machine.sync.fire(
             slice_weapon.id, point[0], point[1], shot.angle, shot.power,
-            handle_step=slice_weapon.handle_step, shots=slice_weapon.shots,
+            handle_step=slice_weapon.fire_step, shots=slice_weapon.shots,
             group=botsync.FIRE_GROUP_EVERYONE)
         _emit(machine, packet)
         max_ticks = _shell_max_ticks(terrain, shot, slice_weapon)
@@ -3153,15 +3229,18 @@ def _advance_dash(room, machine, now):
             seat_index, region = landed
             swing.hit = True
             offset = swing.move.offset(step)
+            # ★ 近身伤害也走同一条路（§87）：`0x481dfd` 那个 `[vft+0x128]`
+            #   进门第一件事就是 `call 0x4806bf`。
+            damage = swing.move.damage * _damage_scale(room)
             _emit(machine, machine.sync.event(
                 botsync.OP_SPLASH_DAMAGED,
                 botsync.splash_body(
                     swing.handle, botsync.character_handle(seat_index),
-                    swing.move.damage,
+                    damage,
                     x + offset[0] * (1.0 if swing.direction >= 0 else -1.0),
                     y + offset[1])))
             machine.log(f"   近身: 冲刺打中 座位{seat_index} 的{region}"
-                        f" 伤害 {swing.move.damage} 第{step}帧"
+                        f" 伤害 {damage} 第{step}帧"
                         f" 句柄 {swing.handle}")
             break
     if frame >= swing.move.total_frame:
@@ -3271,12 +3350,12 @@ def _try_fire(room, machine, seat_index, weapon, target, now):
     # ★ 这一发 `rpFire` 会拿到的**事件序号** —— 换代之后拿它认出「这颗是
     #   上一代的」（`_advance_shells` 开头那一道保险）。
     fire_seq = machine.sync.events
-    # ★★ `/noboom` 开着时**句柄步进要跟着变小**（用户 2026-08-27 实机踩到）：
-    #   带溅射的武器每发多吃一个句柄，而那一个是**爆炸那一刻**收方创建
-    #   `SplashDamage` 时分配的（§54 —— 这条实验正好把 §46 的悬案定死了）。
-    #   不发爆炸 ⇒ 收方少分配一个 ⇒ 服务端照旧 +2 就会永久错开，
-    #   表现是「关掉 /noboom 之后再也打不中」。
-    step = weapon.shots if machine.no_explode else weapon.handle_step
+    # ★★★ 开火那一刻只吃 `shots` 个句柄 —— 带溅射的武器多出来的那一个是
+    #   **爆炸那一刻**收方创建 `SplashDamage` 时分配的（§54 / §86），
+    #   由 `_resolve_shell()` 的 `sync.explode()` 单独记。
+    #   ⚠ `/noboom` 开着时不发爆炸，那一个自然也就不记 —— 两边天然一致，
+    #     不再需要单独打补丁（用户 2026-08-27 踩过的那条路）。
+    step = weapon.fire_step
     # ★★★ 碰撞排除组（§63）：**填错就是「明明躲开了还掉血」**。
     #   收方把它写进弹体的 `[proj+0x15c]`，和角色的一比，相同就整个跳过
     #   碰撞 —— 以前这一格被当成「武器槽」写死成 1，于是个人战里座位 0

@@ -923,10 +923,12 @@ class BotSyncStream:
         `call 0x473e7c` 在内层循环里，§46），所以它们的句柄是
         `base + 0 … base + shots − 1`，调用方按这个序去发 `rpExplode`。
 
-        `handle_step` = 这一发**总共**吃掉几个句柄（`shots × (2 if 溅射 else 1)`）。
-        多出来的那些是爆炸时才创建的溅射对象，所以这个数只在
-        「本发的 `rpExplode` 全发完之前不开下一枪」的前提下成立 ——
-        闸门在 `bot.py`（`_pending_explosions`）。
+        `handle_step` = 这一发在**开火那一刻**吃掉几个句柄。
+        ★★★ 正常路径下调用方传的是 `weapon.fire_step`（= `shots`），
+        爆炸时那几个溅射对象由 `explode()` 单独记（§86）——
+        **别再把 `weapon.handle_step`（总数）直接传进来**：分裂弹的 4 片
+        碎片是同时在飞的，按总数记会把它们的号排成 `base, base+2, …`，
+        而收方给的是连号，从此每一发 `rpExplode` 都被静默丢弃（§42）。
 
         `group` = body `+1` 的**碰撞排除组**（§63）。不给就退成
         「个人战」口径（座位 + 1）—— 组队房里调用方必须自己传队伍号，
@@ -950,6 +952,24 @@ class BotSyncStream:
                 group=group, shots=shots, **kwargs))
             self.projectiles += int(handle_step)
             return packet, handle
+
+    def explode(self, handle, target_handle, x, y, hit_kind, damage,
+                spawns):
+        """一发 `rpExplode`，**同时把爆炸对象的句柄记账推进 `spawns` 个**。
+
+        ★★★ `spawns` = `weapon.explode_step`（带溅射的 1、不带的 0，§86）。
+        收方处理这一发时会创建那个溅射对象，它和弹体**共用同一个句柄
+        计数器** —— 少记一个，之后每一发 `rpExplode` 都对不上号、被静默
+        丢弃（§42），一局之内不自愈。
+
+        和 `fire()` 同一个理由：组包和记账**必须在一次加锁里做完**。
+        """
+        with self._lock:
+            packet = self.event(OP_EXPLODE, explode_body(
+                handle, target_handle, x, y,
+                hit_kind=hit_kind, damage=damage))
+            self.projectiles += int(spawns)
+            return packet
 
     def set_on_fire(self, x, y, slice_id, spawn_count):
         """一发 `rpSetOnFire`（地面燃烧），**同时把句柄记账推进 `2n+1`**。
