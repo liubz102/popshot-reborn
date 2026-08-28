@@ -401,6 +401,23 @@ def _solve_vertical(weapon, dy, speed, gravity):
     return None
 
 
+def launch(weapon, angle, power):
+    """★ **不解目标**、直接按给定的角度和力度造一个 `Shot`（§81）。
+
+    `solve()` 走的是「我要打到那一点，角度和力度该是多少」；有些弹体
+    根本不瞄人 —— 分裂弹的碎片就是照着 `SliceAngle*` 那个扇形往外撒的
+    （`0x47c9ae` 的循环），角度和力度都是**给定**的。
+
+    `ticks` 填 0：碎片没有「飞到目标要几个 tick」这回事，它的上界由
+    `bot._shell_max_ticks()`（图的对角线 / 引信）决定。
+    """
+    speed = speed_for_power(weapon, power)
+    accel = accel_per_tick(weapon)
+    cap = float(weapon.max_velocity or 0.0) if accel else 0.0
+    return Shot(_wrap(float(angle)), float(power), speed, 0.0,
+                gravity_per_tick(weapon), accel, cap)
+
+
 def _wrap(angle):
     """把角度归到 `(-π, π]` —— 客户端 `atan2` 出来的就是这个范围。"""
     while angle <= -math.pi:

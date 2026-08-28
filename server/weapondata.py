@@ -38,7 +38,9 @@ import os
 #:   `usable` 改成按 `SAFE_CLASSES` 白名单放行，新增 `slice_time` / `fuse_ticks`。
 #: ★ 5（会话 22）：新增火墙那几格（`slice_id` / `spawn_count` / …，§75）。
 #: ★ 6（会话 23）：新增 `homing_angle`（追踪弹的转向速率，§77）。
-FORMAT = 6
+#: ★ 7（会话 24）：新增分裂弹的碎片那几格（`slice_count` / `slice_angle` /
+#:   `slice_angle_base` / `slice_angle_random`，§81）。
+FORMAT = 7
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "bot_weapons.json")
@@ -216,6 +218,51 @@ class Weapon(object):
         0 = 不追踪（`0x47e35a: cmp [weapondef+0x78], 0; je 出口`）。
         """
         return float(self.raw.get("homing_angle") or 0.0)
+
+    #: ★★ 碎片扇形三个参数的**缺省值**（§81）。
+    #:
+    #: 出处是解析器里那三条设默认值的指令 —— `0x40b8c2` 读 ini 时
+    #: `ebx` 就是缺省值：
+    #:
+    #:     0x48984d  mov ebx, 0xa0     -> [def+0xac] SliceAngle        = 160
+    #:     0x489887  push 0x1e; pop ebx-> [def+0xb0] SliceAngleBase    = 30
+    #:     0x4898c5  （ebx 仍是 0x1e） -> [def+0xb4] SliceAngleRandom  = 30
+    #:
+    #: 苹果雷的碎片节 `ch00-02a` 三格一个都没写 ⇒ 走的正是这组缺省值。
+    #: ★ 语料交叉验证（1992 组碎片，每组 4 片）：四片的角度取值范围
+    #: 分别是 `[15,44] [68,97] [121,150] [175,204]`，每档正好 30 个整数值
+    #: —— 按上面的公式算出来一位不差。
+    SLICE_ANGLE_DEFAULT = 160
+    SLICE_ANGLE_BASE_DEFAULT = 30
+    SLICE_ANGLE_RANDOM_DEFAULT = 30
+
+    @property
+    def slice_count(self):
+        """★ 这颗弹体炸开会分成几片（`SliceCount`）；不分裂返回 0（§81）。
+
+        只有**母弹**那一节有它（`ch00-02` = 4、`ch03-02` = 3），
+        碎片那一节（`SliceId` 指向的 `ch00-02a`）一般不写。
+        """
+        return int(self.raw.get("slice_count") or 0)
+
+    @property
+    def slice_angle(self):
+        """碎片扇形的**张角**（度），缺省 160 —— 见 `SLICE_ANGLE_DEFAULT`。"""
+        value = self.raw.get("slice_angle")
+        return self.SLICE_ANGLE_DEFAULT if value is None else int(value)
+
+    @property
+    def slice_angle_base(self):
+        """碎片扇形的**起始角**（度），缺省 30。"""
+        value = self.raw.get("slice_angle_base")
+        return self.SLICE_ANGLE_BASE_DEFAULT if value is None else int(value)
+
+    @property
+    def slice_angle_random(self):
+        """每片角度上叠的**随机幅度**（度，`[0, n)` 再减 `n/2`），缺省 30。"""
+        value = self.raw.get("slice_angle_random")
+        return (self.SLICE_ANGLE_RANDOM_DEFAULT if value is None
+                else int(value))
 
     @property
     def lockon_range(self):

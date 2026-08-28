@@ -38,7 +38,7 @@
 
 - D1 —— 为什么是「假连接对象」而不是 `Seat.conn = None`；
 - D2 —— 房主迁移为什么跳过 bot 座；
-- D6 —— `/char N M` 的 M 为什么是面板序号 1..14 而不是原始角色 id；
+- D6 —— `/c N M` 的 M 为什么是面板序号 1..14 而不是原始角色 id；
 - D7 —— bot 占座时真人为什么照常被「房间已满」挡住；
 - D16 —— bot 的落脚点为什么是「回放真人的轨迹」而不是自己算；
 - D17 —— bot 的帧为什么由真人的同步包驱动，而不是定时器线程。
@@ -49,6 +49,7 @@ import collections
 import contextlib
 import math
 import os
+import random
 import threading
 import time
 
@@ -69,8 +70,8 @@ from lobby import ROOM_SEAT_COUNT, Seat, TEAM_A, TEAM_B, TEAM_LAYOUT_TEAMS
 #: bot 的昵称：`bot <座位号>`。
 #:
 #: ★ 座位号用的是**服务端座位号 0..5**，和日志、`0x0301` 的座位字段、
-#: `/del N` 里的 N 完全一致 —— 玩家在聊天窗口看到「bot 3」，敲的就是
-#: `/del 3`，不用在脑子里做任何换算。
+#: `/c N M` / `/t N` 里的 N 完全一致 —— 玩家在聊天窗口看到「bot 3」，
+#: 敲的就是 `/c 3 2`，不用在脑子里做任何换算。
 BOT_NICKNAME_PREFIX = "bot "
 
 #: bot 座位里发下去的等级（`SessionSlot+0x10`）。
@@ -80,12 +81,12 @@ BOT_NICKNAME_PREFIX = "bot "
 #: 取 `MINIMUM_PLAYER_LEVEL`（真人下发等级的下限）是为了看起来不突兀。
 BOT_LEVEL = MINIMUM_PLAYER_LEVEL
 
-#: 「人物选择」面板上的角色顺序 —— `/char N M` 里的 M 就是这张表的 1-based 下标。
+#: 「人物选择」面板上的角色顺序 —— `/c N M` 里的 M 就是这张表的 1-based 下标。
 #:
 #: 原始角色 id 是 `0/1/2` + `100..110`，中间断了一大截（id 3 아이린 和 98
 #: 쉐도우 타이 被客户端的按钮循环 `0x4f58e8` 显式跳过，99 랜덤 要另一个开关，
 #: 三个都放不出来，见 `account_store.PREMIUM_CHARACTER_IDS` 的注释）。
-#: 直接让玩家写原始 id 的话 `/char 3 5` 这种自然写法就是非法值 —— 所以命令里
+#: 直接让玩家写原始 id 的话 `/c 3 5` 这种自然写法就是非法值 —— 所以命令里
 #: 用连续的面板序号，只在服务端换算一次（D6）。
 #:
 #: ★ 这张表是**真人**的选择面板，`panel_for_character()` 拿它显示序号。
@@ -122,7 +123,8 @@ COMMAND_PREFIX = "/"
 #: 只把剩下的正文发出来，同时把 `0x0305` 的聊天类型改成 1（队伍）或 2（悄悄话）。
 #: 也就是说这些命令**根本到不了服务端**：`/team 1` 到我们手里只剩一个 `"1"`。
 #:
-#: 这就是「`/team` 没反应」的全部原因，所以换队命令改叫 `/tm`。
+#: 这就是「`/team` 没反应」的全部原因，所以换队命令叫 `/t`（`/tell ` / `/to `
+#: 都比它长，第 3 个字符就分岔，撞不上）。
 CLIENT_RESERVED_PREFIXES = ("/team ", "/팀 ", "/say ", "/tell ", "/to ", "/귓 ")
 
 #: 造过几个 bot（只用来给日志编号，和座位号无关）。
@@ -295,15 +297,21 @@ class BotConn(gameserver.Conn):
         self.fire_logged = set()
         #: 这一图命中 / 落空的爆炸日志各打过了吗（同上，诊断口径）。
         self.explode_logged = set()
+        #: 这一图的「分裂弹炸成几片」日志打过了吗（同上，§81）。
+        self.split_logged = False
+        #: ★ 分裂弹撒碎片时的随机数（`0x47c9b7` 那一发 `rand() % n`）。
+        #:   做成实例字段是为了**单测能钉住**它 —— 换成 `lambda n: 0` 就
+        #:   得到确定的四个角度。默认走 `random.randrange`。
+        self.roll = random.randrange
         #: ★ 已经用 `rpChangeWeapon` 向别人**声明过**的武器 id。
         #:   `None` = 还没声明。收方拿它换武器模型 —— 不发的话别人看见的是
         #:   客户端自己给的默认枪，和 bot 打出来的子弹对不上（会话 13 修）。
         #:   换图 / 新一局角色重建，这边跟着清（同 `crouched` 的道理，§41）。
         self.declared_weapon = None
-        #: 房主用 `/gun N M` 指定的武器**槽位**（1/2/3）；`None` = 用首选。
+        #: 房主用 `/w N M` 指定的武器**槽位**（1/2/3）；`None` = 用首选。
         #: ★ **不跟着换图清** —— 那是房主给的指令，不是一图之内的机器状态。
         self.weapon_slot = None
-        #: 房主用 `/hold N` 让它站住了吗。★ 同上，跨图保持。
+        #: 房主用 `/s N` 让它站住了吗。★ 同上，跨图保持。
         #:   站住的时候照常发心跳（真人站着不动也发），只是坐标不再前进 ——
         #:   这样才好测「隔着墙打不打得到」（用户 2026-08-26 要的测试手段）。
         self.holding = False
@@ -407,6 +415,7 @@ class BotConn(gameserver.Conn):
         self.rounds_left = None
         self.fire_logged = set()
         self.explode_logged = set()
+        self.split_logged = False
         # ★ 体力和近身动作跟着一起清：换图 / 新一局客户端把角色重建，
         #   `[char+0x2b5]` 那一套状态全归零（同 `crouched` 的道理，§41），
         #   而正在进行的那一下的句柄在收方那边已经不存在了。
@@ -430,7 +439,7 @@ class BotConn(gameserver.Conn):
     def weapon(self):
         """这个 bot 用哪把枪（`weapondata.Weapon`），`None` = **不开火**。
 
-        ★ 做成 property 是为了跟着 `/char` 和 `/gun` 走：换角色 / 换枪时
+        ★ 做成 property 是为了跟着 `/c` 和 `/w` 走：换角色 / 换枪时
         命令层只改 `character_id` / `weapon_slot`，武器自动跟着变，
         不用记得同步第二个字段。表本身有缓存，每帧问一次的开销可以忽略。
 
@@ -439,7 +448,7 @@ class BotConn(gameserver.Conn):
         **别随便挑一把凑合的**：步进猜错的表现是「子弹飞过去不炸」，
         而且静默、一局之内不自愈（§42）。
 
-        ★ 房主用 `/gun N M` 指定过槽位就用那一把；那一把不可用（或者换角色
+        ★ 房主用 `/w N M` 指定过槽位就用那一把；那一把不可用（或者换角色
         之后那个槽位空了）就**退回首选**，不是不开火 —— 房主的指令是
         「用几号枪」，不是「打不了就别打」。
         """
@@ -535,20 +544,20 @@ class BotConn(gameserver.Conn):
 #: 不能要，改成**多条命令挤一行**、命令之间用 `;` + 两个空格分隔。
 #:
 #: ★ 每行**控制在 50 个半角宽以内**：聊天框到边就自己折行，而折出来的行同样
-#: 占那 4 行的额度。50 是实测过的安全值 —— 旧版最长那行（`/char` 那条）
+#: 占那 4 行的额度。50 是实测过的安全值 —— 旧版最长那行（`/c` 那条）
 #: 54 宽在框里没折，往回收一点留余量。改这张表时请用同样的口径数宽度
 #: （中文和全角标点算 2，ASCII 算 1）。
 HELP_LINES = (
     "bot 命令（房主专用，N = 座位号，/h 重看）：",
-    "/bot 加一个;  /del N 删掉;  /ready 全部准备",
-    "/char N M 换角色（M=1~3）;  /tm N 换队（组队战）",
+    "/a [n] 加 n 个（默认 1）;  /r 全部准备（再敲取消）",
+    "/c N M 换角色（M=1~3）;  /t N 换队（组队战）",
 )
 
 #: ★ **战斗中**的 `/h`。房间里那几条会被 `MUTATING_COMMANDS` 挡掉，列出来
 #: 只会占满那 4 行的额度（§20），所以这里只放战斗中真能用的两条。
 BATTLE_HELP_LINES = (
-    "战斗中：/hold N 让 bot 站住;  再敲一次恢复跟随",
-    "/gun N M 换武器（M=1~3）;  /dash 近身攻击开关",
+    "战斗中：/s N 让 bot 站住;  再敲一次恢复跟随",
+    "/w N M 换武器（M=1~3）;  /dash 近身攻击开关",
     "查子弹: /noboom 只飞不炸;  /slow 降到 1/10 速",
 )
 
@@ -572,9 +581,9 @@ def parse_command(text):
 #: 命令名 -> 处理函数。`/h` 和 `/?` 是 `/help` 的别名。
 #: 在这张表里 = 「这是一条 bot 命令」，命令层据此决定要不要吞掉这行聊天。
 #:
-#: ★ `team` 还在表里，但它**不是**换队命令，只是一行「请改用 /tm」的提示
+#: ★ `team` 还在表里，但它**不是**换队命令，只是一行「请改用 /t」的提示
 #: —— 客户端自己把 `/team ` 当队伍聊天吃掉了，服务端根本收不到（§19）。
-COMMAND_NAMES = ("bot", "del", "char", "tm", "team", "ready", "help", "h", "?")
+COMMAND_NAMES = ("a", "c", "t", "team", "r", "help", "h", "?")
 
 
 def _seat_arg(args, index=0):
@@ -632,18 +641,18 @@ def _align_epoch(machine, room):
         room.epoch_value, gameserver.room_generation(room))
 
 
-def _cmd_bot(conn, room, args):
-    """`/bot` —— 最小空座加一个 bot。"""
+def _add_one_bot(conn, room):
+    """加一个 bot，返回 `(座位号, 错误文案)`。`/a` 的单步。"""
     index = room.free_seat()
     if index is None:
-        return "房间已经满了（6 个座位都有人），先 /del 掉一个再加。"
+        return None, "房间已经满了（6 个座位都有人），先把 bot 踢掉一个再加。"
     machine = BotConn(index)
     seat = machine.seat_snapshot()
     index = gameserver.LOBBY.add_bot(room, seat)
     if index is None:                      # 拿锁那一刻被别人坐满了
-        return "房间刚好被坐满了，没加上。"
+        return None, "房间刚好被坐满了，没加上。"
     _align_epoch(machine, room)
-    conn.log(f"   /bot: 座位 {index} 加入 {seat.nickname}"
+    conn.log(f"   /a: 座位 {index} 加入 {seat.nickname}"
              f"（角色 {seat.character_id} 队伍 {seat.team}）")
     conn.online(f"房间 + bot 房间 #{room.room_id} 座位={index} "
                 f"房主={conn.account_name!r}")
@@ -653,32 +662,44 @@ def _cmd_bot(conn, room, args):
     conn.broadcast_seat_slot(room, index, gameserver.SEAT_ACTION_JOIN,
                              reason=f"：座位 {index} 加入 bot")
     conn.room_system_chat(f"{seat.nickname} 加入了房间。")
-    return _team_balance_warning(room)
+    return index, None
 
 
-def _cmd_del(conn, room, args):
-    """`/del N` —— 删掉一个 bot。"""
-    index, error = _seat_arg(args)
+def _cmd_add(conn, room, args):
+    """`/a [n]` —— 一次加 `n` 个 bot（不给就是 1），坐最小的空座。
+
+    ★ 没有对应的删除命令：**客户端自带踢人功能**，bot 座位和真人座位在
+    它眼里是一样的（用户 2026-08-28 拍板，D56）。以前那条 `/del N` 是
+    在踢人这条路验通之前的替代品，现在只是多一个要记的命令。
+    """
+    count = 1
+    if args:
+        try:
+            count = int(str(args[0]).strip())
+        except (TypeError, ValueError):
+            return f"/a 用法：/a [个数]。{args[0]!r} 不是数字。"
+        if count < 1:
+            return f"/a 用法：/a [个数]。{count} 至少要是 1。"
+        # ★ 上界不是我们定的阈值：房间就 6 个座位（`ROOM_SEAT_COUNT`），
+        #   写多了下面那个循环自己会撞到「房间满了」。
+        count = min(count, ROOM_SEAT_COUNT)
+    added = []
+    error = None
+    for _ in range(count):
+        index, error = _add_one_bot(conn, room)
+        if index is None:
+            break
+        added.append(index)
+    if not added:
+        return error
     if error:
-        return f"/del 用法：/del <座位号>。{error}"
-    seat, error = _bot_seat(room, index)
-    if error:
-        return f"删不掉：{error}"
-    nickname = seat.nickname
-    if gameserver.LOBBY.remove_bot(room, index) is None:
-        return f"删不掉：{index} 号位刚刚已经空了。"
-    conn.log(f"   /del: 座位 {index} 的 {nickname} 已删除")
-    conn.online(f"房间 - bot 房间 #{room.room_id} 座位={index} "
-                f"房主={conn.account_name!r}")
-    # ★ 必须发 action 1，不能发 3 —— 只有 1/2 会走 `0x405f8f` 把座位的 3D
-    #   模型销毁掉。发 3 的话名字没了、模型还杵在天上（§147）。
-    conn.broadcast_seat_leave(index, reason=f"：座位 {index} 的 bot 被删除")
-    conn.room_system_chat(f"{nickname} 离开了房间。")
+        # 加了几个之后满了 —— 把加成功的报出去，再说为什么停下。
+        return f"加了 {len(added)} 个（座位 {added}），{error}"
     return _team_balance_warning(room)
 
 
 def _cmd_char(conn, room, args):
-    """`/char N M` —— 换 bot 的角色。M 是面板序号 **1~3**（D6 / D54）。
+    """`/c N M` —— 换 bot 的角色。M 是面板序号 **1~3**（D6 / D54）。
 
     ★ 商城角色（面板 4~14）**不给 bot 用**：它们的 2/3 号武器里有反弹弹、
     炮台、等离子炮这些服务端还没有飞行模型的类（§72），逐个适配代价太大
@@ -687,9 +708,9 @@ def _cmd_char(conn, room, args):
     span = len(BOT_CHARACTER_PANEL_IDS)
     index, error = _seat_arg(args)
     if error:
-        return f"/char 用法：/char <座位号> <角色序号 1~{span}>。{error}"
+        return f"/c 用法：/c <座位号> <角色序号 1~{span}>。{error}"
     if len(args) < 2:
-        return f"/char 用法：/char <座位号> <角色序号 1~{span}>。少了角色序号。"
+        return f"/c 用法：/c <座位号> <角色序号 1~{span}>。少了角色序号。"
     character = character_for_panel(args[1])
     if character is None:
         return (f"角色序号 {args[1]!r} 不对，只能是 1~{span}"
@@ -700,7 +721,7 @@ def _cmd_char(conn, room, args):
     seat.update(character_id=character)
     if isinstance(seat.conn, BotConn):
         seat.conn.character_id = character
-    conn.log(f"   /char: 座位 {index} 的 {seat.nickname} -> "
+    conn.log(f"   /c: 座位 {index} 的 {seat.nickname} -> "
              f"面板 {args[1]} = 角色 id {character}")
     # ★ 用 action 3（按座位数据重建模型）而不是 action 4：后者会让客户端播
     #   一句韩文「%s님이 %s 캐릭터로 선택되었습니다.」（`0x406520`）。
@@ -712,14 +733,16 @@ def _cmd_char(conn, room, args):
 
 
 def _cmd_team(conn, room, args):
-    """`/tm N` —— bot 换队（1↔2）。只有组队战有效。
+    """`/t N` —— bot 换队（1↔2）。只有组队战有效。
 
     ★ **命令名不能叫 `/team`**：客户端把 `/team ` 当成队伍聊天的前缀自己吃掉了
     （见 `CLIENT_RESERVED_PREFIXES` / §19），服务端一个字都收不到。
+    ★ `/t ` 不在那张前缀表里（`/tell ` / `/to ` 都比它长，第 3 个字符就分岔），
+    所以这个短名是安全的。
     """
     index, error = _seat_arg(args)
     if error:
-        return f"/tm 用法：/tm <座位号>。{error}"
+        return f"/t 用法：/t <座位号>。{error}"
     layout = room.team_layout()
     if layout != TEAM_LAYOUT_TEAMS:
         # ★ 「个人战不能分队」不是偷懒：客户端的队伍记录数组只有两格，
@@ -733,7 +756,7 @@ def _cmd_team(conn, room, args):
         return f"换不了队：{error}"
     want = TEAM_B if int(seat.team) == TEAM_A else TEAM_A
     seat.update(team=want)
-    conn.log(f"   /tm: 座位 {index} 的 {seat.nickname} -> {want} 队")
+    conn.log(f"   /t: 座位 {index} 的 {seat.nickname} -> {want} 队")
     conn.broadcast_seat_slot(room, index, gameserver.SEAT_ACTION_RESYNC,
                              reason=f"：座位 {index} 的 bot 换队")
     conn.room_system_chat(f"{seat.nickname} 换到了 {want} 队。")
@@ -741,37 +764,47 @@ def _cmd_team(conn, room, args):
 
 
 def _cmd_ready(conn, room, args):
-    """`/ready` —— 所有 bot 一键准备。"""
+    """`/r` —— 所有 bot 一键准备；**已经准备好的话再敲一次就全部取消**。
+
+    ★ 开关口径和真人按「游戏准备」一致（`on_toggle_ready` 也是翻转），
+    判据是**当前状态**而不是敲了第几次（铁律 10）：房里的 bot 只要还有一个
+    没准备好，这一发就是「全部准备」；全都准备好了才是「全部取消」。
+    """
     seats = room.bot_seats()
     if not seats:
-        return "房间里一个 bot 都没有，先 /bot 加一个。"
+        return "房间里一个 bot 都没有，先 /a 加一个。"
+    present = [room.seats[i] for i in seats if room.seats[i] is not None]
+    want = not all(seat.ready for seat in present)
     changed = []
     for index in seats:
         seat = room.seats[index]
-        if seat is None or seat.ready:
+        if seat is None or bool(seat.ready) == want:
             continue
-        seat.update(ready=True)
+        seat.update(ready=want)
         changed.append(index)
         # ★ 和真人按「游戏准备」走同一条路（`on_toggle_ready`）：action 3。
         #   房里其他人的「准备中」标记、房主能不能按开始，全靠这一发。
         conn.broadcast_seat_slot(room, index, gameserver.SEAT_ACTION_RESYNC,
-                                 reason=f"：座位 {index} 的 bot 准备")
+                                 reason=f"：座位 {index} 的 bot "
+                                        f"{'准备' if want else '取消准备'}")
     if not changed:
-        return f"{len(seats)} 个 bot 本来就都准备好了。"
-    conn.log(f"   /ready: 座位 {changed} 的 bot 已准备")
-    conn.room_system_chat(f"{len(changed)} 个 bot 准备好了。")
-    return _team_balance_warning(room)
+        return f"{len(seats)} 个 bot 的准备状态没变化。"
+    conn.log(f"   /r: 座位 {changed} 的 bot "
+             f"{'已准备' if want else '已取消准备'}")
+    conn.room_system_chat(
+        f"{len(changed)} 个 bot {'准备好了' if want else '取消了准备'}。")
+    return _team_balance_warning(room) if want else None
 
 
 def _cmd_team_alias(conn, room, args):
-    """`/team` —— 只回一行「请改用 /tm」。
+    """`/team` —— 只回一行「请改用 /t」。
 
     ★ 带参数的 `/team 1` **永远走不到这里**：客户端匹配的是 `"/team "`
     （连空格），中了就切掉前缀当队伍聊天发出去（§19）。不带参数的光杆
     `/team` 差那个空格，反而能原样送到服务端 —— 这一条就是为它准备的，
     玩家敲错时至少能看见该敲什么。
     """
-    return "换队请敲 /tm N（例：/tm 1）—— /team 被客户端当成队伍聊天吃掉了。"
+    return "换队请敲 /t N（例：/t 1）—— /team 被客户端当成队伍聊天吃掉了。"
 
 
 def _battle_bots(room, args):
@@ -790,7 +823,7 @@ def _battle_bots(room, args):
 
 
 def _cmd_hold(conn, room, args):
-    """`/hold [N]` —— 让 bot **站在原地不动**（再敲一次恢复跟随）。
+    """`/s [N]` —— 让 bot **站在原地不动**（再敲一次恢复跟随）。
 
     ★ 这是**测试手段**，不是玩法：bot 平时走的是真人趟过的路（D16），
     所以「隔着墙打不打得到」这种事在实机上根本碰不上 —— 中间不可能有墙。
@@ -802,7 +835,7 @@ def _cmd_hold(conn, room, args):
     """
     seats, error = _battle_bots(room, args)
     if error:
-        return f"/hold 用法：/hold [座位号]（不给就是全部）。{error}"
+        return f"/s 用法：/s [座位号]（不给就是全部）。{error}"
     changed = []
     for index in seats:
         machine = room.seats[index].conn
@@ -819,7 +852,7 @@ def _cmd_hold(conn, room, args):
         parts.append(f"座位 {'、'.join(held)} 的 bot 站住不动了")
     if freed:
         parts.append(f"座位 {'、'.join(freed)} 的 bot 恢复跟随")
-    conn.log(f"   /hold: {changed}")
+    conn.log(f"   /s: {changed}")
     conn.room_system_chat("；".join(parts) + "。")
     return None
 
@@ -938,7 +971,7 @@ def _cmd_slow(conn, room, args):
 
 
 def _cmd_gun(conn, room, args):
-    """`/gun N [M]` —— 给 bot 换武器（M = 槽位 1/2/3）；不给 M 就列出有哪些。
+    """`/w N [M]` —— 给 bot 换武器（M = 槽位 1/2/3）；不给 M 就列出有哪些。
 
     ★★ **为什么只有手动换，没有自动换**：「什么时候该换枪」是 AI 决策，归 M5。
     换枪这条链（`rpChangeWeapon` + 句柄步进跟着变）本身现在就能实机验。
@@ -954,7 +987,7 @@ def _cmd_gun(conn, room, args):
     """
     index, error = _seat_arg(args)
     if error:
-        return f"/gun 用法：/gun <座位号> [武器槽 1~3]。{error}"
+        return f"/w 用法：/w <座位号> [武器槽 1~3]。{error}"
     seat, error = _bot_seat(room, index)
     if error:
         return f"换不了武器：{error}"
@@ -970,7 +1003,7 @@ def _cmd_gun(conn, room, args):
             + ("（当前）" if machine.weapon is not None
                and w.id == machine.weapon.id else "")
             for w in choices)
-        return f"{seat.nickname} 可用武器槽：{listed}。敲 /gun {index} <槽位> 换。"
+        return f"{seat.nickname} 可用武器槽：{listed}。敲 /w {index} <槽位> 换。"
     try:
         slot = int(str(args[1]).strip())
     except (TypeError, ValueError):
@@ -988,7 +1021,7 @@ def _cmd_gun(conn, room, args):
     if room.is_playing():
         with contextlib.suppress(botsync.SyncInvariantError):
             _declare_weapon(machine, index, machine.weapon)
-    conn.log(f"   /gun: 座位 {index} 的 {seat.nickname} -> 槽位 {slot} "
+    conn.log(f"   /w: 座位 {index} 的 {seat.nickname} -> 槽位 {slot} "
              f"= {chosen.id}({chosen.section}) 伤害 {chosen.damage} "
              f"步进 {chosen.handle_step} 间隔 {chosen.fire_interval_ms}ms")
     conn.room_system_chat(
@@ -1004,15 +1037,19 @@ def _cmd_help(conn, room, args):
     return None
 
 
+#: 命令名 -> 处理函数。
+#:
+#: ★★ 名字全部是**一个字母**（用户 2026-08-28 要的，D56）：这些命令是在
+#: **游戏里的聊天框**敲的，打字要占住键盘、bot 那边还在打你 —— 每多一个
+#: 字母都是实打实的代价。`/del` 整条删掉了，踢 bot 用**客户端自带的踢人**。
 COMMANDS = {
-    "bot": _cmd_bot,
-    "del": _cmd_del,
-    "char": _cmd_char,
-    "tm": _cmd_team,
+    "a": _cmd_add,
+    "c": _cmd_char,
+    "t": _cmd_team,
     "team": _cmd_team_alias,
-    "ready": _cmd_ready,
-    "hold": _cmd_hold,
-    "gun": _cmd_gun,
+    "r": _cmd_ready,
+    "s": _cmd_hold,
+    "w": _cmd_gun,
     "dash": _cmd_dash,
     "noboom": _cmd_noboom,
     "slow": _cmd_slow,
@@ -1022,8 +1059,8 @@ COMMANDS = {
 }
 
 #: 改房间状态的命令 —— 游戏中一律拒绝。`/help` 不在里面，随时能看。
-#: `team` 也不在里面：它只是一行「请改用 /tm」的提示，什么都不改。
-MUTATING_COMMANDS = ("bot", "del", "char", "tm", "ready")
+#: `team` 也不在里面：它只是一行「请改用 /t」的提示，什么都不改。
+MUTATING_COMMANDS = ("a", "c", "t", "r")
 
 
 # ----------------------------------------------------------------------------
@@ -1793,7 +1830,7 @@ def _declare_weapon(machine, seat_index, weapon):
     —— 换图 / 新一局客户端重建角色，武器回默认，两边的记账必须一起清（§41）。
 
     ⚠ 这只管**声明**，不管「什么时候该换枪」—— 那是 AI 决策，归 M5。
-    现在换枪的唯一来源是房主的 `/gun N M`。
+    现在换枪的唯一来源是房主的 `/w N M`。
     """
     if machine.declared_weapon == weapon.id:
         return False
@@ -1920,8 +1957,21 @@ def _reload_after_shot(machine, weapon, now):
 #: 的对角线还长。★ 这是**几何上界**（图有多大），不是「飞多久算超时」。
 BOT_SHELL_MAX_TRAVEL = 12288.0
 
-#: 判「这一 tick 有没有撞地形」时沿线段采样的步长（像素），同 `BOT_LINE_STEP`。
-BOT_SHELL_TERRAIN_STEP = BOT_LINE_STEP
+#: ★★ 判「这一 tick 有没有撞地形」时沿线段采样的步长 —— **1 个像素**（§79）。
+#:
+#: 收方是**逐像素**走的：`0x47f8a5` 把上一帧和这一帧的位置取整，
+#: `0x47f912` 起在两点之间一格一格插值，每一格问一次 `TerrainData::Get`
+#: （`0x472fe0`），值 2/3 就算撞上（`0x47f976`）。中间**一个像素都不跳**。
+#:
+#: 这里原来跟着 `BOT_LINE_STEP`（4）走，于是**擦边**的那些发就漏判了：
+#: 弹体半径才 8，平台边缘只要窄于 4 个像素就整个从采样点之间穿过去
+#: —— 收方把弹体停在平台边上，服务端却让它一路飞到下面的地面才炸
+#: （用户 2026-08-28 报的「手雷擦到平台右边缘，结果穿过去在地上炸开」）。
+#:
+#: ⚠ 别拿它和 `BOT_LINE_STEP` 合并：那一个是**开枪前**问「这条线通不通」，
+#: 采样粗一点只影响 bot 要不要开这一枪；这一个是**结算**，
+#: 和收方差一个像素就是爆炸点对不上。
+BOT_SHELL_TERRAIN_STEP = 1
 
 
 class Shell(object):
@@ -2070,6 +2120,14 @@ def _terrain_stop_t(terrain, ax, ay, bx, by):
 #: 而 `30 / 7 = 4.2857` —— 一位不差。
 HOMING_TURN_FACTOR = 1.0 / 7.0
 
+#: ★★ 「目标丢了」的哨兵，照抄收方那一格写的 **−2**（§80）。
+#:
+#: `0x47e411: mov dword ptr [edi], 0xfffffffe` —— 目标句柄查不到、或者这一
+#: tick 量出来已经出了 `HomingRange`，收方就把锁定格写成 −2。而重新选目标
+#: 那一段的入口是 `cmp [edi], -1`（`0x47e36b`），−2 进不去
+#: ⇒ **这颗弹从此再也不追踪，走直线到底**。
+HOMING_LOST = -2
+
 
 def _homing_target(room, shell, bodies):
     """这一 tick 锁得上谁：`HomingRange` 之内**最近**的那个；没有返回 `None`。
@@ -2098,15 +2156,34 @@ def _homing_step(room, shell, bodies):
     用户 2026-08-28 报的「火箭的飞行轨迹和最终爆炸动画的地点不一样，
     看着撞墙了却在墙的附近另一处爆炸」就是这条没建模：服务端按直线算，
     收方却把它拐走了。
+
+    ## ★★ 目标丢了就**永远**不再追（§80）
+
+    收方每个 tick 都重新量一次「目标还在不在 `HomingRange` 里」
+    （`0x47e45b` 的 `fcomp [weapondef+0x7c]`），一旦出圈 / 目标没了，
+    它把锁定格写成 **−2**（`0x47e411: mov [edi], 0xfffffffe`）——
+    而选目标那一段的入口条件是「锁定格 == −1」（`0x47e36b`），
+    所以 −2 之后**再也不会重新选目标**，这颗火箭从此走直线。
+
+    以前服务端锁上就一路跟到底，目标一跑出 200 两边就分家 ——
+    用户 2026-08-28 说的「基本吻合了，但偶尔还是不一样」剩下的就是它。
     """
     if shell.locked is None:
+        # 还没锁上 —— 和收方一样**每个 tick 都重新扫一遍**，扫不到就下一 tick 再扫
+        # （`[proj+0x328]` 停在 −1，`0x47e3e4` 那一跳直接出去，不算「丢了」）。
         shell.locked = _homing_target(room, shell, bodies)
     target = None
-    if shell.locked is not None:
+    if shell.locked is not None and shell.locked != HOMING_LOST:
         for seat_index, px, py, crouched, character_id in bodies:
             if seat_index == shell.locked:
-                target = chrprops.get(character_id).center(px, py, crouched)
+                center = chrprops.get(character_id).center(px, py, crouched)
+                # ★ 每 tick 复查射程 —— 出圈就是「丢了」，永久不再追。
+                if math.hypot(center[0] - shell.x, center[1] - shell.y) \
+                        <= (shell.weapon.homing_range or 0.0):
+                    target = center
                 break
+        if target is None:
+            shell.locked = HOMING_LOST
     if target is not None:
         speed = math.hypot(shell.vx, shell.vy)
         want = math.atan2(target[1] - shell.y, target[0] - shell.x)
@@ -2248,7 +2325,19 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region):
             botsync.splash_body(shell.handle,
                                 botsync.character_handle(seat_index),
                                 splash, where[0], where[1])))
-    _set_ground_on_fire(room, machine, weapon, point)
+    # ★★★ **直接砸中人的那一发不铺火墙**（§79）—— 铺火那一段前面有一道
+    #   `cmp dword [esp+8], 0 ; jne 出口`（`0x4829d7`），`[esp+8]` 就是
+    #   「撞上的那个角色」的指针（基类 `0x47eb67` 拿它和 0 比），非空 ⇒
+    #   整段跳过。语料 1079 发 `rpSetOnFire` **无一例外**跟在「什么都没打中」
+    #   的那一发爆炸后面；反过来 308 发「打中角色」的火焰弹爆炸里只有 1 发
+    #   后面跟着火墙（那一发是同一台机器上另一颗弹体的）。
+    #
+    #   用户 2026-08-28：「我自己扔出去后如果直接命中别人，那么别人是一次性
+    #   收到伤害，之后就不会再有持续伤害了……而 bot 扔出去的手雷，即便是
+    #   直接命中我，我身上的火焰也会持续造成伤害。」
+    if not hit:
+        _set_ground_on_fire(room, machine, weapon, point)
+    _split_shell(room, machine, shell, point, victim_seat)
 
 
 def _fire_wall_of(weapon):
@@ -2283,54 +2372,122 @@ def _fire_wall_of(weapon):
 BOT_FIRE_REBURN_TICKS = 20
 
 
-class FireWall(object):
-    """地上那一道**还在烧**的火（§75 / §78）—— 服务端这边的那一份。
+class Flame(object):
+    """火墙里的**一团**火（§79）。
 
-    收方那边是 `SpawnCount` 个 `Flame` 对象，`OnSetOnFire` 一次性造好；
-    但**算伤害的还是射手那台机器**（和弹体、溅射同一条守卫，§42），
-    bot 没有本机 ⇒ 不补 `rpSplashDamaged` 的话，火看得见、站上去不掉血
-    （用户 2026-08-28 报的就是这个）。
+    ★ 它是收方一个真的 `Flame` 对象（`0x492426` 造的那个类），有自己的
+    弹体句柄、自己的出生时刻、自己的寿命。
     """
 
-    __slots__ = ("handle", "flame", "spots", "born", "ticks", "max_ticks",
+    __slots__ = ("handle", "x", "y", "born", "dies")
+
+    def __init__(self, handle, x, y, born, dies):
+        self.handle = int(handle)
+        self.x = float(x)
+        self.y = float(y)
+        #: 第几个 tick 生出来（根火 = 0，往外一格加一个 `SpawnInterval`）。
+        self.born = int(born)
+        #: 第几个 tick 消失（`born + SpawnLifeTime`）。
+        self.dies = int(dies)
+
+    def alive(self, tick):
+        return self.born <= tick < self.dies
+
+    def __repr__(self):
+        return ("<Flame %d (%.0f, %.0f) %d~%dtick>"
+                % (self.handle, self.x, self.y, self.born, self.dies))
+
+
+class FireWall(object):
+    """地上那一道**还在烧**的火（§75 / §78 / §79）—— 服务端这边的那一份。
+
+    收方那边是 **`2 × SpawnCount + 1` 个 `Flame` 对象**，不是一次性造好的：
+    `OnSetOnFire`（`0x492471`）只造**根火**那一团，之后每一团在自己出生
+    `SpawnInterval` 个 tick 之后再往外生一团（`Flame::Tick` `0x482696`
+    那一段），根火**左右各生一路**、子火只往自己那个方向传
+    （`0x4827de: add [ebp-0x14], 2` 那个 −1 / +1 的循环）。
+    所以整道墙是**从爆点往两边铺开**的，宽度 `± SpawnCount × SpawnDistance`。
+
+    ★ 这正好解释了 §75 那个句柄数 `2n+1`：根火 1 个 + 左右各 n 个。
+
+    但**算伤害的还是射手那台机器**（和弹体、溅射同一条守卫，§42），
+    bot 没有本机 ⇒ 不补 `rpSplashDamaged` 的话，火看得见、站上去不掉血。
+    """
+
+    __slots__ = ("handle", "flame", "flames", "born", "ticks", "max_ticks",
                  "burnt")
 
-    def __init__(self, handle, flame, spots, born, max_ticks):
-        #: 拿火墙那一段句柄的**头一个**当伤害源。★ 源句柄查不到也不要紧：
-        #: 收侧 `0x492c6d` 查不到只是跳过击退那一支，伤害照扣。
+    def __init__(self, handle, flame, flames, born, max_ticks):
+        #: 这道墙那一段句柄的**头一个**（= 根火）。
         self.handle = int(handle)
         self.flame = flame
-        #: 每一团火的落点。
-        self.spots = list(spots)
+        #: 每一团火（`Flame`），按收方的创建顺序：根、左1、右1、左2、右2……
+        self.flames = list(flames)
         self.born = float(born)
         self.ticks = 0
         self.max_ticks = int(max_ticks)
         #: 每个座位**上一次**被烧是第几个 tick（`BOT_FIRE_REBURN_TICKS` 的账）。
         self.burnt = {}
 
+    @property
+    def spots(self):
+        """所有火团的落点（不分死活）—— 日志和单测看的就是它。"""
+        return [(f.x, f.y) for f in self.flames]
+
     def __repr__(self):
         return ("<FireWall %d %d团 %d/%dtick>"
-                % (self.handle, len(self.spots), self.ticks, self.max_ticks))
+                % (self.handle, len(self.flames), self.ticks, self.max_ticks))
 
 
-def _fire_wall_spots(terrain, flame, point):
-    """`SpawnCount` 团火摆在哪：以爆点为中心、左右各排开 `SpawnDistance`。
+def _flame_ground(terrain, x, y, reach):
+    """火团往 `x` 那一列挪一格之后落在哪；落不住返回 `None`（§79）。
 
-    ★ 每一团都落到**那一列的地面**上（火是铺在地上的）；那一列没有
-    地面就退回爆点的高度。
+    收方是拿**通用的横向移动**把子火从父火那儿挪出去的
+    （`0x50d9a7`，和人走路是同一个例程），挪不动 / 落点在地形里就当场
+    把这团火销毁（`0x4827b8` / `0x4827c9` 那两支都接着 `[vft+0x20]`）。
+    ⇒ 服务端这边用**同一个**横向移动模型：`botmove.surface_near()`
+    在这一列上找离父火最近的站立面，找不到就是「这一路到此为止」。
+    """
+    if terrain is None:
+        return y
+    surface = botmove.surface_near(terrain, x, y, reach)
+    return None if surface is None else float(surface)
+
+
+def _fire_wall_flames(terrain, flame, point, handle):
+    """摆好一道火墙的 `2n+1` 团火（§79）。
+
+    * 根火在**爆点**上（`0x492481` 把 y 减了 1：`fsub [0x693720]` = 1.0）；
+    * 之后每 `SpawnInterval` 个 tick 往外铺一格，一格 `SpawnDistance`；
+    * 左右两路各铺 `SpawnCount` 格，某一路落不住就那一路停下
+      （剩下的句柄照样占着 —— 收方是**开头一次性**分配 `2n+1` 个的）。
     """
     count = int(flame.raw.get("spawn_count") or 4)
     gap = float(flame.raw.get("spawn_distance") or 30.0)
-    spots = []
-    for index in range(count):
-        x = point[0] + (index - (count - 1) / 2.0) * gap
-        y = point[1]
-        if terrain is not None:
-            ground = terrain.ground_below(int(x), int(point[1]) - 1)
-            if ground is not None:
-                y = float(ground)
-        spots.append((x, y))
-    return spots
+    interval = int(flame.raw.get("spawn_interval") or 4)
+    life = int(flame.raw.get("spawn_life") or 60)
+    reach = gap * botmove.CLIMB_SLOPE
+    root_y = point[1] - 1.0
+    flames = [Flame(handle, point[0], root_y, 0, life)]
+    # ★ 句柄按**收方的创建顺序**发：根、（第 1 个 interval）左1 右1、
+    #   （第 2 个）左2 右2……—— 根火先造，之后每一 tick 两路各生一团。
+    tails = {-1: (point[0], root_y), 1: (point[0], root_y)}
+    next_handle = handle + 1
+    for step in range(1, count + 1):
+        for direction in (-1, 1):
+            tail = tails.get(direction)
+            this_handle, next_handle = next_handle, next_handle + 1
+            if tail is None:
+                continue                      # 这一路已经断了
+            x = tail[0] + direction * gap
+            y = _flame_ground(terrain, x, tail[1], reach)
+            if y is None:
+                tails[direction] = None       # 挪不过去 —— 这一路到此为止
+                continue
+            tails[direction] = (x, y)
+            flames.append(Flame(this_handle, x, y,
+                                step * interval, step * interval + life))
+    return flames
 
 
 def _fire_wall_ticks(flame):
@@ -2349,10 +2506,15 @@ def _advance_fires(room, machine, now):
     """把所有还在烧的火墙推进到**此刻**，站在火上的人该掉血就掉（§78）。
 
     和 `_advance_shells()` 同一套路数：按**真实流逝的时间**算该推到第几个
-    tick，每个 tick 问一次「谁站在火里」。
+    tick，每个 tick 问一次「谁站在**还活着的**火里」。
 
     ★★ 名单**不按碰撞组过滤**：火墙的组是 255 = 撞所有人（§69 /
     packet_api §5.4d），队友和 bot 自己都烧。
+
+    ★ 再烧间隔按**人**记（`wall.burnt[座位]`），不按火团记 —— 语料 181 次
+    火烧里**同一发心跳里挨两次的一次都没有**（§78 那 102 次的复量），
+    而一道墙同一个人的伤害源句柄有 1 个也有 2 个 ⇒ 是**几团火轮流烧同一个
+    人**，不是每团各烧各的。
     """
     if not machine.fires:
         return
@@ -2371,30 +2533,32 @@ def _advance_fires(room, machine, now):
                         wall.ticks - last < BOT_FIRE_REBURN_TICKS:
                     continue
                 character = chrprops.get(character_id)
-                spot = _fire_touch(character, px, py, crouched, wall.spots,
-                                   radius)
-                if spot is None:
+                lit = _fire_touch(character, px, py, crouched, wall.flames,
+                                  radius, wall.ticks)
+                if lit is None:
                     continue
                 wall.burnt[seat_index] = wall.ticks
                 machine.log(f"   火烧: 座位{seat_index} 在 "
-                            f"({spot[0]:.0f}, {spot[1]:.0f}) 挨了 {damage} 点"
-                            f"（第 {wall.ticks} tick，§78）")
+                            f"({lit.x:.0f}, {lit.y:.0f}) 挨了 {damage} 点"
+                            f"（第 {wall.ticks} tick，火团句柄 {lit.handle}，§78）")
                 _emit(machine, machine.sync.event(
                     botsync.OP_SPLASH_DAMAGED,
-                    botsync.splash_body(wall.handle,
+                    botsync.splash_body(lit.handle,
                                         botsync.character_handle(seat_index),
-                                        damage, spot[0], spot[1])))
+                                        damage, lit.x, lit.y)))
         if wall.ticks < wall.max_ticks:
             still.append(wall)
     machine.fires = still
 
 
-def _fire_touch(character, px, py, crouched, spots, radius):
-    """这个人有没有踩在某一团火里；踩着了返回那一团的位置。"""
+def _fire_touch(character, px, py, crouched, flames, radius, tick):
+    """这个人有没有踩在**这一刻还活着**的某一团火里；踩着了返回那一团。"""
     for cx, cy, r, _region in character.circles(px, py, crouched):
-        for sx, sy in spots:
-            if math.hypot(sx - cx, sy - cy) <= r + radius:
-                return (sx, sy)
+        for flame in flames:
+            if not flame.alive(tick):
+                continue
+            if math.hypot(flame.x - cx, flame.y - cy) <= r + radius:
+                return flame
     return None
 
 
@@ -2419,16 +2583,120 @@ def _set_ground_on_fire(room, machine, weapon, point):
                                        machine.sync.projectiles)
     packet, step = machine.sync.set_on_fire(
         point[0], point[1], flame.id, flame.raw.get("spawn_count"))
-    machine.log(f"   火墙: 在 ({point[0]:.1f}, {point[1]:.1f}) 点着 "
-                f"{flame.id}({flame.raw.get('section')}) "
-                f"{flame.raw.get('spawn_count')} 团火"
-                f"（★ 收方吃掉 {step} 个弹体句柄，§75）")
-    _emit(machine, packet)
     # ★★ 伤害归服务端（§78）：收方只把火画出来，算谁被烧的还是「射手那台」。
     terrain = mapdata.load(_current_map(room))
+    flames = _fire_wall_flames(terrain, flame, point, handle)
+    machine.log(f"   火墙: 在 ({point[0]:.1f}, {point[1]:.1f}) 点着 "
+                f"{flame.id}({flame.raw.get('section')}) "
+                f"{len(flames)}/{step} 团火"
+                f"（★ 收方吃掉 {step} 个弹体句柄，§75/§79）")
+    _emit(machine, packet)
     machine.fires.append(FireWall(
-        handle, flame, _fire_wall_spots(terrain, flame, point),
-        time.monotonic(), _fire_wall_ticks(flame)))
+        handle, flame, flames, time.monotonic(), _fire_wall_ticks(flame)))
+
+
+# ---------------------------------------------------------------------------
+# ★★ 分裂弹的碎片（§81）—— 苹果雷炸开的那几片
+# ---------------------------------------------------------------------------
+def _slice_weapon_of(weapon):
+    """这颗弹体炸开会不会分裂；会的话返回**碎片**那一节的武器记录（§81）。
+
+    判据是**母弹自己写了 `SliceCount`**（`ch00-02` = 4、`ch03-02` = 3）。
+    火焰弹也有 `SliceId`，但它没有 `SliceCount` —— 那条走的是火墙
+    （`rpSetOnFire`），不是这里。
+    """
+    if not weapon.slice_count:
+        return None
+    slice_id = weapon.raw.get("slice_id")
+    return None if not slice_id else weapondata.get(slice_id)
+
+
+def _slice_angles(weapon, slice_weapon, roll):
+    """`SliceCount` 片碎片各自的**发射角**（弧度），照抄 `0x47c9ae` 那个循环。
+
+        度数 = SliceAngleBase + SliceAngle × i / (n − 1)
+               + rand() % SliceAngleRandom − SliceAngleRandom / 2
+        包里填的是它的**相反数**转弧度（`0x47ca03` 的 `fchs`）
+
+    三个 `SliceAngle*` 读的是**碎片**那一节的定义（`ebx` 是按 `SliceId`
+    查出来的那一份），苹果雷的 `ch00-02a` 三格都没写 ⇒ 用解析器里的缺省值
+    160 / 30 / 30（`weapondata.Weapon.SLICE_ANGLE_DEFAULT` 那一组）。
+
+    `roll(n)` 就是 `rand() % n`，单测拿它把随机数钉住。
+    """
+    count = int(weapon.slice_count)
+    span = slice_weapon.slice_angle
+    base = slice_weapon.slice_angle_base
+    spread = slice_weapon.slice_angle_random
+    out = []
+    for index in range(count):
+        degrees = base
+        if count > 1:
+            degrees += span * index // (count - 1)
+        if spread > 0:
+            degrees += roll(spread) - spread // 2
+        out.append(math.radians(-degrees))
+    return out
+
+
+def _split_shell(room, machine, shell, point, victim_seat):
+    """★★ 苹果雷炸开的那几片碎片（§81）—— 每片一发 `rpFire` + 一颗 `Shell`。
+
+    用户 2026-08-28：「1 号角色的 2 号武器苹果弹，真人玩的时候能看见敌人
+    扔出去后炸裂开的几个碎片，现在看不到 bot 的炸裂碎片。」
+
+    根子和火墙、溅射是同一个（§72）：造碎片那一段套在 `IsMine` 门里
+    （`0x47c96e` 的 `call 0x50d294`），bot 的弹体在**任何一台**上都不是
+    「自己的」⇒ 一片都不会生出来。
+
+    ## 什么时候分裂
+
+    收方是在**引信到期**那一 tick 分的（`0x47c952: dec [proj+0x338]` 数到 0
+    → `OnHit(NULL, NULL)` → `IsMine` → 造碎片）；砸中角色的那一发弹体
+    当场就没了，所以**不分裂**。语料对得上：2353 发苹果雷里
+    「没打中角色」的 1837 发全部跟着 4 片碎片（飞了 12 发心跳 ≈ 1536 ms
+    ≈ `SliceTime`），「打中角色」的 401 发一片都没有。
+    ⇒ 服务端这边的判据就是 **`victim_seat is None`**。
+
+    ## 句柄
+
+    每一片都是收方一个真的弹体，**必须走 `sync.fire()`**（组包 + 记账在
+    同一次加锁里），而且每一片之后都得有一发自己的 `rpExplode`
+    —— `_advance_shells()` 会替它们发，所以这里把它们挂进 `pending_shots`。
+
+    碎片的 `owner` 是射手，**碰撞组恒 255 = 撞所有人**（语料 7968 发一个
+    例外都没有，和火墙同一个口径 —— `0x47ca0f: or eax, 0xffffffff`）。
+    """
+    slice_weapon = _slice_weapon_of(shell.weapon)
+    if slice_weapon is None or victim_seat is not None:
+        return
+    fire_seq = machine.sync.events
+    terrain = mapdata.load(_current_map(room))
+    # ★ 力度就是碎片那一节的 `Velocity`（`0x47ca12: fld [ebx+0x24]` 原样推
+    #   进包里）。语料 7968 发碎片的 `+18` **恒 10.0**，而 `ch00-02a`
+    #   的 `Velocity` 正是 10。
+    power = float(slice_weapon.velocity or 0.0)
+    for angle in _slice_angles(shell.weapon, slice_weapon, machine.roll):
+        shot = ballistics.launch(slice_weapon, angle, power)
+        packet, handle = machine.sync.fire(
+            slice_weapon.id, point[0], point[1], shot.angle, shot.power,
+            handle_step=slice_weapon.handle_step, shots=slice_weapon.shots,
+            group=botsync.FIRE_GROUP_EVERYONE)
+        _emit(machine, packet)
+        max_ticks = _shell_max_ticks(terrain, shot, slice_weapon)
+        for offset in range(slice_weapon.shots):
+            machine.pending_shots.append(
+                Shell(handle + offset, fire_seq, slice_weapon,
+                      botsync.FIRE_GROUP_EVERYONE, point[0], point[1],
+                      shot, time.monotonic(), max_ticks))
+        fire_seq = machine.sync.events
+    if not machine.split_logged:
+        machine.split_logged = True
+        machine.log(f"   分裂: 武器 {shell.weapon.id} 在 "
+                    f"({point[0]:.1f}, {point[1]:.1f}) 炸成 "
+                    f"{shell.weapon.slice_count} 片 {slice_weapon.id}"
+                    f"({slice_weapon.raw.get('section')})，每片吃 "
+                    f"{slice_weapon.handle_step} 个句柄（§81）")
 
 
 def _advance_shells(room, machine, now):
@@ -2454,13 +2722,23 @@ def _advance_shells(room, machine, now):
     #   真发生了的话这些记录是上一代的，句柄早就作废了 —— 丢掉，别拿过期的
     #   号去撞收方那个静默丢弃。
     alive = [s for s in machine.pending_shots if s.fire_seq < machine.sync.events]
+    # ★★★ **结算过程中还会有新的弹体生出来**：分裂弹炸开的碎片就是在
+    #   `_resolve_shell()` 里挂进 `pending_shots` 的（§81）。先把队列腾空，
+    #   收尾时再和「还在飞的」拼回去 —— 直接 `pending_shots = still` 会把
+    #   这一轮新生的 4 片**整个吞掉**，于是它们的 `rpExplode` 一发都不发，
+    #   句柄从此永久错开（§42 那个静默丢弃）。
+    machine.pending_shots = []
     terrain = mapdata.load(_current_map(room))
     bodies_cache = {}
     still = []
     for shell in alive:
         bodies = bodies_cache.get(shell.group)
         if bodies is None:
-            bodies = _battle_bodies(room, machine.my_seat, shell.group)
+            # ★ 组 255 = **撞所有人**（分裂弹的碎片就是这个组，§81）——
+            #   「所有人」里含射手自己，和溅射、火墙同一个口径（§69 / D50）。
+            bodies = _battle_bodies(
+                room, machine.my_seat, shell.group,
+                include_self=(shell.group == botsync.FIRE_GROUP_EVERYONE))
             bodies_cache[shell.group] = bodies
         # ★ 收方每 32 ms 推一步（`ballistics.TICK_MS`，§47）。这里按**真实
         #   流逝的时间**算它该走到第几步 —— 服务端的帧率（跟着真人心跳走，
@@ -2482,7 +2760,9 @@ def _advance_shells(room, machine, now):
             # 飞到头了什么都没撞上（打空 / 飞出图外）—— 在最后那一点炸掉。
             landed = ((shell.x, shell.y), None, None)
         _resolve_shell(room, machine, shell, landed[0], landed[1], landed[2])
-    machine.pending_shots = still
+    # ★ `still` 在前、这一轮新生的碎片在后 —— 顺序只影响下一帧的推进次序，
+    #   不影响句柄（那个在 `sync.fire()` 里就定死了）。
+    machine.pending_shots = still + machine.pending_shots
 
 
 # ---------------------------------------------------------------------------
@@ -2665,7 +2945,7 @@ def _try_dash(room, machine, seat_index, now, on_ground):
     if not machine.melee or machine.dash_swing is not None or not on_ground:
         return False
     if machine.holding:
-        return False                       # `/hold` 是「站住别动」，那就别冲
+        return False                       # `/s` 是「站住别动」，那就别冲
     move = chrprops.get(machine.character_id).dash(BOT_DASH_INDEX)
     if move is None or move.damage <= 0 or move.radius <= 0:
         return False
@@ -2846,7 +3126,7 @@ def _tick_bot(room, machine, seat_index):
     now = time.monotonic()
     try:
         # ★★ **排在所有分支前面**：在飞的子弹一发都不能漏（见那个函数的
-        #   注释）。bot 躺着、`/hold` 着、这一帧没有新位置点 —— 都不影响
+        #   注释）。bot 躺着、`/s` 着、这一帧没有新位置点 —— 都不影响
         #   「上一发子弹该炸了」这个事实。
         _advance_shells(room, machine, now)
         # ★ 地上的火同理：它烧不烧得到人，和 bot 躺没躺着无关（§78）。
@@ -2887,7 +3167,7 @@ def _tick_bot(room, machine, seat_index):
     machine.last_trail_mark = mark
 
     if machine.holding and machine.battle_pos is not None:
-        # ★ `/hold`：站在原地不动（用户 2026-08-26 要的测试手段）。
+        # ★ `/s`：站在原地不动（用户 2026-08-26 要的测试手段）。
         #   **照常发心跳** —— 真人站着不动时也一直在发，停发反而是异常状态。
         #   姿势按「站着」来：踩地、速度 0、不按键、不冲刺、不蹲。
         #   ★ 开火那一段照跑：站住正是为了让房主走开、绕到墙后，

@@ -84,7 +84,7 @@ def chat_lines(conn):
 
 
 class BotCommandTests(LobbyIsolated):
-    """`/bot` `/del` `/char` `/tm` `/ready` 的行为。"""
+    """`/a` `/c` `/t` `/r` 的行为。"""
 
     def setUp(self):
         super().setUp()
@@ -110,10 +110,10 @@ class BotCommandTests(LobbyIsolated):
         self.guest.sent.clear()
         return index
 
-    # -- /bot ---------------------------------------------------------------
+    # -- /a ---------------------------------------------------------------
     def test_bot_takes_the_lowest_free_seat_and_is_marked_as_a_bot(self):
         room = self.open_room()
-        self.assertTrue(bot.handle_command(self.host, "/bot"))
+        self.assertTrue(bot.handle_command(self.host, "/a"))
         seat = room.seats[1]
         self.assertIsNotNone(seat)
         self.assertTrue(seat.is_bot)
@@ -130,7 +130,7 @@ class BotCommandTests(LobbyIsolated):
         #   所以 bot 这条路必须补上房主自己的那一份。
         room = self.open_room()
         self.add_guest(room)
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         for who in (self.host, self.guest):
             updates = [u for u in seat_updates(who) if u[1] == 2]
             self.assertEqual(1, len(updates), f"{who.account_name} 没收到座位广播")
@@ -144,7 +144,7 @@ class BotCommandTests(LobbyIsolated):
         # `default_team_for`（座位号奇偶）天然平衡。
         room = self.open_room()
         for _ in range(5):
-            bot.handle_command(self.host, "/bot")
+            bot.handle_command(self.host, "/a")
         teams = [seat.team for seat in room.seats]
         self.assertEqual([TEAM_A, TEAM_B, TEAM_A, TEAM_B, TEAM_A, TEAM_B], teams)
         self.assertIsNone(bot._team_balance_warning(room))
@@ -152,9 +152,9 @@ class BotCommandTests(LobbyIsolated):
     def test_bot_on_a_full_room_says_so_and_changes_nothing(self):
         room = self.open_room()
         for _ in range(5):
-            bot.handle_command(self.host, "/bot")
+            bot.handle_command(self.host, "/a")
         self.host.sent.clear()
-        self.assertTrue(bot.handle_command(self.host, "/bot"))
+        self.assertTrue(bot.handle_command(self.host, "/a"))
         self.assertEqual(5, len(room.bot_seats()))
         self.assertIn("满", "".join(chat_lines(self.host)))
         # 一发座位广播都不该有：什么都没变。
@@ -165,51 +165,52 @@ class BotCommandTests(LobbyIsolated):
         #   账号时的默认目标，混进 bot 就会对着空气发命令。
         room = self.open_room()
         before = gameserver.all_conns()
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         self.assertEqual(before, gameserver.all_conns())
         self.assertIsInstance(room.seats[1].conn, bot.BotConn)
 
-    # -- /del ---------------------------------------------------------------
-    def test_del_removes_the_bot_and_broadcasts_action_1(self):
+    # -- /a 的个数参数（D56）------------------------------------------------
+    def test_a_with_a_count_adds_that_many_bots_at_once(self):
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")
-        self.host.sent.clear()
-        self.assertTrue(bot.handle_command(self.host, "/del 1"))
-        self.assertIsNone(room.seats[1])
-        updates = seat_updates(self.host)
-        self.assertEqual(1, len(updates))
-        action, seat_index, slot = updates[0]
-        # ★ 只有 action 1/2 会销毁座位的 3D 模型；发 3 会留下鬼影（§147）。
-        self.assertEqual(SEAT_ACTION_LEAVE, action)
-        self.assertEqual(1, seat_index)
-        self.assertFalse(slot["occupied"])
+        self.assertTrue(bot.handle_command(self.host, "/a 3"))
+        self.assertEqual([1, 2, 3], room.bot_seats())
 
-    def test_del_refuses_to_touch_a_human_seat(self):
+    def test_a_without_a_count_still_adds_exactly_one(self):
         room = self.open_room()
-        guest_seat = self.add_guest(room)
-        self.assertTrue(bot.handle_command(self.host, f"/del {guest_seat}"))
-        self.assertIsNotNone(room.seats[guest_seat])
-        self.assertIs(self.guest, room.seats[guest_seat].conn)
-        self.assertIn("不是 bot", "".join(chat_lines(self.host)))
+        bot.handle_command(self.host, "/a")
+        self.assertEqual([1], room.bot_seats())
 
-    def test_del_on_an_empty_seat_says_it_is_empty(self):
-        self.open_room()
-        self.assertTrue(bot.handle_command(self.host, "/del 4"))
-        self.assertIn("空的", "".join(chat_lines(self.host)))
+    def test_a_stops_at_the_last_free_seat_and_says_so(self):
+        """★ 要 6 个只坐得下 5 个（房主自己占一格）—— 加成功的照样留下。"""
+        room = self.open_room()
+        self.assertTrue(bot.handle_command(self.host, "/a 6"))
+        self.assertEqual([1, 2, 3, 4, 5], room.bot_seats())
+        self.assertIn("房间已经满了", "".join(chat_lines(self.host)))
 
-    def test_del_needs_a_seat_number_in_range(self):
-        self.open_room()
-        for text in ("/del", "/del x", "/del 9", "/del -1"):
+    def test_a_rejects_a_count_that_is_not_a_positive_number(self):
+        room = self.open_room()
+        for text in ("/a x", "/a 0", "/a -2"):
             self.host.sent.clear()
             self.assertTrue(bot.handle_command(self.host, text))
             self.assertTrue(chat_lines(self.host), f"{text} 没有给出原因")
+        self.assertEqual([], room.bot_seats())
 
-    # -- /char --------------------------------------------------------------
+    def test_del_is_gone_and_falls_through_to_normal_chat(self):
+        """★ `/del` 整条删掉了（D56）—— 踢 bot 用客户端自带的踢人按钮。
+
+        删掉之后它就是**普通聊天**，不该再被命令层吞掉。
+        """
+        room = self.open_room()
+        bot.handle_command(self.host, "/a")
+        self.assertFalse(bot.handle_command(self.host, "/del 1"))
+        self.assertEqual([1], room.bot_seats())
+
+    # -- /c --------------------------------------------------------------
     def test_char_maps_panel_index_to_the_real_character_id(self):
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         self.host.sent.clear()
-        self.assertTrue(bot.handle_command(self.host, "/char 1 3"))
+        self.assertTrue(bot.handle_command(self.host, "/c 1 3"))
         # ★ 面板 1/2/3 -> id 0/1/2（D6）。商城角色不给 bot 用（D54）。
         self.assertEqual(2, room.seats[1].character_id)
         self.assertEqual(2, room.seats[1].conn.character_id)
@@ -218,9 +219,9 @@ class BotCommandTests(LobbyIsolated):
         # ★ action 4 会让客户端播一句韩文「…캐릭터로 선택되었습니다.」
         #   （`0x406520`）。bot 换角色的提示我们自己用中文说。
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         self.host.sent.clear()
-        bot.handle_command(self.host, "/char 1 2")
+        bot.handle_command(self.host, "/c 1 2")
         actions = [action for action, seat_index, _ in seat_updates(self.host)
                    if seat_index == 1]
         self.assertEqual([SEAT_ACTION_RESYNC], actions)
@@ -229,9 +230,9 @@ class BotCommandTests(LobbyIsolated):
 
     def test_char_rejects_panel_indexes_outside_1_to_14(self):
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         before = room.seats[1].character_id
-        for text in ("/char 1 0", "/char 1 15", "/char 1 x", "/char 1"):
+        for text in ("/c 1 0", "/c 1 15", "/c 1 x", "/c 1"):
             self.host.sent.clear()
             self.assertTrue(bot.handle_command(self.host, text))
             self.assertEqual(before, room.seats[1].character_id)
@@ -240,30 +241,30 @@ class BotCommandTests(LobbyIsolated):
     def test_char_keeps_team_and_ready_when_it_rebuilds_the_seat(self):
         # 座位快照是整发的：换角色那一发不能顺手把队伍/准备抹成 0。
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")
-        bot.handle_command(self.host, "/ready")
+        bot.handle_command(self.host, "/a")
+        bot.handle_command(self.host, "/r")
         self.host.sent.clear()
-        bot.handle_command(self.host, "/char 1 3")
+        bot.handle_command(self.host, "/c 1 3")
         _action, _seat_index, slot = seat_updates(self.host)[0]
         self.assertTrue(slot["ready"])
         self.assertEqual(room.seats[1].team, slot["team"])
 
-    # -- /tm ----------------------------------------------------------------
+    # -- /t ----------------------------------------------------------------
     def test_tm_toggles_between_1_and_2_in_a_team_room(self):
         room = self.open_room(**TEAMS_ROOM)
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         self.assertEqual(TEAM_B, room.seats[1].team)
-        self.assertTrue(bot.handle_command(self.host, "/tm 1"))
+        self.assertTrue(bot.handle_command(self.host, "/t 1"))
         self.assertEqual(TEAM_A, room.seats[1].team)
-        bot.handle_command(self.host, "/tm 1")
+        bot.handle_command(self.host, "/t 1")
         self.assertEqual(TEAM_B, room.seats[1].team)
 
     def test_tm_warns_when_the_two_sides_stop_being_equal(self):
         # 客户端 `0x468495` 数两队人数，不等就拒绝开局（§8）—— 必须当场说。
         room = self.open_room(**TEAMS_ROOM)
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         self.host.sent.clear()
-        bot.handle_command(self.host, "/tm 1")
+        bot.handle_command(self.host, "/t 1")
         self.assertIn("两队人数不等", "".join(chat_lines(self.host)))
         self.assertEqual(TEAM_A, room.seats[1].team)
 
@@ -274,10 +275,10 @@ class BotCommandTests(LobbyIsolated):
             with self.subTest(params=params):
                 self.lobby.reset()
                 room = self.open_room(**params)
-                bot.handle_command(self.host, "/bot")
+                bot.handle_command(self.host, "/a")
                 before = room.seats[1].team
                 self.host.sent.clear()
-                self.assertTrue(bot.handle_command(self.host, "/tm 1"))
+                self.assertTrue(bot.handle_command(self.host, "/t 1"))
                 self.assertEqual(before, room.seats[1].team)
                 self.assertIn("换不了队", "".join(chat_lines(self.host)))
 
@@ -287,12 +288,12 @@ class BotCommandTests(LobbyIsolated):
         #   所以 `/team 1` 根本到不了服务端；能到的只有光杆 `/team`
         #   （差那个空格）。它必须只回一行提示，一个座位都不许动。
         room = self.open_room(**TEAMS_ROOM)
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         before = room.seats[1].team
         self.host.sent.clear()
         self.assertTrue(bot.handle_command(self.host, "/team"))
         self.assertEqual(before, room.seats[1].team)
-        self.assertIn("/tm", "".join(chat_lines(self.host)))
+        self.assertIn("/t", "".join(chat_lines(self.host)))
         self.assertEqual([], seat_updates(self.host))
 
     def test_no_command_name_collides_with_a_client_reserved_prefix(self):
@@ -303,13 +304,13 @@ class BotCommandTests(LobbyIsolated):
         live = set(bot.COMMANDS) - {"team"}   # team 留着只为回一行提示
         self.assertEqual(set(), live & reserved)
 
-    # -- /ready -------------------------------------------------------------
+    # -- /r -------------------------------------------------------------
     def test_ready_marks_every_bot_and_broadcasts_each_seat(self):
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
+        bot.handle_command(self.host, "/a")
         self.host.sent.clear()
-        self.assertTrue(bot.handle_command(self.host, "/ready"))
+        self.assertTrue(bot.handle_command(self.host, "/r"))
         self.assertTrue(room.seats[1].ready)
         self.assertTrue(room.seats[2].ready)
         # 房主自己那格不动 —— 客户端本来就把房主算成已准备（`0x4696f8`）。
@@ -319,8 +320,33 @@ class BotCommandTests(LobbyIsolated):
 
     def test_ready_without_any_bot_says_so(self):
         self.open_room()
-        self.assertTrue(bot.handle_command(self.host, "/ready"))
+        self.assertTrue(bot.handle_command(self.host, "/r"))
         self.assertIn("一个 bot 都没有", "".join(chat_lines(self.host)))
+
+    def test_ready_again_cancels_every_bot(self):
+        """★ 全都准备好了再敲一次 `/r` = **全部取消**（用户 2026-08-28，D56）。
+
+        判据是**当前状态**（「还有没准备好的吗」），不是敲了第几次 ——
+        计数器会在别人手动改过之后和事实对不上（铁律 10）。
+        """
+        room = self.open_room()
+        bot.handle_command(self.host, "/a 2")
+        bot.handle_command(self.host, "/r")
+        self.assertTrue(all(room.seats[i].ready for i in room.bot_seats()))
+        self.host.sent.clear()
+        self.assertTrue(bot.handle_command(self.host, "/r"))
+        self.assertFalse(any(room.seats[i].ready for i in room.bot_seats()))
+        self.assertEqual([1, 2],
+                         sorted(s for _a, s, _x in seat_updates(self.host)))
+        self.assertIn("取消", "".join(chat_lines(self.host)))
+
+    def test_ready_marks_the_rest_when_only_some_are_ready(self):
+        """★ 还有一个没准备好 ⇒ 这一发是「全部准备」，不是「全部取消」。"""
+        room = self.open_room()
+        bot.handle_command(self.host, "/a 2")
+        room.seats[1].update(ready=True)
+        self.assertTrue(bot.handle_command(self.host, "/r"))
+        self.assertTrue(all(room.seats[i].ready for i in room.bot_seats()))
 
     # -- 权限 / 时机 --------------------------------------------------------
     def test_a_non_host_command_is_not_swallowed_but_gets_a_hint(self):
@@ -328,19 +354,19 @@ class BotCommandTests(LobbyIsolated):
         # 什么都没发生 —— 两件事不矛盾。
         room = self.open_room()
         self.add_guest(room)
-        self.assertFalse(bot.handle_command(self.guest, "/bot"))
+        self.assertFalse(bot.handle_command(self.guest, "/a"))
         self.assertEqual([], room.bot_seats())
         self.assertIn("只有房主", "".join(chat_lines(self.guest)))
 
     def test_commands_outside_a_room_are_consumed_with_a_reason(self):
-        self.assertTrue(bot.handle_command(self.host, "/bot"))
+        self.assertTrue(bot.handle_command(self.host, "/a"))
         self.assertIn("只能在房间里", "".join(chat_lines(self.host)))
 
     def test_mutating_commands_are_refused_while_the_game_is_running(self):
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         room.status = SESSION_STATUS_PLAYING
-        for text in ("/bot", "/del 1", "/char 1 2", "/tm 1", "/ready"):
+        for text in ("/a", "/a 2", "/c 1 2", "/t 1", "/r"):
             self.host.sent.clear()
             self.assertTrue(bot.handle_command(self.host, text))
             self.assertIn("游戏进行中", "".join(chat_lines(self.host)))
@@ -356,8 +382,8 @@ class BotCommandTests(LobbyIsolated):
         self.assertTrue(bot.handle_command(self.host, "/help"))
         lines = chat_lines(self.host)
         self.assertEqual(len(bot.BATTLE_HELP_LINES), len(lines))
-        self.assertIn("/hold", "".join(lines))
-        self.assertIn("/gun", "".join(lines))
+        self.assertIn("/s", "".join(lines))
+        self.assertIn("/w", "".join(lines))
 
     def test_help_in_the_room_lists_the_room_commands(self):
         self.open_room()
@@ -365,7 +391,7 @@ class BotCommandTests(LobbyIsolated):
         self.assertTrue(bot.handle_command(self.host, "/help"))
         lines = chat_lines(self.host)
         self.assertEqual(len(bot.HELP_LINES), len(lines))
-        self.assertIn("/bot", "".join(lines))
+        self.assertIn("/a", "".join(lines))
 
     def test_help_has_three_aliases(self):
         self.open_room()
@@ -399,9 +425,9 @@ class BotCommandTests(LobbyIsolated):
         # bot 命令跑在房主自己的收包线程上：抛出去就是房主掉线。
         room = self.open_room()
         broken = dict(bot.COMMANDS)
-        broken["bot"] = lambda conn, room_, args: 1 / 0
+        broken["a"] = lambda conn, room_, args: 1 / 0
         with unittest.mock.patch.dict(bot.COMMANDS, broken, clear=True):
-            self.assertTrue(bot.handle_command(self.host, "/bot"))
+            self.assertTrue(bot.handle_command(self.host, "/a"))
         self.assertEqual([], room.bot_seats())
         self.assertIn("出错", "".join(chat_lines(self.host)))
 
@@ -424,8 +450,8 @@ class BotSeatLifecycleTests(LobbyIsolated):
     def test_host_migration_skips_bot_seats(self):
         # ★ D2：把房主转给 bot = 房间彻底死掉（没人能开局、没人能 /del）。
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")          # 座位 1
-        bot.handle_command(self.host, "/bot")          # 座位 2
+        bot.handle_command(self.host, "/a")          # 座位 1
+        bot.handle_command(self.host, "/a")          # 座位 2
         self.lobby.join(self.guest, room.room_id,
                         seat=self.guest.seat_snapshot())   # 座位 3
         result = self.lobby.leave(self.host)
@@ -437,7 +463,7 @@ class BotSeatLifecycleTests(LobbyIsolated):
     def test_the_last_human_leaving_takes_every_bot_with_them(self):
         room = self.open_room()
         for _ in range(3):
-            bot.handle_command(self.host, "/bot")
+            bot.handle_command(self.host, "/a")
         room_id = room.room_id
         result = self.lobby.leave(self.host)
         self.assertTrue(result.closed)
@@ -452,7 +478,7 @@ class BotSeatLifecycleTests(LobbyIsolated):
 
     def test_bots_survive_a_non_last_human_leaving(self):
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         self.lobby.join(self.guest, room.room_id,
                         seat=self.guest.seat_snapshot())
         result = self.lobby.leave(self.guest)
@@ -462,7 +488,7 @@ class BotSeatLifecycleTests(LobbyIsolated):
 
     def test_a_room_with_only_bots_left_never_shows_up_in_the_lobby_list(self):
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         self.lobby.leave(self.host)
         self.assertEqual([], [r.room_id for r in self.lobby.rooms()])
         self.assertEqual(0, room.player_count())
@@ -472,7 +498,7 @@ class BotSeatLifecycleTests(LobbyIsolated):
         #   `len(room.members()) >= 2` 判要不要开通道 A，而 bot 有假连接，
         #   所以「1 真人 + N bot」自动算够两个「会动的座位」。
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         members = room.members(exclude=None)
         self.assertEqual(2, len(members))
         self.assertIs(self.host, members[0])
@@ -484,7 +510,7 @@ class BotSeatLifecycleTests(LobbyIsolated):
         # 这条路（`on_kick_out` -> `Lobby.kick` -> `after_someone_left`）会把
         # 一串本来给真人用的收尾动作调到 `BotConn` 头上 —— 它必须全都活得下来。
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         self.host.sent.clear()
         self.host.on_kick_out(gameserver.w_i32(1) + gameserver.w_i32(0))
         self.assertIsNone(room.seats[1])
@@ -496,7 +522,7 @@ class BotSeatLifecycleTests(LobbyIsolated):
         # `send_session_members()` 会对**每个房间成员**调 `refresh_seat()`，
         # 而 bot 的 `account` 是 None —— 跑真的那一版就会把昵称刷成空串。
         room = self.open_room()
-        bot.handle_command(self.host, "/bot")
+        bot.handle_command(self.host, "/a")
         machine = room.seats[1].conn
         machine.send_session_members()
         self.assertEqual("bot 1", room.seats[1].nickname)
@@ -504,7 +530,7 @@ class BotSeatLifecycleTests(LobbyIsolated):
 
 
 class CharacterPanelTests(unittest.TestCase):
-    """`/char N M` 的 M 是**面板序号**，不是原始角色 id（D6）。"""
+    """`/c N M` 的 M 是**面板序号**，不是原始角色 id（D6）。"""
 
     def test_the_panel_has_exactly_fourteen_entries(self):
         # 基础 0/1/2 + 商城 100..110。id 3 / 98 / 99 客户端放不出来。
@@ -555,7 +581,7 @@ class BotStartChainTests(BattleRoom):
     """
 
     def start_battle(self):
-        bot.handle_command(self.alice, "/bot")
+        bot.handle_command(self.alice, "/a")
         self.bot_seat = self.room.bot_seats()[0]
         self.bot_conn = self.room.seats[self.bot_seat].conn
 
@@ -619,7 +645,7 @@ class BotStartChainTests(BattleRoom):
         gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
         self.members = [self.alice]
         for _ in range(4):                          # 夹具已经放了一个
-            bot.handle_command(self.alice, "/bot")
+            bot.handle_command(self.alice, "/a")
         self.assertEqual([1, 2, 3, 4, 5], self.room.bot_seats())
         self.ready(self.alice); self.ready(self.alice)
         self.loaded(self.alice)
@@ -630,7 +656,7 @@ class BotBattleRoom(BattleRoom):
     """alice（房主，座位 0）+ bob（座位 1）+ 一个 bot（座位 2），已经进了关卡。"""
 
     def start_battle(self):
-        bot.handle_command(self.alice, "/bot")
+        bot.handle_command(self.alice, "/a")
         self.bot_seat = self.room.bot_seats()[0]
         self.bot_conn = self.room.seats[self.bot_seat].conn
         self.bot_handle = player_handle(self.bot_seat)

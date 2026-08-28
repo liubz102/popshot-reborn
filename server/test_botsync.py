@@ -1206,7 +1206,7 @@ class TwoBotFrameRoom(BotFrameRoom):
     """两个 bot ——`/bot` 在游戏中是拒绝的，所以必须开局**前**加好。"""
 
     def start_battle(self):
-        bot.handle_command(self.alice, "/bot")
+        bot.handle_command(self.alice, "/a")
         super().start_battle()
         self.bot_seats = self.room.bot_seats()
 
@@ -1829,13 +1829,13 @@ class BotWeaponDeclarationTests(BotFireRoom):
 
 
 class BotGunCommandTests(BotFireRoom):
-    """`/gun N M` —— 房主手动换枪（自动换是 M5 的事，见 `_cmd_gun` 的注释）。"""
+    """`/w N M` —— 房主手动换枪（自动换是 M5 的事，见 `_cmd_gun` 的注释）。"""
 
     def gun(self, *args):
-        """敲一条 `/gun`，返回房主看到的那几行系统提示。"""
+        """敲一条 `/w`，返回房主看到的那几行系统提示。"""
         self.alice.sent.clear()
         self.assertTrue(bot.handle_command(
-            self.alice, "/gun " + " ".join(map(str, args))))
+            self.alice, "/w " + " ".join(map(str, args))))
         return "".join(chat_lines(self.alice))
 
     def test_listing_shows_the_usable_slots(self):
@@ -1875,7 +1875,7 @@ class BotGunCommandTests(BotFireRoom):
         self.assertEqual(slot, self.bot_conn.weapon_slot)
 
     def test_switching_to_a_slot_the_new_character_lacks_falls_back(self):
-        """`/char` 换到一个没有那个槽位的角色 —— 退回首选，**不是**哑火。
+        """`/c` 换到一个没有那个槽位的角色 —— 退回首选，**不是**哑火。
 
         角色 3（아이린，玩家选不到）的 3 号槽是 `TotemLauncher`，
         `Damage=0` 打不动人 ⇒ 不在 `usable` 里，正好当这个局面的样本。
@@ -1889,12 +1889,12 @@ class BotGunCommandTests(BotFireRoom):
 
 
 class BotHoldCommandTests(BotFireRoom):
-    """`/hold N` —— 让 bot 站住，好测「隔着墙打不打得到」。"""
+    """`/s N` —— 让 bot 站住，好测「隔着墙打不打得到」。"""
 
     def hold(self, *args):
         self.alice.sent.clear()
         self.assertTrue(bot.handle_command(
-            self.alice, "/hold " + " ".join(map(str, args))))
+            self.alice, "/s " + " ".join(map(str, args))))
         return "".join(chat_lines(self.alice))
 
     def test_holding_freezes_the_position_but_keeps_the_heartbeat(self):
@@ -1943,7 +1943,7 @@ class BotBallisticFireTests(BotFireRoom):
     def gun(self, *args):
         self.alice.sent.clear()
         self.assertTrue(bot.handle_command(
-            self.alice, "/gun " + " ".join(map(str, args))))
+            self.alice, "/w " + " ".join(map(str, args))))
         return "".join(chat_lines(self.alice))
 
     def test_the_explode_waits_for_the_bullet_to_arrive(self):
@@ -2018,7 +2018,7 @@ class BotBallisticFireTests(BotFireRoom):
         站在身边才开枪」。射程口径从 `LockonRange`（80~120）换成语料量出来的
         交战距离 1000 之后，隔半个屏幕也该开火（§48）。"""
         self.approach()
-        bot.handle_command(self.alice, f"/hold {self.bot_seat}")
+        bot.handle_command(self.alice, f"/s {self.bot_seat}")
         self.clear()
         self.bot_conn.next_fire_at = 0.0
         far = self.bot_conn.battle_pos[0] + 700.0
@@ -2028,7 +2028,7 @@ class BotBallisticFireTests(BotFireRoom):
 
     def test_nothing_is_shot_at_beyond_the_engagement_range(self):
         self.approach()
-        bot.handle_command(self.alice, f"/hold {self.bot_seat}")
+        bot.handle_command(self.alice, f"/s {self.bot_seat}")
         self.clear()
         self.bot_conn.next_fire_at = 0.0
         far = self.bot_conn.battle_pos[0] + bot.BOT_ENGAGE_RANGE + 200.0
@@ -2215,7 +2215,7 @@ class HumanFireLogTests(BotFireRoom):
 
 
 class BotGunDeclaresAtOnceTests(BotFireRoom):
-    """★ `/gun` 敲完**当场**发 `rpChangeWeapon`（用户 2026-08-27 报的）。
+    """★ `/w` 敲完**当场**发 `rpChangeWeapon`（用户 2026-08-27 报的）。
 
     以前 `_declare_weapon()` 只挂在 `_try_fire()` 上 —— 房主敲完命令盯着看，
     bot 手里那把枪半天不动，等它下一次开火才突然跳变。
@@ -2231,7 +2231,7 @@ class BotGunDeclaresAtOnceTests(BotFireRoom):
         # ★ 把开火挡住，确保发出去的那一发只可能来自命令本身。
         self.bot_conn.next_fire_at = time.monotonic() + 3600.0
         self.assertTrue(bot.handle_command(
-            self.alice, f"/gun {self.bot_seat} {other[0]}"))
+            self.alice, f"/w {self.bot_seat} {other[0]}"))
         frames = [f for f in bot_frames(self.alice, self.bot_seat)
                   if header(f)["opcode"] == botsync.OP_CHANGE_WEAPON]
         self.assertTrue(frames, "敲完命令就该把新枪声明出去")
@@ -2247,7 +2247,7 @@ class BotGunDeclaresAtOnceTests(BotFireRoom):
         room.battle.host.state = gameserver.StartGameHandshake.PREPARING
         self.clear()
         self.assertTrue(bot.handle_command(
-            self.alice, f"/gun {self.bot_seat}"))
+            self.alice, f"/w {self.bot_seat}"))
 
 
 class BotLoadingWindowTests(BotFireRoom):
@@ -2728,6 +2728,180 @@ class BotFuseTests(BotFireRoom):
         self.assertGreaterEqual(shot.ticks, weapon.fuse_ticks - 1)
         self.assertTrue(bot._outlives_fuse(weapon, shot))
 
+
+class BotSliceTests(BotFireRoom):
+    """★★ **苹果雷炸开的那几片碎片**（§81）。
+
+    用户 2026-08-28：「1 号角色的 2 号武器苹果弹，真人玩的时候能看见敌人
+    扔出去后炸裂开的几个碎片，现在看不到 bot 的炸裂碎片。」
+
+    根子和火墙、溅射是同一个（§72）：造碎片那一段套在 `IsMine` 门里
+    （`0x47c96e`），bot 的弹体在任何一台上都不是「自己的」⇒ 一片都不会生。
+    """
+
+    def apple(self):
+        """把 bot 换成角色 0 的 2 号槽（사과탄，`CreatingClass=AppleGrenade`）。"""
+        self.room.seats[self.bot_seat].character_id = 0
+        self.bot_conn.character_id = 0
+        self.bot_conn.weapon_slot = 2
+        self.bot_conn.declared_weapon = None
+        weapon = self.bot_conn.weapon
+        self.assertEqual(1000020, weapon.id)
+        return weapon
+
+    def test_the_fan_matches_the_original_formula(self):
+        """★★★ 四片的角度 = `Base + Angle × i / (n−1) + rand % R − R/2`。
+
+        三个 `SliceAngle*` 苹果雷一个都没写 ⇒ 走解析器里的缺省值
+        **160 / 30 / 30**（`0x48984d` / `0x489887` / `0x4898c5` 那三条
+        `mov ebx`）。语料 1992 组碎片量到的四档取值范围
+        `[15,44] [68,97] [121,150] [175,204]` 和这个公式一位不差。
+        """
+        weapon = weapondata.get(1000020)
+        slice_weapon = weapondata.get(1000500)
+        self.assertEqual(4, weapon.slice_count)
+        self.assertEqual((160, 30, 30), (slice_weapon.slice_angle,
+                                         slice_weapon.slice_angle_base,
+                                         slice_weapon.slice_angle_random))
+        lows = [round(math.degrees(-a))
+                for a in bot._slice_angles(weapon, slice_weapon, lambda n: 0)]
+        highs = [round(math.degrees(-a))
+                 for a in bot._slice_angles(weapon, slice_weapon,
+                                            lambda n: n - 1)]
+        self.assertEqual([15, 68, 121, 175], lows)
+        self.assertEqual([44, 97, 150, 204], highs)
+
+    def test_the_bot_fires_four_fragments_when_it_misses(self):
+        """★ 碎片是 `SliceCount` 发**真的** `rpFire`，句柄跟着走。"""
+        self.apple()
+        self.bot_conn.roll = lambda n: 0
+        self.bot_conn.holding = True
+        self.walk(self.alice, [(0.0, 100.0), (600.0, 100.0)])
+        self.settle()
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.walk(self.alice, [(600.0, 100.0)])
+        self.charge()
+        self.walk(self.alice, [(600.0, 100.0)])
+        shots = list(self.bot_conn.pending_shots)
+        self.assertTrue(shots, "该有一颗苹果雷在飞")
+        before = self.bot_conn.sync.projectiles
+        self.walk(self.alice, [(3000.0, 100.0)])       # 躲开 —— 别被砸中
+        for shell in self.bot_conn.pending_shots:
+            shell.max_ticks = min(shell.max_ticks, 20)
+        self.clear()
+        self.settle()
+        frags = [f for f in fire_frames(self.alice, self.bot_seat)
+                 if struct.unpack_from("<i", body_of(f), 2)[0] == 1000500]
+        self.assertEqual(4, len(frags))
+        # 每片吃 `handle_step` 个句柄。
+        step = weapondata.get(1000500).handle_step
+        self.assertEqual(before + 4 * step, self.bot_conn.sync.projectiles)
+
+    def test_the_fragments_hit_everyone_and_come_from_the_shooter(self):
+        """★ 碰撞组恒 255（`0x47ca0f: or eax, 0xffffffff`），owner 是射手。
+
+        语料 7968 发碎片 `rpFire` 的 `(owner, 组, 颗数)` 一个例外都没有。
+        """
+        self.apple()
+        self.bot_conn.roll = lambda n: 0
+        weapon = self.bot_conn.weapon
+        shell = bot.Shell(1, 0, weapon, 3, 0.0, 0.0,
+                          ballistics.launch(weapon, 0.0, 15.0), 0.0, 10)
+        self.clear()
+        bot._split_shell(self.room, self.bot_conn, shell, (100.0, 50.0), None)
+        frags = fire_frames(self.alice, self.bot_seat)
+        self.assertEqual(4, len(frags))
+        for frame in frags:
+            body = body_of(frame)
+            self.assertEqual(botsync.FIRE_SOURCE_PLAYER_BASE + self.bot_seat,
+                             body[0])
+            self.assertEqual(botsync.FIRE_GROUP_EVERYONE, body[1])
+            self.assertEqual(1000500, struct.unpack_from("<i", body, 2)[0])
+            # 出生点就是母弹的爆点（语料 7948 组偏移恒 (0, 0)）。
+            self.assertEqual((100.0, 50.0),
+                             struct.unpack_from("<ff", body, 6))
+            # 力度 = 碎片那一节的 `Velocity`（语料恒 10.0）。
+            self.assertAlmostEqual(10.0,
+                                   struct.unpack_from("<f", body, 18)[0],
+                                   places=3)
+            self.assertEqual(1, struct.unpack_from("<i", body, 22)[0])
+
+    def test_a_direct_hit_never_splits(self):
+        """★★ 砸中角色的那一发弹体当场就没了，**不分裂**（§81）。
+
+        语料：「没打中角色」的 1837 发全部跟着 4 片碎片（飞了 12 发心跳
+        ≈ `SliceTime`），「打中角色」的 401 发一片都没有。
+        """
+        self.apple()
+        weapon = self.bot_conn.weapon
+        shell = bot.Shell(1, 0, weapon, 3, 0.0, 0.0,
+                          ballistics.launch(weapon, 0.0, 15.0), 0.0, 10)
+        self.clear()
+        bot._split_shell(self.room, self.bot_conn, shell, (100.0, 50.0), 0)
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+
+    def test_the_fragments_survive_the_frame_that_created_them(self):
+        """★★★ 碎片是在 `_resolve_shell()` **里面**挂进队列的 ——
+        `_advance_shells()` 收尾时不能把它们连同旧队列一起冲掉。
+
+        冲掉的后果是这 4 片一发 `rpExplode` 都不发，句柄从此永久错开、
+        之后每一发都被静默丢弃（§42）：**子弹照飞、一滴血不掉**。
+        """
+        self.apple()
+        self.bot_conn.roll = lambda n: 0
+        self.walk(self.alice, [(600.0, 100.0)])
+        weapon = self.bot_conn.weapon
+        # ★ `fire_seq` 要比当前事件序号小 —— 否则 `_advance_shells()` 开头
+        #   那道「上一代的记录」保险会先把它丢掉。
+        shell = bot.Shell(1, self.bot_conn.sync.events - 1, weapon, 3,
+                          0.0, 0.0, ballistics.launch(weapon, 0.0, 15.0),
+                          time.monotonic() - 3600.0, 3)
+        self.bot_conn.pending_shots = [shell]
+        self.clear()
+        bot._advance_shells(self.room, self.bot_conn, time.monotonic())
+        self.assertEqual(4, len(self.bot_conn.pending_shots),
+                         "碎片被 _advance_shells 的收尾吞掉了")
+        for piece in self.bot_conn.pending_shots:
+            self.assertEqual(1000500, piece.weapon.id)
+
+    def test_group_255_shells_can_hit_the_shooter_itself(self):
+        """★ 碎片的组是 255 = **撞所有人**，「所有人」里含射手自己
+        （和溅射、火墙同一个口径，§69 / D50 —— 自伤照结算）。"""
+        self.walk(self.alice, [(600.0, 100.0)])
+        seats = [s for s, *_ in bot._battle_bodies(
+            self.room, self.bot_seat, botsync.FIRE_GROUP_EVERYONE,
+            include_self=True)]
+        self.assertIn(self.bot_seat, seats)
+        seats = [s for s, *_ in bot._battle_bodies(
+            self.room, self.bot_seat, botsync.FIRE_GROUP_EVERYONE)]
+        self.assertNotIn(self.bot_seat, seats)
+
+    def test_a_weapon_without_a_slice_count_never_splits(self):
+        """★ 火焰弹也有 `SliceId`，但它没有 `SliceCount` —— 那条走火墙。"""
+        self.assertIsNone(bot._slice_weapon_of(weapondata.get(1001020)))
+        self.assertIsNone(bot._slice_weapon_of(weapondata.get(1000010)))
+        self.assertIsNotNone(bot._slice_weapon_of(weapondata.get(1000020)))
+
+    def test_every_fragment_gets_its_own_explosion(self):
+        """★★★ 每一片都是收方一个真的弹体 —— 少发一发 `rpExplode`，
+        句柄记账就永久错开，从此「子弹照飞、一滴血不掉」（§42）。"""
+        self.apple()
+        self.bot_conn.roll = lambda n: 0
+        self.walk(self.alice, [(600.0, 100.0)])
+        weapon = self.bot_conn.weapon
+        shell = bot.Shell(1, 0, weapon, 3, 0.0, 0.0,
+                          ballistics.launch(weapon, 0.0, 15.0), 0.0, 10)
+        self.bot_conn.pending_shots = []
+        bot._split_shell(self.room, self.bot_conn, shell, (100.0, 50.0), None)
+        self.assertEqual(4, len(self.bot_conn.pending_shots))
+        self.clear()
+        for piece in self.bot_conn.pending_shots:
+            piece.max_ticks = min(piece.max_ticks, 12)
+        self.settle()
+        self.assertEqual(4, len(explode_frames(self.alice, self.bot_seat)))
+        self.assertEqual([], self.bot_conn.pending_shots)
+
     def test_the_shell_queue_never_outlives_the_fuse(self):
         weapon = weapondata.get(1110030)          # ch110-03，SliceTime=500
         shot = ballistics.solve(weapon, 300.0, 0.0)
@@ -2783,11 +2957,34 @@ class BotFireWallTests(BotFireRoom):
         self.assertEqual(1001020, weapon.id)
         return weapon
 
+    def dodge(self, x=3000.0, y=100.0):
+        """把 alice 挪出弹道，让那一发**什么都打不中**。
+
+        ★ 火墙只有「没打中角色」的那一发才铺（§79）—— 砸中人的那一发在
+        原版里根本走不到铺火那一段（`0x4829d7` 的 `cmp [esp+8], 0`）。
+        """
+        self.walk(self.alice, [(x, y)])
+
     def throw(self):
-        """蓄满 -> 扔一颗 -> 结算（火墙是**爆炸那一刻**才铺的）。"""
-        self.approach()
+        """站远了蓄满扔一颗 -> **躲开** -> 结算（火墙是**爆炸那一刻**才铺的）。
+
+        ★ 必须扔远的：贴脸那一发在收方的第一个 tick 里就砸在人身上，
+        当场结算（§52），来不及躲 —— 而砸中人的那一发**不铺火墙**（§79）。
+        """
+        self.bot_conn.holding = True
+        self.walk(self.alice, [(0.0, 100.0), (600.0, 100.0)])
+        self.settle()
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.walk(self.alice, [(600.0, 100.0)])      # 手指按下去，开始蓄力
         self.charge()
-        self.approach(x=120.0)
+        self.walk(self.alice, [(600.0, 100.0)])      # 松手，扔出去
+        self.dodge()
+        # ★ 这个房间没有地形数据（`_current_map` 解不出图），弹体永远落不了地
+        #   —— 手动把上界收到 20 个 tick，等价于「这一刻撞到地面了」，
+        #   火墙就铺在弹道上那一点。不收的话它会一路掉到 y 十几万去。
+        for shell in self.bot_conn.pending_shots:
+            shell.max_ticks = min(shell.max_ticks, 20)
         self.settle()
 
     def test_a_flame_bottle_sets_the_ground_on_fire(self):
@@ -2884,7 +3081,9 @@ class BotFireWallTests(BotFireRoom):
         spot = self.alice.sync_trail[-1][:2]
         self.bot_conn.fires = [bot.FireWall(
             botsync.projectile_handle(self.bot_seat, 0), flame,
-            [(float(spot[0]), float(spot[1]))],
+            [bot.Flame(botsync.projectile_handle(self.bot_seat, 0),
+                       float(spot[0]), float(spot[1]), 0,
+                       bot._fire_wall_ticks(flame))],
             time.monotonic() - 3600.0, bot._fire_wall_ticks(flame))]
         self.clear()
         self.walk(self.alice, [tuple(spot)])
@@ -2898,10 +3097,72 @@ class BotFireWallTests(BotFireRoom):
         self.flame_thrower()
         self.throw()
         wall = self.bot_conn.fires[0]
-        self.assertTrue(
-            bot._fire_touch(chrprops.get(1), wall.spots[0][0],
-                            wall.spots[0][1], False, wall.spots,
-                            wall.flame.size))
+        root = wall.flames[0]
+        self.assertIsNotNone(
+            bot._fire_touch(chrprops.get(1), root.x, root.y, False,
+                            wall.flames, wall.flame.size, 0))
+
+    # -- ★★ 会话 24 改的三条（§79）-----------------------------------------
+    def test_a_direct_hit_never_sets_the_ground_on_fire(self):
+        """★★★ 直接砸中人的那一发**不铺火墙**（§79）。
+
+        原版铺火那一段前面有一道 `cmp dword [esp+8], 0 ; jne 出口`
+        （`0x4829d7`），`[esp+8]` 就是撞上的那个角色 —— 非空就整段跳过。
+        语料 1079 发 `rpSetOnFire` 无一例外都跟在「什么都没打中」的爆炸后面。
+
+        用户 2026-08-28：「我自己扔出去后如果直接命中别人……之后就不会再有
+        持续伤害了；而 bot 扔出去的手雷，即便是直接命中我，我身上的火焰
+        也会持续造成伤害。」
+        """
+        self.flame_thrower()
+        self.approach()
+        self.charge()
+        self.approach(x=120.0)          # ★ 不躲 —— 这一发砸在 alice 身上
+        booms = explode_frames(self.alice, self.bot_seat)
+        self.assertTrue(booms)
+        self.assertTrue(any(struct.unpack_from("<i", body_of(f), 4)[0]
+                            for f in booms), "这一轮该有一发打中了人")
+        self.assertEqual([], fire_wall_frames(self.alice, self.bot_seat))
+        self.assertEqual([], self.bot_conn.fires)
+
+    def test_the_wall_is_two_n_plus_one_flames_spreading_outwards(self):
+        """★★ 一道墙是 `2n+1` 团火，从爆点往两边一格一格铺开（§79）。
+
+        收方 `OnSetOnFire`（`0x492471`）只造**根火**那一团；之后每一团在
+        自己出生 `SpawnInterval` 个 tick 后往外再生一团，根火左右各生一路
+        （`Flame::Tick` `0x482696` + `0x4827de` 的 −1/+1 循环）。
+        ⇒ 团数正好等于 §75 那个句柄数 `2 × SpawnCount + 1`。
+        """
+        flame = weapondata.get(1001500)          # SpawnCount=4 Distance=30
+        flames = bot._fire_wall_flames(None, flame, (500.0, 300.0), 200000)
+        self.assertEqual(botsync.fire_wall_handles(4), len(flames))
+        # 根火在爆点上（y 减了 1：`0x492486` 的 `fsub [0x693720]`）。
+        self.assertEqual((500.0, 299.0), (flames[0].x, flames[0].y))
+        self.assertEqual(0, flames[0].born)
+        # 左右各 4 格，一格 30 —— 整道墙 ±120。
+        self.assertEqual(sorted(f.x for f in flames),
+                         [380.0, 410.0, 440.0, 470.0, 500.0,
+                          530.0, 560.0, 590.0, 620.0])
+        # 越往外出生越晚：第 k 格在第 `k × SpawnInterval` 个 tick 上。
+        self.assertEqual({0: 0, 30.0: 4, 60.0: 8, 90.0: 12, 120.0: 16},
+                         {abs(f.x - 500.0): f.born for f in flames})
+        # 句柄按收方的创建顺序：根、左1、右1、左2、右2……
+        self.assertEqual(list(range(200000, 200009)),
+                         [f.handle for f in flames])
+
+    def test_a_flame_only_burns_while_it_is_alive(self):
+        """★ 还没生出来 / 已经烧完的那一团不算数（§79）。"""
+        flame = weapondata.get(1001500)
+        flames = bot._fire_wall_flames(None, flame, (0.0, 0.0), 200000)
+        far = max(flames, key=lambda f: abs(f.x))
+        character = chrprops.get(1)
+        # 那一团在第 16 个 tick 才生出来，活到第 76 个。
+        self.assertIsNone(bot._fire_touch(character, far.x, far.y, False,
+                                          flames, flame.size, 0))
+        self.assertIsNotNone(bot._fire_touch(character, far.x, far.y, False,
+                                             flames, flame.size, far.born))
+        self.assertIsNone(bot._fire_touch(character, far.x, far.y, False,
+                                          flames, flame.size, far.dies))
 
 
 class BotActionLockTests(BotFireRoom):
@@ -3185,7 +3446,7 @@ class BotDashTests(BotFireRoom):
         self.assertIsNone(self.bot_conn.stamina)
 
     def test_a_holding_bot_does_not_dash(self):
-        """`/hold` 的意思是「站住别动」—— 那就别冲出去。"""
+        """`/s` 的意思是「站住别动」—— 那就别冲出去。"""
         self.bot_conn.holding = True
         self.approach()
         self.assertEqual([], dash_frames(self.alice, self.bot_seat))
@@ -3573,6 +3834,48 @@ class BotHomingTests(BotFireRoom):
             want = ballistics.position_at(0.0, 0.0, shell.shot, tick)
             got = shell.position(tick)
             self.assertAlmostEqual(want[0], got[0], places=6)
+
+    # -- ★★ 会话 24：目标跑出射程就**永久**不再追（§80）--------------------
+    def test_losing_the_target_stops_the_homing_for_good(self):
+        """★★ 收方每 tick 复查一次射程（`0x47e45b`），出圈就把锁定格写成
+        **−2**（`0x47e411`），而选目标那一段只认 −1（`0x47e36b`）
+        ⇒ 这颗火箭从此走直线，**目标再回到射程里也不追了**。
+
+        用户 2026-08-28：「爆炸点和飞行动画基本吻合了，但是偶尔还是会出现
+        不一样的时候」—— 剩下的那点差就是这条。
+        """
+        weapon = self.rocket()
+        shell = self.shell(weapon, 0.0, 0.0, 0.0)
+        near = [(0, 0.0, -100.0, False, 0)]
+        bot._homing_step(self.room, shell, near)
+        self.assertEqual(0, shell.locked)
+        # 目标跑远了 —— 这一 tick 就判丢。
+        bot._homing_step(self.room, shell, [(0, 0.0, -900.0, False, 0)])
+        self.assertEqual(bot.HOMING_LOST, shell.locked)
+        # 再靠回来也没用：从此不拐弯。
+        before = (shell.vx, shell.vy)
+        bot._homing_step(self.room, shell, near)
+        self.assertEqual(bot.HOMING_LOST, shell.locked)
+        self.assertAlmostEqual(before[0], shell.vx, places=6)
+        self.assertAlmostEqual(before[1], shell.vy, places=6)
+
+    def test_a_target_that_disappears_also_counts_as_lost(self):
+        """★ 目标死了 / 换图了（句柄查不到）走的是同一条 −2（`0x47e40d`）。"""
+        weapon = self.rocket()
+        shell = self.shell(weapon, 0.0, 0.0, 0.0)
+        bot._homing_step(self.room, shell, [(2, 0.0, -100.0, False, 0)])
+        self.assertEqual(2, shell.locked)
+        bot._homing_step(self.room, shell, [])
+        self.assertEqual(bot.HOMING_LOST, shell.locked)
+
+    def test_not_finding_anyone_yet_is_not_the_same_as_losing(self):
+        """★ 一个都没扫到时锁定格停在 −1，**下一 tick 接着扫**（别写成 −2）。"""
+        weapon = self.rocket()
+        shell = self.shell(weapon, 0.0, 0.0, 0.0)
+        bot._homing_step(self.room, shell, [(0, 0.0, -900.0, False, 0)])
+        self.assertIsNone(shell.locked)
+        bot._homing_step(self.room, shell, [(0, 0.0, -100.0, False, 0)])
+        self.assertEqual(0, shell.locked)
 
 
 class BotBuriedMuzzleTests(TerrainMixin, BotFireRoom):

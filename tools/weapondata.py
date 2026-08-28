@@ -54,7 +54,9 @@ ROOT = os.path.dirname(HERE)
 #: ★ 5（会话 22）：新增火墙那几格（`slice_id` / `spawn_count` /
 #:   `spawn_life` / `spawn_interval` / `spawn_distance`，§75）。
 #: ★ 6（会话 23）：新增 `homing_angle`（追踪弹的转向速率，§77）。
-FORMAT = 6
+#: ★ 7（会话 24）：新增分裂弹那几格（`slice_count` / `slice_angle` /
+#:   `slice_angle_base` / `slice_angle_random`，§81）。
+FORMAT = 7
 
 #: 节名 `chNNN-MM…`：NNN = 角色 id，MM = 武器序号。
 #: ★ 后面还可能跟 `SE` / `D1` / `R1` / `F1` / `a` / `Classic` 之类的后缀 ——
@@ -117,6 +119,19 @@ _FIELDS = (
     ("SpawnLifeTime",   "spawn_life",      int),
     ("SpawnInterval",   "spawn_interval",  int),
     ("SpawnDistance",   "spawn_distance",  float),
+    # ★★ 分裂弹的碎片（§81）：`SliceCount` 是**母弹**那一节写的「炸成几片」
+    #   （`[proj+0x33c]`），后面三格是**碎片**那一节的扇形参数
+    #   （`weapondef+0xac/0xb0/0xb4`，解析在 `0x48984d` / `0x489887` /
+    #   `0x4898c5`，缺省 **160 / 30 / 30** 就写在那三条 `mov ebx` 里）：
+    #
+    #       第 i 片的角度（度）= SliceAngleBase + SliceAngle × i / (n−1)
+    #                            + rand() % SliceAngleRandom − SliceAngleRandom / 2
+    #
+    #   包里填的是它的**相反数**转弧度（`0x47ca03` 的 `fchs`）。
+    ("SliceCount",        "slice_count",         int),
+    ("SliceAngle",        "slice_angle",         int),
+    ("SliceAngleBase",    "slice_angle_base",    int),
+    ("SliceAngleRandom",  "slice_angle_random",  int),
 )
 
 
