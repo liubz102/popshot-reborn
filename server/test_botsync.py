@@ -818,11 +818,13 @@ class BotFrameRoom(BotBattleRoom):
 
         ★ 直接写 `0.0` 而不是 `None`：`None` 的语义是「这一局还没上过锁」，
         `_note_action_lock()` 下一帧会补上一把新的。
+        ★ 进图那道「连走都不许走」的锁（§94）一起解掉。
         """
         for index in self.room.bot_seats():
             conn = self.room.seats[index].conn
             if isinstance(conn, bot.BotConn):
                 conn.act_lock_until = 0.0
+                conn.enter_lock_until = 0.0
 
     def human_heartbeat(self, conn, x, y, jumped=0, on_ground=True,
                         velocity=(0, 0), fast_run=False):
@@ -2599,7 +2601,7 @@ class BotSplashTests(BotFireRoom):
         point = character.center(0.0, 0.0)
         hits = bot._splash_targets(self.room, shell, point, None, bodies)
         self.assertEqual(1, len(hits))
-        seat, damage, _where = hits[0]
+        seat, damage, _where, _push = hits[0]
         self.assertEqual(0, seat)
         self.assertGreater(damage, 0)
         # ★ 夺分模式（夹具默认 args[1] = 3）整条伤害 ×2（§87）。
@@ -3205,10 +3207,11 @@ class BotActionLockTests(BotFireRoom):
         self.assertEqual([], fire_frames(self.alice, self.bot_seat))
         self.assertEqual([], dash_frames(self.alice, self.bot_seat))
 
-    def test_it_still_moves_while_the_lock_is_on(self):
-        """★ 锁的是**动手**，不是走路 —— 真人那两秒照样能跑。"""
+    def test_it_keeps_sending_heartbeats_while_the_lock_is_on(self):
+        """★ 锁住的是**动作**，心跳照发 —— 停发反而是异常状态。"""
         self.walk(self.alice, [(0, 100), (200, 100), (400, 100)])
         self.assertTrue(bot_frames(self.alice, self.bot_seat))
+
 
     def test_it_shoots_once_the_lock_expires(self):
         self.approach()
@@ -3760,6 +3763,49 @@ class BotOwnMovementTests(TerrainMixin, BotFireRoom):
         self.assertEqual((120, 50), udpsync.heartbeat_position(last))
 
 
+class BotEntryLockMovementTests(TerrainMixin, BotFireRoom):
+    """★★★ 进图那一档**连走都不许走**（§94）—— 复活那一档只拦动手。
+
+    用户 2026-08-28：「一开始我还不能动呢，我就看见 bot 已经向我这边
+    跑来了」。M5 之前 bot 回放真人轨迹，真人不动它就不动，所以这条天然
+    成立；自己会走之后就得显式挡住。
+    ⚠ 分界线是用户自己给的另一句：「被打死复活后有大概两三秒不能开枪，
+    **只能移动**」（2026-08-27）。
+    """
+
+    action_lock = True                  # ★ 这一批要的就是那道锁
+    melee = False
+
+    def test_it_stands_still_during_the_entry_lock(self):
+        self.install_terrain(synth_terrain("flat"))
+        self.place_bot(200.0)
+        self.beats(6, 1300.0)           # 真人在很远的地方，正常会走过去
+        self.assertGreater(self.bot_conn.enter_lock_until, time.monotonic())
+        self.assertEqual(200.0, self.bot_conn.body.x,
+                         "预备 / 开始那两秒 bot 不该迈腿")
+
+    def test_it_walks_once_the_entry_lock_expires(self):
+        self.install_terrain(synth_terrain("flat"))
+        self.place_bot(200.0)
+        self.unlock_bots()
+        self.beats(6, 1300.0)
+        self.assertGreater(self.bot_conn.body.x, 200.0)
+
+    def test_the_respawn_lock_still_lets_it_walk(self):
+        self.install_terrain(synth_terrain("flat"))
+        self.place_bot(200.0)
+        self.unlock_bots()              # 进图那一档已经过去了
+        quest = self.room.quest
+        quest.respawn_due[self.bot_seat] = (time.monotonic() + 5.0, (0, 0))
+        self.beats(1, 1300.0)           # 躺着这一帧
+        quest.respawn_due.pop(self.bot_seat)
+        self.beats(6, 1300.0)           # 站起来之后接着走
+        self.assertGreater(self.bot_conn.act_lock_until, time.monotonic(),
+                           "复活那一刻动手的锁要重新挂上")
+        self.assertGreater(self.bot_conn.body.x, 200.0,
+                           "★ 复活之后照样能走")
+
+
 class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
     """★ 闯关房**照旧回放真人的轨迹** —— 那儿要的就是「跟着推进」，
     而怪的位置服务端手里没有（`_hostile_targets` 在闯关房恒为空）。"""
@@ -3897,6 +3943,187 @@ class BotSpawnPointTests(TerrainMixin, BotFireRoom):
         self.assertEqual([], bot._hostile_targets(self.room, self.bot_seat))
         self.walk(self.alice, [(700.0, 150.0), (700.0, 150.0)])
         self.assertEqual(here, self.bot_conn.battle_pos)
+
+
+class BotKnockbackLadderTests(unittest.TestCase):
+    """★★★ 击退强度阶梯 + 方向公式（§92，`0x481003`）。
+
+    语料 13160 发 `rpSplashDamaged` 逐档对得死：伤害 1~9 恒 4.0（5637 发）、
+    10~19 恒 8.0（3908 发）、20 起 15.0。
+    """
+
+    def test_the_ladder_matches_the_five_fcom_steps(self):
+        for damage, want in ((0, 4.0), (1, 4.0), (9, 4.0),
+                             (10, 8.0), (19, 8.0),
+                             (20, 15.0), (39, 15.0),
+                             (40, 20.0), (79, 20.0),
+                             (80, 40.0), (159, 40.0),
+                             (160, 1.0), (999, 1.0)):
+            self.assertEqual(want, bot.knockback_strength(damage),
+                             f"伤害 {damage}")
+
+    def test_the_vector_is_lifted_by_zero_point_seven(self):
+        """★ 归一化 -> `y −= 0.7` -> 再归一化 -> ×强度（`0x481017`）。"""
+        push = bot.knockback_vector(1.0, 0.0, 5)        # 正右方飞来
+        want = math.hypot(1.0, -0.7)
+        self.assertAlmostEqual(4.0 * 1.0 / want, push[0], places=4)
+        self.assertAlmostEqual(4.0 * -0.7 / want, push[1], places=4)
+        self.assertAlmostEqual(4.0, math.hypot(*push), places=4)
+
+    def test_a_zero_direction_throws_straight_up(self):
+        """★ 来向是零向量时原版把 `dy` 强置 −1（`0x485805`）。"""
+        push = bot.knockback_vector(0.0, 0.0, 25)
+        self.assertAlmostEqual(0.0, push[0], places=4)
+        self.assertAlmostEqual(-15.0, push[1], places=4)
+
+    def test_the_length_is_always_the_step_strength(self):
+        for dx, dy in ((3.0, 4.0), (-7.0, 0.0), (0.0, 9.0), (1.0, -1.0)):
+            for damage, want in ((5, 4.0), (12, 8.0), (30, 15.0)):
+                self.assertAlmostEqual(
+                    want, math.hypot(*bot.knockback_vector(dx, dy, damage)),
+                    places=4, msg=f"({dx},{dy}) 伤害 {damage}")
+
+
+class BotDealsKnockbackTests(BotFireRoom):
+    """★★ bot 打人时 `rpSplashDamaged +13/+17` 得**填上**击退矢量（§92）。
+
+    原来那三处（溅射 / 地面燃烧 / 近身）全填的 0，于是「真人的手雷把人顶飞、
+    bot 的同一颗一动不动」。
+    """
+
+    def test_the_splash_packet_carries_a_push(self):
+        weapon = weapondata.get(1000020)
+        shell = bot.Shell(1, 0, weapon, 9, 0.0, 0.0,
+                          ballistics.launch(weapon, 0.0, 30.0), 0.0, 40)
+        character = chrprops.get(0)
+        lift = 2.0 * character.size_legs + character.size_body
+        bodies = [(0, 30.0, lift, False, 0)]        # 身体圆心在 (30, 0)
+        hits = bot._splash_targets(self.room, shell, (0.0, 0.0), None, bodies)
+        self.assertEqual(1, len(hits))
+        _seat, damage, _where, push = hits[0]
+        # 强度按**没乘模式倍率**的那一档查（§92）。
+        base = damage // bot._damage_scale(self.room)
+        self.assertAlmostEqual(bot.knockback_strength(base),
+                               math.hypot(*push), places=4)
+        self.assertLess(push[1], 0.0, "★ 击退永远带一点向上的分量")
+
+    def test_the_fire_and_dash_pushes_are_the_hard_coded_ones(self):
+        """★ 火 `(0, −8)`（语料 1164 发）、近身 `(±15, −10)`（1347 发）。"""
+        self.assertEqual((0.0, -8.0), bot.FIRE_KNOCKBACK)
+        self.assertEqual((15.0, -10.0), bot.DASH_KNOCKBACK)
+
+
+class BotTakesKnockbackTests(TerrainMixin, BotFireRoom):
+    """★★★ **bot 挨打也要被顶飞**（§92）—— 用户 2026-08-28 报的那条。
+
+    bot 的位置是服务端说了算的：客户端各自把它的模型顶飞，服务端这边不动
+    的话下一发心跳当场拽回去，看着就是「只是原地跳一下」。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.install_terrain(synth_terrain("flat"))
+        self.place_bot(600.0)
+        self.alice_seat = self.room.seat_index_of(self.alice)
+
+    def human_packet(self, opcode, body):
+        return botsync.build_peer_packet(
+            self.alice_seat, opcode, body,
+            game_id=self.room.epoch_value, sequence=self.next_seq(self.alice))
+
+    def send(self, opcode, body):
+        gameserver.Conn.on_game_packet(
+            self.alice, OP_PEER_DATA_UP, self.human_packet(opcode, body))
+
+    def splash(self, damage, push):
+        self.send(botsync.OP_SPLASH_DAMAGED, botsync.splash_body(
+            100002, botsync.character_handle(self.bot_seat), damage,
+            600.0, 150.0, push_x=push[0], push_y=push[1]))
+
+    def test_a_human_splash_pushes_the_bot_off_the_ground(self):
+        self.assertTrue(self.bot_conn.body.on_ground)
+        self.splash(20, (12.0, -9.0))
+        body = self.bot_conn.body
+        self.assertFalse(body.on_ground, "甲档一定离地（0x50f947）")
+        self.assertAlmostEqual(12.0, body.vx, places=4)
+        self.assertAlmostEqual(-9.0, body.vy, places=4)
+
+    def test_exactly_ten_damage_only_clamps_the_upward_speed(self):
+        """★ `伤害 > 10` 才真给速度；正好 10 只把 `v.y` 夹到 −10（`0x50f8a2`）。"""
+        self.splash(10, (12.0, -9.0))
+        body = self.bot_conn.body
+        self.assertFalse(body.on_ground)
+        self.assertAlmostEqual(0.0, body.vx, places=4)
+        self.assertAlmostEqual(bot.KNOCKBACK_MIN_LIFT, body.vy, places=4)
+
+    def test_a_weak_hit_only_slides_along_the_ground(self):
+        """★ 乙档（伤害 < 10）在地上时**不离地**，只横着滑 `push.x × 3`。"""
+        before = self.bot_conn.body.x
+        self.splash(6, (4.0, -1.0))
+        body = self.bot_conn.body
+        self.assertTrue(body.on_ground, "乙档不离地")
+        self.assertAlmostEqual(before + 4.0 * bot.KNOCKBACK_SLIDE, body.x,
+                               places=4)
+
+    def test_a_weak_hit_in_the_air_pushes_nothing_at_all(self):
+        """★ 伤害 < 10 且**腾空中**走的是甲档，而甲档里「<= 10」那一路
+        要求「在地上且 v.x == 0」—— 两条都不成立 ⇒ 速度一点不动（§92 修正）。
+        """
+        self.bot_conn.body = bot.botmove.Body(600.0, 100.0, 1.0, -2.0,
+                                              on_ground=False)
+        self.splash(6, (4.0, -1.0))
+        body = self.bot_conn.body
+        self.assertAlmostEqual(1.0, body.vx, places=4)
+        self.assertAlmostEqual(-2.0, body.vy, places=4)
+        self.assertFalse(body.on_ground)
+
+    def test_a_direct_hit_uses_the_velocity_reconstructed_from_the_fire(self):
+        """★★ `rpExplode` **不带**击退矢量 —— 服务端按 `rpFire` 反推（§92）。"""
+        weapon = weapondata.get(1000030)             # T1 狙击，直射弹
+        self.send(botsync.OP_FIRE, botsync.fire_body(
+            self.alice_seat, weapon.id, 0.0, 150.0, 0.0,
+            ballistics.power_for_speed(weapon, weapon.velocity)))
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, botsync.character_handle(self.bot_seat), 600.0, 150.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=20.0))
+        body = self.bot_conn.body
+        self.assertFalse(body.on_ground)
+        # 正右方直飞过来 -> 击退是「右上」，长度按伤害 20 那一档 = 15。
+        self.assertGreater(body.vx, 0.0)
+        self.assertLess(body.vy, 0.0)
+        self.assertAlmostEqual(15.0, math.hypot(body.vx, body.vy), places=3)
+
+    def test_an_unmatched_explode_leaves_the_bot_alone(self):
+        """★ 配不上开火记录就**不给击退** —— 宁可少顶一下，也不要乱甩。"""
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, botsync.character_handle(self.bot_seat), 600.0, 150.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=20.0))
+        self.assertTrue(self.bot_conn.body.on_ground)
+
+    def test_the_bot_really_flies_away_over_the_next_frames(self):
+        """★★★ 用户 2026-08-28 第二轮报的那条：**打 bot 它得真的飞出去**。
+
+        光把速度写进 `machine.body` 不够 —— 下一帧 `_own_step()` 还要把它
+        推出去。以前 `botmove._air_tick()` 会拿「朝着真人的方向键」把腾空
+        的水平速度覆写成 `走速 × 1.5`（§93 证明那条是错的），于是 bot
+        **朝开枪的人飘过去**，看着就是「原地跳一下」。
+        """
+        # ★ 挑不到目标 ⇒ `_move_intent()` 会一路朝真人按方向键 —— 这正是
+        #   出问题的那一种（挑得到目标时它返回「站住」，键是 0，撞不上）。
+        original = bot._fire_target
+        bot._fire_target = lambda *args, **kwargs: None
+        self.addCleanup(setattr, bot, "_fire_target", original)
+        before = self.bot_conn.body.x
+        self.splash(30, (12.0, -9.0))    # 真人在左边，击退朝右
+        self.beats(4, 100.0)             # 真人站在 x=100，bot 走 4 帧
+        self.assertGreater(self.bot_conn.battle_pos[0], before + 100.0,
+                           "击退该把 bot 往**远离**真人的方向甩出去")
+
+    def test_a_hit_on_someone_else_is_ignored(self):
+        self.send(botsync.OP_SPLASH_DAMAGED, botsync.splash_body(
+            100002, botsync.character_handle(self.alice_seat), 30,
+            600.0, 150.0, push_x=12.0, push_y=-9.0))
+        self.assertTrue(self.bot_conn.body.on_ground)
 
 
 if __name__ == "__main__":

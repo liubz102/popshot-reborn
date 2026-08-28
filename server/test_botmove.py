@@ -210,11 +210,22 @@ class JumpTests(unittest.TestCase):
         again = botmove.jump(body)
         self.assertEqual(body, again)
 
-    def test_holding_a_direction_in_the_air_moves_at_one_and_a_half(self):
+    def test_a_jump_carries_the_walking_speed_and_keeps_it(self):
+        """★★★ 起跳带走这一刻的走速，腾空之后**方向键改不了它**（§93）。"""
+        body = botmove.tick(self.t, self.body, self.who,
+                            direction=1, want_jump=True)
+        self.assertAlmostEqual(4.0, body.vx)
+        # 空中改按左键：水平速度**一点不动**，位移还是 +4。
+        moved = botmove.tick(self.t, body, self.who, direction=-1)
+        self.assertAlmostEqual(4.0, moved.vx)
+        self.assertAlmostEqual(4.0, moved.x - body.x)
+
+    def test_a_standing_jump_goes_straight_up(self):
+        """站着起跳是**竖直**的 —— 语料里 11256 发「腾空 + 按着键但 vx=0」。"""
         body = botmove.tick(self.t, self.body, self.who, want_jump=True)
+        self.assertAlmostEqual(0.0, body.vx)
         moved = botmove.tick(self.t, body, self.who, direction=1)
-        self.assertAlmostEqual(4.0 * botmove.AIR_KEY_FACTOR,
-                               moved.x - body.x)
+        self.assertAlmostEqual(0.0, moved.x - body.x)
 
     def test_want_jump_only_fires_on_the_first_tick(self):
         body = botmove.advance(self.t, self.body, self.who, 8,
@@ -266,6 +277,90 @@ class CeilingAndPlatformTests(unittest.TestCase):
                 break
         self.assertTrue(top < 20.0, "单向平台不该挡住上升（只到了 %.1f）" % top)
         self.assertAlmostEqual(20.0, body.y, msg="落下来该踩在薄板上")
+
+
+class KnockedBackOverBumpsTests(unittest.TestCase):
+    """★★★ 地形上一个**几像素的小坎**不该把整段击退吃掉（§95）。
+
+    用户 2026-08-28 实机：`Forest_b (581, 651)` 左边一列的地面是 646
+    （高 **5** 个像素）、`Domir_Newbie (483, 342)` 左边高 **4** 个像素 ——
+    两次强度 15 的击退在日志里都是 **位移 +0**。两处都是同一个型：
+    脚升过那个坎的上沿时被当成「撞天花板」/「撞墙」，速度当场清零。
+    """
+
+    def bumpy(self, step=5, edge=300, width=600, floor=150, height=220):
+        """左边地面在 `floor`，`edge` 往右抬高 `step` 个像素。"""
+        rows = []
+        for y in range(height):
+            rows.append("".join(
+                "2" if y >= (floor - step if x >= edge else floor) else "0"
+                for x in range(width)))
+        return terrain_from(rows)
+
+    def fly(self, terrain, body, who, ticks=200):
+        n = 0
+        while not body.on_ground and n < ticks:
+            body = botmove.tick(terrain, body, who)
+            n += 1
+        return body, n
+
+    def test_a_five_pixel_step_does_not_eat_the_knockback(self):
+        terrain = self.bumpy()
+        who = Dummy(7.5)
+        start = botmove.Body(290.0, 150.0, 8.0, -12.0, on_ground=False)
+        landed, ticks = self.fly(terrain, start, who)
+        self.assertTrue(landed.on_ground, "%d 个 tick 还没落地" % ticks)
+        self.assertGreater(landed.x - start.x, 60.0,
+                           "小坎不该把水平击退清零（只飞了 %.0f）"
+                           % (landed.x - start.x))
+
+    def test_a_real_wall_still_blocks(self):
+        """★ 对照：够不着的高墙照旧挡得住。"""
+        terrain = self.bumpy(step=120)          # 抬高 120 —— 真的是一堵墙
+        who = Dummy(7.5)
+        start = botmove.Body(290.0, 150.0, 8.0, -12.0, on_ground=False)
+        landed, _ticks = self.fly(terrain, start, who)
+        self.assertLess(landed.x - start.x, 20.0,
+                        "高墙前面不该穿过去（飞了 %.0f）" % (landed.x - start.x))
+
+    def test_a_weak_push_still_rides_up_a_gentle_slope(self):
+        """★★★ 第二轮那一条：**抬升还不到坎高**的弱击退也得走得动（§95）。
+
+        实机 `Forest_b` 那一带是缓上坡，强度 8 的击退抬升顶点只有 1.8~3.3
+        个像素，够不着前面那个 4 像素的坎 —— 光靠「升过去」永远升不过去，
+        必须像走路一样**蹭上坎**。
+        """
+        terrain = self.bumpy(step=4)
+        who = Dummy(7.5)
+        # 抬升顶点 2.8²/2g = 3.3 px < 4 px 的坎
+        start = botmove.Body(296.0, 150.0, 7.5, -2.8, on_ground=False)
+        landed, ticks = self.fly(terrain, start, who)
+        self.assertTrue(landed.on_ground, "%d 个 tick 还没落地" % ticks)
+        self.assertGreater(landed.x - start.x, 12.0,
+                           "升不过去的小坎该蹭上去，不是把人钉住（只飞了 %.0f）"
+                           % (landed.x - start.x))
+
+    def test_falling_along_a_cliff_is_not_hoisted_up(self):
+        """★ 对照：贴着崖壁往下掉，不许被上面很远的崖顶勾上去。
+
+        判据锚在**出发时**的脚下高度（和 `_walk_tick` 同一条），
+        所以崖顶够不着就还是墙。
+        """
+        terrain = self.bumpy(step=120, edge=300)
+        who = Dummy(7.5)
+        # 左边地面在 150、右边是一堵顶在 30 的高墙；人贴着墙往下掉。
+        start = botmove.Body(296.0, 100.0, 7.5, 6.0, on_ground=False)
+        step = botmove.tick(terrain, start, who)
+        self.assertAlmostEqual(296.0, step.x, msg="崖壁前面不该被抬上去")
+        self.assertGreater(step.y, 100.0, "该继续往下掉")
+
+    def test_the_velocity_survives_one_blocked_tick(self):
+        """★ 被挡住的那一 tick **只是不挪**，速度留着 —— 升过去还要接着走。"""
+        terrain = self.bumpy(step=40)
+        who = Dummy(7.5)
+        body = botmove.Body(290.0, 150.0, 8.0, -30.0, on_ground=False)
+        first = botmove.tick(terrain, body, who)
+        self.assertEqual(8.0, first.vx, "速度不许被清零")
 
 
 class BodyTests(unittest.TestCase):

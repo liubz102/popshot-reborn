@@ -198,6 +198,22 @@ def handle_owner(handle):
     return value // HANDLE_SPAN + OWNER_SEAT_BASE
 
 
+def handle_seat(handle):
+    """**角色**句柄 -> 座位号；不是角色句柄就返回 `None`。
+
+    `character_handle()` 的反函数（`座位 × 100000 + 100001`）。
+    读别人发来的 `rpExplode +4` / `rpSplashDamaged +4`「打中了谁」时用它 ——
+    弹体句柄、怪的句柄都不落在这一族上，会被挡掉。
+
+    ★ 只判「是不是这一族」，**不判座位在不在房里** —— 那是调用方的事
+    （`room.seats` 才知道）。
+    """
+    value = int(handle) - HANDLE_BASE - CHARACTER_HANDLE_OFFSET
+    if value < 0 or value % HANDLE_SPAN:
+        return None
+    return value // HANDLE_SPAN
+
+
 class SyncInvariantError(AssertionError):
     """D5 的三条不变式被违反了。**继承 `AssertionError` 是故意的** ——
     它就是一条断言，只是不用 `assert` 语句（`python -O` 会把那个整句删掉，
@@ -591,6 +607,10 @@ FIRE_POWER_FIXED = 1.0
 
 _FIRE = struct.Struct("<BBiffffi")
 _EXPLODE = struct.Struct("<iiffiif")
+
+#: 读**别人**发来的这两种包时先拿它挡一下长度（`bot.note_peer_hit`）。
+FIRE_BODY_SIZE = _FIRE.size          # 26
+EXPLODE_BODY_SIZE = _EXPLODE.size    # 28
 _JUMP = struct.Struct("<BB")
 _CROUCH = struct.Struct("<BB")
 _DASH = struct.Struct("<Bbbff")
@@ -663,6 +683,9 @@ def crouch_body(seat, down=True):
 
 
 _SPLASH = struct.Struct("<iifBffffi")
+
+#: 同上（33 字节）。
+SPLASH_BODY_SIZE = _SPLASH.size
 
 
 def splash_body(source_handle, target_handle, damage, x, y,

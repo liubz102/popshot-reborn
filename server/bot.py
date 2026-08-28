@@ -50,6 +50,7 @@ import contextlib
 import math
 import os
 import random
+import struct
 import threading
 import time
 
@@ -306,6 +307,12 @@ class BotConn(gameserver.Conn):
         self.fire_logged = set()
         #: 这一图命中 / 落空的爆炸日志各打过了吗（同上，诊断口径）。
         self.explode_logged = set()
+        #: ★ 这一图**每一类击退结果**的日志打过了吗（同上）。
+        #:   key = `(来源, 结果分类)`，例如 `("直接命中", "飞出去")` /
+        #:   `("直接命中", "配不上开火记录")` / `("溅射", "撞墙没动")`。
+        #:   用户 2026-08-28 报「有时候有击退，有时候没有」——
+        #:   这本账就是为了让日志把「哪一类没动、为什么」一次讲清楚。
+        self.knock_logged = set()
         #: 这一图的「分裂弹炸成几片」日志打过了吗（同上，§81）。
         self.split_logged = False
         #: ★ 分裂弹撒碎片时的随机数（`0x47c9b7` 那一发 `rand() % n`）。
@@ -376,6 +383,15 @@ class BotConn(gameserver.Conn):
         #:   这就是真人「预备 / 开始那两下没打完不能动手」「刚复活那两秒
         #:   只能跑不能打」的来源（§74）。
         self.act_lock_until = None
+        #: ★★ **进图**那一次额外的「连走都不许走」的封锁（`time.monotonic()`）。
+        #:   `None` = 还没进图 / 已经过去了。
+        #:
+        #:   和 `act_lock_until` 的区别是**只在进图那一档挂，复活不挂** ——
+        #:   这条分界是用户自己给的两句话（§94）：
+        #:   「真人被打死复活后有大概两三秒**只能移动**、不能开枪」
+        #:   「一开始我**还不能动**呢，就看见 bot 已经向我这边跑来了」。
+        #:   ⇒ 复活那一档拦的只有动手，进图（预备 / 开始）那一档连走位一起拦。
+        self.enter_lock_until = None
         #: 上一帧「躺着没有」。拿它做**状态翻转**：躺着 -> 站起来 = 复活了，
         #: 那一刻重新上锁（铁律 10 的口径，不看时间只看事实翻转）。
         self.was_lying = False
@@ -435,6 +451,7 @@ class BotConn(gameserver.Conn):
         self.rounds_left = None
         self.fire_logged = set()
         self.explode_logged = set()
+        self.knock_logged = set()
         self.split_logged = False
         # ★ 体力和近身动作跟着一起清：换图 / 新一局客户端把角色重建，
         #   `[char+0x2b5]` 那一套状态全归零（同 `crouched` 的道理，§41），
@@ -446,6 +463,7 @@ class BotConn(gameserver.Conn):
         #   那一刻 `Character::Respawn` 又挂一次 2000 ms 的状态 0（§74）。
         #   清成 `None` = 「还没上过锁」，`_tick_bot` 的第一帧会补上。
         self.act_lock_until = None
+        self.enter_lock_until = None
         self.was_lying = False
         # ★ 手指也松开：换图之后武器要重新声明，蓄力从零开始（§73）。
         self.charge_at = None
@@ -1419,6 +1437,400 @@ def _direct_hit_damage(room, machine, weapon, region, victim_seat):
     return damage
 
 
+# ---------------------------------------------------------------------------
+# ★★★ 击退（§92）—— 谁挨了打就得往后飞
+# ---------------------------------------------------------------------------
+#: 击退方向的「上抬量」：先把来向归一化，**y 减去 0.7**，再归一化一次。
+#:
+#: 出处 `0x481003`（所有伤害源的虚表槽 `+0x148`，19 个弹体类 +
+#: `SplashDamage` / `Flame` / `DashDamage` 全指向它）：
+#:
+#:     0048100f  D3DXVec2Normalize(&d, v)
+#:     00481017  d.y -= [0x6937e0]        ; ★ 0.7
+#:     00481025  D3DXVec2Normalize(&d, &d)
+#:     004810a8  out = d × 强度(伤害)
+#:
+#: y 轴向下为正 ⇒ 减 0.7 = **往上顶**。所以任何击退都带一点向上的分量，
+#: 这就是「被打中会飞起来」的来源。
+KNOCKBACK_LIFT = 0.7
+
+#: ★★ 击退**强度**的阶梯：`(伤害上界, 强度)`，第一个「伤害 < 上界」的档说了算。
+#:
+#: `0x48102f` 起那五发 `fcom` + `jp`（相等走下一档）。语料 13160 发
+#: `rpSplashDamaged` 逐档对得死：伤害 1~9 全是 4.0（5637 发）、
+#: 10~19 全是 8.0（3908 发）、20 起 15.0。
+#:
+#: ⚠ 喂进这道阶梯的伤害**是模式倍率之前**那个数（溅射这条路上
+#: `0x4858a2 push eax` 取的是 `+0x134` 的返回值，`×2` 是后面
+#: `+0x128` 才乘的，§90）。语料佐证：同一个「包里伤害 20」在生存局是
+#: 15.0、在夺分局是 8.0（因为夺分那边喂进去的是 10）。
+KNOCKBACK_STEPS = ((10.0, 4.0), (20.0, 8.0), (40.0, 15.0),
+                   (80.0, 20.0), (160.0, 40.0))
+
+#: 伤害 >= 160 时的强度（`0x48102a` 那发 `fld1` 留下来的 1.0）。
+#: 现实里够不着 —— 照抄留着。
+KNOCKBACK_OVERKILL = 1.0
+
+#: ★ 地面燃烧的击退是**常量**，不走阶梯（`Flame` 虚表槽 `+0x134` =
+#: `0x485e4d`：`mov [ebp-4], 0xc1000000` = −8.0，x 恒 0）。
+#: 语料 1164 发 `(0.0, -8.0)`，一发例外都没有。
+FIRE_KNOCKBACK = (0.0, -8.0)
+
+#: ★ 近身冲刺的击退也是常量（`DashDamage` 虚表槽 `+0x134` = `0x481d6e`：
+#: `fild [this+0x308] × [0x69381c]=15`、y = `0xc1200000` = −10）。
+#: `[+0x308]` 是朝向（±1）⇒ 语料里就是 `(±15, -10)`，1347 发。
+DASH_KNOCKBACK = (15.0, -10.0)
+
+#: ★★ 「吃不吃击退」的门槛（`0x50f7ca` 里那两处 `cmp ..., 0xa`）。
+#:
+#: 收侧那个函数按伤害分两档反应（`kind == 0` 这一路，直接命中和溅射都是它）：
+#:
+#:     伤害 >= 10 -> 甲：伤害 **> 10** 才真的加速度；**无论如何都离地**
+#:     伤害 <  10 -> 在地上：只沿地面滑 `push.x × 3`（`0x50d9a7`），不离地
+#:                   腾空中：★ **一点都不推**（走的也是甲档，而甲档里
+#:                   「伤害 <= 10」那一路要求「在地上且 v.x == 0」）
+KNOCKBACK_MIN_DAMAGE = 10
+
+#: 甲档里「伤害正好等于 10」时给 `v.y` 的下限（`0x693bb0` = −10）——
+#: 只有「站在地上且水平速度为 0」时才夹（`0x50f884`）。
+KNOCKBACK_MIN_LIFT = -10.0
+
+#: 乙档在地上时横向滑多远的系数（`0x50f84f: fmul [0x6937c8]` = 3.0）。
+KNOCKBACK_SLIDE = 3.0
+
+
+def knockback_strength(damage):
+    """这么多伤害该把人推多快（`0x481003` 那五发 `fcom`）。"""
+    value = float(damage)
+    for limit, strength in KNOCKBACK_STEPS:
+        if value < limit:
+            return strength
+    return KNOCKBACK_OVERKILL
+
+
+def knockback_vector(dx, dy, damage):
+    """来向 `(dx, dy)` + 伤害 -> 击退矢量（`0x481003`）。
+
+    `(dx, dy)` 是**冲击的来向**：直接命中取**弹体此刻的速度**
+    （`0x49285c` 读 `[proj+0x120]/[+0x124]`），溅射取**爆点指向目标身体
+    圆心**的那条（`0x4857d0`）。两个都在这里先归一化、再上抬、再归一化。
+
+    ★ 来向是零向量时原版把 `dy` 强置成 **−1**（`0x485805`，「正上方顶飞」）。
+    """
+    span = math.hypot(dx, dy)
+    if span <= 0.0:
+        ux, uy = 0.0, -1.0
+    else:
+        ux, uy = dx / span, dy / span
+    uy -= KNOCKBACK_LIFT
+    span = math.hypot(ux, uy)
+    if span <= 0.0:
+        return (0.0, 0.0)
+    strength = knockback_strength(damage)
+    return (ux / span * strength, uy / span * strength)
+
+
+#: ★ 真人的一发子弹在「配爆炸」这本账上留多久（tick）。
+#:
+#: 不是时序阈值：它是**弹道本身的上界** —— 图的对角线除以最慢的速率，
+#: `_shell_max_ticks()` 给 bot 自己的弹体算的也是这个量级。这里取一个
+#: 宽松的固定上界只是为了让账本不会无限长；配不上就不给击退，不影响伤害。
+BOT_PEER_SHOT_TICKS = 200
+
+#: 账本里每个座位最多留几发。散弹一次 3 颗、苹果雷炸开 4 片，留 16 发
+#: 足够覆盖「同时在飞」的最坏情况。
+BOT_PEER_SHOT_KEEP = 16
+
+#: 拿爆点去配开火记录时，弹道预测的 y 允许差多远（世界单位）。
+#:
+#: ★ 出处是 §76 量过的「客户端 vs 服务端同帧偏差中位 19.5 / 26.0」——
+#: 取 4 倍留够余量。配不上就**不给击退**（宁可少顶一下，也不要按一条
+#: 不相干的弹道把 bot 往反方向甩）。
+BOT_PEER_SHOT_TOLERANCE = 120.0
+
+
+class PeerShot(object):
+    """真人打出去的一发（`rpFire`），留着给击退算来向用（§92）。"""
+
+    __slots__ = ("weapon", "x", "y", "shot")
+
+    def __init__(self, weapon, x, y, shot):
+        self.weapon = weapon
+        self.x = float(x)
+        self.y = float(y)
+        self.shot = shot
+
+
+def note_peer_fire(conn, body):
+    """记一发真人的 `rpFire`（§92）。解不出武器就不记。"""
+    if len(body) < botsync.FIRE_BODY_SIZE:
+        return
+    ammo, fx, fy, angle, power = struct.unpack_from("<iffff", body, 2)
+    weapon = weapondata.get(ammo)
+    if weapon is None:
+        return
+    shots = getattr(conn, "peer_shots", None)
+    if not isinstance(shots, collections.deque):
+        shots = conn.peer_shots = collections.deque(
+            maxlen=BOT_PEER_SHOT_KEEP)
+    shots.append(PeerShot(weapon, fx, fy,
+                          ballistics.launch(weapon, angle, power)))
+
+
+def _peer_shot_velocity(conn, bx, by):
+    """真人这一发**直接命中**时弹体的速度矢量；配不上返回 `None`（§92）。
+
+    包里没有速度，也没有「这一发是哪一枪打出来的」——
+    但 `rpFire` 给了发射点 / 角度 / 力度，闭式解一算就知道这条弹道**什么
+    时候会走到爆点那一列**，走到时的速度是多少：
+
+        t  = (爆点x − 发射点x) / v.x           ; v.x 是常数
+        y  = 发射点y + t·v.y + g·t(t+1)/2      ; 和 `ballistics.position_at` 同一式
+        v  = (v.x, v.y + g·t)                  ; 和 `_shell_velocity()` 同一式
+
+    ⇒ 拿**预测的 y 和爆点 y 差多少**当匹配分，最接近的那一发就是它。
+    差得超过 `BOT_PEER_SHOT_TOLERANCE` 就当没配上。
+
+    ⚠ 配不上的已知情形：弹跳过的弹体（苹果雷撞地形会弹，§84 之后闭式解
+    不成立）、追踪弹拐过弯的（§77）。这两种只是**少一份击退**，
+    伤害和位置照旧 —— 不会把 bot 甩到别处去。
+    """
+    shots = getattr(conn, "peer_shots", None)
+    if not shots:
+        return None
+    best = None
+    for record in shots:
+        shot = record.shot
+        vx = shot.speed * math.cos(shot.angle)
+        vy = shot.speed * math.sin(shot.angle)
+        if abs(vx) < 1e-6:
+            continue
+        ticks = (bx - record.x) / vx
+        if ticks < 0.0 or ticks > BOT_PEER_SHOT_TICKS:
+            continue
+        y = record.y + ticks * vy + shot.gravity * ticks * (ticks + 1.0) / 2.0
+        error = abs(y - by)
+        if best is None or error < best[0]:
+            best = (error, vx, vy + shot.gravity * ticks)
+    if best is None or best[0] > BOT_PEER_SHOT_TOLERANCE:
+        return None
+    return (best[1], best[2])
+
+
+def note_peer_hit(room, conn, payload):
+    """真人发来的一发同步包 —— 打到 bot 身上就替它挨这一下击退（§92）。
+
+    挂在 `gameserver.BOT_PEER_HIT` 上，`forward_peer_data()` 每发都问一次。
+    **只管击退**：伤害是收方自己扣的（`rpExplode +24` / `rpSplashDamaged +8`
+    原样进 `Character::OnHit`，§42），服务端不重算，bot 的血也不在这边记。
+
+    两条路各取各的来向：
+
+    * `rpExplode`（直接命中）—— 包里**没有**击退矢量，每台机器都拿自己那颗
+      弹体的速度现算（`0x49285c`）。服务端只好按 `rpFire` 反推（见
+      `_peer_shot_velocity()`）。
+    * `rpSplashDamaged`（溅射 / 地面燃烧 / 近身）—— 击退矢量**就在包里**
+      （`+13/+17`），照抄就行，一点都不用猜。
+    """
+    opcode = udpsync.peer_opcode(payload)
+    if opcode == botsync.OP_FIRE:
+        note_peer_fire(conn, payload[udpsync.PEER_HEADER_SIZE:])
+        return
+    if opcode not in (botsync.OP_EXPLODE, botsync.OP_SPLASH_DAMAGED):
+        return
+    body = payload[udpsync.PEER_HEADER_SIZE:]
+    if opcode == botsync.OP_EXPLODE:
+        if len(body) < botsync.EXPLODE_BODY_SIZE:
+            return
+        _handle, target, bx, by, _kind, _flags, damage = struct.unpack_from(
+            "<iiffiif", body, 0)
+        if target <= 0 or damage <= 0:
+            return
+        source = "真人直接命中"
+        velocity = _peer_shot_velocity(conn, bx, by)
+        if velocity is None:
+            # ★ 诊断：配不上开火记录 = **这一发不给击退**（§92 的取舍）。
+            #   用户报「有时候有击退，有时候没有」时，这一行是第一嫌疑。
+            _note_no_knockback(room, botsync.handle_seat(target),
+                               conn, source, damage, bx, by)
+            return
+        push = knockback_vector(velocity[0], velocity[1], damage)
+    else:
+        if len(body) < botsync.SPLASH_BODY_SIZE:
+            return
+        _source, target, damage, _z, push_x, push_y = struct.unpack_from(
+            "<iifBff", body, 0)
+        if target <= 0 or damage <= 0:
+            return
+        source = "真人溅射/火/近身"
+        push = (push_x, push_y)
+    seat_index = botsync.handle_seat(target)
+    if seat_index is None:
+        return
+    _knock_back_seat(room, seat_index, damage, push, source=source)
+
+
+def _note_no_knockback(room, seat_index, shooter, source, damage, bx, by):
+    """★ 诊断：这一发**没给击退**，把原因留一行（按分类去重，§94）。"""
+    if seat_index is None:
+        return
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    machine = None if seat is None else seat.conn
+    if not isinstance(machine, BotConn):
+        return
+    key = (source, "配不上开火记录")
+    if key in machine.knock_logged:
+        return
+    machine.knock_logged.add(key)
+    shots = getattr(shooter, "peer_shots", None)
+    machine.log(
+        f"   挨打击退[{source}]: ★**没给击退** —— 爆点 ({bx:.0f}, {by:.0f}) "
+        f"配不上真人的任何一发 `rpFire`（伤害 {damage:g}；账上有 "
+        f"{0 if not shots else len(shots)} 发在飞）。已知配不上的两种："
+        f"弹跳过的弹体（§84）和拐过弯的追踪弹（§77）")
+
+
+def _knock_back_seat(room, seat_index, damage, push, source="?"):
+    """把一次击退**结算到 bot 自己的身体上**（`0x50f7ca` 的 `kind == 0` 那一路）。
+
+    `source` 只进日志（`_log_knockback`），不参与任何判定。
+
+    座位上不是 bot、或者它还没落脚点，就什么都不做 —— 真人的击退归他自己
+    那台机器算（那边收到 `rpExplode` / `rpSplashDamaged` 就会做，§92）。
+
+    ## 为什么非做不可
+
+    bot 的位置是**服务端说了算**的：每台客户端都把 bot 的角色硬同步到心跳
+    报的坐标上（§5.6）。挨打时客户端各自把 bot 的模型顶飞了，而服务端这边
+    的模型没动 ⇒ 下一发心跳（8 Hz）当场把它拽回去。
+    用户 2026-08-28 报的「我打 bot，bot 不会被击退，只是原地跳一下」
+    就是这个拽回去的过程。
+
+    ## 原版怎么分档（`0x50f7ca`，`kind` 恒 0）
+
+    开头那三条 `cmp` 先挑一个档位（`0x50f7d5` ~ `0x50f7ea`）：
+
+        伤害 >= 10                -> 甲档
+        伤害 <  10 且**腾空中**   -> 甲档
+        伤害 <  10 且**在地上**   -> 乙档
+
+    甲档（`0x50f864`）：
+
+        伤害 **> 10** -> `[char+0x120] += push`
+        伤害 <= 10    -> ★ 只有「在地上 **且** v.x == 0」才把 v.y 夹到 −10
+                         （`0x50f884` 那两道门）—— 腾空那一批就此**什么都不做**
+        ★ 出口无论如何都落到 `0x50f947`，把「我踩在地上」那一位清掉
+
+    乙档（`0x50f849`）：只沿地面滑 `push.x × 3`（`0x50d9a7`），不离地。
+    """
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    machine = None if seat is None else seat.conn
+    if not isinstance(machine, BotConn) or machine.body is None:
+        return
+    body = machine.body
+    damage = int(damage)
+    if damage >= KNOCKBACK_MIN_DAMAGE or not body.on_ground:
+        vx, vy = body.vx, body.vy
+        if damage > KNOCKBACK_MIN_DAMAGE:
+            vx += push[0]
+            vy += push[1]
+        elif body.on_ground and body.vx == 0.0:
+            # 正好 10 点：不给速度，只把 v.y 夹到 −10（`0x50f8a2`）。
+            vy = min(vy, KNOCKBACK_MIN_LIFT)
+        # ★ 甲档一定离地：`0x50f8c3` 那条尾巴无论 v.y 正负都落到
+        #   `0x50f947`，把「我踩在地上」那一位清掉。
+        machine.body = botmove.Body(body.x, body.y, vx, vy, on_ground=False)
+        # ★ 日志里把「push 到底给没给」写清楚 —— 伤害正好 10 的那一发
+        #   原版只夹 `v.y`、一点 push 都不给（`0x50f864` 的 `jle`），
+        #   不标出来的话日志上写着 push 却看不见位移，下次又要查一轮。
+        _log_knockback(room, machine, source, damage, push, body,
+                       "甲档" if damage > KNOCKBACK_MIN_DAMAGE
+                       else "甲档·只夹v.y不给push")
+        return
+    # 乙档 · 在地上：横向滑一段，**不离地**。和火团往外铺是同一个例程
+    #   （`0x50d9a7`），所以这里也用同一个模型：那一列上够得着的站立面。
+    terrain = mapdata.load(_current_map(room))
+    if terrain is None:
+        return
+    span = push[0] * KNOCKBACK_SLIDE
+    x = body.x + span
+    # 够得着的坡度和走路同一条（`botmove.CLIMB_SLOPE`）—— 收方那边这一段
+    # 走的就是走路那个例程。
+    surface = botmove.surface_near(terrain, x, body.y,
+                                   abs(span) * botmove.CLIMB_SLOPE)
+    if surface is None:
+        _log_knockback(room, machine, source, damage, push, body,
+                       "乙档", note="滑不过去（那一列没有够得着的站立面）")
+        return
+    machine.body = botmove.Body(x, float(surface), on_ground=True)
+    _log_knockback(room, machine, source, damage, push, body, "乙档")
+
+
+#: 预演击退落点时最多推几个 tick（**只给日志用**，不影响任何判定）。
+#: 上界来自 `2v/g`：最强那一档 push 是 40，`2 × 40 / 1.2 = 67` 个 tick，
+#: 再宽一倍留给「被顶下悬崖一路往下掉」的情形。
+KNOCKBACK_PREVIEW_TICKS = 200
+
+#: 击退日志的**结果分类**（每个来源每一类只打第一发）。
+#:
+#: ★ 它同时是「还要不要预演」的判据：一个来源的这几类全打过了，
+#: 后面同来源的击退连预演都不跑 —— 那一段推 tick 挂在**转发真人同步包**
+#: 的路径上，不能让它一直烧 CPU（D1 / §182 的口径）。
+KNOCK_KINDS = ("飞出去", "推了一小段", "★几乎没动", "★横向被地形挡住了",
+               "滑不过去（那一列没有够得着的站立面）")
+
+
+def _log_knockback(room, machine, source, damage, push, before, tier,
+                   note=None):
+    """★ 诊断：把这一下击退**推到落地**，一行讲清「飞了多远」（§94）。
+
+    用户 2026-08-28 报「有时候有击退，有时候没有」——「有没有」这件事
+    服务端手里本来就有答案（`machine.body` 前后一比），只是以前一个字都不打，
+    日志里查不到。
+
+    ★ 按**结果分类**去重（铁律 10 的口径）：key = `(来源, 分类)`，
+    一张图里每一类只打第一发，不刷屏。真正想看的「这一类为什么没动」
+    第一次发生时就留下了完整数字。
+    """
+    logged = machine.knock_logged
+    if all((source, kind) in logged for kind in KNOCK_KINDS):
+        return                          # 这个来源该说的都说过了，别再预演
+    after = machine.body
+    terrain = mapdata.load(_current_map(room))
+    landed, ticks, walled = after, 0, False
+    if terrain is not None and not after.on_ground:
+        who = _character_of(machine)
+        while not landed.on_ground and ticks < KNOCKBACK_PREVIEW_TICKS:
+            step = botmove.tick(terrain, landed, who)
+            # ★ 「有水平速度，但这一 tick 一步都没挪」= 被地形挡住了
+            #   （§95 之后速度不再被清零，所以判据从「速度归零」改成
+            #   「位置没动」）。「飞起来了却横着没动」就是它，单独标出来。
+            if step.vx and step.x == landed.x and not step.on_ground:
+                walled = True
+            landed = step
+            ticks += 1
+    span = landed.x - before.x
+    if note is not None:
+        kind = note
+    elif walled and abs(span) < 60.0:
+        kind = "★横向被地形挡住了"
+    elif abs(span) >= 60.0:
+        kind = "飞出去"
+    elif abs(span) >= 12.0:
+        kind = "推了一小段"
+    else:
+        kind = "★几乎没动"
+    key = (source, kind)
+    if key in machine.knock_logged:
+        return
+    machine.knock_logged.add(key)
+    machine.log(
+        f"   挨打击退[{source}/{tier}]: 伤害 {damage} 强度 "
+        f"{knockback_strength(damage):g} push=({push[0]:.1f}, {push[1]:.1f})"
+        f"；({before.x:.0f}, {before.y:.0f}) -> ({landed.x:.0f}, "
+        f"{landed.y:.0f}) 位移 {span:+.0f} 滞空 {ticks} tick —— {kind}")
+
+
 def _seat_group(room, seat_index):
     """这个座位的**碰撞排除组**（`rpFire body+1`，§63）。
 
@@ -1757,7 +2169,9 @@ def _move_intent(room, machine, seat_index, terrain, target):
     direction = 1 if spot[0] >= body.x else -1
     who = _character_of(machine)
     if not body.on_ground:
-        # ★ 空中照按方向键：收方也是拿按键算空中水平速度的（§39 / §71）。
+        # ★★ 腾空时方向键**改不了**水平速度（§93 推翻了 §71 的那一行）——
+        #   这里照样返回方向，只是为了这一批 tick 里**落地之后**那几个 tick
+        #   接着往前走；空中那几个 tick 它是死的。
         return (direction, False)
     if botmove.blocked(terrain, body, who, direction):
         return (direction, True)
@@ -1806,8 +2220,15 @@ def _own_step(room, machine, seat_index, terrain, target, now):
             anchor = machine.battle_pos
         machine.body = _settle_spawn(terrain, machine, anchor)
         machine.move_at = now
-    direction, want_jump = _move_intent(room, machine, seat_index,
-                                        terrain, target)
+    if _may_walk(machine, now):
+        direction, want_jump = _move_intent(room, machine, seat_index,
+                                            terrain, target)
+    else:
+        # ★★ 进图那两秒站着不动（§94）—— 屏幕上还在放「预备 / 开始」，
+        #   真人这时候也动不了。**心跳照发**（站着的姿势），只是不迈腿；
+        #   被顶飞的话下面那几个 tick 照样把它推出去（`direction` 在空中
+        #   本来就不起作用，§93）。
+        direction, want_jump = 0, False
     # ★★ 推几个 tick 按**真实流逝的时间**算（和 `_advance_shells()` 一个
     #   口径），而且**余数留到下一帧**：一发心跳 125 ms = 3.9 个 tick，
     #   每帧直接截断的话 bot 会稳定地比真人慢 23% —— 攒起来就不会。
@@ -1988,7 +2409,14 @@ def _note_action_lock(room, machine, seat_index, now):
     2. **躺着 -> 站起来**（`_lying_dead()` 翻转）—— 重生广播刚发出去。
     """
     lying = _lying_dead(room, seat_index)
-    if machine.act_lock_until is None or (machine.was_lying and not lying):
+    if machine.act_lock_until is None:
+        # ★★ 进图那一档：屏幕上正在放「预备 / 开始」，**连走都还不能走**
+        #   （§94）。所以这一档比复活那一档多挂一个 `enter_lock_until`。
+        machine.act_lock_until = now + BOT_ACTION_LOCK_S
+        machine.enter_lock_until = machine.act_lock_until
+    elif machine.was_lying and not lying:
+        # 复活那一档：真人这两秒**只能跑不能打**（用户 2026-08-27 的原话），
+        # 所以只挂动手那道锁，走位照旧。
         machine.act_lock_until = now + BOT_ACTION_LOCK_S
     machine.was_lying = lying
 
@@ -1996,6 +2424,21 @@ def _note_action_lock(room, machine, seat_index, now):
 def _may_act(machine, now):
     """这一帧允许开枪 / 近身吗（`BOT_ACTION_LOCK_S` 那道锁）。"""
     until = machine.act_lock_until
+    return until is None or now >= until
+
+
+def _may_walk(machine, now):
+    """这一帧允许**走位**吗 —— 只有**进图**那一档拦（§94）。
+
+    ★ 为什么单独一道：M5 之前 bot 的位置是**回放真人轨迹**的（D16），
+    真人不动它就不动，所以「预备 / 开始」那两秒天然不会抢跑；M5 让它自己
+    走之后，第一发心跳一到它就出发了 —— 用户 2026-08-28 报的
+    「一开始我还不能动呢，就看见 bot 已经向我这边跑来了」。
+
+    ⚠ 复活那一档**不拦**：用户 2026-08-27 说得很清楚
+    「被打死复活后有大概两三秒不能开枪，**只能移动**」。
+    """
+    until = machine.enter_lock_until
     return until is None or now >= until
 
 
@@ -2807,7 +3250,7 @@ SPLASH_BODY_RADIUS = 35.0
 
 
 def _splash_targets(room, shell, point, victim_seat, bodies):
-    """爆炸溅到了谁：`[(座位号, 伤害, 受击点)]`。武器没有溅射就是空表。
+    """爆炸溅到了谁：`[(座位号, 伤害, 受击点, 击退矢量)]`。没有溅射就是空表。
 
     ## ★★★ 衰减公式是**逆出来的**，不是猜的（§90）
 
@@ -2857,10 +3300,15 @@ def _splash_targets(room, shell, point, victim_seat, bodies):
             continue
         # ★ 朝零截断（`0x5f895c` 是 `_ftol2`，等价于 C 的 `(int)`），
         #   **然后**才乘模式倍率 —— 顺序和原版一致（§90）。
-        damage = int((1.0 - span / reach) * (full - 1) + 1) * scale
+        base = int((1.0 - span / reach) * (full - 1) + 1)
+        damage = base * scale
         if damage <= 0:
             continue
-        out.append((seat_index, damage, (cx, cy)))
+        # ★★ 击退（§92）：来向是**爆点指向身体圆心**那一条，强度按**没乘
+        #   模式倍率**的那个伤害查阶梯（`0x4858a2` 传的就是 `+0x134` 的返回
+        #   值，`×2` 是后面 `+0x128` 才乘的）。
+        push = knockback_vector(cx - point[0], cy - point[1], base)
+        out.append((seat_index, damage, (cx, cy), push))
     return out
 
 
@@ -2900,20 +3348,32 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region):
                     f"　飞了 {shell.ticks} tick"
                     f"；头 {head.hex()} body({len(body)}) {body.hex()}")
     _emit(machine, packet)
+    # ★★ 直接命中的击退**不进包**：每台机器都拿它自己那颗弹体的速度现算
+    #   （`0x49285c` 读 `[proj+0x120]`，§92）。所以只有「被打的是另一个
+    #   bot」时服务端才要自己补一份 —— 真人那份归他自己那台机器。
+    if hit:
+        vx, vy = _shell_velocity(shell)
+        _knock_back_seat(room, victim_seat, damage,
+                         knockback_vector(vx, vy, damage),
+                         source="bot 直接命中")
     # ★★★ 溅射的名单和弹体**不是同一份**（§69）：弹体按碰撞排除组过滤
     #   （队友撞不着），而溅射对象的组恒为 0 = **撞所有人** ——
     #   队友、连射手自己都吃。所以这里重新问一次、不带组。
-    for seat_index, splash, where in _splash_targets(
+    for seat_index, splash, where, push in _splash_targets(
             room, shell, point, victim_seat,
             _battle_bodies(room, machine.my_seat, include_self=True)):
         # ★ 溅射伤害得**单独报**：收方处理 `rpExplode` 时确实会建一个
         #   `SplashDamage` 对象（§54 那个多出来的句柄），但算伤害的是射手
         #   那台机器 —— bot 没有本机，不补这一发就一滴血都不掉（§67）。
+        # ★★ `+13/+17` 是**击退矢量**（§92）：不填的话被溅到的人一动不动，
+        #   而真人扔的同一颗手雷会把人顶飞 —— 用户 2026-08-28 报的就是这个。
         _emit(machine, machine.sync.event(
             botsync.OP_SPLASH_DAMAGED,
             botsync.splash_body(shell.handle,
                                 botsync.character_handle(seat_index),
-                                splash, where[0], where[1])))
+                                splash, where[0], where[1],
+                                push_x=push[0], push_y=push[1])))
+        _knock_back_seat(room, seat_index, splash, push, source="bot 溅射")
     # ★★★ **直接砸中人的那一发不铺火墙**（§79）—— 铺火那一段前面有一道
     #   `cmp dword [esp+8], 0 ; jne 出口`（`0x4829d7`），`[esp+8]` 就是
     #   「撞上的那个角色」的指针（基类 `0x47eb67` 拿它和 0 比），非空 ⇒
@@ -3163,11 +3623,16 @@ def _advance_fires(room, machine, now):
                 machine.log(f"   火烧: 座位{seat_index} 在 "
                             f"({lit.x:.0f}, {lit.y:.0f}) 挨了 {damage} 点"
                             f"（第 {local} tick，火团句柄 {lit.handle}，§78/§85）")
+                # ★ 火的击退是**常量** `(0, −8)`（§92，语料 1164 发无例外）。
                 _emit(machine, machine.sync.event(
                     botsync.OP_SPLASH_DAMAGED,
                     botsync.splash_body(lit.handle,
                                         botsync.character_handle(seat_index),
-                                        damage, lit.x, lit.y)))
+                                        damage, lit.x, lit.y,
+                                        push_x=FIRE_KNOCKBACK[0],
+                                        push_y=FIRE_KNOCKBACK[1])))
+                _knock_back_seat(room, seat_index, damage, FIRE_KNOCKBACK,
+                                 source="地面燃烧")
     # ★ 两条都算烧完了：推到头了，或者**这一刻它本来就该灭了**
     #   （服务端卡了一下、`BOT_FIRE_CATCHUP_TICKS` 那道闸没让它补完）。
     machine.fires = [w for w in machine.fires
@@ -3517,13 +3982,19 @@ def _advance_dash(room, machine, now):
             # ★ 近身伤害也走同一条路（§87）：`0x481dfd` 那个 `[vft+0x128]`
             #   进门第一件事就是 `call 0x4806bf`。
             damage = swing.move.damage * _damage_scale(room)
+            # ★ 近身的击退也是**常量**：`(朝向 × 15, −10)`（§92，语料 1347 发）。
+            facing = 1.0 if swing.direction >= 0 else -1.0
+            push = (DASH_KNOCKBACK[0] * facing, DASH_KNOCKBACK[1])
             _emit(machine, machine.sync.event(
                 botsync.OP_SPLASH_DAMAGED,
                 botsync.splash_body(
                     swing.handle, botsync.character_handle(seat_index),
                     damage,
-                    x + offset[0] * (1.0 if swing.direction >= 0 else -1.0),
-                    y + offset[1])))
+                    x + offset[0] * facing,
+                    y + offset[1],
+                    push_x=push[0], push_y=push[1])))
+            _knock_back_seat(room, seat_index, damage, push,
+                             source="bot 近身")
             machine.log(f"   近身: 冲刺打中 座位{seat_index} 的{region}"
                         f" 伤害 {damage} 第{step}帧"
                         f" 句柄 {swing.handle}")
@@ -4009,6 +4480,8 @@ gameserver.BOT_ROOM_TICK = tick_room
 gameserver.BOT_ROOM_LOADED = report_bots_loaded
 #: 同上：bot 该在哪重生（§91）。看门狗补 `0x0419` 之前问这一发。
 gameserver.BOT_RESPAWN_POINT = pick_respawn_point
+#: 同上：真人打出来的每一发同步包都过一次，打到 bot 身上的替它结算击退（§92）。
+gameserver.BOT_PEER_HIT = note_peer_hit
 
 
 def handle_command(conn, text):

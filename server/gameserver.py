@@ -3173,6 +3173,14 @@ BOT_ROOM_LOADED = None
 #: 那在 `bot.py`（它有 `mapdata`），所以做成钩子（V0.3 §91）。
 BOT_RESPAWN_POINT = None
 
+#: ★★ 同上，`bot.note_peer_hit` 挂这儿：**真人打出来的每一发同步包**都过一次，
+#: 打到 bot 身上的那些替 bot 结算**击退**（V0.3 §92）。签名 `(room, conn, payload)`。
+#:
+#: 为什么非有不可：bot 的位置由服务端说了算，每台客户端都把它硬同步到心跳
+#: 报的坐标上。挨打时客户端各自把 bot 的模型顶飞、服务端这边没动 ⇒ 下一发
+#: 心跳当场把它拽回去（用户 2026-08-28 报的「只是原地跳一下」）。
+BOT_PEER_HIT = None
+
 
 def pvp_score_limit(player_count, team_mode):
     """这一局要拿几分（几个人头）才算赢。抄自 `0x55be71`（§167）。
@@ -4290,6 +4298,11 @@ def reset_sync_trails(room, why):
         conn.sync_crouch = False
         # ★ 诊断（`note_human_fire`）：换图 / 新一局重新打第一发。M3b 收口后删。
         conn.human_fire_logged = set()
+        # ★ 开火记录跟着清（§92）：上一张图的弹道配不上这一张图的爆点，
+        #   留着只会让击退方向偶尔配错一发。
+        shots = getattr(conn, "peer_shots", None)
+        if shots:
+            shots.clear()
         # bot 那一份（`bot.BotConn` 才有；真人身上没有这几个字段）。
         if conn.is_bot_conn():
             conn.reset_battle_frame()
@@ -4542,6 +4555,11 @@ class Conn:
     sync_trail_seq = 0
     #: ★ 诊断（`note_human_fire`）的类级默认 —— 控制通道造的假连接也得有。
     human_fire_logged = frozenset()
+    #: ★ 这条连接**本图打出去、还没配上爆炸**的几发 `rpFire`（V0.3 §92）。
+    #:   `bot.note_peer_fire()` 现建一个 deque —— 和 `sync_trail` 同一个套路
+    #:   （类上放可变对象会让所有实例共用一份）。bot 拿它反推「打中我的那颗
+    #:   子弹是从哪个方向来的」，好把击退结算到自己身上。
+    peer_shots = ()
 
     def __init__(self, sock, addr, args, accounts=None, tickets=None):
         global _seq
@@ -7462,6 +7480,16 @@ class Conn:
         #   M5 的瞄准也要用它。开销 = 一次定长 unpack，可以忽略。
         self.note_sync_position(payload)
         self.note_human_fire(payload)
+        # ★★ 打到 bot 身上的那一下**击退**归服务端算（V0.3 §92）——
+        #   bot 没有本机，客户端那边顶飞的模型会被下一发心跳拽回去。
+        #   ★ 出错不能连累真人的同步（D1），所以整段吞异常。
+        if BOT_PEER_HIT is not None:
+            try:
+                room = self.lobby_room()
+                if room is not None:
+                    BOT_PEER_HIT(room, self, payload)
+            except Exception as error:          # noqa: BLE001 —— 见上
+                self.log(f"   ⚠ 替 bot 结算击退时出错，已跳过: {error!r}")
         # ★ 走 `PEER_RELAY.deliver` 而不是直接广播 `0x040f`：房里可能有人已经
         #   接上原版中继了，那些人要走中继收（原版路径），剩下的才走 `0x040f`。
         #   两条路在客户端进的是同一个入口 `0x407869`，谁收哪条都一样。

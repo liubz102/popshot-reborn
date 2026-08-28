@@ -21,7 +21,7 @@
 | 走路速度 | **`ChrSpeed` 单位 / tick**（6.0~8.0）| `0x50766a`：`速度 × 方向 × 倍率` |
 | 冲刺跑 | **× 1.5** | `GameProps.ini` 的 `FastRunRate`（`0x507567` 读它）|
 | 蹲着走 | **× 1/3** | `0x507607` 乘 `[0x69387c]` = 0.3333 |
-| 空中水平 | 按着方向键时 **× 1.5** | `0x507473` 乘 `[0x69375c]` = 1.5 |
+| 空中水平 | ★ **方向键管不着**：一直是起跳那一刻的走速 | `0x5073a6`（腾空整段跳过读键）+ 语料，§93 |
 | 重力 | **1.2 单位 / tick²** | `[0x693784]`，`0x40a04f` 返回它 —— **和子弹是同一个数** |
 | 起跳初速 | **20 单位 / tick**（向上）| 语料 33971 段：起跳后第一发心跳 `vy` 中位 **−19**（p10 −20 / p90 −17）|
 | 爬得动的坡 | `|dy/dx| ≤ **2**` | 语料 88875 发上坡心跳的 **p99** |
@@ -58,9 +58,6 @@ FAST_RUN_RATE = 1.5
 
 #: 蹲着走：`0x507607` 乘的那个常量。
 CROUCH_FACTOR = 1.0 / 3.0
-
-#: 腾空时按着方向键，水平速度的倍率（`0x69375c`）。
-AIR_KEY_FACTOR = 1.5
 
 #: 走路能爬的最陡坡（`|dy / dx|`）。语料 88875 发上坡心跳的 p99 = 2.0
 #: （中位 0.23、p90 0.85）——**这是真人走得动的坡**，不是我挑的数。
@@ -119,11 +116,17 @@ def jump_apex():
     return JUMP_SPEED * JUMP_SPEED / (2.0 * GRAVITY)
 
 
-def jump(body):
-    """起跳：把垂直速度置成初速，人离地。已经在空中就原样返回。"""
+def jump(body, vx=0.0):
+    """起跳：把垂直速度置成初速，人离地。已经在空中就原样返回。
+
+    ★★ `vx` = **起跳那一刻的水平走速**（`走速 × 方向 × 倍率`）。腾空之后
+    方向键就管不着水平速度了（§93），所以这一刻带上去多少，整段弧线就是
+    多少 —— 站着起跳的人是**竖直**上下的，语料里那 11256 发「腾空 + 按着
+    方向键但 `vx` 恒 0」就是他们。
+    """
     if not body.on_ground:
         return body
-    return body.moved(body.x, body.y, 0.0, -JUMP_SPEED, on_ground=False)
+    return body.moved(body.x, body.y, float(vx), -JUMP_SPEED, on_ground=False)
 
 
 # ---------------------------------------------------------------------------
@@ -176,18 +179,68 @@ def _walk_tick(terrain, body, character, direction, fast_run, crouched):
     return body.moved(nx, body.y, nx - body.x, 0.0, on_ground=False)
 
 
-def _air_tick(terrain, body, character, direction, fast_run, crouched):
-    """腾空走一个 tick：先加重力，再走，撞上什么就停什么。"""
+def _is_ledge(terrain, x, y):
+    """`(x, y)` 这个实心点是不是某个**站立面本身**（台阶的上沿）。
+
+    ★★ 拿它把「头顶的板」和「台阶的边」分开（§95）。
+
+    腾空往上走时，脚**掠过一个站立面**说明人正翻过一个坎的边缘 ——
+    站立面按定义上面就是空气，那不是天花板。真正的天花板（板的**下沿**）
+    不是站立面：板顶那个站立面在更上面，脚够不着。
+
+    实机代价：用户 2026-08-28 那张图里 bot 站在 `(581, 651)`，左边一列的
+    地面是 **646**（高 5 个像素）。旧代码把「脚升到 646.5」当成撞天花板，
+    于是 `v.y` 当场清零、人卡在原地不动 —— 一次强度 15 的击退**位移 0**。
+    """
+    return int(y) in terrain.surfaces(int(x))
+
+
+def _air_tick(terrain, body):
+    """腾空走一个 tick：先加重力，再走，撞上什么就停什么。
+
+    ★★★ **方向键在这里一点用都没有**（§93）。原来这儿按 §71 抄了一句
+    「按方向键 -> 水平速度 = 走速 × 1.5」，出处是 `0x507473` —— 可那一段
+    整个挂在 `0x493d00()` 为真的分支下面（`0x5073f5` / `0x507615` 各一道
+    门），正常对局里它是假的。真正的分支在 `0x5073a6`：**腾空 ⇒ 直接跳到
+    `0x50767e`**，读键、算走路方向、按走速挪那三件事整段跳过。
+
+    代价是实打实的：击退把 `vx` 设成 `+12` 之后，下一帧这句就按「朝着敌人」
+    把它改写成 `−11`，bot 于是**朝开枪的人飘过去**（模拟：位移 −157 而不是
+    +172）。用户 2026-08-28 报的「打 bot 它不会被击退，只是原地跳一下」
+    就是这个。
+    """
     vx = body.vx
-    if direction:
-        # ★ 空中按方向键：收方 `0x507473` 拿按键覆写水平速度并 × 1.5。
-        speed = walk_speed(character, fast_run, crouched) * AIR_KEY_FACTOR
-        vx = speed if direction > 0 else -speed
     vy = body.vy + GRAVITY
     nx = body.x + vx
     ny = body.y + vy
-    if vx and _solid(terrain, nx, body.y - 1):
-        nx, vx = body.x, 0.0           # 撞墙：横向停住，继续该升该落
+    if vx and _solid(terrain, nx, ny - 1):
+        # ★★★★ 目标点在地形里。先问一句：这一列上**够不够得着一个站立面**？
+        #
+        # 够得着 = 那只是个**坎**，不是墙 —— 蹭上去、接着飞。判据和走路
+        # 完全同一条（`CLIMB_SLOPE`，`_walk_tick` 用的就是它）：走路一步迈得
+        # 上去的坎，被顶飞时更不该被它挡住。
+        #
+        # ⚠ 这一条是**分两轮**才补齐的（§95），两轮的实机现象不一样：
+        #
+        # 1. 第一轮（用户 2026-08-28）：采样点原来用的是**出发时**的脚下
+        #    高度 `body.y - 1`，而人正在往上升 ⇒ 4~5 像素的坎就算「墙」；
+        #    而且撞上就把 `vx` **永久清零**，整段飞行再也没有水平速度。
+        #    改成采样**落点**高度 `ny - 1`、并且**不清零速度**（撞上只是
+        #    这一 tick 不挪，升过去下一 tick 接着走）。
+        # 2. 第二轮（用户 2026-08-29，同一张图同一个位置）：**弱击退还是
+        #    卡住**。`Forest_b` 那一带是缓上坡 `654→653→651→650→647→645`，
+        #    而强度 8 的击退抬升顶点只有 **1.8~3.3 个像素**，够不着前面那个
+        #    4 像素的坎 —— 它自己**永远**升不过去。强度 15 那一发抬升 28，
+        #    所以只有弱击退才卡。⇒ 必须像走路一样**蹭上去**。
+        # ★ 锚在**出发时**的脚下高度（和 `_walk_tick` 完全一样）：
+        #   这样「贴着崖壁往下掉」不会被上面很远的崖顶勾上去。
+        step = surface_near(terrain, nx, body.y, abs(vx) * CLIMB_SLOPE)
+        if step is not None and step < ny:
+            ny = float(step)            # 蹭上坎：脚抬到坎顶，**仍然腾空**
+        else:
+            # 真的够不着 = 墙。这一 tick 横向过不去，**速度留着**：
+            # 踩地时 `Body` 会把速度归零（§35），落地那一下自然收尾。
+            nx = body.x
     if vy > 0:
         landing = terrain.ground_below(int(nx), int(body.y))
         if landing is not None and landing <= ny:
@@ -196,7 +249,8 @@ def _air_tick(terrain, body, character, direction, fast_run, crouched):
             # 掉出图外（陷阱）—— 停在图底，别让坐标一路跑到无穷。
             # ★ 死不死由客户端上报（`0x0409`），服务端不替它判。
             return body.moved(nx, terrain.height - 1, vx, vy, on_ground=False)
-    elif vy < 0 and _blocks_up(terrain, nx, ny):
+    elif vy < 0 and _blocks_up(terrain, nx, ny) and not _is_ledge(terrain,
+                                                                 nx, ny):
         return body.moved(nx, body.y, vx, 0.0, on_ground=False)   # 撞天花板
     return body.moved(nx, ny, vx, vy, on_ground=False)
 
@@ -206,16 +260,24 @@ def tick(terrain, body, character, direction=0, fast_run=False,
     """走一个 tick（32 ms），返回**新的** `Body`。
 
     `direction`：−1 左 / 0 不按 / +1 右，就是心跳里那个方向键掩码（§39）。
+    ★ 它**只在踩着地的时候有意义**（§93）—— 腾空那一段收方根本不读键。
     `want_jump`：这一 tick 要不要起跳（只在踩着地时有效）。
     """
     if terrain is None:
         return body
     if body.on_ground and want_jump:
-        body = jump(body)
+        # ★ 起跳带走**这一刻的走速**：腾空之后就再也改不了了（§93）。
+        speed = walk_speed(character, fast_run, crouched)
+        if direction > 0:
+            body = jump(body, speed)
+        elif direction < 0:
+            body = jump(body, -speed)
+        else:
+            body = jump(body)               # 站着起跳 —— 竖直上下
     if body.on_ground:
         return _walk_tick(terrain, body, character, direction,
                           fast_run, crouched)
-    return _air_tick(terrain, body, character, direction, fast_run, crouched)
+    return _air_tick(terrain, body)
 
 
 def advance(terrain, body, character, ticks, direction=0, fast_run=False,
