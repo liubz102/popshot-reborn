@@ -372,6 +372,14 @@ class BotConn(gameserver.Conn):
         #:   `None` = 还没有上一帧。`_advance_shells()` 拿它和这一帧的快照
         #:   **逐 tick 插值**出「那一 tick 人在哪」（§96）。
         self.shell_bodies = None
+        #: ★ 地上捡到的特殊武器（`weapondata.Weapon`）；`None` = 用自己那把。
+        #:   捡到就一直用（和真人一样），死了重生时清掉。
+        self.item_weapon = None
+        #: ★ 踩到减速胶水之后**减速到什么时候**（`time.monotonic()` 的刻度）；
+        #:   `None` = 没中招（V0.3 §101）。
+        self.slowed_until = None
+        #: ★ 被冰冻**到什么时候**；`None` = 没被冻（V0.3 §106）。
+        self.frozen_until = None
         #: ★★ **地上还在烧的火墙**（`FireWall`，§78）。收方只把火画出来，
         #:   算谁被烧的还是「射手那台机器」—— bot 没有本机，所以归这边。
         self.fires = []
@@ -445,6 +453,10 @@ class BotConn(gameserver.Conn):
         #   （`ForceReloadTerrain`），上一张图的弹体在那边已经不存在了 ——
         #   补发只会拿一个查不到的句柄去撞 `0x492750` 那个静默丢弃。
         self.pending_shots = []
+        # ★ 捡来的枪跟着清：新一局 / 换图之后地上那件东西已经不存在了。
+        self.item_weapon = None
+        self.slowed_until = None
+        self.frozen_until = None
         # ★ 身体快照跟着清：换图之后上一张图的坐标一个字都不作数，
         #   拿它去插值只会插出一条横跨两张图的假轨迹。
         self.shell_bodies = None
@@ -497,6 +509,10 @@ class BotConn(gameserver.Conn):
         之后那个槽位空了）就**退回首选**，不是不开火 —— 房主的指令是
         「用几号枪」，不是「打不了就别打」。
         """
+        # ★ 地上捡到的那三把特殊武器压过一切（§223 / §100）：真人捡到也是
+        #   **当场换枪**，直到死了重生才换回来。
+        if self.item_weapon is not None:
+            return self.item_weapon
         if self.weapon_slot is not None:
             chosen = weapondata.slot_for(self.character_id, self.weapon_slot)
             if chosen is not None:
@@ -1944,6 +1960,304 @@ def _seat_on_ground(room, seat_index):
     return bool(point[3]) if len(point) > 3 else None
 
 
+#: ★ **道具自己那个碰撞圆的半径**（V0.3 §100）。
+#:
+#: 判定本身是逆出来的：`Character::CheckItemPickup`（`0x5154d3`）扫世界
+#: 第 2 类（掉落物），对每一件先看 `[item+0x2a8] == 0`（还没被捡）和
+#: `[item+0x2aa] != 0`（可捡），再调 **`0x50f410`** —— 和「子弹撞人」
+#: 「弹跳台弹人」是**同一个**圆相交函数。
+#:
+#: ⚠ 但**这个 20 是估的**：物件那个圆的半径在 `Item` 构造链里，还没读出来。
+#: 20 是照弹跳台那个（`0x510ade` 写死 20.0）取的同量级值。
+#: 偏大 = bot 隔着一点点就捡到；偏小 = 得踩得很准。实机觉得不对就改这里。
+BOT_ITEM_RADIUS = 20.0
+
+
+def _item_pickups(room, machine, seat_index):
+    """bot 踩到地上的道具就捡起来（V0.3 §100）。返回捡到的 `[(句柄, 物件id)]`。
+
+    ## 为什么非服务端做不可
+
+    拾取这条链原本**整条都是客户端发起**的：`CheckItemPickup` 在**每台机器
+    自己的本地玩家**身上跑，踩到了就发 `0x0407` 问服务端「能捡吗」。
+    bot 没有本机 ⇒ 一辈子发不出那一发 ⇒ **一件都捡不到**
+    （用户 2026-08-29 报的就是这个）。
+
+    ## 位置从哪来
+
+    老口径下服务端**不知道道具在哪**（随便给个大坐标、让客户端取模+顶出
+    地形，§192）。V0.3 §100 把刷新点改成按地形挑的合法落点并记进
+    `quest.items_at`，这里才判得了「踩到没有」。
+
+    ## 捡到之后
+
+    * 广播 `0x0405` —— 每台机器把这件东西从世界里抹掉、放拾取特效；
+    * **绝不发 `0x040b`**：那一发是「往**收包的那个人**的道具槽里塞一件」，
+      bot 没有客户端，发给谁都是凭空多给别人一件。bot 的道具只记在服务端
+      那份镜像（`quest.grant_item`）里。
+    """
+    quest = room.quest
+    body = machine.body
+    if quest is None or body is None or not getattr(quest, "items_at", None):
+        return []
+    character = chrprops.get(machine.character_id)
+    circles = character.circles(body.x, body.y, machine.crouched)
+    got = []
+    for handle, spot in list(quest.items_at.items()):
+        ix, iy = spot
+        if not any(math.hypot(ix - cx, iy - cy) <= r + BOT_ITEM_RADIUS
+                   for cx, cy, r, _region in circles):
+            continue
+        if not quest.claim_item(handle, seat_index):
+            continue
+        item_id = quest.item_id_of(handle)
+        machine.battle_broadcast(
+            gameserver.build_game(
+                gameserver.OP_PICKED_ITEM,
+                gameserver.build_picked_item(seat_index, handle)),
+            reason=f"：bot 捡到 {item_id}")
+        got.append((handle, item_id))
+        if item_id in gameserver.GRANTABLE_ITEM_IDS:
+            quest.grant_item(seat_index, item_id)
+            held = quest.item_slots[seat_index]
+            machine.log(
+                f"   捡到道具 {item_id} "
+                f"{gameserver.ITEM_NAMES.get(item_id, '未知物件')} "
+                f"@ ({ix:.0f}, {iy:.0f})；手上 {len(held)} 件 {list(held)}")
+        elif item_id in gameserver.PVP_WEAPON_ITEM_IDS:
+            _take_weapon_item(machine, seat_index, item_id)
+    return got
+
+
+def _take_weapon_item(machine, seat_index, item_id):
+    """捡到地上那三把特殊武器（§223）—— bot 得**服务端自己换枪**。
+
+    真人是客户端在收到 `0x0405` 的那一刻自己调 `vf_11c` 换的，而那一句里
+    有 `cmp [char+0x2ac], 0x409f7d()`：**只有那台机器上的本地玩家会换**。
+    bot 不是任何一台机器的本地玩家 ⇒ 没有一台会替它换 ⇒ 必须这边换完再
+    用 `rpChangeWeapon` 声明出去。
+    """
+    weapon_id = gameserver.PVP_WEAPON_GIVES.get(item_id)
+    weapon = None if weapon_id is None else weapondata.get(weapon_id)
+    if weapon is None:
+        machine.log(f"   捡到特殊武器 {item_id}，但服务端没有这把枪的记录，只捡不换")
+        return
+    machine.item_weapon = weapon
+    machine.log(f"   捡到特殊武器 {item_id} -> {weapon.id}({weapon.section}) "
+                f"伤害 {weapon.damage}")
+    with contextlib.suppress(botsync.SyncInvariantError):
+        _declare_weapon(machine, seat_index, machine.weapon)
+
+
+def _use_held_item(room, machine, seat_index):
+    """手上有道具就用掉（V0.3 §100 / D65）。用了返回 `True`。
+
+    发的是 `0x040a` 广播 —— 和真人按 Ctrl 之后服务端回的那一发一模一样，
+    每台机器按包里的**座位号**找到 bot 的角色、调 `Character::UseItemEffect`。
+
+    ⚠ **「什么时候用」原版没有答案**（那时候没有 bot），所以这一条是我们
+    定的：**捡到就用**（D65）。理由是这 16 件里绝大多数是「立刻生效、持续
+    一段时间」的增益，攒着没有任何机制上的好处，而 4 个格子占满之后再捡
+    就直接丢了。要改成别的策略就改这一个函数。
+    """
+    quest = room.quest
+    if quest is None:
+        return False
+    if not quest.item_slots or not 0 <= seat_index < len(quest.item_slots):
+        return False
+    if not quest.item_slots[seat_index]:
+        return False
+    item_id = quest.use_item(seat_index, 0)
+    if item_id is None:
+        return False
+    machine.log(f"   用道具 {item_id} "
+                f"{gameserver.ITEM_NAMES.get(item_id, '未知物件')}"
+                f"（捡到就用，D65）")
+    machine.battle_broadcast(
+        gameserver.build_game(gameserver.OP_ITEM_EFFECT,
+                              gameserver.build_item_effect(seat_index, item_id)),
+        reason=f"：bot 的道具 {item_id} 生效")
+    return True
+
+
+def _broadcast_status(room, machine, seat_index, status_item_id, why):
+    """让**每台机器**都给 bot 挂上一个状态（V0.3 §109）。
+
+    ## 为什么必须发这一发
+
+    §101 的形状是「效果每台机器各算各的，而 bot 没有本机」。会话 34 的解法是
+    「服务端自己也算一遍」—— 走位对了，可**别人屏幕上什么都看不见**：
+    收方的角色是靠心跳里那六位方向键**自己走**的（§39），心跳只纠偏。
+    服务端把 bot 的走速压到 0.3，客户端却照旧按满速走再被拽回来 ——
+    看起来就是「一切正常」，用户报的「bot 走过胶水没有被粘住」就是这个。
+
+    正解不是我们去猜别人该看见什么，而是**替 bot 走一遍原版那条链**：
+    `Item.ini` 里状态本身就是四件道具（10600 中毒 / 10601 冻住 /
+    10602 幽灵 / 10603 减速），客户端自己也是这么用的（冰冻在 `0x50886a`
+    拿 10601 再调一次 `UseItemEffect`）。广播一发
+    `0x040a gspItemEffect(bot 的座位, 10603)`，每台机器就按
+    `Status.ini` 给 bot 加上「4 秒、走速 ×0.3」，模型、特效、本地走位一起对。
+
+    效果的**结束**不用管：这四条都有 `Time`，客户端自己会到点撤掉
+    （要靠 `0x040d` 撤的只有 `Magazine` 那一族，§200）。
+    """
+    try:
+        machine.battle_broadcast(
+            gameserver.build_game(
+                gameserver.OP_ITEM_EFFECT,
+                gameserver.build_item_effect(seat_index, status_item_id)),
+            reason=f"：bot 身上的状态 {status_item_id}（{why}）")
+    except OSError as error:
+        machine.log(f"   ⚠ 状态 {status_item_id} 广播失败（{error!r}），"
+                    f"服务端这边照样算")
+
+
+def _live_slow_mines(quest, now):
+    """此刻**真的还在地上、而且已经布好**的那几摊胶水（V0.3 §108）。
+
+    到期的当场从表里摘掉 —— 客户端那边 `SlowMineObject::Tick` 也是自毁。
+    """
+    mines = getattr(quest, "slow_mines", None)
+    if not mines:
+        return ()
+    live = []
+    for mine in list(mines):
+        born = mine[3] if len(mine) > 3 else None
+        if born is None:
+            live.append(mine)                      # 老格式（没记时刻）
+            continue
+        age = now - born
+        if age >= gameserver.SLOW_MINE_LIFE_SECONDS:
+            mines.remove(mine)                     # 15 秒到了，那摊没了
+            continue
+        if age < gameserver.SLOW_MINE_ARM_SECONDS:
+            continue                               # 头 3 秒还没布好
+        live.append(mine)
+    return live
+
+
+def _step_on_slow_mine(room, machine, seat_index, now):
+    """bot 站在地上那摊减速胶水里就中招（V0.3 §101 / §105 / §108）。中了返回 `True`。
+
+    真人是**自己那台机器**判的：胶水那一摊是个独立物件（id 10603 `Slowed`），
+    谁碰到谁那边给谁挂 `Slowed`（`Status.ini` 第 14 条：4 秒、走速 × 0.3）。
+    bot 没有本机 ⇒ 没有一台会替它算，而且就算别人那台把 bot 的模型减速了，
+    下一发心跳（服务端算的）当场把它拽回去 —— 和 §92 的击退**同一个形状**。
+
+    ⇒ 两件事一起做：服务端自己压走速（走位才对），**并且**广播一发
+    `0x040a`（别人屏幕上才看得见，见 `_broadcast_status`）。
+
+    ★ **不消耗那一摊**：胶水是留在地上的，站在里面就一直被减速
+    （`slowed_until` 每帧往后推），但那一摊 15 秒之后自己没了（§108）。
+    """
+    quest = room.quest
+    body = machine.body
+    if quest is None or body is None:
+        return False
+    mines = _live_slow_mines(quest, now)
+    if not mines:
+        return False
+    character = chrprops.get(machine.character_id)
+    circles = character.circles(body.x, body.y, machine.crouched)
+    reach = gameserver.SLOW_MINE_RADIUS
+    for mine in mines:
+        mx, my = mine[0], mine[1]
+        if not any(math.hypot(mx - cx, my - cy) <= r + reach
+                   for cx, cy, r, _region in circles):
+            continue
+        was = machine.slowed_until
+        machine.slowed_until = now + gameserver.SLOWED_SECONDS
+        if was is None or was <= now:
+            machine.log(
+                f"   踩进减速胶水 @ ({mx:.0f}, {my:.0f})：走速 × "
+                f"{gameserver.SLOWED_SPEED_RATIO}，"
+                f"{gameserver.SLOWED_SECONDS:g} 秒")
+            _broadcast_status(room, machine, seat_index,
+                              gameserver.STATUS_ITEM_SLOWED, "踩到胶水")
+        return True
+    return False
+
+
+def _take_freeze(room, machine, seat_index, now):
+    """别人放的冰冻把 bot 冻住（V0.3 §106）。冻上了返回 `True`。
+
+    原版的判据整条都在 `UseItemEffect` 的 10310 分支（`0x5087b6`）里：
+
+        不是自己（0x5087d1）
+        [char+0x2b4] == 0（0x5087d9）
+        **队伍号不同**（[vft+0x144]，0x5087e6）
+        dist < Range（0x50884a；Range 来自 `Item.ini` 的 `[Freezer] Range=300`）
+
+    冻多久看 `Status.ini` 第 12 条：`Time=2.0`。
+
+    ★ 每一发冰冻只结算一次：结算完就把它从 `freeze_bursts` 里摘掉
+    （那张表是**给 bot 用的待办**，不是场上的对象）。
+    """
+    quest = room.quest
+    body = machine.body
+    if quest is None or body is None or not getattr(quest, "freeze_bursts", None):
+        return False
+    my_seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    caught = False
+    for burst in list(quest.freeze_bursts):
+        bx, by, owner, _when = burst
+        quest.freeze_bursts.remove(burst)
+        if owner == seat_index:
+            continue                                  # 不冻自己
+        other = (room.seats[owner]
+                 if 0 <= owner < len(room.seats) else None)
+        if (my_seat is not None and other is not None
+                and my_seat.team == other.team
+                and room.team_layout() == lobby_module.TEAM_LAYOUT_TEAMS):
+            continue                                  # 队伍号相同不冻
+        if math.hypot(bx - body.x, by - body.y) >= gameserver.FREEZER_RANGE:
+            continue
+        machine.frozen_until = now + gameserver.FROZEN_SECONDS
+        machine.log(f"   被冻住 @ ({bx:.0f}, {by:.0f})："
+                    f"{gameserver.FROZEN_SECONDS:g} 秒不能动")
+        # ★ 和胶水同一条路（§109）：不广播的话别人屏幕上 bot 照跑不误。
+        _broadcast_status(room, machine, seat_index,
+                          gameserver.STATUS_ITEM_FREEZED, "被冰冻")
+        caught = True
+    return caught
+
+
+def _in_smoke(room, x, y, now):
+    """`(x, y)` 这个点在不在还没散的烟雾里（D67）。"""
+    quest = room.quest
+    smokes = getattr(quest, "smokes", None) if quest is not None else None
+    if not smokes:
+        return False
+    for cloud in list(smokes):
+        cx, cy, until = cloud
+        if now >= until:
+            smokes.remove(cloud)
+            continue
+        if math.hypot(cx - x, cy - y) <= gameserver.SMOKE_RADIUS:
+            return True
+    return False
+
+
+def _speed_scale(machine, now):
+    """bot 这一帧的走速倍率（`Status.ini` 的 `SpeedRatio`）。
+
+    冻住的时候是 **0** —— `Freezed` 那一条没有 `SpeedRatio`，它是整个
+    「动不了」（`Status.ini` 第 12 条只有 `Time=2.0`）。
+    """
+    frozen = machine.frozen_until
+    if frozen is not None:
+        if now < frozen:
+            return 0.0
+        machine.frozen_until = None
+    until = machine.slowed_until
+    if until is None:
+        return 1.0
+    if now >= until:
+        machine.slowed_until = None
+        return 1.0
+    return gameserver.SLOWED_SPEED_RATIO
+
+
 def _battle_bodies(room, shooter_seat, group=None, include_self=False):
     """场上活着、位置已知的人：`[(座位号, x, y, 蹲着没有, 角色id)]`。
 
@@ -2013,6 +2327,11 @@ def _hostile_targets(room, seat_index):
             continue
         body = _seat_body(room, index)
         if body is None:
+            continue
+        # ★★ 烟雾里的人**挑不中**（D67）：别人放了烟，bot 还能隔着云精确
+        #    打到里面的人不合理。⚠ 这一条是我们定的，不是原版行为
+        #    —— 原版的烟就是一团纯视觉的云，挡的是真人的眼睛。
+        if _in_smoke(room, body[0], body[1], time.monotonic()):
             continue
         out.append((index, body[0], body[1], body[2]))
     return out
@@ -2296,7 +2615,8 @@ def _own_step(room, machine, seat_index, terrain, target, now):
         machine.move_at += ticks * botmove.TICK_MS / 1000.0
     before = machine.body
     machine.body = botmove.advance(terrain, before, who, ticks,
-                                   direction=direction, want_jump=want_jump)
+                                   direction=direction, want_jump=want_jump,
+                                   speed_scale=_speed_scale(machine, now))
     body = machine.body
     jumped = 1 if (want_jump and before.on_ground and not body.on_ground) else 0
     return (body.x, body.y, jumped, body.on_ground, body.vx, body.vy,
@@ -3150,22 +3470,68 @@ def _wrap_angle(angle):
 BOUNCE_RESTITUTION = 0.5
 
 
+#: ★★★★★ 撞了地形怎么办 —— **按弹体类分档**（V0.3 §111，★ 修正 §84）。
+#:
+#: `BulletObj::OnBlocked`（`0x47eda1`，虚表槽 `+0xa8`，由 `0x50d404` 在
+#: 「这一步走不动」时调）第一件事是把位置夹回命中结构里的接触点，
+#: 然后 `call [vft+0x160]` 拿一个 **0~4 的档位**分流（`0x47ee40` 那串 `dec eax`）：
+#:
+#: | 档 | 干什么 | 哪些类（虚表槽 `+0x160` 直接读出来的） |
+#: |---|---|---|
+#: | 0 | **当场炸**（`[vft+0x15c]` = `Projectile::OnHit`）| `BulletObj`（`0x47d487` 返回 0）、`FlameBomb`、★`SliceBullet`、`ThrowerFlame`、`ThrowerWater`、`TotemLauncher` |
+#: | 1 | **弹开** | `AppleGrenade`、`SeedBomb`、`TimeBomb`、`SoldierGrenade`、`RasTurret`（`0x4f167c` 返回 1）|
+#: | 2 | **看角度**：`2×|sx| ≤ sy` 就炸，否则弹开（`0x47eec1`~`0x47eede`）| `FlamingBottle`、`TrainingGrenade`（`0x51b052` 返回 2）|
+#: | 3 | **钉住**（速度清零，`0x47ee6d`）| `MineBomb`、`PlasmaCannon`、`SpiralKnife`（`0x48528f` 返回 3）|
+#: | 4 | 什么都不做，接着飞 | 没有武器用 |
+#:
+#: ★★ 这**推翻了 §84 的判据**（「有没有 `SliceTime`」）：
+#: `SliceBullet` 有引信却是 0 档（撞地就炸），`SoldierGrenade` / `TimeBomb`
+#: 没引信却会弹。§84 量出来的「苹果雷落空恒在 11~13 发心跳炸」仍然成立
+#: —— 那是引信的效果，不是「会不会弹」的判据。
+#: ★ 火焰弹（`FlamingBottle`）落空分布很散那条也对上了：它是 2 档，
+#: 平地上 `sx≈0` ⇒ 炸；撞陡壁才弹。
+#:
+#: `weapon.ini` 里认不出来的 `CreatingClass`（`Grenade` / `Flame` 这些工厂里
+#: 没有的名字）会退回基类 `BulletObj` —— 实机验过：`ch00-02a`
+#: （`CreatingClass=Grenade`）的弹体虚表就是 `0x66D004` = `BulletObj`。
+#: ⇒ 表里查不到的一律 **0 档**。
+BLOCKED_EXPLODE = 0
+BLOCKED_BOUNCE = 1
+BLOCKED_BOUNCE_IF_STEEP = 2
+BLOCKED_STICK = 3
+
+BLOCKED_MODE_BY_CLASS = {
+    "AppleGrenade": BLOCKED_BOUNCE,
+    "SeedBomb": BLOCKED_BOUNCE,
+    "TimeBomb": BLOCKED_BOUNCE,
+    "SoldierGrenade": BLOCKED_BOUNCE,
+    "RasTurret": BLOCKED_BOUNCE,
+    "FlamingBottle": BLOCKED_BOUNCE_IF_STEEP,
+    "TrainingGrenade": BLOCKED_BOUNCE_IF_STEEP,
+    "MineBomb": BLOCKED_STICK,
+    "PlasmaCannon": BLOCKED_STICK,
+    "SpiralKnife": BLOCKED_STICK,
+    # ⚠ 这三个的档位是**每颗弹体自己带的**（`[this+0x350]` / `[this+0x344]` /
+    #   `[this+0x33c]`，构造时从武器定义里读），不是常量。武器表里现在
+    #   一把都没用到它们，真用上了再逆那三格。
+    #   "BounceBullet" / "BoundBall" / "BowlingBullet"
+}
+
+
+def _blocked_mode(weapon):
+    """这把武器的弹体撞了地形走哪一档（§111）。认不出来的按 0（当场炸）。"""
+    return BLOCKED_MODE_BY_CLASS.get(
+        getattr(weapon, "creating_class", None), BLOCKED_EXPLODE)
+
+
 def _bounces_off_terrain(weapon):
-    """这把武器的弹体撞了地形是**弹开**还是**当场炸**（§84）。
+    """这把武器的弹体撞了地形**不会当场炸**吗（§111）。
 
-    判据是**有没有引信**（`SliceTime`）：有引信的弹体（`AppleGrenade` /
-    `SeedBomb` / `SliceBullet`）到期在每一台机器上自爆（§72），地形拦不住
-    它 —— 语料 2353 发苹果雷里「没打中角色」的那些**爆炸时刻死死压在
-    11~13 发心跳上**（p50 = 12 ≈ `SliceTime` 1500 ms / 128 ms），
-    要是撞地就炸，这个分布该是散开的。
-
-    用户 2026-08-28：「真人对局时，苹果弹直接扔到地上会弹跳，
-    过一会儿之后才会炸开。」
-
-    ★ 反过来，火焰弹（`FlamingBottle`，没有 `SliceTime`）语料里落空的
-    p50 只有 6 发心跳、分布很散 —— 那就是「撞上什么就炸在那儿」。
+    「弹开」「钉住」「接着飞」都算 —— 判据是「这一发**没结束**」。
+    2 档（火焰弹那种「看角度」）在这里算 True，真正炸不炸由
+    `_resolve_terrain_block()` 拿到法线之后再定。
     """
-    return bool(weapon.fuse_ticks)
+    return _blocked_mode(weapon) != BLOCKED_EXPLODE
 
 
 def _shell_velocity(shell):
@@ -3181,54 +3547,142 @@ def _shell_velocity(shell):
             speed * math.sin(shell.shot.angle) + shell.shot.gravity * shell.ticks)
 
 
-#: 量地形法线时往外看多远 —— 弹体半径的**两倍**（§88）。
+#: ★★★★★ 量地形朝向时那个窗口有多大 —— **原版是 7×7**（V0.3 §110）。
 #:
-#: ★ 这是个**拟合值**，不是逆出来的：原版怎么算法线还没读出来，
-#: 只能拿实机的 57 次反弹（客户端逐帧日志，Forest_b）反推每一次的法线，
-#: 再看哪个采样半径最贴。出射方向的中位误差：
+#: `0x473b36(世界, x, y)` 整个函数就这么几句（`0x473b43` 起 `push -3; pop ebx`，
+#: 两层循环 `0x473b86` / `0x473b8f` 都是 `cmp …, 3; jle`）：
 #:
-#:     半径  9（= Size+1，会话 25 用的）  17.1°   ★ 还有 27 次根本量不出法线
-#:     半径 12                            10.2°
-#:     半径 16（= Size×2）                10.4°   p75 15.4°  p90 23.5°
-#:     半径 20                            10.8°
+#:     sx = sy = 0
+#:     for dy in -3..3:
+#:         for dx in -3..3:
+#:             if 格子(x+dx, y+dy) 非空:            ← 0x473969，返回格子类型
+#:                 sx += dx ; sy += dy
+#:     return (sx, sy)
 #:
-#: 12~20 之间是平的，取 `Size × 2` 只是因为它是个跟着武器走的比例，
-#: 不是又一个魔数。⚠ 残差写在 §88 里，别把它当成对的。
-BOUNCE_NORMAL_REACH = 2.0
+#: 得到的是一个**指向实心那一侧**的矢量（没有归一化，也没有按距离加权 ——
+#: 会话 25 那版「每格投一票单位矢量」猜错的正是这两点）。
+#:
+#: ★ 判据是「格子非空」（`test al,al; je`），**单向平台也算**（值 1）——
+#: 所以这里用 `is_solid()` 而不是 `blocks_bullet()`。
+TERRAIN_VOTE_WINDOW = 3
+
+#: 反弹的两个系数，都是 `0x47c7a4: fld [0x69371c]` = **0.5**（V0.3 §110）：
+#: 法向 `× −[vft+0x94]`、切向 `× (1 − [vft+0x98])`。两个都是 0.5 ⇒ 速度正好对折，
+#: 和 §84 量到的「撞上之后 |v| 恰好减半」对得上。
+BOUNCE_RESTITUTION = 0.5
+BOUNCE_FRICTION = 0.5
 
 
-def _terrain_normal(terrain, x, y, radius):
-    """`(x, y)` 附近那片地形的法线（指向弹体这一侧），量不出来返回 `None`。
+def _terrain_facing(terrain, x, y):
+    """`(x, y)` 那一片地形**朝哪边**：原版 `0x473b36` 的 7×7 投票（§110）。
 
-    做法：把 `BOUNCE_NORMAL_REACH × radius` 之内所有挡子弹的格子拿出来，
-    每个格子投一票「从它指向圆心」的单位矢量，加起来再归一化。
-    竖直的墙 / 水平的地面正好得到 `(±1, 0)` / `(0, ±1)`；斜坡得到坡的法线。
+    返回 `(sx, sy)`，**指向实心那一侧**（不是法线，法线是它的反向）；
+    量不出朝向就返回 `None` —— 两种情况：一格实心的都没有（悬在空中），
+    或者**整片都是实心**（采样点埋进地形里，49 票正负对消）。后者是采样点
+    选错了的信号，调用方该换一个点再问一次。
 
     ★ 图顶上面（`y < 0`）和 `_disc_blocked()` 一个口径，不算实心（§83）。
-
-    ⚠ **近似**（§88）：原版怎么算法线没逆出来。能对死的只有图边那一类
-    竖直面 —— 客户端实测的三发（例如 `v=(-26.76, -0.45)` → `(13.38, -0.23)`）
-    正好是「x 取反、y 不动」，这个模型给的就是它；斜坡上中位差 10°。
     """
-    cx, cy = int(x), int(y)
-    nx = ny = 0.0
-    for ox, oy in _disc_offsets(max(1.0, radius) * BOUNCE_NORMAL_REACH):
-        yy = cy + oy
-        if yy < 0 or not terrain.blocks_bullet(cx + ox, yy):
+    cx, cy = int(round(x)), int(round(y))
+    sx = sy = 0.0
+    n = TERRAIN_VOTE_WINDOW
+    for dy in range(-n, n + 1):
+        yy = cy + dy
+        if yy < 0:
             continue
-        span = math.hypot(ox, oy)
-        if span <= 0.0:
-            continue
-        nx -= ox / span
-        ny -= oy / span
-    span = math.hypot(nx, ny)
-    if span <= 1e-6:
+        for dx in range(-n, n + 1):
+            if not terrain.is_solid(cx + dx, yy):
+                continue
+            sx += dx
+            sy += dy
+    if abs(sx) < 1e-6 and abs(sy) < 1e-6:
         return None
-    return (nx / span, ny / span)
+    return (sx, sy)
 
 
-def _bounce_shell(shell, terrain, ax, ay, bx, by, free_t):
-    """弹体撞地形之后**弹开**（§84）：夹回撞上之前那一点、反射、速度减半。
+def _reflect_velocity(vx, vy, facing):
+    """把速度按地形朝向反射一次 —— 原版 `0x50f240` 那 12 句（§110）。
+
+    ```
+    θ  = atan2(sx, sy)              ← ★ 参数是 (x, y)，不是常见的 (y, x)
+    u  =  cosθ·vx − sinθ·vy         ← 转进「以坡面为轴」的坐标系
+    w  =  sinθ·vx + cosθ·vy
+    u *= 1 − 摩擦(0.5)              ← 切向
+    w *= −弹性(0.5)                 ← 法向取反
+    转回来（角度 −θ）
+    ```
+
+    平地（`sx=0, sy>0` ⇒ `θ=0`）算出来正好是 `(0.5·vx, −0.5·vy)`；
+    右侧竖直墙（`sy=0, sx>0` ⇒ `θ=π/2`）是 `(−0.5·vx, 0.5·vy)`
+    —— §84 实测的 `v=(22.28, 12.50) → (−11.14, 6.25)` 一位不差。
+    """
+    theta = math.atan2(facing[0], facing[1])
+    c, s = math.cos(theta), math.sin(theta)
+    u = c * vx - s * vy
+    w = s * vx + c * vy
+    u *= 1.0 - BOUNCE_FRICTION
+    w *= -BOUNCE_RESTITUTION
+    # 逆旋转（cos(−θ)=c、sin(−θ)=−s）
+    return (c * u + s * w, -s * u + c * w)
+
+
+#: 找「挡住这一发的那一格」时最远往外看多少格。
+#:
+#: 圆心停在离面一个 `Size` 的地方（§83，抛射弹 8、直射弹 4），
+#: 再宽一点兜住采样和取整的零头就够。
+BLOCK_CELL_REACH = 14
+
+
+def _nearest_solid(terrain, x, y, reach=BLOCK_CELL_REACH):
+    """离 `(x, y)` 最近的那一格实心地形；`reach` 之内没有就返回 `None`。"""
+    cx, cy = int(round(x)), int(round(y))
+    best = None
+    for oy in range(-reach, reach + 1):
+        yy = cy + oy
+        if yy < 0:
+            continue
+        for ox in range(-reach, reach + 1):
+            if not terrain.is_solid(cx + ox, yy):
+                continue
+            span = ox * ox + oy * oy
+            if best is None or span < best[0]:
+                best = (span, cx + ox, yy)
+    return None if best is None else (best[1], best[2])
+
+
+def _block_facing(shell, terrain, ax, ay, bx, by, ground_t):
+    """撞上的那一刻，地形朝哪边（§110）。量不出来返回 `None`。
+
+    ★★ **采样点是挡住它的那一格地形，不是弹体圆心**（§110 末尾那张表）。
+    原版 `0x50effb` 把命中结构的 `+4/+8` 先 `0x5f895c` 取整再交给
+    `0x473b36` —— 那两格装的就是**格子坐标**。拿圆心去投票不行：
+    `_terrain_contact()` 停下的地方离面还有一个 `Size`（§83），
+    7×7 窗口根本够不着（55 次实测里 14 次一格实心都采不到）；
+    拿这一步的**终点**也不行 —— 那个点常常整片埋在地形里，49 票正负对消。
+
+    Iceria_b 那 55 次真实反弹（客户端逐帧日志）上，三种采样点的出射方向误差：
+
+    | 采样点 | 中位 | p75 | p90 | 量不出 |
+    |---|---|---|---|---|
+    | 圆心（n=3）| —— | —— | —— | **55/55** |
+    | 圆心 + `Size`·v̂（n=3）| 9.5° | 19.9° | 49.9° | 14 |
+    | **挡住它的那一格（n=3）** | **1.2°** | **5.4°** | **9.5°** | **0** |
+
+    而且窗口大小在 n=3 取到最好（n=2 → 3.1°，n=4 → 2.4°，n=6 → 4.4°）——
+    和 `0x473b36` 里那两句 `cmp …, 3; jle` **独立地对上了**。
+    """
+    px = ax + (bx - ax) * ground_t
+    py = ay + (by - ay) * ground_t
+    cell = _nearest_solid(terrain, px, py)
+    if cell is None:
+        cell = _nearest_solid(terrain, bx, by)
+    if cell is None:
+        return None
+    return _terrain_facing(terrain, cell[0], cell[1])
+
+
+def _bounce_shell(shell, terrain, ax, ay, bx, by, ground_t, free_t):
+    """弹体撞地形之后**弹开**（§84 / §110）：夹回撞上之前那一点，再反射。
 
     夹回去这一步不能省：贴在地形里的话下一 tick 一开头又撞上，
     速度一路对折，弹体原地卡死（§76 里客户端那个「速度每帧对折、
@@ -3237,19 +3691,40 @@ def _bounce_shell(shell, terrain, ax, ay, bx, by, free_t):
     px = ax + (bx - ax) * free_t
     py = ay + (by - ay) * free_t
     vx, vy = _shell_velocity(shell)
-    normal = _terrain_normal(terrain, ax + (bx - ax), ay + (by - ay),
-                             shell.weapon.size)
-    if normal is None:
-        normal = _terrain_normal(terrain, px, py, shell.weapon.size)
-    if normal is not None:
-        dot = vx * normal[0] + vy * normal[1]
-        if dot < 0.0:              # 只有迎着面撞上去才反射
-            vx -= 2.0 * dot * normal[0]
-            vy -= 2.0 * dot * normal[1]
-    shell.vx = vx * BOUNCE_RESTITUTION
-    shell.vy = vy * BOUNCE_RESTITUTION
+    facing = _block_facing(shell, terrain, ax, ay, bx, by, ground_t)
+    if facing is None:
+        # 一格实心都采不到（图外 / 数据缺）—— 只减半，方向不动。
+        shell.vx, shell.vy = vx * BOUNCE_RESTITUTION, vy * BOUNCE_RESTITUTION
+    else:
+        shell.vx, shell.vy = _reflect_velocity(vx, vy, facing)
     shell.x, shell.y = px, py
     shell.bounced = True
+
+
+def _resolve_terrain_block(shell, terrain, ax, ay, bx, by, ground_t, free_t):
+    """撞地形之后按档位收口（§111）。**这一发还活着**就返回 `True`。
+
+    2 档（`FlamingBottle` / `TrainingGrenade`）那道门抄的是 `0x47eec1`：
+    拿 `0x473b36` 的 `(sx, sy)`，`2×|sx| ≤ sy` 就当场炸，否则弹开。
+    平地上 `sx ≈ 0`、`sy > 0` ⇒ 炸；撞陡壁 / 天花板才弹。
+    """
+    mode = _blocked_mode(shell.weapon)
+    if mode == BLOCKED_EXPLODE:
+        return False
+    if mode == BLOCKED_BOUNCE_IF_STEEP:
+        facing = _block_facing(shell, terrain, ax, ay, bx, by, ground_t)
+        if facing is None or 2.0 * abs(facing[0]) <= facing[1]:
+            return False
+    if mode == BLOCKED_STICK:
+        # `0x47ee6d`：速度清零、位置夹回接触点。下一 tick 重力又把它按回
+        # 地形里，再清一次 —— 效果就是钉在那儿等引信 / 寿命。
+        shell.x = ax + (bx - ax) * free_t
+        shell.y = ay + (by - ay) * free_t
+        shell.vx = shell.vy = 0.0
+        shell.bounced = True
+        return True
+    _bounce_shell(shell, terrain, ax, ay, bx, by, ground_t, free_t)
+    return True
 
 
 def _shell_step(room, shell, terrain, bodies):
@@ -3284,17 +3759,99 @@ def _shell_step(room, shell, terrain, bodies):
             best = (seat_index, region)
     ground_t, free_t = _terrain_contact(terrain, ax, ay, bx, by, radius)
     if ground_t is not None and (best_t is None or ground_t < best_t):
-        if _bounces_off_terrain(shell.weapon):
-            _bounce_shell(shell, terrain, ax, ay, bx, by, free_t)
+        if _resolve_terrain_block(shell, terrain, ax, ay, bx, by,
+                                  ground_t, free_t):
             return None
         best_t = ground_t
         best = (None, None)
     shell.x, shell.y = bx, by
     if best is None:
+        _jump_pad_shell(shell, terrain)
         return None
     point = (ax + (bx - ax) * best_t, ay + (by - ay) * best_t)
     shell.x, shell.y = point
     return (point, best[0], best[1])
+
+
+def _jump_pad_shell(shell, terrain):
+    """弹跳台把**弹体**也弹起来（V0.3 §103）。弹了返回 `True`。
+
+    ## 这是原版行为，不是猜的
+
+    用户 2026-08-29：「手雷会在弹跳台上弹跳，这是这个游戏的特色；在垂直的
+    弹跳台上不停扔手雷可以封路。」—— `JumpingObj::Tick`（`0x510d05`）里
+    确实有**第二条分支**（`0x510fb4`），对同一个对象再做两次 `dynamic_cast`：
+
+        0x510fb9  目标 0x6e06ac = .?AVMobObject@@     ← 怪
+        0x510fcb  目标 0x6dff90 = .?AVBulletObj@@     ← ★ **弹体**
+        两个有一个成就继续；再 0x50f410 判碰撞
+
+    弹体这一档和角色那一档共用同一个解算器 `0x5111ca`，唯一的差别是
+    **没有** `− 0.25 × 重力` 那一项（`0x510e68` 只在角色分支里）：
+
+        tx = 台dx + (台x − 弹x)
+        ty = 台dy + (台y − 弹y)
+        vy = −sqrt(2 × g × |ty|) ; vx = tx / (|vy| / g)
+
+    ## 实机逐帧对死了
+
+    2026-08-29 那一局 `Iceria_b`，真人的手雷句柄 **100048**：
+    第 5 帧还是 `v = (22.66, 33.34)`（往右下砸），第 6 帧位置
+    `(771.30, 877.91)`、速度**突变成 `(2.43, −30.43)`**（直冲上天）。
+    把第 6 帧的位置代进上面三行 ⇒ `(2.43, −30.43)`，**一位不差**。
+    句柄 100058 同样对上。
+
+    ## 判定是**扫掠**的，不是「此刻在不在圈里」
+
+    `0x50f410` 把两边的**速度**（`[obj+0x120]`）一起传给 `0x50c758`，
+    做的是「这一步扫过去的那一段」相交。句柄 100048 触发那一刻，弹体圆心
+    离台心还有 **36.5**（比 20 + 8 大），但它这一步要扫到 `(793.96, 912.21)`
+    —— 那条线离台心只有 **0.7**。不按扫掠算的话这一发根本判不出来。
+
+    ## ★★★ 只有「撞地形不当场炸」的那几类会被弹（§112，用户 2026-08-29 报的）
+
+    静态分析看不出过滤（19 个弹体类的 RTTI 基类链全含 `BulletObj`，
+    `0x50f410` 那道 `test [shape+0xc], mask` 传的 mask 恒 0），
+    **但客户端逐帧日志说得很清楚**（`Iceria_b`，两台的 `PROJ.` 探针）：
+
+    | 弹体类 | 扫过台子（半径 20+Size）几次 | 被弹起几次 |
+    |---|---|---|
+    | `BulletObj`（`ch00-01` / `ch00-02a` / **`ch02-02`**）| **17** | **0** |
+    | `AppleGrenade`（`ch00-02`）| 多次 | 每次都弹 |
+
+    `ch02-02` 那几发（13:55:34 / 13:55:38）**扫到离台心 10~17 就到此为止**
+    —— 客户端把它当地形撞掉了；13:55:40 那一发干脆从台子正上方穿过去、
+    弹道一点没变。用户报的正是这个：「炮弹飞到弹跳台后就消失了，
+    过一会儿在弹跳台弹跳后的上方位置出现爆炸动画」—— 消失的是客户端那颗
+    （撞地形炸了），后来那个爆炸是服务端这颗被台子弹上天之后才炸的。
+
+    ⇒ 服务端按同一条线收口：**`_bounces_off_terrain()` 为假的一律不弹**。
+    （机制上最可能的原因是这类弹体压根没往 `[obj+0x140]` 挂碰撞形状，
+    于是 `0x50f410` 的内层循环一次都不跑 —— 那一步还没证实，
+    但「弹不弹」这条线是实测出来的。）
+    """
+    pads = getattr(terrain, "jump_pads", ()) if terrain is not None else ()
+    if not pads:
+        return False
+    if not _bounces_off_terrain(shell.weapon):
+        return False
+    vx, vy = _shell_velocity(shell)
+    reach = botmove.JUMP_PAD_RADIUS + shell.weapon.size
+    for px, py, dx, dy in pads:
+        if _segment_circle_t(shell.x, shell.y, shell.x + vx, shell.y + vy,
+                             px, py, reach) is None:
+            continue
+        ty = dy + (py - shell.y)
+        if ty >= 0.0:
+            continue
+        launch_y = -math.sqrt(2.0 * botmove.GRAVITY * abs(ty))
+        ticks = abs(launch_y) / botmove.GRAVITY
+        launch_x = (dx + (px - shell.x)) / ticks if ticks else 0.0
+        shell.vx, shell.vy = launch_x, launch_y
+        # ★ 弹过之后闭式解不作数了 —— 和撞地形弹开走同一条积分路（§84）。
+        shell.bounced = True
+        return True
+    return False
 
 
 #: ★★ **角色在溅射判定里的半径**：所有角色都是 **35**，写死在
@@ -4366,6 +4923,12 @@ def _tick_bot(room, machine, seat_index):
         machine.crouched = False
         # ★ 手指也松开：躺着的时候鼠标按下去没有任何意义（§73）。
         machine.charge_at = None
+        # ★ 捡来的枪也丢掉：真人死了重生就换回自己那把（§223 的 `GiveWeapon`
+        #   是「换成这把」，重生时 `Character::Reset` 把武器恢复成角色本来的）。
+        machine.item_weapon = None
+        # ★ 减速 / 冰冻也一样：死一次身上的状态就清了（`Character::Reset`）。
+        machine.slowed_until = None
+        machine.frozen_until = None
         return
 
     leader = _follow_target(room, machine)
@@ -4374,6 +4937,16 @@ def _tick_bot(room, machine, seat_index):
         # 这时候一发都不发：与其把 bot 摆到一个可能在地形里 / 图外的点上，
         # 不如让客户端按自己加载出来的出生点继续画着（D16）。
         return
+    # ★★ 道具（V0.3 §100）：踩到就捡、捡到就用。放在「有没有新位置点」
+    #    那道闸**前面** —— 「踩到了没有」是**位置**决定的事实，和真人这一发
+    #    是不是新位置点无关。非道具模式下 `items_at` 恒空，等于没开销。
+    if _item_pickups(room, machine, seat_index):
+        _use_held_item(room, machine, seat_index)
+    # ★ 别人的道具：减速胶水踩上去要真的慢（§101/§105）、
+    #   冰冻圈里要真的动不了（§106）。
+    _step_on_slow_mine(room, machine, seat_index, now)
+    _take_freeze(room, machine, seat_index, now)
+
     mark = (room.seat_index_of(leader), leader.sync_trail_seq)
     if mark == machine.last_trail_mark:
         # 这一发不是位置心跳（开火 / 爆炸 / AI 消息也走同一条转发路），

@@ -65,7 +65,18 @@ DIR_TYPE = {"TERRAIN": 200, "LAYER": 202, "COVER": 201,
             "EFFECT": 209, "BREAKABLE": 203}
 
 #: 产物格式版本。改了布局就 +1，`server/mapdata.py` 会拒绝不认识的版本。
-FORMAT = 1
+#:
+#: 2：加了 `jump`（弹跳台，V0.3 §99）。
+FORMAT = 2
+
+#: ★★★ **弹跳台**（`Maps/!Basic/210-JumpingObj.png`，客户端类 `JumpingObj`，
+#: `GetType` = `0x510a52: mov eax,0xd2; ret`）。全 174 张图里共 189 个。
+JUMP_PAD_TYPE = 210
+
+#: 弹跳台自己那两个字段：**落点相对台子的偏移** `(dx, dy)`，两个 float，
+#: 躺在对象 blob 的最后 8 个字节里（ver 8 / 13 / 15 / 16 / 18 都一样）。
+#: 客户端构造函数 `0x510a8e` 的默认值是 `(0, -40)`，但地图里 189 个全都带了值。
+JUMP_PAD_DEFAULT = (0.0, -40.0)
 
 
 class MapFormatError(Exception):
@@ -189,7 +200,8 @@ def parse_map(path):
             if ver >= 13:
                 otype = r.i32()
                 r.i32()
-                obj, _left = _read_obj_blob(r.raw(r.i32()), ver)
+                blob = r.raw(r.i32())
+                obj, left = _read_obj_blob(blob, ver)
                 obj["type"] = otype
             else:
                 r.i32()
@@ -199,9 +211,13 @@ def parse_map(path):
                     r.i32()
                 pos = [r.f32() for _ in range(7)]
                 tex = r.wstr()
-                _read_obj_blob(r.raw(r.i32()), ver)
+                blob = r.raw(r.i32())
+                _unused, left = _read_obj_blob(blob, ver)
                 obj = {"type": _type_from_path(tex), "path": tex,
                        "x": pos[0], "y": pos[1]}
+            # ★ 每类对象自己那几个字段就躺在 blob 的**尾巴**上（基类解完之后
+            #   剩下的）。弹跳台（210）用的是最后两个 float，见 `JUMP_PAD_TYPE`。
+            obj["tail"] = blob[len(blob) - left:] if left else b""
             objects.append(obj)
     terrain = _read_terrain_data(r)
     # 尾部还有一张「贴图路径 -> 该精灵的掩码」的表，破坏物碎掉时拿它抠格子用。
@@ -280,12 +296,21 @@ def build_record(name, ver, width, height, objects, terrain):
     if height > 0xFFFF or (counts and max(counts) > 0xFFFF):
         raise MapFormatError("%s 的站立面超出 uint16 能表达的范围" % name)
     points = collections.OrderedDict()
+    pads = []
     for obj in objects:
         otype = obj.get("type", 0)
         if otype in DECOR_TYPES or not otype or "x" not in obj:
             continue
         points.setdefault(str(otype), []).append(
             [int(obj["x"]), int(obj["y"])])
+        if otype == JUMP_PAD_TYPE:
+            tail = obj.get("tail") or b""
+            if len(tail) >= 8:
+                dx, dy = struct.unpack_from("<ff", tail, len(tail) - 8)
+            else:
+                dx, dy = JUMP_PAD_DEFAULT
+            pads.append([int(obj["x"]), int(obj["y"]),
+                         round(float(dx), 3), round(float(dy), 3)])
     return collections.OrderedDict((
         ("format", FORMAT),
         ("name", name),
@@ -297,6 +322,8 @@ def build_record(name, ver, width, height, objects, terrain):
         ("ground_counts", _blob(struct.pack("<%dH" % width, *counts))),
         ("ground_ys", _blob(struct.pack("<%dH" % len(ys), *ys))),
         ("points", points),
+        # ★ 弹跳台：`[台x, 台y, 落点dx, 落点dy]`（V0.3 §99）。
+        ("jump", pads),
     ))
 
 

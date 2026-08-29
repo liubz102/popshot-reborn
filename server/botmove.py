@@ -39,6 +39,8 @@
 """
 from __future__ import annotations
 
+import math
+
 import ballistics
 
 #: 逻辑步长（毫秒）—— 人和子弹用的是同一套（§47）。
@@ -66,6 +68,18 @@ CLIMB_SLOPE = 2.0
 #: 一发心跳等于几个 tick。语料：腾空段相邻两发的 `dx` 恒等于 `4 × vx`。
 #: ★ 只在「没有真实时间可依据」的地方当兜底用（`bot.py` 按流逝时间算）。
 TICKS_PER_BEAT = 4
+
+#: ★★★ **弹跳台**的作用半径（V0.3 §99）。
+#:
+#: `JumpingObj` 构造函数 `0x510ade` 把碰撞形状的半径写成 **20.0**
+#: （`[obj+0x13c]` 的 `+0x18`），判定是它和**角色的碰撞圆**相交
+#: （`0x50f410`，和子弹撞人是同一个函数）。角色最下面那个圆（腿）半径 12，
+#: 所以水平方向大约 32 个单位以内会被弹 —— 实机 12 次弹飞的水平距离
+#: 全部 ≤ 29.7，最近的一次「没被弹」是 51.5，和这个口径对得上。
+JUMP_PAD_RADIUS = 20.0
+
+#: ★ 台子给的目标点还要再减这一项：`0x510e75` 把**角色重力**乘上它。
+JUMP_PAD_GRAVITY_BIAS = 0.25
 
 
 class Body(object):
@@ -98,22 +112,81 @@ class Body(object):
                    "地上" if self.on_ground else "空中"))
 
 
-def walk_speed(character, fast_run=False, crouched=False):
+def walk_speed(character, fast_run=False, crouched=False, scale=1.0):
     """一个 tick 走多远（世界单位）。
 
     `ChrSpeed × 倍率`，倍率来自那两个开关（都是原版常量，见文件头）。
+
+    ★ `scale` 是**状态效果**那一档（`Status.ini` 的 `SpeedRatio`）：
+    减速胶水踩上去是 0.3、加速道具是 2.0。原版是 `UseItemEffect` 把它加进
+    角色的属性表，走路那一句再乘上去；服务端这边只能自己乘（V0.3 §101）。
     """
     speed = float(getattr(character, "speed", 7.0) or 7.0)
     if fast_run:
         speed *= FAST_RUN_RATE
     if crouched:
         speed *= CROUCH_FACTOR
-    return speed
+    return speed * float(scale)
 
 
 def jump_apex():
     """一次跳最高能上升多少（`v² / 2g`）。语料量到的中位是 170。"""
     return JUMP_SPEED * JUMP_SPEED / (2.0 * GRAVITY)
+
+
+def jump_pad_launch(terrain, body, character):
+    """踩在弹跳台上就把人弹出去（V0.3 §99）；没踩着返回 `None`。
+
+    ## 原版怎么做的（`JumpingObj::Tick`，`0x510d05`）
+
+    台子**自己**每帧扫一遍场上的角色，对每一个：
+
+        cmp byte [char+0x128], 0 ; je 跳过      ← ★ 必须**踩在地上**
+        call 0x50f410（台子 vs 角色的碰撞圆）    ← 半径 20 vs 角色那三个圆
+        tx = 台dx + (台x − 人x)                 ← 0x510e5e
+        ty = 台dy + (台y − 人y) − 0.25×角色重力  ← 0x510e68
+        (vx, vy) = 0x5111ca(tx, ty)             ← 解抛物线
+        [char+0x120] = vx ; [char+0x124] = vy
+        [台+0x2a4] = 20                          ← 只是压缩动画的计时
+
+    `0x5111ca` 就三行：
+
+        vy = −sqrt(2 × g × |ty|)     ← 升到 |ty| 那么高要多大初速
+        t  = |vy| / g                ← 到顶点要几个 tick
+        vx = tx / t                  ← 这段时间正好横移 tx
+
+    **没有冷却**：弹完角色就离地，下一帧 `[char+0x128]` 已经是 0，
+    自然不会连着弹第二下。
+
+    ## 台子那两个数是**落点偏移**，不是速度
+
+    `Iceria_b` 的两个台子分别是 `(41, −416)` 和 `(−24, −395)`。
+    实机验：真人站在 `(1742, 904)`、台子 `(1743, 895)` ⇒
+    `ty = −395 − 9 − 0.3 = −404.3` ⇒ `vy = −31.15`，
+    心跳里报出来的正是 **−31**；`vx = −23 / 25.96 = −0.89`，报的是 **0**。
+    另一个台子同样对得上（预测 −31.9 / 实测 −29，差的是采样滞后的 2 个 tick）。
+    """
+    if terrain is None or not body.on_ground:
+        return None
+    pads = getattr(terrain, "jump_pads", ())
+    if not pads:
+        return None
+    # ★ 角色那三个圆里最下面那个（腿）是唯一够得着台子的 —— 台子贴着地面。
+    #   （和 `walk_speed()` 一样对「只给了走速的假角色」留一条兜底。）
+    legs = float(getattr(character, "size_legs", 12.0) or 12.0)
+    for px, py, dx, dy in pads:
+        span = math.hypot(px - body.x, py - (body.y - legs))
+        if span > JUMP_PAD_RADIUS + legs:
+            continue
+        tx = dx + (px - body.x)
+        ty = dy + (py - body.y) - JUMP_PAD_GRAVITY_BIAS * GRAVITY
+        if ty >= 0.0:
+            continue                  # 台子往下弹？原版没有这种数据，跳过
+        vy = -math.sqrt(2.0 * GRAVITY * abs(ty))
+        ticks = abs(vy) / GRAVITY
+        vx = tx / ticks if ticks else 0.0
+        return body.moved(body.x, body.y, vx, vy, on_ground=False)
+    return None
 
 
 def jump(body, vx=0.0):
@@ -161,11 +234,12 @@ def surface_near(terrain, x, y, reach):
     return best
 
 
-def _walk_tick(terrain, body, character, direction, fast_run, crouched):
+def _walk_tick(terrain, body, character, direction, fast_run, crouched,
+               scale=1.0):
     """踩在地上走一个 tick。"""
     if not direction:
         return body
-    speed = walk_speed(character, fast_run, crouched)
+    speed = walk_speed(character, fast_run, crouched, scale)
     nx = body.x + (speed if direction > 0 else -speed)
     reach = speed * CLIMB_SLOPE
     sy = surface_near(terrain, nx, body.y, reach)
@@ -256,7 +330,7 @@ def _air_tick(terrain, body):
 
 
 def tick(terrain, body, character, direction=0, fast_run=False,
-         crouched=False, want_jump=False):
+         crouched=False, want_jump=False, speed_scale=1.0):
     """走一个 tick（32 ms），返回**新的** `Body`。
 
     `direction`：−1 左 / 0 不按 / +1 右，就是心跳里那个方向键掩码（§39）。
@@ -267,7 +341,7 @@ def tick(terrain, body, character, direction=0, fast_run=False,
         return body
     if body.on_ground and want_jump:
         # ★ 起跳带走**这一刻的走速**：腾空之后就再也改不了了（§93）。
-        speed = walk_speed(character, fast_run, crouched)
+        speed = walk_speed(character, fast_run, crouched, speed_scale)
         if direction > 0:
             body = jump(body, speed)
         elif direction < 0:
@@ -275,18 +349,23 @@ def tick(terrain, body, character, direction=0, fast_run=False,
         else:
             body = jump(body)               # 站着起跳 —— 竖直上下
     if body.on_ground:
-        return _walk_tick(terrain, body, character, direction,
-                          fast_run, crouched)
+        body = _walk_tick(terrain, body, character, direction,
+                          fast_run, crouched, speed_scale)
+        # ★★★ 弹跳台（§99）：台子每帧扫一遍**踩在地上**的角色，够得着就把人
+        #   弹出去。排在走路**之后** —— 实机那一发心跳里人是「又走了一步、
+        #   同时被弹起来」的（`(1742,904) -> (1721,905) v=(0,−31)`）。
+        launched = jump_pad_launch(terrain, body, character)
+        return body if launched is None else launched
     return _air_tick(terrain, body)
 
 
 def advance(terrain, body, character, ticks, direction=0, fast_run=False,
-            crouched=False, want_jump=False):
+            crouched=False, want_jump=False, speed_scale=1.0):
     """连走 `ticks` 个 tick。起跳只在第一个 tick 上生效。"""
     for i in range(max(0, int(ticks))):
         body = tick(terrain, body, character, direction=direction,
                     fast_run=fast_run, crouched=crouched,
-                    want_jump=want_jump and i == 0)
+                    want_jump=want_jump and i == 0, speed_scale=speed_scale)
     return body
 
 

@@ -2603,6 +2603,105 @@ static __declspec(naked) void proj_fire_detour(void)
     }
 }
 
+/* ========================================================================== */
+/* ★★★ 诊断：`Projectile::Move` 的**调用方**是谁（V0.3 §102 / §104）          */
+/*                                                                            */
+/*   要查的是「弹体撞地形之后的反弹法线」怎么算的。静态分析追到：              */
+/*                                                                            */
+/*     Move  0x47f603  ── [vft+0x16c] 0x47feab「挡住没」                       */
+/*                        └─ [vft+0x168] 0x47f738 扫掠地形                    */
+/*                             ↑ 它返回的命中结构里**没有法线**               */
+/*                                                                            */
+/*   ⇒ 反射一定是 Move 的调用方算的。可 `call [reg+0x158]`（Move 的虚表槽）    */
+/*   在整个 exe 里**只有 6 个点，全是 lua_tinker 的绑定桩** —— 真正驱动飞行的  */
+/*   那一层静态找不到。                                                       */
+/*                                                                            */
+/*   所以直接问运行时：在 Move 入口把**返回地址**打出来。按返回地址去重，      */
+/*   所以刷不了屏（真正的调用点就那么几个）。                                  */
+/*                                                                            */
+/*   ★ 顺带把这一发的速度和「这一步走不走得了」一起打 —— 反弹发生的那一        */
+/*     tick，速度会在**同一个调用方**里被改写，两行一对比就锁死了。            */
+/*                                                                            */
+/*   ★ 这是**临时诊断**，查明反弹法线之后连同 detour 一起删。                  */
+/*     `BSHOOK_MOVE_DIAG=0` 可以关掉（默认开）。                               */
+/* ========================================================================== */
+#define PROJ_MOVE_VA  0x0047F603u   /* BulletObj vft+0x158：Move __thiscall    */
+
+/* 0x47f603  55 / 8b ec / 83 ec 18   ← 1+2+3 = 6 字节，和 PROJ_TICK 同一形状 */
+static const unsigned char PROJ_MOVE_SIG[6] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x18 };
+
+static void *g_proj_move_tramp = NULL;
+
+#define MOVE_CALLER_MAX 16
+static unsigned g_move_callers[MOVE_CALLER_MAX];
+static int g_move_caller_n = 0;
+
+static int move_diag_enabled(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_MOVE_DIAG", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return 1;     /* 没设 = 开 */
+    return buf[0] != '0';
+}
+
+static void __cdecl proj_move_log(void *proj, unsigned ret_addr)
+{
+    unsigned char *p = (unsigned char *)proj;
+    int i;
+
+    for (i = 0; i < g_move_caller_n; i++)
+        if (g_move_callers[i] == ret_addr) return;     /* 见过了，别刷屏 */
+    if (g_move_caller_n < MOVE_CALLER_MAX)
+        g_move_callers[g_move_caller_n++] = ret_addr;
+
+    if (!p || IsBadReadPtr(p, 0x340)) {
+        bslog("MOVE>   ★Projectile::Move 的调用方 返回地址 %08X（弹体读不了）",
+              ret_addr);
+        return;
+    }
+    bslog("MOVE>   ★Projectile::Move 的调用方 返回地址 %08X"
+          " | 弹体 %08X vft %08X 句柄 %d 位置 (%.2f, %.2f) 速度 (%.3f, %.3f)"
+          "  ← 反弹法线就在这个调用方里算（§102）",
+          ret_addr, (unsigned)(UINT_PTR)p,
+          (unsigned)*(UINT_PTR *)(p + 0x00), *(int *)(p + 0xD0),
+          *(float *)(p + 0x34), *(float *)(p + 0x38),
+          *(float *)(p + 0x120), *(float *)(p + 0x124));
+}
+
+/* __thiscall(ecx=弹体) + 一个栈参数。pushad 之后返回地址在 [esp+0x20]。 */
+static __declspec(naked) void proj_move_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push dword ptr [esp + 0x24]
+        push ecx
+        call proj_move_log
+        add  esp, 8
+        popfd
+        popad
+        jmp  dword ptr [g_proj_move_tramp]
+    }
+}
+
+static int try_patch_move_diag(void)
+{
+    unsigned char *m = (unsigned char *)PROJ_MOVE_VA;
+
+    if (g_proj_move_tramp != NULL) return 1;
+    if (!move_diag_enabled()) return 1;
+    if (IsBadReadPtr(m, sizeof(PROJ_MOVE_SIG))) return 0;
+    if (memcmp(m, PROJ_MOVE_SIG, sizeof(PROJ_MOVE_SIG)) != 0) return 0;
+    g_proj_move_tramp = install_inline_hook((void *)PROJ_MOVE_VA,
+                                            proj_move_detour,
+                                            "Move 调用方诊断");
+    if (!g_proj_move_tramp) return 0;
+    bslog("PATCH   ★Move 调用方诊断已装 @ %08X：每个**新**的返回地址打一行"
+          "（按地址去重，不刷屏）—— 查反弹法线在谁那里算"
+          "（BSHOOK_MOVE_DIAG=0 可关）", (unsigned)PROJ_MOVE_VA);
+    return 1;
+}
+
 static int try_patch_proj_diag(void)
 {
     unsigned char *a = (unsigned char *)PROJ_ADD_VA;
@@ -3753,6 +3852,20 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_proj_diag_patched)
             bslog("PATCH   !! 超时未能装弹体诊断"
                   "（0x473e7c / 0x47de6a 的特征串一直对不上）");
+    }
+
+    /* ★ 反弹法线诊断（临时，V0.3 §102）：查 Move 的调用方是谁。 */
+    if (!move_diag_enabled()) {
+        bslog("PATCH   BSHOOK_MOVE_DIAG=0 已设，不装 Move 调用方诊断 hook");
+    } else {
+        int done = 0;
+        for (ticks = 0; !g_stop && !done && ticks < 2000; ticks++) {
+            if (try_patch_move_diag()) { done = 1; break; }
+            Sleep(2);
+        }
+        if (!done)
+            bslog("PATCH   !! 超时未能装 Move 调用方诊断"
+                  "（0x47f603 一直不是 55 8B EC 83 EC 18）");
     }
 
     if (!afk_kick_disabled()) {

@@ -56,7 +56,7 @@ import zlib
 
 #: 认得的产物格式版本。对不上就当没有数据 —— 宁可 bot 不会走，
 #: 也不要按错的布局解出一张乱七八糟的地图。
-FORMAT = 1
+FORMAT = 2
 
 #: 找不到精确名时按这个顺序退。
 DIFFICULTY_ORDER = ("#Normal", "#Easy", "#Hard", "#Extreme")
@@ -72,7 +72,7 @@ class MapTerrain(object):
     """一张图的地形。**只读**，加载后不再变。"""
 
     __slots__ = ("name", "version", "width", "height", "_cells",
-                 "_offsets", "_ys", "points")
+                 "_offsets", "_ys", "points", "jump_pads")
 
     def __init__(self, record):
         self.name = record["name"]
@@ -93,6 +93,12 @@ class MapTerrain(object):
         self._offsets = offsets
         self.points = dict((int(k), [tuple(p) for p in v])
                            for k, v in record.get("points", {}).items())
+        #: ★ **弹跳台**（V0.3 §99）：`[(台x, 台y, 落点dx, 落点dy), …]`。
+        #:   `dx/dy` 是**落点相对台子的偏移**，不是速度 —— 客户端
+        #:   `JumpingObj::Tick`（`0x510d05`）拿它现解一条抛物线。
+        self.jump_pads = tuple(
+            (float(a), float(b), float(c), float(d))
+            for a, b, c, d in record.get("jump", ()))
 
     # -- 格子 ---------------------------------------------------------------
 

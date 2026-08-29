@@ -6,6 +6,20 @@
 
 **这个文件只是路标，不是进度记录。任何新发现 / 新决定都写进上面那套文件，不要写这里。**
 
+## ★ 启动 / 停止游戏：**项目根目录下的三个脚本**，agent 自己跑就行
+
+```text
+start.bat        一键启动（服务端 + 客户端，精简日志，正常游玩用这个）
+start-debug.bat  同上，但开调试日志（要看包 / 查 bug 用这个）
+stop.bat         一键停止（客户端 + 服务端 + 中继，按端口的 OwningProcess 找，不误杀别的 python）
+```
+
+- 用 PowerShell 的 `Start-Process` 跑，别用 Git Bash（这两个 bat 里有 `pause`）。
+- **改完 `server/` 的代码必须重启服务端才生效**（铁律 7）：`stop.bat` 再 `start.bat`。
+- ⚠ 「启动游戏」和「用鼠标键盘操作游戏」是两件事：脚本负责前者；后者要
+  computer-use 授权，而开始菜单里那个「炮炮火枪手」指向的是**只读原版**
+  `game_org\...\bigshot.exe`，不是 `game_patched` —— 别拿它当入口。
+
 三条最容易致命的铁律（完整版在 V0.3 的 CLAUDE.md 里）：
 
 1. `game_org/` 和 `原版安装包/` **只读**，改什么都去 `game_patched/`。

@@ -30,6 +30,8 @@ import ballistics                                              # noqa: E402
 import bot                                                     # noqa: E402
 import botsync                                                 # noqa: E402
 import chrprops                                                # noqa: E402
+import botmove                                            # noqa: E402
+import test_mapdata                                            # noqa: E402
 import gameserver                                              # noqa: E402
 import lobby                                                   # noqa: E402
 import mapdata                                                 # noqa: E402
@@ -4327,6 +4329,289 @@ class BotBuriedMuzzleTests(TerrainMixin, BotFireRoom):
         self.assertEqual([], fire_frames(self.alice, self.bot_seat))
 
 
+class ShellJumpPadTests(unittest.TestCase):
+    """★★★ 弹跳台把**弹体**也弹起来（V0.3 §103）。
+
+    用户 2026-08-29：「我 100% 肯定手雷一定会在弹跳台上弹跳，这也是这个游戏
+    的特色……在完全垂直的弹跳台上不停的扔手雷可以达到封路的效果。」
+
+    真值来自那一局的客户端逐帧日志：真人的手雷句柄 **100048** 在第 6 帧
+    位置 `(771.30, 877.91)` 上速度从 `(22.66, 34.30)` 突变成 `(2.43, −30.43)`。
+    """
+
+    def pad_terrain(self, pads):
+        rows = ["0" * 64 for _ in range(32)]
+        return mapdata.MapTerrain(test_mapdata.make_record(rows, jump=pads))
+
+    def shell_at(self, weapon, x, y, vx, vy):
+        shot = ballistics.Shot(math.atan2(vy, vx), 0.0,
+                               math.hypot(vx, vy), 46, 0.96)
+        shell = bot.Shell(1, 0, weapon, 2, x, y, shot, 0.0, 46)
+        shell.x, shell.y = x, y
+        shell.bounced = True
+        shell.vx, shell.vy = vx, vy
+        return shell
+
+    def test_it_reproduces_the_real_shot(self):
+        terrain = mapdata.load("Iceria_b")
+        if terrain is None or not terrain.jump_pads:
+            self.skipTest("没有 Iceria_b 的地形产物")
+        shell = self.shell_at(weapondata.get(1000020),
+                              771.30, 877.91, 22.66, 34.30)
+        self.assertTrue(bot._jump_pad_shell(shell, terrain))
+        self.assertAlmostEqual(2.43, shell.vx, places=2)
+        self.assertAlmostEqual(-30.43, shell.vy, places=2)
+
+    def test_the_test_is_swept_not_a_point(self):
+        """★ 触发那一刻弹体圆心离台心还有 36.5（> 20 + 8）——
+        判定的是**这一步扫过去的那一段**（`0x50f410` 把速度一起传下去）。"""
+        terrain = self.pad_terrain([[792, 908, 41.0, -416.0]])
+        weapon = weapondata.get(1000020)
+        far = self.shell_at(weapon, 771.30, 877.91, 0.0, 0.0)
+        self.assertFalse(bot._jump_pad_shell(far, terrain),
+                         "站着不动就该够不着")
+        moving = self.shell_at(weapon, 771.30, 877.91, 22.66, 34.30)
+        self.assertTrue(bot._jump_pad_shell(moving, terrain),
+                        "扫过去的那一段穿过台子，就该被弹")
+
+    def test_it_switches_to_the_integrated_path(self):
+        """弹完闭式解就不作数了（和撞地形弹开同一条路，§84）。"""
+        terrain = self.pad_terrain([[792, 908, 41.0, -416.0]])
+        shell = self.shell_at(weapondata.get(1000020),
+                              771.30, 877.91, 22.66, 34.30)
+        shell.bounced = False
+        bot._jump_pad_shell(shell, terrain)
+        self.assertTrue(shell.bounced)
+
+    def test_no_pads_no_launch(self):
+        terrain = self.pad_terrain([])
+        shell = self.shell_at(weapondata.get(1000020),
+                              771.30, 877.91, 22.66, 34.30)
+        self.assertFalse(bot._jump_pad_shell(shell, terrain))
+
+    def test_a_plain_bullet_is_not_launched(self):
+        """★★★ 撞地形当场炸的那一类**不会被台子弹起来**（§112）。
+
+        客户端逐帧日志：`ch02-02`（`BulletObj`）扫过 `Iceria_b` 那个台子
+        17 次、一次都没被弹；`ch00-02`（`AppleGrenade`）每次都弹。
+        用户 2026-08-29 报的「炮弹飞到弹跳台就消失了，过一会儿在台子上方
+        才出现爆炸动画」就是服务端这边多弹了这一下。
+        """
+        terrain = self.pad_terrain([[792, 908, 41.0, -416.0]])
+        plain = weapondata.get(1002020)                       # ch02-02
+        self.assertFalse(bot._bounces_off_terrain(plain))
+        shell = self.shell_at(plain, 771.30, 877.91, 22.66, 34.30)
+        self.assertFalse(bot._jump_pad_shell(shell, terrain))
+        self.assertAlmostEqual(22.66, shell.vx, places=2)
+        self.assertAlmostEqual(34.30, shell.vy, places=2)
+
+    def test_it_throws_much_higher_than_the_shot_itself(self):
+        """★ 用户说的「弹得很高，自己手动扔都扔不了那么高」。"""
+        terrain = self.pad_terrain([[792, 908, 41.0, -416.0]])
+        shell = self.shell_at(weapondata.get(1000020),
+                              771.30, 877.91, 22.66, 34.30)
+        bot._jump_pad_shell(shell, terrain)
+        apex = shell.vy * shell.vy / (2.0 * botmove.GRAVITY)
+        self.assertGreater(apex, 350.0, "台子给的高度应该有好几百")
+
+
+class BotItemTests(BotFireRoom):
+    """★★★ 道具模式：bot 捡得到、用得掉、也踩得中别人的雷（V0.3 §100 / §101）。
+
+    用户 2026-08-29：「道具模式里，bot 似乎捡不到道具。我用减速胶水道具后，
+    bot 踩上去似乎没有什么效果，不会被减速。」
+
+    真因是同一个形状：拾取和道具效果**整条链都是客户端发起**的
+    （`Character::CheckItemPickup` 只跑本机玩家），bot 没有本机 ⇒ 一件都
+    捡不到、一个效果都吃不到。
+    """
+
+    def drop(self, item_id, x, y):
+        """在 `(x, y)` 刷一件道具，返回句柄。"""
+        quest = self.room.quest
+        handle = quest.allocate_item() & 0xFFFFFFFF
+        quest.items_on_map.add(handle)
+        quest.remember_item(handle, item_id)
+        quest.items_at[handle] = (float(x), float(y))
+        return handle
+
+    def stand(self, x=400.0, y=300.0):
+        self.bot_conn.body = bot.botmove.Body(x, y)
+        self.bot_conn.battle_pos = (x, y)
+
+    def test_it_picks_up_what_it_steps_on(self):
+        self.stand()
+        handle = self.drop(10300, 400.0, 280.0)     # Shield
+        got = bot._item_pickups(self.room, self.bot_conn, self.bot_seat)
+        self.assertEqual([(handle, 10300)], got)
+        self.assertEqual([10300], self.room.quest.item_slots[self.bot_seat])
+        self.assertNotIn(handle, self.room.quest.items_at)
+
+    def test_a_far_item_is_left_alone(self):
+        self.stand()
+        self.drop(10300, 900.0, 280.0)
+        self.assertEqual([], bot._item_pickups(self.room, self.bot_conn,
+                                               self.bot_seat))
+
+    def test_the_pickup_is_broadcast_so_it_vanishes_on_every_screen(self):
+        """★ `0x0405` 必须广播 —— 不广播的话那件东西在所有人屏幕上都还在。"""
+        self.stand()
+        self.clear()
+        handle = self.drop(10300, 400.0, 280.0)
+        bot._item_pickups(self.room, self.bot_conn, self.bot_seat)
+        self.assertIn(gameserver.OP_PICKED_ITEM, opcodes(self.alice),
+                      "拾取放行没广播出去")
+
+    def test_it_never_sends_the_slot_packet(self):
+        """★★ `0x040b` 是「往**收包的那个人**的槽里塞一件」——
+        替 bot 发等于凭空给真人多一件道具。"""
+        self.stand()
+        self.clear()
+        self.drop(10300, 400.0, 280.0)
+        bot._item_pickups(self.room, self.bot_conn, self.bot_seat)
+        self.assertNotIn(gameserver.OP_GRANT_ITEM, opcodes(self.alice))
+
+    def test_it_uses_what_it_holds(self):
+        self.stand()
+        self.drop(10301, 400.0, 280.0)              # SpeedUp
+        bot._item_pickups(self.room, self.bot_conn, self.bot_seat)
+        self.clear()
+        self.assertTrue(bot._use_held_item(self.room, self.bot_conn,
+                                           self.bot_seat))
+        self.assertEqual([], self.room.quest.item_slots[self.bot_seat])
+        self.assertIn(gameserver.OP_ITEM_EFFECT, opcodes(self.alice))
+
+    def test_an_empty_hand_uses_nothing(self):
+        self.assertFalse(bot._use_held_item(self.room, self.bot_conn,
+                                            self.bot_seat))
+
+    def test_a_ground_weapon_changes_the_gun_server_side(self):
+        """★ 那三把枪真人是**客户端自己**换的（`vf_11c` 只认本机玩家，§223），
+        bot 只能服务端换。"""
+        self.stand()
+        self.drop(10201, 400.0, 280.0)              # 火焰喷射器
+        bot._item_pickups(self.room, self.bot_conn, self.bot_seat)
+        self.assertEqual(1900000, self.bot_conn.weapon.id)
+        # 死一次就换回自己那把。
+        self.bot_conn.item_weapon = None
+        self.assertNotEqual(1900000, self.bot_conn.weapon.id)
+
+    def _mine(self, x, y, age=None):
+        """在 `(x, y)` 放一摊胶水，`age` = 已经放了多久（缺省 = 刚布好）。"""
+        if age is None:
+            age = gameserver.SLOW_MINE_ARM_SECONDS + 0.01
+        self.room.quest.slow_mines.append(
+            (x, y, 0, time.monotonic() - age))
+
+    def test_stepping_on_a_slow_mine_actually_slows_it(self):
+        self.stand()
+        self._mine(400.0, 285.0)
+        now = time.monotonic()
+        self.assertTrue(bot._step_on_slow_mine(self.room, self.bot_conn,
+                                               self.bot_seat, now))
+        # ★ 胶水是**留在地上**的一摊，不是踩一次就没的雷（§105）。
+        self.assertEqual(1, len(self.room.quest.slow_mines))
+        self.assertAlmostEqual(gameserver.SLOWED_SPEED_RATIO,
+                               bot._speed_scale(self.bot_conn, now))
+        # 到点自己恢复。
+        self.assertAlmostEqual(
+            1.0, bot._speed_scale(self.bot_conn,
+                                  now + gameserver.SLOWED_SECONDS + 0.01))
+
+    def test_stepping_on_a_slow_mine_tells_everybody(self):
+        """★★ §109：不广播 `0x040a` 的话别人屏幕上 bot 照旧满速走
+        —— 收方的角色是靠心跳里那六位方向键自己走的（§39）。"""
+        self.stand()
+        self._mine(400.0, 285.0)
+        before = len(self.alice.sent)
+        bot._step_on_slow_mine(self.room, self.bot_conn, self.bot_seat,
+                               time.monotonic())
+        blob = b"".join(self.alice.sent[before:])
+        self.assertIn(struct.pack("<i", gameserver.STATUS_ITEM_SLOWED), blob,
+                      "该给房里每个人发一发「bot 减速了」")
+
+    def test_a_mine_that_has_not_armed_yet_does_nothing(self):
+        """★ 原版那一摊要等 3 秒才生效（`0x523e12`，§108）。"""
+        self.stand()
+        self._mine(400.0, 285.0, age=0.5)
+        self.assertFalse(bot._step_on_slow_mine(self.room, self.bot_conn,
+                                                self.bot_seat,
+                                                time.monotonic()))
+
+    def test_a_mine_past_its_life_is_gone(self):
+        """★ 15 秒之后 `SlowMineObject::Tick` 自毁（`0x523df8`，§108）——
+        服务端也得把它从表里摘掉，不然「放下去半分钟还粘人」。"""
+        self.stand()
+        self._mine(400.0, 285.0,
+                   age=gameserver.SLOW_MINE_LIFE_SECONDS + 0.01)
+        self.assertFalse(bot._step_on_slow_mine(self.room, self.bot_conn,
+                                                self.bot_seat,
+                                                time.monotonic()))
+        self.assertEqual([], self.room.quest.slow_mines)
+
+    def test_a_far_mine_does_nothing(self):
+        self.stand()
+        self._mine(900.0, 285.0)
+        self.assertFalse(bot._step_on_slow_mine(self.room, self.bot_conn,
+                                                self.bot_seat,
+                                                time.monotonic()))
+
+    def test_a_freeze_burst_in_range_stops_it(self):
+        """★ `Item.ini` 的 `[Freezer] Range=300`，`Status.ini` 第 12 条 2 秒。"""
+        self.stand(400.0, 300.0)
+        now = time.monotonic()
+        self.room.quest.freeze_bursts.append((400.0, 320.0, 0, now))
+        self.assertTrue(bot._take_freeze(self.room, self.bot_conn,
+                                         self.bot_seat, now))
+        self.assertEqual(0.0, bot._speed_scale(self.bot_conn, now),
+                         "冻住就是一步都走不了")
+        self.assertAlmostEqual(
+            1.0, bot._speed_scale(self.bot_conn,
+                                  now + gameserver.FROZEN_SECONDS + 0.01))
+
+    def test_a_freeze_burst_out_of_range_misses(self):
+        self.stand(400.0, 300.0)
+        now = time.monotonic()
+        self.room.quest.freeze_bursts.append((400.0 + 400.0, 300.0, 0, now))
+        self.assertFalse(bot._take_freeze(self.room, self.bot_conn,
+                                          self.bot_seat, now))
+        self.assertEqual(1.0, bot._speed_scale(self.bot_conn, now))
+
+    def test_a_freeze_burst_is_settled_once(self):
+        self.stand(400.0, 300.0)
+        now = time.monotonic()
+        self.room.quest.freeze_bursts.append((400.0, 320.0, 0, now))
+        bot._take_freeze(self.room, self.bot_conn, self.bot_seat, now)
+        self.assertEqual([], self.room.quest.freeze_bursts)
+
+    def test_smoke_hides_the_enemy_from_the_bot(self):
+        """★ D67（我们定的）：别人放了烟，云里的人 bot 挑不中。"""
+        self.walk(self.alice, [(500.0, 300.0)])
+        seat = self.room.seat_index_of(self.alice)
+        before = [s for s, *_ in bot._hostile_targets(self.room, self.bot_seat)]
+        self.assertIn(seat, before)
+        self.room.quest.smokes.append(
+            (500.0, 300.0, time.monotonic() + gameserver.SMOKE_SECONDS))
+        after = [s for s, *_ in bot._hostile_targets(self.room, self.bot_seat)]
+        self.assertNotIn(seat, after, "云里的人不该还被挑中")
+
+    def test_smoke_expires(self):
+        self.walk(self.alice, [(500.0, 300.0)])
+        seat = self.room.seat_index_of(self.alice)
+        self.room.quest.smokes.append((500.0, 300.0, time.monotonic() - 1.0))
+        after = [s for s, *_ in bot._hostile_targets(self.room, self.bot_seat)]
+        self.assertIn(seat, after, "散掉的烟不该还挡着")
+        self.assertEqual([], self.room.quest.smokes, "散了就该清掉")
+
+    def test_the_slow_really_shortens_the_step(self):
+        """★ 减速要真的落到**走出去多远**上 —— 只挂个标记等于没做。"""
+        who = chrprops.get(self.bot_conn.character_id)
+        full = bot.botmove.walk_speed(who)
+        slow = bot.botmove.walk_speed(
+            who, scale=gameserver.SLOWED_SPEED_RATIO)
+        self.assertAlmostEqual(full * 0.3, slow)
+
+
 class BotShellBodyLerpTests(BotFireRoom):
     """★★★ 判命中要用「**那一 tick** 人在哪」，不是「此刻人在哪」（§96）。
 
@@ -4587,9 +4872,15 @@ class BotBounceTests(TerrainMixin, BotFireRoom):
                                shell.vy, places=2)
 
     def test_the_flame_bomb_still_explodes_on_contact(self):
-        """★ 没引信的照旧撞上什么炸在那儿 —— 别把火焰弹一起改了。"""
+        """★ 火焰弹（`FlamingBottle`）撞**平地**照旧当场炸（§111 的 2 档）。
+
+        ⚠ 判据不是「有没有引信」（§84 那条已被 §111 推翻）：它走
+        `[vft+0x160] == 2` 那一档 —— `2×|sx| ≤ sy` 就炸。平地上 `sx ≈ 0`，
+        所以永远炸；撞陡壁才弹。
+        """
         weapon = weapondata.get(1001020)
-        self.assertFalse(bot._bounces_off_terrain(weapon))
+        self.assertEqual(bot.BLOCKED_BOUNCE_IF_STEEP,
+                         bot._blocked_mode(weapon))
         terrain = self.flat()
         shell = self.shell(weapon, 200.0, 300.0, math.radians(-20.0), 25.0)
         landed = None

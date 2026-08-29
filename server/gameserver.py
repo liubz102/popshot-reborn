@@ -66,6 +66,7 @@ from account_store import (AccountStore, BASE_CHARACTER_IDS,
                            tutorial_state)
 import eventlog
 import lobby as lobby_module
+import mapdata
 # ★ `SESSION_STATUS_WAITING` 不从 lobby 导入：本模块下面有一份带完整考据的
 #   同名常量（V0.1 §102），两处值必须一样，import 进来只会让人以为它只有一处定义。
 from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
@@ -2210,6 +2211,106 @@ PVP_TEAM_ITEM_IDS = (10313, 10314)
 #: `UseItemEffect`（按 Ctrl）用的，换武器根本不走那条路（§201 只约束进槽的道具）。
 PVP_WEAPON_ITEM_IDS = (10200, 10201, 10202)
 
+#: 那三把枪各给的是 `weapon.ini` 里的哪一把（表在上面那段注释里）。
+#: ★ 真人这一步是**客户端自己**做的（`vf_11c` -> `Character::GiveWeapon`），
+#:   服务端本来一格都不需要；bot 没有本机，只能这边换（V0.3 §100）。
+PVP_WEAPON_GIVES = {10200: 1900020, 10201: 1900000, 10202: 1900030}
+
+#: ★ 减速胶水（`Item.ini` 的 `[SlowMine]`）。放下去之后谁踩谁中招。
+SLOW_MINE_ITEM_ID = 10400
+
+#: ★★★ 胶水**落在地上那一摊**的物件 id（V0.3 §105）。
+#:
+#: `UseItemEffect` 的 10400 分支（`0x508cbb`）里：
+#:
+#:     0x508cbb  call 0x409f7d ; cmp [char+0x2ac], eax ; jne 跳过   ← 只有本机玩家发
+#:     0x508cdd  push 0x296b (= 10603 `Slowed`) ; call 0x4939c0
+#:
+#: `0x4939c0` 就是发 **`0x0406 gcpCreateItem`** 的那一处（`on_create_item`
+#: 的注释里点名的两个发送点之一）。⇒ **服务端本来就收得到这一摊的精确坐标**，
+#: 不用去猜使用者当时站在哪。
+SLOWED_OBJECT_ID = 10603
+
+#: ★ 冰冻（`Item.ini` 的 `[Freezer]`）。
+FREEZER_ITEM_ID = 10310
+
+#: 冰冻的作用半径 —— `Item.ini` 的 `[Freezer] Range=300`（V0.3 §106）。
+#: `UseItemEffect` 的 10310 分支 `0x508843: fild [记录+0xc]` 读的就是这一格，
+#: 再和「使用者到目标的直线距离」比：**`dist < Range` 才中**（`0x50884a`）。
+#: 同一条链上的门还有：不是自己、`[char+0x2b4] == 0`、**队伍号不同**
+#: （`[vft+0x144]`，`0x5087e6`）。
+FREEZER_RANGE = 300.0
+
+#: 冻住多久 —— `Status.ini` 第 **12** 条（`[Freezed]`，`Item.ini` 里
+#: `Freezed` 的 `CharAttr` 就是 12）：`Time=2.0`。
+FROZEN_SECONDS = 2.0
+
+#: ★ 烟雾（`Item.ini` 的 `[Smoke]`）。
+SMOKE_ITEM_ID = 10401
+
+#: ★★ 烟雾对 bot 的效果**是我们定的**（D67），不是原版行为：原版的烟雾就是
+#: 一团**纯视觉**的云（`0x508bcd` 造的那个对象构造函数里一个半径都没有，
+#: 它挡的是真人的眼睛），游戏逻辑里没有「你看不见就打不着」这条。
+#: 用户 2026-08-29：「别人都放烟雾了，bot 还能准确打到烟雾里的人很不合理。」
+#: ⇒ 云里的人 bot 挑不中。这两个数没有原版出处，觉得不对就改这里。
+SMOKE_RADIUS = 150.0
+SMOKE_SECONDS = 8.0
+
+#: 踩中之后的效果，来自 `Data/Status.ini` 第 **14** 条（`[Slowed]`，
+#: `Item.ini` 里 `Slowed` 的 `CharAttr` 就是 14）：
+#:
+#:     [14]
+#:     Time=4.0
+#:     SpeedRatio=0.3
+SLOWED_SECONDS = 4.0
+SLOWED_SPEED_RATIO = 0.3
+
+#: 胶水那一摊的**碰撞半径**（V0.3 §108）。
+#:
+#: `SlowMineObject` 的构造链 `0x51f2e2: mov [ [this+0x13c] + 0x18 ], 0x41900000`
+#: —— `0x41900000` 就是 **18.0f**。会话 34 那个「估的 20」到此作废。
+SLOW_MINE_RADIUS = 18.0
+
+#: 那一摊要等 **3 秒**才生效、**15 秒**之后自己消失（V0.3 §108）。
+#:
+#: `SlowMineObject::Tick`（`0x523dd3`）第一次跑的时候把当时的毫秒数记进
+#: `[this+0x2c4]`，之后每帧：
+#:
+#:     [2c4] + 0x3a98 (=15000) < now  -> 0x417c49(this, 4) 自毁
+#:     [2c4] + 0x0bb8 (= 3000) >= now -> 直接 return（还没「布好」）
+#:     否则                            -> [this+0x2aa] = 1
+#:
+#: 服务端以前两头都没管：那一摊**永远**留在 `slow_mines` 里，于是
+#: 「放下去 39 秒之后 bot 走过去还被粘一下」（2026-08-29 那一局的日志里
+#: 就有这么一行），而每台机器上那摊胶水早就没了。
+SLOW_MINE_ARM_SECONDS = 3.0
+SLOW_MINE_LIFE_SECONDS = 15.0
+
+#: ★★★ **状态本身也是一件「道具」**（V0.3 §109）。
+#:
+#: `Data/Item.ini` 里除了玩家手上那些道具，还有四条**只有状态**的记录，
+#: `CharAttr` 直接指向 `Status.ini` 的那一条：
+#:
+#:     [Poisoned] ItemId=10600 CharAttr=11   中毒
+#:     [Freezed]  ItemId=10601 CharAttr=12   冻住
+#:     [Hudded]   ItemId=10602 CharAttr=13   幽灵缠身
+#:     [Slowed]   ItemId=10603 CharAttr=14   减速（胶水）
+#:
+#: 客户端自己就是这么用的：冰冻的 10310 分支在 `0x50886a` 拿 **10601** 再调一次
+#: `UseItemEffect`，幽灵在 `0x5086bc` 拿 10602，胶水那一摊在 `0x523c52` 拿 10603。
+#: 这四个 id 在 `UseItemEffect` 里**没有自己的分支**，落到通用分支 `0x508de6`
+#: 按 `Status.ini` 的数值加 buff。
+#:
+#: ⇒ 服务端只要广播一发 `0x040a gspItemEffect(bot 的座位, 10603)`，
+#: **每台机器**都会给 bot 挂上「减速 4 秒、走速 ×0.3」——
+#: 这正是 §101 那一族问题（效果各机各算、bot 没有本机）的正解：
+#: 不用我们去模拟别人屏幕上该看见什么，把原版那条链**替 bot 走一遍**就行。
+#: 而且这四条都有 `Time`，客户端自己会到点撤掉，不需要谁补 `0x040d`。
+STATUS_ITEM_POISONED = 10600
+STATUS_ITEM_FREEZED = 10601
+STATUS_ITEM_HUDDED = 10602
+STATUS_ITEM_SLOWED = 10603
+
 #: ★ 捡到之后**要进道具槽**的物件 id（§194）。
 #:
 #: 判据不是「谁刷的」而是**物件本身的类型**：这 17 个类构造时基类第 4 个参数
@@ -2281,8 +2382,27 @@ PVP_WEAPON_SPAWN_WEIGHT = 1
 #: 实测最宽的图 11400、最高的 2048。
 #: Y 取靠下的一段（Y 向下增大，§192）—— 落在地形里正好被顶到地面上，
 #: 悬在半空的概率小得多。
+#:
+#: ★★★ **只在拿不到这张图的地形数据时才用这一路**（V0.3 §100）。
+#: 有地形（`bot_mapdata`，V0.3 M4 之后 174 张图全有）就改走
+#: `_ground_item_spawn()`：随机挑一列、放在那一列**站立面上方**。
+#: 这么做的两个理由：
+#:
+#: 1. `fmod` + 「顶出地形」都不会再动它 ⇒ **服务端知道每一件道具在哪**，
+#:    bot 才可能走过去捡（用户 2026-08-29 报的「bot 捡不到道具」）；
+#: 2. 顺带把真人那边也修好了 —— 取模落点是纯随机的，经常刷在墙里/天上，
+#:    再被客户端顶到一个谁也想不到的地方。
 ITEM_SPAWN_X_RANGE = (0.0, 11400.0)
 ITEM_SPAWN_Y_RANGE = (0.0, 2048.0)
+
+#: 刷在站立面**上方**多少个单位。放高一点是为了两件事都不发生：
+#: 埋进地形（会被客户端顶走）、贴着地面（物件自己的形状还是可能压到）。
+ITEM_SPAWN_LIFT = 24.0
+
+#: 挑列的时候最多试几次 —— 图边和纯天空列没有站立面。
+#: ★ 这不是「重试 N 次就当失败」的时序阈值（铁律 10），是**有限集合上的
+#:   拒绝采样**：整张图的列数是已知的，试不中就退回老口径。
+ITEM_SPAWN_COLUMN_TRIES = 24
 
 #: `0x0404` 后三个字段：客户端自己掉东西时发的就是 `3, -1, -1`
 #: （`+0x18 == 1` 才走「宠物捡到」的特效分支，`+0x1c` 是配套的座位号）。
@@ -2313,6 +2433,33 @@ def item_spawn_pool(team_mode=False):
     weapons = tuple(PVP_WEAPON_ITEM_IDS) * max(0, int(PVP_WEAPON_SPAWN_WEIGHT))
     return (tuple(PVP_ITEM_IDS) + weapons
             + (tuple(PVP_TEAM_ITEM_IDS) if team_mode else ()))
+
+
+def ground_item_spawn(map_name, rng=None):
+    """在这张图上挑一个**站得住人的**刷新点，返回 `(x, y)`；挑不出返回 `None`。
+
+    ★ 为什么要挑（V0.3 §100）：老口径是「随便给个大坐标，让客户端 `fmod`
+    进图、再把埋进地形的顶出来」（§192）—— 服务端因此**不知道道具在哪**，
+    bot 想捡也无从判起。这里改成服务端自己按地形挑：`fmod` 是恒等、
+    「顶出地形」也不触发，两边看到的位置从此一样。
+
+    挑法：随机一列，取那一列**最上面**那个站立面，往上抬 `ITEM_SPAWN_LIFT`。
+    取最上面那个是为了让道具落在高台上而不是老掉在图底那条地面上。
+    """
+    terrain = mapdata.load(map_name) if map_name else None
+    if terrain is None or terrain.width <= 0:
+        return None
+    picker = rng if rng is not None else random
+    for _ in range(ITEM_SPAWN_COLUMN_TRIES):
+        x = picker.randrange(terrain.width)
+        surfaces = terrain.surfaces(x)
+        if not surfaces:
+            continue
+        y = float(surfaces[0]) - ITEM_SPAWN_LIFT
+        if y <= 0.0:
+            continue                   # 站立面顶到图顶了 —— 换一列
+        return (float(x), y)
+    return None
 
 
 def parse_create_item(payload):
@@ -3250,6 +3397,18 @@ class RoomQuest:
         self.next_item_handle = int(item_handle_base)
         #: 已经被谁捡走的掉落物句柄 -> 座位号。仲裁靠它。
         self.items_taken = {}
+        #: ★ 句柄 -> `(x, y)`：服务端刷出来的道具在哪（V0.3 §100）。
+        #:   只有 bot 用得上 —— 真人那边碰撞是客户端自己算的。
+        self.items_at = {}
+        #: ★ 地上那些**减速胶水**（`SlowMine` 10400 掉出来的 10603 物件）：
+        #:   `[(x, y, 句柄, 落地时刻), …]`（V0.3 §101 / §105 / §108）。
+        #:   同样只有 bot 用得上 —— 真人踩没踩到是他自己那台机器算的。
+        #:   ★ 时刻是给 `SLOW_MINE_ARM_SECONDS` / `SLOW_MINE_LIFE_SECONDS` 用的。
+        self.slow_mines = []
+        #: ★ 还没结算给 bot 的**冰冻**：`[(x, y, 放的人, 时刻), …]`（§106）。
+        self.freeze_bursts = []
+        #: ★ 地上还在飘的**烟雾**：`[(x, y, 散掉的时刻), …]`（D67）。
+        self.smokes = []
         #: ★ **道具模式**：服务端刷在地图上、还没被人捡走的道具句柄（§191）。
         #: 只用来卡「地图上最多同时躺几件」，捡走了就从这里去掉。
         self.items_on_map = set()
@@ -3435,6 +3594,7 @@ class RoomQuest:
         self.items_taken[handle] = int(seat_id)
         # 服务端刷的那件被人捡走了，地图上就少一件（配额腾出来）。
         self.items_on_map.discard(handle)
+        self.items_at.pop(handle, None)
         # ★ 金币在**这里**入账，不在 `grant_picked_item` 里 —— 那个函数只管
         #   「要不要补一发 0x040b」，金币根本不进道具槽、会被它提前 return 掉。
         #   仲裁这一步才是「这一件确定归这个座位了」的唯一判定点。
@@ -3488,7 +3648,8 @@ class RoomQuest:
         return slots.pop(index)
 
     # -- 道具模式：往地图上刷道具（§191 / D109）------------------------------
-    def due_item_spawn(self, now=None, team_mode=False, random_source=None):
+    def due_item_spawn(self, now=None, team_mode=False, random_source=None,
+                       map_name=None):
         """现在该不该刷一件道具？该刷就返回 `(句柄, 物件 id, X, Y)`，否则 ``None``。
 
         ★ **调用点是每收到一发 `0x040e` 就问一次**（约 8 Hz，和
@@ -3513,14 +3674,21 @@ class RoomQuest:
         rng = random_source if random_source is not None else random
         pool = item_spawn_pool(team_mode)
         item_id = rng.choice(pool)
-        x = rng.uniform(*ITEM_SPAWN_X_RANGE)
-        y = rng.uniform(*ITEM_SPAWN_Y_RANGE)
+        spot = ground_item_spawn(map_name, rng)
+        if spot is None:
+            x = rng.uniform(*ITEM_SPAWN_X_RANGE)
+            y = rng.uniform(*ITEM_SPAWN_Y_RANGE)
+        else:
+            x, y = spot
         handle = self.allocate_item() & 0xFFFFFFFF
         self.items_on_map.add(handle)
         # ★ 记进「句柄 -> 物件 id」表：捡起来之后要靠它才知道该不该补
         # 一发 `0x040b` 把道具塞进槽（§194）。记在这里而不是调用方，
         # 是为了「刷了一件却忘了记」这种漂移压根发生不了。
         self.remember_item(handle, item_id)
+        # ★★ 位置也要记：bot 靠它判「我踩到这件了没有」（V0.3 §100）。
+        #    真人那边是客户端自己算碰撞，服务端本来一点位置都不需要。
+        self.items_at[handle] = (float(x), float(y))
         return handle, item_id, x, y
 
     # -- 死亡 / 重生 --------------------------------------------------------
@@ -3903,6 +4071,10 @@ class RoomQuest:
         #     `Character::Die()`，人躺在地上再也起不来（「被打死后无法复活」）。
         keep = self.player_handles
         self.items_taken.clear()
+        self.items_at.clear()
+        del self.slow_mines[:]
+        del self.freeze_bursts[:]
+        del self.smokes[:]
         self.dead_events = {key for key in self.dead_events if key[0] in keep}
         self.death_counts = {handle: count
                              for handle, count in self.death_counts.items()
@@ -4451,6 +4623,22 @@ def conn_is_playing(conn):
     """
     room = LOBBY.room_of(conn)
     return room is not None and room.status == SESSION_STATUS_PLAYING
+
+
+def current_map_name(room):
+    """房间**这一刻**在哪张图上。闯关换过图的话就是最后进的那张。
+
+    ★ 和 `bot._current_map()` 是同一条口径 —— 那边是给弹道用的，
+    这边是给刷道具挑落点用的（V0.3 §100）。放在这里是为了不让
+    `gameserver` 反过来 import `bot`（那是一条循环依赖）。
+    """
+    if room is None:
+        return None
+    quest = getattr(room, "quest", None)
+    entered = getattr(quest, "maps_entered", None) if quest is not None else None
+    if entered:
+        return entered[-1]
+    return getattr(room, "map_name", None)
 
 
 def room_in_battle(room):
@@ -5041,7 +5229,8 @@ class Conn:
         if quest.settled or quest.pvp_reason is not None:
             return False
         spawn = quest.due_item_spawn(
-            now=now, team_mode=room.team_layout() == TEAM_LAYOUT_TEAMS)
+            now=now, team_mode=room.team_layout() == TEAM_LAYOUT_TEAMS,
+            map_name=current_map_name(room))
         if spawn is None:
             return False
         handle, item_id, x, y = spawn
@@ -6270,6 +6459,16 @@ class Conn:
                      + ("" if VERBOSE else "（本局第一件，后续同类静音）"))
         self.battle_broadcast(
             build_game(OP_CREATED_ITEM, build_created_item(handle, fields)))
+        # ★★ 胶水那一摊（V0.3 §105）：位置就在这一发里，不用猜。
+        #    只有 bot 用得上 —— 真人踩没踩到是他自己那台机器算的。
+        if item_id == SLOWED_OBJECT_ID:
+            quest.slow_mines.append((float(x), float(y), int(handle),
+                                     time.monotonic()))
+            self.log(f"   记下减速胶水 @ ({x:.0f}, {y:.0f}) "
+                     f"句柄=0x{handle & 0xffffffff:08x}"
+                     f"；地上现有 {len(quest.slow_mines)} 摊"
+                     f"（{SLOW_MINE_ARM_SECONDS:g} 秒后生效、"
+                     f"{SLOW_MINE_LIFE_SECONDS:g} 秒后消失，§108）")
 
     def on_get_item(self, payload):
         """0x0407 `gcpGetItem`「我踩到这件了」-> 回 0x0405，客户端才真的捡起来。
@@ -6423,6 +6622,39 @@ class Conn:
         self.battle_broadcast(
             build_game(OP_ITEM_EFFECT, build_item_effect(seat_id, item_id)),
             reason=f"：道具效果 {item_id} 作用于座位 {seat_id}")
+        self.note_area_item(item_id, seat_id, quest)
+
+    def note_area_item(self, item_id, seat_id, quest):
+        """「作用于别人」的那几件道具，服务端要自己记一份（V0.3 §101/§106）。
+
+        `0x040a` 广播出去之后每台机器都会算一遍效果，可 **bot 的位置和移动是
+        服务端说了算的** —— 客户端各自算出来的减速 / 冻结下一发心跳就被拽回去。
+        和 §92 的击退是同一个形状：**要真的生效，服务端必须自己也算一遍**。
+
+        | 道具 | 服务端怎么拿到位置 |
+        |---|---|
+        | 减速胶水 10400 | ★ 不在这里 —— 那一摊是**独立物件 10603**，客户端会发 `0x0406`，位置是精确的（§105，见 `on_create_item`）|
+        | 冰冻 10310 | 判据是「离**使用者**多远」，使用者的坐标就是他这一刻的心跳（§106）|
+        | 烟雾 10401 | 同上，云在使用者脚下（D67）|
+        """
+        item_id = int(item_id)
+        if item_id not in (FREEZER_ITEM_ID, SMOKE_ITEM_ID):
+            return
+        trail = getattr(self, "sync_trail", None)
+        if not trail:
+            self.log(f"   ⚠ 用 {item_id} 时还没有位置心跳，服务端记不下作用点"
+                     f"（bot 不会受影响）")
+            return
+        point = trail[-1]
+        x, y = float(point[0]), float(point[1])
+        if item_id == FREEZER_ITEM_ID:
+            quest.freeze_bursts.append((x, y, int(seat_id), time.monotonic()))
+            self.log(f"   冰冻 @ ({x:.0f}, {y:.0f}) 半径 {FREEZER_RANGE:g}"
+                     f"（bot 在圈里会被冻 {FROZEN_SECONDS:g} 秒）")
+        else:
+            quest.smokes.append((x, y, time.monotonic() + SMOKE_SECONDS))
+            self.log(f"   烟雾 @ ({x:.0f}, {y:.0f}) 半径 {SMOKE_RADIUS:g}"
+                     f"，{SMOKE_SECONDS:g} 秒（bot 看不见云里的人，D67）")
 
     def on_remove_char_attr(self, payload):
         """0x040d（客户端方向）「我身上那个道具效果结束了」（§200）。

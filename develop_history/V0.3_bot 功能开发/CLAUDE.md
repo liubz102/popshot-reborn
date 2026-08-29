@@ -186,6 +186,35 @@ D:\git\popshot-reborn\main\Pack_decrypt\Data\        ← ChrProps.ini / map.ini 
     定规则前先问一句：**真人对局的时候是什么样的？** 答不上来就是凭空造的。
     （已经删掉的两条：D47「保持交战距离」、D50「不往自己爆炸半径开炮」。）
 
+## ★ 启动 / 停止游戏 —— **脚本在项目根目录，agent 自己跑**
+
+用户 2026-08-29：「游戏的启动脚本在根目录下的 `start.bat` / `start-debug.bat`，
+结束是 `stop.bat`。」**不用问，要跑就跑。**
+
+| 脚本 | 干什么 |
+|---|---|
+| `start.bat` | 一键启动：服务端 + 中继 + 客户端。精简日志，正常游玩 / 快速复现用它 |
+| `start-debug.bat` | 同上 + 调试日志（客户端密码钩子、服务端逐包 dump）。查 bug 用它 |
+| `stop.bat` | 一键停止。按端口的 `OwningProcess` 找进程，**不会误杀别的 python** |
+
+- 用 **PowerShell 的 `Start-Process`** 起，别用 Git Bash —— 这两个 bat 末尾有 `pause`。
+  例：`Start-Process -FilePath "…\start-debug.bat" -WorkingDirectory "…"`。
+- **改完 `server/` 的代码必须重启服务端才生效**（铁律 7）。
+  `start.bat` 会复用已经在跑的服务端，所以要生效就先 `stop.bat`。
+- 起完看三个地方：`logs/server.out`（服务端）、`logs/server.err`（该是空的）、
+  `logs/bshook_*.log`（客户端探针）。
+
+### ⚠ 「启动游戏」≠「操作游戏」
+
+脚本只负责把它跑起来。要 agent **自己点鼠标打一局**，还得 computer-use 授权，
+而且有个坑：开始菜单里的「炮炮火枪手」解析到的是**只读原版**
+`d:\work\popshot\game_org\popshot\bigshot.exe`，**不是 `game_patched`**。
+会话 35 / 36 两次申请都卡在这儿。要让 agent 能实机验，得先有一个指向
+`game_patched\bsloader.exe` 的入口。
+
+⇒ 在那之前：**能自己跑的验证（起服务端、看日志、跑测试）自己做完**，
+只有「真打一局、看别人屏幕上是什么样」这类才停下来请用户操作。
+
 ## 环境速查
 
 - Win10 Pro 19045 x64 / RTX 3070；`d3d9.dll` + `d3dx9_43.dll` 齐全；VC++ 2005/2008 x86 运行库已装

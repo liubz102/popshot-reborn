@@ -21,6 +21,8 @@ if HERE not in sys.path:
 
 import botmove                                                 # noqa: E402
 import mapdata                                                 # noqa: E402
+import chrprops                                                # noqa: E402
+import test_mapdata                                            # noqa: E402
 from test_mapdata import make_record                           # noqa: E402
 
 
@@ -381,6 +383,68 @@ class BodyTests(unittest.TestCase):
         """地图数据缺失时**原地不动**，不是乱走（fail-safe）。"""
         body = botmove.Body(5.0, 5.0)
         self.assertEqual(body, botmove.tick(None, body, Dummy(), direction=1))
+
+
+class JumpPadTests(unittest.TestCase):
+    """★★★ 弹跳平台（V0.3 §99）—— 用户 2026-08-29 报的「bot 站上去不弹」。
+
+    真值全部来自 2026-08-29 那一局 `Iceria_b` 的客户端上行心跳：
+    真人站在台子上那一发之后 `vy` 突然变成 −27~−31，而普通跳只有 −17~−20。
+    """
+
+    def pad_map(self, pads):
+        rows = []
+        for y in range(32):
+            rows.append(("2" if y >= 20 else "0") * 64)
+        return mapdata.MapTerrain(
+            test_mapdata.make_record(rows, jump=pads))
+
+    def test_it_launches_and_matches_the_real_shot(self):
+        """★ 拿实机那一发对：`Iceria_b` 的台子 `(1743,895,-24,-395)`，
+        真人站在 `(1742,904)` ⇒ 心跳报 `v=(0,−31)`。"""
+        terrain = self.pad_map([[1743, 895, -24.0, -395.0]])
+        body = botmove.Body(1742.0, 904.0)
+        got = botmove.jump_pad_launch(terrain, body, chrprops.get(0))
+        self.assertIsNotNone(got, "站在台子上必须被弹")
+        self.assertFalse(got.on_ground)
+        self.assertAlmostEqual(-31.15, got.vy, delta=0.2)
+        self.assertAlmostEqual(-0.89, got.vx, delta=0.2)
+        # ★ 比普通跳高得多 —— 这正是玩家看到的「飞得很高」。
+        self.assertGreater(abs(got.vy), botmove.JUMP_SPEED * 1.4)
+
+    def test_out_of_reach_does_nothing(self):
+        """★ 实机最近的一次「没被弹」离台子 51.5 个单位。"""
+        terrain = self.pad_map([[1743, 895, -24.0, -395.0]])
+        for dx in (40, 52, 80):
+            body = botmove.Body(1743.0 - dx, 904.0)
+            self.assertIsNone(
+                botmove.jump_pad_launch(terrain, body, chrprops.get(0)),
+                f"离 {dx} 个单位不该被弹")
+
+    def test_airborne_is_not_launched(self):
+        """★ `0x510dfa: cmp byte [char+0x128], 0; je 跳过` —— 必须踩在地上。"""
+        terrain = self.pad_map([[1743, 895, -24.0, -395.0]])
+        body = botmove.Body(1743.0, 904.0, 0.0, -5.0, on_ground=False)
+        self.assertIsNone(
+            botmove.jump_pad_launch(terrain, body, chrprops.get(0)))
+
+    def test_tick_launches_a_bot_that_walks_onto_it(self):
+        """走过去就该被弹 —— 用户报的正是「bot 站上去不弹」。"""
+        terrain = self.pad_map([[30, 19, 0.0, -400.0]])
+        body = botmove.Body(10.0, 20.0)
+        who = chrprops.get(0)
+        for _ in range(40):
+            body = botmove.tick(terrain, body, who, direction=1)
+            if not body.on_ground:
+                break
+        self.assertFalse(body.on_ground, "走到台子上必须离地")
+        self.assertLess(body.vy, -botmove.JUMP_SPEED)
+
+    def test_no_pads_no_change(self):
+        terrain = self.pad_map([])
+        body = botmove.Body(30.0, 20.0)
+        self.assertIsNone(
+            botmove.jump_pad_launch(terrain, body, chrprops.get(0)))
 
 
 class RealMapTests(unittest.TestCase):

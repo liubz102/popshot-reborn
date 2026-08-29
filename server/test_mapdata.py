@@ -56,7 +56,7 @@ def blob(raw):
     return base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
 
 
-def make_record(rows, name="Tiny", version=18, points=None):
+def make_record(rows, name="Tiny", version=18, points=None, jump=None):
     height, width = len(rows), len(rows[0])
     counts, ys = ground_from(rows)
     return {
@@ -69,6 +69,7 @@ def make_record(rows, name="Tiny", version=18, points=None):
         "ground_counts": blob(struct.pack("<%dH" % width, *counts)),
         "ground_ys": blob(struct.pack("<%dH" % len(ys), *ys)),
         "points": points or {},
+        "jump": jump or [],
     }
 
 
