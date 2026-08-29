@@ -1997,10 +1997,11 @@ def _seat_on_ground(room, seat_index):
 #: `[item+0x2aa] != 0`（可捡），再调 **`0x50f410`** —— 和「子弹撞人」
 #: 「弹跳台弹人」是**同一个**圆相交函数。
 #:
-#: ⚠ 但**这个 20 是估的**：物件那个圆的半径在 `Item` 构造链里，还没读出来。
-#: 20 是照弹跳台那个（`0x510ade` 写死 20.0）取的同量级值。
-#: 偏大 = bot 隔着一点点就捡到；偏小 = 得踩得很准。实机觉得不对就改这里。
-BOT_ITEM_RADIUS = 20.0
+#: ★★ **18 是逆出来的，不再是估的**（V0.3 §118）：`Item` 构造函数
+#: `0x51f2e2` 那一句 `mov [[item+0x13c]+0x18], 0x41900000` 写死的就是
+#: **18.0f** —— 那一格正是碰撞形状的半径，`0x50f410` 拿它和角色那三个圆求交。
+#: （§100 当时按弹跳台那个 20.0 取的同量级值，偏大 2。）
+BOT_ITEM_RADIUS = 18.0
 
 
 def _item_pickups(room, machine, seat_index):
@@ -2028,7 +2029,12 @@ def _item_pickups(room, machine, seat_index):
     """
     quest = room.quest
     body = machine.body
-    if quest is None or body is None or not getattr(quest, "items_at", None):
+    if quest is None or body is None:
+        return []
+    # ★★ 先把**玩家屏幕上已经没了**的那几件摘掉（§118）：原版的掉落物
+    #    13 秒就自己消失，不摘的话 bot 会去捡一件谁也看不见的东西。
+    quest.expire_items(time.monotonic())
+    if not getattr(quest, "items_at", None):
         return []
     character = chrprops.get(machine.character_id)
     circles = character.circles(body.x, body.y, machine.crouched)
@@ -3928,6 +3934,75 @@ def _resolve_terrain_block(shell, terrain, ax, ay, bx, by, ground_t, free_t):
     return True
 
 
+def _reflecting_seats(room, now):
+    """此刻**开着反射护盾**的那些座位（V0.3 §119）。到点的顺手摘掉。"""
+    quest = getattr(room, "quest", None) if room is not None else None
+    table = getattr(quest, "reflect_until", None)
+    if not table:
+        return ()
+    live = []
+    for seat, until in list(table.items()):
+        if until <= now:
+            del table[seat]
+        else:
+            live.append(seat)
+    return tuple(live)
+
+
+def _reflect_shield_hit(room, shell, ax, ay, bx, by, bodies):
+    """这一步有没有撞进谁的反射护盾。撞了返回 `(t, 圆心x, 圆心y, 座位)`。
+
+    ★ 护盾的圆心用**身体那个圆**的圆心（`chrprops.center()`）——
+    原版取的是 `[角色 vft+0x74]`，和瞄准用的那个点同源（§62）。
+    """
+    if not bodies:
+        return None
+    seats = _reflecting_seats(room, time.monotonic())
+    if not seats:
+        return None
+    reach = gameserver.REFLECT_RADIUS + shell.radius
+    best = None
+    for seat_index, px, py, crouched, character_id in bodies:
+        if seat_index not in seats:
+            continue
+        character = chrprops.get(character_id)
+        cx, cy = character.center(px, py, crouched)
+        t = _segment_circle_t(ax, ay, bx, by, cx, cy, reach)
+        if t is None or (best is not None and t >= best[0]):
+            continue
+        best = (t, cx, cy, seat_index)
+    return best
+
+
+def _reflect_off_shield(shell, ax, ay, bx, by, shield):
+    """弹体被反射护盾弹开（V0.3 §119）—— 原版 `0x47f0b4` 起那一段。
+
+    原版是「沿 −v 一步一步退到圆外（最多 5 步），再解线与圆的交点、
+    对半径方向镜像速度」。退出来那一步和这里的「夹到交点上」是同一件事
+    （交点本来就在圆上），所以直接用交点。
+
+    ★ **速度只换方向、不减半**：这条路上没有地形反弹那两个 `× 0.5`
+    （`vft+0x94` / `+0x98`，§110）—— 护盾是把弹体原样弹回去。
+    """
+    t, cx, cy, _seat = shield
+    px = ax + (bx - ax) * t
+    py = ay + (by - ay) * t
+    vx, vy = _shell_velocity(shell)
+    nx, ny = px - cx, py - cy
+    span = math.hypot(nx, ny)
+    if span < 1e-6:
+        shell.vx, shell.vy = -vx, -vy
+    else:
+        nx /= span
+        ny /= span
+        dot = vx * nx + vy * ny
+        shell.vx = vx - 2.0 * dot * nx
+        shell.vy = vy - 2.0 * dot * ny
+    shell.x, shell.y = px, py
+    # 弹过之后闭式解不作数了，和撞地形那一路一样改走逐 tick 积分。
+    shell.bounced = True
+
+
 def _shell_step(room, shell, terrain, bodies):
     """把这颗子弹往前推**一个 tick**，返回 `(落点, 座位号或None, 部位或None)`。
 
@@ -3947,6 +4022,12 @@ def _shell_step(room, shell, terrain, bodies):
     else:
         bx, by = shell.position(shell.ticks + 1)
     shell.ticks += 1
+    # ★★★ 反射护盾排在最前面（§119）：它那个圆半径 50，比谁的碰撞圆都大，
+    #     所以只要有人开着护盾，弹体一定先碰到圆再碰到人。
+    shield = _reflect_shield_hit(room, shell, ax, ay, bx, by, bodies)
+    if shield is not None:
+        _reflect_off_shield(shell, ax, ay, bx, by, shield)
+        return None
     best_t = None
     best = None
     radius = shell.radius

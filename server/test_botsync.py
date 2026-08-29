@@ -4626,6 +4626,132 @@ class BotItemTests(BotFireRoom):
         self.assertAlmostEqual(full * 0.3, slow)
 
 
+class BotGhostItemTests(BotItemTests):
+    """★★★ **已经在玩家屏幕上消失**的道具，bot 不许再捡（V0.3 §118）。
+
+    用户 2026-08-29 17:50：「地上有一个胶水道具，bot 走过去之后，它捡到后
+    突然变成了特殊武器，道具识别是不是不对。」—— **识别没问题**：那一格
+    的确是胶水，可 13 个单位外还躺着一把**已经在地上 95 秒**的核弹发射器，
+    玩家屏幕上早没了，服务端还当它在，于是 bot 一步踩到两件。
+    17:58 那条「闪烁消失之后还能捡到」是同一个根因。
+    """
+
+    def drop_aged(self, item_id, x, y, age):
+        handle = self.drop(item_id, x, y)
+        quest = self.room.quest
+        quest.items_born[handle] = time.monotonic() - age
+        return handle
+
+    def test_an_expired_item_is_not_picked_up(self):
+        self.stand()
+        handle = self.drop_aged(10201, 400.0, 280.0,
+                                gameserver.ITEM_LIFE_SECONDS + 1.0)
+        self.assertEqual([], bot._item_pickups(self.room, self.bot_conn,
+                                               self.bot_seat))
+        self.assertNotIn(handle, self.room.quest.items_at)
+        self.assertIsNone(self.bot_conn.item_weapon, "捡了一把鬼枪")
+
+    def test_a_fresh_item_is_still_picked_up(self):
+        self.stand()
+        handle = self.drop_aged(10300, 400.0, 280.0,
+                                gameserver.ITEM_LIFE_SECONDS - 1.0)
+        got = bot._item_pickups(self.room, self.bot_conn, self.bot_seat)
+        self.assertEqual([(handle, 10300)], got)
+
+    def test_the_ghost_next_door_no_longer_gets_swept_up(self):
+        """★ 用户那一幕：脚下是新鲜的胶水，13 个单位外是一把过期的枪。"""
+        self.stand()
+        glue = self.drop_aged(10400, 400.0, 280.0, 1.0)
+        self.drop_aged(10200, 413.0, 266.0, 95.0)     # 躺了 95 秒的核弹发射器
+        got = bot._item_pickups(self.room, self.bot_conn, self.bot_seat)
+        self.assertEqual([(glue, 10400)], got, "只该捡到胶水")
+        self.assertIsNone(self.bot_conn.item_weapon)
+
+    def test_the_pickup_radius_is_the_reversed_one(self):
+        """★ 18 是 `0x51f2e2` 写死的 `18.0f`，不再是 §100 估的 20。"""
+        self.assertEqual(18.0, bot.BOT_ITEM_RADIUS)
+
+
+class BotReflectShieldTests(BotFireRoom):
+    """★★★ 有反射护盾的人，bot 的弹体该被**弹开**而不是炸掉（V0.3 §119）。
+
+    用户 2026-08-29：「我捡了反射道具，我有反射效果时，bot 扔的苹果弹到我
+    身上还是能直接炸掉，应该反弹才对。」
+
+    原版判定在 `BulletObj` 撞人那条路上（`0x47f09c` 的 `HasAttr(属性 3)`）：
+    命中前先看目标身上有没有 `반사`，有就把弹体从半径 50 的圆里退出来、
+    对圆的法线镜像速度、接着飞。真人之间各机器各算，**bot 的弹体是服务端
+    算的** ⇒ 服务端不记这本账就照旧炸在人身上。
+    """
+
+    def straight_shell(self, x, y, vx, vy):
+        weapon = weapondata.get(1000010)              # ch00-01，直射、无重力
+        shot = ballistics.launch(weapon, 0.0, 1.0)
+        shell = bot.Shell(1, 0, weapon, 9, x, y, shot, 0.0, 200)
+        shell.bounced = True                          # 逐 tick 积分
+        shell.vx, shell.vy = vx, vy
+        return shell
+
+    def target(self, x=500.0, y=300.0, seat=0):
+        return [(seat, x, y, False, self.alice_character())]
+
+    def alice_character(self):
+        return self.room.seats[0].character_id
+
+    def shield(self, seat=0, seconds=None):
+        seconds = (gameserver.REFLECT_SECONDS if seconds is None else seconds)
+        self.room.quest.reflect_until[seat] = time.monotonic() + seconds
+
+    def run_shell(self, shell, bodies, ticks=12):
+        for _ in range(ticks):
+            hit = bot._shell_step(self.room, shell, None, bodies)
+            if hit is not None:
+                return hit
+        return None
+
+    def test_without_a_shield_it_just_hits(self):
+        bodies = self.target()
+        centre = chrprops.get(bodies[0][4]).center(500.0, 300.0, False)
+        shell = self.straight_shell(380.0, centre[1], 20.0, 0.0)
+        self.assertIsNotNone(self.run_shell(shell, bodies), "没护盾就该打中")
+
+    def test_a_shield_bounces_it_back(self):
+        self.shield()
+        bodies = self.target()
+        centre = chrprops.get(bodies[0][4]).center(500.0, 300.0, False)
+        shell = self.straight_shell(380.0, centre[1], 20.0, 0.0)
+        self.assertIsNone(self.run_shell(shell, bodies), "有护盾就不该结算")
+        self.assertLess(shell.vx, 0.0, "该被弹回去")
+        self.assertAlmostEqual(20.0, math.hypot(shell.vx, shell.vy), places=3,
+                               msg="护盾只换方向、不减速（那两个 ×0.5 是地形的）")
+
+    def test_it_stops_on_the_circle_not_inside_the_body(self):
+        self.shield()
+        bodies = self.target()
+        centre = chrprops.get(bodies[0][4]).center(500.0, 300.0, False)
+        shell = self.straight_shell(380.0, centre[1], 20.0, 0.0)
+        self.run_shell(shell, bodies)
+        span = math.hypot(shell.x - centre[0], shell.y - centre[1])
+        self.assertAlmostEqual(gameserver.REFLECT_RADIUS + shell.radius, span,
+                               delta=0.5)
+
+    def test_it_wears_off(self):
+        self.shield(seconds=-0.1)                     # 已经到点了
+        bodies = self.target()
+        centre = chrprops.get(bodies[0][4]).center(500.0, 300.0, False)
+        shell = self.straight_shell(380.0, centre[1], 20.0, 0.0)
+        self.assertIsNotNone(self.run_shell(shell, bodies),
+                             "8 秒过了就该照旧打中")
+        self.assertEqual({}, self.room.quest.reflect_until, "到点的该摘掉")
+
+    def test_somebody_elses_shield_does_not_protect_this_one(self):
+        self.shield(seat=3)
+        bodies = self.target(seat=0)
+        centre = chrprops.get(bodies[0][4]).center(500.0, 300.0, False)
+        shell = self.straight_shell(380.0, centre[1], 20.0, 0.0)
+        self.assertIsNotNone(self.run_shell(shell, bodies))
+
+
 class BotItemWeaponBudgetTests(BotFireRoom):
     """★★★ 捡来的枪**用完就还原**（V0.3 §115）。
 

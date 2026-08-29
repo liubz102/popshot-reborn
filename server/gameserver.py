@@ -2245,6 +2245,31 @@ FREEZER_RANGE = 300.0
 #: `Freezed` 的 `CharAttr` 就是 12）：`Time=2.0`。
 FROZEN_SECONDS = 2.0
 
+#: ★★★ **反射护盾**（`Item.ini` `[Reflect] ItemId=10303 CharAttr=3`，
+#: 全队版 `[TeamReflect] ItemId=10314`）。V0.3 §119。
+#:
+#: 原版的判定在**弹体撞人**那条路上（`BulletObj`，`0x47f07c` 起）：
+#:
+#:     if (被撞的东西.vft+0x48() == 0x190)        ; 是「角色」这一类
+#:         if (HasAttr(角色.属性表 +0x6a0, 3))     ; 0x47f09c: push 3
+#:             ; ★ 不是命中 —— 把弹体从半径 R 的圆里退出来（沿 −v，最多 5 步，
+#:             ;   0x47f108 那个循环），再对圆的法线镜像速度，接着飞
+#:
+#: `R` 在 `0x47f0f0` / `0x47f0ff`：默认 **50.0**，只有 `[char+0x2b0] == 2`
+#: 时才是 70.0。⚠ `[char+0x2b0]` 那一格是什么还没逆出来，先一律按 50。
+#:
+#: ⇒ 真人之间这一套是**各自机器**算的，服务端一个字都不用碰；可 **bot 的
+#: 弹体是服务端算的** —— 不记这本账，bot 的苹果弹就照旧炸在有护盾的人身上
+#: （用户 2026-08-29：「我有反射效果时，bot 扔的苹果弹到我身上还是能直接炸掉」）。
+REFLECT_ITEM_ID = 10303
+TEAM_REFLECT_ITEM_ID = 10314
+
+#: 撑多久 —— `Status.ini` 第 **3** 条（`[Reflect]` 的 `CharAttr` 就是 3）：`Time=8.0`。
+REFLECT_SECONDS = 8.0
+
+#: 护盾那个圆有多大（`0x47f0f0` 的 `0x42480000` = 50.0f）。
+REFLECT_RADIUS = 50.0
+
 #: ★ 烟雾（`Item.ini` 的 `[Smoke]`）。
 SMOKE_ITEM_ID = 10401
 
@@ -2429,6 +2454,27 @@ ITEM_SPAWN_Y_RANGE = (0.0, 2048.0)
 #: 就地不动，服务端记的位置和所有人屏幕上看到的是同一个点。
 #: （原来是 24 —— 差的那 4 个单位会被重力吃掉，服务端却一直按 24 记。）
 ITEM_SPAWN_LIFT = 20.0
+
+#: ★★★ **掉落物在地上躺多久就自己没了**（V0.3 §118）。
+#:
+#: 逆出来的，不是估的 —— `Item` 构造函数 `0x51f2b7` 那三句：
+#:
+#:     mov  eax, 0x32c8            ; 13000
+#:     cdq
+#:     idiv dword ptr [0x6dc528]   ; ÷ 每 tick 多少毫秒（实测 32）
+#:     …
+#:     call 0x5d5e37               ; Timer_Start([item+0x2ac], 那个 tick 数)
+#:
+#: `Item::Tick`（`0x51f37a`）每帧问一次 `[item+0x2ac]` 到期没有，到期就
+#: `jmp [vft+0x20]` 把自己删掉。⇒ **13 秒**。
+#: 最后 **2.6 秒**会闪（`0x51f3b5` / `0x51f3c0` 的 `0x258` / `0xa28`
+#: 就是剩余毫秒 600 / 2600 两道门，中间每 200 ms 明暗一次）——
+#: 用户 2026-08-29 说的「武器闪烁消失」就是它。
+#:
+#: ⇒ **服务端不跟着删，`items_at` 里就全是鬼**：bot 会走过去捡一件
+#: 玩家屏幕上早就没有的东西（17:50 那一局，一把躺了 95 秒的核弹发射器），
+#: 而且 `items_on_map` 的配额被鬼占满，新道具刷不出来。
+ITEM_LIFE_SECONDS = 13.0
 
 #: 挑列的时候最多试几次 —— 图边和纯天空列没有站立面。
 #: ★ 这不是「重试 N 次就当失败」的时序阈值（铁律 10），是**有限集合上的
@@ -3451,6 +3497,15 @@ class RoomQuest:
         #: ★ **道具模式**：服务端刷在地图上、还没被人捡走的道具句柄（§191）。
         #: 只用来卡「地图上最多同时躺几件」，捡走了就从这里去掉。
         self.items_on_map = set()
+        #: ★★ 每件在地上的道具是**什么时候刷的**（`{句柄: time.monotonic()}`，
+        #: V0.3 §118）。原版的掉落物 13 秒就自己没了（最后 2.6 秒闪烁），
+        #: 服务端不跟着删的话 `items_at` 里全是玩家早就看不见的鬼。
+        self.items_born = {}
+        #: ★★ 每个座位的**反射护盾**撑到什么时候（`{座位: 时刻}`，V0.3 §119）。
+        #: `Status.ini [3] 반사 Time=8.0`。收方的弹体撞到有这个属性的人
+        #: 会被**弹开**而不是炸掉（`0x47f09c` 那道 `HasAttr(3)` 门），
+        #: 而 bot 的弹体是服务端算的 ⇒ 这边不记就照旧炸在人身上。
+        self.reflect_until = {}
         #: 本局下发过的每一件 `0x0404` 的「句柄 -> 物件 id」（服务端刷的和
         #: 客户端掉的都记）。★ 拾取放行时**只有靠它才知道捡到的是什么** ——
         #: `0x0407` 只带句柄，而要不要补一发 `0x040b` 完全取决于物件类型（§194）。
@@ -3621,6 +3676,36 @@ class RoomQuest:
         """这个句柄上是哪件东西？没记过就是 ``None``（当成不进道具槽处理）。"""
         return self.item_handles.get(handle & 0xFFFFFFFF)
 
+    def expire_items(self, now=None):
+        """把**已经在玩家屏幕上消失**的那几件从账上摘掉（V0.3 §118）。
+
+        返回摘掉的 `[(句柄, 物件 id)]`。
+
+        原版的掉落物在地上只躺 `ITEM_LIFE_SECONDS`（13 秒，`0x51f2b7` 那个
+        13000 ÷ 每 tick 毫秒），到点 `Item::Tick` 自己把对象删掉，
+        最后 2.6 秒还会闪烁提示。**服务端一直没跟这条**，于是：
+
+        * bot 会走过去「捡」一件玩家早就看不见的东西 —— 用户 2026-08-29
+          17:50 报的「地上是胶水，bot 捡完却换成了特殊武器」，那把核弹发射器
+          已经在地上躺了 **95 秒**；17:58 报的「闪烁消失之后还能捡到」同理；
+        * `items_on_map` 的 8 件配额被鬼占着，新道具刷不出来。
+
+        ⚠ **不发任何包**：客户端那边是自己的计时器删的，我们补一发
+        `0x0405` 反而会在别人屏幕上放一次不该有的拾取特效。
+        ⚠ 只管**服务端刷的**那些（在 `items_born` 里）。客户端自己掉的金币 /
+        红心不进这本账，它们那 13 秒也由客户端自己管。
+        """
+        now = time.monotonic() if now is None else now
+        gone = []
+        for handle, born in list(self.items_born.items()):
+            if now - born < ITEM_LIFE_SECONDS:
+                continue
+            del self.items_born[handle]
+            self.items_on_map.discard(handle)
+            self.items_at.pop(handle, None)
+            gone.append((handle, self.item_id_of(handle)))
+        return gone
+
     def claim_item(self, handle, seat_id):
         """拾取仲裁。第一个来的返回 True，之后一律 False。
 
@@ -3634,6 +3719,7 @@ class RoomQuest:
         # 服务端刷的那件被人捡走了，地图上就少一件（配额腾出来）。
         self.items_on_map.discard(handle)
         self.items_at.pop(handle, None)
+        self.items_born.pop(handle, None)
         # ★ 金币在**这里**入账，不在 `grant_picked_item` 里 —— 那个函数只管
         #   「要不要补一发 0x040b」，金币根本不进道具槽、会被它提前 return 掉。
         #   仲裁这一步才是「这一件确定归这个座位了」的唯一判定点。
@@ -3703,6 +3789,9 @@ class RoomQuest:
         **捡了当场换枪**的特殊武器（核弹发射器 / 火焰喷射器 / 水炮，§223）。
         """
         now = time.monotonic() if now is None else now
+        # ★★ 先把过期的清掉再看配额（§118）：不清的话地上的鬼会把
+        #    8 件的名额一直占着，新道具刷不出来。
+        self.expire_items(now)
         if now < self.next_item_spawn_at:
             return None
         # 先把下一次的时刻推掉，再决定这一次刷不刷 —— 配额满的时候
@@ -3728,6 +3817,8 @@ class RoomQuest:
         # ★★ 位置也要记：bot 靠它判「我踩到这件了没有」（V0.3 §100）。
         #    真人那边是客户端自己算碰撞，服务端本来一点位置都不需要。
         self.items_at[handle] = (float(x), float(y))
+        # ★★ 刷的时刻也要记：13 秒之后它在每台客户端上都没了（§118）。
+        self.items_born[handle] = now
         return handle, item_id, x, y
 
     # -- 死亡 / 重生 --------------------------------------------------------
@@ -4111,6 +4202,8 @@ class RoomQuest:
         keep = self.player_handles
         self.items_taken.clear()
         self.items_at.clear()
+        self.items_born.clear()
+        self.reflect_until.clear()
         del self.slow_mines[:]
         del self.freeze_bursts[:]
         del self.smokes[:]
@@ -6677,6 +6770,24 @@ class Conn:
         | 烟雾 10401 | 同上，云在使用者脚下（D67）|
         """
         item_id = int(item_id)
+        # ★★★ 反射护盾（§119）：和位置无关，记的是「谁、到什么时候」。
+        #     bot 的弹体撞上有护盾的人要**弹开**，不是炸掉。
+        if item_id in (REFLECT_ITEM_ID, TEAM_REFLECT_ITEM_ID):
+            until = time.monotonic() + REFLECT_SECONDS
+            seats = [int(seat_id)]
+            if item_id == TEAM_REFLECT_ITEM_ID:
+                # 全队版：客户端 `UseItemEffect` 把它换成 10303 再对同队
+                # 每个座位来一遍（§194 那段注释里写的就是这条）。
+                room = self.lobby_room()
+                mine = room.seats[seat_id].team if room is not None else None
+                if room is not None and mine:
+                    seats = [i for i, s in enumerate(room.seats)
+                             if s.conn is not None and s.team == mine]
+            for seat in seats:
+                quest.reflect_until[seat] = until
+            self.log(f"   反射护盾 座位 {seats} 撑 {REFLECT_SECONDS:g} 秒"
+                     f"（bot 的弹体打上去会被弹开，§119）")
+            return
         if item_id not in (FREEZER_ITEM_ID, SMOKE_ITEM_ID):
             return
         trail = getattr(self, "sync_trail", None)

@@ -970,6 +970,63 @@ class ItemPoolTests(unittest.TestCase):
         self.assertNotIn(10302, gameserver.ITEM_INI_ITEM_IDS)
 
 
+class ItemLifetimeTests(unittest.TestCase):
+    """★★★ 掉落物在地上只躺 13 秒，服务端得跟着删（V0.3 §118）。
+
+    用户 2026-08-29：「地上有一个胶水道具，bot 走过去之后，它捡到后突然
+    变成了特殊武器」/「武器闪烁消失，之后 bot 走过去却捡到了特殊武器」。
+
+    两条是**同一个根因**：`Item` 构造函数 `0x51f2b7` 起了一个
+    `13000 ÷ 每tick毫秒` 的计时器，到点 `Item::Tick` 把自己删掉
+    （最后 2.6 秒闪烁）。服务端从来没跟这条 —— 于是 `items_at` 里全是
+    玩家早就看不见的鬼，bot 照捡不误，配额也被占死。
+    """
+
+    def quest_with(self, *ages):
+        """造一个道具模式的镜像，按 `ages`（秒）往地上摆几件。"""
+        quest = RoomQuest()
+        now = 1000.0
+        for i, age in enumerate(ages):
+            handle = quest.allocate_item() & 0xFFFFFFFF
+            quest.items_on_map.add(handle)
+            quest.remember_item(handle, 10300 + i)
+            quest.items_at[handle] = (100.0 * i, 200.0)
+            quest.items_born[handle] = now - age
+        return quest, now
+
+    def test_a_stale_item_is_dropped(self):
+        quest, now = self.quest_with(gameserver.ITEM_LIFE_SECONDS + 0.5)
+        self.assertEqual(1, len(quest.items_at))
+        gone = quest.expire_items(now)
+        self.assertEqual(1, len(gone))
+        self.assertEqual({}, quest.items_at)
+        self.assertEqual(set(), quest.items_on_map)
+
+    def test_a_fresh_one_stays(self):
+        quest, now = self.quest_with(gameserver.ITEM_LIFE_SECONDS - 0.5)
+        self.assertEqual([], quest.expire_items(now))
+        self.assertEqual(1, len(quest.items_at))
+
+    def test_the_lifetime_is_the_reversed_one(self):
+        """★ 13 秒不是估的 —— `0x51f2b7` 的 13000 ÷ `[0x6dc528]`（=32）。"""
+        self.assertEqual(13.0, gameserver.ITEM_LIFE_SECONDS)
+
+    def test_the_quota_frees_up_so_new_ones_can_spawn(self):
+        """★★ 鬼把 8 件的名额占死，新道具就再也刷不出来了。"""
+        quest, now = self.quest_with(*([20.0] * gameserver.ITEM_SPAWN_MAX_ALIVE))
+        quest.next_item_spawn_at = 0.0
+        self.assertEqual(gameserver.ITEM_SPAWN_MAX_ALIVE,
+                         len(quest.items_on_map))
+        self.assertIsNotNone(quest.due_item_spawn(now=now),
+                             "过期的清掉之后就该刷得出来")
+
+    def test_taking_one_forgets_when_it_was_born(self):
+        quest, _now = self.quest_with(1.0)
+        handle = next(iter(quest.items_at))
+        self.assertTrue(quest.claim_item(handle, 0))
+        self.assertEqual({}, quest.items_born)
+
+
 class GroundItemSpawnTests(unittest.TestCase):
     """★★ 刷新点必须挑在**东西真的躺得住**的地方（V0.3 §114）。
 
