@@ -5529,3 +5529,86 @@ Bresenham 线和 ftol 取整，试过换成整数端点的 DDA，只从 65.21 �
 「图顶上面 `y < 0` 不算实心」）；`_terrain_contact()` / `_muzzle_blocked()`
 共用同一组采样点；`_bounce_shell()` 落点取整；`_block_facing()` 用被挡的
 那个探测点。`_disc_offsets` / `_rim_offsets` / `_disc_blocked` 三个函数删掉。
+
+---
+
+## §117 ★★★★★ 「打几发就结束」的三条状态（`Magazine`），服务端必须替 bot 数
+
+用户 2026-08-29：「bot 捡到加强道具后，苹果弹模型会变大，这个没问题，
+但是变大的苹果弹应该打几次之后就恢复的，但是 bot 的苹果弹一直不恢复。」
+
+★ **和 §115 不是一条链** —— §115 修的是地上那三把**枪**（`ForceTime` /
+`ForceCount`），这一条是箱子道具挂的**状态**（`Status.ini` 的 `Magazine`）。
+
+### 数据
+
+| 物件 | `Item.ini` `CharAttr` | `Status.ini` 那一节 |
+|---|---|---|
+| 10306 TripleShot 三重射击 | 6 | `Magazine=3` |
+| **10307 PowerShot 强力射击** | **7** | **`Magazine=3` `DamageRatio=2.0` `SizeRatio=2.0`** |
+| 10500 BulletPoison 毒弹 | 10 | `Magazine=3` `OneMagazine=1` |
+
+`SizeRatio=2.0` 就是用户看到的「苹果弹模型变大」。
+
+### 为什么 bot 的不结束（接 §200 / §201）
+
+`Status.ini` 里绝大多数状态有 `Time`，每台机器各自倒计时、自己撤掉。
+这三条**只有 `Magazine`、没有 `Time`** ⇒ `UseItemEffect` 给的时长是
+**−1（无限）**，真正的结束条件是「**开了 Magazine 发**」。
+数这个数的只有**持有者那台机器**，数完在
+`Character::RemoveAttrEffect`（`0x50982e`）里那句
+`if ([char+0x2ac] == 我的座位)` 发一发 `0x040d` 告诉别人。
+
+⇒ bot 没有本机 ⇒ **没有一台会数** ⇒ 效果永远挂着。
+实机日志钉死：16:55:06 bot 用了 10307，此后到这一局结束**一发 `0x040d`
+都没有**（真人座位 0 那边同一局有三发）。
+
+### 实装
+
+* `gameserver.MAGAZINE_STATUS`：`物件 id -> (属性号, 弹数, 伤害倍率, 大小倍率)`；
+* `BotConn.magazine_attrs`（`{属性号: 剩余发数}`），死亡 / 换图跟着清
+  （`Character::Reset` 那时候客户端自己会拆，**不用**补 `0x040d`）；
+* `_use_held_item()` 挂上就开始数；`_spend_magazine_shots()` 挂在**开火那一刻**，
+  数完广播 `0x040d(座位, 属性号)`；
+* ★★ **倍率也得跟**：`Shell.damage_ratio` / `size_ratio` 在开火那一刻定死，
+  `Shell.radius = Size × SizeRatio`。`SizeRatio` 非跟不可 —— 每台客户端都把
+  bot 那颗弹体放大了，服务端还按原半径判地形 / 判命中的话，两边又不是同一颗
+  （正是 §116 刚修掉的那类分歧）。`DamageRatio` 不跟的话这件道具对 bot
+  纯粹是个特效（伤害是服务端填进 `rpExplode` 的，收方照抄，§42）。
+
+⚠ **`OneMagazine`（毒弹独有）含义还没逆出来**，先当它不影响发数。
+⚠ 「一发」按 **`rpFire`** 算（和 §115 的 `ForceCount` 同一个口径）。
+三重射击一发出三颗，两种读法会不一样 —— 苹果弹一发一颗，用户这条碰不到。
+
+## §118 ★★★ 火墙用例的偶发红：判据落在**两次挂钟读数之间**（铁律 10 踩在测试里）
+
+`test_botsync.BotGameModeDamageTests.test_the_fire_wall_doubles_in_deathmatch`
+在 3.14 上单跑 **200 次红 2 次**（`模式 3 该掉血`，`burns` 为空），
+Win7 的 3.8 跑全量也偶尔命中。**是用例的问题，产品代码没错。**
+
+### 链路
+
+用例按 `(生存, 夺分)` 两轮跑，每轮：清 `burnt` → 走一步 → 造一道新墙
+（`born_tick -= BOT_FIRE_REBURN_TICKS`）→ `fires = [新墙]` → 再走一步量伤害。
+
+* 上一轮那道墙活 **76 个 tick**（≈2.4 秒，`60 + 4×4`），第二轮开头**还在
+  `machine.fires` 里**；
+* 而再烧的账记在**人**身上（§85），第二轮开头刚被清空 ⇒ 那道旧墙在
+  「走一步」那一帧**可以再烧一次**，把 alice 的免伤时刻戳按到「此刻」；
+* 20 个 tick 的冷却于是把新墙第 1 个 tick 那一发吃掉 ⇒ `burns` 空。
+
+★★ **旧墙烧不烧，取决于 `time.monotonic()` 有没有跨过一个 tick 边界**：
+`_advance_fires()` 的 `end = _clock_tick(now)` 是之后才读的挂钟，
+`start = born_tick + ticks + 1` 是上一帧留下的。同一个 tick 内 `range()` 是空的
+（正常情况），跨一格就多出恰好一个 tick。一个 tick 32 ms，单测一整轮才几十
+微秒 ⇒ 几百次翻一次。
+
+### 修法
+
+把 `fires` 和 `burnt` **一起**在墙装好之后清，中间不再走帧。判定就只剩
+「墙推到第 1 个 tick、账本是空的」：`start = born_tick + 1` 恒 ≤ `end`，
+和挂钟走了多远无关。3.14 单跑 **400 次 0 红**，两个运行时全量 1660 条全绿。
+
+⚠ 教训：铁律 10（判据不许落在真实时间上）**对测试同样成立**。
+把出生时刻往回多退几个 tick「离边界远一点」是治标 —— 那只是把翻面的概率
+调小，判据还在挂钟上。

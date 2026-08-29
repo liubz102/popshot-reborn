@@ -40,7 +40,7 @@ import udpsync                                                 # noqa: E402
 import weapondata                                              # noqa: E402
 from gameserver import OP_LEAVE_SESSION, OP_PEER_DATA_DOWN, \
     OP_PEER_DATA_UP                                            # noqa: E402
-from test_battle import opcodes                                # noqa: E402
+from test_battle import bodies, opcodes                        # noqa: E402
 from lobby import TEAM_A, TEAM_B                                # noqa: E402
 from test_bot import BotBattleRoom, chat_lines                 # noqa: E402
 from test_mapdata import make_record                           # noqa: E402
@@ -4725,6 +4725,96 @@ class BotItemWeaponBudgetTests(BotFireRoom):
         self.assertEqual(3, self.bot_conn.item_weapon_shots)
 
 
+class BotMagazineStatusTests(BotFireRoom):
+    """★★★ 「打几发就结束」的那三条状态，服务端得**自己数**（V0.3 §117）。
+
+    用户 2026-08-29：「bot 捡到加强道具后，苹果弹模型会变大，这个没问题，
+    但是变大的苹果弹应该打几次之后就恢复的，但是 bot 的苹果弹一直不恢复。」
+
+    `Status.ini` 里绝大多数状态有 `Time`，客户端各自倒计时、自己撤掉；
+    强力射击 `[7]` / 三重射击 `[6]` / 毒弹 `[10]` **只有 `Magazine=3`**，
+    时长是 −1（无限），真正的结束条件是「持有者打完 3 发」——
+    只有他那台机器数得出来，数完发一发 `0x040d`（§200）。
+    bot 没有本机 ⇒ 没有一台会替它数 ⇒ 永远是加强状态。
+    """
+
+    def use(self, item_id):
+        """让 bot 用掉一件道具（和 `_item_pickups` 之后那一步同一条路）。"""
+        self.room.quest.grant_item(self.bot_seat, item_id)
+        self.clear()
+        return bot._use_held_item(self.room, self.bot_conn, self.bot_seat)
+
+    def shoot(self, times=1):
+        for _ in range(times):
+            bot._spend_magazine_shots(self.room, self.bot_conn, self.bot_seat)
+
+    def removals(self):
+        return bodies(self.alice, gameserver.OP_REMOVE_CHAR_ATTR)
+
+    def test_using_it_starts_the_count(self):
+        self.assertTrue(self.use(10307))
+        self.assertEqual({7: 3}, self.bot_conn.magazine_attrs)
+
+    def test_the_other_two_magazine_items_count_too(self):
+        self.use(10306)                              # 三重射击
+        self.assertEqual({6: 3}, self.bot_conn.magazine_attrs)
+        self.bot_conn.magazine_attrs = {}
+        self.use(10500)                              # 毒弹
+        self.assertEqual({10: 3}, self.bot_conn.magazine_attrs)
+
+    def test_a_timed_item_is_left_to_the_clients(self):
+        """★ 有 `Time` 的（护盾 8 秒…）客户端自己会撤，服务端一格都不记。"""
+        self.use(10300)
+        self.assertEqual({}, self.bot_conn.magazine_attrs)
+
+    def test_it_survives_the_first_two_shots(self):
+        self.use(10307)
+        self.clear()
+        self.shoot(2)
+        self.assertEqual({7: 1}, self.bot_conn.magazine_attrs)
+        self.assertNotIn(gameserver.OP_REMOVE_CHAR_ATTR, opcodes(self.alice),
+                         "才打两发就撤掉了")
+
+    def test_the_third_shot_ends_it_and_tells_everybody(self):
+        """★★ 不广播 `0x040d` 的话，别人屏幕上那个效果永远不会结束（§200）。"""
+        self.use(10307)
+        self.clear()
+        self.shoot(3)
+        self.assertEqual({}, self.bot_conn.magazine_attrs)
+        self.assertIn(gameserver.OP_REMOVE_CHAR_ATTR, opcodes(self.alice))
+        seat, attr = struct.unpack_from("<ii", self.removals()[-1], 0)
+        self.assertEqual((self.bot_seat, 7), (seat, attr))
+
+    def test_a_power_shot_really_is_twice_as_big_and_twice_as_hard(self):
+        """★★ `SizeRatio=2.0` 非跟不可：每台客户端都把 bot 那颗放大了，
+        服务端还按原半径判地形 / 判命中就又不是同一颗弹了（§116 的形状）。"""
+        self.use(10307)
+        self.bot_conn.next_fire_at = 0.0
+        self.approach_far(settle=False)
+        shells = self.bot_conn.pending_shots
+        self.assertTrue(shells, "这一下应该开火了")
+        shell = shells[0]
+        self.assertEqual(2.0, shell.size_ratio)
+        self.assertEqual(2.0, shell.damage_ratio)
+        self.assertEqual(shell.weapon.size * 2.0, shell.radius)
+
+    def test_a_plain_shot_is_unchanged(self):
+        self.bot_conn.next_fire_at = 0.0
+        self.approach_far(settle=False)
+        shell = self.bot_conn.pending_shots[0]
+        self.assertEqual(1.0, shell.size_ratio)
+        self.assertEqual(shell.weapon.size, shell.radius)
+
+    def test_dying_clears_it_without_a_packet(self):
+        """★ 死一次属性表就空了（`Character::Reset`），每台客户端自己拆 ——
+        这边跟着清就行，**不用**补 `0x040d`。"""
+        self.use(10307)
+        self.clear()
+        self.bot_conn.magazine_attrs = {}            # `_tick_bot` 死亡分支干的事
+        self.shoot(3)
+        self.assertNotIn(gameserver.OP_REMOVE_CHAR_ATTR, opcodes(self.alice))
+
+
 class BotShellBodyLerpTests(BotFireRoom):
     """★★★ 判命中要用「**那一 tick** 人在哪」，不是「此刻人在哪」（§96）。
 
@@ -5336,11 +5426,31 @@ class BotGameModeDamageTests(BotFireRoom):
                                self.damage_of_one_shot(), places=3)
 
     def test_the_fire_wall_doubles_in_deathmatch(self):
+        """地面燃烧的伤害也走 `_damage_scale()`（§87）。
+
+        ⚠ **火墙和再烧账本要一起装、装完立刻量**，中间不许再走一帧
+        （会话 38 修的偶发红）：
+
+        * `fires` —— 上一轮那道墙活 76 个 tick（≈2.4 秒），这一轮开头
+          还在烧；
+        * `burnt` —— 再烧的账记在**人**身上（§85）。上一轮那道墙只要在
+          这一轮的站位那一步上再烧一次，就把 alice 的免伤时刻戳按到
+          「此刻」，新墙第 1 个 tick 那一发就被 20 tick 的冷却吃掉，
+          `burns` 空 ⇒ 红。
+
+        ★★ 而它烧不烧，取决于 `time.monotonic()` 在这中间**有没有跨过一个
+        tick 边界** —— `_advance_fires()` 的 `end = _clock_tick(now)` 是之后
+        才读的挂钟，一个 tick 32 ms，而单测一整轮才几十微秒，所以是几百次
+        里翻一次（3.14 上 200 次红 2 次，Win7 的 3.8 上跑全量偶尔命中）。
+        判据落在真实时间上就是铁律 10 说的那件事，只不过踩在测试里。
+
+        ⇒ 把这两样都**在墙装好之后**清掉，判定就只剩「墙推到第 1 个 tick、
+        账本是空的」，`start = born_tick + 1` 恒 ≤ `end`，和挂钟无关。
+        """
         flame = weapondata.get(1001500)
         for mode, want in ((gameserver.PVP_MODE_SURVIVAL, flame.damage),
                            (gameserver.PVP_MODE_DEATHMATCH, flame.damage * 2)):
             self.set_mode(mode)
-            self.bot_conn.burnt = {}
             self.walk(self.alice, [(400, 100)])
             spot = self.alice.sync_trail[-1][:2]
             life = bot._fire_wall_ticks(flame)
@@ -5349,8 +5459,12 @@ class BotGameModeDamageTests(BotFireRoom):
                 [bot.Flame(botsync.projectile_handle(self.bot_seat, 0),
                            float(spot[0]), float(spot[1]), 0, life)],
                 time.monotonic(), life)
+            # ★ 往回退 20 个 tick = 这道墙「已经烧了一会儿」，这一帧才有
+            #   tick 可推（`start = born_tick + ticks + 1` 得 ≤ `end`）。
             wall.born_tick -= bot.BOT_FIRE_REBURN_TICKS
+            # ★★ 墙和账本一起装，装完立刻量 —— 见上面那段。
             self.bot_conn.fires = [wall]
+            self.bot_conn.burnt = {}
             self.clear()
             self.walk(self.alice, [tuple(spot)])
             burns = [f for f in bot_frames(self.alice, self.bot_seat)

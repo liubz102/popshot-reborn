@@ -383,6 +383,12 @@ class BotConn(gameserver.Conn):
         #:   `None` = 这把枪不限时。原版的 `ForceTime`（`+0x94` -> `[+0x38]`
         #:   = 拿到手的时刻 + 它）。火焰喷射器 15 秒、水炮 10 秒。
         self.item_weapon_until = None
+        #: ★★★ **按「还能打几发」算的状态**：`{属性号: 剩余发数}`
+        #:   （`gameserver.MAGAZINE_STATUS`，V0.3 §117）。
+        #:   强力射击 / 三重射击 / 毒弹这三条在 `Status.ini` 里**只有
+        #:   `Magazine`、没有 `Time`**，客户端不会自己撤 —— 得服务端数完
+        #:   补一发 `0x040d`。空 = 身上没有这一类状态。
+        self.magazine_attrs = {}
         #: ★ 踩到减速胶水之后**减速到什么时候**（`time.monotonic()` 的刻度）；
         #:   `None` = 没中招（V0.3 §101）。
         self.slowed_until = None
@@ -463,6 +469,8 @@ class BotConn(gameserver.Conn):
         self.pending_shots = []
         # ★ 捡来的枪跟着清：新一局 / 换图之后地上那件东西已经不存在了。
         self.drop_item_weapon()
+        # ★ 按发数算的状态跟着清：客户端重建角色时属性表也整个没了。
+        self.magazine_attrs = {}
         self.slowed_until = None
         self.frozen_until = None
         # ★ 身体快照跟着清：换图之后上一张图的坐标一个字都不作数，
@@ -1501,7 +1509,8 @@ BOT_LONG_SHOT_RANGE = 1024.0
 BOT_DAMAGE_PENALTY = 0.75
 
 
-def _direct_hit_damage(room, machine, weapon, region, victim_seat):
+def _direct_hit_damage(room, machine, weapon, region, victim_seat,
+                       damage_ratio=1.0):
     """**直接命中**要填进 `rpExplode +24` 的伤害（§87 + §89）。
 
     三步，顺序和 `0x47ec5b` 那条链一模一样：
@@ -1515,7 +1524,8 @@ def _direct_hit_damage(room, machine, weapon, region, victim_seat):
     不是爆点到目标。踩没踩地读的是 `[char+0x128]`，服务端这边就是心跳
     位域的 bit2（§5.6）—— 读不出来就**不减**，宁可少扣也不要凭空扣。
     """
-    damage = weapon.damage_for(region) * _damage_scale(room)
+    # ★ 强力射击的 `DamageRatio`（§117）—— 原版也是在射手这边算完才塞进包的。
+    damage = int(weapon.damage_for(region) * damage_ratio) * _damage_scale(room)
     if _pvp_game_mode(room) not in BOT_LONG_SHOT_MODES:
         return damage
     shooter = machine.battle_pos
@@ -2174,7 +2184,65 @@ def _use_held_item(room, machine, seat_index):
         gameserver.build_game(gameserver.OP_ITEM_EFFECT,
                               gameserver.build_item_effect(seat_index, item_id)),
         reason=f"：bot 的道具 {item_id} 生效")
+    # ★★★ 按发数算的那三条状态：服务端得**自己开始数**（§117）。
+    #     有 `Time` 的客户端会自己撤，只有这三条要人补 `0x040d`。
+    entry = gameserver.MAGAZINE_STATUS.get(item_id)
+    if entry is not None:
+        attr_id, rounds = entry[0], entry[1]
+        machine.magazine_attrs[attr_id] = rounds
+        machine.log(f"   状态 {gameserver.CHAR_ATTR_NAMES.get(attr_id, attr_id)}"
+                    f"（属性 {attr_id}）挂上了，还能打 {rounds} 发")
     return True
+
+
+def _magazine_ratios(machine):
+    """身上那些按发数算的状态叠出来的 `(伤害倍率, 弹体大小倍率)`（§117）。
+
+    强力射击是 `DamageRatio=2.0` / `SizeRatio=2.0`，另外两条都是 1。
+    ★ **`SizeRatio` 非做不可**：每台客户端都会把 bot 那颗弹体照着放大，
+    服务端还按原半径判地形 / 判命中的话，两边的弹体又不是同一颗了
+    （§116 刚修掉的正是这类分歧）。
+    """
+    damage = size = 1.0
+    for attr_id in machine.magazine_attrs:
+        for entry in gameserver.MAGAZINE_STATUS.values():
+            if entry[0] == attr_id:
+                damage *= entry[2]
+                size *= entry[3]
+                break
+    return (damage, size)
+
+
+def _spend_magazine_shots(room, machine, seat_index):
+    """开了一发 —— 身上那些按发数算的状态各减一，数完的**撤掉**（§117）。
+
+    原版是持有者那台机器数的：`Status.ini` 只写了 `Magazine`、没有 `Time`，
+    `UseItemEffect` 给的时长是 −1，属性表每帧扫过去时靠这个计数收尾，
+    收尾的那一下顺手发一发 `0x040d`（`Character::RemoveAttrEffect` 里
+    `if ([char+0x2ac] == 我的座位)` 那一句，§200）。
+
+    ⇒ **不发这一发，别人屏幕上那个效果永远不会结束**
+    —— 用户 2026-08-29 报的「bot 的苹果弹一直是加强状态」就是它。
+    """
+    if not machine.magazine_attrs:
+        return
+    for attr_id in list(machine.magazine_attrs):
+        left = machine.magazine_attrs[attr_id] - 1
+        if left > 0:
+            machine.magazine_attrs[attr_id] = left
+            continue
+        del machine.magazine_attrs[attr_id]
+        name = gameserver.CHAR_ATTR_NAMES.get(attr_id, attr_id)
+        machine.log(f"   状态 {name}（属性 {attr_id}）打完了，撤掉")
+        try:
+            machine.battle_broadcast(
+                gameserver.build_game(
+                    gameserver.OP_REMOVE_CHAR_ATTR,
+                    gameserver.build_remove_char_attr(seat_index, attr_id)),
+                reason=f"：bot 的状态 {name} 结束")
+        except OSError as error:
+            machine.log(f"   ⚠ 状态 {name} 的结束没广播出去（{error!r}），"
+                        f"服务端这边照样算它结束了")
 
 
 def _broadcast_status(room, machine, seat_index, status_item_id, why):
@@ -3231,7 +3299,8 @@ class Shell(object):
 
     __slots__ = ("handle", "fire_seq", "weapon", "group", "x0", "y0",
                  "shot", "born", "ticks", "x", "y", "max_ticks",
-                 "vx", "vy", "locked", "bounced")
+                 "vx", "vy", "locked", "bounced",
+                 "damage_ratio", "size_ratio")
 
     def __init__(self, handle, fire_seq, weapon, group, x0, y0, shot, born,
                  max_ticks):
@@ -3262,6 +3331,20 @@ class Shell(object):
         #: ★★ **已经在地上弹过了**（带引信的武器，§84）。弹过之后弹道
         #:   不再是闭式解，改走 `vx/vy` 逐 tick 积分那一路。
         self.bounced = False
+        #: ★★ 开火那一刻射手身上那些**按发数算的状态**给的倍率（§117）。
+        #:   强力射击是伤害 ×2、弹体大小 ×2。在**开火那一刻**定死，
+        #:   不跟着状态到期变 —— 这一颗已经飞出去了。
+        self.damage_ratio = 1.0
+        self.size_ratio = 1.0
+
+    @property
+    def radius(self):
+        """这一颗**实际**的碰撞半径 = `Size × SizeRatio`（§116 / §117）。
+
+        ★ 判地形、判命中、判弹跳台一律用它，不要直接读 `weapon.size`
+        —— 强力射击那三发在每台客户端上都是两倍大的。
+        """
+        return self.weapon.size * self.size_ratio
 
     def position(self, ticks):
         return ballistics.position_at(self.x0, self.y0, self.shot, ticks)
@@ -3778,7 +3861,7 @@ def _block_facing(shell, terrain, ax, ay, bx, by, ground_t):
     """
     hx = int(ax + (bx - ax) * ground_t)
     hy = int(ay + (by - ay) * ground_t)
-    radius = shell.weapon.size
+    radius = shell.radius
     if radius and radius >= 1.0:
         for ox, oy in shell_probe_offsets(radius, bx - ax, by - ay):
             if terrain.blocks_bullet(hx + ox, hy + oy):
@@ -3866,7 +3949,7 @@ def _shell_step(room, shell, terrain, bodies):
     shell.ticks += 1
     best_t = None
     best = None
-    radius = shell.weapon.size
+    radius = shell.radius
     for seat_index, px, py, crouched, character_id in bodies:
         character = chrprops.get(character_id)
         for cx, cy, r, region in character.circles(px, py, crouched):
@@ -3954,7 +4037,7 @@ def _jump_pad_shell(shell, terrain):
     if not _bounces_off_terrain(shell.weapon):
         return False
     vx, vy = _shell_velocity(shell)
-    reach = botmove.JUMP_PAD_RADIUS + shell.weapon.size
+    reach = botmove.JUMP_PAD_RADIUS + shell.radius
     for px, py, dx, dy in pads:
         if _segment_circle_t(shell.x, shell.y, shell.x + vx, shell.y + vy,
                              px, py, reach) is None:
@@ -4018,7 +4101,8 @@ def _splash_targets(room, shell, point, victim_seat, bodies):
         return []
     # ★ 目标那 35 是加在**半径**上的（`0x485831` 把两边的 `vft+0x7c` 相加）。
     reach = span_max + SPLASH_BODY_RADIUS
-    full = int(weapon.splash_damage)
+    # ★ 强力射击的 `DamageRatio` 也吃在溅射上（§117）。
+    full = int(weapon.splash_damage * shell.damage_ratio)
     scale = _damage_scale(room)
     out = []
     for seat_index, px, py, crouched, character_id in bodies:
@@ -4059,7 +4143,8 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region):
     # ★★ 夺分模式伤害翻倍（§87）+ 夺分独有的两条 ×0.75（§89）——
     #   原版是射手那台机器在把数字塞进包之前做的
     #   （`0x4806f1: shl` / `0x47e6df` / `0x47e6fe`）。
-    damage = (_direct_hit_damage(room, machine, weapon, region, victim_seat)
+    damage = (_direct_hit_damage(room, machine, weapon, region, victim_seat,
+                                 shell.damage_ratio)
               if hit else 0)
     # ★★★ 组包 + **爆炸对象的句柄记账**在同一次加锁里（§86）：收方处理这一
     #   发时会创建那个溅射对象，它和弹体共用同一个计数器。
@@ -4897,6 +4982,9 @@ def _try_fire(room, machine, seat_index, weapon, target, now):
     #   由 `_resolve_shell()` 的 `sync.explode()` 单独记。
     #   ⚠ `/noboom` 开着时不发爆炸，那一个自然也就不记 —— 两边天然一致，
     #     不再需要单独打补丁（用户 2026-08-27 踩过的那条路）。
+    # ★★ 这一颗的倍率在**开火那一刻**定死（§117）：状态可能在它飞到一半
+    #    时打完撤掉，可这一颗已经是放大过的了。
+    damage_ratio, size_ratio = _magazine_ratios(machine)
     step = weapon.fire_step
     # ★★★ 碰撞排除组（§63）：**填错就是「明明躲开了还掉血」**。
     #   收方把它写进弹体的 `[proj+0x15c]`，和角色的一比，相同就整个跳过
@@ -4941,12 +5029,17 @@ def _try_fire(room, machine, seat_index, weapon, target, now):
     #   创建弹体的前一步 `0x5151dd`）。到 0 之后由 `_expire_item_weapon()`
     #   下一帧换回自己那把 —— 和原版一样，是「刷新武器」时才结算。
     _spend_item_weapon_shot(machine)
+    # ★★ 强力射击 / 三重射击 / 毒弹这三条状态同样按**发**消耗（§117）。
+    #    打完就地撤掉并广播 `0x040d` —— 不发的话别人屏幕上永远不结束。
+    _spend_magazine_shots(room, machine, seat_index)
     terrain = mapdata.load(_current_map(room))
     max_ticks = _shell_max_ticks(terrain, shot, weapon)
     for offset in range(weapon.shots):
-        machine.pending_shots.append(
-            Shell(handle + offset, fire_seq, weapon, group,
-                  muzzle_x, muzzle_y, shot, now, max_ticks))
+        shell = Shell(handle + offset, fire_seq, weapon, group,
+                      muzzle_x, muzzle_y, shot, now, max_ticks)
+        shell.damage_ratio = damage_ratio
+        shell.size_ratio = size_ratio
+        machine.pending_shots.append(shell)
     machine.next_fire_at = _reload_after_shot(machine, weapon, now)
     # ★ 松手 = 蓄力清零（`0x51685c: and [char+0x594], 0`，§73）。
     #   下一颗手雷得从头按起。
@@ -5051,6 +5144,9 @@ def _tick_bot(room, machine, seat_index):
         # ★ 捡来的枪也丢掉：真人死了重生就换回自己那把（§223 的 `GiveWeapon`
         #   是「换成这把」，重生时 `Character::Reset` 把武器恢复成角色本来的）。
         machine.drop_item_weapon()
+        # ★ 按发数算的状态也清：死一次属性表就空了（`Character::Reset`），
+        #   每台客户端自己会拆掉，这边不用补 `0x040d`。
+        machine.magazine_attrs = {}
         # ★ 减速 / 冰冻也一样：死一次身上的状态就清了（`Character::Reset`）。
         machine.slowed_until = None
         machine.frozen_until = None
