@@ -148,6 +148,36 @@ class SyntheticTests(unittest.TestCase):
         self.assertEqual(2, self.t.ground_above(3, 3))
         self.assertEqual(5, self.t.ground_above(3, 6))
 
+    def test_first_solid_skips_one_way_platforms(self):
+        """★★ 掉落物**穿过**单向平台（§114）—— 站立面不是它的判据。
+
+        x=0 这一列最上面的站立面是 y=5 那条白线，可一件道具会一直掉到
+        y=7 的地面上。按站立面刷道具，服务端记的位置就会比屏幕上高一层。
+        """
+        self.assertEqual(5, self.t.surfaces(0)[0])       # 人站白线上
+        self.assertEqual(7, self.t.first_solid(0))       # 东西落到地面上
+        # x=3 最上面就是实心浮空块，两个判据一致。
+        self.assertEqual(2, self.t.surfaces(3)[0])
+        self.assertEqual(2, self.t.first_solid(3))
+
+    def test_first_solid_looks_inside_a_run(self):
+        """白线**直接压在**实心上时，那一段只报一个站立面 —— 得往里找。"""
+        rows = ["0000",
+                "0000",
+                "1111",      # 白线
+                "2222",      # 紧贴着的实心
+                "0000"]
+        t = mapdata.MapTerrain(make_record(rows))
+        self.assertEqual((2,), tuple(t.surfaces(1)))     # 只有一个站立面
+        self.assertEqual(3, t.first_solid(1))            # 东西停在实心那一格
+
+    def test_first_solid_returns_none_for_a_sky_column(self):
+        t = mapdata.MapTerrain(make_record(["0000", "0000", "0000"]))
+        self.assertIsNone(t.first_solid(2))
+        # 整列只有白线的一样没有落点。
+        t2 = mapdata.MapTerrain(make_record(["0000", "1111", "0000"]))
+        self.assertIsNone(t2.first_solid(2))
+
     def test_line_blocked_through_the_block(self):
         # 从浮空块左边穿到右边，中间隔着 x=3..4 的实心。
         self.assertTrue(self.t.line_blocked(0, 2, 7, 2, step=1))

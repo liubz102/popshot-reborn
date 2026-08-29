@@ -45,7 +45,9 @@ from gameserver import (                                       # noqa: E402
 )
 from lobby import (Lobby, MOVE_INTO_ALREADY_PLAYING,               # noqa: E402
                    TEAM_A, TEAM_B, TEAM_LAYOUT_TEAMS)
+import mapdata                                                      # noqa: E402
 import relayserver                                                  # noqa: E402
+import test_mapdata                                                 # noqa: E402
 
 
 # ----------------------------------------------------------------------------
@@ -966,6 +968,81 @@ class ItemPoolTests(unittest.TestCase):
         self.assertNotIn(10302, gameserver.PVP_ITEM_IDS)
         self.assertNotIn(10302, gameserver.PVP_TEAM_ITEM_IDS)
         self.assertNotIn(10302, gameserver.ITEM_INI_ITEM_IDS)
+
+
+class GroundItemSpawnTests(unittest.TestCase):
+    """★★ 刷新点必须挑在**东西真的躺得住**的地方（V0.3 §114）。
+
+    用户 2026-08-29：「有一把特殊枪掉落在平台下方的地面上，而 bot 站在
+    上方平台，bot 走到道具枪的正上方时，枪被 bot 捡起来了。」
+
+    真因：老口径挑的是**站立面**（`is_solid`，含那种细白线单向平台），
+    可掉落物的 `vft+0x100` 是 `xor al,al ; ret` —— 它**穿过白线**掉到
+    下面那层实心地面上。服务端却一直按白线的高度记着，于是 bot 站在白线
+    平台上、横坐标一对上就把下面那把枪「捡」走了。
+    """
+
+    #: 一张 4 列 × 60 行的小图：y=20 一条细白线（单向平台，东西穿过去），
+    #: y=50 实心地面（东西停在这儿）。★ 高度要够 —— 落点还要往上抬
+    #: `ITEM_SPAWN_LIFT`，抬到图顶外面就是「换一列」。
+    WHITE_LINE_Y = 20
+    FLOOR_Y = 50
+    HEIGHT = 60
+
+    @classmethod
+    def rows(cls, floor=True):
+        return ["1111" if y == cls.WHITE_LINE_Y
+                else "2222" if (floor and y == cls.FLOOR_Y)
+                else "0000"
+                for y in range(cls.HEIGHT)]
+
+    class Picker:
+        """把「随机挑一列」钉成固定的一列。"""
+
+        def __init__(self, column):
+            self.column = column
+
+        def randrange(self, _width):
+            return self.column
+
+        def uniform(self, low, _high):
+            return low
+
+    def setUp(self):
+        self.terrain = mapdata.MapTerrain(
+            test_mapdata.make_record(self.rows()))
+        self.saved = mapdata.load
+        mapdata.load = lambda name: self.terrain if name else None
+
+    def tearDown(self):
+        mapdata.load = self.saved
+
+    def spawn(self, column=1):
+        return gameserver.ground_item_spawn("Tiny", self.Picker(column))
+
+    def test_it_lands_on_the_solid_floor_not_on_the_white_line(self):
+        x, y = self.spawn()
+        self.assertEqual(1.0, x)
+        # 白线在上、实心地面在下 —— 必须按地面算。
+        self.assertEqual(self.FLOOR_Y - gameserver.ITEM_SPAWN_LIFT, y)
+        self.assertNotEqual(self.WHITE_LINE_Y - gameserver.ITEM_SPAWN_LIFT, y)
+        # ★ 这就是老口径挑的那个点 —— 站立面第一个是白线。
+        self.assertEqual(self.WHITE_LINE_Y, self.terrain.surfaces(1)[0])
+
+    def test_the_lift_is_the_items_own_probe_offset(self):
+        """★ 20 = `vft+0x104` 返回的那一对 `(0, 20)`：物件静止躺在地上时，
+        它的坐标就是「地面 − 20」⇒ 客户端重力一算就地不动。"""
+        self.assertEqual(20.0, gameserver.ITEM_SPAWN_LIFT)
+
+    def test_a_column_with_only_a_white_line_is_skipped(self):
+        terrain = mapdata.MapTerrain(
+            test_mapdata.make_record(self.rows(floor=False)))
+        mapdata.load = lambda _name: terrain
+        self.assertIsNone(self.spawn())
+
+    def test_no_terrain_falls_back_to_the_old_random_path(self):
+        mapdata.load = lambda _name: None
+        self.assertIsNone(gameserver.ground_item_spawn("Tiny"))
 
 
 class ItemSpawnTeamModeTests(ItemSpawnBase):

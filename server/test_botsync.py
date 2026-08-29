@@ -4493,8 +4493,22 @@ class BotItemTests(BotFireRoom):
         bot._item_pickups(self.room, self.bot_conn, self.bot_seat)
         self.assertEqual(1900000, self.bot_conn.weapon.id)
         # 死一次就换回自己那把。
-        self.bot_conn.item_weapon = None
+        self.bot_conn.drop_item_weapon()
         self.assertNotEqual(1900000, self.bot_conn.weapon.id)
+
+    def test_an_item_below_the_platform_is_left_alone(self):
+        """★★ 「bot 走到道具枪的**正上方**就把它捡起来了」（V0.3 §114）。
+
+        横坐标对上不算数 —— 纵坐标差着一层平台的时候，三个碰撞圆一个都够
+        不着。这条钉的是判定本身；刷新点为什么会错开一层见
+        `test_battle.GroundItemSpawnTests`。
+        """
+        self.stand()                                 # 脚在 y=300
+        handle = self.drop(10201, 400.0, 460.0)      # 下面那层地面
+        self.assertEqual([], bot._item_pickups(self.room, self.bot_conn,
+                                               self.bot_seat))
+        self.assertIn(handle, self.room.quest.items_at)
+        self.assertIsNone(self.bot_conn.item_weapon)
 
     def _mine(self, x, y, age=None):
         """在 `(x, y)` 放一摊胶水，`age` = 已经放了多久（缺省 = 刚布好）。"""
@@ -4610,6 +4624,105 @@ class BotItemTests(BotFireRoom):
         slow = bot.botmove.walk_speed(
             who, scale=gameserver.SLOWED_SPEED_RATIO)
         self.assertAlmostEqual(full * 0.3, slow)
+
+
+class BotItemWeaponBudgetTests(BotFireRoom):
+    """★★★ 捡来的枪**用完就还原**（V0.3 §115）。
+
+    用户 2026-08-29：「bot 捡到道具枪后，过一段时间后，道具枪应该恢复成
+    正常枪的，但是 bot 从此以后一直拿着道具枪，不会自动恢复。」
+
+    真因和 §100 / §109 同形：额度记在**持枪那台机器**上
+    （`[持枪器+0x30/0x34/0x38]`，每帧由 `0x48be09` 结算），bot 没有本机
+    ⇒ 没有一台会替它数。`weapon.ini` 里的两个键就是额度本身：
+    `ch-nuke ForceCount=3`、`ch-flamer ForceTime=15000`、
+    `ch-water ForceTime=10000`。
+    """
+
+    def take(self, item_id):
+        """让 bot 捡到地上那把枪，返回它的 `weapondata.Weapon`。"""
+        bot._take_weapon_item(self.bot_conn, self.bot_seat, item_id)
+        return self.bot_conn.item_weapon
+
+    def expire(self, now):
+        return bot._expire_item_weapon(self.room, self.bot_conn,
+                                       self.bot_seat, now)
+
+    def test_the_nuke_is_metered_in_shots(self):
+        weapon = self.take(10200)                    # 迷你核弹发射器
+        self.assertEqual(1900020, weapon.id)
+        self.assertEqual(3, weapon.force_count)
+        self.assertEqual(3, self.bot_conn.item_weapon_shots)
+        self.assertIsNone(self.bot_conn.item_weapon_until, "它不限时")
+
+    def test_the_throwers_are_metered_in_seconds(self):
+        for item_id, ammo, seconds in ((10201, 1900000, 15.0),
+                                       (10202, 1900030, 10.0)):
+            self.bot_conn.drop_item_weapon()
+            weapon = self.take(item_id)
+            self.assertEqual(ammo, weapon.id)
+            self.assertEqual(seconds, weapon.force_ms / 1000.0)
+            self.assertIsNone(self.bot_conn.item_weapon_shots, "它不限发数")
+            self.assertIsNotNone(self.bot_conn.item_weapon_until)
+
+    def test_it_keeps_the_nuke_until_the_last_shot_is_spent(self):
+        self.take(10200)
+        for spent in range(3):
+            self.assertFalse(self.expire(time.monotonic()),
+                             f"才打了 {spent} 发就还原了")
+            bot._spend_item_weapon_shot(self.bot_conn)
+        self.assertEqual(0, self.bot_conn.item_weapon_shots)
+        self.assertTrue(self.expire(time.monotonic()))
+        self.assertIsNone(self.bot_conn.item_weapon)
+
+    def test_it_keeps_a_thrower_until_the_time_is_up(self):
+        self.take(10201)                             # 15 秒
+        deadline = self.bot_conn.item_weapon_until
+        self.assertFalse(self.expire(deadline - 0.5))
+        self.assertEqual(1900000, self.bot_conn.weapon.id)
+        self.assertTrue(self.expire(deadline))
+        self.assertIsNone(self.bot_conn.item_weapon)
+
+    def test_a_thrower_never_runs_out_of_shots(self):
+        """★ 限时的两把 `ForceCount` 是 0 —— 原版那一跳减不到它们头上。"""
+        self.take(10202)
+        for _ in range(50):
+            bot._spend_item_weapon_shot(self.bot_conn)
+        self.assertIsNone(self.bot_conn.item_weapon_shots)
+        self.assertFalse(self.expire(self.bot_conn.item_weapon_until - 0.1))
+
+    def test_the_switch_back_is_announced_to_everyone(self):
+        """★★ 不发 `rpChangeWeapon` 的话，别人屏幕上那把枪不会变回去
+        —— 收方那条路只认包，自己不带额度。"""
+        self.take(10200)
+        self.clear()
+        for _ in range(3):
+            bot._spend_item_weapon_shot(self.bot_conn)
+        self.assertTrue(self.expire(time.monotonic()))
+        frames = change_weapon_frames(self.alice, self.bot_seat)
+        self.assertTrue(frames, "还原没有广播出去")
+        seat, ammo = struct.unpack_from("<Bi", body_of(frames[-1]), 0)
+        self.assertEqual(self.bot_seat, seat)
+        self.assertEqual(self.bot_conn.weapon.id, ammo)
+        self.assertNotEqual(1900020, ammo)
+
+    def test_firing_spends_a_shot(self):
+        """★ 扣次数挂在**开火那一刻**（原版 `0x48bade` 就在造弹体的前一步）。"""
+        self.take(10200)
+        before = self.bot_conn.item_weapon_shots
+        self.bot_conn.next_fire_at = 0.0
+        self.approach()
+        self.assertLess(self.bot_conn.item_weapon_shots, before)
+
+    def test_dying_drops_the_budget_with_the_gun(self):
+        """★ 三格要一起清：留着余额的话，下一把枪会带着上一把的账。"""
+        self.take(10200)
+        bot._spend_item_weapon_shot(self.bot_conn)
+        self.bot_conn.drop_item_weapon()
+        self.assertIsNone(self.bot_conn.item_weapon_shots)
+        self.assertIsNone(self.bot_conn.item_weapon_until)
+        self.assertEqual(3, self.take(10200).force_count)
+        self.assertEqual(3, self.bot_conn.item_weapon_shots)
 
 
 class BotShellBodyLerpTests(BotFireRoom):
@@ -4756,6 +4869,73 @@ class BotShellGirthTests(TerrainMixin, BotFireRoom):
             bot._terrain_stop_t(terrain, 1360, 100, 1399, 100, 8.0))
         self.assertIsNotNone(
             bot._terrain_stop_t(terrain, 40, 100, 1, 100, 8.0))
+
+
+class BotShellProbeShapeTests(TerrainMixin, BotFireRoom):
+    """★★★ 弹体那个「粗细」是**朝前的**，不是一个圆盘（V0.3 §116）。
+
+    用户 2026-08-29：「bot 扔了一个苹果弹，从平台上面扔到下层地面，
+    反弹过后落点和炸点位置不一致。」
+
+    真因：§83 把形状拟合成半径 `Size` 的**实心圆盘**，而原版的采样点是
+    `形状中心 + 半径 × 单位速度矢量`（`0x50e98c`）再加一个 `(0, 半径)`
+    （`0x50e904` 取 `vft+0x104`）—— **朝前一个点 + 正下方一个点**。
+    圆盘是各向同性的，于是「贴着侧面飞过去」被误判成撞上：那一发
+    （句柄 200193）在服务端第 7 tick 撞上右边 6.7 个单位外的斜坡当场弹开，
+    客户端那颗从旁边擦过去继续下落，爆炸时两颗差了 **264 个单位**。
+    """
+
+    def wall_on_the_right(self):
+        """左边一条深谷，x ≥ 300 是一堵从天到地的墙。"""
+        return synth_terrain("probe_side", floor=430, width=600, height=440,
+                             walls=((300, 600, 0),))
+
+    def test_the_offsets_are_the_two_the_client_uses(self):
+        # 正右方飞：鼻尖在 +x、另一个恒在正下方。
+        self.assertEqual(((0, 8), (8, 0)),
+                         bot.shell_probe_offsets(8.0, 10.0, 0.0))
+        # 正下方落：两个点重合成一个方向，都在下面。
+        self.assertEqual(((0, 8), (0, 8)),
+                         bot.shell_probe_offsets(8.0, 0.0, 5.0))
+
+    def test_a_wall_beside_it_does_not_stop_a_falling_shell(self):
+        """★★★ 就是用户那一发：墙在**侧面** 7 个单位，直着往下落**不该停**。"""
+        terrain = self.wall_on_the_right()
+        self.assertTrue(terrain.blocks_bullet(300, 200), "夹具没造对")
+        self.assertIsNone(
+            bot._terrain_stop_t(terrain, 293, 100, 293, 200, 8.0),
+            "墙在侧面，擦过去不该被判撞上（圆盘那一版就是死在这儿）")
+
+    def test_the_same_wall_stops_it_head_on(self):
+        """★ 同一堵墙，**朝它飞**就该停 —— 停在离墙一个 `Size` 的地方。"""
+        terrain = self.wall_on_the_right()
+        hit = bot._terrain_stop_t(terrain, 200, 100, 320, 100, 8.0)
+        self.assertIsNotNone(hit)
+        stop_x = 200 + (320 - 200) * hit
+        self.assertAlmostEqual(292.0, stop_x, delta=1.5)
+
+    def test_a_ledge_under_it_still_stops_it(self):
+        """★ 正下方那个采样点还在 —— §83 「擦到台子上沿」那一类照旧停住。"""
+        terrain = synth_terrain("girth", floor=400, width=1400, height=440,
+                                walls=((700, 1400, 300),))
+        self.assertIsNotNone(
+            bot._terrain_stop_t(terrain, 600, 293, 800, 293, 8.0))
+
+    def test_the_bounce_lands_on_an_integer_cell(self):
+        """★★ 收方逐**整数格**扫掠，弹开之后的落点一定是整数
+        （客户端逐帧日志里每一次反弹都是 `(123, 835)` 这种整点）。"""
+        terrain = synth_terrain("girth", floor=400, width=1400, height=440,
+                                walls=((700, 1400, 300),))
+        weapon = weapondata.get(1000020)
+        shell = bot.Shell(1, 0, weapon, 9, 400.0, 100.0,
+                          ballistics.launch(weapon, 1.2, 30.0), 0.0, 200)
+        for _ in range(60):
+            bot._shell_step(self.room, shell, terrain, [])
+            if shell.bounced:
+                break
+        self.assertTrue(shell.bounced, "这一发应该会落地弹起来")
+        self.assertEqual(float(int(shell.x)), shell.x)
+        self.assertEqual(float(int(shell.y)), shell.y)
 
 
 class BotHighLobTicksTests(BotFireRoom):

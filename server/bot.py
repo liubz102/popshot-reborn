@@ -373,8 +373,16 @@ class BotConn(gameserver.Conn):
         #:   **逐 tick 插值**出「那一 tick 人在哪」（§96）。
         self.shell_bodies = None
         #: ★ 地上捡到的特殊武器（`weapondata.Weapon`）；`None` = 用自己那把。
-        #:   捡到就一直用（和真人一样），死了重生时清掉。
+        #:   死了重生时清掉，用完（见下面两格）也清掉。
         self.item_weapon = None
+        #: ★★ 捡来那把枪**还能打几发**；`None` = 这把枪不限发数（V0.3 §115）。
+        #:   原版的 `ForceCount`，落在武器记录的 `+0x98`、角色那边的
+        #:   `[持枪器+0x34]`，每开一发 `0x48baee` 减一。核弹发射器 = 3。
+        self.item_weapon_shots = None
+        #: ★★ 捡来那把枪**能拿到什么时候**（`time.monotonic()` 的刻度）；
+        #:   `None` = 这把枪不限时。原版的 `ForceTime`（`+0x94` -> `[+0x38]`
+        #:   = 拿到手的时刻 + 它）。火焰喷射器 15 秒、水炮 10 秒。
+        self.item_weapon_until = None
         #: ★ 踩到减速胶水之后**减速到什么时候**（`time.monotonic()` 的刻度）；
         #:   `None` = 没中招（V0.3 §101）。
         self.slowed_until = None
@@ -454,7 +462,7 @@ class BotConn(gameserver.Conn):
         #   补发只会拿一个查不到的句柄去撞 `0x492750` 那个静默丢弃。
         self.pending_shots = []
         # ★ 捡来的枪跟着清：新一局 / 换图之后地上那件东西已经不存在了。
-        self.item_weapon = None
+        self.drop_item_weapon()
         self.slowed_until = None
         self.frozen_until = None
         # ★ 身体快照跟着清：换图之后上一张图的坐标一个字都不作数，
@@ -510,7 +518,7 @@ class BotConn(gameserver.Conn):
         「用几号枪」，不是「打不了就别打」。
         """
         # ★ 地上捡到的那三把特殊武器压过一切（§223 / §100）：真人捡到也是
-        #   **当场换枪**，直到死了重生才换回来。
+        #   **当场换枪**，直到打完 / 到点 / 死了才换回来（§115）。
         if self.item_weapon is not None:
             return self.item_weapon
         if self.weapon_slot is not None:
@@ -518,6 +526,18 @@ class BotConn(gameserver.Conn):
             if chosen is not None:
                 return chosen
         return weapondata.preferred_for(self.character_id)
+
+    def drop_item_weapon(self):
+        """把捡来的那把枪连同它的两个计数一起丢掉。
+
+        ★ 三格要一起动，所以收在一个地方：漏清计数的话，下一次捡到同一类
+        枪时会带着上一把的余额（原版 `0x48be2f` 也是三格一起清）。
+        ★ **只改状态、不发包** —— `rpChangeWeapon` 由调用方决定发不发
+        （重生 / 换图那两条路上客户端自己就把武器复位了）。
+        """
+        self.item_weapon = None
+        self.item_weapon_shots = None
+        self.item_weapon_until = None
 
     def __repr__(self):
         return f"<BotConn {self.nickname} 座位 {self.my_seat}>"
@@ -2036,17 +2056,94 @@ def _take_weapon_item(machine, seat_index, item_id):
     有 `cmp [char+0x2ac], 0x409f7d()`：**只有那台机器上的本地玩家会换**。
     bot 不是任何一台机器的本地玩家 ⇒ 没有一台会替它换 ⇒ 必须这边换完再
     用 `rpChangeWeapon` 声明出去。
+
+    ★★ **两个额度也在这里起算**（V0.3 §115）：`vf_11c` 调的是
+    `0x517121(角色, 武器id, 0)` 且 eax = 0 —— 那两个 0 的意思正是
+    「用这把枪自己的 `ForceTime` / `ForceCount`」（`0x517130` / `0x517148`
+    两处从武器记录的 `+0x94` / `+0x98` 补进来）。
     """
     weapon_id = gameserver.PVP_WEAPON_GIVES.get(item_id)
     weapon = None if weapon_id is None else weapondata.get(weapon_id)
     if weapon is None:
         machine.log(f"   捡到特殊武器 {item_id}，但服务端没有这把枪的记录，只捡不换")
         return
+    now = time.monotonic()
     machine.item_weapon = weapon
+    # 0 = 这把枪不限发数 / 不限时（原版拿 0 当「这一路不设限」，`0x48ba6e`
+    # 和 `0x48ba82` 两处都是「参数为 0 就不写那一格」）。
+    machine.item_weapon_shots = weapon.force_count or None
+    machine.item_weapon_until = (now + weapon.force_ms / 1000.0
+                                 if weapon.force_ms else None)
     machine.log(f"   捡到特殊武器 {item_id} -> {weapon.id}({weapon.section}) "
-                f"伤害 {weapon.damage}")
+                f"伤害 {weapon.damage}；额度 "
+                f"{_item_weapon_budget(machine)}")
     with contextlib.suppress(botsync.SyncInvariantError):
         _declare_weapon(machine, seat_index, machine.weapon)
+
+
+def _item_weapon_budget(machine):
+    """捡来那把枪的额度，给日志看的一行字。"""
+    parts = []
+    if machine.item_weapon_shots is not None:
+        parts.append(f"{machine.item_weapon_shots} 发")
+    if machine.item_weapon_until is not None:
+        parts.append(f"{machine.item_weapon.force_ms / 1000.0:g} 秒")
+    return " + ".join(parts) if parts else "无（下一帧就还原）"
+
+
+def _spend_item_weapon_shot(machine):
+    """打完一发，捡来那把枪的**次数**减一（原版 `0x48bade`）。
+
+    ★ 只对「有发数限制」的那一把（核弹发射器）有效；限时的两把喷射器
+    `ForceCount` 是 0，原版那一跳（`cmp [+0x2c], 0` / `[+0x34] > 0`）
+    压根不会减到它们头上。
+    """
+    if machine.item_weapon is None or machine.item_weapon_shots is None:
+        return
+    if machine.item_weapon_shots > 0:
+        machine.item_weapon_shots -= 1
+
+
+def _expire_item_weapon(room, machine, seat_index, now):
+    """捡来的那把枪打完 / 到点了就换回自己那把（V0.3 §115）。换了返回 `True`。
+
+    ## 为什么非服务端做不可
+
+    和 §100 的拾取、§109 的状态是**同一个形状**：真人那把临时枪的两个额度
+    记在**他自己那台机器**上（`[持枪器+0x30/0x34/0x38]`），每帧由
+    `0x48be09` 判「两个都到头了 ⇒ `[+0x2c] = −1`，换回本来那把」。
+    bot 没有本机 ⇒ 没有一台会替它数 ⇒ 它会**一辈子举着那把枪**
+    （用户 2026-08-29 报的就是这个）。而收方那边 `rpChangeWeapon` 走的是
+    「直接改武器」那一路，**不带额度**，所以别人的机器也不会自己还原。
+
+    ## 判据照抄 `0x48be09`
+
+    ```text
+    还能打的发数 = (ForceCount != 0) ? 剩余发数 : 0      ← 0x48ba3a
+    还能拿的时间 = (到期时刻 != 0 && 到期 > 现在) ? … : 0 ← 0x48ba47
+    两个都是 0  ⇒  换回去
+    ```
+
+    ⇒ **一把两样都没写的枪捡到手就会立刻还原**。原版就是这个结果，
+    地上那三把各写了一样，所以谁也碰不到这条边。
+    """
+    if machine.item_weapon is None:
+        return False
+    shots_left = machine.item_weapon_shots or 0
+    timed_out = (machine.item_weapon_until is None
+                 or machine.item_weapon_until <= now)
+    if shots_left > 0 or not timed_out:
+        return False
+    spent = machine.item_weapon
+    machine.drop_item_weapon()
+    own = machine.weapon
+    machine.log(f"   捡来的 {spent.id}({spent.section}) 用完了，换回 "
+                f"{own.id if own is not None else '（这个角色没有能用的枪）'}")
+    # ★ `own is None` = 这个角色一把可用的枪都没有（D29）。这时**不发**
+    #   `rpChangeWeapon` —— 没有 id 可填，而且 bot 本来也不会开火。
+    if own is not None:
+        _declare_weapon(machine, seat_index, own)
+    return True
 
 
 def _use_held_item(room, machine, seat_index):
@@ -2658,10 +2755,15 @@ def _path_blocked(terrain, x0, y0, shot, radius=0.0):
     """
     if terrain is None:
         return False
+    # ★ 采样点组和 `_terrain_contact()` 必须是同一套（§116）：这里判「枪口
+    #   通不通」，那边判「飞到哪儿撞上」，两边口径不一样就会出现
+    #   「开火时觉得通、结算时当场撞在枪口上」。
     if radius and radius >= 1.0:
-        if _disc_blocked(terrain, int(x0), int(y0), _disc_offsets(radius)):
-            return True
-    elif terrain.blocks_bullet(int(x0), int(y0)):
+        offsets = shell_probe_offsets(radius, math.cos(shot.angle),
+                                      math.sin(shot.angle))
+    else:
+        offsets = ((0, 0),)
+    if _probe_blocked(terrain, int(x0), int(y0), offsets):
         return True
     points = ballistics.path_points(x0, y0, shot)
     for (ax, ay), (bx, by) in zip(points, points[1:]):
@@ -3245,51 +3347,56 @@ def _segment_circle_t(ax, ay, bx, by, cx, cy, radius):
     return t if 0.0 <= t <= 1.0 else None
 
 
-#: 圆盘 / 圆环的整数格偏移表，按半径缓存（半径都是 `weapon.size`，就那几种）。
-_DISC_OFFSETS = {}
-_RIM_OFFSETS = {}
+def shell_probe_offsets(radius, dx, dy):
+    """收方拿**哪几个点**去查地形（V0.3 §116）。返回整数格偏移的元组。
 
+    ## 这是逆出来的，不是拟合的
 
-def _disc_offsets(radius):
-    """半径 `radius` 的**实心**圆盘覆盖到的整数格偏移。"""
-    key = int(radius)
-    got = _DISC_OFFSETS.get(key)
-    if got is None:
-        limit = key * key
-        got = tuple((ox, oy)
-                    for oy in range(-key, key + 1)
-                    for ox in range(-key, key + 1)
-                    if ox * ox + oy * oy <= limit)
-        _DISC_OFFSETS[key] = got
-    return got
+    扫掠函数 `0x50e759` 每走到线上一格，就拿一组**偏移**去查那一格
+    （`0x50ea43` 的 `linePoint + offset[j]`）。偏移只有两种来源：
 
+    ```text
+    offset[0] = ftol([vft+0x104])                       ← 0x50e904..0x50e935
+                弹体类一律 0x47c7d3 = (0.0, [vft+0x7c]) = (0, 半径)
+    offset[n] = ftol(形状中心 + 半径 × 单位速度矢量)      ← 0x50e98c..0x50e9b0
+                fld [shape+0x18]        ; 半径
+                fmul [ebp-0x50/-0x4c]   ; × 单位速度的 x / y
+                fadd [shape+0x10/+0x14] ; + 形状中心
+    ```
 
-def _rim_offsets(radius):
-    """半径 `radius` 的圆盘**最外一圈**（厚 1 格）的整数格偏移。
+    ⇒ **是沿飞行方向前伸的一个点 + 正下方一个点，不是一个圆盘。**
 
-    ★ 沿线一格一格走的时候只查这一圈就够：圆盘每步只挪 1 格，
-    任何格子要落进圆盘内部，**必先经过某一步的外圈**。
-    起点那一格例外（弹体可能直接生在地形里），所以起点查整个圆盘。
+    ## ★★ 这一条推翻了 §83 的「圆盘」
+
+    §83 只看到「停下那一点离最近实心格恰好一个 `Size`」，就把形状拟合成
+    半径 `Size` 的**实心圆盘**。可圆盘是**各向同性**的，而这个采样点组是
+    **朝前**的 —— 两者在「贴着侧面飞过去」时结论相反：
+
+    | | 圆盘 r=Size | 鼻尖 + 正下方（原版）|
+    |---|---|---|
+    | 客户端明明飞过去了、模型说撞上（5312 个样本）| **102** | **2** |
+    | 客户端撞上了、模型没拦住（5 次真反弹）| 0 | **0** |
+
+    样本是 2026-08-29 16:17 那一局 `Iceria_b` 的客户端逐帧日志 `PROJ.`
+    （21 条弹道）。**102 次误判**就是用户报的「苹果弹从平台扔到下层地面，
+    反弹后落点和炸点不一致」：那一发（句柄 200193）在服务端第 7 tick 撞上了
+    右边 6.7 个单位外的斜坡、当场弹开往左走，客户端那颗从旁边擦过去继续下落
+    —— 到爆炸时两颗差了 **264 个单位**（服务端炸在 `(24.75, 814.86)`，
+    玩家看见的那颗在 `(286, 852)`）。
     """
-    key = int(radius)
-    got = _RIM_OFFSETS.get(key)
-    if got is None:
-        outer = key * key
-        inner = (key - 1) * (key - 1)
-        got = tuple((ox, oy)
-                    for oy in range(-key, key + 1)
-                    for ox in range(-key, key + 1)
-                    if inner < ox * ox + oy * oy <= outer)
-        _RIM_OFFSETS[key] = got
-    return got
+    offsets = [(0, int(radius))]
+    span = math.hypot(dx, dy)
+    if span > 1e-9:
+        offsets.append((int(radius * dx / span), int(radius * dy / span)))
+    return tuple(offsets)
 
 
-def _disc_blocked(terrain, x, y, offsets):
-    """圆心在 `(x, y)` 的那个圆盘（用给定偏移表）碰到挡子弹的格子了吗。
+def _probe_blocked(terrain, x, y, offsets):
+    """这一组采样点里有没有一个落在挡子弹的地形上。
 
-    ★★ **图顶上面（`y < 0`）不算**（§83）。`TerrainData::Get`（`0x472fe0`）
+    ★★ **图顶上面（`y < 0`）不算实心**（§83）。`TerrainData::Get`（`0x472fe0`）
     对出界一律返回 2，可实机逐帧日志里弹体是**从图顶飞出去又落回来**的
-    （句柄 200048 第 36 帧在 `(1323.48, 0.68)`，圆盘早该顶到 `y = −7` 了，
+    （句柄 200048 第 36 帧在 `(1323.48, 0.68)`，采样点早该顶到 `y = −7` 了，
     它照飞不误）。把顶上算成实心的话，高抛的手雷会在半空中被判撞墙 ——
     那两发实测差了 400 / 495 个单位。左右和底下照旧算实心。
     """
@@ -3308,42 +3415,34 @@ def _terrain_contact(terrain, ax, ay, bx, by, radius=0.0):
 
     用 `blocks_bullet()` 那一路 —— 单向平台（值 1）挡人不挡子弹（§29）。
 
-    ## ★★★ 弹体是**有粗细**的，不是一个点（§83）
+    ## ★★★ 弹体是**有粗细**的，不是一个点（§83 / ★ 形状按 §116 收口）
 
-    这里原来只查**圆心**那一格。可弹体的碰撞形状是半径 `Size` 的圆盘
-    （`weapon.ini` 的 `Size`：直射弹 4、抛射弹 8），收方是拿**整个形状**
-    去撞地形的 —— 于是「圆心还在空中、边缘已经蹭上平台」的那些发，
-    服务端全部放行、一路飞下去，在几百个单位以外才炸。
+    这里原来只查**圆心**那一格，于是「圆心还在空中、边缘已经蹭上平台」的
+    那些发服务端全部放行、一路飞下去，在几百个单位以外才炸（用户报的
+    「手雷空中飞一半突然消失，过一会儿在地图边缘炸」）。
 
-    实机对上的证据（2026-08-28 的客户端逐帧日志 `PROJ.`，Forest_b）：
-    6 发被地形停住的火焰弹，**停下那一点到最近的实心格的距离分别是
-    8.06 / 7.00 / 6.71 / 8.94 / 7.00 / 6.40** —— 全部贴着 `Size = 8`，
-    而不是 0~1.4（那才是「只看圆心」该有的样子）。
-    其中句柄 200072 那一发停在 `(1070, 369)`，服务端却让它又飞了 1.1 秒、
-    在 `(1644.8, 582.3)` 才炸 —— 用户报的「手雷空中飞一半突然消失了，
-    过了一会儿在右边地图边缘出现了爆炸动画」就是它。
+    ⚠ **粗细的形状是「前伸的一个点 + 正下方一个点」，不是圆盘**
+    —— 见 `shell_probe_offsets()`。圆盘那一版会在「贴着侧面飞过去」时
+    误判成撞上，5312 个客户端样本里错 102 次。
 
     ⚠ 反弹要用**撞上之前**那一点（收方也是把弹体夹回最后一个不重叠的
     采样点），否则弹体贴在地形里，下一 tick 一开头又撞上，原地卡死。
     """
     if terrain is None:
         return (None, None)
-    if radius and radius >= 1.0:
-        rim = _rim_offsets(radius)
-        if _disc_blocked(terrain, int(ax), int(ay), _disc_offsets(radius)):
-            return (0.0, 0.0)
-        probe = lambda x, y: _disc_blocked(terrain, x, y, rim)   # noqa: E731
-    else:
-        if terrain.blocks_bullet(int(ax), int(ay)):
-            return (0.0, 0.0)
-        probe = terrain.blocks_bullet
     dx = bx - ax
     dy = by - ay
+    if radius and radius >= 1.0:
+        offsets = shell_probe_offsets(radius, dx, dy)
+    else:
+        offsets = ((0, 0),)
+    if _probe_blocked(terrain, int(ax), int(ay), offsets):
+        return (0.0, 0.0)
     span = max(abs(dx), abs(dy))
     steps = max(1, int(span // BOT_SHELL_TERRAIN_STEP))
     for i in range(1, steps + 1):
         t = float(i) / steps
-        if probe(int(ax + dx * t), int(ay + dy * t)):
+        if _probe_blocked(terrain, int(ax + dx * t), int(ay + dy * t), offsets):
             return (t, float(i - 1) / steps)
     return (None, None)
 
@@ -3581,7 +3680,7 @@ def _terrain_facing(terrain, x, y):
     或者**整片都是实心**（采样点埋进地形里，49 票正负对消）。后者是采样点
     选错了的信号，调用方该换一个点再问一次。
 
-    ★ 图顶上面（`y < 0`）和 `_disc_blocked()` 一个口径，不算实心（§83）。
+    ★ 图顶上面（`y < 0`）和 `_probe_blocked()` 一个口径，不算实心（§83）。
     """
     cx, cy = int(round(x)), int(round(y))
     sx = sy = 0.0
@@ -3670,10 +3769,23 @@ def _block_facing(shell, terrain, ax, ay, bx, by, ground_t):
 
     而且窗口大小在 n=3 取到最好（n=2 → 3.1°，n=4 → 2.4°，n=6 → 4.4°）——
     和 `0x473b36` 里那两句 `cmp …, 3; jle` **独立地对上了**。
+
+    ★★ **收口（V0.3 §116）**：现在拿得到**真正被挡住的那个采样点**了 ——
+    采样点组是 `shell_probe_offsets()` 那两个，逐个查一下就知道是哪个撞上的，
+    不用再拿「离接触点最近的实心格」去猜。实机对照（21 条客户端弹道）：
+    句柄 200012 的末点误差 **24.16 → 0.01**、200193 **11.28 → 2.35**。
+    `_nearest_solid()` 只留作兜底（采样点组和 `blocks_bullet` 口径对不上时）。
     """
-    px = ax + (bx - ax) * ground_t
-    py = ay + (by - ay) * ground_t
-    cell = _nearest_solid(terrain, px, py)
+    hx = int(ax + (bx - ax) * ground_t)
+    hy = int(ay + (by - ay) * ground_t)
+    radius = shell.weapon.size
+    if radius and radius >= 1.0:
+        for ox, oy in shell_probe_offsets(radius, bx - ax, by - ay):
+            if terrain.blocks_bullet(hx + ox, hy + oy):
+                return _terrain_facing(terrain, hx + ox, hy + oy)
+    elif terrain.blocks_bullet(hx, hy):
+        return _terrain_facing(terrain, hx, hy)
+    cell = _nearest_solid(terrain, float(hx), float(hy))
     if cell is None:
         cell = _nearest_solid(terrain, bx, by)
     if cell is None:
@@ -3687,9 +3799,15 @@ def _bounce_shell(shell, terrain, ax, ay, bx, by, ground_t, free_t):
     夹回去这一步不能省：贴在地形里的话下一 tick 一开头又撞上，
     速度一路对折，弹体原地卡死（§76 里客户端那个「速度每帧对折、
     位置一动不动」就是这个样子）。
+
+    ★★ **夹回去的那一点要取整**（V0.3 §116）：收方的扫掠是**逐整数格**走的
+    （`0x50ea43` 的 `linePoint + offset`），挡住之后位置就是**最后一个通的
+    那一格的整数坐标** —— 客户端逐帧日志里每一次反弹的落点都是整数
+    （`(123, 835)` / `(277, 861)` / `(1245, 887)` …），一次例外都没有。
+    留着小数会让下一 tick 的采样线整体偏半格，几十帧之后累出几十个单位。
     """
-    px = ax + (bx - ax) * free_t
-    py = ay + (by - ay) * free_t
+    px = float(int(ax + (bx - ax) * free_t))
+    py = float(int(ay + (by - ay) * free_t))
     vx, vy = _shell_velocity(shell)
     facing = _block_facing(shell, terrain, ax, ay, bx, by, ground_t)
     if facing is None:
@@ -4819,6 +4937,10 @@ def _try_fire(room, machine, seat_index, weapon, target, now):
                     f"瞄 座位{target_seat} ({point[0]:.0f}, {point[1]:.0f})"
                     f"；头 {head.hex()} body({len(body)}) {body.hex()}")
     _emit(machine, packet)
+    # ★ 捡来那把枪的发数在**开火那一刻**减一（原版 `0x48bade`，就挂在
+    #   创建弹体的前一步 `0x5151dd`）。到 0 之后由 `_expire_item_weapon()`
+    #   下一帧换回自己那把 —— 和原版一样，是「刷新武器」时才结算。
+    _spend_item_weapon_shot(machine)
     terrain = mapdata.load(_current_map(room))
     max_ticks = _shell_max_ticks(terrain, shot, weapon)
     for offset in range(weapon.shots):
@@ -4906,6 +5028,9 @@ def _tick_bot(room, machine, seat_index):
         # ★ 正在进行的那一下近身攻击同理：它的伤害判定是**物理**的
         #   （动作走到第几帧、圈里有没有人），和 bot 躺没躺着无关。
         _advance_dash(room, machine, now)
+        # ★ 捡来那把枪的额度同理：「15 秒到了」是**时间**决定的事实，
+        #   和这一帧有没有新位置点、bot 在不在跑无关（§115）。
+        _expire_item_weapon(room, machine, seat_index, now)
     except botsync.SyncInvariantError as error:
         machine.sync.broken = True
         machine.log(f"   ★★ 同步流不变式被破坏，已停掉这个 bot 的同步: {error}")
@@ -4925,7 +5050,7 @@ def _tick_bot(room, machine, seat_index):
         machine.charge_at = None
         # ★ 捡来的枪也丢掉：真人死了重生就换回自己那把（§223 的 `GiveWeapon`
         #   是「换成这把」，重生时 `Character::Reset` 把武器恢复成角色本来的）。
-        machine.item_weapon = None
+        machine.drop_item_weapon()
         # ★ 减速 / 冰冻也一样：死一次身上的状态就清了（`Character::Reset`）。
         machine.slowed_until = None
         machine.frozen_until = None

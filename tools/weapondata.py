@@ -56,7 +56,9 @@ ROOT = os.path.dirname(HERE)
 #: ★ 6（会话 23）：新增 `homing_angle`（追踪弹的转向速率，§77）。
 #: ★ 7（会话 24）：新增分裂弹那几格（`slice_count` / `slice_angle` /
 #:   `slice_angle_base` / `slice_angle_random`，§81）。
-FORMAT = 7
+#: ★ 8（会话 37）：新增 `force_ms` / `force_count` —— 地上捡来那把枪
+#:   **用多久就还原**（§115）。
+FORMAT = 8
 
 #: 节名 `chNNN-MM…`：NNN = 角色 id，MM = 武器序号。
 #: ★ 后面还可能跟 `SE` / `D1` / `R1` / `F1` / `a` / `Classic` 之类的后缀 ——
@@ -132,6 +134,13 @@ _FIELDS = (
     ("SliceAngle",        "slice_angle",         int),
     ("SliceAngleBase",    "slice_angle_base",    int),
     ("SliceAngleRandom",  "slice_angle_random",  int),
+    # ★★ `ForceTime`（毫秒）/ `ForceCount`（发数）：**捡来的枪能用多久**
+    #   （V0.3 §115）。整个 ini 里只有四把有：`ch-nuke` 3 发、
+    #   `ch-flamer` 15 秒、`ch-water` 10 秒、`ch-powershot`（教学）14 发。
+    #   解析在 `0x4899bf` / `0x4899f6`，落进武器记录的 `+0x94` / `+0x98`；
+    #   `0x48be09` 每次刷新武器时判「两个都到头了就换回自己那把」。
+    ("ForceTime",         "force_ms",            int),
+    ("ForceCount",        "force_count",         int),
 )
 
 

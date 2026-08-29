@@ -146,6 +146,25 @@ class MapTerrain(object):
                 break
         return found
 
+    def first_solid(self, x):
+        """第 x 列最上面那块**挡得住掉落物**的格子的 y；整列没有返回 None。
+
+        ★★ **和 `surfaces(x)[0]` 不是一回事**（V0.3 §114）：站立面是**人**
+        的判据（`is_solid`，单向平台算数），而掉落物 / 弹体的
+        `vft+0x100` 是 `xor al,al ; ret` —— 值 1 的**单向平台根本不挡它们**，
+        东西会直接穿过去落到下面那层实心地面上。所以「一件道具会停在哪」
+        要用 `blocks_bullet`（cell ≥ 2）来找，不能用站立面。
+
+        从站立面起步只是为了少扫几格：实心格一定在某一段非空区里。
+        """
+        for sy in self.surfaces(x):
+            y = sy
+            while y < self.height and self.cell(x, y) != 0:
+                if self.blocks_bullet(x, y):
+                    return y
+                y += 1
+        return None
+
     # -- 弹道 ---------------------------------------------------------------
 
     def line_blocked(self, x0, y0, x1, y1, step=4):

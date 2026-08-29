@@ -2395,9 +2395,15 @@ PVP_WEAPON_SPAWN_WEIGHT = 1
 ITEM_SPAWN_X_RANGE = (0.0, 11400.0)
 ITEM_SPAWN_Y_RANGE = (0.0, 2048.0)
 
-#: 刷在站立面**上方**多少个单位。放高一点是为了两件事都不发生：
-#: 埋进地形（会被客户端顶走）、贴着地面（物件自己的形状还是可能压到）。
-ITEM_SPAWN_LIFT = 24.0
+#: 刷在实心地面**上方**多少个单位。
+#:
+#: ★★ **20 不是估的，是物件自己的探地偏移**（V0.3 §114）：掉落物类的
+#: `vft+0x104` 一律是 `0x51fab6`，写死返回 `(0.0, 20.0)`；`0x50f0cc` 的落地
+#: 分支拿「物件坐标 + 这一对」去探地形。⇒ 一件东西**静止躺在地上**时，
+#: 它的坐标正好是「地面 − 20」。刷在这个高度上，客户端那边重力一算
+#: 就地不动，服务端记的位置和所有人屏幕上看到的是同一个点。
+#: （原来是 24 —— 差的那 4 个单位会被重力吃掉，服务端却一直按 24 记。）
+ITEM_SPAWN_LIFT = 20.0
 
 #: 挑列的时候最多试几次 —— 图边和纯天空列没有站立面。
 #: ★ 这不是「重试 N 次就当失败」的时序阈值（铁律 10），是**有限集合上的
@@ -2436,15 +2442,23 @@ def item_spawn_pool(team_mode=False):
 
 
 def ground_item_spawn(map_name, rng=None):
-    """在这张图上挑一个**站得住人的**刷新点，返回 `(x, y)`；挑不出返回 `None`。
+    """在这张图上挑一个**道具躺得住的**刷新点，返回 `(x, y)`；挑不出返回 `None`。
 
     ★ 为什么要挑（V0.3 §100）：老口径是「随便给个大坐标，让客户端 `fmod`
     进图、再把埋进地形的顶出来」（§192）—— 服务端因此**不知道道具在哪**，
     bot 想捡也无从判起。这里改成服务端自己按地形挑：`fmod` 是恒等、
     「顶出地形」也不触发，两边看到的位置从此一样。
 
-    挑法：随机一列，取那一列**最上面**那个站立面，往上抬 `ITEM_SPAWN_LIFT`。
-    取最上面那个是为了让道具落在高台上而不是老掉在图底那条地面上。
+    挑法：随机一列，取那一列最上面那块**实心**格子，往上抬
+    `ITEM_SPAWN_LIFT`（= 物件自己的探地偏移，所以它就地不动）。
+    取最上面那块是为了让道具落在高台上而不是老掉在图底那条地面上。
+
+    ★★ **实心，不是站立面**（V0.3 §114）：`surfaces()` 是**人**的判据，
+    含那种细白线单向平台；而掉落物和弹体一样**穿过单向平台**
+    （`Item::vft+0x100` = `xor al,al ; ret`）。按站立面挑的话，刷在白线上方
+    的那一件会在所有人屏幕上**掉到下面那层地面**，服务端却还按白线的高度
+    记着 —— 用户 2026-08-29 报的「bot 站在平台上，走到下面那把枪的正上方
+    就把它捡起来了」就是这个。
     """
     terrain = mapdata.load(map_name) if map_name else None
     if terrain is None or terrain.width <= 0:
@@ -2452,12 +2466,12 @@ def ground_item_spawn(map_name, rng=None):
     picker = rng if rng is not None else random
     for _ in range(ITEM_SPAWN_COLUMN_TRIES):
         x = picker.randrange(terrain.width)
-        surfaces = terrain.surfaces(x)
-        if not surfaces:
-            continue
-        y = float(surfaces[0]) - ITEM_SPAWN_LIFT
+        ground = terrain.first_solid(x)
+        if ground is None:
+            continue                   # 纯天空 / 只有白线的一列 —— 换一列
+        y = float(ground) - ITEM_SPAWN_LIFT
         if y <= 0.0:
-            continue                   # 站立面顶到图顶了 —— 换一列
+            continue                   # 实心顶到图顶了 —— 换一列
         return (float(x), y)
     return None
 

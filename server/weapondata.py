@@ -40,7 +40,8 @@ import os
 #: ★ 6（会话 23）：新增 `homing_angle`（追踪弹的转向速率，§77）。
 #: ★ 7（会话 24）：新增分裂弹的碎片那几格（`slice_count` / `slice_angle` /
 #:   `slice_angle_base` / `slice_angle_random`，§81）。
-FORMAT = 7
+#: ★ 8（会话 37）：新增 `force_ms` / `force_count`（§115）。
+FORMAT = 8
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "bot_weapons.json")
@@ -169,6 +170,30 @@ class Weapon(object):
         （榴弹 / 火箭那一类，打一发装一次）。"""
         value = self.raw.get("magazine")
         return None if not value else int(value)
+
+    @property
+    def force_ms(self):
+        """★ 捡来的这把枪**能拿多少毫秒**（`ForceTime`）。0 = 不限时（§115）。
+
+        `ch-flamer` 15000、`ch-water` 10000；`ch-nuke` 没有这一格（限发数）。
+        """
+        return int(self.raw.get("force_ms") or 0)
+
+    @property
+    def force_count(self):
+        """★ 捡来的这把枪**还能打几发**（`ForceCount`）。0 = 不限发数（§115）。
+
+        `ch-nuke` 3；两把喷射器没有这一格（限时间）。
+        """
+        return int(self.raw.get("force_count") or 0)
+
+    @property
+    def is_temporary(self):
+        """这把枪是不是**捡来的、用完要还原**的那一类（`weapondef+0x9c`）。
+
+        原版 `0x489a2b` 就是这么算的：`ForceTime > 0 || ForceCount > 0`。
+        """
+        return self.force_ms > 0 or self.force_count > 0
 
     @property
     def cooling_ms(self):
