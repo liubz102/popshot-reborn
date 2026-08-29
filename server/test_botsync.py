@@ -6363,8 +6363,10 @@ class BotItemUseTests(HumanShotRoom):
 class BotQuestCombatTests(TerrainMixin, BotFrameRoom):
     """★★ M5-G：闯关房里也要**躲怪的子弹、打怪、打 boss**。
 
-    怪的位置服务端**没有任何包在广播**（§125）—— 只能在「它开了一枪」
-    「有人打中了它」这两个瞬间瞄一眼。这一批用例验的就是那两条链。
+    ★★★ 怪的位置是**控制者广播的**（`rpAiMsg` 的 `setState`，§125）——
+    和别人的客户端拿到的是同一份信息。会话 40 上半场曾经错误地断言
+    「怪的位置一个包都不广播」，是用户 2026-08-29 的反问纠正的：
+    「真人可以合作，其他人全都能看见怪的位置和血量，bot 应该也能」。
     """
 
     def setUp(self):
@@ -6384,6 +6386,18 @@ class BotQuestCombatTests(TerrainMixin, BotFrameRoom):
         gameserver.Conn.on_game_packet(
             self.alice, OP_PEER_DATA_UP, self.human_packet(opcode, body))
 
+    def ai_message(self, handle, **fields):
+        """控制者替一只怪广播一发 `rpAiMsg`（明文 `key=value`）。"""
+        text = "".join("%s=%s\r\n" % (k, v) for k, v in sorted(fields.items()))
+        raw = text.encode("ascii")
+        self.send(botsync.OP_AI_MSG,
+                  struct.pack("<ii", handle, len(raw)) + raw)
+
+    def spot_mob(self, handle=500123, x=880.0, y=120.0, state="chase"):
+        self.ai_message(handle, msgType="setState", state=state,
+                        posX="%.6f" % x, posY="%.6f" % y, targetChrSlot=1)
+        return handle
+
     def mob_fires(self, x=900.0, y=120.0, ammo=1002010):
         """控制者那台机器替怪发的一发 `rpFire`（`body+0 == 20`，§23）。"""
         weapon = weapondata.get(ammo)
@@ -6395,38 +6409,66 @@ class BotQuestCombatTests(TerrainMixin, BotFrameRoom):
         self.send(botsync.OP_FIRE, body)
         return weapon
 
-    def test_a_mobs_muzzle_flash_is_a_sighting(self):
-        self.mob_fires()
-        seen = bot.mob_sightings(self.room)
-        self.assertEqual(1, len(seen))
-        self.assertAlmostEqual(900.0, seen[0][0], places=3)
-        self.assertIsNone(seen[0][2], "枪口那一路没有句柄")
+    # -- 怪物表 -------------------------------------------------------------
+    def test_a_setstate_puts_the_mob_on_the_table(self):
+        self.spot_mob()
+        self.assertEqual([(880.0, 120.0, 500123)], bot.live_mobs(self.room))
 
+    def test_the_table_also_keeps_what_it_is_doing(self):
+        self.spot_mob(state="attack")
+        row = self.room.quest.mobs[500123]
+        self.assertEqual("attack", row[2])
+        self.assertEqual(1, row[3], "targetChrSlot = 它在追谁")
+
+    def test_a_death_message_takes_it_off(self):
+        """★ 判据是**控制者报的那一发**，不是超时（铁律 10）。"""
+        self.spot_mob()
+        self.ai_message(500123, msgType="setState", state="death")
+        self.assertEqual([], bot.live_mobs(self.room))
+
+    def test_a_state_without_coordinates_keeps_the_last_known_spot(self):
+        """boss 的几个阶段只报 state，不报坐标 —— 别把它挪到 (0,0)。"""
+        self.spot_mob()
+        self.ai_message(500123, msgType="setState", state="idle")
+        self.assertEqual([(880.0, 120.0, 500123)], bot.live_mobs(self.room))
+
+    def test_an_action_state_message_is_animation_only(self):
+        self.ai_message(500123, msgType="setActionState", actionState=7)
+        self.assertEqual([], bot.live_mobs(self.room))
+
+    def test_a_spawn_point_is_not_a_mob(self):
+        """`type=spawn` 是**刷怪点**在报（语料 26 个句柄只有 4 个后来是怪）。"""
+        self.ai_message(700001, type="spawn", xpos="1410.000000",
+                        ypos="81.000000", group="", bySpawn=0)
+        self.assertEqual([], bot.live_mobs(self.room))
+
+    def test_a_hit_refines_a_mob_we_already_know(self):
+        self.spot_mob()
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, 500123, 870.0, 118.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=12.0))
+        self.assertEqual([(870.0, 118.0, 500123)], bot.live_mobs(self.room))
+
+    def test_a_hit_on_an_unknown_handle_invents_nothing(self):
+        """★ 非玩家句柄里还混着破坏物 —— 凭它建表会把箱子当成怪（§125）。"""
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, 0x30e00, 300.0, 140.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=12.0))
+        self.assertEqual([], bot.live_mobs(self.room))
+
+    def test_a_mob_hit_is_not_charged_to_a_player_seat(self):
+        self.spot_mob()
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, 500123, 880.0, 120.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=12.0))
+        self.assertEqual({}, bot._health(self.room).taken)
+
+    # -- 怪的子弹 -----------------------------------------------------------
     def test_a_mob_shot_does_not_overwrite_the_humans_weapon(self):
         """★ 怪的枪是队友那台机器替它发的 —— 别把它记成「他现在用这把」。"""
         self.assertIsNone(getattr(self.alice, "peer_weapon", None))
         self.mob_fires()
         self.assertIsNone(getattr(self.alice, "peer_weapon", None))
-
-    def test_a_hit_on_a_mob_gives_us_its_handle(self):
-        self.send(botsync.OP_EXPLODE, botsync.explode_body(
-            100002, 500123, 880.0, 130.0,
-            hit_kind=botsync.HIT_CHARACTER, damage=12.0))
-        seen = bot.mob_sightings(self.room)
-        self.assertEqual([(880.0, 130.0, 500123)], seen)
-
-    def test_a_mob_hit_is_not_charged_to_a_player_seat(self):
-        self.send(botsync.OP_EXPLODE, botsync.explode_body(
-            100002, 500123, 880.0, 130.0,
-            hit_kind=botsync.HIT_CHARACTER, damage=12.0))
-        self.assertEqual({}, bot._health(self.room).taken)
-
-    def test_a_stale_sighting_expires(self):
-        self.mob_fires()
-        table = self.room.quest.mob_sightings
-        for key in table:
-            table[key][2] -= bot.MOB_SIGHTING_SECONDS + 1.0
-        self.assertEqual([], bot.mob_sightings(self.room))
 
     def test_a_mobs_bullet_is_dodged_even_though_a_teammate_sent_it(self):
         """★ 队友的子弹撞不着自己（§63），**怪的子弹撞得着** —— 得躲。"""
@@ -6442,21 +6484,24 @@ class BotQuestCombatTests(TerrainMixin, BotFrameRoom):
         self.assertEqual([], bot._threats_against(
             self.room, self.bot_conn, self.bot_seat))
 
-    def test_it_shoots_at_a_fresh_sighting(self):
-        self.send(botsync.OP_EXPLODE, botsync.explode_body(
-            100002, 500123, 880.0, 120.0,
-            hit_kind=botsync.HIT_CHARACTER, damage=12.0))
+    # -- 打怪 ---------------------------------------------------------------
+    def test_it_shoots_at_a_known_mob(self):
+        self.spot_mob()
         target = bot._fire_target(self.room, self.bot_conn, self.bot_seat,
                                   self.bot_conn.weapon)
-        self.assertIsNotNone(target, "看见过怪就该朝那儿打")
+        self.assertIsNotNone(target, "看得见怪就该朝那儿打")
         self.assertEqual(bot.MOB_SEAT, target[0])
         self.assertAlmostEqual(880.0, target[1][0], places=3)
 
+    def test_a_dead_mob_is_not_shot_at(self):
+        self.spot_mob()
+        self.ai_message(500123, msgType="setState", state="death")
+        self.assertIsNone(bot._fire_target(
+            self.room, self.bot_conn, self.bot_seat, self.bot_conn.weapon))
+
     def test_the_explosion_names_the_mob_handle_so_the_damage_lands(self):
         """★★ 收方按**句柄**扣血（§42）—— 填错就是「子弹飞过去不掉血」。"""
-        self.send(botsync.OP_EXPLODE, botsync.explode_body(
-            100002, 500123, 880.0, 120.0,
-            hit_kind=botsync.HIT_CHARACTER, damage=12.0))
+        self.spot_mob()
         self.clear()
         self.bot_conn.next_fire_at = 0.0
         self.beats(2, 300.0)
@@ -6471,11 +6516,7 @@ class BotQuestCombatTests(TerrainMixin, BotFrameRoom):
                    for f in explodes}
         self.assertIn(500123, targets)
 
-    def test_a_sighting_without_a_handle_cannot_be_damaged(self):
-        """枪口那一路没有句柄 —— 朝它打没问题，但 `rpExplode` 填不了目标。"""
-        self.mob_fires(x=880.0, y=120.0)
-        shell = bot.Shell(1, 0, self.bot_conn.weapon, 3, 600.0, 93.0,
-                          ballistics.launch(self.bot_conn.weapon, 0.0, 1.0),
-                          0.0, 40)
-        self.assertIsNone(bot._mob_contact(self.room, shell,
-                                           860.0, 120.0, 900.0, 120.0))
+    def test_a_new_map_wipes_the_table(self):
+        self.spot_mob()
+        self.room.quest.begin_map_change('ZZ_next')
+        self.assertEqual([], bot.live_mobs(self.room))

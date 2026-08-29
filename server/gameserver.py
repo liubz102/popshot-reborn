@@ -3535,11 +3535,11 @@ class RoomQuest:
         #: ★ 正在**回血**的座位：`{座位: [下一跳的时刻, 还剩几跳]}`（§122）。
         #:   `Status.ini[8]` 是 8 秒 × 每秒 10 点；这里按同一个节奏往台账里加。
         self.hp_charges = {}
-        #: ★★ **怪的目击点**：`{钥匙: [x, y, 时刻, 句柄或 None]}`（§125）。
-        #:   闯关模式里怪的位置**没有任何包在广播**（各台机器各自模拟），
-        #:   服务端只能从「它开了一枪」和「有人打中了它」这两件事上瞄一眼。
-        #:   只有 bot 读它。
-        self.mob_sightings = {}
+        #: ★★★ **场上还活着的怪**：`{世界句柄: [x, y, 状态, 追谁的座位]}`
+        #:   （§125）。位置是**控制者广播的**（`rpAiMsg` 的 `setState`），
+        #:   `state=death` 那一发就把它删掉 —— 全是事件，没有定时器。
+        #:   只有 bot 读它；句柄和 `rpExplode +4` 是同一套，所以打得着。
+        self.mobs = {}
         #: ★ **道具模式**：服务端刷在地图上、还没被人捡走的道具句柄（§191）。
         #: 只用来卡「地图上最多同时躺几件」，捡走了就从这里去掉。
         self.items_on_map = set()
@@ -4255,7 +4255,7 @@ class RoomQuest:
         del self.smokes[:]
         self.hud_jam_until.clear()
         self.hp_charges.clear()
-        self.mob_sightings.clear()
+        self.mobs.clear()
         self.dead_events = {key for key in self.dead_events if key[0] in keep}
         self.death_counts = {handle: count
                              for handle, count in self.death_counts.items()

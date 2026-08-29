@@ -114,6 +114,52 @@ OP_DASH = 0x0007
 #: 别人屏幕上一直保持错的姿势 —— 它和 `rpJump` 一样是可靠有序的（D5）。
 OP_CROUCH = 0x000B
 
+#: ★★★ `0x0011 rpAiMsg` —— **怪的状态广播**（V0.3 §125 改正版）。
+#:
+#: 只有那批怪的**控制者**（一定是真人，§22）发；body 是
+#: 「句柄 + 长度 + 一段明文 `key=value\r\n`」。**怪的位置就在这里面**——
+#: 别的机器（和服务端）全靠它知道怪走到哪了。
+OP_AI_MSG = 0x0011
+
+#: `rpAiMsg` body 的定长头：`+0` 世界句柄、`+4` 后面那段文本有多长。
+_AI_MSG_HEAD = struct.Struct("<ii")
+AI_MSG_HEAD_SIZE = _AI_MSG_HEAD.size
+
+
+def parse_ai_message(body):
+    """拆一发 `rpAiMsg`，返回 `(句柄, {键: 值})`；不像样就返回 `None`。
+
+    ```
+    +0..3   i32    ★ 世界句柄 —— 和 `rpExplode +4` 的目标句柄**是同一套**
+                     （语料 294 个 AI 句柄里 261 个也出现在 rpExplode 的目标上）
+    +4..7   i32    文本长度
+    +8..    ascii  "key=value\r\n" 若干行
+    ```
+
+    语料 10215 发**全部**解得开（长度字段一次都没对不上）。常见的三类：
+
+    | `msgType` / `type` | 带什么 |
+    |---|---|
+    | `setState`（4977）| ★ `posX` / `posY` / `state` / `direction` / `targetChrSlot` / `destX`/`destY` / `phase` |
+    | `setActionState`（1307）| 只有动画帧号 `actionState` |
+    | `spawn`（649）| `xpos` / `ypos` / `group` —— 这是**刷怪点**在报，不是怪本身 |
+
+    ★ 值一律按**字符串**返回，要什么类型调用方自己转 —— 这一层只负责拆包。
+    """
+    if len(body) < AI_MSG_HEAD_SIZE:
+        return None
+    handle, size = _AI_MSG_HEAD.unpack_from(body, 0)
+    text = body[AI_MSG_HEAD_SIZE:AI_MSG_HEAD_SIZE + size]
+    if len(text) != size:
+        return None
+    fields = {}
+    for line in text.decode("ascii", "replace").split("\r\n"):
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key] = value
+    return (handle, fields)
+
+
 OP_HEARTBEAT = udpsync.OPCODE_HEARTBEAT          # 0x4001
 
 #: `0x4005` —— **加载进度**（body = 一个 int32，取值 0..100，§30）。

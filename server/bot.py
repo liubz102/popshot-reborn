@@ -1837,58 +1837,97 @@ BOT_PEER_SHOT_TOLERANCE = 120.0
 #: 30（§42 末尾那条勘误），两个都收着。
 MOB_FIRE_SOURCES = (20, 30)
 
-#: ★★ 一次「目击」多久之后就不作数了（秒）。
-#:
-#: ⚠ 这是**铁律 10 明说的那个例外**：怪的位置在这个游戏里**根本没有事件可等**
-#: —— 各台机器各自模拟，一个广播包都没有（§125）。服务端只能在「它开了一枪」
-#: 「有人打中了它」这两个瞬间瞄一眼，之后只能靠猜。
-#: 取 1 秒的依据是 `Mob.ini` 的 `MoveSpeed`：最快的怪 9 单位/tick ⇒ 1 秒能挪
-#: **281 个单位**，比任何一只怪的 `Size`（15~65）大一个数量级。
-#: 再旧的目击点已经和「随便猜一个点」没区别了。
-MOB_SIGHTING_SECONDS = 1.0
-
 #: ★ 判「打没打中怪」用的碰撞半径。`Mob.ini` 24 个怪里 **9 个是 40**
 #: （唯一的众数；15 和 65 各只有一只），而服务端**没法把句柄映射回怪的类型**
 #: —— 那要连刷怪组和关卡脚本一起解。所以统一按众数算。
 #: ⚠ 这一格是实机最该盯的：觉得 bot 打怪「明明没碰到也掉血」就调小它。
 MOB_HIT_RADIUS = 40.0
 
+#: `rpAiMsg` 里那几个键（明文，见 `botsync.parse_ai_message`）。
+AI_MSG_STATE = "setState"
+AI_STATE_DEATH = "death"
 
-def note_mob_sighting(room, x, y, handle=None):
-    """记一次「在这儿看见过怪」（§125）。`handle` 知道就带上。
 
-    两个来源都是**别人本来就要发的包**，一发新的逆向都不用：
+def note_ai_message(room, handle, fields):
+    """收下一发 `rpAiMsg` —— **怪的位置就是这么广播的**（§125）。
 
-    * 怪开枪 —— `rpFire body+0 == 20`，包里带枪口坐标；
-    * 有人打中怪 —— `rpExplode` / `rpSplashDamaged` 的目标句柄不是玩家座位，
-      包里带爆炸点。
+    ## 这一条推翻了会话 40 上半场的结论
 
-    ★ 没有句柄的（枪口那一路）按**粗网格**去重，否则同一只怪连打三枪就变成
-    三只怪。有句柄的直接按句柄覆盖。
+    上半场我扫了一遍上行流，看见心跳的「角色数」字段恒为 1，就下结论说
+    「怪的位置一个包都不广播」。**错的**：位置不在心跳里，在 `rpAiMsg` 里，
+    而那一发的 body 是一段**明文 `key=value`**，静态分析看组包点只看到
+    「写了 8 字节的头」，正文是另一个地方拼进去的（§23 那条 ⚠ 早就写了
+    「实测长度 48 / 91 / 139 变长」，我没去核）。
+
+    用户 2026-08-29 的反问才是对的：真人之间能合作、都看得见怪，
+    那一定有广播。
+
+    ## 怎么记
+
+    * `msgType=setState` 带 `posX` / `posY` ⇒ 更新位置；
+    * `state=death` ⇒ 这只怪没了，**删掉**；
+    * `targetChrSlot` ⇒ 它在追谁（留着，以后做仇恨/走位可能要）。
+
+    ★ 全是**事件**驱动，一个定时器都没有（铁律 10）：位置由控制者报，
+    死亡由控制者报，换图由 `RoomQuest` 清。
     """
     quest = None if room is None else room.quest
-    table = getattr(quest, "mob_sightings", None) if quest is not None else None
-    if table is None:
+    table = getattr(quest, "mobs", None) if quest is not None else None
+    if table is None or not handle:
         return
-    key = handle if handle else ("spot", int(x) // 64, int(y) // 64)
-    table[key] = [float(x), float(y), time.monotonic(), handle]
+    if fields.get("msgType") != AI_MSG_STATE:
+        return
+    if fields.get("state") == AI_STATE_DEATH:
+        table.pop(handle, None)
+        return
+    row = table.get(handle)
+    x = _ai_float(fields, "posX", row[0] if row else None)
+    y = _ai_float(fields, "posY", row[1] if row else None)
+    if x is None or y is None:
+        # 只报了状态没报坐标（boss 的几个阶段就是这样）——- 还没见过它就不建表。
+        if row is None:
+            return
+        x, y = row[0], row[1]
+    table[handle] = [x, y, fields.get("state"),
+                     _ai_int(fields, "targetChrSlot")]
 
 
-def mob_sightings(room, now=None):
-    """还**新鲜**的目击点：`[(x, y, 句柄或 None)]`（过期的顺手删掉）。"""
+def _ai_float(fields, key, fallback=None):
+    try:
+        return float(fields[key])
+    except (KeyError, TypeError, ValueError):
+        return fallback
+
+
+def _ai_int(fields, key, fallback=None):
+    try:
+        return int(fields[key])
+    except (KeyError, TypeError, ValueError):
+        return fallback
+
+
+def note_mob_hit(room, handle, x, y):
+    """有人打中了这只怪 —— 爆点是一次**额外的**位置采样（免费的精度）。
+
+    ★ 只更新**已经在表里**的怪：`rpExplode` 打中的「非玩家句柄」里还混着
+    破坏物之类的世界对象（语料里 509 个非玩家目标，只有 261 个在 AI 流里
+    出现过），凭它建表会把箱子当成怪。
+    """
     quest = None if room is None else room.quest
-    table = getattr(quest, "mob_sightings", None) if quest is not None else None
+    table = getattr(quest, "mobs", None) if quest is not None else None
+    if not table or handle not in table:
+        return
+    row = table[handle]
+    row[0], row[1] = float(x), float(y)
+
+
+def live_mobs(room):
+    """场上还活着、位置已知的怪：`[(x, y, 句柄)]`。"""
+    quest = None if room is None else room.quest
+    table = getattr(quest, "mobs", None) if quest is not None else None
     if not table:
         return []
-    now = time.monotonic() if now is None else now
-    out = []
-    for key in list(table):
-        x, y, at, handle = table[key]
-        if now - at > MOB_SIGHTING_SECONDS:
-            table.pop(key, None)
-            continue
-        out.append((x, y, handle))
-    return out
+    return [(row[0], row[1], handle) for handle, row in table.items()]
 
 
 class PeerShot(object):
@@ -1939,9 +1978,9 @@ def note_peer_fire(conn, body, room=None):
                           ballistics.launch(weapon, angle, power),
                           at=time.monotonic(), source=source))
     if source in MOB_FIRE_SOURCES:
-        # ★ 怪开的枪：枪口就是它此刻站的地方（§125）。**不要**把这把枪
-        #   记成「这个真人现在用的枪」—— 那会让 M5-C 的战力对比按怪的枪算。
-        note_mob_sighting(room, fx, fy)
+        # ★ 怪开的枪：**不要**把这把枪记成「这个真人现在用的枪」——
+        #   那会让 M5-C 的战力对比按怪的枪算。
+        #   ⚠ 位置不用从这儿取：`rpAiMsg` 已经在广播它了（§125）。
         return
     # ★ 顺手记住「他现在用的是哪把枪」（M5-C 的战力对比要用）。
     #   `rpChangeWeapon` 也会写这一格，见 `note_peer_hit()`。
@@ -2007,6 +2046,12 @@ def note_peer_hit(room, conn, payload):
     if opcode == botsync.OP_FIRE:
         note_peer_fire(conn, payload[udpsync.PEER_HEADER_SIZE:], room)
         return
+    if opcode == botsync.OP_AI_MSG:
+        # ★★★ 怪的位置广播（§125）。只有控制者发，而控制者一定是真人（§22）。
+        parsed = botsync.parse_ai_message(payload[udpsync.PEER_HEADER_SIZE:])
+        if parsed is not None:
+            note_ai_message(room, parsed[0], parsed[1])
+        return
     if opcode == botsync.OP_CHANGE_WEAPON:
         # ★ 「他换枪了」——`rpChangeWeapon` body `+1..4` 就是 ammo id
         #   （`botsync.change_weapon_body()` 组的是同一份布局）。
@@ -2031,8 +2076,8 @@ def note_peer_hit(room, conn, payload):
         # ★★ 血量台账**排在击退前面**（M5-C）：这一发扣了多少血是包里写死的
         #   事实（§42 收方原样扣），和「配不配得上某一发 rpFire」无关。
         if botsync.handle_seat(target) is None:
-            # ★ 打中的不是玩家座位 ⇒ 那是一只怪，爆点就是它此刻在哪（§125）。
-            note_mob_sighting(room, bx, by, target)
+            # ★ 打中的不是玩家座位 ⇒ 爆点是那只怪的一次额外位置采样（§125）。
+            note_mob_hit(room, target, bx, by)
         _note_damage(room, botsync.handle_seat(target), damage)
         velocity = _peer_shot_velocity(conn, bx, by)
         if velocity is None:
@@ -2053,7 +2098,7 @@ def note_peer_hit(room, conn, payload):
         push = (push_x, push_y)
         if botsync.handle_seat(target) is None:
             hit_x, hit_y = struct.unpack_from("<ff", body, 21)
-            note_mob_sighting(room, hit_x, hit_y, target)
+            note_mob_hit(room, target, hit_x, hit_y)
         _note_damage(room, botsync.handle_seat(target), damage)
     seat_index = botsync.handle_seat(target)
     if seat_index is None:
@@ -4234,14 +4279,15 @@ def _mob_engagement(room, machine, weapon, terrain, solve, x, y):
 
     ## 服务端凭什么知道怪在哪
 
-    凭两件别人本来就要发的包（§125）：怪开枪时的枪口坐标、以及有人打中它时
-    的爆炸点。**没有位置广播**，所以这是「瞄一眼记下来」，过 `MOB_SIGHTING_SECONDS`
-    就作废 —— 和真人看见枪口火光之后往那儿还击是同一种信息量。
+    凭控制者广播的 `rpAiMsg`（§125）：`msgType=setState` 里带 `posX` / `posY`，
+    `state=death` 报死亡。和别人的客户端拿到的是**同一份**信息 ——
+    真人之间能合作看见怪，靠的就是这一发。
 
-    ⚠ 所以 bot 打怪**本来就会经常打偏**，这是信息的极限，不是 bug。
+    ⚠ 位置是**状态变化那一刻**报的，两次之间怪会自己走（语料：中位 10 个
+    单位、p90 81）。所以偶尔打偏是正常的，和真人看着别人屏幕上的怪打差不多。
     """
     best = None
-    for mx_, my_, handle in mob_sightings(room):
+    for mx_, my_, handle in live_mobs(room):
         gx, gy = _muzzle(x, y, mx_)
         span = math.hypot(mx_ - gx, my_ - gy)
         if span > BOT_ENGAGE_RANGE:
@@ -5262,15 +5308,15 @@ def _reflect_off_shield(shell, ax, ay, bx, by, shield):
 
 
 def _mob_contact(room, shell, ax, ay, bx, by):
-    """这一 tick 有没有扫中一只**还新鲜的怪**：`(t, 句柄)`；没有返回 `None`。
+    """这一 tick 有没有扫中一只怪：`(t, 句柄)`；没有返回 `None`。
 
-    ★ 只认**带句柄**的目击点（那是「有人打中过它」留下的）——- 枪口那一路
-    没有句柄，`rpExplode` 填不了目标，打上去也白打。
+    位置来自控制者广播的 `rpAiMsg`（§125），句柄和 `rpExplode +4` 是同一套
+    ⇒ 填进爆炸包收方就照着扣血。
     ⚠ 半径统一按 `MOB_HIT_RADIUS`（`Mob.ini` 的众数 40），因为服务端没法把
     句柄映射回怪的类型。这一格实机最该盯（见那个常量的注释）。
     """
     best = None
-    for mx_, my_, handle in mob_sightings(room):
+    for mx_, my_, handle in live_mobs(room):
         if not handle:
             continue
         t = _segment_circle_t(ax, ay, bx, by, mx_, my_,
