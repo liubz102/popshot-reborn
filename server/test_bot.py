@@ -348,6 +348,48 @@ class BotCommandTests(LobbyIsolated):
         self.assertTrue(bot.handle_command(self.host, "/r"))
         self.assertTrue(all(room.seats[i].ready for i in room.bot_seats()))
 
+    # -- AI 难度 -----------------------------------------------------------
+    def test_a_new_room_defaults_to_medium_and_the_three_commands_are_global(self):
+        room = self.open_room()
+        bot.handle_command(self.host, "/a 2")
+        self.assertEqual("medium", room.bot_difficulty)
+        for text, level in (("/s", "easy"), ("/h", "hard"), ("/m", "medium")):
+            self.host.sent.clear()
+            self.assertTrue(bot.handle_command(self.host, text))
+            self.assertEqual(level, room.bot_difficulty)
+            self.assertIn(bot.BOT_DIFFICULTY_LABELS[level],
+                          "".join(chat_lines(self.host)))
+
+    def test_difficulty_changes_work_during_battle_and_survive_a_new_game(self):
+        room = self.open_room()
+        bot.handle_command(self.host, "/a")
+        machine = room.seats[1].conn
+        room.status = SESSION_STATUS_PLAYING
+        self.assertTrue(bot.handle_command(self.host, "/h"))
+        self.assertEqual("hard", room.bot_difficulty)
+        machine.reset_battle_frame()       # 换图 / 后来新开一局
+        self.assertEqual("hard", room.bot_difficulty)
+        self.assertEqual(bot.BOT_DIFFICULTY_PROFILES["hard"],
+                         bot.difficulty_profile(room))
+
+    def test_the_two_error_probabilities_decrease_with_difficulty(self):
+        easy = bot.BOT_DIFFICULTY_PROFILES["easy"]
+        medium = bot.BOT_DIFFICULTY_PROFILES["medium"]
+        hard = bot.BOT_DIFFICULTY_PROFILES["hard"]
+        self.assertGreater(easy["aim_error"], medium["aim_error"])
+        self.assertGreater(medium["aim_error"], hard["aim_error"])
+        self.assertGreater(easy["dodge_error"], medium["dodge_error"])
+        self.assertGreater(medium["dodge_error"], hard["dodge_error"])
+
+    def test_old_s_with_a_seat_argument_points_at_hold_without_freezing(self):
+        room = self.open_room()
+        bot.handle_command(self.host, "/a")
+        machine = room.seats[1].conn
+        self.host.sent.clear()
+        self.assertTrue(bot.handle_command(self.host, "/s 1"))
+        self.assertFalse(machine.holding)
+        self.assertIn("/hold", "".join(chat_lines(self.host)))
+
     # -- 权限 / 时机 --------------------------------------------------------
     def test_a_non_host_command_is_not_swallowed_but_gets_a_hint(self):
         # PLAN M1：别人发的原样当聊天广播出去，不要吞。但也要告诉他为什么
@@ -393,12 +435,15 @@ class BotCommandTests(LobbyIsolated):
         self.assertEqual(len(bot.HELP_LINES), len(lines))
         self.assertIn("/a", "".join(lines))
 
-    def test_help_has_three_aliases(self):
+    def test_help_has_two_aliases_and_h_is_reserved_for_hard(self):
         self.open_room()
-        for text in ("/help", "/h", "/?"):
+        for text in ("/help", "/?"):
             self.host.sent.clear()
             self.assertTrue(bot.handle_command(self.host, text))
             self.assertEqual(len(bot.HELP_LINES), len(chat_lines(self.host)))
+        self.host.sent.clear()
+        self.assertTrue(bot.handle_command(self.host, "/h"))
+        self.assertEqual(1, len(chat_lines(self.host)))
 
     def test_help_fits_in_the_four_visible_chat_rows(self):
         # ★ 房间聊天框一次只看得见 4 行，被顶出去的就永远看不到了（§20）。
@@ -413,7 +458,7 @@ class BotCommandTests(LobbyIsolated):
         # 精简可以，但不能精简掉某条命令 —— 玩家除了这张表没有别的地方能看到。
         table = " ".join(bot.HELP_LINES)
         for name in bot.MUTATING_COMMANDS:
-            self.assertIn(f"/{name}", table, f"/{name} 没写进 /h")
+            self.assertIn(f"/{name}", table, f"/{name} 没写进 /?")
 
     def test_ordinary_chat_and_unknown_slash_words_pass_through(self):
         self.open_room()

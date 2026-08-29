@@ -269,8 +269,9 @@ function Get-ServerSourceFile([string]$Root) {
                         'account_store.py', 'netlisten.py', 'tickets.py',
                         'eventlog.py', 'lobby.py', 'relayserver.py', 'protocol.py',
                         'simple.py', 'udpsync.py', 'bot.py', 'botsync.py',
-                        'botmove.py', 'mapdata.py', 'weapondata.py',
-                        'ballistics.py', 'chrprops.py')) {
+                        'botmove.py', 'botnav.py', 'mapdata.py', 'weapondata.py',
+                        'ballistics.py', 'chrprops.py',
+                        'bothp.py', 'botarms.py', 'botaim.py', 'botthreat.py')) {
         if ($files -notcontains $must) { throw "server\$must 没被选中，打包脚本的过滤规则坏了" }
     }
     return $files

@@ -20,7 +20,9 @@ if HERE not in sys.path:
 
 MODULES = ("test_account_store", "test_gameserver", "test_online",
            "test_lobby", "test_room", "test_battle", "test_bot",
-           "test_botsync", "test_botmove", "test_mapdata", "test_weapondata",
+           "test_botsync", "test_botmove", "test_botnav", "test_botcombat",
+           "test_mapdata",
+           "test_weapondata",
            "test_chrprops",
            "test_ballistics",
            "test_relayserver", "test_proxy",

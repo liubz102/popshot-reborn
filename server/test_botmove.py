@@ -173,6 +173,43 @@ class SlopeAndWallTests(unittest.TestCase):
         self.assertFalse(botmove.leaves_ground(t, body, Dummy(4.0), 0))
 
 
+class DropThroughTests(unittest.TestCase):
+    """按 ↓ 穿值-1 平台；实心地面绝不能穿。"""
+
+    def setUp(self):
+        rows = []
+        for y in range(32):
+            if y == 10:
+                rows.append("1" * 48)
+            elif y >= 25:
+                rows.append("2" * 48)
+            else:
+                rows.append("0" * 48)
+        self.t = terrain_from(rows)
+        self.who = Dummy(4.0)
+
+    def test_drop_moves_below_the_one_way_band_and_enters_the_air(self):
+        body = botmove.Body(20.0, 10.0)
+        dropped = botmove.drop_through(self.t, body)
+        self.assertFalse(dropped.on_ground)
+        self.assertGreater(dropped.y, body.y)
+        self.assertFalse(self.t.is_one_way(int(dropped.x), int(dropped.y)))
+
+    def test_want_drop_falls_to_the_next_surface(self):
+        body = botmove.tick(self.t, botmove.Body(20.0, 10.0), self.who,
+                            want_drop=True)
+        self.assertFalse(body.on_ground)
+        landed = botmove.settle(self.t, body, self.who, ticks=80)
+        self.assertTrue(landed.on_ground)
+        self.assertAlmostEqual(25.0, landed.y)
+
+    def test_down_does_not_pass_through_solid_ground(self):
+        body = botmove.Body(20.0, 25.0)
+        self.assertEqual(body, botmove.drop_through(self.t, body))
+        self.assertEqual(body, botmove.tick(self.t, body, self.who,
+                                            want_drop=True))
+
+
 class JumpTests(unittest.TestCase):
     """起跳初速 20、重力 1.2 —— 顶点 `v²/2g ≈ 167`（语料中位 170）。"""
 

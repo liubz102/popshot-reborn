@@ -350,6 +350,11 @@ class BotSeatTests(unittest.TestCase):
         self.room = self.lobby.create_room(self.alice,
                                            seat=seat_for(self.alice))
 
+    def test_a_new_room_starts_with_medium_auto_ai(self):
+        """难度/武器锁只活在一个房间对象里；新房间必须恢复 `/m`、`/w 0`。"""
+        self.assertEqual("medium", self.room.bot_difficulty)
+        self.assertEqual(0, self.room.bot_weapon_slot)
+
     def add_bot(self, name="bot"):
         machine = FakeConn(name)
         return self.lobby.add_bot(self.room, Seat(machine, nickname=name)), machine

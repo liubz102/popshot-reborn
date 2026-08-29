@@ -29,6 +29,7 @@ if HERE not in sys.path:
 import ballistics                                              # noqa: E402
 import bot                                                     # noqa: E402
 import botsync                                                 # noqa: E402
+import botthreat                                               # noqa: E402
 import chrprops                                                # noqa: E402
 import botmove                                            # noqa: E402
 import test_mapdata                                            # noqa: E402
@@ -810,10 +811,25 @@ class BotFrameRoom(BotBattleRoom):
     #: 单独验（同 `BotFireRoom.melee` 的路数）。
     action_lock = False
 
+    #: ★★ 瞄准失误（M5-D）默认**钉成不失误**。
+    #:
+    #: `BotConn.roll` 默认是 `random.randrange`，而 M5-D 之后中等难度有 22%
+    #: 的概率把这一发打歪 —— 那会让「打得中、扣得掉血」这一大批用例
+    #: **随机变红**。这里把骰子钉成「永远掷到最大值」= 永不失误；
+    #: 专门验失误的用例自己改 `bot_conn.roll`。
+    #: ⚠ 同一颗骰子还管碎片角度（`_slice_angles`）和重生点挑选 ——
+    #: 那两处本来就是随机的，用例要钉就自己钉（好几处已经这么做了）。
+    pin_roll = staticmethod(lambda n: n - 1)
+
     def setUp(self):
         super().setUp()
         if not self.action_lock:
             self.unlock_bots()
+        if self.pin_roll is not None:
+            for index in self.room.bot_seats():
+                conn = self.room.seats[index].conn
+                if isinstance(conn, bot.BotConn):
+                    conn.roll = self.pin_roll
 
     def unlock_bots(self):
         """把房里每个 bot 的那道 2 秒锁提前解掉。
@@ -1836,7 +1852,7 @@ class BotWeaponDeclarationTests(BotFireRoom):
 
 
 class BotGunCommandTests(BotFireRoom):
-    """`/w [N] M` —— 房主手动换枪（自动换是 M5 的事，见 `_cmd_gun` 的注释）。"""
+    """`/w [N] M` —— 房间级自动/锁定武器。"""
 
     def gun(self, *args):
         """敲一条 `/w`，返回房主看到的那几行系统提示。"""
@@ -1859,6 +1875,7 @@ class BotGunCommandTests(BotFireRoom):
         self.assertTrue(other, "这个角色得有第二个可用槽，用例才有意义")
         self.gun(other[0])
         self.assertEqual(other[0], self.bot_conn.weapon_slot)
+        self.assertEqual(other[0], self.room.bot_weapon_slot)
         self.assertEqual(weapondata.slot_for(self.bot_conn.character_id,
                                              other[0]).id,
                          self.bot_conn.weapon.id)
@@ -1875,6 +1892,32 @@ class BotGunCommandTests(BotFireRoom):
         self.gun(slot)
         for machine in machines:
             self.assertEqual(slot, machine.weapon_slot)
+
+    def test_a_bot_added_later_inherits_the_room_weapon_lock(self):
+        self.gun(2)
+        index, error = bot._add_one_bot(self.alice, self.room)
+        self.assertIsNotNone(index, error)
+        self.assertEqual(2, self.room.seats[index].conn.weapon_slot)
+
+    def test_w_zero_restores_auto_for_every_bot_and_the_room(self):
+        self.gun(2)
+        index, error = bot._add_one_bot(self.alice, self.room)
+        self.assertIsNotNone(index, error)
+        self.gun(0)
+        self.assertEqual(0, self.room.bot_weapon_slot)
+        for seat_index in self.room.bot_seats():
+            machine = self.room.seats[seat_index].conn
+            self.assertIsNone(machine.weapon_slot)
+            self.assertIsNotNone(machine.weapon)
+
+    def test_a_room_weapon_lock_can_be_set_before_any_bot_joins(self):
+        # 把当前 bot 摘掉，验证配置不是“遍历现有 bot 时顺便写”的副作用。
+        gameserver.LOBBY.remove_bot(self.room, self.bot_seat)
+        self.gun(3)
+        self.assertEqual(3, self.room.bot_weapon_slot)
+        index, error = bot._add_one_bot(self.alice, self.room)
+        self.assertIsNotNone(index, error)
+        self.assertEqual(3, self.room.seats[index].conn.weapon_slot)
 
     def test_one_argument_with_an_unusable_slot_is_refused(self):
         before = self.bot_conn.weapon.id
@@ -1908,14 +1951,15 @@ class BotGunCommandTests(BotFireRoom):
         """★ 房主的指令不是「一图之内的机器状态」，换图不该把它清掉。"""
         choices = weapondata.usable_for(self.bot_conn.character_id)
         slot = choices[-1].raw["slot"]
-        self.gun(self.bot_seat, slot)
+        self.gun(slot)
         gameserver.Conn.on_game_packet(
             self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
             gameserver.w_wstr("Stage02"))
         self.assertEqual(slot, self.bot_conn.weapon_slot)
+        self.assertEqual(slot, self.room.bot_weapon_slot)
 
-    def test_switching_to_a_slot_the_new_character_lacks_falls_back(self):
-        """`/c` 换到一个没有那个槽位的角色 —— 退回首选，**不是**哑火。
+    def test_a_locked_slot_never_silently_falls_back(self):
+        """锁定槽位在新角色上不可用时宁可不开火，也不能暗中换别的枪。
 
         角色 3（아이린，玩家选不到）的 3 号槽是 `TotemLauncher`，
         `Damage=0` 打不动人 ⇒ 不在 `usable` 里，正好当这个局面的样本。
@@ -1924,17 +1968,16 @@ class BotGunCommandTests(BotFireRoom):
         self.bot_conn.character_id = 3
         self.assertIsNotNone(self.bot_conn.weapon)
         self.bot_conn.weapon_slot = 3       # 角色 3 的 slot3 伤害 0，不可用
-        self.assertEqual(weapondata.preferred_for(3).id,
-                         self.bot_conn.weapon.id)
+        self.assertIsNone(self.bot_conn.weapon)
 
 
 class BotHoldCommandTests(BotFireRoom):
-    """`/s N` —— 让 bot 站住，好测「隔着墙打不打得到」。"""
+    """`/hold N` —— 让 bot 站住，好测「隔着墙打不打得到」。"""
 
     def hold(self, *args):
         self.alice.sent.clear()
         self.assertTrue(bot.handle_command(
-            self.alice, "/s " + " ".join(map(str, args))))
+            self.alice, "/hold " + " ".join(map(str, args))))
         return "".join(chat_lines(self.alice))
 
     def test_holding_freezes_the_position_but_keeps_the_heartbeat(self):
@@ -2058,7 +2101,7 @@ class BotBallisticFireTests(BotFireRoom):
         站在身边才开枪」。射程口径从 `LockonRange`（80~120）换成语料量出来的
         交战距离 1000 之后，隔半个屏幕也该开火（§48）。"""
         self.approach()
-        bot.handle_command(self.alice, f"/s {self.bot_seat}")
+        bot.handle_command(self.alice, f"/hold {self.bot_seat}")
         self.clear()
         self.bot_conn.next_fire_at = 0.0
         far = self.bot_conn.battle_pos[0] + 700.0
@@ -2068,7 +2111,7 @@ class BotBallisticFireTests(BotFireRoom):
 
     def test_nothing_is_shot_at_beyond_the_engagement_range(self):
         self.approach()
-        bot.handle_command(self.alice, f"/s {self.bot_seat}")
+        bot.handle_command(self.alice, f"/hold {self.bot_seat}")
         self.clear()
         self.bot_conn.next_fire_at = 0.0
         far = self.bot_conn.battle_pos[0] + bot.BOT_ENGAGE_RANGE + 200.0
@@ -3498,7 +3541,7 @@ class BotDashTests(BotFireRoom):
         self.assertIsNone(self.bot_conn.stamina)
 
     def test_a_holding_bot_does_not_dash(self):
-        """`/s` 的意思是「站住别动」—— 那就别冲出去。"""
+        """`/hold` 的意思是「站住别动」—— 那就别冲出去。"""
         self.bot_conn.holding = True
         self.approach()
         self.assertEqual([], dash_frames(self.alice, self.bot_seat))
@@ -3737,6 +3780,12 @@ class BotOwnMovementTests(TerrainMixin, BotFireRoom):
 
     melee = False                       # 近身会抢在开枪前面，这批用例不验它
 
+    def force_no_shot(self):
+        """让这一批只验“到不了就寻路”，不被射程判定提前截停。"""
+        original = bot._fire_target
+        bot._fire_target = lambda *_args, **_kwargs: None
+        self.addCleanup(setattr, bot, "_fire_target", original)
+
     def test_it_walks_toward_the_enemy_when_it_has_no_shot(self):
         """★ 隔着一整张图（> `BOT_ENGAGE_RANGE`）时朝对方挪。"""
         self.install_terrain(synth_terrain("flat"))
@@ -3770,7 +3819,14 @@ class BotOwnMovementTests(TerrainMixin, BotFireRoom):
                         "站住是为了打，不是发呆")
 
     def test_a_step_it_cannot_climb_makes_it_jump(self):
-        """前面是爬不上去的坎就跳 —— 真人卡在墙根时也是这么干的。"""
+        """前面是爬不上去的坎就跳 —— 真人卡在墙根时也是这么干的。
+
+        ★ M5-C 之后必须先 `force_no_shot()`：会自动换枪的 bot 走到 620 就
+        **换成抛物线武器隔着这堵墙把手雷吊过去**（实测 `1002010 -> 1002020`），
+        于是站住开枪、根本走不到墙根。那是想要的行为，不是回归 —— 这一条
+        验的是「走不过去就跳」，得先把开枪这条路关掉。
+        """
+        self.force_no_shot()
         self.install_terrain(synth_terrain(
             "wall", walls=((900, 960, 90),)))
         self.place_bot(200.0)
@@ -3789,6 +3845,61 @@ class BotOwnMovementTests(TerrainMixin, BotFireRoom):
         self.assertTrue(body.x < 400.0,
                         "该停在坑边上，实际走到了 %.1f" % body.x)
 
+    def test_it_executes_the_planned_jump_onto_a_high_platform(self):
+        """★★ A* 算出的高台边必须真变成跳跃帧，并最终落到高台上。"""
+        self.force_no_shot()
+        self.install_terrain(synth_terrain(
+            "nav_runtime_high", floor=200, height=240,
+            walls=((680, 1400, 80),)))
+        self.place_bot(560.0, 200.0)
+        self.beats(36, 900.0, 80.0)
+        body = self.bot_conn.body
+        self.assertTrue(body.on_ground)
+        self.assertGreaterEqual(body.x, 680.0)
+        self.assertAlmostEqual(80.0, body.y)
+        jumps = [f for f in bot_frames(self.alice, self.bot_seat)
+                 if header(f)["opcode"] == botsync.OP_JUMP]
+        self.assertTrue(jumps, "高台路线必须实际发出跳跃帧")
+
+    def test_it_executes_the_planned_jump_across_a_gap(self):
+        """★★ 有对岸的坑要按规划跳过去，而不是沿用无底坑前停步兜底。"""
+        self.force_no_shot()
+        self.install_terrain(synth_terrain(
+            "nav_runtime_gap", floor=180, height=220,
+            pits=((640, 720),)))
+        self.place_bot(560.0, 180.0)
+        self.beats(36, 900.0, 180.0)
+        body = self.bot_conn.body
+        self.assertTrue(body.on_ground)
+        self.assertGreater(body.x, 720.0)
+        jumps = [f for f in bot_frames(self.alice, self.bot_seat)
+                 if header(f)["opcode"] == botsync.OP_JUMP]
+        self.assertTrue(jumps, "跨坑路线必须实际发出跳跃帧")
+
+    def test_it_presses_down_to_leave_a_one_way_platform(self):
+        """★★ 目标在细绳下方时，身体下落且心跳键位明确带 KEY_DOWN。"""
+        self.force_no_shot()
+        rows = []
+        for y in range(220):
+            if y == 80:
+                rows.append("1" * 1400)
+            elif y >= 180:
+                rows.append("2" * 1400)
+            else:
+                rows.append("0" * 1400)
+        self.install_terrain(mapdata.MapTerrain(make_record(rows)))
+        self.place_bot(700.0, 80.0)
+        self.beats(16, 705.0, 180.0)
+        body = self.bot_conn.body
+        self.assertTrue(body.on_ground)
+        self.assertAlmostEqual(180.0, body.y)
+        heartbeats = [f for f in bot_frames(self.alice, self.bot_seat)
+                      if udpsync.is_heartbeat(f)]
+        keys = [struct.unpack_from("<H", body_of(frame), 7 + 16)[0]
+                for frame in heartbeats]
+        self.assertTrue(any(value & botsync.KEY_DOWN for value in keys),
+                        "穿过单向平台的那一帧必须真的按下 ↓")
+
     def test_without_terrain_data_it_falls_back_to_the_human_trail(self):
         """没有地形产物的图上退回 D16 那条老路 —— 少走两步好过走进墙里。"""
         self.room.map_name = "没有这张图"
@@ -3796,6 +3907,174 @@ class BotOwnMovementTests(TerrainMixin, BotFireRoom):
         self.assertIsNone(self.bot_conn.body)
         last = bot_frames(self.alice, self.bot_seat)[-1]
         self.assertEqual((120, 50), udpsync.heartbeat_position(last))
+
+
+class BotWeaponChoiceTests(TerrainMixin, BotFireRoom):
+    """★★ M5-C：按此刻的局面自己换枪；房主锁了 / 捡到枪了就轮不到 AI。"""
+
+    def test_a_wall_makes_it_pick_the_lobbing_weapon(self):
+        """★ 直射被墙挡住、抛物线吊得过去 ⇒ 换成抛物线那把。
+
+        这不是「近战用手雷」那种偏好表：直射武器在 `_engagement()` 里被
+        `_path_blocked()` 判成**打不到**，压根不进候选。
+        """
+        self.install_terrain(synth_terrain("wall", walls=((900, 960, 90),)))
+        self.place_bot(560.0)
+        self.beats(12, 1300.0)
+        weapon = self.bot_conn.weapon
+        self.assertGreater(weapon.gravity, 0.0,
+                           "隔着墙就该改用抛物线武器，实际是 %s" % weapon.id)
+
+    def test_the_host_lock_beats_the_ai(self):
+        """`/w N` 锁住之后，局面再怎么变也不许换（用户要的「只能用指定武器」）。"""
+        self.install_terrain(synth_terrain("wall", walls=((900, 960, 90),)))
+        self.room.bot_weapon_slot = 1
+        self.bot_conn.weapon_slot = 1
+        self.place_bot(560.0)
+        self.beats(12, 1300.0)
+        self.assertEqual(1, self.bot_conn.weapon.raw["slot"])
+        self.assertIsNone(self.bot_conn.auto_weapon_id)
+
+    def test_a_picked_up_gun_beats_the_ai(self):
+        """地上捡来的枪压过 AI 的选择（§115 / §223 的原版口径）。"""
+        self.install_terrain(synth_terrain("flat"))
+        self.place_bot(560.0)
+        picked = weapondata.get(gameserver.PVP_WEAPON_GIVES[10200])
+        self.bot_conn.item_weapon = picked
+        self.bot_conn.item_weapon_shots = picked.force_count
+        self.beats(6, 900.0)
+        self.assertEqual(picked.id, self.bot_conn.weapon.id)
+        self.assertIsNone(self.bot_conn.auto_weapon_id)
+
+    def test_it_does_not_flip_flop_between_two_close_options(self):
+        """★ 换枪要丢半个弹匣，所以要有迟滞 —— 一局里不该来回横跳。"""
+        self.install_terrain(synth_terrain("flat"))
+        self.place_bot(300.0)
+        self.beats(24, 900.0)
+        changes = change_weapon_frames(self.alice, self.bot_seat)
+        self.assertLessEqual(len(changes), 2,
+                             "24 帧里换了 %d 次枪" % len(changes))
+
+
+class BotStanceTests(TerrainMixin, BotFireRoom):
+    """★★ M5-C：按双方血量决定逼近还是拉开（用户 2026-08-29 的要求）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.install_terrain(synth_terrain("flat"))
+        self.alice_seat = self.room.seat_index_of(self.alice)
+
+    def hurt(self, seat, fraction):
+        """把这个座位打掉 `fraction` 的血。
+
+        ★ 按**比例**而不是写死的数字：角色的满血各不相同
+        （`ChrProps.ini` 的 `Hp`，角色 0 是 100、角色 2 是 130）。
+        """
+        top = bot._seat_max_hp(self.room, seat)
+        bot._health(self.room).note_damage(seat, top * fraction)
+
+    def test_a_healthy_bot_presses_in(self):
+        self.place_bot(200.0)
+        self.beats(6, 1300.0)
+        self.assertEqual("press", self.bot_conn.stance)
+        self.assertGreater(self.bot_conn.body.x, 200.0)
+
+    def test_a_badly_hurt_bot_backs_away(self):
+        """★ 血被打掉大半 ⇒ 「照这样打下去我先倒」⇒ 往后退。"""
+        self.place_bot(700.0)
+        self.beats(2, 900.0)
+        self.hurt(self.bot_seat, 0.9)
+        before = self.bot_conn.body.x
+        self.beats(8, 900.0)
+        self.assertEqual("retreat", self.bot_conn.stance)
+        self.assertLess(self.bot_conn.body.x, before,
+                        "该往远离敌人的方向退，实际停在 %.1f"
+                        % self.bot_conn.body.x)
+
+    def test_it_comes_back_when_the_enemy_is_the_hurt_one(self):
+        self.place_bot(700.0)
+        self.beats(2, 900.0)
+        book = bot._health(self.room)
+        self.hurt(self.bot_seat, 0.9)
+        self.beats(4, 900.0)
+        self.assertEqual("retreat", self.bot_conn.stance)
+        book.reset(self.bot_seat)
+        self.hurt(self.alice_seat, 0.9)
+        self.beats(4, 900.0)
+        self.assertEqual("press", self.bot_conn.stance)
+
+    def test_retreating_still_shoots(self):
+        """拉开距离不等于不开枪 —— 真人也是一边退一边打（§37 的朝向口径）。"""
+        self.place_bot(700.0)
+        self.beats(2, 900.0)
+        self.hurt(self.bot_seat, 0.9)
+        # ★ 先把在飞的那一发结算掉：带溅射的枪要等上一发炸完
+        #   才能开下一枪（`_may_fire()` 的句柄闸门，§43）。
+        self.settle()
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.beats(8, 900.0)
+        self.assertEqual("retreat", self.bot_conn.stance)
+        self.assertTrue(fire_frames(self.alice, self.bot_seat),
+                        "退的时候也该还手")
+
+
+class BotAimLeadTests(BotFireRoom):
+    """★★ M5-D：对着**动的人**要算提前量；失误时要真的打偏。"""
+
+    def fired_angle(self):
+        frames = fire_frames(self.alice, self.bot_seat)
+        self.assertTrue(frames)
+        return struct.unpack_from("<f", body_of(frames[-1]), 14)[0]
+
+    def cursor_x(self):
+        beats = [f for f in bot_frames(self.alice, self.bot_seat)
+                 if udpsync.is_heartbeat(f)]
+        self.assertTrue(beats)
+        return struct.unpack_from("<h", body_of(beats[-1]), 7 + 0x12)[0]
+
+    def test_it_leads_a_target_running_away(self):
+        """★ 目标朝右跑 ⇒ 瞄准点在他前面，准星 x **大于**他此刻的 x。"""
+        self.walk(self.alice, [(600.0, 100.0), (632.0, 100.0),
+                               (664.0, 100.0)])
+        self.bot_conn.holding = True
+        self.clear()
+        self.walk(self.alice, [(696.0, 100.0), (728.0, 100.0)])
+        self.assertGreater(self.cursor_x(), self.alice.sync_trail[-1][0],
+                           "朝右跑的人要往他前面瞄")
+
+    def test_a_standing_target_gets_no_lead(self):
+        """站着不动的人，提前量退化成 0 —— M5-D 不该改变老行为。"""
+        self.approach(x=400.0)
+        self.assertLessEqual(
+            abs(self.cursor_x() - self.alice.sync_trail[-1][0]), 2)
+
+    def test_a_rolled_miss_really_bends_the_shot(self):
+        """★★ 失误必须**连弹道一起重解** —— 否则包里的角度还是准的。"""
+        self.approach(x=400.0)
+        honest = self.fired_angle()
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.bot_conn.roll = lambda n: 0            # 必失误（提前量 ×−0.5）
+        bot._reroll_aim_miss(self.bot_conn)
+        self.approach(x=400.0)
+        self.assertNotAlmostEqual(honest, self.fired_angle(), places=4)
+
+    def test_the_difficulty_is_the_only_knob(self):
+        """三档只改两个概率，物理一格都不动（M5-A 的口径）。"""
+        self.room.bot_difficulty = "easy"
+        easy = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
+        self.room.bot_difficulty = "hard"
+        hard = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
+        self.assertGreater(easy, hard)
+
+    def test_a_hud_jam_makes_it_much_worse(self):
+        """★ 别人放糊屏 ⇒ 失误概率明显上去（§121，用户的要求）。"""
+        self.room.bot_difficulty = "medium"
+        plain = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
+        self.room.quest.hud_jam_until[self.bot_seat] = time.monotonic() + 8.0
+        jammed = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
+        self.assertGreater(jammed, plain + 0.3)
 
 
 class BotEntryLockMovementTests(TerrainMixin, BotFireRoom):
@@ -3842,15 +4121,36 @@ class BotEntryLockMovementTests(TerrainMixin, BotFireRoom):
 
 
 class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
-    """★ 闯关房**照旧回放真人的轨迹** —— 那儿要的就是「跟着推进」，
-    而怪的位置服务端手里没有（`_hostile_targets` 在闯关房恒为空）。"""
+    """★★ 闯关房从 M5-G 起**自己走**，但目标仍然是「队伍刚踩过的那个点」。
 
-    def test_a_coop_bot_still_follows_the_trail(self):
+    以前这儿是纯轨迹回放（D16）：节奏天然对，可**一步都躲不开**。
+    现在把跟随点当寻路目标 —— 节奏还是跟着真人的轨迹，中间那段路自己走，
+    所以躲子弹 / 跳坑 / 打怪全接得上（M5-G）。
+    """
+
+    def test_it_takes_over_its_own_walking(self):
         self.install_terrain(synth_terrain("flat"))
         self.walk(self.alice, [(0.0, 150.0), (120.0, 150.0), (240.0, 150.0)])
-        self.assertIsNone(self.bot_conn.body, "闯关房不该接管走位")
-        last = bot_frames(self.alice, self.bot_seat)[-1]
-        self.assertEqual((120, 150), udpsync.heartbeat_position(last))
+        self.assertIsNotNone(self.bot_conn.body, "闯关房也该自己走")
+
+    def test_it_keeps_pace_with_the_party(self):
+        """★ 「不能太慢拖进度、也不能太快甩太远」—— 由**目标点**保证。"""
+        self.install_terrain(synth_terrain("flat"))
+        self.walk(self.alice, [(0.0, 150.0), (120.0, 150.0), (240.0, 150.0)])
+        for _ in range(10):
+            self.bot_conn.move_at -= bot.botmove.TICKS_PER_BEAT                 * bot.botmove.TICK_MS / 1000.0
+            self.human_heartbeat(self.alice, 240.0, 150.0)
+        goal = bot._coop_goal(self.room, self.bot_conn, self.bot_seat)
+        self.assertIsNotNone(goal)
+        self.assertLessEqual(abs(self.bot_conn.body.x - goal[0]),
+                             bot.BOT_COOP_BAND + 8.0,
+                             "跟随点 %.0f，bot 在 %.0f"
+                             % (goal[0], self.bot_conn.body.x))
+
+    def test_without_a_leader_it_falls_back_to_the_old_replay(self):
+        self.install_terrain(synth_terrain("flat"))
+        self.assertIsNone(bot._coop_goal(self.room, self.bot_conn,
+                                         self.bot_seat))
 
 
 #: 一张带出生点的合成图：101（1 队）两个点、102（2 队）两个点，
@@ -4048,11 +4348,11 @@ class BotDealsKnockbackTests(BotFireRoom):
         self.assertEqual((15.0, -10.0), bot.DASH_KNOCKBACK)
 
 
-class BotTakesKnockbackTests(TerrainMixin, BotFireRoom):
-    """★★★ **bot 挨打也要被顶飞**（§92）—— 用户 2026-08-28 报的那条。
+class HumanShotRoom(TerrainMixin, BotFireRoom):
+    """平地 + 一个站在 `(600, 150)` 的 bot，外加「让真人发一发同步包」的手脚架。
 
-    bot 的位置是服务端说了算的：客户端各自把它的模型顶飞，服务端这边不动
-    的话下一发心跳当场拽回去，看着就是「只是原地跳一下」。
+    ★ 抽出来是为了让击退 / 血量台账 / 闪避三批用例共用它，
+      而**不用互相继承** —— 继承会把上一批的用例整个再跑一遍。
     """
 
     def setUp(self):
@@ -4074,6 +4374,14 @@ class BotTakesKnockbackTests(TerrainMixin, BotFireRoom):
         self.send(botsync.OP_SPLASH_DAMAGED, botsync.splash_body(
             100002, botsync.character_handle(self.bot_seat), damage,
             600.0, 150.0, push_x=push[0], push_y=push[1]))
+
+
+class BotTakesKnockbackTests(HumanShotRoom):
+    """★★★ **bot 挨打也要被顶飞**（§92）—— 用户 2026-08-28 报的那条。
+
+    bot 的位置是服务端说了算的：客户端各自把它的模型顶飞，服务端这边不动
+    的话下一发心跳当场拽回去，看着就是「只是原地跳一下」。
+    """
 
     def test_a_human_splash_pushes_the_bot_off_the_ground(self):
         self.assertTrue(self.bot_conn.body.on_ground)
@@ -5749,3 +6057,425 @@ class BotSplashFalloffTests(BotFireRoom):
         hits = self.hits(weapon, 0.0)
         self.assertEqual(int(weapon.splash_damage) * bot._damage_scale(self.room),
                          hits[0][1])
+
+class BotHealthLedgerTests(HumanShotRoom):
+    """★★ M5-C 的血量台账（`bothp`）—— 和每台客户端记的是同一份账（§42）。"""
+
+    def ledger(self):
+        return bot._health(self.room)
+
+    def test_a_humans_splash_lands_in_the_ledger(self):
+        self.splash(30, (12.0, -9.0))
+        self.assertEqual(30.0, self.ledger().taken_by(self.bot_seat))
+
+    def test_a_humans_direct_hit_lands_in_it_even_without_knockback(self):
+        """★ 配不上 `rpFire` 的那一发**不给击退**，但血照扣（伤害在包里）。"""
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, botsync.character_handle(self.bot_seat), 600.0, 150.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=20.0))
+        self.assertTrue(self.bot_conn.body.on_ground, "这一发不该给击退")
+        self.assertEqual(20.0, self.ledger().taken_by(self.bot_seat))
+
+    def test_damage_to_a_third_party_is_tracked_too(self):
+        """真人打真人服务端也看得见 —— bot 判「谁血多」要用它。"""
+        self.send(botsync.OP_SPLASH_DAMAGED, botsync.splash_body(
+            100002, botsync.character_handle(self.alice_seat), 25,
+            600.0, 150.0, push_x=1.0, push_y=-1.0))
+        self.assertEqual(25.0, self.ledger().taken_by(self.alice_seat))
+
+    def test_a_new_round_wipes_the_whole_book(self):
+        self.splash(30, (12.0, -9.0))
+        for index in self.room.bot_seats():
+            self.room.seats[index].conn.load_progress = 0
+        bot.report_bots_loaded(self.room, "单测：新一局")
+        self.assertEqual({}, self.ledger().taken)
+class BotDodgeTests(HumanShotRoom):
+    """★★ M5-E：真人朝 bot 打一发，它得**真的躲开**。
+
+    共用 `HumanShotRoom` 那套手脚架：平地 + bot 站在 (600, 150)，
+    `send()` 走真的 `0x040e` 入口。
+    """
+
+    def aim_at_bot(self, weapon_id=1002030, from_x=100.0):
+        """真人在 `from_x` 处朝 bot 的身体圆心平射一发。"""
+        weapon = weapondata.get(weapon_id)
+        who = chrprops.get(self.room.seats[self.bot_seat].character_id)
+        body = self.bot_conn.body
+        cx, cy = who.center(body.x, body.y, False)
+        mx, my = from_x, body.y - bot.BOT_MUZZLE_HEIGHT
+        angle = math.atan2(cy - my, cx - mx)
+        self.send(botsync.OP_FIRE, botsync.fire_body(
+            self.alice_seat, weapon.id, mx, my, angle,
+            ballistics.power_for_speed(weapon, weapon.velocity)))
+        return weapon
+
+    def threats(self):
+        return bot._threats_against(self.room, self.bot_conn, self.bot_seat)
+
+    def test_a_humans_shot_becomes_a_threat(self):
+        self.aim_at_bot()
+        threats = self.threats()
+        self.assertEqual(1, len(threats))
+        self.assertEqual(self.alice_seat, threats[0].seat)
+
+    def test_it_gets_out_of_the_way(self):
+        self.aim_at_bot()
+        before = self.bot_conn.body.x
+        self.beats(3, 100.0)
+        self.assertNotAlmostEqual(before, self.bot_conn.body.x,
+                                  msg="子弹飞过来了还站着不动")
+
+    def test_the_action_it_picks_actually_avoids_the_shot(self):
+        """★ 判据不是「动了」而是「这条弹道真的打不到我了」。"""
+        self.aim_at_bot()
+        terrain = mapdata.load(bot._current_map(self.room))
+        who = chrprops.get(self.room.seats[self.bot_seat].character_id)
+        threats = self.threats()
+        now = time.monotonic()
+        option = botthreat.choose(terrain, self.bot_conn.body, who,
+                                  threats, now)
+        self.assertIsNotNone(option)
+        centers = botthreat.simulate(terrain, self.bot_conn.body, who, option)
+        self.assertIsNone(botthreat.impact_tick(
+            terrain, threats[0], now, centers,
+            threats[0].danger_radius(who.size_body)))
+
+    def test_a_shot_that_misses_anyway_is_not_dodged(self):
+        """★ 打不到我就别乱动（真人 39% 的心跳是站着不动的，§71）。"""
+        weapon = weapondata.get(1002030)
+        body = self.bot_conn.body
+        self.send(botsync.OP_FIRE, botsync.fire_body(
+            self.alice_seat, weapon.id, 100.0, body.y - 400.0, 0.0,
+            ballistics.power_for_speed(weapon, weapon.velocity)))
+        before = self.bot_conn.body.x
+        # ★ 也不能被「打不到就走过去」那条带跑 —— 把开火目标关掉隔离掉它。
+        original = bot._fire_target
+        bot._fire_target = lambda *a, **k: None
+        self.addCleanup(setattr, bot, "_fire_target", original)
+        self.bot_conn.stance = "press"
+        self.beats(1, body.x)               # 真人站在 bot 脚下 -> 不用走
+        self.assertAlmostEqual(before, self.bot_conn.body.x)
+
+    def test_a_blind_roll_means_it_guesses_wrong(self):
+        """★ `dodge_error` 掷中 ⇒ 随便挑一个，可能就是站着挨打。"""
+        self.bot_conn.roll = lambda n: 0     # 必失误，且挑到第 0 个 = 站着
+        self.aim_at_bot()
+        self.beats(1, 100.0)
+        self.assertIsNotNone(self.bot_conn.dodge_blind)
+        self.assertIs(botthreat.STAND, self.bot_conn.dodge_blind)
+
+    def test_the_dice_are_rolled_once_per_wave_not_per_frame(self):
+        """★ 判据是「威胁集合变了没有」，不是每一帧重掷（铁律 10）。"""
+        self.aim_at_bot()
+        self.beats(1, 100.0)
+        first = self.bot_conn.dodge_signature
+        self.assertTrue(first)
+        self.beats(2, 100.0)
+        self.assertEqual(first, self.bot_conn.dodge_signature)
+        self.aim_at_bot(from_x=120.0)        # 又来一发 -> 集合变了
+        self.beats(1, 100.0)
+        self.assertNotEqual(first, self.bot_conn.dodge_signature)
+
+    def test_a_teammates_shot_is_not_dodged(self):
+        """碰撞排除组相同的弹体压根撞不着自己（§63），躲它是白躲。"""
+        self.room.seats[self.alice_seat].team = TEAM_A
+        self.room.seats[self.bot_seat].team = TEAM_A
+        original = self.room.team_layout
+        self.room.team_layout = lambda: lobby.TEAM_LAYOUT_TEAMS
+        self.addCleanup(setattr, self.room, "team_layout", original)
+        self.aim_at_bot()
+        self.assertEqual([], self.threats())
+
+    def test_it_reports_the_second_jump_as_segment_two(self):
+        """★ `rpJump` 的段号：地上那一下是 1，空中补的那一下是 2（§124）。"""
+        machine = self.bot_conn
+        machine.body = bot.botmove.Body(600.0, 150.0)
+        terrain = mapdata.load(bot._current_map(self.room))
+        who = chrprops.get(self.room.seats[self.bot_seat].character_id)
+        body = bot.botmove.tick(terrain, machine.body, who, want_jump=True)
+        self.assertFalse(body.on_ground)
+        self.assertFalse(body.air_jumped)
+        again = bot.botmove.tick(terrain, body, who, want_jump=True)
+        self.assertTrue(again.air_jumped)
+class BotItemHuntTests(HumanShotRoom):
+    """★★ M5-F：**主动**去捡地上的道具，而不是只能顺路蹭到（§100 的另一半）。"""
+
+    def drop_item(self, x, y=150.0, handle=900001, item_id=10300):
+        quest = self.room.quest
+        quest.items_at[handle] = (float(x), float(y))
+        quest.item_handles[handle] = item_id
+        quest.items_born[handle] = time.monotonic()
+        quest.items_on_map.add(handle)
+        return handle
+
+    def no_shot(self):
+        original = bot._fire_target
+        bot._fire_target = lambda *a, **k: None
+        self.addCleanup(setattr, bot, "_fire_target", original)
+
+    def test_it_walks_to_an_item_on_the_way(self):
+        self.no_shot()
+        self.drop_item(500.0)                 # bot 在 600，敌人在 1300
+        self.beats(3, 1300.0)                 # ★ 捕到“走过去”那一段；
+        #   再多几帧它就把东西捡起来、又转头朝敌人走了。
+        self.assertLess(self.bot_conn.body.x, 600.0,
+                        "该先绕去捡道具，实际走到了 %.1f" % self.bot_conn.body.x)
+
+    def test_an_item_further_than_the_enemy_is_not_worth_a_trip(self):
+        self.no_shot()
+        self.drop_item(100.0)                 # 比敌人（1300）还远
+        self.beats(6, 800.0)
+        self.assertGreater(self.bot_conn.body.x, 600.0)
+
+    def test_it_does_not_leave_a_shot_to_grab_one(self):
+        """★ 打得到人的时候不去蹲地上那件 —— 真人也不会当着枪口去捡。"""
+        self.drop_item(500.0)
+        self.beats(4, 800.0)
+        self.assertAlmostEqual(600.0, self.bot_conn.body.x)
+
+    def test_walking_onto_it_picks_it_up(self):
+        self.no_shot()
+        handle = self.drop_item(520.0)
+        self.beats(12, 1300.0)
+        self.assertNotIn(handle, self.room.quest.items_at)
+        # ★ 拿到手就用掉了（D65），所以道具格里是空的 ——
+        #   “谁捡走的”这本账在 `items_taken` 里。
+        self.assertEqual(self.bot_seat,
+                         self.room.quest.items_taken.get(handle))
+
+    def test_an_expired_item_is_not_chased(self):
+        """地上的东西只躺 13 秒（§118）—— 过期的不该再去追。"""
+        self.no_shot()
+        handle = self.drop_item(500.0)
+        self.room.quest.items_born[handle] = time.monotonic() - 60.0
+        self.beats(6, 1300.0)
+        self.assertGreater(self.bot_conn.body.x, 600.0)
+
+
+class BotSmokeFireTests(HumanShotRoom):
+    """★★ M5-F：别人放了烟 ⇒ 挑不中人，但要**朝云团乱射**（用户 2026-08-29）。"""
+
+    def smoke_over(self, x, y=150.0):
+        self.room.quest.smokes.append(
+            (float(x), float(y), time.monotonic() + gameserver.SMOKE_SECONDS))
+
+    def test_someone_in_smoke_cannot_be_picked_as_a_target(self):
+        """D67 那一半：云里的人挑不中。"""
+        self.walk(self.alice, [(900.0, 150.0)])
+        self.smoke_over(900.0)
+        self.assertEqual([], bot._hostile_targets(self.room, self.bot_seat))
+
+    def test_it_still_shoots_at_the_cloud(self):
+        """★ 挑不中不等于不还手 —— 朝云团里一个随机点放。"""
+        self.walk(self.alice, [(900.0, 150.0)])
+        self.smoke_over(900.0)
+        self.bot_conn.next_fire_at = 0.0
+        target = bot._fire_target(self.room, self.bot_conn, self.bot_seat,
+                                  self.bot_conn.weapon)
+        self.assertIsNotNone(target, "有人躲在烟里就该朝烟乱放")
+        point = target[1]
+        self.assertLessEqual(
+            math.hypot(point[0] - 900.0, point[1] - 150.0),
+            gameserver.SMOKE_RADIUS * 1.5)
+
+    def test_the_scatter_changes_from_shot_to_shot(self):
+        """★ 「乱射」= 每一发换一个落点（偏移在打完一发之后重掷）。"""
+        self.walk(self.alice, [(900.0, 150.0)])
+        self.smoke_over(900.0)
+        seen = set()
+        for value in (0, 40, 90, 150):
+            self.bot_conn.roll = lambda n, v=value: min(v, n - 1)
+            bot._reroll_aim_miss(self.bot_conn)
+            target = bot._fire_target(self.room, self.bot_conn, self.bot_seat,
+                                      self.bot_conn.weapon)
+            if target is not None:
+                seen.add((round(target[1][0]), round(target[1][1])))
+        self.assertGreater(len(seen), 1, "每一发都打在同一个点上就不叫乱射")
+
+    def test_no_smoke_means_no_blind_fire(self):
+        self.walk(self.alice, [(900.0, 150.0)])
+        self.room.quest.arm_respawn_watchdog(self.alice_seat, (900.0, 150.0))
+        self.assertIsNone(bot._smoke_aim(self.room, self.bot_conn,
+                                         self.bot_seat, time.monotonic()))
+
+
+class BotItemUseTests(HumanShotRoom):
+    """★★ M5-F：**正确**使用道具 —— 回血药是唯一「满血先别喝」的那件。"""
+
+    def hold(self, *item_ids):
+        self.room.quest.item_slots[self.bot_seat] = list(item_ids)
+
+    def test_a_full_health_bot_saves_the_medkit(self):
+        self.hold(gameserver.HP_CHARGE_ITEM_ID)
+        self.assertFalse(bot._use_held_item(self.room, self.bot_conn,
+                                            self.bot_seat))
+        self.assertEqual([gameserver.HP_CHARGE_ITEM_ID],
+                         self.room.quest.item_slots[self.bot_seat])
+
+    def test_it_uses_the_other_item_first(self):
+        self.hold(gameserver.HP_CHARGE_ITEM_ID, 10300)
+        self.assertTrue(bot._use_held_item(self.room, self.bot_conn,
+                                           self.bot_seat))
+        self.assertEqual([gameserver.HP_CHARGE_ITEM_ID],
+                         self.room.quest.item_slots[self.bot_seat])
+
+    def test_a_hurt_bot_drinks_it(self):
+        bot._health(self.room).note_damage(self.bot_seat, 20)
+        self.hold(gameserver.HP_CHARGE_ITEM_ID)
+        self.assertTrue(bot._use_held_item(self.room, self.bot_conn,
+                                           self.bot_seat))
+        self.assertEqual([], self.room.quest.item_slots[self.bot_seat])
+
+    def test_full_slots_beat_the_saving(self):
+        """格子满了还留着就是把后面捡的全丢掉（`grant_item` 会返回 False）。"""
+        self.hold(*([gameserver.HP_CHARGE_ITEM_ID]
+                    * gameserver.ITEM_SLOT_COUNT))
+        self.assertTrue(bot._use_held_item(self.room, self.bot_conn,
+                                           self.bot_seat))
+
+    def test_the_medkit_really_heals_the_ledger(self):
+        """★ `Status.ini[8]`：8 秒 × 每秒 10 点。台账不跟着回，
+        「谁先倒」就会一直按残血算（§122）。"""
+        book = bot._health(self.room)
+        book.note_damage(self.bot_seat, 50)
+        self.hold(gameserver.HP_CHARGE_ITEM_ID)
+        bot._use_held_item(self.room, self.bot_conn, self.bot_seat)
+        charge = self.room.quest.hp_charges[self.bot_seat]
+        self.assertEqual(8, charge[1])
+        charge[0] = time.monotonic() - 0.001      # 把第一跳拨到过去
+        bot._refresh_health(self.room)
+        self.assertEqual(40.0, book.taken_by(self.bot_seat))
+
+    def test_a_bots_smoke_is_registered_too(self):
+        """★ 以前 bot 放的烟 / 冰冻 / 糊屏**一件都没登记过**（读的是
+        `sync_trail`，bot 没有）—— 已经改成 `area_effect_origin()`。"""
+        self.hold(gameserver.SMOKE_ITEM_ID)
+        bot._use_held_item(self.room, self.bot_conn, self.bot_seat)
+        self.assertTrue(self.room.quest.smokes)
+        x, y, _until = self.room.quest.smokes[-1]
+        self.assertAlmostEqual(self.bot_conn.battle_pos[0], x)
+
+    def test_a_bots_hud_jam_lands_on_the_enemies(self):
+        self.hold(gameserver.HUD_JAM_ITEM_ID)
+        bot._use_held_item(self.room, self.bot_conn, self.bot_seat)
+        self.assertIn(self.alice_seat, self.room.quest.hud_jam_until)
+        self.assertNotIn(self.bot_seat, self.room.quest.hud_jam_until)
+class BotQuestCombatTests(TerrainMixin, BotFrameRoom):
+    """★★ M5-G：闯关房里也要**躲怪的子弹、打怪、打 boss**。
+
+    怪的位置服务端**没有任何包在广播**（§125）—— 只能在「它开了一枪」
+    「有人打中了它」这两个瞬间瞄一眼。这一批用例验的就是那两条链。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.install_terrain(synth_terrain("flat"))
+        self.place_bot(600.0)
+        self.alice_seat = self.room.seat_index_of(self.alice)
+        self.bot_conn.act_lock_until = 0.0
+        self.bot_conn.enter_lock_until = 0.0
+
+    def human_packet(self, opcode, body):
+        return botsync.build_peer_packet(
+            self.alice_seat, opcode, body,
+            game_id=self.room.epoch_value, sequence=self.next_seq(self.alice))
+
+    def send(self, opcode, body):
+        gameserver.Conn.on_game_packet(
+            self.alice, OP_PEER_DATA_UP, self.human_packet(opcode, body))
+
+    def mob_fires(self, x=900.0, y=120.0, ammo=1002010):
+        """控制者那台机器替怪发的一发 `rpFire`（`body+0 == 20`，§23）。"""
+        weapon = weapondata.get(ammo)
+        angle = math.atan2(93.0 - y, 643.0 - x)
+        body = botsync.fire_body(
+            self.alice_seat, weapon.id, x, y, angle,
+            ballistics.power_for_speed(weapon, weapon.velocity))
+        body = bytes([bot.MOB_FIRE_SOURCES[0]]) + body[1:]
+        self.send(botsync.OP_FIRE, body)
+        return weapon
+
+    def test_a_mobs_muzzle_flash_is_a_sighting(self):
+        self.mob_fires()
+        seen = bot.mob_sightings(self.room)
+        self.assertEqual(1, len(seen))
+        self.assertAlmostEqual(900.0, seen[0][0], places=3)
+        self.assertIsNone(seen[0][2], "枪口那一路没有句柄")
+
+    def test_a_mob_shot_does_not_overwrite_the_humans_weapon(self):
+        """★ 怪的枪是队友那台机器替它发的 —— 别把它记成「他现在用这把」。"""
+        self.assertIsNone(getattr(self.alice, "peer_weapon", None))
+        self.mob_fires()
+        self.assertIsNone(getattr(self.alice, "peer_weapon", None))
+
+    def test_a_hit_on_a_mob_gives_us_its_handle(self):
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, 500123, 880.0, 130.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=12.0))
+        seen = bot.mob_sightings(self.room)
+        self.assertEqual([(880.0, 130.0, 500123)], seen)
+
+    def test_a_mob_hit_is_not_charged_to_a_player_seat(self):
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, 500123, 880.0, 130.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=12.0))
+        self.assertEqual({}, bot._health(self.room).taken)
+
+    def test_a_stale_sighting_expires(self):
+        self.mob_fires()
+        table = self.room.quest.mob_sightings
+        for key in table:
+            table[key][2] -= bot.MOB_SIGHTING_SECONDS + 1.0
+        self.assertEqual([], bot.mob_sightings(self.room))
+
+    def test_a_mobs_bullet_is_dodged_even_though_a_teammate_sent_it(self):
+        """★ 队友的子弹撞不着自己（§63），**怪的子弹撞得着** —— 得躲。"""
+        self.mob_fires(x=100.0, y=93.0)
+        threats = bot._threats_against(self.room, self.bot_conn, self.bot_seat)
+        self.assertEqual(1, len(threats))
+
+    def test_a_real_teammate_bullet_is_still_ignored(self):
+        weapon = weapondata.get(1002010)
+        self.send(botsync.OP_FIRE, botsync.fire_body(
+            self.alice_seat, weapon.id, 100.0, 93.0, 0.0,
+            ballistics.power_for_speed(weapon, weapon.velocity)))
+        self.assertEqual([], bot._threats_against(
+            self.room, self.bot_conn, self.bot_seat))
+
+    def test_it_shoots_at_a_fresh_sighting(self):
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, 500123, 880.0, 120.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=12.0))
+        target = bot._fire_target(self.room, self.bot_conn, self.bot_seat,
+                                  self.bot_conn.weapon)
+        self.assertIsNotNone(target, "看见过怪就该朝那儿打")
+        self.assertEqual(bot.MOB_SEAT, target[0])
+        self.assertAlmostEqual(880.0, target[1][0], places=3)
+
+    def test_the_explosion_names_the_mob_handle_so_the_damage_lands(self):
+        """★★ 收方按**句柄**扣血（§42）—— 填错就是「子弹飞过去不掉血」。"""
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, 500123, 880.0, 120.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=12.0))
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.beats(2, 300.0)
+        # ★ 把在飞的那几发推到头（`BotFireRoom.settle()` 的手法，
+        #   这一批继承的是闯关房那个基类，没那个助手）。
+        for shell in self.bot_conn.pending_shots:
+            shell.born -= 10.0
+        bot._advance_shells(self.room, self.bot_conn, time.monotonic())
+        explodes = explode_frames(self.alice, self.bot_seat)
+        self.assertTrue(explodes, "该打出一发并结算")
+        targets = {struct.unpack_from("<i", body_of(f), 4)[0]
+                   for f in explodes}
+        self.assertIn(500123, targets)
+
+    def test_a_sighting_without_a_handle_cannot_be_damaged(self):
+        """枪口那一路没有句柄 —— 朝它打没问题，但 `rpExplode` 填不了目标。"""
+        self.mob_fires(x=880.0, y=120.0)
+        shell = bot.Shell(1, 0, self.bot_conn.weapon, 3, 600.0, 93.0,
+                          ballistics.launch(self.bot_conn.weapon, 0.0, 1.0),
+                          0.0, 40)
+        self.assertIsNone(bot._mob_contact(self.room, shell,
+                                           860.0, 120.0, 900.0, 120.0))

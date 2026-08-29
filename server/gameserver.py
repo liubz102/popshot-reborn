@@ -2281,6 +2281,41 @@ SMOKE_ITEM_ID = 10401
 SMOKE_RADIUS = 150.0
 SMOKE_SECONDS = 8.0
 
+#: ★★ **HP 回复剂**（`Item.ini` `[HpCharge] ItemId=10308 CharAttr=8`，
+#: 全队版 `[TeamHpCharge] ItemId=10313`）。效果来自 `Status.ini` 第 **8** 条：
+#:
+#:     [8]
+#:     Time=8.0
+#:     Interval=1.0
+#:     Hp=10
+#:
+#: ⇒ **8 秒里每秒回 10 点，一共 80 点**。血量是每台机器各算各的（§122），
+#: 服务端记那份台账时得跟着回 —— 不跟的话 bot 眼里「刚喝完药的人」还是残血，
+#: 逼近 / 拉开会判反。
+HP_CHARGE_ITEM_ID = 10308
+TEAM_HP_CHARGE_ITEM_ID = 10313
+HP_CHARGE_SECONDS = 8.0
+HP_CHARGE_INTERVAL = 1.0
+HP_CHARGE_AMOUNT = 10
+
+#: ★ 干扰道具（`Item.ini` 的 `[HudDevil]`，糊屏）。
+HUD_JAM_ITEM_ID = 10311
+
+#: ★★ 糊屏对 bot 的效果**也是我们定的**（同烟雾那条，D67 / D76）：
+#: bot 没有屏幕，原版那张盖住 HUD 的鬼脸对它一点意义都没有。
+#: 用户 2026-08-29：「别人使用了干扰道具，bot 的发射子弹的失误概率应该
+#: 明显增加。」⇒ 折算成瞄准失误概率的一段加成。
+#:
+#: ⚠ 顺带查到的原版事实：`[HudDevil] Range=-1`，而施加 `Hudded` 的那个
+#: 循环（`0x50854d`~`0x508712`）在 `0x5085e8` 要求 **距离 ≤ Range** 才生效
+#: （和冰冻 `0x508843` 同一个形状，§106 已经把那一处钉死过）——
+#: `-1` 意味着**这一条在原版里谁都罩不到**。所以我们这条不是「复现原版」，
+#: 是**替它补一个说得通的效果**，出处只有用户的要求。见 §121。
+#:
+#: 时长取 `Status.ini` 第 **13** 条（`[Hudded]` 的 `CharAttr` 就是 13）
+#: 的 `Time=8.0` —— 这一格是原版的。
+HUD_JAM_SECONDS = 8.0
+
 #: 踩中之后的效果，来自 `Data/Status.ini` 第 **14** 条（`[Slowed]`，
 #: `Item.ini` 里 `Slowed` 的 `CharAttr` 就是 14）：
 #:
@@ -3494,6 +3529,17 @@ class RoomQuest:
         self.freeze_bursts = []
         #: ★ 地上还在飘的**烟雾**：`[(x, y, 散掉的时刻), …]`（D67）。
         self.smokes = []
+        #: ★ 被**糊屏**（10311）罩住的座位撑到什么时候（`{座位: 时刻}`，§121）。
+        #:   只有 bot 读它 —— 真人那张鬼脸是他自己客户端画的。
+        self.hud_jam_until = {}
+        #: ★ 正在**回血**的座位：`{座位: [下一跳的时刻, 还剩几跳]}`（§122）。
+        #:   `Status.ini[8]` 是 8 秒 × 每秒 10 点；这里按同一个节奏往台账里加。
+        self.hp_charges = {}
+        #: ★★ **怪的目击点**：`{钥匙: [x, y, 时刻, 句柄或 None]}`（§125）。
+        #:   闯关模式里怪的位置**没有任何包在广播**（各台机器各自模拟），
+        #:   服务端只能从「它开了一枪」和「有人打中了它」这两件事上瞄一眼。
+        #:   只有 bot 读它。
+        self.mob_sightings = {}
         #: ★ **道具模式**：服务端刷在地图上、还没被人捡走的道具句柄（§191）。
         #: 只用来卡「地图上最多同时躺几件」，捡走了就从这里去掉。
         self.items_on_map = set()
@@ -4207,6 +4253,9 @@ class RoomQuest:
         del self.slow_mines[:]
         del self.freeze_bursts[:]
         del self.smokes[:]
+        self.hud_jam_until.clear()
+        self.hp_charges.clear()
+        self.mob_sightings.clear()
         self.dead_events = {key for key in self.dead_events if key[0] in keep}
         self.death_counts = {handle: count
                              for handle, count in self.death_counts.items()
@@ -6756,6 +6805,18 @@ class Conn:
             reason=f"：道具效果 {item_id} 作用于座位 {seat_id}")
         self.note_area_item(item_id, seat_id, quest)
 
+    def area_effect_origin(self):
+        """「作用于周围」的那几件道具的**作用中心** = 使用者此刻站在哪。
+
+        真人的来自他自己的位置心跳；★ `BotConn` 覆写成 `battle_pos`
+        —— bot 没有心跳上行，但服务端本来就知道它站在哪。
+        """
+        trail = getattr(self, "sync_trail", None)
+        if not trail:
+            return None
+        point = trail[-1]
+        return (float(point[0]), float(point[1]))
+
     def note_area_item(self, item_id, seat_id, quest):
         """「作用于别人」的那几件道具，服务端要自己记一份（V0.3 §101/§106）。
 
@@ -6788,14 +6849,55 @@ class Conn:
             self.log(f"   反射护盾 座位 {seats} 撑 {REFLECT_SECONDS:g} 秒"
                      f"（bot 的弹体打上去会被弹开，§119）")
             return
+        # ★★ HP 回复剂（10308 / 全队版 10313）：和位置无关，记的是
+        #    「谁、从什么时候起、每秒回 10 点、回 8 次」（§122）。
+        if item_id in (HP_CHARGE_ITEM_ID, TEAM_HP_CHARGE_ITEM_ID):
+            room = self.lobby_room()
+            seats = [int(seat_id)]
+            if item_id == TEAM_HP_CHARGE_ITEM_ID and room is not None:
+                mine = (room.seats[seat_id].team
+                        if 0 <= seat_id < ROOM_SEAT_COUNT
+                        and room.seats[seat_id] is not None else None)
+                if mine:
+                    seats = [i for i, s in enumerate(room.seats)
+                             if s is not None and s.conn is not None
+                             and s.team == mine]
+            doses = int(HP_CHARGE_SECONDS / HP_CHARGE_INTERVAL)
+            first = time.monotonic() + HP_CHARGE_INTERVAL
+            for seat in seats:
+                quest.hp_charges[seat] = [first, doses]
+            self.log(f"   HP 回复剂 座位 {seats}：{doses} 跳 × "
+                     f"{HP_CHARGE_AMOUNT} 点（Status.ini[8]）")
+            return
+        # ★★ 糊屏（10311）：和位置无关 —— 原版那道距离门用的是
+        #    `Range=-1`，谁都罩不到（§121）。我们按用户的要求让它罩住
+        #    **所有敌人**（同队跳过，这一条原版是有的：`0x508592`
+        #    比两边的 `[vft+0x144]`，相同就跳过）。
+        if item_id == HUD_JAM_ITEM_ID:
+            room = self.lobby_room()
+            if room is None:
+                return
+            until = time.monotonic() + HUD_JAM_SECONDS
+            mine = room.seats[seat_id].team if 0 <= seat_id < ROOM_SEAT_COUNT                 and room.seats[seat_id] is not None else None
+            teams = room.team_layout() == TEAM_LAYOUT_TEAMS
+            hit = []
+            for index, other in enumerate(room.seats):
+                if other is None or index == seat_id:
+                    continue
+                if teams and other.team == mine:
+                    continue
+                quest.hud_jam_until[index] = until
+                hit.append(index)
+            self.log(f"   糊屏 座位 {hit} 罩 {HUD_JAM_SECONDS:g} 秒"
+                     f"（bot 的瞄准失误概率明显上升，§121）")
+            return
         if item_id not in (FREEZER_ITEM_ID, SMOKE_ITEM_ID):
             return
-        trail = getattr(self, "sync_trail", None)
-        if not trail:
-            self.log(f"   ⚠ 用 {item_id} 时还没有位置心跳，服务端记不下作用点"
-                     f"（bot 不会受影响）")
+        point = self.area_effect_origin()
+        if point is None:
+            self.log(f"   ⚠ 用 {item_id} 时还不知道使用者站在哪，服务端记不下"
+                     f"作用点（bot 不会受影响）")
             return
-        point = trail[-1]
         x, y = float(point[0]), float(point[1])
         if item_id == FREEZER_ITEM_ID:
             quest.freeze_bursts.append((x, y, int(seat_id), time.monotonic()))

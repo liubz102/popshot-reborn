@@ -55,6 +55,17 @@ GRAVITY = 1.2
 #: 起跳初速（单位 / tick，向上）。★ 语料量的，见文件头那张表。
 JUMP_SPEED = 20.0
 
+#: ★★ **第二段跳**的初速（单位 / tick，向上）。同样是语料量的（V0.3 §124）：
+#: 380 份上行流里 `rpJump` 的 `+1` 段号分成两拨，各取「起跳后第一发心跳的
+#: `vy`」——
+#:
+#:     第 1 段  n=37147   峰值 **−20**（9712 发），后面 19 / 18 / 17 是采样滞后
+#:     第 2 段  n=20988   峰值 **−24**（5445 发），后面 22 / 21 / 20 同理
+#:
+#: 分布只有四个桶、而且每桶都上千发 ⇒ 它是**常量**，而且第二段跳是**把
+#: `v.y` 重新置成这个数**（不是在当前速度上叠加 —— 叠加的话分布会散开）。
+DOUBLE_JUMP_SPEED = 24.0
+
 #: 按着右键冲刺跑：`GameProps.ini` 的 `FastRunRate`。
 FAST_RUN_RATE = 1.5
 
@@ -89,22 +100,30 @@ class Body(object):
     踩在地上时真人报的速度就是 0，是收方自己按按键把他走过去的）。
     """
 
-    __slots__ = ("x", "y", "vx", "vy", "on_ground")
+    __slots__ = ("x", "y", "vx", "vy", "on_ground", "air_jumped")
 
-    def __init__(self, x, y, vx=0.0, vy=0.0, on_ground=True):
+    def __init__(self, x, y, vx=0.0, vy=0.0, on_ground=True,
+                 air_jumped=False):
         self.x = float(x)
         self.y = float(y)
         self.vx = 0.0 if on_ground else float(vx)
         self.vy = 0.0 if on_ground else float(vy)
         self.on_ground = bool(on_ground)
+        #: ★ 这一段腾空里**第二段跳用掉了没有**。落地自动清 —— `rpJump` 的
+        #:   段号只有 1 和 2（§23），所以一次腾空只能再跳一下。
+        self.air_jumped = False if on_ground else bool(air_jumped)
 
-    def moved(self, x, y, vx=0.0, vy=0.0, on_ground=True):
-        return Body(x, y, vx, vy, on_ground)
+    def moved(self, x, y, vx=0.0, vy=0.0, on_ground=True, air_jumped=None):
+        """派生一个新状态。`air_jumped` 不给就**沿用自己的**。"""
+        return Body(x, y, vx, vy, on_ground,
+                    self.air_jumped if air_jumped is None else air_jumped)
 
     def __eq__(self, other):
         return (isinstance(other, Body)
-                and (self.x, self.y, self.vx, self.vy, self.on_ground)
-                == (other.x, other.y, other.vx, other.vy, other.on_ground))
+                and (self.x, self.y, self.vx, self.vy, self.on_ground,
+                     self.air_jumped)
+                == (other.x, other.y, other.vx, other.vy, other.on_ground,
+                    other.air_jumped))
 
     def __repr__(self):
         return ("<Body (%.1f, %.1f) v=(%.1f, %.1f) %s>"
@@ -189,6 +208,20 @@ def jump_pad_launch(terrain, body, character):
     return None
 
 
+def double_jump(body):
+    """★★ **第二段跳**：腾空中再按一次跳（§124）。不能跳就原样返回。
+
+    * 只在**腾空**时有效（踩着地的那一下是第一段，走 `jump()`）；
+    * 一段腾空只能用一次（`rpJump` 的段号只有 1 / 2）；
+    * 把 `v.y` **重新置成** `DOUBLE_JUMP_SPEED`（语料实证是「置」不是「叠」），
+      水平速度一点不动 —— 腾空里方向键管不着水平速度（§93）。
+    """
+    if body.on_ground or body.air_jumped:
+        return body
+    return body.moved(body.x, body.y, body.vx, -DOUBLE_JUMP_SPEED,
+                      on_ground=False, air_jumped=True)
+
+
 def jump(body, vx=0.0):
     """起跳：把垂直速度置成初速，人离地。已经在空中就原样返回。
 
@@ -200,6 +233,29 @@ def jump(body, vx=0.0):
     if not body.on_ground:
         return body
     return body.moved(body.x, body.y, float(vx), -JUMP_SPEED, on_ground=False)
+
+
+def drop_through(terrain, body):
+    """按 ↓ 穿过脚下的**单向平台**；不能下落就原样返回。
+
+    原版行为已经由实机确认（§29），但“关掉单向碰撞一帧”的内部标志尚未逆到。
+    服务端没有那个角色对象可写，所以这里做它在物理上的等价操作：把脚移到
+    当前连续值-1 带的下沿之后，再让普通重力/落地链继续算。没有向下初速；
+    下一次 `_air_tick()` 会照常加 `GRAVITY`。
+
+    ★ 只认**脚下这一格就是 1**。实心地面按 ↓ 不能穿，站在空气里也不能。
+    """
+    if terrain is None or not body.on_ground:
+        return body
+    x = int(body.x)
+    y = int(body.y)
+    if not terrain.is_one_way(x, y):
+        return body
+    # 白线通常一像素厚，但按连续带扫描，不把产物形状假定成固定厚度。
+    below = y
+    while below < terrain.height and terrain.is_one_way(x, below):
+        below += 1
+    return body.moved(body.x, float(below), 0.0, 0.0, on_ground=False)
 
 
 # ---------------------------------------------------------------------------
@@ -330,16 +386,22 @@ def _air_tick(terrain, body):
 
 
 def tick(terrain, body, character, direction=0, fast_run=False,
-         crouched=False, want_jump=False, speed_scale=1.0):
+         crouched=False, want_jump=False, want_drop=False, speed_scale=1.0):
     """走一个 tick（32 ms），返回**新的** `Body`。
 
     `direction`：−1 左 / 0 不按 / +1 右，就是心跳里那个方向键掩码（§39）。
     ★ 它**只在踩着地的时候有意义**（§93）—— 腾空那一段收方根本不读键。
     `want_jump`：这一 tick 要不要起跳（只在踩着地时有效）。
+    `want_drop`：这一 tick 要不要按 ↓ 穿过脚下单向平台；和跳同时给时下落优先。
     """
     if terrain is None:
         return body
-    if body.on_ground and want_jump:
+    if not body.on_ground and want_jump:
+        # ★ 腾空中按跳 = 第二段跳（§124）。用掉了就什么都不做。
+        body = double_jump(body)
+    elif body.on_ground and want_drop:
+        body = drop_through(terrain, body)
+    elif body.on_ground and want_jump:
         # ★ 起跳带走**这一刻的走速**：腾空之后就再也改不了了（§93）。
         speed = walk_speed(character, fast_run, crouched, speed_scale)
         if direction > 0:
@@ -360,12 +422,14 @@ def tick(terrain, body, character, direction=0, fast_run=False,
 
 
 def advance(terrain, body, character, ticks, direction=0, fast_run=False,
-            crouched=False, want_jump=False, speed_scale=1.0):
-    """连走 `ticks` 个 tick。起跳只在第一个 tick 上生效。"""
+            crouched=False, want_jump=False, want_drop=False, speed_scale=1.0):
+    """连走 `ticks` 个 tick。起跳/下落只在第一个 tick 上生效。"""
     for i in range(max(0, int(ticks))):
         body = tick(terrain, body, character, direction=direction,
                     fast_run=fast_run, crouched=crouched,
-                    want_jump=want_jump and i == 0, speed_scale=speed_scale)
+                    want_jump=want_jump and i == 0,
+                    want_drop=want_drop and i == 0,
+                    speed_scale=speed_scale)
     return body
 
 
