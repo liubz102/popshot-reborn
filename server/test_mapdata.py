@@ -122,6 +122,28 @@ class SyntheticTests(unittest.TestCase):
         self.assertTrue(self.t.blocks_bullet(3, 7))
         self.assertTrue(self.t.blocks_bullet(-1, 0))
 
+    def test_a_breakable_blocks_walking_and_bullets(self):
+        """★★★ 值 3 = **可破坏物**（冰块 / 木箱，V0.3 §136）。
+
+        没打碎之前它就是一堵墙：挡人、挡子弹、**按 ↓ 穿不过去**。
+        用户 2026-08-30 实机：`Iceria00` 上那两处封着冰的窟窿，
+        真人上不去下不来，bot 却大摇大摆穿过去 —— 就是因为产物里那一块
+        原本是**空的**（客户端把破坏物当独立对象做碰撞，没烘进主网格）。
+        """
+        rows = ["00000000",
+                "00033000",
+                "00033000",
+                "00000000",
+                "22222222"]
+        t = mapdata.MapTerrain(make_record(rows, name="Ice"))
+        self.assertTrue(t.is_solid(3, 1))
+        self.assertTrue(t.blocks_bullet(3, 1))
+        self.assertFalse(t.is_one_way(3, 1))
+        # 冰块顶上站得住人 —— 那也是站立面。
+        self.assertEqual((1, 4), tuple(t.surfaces(3)))
+        # 子弹打不穿。
+        self.assertTrue(t.line_blocked(3, 0, 3, 4, step=1))
+
     def test_line_of_fire_passes_through_a_one_way_platform(self):
         # y=5 整行都是单向平台：往下打、往上打都该打得穿。
         self.assertFalse(self.t.line_blocked(0, 4, 0, 6, step=1))
@@ -279,6 +301,31 @@ class RealDataTests(unittest.TestCase):
                         0, terrain.cell(x, y - 1),
                         "%s (%d,%d) 上方也是实心，不该算上沿" % (name, x, y))
 
+    def test_the_ice_on_iceria00_is_in_the_grid(self):
+        """★★★ `Iceria00` 那两处冰块必须在网格里（V0.3 §136）。
+
+        它们在 `.map` 里是三个 `BreakableObj`，位置 (1054,478) / (1507,478)
+        / (1280,356)，形状在文件尾部那张掩码表里。产物是 FORMAT 3 才有。
+        """
+        terrain = self.store.load("Iceria00")
+        if terrain is None:
+            self.skipTest("产物里没有 Iceria00")
+        for x, y in ((1054, 478), (1507, 478), (1280, 400)):
+            self.assertEqual(3, terrain.cell(x, y),
+                             "(%d,%d) 该是冰块" % (x, y))
+            self.assertTrue(terrain.blocks_bullet(x, y))
+
+    def test_no_map_has_a_breakable_free_column_where_ice_used_to_be(self):
+        """全 174 张：值 3 只该出现在有破坏物的图上，而且**真的出现了**。"""
+        with_ice = [name for name in self.names
+                    if any(self.store.load(name).cell(x, y) == 3
+                           for x in range(0, self.store.load(name).width, 13)
+                           for y in range(0, self.store.load(name).height, 13))]
+        # 677 个破坏物分布在 67 张图上；13 像素的抽样必然漏掉一些小件，
+        # 所以只钉「明显有」的下限，防止哪天整层又丢了。
+        self.assertGreaterEqual(len(with_ice), 40,
+                                "带破坏物的图只剩 %d 张了" % len(with_ice))
+
     def test_spawn_points_are_not_inside_walls(self):
         # 出生点该悬在空中或贴着地面，绝不该埋在实心里。
         inside = []
@@ -307,3 +354,72 @@ class RealDataTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class BreakableTerrainTests(unittest.TestCase):
+    """★★★ 可破坏物：打碎了要**放行**，过一阵原样长回来（V0.3 §138）。
+
+    用户 2026-08-30：「真人对战时，也是一个人破坏之后，其他人就可以通过了。
+    过一段时间后，恢复原状，所有人无法通过，需要再次破坏。」
+    """
+
+    #    x= 01234567
+    ROWS = ["00000000",   # y=0
+            "00000000",   # y=1
+            "00000000",   # y=2
+            "11111111",   # y=3  一整条**单向平台**（白线）
+            "00000000",   # y=4
+            "00000000",   # y=5
+            "22222222"]   # y=6  地面
+
+    def record(self, alive_mask=("0011110000",)):
+        # 一件 4x3 的破坏物，中心 (4, 3) —— 正好罩住白线 x=2..5。
+        mask_rows = ["3333", "3333", "3333"]
+        rec = make_record(self.ROWS, name="Ice")
+        rec["breakables"] = [{
+            "x": 4, "y": 3, "w": 4, "h": 3, "hp": 40, "regen": 15000,
+            "mask": blob(pack_cells(mask_rows)),
+        }]
+        return rec
+
+    def setUp(self):
+        self.t = mapdata.MapTerrain(self.record())
+
+    def test_intact_it_is_a_wall(self):
+        # 中心 (4,3)、4x3 ⇒ 左上角 (2,2)，盖住 x=2..5 / y=2..4。
+        for x in range(2, 6):
+            for y in range(2, 5):
+                self.assertEqual(3, self.t.cell(x, y), "(%d,%d)" % (x, y))
+        self.assertTrue(self.t.is_solid(3, 3))
+        self.assertTrue(self.t.blocks_bullet(3, 3))
+        self.assertFalse(self.t.is_one_way(3, 3))
+        # 冰顶上站得住；冰没盖到的地方还是原来那根白线。
+        self.assertEqual(2, self.t.surfaces(3)[0])
+        self.assertEqual(3, self.t.surfaces(0)[0])
+
+    def test_broken_it_reveals_the_one_way_platform(self):
+        broken = self.t.variant([])
+        self.assertEqual(0, broken.cell(3, 2))
+        self.assertEqual(1, broken.cell(3, 3), "碎了该露出白线")
+        self.assertTrue(broken.is_one_way(3, 3))
+        self.assertFalse(broken.blocks_bullet(3, 3))
+        self.assertEqual(3, broken.surfaces(3)[0])
+
+    def test_the_same_state_gives_the_same_object(self):
+        """★ `botnav` 的可达图缓存按地形对象做键 —— 同一状态必须同一对象。"""
+        self.assertIs(self.t.variant([]), self.t.variant([]))
+        self.assertIs(self.t, self.t.variant([0]), "全都在 = 根那一份")
+
+    def test_the_untouched_columns_are_untouched(self):
+        broken = self.t.variant([])
+        for x in (0, 1, 6, 7):
+            self.assertEqual(tuple(self.t.surfaces(x)),
+                             tuple(broken.surfaces(x)), "第 %d 列不该动" % x)
+
+    def test_breakable_fields_come_from_the_map(self):
+        item = self.t.breakables[0]
+        self.assertEqual(40, item.hp)
+        self.assertEqual(15000, item.regen_ms)
+        self.assertEqual((2, 2), (item.left, item.top))
+        self.assertEqual(0.0, item.distance_to(3, 3))
+        self.assertAlmostEqual(2.0, item.distance_to(8, 3))

@@ -19,6 +19,7 @@ import math
 import os
 import struct
 import sys
+import threading
 import time
 import unittest
 
@@ -28,6 +29,7 @@ if HERE not in sys.path:
 
 import ballistics                                              # noqa: E402
 import bot                                                     # noqa: E402
+import botplan                                                 # noqa: E402
 import botsync                                                 # noqa: E402
 import botthreat                                               # noqa: E402
 import chrprops                                                # noqa: E402
@@ -856,7 +858,12 @@ class BotFrameRoom(BotBattleRoom):
 
         ★ `action_lock = False` 时**每一发之前都放一次锁**：换图 / 复活
         都会重新上锁（§74），逐发放开才不用在每个用例里记着这件事。
+
+        ★★ 每发之前先让**后台规划线程**把手上的单子算完（§137）。
+        A\\* 从会话 42 起不在游戏线程上跑了，节奏是「这一帧递单、下一帧
+        取结果」；这一句把真实节奏原样搬进单测 —— 不是给测试开同步后门。
         """
+        botplan.PLANNER.settle()
         if not self.action_lock:
             self.unlock_bots()
         if jumped:
@@ -4121,11 +4128,13 @@ class BotEntryLockMovementTests(TerrainMixin, BotFireRoom):
 
 
 class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
-    """★★ 闯关房从 M5-G 起**自己走**，但目标仍然是「队伍刚踩过的那个点」。
+    """★★ 闯关房从 M5-G 起**自己走**；会话 42 起目标是「最靠前那个真人」。
 
     以前这儿是纯轨迹回放（D16）：节奏天然对，可**一步都躲不开**。
-    现在把跟随点当寻路目标 —— 节奏还是跟着真人的轨迹，中间那段路自己走，
-    所以躲子弹 / 跳坑 / 打怪全接得上（M5-G）。
+    M5-G 把跟随点当寻路目标，中间那段路自己走 —— 躲子弹 / 跳坑 / 打怪
+    全接得上。会话 42 又改了两处（用户 2026-08-30 实机「有 bot 一直在
+    屏幕最左边拖进度」）：盯的是**推进得最远**那个真人的**当前位置**
+    （不再是「最近的人的轨迹」），而且掉了队就**冲刺**追。
     """
 
     def test_it_takes_over_its_own_walking(self):
@@ -4140,7 +4149,8 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
         for _ in range(10):
             self.bot_conn.move_at -= bot.botmove.TICKS_PER_BEAT                 * bot.botmove.TICK_MS / 1000.0
             self.human_heartbeat(self.alice, 240.0, 150.0)
-        goal = bot._coop_goal(self.room, self.bot_conn, self.bot_seat)
+        goal = bot._coop_goal(self.room, self.bot_conn, self.bot_seat,
+                              mapdata.load(self.room.map_name))
         self.assertIsNotNone(goal)
         self.assertLessEqual(abs(self.bot_conn.body.x - goal[0]),
                              bot.BOT_COOP_BAND + 8.0,
@@ -4149,8 +4159,64 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
 
     def test_without_a_leader_it_falls_back_to_the_old_replay(self):
         self.install_terrain(synth_terrain("flat"))
-        self.assertIsNone(bot._coop_goal(self.room, self.bot_conn,
-                                         self.bot_seat))
+        self.assertIsNone(bot._coop_goal(
+            self.room, self.bot_conn, self.bot_seat,
+            mapdata.load(self.room.map_name)))
+
+    def test_forward_comes_from_the_spawn_points(self):
+        """★ 「前方」是每张图自己的出生点说的，不是「都往右」。"""
+        right = synth_terrain("fwd_right", points={101: [(100, 40)]})
+        self.assertEqual(1, bot._quest_forward(right))
+        left = synth_terrain("fwd_left", points={101: [(1300, 40)]})
+        self.assertEqual(-1, bot._quest_forward(left))
+        # 一个出生点都没有的图不猜，默认 +x。
+        self.assertEqual(1, bot._quest_forward(synth_terrain("fwd_none")))
+
+    def test_it_follows_the_most_advanced_human_not_the_nearest(self):
+        """★★★ 跟**最靠前**那个真人（用户 2026-08-30「bot 拖进度」）。
+
+        以前跟「离自己最近的」：bot 掉队之后最近的往往是**后面**那个人，
+        于是整队互相锚着，一起停在图的左边。
+        """
+        terrain = self.install_terrain(
+            synth_terrain("coop_lead", points={101: [(100, 40)]}))
+        # alice 掉在后面、bob 冲在前面；bot 就站在 alice 旁边。
+        self.walk(self.alice, [(0.0, 150.0), (200.0, 150.0)])
+        self.walk(self.bob, [(600.0, 150.0), (900.0, 150.0)])
+        self.bot_conn.battle_pos = (210.0, 150.0)
+        self.assertIs(self.bob,
+                      bot._coop_leader(self.room, bot._quest_forward(terrain)),
+                      "该跟最靠前的 bob，不是离得最近的 alice")
+        # 以前那条「跟最近的」正好会挑中 alice —— 这就是拖进度的根。
+        self.assertIs(self.alice, bot._follow_target(self.room, self.bot_conn))
+
+    def test_it_sprints_when_it_has_fallen_behind(self):
+        """★★★ 掉队就**冲刺**追 —— 真人是按着右键推进的，走速追不上。"""
+        self.install_terrain(synth_terrain("coop_sprint", width=2400,
+                                           points={101: [(100, 40)]}))
+        self.walk(self.alice, [(0.0, 150.0), (200.0, 150.0)])
+        self.bot_conn.battle_pos = (200.0, 150.0)
+        self.bot_conn.body = bot.botmove.Body(200.0, 150.0)
+        self.bot_conn.move_at = time.monotonic()
+        # 真人一下子跑到很远的前面。
+        self.walk(self.alice, [(1800.0, 150.0), (2000.0, 150.0)])
+        terrain = mapdata.load(self.room.map_name)
+        intent = bot._coop_intent(self.room, self.bot_conn, self.bot_seat,
+                                  terrain, None)
+        self.assertEqual(1, intent[0], "该朝前走")
+        self.assertTrue(intent[3], "掉这么远还不冲刺")
+
+    def test_it_does_not_sprint_once_it_has_caught_up(self):
+        self.install_terrain(synth_terrain("coop_close",
+                                           points={101: [(100, 40)]}))
+        self.walk(self.alice, [(0.0, 150.0), (400.0, 150.0)])
+        self.bot_conn.battle_pos = (330.0, 150.0)
+        self.bot_conn.body = bot.botmove.Body(330.0, 150.0)
+        self.bot_conn.move_at = time.monotonic()
+        terrain = mapdata.load(self.room.map_name)
+        intent = bot._coop_intent(self.room, self.bot_conn, self.bot_seat,
+                                  terrain, None)
+        self.assertFalse(intent[3], "已经跟上了就别一直冲刺，体力要留着")
 
 
 #: 一张带出生点的合成图：101（1 队）两个点、102（2 队）两个点，
@@ -6760,7 +6826,13 @@ class BotQuestMeleeTests(BotQuestCombatTests):
 
 
 class BotPlanBudgetTests(TerrainMixin, BotFireRoom):
-    """★★★ 一帧最多跑一次 A*（会话 41）—— 卡顿和「闪现」的根。"""
+    """★★★ A* 一次都不在游戏线程上跑（会话 42 / §137）。
+
+    卡顿的根：bot 的帧挂在**真人的同步转发路径**上，A* 在那儿跑多久，
+    真人屏幕就卡多久。会话 41 用边缓存把「够得着的目标」压到 0.14 ms，
+    但「够不着的目标」仍然要泛洪整片可达分量（`Quest03_1` 实测 22 ms，
+    ×3 个 bot ×每一帧）。会话 42 整个搬到后台线程（`botplan`）。
+    """
 
     def setUp(self):
         super().setUp()
@@ -6768,19 +6840,62 @@ class BotPlanBudgetTests(TerrainMixin, BotFireRoom):
             "budget", width=2400, walls=((1200, 2400, 40),)))
         self.place_bot(200.0)
 
-    def test_one_frame_plans_at_most_once(self):
-        calls = []
+    def test_the_game_thread_never_runs_a_star(self):
+        """★★★ 游戏线程上 `botnav.plan()` **一次都不许被调到**。"""
+        here = threading.current_thread()
+        offenders = []
         original = bot.botnav.plan
+
+        def watched(*args, **kwargs):
+            if threading.current_thread() is here:
+                offenders.append(1)
+            return original(*args, **kwargs)
+
+        bot.botnav.plan = watched
+        self.addCleanup(setattr, bot.botnav, "plan", original)
+        self.beats(6, 2200.0, 40.0)
+        self.assertEqual([], offenders,
+                         "A* 又跑回真人的转发线程上了")
+
+    def test_one_frame_asks_for_a_route_at_most_once(self):
+        """一帧最多递**一张**单子 —— 逐 tick 问意图不该变成逐 tick 递单。"""
+        asked = []
+        original = bot.botplan.ask
+
+        def counted(*args, **kwargs):
+            asked.append(1)
+            return original(*args, **kwargs)
+
+        bot.botplan.ask = counted
+        self.addCleanup(setattr, bot.botplan, "ask", original)
+        self.beats(1, 2200.0, 40.0)
+        self.assertLessEqual(len(asked), 1,
+                             f"一帧递了 {len(asked)} 张单子")
+
+    def test_decisions_are_capped_at_a_human_reaction_rate(self):
+        """★★★ 一帧里**不再逐 tick** 重新决策（用户 2026-08-30）。
+
+        「真人也不可能脑内计算那么快，每秒 10 到 20 次就够了」。
+        判据一个都没改，只是问得没那么密 —— 每帧的 AI 计算量对折，
+        而那份计算是压在真人转发路径上的。
+        """
+        self.assertLessEqual(10.0, bot.BOT_DECISIONS_PER_SECOND)
+        self.assertLessEqual(bot.BOT_DECISIONS_PER_SECOND, 20.0)
+        calls = []
+        original = bot._move_intent
 
         def counted(*args, **kwargs):
             calls.append(1)
             return original(*args, **kwargs)
 
-        bot.botnav.plan = counted
-        self.addCleanup(setattr, bot.botnav, "plan", original)
-        self.beats(1, 2200.0, 40.0)
-        self.assertEqual(1, len(calls),
-                         f"一帧跑了 {len(calls)} 次 A*，逐 tick 规划回来了")
+        bot._move_intent = counted
+        self.addCleanup(setattr, bot, "_move_intent", original)
+        # 一帧最多推 BOT_MOVE_MAX_TICKS 个 tick；决策次数该是它除以节拍。
+        self.bot_conn.move_at -= 1.0        # 攒够一帧的满额 tick
+        self.human_heartbeat(self.alice, 2200.0, 40.0)
+        ceiling = -(-bot.BOT_MOVE_MAX_TICKS // bot.BOT_DECISION_TICKS)
+        self.assertLessEqual(len(calls), ceiling,
+                             f"一帧问了 {len(calls)} 次走位，上限是 {ceiling}")
 
     def test_the_body_never_jumps_more_than_two_heartbeats(self):
         """★★ 服务端卡住之后不许把攒下的位移一次性推出去（= 闪现）。"""
@@ -6919,3 +7034,90 @@ class BotQuestSplashTests(BotQuestCombatTests):
         targets = {struct.unpack_from("<i", body_of(f), 4)[0]
                    for f in splash_frames(self.alice, self.bot_seat)}
         self.assertIn(500123, targets, "站在火里的怪该掉血")
+
+
+def ice_terrain(key, floor=150, width=1400, height=180,
+                pits=((640, 720),), ice=((680, 96, 60),)):
+    """一张平地 + 一个坑，坑上罩着**可破坏物**（V0.3 §138）。
+
+    `ice` 是 `[(中心x, 宽, 高), …]`；中心 y 取坑的上沿附近。
+    """
+    if key in _TERRAIN_CACHE:
+        return _TERRAIN_CACHE[key]
+    holes = set()
+    for x0, x1 in pits:
+        holes.update(range(x0, min(x1, width)))
+    rows = ["".join("0" if (x in holes or y < floor) else "2"
+                    for x in range(width))
+            for y in range(height)]
+    record = make_record(rows)
+    record["breakables"] = [
+        {"x": cx, "y": floor + h // 2, "w": w, "h": h, "hp": 40,
+         "regen": 15000,
+         "mask": test_mapdata.blob(
+             test_mapdata.pack_cells(["3" * w] * h))}
+        for cx, w, h in ice]
+    terrain = mapdata.MapTerrain(record)
+    _TERRAIN_CACHE[key] = terrain
+    return terrain
+
+
+class BotBreakableTests(TerrainMixin, BotFireRoom):
+    """★★★ 可破坏物：**碎了就放行、过一阵长回来**（用户 2026-08-30 / §138）。
+
+    「真人对战时，也是一个人破坏之后，其他人就可以通过了。过一段时间后，
+    恢复原状，所有人无法通过，需要再次破坏。」
+
+    原版**一发同步包都没有** —— 每台客户端从同一批爆炸里各算各的，
+    服务端要跟上就得自己记同一本账（`botbreak`）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(ice_terrain("ice_gap"))
+        self.place_bot(560.0, 150.0)
+
+    def ledger(self):
+        return bot._breakables(self.room)
+
+    def test_the_bot_sees_the_ice_while_it_is_intact(self):
+        seen = bot._terrain(self.room)
+        self.assertIs(self.terrain, seen, "完好时就是根那一份")
+        self.assertEqual(3, seen.cell(680, 160), "坑上该罩着冰")
+        self.assertTrue(seen.is_solid(680, 160))
+
+    def test_breaking_it_opens_the_way(self):
+        ledger = self.ledger()
+        self.assertTrue(ledger.blast(self.terrain, 680, 160, 0.0, 99))
+        seen = bot._terrain(self.room)
+        self.assertIsNot(self.terrain, seen, "碎了要换一份地形")
+        self.assertEqual(0, seen.cell(680, 160), "碎了那儿该是空的")
+
+    def test_it_grows_back_and_blocks_again(self):
+        ledger = self.ledger()
+        ledger.blast(self.terrain, 680, 160, 0.0, 99, now=500.0)
+        self.assertEqual(frozenset(),
+                         ledger.alive(self.terrain, now=500.0))
+        # 到点之后原样长回来 —— 又是根那一份地形（连可达图都能复用）。
+        self.assertEqual(frozenset([0]),
+                         ledger.alive(self.terrain, now=516.0))
+        self.assertIs(self.terrain, bot._terrain(self.room))
+
+    def test_a_human_grenade_is_recorded_too(self):
+        """★★★ 真人砸碎的那一下**也得记上**，否则 bot 以为路还堵着。"""
+        weapon = weapondata.get(1001030)
+        self.alice.peer_weapon = weapon
+        bot._note_peer_blast(self.room, self.alice, 680.0, 160.0, 99)
+        self.assertEqual(frozenset(), self.ledger().alive(self.terrain))
+
+    def test_a_bot_shot_that_misses_the_ice_leaves_it_alone(self):
+        weapon = weapondata.get(1001030)
+        bot._blast_breakables(self.room, weapon, (200.0, 150.0), 99)
+        self.assertEqual(frozenset([0]), self.ledger().alive(self.terrain))
+
+    def test_the_route_is_dropped_when_the_terrain_flips(self):
+        """★ 路线是在**上一份**地形上算出来的 —— 状态一翻就作废。"""
+        self.bot_conn.nav_path = ["假的一条边"]
+        self.ledger().blast(self.terrain, 680, 160, 0.0, 99)
+        bot._refresh_breakables(self.room)
+        self.assertEqual([], self.bot_conn.nav_path)

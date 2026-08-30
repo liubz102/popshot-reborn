@@ -319,17 +319,15 @@ def _scale_key(character):
 
 
 def graph_of(terrain, character):
-    """取（必要时新建）这张图 + 这类角色的边缓存。"""
-    per_scale = _EDGE_CACHE.get(terrain)
-    if per_scale is None:
-        per_scale = {}
-        _EDGE_CACHE[terrain] = per_scale
-    key = _scale_key(character)
-    graph = per_scale.get(key)
-    if graph is None:
-        graph = {}
-        per_scale[key] = graph
-    return graph
+    """取（必要时新建）这张图 + 这类角色的边缓存。
+
+    ★ 一律用 `setdefault`：预热线程、后台规划线程（`botplan`）和游戏线程
+      会同时问到同一张图。`setdefault` 在 CPython 里是一次原子操作，
+      三方拿到的**一定是同一个 dict**；写进去的边本来就幂等，
+      同时算只是白做一遍功。
+    """
+    per_scale = _EDGE_CACHE.setdefault(terrain, {})
+    return per_scale.setdefault(_scale_key(character), {})
 
 
 def node(graph, terrain, character, body):

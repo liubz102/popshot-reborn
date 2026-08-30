@@ -10,6 +10,7 @@ if HERE not in sys.path:
 
 import botmove                                                 # noqa: E402
 import botnav                                                  # noqa: E402
+import botplan                                                 # noqa: E402
 import mapdata                                                 # noqa: E402
 from test_botmove import Dummy                                 # noqa: E402
 from test_mapdata import make_record                           # noqa: E402
@@ -284,3 +285,100 @@ class JumpPadRouteTests(unittest.TestCase):
         jumped = botmove.tick(terrain, onpad, self.who, want_jump=True)
         self.assertAlmostEqual(-botmove.JUMP_SPEED + botmove.GRAVITY,
                                jumped.vy, places=3)
+
+
+class PlannerTests(unittest.TestCase):
+    """★★★ `botplan` —— A* 挪到后台线程之后那套单子机制（§137）。"""
+
+    class Owner(object):
+        """`botplan` 只要求主人身上有一格 `nav_ticket`。"""
+
+        def __init__(self):
+            self.nav_ticket = None
+
+    def setUp(self):
+        self.who = Dummy(7.0)
+        self.terrain = terrain_from(solid_heights([180] * 900, 220))
+        self.start = botmove.settle(
+            self.terrain, botmove.Body(100.0, 180.0), self.who)
+
+    def test_a_submitted_ticket_comes_back_with_the_same_route(self):
+        owner = self.Owner()
+        goal = (600.0, 180.0)
+        self.assertTrue(botplan.ask(owner, self.terrain, self.start,
+                                    self.who, goal))
+        # 还没算完时**什么都拿不到** —— 主人这一帧走兜底。
+        self.assertTrue(botplan.PLANNER.settle())
+        route = botplan.take(owner, self.start, goal)
+        self.assertTrue(route, "后台没算出路线")
+        self.assertEqual(
+            botnav.plan(self.terrain, self.start, self.who, goal), route,
+            "后台算的和同步算的必须一模一样")
+        # 取过就没了，不会重复用同一张单子。
+        self.assertIsNone(botplan.take(owner, self.start, goal))
+
+    def test_asking_again_for_the_same_goal_does_not_queue_a_second_ticket(self):
+        owner = self.Owner()
+        goal = (600.0, 180.0)
+        self.assertTrue(botplan.ask(owner, self.terrain, self.start,
+                                    self.who, goal))
+        first = owner.nav_ticket
+        # 目标只挪了几个单位 —— 还是同一件事，别再递一张。
+        self.assertFalse(botplan.ask(owner, self.terrain, self.start,
+                                     self.who, (610.0, 180.0)))
+        self.assertIs(first, owner.nav_ticket)
+        botplan.PLANNER.settle()
+
+    def test_a_moved_goal_abandons_the_old_ticket(self):
+        owner = self.Owner()
+        botplan.ask(owner, self.terrain, self.start, self.who, (600.0, 180.0))
+        first = owner.nav_ticket
+        self.assertTrue(botplan.ask(owner, self.terrain, self.start,
+                                    self.who, (100.0, 180.0)))
+        self.assertTrue(first.abandoned)
+        self.assertIsNot(first, owner.nav_ticket)
+        botplan.PLANNER.settle()
+
+    def test_a_route_planned_from_far_away_is_thrown_out(self):
+        """★ 起点挪得比一条步行边还远 = 这条路线不作数了，重递。"""
+        owner = self.Owner()
+        goal = (600.0, 180.0)
+        botplan.ask(owner, self.terrain, self.start, self.who, goal)
+        botplan.PLANNER.settle()
+        far = self.start.moved(self.start.x + 400.0, self.start.y)
+        self.assertIsNone(botplan.take(owner, far, goal))
+
+    def test_forget_drops_the_pending_ticket(self):
+        owner = self.Owner()
+        botplan.ask(owner, self.terrain, self.start, self.who, (600.0, 180.0))
+        ticket = owner.nav_ticket
+        botplan.forget(owner)
+        self.assertTrue(ticket.abandoned)
+        self.assertIsNone(owner.nav_ticket)
+        botplan.PLANNER.settle()
+
+    def test_a_broken_plan_never_kills_the_worker(self):
+        """规划炸了只当「没有路」—— 线程死了所有 bot 就再也拿不到路线。"""
+        owner = self.Owner()
+        original = botnav.plan
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("造出来的故障")
+
+        botnav.plan = boom
+        try:
+            botplan.ask(owner, self.terrain, self.start, self.who,
+                        (600.0, 180.0))
+            self.assertTrue(botplan.PLANNER.settle())
+            self.assertEqual((), botplan.take(owner, self.start,
+                                              (600.0, 180.0)))
+        finally:
+            botnav.plan = original
+        # 线程还活着：再递一张照样算得出来。
+        botplan.ask(owner, self.terrain, self.start, self.who, (600.0, 180.0))
+        self.assertTrue(botplan.PLANNER.settle())
+        self.assertTrue(botplan.take(owner, self.start, (600.0, 180.0)))
+
+
+if __name__ == "__main__":
+    unittest.main()

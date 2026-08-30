@@ -21,7 +21,10 @@
     0  空
     1  薄的可站立面（细绳桥 / 藤蔓 / 窄檐）—— 实测有 77 个出生点直接落在它上面
     2  实心
-    3  原版 174 张图里**一个都没有**；只在运行时出现（`0x4fa844` 拿它当哨兵）
+    3  ★ **可破坏物**（`BreakableObj`，游戏里的冰块 / 木箱）。烘焙的主网格里
+       一个都没有 —— 它们的形状躺在**文件尾部那张掩码表**里，客户端把它们
+       当独立对象做碰撞。本工具把它们抽成产物里的 `breakables` 一层
+       （见 `collect_breakables`），由服务端按打没打碎动态合成。
 
     ★ **出界返回 2**（不是 0）—— 照抄，别改成「出界算空」。
 
@@ -67,7 +70,28 @@ DIR_TYPE = {"TERRAIN": 200, "LAYER": 202, "COVER": 201,
 #: 产物格式版本。改了布局就 +1，`server/mapdata.py` 会拒绝不认识的版本。
 #:
 #: 2：加了 `jump`（弹跳台，V0.3 §99）。
-FORMAT = 2
+#: 3：把**可破坏物**（`BreakableObj`）按值 3 贴进 `cells`（V0.3 §136）。
+#: 4：可破坏物改成**单独一层** `breakables`（位置 / 掩码 / 血量 / 恢复延迟），
+#:    `cells` 退回**不含它们**的原样网格 —— 服务端要按打没打碎动态合成
+#:    （V0.3 §138）。
+FORMAT = 4
+
+#: ★★★ **可破坏物**（`Maps/*/Breakable/*.png`，客户端类 `BreakableObj`）。
+#: 全 174 张图里共 677 个，分布在 67 张图上。
+BREAKABLE_TYPE = 203
+
+#: 可破坏物在碰撞网格里的格值。★ 不是我们挑的：客户端自己的命中判定
+#: （`BreakableObj::HitTest` = `0x4fa7b5`，`cmp al,3`）认的就是 3，
+#: 而**烘焙的主网格里 174 张一个 3 都没有** —— 所以「值 3 = 可破坏物」
+#: 在产物里是**无歧义**的，将来要做「打碎之后放行」直接按它摘。
+BREAKABLE_CELL = 3
+
+#: 破坏物自己那两个字段的兜底值（`BreakableObj::Deserialize` = `0x4fa3e7`：
+#: 第一个 i32 是初始血量，第二个写进 `[this+0x2cc]` = 恢复延迟毫秒）。
+#: 677 件里 598 件只带得动第一个，79 件两个都带；实测带全的那些
+#: 恢复延迟**全是 15000**。
+BREAKABLE_DEFAULT_HP = 40
+BREAKABLE_DEFAULT_REGEN_MS = 15000
 
 #: ★★★ **弹跳台**（`Maps/!Basic/210-JumpingObj.png`，客户端类 `JumpingObj`，
 #: `GetType` = `0x510a52: mov eax,0xd2; ret`）。全 174 张图里共 189 个。
@@ -185,7 +209,11 @@ def _read_terrain_data(r):
 
 
 def parse_map(path):
-    """解一个 `.map`，返回 (版本, 宽, 高, 对象表, TerrainData)。"""
+    """解一个 `.map`，返回 (版本, 宽, 高, 对象表, TerrainData, 掩码表)。
+
+    掩码表 = `贴图路径 -> TerrainData`，可破坏物的形状就在里面
+    （见 `paint_breakables`）。
+    """
     with open(path, "rb") as fp:
         r = Reader(fp.read())
     ver = r.u16()
@@ -220,18 +248,24 @@ def parse_map(path):
             obj["tail"] = blob[len(blob) - left:] if left else b""
             objects.append(obj)
     terrain = _read_terrain_data(r)
-    # 尾部还有一张「贴图路径 -> 该精灵的掩码」的表，破坏物碎掉时拿它抠格子用。
-    # bot 用不上，跳过即可 —— 但要把它读完，读不完说明前面的字段错位了。
+    # ★★★ 尾部那张「贴图路径 -> 该精灵的掩码」表就是**可破坏物的形状**
+    #     （V0.3 §136）。以前这里只是读完丢掉 —— 结果 bot 的地形图里
+    #     冰块那一块是**空的**，它能大摇大摆穿过去。
+    masks = {}
     for _ in range(r.i32()):
-        r.wstr()
-        _read_terrain_data(r)
+        # 键一律**规范化**（`//` -> `/`）：v≥13 的对象路径客户端已经规范过
+        # （`0x511e95`），v<13 没有，两边在这里对齐，查表就不会漏。
+        # ⚠ 路径必须**先**读出来：`d[k] = v` 里 Python 先算 `v`，
+        #   写成一行会把两个字段的读取顺序颠倒过来。
+        mask_path = r.wstr()
+        masks[mask_path.replace("//", "/")] = _read_terrain_data(r)
     if r.left() > 1:               # testipkn.map 尾部多 1 字节填充
         raise MapFormatError("文件尾还剩 %d 字节没解释" % r.left())
     if (width, height) != (terrain["width"], terrain["height"]):
         raise MapFormatError(
             "地图 %dx%d 和 TerrainData %dx%d 不一致"
             % (width, height, terrain["width"], terrain["height"]))
-    return ver, width, height, objects, terrain
+    return ver, width, height, objects, terrain, masks
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +283,63 @@ def unpack_cells(packed, width, height):
     """2bit/格 -> 1 字节/格（值仍是 0..3），行优先。"""
     flat = b"".join(map(_UNPACK.__getitem__, packed))
     return flat[:width * height]
+
+
+def pack_cells(cells, width, height):
+    """1 字节/格（值 0..3）-> 2 bit/格，行优先低位在前。`unpack_cells` 的逆。"""
+    need = ((width * height + 15) // 16) * 4
+    out = bytearray(need)
+    for i, v in enumerate(cells):
+        if v:
+            out[i >> 2] |= (v & 3) << ((i & 3) * 2)
+    return bytes(out)
+
+
+def collect_breakables(width, height, objects, masks):
+    """把**可破坏物**抽成单独一层（V0.3 §138），返回可进 JSON 的列表。
+
+    每一件：`{x, y, w, h, hp, regen, mask}`
+
+    * `x/y` —— 对象**中心**。出处是客户端把世界坐标换算成对象局部坐标的
+      那一句（`0x51a935`）：`局部 = (世界 − 对象位置) + 半尺寸 × 缩放`。
+      677 件**全部** `缩放 = (1,1)`、旋转 = 0，所以只有平移。
+    * `mask` —— 形状，2 bit/格、行优先，非 0 的格就是这件东西占的地方。
+      它就是 `.map` **尾部那张掩码表**里那一份（值恒为 3）。
+    * `hp` —— `BreakableObj::Deserialize`（`0x4fa3e7`）读的**第一个** i32，
+      随后 `0x4fa3d7` 把它写进 `[this+0x154]`（初始血量）。
+    * `regen` —— 第二个 i32，写进 `[this+0x2cc]`：**碎了多久原样长回来**
+      （毫秒）。`BreakableObj::Tick`（`0x4fa4e9`）里
+      `if (破坏时刻 + regen < GetTickCount()) 恢复满血`。
+      ★ 所以「恢复」在原版里是**纯本地定时器，一发包都不发** ——
+      每台客户端各算各的，靠「大家看到同一批爆炸」保持一致。
+
+    ⚠ 这里**不往 `cells` 上贴**。服务端按「这一局哪几件还没碎」现合成
+    （`server/mapdata.py` 的 `MapTerrain`）—— 碎了就得放行。
+    """
+    out = []
+    for obj in objects:
+        if obj.get("type") != BREAKABLE_TYPE or "x" not in obj:
+            continue
+        mask = masks.get((obj.get("path") or "").replace("//", "/"))
+        if mask is None:
+            raise MapFormatError(
+                "破坏物 %r 在尾部掩码表里找不到" % obj.get("path"))
+        tail = obj.get("tail") or b""
+        hp, regen = BREAKABLE_DEFAULT_HP, BREAKABLE_DEFAULT_REGEN_MS
+        if len(tail) >= 4:
+            hp = struct.unpack_from("<i", tail, 0)[0]
+        if len(tail) >= 8:
+            regen = struct.unpack_from("<i", tail, 4)[0]
+        out.append(collections.OrderedDict((
+            ("x", int(round(obj["x"]))),
+            ("y", int(round(obj["y"]))),
+            ("w", mask["width"]),
+            ("h", mask["height"]),
+            ("hp", int(hp)),
+            ("regen", int(regen)),
+            ("mask", _blob(mask["cells"])),
+        )))
+    return out
 
 
 def extract_ground(cells, width, height):
@@ -290,9 +381,14 @@ def _blob(raw):
     return base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
 
 
-def build_record(name, ver, width, height, objects, terrain):
+def build_record(name, ver, width, height, objects, terrain, masks=None):
+    # ★★ `cells` / `ground` 是**不含可破坏物**的原样网格（FORMAT 4）：
+    #    冰块打碎之后就是这个样子，而服务端要按打没打碎在这上面动态合成
+    #    （`server/mapdata.py` 的 `MapTerrain`）。
     cells = unpack_cells(terrain["cells"], width, height)
+    packed = terrain["cells"]
     counts, ys = extract_ground(cells, width, height)
+    breakables = collect_breakables(width, height, objects, masks or {})
     if height > 0xFFFF or (counts and max(counts) > 0xFFFF):
         raise MapFormatError("%s 的站立面超出 uint16 能表达的范围" % name)
     points = collections.OrderedDict()
@@ -318,12 +414,15 @@ def build_record(name, ver, width, height, objects, terrain):
         ("width", width),
         ("height", height),
         # 原样搬客户端的位图：2 bit/像素，行优先，低位在前。
-        ("cells", _blob(terrain["cells"])),
+        # ★ **不含可破坏物** —— 它们在 `breakables` 那一层里（§138）。
+        ("cells", _blob(packed)),
         ("ground_counts", _blob(struct.pack("<%dH" % width, *counts))),
         ("ground_ys", _blob(struct.pack("<%dH" % len(ys), *ys))),
         ("points", points),
         # ★ 弹跳台：`[台x, 台y, 落点dx, 落点dy]`（V0.3 §99）。
         ("jump", pads),
+        # ★★★ 可破坏物（V0.3 §138）：打碎了就放行、过一阵原样长回来。
+        ("breakables", breakables),
     ))
 
 
@@ -440,9 +539,10 @@ def main(argv=None):
     written = set()
     for name in names:
         try:
-            ver, width, height, objects, terrain = parse_map(
+            ver, width, height, objects, terrain, masks = parse_map(
                 os.path.join(maps_dir, name + ".map"))
-            record = build_record(name, ver, width, height, objects, terrain)
+            record = build_record(name, ver, width, height, objects,
+                                  terrain, masks)
         except MapFormatError as exc:
             raise SystemExit("解析 %s.map 失败：%s" % (name, exc))
         fname = name + ".json"
@@ -463,7 +563,9 @@ def main(argv=None):
         if name in verify:
             png = os.path.join(preview_dir, "%s.png" % name.replace("#", "_"))
             drawn = write_preview(
-                record, unpack_cells(terrain["cells"], width, height), png)
+                record, unpack_cells(
+                    zlib.decompress(base64.b64decode(record["cells"])),
+                    width, height), png)
             if not args.quiet:
                 print("   可视化 -> %s" % png if drawn
                       else "   没装 Pillow，跳过可视化（提取本身不受影响）")

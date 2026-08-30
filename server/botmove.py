@@ -255,6 +255,11 @@ def drop_through(terrain, body):
     below = y
     while below < terrain.height and terrain.is_one_way(x, below):
         below += 1
+    # ★★ 穿出去的那一格必须是**空的**（V0.3 §136）。白线底下紧贴着实心
+    #    （最常见的是**冰块**罩着一根白线）的时候，原版按 ↓ 是纹丝不动的
+    #    —— 不查这一句的话人会一头钻进地形里面。
+    if terrain.is_solid(x, below):
+        return body
     return body.moved(body.x, float(below), 0.0, 0.0, on_ground=False)
 
 

@@ -60,9 +60,11 @@ from account_store import BASE_CHARACTER_IDS, MINIMUM_PLAYER_LEVEL, \
 import ballistics
 import botaim
 import botarms
+import botbreak
 import bothp
 import botmove
 import botnav
+import botplan
 import botsync
 import botthreat
 import chrprops
@@ -337,6 +339,10 @@ class BotConn(gameserver.Conn):
         self.nav_goal = None
         self.nav_started = False
         self.nav_failed = None
+        #: ★★★ 递给后台规划线程的那张单子（`botplan.Ticket`，V0.3 §137）。
+        #:   A\* 不在真人的转发路径上跑了 —— 这一帧递单、下一帧取结果，
+        #:   还没取到就照旧走 `_walk_to()` 的老兜底（朝目标直着走）。
+        self.nav_ticket = None
         #: ★★ 这一帧已经跑过一次 `botnav.plan()` 了吗（缓存键 = `frame_seq`，
         #:   和 `dodge_at` 同一个套路）。
         #:
@@ -576,6 +582,7 @@ class BotConn(gameserver.Conn):
         self.nav_goal = None
         self.nav_started = False
         self.nav_failed = None
+        botplan.forget(self)
         self.nav_planned_at = None
         self.nav_double_jump = False
         self.move_down = False
@@ -1650,6 +1657,68 @@ def _current_map(room):
     return room.map_name
 
 
+def _breakables(room):
+    """这一局的可破坏物账（`botbreak.Ledger`）；还没开局返回 `None`。
+
+    ★ 和血量台账（`_health`）一样懒挂在 `RoomQuest` 上：它跟着「一局」
+      生灭，回房间时整个丢掉。
+    """
+    quest = None if room is None else room.quest
+    if quest is None:
+        return None
+    ledger = getattr(quest, "bot_breakables", None)
+    if ledger is None:
+        ledger = quest.bot_breakables = botbreak.Ledger()
+    return ledger
+
+
+def _refresh_breakables(room):
+    """可破坏物的状态翻了没有；翻了就把路线作废、把新那张图预热掉（§138）。
+
+    ★ 判据是**地形对象换没换**（`variant()` 是 memo 化的，同一个存活集合
+      永远同一个对象）——「碎了」和「长回来了」两个方向自动都覆盖到，
+      不用各写一遍，也不用比集合。
+    ★ 「长回来」这一下是在 `Ledger.alive()` 里判的，而这个函数每一帧都会
+      被问到 —— 帧本身是真人的同步包驱动的，没有另起定时器。
+    """
+    quest = None if room is None else room.quest
+    if quest is None:
+        return
+    terrain = _terrain(room)
+    if terrain is None or not terrain.breakables:
+        return
+    if getattr(quest, "bot_terrain", None) is terrain:
+        return
+    quest.bot_terrain = terrain
+    # 路线是在**上一份**地形上算出来的，整个作废。
+    for index in room.bot_seats():
+        seat = room.seats[index]
+        machine = None if seat is None else seat.conn
+        if isinstance(machine, BotConn):
+            _clear_navigation(machine)
+    # 新那张图的可达图是冷的 —— 放后台算，别等到战斗中现算。
+    warm_navigation(room, "破坏物变化")
+
+
+def _terrain(room):
+    """★★★ 房间这一刻的地形 —— **按可破坏物碎了哪几件挑那一份**（§138）。
+
+    `mapdata.load()` 给的是「全都完好」那一份；碎掉的那几件要摘掉，
+    否则 bot 会觉得已经被打开的路还堵着（反过来，不摘就是原来那个 bug
+    的另一半）。`variant()` 是 memo 化的，同一个状态永远同一个对象，
+    所以 `botnav` 的可达图缓存该复用的照样复用。
+
+    ⚠ 一切要地形的地方都必须走这里，不许再直接 `mapdata.load()`。
+    """
+    terrain = mapdata.load(_current_map(room))
+    if terrain is None or not terrain.breakables:
+        return terrain
+    ledger = _breakables(room)
+    if ledger is None:
+        return terrain
+    return terrain.variant(ledger.alive(terrain))
+
+
 #: ★★★ **伤害翻倍的那两个游戏模式**（§87）。
 #:
 #: 出处 `0x4806bf`（射手那台机器上，所有伤害的必经之路）开头三句：
@@ -2084,6 +2153,16 @@ def _peer_shot_velocity(conn, bx, by):
     不成立）、追踪弹拐过弯的（§77）。这两种只是**少一份击退**，
     伤害和位置照旧 —— 不会把 bot 甩到别处去。
     """
+    matched = _match_peer_shot(conn, bx, by)
+    return None if matched is None else (matched[1], matched[2])
+
+
+def _match_peer_shot(conn, bx, by):
+    """爆点 `(bx, by)` 是**哪一发** `rpFire`；配不上返回 `None`。
+
+    返回 `(PeerShot 记录, v.x, v.y)`。击退要的是速度，破坏物要的是那把枪
+    （溅射半径），两边问的是同一件事，所以只有这一份匹配。
+    """
     shots = getattr(conn, "peer_shots", None)
     if not shots:
         return None
@@ -2100,10 +2179,28 @@ def _peer_shot_velocity(conn, bx, by):
         y = record.y + ticks * vy + shot.gravity * ticks * (ticks + 1.0) / 2.0
         error = abs(y - by)
         if best is None or error < best[0]:
-            best = (error, vx, vy + shot.gravity * ticks)
+            best = (error, vx, vy + shot.gravity * ticks, record)
     if best is None or best[0] > BOT_PEER_SHOT_TOLERANCE:
         return None
-    return (best[1], best[2])
+    return (best[3], best[1], best[2])
+
+
+def _note_peer_blast(room, conn, bx, by, damage):
+    """真人打的这一发爆炸砸到可破坏物了没有（§138）。
+
+    ★ 服务端必须自己记这本账：原版**一发同步包都没有**（见 `botbreak`
+      的文件头），每台客户端各自从同一批爆炸里算出同一个结果。
+      不记的话真人把冰砸开走过去了，bot 眼里那条路还堵着。
+    """
+    if damage <= 0:
+        return
+    matched = _match_peer_shot(conn, bx, by)
+    weapon = None if matched is None else matched[0].weapon
+    if weapon is None:
+        weapon = getattr(conn, "peer_weapon", None)
+    if weapon is None:
+        return
+    _blast_breakables(room, weapon, (bx, by), damage)
 
 
 def note_peer_hit(room, conn, payload):
@@ -2149,6 +2246,10 @@ def note_peer_hit(room, conn, payload):
             return
         _handle, target, bx, by, _kind, _flags, damage = struct.unpack_from(
             "<iiffiif", body, 0)
+        # ★★★ **冰块 / 木箱**（§138）：真人打碎的那一下服务端也得记上，
+        #   否则他从洞里过去了、bot 还以为堵着。★ 排在 `target <= 0`
+        #   那道门**前面** —— 砸在冰上的那一发多半什么人都没打中。
+        _note_peer_blast(room, conn, bx, by, damage)
         if target <= 0 or damage <= 0:
             return
         source = "真人直接命中"
@@ -2264,7 +2365,7 @@ def _knock_back_seat(room, seat_index, damage, push, source="?"):
         return
     # 乙档 · 在地上：横向滑一段，**不离地**。和火团往外铺是同一个例程
     #   （`0x50d9a7`），所以这里也用同一个模型：那一列上够得着的站立面。
-    terrain = mapdata.load(_current_map(room))
+    terrain = _terrain(room)
     if terrain is None:
         return
     span = push[0] * KNOCKBACK_SLIDE
@@ -2311,7 +2412,7 @@ def _log_knockback(room, machine, source, damage, push, before, tier,
     if all((source, kind) in logged for kind in KNOCK_KINDS):
         return                          # 这个来源该说的都说过了，别再预演
     after = machine.body
-    terrain = mapdata.load(_current_map(room))
+    terrain = _terrain(room)
     landed, ticks, walled = after, 0, False
     if terrain is not None and not after.on_ground:
         who = _character_of(machine)
@@ -3199,6 +3300,25 @@ def _hostile_targets(room, seat_index):
 #: 真正的病根（服务端卡住）在 `botnav` 的边缓存那一侧治。
 BOT_MOVE_MAX_TICKS = botmove.TICKS_PER_BEAT * 2
 
+#: ★★★ bot **每秒重新做几次决策**（用户 2026-08-30）。
+#:
+#: 「不需要每一帧都重新计算决策，因为真人也不可能脑内计算那么快，
+#:  每秒计算 10 到 20 次就够了，这个频率已经大幅超过人类的反应速度了。」
+#:
+#: ★ 为什么这不违反铁律 10：它不是「跳过头 N 次」那种**判据**，而是
+#:   一个**采样率** —— 和 D17 里 `BOT_FRAME_INTERVAL_S` 同一条豁免：
+#:   物理上没有「该重新想一想了」这个事件可等，人的反应速度本身就是
+#:   一个频率。判据（往哪走、跳不跳）一个都没变，只是问得没那么密。
+#:
+#: 代价与收益：一个动作最多晚 `BOT_DECISION_TICKS - 1` 个 tick（32 ms，
+#: 走位上约 8 个单位）才做出来；换来的是每帧的 AI 计算量**对折**
+#: —— 而那份计算是压在真人转发路径上的（§137 的另一半）。
+BOT_DECISIONS_PER_SECOND = 15.0
+
+#: 隔几个 tick 重新决策一次。由上面那个频率算出来，不单独拍一个数。
+BOT_DECISION_TICKS = max(1, int(round(botmove.TICKS_PER_SECOND
+                                      / BOT_DECISIONS_PER_SECOND)))
+
 
 def _character_of(machine):
     return chrprops.get(machine.character_id)
@@ -3300,7 +3420,7 @@ def respawn_point(room, seat_index, terrain=None, roll=None):
     `roll` 是给单测钉死随机数用的（`roll(n) -> 0..n-1`），默认 `random`。
     """
     if terrain is None:
-        terrain = mapdata.load(_current_map(room))
+        terrain = _terrain(room)
     points = _spawn_points(terrain, 0)
     if not points:
         return None
@@ -3336,7 +3456,7 @@ def pick_respawn_point(room, seat_index):
     machine = None if seat is None else seat.conn
     if not isinstance(machine, BotConn):
         return None
-    terrain = mapdata.load(_current_map(room))
+    terrain = _terrain(room)
     point = respawn_point(room, seat_index, terrain, roll=machine.roll)
     if point is None:
         return None
@@ -3589,6 +3709,8 @@ def _clear_navigation(machine, failed=None):
     machine.nav_started = False
     machine.nav_failed = failed
     machine.nav_double_jump = False
+    # ★ 在算的那张单子也作废：目标已经不作数了，算回来也用不上（§137）。
+    botplan.forget(machine)
 
 
 def _nav_signature(terrain, body, spot):
@@ -3642,12 +3764,16 @@ def _route_intent(machine, terrain, who, spot):
         signature = _nav_signature(terrain, body, spot)
         if machine.nav_failed == signature:
             return None
-        if machine.nav_planned_at == machine.frame_seq:
-            # 这一帧已经规划过一次了（那一次没成，或者刚走完最后一条边）。
-            # 再算一遍只会得到同一个答案 —— 下一帧再说。
+        # ★★★ A\* **在后台线程上跑**（§137）：这里只做两件 O(1) 的事 ——
+        #     看看上一张单子算好了没有、没有就递一张新的。
+        path = botplan.take(machine, body, spot)
+        if path is None:
+            if machine.nav_planned_at != machine.frame_seq:
+                # ★ 一帧最多递一张单（`_own_step` 是**逐 tick**问意图的，
+                #   §120）。判据是「这一帧」这个事件，不是挂钟。
+                machine.nav_planned_at = machine.frame_seq
+                botplan.ask(machine, terrain, body, who, spot)
             return None
-        machine.nav_planned_at = machine.frame_seq
-        path = botnav.plan(terrain, body, who, spot)
         if not path:
             _clear_navigation(machine, failed=signature)
             return None
@@ -3836,9 +3962,7 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
             spot = goal
             # ★ 脱离时按着右键跑（`FastRunRate`）—— 体力够才跑，
             #   这是原版的开关，不是我们加的动作。
-            fast_run = (machine.stamina is None
-                        or machine.stamina > _stamina_props().fast_run_sp_cost
-                        * botmove.TICKS_PER_BEAT)
+            fast_run = _may_fast_run(machine)
     else:
         machine.retreat_goal = None
         # ★★ **主动捡道具**（M5-F）：这一枪打不出去（`target is None`）的时候
@@ -3971,26 +4095,63 @@ def _walk_to(room, machine, terrain, spot, fast_run):
 BOT_COOP_BAND = botnav.GOAL_X
 
 
-def _coop_goal(room, machine, seat_index):
-    """闯关时该往哪走：**队伍刚刚踩过的那个点**（D16 的轨迹，当寻路目标用）。
+def _quest_forward(terrain):
+    """闯关图的「前方」是 +x 还是 −x —— 拿**出生点**问出来的。
 
-    ★ 「不能走太慢拖进度、也不能走太快甩太远」这条要求是**目标点**保证的，
-    不是靠速度旋钮：目标恒定落在带头那个真人身后 `BOT_FOLLOW_DISTANCE × 名次`
-    处，他往前走目标就往前挪，他停下目标就停下。
+    闯关是横版推进：全队从出生点那一头往另一头打。所以「前」= 从出生点
+    堆的重心指向地图另一侧的那个方向。★ 这不是「所有图都往右」这种拍脑袋
+    的假设，是每张图自己的数据说的（`terrain.points` 就是 `.map` 里那张
+    出生点表，真人重生走的也是它）。
     """
-    leader = _follow_target(room, machine)
+    if terrain is None:
+        return 1
+    spawns = [p for otype in (SPAWN_TYPE_TEAM_A, SPAWN_TYPE_TEAM_B, 108)
+              for p in terrain.points.get(otype, ())]
+    if not spawns:
+        return 1
+    mean = sum(float(p[0]) for p in spawns) / len(spawns)
+    return 1 if mean <= terrain.width * 0.5 else -1
+
+
+def _coop_leader(room, forward):
+    """闯关时跟谁：**最靠前的那个真人**（用户 2026-08-30）。
+
+    以前跟的是「离自己最近的真人」。房里只有一个真人时两者一样，但一旦
+    bot 掉了队，「最近」会把它锚在**后面**那个人身上 —— 几个 bot 互相
+    当参照物，整队就一起停在图的左边，真人推不动进度。
+    改成恒定盯住**推进得最远**的那一个：他走多远，bot 就得跟多远。
+    """
+    humans = _followable_humans(room)
+    if not humans:
+        return None
+    return max(humans, key=lambda conn: forward * conn.sync_trail[-1][0])
+
+
+def _coop_goal(room, machine, seat_index, terrain):
+    """闯关时该往哪走：**最靠前那个真人身后一点点**。
+
+    ★ 锚是他**此刻站的地方**，不再是他走过的轨迹（D16 那条老路）：
+      轨迹是他绕过的每一个弯，跟着重走既慢又白绕；而中间那段路现在有
+      A\\* 自己会走（M5-G），不需要拿轨迹保证「踩得到地面」。
+
+    ★ 每个 bot 往后错开 `BOT_FOLLOW_DISTANCE × 名次`，免得几个叠在一个点上。
+      错开的方向是**后方**（`−forward`），所以 bot 永远排在带头的人后面，
+      不会冲到他前面挡枪。
+    """
+    leader = _coop_leader(room, _quest_forward(terrain))
     if leader is None:
         return None
+    forward = _quest_forward(terrain)
     seats = room.bot_seats()
     rank = (seats.index(seat_index) + 1) if seat_index in seats else 1
-    point = trail_point(leader.sync_trail, BOT_FOLLOW_DISTANCE * rank)
-    return None if point is None else (float(point[0]), float(point[1]))
+    x, y = leader.sync_trail[-1][:2]
+    return (float(x) - forward * BOT_FOLLOW_DISTANCE * rank, float(y))
 
 
 def _coop_intent(room, machine, seat_index, terrain, target):
     """闯关模式这一帧往哪走（M5-G）。"""
     body = machine.body
-    spot = _coop_goal(room, machine, seat_index)
+    spot = _coop_goal(room, machine, seat_index, terrain)
     if spot is None:
         _clear_navigation(machine)
         return (0, False, False, False)
@@ -3999,7 +4160,21 @@ def _coop_intent(room, machine, seat_index, terrain, target):
         # 已经跟上了：站住打怪（打不到就干脆站着，和对战房同一条规矩）。
         _clear_navigation(machine)
         return (0, False, False, False)
-    return _walk_to(room, machine, terrain, spot, False)
+    # ★★ **掉队了就跑**（用户 2026-08-30：「让 bot 尽量往前走」）。
+    #    真人是按着右键冲刺推进的（`FastRunRate` 1.5 倍），bot 只用走速
+    #    的话**永远**追不上，一路被落下 500~800 个单位，卡在屏幕左边
+    #    把镜头钉住 —— 实机日志里量出来的就是这个数。
+    #    判据是「差得比跟随带还远」这个空间事实 + 体力够不够（原版开关）。
+    behind = math.hypot(spot[0] - body.x, spot[1] - body.y)
+    return _walk_to(room, machine, terrain, spot,
+                    behind > BOT_FOLLOW_DISTANCE and _may_fast_run(machine))
+
+
+def _may_fast_run(machine):
+    """体力够不够按着右键跑一整帧（原版 `FastRunRate` 的开关，不是新规则）。"""
+    return (machine.stamina is None
+            or machine.stamina > _stamina_props().fast_run_sp_cost
+            * botmove.TICKS_PER_BEAT)
 
 
 def _retreat_done(body, goal, enemy):
@@ -4089,6 +4264,8 @@ def _own_step(room, machine, seat_index, terrain, target, now):
     jumped = 0
     crouched = bool(machine.dodge_crouch)
     remaining = ticks
+    #: 距离下一次重新决策还有几个 tick（`BOT_DECISIONS_PER_SECOND`）。
+    hold = BOT_DECISION_TICKS
     while remaining > 0:
         before = machine.body
         machine.body = botmove.tick(terrain, before, who,
@@ -4105,8 +4282,15 @@ def _own_step(room, machine, seat_index, terrain, target, now):
             elif machine.body.air_jumped and not before.air_jumped:
                 # ★ 第二段跳（§124）—— `rpJump` 的段号要报 2，不是 1。
                 jumped = 2
+            # ★★ 跳的意图**用掉就作废**：不清的话，下一个 tick 还举着
+            #    `want_jump=True`，而腾空中按跳 = 第二段跳（§124）——
+            #    白白多跳一段。以前逐 tick 重问意图掩盖了这件事。
+            if not machine.body.on_ground:
+                want_jump = False
         remaining -= 1
-        if remaining:
+        hold -= 1
+        if remaining and hold <= 0:
+            hold = BOT_DECISION_TICKS
             direction, want_jump, want_drop, fast_run = intent()
             crouched = bool(machine.dodge_crouch)
             if want_drop:
@@ -4456,7 +4640,7 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
     if machine.battle_pos is None:
         return None
     x, y = machine.battle_pos
-    terrain = mapdata.load(_current_map(room))
+    terrain = _terrain(room)
     solve = _solver_for(weapon)
     best = None
     # ★★ **只打看得见的**（§127）：屏幕外的人真人根本不知道在哪，
@@ -6014,7 +6198,34 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region):
     #   直接命中我，我身上的火焰也会持续造成伤害。」
     if not hit:
         _set_ground_on_fire(room, machine, weapon, point)
+    # ★★★ **冰块 / 木箱也吃这一发**（§138）：原版里破坏物和角色走同一条
+    #   伤害路（`0x480dfb`），打碎了那条路就通了。
+    _blast_breakables(room, weapon, point,
+                      damage if hit else weapon.damage_for("body"))
     _split_shell(room, machine, shell, point, victim_seat)
+
+
+def _blast_breakables(room, weapon, point, damage):
+    """一发爆炸落在 `point`：范围内的可破坏物一起扣血（§138）。
+
+    作用半径用武器自己的 `SplashRange`（没有溅射的武器就是 0 = 只有
+    砸在它身上才算）。★ 伤害数字和打人是同一个 —— 原版里破坏物和角色
+    共用 `0x480dfb` 那条伤害路，没有第二套系数。
+    """
+    ledger = _breakables(room)
+    if ledger is None or damage <= 0:
+        return ()
+    terrain = mapdata.load(_current_map(room))
+    if terrain is None or not terrain.breakables:
+        return ()
+    radius = float(getattr(weapon, "splash_range", 0.0) or 0.0)
+    broken = ledger.blast(terrain, point[0], point[1], radius, int(damage))
+    for index in broken:
+        item = terrain.breakables[index]
+        print(f"[{gameserver.ts()}]    破坏物碎了: #{index} @ "
+              f"({item.x}, {item.y})　{item.regen_ms / 1000.0:.0f} 秒后长回来",
+              flush=True)
+    return broken
 
 
 def _fire_wall_of(weapon):
@@ -6328,7 +6539,7 @@ def _set_ground_on_fire(room, machine, weapon, point):
     packet, step = machine.sync.set_on_fire(
         point[0], point[1], flame.id, flame.raw.get("spawn_count"))
     # ★★ 伤害归服务端（§78）：收方只把火画出来，算谁被烧的还是「射手那台」。
-    terrain = mapdata.load(_current_map(room))
+    terrain = _terrain(room)
     flames = _fire_wall_flames(terrain, flame, point, handle)
     machine.log(f"   火墙: 在 ({point[0]:.1f}, {point[1]:.1f}) 点着 "
                 f"{flame.id}({flame.raw.get('section')}) "
@@ -6415,7 +6626,7 @@ def _split_shell(room, machine, shell, point, victim_seat):
     if slice_weapon is None or victim_seat is not None:
         return
     fire_seq = machine.sync.events
-    terrain = mapdata.load(_current_map(room))
+    terrain = _terrain(room)
     # ★ 力度就是碎片那一节的 `Velocity`（`0x47ca12: fld [ebx+0x24]` 原样推
     #   进包里）。语料 7968 发碎片的 `+18` **恒 10.0**，而 `ch00-02a`
     #   的 `Velocity` 正是 10。
@@ -6517,7 +6728,7 @@ def _advance_shells(room, machine, now):
     #   这一轮新生的 4 片**整个吞掉**，于是它们的 `rpExplode` 一发都不发，
     #   句柄从此永久错开（§42 那个静默丢弃）。
     machine.pending_shots = []
-    terrain = mapdata.load(_current_map(room))
+    terrain = _terrain(room)
     bodies_cache = {}
     # ★★★ 上一帧那份快照 + 它的时刻 —— 逐 tick 插值的另一个端点（§96）。
     was = machine.shell_bodies
@@ -6919,7 +7130,7 @@ def _try_fire(room, machine, seat_index, weapon, target, now):
     # ★★ 强力射击 / 三重射击 / 毒弹这三条状态同样按**发**消耗（§117）。
     #    打完就地撤掉并广播 `0x040d` —— 不发的话别人屏幕上永远不结束。
     _spend_magazine_shots(room, machine, seat_index)
-    terrain = mapdata.load(_current_map(room))
+    terrain = _terrain(room)
     max_ticks = _shell_max_ticks(terrain, shot, weapon)
     for offset in range(weapon.shots):
         shell = Shell(handle + offset, fire_seq, weapon, group,
@@ -7105,7 +7316,7 @@ def _tick_bot(room, machine, seat_index):
         # ★★ **自己走位**（M5 / §71）：对战房里 bot 按地形自己挪，
         #   闯关房和「还没落地」两种情形 `_own_step()` 会返回 None ——
         #   那就退回 D16 那条老路，回放真人的轨迹。
-        terrain = mapdata.load(_current_map(room))
+        terrain = _terrain(room)
         # ★★ **换枪排在最前面**（M5-C）：这一帧用哪把枪决定了「打不打得到」，
         #    而「打不打得到」又决定了走不走。房主锁了枪 / 手上是捡来的枪时
         #    这一步是空转。
@@ -7303,7 +7514,7 @@ def warm_navigation(room, why):
     地图自己的**出生点表**（`terrain.points`）。所有人都是从那儿进图的，
     从那儿走得到的地方就是这一局真正会用到的那一片。
     """
-    terrain = mapdata.load(_current_map(room))
+    terrain = _terrain(room)
     if terrain is None:
         return
     seeds_raw = [point for group in terrain.points.values() for point in group]
@@ -7367,6 +7578,11 @@ def tick_room(sender):
         _refresh_health(room)
     except Exception as error:          # noqa: BLE001 —— 见 docstring
         sender.log(f"   ⚠ 刷新血量台账出错，已跳过: {error!r}")
+    # ★★★ 可破坏物碎了 / 长回来了（§138）—— 地形对象跟着换一份。
+    try:
+        _refresh_breakables(room)
+    except Exception as error:          # noqa: BLE001 —— 见 docstring
+        sender.log(f"   ⚠ 刷新破坏物出错，已跳过: {error!r}")
     for index in room.bot_seats():
         seat = room.seats[index]
         machine = None if seat is None else seat.conn

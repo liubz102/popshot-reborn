@@ -209,6 +209,29 @@ class DropThroughTests(unittest.TestCase):
         self.assertEqual(body, botmove.tick(self.t, body, self.who,
                                             want_drop=True))
 
+    def test_down_does_nothing_when_a_breakable_plugs_the_hole(self):
+        """★★★ 白线底下紧贴着**冰块**时，按 ↓ 纹丝不动（V0.3 §136）。
+
+        `Iceria00` 那两处窟窿就长这样：一根单向平台白线，下面整个塞满
+        可破坏物（值 3）。不查「穿出去那一格是不是空的」的话，人会被
+        挪到白线下沿 —— 也就是**冰块里面**。
+        """
+        rows = []
+        for y in range(32):
+            if y == 10:
+                rows.append("1" * 48)
+            elif 11 <= y < 20:
+                rows.append("3" * 48)       # 白线底下整块冰
+            elif y >= 25:
+                rows.append("2" * 48)
+            else:
+                rows.append("0" * 48)
+        t = terrain_from(rows)
+        body = botmove.Body(20.0, 10.0)
+        self.assertEqual(body, botmove.drop_through(t, body))
+        self.assertEqual(body, botmove.tick(t, body, self.who,
+                                            want_drop=True))
+
 
 class JumpTests(unittest.TestCase):
     """起跳初速 20、重力 1.2 —— 顶点 `v²/2g ≈ 167`（语料中位 170）。"""

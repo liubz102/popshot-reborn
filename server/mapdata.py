@@ -15,15 +15,16 @@
     1  ★ **单向平台**（游戏里那种细白线）：站得上去、按 ↓ 能穿下去、
        从下往上跳能穿过去，而且**完全不挡子弹**（§29）
     2  实心
-    3  原版数据里没有，只在运行时出现
+    3  ★ **可破坏物**（冰块 / 木箱）。挡人也挡子弹，和实心一样 ——
+       打碎之前它就是一堵墙（§136）
 
     ★ **出界返回 2**，和客户端一致。别改成「出界算空」——
       那会让 bot 觉得图外能走。
 
 ## ★ 「挡人」和「挡子弹」是**两个**判据，别混用
 
-    is_solid(x, y)       挡住行走 / 接住下落  -> cell != 0（含单向平台）
-    blocks_bullet(x, y)  挡住子弹             -> cell >= 2（★ 单向平台不挡）
+    is_solid(x, y)       挡住行走 / 接住下落  -> cell != 0（含单向平台、冰块）
+    blocks_bullet(x, y)  挡住子弹             -> cell >= 2（★ 单向平台不挡，冰块挡）
 
 判据来自客户端弹体的扫掠碰撞 `0x47f976`：值 2/3 恒挡，值 1 那条分支还要
 一个虚函数点头，而 19 个弹体类**全部**用的是默认实现 `xor al,al ; ret`
@@ -50,13 +51,20 @@
 """
 import base64
 import json
+import math
 import os
 import struct
 import zlib
 
 #: 认得的产物格式版本。对不上就当没有数据 —— 宁可 bot 不会走，
 #: 也不要按错的布局解出一张乱七八糟的地图。
-FORMAT = 2
+#:
+#: 3：`cells` 里多了值 3 = **可破坏物**（冰块 / 木箱，§136）。
+#:    2 那一版的产物里冰块那一块是**空的**，bot 会直接穿过去。
+#: 4：可破坏物改成**单独一层** `breakables`（形状 / 血量 / 恢复延迟），
+#:    `cells` 退回不含它们的原样网格 —— 打碎了要放行，过一阵原样长回来
+#:    （§138）。合成在 `MapTerrain` 里做。
+FORMAT = 4
 
 #: 找不到精确名时按这个顺序退。
 DIFFICULTY_ORDER = ("#Normal", "#Easy", "#Hard", "#Extreme")
@@ -67,33 +75,131 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 #: 出界的格值。照抄客户端 `0x472fe0`。
 OUT_OF_BOUNDS = 2
 
+#: 可破坏物在网格里的格值。客户端自己的命中判定（`BreakableObj::HitTest`
+#: = `0x4fa7b5`）认的就是 3，而原版 174 张烘焙网格里一个 3 都没有。
+BREAKABLE_CELL = 3
+
+#: 一字节 4 格 -> 4 个字节（值仍是 0..3）。合成破坏物时重算站立面用。
+_UNPACK = tuple(bytes(((b >> 0) & 3, (b >> 2) & 3, (b >> 4) & 3, (b >> 6) & 3))
+                for b in range(256))
+#: 再把 0..3 压成「非空 = 1」。和 `tools/mapdata.py` 的 `_SOLID` 同一张表。
+_SOLID = bytes((0, 1, 1, 1)) + bytes(252)
+
+
+class Breakable(object):
+    """一件**可破坏物**（冰块 / 木箱）—— 形状、血量、碎了多久长回来。
+
+    数据全是原版的（`tools/mapdata.py` 的 `collect_breakables` 从 `.map`
+    里抽的）：
+
+    * `hp` —— `BreakableObj::Deserialize`（`0x4fa3e7`）读的第一个 i32；
+    * `regen_ms` —— 第二个 i32（缺省 15000，构造函数 `0x4fa379` 写死的），
+      `BreakableObj::Tick`（`0x4fa4e9`）拿它判「碎了多久原样长回来」。
+
+    `rows` 是**预先算好的贴图行**：`(起字节, 止字节, 或运算位图)`。
+    合成一份地形 = 从不含破坏物的原网格出发，把还活着的这几件 **OR** 上去
+    —— 一行一次大整数运算，走 C 层，不逐格循环。
+    """
+
+    __slots__ = ("index", "x", "y", "left", "top", "width", "height",
+                 "hp", "regen_ms", "rows", "col0", "col1", "row0", "row1")
+
+    def __init__(self, index, record, map_width, map_height):
+        self.index = index
+        self.x = int(record["x"])
+        self.y = int(record["y"])
+        self.width = int(record["w"])
+        self.height = int(record["h"])
+        self.hp = int(record.get("hp", 40))
+        self.regen_ms = int(record.get("regen", 15000))
+        self.left = self.x - self.width // 2
+        self.top = self.y - self.height // 2
+        mask = _unblob(record["mask"])
+        rows = []
+        col0, col1 = map_width, -1
+        row0, row1 = map_height, -1
+        for my in range(self.height):
+            ty = self.top + my
+            if ty < 0 or ty >= map_height:
+                continue
+            base = my * self.width
+            filled = []
+            for mx in range(self.width):
+                tx = self.left + mx
+                if tx < 0 or tx >= map_width:
+                    continue
+                i = base + mx
+                if (mask[i >> 2] >> ((i & 3) * 2)) & 3:
+                    filled.append(tx)
+            if not filled:
+                continue
+            lo, hi = filled[0], filled[-1]
+            col0 = min(col0, lo)
+            col1 = max(col1, hi)
+            row0 = min(row0, ty)
+            row1 = max(row1, ty)
+            first = (ty * map_width + lo) >> 2
+            last = ((ty * map_width + hi) >> 2) + 1
+            pattern = bytearray(last - first)
+            for tx in filled:
+                i = ty * map_width + tx
+                pattern[(i >> 2) - first] |= BREAKABLE_CELL << ((i & 3) * 2)
+            rows.append((first, last, int.from_bytes(bytes(pattern), "big")))
+        self.rows = tuple(rows)
+        self.col0, self.col1 = col0, col1
+        self.row0, self.row1 = row0, row1
+
+    def covers(self, x, y):
+        """(x, y) 在这件东西的**外接矩形**里吗（溅射判定用，不查逐格形状）。"""
+        return (self.left <= x < self.left + self.width
+                and self.top <= y < self.top + self.height)
+
+    def distance_to(self, x, y):
+        """(x, y) 到这件东西外接矩形的距离；在里面就是 0。"""
+        dx = max(self.left - x, 0.0, x - (self.left + self.width))
+        dy = max(self.top - y, 0.0, y - (self.top + self.height))
+        return math.hypot(dx, dy)
+
+    def __repr__(self):
+        return "<Breakable #%d (%d,%d) %dx%d hp=%d regen=%dms>" % (
+            self.index, self.x, self.y, self.width, self.height,
+            self.hp, self.regen_ms)
+
 
 class MapTerrain(object):
-    """一张图的地形。**只读**，加载后不再变。"""
+    """一张图的地形。**只读** —— 破坏物状态变了要换一个对象（`variant()`）。
+
+    ★★ 「只读」这条是 `botnav` 那份可达图缓存的**前提**：缓存按地形对象
+      本身做弱引用键，一个对象 = 一张可达图。所以「哪几件破坏物还在」
+      不能做成这个对象上的可变状态，只能一个状态一份地形（§138）。
+      同一个存活集合永远拿到**同一个对象** ⇒ 那张图也只算一次。
+    """
 
     #: ★ `__weakref__` 是给 `botnav` 的可达图缓存留的：那份缓存按**地形对象
     #:   本身**做弱引用键（图名不行 —— 单测里的合成地形全叫 `Tiny`），
     #:   地形被丢掉时缓存自然跟着没。地形本身仍然是只读的。
     __slots__ = ("name", "version", "width", "height", "_cells",
-                 "_offsets", "_ys", "points", "jump_pads", "__weakref__")
+                 "_offsets", "_ys", "points", "jump_pads", "__weakref__",
+                 "breakables", "alive", "_base_cells", "_base_offsets",
+                 "_base_ys", "_root", "_variants")
 
     def __init__(self, record):
         self.name = record["name"]
         self.version = record["version"]
         self.width = record["width"]
         self.height = record["height"]
-        self._cells = _unblob(record["cells"])
+        self._base_cells = _unblob(record["cells"])
         counts = struct.unpack(
             "<%dH" % self.width, _unblob(record["ground_counts"]))
         ys_raw = _unblob(record["ground_ys"])
-        self._ys = struct.unpack("<%dH" % (len(ys_raw) // 2), ys_raw)
+        self._base_ys = struct.unpack("<%dH" % (len(ys_raw) // 2), ys_raw)
         # 前缀和：第 x 列的站立面是 _ys[_offsets[x]:_offsets[x+1]]。
         offsets = [0] * (self.width + 1)
         acc = 0
         for i, n in enumerate(counts):
             acc += n
             offsets[i + 1] = acc
-        self._offsets = offsets
+        self._base_offsets = offsets
         self.points = dict((int(k), [tuple(p) for p in v])
                            for k, v in record.get("points", {}).items())
         #: ★ **弹跳台**（V0.3 §99）：`[(台x, 台y, 落点dx, 落点dy), …]`。
@@ -102,6 +208,115 @@ class MapTerrain(object):
         self.jump_pads = tuple(
             (float(a), float(b), float(c), float(d))
             for a, b, c, d in record.get("jump", ()))
+        self.breakables = tuple(
+            Breakable(i, item, self.width, self.height)
+            for i, item in enumerate(record.get("breakables", ())))
+        self._root = self
+        self._variants = {}
+        # 缺省状态 = **全都还在**：原版里碎了会自己长回来，完好才是稳态。
+        self._compose(frozenset(range(len(self.breakables))))
+
+    # -- 破坏物合成 ---------------------------------------------------------
+
+    def _compose(self, alive):
+        """把 `alive` 这几件破坏物贴上去，重算被盖住的那几列站立面。"""
+        self.alive = alive
+        items = [b for b in self.breakables if b.index in alive]
+        if not items:
+            self._cells = self._base_cells
+            self._offsets = self._base_offsets
+            self._ys = self._base_ys
+            return
+        cells = bytearray(self._base_cells)
+        for item in items:
+            for first, last, pattern in item.rows:
+                chunk = int.from_bytes(cells[first:last], "big") | pattern
+                cells[first:last] = chunk.to_bytes(last - first, "big")
+        self._cells = bytes(cells)
+        # ★★ 站立面只重算**被盖住的那一片矩形**，而且用和 `extract_ground`
+        #    同一个位运算手法：「这一行非空 且 上一行是空」= `cur & ~prev`，
+        #    一次大整数运算出一整行的上沿。逐格 `cell()` 问的话，
+        #    `CamelCulvert_br2`（44 件）要 240 ms —— 那就是一次卡顿。
+        x0 = max(0, min(item.col0 for item in items))
+        x1 = min(self.width - 1, max(item.col1 for item in items))
+        # ★ 下界多看一格：盖住 y=hi 之后，原来 y=hi+1 那个站立面就不再
+        #   满足「正上方是空」了。
+        y0 = max(1, min(item.row0 for item in items))
+        y1 = min(self.height - 1, max(item.row1 for item in items) + 1)
+        span = x1 - x0 + 1
+        fresh = {}
+        prev = self._solid_row(y0 - 1, x0, span)
+        for y in range(y0, y1 + 1):
+            cur = self._solid_row(y, x0, span)
+            edge = cur & ~prev
+            prev = cur
+            if not edge:
+                continue
+            row = edge.to_bytes(span, "big")
+            start = 0
+            while True:
+                idx = row.find(1, start)
+                if idx < 0:
+                    break
+                fresh.setdefault(x0 + idx, []).append(y)
+                start = idx + 1
+        column = {}
+        base_ys, base_offsets = self._base_ys, self._base_offsets
+        for x in range(x0, x1 + 1):
+            keep = [y for y in base_ys[base_offsets[x]:base_offsets[x + 1]]
+                    if y < y0 or y > y1]
+            column[x] = sorted(keep + fresh.get(x, []))
+        ys = []
+        offsets = [0] * (self.width + 1)
+        acc = 0
+        for x in range(self.width):
+            seg = column.get(x)
+            if seg is None:
+                seg = base_ys[base_offsets[x]:base_offsets[x + 1]]
+            ys.extend(seg)
+            acc += len(seg)
+            offsets[x + 1] = acc
+        self._ys = tuple(ys)
+        self._offsets = offsets
+
+    def _solid_row(self, y, x0, span):
+        """第 y 行、从 x0 起 `span` 格的「非空」位图，当一个大整数返回。
+
+        ★ 两张查表都走 C 层：`_UNPACK` 把 2 bit/格摊成 1 字节/格，
+          `_SOLID` 再把 0..3 压成 0/1。逐格 Python 循环慢两个数量级。
+        """
+        if y < 0 or y >= self.height:
+            return 0
+        i0 = y * self.width + x0
+        i1 = i0 + span - 1
+        first, last = i0 >> 2, (i1 >> 2) + 1
+        flat = b"".join(map(_UNPACK.__getitem__, self._cells[first:last]))
+        off = i0 - (first << 2)
+        return int.from_bytes(flat[off:off + span].translate(_SOLID), "big")
+
+    def variant(self, alive):
+        """「只有 `alive` 这几件破坏物还在」的那一份地形。**memo 化**。
+
+        同一个存活集合永远返回**同一个对象** —— `botnav` 的可达图缓存按
+        对象做键，这样一个状态只算一张图，来回破坏 / 恢复也不重复算。
+        """
+        count = len(self.breakables)
+        alive = frozenset(int(i) for i in alive if 0 <= int(i) < count)
+        root = self._root
+        if alive == root.alive:
+            return root
+        got = root._variants.get(alive)
+        if got is None:
+            got = object.__new__(MapTerrain)
+            for field in ("name", "version", "width", "height", "points",
+                          "jump_pads", "breakables", "_base_cells",
+                          "_base_offsets", "_base_ys"):
+                setattr(got, field, getattr(root, field))
+            got._root = root
+            got._variants = root._variants
+            got._compose(alive)
+            root._variants[alive] = got
+        return got
 
     # -- 格子 ---------------------------------------------------------------
 
