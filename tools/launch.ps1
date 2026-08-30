@@ -336,6 +336,10 @@ if ($running -and $lastMode -eq $Mode) {
     $appScript = Join-Path $Root 'server\app.py'
     $appArgs = @("`"$appScript`"")
     if ($DebugLog) { $appArgs += '--verbose' }
+    # 关掉原版 rcp 中继服，降低复杂度，提升稳定性 —— 27798 不再
+    #   监听、不回 0x0210，玩家间同步整场走 0x040e/0x040f 回退路径。
+    #   启动日志应出现「中继服   已关闭（--no-tcp-relay）」。
+    $appArgs += '--no-tcp-relay'
 
     Start-Process -FilePath $Python -WorkingDirectory $Root `
         -ArgumentList $appArgs `
