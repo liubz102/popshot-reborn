@@ -64,7 +64,9 @@ import zlib
 #: 4：可破坏物改成**单独一层** `breakables`（形状 / 血量 / 恢复延迟），
 #:    `cells` 退回不含它们的原样网格 —— 打碎了要放行，过一阵原样长回来
 #:    （§138）。合成在 `MapTerrain` 里做。
-FORMAT = 4
+#: 5：破坏物多一格 `handle` = **世界句柄**（§139），`rpSplashDamaged +4`
+#:    填的就是它。
+FORMAT = 5
 
 #: 找不到精确名时按这个顺序退。
 DIFFICULTY_ORDER = ("#Normal", "#Easy", "#Hard", "#Extreme")
@@ -101,11 +103,16 @@ class Breakable(object):
     —— 一行一次大整数运算，走 C 层，不逐格循环。
     """
 
-    __slots__ = ("index", "x", "y", "left", "top", "width", "height",
-                 "hp", "regen_ms", "rows", "col0", "col1", "row0", "row1")
+    __slots__ = ("index", "handle", "x", "y", "left", "top", "width",
+                 "height", "hp", "regen_ms", "rows", "mask",
+                 "col0", "col1", "row0", "row1")
 
     def __init__(self, index, record, map_width, map_height):
         self.index = index
+        #: ★★ **世界句柄**（§139）：`rpSplashDamaged +4` 填的就是它。
+        #:   服务端靠它认「真人把哪一块打碎了」，也靠它让 bot 打碎的那一下
+        #:   在别人屏幕上生效。0 = 产物是老格式，没这一格。
+        self.handle = int(record.get("handle", 0))
         self.x = int(record["x"])
         self.y = int(record["y"])
         self.width = int(record["w"])
@@ -115,6 +122,9 @@ class Breakable(object):
         self.left = self.x - self.width // 2
         self.top = self.y - self.height // 2
         mask = _unblob(record["mask"])
+        #: 形状本身留着：命中判定要**逐格**问「这一点在不在它身上」
+        #: （客户端 `BreakableObj::HitTest` = `0x4fa7b5`）。2 bit/格。
+        self.mask = mask
         rows = []
         col0, col1 = map_width, -1
         row0, row1 = map_height, -1
@@ -150,9 +160,43 @@ class Breakable(object):
         self.row0, self.row1 = row0, row1
 
     def covers(self, x, y):
-        """(x, y) 在这件东西的**外接矩形**里吗（溅射判定用，不查逐格形状）。"""
+        """(x, y) 在这件东西的**外接矩形**里吗。"""
         return (self.left <= x < self.left + self.width
                 and self.top <= y < self.top + self.height)
+
+    def hit(self, x, y):
+        """★★★ (x, y) 打在这件东西身上了吗 —— **逐格问形状**。
+
+        照抄客户端 `BreakableObj::HitTest`（`0x4fa7b5`）：把世界坐标换算成
+        局部坐标（`局部 = 世界 − 左上角`，`0x51a935` 那一句），再看
+        **3×3 邻域**里有没有一格是它（`cmp al, 3`）。
+        """
+        mx = int(x) - self.left
+        my = int(y) - self.top
+        for dy in (-1, 0, 1):
+            ny = my + dy
+            if ny < 0 or ny >= self.height:
+                continue
+            base = ny * self.width
+            for dx in (-1, 0, 1):
+                nx = mx + dx
+                if nx < 0 or nx >= self.width:
+                    continue
+                i = base + nx
+                if (self.mask[i >> 2] >> ((i & 3) * 2)) & 3:
+                    return True
+        return False
+
+    @property
+    def radius(self):
+        """★ 它在伤害衰减里的半径 —— `(宽 + 高) / 2`（§139）。
+
+        出处 `BreakableObj` 虚表槽 `+0x7c` = `0x50d8a1`：
+        `(h + w) × [[this+0x13c]+0x18] × 0.5`，中间那个系数的构造缺省是
+        **1.0**（`0x4c9946: fld1; fstp [esi+0x18]`），而 677 件的缩放全是 1。
+        角色那一侧同一个槽返回的是写死的 **35**（§90）。
+        """
+        return (self.width + self.height) / 2.0
 
     def distance_to(self, x, y):
         """(x, y) 到这件东西外接矩形的距离；在里面就是 0。"""
@@ -293,6 +337,15 @@ class MapTerrain(object):
         flat = b"".join(map(_UNPACK.__getitem__, self._cells[first:last]))
         off = i0 - (first << 2)
         return int.from_bytes(flat[off:off + span].translate(_SOLID), "big")
+
+    def breakable_by_handle(self, handle):
+        """按**世界句柄**找破坏物；不是破坏物的句柄返回 `None`（§139）。"""
+        if not handle:
+            return None
+        for item in self.breakables:
+            if item.handle == handle:
+                return item
+        return None
 
     def variant(self, alive):
         """「只有 `alive` 这几件破坏物还在」的那一份地形。**memo 化**。

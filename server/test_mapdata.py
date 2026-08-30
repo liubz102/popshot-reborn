@@ -377,7 +377,8 @@ class BreakableTerrainTests(unittest.TestCase):
         mask_rows = ["3333", "3333", "3333"]
         rec = make_record(self.ROWS, name="Ice")
         rec["breakables"] = [{
-            "x": 4, "y": 3, "w": 4, "h": 3, "hp": 40, "regen": 15000,
+            "handle": 247, "x": 4, "y": 3, "w": 4, "h": 3,
+            "hp": 40, "regen": 15000,
             "mask": blob(pack_cells(mask_rows)),
         }]
         return rec

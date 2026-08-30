@@ -12,16 +12,30 @@
 * **长回来**：`BreakableObj::Tick`（`0x4fa4e9`）——
   `if (碎掉时刻 + 恢复延迟 < GetTickCount()) { 清标记; 血量恢复满 }`。
 
-## ★★★ 一发同步包都没有
+## ★★★ 「碎」是**广播**的，「长回来」不是（§139）
 
-全镜像扫过：`BreakableObj` 那一段代码里**唯一**一处调进发包区的
-（`0x4faad`）是 `0x4939c0` —— 那是**放特效**，不是 `UdpPacket`
-（整个函数里一次 `0x5bbe1b` 都没有）。内层 opcode 表里也没有任何一个是
-破坏物。
+* **碎**：伤害走的是所有伤害对象共用的那条通用路 `0x480dfb`，而它在扣血
+  **之前**先发一发 **`rpSplashDamaged`**（`0x480f2e -> 0x492b63`），
+  `+4` 填的就是破坏物的**世界句柄**。语料实证：`Desert03` 上 11 发
+  `rpSplashDamaged` 的受害者句柄正是那张图里破坏物的对象 id，
+  受击点全部落在它们的掩码上。
+  ⇒ **真人打碎的那一下，服务端读包就知道，一个数都不用算。**
+* **长回来**：`BreakableObj::Tick`（`0x4fa4e9`）——
+  `if (碎掉时刻 + 恢复延迟 < GetTickCount()) { 清标记; 血量恢复满 }`。
+  **这一半没有任何包**，每台客户端各自计时。
 
-⇒ 原版靠的是**确定性**：每台客户端都收到同一批 `rpExplode`，各自在本地
-   扣血、各自按本地时钟计时恢复。**服务端要跟上，就得自己算同一份账**
-   —— 这个模块干的就是这件事，喂给它的是服务端本来就要过一遍的爆炸。
+## 谁能打碎它
+
+`0x480469` 是 `DamagingObj` 的 `+0x11c`，**12 个伤害对象类共用**
+（`SplashDamage` / `Flame` / `DashDamage` / `LaserDamage` / …）。
+它按 `i = −1 … 9` 取 **11 个采样点**（爆点本身 + 半径 `SplashRange` 的圆上
+10 个等分点，角步长 `2π/10`），每个点问一遍「在不在某件破坏物身上」
+（`BreakableObj::HitTest` = `0x4fa7b5`，3×3 邻域）。
+⇒ **不是「离得近就掉血」，是「炸出来的那一圈点得真的碰到它」**。
+
+★ 那条遍历外面还有一道门 `0x50d294` = 「这颗弹是我的 / 中立的吗」。
+所以 **bot 打碎的那一下别人机器上算不出来** —— 服务端必须替它补发
+`rpSplashDamaged`，否则服务端和客户端会各看各的。
 
 ## 恢复为什么可以用时钟（铁律 10 的豁免）
 
@@ -33,7 +47,14 @@
 """
 from __future__ import annotations
 
+import math
 import time
+
+
+#: 那一圈采样点有几个 + 角步长。★ 都是原版写死的：`0x480648` 的
+#: `cmp [ebp-0x10], 0xa` 给出 10 个，`[0x693c30] = 0.6283185` = 2π/10。
+SPLASH_SAMPLES = 10
+SPLASH_STEP = 2.0 * math.pi / SPLASH_SAMPLES
 
 
 class Ledger(object):
@@ -92,24 +113,71 @@ class Ledger(object):
         self.broken_at[index] = time.monotonic() if now is None else now
         return True
 
-    def blast(self, terrain, x, y, radius, amount, now=None):
-        """一发爆炸落在 (x, y)：范围内的破坏物一起扣血。
+    def blast(self, terrain, x, y, splash_range, splash_damage, mult=1,
+              now=None):
+        """一发爆炸落在 (x, y)：照原版那 11 个采样点判，命中的一起扣血。
 
-        返回**这一发打碎的**那几件的下标。
+        返回 `[(破坏物, 伤害, 命中点, 这一下碎没碎), …]`。调用方拿它补发
+        `rpSplashDamaged` —— 别人机器上算不出 bot 的伤害（`0x50d294`
+        那道「这颗弹是我的吗」的门），不补发两边就各看各的。
 
-        ★ 判据是「爆点到这件东西的**外接矩形**有多远」——
-          和服务端算角色溅射时那条（爆点到身体表面）同一个口径。
-          逐格查形状对冰柱这种一团一团的东西没有意义，还慢。
+        ## 判据全是逐指令逆出来的（§139）
+
+        * **打没打到**：`i = −1 … 9` 共 11 个采样点 —— 爆点本身，加上
+          半径 `SplashRange` 的圆上 10 个等分点（`0x480577` 那个循环，
+          角步长 `2π/10` = `[0x693c30]`）。每个点问 `Breakable.hit()`
+          （`0x4fa7b5` 的 3×3 邻域）。
+        * **掉多少血**：和打人**同一条**衰减（`0x4857aa`，§90），
+          只是把「目标半径 35」换成破坏物自己的 `(宽+高)/2`：
+
+              r  = |爆点 → 破坏物中心| / (SplashRange + (宽+高)/2)
+              r > 1                 -> 一点都不掉
+              伤害 = int((1−r) × (SplashDamage − 1) + 1)   ★ 朝零截断
+              再 × 模式倍率（夺分 / 模式 5 是 ×2，`0x4806f1`）
         """
-        broken = []
-        for item in getattr(terrain, "breakables", ()):
-            if item.index in self.broken_at:
+        items = [b for b in getattr(terrain, "breakables", ())
+                 if b.index not in self.broken_at]
+        if not items or splash_damage <= 0:
+            return []
+        points = [(x, y)]
+        if splash_range > 0:
+            for i in range(SPLASH_SAMPLES):
+                angle = i * SPLASH_STEP
+                points.append((x + math.cos(angle) * splash_range,
+                               y + math.sin(angle) * splash_range))
+        out = []
+        for item in items:
+            where = None
+            for px, py in points:
+                if item.hit(px, py):
+                    where = (px, py)
+                    break
+            if where is None:
                 continue
-            if item.distance_to(x, y) > radius:
+            span = math.hypot(x - item.x, y - item.y)
+            reach = splash_range + item.radius
+            if reach <= 0.0:
                 continue
-            if self.damage(terrain, item.index, amount, now=now):
-                broken.append(item.index)
-        return broken
+            r = span / reach
+            if r > 1.0:
+                continue
+            hurt = int((1.0 - r) * (splash_damage - 1.0) + 1.0) * int(mult)
+            if hurt <= 0:
+                continue
+            out.append((item, hurt, where,
+                        self.damage(terrain, item.index, hurt, now=now)))
+        return out
+
+    def apply_broadcast(self, terrain, handle, amount, now=None):
+        """真人那边报过来的一发（`rpSplashDamaged`）：照它说的扣（§139）。
+
+        ★ 一个数都不用算 —— 包里的伤害就是他那台机器**已经扣掉**的那个。
+        不是破坏物的句柄返回 `None`。
+        """
+        item = None if terrain is None else terrain.breakable_by_handle(handle)
+        if item is None:
+            return None
+        return (item, self.damage(terrain, item.index, int(amount), now=now))
 
     def __repr__(self):
         return "<botbreak.Ledger 受损 %d 碎 %d>" % (len(self.hp),

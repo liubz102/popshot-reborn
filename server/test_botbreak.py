@@ -49,20 +49,64 @@ class LedgerTests(unittest.TestCase):
         # 长回来之后要**重新**打两下才碎（血是满的）。
         self.assertFalse(self.ledger.damage(self.terrain, 0, 22))
 
-    def test_a_blast_only_reaches_what_it_covers(self):
-        # 这件东西占 x=2..5 / y=2..4。半径 0 的爆炸砸在 (10, 3) 够不着。
+    def test_the_blast_has_to_actually_touch_it(self):
+        """★★★ 判据是「那 11 个采样点碰没碰到它」，不是「离得近」（§139）。
+
+        这件东西占 x=2..5 / y=2..4。溅射半径 0 ⇒ 只有爆点本身一个采样点。
+        """
         self.assertEqual([], self.ledger.blast(self.terrain, 10, 3, 0.0, 99))
         self.assertEqual(frozenset([0]), self.ledger.alive(self.terrain))
-        # 砸在身上就碎。
-        self.assertEqual([0], self.ledger.blast(self.terrain, 3, 3, 0.0, 99))
+        hits = self.ledger.blast(self.terrain, 3, 3, 0.0, 99)
+        self.assertEqual(1, len(hits))
+        item, hurt, where, broke = hits[0]
+        self.assertEqual(0, item.index)
+        self.assertTrue(broke)
 
-    def test_a_splash_radius_reaches_further(self):
-        self.assertEqual([], self.ledger.blast(self.terrain, 12, 3, 4.0, 99))
-        self.assertEqual([0], self.ledger.blast(self.terrain, 9, 3, 4.0, 99))
+    def test_the_ring_of_samples_reaches_further_than_the_centre(self):
+        """半径 4 的那一圈上有采样点落在它身上 —— 爆点自己在外面也算。"""
+        # 太远：圆上 10 个点一个都够不着。
+        self.assertEqual([], self.ledger.blast(self.terrain, 30, 3, 4.0, 99))
+        # 贴边：圆上有点落进 x=2..5 那一块。
+        self.assertEqual(1, len(self.ledger.blast(self.terrain, 9, 3, 4.0, 99)))
+
+    def test_the_damage_falls_off_with_distance(self):
+        """★ 和打人**同一条**衰减（§90），只是半径换成 (宽+高)/2。"""
+        # 半径 = (4+3)/2 = 3.5；爆点就在中心 ⇒ r=0 ⇒ 满额。
+        near = self.ledger.blast(self.terrain, 4, 3, 20.0, 41)[0][1]
+        self.assertEqual(41, near, "正中心该是满额 int((1-0)*(41-1)+1)")
+        self.ledger.clear()
+        # 挪开一点：r = 2/(20+3.5) ⇒ int((1-0.0851)*40+1) = 37
+        far = self.ledger.blast(self.terrain, 6, 3, 20.0, 41)[0][1]
+        self.assertEqual(37, far)
+
+    def test_the_game_mode_multiplier_is_applied_last(self):
+        doubled = self.ledger.blast(self.terrain, 4, 3, 20.0, 41, mult=2)
+        self.assertEqual(82, doubled[0][1])
 
     def test_a_broken_one_takes_no_more_damage(self):
         self.ledger.blast(self.terrain, 3, 3, 0.0, 99)
         self.assertEqual([], self.ledger.blast(self.terrain, 3, 3, 0.0, 99))
+
+    def test_a_weapon_without_splash_damage_does_nothing(self):
+        """普通子弹（`SplashDamage` = 0）打不碎它 —— 伤害算出来是 0。"""
+        self.assertEqual([], self.ledger.blast(self.terrain, 3, 3, 0.0, 0))
+
+    def test_a_broadcast_from_a_human_is_taken_at_face_value(self):
+        """★★★ 真人那一发照包里的数扣，一个字都不重算（§139）。"""
+        item = self.terrain.breakables[0]
+        self.assertEqual((item, False),
+                         self.ledger.apply_broadcast(self.terrain,
+                                                     item.handle, 20))
+        self.assertEqual(20, item.hp - self.ledger.hp[0])
+        self.assertEqual((item, True),
+                         self.ledger.apply_broadcast(self.terrain,
+                                                     item.handle, 20))
+        self.assertEqual(frozenset(), self.ledger.alive(self.terrain))
+
+    def test_a_broadcast_for_something_else_is_not_ours(self):
+        """不是破坏物的句柄（怪 / 角色）要原样放行给别的分支。"""
+        self.assertIsNone(self.ledger.apply_broadcast(self.terrain, 1100419,
+                                                      20))
 
     def test_clear_resets_the_whole_ledger(self):
         self.ledger.blast(self.terrain, 3, 3, 0.0, 99)

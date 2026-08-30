@@ -7052,11 +7052,11 @@ def ice_terrain(key, floor=150, width=1400, height=180,
             for y in range(height)]
     record = make_record(rows)
     record["breakables"] = [
-        {"x": cx, "y": floor + h // 2, "w": w, "h": h, "hp": 40,
-         "regen": 15000,
+        {"handle": 900 + i, "x": cx, "y": floor + h // 2, "w": w, "h": h,
+         "hp": 40, "regen": 15000,
          "mask": test_mapdata.blob(
              test_mapdata.pack_cells(["3" * w] * h))}
-        for cx, w, h in ice]
+        for i, (cx, w, h) in enumerate(ice)]
     terrain = mapdata.MapTerrain(record)
     _TERRAIN_CACHE[key] = terrain
     return terrain
@@ -7103,17 +7103,58 @@ class BotBreakableTests(TerrainMixin, BotFireRoom):
                          ledger.alive(self.terrain, now=516.0))
         self.assertIs(self.terrain, bot._terrain(self.room))
 
-    def test_a_human_grenade_is_recorded_too(self):
-        """★★★ 真人砸碎的那一下**也得记上**，否则 bot 以为路还堵着。"""
-        weapon = weapondata.get(1001030)
-        self.alice.peer_weapon = weapon
-        bot._note_peer_blast(self.room, self.alice, 680.0, 160.0, 99)
+    def test_a_human_break_is_read_straight_off_the_packet(self):
+        """★★★ 真人砸的那一下服务端**照包里的数扣**，不重算（§139）。
+
+        `rpSplashDamaged +4` 填的是破坏物的世界句柄，`+8` 是他那台机器
+        已经扣掉的伤害。不记这本账，他从洞里过去了 bot 还以为堵着。
+        """
+        handle = self.terrain.breakables[0].handle
+        self.assertTrue(bot._note_peer_breakable(self.room, handle, 20))
+        self.assertEqual(frozenset([0]), self.ledger().alive(self.terrain))
+        self.assertTrue(bot._note_peer_breakable(self.room, handle, 30))
         self.assertEqual(frozenset(), self.ledger().alive(self.terrain))
 
+    def test_a_splash_packet_for_a_mob_is_not_mistaken_for_ice(self):
+        """怪的句柄不能被当成破坏物 —— 它得继续走喂怪物表那一路。"""
+        self.assertFalse(bot._note_peer_breakable(self.room, 1100419, 20))
+
     def test_a_bot_shot_that_misses_the_ice_leaves_it_alone(self):
-        weapon = weapondata.get(1001030)
-        bot._blast_breakables(self.room, weapon, (200.0, 150.0), 99)
+        """炸在半张图外 —— 那 11 个采样点一个都碰不到它。"""
+        class _Shell(object):
+            handle = 200001
+
+        hits = bot._blast_breakables(self.room, self.bot_conn,
+                                     weapondata.get(1001030), _Shell(),
+                                     (200.0, 150.0))
+        self.assertEqual([], hits)
         self.assertEqual(frozenset([0]), self.ledger().alive(self.terrain))
+
+    def test_a_bot_break_is_broadcast_so_it_breaks_on_screen_too(self):
+        """★★★ bot 打碎的那一下**必须补发** `rpSplashDamaged`（§139）。
+
+        别人机器上跑不出这一下：那条遍历外面套着 `0x50d294`
+        =「这颗弹是我的 / 中立的吗」，bot 的弹两样都不是 ⇒ 整段跳过。
+        不补发，真人屏幕上的冰就永远不碎。
+        """
+        weapon = weapondata.get(1001030)
+
+        class _Shell(object):
+            handle = 200001
+
+        self.clear()
+        hits = bot._blast_breakables(self.room, self.bot_conn, weapon,
+                                     _Shell(), (680.0, 160.0))
+        self.assertTrue(hits, "砸在冰上却一件都没打到")
+        item, hurt, _where, _broke = hits[0]
+        self.assertGreater(hurt, 0)
+        splashes = [f for f in bot_frames(self.alice, self.bot_seat)
+                    if header(f)["opcode"] == botsync.OP_SPLASH_DAMAGED]
+        self.assertTrue(splashes, "没补发 rpSplashDamaged")
+        body = splashes[-1][12:]
+        target, = struct.unpack_from("<i", body, 4)
+        self.assertEqual(item.handle, target,
+                         "+4 该填破坏物的世界句柄")
 
     def test_the_route_is_dropped_when_the_terrain_flips(self):
         """★ 路线是在**上一份**地形上算出来的 —— 状态一翻就作废。"""

@@ -2185,22 +2185,28 @@ def _match_peer_shot(conn, bx, by):
     return (best[3], best[1], best[2])
 
 
-def _note_peer_blast(room, conn, bx, by, damage):
-    """真人打的这一发爆炸砸到可破坏物了没有（§138）。
+def _note_peer_breakable(room, handle, damage):
+    """真人报过来的这一发是不是打在**可破坏物**上（§139）。是就照它扣。
 
-    ★ 服务端必须自己记这本账：原版**一发同步包都没有**（见 `botbreak`
-      的文件头），每台客户端各自从同一批爆炸里算出同一个结果。
-      不记的话真人把冰砸开走过去了，bot 眼里那条路还堵着。
+    ★ 一个数都不用算：`rpSplashDamaged +8` 就是他那台机器**已经扣掉**的
+      伤害，`+4` 是破坏物的世界句柄（产物里那一格 `handle`）。
+      不记这本账的话，真人把冰砸开自己走过去了，bot 眼里那条路还堵着。
     """
-    if damage <= 0:
-        return
-    matched = _match_peer_shot(conn, bx, by)
-    weapon = None if matched is None else matched[0].weapon
-    if weapon is None:
-        weapon = getattr(conn, "peer_weapon", None)
-    if weapon is None:
-        return
-    _blast_breakables(room, weapon, (bx, by), damage)
+    ledger = _breakables(room)
+    if ledger is None or damage <= 0:
+        return False
+    terrain = mapdata.load(_current_map(room))
+    if terrain is None or not terrain.breakables:
+        return False
+    got = ledger.apply_broadcast(terrain, handle, damage)
+    if got is None:
+        return False
+    item, broke = got
+    if broke:
+        print(f"[{gameserver.ts()}]    破坏物碎了（真人打的）: 句柄 "
+              f"{item.handle} @ ({item.x}, {item.y})　"
+              f"{item.regen_ms / 1000.0:.0f} 秒后长回来", flush=True)
+    return True
 
 
 def note_peer_hit(room, conn, payload):
@@ -2246,10 +2252,6 @@ def note_peer_hit(room, conn, payload):
             return
         _handle, target, bx, by, _kind, _flags, damage = struct.unpack_from(
             "<iiffiif", body, 0)
-        # ★★★ **冰块 / 木箱**（§138）：真人打碎的那一下服务端也得记上，
-        #   否则他从洞里过去了、bot 还以为堵着。★ 排在 `target <= 0`
-        #   那道门**前面** —— 砸在冰上的那一发多半什么人都没打中。
-        _note_peer_blast(room, conn, bx, by, damage)
         if target <= 0 or damage <= 0:
             return
         source = "真人直接命中"
@@ -2278,6 +2280,11 @@ def note_peer_hit(room, conn, payload):
         push = (push_x, push_y)
         if botsync.handle_seat(target) is None:
             hit_x, hit_y = struct.unpack_from("<ff", body, 21)
+            # ★★★ 先问「是不是**可破坏物**」（§139）：原版的破坏物伤害走的
+            #   就是这一发，`+4` 填的是它的世界句柄。不先分流的话它会被
+            #   当成怪，喂进怪物表里一个根本不存在的位置。
+            if _note_peer_breakable(room, target, damage):
+                return
             note_mob_hit(room, target, hit_x, hit_y)
         _note_damage(room, botsync.handle_seat(target), damage)
     seat_index = botsync.handle_seat(target)
@@ -6198,34 +6205,49 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region):
     #   直接命中我，我身上的火焰也会持续造成伤害。」
     if not hit:
         _set_ground_on_fire(room, machine, weapon, point)
-    # ★★★ **冰块 / 木箱也吃这一发**（§138）：原版里破坏物和角色走同一条
-    #   伤害路（`0x480dfb`），打碎了那条路就通了。
-    _blast_breakables(room, weapon, point,
-                      damage if hit else weapon.damage_for("body"))
+    # ★★★ **冰块 / 木箱也吃这一发**（§139）：破坏物和角色走的是同一条
+    #   伤害路（`0x480dfb`），只是命中判据和半径不一样。
+    _blast_breakables(room, machine, weapon, shell, point)
     _split_shell(room, machine, shell, point, victim_seat)
 
 
-def _blast_breakables(room, weapon, point, damage):
-    """一发爆炸落在 `point`：范围内的可破坏物一起扣血（§138）。
+def _blast_breakables(room, machine, weapon, shell, point):
+    """一发爆炸落在 `point`：照原版判哪几件可破坏物挨到了（§139）。
 
-    作用半径用武器自己的 `SplashRange`（没有溅射的武器就是 0 = 只有
-    砸在它身上才算）。★ 伤害数字和打人是同一个 —— 原版里破坏物和角色
-    共用 `0x480dfb` 那条伤害路，没有第二套系数。
+    ## ★★★ 为什么非得**补发** `rpSplashDamaged`
+
+    别人机器上跑不出这一下：那条「炸到破坏物没有」的遍历
+    （`DamagingObj +0x11c` = `0x480469`）外面套着一道
+    `0x50d294` =「这颗弹是我的 / 中立的吗」。bot 的弹在真人那台机器上
+    两样都不是 ⇒ 整段跳过。所以**射手那台**（这里就是服务端）不补发，
+    真人屏幕上的冰就永远不碎，和服务端的模型对不上。
+
+    真人自己打的那一下不走这里 —— 他的客户端已经广播过了，
+    服务端在 `note_peer_hit()` 里照着扣就行。
     """
     ledger = _breakables(room)
-    if ledger is None or damage <= 0:
+    if ledger is None:
         return ()
     terrain = mapdata.load(_current_map(room))
     if terrain is None or not terrain.breakables:
         return ()
-    radius = float(getattr(weapon, "splash_range", 0.0) or 0.0)
-    broken = ledger.blast(terrain, point[0], point[1], radius, int(damage))
-    for index in broken:
-        item = terrain.breakables[index]
-        print(f"[{gameserver.ts()}]    破坏物碎了: #{index} @ "
-              f"({item.x}, {item.y})　{item.regen_ms / 1000.0:.0f} 秒后长回来",
-              flush=True)
-    return broken
+    splash_range = float(getattr(weapon, "splash_range", 0.0) or 0.0)
+    splash_damage = float(getattr(weapon, "splash_damage", 0.0) or 0.0)
+    hits = ledger.blast(terrain, point[0], point[1], splash_range,
+                        splash_damage, mult=_damage_scale(room),
+                        now=None)
+    for item, hurt, where, broke in hits:
+        # ★ 和打人那一发用同一个组包（`botsync.splash_body`）——
+        #   区别只是 `+4` 填的是**世界句柄**而不是角色句柄。
+        _emit(machine, machine.sync.event(
+            botsync.OP_SPLASH_DAMAGED,
+            botsync.splash_body(shell.handle, item.handle, hurt,
+                                where[0], where[1])))
+        if broke:
+            machine.log(f"   破坏物碎了: 句柄 {item.handle} @ "
+                        f"({item.x}, {item.y})　"
+                        f"{item.regen_ms / 1000.0:.0f} 秒后长回来")
+    return hits
 
 
 def _fire_wall_of(weapon):

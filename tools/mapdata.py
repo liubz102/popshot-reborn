@@ -74,7 +74,10 @@ DIR_TYPE = {"TERRAIN": 200, "LAYER": 202, "COVER": 201,
 #: 4：可破坏物改成**单独一层** `breakables`（位置 / 掩码 / 血量 / 恢复延迟），
 #:    `cells` 退回**不含它们**的原样网格 —— 服务端要按打没打碎动态合成
 #:    （V0.3 §138）。
-FORMAT = 4
+#: 5：破坏物多一格 `handle` = 它的**世界句柄**（V0.3 §139）。
+#:    `rpSplashDamaged +4` 填的就是它 —— 服务端靠它认「真人把哪块打碎了」，
+#:    也靠它让 bot 打碎的那一下在别人屏幕上也生效。
+FORMAT = 5
 
 #: ★★★ **可破坏物**（`Maps/*/Breakable/*.png`，客户端类 `BreakableObj`）。
 #: 全 174 张图里共 677 个，分布在 67 张图上。
@@ -227,12 +230,16 @@ def parse_map(path):
         for _ in range(r.i32()):
             if ver >= 13:
                 otype = r.i32()
-                r.i32()
+                # ★★ 第 2 个 i32 = **世界句柄**（§139）。客户端把它原样
+                #    传给对象工厂（`0x4746d5 -> 0x513278`），对象存进
+                #    `[this+0xd0]`，`rpSplashDamaged +4` 填的就是它。
+                handle = r.i32()
                 blob = r.raw(r.i32())
                 obj, left = _read_obj_blob(blob, ver)
                 obj["type"] = otype
+                obj["handle"] = handle
             else:
-                r.i32()
+                handle = r.i32()      # v<13：句柄在记录最前面
                 if ver >= 9:
                     r.wstr()       # 名字
                 else:
@@ -242,7 +249,7 @@ def parse_map(path):
                 blob = r.raw(r.i32())
                 _unused, left = _read_obj_blob(blob, ver)
                 obj = {"type": _type_from_path(tex), "path": tex,
-                       "x": pos[0], "y": pos[1]}
+                       "x": pos[0], "y": pos[1], "handle": handle}
             # ★ 每类对象自己那几个字段就躺在 blob 的**尾巴**上（基类解完之后
             #   剩下的）。弹跳台（210）用的是最后两个 float，见 `JUMP_PAD_TYPE`。
             obj["tail"] = blob[len(blob) - left:] if left else b""
@@ -331,6 +338,7 @@ def collect_breakables(width, height, objects, masks):
         if len(tail) >= 8:
             regen = struct.unpack_from("<i", tail, 4)[0]
         out.append(collections.OrderedDict((
+            ("handle", int(obj.get("handle", 0))),
             ("x", int(round(obj["x"]))),
             ("y", int(round(obj["y"]))),
             ("w", mask["width"]),
