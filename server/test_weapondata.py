@@ -249,6 +249,62 @@ class RealTableTests(unittest.TestCase):
             self.assertEqual(weapon.raw["slice_time"] // 32, weapon.fuse_ticks)
         self.assertEqual(fused, seen)
 
+    def test_quest_weapons_carry_their_quest_and_difficulty(self):
+        """★★★ 每关的怪 / boss 武器表（§141）：**`(关卡, 难度, id)` 三维查**。
+
+        这些 id 是关卡内局部的（`2003010` 在 Quest02..Quest07 里是不同的
+        枪），四个难度各一份、**连弹速都不同** —— 全局按 id 查必然给错的
+        数值。载具 boss 替发的 `rpFire` 用这批 id：`note_peer_fire` 解不出
+        武器的话整包丢掉，boss 的枪口坐标流（它位置的唯一网络来源）和
+        「躲 boss 子弹」一起没。★ 它们**不是任何角色的槽位**，不在主表
+        `weapons` 里，永远进不了 `usable`（bot 换不到怪枪）。
+        """
+        easy = weapondata.get_quest(3003010, 3, 1)   # quest03 Boss-HeadFire
+        self.assertIsNotNone(easy, "quest3 难度1 的 3003010 不在表里")
+        self.assertAlmostEqual(14.0, easy.velocity, places=3)
+        self.assertAlmostEqual(25.0, easy.damage, places=3)
+        hard = weapondata.get_quest(3003010, 3, 3)
+        self.assertIsNotNone(hard)
+        self.assertAlmostEqual(17.0, hard.velocity, places=3,
+                               msg="难度之间连弹速都不同（14 -> 17）")
+        self.assertIsNone(weapondata.get(3003010),
+                          "关卡武器不在主表里，只能带关卡+难度查")
+        # 同一个 id 在别的关卡是别的枪。
+        self.assertIsNotNone(weapondata.get_quest(2003020, 2, 1))
+        self.assertIsNotNone(weapondata.get_quest(2003020, 7, 1))
+        usable = {str(w) for w in weapondata.usable()}
+        for ammo in ("3003010", "3003020", "2003020"):
+            self.assertNotIn(ammo, usable,
+                             "%s 是怪/boss 的枪，bot 不许用" % ammo)
+
+    def test_quest_overlays_apply_on_top_of_the_main_definition(self):
+        """★★★（二次复审）重号的 8 个怪武器 id：quest 节是主表的**增量覆盖**。
+
+        提取时在原始字段层合并（主表节做底、quest 字段盖上）：
+        * Quest03 简单的 `2003010` 是 **弹速 5 / 伤害 6** —— 主表那份是
+          弹速 3 / 伤害 8，先查主表的话永远拿不到关卡数值（reviewer 的复现）；
+        * quest 节没写的字段**继承主表**（`2003000` 的 Velocity / CreatingClass），
+          否则 436 份变体里 188 份没有 `CreatingClass`、84 份弹速会变 0；
+        * 主表本身一个字都不动（非闯关上下文的兜底还是它）。
+        """
+        overlay = weapondata.get_quest(2003010, 3, 1)
+        self.assertIsNotNone(overlay)
+        self.assertAlmostEqual(5.0, overlay.velocity, places=3,
+                               msg="Quest03 简单的 Soldier-Pistol 弹速是 5")
+        self.assertAlmostEqual(6.0, overlay.damage, places=3,
+                               msg="……伤害是 6，不是主表的 8")
+        self.assertEqual("GeneralBullet", overlay.creating_class,
+                         "quest 节没写 CreatingClass，从主表那节继承")
+        melee = weapondata.get_quest(2003000, 3, 1)
+        self.assertAlmostEqual(1.0, melee.velocity, places=3,
+                               msg="quest 节没写 Velocity，从主表那节继承")
+        self.assertAlmostEqual(10.0, melee.damage, places=3,
+                               msg="伤害用 quest 覆盖的 10，不是主表的 5")
+        main = weapondata.get(2003010)
+        self.assertAlmostEqual(3.0, main.velocity, places=3)
+        self.assertAlmostEqual(8.0, main.damage, places=3,
+                               msg="主表那份不动 —— 非闯关上下文的兜底")
+
     def test_the_uppercase_sections_are_not_dropped(self):
         """★ `[CH01-01]` / `[CH03-01]` 这两个大写节的回归钉子（§45）。"""
         for ammo in (1001010, 1003010):

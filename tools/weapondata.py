@@ -58,7 +58,18 @@ ROOT = os.path.dirname(HERE)
 #:   `slice_angle_base` / `slice_angle_random`，§81）。
 #: ★ 8（会话 37）：新增 `force_ms` / `force_count` —— 地上捡来那把枪
 #:   **用多久就还原**（§115）。
-FORMAT = 8
+#: ★ 9（会话 44）：并入**每关自己的武器表** `Data/Quest/QuestNN/weapon-N.ini`
+#:   （小怪 `Soldier-*` 2003xxx / boss `Boss-*` 3003xxx，§141）。
+#: ★ 10（会话 44 复审）：quest 武器改成 **`(关卡, 难度, id)` 三维存**
+#:   `quest_weapons`—— 这些 id 是**关卡内局部**的（`2003010` 在
+#:   Quest02..Quest07 里是不同的枪），难度之间**连弹速都不同**
+#:   （Boss-Jiksa 12→23）。全局按 id 先到先得会把错的数值给所有人。
+#: ★ 11（会话 44 二次复审）：quest 节是主表的**增量覆盖**，不是完整定义
+#:   —— 重号的 8 个 id（`Soldier-*` / `Cannon-Bullet`）在 quest 文件里
+#:   只有数值那几格（436 份变体里 188 份缺 `CreatingClass`、84 份缺
+#:   `Velocity`），单独成记录弹速会变 0。提取时先按 `Id` 找到主表那节的
+#:   **原始字段**做底、quest 字段盖上去，再 `build_record`。
+FORMAT = 11
 
 #: 节名 `chNNN-MM…`：NNN = 角色 id，MM = 武器序号。
 #: ★ 后面还可能跟 `SE` / `D1` / `R1` / `F1` / `a` / `Classic` 之类的后缀 ——
@@ -167,7 +178,13 @@ def read_ini(path):
     elif raw[:3] == b"\xef\xbb\xbf":
         text = raw.decode("utf-8-sig", "replace")
     else:
-        text = raw.decode("cp936", "replace")
+        # ★ 单字节的两种都出现过：韩文原版（CP949）和中文代理版（CP936）。
+        #   先按 CP949 严格解，解不动再退 CP936 —— 键和值都是 ASCII，
+        #   编码只影响注释，但注释里混进乱码字符有可能破坏解析。
+        try:
+            text = raw.decode("cp949")
+        except UnicodeDecodeError:
+            text = raw.decode("cp936", "replace")
 
     sections = collections.OrderedDict()
     current = None
@@ -479,6 +496,38 @@ def find_weapon_ini(explicit=None):
           " --ini D:\\git\\popshot-reborn\\main\\Pack_decrypt\\Data\\weapon.ini")
 
 
+def find_quest_weapon_inis(weapon_ini_path):
+    """`Data/Quest/QuestNN/weapon-N.ini` —— **每关自己的怪 / boss 武器表**（§141）。
+
+    小怪（`Soldier-*`，`Id` 2003xxx）和 boss（`Boss-*`，`Id` 3003xxx）的枪
+    全在这批文件里，主 `weapon.ini` 一把都没有。
+
+    ★★ 这些 id 是**关卡内局部**的：`2003010` 在 Quest02..Quest07 里是不同
+      的枪；同一个 id 四个难度各一份、**连弹速都不同**（Boss-Jiksa
+      12→23）。客户端进图时只加载「该关卡该难度」那一份按局部 id 解析
+      —— 所以产物按 `(关卡号, 难度, id)` 三维存（`quest_weapons`），
+      服务端查表带房间上下文（`bot._quest_weapon`）。
+
+    ★ 这些武器进产物只是为了让服务端**认得出**（`note_peer_fire` 解弹速、
+      重建威胁；boss 的枪口坐标是它位置的唯一网络来源）。它们不是
+      任何角色的槽位（`character = None`），`_is_usable` 第一条就进不了
+      `usable`，bot 永远换不到它们。
+    """
+    quest_root = os.path.join(os.path.dirname(os.path.abspath(weapon_ini_path)),
+                              "Quest")
+    out = []
+    if not os.path.isdir(quest_root):
+        return out
+    for name in sorted(os.listdir(quest_root)):
+        folder = os.path.join(quest_root, name)
+        if not os.path.isdir(folder):
+            continue
+        for entry in sorted(os.listdir(folder)):
+            if re.match(r"weapon-\d+\.ini$", entry, re.IGNORECASE):
+                out.append(os.path.join(folder, entry))
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="从原版 weapon.ini 提取武器表")
     ap.add_argument("--ini", help="weapon.ini 的路径")
@@ -499,6 +548,52 @@ def main(argv=None):
     if not weapons:
         raise SystemExit("%s 里一把带 Id 的武器都没有" % path)
 
+    # ★★ 每关自己的怪 / boss 武器表按 `(关卡, 难度, id)` 三维存（§141）。
+    #    这些 id 是**关卡内局部**的（2003010 在 Quest02..07 里是不同的枪），
+    #    难度之间连弹速都不同 —— 全局按 id 合并必然把错的数值给一部分人。
+    #
+    #    ★★ quest 节是主表的**增量覆盖**：8 个重号 id（`Soldier-*` /
+    #    `Cannon-Bullet`）在 quest 文件里只改数值那几格，`CreatingClass` /
+    #    `Velocity` 这些"飞行要用的"字段在主表那节里。所以**在原始 INI
+    #    字段层合并**（主表节做底、quest 字段盖上去）再建记录 —— 直接
+    #    `build_record(quest 节)` 的话 188 份变体缺 `CreatingClass`、
+    #    84 份缺 `Velocity`，单独读弹速就是 0。
+    main_fields_by_id = {}
+    for _section, _fields in sections.items():
+        _ammo = _num(_fields.get("Id"), int)
+        if _ammo is not None:
+            main_fields_by_id[str(_ammo)] = _fields   # 后读盖先读，同 build_table
+    quest_table = collections.OrderedDict()
+    quest_variant_count = 0
+    for quest_path in find_quest_weapon_inis(path):
+        folder = os.path.basename(os.path.dirname(quest_path))
+        folder_match = re.match(r"[Qq]uest(\d+)$", folder)
+        diff_match = re.match(r"weapon-(\d+)\.ini$",
+                              os.path.basename(quest_path), re.IGNORECASE)
+        if folder_match is None or diff_match is None:
+            continue
+        quest_no = str(int(folder_match.group(1)))
+        difficulty = diff_match.group(1)
+        try:
+            quest_sections = read_ini(quest_path)
+        except WeaponDataError as exc:
+            print("⚠ 跳过 %s：%s" % (quest_path, exc))
+            continue
+        for section, fields in quest_sections.items():
+            ammo = _num(fields.get("Id"), int)
+            if ammo is None:
+                continue
+            merged = dict(main_fields_by_id.get(str(ammo), {}))
+            merged.update(fields)
+            record = build_record(section, merged)
+            if record is None:
+                continue
+            by_quest = quest_table.setdefault(quest_no, collections.OrderedDict())
+            by_id = by_quest.setdefault(str(record["id"]),
+                                        collections.OrderedDict())
+            by_id[difficulty] = record
+            quest_variant_count += 1
+
     table = collections.OrderedDict((
         ("format", FORMAT),
         ("source", os.path.basename(path)),
@@ -507,6 +602,9 @@ def main(argv=None):
         ("preferred", preferred),
         ("usable", usable),
         ("weapons", weapons),
+        # ★ 关卡怪 / boss 武器：`{关卡号: {ammo_id: {难度: 记录}}}`（§141）。
+        #   不在 `weapons` 里 —— id 是关卡内局部的，只能带房间上下文查。
+        ("quest_weapons", quest_table),
     ))
     out_dir = os.path.dirname(out_path)
     if out_dir and not os.path.isdir(out_dir):
@@ -530,9 +628,10 @@ def main(argv=None):
 
     if not args.quiet:
         size = os.path.getsize(out_path)
-        print("完成：%d 把武器（%d 个角色、%d 把可用）-> %s（%.1f KB）"
+        print("完成：%d 把武器（%d 个角色、%d 把可用、另有 %d 份关卡怪/boss "
+              "武器变体按 关卡×难度 存）-> %s（%.1f KB）"
               % (len(weapons), len(by_character), len(usable),
-                 out_path, size / 1024.0))
+                 quest_variant_count, out_path, size / 1024.0))
         missing = [c for c in by_character if c not in preferred]
         if missing:
             print("   ⚠ 这些角色一把可用武器都没有，它们的 bot 不会开火："

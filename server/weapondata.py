@@ -41,7 +41,15 @@ import os
 #: ★ 7（会话 24）：新增分裂弹的碎片那几格（`slice_count` / `slice_angle` /
 #:   `slice_angle_base` / `slice_angle_random`，§81）。
 #: ★ 8（会话 37）：新增 `force_ms` / `force_count`（§115）。
-FORMAT = 8
+#: ★ 9（会话 44）：并入每关的怪 / boss 武器表（§141）。bot 用不到它们，
+#:   但 `note_peer_fire` 要认得出 —— boss 替发的 `rpFire` 得解出弹速。
+#: ★ 10（会话 44 复审）：quest 武器改成 `(关卡, 难度, id)` 三维
+#:   `quest_weapons` —— id 是**关卡内局部**的、难度之间连弹速都不同，
+#:   查表用 `get_quest()` 带房间上下文。
+#: ★ 11（会话 44 二次复审）：quest 节是主表的**增量覆盖**（重号 id 只带
+#:   数值那几格）—— 提取时在原始字段层和主表那节合并成完整记录。
+#:   查询顺序：**quest（关卡+难度）优先，主表兜底**。
+FORMAT = 11
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "bot_weapons.json")
@@ -376,6 +384,25 @@ class _Store(object):
         self._cache[key] = weapon
         return weapon
 
+    def get_quest(self, ammo_id, quest, difficulty):
+        """★ 关卡怪 / boss 的枪：按 `(关卡号, 难度, id)` 三元组查（§141）。
+
+        这些 id 是**关卡内局部**的（`2003010` 在 Quest02..Quest07 里是
+        不同的枪），四个难度各一份、**连弹速都不同**（Boss-Jiksa
+        12→23）—— 全局按 id 查必然拿到错的数值。不在 `weapons` 里，
+        也永远不进 `usable` / `by_character`。
+        """
+        key = ("quest", str(int(quest)), str(int(difficulty)), str(ammo_id))
+        if key in self._cache:
+            return self._cache[key]
+        raw = (self.table().get("quest_weapons", {})
+               .get(str(int(quest)), {})
+               .get(str(ammo_id), {})
+               .get(str(int(difficulty))))
+        weapon = None if raw is None else Weapon(raw)
+        self._cache[key] = weapon
+        return weapon
+
     def preferred_for(self, character_id):
         """这个角色该给 bot 配哪把枪；没有可用的返回 `None`。
 
@@ -421,6 +448,11 @@ STORE = _Store()
 def get(ammo_id):
     """按 ammo_id 取一把武器；表里没有返回 `None`（**调用方必须能接受**）。"""
     return STORE.get(ammo_id)
+
+
+def get_quest(ammo_id, quest, difficulty):
+    """关卡怪 / boss 的枪，按 `(关卡号 1..7, 难度 1..4, id)` 查；没有返回 `None`。"""
+    return STORE.get_quest(ammo_id, quest, difficulty)
 
 
 def preferred_for(character_id):

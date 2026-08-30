@@ -50,6 +50,7 @@ import contextlib
 import math
 import os
 import random
+import re
 import struct
 import threading
 import time
@@ -358,10 +359,13 @@ class BotConn(gameserver.Conn):
         #:   「掉队了」（日志按这个状态翻转去重）；`leash_mark` = 掉队以来
         #:   自己沿前进轴走到过的**最靠前**的地方；`leash_gap` = 掉队那一刻
         #:   的差距。后两个凑起来判「按着方向键却一步都没往前挪」。
-        #:   归队就一起清掉。
+        #:   `leash_anchor` = 掉队那一刻**带头的人**的位置（§141）—— 他又
+        #:   往前走满一整屏而我还掉着队，就是「追不上」（极速相同，差距
+        #:   冻结），该瞬移了。归队就一起清掉。
         self.leash_lagging = False
         self.leash_mark = None
         self.leash_gap = 0.0
+        self.leash_anchor = None
         #: 这一帧是否在按 ↓ 穿单向平台。物理层读 `want_drop`，心跳层把它
         #: 翻成 `botsync.KEY_DOWN`；两边必须来自同一个决定。
         self.move_down = False
@@ -597,6 +601,7 @@ class BotConn(gameserver.Conn):
         self.leash_lagging = False
         self.leash_mark = None
         self.leash_gap = 0.0
+        self.leash_anchor = None
         self.move_down = False
         self.last_trail_mark = None
         self.load_progress = None
@@ -1959,6 +1964,14 @@ BOT_PEER_SHOT_TOLERANCE = 120.0
 #: 30（§42 末尾那条勘误），两个都收着。
 MOB_FIRE_SOURCES = (20, 30)
 
+#: ★★ 怪 / boss 替发的 `rpFire`，枪口坐标归给「最近的那只已知怪」的距离上限。
+#:
+#: 载具 boss 的部件（`MachineGun` / `Cannon1` / `Cannon2`…）各有各的枪口，
+#: 但都装在同一台车上 —— 实机（2026-08-30 第四轮，§141）量下来：
+#: 机关枪 (871.7, 430.0)、炮 (765.9, 517.9)，两个部件相距 **106**，
+#: 本体行（真人第一发命中建的）到部件枪口 ~100。300 够把整车都归进去。
+MOB_GUN_REACH = 300.0
+
 #: ★ 判「打没打中怪」用的碰撞半径。`Mob.ini` 24 个怪里 **9 个是 40**
 #: （唯一的众数；15 和 65 各只有一只），而服务端**没法把句柄映射回怪的类型**
 #: —— 那要连刷怪组和关卡脚本一起解。所以统一按众数算。
@@ -1997,6 +2010,18 @@ def note_ai_message(room, handle, fields):
     table = getattr(quest, "mobs", None) if quest is not None else None
     if table is None or not handle:
         return
+    # ★★ **boss 房是从这一发认出来的**（§141）：进 boss 图时控制者广播
+    #    `fileName=data/quest/questNN/questNNSxboss.ini` + `type=start`
+    #    （普通关卡的 `questNNS1enemy.ini` / `questNNS1clear.ini` 也是一个
+    #    格式，靠文件名里的 `boss` 分）。置起 `quest.boss_room` 之后
+    #    牵引绳 / 跟随点整条停用，bot 只管打 boss。
+    name = fields.get("fileName") or ""
+    if name and fields.get("type") == "start":
+        if "boss" in name.lower() and not getattr(quest, "boss_room", False):
+            quest.boss_room = True
+            print(f"[{gameserver.ts()}]    进入 boss 房（{name}）—— "
+                  f"牵引绳停用，bot 只管打 boss", flush=True)
+        return
     if fields.get("msgType") != AI_MSG_STATE:
         return
     if fields.get("state") == AI_STATE_DEATH:
@@ -2021,6 +2046,50 @@ def _ai_float(fields, key, fallback=None):
         return fallback
 
 
+def note_mob_gun_muzzle(room, x, y):
+    """★★★ 怪 / boss 的枪响了 —— 枪口坐标是一次**它的位置采样**（§141）。
+
+    ## 这就是「不报坐标的那族 boss」的位置同步
+
+    用户 2026-08-30 第四轮：「真人是可以合作打 boss 的，所有人都能同步
+    看到 boss 的状态和招式，既然真人能合作，那一定有某种 boss 状态同步
+    机制。」—— **他是对的**，机制分两层：
+
+    * **招式 / 阶段**：`rpAiMsg` 的 `setState` 广播 `phase` / `state`
+      （`machinegun` / `cannon1` / `move`… 都是招式名），各客户端**本地
+      锁步演播**动画 —— 这就是「所有人都看得到 boss 在挥什么招」；
+    * **位置**：两族 boss 两种做法 ——
+      * 报坐标的（语料 Quest02 的吊车 boss，62 发里 23 发带 `posX`）
+        直接随 `setState` 广播；
+      * **载具 boss 那一族**（quest02 的 `jiksa/melee/powerwave`、
+        quest03 的 `machinegun/cannon1/cannon2`，和 §141 实机那场同族）
+        `setState` **从不带 posX** —— 但它们的枪是**控制者机器替它发的**
+        （`rpFire body+0 == 20`），**每一发都带着部件的世界坐标**
+        （实机 35 发机关枪 / 炮，全钉在 (871.7, 430.0) 和
+        (765.9, 517.9) 两个部件上）。位置同步就在这条流里。
+
+    ## 归属
+
+    `rpFire` 里没有怪的句柄，归给**怪物表里离枪口最近的那只**
+    （`MOB_GUN_REACH` 以内才算 —— 部件都装在同一台车上）。
+    boss 房里一只都还不知道（真人还没打中过）就把最近一次枪口存进
+    `quest.boss_gun`：开不了枪（没有句柄），但 bot 的走位目标有了。
+    """
+    quest = None if room is None else room.quest
+    table = getattr(quest, "mobs", None) if quest is not None else None
+    if table:
+        best = None
+        for handle, row in table.items():
+            span = math.hypot(row[0] - x, row[1] - y)
+            if best is None or span < best[0]:
+                best = (span, handle, row)
+        if best is not None and best[0] <= MOB_GUN_REACH:
+            best[2][0], best[2][1] = float(x), float(y)
+            return
+    if _boss_room(room):
+        quest.boss_gun = (float(x), float(y))
+
+
 def _ai_int(fields, key, fallback=None):
     try:
         return int(fields[key])
@@ -2028,18 +2097,49 @@ def _ai_int(fields, key, fallback=None):
         return fallback
 
 
-def note_mob_hit(room, handle, x, y):
+def _is_breakable_handle(room, handle):
+    """这个句柄是不是**当前这张图**上的一件可破坏物。
+
+    破坏物的世界句柄是 `.map` 里原样抽出来的（`terrain.breakables`，
+    §136 / §139）—— 拿它当过滤器，`rpExplode` 打中的非玩家句柄就能分清
+    「箱子」和「怪 / boss」了。
+    """
+    terrain = _terrain(room)
+    items = getattr(terrain, "breakables", ()) if terrain is not None else ()
+    return any(item.handle == handle for item in items)
+
+
+def note_mob_hit(room, handle, x, y, create=False):
     """有人打中了这只怪 —— 爆点是一次**额外的**位置采样（免费的精度）。
 
-    ★ 只更新**已经在表里**的怪：`rpExplode` 打中的「非玩家句柄」里还混着
-    破坏物之类的世界对象（语料里 509 个非玩家目标，只有 261 个在 AI 流里
-    出现过），凭它建表会把箱子当成怪。
+    ★ 只更新**已经在表里**的怪（`create=False`，默认）：`rpExplode` 打中的
+      「非玩家句柄」里还混着破坏物之类的世界对象（语料里 509 个非玩家
+      目标，只有 261 个在 AI 流里出现过），凭它建表会把箱子当成怪。
+
+    ★★ `create=True`（§141）：**boss 从来不广播坐标** —— 它的 `setState`
+      只带 `phase` / `state`（实机整场 72 发一发 posX 都没有），AI 流里
+      永远等不到它。但它会**被打中**：每一发直接命中都是一次「它在哪」
+      的采样，而且句柄就是收方扣血用的那个（=AI 句柄 +1，部件各自一个）。
+      ★ 建表**只在 boss 房里放行**：普通关卡里的怪全部走 AI 流（§125），
+      而命中的「非玩家句柄」里除了怪和可破坏物还混着**别的世界对象**
+      （机关 / 场景物）—— boss 房里那些都是要打的 boss 部件，普通关卡里
+      建出来的只可能是鬼目标。破坏物两头都靠 `.map` 里的世界句柄表分流。
     """
     quest = None if room is None else room.quest
     table = getattr(quest, "mobs", None) if quest is not None else None
-    if not table or handle not in table:
+    if table is None or not handle:
+        # ★ `is None` 而不是 `not table`：空表也要进得来 —— 建表（`create`）
+        #   恰恰发生在表还空着的时候（§141：boss 房的第一发命中）。
         return
-    row = table[handle]
+    row = table.get(handle)
+    if row is None:
+        if (not create or not _boss_room(room)
+                or _is_breakable_handle(room, handle)):
+            return
+        table[handle] = [float(x), float(y), None, None]
+        print(f"[{gameserver.ts()}]    见到怪（命中建表）: 句柄 {handle} "
+              f"@ ({float(x):.0f}, {float(y):.0f})", flush=True)
+        return
     row[0], row[1] = float(x), float(y)
 
 
@@ -2116,6 +2216,38 @@ class PeerShot(object):
         self.serial = PeerShot._next_serial
 
 
+def _quest_weapon(room, ammo):
+    """按 id 查一把武器 —— **怪 / boss 的枪优先查「当前关卡 + 难度」**（§141）。
+
+    `Data/Quest/QuestNN/weapon-N.ini` 的 id 是**关卡内局部**的：
+    `2003010` 在 Quest02..Quest07 里是不同的枪；同一个 id 四个难度各一份、
+    **连弹速都不同**（Boss-Jiksa 12→23）。客户端进图时只加载「该关卡该
+    难度」那一份照局部 id 解析 —— 服务端照同一个口径查：**quest 三维表
+    优先，查不到才退主表**。
+
+    ★★ 为什么 quest 在前（二次复审抓的）：主表里本来就有 8 个怪武器 id
+      （`Soldier-*` / `Cannon-Bullet`），quest 文件是对它们的**增量覆盖**
+      —— Quest03 简单的 `2003010` 是弹速 5 / 伤害 6，主表那份是
+      弹速 3 / 伤害 8。先查主表的话这 8 个 id 永远拿不到关卡数值。
+    """
+    if room is not None:
+        name = gameserver.current_map_name(room) or ""
+        prefix = re.match(r"[Qq]uest(\d+)", name)
+        difficulty = gameserver.room_difficulty(room)
+        if difficulty is None:
+            # 描述符参数缺失时退「地图名后缀」—— `current_map_name` 补的就是它。
+            for number, suffix in mapdata.DIFFICULTY_SUFFIX.items():
+                if name.endswith(suffix):
+                    difficulty = number
+                    break
+        if prefix is not None and difficulty is not None:
+            weapon = weapondata.get_quest(ammo, int(prefix.group(1)),
+                                          difficulty)
+            if weapon is not None:
+                return weapon
+    return weapondata.get(ammo)
+
+
 def note_peer_fire(conn, body, room=None):
     """记一发 `rpFire`（§92）。解不出武器就不记。
 
@@ -2127,7 +2259,12 @@ def note_peer_fire(conn, body, room=None):
         return
     source = body[0]
     ammo, fx, fy, angle, power = struct.unpack_from("<iffff", body, 2)
-    weapon = weapondata.get(ammo)
+    if source in MOB_FIRE_SOURCES:
+        # ★★ 位置采样**排在武器解析前面**（§141）：怪 / boss 的枪一响，
+        #    枪口坐标就是它此刻的位置 —— 就算这把枪不在武器表里
+        #    （认不出弹速、躲不了它），这条坐标流也不能丢。
+        note_mob_gun_muzzle(room, fx, fy)
+    weapon = _quest_weapon(room, ammo)
     if weapon is None:
         return
     shots = getattr(conn, "peer_shots", None)
@@ -2271,7 +2408,9 @@ def note_peer_hit(room, conn, payload):
         #   事实（§42 收方原样扣），和「配不配得上某一发 rpFire」无关。
         if botsync.handle_seat(target) is None:
             # ★ 打中的不是玩家座位 ⇒ 爆点是那只怪的一次额外位置采样（§125）。
-            note_mob_hit(room, target, bx, by)
+            #   `create=True`：boss 从不广播坐标，直接命中是它唯一的
+            #   位置来源（§141）；破坏物在里面被分流。
+            note_mob_hit(room, target, bx, by, create=True)
         _note_damage(room, botsync.handle_seat(target), damage)
         velocity = _peer_shot_velocity(conn, bx, by)
         if velocity is None:
@@ -2297,7 +2436,7 @@ def note_peer_hit(room, conn, payload):
             #   当成怪，喂进怪物表里一个根本不存在的位置。
             if _note_peer_breakable(room, target, damage):
                 return
-            note_mob_hit(room, target, hit_x, hit_y)
+            note_mob_hit(room, target, hit_x, hit_y, create=True)
         _note_damage(room, botsync.handle_seat(target), damage)
     seat_index = botsync.handle_seat(target)
     if seat_index is None:
@@ -3950,7 +4089,9 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     # ★★★★ **牵引绳排在最前面**（D99）：闯关时落后带头的真人超过 3/4 个
     #   屏幕就无条件追，连躲子弹都往后排 —— 掉队的那一个会把整队的扇区
     #   进度钉死，比挨几枪严重得多。没掉队时它返回 None，下面照旧。
-    if coop:
+    #   ★ boss 房里它**整条不生效**（§141）：那儿没有进度可推，
+    #   bot 只管打 boss（用户 2026-08-30 第四轮实机）。
+    if coop and not _boss_room(room):
         leash = _coop_leash_intent(room, machine, seat_index, terrain)
         if leash is not None:
             return leash
@@ -4139,6 +4280,16 @@ BOT_VIEWPORT_WIDTH = 1024.0
 #:   的进度钉住，「拖进度」比「像不像真人」严重得多。
 BOT_COOP_LEASH = BOT_VIEWPORT_WIDTH * 0.75
 
+#: ★★ 掉队之后要追回到多近才算「归队」—— 比触发线**更紧**的滞回（§141）。
+#:
+#: 实机（2026-08-30 第四轮）量出来的事实：bot 和带头的真人**极速相同**
+#: （都是 `FastRunRate` 1.5 倍走速），差距一旦拉开，双方都在冲刺时它就
+#: **冻结**，永远缩不回 768 以内 —— bot 全程钉在 749~828 之间、每 130ms
+#: 在「掉队 / 归队」之间翻转一次，恰好停在把镜头钉死的那个位置上。
+#: 触发线和释放线分开之后：掉队中的 bot 要追到**半屏以内**才撒手，
+#: 「掉队了」是一个稳定的区间而不是一条会抖的线。
+BOT_COOP_LEASH_RELEASE = BOT_VIEWPORT_WIDTH * 0.5
+
 
 def _quest_forward(terrain):
     """闯关图的「前方」是 +x 还是 −x —— 拿**出生点**问出来的。
@@ -4196,6 +4347,9 @@ def _coop_goal(room, machine, seat_index, terrain):
 def _coop_intent(room, machine, seat_index, terrain, target):
     """闯关模式这一帧往哪走（M5-G）。"""
     body = machine.body
+    if _boss_room(room):
+        # ★ boss 房里没有「跟上队伍」这回事 —— 朝 boss 打（§141）。
+        return _boss_fight_intent(room, machine, seat_index, terrain, target)
     spot = _coop_goal(room, machine, seat_index, terrain)
     if spot is None:
         _clear_navigation(machine)
@@ -4220,6 +4374,63 @@ def _may_fast_run(machine):
     return (machine.stamina is None
             or machine.stamina > _stamina_props().fast_run_sp_cost
             * botmove.TICKS_PER_BEAT)
+
+
+def _boss_room(room):
+    """这一局是不是在 boss 房里（§141）。
+
+    进 boss 图那一刻控制者会广播 `fileName=data/quest/questNN/
+    questNNSxboss.ini` + `type=start`（`note_ai_message` 看到就把
+    `quest.boss_room` 置起来，换图跟着清）。boss 房里没有「往前推进」
+    这回事 —— 门要等 boss 死才开，把带头的人押在身上没意义。
+    """
+    quest = None if room is None else room.quest
+    return bool(getattr(quest, "boss_room", False))
+
+
+def _nearest_mob(room, body):
+    """离 `body` 最近的那个已知怪的位置；一只都不知道返回 `None`。"""
+    mobs = live_mobs(room)
+    if not mobs or body is None:
+        return None
+    row = min(mobs, key=lambda m: math.hypot(m[0] - body.x, m[1] - body.y))
+    return (float(row[0]), float(row[1]))
+
+
+def _boss_fight_intent(room, machine, seat_index, terrain, target):
+    """★ boss 房里这一帧往哪走：**朝着 boss 打，不跟人**（§141）。
+
+    用户 2026-08-30 第四轮实机：「bot 进入 boss 房间后，就没必要再有推进
+    进度的限制了，因为 boss 房间内只需要打 boss，不需要推进进度。」
+
+    规则还是 `_move_intent` 那两条，只是目标从「带头的人」换成 boss：
+    **打得到就站住打，打不到就朝它走过去**。
+    boss 的位置来自**命中的采样**（`note_mob_hit`，§141）—— boss 的
+    `setState` 从来不带 posX，真人打中它的每一发都在替我们量它在哪。
+    还没人打中过它（表是空的）就朝它最近一次开枪的位置走
+    （`quest.boss_gun`），连枪都没开过才站住等。
+
+    ★★ 「打得到」的判据就是**这一帧真的有得打**：`target` 是
+      `_fire_target()` 的结果（弹道解得出来 / 引信飞得到 / 地形不挡 /
+      看得见，全在里面），不是「距离够近 + 屏幕内」—— 隔着掩体站住
+      会**永远开不了枪**还站着不动（复审抓的就是这个）。和对战房
+      「打得到就站住打」同一条规则、同一个来源。
+    """
+    body = machine.body
+    if target is not None:
+        _clear_navigation(machine)
+        return (0, False, False, False)
+    spot = _nearest_mob(room, body)
+    if spot is None:
+        # 一只都还不知道（真人还没打中过 boss）—— 但它可能**已经开过枪**
+        # （`quest.boss_gun`，替它发的 `rpFire` 枪口，§141）。
+        # 开不了枪（没有句柄），至少走位该朝它去。
+        quest = None if room is None else room.quest
+        spot = getattr(quest, "boss_gun", None)
+    if spot is None:
+        _clear_navigation(machine)
+        return (0, False, False, False)
+    return _walk_to(room, machine, terrain, spot, False)
 
 
 # ---------------------------------------------------------------------------
@@ -4256,7 +4467,7 @@ def _coop_leash_intent(room, machine, seat_index, terrain):
 
     ## 「走不过去」是怎么判的 —— **事件，不是计时器**（铁律 10）
 
-    两条，任一条成立就算：
+    三条，任一条成立就算：
 
     * **规划器把话说死了**：`botnav.plan()` 泛洪完整个可达分量之后回了空
       （`nav_failed` 记的就是这个判决，键是当前的空间事实）。这是 A\* 自己
@@ -4268,6 +4479,13 @@ def _coop_leash_intent(room, machine, seat_index, terrain):
       按着、人却在墙根原地蹦」那种：规划器不会给出判决，但这是明摆着的
       空间事实。★ 正常在走的时候 `leash_mark` 跟着往前，左边跟着变小，
       这条永远不会成立。
+    * ★ **他跑满了一整屏我还是掉着队**（§141，第四轮实机加的）：
+      `leash_anchor` 是掉队那一刻带头的人的位置 —— 他又前进了
+      `BOT_VIEWPORT_WIDTH` 而我还落后 3/4 屏以上，就是「追不上」：
+      双方极速相同（都是冲刺），差距在奔跑中是**冻结**的，只会在他停下来
+      时才缩得回去。这不是「路走不过去」，是「追不近」—— 用户说的
+      「要等一会儿才能跟上」等的就是他停下来那一刻；牵引绳等不起，
+      直接瞬移归队。
 
     第一条尤其要紧：真人**停下来等 bot** 的时候，跟随点不动、bot 也不动，
     两边的空间事实全部冻住 —— 谁都不会再产生新事件。会话 42 之前那个
@@ -4278,7 +4496,11 @@ def _coop_leash_intent(room, machine, seat_index, terrain):
         _leash_release(machine, seat_index)
         return None
     behind, leader, forward = lag
-    if behind <= BOT_COOP_LEASH:
+    # ★ 触发线（3/4 屏）和释放线（半屏）是**两个数**：掉队中的 bot 要追回
+    #   到半屏以内才算归队。写成同一个数的话 bot 会钉在线上抖 —— 实机
+    #   第四轮三只 bot 全程 749~828、每 130ms 翻转一次「掉队 / 归队」。
+    limit = BOT_COOP_LEASH_RELEASE if machine.leash_lagging else BOT_COOP_LEASH
+    if behind <= limit:
         _leash_release(machine, seat_index, behind)
         return None
     spot = _coop_goal(room, machine, seat_index, terrain)
@@ -4287,23 +4509,31 @@ def _coop_leash_intent(room, machine, seat_index, terrain):
         return None
     body = machine.body
     here = forward * body.x
+    ahead = forward * float(leader.sync_trail[-1][0])
     if not machine.leash_lagging:
         machine.leash_lagging = True
         machine.leash_mark = here
         machine.leash_gap = behind
+        machine.leash_anchor = ahead
         print(f"[{gameserver.ts()}] bot {seat_index}    掉队: 落后带头的人 "
               f"{behind:.0f}（超过 3/4 屏 {BOT_COOP_LEASH:.0f}）—— "
               f"无条件冲刺追上去", flush=True)
+    elif machine.leash_anchor is None:
+        machine.leash_anchor = ahead    # 瞬移之后重新起算「他跑了多远」
     elif here > machine.leash_mark:
         machine.leash_mark = here          # 还在往前挪，绳子还没绷断
     intent = _walk_to(room, machine, terrain, spot, _may_fast_run(machine))
     stuck_by_plan = (machine.nav_failed is not None
                      and machine.nav_failed == _nav_signature(terrain, body,
                                                               spot))
-    stuck_by_fact = (forward * float(leader.sync_trail[-1][0])
+    stuck_by_fact = (ahead
                      - machine.leash_mark) > machine.leash_gap + BOT_COOP_LEASH
-    if stuck_by_plan or stuck_by_fact:
-        why = "A* 说这儿到不了" if stuck_by_plan else "按着方向键也没往前挪"
+    stuck_by_chase = (machine.leash_anchor is not None
+                      and ahead - machine.leash_anchor >= BOT_VIEWPORT_WIDTH)
+    if stuck_by_plan or stuck_by_fact or stuck_by_chase:
+        why = ("A* 说这儿到不了" if stuck_by_plan
+               else "按着方向键也没往前挪" if stuck_by_fact
+               else "他跑满一整屏我还是追不上（极速相同，差距冻结）")
         _leash_warp(room, machine, seat_index, terrain, spot, behind, why)
         return (0, False, False, False)
     return intent
@@ -4320,9 +4550,11 @@ def _leash_release(machine, seat_index=None, behind=None):
     machine.leash_lagging = False
     machine.leash_mark = None
     machine.leash_gap = 0.0
+    machine.leash_anchor = None
     if seat_index is not None and behind is not None:
         print(f"[{gameserver.ts()}] bot {seat_index}    归队: 现在落后 "
-              f"{behind:.0f}（牵引绳 {BOT_COOP_LEASH:.0f}）", flush=True)
+              f"{behind:.0f}（归队线 {BOT_COOP_LEASH_RELEASE:.0f}）",
+              flush=True)
 
 
 def _leash_warp(room, machine, seat_index, terrain, spot, behind, why):
@@ -4349,6 +4581,9 @@ def _leash_warp(room, machine, seat_index, terrain, spot, behind, why):
         machine.body = body
         _clear_navigation(machine)
         machine.leash_mark = _quest_forward(terrain) * body.x
+        # 「他跑了多远」从落点重新起算：瞬移完还在掉队的话，得再给他
+        # 一整屏的余量才谈得上「又追不上」（§141）。
+        machine.leash_anchor = None
         print(f"[{gameserver.ts()}] bot {seat_index}    ★瞬移归队: "
               f"({was.x:.0f}, {was.y:.0f}) -> ({body.x:.0f}, {body.y:.0f})"
               f"　落后 {behind:.0f}，{why}", flush=True)

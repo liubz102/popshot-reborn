@@ -3540,6 +3540,17 @@ class RoomQuest:
         #:   `state=death` 那一发就把它删掉 —— 全是事件，没有定时器。
         #:   只有 bot 读它；句柄和 `rpExplode +4` 是同一套，所以打得着。
         self.mobs = {}
+        #: ★★ **是不是在 boss 房里**（§141）：进 boss 图那一刻控制者会广播
+        #:   `fileName=data/quest/questNN/questNNSxboss.ini` + `type=start`，
+        #:   `bot.note_ai_message` 看到就把这位置起来。boss 房里没有
+        #:   「往前推进」这回事 —— bot 的牵引绳 / 跟随点整条停用，
+        #:   只管打 boss（用户 2026-08-30 第四轮实机反馈）。
+        self.boss_room = False
+        #: ★★ boss **最近一次开枪的枪口坐标**（§141）—— 载具 boss 那一族
+        #:   的 `setState` 从不带 posX，位置同步靠控制者替它发的 `rpFire`
+        #:   （`bot.note_mob_gun_muzzle`）。怪物表里还没有它的行时，
+        #:   bot 的走位目标用它；真人第一发命中建了行之后就不需要了。
+        self.boss_gun = None
         #: ★ **道具模式**：服务端刷在地图上、还没被人捡走的道具句柄（§191）。
         #: 只用来卡「地图上最多同时躺几件」，捡走了就从这里去掉。
         self.items_on_map = set()
@@ -4256,6 +4267,10 @@ class RoomQuest:
         self.hud_jam_until.clear()
         self.hp_charges.clear()
         self.mobs.clear()
+        # ★ boss 房的标志跟着 mobs 一起清：换图之后是不是 boss 房，
+        #   要等新图自己那一发 `fileName=…boss.ini` 再说（§141）。
+        self.boss_room = False
+        self.boss_gun = None
         self.dead_events = {key for key in self.dead_events if key[0] in keep}
         self.death_counts = {handle: count
                              for handle, count in self.death_counts.items()

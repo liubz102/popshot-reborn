@@ -3742,6 +3742,13 @@ def synth_terrain(key, floor=150, width=1400, height=180, walls=(), pits=(),
     return terrain
 
 
+class _FakeBreakable(object):
+    """只带 `handle` 一格的假破坏物 —— `_is_breakable_handle` 只读它。"""
+
+    def __init__(self, handle):
+        self.handle = handle
+
+
 class TerrainMixin(object):
     """把一张合成地形挂到这个房间当前那张图的名下（用完摘掉）。"""
 
@@ -4358,6 +4365,257 @@ class BotCoopLeashTests(TerrainMixin, BotFrameRoom):
         bot._move_intent(self.room, self.bot_conn, self.bot_seat, terrain,
                          None)
         self.assertFalse(self.bot_conn.leash_lagging)
+
+    # -- §141：滞回 + 「追不上就瞬移」 ---------------------------------------
+    def test_a_lagging_bot_keeps_chasing_until_half_a_screen(self):
+        """★★★ 触发线（3/4 屏）和释放线（半屏）是两个数 —— 别钉在线上抖。
+
+        实机第四轮：三只 bot 全程 749~828、每 130ms 翻转一次「掉队 /
+        归队」。掉队中的 bot 追回到 **600**（还没进半屏）必须还在追。
+        """
+        terrain = self.leash_room(key="leash_hysteresis", width=4000)
+        self.place_bot(200.0)
+        self.walk(self.alice, [(1500.0, 150.0), (1600.0, 150.0)])
+        bot._coop_leash_intent(self.room, self.bot_conn, self.bot_seat,
+                               terrain)
+        self.assertTrue(self.bot_conn.leash_lagging)
+        self.place_bot(1000.0)          # 落后 600：过了触发线的"里侧"，
+        intent = bot._coop_leash_intent(  # 但还没进半屏的归队线
+            self.room, self.bot_conn, self.bot_seat, terrain)
+        self.assertIsNotNone(intent, "落后 600 还没进归队线（512），"
+                                     "该接着追")
+        self.assertEqual(1, intent[0])
+        self.assertTrue(self.bot_conn.leash_lagging)
+        self.place_bot(1200.0)          # 落后 400：进半屏了，撒手
+        self.assertIsNone(bot._coop_leash_intent(
+            self.room, self.bot_conn, self.bot_seat, terrain))
+        self.assertFalse(self.bot_conn.leash_lagging)
+
+    def test_an_unchasable_lead_ends_in_a_warp(self):
+        """★★★ 「他跑满一整屏我还是掉着队」也是「走不过去」（§141）。
+
+        双方极速相同（都是 `FastRunRate` 1.5 倍），奔跑中差距**冻结** ——
+        bot 一直在卖力追、`leash_mark` 一直在涨，旧的两条判据（A\* 回空 /
+        一步没挪）永远不成立，可差距就是缩不回去。带头的人又跑满一整屏
+        还掉着队 = 追不上，瞬移归队（用户明示过可以）。
+        """
+        terrain = self.leash_room(key="leash_chase", width=6000)
+        self.place_bot(200.0)
+        self.walk(self.alice, [(1500.0, 150.0), (1600.0, 150.0)])
+        bot._coop_leash_intent(self.room, self.bot_conn, self.bot_seat,
+                               terrain)
+        self.assertTrue(self.bot_conn.leash_lagging)
+        anchor = self.bot_conn.leash_anchor
+        self.assertGreaterEqual(anchor, 1500.0)
+        # bot 也卖力追了 1000+（`leash_mark` 跟着涨，`stuck_by_fact`
+        # 不成立）；路是平的（`stuck_by_plan` 不成立）。
+        # 他再跑过 anchor+一整屏 —— 能开口的只有「追不上」这一条。
+        self.place_bot(1250.0)
+        self.bot_conn.leash_mark = 1250.0     # 锁住「一直在往前挪」这个事实
+        self.walk(self.alice, [(2600.0, 150.0), (2650.0, 150.0)])
+        self.assertGreater(self.bot_conn.body.x, 2400.0,
+                           "该瞬移到带头的人身后，实际在 %.0f"
+                           % self.bot_conn.body.x)
+        self.assertTrue(self.bot_conn.body.on_ground, "落点必须站得住")
+
+    def test_a_chase_within_one_screen_is_still_just_a_chase(self):
+        """★ 他还没跑满一整屏就别瞬移 —— 给「瞬移滥用」上的闸。"""
+        terrain = self.leash_room(key="leash_chase_gate", width=6000)
+        self.place_bot(200.0)
+        self.walk(self.alice, [(1500.0, 150.0), (1600.0, 150.0)])
+        bot._coop_leash_intent(self.room, self.bot_conn, self.bot_seat,
+                               terrain)
+        anchor = self.bot_conn.leash_anchor
+        # 他只又跑了不到一整屏（< 1024）：这一刻还轮不到瞬移。
+        self.place_bot(1250.0)
+        self.bot_conn.leash_mark = 1250.0
+        self.walk(self.alice, [(1900.0, 150.0), (anchor + 900.0, 150.0)])
+        self.assertLess(self.bot_conn.body.x, 1400.0,
+                        "没跑满一整屏，不该瞬移（实际在 %.0f）"
+                        % self.bot_conn.body.x)
+
+
+class BotBossRoomTests(TerrainMixin, BotFrameRoom):
+    """★★★ boss 房（§141）—— 牵引绳停用、只管打 boss。
+
+    用户 2026-08-30 第四轮实机的两条：
+    ① 「bot 进入 boss 房间后，就没必要再有推进进度的限制了，因为
+       boss 房间内只需要打 boss，不需要推进进度」；
+    ② 顺着 ① 的病根 —— boss 房里 bot 一发不开（boss 不广播坐标，
+       见 `BotQuestCombatTests` 里那三条），修好之后走位目标也该换成 boss。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(
+            synth_terrain("boss_room", width=2400))
+        self.alice_seat = self.room.seat_index_of(self.alice)
+
+    def human_packet(self, opcode, body):
+        return botsync.build_peer_packet(
+            self.alice_seat, opcode, body,
+            game_id=self.room.epoch_value, sequence=self.next_seq(self.alice))
+
+    def send(self, opcode, body):
+        gameserver.Conn.on_game_packet(
+            self.alice, OP_PEER_DATA_UP, self.human_packet(opcode, body))
+
+    def ai_message(self, handle, **fields):
+        text = "".join("%s=%s\r\n" % (k, v) for k, v in sorted(fields.items()))
+        raw = text.encode("ascii")
+        self.send(botsync.OP_AI_MSG,
+                  struct.pack("<ii", handle, len(raw)) + raw)
+
+    def enter_boss_room(self):
+        self.ai_message(1100002, fileName="data/quest/quest03/"
+                                        "quest03S6boss.ini", type="start")
+        self.assertTrue(self.room.quest.boss_room)
+
+    def spot_boss(self, x=2200.0, y=150.0, handle=1100276):
+        """真人打中 boss 一发 —— 命中建表（§141），boss 从此看得见。"""
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, handle, x, y,
+            hit_kind=botsync.HIT_CHARACTER, damage=16.0))
+        return handle
+
+    def boss_fires(self, x, y, ammo=3003010):
+        """控制者机器替 boss 发的一发 `rpFire`（`body+0 == 20`）——
+        枪口坐标就是部件的位置（§141）。弹药用 quest03 的 boss 武器表
+        （难度 1 那份 —— id 是关卡内局部的，见 `weapondata.get_quest`）。"""
+        weapon = weapondata.get_quest(ammo, 3, 1)
+        body = botsync.fire_body(
+            self.alice_seat, weapon.id, x, y, 0.0,
+            ballistics.power_for_speed(weapon, weapon.velocity))
+        body = bytes([bot.MOB_FIRE_SOURCES[0]]) + body[1:]
+        self.send(botsync.OP_FIRE, body)
+
+    def test_the_bosss_own_gunfire_marks_where_it_is(self):
+        """★★★ boss 替发的 `rpFire` 枪口 = 它的位置（§141）。
+
+        还没建行时存进 `quest.boss_gun` —— 开不了枪（没有句柄），
+        但 bot 的走位目标先跟上，不再傻站。
+        """
+        self.enter_boss_room()
+        self.place_bot(300.0)
+        intent = bot._boss_fight_intent(self.room, self.bot_conn,
+                                        self.bot_seat, self.terrain, None)
+        self.assertEqual((0, False, False, False), intent,
+                         "什么都不知道时站住")
+        self.boss_fires(2200.0, 150.0)
+        self.assertEqual((2200.0, 150.0), self.room.quest.boss_gun)
+        intent = bot._boss_fight_intent(self.room, self.bot_conn,
+                                        self.bot_seat, self.terrain, None)
+        self.assertEqual(1, intent[0], "该朝 boss 的枪口走过去")
+
+    def test_gunfire_keeps_a_known_boss_row_fresh(self):
+        """★ 建行之后，boss 每开一枪都把**最近的行**挪到枪口 ——
+        载具的部件跟着车走，枪口永远是最新的。"""
+        self.enter_boss_room()
+        self.spot_boss(x=2200.0, y=150.0)          # 真人打中，命中建表
+        self.boss_fires(2260.0, 150.0)             # 同一台车上的部件
+        self.assertEqual([(2260.0, 150.0, 1100276)], bot.live_mobs(self.room))
+
+    def test_boss_bullets_are_rebuilt_with_the_rooms_difficulty(self):
+        """★★★ 关卡武器表带 (关卡, 难度) 查 —— 难度间连弹速都不同
+        （Boss-HeadFire 14 → 17），用错难度躲闪预测就歪了（复审抓的）。"""
+        self.room.arguments = (3, 1)
+        self.room.quest.maps_entered.append("Quest03_6")
+        self.enter_boss_room()
+        self.place_bot(300.0)
+        self.boss_fires(2200.0, 150.0)
+        threats = bot._threats_against(self.room, self.bot_conn, self.bot_seat)
+        self.assertEqual(1, len(threats), "boss 的子弹重建得出来才躲得开")
+        self.assertAlmostEqual(14.0, threats[0].weapon.velocity, places=3)
+        # 换难度 3 再来一发：同一把 id，弹速 17。
+        self.room.arguments = (3, 3)
+        self.boss_fires(2200.0, 150.0)
+        threats = bot._threats_against(self.room, self.bot_conn, self.bot_seat)
+        self.assertAlmostEqual(17.0, threats[-1].weapon.velocity, places=3)
+
+    def test_a_shared_mob_weapon_takes_the_quest_numbers_first(self):
+        """★★★（二次复审）和主表**重号**的小怪武器：闯关里先取当前关卡 /
+        难度的覆盖值，离开闯关上下文才退主表。
+
+        reviewer 的复现：Quest03 简单的 `2003010` 弹速 5 / 伤害 6，
+        主表那份是 3 / 8 —— 先查主表的话这 8 个重号 id 永远拿错数值。
+        """
+        self.room.arguments = (3, 1)
+        self.room.quest.maps_entered.append("Quest03_6")
+        self.enter_boss_room()
+        self.place_bot(300.0)
+        self.boss_fires(2200.0, 150.0, ammo=2003010)
+        threats = bot._threats_against(self.room, self.bot_conn, self.bot_seat)
+        self.assertEqual(1, len(threats))
+        self.assertAlmostEqual(5.0, threats[0].weapon.velocity, places=3,
+                               msg="quest03 简单的 Soldier-Pistol，不是主表的 3")
+        # 同一把枪、不在闯关图上（地图名不带 QuestNN）：退主表兜底。
+        self.room.quest.maps_entered.append("ZZ_test_terrain")
+        self.boss_fires(2200.0, 150.0, ammo=2003010)
+        threats = bot._threats_against(self.room, self.bot_conn, self.bot_seat)
+        self.assertAlmostEqual(3.0, threats[-1].weapon.velocity, places=3,
+                               msg="非闯关上下文退主表那份")
+
+    def test_the_leash_is_suspended_in_a_boss_room(self):
+        """★★★ boss 房里落后再远也不追人 —— 没有进度可推（§141）。"""
+        self.enter_boss_room()
+        self.place_bot(200.0)
+        self.walk(self.alice, [(2000.0, 150.0), (2200.0, 150.0)])
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, None)
+        self.assertFalse(self.bot_conn.leash_lagging,
+                         "boss 房里牵引绳一个字都不该说")
+        self.assertEqual((0, False, False, False), intent,
+                         "还不知道 boss 在哪，该站住等，不是去追人")
+
+    def test_it_walks_toward_the_boss_when_out_of_range(self):
+        self.enter_boss_room()
+        self.spot_boss(x=2200.0)
+        self.place_bot(300.0)
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, None)
+        self.assertEqual(1, intent[0], "boss 在射程外，该朝它走过去")
+        # 走进射程、弹道也解得开：这一帧 `_fire_target` 有结果，
+        # 传给它就是「站住打」—— 判据和真正开火是同一个来源。
+        self.place_bot(1300.0)
+        target = bot._fire_target(self.room, self.bot_conn, self.bot_seat,
+                                  self.bot_conn.weapon)
+        self.assertIsNotNone(target, "平地上这个位置该有得打")
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, target)
+        self.assertEqual((0, False, False, False), intent,
+                         "打得着 boss 就站住打，不往它身上撞")
+
+    def test_a_boss_behind_cover_is_not_stood_at(self):
+        """★★★ 「站住」的判据必须是**真的有得打**，不是「够近 + 看得见」
+        （复审抓的：隔着掩体站着，距离再近也永远开不了枪，还站着不动）。
+
+        boss 在射程内、屏幕内，但中间隔一堵通天的墙 —— `_fire_target`
+        解不出（弹道被挡），这一帧该**挪过去**，不是站桩。
+        """
+        terrain = self.install_terrain(synth_terrain(
+            "boss_cover", width=2400, walls=((1600, 1800, 0),)))
+        self.enter_boss_room()
+        self.spot_boss(x=2200.0)
+        self.place_bot(1400.0)          # 射程内（800 < 1000）、看得见
+        target = bot._fire_target(self.room, self.bot_conn, self.bot_seat,
+                                  self.bot_conn.weapon)
+        self.assertIsNone(target, "墙挡着弹道，这一发打不出去")
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  terrain, target)
+        self.assertNotEqual((0, False, False, False), intent,
+                            "打不到还站住就是永远开不了枪")
+
+    def test_a_non_boss_script_keeps_the_leash(self):
+        """★ 分流要准：普通关卡的 `type=start` 不许把牵引绳停掉。"""
+        self.ai_message(1100002, fileName="data/quest/quest03/"
+                                        "quest03S1Enemy.ini", type="start")
+        self.assertFalse(self.room.quest.boss_room)
+        self.place_bot(200.0)
+        self.walk(self.alice, [(1500.0, 150.0), (1600.0, 150.0)])
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, None)
+        self.assertTrue(self.bot_conn.leash_lagging,
+                        "普通关卡里落后 1400，牵引绳照旧该管")
 
 
 #: 一张带出生点的合成图：101（1 队）两个点、102（2 队）两个点，
@@ -6667,12 +6925,90 @@ class BotQuestCombatTests(TerrainMixin, BotFrameRoom):
             hit_kind=botsync.HIT_CHARACTER, damage=12.0))
         self.assertEqual([(870.0, 118.0, 500123)], bot.live_mobs(self.room))
 
-    def test_a_hit_on_an_unknown_handle_invents_nothing(self):
-        """★ 非玩家句柄里还混着破坏物 —— 凭它建表会把箱子当成怪（§125）。"""
+    def test_a_hit_on_a_breakable_invents_no_mob(self):
+        """★ 破坏物的世界句柄在产物里（§136 / §139）—— 命中它**不**建怪物表。
+
+        §125 当年「凭 `rpExplode` 建表会把箱子当怪」的顾虑，如今靠这张
+        句柄表分流掉了；boss 房里剩下的非玩家句柄才是 boss 的部件。
+        """
+        self.ai_message(1100002, fileName="data/quest/quest03/"
+                                        "quest03S6boss.ini", type="start")
+        terrain = self.install_terrain(synth_terrain("hit_breakable"))
+        terrain.breakables = (_FakeBreakable(0x30e00),)
         self.send(botsync.OP_EXPLODE, botsync.explode_body(
             100002, 0x30e00, 300.0, 140.0,
             hit_kind=botsync.HIT_CHARACTER, damage=12.0))
         self.assertEqual([], bot.live_mobs(self.room))
+
+    def test_a_hit_outside_a_boss_room_invents_nothing(self):
+        """★★★ 建表**只在 boss 房里放行**（复审抓的：普通关卡里命中的
+        非玩家句柄还混着机关 / 场景物，建出来全是鬼目标）。
+
+        普通关卡的怪全部走 AI 流（§125），用不着凭命中建表。
+        """
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, 1100276, 810.0, 120.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=16.0))
+        self.assertEqual([], bot.live_mobs(self.room))
+
+    def test_a_direct_hit_on_the_boss_builds_the_table(self):
+        """★★★ boss 从不广播坐标（§141）—— 直接命中是它唯一的位置来源。
+
+        实机 2026-08-30 第四轮：boss（AI 句柄 1100275）整场 72 发
+        `rpAiMsg` 一发 posX 都没有；旧逻辑因此永远不给它建表，
+        bot 进 boss 房一发不开。打中它的句柄是 1100276（AI 句柄 +1，
+        收方扣血用的就是它）。
+        """
+        self.ai_message(1100002, fileName="data/quest/quest03/"
+                                        "quest03S6boss.ini", type="start")
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, 1100276, 810.0, 120.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=16.0))
+        self.assertEqual([(810.0, 120.0, 1100276)], bot.live_mobs(self.room))
+        # 再打一发，位置跟着采样走。
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100003, 1100276, 830.0, 124.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=16.0))
+        self.assertEqual([(830.0, 124.0, 1100276)], bot.live_mobs(self.room))
+
+    def test_a_boss_seen_by_hit_is_shot_at(self):
+        """建了表的 boss 就是打得着的目标（和普通怪同一条路）。"""
+        self.ai_message(1100002, fileName="data/quest/quest03/"
+                                        "quest03S6boss.ini", type="start")
+        self.send(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, 1100276, 880.0, 120.0,
+            hit_kind=botsync.HIT_CHARACTER, damage=16.0))
+        target = bot._fire_target(self.room, self.bot_conn, self.bot_seat,
+                                  self.bot_conn.weapon)
+        self.assertIsNotNone(target, "看得见 boss 就该朝那儿打")
+        self.assertEqual(bot.MOB_SEAT, target[0])
+        self.assertAlmostEqual(880.0, target[1][0], places=3)
+
+    def test_a_boss_script_start_marks_the_room(self):
+        """★★ 进 boss 房那一刻控制者会广播 `fileName=…boss.ini`（§141）。"""
+        self.ai_message(1100002, fileName="data/quest/quest03/"
+                                        "quest03S1Enemy.ini", type="start")
+        self.assertFalse(self.room.quest.boss_room,
+                         "普通关卡的脚本不该置 boss 房")
+        self.ai_message(1100002, fileName="data/quest/quest03/"
+                                        "quest03S6boss.ini", type="start")
+        self.assertTrue(self.room.quest.boss_room)
+        # 换图跟着清：是不是 boss 房要等新图自己那一发再说。
+        self.room.quest.begin_map_change("Quest03_1")
+        self.assertFalse(self.room.quest.boss_room)
+
+    def test_a_mobs_gun_refreshes_its_own_row(self):
+        """★ 怪开枪那刻的枪口坐标是一次它的位置采样（§141）。"""
+        self.spot_mob(x=880.0, y=120.0)
+        self.mob_fires(x=900.0, y=120.0)
+        self.assertEqual([(900.0, 120.0, 500123)], bot.live_mobs(self.room))
+
+    def test_a_muzzle_far_from_any_row_moves_nothing(self):
+        """★ 枪口离哪只怪都超过 `MOB_GUN_REACH`（300）就不挪 ——
+        归属是「同一台车上的部件」这个几何事实，不是乱吸。"""
+        self.spot_mob(x=880.0, y=120.0)
+        self.mob_fires(x=1500.0, y=120.0)
+        self.assertEqual([(880.0, 120.0, 500123)], bot.live_mobs(self.room))
 
     def test_a_mob_hit_is_not_charged_to_a_player_seat(self):
         self.spot_mob()
