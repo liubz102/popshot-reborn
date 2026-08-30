@@ -77,7 +77,10 @@ DIR_TYPE = {"TERRAIN": 200, "LAYER": 202, "COVER": 201,
 #: 5：破坏物多一格 `handle` = 它的**世界句柄**（V0.3 §139）。
 #:    `rpSplashDamaged +4` 填的就是它 —— 服务端靠它认「真人把哪块打碎了」，
 #:    也靠它让 bot 打碎的那一下在别人屏幕上也生效。
-FORMAT = 5
+#: 6：`index.json` 多一层 `props` = **`Data/map.ini` 的地图属性**，现在只有
+#:    **`FallDown`**（这张图掉出下边界会不会死，V0.3 §143）。它不在 `.map`
+#:    里，所以按**带玩法后缀的完整地图串**索引，和按文件名的 `maps` 分开。
+FORMAT = 6
 
 #: ★★★ **可破坏物**（`Maps/*/Breakable/*.png`，客户端类 `BreakableObj`）。
 #: 全 174 张图里共 677 个，分布在 67 张图上。
@@ -492,6 +495,59 @@ def write_preview(record, cells, out_path, scale=4):
 #  入口
 # ---------------------------------------------------------------------------
 
+#: ★★★ `Data/map.ini` 里**掉出图外会不会死**那一格（V0.3 §143）。
+#:
+#: 客户端 `Character::CheckFallDown`（`0x50d520`，每帧从 `Update` 调）：
+#:
+#:     eax = [0x72e2dc]->[0x394]        ; 当前这张图的 map.ini 记录
+#:     if (!eax) return                 ; 没有记录 -> 不判
+#:     if (eax->[0x4d] == 0) return     ; ★ 这一格就是 FallDown
+#:     if (角色底部 y + 5.0 >= 地图高度) -> [vft+0x6c] = ProcessFallDown()
+#:
+#: `PlayerCharacter::ProcessFallDown`（`0x51503a`）不扣血 —— 它**直接**
+#: `GameContext::ReportDeath`（`0x493855`）发 `0x0408`，凶手 id 是 0。
+#: 语料实证：`bug调查/**/*.dec.bin` 里的玩家死亡上报有 y=767 / 768
+#: （= 地图高度）那一族，凶手 id 全是 0（packet_api §0x0408 早就标着
+#: 「掉岩浆 / 自杀是 0x00」）。
+#:
+#: ⚠ **键是完整的地图串，不是文件名**：`map.ini` 里 `Forest03` 和
+#:   `Forest03:NewPvp` 是两条记录，只有后者 `FallDown=1` —— 客户端拿房间
+#:   那个带模式后缀的串查表，服务端跟着它查。
+MAP_INI_RELATIVE = os.path.join("Data", "map.ini")
+
+
+def read_map_props(pack):
+    """从 `Data/map.ini` 读每张图的属性，现在只取 `FallDown`。
+
+    返回 `{地图串: {"fall_down": True}}` —— **只收 `FallDown=1` 的那些**，
+    没这一格的图不进表（省得 174 张全写一遍 false）。
+
+    格式：UTF-16LE + CRLF，`#` 开头是注释（整段被注掉的地图也是这样），
+    行尾也可能跟着 `\t\t# 说明`。
+    """
+    path = os.path.join(pack, MAP_INI_RELATIVE)
+    if not os.path.isfile(path):
+        raise SystemExit("找不到 %s —— FallDown 提不出来" % path)
+    with open(path, "rb") as fp:
+        text = fp.read().decode("utf-16-le", "replace")
+    props = collections.OrderedDict()
+    name = None
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("﻿")
+        if not line or line.startswith("#") or line.startswith("["):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.split("#", 1)[0].strip()
+        if key == "MapFileName":
+            name = value
+        elif key == "FallDown" and name and value == "1":
+            props[name] = collections.OrderedDict((("fall_down", True),))
+    return props
+
+
 def find_pack_root(explicit=None):
     """找 `Pack_decrypt/`。它太大没进本工作副本，只在 `main` worktree 里。"""
     candidates = []
@@ -580,9 +636,12 @@ def main(argv=None):
         if not args.quiet:
             print("%-28s v%-2d %5dx%-5d 站立面 %6d" % (name, ver, width, height, nsurf))
 
+    # ★ `props` 是 `Data/map.ini` 的地图属性（现在只有 `FallDown`，§143）——
+    #   键是**带玩法后缀的完整地图串**，和地形那份按文件名的索引不是一套。
+    props = read_map_props(pack)
     idx = collections.OrderedDict((
         ("format", FORMAT), ("count", len(index)),
-        ("maps", index), ("bases", bases)))
+        ("maps", index), ("bases", bases), ("props", props)))
     with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8",
               newline="\n") as fp:
         json.dump(idx, fp, ensure_ascii=False, indent=1, sort_keys=False)

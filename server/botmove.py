@@ -515,6 +515,53 @@ def jump_lands(terrain, body, character, direction, fast_run=False,
     return body if body.on_ground else None
 
 
+def at_apex(body):
+    """这一 tick 是不是**这段腾空的顶点** —— 第二段跳该按下去的那一刻。
+
+    ★ 判据是「已经不再上升了」这个**物理事实**（`v.y >= 0`，y 向下为正），
+    不是「起跳后第 N 个 tick」这种阈值（铁律 10）。
+
+    ★★ 规划（`botnav._double_jump_edge`）、执行（`bot._route_intent`）和
+    兜底（`bot._walk_to` 跨坑那一条）**必须用同一句** —— 三边不一致的话
+    规划出来的落点和真跑出来的对不上。所以它住在这里，另外两处都来问它。
+    """
+    return (body is not None and not body.on_ground
+            and not body.air_jumped and body.vy >= 0.0)
+
+
+def double_jump_lands(terrain, body, character, direction, fast_run=False,
+                      crouched=False, ticks=None):
+    """★★ 起跳 + **在顶点再按一次**，落在哪；落不到返回 `None`（§124）。
+
+    和 `jump_lands()` 是一对：那个问「一段跳够不够」，这个问「两段够不够」。
+    坑宽到一段跳过不去、两段跳过得去时，缺了它 bot 只会一遍遍地一段跳
+    掉进坑里 —— 用户 2026-08-30：「经过岩浆时，bot 似乎不会用二段跳来跳到
+    对面平台，只会用一段跳，然后反复掉进岩浆。」
+
+    ★ 没跳成第二段（比如起跳那一下就落回地面）一律返回 `None`：调用方拿它
+      当「二段跳能不能过去」的答案，跳不成就不算数。
+    """
+    if ticks is None:
+        # 两段的升段各 `v/g` 个 tick，再加从图顶落到图底那一趟。
+        ticks = (fall_ticks(terrain)
+                 + int((JUMP_SPEED + DOUBLE_JUMP_SPEED) / GRAVITY) + 2)
+    current = tick(terrain, body, character, direction=direction,
+                   fast_run=fast_run, crouched=crouched, want_jump=True)
+    if current.on_ground:
+        return None                        # 压根没离地
+    jumped = False
+    for _ in range(max(0, int(ticks))):
+        if current.on_ground:
+            break
+        want = not jumped and at_apex(current)
+        if want:
+            jumped = True
+        current = tick(terrain, current, character, want_jump=want)
+    if not current.on_ground or not jumped:
+        return None
+    return current
+
+
 def drop_below(terrain, body, character, direction, fast_run=False,
                crouched=False, ticks=None):
     """走出崖边之后会掉多深（掉不到底返回 `None`）。

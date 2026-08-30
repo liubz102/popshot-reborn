@@ -66,7 +66,9 @@ import zlib
 #:    （§138）。合成在 `MapTerrain` 里做。
 #: 5：破坏物多一格 `handle` = **世界句柄**（§139），`rpSplashDamaged +4`
 #:    填的就是它。
-FORMAT = 5
+#: 6：索引里多一层 `props` = `Data/map.ini` 的地图属性（现在只有
+#:    **`FallDown`** —— 这张图掉出去会不会死，§143）。
+FORMAT = 6
 
 #: 找不到精确名、**也没人告诉我们难度**时按这个顺序退。
 #: ⚠ 这只是最后的兜底 —— 闯关房请一律把难度传进来（见 `DIFFICULTY_SUFFIX`）。
@@ -246,9 +248,14 @@ class MapTerrain(object):
     __slots__ = ("name", "version", "width", "height", "_cells",
                  "_offsets", "_ys", "points", "jump_pads", "__weakref__",
                  "breakables", "alive", "_base_cells", "_base_offsets",
-                 "_base_ys", "_root", "_variants")
+                 "_base_ys", "_root", "_variants", "fall_down")
 
-    def __init__(self, record):
+    def __init__(self, record, fall_down=False):
+        #: ★★ 这张图**掉出下边界会不会死**（`map.ini` 的 `FallDown`，§143）。
+        #:   它不在 `.map` 里、也不按文件名索引（同一张图不同玩法可以不一样），
+        #:   所以由 `load()` 按**房间给的那个完整地图串**查好了塞进来。
+        #:   走位判据要用它：致命的落点和无底洞一样，**不能往那儿走**（§145）。
+        self.fall_down = bool(fall_down)
         self.name = record["name"]
         self.version = record["version"]
         self.width = record["width"]
@@ -384,7 +391,7 @@ class MapTerrain(object):
             got = object.__new__(MapTerrain)
             for field in ("name", "version", "width", "height", "points",
                           "jump_pads", "breakables", "_base_cells",
-                          "_base_offsets", "_base_ys"):
+                          "_base_offsets", "_base_ys", "fall_down"):
                 setattr(got, field, getattr(root, field))
             got._root = root
             got._variants = root._variants
@@ -511,9 +518,9 @@ class _Store(object):
         except (IOError, OSError, ValueError):
             # 没有地形数据不该让服务端起不来：bot 照样能跟着真人的轨迹走
             # （D16），只是不会自己找路。
-            return {"maps": {}, "bases": {}}
+            return {"maps": {}, "bases": {}, "props": {}}
         if idx.get("format") != FORMAT:
-            return {"maps": {}, "bases": {}}
+            return {"maps": {}, "bases": {}, "props": {}}
         return idx
 
     def available(self):
@@ -550,8 +557,14 @@ class _Store(object):
         name = self.resolve(map_name, difficulty)
         if name is None:
             return None
-        if name in self._cache:
-            return self._cache[name]
+        # ★★ 缓存键带上 `FallDown`（§145）：那一格是按**带玩法后缀的完整
+        #   地图串**查的（`Forest03` 没有、`Forest03:NewPvp` 有），而这里
+        #   的 `name` 是**文件名**。不带进键的话，先加载的那一份会把标志
+        #   带给后加载的另一个玩法。
+        deadly = self.falls_out_of_the_world(map_name)
+        key = (name, deadly)
+        if key in self._cache:
+            return self._cache[key]
         entry = self.index()["maps"][name]
         path = os.path.join(self.data_dir, entry["file"])
         try:
@@ -561,9 +574,20 @@ class _Store(object):
             return None
         if record.get("format") != FORMAT:
             return None
-        terrain = MapTerrain(record)
-        self._cache[name] = terrain
+        terrain = MapTerrain(record, fall_down=deadly)
+        self._cache[key] = terrain
         return terrain
+
+    def falls_out_of_the_world(self, map_name):
+        """这张图掉出下边界会不会死（`map.ini` 的 `FallDown`，§143）。"""
+        props = self.index().get("props", {})
+        if not props or not map_name:
+            return False
+        name = str(map_name).strip()
+        entry = props.get(name)
+        if entry is None:
+            entry = props.get(name.split(":", 1)[0].strip())
+        return bool(entry and entry.get("fall_down"))
 
 
 STORE = _Store()
@@ -580,6 +604,27 @@ def load(map_name, difficulty=None):
 
 def resolve(map_name, difficulty=None):
     return STORE.resolve(map_name, difficulty)
+
+
+def falls_out_of_the_world(map_name):
+    """这张图**掉出下边界会不会死**（`map.ini` 的 `FallDown`，§143）。
+
+    客户端每帧判一次（`Character::CheckFallDown` = `0x50d520`）：这张图的
+    记录有 `FallDown` 且**角色底部 y + 5 >= 地图高度**，就调
+    `ProcessFallDown` —— 玩家角色那一份（`0x51503a`）**直接发 `0x0408`**
+    报死，不走扣血（所以凶手 id 是 0，packet_api §0x0408 那句「掉岩浆 /
+    自杀是 0x00」说的就是它）。
+
+    ⚠ **键是完整的地图串**（含 `:NewPvp` 那种玩法后缀）：`map.ini` 里
+      `Forest03` 和 `Forest03:NewPvp` 是两条记录，只有后者 `FallDown=1`。
+      所以这里**不切** `:` —— 先按原样查，查不到再退回基名。
+    """
+    return STORE.falls_out_of_the_world(map_name)
+
+
+#: ★★ 判「掉出去了」时给角色底部加的余量 —— 客户端 `0x50d55d` 那个
+#: 立即数（`[0x693878]` = 5.0）。照抄，别改成别的数。
+FALL_DOWN_MARGIN = 5.0
 
 
 def qualify(map_name, difficulty):

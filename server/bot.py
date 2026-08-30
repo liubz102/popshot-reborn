@@ -4098,7 +4098,7 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     if body is None or terrain is None:
         return (0, False, False, False)
     coop = room.team_layout() == lobby_module.TEAM_LAYOUT_COOP
-    # ★★★★ **牵引绳排在最前面**（D99）：闯关时落后带头的真人超过 3/4 个
+    # ★★★★ **牵引绳排在最前面**（D99）：闯关时落后带头的真人超过 1/4 个
     #   屏幕就无条件追，连躲子弹都往后排 —— 掉队的那一个会把整队的扇区
     #   进度钉死，比挨几枪严重得多。没掉队时它返回 None，下面照旧。
     #   ★ boss 房里它**整条不生效**（§141）：那儿没有进度可推，
@@ -4238,8 +4238,16 @@ def _walk_to(room, machine, terrain, spot, fast_run):
             routed = _route_intent(machine, terrain, who, spot)
             if routed is not None:
                 return routed
-        return (direction, False, False, fast_run)
+        # ★★★ **兜底跨坑那一跳的第二段**（§144）：A\* 还没算完 / 说不可达时
+        #   走的是下面那条老兜底，它起跳时把「这一段要补第二跳」记在
+        #   `nav_double_jump` 上。判据和规划层同一句（`botmove.at_apex`）。
+        again = machine.nav_double_jump and botmove.at_apex(body)
+        return (direction, again, False, fast_run)
 
+    # ★ 踩着地 = 上一段腾空结束，兜底那一跳的「补第二段」旗子作废。
+    #   放在这里而不是落地事件上：`_route_intent` 走 A\* 路线时会**自己**
+    #   按 `Step.double` 重设它，清早了也不影响（§144）。
+    machine.nav_double_jump = False
     # ★ 已经有路线时先执行路线，**不再算一遍 blocked / bottomless** ——
     #   那两个判据各要跑一遍物理模拟，而逐 tick 决策（`_own_step`）会把这个
     #   函数调用频率提高到每 tick 一次。有路线时它们的结论也用不上。
@@ -4264,9 +4272,21 @@ def _walk_to(room, machine, terrain, spot, fast_run):
         return (direction, True, False, fast_run)
     if bottomless:
         # 脚下这一步是个掉不到底的坑：跳得过去就跳，跳不过去就别走。
-        landing = botmove.jump_lands(terrain, body, who, direction)
-        return ((direction, True, False, fast_run) if landing is not None
-                else (0, False, False, False))
+        # ★★★ 一段跳够不着时**再问一次二段跳**（§144）—— 用户 2026-08-30：
+        #   「经过岩浆时，bot 似乎不会用二段跳来跳到对面平台，只会用一段跳，
+        #   然后反复掉进岩浆。」二段跳在 A\* 那边一直是有边的（§124），
+        #   缺的是**这条兜底路**：A\* 还没算完（后台线程，§137）或者说
+        #   「到不了」的时候走的就是这里，而它以前只会一段跳。
+        # ★ 两次模拟都带上 `fast_run`：起跳带走的是**那一刻的走速**（§93），
+        #   冲刺着跳比走着跳远得多，不带的话预测的落点根本不是真落点。
+        if botmove.jump_lands(terrain, body, who, direction,
+                              fast_run=fast_run) is not None:
+            return (direction, True, False, fast_run)
+        if botmove.double_jump_lands(terrain, body, who, direction,
+                                     fast_run=fast_run) is not None:
+            machine.nav_double_jump = True
+            return (direction, True, False, fast_run)
+        return (0, False, False, False)
     if vertical and spot[1] < body.y:
         return (direction, True, False, fast_run)
     return (direction, False, False, fast_run)
@@ -4290,17 +4310,34 @@ BOT_VIEWPORT_WIDTH = 1024.0
 #: ⚠ 这一条**不是从原版推出来的**（铁律 11 的例外，D99）—— 它是用户在
 #:   反复实机之后下的产品决定：闯关是**扇区推进**的，掉队的那一个会把整队
 #:   的进度钉住，「拖进度」比「像不像真人」严重得多。
-BOT_COOP_LEASH = BOT_VIEWPORT_WIDTH * 0.75
+#:
+#: ★★★ 2026-08-30 第五轮实机后收紧到 **1/4 屏**（D103）。用户的原话：
+#:   「不能在第一个真人身后 1/4 屏幕以上的后方停下来，如果自己距离第一个
+#:   真人身后 1/4 屏幕以上，则必须往前走。」3/4 屏那个数太松 —— 三个 bot
+#:   全在 700 多的地方晃，镜头照样被钉住。
+BOT_COOP_LEASH = BOT_VIEWPORT_WIDTH / 4.0
 
 #: ★★ 掉队之后要追回到多近才算「归队」—— 比触发线**更紧**的滞回（§141）。
 #:
 #: 实机（2026-08-30 第四轮）量出来的事实：bot 和带头的真人**极速相同**
 #: （都是 `FastRunRate` 1.5 倍走速），差距一旦拉开，双方都在冲刺时它就
-#: **冻结**，永远缩不回 768 以内 —— bot 全程钉在 749~828 之间、每 130ms
-#: 在「掉队 / 归队」之间翻转一次，恰好停在把镜头钉死的那个位置上。
-#: 触发线和释放线分开之后：掉队中的 bot 要追到**半屏以内**才撒手，
-#: 「掉队了」是一个稳定的区间而不是一条会抖的线。
-BOT_COOP_LEASH_RELEASE = BOT_VIEWPORT_WIDTH * 0.5
+#: **冻结**，永远缩不回去 —— bot 全程钉在触发线上、每 130ms 在
+#: 「掉队 / 归队」之间翻转一次，恰好停在把镜头钉死的那个位置上。
+#: 触发线和释放线分开之后，「掉队了」是一个稳定的区间而不是一条会抖的线。
+#: ★ 释放线取触发线的一半（1/8 屏）：追回来时要**往前多追一段**才撒手，
+#:   撒手的地方离后界远一点，才不会一松手就又贴回边缘上（D103 的「前面
+#:   比后面好」）。
+BOT_COOP_LEASH_RELEASE = BOT_COOP_LEASH / 2.0
+
+#: ★★★ **不许超过带头的真人多远**（用户 2026-08-30 第五轮，D103）：
+#:
+#: 「但是不能超过最前方的真人 1/3 屏幕以上，如果超过第一个真人 1/3 屏幕
+#:  以上，则停下来等。等的时候不能影响打怪或躲避的判定。」
+#:
+#: 于是 bot 的**活动范围**就是 `[带头的人 − 1/4 屏, 带头的人 + 1/3 屏]`。
+#: 超前是「停下来等」（走位不再往前），**不是往回走** —— 往回走等于把
+#: 刚推进的进度吐回去，而且打怪 / 躲避这两条照旧管用（它们不看这条带）。
+BOT_COOP_AHEAD_LIMIT = BOT_VIEWPORT_WIDTH / 3.0
 
 
 def _quest_forward(terrain):
@@ -4336,15 +4373,26 @@ def _coop_leader(room, forward):
 
 
 def _coop_goal(room, machine, seat_index, terrain):
-    """闯关时该往哪走：**最靠前那个真人身后一点点**。
+    """闯关时该往哪走：**带头那个真人的前方**（活动范围里尽量靠前，D103）。
 
     ★ 锚是他**此刻站的地方**，不再是他走过的轨迹（D16 那条老路）：
       轨迹是他绕过的每一个弯，跟着重走既慢又白绕；而中间那段路现在有
       A\\* 自己会走（M5-G），不需要拿轨迹保证「踩得到地面」。
 
-    ★ 每个 bot 往后错开 `BOT_FOLLOW_DISTANCE × 名次`，免得几个叠在一个点上。
-      错开的方向是**后方**（`−forward`），所以 bot 永远排在带头的人后面，
-      不会冲到他前面挡枪。
+    ## ★★★ 跟随点从「他身后」搬到「他身前」（用户 2026-08-30 第五轮）
+
+    > 给 bot 灌输一个信念，尽量往前走，不要拖后腿，即便已经在允许的范围内，
+    > 也要尽量往前走，前面比后面好，不要总停在最后面的界限边缘。
+
+    以前的跟随点是 `他 − 120 × 名次`，第三个 bot 就钉在他身后 360 ——
+    刚好是「范围内最靠后」的那一档，用户看到的就是「bot 总在最后面」。
+    现在从**前界**（`+1/3 屏`）往回排：第 1 个 bot 站前界减一个身位、
+    第 2 个再退一个身位……最后**夹回活动范围**
+    `[−BOT_COOP_LEASH, +BOT_COOP_AHEAD_LIMIT]`，谁都不会被排到界外。
+
+    ★ 「站到真人前面会不会挡枪」以前是不排前面的理由 —— 现在不成立了：
+      闯关房里子弹按碰撞组跳过队友（§63），溅射 / 火墙也一点伤害都没有
+      （§142）。挡不着。
     """
     leader = _coop_leader(room, _quest_forward(terrain))
     if leader is None:
@@ -4352,8 +4400,10 @@ def _coop_goal(room, machine, seat_index, terrain):
     forward = _quest_forward(terrain)
     seats = room.bot_seats()
     rank = (seats.index(seat_index) + 1) if seat_index in seats else 1
+    offset = BOT_COOP_AHEAD_LIMIT - BOT_FOLLOW_DISTANCE * rank
+    offset = max(-BOT_COOP_LEASH, min(BOT_COOP_AHEAD_LIMIT, offset))
     x, y = leader.sync_trail[-1][:2]
-    return (float(x) - forward * BOT_FOLLOW_DISTANCE * rank, float(y))
+    return (float(x) + forward * offset, float(y))
 
 
 def _coop_intent(room, machine, seat_index, terrain, target):
@@ -4366,6 +4416,14 @@ def _coop_intent(room, machine, seat_index, terrain, target):
     if spot is None:
         _clear_navigation(machine)
         return (0, False, False, False)
+    # ★★★ 冲过前界了就**停下来等**，不往回走（用户 2026-08-30 第五轮，D103）：
+    #   「超过第一个真人 1/3 屏幕以上，则停下来等。」往回走等于把刚推进的
+    #   进度吐回去；而这只是**走位**停住 —— 打怪和躲子弹这一帧照旧
+    #   （躲避排在这个函数前面，开火根本不走这条路）。
+    lag = _coop_lag(room, machine, terrain)
+    if lag is not None and lag[0] < -BOT_COOP_AHEAD_LIMIT:
+        _clear_navigation(machine)
+        return (0, False, False, False)
     if (abs(body.x - spot[0]) <= BOT_COOP_BAND
             and abs(body.y - spot[1]) <= botnav.GOAL_Y):
         # 已经跟上了：站住打怪（打不到就干脆站着，和对战房同一条规矩）。
@@ -4376,7 +4434,10 @@ def _coop_intent(room, machine, seat_index, terrain, target):
     #    的话**永远**追不上，一路被落下 500~800 个单位，卡在屏幕左边
     #    把镜头钉住 —— 实机日志里量出来的就是这个数。
     #    判据是「差得比跟随带还远」这个空间事实 + 体力够不够（原版开关）。
-    behind = math.hypot(spot[0] - body.x, spot[1] - body.y)
+    #    ★ 量的是**落在带头的人后面多远**，不是「离跟随点多远」（D103）：
+    #      跟随点搬到他**前面**之后，后者在正常跟随时也一直大于一个身位，
+    #      bot 会全程按着冲刺键把体力烧光。真人也是落后了才冲。
+    behind = lag[0] if lag is not None else 0.0
     return _walk_to(room, machine, terrain, spot,
                     behind > BOT_FOLLOW_DISTANCE and _may_fast_run(machine))
 
@@ -4466,7 +4527,7 @@ def _coop_lag(room, machine, terrain):
 
 
 def _coop_leash_intent(room, machine, seat_index, terrain):
-    """★★★ 掉队超过 3/4 个屏幕时的**最高优先级**动作；没掉队返回 `None`。
+    """★★★ 掉队超过 1/4 个屏幕时的**最高优先级**动作；没掉队返回 `None`。
 
     没掉队时这个函数一分钱都不花（一次减法），行为和以前一模一样 ——
     躲子弹、打怪、捡道具照旧按原来的次序走。
@@ -4493,7 +4554,7 @@ def _coop_leash_intent(room, machine, seat_index, terrain):
       这条永远不会成立。
     * ★ **他跑满了一整屏我还是掉着队**（§141，第四轮实机加的）：
       `leash_anchor` 是掉队那一刻带头的人的位置 —— 他又前进了
-      `BOT_VIEWPORT_WIDTH` 而我还落后 3/4 屏以上，就是「追不上」：
+      `BOT_VIEWPORT_WIDTH` 而我还掉着队，就是「追不上」：
       双方极速相同（都是冲刺），差距在奔跑中是**冻结**的，只会在他停下来
       时才缩得回去。这不是「路走不过去」，是「追不近」—— 用户说的
       「要等一会儿才能跟上」等的就是他停下来那一刻；牵引绳等不起，
@@ -4508,8 +4569,8 @@ def _coop_leash_intent(room, machine, seat_index, terrain):
         _leash_release(machine, seat_index)
         return None
     behind, leader, forward = lag
-    # ★ 触发线（3/4 屏）和释放线（半屏）是**两个数**：掉队中的 bot 要追回
-    #   到半屏以内才算归队。写成同一个数的话 bot 会钉在线上抖 —— 实机
+    # ★ 触发线（1/4 屏）和释放线（1/8 屏）是**两个数**：掉队中的 bot 要追
+    #   过头一截才算归队。写成同一个数的话 bot 会钉在线上抖 —— 实机
     #   第四轮三只 bot 全程 749~828、每 130ms 翻转一次「掉队 / 归队」。
     limit = BOT_COOP_LEASH_RELEASE if machine.leash_lagging else BOT_COOP_LEASH
     if behind <= limit:
@@ -4528,7 +4589,7 @@ def _coop_leash_intent(room, machine, seat_index, terrain):
         machine.leash_gap = behind
         machine.leash_anchor = ahead
         print(f"[{gameserver.ts()}] bot {seat_index}    掉队: 落后带头的人 "
-              f"{behind:.0f}（超过 3/4 屏 {BOT_COOP_LEASH:.0f}）—— "
+              f"{behind:.0f}（超过 1/4 屏 {BOT_COOP_LEASH:.0f}）—— "
               f"无条件冲刺追上去", flush=True)
     elif machine.leash_anchor is None:
         machine.leash_anchor = ahead    # 瞬移之后重新起算「他跑了多远」
@@ -4538,8 +4599,10 @@ def _coop_leash_intent(room, machine, seat_index, terrain):
     stuck_by_plan = (machine.nav_failed is not None
                      and machine.nav_failed == _nav_signature(terrain, body,
                                                               spot))
-    stuck_by_fact = (ahead
-                     - machine.leash_mark) > machine.leash_gap + BOT_COOP_LEASH
+    # ★ 「一整根绳子」这一条量的是**一整屏**，不跟着触发线走（D103 把触发线
+    #   收紧到 1/4 屏之后，拿 256 当尺子会让瞬移变成家常便饭）。
+    stuck_by_fact = (ahead - machine.leash_mark) > (machine.leash_gap
+                                                   + BOT_VIEWPORT_WIDTH)
     stuck_by_chase = (machine.leash_anchor is not None
                       and ahead - machine.leash_anchor >= BOT_VIEWPORT_WIDTH)
     if stuck_by_plan or stuck_by_fact or stuck_by_chase:
@@ -7617,6 +7680,64 @@ def _battle_started(room):
     return state == gameserver.StartGameHandshake.IN_GAME
 
 
+def _fell_out_of_the_world(room, machine, terrain):
+    """★★★ 这个 bot 是不是**掉出地图下边界**了（§143）。
+
+    照抄客户端每帧那一下 `Character::CheckFallDown`（`0x50d520`）：
+
+        这张图的 map.ini 记录有 `FallDown` 吗？没有 -> 掉下去不死；
+        角色底部 y + 5 >= 地图高度 ?  -> ProcessFallDown()
+
+    ★ 服务端的 `body.y` 就是**落脚点**（和客户端 `[char+0x38]` 同一口径，
+      `chrprops.center()` 是拿它减去身体半高算出来的），所以直接和图高比。
+
+    ★★ 为什么 bot 会「站」在图外：`mapdata` 里**出界返回 2**（照抄客户端，
+      免得 bot 觉得图外能走）—— 于是掉下去的 bot 被图外那圈虚拟实心接住，
+      悬在最后一行上，既不死也回不来。用户 2026-08-30 报的
+      「bot 掉到岩浆里不会死亡，还在空中不停上下抽搐，然后进度卡住」
+      就是这个：**判死这一条以前整条不存在**。
+    """
+    body = machine.body
+    if body is None or terrain is None or room is None:
+        return False
+    if not mapdata.falls_out_of_the_world(getattr(room, "map_name", "")):
+        return False
+    return body.y + mapdata.FALL_DOWN_MARGIN >= terrain.height
+
+
+def _report_fall_death(room, machine, seat_index):
+    """替掉出去的 bot 走一遍**真人那条死亡路**（§143）。
+
+    原版是角色本机 `PlayerCharacter::ProcessFallDown`（`0x51503a`）**直接**
+    `GameContext::ReportDeath`（`0x493855`）发一发 `0x0408` —— 不扣血、
+    不经过伤害那一路。bot 没有本机，服务端照着造一发同样的包，喂给
+    `Conn.on_report_hp_zero`：广播 `0x0406`、上重生闩、记分**一条都不用
+    重写**，和「别人打死它」走的是同一段代码（D3 那条放宽本来就为它开的）。
+
+    ★★ **凶手那一格填自己的座位**（= 自杀），不是原版那个 0：原版的 0 是
+      `[char+0x158]`「没人打过我」的默认值，而服务端这边 `record_kill()`
+      会把它当**座位号 0** —— 照填等于每次掉坑都给 0 号位白送一个人头。
+      填自己 = 自杀，扣自己一分（§224），账才是对的（D104）。
+    """
+    quest = None if room is None else room.quest
+    handle = botsync.character_handle(seat_index) & 0xFFFFFFFF
+    # ★ 「我死之前死过几次」要报**服务端权威计数**：`record_death()` 的第 2
+    #   层判重是 `报的值 + 1 <= 已广播次数`，恒填 0 的话第二次掉坑就被吃掉。
+    reported = 0
+    if quest is not None:
+        reported = int(getattr(quest, "death_counts", {}).get(handle, 0))
+    body = machine.body
+    payload = struct.pack(gameserver.DEATH_REPORT_FORMAT, handle,
+                          seat_index & 0xFF, seat_index & 0xFF, reported,
+                          float(body.x), float(body.y))
+    machine.log(f"   ★掉出地图: ({body.x:.0f}, {body.y:.0f}) "
+                f"—— 这张图 FallDown=1，照原版判死")
+    try:
+        machine.on_report_hp_zero(payload)
+    except (OSError, ValueError, struct.error) as error:
+        machine.log(f"   ⚠ 掉落判死上报失败（{error!r}）")
+
+
 def _lying_dead(room, seat_index):
     """这个座位现在是不是「躺着」—— 等重生，或者命用完了这一局不再起来。
 
@@ -7793,6 +7914,12 @@ def _tick_bot(room, machine, seat_index):
     # ★ 记下这一帧报出去的地面标志：别人那台机器上 bot 的 `[char+0x128]`
     #   就是它，而夺分模式的一条 ×0.75 按受害者这一格判（§89）。
     machine.on_ground = bool(on_ground)
+    # ★★★ **掉出地图下边界 = 死**（§143）：排在发心跳前面 —— 真人死了
+    #   那一帧也不发心跳，而且这一发要是发出去了，别人屏幕上的 bot 会先
+    #   闪到图外再倒下。
+    if _fell_out_of_the_world(room, machine, _terrain(room)):
+        _report_fall_death(room, machine, seat_index)
+        return
     direction = _walk_direction(previous, x)
     if direction:
         machine.heading = direction

@@ -764,6 +764,15 @@ opcode 分段（V0.1 §45）：
 `GameContext::vf_1c()`(`0x46e188`) **恒返回 0**（所以客户端**不会自己判死**）→
 `GameContext::ReportDeath`(`0x493855`) → 发本包 → **等服务端回 `0x0406`** 才真的倒下。
 
+★★★ **还有第二条入口：掉出地图下边界**（V0.3 §143）。`Character::CheckFallDown`
+（`0x50d520`，每帧从 `Update` 调）：这张图的 `map.ini` 记录有 **`FallDown=1`**
+（`[记录+0x4d]`）且**角色底部 y + 5 ≥ 地图高度**（`0x693878` = 5.0，图高来自
+`0x40a119`）⇒ `PlayerCharacter::ProcessFallDown`（`0x51503a`）**不扣血**，
+直接 `ReportDeath` 发本包。全 117 条 `map.ini` 记录里只有 **14 条**有这一格
+（`Esperan00` 熔岩洞那一族 / `Quest02_1` / `Quest06_stage` …），而且键是
+**带玩法后缀的完整地图串**（`Forest03` 没有、`Forest03:NewPvp` 有）。
+⇒ 自己造包的一方（bot）要照抄这个判据，否则掉下去既不死也回不来。
+
 | 线偏移 | 类型 | 含义 | 可信度 |
 |---|---|---|---|
 | `+0x00` | u32 | **角色对象句柄**（`[char+0xd0]`），`World::Find` 用它找对象 | ✅实测 |

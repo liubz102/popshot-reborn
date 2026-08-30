@@ -1,5 +1,5 @@
 {
- "format": 5,
+ "format": 6,
  "count": 174,
  "maps": {
   "01test": {
@@ -1276,5 +1276,49 @@
    "Quest06_Stage_ch#Hard",
    "Quest06_Stage_ch#Normal"
   ]
+ },
+ "props": {
+  "Esperan00": {
+   "fall_down": true
+  },
+  "Esperan03": {
+   "fall_down": true
+  },
+  "Esperan_M00": {
+   "fall_down": true
+  },
+  "Esperan04": {
+   "fall_down": true
+  },
+  "CamelCulvert04": {
+   "fall_down": true
+  },
+  "Festival02": {
+   "fall_down": true
+  },
+  "Forest03:NewPvp": {
+   "fall_down": true
+  },
+  "Esperan00:NewPvp": {
+   "fall_down": true
+  },
+  "Esperan03:NewPvp": {
+   "fall_down": true
+  },
+  "Esperan04:NewPvp": {
+   "fall_down": true
+  },
+  "CamelCulvert04:NewPvp": {
+   "fall_down": true
+  },
+  "Festival02:NewPvp": {
+   "fall_down": true
+  },
+  "Quest02_1": {
+   "fall_down": true
+  },
+  "Quest06_stage": {
+   "fall_down": true
+  }
  }
 }

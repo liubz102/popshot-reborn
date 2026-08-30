@@ -179,16 +179,12 @@ def _jump_edge(terrain, body, character, direction, fast_run):
 def at_apex(body):
     """这一 tick 是不是**这段腾空的顶点** —— 二段跳该按下去的那一刻。
 
-    ★ 判据是「已经不再上升了」这个**物理事实**（`v.y >= 0`，y 向下为正），
-    不是「起跳后第 N 个 tick」这种阈值（铁律 10）。站着起跳时它算出来正好
-    是第 17 个 tick（初速 20 ÷ 重力 1.2），被弹跳台弹上去时自动往后挪 ——
-    两种情形都不用另写一条规则。
-
-    ★★ 图（`_double_jump_edge`）和执行层（`bot._route_intent`）**必须用
-    同一句**，否则规划出来的落点和真跑出来的对不上。
+    ★ 真正的判据住在 `botmove.at_apex()`：规划（这里）、执行
+      （`bot._route_intent`）和跨坑兜底（`bot._walk_to`）**必须用同一句**，
+      否则规划出来的落点和真跑出来的对不上。这里只是个转发，留着是因为
+      图这一侧到处都在用这个名字。
     """
-    return (body is not None and not body.on_ground
-            and not body.air_jumped and body.vy >= 0.0)
+    return botmove.at_apex(body)
 
 
 def _double_jump_edge(terrain, body, character, direction, fast_run):

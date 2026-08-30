@@ -4150,10 +4150,14 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
         self.assertIsNotNone(self.bot_conn.body, "闯关房也该自己走")
 
     def test_it_keeps_pace_with_the_party(self):
-        """★ 「不能太慢拖进度、也不能太快甩太远」—— 由**目标点**保证。"""
+        """★ 「不能太慢拖进度、也不能太快甩太远」—— 由**目标点**保证。
+
+        ★ D103 起跟随点在带头的人**前面**（前界减一个身位），所以这里要多
+          走几帧才走得到 —— 走得到就说明「尽量往前」那条真的在推着它走。
+        """
         self.install_terrain(synth_terrain("flat"))
         self.walk(self.alice, [(0.0, 150.0), (120.0, 150.0), (240.0, 150.0)])
-        for _ in range(10):
+        for _ in range(24):
             self.bot_conn.move_at -= bot.botmove.TICKS_PER_BEAT                 * bot.botmove.TICK_MS / 1000.0
             self.human_heartbeat(self.alice, 240.0, 150.0)
         goal = bot._coop_goal(self.room, self.bot_conn, self.bot_seat,
@@ -4225,6 +4229,56 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
                                   terrain, None)
         self.assertFalse(intent[3], "已经跟上了就别一直冲刺，体力要留着")
 
+    # -- ★★★ D103：活动范围 = 带头的人后方 1/4 屏 ~ 前方 1/3 屏 -------------
+    #
+    # 用户 2026-08-30 第五轮：「bot 的活动范围限定在第一个真人的后方 1/4
+    # 屏幕到前方 1/3 屏幕这个范围内，超过就要尽快回去」+「即便已经在允许
+    # 的范围内，也要尽量往前走，前面比后面好，不要总停在最后面的界限边缘」。
+
+    def test_the_follow_point_sits_ahead_of_the_leader(self):
+        """★ 跟随点在带头的人**前面** —— 「前面比后面好」。"""
+        self.install_terrain(synth_terrain("coop_band",
+                                           points={101: [(100, 40)]}))
+        self.walk(self.alice, [(0.0, 150.0), (400.0, 150.0)])
+        goal = bot._coop_goal(self.room, self.bot_conn, self.bot_seat,
+                              mapdata.load(self.room.map_name))
+        self.assertIsNotNone(goal)
+        self.assertGreater(goal[0], 400.0,
+                           "跟随点该排在带头的人前面，实际 %.0f" % goal[0])
+        self.assertLessEqual(goal[0], 400.0 + bot.BOT_COOP_AHEAD_LIMIT,
+                             "但不许越过前界")
+
+    def test_every_bot_lands_inside_the_band(self):
+        """★ 名次再靠后也不会被排到界外（跟随点是夹过的）。"""
+        self.install_terrain(synth_terrain("coop_band_all",
+                                           points={101: [(100, 40)]}))
+        self.walk(self.alice, [(0.0, 150.0), (400.0, 150.0)])
+        terrain = mapdata.load(self.room.map_name)
+        for rank in range(1, 7):
+            offset = bot.BOT_COOP_AHEAD_LIMIT - bot.BOT_FOLLOW_DISTANCE * rank
+            offset = max(-bot.BOT_COOP_LEASH,
+                         min(bot.BOT_COOP_AHEAD_LIMIT, offset))
+            self.assertGreaterEqual(offset, -bot.BOT_COOP_LEASH)
+            self.assertLessEqual(offset, bot.BOT_COOP_AHEAD_LIMIT)
+        goal = bot._coop_goal(self.room, self.bot_conn, self.bot_seat, terrain)
+        self.assertGreaterEqual(goal[0], 400.0 - bot.BOT_COOP_LEASH)
+
+    def test_too_far_ahead_it_stops_and_waits(self):
+        """★★ 冲过前界 = **停下来等**，不是往回走。"""
+        self.install_terrain(synth_terrain("coop_ahead", width=4000,
+                                           points={101: [(100, 40)]}))
+        self.walk(self.alice, [(0.0, 150.0), (400.0, 150.0)])
+        far = 400.0 + bot.BOT_COOP_AHEAD_LIMIT + 200.0
+        self.bot_conn.battle_pos = (far, 150.0)
+        self.bot_conn.body = bot.botmove.Body(far, 150.0)
+        self.bot_conn.move_at = time.monotonic()
+        intent = bot._coop_intent(self.room, self.bot_conn, self.bot_seat,
+                                  mapdata.load(self.room.map_name), None)
+        self.assertEqual(0, intent[0],
+                         "超过前界该站住等，不该往回走（实际方向 %d）"
+                         % intent[0])
+        self.assertFalse(intent[3])
+
 
 class BotCoopLeashTests(TerrainMixin, BotFrameRoom):
     """★★★★ 闯关**牵引绳**（D99）—— 落后 3/4 屏就无条件追，追不上就瞬移。
@@ -4242,13 +4296,15 @@ class BotCoopLeashTests(TerrainMixin, BotFrameRoom):
 
     def test_within_the_leash_nothing_changes(self):
         terrain = self.leash_room(key="leash_near")
+        near = bot.BOT_COOP_LEASH / 2.0        # 后界以内 = 牵引绳不插手
         self.place_bot(200.0)
-        self.walk(self.alice, [(600.0, 150.0), (800.0, 150.0)])
+        self.walk(self.alice, [(200.0 + near - 100.0, 150.0),
+                               (200.0 + near, 150.0)])
         self.assertIsNone(
             bot._coop_leash_intent(self.room, self.bot_conn, self.bot_seat,
                                    terrain),
-            "落后 600 还没到 3/4 屏（%.0f），牵引绳不该插手"
-            % bot.BOT_COOP_LEASH)
+            "落后 %.0f 还没到后界（%.0f），牵引绳不该插手"
+            % (near, bot.BOT_COOP_LEASH))
         self.assertFalse(self.bot_conn.leash_lagging)
 
     def test_past_the_leash_it_chases_at_a_sprint(self):
@@ -4257,7 +4313,7 @@ class BotCoopLeashTests(TerrainMixin, BotFrameRoom):
         self.walk(self.alice, [(1500.0, 150.0), (1600.0, 150.0)])
         intent = bot._coop_leash_intent(self.room, self.bot_conn,
                                         self.bot_seat, terrain)
-        self.assertIsNotNone(intent, "落后 1400 早过了 3/4 屏")
+        self.assertIsNotNone(intent, "落后 1400 早过了后界")
         self.assertEqual(1, intent[0], "该朝前追")
         self.assertTrue(intent[3], "该按着右键冲刺")
         self.assertTrue(self.bot_conn.leash_lagging)
@@ -4368,25 +4424,28 @@ class BotCoopLeashTests(TerrainMixin, BotFrameRoom):
 
     # -- §141：滞回 + 「追不上就瞬移」 ---------------------------------------
     def test_a_lagging_bot_keeps_chasing_until_half_a_screen(self):
-        """★★★ 触发线（3/4 屏）和释放线（半屏）是两个数 —— 别钉在线上抖。
+        """★★★ 触发线和释放线是两个数 —— 别钉在线上抖（§141 / D103）。
 
-        实机第四轮：三只 bot 全程 749~828、每 130ms 翻转一次「掉队 /
-        归队」。掉队中的 bot 追回到 **600**（还没进半屏）必须还在追。
+        实机第四轮：三只 bot 全程钉在触发线上、每 130ms 翻转一次「掉队 /
+        归队」。掉队中的 bot 要**追过头一截**（追进释放线）才算归队。
         """
         terrain = self.leash_room(key="leash_hysteresis", width=4000)
+        lead = 1600.0
+        between = (bot.BOT_COOP_LEASH + bot.BOT_COOP_LEASH_RELEASE) / 2.0
+        inside = bot.BOT_COOP_LEASH_RELEASE / 2.0
         self.place_bot(200.0)
-        self.walk(self.alice, [(1500.0, 150.0), (1600.0, 150.0)])
+        self.walk(self.alice, [(lead - 100.0, 150.0), (lead, 150.0)])
         bot._coop_leash_intent(self.room, self.bot_conn, self.bot_seat,
                                terrain)
         self.assertTrue(self.bot_conn.leash_lagging)
-        self.place_bot(1000.0)          # 落后 600：过了触发线的"里侧"，
-        intent = bot._coop_leash_intent(  # 但还没进半屏的归队线
+        self.place_bot(lead - between)   # 过了触发线的「里侧」，
+        intent = bot._coop_leash_intent(  # 但还没进释放线
             self.room, self.bot_conn, self.bot_seat, terrain)
-        self.assertIsNotNone(intent, "落后 600 还没进归队线（512），"
-                                     "该接着追")
+        self.assertIsNotNone(intent, "落后 %.0f 还没进释放线（%.0f），该接着追"
+                                     % (between, bot.BOT_COOP_LEASH_RELEASE))
         self.assertEqual(1, intent[0])
         self.assertTrue(self.bot_conn.leash_lagging)
-        self.place_bot(1200.0)          # 落后 400：进半屏了，撒手
+        self.place_bot(lead - inside)    # 进释放线了，撒手
         self.assertIsNone(bot._coop_leash_intent(
             self.room, self.bot_conn, self.bot_seat, terrain))
         self.assertFalse(self.bot_conn.leash_lagging)
@@ -7572,6 +7631,175 @@ class BotQuestSplashTests(BotQuestCombatTests):
         targets = {struct.unpack_from("<i", body_of(f), 4)[0]
                    for f in splash_frames(self.alice, self.bot_seat)}
         self.assertNotIn(handle, targets, "任务模式的火墙烧不到队友")
+
+
+class BotGapJumpTests(TerrainMixin, BotFrameRoom):
+    """★★★ 坑太宽时**兜底也要会二段跳**（§144）。
+
+    用户 2026-08-30：「经过岩浆时，bot 似乎不会用二段跳来跳到对面平台，
+    只会用一段跳，然后反复掉进岩浆。」
+
+    二段跳在 A\* 那边一直是有边的（§124），缺的是**兜底那条路**：A\* 在
+    后台线程上跑（§137），算好之前 / 说「到不了」时走的都是
+    `_walk_to()` 末尾那几行，而它以前只问过一段跳。
+    ★ 量出来的跨度（floor=700 的合成图，够高才不会撞天花板）：
+    一段跳 264、二段跳 **488** —— 差不多两倍。
+    """
+
+    def gap_room(self, key, gap):
+        """左平台 + 宽 `gap` 的无底洞 + 右平台；bot 站在洞左边一步远。"""
+        terrain = self.install_terrain(synth_terrain(
+            key, floor=700, width=1600, height=800, pits=((700, 700 + gap),)))
+        # ★ 贴着洞口站：`drop_below()` 只看**下一步**踩不踩得空，站远了
+        #   这一帧的答案是「脚下还是平地」，根本走不到跳那一段。
+        self.place_bot(697.0, 700.0)
+        return terrain
+
+    def walk_east(self, terrain):
+        return bot._walk_to(self.room, self.bot_conn, terrain,
+                            (1500.0, 700.0), False)
+
+    def test_a_narrow_gap_is_a_plain_jump(self):
+        terrain = self.gap_room("gap_narrow", 180)
+        intent = self.walk_east(terrain)
+        self.assertEqual((1, True), intent[:2], "一段跳够得着就一段跳")
+        self.assertFalse(self.bot_conn.nav_double_jump,
+                         "够得着就别白按第二段")
+
+    def test_a_wide_gap_uses_the_second_jump(self):
+        terrain = self.gap_room("gap_wide", 300)
+        self.assertIsNone(
+            botmove.jump_lands(terrain, self.bot_conn.body,
+                               chrprops.get(self.bot_conn.character_id), 1),
+            "这个宽度一段跳本来就过不去（前提没了测试就不成立）")
+        intent = self.walk_east(terrain)
+        self.assertEqual((1, True), intent[:2], "该起跳")
+        self.assertTrue(self.bot_conn.nav_double_jump,
+                        "一段跳过不去 -> 这一跳要在顶点补第二段")
+
+    def test_an_impossible_gap_still_stops_at_the_edge(self):
+        """★ 两段都过不去就**别走** —— 这条闸不能被新逻辑拆掉。"""
+        terrain = self.gap_room("gap_huge", 900)
+        intent = self.walk_east(terrain)
+        self.assertEqual(0, intent[0], "过不去就站住，别往坑里走")
+        self.assertFalse(intent[1])
+
+    def test_the_second_stage_is_pressed_at_the_apex(self):
+        """★★ 起跳之后：升段不按、**顶点**按一次、按过就不再按。"""
+        terrain = self.gap_room("gap_apex", 300)
+        self.walk_east(terrain)
+        self.assertTrue(self.bot_conn.nav_double_jump)
+        who = chrprops.get(self.bot_conn.character_id)
+        body = botmove.tick(terrain, self.bot_conn.body, who,
+                            direction=1, want_jump=True)
+        pressed = []
+        for _ in range(40):
+            if body.on_ground:
+                break
+            self.bot_conn.body = body
+            intent = self.walk_east(terrain)
+            pressed.append(bool(intent[1]))
+            body = botmove.tick(terrain, body, who, want_jump=intent[1])
+        self.assertEqual(1, pressed.count(True),
+                         "第二段只该按一次，实际按了 %d 次" % pressed.count(True))
+        self.assertFalse(pressed[0], "刚离地还在往上升，这时候按是浪费")
+
+    def test_landing_clears_the_flag(self):
+        """★ 落地之后旗子要清 —— 不然下次从台阶走下去会白跳一段。"""
+        terrain = self.gap_room("gap_clear", 300)
+        self.walk_east(terrain)
+        self.assertTrue(self.bot_conn.nav_double_jump)
+        self.place_bot(400.0, 700.0)          # 重新站到平地中间
+        bot._walk_to(self.room, self.bot_conn, terrain, (405.0, 700.0), False)
+        self.assertFalse(self.bot_conn.nav_double_jump)
+
+
+class BotFallDownTests(TerrainMixin, BotFrameRoom):
+    """★★★ **掉出地图下边界 = 死**（§143）—— `map.ini` 的 `FallDown`。
+
+    用户 2026-08-30：「bot 掉到岩浆里不会死亡，并且还会在空中不停的上下
+    抽搐，然后游戏进度卡住」+「这个问题不局限于任务模式，对战模式也一样」。
+
+    根因：`mapdata` 里**出界返回 2**（照抄客户端，免得 bot 觉得图外能走）
+    ⇒ 掉下去的 bot 被图外那圈虚拟实心接住，悬在最后一行既不死也回不来；
+    而「掉出去要判死」这一条服务端整条没有 —— 它在客户端是每帧一次的
+    `Character::CheckFallDown`（`0x50d520`），玩家角色那一份直接发 `0x0408`。
+    """
+
+    def enable_fall_down(self, value=True):
+        """给这张（合成的）图挂上 `map.ini` 的 `FallDown` 那一格。"""
+        props = mapdata.STORE.index().setdefault("props", {})
+        if value:
+            props[self.room.map_name] = {"fall_down": True}
+        else:
+            props.pop(self.room.map_name, None)
+        self.addCleanup(props.pop, self.room.map_name, None)
+
+    def test_the_flag_comes_from_the_real_products(self):
+        """★ 真产物里 `FallDown` 只有那 14 张图有 —— 别把它当默认值。"""
+        self.assertTrue(mapdata.falls_out_of_the_world("Esperan00"),
+                        "에스페란 용암동굴（岩浆洞）是 FallDown=1 的图")
+        self.assertTrue(mapdata.falls_out_of_the_world("Esperan00:NewPvp"),
+                        "带玩法后缀的完整串也要查得到")
+        self.assertFalse(mapdata.falls_out_of_the_world("Quest03_1"))
+        self.assertFalse(mapdata.falls_out_of_the_world(""))
+
+    def test_a_bot_at_the_bottom_of_the_map_has_fallen_out(self):
+        terrain = self.install_terrain(synth_terrain("falldown", width=1200))
+        self.enable_fall_down()
+        self.place_bot(600.0, terrain.height - 1.0)
+        self.assertTrue(bot._fell_out_of_the_world(
+            self.room, self.bot_conn, terrain))
+
+    def test_normal_ground_is_not_a_fall(self):
+        terrain = self.install_terrain(synth_terrain("falldown_ok",
+                                                     width=1200))
+        self.enable_fall_down()
+        self.place_bot(600.0, 150.0)
+        self.assertFalse(bot._fell_out_of_the_world(
+            self.room, self.bot_conn, terrain))
+
+    def test_without_the_map_flag_nothing_happens(self):
+        """★ 没有 `FallDown` 的图掉到底也不死 —— 原版就是这样。"""
+        terrain = self.install_terrain(synth_terrain("falldown_off",
+                                                     width=1200))
+        self.enable_fall_down(False)
+        self.place_bot(600.0, terrain.height - 1.0)
+        self.assertFalse(bot._fell_out_of_the_world(
+            self.room, self.bot_conn, terrain))
+
+    def test_falling_out_reports_a_death_and_arms_the_respawn(self):
+        """★★ 判死走的是真人那条路：广播 `0x0406` + 上重生闩。"""
+        terrain = self.install_terrain(synth_terrain("falldown_die",
+                                                     width=1200))
+        self.enable_fall_down()
+        self.place_bot(600.0, terrain.height - 1.0)
+        self.clear()
+        bot._report_fall_death(self.room, self.bot_conn, self.bot_seat)
+        codes = opcodes(self.alice)
+        self.assertIn(gameserver.OP_BROADCAST_DEATH, codes,
+                      "该广播死亡，实际发了 %s" % codes)
+        self.assertIn(self.bot_seat, self.room.quest.respawn_due,
+                      "该上重生闩 —— 5 秒后自己站起来")
+
+    def test_a_second_fall_is_reported_again(self):
+        """★ 第二次掉下去还得报得出来（死亡次数要报服务端的权威计数）。"""
+        terrain = self.install_terrain(synth_terrain("falldown_twice",
+                                                     width=1200))
+        self.enable_fall_down()
+        self.place_bot(600.0, terrain.height - 1.0)
+        bot._report_fall_death(self.room, self.bot_conn, self.bot_seat)
+        quest = self.room.quest
+        quest.respawn_due.pop(self.bot_seat, None)
+        handle = botsync.character_handle(self.bot_seat)
+        # 时间窗（3 秒）是给「几台机器同时代报」用的，把它拨过去。
+        quest.last_death_broadcast_at[handle] = (
+            time.monotonic() - gameserver.MONSTER_DEATH_DEDUP_WINDOW_S - 1.0)
+        self.clear()
+        bot._report_fall_death(self.room, self.bot_conn, self.bot_seat)
+        codes = opcodes(self.alice)
+        self.assertIn(gameserver.OP_BROADCAST_DEATH, codes,
+                      "第二次掉下去也要报死，实际发了 %s" % codes)
 
 
 def ice_terrain(key, floor=150, width=1400, height=180,
