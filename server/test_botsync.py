@@ -4266,7 +4266,12 @@ class BotSpawnPointTests(TerrainMixin, BotFireRoom):
         """★★★ 用户 2026-08-28 报的「我一死 bot 就瞬移过来然后抽搐」。
 
         真人一死，`_hostile_targets()` 就空了 —— 旧代码在那一刻退回
-        `trail_point(真人轨迹)`，bot 被拽到他身边。现在该**原地站着**。
+        `trail_point(真人轨迹)`，bot 被拽到他身边。
+
+        ★ 会话 41 起 bot **不再是站着不动**（用户 2026-08-30：「敌人死后
+        bot 就停下不动了，我希望它会自己走位」）—— 它会朝敌方出生点挪。
+        所以这条要钉的两件事变成：**不会被拽到真人身上**、
+        **每帧最多挪一步**（不瞬移）。
         """
         self.terrain()
         self.walk(self.alice, [(700.0, 150.0)])
@@ -4276,8 +4281,14 @@ class BotSpawnPointTests(TerrainMixin, BotFireRoom):
         self.room.quest.arm_respawn_watchdog(
             self.room.seat_index_of(self.alice), (700.0, 150.0), after=5.0)
         self.assertEqual([], bot._hostile_targets(self.room, self.bot_seat))
-        self.walk(self.alice, [(700.0, 150.0), (700.0, 150.0)])
-        self.assertEqual(here, self.bot_conn.battle_pos)
+        previous = here
+        for _ in range(4):
+            self.walk(self.alice, [(700.0, 150.0)])
+            now = self.bot_conn.battle_pos
+            self.assertNotEqual((700.0, 150.0), now, "不许被拽到真人身上")
+            step = math.hypot(now[0] - previous[0], now[1] - previous[1])
+            self.assertLess(step, 200.0, f"一帧挪了 {step:.0f}，这是瞬移")
+            previous = now
 
 
 class BotKnockbackLadderTests(unittest.TestCase):
@@ -6520,3 +6531,391 @@ class BotQuestCombatTests(TerrainMixin, BotFrameRoom):
         self.spot_mob()
         self.room.quest.begin_map_change('ZZ_next')
         self.assertEqual([], bot.live_mobs(self.room))
+
+
+# ---------------------------------------------------------------------------
+# ★★★ 会话 41：视野 / 换枪冷却 / 没有敌人时的走位 / 闯关近身与记分
+# ---------------------------------------------------------------------------
+class BotVisionTests(TerrainMixin, BotFireRoom):
+    """★★★ **屏幕外的人 bot 看不见**（§127）。
+
+    用户 2026-08-30：「离得很远时 bot 都能朝我的方向准确开枪，这不合理。
+    真人只能看见自己屏幕内的人。……为防止所有人都在范围外导致 bot 找不到人
+    而不知道干什么，可以告诉 bot 敌人的粗略方位，上下左右这个粗略程度就够了。」
+
+    视野框是**语料量出来的**（144 万发心跳里 `|准星 − 角色|` 的 p95），
+    见 `bot.BOT_VISION_HALF_X` 的注释。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.install_terrain(synth_terrain("vision", width=4000))
+        self.place_bot(200.0)
+
+    def test_a_target_inside_the_box_is_visible(self):
+        self.assertTrue(bot._in_sight(self.bot_conn, 200.0 + 900.0, 150.0))
+        self.assertTrue(bot._in_sight(self.bot_conn, 200.0, 150.0 - 500.0))
+
+    def test_a_target_outside_the_box_is_not(self):
+        self.assertFalse(
+            bot._in_sight(self.bot_conn, 200.0 + bot.BOT_VISION_HALF_X + 1.0,
+                          150.0))
+        self.assertFalse(
+            bot._in_sight(self.bot_conn, 200.0,
+                          150.0 - bot.BOT_VISION_HALF_Y - 1.0))
+
+    def test_it_does_not_shoot_someone_off_screen(self):
+        """★★ 这就是用户报的那条：隔半张图也弹无虚发。"""
+        far = 200.0 + bot.BOT_VISION_HALF_X + 400.0
+        self.walk(self.alice, [(far, 150.0)])
+        self.place_bot(200.0)
+        self.clear()
+        self.bot_conn.next_fire_at = 0.0
+        self.assertEqual([], bot._visible_targets(self.room, self.bot_conn,
+                                                  self.bot_seat))
+        self.assertIsNone(bot._fire_target(self.room, self.bot_conn,
+                                           self.bot_seat,
+                                           self.bot_conn.weapon))
+
+    def test_a_target_that_walks_into_the_box_becomes_shootable(self):
+        self.walk(self.alice, [(200.0 + 600.0, 150.0)])
+        self.place_bot(200.0)
+        self.bot_conn.next_fire_at = 0.0
+        self.assertTrue(bot._visible_targets(self.room, self.bot_conn,
+                                             self.bot_seat))
+
+    def test_out_of_sight_leaves_only_a_rough_bearing(self):
+        """★ 只剩上下左右：给出来的点在**视野边缘**上，不是敌人的真坐标。"""
+        far = 200.0 + bot.BOT_VISION_HALF_X + 400.0
+        self.walk(self.alice, [(far, 40.0)])
+        self.place_bot(200.0)
+        spot = bot._rough_bearing(self.room, self.bot_conn, self.bot_seat)
+        self.assertIsNotNone(spot)
+        self.assertEqual(200.0 + bot.BOT_VISION_HALF_X, spot[0])
+        self.assertEqual(150.0 - bot.BOT_VISION_HALF_Y, spot[1])
+        self.assertNotEqual(far, spot[0], "不许把精确坐标喂给它")
+
+    def test_it_walks_toward_the_bearing(self):
+        far = 200.0 + bot.BOT_VISION_HALF_X + 400.0
+        self.walk(self.alice, [(far, 150.0)])
+        self.place_bot(200.0)
+        self.beats(4, far)
+        self.assertGreater(self.bot_conn.body.x, 200.0,
+                           "看不见也该朝那个方向挪")
+
+
+class BotIdleRepositionTests(TerrainMixin, BotFireRoom):
+    """★★ 敌人全躺下时**不站着发呆**，去敌方出生点等（§128）。
+
+    用户 2026-08-30：「敌人死后，bot 就停下不动了。我希望改成像真人一样，
+    会自己走位，提前寻找有利地形。」
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.install_terrain(synth_terrain(
+            "idle_spawn", width=2000,
+            points={bot.SPAWN_TYPE_TEAM_A: [(1500, 40)],
+                    bot.SPAWN_TYPE_TEAM_B: [(1700, 40)]}))
+        self.place_bot(200.0)
+
+    def kill_everyone(self):
+        for conn in (self.alice, self.bob):
+            self.room.quest.arm_respawn_watchdog(
+                self.room.seat_index_of(conn), (300.0, 150.0), after=99.0)
+
+    def test_the_watch_spot_is_an_enemy_spawn_point(self):
+        spot = bot._spawn_watch_spot(self.room, self.bot_conn, self.bot_seat,
+                                     mapdata.load(self.room.map_name))
+        self.assertIn(spot, [(1500.0, 40.0), (1700.0, 40.0)])
+
+    def test_it_keeps_moving_after_everyone_is_down(self):
+        self.kill_everyone()
+        self.assertEqual([], bot._hostile_targets(self.room, self.bot_seat))
+        start = self.bot_conn.body.x
+        self.beats(6, 300.0)
+        self.assertGreater(self.bot_conn.body.x, start,
+                           "敌人全躺着也该走位，不该杵在原地")
+
+
+class BotWeaponCooldownTests(BotFireRoom):
+    """★★★ 换枪之后要**上膛**，而且每把枪的冷却是各算各的（§126）。
+
+    用户 2026-08-30：「bot 换枪后立刻就能开枪，这不合理。……第一个 cd 是
+    固定的 cd，更换武器后有 1 秒左右无法开枪，第二个 cd 是武器原本的 cd。
+    每个角色的 3 种武器的 cd 是单独计算的，切换到别的武器后上一个武器的
+    cd 进度就会暂停，下次再切换回这个武器后会继续走完之前的 cd。」
+
+    原版实现见 `bot._switch_weapon_clock()` 的 docstring（逐指令）。
+    """
+
+    def machine(self):
+        return self.bot_conn
+
+    def test_loading_time_is_the_original_per_weapon_number(self):
+        self.assertEqual(200, weapondata.get(1000010).loading_ms)
+        self.assertEqual(300, weapondata.get(1000020).loading_ms)
+        self.assertEqual(400, weapondata.get(1000030).loading_ms)
+
+    def test_switching_arms_the_loading_time(self):
+        machine = self.machine()
+        machine.declared_weapon = 1000010
+        machine.next_fire_at = 0.0
+        now = time.monotonic()
+        bot._switch_weapon_clock(machine, 1000010, weapondata.get(1000030),
+                                 now)
+        self.assertAlmostEqual(now + 0.400, machine.next_fire_at, places=3)
+
+    def test_the_old_weapon_cooldown_freezes_and_resumes(self):
+        """★★★ 切走暂停、切回来接着走完 —— 用户描述的那条。"""
+        machine = self.machine()
+        now = time.monotonic()
+        machine.declared_weapon = 1000010
+        machine.next_fire_at = now + 1.0          # 1 号枪还剩 1 秒冷却
+        bot._switch_weapon_clock(machine, 1000010, weapondata.get(1000020),
+                                 now)
+        self.assertAlmostEqual(1.0, machine.weapon_cd[1000010], places=3)
+        # 过了 10 秒（1 号枪没在手上，那 1 秒**一点都没走**）
+        later = now + 10.0
+        bot._switch_weapon_clock(machine, 1000020, weapondata.get(1000010),
+                                 later)
+        # 剩下的 1 秒 + 1 号枪自己的上膛 0.2 秒
+        self.assertAlmostEqual(later + 1.2, machine.next_fire_at, places=3)
+
+    def test_the_magazine_travels_with_the_weapon(self):
+        machine = self.machine()
+        now = time.monotonic()
+        machine.declared_weapon = 1000010
+        machine.rounds_left = 3
+        bot._switch_weapon_clock(machine, 1000010, weapondata.get(1000020),
+                                 now)
+        self.assertIsNone(machine.rounds_left, "新枪是满弹匣")
+        bot._switch_weapon_clock(machine, 1000020, weapondata.get(1000010),
+                                 now)
+        self.assertEqual(3, machine.rounds_left, "切回来还是剩 3 发")
+
+    def test_a_switch_cannot_fire_in_the_same_frame(self):
+        """★★ 端到端：刚换完枪那一帧一发都打不出去。"""
+        machine = self.machine()
+        self.approach()
+        self.clear()
+        machine.next_fire_at = 0.0
+        bot._declare_weapon(machine, self.bot_seat, weapondata.get(1000030))
+        self.assertGreater(machine.next_fire_at, time.monotonic())
+        self.walk(self.alice, [(140.0, 100.0)])
+        self.assertEqual([], fire_frames(self.alice, self.bot_seat))
+
+
+class BotQuestMeleeTests(BotQuestCombatTests):
+    """★★ 闯关房里近身招式也该对**怪**发得出来（§129）+ 打怪要记分（§130）。
+
+    用户 2026-08-30：「闯关模式下，bot 似乎不会用近战招式，怪都贴脸了，
+    bot 都不发动近战招式。」「bot 打怪后，右上角 bot 没有分数。」
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.bot_conn.melee = True
+        self.bot_conn.stamina = 100.0
+
+    def test_a_mob_next_to_it_is_a_melee_target(self):
+        self.spot_mob(x=640.0, y=150.0)          # bot 站在 600
+        bodies = bot._melee_bodies(self.room, self.bot_conn,
+                                   self.bot_seat, targeting=True)
+        self.assertTrue(any(isinstance(row[0], tuple) for row in bodies),
+                        "怪该进近身名单")
+        move = chrprops.get(self.bot_conn.character_id).dash(bot.BOT_DASH_INDEX)
+        self.assertIsNotNone(
+            bot._dash_target(self.room, self.bot_conn, self.bot_seat, move))
+
+    def test_a_mob_off_screen_is_not(self):
+        self.spot_mob(x=600.0 + bot.BOT_VISION_HALF_X + 100.0, y=150.0)
+        self.assertEqual(
+            [], [row for row in bot._melee_bodies(self.room, self.bot_conn,
+                                                  self.bot_seat,
+                                                  targeting=True)
+                 if isinstance(row[0], tuple)])
+
+    def test_hitting_a_mob_scores(self):
+        """★ 分数 = 打在怪身上的伤害（语料：加分增量众数就是武器伤害）。"""
+        before = int(self.bot_conn.quest_score)
+        bot._score_quest_damage(self.room, self.bot_conn, 22)
+        self.assertEqual(before + 22, self.bot_conn.quest_score)
+
+    def test_the_score_is_broadcast_so_the_panel_shows_it(self):
+        self.clear()
+        bot._score_quest_damage(self.room, self.bot_conn, 18)
+        codes = opcodes(self.alice)
+        self.assertIn(gameserver.OP_REP_QUEST_SCORE, codes)
+
+    def test_a_pvp_room_does_not_use_the_quest_score(self):
+        """对战房记的是杀敌数（§167），这一格不该动。"""
+        room = self.room
+        original = room.team_layout
+        room.team_layout = lambda: lobby.TEAM_LAYOUT_FREE
+        self.addCleanup(setattr, room, "team_layout", original)
+        before = int(self.bot_conn.quest_score)
+        bot._score_quest_damage(room, self.bot_conn, 22)
+        self.assertEqual(before, self.bot_conn.quest_score)
+
+
+class BotPlanBudgetTests(TerrainMixin, BotFireRoom):
+    """★★★ 一帧最多跑一次 A*（会话 41）—— 卡顿和「闪现」的根。"""
+
+    def setUp(self):
+        super().setUp()
+        self.install_terrain(synth_terrain(
+            "budget", width=2400, walls=((1200, 2400, 40),)))
+        self.place_bot(200.0)
+
+    def test_one_frame_plans_at_most_once(self):
+        calls = []
+        original = bot.botnav.plan
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        bot.botnav.plan = counted
+        self.addCleanup(setattr, bot.botnav, "plan", original)
+        self.beats(1, 2200.0, 40.0)
+        self.assertEqual(1, len(calls),
+                         f"一帧跑了 {len(calls)} 次 A*，逐 tick 规划回来了")
+
+    def test_the_body_never_jumps_more_than_two_heartbeats(self):
+        """★★ 服务端卡住之后不许把攒下的位移一次性推出去（= 闪现）。"""
+        self.beats(1, 2200.0, 40.0)
+        before = self.bot_conn.body
+        # 假装服务端卡了 3 秒
+        self.bot_conn.move_at -= 3.0
+        self.human_heartbeat(self.alice, 2200.0, 40.0)
+        after = self.bot_conn.body
+        # ★ 量**水平**位移：垂直那一格是重力，收方自己也在算（腾空段照抄
+        #   速度，§35），拉不出「穿墙」；横着一次挪过去才是用户看到的闪现。
+        step = abs(after.x - before.x)
+        ceiling = (bot.BOT_MOVE_MAX_TICKS
+                   * botmove.walk_speed(chrprops.get(
+                       self.bot_conn.character_id), fast_run=True) + 1.0)
+        self.assertLessEqual(step, ceiling,
+                             f"一帧横着挪了 {step:.0f} 个单位，这是闪现")
+        # 攒下的那 3 秒被丢掉了，不会在后面几帧接着补出来。
+        self.assertLessEqual(time.monotonic() - self.bot_conn.move_at, 0.1)
+
+
+class BotDoubleJumpNavTests(TerrainMixin, BotFireRoom):
+    """★★★ **两段跳才上得去的高台**（会话 41 / §131）。
+
+    用户 2026-08-30：「我在的平台位置比较高时，bot 不会自己找附近的弹跳
+    平台跳上去，只会在我下面的平台自己来回跳，看起来有点笨。」
+
+    根因：`botnav` 的可达图里只有**一段**跳（顶点 `20²/2.4 = 167`），
+    比它高的平台在图里就是「不可达」。实测 `Iceria02` 上从任何一个出生点
+    泛洪，y 一路只到 396 —— 上面那一整层（出生点表里写着 y=255）
+    bot 一辈子上不去。加上二段跳边之后泛洪到 y=244。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.original_fire = bot._fire_target
+        bot._fire_target = lambda *a, **k: None
+        self.addCleanup(setattr, bot, "_fire_target", self.original_fire)
+
+    def test_a_platform_above_one_jump_is_still_reachable(self):
+        # 台面比地面高 240 —— 一段跳（167）够不着，两段跳（≈407）够得着。
+        self.install_terrain(synth_terrain(
+            "nav_double", floor=300, height=340, walls=((700, 1400, 60),)))
+        self.place_bot(560.0, 300.0)
+        self.beats(60, 900.0, 60.0)
+        body = self.bot_conn.body
+        self.assertTrue(body.on_ground)
+        self.assertAlmostEqual(60.0, body.y,
+                               msg="两段跳该把它送上高台，实际停在 y=%.0f"
+                                   % body.y)
+
+    def test_the_second_stage_is_reported_as_stage_two(self):
+        """★ `rpJump` 的段号要报 2（§124），别人屏幕上才画得出第二段。"""
+        self.install_terrain(synth_terrain(
+            "nav_double", floor=300, height=340, walls=((700, 1400, 60),)))
+        self.place_bot(560.0, 300.0)
+        self.beats(60, 900.0, 60.0)
+        stages = [body_of(f)[1] for f in bot_frames(self.alice, self.bot_seat)
+                  if header(f)["opcode"] == botsync.OP_JUMP]
+        self.assertIn(2, stages, "应该发过一发第 2 段的 rpJump")
+
+
+class BotQuestSplashTests(BotQuestCombatTests):
+    """★★★ **闯关模式里溅射 / 地面燃烧也该打得到怪**（V0.3 §134）。
+
+    用户 2026-08-30：「你说的闯关模式溅射打怪问题也要修。」
+
+    根因：`_splash_targets()` / `_advance_fires()` 的名单只有
+    `_battle_bodies()`（= 座位），而原版溅射对象和火墙的碰撞组是
+    「撞所有人」—— 怪当然也在里面。于是 bot 的手雷炸在一堆怪中间
+    一滴血都不掉，燃烧瓶铺完火一只怪都烧不到。
+    """
+
+    def shell_at(self, x, y, ammo=1002020):
+        """在 `(x, y)` 造一颗**已经飞到头**的弹体（只用来验结算）。"""
+        weapon = weapondata.get(ammo)
+        shot = ballistics.solve(weapon, 100.0, 0.0)
+        shell = bot.Shell(handle=300099, fire_seq=0, weapon=weapon,
+                          group=bot._seat_group(self.room, self.bot_seat),
+                          x0=x, y0=y, shot=shot, born=time.monotonic(),
+                          max_ticks=200)
+        shell.x, shell.y = x, y
+        return shell
+
+    def test_splash_reaches_a_mob(self):
+        self.spot_mob(handle=500123, x=880.0, y=120.0)
+        self.clear()
+        shell = self.shell_at(880.0, 120.0)
+        bot._resolve_shell(self.room, self.bot_conn, shell,
+                           (900.0, 120.0), None, None)
+        targets = {struct.unpack_from("<i", body_of(f), 4)[0]
+                   for f in splash_frames(self.alice, self.bot_seat)}
+        self.assertIn(500123, targets, "手雷炸在怪旁边该溅到它")
+
+    def test_the_directly_hit_mob_is_not_splashed_twice(self):
+        self.spot_mob(handle=500123, x=880.0, y=120.0)
+        self.clear()
+        shell = self.shell_at(880.0, 120.0)
+        bot._resolve_shell(self.room, self.bot_conn, shell,
+                           (880.0, 120.0), ("mob", 500123), None)
+        targets = [struct.unpack_from("<i", body_of(f), 4)[0]
+                   for f in splash_frames(self.alice, self.bot_seat)]
+        self.assertNotIn(500123, targets,
+                         "直接命中的那只已经吃过 rpExplode 那一档了")
+
+    def test_splashing_a_mob_scores(self):
+        self.spot_mob(handle=500123, x=880.0, y=120.0)
+        before = int(self.bot_conn.quest_score)
+        shell = self.shell_at(880.0, 120.0)
+        bot._resolve_shell(self.room, self.bot_conn, shell,
+                           (900.0, 120.0), None, None)
+        self.assertGreater(self.bot_conn.quest_score, before)
+
+    def test_a_mob_far_from_the_blast_is_untouched(self):
+        self.spot_mob(handle=500123, x=880.0, y=120.0)
+        self.clear()
+        shell = self.shell_at(880.0, 120.0)
+        bot._resolve_shell(self.room, self.bot_conn, shell,
+                           (3000.0, 120.0), None, None)
+        targets = [struct.unpack_from("<i", body_of(f), 4)[0]
+                   for f in splash_frames(self.alice, self.bot_seat)]
+        self.assertNotIn(500123, targets)
+
+    def test_ground_fire_burns_a_mob(self):
+        """★ 燃烧瓶铺的那道火墙同理（火墙的碰撞组是 255 = 撞所有人）。"""
+        self.spot_mob(handle=500123, x=880.0, y=150.0)
+        weapon = weapondata.get(1001020)          # ch01-02 燃烧瓶
+        bot._set_ground_on_fire(self.room, self.bot_conn, weapon,
+                                (880.0, 150.0))
+        self.assertTrue(self.bot_conn.fires, "该铺出一道火墙")
+        self.clear()
+        self.bot_conn.burnt = {}
+        for wall in self.bot_conn.fires:
+            wall.born_tick -= 40
+        bot._advance_fires(self.room, self.bot_conn, time.monotonic())
+        targets = {struct.unpack_from("<i", body_of(f), 4)[0]
+                   for f in splash_frames(self.alice, self.bot_seat)}
+        self.assertIn(500123, targets, "站在火里的怪该掉血")

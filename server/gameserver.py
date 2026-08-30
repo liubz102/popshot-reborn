@@ -6264,6 +6264,13 @@ class Conn:
         self.log(f"   HP 归零上报: {who} 句柄=0x{info['handle']:08x} "
                  f"凶手={info['arg']} 死亡次数={info['deaths']} "
                  f"位置=({info['x']:.0f}, {info['y']:.0f})")
+        if not 0 <= seat < ROOM_SEAT_COUNT:
+            # ★★ 死掉的是**怪**：从 AI 位置表里摘掉（V0.3 §125 的那张表就是
+            #   bot 的目标表）。`rpAiMsg` 的 `state=death` 是主路，但语料里
+            #   272 个句柄有 2 个到最后都没报过 —— 那两只留在表里就成了
+            #   「bot 一直朝一具不存在的尸体开枪」。这一发是**另一个独立的
+            #   死亡事实**，两条都收下才不会漏。
+            quest.mobs.pop(info["handle"], None)
         if not first:
             # 已经替这个句柄报过了。再广播一次就多记一次死亡。
             self.vlog(f"   句柄 0x{info['handle']:08x} 的死亡已经广播过；"

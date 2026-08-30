@@ -206,6 +206,25 @@ class Weapon(object):
         return self.raw.get("reload_ms")
 
     @property
+    def loading_ms(self):
+        """★★ `LoadingTime`：**换到这把枪之后要上多久的膛**（V0.3 §126）。
+
+        用户 2026-08-30 报的「bot 换枪后立刻就能开枪，不合理」说的就是它。
+        原版把它做成**按武器 id 记的一张倒计时表**：
+
+            换武器           `0x51727f` -> `0x48bcaa(持枪器, 武器id, LoadingTime)`
+            重生 / Reset     `0x514565` -> 同上，三张表一起上
+            每帧递减          `0x5163fe` -> `0x48bd59(持枪器, [持枪器+0x18])`
+                             ★ 键是**当前手上那把** ⇒ 切走的那把定格不动
+            能不能开枪        `0x48f573`：三张表任意一张 > 0 就开不出去
+
+        基础九把枪是 100~400 ms，重武器到 2000 ms。**不是全局常量** ——
+        每把枪自己的数。语料佐证：换到另一把插槽武器之后第一发开火，
+        只有 2.9% 落在 128 ms 以内，中位数在 10 发心跳（≈1.28 秒）。
+        """
+        return self.raw.get("loading_ms")
+
+    @property
     def velocity(self):
         return float(self.raw.get("velocity", 0.0))
 

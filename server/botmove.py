@@ -438,8 +438,33 @@ def ticks_for(seconds):
     return max(1, int(float(seconds) * TICKS_PER_SECOND))
 
 
-def settle(terrain, body, character, ticks=TICKS_PER_BEAT * 8):
+def fall_ticks(terrain):
+    """从图顶自由落到图底要几个 tick —— 「掉不到底」的**几何上界**。
+
+    `h = ½ g t²  ⇒  t = √(2h/g)`，再多给两个 tick 兜底。
+
+    ★★ 会话 41 补的。以前这几个「会不会掉下去」的判据统一用
+    `TICKS_PER_BEAT * 8 = 32` 个 tick —— 那只够落 **614** 个单位。
+    `Megatron01` 高 2048、`Megatron00` 高 2048，从上层往下掉一趟远不止 614
+    ⇒ `drop_below()` 返回 `None`，`bot._walk_to()` 把它当成**无底洞**，
+    于是「站在高处的 bot 死活不肯往下走」——用户 2026-08-30 报的
+    「只能看到一个 bot，另外两个像是在图外」和闯关那条「总有 bot 待在最左边
+    不往前走」都有它的份。
+
+    ★ 这是**地图有多高**这个几何事实，不是「等多久算超时」那类阈值
+    （和 `BOT_SHELL_MAX_TRAVEL` 取图的对角线是同一个道理）。
+    没有地形时退回老值，行为一个字节不变。
+    """
+    height = getattr(terrain, "height", None)
+    if not height:
+        return TICKS_PER_BEAT * 8
+    return int(math.sqrt(2.0 * float(height) / GRAVITY)) + 2
+
+
+def settle(terrain, body, character, ticks=None):
     """让人落到地上（新出生 / 刚接管位置时用）。落不到就原样返回。"""
+    if ticks is None:
+        ticks = fall_ticks(terrain)
     for _ in range(max(0, int(ticks))):
         if body.on_ground:
             return body
@@ -466,12 +491,15 @@ def leaves_ground(terrain, body, character, direction, fast_run=False,
 
 
 def jump_lands(terrain, body, character, direction, fast_run=False,
-               crouched=False, ticks=TICKS_PER_BEAT * 16):
+               crouched=False, ticks=None):
     """原地起跳、空中一路按着 `direction`，**落在哪**；落不到返回 `None`。
 
     这就是「跳跃弧线」：要不要跳过这个坑、够不够得着那个台子，
     问它就行 —— 弧线是真跑出来的，不是拿公式估的。
     """
+    if ticks is None:
+        # 起跳先上去、再落到图底：升段 `v/g` 个 tick，落段见 `fall_ticks()`。
+        ticks = fall_ticks(terrain) + int(JUMP_SPEED / GRAVITY) + 2
     body = tick(terrain, body, character, direction=direction,
                 fast_run=fast_run, crouched=crouched, want_jump=True)
     for _ in range(max(0, int(ticks))):
@@ -483,7 +511,7 @@ def jump_lands(terrain, body, character, direction, fast_run=False,
 
 
 def drop_below(terrain, body, character, direction, fast_run=False,
-               crouched=False, ticks=TICKS_PER_BEAT * 8):
+               crouched=False, ticks=None):
     """走出崖边之后会掉多深（掉不到底返回 `None`）。
 
     给决策层用：真人不会主动跳进无底洞，但**从一米高的台阶走下去**

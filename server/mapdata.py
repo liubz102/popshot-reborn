@@ -71,8 +71,11 @@ OUT_OF_BOUNDS = 2
 class MapTerrain(object):
     """一张图的地形。**只读**，加载后不再变。"""
 
+    #: ★ `__weakref__` 是给 `botnav` 的可达图缓存留的：那份缓存按**地形对象
+    #:   本身**做弱引用键（图名不行 —— 单测里的合成地形全叫 `Tiny`），
+    #:   地形被丢掉时缓存自然跟着没。地形本身仍然是只读的。
     __slots__ = ("name", "version", "width", "height", "_cells",
-                 "_offsets", "_ys", "points", "jump_pads")
+                 "_offsets", "_ys", "points", "jump_pads", "__weakref__")
 
     def __init__(self, record):
         self.name = record["name"]
