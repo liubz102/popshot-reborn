@@ -7704,6 +7704,67 @@ class BotGapJumpTests(TerrainMixin, BotFrameRoom):
                          "第二段只该按一次，实际按了 %d 次" % pressed.count(True))
         self.assertFalse(pressed[0], "刚离地还在往上升，这时候按是浪费")
 
+    # -- ★★★ §146：「目标在上面」不等于「现在就该跳」 --------------------
+
+    def test_a_higher_goal_alone_does_not_trigger_a_jump(self):
+        """★★★ 用户 2026-08-30：「经常跳早了，导致跳不过去。」
+
+        `_walk_to()` 最后那条兜底原来是**无条件**起跳的：跟随点只要比自己
+        高一点（对岸台子高 75 就够），bot 就在**离坑还有 150 的平地上**
+        起跳，弧线飞到对岸时早已低于台面 —— 一头栽进岩浆。
+        ⇒ 先问一句「这一跳落得住吗」，落不住就接着走。
+        """
+        terrain = self.gap_room("gap_high_goal", 300)
+        self.place_bot(500.0, 700.0)          # 离坑边（700）还有 200
+        intent = bot._walk_to(self.room, self.bot_conn, terrain,
+                              (1500.0, 500.0), False)   # 目标在**上方**
+        self.assertEqual(1, intent[0], "该继续往前走")
+        self.assertFalse(intent[1],
+                         "离坑还有 200 就起跳 = 跳早了，弧线一定栽进坑里")
+
+    def test_a_wall_in_the_way_still_gets_a_jump(self):
+        """★ 「该跳的还得跳」—— 上面那条闸不能顺手把墙根跳也关掉。
+
+        （墙根跳走的是 `blocked` 那一支，和「目标在上面」那条无关；
+        这里守的是「改一条兜底别把另一条带塌」。）
+        """
+        terrain = self.install_terrain(synth_terrain(
+            "gap_wall", floor=700, width=1600, height=800,
+            walls=((600, 1600, 560),)))       # 前方一道 140 高的坎
+        self.place_bot(598.0, 700.0)          # 贴着坎站，走一步撞上去
+        who = chrprops.get(self.bot_conn.character_id)
+        self.assertTrue(
+            botmove.blocked(terrain, self.bot_conn.body, who, 1),
+            "这道坎该是走不上去的（前提没了测试就不成立）")
+        intent = bot._walk_to(self.room, self.bot_conn, terrain,
+                              (900.0, 560.0), False)
+        self.assertEqual(1, intent[0])
+        self.assertTrue(intent[1], "撞墙了就该起跳")
+
+    def test_it_crosses_the_lava_pit_on_the_real_map(self):
+        """★★★★ 端到端回归：**岩浆巨龙**那张图第一个坑（宽 327）。
+
+        用户实机报的就是这里：bot 一遍遍跳早、一遍遍掉进岩浆
+        （服务端日志 `★掉出地图: (3009, 767)` 那一串）。对岸比这岸高 75，
+        所以「目标在上面」那条兜底会在 x≈2700 就让它起跳。
+        """
+        terrain = mapdata.load("Quest02_1", difficulty=2)
+        if terrain is None:
+            self.skipTest("没有 Quest02_1 的地形产物")
+        self.install_terrain(terrain)
+        self.walk(self.alice, [(3400.0, 378.0), (3500.0, 378.0)])
+        self.place_bot(2700.0, 453.0)         # 坑左沿再往回 150
+        for _ in range(40):
+            self.beats(1, 3500.0, 378.0)
+            body = self.bot_conn.body
+            self.assertLess(body.y, 700.0,
+                            "掉进岩浆了：(%.0f, %.0f)" % (body.x, body.y))
+            if body.x > 3177.0 and body.on_ground:
+                break
+        else:
+            self.fail("40 帧还没跨过去，停在 (%.0f, %.0f)"
+                      % (self.bot_conn.body.x, self.bot_conn.body.y))
+
     def test_landing_clears_the_flag(self):
         """★ 落地之后旗子要清 —— 不然下次从台阶走下去会白跳一段。"""
         terrain = self.gap_room("gap_clear", 300)

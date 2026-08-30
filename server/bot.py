@@ -4288,7 +4288,17 @@ def _walk_to(room, machine, terrain, spot, fast_run):
             return (direction, True, False, fast_run)
         return (0, False, False, False)
     if vertical and spot[1] < body.y:
-        return (direction, True, False, fast_run)
+        # ★★★ **目标在上面 ≠ 现在就该跳**（§146）。这条兜底原来是无条件
+        #   起跳的，而跟随点只要比自己高一点（对岸台子高 75 就够）它就在
+        #   **离坑还有 150 的平地上**起跳 —— 弧线飞到对岸时早就低于台面了，
+        #   一头栽进岩浆。用户 2026-08-30：「经常跳早了，导致跳不过去。」
+        # ⇒ 先问一句「这一跳落得住吗、落了之后是不是真的更高」：落不住
+        #   （掉出图外 / 掉进坑）或者白跳，就**接着走** —— 走到坎底下再蹦，
+        #   走到坑边上会有 `bottomless` 那两条接手。
+        landing = botmove.jump_lands(terrain, body, who, direction,
+                                     fast_run=fast_run)
+        if landing is not None and landing.y < body.y - 1.0:
+            return (direction, True, False, fast_run)
     return (direction, False, False, fast_run)
 
 
