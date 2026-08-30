@@ -3373,7 +3373,19 @@ def _battle_bodies(room, shooter_seat, group=None, include_self=False):
     语料也是这么说的：13160 发 `rpSplashDamaged` 里有 **1513 发是打到
     射手自己**的。用户 2026-08-27 报的就是这条：「组队战不能直接伤害友军没错，
     但溅射可以伤害友军」。
+
+    ★★★ **但上面那两条只在对战模式成立** —— 闯关（任务）房里**一个角色
+    都不返回**（§142，用户 2026-08-30 实机报的：「任务模式中 bot 的溅射和
+    火墙会伤到队友，还弹出 bot1 击杀 bot2」）。任务模式里玩家造成的伤害
+    **只落在怪和场景物上**，队友和射手自己一点都不吃：语料 8 个闯关局的
+    「怪 AI 广播密集时段」里，玩家弹体的 3092 发 `rpSplashDamaged` +
+    2034 发 `rpExplode` **无一发**的受害者是角色句柄（自己也没有），
+    打到角色的 1337 发**全部**是怪的弹（源句柄在怪那一族，由控制者代发）。
+    ⇒ 这道门放在这里而不是各个伤害点上：溅射 / 火墙 / 弹体 / 近身四条路
+    的「碰得着谁」全问这一个函数，一处堵住就全堵住了（D102）。
     """
+    if room.team_layout() == lobby_module.TEAM_LAYOUT_COOP:
+        return []
     out = []
     for index, seat in enumerate(room.seats):
         if seat is None:
@@ -6461,6 +6473,8 @@ def _splash_targets(room, shell, point, victim_seat, bodies, victim_mob=None):
     `group=None`）：溅射**分不清敌我**，队友和射手自己都吃（§69）。
     过滤了的话组队房里 bot 的手雷炸在队友脚下一滴血都不掉，
     和原版对不上。
+    ★ **闯关房例外**：那儿 `_battle_bodies()` 一个角色都不返回（§142），
+    于是这张名单里只剩怪 —— 任务模式没有任何角色间伤害。
 
     ★ 直接命中的那个人**不重复算**（他已经吃过 `rpExplode` 那一档伤害了）。
 
@@ -6575,6 +6589,7 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region):
     #   （队友撞不着），而溅射对象的组恒为 0 = **撞所有人** ——
     #   队友、连射手自己都吃。所以这里重新问一次、不带组。
     #   ★★ 名单里还要有**怪**（§134）：溅射对象撞所有人，怪自然也在里面。
+    #   ★★★ 闯关房里角色那半截是空的（§142）—— 任务模式只伤怪和场景物。
     for seat_index, splash, where, push in _splash_targets(
             room, shell, point, victim_seat,
             _battle_bodies(room, machine.my_seat, include_self=True)
@@ -6846,6 +6861,8 @@ def _advance_fires(room, machine, now):
 
     ★★ 名单**不按碰撞组过滤**：火墙的组是 255 = 撞所有人（§69 /
     packet_api §5.4d），队友和 bot 自己都烧。
+    ★★★ **闯关房里烧不着人**（§142）：`_battle_bodies()` 在那儿返回空表，
+    这份名单只剩怪 —— 火墙照铺、照烧怪，队友和 bot 自己一点都不掉。
 
     ## ★★★ 再烧的账记在**人**身上，几道墙共用一本（§85）
 
@@ -7168,6 +7185,8 @@ def _advance_shells(room, machine, now):
         if bodies is None:
             # ★ 组 255 = **撞所有人**（分裂弹的碎片就是这个组，§81）——
             #   「所有人」里含射手自己，和溅射、火墙同一个口径（§69 / D50）。
+            #   ★ 闯关房里连这一组也撞不着人（§142）：`_battle_bodies()`
+            #     在那儿返回空表，弹体只剩怪和地形可撞。
             bodies = _battle_bodies(
                 room, machine.my_seat, shell.group,
                 include_self=(shell.group == botsync.FIRE_GROUP_EVERYONE))

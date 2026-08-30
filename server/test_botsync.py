@@ -7512,6 +7512,67 @@ class BotQuestSplashTests(BotQuestCombatTests):
                    for f in splash_frames(self.alice, self.bot_seat)}
         self.assertIn(500123, targets, "站在火里的怪该掉血")
 
+    # -- ★★★ 反过来：闯关房里**角色一个都不该挨打**（§142） --------------
+    #
+    # 用户 2026-08-30：「任务模式中真人之间是没有队友伤害的，包括溅射伤害和
+    # 燃烧弹的火墙……但我发现 bot 的溅射和火墙会对队友造成伤害，屏幕上甚至
+    # 还会提示 bot1 击杀 bot2。」
+    #
+    # 语料实证：8 个闯关局的「怪 AI 广播密集时段」里，玩家弹体发出的
+    # 3092 发 `rpSplashDamaged` + 2034 发 `rpExplode`，受害者**没有一发**
+    # 是角色句柄（连自伤都没有）；打到角色的 1337 发全部是怪的弹。
+
+    def human_at(self, x, y):
+        """把真人摆到 `(x, y)`（心跳走真入口，和 `_seat_body()` 同一口径）。"""
+        self.human_heartbeat(self.alice, x, y)
+        return botsync.character_handle(self.alice_seat)
+
+    def test_a_quest_room_has_no_bodies_to_damage(self):
+        """那道门本身：闯关房里「碰得着谁」一个角色都不返回。"""
+        self.human_at(880.0, 150.0)
+        self.assertEqual(lobby.TEAM_LAYOUT_COOP, self.room.team_layout())
+        self.assertEqual([], bot._battle_bodies(
+            self.room, self.bot_seat, include_self=True),
+            "任务模式没有任何角色间伤害 —— 溅射 / 火墙 / 弹体全问这一个函数")
+
+    def test_splash_spares_a_human_teammate(self):
+        handle = self.human_at(880.0, 150.0)
+        self.clear()
+        shell = self.shell_at(880.0, 150.0)
+        bot._resolve_shell(self.room, self.bot_conn, shell,
+                           (890.0, 150.0), None, None)
+        targets = {struct.unpack_from("<i", body_of(f), 4)[0]
+                   for f in splash_frames(self.alice, self.bot_seat)}
+        self.assertNotIn(handle, targets, "任务模式的溅射伤不到队友")
+
+    def test_splash_spares_the_shooter_itself(self):
+        """★ 自伤也没有 —— 闯关房里射手自己也是「队友」。"""
+        self.human_at(200.0, 150.0)
+        self.clear()
+        shell = self.shell_at(600.0, 150.0)
+        bot._resolve_shell(self.room, self.bot_conn, shell,
+                           (600.0, 150.0), None, None)
+        mine = botsync.character_handle(self.bot_seat)
+        targets = {struct.unpack_from("<i", body_of(f), 4)[0]
+                   for f in splash_frames(self.alice, self.bot_seat)}
+        self.assertNotIn(mine, targets, "炸在自己脚下也不该掉血")
+
+    def test_ground_fire_spares_a_human_teammate(self):
+        """★ 火墙照铺、照烧怪，站在火里的**人**一点都不掉（§142）。"""
+        handle = self.human_at(880.0, 150.0)
+        weapon = weapondata.get(1001020)          # ch01-02 燃烧瓶
+        bot._set_ground_on_fire(self.room, self.bot_conn, weapon,
+                                (880.0, 150.0))
+        self.assertTrue(self.bot_conn.fires, "火墙照铺 —— 少的只是角色伤害")
+        self.clear()
+        self.bot_conn.burnt = {}
+        for wall in self.bot_conn.fires:
+            wall.born_tick -= 40
+        bot._advance_fires(self.room, self.bot_conn, time.monotonic())
+        targets = {struct.unpack_from("<i", body_of(f), 4)[0]
+                   for f in splash_frames(self.alice, self.bot_seat)}
+        self.assertNotIn(handle, targets, "任务模式的火墙烧不到队友")
+
 
 def ice_terrain(key, floor=150, width=1400, height=180,
                 pits=((640, 720),), ice=((680, 96, 60),)):
