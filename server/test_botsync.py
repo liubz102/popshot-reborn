@@ -4219,6 +4219,147 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
         self.assertFalse(intent[3], "已经跟上了就别一直冲刺，体力要留着")
 
 
+class BotCoopLeashTests(TerrainMixin, BotFrameRoom):
+    """★★★★ 闯关**牵引绳**（D99）—— 落后 3/4 屏就无条件追，追不上就瞬移。
+
+    用户 2026-08-30 第三轮实机：「还是总有 bot 不停的躲在画面最左边阻挡
+    进度，每次都走不动太烦了」。这一条是他下的产品决定，优先级压过一切。
+    """
+
+    def leash_room(self, **kwargs):
+        kwargs.setdefault("width", 4000)
+        kwargs.setdefault("points", {101: [(100, 40)]})
+        terrain = self.install_terrain(synth_terrain(**kwargs))
+        self.walk(self.alice, [(0.0, 150.0), (200.0, 150.0)])
+        return terrain
+
+    def test_within_the_leash_nothing_changes(self):
+        terrain = self.leash_room(key="leash_near")
+        self.place_bot(200.0)
+        self.walk(self.alice, [(600.0, 150.0), (800.0, 150.0)])
+        self.assertIsNone(
+            bot._coop_leash_intent(self.room, self.bot_conn, self.bot_seat,
+                                   terrain),
+            "落后 600 还没到 3/4 屏（%.0f），牵引绳不该插手"
+            % bot.BOT_COOP_LEASH)
+        self.assertFalse(self.bot_conn.leash_lagging)
+
+    def test_past_the_leash_it_chases_at_a_sprint(self):
+        terrain = self.leash_room(key="leash_far")
+        self.place_bot(200.0)
+        self.walk(self.alice, [(1500.0, 150.0), (1600.0, 150.0)])
+        intent = bot._coop_leash_intent(self.room, self.bot_conn,
+                                        self.bot_seat, terrain)
+        self.assertIsNotNone(intent, "落后 1400 早过了 3/4 屏")
+        self.assertEqual(1, intent[0], "该朝前追")
+        self.assertTrue(intent[3], "该按着右键冲刺")
+        self.assertTrue(self.bot_conn.leash_lagging)
+
+    def test_it_outranks_dodging(self):
+        """★★★ 「无论发生什么」—— 连躲子弹都要往后排。"""
+        terrain = self.leash_room(key="leash_dodge")
+        self.place_bot(200.0)
+        self.walk(self.alice, [(1500.0, 150.0), (1600.0, 150.0)])
+        original = bot._dodge_intent
+        bot._dodge_intent = lambda *_a, **_k: (-1, True, False, False)
+        self.addCleanup(setattr, bot, "_dodge_intent", original)
+        # 先确认这张「一定会躲」的桩在对战房里确实会被采纳。
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  terrain, None)
+        self.assertEqual(1, intent[0],
+                         "掉队时该往前追，不该按躲子弹那一套往回走")
+
+    def test_it_gives_way_back_once_it_has_caught_up(self):
+        terrain = self.leash_room(key="leash_back")
+        self.place_bot(200.0)
+        self.walk(self.alice, [(1500.0, 150.0), (1600.0, 150.0)])
+        bot._coop_leash_intent(self.room, self.bot_conn, self.bot_seat,
+                               terrain)
+        self.assertTrue(self.bot_conn.leash_lagging)
+        self.place_bot(1550.0)
+        self.assertIsNone(bot._coop_leash_intent(
+            self.room, self.bot_conn, self.bot_seat, terrain))
+        self.assertFalse(self.bot_conn.leash_lagging)
+        self.assertIsNone(self.bot_conn.leash_mark)
+
+    def test_an_impassable_wall_ends_in_a_warp(self):
+        """★★★ 「实在走不过去就瞬移传送也行」（用户 2026-08-30）。
+
+        判据是**规划器的判决**，不是等了多久：墙对面够不着 ⇒ A\\* 泛洪完
+        回空 ⇒ 当场瞬移。这也正是「真人停下来等 bot」那个死锁的出口 ——
+        两边都不动的时候，只有这条判据还会产生结论。
+
+        （墙是**通天**的：`walls` 的第三格是这一段的地面高度，写 0 就等于
+        从图顶实到图底，跳不过去也钻不过去。）
+        """
+        terrain = self.leash_room(key="leash_wall", width=4000,
+                                  walls=((1000, 1200, 0),))
+        self.place_bot(200.0)
+        self.walk(self.alice, [(3000.0, 150.0), (3200.0, 150.0)])
+        warped = []
+        original = bot._leash_warp
+        bot._leash_warp = lambda *a, **k: (warped.append(a[4])
+                                           or original(*a, **k))
+        self.addCleanup(setattr, bot, "_leash_warp", original)
+        for _ in range(60):
+            self.beats(1, 3200.0)
+            if warped:
+                break
+        self.assertTrue(warped, "坑对面够不着，A* 回空之后就该瞬移；"
+                                "bot 停在 %.0f" % self.bot_conn.body.x)
+        self.assertGreater(self.bot_conn.body.x, 2000.0,
+                           "瞬移之后该落在带头的人身后，实际在 %.0f"
+                           % self.bot_conn.body.x)
+        self.assertTrue(self.bot_conn.body.on_ground, "瞬移的落点必须站得住")
+
+    def test_the_warp_lands_on_real_ground(self):
+        """★ 落点得**掉到地面上**，不能停在半空里。
+
+        跟随点的 y 是带头那个真人报的高度 —— 往后错开 120 之后那一列的
+        地面高度完全可能是另一个数。这里直接给一个悬空的落点，
+        瞬移之后必须站在 y=150 的地面上。
+        """
+        terrain = self.leash_room(key="leash_land")
+        self.place_bot(200.0)
+        self.walk(self.alice, [(3000.0, 150.0), (3200.0, 150.0)])
+        self.assertTrue(bot._leash_warp(
+            self.room, self.bot_conn, self.bot_seat, terrain,
+            (3080.0, 40.0), 2800.0, "单测"))
+        self.assertEqual(150.0, self.bot_conn.body.y,
+                         "该掉到地面上，实际停在 %.0f" % self.bot_conn.body.y)
+        self.assertTrue(self.bot_conn.body.on_ground)
+
+    def test_a_crossable_gap_is_walked_not_warped(self):
+        """★ 走得过去就**别**瞬移 —— 这一条是给「瞬移滥用」上的闸。"""
+        terrain = self.leash_room(key="leash_walk", width=4000)
+        self.place_bot(200.0)
+        self.walk(self.alice, [(1600.0, 150.0), (1700.0, 150.0)])
+        warped = []
+        original = bot._leash_warp
+        bot._leash_warp = lambda *a, **k: warped.append(a[4])
+        self.addCleanup(setattr, bot, "_leash_warp", original)
+        start = self.bot_conn.body.x
+        self.beats(20, 1700.0)
+        self.assertFalse(warped, "平地上走得到，不该瞬移")
+        self.assertGreater(self.bot_conn.body.x, start + 200.0,
+                           "该自己一路走过去")
+
+    def test_pvp_rooms_never_grow_a_leash(self):
+        """对战房没有「队伍推进」这回事 —— 一个字都不该改。"""
+        self.assertEqual(bot.lobby_module.TEAM_LAYOUT_COOP,
+                         self.room.team_layout())
+        self.room.session_type = 1
+        self.room.arguments = (0, 0, 0)
+        self.assertNotEqual(bot.lobby_module.TEAM_LAYOUT_COOP,
+                            self.room.team_layout())
+        terrain = self.install_terrain(synth_terrain("leash_pvp", width=4000))
+        self.place_bot(200.0)
+        self.walk(self.alice, [(3000.0, 150.0), (3200.0, 150.0)])
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat, terrain,
+                         None)
+        self.assertFalse(self.bot_conn.leash_lagging)
+
+
 #: 一张带出生点的合成图：101（1 队）两个点、102（2 队）两个点，
 #: 都挂在地面（y=150）上方，和原版 `.map` 一样（角色是掉下去站住的）。
 SPAWN_POINTS = {101: [(200, 40), (300, 40)], 102: [(900, 40), (1000, 40)]}

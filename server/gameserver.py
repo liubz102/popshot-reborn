@@ -4806,20 +4806,46 @@ def conn_is_playing(conn):
     return room is not None and room.status == SESSION_STATUS_PLAYING
 
 
+def room_difficulty(room):
+    """闯关房选的**难度**（1..4）；不是闯关房 / 参数不全返回 `None`。
+
+    描述符的第 2 个参数就是它（§68），客户端拼地图文件名用的也是它
+    （`mapdata.DIFFICULTY_SUFFIX`，§140）。
+    """
+    if room is None or getattr(room, "session_type", None) != SESSION_TYPE_QUEST:
+        return None
+    arguments = getattr(room, "arguments", None) or ()
+    if len(arguments) < 2:
+        return None
+    try:
+        return int(arguments[1])
+    except (TypeError, ValueError):
+        return None
+
+
 def current_map_name(room):
     """房间**这一刻**在哪张图上。闯关换过图的话就是最后进的那张。
 
     ★ 和 `bot._current_map()` 是同一条口径 —— 那边是给弹道用的，
     这边是给刷道具挑落点用的（V0.3 §100）。放在这里是为了不让
     `gameserver` 反过来 import `bot`（那是一条循环依赖）。
+
+    ★★★ 闯关房返回的是**带难度后缀**的确切名字（§140）：客户端加载的是
+    `Quest03_1#Easy.map` 那一份，而客户端报上来的（建房参数 / `0x0411`）
+    永远是不带后缀的基名。不补这一手的话服务端恒退到 `#Normal`，
+    手上那张图和真人屏幕上那张**根本不是一张**。
     """
     if room is None:
         return None
     quest = getattr(room, "quest", None)
     entered = getattr(quest, "maps_entered", None) if quest is not None else None
-    if entered:
-        return entered[-1]
-    return getattr(room, "map_name", None)
+    name = entered[-1] if entered else getattr(room, "map_name", None)
+    if not name:
+        return name
+    difficulty = room_difficulty(room)
+    if difficulty is None:
+        return name
+    return mapdata.qualify(name, difficulty)
 
 
 def room_in_battle(room):

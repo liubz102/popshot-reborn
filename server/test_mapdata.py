@@ -257,6 +257,75 @@ class ResolveTests(unittest.TestCase):
         self.assertIsNone(store.load("Megatron_b"))
 
 
+class QuestDifficultyTests(unittest.TestCase):
+    """★★★ 闯关房**按难度**挑地图文件（§140 / D100）。
+
+    客户端拼文件名的那一段（`0x405742`）是 `1=#Easy 2=#Normal 3=#Hard
+    4=#Extreme`。不传难度就恒退到 `#Normal` —— 而四份 `.map` **不是同一
+    张图**，服务端手上那张和真人屏幕上那张会整个对不上。
+    """
+
+    def setUp(self):
+        self.store = mapdata._Store(data_dir="__不存在的目录__")
+        self.store._index = {
+            "maps": {"Quest03_1#Easy": {}, "Quest03_1#Normal": {},
+                     "Quest03_1#Hard": {}, "Quest03_1#Extreme": {},
+                     "Quest03_2": {}, "Megatron_b": {}},
+            "bases": {"Quest03_1": ["Quest03_1#Easy", "Quest03_1#Normal",
+                                    "Quest03_1#Hard", "Quest03_1#Extreme"]},
+        }
+
+    def test_each_difficulty_picks_its_own_file(self):
+        for level, suffix in ((1, "#Easy"), (2, "#Normal"),
+                              (3, "#Hard"), (4, "#Extreme")):
+            self.assertEqual("Quest03_1" + suffix,
+                             self.store.resolve("Quest03_1", level),
+                             "难度 %d 该挑 %s" % (level, suffix))
+
+    def test_without_a_difficulty_it_still_falls_back_to_normal(self):
+        self.assertEqual("Quest03_1#Normal", self.store.resolve("Quest03_1"))
+
+    def test_maps_with_a_single_version_ignore_the_difficulty(self):
+        # `Quest03_2` 只有一份 —— 四个难度都该拿到它，不是空手而归。
+        for level in (1, 2, 3, 4):
+            self.assertEqual("Quest03_2",
+                             self.store.resolve("Quest03_2", level))
+
+    def test_an_unknown_difficulty_falls_back(self):
+        self.assertEqual("Quest03_1#Normal", self.store.resolve("Quest03_1", 9))
+        self.assertEqual("Quest03_1#Normal",
+                         self.store.resolve("Quest03_1", None))
+
+    def test_qualify_keeps_the_name_usable(self):
+        original = mapdata.STORE
+        mapdata.STORE = self.store
+        self.addCleanup(setattr, mapdata, "STORE", original)
+        self.assertEqual("Quest03_1#Easy", mapdata.qualify("Quest03_1", 1))
+        # `:模式` 照旧切掉；补不出来时原样退回基名（对战房走的就是这条）。
+        self.assertEqual("Megatron_b", mapdata.qualify("Megatron_b:NewPvp", 1))
+        self.assertEqual("没有这张图", mapdata.qualify("没有这张图", 1))
+        self.assertIsNone(mapdata.qualify(None, 1))
+
+
+class RealQuestDifficultyTests(unittest.TestCase):
+    """★ 拿**真产物**验一遍「四个难度不是同一张图」这条硬事实。"""
+
+    @classmethod
+    def setUpClass(cls):
+        if not mapdata.available():
+            raise unittest.SkipTest("没有 bot_mapdata 产物")
+        if mapdata.resolve("Quest03_1#Easy") is None:
+            raise unittest.SkipTest("产物里没有 Quest03_1")
+
+    def test_easy_and_normal_are_different_maps(self):
+        easy = mapdata.load("Quest03_1", 1)
+        normal = mapdata.load("Quest03_1", 2)
+        self.assertEqual("Quest03_1#Easy", easy.name)
+        self.assertEqual("Quest03_1#Normal", normal.name)
+        self.assertNotEqual(easy.width, normal.width,
+                            "这两份宽度就不一样（10600 / 11400）")
+
+
 class FormatGuardTests(unittest.TestCase):
     """格式版本对不上就当没有数据，不要按错的布局硬解。"""
 

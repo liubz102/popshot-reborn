@@ -1552,6 +1552,68 @@ class MapTransitionTests(unittest.TestCase):
         self.assertFalse(conn.map_change_pending)
 
 
+class QuestMapDifficultyTests(unittest.TestCase):
+    """★★★ 闯关房这一刻在哪张图上 —— **要带难度后缀**（§140 / D100）。
+
+    客户端报上来的（建房参数、`0x0411`）永远是不带后缀的基名
+    `Quest03_1`，而它自己加载的是 `Quest03_1#Easy.map`。服务端不补这一手
+    就恒退到 `#Normal`，手上那张图和真人屏幕上那张**不是一张** ——
+    用户 2026-08-30 实机报的「bot 从树里穿过去 / 在空地上腾空走路」。
+    """
+
+    class Quest:
+        def __init__(self, entered=()):
+            self.maps_entered = list(entered)
+
+    class Room:
+        def __init__(self, session_type, arguments, map_name, quest=None):
+            self.session_type = session_type
+            self.arguments = arguments
+            self.map_name = map_name
+            self.quest = quest
+
+    def setUp(self):
+        import mapdata
+        store = mapdata._Store(data_dir="__不存在的目录__")
+        store._index = {
+            "maps": {"Quest03_1#Easy": {}, "Quest03_1#Normal": {},
+                     "Quest03_1#Hard": {}, "Quest03_1#Extreme": {},
+                     "Quest03_3#Easy": {}, "Quest03_3#Normal": {},
+                     "Quest03_2": {}, "Megatron_b": {}},
+            "bases": {},
+        }
+        self._saved_store = mapdata.STORE
+        mapdata.STORE = store
+        self.addCleanup(setattr, mapdata, "STORE", self._saved_store)
+
+    def test_the_starting_map_carries_the_rooms_difficulty(self):
+        for level, suffix in ((1, "#Easy"), (2, "#Normal"),
+                              (3, "#Hard"), (4, "#Extreme")):
+            room = self.Room(2, (3, level), "Quest03_1")
+            self.assertEqual("Quest03_1" + suffix,
+                             gameserver.current_map_name(room))
+
+    def test_maps_entered_mid_quest_carry_it_too(self):
+        # 换图那一发 `0x0411` 报的也是基名 —— 同样要补。
+        room = self.Room(2, (3, 1), "Quest03_1",
+                         self.Quest(["Quest03_2", "Quest03_3"]))
+        self.assertEqual("Quest03_3#Easy", gameserver.current_map_name(room))
+
+    def test_a_map_without_variants_is_left_alone(self):
+        room = self.Room(2, (3, 1), "Quest03_1", self.Quest(["Quest03_2"]))
+        self.assertEqual("Quest03_2", gameserver.current_map_name(room))
+
+    def test_pvp_rooms_are_untouched(self):
+        room = self.Room(1, (1, 0, 1), "Megatron_b:NewPvp")
+        self.assertIsNone(gameserver.room_difficulty(room))
+        self.assertEqual("Megatron_b:NewPvp", gameserver.current_map_name(room))
+
+    def test_a_quest_room_without_arguments_is_not_fatal(self):
+        room = self.Room(2, (), "Quest03_1")
+        self.assertIsNone(gameserver.room_difficulty(room))
+        self.assertEqual("Quest03_1", gameserver.current_map_name(room))
+
+
 class ItemDropTests(unittest.TestCase):
     """掉落物：`0x0406 gcpCreateItem -> 0x0404 gspCreatedItem`（会话 17，§112）。
 

@@ -354,6 +354,14 @@ class BotConn(gameserver.Conn):
         #: ★ 正在执行的那条边要不要在顶点补一次**二段跳**
         #:   （`botnav.ACTION_DOUBLE_JUMP`）。落地 / 换边就清。
         self.nav_double_jump = False
+        #: ★★★ 闯关**牵引绳**的记账（D99）。`leash_lagging` = 此刻算不算
+        #:   「掉队了」（日志按这个状态翻转去重）；`leash_mark` = 掉队以来
+        #:   自己沿前进轴走到过的**最靠前**的地方；`leash_gap` = 掉队那一刻
+        #:   的差距。后两个凑起来判「按着方向键却一步都没往前挪」。
+        #:   归队就一起清掉。
+        self.leash_lagging = False
+        self.leash_mark = None
+        self.leash_gap = 0.0
         #: 这一帧是否在按 ↓ 穿单向平台。物理层读 `want_drop`，心跳层把它
         #: 翻成 `botsync.KEY_DOWN`；两边必须来自同一个决定。
         self.move_down = False
@@ -585,6 +593,10 @@ class BotConn(gameserver.Conn):
         botplan.forget(self)
         self.nav_planned_at = None
         self.nav_double_jump = False
+        # ★ 牵引绳的记账跟着清：新一张图上「落后多少」要从头量（同 `body`）。
+        self.leash_lagging = False
+        self.leash_mark = None
+        self.leash_gap = 0.0
         self.move_down = False
         self.last_trail_mark = None
         self.load_progress = None
@@ -1649,12 +1661,12 @@ def _walk_direction(previous, x):
 
 
 def _current_map(room):
-    """房间**这一刻**在哪张图上。闯关换过图的话就是最后进的那张。"""
-    quest = room.quest
-    entered = getattr(quest, "maps_entered", None) if quest is not None else None
-    if entered:
-        return entered[-1]
-    return room.map_name
+    """房间**这一刻**在哪张图上（闯关房带 `#难度` 后缀，§140）。
+
+    ★ 只有一份实现，在 `gameserver.current_map_name()` 里 —— 以前这儿抄了
+      一份一模一样的，结果「闯关按难度选图」那一手只补在一边就会漂移。
+    """
+    return gameserver.current_map_name(room)
 
 
 def _breakables(room):
@@ -3934,6 +3946,16 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     body = machine.body
     if body is None or terrain is None:
         return (0, False, False, False)
+    coop = room.team_layout() == lobby_module.TEAM_LAYOUT_COOP
+    # ★★★★ **牵引绳排在最前面**（D99）：闯关时落后带头的真人超过 3/4 个
+    #   屏幕就无条件追，连躲子弹都往后排 —— 掉队的那一个会把整队的扇区
+    #   进度钉死，比挨几枪严重得多。没掉队时它返回 None，下面照旧。
+    if coop:
+        leash = _coop_leash_intent(room, machine, seat_index, terrain)
+        if leash is not None:
+            return leash
+    else:
+        _leash_release(machine)
     # ★★★ **躲子弹排在一切之前**（M5-E）：真人也是先躲开再想别的。
     #   躲得开就按躲的那套键走这一 tick，路线作废（人已经被挪到别处了）。
     dodge = _dodge_intent(room, machine, seat_index, terrain,
@@ -3942,7 +3964,7 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
         _clear_navigation(machine)
         return dodge
     # ★★★ 闯关房（M5-G）：那儿没有「敌方座位」，走位的目标是**跟上队伍**。
-    if room.team_layout() == lobby_module.TEAM_LAYOUT_COOP:
+    if coop:
         return _coop_intent(room, machine, seat_index, terrain, target)
     enemy = _enemy_spot(room, machine, seat_index)
     if enemy is None:
@@ -4101,6 +4123,22 @@ def _walk_to(room, machine, terrain, spot, fast_run):
 #: 到了这个范围里就站住打怪，而不是原地和跟随点较劲。
 BOT_COOP_BAND = botnav.GOAL_X
 
+#: 客户端视口的宽（世界单位）。`ViewPort::Init(x, y, w, h)` = `0x5cc7f5`，
+#: 全镜像唯一构造点 `0x5bfc8f` 传的是 `(0, 0, 0x400, 0x300)` ⇒ **1024 × 768**。
+#: （夺分模式那条「距离 > 视口宽就减伤」用的也是同一个 `[视口+0x30]`，§89。）
+BOT_VIEWPORT_WIDTH = 1024.0
+
+#: ★★★ **闯关模式的牵引绳**：bot 沿前进轴落后带头的真人**不许**超过这么远。
+#:
+#: 用户 2026-08-30：「给 bot 加一条优先级最高的指令，无论发生什么，不可以离
+#: 最前面的真人距离超过 3/4 个屏幕的距离，超过 3/4 个屏幕的距离就要无条件
+#: 向前追上最前面的人，实在走不过去就瞬移传送也行。」
+#:
+#: ⚠ 这一条**不是从原版推出来的**（铁律 11 的例外，D99）—— 它是用户在
+#:   反复实机之后下的产品决定：闯关是**扇区推进**的，掉队的那一个会把整队
+#:   的进度钉住，「拖进度」比「像不像真人」严重得多。
+BOT_COOP_LEASH = BOT_VIEWPORT_WIDTH * 0.75
+
 
 def _quest_forward(terrain):
     """闯关图的「前方」是 +x 还是 −x —— 拿**出生点**问出来的。
@@ -4182,6 +4220,140 @@ def _may_fast_run(machine):
     return (machine.stamina is None
             or machine.stamina > _stamina_props().fast_run_sp_cost
             * botmove.TICKS_PER_BEAT)
+
+
+# ---------------------------------------------------------------------------
+# ★★★ 闯关模式的**牵引绳**（D99）—— 优先级压过一切，包括躲子弹
+# ---------------------------------------------------------------------------
+def _coop_lag(room, machine, terrain):
+    """沿「前方」轴，这个 bot 落在**最靠前那个真人**后面多少。
+
+    返回 `(落后多少, 带头的人, 前方是 +1 还是 −1)`；队伍还不知道在哪、
+    或者自己还没有身体时返回 `None`。负数 = 已经冲到他前面去了。
+    """
+    body = machine.body
+    if body is None or terrain is None:
+        return None
+    forward = _quest_forward(terrain)
+    leader = _coop_leader(room, forward)
+    if leader is None:
+        return None
+    return (forward * (float(leader.sync_trail[-1][0]) - body.x),
+            leader, forward)
+
+
+def _coop_leash_intent(room, machine, seat_index, terrain):
+    """★★★ 掉队超过 3/4 个屏幕时的**最高优先级**动作；没掉队返回 `None`。
+
+    没掉队时这个函数一分钱都不花（一次减法），行为和以前一模一样 ——
+    躲子弹、打怪、捡道具照旧按原来的次序走。
+
+    ## 掉队之后做两件事
+
+    1. **无条件往前追**：目标就是平时那个跟随点，体力够就按着右键冲刺。
+       这一帧不躲子弹、不停下来打怪 —— 掉队的代价（挨枪）比拖住整队小。
+    2. **实在走不过去就瞬移**（用户 2026-08-30 明确点头）。
+
+    ## 「走不过去」是怎么判的 —— **事件，不是计时器**（铁律 10）
+
+    两条，任一条成立就算：
+
+    * **规划器把话说死了**：`botnav.plan()` 泛洪完整个可达分量之后回了空
+      （`nav_failed` 记的就是这个判决，键是当前的空间事实）。这是 A\* 自己
+      给的结论「从这儿一步都靠近不了目标」，不是等出来的；
+    * **差距比掉队那一刻又拉开了一整根绳子**：`leash_mark` 是掉队以来自己
+      走到过的**最靠前**的地方，`leash_gap` 是掉队那一刻的差距 ——
+      `他现在的位置 − 我最远走到的地方 > leash_gap + 一根绳子` 就是
+      「这段时间他走了一整屏，我一步都没往前挪」。这条管的是「方向键
+      按着、人却在墙根原地蹦」那种：规划器不会给出判决，但这是明摆着的
+      空间事实。★ 正常在走的时候 `leash_mark` 跟着往前，左边跟着变小，
+      这条永远不会成立。
+
+    第一条尤其要紧：真人**停下来等 bot** 的时候，跟随点不动、bot 也不动，
+    两边的空间事实全部冻住 —— 谁都不会再产生新事件。会话 42 之前那个
+    「怎么修都还在」的死锁就是它（用户 2026-08-30：「每次都走不动太烦了」）。
+    """
+    lag = _coop_lag(room, machine, terrain)
+    if lag is None:
+        _leash_release(machine, seat_index)
+        return None
+    behind, leader, forward = lag
+    if behind <= BOT_COOP_LEASH:
+        _leash_release(machine, seat_index, behind)
+        return None
+    spot = _coop_goal(room, machine, seat_index, terrain)
+    if spot is None:
+        _leash_release(machine, seat_index)
+        return None
+    body = machine.body
+    here = forward * body.x
+    if not machine.leash_lagging:
+        machine.leash_lagging = True
+        machine.leash_mark = here
+        machine.leash_gap = behind
+        print(f"[{gameserver.ts()}] bot {seat_index}    掉队: 落后带头的人 "
+              f"{behind:.0f}（超过 3/4 屏 {BOT_COOP_LEASH:.0f}）—— "
+              f"无条件冲刺追上去", flush=True)
+    elif here > machine.leash_mark:
+        machine.leash_mark = here          # 还在往前挪，绳子还没绷断
+    intent = _walk_to(room, machine, terrain, spot, _may_fast_run(machine))
+    stuck_by_plan = (machine.nav_failed is not None
+                     and machine.nav_failed == _nav_signature(terrain, body,
+                                                              spot))
+    stuck_by_fact = (forward * float(leader.sync_trail[-1][0])
+                     - machine.leash_mark) > machine.leash_gap + BOT_COOP_LEASH
+    if stuck_by_plan or stuck_by_fact:
+        why = "A* 说这儿到不了" if stuck_by_plan else "按着方向键也没往前挪"
+        _leash_warp(room, machine, seat_index, terrain, spot, behind, why)
+        return (0, False, False, False)
+    return intent
+
+
+def _leash_release(machine, seat_index=None, behind=None):
+    """没掉队（或者判不了）—— 把牵引绳的记账清掉。
+
+    ★ 日志按**状态翻转**去重：说过一次「掉队了」，就等它真的归了队再说
+      一句「归队了」，中间一个字都不刷。
+    """
+    if not machine.leash_lagging:
+        return
+    machine.leash_lagging = False
+    machine.leash_mark = None
+    machine.leash_gap = 0.0
+    if seat_index is not None and behind is not None:
+        print(f"[{gameserver.ts()}] bot {seat_index}    归队: 现在落后 "
+              f"{behind:.0f}（牵引绳 {BOT_COOP_LEASH:.0f}）", flush=True)
+
+
+def _leash_warp(room, machine, seat_index, terrain, spot, behind, why):
+    """★ 追不上的最后一招：直接把 bot 挪到跟随点上（用户 2026-08-30 点头）。
+
+    落点必须是**站得住的地面** —— 和出生点走**同一条**路
+    （`_settle_spawn()`：从那一点往下掉一趟，`on_ground=False` 起步）；
+    跟随点悬空就退回带头的人**脚下那一点**（他站得住，那儿一定是合法
+    地面）。两个都落不住就不挪，下一帧再说。
+
+    ⚠ 别写成 `botmove.Body(x, y)` —— 那个的 `on_ground` 缺省是 **True**，
+      `settle()` 看见就直接原样返回，人会停在半空里。
+    """
+    lag = _coop_lag(room, machine, terrain)
+    candidates = [spot]
+    if lag is not None:
+        leader = lag[1]
+        candidates.append(tuple(leader.sync_trail[-1][:2]))
+    for point in candidates:
+        body = _settle_spawn(terrain, machine, point)
+        if body is None or not body.on_ground:
+            continue
+        was = machine.body
+        machine.body = body
+        _clear_navigation(machine)
+        machine.leash_mark = _quest_forward(terrain) * body.x
+        print(f"[{gameserver.ts()}] bot {seat_index}    ★瞬移归队: "
+              f"({was.x:.0f}, {was.y:.0f}) -> ({body.x:.0f}, {body.y:.0f})"
+              f"　落后 {behind:.0f}，{why}", flush=True)
+        return True
+    return False
 
 
 def _retreat_done(body, goal, enemy):
@@ -7555,9 +7727,13 @@ def warm_navigation(room, why):
                 continue
             done.add(key)
         seeds = []
-        for px, py in seeds_raw:
-            body = botmove.settle(terrain,
-                                  botmove.Body(float(px), float(py)), who)
+        for point in seeds_raw:
+            # ★ 走 `_settle_spawn()`（`on_ground=False` 起步、往下掉一趟）
+            #   —— 出生点对象在编辑器里挂在半空（§91），直接
+            #   `botmove.Body(x, y)` 的 `on_ground` 缺省是 **True**，
+            #   `settle()` 看见就原样返回，泛洪会从半空里那一点起步
+            #   （实测比真正的地面高 50~90）。
+            body = _settle_spawn(terrain, machine, point)
             if body is not None and body.on_ground:
                 seeds.append(body)
         if not seeds:

@@ -68,8 +68,29 @@ import zlib
 #:    填的就是它。
 FORMAT = 5
 
-#: 找不到精确名时按这个顺序退。
+#: 找不到精确名、**也没人告诉我们难度**时按这个顺序退。
+#: ⚠ 这只是最后的兜底 —— 闯关房请一律把难度传进来（见 `DIFFICULTY_SUFFIX`）。
 DIFFICULTY_ORDER = ("#Normal", "#Easy", "#Hard", "#Extreme")
+
+#: ★★★ 闯关房的**难度 -> 地图文件后缀**（§140）。
+#:
+#: 出处是客户端自己拼文件名那一段（`0x405742`，房间描述符 `type == 2` 时）：
+#:
+#:     mov edi, [房间+0x24]        ; 描述符的第 2 个参数 = 难度
+#:     dec edi ; je -> push 0x65e9ac (#Easy)
+#:     dec edi ; je -> push 0x65e99c (#Normal)
+#:     dec edi ; je -> push 0x65e990 (#Hard)
+#:     dec edi ; jne 跳过 -> push 0x65e97c (#Extreme)
+#:
+#: 也就是 **1=简单 2=普通 3=困难 4=极限**，和 `Data/Quest/QuestNN/mob-1..4.ini`
+#: 那四份怪物表一一对应。
+#:
+#: ★ 为什么非有不可：四个难度的 `.map` **不是同一张图**。`Quest03_1` 的四份
+#:   宽度是 10600 / 11400 / 11350 / 11350，从 x≈4500 起几乎每一列都不一样。
+#:   不传难度就恒退到 `#Normal`，于是玩「简单」时服务端手上是另一张图 ——
+#:   bot 从真实的树里穿过去、在真实的空地上腾空走路，A\* 算出来的路线
+#:   在真人屏幕上根本不成立（用户 2026-08-30 实机）。
+DIFFICULTY_SUFFIX = {1: "#Easy", 2: "#Normal", 3: "#Hard", 4: "#Extreme"}
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "bot_mapdata")
@@ -498,8 +519,13 @@ class _Store(object):
     def available(self):
         return sorted(self.index().get("maps", {}))
 
-    def resolve(self, map_name):
-        """把客户端给的地图串解析成产物里的确切名字；找不到返回 None。"""
+    def resolve(self, map_name, difficulty=None):
+        """把客户端给的地图串解析成产物里的确切名字；找不到返回 None。
+
+        `difficulty` 是**闯关房描述符的第 2 个参数**（1..4）。给了就先按
+        `DIFFICULTY_SUFFIX` 那一档找 —— 客户端拼文件名用的就是它。
+        这一档没有（`Quest03_2` 那种只有一份的图）才退回老顺序。
+        """
         if not map_name:
             return None
         name = map_name.split(":", 1)[0].strip()
@@ -508,6 +534,9 @@ class _Store(object):
         maps = self.index().get("maps", {})
         if name in maps:
             return name
+        wanted = DIFFICULTY_SUFFIX.get(difficulty)
+        if wanted and name + wanted in maps:
+            return name + wanted
         for suffix in DIFFICULTY_ORDER:
             if name + suffix in maps:
                 return name + suffix
@@ -516,9 +545,9 @@ class _Store(object):
                 return cand
         return None
 
-    def load(self, map_name):
+    def load(self, map_name, difficulty=None):
         """按客户端给的地图串取地形；没有这张图的数据返回 None。"""
-        name = self.resolve(map_name)
+        name = self.resolve(map_name, difficulty)
         if name is None:
             return None
         if name in self._cache:
@@ -540,13 +569,32 @@ class _Store(object):
 STORE = _Store()
 
 
-def load(map_name):
-    """取一张图的地形；没有数据返回 `None`（**调用方必须能接受 None**）。"""
-    return STORE.load(map_name)
+def load(map_name, difficulty=None):
+    """取一张图的地形；没有数据返回 `None`（**调用方必须能接受 None**）。
+
+    `difficulty` 见 `DIFFICULTY_SUFFIX` —— 闯关房**必须**传，不传会拿到
+    别的难度那张图。
+    """
+    return STORE.load(map_name, difficulty)
 
 
-def resolve(map_name):
-    return STORE.resolve(map_name)
+def resolve(map_name, difficulty=None):
+    return STORE.resolve(map_name, difficulty)
+
+
+def qualify(map_name, difficulty):
+    """把地图串补成**带难度后缀**的确切名字；补不出来就原样返回。
+
+    ★ 只做名字这一件事，所以调用方可以把结果继续当「地图名」用（日志、
+      `ground_item_spawn()`、`mapdata.load()` 都吃），而不必到处多带一个
+      难度参数。补不出来时返回去掉 `:模式` 之后的基名，行为和以前一样。
+    """
+    if not map_name:
+        return map_name
+    name = map_name.split(":", 1)[0].strip()
+    if not name:
+        return map_name
+    return STORE.resolve(name, difficulty) or name
 
 
 def available():
