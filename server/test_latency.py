@@ -54,7 +54,6 @@ class Args:
     version_result = 0
     login_result = 0
     no_death_reply = False
-    room_burst_delay = 0
 
 
 class Spy:

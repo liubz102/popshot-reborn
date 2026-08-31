@@ -338,7 +338,6 @@ class BotConn(gameserver.Conn):
         self.ft = self.fb_raw = self.fb_dec = None
         self.send_lock = threading.RLock()
         self.send_queue = None
-        self.batch_delay_ms = 0
         self.connected_at = time.monotonic()
         # -- 只属于 bot 的机器状态（D9）--------------------------------------
         #: 这个 bot 的同步流（M3）：序号记账 + 组包，见 `botsync.py`。

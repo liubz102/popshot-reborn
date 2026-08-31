@@ -78,7 +78,6 @@ def bodies(conn, opcode):
 
 class Args:
     hold_lobby = False
-    room_burst_delay = 0
     login_result = 0
     no_death_reply = False
 
@@ -137,7 +136,6 @@ def make_conn(username, accounts=None):
     conn.send = _send
     conn.send_lock = threading.RLock()
     conn.send_queue = None
-    conn.batch_delay_ms = 0
     conn.last_packet_at = 0.0
     conn.noisy_seen = set()
     conn.account_name = username

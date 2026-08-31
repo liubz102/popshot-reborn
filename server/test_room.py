@@ -77,7 +77,6 @@ def opcodes(conn):
 
 class Args:
     hold_lobby = False
-    room_burst_delay = 0
     login_result = 0
 
 
@@ -116,7 +115,6 @@ def make_conn(username):
     conn.send = _send
     conn.send_lock = threading.RLock()
     conn.send_queue = None
-    conn.batch_delay_ms = 0
     conn.last_packet_at = 0.0
     conn.noisy_seen = set()
     conn.account_name = username
@@ -569,6 +567,8 @@ class JoinBatchTests(LobbyIsolated):
         bob = self.make_socket_conn("bob")
         gameserver.Conn.on_game_packet(bob, OP_MOVE_INTO_SESSION,
                                        move_into_payload(room.room_id))
+        # ★ D108：写发生在 bob 自己那条发送线程上，先排空再数。
+        bob.flush_outbox(timeout=5.0)
         # 被客户端的 recv 切开会让「人物选择」缩回 3 个头像，这一局回不来。
         # ★ 后面那发 0x0410（玩家间同步开关）是**单独一次** sendall ——
         #   挤进这一批就等于把四连发拉长成五连发，同一条禁忌。

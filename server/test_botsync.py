@@ -8254,6 +8254,43 @@ class RoomLoopLifecycleTests(BotFrameRoom):
         time.sleep(0.1)
         self.assertEqual(settled, loop.done, "停了还在走")
 
+    def test_a_stuck_human_does_not_slow_the_room_tick(self):
+        """★★★★ **一个人卡死不许拖住整个房间**（D108）。
+
+        D106 之前「谁发包谁被堵」只坑发送者自己；房间循环上线之后，房里所有
+        bot 的包都是**同一条线程**挨个发的 —— 排在卡死那个人后面的所有人
+        跟着一起停 8 秒（`GAME_SEND_DEADLINE_S`），那一段的 `rpExplode`
+        全部迟到，句柄账当场错开（§147）。
+
+        现在写 socket 是每条连接自己那条发送线程的活，这一格该在几毫秒里跑完。
+        """
+        self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+
+        class StuckSocket:
+            """永远收不走字节的对端（卡在 WER 弹窗上的客户端）。"""
+
+            def __init__(self):
+                self.gate = threading.Event()
+
+            def sendall(self, _data):
+                self.gate.wait(10.0)
+
+        stuck = StuckSocket()
+        self.bob.sock = stuck
+        self.bob.cout = gameserver.SimpleCipher.server_to_client()
+        del self.bob.send                    # 用回真的 `Conn.send`
+        self.addCleanup(stuck.gate.set)
+
+        loop = self.loop()
+        started = time.monotonic()
+        loop.advance(gameserver.HEARTBEAT_TICKS)
+        spent = time.monotonic() - started
+        self.assertLess(spent, 1.0,
+                        f"房里有人卡死，这一帧跑了 {spent * 1000:.0f} ms")
+        # ★ 卡死的是 bob，alice 那边照样收得到 bot 的心跳。
+        self.assertTrue([f for f in bot_frames(self.alice, self.bot_seat)
+                         if udpsync.is_heartbeat(f)])
+
     def test_a_stalled_loop_catches_up_tick_by_tick(self):
         """★★★ 落后了要**逐格补跑**，一格都不许跳 —— 跳掉的那一格里弹体不
         推进，它的 `rpExplode` 就又变成迟到（§147）。"""

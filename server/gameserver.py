@@ -5329,6 +5329,13 @@ class Conn:
     #:   子弹是从哪个方向来的」，好把击退结算到自己身上。
     peer_shots = ()
 
+    #: ★ 类级默认值：测试里用 `Conn.__new__` 造的假连接**不走 `__init__`**
+    #: （和 `relayserver.RelayConn` 那份注释同一个理由）。真实例在 `__init__`
+    #: 里各建各的；假实例第一次用到时由 `_outbox()` 补建。
+    outbox_cv = None
+    #: 补建时用的类级锁。**只**在上面那一格还是 `None` 时会走到。
+    _outbox_boot = threading.Lock()
+
     def __init__(self, sock, addr, args, accounts=None, tickets=None):
         global _seq
         with _lock:
@@ -5479,8 +5486,29 @@ class Conn:
         self.send_lock = threading.RLock()
         # send_batch() 期间攒着的明文包；非 None 时 send() 只入队不发。
         self.send_queue = None
-        # 只给 `--room-burst-delay` 用：每发完一个包故意等这么久，复现 §120。
-        self.batch_delay_ms = 0
+        #: ★★★★ **已经加密、等着写 socket 的密文**（D108）。
+        #:
+        #: `send()` 只做「加密 + 挂到这儿」，写 socket 是本连接**自己那条发送
+        #: 线程**的活。为什么非拆不可：写 socket 带 `GAME_SEND_DEADLINE_S`
+        #: （8 秒）的截止时间，而房间那条 32 ms 循环发一发 bot 心跳要遍历房里
+        #: 每一个人 —— 队伍里排在卡死那个人**后面**的所有人都被一起堵住，
+        #: 整个房间的 bot 冻 8 秒，那一段的 `rpExplode` 全部迟到（§147）。
+        #: 拆开之后，写不出去只影响它自己那一条线程。
+        #:
+        #: ★ 顺序：加密在 `send_lock` 里按序做，密文按加密顺序进这个队列
+        #:   —— `SimpleCipher` 是逐字节流密码，顺序错一次整条流就废了。
+        #: ★ 锁序 **`send_lock` → `outbox_cv`**；发送线程**只**拿 `outbox_cv`，
+        #:   永远不拿 `send_lock`，所以没有环。
+        self.outbox = collections.deque()
+        self.outbox_bytes = 0
+        self.outbox_cv = threading.Condition()
+        #: 队列**从空变成非空**的那一刻。慢读者（每次都勉强写进去几个字节、
+        #: 积压却一直涨）靠它收口 —— 判据和写超时是**同一个**：
+        #: 「这个客户端 8 秒没把我们的字节收走」。
+        self.outbox_since = 0.0
+        #: 发送线程（**懒启动**：没发过包的连接一条都不多起）和它的收工旗。
+        self.writer = None
+        self.writer_stop = False
         #: 连上来的时刻，断开时用来算在线时长（连接事件日志用）。
         self.connected_at = time.monotonic()
         register_conn(self)
@@ -5617,14 +5645,9 @@ class Conn:
             if self.send_queue is not None:
                 self.send_queue.append(plain)
                 return
-            wire = self.cout.encrypt(plain)
-            try:
-                send_all_bounded(self.sock, wire, GAME_SEND_DEADLINE_S)
-            except OSError as error:
-                self.kill_stream(f"send: {error!r}")
-                raise
-            if self.batch_delay_ms:
-                time.sleep(self.batch_delay_ms / 1000.0)
+            # ★★★ 只加密、只入队，**不碰 socket**（D108）——
+            #   写 socket 是本连接那条发送线程的活，见 `self.outbox`。
+            self._enqueue(self.cout.encrypt(plain))
 
     @contextlib.contextmanager
     def send_batch(self, reason=""):
@@ -5648,19 +5671,6 @@ class Conn:
         这个窗口就没有了。SimpleCipher 是逐字节流密码，
         `encrypt(a+b) == encrypt(a)+encrypt(b)`，下发字节一个都没变。
         """
-        delay_ms = getattr(self.args, "room_burst_delay", 0) or 0
-        if delay_ms > 0:
-            # --room-burst-delay：故意退回「一包一次 sendall」并拉开间隔，
-            # 用来复现这个 bug（同 D047 的思路：留一个能一键回到坏行为的开关）。
-            self.log(f"   （--room-burst-delay {delay_ms}ms：不合并，"
-                     f"逐包发送{reason}）")
-            with self.send_lock:
-                self.batch_delay_ms = delay_ms
-                try:
-                    yield
-                finally:
-                    self.batch_delay_ms = 0
-            return
         with self.send_lock:
             if self.send_queue is not None:
                 # 已经在批里了，不嵌套（内层 with 结束就把整批发出去会破坏语义）。
@@ -5675,12 +5685,128 @@ class Conn:
                     plain = b"".join(packets)
                     self.log(f"   （{len(packets)} 个包 {len(plain)} 字节"
                              f"合并成一次发送{reason}）")
-                    wire = self.cout.encrypt(plain)
-                    try:
-                        send_all_bounded(self.sock, wire, GAME_SEND_DEADLINE_S)
-                    except OSError as error:
-                        self.kill_stream(f"send_batch: {error!r}")
-                        raise
+                    # ★ 整批**一份密文**入队 —— 发送线程会把它一次写出去，
+                    #   §120 要的「要么一起进客户端的接收缓冲、要么一起不进」
+                    #   一点没变。
+                    self._enqueue(self.cout.encrypt(plain))
+
+    # -- 发送队列（D108）-----------------------------------------------------
+    def _outbox(self):
+        """本连接发送队列的 `Condition`；假连接（`__new__`）第一次用时补建。"""
+        cv = self.__dict__.get("outbox_cv")
+        if cv is not None:
+            return cv
+        with Conn._outbox_boot:
+            cv = self.__dict__.get("outbox_cv")
+            if cv is None:
+                self.outbox = collections.deque()
+                self.outbox_bytes = 0
+                self.outbox_since = 0.0
+                self.writer = None
+                self.writer_stop = False
+                cv = self.outbox_cv = threading.Condition()
+        return cv
+
+    def _enqueue(self, wire):
+        """把一份**已经加密**的字节挂进发送队列，必要时把发送线程叫起来。
+
+        ⚠ 调用方必须已经持有 `send_lock`（加密和入队要在同一次加锁里，
+        否则两个线程的密文会交错入队，客户端整条流就解不开了）。
+        """
+        if not wire:
+            return
+        start = None
+        with self._outbox():
+            if self.writer_stop or self.send_broken:
+                return
+            now = time.monotonic()
+            if not self.outbox:
+                self.outbox_since = now
+            elif now - self.outbox_since > GAME_SEND_DEADLINE_S:
+                # ★ 慢读者：每次写都勉强返回，积压却一直涨。判据和写超时
+                #   是同一个 —— 「8 秒没把我们的字节收走」，那这条流已经废了。
+                start = "slow"
+            if start is None:
+                self.outbox.append(wire)
+                self.outbox_bytes += len(wire)
+                if self.writer is None or not self.writer.is_alive():
+                    self.writer = threading.Thread(
+                        target=self._writer_loop, daemon=True,
+                        name=f"send-{getattr(self, 'seq', 0)}")
+                    start = "thread"
+                self.outbox_cv.notify_all()
+        if start == "slow":
+            self.kill_stream(
+                f"发送积压超过 {GAME_SEND_DEADLINE_S:.0f} 秒没写出去"
+                f"（{self.outbox_bytes} 字节）")
+        elif start == "thread":
+            self.writer.start()
+
+    def _writer_loop(self):
+        """本连接的发送线程：把队列里的密文写出去。**只堵它自己。**
+
+        ★★ **一份入队 = 一次写**，绝不把两份合起来写。
+          这样 `send()` / `send_batch()` 在线上的样子和 D108 之前**一模一样**：
+          一次 `send()` 一次写、整批合并成一次写（§120 那条「要么一起进客户端
+          的接收缓冲、要么一起不进」靠的就是后者）。合并着写能省几次系统调用，
+          但会让「写了几次」变成**看线程什么时候醒**的随机数 —— 那条语义比
+          那几次系统调用值钱得多。
+        ★ 超时 / 出错的处置和以前一模一样：`kill_stream()` 拆连接让客户端
+          重连（这条流的密码状态已经错位，留着只会是半死连接）。
+        """
+        cv = self._outbox()
+        while True:
+            with cv:
+                while not self.outbox and not self.writer_stop:
+                    self.outbox_cv.wait()
+                if self.writer_stop and not self.outbox:
+                    return
+                if self.writer_stop:
+                    # 收工时不再往一个已经要关的 socket 上写。
+                    self.outbox.clear()
+                    self.outbox_bytes = 0
+                    cv.notify_all()
+                    return
+                chunk = self.outbox.popleft()
+                self.outbox_bytes -= len(chunk)
+                if not self.outbox:
+                    self.outbox_bytes = 0
+            try:
+                send_all_bounded(self.sock, chunk, GAME_SEND_DEADLINE_S)
+            except OSError as error:
+                self.kill_stream(f"send: {error!r}")
+                return
+            except Exception as error:      # noqa: BLE001 —— 线程里不许漏
+                self.kill_stream(f"send: {error!r}")
+                return
+            finally:
+                with cv:
+                    cv.notify_all()
+
+    def flush_outbox(self, timeout=None):
+        """等到队列排空（或超时 / 流已废）。返回排空了没有。
+
+        用在两处：**关连接之前**（前面刚发过一发有意义的包，见 `close_now`），
+        以及单测里「数一数真的写了几次」那种断言。
+        """
+        if timeout is None:
+            timeout = GAME_SEND_DEADLINE_S
+        deadline = time.monotonic() + float(timeout)
+        cv = self._outbox()
+        with cv:
+            while self.outbox and not self.send_broken:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                cv.wait(left)
+            return not self.outbox
+
+    def stop_writer(self):
+        """收工：叫发送线程退出（不等它，也不再往 socket 上写）。"""
+        cv = self._outbox()
+        with cv:
+            self.writer_stop = True
+            cv.notify_all()
 
     # -- 大厅 / 房间 ---------------------------------------------------------
     def lobby_room(self):
@@ -6271,6 +6397,10 @@ class Conn:
 
     def close_now(self):
         """立刻切断这条连接（被顶号、被踢时用）。`run()` 的收包循环会自己收尾。"""
+        # ★ D108：发送是异步的了 —— 前面那一发「你被顶号了 / 版本过旧」
+        #   还躺在队列里。先**有界地**排空，否则玩家什么提示都看不到就断了。
+        self.flush_outbox()
+        self.stop_writer()
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
@@ -9205,6 +9335,9 @@ class Conn:
                 self.report_peer_timing(force=True)
             except Exception:                # 收尾路径上绝不能再抛
                 pass
+            # ★ D108：对端已经走了，队列里剩下的字节没有去处 —— 停掉
+            #   发送线程，别让它再去写一个马上要关的 socket。
+            self.stop_writer()
             unregister_conn(self)
             # 中继票据跟着游戏连接一起作废。**不去关中继 socket** ——
             # 游戏连接一断，客户端那条中继连接自己也会走掉；而主动关别人的
@@ -9690,11 +9823,6 @@ def main():
                          f"默认 {RESPAWN_WATCHDOG_S:.0f} 秒；**0 = 关掉兜底**。"
                          "调大或关掉是为了留出取证窗口 —— 兜底一开，卡住的人 8 秒"
                          "就被捞起来了，来不及在他那台跑 probe-death.bat。")
-    ap.add_argument("--room-burst-delay", type=int, default=0, metavar="毫秒",
-                    help="建房/回房间的那一串包不合并，并且每个之间等这么久"
-                         "（回到会话 21 及以前的行为）。用来**复现**「进房间只剩"
-                         "3 个角色」：客户端只要在这个缝里 recv 一次，房间就用"
-                         "空清单建 UI。0 = 合并成一次发送（默认，§120）。")
     ap.add_argument("--control-port", type=int, default=CONTROL_PORT,
                     help="调试控制通道端口（tools/gs_ctl.py 连它）；0 = 关闭")
     ap.add_argument("--verbose", action="store_true",

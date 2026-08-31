@@ -1037,5 +1037,89 @@ class StatusLineTests(unittest.TestCase):
         self.assertIn("投递 UDP", reply)
 
 
+
+class StuckRelayClientTests(unittest.TestCase):
+    """★★★ **一个卡死的中继客户端不许拖住别人**（D108）。
+
+    中继的投递是一个人一个人挨着发的，而 `send_frame()` 以前是「加密 + 写
+    socket」一体的，写带 `RELAY_SEND_DEADLINE_S`（2 秒）的截止时间 ——
+    排在卡死那个人后面的所有人跟着一起停。D106 之后那就是整个房间的 bot。
+
+    ★ 中继超时后的**处置一个字没改**（铁律 1）：只标 `send_broken`、
+    不关连接，投递自动回退 `0x040f`。
+    """
+
+    class StuckSocket:
+        def __init__(self):
+            self.gate = threading.Event()
+            self.entered = threading.Event()
+            self.writes = []
+
+        def sendall(self, data):
+            self.entered.set()
+            self.gate.wait(10.0)
+            self.writes.append(bytes(data))
+
+    def make_conn(self, sock):
+        conn = relayserver.RelayConn.__new__(relayserver.RelayConn)
+        conn.sock = sock
+        conn.cout = SimpleCipher.server_to_client()
+        conn.send_lock = threading.Lock()
+        conn.closed = False
+        conn.send_broken = False
+        conn.frames_out = 0
+        conn.data_out = 0
+        conn.addr = ("127.0.0.1", 40000)
+        conn.log = lambda _msg: None
+        return conn
+
+    def test_send_frame_returns_at_once_even_when_the_client_never_reads(self):
+        sock = self.StuckSocket()
+        conn = self.make_conn(sock)
+        self.addCleanup(sock.gate.set)
+        started = time.monotonic()
+        self.assertTrue(conn.send_data(b"\xff" * 43))
+        self.assertLess(time.monotonic() - started, 1.0,
+                        "send_data() 被卡死的中继客户端堵住了")
+        self.assertEqual([], sock.writes, "这会儿还没写出去才对")
+        sock.gate.set()
+        deadline = time.monotonic() + 5.0
+        while not sock.writes and time.monotonic() < deadline:
+            time.sleep(0.002)
+        self.assertEqual(1, len(sock.writes))
+
+    def test_a_stuck_relay_client_does_not_hold_up_anybody_else(self):
+        stuck_sock = self.StuckSocket()
+        stuck = self.make_conn(stuck_sock)
+        self.addCleanup(stuck_sock.gate.set)
+        healthy_sock = self.StuckSocket()
+        healthy_sock.gate.set()             # 这条一直收得走
+        healthy = self.make_conn(healthy_sock)
+
+        stuck.send_data(b"\xff" * 43)
+        self.assertTrue(stuck_sock.entered.wait(5.0))
+        started = time.monotonic()
+        healthy.send_data(b"\xee" * 43)
+        deadline = time.monotonic() + 5.0
+        while not healthy_sock.writes and time.monotonic() < deadline:
+            time.sleep(0.002)
+        self.assertEqual(1, len(healthy_sock.writes))
+        self.assertLess(time.monotonic() - started, 1.0,
+                        "健康的那条被卡死的那条拖住了")
+        self.assertEqual([], stuck_sock.writes)
+
+    def test_a_backlog_that_never_drains_marks_the_stream_broken(self):
+        """★ 积压太久 ⇒ `send_broken`（**不关连接**，投递回退 `0x040f`）。"""
+        sock = self.StuckSocket()
+        conn = self.make_conn(sock)
+        self.addCleanup(sock.gate.set)
+        conn.send_data(b"\xff" * 43)
+        self.assertTrue(sock.entered.wait(5.0), "发送线程没起来")
+        conn.send_data(b"\xff" * 43)        # 这一份留在队列里
+        conn.outbox_since -= relayserver.RELAY_SEND_DEADLINE_S + 1.0
+        self.assertEqual(0, conn.send_data(b"\xff" * 43))
+        self.assertTrue(conn.send_broken)
+        self.assertFalse(conn.closed, "铁律 1：不关连接，只绕开它")
+
 if __name__ == "__main__":
     unittest.main()

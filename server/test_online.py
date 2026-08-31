@@ -306,7 +306,6 @@ class GameLoginTests(unittest.TestCase):
         hold_lobby = False
         accounts = None
         login_result = 0
-        room_burst_delay = 0
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -330,7 +329,6 @@ class GameLoginTests(unittest.TestCase):
         conn.cout = SimpleCipher.server_to_client()
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.seq = 1
         conn.logged = []
         conn.log = conn.logged.append
@@ -357,6 +355,7 @@ class GameLoginTests(unittest.TestCase):
 
     def sent_opcodes(self, conn):
         out = []
+        conn.flush_outbox(timeout=5.0)   # D108：写在另一条线程上
         for blob in conn.sock.writes:
             # 明文是逐包 encrypt 的，测试里只关心 opcode，直接解一遍流。
             out.append(blob)
@@ -518,6 +517,7 @@ class GameLoginTests(unittest.TestCase):
     def decode_first_login_reply(self, conn):
         stream = SimpleCipher.server_to_client()
         plain = bytearray()
+        conn.flush_outbox(timeout=5.0)   # D108：写在另一条线程上
         for blob in conn.sock.writes:
             plain += stream.decrypt(blob)
         buf = bytearray(plain)
@@ -557,6 +557,7 @@ class VersionGateTests(GameLoginTests):
     def decode_frames(self, conn):
         stream = SimpleCipher.server_to_client()
         plain = bytearray()
+        conn.flush_outbox(timeout=5.0)   # D108：写在另一条线程上
         for blob in conn.sock.writes:
             plain += stream.decrypt(blob)
         frames = []

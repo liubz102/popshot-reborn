@@ -790,7 +790,6 @@ class LeaveSessionTests(unittest.TestCase):
         # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = True
         conn.quest_score = 64
@@ -1049,7 +1048,6 @@ class NoisyPacketLoggingTests(unittest.TestCase):
         # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 0
@@ -1145,7 +1143,6 @@ class DeathAndRespawnTests(unittest.TestCase):
         # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 0
@@ -1352,7 +1349,6 @@ class QuestScoreTests(unittest.TestCase):
         # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 0
@@ -1424,7 +1420,6 @@ class MapTransitionTests(unittest.TestCase):
         # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 0
@@ -1644,7 +1639,6 @@ class ItemDropTests(unittest.TestCase):
         # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 0
@@ -1757,7 +1751,6 @@ class QuestClearFlagTests(unittest.TestCase):
         # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 100
@@ -1886,7 +1879,6 @@ class ItemPickupTests(unittest.TestCase):
         # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = 0
@@ -2018,7 +2010,6 @@ class ResultScreenNumbersTests(unittest.TestCase):
         # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2}
         conn.settled = False
         conn.quest_score = score
@@ -2213,7 +2204,6 @@ class QuestDifficultyTests(unittest.TestCase):
         # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.room = {"session_type": 2, "arguments": quest}
         conn.settled = False
         conn.quest_score = 10
@@ -2488,7 +2478,6 @@ class CharacterUnlockTests(unittest.TestCase):
         # 真正的合并行为由 SendBatchTests 用带假 socket 的真 Conn 覆盖。
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.my_seat = 0
         conn.account_name = "tester"
         conn.account = account if account is not None else {
@@ -2690,7 +2679,6 @@ class SendBatchTests(unittest.TestCase):
         hold_lobby = False
         accounts = None
         login_result = 0
-        room_burst_delay = 0
 
     def make_conn(self):
         conn = gameserver.Conn.__new__(gameserver.Conn)
@@ -2703,7 +2691,6 @@ class SendBatchTests(unittest.TestCase):
         conn.cout = SimpleCipher.server_to_client()
         conn.send_lock = threading.RLock()
         conn.send_queue = None
-        conn.batch_delay_ms = 0
         conn.logged = []
         conn.log = conn.logged.append
         conn.vlog = lambda _msg: None
@@ -2727,17 +2714,27 @@ class SendBatchTests(unittest.TestCase):
             del rest[:consumed]
         return opcodes
 
+    def writes(self, conn):
+        """假 socket 上的写。**先把发送队列排空**（D108：写发生在另一条线程上）。
+
+        ★ 排空之后「写了几次」仍然是确定的：一份入队 = 一次写，发送线程
+        绝不把两份合起来写（见 `Conn._writer_loop`），所以下面这些
+        「一批就是一次写」的断言含义一点没变。
+        """
+        conn.flush_outbox(timeout=5.0)
+        return conn.sock.writes
+
     def decrypted(self, conn):
         """把假 socket 上的所有写按顺序解回明文。"""
         cin = SimpleCipher.server_to_client()
-        return cin.decrypt(b"".join(conn.sock.writes))
+        return cin.decrypt(b"".join(self.writes(conn)))
 
     def test_a_batch_leaves_the_socket_as_exactly_one_write(self):
         conn = self.make_conn()
         with gameserver.Conn.send_batch(conn):
             conn.send(build_game(0x0200, build_rep_list_session()))
             conn.send(build_game(0x0201, build_rep_create_session(1)))
-        self.assertEqual(1, len(conn.sock.writes))
+        self.assertEqual(1, len(self.writes(conn)))
         self.assertEqual([0x0200, 0x0201], self.frames_of(self.decrypted(conn)))
 
     def test_batching_does_not_change_a_single_byte_on_the_wire(self):
@@ -2755,16 +2752,16 @@ class SendBatchTests(unittest.TestCase):
         with gameserver.Conn.send_batch(batched):
             for packet in packets:
                 batched.send(packet)
-        self.assertEqual(3, len(one_by_one.sock.writes))
-        self.assertEqual(1, len(batched.sock.writes))
-        self.assertEqual(b"".join(one_by_one.sock.writes),
-                         b"".join(batched.sock.writes))
+        self.assertEqual(3, len(self.writes(one_by_one)))
+        self.assertEqual(1, len(self.writes(batched)))
+        self.assertEqual(b"".join(self.writes(one_by_one)),
+                         b"".join(self.writes(batched)))
 
     def test_an_empty_batch_writes_nothing(self):
         conn = self.make_conn()
         with gameserver.Conn.send_batch(conn):
             pass
-        self.assertEqual([], conn.sock.writes)
+        self.assertEqual([], self.writes(conn))
 
     def test_the_batch_is_flushed_even_if_the_block_raises(self):
         # 中途抛异常也要把已经攒下的字节发出去：漏发比早发危险得多
@@ -2774,7 +2771,7 @@ class SendBatchTests(unittest.TestCase):
             with gameserver.Conn.send_batch(conn):
                 conn.send(build_game(0x0200, build_rep_list_session()))
                 raise RuntimeError("boom")
-        self.assertEqual(1, len(conn.sock.writes))
+        self.assertEqual(1, len(self.writes(conn)))
         self.assertEqual([0x0200], self.frames_of(self.decrypted(conn)))
 
     def test_a_nested_batch_does_not_flush_early(self):
@@ -2783,25 +2780,14 @@ class SendBatchTests(unittest.TestCase):
             conn.send(build_game(0x0200, build_rep_list_session()))
             with gameserver.Conn.send_batch(conn):
                 conn.send(build_game(0x0201, build_rep_create_session(1)))
-            self.assertEqual([], conn.sock.writes)
-        self.assertEqual(1, len(conn.sock.writes))
+            self.assertEqual([], self.writes(conn))
+        self.assertEqual(1, len(self.writes(conn)))
         self.assertEqual([0x0200, 0x0201], self.frames_of(self.decrypted(conn)))
 
     def test_a_plain_send_outside_a_batch_still_goes_out_immediately(self):
         conn = self.make_conn()
         conn.send(build_game(0x0200, build_rep_list_session()))
-        self.assertEqual(1, len(conn.sock.writes))
-
-    def test_room_burst_delay_puts_the_broken_behaviour_back(self):
-        # `--room-burst-delay` 是复现开关（同 D047）：退回一包一次 sendall，
-        # 客户端的 recv 就又能插进缝里了。字节仍然一个不差。
-        conn = self.make_conn()
-        conn.args.room_burst_delay = 1
-        with gameserver.Conn.send_batch(conn):
-            conn.send(build_game(0x0200, build_rep_list_session()))
-            conn.send(build_game(0x0201, build_rep_create_session(1)))
-        self.assertEqual(2, len(conn.sock.writes))
-        self.assertEqual([0x0200, 0x0201], self.frames_of(self.decrypted(conn)))
+        self.assertEqual(1, len(self.writes(conn)))
 
     # -- 真正要保住的两条链 -------------------------------------------------
     def test_the_whole_room_burst_goes_out_in_one_write(self):
@@ -2810,7 +2796,7 @@ class SendBatchTests(unittest.TestCase):
         request = (w_wstr("想和做朋友吗?") + w_wstr("") + w_wstr("")
                    + w_i32(0) + w_i32(2) + w_i32(3) + w_i32(1))
         gameserver.Conn.on_game_packet(conn, 0x0201, request)
-        self.assertEqual(1, len(conn.sock.writes))
+        self.assertEqual(1, len(self.writes(conn)))
         self.assertEqual([OP_UPDATE_SESSION, 0x0201,
                           OP_SESSION_MEMBERS, OP_SLOT_EQUIPPED_LIST],
                          self.frames_of(self.decrypted(conn)))
@@ -2825,11 +2811,177 @@ class SendBatchTests(unittest.TestCase):
         conn.items_picked = 0
         conn.solo_quest = gameserver.RoomQuest()
         gameserver.Conn.leave_game_result(conn)
-        self.assertEqual(1, len(conn.sock.writes))
+        self.assertEqual(1, len(self.writes(conn)))
         opcodes = self.frames_of(self.decrypted(conn))
         self.assertEqual(gameserver.OP_LOADING_DONE, opcodes[0])
         self.assertEqual(OP_SLOT_EQUIPPED_LIST, opcodes[-1])
 
+
+
+class StuckClientIsolationTests(SendBatchTests):
+    """★★★★★ **一个人卡死不许影响别人**（D108）。
+
+    以前 `Conn.send()` 是「加密 + 写 socket」一体的，而写 socket 带
+    `GAME_SEND_DEADLINE_S`（8 秒）的截止时间。房间那条 32 ms 循环发一发
+    bot 心跳要遍历房里每一个人 —— 排在卡死那个人**后面**的所有人都被一起
+    堵住，整个房间的 bot 冻 8 秒，那一段的 `rpExplode` 全部迟到（§147）。
+
+    现在写 socket 是每条连接**自己那条发送线程**的活。
+    """
+
+    class BlockingSocket:
+        """一个**永远收不走字节**的假 socket（卡在 WER 弹窗上的客户端就是这样）。"""
+
+        def __init__(self):
+            self.gate = threading.Event()
+            #: 发送线程**进到** `sendall` 了没有 —— 用例拿它当事件等，
+            #: 不拿 sleep 猜（铁律 10）。
+            self.entered = threading.Event()
+            self.writes = []
+            self.closed = False
+
+        def sendall(self, data):
+            self.entered.set()
+            self.gate.wait(10.0)
+            self.writes.append(bytes(data))
+
+        def shutdown(self, _how):
+            self.closed = True
+
+        def close(self):
+            self.closed = True
+
+    class TimeoutSocket:
+        """写永远超时的假 socket（`send_all_bounded` 对真 socket 的那条路）。"""
+
+        def __init__(self):
+            self.writes = []
+            self.closed = False
+
+        def sendall(self, _data):
+            raise socket.timeout("send deadline exceeded")
+
+        def shutdown(self, _how):
+            self.closed = True
+
+        def close(self):
+            self.closed = True
+
+    class ClosableSocket(SendBatchTests.FakeSocket):
+        """`make_conn` 那份假 socket 没有 `shutdown`/`close` —— 补上，
+        拆流和关连接那两条路才走得通。"""
+
+        def __init__(self):
+            super().__init__()
+            self.closed = False
+
+        def shutdown(self, _how):
+            self.closed = True
+
+        def close(self):
+            self.closed = True
+
+    def stuck_conn(self):
+        conn = self.make_conn()
+        conn.sock = self.BlockingSocket()
+        return conn
+
+    def closable_conn(self):
+        conn = self.make_conn()
+        conn.sock = self.ClosableSocket()
+        return conn
+
+    def wait_for(self, predicate, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.002)
+        return False
+
+    # -- 核心：发送方不再被卡死的对端拖住 ------------------------------------
+
+    def test_send_returns_at_once_even_though_the_client_never_reads(self):
+        """★★★ 这条就是问题本身：`send()` 当场返回，不等那个卡死的 socket。"""
+        conn = self.stuck_conn()
+        started = time.monotonic()
+        conn.send(build_game(0x0200, build_rep_list_session()))
+        self.assertLess(time.monotonic() - started, 1.0,
+                        "send() 被卡死的客户端堵住了")
+        self.assertEqual([], conn.sock.writes, "这会儿还没写出去才对")
+        conn.sock.gate.set()
+        self.assertTrue(self.wait_for(lambda: len(conn.sock.writes) == 1))
+
+    def test_a_stuck_client_does_not_hold_up_anybody_else(self):
+        """★★★ A 卡死时给 B 发包，B 立刻就拿得到。"""
+        stuck = self.stuck_conn()
+        healthy = self.make_conn()
+        stuck.send(build_game(0x0200, build_rep_list_session()))
+        started = time.monotonic()
+        healthy.send(build_game(0x0200, build_rep_list_session()))
+        self.assertTrue(self.wait_for(lambda: len(healthy.sock.writes) == 1))
+        self.assertLess(time.monotonic() - started, 1.0,
+                        "健康的那条被卡死的那条拖住了")
+        self.assertEqual([], stuck.sock.writes)
+        stuck.sock.gate.set()
+
+    def test_the_order_survives_the_queue(self):
+        """★ 排队不许打乱顺序 —— `SimpleCipher` 是逐字节流密码，错一次全废。"""
+        conn = self.stuck_conn()
+        for opcode in (0x0200, 0x0201, 0x0200):
+            conn.send(build_game(opcode, build_rep_list_session()
+                                 if opcode == 0x0200
+                                 else build_rep_create_session(1)))
+        conn.sock.gate.set()
+        self.assertTrue(self.wait_for(lambda: len(conn.sock.writes) == 3))
+        self.assertEqual([0x0200, 0x0201, 0x0200],
+                         self.frames_of(self.decrypted(conn)))
+
+    # -- 收口：写不出去的连接照旧被拆掉 --------------------------------------
+
+    def test_a_write_that_times_out_still_kills_the_stream(self):
+        """★ 处置一个字没改：写超时 = 密码流已错位 ⇒ 拆连接让客户端重连。"""
+        conn = self.make_conn()
+        conn.sock = self.TimeoutSocket()
+        conn.send(build_game(0x0200, build_rep_list_session()))
+        self.assertTrue(self.wait_for(lambda: conn.send_broken))
+        self.assertTrue(conn.sock.closed, "该把 socket 拆掉")
+
+    def test_a_slow_reader_that_never_catches_up_is_killed_too(self):
+        """★★ 每次都勉强写进去几个字节、积压却一直涨的那种连接。
+
+        判据和写超时是**同一个**：「这个客户端 8 秒没把我们的字节收走」——
+        不是另拍一个内存上限。
+        """
+        conn = self.stuck_conn()
+        # 第一发被发送线程取走、卡在 `sendall` 里；第二发就留在队列里了。
+        conn.send(build_game(0x0200, build_rep_list_session()))
+        self.assertTrue(conn.sock.entered.wait(5.0), "发送线程没起来")
+        conn.send(build_game(0x0201, build_rep_create_session(1)))
+        self.assertTrue(conn.outbox, "第二发该还在队列里")
+        # 把「队列从空变非空」的时刻拨到 8 秒之前 = 积压了这么久还没走掉。
+        conn.outbox_since -= gameserver.GAME_SEND_DEADLINE_S + 1.0
+        conn.send(build_game(0x0200, build_rep_list_session()))
+        self.assertTrue(conn.send_broken, "积压太久该拆流")
+        conn.sock.gate.set()
+
+    def test_broken_streams_take_nothing_more(self):
+        """流已废之后再 `send()` 就是空操作（和 D108 之前一样）。"""
+        conn = self.closable_conn()
+        conn.kill_stream("用例造的")
+        conn.send(build_game(0x0200, build_rep_list_session()))
+        self.assertEqual([], conn.sock.writes)
+
+    # -- 收尾：关连接之前那一发要真的发出去 ----------------------------------
+
+    def test_close_now_flushes_what_is_still_queued(self):
+        """★★ 顶号 / 踢人 / 版本拒绝都是「先发一发说明，再关连接」——
+        队列没排空就关，玩家什么提示都看不到（D108 之前是同步发，天然没这问题）。
+        """
+        conn = self.closable_conn()
+        conn.send(build_game(0x0200, build_rep_list_session()))
+        conn.close_now()
+        self.assertEqual(1, len(conn.sock.writes), "关之前那一发丢了")
 
 if __name__ == "__main__":
     unittest.main()

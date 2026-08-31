@@ -52,6 +52,7 @@ opcode（`0x54bce1` 分发）：
 """
 from __future__ import annotations
 
+import collections
 import os
 import select
 import socket
@@ -513,9 +514,13 @@ class RelayConn:
     """一条中继 TCP 连接。注册成功后就绑定到一条**游戏连接**上，直到断开。"""
 
     # ★ 类级默认值：`RelayConn.__new__` 造的测试实例（test_latency）不走
-    #   `__init__`，这两个标志必须在类上也有一份默认。
+    #   `__init__`，这几个标志必须在类上也有一份默认。
     send_broken = False
     last_inbound_at = 0.0
+    #: 发送队列（D108）。真实例在 `__init__` 里各建各的，假实例第一次用到时
+    #: 由 `_outbox()` 补建。
+    outbox_cv = None
+    _outbox_boot = threading.Lock()
 
     def __init__(self, server, sock, addr):
         self.server = server
@@ -525,6 +530,18 @@ class RelayConn:
         self.cout = SimpleCipher.server_to_client()
         self.buf = bytearray()
         self.send_lock = threading.Lock()
+        #: ★★★ **已经加密、等着写 socket 的帧**（D108）。和游戏服那条连接
+        #: 同一个道理：写 socket 带 `RELAY_SEND_DEADLINE_S` 的截止时间，而
+        #: 投递是**一个人一个人挨着发**的 —— 一个卡死的客户端会把排在它
+        #: 后面的所有人一起堵住（D106 之后那就是整个房间的 bot）。
+        #: 拆开之后写不出去只影响它自己那一条线程。
+        #: ★ 锁序 `send_lock` → `outbox_cv`；发送线程只拿后者，没有环。
+        self.outbox = collections.deque()
+        self.outbox_cv = threading.Condition()
+        #: 队列从空变非空的时刻 —— 慢读者靠它收口，判据和写超时是同一个。
+        self.outbox_since = 0.0
+        self.writer = None
+        self.writer_stop = False
         self.game_conn = None       #: 注册成功后指向 `gameserver.Conn`
         self.auth = None            #: 兑换掉的那三个 int32（日志用）
         self.frames_in = 0
@@ -577,20 +594,109 @@ class RelayConn:
         if self.closed or self.send_broken:
             return False
         frame = build_rcp(opcode, payload)
-        try:
-            # 流密码是有状态的，加密和发送必须锁在一起，
-            # 否则两个线程各加密一半、交错发出去，客户端整条流就废了。
-            with self.send_lock:
-                wire = self.cout.encrypt(frame)
-                send_all_bounded(self.sock, wire, RELAY_SEND_DEADLINE_S)
-        except OSError as error:
-            if not self.send_broken:
-                self.send_broken = True
-                self.log(f"!! 中继发送失败（{error!r}）—— 这条流已错位，"
-                         f"投递改走 0x040f 回退（不关连接，铁律 1）")
-            return False
+        # 流密码是有状态的，加密必须锁起来按序做；写 socket 是**这条连接
+        # 自己那条发送线程**的活（D108），这里只入队。
+        with self.send_lock:
+            if not self._enqueue(self.cout.encrypt(frame)):
+                return False
         self.frames_out += 1
         return True
+
+    # -- 发送队列（D108）-----------------------------------------------------
+    def _outbox(self):
+        """本连接发送队列的 `Condition`；假连接（`__new__`）第一次用时补建。"""
+        cv = self.__dict__.get("outbox_cv")
+        if cv is not None:
+            return cv
+        with RelayConn._outbox_boot:
+            cv = self.__dict__.get("outbox_cv")
+            if cv is None:
+                self.outbox = collections.deque()
+                self.outbox_since = 0.0
+                self.writer = None
+                self.writer_stop = False
+                cv = self.outbox_cv = threading.Condition()
+        return cv
+
+    def _enqueue(self, wire):
+        """把一份已经加密的帧挂进队列。返回「还收得下吗」。
+
+        ⚠ 调用方必须已经持有 `send_lock`（加密和入队要在同一次加锁里）。
+        """
+        slow = False
+        with self._outbox():
+            if self.closed or self.send_broken or self.writer_stop:
+                return False
+            now = time.monotonic()
+            if not self.outbox:
+                self.outbox_since = now
+            elif now - self.outbox_since > RELAY_SEND_DEADLINE_S:
+                slow = True                 # 慢读者：积压一直涨，这条流废了
+            if not slow:
+                self.outbox.append(wire)
+                if self.writer is None or not self.writer.is_alive():
+                    self.writer = threading.Thread(
+                        target=self._writer_loop, daemon=True,
+                        name=f"relay-send-{self.addr[1] if self.addr else 0}")
+                    self.outbox_cv.notify_all()
+                    self.writer.start()
+                    return True
+                self.outbox_cv.notify_all()
+        if slow:
+            self._note_send_broken(
+                f"积压超过 {RELAY_SEND_DEADLINE_S:.0f} 秒没写出去")
+            return False
+        return True
+
+    def _writer_loop(self):
+        """本中继连接的发送线程。**一份入队 = 一次写**（同游戏服那条）。"""
+        cv = self._outbox()
+        while True:
+            with cv:
+                while not self.outbox and not self.writer_stop:
+                    cv.wait()
+                if self.writer_stop or not self.outbox:
+                    self.outbox.clear()
+                    cv.notify_all()
+                    return
+                chunk = self.outbox.popleft()
+            try:
+                send_all_bounded(self.sock, chunk, RELAY_SEND_DEADLINE_S)
+            except Exception as error:      # noqa: BLE001 —— 线程里不许漏
+                self._note_send_broken(repr(error))
+                return
+            finally:
+                with cv:
+                    cv.notify_all()
+
+    def _note_send_broken(self, why):
+        """★ 处置**一个字都没改**（铁律 1）：只标记，不关连接 —— 投递自动
+        回退 `0x040f`，玩家的画面靠回退路径恢复，不用断线。"""
+        if self.send_broken:
+            return
+        self.send_broken = True
+        self.log(f"!! 中继发送失败（{why}）—— 这条流已错位，"
+                 f"投递改走 0x040f 回退（不关连接，铁律 1）")
+
+    def flush_outbox(self, timeout=None):
+        """等到队列排空（或超时 / 流已废）。给收尾和单测用。"""
+        if timeout is None:
+            timeout = RELAY_SEND_DEADLINE_S
+        deadline = time.monotonic() + float(timeout)
+        cv = self._outbox()
+        with cv:
+            while self.outbox and not self.send_broken:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                cv.wait(left)
+            return not self.outbox
+
+    def stop_writer(self):
+        cv = self._outbox()
+        with cv:
+            self.writer_stop = True
+            cv.notify_all()
 
     def send_data(self, udp_packet):
         """把一份同步数据发给这个客户端（rcp opcode 0）。"""
@@ -766,6 +872,7 @@ class RelayConn:
         if self.closed:
             return
         self.closed = True
+        self.stop_writer()          # D108：别再往一个要关的 socket 上写
         self.server.unbind(self)
         try:
             self.sock.close()
