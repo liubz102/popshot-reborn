@@ -39,6 +39,7 @@ import gameserver                                              # noqa: E402
 import lobby                                                   # noqa: E402
 import mapdata                                                 # noqa: E402
 import relayserver                                             # noqa: E402
+import roomclock                                               # noqa: E402
 import udpsync                                                 # noqa: E402
 import weapondata                                              # noqa: E402
 from gameserver import OP_LEAVE_SESSION, OP_PEER_DATA_DOWN, \
@@ -802,8 +803,14 @@ def bot_frames(conn, seat):
 class BotFrameRoom(BotBattleRoom):
     """alice（房主，座位 0）+ bob（座位 1）+ 一个 bot（座位 2），已进关卡。
 
-    ★ 每个用例自己喂真人的心跳 —— bot 的帧是**被真人的同步包驱动**的（D17），
-    不喂就一帧都不该有。
+    ★★ **帧由房间那条 32 ms 循环推**（D106，废止 D17）。单测里
+    `gameserver.ROOM_LOOP_THREADED` 是关着的（只有 `app.py` 打开），
+    所以拍子在这儿手动数 —— 跑的是**同一段** `RoomLoop.run_tick()`，
+    不是给测试开的后门。
+
+    `human_heartbeat()` 喂一发真人心跳之后顺手推 `HEARTBEAT_TICKS` 格，
+    于是「一发真人心跳 ≈ 一发 bot 心跳」这个老口径继续成立；要逐格看的
+    用例直接调 `advance(n)`。
     """
 
     #: ★★ 「进图 / 复活之后 2 秒不能动手」那道锁（§74）默认**放开**。
@@ -847,11 +854,13 @@ class BotFrameRoom(BotBattleRoom):
                 conn.enter_lock_until = 0.0
 
     def human_heartbeat(self, conn, x, y, jumped=0, on_ground=True,
-                        velocity=(0, 0), fast_run=False):
+                        velocity=(0, 0), fast_run=False, ticks=None):
         """让 `conn` 发一发带位置的心跳（走真的 `0x040e` 入口）。
 
-        ★ 不用再复位什么闸门：bot 的帧判据是「这个真人报了一个新位置」
-        （`sync_trail_seq` 变了），喂一发就走一帧（V0.3 §32）。
+        ★★ 喂完之后把房间的 32 ms 循环推 `HEARTBEAT_TICKS` 格（D106）——
+        真人心跳 ~128 ms 一发、收方的物理步长 32 ms，四格正好一发。
+        bot 的帧**不再**由这一发驱动（那正是 `rpExplode` 迟到的病根，§147），
+        这里推格子只是把真实节奏搬进单测。
 
         ★ 默认「踩在地上、速度 0」—— 那是真人**走路**时的样子（§35），
         绝大多数用例要的就是它。跳跃的段落显式传 `on_ground=False`。
@@ -873,6 +882,56 @@ class BotFrameRoom(BotBattleRoom):
             conn, OP_PEER_DATA_UP,
             self.beat(conn, x, y, on_ground=on_ground, velocity=velocity,
                       fast_run=fast_run))
+        self.advance(gameserver.HEARTBEAT_TICKS if ticks is None
+                     else ticks)
+
+    def loop(self):
+        """房间那条 32 ms 循环（`gameserver.RoomLoop`）；没有就是 ``None``。"""
+        return gameserver.room_loop(self.room, create=False)
+
+    def now(self):
+        """**下一格**的绝对时刻 —— bot 眼里的「现在」（D106）。
+
+        ★ 单测里挂钟几乎不走，而模拟时钟一格 32 ms 地往前跑，两者会拉开
+        好几秒。要和 bot 的冷却 / 蓄力比时刻，就得用这个，别用挂钟。
+        """
+        loop = self.loop()
+        if loop is None:
+            return time.monotonic()
+        return roomclock.deadline_of(loop.t0, loop.done)
+
+    def last_beat(self, conn=None):
+        """这条连接收到的 bot 的**最后一发心跳**。
+
+        ★ 不能直接拿 `bot_frames(...)[-1]`：心跳每 4 格才一发，而事件包
+        （`rpFire` / `rpJump` / `rpCrouch`）在**发生的那一格**就发，
+        所以最后一份包经常不是心跳（D106）。
+        """
+        beats = [f for f in bot_frames(conn or self.alice, self.bot_seat)
+                 if udpsync.is_heartbeat(f)]
+        self.assertTrue(beats, "一发心跳都没有")
+        return beats[-1]
+
+    def change_map(self, name="Stage02"):
+        """走完整条换图握手（`0x0411` -> `0x0412` ×N -> `0x0418`）。
+
+        ★ D106 之后换图会**停掉**房间那条 32 ms 循环（真人在加载画面里，
+        世界还没建起来），放行 `0x0418` 时才起新的一代 —— 所以用例不能
+        只发一发 `0x0411` 就接着喂心跳，那样 bot 一格都不会走。
+        """
+        gameserver.Conn.on_game_packet(
+            self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
+            gameserver.w_wstr(name))
+        for conn in self.room.human_members():
+            gameserver.Conn.on_game_packet(
+                conn, gameserver.OP_MAP_LOADING_DONE, b"")
+
+    def advance(self, ticks=1):
+        """把房间的 32 ms 循环往前推 `ticks` 格，返回真的跑了几格。"""
+        loop = self.loop()
+        if loop is None:
+            return 0
+        return loop.advance(ticks)
 
     def beat(self, conn, x, y, on_ground=True, velocity=(0, 0),
              fast_run=False):
@@ -1644,15 +1703,16 @@ class BotFireRoom(BotFrameRoom):
                 conn.charge_at -= 3600.0
 
     def arrive(self):
-        """让在飞的子弹**把整条弹道跑完**（把出膛时刻拨到很久以前）。
+        """让在飞的子弹**把整条弹道跑完**（把出膛那一格拨到很久以前）。
 
-        ★ 单测里的一帧和一帧之间只差几微秒，而真实的 bot 帧是 ~125 ms ——
-        `_advance_shells()` 是按**真实流逝的时间**决定推几个 tick 的（§65），
-        所以在单测里得手动把出膛时刻往回拨。
-        ★ 贴脸那种一个 tick 之内就撞上的本来就当场结算，用不着这个。
+        ★★ D106 之后弹体按**格子**走（`tick − born_tick`），所以拨的是
+        `born_tick`，不是挂钟 —— 拨挂钟一格都不会动。`born` 跟着一起拨，
+        碎片 / 火墙的诞生时刻是拿它换算的（`_tick_moment`）。
         """
         for shell in self.bot_conn.pending_shots:
-            shell.born -= 3600.0
+            back = shell.max_ticks + 1
+            shell.born_tick -= back
+            shell.born -= back / ballistics.TICKS_PER_SECOND
 
     def settle(self):
         """让在飞的子弹**立刻到点**，再走一帧把 `rpExplode` 发出去。
@@ -1751,8 +1811,15 @@ class BotFireTests(BotFireRoom):
         """★ 开火间隔来自 `weapon.ini` 的 `CoolingTime`（D29）——
         原版这把枪就是这个节奏，不是我拍脑袋的常量。"""
         self.approach()
+        self.bot_conn.next_fire_at = 0.0
         self.clear()
-        self.approach()          # 冷却还没过，这一轮不该有新的 rpFire
+        self.advance(1)
+        self.assertTrue(fire_frames(self.alice, self.bot_seat),
+                        "这一格该打一发")
+        # ★ 刚打完那一发，`CoolingTime`（几百毫秒）还没走完 —— 一格才 32 ms。
+        self.assertGreater(self.bot_conn.next_fire_at, self.now())
+        self.clear()
+        self.advance(1)
         self.assertEqual([], fire_frames(self.alice, self.bot_seat))
 
     def test_the_bot_aims_at_its_target(self):
@@ -1849,9 +1916,7 @@ class BotWeaponDeclarationTests(BotFireRoom):
         （和 `crouched` 同一个坑，§41）。"""
         self.approach()
         self.assertIsNotNone(self.bot_conn.declared_weapon)
-        gameserver.Conn.on_game_packet(
-            self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
-            gameserver.w_wstr("Stage02"))
+        self.change_map()
         self.assertIsNone(self.bot_conn.declared_weapon)
         self.clear()
         self.approach(x=300.0)
@@ -2057,8 +2122,10 @@ class BotBallisticFireTests(BotFireRoom):
         # 解出来的弹道说它要飞好几个客户端 tick，而且不到一秒就到。
         self.assertGreater(shell.shot.ticks, 1.0)
         self.assertLess(shell.shot.seconds, 1.0)
-        # 出膛那一下只推了收方的第一步，还没走完。
-        self.assertEqual(1, shell.ticks)
+        # ★★ D106：弹体走到第几格 = **这一格减出膛那一格**，一格不多一格不少
+        #    （收方也是这么数的，§147）。出膛那一格本身**不推**。
+        self.assertEqual(min(self.loop().done - 1 - shell.born_tick,
+                             shell.max_ticks), shell.ticks)
 
     def test_a_pending_explosion_still_goes_out_while_the_bot_is_dead(self):
         """★★ **一发都不能漏**：句柄记账在开火那一刻就推进了，少发一发
@@ -2157,11 +2224,12 @@ class BotBallisticFireTests(BotFireRoom):
         self.approach()
         fires = fire_frames(self.alice, self.bot_seat)
         explodes = explode_frames(self.alice, self.bot_seat)
-        self.assertEqual(1, len(fires))
-        self.assertEqual(3, len(explodes))
-        handles = [struct.unpack_from("<i", body_of(f), 0)[0] for f in explodes]
+        self.assertTrue(fires)
+        # ★ 只看**第一发**那三颗：D106 之后一次 `approach()` 是实打实的
+        #   384 ms，冷却过得去就会再打一发。
         base = botsync.projectile_handle(self.bot_seat, 0)
-        self.assertEqual([base, base + 1, base + 2], handles)
+        handles = [struct.unpack_from("<i", body_of(f), 0)[0] for f in explodes]
+        self.assertEqual([base, base + 1, base + 2], handles[:3])
         self.assertEqual(3, struct.unpack_from("<i", body_of(fires[0]), 22)[0])
 
     def test_a_splash_weapon_holds_fire_until_its_bullet_exploded(self):
@@ -2868,20 +2936,23 @@ class BotSliceTests(BotFireRoom):
         self.apple()
         self.bot_conn.roll = lambda n: 0
         self.bot_conn.holding = True
+        # ★★ D106：一发真人心跳是实打实的 128 ms（4 格）—— 不把枪口封住的话，
+        #    母弹在**扔出去的那一发心跳里**就飞完、炸开了，碎片的 `rpFire`
+        #    会被后面那句 `clear()` 一起吃掉。整段封死，只放开一格。
+        self.bot_conn.next_fire_at = time.monotonic() + 3600.0
         self.walk(self.alice, [(0.0, 100.0), (600.0, 100.0)])
-        self.settle()
-        self.clear()
-        self.bot_conn.next_fire_at = 0.0
-        self.walk(self.alice, [(600.0, 100.0)])
+        self.walk(self.alice, [(600.0, 100.0)])        # 手指按下去，开始蓄力
         self.charge()
-        self.walk(self.alice, [(600.0, 100.0)])
+        self.bot_conn.next_fire_at = 0.0
+        self.advance(1)                               # 松手，就这一格
+        self.bot_conn.next_fire_at = self.now() + 3600.0
         shots = list(self.bot_conn.pending_shots)
         self.assertTrue(shots, "该有一颗苹果雷在飞")
         before = self.bot_conn.sync.projectiles
-        self.walk(self.alice, [(3000.0, 100.0)])       # 躲开 —— 别被砸中
         for shell in self.bot_conn.pending_shots:
             shell.max_ticks = min(shell.max_ticks, 20)
         self.clear()
+        self.walk(self.alice, [(3000.0, 100.0)])       # 躲开 —— 别被砸中
         self.settle()
         frags = [f for f in fire_frames(self.alice, self.bot_seat)
                  if struct.unpack_from("<i", body_of(f), 2)[0] == 1000500]
@@ -2901,7 +2972,7 @@ class BotSliceTests(BotFireRoom):
         shell = bot.Shell(1, 0, weapon, 3, 0.0, 0.0,
                           ballistics.launch(weapon, 0.0, 15.0), 0.0, 10)
         self.clear()
-        bot._split_shell(self.room, self.bot_conn, shell, (100.0, 50.0), None)
+        bot._split_shell(self.room, self.bot_conn, shell, (100.0, 50.0), None, 0)
         frags = fire_frames(self.alice, self.bot_seat)
         self.assertEqual(4, len(frags))
         for frame in frags:
@@ -2930,7 +3001,7 @@ class BotSliceTests(BotFireRoom):
         shell = bot.Shell(1, 0, weapon, 3, 0.0, 0.0,
                           ballistics.launch(weapon, 0.0, 15.0), 0.0, 10)
         self.clear()
-        bot._split_shell(self.room, self.bot_conn, shell, (100.0, 50.0), 0)
+        bot._split_shell(self.room, self.bot_conn, shell, (100.0, 50.0), 0, 0)
         self.assertEqual([], fire_frames(self.alice, self.bot_seat))
 
     def test_the_fragments_survive_the_frame_that_created_them(self):
@@ -2985,7 +3056,7 @@ class BotSliceTests(BotFireRoom):
         shell = bot.Shell(1, 0, weapon, 3, 0.0, 0.0,
                           ballistics.launch(weapon, 0.0, 15.0), 0.0, 10)
         self.bot_conn.pending_shots = []
-        bot._split_shell(self.room, self.bot_conn, shell, (100.0, 50.0), None)
+        bot._split_shell(self.room, self.bot_conn, shell, (100.0, 50.0), None, 0)
         self.assertEqual(4, len(self.bot_conn.pending_shots))
         self.clear()
         for piece in self.bot_conn.pending_shots:
@@ -3017,9 +3088,13 @@ class BotSliceTests(BotFireRoom):
         self.bot_conn.declared_weapon = None
         self.assertEqual(1000020, self.bot_conn.weapon.id)
         self.approach()
+        self.bot_conn.charge_at = None      # 手指重新按下去（同上）
+        self.clear()
+        self.advance(1)
         self.assertEqual([], fire_frames(self.alice, self.bot_seat),
                          "手指才刚按下去，一发都不该有（§73）")
         self.charge()
+        self.bot_conn.next_fire_at = 0.0     # 上一发的冷却不算数
         self.approach(x=120.0)
         self.assertTrue(fire_frames(self.alice, self.bot_seat))
 
@@ -3064,13 +3139,17 @@ class BotFireWallTests(BotFireRoom):
         当场结算（§52），来不及躲 —— 而砸中人的那一发**不铺火墙**（§79）。
         """
         self.bot_conn.holding = True
+        # ★★ D106：一发真人心跳是实打实的 128 ms，蓄力说不定走到一半就够了
+        #    —— 整段先把枪口封死，只在下面那**一格**上放开，`throw()` 才是
+        #    「恰好扔一颗」。不封的话火墙那本句柄账当场翻倍。
+        self.bot_conn.next_fire_at = time.monotonic() + 3600.0
         self.walk(self.alice, [(0.0, 100.0), (600.0, 100.0)])
-        self.settle()
         self.clear()
-        self.bot_conn.next_fire_at = 0.0
         self.walk(self.alice, [(600.0, 100.0)])      # 手指按下去，开始蓄力
         self.charge()
-        self.walk(self.alice, [(600.0, 100.0)])      # 松手，扔出去
+        self.bot_conn.next_fire_at = 0.0
+        self.advance(1)                             # 松手，就这一格
+        self.bot_conn.next_fire_at = self.now() + 3600.0
         self.dodge()
         # ★ 这个房间没有地形数据（`_current_map` 解不出图），弹体永远落不了地
         #   —— 手动把上界收到 20 个 tick，等价于「这一刻撞到地面了」，
@@ -3358,8 +3437,14 @@ class BotChargeTests(BotFireRoom):
         self.assertIsNotNone(self.bot_conn.charge_at)
 
     def test_it_does_not_throw_before_the_charge_is_ready(self):
+        """★ 蓄力按**时间**长（`0x516694` 每个 tick +2）—— 手指刚按下去
+        的那一格力气还不够（D106 之后一格就是 32 ms，所以只推一格）。"""
         self.grenade()
         self.approach()
+        self.bot_conn.charge_at = None      # 手指重新按下去
+        self.bot_conn.next_fire_at = 0.0    # 只留蓄力这一道闸
+        self.clear()
+        self.advance(1)
         self.assertEqual([], fire_frames(self.alice, self.bot_seat))
 
     def test_it_throws_once_the_charge_is_ready(self):
@@ -3378,8 +3463,10 @@ class BotChargeTests(BotFireRoom):
         self.assertTrue(fire_frames(self.alice, self.bot_seat))
         self.clear()
         # ★ 冷却拨掉，只留蓄力这一道闸：手指是从零重按的，所以还是打不出来。
+        #   ★ D106：只推**一格**（32 ms）—— 推满一帧的话力气就攒够了。
         self.bot_conn.next_fire_at = 0.0
-        self.approach(x=140.0)
+        self.bot_conn.charge_at = None       # 手指从零重按
+        self.advance(1)
         self.assertEqual([], fire_frames(self.alice, self.bot_seat),
                          "第二颗手雷也得重新蓄力")
 
@@ -3472,14 +3559,17 @@ class BotDashTests(BotFireRoom):
         self.assertIsNotNone(move)
         full = chrprops.game().sp_max
         self.approach()
-        # ★ 花掉 `SpCost`，同一帧里又按 `SpCharging` 回了一丁点 —— 取个余量。
-        self.assertAlmostEqual(full - move.sp_cost, self.bot_conn.stamina,
-                               delta=1.0)
+        # ★ 花掉 `SpCost`，之后按 `SpCharging` 一格一格回。D106 之后
+        #   `approach()` 是实打实的 384 ms，回的量不再可以忽略 ——
+        #   所以只断言这个区间：花过、而且没白花。
+        self.assertLess(self.bot_conn.stamina, full)
+        self.assertGreaterEqual(self.bot_conn.stamina, full - move.sp_cost)
         # 体力不够就不冲了。
         self.bot_conn.stamina = move.sp_cost - 1.0
         self.bot_conn.dash_swing = None
         self.clear()
-        self.walk(self.alice, [(160.0, 100.0), (170.0, 100.0)])
+        # ★ D106：只推一格 —— 多推几格体力就按 `SpCharging` 回上来了。
+        self.advance(1)
         self.assertEqual([], dash_frames(self.alice, self.bot_seat),
                          "体力不够就不该冲")
 
@@ -3488,14 +3578,17 @@ class BotDashTests(BotFireRoom):
         补一发 `rpSplashDamaged`（§67）。"""
         self.approach()
         self.assertTrue(dash_frames(self.alice, self.bot_seat))
-        # 把动作推到伤害帧。
-        swing = self.bot_conn.dash_swing
-        self.assertIsNotNone(swing)
-        handle = swing.handle
-        swing.born -= 1.0
+        # ★ D106：动作一格一格推（32 ms 一帧动画），而 `rpDash` 包里**没有**
+        #   句柄 —— 逐格看 `dash_swing`，把这几下的句柄都攒起来再对账。
         self.clear()
-        self.walk(self.alice, [tuple(self.alice.sync_trail[-1][:2])])
-        hits = splash_frames(self.alice, self.bot_seat)
+        handles = set()
+        for _ in range(60):
+            swing = self.bot_conn.dash_swing
+            if swing is not None:
+                handles.add(swing.handle)
+            self.advance(1)
+        hits = [f for f in splash_frames(self.alice, self.bot_seat)
+                if struct.unpack_from("<i", body_of(f), 0)[0] in handles]
         self.assertTrue(hits, "贴着打这一下该打中")
         body = body_of(hits[0])
         source, victim = struct.unpack_from("<ii", body, 0)
@@ -3505,16 +3598,20 @@ class BotDashTests(BotFireRoom):
         # ★ 夺分模式（夹具默认 args[1] = 3）伤害 ×2（§87）。
         self.assertAlmostEqual(float(move.damage) * bot._damage_scale(self.room),
                                damage, places=3)
-        self.assertEqual(handle, source, "伤害源就是这一下的句柄")
+        self.assertIn(source, handles, "伤害源就是那一下的句柄")
 
     def test_one_dash_damages_at_most_once(self):
         self.approach()
-        swing = self.bot_conn.dash_swing
-        self.assertIsNotNone(swing)
-        swing.born -= 1.0
+        dashes = dash_frames(self.alice, self.bot_seat)
+        self.assertTrue(dashes)
+        handle = struct.unpack_from("<i", body_of(dashes[0]), 0)[0]
         for _ in range(3):
             self.walk(self.alice, [tuple(self.alice.sync_trail[-1][:2])])
-        self.assertLessEqual(len(splash_frames(self.alice, self.bot_seat)), 1)
+        # ★ 按**这一下的句柄**数：D106 之后时间真的在走，一次 `approach()`
+        #   之后 bot 会再冲第二下 —— 那是另一下，不算重复伤害。
+        same = [f for f in splash_frames(self.alice, self.bot_seat)
+                if struct.unpack_from("<i", body_of(f), 0)[0] == handle]
+        self.assertLessEqual(len(same), 1)
 
     def test_it_does_not_shoot_while_dashing(self):
         """原版那一下会占住整个角色（`TotalFrame` 帧），真人也开不了枪。"""
@@ -3697,9 +3794,7 @@ class BotFireHandleResetTests(BotFireRoom):
         for _ in range(3):
             self.bot_conn.next_fire_at = 0.0
             self.approach()
-        gameserver.Conn.on_game_packet(
-            self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
-            gameserver.w_wstr("Stage02"))
+        self.change_map()
         self.clear()
         self.bot_conn.next_fire_at = 0.0
         self.approach(x=300.0)
@@ -3768,19 +3863,14 @@ class TerrainMixin(object):
         """把 bot 直接摆在某个落脚点上（省掉「先跟真人锚一帧」那一步）。"""
         self.bot_conn.battle_pos = (x, y)
         self.bot_conn.body = bot.botmove.Body(x, y)
-        self.bot_conn.move_at = time.monotonic()
 
     def beats(self, count, x, y=150.0):
-        """真人在 `(x, y)` 站着发 `count` 发心跳 —— bot 跟着走 `count` 帧。
+        """真人在 `(x, y)` 站着发 `count` 发心跳 —— bot 跟着走 `count × 4` 格。
 
-        ★ 每帧**把上一次推运动的时刻往回拨一发心跳的时间**：单测里两帧只
-        差几微秒，而真实的 bot 帧是 ~125 ms = 4 个 tick（§71）。不拨的话
-        一帧只推得动 1 个 tick，走几百个单位要喂上百发心跳。
-        和 `arrive()` / `settle()` 拨子弹出膛时刻是同一个手法。
+        ★ D106 之后不用再拨任何时刻：一发心跳就是实打实的 4 个 32 ms 格子，
+        `advance()` 推的就是它们。以前那个 `move_at` 累加器没有了。
         """
         for _ in range(count):
-            self.bot_conn.move_at -= bot.botmove.TICKS_PER_BEAT \
-                * bot.botmove.TICK_MS / 1000.0
             self.human_heartbeat(self.alice, x, y)
 
 
@@ -3919,8 +4009,8 @@ class BotOwnMovementTests(TerrainMixin, BotFireRoom):
         self.room.map_name = "没有这张图"
         self.walk(self.alice, [(0.0, 50.0), (120.0, 50.0), (240.0, 50.0)])
         self.assertIsNone(self.bot_conn.body)
-        last = bot_frames(self.alice, self.bot_seat)[-1]
-        self.assertEqual((120, 50), udpsync.heartbeat_position(last))
+        self.assertEqual((120, 50),
+                         udpsync.heartbeat_position(self.last_beat()))
 
 
 class BotWeaponChoiceTests(TerrainMixin, BotFireRoom):
@@ -4158,7 +4248,6 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
         self.install_terrain(synth_terrain("flat"))
         self.walk(self.alice, [(0.0, 150.0), (120.0, 150.0), (240.0, 150.0)])
         for _ in range(24):
-            self.bot_conn.move_at -= bot.botmove.TICKS_PER_BEAT                 * bot.botmove.TICK_MS / 1000.0
             self.human_heartbeat(self.alice, 240.0, 150.0)
         goal = bot._coop_goal(self.room, self.bot_conn, self.bot_seat,
                               mapdata.load(self.room.map_name))
@@ -4208,7 +4297,6 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
         self.walk(self.alice, [(0.0, 150.0), (200.0, 150.0)])
         self.bot_conn.battle_pos = (200.0, 150.0)
         self.bot_conn.body = bot.botmove.Body(200.0, 150.0)
-        self.bot_conn.move_at = time.monotonic()
         # 真人一下子跑到很远的前面。
         self.walk(self.alice, [(1800.0, 150.0), (2000.0, 150.0)])
         terrain = mapdata.load(self.room.map_name)
@@ -4223,7 +4311,6 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
         self.walk(self.alice, [(0.0, 150.0), (400.0, 150.0)])
         self.bot_conn.battle_pos = (330.0, 150.0)
         self.bot_conn.body = bot.botmove.Body(330.0, 150.0)
-        self.bot_conn.move_at = time.monotonic()
         terrain = mapdata.load(self.room.map_name)
         intent = bot._coop_intent(self.room, self.bot_conn, self.bot_seat,
                                   terrain, None)
@@ -4271,7 +4358,6 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
         far = 400.0 + bot.BOT_COOP_AHEAD_LIMIT + 200.0
         self.bot_conn.battle_pos = (far, 150.0)
         self.bot_conn.body = bot.botmove.Body(far, 150.0)
-        self.bot_conn.move_at = time.monotonic()
         intent = bot._coop_intent(self.room, self.bot_conn, self.bot_seat,
                                   mapdata.load(self.room.map_name), None)
         self.assertEqual(0, intent[0],
@@ -4730,9 +4816,11 @@ class BotSpawnPointTests(TerrainMixin, BotFireRoom):
         `trail_point()` 把锚定下来，第二帧才接管。有出生点的图不用等。
         """
         self.install_terrain(synth_terrain("flat"))
-        self.walk(self.alice, [(700.0, 150.0)])
+        # ★ D106 之后一「帧」= 4 格，所以这里逐**格**看：第一格
+        #   `battle_pos` 还是 None，只能先走 `trail_point()` 把锚定下来。
+        self.human_heartbeat(self.alice, 700.0, 150.0, ticks=1)
         self.assertIsNone(self.bot_conn.body)
-        self.walk(self.alice, [(700.0, 150.0)])
+        self.advance(1)
         self.assertIsNotNone(self.bot_conn.body)
         self.assertEqual(700.0, self.bot_conn.body.x)
 
@@ -5784,42 +5872,29 @@ class BotMagazineStatusTests(BotFireRoom):
         self.assertNotIn(gameserver.OP_REMOVE_CHAR_ATTR, opcodes(self.alice))
 
 
-class BotShellBodyLerpTests(BotFireRoom):
-    """★★★ 判命中要用「**那一 tick** 人在哪」，不是「此刻人在哪」（§96）。
+class BotShellHitNowTests(BotFireRoom):
+    """★★★ 判命中用的是「**此刻已知**的位置」（D106，换掉了 §96 的事后插值）。
 
-    用户 2026-08-29：「我跳起来看见苹果弹已经砸到我身上了，但是没有爆炸。」
+    以前一帧要把弹体推 4 个 tick（收方 32 ms 一步、真人心跳 128 ms 一发），
+    于是「128 ms 前那一 tick 的弹体」被拿去撞「此刻的人」。§96 当时的补法是
+    **在两帧之间插值** —— 那要等到**下一发**心跳到了才算得出来，也就是说
+    这一帧的爆炸得往后拖，而弹体的 `rpExplode` 迟到一格就是永久错账（§147）。
 
-    一帧要把弹体推 4 个 tick（收方 32 ms 一步、真人心跳 128 ms 一发），
-    而 `_battle_bodies()` 给的是**这一帧刚到**的位置 —— 于是「128 ms 前那一
-    tick 的弹体」被拿去撞「此刻的人」。2026-08-29 那一局的 1054 发心跳里，
-    相邻两发之间的位移中位 12、p90 62、**最大 245** 个单位，而碰撞圆最大
-    半径才 13：跳起来 / 被顶飞的那几发，判定用的人根本不在那儿。
+    D106 之后一格就是一格：弹体每 32 ms 推一步，判命中用的就是那一刻手上
+    最新的那份位置事实 —— 不再需要、也不允许等未来的心跳回头插值。
     """
 
-    def lerp_setup(self, old_y, new_y):
-        """真人从 `old_y` 挪到 `new_y`，返回 `(时刻, 上一帧的身体表, 组)`。"""
-        self.walk(self.alice, [(500.0, new_y)])
-        self.settle()
-        self.clear()
-        group = bot._seat_group(self.room, self.bot_seat)
-        alice_seat = self.room.seat_index_of(self.alice)
-        old = [(alice_seat, 500.0, old_y, False,
-                self.room.seats[alice_seat].character_id)]
-        now = time.monotonic()
-        self.bot_conn.shell_bodies = (now - 1.0, {group: old})
-        return now, old, group
-
-    def shoot_through(self, now, group, y):
-        """从 `(0, y)` 横着打一发**极快**的弹（第 1 个 tick 就到 x=500）。
+    def shoot_through(self, group, y, tick=1):
+        """从 `(0, y)` 横着打一发**极快**的弹（第 1 格就到 x=500）。
 
         返回这一发有没有打中人。
         """
         weapon = self.bot_conn.weapon
         shot = ballistics.Shot(0.0, 1.0, 500.0, 4, 0.0)
         shell = bot.Shell(1, self.bot_conn.sync.events - 1, weapon, group,
-                          0.0, y, shot, now - 1.0, 4)
+                          0.0, y, shot, time.monotonic(), 4, born_tick=0)
         self.bot_conn.pending_shots = [shell]
-        bot._advance_shells(self.room, self.bot_conn, now)
+        bot._advance_shells(self.room, self.bot_conn, tick)
         frames = explode_frames(self.alice, self.bot_seat)
         self.assertTrue(frames, "每一颗都必须恰好发一发 rpExplode（§42）")
         return struct.unpack_from("<i", body_of(frames[0]), 4)[0] != 0
@@ -5829,44 +5904,48 @@ class BotShellBodyLerpTests(BotFireRoom):
             self.room.seats[self.room.seat_index_of(self.alice)].character_id
         ).center(500.0, foot_y)[1]
 
-    def test_it_hits_where_the_target_was_during_that_tick(self):
-        """★ 弹体第 1 个 tick 发生在这一帧**刚开头** —— 那时人还在原地。"""
-        now, _old, group = self.lerp_setup(100.0, 900.0)
-        fraction = (1.0 / ballistics.TICKS_PER_SECOND) / 1.0
-        y = self.body_center_at(100.0 + (900.0 - 100.0) * fraction)
-        self.assertTrue(self.shoot_through(now, group, y),
-                        "插值后该打中「那一 tick 的人」")
-
-    def test_it_no_longer_hits_where_the_target_only_got_to_at_the_end(self):
-        """★ 反过来：人这一帧结束时才到的地方，不该被 128 ms 前的弹体打到。
-
-        改之前正是这一条错的 —— 2026-08-29 那一局 49 发苹果雷里有一发
-        （句柄 200088）就这么判成了命中，而玩家看到的弹体离身体还有 20 个单位。
-        """
-        now, _old, group = self.lerp_setup(100.0, 900.0)
-        self.assertFalse(self.shoot_through(now, group,
-                                            self.body_center_at(900.0)),
-                         "不该拿「这一帧末的人」去撞「这一帧初的弹」")
-
-    def test_without_a_previous_frame_it_falls_back_to_the_latest(self):
-        """★ 这一局第一发（没有上一帧可插）—— 老口径，别把它判空。"""
-        self.walk(self.alice, [(500.0, 900.0)])
+    def setup_target(self, y):
+        self.walk(self.alice, [(500.0, y)])
         self.settle()
         self.clear()
-        self.bot_conn.shell_bodies = None
-        group = bot._seat_group(self.room, self.bot_seat)
-        self.assertTrue(self.shoot_through(time.monotonic(), group,
+        return bot._seat_group(self.room, self.bot_seat)
+
+    def test_it_hits_the_target_where_it_is_now(self):
+        """★ 人此刻站在哪，弹体就该撞在哪。"""
+        group = self.setup_target(900.0)
+        self.assertTrue(self.shoot_through(group,
                                            self.body_center_at(900.0)))
 
-    def test_interpolate_bodies_only_moves_the_position(self):
-        before = [(0, 0.0, 0.0, True, 7)]
-        after = [(0, 100.0, 200.0, False, 7), (1, 5.0, 5.0, False, 2)]
-        got = bot._interpolate_bodies(before, after, 0.25)
-        self.assertEqual((0, 25.0, 50.0, False, 7), got[0])
-        # 上一帧没有的座位（刚复活）原样用这一帧的。
-        self.assertEqual((1, 5.0, 5.0, False, 2), got[1])
-        self.assertEqual(after, bot._interpolate_bodies(before, after, 1.0))
-        self.assertEqual(after, bot._interpolate_bodies(None, after, 0.5))
+    def test_it_misses_where_the_target_no_longer_is(self):
+        """★ 反过来：人已经不在那儿了，就不该判成命中。
+
+        ★ 推到 `max_ticks`：什么都没撞上的那一发要**飞到头**才结算
+        （在最后那一点炸掉，句柄账一发都不许漏，§42）。
+        """
+        group = self.setup_target(900.0)
+        self.assertFalse(self.shoot_through(group,
+                                            self.body_center_at(100.0),
+                                            tick=4))
+
+    def test_a_shell_fired_this_tick_does_not_move_yet(self):
+        """★★★ 出膛那一格**一步都不推** —— 收方也是下一帧才推第一格（§147）。
+
+        这一条是整套时序的地基：`rpFire` 到 `rpExplode` 的间隔必须恰好是
+        `k × 32 ms`，早一格晚一格都会让收方那份弹体对不上号。
+        """
+        group = self.setup_target(900.0)
+        weapon = self.bot_conn.weapon
+        shot = ballistics.Shot(0.0, 1.0, 500.0, 4, 0.0)
+        shell = bot.Shell(1, self.bot_conn.sync.events - 1, weapon, group,
+                          0.0, self.body_center_at(900.0), shot,
+                          time.monotonic(), 4, born_tick=7)
+        self.bot_conn.pending_shots = [shell]
+        bot._advance_shells(self.room, self.bot_conn, 7)
+        self.assertEqual(0, shell.ticks)
+        self.assertEqual([], explode_frames(self.alice, self.bot_seat))
+        bot._advance_shells(self.room, self.bot_conn, 8)
+        self.assertEqual(1, shell.ticks)
+        self.assertTrue(explode_frames(self.alice, self.bot_seat))
 
 
 class BotShellGirthTests(TerrainMixin, BotFireRoom):
@@ -6326,7 +6405,8 @@ class BotHandleLedgerTests(BotSliceTests):
         shell = bot.Shell(botsync.projectile_handle(self.bot_seat, 0), 0,
                           weapon, 9, 100.0, 100.0,
                           ballistics.launch(weapon, 0.0, 30.0), 0.0, 40)
-        bot._split_shell(self.room, self.bot_conn, shell, (100.0, 100.0), None)
+        bot._split_shell(self.room, self.bot_conn, shell, (100.0, 100.0), None,
+                         0)
         frags = list(self.bot_conn.pending_shots)
         self.assertEqual(4, len(frags), "该有四片碎片在飞")
         handles = sorted(s.handle for s in frags)
@@ -7302,9 +7382,13 @@ class BotWeaponCooldownTests(BotFireRoom):
         self.approach()
         self.clear()
         machine.next_fire_at = 0.0
-        bot._declare_weapon(machine, self.bot_seat, weapondata.get(1000030))
-        self.assertGreater(machine.next_fire_at, time.monotonic())
-        self.walk(self.alice, [(140.0, 100.0)])
+        # ★ D106：声明武器要在**这一格的时刻**上算（`_now()`），否则拿的是
+        #   挂钟 —— 单测里挂钟比模拟时钟慢好几秒，`LoadingTime` 一上来就过期了。
+        with bot._tick_clock(self.now()):
+            bot._declare_weapon(machine, self.bot_seat,
+                                weapondata.get(1000030))
+        self.assertGreater(machine.next_fire_at, self.now())
+        self.advance(1)
         self.assertEqual([], fire_frames(self.alice, self.bot_seat))
 
 
@@ -7409,11 +7493,12 @@ class BotPlanBudgetTests(TerrainMixin, BotFireRoom):
                              f"一帧递了 {len(asked)} 张单子")
 
     def test_decisions_are_capped_at_a_human_reaction_rate(self):
-        """★★★ 一帧里**不再逐 tick** 重新决策（用户 2026-08-30）。
+        """★★★ **不逐格**重新决策（用户 2026-08-30）。
 
         「真人也不可能脑内计算那么快，每秒 10 到 20 次就够了」。
-        判据一个都没改，只是问得没那么密 —— 每帧的 AI 计算量对折，
-        而那份计算是压在真人转发路径上的。
+        D106 之后物理是 32 ms 一格（收方的步长，改不得），而 AI 还是
+        `BOT_DECISIONS_PER_SECOND` 那个节奏 —— 判据一个都没改，只是问得
+        没那么密。
         """
         self.assertLessEqual(10.0, bot.BOT_DECISIONS_PER_SECOND)
         self.assertLessEqual(bot.BOT_DECISIONS_PER_SECOND, 20.0)
@@ -7426,31 +7511,27 @@ class BotPlanBudgetTests(TerrainMixin, BotFireRoom):
 
         bot._move_intent = counted
         self.addCleanup(setattr, bot, "_move_intent", original)
-        # 一帧最多推 BOT_MOVE_MAX_TICKS 个 tick；决策次数该是它除以节拍。
-        self.bot_conn.move_at -= 1.0        # 攒够一帧的满额 tick
-        self.human_heartbeat(self.alice, 2200.0, 40.0)
-        ceiling = -(-bot.BOT_MOVE_MAX_TICKS // bot.BOT_DECISION_TICKS)
+        ticks = 16
+        self.human_heartbeat(self.alice, 2200.0, 40.0, ticks=ticks)
+        ceiling = -(-ticks // bot.BOT_DECISION_TICKS)
         self.assertLessEqual(len(calls), ceiling,
-                             f"一帧问了 {len(calls)} 次走位，上限是 {ceiling}")
+                             f"{ticks} 格里决策了 {len(calls)} 次")
 
-    def test_the_body_never_jumps_more_than_two_heartbeats(self):
-        """★★ 服务端卡住之后不许把攒下的位移一次性推出去（= 闪现）。"""
+    def test_one_tick_is_one_tick(self):
+        """★★★ 一格就是一格：推一格，身体最多挪一格的步长（D106）。
+
+        以前这里防的是「服务端卡住之后把攒下的位移一次性推出去」——
+        那个累加器（`move_at`）随 D106 一起没了：房间循环落后时是**逐格
+        补跑**的，一格一格都真的走过，不存在「一次挪一大步」。
+        """
         self.beats(1, 2200.0, 40.0)
         before = self.bot_conn.body
-        # 假装服务端卡了 3 秒
-        self.bot_conn.move_at -= 3.0
-        self.human_heartbeat(self.alice, 2200.0, 40.0)
+        self.advance(1)
         after = self.bot_conn.body
-        # ★ 量**水平**位移：垂直那一格是重力，收方自己也在算（腾空段照抄
-        #   速度，§35），拉不出「穿墙」；横着一次挪过去才是用户看到的闪现。
-        step = abs(after.x - before.x)
-        ceiling = (bot.BOT_MOVE_MAX_TICKS
-                   * botmove.walk_speed(chrprops.get(
-                       self.bot_conn.character_id), fast_run=True) + 1.0)
-        self.assertLessEqual(step, ceiling,
-                             f"一帧横着挪了 {step:.0f} 个单位，这是闪现")
-        # 攒下的那 3 秒被丢掉了，不会在后面几帧接着补出来。
-        self.assertLessEqual(time.monotonic() - self.bot_conn.move_at, 0.1)
+        ceiling = botmove.walk_speed(
+            chrprops.get(self.bot_conn.character_id), fast_run=True) + 1.0
+        self.assertLessEqual(abs(after.x - before.x), ceiling,
+                             f"一格横着挪了 {abs(after.x - before.x):.0f} 个单位")
 
 
 class BotDoubleJumpNavTests(TerrainMixin, BotFireRoom):
@@ -7521,7 +7602,7 @@ class BotQuestSplashTests(BotQuestCombatTests):
         self.clear()
         shell = self.shell_at(880.0, 120.0)
         bot._resolve_shell(self.room, self.bot_conn, shell,
-                           (900.0, 120.0), None, None)
+                           (900.0, 120.0), None, None, 0)
         targets = {struct.unpack_from("<i", body_of(f), 4)[0]
                    for f in splash_frames(self.alice, self.bot_seat)}
         self.assertIn(500123, targets, "手雷炸在怪旁边该溅到它")
@@ -7531,7 +7612,7 @@ class BotQuestSplashTests(BotQuestCombatTests):
         self.clear()
         shell = self.shell_at(880.0, 120.0)
         bot._resolve_shell(self.room, self.bot_conn, shell,
-                           (880.0, 120.0), ("mob", 500123), None)
+                           (880.0, 120.0), ("mob", 500123), None, 0)
         targets = [struct.unpack_from("<i", body_of(f), 4)[0]
                    for f in splash_frames(self.alice, self.bot_seat)]
         self.assertNotIn(500123, targets,
@@ -7542,7 +7623,7 @@ class BotQuestSplashTests(BotQuestCombatTests):
         before = int(self.bot_conn.quest_score)
         shell = self.shell_at(880.0, 120.0)
         bot._resolve_shell(self.room, self.bot_conn, shell,
-                           (900.0, 120.0), None, None)
+                           (900.0, 120.0), None, None, 0)
         self.assertGreater(self.bot_conn.quest_score, before)
 
     def test_a_mob_far_from_the_blast_is_untouched(self):
@@ -7550,7 +7631,7 @@ class BotQuestSplashTests(BotQuestCombatTests):
         self.clear()
         shell = self.shell_at(880.0, 120.0)
         bot._resolve_shell(self.room, self.bot_conn, shell,
-                           (3000.0, 120.0), None, None)
+                           (3000.0, 120.0), None, None, 0)
         targets = [struct.unpack_from("<i", body_of(f), 4)[0]
                    for f in splash_frames(self.alice, self.bot_seat)]
         self.assertNotIn(500123, targets)
@@ -7560,7 +7641,7 @@ class BotQuestSplashTests(BotQuestCombatTests):
         self.spot_mob(handle=500123, x=880.0, y=150.0)
         weapon = weapondata.get(1001020)          # ch01-02 燃烧瓶
         bot._set_ground_on_fire(self.room, self.bot_conn, weapon,
-                                (880.0, 150.0))
+                                (880.0, 150.0), time.monotonic())
         self.assertTrue(self.bot_conn.fires, "该铺出一道火墙")
         self.clear()
         self.bot_conn.burnt = {}
@@ -7599,7 +7680,7 @@ class BotQuestSplashTests(BotQuestCombatTests):
         self.clear()
         shell = self.shell_at(880.0, 150.0)
         bot._resolve_shell(self.room, self.bot_conn, shell,
-                           (890.0, 150.0), None, None)
+                           (890.0, 150.0), None, None, 0)
         targets = {struct.unpack_from("<i", body_of(f), 4)[0]
                    for f in splash_frames(self.alice, self.bot_seat)}
         self.assertNotIn(handle, targets, "任务模式的溅射伤不到队友")
@@ -7610,7 +7691,7 @@ class BotQuestSplashTests(BotQuestCombatTests):
         self.clear()
         shell = self.shell_at(600.0, 150.0)
         bot._resolve_shell(self.room, self.bot_conn, shell,
-                           (600.0, 150.0), None, None)
+                           (600.0, 150.0), None, None, 0)
         mine = botsync.character_handle(self.bot_seat)
         targets = {struct.unpack_from("<i", body_of(f), 4)[0]
                    for f in splash_frames(self.alice, self.bot_seat)}
@@ -7621,7 +7702,7 @@ class BotQuestSplashTests(BotQuestCombatTests):
         handle = self.human_at(880.0, 150.0)
         weapon = weapondata.get(1001020)          # ch01-02 燃烧瓶
         bot._set_ground_on_fire(self.room, self.bot_conn, weapon,
-                                (880.0, 150.0))
+                                (880.0, 150.0), time.monotonic())
         self.assertTrue(self.bot_conn.fires, "火墙照铺 —— 少的只是角色伤害")
         self.clear()
         self.bot_conn.burnt = {}
@@ -7989,3 +8070,209 @@ class BotBreakableTests(TerrainMixin, BotFireRoom):
         self.ledger().blast(self.terrain, 680, 160, 0.0, 99)
         bot._refresh_breakables(self.room)
         self.assertEqual([], self.bot_conn.nav_path)
+
+
+class ShellClockTests(BotFireRoom):
+    """★★★★★ D106 的**核心不变式**：同一条有序流上，一颗弹体的 `rpFire` 与
+    `rpExplode` 的发出间隔恰好是 `k × 32 ms`。
+
+    ## 为什么这是最要紧的一条（§147）
+
+    收方对**远端弹体**每 32 ms 自己推一格，撞地形 / 引信到期就**本地自灭**；
+    `rpExplode` 晚到一步就被 `0x492750` 静默丢弃 —— 不扣血、不建溅射对象、
+    **计数器不 +1**，而服务端照记 ⇒ 这个座位的弹体句柄从此永久错开，
+    「子弹照飞、一滴血不掉」，一局之内不自愈。
+
+    收方那份弹体的时钟锚在它**收到 `rpFire` 的那一帧**，两发又走同一条有序流
+    ⇒ 网络延迟对两发是同一份、自动抵消。剩下唯一的自变量就是**我们两发之间
+    的间隔**。所以这里一格一格地量，不看挂钟。
+    """
+
+    def one_shot(self):
+        """逼出**恰好一颗**在飞的子弹，返回它。"""
+        self.approach_far(settle=False)
+        shells = list(self.bot_conn.pending_shots)
+        self.assertTrue(shells, "该有一颗在飞")
+        # ★ 把枪口封住：后面一格一格推的时候不许再打，否则数不清是哪一发炸了。
+        self.bot_conn.next_fire_at = self.now() + 3600.0
+        self.clear()
+        return shells[0]
+
+    def test_the_explode_goes_out_on_the_very_tick_of_the_collision(self):
+        """★★★ 撞上是第几格，`rpExplode` 就在第几格发出去 —— 一格不多一格不少。"""
+        shell = self.one_shot()
+        fired_at = shell.born_tick
+        exploded_at = None
+        for _ in range(shell.max_ticks + 2):
+            tick = self.loop().done
+            self.advance(1)
+            if explode_frames(self.alice, self.bot_seat):
+                exploded_at = tick
+                break
+        self.assertIsNotNone(exploded_at, "总得炸 —— 句柄账一发都不许漏（§42）")
+        self.assertEqual(shell.ticks, exploded_at - fired_at,
+                         "rpFire 到 rpExplode 的间隔必须等于撞上的那一格")
+
+    def test_the_shell_does_not_move_on_the_tick_it_was_fired(self):
+        """★★ 出膛那一格**一步都不推**：收方也是下一帧才推第一格（语料实测，
+        2610 对 `rpFire`/`rpExplode` 的残差中位 +13 ms，不是 ±32）。"""
+        shell = self.one_shot()
+        self.assertEqual(self.loop().done - 1 - shell.born_tick, shell.ticks)
+
+
+class HeartbeatCadenceTests(BotFrameRoom):
+    """★★ 心跳 4 格一发（128 ms），事件包**在发生的那一格**发（D106）。"""
+
+    def beats_only(self):
+        return [f for f in bot_frames(self.alice, self.bot_seat)
+                if udpsync.is_heartbeat(f)]
+
+    def test_one_heartbeat_every_four_ticks(self):
+        self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+        self.clear()
+        self.advance(gameserver.HEARTBEAT_TICKS * 3)
+        self.assertEqual(3, len(self.beats_only()))
+
+    def test_three_ticks_are_not_enough_for_a_second_one(self):
+        self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+        self.clear()
+        self.advance(gameserver.HEARTBEAT_TICKS - 1)
+        self.assertEqual([], self.beats_only())
+
+
+class ReceiverLedgerTests(BotFireRoom):
+    """★★★★ **收方账本重放对账**：把 bot 发出去的那串包按收方的规矩重放一遍，
+    看每一发 `rpExplode` 指的弹体在收方那边是不是真的存在（§42 / §147）。
+
+    这正是 2026-08-31 那次实机定位漂移用的方法（`bshook` 的 `PROJ+` 序列和
+    服务端的计数器逐条并排）—— 只是这里用的是单测里的那串字节。
+    """
+
+    def replay(self):
+        """按收方的规矩重放一遍，返回 `(建过的弹体数, 对不上号的 rpExplode)`。"""
+        alive = set()
+        created = 0
+        strays = []
+        cursor = botsync.projectile_handle(self.bot_seat, 0)
+        for frame in bot_frames(self.alice, self.bot_seat):
+            opcode = header(frame)["opcode"]
+            body = body_of(frame)
+            if opcode == botsync.OP_FIRE:
+                ammo = struct.unpack_from("<i", body, 2)[0]
+                shots = struct.unpack_from("<i", body, 22)[0]
+                weapon = weapondata.get(ammo)
+                self.assertIsNotNone(weapon, f"武器 {ammo} 不在表里")
+                for offset in range(shots):
+                    alive.add(cursor + offset)
+                created += shots
+                cursor += weapon.fire_step
+            elif opcode == botsync.OP_EXPLODE:
+                handle = struct.unpack_from("<i", body, 0)[0]
+                if handle not in alive:
+                    strays.append(handle)
+                    continue
+                alive.discard(handle)
+                # ★ 带溅射的武器在**爆炸那一刻**多建一个对象（§86）。
+                cursor += 1 if self.explode_step_of(handle) else 0
+            elif opcode == botsync.OP_DASH:
+                cursor += 1                 # `DashDamage`（§64）
+            elif opcode == botsync.OP_SET_ON_FIRE:
+                cursor += botsync.fire_wall_handles(
+                    self.bot_conn.weapon.raw.get("spawn_count"))
+        return created, strays
+
+    def explode_step_of(self, handle):
+        """这一发爆炸建不建溅射对象 —— 单测里全场只用一把枪，直接问它。"""
+        return self.bot_conn.weapon.explode_step
+
+    def test_every_explode_names_a_shell_the_receiver_really_has(self):
+        """★★★ 一发对不上号，这个座位从此就打不掉血了（§42）。"""
+        for _ in range(6):
+            self.bot_conn.next_fire_at = 0.0
+            self.approach()
+        created, strays = self.replay()
+        self.assertGreater(created, 2, "总得打出几发来")
+        self.assertEqual([], strays,
+                         "有 rpExplode 指向收方根本没建过的弹体（§147 的漂移）")
+
+
+class RoomLoopLifecycleTests(BotFrameRoom):
+    """★★ 循环什么时候起、什么时候停（D106）。"""
+
+    def test_the_last_human_leaving_stops_it(self):
+        """房里没有真人了 = 这一局没有意义了 —— 循环自己停掉，不留野线程。"""
+        loop = self.loop()
+        self.assertTrue(loop.running())
+        for conn in list(self.room.human_members()):
+            gameserver.Conn.on_game_packet(conn, OP_LEAVE_SESSION, b"")
+            gameserver.Conn.leave_game_result(conn)
+        loop.advance(1)
+        self.assertFalse(loop.running())
+
+    def test_a_map_change_stops_it_and_the_release_starts_a_new_generation(self):
+        """★★ 换图那一段真人在加载画面里 —— bot 一格都不许动；放行之后
+        起**新的一代**，tick 从 0 重新数（旧代排在堆里的定时任务自动作废）。"""
+        loop = self.loop()
+        was = loop.gen
+        self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+        self.assertGreater(loop.done, 0)
+        gameserver.Conn.on_game_packet(
+            self.alice, gameserver.OP_REQ_CHANGE_TO_NEXT_MAP,
+            gameserver.w_wstr("Stage02"))
+        self.assertFalse(loop.running(), "换图期间循环该停")
+        for conn in self.room.human_members():
+            gameserver.Conn.on_game_packet(
+                conn, gameserver.OP_MAP_LOADING_DONE, b"")
+        loop = self.loop()
+        self.assertTrue(loop.running(), "放行 0x0418 之后该起新的一代")
+        self.assertNotEqual(was, loop.gen)
+        self.assertEqual(0, loop.done)
+
+    def test_the_room_thread_really_ticks(self):
+        """★ 线程那条路的冒烟：`ROOM_LOOP_THREADED` 打开之后房间自己会走格子。
+
+        上面所有用例都用 `advance()` 手动推（那样才确定），所以**节拍器线程 +
+        房间线程**这两条一行都没被跑过 —— 而生产上跑的就是它们。
+        这里只验「真的会自己走、停得掉」，不验时序精度（那个在
+        `test_roomclock` 里用假时钟量）。
+        """
+        self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+        loop = self.loop()
+        loop.stop("重新起一代，这回带线程")
+        saved = gameserver.ROOM_LOOP_THREADED
+        self.addCleanup(loop.stop, "用例收尾")
+        self.addCleanup(setattr, gameserver, "ROOM_LOOP_THREADED", saved)
+        gameserver.ROOM_LOOP_THREADED = True
+        loop.start("线程冒烟")
+        want = gameserver.HEARTBEAT_TICKS * 2
+        deadline = time.monotonic() + 5.0
+        while loop.done < want and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertGreaterEqual(loop.done, want, "房间线程没在走格子")
+        loop.stop("验完了")
+        settled = loop.done
+        time.sleep(0.1)
+        self.assertEqual(settled, loop.done, "停了还在走")
+
+    def test_a_stalled_loop_catches_up_tick_by_tick(self):
+        """★★★ 落后了要**逐格补跑**，一格都不许跳 —— 跳掉的那一格里弹体不
+        推进，它的 `rpExplode` 就又变成迟到（§147）。"""
+        loop = self.loop()
+        self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+        ran = []
+        original = bot.tick_room
+
+        def counted(room, tick, now):
+            ran.append(tick)
+            return original(room, tick, now)
+
+        bot.tick_room = counted
+        gameserver.BOT_ROOM_TICK = counted
+        self.addCleanup(setattr, gameserver, "BOT_ROOM_TICK", original)
+        self.addCleanup(setattr, bot, "tick_room", original)
+        # 假装节拍器晚了 10 格才叫醒房间。
+        start = loop.done
+        loop._on_due(loop.gen, roomclock.deadline_of(loop.t0, start),
+                     roomclock.deadline_of(loop.t0, start + 9))
+        loop.advance(loop.scheduled - loop.done)
+        self.assertEqual(list(range(start, start + 10)), ran)

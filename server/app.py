@@ -230,6 +230,10 @@ def main(argv=None):
 
     gameserver.VERBOSE = args.verbose
     authserver.VERBOSE = args.verbose
+    # ★★★ 打开房间的 32 ms 战斗循环（D106）。**只有生产入口开**：单测里
+    #   房间照样会走到 `IN_GAME`，真起了线程整套测试就变成不确定的
+    #   —— 那边用 `RoomLoop.advance()` 一格一格推同一段代码。
+    gameserver.enable_room_loops()
 
     config_path = args.config or server_config.config_path()
     server_config.ensure_exists(config_path)

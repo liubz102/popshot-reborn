@@ -184,6 +184,11 @@ PEER_HEARTBEAT_VELOCITY_OFFSET = PEER_HEARTBEAT_STATE_OFFSET + 4
 #: ★★ bit2（= `[char+0x128]`，收方 `0x5042b1` 写）是 **「我此刻踩在地面上」**，
 #: 不是「我静止着」（V0.3 §35）。判据见那一节的四格表。
 PEER_HEARTBEAT_FIELD_OFFSET = PEER_HEARTBEAT_STATE_OFFSET + 12
+
+#: ★★ 角色状态结构 `+0x10` = **方向键掩码**（V0.3 §39）。收方 `0x5073c2` 拿它
+#: 算走路方向、`0x507660` 照着**每 32 ms 替远端角色走一步**。服务端逐格外推
+#: 真人位置时要读的就是它（D106，`bot._advance_humans`）。
+PEER_HEARTBEAT_KEYS_OFFSET = PEER_HEARTBEAT_STATE_OFFSET + 0x10
 PEER_HEARTBEAT_BIT_ONGROUND = 0x04
 
 #: 同一个位域的 **bit3**（= `[char+0x4bc]`）= ★ **「我在冲刺」**（V0.3 §40）。
@@ -434,6 +439,24 @@ def heartbeat_motion(udp_packet):
                                PEER_HEARTBEAT_FIELD_OFFSET)[0]
     return (x, y, bool(field & PEER_HEARTBEAT_BIT_ONGROUND), vx, vy,
             bool(field & PEER_HEARTBEAT_BIT_FASTRUN))
+
+
+def heartbeat_keys(udp_packet):
+    """心跳里的**方向键掩码**（角色状态结构 `+0x10`，§39）；不是心跳就 ``None``。
+
+    ★★ 为什么服务端要读它（D106）：收方对**远端角色**是拿这个掩码
+    **每 32 ms 替它走一步**的（`0x507660`），心跳只是每 128 ms 纠一次偏。
+    服务端替 bot 判命中时说的「这个人在哪」必须是同一个口径 —— 否则拿
+    128 ms 前那一发心跳的坐标去撞此刻的弹体，跳起来 / 被顶飞的那几发
+    根本判不准（旧 §96 拿**事后插值**补过这一课，但那要等下一发心跳才算得
+    出来，而 `rpExplode` 迟到一格就是永久错账，§147）。
+    """
+    if not is_heartbeat(udp_packet):
+        return None
+    end = PEER_HEARTBEAT_KEYS_OFFSET + 2
+    if len(udp_packet) < end:
+        return None
+    return struct.unpack_from("<H", udp_packet, PEER_HEARTBEAT_KEYS_OFFSET)[0]
 
 
 def as_broadcast(udp_packet):

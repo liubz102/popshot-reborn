@@ -78,6 +78,7 @@ from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
                    item_mode_of, team_layout_of)
 from netlisten import create_listener, describe as describe_listen, tune_stream
 import relayserver
+import roomclock
 from tickets import TicketStore, short as short_ticket
 import udpsync
 import versioning
@@ -3398,8 +3399,11 @@ SYNC_TRAIL_POINTS = 64
 #: ★ 做成 `namedtuple` 是为了**旧的下标写法照样能用**（`point[0]` / `[1]`
 #: / `[2]` 仍是 x / y / jumped），单测里的假轨迹不用全改。
 SyncTrailPoint = collections.namedtuple(
-    "SyncTrailPoint", "x y jumped on_ground vx vy fast_run crouch")
-SyncTrailPoint.__new__.__defaults__ = (True, 0, 0, False, False)
+    "SyncTrailPoint",
+    "x y jumped on_ground vx vy fast_run crouch keys")
+#: ★ `keys` 排在**最后**、而且有缺省值：`bot.trail_point()` 返回的那个
+#: 八元组形状一个字都不许变，它在 `bot.py` 里是逐位解包的。
+SyncTrailPoint.__new__.__defaults__ = (True, 0, 0, False, False, 0)
 
 #: `UdpPacket` 的内层 `0x0006 rpJump`（body = 座位号 + 第几段跳，V0.3 §23）。
 #: 这里只用来把「他起跳了」记进位置轨迹，组包在 `botsync.py`。
@@ -3428,7 +3432,14 @@ PEER_OP_LOAD_PROGRESS = 0x4005
 #:
 #: `app.py` 启动时有一发显式 `import bot`，所以真服务端里它一定装上了；
 #: 没装（只 import 了 `gameserver` 的场合，比如某些老单测）时这里是 `None`，
-#: `_relay_battle_tick` 判空跳过，行为等同于「房里没有 bot」。
+#: `RoomLoop.run_tick` 判空跳过，行为等同于「房里没有 bot」。
+#:
+#: ★★★ **签名 `(room, tick, now)`**（V0.3 D106，废止 D17）：
+#: `tick` 是本局第几个 32 ms 格子，`now` 是这一格的**绝对时刻**
+#: （`t0 + tick × 32 ms`，追赶时是过去的时刻）。调用方是 `RoomLoop`，
+#: **不再是**真人的同步转发路径 —— 挂在真人 ~128 ms 的心跳上会让
+#: `rpExplode` 系统性迟到一个帧距，收方那份弹体已经自灭、包被静默丢弃，
+#: 弹体句柄计数器从此永久错开（§147）。
 BOT_ROOM_TICK = None
 
 #: ★ 同上，`bot.report_bots_loaded` 挂这儿：房里每个 bot 广播一发
@@ -4709,6 +4720,349 @@ def _relay_fallback(member, udp_packet):
     member.send(build_game(OP_PEER_DATA_DOWN, udp_packet))
 
 
+# ---------------------------------------------------------------------------
+# ★★★★★ 房间的 32 ms 战斗循环（V0.3 D106 —— **废止 D17**）
+# ---------------------------------------------------------------------------
+#: 一发 bot 心跳隔几个物理 tick。`4 × 32 ms = 128 ms`，就是真人客户端自己那个
+#: 节奏（语料 ~8 Hz）。
+#:
+#: ★★ **事件包不看这个数**：`rpFire` / `rpExplode` / `rpJump` / `rpCrouch`
+#: 在**它发生的那一 tick** 就发 —— 原版射手就是这么干的，而
+#: 「`rpFire` 到 `rpExplode` 恰好隔 k×32 ms」正是收方那份弹体活着的全部依据
+#: （§147：晚一格就被 `0x492750` 静默丢弃，句柄账从此永久错开）。
+HEARTBEAT_TICKS = 4
+
+#: 房间级那几件「到点了就动一下」的事每几个 tick 问一次。
+#: 它们本来挂在真人 ~8 Hz 的同步流上，换成同一个频率，行为不变。
+CHORE_TICKS = HEARTBEAT_TICKS
+
+#: 落后几个 tick 才吼一嗓子。
+#:
+#: ⚠ 这**不是**「超过就跳过」的阈值（铁律 10 禁的那种）—— 迟到的 tick
+#: **照样一个不落地跑完**：跳过一格等于那一格里弹体不推进，它的 `rpExplode`
+#: 又变成迟到（§147）。这个数只决定**打不打日志**。
+LATE_TICKS_WARN = 2
+
+#: ★★★ 房间循环要不要真的起线程。**默认关**，由 `app.py` 打开
+#: （那是唯一的生产入口，也是唯一 `import bot` 装钩子的地方）。
+#:
+#: 为什么默认关：单测里房间照样会走到 `IN_GAME`，真起了线程整套测试就变成
+#: 不确定的。关着的时候 `RoomLoop` 一样建、一样记 tick，测试用 `advance()`
+#: 一格一格推 —— 跑的是**同一段** `run_tick()`，不是给测试开的后门。
+ROOM_LOOP_THREADED = False
+
+
+def enable_room_loops():
+    """打开 32 ms 房间循环的线程（生产入口调它，见 `ROOM_LOOP_THREADED`）。"""
+    global ROOM_LOOP_THREADED
+    ROOM_LOOP_THREADED = True
+
+
+class RoomLoop:
+    """一个房间的 **32 ms 虚拟客户端循环**（D106）。
+
+    ## 为什么非有它不可
+
+    收方对**远端弹体**每 32 ms 自己推一格，撞地形 / 引信到期就本地自灭；
+    `rpExplode` 晚到一步就被静默丢弃、弹体句柄计数器从此永久错开
+    （§147，实机表现是「bot 打着打着就一滴血都打不掉」）。
+    D17 那套「bot 的帧由真人同步包驱动」的节奏是 ~128 ms，**系统性地晚一个
+    帧距** —— 所以服务端必须自己有一个和收方同频的时钟。
+
+    ⇒ 我们要抄的不是「原版服务端做了什么」（它只是中继，什么都不模拟），
+    而是「**原版射手做了什么**」：出膛与炸开由同一台机器、同一个 32 ms
+    时钟决定，两发之间恰好隔 k×32 ms。本类就是把服务端变成那台射手。
+
+    ## 三条线程怎么分工
+
+    | 谁 | 干什么 |
+    |---|---|
+    | 网络线程 | 收真人包 -> 在 `room.sim_lock` 里**记输入**，不推帧 |
+    | `roomclock.SCHEDULER`（进程唯一） | **只管定时**：到点把本房间那条线程叫醒 |
+    | 本房间这条线程 | 跑 tick：物理、发包、房间级杂事。**bot 状态的唯一写者** |
+
+    ★★ **为什么 tick 不能直接跑在节拍器线程上**：`Conn.send()` 的截止时间是
+    `GAME_SEND_DEADLINE_S`（8 秒）—— 一个崩在 WER 弹窗上的客户端能把发包方
+    堵住整整 8 秒。跑在共享线程上就是**所有房间一起冻 8 秒**；一房一线程把
+    这个爆炸半径关回它自己的房间（和今天「谁发包谁被堵」同性质）。
+
+    ★ 这不违反「不给每个房间开 `threading.Timer`」：**定时只有节拍器一处**，
+    房间线程是执行体，平时阻塞在自己的 `Condition` 上，不自己掐表。
+
+    ## 谁数 tick
+
+    `scheduled` 只由节拍器线程写（「到现在为止该跑完几格」），
+    `done` 只由房间线程写（「已经跑完几格」）。两个数各有唯一写者，
+    落后多少 = 两者之差，追赶是房间线程自己的事。
+    """
+
+    def __init__(self, room):
+        self.room = room
+        #: 本局 tick 0 的**绝对时刻**。所有 deadline 都从它算
+        #: （`t0 + n × 32 ms`），不从「现在」算 —— 见 `roomclock` 的约束 1。
+        self.t0 = 0.0
+        #: 本代的代号（`roomclock.Scheduler.start()` 发的）。换图 / 开新一局
+        #: 各换一次，上一代排在堆里的定时任务自动作废。
+        self.gen = 0
+        self.why = ""
+        self.scheduled = 0
+        self.done = 0
+        self.stopped = True
+        #: 「现在是不是正在落后」——按**状态翻转**去重打日志（铁律 10）。
+        self.late = False
+        self._cv = threading.Condition()
+        self._thread = None
+
+    def __repr__(self):
+        return (f"<RoomLoop #{self.room.room_id} 第{self.gen}代 "
+                f"tick {self.done}/{self.scheduled}"
+                f"{'（停）' if self.stopped else ''}>")
+
+    # -- 起停 ---------------------------------------------------------------
+    def running(self):
+        """这一代还没被停掉（`advance()` / `_run()` 用它决定要不要接着跑）。"""
+        return not self.stopped
+
+    def driven(self):
+        """★ **有没有一条线程在替这个房间数拍子。**
+
+        `_relay_battle_tick` 拿它决定房间级杂事归谁：有人数拍子就归循环，
+        没有就退回真人的同步流（单测里的房间就是后者 —— 那边由
+        `advance()` 手动推，`ROOM_LOOP_THREADED` 是关着的）。
+        判据是**线程活着没有**这个结构性事实，不是那个全局开关本身。
+        """
+        return (not self.stopped and self._thread is not None
+                and self._thread.is_alive())
+
+    def start(self, why, now=None):
+        """开一局 / 换完图：**重新起一代**，tick 从 0 重新数。"""
+        now = time.monotonic() if now is None else float(now)
+        with self._cv:
+            self.t0 = now
+            self.scheduled = 1              # tick 0 的 deadline 就是 t0
+            self.done = 0
+            self.stopped = False
+            self.late = False
+            self.why = why
+            if ROOM_LOOP_THREADED:
+                # ★ 第一次回调排在 tick 1 上：tick 0 由下面这一发 notify 当场跑掉。
+                self.gen = roomclock.SCHEDULER.start(
+                    self, self._on_due,
+                    first=roomclock.deadline_of(now, 1))
+            else:
+                # ★ 没起线程 = 拍子由别人数（单测里的 `advance()`）——
+                #   **不往节拍器里挂**：挂了只会在堆里越积越多，而且一旦有
+                #   哪个用例打开线程，那些早就结束的房间会被一起叫起来。
+                self.gen = roomclock.SCHEDULER.generation()
+            if ROOM_LOOP_THREADED and (self._thread is None
+                                       or not self._thread.is_alive()):
+                self._thread = threading.Thread(
+                    target=self._run, daemon=True,
+                    name=f"roomloop-{self.room.room_id}")
+                self._thread.start()
+            self._cv.notify_all()
+        print(f"[{ts()}] [sim] 房间 #{self.room.room_id} 32ms 循环起步"
+              f"（第 {self.gen} 代，{why}）", flush=True)
+        return self.gen
+
+    def stop(self, why):
+        """换图 / 结算 / 退房 / 最后一个真人走了 —— 停。返回真的停掉了没有。"""
+        with self._cv:
+            if self.stopped:
+                return False
+            self.stopped = True
+            # ★ 代号清零：在飞的回调和正跑到一半的那一格全部作废。
+            self.gen = 0
+            self._cv.notify_all()
+        roomclock.SCHEDULER.stop(self)
+        print(f"[{ts()}] [sim] 房间 #{self.room.room_id} 32ms 循环停"
+              f"（跑了 {self.done} 格，{why}）", flush=True)
+        return True
+
+    # -- 节拍器线程这一侧 ---------------------------------------------------
+    def _on_due(self, gen, deadline, now):
+        """到点了。**只把房间线程叫起来**，一点活都不干（见类注释）。"""
+        with self._cv:
+            if self.stopped or gen != self.gen:
+                return None
+            # 「到现在为止该跑完几格」。落后时这一步直接把欠的全排上，
+            # 房间线程一次追完 —— 不跳过任何一格（§147）。
+            want = max(self.scheduled + 1,
+                       roomclock.ticks_due(self.t0, now))
+            self.scheduled = want
+            self._cv.notify_all()
+            return roomclock.deadline_of(self.t0, want)
+
+    # -- 房间线程这一侧 -----------------------------------------------------
+    def _run(self):
+        while True:
+            with self._cv:
+                while not self.stopped and self.done >= self.scheduled:
+                    self._cv.wait()
+                if self.stopped:
+                    return
+                gen, tick = self.gen, self.done
+                self._note_late(self.scheduled - self.done - 1)
+            if not self.run_tick(tick):
+                self.stop("这一局到头了（循环自校验）")
+                return
+            with self._cv:
+                if gen != self.gen:
+                    # 跑这一格的中途换代了（换图 / 新一局）——
+                    # `start()` 已经把 tick 清成 0，这里绝不能再写回去。
+                    continue
+                self.done = tick + 1
+
+    def _note_late(self, behind):
+        """落后了吼一嗓子。**按状态翻转去重**（铁律 10），不是每格一行。"""
+        late = behind >= LATE_TICKS_WARN
+        if late == self.late:
+            return
+        self.late = late
+        if late:
+            print(f"[{ts()}] [sim] ⚠ 房间 #{self.room.room_id} 落后 "
+                  f"{behind} 格（{behind * roomclock.TICK_S * 1000:.0f} ms）"
+                  f"—— 这几格的 rpExplode 会迟到，句柄账有错开的风险（§147）",
+                  flush=True)
+        else:
+            print(f"[{ts()}] [sim] 房间 #{self.room.room_id} 追上了",
+                  flush=True)
+
+    # -- 一格 ---------------------------------------------------------------
+    def alive(self):
+        """这个循环还该不该**存在**（每格都问）。
+
+        起停钩子难免有漏网的（退房的路子有好几条），所以真正说了算的是
+        这道自校验 —— 漏挂钩子最多让循环多跑一格，不会留下野线程。
+
+        ⚠ 和 `idle()` 分开是有讲究的：**「这一局结束了」才停**，
+        「这会儿还没有世界可推」只空转。停掉的循环要等下一次 `start()`
+        才回来，而那只挂在开局 / 换图放行两个事件上 —— 拿它去处理
+        「加载中」这种会自己好的状态，循环就再也醒不过来了。
+        """
+        room = self.room
+        if room is None or room.status != SESSION_STATUS_PLAYING:
+            return False                    # 结算完 / 回房间了
+        if room.human_count() <= 0:
+            return False                    # 最后一个真人走了（房间也散了）
+        quest = room.quest
+        if quest is None or quest.settled:
+            return False
+        return True
+
+    def idle(self):
+        """这一格该不该**空转** —— 循环还在，只是这会儿没有世界可推。
+
+        两种：**还没进 stage 7**（`0x0400` 到 `0x0402` 之间大家在读图），
+        以及**换图在飞**（真人卡在换图的加载画面里）。这两段 bot 一动不许动
+        （动了就是往一张不存在的图上发包，而且会拿上一局的句柄计数器开枪）。
+
+        ★ 拿不到 `battle` 的场合（控制通道造的假房间）按**已开始**算，
+        别把那条测试路径挡死 —— 和 `bot._battle_started()` 同一个口径。
+        """
+        room = self.room
+        state = getattr(getattr(room, "battle", None), "state", None)
+        if state is not None and state != StartGameHandshake.IN_GAME:
+            return True
+        return getattr(room.quest, "pending_map", None) is not None
+
+    def run_tick(self, tick, now=None):
+        """跑一格。返回 ``False`` = 这一局到头了，循环该停。
+
+        `now` 是这一格的**绝对时刻**（`t0 + tick × 32 ms`），不是「此刻」——
+        追赶时它是过去的时刻，物理照着它算才对得上。
+        """
+        room = self.room
+        if now is None:
+            now = roomclock.deadline_of(self.t0, tick)
+        with room.sim_lock:
+            if not self.alive():
+                return False
+            if self.idle():
+                return True                 # 加载中 / 换图在飞 —— 空转一格
+            # ★ 房间级杂事排在 bot 前面：看门狗补的那一发 `0x0419` 要在**同一格**
+            #   里被 bot 看见（`pending_spawn`），顺序和 D17 时代一样。
+            if tick % CHORE_TICKS == 0:
+                self._chores()
+            if BOT_ROOM_TICK is not None:
+                try:
+                    BOT_ROOM_TICK(room, tick, now)
+                except Exception as error:  # noqa: BLE001 —— 见下
+                    # bot 出问题不能把房间那条循环带走（D1）：真人的对战计时、
+                    # 刷道具、复活看门狗都还挂在它上面。逐个 bot 的隔离在
+                    # `bot.tick_room()` 里，这是最后一道。
+                    print(f"[{ts()}] [sim] ⚠ 房间 #{room.room_id} 的 bot 帧"
+                          f"整个出错，这一格跳过: {error!r}", flush=True)
+        return True
+
+    def _chores(self):
+        """房间级那几件「到点了就动一下」的事（原来挂在真人流量上）。
+
+        ★ 找**一个真人**来跑就够：三件事都是房间级的、按截止时间幂等，
+        而它们要一条连接才有 `battle_broadcast` / `log`。
+        ★ 顺带修掉一个老毛病：以前没人发同步包（全员卡住 / 全员观战）时
+        对战的 240 秒上限永远不结算 —— 现在时钟是房间自己的。
+        """
+        humans = self.room.human_members()
+        if not humans:
+            return
+        conn = humans[0]
+        try:
+            conn.check_pvp_finished()
+            conn.maybe_spawn_item()
+            conn.check_respawn_watchdog()
+        except Exception as error:          # noqa: BLE001 —— 别连累这一格
+            conn.log(f"   ⚠ 房间级定时任务出错，已跳过: {error!r}")
+
+    def advance(self, ticks=1, now=None):
+        """★ **单测用**：同步跑 `ticks` 格，一条线程都不起。返回真的跑了几格。
+
+        跑的是和线程那条路**同一个** `run_tick()` —— 差别只在谁来数拍子。
+        """
+        ran = 0
+        for _ in range(int(ticks)):
+            with self._cv:
+                if self.stopped:
+                    break
+                tick = self.done
+            at = None if now is None else now
+            if not self.run_tick(tick, at):
+                self.stop("这一局到头了（循环自校验）")
+                break
+            with self._cv:
+                self.done = tick + 1
+                if self.scheduled < self.done:
+                    self.scheduled = self.done
+            ran += 1
+        return ran
+
+
+def room_loop(room, create=True):
+    """房间那条 32 ms 循环；`create=False` 时不存在就返回 ``None``。"""
+    if room is None:
+        return None
+    loop = getattr(room, "sim", None)
+    if loop is None and create:
+        loop = room.sim = RoomLoop(room)
+    return loop
+
+
+def start_room_loop(room, why):
+    """开一局 / 换完图：把房间挂上节拍器（**每次都换一代**）。"""
+    loop = room_loop(room)
+    if loop is None:
+        return None
+    return loop.start(why)
+
+
+def stop_room_loop(room, why):
+    """换图 / 结算 / 退房 / 房间销毁：把房间从节拍器上摘下来。"""
+    loop = room_loop(room, create=False)
+    if loop is None:
+        return False
+    return loop.stop(why)
+
+
 def _relay_battle_tick(game_conn):
     """每转发一份同步数据就跑一次的房间级判断。
 
@@ -4716,38 +5070,29 @@ def _relay_battle_tick(game_conn):
     原版中继一旦建起来，整局连一发 `0x040e` 都不会再有（§160），
     而 `deliver()` 是两条通道唯一的汇合点。
 
-    这里放的两件事都是「到点了就动一下」，本身带房间级去重：
+    ## ★★★ D106 之后这里**不再推 bot 的帧**
 
-    - `check_pvp_finished()` —— 对战的 240 秒时间上限（§167）。挂在这儿之前
-      它只在有人死的时候才会被问到，中继模式下一局不死人就永远不结算。
-    - `maybe_spawn_item()` —— 道具模式往地图上刷道具（§191 / D109）。
-    - `check_respawn_watchdog()` —— 死了 8 秒还没发 `0x0413` 的人由服务端
-      补一发 `0x0419`（bug调查/8「死了不复活」）。同步数据战斗中恒定 ~8 Hz，
-      拿它当心跳的精度绰绰有余。
+    bot 的帧现在由房间自己那条 **32 ms 循环**（`RoomLoop`）走 —— 挂在真人
+    ~128 ms 的心跳上会让 `rpExplode` 系统性迟到一个帧距，收方那份弹体已经
+    自灭、包被静默丢弃，句柄计数器从此永久错开（§147）。D17 因此作废。
 
-    ★ 排在最后的两件事都**不许**把同步转发带崩：`deliver()` 已经把本函数
-    整个包在 try 里（见 `RelayServer.deliver`），这里不再另加一层。
+    剩下的三件房间级杂事**也归 `RoomLoop`**；只有「那个房间没在跑循环」时
+    才退回这条老路（单测里的房间就是这种）。判据是**循环在不在跑**这个
+    结构性事实，所以两条路永远只有一条生效，不会双倍节拍。
     """
-    # ★★ bot 自己合成的那一发**不驱动这里的任何东西**（V0.3 M3 / D17）。
-    #
-    #   两个理由，缺一条都不行：
-    #   1. 再驱动一轮 bot 帧就是**无限递归**：
-    #      `tick_room` -> `deliver()` -> 本回调 -> `tick_room` -> …
-    #   2. 下面三件房间级判断本来就该由**真人的 8 Hz 同步流**驱动。让 bot
-    #      也来敲一遍，等于房里每多一个 bot 就多一倍的节拍 —— 它们眼下都是
-    #      按截止时间幂等的，但那是运气，不是设计。
-    #
-    #   判据是「这一发是谁发的」这个结构性事实，不是计数器、也不是时间窗。
+    # ★★ bot 自己合成的那一发**不驱动这里的任何东西**（V0.3 M3 / D17 / D106）。
+    #   即使 bot 帧已经不在这儿了，这道门也必须留着：`_emit()` 走的是同一条
+    #   `PEER_RELAY.deliver()`，放它进来就是「房里每多一个 bot，房间级杂事
+    #   就多一倍节拍」。判据是「这一发是谁发的」这个结构性事实。
     if game_conn.is_bot_conn():
         return
+    room = LOBBY.room_of(game_conn)
+    loop = room_loop(room, create=False)
+    if loop is not None and loop.driven():
+        return                              # 这三件事归那条 32 ms 循环
     game_conn.check_pvp_finished()
     game_conn.maybe_spawn_item()
     game_conn.check_respawn_watchdog()
-    # ★ 房里的 bot 各走一帧。**挂在这儿是有意的**：「真人正在打」这件事
-    #   本身就是一串 8 Hz 的事件流，服务端手上就有，不需要另起定时器线程
-    #   （铁律 10）。真人全卡住 / 全在加载时 bot 跟着停 —— 那正是想要的。
-    if BOT_ROOM_TICK is not None:
-        BOT_ROOM_TICK(game_conn)
 
 
 #: 全进程唯一的原版 TCP 中继（里程碑 J.3 / D078）。和 `LOBBY` 同一个理由做成
@@ -6588,6 +6933,10 @@ class Conn:
         #   事件本身，和 D4 同一处。
         if room is not None:
             reset_sync_trails(room, "换图")
+            # ★★★ 循环停在这儿（D106）：真人这会儿在加载画面里，
+            #   世界还没建起来；bot 再动就是往一张不存在的图上发包。
+            #   等 `0x0418` 放行时再起**新的一代**。
+            stop_room_loop(room, "换图")
         bots = room.bot_members() if room is not None else []
         if bots:
             members = self.battle_members()
@@ -6642,6 +6991,11 @@ class Conn:
                  "客户端退出换图加载循环")
         self.battle_broadcast(build_game(OP_MAP_CHANGE_READY),
                               reason="：换图放行")
+        # ★★★ 新图的 32 ms 循环起一代新的（D106）—— tick 从 0 重数，
+        #   上一张图排在节拍器堆里的定时任务按代号自动作废。
+        room = self.lobby_room()
+        if room is not None:
+            start_room_loop(room, "换图完成")
 
     def on_create_item(self, payload):
         """0x0406 `gcpCreateItem`「在这里生成一个掉落物」-> 回 0x0404，它才落地。
@@ -7523,6 +7877,11 @@ class Conn:
             # ★ 位置轨迹跟着新局作废 —— 上一局的坐标（可能还是另一张图上的）
             #   放到这一局是个随机点，bot 会照着它站过去（V0.3 M3）。
             reset_sync_trails(room, "新一局开始")
+            # ★★★ 这一局的 32 ms 循环从这儿起步（D106）：`reset_sync_trails`
+            #   刚把 bot 的战斗帧和弹体句柄计数器清空，收方那边
+            #   `ForceReloadTerrain` 也是这一刻复位的 —— 两边的 tick 0
+            #   对齐在同一个事件上（§147）。
+            start_room_loop(room, "开局")
             # 「准备好了」跟着客户端一起清 —— 它进 stage 6 时自己清了一遍
             # （`LoadingStage` 构造函数，§165）。不跟着清就会两边不一致。
             room.clear_ready()
@@ -7973,8 +8332,11 @@ class Conn:
         if not isinstance(trail, collections.deque):    # 见类级默认值的说明
             trail = self.sync_trail = collections.deque(
                 maxlen=SYNC_TRAIL_POINTS)
+        # ★★ 按键掩码也记（D106）：收方拿它**每 32 ms 替远端角色走一步**
+        #    （§39），服务端逐格外推真人位置时要用同一份（`_advance_humans`）。
         trail.append(SyncTrailPoint(x, y, self.sync_jumped, on_ground, vx, vy,
-                                    fast_run, bool(self.sync_crouch)))
+                                    fast_run, bool(self.sync_crouch),
+                                    udpsync.heartbeat_keys(payload) or 0))
         self.sync_trail_seq += 1
         self.sync_jumped = 0
 
@@ -8023,18 +8385,30 @@ class Conn:
         #   （V0.3 §24 / §25）。记一条短轨迹，bot 靠回放它决定自己站哪
         #   （服务端没有任何地图几何，真人刚站过的点一定是合法地面，D16），
         #   M5 的瞄准也要用它。开销 = 一次定长 unpack，可以忽略。
-        self.note_sync_position(payload)
-        self.note_human_fire(payload)
-        # ★★ 打到 bot 身上的那一下**击退**归服务端算（V0.3 §92）——
-        #   bot 没有本机，客户端那边顶飞的模型会被下一发心跳拽回去。
-        #   ★ 出错不能连累真人的同步（D1），所以整段吞异常。
-        if BOT_PEER_HIT is not None:
-            try:
-                room = self.lobby_room()
-                if room is not None:
-                    BOT_PEER_HIT(room, self, payload)
-            except Exception as error:          # noqa: BLE001 —— 见上
-                self.log(f"   ⚠ 替 bot 结算击退时出错，已跳过: {error!r}")
+        # ★★★ 记输入的这一段全在 `room.sim_lock` 里（D106）：房间那条 32 ms
+        #   线程正拿着同一把锁在推物理。同一把锁保证了「**一个 tick 开始前
+        #   已经到达的输入，那一格一定看得见**」—— 这是结构性的，不靠时序运气。
+        #   ⚠ 锁序 `peer_lock -> sim_lock -> send_lock`：本函数进来时手上已经
+        #     有 `peer_lock` 了，所以这里只能往下拿，绝不能反过来。
+        #   ★ 转发（`PEER_RELAY.deliver`）**留在锁外**：它要往别人的 socket 上写，
+        #     一个卡死的客户端能堵 8 秒（`GAME_SEND_DEADLINE_S`），
+        #     拿着房间锁堵在那儿就是整个房间的 bot 一起冻住。
+        room = self.lobby_room()
+        if room is None:
+            self.note_sync_position(payload)
+            self.note_human_fire(payload)
+        else:
+            with room.sim_lock:
+                self.note_sync_position(payload)
+                self.note_human_fire(payload)
+                # ★★ 打到 bot 身上的那一下**击退**归服务端算（V0.3 §92）——
+                #   bot 没有本机，客户端那边顶飞的模型会被下一发心跳拽回去。
+                #   ★ 出错不能连累真人的同步（D1），所以整段吞异常。
+                if BOT_PEER_HIT is not None:
+                    try:
+                        BOT_PEER_HIT(room, self, payload)
+                    except Exception as error:      # noqa: BLE001 —— 见上
+                        self.log(f"   ⚠ 替 bot 结算击退时出错，已跳过: {error!r}")
         # ★ 走 `PEER_RELAY.deliver` 而不是直接广播 `0x040f`：房里可能有人已经
         #   接上原版中继了，那些人要走中继收（原版路径），剩下的才走 `0x040f`。
         #   两条路在客户端进的是同一个入口 `0x407869`，谁收哪条都一样。
@@ -8276,6 +8650,7 @@ class Conn:
                 and quest.map_done(None, members)):
             quest.finish_map_change()
             self.log("   换图: 等的人走了，剩下的已经全加载完 -> 放行 0x0418")
+            start_room_loop(room, "换图完成（等的人走了）")
             packet = build_game(OP_MAP_CHANGE_READY)
             for other in members:
                 try:
@@ -8382,6 +8757,10 @@ class Conn:
         room = self.lobby_room()
         if room is None:
             return
+        # ★★★ 这一局的 32 ms 循环到此为止（D106）。`alive()` 那道自校验其实
+        #   也拦得住（`room_in_battle` 马上就不成立了），但结算是**明确的
+        #   事件**，明说一句比等下一格自己发现干净。
+        stop_room_loop(room, "本局结束，回房间")
         if room.status != SESSION_STATUS_WAITING:
             LOBBY.update_room(room, status=SESSION_STATUS_WAITING)
             self.log(f"   房间 #{room.room_id} -> 待机中（本局结束，可以再开一局）")
@@ -9325,6 +9704,8 @@ def main():
 
     global VERBOSE
     VERBOSE = args.verbose
+    # ★ 生产入口打开 32 ms 房间循环（同 `app.py`，见 `ROOM_LOOP_THREADED`）。
+    enable_room_loops()
 
     if args.control_port:
         threading.Thread(target=serve_control, args=(args.control_port,),
