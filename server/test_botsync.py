@@ -5139,6 +5139,27 @@ class BotBreakableShortcutTests(TerrainMixin, BotFireRoom):
         self.assertIsNone(self.bot_conn.path_breakable)
         self.assertNotIn(55, bot._terrain(self.room).alive)
 
+    def test_a_breakable_flip_does_not_start_a_preheat(self):
+        """★★★★★ 战斗中翻罐子**不许**再整图预热（V0.3 §163 / D124）。
+
+        它和 `botplan` 那条线程做的是同一份活（`Esperan03` 实测 981 vs
+        931 ms），却每翻一次就抢着多做几遍 —— 代价是占住 GIL、饿死每条连接
+        那条发送线程：下行积压 1~2.5 秒，`rpExplode` 迟到就被收方静默丢弃，
+        句柄从此永久错开（§42），表现是「bot 打我没有伤害」。
+        """
+        jobs = []
+        real = bot._submit_warm
+        bot._submit_warm = jobs.append
+        self.addCleanup(setattr, bot, "_submit_warm", real)
+        self.room.quest.bot_terrain = self.terrain
+        ledger = bot._breakables(self.room)
+        self.assertTrue(ledger.damage(self.terrain, 55, 999))
+        bot._refresh_breakables(self.room)
+        self.assertEqual([], jobs, "翻罐子不该再排预热活儿")
+        # 开局那一次照旧要预热 —— 那时候 CPU 是空着的。
+        bot.warm_navigation(self.room, "开局")
+        self.assertTrue(jobs, "开局 / 换图仍然要预热")
+
     def test_being_pinned_inside_a_breakable_beats_crack_unsticking(self):
         """★ 被罐子裹住时锁定它、瞄上之后站住打，而不是在缝里乱蹦。
 
@@ -6796,6 +6817,78 @@ class BotHandleLedgerTests(BotSliceTests):
         self.assertEqual(4, len(frags), "该有四片碎片在飞")
         handles = sorted(s.handle for s in frags)
         self.assertEqual(list(range(handles[0], handles[0] + 4)), handles)
+
+
+class BotNavWarmIsSingleThreadedTests(unittest.TestCase):
+    """★★★★★ 可达图预热**全进程只有一条线程**（V0.3 §163）。
+
+    用户 2026-09-01 23:59：「所有 bot 都卡几秒钟，后突然又换了个坐标恢复……
+    bot 的位置有突变，空中的子弹也会突然显示出来，仿佛积压了几秒钟的网络包
+    突然挤在一起爆发出来一样。」
+
+    实机对上的那一次：破坏物 247 在 23:59:34.762 碎了 -> `_refresh_breakables()`
+    起预热 -> 两条线程分别在 23:59:37.05（2255 ms）和 23:59:37.4（2611 ms）
+    算完 -> 客户端在 **23:59:37.408~37.412 的 4 毫秒里一次收到 5.6 KB**
+    （350/236/255/209/262/260/156/2048/991 …）。中间那两秒下行是**积压**的：
+    客户端到达侧最大间隔只有 0.26 s，服务端 `→ 发出` 也一直在打 ——
+    卡住的是每条连接那条**发送线程**（D108），它每写一个包都要重抢一次 GIL。
+
+    离线复现（32 ms 醒一次的探针线程 + `Iceria00` 真图）：
+
+    ```text
+    什么都不跑        中位  0.3 ms   p95   0.3 ms   最大   0.3 ms
+    两条预热并行      中位 16.9 ms   p95  76.1 ms   最大 132.0 ms   ← 现状
+    串成一条          中位  7.1 ms   p95  14.5 ms   最大  15.4 ms   ← 改成这样
+    ```
+
+    总耗时一模一样（2357 vs 2371 ms）—— 并行一点没赚到，只是把延迟放大了
+    一个数量级。
+    """
+
+    def test_many_jobs_share_one_worker(self):
+        seen = []
+        real = bot._warm_navigation_now
+        gate = threading.Event()
+
+        def slow(terrain, who, seeds, label):
+            seen.append(threading.current_thread().name)
+            gate.wait(5.0)
+
+        bot._warm_navigation_now = slow
+        self.addCleanup(setattr, bot, "_warm_navigation_now", real)
+        try:
+            for i in range(6):
+                bot._submit_warm((None, None, (), f"job{i}"))
+            # 头一份会被那条线程认领，剩下的必须**排队**，不许各起一条。
+            deadline = time.monotonic() + 5.0
+            while len(seen) < 1 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual(1, len(seen), "同时最多只许有一份在算")
+            workers = [t for t in threading.enumerate()
+                       if t.name == "botnav-warm"]
+            self.assertEqual(1, len(workers), "预热线程全进程只许有一条")
+        finally:
+            gate.set()
+        self.assertTrue(bot.warm_settle(10.0))
+        self.assertEqual(6, len(seen), "排队的那几份最后都要算掉")
+        self.assertEqual({"botnav-warm"}, set(seen))
+
+    def test_the_worker_survives_a_job_that_blows_up(self):
+        """★ 一份炸了不许把线程带走 —— 带走了之后的图就再也不预热了。"""
+        done = []
+        real = bot._warm_navigation_now
+
+        def boom(terrain, who, seeds, label):
+            if label == "bad":
+                raise RuntimeError("炸一个")
+            done.append(label)
+
+        bot._warm_navigation_now = boom
+        self.addCleanup(setattr, bot, "_warm_navigation_now", real)
+        bot._submit_warm((None, None, (), "bad"))
+        bot._submit_warm((None, None, (), "good"))
+        self.assertTrue(bot.warm_settle(10.0))
+        self.assertEqual(["good"], done)
 
 
 class BotShellFallsOutOfTheWorldTests(TerrainMixin, BotFireRoom):

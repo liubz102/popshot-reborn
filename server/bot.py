@@ -428,6 +428,12 @@ class BotConn(gameserver.Conn):
         #: ★ 临时诊断（会话 17）：上一次打过的「为什么不开枪」，用来做状态翻转
         #:   去重。跟 `BOT_DIAG_FIRE_ANYWHERE` 一起删。
         self.diag_last_why = ""
+        #: ★ 诊断（§162）：上一次打过的「为什么一动不动」，同样按状态翻转去重。
+        #:   `None` = 这会儿它在动。初值取一个不可能的哨兵，
+        #:   免得开局第一格就白打一行「又动起来了」。
+        self.diag_idle_why = ""
+        #: ★ 诊断（§164）：上一帧的走位意图来自哪个分支，同样按状态翻转去重。
+        self.diag_src = None
         #: 现在朝哪走：`+1` 右 / `-1` 左。
         self.heading = botsync.FACING_RIGHT
         #: ★★ **回放真人轨迹那条退路专用**（D16 + D106）：上一次消费到的是
@@ -1792,8 +1798,23 @@ def _refresh_breakables(room):
             _clear_navigation(machine)
             machine.path_breakable = None
             machine.path_breakable_prefix = []
-    # 新那张图的可达图是冷的 —— 放后台算，别等到战斗中现算。
-    warm_navigation(room, "破坏物变化")
+    # ★★★★★ **战斗中不预热**（V0.3 §163 / D124）。这里原来是
+    #   `warm_navigation(room, "破坏物变化")` —— 每翻一次罐子就把整张图重算
+    #   一遍 × 每个角色尺度。而它和 `botplan` 那条线程做的是**同一份活**：
+    #
+    #       Esperan03  整图预热          981 ms
+    #       Esperan03  botplan 冷缓存第一发  931 ms（第二发 7.9 ms）
+    #
+    #   ⇒ 预热在这儿一点都不省，纯属抢着把同一份活多做几遍，而代价是
+    #   把 GIL 占住、饿死每条连接那条发送线程（D108）：下行积压 1~2.5 秒，
+    #   `rpExplode` 迟到 ⇒ 收方那颗弹体早按自己的引信自灭了 ⇒ 整包静默丢弃
+    #   ⇒ 句柄永久错开 ⇒ 「bot 打我没有伤害」（§42/§147/§161）。
+    #   `Esperan03` 一局翻二十来次，实测三条预热线程一起转的时候，
+    #   子弹积压了 2314 / 2294 / 1523 ms，全在预热收尾那一刻一起到达。
+    #
+    #   ★ 弹道粗网格不用管：variant 是从母地形补出来的，实测 **0.0 ms**。
+    #   ★ 开局 / 换图那一次**照旧预热** —— 那时候房间循环还没起步、真人还在
+    #     读图，CPU 是空着的，正是该把这份活做掉的时候。
 
 
 def _terrain(room):
@@ -4554,7 +4575,7 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     """
     body = machine.body
     if body is None or terrain is None:
-        return (0, False, False, False)
+        return _src(machine, "没身体/没地形", (0, False, False, False))
     # ★★★★ **被破坏物压住排在脱困之前**：`LockInBreakable=1` 的图会把
     #   人塞进罐子掩码里，那一刻 `_unstick_intent()` 也没有方向可走
     #   （裹着人的是实心掩码，往哪挪都是塞不下），唯一的出路是把它打碎。
@@ -4568,7 +4589,8 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
             _clear_navigation(machine)
             machine.log(f"   被可破坏物 {pinned.handle} 压住 -> 站住打碎它")
         if target is not None and target[0] == BREAKABLE_SEAT:
-            return (0, False, False, False)  # 已经瞄上它了：站住打
+            # 已经瞄上它了：站住打
+            return _src(machine, "被压住·站住打它", (0, False, False, False))
         # 还没瞄上它（这一格才刚锁上），或者手上这把枪根本够不着 ——
         # 那就照旧往下走 `_unstick_intent()`，挪出去也是一条出路。
     # ★★★★ **卡在缝里排在一切之前**（V0.3 §152）：塞不进去的时候躲子弹、
@@ -4576,7 +4598,7 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     #   没卡住时它只花一次 `fits()`（15 µs），等于没开销。
     stuck = _unstick_intent(room, machine, terrain)
     if stuck is not None:
-        return stuck
+        return _src(machine, "脱困", stuck)
     coop = room.team_layout() == lobby_module.TEAM_LAYOUT_COOP
     # ★★★★ **牵引绳排在最前面**（D99）：闯关时落后带头的真人超过 1/4 个
     #   屏幕就无条件追，连躲子弹都往后排 —— 掉队的那一个会把整队的扇区
@@ -4586,7 +4608,7 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     if coop and not _boss_room(room):
         leash = _coop_leash_intent(room, machine, seat_index, terrain)
         if leash is not None:
-            return leash
+            return _src(machine, "牵引绳", leash)
     else:
         _leash_release(machine)
     # ★★★ **躲子弹排在一切之前**（M5-E）：真人也是先躲开再想别的。
@@ -4595,7 +4617,7 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
                           _now() if now is None else now)
     if dodge is not None:
         _clear_navigation(machine)
-        return dodge
+        return _src(machine, "躲子弹", dodge)
     # ★★★ **打通挡路的破坏物**（用户 2026-09-01）：后台双路线比较证明
     #   打碎它的那条路更短时，走完安全前缀就站住开火。
     #   ★ 排在脱困 / 牵引绳 / 躲子弹**之后**：那三条各自都是「不先做这件事
@@ -4604,14 +4626,16 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     breaking = _breakable_move_intent(room, machine, seat_index, terrain,
                                       target)
     if breaking is not None:
-        return breaking
+        return _src(machine, "破障", breaking)
     # ★★★ 闯关房（M5-G）：那儿没有「敌方座位」，走位的目标是**跟上队伍**。
     if coop:
-        return _coop_intent(room, machine, seat_index, terrain, target)
+        return _src(machine, "闯关",
+                    _coop_intent(room, machine, seat_index, terrain, target))
     enemy = _enemy_spot(room, machine, seat_index)
     if enemy is None:
         # ★★★ 视野里一个敌人都没有（§127 / §128）—— 这时候**不站着发呆**。
-        return _blind_intent(room, machine, seat_index, terrain)
+        return _src(machine, "框外走位",
+                    _blind_intent(room, machine, seat_index, terrain))
     enemy_index, spot = enemy
     enemy_span = math.hypot(spot[0] - body.x, spot[1] - body.y)
     # ★★★ 逼近还是拉开（M5-C）—— 用户 2026-08-29 要的那条「按双方血量判断」。
@@ -4645,8 +4669,9 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
             # 打得到就站住打（老规则，D50）。★ 只在**逼近**姿态下成立：
             #   拉开的时候真人也是一边退一边打的。
             _clear_navigation(machine)
-            return (0, False, False, False)
-    return _walk_to(room, machine, terrain, spot, fast_run)
+            return _src(machine, "打得到·站住打", (0, False, False, False))
+    return _src(machine, "朝目标走", _walk_to(room, machine, terrain, spot,
+                                              fast_run))
 
 
 def _blind_cover_spot(machine, terrain, bearing):
@@ -4735,6 +4760,54 @@ def _blind_walk(room, machine, terrain, spot, side, fast_run):
     return intent if probe is None else probe
 
 
+def _src(machine, tag, intent):
+    """★ 诊断（V0.3 §164）：记下这一帧的走位意图是**哪个分支**给的。
+
+    用户 2026-09-02 00:48：「bot 走路还会有一卡一卡的感觉……来回跳。」
+    心跳里量出来的形态很干净 —— bot 贴在地图横向边缘上，位置以
+    **3 发心跳（12 tick）为周期**在两三个点之间来回，幅度 7~14 像素：
+
+        seat 2  00:48:19.6~23.6  x = 0 → 4 → 7 → 0 → 4 → 7 …（图左边缘）
+        seat 3  00:48:09.7~10.4  x = 2043 → 2040 → 2036 → 2043 …（图右边缘）
+
+    纯物理排除掉了：`botmove.tick(direction=-1)` 在 x=0 处**一格都不动**；
+    起跳的话 y 会从 258 冲到 101（心跳里没有，`on_ground` 全程是 1）。
+    ⇒ 来回跳的是**意图**，不是物理：两个分支在互相打架。这一行就是
+    「到底是哪两个」。
+
+    按状态翻转去重（铁律 10）：分支或方向变了才打一行。
+    """
+    if intent is None:
+        return intent
+    key = (tag, intent[0], bool(intent[1]), bool(intent[2]))
+    if key != machine.diag_src:
+        machine.diag_src = key
+        machine.log(f"   ◆走位来自「{tag}」 方向={intent[0]:+d} "
+                    f"跳={'是' if intent[1] else '否'} "
+                    f"下={'是' if intent[2] else '否'}")
+    return intent
+
+
+def _note_idle(machine, why):
+    """★ 诊断：这个 bot 为什么**一动不动**（V0.3 §162）。`None` = 它在动。
+
+    用户 2026-09-01 已经报过三回「所有 bot 一起卡住」。心跳里能看出「站着」，
+    看不出「为什么」—— 这一行就是那个「为什么」。
+
+    **按状态翻转去重**（铁律 10 的口径）：理由和上一次一样就什么都不打，
+    真的换了才打一行。所以 32 ms 一格的节奏不会把日志刷爆，
+    而「从这一刻起站住了 / 又开始动了」两个时刻都看得见。
+    """
+    if why == machine.diag_idle_why:
+        return
+    first = machine.diag_idle_why == ""      # 还没记过任何一次（哨兵）
+    machine.diag_idle_why = why
+    if why is not None:
+        machine.log(f"   ◆一动不动：{why}")
+    elif not first:
+        machine.log("   ◆又动起来了")
+
+
 def _blind_intent(room, machine, seat_index, terrain, spawn_fallback=True,
                   may_hide=True):
     """**视野里没有敌人**的那一帧往哪走（V0.3 §127 / §128）。
@@ -4788,13 +4861,18 @@ def _blind_intent(room, machine, seat_index, terrain, spawn_fallback=True,
                     # 已经蹲在掩体后面了 —— 这时候站住不动**就是**
                     # 正确动作，别拿探路把自己从掩体后面赶出去。
                     _clear_navigation(machine)
+                    _note_idle(machine, "躲在掩体后面（血 %.0f%%）" % (health * 100))
                     return (0, False, False, False)
+                _note_idle(machine, None)
                 return _blind_walk(room, machine, terrain, goal, -side,
                                    _may_fast_run(machine))
             # 真没有任何可站候选才允许停；这是“无合法动作”，
             # 不是视野空了就发呆。
             _clear_navigation(machine)
+            _note_idle(machine, "低血量想躲，可一处可站的掩体候选都没有"
+                                "（血 %.0f%%）" % (health * 100))
             return (0, False, False, False)
+        _note_idle(machine, None)
         machine.retreat_goal = None
         item = _item_goal(room, machine, seat_index)
         if item is not None and item[0] < math.hypot(spot[0] - body.x,
@@ -9260,6 +9338,71 @@ def report_bots_loaded(room, why, confirmed=False, who=None):
 _WARMED = weakref.WeakKeyDictionary()
 _WARM_LOCK = threading.Lock()
 
+#: ★★★ 预热的活**全进程只有一条线程在干**（V0.3 §163）。
+#:
+#: 以前是「每个 (地形, 角色尺度) 各起一条线程」，破坏物一翻就是两条，
+#: 每条把整张图重算一遍（`Iceria00` 实测 2.2~2.6 秒的纯 Python）。
+#: CPython 只有一把 GIL —— 两条算力线程一起转的时候，每条连接那条
+#: **发送线程**（D108）就被饿着：它每写一个包都要重新抢一次 GIL。
+#: 实测（32 ms 醒一次的探针线程，`Iceria00` 真图）：
+#:
+#:     什么都不跑        中位 0.3 ms   p95   0.3 ms   最大   0.3 ms
+#:     两条预热并行      中位 16.9 ms  p95  76.1 ms   最大 132.0 ms
+#:     ★ 串成一条        中位 7.1 ms   p95  14.5 ms   最大  15.4 ms
+#:     并行+switch 1ms   中位 14.3 ms  p95  53.8 ms   最大  85.8 ms
+#:
+#: 总耗时一模一样（2357 vs 2371 ms）—— 并行一点没赚到，只是把延迟放大了
+#: 一个数量级。而发送队列排不干净的后果，用户 2026-09-01 23:59 看得清清楚楚：
+#: 下行积压两秒，等预热线程一算完，5.6 KB 在 4 毫秒里一起涌进客户端
+#: （bot 位置突变、空中的子弹突然全冒出来）。
+_WARM_QUEUE = collections.deque()
+_WARM_CV = threading.Condition()
+#: `[线程, 正在算几份]` —— 和 `botplan.Planner` 同一套记账。
+_WARM_WORKER = [None, 0]
+
+
+def _warm_worker_loop():
+    while True:
+        with _WARM_CV:
+            while not _WARM_QUEUE:
+                _WARM_CV.wait()
+            job = _WARM_QUEUE.popleft()
+            _WARM_WORKER[1] += 1
+        try:
+            _warm_navigation_now(*job)
+        except Exception as error:          # noqa: BLE001 —— 纯缓存，不许炸
+            # ★ 一份炸了不能把这条线程带走：它死了之后**所有**图都不再预热，
+            #   而预热失败本身一点行为都不影响（游戏线程该算就自己算）。
+            asynclog.emit(f"[bot] ⚠ 可达图预热线程吞掉一个异常: {error!r}")
+        finally:
+            with _WARM_CV:
+                _WARM_WORKER[1] -= 1
+                _WARM_CV.notify_all()
+
+
+def _submit_warm(job):
+    """把一份预热活儿排进那条唯一的线程（线程懒启动，和 `botplan` 同款）。"""
+    with _WARM_CV:
+        _WARM_QUEUE.append(job)
+        worker = _WARM_WORKER[0]
+        if worker is None or not worker.is_alive():
+            worker = _WARM_WORKER[0] = threading.Thread(
+                target=_warm_worker_loop, name="botnav-warm", daemon=True)
+            worker.start()
+        _WARM_CV.notify()
+
+
+def warm_settle(timeout=30.0):
+    """等到预热队列排空、也没有正在算的。**给单测和收工检查用。**"""
+    deadline = time.monotonic() + float(timeout)
+    with _WARM_CV:
+        while _WARM_QUEUE or _WARM_WORKER[1]:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            _WARM_CV.wait(left)
+        return True
+
 
 def _warm_navigation_now(terrain, who, seeds, label):
     try:
@@ -9337,10 +9480,8 @@ def warm_navigation(room, why):
             suffix = "无破坏物捷径" if nav_terrain is not terrain else "完整地形"
             label = (f"{nav_terrain.name} 角色{machine.character_id} "
                      f"{suffix}（{why}）")
-            threading.Thread(target=_warm_navigation_now,
-                             args=(nav_terrain, who, seeds, label),
-                             name=f"botnav-warm-{nav_terrain.name}",
-                             daemon=True).start()
+            # ★★ 排进那条**唯一**的预热线程，不再一个尺度一条（§163）。
+            _submit_warm((nav_terrain, who, seeds, label))
 
 
 def _emit(machine, packet):
