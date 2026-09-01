@@ -404,6 +404,10 @@ class BotConn(gameserver.Conn):
         #:   在冷缓存下要几百毫秒，一帧问 16 次就是几秒（实机日志里同步转发
         #:   `max=4756 ms` 就是它）。★ 判据是「这一帧」这个事件，不是挂钟。
         self.nav_planned_at = None
+        #: 后台双路线比较证明这件破坏物是更短捷径上的第一道门。
+        self.path_breakable = None
+        #: 走到这件物体之前仍可在完整地形上安全执行的 Step 前缀。
+        self.path_breakable_prefix = []
         #: ★ 正在执行的那条边要不要在顶点补一次**二段跳**
         #:   （`botnav.ACTION_DOUBLE_JUMP`）。落地 / 换边就清。
         self.nav_double_jump = False
@@ -438,6 +442,18 @@ class BotConn(gameserver.Conn):
         #: 这一轮加载报过那一发 `0x4005` 了吗（D26）。
         #: `None` = 还没报。报过之后恒为 100，拿它**按状态翻转去重**。
         self.load_progress = None
+        #: **哪几个真人**已经用自己的 `0x4005` / 加载完成请求证明过
+        #: 「我的加载界面建好了」，从而换来一发确认性 100。
+        #:
+        #: 关掉原版 TCP 中继后，`0x0400` 和第一发 100 紧挨着
+        #: 走同一条游戏 TCP 流；客户端处理 `0x0400` 只是预约换
+        #: stage，下一帧才建 LoadingStage，因此那一发可能过早。
+        #:
+        #: ★ 记的是**连接**不是一个布尔：加载界面是**每台客户端各自**
+        #:   建的，只按「整房补过一次」去重的话，界面建得比第一个人晚、
+        #:   自己又没发过进度包的那一个仍然会看到 0%。每个真人的第一个
+        #:   加载事件各补一发，仍然全是事件驱动、一局最多几发。
+        self.load_progress_confirmed = frozenset()
         #: ★ 现在蹲着没有（§41）。蹲**不在心跳里**，只有 `rpCrouch` 那一发
         #:   事件包说得着，所以这边得自己记着状态、**只在翻转时发**。
         self.crouched = False
@@ -652,6 +668,8 @@ class BotConn(gameserver.Conn):
         botplan.forget(self)
         self.nav_planned_at = None
         self.nav_double_jump = False
+        self.path_breakable = None
+        self.path_breakable_prefix = []
         # ★ 牵引绳的记账跟着清：新一张图上「落后多少」要从头量（同 `body`）。
         self.leash_lagging = False
         self.leash_mark = None
@@ -663,6 +681,7 @@ class BotConn(gameserver.Conn):
         self.trail_mark = None
         self.trail_heading = 0
         self.load_progress = None
+        self.load_progress_confirmed = frozenset()
         self.crouched = False
         self.sync.reset_projectiles()
         # ★ 在飞的子弹一起丢：收方的弹体表和句柄计数器这一刻也整个复位
@@ -1771,6 +1790,8 @@ def _refresh_breakables(room):
         machine = None if seat is None else seat.conn
         if isinstance(machine, BotConn):
             _clear_navigation(machine)
+            machine.path_breakable = None
+            machine.path_breakable_prefix = []
     # 新那张图的可达图是冷的 —— 放后台算，别等到战斗中现算。
     warm_navigation(room, "破坏物变化")
 
@@ -3737,6 +3758,106 @@ def _settle_spawn(terrain, machine, point):
     return botmove.settle(terrain, body, _character_of(machine))
 
 
+def _spawn_overlaps(room, seat_index, point, character):
+    """这个复活候选点会不会和另一个活角色叠在一起。
+
+    判据就是 `ChrProps.ini` 的三个碰撞圆；不额外拍“至少隔多少”。
+    同一格里几个 bot 同时到期时，前一个的 `pending_spawn` 已经写好
+    但身体还没在下一格搬过去，所以这里优先读它，免得两个人
+    挑中同一个空位。
+    """
+    mine = character.circles(float(point[0]), float(point[1]), False)
+    for index, seat in enumerate(room.seats):
+        if seat is None or index == seat_index or _lying_dead(room, index):
+            continue
+        conn = seat.conn
+        pending = getattr(conn, "pending_spawn", None)
+        if pending is not None:
+            other = (float(pending[0]), float(pending[1]), False)
+        else:
+            other = _seat_body(room, index)
+        if other is None:
+            continue
+        theirs = chrprops.get(seat.character_id).circles(
+            other[0], other[1], bool(other[2]))
+        for ax, ay, ar, _aname in mine:
+            for bx, by, br, _bname in theirs:
+                if math.hypot(ax - bx, ay - by) < ar + br:
+                    return True
+    return False
+
+
+def _columns_by_distance(center, width):
+    """按到 `center` 的**水平距离从近到远**产出列号 `0..width-1`。
+
+    ★ 这个顺序是 `_nearest_front_spawn()` 能提前收工的**前提**：
+      产出是按 `|x − center|` 单调不减的，所以「这一列本身就比已有的
+      最优候选还远」的那一刻，后面每一列只会更远 —— 整个扫描到此为止。
+      两边各一个游标做归并，`center` 是浮点也照样精确排序。
+    """
+    left = int(math.floor(center))
+    right = left + 1
+    if left >= width:
+        left, right = width - 1, width
+    if right < 0:
+        left, right = -1, 0
+    while left >= 0 or right < width:
+        if left < 0:
+            yield right
+            right += 1
+        elif right >= width:
+            yield left
+            left -= 1
+        elif center - left <= right - center:
+            yield left
+            left -= 1
+        else:
+            yield right
+            right += 1
+
+
+def _nearest_front_spawn(room, seat_index, terrain, machine, anchor):
+    """离带头真人最近的**有效可站人处**；找不到返回 `None`。
+
+    搜索用的是当前动态地形的全部站立面，所以尚未打碎的罐子、
+    已打开的空档和刚长回来的物件都自动是对的。排序口径是：
+    欧氏距离 -> 竖直差 -> 水平差 -> 坐标，因此同一份地图上结果稳定。
+
+    ## ★★★ 从带头真人那一列**向两边发散**扫，不是从 x=0 扫到头
+
+    这个函数跑在**游戏主线程**上（重生看门狗），而任务图很宽 ——
+    `Quest03_1` 是 11400 列 / 15029 个站立面。从 x=0 往右扫的话，
+    在越过锚点之前 `best` 一路都在改善，剪枝一格都剪不掉：实测
+    带头真人在图中部时**一次调用 99.5 ms**、`fits()` 被调 5982 次，
+    等于一次复活吞掉三格房间循环（§137 把 A\\* 挪去后台就是治这个病）。
+    发散着扫、一超过当前最优就 `break`，答案一模一样，代价只和
+    「锚点附近有多空」有关。
+    """
+    if terrain is None or anchor is None or terrain.width <= 0:
+        return None
+    who = _character_of(machine)
+    ax, ay = float(anchor[0]), float(anchor[1])
+    best = None
+    for x in _columns_by_distance(ax, terrain.width):
+        dx = float(x) - ax
+        # 水平差单独就超过已有最优的总距离 ⇒ 这一列和它**之后的每一列**
+        # 都不可能更好（产出是按 |x − ax| 排的）。
+        if best is not None and dx * dx > best[0][0]:
+            break
+        for y in terrain.surfaces(x):
+            point = (float(x), float(y))
+            dy = point[1] - ay
+            rank = (dx * dx + dy * dy, abs(dy), abs(dx), point[0], point[1])
+            if best is not None and rank >= best[0]:
+                continue
+            if not botmove.fits(terrain, point[0], point[1], who):
+                continue
+            if _spawn_overlaps(room, seat_index, point, who):
+                continue
+            best = (rank, point)
+    return None if best is None else best[1]
+
+
 def pick_respawn_point(room, seat_index):
     """★ 给 `gameserver` 的重生看门狗用：这个 bot 该在哪站起来（§91）。
 
@@ -3755,10 +3876,35 @@ def pick_respawn_point(room, seat_index):
     if not isinstance(machine, BotConn):
         return None
     terrain = _terrain(room)
-    point = respawn_point(room, seat_index, terrain, roll=machine.roll)
+    point = None
+    point_settled = False
+    # ★★★ 任务模式不再从全图随机表里抽：用户要求 bot 在
+    #   **推进最靠前的真人**附近站起来。“最靠前”复用任务牵引绳
+    #   的 `_quest_forward + _coop_leader`，两条链不会对“前”有两种说法。
+    if room.team_layout() == lobby_module.TEAM_LAYOUT_COOP and terrain is not None:
+        leader = _coop_leader(room, _quest_forward(terrain))
+        anchor = None if leader is None else tuple(leader.sync_trail[-1][:2])
+        point = _nearest_front_spawn(room, seat_index, terrain, machine, anchor)
+        point_settled = point is not None
+        if point is None and anchor is not None:
+            # 极端地图没找到不重叠的空位：带头真人的脚下至少是
+            # 一个真客户端已经证明可站的点。允许短暂叠人，也不退回后方。
+            body = _settle_spawn(terrain, machine, anchor)
+            if (body is not None and body.on_ground
+                    and botmove.fits(terrain, body.x, body.y, _character_of(machine))):
+                point = (body.x, body.y)
+                point_settled = True
+        if point is not None:
+            machine.log(f"   任务重生点: 带头真人 @ "
+                        f"({anchor[0]:.0f}, {anchor[1]:.0f}) -> "
+                        f"({point[0]:.0f}, {point[1]:.0f}) 最近有效站立面")
+    # PVP 照原版的全表随机；任务模式拿不到真人位置/地形时也
+    # 退回这条已验证的老路，不让复活整个失效。
+    if point is None:
+        point = respawn_point(room, seat_index, terrain, roll=machine.roll)
     if point is None:
         return None
-    if terrain is not None:
+    if terrain is not None and not point_settled:
         body = _settle_spawn(terrain, machine, point)
         point = (body.x, body.y)
     machine.pending_spawn = point
@@ -3784,8 +3930,17 @@ def pick_respawn_point(room, seat_index):
 #: 准星永远在屏幕里，所以「准星最远能离我多远」= 「我最远能看多远」。
 #: 交叉验证：§48 量的**打中人的距离** p99 = 1015、最大 1163 —— 两把完全
 #: 独立的尺子都落在 1000 上下，说明这就是真人的可视半径。
-BOT_VISION_HALF_X = 960.0
-BOT_VISION_HALF_Y = 520.0
+#: 用户 2026-09-01 明确改成「以 bot 为中心，上下左右各一个
+#: 1024x768 屏幕」，所以整个框是 **2048 x 1536**。这两个是
+#: 半宽/半高，不要再除以 2。
+BOT_VISION_HALF_X = 1024.0
+BOT_VISION_HALF_Y = 768.0
+
+#: 视野内没有敌人时的血量滞回（用户 2026-09-01 拍板）。
+#: 严格小于 25% 才转隐蔽，严格大于 50% 才转逼近；中间保持
+#: 上一姿态，治掉治疗/伤害在边界上让 bot 来回掉头。
+BOT_BLIND_HIDE_BELOW = 0.25
+BOT_BLIND_PRESS_ABOVE = 0.50
 
 
 def _in_sight(machine, x, y):
@@ -3812,22 +3967,55 @@ def _rough_bearing(room, machine, seat_index):
     ⇒ 返回的是一个**视野边缘上的点**，不是敌人的真实坐标：bot 朝那儿挪，
     挪到人进了视野框，`_enemy_spot()` 才重新给出精确位置。
     """
+    rough = _rough_bearing_raw(room, machine, seat_index)
+    return None if rough is None else rough[0]
+
+
+def _rough_bearing_raw(room, machine, seat_index):
+    """`_rough_bearing()` 的完整答案：`(粗方位点, 左右符号)`。
+
+    第二格是「最近那个敌人在我**左边还是右边**」（`-1/0/1`）。粗方位点
+    在竖直占优时 x 和自己完全相同，`_walk_to()` 那句
+    `direction = 0 if abs(delta_x) < 1.0` 于是恒为 0 —— A\\* 再解不出
+    上下层的路（一张图的可达分量往往只覆盖一半，§137），bot 就**杵在
+    原地**，正是用户 2026-09-01 要治的那个症状。这一格让
+    `_blind_intent()` 在那种时候还能横着走去找上去的路，而**不泄露
+    任何距离**：只有一个符号。
+    """
     body = machine.battle_pos
     if body is None:
         return None
     best = None
-    for _index, tx, ty, _crouched in _hostile_targets(room, seat_index):
+    candidates = [(tx, ty) for _index, tx, ty, _crouched
+                  in _hostile_targets(room, seat_index)]
+    if room.team_layout() == lobby_module.TEAM_LAYOUT_COOP:
+        # 任务模式的“敌人”是怪。`live_mobs` 的位置和真人客户端
+        # 拿到的是同一发 rpAiMsg；这里也只把它压成一个方向。
+        candidates.extend((tx, ty) for tx, ty, _handle in live_mobs(room))
+        quest = None if room is None else room.quest
+        gun = getattr(quest, "boss_gun", None)
+        if gun is not None:
+            candidates.append((float(gun[0]), float(gun[1])))
+    for tx, ty in candidates:
         span = math.hypot(tx - body[0], ty - body[1])
         if best is None or span < best[0]:
             best = (span, tx, ty)
     if best is None:
         return None
     _span, tx, ty = best
-    step_x = 0.0 if abs(tx - body[0]) < 1.0 else math.copysign(
-        BOT_VISION_HALF_X, tx - body[0])
-    step_y = 0.0 if abs(ty - body[1]) < 1.0 else math.copysign(
-        BOT_VISION_HALF_Y, ty - body[1])
-    return (body[0] + step_x, body[1] + step_y)
+    dx, dy = tx - body[0], ty - body[1]
+    side = 0 if abs(dx) < 1.0 else int(math.copysign(1, dx))
+    # ★ 只给**一个**主方向，不给对角线。用各自的视野半径归一化
+    #   之后比，否则 1024x768 的非正方形视野会偏爱 x 方向。
+    nx = abs(dx) / BOT_VISION_HALF_X
+    ny = abs(dy) / BOT_VISION_HALF_Y
+    if nx >= ny and abs(dx) >= 1.0:
+        return ((body[0] + math.copysign(BOT_VISION_HALF_X, dx), body[1]),
+                side)
+    if abs(dy) >= 1.0:
+        return ((body[0], body[1] + math.copysign(BOT_VISION_HALF_Y, dy)),
+                side)
+    return None
 
 
 def _enemy_spot(room, machine, seat_index):
@@ -4064,34 +4252,53 @@ def _route_intent(machine, terrain, who, spot):
                              spot[1] - machine.nav_goal[1])
         if shifted > botnav.GOAL_X:
             _clear_navigation(machine)
+            machine.path_breakable = None
+            machine.path_breakable_prefix = []
 
     # 吃掉已经走到的边；动作完成是“重新落在规划落脚点”这个事实，不看时间。
     while machine.nav_path and botnav.step_reached(body, machine.nav_path[0]):
         machine.nav_path.pop(0)
         machine.nav_started = False
         machine.nav_double_jump = False
+    if not machine.nav_path and machine.path_breakable is not None:
+        # 捷径的安全前缀已经走完：这里就是对挡路物开火的位置。
+        return (0, False, False, False)
     if not machine.nav_path:
         signature = _nav_signature(terrain, body, spot)
         if machine.nav_failed == signature:
             return None
         # ★★★ A\* **在后台线程上跑**（§137）：这里只做两件 O(1) 的事 ——
         #     看看上一张单子算好了没有、没有就递一张新的。
-        path = botplan.take(machine, body, spot)
-        if path is None:
+        choice = botplan.take_result(machine, body, spot)
+        if choice is None:
             if machine.nav_planned_at != machine.frame_seq:
                 # ★ 一帧最多递一张单（`_own_step` 是**逐 tick**问意图的，
                 #   §120）。判据是「这一帧」这个事件，不是挂钟。
                 machine.nav_planned_at = machine.frame_seq
-                botplan.ask(machine, terrain, body, who, spot)
+                opened = (terrain.variant(())
+                          if getattr(terrain, "breakables", ())
+                          and getattr(terrain, "alive", frozenset())
+                          else None)
+                botplan.ask(machine, terrain, body, who, spot,
+                            open_terrain=opened)
             return None
-        if not path:
+        if choice.blocker is not None:
+            machine.path_breakable = int(choice.blocker)
+            machine.path_breakable_prefix = list(choice.prefix)
+            machine.nav_path = list(choice.prefix)
+        else:
+            machine.path_breakable = None
+            machine.path_breakable_prefix = []
+            machine.nav_path = list(choice.path)
+        if not machine.nav_path and not choice.reached and choice.blocker is None:
             _clear_navigation(machine, failed=signature)
             return None
-        machine.nav_path = list(path)
         machine.nav_goal = (float(spot[0]), float(spot[1]))
         machine.nav_started = False
         machine.nav_double_jump = False
         machine.nav_failed = None
+        if not machine.nav_path:
+            return (0, False, False, False)
 
     step = machine.nav_path[0]
     if machine.nav_started:
@@ -4212,6 +4419,90 @@ def _dodge_intent(room, machine, seat_index, terrain, now):
                             option.want_drop, option.fast_run)
     return machine.dodge_cached
 
+
+def _breakable_pinning_body(machine, terrain):
+    """身体**此刻真的被破坏物压住**了吗 —— 压住它的那一件，否则 `None`。
+
+    ## ★★★ 判据是两句 `fits()` 的**地形差**，不是「碰没碰到掩码」
+
+    `Breakable.hit()` 抄的是客户端 `HitTest`，自带 **3×3 邻域** ——
+    拿碰撞圆的上下左右边缘点去问它，「站在罐子**旁边**」和「被罐子
+    裹住」返回的是同一个答案。实测截图那张 `CamelCulvert04`：
+    3514 个可站落脚点里 **571 个（16.2%）**会被这么误判成「被困住」，
+    bot 于是站住打一件根本不挡路的罐子。
+
+    真正区分这两种情况的事实是「**这个位置塞不塞得下人**」，而这句话
+    `botmove.fits()` 已经在回答了（§152）。所以：这儿塞不下（`fits`
+    说的）、而**把破坏物全拿掉就塞得下**（同一句话问 `variant(())`）
+    ⇒ 压住我的只可能是破坏物。两句都是几何事实，没有第二套近似。
+
+    ★ 排在 `_unstick_intent()` **之前**用（见 `_move_intent`）：人被
+      实心掩码裹着的时候脱困没有方向可走，唯一的出路是把它打碎。
+    """
+    body = machine.body
+    if body is None or terrain is None:
+        return None
+    alive = getattr(terrain, "alive", frozenset())
+    if not alive or not getattr(terrain, "breakables", ()):
+        return None
+    who = _character_of(machine)
+    if botmove.fits(terrain, body.x, body.y, who):
+        return None                         # 塞得下 = 没被压住
+    opened = terrain.variant(())
+    if opened is terrain or not botmove.fits(opened, body.x, body.y, who):
+        return None                         # 拿掉破坏物照样塞不下 = 是地形
+    # 到这儿已经证明「压住我的是破坏物」，剩下的只是挑哪一件：最近的。
+    return min((item for item in terrain.breakables if item.index in alive),
+               key=lambda item: item.distance_to(body.x, body.y),
+               default=None)
+
+
+def _breaking_now(room, machine, seat_index, terrain=None):
+    """这一刻该不该把火力压在挡路物上 —— 那一件，或者 `None`。
+
+    用户要的是「挡路就打」，**不是**「人贴脸了也先打罐子」。所以
+    锁定了挡路物之后还要过一道现成的门：
+
+    * 被它**压住**（`_breakable_pinning_body`）—— 无条件打，不打碎
+      它连挪都挪不动，这正是用户报的「被围住困在里面」；
+    * 否则**视野里有活敌人 / 活怪**就先不打 —— 走位和开火两边用的是
+      同一句判断，不会出现「走位站住等打罐子、开火却去打人」的僵局。
+
+    判据全是现成的表（`_visible_targets` / `live_mobs` + `_in_sight`），
+    不引入第二套「威胁」口径。
+    """
+    terrain = _terrain(room) if terrain is None else terrain
+    item = _path_breakable_item(room, machine, terrain)
+    if item is None:
+        return None
+    if _breakable_pinning_body(machine, terrain) is not None:
+        return item
+    if _visible_targets(room, machine, seat_index):
+        return None
+    if room.team_layout() == lobby_module.TEAM_LAYOUT_COOP:
+        for mx, my, _handle in live_mobs(room):
+            if _in_sight(machine, mx, my):
+                return None
+    return item
+
+
+def _breakable_move_intent(room, machine, seat_index, terrain, target):
+    """已锁定捷径的第一道破坏物时，走安全前缀或站住开火。"""
+    if _breaking_now(room, machine, seat_index, terrain) is None:
+        return None
+    if target is not None and target[0] == BREAKABLE_SEAT:
+        return (0, False, False, False)       # `_tick_bot` 后面照常扣扳机
+    if machine.nav_path and machine.nav_goal is not None:
+        routed = _route_intent(machine, terrain, _character_of(machine),
+                               machine.nav_goal)
+        if routed is not None:
+            return routed
+    # ★ 安全前缀走完了，可这一枪又不是冲着它去的（够不着 / 换枪还没生效）
+    #   —— **不站在那儿干等**，放行给正常走位，下一轮后台规划会重新给
+    #   答案。这条是「站住打挡路物」和「一动不动」之间唯一的分界。
+    return None
+
+
 def _move_intent(room, machine, seat_index, terrain, target, now=None):
     """这一帧往哪走 —— 返回 `(方向, 起跳, 下落, 冲刺跑)`。
 
@@ -4237,6 +4528,22 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     body = machine.body
     if body is None or terrain is None:
         return (0, False, False, False)
+    # ★★★★ **被破坏物压住排在脱困之前**：`LockInBreakable=1` 的图会把
+    #   人塞进罐子掩码里，那一刻 `_unstick_intent()` 也没有方向可走
+    #   （裹着人的是实心掩码，往哪挪都是塞不下），唯一的出路是把它打碎。
+    #   判据见 `_breakable_pinning_body()`，同样是一句 `fits()` 的地形差。
+    pinned = _breakable_pinning_body(machine, terrain)
+    if pinned is not None:
+        if machine.path_breakable != pinned.index:
+            # ★ 按**状态翻转**记（铁律 10）：锁的是哪一件变了才重置路线。
+            machine.path_breakable = pinned.index
+            machine.path_breakable_prefix = []
+            _clear_navigation(machine)
+            machine.log(f"   被可破坏物 {pinned.handle} 压住 -> 站住打碎它")
+        if target is not None and target[0] == BREAKABLE_SEAT:
+            return (0, False, False, False)  # 已经瞄上它了：站住打
+        # 还没瞄上它（这一格才刚锁上），或者手上这把枪根本够不着 ——
+        # 那就照旧往下走 `_unstick_intent()`，挪出去也是一条出路。
     # ★★★★ **卡在缝里排在一切之前**（V0.3 §152）：塞不进去的时候躲子弹、
     #   打怪、跟队伍全都无从谈起 —— 人根本挪不动。先出去再说。
     #   没卡住时它只花一次 `fits()`（15 µs），等于没开销。
@@ -4262,14 +4569,21 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     if dodge is not None:
         _clear_navigation(machine)
         return dodge
+    # ★★★ **打通挡路的破坏物**（用户 2026-09-01）：后台双路线比较证明
+    #   打碎它的那条路更短时，走完安全前缀就站住开火。
+    #   ★ 排在脱困 / 牵引绳 / 躲子弹**之后**：那三条各自都是「不先做这件事
+    #     别的都无从谈起」，而罐子不会跑 —— 躲完这一发再打完全来得及。
+    #     真被裹在里面的那种「非打不可」已经在上面单独处理过了。
+    breaking = _breakable_move_intent(room, machine, seat_index, terrain,
+                                      target)
+    if breaking is not None:
+        return breaking
     # ★★★ 闯关房（M5-G）：那儿没有「敌方座位」，走位的目标是**跟上队伍**。
     if coop:
         return _coop_intent(room, machine, seat_index, terrain, target)
     enemy = _enemy_spot(room, machine, seat_index)
     if enemy is None:
         # ★★★ 视野里一个敌人都没有（§127 / §128）—— 这时候**不站着发呆**。
-        machine.stance = "press"
-        machine.retreat_goal = None
         return _blind_intent(room, machine, seat_index, terrain)
     enemy_index, spot = enemy
     enemy_span = math.hypot(spot[0] - body.x, spot[1] - body.y)
@@ -4308,7 +4622,94 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     return _walk_to(room, machine, terrain, spot, fast_run)
 
 
-def _blind_intent(room, machine, seat_index, terrain):
+def _blind_cover_spot(machine, terrain, bearing):
+    """只拿“上/下/左/右”粗方向找一个掩体点。
+
+    候选仍是原版地形的站立面；“躲住了没有”仍用
+    `line_blocked()`（单向平台不挡子弹）。有掩体就选离自己最近的，
+    一处都没有就选离粗方向最远的可站点；精确敌人坐标自始至终
+    没有进入这个函数。
+    """
+    body = machine.body
+    if body is None or terrain is None or bearing is None:
+        return None
+    who = _character_of(machine)
+    # 已经在掩体后面，当前点就是最近答案。
+    mx, my = _muzzle(body.x, body.y, bearing[0])
+    if terrain.line_blocked(mx, my, bearing[0],
+                            bearing[1] - BOT_MUZZLE_HEIGHT):
+        return (body.x, body.y)
+    reach_y = (botmove.walk_speed(who) * botmove.CLIMB_SLOPE
+               * botmove.TICKS_PER_BEAT)
+    covers = []
+    fallback = []
+    steps = max(1, int(BOT_RETREAT_SPAN / BOT_RETREAT_STEP))
+    for index in range(1, steps + 1):
+        for direction in (-1, 1):
+            cx = body.x + direction * BOT_RETREAT_STEP * index
+            if cx < 0 or cx >= terrain.width:
+                continue
+            sy = botmove.surface_near(terrain, cx, body.y, reach_y)
+            if sy is None or not botmove.fits(terrain, cx, sy, who):
+                continue
+            point = (float(cx), float(sy))
+            from_here = math.hypot(point[0] - body.x, point[1] - body.y)
+            from_bearing = math.hypot(point[0] - bearing[0],
+                                      point[1] - bearing[1])
+            px, py = _muzzle(point[0], point[1], bearing[0])
+            if terrain.line_blocked(px, py, bearing[0],
+                                    bearing[1] - BOT_MUZZLE_HEIGHT):
+                covers.append((from_here, -from_bearing, point))
+            fallback.append((from_bearing, -from_here, point))
+    if covers:
+        return min(covers, key=lambda row: (row[0], row[1], row[2]))[2]
+    if fallback:
+        return max(fallback, key=lambda row: (row[0], row[1], row[2]))[2]
+    return None
+
+
+def _blind_probe_intent(room, machine, terrain, side):
+    """框外走位算出「一动不动」时，**横着探一步**；无处可走返回 `None`。
+
+    竖直粗方位（`(自己的 x, y ± 视野高)`）在 `_walk_to()` 里 `direction`
+    恒为 0，A\\* 再解不出上下层的路就是原地发呆 —— 用户 2026-09-01：
+    「尽量不要傻站着不动」。真人知道人在楼上时也是**横着走去找上去的
+    那条路**，不是杵在原地仰头。
+
+    方向先取敌人那一侧（只有符号，不含距离），那一侧撞墙 / 前面是
+    无底洞就换另一侧；两侧都不成才是真的没有合法动作。
+    """
+    body = machine.body
+    if body is None or terrain is None or not body.on_ground:
+        return None
+    who = _character_of(machine)
+    crouched = bool(machine.dodge_crouch)
+    scale = _speed_scale(machine, _now())
+    first = side if side else 1
+    for direction in (first, -first):
+        if botmove.blocked(terrain, body, who, direction, fast_run=False,
+                           crouched=crouched, speed_scale=scale):
+            continue
+        if botmove.bottomless_ahead(terrain, body, who, direction,
+                                    fast_run=False, crouched=crouched,
+                                    speed_scale=scale,
+                                    ticks=BOT_DECISION_TICKS):
+            continue
+        return (direction, False, False, False)
+    return None
+
+
+def _blind_walk(room, machine, terrain, spot, side, fast_run):
+    """框外走位专用的 `_walk_to()`：算出来一动不动就横着探一步。"""
+    intent = _walk_to(room, machine, terrain, spot, fast_run)
+    if intent[0] or intent[1] or intent[2]:
+        return intent
+    probe = _blind_probe_intent(room, machine, terrain, side)
+    return intent if probe is None else probe
+
+
+def _blind_intent(room, machine, seat_index, terrain, spawn_fallback=True,
+                  may_hide=True):
     """**视野里没有敌人**的那一帧往哪走（V0.3 §127 / §128）。
 
     两种情形，用户 2026-08-30 各报了一条：
@@ -4331,10 +4732,61 @@ def _blind_intent(room, machine, seat_index, terrain):
     if body is None:
         _clear_navigation(machine)
         return (0, False, False, False)
+    rough = _rough_bearing_raw(room, machine, seat_index)
+    if rough is not None:
+        spot, side = rough
+        health = _seat_health(room, seat_index)
+        if not may_hide:
+            # ★ boss 房不许躲（`_boss_fight_intent` 传的）：那儿的门要打死
+            #   boss 才开，两个 bot 一起躲起来就是把这一关钉死（同 §141
+            #   「boss 房里没有推进进度这回事」的口径）。
+            machine.stance = "press"
+            machine.retreat_goal = None
+        elif health < BOT_BLIND_HIDE_BELOW:
+            machine.stance = "retreat"
+            machine.retreat_goal = None
+        elif health > BOT_BLIND_PRESS_ABOVE:
+            machine.stance = "press"
+            machine.retreat_goal = None
+        # 25%..50% 一字不动：保持上一姿态，这就是滞回。
+        if may_hide and machine.stance == "retreat":
+            goal = machine.retreat_goal
+            if goal is None or _retreat_done(body, goal, spot):
+                goal = _blind_cover_spot(machine, terrain, spot)
+                machine.retreat_goal = goal
+                _clear_navigation(machine)
+            if goal is not None:
+                if (abs(goal[0] - body.x) <= botnav.GOAL_X
+                        and abs(goal[1] - body.y) <= botnav.GOAL_Y):
+                    # 已经蹲在掩体后面了 —— 这时候站住不动**就是**
+                    # 正确动作，别拿探路把自己从掩体后面赶出去。
+                    _clear_navigation(machine)
+                    return (0, False, False, False)
+                return _blind_walk(room, machine, terrain, goal, -side,
+                                   _may_fast_run(machine))
+            # 真没有任何可站候选才允许停；这是“无合法动作”，
+            # 不是视野空了就发呆。
+            _clear_navigation(machine)
+            return (0, False, False, False)
+        machine.retreat_goal = None
+        item = _item_goal(room, machine, seat_index)
+        if item is not None and item[0] < math.hypot(spot[0] - body.x,
+                                                     spot[1] - body.y):
+            spot = item[1]
+            side = (0 if abs(spot[0] - body.x) < 1.0
+                    else int(math.copysign(1, spot[0] - body.x)))
+        return _blind_walk(room, machine, terrain, spot, side, False)
+
+    # 一个活敌人都没有：PVP 去敌方出生点等；任务模式由
+    # `_coop_intent` 照带头真人/活动带继续处理，不凭空发明巡逻点。
+    # ★ 姿态复位放在这里（以前在 `_move_intent` 调用点上）：没有敌人
+    #   就无所谓逼近/后撤，留着上一轮的 `retreat_goal` 只会让人绕远。
+    machine.stance = "press"
+    machine.retreat_goal = None
+    if not spawn_fallback:
+        return None
     item = _item_goal(room, machine, seat_index)
-    spot = _rough_bearing(room, machine, seat_index)
-    if spot is None:
-        spot = _spawn_watch_spot(room, machine, seat_index, terrain)
+    spot = _spawn_watch_spot(room, machine, seat_index, terrain)
     if item is not None and (spot is None
                              or item[0] < math.hypot(spot[0] - body.x,
                                                      spot[1] - body.y)):
@@ -4696,6 +5148,25 @@ def _coop_intent(room, machine, seat_index, terrain, target):
     if lag is None or spot is None:
         _clear_navigation(machine)
         return (0, False, False, False)
+    # 超过带头真人前界时仍然站住等：框外有怪也不能借机把
+    # 任务进度带整个吐到前面去。打怪/躲子弹仍在它之前判。
+    if lag[0] < -BOT_COOP_AHEAD_LIMIT:
+        _clear_navigation(machine)
+        return (0, False, False, False)
+    visible_mob = None
+    for mx, my, _handle in live_mobs(room):
+        if _in_sight(machine, mx, my):
+            visible_mob = (float(mx), float(my))
+            break
+    if target is None and visible_mob is None:
+        blind = _blind_intent(room, machine, seat_index, terrain,
+                              spawn_fallback=False)
+        if blind is not None:
+            return blind
+    elif target is None and visible_mob is not None:
+        # 怪已在框内，只是当前武器被地形挡住/弹道解不出：朝它
+        # 挪，不要因为自己正好在任务活动带里就站着发呆。
+        return _walk_to(room, machine, terrain, visible_mob, False)
     # ★★★ **在活动带里就不再调整身位**（用户 2026-09-01，D114）。
     #   超前那一头照旧是「停下来等，不往回走」（D103）：往回走等于把刚
     #   推进的进度吐回去，而且往回那一步经常就是走回刚跳过的坑。
@@ -4770,6 +5241,16 @@ def _boss_fight_intent(room, machine, seat_index, terrain, target):
     if target is not None:
         _clear_navigation(machine)
         return (0, False, False, False)
+    visible = [row for row in live_mobs(room)
+               if _in_sight(machine, row[0], row[1])]
+    if not visible:
+        # ★ `may_hide=False`：boss 房的门要**打死 boss 才开**，血少了
+        #   躲起来等于把这一关钉死（§141 那条「boss 房里没有推进进度
+        #   这回事」的另一半）。粗方位照给，只是不许转隐蔽。
+        blind = _blind_intent(room, machine, seat_index, terrain,
+                              spawn_fallback=False, may_hide=False)
+        if blind is not None:
+            return blind
     spot = _nearest_mob(room, body)
     if spot is None:
         # 一只都还不知道（真人还没打中过 boss）—— 但它可能**已经开过枪**
@@ -5147,6 +5628,23 @@ def _path_blocked(terrain, x0, y0, shot, radius=0.0):
     return False
 
 
+def _shot_impact(terrain, x0, y0, shot, radius=0.0):
+    """这条弹道首次撞地形的坐标；飞完都没撞上返回 `None`。
+
+    分段和碰撞形状完全复用 `_terrain_contact()` / `ballistics.path_points()`，
+    所以“AI 认为能打在罐子上”和子弹实际结算不会有第二套近似。
+    """
+    if terrain is None:
+        return None
+    points = ballistics.path_points(x0, y0, shot)
+    for (ax, ay), (bx, by) in zip(points, points[1:]):
+        hit_t, _safe_t = _terrain_contact(terrain, ax, ay, bx, by,
+                                          radius=radius)
+        if hit_t is not None:
+            return (ax + (bx - ax) * hit_t, ay + (by - ay) * hit_t)
+    return None
+
+
 #: 解抛物线弹道时，在「刚好够得着」的初速上留多少余量。
 #:
 #: ★ 它**不是**观测阈值，是**数值余量**：`_lob_speed()` 用连续模型的
@@ -5421,6 +5919,85 @@ def _solver_for(weapon):
     return solve
 
 
+BREAKABLE_SEAT = -2
+
+
+def _path_breakable_item(room, machine, terrain=None):
+    """当前锁定的挡路物；已碎/索引失效就就地清掉。"""
+    index = getattr(machine, "path_breakable", None)
+    if index is None:
+        return None
+    terrain = _terrain(room) if terrain is None else terrain
+    items = () if terrain is None else getattr(terrain, "breakables", ())
+    alive = frozenset() if terrain is None else getattr(terrain, "alive",
+                                                        frozenset())
+    if not 0 <= int(index) < len(items) or int(index) not in alive:
+        machine.path_breakable = None
+        machine.path_breakable_prefix = []
+        return None
+    return items[int(index)]
+
+
+def _breakable_aim_points(item, x, y):
+    """从射手这一侧尝试的几个点：先正对着的表面，再中心/四边。"""
+    near_x = min(max(float(x), item.left), item.left + item.width - 1)
+    near_y = min(max(float(y), item.top), item.top + item.height - 1)
+    face_x = item.left if x <= item.x else item.left + item.width - 1
+    face_y = item.top if y <= item.y else item.top + item.height - 1
+    raw = ((float(face_x), near_y), (near_x, float(face_y)),
+           (float(item.x), float(item.y)),
+           (float(item.left), float(item.y)),
+           (float(item.left + item.width - 1), float(item.y)),
+           (float(item.x), float(item.top)),
+           (float(item.x), float(item.top + item.height - 1)))
+    out = []
+    for point in raw:
+        if point not in out:
+            out.append(point)
+    return tuple(out)
+
+
+def _breakable_option(room, machine, weapon, terrain, solve, x, y):
+    """这把枪能不能真的打到当前挡路物。
+
+    返回 `(Engagement, 这一发实际伤害, 爆炸点)`。中途撞到别的
+    地形/另一件物体、引信先炸、或 11 个原版采样点一个都没碰到
+    目标时都返回 `None`。
+    """
+    item = _path_breakable_item(room, machine, terrain)
+    if item is None or not _in_sight(machine, item.x, item.y):
+        return None
+    best = None
+    splash_range = float(getattr(weapon, "splash_range", 0.0) or 0.0)
+    splash_damage = float(getattr(weapon, "splash_damage", 0.0) or 0.0)
+    if splash_damage <= 0.0:
+        return None
+    for tx, ty in _breakable_aim_points(item, x, y):
+        mx, my = _muzzle(x, y, tx)
+        span = math.hypot(tx - mx, ty - my)
+        if span > BOT_ENGAGE_RANGE:
+            continue
+        shot = solve(tx - mx, ty - my)
+        if shot is None or _outlives_fuse(weapon, shot):
+            continue
+        impact = _shot_impact(terrain, mx, my, shot,
+                              float(getattr(weapon, "size", 0.0) or 0.0))
+        if impact is None:
+            continue
+        preview = botbreak.preview_damage(
+            item, impact[0], impact[1], splash_range, splash_damage,
+            mult=_damage_scale(room))
+        if preview is None:
+            continue
+        hurt, _where = preview
+        engagement = Engagement(BREAKABLE_SEAT, (tx, ty), shot, span, 0.0,
+                                item.radius + float(weapon.size or 0.0))
+        option = (engagement, hurt, impact)
+        if best is None or (hurt, -span) > (best[1], -best[0].span):
+            best = option
+    return best
+
+
 def _engagement(room, machine, seat_index, weapon, miss=None):
     """挑最近的那个打得到的敌人，连提前量一起解好；没得打返回 `None`。
 
@@ -5477,6 +6054,20 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
             continue
         best = Engagement(index, point, shot, span,
                           math.hypot(velocity[0], velocity[1]), radius)
+    if best is None and not BOT_DIAG_FIRE_ANYWHERE:
+        # ★★★ 双路线规划认定的**捷径第一道门**（用户 2026-09-01）。
+        #   排在真人后面：`_breaking_now()` 已经把「视野里有活敌人/活怪」
+        #   挡掉了，这里再让 `best` 优先一次，是为了和走位那一侧
+        #   （`_breakable_move_intent`）用**同一个**门 —— 两边判得不一样
+        #   就会出现「走位站着等打罐子、开火却去打别的」的僵局。
+        #   ★ 也排在烟雾 / 怪目击点之前：那两条打的是「猜的位置」，
+        #     而挡路物的坐标是地图数据，实打实挡着路。
+        #   打碎之后 `_refresh_breakables()` 换地形、清目标并重规划。
+        if _breaking_now(room, machine, seat_index, terrain) is not None:
+            blocked = _breakable_option(room, machine, weapon, terrain,
+                                        solve, x, y)
+            if blocked is not None:
+                return blocked[0]
     if best is None and not BOT_DIAG_FIRE_ANYWHERE:
         # ★★ 一个都挑不中，但有人躲在烟里 ⇒ **朝云团乱射**（M5-F）。
         best = _smoke_engagement(room, machine, seat_index, weapon, terrain,
@@ -5629,6 +6220,52 @@ def _choose_weapon(room, machine, seat_index):
     options = weapondata.usable_for(machine.character_id)
     if not options:
         return machine.weapon
+    terrain = _terrain(room)
+    # ★ 和开火 / 走位**同一个门**（`_breaking_now`）：视野里有活敌人或
+    #   活怪的时候不为了一件罐子换枪 —— 换枪要丢半个弹匣，人贴脸时
+    #   这一下比罐子贵得多。被压住那种「非打不可」它自己会放行。
+    blocker = _breaking_now(room, machine, seat_index, terrain)
+    if blocker is not None and machine.battle_pos is not None:
+        # 破障时的评分是“还要多久打碎”：剩余 HP / 这一发真会造成的
+        # 伤害，再按武器自己的弹匣、冷却、换弹和切枪等待算完。
+        # `/w` 锁枪和特殊武器已在上面返回，仍然优先于 AI。
+        ledger = _breakables(room)
+        left = (blocker.hp if ledger is None
+                else ledger.hp.get(blocker.index, blocker.hp))
+        now = _now()
+        timings = {}
+        hurts = {}
+        x, y = machine.battle_pos
+        for candidate in options:
+            option = _breakable_option(
+                room, machine, candidate, terrain, _solver_for(candidate), x, y)
+            if option is None or option[1] <= 0:
+                continue
+            hurt = option[1]
+            shots = max(1, int(math.ceil(float(left) / hurt)))
+            wait = _switch_wait(machine, candidate, now)
+            magazine = int(candidate.magazine or 0)
+            if magazine > 0:
+                active = max(0, shots - 1) * float(candidate.cooling_ms or 0)
+                reloads = max(0, (shots - 1) // magazine)
+                active += reloads * float(candidate.reload_ms or 0)
+            else:
+                active = (max(0, shots - 1)
+                          * float(candidate.fire_interval_ms or 0))
+            timings[candidate.id] = wait + active / 1000.0
+            hurts[candidate.id] = hurt
+        if timings:
+            current = machine.weapon
+            current_id = None if current is None else current.id
+            best_id = min(timings,
+                          key=lambda key: (timings[key], key != current_id, key))
+            if best_id != current_id:
+                machine.auto_weapon_id = best_id
+                machine.log(
+                    f"   破障换枪: {current_id} -> {best_id}；挡路物 "
+                    f"{blocker.handle} 剩余 {left} HP，每发 {hurts[best_id]}，"
+                    f"预计 {timings[best_id]:.2f}s 打碎")
+            return machine.weapon
     scale = _damage_scale(room)
     ratio = _magazine_ratios(machine)[0]
     current = machine.weapon
@@ -8446,8 +9083,9 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
             _diag_why_not_firing(room, machine, seat_index, weapon, target, now)
         # ★★ **近身冲刺攻击优先于开枪**（§64）：原版这一下会占住整个角色
         #   （`TotalFrame` 那么多帧），真人也开不了枪。够得着就冲，够不着才打枪。
-        dashing = acting and _try_dash(room, machine, seat_index, now,
-                                       on_ground)
+        dashing = (acting
+                   and not (target is not None and target[0] == BREAKABLE_SEAT)
+                   and _try_dash(room, machine, seat_index, now, on_ground))
         if (acting and not dashing and machine.dash_swing is None
                 and target is not None and now >= machine.next_fire_at
                 and _may_fire(machine, weapon)):
@@ -8467,7 +9105,7 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         machine.log(f"   ★★ 同步流不变式被破坏，已停掉这个 bot 的同步: {error}")
 
 
-def report_bots_loaded(room, why):
+def report_bots_loaded(room, why, confirmed=False, who=None):
     """房里每个 bot 广播一发 **`0x4005` = 100**「我这边已经加载完了」（D26）。
 
     ★★ **bot 的进度条一开始就是满的，这不是偷懒，是事实**：bot 没有客户端、
@@ -8482,8 +9120,23 @@ def report_bots_loaded(room, why):
     调用点是两处**事件**，和 D4 那两处标记「bot 已加载完」的地方成对：
     刚广播完 `0x0400`（开局）、刚广播完 `0x0417`（换图）。
 
-    ★ **按状态翻转去重**（铁律 10 的口径）：报过就不再报，直到
-    `reset_battle_frame()` 把它清掉 —— 那正好发生在下一轮加载开始的时候。
+    ★★ 一轮里有两类**状态翻转**：
+
+    1. `confirmed=False`：`0x0400` / `0x0417` 刚广播，立即报一次（整房
+       一发，`load_progress` 记着）；
+    2. `confirmed=True`：**某一个真人**（`who`）用自己的 `0x4005` 或加载
+       完成请求证明「我这台的 LoadingStage 已经建好了」，替他确认重画。
+
+    ★★★ 第 2 类为什么按**连接**去重、而不是整房一次：加载界面是每台
+    客户端**各自**建的（§158），而唯一那发 100 和 `0x0400` 走同一条
+    TCP 流、早了一帧，收侧因为座位对象还不存在整包丢掉（§38）。只按
+    「整房补过一次」去重的话，界面建得比第一个人晚、自己又因为加载太快
+    没发过进度包的那一个，仍然会看到 0%。每个真人的**第一个**加载事件
+    各补一发，一局最多几发，仍然全是事件驱动、不吃可靠序号、不开计时器。
+
+    `reset_battle_frame()` 在下一轮加载开始时把两本账一起清掉。
+    `0x4005` 是可丢的立即包，重画同一个 100 既不吃事件序号，
+    也不改收包队列。
     """
     # ★★ 血量台账整本清空（M5-C）：`0x0400` / `0x0417` 广播那一刻，
     #    每台客户端都把角色重建成满血 —— 和 `reset_battle_frame()` 同一个事件。
@@ -8495,18 +9148,27 @@ def report_bots_loaded(room, why):
         machine = None if seat is None else seat.conn
         if not isinstance(machine, BotConn) or machine.sync.broken:
             continue
-        if machine.load_progress == botsync.LOAD_PROGRESS_MAX:
+        if confirmed:
+            if who in machine.load_progress_confirmed:
+                continue
+        elif machine.load_progress == botsync.LOAD_PROGRESS_MAX:
             continue
         try:
-            machine.load_progress = botsync.LOAD_PROGRESS_MAX
+            if confirmed:
+                machine.load_progress_confirmed = (
+                    machine.load_progress_confirmed | {who})
+            else:
+                machine.load_progress = botsync.LOAD_PROGRESS_MAX
             _emit(machine, machine.sync.volatile(
                 botsync.OP_LOAD_PROGRESS,
                 botsync.load_progress_body(botsync.LOAD_PROGRESS_MAX)))
         except Exception as error:          # noqa: BLE001 —— 同 `tick_room`
             machine.sync.broken = True
             machine.log(f"   ⚠ bot 进度条出错（{why}），已停掉它的同步: {error!r}")
-    # ★★ 顺手把这张图的可达图**预热**掉（会话 41）。见下面那个函数。
-    warm_navigation(room, why)
+    # ★★ 只在加载刚开始时预热。确认性重发只是补画进度条，
+    #   不应该顺手又走一遍预热登记。
+    if not confirmed:
+        warm_navigation(room, why)
 
 
 #: 预热线程的登记表：`地形对象 -> {角色尺度}`。**只防重复开线程**，
@@ -8563,6 +9225,11 @@ def warm_navigation(room, why):
     seeds_raw = [point for group in terrain.points.values() for point in group]
     if not seeds_raw:
         return
+    variants = [terrain]
+    if getattr(terrain, "breakables", ()) and getattr(terrain, "alive", frozenset()):
+        opened = terrain.variant(())
+        if opened is not terrain:
+            variants.append(opened)
     for index in room.bot_seats():
         seat = room.seats[index]
         machine = None if seat is None else seat.conn
@@ -8570,28 +9237,28 @@ def warm_navigation(room, why):
             continue
         who = _character_of(machine)
         key = botnav._scale_key(who)
-        with _WARM_LOCK:
-            done = _WARMED.setdefault(terrain, set())
-            if key in done:
+        for nav_terrain in variants:
+            with _WARM_LOCK:
+                done = _WARMED.setdefault(nav_terrain, set())
+                if key in done:
+                    continue
+                done.add(key)
+            seeds = []
+            for point in seeds_raw:
+                # ★ 走 `_settle_spawn()`（`on_ground=False` 起步、往下掉一趟）
+                #   —— 出生点对象在编辑器里挂在半空（§91）。
+                body = _settle_spawn(nav_terrain, machine, point)
+                if body is not None and body.on_ground:
+                    seeds.append(body)
+            if not seeds:
                 continue
-            done.add(key)
-        seeds = []
-        for point in seeds_raw:
-            # ★ 走 `_settle_spawn()`（`on_ground=False` 起步、往下掉一趟）
-            #   —— 出生点对象在编辑器里挂在半空（§91），直接
-            #   `botmove.Body(x, y)` 的 `on_ground` 缺省是 **True**，
-            #   `settle()` 看见就原样返回，泛洪会从半空里那一点起步
-            #   （实测比真正的地面高 50~90）。
-            body = _settle_spawn(terrain, machine, point)
-            if body is not None and body.on_ground:
-                seeds.append(body)
-        if not seeds:
-            continue
-        label = f"{terrain.name} 角色{machine.character_id}（{why}）"
-        threading.Thread(target=_warm_navigation_now,
-                         args=(terrain, who, seeds, label),
-                         name=f"botnav-warm-{terrain.name}",
-                         daemon=True).start()
+            suffix = "无破坏物捷径" if nav_terrain is not terrain else "完整地形"
+            label = (f"{nav_terrain.name} 角色{machine.character_id} "
+                     f"{suffix}（{why}）")
+            threading.Thread(target=_warm_navigation_now,
+                             args=(nav_terrain, who, seeds, label),
+                             name=f"botnav-warm-{nav_terrain.name}",
+                             daemon=True).start()
 
 
 def _emit(machine, packet):

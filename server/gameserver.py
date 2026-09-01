@@ -3445,7 +3445,10 @@ PEER_OP_LOAD_PROGRESS = 0x4005
 BOT_ROOM_TICK = None
 
 #: ★ 同上，`bot.report_bots_loaded` 挂这儿：房里每个 bot 广播一发
-#: `0x4005 = 100`「我这边已经加载完了」。签名 `(room, why)`。
+#: `0x4005 = 100`「我这边已经加载完了」。签名
+#: `(room, why, confirmed=False, who=None)`：`confirmed=True` 是**某一个
+#: 真人**（`who`）已经用自己的进度 / 加载完成包证明它那台的 LoadingStage
+#: 已建好之后，替他补的那一发确认重画（按连接去重，见 `report_bots_loaded`）。
 #:
 #: ★★ **bot 的进度条一开始就是满的**（D26，用户 2026-08-26 拍板）：bot 没有
 #: 客户端、没有一个字节的资源要读，它永远是房里加载最快的那个 —— D4 定的
@@ -7126,7 +7129,7 @@ class Conn:
             #   （D26）。★ 必须排在 `reset_sync_trails` **之后**：那边刚把
             #   `load_progress` 清成 None，排前面这一发会被去重挡掉。
             if BOT_ROOM_LOADED is not None:
-                BOT_ROOM_LOADED(room, "换图")
+                BOT_ROOM_LOADED(room, "换图", confirmed=False)
 
     def on_map_loading_done(self):
         """0x0412「新地图加载完了」-> 回 0x0418，客户端才从加载画面里出来。
@@ -7153,12 +7156,19 @@ class Conn:
         所以不会出现「放行了一半」的状态。
         """
         quest = self.quest_state()
+        room = self.lobby_room()
         if quest.pending_map is None:
             # 没有换图在飞时收到它，说明我们对触发条件的理解有偏差。照样放行
             # （这个包只是置一个在换图期间才有意义的标志），但把它记下来。
             self.log("   收到 0x0412 但本地没有记录在飞的换图；仍然放行")
             self.send(build_game(OP_MAP_CHANGE_READY))
             return
+        # ★★ 能在一次真正在飞的换图里发 `0x0412`，就证明**这台客户端**的
+        #   LoadingStage 已建好。放行换图之前替他确认重画 bot 100。
+        #   ★ `who=self`：去重按连接走，界面建得晚的那一个也补得到（§158）。
+        if room is not None and BOT_ROOM_LOADED is not None:
+            BOT_ROOM_LOADED(room, "新图加载界面已就绪", confirmed=True,
+                            who=self)
         members = self.battle_members()
         if not quest.map_done(self, members):
             still = quest.waiting_for_map(members)
@@ -7171,7 +7181,6 @@ class Conn:
                               reason="：换图放行")
         # ★★★ 新图的 32 ms 循环起一代新的（D106）—— tick 从 0 重数，
         #   上一张图排在节拍器堆里的定时任务按代号自动作废。
-        room = self.lobby_room()
         if room is not None:
             start_room_loop(room, "换图完成")
 
@@ -8034,7 +8043,7 @@ class Conn:
                 #   stage 6、加载界面已经在画了。bot 那一格**直接报满**（D26）
                 #   —— 它本来就没有资源要读，这是事实不是演出。
                 if BOT_ROOM_LOADED is not None:
-                    BOT_ROOM_LOADED(room, "开局")
+                    BOT_ROOM_LOADED(room, "开局", confirmed=False)
             if bot_replies:
                 # 正常路径到不了这里 —— 房主是真人，他那发 `0x0403` 还没来，
                 # 而房里没有真人的话房间早就散了（`_leave_unlocked`）。留着是
@@ -8109,6 +8118,14 @@ class Conn:
         old = battle.state
 
         if opcode == OP_LOADING_DONE:
+            # ★★ 这发请求来自**这台**客户端已建好的 stage 6 / LoadingStage。
+            #   在可能广播 `0x0402` 进 stage 7 之前，替他把 bot 的 100
+            #   确认重画。他自己早先的 `0x4005` 若已触发过，按连接去重
+            #   会让这一发空转。
+            if (battle.state == StartGameHandshake.PREPARING
+                    and BOT_ROOM_LOADED is not None):
+                BOT_ROOM_LOADED(room, "开局加载界面已就绪", confirmed=True,
+                                who=self)
             replies = battle.on_loaded(self, members)
             still = battle.waiting_for(members)
             if replies:
@@ -8500,7 +8517,19 @@ class Conn:
                 self.sync_crouch = bool(payload[udpsync.PEER_HEADER_SIZE + 1])
             return
         if opcode == PEER_OP_LOAD_PROGRESS:
-            # 加载进度：不带坐标，也不再记（D26 之后没人读它了）。
+            # 加载进度不带坐标，但它现在还是一个关键**事件**：
+            # 能从**这台**客户端发出来，就证明它的 LoadingStage 的座位和
+            # 进度条已经建好。关 TCP 中继后，紧跟 `0x0400` 的那发 bot 100
+            # 容易早一帧到；在这个硬事件上替他确认重画一次。
+            room = self.lobby_room()
+            battle = None if room is None else getattr(room, "battle", None)
+            quest = None if room is None else getattr(room, "quest", None)
+            loading = (getattr(battle, "state", None)
+                       == StartGameHandshake.PREPARING
+                       or getattr(quest, "pending_map", None) is not None)
+            if loading and BOT_ROOM_LOADED is not None:
+                BOT_ROOM_LOADED(room, "真人加载进度已到", confirmed=True,
+                                who=self)
             return
         motion = udpsync.heartbeat_motion(payload)
         if motion is None:

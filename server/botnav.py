@@ -110,6 +110,21 @@ class Step(collections.namedtuple(
     __slots__ = ()
 
 
+class PlanResult(collections.namedtuple(
+        "PlanResult", "path reached cost gap")):
+    """A* 的完整答案。
+
+    `path` 仍是老接口的 `tuple[Step, ...]`；`reached` 区分“真到了”
+    和 D85 的“只能走到最近处”；`cost` 是路径上原版物理 tick 成本之和；
+    `gap` 是终点到目标的几何距离。
+
+    旧的 `plan()` 仍只返回 `path`，所有现有调用无需改。只有“完好
+    地形 vs 打通捷径”的后台比较需要后三格。
+    """
+
+    __slots__ = ()
+
+
 def _state_key(body):
     return (int(round(body.x / KEY_X)), int(round(body.y / KEY_Y)))
 
@@ -384,8 +399,9 @@ def warm(terrain, character, seeds, limit=MAX_EXPANSIONS):
     return done
 
 
-def plan(terrain, start, character, goal, max_expansions=MAX_EXPANSIONS):
-    """从 ``start`` 到 ``goal`` 跑 A*，返回 ``tuple[Step, ...]``。
+def plan_result(terrain, start, character, goal,
+                max_expansions=MAX_EXPANSIONS):
+    """从 ``start`` 到 ``goal`` 跑 A*，返回 :class:`PlanResult`。
 
     只接受已落地的起点；起点本来就在目标附近返回空。
 
@@ -394,15 +410,18 @@ def plan(terrain, start, character, goal, max_expansions=MAX_EXPANSIONS):
     「撞墙就跳 / 坑前停下」的老兜底。理由见文件头第 3 条。
     """
     if terrain is None or start is None or character is None:
-        return ()
-    if not start.on_ground or _at_goal(start, goal):
-        return ()
-    graph = graph_of(terrain, character)
-    speed = botmove.walk_speed(character)
+        return PlanResult((), False, 0.0, float("inf"))
     goal_x, goal_y = _goal_xy(goal)
 
     def gap(body):
         return math.hypot(body.x - goal_x, body.y - goal_y)
+
+    if not start.on_ground:
+        return PlanResult((), False, 0.0, gap(start))
+    if _at_goal(start, goal):
+        return PlanResult((), True, 0.0, gap(start))
+    graph = graph_of(terrain, character)
+    speed = botmove.walk_speed(character)
 
     start_key = _state_key(start)
     bodies = {start_key: start}
@@ -432,7 +451,7 @@ def plan(terrain, start, character, goal, max_expansions=MAX_EXPANSIONS):
         body, edges = node(graph, terrain, character, bodies[key])
         expansions += 1
         if _at_goal(body, goal):
-            return route(key)
+            return PlanResult(route(key), True, costs[key], gap(body))
         span = gap(body)
         if span < nearest[0]:
             nearest = (span, key)
@@ -454,8 +473,127 @@ def plan(terrain, start, character, goal, max_expansions=MAX_EXPANSIONS):
     # ★ 门槛就是图自己的分辨率（`KEY_X`）：比一个格子还小的「靠近」不算
     #   靠近，原地待着更好，免得为了两三个单位来回跑。
     if nearest[1] != start_key and nearest[0] + KEY_X < gap(start):
-        return route(nearest[1])
-    return ()
+        path = route(nearest[1])
+        return PlanResult(path, False, costs[nearest[1]], nearest[0])
+    return PlanResult((), False, 0.0, gap(start))
+
+
+def plan(terrain, start, character, goal, max_expansions=MAX_EXPANSIONS):
+    """兼容旧接口：只返回 A* 的 ``tuple[Step, ...]``。"""
+    return plan_result(terrain, start, character, goal,
+                       max_expansions=max_expansions).path
+
+
+def _commands_for_step(terrain, body, character, step):
+    """把一条 :class:`Step` 重放成逐 tick 按键和身体。
+
+    建边和执行层的口径原本就是这一套；这份显式记录只给
+    “捷径穿过了哪件可破坏物”用。返回 `[(按键字典, 这格后身体), ...]`。
+    """
+    out = []
+    current = body
+
+    def push(**keys):
+        nonlocal current
+        current = botmove.tick(terrain, current, character, **keys)
+        out.append((keys, current))
+
+    if step.action == ACTION_WALK:
+        for _ in range(WALK_TICKS):
+            before = current
+            push(direction=step.direction)
+            if current == before:
+                break
+        while not current.on_ground and len(out) < WALK_TICKS + AIR_TICKS:
+            push()
+        return out
+
+    if step.action in (ACTION_JUMP, ACTION_DOUBLE_JUMP):
+        push(direction=step.direction, fast_run=step.fast_run, want_jump=True)
+    elif step.action == ACTION_DROP:
+        push(want_drop=True)
+    elif step.action == ACTION_PAD:
+        push()                              # 先让脚下的台子把人弹起
+    else:
+        return out
+
+    jumped = False
+    while not current.on_ground and len(out) < AIR_TICKS:
+        again = bool(step.double and not jumped and at_apex(current))
+        if again:
+            jumped = True
+        push(want_jump=again)
+    return out
+
+
+def _breakable_at_transition(terrain, before, intended, character):
+    """开放地形这一格能走、完整地形走不成：找出头一件挡住的东西。"""
+    alive = getattr(terrain, "alive", frozenset())
+    items = [item for item in getattr(terrain, "breakables", ())
+             if item.index in alive]
+    if not items:
+        return None
+    radius = max(float(getattr(character, "size_body", 13.0) or 13.0),
+                 float(getattr(character, "size_legs", 12.0) or 12.0))
+    x0, x1 = sorted((before.x, intended.x))
+    y0, y1 = sorted((before.y, intended.y))
+    candidates = [item for item in items
+                  if item.left <= x1 + radius
+                  and item.left + item.width >= x0 - radius
+                  and item.top <= y1 + radius
+                  and item.top + item.height >= y0 - radius]
+    if not candidates:
+        return None
+    # 一个 tick 最多二十多像素，逐像素沿这一小段扫不会成为热点；
+    # 它在 botplan 后台线程上，且只重放**选中的**那条路。
+    samples = max(1, int(math.ceil(max(abs(intended.x - before.x),
+                                       abs(intended.y - before.y)))))
+    ordered = sorted(candidates,
+                     key=lambda item: item.distance_to(before.x, before.y))
+    for index in range(samples + 1):
+        ratio = float(index) / samples
+        px = before.x + (intended.x - before.x) * ratio
+        py = before.y + (intended.y - before.y) * ratio
+        probes = [(px, py), (px, py + 1.0)]
+        for cx, cy, cr, _name in character.circles(px, py, False):
+            probes.extend(((cx, cy), (cx - cr, cy), (cx + cr, cy),
+                           (cx, cy - cr), (cx, cy + cr)))
+        for item in ordered:
+            if any(item.hit(tx, ty) for tx, ty in probes):
+                return item.index
+    # `botmove` 查的是斜率/脚下邻域，极端边缘可能比上面的圆
+    # 多一格。差异已经证明挡住它的只可能是这些相交外接矩形之一，
+    # 退到运动终点最近的那件，不把整条捷径判丢。
+    return min(candidates,
+               key=lambda item: item.distance_to(intended.x, intended.y)).index
+
+
+def first_breakable_on_path(terrain, open_terrain, start, character, path):
+    """重放捷径，返回 `(首个挡路物下标, 挡住前的安全 Step 前缀)`。
+
+    两边吃**同一串按键**。第一格身体不同就是第一个动态
+    破坏物产生影响的地方；除了破坏物，两份地形的每一个格完全相同。
+    """
+    if terrain is None or open_terrain is None or start is None:
+        return None, ()
+    open_body = start
+    live_body = start
+    prefix = []
+    for step in path or ():
+        trace = _commands_for_step(open_terrain, open_body, character, step)
+        if not trace:
+            return None, tuple(prefix)
+        for keys, intended in trace:
+            before = live_body
+            actual = botmove.tick(terrain, live_body, character, **keys)
+            if actual != intended:
+                return (_breakable_at_transition(terrain, before, intended,
+                                                  character),
+                        tuple(prefix))
+            live_body = actual
+        open_body = trace[-1][1]
+        prefix.append(step)
+    return None, tuple(prefix)
 
 
 def step_reached(body, step):

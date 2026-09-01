@@ -57,6 +57,36 @@ SPLASH_SAMPLES = 10
 SPLASH_STEP = 2.0 * math.pi / SPLASH_SAMPLES
 
 
+def preview_damage(item, x, y, splash_range, splash_damage, mult=1):
+    """一发在 `(x,y)` 爆开会给 `item` 多少伤害；打不到返回 `None`。
+
+    这是 `Ledger.blast()` 里原版 11 点命中 + 衰减公式的纯函数版。
+    AI 选“多久能打碎挡路物”时可以先算、不动真血条。
+    返回 `(伤害, 命中采样点)`。
+    """
+    if item is None or splash_damage <= 0:
+        return None
+    points = [(x, y)]
+    if splash_range > 0:
+        for i in range(SPLASH_SAMPLES):
+            angle = i * SPLASH_STEP
+            points.append((x + math.cos(angle) * splash_range,
+                           y + math.sin(angle) * splash_range))
+    where = next((point for point in points if item.hit(point[0], point[1])),
+                 None)
+    if where is None:
+        return None
+    span = math.hypot(x - item.x, y - item.y)
+    reach = splash_range + item.radius
+    if reach <= 0.0:
+        return None
+    ratio = span / reach
+    if ratio > 1.0:
+        return None
+    hurt = int((1.0 - ratio) * (splash_damage - 1.0) + 1.0) * int(mult)
+    return (hurt, where) if hurt > 0 else None
+
+
 class Ledger(object):
     """一张图上那几件可破坏物**此刻**的状态。
 
@@ -180,31 +210,13 @@ class Ledger(object):
                  if b.index not in self.broken_at]
         if not items or splash_damage <= 0:
             return []
-        points = [(x, y)]
-        if splash_range > 0:
-            for i in range(SPLASH_SAMPLES):
-                angle = i * SPLASH_STEP
-                points.append((x + math.cos(angle) * splash_range,
-                               y + math.sin(angle) * splash_range))
         out = []
         for item in items:
-            where = None
-            for px, py in points:
-                if item.hit(px, py):
-                    where = (px, py)
-                    break
-            if where is None:
+            preview = preview_damage(item, x, y, splash_range,
+                                     splash_damage, mult=mult)
+            if preview is None:
                 continue
-            span = math.hypot(x - item.x, y - item.y)
-            reach = splash_range + item.radius
-            if reach <= 0.0:
-                continue
-            r = span / reach
-            if r > 1.0:
-                continue
-            hurt = int((1.0 - r) * (splash_damage - 1.0) + 1.0) * int(mult)
-            if hurt <= 0:
-                continue
+            hurt, where = preview
             out.append((item, hurt, where,
                         self.damage(terrain, item.index, hurt, now=now)))
         return out

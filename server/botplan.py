@@ -56,6 +56,19 @@ import botmove
 import botnav
 
 
+class RouteChoice(collections.namedtuple(
+        "RouteChoice",
+        "path reached cost gap blocker prefix shortcut")):
+    """后台规划器选定的路。
+
+    `blocker` 是捷径上第一件存活破坏物的下标；`prefix` 是到
+    它之前可在完整地形上安全执行的路径前缀。`shortcut=True`
+    表示这份答案来自“先假定破坏物已打碎”的地形。
+    """
+
+    __slots__ = ()
+
+
 class Ticket(object):
     """一张规划单子。游戏线程只读 `ready` / `path`，后台线程只写它们。
 
@@ -63,15 +76,18 @@ class Ticket(object):
       事实比一比，差得比 A\\* 自己认的「到了」窗口还远就作废重递。
     """
 
-    __slots__ = ("terrain", "body", "character", "goal", "path", "ready",
-                 "abandoned")
+    __slots__ = ("terrain", "open_terrain", "body", "character", "goal",
+                 "path", "choice", "ready", "abandoned")
 
-    def __init__(self, terrain, body, character, goal):
+    def __init__(self, terrain, body, character, goal, open_terrain=None):
         self.terrain = terrain
+        self.open_terrain = open_terrain
         self.body = body
         self.character = character
         self.goal = (float(goal[0]), float(goal[1]))
         self.path = ()
+        self.choice = RouteChoice((), False, 0.0, float("inf"),
+                                  None, (), False)
         self.ready = False
         self.abandoned = False
 
@@ -154,14 +170,51 @@ class Planner(object):
                     self.dropped += 1
                     ticket.path = ()
                 else:
-                    ticket.path = botnav.plan(
+                    current = botnav.plan_result(
                         ticket.terrain, ticket.body, ticket.character,
                         ticket.goal)
+                    chosen = RouteChoice(
+                        current.path, current.reached, current.cost,
+                        current.gap, None, current.path, False)
+                    opened = None
+                    if (ticket.open_terrain is not None
+                            and ticket.open_terrain is not ticket.terrain):
+                        opened = botnav.plan_result(
+                            ticket.open_terrain, ticket.body,
+                            ticket.character, ticket.goal)
+                    use_open = False
+                    if opened is not None:
+                        if opened.reached and not current.reached:
+                            use_open = True
+                        elif opened.reached and current.reached:
+                            # 用户选的是“捷径优先打碎”：只比较移动成本，
+                            # 不把打碎所需的时间加进去。相等时不浪费弹药。
+                            use_open = opened.cost < current.cost
+                        elif not opened.reached and not current.reached:
+                            use_open = opened.gap < current.gap
+                    if use_open:
+                        blocker, prefix = botnav.first_breakable_on_path(
+                            ticket.terrain, ticket.open_terrain, ticket.body,
+                            ticket.character, opened.path)
+                        # ★★★ 认不出挡路的是**哪一件**时，绝不能把开放地形
+                        #   那条路交出去 —— 它是穿过实心罐子画的，拿到真
+                        #   地形上执行就是一路撞墙。当作「没有捷径」，
+                        #   退回完整地形那条已经验证过的答案。
+                        if blocker is None:
+                            use_open = False
+                        else:
+                            chosen = RouteChoice(
+                                opened.path, opened.reached, opened.cost,
+                                opened.gap, blocker, prefix, True)
+                    ticket.choice = chosen
+                    ticket.path = chosen.path
                     self.planned += 1
             except Exception:               # noqa: BLE001
                 # ★ 纯计算，出什么事都不许把这条线程弄死 —— 它死了所有
                 #   bot 就再也拿不到路线。当作「没找到路」，主人退回兜底。
                 ticket.path = ()
+                ticket.choice = RouteChoice((), False, 0.0, float("inf"),
+                                            None, (), False)
             finally:
                 ticket.ready = True
                 with self._cv:
@@ -174,7 +227,7 @@ class Planner(object):
 PLANNER = Planner()
 
 
-def ask(machine, terrain, body, character, goal):
+def ask(machine, terrain, body, character, goal, open_terrain=None):
     """替 `machine` 递一张单子；已经有一张**同一个目标**的就不重复递。
 
     返回这一帧有没有真的递出去（只为诊断/单测）。
@@ -186,19 +239,25 @@ def ask(machine, terrain, body, character, goal):
             return False                    # 已经在算同一件事了
         old.abandoned = True                # 目标换了，旧的作废
     machine.nav_ticket = PLANNER.submit(
-        Ticket(terrain, body, character, goal))
+        Ticket(terrain, body, character, goal, open_terrain=open_terrain))
     return True
 
 
-def take(machine, body, goal):
-    """取回算好的路线：`None` = 还没好 / 作废了；`()` = 算过，没有路。"""
+def take_result(machine, body, goal):
+    """取回完整 :class:`RouteChoice`；`None` = 还没好 / 空间事实已变。"""
     ticket = getattr(machine, "nav_ticket", None)
     if ticket is None or not ticket.ready:
         return None
     machine.nav_ticket = None
     if ticket.abandoned or not ticket.matches(body, goal):
         return None
-    return ticket.path
+    return ticket.choice
+
+
+def take(machine, body, goal):
+    """兼容旧接口：只取路径。"""
+    result = take_result(machine, body, goal)
+    return None if result is None else result.path
 
 
 def forget(machine):

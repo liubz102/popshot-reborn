@@ -29,6 +29,7 @@ if HERE not in sys.path:
 
 import ballistics                                              # noqa: E402
 import bot                                                     # noqa: E402
+import botnav                                                  # noqa: E402
 import botplan                                                 # noqa: E402
 import botsync                                                 # noqa: E402
 import botthreat                                               # noqa: E402
@@ -1220,9 +1221,17 @@ class BotLoadProgressTests(BotFrameRoom):
     永远是房里加载最快的那个（D4 已经定了「广播出去那一刻就算它加载完」）。
     """
 
+    def expected_full_bars(self):
+        """一轮加载里 bot 该报几发 100：立即那一发 + 每个真人各确认一发。
+
+        ★ 确认那几发按**连接**去重（§158）：加载界面是每台客户端各自建的，
+          界面建得比第一个人晚、自己又没发过进度包的那一个否则一直是 0%。
+        """
+        return 1 + len(self.room.human_seats())
+
     def test_the_bot_reports_a_full_bar_the_moment_loading_starts(self):
-        """★★ 开局：`0x0400` 广播完就是一发 100，不跟任何人的进度。"""
-        self.assertEqual([botsync.LOAD_PROGRESS_MAX],
+        """开局立即 100，每个真人的界面就绪后再各确认一发（关中继回归）。"""
+        self.assertEqual([botsync.LOAD_PROGRESS_MAX] * self.expected_full_bars(),
                          load_frames_in(self.start_sent["bob"], self.bot_seat))
 
     def test_the_full_bar_goes_out_before_the_stage_seven_packet(self):
@@ -1231,19 +1240,21 @@ class BotLoadProgressTests(BotFrameRoom):
         排在后面的话客户端已经切场景了，那一格白画。
         """
         frames = self.start_sent["bob"]
-        hundred = next(i for i, plain in enumerate(frames)
-                       if load_frames_in([plain], self.bot_seat) == [100])
+        hundreds = [i for i, plain in enumerate(frames)
+                    if load_frames_in([plain], self.bot_seat) == [100]]
         stage_seven = next(
             i for i, plain in enumerate(frames)
             if len(plain) >= 10 and plain[0] == gameserver.MAGIC_GAME
             and struct.unpack_from("<H", plain, 8)[0]
             == gameserver.OP_COUNT_GAME_READY)
-        self.assertLess(hundred, stage_seven)
+        self.assertEqual(self.expected_full_bars(), len(hundreds))
+        self.assertLess(max(hundreds), stage_seven)
 
     def test_every_bot_in_the_room_gets_its_own_full_bar(self):
         for seat in self.room.bot_seats():
-            self.assertEqual([botsync.LOAD_PROGRESS_MAX],
-                             load_frames_in(self.start_sent["bob"], seat))
+            self.assertEqual(
+                [botsync.LOAD_PROGRESS_MAX] * self.expected_full_bars(),
+                load_frames_in(self.start_sent["bob"], seat))
 
     def test_it_is_reported_once_per_load_not_once_per_packet(self):
         """★ 按**状态翻转**去重（铁律 10 的口径），不是每帧都发一发。"""
@@ -1276,8 +1287,8 @@ class BotLoadProgressTests(BotFrameRoom):
                                                        self.bot_seat)
                               if udpsync.is_heartbeat(f)])
 
-    def test_a_humans_progress_report_is_ignored(self):
-        """★ bot 不再镜像真人报的百分比（D23 -> D26）：条早就满了。"""
+    def test_a_late_humans_progress_report_is_ignored(self):
+        """stage 7 之后的迟到进度不再补画：这轮加载已经结束。"""
         self.clear()
         seat = self.room.seat_index_of(self.alice)
         gameserver.Conn.on_game_packet(
@@ -1286,6 +1297,42 @@ class BotLoadProgressTests(BotFrameRoom):
                                       botsync.load_progress_body(42),
                                       game_id=self.room.epoch_value))
         self.assertEqual([], load_frames(self.bob, self.bot_seat))
+
+    def send_progress(self, conn, value):
+        """替某个真人发一发自己的 `0x4005`（加载界面已经建好的硬证据）。"""
+        gameserver.Conn.on_game_packet(
+            conn, OP_PEER_DATA_UP,
+            botsync.build_peer_packet(
+                self.room.seat_index_of(conn), botsync.OP_LOAD_PROGRESS,
+                botsync.load_progress_body(value),
+                game_id=self.room.epoch_value))
+
+    def test_each_humans_first_progress_confirms_once(self):
+        """★★ 去重按**连接**走：每个真人的第一发进度各补一个 100。
+
+        整房只补一次的话，加载界面建得比第一个人晚、自己又因为加载太快
+        没发过进度包的那一个仍然是 0%（§158）。同一个人的后续 1Hz 进度
+        不刷屏 —— 那才是「状态翻转去重」要挡的。
+        """
+        self.room.battle.host.state = gameserver.StartGameHandshake.PREPARING
+        self.bot_conn.load_progress_confirmed = frozenset()
+        self.clear()
+        for value in (1, 42, 99):
+            self.send_progress(self.alice, value)
+        self.assertEqual([botsync.LOAD_PROGRESS_MAX],
+                         load_frames(self.bob, self.bot_seat),
+                         "alice 的第一发补一个 100，后两发不再补")
+        self.clear()
+        for value in (5, 60):
+            self.send_progress(self.bob, value)
+        self.assertEqual([botsync.LOAD_PROGRESS_MAX],
+                         load_frames(self.bob, self.bot_seat),
+                         "bob 自己的界面就绪时也要补得到")
+        self.clear()
+        self.send_progress(self.alice, 100)
+        self.send_progress(self.bob, 100)
+        self.assertEqual([], load_frames(self.bob, self.bot_seat),
+                         "两个人都补过了就不再补")
 
 
 class TwoBotFrameRoom(BotFrameRoom):
@@ -4937,6 +4984,266 @@ class BotSpawnPointTests(TerrainMixin, BotFireRoom):
             previous = now
 
 
+class BotCoopFrontRespawnTests(TerrainMixin, BotFrameRoom):
+    """任务模式的 bot 复活在推进最靠前真人附近的有效站立面。"""
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(synth_terrain("coop_respawn",
+                                                          width=2200))
+        self.walk(self.alice, [(1400.0, 150.0)])
+        self.walk(self.bob, [(700.0, 150.0)])
+
+    def test_it_anchors_to_the_frontmost_human(self):
+        point = bot.pick_respawn_point(self.room, self.bot_seat)
+        self.assertIsNotNone(point)
+        self.assertLess(abs(point[0] - 1400.0), 100.0)
+        self.assertGreater(abs(point[0] - 700.0), 500.0)
+
+    def test_the_point_is_standable_and_does_not_overlap_the_leader(self):
+        point = bot.pick_respawn_point(self.room, self.bot_seat)
+        who = bot._character_of(self.bot_conn)
+        self.assertTrue(botmove.fits(self.terrain, point[0], point[1], who))
+        self.assertFalse(bot._spawn_overlaps(
+            self.room, self.bot_seat, point, who))
+        self.assertEqual(point, self.bot_conn.pending_spawn)
+
+
+class BotCoopRespawnScanTests(TerrainMixin, BotFrameRoom):
+    """★★★ 复活点扫描跑在**游戏主线程**上，只许看锚点附近那一小片。"""
+
+    def setUp(self):
+        super().setUp()
+        # 现有最宽的一张任务图：11400 列 / 15029 个站立面。
+        self.terrain = self.install_terrain(mapdata.load("Quest03_1"))
+
+    def naive(self, anchor):
+        """朴素的全图逐列扫 —— 发散扫必须给出和它一模一样的答案。"""
+        who = bot._character_of(self.bot_conn)
+        ax, ay = anchor
+        best = None
+        for x in range(self.terrain.width):
+            for y in self.terrain.surfaces(x):
+                point = (float(x), float(y))
+                dx, dy = point[0] - ax, point[1] - ay
+                rank = (dx * dx + dy * dy, abs(dy), abs(dx), point[0], point[1])
+                if best is not None and rank >= best[0]:
+                    continue
+                if not botmove.fits(self.terrain, point[0], point[1], who):
+                    continue
+                if bot._spawn_overlaps(self.room, self.bot_seat, point, who):
+                    continue
+                best = (rank, point)
+        return None if best is None else best[1]
+
+    def test_it_matches_a_full_scan(self):
+        for anchor in ((200.0, 400.0), (6000.0, 400.0), (11000.0, 400.0)):
+            self.assertEqual(
+                self.naive(anchor),
+                bot._nearest_front_spawn(self.room, self.bot_seat,
+                                         self.terrain, self.bot_conn, anchor),
+                f"锚点 {anchor}")
+
+    def test_the_columns_come_out_nearest_first(self):
+        """发散扫能提前 `break` 的**前提**：产出按 |x − center| 单调不减。"""
+        got = list(bot._columns_by_distance(3.4, 9))
+        self.assertEqual(sorted(range(9), key=lambda x: abs(x - 3.4)), got)
+        self.assertEqual(list(range(9)), sorted(got), "一列都不能漏")
+
+    def test_it_does_not_scan_the_whole_map(self):
+        """★ 判据是 `botmove.fits()` 被调了几次，不是挂钟。
+
+        从 x=0 往右扫的旧写法在越过锚点之前 `best` 一路都在改善、剪枝一格
+        都剪不掉：这张图上实测一次调用 **99.5 ms、`fits()` 5982 次**，
+        等于一次复活吞掉三格房间循环（§137 把 A* 挪去后台就是治这个病）。
+        """
+        real = botmove.fits
+        calls = []
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return real(*args, **kwargs)
+
+        botmove.fits = counted
+        try:
+            bot._nearest_front_spawn(self.room, self.bot_seat, self.terrain,
+                                     self.bot_conn, (6000.0, 400.0))
+        finally:
+            botmove.fits = real
+        self.assertLess(len(calls), 100, "只该看锚点附近那一小片")
+
+
+class BotCoopRespawnCrowdingTests(TerrainMixin, TwoBotFrameRoom):
+    """同一格到期的两个 bot 不会挑中同一个前线空位。"""
+
+    def test_pending_spawn_reserves_the_first_bots_point(self):
+        self.install_terrain(synth_terrain("coop_respawn_two", width=2200))
+        self.walk(self.alice, [(1400.0, 150.0)])
+        points = [bot.pick_respawn_point(self.room, seat)
+                  for seat in self.bot_seats]
+        self.assertNotEqual(points[0], points[1])
+        first = self.room.seats[self.bot_seats[0]].conn
+        second = self.room.seats[self.bot_seats[1]].conn
+        circles_a = bot._character_of(first).circles(*points[0], False)
+        circles_b = bot._character_of(second).circles(*points[1], False)
+        self.assertTrue(all(math.hypot(ax - bx, ay - by) >= ar + br
+                            for ax, ay, ar, _ in circles_a
+                            for bx, by, br, _ in circles_b))
+
+
+class BotBreakableShortcutTests(TerrainMixin, BotFireRoom):
+    """截图真图 `CamelCulvert04:NewPvp`：绕路和打罐子的捷径同时存在。"""
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(mapdata.load("CamelCulvert04"))
+        self.place_bot(353.0, 988.0)
+
+    def test_the_background_planner_selects_the_first_vase_on_the_shortcut(self):
+        who = bot._character_of(self.bot_conn)
+        goal = (1605.0, 937.0)
+        botplan.forget(self.bot_conn)
+        botplan.ask(self.bot_conn, self.terrain, self.bot_conn.body, who, goal,
+                    open_terrain=self.terrain.variant(()))
+        self.assertTrue(botplan.PLANNER.settle())
+        choice = botplan.take_result(self.bot_conn, self.bot_conn.body, goal)
+        self.assertTrue(choice.shortcut)
+        self.assertTrue(choice.reached)
+        self.assertEqual(55, choice.blocker)
+        self.assertEqual(1, len(choice.prefix))
+        self.assertEqual((526, 840),
+                         (self.terrain.breakables[choice.blocker].x,
+                          self.terrain.breakables[choice.blocker].y))
+
+    def test_it_switches_to_a_weapon_that_really_hits_the_vase(self):
+        self.place_bot(493.0, 988.0)
+        self.bot_conn.path_breakable = 55
+        with bot._tick_clock(self.now()):
+            bot._choose_weapon(self.room, self.bot_conn, self.bot_seat)
+            target = bot._fire_target(self.room, self.bot_conn, self.bot_seat,
+                                      self.bot_conn.weapon)
+        self.assertEqual(1002030, self.bot_conn.weapon.id)
+        self.assertIsNotNone(target)
+        self.assertEqual(bot.BREAKABLE_SEAT, target[0])
+        option = bot._breakable_option(
+            self.room, self.bot_conn, self.bot_conn.weapon, self.terrain,
+            bot._solver_for(self.bot_conn.weapon), 493.0, 988.0)
+        self.assertEqual(20, option[1])       # 40 HP，两发打碎
+
+    def test_breaking_it_clears_the_objective_and_replans(self):
+        self.bot_conn.path_breakable = 55
+        self.room.quest.bot_terrain = self.terrain
+        ledger = bot._breakables(self.room)
+        self.assertTrue(ledger.damage(self.terrain, 55, 999))
+        bot._refresh_breakables(self.room)
+        self.assertIsNone(self.bot_conn.path_breakable)
+        self.assertNotIn(55, bot._terrain(self.room).alive)
+
+    def test_being_pinned_inside_a_breakable_beats_crack_unsticking(self):
+        """★ 被罐子裹住时锁定它、瞄上之后站住打，而不是在缝里乱蹦。
+
+        判据是两句 `fits()` 的地形差（`_breakable_pinning_body`）：这儿塞
+        不下、拿掉破坏物就塞得下 ⇒ 压住我的是它。第一格只锁定并照旧走
+        `_unstick_intent()`（挪出去也是一条出路），瞄上它的那一格才站住。
+        """
+        item = self.terrain.breakables[55]
+        self.place_bot(float(item.x), float(item.y))
+        self.bot_conn.path_breakable = None
+        self.assertIsNotNone(
+            bot._breakable_pinning_body(self.bot_conn, self.terrain))
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, None)
+        self.assertEqual(item.index, self.bot_conn.path_breakable)
+        target = (bot.BREAKABLE_SEAT, (float(item.x), float(item.y)), None)
+        self.assertEqual((0, False, False, False),
+                         bot._move_intent(self.room, self.bot_conn,
+                                          self.bot_seat, self.terrain, target))
+
+    def test_a_visible_enemy_outranks_the_vase(self):
+        """★★ 人在眼前时不打罐子、也不为罐子换枪 —— 三处同一个门。
+
+        走位（`_breakable_move_intent`）、开火（`_engagement`）、换枪
+        （`_choose_weapon`）全走 `_breaking_now()`。判得不一样就会出现
+        「走位站着等打罐子、开火却去打别的」那种谁也动不了的僵局。
+        """
+        self.place_bot(493.0, 988.0)
+        self.bot_conn.path_breakable = 55
+        self.assertIsNotNone(bot._breaking_now(self.room, self.bot_conn,
+                                               self.bot_seat, self.terrain))
+        self.walk(self.alice, [(560.0, 988.0)])
+        self.assertIsNone(bot._breaking_now(self.room, self.bot_conn,
+                                            self.bot_seat, self.terrain))
+        self.assertIsNone(bot._breakable_move_intent(
+            self.room, self.bot_conn, self.bot_seat, self.terrain, None))
+
+    def test_dodging_outranks_breaking_a_blocker(self):
+        """★★★ 脱困 / 牵引绳 / 躲子弹都排在破障**前面**。
+
+        锁住一件挡路物之后连躲都不躲的话，手雷飞脸上 bot 也站着不动
+        （§152「卡在缝里排在一切之前」/ D99「牵引绳排在最前面」/
+        M5-E「躲子弹排在一切之前」三条会被同时绕过）。罐子不会跑，
+        躲完这一发再打完全来得及。
+        """
+        self.place_bot(493.0, 988.0)
+        self.bot_conn.path_breakable = 55
+        target = (bot.BREAKABLE_SEAT, (526.0, 840.0), None)
+        self.assertEqual((0, False, False, False),
+                         bot._move_intent(self.room, self.bot_conn,
+                                          self.bot_seat, self.terrain, target))
+        real = bot._dodge_intent
+        bot._dodge_intent = lambda *args, **kwargs: (-1, True, False, True)
+        try:
+            self.assertEqual((-1, True, False, True),
+                             bot._move_intent(self.room, self.bot_conn,
+                                              self.bot_seat, self.terrain,
+                                              target))
+        finally:
+            bot._dodge_intent = real
+
+    def test_an_unidentified_blocker_falls_back_to_the_intact_route(self):
+        """★★★ 认不出挡路的是**哪一件**时，绝不能把开放地形那条路交出去。
+
+        那条路是「假定罐子都碎了」画出来的，拿到真地形上执行就是一路撞墙。
+        这种时候当作「没有捷径」，退回完整地形那条已经验证过的答案。
+        """
+        who = bot._character_of(self.bot_conn)
+        goal = (1605.0, 937.0)
+        intact = botnav.plan_result(self.terrain, self.bot_conn.body, who, goal)
+        real = botnav.first_breakable_on_path
+        botnav.first_breakable_on_path = lambda *args, **kwargs: (None, ())
+        try:
+            botplan.forget(self.bot_conn)
+            botplan.ask(self.bot_conn, self.terrain, self.bot_conn.body, who,
+                        goal, open_terrain=self.terrain.variant(()))
+            self.assertTrue(botplan.PLANNER.settle())
+            choice = botplan.take_result(self.bot_conn, self.bot_conn.body,
+                                         goal)
+        finally:
+            botnav.first_breakable_on_path = real
+        self.assertFalse(choice.shortcut)
+        self.assertIsNone(choice.blocker)
+        self.assertEqual(intact.path, choice.path)
+
+    def test_standing_beside_a_vase_is_not_being_pinned(self):
+        """★★ 站在罐子**旁边**不算被困住。
+
+        `Breakable.hit()` 抄的是客户端 `HitTest`，自带 3×3 邻域 —— 拿碰撞圆
+        的边缘点去问它，「贴着罐子站」和「被罐子裹住」返回同一个答案：实测
+        这张图 3514 个可站落脚点里 **571 个（16.2%）**会被这么误判，bot 于是
+        站住打一件根本不挡路的罐子。`(156, 990)` 就是其中一个 —— 身圆右缘
+        `(169, 953)` 落在罐 #10 的掩码里，可人明明站得好好的。
+        """
+        self.place_bot(156.0, 990.0)
+        self.bot_conn.path_breakable = None
+        who = bot._character_of(self.bot_conn)
+        self.assertTrue(botmove.fits(self.terrain, 156.0, 990.0, who))
+        self.assertIsNone(
+            bot._breakable_pinning_body(self.bot_conn, self.terrain))
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, None)
+        self.assertIsNone(self.bot_conn.path_breakable)
+
+
 class BotKnockbackLadderTests(unittest.TestCase):
     """★★★ 击退强度阶梯 + 方向公式（§92，`0x481003`）。
 
@@ -7269,6 +7576,8 @@ class BotVisionTests(TerrainMixin, BotFireRoom):
         self.place_bot(200.0)
 
     def test_a_target_inside_the_box_is_visible(self):
+        self.assertEqual((1024.0, 768.0),
+                         (bot.BOT_VISION_HALF_X, bot.BOT_VISION_HALF_Y))
         self.assertTrue(bot._in_sight(self.bot_conn, 200.0 + 900.0, 150.0))
         self.assertTrue(bot._in_sight(self.bot_conn, 200.0, 150.0 - 500.0))
 
@@ -7308,8 +7617,27 @@ class BotVisionTests(TerrainMixin, BotFireRoom):
         spot = bot._rough_bearing(self.room, self.bot_conn, self.bot_seat)
         self.assertIsNotNone(spot)
         self.assertEqual(200.0 + bot.BOT_VISION_HALF_X, spot[0])
-        self.assertEqual(150.0 - bot.BOT_VISION_HALF_Y, spot[1])
+        self.assertEqual(150.0, spot[1], "只能给右，不能泄露成右上对角线")
         self.assertNotEqual(far, spot[0], "不许把精确坐标喂给它")
+
+    def test_the_same_direction_does_not_leak_distance(self):
+        """同样在右边，超出 1 像素和超出 2000 单位得到的点完全相同。"""
+        points = []
+        for extra in (1.0, 2000.0):
+            far = 200.0 + bot.BOT_VISION_HALF_X + extra
+            self.alice.sync_trail.clear()
+            self.alice.sync_trail.append((far, 150.0, 0))
+            points.append(bot._rough_bearing(
+                self.room, self.bot_conn, self.bot_seat))
+        self.assertEqual(points[0], points[1])
+
+    def test_vertical_bearing_has_no_horizontal_component(self):
+        self.alice.sync_trail.clear()
+        self.alice.sync_trail.append(
+            (200.0, 150.0 + bot.BOT_VISION_HALF_Y + 100.0, 0))
+        self.assertEqual((200.0, 150.0 + bot.BOT_VISION_HALF_Y),
+                         bot._rough_bearing(self.room, self.bot_conn,
+                                            self.bot_seat))
 
     def test_it_walks_toward_the_bearing(self):
         far = 200.0 + bot.BOT_VISION_HALF_X + 400.0
@@ -7318,6 +7646,101 @@ class BotVisionTests(TerrainMixin, BotFireRoom):
         self.beats(4, far)
         self.assertGreater(self.bot_conn.body.x, 200.0,
                            "看不见也该朝那个方向挪")
+
+
+class BotBlindHealthTests(TerrainMixin, BotFireRoom):
+    """框内没敌人时的 25% / 50% 滞回与粗方向掩体。"""
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(synth_terrain("blind_hp", width=4000))
+        self.place_bot(600.0)
+        self.far = 600.0 + bot.BOT_VISION_HALF_X + 500.0
+        self.walk(self.alice, [(self.far, 150.0)])
+        self.place_bot(600.0)
+
+    def set_health(self, fraction):
+        ledger = bot._health(self.room)
+        ledger.reset(self.bot_seat)
+        maximum = bot._seat_max_hp(self.room, self.bot_seat)
+        ledger.note_damage(self.bot_seat, maximum * (1.0 - fraction))
+
+    def intent(self):
+        return bot._blind_intent(self.room, self.bot_conn, self.bot_seat,
+                                 self.terrain)
+
+    def test_below_twenty_five_percent_hides(self):
+        self.set_health(0.24)
+        self.bot_conn.stance = "press"
+        intent = self.intent()
+        self.assertEqual("retreat", self.bot_conn.stance)
+        self.assertLessEqual(intent[0], 0, "敌人在右边，低血不该继续往右送")
+
+    def test_above_fifty_percent_presses(self):
+        self.set_health(0.51)
+        self.bot_conn.stance = "retreat"
+        intent = self.intent()
+        self.assertEqual("press", self.bot_conn.stance)
+        self.assertEqual(1, intent[0])
+
+    def test_middle_band_preserves_either_previous_stance(self):
+        self.set_health(0.40)
+        self.bot_conn.stance = "retreat"
+        self.intent()
+        self.assertEqual("retreat", self.bot_conn.stance)
+        self.bot_conn.stance = "press"
+        self.bot_conn.retreat_goal = None
+        self.intent()
+        self.assertEqual("press", self.bot_conn.stance)
+
+    def test_exact_thresholds_do_not_flip(self):
+        for fraction, stance in ((0.25, "press"), (0.50, "retreat")):
+            self.set_health(fraction)
+            self.bot_conn.stance = stance
+            self.bot_conn.retreat_goal = None
+            self.intent()
+            self.assertEqual(stance, self.bot_conn.stance)
+
+    def test_a_vertical_bearing_does_not_freeze_the_bot(self):
+        """★★★ 上下方位不许把 bot 定在原地（用户 2026-09-01）。
+
+        竖直粗方位是 `(自己的 x, y ± 视野高)`，`_walk_to()` 那句
+        `direction = 0 if abs(delta_x) < 1.0` 于是恒为 0；A\\* 再解不出
+        上下层的路（一张图的可达分量往往只覆盖一半，§137），就正好是
+        用户报的「傻站着不动」。真人这时候是**横着走去找上去的那条路**。
+        ★ 粗方位本身一个字没变 —— 泄露出去的仍然只有「上/下」。
+        """
+        above = 150.0 - bot.BOT_VISION_HALF_Y - 300.0
+        for conn in (self.alice, self.bob):
+            conn.sync_trail.clear()
+            conn.sync_trail.append((600.0, above, 0))
+        self.set_health(1.0)
+        self.bot_conn.stance = "press"
+        rough = bot._rough_bearing_raw(self.room, self.bot_conn, self.bot_seat)
+        self.assertEqual(600.0, rough[0][0], "仍然只给上下，不泄露 x")
+        self.assertEqual(0, rough[1])
+        self.assertNotEqual(0, self.intent()[0],
+                            "上下方位也得横着走去找上去的路")
+
+    def test_a_boss_room_never_hides(self):
+        """★ boss 房的门要**打死 boss 才开** —— 血再少也不许躲（§141）。"""
+        self.set_health(0.05)
+        self.bot_conn.stance = "retreat"
+        intent = bot._blind_intent(self.room, self.bot_conn, self.bot_seat,
+                                   self.terrain, may_hide=False)
+        self.assertEqual("press", self.bot_conn.stance)
+        self.assertEqual(1, intent[0], "血再少也要朝 boss 那个方向压过去")
+
+    def test_low_health_uses_a_real_cover_when_available(self):
+        self.terrain = self.install_terrain(synth_terrain(
+            "blind_cover", width=4000, walls=((480, 520, 0),)))
+        self.place_bot(600.0)
+        self.set_health(0.10)
+        self.bot_conn.stance = "press"
+        self.intent()
+        self.assertIsNotNone(self.bot_conn.retreat_goal)
+        self.assertLess(self.bot_conn.retreat_goal[0], 520.0,
+                        "应该走到左边、让墙挡在自己和右方敌人之间")
 
 
 class BotIdleRepositionTests(TerrainMixin, BotFireRoom):

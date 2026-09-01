@@ -655,7 +655,9 @@ class BotStartChainTests(BattleRoom):
         self.ready(self.alice); self.ready(self.alice)
         self.clear()
         self.loaded(self.alice)
-        self.assertEqual([], opcodes(self.bob))      # 还差 bob
+        # 还差 bob；唯一的包是“LoadingStage 已就绪”后确认重画
+        # bot 100%，绝不是提前放行 stage 7。
+        self.assertEqual([gameserver.OP_PEER_DATA_DOWN], opcodes(self.bob))
         self.loaded(self.bob)                        # 只差这两个真人
         self.assertIn(OP_COUNT_GAME_READY, opcodes(self.alice))
         self.assertIn(OP_COUNT_GAME_READY, opcodes(self.bob))
@@ -908,11 +910,15 @@ class BotMapChangeTests(BotBattleRoom):
                          opcodes(self.alice))
         self.assertIn(self.bot_conn, self.room.quest.map_loaded)
         self.clear()
+        # ★ 每个真人自己那发 `0x0412` 都证明「我这台的加载界面建好了」，
+        #   各换来一发确认重画的 bot 100（§158，按连接去重）。
         gameserver.Conn.on_game_packet(self.alice, OP_MAP_LOADING_DONE, b"")
-        self.assertEqual([], opcodes(self.bob))      # 还差 bob
+        self.assertEqual([gameserver.OP_PEER_DATA_DOWN], opcodes(self.bob))
         gameserver.Conn.on_game_packet(self.bob, OP_MAP_LOADING_DONE, b"")
-        self.assertEqual([OP_MAP_CHANGE_READY], opcodes(self.alice))
-        self.assertEqual([OP_MAP_CHANGE_READY], opcodes(self.bob))
+        both = [gameserver.OP_PEER_DATA_DOWN, gameserver.OP_PEER_DATA_DOWN,
+                OP_MAP_CHANGE_READY]
+        self.assertEqual(both, opcodes(self.alice))
+        self.assertEqual(both, opcodes(self.bob))
 
     def test_the_bot_is_marked_again_for_the_next_map(self):
         # `begin_map_change` 每次都清 `map_loaded` —— 第二次换图要重新报。

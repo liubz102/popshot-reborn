@@ -360,12 +360,12 @@ class PlannerTests(unittest.TestCase):
     def test_a_broken_plan_never_kills_the_worker(self):
         """规划炸了只当「没有路」—— 线程死了所有 bot 就再也拿不到路线。"""
         owner = self.Owner()
-        original = botnav.plan
+        original = botnav.plan_result
 
         def boom(*_args, **_kwargs):
             raise RuntimeError("造出来的故障")
 
-        botnav.plan = boom
+        botnav.plan_result = boom
         try:
             botplan.ask(owner, self.terrain, self.start, self.who,
                         (600.0, 180.0))
@@ -373,7 +373,7 @@ class PlannerTests(unittest.TestCase):
             self.assertEqual((), botplan.take(owner, self.start,
                                               (600.0, 180.0)))
         finally:
-            botnav.plan = original
+            botnav.plan_result = original
         # 线程还活着：再递一张照样算得出来。
         botplan.ask(owner, self.terrain, self.start, self.who, (600.0, 180.0))
         self.assertTrue(botplan.PLANNER.settle())
