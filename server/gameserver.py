@@ -4913,8 +4913,9 @@ class RoomLoop:
                 if self.stopped:
                     return
                 gen, tick = self.gen, self.done
-                self._note_late(self.scheduled - self.done - 1)
-            if not self.run_tick(tick):
+                behind = self.scheduled - self.done - 1
+                self._note_late(behind)
+            if not self.run_tick(tick, behind=behind):
                 self.stop("这一局到头了（循环自校验）")
                 return
             with self._cv:
@@ -4987,11 +4988,15 @@ class RoomLoop:
             return True
         return getattr(room.quest, "pending_map", None) is not None
 
-    def run_tick(self, tick, now=None):
+    def run_tick(self, tick, now=None, behind=0):
         """跑一格。返回 ``False`` = 这一局到头了，循环该停。
 
         `now` 是这一格的**绝对时刻**（`t0 + tick × 32 ms`），不是「此刻」——
         追赶时它是过去的时刻，物理照着它算才对得上。
+
+        `behind` = 这一格跑完之后**还欠几格**。0 = 已经追平了。
+        物理不看它（欠的格一个不落地跑完，§147），只有**位置心跳**看：
+        追赶途中的那几发要是照发，收方会在几毫秒里连吃好几发（V0.3 §153）。
         """
         room = self.room
         if now is None:
@@ -5015,7 +5020,7 @@ class RoomLoop:
             spent["杂事"] = (t_chores - t_locked) * 1000.0
             if BOT_ROOM_TICK is not None:
                 try:
-                    BOT_ROOM_TICK(room, tick, now)
+                    BOT_ROOM_TICK(room, tick, now, behind)
                 except Exception as error:  # noqa: BLE001 —— 见下
                     # bot 出问题不能把房间那条循环带走（D1）：真人的对战计时、
                     # 刷道具、复活看门狗都还挂在它上面。逐个 bot 的隔离在
@@ -5046,19 +5051,24 @@ class RoomLoop:
         except Exception as error:          # noqa: BLE001 —— 别连累这一格
             conn.log(f"   ⚠ 房间级定时任务出错，已跳过: {error!r}")
 
-    def advance(self, ticks=1, now=None):
+    def advance(self, ticks=1, now=None, burst=False):
         """★ **单测用**：同步跑 `ticks` 格，一条线程都不起。返回真的跑了几格。
 
         跑的是和线程那条路**同一个** `run_tick()` —— 差别只在谁来数拍子。
+
+        `burst=True` = 把这一批当成**一次追赶**（欠了 `ticks` 格、一口气补完），
+        `behind` 跟着往下数 —— 用来验「追赶途中不刷位置心跳」（V0.3 §153）。
         """
         ran = 0
-        for _ in range(int(ticks)):
+        total = int(ticks)
+        for step in range(total):
             with self._cv:
                 if self.stopped:
                     break
                 tick = self.done
             at = None if now is None else now
-            if not self.run_tick(tick, at):
+            if not self.run_tick(tick, at,
+                                 behind=(total - step - 1) if burst else 0):
                 self.stop("这一局到头了（循环自校验）")
                 break
             with self._cv:

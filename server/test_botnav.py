@@ -380,5 +380,93 @@ class PlannerTests(unittest.TestCase):
         self.assertTrue(botplan.take(owner, self.start, (600.0, 180.0)))
 
 
+class NarrowSlotEdgeTests(unittest.TestCase):
+    """★★★★ 落点**塞不进去**的边不生成（V0.3 §152）。
+
+    这一层的物理把角色当一个点，所以 1 像素的缝在图里是合法落脚点 ——
+    A\\* 会把它当捷径，**主动**把 bot 送进去，而真客户端的三个碰撞圆卡在
+    缝口出不来。实机 `Iceria03` (1174, 864)：31 条 `jump` 入边、0 条出边。
+    """
+
+    def setUp(self):
+        self.who = Dummy(7.0)
+
+    def slot_map(self, gap):
+        """左边一片开阔地，右边一条 `gap` 像素宽的深缝（缝底有地面）。"""
+        width, height, floor, lip = 400, 200, 150, 60
+        rows = []
+        for y in range(height):
+            if y >= floor:
+                rows.append("2" * width)
+            elif y >= lip:
+                # 右半边是实心块，中间挖一条缝。
+                slot = 300
+                rows.append("0" * 200 + "2" * (slot - 200)
+                            + "0" * gap + "2" * (width - slot - gap))
+            else:
+                rows.append("0" * width)
+        return terrain_from(rows)
+
+    def landing_xs(self, terrain, start_x=100.0):
+        body = botmove.Body(start_x, 150.0, on_ground=True)
+        return [int(nb.x) for nb, _step in
+                botnav.neighbors(terrain, body, self.who)]
+
+    def test_a_hairline_slot_is_not_a_neighbour(self):
+        terrain = self.slot_map(6)
+        for x in self.landing_xs(terrain):
+            self.assertFalse(300 <= x < 306,
+                             "落点 %d 在 6 像素宽的缝里，不该成边" % x)
+
+    def test_a_wide_gap_still_is(self):
+        """★ 对照组：同一张图把缝拓宽到人塞得下，边就该回来。"""
+        wide = self.slot_map(60)
+        self.assertTrue(any(300 <= x < 360 for x in self.landing_xs(wide)),
+                        "60 像素宽的通道人走得进去，边不该被滤掉")
+
+    def test_the_cache_key_tells_fat_and_thin_characters_apart(self):
+        """★★ 「塞不塞得下」用的是身圆，所以身圆必须进边缓存的 key。"""
+        thin = Dummy(7.0)
+        thin.size_legs, thin.size_body = 12.0, 13.0
+        fat = Dummy(7.0)
+        fat.size_legs, fat.size_body = 12.0, 30.0
+        self.assertNotEqual(botnav._scale_key(thin), botnav._scale_key(fat))
+
+
+class RealTrapNodeEdgeTests(unittest.TestCase):
+    """★★★★★ `Iceria03` 上那 8 个只进不出的点，过滤之后**入边为 0**。"""
+
+    TRAPS = ((1174, 864), (1176, 867), (686, 1038), (694, 1050),
+             (1246, 1105), (1174, 1112), (1176, 1116), (696, 1548))
+
+    @classmethod
+    def setUpClass(cls):
+        cls.terrain = mapdata.load("Iceria03")
+        if cls.terrain is None:
+            raise unittest.SkipTest("没有 Iceria03 的地形产物")
+        import chrprops                                        # noqa: PLC0415
+        cls.who = chrprops.get(0)
+
+    @staticmethod
+    def key(x, y):
+        return (int(round(x / botnav.KEY_X)), int(round(y / botnav.KEY_Y)))
+
+    def test_nothing_routes_into_the_traps_any_more(self):
+        wanted = {self.key(x, y) for x, y in self.TRAPS}
+        hits = 0
+        for x in range(2, self.terrain.width - 2, 4):
+            for y in self.terrain.surfaces(x):
+                if not botmove.fits(self.terrain, x, y, self.who):
+                    continue
+                body = botmove.Body(float(x), float(y), on_ground=True)
+                for nb, _step in botnav.neighbors(self.terrain, body,
+                                                  self.who):
+                    if self.key(nb.x, nb.y) in wanted:
+                        hits += 1
+        self.assertEqual(0, hits,
+                         "还有 %d 条边指向那几条冰缝（改之前 (1174,864) 一个点"
+                         "就有 31 条入边）" % hits)
+
+
 if __name__ == "__main__":
     unittest.main()

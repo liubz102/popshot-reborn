@@ -478,40 +478,48 @@ def settle(terrain, body, character, ticks=None):
 
 
 def blocked(terrain, body, character, direction, fast_run=False,
-            crouched=False):
+            crouched=False, speed_scale=1.0):
     """朝 `direction` 走一步会不会**撞在墙上**（原地不动）。"""
     if not direction or not body.on_ground:
         return False
     return tick(terrain, body, character, direction=direction,
-                fast_run=fast_run, crouched=crouched).x == body.x
+                fast_run=fast_run, crouched=crouched,
+                speed_scale=speed_scale).x == body.x
 
 
 def leaves_ground(terrain, body, character, direction, fast_run=False,
-                  crouched=False):
+                  crouched=False, speed_scale=1.0):
     """朝 `direction` 走一步会不会**踩空**（走出崖边）。"""
     if not direction or not body.on_ground:
         return False
     return not tick(terrain, body, character, direction=direction,
-                    fast_run=fast_run, crouched=crouched).on_ground
+                    fast_run=fast_run, crouched=crouched,
+                    speed_scale=speed_scale).on_ground
 
 
 def jump_lands(terrain, body, character, direction, fast_run=False,
-               crouched=False, ticks=None):
+               crouched=False, ticks=None, speed_scale=1.0):
     """原地起跳、空中一路按着 `direction`，**落在哪**；落不到返回 `None`。
 
     这就是「跳跃弧线」：要不要跳过这个坑、够不够得着那个台子，
     问它就行 —— 弧线是真跑出来的，不是拿公式估的。
+
+    ★ `speed_scale` 要和真起跳那一刻的一致（V0.3 §151）：起跳带走的是**这一刻
+      的走速**（§93），被冻住（0.0）/ 踩了减速胶水（0.3）时不传的话，
+      预测出来的是一条满速弧线，而真跑出来的是原地竖直跳。
     """
     if ticks is None:
         # 起跳先上去、再落到图底：升段 `v/g` 个 tick，落段见 `fall_ticks()`。
         ticks = fall_ticks(terrain) + int(JUMP_SPEED / GRAVITY) + 2
     body = tick(terrain, body, character, direction=direction,
-                fast_run=fast_run, crouched=crouched, want_jump=True)
+                fast_run=fast_run, crouched=crouched, want_jump=True,
+                speed_scale=speed_scale)
     for _ in range(max(0, int(ticks))):
         if body.on_ground:
             return body
         body = tick(terrain, body, character, direction=direction,
-                    fast_run=fast_run, crouched=crouched)
+                    fast_run=fast_run, crouched=crouched,
+                    speed_scale=speed_scale)
     return body if body.on_ground else None
 
 
@@ -530,7 +538,7 @@ def at_apex(body):
 
 
 def double_jump_lands(terrain, body, character, direction, fast_run=False,
-                      crouched=False, ticks=None):
+                      crouched=False, ticks=None, speed_scale=1.0):
     """★★ 起跳 + **在顶点再按一次**，落在哪；落不到返回 `None`（§124）。
 
     和 `jump_lands()` 是一对：那个问「一段跳够不够」，这个问「两段够不够」。
@@ -546,7 +554,8 @@ def double_jump_lands(terrain, body, character, direction, fast_run=False,
         ticks = (fall_ticks(terrain)
                  + int((JUMP_SPEED + DOUBLE_JUMP_SPEED) / GRAVITY) + 2)
     current = tick(terrain, body, character, direction=direction,
-                   fast_run=fast_run, crouched=crouched, want_jump=True)
+                   fast_run=fast_run, crouched=crouched, want_jump=True,
+                   speed_scale=speed_scale)
     if current.on_ground:
         return None                        # 压根没离地
     jumped = False
@@ -563,17 +572,120 @@ def double_jump_lands(terrain, body, character, direction, fast_run=False,
 
 
 def drop_below(terrain, body, character, direction, fast_run=False,
-               crouched=False, ticks=None):
+               crouched=False, ticks=None, speed_scale=1.0):
     """走出崖边之后会掉多深（掉不到底返回 `None`）。
 
     给决策层用：真人不会主动跳进无底洞，但**从一米高的台阶走下去**
     再正常不过 —— 判据是「掉多深」，不是「许不许离地」。
+
+    ⚠ 它只看**下一步**。「这份意图握着的这几格里会不会踩进无底洞」要问
+    `bottomless_ahead()`，别拿这个凑（V0.3 §151）。
     """
     step = tick(terrain, body, character, direction=direction,
-                fast_run=fast_run, crouched=crouched)
+                fast_run=fast_run, crouched=crouched, speed_scale=speed_scale)
     if step.on_ground:
         return 0.0
     landed = settle(terrain, step, character, ticks)
     if not landed.on_ground:
         return None
     return landed.y - body.y
+
+
+def bottomless_ahead(terrain, body, character, direction, fast_run=False,
+                     crouched=False, speed_scale=1.0, ticks=1):
+    """接下来这 `ticks` 格照这个方向走，**会不会踩进掉不到底的坑**。
+
+    ## ★★★ 为什么要看不止一格（V0.3 §151）
+
+    `drop_below()` 只推**一格**，而崖边那个「下一步就踩空」的窗口在真图上
+    只有**一个走步宽**（`Quest02_1#Normal` 实测 8~11 像素）。意图不是每格
+    重算的 —— 它由 `bot._decide()` 产出、要**握着用 `BOT_DECISION_TICKS`
+    格**。于是约一半的接近位置整个跳过这个窗口：bot 一步走出崖边，等下一次
+    决策时人已经腾空往坑里掉了，一次跳都没按。实测掉坑率 **50%**；把前瞻
+    改成「这份意图要用几格」之后是 **0.1%**。
+
+    ★ 这**不是**「跳过头 N 格」那类阈值（铁律 10）：`ticks` 就是这份意图的
+      寿命，调用方拿自己的决策周期传进来。判据仍然是「照这么走会不会掉进
+      无底洞」这个物理事实，只是把它放在**整段区间**上问，而不是只问第一格。
+
+    ★ 决策频率一个字没改 —— §146 里用户明确否掉过「即将踩空就地重问」。
+      改的是**看多远**，不是**多久看一次**。
+    """
+    if not direction:
+        return False
+    current = body
+    for _ in range(max(1, int(ticks))):
+        if not current.on_ground:
+            break
+        step = tick(terrain, current, character, direction=direction,
+                    fast_run=fast_run, crouched=crouched,
+                    speed_scale=speed_scale)
+        if not step.on_ground:
+            return not settle(terrain, step, character).on_ground
+        if step.x == current.x:
+            return False               # 撞墙了，再往后推也是原地
+        current = step
+    return False
+
+
+def fits(terrain, x, y, character, crouched=False):
+    """脚站在 `(x, y)` 时，**角色的碰撞体塞得进去吗**（V0.3 §152）。
+
+    ## ★★★ 为什么需要它
+
+    这个文件其余部分把角色当**一个点**（`_solid()` 只问一个像素），于是
+    一条 1 像素宽的裂缝在模型里是完全合法的通路，`botnav` 用同一套物理建边
+    ⇒ 裂缝里的点成了合法 A\\* 节点，A\\* 会**主动**把 bot 送进去。
+    而真客户端用的是 `ChrProps.ini` 的三个碰撞圆（最宽 26 像素），人卡在
+    缝口出不来 —— 用户 2026-09-01 报的 `Iceria03` (1174, 864) 就是它，
+    两个 bot 先后卡在同一个像素上，一个 59 秒一个 13 秒。
+
+    ★ 判据是「碰撞体塞不进去」这个**几何事实**，不是人工维护的坑位黑名单
+      （铁律 10 / 铁律 11）。实测 6 张图：净空 < 24 的落脚点只占 0.3%~6%，
+      而且几乎全部 < 12 —— 要么开阔要么发丝缝，中间没有灰区。
+
+    圆心高度照抄 `chrprops.Character.circles()`（腿 / 身自下而上）。
+
+    ⚠ **只查腿圆和身圆，不查头圆**：卡死人的缝全是「窄」不是「矮」，而
+    低矮的通道（`CamelCulvert` 那种下水道）在原版里是走得过去的。原版的
+    地形碰撞本身是什么形状我们没逆出来，所以只用「水平放不下最宽的那一圈」
+    这条**看得见的事实**，不往上加推测。
+    """
+    if terrain is None:
+        return True
+    legs = float((getattr(character, "size_legs_crouch", 7.0) if crouched
+                  else getattr(character, "size_legs", 12.0)) or 12.0)
+    body_r = float(getattr(character, "size_body", 13.0) or 13.0)
+    legs_y = y - legs
+    body_y = legs_y - legs - body_r
+    return (_clearance_ok(terrain, x, legs_y, legs)
+            and _clearance_ok(terrain, x, body_y, body_r))
+
+
+def _clearance_ok(terrain, x, y, radius):
+    """`(x, y)` 这一行上，左右加起来有没有 `2 × radius` 的净空。
+
+    只量**水平**方向：竖直方向由站立面本身保证（`surfaces()` 给的就是
+    站得住的地方）。
+    ★ 一侧的富余可以补另一侧的不足 —— **贴着墙站是合法的**，只要整条空隙
+      放得下这一圈。所以两边各最多看 `2 × radius`，够了就提前收工。
+    ★ 圆心那一格是实心时直接判塞不进去（人已经嵌在地形里了）。
+    """
+    iy = int(y)
+    if iy < 0:
+        return True                    # 伸到图外：图外不是墙，照原版
+    ix = int(x)
+    if _solid(terrain, ix, iy):
+        return False
+    need = 2.0 * radius
+    limit = int(math.ceil(need))
+    left = 0
+    while left < limit and not _solid(terrain, ix - left - 1, iy):
+        left += 1
+    if left + 1 >= need:
+        return True
+    right = 0
+    while (left + right + 1 < need and right < limit
+           and not _solid(terrain, ix + right + 1, iy)):
+        right += 1
+    return left + right + 1 >= need

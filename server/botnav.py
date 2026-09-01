@@ -259,7 +259,17 @@ def _pad_edge(terrain, body, character, double=False):
 
 
 def neighbors(terrain, body, character):
-    """从一个落脚点实际模拟所有动作边，产出 ``(下一身体, Step)``。"""
+    """从一个落脚点实际模拟所有动作边，产出 ``(下一身体, Step)``。
+
+    ## ★★★ 落点**塞不进去**的边不生成（V0.3 §152）
+
+    这一层的物理（`botmove`）把角色当一个点，于是一条 1 像素宽的裂缝在图里
+    是完全合法的落脚点 —— A\\* 会**主动**把 bot 送进去当捷径，而真客户端用的
+    是三个碰撞圆（最宽 26 像素），人卡在缝口出不来。
+    实机 `Iceria03`：(1174, 864) 有 **31 条 `jump` 入边、0 条出边**，
+    两个 bot 先后卡在那一个像素上，一个 59 秒一个 13 秒。
+    ⇒ 出图之前问一句 `botmove.fits()`。判据是几何事实，不是人工坑位表。
+    """
     if terrain is None or body is None or not body.on_ground:
         return ()
     out = []
@@ -289,7 +299,8 @@ def neighbors(terrain, body, character):
         edge = _pad_edge(terrain, body, character, double=double)
         if edge is not None:
             out.append(edge)
-    return tuple(out)
+    return tuple(edge for edge in out
+                 if botmove.fits(terrain, edge[0].x, edge[0].y, character))
 
 
 # ---------------------------------------------------------------------------
@@ -304,14 +315,17 @@ _EDGE_CACHE = weakref.WeakKeyDictionary()
 
 
 def _scale_key(character):
-    """角色身上**唯一影响可达图**的两个量：走速和腿的碰撞半径。
+    """角色身上**影响可达图**的那几个量：走速 + 两个碰撞半径。
 
     走速决定走 / 跳的水平位移，腿半径决定够不够得着弹跳台
-    （`botmove.jump_pad_launch`）。其余属性（血量、招式、武器）和地形无关，
-    所以 17 个角色只落在 9 种组合上，缓存自然共用。
+    （`botmove.jump_pad_launch`）。★ V0.3 §152 起**身圆半径也算一个**：
+    「落点塞不塞得下」用的就是腿圆和身圆，两个角色胖瘦不同、可达图就不同，
+    不带进 key 的话它们会共用错的边缓存。
+    其余属性（血量、招式、武器）和地形无关，缓存自然共用。
     """
     return (float(getattr(character, "speed", 7.0) or 7.0),
-            float(getattr(character, "size_legs", 12.0) or 12.0))
+            float(getattr(character, "size_legs", 12.0) or 12.0),
+            float(getattr(character, "size_body", 13.0) or 13.0))
 
 
 def graph_of(terrain, character):

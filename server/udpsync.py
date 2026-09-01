@@ -581,7 +581,8 @@ class Endpoint:
     """一条**已经认出来是谁**的 UDP 流。"""
 
     __slots__ = ("game_conn", "addr", "last_seen", "created_at",
-                 "downlink_ok", "out_index", "recent", "last_n")
+                 "downlink_ok", "out_index", "recent", "last_n",
+                 "tcp_at", "flips", "flip_gap_min")
 
     def __init__(self, game_conn, addr, now):
         self.game_conn = game_conn
@@ -596,6 +597,18 @@ class Endpoint:
         self.recent = []
         #: `发送方 id -> 已经送给本收件人的最新 N`。铁律 3 的下行版本靠它。
         self.last_n = {}
+        #: ★★ 换路倒序的**曝光计量**（V0.3 §154）。`发送方 id -> 上一发被
+        #: 逼回 TCP 的时刻`；`flips` = 「TCP 之后紧接着一发走 UDP」发生过几次；
+        #: `flip_gap_min` = 这两发之间**最短**的间隔（秒）。
+        #:
+        #: 危险的形状只有这一种：先发的那一发走了慢的 TCP、后发的那一发走了
+        #: 快的 UDP，后发的先到 —— 心跳没有任何可判新旧的原版字段，收方拦不住，
+        #: 角色被拉回上一发的位置（用户 2026-09-01：「位置跳来跳去」）。
+        #: 间隔比两条路的时延差还小时才可能翻车，所以量的就是这个间隔。
+        #: ★ 只计数不改行为：这一版先把事实量出来，够不够危险由数据说了算。
+        self.tcp_at = {}
+        self.flips = 0
+        self.flip_gap_min = None
 
     def alive(self, now):
         return (now - self.last_seen) <= DEAD_AFTER_S
@@ -710,9 +723,18 @@ class UdpSyncServer:
             return False
         key = id(sender)
         if endpoint.last_n.get(key) == want:
+            # ★ 上一发刚被逼回 TCP、这一发走 UDP —— 就是「换路」那一下
+            #   （V0.3 §154）。量它，不改行为，见 `Endpoint.tcp_at`。
+            since = endpoint.tcp_at.pop(key, None)
+            if since is not None:
+                gap = time.monotonic() - since
+                endpoint.flips += 1
+                if endpoint.flip_gap_min is None or gap < endpoint.flip_gap_min:
+                    endpoint.flip_gap_min = gap
             return True
         # N 变了：这一发交给 TCP，并记下新值 —— 下一发起就能走 UDP 了。
         endpoint.last_n[key] = want
+        endpoint.tcp_at[key] = time.monotonic()
         return False
 
     def forget(self, game_conn):
@@ -721,6 +743,15 @@ class UdpSyncServer:
             endpoint = self._by_conn.pop(id(game_conn), None)
             if endpoint is not None:
                 self._by_addr.pop(endpoint.addr, None)
+        if endpoint is not None and endpoint.flips:
+            # ★ 换路的曝光量，走的时候报一次（V0.3 §154）。间隔越短越危险 ——
+            #   先发的那一发走慢的 TCP、后发的走快的 UDP，后发的先到就会把
+            #   角色拉回旧位置，而心跳没有可判新旧的字段，收方拦不住。
+            gap = endpoint.flip_gap_min
+            self.log(f"位置UDP  这条流一共 {endpoint.flips} 次「TCP 之后紧接着走"
+                     f" UDP」，最短间隔 "
+                     f"{'—' if gap is None else '%.0f ms' % (gap * 1000.0)}"
+                     f"（间隔小于两条路的时延差时，后发的那一发会先到）")
 
     def _prune(self, now):
         with self._lock:

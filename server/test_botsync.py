@@ -4240,22 +4240,22 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
         self.assertIsNotNone(self.bot_conn.body, "闯关房也该自己走")
 
     def test_it_keeps_pace_with_the_party(self):
-        """★ 「不能太慢拖进度、也不能太快甩太远」—— 由**目标点**保证。
+        """★ 「不能太慢拖进度、也不能太快甩太远」—— 由**活动带**保证（D114）。
 
-        ★ D103 起跟随点在带头的人**前面**（前界减一个身位），所以这里要多
-          走几帧才走得到 —— 走得到就说明「尽量往前」那条真的在推着它走。
+        判据就是用户的原话：走完之后 bot 要落在「带头真人的后 1/4 屏 ~
+        前 1/3 屏」这个范围里。**不是**落在某个固定点位附近。
         """
         self.install_terrain(synth_terrain("flat"))
         self.walk(self.alice, [(0.0, 150.0), (120.0, 150.0), (240.0, 150.0)])
         for _ in range(24):
             self.human_heartbeat(self.alice, 240.0, 150.0)
-        goal = bot._coop_goal(self.room, self.bot_conn, self.bot_seat,
-                              mapdata.load(self.room.map_name))
-        self.assertIsNotNone(goal)
-        self.assertLessEqual(abs(self.bot_conn.body.x - goal[0]),
-                             bot.BOT_COOP_BAND + 8.0,
-                             "跟随点 %.0f，bot 在 %.0f"
-                             % (goal[0], self.bot_conn.body.x))
+        lag = bot._coop_lag(self.room, self.bot_conn,
+                            mapdata.load(self.room.map_name))
+        self.assertIsNotNone(lag)
+        self.assertTrue(bot._coop_in_band(lag[0]),
+                        "该待在活动带里，实际落后 %.0f（带是 %.0f ~ %.0f）"
+                        % (lag[0], -bot.BOT_COOP_AHEAD_LIMIT,
+                           bot.BOT_COOP_LEASH))
 
     def test_without_a_leader_it_falls_back_to_the_old_replay(self):
         self.install_terrain(synth_terrain("flat"))
@@ -4322,33 +4322,67 @@ class BotCoopMovementTests(TerrainMixin, BotFrameRoom):
     # 屏幕到前方 1/3 屏幕这个范围内，超过就要尽快回去」+「即便已经在允许
     # 的范围内，也要尽量往前走，前面比后面好，不要总停在最后面的界限边缘」。
 
-    def test_the_follow_point_sits_ahead_of_the_leader(self):
-        """★ 跟随点在带头的人**前面** —— 「前面比后面好」。"""
+    def test_the_goal_is_the_leader_himself(self):
+        """★★★ 目标就是带头的人本人 —— **没有按名次排的固定点位**（D114）。
+
+        用户 2026-09-01：「我希望不要跟随固定点位，我原话说的是 bot 要在
+        带头真人的后 1/4 屏 ~ 前 1/3 屏范围内。」以前这里是
+        `他 + (前界 − 120 × 名次)`，于是 bot 超过自己那个点、又没到全局
+        前界的那一段会**掉头往回走** —— 走回它刚跳过去的岩浆坑。
+        """
         self.install_terrain(synth_terrain("coop_band",
                                            points={101: [(100, 40)]}))
         self.walk(self.alice, [(0.0, 150.0), (400.0, 150.0)])
         goal = bot._coop_goal(self.room, self.bot_conn, self.bot_seat,
                               mapdata.load(self.room.map_name))
-        self.assertIsNotNone(goal)
-        self.assertGreater(goal[0], 400.0,
-                           "跟随点该排在带头的人前面，实际 %.0f" % goal[0])
-        self.assertLessEqual(goal[0], 400.0 + bot.BOT_COOP_AHEAD_LIMIT,
-                             "但不许越过前界")
+        self.assertEqual((400.0, 150.0), goal)
 
-    def test_every_bot_lands_inside_the_band(self):
-        """★ 名次再靠后也不会被排到界外（跟随点是夹过的）。"""
-        self.install_terrain(synth_terrain("coop_band_all",
-                                           points={101: [(100, 40)]}))
+    def test_the_band_is_the_quarter_screen_behind_to_a_third_ahead(self):
+        """★ 活动带的两条边就是用户说的那两个数，名次一点都不参与。"""
+        self.assertTrue(bot._coop_in_band(0.0))
+        self.assertTrue(bot._coop_in_band(bot.BOT_COOP_LEASH))
+        self.assertTrue(bot._coop_in_band(-bot.BOT_COOP_AHEAD_LIMIT))
+        self.assertFalse(bot._coop_in_band(bot.BOT_COOP_LEASH + 1.0))
+        self.assertFalse(bot._coop_in_band(-bot.BOT_COOP_AHEAD_LIMIT - 1.0))
+
+    def test_inside_the_band_it_stops_adjusting(self):
+        """★★★ 「只要进入了这个范围内，bot 就没必要再继续调整身位」。
+
+        ★ 走位停住而已 —— 打怪 / 躲子弹排在 `_coop_intent()` 前面，照旧。
+        """
+        terrain = self.install_terrain(
+            synth_terrain("coop_inband", width=4000,
+                          points={101: [(100, 40)]}))
         self.walk(self.alice, [(0.0, 150.0), (400.0, 150.0)])
-        terrain = mapdata.load(self.room.map_name)
-        for rank in range(1, 7):
-            offset = bot.BOT_COOP_AHEAD_LIMIT - bot.BOT_FOLLOW_DISTANCE * rank
-            offset = max(-bot.BOT_COOP_LEASH,
-                         min(bot.BOT_COOP_AHEAD_LIMIT, offset))
-            self.assertGreaterEqual(offset, -bot.BOT_COOP_LEASH)
-            self.assertLessEqual(offset, bot.BOT_COOP_AHEAD_LIMIT)
-        goal = bot._coop_goal(self.room, self.bot_conn, self.bot_seat, terrain)
-        self.assertGreaterEqual(goal[0], 400.0 - bot.BOT_COOP_LEASH)
+        for lag in (0.0, bot.BOT_COOP_LEASH - 8.0,
+                    -bot.BOT_COOP_AHEAD_LIMIT + 8.0):
+            where = 400.0 - lag
+            self.bot_conn.battle_pos = (where, 150.0)
+            self.bot_conn.body = bot.botmove.Body(where, 150.0)
+            intent = bot._coop_intent(self.room, self.bot_conn, self.bot_seat,
+                                      terrain, None)
+            self.assertEqual((0, False, False, False), intent,
+                             "落后 %.0f 已经在带里，不该再挪（实际 %r）"
+                             % (lag, intent))
+
+    def test_ahead_of_the_band_it_never_walks_back(self):
+        """★★★ 超前出带 = 站住等。**往回走那一步经常就是走回刚跳过的坑。**"""
+        terrain = self.install_terrain(
+            synth_terrain("coop_overshoot", width=4000,
+                          points={101: [(100, 40)]}))
+        self.walk(self.alice, [(0.0, 150.0), (400.0, 150.0)])
+        # 只超前一点点：以前这一档正好落在「过了自己的跟随点、没到全局
+        # 前界」的窗口里，bot 会掉头。
+        for over in (bot.BOT_COOP_AHEAD_LIMIT + 8.0,
+                     bot.BOT_COOP_AHEAD_LIMIT + 400.0):
+            where = 400.0 + over
+            self.bot_conn.battle_pos = (where, 150.0)
+            self.bot_conn.body = bot.botmove.Body(where, 150.0)
+            intent = bot._coop_intent(self.room, self.bot_conn, self.bot_seat,
+                                      terrain, None)
+            self.assertEqual(0, intent[0],
+                             "超前 %.0f 该站住等，不该往回走（方向 %d）"
+                             % (over, intent[0]))
 
     def test_too_far_ahead_it_stops_and_waits(self):
         """★★ 冲过前界 = **停下来等**，不是往回走。"""
@@ -7855,6 +7889,123 @@ class BotGapJumpTests(TerrainMixin, BotFrameRoom):
         bot._walk_to(self.room, self.bot_conn, terrain, (405.0, 700.0), False)
         self.assertFalse(self.bot_conn.nav_double_jump)
 
+    # -- ★★★★ V0.3 §151：腾空途中不许把二段跳那面旗抹掉 ------------------
+
+    def test_clearing_navigation_in_mid_air_keeps_the_second_jump(self):
+        """★★★★ 飞在坑上方时被 `_clear_navigation()` 一抹，第二段就没了。
+
+        `_move_intent()` 里有一串**不看在不在空中**的早退分支都会调它
+        （躲子弹 / 打得到就站住 / 后撤 / 闯关那几条）。命中任何一条 ⇒
+        一段跳掉进岩浆。判据改成「在不在地上」这个事实。
+        """
+        terrain = self.gap_room("gap_midair_clear", 300)
+        self.walk_east(terrain)               # 起跳，挂上「这一段要补第二跳」
+        self.assertTrue(self.bot_conn.nav_double_jump)
+        who = chrprops.get(self.bot_conn.character_id)
+        self.bot_conn.body = botmove.tick(terrain, self.bot_conn.body, who,
+                                          direction=1, want_jump=True)
+        self.assertFalse(self.bot_conn.body.on_ground, "这会儿人该在天上")
+        bot._clear_navigation(self.bot_conn)
+        self.assertTrue(self.bot_conn.nav_double_jump,
+                        "腾空中路线可以作废，但这一段飞行欠的第二跳不能作废")
+
+    def test_clearing_navigation_on_the_ground_still_clears_it(self):
+        """★ 反过来：脚踩着地时照旧清 —— 那面旗说的是「正在进行的这一段」。"""
+        terrain = self.gap_room("gap_ground_clear", 300)
+        self.walk_east(terrain)
+        self.assertTrue(self.bot_conn.nav_double_jump)
+        self.assertTrue(self.bot_conn.body.on_ground)
+        bot._clear_navigation(self.bot_conn)
+        self.assertFalse(self.bot_conn.nav_double_jump)
+
+    def test_dodging_in_mid_air_does_not_eat_the_second_jump(self):
+        """★★★★ 端到端：飞越坑的途中触发躲子弹，第二段照样补得上。"""
+        terrain = self.gap_room("gap_dodge_midair", 300)
+        tick = self.loop().done
+        # 先按兜底那条真起跳（旗子跟着挂上）。
+        self.bot_conn.intent = self.walk_east(terrain)
+        self.assertTrue(self.bot_conn.nav_double_jump)
+        bot._own_step(self.room, self.bot_conn, self.bot_seat, terrain,
+                      self.now(), tick)
+        self.assertFalse(self.bot_conn.body.on_ground, "这一格该离地了")
+        # 人已经在天上了，这时候装一张「一定会躲」的桩 —— 它会让
+        # `_move_intent()` 每一格都早退，`_walk_to()` 再也轮不到。
+        original = bot._dodge_intent
+        bot._dodge_intent = lambda *_a, **_k: (1, False, False, False)
+        self.addCleanup(setattr, bot, "_dodge_intent", original)
+        for step in range(1, 40):
+            bot._decide(self.room, self.bot_conn, self.bot_seat, terrain,
+                        self.now(), tick + step)
+            bot._own_step(self.room, self.bot_conn, self.bot_seat, terrain,
+                          self.now(), tick + step)
+            if self.bot_conn.body.on_ground:
+                break
+        self.assertTrue(self.bot_conn.body.air_jumped,
+                        "一路被「躲子弹」打断，第二段跳还是得按下去")
+
+    # -- ★★★★ V0.3 §152：卡在塞不进去的缝里要自己出来 --------------------
+
+    def crack_room(self, key="crack"):
+        """左边一片开阔平地，右边一条 6 像素宽的深缝（缝底有地面）。"""
+        width, height, floor, lip = 1200, 800, 700, 560
+        rows = []
+        for y in range(height):
+            if y >= floor:
+                rows.append("2" * width)
+            elif y >= lip:
+                rows.append("0" * 800 + "2" * 100 + "0" * 6
+                            + "2" * (width - 906))
+            else:
+                rows.append("0" * width)
+        terrain = mapdata.MapTerrain(make_record(rows, name=key))
+        return self.install_terrain(terrain)
+
+    def test_a_bot_wedged_in_a_crack_walks_out(self):
+        """★★★★★ 实机 `Iceria03` (1174, 864)：两个 bot 先后卡在同一个像素上，
+        一个 **58.9 秒**、一个 **13.0 秒**。对战模式一条脱困都没有。"""
+        terrain = self.crack_room("crack_out")
+        who = chrprops.get(self.bot_conn.character_id)
+        self.place_bot(903.0, 700.0)          # 缝底
+        self.assertFalse(botmove.fits(terrain, 903.0, 700.0, who),
+                         "这条缝该是塞不进去的（前提没了测试就不成立）")
+        intent = bot._unstick_intent(self.room, self.bot_conn, terrain)
+        self.assertIsNotNone(intent, "卡住了就该有脱困动作")
+        self.assertNotEqual((0, False, False, False), intent,
+                            "站着不动不是脱困")
+
+    def test_it_outranks_everything_else(self):
+        """★★★ 塞不进去的时候躲子弹 / 打怪都无从谈起 —— 先出去。"""
+        terrain = self.crack_room("crack_first")
+        self.place_bot(903.0, 700.0)
+        # ★ 桩故意选一个脱困**造不出来**的组合（按 ↓ + 冲刺），
+        #   免得两边碰巧撞成同一个元组，断言变成永真。
+        dodge = (0, False, True, True)
+        original = bot._dodge_intent
+        bot._dodge_intent = lambda *_a, **_k: dodge
+        self.addCleanup(setattr, bot, "_dodge_intent", original)
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  terrain, None)
+        self.assertNotEqual(dodge, intent, "脱困该排在躲子弹前面")
+
+    def test_it_costs_nothing_when_not_stuck(self):
+        """★ 没卡住时它只花一次 `fits()`，直接返回 `None`。"""
+        terrain = self.crack_room("crack_free")
+        self.place_bot(400.0, 700.0)
+        self.assertIsNone(bot._unstick_intent(self.room, self.bot_conn,
+                                              terrain))
+
+    def test_it_does_not_walk_into_a_crack(self):
+        """★★★ 主动往缝里蹭也要挡掉 —— 站住比卡住好。"""
+        terrain = self.crack_room("crack_avoid")
+        who = chrprops.get(self.bot_conn.character_id)
+        self.place_bot(898.0, 700.0)          # 缝口左边，再走一步就掉进去
+        step = botmove.tick(terrain, self.bot_conn.body, who, direction=1)
+        self.assertFalse(botmove.fits(terrain, step.x, step.y, who),
+                         "下一步该正好落在缝里（前提没了测试就不成立）")
+        intent = bot._walk_to(self.room, self.bot_conn, terrain,
+                              (1100.0, 700.0), False)
+        self.assertEqual(0, intent[0], "不该往缝里走")
+
 
 class BotFallDownTests(TerrainMixin, BotFrameRoom):
     """★★★ **掉出地图下边界 = 死**（§143）—— `map.ini` 的 `FallDown`。
@@ -8140,6 +8291,68 @@ class HeartbeatCadenceTests(BotFrameRoom):
         self.assertEqual([], self.beats_only())
 
 
+class CatchUpHeartbeatTests(BotFrameRoom):
+    """★★★★★ 追赶时**不刷位置心跳**（V0.3 §153 / D115）。
+
+    房间循环落后时会把欠的格一口气补完 —— 这是对的（弹体一格都不许跳，
+    §147）。可要是每 4 格照发一发心跳，落后 38 格就是 9 发心跳挤在几毫秒里，
+    而在落后的那一秒多里一发都没有。收方在静默期一直拿最后那份按键掩码替
+    bot 走（最高 ~690 px/s），恢复时被一把拽回去 = 用户看到的「bot 瞬移
+    一段距离」。原版客户端卡了一秒之后也只发**一发**位置包。
+    """
+
+    def beats_only(self):
+        return [f for f in bot_frames(self.alice, self.bot_seat)
+                if udpsync.is_heartbeat(f)]
+
+    def test_a_catch_up_burst_reports_the_position_once(self):
+        self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+        self.clear()
+        ticks = gameserver.HEARTBEAT_TICKS * 3
+        self.assertEqual(ticks, self.loop().advance(ticks, burst=True))
+        self.assertEqual(1, len(self.beats_only()),
+                         "12 格一口气补完 —— 只该在追平的那一格报一次位置")
+
+    def test_the_same_ticks_at_normal_pace_report_three_times(self):
+        """★ 对照组：同样 12 格，正常节奏下照旧 3 发（相位一个字没变）。"""
+        self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+        self.clear()
+        self.advance(gameserver.HEARTBEAT_TICKS * 3)
+        self.assertEqual(3, len(self.beats_only()))
+
+    def test_a_burst_that_swallowed_no_beat_owes_nothing(self):
+        """★ 追赶只跨了一两格、没吞掉任何一发时，不该凭空多补一发。"""
+        self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+        self.advance(gameserver.HEARTBEAT_TICKS)   # 相位对齐到刚发完
+        self.clear()
+        self.loop().advance(2, burst=True)
+        self.assertEqual([], self.beats_only())
+
+    def test_the_burst_only_holds_back_the_position(self):
+        """★★★ 追赶押后的**只有位置**：物理照跑、事件包一发不少（§147）。
+
+        对照的办法是跑两遍同样的格数 —— 一遍追赶、一遍正常节奏 ——
+        然后比走到哪、以及发了几发**非心跳**的包。
+        """
+        ticks = gameserver.HEARTBEAT_TICKS * 4
+
+        def run(burst):
+            self.setUp()
+            self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+            self.clear()
+            self.loop().advance(ticks, burst=burst)
+            frames = bot_frames(self.alice, self.bot_seat)
+            return (self.room.seats[self.bot_seat].conn.battle_pos,
+                    len([f for f in frames if not udpsync.is_heartbeat(f)]))
+
+        burst_pos, burst_events = run(True)
+        normal_pos, normal_events = run(False)
+        self.assertEqual(normal_pos, burst_pos,
+                         "追赶不许改变物理 —— 欠的格是一格一格补完的")
+        self.assertEqual(normal_events, burst_events,
+                         "事件包是句柄账本，追赶途中一发都不许省")
+
+
 class ReceiverLedgerTests(BotFireRoom):
     """★★★★ **收方账本重放对账**：把 bot 发出去的那串包按收方的规矩重放一遍，
     看每一发 `rpExplode` 指的弹体在收方那边是不是真的存在（§42 / §147）。
@@ -8299,9 +8512,9 @@ class RoomLoopLifecycleTests(BotFrameRoom):
         ran = []
         original = bot.tick_room
 
-        def counted(room, tick, now):
+        def counted(room, tick, now, behind=0):
             ran.append(tick)
-            return original(room, tick, now)
+            return original(room, tick, now, behind)
 
         bot.tick_room = counted
         gameserver.BOT_ROOM_TICK = counted

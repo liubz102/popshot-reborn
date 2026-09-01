@@ -560,5 +560,341 @@ class RealMapTests(unittest.TestCase):
         self.assertTrue(landed.on_ground)
 
 
+class BottomlessLookaheadTests(unittest.TestCase):
+    """★★★★★ 前瞻要覆盖**这份意图的寿命**（V0.3 §151）。
+
+    `drop_below()` 只推一格，而崖边「下一步就踩空」的窗口只有一个走步宽。
+    意图是 `BOT_DECISION_TICKS` 格产出一次的 —— 只问一格的话，接近位置的
+    相位一变就整个跳过那个窗口，人一步走出崖边，等下一次决策时已经在往下掉。
+    """
+
+    def cliff(self, width=200, floor=20, height=40, edge=100):
+        """`edge` 右边整条没有地面 —— 一个真正的无底洞。"""
+        rows = []
+        for y in range(height):
+            if y < floor:
+                rows.append("0" * width)
+            else:
+                rows.append("2" * edge + "0" * (width - edge))
+        return terrain_from(rows)
+
+    def test_one_tick_of_lookahead_misses_the_edge(self):
+        """★ 病灶本身：站在离崖边一步以外时，只问一格的判据是**假**的。"""
+        terrain = self.cliff()
+        who = Dummy(7.0)
+        far = botmove.Body(float(100 - 9), 20.0, on_ground=True)
+        self.assertFalse(
+            botmove.bottomless_ahead(terrain, far, who, 1, ticks=1),
+            "离崖边 9、走速 7 —— 下一步还踩得着地，一格前瞻当然看不见坑")
+
+    def test_lookahead_that_covers_the_intent_sees_it(self):
+        """★★★ 同一个位置，前瞻覆盖两格就看见了。"""
+        terrain = self.cliff()
+        who = Dummy(7.0)
+        far = botmove.Body(float(100 - 9), 20.0, on_ground=True)
+        self.assertTrue(
+            botmove.bottomless_ahead(terrain, far, who, 1, ticks=2),
+            "两步之后就踩空了，这份意图要握两格 —— 必须现在就知道")
+
+    def test_a_step_down_is_not_a_pit(self):
+        """★ 「掉得到底」的台阶不算坑 —— 真人从一米高的台阶走下去很正常。"""
+        rows = []
+        for y in range(40):
+            if y < 20:
+                rows.append("0" * 200)
+            elif y < 30:
+                rows.append("2" * 100 + "0" * 100)
+            else:
+                rows.append("2" * 200)
+        terrain = terrain_from(rows)
+        who = Dummy(7.0)
+        body = botmove.Body(95.0, 20.0, on_ground=True)
+        self.assertFalse(botmove.bottomless_ahead(terrain, body, who, 1,
+                                                  ticks=4))
+
+    def test_a_wall_is_not_a_pit(self):
+        """★ 撞墙时**不**报坑：原地不动就不会走出去，再往后推也是原地。"""
+        # 右边是一堵**爬不上去**的高墙（比 `speed × CLIMB_SLOPE` = 14 高得多），
+        # 墙脚外面是无底洞 —— 撞墙和坑同时成立时，报的必须是撞墙。
+        rows = []
+        for y in range(40):
+            if y < 3:
+                rows.append("0" * 200)
+            elif y < 20:
+                rows.append("0" * 100 + "2" * 100)
+            else:
+                rows.append("2" * 100 + "0" * 100)
+        terrain = terrain_from(rows)
+        who = Dummy(7.0)
+        body = botmove.Body(96.0, 20.0, on_ground=True)
+        self.assertTrue(botmove.blocked(terrain, body, who, 1))
+        self.assertFalse(botmove.bottomless_ahead(terrain, body, who, 1,
+                                                  ticks=4))
+
+    def test_standing_still_is_never_a_pit(self):
+        terrain = self.cliff()
+        self.assertFalse(botmove.bottomless_ahead(terrain,
+                                                  botmove.Body(99.0, 20.0,
+                                                               on_ground=True),
+                                                  Dummy(7.0), 0, ticks=4))
+
+
+class RealPitCrossingTests(unittest.TestCase):
+    """★★★★★ 真图上的跨坑成功率（V0.3 §151）—— 这一条钉的是**那个数**。
+
+    `Quest02_1#Normal`（岩浆巨龙 普通）两个无底洞，逐格跑真物理：
+    走速 / 冲刺 × 决策相位 0 / 1 × 190 个接近位置。
+
+    | 前瞻 | 掉坑率 |
+    |---|---|
+    | 1 格（改之前） | **50.0%** |
+    | 2 格（= `BOT_DECISION_TICKS`） | **0.1%** |
+
+    ★ 变异验证就在同一个用例里：`horizon=1` 那一档必须**还是**掉一半，
+      否则说明这个用例根本没测到那条路。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.terrain = mapdata.load("Quest02_1", "Normal")
+        if cls.terrain is None:
+            raise unittest.SkipTest("没有 Quest02_1 的地形产物")
+        cls.who = chrprops.get(0)
+        cls.pits = cls.find_pits(cls.terrain)
+        if not cls.pits:
+            raise unittest.SkipTest("这张图上没找到无底洞")
+
+    @staticmethod
+    def find_pits(terrain, least=40):
+        """连续没有任何站立面的那几段列 = 无底洞。"""
+        pits = []
+        x = 1
+        while x < terrain.width:
+            if not terrain.surfaces(x) and terrain.surfaces(x - 1):
+                start = x
+                while x < terrain.width and not terrain.surfaces(x):
+                    x += 1
+                if x < terrain.width and x - start >= least:
+                    pits.append((start, x))
+            x += 1
+        return pits
+
+    def cross(self, start_x, phase, fast_run, horizon, goal, limit=600):
+        """照 `bot._walk_to()` 那条兜底跑一遍，返回 `'过去了' / '掉坑' / '停住'`。
+
+        决策每 `BOT_DECISION_TICKS`（2）格一次、相位由 `phase` 定 —— 这正是
+        `bot._decide()` 的节奏（座位号决定相位）。物理每格都推。
+        """
+        terrain, who = self.terrain, self.who
+        surfaces = terrain.surfaces(start_x)
+        if not surfaces:
+            return None
+        body = botmove.Body(float(start_x), float(surfaces[0]), on_ground=True)
+        intent = (1, False, False, fast_run)
+        double = False
+        for tick in range(limit):
+            if (tick % 2) == phase:
+                if body.on_ground:
+                    double = False
+                    if botmove.bottomless_ahead(terrain, body, who, 1,
+                                                fast_run=fast_run,
+                                                ticks=horizon):
+                        landing = botmove.jump_lands(terrain, body, who, 1,
+                                                     fast_run=fast_run)
+                        if landing is not None:
+                            intent = (1, True, False, fast_run)
+                        else:
+                            landing = botmove.double_jump_lands(
+                                terrain, body, who, 1, fast_run=fast_run)
+                            if landing is None:
+                                return "停住"
+                            double = True
+                            intent = (1, True, False, fast_run)
+                    else:
+                        intent = (1, False, False, fast_run)
+                else:
+                    intent = (1, double and botmove.at_apex(body), False,
+                              fast_run)
+            direction, jump, drop, fast = intent
+            body = botmove.tick(terrain, body, who, direction=direction,
+                                fast_run=fast, want_jump=jump)
+            if jump and not body.on_ground:
+                intent = (direction, False, drop, fast)
+            if body.y >= terrain.height - 1:
+                return "掉坑"
+            if body.on_ground and body.x > goal:
+                return "过去了"
+        return "超时"
+
+    def sweep(self, horizon):
+        tally = {}
+        for start, end in self.pits:
+            for fast_run in (False, True):
+                for phase in (0, 1):
+                    for offset in range(10, 200):
+                        got = self.cross(start - offset, phase, fast_run,
+                                         horizon, end + 40)
+                        if got is not None:
+                            tally[got] = tally.get(got, 0) + 1
+        return tally
+
+    @staticmethod
+    def rate(tally, key):
+        total = sum(tally.values())
+        return 0.0 if not total else 100.0 * tally.get(key, 0) / total
+
+    def test_one_tick_of_lookahead_falls_in_half_the_time(self):
+        """★★ 变异验证：把前瞻改回一格，掉坑率必须**回到一半左右**。"""
+        tally = self.sweep(horizon=1)
+        self.assertGreater(self.rate(tally, "掉坑"), 40.0,
+                           "一格前瞻本来就该掉一半，实际 %r" % (tally,))
+
+    def test_lookahead_of_one_decision_period_crosses_the_pits(self):
+        """★★★★★ 前瞻 = 意图的寿命 ⇒ 基本不再掉进去。"""
+        import bot                                             # noqa: PLC0415
+        tally = self.sweep(horizon=bot.BOT_DECISION_TICKS)
+        self.assertLessEqual(self.rate(tally, "掉坑"), 1.0,
+                             "掉坑率该 ≤1%%，实际 %r" % (tally,))
+        self.assertGreater(self.rate(tally, "过去了"), 90.0,
+                           "绝大多数接近位置都该跨过去，实际 %r" % (tally,))
+
+
+class SlowedPredictionTests(unittest.TestCase):
+    """★★★ 预测要和**执行**用同一个 `speed_scale`（V0.3 §151）。
+
+    被冻住（倍率 0.0）/ 踩了减速胶水（0.3）的 bot 起跳带走的是**那一刻的
+    走速**（§93）。预测不带这一档的话算出来的是一条满速弧线，而真跑出来的
+    是原地竖直跳 —— 于是「算着跳得过去」，实际一头栽进坑里。
+    """
+
+    def setUp(self):
+        self.terrain = flat(width=400, floor=20, height=48)
+        self.who = Dummy(7.0)
+
+    def landing_of(self, scale):
+        body = botmove.Body(100.0, 20.0, on_ground=True)
+        return botmove.jump_lands(self.terrain, body, self.who, 1,
+                                  speed_scale=scale)
+
+    def test_the_prediction_matches_what_actually_runs(self):
+        for scale in (1.0, 0.3, 0.0):
+            predicted = self.landing_of(scale)
+            body = botmove.Body(100.0, 20.0, on_ground=True)
+            body = botmove.tick(self.terrain, body, self.who, direction=1,
+                                want_jump=True, speed_scale=scale)
+            for _ in range(80):
+                if body.on_ground:
+                    break
+                body = botmove.tick(self.terrain, body, self.who, direction=1,
+                                    speed_scale=scale)
+            self.assertIsNotNone(predicted, "倍率 %.1f 该落得住" % scale)
+            self.assertAlmostEqual(predicted.x, body.x, places=6,
+                                   msg="倍率 %.1f 的预测落点和真跑的对不上"
+                                       % scale)
+
+    def test_frozen_jumps_straight_up(self):
+        """★ 冻住时倍率是 0 —— 跳起来是**竖直**的，一步都不往前。"""
+        self.assertAlmostEqual(100.0, self.landing_of(0.0).x, places=6)
+        self.assertGreater(self.landing_of(1.0).x, 100.0)
+
+    def test_double_jump_takes_the_scale_too(self):
+        far = self.landing_of(1.0)
+        body = botmove.Body(100.0, 20.0, on_ground=True)
+        frozen = botmove.double_jump_lands(self.terrain, body, self.who, 1,
+                                           speed_scale=0.0)
+        self.assertIsNotNone(frozen)
+        self.assertAlmostEqual(100.0, frozen.x, places=6)
+        self.assertGreater(far.x, frozen.x)
+
+
+class FitsTests(unittest.TestCase):
+    """★★★★ 「碰撞体塞不塞得下」（V0.3 §152）—— 窄缝陷阱的判据。"""
+
+    def slot(self, gap):
+        """两堵墙中间留 `gap` 像素宽的一条缝，缝底有地面。"""
+        width, height, floor = 120, 60, 40
+        rows = []
+        for y in range(height):
+            if y >= floor:
+                rows.append("2" * width)
+            elif y >= 10:
+                left = 60 - gap // 2
+                rows.append("2" * left + "0" * gap + "2" * (width - left - gap))
+            else:
+                rows.append("0" * width)
+        return terrain_from(rows)
+
+    def test_a_hairline_crack_does_not_fit(self):
+        who = chrprops.get(0)
+        self.assertFalse(botmove.fits(self.slot(6), 60, 40, who))
+
+    def test_a_wide_corridor_fits(self):
+        who = chrprops.get(0)
+        self.assertTrue(botmove.fits(self.slot(60), 60, 40, who))
+
+    def test_standing_against_a_wall_is_legal(self):
+        """★★ 贴着墙站是合法的 —— 一侧的富余补得上另一侧的不足。"""
+        who = chrprops.get(0)
+        width, height, floor = 200, 60, 40
+        rows = []
+        for y in range(height):
+            if y >= floor:
+                rows.append("2" * width)
+            elif y >= 5:
+                rows.append("2" * 40 + "0" * (width - 40))
+            else:
+                rows.append("0" * width)
+        terrain = terrain_from(rows)
+        self.assertTrue(botmove.fits(terrain, 41, 40, who),
+                        "左边紧贴墙、右边一片开阔 —— 人站得住")
+
+    def test_open_ground_fits(self):
+        self.assertTrue(botmove.fits(flat(width=200, floor=20, height=40),
+                                     100, 20, chrprops.get(0)))
+
+    def test_no_terrain_always_fits(self):
+        self.assertTrue(botmove.fits(None, 0, 0, chrprops.get(0)))
+
+
+class RealTrapNodeTests(unittest.TestCase):
+    """★★★★★ `Iceria03` 上那几个**只进不出**的陷阱点（V0.3 §152）。
+
+    用户 2026-09-01 实机（`Iceria03:NewPvp`，00:19 那一局）：座位 2 在
+    (1174, 864) 杵了 **58.9 秒**，紧接着座位 3 在**同一个像素**上杵了
+    **13.0 秒**（从 `logs/game_003_27799.txt` 的心跳坐标反解出来的）。
+    那里是一条 6 像素宽的斜裂缝，而角色身圆直径 26。
+    """
+
+    #: 全图正/反向可达差集跑出来的 8 个只进不出的点（净空 1~7 像素）。
+    TRAPS = ((1174, 864), (1176, 867), (686, 1038), (694, 1050),
+             (1246, 1105), (1174, 1112), (1176, 1116), (696, 1548))
+
+    @classmethod
+    def setUpClass(cls):
+        cls.terrain = mapdata.load("Iceria03")
+        if cls.terrain is None:
+            raise unittest.SkipTest("没有 Iceria03 的地形产物")
+        cls.who = chrprops.get(0)
+
+    def test_every_known_trap_is_rejected(self):
+        for x, y in self.TRAPS:
+            self.assertFalse(botmove.fits(self.terrain, x, y, self.who),
+                             "(%d, %d) 是缝，碰撞体塞不进去" % (x, y))
+
+    def test_it_does_not_reject_the_whole_map(self):
+        """★ 误伤面要小：绝大多数落脚点照旧可用（实测这张图 5.8% 被拒）。"""
+        good = bad = 0
+        for x in range(2, self.terrain.width - 2, 8):
+            for y in self.terrain.surfaces(x):
+                if botmove.fits(self.terrain, x, y, self.who):
+                    good += 1
+                else:
+                    bad += 1
+        total = good + bad
+        self.assertGreater(total, 200, "采样太少，这个断言没意义")
+        self.assertLess(100.0 * bad / total, 15.0,
+                        "拒掉 %d/%d 个落脚点，过滤面太大了" % (bad, total))
+
+
 if __name__ == "__main__":
     unittest.main()

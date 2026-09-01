@@ -382,6 +382,10 @@ class BotConn(gameserver.Conn):
         #: 真人是**按住**的，所以原版没有这个问题。
         #: ⇒ 这一组里按过就锁住，发心跳时报出去、报完清掉。
         self.down_latch = False
+        #: ★★ **欠着一发位置心跳**（D115）。房间循环追赶时那几格不报位置
+        #: （报了就是一串挤在几毫秒里，收方看着像瞬移）；被跳过的那一发记在
+        #: 这里，追平的那一格一起还。★ 不追赶时心跳的相位一个字没变。
+        self.beat_pending = False
         #: ★ M5-B 的逐帧路径执行状态。`botnav.plan()` 返回落脚点边；这里保留
         #: 尚未走完的那一串，目标/地图/身体事实变化时再重算，不按挂钟重算。
         self.nav_path = []
@@ -655,6 +659,7 @@ class BotConn(gameserver.Conn):
         self.leash_anchor = None
         self.move_down = False
         self.down_latch = False
+        self.beat_pending = False
         self.trail_mark = None
         self.trail_heading = 0
         self.load_progress = None
@@ -3996,12 +4001,24 @@ def _retreat_spot(room, machine, terrain, enemy):
 
 
 def _clear_navigation(machine, failed=None):
-    """清掉逐帧路线；`failed` 可记一份“同一事实下别立刻重算”的签名。"""
+    """清掉逐帧路线；`failed` 可记一份“同一事实下别立刻重算”的签名。
+
+    ## ★★★ 腾空时**不动**二段跳那面旗（V0.3 §151）
+
+    「这一段飞行还欠第二跳」说的是**正在进行的这一段抛物线**，不是路线。
+    而 `_move_intent()` 里有一串早退分支（躲子弹 / 打得到就站住 / 后撤 /
+    闯关那几条）都会调到这里，它们**都不看在不在空中** —— bot 飞在岩浆
+    上方时只要命中任何一条，第二段就永远补不上，一段跳掉进去。
+    ⇒ 判据是**在不在地上**这个事实：脚一沾地 `_walk_to()` 那句就把它清了，
+      根本轮不到这里。
+    """
     machine.nav_path = []
     machine.nav_goal = None
     machine.nav_started = False
     machine.nav_failed = failed
-    machine.nav_double_jump = False
+    body = machine.body
+    if body is None or body.on_ground:
+        machine.nav_double_jump = False
     # ★ 在算的那张单子也作废：目标已经不作数了，算回来也用不上（§137）。
     botplan.forget(machine)
 
@@ -4220,6 +4237,12 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     body = machine.body
     if body is None or terrain is None:
         return (0, False, False, False)
+    # ★★★★ **卡在缝里排在一切之前**（V0.3 §152）：塞不进去的时候躲子弹、
+    #   打怪、跟队伍全都无从谈起 —— 人根本挪不动。先出去再说。
+    #   没卡住时它只花一次 `fits()`（15 µs），等于没开销。
+    stuck = _unstick_intent(room, machine, terrain)
+    if stuck is not None:
+        return stuck
     coop = room.team_layout() == lobby_module.TEAM_LAYOUT_COOP
     # ★★★★ **牵引绳排在最前面**（D99）：闯关时落后带头的真人超过 1/4 个
     #   屏幕就无条件追，连躲子弹都往后排 —— 掉队的那一个会把整队的扇区
@@ -4353,6 +4376,12 @@ def _walk_to(room, machine, terrain, spot, fast_run):
     delta_x = spot[0] - body.x
     direction = 0 if abs(delta_x) < 1.0 else (1 if delta_x > 0 else -1)
     who = _character_of(machine)
+    # ★★ 预测要和**执行**用同一组参数（V0.3 §151）：`_own_step()` 真跑这一格
+    #    时带的就是这两个，而这里以前一个都不带 —— 被冻住（倍率 0.0）或者
+    #    踩了减速胶水（0.3）的 bot 会按满速算出「跳得过去」，然后原地竖直
+    #    跳进坑里。起跳带走的是**这一刻的走速**（§93），差一档就差整条弧线。
+    crouched = bool(machine.dodge_crouch)
+    scale = _speed_scale(machine, _now())
     if not body.on_ground:
         # ★★ 腾空时方向键**改不了**水平速度（§93 推翻了 §71 的那一行）——
         #   这里照样返回方向，只是为了这一批 tick 里**落地之后**那几个 tick
@@ -4379,9 +4408,18 @@ def _walk_to(room, machine, terrain, spot, fast_run):
         if routed is not None:
             return routed
 
-    blocked = botmove.blocked(terrain, body, who, direction)
-    bottomless = (direction != 0
-                  and botmove.drop_below(terrain, body, who, direction) is None)
+    blocked = botmove.blocked(terrain, body, who, direction, fast_run=fast_run,
+                              crouched=crouched, speed_scale=scale)
+    # ★★★ 前瞻要覆盖**这份意图的寿命**（V0.3 §151）：意图是 `_decide()`
+    #   `BOT_DECISION_TICKS` 格产出一次的，产出之后要握着用那么久；而崖边
+    #   「下一步就踩空」的窗口在真图上只有一个走步宽（`Quest02_1#Normal`
+    #   实测 8~11 像素）。只问一格的话约一半的接近位置整个跳过这个窗口 ——
+    #   实测掉坑率 50%，改成按寿命前瞻之后 0.1%。
+    #   ★ 决策频率一个字没动（§146 里用户明确否掉过「就地重问」），
+    #     改的是**看多远**。
+    bottomless = botmove.bottomless_ahead(
+        terrain, body, who, direction, fast_run=fast_run, crouched=crouched,
+        speed_scale=scale, ticks=BOT_DECISION_TICKS)
     vertical = abs(spot[1] - body.y) > botnav.GOAL_Y
     if blocked or bottomless or vertical:
         routed = _route_intent(machine, terrain, who, spot)
@@ -4402,11 +4440,12 @@ def _walk_to(room, machine, terrain, spot, fast_run):
         #   「到不了」的时候走的就是这里，而它以前只会一段跳。
         # ★ 两次模拟都带上 `fast_run`：起跳带走的是**那一刻的走速**（§93），
         #   冲刺着跳比走着跳远得多，不带的话预测的落点根本不是真落点。
-        if botmove.jump_lands(terrain, body, who, direction,
-                              fast_run=fast_run) is not None:
+        if _landing_ok(terrain, _jump_lands(terrain, body, who, direction,
+                                            fast_run, crouched, scale), who):
             return (direction, True, False, fast_run)
-        if botmove.double_jump_lands(terrain, body, who, direction,
-                                     fast_run=fast_run) is not None:
+        if _landing_ok(terrain,
+                       _double_jump_lands(terrain, body, who, direction,
+                                          fast_run, crouched, scale), who):
             machine.nav_double_jump = True
             return (direction, True, False, fast_run)
         return (0, False, False, False)
@@ -4418,16 +4457,122 @@ def _walk_to(room, machine, terrain, spot, fast_run):
         # ⇒ 先问一句「这一跳落得住吗、落了之后是不是真的更高」：落不住
         #   （掉出图外 / 掉进坑）或者白跳，就**接着走** —— 走到坎底下再蹦，
         #   走到坑边上会有 `bottomless` 那两条接手。
-        landing = botmove.jump_lands(terrain, body, who, direction,
-                                     fast_run=fast_run)
-        if landing is not None and landing.y < body.y - 1.0:
+        landing = _jump_lands(terrain, body, who, direction,
+                              fast_run, crouched, scale)
+        if _landing_ok(terrain, landing, who) and landing.y < body.y - 1.0:
             return (direction, True, False, fast_run)
+        # ★★ 一段够不着就问二段（V0.3 §151）—— `bottomless` 那条从 §144
+        #    起就有这一句，`vertical` 这条一直漏着：目标平台高过一段跳的
+        #    顶点（167）而 A\* 又还没算完时，bot 只会在下面一段跳，上不去。
+        landing = _double_jump_lands(terrain, body, who, direction,
+                                     fast_run, crouched, scale)
+        if _landing_ok(terrain, landing, who) and landing.y < body.y - 1.0:
+            machine.nav_double_jump = True
+            return (direction, True, False, fast_run)
+    if direction and _walks_into_a_crack(terrain, body, who, direction,
+                                         fast_run, crouched, scale):
+        # ★ 前面那一步碰撞体塞不进去（V0.3 §152）—— 别往里蹭。站住比卡住好。
+        return (0, False, False, fast_run)
     return (direction, False, False, fast_run)
 
 
-#: 闯关时「已经跟上队伍了」的判据 —— 和 A\* 的路点分辨率同一个尺度。
-#: 到了这个范围里就站住打怪，而不是原地和跟随点较劲。
-BOT_COOP_BAND = botnav.GOAL_X
+def _jump_lands(terrain, body, who, direction, fast_run, crouched, scale):
+    """`botmove.jump_lands()` 的短名字版 —— 参数照 `_own_step()` 那一组带全。"""
+    return botmove.jump_lands(terrain, body, who, direction,
+                              fast_run=fast_run, crouched=crouched,
+                              speed_scale=scale)
+
+
+def _double_jump_lands(terrain, body, who, direction, fast_run, crouched,
+                       scale):
+    """同上，二段跳那一份。"""
+    return botmove.double_jump_lands(terrain, body, who, direction,
+                                     fast_run=fast_run, crouched=crouched,
+                                     speed_scale=scale)
+
+
+def _landing_ok(terrain, landing, who):
+    """这个落点**落得住**、而且碰撞体**塞得下**（V0.3 §152）。
+
+    以前只问前半句。后半句是 `Iceria03` (1174, 864) 那条 6 像素宽的冰缝
+    教的：落点在缝里，服务端的点模型觉得没问题，客户端的三个碰撞圆把人
+    卡死在缝口 —— 实机里两个 bot 先后卡在同一个像素上，一个 59 秒一个 13 秒。
+    """
+    return (landing is not None
+            and botmove.fits(terrain, landing.x, landing.y, who))
+
+
+def _walks_into_a_crack(terrain, body, who, direction, fast_run, crouched,
+                        scale):
+    """照这个方向走一步，会不会踩进一条**塞不进去**的缝（V0.3 §152）。"""
+    step = botmove.tick(terrain, body, who, direction=direction,
+                        fast_run=fast_run, crouched=crouched,
+                        speed_scale=scale)
+    if not step.on_ground or step.x == body.x:
+        return False                   # 踩空/撞墙自有上面那两条判据管
+    return not botmove.fits(terrain, step.x, step.y, who)
+
+
+def _unstick_intent(room, machine, terrain):
+    """★★★ 已经卡在塞不进去的地方了 —— 往外挪（V0.3 §152）；没卡返回 `None`。
+
+    ## 为什么要有这一条
+
+    `_landing_ok()` 只挡「主动往里跳」。被手雷炸飞、被击退、A\\* 缓存还是
+    旧的 —— 人照样可能落进缝里。而**对战模式一条脱困都没有**：
+    `_coop_leash_intent()` 那套被 `if coop` 挡在闯关模式里，量的还是
+    「推进进度」；`Iceria` 也不在 `FallDown` 名单里，掉进去既不判死也没人捞。
+    实机里那两个 bot 就这么杵了 59 秒和 13 秒。
+
+    ★ 判据是**几何事实**（碰撞体塞不塞得下），不是「多久没动」这种计时器
+      （铁律 10）。没卡住的时候只花一次 `fits()`（实测 15 µs）。
+
+    出去的路按**真跑一遍**挑，和别处一个口径：先看走得出去吗，走不出去
+    就问跳，两段都试；实在没辙就朝净空宽的那一侧跳一下，总比杵着强。
+    """
+    body = machine.body
+    if body is None or terrain is None or not body.on_ground:
+        return None
+    who = _character_of(machine)
+    if botmove.fits(terrain, body.x, body.y, who):
+        return None
+    # 路线是照着「点模型」算出来的，而这会儿已经证明那套模型在这儿不成立。
+    # ★ 排在挂旗子前面：`_clear_navigation()` 踩地时会把 `nav_double_jump` 清掉。
+    _clear_navigation(machine)
+    for direction in _unstick_directions(terrain, body, who):
+        # 走：一条边的长度（`botnav.WALK_TICKS`）之内能走到塞得下的地方吗。
+        step = body
+        for _ in range(botnav.WALK_TICKS):
+            step = botmove.tick(terrain, step, who, direction=direction)
+            if not step.on_ground or step.x == body.x:
+                break
+            if botmove.fits(terrain, step.x, step.y, who):
+                return (direction, False, False, False)
+    for direction in _unstick_directions(terrain, body, who):
+        if _landing_ok(terrain, botmove.jump_lands(terrain, body, who,
+                                                   direction), who):
+            return (direction, True, False, False)
+        if _landing_ok(terrain, botmove.double_jump_lands(terrain, body, who,
+                                                          direction), who):
+            machine.nav_double_jump = True
+            return (direction, True, False, False)
+    # 都不成：朝宽的那一侧跳。缝里跳一下至少能换个落点，杵着永远不会变。
+    return (next(iter(_unstick_directions(terrain, body, who)), 1),
+            True, False, False)
+
+
+def _unstick_directions(terrain, body, who):
+    """脱困先往哪边试 —— **净空宽的那一侧优先**，然后是另一侧。"""
+    radius = float(getattr(who, "size_body", 13.0) or 13.0)
+    reach = int(round(radius * 4.0))
+    y = int(body.y - radius)
+    room_right = room_left = 0
+    while room_right < reach and not terrain.is_solid(int(body.x) + room_right + 1, y):
+        room_right += 1
+    while room_left < reach and not terrain.is_solid(int(body.x) - room_left - 1, y):
+        room_left += 1
+    return (1, -1) if room_right >= room_left else (-1, 1)
+
 
 #: 客户端视口的宽（世界单位）。`ViewPort::Init(x, y, w, h)` = `0x5cc7f5`，
 #: 全镜像唯一构造点 `0x5bfc8f` 传的是 `(0, 0, 0x400, 0x300)` ⇒ **1024 × 768**。
@@ -4506,73 +4651,72 @@ def _coop_leader(room, forward):
 
 
 def _coop_goal(room, machine, seat_index, terrain):
-    """闯关时该往哪走：**带头那个真人的前方**（活动范围里尽量靠前，D103）。
+    """闯关时该往哪走：**带头那个真人此刻站的地方**。
 
     ★ 锚是他**此刻站的地方**，不再是他走过的轨迹（D16 那条老路）：
       轨迹是他绕过的每一个弯，跟着重走既慢又白绕；而中间那段路现在有
       A\\* 自己会走（M5-G），不需要拿轨迹保证「踩得到地面」。
 
-    ## ★★★ 跟随点从「他身后」搬到「他身前」（用户 2026-08-30 第五轮）
+    ## ★★★ 不再有「按名次排的固定点位」（用户 2026-09-01，D114）
 
-    > 给 bot 灌输一个信念，尽量往前走，不要拖后腿，即便已经在允许的范围内，
-    > 也要尽量往前走，前面比后面好，不要总停在最后面的界限边缘。
+    > 我希望不要跟随固定点位，我原话说的是 bot 要在带头真人的后 1/4 屏 ~
+    > 前 1/3 屏范围内，只要进入了这个范围内，bot 就没必要再继续调整身位。
 
-    以前的跟随点是 `他 − 120 × 名次`，第三个 bot 就钉在他身后 360 ——
-    刚好是「范围内最靠后」的那一档，用户看到的就是「bot 总在最后面」。
-    现在从**前界**（`+1/3 屏`）往回排：第 1 个 bot 站前界减一个身位、
-    第 2 个再退一个身位……最后**夹回活动范围**
-    `[−BOT_COOP_LEASH, +BOT_COOP_AHEAD_LIMIT]`，谁都不会被排到界外。
-
-    ★ 「站到真人前面会不会挡枪」以前是不排前面的理由 —— 现在不成立了：
-      闯关房里子弹按碰撞组跳过队友（§63），溅射 / 火墙也一点伤害都没有
-      （§142）。挡不着。
+    以前这里是 `他 + (前界 − 120 × 名次)` —— 一个**点**。于是 bot 超过了
+    自己那个点、又还没到全局前界的那一段会**掉头往回走**，走回它刚跳过去
+    的岩浆坑（用户 2026-09-01：「有时候已经跳过去了，它却还要往回走」）。
+    现在目标就是带头的人本人，而「到没到」由 `_coop_intent()` 用**活动带**
+    判 —— 带内不再调整身位，一个字的排位逻辑都不需要。
     """
-    leader = _coop_leader(room, _quest_forward(terrain))
+    forward = _quest_forward(terrain)
+    leader = _coop_leader(room, forward)
     if leader is None:
         return None
-    forward = _quest_forward(terrain)
-    seats = room.bot_seats()
-    rank = (seats.index(seat_index) + 1) if seat_index in seats else 1
-    offset = BOT_COOP_AHEAD_LIMIT - BOT_FOLLOW_DISTANCE * rank
-    offset = max(-BOT_COOP_LEASH, min(BOT_COOP_AHEAD_LIMIT, offset))
     x, y = leader.sync_trail[-1][:2]
-    return (float(x) + forward * offset, float(y))
+    return (float(x), float(y))
+
+
+def _coop_in_band(lag):
+    """在**活动带**里吗 —— `[带头的人 − 1/4 屏, 带头的人 + 1/3 屏]`（D114）。
+
+    `lag` 是 `_coop_lag()` 的第一格：落后带头的人多远，负数 = 已经超前。
+    这就是用户 2026-08-30 / 2026-09-01 两次都在说的那同一个范围，
+    两条边界是现成的常量，不是新数。
+    """
+    return -BOT_COOP_AHEAD_LIMIT <= lag <= BOT_COOP_LEASH
 
 
 def _coop_intent(room, machine, seat_index, terrain, target):
     """闯关模式这一帧往哪走（M5-G）。"""
-    body = machine.body
     if _boss_room(room):
         # ★ boss 房里没有「跟上队伍」这回事 —— 朝 boss 打（§141）。
         return _boss_fight_intent(room, machine, seat_index, terrain, target)
-    spot = _coop_goal(room, machine, seat_index, terrain)
-    if spot is None:
-        _clear_navigation(machine)
-        return (0, False, False, False)
-    # ★★★ 冲过前界了就**停下来等**，不往回走（用户 2026-08-30 第五轮，D103）：
-    #   「超过第一个真人 1/3 屏幕以上，则停下来等。」往回走等于把刚推进的
-    #   进度吐回去；而这只是**走位**停住 —— 打怪和躲子弹这一帧照旧
-    #   （躲避排在这个函数前面，开火根本不走这条路）。
     lag = _coop_lag(room, machine, terrain)
-    if lag is not None and lag[0] < -BOT_COOP_AHEAD_LIMIT:
+    spot = _coop_goal(room, machine, seat_index, terrain)
+    if lag is None or spot is None:
         _clear_navigation(machine)
         return (0, False, False, False)
-    if (abs(body.x - spot[0]) <= BOT_COOP_BAND
-            and abs(body.y - spot[1]) <= botnav.GOAL_Y):
-        # 已经跟上了：站住打怪（打不到就干脆站着，和对战房同一条规矩）。
+    # ★★★ **在活动带里就不再调整身位**（用户 2026-09-01，D114）。
+    #   超前那一头照旧是「停下来等，不往回走」（D103）：往回走等于把刚
+    #   推进的进度吐回去，而且往回那一步经常就是走回刚跳过的坑。
+    #   ★ 只按**前进轴**判，不看 y —— 以前还要求
+    #     `abs(body.y - spot[1]) <= GOAL_Y`，而跟随点的 y 是抄带头真人的：
+    #     bot 落在对岸更高的台子上就永远判「没到」，接着 A\\* 去找一条
+    #     下到他那一层的路，又是一次往回走。
+    #   ★ 这只停**走位**：打怪 / 躲子弹 / 捡道具都排在这个函数前面，照旧。
+    if _coop_in_band(lag[0]):
         _clear_navigation(machine)
         return (0, False, False, False)
-    # ★★ **掉队了就跑**（用户 2026-08-30：「让 bot 尽量往前走」）。
+    if lag[0] < 0.0:
+        return (0, False, False, False)     # 超前出带：站住等
+    # ★★ **掉队出带了就跑**（用户 2026-08-30：「让 bot 尽量往前走」）。
     #    真人是按着右键冲刺推进的（`FastRunRate` 1.5 倍），bot 只用走速
     #    的话**永远**追不上，一路被落下 500~800 个单位，卡在屏幕左边
     #    把镜头钉住 —— 实机日志里量出来的就是这个数。
-    #    判据是「差得比跟随带还远」这个空间事实 + 体力够不够（原版开关）。
-    #    ★ 量的是**落在带头的人后面多远**，不是「离跟随点多远」（D103）：
-    #      跟随点搬到他**前面**之后，后者在正常跟随时也一直大于一个身位，
-    #      bot 会全程按着冲刺键把体力烧光。真人也是落后了才冲。
-    behind = lag[0] if lag is not None else 0.0
+    #    ★ 落后到这儿的一般已经由 `_coop_leash_intent()`（触发 1/4 屏、
+    #      释放 1/8 屏的滞回）接管了；这条是它释放之后的那一小段。
     return _walk_to(room, machine, terrain, spot,
-                    behind > BOT_FOLLOW_DISTANCE and _may_fast_run(machine))
+                    lag[0] > BOT_FOLLOW_DISTANCE and _may_fast_run(machine))
 
 
 def _may_fast_run(machine):
@@ -4914,6 +5058,19 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
     crouched = bool(machine.dodge_crouch)
     speed_scale = _speed_scale(machine, now)
     before = machine.body
+    # ★★★ **第二段跳在物理这一层按**（V0.3 §151），和 ↓ 的锁存同一个道理。
+    #   它不是「这一格想干什么」，是**这一段飞行**起跳时就欠下的一个动作：
+    #   谁规划了这一跳（A\* 的 `Step.double` / 兜底那条），谁就把旗子挂上，
+    #   到了顶点由这里按下去。
+    #   ★ 放在决策层的两个后果，实机都吃过：
+    #     ① 顶点落在**非决策格**上时晚一格，和 `double_jump_lands()`
+    #        逐格模拟出来的弧线对不上；
+    #     ② 飞到一半命中 `_move_intent()` 的任何一条早退分支（躲子弹 /
+    #        打得到就站住 / 闯关那几条）就**再也没人按了** ——
+    #        一段跳掉进岩浆。旗子保住了也没用，得有人真按下去。
+    if (not before.on_ground and machine.nav_double_jump
+            and botmove.at_apex(before)):
+        want_jump = True
     machine.body = botmove.tick(terrain, before, who,
                                 direction=direction, fast_run=fast_run,
                                 crouched=crouched,
@@ -8022,7 +8179,7 @@ def _lying_dead(room, seat_index):
             or seat_index in getattr(quest, "lives_spent", ()))
 
 
-def _tick_bot(room, machine, seat_index, tick, now):
+def _tick_bot(room, machine, seat_index, tick, now, behind=0):
     """一个 bot 走**一格**（32 ms）。
 
     ## ★★★ 一格 = 收方的一个物理 tick（D106，废止 D17 / §32）
@@ -8058,8 +8215,24 @@ def _tick_bot(room, machine, seat_index, tick, now):
     #: 这一格发不发心跳。事件包**不看它** —— 那些在发生的那一格就发。
     #: ★ 落在这一组的**最后一格**：心跳报的位置因此就是这 4 格走完之后的
     #:   位置，和真人客户端「跑完这一帧再发」是同一个口径。
-    beat = (tick % gameserver.HEARTBEAT_TICKS) == (
+    # ★★★ **追赶途中不报位置**（V0.3 §153 / D115）：房间循环落后时会把欠的
+    #   格一口气补完（`RoomLoop._run`，这是对的 —— 弹体一格都不许跳，§147），
+    #   可要是每 4 格照发一发心跳，落后 38 格就是**9 发心跳挤在几毫秒里**，
+    #   而在落后的那一秒多里一发都没有。收方在静默期一直拿最后那份按键掩码
+    #   替 bot 走（`0x507660`，最高 ~690 px/s），恢复时被一把拽回去 ——
+    #   屏幕上就是「bot 瞬移一段距离」。实机量到过「落后 38 格（1216 ms）」
+    #   ≈ 840 像素，和用户看到的量级对得上。
+    #   ⇒ 追平的那一格才报。这正是原版客户端卡了一秒之后的行为：
+    #     恢复时发**一发**位置包，不是十发。事件包不受影响 —— 那是账本。
+    #   ★ 判据是「还欠不欠格」这个事实，不是「落后超过 N 格」的阈值（铁律 10）。
+    due = (tick % gameserver.HEARTBEAT_TICKS) == (
         gameserver.HEARTBEAT_TICKS - 1)
+    if behind > 0:
+        # 还欠着格 = 正在追赶。这一发**欠下来**，追平的那一格一起还。
+        machine.beat_pending = machine.beat_pending or due
+        beat = False
+    else:
+        beat = due or machine.beat_pending
     try:
         # ★★ **排在所有分支前面**：在飞的子弹一发都不能漏（见那个函数的
         #   注释）。bot 躺着、`/hold` 着 —— 都不影响「上一发子弹该炸了」
@@ -8266,6 +8439,7 @@ def _tick_bot(room, machine, seat_index, tick, now):
                 facing=machine.heading, keys=keys, fast_run=fast_run,
                 cursor=cursor, state_byte=_charge_value(machine, now))
             _emit(machine, machine.sync.heartbeat(state))
+            machine.beat_pending = False
             # ★ ↓ 报出去了就把锁松开（见 `down_latch`）。
             machine.down_latch = False
         if BOT_DIAG_FIRE_ANYWHERE:
@@ -8425,7 +8599,7 @@ def _emit(machine, packet):
     return machine.sync.deliver(packet, gameserver.PEER_RELAY.deliver)
 
 
-def tick_room(room, tick, now):
+def tick_room(room, tick, now, behind=0):
     """房里每个 bot 走**一格**（32 ms）。由 `gameserver.RoomLoop` 调（D106）。
 
     `tick` 是本局第几格，`now` 是这一格的**绝对时刻**（`t0 + tick × 32 ms`）——
@@ -8446,10 +8620,10 @@ def tick_room(room, tick, now):
     if room is None or not room.is_playing():
         return
     with _tick_clock(now):
-        _tick_room_locked(room, tick, now)
+        _tick_room_locked(room, tick, now, behind)
 
 
-def _tick_room_locked(room, tick, now):
+def _tick_room_locked(room, tick, now, behind=0):
     """`tick_room()` 的正文 —— 这一格的时刻已经装好了（`_tick_clock`）。"""
     # ★ 血量台账每格过一遍「躺着 -> 站起来」的翻转（M5-C）。放在最外层：
     #   它是**房间级**的事实，和某一个 bot 这一格动没动无关。
@@ -8476,7 +8650,7 @@ def _tick_room_locked(room, tick, now):
         if not isinstance(machine, BotConn):
             continue
         try:
-            _tick_bot(room, machine, index, tick, now)
+            _tick_bot(room, machine, index, tick, now, behind)
         except Exception as error:          # noqa: BLE001 —— 见 docstring
             # ★ 连 `sync` 本身都坏了的场合（单测里就是这么造的）也要接住 ——
             #   这一层的全部意义就是「一个 bot 坏掉不许连累别人」。

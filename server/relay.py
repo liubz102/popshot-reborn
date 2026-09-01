@@ -518,6 +518,10 @@ class UdpSyncRelay:
         self.recent = []
         #: 下行闸门：只准前进。**没有它，网络乱序或冗余补发会把角色拉回旧位置。**
         self.downlink_high_water = -1
+        #: ★ 真乱序（不是冗余捎带）被闸门拦下来的次数，以及「说过了没有」
+        #: —— 按状态翻转打日志，不逐发刷屏（铁律 10）。V0.3 §154。
+        self.reordered = 0
+        self.warned_reorder = False
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
@@ -609,6 +613,8 @@ class UdpSyncRelay:
                     self.recent.clear()
                     self.acked = False
                     self.downlink_high_water = -1
+                    self.reordered = 0
+                    self.warned_reorder = False
                     # ★ 提示的账也跟着清：新的一条游戏连接要重新计时、
                     #   重新允许打一次日志（否则整个中继进程里只会提示一次，
                     #   玩家中途换服务器 / 服务端重启就再也看不到提示了）。
@@ -755,6 +761,16 @@ class UdpSyncRelay:
         #   客户端自己拦不住，只能在这儿拦。
         for index, packet in sorted(chunks, key=lambda item: item[0]):
             if index <= self.downlink_high_water:
+                # ★ 冗余捎带天然会命中这里（同一份发 3 遍），所以**只数
+                #   真乱序**：索引比水位小得多的那种（V0.3 §154）。
+                #   `redundancy + 1` 是一批里捎带几份，超出它就不是冗余了。
+                if index < self.downlink_high_water - self.redundancy:
+                    self.reordered += 1
+                    if not self.warned_reorder:
+                        self.warned_reorder = True
+                        log(f"位置UDP  ⚠ 收到乱序的位置包（索引 {index} < 水位 "
+                            f"{self.downlink_high_water}），已丢弃 —— 这条闸拦住的"
+                            f"正是「角色被拉回旧位置」。之后不再逐发提示")
                 continue
             if not udpsync.is_heartbeat(packet):
                 continue                    # 铁律 1：只有位置能走这条路
