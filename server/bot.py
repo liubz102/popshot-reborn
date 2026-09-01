@@ -4220,8 +4220,23 @@ def _nav_signature(terrain, body, spot):
             int(round(spot[1] / botnav.KEY_Y)))
 
 
-def _route_intent(machine, terrain, who, spot):
+def _route_intent(machine, terrain, who, spot, hold_at_breakable=False):
     """规划/执行一条可达路线；找不到返回 `None`。
+
+    ## ★★★ `hold_at_breakable` —— 「站住打挡路物」只属于破障那个调用者
+
+    锁着一件挡路物（`path_breakable`）而安全前缀又走空时，**只有**
+    `_breakable_move_intent()` 那条路该回「原地不动」—— 它前面有
+    `_breaking_now()` 那道门，确认了这一帧真的是冲着挡路物去的。
+
+    ⚠ 这一句以前对**所有**调用者生效，而且排在规划分支前面，于是
+    `_walk_to()` 那条正常走位一旦碰上这个状态就永远回「不动」，
+    **连规划单都不再递**（V0.3 §160）。解锁只剩两条路：挡路物自己
+    翻转（`_refresh_breakables` 把全房间的锁一起清），或者移动目标挪出
+    `GOAL_X`。而对战房里 bot 的移动目标就是别的 bot —— 它们同样被钉住，
+    目标不动 ⇒ 谁也解不开 ⇒ **整个房间一起僵住，直到某个罐子碎 / 长回来
+    把所有人一起放开**。用户 2026-09-01 22:53 实机看到的「所有 bot 都不动，
+    一分钟后又都恢复」「卡几秒后突然一起动」就是它。
 
     ## ★★ 一帧最多规划一次
 
@@ -4260,8 +4275,10 @@ def _route_intent(machine, terrain, who, spot):
         machine.nav_path.pop(0)
         machine.nav_started = False
         machine.nav_double_jump = False
-    if not machine.nav_path and machine.path_breakable is not None:
+    if (hold_at_breakable and not machine.nav_path
+            and machine.path_breakable is not None):
         # 捷径的安全前缀已经走完：这里就是对挡路物开火的位置。
+        # ★ 只对破障那个调用者成立，见函数抬头。
         return (0, False, False, False)
     if not machine.nav_path:
         signature = _nav_signature(terrain, body, spot)
@@ -4298,14 +4315,24 @@ def _route_intent(machine, terrain, who, spot):
         machine.nav_double_jump = False
         machine.nav_failed = None
         if not machine.nav_path:
-            return (0, False, False, False)
+            if hold_at_breakable or machine.path_breakable is None:
+                # 已经站在目标上（或者破障那条正等着开火）—— 站住是对的。
+                return (0, False, False, False)
+            # ★ 后台给的是「先打碎它」那条捷径，而这一帧并不是冲着挡路物
+            #   去的（`_breaking_now()` 已经否了 / 手上这把枪够不着）。
+            #   **别把人钉在这儿** —— 回 `None`，让 `_walk_to()` 那套老兜底
+            #   照常把腿迈出去。同一组空间事实下不重复递单：签名和「A\* 说
+            #   到不了」用的是同一个（空间事实，不是挂钟，铁律 10）。
+            machine.nav_failed = signature
+            return None
 
     step = machine.nav_path[0]
     if machine.nav_started:
         # 上一帧已经离地、这一帧又落在别处 = 这条物理边没按规划结束，重算。
         if body.on_ground:
             _clear_navigation(machine)
-            return _route_intent(machine, terrain, who, spot)
+            return _route_intent(machine, terrain, who, spot,
+                                 hold_at_breakable=hold_at_breakable)
         return (step.direction, False, False, step.fast_run)
     # ★ 「这条边要不要在顶点补第二段」是 `Step.double` 说了算，和起跳那一下
     #   按什么键分开记 —— 弹跳台那一条**起跳不能按跳**（按了人先离地，
@@ -4494,7 +4521,7 @@ def _breakable_move_intent(room, machine, seat_index, terrain, target):
         return (0, False, False, False)       # `_tick_bot` 后面照常扣扳机
     if machine.nav_path and machine.nav_goal is not None:
         routed = _route_intent(machine, terrain, _character_of(machine),
-                               machine.nav_goal)
+                               machine.nav_goal, hold_at_breakable=True)
         if routed is not None:
             return routed
     # ★ 安全前缀走完了，可这一枪又不是冲着它去的（够不着 / 换枪还没生效）
@@ -7671,12 +7698,67 @@ def _splash_targets(room, shell, point, victim_seat, bodies, victim_mob=None):
     return out
 
 
+def _shell_fell_out_of_the_world(room, shell, point):
+    """这颗弹体是**掉出地图下边界**没的吗（V0.3 §161）。
+
+    ★★★ 判据和角色那条（`_fell_out_of_the_world` / §143）同一套：
+    这张图的 `map.ini` 有 `FallDown`，而**拦住它的那个采样点**已经在图外。
+
+    ★ 为什么要把碰撞半径加回去：`_terrain_contact()` 是拿弹体外缘的探针
+      去问地形的（`shell_probe_offsets`，往下飞时偏移就是 `+radius`），
+      所以「探针出界」这件事在落点上写着的是 `y + radius >= 图高`。
+      直接拿 `y` 比会漏掉一切带半径的弹体（半径 8 的能差 8 个像素）。
+
+    ## 为什么要单独认出这一种
+
+    实机对账（2026-09-01 23:14，`Esperan00`）：苹果雷的第 4 片碎片
+    （客户端句柄 400024）第 42 帧还在 `(955, 2022)`、竖直速度 29.4，
+    下一帧就越过图高 2048 —— 客户端**把它删掉了，一个爆炸对象都没建**
+    （另外三片各自在落地那一帧后 32 ms 建出了 400027/400028/400029）。
+    而服务端照旧把它当「撞到实心」结算，`explode(spawns=1)` 替那个
+    根本不存在的对象记了一个句柄 ⇒ 从这一发起，这个座位的句柄
+    **永久错开 1**，之后每一发 `rpExplode` 都被 `0x492750` 静默丢弃
+    （§42）：子弹照飞、爆炸动画没有、一滴血不掉。
+
+    对账证据（客户端 `PROJ+` 的句柄 vs 服务端 `rpFire` 预测的句柄）：
+
+    | 局 | 地图 | `FallDown` | 五个 bot 的最终偏差 |
+    |---|---|---|---|
+    | 22:53 | `Iceria00` | 否 | 0 0 0 0 0 |
+    | 22:58 | `Esperan00` | **是** | 13 6 20 0 0 |
+    | 23:03 | `Esperan00` | **是** | 19 41 101 0 0 |
+    | 23:08 | `Forest00` | 否 | 0 0 0 0 0 |
+    | 23:13 | `Esperan00` | **是** | 188 138 125 196 142 |
+
+    用户 2026-09-01 报的「bot3 打我没有伤害」「苹果弹没有爆炸动画也没有
+    伤害」「出问题的几局好像都是有岩浆的地图」—— 岩浆图就是 `FallDown` 图。
+    """
+    if room is None:
+        return False
+    if not mapdata.falls_out_of_the_world(getattr(room, "map_name", "")):
+        return False
+    terrain = _terrain(room)
+    if terrain is None:
+        return False
+    radius = float(getattr(shell, "radius", 0.0) or 0.0)
+    return float(point[1]) + radius >= float(terrain.height)
+
+
 def _resolve_shell(room, machine, shell, point, victim_seat, region, tick):
     """这颗子弹到头了：发 `rpExplode`（+ 溅射的 `rpSplashDamaged`）。
 
     `victim_seat is None` = 打在地形上 / 飞出图外 —— 照样要发，
     **句柄记账不许漏**（§42）。
+
+    ★★★ 唯一的例外是**掉出下边界**（§161）：收方把那种弹体静默删掉、
+    不建爆炸对象，这边跟着一句都不发、一个句柄都不记，两边才对得上。
     """
+    if _shell_fell_out_of_the_world(room, shell, point):
+        # 收方那边这颗弹体已经没了：发了也是被静默丢弃，而 `spawns` 那一个
+        # 句柄它**根本不会记** —— 记了就是永久错开（§42）。
+        # ★ 分裂 / 火墙 / 破坏物那几段也一并跳过：删掉的弹体跑不出 `Tick`，
+        #   自然一片碎片都不生（§81 的分裂就挂在 `AppleGrenade::Tick` 上）。
+        return
     if machine.no_explode:
         # ★ 诊断开关（`/noboom`）：到头了也不发爆炸，让弹体一直飞下去。
         #   记录照样出队 —— 收方没收到爆炸就不会创建溅射对象，

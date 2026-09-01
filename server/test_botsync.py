@@ -5176,6 +5176,50 @@ class BotBreakableShortcutTests(TerrainMixin, BotFireRoom):
         self.assertIsNone(bot._breakable_move_intent(
             self.room, self.bot_conn, self.bot_seat, self.terrain, None))
 
+    def test_an_exhausted_prefix_does_not_freeze_ordinary_walking(self):
+        """★★★★★ 锁着挡路物、安全前缀又走空 —— 正常走位不许被钉住（§160）。
+
+        用户 2026-09-01 22:53 实机：整张图的 bot 一起不动，一分钟后又一起
+        恢复。病根就是 `_route_intent()` 里那句「前缀走完 = 站住打挡路物」
+        对**所有**调用者生效，而且排在规划分支前面：一旦锁上，这个 bot
+        每一帧都回「不动」，**连规划单都不再递**，只有挡路物自己翻转
+        （`_refresh_breakables` 一次清全房间）才放得开。
+
+        「站住」只属于破障那个调用者 —— 它前面有 `_breaking_now()` 那道门。
+        """
+        self.place_bot(493.0, 988.0)
+        who = bot._character_of(self.bot_conn)
+        goal = (1605.0, 937.0)
+        self.bot_conn.path_breakable = 55
+        self.bot_conn.path_breakable_prefix = []
+        self.bot_conn.nav_path = []
+        self.bot_conn.nav_goal = None      # `_clear_navigation()` 之后的样子
+        routed = bot._route_intent(self.bot_conn, self.terrain, who, goal)
+        self.assertNotEqual((0, False, False, False), routed)
+        held = bot._route_intent(self.bot_conn, self.terrain, who, goal,
+                                 hold_at_breakable=True)
+        self.assertEqual((0, False, False, False), held)
+
+    def test_a_latched_blocker_still_lets_the_bot_walk_towards_a_target(self):
+        """★★★★★ 同一件事走到 `_move_intent()` 这一层：腿要迈得出去。
+
+        `_breakable_move_intent()` 自己的注释写着「安全前缀走完了、这一枪
+        又不是冲着它去的 —— **不站在那儿干等**，放行给正常走位」。放行之后
+        走的就是 `_walk_to()` -> `_route_intent()`，而那一句把它又钉回去了。
+        """
+        self.place_bot(493.0, 988.0)
+        self.walk(self.alice, [(900.0, 700.0)])
+        self.place_bot(493.0, 988.0)
+        self.bot_conn.path_breakable = 55
+        self.bot_conn.path_breakable_prefix = []
+        self.bot_conn.nav_path = []
+        self.bot_conn.nav_goal = None
+        with bot._tick_clock(self.now()):
+            intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                      self.terrain, None)
+        self.assertNotEqual((0, False, False, False), intent)
+        self.assertEqual(55, self.bot_conn.path_breakable)   # 锁本身还留着
+
     def test_dodging_outranks_breaking_a_blocker(self):
         """★★★ 脱困 / 牵引绳 / 躲子弹都排在破障**前面**。
 
@@ -6752,6 +6796,135 @@ class BotHandleLedgerTests(BotSliceTests):
         self.assertEqual(4, len(frags), "该有四片碎片在飞")
         handles = sorted(s.handle for s in frags)
         self.assertEqual(list(range(handles[0], handles[0] + 4)), handles)
+
+
+class BotShellFallsOutOfTheWorldTests(TerrainMixin, BotFireRoom):
+    """★★★★★ 掉出下边界的弹体：**不发爆炸、不记句柄**（V0.3 §161）。
+
+    用户 2026-09-01：「23:02 结束的那局……快结束之前的一分钟左右，bot3 打我
+    没有伤害。」「23:14 那一局，后来 bot3 扔的苹果弹没有爆炸动画，也没有伤害。」
+    「出问题的几局，好像都是有岩浆的地图。」
+
+    实机对账（客户端 `PROJ+` 的句柄 vs 服务端 `开火:` 预测的句柄）：
+
+    ```text
+    22:53 Iceria00   FallDown 否   五个 bot 的最终偏差 0 0 0 0 0
+    22:58 Esperan00  FallDown 是                     13 6 20 0 0
+    23:03 Esperan00  FallDown 是                     19 41 101 0 0
+    23:08 Forest00   FallDown 否                     0 0 0 0 0
+    23:13 Esperan00  FallDown 是                     188 138 125 196 142
+    ```
+
+    23:14:14 那一次逐帧钉死了：苹果雷炸成四片（客户端 400023..400026），
+    其中 400024 竖直往下飞，第 42 帧还在 `(955, 2022)`、竖直速度 29.4，
+    下一帧越过图高 2048 —— 客户端**把它删掉了，一个爆炸对象都没建**；
+    另外三片各自在落地那一帧之后 32 ms 建出了 400027/400028/400029。
+    而服务端照旧当「撞到实心」结算，`explode(spawns=1)` 替一个不存在的
+    对象记了一格 ⇒ 下一发 `rpFire` 服务端给 400031、客户端给 400030，
+    从此每一发 `rpExplode` 都被静默丢弃（§42）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(mapdata.load("Esperan00"))
+        self.set_fall_down(True)
+
+    def set_fall_down(self, value):
+        props = mapdata.STORE.index().setdefault("props", {})
+        props[self.room.map_name] = {"fall_down": bool(value)}
+        self.addCleanup(props.pop, self.room.map_name, None)
+
+    def shell_at(self, x, y, ammo=1000020):
+        weapon = weapondata.get(ammo)
+        shell = bot.Shell(handle=botsync.projectile_handle(self.bot_seat, 0),
+                          fire_seq=0, weapon=weapon,
+                          group=bot._seat_group(self.room, self.bot_seat),
+                          x0=x, y0=y,
+                          shot=ballistics.launch(weapon, 0.0, 30.0),
+                          born=time.monotonic(), max_ticks=200)
+        shell.x, shell.y = x, y
+        return shell
+
+    def resolve(self, y):
+        """在 `(500, y)` 结算一颗弹体，返回 `(吃掉几个句柄, 发了几发包)`。"""
+        shell = self.shell_at(500.0, y)
+        self.clear()
+        before = self.bot_conn.sync.projectiles
+        bot._resolve_shell(self.room, self.bot_conn, shell, (500.0, y),
+                           None, None, 0)
+        return (self.bot_conn.sync.projectiles - before,
+                len(bot_frames(self.alice, self.bot_seat)))
+
+    def test_a_shell_that_leaves_the_bottom_edge_costs_nothing(self):
+        """★ 收方把它静默删掉了 —— 这边一个句柄都不许记，一发包都不许发。"""
+        spent, frames = self.resolve(float(self.terrain.height))
+        self.assertEqual(0, spent, "收方根本没建爆炸对象，记了就永久错开")
+        self.assertEqual(0, frames, "收方那颗弹体已经没了，发了也是被丢弃")
+
+    def test_the_collision_radius_counts(self):
+        """★ 拦住它的是**外缘探针**，落点因此比图高早一个半径（`Size`）。"""
+        shell = self.shell_at(500.0, 100.0)
+        self.assertGreater(shell.radius, 0.0, "苹果雷是有碰撞半径的")
+        edge = float(self.terrain.height) - shell.radius
+        self.assertTrue(bot._shell_fell_out_of_the_world(
+            self.room, shell, (500.0, edge)))
+        self.assertFalse(bot._shell_fell_out_of_the_world(
+            self.room, shell, (500.0, edge - 1.0)))
+
+    def test_a_map_without_falldown_still_explodes_normally(self):
+        """★★ 判据是这张图的 `FallDown`，和角色那条（§143）同一套。
+
+        没有 `FallDown` 的图底下就是实心地面，收方照常造爆炸对象 ——
+        这一条要是把它们也吞了，反过来又是永久错开。
+        """
+        self.set_fall_down(False)
+        spent, frames = self.resolve(float(self.terrain.height))
+        self.assertGreaterEqual(spent, weapondata.get(1000020).explode_step)
+        self.assertTrue(frames)
+
+    def test_a_normal_hit_inside_the_map_is_untouched(self):
+        spent, frames = self.resolve(400.0)
+        self.assertGreaterEqual(spent, weapondata.get(1000020).explode_step)
+        self.assertTrue(frames)
+
+    def test_a_grenade_that_falls_out_does_not_split(self):
+        """★ 删掉的弹体跑不出 `AppleGrenade::Tick`，一片碎片都不生（§81）。"""
+        shell = self.shell_at(500.0, float(self.terrain.height))
+        self.bot_conn.pending_shots = []
+        bot._resolve_shell(self.room, self.bot_conn, shell,
+                           (500.0, float(self.terrain.height)), None, None, 0)
+        self.assertEqual([], self.bot_conn.pending_shots)
+
+    def test_the_receiver_and_the_server_still_agree(self):
+        """★★★★★ 端到端：收方那本账（`ReceiverLedger`）一格都不许差。
+
+        收方这一侧照实机加一条：**掉出下边界的弹体它自己删掉**，
+        不等 `rpExplode`、也不建爆炸对象。
+        """
+        led = ReceiverLedger(self.bot_seat)
+        weapon = weapondata.get(1000020)
+        bottom = float(self.terrain.height)
+        # ① 正常落地的一发；② 掉出下边界的一发（收方自己删掉，不等爆炸包）。
+        for y, vanished in ((400.0, False), (bottom, True)):
+            self.clear()
+            self.bot_conn.pending_shots = []
+            packet, handle = self.bot_conn.sync.fire(
+                weapon.id, 500.0, y, 0.0, 30.0,
+                handle_step=weapon.fire_step, shots=weapon.shots,
+                group=bot._seat_group(self.room, self.bot_seat))
+            led.feed(packet)
+            if vanished:
+                led.live.pop(handle, None)      # ★ 收方那颗已经没了
+            shell = self.shell_at(500.0, y)
+            shell.handle = handle
+            bot._resolve_shell(self.room, self.bot_conn, shell, (500.0, y),
+                               None, None, 0)
+            for frame in bot_frames(self.alice, self.bot_seat):
+                led.feed(frame)
+        self.assertEqual([], led.dropped,
+                         "收方查不到句柄 = 静默丢弃 = 从此打不掉血（§42）")
+        self.assertEqual(self.bot_conn.sync.projectiles, led.counter,
+                         "服务端和收方的下一个句柄必须一格不差")
 
 
 class BotGameModeDamageTests(BotFireRoom):
