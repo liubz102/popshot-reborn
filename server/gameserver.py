@@ -64,7 +64,9 @@ from account_store import (AccountStore, BASE_CHARACTER_IDS,
                            player_money, quest_cleared_difficulty,
                            quest_difficulty_records, quest_unlock_all,
                            tutorial_state)
+import asynclog
 import eventlog
+import logcleanup
 import lobby as lobby_module
 import mapdata
 # ★ `SESSION_STATUS_WAITING` 不从 lobby 导入：本模块下面有一份带完整考据的
@@ -4810,6 +4812,15 @@ class RoomLoop:
         self.stopped = True
         #: 「现在是不是正在落后」——按**状态翻转**去重打日志（铁律 10）。
         self.late = False
+        #: ★ **最近一格的分段耗时**（毫秒），只在真的报「落后」时打出来。
+        #:
+        #:   `{'杂事': 1.2, 'bot': 47.9, '总': 49.3}`
+        #:
+        #: 为什么要有它（用户 2026-09-01 的卡顿）：以前 `⚠ 落后 38 格` 只告诉
+        #: 你「慢了」，不告诉你**慢在谁身上**。量一格的开销本身几乎免费
+        #: （两次 `perf_counter`），而这一行只在**状态翻转**的那一刻打一次，
+        #: 平时一个字都不写 —— 不是采样、不是定时器（铁律 10）。
+        self.spent = {}
         self._cv = threading.Condition()
         self._thread = None
 
@@ -4861,8 +4872,8 @@ class RoomLoop:
                     name=f"roomloop-{self.room.room_id}")
                 self._thread.start()
             self._cv.notify_all()
-        print(f"[{ts()}] [sim] 房间 #{self.room.room_id} 32ms 循环起步"
-              f"（第 {self.gen} 代，{why}）", flush=True)
+        asynclog.emit(f"[{ts()}] [sim] 房间 #{self.room.room_id} 32ms 循环起步"
+                      f"（第 {self.gen} 代，{why}）")
         return self.gen
 
     def stop(self, why):
@@ -4875,8 +4886,8 @@ class RoomLoop:
             self.gen = 0
             self._cv.notify_all()
         roomclock.SCHEDULER.stop(self)
-        print(f"[{ts()}] [sim] 房间 #{self.room.room_id} 32ms 循环停"
-              f"（跑了 {self.done} 格，{why}）", flush=True)
+        asynclog.emit(f"[{ts()}] [sim] 房间 #{self.room.room_id} 32ms 循环停"
+                      f"（跑了 {self.done} 格，{why}）")
         return True
 
     # -- 节拍器线程这一侧 ---------------------------------------------------
@@ -4913,6 +4924,16 @@ class RoomLoop:
                     continue
                 self.done = tick + 1
 
+    def _late_detail(self):
+        """最近一格的分段耗时，拼成一句人话；没量到就是空串。
+
+        跟在「落后」那一行后面，让「慢在谁身上」当场有答案，不用再去猜。
+        """
+        if not self.spent:
+            return ""
+        parts = " ".join(f"{name} {ms:.1f}ms" for name, ms in self.spent.items())
+        return f"　最近一格：{parts}"
+
     def _note_late(self, behind):
         """落后了吼一嗓子。**按状态翻转去重**（铁律 10），不是每格一行。"""
         late = behind >= LATE_TICKS_WARN
@@ -4920,13 +4941,13 @@ class RoomLoop:
             return
         self.late = late
         if late:
-            print(f"[{ts()}] [sim] ⚠ 房间 #{self.room.room_id} 落后 "
-                  f"{behind} 格（{behind * roomclock.TICK_S * 1000:.0f} ms）"
-                  f"—— 这几格的 rpExplode 会迟到，句柄账有错开的风险（§147）",
-                  flush=True)
+            asynclog.emit(
+                f"[{ts()}] [sim] ⚠ 房间 #{self.room.room_id} 落后 "
+                f"{behind} 格（{behind * roomclock.TICK_S * 1000:.0f} ms）"
+                f"—— 这几格的 rpExplode 会迟到，句柄账有错开的风险（§147）"
+                f"{self._late_detail()}")
         else:
-            print(f"[{ts()}] [sim] 房间 #{self.room.room_id} 追上了",
-                  flush=True)
+            asynclog.emit(f"[{ts()}] [sim] 房间 #{self.room.room_id} 追上了")
 
     # -- 一格 ---------------------------------------------------------------
     def alive(self):
@@ -4975,7 +4996,13 @@ class RoomLoop:
         room = self.room
         if now is None:
             now = roomclock.deadline_of(self.t0, tick)
+        # 分段计时：两次 perf_counter 的开销在 32 ms 面前可以忽略，
+        # 而它换来的是「落后的时候慢在谁身上」有据可查（见 self.spent）。
+        t_enter = time.perf_counter()
+        spent = {}
         with room.sim_lock:
+            t_locked = time.perf_counter()
+            spent["等锁"] = (t_locked - t_enter) * 1000.0
             if not self.alive():
                 return False
             if self.idle():
@@ -4984,6 +5011,8 @@ class RoomLoop:
             #   里被 bot 看见（`pending_spawn`），顺序和 D17 时代一样。
             if tick % CHORE_TICKS == 0:
                 self._chores()
+            t_chores = time.perf_counter()
+            spent["杂事"] = (t_chores - t_locked) * 1000.0
             if BOT_ROOM_TICK is not None:
                 try:
                     BOT_ROOM_TICK(room, tick, now)
@@ -4991,8 +5020,11 @@ class RoomLoop:
                     # bot 出问题不能把房间那条循环带走（D1）：真人的对战计时、
                     # 刷道具、复活看门狗都还挂在它上面。逐个 bot 的隔离在
                     # `bot.tick_room()` 里，这是最后一道。
-                    print(f"[{ts()}] [sim] ⚠ 房间 #{room.room_id} 的 bot 帧"
-                          f"整个出错，这一格跳过: {error!r}", flush=True)
+                    asynclog.emit(f"[{ts()}] [sim] ⚠ 房间 #{room.room_id} 的 bot 帧"
+                                  f"整个出错，这一格跳过: {error!r}")
+            spent["bot"] = (time.perf_counter() - t_chores) * 1000.0
+        spent["总"] = (time.perf_counter() - t_enter) * 1000.0
+        self.spent = spent
         return True
 
     def _chores(self):
@@ -5108,7 +5140,7 @@ PEER_RELAY = relayserver.RelayServer(
     # 准入条件最窄**的那一条路：只有位置心跳、只有自证过能收的收件人、
     # 而且只有 N 没变的那一发才走它。见 `udpsync.may_send_heartbeat`。
     udp_sender=udpsync.SERVER,
-    logger=lambda msg: print(f"[{ts()}] [relay] {msg}", flush=True),
+    logger=lambda msg: asynclog.emit(f"[{ts()}] [relay] {msg}"),
 )
 
 
@@ -5130,7 +5162,7 @@ def _conn_for_udp_ticket(ticket):
 
 udpsync.SERVER.bind_lookup(
     _conn_for_udp_ticket,
-    logger=lambda msg: print(f"[{ts()}] [udpsync] {msg}", flush=True))
+    logger=lambda msg: asynclog.emit(f"[{ts()}] [udpsync] {msg}"))
 
 
 def register_conn(conn):
@@ -5475,10 +5507,14 @@ class Conn:
         #   以前那份 .txt 是无条件建的，于是玩一次就多一个文件、清也没人清：
         #   这台开发机的 logs/ 里攒了 1076 份（用户 2026-08-14 报的正是这件事）。
         if VERBOSE:
-            self.ft = open(os.path.join(LOGDIR, f"game_{self.seq:03d}_27799.txt"),
-                           "w", encoding="utf-8")
-            self.fb_raw = open(os.path.join(LOGDIR, f"game_{self.seq:03d}_27799.raw.bin"), "wb")
-            self.fb_dec = open(os.path.join(LOGDIR, f"game_{self.seq:03d}_27799.dec.bin"), "wb")
+            # ★ 名字里带**本次启动的时刻**（`logcleanup.RUN_STAMP`）：`_seq` 是
+            #   进程级的、每次启动从 1 重来，不带它的话同一天第二次启动就把
+            #   上一次的抓包冲掉（用户 2026-09-01）。仍匹配 `game_*` 白名单。
+            stem = os.path.join(LOGDIR,
+                                f"game_{logcleanup.RUN_STAMP}_{self.seq:03d}_27799")
+            self.ft = open(f"{stem}.txt", "w", encoding="utf-8")
+            self.fb_raw = open(f"{stem}.raw.bin", "wb")
+            self.fb_dec = open(f"{stem}.dec.bin", "wb")
         else:
             self.ft = self.fb_raw = self.fb_dec = None
         # 控制通道的线程会从另一个线程调 send()，加密流是有状态的，必须串行化。
@@ -5515,12 +5551,14 @@ class Conn:
 
     def log(self, msg):
         line = f"[{ts()}] #{self.seq} {msg}"
-        print(line, flush=True)
+        # ★★ 异步（用户 2026-09-01）：这个函数会在 `room.sim_lock` 里面被调到
+        #    （`RoomLoop.run_tick` → `_chores` → 各种 `conn.log`），同步写盘就是
+        #    整个房间跟着等磁盘。见 `asynclog.py` 开头。
+        asynclog.emit(line)
         # `self.ft` 只在 --verbose 下存在（见构造函数）。stdout 那一份一直都在，
         # 被启动脚本重定向进 `logs/server.out`。
         if self.ft is not None:
-            self.ft.write(line + "\n")
-            self.ft.flush()
+            asynclog.emit_text(line + "\n", self.ft)
 
     def peer(self):
         """本连接对端的 ``ip:port``（v4-mapped 前缀已剥掉）。"""
@@ -9229,10 +9267,10 @@ class Conn:
         # 两个文件，日常游玩纯属跟游戏抢 I/O，所以跟着 --verbose 走。
         plain = self.cin.decrypt(data)
         if VERBOSE:
-            self.fb_raw.write(data)
-            self.fb_raw.flush()
-            self.fb_dec.write(plain)
-            self.fb_dec.flush()
+            # ★ 异步：改造前这里每个包两次 write + 两次 flush，读线程要等磁盘
+            #   （用户 2026-09-01）。内容一字节不差，只是攒成一批再落盘。
+            asynclog.emit_bytes(self.fb_raw, data)
+            asynclog.emit_bytes(self.fb_dec, plain)
         self.buf += plain
 
         if not self.got_version:
@@ -9357,6 +9395,11 @@ class Conn:
             who = repr(self.account_name) if self.account_name else "?（没登录成功）"
             self.online(f"- 断开 账号={who} ip={self.peer()} "
                         f"在线 {eventlog.duration(time.monotonic() - self.connected_at)}")
+            if self.ft is not None or self.fb_raw is not None:
+                # ★ 抓包文件是**异步**写的（asynclog），队列里可能还压着这条连接
+                #   的字节。先排空再关，否则最后那几个包会静默丢掉。
+                #   只有 --verbose 才会走到这儿，而且这是断线收尾、不是战斗路径。
+                asynclog.drain(timeout=5.0)
             for f in (self.ft, self.fb_raw, self.fb_dec):
                 if f is None:      # 非 verbose 时抓包文件根本没开
                     continue
@@ -9765,20 +9808,20 @@ def serve_control(port):
     try:
         s.bind(("127.0.0.1", port))
     except OSError as error:
-        print(f"[{ts()}] !! 控制端口 {port} 绑定失败: {error}", flush=True)
+        asynclog.emit(f"[{ts()}] !! 控制端口 {port} 绑定失败: {error}")
         return
     s.listen(4)
-    print(f"[{ts()}] [gameserver] 控制通道监听 127.0.0.1:{port}", flush=True)
+    asynclog.emit(f"[{ts()}] [gameserver] 控制通道监听 127.0.0.1:{port}")
     while True:
         sock, _ = s.accept()
         try:
             sock.settimeout(5.0)
             line = sock.makefile("r", encoding="utf-8").readline().strip()
             reply = handle_control_command(line)
-            print(f"[{ts()}] [ctl] {line!r} -> {reply.splitlines()[0]}", flush=True)
+            asynclog.emit(f"[{ts()}] [ctl] {line!r} -> {reply.splitlines()[0]}")
             sock.sendall((reply + "\n").encode("utf-8"))
         except Exception as error:
-            print(f"[{ts()}] [ctl] 控制连接异常: {error!r}", flush=True)
+            asynclog.emit(f"[{ts()}] [ctl] 控制连接异常: {error!r}")
         finally:
             try:
                 sock.close()
@@ -9839,14 +9882,13 @@ def main():
         threading.Thread(target=serve_control, args=(args.control_port,),
                          daemon=True).start()
 
-    print(f"[{ts()}] [gameserver] 监听 {describe_listen(args.host, args.port)} "
-          f"{'(hold)' if args.hold else f'version_result={args.version_result}'} "
-          f"日志={'详细（逐包 dump）' if VERBOSE else '精简（--verbose 开全量）'}",
-          flush=True)
+    asynclog.emit(f"[{ts()}] [gameserver] 监听 {describe_listen(args.host, args.port)} "
+                  f"{'(hold)' if args.hold else f'version_result={args.version_result}'} "
+                  f"日志={'详细（逐包 dump）' if VERBOSE else '精简（--verbose 开全量）'}")
     try:
         serve(args.port, args, host=args.host)
     except OSError as e:
-        print(f"!! 端口 {args.port} 绑定失败（旧进程没退？）: {e}", flush=True)
+        asynclog.emit(f"!! 端口 {args.port} 绑定失败（旧进程没退？）: {e}")
 
 
 def listen(port, host="::"):

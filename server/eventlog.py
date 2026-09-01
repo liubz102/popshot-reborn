@@ -39,6 +39,8 @@ import os
 import threading
 import time
 
+import asynclog
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PATH = os.path.join(ROOT, "logs", "online.log")
 
@@ -65,6 +67,10 @@ def configure(path=None, to_file=True, to_stdout=True, verbose=None):
     `verbose=True` 让 `debug()` 也开始写；不传就保持原样。
     """
     global _path, _fh, _fh_day, _to_file, _to_stdout, _verbose
+    # ★ 先把还排着队的行写进**旧**文件再换 —— 否则换文件那一刻队列里的行
+    #   会跑到新文件里去（或者被 to_file=False 丢掉）。`configure()` 只在
+    #   启动和单测里调，不在任何热路径上。
+    asynclog.drain(timeout=5.0)
     with _lock:
         if _fh is not None:
             try:
@@ -135,18 +141,34 @@ def _fh_unlocked():
     return _fh
 
 
-def _write(line):
+def _file_target():
+    """给 `asynclog` 的回调：**在写线程上**拿到「当前这一天该写的那个句柄」。
+
+    ★ 跨天切名（`_fh_unlocked` → `_rotate_unlocked`）里有 `os.replace` 和
+      重新 `open`，这两件事都可能等磁盘。改造前它们发生在**调用方线程**上，
+      也就是可能发生在 `room.sim_lock` 里的房间线程上。搬到写线程之后，
+      切分再慢也只慢日志自己。
+
+    ★ 仍然拿 `_lock`：`configure()` 会从别的线程换文件，句柄不能被换到一半。
+    """
     with _lock:
-        if _to_stdout:
-            print(line, flush=True)
-        if _to_file:
-            try:
-                fh = _fh_unlocked()
-                fh.write(line + "\n")
-                fh.flush()
-            except Exception:
-                # 日志写不进去绝不能把服务端拖垮（磁盘满 / 目录只读）。
-                pass
+        if not _to_file:
+            return None
+        try:
+            return _fh_unlocked()
+        except Exception:           # noqa: BLE001
+            # 日志写不进去绝不能把服务端拖垮（磁盘满 / 目录只读）。
+            return None
+
+
+def _write(line):
+    # ★★ 异步（用户 2026-09-01）：改造前这里在**全进程唯一**的 `_lock` 里
+    #    做两次同步 I/O（stdout + 文件，各带一次 flush）—— 任何线程记一条
+    #    上下线事件，所有别的线程都得排队等它写完盘。现在只入队。
+    if _to_stdout:
+        asynclog.emit(line)
+    if _to_file:
+        asynclog.emit_text(line + "\n", _file_target)
 
 
 def online(msg):

@@ -50,6 +50,7 @@ if __name__ == "__main__":
 
 from account_store import (AUTH_MESSAGES, AUTH_OK, NICKNAME_RULE_TEXT,
                            USERNAME_RULE_TEXT, AccountError, AccountStore)
+import asynclog
 import config as server_config
 import eventlog
 from netlisten import create_listener
@@ -305,7 +306,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # 默认实现往 stderr 写 Apache 风格的行，和服务端其它日志格式不一致。
         # ★ 绝不打 query string / 请求体 —— 密码就在里面（D067）。
-        print(f"[web] {self.address_string()} {fmt % args}", flush=True)
+        asynclog.emit(f"[web] {self.address_string()} {fmt % args}")
 
     # -------------------------------------------------------------- 路由
     def do_GET(self):
@@ -538,7 +539,7 @@ def main():
     if cooldown is None:
         cooldown = server_config.load()[0]["register_cooldown_seconds"]
     note = f"注册冷却 {cooldown} 秒" if cooldown else "注册冷却已关闭"
-    print(f"注册页 http://127.0.0.1:{args.port}/（{note}）", flush=True)
+    asynclog.emit(f"注册页 http://127.0.0.1:{args.port}/（{note}）")
     serve(args.port, AccountStore(args.accounts), args.host, cooldown=cooldown)
 
 

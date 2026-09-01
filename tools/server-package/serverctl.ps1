@@ -217,6 +217,9 @@ if ($busy.Count -gt 0) {
 $appArgs = @("`"$AppPy`"", '--no-control')
 if ($DebugLog) { $appArgs += '--verbose' }
 
+# ★ 上一次那份先归档，别覆盖（同一天多次重启也留得住）。见 Move-LogAside。
+Move-LogAside (Join-Path $LogDir 'server.out') | Out-Null
+Move-LogAside (Join-Path $LogDir 'server.err') | Out-Null
 Start-Process -FilePath $Python -WorkingDirectory $Root `
     -ArgumentList $appArgs `
     -RedirectStandardOutput (Join-Path $LogDir 'server.out') `

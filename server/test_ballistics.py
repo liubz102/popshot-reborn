@@ -8,14 +8,20 @@
 """
 from __future__ import annotations
 
+import base64
 import math
 import os
+import random
+import struct
 import sys
 import unittest
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import ballistics                                              # noqa: E402
+import bot                                                     # noqa: E402
+import mapdata                                                 # noqa: E402
 import weapondata                                              # noqa: E402
 
 
@@ -290,6 +296,141 @@ class RealWeaponTests(unittest.TestCase):
         weapon = weapondata.get(1002010)
         shot = ballistics.solve(weapon, 600.0, 0.0)
         self.assertAlmostEqual(0.192, shot.seconds, places=3)
+
+
+class CoarseTerrainTests(unittest.TestCase):
+    """★★★ `bot._terrain_contact()` 的**粗网格加速**必须和逐像素扫逐位一致。
+
+    加速本身（`mapdata.MapTerrain.bullet_coarse()` + 按余量跳步）是纯性能改写：
+    实测空中飞 300 像素的一颗弹从 217 µs 降到 112 µs，而每颗在飞的弹每 32 ms
+    都要算一次 —— 子弹一多就是整格的预算（用户 2026-09-01 的掉帧）。
+
+    ⚠ 它改的是**命中判定**这条战斗关键路径。所以判据只有一条：
+      **返回值和 `_terrain_contact_exact()`（加速之前那一版）完全相等**。
+      不是「差不多」，不是「误差可接受」—— 元组相等。
+
+    差分测试自己造地形，不读 `bot_mapdata/`：造得出「宽度不是 16 的整数倍」
+    「图顶上面」「贴着图边」这些**真图里不一定采得到**的坑。
+    （最初的实现就是栽在「图宽 1800，最后一列块管到 x=1807，而 1800..1807
+      是出界＝实心」上，被随机差分逮到的。）
+    """
+
+    @staticmethod
+    def _blob(raw):
+        return base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
+
+    @classmethod
+    def _terrain(cls, width, height, walls):
+        """造一份 `MapTerrain`：`walls` 是 `(x, y)` 的集合，值 2（实心）。
+
+        站立面留空 —— 这一组只问 `blocks_bullet`，走不走得上去和它无关。
+        """
+        cells = bytearray((width * height + 3) // 4)
+        for x, y in walls:
+            i = y * width + x
+            cells[i >> 2] |= 2 << ((i & 3) * 2)
+        return mapdata.MapTerrain({
+            "format": mapdata.FORMAT,
+            "name": "Diff", "version": 18,
+            "width": width, "height": height,
+            "cells": cls._blob(bytes(cells)),
+            "ground_counts": cls._blob(struct.pack("<%dH" % width,
+                                                   *([0] * width))),
+            "ground_ys": cls._blob(b""),
+        })
+
+    def _check(self, terrain, cases):
+        for ax, ay, bx, by, radius in cases:
+            with self.subTest(seg=(ax, ay, bx, by), r=radius):
+                self.assertEqual(
+                    bot._terrain_contact_exact(terrain, ax, ay, bx, by, radius),
+                    bot._terrain_contact(terrain, ax, ay, bx, by, radius))
+
+    def test_the_coarse_grid_never_misses_a_blocking_cell(self):
+        """漏标一格就是「子弹穿墙」。多标只是慢一点，漏标是错的。"""
+        random.seed(4)
+        width, height = 61, 45          # 都**不是** 16 的整数倍
+        walls = {(random.randrange(width), random.randrange(height))
+                 for _ in range(150)}
+        terrain = self._terrain(width, height, walls)
+        grid, gw, _gh = terrain.bullet_coarse()
+        for x, y in walls:
+            self.assertTrue(
+                grid[(y >> mapdata.COARSE_SHIFT) * gw
+                     + (x >> mapdata.COARSE_SHIFT)],
+                f"({x}, {y}) 挡子弹却落在没标脏的块里")
+
+    def test_it_matches_the_pixel_walk_on_scattered_terrain(self):
+        random.seed(20260901)
+        width, height = 200, 150
+        walls = {(random.randrange(width), random.randrange(height))
+                 for _ in range(600)}
+        terrain = self._terrain(width, height, walls)
+        cases = []
+        for _ in range(400):
+            ax = random.uniform(-20, width + 20)
+            ay = random.uniform(-20, height + 20)
+            cases.append((ax, ay,
+                          ax + random.uniform(-250, 250),
+                          ay + random.uniform(-250, 250),
+                          random.choice((0.0, 1.0, 4.0, 8.0, 20.0))))
+        self._check(terrain, cases)
+
+    def test_it_matches_along_a_single_wall(self):
+        """一堵竖墙 —— 「跳过一整段空气然后正好撞上」的最干净形态。"""
+        terrain = self._terrain(200, 100, {(150, y) for y in range(100)})
+        cases = [(x, 50.0, 199.0, 50.0, r)
+                 for x in (0.0, 1.5, 10.0, 133.0, 149.0, 149.9)
+                 for r in (0.0, 1.0, 8.0)]
+        cases += [(199.0, 50.0, 0.0, 50.0, r) for r in (0.0, 1.0, 8.0)]
+        self._check(terrain, cases)
+
+    def test_it_matches_hard_against_the_map_edges(self):
+        """★ 图宽/高不是 16 的整数倍时，最后一列/行块是**残缺**的：
+        块里还有一截是「出界＝实心」，网格里却没有它。"""
+        terrain = self._terrain(1800, 800, {(900, y) for y in range(400, 800)})
+        cases = []
+        for start in (1700.0, 1780.0, 1799.0):
+            for dy in (-1.0, 0.0, 1.0, 40.0):
+                cases.append((start, 300.0, start + 60.0, 300.0 + dy, 8.0))
+                cases.append((start, 300.0, start - 400.0, 300.0 + dy, 8.0))
+        for start in (700.0, 790.0, 799.0):
+            cases.append((100.0, start, 900.0, start + 5.0, 8.0))
+        self._check(terrain, cases)
+
+    def test_it_matches_above_the_top_of_the_map(self):
+        """★ `y < 0` **不算实心**（§83）—— 高抛的手雷从图顶飞出去又落回来。"""
+        terrain = self._terrain(300, 200, {(x, 150) for x in range(300)})
+        cases = []
+        for ay in (-90.0, -30.0, -5.0, -1.0, 0.0, 3.0):
+            for by in (-80.0, -1.0, 20.0, 199.0):
+                cases.append((10.0, ay, 290.0, by, 8.0))
+                cases.append((290.0, by, 10.0, ay, 8.0))
+        self._check(terrain, cases)
+
+    def test_it_matches_on_degenerate_and_out_of_bounds_segments(self):
+        terrain = self._terrain(100, 80, {(50, 40)})
+        cases = [
+            (10.0, 10.0, 10.0, 10.0, 8.0),          # 零位移
+            (10.0, 10.0, 10.4, 10.4, 8.0),          # 亚像素
+            (-50.0, -50.0, 150.0, 130.0, 8.0),      # 整段在图外进出
+            (99.9, 79.9, 0.1, 0.1, 8.0),            # 贴着两个角
+            (50.0, 40.0, 60.0, 40.0, 8.0),          # 起点就在实心里
+        ]
+        self._check(terrain, cases)
+
+    def test_a_broken_breakable_changes_the_grid(self):
+        """破坏物碎了要放行 —— variant 的粗网格必须跟着换，不能沿用根那份。"""
+        terrain = mapdata.load("Beginner")
+        if terrain is None or not terrain.breakables:
+            self.skipTest("Beginner 没有破坏物")
+        gone = terrain.variant(frozenset())
+        self.assertIsNot(terrain.bullet_coarse()[0], gone.bullet_coarse()[0])
+        item = terrain.breakables[0]
+        cases = [(item.x - 60.0, float(item.y), item.x + 60.0, float(item.y),
+                  r) for r in (0.0, 4.0, 8.0)]
+        self._check(terrain, cases)
+        self._check(gone, cases)
 
 
 if __name__ == "__main__":

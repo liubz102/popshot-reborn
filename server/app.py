@@ -23,6 +23,7 @@ app.py —— 服务端唯一入口。
 from __future__ import annotations
 
 import argparse
+import atexit
 import errno
 import os
 import sys
@@ -32,6 +33,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import account_store
+import asynclog
 import authserver
 # ★ `bot` 在 `gameserver.on_chat()` 里是**惰性 import**（两个模块互相要对方，
 #   见 bot.py 开头「导入方向」）。那意味着 bot.py 缺失 / 语法坏掉时，服务端
@@ -52,9 +54,19 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
+# ★★ 从这一行起，所有日志都由 `asynclog` 那条写线程落盘（用户 2026-09-01）。
+#    **只有真服务端进程会调它** —— 单测里 `asynclog` 保持同步，行为和改造前
+#    一字不差，所以 `test_logs.py` 那几个断言 stdout 的用例一行都不用改。
+#    排在 `reconfigure` 之后：写线程每次写的时候现查 `sys.stdout`，但编码是
+#    进程级的，先设好省得第一批日志赶不上。
+asynclog.start()
+# 进程收尾时把队列排空。`stop.bat` 是强杀（拿不到 atexit），所以 KeyboardInterrupt
+# 那条路径里另有一发显式的 —— 两条路都要有，谁先到算谁的。
+atexit.register(asynclog.stop)
+
 
 def log(msg):
-    print(f"[{gameserver.ts()}] [app] {msg}", flush=True)
+    asynclog.emit(f"[{gameserver.ts()}] [app] {msg}")
 
 
 class _AuthArgs:
@@ -380,6 +392,7 @@ def main(argv=None):
             time.sleep(3600)
     except KeyboardInterrupt:
         log("bye")
+        asynclog.stop()      # 把「bye」和它前面那些真的写出去再退
 
 
 if __name__ == "__main__":

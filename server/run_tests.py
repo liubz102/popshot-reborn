@@ -27,7 +27,8 @@ MODULES = ("test_account_store", "test_gameserver", "test_online",
            "test_chrprops",
            "test_ballistics",
            "test_relayserver", "test_proxy",
-           "test_latency", "test_logs", "test_udpsync", "test_ports",
+           "test_latency", "test_logs", "test_asynclog",
+           "test_udpsync", "test_ports",
            "test_versioning", "test_roomclock")
 
 

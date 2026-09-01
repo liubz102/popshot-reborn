@@ -48,15 +48,35 @@ class FindStaleTests(unittest.TestCase):
         made = [touch(os.path.join(self.dir, name), days_ago=5) for name in (
             "server.out", "server.err", "relay.out", "relay.err",
             "bsloader.out", "bsloader.err",
+            # ★ 启动脚本归档下来的上一次那份（`Move-LogAside` / `rotate_log`，
+            #   用户 2026-09-01）。它们也必须到期被清掉，否则「不覆盖」就变成
+            #   「只增不减」，比覆盖还糟。
+            "server-20260901-013012.out", "server-20260901-013012.err",
+            "relay-20260901-013012.out", "relay-20260901-013012.err",
+            "bsloader-20260901-013012.out", "bsloader-20260901-013012.err",
             "bshook_20260813_142534_pid24332.log",
             "online.log", "online-20260810.log",
+            # ★ 逐连接抓包现在名字里带 `logcleanup.RUN_STAMP`（同一天多次
+            #   启动不再互相覆盖）。新旧两种写法都得认。
             "game_001_27799.txt", "game_001_27799.raw.bin",
             "game_001_27799.dec.bin",
+            "game_20260901-013012_001_27799.txt",
+            "game_20260901-013012_001_27799.raw.bin",
+            "game_20260901-013012_001_27799.dec.bin",
             "auth_001_47611.txt", "auth_001_47611.bin",
+            "auth_20260901-013012_001_47611.txt",
+            "auth_20260901-013012_001_47611.bin",
             "conn_001_27799.txt", "conn_001_27799.bin",
         )]
         self.assertEqual(self.name(*made),
                          self.name(*logcleanup.find_stale(self.dir, 3)))
+
+    def test_the_run_stamp_is_a_sortable_timestamp(self):
+        """`RUN_STAMP` 进了文件名，格式错了会直接体现在磁盘上。"""
+        self.assertRegex(logcleanup.RUN_STAMP, r"^\d{8}-\d{6}$")
+        # 它必须在**模块导入**时就定死 —— 每条连接各算一次的话，
+        # 同一次启动的抓包文件就分不到一组里去了。
+        self.assertIs(logcleanup.RUN_STAMP, logcleanup.RUN_STAMP)
 
     def test_state_files_and_stray_artifacts_are_never_touched(self):
         # ★ `.server_mode` / `.relay_target` 是启动脚本的状态文件，

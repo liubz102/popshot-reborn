@@ -65,15 +65,33 @@ class Ledger(object):
     所以完好的一局里它们恒空，一点开销都没有。
     """
 
-    __slots__ = ("hp", "broken_at")
+    __slots__ = ("hp", "broken_at", "_alive_memo", "_alive_until")
 
     def __init__(self):
         self.hp = {}
         self.broken_at = {}
+        #: ★ `alive()` 上一次的答案，以及它**什么时候会失效**。
+        #:
+        #: 为什么要缓存（用户 2026-09-01 的卡顿）：`alive()` 每次都新建一个
+        #: `frozenset(range(N))`，而 `bot._terrain(room)` 一格里被调 6~10 次
+        #: × 每个 bot；`MapTerrain.variant()` 拿到它之后还要再建一个
+        #: 才去查 memo。62 件破坏物的图上，这是每秒两万多次白建集合。
+        #:
+        #: 失效判据是**事件**，不是定时器（铁律 10）：`broken_at` 变了
+        #: （`damage` / `note_broken` / `clear` 会动它），或者时间越过了
+        #: 「下一件该长回来的时刻」—— 后者是原版自己就用时钟的那一半
+        #: （`0x4fa4e9`），见文件头的豁免说明。
+        self._alive_memo = None
+        self._alive_until = 0.0
+
+    def _forget(self):
+        """`broken_at` 变了 —— `alive()` 的答案跟着作废。"""
+        self._alive_memo = None
 
     def clear(self):
         self.hp.clear()
         self.broken_at.clear()
+        self._forget()
 
     def alive(self, terrain, now=None):
         """现在还立着的那几件的下标（`frozenset`），顺便把该长回来的收掉。
@@ -84,8 +102,16 @@ class Ledger(object):
         if terrain is None or not getattr(terrain, "breakables", ()):
             return frozenset()
         if not self.broken_at:
-            return frozenset(range(len(terrain.breakables)))
+            memo = self._alive_memo
+            if memo is None or len(memo) != len(terrain.breakables):
+                memo = frozenset(range(len(terrain.breakables)))
+                self._alive_memo = memo
+                self._alive_until = float("inf")   # 没碎的，等不到恢复
+            return memo
         now = time.monotonic() if now is None else now
+        memo = self._alive_memo
+        if memo is not None and now < self._alive_until:
+            return memo
         for index in list(self.broken_at):
             item = _item(terrain, index)
             if item is None:
@@ -97,8 +123,22 @@ class Ledger(object):
                 self.broken_at.pop(index, None)
                 self.hp.pop(index, None)
         broken = set(self.broken_at)
-        return frozenset(i for i in range(len(terrain.breakables))
+        memo = frozenset(i for i in range(len(terrain.breakables))
                          if i not in broken)
+        # 缓存到「下一件该长回来的那一刻」为止 —— 在那之前答案不可能变
+        # （除非有人再打碎一件，那条路会 `_forget()`）。
+        soonest = float("inf")
+        for index, at in self.broken_at.items():
+            item = _item(terrain, index)
+            if item is None:
+                soonest = 0.0
+                break
+            due = at + item.regen_ms / 1000.0
+            if due < soonest:
+                soonest = due
+        self._alive_memo = memo
+        self._alive_until = soonest
+        return memo
 
     def damage(self, terrain, index, amount, now=None):
         """给第 `index` 件扣血；这一下把它打碎了就返回 `True`。"""
@@ -111,6 +151,7 @@ class Ledger(object):
             return False
         self.hp[index] = 0
         self.broken_at[index] = time.monotonic() if now is None else now
+        self._forget()                  # 存活集合变了，`alive()` 的缓存作废
         return True
 
     def blast(self, terrain, x, y, splash_range, splash_damage, mult=1,

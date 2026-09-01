@@ -112,7 +112,7 @@ V0.3 立三条硬规矩：
 | `re/` | 逆向产物：`BigShot_22524.exe`、`packets.txt`、`rtti_types.txt`、`vftables.json`（机械生成，**别手改**）、★ **`packet_api.md`** |
 | `hook/` | MSVC x86 工程：`bshook.dll`（注入）+ `bsloader.exe`（启动器） |
 | `updater/` | 自研更新器（C 工程），编译产物是 `game_patched\BsPatcherChn.exe` |
-| `server/` | Python 服务端（**单机假服务器和云端服务端是同一套代码**）。★ V0.3 新增 `bot.py` / `botsync.py` / `ballistics.py` / `mapdata.py` / `weapondata.py` / `chrprops.py`，以及三份产物 **`bot_mapdata/`**（地形）、**`bot_weapons.json`**（武器表）、**`bot_chrprops.json`**（角色碰撞圆 + 冲刺招式 + 体力常量）—— 都进 git、进两个包。★ `server/data/` **只装用户数据**（`accounts.json` / `tickets.json`，都 `.gitignore`），别往里塞产物（D22） |
+| `server/` | Python 服务端（**单机假服务器和云端服务端是同一套代码**）。★ V0.3 新增 `bot.py` / `botsync.py` / `ballistics.py` / `mapdata.py` / `weapondata.py` / `chrprops.py` / **`asynclog.py`**（日志异步出口，D109），以及三份产物 **`bot_mapdata/`**（地形）、**`bot_weapons.json`**（武器表）、**`bot_chrprops.json`**（角色碰撞圆 + 冲刺招式 + 体力常量）—— 都进 git、进两个包。★ `server/data/` **只装用户数据**（`accounts.json` / `tickets.json`，都 `.gitignore`），别往里塞产物（D22） |
 | `runtime/python/` | 内置 CPython 3.14.3 x64 embeddable |
 | `runtime-win7/python/` | **Win7 兼容运行时** CPython 3.8.10 win32。★ 改服务端代码后顺手 `runtime-win7\python\python.exe server\run_tests.py`，别把 3.8 兼容性弄丢 |
 | `runtime-linux/` | 服务端包发给 Linux 的那份 CPython 3.14.7，**故意不解压** |
@@ -203,6 +203,18 @@ D:\git\popshot-reborn\main\Pack_decrypt\Data\        ← ChrProps.ini / map.ini 
   `start.bat` 会复用已经在跑的服务端，所以要生效就先 `stop.bat`。
 - 起完看三个地方：`logs/server.out`（服务端）、`logs/server.err`（该是空的）、
   `logs/bshook_*.log`（客户端探针）。
+- ★ **`server.out` 永远是「当前这次运行」**；上一次那份在启动时被改名成
+  `server-<那次结束的时刻>.out` 归档，3 天后由 `logcleanup` 自动清掉（D112）。
+  `relay.out` / `bsloader.out` 同理，抓包文件名里带本次启动时刻。
+  要看上一局就翻归档那份，别以为丢了。
+- ★ **日志一律异步写**（D109）：客户端是环形缓冲 + 写盘线程，服务端是
+  `server/asynclog.py` 的队列 + 写线程。**别往热路径上加同步 `print` /
+  `fh.write`** —— `BotConn.log` / `Conn.log` 都在 `room.sim_lock` 里面，
+  一等磁盘整个房间跟着等（§150）。单测里 `asynclog` 没 `start()`，行为和
+  同步写逐字一致，所以断言 stdout 的用例照旧能写。
+- ★ **弹体逐帧诊断默认跟日志级别走**（D113）：`start.bat` 不装那三个 detour，
+  `start-debug.bat` 才装。要在精简模式下查弹体，自己设
+  `BSHOOK_PROJ_DIAG=1`（反弹法线是 `BSHOOK_MOVE_DIAG=1`）。
 
 ### ⚠ 「启动游戏」≠「操作游戏」
 

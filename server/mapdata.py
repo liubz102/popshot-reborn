@@ -109,6 +109,23 @@ _UNPACK = tuple(bytes(((b >> 0) & 3, (b >> 2) & 3, (b >> 4) & 3, (b >> 6) & 3))
                 for b in range(256))
 #: 再把 0..3 压成「非空 = 1」。和 `tools/mapdata.py` 的 `_SOLID` 同一张表。
 _SOLID = bytes((0, 1, 1, 1)) + bytes(252)
+#: 压成「**挡子弹** = 1」（值 ≥ 2；单向平台 1 不挡，见文件头 §29）。
+#: `bullet_coarse()` 用它。
+_BLOCKS_BULLET = bytes((0, 0, 1, 1)) + bytes(252)
+
+#: ★★ **粗网格的块边长**（像素），`bullet_coarse()` 用。
+#:
+#: 为什么要有粗网格（用户 2026-09-01 的「子弹多就卡」）：
+#: `bot._terrain_contact()` 是**逐像素**扫的（`BOT_SHELL_TERRAIN_STEP = 1`，
+#: 那个 1 是原版口径，不能改），实测空中飞 300 像素的一颗弹要 **270 µs**，
+#: 而每颗在飞的弹每 32 ms 都要算一次 —— 10 颗就吃掉 2.7 ms / 32 ms。
+#: 有了粗网格，成片的空气可以**整块跳过**，逐像素只留给真的贴着地形的那几步。
+#:
+#: 16 是权衡出来的，不是拍的：块越大跳得越远，但「这一块里有地形」的
+#: 误判面积按平方涨（贴地飞的弹会整段退回逐像素）。16×16 让最大的图
+#: （11350×768）也只要 34 KB，而空中一步能跳过平均 7~8 个像素。
+COARSE_SHIFT = 4
+COARSE = 1 << COARSE_SHIFT
 
 
 class Breakable(object):
@@ -248,7 +265,7 @@ class MapTerrain(object):
     __slots__ = ("name", "version", "width", "height", "_cells",
                  "_offsets", "_ys", "points", "jump_pads", "__weakref__",
                  "breakables", "alive", "_base_cells", "_base_offsets",
-                 "_base_ys", "_root", "_variants")
+                 "_base_ys", "_root", "_variants", "_coarse", "_base_coarse")
 
     def __init__(self, record):
         self.name = record["name"]
@@ -280,6 +297,9 @@ class MapTerrain(object):
             for i, item in enumerate(record.get("breakables", ())))
         self._root = self
         self._variants = {}
+        #: 粗网格（弹道加速）。`_base_coarse` 只存在于**根地形**上，
+        #: 所有 variant 共用它；`_coarse` 是本 variant 自己那份。
+        self._base_coarse = None
         # 缺省状态 = **全都还在**：原版里碎了会自己长回来，完好才是稳态。
         self._compose(frozenset(range(len(self.breakables))))
 
@@ -288,6 +308,8 @@ class MapTerrain(object):
     def _compose(self, alive):
         """把 `alive` 这几件破坏物贴上去，重算被盖住的那几列站立面。"""
         self.alive = alive
+        # ★ `_cells` 要重建，挂在它上面的粗网格跟着作废（懒重建）。
+        self._coarse = None
         items = [b for b in self.breakables if b.index in alive]
         if not items:
             self._cells = self._base_cells
@@ -390,6 +412,7 @@ class MapTerrain(object):
                 setattr(got, field, getattr(root, field))
             got._root = root
             got._variants = root._variants
+            got._base_coarse = None       # 只认根那份（`_base_coarse_grid`）
             got._compose(alive)
             root._variants[alive] = got
         return got
@@ -410,6 +433,87 @@ class MapTerrain(object):
     def blocks_bullet(self, x, y):
         """挡得住**子弹**吗。★ 单向平台（值 1）**不挡**，见文件头 §29。"""
         return self.cell(x, y) >= 2
+
+    # -- 粗网格（弹道加速） -------------------------------------------------
+
+    def _base_coarse_grid(self):
+        """**不含破坏物**的那张粗网格，整张图算一次，所有 variant 共用。
+
+        走 `_base_cells`（原网格）而不是 `_cells`：破坏物是一层一层 OR 上去的，
+        每换一个存活集合就整张重算的话，最大的图要 96 ms —— 那本身就是一次
+        卡顿。破坏物那几块由 `bullet_coarse()` 另外补，见那边。
+        """
+        root = self._root
+        got = root._base_coarse
+        if got is not None:
+            return got
+        width, height = self.width, self.height
+        gw = (width + COARSE - 1) >> COARSE_SHIFT
+        gh = (height + COARSE - 1) >> COARSE_SHIFT
+        grid = bytearray(gw * gh)
+        cells = root._base_cells
+        for y in range(height):
+            i0 = y * width
+            i1 = i0 + width - 1
+            first, last = i0 >> 2, (i1 >> 2) + 1
+            flat = b"".join(map(_UNPACK.__getitem__, cells[first:last]))
+            off = i0 - (first << 2)
+            row = flat[off:off + width].translate(_BLOCKS_BULLET)
+            pos = row.find(1)
+            if pos < 0:
+                continue                    # 整行都是空气（绝大多数行）
+            base = (y >> COARSE_SHIFT) * gw
+            while pos >= 0:
+                bx = pos >> COARSE_SHIFT
+                grid[base + bx] = 1
+                # 直接跳到下一块的开头 —— 同一块里再有几个也没有新信息。
+                pos = row.find(1, (bx + 1) << COARSE_SHIFT)
+        got = (bytes(grid), gw, gh)
+        root._base_coarse = got
+        return got
+
+    def bullet_coarse(self):
+        """「每 `COARSE`×`COARSE` 一块，这块里**有没有**挡子弹的格子」。
+
+        返回 ``(网格 bytes, 网格宽, 网格高)``，`网格[by * 宽 + bx]` 非 0 = 这一块
+        里有东西。**只读、按地形对象 memo 一份**（地形本身就是只读的）。
+
+        用法见 `bot._terrain_contact()`：某一步的采样点落在为 0 的块里 ⇒
+        这一块内部整个是空的 ⇒ 该采样点连同**它在这块里还能走的那几步**
+        全都不用逐格问，直接跳过去。跳多远由采样点离块边还有多少像素决定
+        （每步每个轴最多走 1 像素），所以**结果和逐像素扫完全一致**。
+
+        ★★ 网格只会**多**标不会**少**标：还活着的破坏物按**外接矩形**整块标脏
+        （不是按它真正的形状）。标脏的后果只是「这一段退回逐像素扫」，
+        而逐像素扫给的就是精确答案 —— 所以过度标记安全，漏标才不安全。
+        换来的是换一个存活集合只要几十微秒，不用整张重算。
+
+        ★ 出界不进这张网格：`y < 0` 不算实心（§83），左右和底下算实心，
+          三种口径各不相同，交给调用方按老规矩判 —— 那几步很少见，不值得
+          为它把网格搞复杂。
+        """
+        got = self._coarse
+        if got is not None:
+            return got
+        base, gw, gh = self._base_coarse_grid()
+        alive = self.alive
+        items = [b for b in self.breakables
+                 if b.index in alive and b.col1 >= 0]
+        if not items:
+            got = (base, gw, gh)
+        else:
+            grid = bytearray(base)
+            for item in items:
+                bx0 = max(0, item.col0) >> COARSE_SHIFT
+                bx1 = min(self.width - 1, item.col1) >> COARSE_SHIFT
+                by0 = max(0, item.row0) >> COARSE_SHIFT
+                by1 = min(self.height - 1, item.row1) >> COARSE_SHIFT
+                for by in range(by0, by1 + 1):
+                    row = by * gw
+                    grid[row + bx0:row + bx1 + 1] = b"\x01" * (bx1 - bx0 + 1)
+            got = (bytes(grid), gw, gh)
+        self._coarse = got
+        return got
 
     def is_one_way(self, x, y):
         """是不是单向平台：站得上去，按 ↓ 能穿下去，往上跳能穿过去。"""

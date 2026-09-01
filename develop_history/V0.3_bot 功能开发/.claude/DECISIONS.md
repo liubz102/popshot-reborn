@@ -2383,3 +2383,155 @@ select 还有 512 个 fd 的上限。而这个项目本来就是一人一条读�
 **顺带**：`--room-burst-delay`（§120 的复现开关）整个删掉 —— 用户说不需要了，
 而留着它就要在写线程里专门养一条并发岔路。§120 的回归由
 `test_the_whole_room_burst_goes_out_in_one_write` 继续钉着。
+
+## D109 ★★★★★ 日志一律**异步写**——客户端环形缓冲 + 写盘线程，服务端队列 + 写线程
+
+**问题**（§150）：客户端每条日志同步 `FlushFileBuffers`（2 ms，还握着全局锁），
+服务端每条日志 `print(..., flush=True)` 而且发生在 `room.sim_lock` 里面。
+两边都是「游戏逻辑线程在等磁盘」。
+
+**决定**：两边都改成「生产者只入队，一条专用线程负责落盘」。
+
+### 客户端（`hook/bshook.c`）
+
+4 MB 静态环形缓冲 + 一条写盘线程。生产者只做「格式化到栈上 + memcpy 进环 +
+可能一次 `SetEvent`」；写线程整批取走、**一次 `WriteFile` 写一批**。
+
+* **flush 的判据是「这一批里有没有关键记录」**，不是计时器也不是计数
+  （铁律 10）。忙的时候一批几百条只 flush 一次，闲的时候一批就一条、和改之前
+  一样一条一 flush —— 关键事件的持久性一点没降。
+* **环满就丢**，`g_dropped++`，绝不阻塞游戏线程；写线程排空时按**状态翻转**
+  补一行「丢了 N 条」再清零。
+* **`OutputDebugStringA` 挪到写线程上**，仍然只给关键记录用。
+* 收尾：`DLL_PROCESS_DETACH` 里就地排空（进程退出时别的线程已经没了，所以用
+  `TryEnterCriticalSection`，拿不到就不加锁直接排）；DllMain 的三条
+  `return FALSE` 之前也各补一发。
+
+**为什么敢把「每条 flush」降成「每批 flush」**：`WriteFile` 过的字节即使没
+flush 也已经在 OS 文件缓存里，进程被 `TerminateProcess` 掉也不丢，只有整机
+断电才丢。这正是原来「详细日志不 flush」那条早就在用的理由。真正的风险窗口
+只剩「还在环里、写线程还没取走」的那几微秒。
+
+### 服务端（新 `server/asynclog.py`）
+
+**不引入 `logging`**，照抄仓库里已经在用的异步模式（`botplan.Planner` /
+`roomclock.Scheduler` / `Conn._writer_loop`）。三条理由：
+
+1. 服务端一行 `logging` 都没用过，全是裸 `print` 和 `fh.write`。要接
+   `QueueHandler` 得把几百个调用点改成 `logger.info(...)`，改动面大得多；
+2. `logging` 每条记录都要 `findCaller`（`sys._getframe`），在 31 Hz × N 房间
+   的量级上是白花的钱；
+3. f-string 在调用前就求值了，`QueueHandler` 省不掉它 —— 逐包 dump 那种贵的
+   格式化**必须**保留调用点上的 `if VERBOSE:` 前置门，换成 logging 反而容易
+   让人以为「有 level 了就不用管」。
+
+★ **没 `start()` 的时候就是同步写**，和改造前逐字一致 ⇒ 现有测试
+（`test_logs.py` 那几个 `redirect_stdout` 断言）**一行都没改**。只有 `app.py`
+会 `start()`。单队列 ⇒ 全局顺序和改造前完全一样；写线程按目标**连续分组**，
+每组一次 `write` + 一次 `flush`。
+
+**改的是「最后真正落笔」的那十几处**（`Conn.log` / `BotConn.log` /
+`eventlog._write` / `[sim]` 那几条裸 print / 注入给 relay/udpsync 的 lambda /
+`authserver.log` / `relay.log` / `web` 的访问日志 / verbose 抓包的
+`fb_raw`/`fb_dec`），上游几百个调用点一个没动。
+
+⚠ **抓包文件关闭前要 `drain()`**：队列里可能还压着这条连接的字节，先关文件
+的话最后那几个包会静默丢掉。只有 `--verbose` 会走到，而且是断线收尾、不是
+战斗路径。
+
+
+## D110 ★★★ 弹道地形扫描加一层**粗网格**跳过空气 —— 但只快 2×，别指望更多
+
+**问题**（§150）：`bot._terrain_contact()` 逐像素扫，空中飞 300 像素要 270 µs，
+而每颗在飞的弹每 32 ms 都要算一次。
+
+**决定**：`mapdata.MapTerrain.bullet_coarse()` —— 每 16×16 一块记「这块里有没有
+挡子弹的格子」，采样点落在空块里就整段跳过。
+
+* **跳几步是算出来的，不是猜的**：走 j 步的位移是 `δ = j × |d| / steps`，而
+  `|floor(u+δ) − floor(u)| ≤ floor(δ) + 1`，所以 `δ < 离块边的像素数` 就一定
+  还在同一块里。展开成 `j × |d| < margin × steps`，全整数比较。
+  ⇒ **返回值和逐像素扫逐位一致**，不是近似。
+* **x 和 y 的余量必须分开算**。一开始取 min 之后拿 `span`（两轴最大值）一起
+  换算，斜率 6:1 的平射弹被慢轴白白拖住 —— 平均只能跳 1.8 步；分开之后跳 8 步
+  以上，这一处就差了 1.7 倍。
+* **「还能走多远」同时受块边和图边两个约束**。只看块边会栽在残缺的边界块上
+  （§150 那 129 条差分失败全是这一个原因）。
+* 破坏物按**外接矩形**整块标脏，不按真实形状 —— 多标只是「这一段退回逐像素」，
+  而逐像素给的就是精确答案，**过度标记安全，漏标才不安全**。换来的是换一个
+  存活集合只要几十微秒，不用整张重算（整张要 20~90 ms）。
+* 根地图那张网格在**后台预热线程**里烘（`_warm_navigation_now`，和可达图一起），
+  不落在战斗那一格里。
+
+**为什么停在 2× 不往下做**：Python 里一次粗检查约等于 4 次逐格问，平均跳 8 步
+⇒ 净收益就是 2 倍。再快一个量级要上「每块记到最近脏块几格」的距离场，代价是
+每图再多几十毫秒预热 + 一批新的边界情况，而这条路径是**命中判定**。
+先把已经验证过的 2× 落地，等真有需要再说。
+
+**验收判据只有一条**：`_terrain_contact()` 和 `_terrain_contact_exact()`
+（加速之前那一版，原样留着）**返回值元组相等**。不是「差不多」，不是
+「误差可接受」。差分测试在 `test_ballistics.CoarseTerrainTests` 里，
+自己造地形（造得出「宽度不是 16 的整数倍」「图顶上面」这些真图不一定采得到
+的坑），另有 174 张真图 × 20880 条随机线段跑过一轮 0 不一致。
+
+
+## D111 ★ 房间那一格量**分段耗时**，只在报「落后」的那一刻打出来
+
+**问题**：`[sim] ⚠ 落后 38 格` 只告诉你「慢了」，不告诉你**慢在谁身上**。
+§150 里「account_store 的 fsync 在 sim_lock 里」这条嫌疑就是因为没有数据而
+不敢动。
+
+**决定**：`RoomLoop.run_tick()` 按阶段量（等锁 / 杂事 / bot / 总），存进
+`self.spent`；`_note_late()` 报「落后」时把最近一格的分段跟在后面一起打。
+
+* 量一格就两次 `perf_counter`，在 32 ms 面前可以忽略；
+* 打日志仍然是**状态翻转**触发，平时一个字都不写（铁律 10）；
+* 走异步日志，所以连那一下也不占房间线程的时间。
+
+
+## D112 日志**归档**而不是覆盖：`server.out` 永远是「本次」，上一次改名让位
+
+**问题**（§150）：同一天多次重启，`server.out` / `relay.out` / `bsloader.out` /
+抓包文件互相覆盖。用户 2026-09-01：「我希望不要被覆盖、只清理过期日志。」
+
+**决定**：沿用 `eventlog.py` 已经验证过的那套模型 —— **改名归档 + 让 mtime
+自然老化，交给 `logcleanup` 按天回收**。不引入任何新的保留策略
+（`log_retention_days` 保持 3 天不变）。
+
+* **启动脚本侧**：`tools/wincompat.ps1` 加 `Move-LogAside`
+  （`serverctl.sh` 加等价的 `rotate_log`）—— 起进程**之前**把旧的改名成
+  `server-yyyyMMdd-HHmmss.out`。`Start-Process -RedirectStandardOutput` 是
+  截断语义、PowerShell 没有追加模式，所以只能在起之前动手。
+  ⇒ `logs\server.out` **仍然永远是「当前这次运行」**，文档和「看 server.err
+  末尾」的失败诊断都不用改。
+* **归档名用文件自己的 `LastWriteTime`，不是「现在」**：① 名字标的是那次运行
+  **结束**的时刻；② `Move-Item` / `mv` 保留 mtime ⇒ `logcleanup` 按 mtime
+  老化立刻就对，不会因为刚归档过而白白多留 3 天。
+* **0 字节的不留**（上次启动就没写出东西的 `.err`），免得攒一堆空文件。
+* **挪不动就原样往下走**（正被占着、目标重名）—— 归档不值得为它冒
+  「服务端起不来」的险，和 `eventlog._rotate_unlocked` 同一个取舍。
+* **抓包文件**（`auth_NNN` / `game_NNN`）序号是进程级的、每次启动从 1 重来，
+  所以名字里加 `logcleanup.RUN_STAMP`（模块导入时算一次 = 进程启动时刻）：
+  `auth_20260901-023945_001_47611.txt`。`RUN_STAMP` 放在 `logcleanup` 里是
+  因为它是 `logs/` 的门房、**不 import 任何别的 server 模块**，
+  `authserver` 和 `gameserver` 都能安全地拿它。
+* 新名字仍然落在 `LOG_PATTERNS` 白名单里（`*.out` / `*.err` / `auth_*` /
+  `game_*`），到期照样被清 —— 否则「不覆盖」就变成「只增不减」，比覆盖还糟。
+  `test_logs.py` 那张「每一种真会长出来的文件都必须被认出来」的清单已补上。
+
+
+## D113 ★★ 弹体 / Move 诊断 hook 的默认值改成**跟日志级别走**
+
+**问题**（§150）：`proj_diag_enabled()` / `move_diag_enabled()` 以前是
+「环境变量没设 = **开**」，于是 `start.bat` 正常游玩时那三个**每帧每弹体**的
+detour 一直在跑，精简模式日志里 89% 的行出自它。
+
+**决定**：没设时跟 `g_verbose` 走（`start.bat` 关、`start-debug.bat` 开），
+显式设 `BSHOOK_PROJ_DIAG=1` / `=0` 仍然能强制覆盖。
+
+* 关掉时 `patch_thread` 压根不装那三个 detour ⇒ 连 `IsBadReadPtr(p, 0x340)`
+  （每弹体每帧探 13 页）和 64 项线性扫描一起省掉，是真的零成本。
+* 安全性已确认：`g_proj_track` **只被诊断代码自己读写**，不喂同步路径。
+  这两段代码的注释本来就写着「临时，查完就删」。
+* 顺带把 `proj_tick_log` 那三条从 `bslog` 换成 `bsvlog` —— 即使有人手动开了
+  `BSHOOK_PROJ_DIAG=1`，每帧级的东西也不该占 flush + DebugView 那一档。

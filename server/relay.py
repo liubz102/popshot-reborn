@@ -45,6 +45,7 @@ import time
 from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import asynclog
 import config as server_config
 import udpsync
 from netlisten import create_listener, tune_stream
@@ -314,7 +315,7 @@ def ts():
 
 
 def log(msg):
-    print(f"[{ts()}] [relay] {msg}", flush=True)
+    asynclog.emit(f"[{ts()}] [relay] {msg}")
 
 
 def vlog(msg):

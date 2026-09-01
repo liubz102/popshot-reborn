@@ -56,11 +56,185 @@ static volatile LONG     g_stop = 0;
  * 排查问题该有的证据一条不少。 */
 static volatile LONG     g_verbose = 0;
 
+/* ★★★ 异步写盘（用户 2026-09-01：「把所有 log 改成异步写入，不要阻塞游戏进程」）
+ *
+ * 改之前：`bslog_emit` 在**游戏线程上**做 格式化 → 进临界区 → WriteFile →
+ * FlushFileBuffers（上面注释里自己记的 **2.0 ms/条**，而且是**握着锁**等的）
+ * → 出临界区 → OutputDebugStringA。于是：
+ *   - 打日志的那条线程每条停 2 ms；
+ *   - 临界区盖住了 flush ⇒ 别的线程（watch_thread 10 Hz、patch_thread）
+ *     一打日志就把渲染/网络线程一起拖住 —— 「护航效应」；
+ *   - 弹体诊断是**每帧 × 每弹体**的（见 `proj_tick_log`），60 fps 的 16.7 ms
+ *     预算里光日志就吃掉大半 —— 用户报的「子弹一多就突发性掉帧」正是这个。
+ *
+ * 改之后：**环形缓冲 + 一条专用写盘线程**。
+ *   - 生产者只做「格式化 + memcpy 进环 + 可能一次 SetEvent」，微秒级；
+ *   - 写线程整批取走、**一次 WriteFile 写一批**，磁盘的账全记在它头上。
+ *
+ * ★ flush 的判据是**「这一批里有没有关键记录」**，不是计时器也不是计数
+ *   （铁律 10）：忙的时候一批几百条只 flush 一次，闲的时候一批就一条、
+ *   和改之前一样一条一 flush。关键事件的持久性一点没降。
+ *
+ * ★ 崩溃安全性：`WriteFile` 过的字节即使没 flush 也已经在 OS 文件缓存里，
+ *   进程被 TerminateProcess 掉也不丢，只有整机断电才丢 —— 这正是下面
+ *   「详细日志不 flush」那条早就在用的理由，现在对关键日志同样成立，
+ *   因为 flush 只是从「每条」变成「每批」，没有取消。真正的风险窗口只剩
+ *   「还在环里、写线程还没取走」的那几微秒。
+ */
+#define BSLOG_RING_BYTES   (1 << 22)      /* 4 MB。这是**内存预算**，不是判据 */
+#define BSLOG_BATCH_BYTES  (64 * 1024)    /* 写线程一批最多搬这么多 */
+
+static char   g_ring[BSLOG_RING_BYTES];
+static DWORD  g_ring_head = 0;            /* 写线程从这儿取 */
+static DWORD  g_ring_tail = 0;            /* 生产者往这儿放 */
+static DWORD  g_ring_used = 0;
+static DWORD  g_dropped   = 0;            /* 环满丢掉了几条（写线程负责补报） */
+static HANDLE g_log_evt    = NULL;        /* 自动重置：环「从空变非空」时置位 */
+static HANDLE g_log_thread = NULL;
+
+/* 环里一条记录 = [长度低字节][长度高字节][detail 标志][正文 长度字节]。
+   正文最长 8192，3 + 8192 一定塞得进 BSLOG_BATCH_BYTES，所以写线程每批
+   至少能搬走一条，不会卡死在「一条都放不下」上。 */
+#define BSLOG_HDR 3
+
+/* 下面四个 ring_* 都**要求调用方已经持有 g_cs**（收尾路径除外，见 bslog_shutdown）。 */
+static void ring_put(const void *src, DWORD n)
+{
+    DWORD first = BSLOG_RING_BYTES - g_ring_tail;
+    if (first > n) first = n;
+    memcpy(g_ring + g_ring_tail, src, first);
+    if (n > first) memcpy(g_ring, (const char *)src + first, n - first);
+    g_ring_tail = (g_ring_tail + n) % BSLOG_RING_BYTES;
+    g_ring_used += n;
+}
+
+static void ring_get(void *dst, DWORD n)
+{
+    DWORD first = BSLOG_RING_BYTES - g_ring_head;
+    if (first > n) first = n;
+    memcpy(dst, g_ring + g_ring_head, first);
+    if (n > first) memcpy((char *)dst + first, g_ring, n - first);
+    g_ring_head = (g_ring_head + n) % BSLOG_RING_BYTES;
+    g_ring_used -= n;
+}
+
+/* 环头那条记录的**整条**长度（含 3 字节头）；环空返回 0。不移动 head。 */
+static DWORD ring_peek(void)
+{
+    DWORD lo, hi;
+    if (g_ring_used < BSLOG_HDR) return 0;
+    lo = (unsigned char)g_ring[g_ring_head];
+    hi = (unsigned char)g_ring[(g_ring_head + 1) % BSLOG_RING_BYTES];
+    return BSLOG_HDR + lo + (hi << 8);
+}
+
+/* 直接写盘的底层（写线程 / 收尾路径用，**不经过环**）。 */
+static void bslog_write_raw(const char *text, DWORD n)
+{
+    DWORD written;
+    if (g_log != INVALID_HANDLE_VALUE && n)
+        WriteFile(g_log, text, n, &written, NULL);
+}
+
+/* 把环里现在有的记录搬一批写出去。返回这一批搬了多少字节（0 = 环空）。
+   `take_lock = 0` 只给收尾路径用（那时没有并发方，见 bslog_shutdown）。 */
+static DWORD bslog_drain_once(int take_lock)
+{
+    /* ★ 只有写线程和收尾路径会进这个函数，两者不并发，所以 static 缓冲安全，
+       也避免了在 4 MB 环之外再往栈上要 64 KB。 */
+    static char batch[BSLOG_BATCH_BYTES];
+    static char text[BSLOG_BATCH_BYTES];
+    DWORD used = 0, dropped = 0, rec, off, textn = 0;
+    int   crit = 0;
+
+    if (take_lock) EnterCriticalSection(&g_cs);
+    while ((rec = ring_peek()) != 0 && used + rec <= sizeof(batch)) {
+        ring_get(batch + used, rec);
+        used += rec;
+    }
+    dropped = g_dropped;
+    g_dropped = 0;
+    if (take_lock) LeaveCriticalSection(&g_cs);
+
+    if (!used && !dropped) return 0;
+
+    /* 这一段全在锁外做 —— 生产者可以同时往环里放，互不打扰。 */
+    for (off = 0; off + BSLOG_HDR <= used; ) {
+        DWORD len = (unsigned char)batch[off] + ((DWORD)(unsigned char)batch[off + 1] << 8);
+        int   detail = batch[off + 2];
+        if (off + BSLOG_HDR + len > used) break;      /* 不该发生，防御 */
+        memcpy(text + textn, batch + off + BSLOG_HDR, len);
+        textn += len;
+        if (!detail) crit = 1;
+        off += BSLOG_HDR + len;
+    }
+    bslog_write_raw(text, textn);
+
+    /* 环满丢过日志就补一行说清楚。**按状态翻转补报**（丢过 → 说一次 → 清零），
+       不是按次数也不是按时间（铁律 10）。这一行自己算关键记录。 */
+    if (dropped) {
+        char note[128];
+        int  m = _snprintf(note, sizeof(note) - 1,
+                           "LOG     !! 日志缓冲满，丢了 %lu 条\r\n",
+                           (unsigned long)dropped);
+        if (m > 0) {
+            bslog_write_raw(note, (DWORD)m);
+            crit = 1;
+        }
+    }
+
+    if (crit) {
+        FlushFileBuffers(g_log);
+        /* OutputDebugStringA 在没有调试器时也要走一次 RaiseException，
+           有 DebugView 时还要抢全局互斥体 —— 现在它在**写线程**上，
+           游戏线程一分钱都不出。仍然只给关键记录用。 */
+        for (off = 0; off + BSLOG_HDR <= used; ) {
+            DWORD len = (unsigned char)batch[off] + ((DWORD)(unsigned char)batch[off + 1] << 8);
+            int   detail = batch[off + 2];
+            if (off + BSLOG_HDR + len > used) break;
+            if (!detail) {
+                char save = batch[off + BSLOG_HDR + len];   /* 借下一条的头字节当结束符 */
+                batch[off + BSLOG_HDR + len] = '\0';
+                OutputDebugStringA(batch + off + BSLOG_HDR);
+                batch[off + BSLOG_HDR + len] = save;
+            }
+            off += BSLOG_HDR + len;
+        }
+    }
+    return used ? used : 1;
+}
+
+static DWORD WINAPI log_writer_thread(void *param)
+{
+    (void)param;
+    for (;;) {
+        WaitForSingleObject(g_log_evt, INFINITE);
+        while (bslog_drain_once(1)) { }
+        if (g_stop) break;
+    }
+    return 0;
+}
+
+/* 收尾：把环里剩下的全排出去。进程退出、以及 DllMain 失败返回之前调。
+ *
+ * ★ 用 TryEnterCriticalSection 而不是 Enter：DLL_PROCESS_DETACH 跑到的时候
+ *   别的线程已经被系统干掉了，万一有一条正好死在临界区里，Enter 会永远等下去。
+ *   拿不到就直接排 —— 此时没有并发方，不加锁是安全的。 */
+static void bslog_shutdown(void)
+{
+    int got = TryEnterCriticalSection(&g_cs) ? 1 : 0;
+    while (bslog_drain_once(0)) { }
+    if (got) LeaveCriticalSection(&g_cs);
+    if (g_log != INVALID_HANDLE_VALUE) FlushFileBuffers(g_log);
+}
+
 static void bslog_emit(int detail, const char *fmt, va_list ap)
 {
     char line[8192];
+    unsigned char hdr[BSLOG_HDR];
     SYSTEMTIME st;
     int n;
+    int wake = 0;
 
     GetLocalTime(&st);
     n = _snprintf(line, sizeof(line) - 4, "[%02u:%02u:%02u.%03u] ",
@@ -76,22 +250,28 @@ static void bslog_emit(int detail, const char *fmt, va_list ap)
     line[n++] = '\n';
     line[n]   = '\0';
 
+    hdr[0] = (unsigned char)(n & 0xFF);
+    hdr[1] = (unsigned char)((n >> 8) & 0xFF);
+    hdr[2] = (unsigned char)(detail ? 1 : 0);
+
     EnterCriticalSection(&g_cs);
-    if (g_log != INVALID_HANDLE_VALUE) {
-        DWORD written;
-        WriteFile(g_log, line, (DWORD)n, &written, NULL);
-        /* 详细日志只写进系统文件缓存，不同步落盘：进程正常/异常退出时
-           OS 都会把缓存写回，只有整机断电才丢 —— 换来的是 2ms → ~2us。 */
-        if (!detail) FlushFileBuffers(g_log);
+    if ((DWORD)n + BSLOG_HDR <= BSLOG_RING_BYTES - g_ring_used) {
+        wake = (g_ring_used == 0);
+        ring_put(hdr, BSLOG_HDR);
+        ring_put(line, (DWORD)n);
+    } else {
+        /* 环满：**丢掉，绝不阻塞游戏线程**。写线程会补一行说丢了几条。 */
+        g_dropped++;
     }
     LeaveCriticalSection(&g_cs);
 
-    /* OutputDebugStringA 在没有调试器时也要走一次 RaiseException，
-       高频路径上同样是负担，详细日志一并跳过。 */
-    if (!detail) OutputDebugStringA(line);
+    /* 只有「环从空变非空」才叫醒写线程 —— 它自己会一直排到空为止，
+       所以不会漏唤醒，也不会每条一次系统调用。 */
+    if (wake && g_log_evt) SetEvent(g_log_evt);
 }
 
-/* 关键事件：任何模式都记，且立刻落盘（崩溃时不能丢）。 */
+/* 关键事件：任何模式都记，且**这一批**写完就落盘（崩溃时不能丢）。
+   「这一批」是异步化之后的口径 —— 见上面 bslog_drain_once 的说明。 */
 void bslog(const char *fmt, ...)
 {
     va_list ap;
@@ -100,7 +280,7 @@ void bslog(const char *fmt, ...)
     va_end(ap);
 }
 
-/* 详细/高频事件：只在 `BSHOOK_VERBOSE_LOG=1` 时记，且不 flush。 */
+/* 详细/高频事件：只在 `BSHOOK_VERBOSE_LOG=1` 时记，且不 flush、不进 DebugView。 */
 void bsvlog(const char *fmt, ...)
 {
     va_list ap;
@@ -2339,11 +2519,21 @@ static void *g_proj_tick_tramp = NULL;
 static void *g_proj_fire_tramp = NULL;
 static volatile LONG g_proj_diag_patched = 0;
 
+/* ★★ 默认值是**跟着日志级别走**，不是「没设 = 开」（用户 2026-09-01 的卡顿）。
+ *
+ * 这套 hook 是**每帧 × 每弹体**跑的（见 proj_tick_log）：一次 IsBadReadPtr 探
+ * 0x340 字节（≈13 页）+ 64 项线性扫 + 最多 3 条日志 + 两次 20 个 float 的格式化。
+ * 以前「没设 = 开」意味着 `start.bat` 正常游玩时它**一直在跑**，精简模式日志里
+ * 89% 的行出自它 —— 子弹一多就掉帧的头号原因。
+ *
+ * 关掉时 patch_thread 压根不装那三个 detour ⇒ 连探测和扫描都省掉，是真的零成本。
+ * 要单独查弹体问题时 `BSHOOK_PROJ_DIAG=1` 仍然能在精简模式下强制打开。
+ */
 static int proj_diag_enabled(void)
 {
     char buf[8];
     DWORD n = GetEnvironmentVariableA("BSHOOK_PROJ_DIAG", buf, sizeof(buf));
-    if (n == 0 || n >= sizeof(buf)) return 1;     /* 没设 = 开 */
+    if (n == 0 || n >= sizeof(buf)) return g_verbose ? 1 : 0;   /* 没设 = 跟日志级别 */
     return buf[0] != '0';
 }
 
@@ -2373,15 +2563,22 @@ static int proj_is_bullet(unsigned char *p);
 
 /* 把一个小对象的前 n 个 dword 原样倒出来（一行装得下），带 vftable。
    浮点那几格顺手按 float 也印一遍 —— 缩放 / alpha 之类都是 float。 */
-static void proj_dump_obj(const char *tag, void *obj, int n)
+/* `detail = 1` 走 bsvlog（每帧级的调用方用它）—— 见 bslog_emit 的说明：
+   每帧 × 每弹体的东西不该占 flush + DebugView 那一档。 */
+static void proj_dump_obj(int detail, const char *tag, void *obj, int n)
 {
     char hex[320], flt[320];
     int i, hx = 0, fx = 0;
     unsigned *w = (unsigned *)obj;
 
+    if (detail && !g_verbose) return;
     if (!obj || IsBadReadPtr(obj, (UINT_PTR)n * 4)) {
-        bslog("            %s = %08X（空 / 读不了）", tag,
-              (unsigned)(UINT_PTR)obj);
+        if (detail)
+            bsvlog("            %s = %08X（空 / 读不了）", tag,
+                   (unsigned)(UINT_PTR)obj);
+        else
+            bslog("            %s = %08X（空 / 读不了）", tag,
+                  (unsigned)(UINT_PTR)obj);
         return;
     }
     for (i = 0; i < n && hx < 280; i++) {
@@ -2394,8 +2591,12 @@ static void proj_dump_obj(const char *tag, void *obj, int n)
     }
     hex[hx] = 0;
     flt[fx] = 0;
-    bslog("            %s @%08X: %s | %s", tag, (unsigned)(UINT_PTR)obj,
-          hex, flt);
+    if (detail)
+        bsvlog("            %s @%08X: %s | %s", tag, (unsigned)(UINT_PTR)obj,
+               hex, flt);
+    else
+        bslog("            %s @%08X: %s | %s", tag, (unsigned)(UINT_PTR)obj,
+              hex, flt);
 }
 
 static void __cdecl proj_add_log(void *proj)
@@ -2423,9 +2624,9 @@ static void __cdecl proj_add_log(void *proj)
     /* ★ 光看「指针非 0」不够 —— bot 和真人的四个视觉指针全都非 0，
        模式也一样，可屏幕上就是只有真人的看得见。所以把那两个对象**的内容**
        原样倒出来，一格一格比。 */
-    proj_dump_obj("特效(+e4)", (void *)(UINT_PTR)PU(0xE4), 20);
-    proj_dump_obj("拖尾(+310)", (void *)(UINT_PTR)PU(0x310), 20);
-    proj_dump_obj("线(+30c)", (void *)(UINT_PTR)PU(0x30C), 20);
+    proj_dump_obj(0, "特效(+e4)", (void *)(UINT_PTR)PU(0xE4), 20);
+    proj_dump_obj(0, "拖尾(+310)", (void *)(UINT_PTR)PU(0x310), 20);
+    proj_dump_obj(0, "线(+30c)", (void *)(UINT_PTR)PU(0x30C), 20);
 }
 
 /* ★ 只跟踪「`Add` 认出来是子弹」的那些对象 —— `ProjectileMgr` 那张 map 里
@@ -2464,19 +2665,21 @@ static void __cdecl proj_tick_log(void *proj)
         if (g_proj_track[i].obj != proj) continue;
         if (g_proj_track[i].handle != PI(0xD0)) return;   /* 地址被复用了 */
         g_proj_track[i].ticks++;
-        bslog("PROJ.   弹体 %08X 句柄 %d owner %d 第%d帧 位置(+34,38)"
-              " (%.2f, %.2f) 渲染(+2c,30) (%.2f, %.2f) 速度 (%.2f, %.2f)"
-              " 状态 %d 线 %08X",
-              (unsigned)(UINT_PTR)p, g_proj_track[i].handle,
-              proj_owner_of(g_proj_track[i].handle), g_proj_track[i].ticks,
-              PF(0x34), PF(0x38), PF(0x2C), PF(0x30),
-              PF(0x120), PF(0x124), PI(0x54), PU(0x30C));
+        /* ★ 走 bsvlog 不走 bslog：这是**每帧 × 每弹体**的，占不起 flush +
+           DebugView 那一档（用户 2026-09-01 的掉帧）。 */
+        bsvlog("PROJ.   弹体 %08X 句柄 %d owner %d 第%d帧 位置(+34,38)"
+               " (%.2f, %.2f) 渲染(+2c,30) (%.2f, %.2f) 速度 (%.2f, %.2f)"
+               " 状态 %d 线 %08X",
+               (unsigned)(UINT_PTR)p, g_proj_track[i].handle,
+               proj_owner_of(g_proj_track[i].handle), g_proj_track[i].ticks,
+               PF(0x34), PF(0x38), PF(0x2C), PF(0x30),
+               PF(0x120), PF(0x124), PI(0x54), PU(0x30C));
         /* ★ 弹道线 / 拖尾**每帧的内容**：光看「指针非 0」证明不了它被画了
            —— 要看它有没有跟着弹体动。真人和 bot 并排比这几行就够了。 */
         if (PU(0x30C))
-            proj_dump_obj("线(+30c)", (void *)(UINT_PTR)PU(0x30C), 20);
+            proj_dump_obj(1, "线(+30c)", (void *)(UINT_PTR)PU(0x30C), 20);
         if (PU(0x310))
-            proj_dump_obj("拖尾(+310)", (void *)(UINT_PTR)PU(0x310), 20);
+            proj_dump_obj(1, "拖尾(+310)", (void *)(UINT_PTR)PU(0x310), 20);
         return;
     }
 }
@@ -2636,11 +2839,13 @@ static void *g_proj_move_tramp = NULL;
 static unsigned g_move_callers[MOVE_CALLER_MAX];
 static int g_move_caller_n = 0;
 
+/* 同 proj_diag_enabled：默认跟日志级别走。这一档本身按返回地址去重、全程 ≤16 行，
+   量可以忽略，但它挂的是 `Projectile::Move` —— 每帧每弹体都要过一次 detour 跳板。 */
 static int move_diag_enabled(void)
 {
     char buf[8];
     DWORD n = GetEnvironmentVariableA("BSHOOK_MOVE_DIAG", buf, sizeof(buf));
-    if (n == 0 || n >= sizeof(buf)) return 1;     /* 没设 = 开 */
+    if (n == 0 || n >= sizeof(buf)) return g_verbose ? 1 : 0;   /* 没设 = 跟日志级别 */
     return buf[0] != '0';
 }
 
@@ -3843,7 +4048,8 @@ static DWORD WINAPI patch_thread(LPVOID param)
     /* ★ M3b 诊断：弹体全字段快照（临时，查完「看不见 bot 的子弹」就删）。
        两个 hook 的目标函数都在战斗里才第一次跑，远晚于解壳窗口。 */
     if (!proj_diag_enabled()) {
-        bslog("PATCH   BSHOOK_PROJ_DIAG=0 已设，不装弹体诊断 hook");
+        bslog("PATCH   不装弹体诊断 hook（每帧每弹体都要跑，精简模式默认关；"
+              "要查弹体设 BSHOOK_PROJ_DIAG=1）");
     } else {
         for (ticks = 0; !g_stop && !g_proj_diag_patched && ticks < 2000; ticks++) {
             if (try_patch_proj_diag()) break;
@@ -3856,7 +4062,8 @@ static DWORD WINAPI patch_thread(LPVOID param)
 
     /* ★ 反弹法线诊断（临时，V0.3 §102）：查 Move 的调用方是谁。 */
     if (!move_diag_enabled()) {
-        bslog("PATCH   BSHOOK_MOVE_DIAG=0 已设，不装 Move 调用方诊断 hook");
+        bslog("PATCH   不装 Move 调用方诊断 hook（精简模式默认关；"
+              "要查反弹法线设 BSHOOK_MOVE_DIAG=1）");
     } else {
         int done = 0;
         for (ticks = 0; !g_stop && !done && ticks < 2000; ticks++) {
@@ -3993,6 +4200,19 @@ static void open_log(void)
 
     g_log = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    /* ★ 写盘线程。自动重置事件 —— 生产者只在「环从空变非空」时置位。
+       线程要等 DllMain 返回才真正跑起来（加载器锁），所以 DllMain 里那几条
+       banner / HWBP 会先在环里躺一小会儿，正常。DllMain 走失败分支直接
+       return FALSE 时由 bslog_shutdown() 就地排空，一条都不会丢。 */
+    g_log_evt = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (g_log_evt) {
+        g_log_thread = CreateThread(NULL, 0, log_writer_thread, NULL, 0, NULL);
+        if (g_log_thread) {
+            CloseHandle(g_log_thread);
+            g_log_thread = NULL;
+        }
+    }
 }
 
 static void banner(void)
@@ -4052,6 +4272,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         ready_event = open_loader_event(POPSHOT_BSHOOK_READY_ENV);
         if (!ready_event) {
             bslog("HWBP    !! 找不到 bsloader 就绪事件，拒绝在没有 DR0 握手的情况下继续");
+            bslog_shutdown();   /* 写线程还没跑起来，就地把环排空 */
             return FALSE;
         }
         /* 这两个只是回报结果用的，老版本 bsloader 没有也照跑。 */
@@ -4063,6 +4284,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             bslog("HWBP    !! AddVectoredExceptionHandler 失败 err=%lu",
                   (unsigned long)GetLastError());
             CloseHandle(ready_event);
+            bslog_shutdown();
             return FALSE;
         }
         bslog("HWBP    GameGuard VEH 已安装，等待 DR0 命中 %08X"
@@ -4088,6 +4310,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             CloseHandle(ready_event);
             RemoveVectoredExceptionHandler(g_gg_veh);
             g_gg_veh = NULL;
+            bslog_shutdown();
             return FALSE;
         }
         CloseHandle(th);
@@ -4106,6 +4329,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             g_gg_veh = NULL;
         }
         bslog("================ process detach ================");
+        /* ★ 写线程这时候多半已经被系统干掉了（进程退出时先杀线程再 DETACH），
+           所以在**当前**线程上就地把环排空 —— 否则最后那几条永远出不去。 */
+        bslog_shutdown();
         break;
     }
     return TRUE;

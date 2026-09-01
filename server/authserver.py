@@ -35,6 +35,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import protocol as P
 from account_store import (AUTH_BAD_PASSWORD, AUTH_MESSAGES, AUTH_NO_SUCH_USER,
                            AUTH_OK, AccountStore)
+import asynclog
+import logcleanup
 import eventlog
 from netlisten import create_listener, tune_stream
 from tickets import TicketStore, short as short_ticket
@@ -82,10 +84,9 @@ def ts():
 
 def log(msg, fh=None):
     line = f"[{ts()}] {msg}"
-    print(line, flush=True)
+    asynclog.emit(line)
     if fh:
-        fh.write(line + "\n")
-        fh.flush()
+        asynclog.emit_text(line + "\n", fh)
 
 
 class AuthService:
@@ -189,9 +190,12 @@ def handle(conn, addr, args, port=0, service=None):
     service = service or AuthService(AccountStore(args.accounts))
     ft = fb = None
     if VERBOSE:
-        fb = open(os.path.join(LOGDIR, f"auth_{seq:03d}_{port}.bin"), "wb")
-        ft = open(os.path.join(LOGDIR, f"auth_{seq:03d}_{port}.txt"), "w",
-                  encoding="utf-8")
+        # ★ 名字里带**本次启动的时刻**（`logcleanup.RUN_STAMP`）：序号是进程级的、
+        #   每次启动从 1 重来，不带它的话同一天第二次启动就把上一次的抓包冲掉
+        #   （用户 2026-09-01）。仍然匹配 `auth_*` 白名单，到期照样清。
+        stem = f"auth_{logcleanup.RUN_STAMP}_{seq:03d}_{port}"
+        fb = open(os.path.join(LOGDIR, f"{stem}.bin"), "wb")
+        ft = open(os.path.join(LOGDIR, f"{stem}.txt"), "w", encoding="utf-8")
     log(f"+++ 连接#{seq} 端口{port} 来自 {addr[0]}:{addr[1]}", ft)
     peer = eventlog.peer(addr)
     buf = b""

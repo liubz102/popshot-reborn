@@ -58,6 +58,7 @@ import weakref
 
 from account_store import BASE_CHARACTER_IDS, MINIMUM_PLAYER_LEVEL, \
     PREMIUM_CHARACTER_IDS
+import asynclog
 import ballistics
 import botaim
 import botarms
@@ -807,7 +808,10 @@ class BotConn(gameserver.Conn):
 
     # -- 日志 ---------------------------------------------------------------
     def log(self, msg):
-        print(f"[{gameserver.ts()}] {self.nickname} {msg}", flush=True)
+        # ★★ 异步（用户 2026-09-01）：这个函数几乎总是在 `room.sim_lock` 里面被
+        #    调到（`_tick_bot` 整格持锁），同步写盘就是整个房间跟着等磁盘，
+        #    而真人的 `forward_peer_data` 又在等同一把锁。见 `asynclog.py` 开头。
+        asynclog.emit(f"[{gameserver.ts()}] {self.nickname} {msg}")
 
     def online(self, msg):
         """bot 的上下线不进运营事件日志 —— `online.log` 记的是真人的流水。"""
@@ -1585,9 +1589,9 @@ def _muzzle(x, y, toward_x):
 BOT_DIAG_FIRE_ANYWHERE = os.environ.get(
     "BOT_DIAG_FIRE_ANYWHERE", "") not in ("", "0")
 if BOT_DIAG_FIRE_ANYWHERE:
-    print("[bot] ★★ BOT_DIAG_FIRE_ANYWHERE 已开 —— bot 会无视交战距离和地形"
-          "遮挡开枪，并逐帧报「为什么不开枪」。这是取证用的临时开关，"
-          "正常游玩别开。")
+    asynclog.emit("[bot] ★★ BOT_DIAG_FIRE_ANYWHERE 已开 —— bot 会无视交战距离和地形"
+                  "遮挡开枪，并逐帧报「为什么不开枪」。这是取证用的临时开关，"
+                  "正常游玩别开。")
 
 
 def _followable_humans(room):
@@ -2068,8 +2072,8 @@ def note_ai_message(room, handle, fields):
     if name and fields.get("type") == "start":
         if "boss" in name.lower() and not getattr(quest, "boss_room", False):
             quest.boss_room = True
-            print(f"[{gameserver.ts()}]    进入 boss 房（{name}）—— "
-                  f"牵引绳停用，bot 只管打 boss", flush=True)
+            asynclog.emit(f"[{gameserver.ts()}]    进入 boss 房（{name}）—— "
+                          f"牵引绳停用，bot 只管打 boss")
         return
     if fields.get("msgType") != AI_MSG_STATE:
         return
@@ -2186,8 +2190,8 @@ def note_mob_hit(room, handle, x, y, create=False):
                 or _is_breakable_handle(room, handle)):
             return
         table[handle] = [float(x), float(y), None, None]
-        print(f"[{gameserver.ts()}]    见到怪（命中建表）: 句柄 {handle} "
-              f"@ ({float(x):.0f}, {float(y):.0f})", flush=True)
+        asynclog.emit(f"[{gameserver.ts()}]    见到怪（命中建表）: 句柄 {handle} "
+                      f"@ ({float(x):.0f}, {float(y):.0f})")
         return
     row[0], row[1] = float(x), float(y)
 
@@ -2401,9 +2405,9 @@ def _note_peer_breakable(room, handle, damage):
         return False
     item, broke = got
     if broke:
-        print(f"[{gameserver.ts()}]    破坏物碎了（真人打的）: 句柄 "
-              f"{item.handle} @ ({item.x}, {item.y})　"
-              f"{item.regen_ms / 1000.0:.0f} 秒后长回来", flush=True)
+        asynclog.emit(f"[{gameserver.ts()}]    破坏物碎了（真人打的）: 句柄 "
+                      f"{item.handle} @ ({item.x}, {item.y})　"
+                      f"{item.regen_ms / 1000.0:.0f} 秒后长回来")
     return True
 
 
@@ -4717,9 +4721,9 @@ def _coop_leash_intent(room, machine, seat_index, terrain):
         machine.leash_mark = here
         machine.leash_gap = behind
         machine.leash_anchor = ahead
-        print(f"[{gameserver.ts()}] bot {seat_index}    掉队: 落后带头的人 "
-              f"{behind:.0f}（超过 1/4 屏 {BOT_COOP_LEASH:.0f}）—— "
-              f"无条件冲刺追上去", flush=True)
+        asynclog.emit(f"[{gameserver.ts()}] bot {seat_index}    掉队: 落后带头的人 "
+                      f"{behind:.0f}（超过 1/4 屏 {BOT_COOP_LEASH:.0f}）—— "
+                      f"无条件冲刺追上去")
     elif machine.leash_anchor is None:
         machine.leash_anchor = ahead    # 瞬移之后重新起算「他跑了多远」
     elif here > machine.leash_mark:
@@ -4756,9 +4760,8 @@ def _leash_release(machine, seat_index=None, behind=None):
     machine.leash_gap = 0.0
     machine.leash_anchor = None
     if seat_index is not None and behind is not None:
-        print(f"[{gameserver.ts()}] bot {seat_index}    归队: 现在落后 "
-              f"{behind:.0f}（归队线 {BOT_COOP_LEASH_RELEASE:.0f}）",
-              flush=True)
+        asynclog.emit(f"[{gameserver.ts()}] bot {seat_index}    归队: 现在落后 "
+                      f"{behind:.0f}（归队线 {BOT_COOP_LEASH_RELEASE:.0f}）")
 
 
 def _leash_warp(room, machine, seat_index, terrain, spot, behind, why):
@@ -4788,9 +4791,9 @@ def _leash_warp(room, machine, seat_index, terrain, spot, behind, why):
         # 「他跑了多远」从落点重新起算：瞬移完还在掉队的话，得再给他
         # 一整屏的余量才谈得上「又追不上」（§141）。
         machine.leash_anchor = None
-        print(f"[{gameserver.ts()}] bot {seat_index}    ★瞬移归队: "
-              f"({was.x:.0f}, {was.y:.0f}) -> ({body.x:.0f}, {body.y:.0f})"
-              f"　落后 {behind:.0f}，{why}", flush=True)
+        asynclog.emit(f"[{gameserver.ts()}] bot {seat_index}    ★瞬移归队: "
+                      f"({was.x:.0f}, {was.y:.0f}) -> ({body.x:.0f}, {body.y:.0f})"
+                      f"　落后 {behind:.0f}，{why}")
         return True
     return False
 
@@ -5997,6 +6000,139 @@ def _terrain_contact(terrain, ax, ay, bx, by, radius=0.0):
 
     ⚠ 反弹要用**撞上之前**那一点（收方也是把弹体夹回最后一个不重叠的
     采样点），否则弹体贴在地形里，下一 tick 一开头又撞上，原地卡死。
+
+    ## ★★★ 逐像素扫**没变**，只是空气整块跳过（用户 2026-09-01 的掉帧）
+
+    实测：空中飞 300 像素的一颗弹，逐格问要 **270 µs**，而每颗在飞的弹每
+    32 ms 都要算一次 —— 10 颗在飞就吃掉 2.7 ms / 32 ms，30 颗就是 8 ms。
+    子弹一多整个房间的 tick 就跟不上，`[sim] ⚠ 落后 N 格` 就是这么来的。
+
+    加速的办法是 `mapdata.MapTerrain.bullet_coarse()` 那张**粗网格**
+    （每 16×16 一块，记「这块里有没有挡子弹的格子」）：采样点落在空块里
+    ⇒ 它在这块里还能走的那几步全都不用问，直接跳过去。
+
+    ★ **结果和逐像素扫逐位一致**，不是近似：跳几步是算出来的，不是猜的。
+      每走 j 步，坐标的位移是 `δ = j × span / steps`；而
+      `|floor(u+δ) − floor(u)| ≤ floor(δ) + 1`，所以只要 `δ < 离块边的像素数`
+      就一定还在同一块里。展开就是 `j × span < margin × steps`，全整数比较，
+      不吃浮点误差。原实现原样留着，叫 `_terrain_contact_exact()`，
+      差分测试拿它当基准（`test_ballistics.py`）。
+
+    ★ 出界和「图顶上面」这两种口径特殊的，一律退回逐格那条 —— 它们很少见，
+      不值得为它们把网格搞复杂。
+    """
+    if terrain is None:
+        return (None, None)
+    dx = bx - ax
+    dy = by - ay
+    if radius and radius >= 1.0:
+        offsets = shell_probe_offsets(radius, dx, dy)
+    else:
+        offsets = ((0, 0),)
+    if _probe_blocked(terrain, int(ax), int(ay), offsets):
+        return (0.0, 0.0)
+    span = max(abs(dx), abs(dy))
+    steps = max(1, int(span // BOT_SHELL_TERRAIN_STEP))
+    grid, gw, _gh = terrain.bullet_coarse()
+    # 全部提成局部变量：这是**每一步**都要跑的循环，属性查找的账付不起。
+    xmax = terrain.width - 1
+    ymax = terrain.height - 1
+    shift = mapdata.COARSE_SHIFT
+    edge = mapdata.COARSE - 1
+    # 走向：只用来判「离块边还有多远」该往哪边量。
+    sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
+    sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
+    adx = abs(dx)
+    ady = abs(dy)
+    far = steps + 1                     # 「这个轴不会离开这一块」的哨兵
+    i = 1
+    while i <= steps:
+        t = float(i) / steps
+        cx = int(ax + dx * t)
+        cy = int(ay + dy * t)
+        # ★★ x 和 y 的余量**分开记**，别取 min 之后拿 span 一起换算：
+        #    两轴的步进速度差多少倍，余量能换成的步数就差多少倍。
+        #    合起来算的话，斜率 6:1 的那种平射弹会被慢轴白白拖住 ——
+        #    实测平均只能跳 1.8 步，分开之后跳 8 步以上。
+        mx = far
+        my = far
+        for ox, oy in offsets:
+            yy = cy + oy
+            if yy < 0:
+                # 图顶上面不算实心（§83），而且**和 x 无关**
+                # （`_probe_blocked` 先判 `yy >= 0`）。往下走的话它还能安全走
+                # `-1 - yy` 步；往上或不动就永远安全。
+                room = far if sy <= 0 else (-1 - yy)
+                if room < my:
+                    my = room
+                continue
+            xx = cx + ox
+            if xx < 0 or xx > xmax or yy > ymax:
+                mx = 0                      # 出界：口径特殊，退回逐格
+                break
+            if grid[(yy >> shift) * gw + (xx >> shift)]:
+                mx = 0                      # 这一块里有东西，老老实实问
+                break
+            # ★★ 「还能走多远」要同时受**块边**和**图边**两个约束。
+            #    只看块边是不够的：图宽不是 16 的整数倍时最后一列块是残缺的
+            #    （`Beginner` 宽 1800，最后一块管到 x=1807），而 1800..1807
+            #    是**出界 = 实心**，网格里却没有它 —— 只看块边就会一步跳过
+            #    真正的撞击点（差分测试逮到的正是这个）。
+            if sx > 0:
+                room = (xx | edge) - xx
+                if xmax - xx < room:
+                    room = xmax - xx
+            elif sx < 0:
+                room = xx - (xx & ~edge)
+                if xx < room:
+                    room = xx
+            else:
+                room = far
+            if room < mx:
+                mx = room
+            if sy > 0:
+                room = (yy | edge) - yy
+                if ymax - yy < room:
+                    room = ymax - yy
+            elif sy < 0:
+                room = yy - (yy & ~edge)
+                if yy < room:
+                    room = yy
+            else:
+                room = far
+            if room < my:
+                my = room
+        if mx > 0 and my > 0:
+            # 每轴各算「再走 j 步仍在同一块里」的上限（推导见 docstring）：
+            #   x 轴要 j × |dx| < mx × steps，y 轴要 j × |dy| < my × steps
+            jump = steps
+            if adx:
+                limit = mx * steps
+                j = int(limit / adx)
+                while j and j * adx >= limit:
+                    j -= 1
+                if j < jump:
+                    jump = j
+            if ady:
+                limit = my * steps
+                j = int(limit / ady)
+                while j and j * ady >= limit:
+                    j -= 1
+                if j < jump:
+                    jump = j
+            i += jump + 1
+            continue
+        if _probe_blocked(terrain, cx, cy, offsets):
+            return (t, float(i - 1) / steps)
+        i += 1
+    return (None, None)
+
+
+def _terrain_contact_exact(terrain, ax, ay, bx, by, radius=0.0):
+    """`_terrain_contact()` 加速之前那一版 —— **逐像素，不跳**。
+
+    留着只有一个用途：给差分测试当基准（`test_ballistics.py`）。
+    战斗路径上一次都不该调它。
     """
     if terrain is None:
         return (None, None)
@@ -8210,11 +8346,18 @@ _WARM_LOCK = threading.Lock()
 def _warm_navigation_now(terrain, who, seeds, label):
     try:
         started = time.monotonic()
+        # ★ 弹道那张粗网格也在这儿一起烘（`_terrain_contact` 用它跳过空气）。
+        #   整张图算一次要 20~90 ms —— 落在战斗那一格里就是一次可见的卡顿，
+        #   而它和可达图一样是「地形的静态事实」，正该跟着一起预热。
+        #   variant（破坏物碎了）不用重烘，它是从这一份补出来的，几十微秒。
+        terrain.bullet_coarse()
+        coarse_ms = (time.monotonic() - started) * 1000
         count = botnav.warm(terrain, who, seeds)
-        print(f"[bot] 可达图预热完毕 {label}：{count} 个落脚点，"
-              f"{(time.monotonic() - started) * 1000:.0f} ms", flush=True)
+        asynclog.emit(f"[bot] 可达图预热完毕 {label}：{count} 个落脚点，"
+                      f"{(time.monotonic() - started) * 1000:.0f} ms"
+                      f"（其中弹道粗网格 {coarse_ms:.0f} ms）")
     except Exception as error:              # noqa: BLE001 —— 纯缓存，不许炸
-        print(f"[bot] ⚠ 可达图预热失败 {label}: {error!r}", flush=True)
+        asynclog.emit(f"[bot] ⚠ 可达图预热失败 {label}: {error!r}")
 
 
 def warm_navigation(room, why):
@@ -8313,22 +8456,20 @@ def _tick_room_locked(room, tick, now):
     try:
         _refresh_health(room)
     except Exception as error:          # noqa: BLE001 —— 见 docstring
-        print(f"[{gameserver.ts()}] [bot] ⚠ 刷新血量台账出错，已跳过: {error!r}",
-              flush=True)
+        asynclog.emit(f"[{gameserver.ts()}] [bot] ⚠ 刷新血量台账出错，已跳过: {error!r}")
     # ★★★ 可破坏物碎了 / 长回来了（§138）—— 地形对象跟着换一份。
     try:
         _refresh_breakables(room)
     except Exception as error:          # noqa: BLE001 —— 见 docstring
-        print(f"[{gameserver.ts()}] [bot] ⚠ 刷新破坏物出错，已跳过: {error!r}",
-              flush=True)
+        asynclog.emit(f"[{gameserver.ts()}] [bot] ⚠ 刷新破坏物出错，已跳过: {error!r}")
     # ★★★ **真人的身体先推一格**（D106）：这一格里 bot 判命中 / 瞄准用的
     #    「人在哪」就是它。排在所有 bot 前面 —— 同一格里每个 bot 看到的
     #    世界必须是同一个。
     try:
         _advance_humans(room, _terrain(room))
     except Exception as error:          # noqa: BLE001 —— 见 docstring
-        print(f"[{gameserver.ts()}] [bot] ⚠ 外推真人位置出错，已跳过: "
-              f"{error!r}", flush=True)
+        asynclog.emit(f"[{gameserver.ts()}] [bot] ⚠ 外推真人位置出错，已跳过: "
+                      f"{error!r}")
     for index in room.bot_seats():
         seat = room.seats[index]
         machine = None if seat is None else seat.conn

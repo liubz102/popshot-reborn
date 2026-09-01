@@ -37,6 +37,30 @@ die() {
     exit 1
 }
 
+# --- 启动前把上一次那份日志改名归档 ----------------------------------------
+# `>` 是截断语义，同一天重启第二次就把上一次的 server.out 冲掉了
+# （用户 2026-09-01）。所以起进程**之前**先把旧的挪走，新进程照旧写
+# server.out —— 文档和「看 logs/server.err 末尾」的失败诊断都不用改。
+#
+# 归档名用**文件自己的最后修改时间**（`mv` 保留 mtime）⇒ logcleanup 按
+# mtime 老化立刻就对，不会因为刚归档过而白白多留几天。
+# 挪不动 / 目标重名就原样返回，让调用方照旧覆盖 —— 归档不值得为它冒
+# 「服务端起不来」的险。
+rotate_log() {
+    target="$1"
+    [ -s "$target" ] || return 0
+    stamp=$(date -r "$target" '+%Y%m%d-%H%M%S' 2>/dev/null) || return 0
+    [ -n "$stamp" ] || return 0
+    case "$target" in
+        *.*) stem="${target%.*}"; ext=".${target##*.}" ;;
+        *)   stem="$target";      ext="" ;;
+    esac
+    archived="${stem}-${stamp}${ext}"
+    [ -e "$archived" ] && return 0
+    mv "$target" "$archived" 2>/dev/null || return 0
+    return 0
+}
+
 # --- 挑一个 Python ---------------------------------------------------------
 # 优先用包里自带的；没有就用系统的 python3（要求 3.10+）。
 #
@@ -226,6 +250,8 @@ fi
 
 # ★ --no-control：调试控制通道（27800）在服务端包里默认关闭。
 #   它能直接往任意连接推包，只该在开发机上开。
+rotate_log "$LOGDIR/server.out"
+rotate_log "$LOGDIR/server.err"
 if [ "$VERBOSE" = "--verbose" ]; then
     nohup "$PY" "$APP" --no-control --verbose >"$LOGDIR/server.out" 2>"$LOGDIR/server.err" &
 else

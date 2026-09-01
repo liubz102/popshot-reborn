@@ -324,6 +324,43 @@ function Read-TextFileRaw {
     }
 }
 
+function Move-LogAside {
+    # 启动前把上一次那份日志改名归档，**同一天多次重启也不会互相覆盖**
+    # （用户 2026-09-01：「server.out、relay.out、连接抓包等日志我希望不要被
+    #  覆盖、只清理过期日志」）。
+    #
+    # 为什么非得改名不可：`Start-Process -RedirectStandardOutput` 是 `>` 语义
+    # （截断新建），PowerShell 没有「追加」模式。所以在起进程**之前**把旧的
+    # 挪走，新进程照旧写 `server.out` —— 文档、`launch.ps1` 读 server.err 尾巴
+    # 的失败诊断、`logcleanup` 的白名单全都不用改。
+    #
+    # 归档名用**文件自己的最后修改时间**，不是「现在」：
+    #   1. 名字标的是那次运行**结束**的时刻，比标归档时刻有意义；
+    #   2. `Move-Item` 保留 mtime ⇒ `logcleanup` 按 mtime 老化立刻就对，
+    #      不会因为「刚归档过」而白白多留 3 天（`eventlog.py` 开头讲的就是
+    #      这个坑）。
+    #
+    # 挪不动（正被别的进程开着、目标重名）就**原样返回**，让调用方照旧覆盖 ——
+    # 归档不值得为它冒「服务端起不来」的险，和 `eventlog._rotate_unlocked`
+    # 是同一个取舍。
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        # 0 字节的（上次启动就没写出东西的 .err）不留，免得攒一堆空文件。
+        if ($item.Length -le 0) { return $false }
+        $stamp  = $item.LastWriteTime.ToString('yyyyMMdd-HHmmss')
+        $stem   = [System.IO.Path]::GetFileNameWithoutExtension($item.Name)
+        $ext    = $item.Extension
+        $target = Join-Path $item.DirectoryName ("{0}-{1}{2}" -f $stem, $stamp, $ext)
+        if (Test-Path -LiteralPath $target) { return $false }
+        Move-Item -LiteralPath $Path -Destination $target -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Get-FileTailLines {
     # 文件末尾 N 行（替 `Get-Content -Tail N`）。文件不在就返回空数组。
     param(

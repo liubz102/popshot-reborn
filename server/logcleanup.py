@@ -36,6 +36,21 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_LOGDIR = os.path.join(ROOT, "logs")
 
+#: ★ **这次启动的时刻**，进程一起就定死，用来给逐连接的抓包文件起名
+#:   （`auth_<RUN_STAMP>_001_47611.txt` / `game_<RUN_STAMP>_001_27799.dec.bin`）。
+#:
+#: 为什么要有它（用户 2026-09-01）：那两处的序号是**进程级全局**、从 1 开始，
+#: 文件又是 `"w"` 打开的 —— 于是同一天第二次启动的第 1 条连接直接把上一次的
+#: `auth_001_47611.txt` 冲掉。磁盘上有实证：`auth_016` 的 mtime 是 8/31 02:53，
+#: 而 `auth_001`~`015` 全是当天 23:39 之后，016 就是被覆盖剩下的孤儿。
+#:
+#: 放在这个模块里：它是 `logs/` 的门房，且**不 import 任何别的 server 模块**，
+#: `authserver` 和 `gameserver` 都能安全地拿它，不会绕出循环导入。
+#:
+#: ★ 新名字仍然落在 `auth_*` / `game_*` 白名单里（见 LOG_PATTERNS），
+#:   到期照样被清掉。
+RUN_STAMP = time.strftime("%Y%m%d-%H%M%S")
+
 #: 每天几点做那次定时清理（本地时间，整点）。需求指定凌晨 4 点。
 DAILY_HOUR = 4
 

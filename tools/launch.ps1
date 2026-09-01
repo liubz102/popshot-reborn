@@ -341,6 +341,9 @@ if ($running -and $lastMode -eq $Mode) {
     #   启动日志应出现「中继服   已关闭（--no-tcp-relay）」。
     $appArgs += '--no-tcp-relay'
 
+    # ★ 上一次那份先归档，别覆盖（同一天多次重启也留得住）。见 Move-LogAside。
+    Move-LogAside (Join-Path $LogDir 'server.out') | Out-Null
+    Move-LogAside (Join-Path $LogDir 'server.err') | Out-Null
     Start-Process -FilePath $Python -WorkingDirectory $Root `
         -ArgumentList $appArgs `
         -RedirectStandardOutput (Join-Path $LogDir 'server.out') `
@@ -398,6 +401,8 @@ if ($relayPid -and $lastSignature -eq $relaySignature) {
         @{ Port = $RelayUdpSync; Proto = 'UDP'; Label = '位置同步中继' }
     ) '本机中继'
     $relayScript = Join-Path $Root 'server\relay.py'
+    Move-LogAside (Join-Path $LogDir 'relay.out') | Out-Null
+    Move-LogAside (Join-Path $LogDir 'relay.err') | Out-Null
     Start-Process -FilePath $Python -WorkingDirectory $Root `
         -ArgumentList @("`"$relayScript`"") `
         -RedirectStandardOutput (Join-Path $LogDir 'relay.out') `
@@ -473,6 +478,8 @@ Assert-PortsFree @(
 
 if ($DebugLog) { $env:BSHOOK_VERBOSE_LOG = '1' } else { $env:BSHOOK_VERBOSE_LOG = '0' }
 
+Move-LogAside (Join-Path $LogDir 'bsloader.out') | Out-Null
+Move-LogAside (Join-Path $LogDir 'bsloader.err') | Out-Null
 Start-Process -FilePath $loader -WorkingDirectory $Root `
     -RedirectStandardOutput (Join-Path $LogDir 'bsloader.out') `
     -RedirectStandardError  (Join-Path $LogDir 'bsloader.err') `
