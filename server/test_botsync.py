@@ -4284,6 +4284,102 @@ class BotRetreatSpotTests(TerrainMixin, BotFireRoom):
                          "退无可退不该把姿态闩改写成 press")
 
 
+class BotWalkOvershootTests(TerrainMixin, BotFireRoom):
+    """★★★★★ 走不满一步的零头不许掉头（V0.3 §167）。
+
+    `_walk_to()` 是个 bang-bang 控制器：方向只有 `±1`，而一份意图要握着走
+    `BOT_DECISION_TICKS` 个 tick（14~21 像素），到达容差却是 **1 像素**。
+    ⇒ 只要目标落在 bot 迈得过去的地方，它就必然踩过头、下一格再踩回来，
+    15 Hz 一个来回。实机 `Esperan00` 10:18:50~52：目标 x=781，
+    bot 在 793 ↔ 779 之间来回，用户看到的就是「位置来回微微跳」。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(synth_terrain("flat_wide",
+                                                          width=4000))
+
+    def march(self, start_x, goal, ticks=16):
+        """照 `_own_step()` 的节奏跑：一格决策握着意图走 `BOT_DECISION_TICKS` tick。"""
+        conn = self.bot_conn
+        who = bot._character_of(conn)
+        self.place_bot(start_x)
+        conn.walk_last = 0
+        bot._clear_navigation(conn)
+        xs, dirs = [], []
+        for _ in range(ticks):
+            intent = bot._walk_to(self.room, conn, self.terrain, goal, False)
+            xs.append(round(conn.body.x, 1))
+            dirs.append(intent[0])
+            for _ in range(bot.BOT_DECISION_TICKS):
+                conn.body = bot.botmove.tick(self.terrain, conn.body, who,
+                                             direction=intent[0],
+                                             fast_run=bool(intent[3]))
+            conn.battle_pos = (conn.body.x, conn.body.y)
+        return xs, dirs
+
+    def test_it_settles_on_the_goal_instead_of_ping_ponging(self):
+        """★★★★★ 这条就是「位置来回微微跳」本身。"""
+        xs, dirs = self.march(919.0, (781.0, 150.0))
+        flips = sum(1 for i in range(len(dirs) - 1)
+                    if dirs[i] and dirs[i + 1] == -dirs[i])
+        self.assertEqual(0, flips, "方向来回翻了：%s / x=%s" % (dirs, xs))
+        self.assertEqual([0] * 4, dirs[-4:], "到了之后该站住：%s" % dirs)
+
+    def test_it_still_walks_across_the_goal_once(self):
+        """★★★ 只挡**掉头**，不挡「接着往前走」—— 穿过去捡道具那一步不能少。
+
+        变异验证：把那段守卫改成无条件 `return (0, …)`，这条当场红。
+        """
+        xs, _ = self.march(919.0, (781.0, 150.0))
+        self.assertTrue(min(xs) <= 781.0,
+                        "一次都没踩到目标点（最左只到 %.1f）" % min(xs))
+
+    def test_a_goal_further_than_one_stride_still_turns_it_around(self):
+        """★ 目标真的挪到一步以外时照旧掉头，一个字没变。"""
+        conn = self.bot_conn
+        who = bot._character_of(conn)
+        self.place_bot(900.0)
+        conn.walk_last = 0
+        bot._clear_navigation(conn)
+        # 先朝左走一段
+        for _ in range(4):
+            intent = bot._walk_to(self.room, conn, self.terrain,
+                                  (700.0, 150.0), False)
+            self.assertEqual(-1, intent[0])
+            for _ in range(bot.BOT_DECISION_TICKS):
+                conn.body = bot.botmove.tick(self.terrain, conn.body, who,
+                                             direction=intent[0])
+        # 目标换到右边一大截 —— 该立刻掉头
+        stride = bot.botmove.walk_speed(who) * bot.BOT_DECISION_TICKS
+        far = conn.body.x + stride * 4
+        self.assertEqual(1, bot._walk_to(self.room, conn, self.terrain,
+                                         (far, 150.0), False)[0],
+                         "目标挪到一步以外还不掉头")
+
+    def test_the_stride_follows_the_real_walk_speed(self):
+        """★ 判据是「这份意图的寿命里能走多远」，不是拍死的像素数。
+
+        冲刺跑一步 1.5 倍长，容差要跟着变宽 —— 否则冲刺时照旧来回跳。
+        """
+        conn = self.bot_conn
+        who = bot._character_of(conn)
+        self.place_bot(900.0)
+        bot._clear_navigation(conn)
+        slow = bot.botmove.walk_speed(who) * bot.BOT_DECISION_TICKS
+        fast = bot.botmove.walk_speed(who, fast_run=True) * bot.BOT_DECISION_TICKS
+        self.assertGreater(fast, slow)
+        gap = (slow + fast) / 2.0            # 走路够不着、冲刺够得着的那一档
+        conn.walk_last = -1
+        self.assertEqual(1, bot._walk_to(self.room, conn, self.terrain,
+                                         (900.0 + gap, 150.0), False)[0],
+                         "走路那一档：这个零头比一步长，该掉头")
+        conn.walk_last = -1
+        self.assertEqual(0, bot._walk_to(self.room, conn, self.terrain,
+                                         (900.0 + gap, 150.0), True)[0],
+                         "冲刺那一档：一步就迈过去了，不该掉头")
+
+
 class BotAimLeadTests(BotFireRoom):
     """★★ M5-D：对着**动的人**要算提前量；失误时要真的打偏。"""
 

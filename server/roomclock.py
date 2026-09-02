@@ -43,6 +43,7 @@ V0.3 到会话 47 为止，bot 的帧是「真人的同步包到达时才走一�
 from __future__ import annotations
 
 import heapq
+import sys
 import threading
 import time
 
@@ -50,6 +51,55 @@ import time
 #: 那边有语料回归的完整推导）。本模块不 import `ballistics` —— 它是通用的
 #: 节拍器，不该认识弹道；两边对不上时由 `bot.py` 那道断言喊出来。
 TICK_S = 0.032
+
+
+def _sharpen_windows_timer(load=None):
+    """★★★★★ 在 Windows 上把系统定时器粒度调到 1 毫秒（V0.3 §168）。
+
+    ## 为什么非调不可
+
+    这条线程是靠 `Condition.wait(deadline − now)` 醒的，而 Windows 上这个
+    等待被**系统定时器粒度**量化 —— 默认 15.6 ms。deadline 排得再准，
+    醒来的时刻也只能落在那个栅格上。实测（本机，CPython 3.14，120 格）：
+
+        默认               中位 31.16 ms  p10 30.05  p90 32.08  **最大 47.15**
+        timeBeginPeriod(1) 中位 32.15 ms  p10 31.12  p90 32.44  **最大 33.04**
+
+    32 ms 的拍子被切成 30~47 ms 的两堆，**平均还是准的**（绝对 deadline 不
+    累积误差），但**每一发都偏**。实机日志里看得一清二楚：bot 心跳的
+    间隔直方图是**双峰**的 —— 123 ms 一堆、138 ms 一堆，128 那儿几乎是空的，
+    而整局平均恰好 **128.00 ms**。
+
+    收方是按**自己的钟**外推 bot 的位置、再拿到达的心跳把它拉回去
+    （`packet_api` §5.6 的 `0.6 旧 + 0.4 新`）。一发心跳带的运动**恒是
+    4 个 tick**，送到的时刻却在 122~219 ms 之间晃 ⇒ 收方一会儿冲过头、
+    一会儿没跟上，每发都被拽一下。踩在地上时速度是 0，拽了也看不出来；
+    **腾空时误差正比于 |v|**，于是就成了用户 2026-09-02 第三轮报的那句：
+    「bot 跳起来在空中的时候，坐标会在抛物线的运动轨迹上前后抖动。」
+
+    ## 为什么这不算「拍一个阈值」（铁律 10）
+
+    `1` 是**这个 API 能给的最细粒度**（毫秒），不是从观测里挑的数；
+    它要对齐的是我们**已有的** 32 ms 拍子。调用是幂等且引用计数的，
+    非 Windows 平台整个不存在这回事。
+
+    ★ `load` 只为单测留一个注入口（真实现是 `ctypes.WinDLL`）——
+      Linux 上根本没有 `winmm`，不注入就没法验「成对调用」这条。
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        if load is None:
+            import ctypes
+
+            load = ctypes.WinDLL
+        winmm = load("winmm")
+        if winmm.timeBeginPeriod(1) != 0:       # TIMERR_NOERROR == 0
+            return None                         # 没按下去就别去还引用计数
+        return winmm
+    except Exception:                           # noqa: BLE001 —— 调优而已
+        return None
+
 
 #: 一次唤醒最多提前多少秒就当作「到点了」。
 #:
@@ -206,19 +256,29 @@ class Scheduler(object):
                 heapq.heappush(self._heap, (task.deadline, gen, key))
 
     def _run(self):
-        while True:
-            with self._cv:
-                if self._stopping:
-                    return
-                deadline = self._peek_locked()
-                now = self._clock()
-                if deadline is None:
-                    self._cv.wait(1.0)
-                    continue
-                if deadline > now + _EPSILON:
-                    self._cv.wait(deadline - now)
-                    continue
-            self.pump()
+        # ★ 这条线程活着的整段时间里把 Windows 的定时器粒度按到 1 ms
+        #   （§168）—— 它就是那个「醒得准不准」的主体，别的线程不需要。
+        winmm = _sharpen_windows_timer()
+        try:
+            while True:
+                with self._cv:
+                    if self._stopping:
+                        return
+                    deadline = self._peek_locked()
+                    now = self._clock()
+                    if deadline is None:
+                        self._cv.wait(1.0)
+                        continue
+                    if deadline > now + _EPSILON:
+                        self._cv.wait(deadline - now)
+                        continue
+                self.pump()
+        finally:
+            if winmm is not None:
+                try:
+                    winmm.timeEndPeriod(1)
+                except Exception:       # noqa: BLE001 —— 收工路上不许炸
+                    pass
 
 
 #: 全进程唯一的一条节拍器。和 `botplan.PLANNER` 同一个理由做成模块级单例：

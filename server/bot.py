@@ -518,6 +518,13 @@ class BotConn(gameserver.Conn):
         self.stance = "press"
         #: 拉开时那个后退落脚点 `(x, y)`；`None` = 还没挑 / 已经到了。
         self.retreat_goal = None
+        #: ★★ 上一次**真的迈出去**的走位方向（`_walk_to()` 的兜底那一路写）。
+        #:   `0` = 还没走过。判「这一次掉头是不是只为了修一个走不满的零头」
+        #:   要用它，见 `_walk_to()` 里那段（V0.3 §167）。
+        self.walk_last = 0
+        #: ★ 诊断（§167）：这一格 `_walk_to()` 拿到的目标点，只给
+        #:   `_src()` 那一行用；每格由 `_move_intent()` 先清空。
+        self.walk_goal = None
         #: ★★ AI 自己挑出来的那把枪的 ammo id（M5-C）；`None` = 还没挑过，
         #:   按 `weapondata.preferred_for()` 的缺省来。房主锁枪（`weapon_slot`）
         #:   和地上捡来的枪（`item_weapon`）都排在它前面。
@@ -739,6 +746,8 @@ class BotConn(gameserver.Conn):
         self.auto_weapon_id = None
         self.stance = "press"
         self.retreat_goal = None
+        self.walk_last = 0
+        self.walk_goal = None
         self.dodge_signature = None
         self.dodge_blind = None
         self.dodge_crouch = False
@@ -4604,6 +4613,9 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     提前量、战术性冲刺和蹲仍在后续阶段。
     """
     body = machine.body
+    # ★ 诊断（§167）：这一格的走位目标由 `_walk_to()` 填；先清掉，
+    #   免得某条不经过它的分支把上一格的目标当成自己的打出来。
+    machine.walk_goal = None
     if body is None or terrain is None:
         return _src(machine, "没身体/没地形", (0, False, False, False))
     # ★★★★ **被破坏物压住排在脱困之前**：`LockInBreakable=1` 的图会把
@@ -4659,13 +4671,13 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
         return _src(machine, "破障", breaking)
     # ★★★ 闯关房（M5-G）：那儿没有「敌方座位」，走位的目标是**跟上队伍**。
     if coop:
-        return _src(machine, "闯关",
-                    _coop_intent(room, machine, seat_index, terrain, target))
+        intent = _coop_intent(room, machine, seat_index, terrain, target)
+        return _src(machine, "闯关", intent, goal=machine.walk_goal)
     enemy = _enemy_spot(room, machine, seat_index)
     if enemy is None:
         # ★★★ 视野里一个敌人都没有（§127 / §128）—— 这时候**不站着发呆**。
-        return _src(machine, "框外走位",
-                    _blind_intent(room, machine, seat_index, terrain))
+        intent = _blind_intent(room, machine, seat_index, terrain)
+        return _src(machine, "框外走位", intent, goal=machine.walk_goal)
     enemy_index, spot = enemy
     enemy_span = math.hypot(spot[0] - body.x, spot[1] - body.y)
     # ★★★ 逼近还是拉开（M5-C）—— 用户 2026-08-29 要的那条「按双方血量判断」。
@@ -4708,8 +4720,8 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
             #   拉开的时候真人也是一边退一边打的。
             _clear_navigation(machine)
             return _src(machine, "打得到·站住打", (0, False, False, False))
-    return _src(machine, "朝目标走", _walk_to(room, machine, terrain, spot,
-                                              fast_run))
+    return _src(machine, "朝目标走",
+                _walk_to(room, machine, terrain, spot, fast_run), goal=spot)
 
 
 def _blind_cover_spot(machine, terrain, bearing):
@@ -4798,8 +4810,14 @@ def _blind_walk(room, machine, terrain, spot, side, fast_run):
     return intent if probe is None else probe
 
 
-def _src(machine, tag, intent):
+def _src(machine, tag, intent, goal=None):
     """★ 诊断（V0.3 §164）：记下这一帧的走位意图是**哪个分支**给的。
+
+    ★★ `goal` 是这一格走位**朝哪个点**（V0.3 §167 补的）。会话 54 查
+    §165 时在这上面白花了一整轮：`_src()` 只说了分支，而同一个分支的
+    `spot` 可能是敌人 / 道具 / 后撤点 / 跟随点，光看标签分不出来。
+    它**不进去重键**（目标每格都在动，进了键就等于不去重），只在
+    「分支或方向真的翻了」那几行上顺手打出来。
 
     用户 2026-09-02 00:48：「bot 走路还会有一卡一卡的感觉……来回跳。」
     心跳里量出来的形态很干净 —— bot 贴在地图横向边缘上，位置以
@@ -4820,9 +4838,13 @@ def _src(machine, tag, intent):
     key = (tag, intent[0], bool(intent[1]), bool(intent[2]))
     if key != machine.diag_src:
         machine.diag_src = key
+        where = ("" if goal is None
+                 else f" 目标=({goal[0]:.0f}, {goal[1]:.0f})")
+        body = machine.body
+        mine = "" if body is None else f" 我在=({body.x:.0f}, {body.y:.0f})"
         machine.log(f"   ◆走位来自「{tag}」 方向={intent[0]:+d} "
                     f"跳={'是' if intent[1] else '否'} "
-                    f"下={'是' if intent[2] else '否'}")
+                    f"下={'是' if intent[2] else '否'}{where}{mine}")
     return intent
 
 
@@ -4968,6 +4990,7 @@ def _walk_to(room, machine, terrain, spot, fast_run):
     `botnav.plan()`（M5-B），A\* 也找不到才退回墙根跳 / 坑前停的老兜底。
     """
     body = machine.body
+    machine.walk_goal = (float(spot[0]), float(spot[1]))   # ★ 诊断（§167）
     delta_x = spot[0] - body.x
     direction = 0 if abs(delta_x) < 1.0 else (1 if delta_x > 0 else -1)
     who = _character_of(machine)
@@ -5068,6 +5091,33 @@ def _walk_to(room, machine, terrain, spot, fast_run):
                                          fast_run, crouched, scale):
         # ★ 前面那一步碰撞体塞不进去（V0.3 §152）—— 别往里蹭。站住比卡住好。
         return (0, False, False, fast_run)
+    # ★★★★★ **走不满一步的零头，不值得掉头**（V0.3 §167）。
+    #
+    #   这一层是个 bang-bang 控制器：方向只有 `±1`，而**一份意图要握着走
+    #   `BOT_DECISION_TICKS` 个 tick**（`_own_step()` 逐格消费同一个
+    #   `machine.intent`）。上面那句 `abs(delta_x) < 1.0` 的容差是 1 像素,
+    #   一次决策却走 14~21 像素 ⇒ 只要目标点落在 bot 迈得过去的地方，
+    #   它就**必然**踩过头、下一格再踩回来，15 Hz 一个来回、幅度一整步。
+    #
+    #   实机 `Esperan00` 10:18:50~52（`logs/server.out`，10:14:45 那次启动）
+    #   离线原样复现：目标 x=781，bot 在 793 ↔ 779 之间来回，
+    #   `◆走位来自「朝目标走」` 每 62 ms 翻一次，心跳里看到的就是
+    #   「位置来回微微跳」。用户 2026-09-02 第二轮实机报的就是它。
+    #
+    #   ⇒ 判据不是新拍的常数，是**这份意图的寿命里能走多远**（和 §151 那条
+    #     前瞻用的是同一把尺）：要掉的这个头如果只是为了修一个比它还短的
+    #     零头，那就站住。目标真的挪到一步以外时照旧掉头，一个字没变。
+    #
+    #   ★ 只挡**掉头**，不挡「接着往前走」：所以「走过去踩到那一点」这件事
+    #     一次都没少做（穿过去捡道具照旧），少掉的只有踩过头之后的那次折返。
+    if direction and machine.walk_last == -direction:
+        stride = botmove.walk_speed(who, fast_run=fast_run,
+                                    crouched=crouched,
+                                    scale=scale) * BOT_DECISION_TICKS
+        if abs(delta_x) <= stride:
+            return (0, False, False, fast_run)
+    if direction:
+        machine.walk_last = direction
     return (direction, False, False, fast_run)
 
 

@@ -220,5 +220,86 @@ class ThreadedSchedulerTests(unittest.TestCase):
         self.assertEqual(settled, len(count), "停了还在叫")
 
 
+class WindowsTimerResolutionTests(unittest.TestCase):
+    """★★★★★ 节拍器线程活着时把 Windows 定时器粒度按到 1 ms（V0.3 §168）。
+
+    默认 15.6 ms 的粒度会把 32 ms 的拍子切成 30~47 ms 两堆 —— 平均还是准的
+    （绝对 deadline 不累积误差），但**每一发都偏**。实机 bot 心跳的间隔
+    直方图因此是双峰的（123 / 138 ms，128 那儿是空的），而收方按自己的钟
+    外推 bot 的位置，一发心跳带的运动恒是 4 个 tick、送到的时刻却在晃
+    ⇒ 腾空时（速度大）就成了「在抛物线上前后抖」。
+
+    这里不断言**时间**（那会看机器脸色），断言的是**这条 API 被成对调用了**。
+    """
+
+    class FakeWinmm(object):
+        def __init__(self, rc=0):
+            self.rc = rc
+            self.calls = []
+
+        def timeBeginPeriod(self, ms):      # noqa: N802 —— 抄 Win32 的名字
+            self.calls.append(("begin", ms))
+            return self.rc
+
+        def timeEndPeriod(self, ms):        # noqa: N802
+            self.calls.append(("end", ms))
+            return 0
+
+    def on_windows(self, load):
+        """假装在 Windows 上跑（Linux 也要能验这几条）。"""
+        real = sys.platform
+        sys.platform = "win32"
+        self.addCleanup(setattr, sys, "platform", real)
+        return roomclock._sharpen_windows_timer(load=load)
+
+    def test_it_asks_for_one_millisecond(self):
+        winmm = self.FakeWinmm()
+        got = self.on_windows(lambda name: winmm)
+        self.assertIs(winmm, got)
+        self.assertEqual([("begin", 1)], winmm.calls,
+                         "1 ms 是这个 API 的最细粒度")
+
+    def test_a_failure_is_not_undone_later(self):
+        """★ 没按下去（返回非 0）就交白卷 —— 否则收工时会把**别人**加的
+        引用计数减掉。"""
+        winmm = self.FakeWinmm(rc=97)             # TIMERR_NOCANDO
+        self.assertIsNone(self.on_windows(lambda name: winmm))
+
+    def test_a_broken_winmm_never_raises(self):
+        """★ 调优而已：它炸了不能把整条节拍器带走。"""
+        def boom(_name):
+            raise OSError("没有 winmm")
+        self.assertIsNone(self.on_windows(boom))
+
+    def test_it_is_a_no_op_where_there_is_no_such_api(self):
+        """★ 非 Windows（服务端包要在 Linux 上跑）整个不存在这回事。"""
+        real = sys.platform
+        sys.platform = "linux"
+        self.addCleanup(setattr, sys, "platform", real)
+        seen = []
+        self.assertIsNone(
+            roomclock._sharpen_windows_timer(load=seen.append))
+        self.assertEqual([], seen, "非 Windows 上连 DLL 都不该去加载")
+
+    def test_the_scheduler_thread_gives_it_back_when_it_exits(self):
+        """★★ 成对：线程活着时按住，退出时还回去。"""
+        winmm = self.FakeWinmm()
+        real = roomclock._sharpen_windows_timer
+        roomclock._sharpen_windows_timer = lambda: winmm
+        self.addCleanup(setattr, roomclock, "_sharpen_windows_timer", real)
+        sched = roomclock.Scheduler()
+        self.addCleanup(sched.shutdown)
+        fired = threading.Event()
+        sched.start("smoke", lambda gen, deadline, now: fired.set(),
+                    first=time.monotonic() + 0.01)
+        self.assertTrue(fired.wait(5.0), "节拍器线程没起来")
+        self.assertEqual([], winmm.calls, "假实现里不该有 begin")
+        sched.shutdown()
+        thread = sched._thread                      # 判据是线程真的退了
+        thread.join(5.0)
+        self.assertFalse(thread.is_alive(), "线程没退")
+        self.assertEqual([("end", 1)], winmm.calls, "退出时没还回去")
+
+
 if __name__ == "__main__":
     unittest.main()
