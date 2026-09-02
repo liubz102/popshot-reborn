@@ -5381,6 +5381,13 @@ class Conn:
     #: 补建时用的类级锁。**只**在上面那一格还是 `None` 时会走到。
     _outbox_boot = threading.Lock()
 
+    #: ★ 诊断（V0.3 §166）：发送线程一次醒来最多并走过几份。**按「刷新纪录」
+    #: 去重**（铁律 10 的口径：状态翻转，不是次数也不是时间窗）——
+    #: 只有比以前更深的一次积压才打一行，所以一条连接一局最多几行。
+    #: 它同时是「积压到底在服务端还是在中继」的分水岭：这个数一直很小
+    #: 而客户端仍然收得一卡一卡，那就不是这条队列的事。
+    send_burst_max = 0
+
     def __init__(self, sock, addr, args, accounts=None, tickets=None):
         global _seq
         with _lock:
@@ -5739,7 +5746,10 @@ class Conn:
                     # ★ 整批**一份密文**入队 —— 发送线程会把它一次写出去，
                     #   §120 要的「要么一起进客户端的接收缓冲、要么一起不进」
                     #   一点没变。
-                    self._enqueue(self.cout.encrypt(plain))
+                    # ★★ `solo=True`：发送线程**不许**把别的包并进这一次写
+                    #   （V0.3 §166）。批本身合成一次写是 D058 要的；
+                    #   往里再掺东西不是。
+                    self._enqueue(self.cout.encrypt(plain), solo=True)
 
     # -- 发送队列（D108）-----------------------------------------------------
     def _outbox(self):
@@ -5758,8 +5768,10 @@ class Conn:
                 cv = self.outbox_cv = threading.Condition()
         return cv
 
-    def _enqueue(self, wire):
+    def _enqueue(self, wire, solo=False):
         """把一份**已经加密**的字节挂进发送队列，必要时把发送线程叫起来。
+
+        `solo=True` 的那一份**只许自己一次写**（`send_batch` 用它，见 §166）。
 
         ⚠ 调用方必须已经持有 `send_lock`（加密和入队要在同一次加锁里，
         否则两个线程的密文会交错入队，客户端整条流就解不开了）。
@@ -5778,7 +5790,7 @@ class Conn:
                 #   是同一个 —— 「8 秒没把我们的字节收走」，那这条流已经废了。
                 start = "slow"
             if start is None:
-                self.outbox.append(wire)
+                self.outbox.append((wire, bool(solo)))
                 self.outbox_bytes += len(wire)
                 if self.writer is None or not self.writer.is_alive():
                     self.writer = threading.Thread(
@@ -5793,15 +5805,48 @@ class Conn:
         elif start == "thread":
             self.writer.start()
 
+    def _note_send_burst(self, packets, size):
+        """★ 诊断：这一次醒来并走了 `packets` 份 —— 刷新纪录才打一行（§166）。
+
+        ⚠ 调用方已经持有 `outbox_cv`。
+        """
+        if packets <= self.send_burst_max:
+            return
+        self.send_burst_max = packets
+        self.log(f"   ★发送队列积压新高：一次写并走 {packets} 份"
+                 f"（{size} 字节）—— 越大说明发送线程被饿得越久（§166）")
+
     def _writer_loop(self):
         """本连接的发送线程：把队列里的密文写出去。**只堵它自己。**
 
-        ★★ **一份入队 = 一次写**，绝不把两份合起来写。
-          这样 `send()` / `send_batch()` 在线上的样子和 D108 之前**一模一样**：
-          一次 `send()` 一次写、整批合并成一次写（§120 那条「要么一起进客户端
-          的接收缓冲、要么一起不进」靠的就是后者）。合并着写能省几次系统调用，
-          但会让「写了几次」变成**看线程什么时候醒**的随机数 —— 那条语义比
-          那几次系统调用值钱得多。
+        ★★★★★ **醒一次就把当时排着的那些一起写出去**（V0.3 §166 / D125）。
+
+        以前是「一份入队 = 一次写」，为的是让「写了几次」不随线程调度变。
+        实机把这条语义的价钱算出来了：一次写要经过 `select` + `send` 两次
+        系统调用，每次回来都得**重抢一次 GIL**；只要进程里有一条纯 Python
+        的计算线程在跑（`botplan` 那条后台规划线程翻到一个没算过的破坏物
+        变体时，一次 `plan_result()` 实测 **832 ms**），发送线程就只能
+        **每 30~50 ms 走掉一个包**。而战斗中光 bot 心跳就是 5 × 8 = 40 包/秒
+        —— 队列只会越排越长。
+
+        `Esperan03` 01:07~01:11 那一局量到的：服务端入队到客户端真的建出弹体，
+        中位 25 ms、**p90 149 ms、p99 803 ms、最大 847 ms**，805 发里 67 发
+        超过 300 ms。客户端那头逐条解密看得一清二楚 —— 20.25~21.05 这 800 ms
+        里它**一次只收到一个 48/50/53 字节的包**，最后才一口气收到 1014 字节。
+        两个端点都没卡（真人上行间隔最大 204 ms、客户端日志最大间隔 126 ms），
+        卡的就是这条队列。
+
+        这就是用户 2026-09-01 / 09-02 反复报的「像积压了几秒的网络包突然
+        挤在一起爆发出来」：`rpExplode` 迟到 ⇒ 击退和死亡动画一起晚半秒才
+        演（「突然向后瞬移一点距离，然后出现死亡动画」），bot 心跳迟到 ⇒
+        客户端先按自己那份物理往下推、再被一批旧坐标拉回来（「下落时沿着
+        下落路径反复上下抖动」）。
+
+        合并**不改一个字节**：`SimpleCipher` 是逐字节流密码，密文早在
+        `send()` 里就生成好了，这里只是少调几次 `send`。顺序也一点没动。
+        ★ `solo` 的那一份（`send_batch` 攒出来的）**不并**：D058 要的是
+          「整批一次写」，不是「往批里再掺东西」。
+
         ★ 超时 / 出错的处置和以前一模一样：`kill_stream()` 拆连接让客户端
           重连（这条流的密码状态已经错位，留着只会是半死连接）。
         """
@@ -5818,8 +5863,20 @@ class Conn:
                     self.outbox_bytes = 0
                     cv.notify_all()
                     return
-                chunk = self.outbox.popleft()
+                chunk, solo = self.outbox.popleft()
                 self.outbox_bytes -= len(chunk)
+                if not solo:
+                    # ★ 把**此刻**排在后面的非 solo 份一起取走。判据是队列
+                    #   自己的状态（「还排着、而且不是 solo」），不是次数
+                    #   也不是时间（铁律 10）。
+                    merged = [chunk]
+                    while self.outbox and not self.outbox[0][1]:
+                        more, _ = self.outbox.popleft()
+                        self.outbox_bytes -= len(more)
+                        merged.append(more)
+                    if len(merged) > 1:
+                        chunk = b"".join(merged)
+                        self._note_send_burst(len(merged), len(chunk))
                 if not self.outbox:
                     self.outbox_bytes = 0
             try:

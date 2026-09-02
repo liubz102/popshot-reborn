@@ -4170,6 +4170,120 @@ class BotStanceTests(TerrainMixin, BotFireRoom):
                         "退的时候也该还手")
 
 
+class BotRetreatSpotTests(TerrainMixin, BotFireRoom):
+    """★★★★★ 后撤点不许只挑出「往后 8 像素」（V0.3 §165）。
+
+    实机 `Esperan03` 01:11:14.989~17.815 座位 1、01:10:25.9~32.7 座位 5：
+    x 在 3/7/10/14 之间来回，`◆走位来自「朝目标走」` **每 62 ms（一次决策）
+    翻一次方向**，整局 45 段、累计 82 秒。用户 2026-09-02：「好几个 bot
+    走路都感觉一卡一卡的。」
+
+    病根是 `_retreat_spot()` 缺了 `_blind_cover_spot()` 开头那一句「已经在
+    掩体后面，当前点就是最近答案」：站着的人本来就被挡着，往后挪一个扫描格
+    （8 像素）当然还挡着 ⇒ `index=1` 立刻 `return` ⇒ `_retreat_done()`
+    一看「只差 8 像素 ≤ GOAL_X(64)」判「退到了」⇒ 下一格重挑。
+    而一次决策走 14~21 像素，**一步就迈过头**；贴到图边更是连一格都挑不出来
+    （`cx < 0` 直接 break）⇒ 改成压上去 ⇒ 走回来又够得着一格 ⇒ 再退。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.alice_seat = self.room.seat_index_of(self.alice)
+
+    def hurt(self, seat, fraction):
+        top = bot._seat_max_hp(self.room, seat)
+        bot._health(self.room).note_damage(seat, top * fraction)
+
+    def behind_cover(self):
+        """右边有敌人、中间隔着一堵墙 —— bot 已经躲在墙后面。"""
+        terrain = self.install_terrain(synth_terrain(
+            "retreat_cover", width=4000, walls=((900, 940, 0),)))
+        self.place_bot(600.0)
+        return terrain
+
+    def test_already_behind_cover_answers_with_the_current_spot(self):
+        terrain = self.behind_cover()
+        goal = bot._retreat_spot(self.room, self.bot_conn, terrain,
+                                 (1500.0, 150.0))
+        self.assertEqual((self.bot_conn.body.x, self.bot_conn.body.y), goal,
+                         "已经在掩体后面了，答案就该是脚下这一点")
+
+    def test_an_exposed_bot_still_walks_to_real_cover(self):
+        """★ 没被挡住的时候一个字没变：照旧往背离敌人的方向扫掩体。"""
+        terrain = self.install_terrain(synth_terrain(
+            "retreat_open", width=4000, walls=((480, 520, 0),)))
+        self.place_bot(600.0)
+        goal = bot._retreat_spot(self.room, self.bot_conn, terrain,
+                                 (1500.0, 150.0))
+        self.assertIsNotNone(goal)
+        self.assertLess(goal[0], 520.0, "该走到墙的另一边去")
+
+    def test_the_direction_stops_flip_flopping_at_the_map_edge(self):
+        """★★★★★ 这条就是抖动本身 —— 贴着图边、一格决策一个来回。
+
+        照 `_own_step()` 的节奏跑：一格决策握着这份意图走
+        `BOT_DECISION_TICKS` 个 tick，再重问。改之前这里 12 格里翻 10 次
+        （离线拿 `Esperan03` 真图复现过，形态和实机逐发心跳一模一样）。
+        """
+        # 敌人要在**视野框里**（`BOT_VISION_HALF_X`），否则走的是「框外走位」
+        # 那条分支，压根到不了后撤这儿。
+        terrain = self.install_terrain(synth_terrain(
+            "retreat_edge_cover", width=4000, walls=((500, 540, 0),)))
+        enemy = (860.0, 150.0)
+        self.hurt(self.bot_seat, 0.9)          # 「照这样打下去我先倒」⇒ 后撤
+        self.bot_conn.stance = "retreat"
+        self.bot_conn.retreat_goal = None
+        for conn in (self.alice, self.bob):
+            conn.sync_trail.clear()
+            conn.sync_trail.append((enemy[0], enemy[1], 0))
+        who = bot._character_of(self.bot_conn)
+        seen = []
+        for start_x in (4.0, 10.0, 16.0):
+            self.place_bot(start_x)
+            self.bot_conn.retreat_goal = None
+            row = []
+            for _ in range(12):
+                intent = bot._move_intent(self.room, self.bot_conn,
+                                          self.bot_seat, terrain, None)
+                row.append(intent[0])
+                for _ in range(bot.BOT_DECISION_TICKS):
+                    self.bot_conn.body = bot.botmove.tick(
+                        terrain, self.bot_conn.body, who,
+                        direction=intent[0], fast_run=bool(intent[3]))
+                self.bot_conn.battle_pos = (self.bot_conn.body.x,
+                                            self.bot_conn.body.y)
+            seen.append((start_x, row))
+        for start_x, row in seen:
+            flips = sum(1 for i in range(len(row) - 1)
+                        if row[i] and row[i + 1] == -row[i])
+            self.assertEqual(0, flips,
+                             "从 x=%.1f 起方向来回翻了 %d 次：%s"
+                             % (start_x, flips, row))
+
+    def test_nowhere_to_retreat_does_not_rewrite_the_stance_latch(self):
+        """★★★ 「退无可退」是**地形**事实，不是战况判断变了（§165）。
+
+        以前这儿写一句 `machine.stance = "press"`，下一格 `_stance()` 拿
+        同一组血量一算又说「该退」—— 闩每一格翻一次，两道迟滞门形同虚设。
+        """
+        terrain = self.install_terrain(synth_terrain("retreat_edge",
+                                                     width=4000))
+        self.place_bot(4.0)                     # 贴着图左边缘
+        self.hurt(self.bot_seat, 0.9)
+        self.bot_conn.stance = "retreat"
+        self.bot_conn.retreat_goal = None
+        for conn in (self.alice, self.bob):
+            conn.sync_trail.clear()
+            conn.sync_trail.append((900.0, 150.0, 0))
+        self.assertIsNone(bot._retreat_spot(self.room, self.bot_conn, terrain,
+                                            (900.0, 150.0)),
+                          "平地图边本来就该退无可退")
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat, terrain,
+                         None)
+        self.assertEqual("retreat", self.bot_conn.stance,
+                         "退无可退不该把姿态闩改写成 press")
+
+
 class BotAimLeadTests(BotFireRoom):
     """★★ M5-D：对着**动的人**要算提前量；失误时要真的打偏。"""
 
@@ -8866,6 +8980,45 @@ class BotBreakableTests(TerrainMixin, BotFireRoom):
     def test_a_splash_packet_for_a_mob_is_not_mistaken_for_ice(self):
         """怪的句柄不能被当成破坏物 —— 它得继续走喂怪物表那一路。"""
         self.assertFalse(bot._note_peer_breakable(self.room, 1100419, 20))
+
+    def human_peer(self, opcode, body):
+        """替 alice 发一发同步事件包（走真的 `0x040e` 入口）。"""
+        seat = self.room.seat_index_of(self.alice)
+        gameserver.Conn.on_game_packet(
+            self.alice, OP_PEER_DATA_UP,
+            botsync.build_peer_packet(
+                seat, opcode, body, game_id=self.room.epoch_value,
+                sequence=self.next_seq(self.alice)))
+
+    def test_a_human_direct_hit_breaks_it_too(self):
+        """★★★★★ **直接命中**（`rpExplode`）打碎的也要记进这本账（§165）。
+
+        `rpSplashDamaged` 那一路一直分流着，`rpExplode` 这一路漏了。
+        实机 `Esperan03` 01:07~01:11：真人 13 发 `rpExplode` 里 12 发打的是
+        破坏物（句柄 114/84/89/79/85，各 60 点），而整局
+        `破坏物碎了（真人打的）` 一行都没有 ⇒ 他把底下那排台子打碎了，
+        服务端这本账上它们还立着，bot 照旧**悬空**从上面走过去
+        （用户 2026-09-02 报的第三件）。
+        """
+        item = self.terrain.breakables[0]
+        self.human_peer(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, item.handle, 680.0, 160.0,
+            hit_kind=0, flags=0, damage=float(item.hp)))
+        self.assertEqual(frozenset(), self.ledger().alive(self.terrain),
+                         "真人直接命中打碎的，服务端也得当它碎了")
+        self.assertEqual(0, bot._terrain(self.room).cell(680, 160),
+                         "地形要跟着换成碎掉那一份")
+
+    def test_a_direct_hit_on_a_mob_still_feeds_the_monster_table(self):
+        """★ 分流只认**这张图上的**破坏物句柄，怪照旧走喂怪物表那一路。"""
+        seen = []
+        real = bot.note_mob_hit
+        bot.note_mob_hit = lambda *a, **k: seen.append(a)
+        self.addCleanup(setattr, bot, "note_mob_hit", real)
+        self.human_peer(botsync.OP_EXPLODE, botsync.explode_body(
+            100002, 1100419, 680.0, 160.0, hit_kind=0, flags=0, damage=40.0))
+        self.assertTrue(seen, "怪的句柄被当成破坏物吃掉了")
+        self.assertEqual(frozenset([0]), self.ledger().alive(self.terrain))
 
     def test_a_bot_shot_that_misses_the_ice_leaves_it_alone(self):
         """炸在半张图外 —— 那 11 个采样点一个都碰不到它。"""

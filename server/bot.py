@@ -2507,9 +2507,21 @@ def note_peer_hit(room, conn, payload):
         # ★★ 血量台账**排在击退前面**（M5-C）：这一发扣了多少血是包里写死的
         #   事实（§42 收方原样扣），和「配不配得上某一发 rpFire」无关。
         if botsync.handle_seat(target) is None:
-            # ★ 打中的不是玩家座位 ⇒ 爆点是那只怪的一次额外位置采样（§125）。
-            #   `create=True`：boss 从不广播坐标，直接命中是它唯一的
-            #   位置来源（§141）；破坏物在里面被分流。
+            # ★★★★★ **先问「是不是可破坏物」**（V0.3 §165）——`rpSplashDamaged`
+            #   那一路早就这么分流了，`rpExplode` 这一路一直漏着。
+            #   实机 Esperan03 01:07~01:11 那一局：真人 13 发 `rpExplode`
+            #   里有 **12 发**打的是破坏物（句柄 114/84/89/79/85，各 60 点），
+            #   而整局 `破坏物碎了（真人打的）` **一行都没有** ⇒ 真人把底下
+            #   那排台子打碎了，服务端这本账上它们还好好的，bot 照旧从
+            #   碎掉的台子上**悬空走过去**（用户 2026-09-02 报的第三件）。
+            #   ★ 直接命中也能打碎它：客户端自己就按这一发扣血，紧接着
+            #     还发了 `0x0408 HP 归零上报 句柄=0x72`，服务端也广播了
+            #     `0x0406` —— 两边都知道，只有 bot 的地形没跟上。
+            if _note_peer_breakable(room, target, damage):
+                return
+            # ★ 打中的不是玩家座位、也不是破坏物 ⇒ 爆点是那只怪的一次额外
+            #   位置采样（§125）。`create=True`：boss 从不广播坐标，直接命中
+            #   是它唯一的位置来源（§141）。
             note_mob_hit(room, target, bx, by, create=True)
         _note_damage(room, botsync.handle_seat(target), damage)
         velocity = _peer_shot_velocity(conn, bx, by)
@@ -4187,10 +4199,28 @@ def _retreat_spot(room, machine, terrain, enemy):
 
     ⚠ 判「挡住没有」用的是 `line_blocked`（`blocks_bullet`，单向平台不挡
     子弹，§29）—— 拿 `is_solid` 会把一根白线当掩体。
+
+    ## ★★★★★ 已经躲在掩体后面了 —— **答案就是脚下这一点**（V0.3 §165）
+
+    `_blind_cover_spot()` 开头本来就有这一句（「已经在掩体后面，当前点就是
+    最近答案」），这儿一直漏着，后果是**每一格都挑出一个只有一个扫描格
+    （8 像素）远的「掩体」**：站着的人本来就被挡住了，往后挪 8 像素当然
+    还是被挡住，于是 `index=1` 那一格立刻 `return`。
+
+    接着 `_retreat_done()` 一看「离目标只有 8 像素 ≤ `GOAL_X`(64)」判「退到了」
+    ⇒ 下一格重挑 ⇒ 又是 8 像素。而 bot 一格决策走 14~21 像素，**一步就迈过头**。
+    贴到图边时更糟：`cx < 0` 直接 `break`，挑不出任何点 ⇒ 走位改成朝敌人压上去
+    ⇒ 走回来又够得着一格了 ⇒ 再退。**三格一个循环 = 12 tick = 3 发心跳**，
+    正是实机量到的周期（`Esperan03` 01:11:14.989~17.815 座位 1
+    x = 3/7/10 来回、01:10:25.9~32.7 座位 5 同样；V0.3 §164 ③ 在图两边
+    都见过）。用户 2026-09-02：「好几个 bot 走路都感觉一卡一卡的。」
     """
     body = machine.body
     if body is None or terrain is None:
         return None
+    mx, my = _muzzle(body.x, body.y, enemy[0])
+    if terrain.line_blocked(mx, my, enemy[0], enemy[1] - BOT_MUZZLE_HEIGHT):
+        return (body.x, body.y)
     away = 1.0 if body.x >= enemy[0] else -1.0
     reach = botmove.walk_speed(_character_of(machine)) * botmove.CLIMB_SLOPE         * botmove.TICKS_PER_BEAT
     farthest = None
@@ -4650,7 +4680,15 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
             _clear_navigation(machine)
         if goal is None:
             # 退无可退（图边 / 没有落脚点）——那就照旧打，别原地发呆。
-            machine.stance = "press"
+            #
+            # ★★★ **不改写姿态闩**（V0.3 §165）。以前这儿写一句
+            #   `machine.stance = "press"`，可「退无可退」是**地形**事实，
+            #   不是战况判断变了 —— 下一格 `_stance()` 拿同一组血量 / 输出
+            #   一算，照旧说「该退」，于是闩每一格翻一次，两道迟滞门
+            #   （`BOT_RETREAT_RATIO` / `BOT_PRESS_RATIO`）形同虚设。
+            #   闩留在 `retreat` 上，回 `press` 就得真的「明显更占便宜」，
+            #   这才是那两个数当初的意思。走位这一格照旧朝敌人走，一个字没变。
+            pass
         else:
             spot = goal
             # ★ 脱离时按着右键跑（`FastRunRate`）—— 体力够才跑，

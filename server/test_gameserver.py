@@ -2717,9 +2717,11 @@ class SendBatchTests(unittest.TestCase):
     def writes(self, conn):
         """假 socket 上的写。**先把发送队列排空**（D108：写发生在另一条线程上）。
 
-        ★ 排空之后「写了几次」仍然是确定的：一份入队 = 一次写，发送线程
-        绝不把两份合起来写（见 `Conn._writer_loop`），所以下面这些
-        「一批就是一次写」的断言含义一点没变。
+        ★★ 「一批就是一次写」的断言仍然成立：`send_batch()` 攒出来的那一份
+        是 `solo` 的，发送线程**不许**把别的包并进去（V0.3 §166）。
+        反过来，几发**独立**的 `send()` 会不会被并成一次写，取决于发送线程
+        什么时候醒 —— 那是刻意换来的（§166 / D125），所以下面不再有任何
+        「n 发独立的 send 就该有 n 次写」的断言。
         """
         conn.flush_outbox(timeout=5.0)
         return conn.sock.writes
@@ -2752,7 +2754,6 @@ class SendBatchTests(unittest.TestCase):
         with gameserver.Conn.send_batch(batched):
             for packet in packets:
                 batched.send(packet)
-        self.assertEqual(3, len(self.writes(one_by_one)))
         self.assertEqual(1, len(self.writes(batched)))
         self.assertEqual(b"".join(self.writes(one_by_one)),
                          b"".join(self.writes(batched)))
@@ -2926,16 +2927,20 @@ class StuckClientIsolationTests(SendBatchTests):
         stuck.sock.gate.set()
 
     def test_the_order_survives_the_queue(self):
-        """★ 排队不许打乱顺序 —— `SimpleCipher` 是逐字节流密码，错一次全废。"""
+        """★ 排队不许打乱顺序 —— `SimpleCipher` 是逐字节流密码，错一次全废。
+
+        ★ 断言的是**字节流**，不是「写了几次」：后两发会被发送线程并成
+        一次写（§166），而那正是要的。
+        """
         conn = self.stuck_conn()
         for opcode in (0x0200, 0x0201, 0x0200):
             conn.send(build_game(opcode, build_rep_list_session()
                                  if opcode == 0x0200
                                  else build_rep_create_session(1)))
         conn.sock.gate.set()
-        self.assertTrue(self.wait_for(lambda: len(conn.sock.writes) == 3))
-        self.assertEqual([0x0200, 0x0201, 0x0200],
-                         self.frames_of(self.decrypted(conn)))
+        self.assertTrue(self.wait_for(
+            lambda: self.frames_of(self.decrypted(conn))
+            == [0x0200, 0x0201, 0x0200]))
 
     # -- 收口：写不出去的连接照旧被拆掉 --------------------------------------
 
@@ -2982,6 +2987,91 @@ class StuckClientIsolationTests(SendBatchTests):
         conn.send(build_game(0x0200, build_rep_list_session()))
         conn.close_now()
         self.assertEqual(1, len(conn.sock.writes), "关之前那一发丢了")
+
+
+class SendCoalescingTests(StuckClientIsolationTests):
+    """★★★★★ 发送线程**醒一次就把排着的一起写出去**（V0.3 §166 / D125）。
+
+    以前一份入队一次写，一次写要两次系统调用、两次重抢 GIL。进程里只要有
+    一条纯 Python 的计算线程在跑（`botplan` 翻到没算过的破坏物变体时一次
+    `plan_result()` 实测 832 ms），发送线程就只能每 30~50 ms 走掉一个包；
+    而战斗中光 bot 心跳就 40 包/秒 —— 实机量到投递延迟 p99 803 ms、
+    最大 847 ms，客户端那头一次只收到一个 48/53 字节的包。
+
+    这里用「卡住的 socket」把时序钉死：第一发被发送线程取走卡在 `sendall`
+    里，后面几发就都排在队列上；放开之后它们必须**一次**写出去。
+    """
+
+    def queued_behind_the_first(self, conn, sends):
+        """第一发卡在 `sendall` 里时，把 `sends` 全排进队列。"""
+        self.assertTrue(conn.sock.entered.wait(5.0), "发送线程没起来")
+        for send in sends:
+            send()
+        self.assertEqual(len(sends), len(conn.outbox), "该都还排着")
+
+    def test_everything_queued_behind_a_slow_write_goes_out_in_one_write(self):
+        conn = self.stuck_conn()
+        conn.send(build_game(0x0200, build_rep_list_session()))
+        self.queued_behind_the_first(conn, [
+            lambda: conn.send(build_game(0x0201, build_rep_create_session(1))),
+            lambda: conn.send(build_game(0x0200, build_rep_list_session())),
+            lambda: conn.send(build_game(0x0201, build_rep_create_session(1))),
+        ])
+        conn.sock.gate.set()
+        self.assertTrue(self.wait_for(lambda: len(conn.sock.writes) == 2),
+                        "排在后面那三份该并成一次写")
+        self.assertEqual([0x0200, 0x0201, 0x0200, 0x0201],
+                         self.frames_of(self.decrypted(conn)))
+
+    def test_merging_does_not_change_a_single_byte(self):
+        """★ 合并只改变「写了几次」——`SimpleCipher` 是逐字节流密码，
+        字节错一个客户端就再也解不回来了。"""
+        packets = [build_game(0x0200, build_rep_list_session()),
+                   build_game(0x0201, build_rep_create_session(1)),
+                   build_game(OP_SLOT_EQUIPPED_LIST,
+                              build_slot_equipped_list(0, [101400001]))]
+        expected = SimpleCipher.server_to_client().encrypt(b"".join(packets))
+        conn = self.stuck_conn()
+        conn.send(packets[0])
+        self.queued_behind_the_first(
+            conn, [lambda: conn.send(packets[1]), lambda: conn.send(packets[2])])
+        conn.sock.gate.set()
+        self.assertTrue(self.wait_for(
+            lambda: b"".join(conn.sock.writes) == expected))
+
+    def test_a_batch_is_never_merged_with_its_neighbours(self):
+        """★★★ D058 要的是「整批一次写」，不是「往批里再掺东西」。
+
+        变异验证：把 `send_batch()` 那一份的 `solo=True` 去掉，这一条当场红。
+        """
+        conn = self.stuck_conn()
+        conn.send(build_game(0x0200, build_rep_list_session()))
+        self.assertTrue(conn.sock.entered.wait(5.0), "发送线程没起来")
+        with gameserver.Conn.send_batch(conn):
+            conn.send(build_game(0x0201, build_rep_create_session(1)))
+            conn.send(build_game(OP_SLOT_EQUIPPED_LIST,
+                                 build_slot_equipped_list(0, [101400001])))
+        conn.send(build_game(0x0200, build_rep_list_session()))
+        conn.sock.gate.set()
+        self.assertTrue(self.wait_for(lambda: len(conn.sock.writes) == 3),
+                        "批该自己占一次写，前后都不许并进来")
+        self.assertEqual([0x0200, 0x0201, OP_SLOT_EQUIPPED_LIST, 0x0200],
+                         self.frames_of(self.decrypted(conn)))
+
+    def test_the_backlog_high_water_mark_is_logged_once_per_record(self):
+        """★ 诊断按**刷新纪录**去重（铁律 10：状态翻转，不是次数 / 时间窗）。"""
+        conn = self.stuck_conn()
+        conn.send(build_game(0x0200, build_rep_list_session()))
+        self.queued_behind_the_first(conn, [
+            lambda: conn.send(build_game(0x0201, build_rep_create_session(1))),
+            lambda: conn.send(build_game(0x0200, build_rep_list_session())),
+        ])
+        conn.sock.gate.set()
+        self.assertTrue(self.wait_for(lambda: len(conn.sock.writes) == 2))
+        burst = [line for line in conn.logged if "发送队列积压新高" in line]
+        self.assertEqual(1, len(burst), burst)
+        self.assertIn("并走 2 份", burst[0])
+
 
 if __name__ == "__main__":
     unittest.main()
