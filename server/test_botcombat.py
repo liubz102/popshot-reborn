@@ -20,6 +20,10 @@ import botarms                                                 # noqa: E402
 import bothp                                                   # noqa: E402
 import botmove                                                 # noqa: E402
 import botthreat                                               # noqa: E402
+import chrprops                                                # noqa: E402
+# ★ 只为拿 `HEARTBEAT_TICKS`（躲避答案握多久）—— 这个数属于 bot 主循环的
+#   节拍，不该在 `botthreat` 或测试里再抄一份。
+import gameserver                                              # noqa: E402
 import mapdata                                                 # noqa: E402
 import weapondata                                              # noqa: E402
 from test_mapdata import make_record                            # noqa: E402
@@ -438,6 +442,111 @@ class DodgeChoiceTests(unittest.TestCase):
         self.assertIsNone(botthreat.roll_blind(lambda n: n - 1, 0.30))
         self.assertIsNotNone(botthreat.roll_blind(lambda n: 0, 0.30))
         self.assertIsNone(botthreat.roll_blind(lambda n: 0, 0.0))
+
+    # -- ★★★★★ V0.3 §174：躲避不许对着空气躲、也不许把自己顶进图边 ------
+
+    def test_a_blind_roll_needs_a_bullet_that_is_actually_coming(self):
+        """★★★★★ 「预估失误」是**躲错方向**，不是没有弹也在乱躲。
+
+        实机 `Esperan03` 21:19:34~38：真人一死，`peer_shots`（按条数封顶的
+        deque）里那几发旧记录一直躺着 ⇒ `threats` 永远非空 ⇒ 盲选那一手
+        无条件返回 ⇒ bot 对着一发两秒前就飞出图外的子弹「躲」了 4.5 秒。
+        """
+        far_away = straight_threat(100.0, 20.0)         # 差着十万八千里
+        blind = botthreat.Option("left", -1, False, False, False, False)
+        self.assertIsNone(botthreat.choose(
+            self.terrain, self.body, self.who, [far_away], 0.0,
+            blind_pick=blind), "站着都打不到我，就没有「躲错」这回事")
+        cx, cy = self.who.center(600.0, 150.0)
+        self.assertIs(blind, botthreat.choose(
+            self.terrain, self.body, self.who, [straight_threat(100.0, cy)],
+            0.0, blind_pick=blind), "真有弹飞过来时，失误照旧生效")
+
+
+class DodgeIntoACrackTests(unittest.TestCase):
+    """★★★★★ V0.3 §174：躲避是 §152 那条 `fits()` 的**第四个挂点**。
+
+    实机 `Esperan03` 左下角那条坡：`fits()` 的分界正好在 x=14，往左一步就
+    塞不下人。躲避把 bot 推过去 ⇒ 下一格 `_unstick_intent()` 把它推回来
+    ⇒ 又躲 —— 每 64 ms 互顶一次，坡上一来一回就是 28 像素的上下抽搐。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.terrain = mapdata.load("Esperan03")
+        cls.who = chrprops.get(1)
+
+    def setUp(self):
+        self.left = botthreat.Option("left", -1, False, False, False, False)
+        #: 图左下角那条坡上**站得住**的一格。
+        self.body = botmove.Body(16.0, 949.0)
+
+    def rocket(self, gun_x=420.0, body=None, now=0.0):
+        """朝这个 bot 平射来的一发带溅射的火箭 —— 蹲下躲不掉，只能挪窝。
+
+        参数照 21:19:33.035 那一发：`1002030`，半径 10、溅射 100、25/tick。
+        """
+        body = self.body if body is None else body
+        cx, cy = self.who.center(body.x, body.y)
+        return botthreat.Threat(
+            2, FakeWeapon(size=10.0, splash_range=100), gun_x, cy,
+            ballistics.Shot(math.atan2(0.0, cx - gun_x), 1.0, 25.0, 16.0, 0.0),
+            now, ("shell", 600066))
+
+    def test_the_slope_really_has_a_fits_boundary_at_x14(self):
+        """★ 前提：这条坡上 x≤13 塞不下人、x≥14 塞得下（没了它测试不成立）。"""
+        for x, y in ((0, 967), (4, 962), (8, 957), (12, 953)):
+            self.assertFalse(botmove.fits(self.terrain, x, y, self.who),
+                             f"x={x} 该是塞不下的")
+        for x, y in ((14, 951), (16, 949), (20, 944), (24, 939)):
+            self.assertTrue(botmove.fits(self.terrain, x, y, self.who),
+                            f"x={x} 该是站得住的")
+
+    def test_a_dodge_never_leaves_us_somewhere_we_cannot_stand(self):
+        """★★★ 正常挑（没掷中失误）也会踩这个坑，不只是盲选。
+
+        全图扫出来的现成例子：`Iceria03` (784, 972)，火箭从左边平射过来，
+        改之前挑的是「往右走」—— 躲开了子弹，人正好蹭进右边那条冰缝。
+        """
+        terrain = mapdata.load("Iceria03")
+        body = botmove.Body(784.0, 972.0)
+        self.assertTrue(botmove.fits(terrain, body.x, body.y, self.who),
+                        "起点该是站得住的（前提没了测试就不成立）")
+        option = botthreat.choose(
+            terrain, body, self.who,
+            [self.rocket(gun_x=body.x - 400.0, body=body)], 0.0,
+            hold_ticks=gameserver.HEARTBEAT_TICKS)
+        self.assertIsNotNone(option, "左边飞来一发火箭，总得躲")
+        self.assertFalse(
+            botthreat._strands(terrain, body, self.who, option,
+                               gameserver.HEARTBEAT_TICKS),
+            "躲开了子弹却把自己卡住，不算躲开")
+
+    def test_a_blind_roll_will_not_wedge_us_either(self):
+        """★★★ 盲选也要过这一关：往左顶进图边不是「判断错」，
+        那是和脱困互相打架。退回站着不动 —— 那本来就是盲选的十种结果之一。"""
+        self.assertTrue(
+            botthreat._strands(self.terrain, self.body, self.who, self.left,
+                               gameserver.HEARTBEAT_TICKS),
+            "从 (16, 949) 往左走一定会走进塞不下的那一段（前提）")
+        self.assertIsNone(botthreat.choose(
+            self.terrain, self.body, self.who, [self.rocket()], 0.0,
+            blind_pick=self.left, hold_ticks=gameserver.HEARTBEAT_TICKS))
+
+    def test_it_does_not_freeze_the_bot_on_open_ground(self):
+        """★ 误伤面：这条坡上**站得住**的格子，躲避的答案不该整片消失。"""
+        answered = 0
+        spots = [(x, y) for x in range(16, 400, 8)
+                 for y in self.terrain.surfaces(x)
+                 if botmove.fits(self.terrain, x, float(y), self.who)]
+        for x, y in spots:
+            self.body = botmove.Body(float(x), float(y))
+            if botthreat.choose(self.terrain, self.body, self.who,
+                                [self.rocket()], 0.0,
+                                hold_ticks=gameserver.HEARTBEAT_TICKS):
+                answered += 1
+        self.assertGreater(answered, len(spots) // 2,
+                           "过滤掉「卡住自己」的候选之后，多数位置仍躲得动")
 
 
 class DoubleJumpTests(unittest.TestCase):

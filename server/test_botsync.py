@@ -9180,6 +9180,62 @@ class BotGapJumpTests(TerrainMixin, BotFrameRoom):
                               (1100.0, 700.0), False)
         self.assertEqual(0, intent[0], "不该往缝里走")
 
+    # -- ★★★★★ V0.3 §174：躲避是 §152 那条 `fits()` 的第四个挂点 ---------
+
+    def test_the_dodge_does_not_fight_the_unstick_at_a_map_edge(self):
+        """★★★★★ 实机 `Esperan03` 21:19:34.494~38.974：真人一死，bot1 在
+        图左下角以 **64 ms** 为周期在「躲子弹」和「脱困」之间互顶了
+        **4.5 秒**（33 个来回）。那条坡上 `fits()` 的分界正好在 x=14，
+        往左一步就塞不下人 ⇒ 下一格脱困把它推回来 ⇒ 又躲。
+        坡上一来一回 = **28 像素**的上下抽搐（用户 2026-09-02 报的那一幕）。
+
+        离线复现：改之前 24 格决策翻 **23 次**方向，改之后 **0 次**。
+        """
+        terrain = self.install_terrain(mapdata.load("Esperan03"))
+        self.bot_conn.character_id = 1
+        who = chrprops.get(self.bot_conn.character_id)
+        # 前提：这条坡上 x≤13 塞不下人、x≥14 站得住（没了它测试不成立）。
+        self.assertTrue(botmove.fits(terrain, 16.0, 949.0, who))
+        self.assertFalse(botmove.fits(terrain, 4.0, 962.0, who))
+        # 难度掷中「预估失误」，而且恰好挑中了往左 —— 实机就是这一手。
+        left = botthreat.Option("left", -1, False, False, False, False)
+        original_roll = botthreat.roll_blind
+        botthreat.roll_blind = lambda *_a, **_k: left
+        self.addCleanup(setattr, botthreat, "roll_blind", original_roll)
+        # 右边一发带溅射的火箭正飞过来（21:19:34.558 打中 bot1 的就是这种：
+        # 溅射把危险半径撑到 100 开外，蹲下躲不掉，只能挪窝）。
+        rocket = max((w for w in weapondata.usable_for(2) if w.splash_range),
+                     key=lambda w: w.splash_range)
+        cx, cy = who.center(16.0, 949.0)
+        threats = [botthreat.Threat(
+            2, rocket, 420.0, cy,
+            ballistics.Shot(math.pi, 1.0, 25.0, 16.0, 0.0), bot._now(),
+            ("shell", 600066))]
+        original_threats = bot._threats_against
+        bot._threats_against = lambda *_a, **_k: threats
+        self.addCleanup(setattr, bot, "_threats_against", original_threats)
+        self.place_bot(16.0, 949.0)
+        flips, last, wedged = 0, None, 0
+        for step in range(24):
+            self.bot_conn.frame_seq = step
+            direction, jump, drop, fast = bot._move_intent(
+                self.room, self.bot_conn, self.bot_seat, terrain, None)
+            if last and direction and direction != last:
+                flips += 1
+            if direction:
+                last = direction
+            for offset in range(bot.BOT_DECISION_TICKS):
+                self.bot_conn.body = botmove.tick(
+                    terrain, self.bot_conn.body, who, direction=direction,
+                    fast_run=fast, crouched=self.bot_conn.dodge_crouch,
+                    want_jump=jump and offset == 0,
+                    want_drop=drop and offset == 0)
+            if not botmove.fits(terrain, self.bot_conn.body.x,
+                                self.bot_conn.body.y, who):
+                wedged += 1
+        self.assertEqual(0, flips, "躲子弹和脱困不该每 64 ms 互顶一次")
+        self.assertEqual(0, wedged, "躲避不该把人推进塞不下的那一段")
+
 
 class BotFallDownTests(TerrainMixin, BotFrameRoom):
     """★★★ **掉出地图下边界 = 死**（§143）—— `map.ini` 的 `FallDown`。

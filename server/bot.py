@@ -4530,8 +4530,14 @@ def _dodge_intent(room, machine, seat_index, terrain, now):
             machine.roll, difficulty_profile(room)["dodge_error"])
     if not threats:
         return None
+    # ★★★ `hold_ticks` = 这份躲避答案的**寿命**（V0.3 §174）：它按
+    #   `frame_seq`（一发心跳的那 4 格）缓存，那几格里这几个键一直按着。
+    #   `botthreat` 拿它前瞻「这一步会不会把人搁在 `fits()` 为假的地方」——
+    #   不看那么远的话，躲避把人推进图边、脱困再推回来，两条分支每 64 ms
+    #   互顶一次（实机 `Esperan03` 左下角抽搐 4.5 秒）。
     option = botthreat.choose(terrain, machine.body, _character_of(machine),
-                              threats, now, blind_pick=machine.dodge_blind)
+                              threats, now, blind_pick=machine.dodge_blind,
+                              hold_ticks=gameserver.HEARTBEAT_TICKS)
     if option is None:
         return None
     machine.dodge_crouch = option.crouched

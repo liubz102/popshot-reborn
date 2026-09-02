@@ -27,6 +27,8 @@
 最优动作**，而是随便挑一个 —— 真人预估错弹道的样子就是这个：要么没反应过来
 （挑中「站着」），要么往错的方向躲。★ 掷骰子的判据是「**这一波威胁**」，
 不是每一帧（同 `botaim` 的口径，D79）。
+★★ 但盲选要成立，**得先真有一发会打到我**（§174）：失误是「躲错方向」，
+不是「没有弹也在乱躲」。这一关和挑最优动作走的是同一句判断。
 
 只用标准库；发布运行时是 CPython 3.8。
 """
@@ -191,7 +193,43 @@ def _worst_impact(terrain, threats, now, centers, character, option):
     return earliest
 
 
-def choose(terrain, body, character, threats, now, blind_pick=None):
+def _strands(terrain, body, character, option, hold_ticks):
+    """按住这套键**握到下一次决策**之后，人会不会被搁在塞不进去的地方。
+
+    ★★★ 这是 V0.3 §152 那条 `fits()` 的**第四个挂点**（V0.3 §174）。
+    那一条当时挂了三处 —— `botnav.neighbors()` 过滤落点、`bot._landing_ok()`
+    包住兜底的落点预测、`bot._walks_into_a_crack()` 挡「走一步蹭进去」——
+    唯独躲避这条路上没有：`choose()` 自己用 `botmove.tick()` 推演候选动作，
+    从头到尾没问过一句「推到的那个地方站不站得住人」。
+
+    于是躲避和 `bot._unstick_intent()` 会**互相打架**：躲避把人推进
+    `fits()` 为假的地方 ⇒ 下一格脱困排在躲避前面，把人推回来 ⇒ 又躲 ——
+    实机 `Esperan03` 左下角坡面（`fits()` 的分界正好在 x=14）bot1 就这么
+    以 64 ms 为周期来回了 **4.5 秒**，坡上一来一回等于 28 像素的上下抽搐。
+
+    ★ 判据用**站着**那一份 `fits()`（不传 `crouched`）—— 和 `_unstick_intent()`
+      问的必须是同一句话，两边口径一错就还是打架。
+
+    ★ 前瞻长度 = 这份躲避意图的**寿命**（§151 的口径）：躲避的答案按心跳帧
+      缓存，那几格里这几个键是一直按着的，所以要看那么远。
+    """
+    current = body
+    for step in range(max(1, int(hold_ticks))):
+        current = botmove.tick(
+            terrain, current, character,
+            direction=option.direction, fast_run=option.fast_run,
+            crouched=option.crouched,
+            want_jump=option.want_jump and step == 0,
+            want_drop=option.want_drop and step == 0)
+        if (current.on_ground
+                and not botmove.fits(terrain, current.x, current.y,
+                                     character)):
+            return True
+    return False
+
+
+def choose(terrain, body, character, threats, now, blind_pick=None,
+           hold_ticks=1):
     """挑一个躲得开的动作；不用躲（或者躲不掉）返回 `None`。
 
     `blind_pick` 给了就**不挑了**，直接用它 —— 那是难度掷中「预估失误」时
@@ -200,20 +238,38 @@ def choose(terrain, body, character, threats, now, blind_pick=None):
     挑法：站着不动就已经安全 ⇒ 返回 `None`（不要为了躲而乱动，真人也不会）。
     否则按 `OPTIONS` 的顺序找第一个**一发都挨不着**的；一个都没有就退而求
     其次，挑「最晚才被打到」的那个 —— 多活几个 tick 也是躲。
+
+    ★★★ 「站着不动就已经安全」这一问**排在盲选前面**（V0.3 §174）。
+    以前它排在后面，于是只要 `threats` 非空，盲选那一手就无条件返回 ——
+    而 `threats` 是不会自己空掉的：真人的 `peer_shots` 是一条按**条数**
+    封顶的 deque，人死了以后那几发旧记录一直躺在里面。实机
+    `Esperan03` 21:19:34~38 真人一死、全场 4.5 秒没人开枪，bot1 却一直
+    「躲」着一发两秒前就飞出图外的子弹，方向恒定往左顶进图边。
+    ⇒ 「预估失误」是**有弹飞过来的时候躲错方向**，不是没有弹也在乱躲。
+
+    `hold_ticks` 是这份意图握多久（tick）—— 见 `_strands()`。
     """
     if terrain is None or body is None or not threats:
         return None
-    if blind_pick is not None:
-        return None if blind_pick is STAND else blind_pick
     safe_now = _worst_impact(
         terrain, threats, now,
         simulate(terrain, body, character, STAND), character, STAND)
     if safe_now is None:
         return None                      # 本来就打不到我，别乱动
+    if blind_pick is not None:
+        # ★ 盲选也要过「塞不塞得下」那一关：躲错方向是真人会犯的错，
+        #   往站不住的地方钻不是 —— 那是和脱困互相打架（`_strands()`）。
+        #   退回站着不动，而站着不动本来就是盲选的十种结果之一。
+        if blind_pick is STAND or _strands(terrain, body, character,
+                                           blind_pick, hold_ticks):
+            return None
+        return blind_pick
     best = None
     for option in OPTIONS:
         if option is STAND:
             continue
+        if _strands(terrain, body, character, option, hold_ticks):
+            continue                     # 躲开了子弹却卡住人，不算躲开
         centers = simulate(terrain, body, character, option)
         hit = _worst_impact(terrain, threats, now, centers, character, option)
         if hit is None:
