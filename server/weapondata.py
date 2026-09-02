@@ -164,6 +164,24 @@ class Weapon(object):
         return int(self.raw.get("shots", 1) or 1)
 
     @property
+    def spread_angle(self):
+        """★★ 散布张角 `SpreadAngle`（**度**，0 / 缺 = 不散）。
+
+        收方 `0x491ffb` 起那一段：`SpreadAngle` 非 0 才进散布分支，
+        每一颗弹体在包里那个角度上**自己**叠一个偏移（§173）。
+        """
+        return float(self.raw.get("spread_angle") or 0.0)
+
+    @property
+    def spread_random(self):
+        """★★ 散布是**随机**的还是均匀扇形（`SpreadRandom`，`0x492012`）。
+
+        真 = 每颗 `(rand[0,1) − 0.5) × SpreadAngle` 度；
+        假 = 第 i 颗 `(i/(n−1) − 0.5) × SpreadAngle` 度。
+        """
+        return bool(self.raw.get("spread_random"))
+
+    @property
     def fire_interval_ms(self):
         """两发之间至少隔多久（毫秒）。`CoolingTime`，没有就退 `ReloadTime`。
 

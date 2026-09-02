@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import struct
 import sys
 import threading
@@ -6588,6 +6589,178 @@ class BotMagazineStatusTests(BotFireRoom):
         self.bot_conn.magazine_attrs = {}            # `_tick_bot` 死亡分支干的事
         self.shoot(3)
         self.assertNotIn(gameserver.OP_REMOVE_CHAR_ATTR, opcodes(self.alice))
+
+
+class SpreadTests(unittest.TestCase):
+    """★★★ 散射武器每颗弹体**各走各的角度**（§173）。
+
+    `rpFire` 里只有一个角度，拨开每一颗是收方的活（`0x491ffb` 起那一段）。
+    服务端以前让 `shots` 颗共用一条弹道 —— 屏幕上扇开的三发在这边叠成
+    一发，「从身体两边擦过去却三发全中」。
+    """
+
+    def test_no_spread_angle_means_every_pellet_goes_straight(self):
+        weapon = weapondata.get(1001030)             # ch01-03，没有 SpreadAngle
+        self.assertEqual([0.0], bot._spread_offsets(weapon, 1, lambda: 0.0))
+
+    def test_random_spread_is_half_the_angle_each_way(self):
+        """★ `(rand[0,1) − 0.5) × SpreadAngle` 度（`0x492038`~`0x492044`）。
+
+        `CH01-01` 的 `SpreadAngle = 10` ⇒ 满档就是 ±5°。实机 61 颗弹体
+        量出来 −4.58° ~ +4.91°，两头都贴着这个界。
+        """
+        weapon = weapondata.get(1001010)
+        self.assertTrue(weapon.spread_random)
+        self.assertEqual(10.0, weapon.spread_angle)
+        self.assertEqual([math.radians(-5.0)] * 3,
+                         bot._spread_offsets(weapon, 3, lambda: 0.0))
+        self.assertEqual([0.0] * 3,
+                         bot._spread_offsets(weapon, 3, lambda: 0.5))
+        for offset in bot._spread_offsets(weapon, 3, random.random):
+            self.assertLessEqual(abs(math.degrees(offset)), 5.0)
+
+    def test_an_even_fan_when_spread_random_is_off(self):
+        """★ `(i/(n−1) − 0.5) × SpreadAngle` 度（`0x492055`~`0x492067`）。"""
+        weapon = weapondata.get(1102020)             # SpreadFrags 2 / Random 0
+        self.assertFalse(weapon.spread_random)
+        self.assertEqual([math.radians(-5.0), math.radians(5.0)],
+                         bot._spread_offsets(weapon, 2, lambda: 0.0))
+
+    def test_the_rolled_angles_are_not_all_the_same(self):
+        """★ 每一颗**各滚各的** —— 一次滚一个数，不是一发滚一个。"""
+        weapon = weapondata.get(1001010)
+        draws = iter([0.0, 0.5, 1.0])
+        self.assertEqual(
+            [math.radians(-5.0), 0.0, math.radians(5.0)],
+            bot._spread_offsets(weapon, 3, lambda: next(draws)))
+
+    def test_spreading_a_shot_only_turns_it(self):
+        shot = ballistics.Shot(0.25, 1.0, 100.0, 4.0, 0.8, 0.1, 30.0)
+        turned = bot._spread_shot(shot, 0.1)
+        self.assertAlmostEqual(0.35, turned.angle)
+        self.assertEqual((shot.power, shot.speed, shot.ticks, shot.gravity,
+                          shot.accel, shot.cap),
+                         (turned.power, turned.speed, turned.ticks,
+                          turned.gravity, turned.accel, turned.cap))
+        self.assertIs(shot, bot._spread_shot(shot, 0.0))
+
+
+class SpreadInFlightTests(BotFireRoom):
+    """散射武器**真打出来**的那几颗弹体在服务端也该是扇开的（§173）。"""
+
+    def setUp(self):
+        super().setUp()
+        # `/w 1` 那条路：锁死成 `CH01-01`（SpreadFrags 3 / SpreadAngle 10）。
+        self.bot_conn.character_id = 1
+        self.bot_conn.weapon_slot = 1
+        self.assertEqual(1001010, self.bot_conn.weapon.id, "夹具没造对")
+
+    def born_shells(self):
+        """这一段里**造出来过**的 `CH01-01` 弹体（贴脸那几发当帧就结算了，
+        不能只看 `pending_shots`）。"""
+        made = []
+        original = bot.Shell
+
+        def spy(*args, **kwargs):
+            shell = original(*args, **kwargs)
+            if getattr(shell.weapon, "id", None) == 1001010:
+                made.append(shell)
+            return shell
+
+        bot.Shell = spy
+        try:
+            self.approach(settle=False)
+        finally:
+            bot.Shell = original
+        return made
+
+    def test_the_three_pellets_fly_on_three_different_lines(self):
+        draws = iter([0.0, 0.5, 1.0] * 200)
+        self.bot_conn.roll_unit = lambda: next(draws)
+        shells = self.born_shells()
+        self.assertGreaterEqual(len(shells), 3, "一发都没打出来")
+        angles = [shell.shot.angle for shell in shells[:3]]
+        self.assertEqual(3, len(set(angles)), "三颗不该共用一条弹道")
+        span = math.degrees(max(angles) - min(angles))
+        self.assertAlmostEqual(10.0, span, 4, "满档张开正好是 SpreadAngle")
+
+    def test_the_packet_still_carries_the_unspread_angle(self):
+        """★ 包里那一格**不动** —— 拨开每一颗是收方自己的活，别替它拨。"""
+        self.bot_conn.roll_unit = lambda: 0.0
+        shells = self.born_shells()
+        self.assertTrue(shells)
+        frames = fire_frames(self.alice, self.bot_seat)
+        self.assertTrue(frames)
+        wire = struct.unpack_from("<f", body_of(frames[0]), 14)[0]
+        self.assertAlmostEqual(math.radians(-5.0),
+                               shells[0].shot.angle - wire, places=5)
+
+
+class HumanJumpExtrapolationTests(TerrainMixin, BotFireRoom):
+    """★★★ `rpJump` 一到就让服务端手上那份真人身体离地（§173 / D132）。
+
+    起跳是**事件**：收方收到 `rpJump` 当场就让那个角色跳（这就是这一发
+    包存在的全部理由）。服务端替 bot 判命中用的 `_advance_humans()` 以前
+    只认心跳，于是从「他按下跳」到「下一发心跳到达」这一段里，服务端手上
+    那份身体还站在地上 —— 2026-09-02 那一局 53 次起跳实测中位差 **38 px**、
+    最大 103 px，正是「我跳起来躲开了、屏幕上也躲开了，却照样掉血」。
+    """
+
+    def stand(self, x=600.0):
+        """真人站在地面上，让服务端把外推那份身体硬置好。"""
+        self.install_terrain(synth_terrain("flat"))
+        self.beats(2, x)
+        body = self.alice.sim_body
+        self.assertTrue(body.on_ground, "夹具没造对：人该站在地上")
+        return body
+
+    def send_jump(self, stage=1):
+        gameserver.Conn.on_game_packet(self.alice, OP_PEER_DATA_UP,
+                                       self.jump(self.alice, stage))
+
+    def test_a_jump_lifts_the_body_before_the_next_heartbeat(self):
+        """★ 只发 `rpJump`、下一发心跳还在路上时，人就该已经在空中了。"""
+        before = self.stand()
+        self.send_jump()
+        self.advance(1)
+        after = self.alice.sim_body
+        self.assertFalse(after.on_ground, "收到 rpJump 就该离地")
+        self.assertLess(after.y, before.y, "而且这一格已经往上走了")
+
+    def test_the_lift_is_the_original_jump_speed(self):
+        """★ 初速就是语料量出来的那个 20.0（§124），不是我们编的。
+
+        第一格走的是「加过这一 tick 重力之后」的速度（`_air_tick` 先
+        `vy += g` 再挪），所以位移是 `20 − 1.2`。
+        """
+        before = self.stand()
+        self.send_jump()
+        self.advance(1)
+        self.assertAlmostEqual(
+            before.y - (botmove.JUMP_SPEED - botmove.GRAVITY),
+            self.alice.sim_body.y, places=5)
+
+    def test_one_rpjump_only_lifts_once(self):
+        """★ 这一下是**事件**，吃掉就没了 —— 不许每一格都再跳一次。"""
+        self.stand()
+        self.send_jump()
+        self.advance(1)
+        rising = self.alice.sim_body.vy
+        self.advance(1)
+        self.assertGreater(self.alice.sim_body.vy, rising,
+                           "第二格该只剩重力，不该被重新置成起跳初速")
+
+    def test_a_heartbeat_after_the_jump_consumes_it(self):
+        """★★ 心跳里的坐标 / 速度**已经带着那一跳**（同一条有序流，先跳后报）。
+
+        欠着的那一下必须在心跳到达时一笔勾销，否则外推那份会**再跳一次**
+        —— 那就从「慢半拍」变成「凭空多跳一段」，比原来的毛病更糟。
+        """
+        self.stand()
+        self.send_jump()
+        self.human_heartbeat(self.alice, 600.0, 130.0, on_ground=False,
+                             velocity=(0, -19))
+        self.assertEqual(0, self.alice.sync_jump_pending)
 
 
 class BotShellHitNowTests(BotFireRoom):

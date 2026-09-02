@@ -418,13 +418,17 @@ def launch(weapon, angle, power):
                 gravity_per_tick(weapon), accel, cap)
 
 
-def _wrap(angle):
+def wrap_angle(angle):
     """把角度归到 `(-π, π]` —— 客户端 `atan2` 出来的就是这个范围。"""
     while angle <= -math.pi:
         angle += 2.0 * math.pi
     while angle > math.pi:
         angle -= 2.0 * math.pi
     return angle
+
+
+#: 模块内的老名字，外面别用。
+_wrap = wrap_angle
 
 
 # ---------------------------------------------------------------------------

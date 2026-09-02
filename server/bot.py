@@ -498,6 +498,11 @@ class BotConn(gameserver.Conn):
         #:   做成实例字段是为了**单测能钉住**它 —— 换成 `lambda n: 0` 就
         #:   得到确定的四个角度。默认走 `random.randrange`。
         self.roll = random.randrange
+        #: ★ 散射武器给每颗弹体拨角度时那一发 `rand`（`0x492033`，§173）。
+        #:   收方那个是 `[0,1)` 的**浮点**（`0x5d8c0e` 的滞后斐波那契
+        #:   × 2⁻³¹），所以这里也是 `random.random`，不是 `roll`。
+        #:   同样做成实例字段，单测换成 `lambda: 0.5` 就得到「一点不散」。
+        self.roll_unit = random.random
         #: ★ 已经用 `rpChangeWeapon` 向别人**声明过**的武器 id。
         #:   `None` = 还没声明。收方拿它换武器模型 —— 不发的话别人看见的是
         #:   客户端自己给的默认枪，和 bot 打出来的子弹对不上（会话 13 修）。
@@ -2826,10 +2831,21 @@ def _advance_humans(room, terrain):
             continue
         who = chrprops.get(seat.character_id)
         keys = point[8] if len(point) > 8 else 0
+        # ★★★ 起跳是**事件**，不是心跳里的一格状态（§173）。收方收到
+        #   `rpJump` 当场就让那个角色离地（`rpJump` 存在的全部理由就是
+        #   这个：不发的话远端的跳只能等下一发心跳把坐标拽上去）。
+        #   以前这里只认心跳 ⇒ 从「他按下跳」到「下一发心跳到达」这一段，
+        #   服务端手上那份身体还站在地上：实测中位差 **38 px**、最大 103 px
+        #   （2026-09-02 那局，53 次起跳）—— 正好是「我跳起来躲开了却
+        #   照样被打中」的那一窗口。
+        want_jump = bool(getattr(conn, "sync_jump_pending", 0))
+        if want_jump:
+            conn.sync_jump_pending = 0
         conn.sim_body = botmove.tick(
             terrain, body, who,
             direction=_human_direction(keys),
-            fast_run=bool(point[6]), crouched=bool(point[7]))
+            fast_run=bool(point[6]), crouched=bool(point[7]),
+            want_jump=want_jump)
 
 
 def _seat_on_ground(room, seat_index):
@@ -8486,6 +8502,68 @@ def _slice_angles(weapon, slice_weapon, roll):
     return out
 
 
+def _spread_offsets(weapon, count, roll_unit):
+    """一发 `rpFire` 造出来的 `count` 颗弹体各自的**角度偏移**（弧度，§173）。
+
+    ## 这一段以前整个漏了
+
+    `rpFire` 里只有**一个**角度，散射靠收方自己把每颗弹体拨开
+    （`0x491ffb` 起）—— 服务端却让 `shots` 颗弹体共用同一条弹道。
+    于是 `CH01-01`（`SpreadFrags=3 SpreadAngle=10 SpreadRandom=1`）在
+    屏幕上是三发扇开、在服务端是三发叠在一条线上：**看着从身体两边擦
+    过去，三发却全判中**，一次结算 3 × 伤害。用户 2026-09-02 报的
+    「其他 bot 用其他枪，看着躲开了随后却凭空被打中」就是它。
+
+    ## 原版那一段（`0x491ffb` ~ `0x492070`）
+
+    ```asm
+    0x491ffb  fild [weapondef+0x84]      ; SpreadAngle
+    0x492010  jnp 跳过                    ; == 0 就完全不散
+    0x492012  cmp byte [weapondef+0x88], 0 ; ★ SpreadRandom
+    0x492019  je 均匀扇形
+      随机： 0x492033 call 0x5d8c9c        ; rand，返回 [0,1)
+             0x492038 fsub 0.5
+             0x49203e fimul SpreadAngle
+             0x492044 fmul π/180
+      扇形： 0x492055 fild 第几颗
+             0x49205c fidiv (SpreadFrags − 1)
+             0x49205f fsub 0.5   … 同上
+    ```
+
+    ⇒ 随机那一档是 **`(rand[0,1) − 0.5) × SpreadAngle` 度**，也就是
+    ±`SpreadAngle/2`；实机 61 颗 `CH01-01` 弹体量出来 −4.58° ~ +4.91°，
+    正好 ±5°（`SpreadAngle=10`）。
+
+    ⚠ **两边的随机数各滚各的**（收方那个 RNG 挂在角色身上、
+    `[0x72e2d4 + 座位×0xe8 + 0x12c]`），所以**逐颗对不上是原版就有的**
+    —— 能对上的只有分布。这里要的正是这个：让服务端这三发和收方那三发
+    一样散开，而不是比谁都准。
+
+    `roll_unit()` = `rand[0,1)`，做成参数是为了单测钉住它。
+    """
+    count = max(0, int(count))
+    span = float(getattr(weapon, "spread_angle", 0.0) or 0.0)
+    if not span or not count:
+        return [0.0] * count
+    if getattr(weapon, "spread_random", False):
+        return [math.radians((roll_unit() - 0.5) * span) for _ in range(count)]
+    if count < 2:
+        # 收方那条是 `fidiv (SpreadFrags − 1)` —— n == 1 会除以 0。
+        # 现有武器表里 `SpreadRandom=0` 的三把全是 n == 2，走不到这儿。
+        return [0.0] * count
+    return [math.radians((float(index) / (count - 1) - 0.5) * span)
+            for index in range(count)]
+
+
+def _spread_shot(shot, offset):
+    """把一条弹道**整体转** `offset` 弧度，别的参数一个不动。"""
+    if not offset:
+        return shot
+    return ballistics.Shot(ballistics.wrap_angle(shot.angle + offset),
+                           shot.power, shot.speed, shot.ticks, shot.gravity,
+                           shot.accel, shot.cap)
+
+
 def _split_shell(room, machine, shell, point, victim_seat, tick):
     """★★ 苹果雷炸开的那几片碎片（§81）—— 每片一发 `rpFire` + 一颗 `Shell`。
 
@@ -9000,12 +9078,19 @@ def _try_fire(room, machine, seat_index, weapon, target, now, tick):
     _spend_magazine_shots(room, machine, seat_index)
     terrain = _terrain(room)
     max_ticks = _shell_max_ticks(terrain, shot, weapon)
+    # ★★★ 散射武器每一颗**各走各的角度**（§173）：包里只有一个角度，
+    #   拨开每一颗是收方的活（`0x491ffb`）。以前这里 `shots` 颗共用一条
+    #   弹道 ⇒ 屏幕上散开的三发在服务端叠成一发，「擦身而过却三发全中」。
+    spread = _spread_offsets(weapon, weapon.shots, machine.roll_unit)
     for offset in range(weapon.shots):
+        pellet = _spread_shot(shot, spread[offset])
+        pellet_ticks = (max_ticks if pellet is shot
+                        else _shell_max_ticks(terrain, pellet, weapon))
         # ★★★ `born_tick` = **发这一发 `rpFire` 的那一格**（D106 / §147）。
         #   收方是在处理这一发的那一帧建弹体、**下一帧**才推第一格，
         #   我们跟着同一个相位，`rpExplode` 就恒在「出膛 + k×32 ms」发出。
         shell = Shell(handle + offset, fire_seq, weapon, group,
-                      muzzle_x, muzzle_y, shot, now, max_ticks,
+                      muzzle_x, muzzle_y, pellet, now, pellet_ticks,
                       born_tick=tick)
         shell.damage_ratio = damage_ratio
         shell.size_ratio = size_ratio

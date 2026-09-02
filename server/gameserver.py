@@ -4690,6 +4690,7 @@ def reset_sync_trails(room, why):
         if trail:
             trail.clear()
         conn.sync_jumped = 0
+        conn.sync_jump_pending = 0
         # ★ 换图 / 新一局客户端会把角色重建，蹲的状态跟着归零（`0x4ffc4a`），
         #   服务端这份记账也要一起清，否则 bot 会照着上一张图的姿势起步。
         conn.sync_crouch = False
@@ -5360,6 +5361,7 @@ class Conn:
     #   测试夹具会走到这一步，正常连接在 `__init__` 里就建好了）。
     sync_trail = ()
     sync_jumped = 0
+    sync_jump_pending = 0
     sync_crouch = False
     # ★ 「这条连接报过几个位置点」。bot 的帧循环拿它当**事件**（V0.3 §32）：
     #   号变了 = 这个真人报了一个新位置 = bot 该走一帧了。只增不减、不回绕
@@ -5502,6 +5504,12 @@ class Conn:
         # 上一发心跳之后收到过的 rpJump 段数（0 = 没跳）。下一发心跳把它
         # 记进轨迹点，bot 回放到那儿时就跟着跳一下。
         self.sync_jumped = 0
+        # ★★ **还没被逐格外推吃掉的那一下起跳**（V0.3 §173）：收方收到
+        #   `rpJump` 当场就让那个角色离地，服务端替 bot 判命中时用的
+        #   `bot._advance_humans()` 也得当场跟上 —— 等下一发心跳才跟，
+        #   那一段（实测中位 38 px、最大 103 px）里服务端还以为人站在地上，
+        #   于是「我跳起来躲开了，屏幕上也躲开了，却照样掉血」。
+        self.sync_jump_pending = 0
         # ★ 他现在蹲着没有。`rpCrouch`(0x000b) 只在按下 / 松开各来一发，
         #   中间的每一发心跳都照这个状态记进轨迹点（V0.3 §41）。
         self.sync_crouch = False
@@ -8566,6 +8574,11 @@ class Conn:
         if opcode == PEER_OP_JUMP:
             if len(payload) >= udpsync.PEER_HEADER_SIZE + 2:
                 self.sync_jumped = payload[udpsync.PEER_HEADER_SIZE + 1]
+                # ★★ 同一发还要**立刻**让逐格外推那份身体离地（V0.3 §173）。
+                #   `sync_jumped` 是给「bot 回放这条轨迹」用的（下一发心跳
+                #   才消费），这一格是给「服务端此刻认为人在哪」用的 ——
+                #   两者的消费者和时机都不一样，不能合并成一个。
+                self.sync_jump_pending = self.sync_jumped or 1
             return
         if opcode == PEER_OP_CROUCH:
             # ★ 蹲是**状态**不是事件（和 rpJump 相反）：`rpCrouch` 只在按下 /
@@ -8603,6 +8616,10 @@ class Conn:
                                     udpsync.heartbeat_keys(payload) or 0))
         self.sync_trail_seq += 1
         self.sync_jumped = 0
+        # ★★ 这一发心跳里的坐标 / 速度**已经带着那一跳**了（他是先发
+        #   `rpJump` 再发心跳的，同一条有序流）—— 外推那份马上就要被硬置
+        #   成它，欠着的那一下到此为止，再补一次就变成跳两下（§173）。
+        self.sync_jump_pending = 0
 
     def sync_peer_epoch(self, payload):
         """局号一变就把排序闸门里的**事件计数**归零（`udpsync` 铁律 3）。
