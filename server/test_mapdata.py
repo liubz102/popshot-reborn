@@ -17,6 +17,7 @@
 import base64
 import json
 import os
+import random
 import struct
 import sys
 import unittest
@@ -419,6 +420,45 @@ class RealDataTests(unittest.TestCase):
         # 房间里的地图串长这样：`Megatron_b:NewPvp`。
         if "Megatron_b" in self.names:
             self.assertIsNotNone(self.store.load("Megatron_b:NewPvp"))
+
+    def test_coarse_clear_never_lies(self):
+        """★★★ `coarse_clear()` 说「空的」就必须真是空的（V0.3 §169）。
+
+        `botmove._ceiling_between()` 拿它跳过绝大多数上升 tick 的逐格扫
+        —— 它**多**说一次「空」，bot 就会穿一次天花板。反过来说
+        「不敢打包票」永远安全（退回逐格扫）。
+
+        随机撒一批「一个 tick 走得到」那么大的小方框，逐格核对。
+        """
+        rng = random.Random(1690)
+        names = [n for n in self.names if "Camel" in n or "Iceria" in n
+                 or "Esperan" in n][:6] or self.names[:6]
+        lied = []
+        for name in names:
+            terrain = self.store.load(name)
+            for _ in range(400):
+                x0 = rng.randrange(0, terrain.width)
+                y0 = rng.randrange(0, terrain.height)
+                x1 = min(terrain.width - 1, x0 + rng.randrange(0, 25))
+                y1 = min(terrain.height - 1, y0 + rng.randrange(0, 25))
+                if not terrain.coarse_clear(x0, y0, x1, y1):
+                    continue
+                for x in range(x0, x1 + 1):
+                    for y in range(y0, y1 + 1):
+                        if terrain.blocks_bullet(x, y):
+                            lied.append((name, x, y))
+                            break
+        self.assertEqual([], lied[:8])
+
+    def test_coarse_clear_bails_out_at_the_map_edge(self):
+        """★ 出界的口径三个方向各不相同 —— 碰到边一律交白卷。"""
+        terrain = self.store.load(self.names[0])
+        self.assertFalse(terrain.coarse_clear(-1, 10, 3, 20))
+        self.assertFalse(terrain.coarse_clear(10, -1, 20, 5))
+        self.assertFalse(terrain.coarse_clear(terrain.width - 2, 10,
+                                              terrain.width + 3, 20))
+        self.assertFalse(terrain.coarse_clear(10, terrain.height - 2,
+                                              20, terrain.height + 3))
 
 
 if __name__ == "__main__":

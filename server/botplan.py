@@ -58,12 +58,21 @@ import botnav
 
 class RouteChoice(collections.namedtuple(
         "RouteChoice",
-        "path reached cost gap blocker prefix shortcut")):
+        "path reached cost gap blocker prefix shortcut stranded",
+        defaults=(False,))):
     """后台规划器选定的路。
 
     `blocker` 是捷径上第一件存活破坏物的下标；`prefix` 是到
     它之前可在完整地形上安全执行的路径前缀。`shortcut=True`
     表示这份答案来自“先假定破坏物已打碎”的地形。
+
+    ★★★★★ `stranded` = **完整地形上一步都走不了**（V0.3 §172）：
+    A\* 在真地形上连「往目标挪近一格」都给不出，也就是说**不打碎
+    `blocker` 这件东西，这个 bot 哪儿都去不了**。它和「被罐子压住」
+    （`_breakable_pinning_body`）是同一类事实，所以吃同一条待遇：
+    无条件开打。没有它的话，「视野里有敌人就先不打罐子」那道门会让
+    bot 站在原地一动不动 —— 实机 `CamelCulvert04` bot1 在 (1285, 853)
+    站了 **27 秒**，直到真人自己挪窝把目标点带走才解开。
     """
 
     __slots__ = ()
@@ -205,7 +214,11 @@ class Planner(object):
                         else:
                             chosen = RouteChoice(
                                 opened.path, opened.reached, opened.cost,
-                                opened.gap, blocker, prefix, True)
+                                opened.gap, blocker, prefix, True,
+                                # ★ 真地形上一步都走不了 = 不打碎它就哪儿
+                                #   都去不了（§172）。这句事实**只有这里**
+                                #   拿得到 —— `current` 出了这个函数就没了。
+                                not current.path)
                     ticket.choice = chosen
                     ticket.path = chosen.path
                     self.planned += 1

@@ -13,7 +13,7 @@ import botnav                                                  # noqa: E402
 import botplan                                                 # noqa: E402
 import mapdata                                                 # noqa: E402
 from test_botmove import Dummy                                 # noqa: E402
-from test_mapdata import make_record                           # noqa: E402
+from test_mapdata import blob, make_record, pack_cells          # noqa: E402
 
 
 def terrain_from(rows, jump=None):
@@ -466,6 +466,146 @@ class RealTrapNodeEdgeTests(unittest.TestCase):
         self.assertEqual(0, hits,
                          "还有 %d 条边指向那几条冰缝（改之前 (1174,864) 一个点"
                          "就有 31 条入边）" % hits)
+
+
+class IncrementalEdgeCacheTests(unittest.TestCase):
+    """★★★★★ **增量边缓存**：变体从母地形继承边（V0.3 §170 / D128）。
+
+    要钉的只有一条 —— **继承下来的答案必须和从头重算逐条一样**。
+    打碎一件罐子换来的是一份新地形对象，以前整张可达图从头再来
+    （`Esperan03` 实测 832 ms 冷），那一下把每条连接的发送线程饿住，
+    用户看到的就是「积压几秒的包一起爆发」（§163 / D125）。
+    """
+
+    #: 一张 480×220 的平地，中间摆一件 40×24 的罐子。
+    FLOOR = 180
+
+    def setUp(self):
+        self.who = Dummy(7.0)
+
+    def record(self):
+        rows = solid_heights([self.FLOOR] * 480, 220)
+        rec = make_record(rows, name="Jarred")
+        rec["breakables"] = [{
+            "handle": 900 + i, "x": x, "y": self.FLOOR - 12,
+            "w": 40, "h": 24, "hp": 40, "regen": 15000,
+            "mask": blob(pack_cells(["3" * 40] * 24)),
+        } for i, x in enumerate((140, 300))]
+        return rec
+
+    def full_rebuild(self, terrain, entry):
+        """拿这一格自己那个**代表身体**，从零整套重算一遍。"""
+        _boxes, fresh = botnav._run_attempts(terrain, entry[0], self.who)
+        return tuple(edge for edge in fresh if edge is not None)
+
+    def flood(self, terrain):
+        seeds = [botmove.settle(terrain, botmove.Body(60.0, 20.0), self.who)]
+        botnav.warm(terrain, self.who, seeds)
+        return botnav.graph_of(terrain, self.who)
+
+    def test_an_inherited_graph_matches_a_full_rebuild(self):
+        root = mapdata.MapTerrain(self.record())
+        self.flood(root)
+        self.flood(root.variant(()))            # 开局预热的另一张
+        for alive in (frozenset((1,)), frozenset((0,)), frozenset()):
+            variant = root.variant(alive)
+            graph = self.flood(variant)
+            self.assertTrue(graph)
+            wrong = [key for key, entry in graph.items()
+                     if entry[1] != self.full_rebuild(variant, entry)]
+            self.assertEqual([], wrong[:4],
+                             "alive=%r 有 %d/%d 格继承错了"
+                             % (sorted(alive), len(wrong), len(graph)))
+
+    def test_it_really_reuses_instead_of_recomputing(self):
+        """★ 变异防线：**大部分**尝试必须是搬过来的，不是重算的。
+
+        没这一条的话，「继承」退化成「每次都重算」也一样能通过上一条
+        —— 那就白改了。判据是「重算的次数远少于总次数」，不是某个具体的量。
+        """
+        root = mapdata.MapTerrain(self.record())
+        self.flood(root)
+        self.flood(root.variant(()))
+        ran = [0]
+        real = botnav._Trace
+
+        class Counting(real):
+            def __init__(self, body):
+                ran[0] += 1
+                real.__init__(self, body)
+
+        botnav._Trace = Counting
+        try:
+            graph = self.flood(root.variant(frozenset((1,))))
+        finally:
+            botnav._Trace = real
+        total = len(graph) * len(botnav._ATTEMPTS)
+        self.assertLess(ran[0], total // 2,
+                        "%d/%d 次尝试还是重算的，继承没生效" % (ran[0], total))
+
+    def test_a_terrain_without_a_parent_still_works(self):
+        """★ 合成地形 / 没有破坏物的图走的是老路（母地形就是自己）。"""
+        plain = terrain_from(solid_heights([180] * 240, 220))
+        graph = self.flood(plain)
+        self.assertTrue(graph)
+        wrong = [key for key, entry in graph.items()
+                 if entry[1] != self.full_rebuild(plain, entry)]
+        self.assertEqual([], wrong[:4])
+
+
+class RealIncrementalEdgeCacheTests(unittest.TestCase):
+    """★★ 真产物上的同一条：每张图逐件罐子打碎，继承的边必须逐条对得上。"""
+
+    #: ★ 只挑两张：一次「整套重算再比一遍」和一次泛洪一样贵，全铺开就是
+    #:   一分钟的单测。会话 55 离线**穷举**跑过 12 张真图 × 每件罐子，
+    #:   一格都没错（§170），这里留的是回归哨兵。
+    MAPS = ("Esperan03", "Iceria00")
+
+    #: 每隔几格核一格 —— 同上，是为了让这条用例跑得完，不是判据的一部分。
+    STRIDE = 4
+
+    @classmethod
+    def setUpClass(cls):
+        import chrprops                                        # noqa: PLC0415
+        cls.who = chrprops.get(1)
+        cls.maps = [m for m in (mapdata.load(n) for n in cls.MAPS)
+                    if m is not None and m.breakables]
+        if not cls.maps:
+            raise unittest.SkipTest("没有带破坏物的地形产物")
+
+    def seeds(self, terrain, points):
+        out = []
+        for px, py in points:
+            surface = terrain.ground_below(int(px), int(py))
+            if surface is not None:
+                out.append(botmove.Body(float(px), float(surface)))
+        return out
+
+    def test_every_single_break_matches_a_full_rebuild(self):
+        for root in self.maps:
+            points = [p for group in root.points.values() for p in group]
+            botnav.warm(root, self.who, self.seeds(root, points))
+            opened = root.variant(())
+            botnav.warm(opened, self.who, self.seeds(opened, points))
+            for item in root.breakables:
+                alive = frozenset(i for i in root.alive if i != item.index)
+                variant = root.variant(alive)
+                botnav.warm(variant, self.who, self.seeds(variant, points))
+                graph = botnav.graph_of(variant, self.who)
+                wrong = []
+                for index, key in enumerate(sorted(graph)):
+                    if index % self.STRIDE:
+                        continue
+                    entry = graph[key]
+                    _bx, fresh = botnav._run_attempts(variant, entry[0],
+                                                      self.who)
+                    want = tuple(e for e in fresh if e is not None)
+                    if want != entry[1]:
+                        wrong.append((key, entry[0]))
+                self.assertEqual([], wrong[:3],
+                                 "%s 碎掉 %d 号之后有 %d/%d 格继承错了"
+                                 % (root.name, item.index, len(wrong),
+                                    len(graph)))
 
 
 if __name__ == "__main__":

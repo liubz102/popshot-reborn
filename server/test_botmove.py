@@ -340,6 +340,109 @@ class CeilingAndPlatformTests(unittest.TestCase):
         self.assertTrue(top < 20.0, "单向平台不该挡住上升（只到了 %.1f）" % top)
         self.assertAlmostEqual(20.0, body.y, msg="落下来该踩在薄板上")
 
+    def slab(self, rows_of_slab, floor=40, width=40, height=64):
+        """一张平地 + 一块**薄天花板**（`rows_of_slab` 那几行整条实心）。"""
+        rows = []
+        for y in range(height):
+            solid = y >= floor or y in rows_of_slab
+            rows.append(("2" if solid else "0") * width)
+        return terrain_from(rows)
+
+    def rise(self, terrain, body, who, ticks=40):
+        top = body.y
+        for _ in range(ticks):
+            body = botmove.tick(terrain, body, who)
+            top = min(top, body.y)
+            if body.on_ground:
+                break
+        return top
+
+    def test_a_thin_ceiling_is_not_tunnelled_through(self):
+        """★★★ **一个 tick 跨过整块板**也得撞上（V0.3 §169）。
+
+        板在 25~26、地面在 40 —— 起跳第一个 tick 就从 40 升到 21.2，
+        **落点（21）是空气**。只判落点的旧代码于是一声不响地穿过去，
+        脚最后停在板**上面**；现在逐格扫，停在板底下沿之下那一格（27）。
+        """
+        t = self.slab((25, 26))
+        who = Dummy(4.0)
+        top = self.rise(t, botmove.jump(botmove.Body(20.0, 40.0)), who)
+        self.assertGreaterEqual(top, 27.0,
+                                "薄天花板被穿过去了（升到了 %.1f）" % top)
+
+    def test_it_rises_all_the_way_up_to_the_ceiling(self):
+        """★ 撞天花板不是「原地不动」：该一路升到板底下沿才停。
+
+        只判落点的旧代码撞上时把脚留在**出发点**，一次跳等于白跳；
+        收方是一格一格推上去的，挡住之前那一格才是终点。
+        """
+        t = self.slab((25, 26))
+        who = Dummy(4.0)
+        top = self.rise(t, botmove.jump(botmove.Body(20.0, 40.0)), who)
+        self.assertAlmostEqual(27.0, top, places=3)
+
+    def test_a_ledge_grazed_on_the_way_up_is_still_not_a_ceiling(self):
+        """★ 逐格扫**不许**把台阶的上沿当成天花板（§95 那一条要保住）。
+
+        左边地面 40、右边 36（4 像素的坎）；人斜着往上飞过那个坎，
+        路上必然掠过右边那个站立面。它是台阶不是板 —— 照旧飞过去。
+        """
+        rows = []
+        for y in range(64):
+            rows.append("".join("2" if y >= (36 if x >= 24 else 40) else "0"
+                                for x in range(64)))
+        t = terrain_from(rows)
+        who = Dummy(4.0)
+        start = botmove.Body(20.0, 40.0, 4.0, -6.0, on_ground=False)
+        body = start
+        for _ in range(60):
+            body = botmove.tick(t, body, who)
+            if body.on_ground:
+                break
+        self.assertGreater(body.x - start.x, 8.0,
+                           "小坎的上沿被当成天花板了（只飞了 %.1f）"
+                           % (body.x - start.x))
+
+    def test_a_body_stuck_in_the_ground_can_still_jump_out(self):
+        """★★★★ **嵌在地形里的人必须跳得出来**（V0.3 §169 第二轮）。
+
+        `Quest02_1` 岩浆坑左沿是一道缓上坡：地面在 444，而 bot 的身体按
+        整数摆在 **453** —— 陷进去 9 个像素。逐格扫如果把头顶那一片
+        「它自己陷进去的实心」当成天花板，这一跳就位移 0，下一帧接着跳，
+        **一辈子过不了那个坑**（整局单测 `test_it_crosses_the_lava_pit…` 就是
+        这么红的）。只判落点的旧代码天然放行 —— 这一条把它保住。
+        """
+        rows = []
+        for y in range(64):
+            rows.append("".join("2" if y >= 40 else "0" for _x in range(40)))
+        t = terrain_from(rows)
+        who = Dummy(4.0)
+        buried = botmove.jump(botmove.Body(20.0, 49.0))   # 埋在地面下 9 格
+        body = buried
+        for _ in range(10):
+            body = botmove.tick(t, body, who)
+            if body.on_ground:
+                break
+        self.assertLess(body.y, 49.0,
+                        "陷在地里的人跳不出来了（还在 %.1f）" % body.y)
+
+    def test_the_sweep_never_lands_the_feet_inside_a_slab(self):
+        """★★ 变异防线：停下来的那一点必须是**空气**，不能嵌在板里。
+
+        板从 25 到 30（6 像素厚），各种初速各扫一遍。
+        """
+        t = self.slab((25, 26, 27, 28, 29, 30))
+        who = Dummy(4.0)
+        for vy in range(-24, 0):
+            body = botmove.Body(20.0, 40.0, 0.0, float(vy), on_ground=False)
+            for _ in range(40):
+                body = botmove.tick(t, body, who)
+                self.assertFalse(
+                    25 <= int(body.y) <= 30,
+                    "vy=%d 时脚停在了板里 (%.1f, %.1f)" % (vy, body.x, body.y))
+                if body.on_ground:
+                    break
+
 
 class KnockedBackOverBumpsTests(unittest.TestCase):
     """★★★ 地形上一个**几像素的小坎**不该把整段击退吃掉（§95）。

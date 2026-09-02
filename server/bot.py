@@ -408,6 +408,10 @@ class BotConn(gameserver.Conn):
         self.path_breakable = None
         #: 走到这件物体之前仍可在完整地形上安全执行的 Step 前缀。
         self.path_breakable_prefix = []
+        #: ★★★★★ 「不打碎 `path_breakable` 这件东西就哪儿都去不了」
+        #:   （V0.3 §172）。后台在**完整地形**上连一格都规划不出来时置起，
+        #:   `_breaking_now()` 拿它和「被压住」吃同一条待遇：无条件开打。
+        self.path_breakable_only = False
         #: ★ 正在执行的那条边要不要在顶点补一次**二段跳**
         #:   （`botnav.ACTION_DOUBLE_JUMP`）。落地 / 换边就清。
         self.nav_double_jump = False
@@ -683,6 +687,7 @@ class BotConn(gameserver.Conn):
         self.nav_double_jump = False
         self.path_breakable = None
         self.path_breakable_prefix = []
+        self.path_breakable_only = False
         # ★ 牵引绳的记账跟着清：新一张图上「落后多少」要从头量（同 `body`）。
         self.leash_lagging = False
         self.leash_mark = None
@@ -1807,6 +1812,7 @@ def _refresh_breakables(room):
             _clear_navigation(machine)
             machine.path_breakable = None
             machine.path_breakable_prefix = []
+            machine.path_breakable_only = False
     # ★★★★★ **战斗中不预热**（V0.3 §163 / D124）。这里原来是
     #   `warm_navigation(room, "破坏物变化")` —— 每翻一次罐子就把整张图重算
     #   一遍 × 每个角色尺度。而它和 `botplan` 那条线程做的是**同一份活**：
@@ -4272,8 +4278,17 @@ def _clear_navigation(machine, failed=None):
 
 
 def _nav_signature(terrain, body, spot):
-    """一次规划请求的空间事实签名；没有挂钟/帧计数。"""
+    """一次规划请求的空间事实签名；没有挂钟/帧计数。
+
+    ★★★★ **破坏物的存活集合也算一项事实**（V0.3 §172）。以前只带图名，
+    而一张图的所有变体名字是一样的 ⇒ 罐子碎了 / 长回来了，「这一组事实下
+    别重算」的闩**一点都不松**。而这个闩的解法本来就写着「挡路物自己翻转
+    就把全房间放开」—— 那句话此前只对 `path_breakable` 成立，对
+    `nav_failed` 不成立。少这一项的代价：bot 站在那儿等着地形变，
+    地形真变了它也不知道。
+    """
     return (getattr(terrain, "name", None),
+            getattr(terrain, "alive", None),
             int(round(body.x / botnav.KEY_X)),
             int(round(body.y / botnav.KEY_Y)),
             int(round(spot[0] / botnav.KEY_X)),
@@ -4329,6 +4344,7 @@ def _route_intent(machine, terrain, who, spot, hold_at_breakable=False):
             _clear_navigation(machine)
             machine.path_breakable = None
             machine.path_breakable_prefix = []
+            machine.path_breakable_only = False
 
     # 吃掉已经走到的边；动作完成是“重新落在规划落脚点”这个事实，不看时间。
     while machine.nav_path and botnav.step_reached(body, machine.nav_path[0]):
@@ -4362,10 +4378,12 @@ def _route_intent(machine, terrain, who, spot, hold_at_breakable=False):
         if choice.blocker is not None:
             machine.path_breakable = int(choice.blocker)
             machine.path_breakable_prefix = list(choice.prefix)
+            machine.path_breakable_only = bool(choice.stranded)
             machine.nav_path = list(choice.prefix)
         else:
             machine.path_breakable = None
             machine.path_breakable_prefix = []
+            machine.path_breakable_only = False
             machine.nav_path = list(choice.path)
         if not machine.nav_path and not choice.reached and choice.blocker is None:
             _clear_navigation(machine, failed=signature)
@@ -4552,6 +4570,14 @@ def _breaking_now(room, machine, seat_index, terrain=None):
 
     * 被它**压住**（`_breakable_pinning_body`）—— 无条件打，不打碎
       它连挪都挪不动，这正是用户报的「被围住困在里面」；
+    * ★★★★★ **不打碎它就哪儿都去不了**（`path_breakable_only`，V0.3 §172）
+      —— 同一类事实，同一条待遇。后台在**完整地形**上连「往目标挪近一格」
+      都规划不出来时置起。少了这一条，下面那道「有敌人就先不打」的门会
+      让 bot **站在原地一动不动**：走不了（唯一的路被罐子堵着）、又不许打
+      （视野里有敌人），而它不动 ⇒ 规划签名不变 ⇒ 永远不重算。实机
+      `CamelCulvert04` bot1 在 (1285, 853) 站了 **27 秒**，直到真人自己
+      挪窝把目标点带走才解开 —— 用户 2026-09-02：「一进游戏所有 bot 都
+      不动，必须我动了之后 bot 才开始动。」
     * 否则**视野里有活敌人 / 活怪**就先不打 —— 走位和开火两边用的是
       同一句判断，不会出现「走位站住等打罐子、开火却去打人」的僵局。
 
@@ -4563,6 +4589,8 @@ def _breaking_now(room, machine, seat_index, terrain=None):
     if item is None:
         return None
     if _breakable_pinning_body(machine, terrain) is not None:
+        return item
+    if machine.path_breakable_only:
         return item
     if _visible_targets(room, machine, seat_index):
         return None
@@ -4628,6 +4656,7 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
             # ★ 按**状态翻转**记（铁律 10）：锁的是哪一件变了才重置路线。
             machine.path_breakable = pinned.index
             machine.path_breakable_prefix = []
+            machine.path_breakable_only = False
             _clear_navigation(machine)
             machine.log(f"   被可破坏物 {pinned.handle} 压住 -> 站住打碎它")
         if target is not None and target[0] == BREAKABLE_SEAT:
@@ -5039,7 +5068,25 @@ def _walk_to(room, machine, terrain, spot, fast_run):
         terrain, body, who, direction, fast_run=fast_run, crouched=crouched,
         speed_scale=scale, ticks=BOT_DECISION_TICKS)
     vertical = abs(spot[1] - body.y) > botnav.GOAL_Y
-    if blocked or bottomless or vertical:
+    # ★★★★★ **「前面那一步塞不进去」也得先问 A\***（V0.3 §171）。
+    #
+    #   这一条以前只写在下面的兜底里：塞不进去就回「不动」。可是
+    #   `blocked` / `bottomless` / `vertical` 三条都是假的（前面有地、
+    #   不是坑、目标不在上下层），于是**规划单一张都不递** —— bot 就在
+    #   原地站到天荒地老。实机 `CamelCulvert04` 13:21:11 起 bot1 在
+    #   (279, 990) 站了 **87 秒**（bot2 56 秒、bot3 58 秒），到局终都没动：
+    #   往左第一步落在 (271, 990)，那儿被 48 号罐子挤成一条塞不下的缝。
+    #
+    #   而 A\* 对这种局面是有答案的：完整地形上 `reached=False`，
+    #   「假定罐子全碎」的地形上**一步就到**，`first_breakable_on_path()`
+    #   认得出挡路的是 48 号 ⇒ 该做的事是**把它打碎**，不是站着。
+    #   ⇒ 把它并进「该问路的四种情形」。问不出来才落到下面那条兜底。
+    #
+    #   ★ 和 §160 是同一个型：那次是 `hold_at_breakable` 把规划挡在门外，
+    #     这次是缝。症状也一样 ——「所有 bot 都不动，过一阵又都恢复」。
+    crack = bool(direction) and _walks_into_a_crack(
+        terrain, body, who, direction, fast_run, crouched, scale)
+    if blocked or bottomless or vertical or crack:
         routed = _route_intent(machine, terrain, who, spot)
         if routed is not None:
             return routed
@@ -5087,9 +5134,10 @@ def _walk_to(room, machine, terrain, spot, fast_run):
         if _landing_ok(terrain, landing, who) and landing.y < body.y - 1.0:
             machine.nav_double_jump = True
             return (direction, True, False, fast_run)
-    if direction and _walks_into_a_crack(terrain, body, who, direction,
-                                         fast_run, crouched, scale):
+    if crack:
         # ★ 前面那一步碰撞体塞不进去（V0.3 §152）—— 别往里蹭。站住比卡住好。
+        #   ★★ 但**先问过 A\* 了**（上面那一段，§171）：这里是「连路都没有」
+        #   才走到的最后一步，不是第一反应。
         return (0, False, False, fast_run)
     # ★★★★★ **走不满一步的零头，不值得掉头**（V0.3 §167）。
     #
@@ -6127,6 +6175,7 @@ def _path_breakable_item(room, machine, terrain=None):
     if not 0 <= int(index) < len(items) or int(index) not in alive:
         machine.path_breakable = None
         machine.path_breakable_prefix = []
+        machine.path_breakable_only = False
         return None
     return items[int(index)]
 

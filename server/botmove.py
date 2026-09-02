@@ -330,6 +330,77 @@ def _is_ledge(terrain, x, y):
     return int(y) in terrain.surfaces(int(x))
 
 
+def _ceiling_between(terrain, x0, y0, x1, y1):
+    """(x0, y0) -> (x1, y1) 这一段**往上**的路上撞没撞到天花板。
+
+    撞上了返回「撞之前最后一个安全点」`(x, y)`；一路畅通返回 `None`。
+
+    ## ★★★ 为什么不能只判落点（V0.3 §169）
+
+    一个 tick 最多往上走 **24 个单位**（二段跳初速），而天花板可以只有
+    几个像素厚。只问落点那一格的话，脚从板底下**穿过去**、落点又正好在板
+    上面的空气里 —— 判据说「没撞」，人就这么钻过去了。
+
+    收方是**逐像素**推进的：`0x50e40a` 把 `(dx, dy)` 归一化成单位向量，
+    一格一格加上去，每加一格问一次 `0x473969`（就是 `mapdata.cell()`，
+    返回 0 空 / 1 白线 / 2+ 实心），**头一格挡住就整个停下**；
+    `0x50d9a7`（走路的爬坎/下坎）和 `0x50e4e9` 也都是一格一格扫的。
+    ⇒ 这里照着扫：沿线段逐**整数行**采样，x 按线段线性插值
+    （单位向量步进的就是这条线），第一处挡得住的格子之前那一格就是终点。
+
+    ⚠ 不是把整条 `_air_tick` 换成客户端那套：横向那一段（撞墙 / 蹭上坎）
+      是 §95 用实机日志两轮收口的，这一发只补**往上**这一条。
+
+    ★ 采样点从 `int(y0) - 1` 起 —— `y0` 那一格是人**已经在**的地方
+      （起跳那一刻脚下就是实心的站立面），再问一遍必然自己挡自己。
+
+    ## ★★★ 「人已经嵌在地形里」不算撞天花板
+
+    脚下那一格实心、**而且不是站立面** = 这个人陷在地形里了（斜坡上按
+    整数坐标摆位置、复活点埋在坡里都会这样）。这时候头顶那一片实心是
+    **他自己陷进去的那一块**，不是板 —— 把它当天花板的话人**永远**跳不
+    出来（`Quest02_1` 的岩浆坑左沿就是这样：地面在 444、身体在 453，
+    一跳被 452 挡住，原地不动，下一帧接着跳，一辈子过不了那个坑）。
+    ⇒ 先跳过「一路连着的实心」，从**第一格空气**起才开始认天花板。
+    只判落点的旧代码天然就是这个行为（落点在空气里 ⇒ 放行），这里是把它
+    保住，不是新加的宽容。
+
+    ★ 站在正经站立面上的人不受这一条影响：站立面按定义**上面就是空气**，
+      第一格采样必然是空的。
+    """
+    span = y0 - y1
+    if span <= 0:
+        return None
+    top = int(y1)
+    first = int(y0) - 1
+    if first < top:
+        return None                 # 这一 tick 连一整格都没升出去
+    # ★ 绝大多数上升 tick 头顶是开阔的。粗网格（`bullet_coarse`，谓词就是
+    #   `blocks_bullet`）一次几个字节就能证明「这一小段整个是空的」——
+    #   证不了才逐格扫。不做这一步的话整张图泛洪要慢一倍（实测 1034 -> 2334 ms）。
+    clear = getattr(terrain, "coarse_clear", None)
+    if clear is not None and clear(x0, top, x1, first):
+        return None
+    # 「人已经嵌在地形里」—— 见上面那一段。
+    digging = (_blocks_up(terrain, x0, y0)
+               and not _is_ledge(terrain, x0, y0))
+    prev_x, prev_y = x0, y0
+    dx = x1 - x0
+    for row in range(first, top - 1, -1):
+        ratio = (y0 - row) / span
+        if ratio > 1.0:
+            ratio = 1.0
+        col = x0 + dx * ratio
+        if not _blocks_up(terrain, col, row):
+            digging = False             # 出土了，从这里起才认天花板
+        elif digging:
+            continue                    # 还在自己陷进去的那一块里
+        elif not _is_ledge(terrain, col, row):
+            return prev_x, prev_y
+        prev_x, prev_y = col, float(row)
+    return None
+
+
 def _air_tick(terrain, body):
     """腾空走一个 tick：先加重力，再走，撞上什么就停什么。
 
@@ -348,6 +419,9 @@ def _air_tick(terrain, body):
     vy = body.vy + GRAVITY
     nx = body.x + vx
     ny = body.y + vy
+    #: 「这一 tick 是**蹭上了一个坎**」——蹭上坎会把脚抬到坎顶（比自然落点
+    #:  还高），那一段是**贴着地形爬**的，不能再拿它当往上飞的路去扫天花板。
+    climbed = False
     if vx and _solid(terrain, nx, ny - 1):
         # ★★★★ 目标点在地形里。先问一句：这一列上**够不够得着一个站立面**？
         #
@@ -372,6 +446,7 @@ def _air_tick(terrain, body):
         step = surface_near(terrain, nx, body.y, abs(vx) * CLIMB_SLOPE)
         if step is not None and step < ny:
             ny = float(step)            # 蹭上坎：脚抬到坎顶，**仍然腾空**
+            climbed = True
         else:
             # 真的够不着 = 墙。这一 tick 横向过不去，**速度留着**：
             # 踩地时 `Body` 会把速度归零（§35），落地那一下自然收尾。
@@ -384,9 +459,13 @@ def _air_tick(terrain, body):
             # 掉出图外（陷阱）—— 停在图底，别让坐标一路跑到无穷。
             # ★ 死不死由客户端上报（`0x0409`），服务端不替它判。
             return body.moved(nx, terrain.height - 1, vx, vy, on_ground=False)
-    elif vy < 0 and _blocks_up(terrain, nx, ny) and not _is_ledge(terrain,
-                                                                 nx, ny):
-        return body.moved(nx, body.y, vx, 0.0, on_ground=False)   # 撞天花板
+    elif vy < 0 and not climbed:
+        # ★ 撞天花板：**整条上升路线**都要扫，不能只问落点（§169）。
+        #   收方一格一格推进，头一格挡住就停 —— 停在挡住之前那一点，
+        #   横向也跟着停（两个轴是一起推进的，不是各走各的）。
+        hit = _ceiling_between(terrain, body.x, body.y, nx, ny)
+        if hit is not None:
+            return body.moved(hit[0], hit[1], vx, 0.0, on_ground=False)
     return body.moved(nx, ny, vx, vy, on_ground=False)
 
 

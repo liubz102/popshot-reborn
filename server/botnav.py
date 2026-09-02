@@ -52,9 +52,22 @@ tick」这种阈值（铁律 10）：顶点是这段弧线上「再跳一次能�
 就是「bot 卡在最左边不往前走，拖着全队的进度」（用户 2026-08-30 实机）。
 现在改成：泛洪完之后挑**离目标最近的那个可达落脚点**走过去，
 只有「一步都靠近不了」时才真的返回空。真人也是这么做的。
+
+## ★★★★★ 会话 55：**增量**边缓存 —— 变体从母地形继承（§170 / D129）
+
+打碎一件破坏物换来的是一份新地形对象，会话 41 那份缓存是**按对象**做键的，
+于是每碎一次就整张可达图从头重算（`Esperan03` 实测 `botplan` 冷 **832 ms**）
+—— 那一下把每条连接的发送线程饿住，用户看到的就是「积压几秒的包一起爆发」
+（§163 / D125）。可变体和母地形的差别**只在那一件罐子附近**。
+
+⇒ 一个落脚点固定跑 **17 次尝试**（`_ATTEMPTS`），每次尝试记下自己摸过的
+那一片（`_Trace`）；变体建这一格时逐条问「这一片被碎掉的那几件碰到了没有」，
+没碰到就把母地形那条边整条搬过来。实测碎一件之后整图泛洪
+**1576 -> 198 ms**（`Esperan03`）、**1617 -> 51 ms**（`Iceria02`）。
 """
 from __future__ import annotations
 
+import array
 import collections
 import heapq
 import itertools
@@ -146,26 +159,99 @@ def _heuristic(body, goal, speed):
     return math.hypot(body.x - gx, body.y - gy) / max(1.0, speed)
 
 
-def _finish_air(terrain, body, character, ticks=AIR_TICKS):
+#: 依赖区存成「几号格」的格子边长（像素）。它只是**存储精度**，不是判据里
+#: 的阈值：取整一律朝外，粗一点只会让多几条边被重算，不会算错。
+_BOX = 16.0
+
+
+def _block(value):
+    """像素坐标 -> 格号，**朝下取整**（负数也是，所以左/上边界不会缩）。"""
+    return int(math.floor(value / _BOX))
+
+
+class _Trace(object):
+    """一次尝试**摸过的那一片地形**：所有身体位置的外接矩形 + 最大 |vx|。
+
+    ★★★ 它是**增量边缓存**的判据（V0.3 §170）：一条边只可能被它自己走过的
+      那一片影响，那一片没变，这条边就一个字都不用重算。
+    """
+
+    __slots__ = ("x0", "x1", "y0", "y1", "vmax")
+
+    def __init__(self, body):
+        self.x0 = self.x1 = body.x
+        self.y0 = self.y1 = body.y
+        self.vmax = 0.0
+
+    def see(self, body):
+        x = body.x
+        if x < self.x0:
+            self.x0 = x
+        elif x > self.x1:
+            self.x1 = x
+        y = body.y
+        if y < self.y0:
+            self.y0 = y
+        elif y > self.y1:
+            self.y1 = y
+        v = body.vx
+        if v < 0.0:
+            v = -v
+        if v > self.vmax:
+            self.vmax = v
+
+    def box(self, character):
+        """外接矩形**再往外放一圈探针够得着的距离**，得到真正的依赖区。
+
+        返回的是 **16 像素一格的格号** `(x0, x1, y0, y1)`（`_BOX`）——
+        一律**朝外**取整，所以只会多算不会少算，多算的后果只是「多重跑一条
+        边」。存格号而不是浮点：一个落脚点 17 次尝试，存浮点元组要 4 KB，
+        存 4 个 `int` 只要 300 字节，而一张真图 1200 个落脚点 × 每个角色
+        尺度一份（`Esperan03` 实测 9.4 -> 5.9 MB）。
+
+        `botmove` 问地形的地方，探针最远伸出多少，全是**角色自己的尺寸**
+        （不是拍出来的常量）：
+
+        * `fits()` 的 `_clearance_ok` 左右各扫 `2 × 半径`，身圆那一行在脚
+          上方 `2 × 腿半径 + 身半径`；
+        * `surface_near()` 的 reach 是 `速度 × CLIMB_SLOPE` —— 走路那一步
+          用走速，腾空那一步用 `|vx|`（弹跳台能给出比走速大的 `vx`，
+          所以这里取「实际见过的最大值」和冲刺走速里大的那个）。
+
+        ★ 列方向必须放够：`surfaces(x)` / `ground_below(x, y)` 问的是**整列**，
+          只要那一列没变，这一列上的每一问答案都一样。
+        """
+        legs = float(getattr(character, "size_legs", 12.0) or 12.0)
+        body_r = float(getattr(character, "size_body", 13.0) or 13.0)
+        speed = botmove.walk_speed(character, True)
+        margin = max(2.0 * legs, 2.0 * body_r, 2.0 * legs + body_r,
+                     max(self.vmax, speed) * botmove.CLIMB_SLOPE) + 1.0
+        return (_block(self.x0 - margin), _block(self.x1 + margin),
+                _block(self.y0 - margin), _block(self.y1 + margin))
+
+
+def _finish_air(terrain, body, character, trace, ticks=AIR_TICKS):
     """把腾空状态推到落地，返回 ``(Body, 用掉的 tick)``；落不到返回 None。"""
     used = 0
     while not body.on_ground and used < ticks:
         body = botmove.tick(terrain, body, character)
+        trace.see(body)
         used += 1
     return (body, used) if body.on_ground else None
 
 
-def _walk_edge(terrain, body, character, direction):
+def _walk_edge(terrain, body, character, trace, direction):
     current = body
     used = 0
     for _ in range(WALK_TICKS):
         nxt = botmove.tick(terrain, current, character, direction=direction)
+        trace.see(nxt)
         used += 1
         if nxt == current:
             break
         current = nxt
     if not current.on_ground:
-        landed = _finish_air(terrain, current, character)
+        landed = _finish_air(terrain, current, character, trace)
         if landed is None:
             return None
         current, air_used = landed
@@ -176,12 +262,13 @@ def _walk_edge(terrain, body, character, direction):
                          direction, False, float(used))
 
 
-def _jump_edge(terrain, body, character, direction, fast_run):
+def _jump_edge(terrain, body, character, trace, direction, fast_run):
     current = botmove.tick(terrain, body, character, direction=direction,
                            fast_run=fast_run, want_jump=True)
+    trace.see(current)
     if current.on_ground:
         return None
-    landed = _finish_air(terrain, current, character)
+    landed = _finish_air(terrain, current, character, trace)
     if landed is None:
         return None
     current, used = landed
@@ -202,7 +289,7 @@ def at_apex(body):
     return botmove.at_apex(body)
 
 
-def _double_jump_edge(terrain, body, character, direction, fast_run):
+def _double_jump_edge(terrain, body, character, trace, direction, fast_run):
     """★ 二段跳边：起跳 -> 飞到顶点 -> 再跳一次 -> 落地（§124）。
 
     没有它的话，凡是要两段才上得去的平台在图里就是「不可达」——
@@ -211,6 +298,7 @@ def _double_jump_edge(terrain, body, character, direction, fast_run):
     """
     current = botmove.tick(terrain, body, character, direction=direction,
                            fast_run=fast_run, want_jump=True)
+    trace.see(current)
     if current.on_ground:
         return None
     used = 1
@@ -220,6 +308,7 @@ def _double_jump_edge(terrain, body, character, direction, fast_run):
         if want:
             jumped = True
         current = botmove.tick(terrain, current, character, want_jump=want)
+        trace.see(current)
         used += 1
     if not current.on_ground or not jumped:
         return None                        # 没落地 / 压根没跳成第二段
@@ -229,11 +318,12 @@ def _double_jump_edge(terrain, body, character, direction, fast_run):
                          direction, bool(fast_run), float(used), True)
 
 
-def _drop_edge(terrain, body, character):
+def _drop_edge(terrain, body, character, trace):
     current = botmove.tick(terrain, body, character, want_drop=True)
+    trace.see(current)
     if current.on_ground:
         return None
-    landed = _finish_air(terrain, current, character)
+    landed = _finish_air(terrain, current, character, trace)
     if landed is None:
         return None
     current, used = landed
@@ -243,7 +333,7 @@ def _drop_edge(terrain, body, character):
                          0, False, float(used + 1))
 
 
-def _pad_edge(terrain, body, character, double=False):
+def _pad_edge(terrain, body, character, trace, double=False):
     """★★ **弹跳台**：站着不动，台子自己把人弹出去（§99）。
 
     `double=True` 时在弹起来的**顶点**再补一段跳 —— 台子把人送到 `dy` 那么
@@ -255,6 +345,7 @@ def _pad_edge(terrain, body, character, double=False):
     台子白站了。所以第一 tick 必须是「什么都不按」。
     """
     current = botmove.tick(terrain, body, character)
+    trace.see(current)
     if current.on_ground:                 # 脚下没有能触发的台
         return None
     used = 1
@@ -264,6 +355,7 @@ def _pad_edge(terrain, body, character, double=False):
         if want:
             jumped = True
         current = botmove.tick(terrain, current, character, want_jump=want)
+        trace.see(current)
         used += 1
     if not current.on_ground or (double and not jumped):
         return None
@@ -287,41 +379,83 @@ def neighbors(terrain, body, character):
     """
     if terrain is None or body is None or not body.on_ground:
         return ()
-    out = []
-    # 平地优先；A* 在同一代价时会先沿地面找，不会无缘无故一路蹦。
-    for direction in (-1, 1):
-        edge = _walk_edge(terrain, body, character, direction)
-        if edge is not None:
-            out.append(edge)
+    _boxes, edges = _run_attempts(terrain, body, character)
+    return tuple(edge for edge in edges if edge is not None)
+
+
+def _attempt_plan():
+    """一个落脚点上**固定的那几次尝试**，顺序写死。
+
+    ★ 顺序就是增量继承的对齐方式（V0.3 §170）：变体按下标一条条问
+      「这一次的足迹被那件罐子碰到了没有」，没碰到就直接沿用母地形算好的
+      那一条。所以**往里加动作只能往后加**，不能插在中间。
+    """
+    plan = [(_walk_edge, (-1,)), (_walk_edge, (1,))]
     # 竖直跳能从下方穿过白线并落在其上；左右两档再覆盖高台/坑。
     for fast_run in (False, True):
         for direction in (-1, 0, 1):
-            edge = _jump_edge(terrain, body, character, direction, fast_run)
-            if edge is not None:
-                out.append(edge)
+            plan.append((_jump_edge, (direction, fast_run)))
             # ★ 同一组方向再来一条**二段跳**边：一段跳顶点 167，两段能到
             #   400 上下，很多高台只有它上得去。
-            edge = _double_jump_edge(terrain, body, character, direction,
-                                     fast_run)
-            if edge is not None:
-                out.append(edge)
-    edge = _drop_edge(terrain, body, character)
-    if edge is not None:
-        out.append(edge)
+            plan.append((_double_jump_edge, (direction, fast_run)))
+    plan.append((_drop_edge, ()))
     # ★★ 弹跳台两条：光弹上去、以及**弹上去之后在顶点再补一段跳**。
     #    后者是「主动用跳高台上高处」真正缺的那一条（用户 2026-08-30）。
-    for double in (False, True):
-        edge = _pad_edge(terrain, body, character, double=double)
-        if edge is not None:
-            out.append(edge)
-    return tuple(edge for edge in out
-                 if botmove.fits(terrain, edge[0].x, edge[0].y, character))
+    plan.append((_pad_edge, (False,)))
+    plan.append((_pad_edge, (True,)))
+    return tuple(plan)
+
+
+#: ★ 走路排在最前面：A* 在同一代价时会先沿地面找，不会无缘无故一路蹦。
+_ATTEMPTS = _attempt_plan()
+
+
+def _box_hits(boxes, at, rects):
+    """第 `at // 4` 次尝试的依赖区和「变了的那几块」碰上了吗。"""
+    x0, x1, y0, y1 = boxes[at], boxes[at + 1], boxes[at + 2], boxes[at + 3]
+    for rx0, rx1, ry0, ry1 in rects:
+        if x0 <= rx1 and x1 >= rx0 and y0 <= ry1 and y1 >= ry0:
+            return True
+    return False
+
+
+def _run_attempts(terrain, body, character, base=None, rects=()):
+    """跑这个落脚点的每一次尝试，返回 ``(依赖区数组, 每次的边 | None)``。
+
+    依赖区是一条 `array("i")`，每次尝试占 4 个格号（`_Trace.box`）；
+    边是和 `_ATTEMPTS` 一一对应的元组。两个分开放是为了省内存 ——
+    这份东西每个落脚点、每个角色尺度都要留一份。
+
+    `base` 给定时**只重跑**「依赖区被 `rects` 碰到」的那几次，其余原样沿用
+    母地形算好的答案 —— 这就是增量（§170）。
+    """
+    boxes = []
+    edges = []
+    old_boxes, old_edges = base if base else (None, None)
+    for index, (build, args) in enumerate(_ATTEMPTS):
+        if old_boxes is not None:
+            at = index * 4
+            if not _box_hits(old_boxes, at, rects):
+                boxes.extend(old_boxes[at:at + 4])
+                edges.append(old_edges[index])
+                continue
+        trace = _Trace(body)
+        edge = build(terrain, body, character, trace, *args)
+        # ★ 落点塞不进去的边不进图（§152），判在这里而不是最后统一过一遍
+        #   —— 这样「这一次尝试的答案」是自足的，继承时整条搬走就行。
+        if edge is not None and not botmove.fits(terrain, edge[0].x,
+                                                 edge[0].y, character):
+            edge = None
+        boxes.extend(trace.box(character))
+        edges.append(edge)
+    return array.array("i", boxes), tuple(edges)
 
 
 # ---------------------------------------------------------------------------
 # ★★★ 边缓存 —— 可达图是 (地形, 角色尺度) 的**静态事实**，算一次就够
 # ---------------------------------------------------------------------------
-#: `地形对象 -> {角色尺度: {落脚点格: (代表身体, 边元组)}}`。
+#: `地形对象 -> {角色尺度: {落脚点格: (代表身体, 边元组, 每次尝试的足迹)}}`。
+#: 第三格是 `_run_attempts()` 的返回值，只给**增量继承**用（§170）。
 #:
 #: ★ 用**弱引用键**而不是图名：`mapdata.load()` 缓存的地形对象在进程里是
 #:   稳定的，而单测里的合成地形名字全叫 `Tiny` —— 按名字缓存会串味。
@@ -355,18 +489,100 @@ def graph_of(terrain, character):
     return per_scale.setdefault(_scale_key(character), {})
 
 
+def _changed_rects(source, terrain):
+    """两份地形差在哪几块 —— 就是**存活集合的对称差**那几件的外接矩形。
+
+    `variant()` 只换「哪几件破坏物还在」，别的一个格子都不动，所以差异面
+    完整地写在那几件破坏物自己身上。没有差异（或者压根不可比）返回空。
+
+    ★ 上下各多放一格：`_compose()` 重算站立面时下界就是多看一格的
+      —— 盖住 `row1` 之后，原来 `row1 + 1` 那个站立面不再满足「正上方是空」。
+    """
+    mine = getattr(terrain, "alive", None)
+    theirs = getattr(source, "alive", None)
+    if mine is None or theirs is None:
+        return ()
+    diff = mine ^ theirs
+    if not diff:
+        return ()
+    return tuple((_block(item.col0 - 1.0), _block(item.col1 + 1.0),
+                  _block(item.row0 - 1.0), _block(item.row1 + 1.0))
+                 for item in terrain.breakables
+                 if item.index in diff and item.col1 >= 0)
+
+
+#: 「破坏物全碎」那一份变体的存活集合。开局预热的就是它和母地形两张
+#: （`bot.warm_navigation`），所以继承时只在这两个里挑。
+_ALL_BROKEN = frozenset()
+
+
+def _inherit_source(terrain, character, key):
+    """挑一份**已经算过**的地形来继承这一格 + 两边差在哪几块。
+
+    候选只有两个：**母地形**和**「全碎」那一份** —— 开局预热的正是这两张
+    （`bot.warm_navigation`），所以它们一定是热的。挑**差得少**的那个：
+    刚碎一件时母地形只差 1 件，快碎完时「全碎那份」差得更少。
+
+    拿不到（自己就是候选 / 候选还没算过这一格）返回 `(None, ())`。
+    """
+    root = getattr(terrain, "_root", None)
+    if root is None:
+        return None, ()
+    variants = getattr(root, "_variants", None)
+    opened = None if variants is None else variants.get(_ALL_BROKEN)
+    scale = _scale_key(character)
+    best = None
+    for source in (root, opened):
+        if source is None or source is terrain:
+            continue
+        rects = _changed_rects(source, terrain)
+        if not rects or (best is not None and len(rects) >= len(best[1])):
+            continue
+        per_scale = _EDGE_CACHE.get(source)
+        graph = None if not per_scale else per_scale.get(scale)
+        entry = None if not graph else graph.get(key)
+        if entry is None or not entry[2]:
+            continue
+        best = (entry, rects)
+    return best if best is not None else (None, ())
+
+
 def node(graph, terrain, character, body):
-    """一个落脚点在图里的那一条记录：`(代表身体, 边元组)`。
+    """一个落脚点在图里的那一条记录：`(代表身体, 边元组, 每次尝试的足迹)`。
 
     ★ 同一个 8×4 格里的身体共用一条记录 —— 这**正是 A\\* 本来就做的近似**
     （`_state_key` 去重），这里只是把它固化下来，顺便让同一次规划里
     「谁先到这一格」不再影响后续展开。
+
+    ## ★★★ 破坏物变体**从母地形继承**，只重算被碰到的那几条（V0.3 §170）
+
+    打碎一件罐子换来的是一份新地形对象，以前整张可达图要从头重算一遍
+    （`Esperan03` 实测 **832 ms 冷** / 0.5~8 ms 热）—— 那一下压在纯 Python 上，
+    把每条连接的发送线程饿住，用户看到的就是「积压几秒的包一起爆发」
+    （§163 / D125）。可是变体和母地形的差别**只在那一件罐子附近**。
+
+    ⇒ 每次尝试都记着自己摸过的那一片（`_Trace`）。变体建这一格时，
+    逐条问「这一片被碎掉的那几件碰到了没有」：没碰到就把母地形那条边整条
+    搬过来，碰到了才重跑。判据是**几何事实**，不是「跳过前 N 个」那类阈值。
+
+    ★ 继承时用母地形那份记录的**代表身体**：搬过来的边就是从它算出来的，
+      换个身体就对不上了。
     """
     key = _state_key(body)
     got = graph.get(key)
-    if got is None:
-        got = (body, neighbors(terrain, body, character))
-        graph[key] = got
+    if got is not None:
+        return got
+    source, rects = _inherit_source(terrain, character, key)
+    if source is not None:
+        body = source[0]
+        attempts = _run_attempts(terrain, body, character, source[2], rects)
+    elif terrain is None or body is None or not body.on_ground:
+        attempts = ()
+    else:
+        attempts = _run_attempts(terrain, body, character)
+    got = (body, tuple(edge for edge in attempts[1] if edge is not None)
+           if attempts else (), attempts)
+    graph[key] = got
     return got
 
 
@@ -392,7 +608,8 @@ def warm(terrain, character, seeds, limit=MAX_EXPANSIONS):
             continue
         seen.add(key)
         done += 1
-        _representative, edges = node(graph, terrain, character, body)
+        _representative, edges, _boxes = node(graph, terrain,
+                                              character, body)
         for next_body, _step in edges:
             if _state_key(next_body) not in seen:
                 stack.append(next_body)
@@ -448,7 +665,8 @@ def plan_result(terrain, start, character, goal,
         if key in closed:
             continue
         closed.add(key)
-        body, edges = node(graph, terrain, character, bodies[key])
+        body, edges, _boxes = node(graph, terrain, character,
+                                   bodies[key])
         expansions += 1
         if _at_goal(body, goal):
             return PlanResult(route(key), True, costs[key], gap(body))

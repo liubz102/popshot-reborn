@@ -5325,6 +5325,47 @@ class BotBreakableShortcutTests(TerrainMixin, BotFireRoom):
                          (self.terrain.breakables[choice.blocker].x,
                           self.terrain.breakables[choice.blocker].y))
 
+    def test_a_crack_ahead_still_asks_the_planner(self):
+        """★★★★★ 前面那一步塞不进去时**不许**直接站住（V0.3 §171）。
+
+        实机 `CamelCulvert04` 13:21:11 起：bot1 在 **(279, 990)** 站到局终
+        —— **87 秒一步没挪**（bot2 56 秒、bot3 58 秒，整局 57% 的时间三个
+        bot 按键掩码是 0）。用户 2026-09-02：「所有 bot 全都突然不动」
+        「bot 经常卡住不动」。
+
+        往左第一步落在 (271, 990)，那儿被 48 号罐子挤成一条塞不下的缝，
+        于是 `_walk_to()` 直接回「不动」；而 `blocked`（前面有地）、
+        `bottomless`（不是坑）、`vertical`（同一层）三条**一条都不成立**
+        ⇒ 规划单一张都不递 ⇒ 永远解不开。
+
+        A\\* 对这种局面是有答案的：完整地形上到不了，「假定罐子全碎」的地形
+        上一步就到，`first_breakable_on_path()` 认得出挡路的是 48 号。
+        """
+        self.place_bot(279.0, 990.0)
+        who = bot._character_of(self.bot_conn)
+        goal = (15.0, 990.0)
+        body = self.bot_conn.body
+        # 前提：缝在前面，而三条老判据一条都不成立（前提没了这条用例就不成立）。
+        self.assertTrue(bot._walks_into_a_crack(self.terrain, body, who, -1,
+                                                False, False, 1.0))
+        self.assertFalse(botmove.blocked(self.terrain, body, who, -1))
+        self.assertFalse(botmove.bottomless_ahead(
+            self.terrain, body, who, -1, ticks=bot.BOT_DECISION_TICKS))
+        # 第一帧：递单（后台还没算完，这一帧照旧站住 —— 那是对的）。
+        botplan.forget(self.bot_conn)
+        self.bot_conn.path_breakable = None
+        self.assertEqual((0, False, False, False),
+                         bot._walk_to(self.room, self.bot_conn, self.terrain,
+                                      goal, False))
+        self.assertIsNotNone(getattr(self.bot_conn, "nav_ticket", None),
+                             "缝在前面就该递一张规划单，不能一声不吭站着")
+        self.assertTrue(botplan.PLANNER.settle())
+        # 第二帧：单子回来 —— 锁上挡路的那件罐子，接下来的活是把它打碎。
+        self.bot_conn.frame_seq += 1
+        bot._walk_to(self.room, self.bot_conn, self.terrain, goal, False)
+        self.assertEqual(48, self.bot_conn.path_breakable,
+                         "该锁上挡在 (271, 990) 那条缝口上的 48 号罐子")
+
     def test_it_switches_to_a_weapon_that_really_hits_the_vase(self):
         self.place_bot(493.0, 988.0)
         self.bot_conn.path_breakable = 55
@@ -5406,6 +5447,67 @@ class BotBreakableShortcutTests(TerrainMixin, BotFireRoom):
                                             self.bot_seat, self.terrain))
         self.assertIsNone(bot._breakable_move_intent(
             self.room, self.bot_conn, self.bot_seat, self.terrain, None))
+
+    def test_being_walled_in_beats_a_visible_enemy(self):
+        """★★★★★ **不打碎它就哪儿都去不了**时，敌人在眼前也照打（§172）。
+
+        用户 2026-09-02：「一进游戏，所有 bot 都不动，必须我动了之后
+        bot 才开始动。」实机 `CamelCulvert04` bot1 在 **(1285, 853)** 站了
+        **27 秒**，一枪没开、一步没挪，直到真人自己挪窝把目标点带走。
+
+        死锁是闭环：唯一的路被 18 号罐子堵着（完整地形上 A\\* **一步都
+        规划不出来**）⇒ 走不了；而「视野里有敌人就先不打罐子」那道门又
+        不许打 ⇒ 站着；一站着规划签名就不变 ⇒ 永远不重算。
+        ⇒ 「被墙住」和「被压住」是同一类事实，吃同一条待遇：无条件开打。
+        """
+        # ★ 先让真人站到 bot 眼前（`walk` 会推房间循环，所以必须排在
+        #   摆 bot 和递单之前，否则那几格会把锁清掉）。
+        self.walk(self.alice, [(1330.0, 853.0)])
+        self.place_bot(1285.0, 853.0)
+        who = bot._character_of(self.bot_conn)
+        goal = (500.0, 988.0)
+        # 前提：完整地形上一步都走不了，而「假定罐子全碎」一步就到。
+        self.assertEqual((), botnav.plan(self.terrain, self.bot_conn.body,
+                                         who, goal))
+        self.assertTrue(botnav.plan(self.terrain.variant(()),
+                                    self.bot_conn.body, who, goal))
+        with bot._tick_clock(self.now()):
+            self.assertTrue(bot._visible_targets(self.room, self.bot_conn,
+                                                 self.bot_seat),
+                            "前提：敌人得真的在视野里")
+        # 递单 -> 拿回答案：锁上 18 号，并记下「不打碎它哪儿都去不了」。
+        for _ in range(3):
+            self.bot_conn.frame_seq += 1
+            with bot._tick_clock(self.now()):
+                bot._walk_to(self.room, self.bot_conn, self.terrain, goal, False)
+            self.assertTrue(botplan.PLANNER.settle())
+        self.assertEqual(18, self.bot_conn.path_breakable)
+        self.assertTrue(self.bot_conn.path_breakable_only,
+                        "完整地形上一步都走不了，该记成「只能打碎它」")
+        item = bot._breaking_now(self.room, self.bot_conn, self.bot_seat,
+                                 self.terrain)
+        self.assertIsNotNone(item, "被墙住时敌人在眼前也得打碎挡路的")
+        self.assertEqual(18, item.index)
+        # 对照：同一局面下只是「有条捷径」（不是唯一出路）就照旧让位给敌人。
+        self.bot_conn.path_breakable_only = False
+        self.assertIsNone(bot._breaking_now(self.room, self.bot_conn,
+                                            self.bot_seat, self.terrain))
+
+    def test_a_breakable_flip_releases_the_replan_latch(self):
+        """★★★ 罐子碎了 / 长回来了，「别重算」那个闩必须松开（§172）。
+
+        `_nav_signature()` 以前只带**图名**，而一张图的所有变体名字一样
+        ⇒ 地形真变了 bot 也不知道，站在那儿等一个永远不会来的变化。
+        """
+        body = self.bot_conn.body
+        who = bot._character_of(self.bot_conn)
+        spot = (500.0, 988.0)
+        intact = bot._nav_signature(self.terrain, body, spot)
+        broken = bot._nav_signature(self.terrain.variant(frozenset()),
+                                    body, spot)
+        self.assertNotEqual(intact, broken,
+                            "破坏物状态变了，签名就该变")
+        self.assertEqual(intact, bot._nav_signature(self.terrain, body, spot))
 
     def test_an_exhausted_prefix_does_not_freeze_ordinary_walking(self):
         """★★★★★ 锁着挡路物、安全前缀又走空 —— 正常走位不许被钉住（§160）。

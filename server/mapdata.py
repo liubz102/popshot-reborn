@@ -515,6 +515,45 @@ class MapTerrain(object):
         self._coarse = got
         return got
 
+    def coarse_clear(self, x0, y0, x1, y1):
+        """`[x0,x1] × [y0,y1]` 这一小块里**保证**一个挡子弹的格子都没有吗。
+
+        只有「保证没有」才返回 True；返回 False 只是「不敢打包票」，
+        调用方照旧逐格扫（逐格扫给的就是精确答案）。
+
+        用的是 `bullet_coarse()` 那张粗网格 —— 它的谓词就是 `blocks_bullet`，
+        而且**只会多标不会少标**（活着的破坏物按外接矩形整块标脏）。
+        出界不进那张网格（左右下算实心、上边不算，三种口径各不相同），
+        所以只要碰到边就交白卷。
+
+        ★ 它是给「一个 tick 走过的那一小段」用的（腾空一 tick 最多 24 个
+          单位），一次最多查六个块；整张图那种大范围问它没有意义。
+        """
+        if x0 > x1:
+            x0, x1 = x1, x0
+        if y0 > y1:
+            y0, y1 = y1, y0
+        if x0 < 0 or y0 < 0 or x1 >= self.width or y1 >= self.height:
+            return False
+        # ★ 它在腾空的热路径上（每个上升 tick 一次），所以直接读 memo 的槽，
+        #   不绕 `bullet_coarse()` 那一层函数调用。
+        got = self._coarse
+        if got is None:
+            got = self.bullet_coarse()
+        grid, gw = got[0], got[1]
+        bx0, bx1 = int(x0) >> COARSE_SHIFT, int(x1) >> COARSE_SHIFT
+        by0, by1 = int(y0) >> COARSE_SHIFT, int(y1) >> COARSE_SHIFT
+        if bx0 == bx1:                      # 最常见：一个 tick 走不出一块宽
+            for row in range(by0 * gw + bx0, by1 * gw + bx0 + 1, gw):
+                if grid[row]:
+                    return False
+            return True
+        for by in range(by0, by1 + 1):
+            row = by * gw
+            if any(grid[row + bx0:row + bx1 + 1]):
+                return False
+        return True
+
     def is_one_way(self, x, y):
         """是不是单向平台：站得上去，按 ↓ 能穿下去，往上跳能穿过去。"""
         return self.cell(x, y) == 1
