@@ -4171,74 +4171,146 @@ class BotStanceTests(TerrainMixin, BotFireRoom):
                         "退的时候也该还手")
 
 
-class BotRetreatSpotTests(TerrainMixin, BotFireRoom):
-    """★★★★★ 后撤点不许只挑出「往后 8 像素」（V0.3 §165）。
+class BotKeepAwayTests(TerrainMixin, BotFireRoom):
+    """★★★★★ 保守姿态 = **维持半个屏幕的距离环**（D137，用户 2026-09-03）。
 
-    实机 `Esperan03` 01:11:14.989~17.815 座位 1、01:10:25.9~32.7 座位 5：
-    x 在 3/7/10/14 之间来回，`◆走位来自「朝目标走」` **每 62 ms（一次决策）
-    翻一次方向**，整局 45 段、累计 82 秒。用户 2026-09-02：「好几个 bot
-    走路都感觉一卡一卡的。」
+    「血量低于 25% 的 bot 要偏向保守，会主动拉开跟敌人的距离，尽量避免
+    主动进入敌人 1/2 屏幕范围内。」
 
-    病根是 `_retreat_spot()` 缺了 `_blind_cover_spot()` 开头那一句「已经在
-    掩体后面，当前点就是最近答案」：站着的人本来就被挡着，往后挪一个扫描格
-    （8 像素）当然还挡着 ⇒ `index=1` 立刻 `return` ⇒ `_retreat_done()`
-    一看「只差 8 像素 ≤ GOAL_X(64)」判「退到了」⇒ 下一格重挑。
-    而一次决策走 14~21 像素，**一步就迈过头**；贴到图边更是连一格都挑不出来
-    （`cx < 0` 直接 break）⇒ 改成压上去 ⇒ 走回来又够得着一格 ⇒ 再退。
+    上一版是 `_retreat_spot()`：往背离敌人的方向扫 320，第一个挡得住弹道的
+    点就躲进去 —— 而它有一句「已经在掩体后面 ⇒ 答案就是脚下这一点」，
+    于是**目标 = 自己**、走位恒为不动、还被掩体挡着开不了枪。线上四次
+    「所有 bot 卡住不动」全出在它和它框外那个孪生兄弟上（§175 / §176）。
+
+    环跟着敌人走，所以它**不可能**是静止点。
     """
 
     def setUp(self):
         super().setUp()
-        self.alice_seat = self.room.seat_index_of(self.alice)
+        self.terrain = self.install_terrain(synth_terrain("keep_away",
+                                                          width=4000))
 
     def hurt(self, seat, fraction):
         top = bot._seat_max_hp(self.room, seat)
+        bot._health(self.room).reset(seat)
         bot._health(self.room).note_damage(seat, top * fraction)
 
-    def behind_cover(self):
-        """右边有敌人、中间隔着一堵墙 —— bot 已经躲在墙后面。"""
-        terrain = self.install_terrain(synth_terrain(
-            "retreat_cover", width=4000, walls=((900, 940, 0),)))
-        self.place_bot(600.0)
-        return terrain
-
-    def test_already_behind_cover_answers_with_the_current_spot(self):
-        terrain = self.behind_cover()
-        goal = bot._retreat_spot(self.room, self.bot_conn, terrain,
-                                 (1500.0, 150.0))
-        self.assertEqual((self.bot_conn.body.x, self.bot_conn.body.y), goal,
-                         "已经在掩体后面了，答案就该是脚下这一点")
-
-    def test_an_exposed_bot_still_walks_to_real_cover(self):
-        """★ 没被挡住的时候一个字没变：照旧往背离敌人的方向扫掩体。"""
-        terrain = self.install_terrain(synth_terrain(
-            "retreat_open", width=4000, walls=((480, 520, 0),)))
-        self.place_bot(600.0)
-        goal = bot._retreat_spot(self.room, self.bot_conn, terrain,
-                                 (1500.0, 150.0))
-        self.assertIsNotNone(goal)
-        self.assertLess(goal[0], 520.0, "该走到墙的另一边去")
-
-    def test_the_direction_stops_flip_flopping_at_the_map_edge(self):
-        """★★★★★ 这条就是抖动本身 —— 贴着图边、一格决策一个来回。
-
-        照 `_own_step()` 的节奏跑：一格决策握着这份意图走
-        `BOT_DECISION_TICKS` 个 tick，再重问。改之前这里 12 格里翻 10 次
-        （离线拿 `Esperan03` 真图复现过，形态和实机逐发心跳一模一样）。
-        """
-        # 敌人要在**视野框里**（`BOT_VISION_HALF_X`），否则走的是「框外走位」
-        # 那条分支，压根到不了后撤这儿。
-        terrain = self.install_terrain(synth_terrain(
-            "retreat_edge_cover", width=4000, walls=((500, 540, 0),)))
-        enemy = (860.0, 150.0)
-        self.hurt(self.bot_seat, 0.9)          # 「照这样打下去我先倒」⇒ 后撤
-        self.bot_conn.stance = "retreat"
-        self.bot_conn.retreat_goal = None
+    def enemy_at(self, x, y=150.0):
         for conn in (self.alice, self.bob):
             conn.sync_trail.clear()
-            conn.sync_trail.append((enemy[0], enemy[1], 0))
+            conn.sync_trail.append((x, y, 0))
+
+    def spot(self, enemy=(1500.0, 150.0)):
+        return bot._keep_away_spot(self.room, self.bot_conn, self.terrain,
+                                   enemy)
+
+    # ---- 环本身 ------------------------------------------------------------
+
+    def test_the_ring_is_half_a_screen_from_the_enemy(self):
+        self.place_bot(1400.0)                  # 在敌人左边、环里面
+        goal = self.spot()
+        self.assertIsNotNone(goal)
+        self.assertAlmostEqual(1500.0 - bot.BOT_KEEP_AWAY_SPAN, goal[0],
+                               places=3)
+
+    def test_the_ring_stays_on_my_side_of_the_enemy(self):
+        self.place_bot(1600.0)                  # 换到敌人右边
+        goal = self.spot()
+        self.assertAlmostEqual(1500.0 + bot.BOT_KEEP_AWAY_SPAN, goal[0],
+                               places=3)
+
+    def test_the_ring_follows_the_enemy(self):
+        """★★★ 这就是「不是静止点」那句话本身：敌人一动目标就动。"""
+        self.place_bot(600.0)
+        first = self.spot((1500.0, 150.0))
+        second = self.spot((1200.0, 150.0))
+        self.assertNotEqual(first[0], second[0])
+        self.assertAlmostEqual(300.0, first[0] - second[0], places=3)
+
+    def test_it_never_answers_with_my_own_feet(self):
+        """★ 老 `_retreat_spot()` 躲在掩体后面时返回的就是脚下这一点。"""
+        terrain = self.install_terrain(synth_terrain(
+            "keep_away_wall", width=4000, walls=((900, 940, 0),)))
+        self.place_bot(600.0)
+        goal = bot._keep_away_spot(self.room, self.bot_conn, terrain,
+                                   (1500.0, 150.0))
+        self.assertNotEqual((600.0, 150.0), goal)
+
+    # ---- 走位 --------------------------------------------------------------
+
+    def target_row(self):
+        """一份「这一枪打得出去」的 `_fire_target()` 结果（只有座位号有用）。"""
+        return (self.room.seat_index_of(self.alice), None, None)
+
+    def test_inside_the_ring_it_backs_off(self):
+        self.hurt(self.bot_seat, 0.9)           # 10% 血 -> 保守
+        self.enemy_at(900.0)
+        self.place_bot(700.0)                   # 离敌人 200 < 512
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual(-1, intent[0], "被贴到环里了，该往外退")
+        self.assertEqual("retreat", self.bot_conn.stance)
+
+    def test_it_backs_off_to_exactly_half_a_screen(self):
+        self.hurt(self.bot_seat, 0.9)
+        self.enemy_at(900.0)
+        self.place_bot(700.0)
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, self.target_row())
+        self.assertAlmostEqual(900.0 - bot.BOT_KEEP_AWAY_SPAN,
+                               self.bot_conn.walk_goal[0], places=3)
+
+    def test_it_does_not_back_off_from_a_shot_it_cannot_take(self):
+        """★★★★★ 「保持距离」的前提是「我在这个距离上打得到他」。
+
+        不带这道门的话：退出去 → 打不到 → 压回来 → 又太近 → 再退，
+        **每格一个来回**（§174 那个型）。打不到就先压到打得到为止。
+        """
+        self.hurt(self.bot_seat, 0.9)
+        self.enemy_at(900.0)
+        self.place_bot(700.0)                   # 一样贴在环里
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, None)     # 但这一枪打不出去
+        self.assertEqual(1, intent[0], "打不到就该压上去，不是往外退")
+
+    def test_outside_the_ring_it_walks_in_but_stops_before_the_ring(self):
+        """★ 「尽量避免主动进入」：环外照旧朝敌人压，可站住打那道门
+        （`BOT_HOLD_RANGE` = 616）比环（512）远 —— 它停在环外。"""
+        self.hurt(self.bot_seat, 0.9)
+        self.enemy_at(900.0)
+        self.place_bot(100.0)                   # 离敌人 800 > 616
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual(1, intent[0], "打得到但还太远，先压近点")
+        self.place_bot(900.0 - bot.BOT_HOLD_RANGE)
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual((0, False, False, False), intent,
+                         "到了命中距离中位数就站住打，不再往环里挤")
+        self.assertGreater(bot.BOT_HOLD_RANGE, bot.BOT_KEEP_AWAY_SPAN,
+                           "站住打那道门必须在环外，否则保守 bot 会挤进环里")
+
+    def test_a_healthy_bot_walks_all_the_way_to_the_enemy(self):
+        """★ 血 > 50% 的一个字没变：正常进攻，目标就是敌人本人。"""
+        self.hurt(self.bot_seat, 0.0)           # 满血 -> 逼近
+        self.enemy_at(900.0)
+        self.place_bot(100.0)
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, None)
+        self.assertEqual("press", self.bot_conn.stance)
+        self.assertAlmostEqual(900.0, self.bot_conn.walk_goal[0], places=3)
+
+    def test_the_direction_stops_flip_flopping_at_the_map_edge(self):
+        """★★★★★ 贴着图边、一格决策一个来回（V0.3 §165 那条抖动）。
+
+        照 `_own_step()` 的节奏跑：一格决策握着这份意图走
+        `BOT_DECISION_TICKS` 个 tick，再重问。
+        """
+        terrain = self.install_terrain(synth_terrain("keep_away_edge",
+                                                     width=4000))
+        self.hurt(self.bot_seat, 0.9)
+        self.enemy_at(860.0)
         who = bot._character_of(self.bot_conn)
-        seen = []
         for start_x in (4.0, 10.0, 16.0):
             self.place_bot(start_x)
             self.bot_conn.retreat_goal = None
@@ -4253,8 +4325,6 @@ class BotRetreatSpotTests(TerrainMixin, BotFireRoom):
                         direction=intent[0], fast_run=bool(intent[3]))
                 self.bot_conn.battle_pos = (self.bot_conn.body.x,
                                             self.bot_conn.body.y)
-            seen.append((start_x, row))
-        for start_x, row in seen:
             flips = sum(1 for i in range(len(row) - 1)
                         if row[i] and row[i + 1] == -row[i])
             self.assertEqual(0, flips,
@@ -4262,27 +4332,243 @@ class BotRetreatSpotTests(TerrainMixin, BotFireRoom):
                              % (start_x, flips, row))
 
     def test_nowhere_to_retreat_does_not_rewrite_the_stance_latch(self):
-        """★★★ 「退无可退」是**地形**事实，不是战况判断变了（§165）。
-
-        以前这儿写一句 `machine.stance = "press"`，下一格 `_stance()` 拿
-        同一组血量一算又说「该退」—— 闩每一格翻一次，两道迟滞门形同虚设。
-        """
-        terrain = self.install_terrain(synth_terrain("retreat_edge",
+        """★★★ 「退无可退」是**地形**事实，不是战况判断变了（§165）。"""
+        terrain = self.install_terrain(synth_terrain("keep_away_edge2",
                                                      width=4000))
         self.place_bot(4.0)                     # 贴着图左边缘
         self.hurt(self.bot_seat, 0.9)
-        self.bot_conn.stance = "retreat"
-        self.bot_conn.retreat_goal = None
-        for conn in (self.alice, self.bob):
-            conn.sync_trail.clear()
-            conn.sync_trail.append((900.0, 150.0, 0))
-        self.assertIsNone(bot._retreat_spot(self.room, self.bot_conn, terrain,
-                                            (900.0, 150.0)),
-                          "平地图边本来就该退无可退")
+        self.enemy_at(900.0)
         bot._move_intent(self.room, self.bot_conn, self.bot_seat, terrain,
                          None)
         self.assertEqual("retreat", self.bot_conn.stance,
                          "退无可退不该把姿态闩改写成 press")
+
+
+class BotHoldRangeTests(TerrainMixin, BotFireRoom):
+    """★★★★ 「打得到就站住打」只在**真人真的打得中的距离**之内（D137）。
+
+    用户 2026-09-03：「距离太远了 bot 就不动了。」线上 `Forest02` 那一局
+    两个 bot 隔着 **1010 像素**互相「打得到·站住打」，谁也打不中谁，
+    站了 **161 秒**到时限（§176）。
+
+    `BOT_ENGAGE_RANGE`（1000 = §48 的 p99）是**开不开枪**的门；
+    `BOT_HOLD_RANGE`（616 = §48 的中位数）是**站不站住**的门。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(synth_terrain("hold_range",
+                                                          width=4000))
+
+    def enemy_at(self, x, y=150.0):
+        for conn in (self.alice, self.bob):
+            conn.sync_trail.clear()
+            conn.sync_trail.append((x, y, 0))
+
+    def target_row(self):
+        """一份「这一枪打得出去」的 `_fire_target()` 结果（只有座位号有用）。"""
+        return (self.room.seat_index_of(self.alice), None, None)
+
+    def test_it_stands_and_shoots_inside_the_median_hit_distance(self):
+        self.place_bot(600.0)
+        self.enemy_at(900.0)                    # 300 < 616
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual((0, False, False, False), intent)
+
+    def test_it_closes_in_instead_of_plinking_from_max_range(self):
+        self.place_bot(100.0)
+        self.enemy_at(1000.0)                   # 900 > 616，仍在交战距离内
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual(1, intent[0],
+                         "比真人常打中的距离还远，该压上去边走边打")
+
+    def test_the_boundary_itself_still_stands(self):
+        """★ 严格大于才压上去：正好 616 照旧站住打。"""
+        self.place_bot(1000.0)
+        self.enemy_at(1000.0 + bot.BOT_HOLD_RANGE)
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual((0, False, False, False), intent)
+
+
+class BotUnstallTests(TerrainMixin, BotFireRoom):
+    """★★★★★ 走位算不出动作时**横着挪一步去找路**（D137）。
+
+    敌人就在正上方 / 正下方时 `|Δx|` 只有几像素，而 `_walk_to()` 是个
+    bang-bang 控制器、一次决策走 14~21 像素 —— 它在 ±1 和 0 之间空转，
+    人一格都不挪。`Forest00` 那个离线复现最干净：(966, 442) 对着
+    (957, 646)，60 格决策**净位移 0**。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(synth_terrain("unstall",
+                                                          width=4000))
+        self.place_bot(1000.0)
+
+    def below(self, dy=450.0):
+        """把两个真人都摆到 bot 正下方（`|Δx| = 0`）。"""
+        for conn in (self.alice, self.bob):
+            conn.sync_trail.clear()
+            conn.sync_trail.append((1000.0, 150.0 + dy, 0))
+
+    def test_an_enemy_straight_below_no_longer_freezes_it(self):
+        self.below()
+        self.assertEqual(
+            (0, False, False, False),
+            bot._walk_to(self.room, self.bot_conn, self.terrain,
+                         (1000.0, 600.0), False),
+            "夹具自检：光靠 `_walk_to()` 这一格是不动的")
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, None)
+        self.assertNotEqual(0, intent[0], "该横着挪一步去找下去的路")
+
+    def test_the_probe_direction_is_latched(self):
+        """★★★ 不闩的话目标那点横向分量每格把它拽回来（§174 那个型）。"""
+        self.below()
+        seen = []
+        for _ in range(8):
+            intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                      self.terrain, None)
+            seen.append(intent[0])
+            self.place_bot(self.bot_conn.body.x + intent[0] * 16.0)
+        self.assertEqual(1, len(set(seen)), "方向该一直是同一个：%s" % seen)
+        self.assertNotIn(0, seen, "而且得真的在走：%s" % seen)
+
+    def test_standing_on_the_goal_is_not_a_stall(self):
+        """★ 「已经到了」不是卡住 —— 真人 39% 的心跳就是站着不动的（§71）。"""
+        for conn in (self.alice, self.bob):
+            conn.sync_trail.clear()
+            conn.sync_trail.append((1000.0, 150.0, 0))
+        intent = bot._unstall(self.room, self.bot_conn, self.terrain,
+                              (1000.0, 150.0), (0, False, False, False), None)
+        self.assertEqual((0, False, False, False), intent)
+        self.assertEqual(0, self.bot_conn.probe_side)
+
+    def test_a_shot_it_can_take_releases_the_latch(self):
+        self.below()
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, None)
+        self.assertNotEqual(0, self.bot_conn.probe_side)
+        bot._unstall(self.room, self.bot_conn, self.terrain, (1000.0, 600.0),
+                     (0, False, False, False), (0, None, None))
+        self.assertEqual(0, self.bot_conn.probe_side, "打得到就不用再找路了")
+
+    def test_a_real_way_up_releases_the_latch(self):
+        self.below()
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, None)
+        self.assertNotEqual(0, self.bot_conn.probe_side)
+        intent = bot._unstall(self.room, self.bot_conn, self.terrain,
+                              (1000.0, 600.0), (1, True, False, False), None)
+        self.assertEqual((1, True, False, False), intent, "能跳就跳，别再横挪")
+        self.assertEqual(0, self.bot_conn.probe_side)
+
+
+class BotFrozenSceneTests(TerrainMixin, TwoBotFrameRoom):
+    """★★★★★ `bug调查/14` 里三个「所有 bot 卡住不动」的现场，在**真图**上重放。
+
+    坐标 / 血量 / 地图全部照 `server.out` 抄。线上这三处分别停了
+    **129.6 / 161 / 144.9 秒**，一格没挪。
+
+    ⚠ 这三张图要 `server/bot_mapdata/` 里的真产物，不是合成地形 ——
+      抖动和卡死都只在真地形上才复现得出来。
+    """
+
+    session_type = 1
+    arguments = (1, 0, 0)
+
+    #: (标题, 图名, 甲方 (x, y, 血), 乙方 (x, y, 血))
+    SCENES = (
+        ("Iceria00 01:20:25", "Iceria00",
+         (2343.0, 836.0, 0.14), (2337.0, 832.0, 0.04)),
+        ("Forest02 09:21:48", "Forest02",
+         (1160.0, 583.0, 0.40), (147.0, 526.0, 0.40)),
+        ("Forest00 00:21:27", "Forest00",
+         (1019.0, 460.0, 0.23), (985.0, 656.0, 0.12)),
+    )
+
+    def setUp(self):
+        super().setUp()
+        alice_seat = self.room.seat_index_of(self.alice)
+        bob_seat = self.room.seat_index_of(self.bob)
+        self.room.seats[bob_seat].team = self.room.seats[alice_seat].team
+        team_a = self.room.seats[alice_seat].team
+        friends = [i for i in self.bot_seats
+                   if self.room.seats[i].team == team_a]
+        foes = [i for i in self.bot_seats if i not in friends]
+        self.seats = (friends[0], foes[0])
+        # 真人三条命都用完 —— 场上再没有会主动打破僵局的东西。
+        self.room.quest.lives_spent.update((alice_seat, bob_seat))
+
+    def arm(self, seat, spec):
+        conn = self.room.seats[seat].conn
+        conn.battle_pos = (spec[0], spec[1])
+        conn.body = botmove.Body(spec[0], spec[1])
+        conn.stance = "press"
+        conn.retreat_goal = None
+        conn.probe_side = 0
+        conn.next_fire_at = 0.0
+        ledger = bot._health(self.room)
+        ledger.reset(seat)
+        ledger.note_damage(seat, bot._seat_max_hp(self.room, seat)
+                           * (1.0 - spec[2]))
+        return conn
+
+    def test_no_scene_parks_the_bots_any_more(self):
+        for title, map_name, first, second in self.SCENES:
+            terrain = self.install_terrain(mapdata.load(map_name))
+            who = {}
+            for seat, spec in zip(self.seats, (first, second)):
+                who[seat] = bot._character_of(self.arm(seat, spec))
+            travel = {seat: 0.0 for seat in self.seats}
+            for step in range(120):
+                for seat in self.seats:
+                    conn = self.room.seats[seat].conn
+                    conn.frame_seq = step
+                    botplan.PLANNER.settle()   # A* 是后台线程，替它跑完
+                    before = conn.body.x
+                    intent = bot._decide(self.room, conn, seat, terrain,
+                                         time.monotonic(),
+                                         step * bot.BOT_DECISION_TICKS)
+                    for _ in range(bot.BOT_DECISION_TICKS):
+                        conn.body = bot.botmove.tick(
+                            terrain, conn.body, who[seat],
+                            direction=intent[0], fast_run=bool(intent[3]))
+                    conn.battle_pos = (conn.body.x, conn.body.y)
+                    travel[seat] += abs(conn.body.x - before)
+            for seat in self.seats:
+                self.assertGreater(
+                    travel[seat], 100.0,
+                    "%s 座位 %d 120 格决策只挪了 %.0f 像素"
+                    % (title, seat, travel[seat]))
+
+    def test_they_end_up_inside_engaging_distance(self):
+        """★ 不只是「在动」—— 它们得真的凑到打得着的距离上。"""
+        for title, map_name, first, second in self.SCENES:
+            terrain = self.install_terrain(mapdata.load(map_name))
+            who = {}
+            for seat, spec in zip(self.seats, (first, second)):
+                who[seat] = bot._character_of(self.arm(seat, spec))
+            for step in range(240):
+                for seat in self.seats:
+                    conn = self.room.seats[seat].conn
+                    conn.frame_seq = step
+                    botplan.PLANNER.settle()
+                    intent = bot._decide(self.room, conn, seat, terrain,
+                                         time.monotonic(),
+                                         step * bot.BOT_DECISION_TICKS)
+                    for _ in range(bot.BOT_DECISION_TICKS):
+                        conn.body = bot.botmove.tick(
+                            terrain, conn.body, who[seat],
+                            direction=intent[0], fast_run=bool(intent[3]))
+                    conn.battle_pos = (conn.body.x, conn.body.y)
+            bodies = [self.room.seats[s].conn.body for s in self.seats]
+            span = abs(bodies[0].x - bodies[1].x)
+            self.assertLessEqual(span, bot.BOT_ENGAGE_RANGE,
+                                 "%s 最后还隔着 %.0f 像素" % (title, span))
 
 
 class BotWalkOvershootTests(TerrainMixin, BotFireRoom):
@@ -4993,16 +5279,37 @@ class BotBossRoomTests(TerrainMixin, BotFrameRoom):
                                msg="非闯关上下文退主表那份")
 
     def test_the_leash_is_suspended_in_a_boss_room(self):
-        """★★★ boss 房里落后再远也不追人 —— 没有进度可推（§141）。"""
+        """★★★ boss 房里落后再远也不**牵引**（§141）—— 没有进度可推。
+
+        ★ 但「不牵引」不等于「站着」：boss 在哪还不知道的时候要跟着带头的
+        真人走（D137），见下一条。这里只验牵引绳本身一个字没说。
+        """
         self.enter_boss_room()
         self.place_bot(200.0)
         self.walk(self.alice, [(2000.0, 150.0), (2200.0, 150.0)])
-        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
-                                  self.terrain, None)
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, None)
         self.assertFalse(self.bot_conn.leash_lagging,
                          "boss 房里牵引绳一个字都不该说")
-        self.assertEqual((0, False, False, False), intent,
-                         "还不知道 boss 在哪，该站住等，不是去追人")
+
+    def test_an_unknown_boss_makes_it_follow_the_human_not_stand(self):
+        """★★★★★ boss 在哪还不知道时**跟着带头的真人**，不许站着（D137）。
+
+        用户 2026-09-03：「任务模式到了 boss 房后又不动了。」
+        服务端手上 boss 的坐标只有两个来源，**两个都要别人先动手**：
+        `note_mob_hit()`（有人打中过它）、`quest.boss_gun`（它自己开过枪）。
+        以前两个都空就站住等 —— 而 bot 站着就打不到 boss，打不到就永远
+        没有采样：**它自己就是自己解锁条件的否定**（§160 家族）。
+        """
+        self.enter_boss_room()
+        self.place_bot(200.0)
+        self.walk(self.alice, [(2000.0, 150.0), (2200.0, 150.0)])
+        self.assertIsNone(bot._nearest_mob(self.room, self.bot_conn.body),
+                          "夹具要的就是「一只都还不知道」")
+        self.assertIsNone(getattr(self.room.quest, "boss_gun", None))
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, None)
+        self.assertEqual(1, intent[0], "该朝带头的真人那边挪，不许站着")
 
     def test_it_walks_toward_the_boss_when_out_of_range(self):
         self.enter_boss_room()
@@ -8400,7 +8707,7 @@ class BotVisionTests(TerrainMixin, BotFireRoom):
 
 
 class BotBlindHealthTests(TerrainMixin, BotFireRoom):
-    """框内没敌人时的 25% / 50% 滞回与粗方向掩体。"""
+    """框外（视野里没敌人）时的 25% / 50% 姿态滞回。★ 不再有「躲掩体」这个动作（D137）。"""
 
     def setUp(self):
         super().setUp()
@@ -8420,12 +8727,20 @@ class BotBlindHealthTests(TerrainMixin, BotFireRoom):
         return bot._blind_intent(self.room, self.bot_conn, self.bot_seat,
                                  self.terrain)
 
-    def test_below_twenty_five_percent_hides(self):
+    def test_low_health_turns_conservative_but_keeps_walking(self):
+        """★★★★★ 低血量只换**姿态**，不再换动作（D137）。
+
+        以前这一条叫 `..._hides`，断言的是「低血不该继续往右送」。
+        躲掩体是个没有出口的停机状态（§175 / §176），用户 2026-09-03
+        拍板拿掉：「无论怎样，全都主动寻找并接近敌人，禁止站在一个地方
+        不动。」框外这一支于是不再看姿态 —— 血再少也朝粗方位挪，
+        「拉开距离」只在看得见敌人（有真实坐标）时才谈得上。
+        """
         self.set_health(0.24)
         self.bot_conn.stance = "press"
         intent = self.intent()
-        self.assertEqual("retreat", self.bot_conn.stance)
-        self.assertLessEqual(intent[0], 0, "敌人在右边，低血不该继续往右送")
+        self.assertEqual("retreat", self.bot_conn.stance, "姿态照旧翻")
+        self.assertEqual(1, intent[0], "但动作是朝粗方位走，不是站着躲")
 
     def test_above_fifty_percent_presses(self):
         self.set_health(0.51)
@@ -8473,25 +8788,129 @@ class BotBlindHealthTests(TerrainMixin, BotFireRoom):
         self.assertNotEqual(0, self.intent()[0],
                             "上下方位也得横着走去找上去的路")
 
-    def test_a_boss_room_never_hides(self):
-        """★ boss 房的门要**打死 boss 才开** —— 血再少也不许躲（§141）。"""
-        self.set_health(0.05)
-        self.bot_conn.stance = "retreat"
-        intent = bot._blind_intent(self.room, self.bot_conn, self.bot_seat,
-                                   self.terrain, may_hide=False)
-        self.assertEqual("press", self.bot_conn.stance)
-        self.assertEqual(1, intent[0], "血再少也要朝 boss 那个方向压过去")
+    def test_it_never_stands_still_however_low_the_health(self):
+        """★★★★★ 血再少也不许原地不动（D137）—— 以前这是 boss 房的例外
+        （`may_hide=False`），现在是**所有**房间的规矩。"""
+        for fraction in (0.01, 0.05, 0.24, 0.30, 0.51, 1.0):
+            self.set_health(fraction)
+            self.bot_conn.retreat_goal = None
+            intent = self.intent()
+            self.assertEqual(1, intent[0],
+                             "血 %.0f%% 时框外走位停住了" % (fraction * 100))
 
-    def test_low_health_uses_a_real_cover_when_available(self):
-        self.terrain = self.install_terrain(synth_terrain(
+    def test_a_wall_no_longer_parks_a_low_health_bot_behind_it(self):
+        """★★★★★ 这条以前叫 `..._uses_a_real_cover_when_available`，
+        断言的正是把 bot 停在墙后面。那就是线上四次「所有 bot 卡住不动」
+        的现场（§175 / §176）—— 现在它必须照旧往前走。"""
+        terrain = self.install_terrain(synth_terrain(
             "blind_cover", width=4000, walls=((480, 520, 0),)))
         self.place_bot(600.0)
         self.set_health(0.10)
         self.bot_conn.stance = "press"
-        self.intent()
-        self.assertIsNotNone(self.bot_conn.retreat_goal)
-        self.assertLess(self.bot_conn.retreat_goal[0], 520.0,
-                        "应该走到左边、让墙挡在自己和右方敌人之间")
+        intent = bot._blind_intent(self.room, self.bot_conn, self.bot_seat,
+                                   terrain)
+        self.assertEqual(1, intent[0], "墙不该再把它钉在原地")
+        self.assertIsNone(self.bot_conn.retreat_goal,
+                          "框外这一支不再挑后撤落脚点")
+
+    def test_the_hiding_machinery_is_gone(self):
+        """★ 哨兵：这几个函数 / 常量再出现就说明「躲」被谁改回来了。"""
+        for name in ("_blind_cover_spot", "_blind_cover_pick",
+                     "_blind_in_cover", "_retreat_spot", "_humans_all_spent",
+                     "BOT_BLIND_HIDE_BELOW", "BOT_BLIND_PRESS_ABOVE"):
+            self.assertFalse(hasattr(bot, name), "%s 又回来了" % name)
+
+
+class BotNeverParksTests(TerrainMixin, TwoBotFrameRoom):
+    """★★★★★ 「禁止站在一个地方不动」的**全局**回归（D137）。
+
+    用户 2026-09-03 报的三条（生存局真人死后全体卡住 / 距离太远就不动 /
+    任务模式进 boss 房就不动）在日志里是同一个形状：某个分支返回
+    「站住」，而它自己产生的状态恰好是自己解锁条件的否定（§160 家族）。
+
+    这个类把**最容易复发的那个现场**照实机摆出来：场上只剩 bot、
+    个个残血、谁都不在谁的视野框里 —— 线上 `Iceria00` 停了 129.6 秒、
+    `Forest02` 停了 161 秒。
+    """
+
+    session_type = 1
+    arguments = (1, 0, 0)       # 组队战 + 生存（三条命）
+
+    def setUp(self):
+        super().setUp()
+        alice_seat = self.room.seat_index_of(self.alice)
+        bob_seat = self.room.seat_index_of(self.bob)
+        self.human_seats = [alice_seat, bob_seat]
+        team_a = self.room.seats[alice_seat].team
+        self.room.seats[bob_seat].team = team_a
+        friends = [i for i in self.bot_seats
+                   if self.room.seats[i].team == team_a]
+        foes = [i for i in self.bot_seats if i not in friends]
+        self.assertTrue(friends and foes, "夹具没把两个 bot 分到两边")
+        self.friend_seat, self.foe_seat = friends[0], foes[0]
+        self.friend = self.room.seats[self.friend_seat].conn
+        self.foe = self.room.seats[self.foe_seat].conn
+        self.terrain = self.install_terrain(synth_terrain("never_parks",
+                                                          width=4000))
+        # 两个 bot 隔得远远的：谁都不在谁的视野框里 = 线上那一局的形状。
+        self.place(self.friend_seat, 600.0)
+        self.place(self.foe_seat, 600.0 + bot.BOT_VISION_HALF_X + 500.0)
+        for seat in (self.friend_seat, self.foe_seat):
+            self.set_health(seat, 0.10)
+        # 真人三条命都用完了 —— 场上再没有会主动打破僵局的东西。
+        self.room.quest.lives_spent.update(self.human_seats)
+
+    def place(self, seat, x, y=150.0):
+        conn = self.room.seats[seat].conn
+        conn.battle_pos = (x, y)
+        conn.body = botmove.Body(x, y)
+
+    def set_health(self, seat, fraction):
+        ledger = bot._health(self.room)
+        ledger.reset(seat)
+        maximum = bot._seat_max_hp(self.room, seat)
+        ledger.note_damage(seat, maximum * (1.0 - fraction))
+
+    def test_both_low_health_bots_keep_walking_toward_each_other(self):
+        """★★★★★ 死锁那一刻：两个 10% 血的 bot 谁都看不见谁。"""
+        for seat, conn, expect in ((self.friend_seat, self.friend, 1),
+                                   (self.foe_seat, self.foe, -1)):
+            intent = bot._move_intent(self.room, conn, seat, self.terrain,
+                                      None)
+            self.assertEqual(expect, intent[0], "座位 %d 停住了" % seat)
+
+    def test_they_actually_meet_instead_of_running_out_the_clock(self):
+        """★★★ 逐格跑到互相进视野框为止 —— 线上是跑满 240 秒时限。"""
+        who = {seat: bot._character_of(self.room.seats[seat].conn)
+               for seat in (self.friend_seat, self.foe_seat)}
+        for step in range(400):
+            a, b = self.friend.body, self.foe.body
+            if (abs(a.x - b.x) <= bot.BOT_VISION_HALF_X
+                    and abs(a.y - b.y) <= bot.BOT_VISION_HALF_Y):
+                break
+            for seat in (self.friend_seat, self.foe_seat):
+                conn = self.room.seats[seat].conn
+                intent = bot._move_intent(self.room, conn, seat, self.terrain,
+                                          None)
+                self.assertNotEqual(0, intent[0],
+                                    "第 %d 格座位 %d 站住了" % (step, seat))
+                for _ in range(bot.BOT_DECISION_TICKS):
+                    conn.body = bot.botmove.tick(
+                        self.terrain, conn.body, who[seat],
+                        direction=intent[0], fast_run=bool(intent[3]))
+                conn.battle_pos = (conn.body.x, conn.body.y)
+        else:
+            self.fail("400 格决策都没走到互相看得见")
+
+    def test_a_healthy_bot_does_the_same(self):
+        """★ 血量不改变「走不走」这件事，只改变**站位**。"""
+        for seat in (self.friend_seat, self.foe_seat):
+            self.set_health(seat, 1.0)
+        for seat, expect in ((self.friend_seat, 1), (self.foe_seat, -1)):
+            conn = self.room.seats[seat].conn
+            intent = bot._move_intent(self.room, conn, seat, self.terrain,
+                                      None)
+            self.assertEqual(expect, intent[0])
 
 
 class BotIdleRepositionTests(TerrainMixin, BotFireRoom):

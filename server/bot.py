@@ -527,6 +527,9 @@ class BotConn(gameserver.Conn):
         self.stance = "press"
         #: 拉开时那个后退落脚点 `(x, y)`；`None` = 还没挑 / 已经到了。
         self.retreat_goal = None
+        #: ★ 「横着找路」闩（`_unstall()`）：`0` = 没在找。解闩全是事件 ——
+        #:   走位重新给得出上下动作、打得到人了、或者这一侧走不动了。
+        self.probe_side = 0
         #: ★★ 上一次**真的迈出去**的走位方向（`_walk_to()` 的兜底那一路写）。
         #:   `0` = 还没走过。判「这一次掉头是不是只为了修一个走不满的零头」
         #:   要用它，见 `_walk_to()` 里那段（V0.3 §167）。
@@ -756,6 +759,7 @@ class BotConn(gameserver.Conn):
         self.auto_weapon_id = None
         self.stance = "press"
         self.retreat_goal = None
+        self.probe_side = 0
         self.walk_last = 0
         self.walk_goal = None
         self.dodge_signature = None
@@ -3535,6 +3539,17 @@ def _item_goal(room, machine, seat_index):
     一个寻路目标 —— 走过去这件事本身仍然由 `botnav` 的真实物理决定
     （够不着的高台上那件自然就规划不出路线，也就不去了）。
     """
+    row = _item_goal_row(room, machine, seat_index)
+    return None if row is None else (row[0], row[1])
+
+
+def _item_goal_row(room, machine, seat_index):
+    """`_item_goal()` 的完整答案：`(距离, 坐标, 句柄)`。
+
+    ★ 多出来的**句柄**是给「这一件还在不在地上」用的。`items_at` 会在
+    两件事上把它删掉：被谁捡走了（`claim_item`）、13 秒到期自灭
+    （`ITEM_LIFE_SECONDS`，抄客户端 `Item::Tick`）—— 两件都是**事件**。
+    """
     quest = None if room is None else room.quest
     body = machine.body
     if quest is None or body is None:
@@ -3543,13 +3558,13 @@ def _item_goal(room, machine, seat_index):
     if not items:
         return None
     best = None
-    for _handle, spot in items.items():
+    for handle, spot in items.items():
         span = math.hypot(spot[0] - body.x, spot[1] - body.y)
         if span > BOT_ENGAGE_RANGE:
             continue                      # 半张图外的东西不值得专门跑一趟
         if best is None or span < best[0]:
-            best = (span, (float(spot[0]), float(spot[1])))
-    return None if best is None else best
+            best = (span, (float(spot[0]), float(spot[1])), handle)
+    return best
 
 
 def _speed_scale(machine, now):
@@ -4000,11 +4015,47 @@ def pick_respawn_point(room, seat_index):
 BOT_VISION_HALF_X = 1024.0
 BOT_VISION_HALF_Y = 768.0
 
-#: 视野内没有敌人时的血量滞回（用户 2026-09-01 拍板）。
-#: 严格小于 25% 才转隐蔽，严格大于 50% 才转逼近；中间保持
-#: 上一姿态，治掉治疗/伤害在边界上让 bot 来回掉头。
-BOT_BLIND_HIDE_BELOW = 0.25
-BOT_BLIND_PRESS_ABOVE = 0.50
+#: ★★★★★ 血量姿态的两道门（用户 2026-09-01 给的数，2026-09-03 改的语义）。
+#:
+#: **旧语义（D119，已废）**：低于 25% 去躲掩体、高于 50% 主动接近。
+#: 躲掩体是个**没有出口的停机状态**（§175 / §176：一躲下去位置不变、
+#: 血不会自愈、粗方位也不变，于是解锁条件永远不成立），线上四次
+#: 「所有 bot 卡住不动」全是它。
+#:
+#: **新语义（D137，用户 2026-09-03）**：「无论怎样，全都主动寻找并接近
+#: 敌人，禁止站在一个地方不动。但是血量影响 bot 的战斗策略，高于 50% 的
+#: bot 无所顾忌，正常进攻，血量低于 25% 的 bot 要偏向保守，会主动拉开
+#: 跟敌人的距离，尽量避免主动进入敌人 1/2 屏幕范围内。」
+#:
+#: ⇒ 两个数一个没变，**只是不再有「躲」这个动作**：低血量改成
+#:   「维持一个距离环」（`BOT_KEEP_AWAY_SPAN`），环本身跟着敌人走，
+#:   所以它天生不是静止点。中间那一档（25%~50%）继续用 D77 的 TTK
+#:   两道迟滞门，没有新事实就不做新决定。
+#: ★ 严格不等号：恰好 25% / 50% 不翻。
+BOT_LOW_HEALTH = 0.25
+BOT_HIGH_HEALTH = 0.50
+
+#: ★★★ 保守姿态要保持的距离 —— **半个屏幕**（用户 2026-09-03：
+#: 「尽量避免主动进入敌人 1/2 屏幕范围内」）。
+#:
+#: 客户端分辨率是 **1024 × 768**（`BOT_VISION_HALF_X/Y` 就是按它定的），
+#: 半个屏幕宽 = 512。这不是我们挑的数，是用户给的规则 + 原版的分辨率。
+BOT_KEEP_AWAY_SPAN = 512.0
+
+#: ★★★ 「站住打」的最远距离 —— **真人命中距离的中位数**（§48）。
+#:
+#: §48 那份分布是「真人**打中了角色**的 247 发」的开火点到爆炸点距离：
+#: `p10=264 / 中位=616 / p99=1015`。`BOT_ENGAGE_RANGE`（1000）取的是 p99
+#: ——「再远就几乎打不中了」，那是**开不开枪**的门。这里取中位数，
+#: 是**站不站住**的门：比真人常打中的距离还远时，真人是**压上去**的，
+#: 不是站在原地对着 1000 像素外放空枪。
+#:
+#: 用户 2026-09-03 报的「距离太远了 bot 就不动了」里有它一份：
+#: `Forest02` 那一局两个 bot 隔着 1010 像素互相「打得到·站住打」，
+#: 谁也打不中谁，站了 161 秒到时限（§176）。
+#: ★ 超过这个距离并**不**停火 —— 走位改成朝敌人压，扳机照旧由
+#:   `_fire_target()` 说了算（边走边打，真人也是这样）。
+BOT_HOLD_RANGE = 616.0
 
 
 def _in_sight(machine, x, y):
@@ -4108,15 +4159,6 @@ def _enemy_spot(room, machine, seat_index):
 BOT_RETREAT_RATIO = 1.25
 BOT_PRESS_RATIO = 0.80
 
-#: 一次后撤最多往回退多远（世界单位）。
-#:
-#: 出处是 §48 那份真人交战距离分布：命中距离 p10 = 264、中位 616。
-#: 退掉半个中位数 ≈ 一次有效的脱离，而不是「跑到图那头去」——
-#: 真人拉开距离也就是退一个屏幕宽的一半。
-BOT_RETREAT_SPAN = 320.0
-
-#: 找后撤落脚点时的扫描粒度 = A\* 的路点分辨率，省得挑出一个规划器分不开的点。
-BOT_RETREAT_STEP = botnav.KEY_X
 
 
 def _seat_weapon(room, seat_index):
@@ -4197,7 +4239,19 @@ def _stance(room, machine, seat_index, enemy_index, span):
 
     算不出来（对面还没露过面、这把枪够不着）时**保持原来的姿态** ——
     没有新事实就不做新决定。
+
+    ## ★★★★★ 自己的血先说话（D137，用户 2026-09-03）
+
+    「高于 50% 的 bot 无所顾忌，正常进攻，血量低于 25% 的 bot 要偏向保守。」
+    ⇒ 两头是**硬边界**，TTK 只在中间那一档说话。以前这两个数只管框外
+    （D119 的 `BOT_BLIND_*`），框内框外两套判据 —— 于是同一个 bot 走出
+    视野框姿态就翻一次。现在**同一套**。
     """
+    health = _seat_health(room, seat_index)
+    if health > BOT_HIGH_HEALTH:
+        return _set_stance(machine, "press")
+    if health < BOT_LOW_HEALTH:
+        return _set_stance(machine, "retreat")
     # ★★★ 两边喂的速度**故意不对称**，这不是笔误：
     #   * 「我要几秒打倒他」—— 他动多快是**外生**的事实，用实测速度；
     #   * 「他要几秒打倒我」—— 我动多快是**这个决定本身的结果**，
@@ -4213,61 +4267,53 @@ def _stance(room, machine, seat_index, enemy_index, span):
         return machine.stance
     if machine.stance == "retreat":
         if mine <= theirs * BOT_PRESS_RATIO:
-            machine.stance = "press"
-            machine.retreat_goal = None
+            return _set_stance(machine, "press")
     elif mine > theirs * BOT_RETREAT_RATIO:
-        machine.stance = "retreat"
-        machine.retreat_goal = None
+        return _set_stance(machine, "retreat")
     return machine.stance
 
 
-def _retreat_spot(room, machine, terrain, enemy):
-    """挑一个「离他更远、最好还有掩体」的落脚点；挑不出来返回 `None`。
+def _set_stance(machine, stance):
+    """姿态闩翻转时顺手把上一份走位目标作废；没翻就什么都不做。"""
+    if machine.stance != stance:
+        machine.stance = stance
+        machine.retreat_goal = None
+    return stance
 
-    从自己脚下**朝背离敌人的方向**一格一格往外扫，每一格问这一列有没有
-    够得着的站立面。第一个**把弹道挡住**的点直接选中（那就是掩体，
-    躲在它后面正是真人拉开距离时干的事）；一个掩体都没有就选扫到的最远点。
 
-    ⚠ 判「挡住没有」用的是 `line_blocked`（`blocks_bullet`，单向平台不挡
-    子弹，§29）—— 拿 `is_solid` 会把一根白线当掩体。
+def _keep_away_spot(room, machine, terrain, enemy):
+    """保守姿态这一格该站在哪 —— **离敌人正好半个屏幕**的那一点。
 
-    ## ★★★★★ 已经躲在掩体后面了 —— **答案就是脚下这一点**（V0.3 §165）
+    只在**前进轴**上取：`敌人.x ± BOT_KEEP_AWAY_SPAN`，符号是「我现在在他
+    哪一边」。y 取那一列够得着的站立面，取不到就沿用敌人的 y —— 走位只吃
+    x（`_walk_to()` 里 `direction` 只看 `delta_x`），A\* 再按真实地形找路。
 
-    `_blind_cover_spot()` 开头本来就有这一句（「已经在掩体后面，当前点就是
-    最近答案」），这儿一直漏着，后果是**每一格都挑出一个只有一个扫描格
-    （8 像素）远的「掩体」**：站着的人本来就被挡住了，往后挪 8 像素当然
-    还是被挡住，于是 `index=1` 那一格立刻 `return`。
+    ## ★★★★★ 为什么不是「找掩体」了（D137，用户 2026-09-03）
 
-    接着 `_retreat_done()` 一看「离目标只有 8 像素 ≤ `GOAL_X`(64)」判「退到了」
-    ⇒ 下一格重挑 ⇒ 又是 8 像素。而 bot 一格决策走 14~21 像素，**一步就迈过头**。
-    贴到图边时更糟：`cx < 0` 直接 `break`，挑不出任何点 ⇒ 走位改成朝敌人压上去
-    ⇒ 走回来又够得着一格了 ⇒ 再退。**三格一个循环 = 12 tick = 3 发心跳**，
-    正是实机量到的周期（`Esperan03` 01:11:14.989~17.815 座位 1
-    x = 3/7/10 来回、01:10:25.9~32.7 座位 5 同样；V0.3 §164 ③ 在图两边
-    都见过）。用户 2026-09-02：「好几个 bot 走路都感觉一卡一卡的。」
+    上一版是 `_retreat_spot()`：往背离敌人的方向扫 320，第一个挡得住弹道
+    的点就躲进去。它有一句「已经在掩体后面 ⇒ 答案就是脚下这一点」——
+    于是**目标 = 自己**，走位恒为「不动」，而且被掩体挡着还开不了枪。
+    线上四次「所有 bot 卡住不动」全出在这条路和它框外那个孪生兄弟上
+    （§175 / §176）。
+
+    这一版的目标点**跟着敌人走**：敌人一动，环就动，bot 就得跟着调整。
+    它不可能是静止点 —— 除非敌人也一动不动，而那时双方相距半个屏幕、
+    都在对方的交战距离（`BOT_ENGAGE_RANGE` = 1000）之内，会互相开枪，
+    血一掉姿态就翻。
     """
     body = machine.body
-    if body is None or terrain is None:
+    if body is None or enemy is None:
         return None
-    mx, my = _muzzle(body.x, body.y, enemy[0])
-    if terrain.line_blocked(mx, my, enemy[0], enemy[1] - BOT_MUZZLE_HEIGHT):
-        return (body.x, body.y)
-    away = 1.0 if body.x >= enemy[0] else -1.0
-    reach = botmove.walk_speed(_character_of(machine)) * botmove.CLIMB_SLOPE         * botmove.TICKS_PER_BEAT
-    farthest = None
-    steps = max(1, int(BOT_RETREAT_SPAN / BOT_RETREAT_STEP))
-    for index in range(1, steps + 1):
-        cx = body.x + away * BOT_RETREAT_STEP * index
-        if cx < 0 or cx >= terrain.width:
-            break
-        sy = botmove.surface_near(terrain, cx, body.y, reach)
-        if sy is None:
-            continue
-        farthest = (cx, float(sy))
-        mx, my = _muzzle(cx, sy, enemy[0])
-        if terrain.line_blocked(mx, my, enemy[0], enemy[1] - BOT_MUZZLE_HEIGHT):
-            return farthest                # 有掩体，就近躲进去
-    return farthest
+    side = 1.0 if body.x >= enemy[0] else -1.0
+    x = enemy[0] + side * BOT_KEEP_AWAY_SPAN
+    if terrain is not None:
+        x = max(1.0, min(float(terrain.width) - 2.0, x))
+        reach = (botmove.walk_speed(_character_of(machine))
+                 * botmove.CLIMB_SLOPE * botmove.TICKS_PER_BEAT)
+        surface = botmove.surface_near(terrain, x, body.y, reach)
+        if surface is not None:
+            return (float(x), float(surface))
+    return (float(x), float(enemy[1]))
 
 
 def _clear_navigation(machine, failed=None):
@@ -4734,15 +4780,31 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     # ★★★ 逼近还是拉开（M5-C）—— 用户 2026-08-29 要的那条「按双方血量判断」。
     #     判据在 `_stance()`：照这样打下去谁先倒。
     fast_run = False
-    if _stance(room, machine, seat_index, enemy_index,
-               enemy_span) == "retreat":
-        goal = machine.retreat_goal
-        if goal is None or _retreat_done(body, goal, spot):
-            goal = _retreat_spot(room, machine, terrain, spot)
+    stance = _stance(room, machine, seat_index, enemy_index, enemy_span)
+    if stance == "retreat":
+        # ★★★★★ **保守 = 别让自己处在半个屏幕以内**（D137，用户 2026-09-03：
+        #   「会主动拉开跟敌人的距离，尽量避免主动进入敌人 1/2 屏幕范围内」）。
+        #   以前这儿是「退 320，最好找个掩体躲进去」—— 而掩体点算出来常常
+        #   就是**自己脚下**（老 `_retreat_spot()` 开头那一句），于是走位恒为
+        #   「不动」、又被掩体挡着开不了枪，一站就是一整局（§176）。
+        #
+        # ★★★ 门上那句 `target is not None` 不是可有可无的：
+        #   **「保持距离」的前提是「我在这个距离上打得到他」**。打不到还退，
+        #   就成了「退出去 → 打不到 → 压回来 → 又太近 → 再退」每格一个
+        #   来回的极限环（§174 那个型）。打不到就先压到打得到为止，
+        #   打得到之后这一条自然把它推回半个屏幕外。
+        if target is not None and enemy_span < BOT_KEEP_AWAY_SPAN:
+            goal = _keep_away_spot(room, machine, terrain, spot)
             machine.retreat_goal = goal
-            _clear_navigation(machine)
-        if goal is None:
-            # 退无可退（图边 / 没有落脚点）——那就照旧打，别原地发呆。
+            if goal is not None:
+                # ★ 脱离时按着右键跑（`FastRunRate`）—— 体力够才跑，
+                #   这是原版的开关，不是我们加的动作。
+                return _src(machine, "拉开距离",
+                            _unstall(room, machine, terrain, goal,
+                                     _walk_to(room, machine, terrain, goal,
+                                              _may_fast_run(machine)),
+                                     None), goal=goal)
+            # 退无可退（没身体 / 没地形）——那就照旧打，别原地发呆。
             #
             # ★★★ **不改写姿态闩**（V0.3 §165）。以前这儿写一句
             #   `machine.stance = "press"`，可「退无可退」是**地形**事实，
@@ -4750,13 +4812,9 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
             #   一算，照旧说「该退」，于是闩每一格翻一次，两道迟滞门
             #   （`BOT_RETREAT_RATIO` / `BOT_PRESS_RATIO`）形同虚设。
             #   闩留在 `retreat` 上，回 `press` 就得真的「明显更占便宜」，
-            #   这才是那两个数当初的意思。走位这一格照旧朝敌人走，一个字没变。
-            pass
+            #   这才是那两个数当初的意思。走位这一格照旧朝敌人走。
         else:
-            spot = goal
-            # ★ 脱离时按着右键跑（`FastRunRate`）—— 体力够才跑，
-            #   这是原版的开关，不是我们加的动作。
-            fast_run = _may_fast_run(machine)
+            machine.retreat_goal = None
     else:
         machine.retreat_goal = None
         # ★★ **主动捡道具**（M5-F）：这一枪打不出去（`target is None`）的时候
@@ -4766,59 +4824,70 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
                                                           seat_index)
         if item is not None and item[0] < enemy_span:
             spot = item[1]
-        elif target is not None:
-            # 打得到就站住打（老规则，D50）。★ 只在**逼近**姿态下成立：
-            #   拉开的时候真人也是一边退一边打的。
-            _clear_navigation(machine)
-            return _src(machine, "打得到·站住打", (0, False, False, False))
+    if target is not None and enemy_span <= BOT_HOLD_RANGE:
+        # ★★ 打得到就站住打（老规则，D50）—— ★ 但**只在真人真的打得中的
+        #   距离之内**（`BOT_HOLD_RANGE` = §48 的命中距离中位数）。
+        #   再远就压上去边走边打：扳机照旧归 `_fire_target()` 管，站不站住
+        #   归这一句管。用户 2026-09-03「距离太远了 bot 就不动了」里有它
+        #   一份 —— `Forest02` 那一局两个 bot 隔着 1010 像素互相「站住打」，
+        #   谁也打不中谁，站了 161 秒到时限（§176）。
+        _clear_navigation(machine)
+        return _src(machine, "打得到·站住打", (0, False, False, False))
     return _src(machine, "朝目标走",
-                _walk_to(room, machine, terrain, spot, fast_run), goal=spot)
+                _unstall(room, machine, terrain, spot,
+                         _walk_to(room, machine, terrain, spot, fast_run),
+                         target), goal=spot)
 
 
-def _blind_cover_spot(machine, terrain, bearing):
-    """只拿“上/下/左/右”粗方向找一个掩体点。
+def _side_toward(body, spot):
+    """`spot` 在我左边还是右边（`-1/0/1`）—— `_blind_walk()` 的探路侧。"""
+    delta = spot[0] - body.x
+    return 0 if abs(delta) < 1.0 else int(math.copysign(1, delta))
 
-    候选仍是原版地形的站立面；“躲住了没有”仍用
-    `line_blocked()`（单向平台不挡子弹）。有掩体就选离自己最近的，
-    一处都没有就选离粗方向最远的可站点；精确敌人坐标自始至终
-    没有进入这个函数。
+
+def _unstall(room, machine, terrain, spot, intent, target):
+    """走位算不出动作时**横着挪一步去找路**（D137：「禁止站在一个地方不动」）。
+
+    ## 现场
+
+    敌人就在正上方 / 正下方时 `|Δx|` 只有几像素，而 `_walk_to()` 是个
+    bang-bang 控制器、一次决策要走 14~21 像素 —— 它在 ±1 和 0 之间空转，
+    人一格都不挪。`Forest00` 那个离线复现最干净：(966, 442) 对着 (957, 646)，
+    60 格决策**净位移 0**，两个 bot 就这么杵着。A\* 这时候常常也给不出
+    上下层的路（一张图的可达分量往往只覆盖一半，§137）。
+
+    真人这时候是**横着走去找上去 / 下去的那条路**的 —— 和 D119 给框外
+    竖直粗方位补的那条出路（`_blind_probe_intent()`）是同一件事，
+    只是那条只挂在「视野里没敌人」那一支上，看得见人的这一支一直缺着。
+
+    ## 闩
+
+    方向**闩住**（`machine.probe_side`）。不闩的话目标那几像素的横向分量
+    每格把它拽回来，就成了 §174 那种极限环。解闩全是**事件**（铁律 10）：
+
+    * 走位重新给得出**跳 / 下落** —— 上下层的路找到了，走它；
+    * **打得到人了**（`target`）—— 位置已经够好，不用再挪；
+    * 这一侧**走不动了**（撞墙 / 前面是无底洞，`_blind_probe_intent`
+      返回 `None`）。
     """
     body = machine.body
-    if body is None or terrain is None or bearing is None:
-        return None
-    who = _character_of(machine)
-    # 已经在掩体后面，当前点就是最近答案。
-    mx, my = _muzzle(body.x, body.y, bearing[0])
-    if terrain.line_blocked(mx, my, bearing[0],
-                            bearing[1] - BOT_MUZZLE_HEIGHT):
-        return (body.x, body.y)
-    reach_y = (botmove.walk_speed(who) * botmove.CLIMB_SLOPE
-               * botmove.TICKS_PER_BEAT)
-    covers = []
-    fallback = []
-    steps = max(1, int(BOT_RETREAT_SPAN / BOT_RETREAT_STEP))
-    for index in range(1, steps + 1):
-        for direction in (-1, 1):
-            cx = body.x + direction * BOT_RETREAT_STEP * index
-            if cx < 0 or cx >= terrain.width:
-                continue
-            sy = botmove.surface_near(terrain, cx, body.y, reach_y)
-            if sy is None or not botmove.fits(terrain, cx, sy, who):
-                continue
-            point = (float(cx), float(sy))
-            from_here = math.hypot(point[0] - body.x, point[1] - body.y)
-            from_bearing = math.hypot(point[0] - bearing[0],
-                                      point[1] - bearing[1])
-            px, py = _muzzle(point[0], point[1], bearing[0])
-            if terrain.line_blocked(px, py, bearing[0],
-                                    bearing[1] - BOT_MUZZLE_HEIGHT):
-                covers.append((from_here, -from_bearing, point))
-            fallback.append((from_bearing, -from_here, point))
-    if covers:
-        return min(covers, key=lambda row: (row[0], row[1], row[2]))[2]
-    if fallback:
-        return max(fallback, key=lambda row: (row[0], row[1], row[2]))[2]
-    return None
+    if (body is None or intent[1] or intent[2] or target is not None
+            or (abs(spot[0] - body.x) <= botnav.GOAL_X
+                and abs(spot[1] - body.y) <= botnav.GOAL_Y)):
+        # ★ 最后那一句是「**已经到了**」：站在目标上不动不是卡住，是到位了
+        #   （真人 39% 的心跳就是站着不动的，§71）。少了它，「打不到我就
+        #   别乱动」那条会被这里带跑。
+        machine.probe_side = 0
+        return intent
+    if intent[0] and not machine.probe_side:
+        return intent                       # 正常走着，没卡住
+    side = machine.probe_side or _side_toward(machine.body, spot)
+    probe = _blind_probe_intent(room, machine, terrain, side)
+    if probe is None:
+        machine.probe_side = 0
+        return intent
+    machine.probe_side = probe[0]
+    return probe
 
 
 def _blind_probe_intent(room, machine, terrain, side):
@@ -4853,11 +4922,18 @@ def _blind_probe_intent(room, machine, terrain, side):
 
 
 def _blind_walk(room, machine, terrain, spot, side, fast_run):
-    """框外走位专用的 `_walk_to()`：算出来一动不动就横着探一步。"""
+    """框外走位专用的 `_walk_to()`：算出来一动不动就横着探一步。
+
+    ★ 探路方向和 `_unstall()` 共用同一个闩（`machine.probe_side`，D137）：
+      不闩的话每格重挑一次，目标那点横向分量会把它拽回来（§174 那个型）。
+    """
     intent = _walk_to(room, machine, terrain, spot, fast_run)
     if intent[0] or intent[1] or intent[2]:
+        machine.probe_side = 0
         return intent
-    probe = _blind_probe_intent(room, machine, terrain, side)
+    probe = _blind_probe_intent(room, machine, terrain,
+                                machine.probe_side or side)
+    machine.probe_side = 0 if probe is None else probe[0]
     return intent if probe is None else probe
 
 
@@ -4919,8 +4995,7 @@ def _note_idle(machine, why):
         machine.log("   ◆又动起来了")
 
 
-def _blind_intent(room, machine, seat_index, terrain, spawn_fallback=True,
-                  may_hide=True):
+def _blind_intent(room, machine, seat_index, terrain, spawn_fallback=True):
     """**视野里没有敌人**的那一帧往哪走（V0.3 §127 / §128）。
 
     两种情形，用户 2026-08-30 各报了一条：
@@ -4937,7 +5012,23 @@ def _blind_intent(room, machine, seat_index, terrain, spawn_fallback=True,
       提前占住那儿是有依据的走位，不是我们发明的战术评分。
 
     ★ 道具模式里地上的东西照旧优先（`_item_goal`）—— 没人打的时候正是
-      去捡道具的时候，这条本来就在（M5-F），只是以前这一帧根本走不到。
+      去捡道具的时候（M5-F）。
+
+    ## ★★★★★ 这儿**再也没有「躲」这个动作**（D137，用户 2026-09-03）
+
+    「无论怎样，全都主动寻找并接近敌人，禁止站在一个地方不动。」
+
+    以前这一支里有 D119 那条：血 < 25% 就去找掩体、蹲在后面不动。它是个
+    **没有出口的停机状态** —— 一躲下去位置不变、血不会自愈（原版里只有
+    `HpChargeItem` 能加血）、粗方位也不变，于是「什么时候不躲了」这个
+    条件永远不成立。线上四次「所有 bot 卡住不动」全是它（§175 / §176）：
+    `Iceria00` 四个 bot 停 129.6 秒、`Forest02` 三个 bot 停 161 秒、
+    `Forest00` 两个 bot 分别停 81.8 / 144.9 秒。
+
+    血量照旧影响姿态（`_stance()` 里那两道门），但**框外这一支不再据此
+    改变动作** —— 不管什么姿态都朝粗方位挪。保守那一档的「拉开距离」
+    只在**看得见敌人**的时候才有意义（要有一个真实坐标才谈得上距离），
+    那是 `_move_intent()` 里 `_keep_away_spot()` 的事。
     """
     body = machine.body
     if body is None:
@@ -4946,58 +5037,28 @@ def _blind_intent(room, machine, seat_index, terrain, spawn_fallback=True,
     rough = _rough_bearing_raw(room, machine, seat_index)
     if rough is not None:
         spot, side = rough
+        # ★ 姿态照旧按血量记（`_stance()` 同一套门）—— 一进视野框就是对的，
+        #   不用等下一次交火再翻。**但这一支的动作和姿态无关**：一律朝
+        #   粗方位挪（D137）。
         health = _seat_health(room, seat_index)
-        if not may_hide:
-            # ★ boss 房不许躲（`_boss_fight_intent` 传的）：那儿的门要打死
-            #   boss 才开，两个 bot 一起躲起来就是把这一关钉死（同 §141
-            #   「boss 房里没有推进进度这回事」的口径）。
-            machine.stance = "press"
-            machine.retreat_goal = None
-        elif health < BOT_BLIND_HIDE_BELOW:
-            machine.stance = "retreat"
-            machine.retreat_goal = None
-        elif health > BOT_BLIND_PRESS_ABOVE:
-            machine.stance = "press"
-            machine.retreat_goal = None
+        if health > BOT_HIGH_HEALTH:
+            _set_stance(machine, "press")
+        elif health < BOT_LOW_HEALTH:
+            _set_stance(machine, "retreat")
         # 25%..50% 一字不动：保持上一姿态，这就是滞回。
-        if may_hide and machine.stance == "retreat":
-            goal = machine.retreat_goal
-            if goal is None or _retreat_done(body, goal, spot):
-                goal = _blind_cover_spot(machine, terrain, spot)
-                machine.retreat_goal = goal
-                _clear_navigation(machine)
-            if goal is not None:
-                if (abs(goal[0] - body.x) <= botnav.GOAL_X
-                        and abs(goal[1] - body.y) <= botnav.GOAL_Y):
-                    # 已经蹲在掩体后面了 —— 这时候站住不动**就是**
-                    # 正确动作，别拿探路把自己从掩体后面赶出去。
-                    _clear_navigation(machine)
-                    _note_idle(machine, "躲在掩体后面（血 %.0f%%）" % (health * 100))
-                    return (0, False, False, False)
-                _note_idle(machine, None)
-                return _blind_walk(room, machine, terrain, goal, -side,
-                                   _may_fast_run(machine))
-            # 真没有任何可站候选才允许停；这是“无合法动作”，
-            # 不是视野空了就发呆。
-            _clear_navigation(machine)
-            _note_idle(machine, "低血量想躲，可一处可站的掩体候选都没有"
-                                "（血 %.0f%%）" % (health * 100))
-            return (0, False, False, False)
         _note_idle(machine, None)
-        machine.retreat_goal = None
         item = _item_goal(room, machine, seat_index)
         if item is not None and item[0] < math.hypot(spot[0] - body.x,
                                                      spot[1] - body.y):
             spot = item[1]
-            side = (0 if abs(spot[0] - body.x) < 1.0
-                    else int(math.copysign(1, spot[0] - body.x)))
+            side = _side_toward(body, spot)
         return _blind_walk(room, machine, terrain, spot, side, False)
 
     # 一个活敌人都没有：PVP 去敌方出生点等；任务模式由
     # `_coop_intent` 照带头真人/活动带继续处理，不凭空发明巡逻点。
     # ★ 姿态复位放在这里（以前在 `_move_intent` 调用点上）：没有敌人
     #   就无所谓逼近/后撤，留着上一轮的 `retreat_goal` 只会让人绕远。
-    machine.stance = "press"
+    _set_stance(machine, "press")
     machine.retreat_goal = None
     if not spawn_fallback:
         return None
@@ -5507,11 +5568,10 @@ def _boss_fight_intent(room, machine, seat_index, terrain, target):
     visible = [row for row in live_mobs(room)
                if _in_sight(machine, row[0], row[1])]
     if not visible:
-        # ★ `may_hide=False`：boss 房的门要**打死 boss 才开**，血少了
-        #   躲起来等于把这一关钉死（§141 那条「boss 房里没有推进进度
-        #   这回事」的另一半）。粗方位照给，只是不许转隐蔽。
+        # ★ 粗方位照给。（以前这儿还要传 `may_hide=False` 把「躲」关掉，
+        #   现在框外这一支本来就不躲了，D137。）
         blind = _blind_intent(room, machine, seat_index, terrain,
-                              spawn_fallback=False, may_hide=False)
+                              spawn_fallback=False)
         if blind is not None:
             return blind
     spot = _nearest_mob(room, body)
@@ -5521,6 +5581,21 @@ def _boss_fight_intent(room, machine, seat_index, terrain, target):
         # 开不了枪（没有句柄），至少走位该朝它去。
         quest = None if room is None else room.quest
         spot = getattr(quest, "boss_gun", None)
+    if spot is None:
+        # ★★★★★ **boss 在哪还不知道 —— 跟着带头的真人走，不许站着**
+        #   （D137，用户 2026-09-03：「任务模式到了 boss 房后又不动了」）。
+        #
+        #   服务端手上 boss 的坐标只有两个来源，**两个都要别人先动手**：
+        #   `note_mob_hit()`（有人打中过它）和 `quest.boss_gun`（它自己开过
+        #   枪）。以前这儿是「两个都没有就站住等」—— 而 bot 站着就不会打到
+        #   boss，不打到就永远没有采样，**它自己就是自己解锁条件的否定**
+        #   （§160 家族）。唯一的出口是真人先打中一枪。
+        #
+        #   出口换成「跟着带头的真人」：那是闯关房本来就在用的目标
+        #   （`_coop_goal`，D103/D114），真人知道 boss 在哪、正朝它走，
+        #   跟过去必然进 boss 的视野框，然后 `live_mobs` / `boss_gun`
+        #   就有内容了。不是新战术，是把闯关房的老规则借回来一格。
+        spot = _coop_goal(room, machine, seat_index, terrain)
     if spot is None:
         _clear_navigation(machine)
         return (0, False, False, False)
@@ -5684,18 +5759,6 @@ def _leash_warp(room, machine, seat_index, terrain, spot, behind, why):
                       f"　落后 {behind:.0f}，{why}")
         return True
     return False
-
-
-def _retreat_done(body, goal, enemy):
-    """这个后撤落脚点是不是该换一个了。
-
-    两种情形：**已经退到了**，或者**敌人绕到了另一边**（原来的落点现在
-    是朝着他走）。判据都是位置事实，没有计时器。
-    """
-    if (abs(body.x - goal[0]) <= botnav.GOAL_X
-            and abs(body.y - goal[1]) <= botnav.GOAL_Y):
-        return True
-    return (goal[0] - body.x) * (enemy[0] - body.x) > 0.0
 
 
 def _decide(room, machine, seat_index, terrain, now, tick):
