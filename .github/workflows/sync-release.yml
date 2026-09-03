@@ -18,4 +18,4 @@ jobs:
             github_owner: liubz102
             github_repo: popshot-reborn
             gitee_upload_retry_times: 3
-            debug: false
+
