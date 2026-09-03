@@ -99,6 +99,16 @@
 # 现在**不会再生成**这个文件。留着这两行只为挡住那阵子留下的残留文件。
 /server/data/tickets.json
 /server/data/tickets.json.*.tmp
+# shop / recipe / drops：商店上架与价格、合成配方、材料掉落（V0.3 D7）。
+# 它们是**运营配置，不是产物** —— 服务端首次启动时按内置默认生成，
+# 之后由用户手改或在管理页 /admin 里改，升级时**绝不覆盖**。
+# ★ 原版数据的只读镜像是 server/shop_items.json，那个要进 git、进包，别混。
+/server/data/shop.json
+/server/data/shop.json.*.tmp
+/server/data/recipe.json
+/server/data/recipe.json.*.tmp
+/server/data/drops.json
+/server/data/drops.json.*.tmp
 
 # config\server.config 是**本机玩家自己填的**联机服务器地址（可能是内网 IP 或
 # 私人域名），不进仓库。模板在 server/config.py 的 DEFAULT_CONFIG_TEXT 里：

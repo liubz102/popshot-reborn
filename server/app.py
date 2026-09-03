@@ -44,6 +44,7 @@ import config as server_config
 import eventlog
 import gameserver
 import logcleanup
+import shopcfg
 import udpsync
 import versioning
 from account_store import AccountStore
@@ -234,6 +235,27 @@ def _report_level_realign(accounts):
         eventlog.online(tail)
 
 
+def _report_shop_config():
+    """三份运营配置（商店 / 合成 / 掉落）缺文件就生成一份默认的。
+
+    ★ **已存在的一律不覆盖**（V0.3商店 D7）：这三份是用户手改或在
+    `/admin` 里改的运营数据，升级时盖掉等于把定价和配方抹了（铁律 11）。
+
+    ★ **按状态翻转说话**：生成过一次之后每次启动都是空结果，一行都不打。
+    """
+    try:
+        created = shopcfg.ensure_files()
+    except Exception as error:              # noqa: BLE001 —— 配置写不出也不该拦住开服
+        log(f"⚠ 商店配置生成失败（{error!r}）；商店会是空的，游戏其余部分照常")
+        return
+    if not created:
+        return
+    head = ("商店配置: 新建了 " + "、".join(created)
+            + f"（在 {shopcfg.DATA_DIR}；改完保存即刻生效，不用重启）")
+    log(head)
+    eventlog.online(head)
+
+
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
 
@@ -286,6 +308,10 @@ def main(argv=None):
     # 那一份流水里，否则重启一次就再也查不到「谁从几级变成了几级」。
     # 只在服务端真的启动时跑，那时没人在线；幂等，清单为空就一个字都不打。
     _report_level_realign(accounts)
+
+    # 商店 / 合成 / 掉落这三份运营配置：缺文件才生成，已有的一律不动。
+    # 和上面一样排在 `eventlog.configure` 之后，让「新建了哪几份」留在流水里。
+    _report_shop_config()
 
     # 日志清理（D113）。**只在服务端真的启动时跑这一次** —— 启动脚本发现
     # 服务端已在运行而跳过启动时，这里根本不会被执行到，正合需求。

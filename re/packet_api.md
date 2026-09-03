@@ -30,7 +30,7 @@
 | [0](#0-怎么读这份表) | 怎么读这份表（**可信度标记** / 三条铁律 / 类名的来路 / vftable 槽位）|
 | [1](#1-通用基础) | 通用基础：三条链路、帧格式、`UdpPacket` 头、**流读写原语表**、**同号反向对照表**、绝对不要发的包 |
 | [2](#2-游戏服客户端--服务端gcp) | **客户端 → 服务端（gcp）逐包**：参数 + 必须回什么 |
-| [3](#3-游戏服服务端--客户端gsp) | **服务端 → 客户端（gsp）逐包**：参数 + 客户端拿它干什么 |
+| [3](#3-游戏服服务端--客户端gsp) | **服务端 → 客户端（gsp）逐包**：参数 + 客户端拿它干什么。★ **§3.8 = 商店 / 合成 / 仓库段**（全 🔍静态）|
 | [4](#4-原版-tcp-中继rcp) | 原版 TCP 中继（rcp）|
 | [5](#5-udppacket-的内层-opcode) | `UdpPacket` 的内层 opcode（`rpFire` / 心跳 …）|
 | [6](#6-共享结构体) | 共享结构体：`SessionSlot` / `SessionDescriptor` / `Session` / `UserSnap` / 物件 id / 属性号 |
@@ -299,6 +299,9 @@ V0.1/V0.2 踩过的坑里有相当一部分就是「望文生义地按名字猜�
 | `0x0413` | `gcpRespawnCharacter` 复活请求 | `gspCreateObject` 建物件 | —— |
 | `0x0414` | `gcpRepFirstAidBox` | `gspChangeControllerSlot` 控制权交接 | —— |
 | `0x0417` | `gcpMarkQuestSuccess` 通关上报 | `gspRepChangeToNextMap` 换图放行 | —— |
+| `0x0505` | `gcpAccumulatedWeaponDamage` 累计伤害上报 | **`gspRepCompositionList` 合成配方列表**（§3.8）| 把配方发成伤害统计 |
+| `0x0604` | **装备 / 卸下请求**（`i32,i32`，§3.8）| **`gspRepEquippedList` 装备清单**（§3.8）| —— |
+| `0x0700` / `0x0704` | 进商店时的两发**空载荷**请求（§3.8）| ❓ | —— |
 
 ### 1.6 绝对不要发的包
 
@@ -954,8 +957,10 @@ opcode 分段（V0.1 §45）：
 | opcode | 类名 | vftable | 现状 |
 |---|---|---|---|
 | `0x0505` | `Packet_gcpAccumulatedWeaponDamage` | `0x65e0c8` | ❓载荷未知。名字 = 「累计武器伤害」统计上报，未观测 |
-| `0x0606` | `Packet_gcpReqComposeItem` | `0x66629c` | ❓未观测（道具合成）|
-| `0x0607` | `Packet_gcpReqGiftList` | `0x666128` | ❓未观测（礼物列表）|
+| `0x0605` | `Packet_gcpReqCompositionList` | `0x6660f8` | 🔍静态：`u8+i32+u16+i32`，进商店时发，回 `0x0505`。见 §3.8 |
+| `0x0606` | `Packet_gcpReqComposeItem` | `0x66629c` | 🔍静态：单 `i32`，回 `0x0506`。见 §3.8 |
+| `0x0607` | `Packet_gcpReqGiftList` | `0x666128` | 🔍静态：进商店时客户端主动发。见 §3.8 |
+| `0x0602` / `0x0603` / `0x0604` / `0x0704` | （无 RTTI 类）| — | 🔍静态：购买 / ? / 装备卸下 / 要装备清单。见 §3.8 |
 | `0x0609` | `Packet_gcpReqGiftAction` | `0x66611c` | ❓未观测 |
 | `0x0705` | `Packet_gcpReqMyInfo` | `0x6917e4` | ❓未观测（个人信息）|
 | `0x0800` | `Packet_gcpReqMoveChannel` | `0x691698` | ❓未观测（切频道）|
@@ -1780,6 +1785,37 @@ setsockopt([0x72e30c]+8, IPPROTO_TCP, TCP_NODELAY, &flag, 4)   ; 顺手关 Nagle
 （看门狗）时要填**这个座位自己**的角色 id。
 ⚠ 乱发这个包会被客户端判成作弊 → 收到 `0x0106 gcpReportHack`（V0.1 §88）。
 
+#### `0x041c` gspRewardReceived（vft `0x670c70`，Deserialize `0x54c5d0`，处理器 `0x493ed1`）
+
+★★★ **结算界面「合成材料」/「称号卡片」那两个物件槽的唯一数据源**
+（V0.3商店 §3；**纠正 V0.1 §99「数据源没跟到」** —— 当年猜的 `0x48e5a8`
+其实在画角色立绘）。**4 个 int32**，和 `0x0419` 共用同一个反序列化器：
+
+| 线偏移 | 类型 | 含义 | 可信度 |
+|---|---|---|---|
+| `+0x00` | int32 | **座位号** | 🔍静态 |
+| `+0x04` | int32 | ★★ **槽类型**：`0` = 合成材料栏，`1` = 称号卡片栏 | 🔍静态 |
+| `+0x08` | int32 | ★ **物品 id** | 🔍静态 |
+| `+0x0c` | int32 | ★ **数量** | 🔍静态 |
+
+落到 `[GameContext + 0x74 + 座位*20]`（材料）/ `[GameContext + 0xec + 座位*20]`（卡片）。
+取出用 `0x48c9be(座位)` / `0x48c9dd(座位)`；绘制 `0x48b7a1` 遍历（元素 `+4`=itemId、`+8`=数量），
+itemId → ItemDB `[0x72e1dc]`(`0x415a94`) → `+0x14` 图标路径 → `0x5c5e14` 载入贴图。
+标签文字来自 `0x48e7cd` 的 `L"ITEM_클리어리절트"`（`0x670f14`，`Chinese.ini` 译作「合成材料」）。
+
+**三条硬约束**：
+
+1. ★★ **必须排在 `0x0411 gspEndGame` 之前发** —— 它写的是 `GameContext`，
+   关卡一结束就变 0（和 `0x0309` 同一个约束，V0.1 §99）。
+   ⇒ 结算发包顺序：**`0x041c` × N → `0x0309` → `0x0411`**。
+2. `0x493f24` 是 `add [entry], count` ⇒ **同一个 itemId 发多次会累加**。
+   服务端每种物品发一发即可，不用自己合并。
+3. ★ **物品 id 必须在 `Data/ShopItem-Chn.ini` 里真有 `[Item-*]` 节**，
+   否则 ItemDB 查不到、图标画不出来（全部合成材料都有，已核对）。
+
+opcode 出处：`0x493808` 的分发链 `sub 0x406 / dec / sub 0xb / dec / dec / sub 8`
+⇒ `0x0406`、`0x0407`、`0x0412`、`0x0414`、**`0x041c`**。
+
 ---
 
 ### 3.5 其它段
@@ -1851,7 +1887,7 @@ setsockopt([0x72e30c]+8, IPPROTO_TCP, TCP_NODELAY, &flag, 4)   ; 顺手关 Nagle
 | `Packet_gspReqGameGuard` / `gspReqHackShieldCheck` | `0x690abc` / `0x691844` | 反作弊质询 |
 | `Packet_gspReqUpdateDurability` | `0x691680` | 耐久度 |
 | `Packet_gspReserveJoinAfterMove` | `0x6918ec` | 切频道后预约进房 |
-| `Packet_gspRewardPopup` / `gspRewardReceived` | `0x6917d8` / `0x670c70` | 奖励弹窗 |
+| `Packet_gspRewardPopup` | `0x6917d8` | 奖励弹窗 |
 | `Packet_gspToggleSendReplay` | `0x65e0ec` | 录像开关 |
 | `Packet_gspUpdateQuestDifficulty` | `0x691674` | 🤔疑似 `0x0416`（V0.1 §118：**会弹一个没读过的通知窗，别拿它改难度解锁**）|
 | `Packet_gspUsableItemList` | `0x6915e4` | 商城消耗品清单，处理器 `0x553f0e`，格式 `u16 个数 + n×(int32 id, int32 数量)`，只认 `210001`/`210002`。**opcode ❓未确认** |
@@ -1880,8 +1916,70 @@ setsockopt([0x72e30c]+8, IPPROTO_TCP, TCP_NODELAY, &flag, 4)   ; 顺手关 Nagle
 | `Packet_gcpReqResetRoomTitle` | `0x664fa0` | 改房名 |
 | `Packet_gcpReqWhisperMsg` | `0x6916ec` | 私聊 |
 | `Packet_gcpSetGuildKey` | `0x6916d4` | 公会 |
-| `Packet_gcpReqCompositionList` | `0x6660f8` | 合成配方列表 |
+| `Packet_gcpReqCompositionList` | `0x6660f8` | 合成配方列表，见 §3.8（opcode `0x0605`）|
 | `Packet_gcpEndQuest` | `0x673af0` | 已用，见 `0x040f` |
+
+---
+
+### 3.8 ★ 商店 / 合成 / 仓库段（ShopStage）—— **全部 🔍静态，一发都没实测过**
+
+V0.3商店 §4 逆出来的。**在实机跑通之前，这一节里没有一个 ✅** ——
+按它写代码可以，但**别把它当实测结论引用**。
+
+**分发器**：`ShopStage` vft `0x666164` 的槽 `+0xc4`，跳表 `@0x44434a`，
+覆盖 `0x0500..0x050c` + `0x0604`。⇒ **这些包只在玩家打开商店界面时才有人处理**，
+和主分发树 `0x54e40c` 是两层。
+
+**★ 进商店时客户端连发四个请求**（ShopStage ctor `0x444009`~`0x44402c` 顺序调用）：
+
+| 顺序 | 发送函数 | opcode | 载荷 | 期望应答 |
+|---|---|---|---|---|
+| 1 | `0x44722b` | **`0x0704`** | **无正文** | `0x0604 gspRepEquippedList` |
+| 2 | `0x447467` | **`0x0605`** `gcpReqCompositionList` | `u8 + i32 + u16 + i32`（11 字节）| `0x0505` |
+| 3 | `0x44792d` | **`0x0607`** `gcpReqGiftList` | ❓ | ❓（不做礼物也要回，否则可能卡界面）|
+| 4 | `0x5541c1` | **`0x0700`** | **无正文** | ❓（V0.1 §50 记过大厅也在轮询它）|
+
+**服务端 → 客户端**
+
+| opcode | 类 / vft | 线格式 | 处理器 |
+|---|---|---|---|
+| `0x0500` | `gspRepShopItemList` `0x666290` | `i32, i32, i32 n, n×Item@ShopStock{i32,i32,i32}`（步长 `0x10`，Des `0x54c47e`）| `0x445ed9` |
+| `0x0502` | `gspRepItemBuy` `0x666158` | `i32 ok, i32, i32`（12 字节，Des `0x54c891`）| `0x44615b` |
+| `0x0505` | `gspRepCompositionList` `0x6662a8` | `i32, i32, i32 n, n×CompositionRule`（Des `0x443ae1`）| `0x4474e4` |
+| `0x0506` | `gspRepComposeItem` `0x66623c` | 单 `i32`（通用 stub `0x404ef7`）| `0x4476c4` |
+| `0x0604` | `gspRepEquippedList` `0x666248` | 见下 | `0x447278` |
+| `0x0503` / `0x0504` | ❓ | ❓ | `0x446700` / `0x446b62` |
+| `0x0508`~`0x050c` | ❓（礼物 / 修理 / 丢弃一类）| ❓ | `0x44798d` `0x447c08` `0x448072` `0x4468bc` `0x448849` |
+| `0x0501` / `0x0507` | 跳表指向 default ⇒ **客户端不处理** | — | — |
+
+**客户端 → 服务端**（都是「无 RTTI 类」，用裸序列化函数发）
+
+| opcode | 线格式 | Ser | 发送点 | 语义 |
+|---|---|---|---|---|
+| `0x0602` | `i32 n, n×i32` | `0x55938f` | `0x446115` | **购买**（回 `0x0502`）🔍 |
+| `0x0603` | `i32` | `0x5593f3` | `0x4466d2` | ❓（大概率回 `0x0503`）🤔 |
+| `0x0604` | `i32, i32` | `0x5593cb` | `0x446f5b`（`ret 8`）| **装备 / 卸下** 🤔（同号反向）|
+| `0x0606` | `i32` | SetType `0x44768a` | `0x44765c` | **合成**（回 `0x0506`）🔍 |
+| `0x0601` | `i32 n, n×i32, u8` | `0x559318` | `0x5540e2` | ❓不在商店模块里 |
+
+**子结构**
+
+- `CompositionMaterial`（vft `0x666104`，Des `0x4438dc`）= `i32 itemId + u16 count`（**6 字节**）
+- `CompositionRule`（vft `0x666254`，Des `0x44394d`，内存 `0x20`）
+  = `i32 + i32 + i32 n + n×CompositionMaterial + i32 + i32`
+- `ShopStock`（vft `0x666278`，Des `0x44360a`）
+  = `i32 + wstr + i32 + i32 + i32 + wstr + i32 + vector<…>`
+  ⚠ **`0x0500` 的元素不是它**（步长对不上）
+
+**❓ 最大的残余不确定：货架目录到底走哪个 opcode。**
+`0x0500` 的元素只有 3 个 int，装不下名字和价格；有两个 `wstr` 的 `ShopStock`
+才像货架目录。⇒ 实机时依次试 `0x0500` / `0x0503` / `0x0504`。
+
+**★★ 让装备加成生效的是 `0x030b`，不是 `0x0604`。**
+`0x0604` 处理器落到 `[ShopStage+0x134/0x138]`（只影响商店界面）；
+`0x030b` 处理器落到 `[GameSession + 0x250 + 座位*4]`，那才是战斗里
+`0x407014 GetEquipBonus` 读的地方（V0.3商店 §1）。
+`0x0604` 还会先过一道 `test byte ptr [eax+0x10], 8`（只有「可装备」标志的才 Equip）。
 
 ---
 
@@ -3321,7 +3419,7 @@ vft `0x665374`，Deserialize `0x43cf5c`，每项 0x14 字节：
 | `Packet_gspReserveJoinAfterMove` | `0x6918ec` | ❓ |
 | `Packet_gspRespawnCharacter` | `0x6916b0` | `0x0419` |
 | `Packet_gspRewardPopup` | `0x6917d8` | ❓ |
-| `Packet_gspRewardReceived` | `0x670c70` | ❓ |
+| `Packet_gspRewardReceived` | `0x670c70` | `0x041c` |
 | `Packet_gspSlotEquippedList` | `0x65e0f8` | `0x030b` |
 | `Packet_gspToggleSendReplay` | `0x65e0ec` | ❓ |
 | `Packet_gspToggleUdpClientCommunication` | `0x65e194` | `0x0410` |
