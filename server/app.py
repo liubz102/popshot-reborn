@@ -235,6 +235,42 @@ def _report_level_realign(accounts):
         eventlog.online(tail)
 
 
+def _report_item_fields(accounts):
+    """把 `AccountStore.ensure_item_fields()` 的结果说出来（屏幕 + 运营流水）。
+
+    ★ **按状态翻转说话**：没有账号需要补、管理员也早就有了，就一行都不打。
+    第一次升到 V0.3 商店版时会刷一屏，之后每次启动都是静默的。
+    """
+    try:
+        report = accounts.ensure_item_fields()
+    except Exception as error:              # noqa: BLE001 —— 存档坏了也不该拦住开服
+        log(f"⚠ 仓库字段补齐失败（{error!r}）；存档没被改动，游戏照常起")
+        return
+    changed = report["accounts"]
+    if changed:
+        head = (f"仓库字段补齐: {len(changed)} 个账号的"
+                "「仓库 / 装备 / 材料」已经写进存档")
+        log(head)
+        eventlog.online(head)
+        for row in changed:
+            line = f"  {row['username']}: " + "；".join(row["notes"])
+            log(line)
+            eventlog.online("仓库补齐 " + line.strip())
+    if report["admin_created"]:
+        # ★ 弱默认密码是明知故犯（D3），所以每次新建都要把「去改掉」喊出来。
+        head = (f"管理页: 已创建默认管理员 {report['admin_created']} / "
+                f"{account_store.DEFAULT_ADMIN_PASSWORD}"
+                "  ★ 请立刻在 /admin 里改掉这个密码")
+        log(head)
+        eventlog.online(head)
+    if report["admin_broken"]:
+        head = (f"⚠ 管理页: 存档里的 {account_store.ADMIN_ACCOUNTS_KEY} 不是一个对象，"
+                "现在谁都登不进 /admin（游戏不受影响）。"
+                "★ 没有自动修复 —— 请手工把它改回 {\"名字\": {\"password\": \"...\"}}")
+        log(head)
+        eventlog.online(head)
+
+
 def _report_shop_config():
     """三份运营配置（商店 / 合成 / 掉落）缺文件就生成一份默认的。
 
@@ -308,6 +344,11 @@ def main(argv=None):
     # 那一份流水里，否则重启一次就再也查不到「谁从几级变成了几级」。
     # 只在服务端真的启动时跑，那时没人在线；幂等，清单为空就一个字都不打。
     _report_level_realign(accounts)
+
+    # 仓库 / 装备 / 材料三个新字段的幂等补齐（V0.3商店 M2 / D5），外加
+    # 「至少有一个管理员」。和上面同一个道理：排在 `eventlog.configure` 之后，
+    # 只在服务端真的启动时跑，那时没人在线；幂等，没得改就一个字都不打。
+    _report_item_fields(accounts)
 
     # 商店 / 合成 / 掉落这三份运营配置：缺文件才生成，已有的一律不动。
     # 和上面一样排在 `eventlog.configure` 之后，让「新建了哪几份」留在流水里。

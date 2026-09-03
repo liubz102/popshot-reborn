@@ -20,6 +20,12 @@ import os
 import re
 import threading
 
+#: 物品表（V0.3商店 M1）。存档层要它只为回答两个**存储完整性**问题：
+#: 「这个 id 客户端认不认识」和「这两件抢不抢同一个槽」。
+#: 业务规则（上没上架 / 等级够不够 / 角色对不对）不在这儿，在 `shop.py`。
+#: 它只依赖 `json` + `os`，不会绕回来 import 本模块。
+import shopdata
+
 
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PATH = os.path.join(SERVER_DIR, "data", "accounts.json")
@@ -50,6 +56,26 @@ NEW_ACCOUNT_DEFAULTS = {
     "character_unlock_all": True,
     #: 手动持有的商城角色 id 列表（`character_unlock_all` 为 False 时才看它）。
     "owned_characters": [],
+    #: 仓库里的持有物 `{itemId 字符串: {"count": 数量, "expires": 到期或 None}}`
+    #: （V0.3商店 M2）。键写成字符串是因为 JSON 的对象键只能是字符串。
+    #:
+    #: `expires` 现在**恒为 None**（本版只做永久物品，见 PLAN「本版不做」）。
+    #: 留着这个键是因为原版真有期限制装备（`ShopItem.ini` 的 `5x` 段），
+    #: 将来要做时不用再动一次线上存档的结构（铁律 11）。
+    #:
+    #: ★ **不含商城角色物品** —— 那一批是从 `owned_characters` 派生的
+    #: （`character_item_ids()`），两条路各管各的。
+    "inventory": {},
+    #: 当前穿在身上的 itemId **列表**（不是「部位 -> id」字典，D6）。
+    #: `0x030b gspSlotEquippedList` 的线格式本来就是一个 id 列表，客户端拿它
+    #: 直接建 `EquipmentEx`；而套装的 `PartFlag` 是组合值（全身 = 31），
+    #: 字典模型下一件套装要占好几个键。
+    #:
+    #: 服务端保证两条不变式：**两两 `part_flag` 按位与为 0**（不抢槽）
+    #: 且**每件都在 `inventory` 里**（不能穿没有的东西）。
+    "equipped": [],
+    #: 合成材料的存量 `{itemId 字符串: 数量}`。★ 和 `inventory` 分开存（D11）。
+    "materials": {},
 }
 
 #: 客户端认为「教程已完成」的最小值。大厅 `0x43b357` 是 `cmp eax,3 / jge`（§54）。
@@ -108,7 +134,19 @@ SAVE_FORMAT_KEY = "popshot_save"
 SAVE_FORMAT_VERSION = 1
 
 #: 存档文件的 schema 版本。1 = V0.1（带 `active_account`）；2 = V0.2（票据制）。
+#:
+#: ★ V0.3 商店给账号加的三个字段**没有**把它推到 3：新字段走
+#: 「读盘时按默认值补齐」，天然幂等，不需要版本号驱动的一次性迁移（D5）。
 SCHEMA_VERSION = 2
+
+#: 管理页（`/admin`）的管理员账号表，和 `accounts` 在存档里平级。
+#: 值的形状是 `{"password": "明文"}` —— 和玩家账号一个口径（D3 / 铁律 9）。
+ADMIN_ACCOUNTS_KEY = "admin_accounts"
+
+#: 首次生成的默认管理员。★ **弱密码是明知故犯**：管理页公网可达，
+#: 所以配套的补偿是「登录按 IP 限速」+「页面上提示立刻改掉」（D3）。
+DEFAULT_ADMIN_NAME = "admin"
+DEFAULT_ADMIN_PASSWORD = "Admin123"
 
 
 class AccountError(Exception):
@@ -346,6 +384,68 @@ class AccountStore:
             if changed:
                 self._write_unlocked(data)
             return changed
+
+    def ensure_item_fields(self):
+        """把存档里的物品三件套补齐 / 洗干净，顺带保证有一个管理员。
+
+        照 `realign_levels()` 的路子（D5）：**幂等** —— 没有任何东西需要改时
+        不写盘，所以每次启动都可以跑，不需要 schema 版本号；以后有人手工丢一份
+        旧 JSON 进来也会被自动补上。
+
+        管四件事：
+
+        1. 老账号缺 `inventory` / `equipped` / `materials` 时补空的。
+           逻辑上 `_merged_account()` 每次读都会补，但**磁盘上**那三个键要等
+           该账号下次被写才出现 —— 中间人去翻存档会以为功能根本没生效。
+        2. 洗掉脏条目：数量 <= 0 的、id 解析不出来的、客户端不认识的。
+        3. 让 `equipped` 满足两条不变式（不抢槽 + 必须是自己的）。
+           `shop_items.json` 换代（某件装备被移出中文版）之后靠它收敛。
+        4. 顶层的 `admin_accounts`：**键不存在**时建一个默认管理员。
+           键在但是空字典 = 用户主动关掉了管理页，**不碰**（D13）。
+
+        返回 ``{"accounts": [{"username", "notes"}, ...],
+                "admin_created": 名字 or None, "admin_broken": bool}``。
+        """
+        with self._lock:
+            data = self._read_unlocked()
+            changed = []
+            for username in sorted(data["accounts"]):
+                raw = data["accounts"][username]
+                if not isinstance(raw, dict):
+                    continue
+                # ★ 必须从**原始字典**算。走 `_merged_account()` 的话三个键
+                #   在读的那一刻就已经被补上了，永远看不出磁盘上缺什么。
+                inventory, equipped, materials, notes = normalize_item_fields(raw)
+                if (raw.get("inventory") == inventory
+                        and raw.get("equipped") == equipped
+                        and raw.get("materials") == materials):
+                    continue
+                raw["inventory"] = inventory
+                raw["equipped"] = equipped
+                raw["materials"] = materials
+                changed.append({
+                    "username": username,
+                    # 形状变了但没丢东西（比如手写的 `"1010015": 2` 简写）
+                    # 也要说一声，否则日志里会出现「改了谁但没说改了什么」。
+                    "notes": notes or ["规范化了物品字段的写法"],
+                })
+
+            admin_created = None
+            admin_broken = False
+            if ADMIN_ACCOUNTS_KEY not in data:
+                data[ADMIN_ACCOUNTS_KEY] = {
+                    DEFAULT_ADMIN_NAME: {"password": DEFAULT_ADMIN_PASSWORD}}
+                admin_created = DEFAULT_ADMIN_NAME
+            elif not isinstance(data[ADMIN_ACCOUNTS_KEY], dict):
+                # 手改坏了。★ **不自动修**：这一格里可能还留着用户自己加的
+                # 管理员，盖成默认值等于把它们抹了。报一声就够 —— 失败模式是
+                # 「谁都登不进管理页」，玩家一点感觉都没有（铁律 11）。
+                admin_broken = True
+
+            if changed or admin_created:
+                self._write_unlocked(data)
+            return {"accounts": changed, "admin_created": admin_created,
+                    "admin_broken": admin_broken}
 
     @staticmethod
     def _merged_account(username, raw):
@@ -617,6 +717,11 @@ class AccountStore:
             #   和「他压根没写 level」。
             account["experience"] = experience_for_import(account, fields)
             account["level"] = level_for_experience(account["experience"])
+            # 仓库 / 装备 / 材料照样跟着存档走（`parse_save` 按
+            # `NEW_ACCOUNT_DEFAULTS` 过滤，加字段就自动带上），但要**当场洗一遍**
+            # —— 上传的文件是玩家用记事本改过的，脏条目不该落到磁盘上。
+            (account["inventory"], account["equipped"],
+             account["materials"], _notes) = normalize_item_fields(account)
             data["accounts"][username] = account
             self._write_unlocked(data)
             return username, ("created" if existing is None else "replaced")
@@ -716,6 +821,304 @@ class AccountStore:
             data["accounts"][username] = account
             self._write_unlocked(data)
             return copy.deepcopy(account)
+
+    # ------------------------------------------------- 仓库 / 装备 / 材料
+    def _account_unlocked(self, data, username):
+        """持锁状态下取一个可改的账号视图。账号不存在就 `KeyError`。"""
+        if username not in data["accounts"]:
+            raise KeyError(username)
+        return self._merged_account(username, data["accounts"][username])
+
+    def spend_money(self, username, amount):
+        """扣金币，返回更新后的账号。余额不够就抛 `AccountError`，**一个字节都不写**。
+
+        ★ 查余额和扣款必须在**同一把锁**里。拆成「先 `get_account()` 看够不够、
+        再 `spend_money()` 扣」的话，两笔购买挤在一起会双双看到余额够，
+        扣成负数 —— 这是商店最经典的一个洞。
+        """
+        amount = int(amount)
+        if amount < 0:
+            raise AccountError("invalid_amount", "扣款金额不能是负数")
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            balance = player_money(account)
+            if balance < amount:
+                raise AccountError(
+                    "not_enough_money",
+                    f"金币不足：需要 {amount}，现有 {balance}")
+            if amount == 0:              # 白送的东西，没必要重写一遍生产数据
+                return copy.deepcopy(account)
+            account["money"] = balance - amount
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return copy.deepcopy(account)
+
+    def add_materials(self, username, materials):
+        """给合成材料，返回 ``(更新后的账号, 被跳过的 id 列表)``。
+
+        `materials` = `{itemId: 数量}`；数量 <= 0 的条目直接忽略（不算跳过）。
+
+        ★ **为什么这里跳过而不抛**（和 `add_item` 恰好相反）：它的调用点是
+        结算发奖，规则来自用户手改的 `drops.json`。一条配错的掉落规则不该让
+        整局的结算包发不出去 —— 玩家看到的会是「卡在结算界面」，
+        比少拿一个材料难查十倍。跳过的 id 原样返回，由调用方打进日志。
+        """
+        wanted = {}
+        skipped = []
+        for key, value in (materials or {}).items():
+            try:
+                item_id, count = int(key), int(value)
+            except (TypeError, ValueError):
+                skipped.append(key)
+                continue
+            if count <= 0:
+                continue
+            if not shopdata.ownable(item_id):
+                # 客户端表里没有 `[Item-]` 节 ⇒ 结算界面那一栏画不出图标
+                # （FINDINGS §3 约束 3），仓库里也查不到（§11）。
+                skipped.append(item_id)
+                continue
+            wanted[item_id] = wanted.get(item_id, 0) + count
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            if not wanted:
+                return copy.deepcopy(account), skipped
+            records = _material_records(account)
+            for item_id, count in wanted.items():
+                records[item_id] = records.get(item_id, 0) + count
+            account["materials"] = {str(i): records[i] for i in sorted(records)}
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return copy.deepcopy(account), skipped
+
+    def consume_materials(self, username, materials):
+        """扣合成材料，返回更新后的账号。
+
+        ★ **任何一种不够就整笔失败**（抛 `AccountError`），一个字节都不写。
+        合成是「材料换装备」的一次性交易，扣一半留一半等于凭空吃掉玩家的材料。
+        和 `spend_money` 一样，查和扣在同一把锁里。
+        """
+        wanted = {}
+        for key, value in (materials or {}).items():
+            try:
+                item_id, count = int(key), int(value)
+            except (TypeError, ValueError):
+                raise AccountError(
+                    "invalid_material", f"材料条目不合法: {key!r}={value!r}") from None
+            if count < 0:
+                raise AccountError("invalid_material", "材料数量不能是负数")
+            if count:
+                wanted[item_id] = wanted.get(item_id, 0) + count
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            if not wanted:
+                return copy.deepcopy(account)
+            records = _material_records(account)
+            short = [(i, n, records.get(i, 0))
+                     for i, n in sorted(wanted.items()) if records.get(i, 0) < n]
+            if short:
+                detail = "、".join(f"{i} 需要 {n} 现有 {have}"
+                                  for i, n, have in short)
+                raise AccountError("not_enough_materials", f"材料不足：{detail}")
+            for item_id, count in wanted.items():
+                left = records[item_id] - count
+                if left > 0:
+                    records[item_id] = left
+                else:
+                    del records[item_id]        # 用光了就把这一格删掉，别留 0
+            account["materials"] = {str(i): records[i] for i in sorted(records)}
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return copy.deepcopy(account)
+
+    def add_item(self, username, item_id, count=1, expires=None):
+        """把一件东西放进仓库，返回更新后的账号。
+
+        ★ **客户端不认识的 id 一律拒绝**（`shopdata.ownable`）：只有货架条目、
+        进不了背包的那 226 件塞进去，仓库里就是一个空格子（FINDINGS §11）。
+
+        ★ 和 `add_materials` 相反，这里**抛异常**：调用点是「买」和「合成」
+        这种玩家主动发起的单笔交易，请求处理器本来就要回一个失败码；
+        静默跳过会变成「钱扣了东西没有」。
+
+        已经有的再拿一件就把 `count` 累加。**「装备不能重复持有」是业务规则，
+        不在这一层** —— 那条由 `shop.py` 在扣钱之前用 `has_item()` 判
+        （原版失败文案 `이미 소지하고 있습니다`，FINDINGS §7）。
+        """
+        item_id = int(item_id)
+        count = int(count)
+        if count <= 0:
+            raise AccountError("invalid_count", "数量必须是正数")
+        if not shopdata.ownable(item_id):
+            raise AccountError(
+                "unknown_item",
+                f"物品 {item_id} 不在客户端认得的物品表里，不能发给玩家")
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            records = _inventory_records(account)
+            entry = records.get(item_id)
+            if entry is None:
+                records[item_id] = {"count": count, "expires": expires}
+            else:
+                entry["count"] += count
+                # 期限制物品的「续期」本版不做（PLAN「本版不做」），所以这里
+                # 不动已有的 `expires` —— 免得买第二件反而把期限改短。
+            account["inventory"] = {str(i): dict(records[i])
+                                    for i in sorted(records)}
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return copy.deepcopy(account)
+
+    def set_equipped(self, username, item_ids):
+        """整套换装，返回 ``(更新后的账号, 被丢掉的 id 列表)``。
+
+        ★ **顺序有意义**：`shopdata.resolve_equipped()` 是**先到先得**，
+        所以调用方要把「玩家刚点的那件」放在最前面 —— 换装于是天然表现为
+        「新的顶掉旧的」，不用在每个调用点重写一遍「先找出同槽的再卸下」。
+
+        丢掉的有两类，都在 `dropped` 里：抢了槽的、和不在仓库里的。
+        """
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            wanted = []
+            for value in item_ids or ():
+                try:
+                    wanted.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            kept, dropped = shopdata.resolve_equipped(wanted)
+            owned = _inventory_records(account)
+            final = []
+            for item_id in kept:
+                if item_id in owned:
+                    final.append(item_id)
+                else:
+                    dropped.append(item_id)
+            # 和磁盘上那份**原样**比：一样就不写（少一次动生产数据的机会），
+            # 不一样就顺手把手改留下的脏条目一起洗掉。
+            if account.get("equipped") == final:
+                return copy.deepcopy(account), dropped
+            account["equipped"] = final
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return copy.deepcopy(account), dropped
+
+    def equip_item(self, username, item_id):
+        """穿上一件，返回 ``(更新后的账号, 被顶下来的 id 列表)``。
+
+        把它排在最前面交给 `set_equipped()`，抢同一个槽的旧装备就被自动顶掉。
+        锁是 `RLock`，所以这里读完再调 `set_equipped()` 全程握着同一把锁。
+        """
+        item_id = int(item_id)
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            rest = [i for i in equipped_items(account) if i != item_id]
+            return self.set_equipped(username, [item_id] + rest)
+
+    def unequip_item(self, username, item_id):
+        """脱下一件，返回 ``(更新后的账号, 被丢掉的 id 列表)``。没穿着就什么都不做。"""
+        item_id = int(item_id)
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            rest = [i for i in equipped_items(account) if i != item_id]
+            return self.set_equipped(username, rest)
+
+    # ----------------------------------------------------------- 管理员
+    def _admin_table_unlocked(self, data):
+        """持锁状态下取可改的管理员表。**手改坏了就拒绝改，绝不覆盖**
+        —— 那一格里可能还留着用户自己加的管理员。"""
+        raw = data.get(ADMIN_ACCOUNTS_KEY)
+        if raw is None:
+            raw = {}
+            data[ADMIN_ACCOUNTS_KEY] = raw
+        if not isinstance(raw, dict):
+            raise AccountError(
+                "admin_table_broken",
+                f"存档里的 {ADMIN_ACCOUNTS_KEY} 不是一个对象，请先手工改回来")
+        return raw
+
+    def admin_names(self):
+        """全部管理员的名字（已排序）。表坏了就当一个都没有。"""
+        with self._lock:
+            return sorted(admin_accounts(self._read_unlocked()))
+
+    def admin_verify(self, name, password):
+        """校验管理员口令，返回 `AUTH_OK` / `AUTH_NO_SUCH_USER` / `AUTH_BAD_PASSWORD`。
+
+        ★ 和玩家登录共用同一套三态，`AUTH_MESSAGES` 的中文文案直接能复用。
+        ★ 调用方**不要把密码打进日志**（铁律 9），打名字和结果就够。
+        """
+        name = str(name or "").strip()
+        password = str(password if password is not None else "")
+        with self._lock:
+            table = admin_accounts(self._read_unlocked())
+        entry = table.get(name)
+        if entry is None:
+            return AUTH_NO_SUCH_USER
+        if str(entry.get("password", "")) != password:
+            return AUTH_BAD_PASSWORD
+        return AUTH_OK
+
+    def admin_add(self, name, password):
+        """加一个管理员，返回新的名字表。
+
+        名字和口令走玩家账号那套规则 —— 管理员名同样是 JSON 的键、
+        也要经表单往返，没理由放得更松。
+        """
+        name = check_username(name)
+        password = check_password(password)
+        with self._lock:
+            data = self._read_unlocked()
+            table = self._admin_table_unlocked(data)
+            if name in table:
+                raise AccountError("admin_exists", f"管理员「{name}」已经存在")
+            table[name] = {"password": password}
+            self._write_unlocked(data)
+            return sorted(table)
+
+    def admin_set_password(self, name, password):
+        """改管理员口令。★ 默认管理员那个弱口令就靠它换掉（D3）。"""
+        name = str(name or "").strip()
+        password = check_password(password)
+        with self._lock:
+            data = self._read_unlocked()
+            table = self._admin_table_unlocked(data)
+            if name not in table:
+                raise AccountError("no_such_admin", f"没有名为「{name}」的管理员")
+            entry = table[name]
+            if not isinstance(entry, dict):
+                entry = {}
+                table[name] = entry
+            entry["password"] = password
+            self._write_unlocked(data)
+            return name
+
+    def admin_remove(self, name):
+        """删一个管理员，返回剩下的名字表。
+
+        ★ **只剩一个时拒绝删**：删光了谁都进不去管理页，只能上服务器手改 JSON
+        才救得回来。这一条拦在**存档层**，不只拦在前端 —— 前端拦得住鼠标，
+        拦不住直接 POST。
+        """
+        name = str(name or "").strip()
+        with self._lock:
+            data = self._read_unlocked()
+            table = self._admin_table_unlocked(data)
+            if name not in table:
+                raise AccountError("no_such_admin", f"没有名为「{name}」的管理员")
+            if len(table) <= 1:
+                raise AccountError("last_admin",
+                                   "至少要保留一个管理员，不能全部删掉")
+            del table[name]
+            self._write_unlocked(data)
+            return sorted(table)
 
 
 #: 升一级需要的经验 = `EXPERIENCE_STEP × 当前等级`（二次曲线）。
@@ -982,3 +1385,191 @@ def player_money(account):
     这就是为什么以前一重登金币就归零（FINDINGS §95）。
     """
     return _non_negative(account, "money")
+
+
+# ==========================================================================
+# 仓库 / 装备 / 材料（V0.3商店 M2）
+#
+# 下面这几个读取器全部**逐条容错**，和 `_quest_records()` 一个道理：存档是
+# 给人手改的，键写成数字、值写成字符串、混进垃圾条目都可能发生，绝不能让
+# 一条脏数据把整个下发打掉。
+# ==========================================================================
+
+def _inventory_records(account):
+    """存档里的 `inventory` -> `{int itemId: {"count": int, "expires": ...}}`。
+
+    ★ 简写也认：`"1010015": 2` 会被当成 `{"count": 2, "expires": None}`
+    —— 人手写 JSON 时最容易这么写，没必要为此把存档判成坏的。
+    """
+    if not account:
+        return {}
+    raw = account.get("inventory")
+    if not isinstance(raw, dict):
+        return {}
+    records = {}
+    for key, value in raw.items():
+        try:
+            item_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        if item_id <= 0:
+            continue
+        expires = None
+        if isinstance(value, dict):
+            expires = value.get("expires")
+            raw_count = value.get("count", 1)
+        else:
+            raw_count = value
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            count = 1
+        if count <= 0:                       # 数量 0 / 负数 = 根本没有这件东西
+            continue
+        records[item_id] = {"count": count, "expires": expires}
+    return records
+
+
+def inventory_items(account):
+    """仓库里的持有物 `{itemId: {"count", "expires"}}`。"""
+    return _inventory_records(account)
+
+
+def owned_item_ids(account):
+    """持有物的 itemId 列表（已排序）。
+
+    ★ **不含商城角色物品** —— 那一批由 `character_item_ids()` 从
+    `owned_characters` 派生（V0.1 §119），不落在 `inventory` 里。
+    要往 `0x030b` 里塞的是这两份的**并集**。
+    """
+    return sorted(_inventory_records(account))
+
+
+def has_item(account, item_id):
+    """仓库里有没有这件东西。"""
+    try:
+        return int(item_id) in _inventory_records(account)
+    except (TypeError, ValueError):
+        return False
+
+
+def _material_records(account):
+    """存档里的 `materials` -> `{int itemId: int 数量}`。"""
+    if not account:
+        return {}
+    raw = account.get("materials")
+    if not isinstance(raw, dict):
+        return {}
+    records = {}
+    for key, value in raw.items():
+        try:
+            item_id, count = int(key), int(value)
+        except (TypeError, ValueError):
+            continue
+        if item_id <= 0 or count <= 0:
+            continue
+        records[item_id] = count
+    return records
+
+
+def material_counts(account):
+    """合成材料的存量 `{itemId: 数量}`。"""
+    return _material_records(account)
+
+
+def material_count(account, item_id):
+    """某一种材料有几个（没有就是 0）。"""
+    try:
+        return _material_records(account).get(int(item_id), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def equipped_items(account):
+    """当前穿在身上的 itemId 列表，**已满足两条不变式**。
+
+    ★ 这是 `0x030b gspSlotEquippedList` 里「装备」那一半的唯一数据源，
+    而 `0x030b` 又是战斗加成的唯一来源（FINDINGS §1 / §4）—— 所以宁可
+    在这儿把可疑的条目丢掉，也不要发一个客户端查不到的 id 下去。
+
+    两条不变式在**读的时候**就地生效（手改过的存档也照样干净），
+    `ensure_item_fields()` 负责把同一套结论落到磁盘上：
+
+    1. 两两 `part_flag` 按位与为 0（`shopdata.resolve_equipped`，先到先得）；
+    2. 每件都在 `inventory` 里 —— 穿着一件自己没有的东西是脏数据。
+    """
+    raw = (account or {}).get("equipped")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    kept, _dropped = shopdata.resolve_equipped(raw)
+    owned = _inventory_records(account)
+    return [item_id for item_id in kept if item_id in owned]
+
+
+def normalize_item_fields(raw):
+    """把一个**原始**账号字典里的物品三件套洗成可以直接写回 JSON 的形态。
+
+    返回 ``(inventory, equipped, materials, notes)``。前三个的键已经排序、
+    已经是字符串；`notes` 是给人看的改动说明（空表 = 这个账号本来就是干净的）。
+
+    ★ 传进来的必须是**原始**字典，不是 `_merged_account()` 的结果 ——
+    后者在读的那一刻就把缺的键补上了，看不出「磁盘上到底缺了什么」。
+    """
+    notes = []
+    for field in ("inventory", "equipped", "materials"):
+        if field not in raw:
+            notes.append("补上 " + field)
+
+    inventory = _inventory_records(raw)
+    # 客户端不认识（或只有货架条目、进不了背包）的持有物留着也发不下去，
+    # 仓库里会是个空格子（FINDINGS §11）。`shop_items.json` 换代之后
+    # 靠这一步收敛。
+    unknown = sorted(i for i in inventory if not shopdata.ownable(i))
+    for item_id in unknown:
+        del inventory[item_id]
+    if unknown:
+        notes.append("丢掉客户端不认识的持有物 "
+                     + "/".join(str(i) for i in unknown))
+
+    materials = _material_records(raw)
+    unknown_material = sorted(i for i in materials if not shopdata.ownable(i))
+    for item_id in unknown_material:
+        del materials[item_id]
+    if unknown_material:
+        notes.append("丢掉客户端不认识的材料 "
+                     + "/".join(str(i) for i in unknown_material))
+
+    new_inventory = {str(i): dict(inventory[i]) for i in sorted(inventory)}
+    new_materials = {str(i): materials[i] for i in sorted(materials)}
+
+    # ★ 装备要拿**洗过的** inventory 去判「是不是自己的」，所以这里现拼一个
+    #   账号视图给 `equipped_items()`，而不是直接把 `raw` 递过去。
+    view = dict(raw)
+    view["inventory"] = new_inventory
+    new_equipped = equipped_items(view)
+    before = raw.get("equipped")
+    if isinstance(before, (list, tuple)):
+        lost = [i for i in before if i not in new_equipped]
+        if lost:
+            notes.append("卸下站不住的装备 "
+                         + "/".join(str(i) for i in lost))
+
+    return new_inventory, new_equipped, new_materials, notes
+
+
+def admin_accounts(data):
+    """存档顶层的管理员表 `{名字: {"password": ...}}`。
+
+    ★ **坏了就当没有，不抛异常** —— 管理页是运维功能，一条手改坏的
+    `admin_accounts` 不该把整个游戏服拖住（铁律 11）。失败模式是
+    「谁都登不进管理页」，改坏它的人一眼看得出来，玩家一点感觉都没有。
+    """
+    raw = (data or {}).get(ADMIN_ACCOUNTS_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    table = {}
+    for name, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        table[str(name)] = value
+    return table

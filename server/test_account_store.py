@@ -6,17 +6,34 @@ import struct
 import tempfile
 import unittest
 
-from account_store import (AUTH_BAD_PASSWORD, AUTH_NO_SUCH_USER, AUTH_OK,
+from account_store import (ADMIN_ACCOUNTS_KEY, AUTH_BAD_PASSWORD,
+                           AUTH_NO_SUCH_USER, AUTH_OK,
+                           DEFAULT_ADMIN_NAME, DEFAULT_ADMIN_PASSWORD,
                            EXPERIENCE_PER_LEVEL, EXPERIENCE_STEP, LEVEL_MAX,
                            MINIMUM_PLAYER_LEVEL,
                            NEW_ACCOUNT_DEFAULTS, QUEST_DIFFICULTY_MAX,
                            QUEST_ID_TABLE, AccountError, AccountStore,
-                           experience_bounds, experience_for_level,
-                           level_for_experience,
-                           player_character, player_level,
+                           equipped_items, experience_bounds,
+                           experience_for_level, has_item, inventory_items,
+                           level_for_experience, material_count,
+                           material_counts, normalize_item_fields,
+                           owned_item_ids,
+                           player_character, player_level, player_money,
                            quest_cleared_difficulty, quest_difficulty_records,
                            quest_unlock_all, tutorial_state)
 from gameserver import build_gsp_rep_login
+
+
+#: 下面这些 id 都来自真的 `shop_items.json`，不是编的。
+#: `test_the_fixture_ids_still_mean_what_the_tests_assume` 守着它们的性质
+#: —— 哪天物品表换代了，先炸的是那一条，而不是十几条语义不明的断言。
+REVOLVER_R1 = 1120041        # 리볼버 R1，武器槽 1（part_flag 1024）
+REVOLVER_R2 = 1120042        # 同一个武器槽的另一把
+TOP_ARMOR = 1010015          # 上衣（part_flag 1），和武器不抢槽
+STOCK_ONLY = 1510001         # ★ 只有 `[Stock-]` 的期限售卖形态，进不了背包（§11）
+BRONZE_PIPE = 30018          # 청동파이프 青铜管（材料）
+BLACK_BEAD = 10001           # 검은구슬 黑珠（材料）
+NO_SUCH_ITEM = 9999999       # 物品表里根本没有
 
 
 class AccountStoreTests(unittest.TestCase):
@@ -454,6 +471,11 @@ class AccountStoreTests(unittest.TestCase):
             "quest_unlock_all": False,
             "character_unlock_all": False,
             "owned_characters": [101, 105],
+            # ★ 这三个写的是**规范形态**：`import_account` 会当场洗一遍
+            #   （上传的是人手改过的文件），洗完要和写进去的一模一样。
+            "inventory": {str(REVOLVER_R1): {"count": 1, "expires": None}},
+            "equipped": [REVOLVER_R1],
+            "materials": {str(BRONZE_PIPE): 3},
         }
         self.assertEqual(sorted(changed), sorted(NEW_ACCOUNT_DEFAULTS),
                          "存档新增字段了？这条用例要跟着补")
@@ -679,6 +701,467 @@ class AccountStoreTests(unittest.TestCase):
     def test_quest_clear_rejects_unknown_account(self):
         with self.assertRaises(KeyError):
             self.store.set_quest_cleared("nobody", 1, 1)
+
+
+# ==========================================================================
+# 仓库 / 装备 / 材料 / 管理员（V0.3商店 M2）
+# ==========================================================================
+
+      # 物品表里根本没有
+
+
+class ItemFieldTests(unittest.TestCase):
+    """仓库 / 装备 / 材料三件套 + 幂等补齐。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "accounts.json")
+        self.store = AccountStore(self.path)
+        self.store.register("alice", "pw")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def saved(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def raw_bytes(self):
+        with open(self.path, "rb") as f:
+            return f.read()
+
+    def write_raw(self, data):
+        """直接铺一份存档（模拟老存档 / 手改过的存档）。"""
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        return AccountStore(self.path)
+
+    # ------------------------------------------------------------ 前提校验
+    def test_the_fixture_ids_still_mean_what_the_tests_assume(self):
+        # 物品表是从原版 ini 提取的产物，换代后这几条性质要是变了，
+        # 下面所有用例的含义都会跟着变 —— 让它先炸，别让人去猜。
+        import shopdata
+        self.assertTrue(shopdata.ownable(REVOLVER_R1))
+        self.assertTrue(shopdata.ownable(REVOLVER_R2))
+        self.assertTrue(shopdata.conflicts(REVOLVER_R1, REVOLVER_R2))
+        self.assertTrue(shopdata.ownable(TOP_ARMOR))
+        self.assertFalse(shopdata.conflicts(REVOLVER_R1, TOP_ARMOR))
+        # 只有货架条目的塞进背包，客户端查不到定义，仓库里是空格子。
+        self.assertFalse(shopdata.ownable(STOCK_ONLY))
+        self.assertFalse(shopdata.exists(NO_SUCH_ITEM))
+        for material in (BRONZE_PIPE, BLACK_BEAD):
+            self.assertTrue(shopdata.is_material(material))
+            self.assertTrue(shopdata.ownable(material))
+
+    def test_new_account_starts_with_empty_item_fields(self):
+        _, account = self.store.get_account("alice")
+        self.assertEqual({}, inventory_items(account))
+        self.assertEqual([], equipped_items(account))
+        self.assertEqual({}, material_counts(account))
+        # 新号注册时就该把三个键写进磁盘，不用等 `ensure_item_fields()`。
+        for field in ("inventory", "equipped", "materials"):
+            self.assertIn(field, self.saved()["accounts"]["alice"])
+
+    # ---------------------------------------------------------------- 金币
+    def test_spend_money_deducts_and_persists(self):
+        self.store.add_quest_reward("alice", money=5000)
+        account = self.store.spend_money("alice", 3000)
+        self.assertEqual(2000, player_money(account))
+        self.assertEqual(2000, self.saved()["accounts"]["alice"]["money"])
+
+    def test_spend_money_refuses_when_short_and_writes_nothing(self):
+        self.store.add_quest_reward("alice", money=100)
+        before = self.raw_bytes()
+        with self.assertRaises(AccountError) as caught:
+            self.store.spend_money("alice", 101)
+        self.assertEqual("not_enough_money", caught.exception.code)
+        # ★ 「差一块钱」也要一个字节都不动 —— 扣一半是最难查的那种账。
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_spend_money_zero_does_not_rewrite_the_file(self):
+        before = self.raw_bytes()
+        self.store.spend_money("alice", 0)
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_spend_money_rejects_a_negative_amount(self):
+        with self.assertRaises(AccountError) as caught:
+            self.store.spend_money("alice", -1)
+        self.assertEqual("invalid_amount", caught.exception.code)
+
+    def test_spend_money_rejects_unknown_account(self):
+        with self.assertRaises(KeyError):
+            self.store.spend_money("nobody", 1)
+
+    # ---------------------------------------------------------------- 仓库
+    def test_add_item_puts_it_in_the_warehouse(self):
+        account = self.store.add_item("alice", REVOLVER_R1)
+        self.assertEqual([REVOLVER_R1], owned_item_ids(account))
+        self.assertTrue(has_item(account, REVOLVER_R1))
+        self.assertFalse(has_item(account, TOP_ARMOR))
+        # 键在 JSON 里必须是字符串（对象键只能是字符串）。
+        self.assertEqual({"count": 1, "expires": None},
+                         self.saved()["accounts"]["alice"]["inventory"][str(REVOLVER_R1)])
+
+    def test_add_item_stacks_the_count(self):
+        self.store.add_item("alice", BRONZE_PIPE, count=2)
+        account = self.store.add_item("alice", BRONZE_PIPE, count=3)
+        self.assertEqual(5, inventory_items(account)[BRONZE_PIPE]["count"])
+
+    def test_add_item_rejects_ids_the_client_does_not_know(self):
+        # 只有货架条目的（§11）和压根不存在的，都得在门口挡掉 ——
+        # 放进去只会在仓库里变成一个空格子。
+        for item_id in (STOCK_ONLY, NO_SUCH_ITEM):
+            before = self.raw_bytes()
+            with self.assertRaises(AccountError) as caught:
+                self.store.add_item("alice", item_id)
+            self.assertEqual("unknown_item", caught.exception.code)
+            self.assertEqual(before, self.raw_bytes())
+
+    def test_add_item_rejects_a_non_positive_count(self):
+        for count in (0, -1):
+            with self.assertRaises(AccountError) as caught:
+                self.store.add_item("alice", REVOLVER_R1, count=count)
+            self.assertEqual("invalid_count", caught.exception.code)
+
+    def test_inventory_reader_accepts_the_shorthand_a_human_would_write(self):
+        # 人手写存档最容易写成 `"1120041": 2`，没必要为此把整个背包判成坏的。
+        account = {"inventory": {str(REVOLVER_R1): 2}}
+        self.assertEqual({REVOLVER_R1: {"count": 2, "expires": None}},
+                         inventory_items(account))
+
+    def test_item_readers_tolerate_garbage(self):
+        account = {"inventory": {"abc": 1, "-3": 1, str(REVOLVER_R1): 0,
+                                 str(TOP_ARMOR): {"count": "x"}},
+                   "materials": {"abc": 1, str(BRONZE_PIPE): -2,
+                                 str(BLACK_BEAD): "7"},
+                   "equipped": "not a list"}
+        # 数量解析不出来时退回 1（「有这件东西」比「没有」更接近人的本意）。
+        self.assertEqual({TOP_ARMOR: {"count": 1, "expires": None}},
+                         inventory_items(account))
+        self.assertEqual({BLACK_BEAD: 7}, material_counts(account))
+        self.assertEqual([], equipped_items(account))
+        self.assertEqual({}, inventory_items(None))
+        self.assertEqual({}, material_counts({"materials": []}))
+
+    # ---------------------------------------------------------------- 装备
+    def test_equip_replaces_the_one_in_the_same_slot(self):
+        self.store.add_item("alice", REVOLVER_R1)
+        self.store.add_item("alice", REVOLVER_R2)
+        account, _ = self.store.equip_item("alice", REVOLVER_R1)
+        self.assertEqual([REVOLVER_R1], equipped_items(account))
+        # ★ 刚点的那件排最前面 ⇒ 先到先得 ⇒ 旧的被顶下来。
+        account, dropped = self.store.equip_item("alice", REVOLVER_R2)
+        self.assertEqual([REVOLVER_R2], equipped_items(account))
+        self.assertIn(REVOLVER_R1, dropped)
+
+    def test_equip_keeps_items_in_different_slots(self):
+        self.store.add_item("alice", REVOLVER_R1)
+        self.store.add_item("alice", TOP_ARMOR)
+        self.store.equip_item("alice", REVOLVER_R1)
+        account, dropped = self.store.equip_item("alice", TOP_ARMOR)
+        self.assertEqual([], dropped)
+        self.assertEqual({REVOLVER_R1, TOP_ARMOR}, set(equipped_items(account)))
+
+    def test_cannot_equip_something_not_owned(self):
+        account, dropped = self.store.equip_item("alice", REVOLVER_R1)
+        self.assertEqual([], equipped_items(account))
+        self.assertEqual([REVOLVER_R1], dropped)
+
+    def test_unequip_removes_only_that_one(self):
+        self.store.add_item("alice", REVOLVER_R1)
+        self.store.add_item("alice", TOP_ARMOR)
+        self.store.equip_item("alice", REVOLVER_R1)
+        self.store.equip_item("alice", TOP_ARMOR)
+        account, _ = self.store.unequip_item("alice", TOP_ARMOR)
+        self.assertEqual([REVOLVER_R1], equipped_items(account))
+
+    def test_unequipping_something_not_worn_does_not_rewrite_the_file(self):
+        self.store.add_item("alice", REVOLVER_R1)
+        self.store.equip_item("alice", REVOLVER_R1)
+        before = self.raw_bytes()
+        self.store.unequip_item("alice", TOP_ARMOR)
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_set_equipped_drops_conflicts_by_first_come_first_served(self):
+        for item_id in (REVOLVER_R1, REVOLVER_R2, TOP_ARMOR):
+            self.store.add_item("alice", item_id)
+        account, dropped = self.store.set_equipped(
+            "alice", [REVOLVER_R1, REVOLVER_R2, TOP_ARMOR])
+        self.assertEqual([REVOLVER_R1, TOP_ARMOR], equipped_items(account))
+        self.assertEqual([REVOLVER_R2], dropped)
+
+    def test_a_hand_edited_save_cannot_wear_conflicting_gear(self):
+        # 读的时候就地收敛（不用等启动补齐），因为 `0x030b` 是战斗加成的
+        # 唯一来源，发一份抢槽的清单下去后果不可知（§1 / §4）。
+        account = {"inventory": {str(REVOLVER_R1): 1, str(REVOLVER_R2): 1},
+                   "equipped": [REVOLVER_R2, REVOLVER_R1]}
+        self.assertEqual([REVOLVER_R2], equipped_items(account))
+
+    # ---------------------------------------------------------------- 材料
+    def test_add_materials_accumulates(self):
+        self.store.add_materials("alice", {BRONZE_PIPE: 3})
+        account, skipped = self.store.add_materials(
+            "alice", {BRONZE_PIPE: 2, BLACK_BEAD: 12})
+        self.assertEqual([], skipped)
+        self.assertEqual({BRONZE_PIPE: 5, BLACK_BEAD: 12},
+                         material_counts(account))
+        self.assertEqual(5, material_count(account, BRONZE_PIPE))
+
+    def test_add_materials_skips_unknown_ids_instead_of_failing(self):
+        # ★ 这是**故意**和 `add_item` 相反的：调用点是结算发奖，一条配错的
+        #   掉落规则不该让整局的结算包发不出去（玩家会卡在结算界面）。
+        account, skipped = self.store.add_materials(
+            "alice", {BRONZE_PIPE: 1, NO_SUCH_ITEM: 5, STOCK_ONLY: 1, "x": 1})
+        self.assertEqual({BRONZE_PIPE: 1}, material_counts(account))
+        self.assertEqual({NO_SUCH_ITEM, STOCK_ONLY, "x"}, set(skipped))
+
+    def test_add_materials_ignores_non_positive_counts(self):
+        account, skipped = self.store.add_materials(
+            "alice", {BRONZE_PIPE: 0, BLACK_BEAD: -3})
+        self.assertEqual({}, material_counts(account))
+        self.assertEqual([], skipped)
+
+    def test_consume_materials_is_all_or_nothing(self):
+        self.store.add_materials("alice", {BRONZE_PIPE: 3, BLACK_BEAD: 1})
+        before = self.raw_bytes()
+        with self.assertRaises(AccountError) as caught:
+            self.store.consume_materials("alice", {BRONZE_PIPE: 1, BLACK_BEAD: 2})
+        self.assertEqual("not_enough_materials", caught.exception.code)
+        # ★ 扣一半留一半 = 凭空吃掉玩家的青铜管。一个字节都不许动。
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_consume_materials_deletes_the_slot_when_used_up(self):
+        self.store.add_materials("alice", {BRONZE_PIPE: 3, BLACK_BEAD: 5})
+        account = self.store.consume_materials(
+            "alice", {BRONZE_PIPE: 3, BLACK_BEAD: 2})
+        self.assertEqual({BLACK_BEAD: 3}, material_counts(account))
+        # 用光的那一格直接删掉，别在存档里留一堆 0。
+        self.assertNotIn(str(BRONZE_PIPE),
+                         self.saved()["accounts"]["alice"]["materials"])
+
+    def test_consume_nothing_does_not_rewrite_the_file(self):
+        before = self.raw_bytes()
+        self.store.consume_materials("alice", {})
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_consume_materials_rejects_a_broken_request(self):
+        for bad in ({"abc": 1}, {BRONZE_PIPE: -1}):
+            with self.assertRaises(AccountError) as caught:
+                self.store.consume_materials("alice", bad)
+            self.assertEqual("invalid_material", caught.exception.code)
+
+    # ------------------------------------------------------- 幂等补齐（D5）
+    def test_ensure_item_fields_backfills_an_old_save(self):
+        store = self.write_raw({
+            "schema_version": 2,
+            "accounts": {"old": {"password": "pw", "money": 500}},
+        })
+        report = store.ensure_item_fields()
+        self.assertEqual(["old"], [row["username"] for row in report["accounts"]])
+        saved = self.saved()["accounts"]["old"]
+        self.assertEqual({}, saved["inventory"])
+        self.assertEqual([], saved["equipped"])
+        self.assertEqual({}, saved["materials"])
+
+    def test_ensure_item_fields_keeps_every_pre_existing_field(self):
+        # ★ 铁律 11：线上玩家数据一个字节都不能丢。
+        before = {"password": "pw", "display_name": "爱丽丝", "money": 8800,
+                  "experience": 4200, "level": 9, "tutorial_completed": True,
+                  "tutorial_progress": 5, "character": 2,
+                  "quest_difficulty": {"3": 2}, "quest_unlock_all": False,
+                  "character_unlock_all": False, "owned_characters": [100, 104]}
+        store = self.write_raw({"schema_version": 2,
+                                "accounts": {"old": dict(before)}})
+        store.ensure_item_fields()
+        after = self.saved()["accounts"]["old"]
+        for key, value in before.items():
+            self.assertEqual(value, after[key], key)
+
+    def test_ensure_item_fields_is_idempotent_and_does_not_rewrite_the_file(self):
+        store = self.write_raw({
+            "schema_version": 2,
+            "accounts": {"old": {"password": "pw"}},
+        })
+        store.ensure_item_fields()
+        before = self.raw_bytes()
+        report = store.ensure_item_fields()
+        self.assertEqual([], report["accounts"])
+        self.assertIsNone(report["admin_created"])
+        self.assertFalse(report["admin_broken"])
+        # 幂等 ⇒ 每次启动都能跑，不需要 schema 版本号（D5）。
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_ensure_item_fields_cleans_dirty_entries(self):
+        store = self.write_raw({
+            "schema_version": 2,
+            "accounts": {"bob": {
+                "password": "pw",
+                "inventory": {str(REVOLVER_R1): 2,          # 简写
+                              str(REVOLVER_R2): {"count": 1},
+                              str(NO_SUCH_ITEM): {"count": 1}},
+                # 抢同一个槽的 + 一件根本没有的
+                "equipped": [REVOLVER_R1, REVOLVER_R2, TOP_ARMOR],
+                "materials": {str(BRONZE_PIPE): 3, str(BLACK_BEAD): -1,
+                              str(NO_SUCH_ITEM): 2, "abc": 5},
+            }},
+        })
+        store.ensure_item_fields()
+        saved = self.saved()["accounts"]["bob"]
+        self.assertEqual({str(REVOLVER_R1): {"count": 2, "expires": None},
+                          str(REVOLVER_R2): {"count": 1, "expires": None}},
+                         saved["inventory"])
+        self.assertEqual([REVOLVER_R1], saved["equipped"])
+        self.assertEqual({str(BRONZE_PIPE): 3}, saved["materials"])
+
+    def test_normalize_says_what_it_changed(self):
+        _, _, _, notes = normalize_item_fields({"password": "pw"})
+        self.assertEqual(["补上 inventory", "补上 equipped", "补上 materials"],
+                         notes)
+        _, _, _, notes = normalize_item_fields(
+            {"inventory": {}, "equipped": [], "materials": {}})
+        self.assertEqual([], notes)
+
+    def test_import_keeps_and_cleans_the_item_fields(self):
+        payload = {"popshot_save": 1, "username": "carol", "account": {
+            "password": "pw",
+            "inventory": {str(REVOLVER_R1): 1, str(NO_SUCH_ITEM): 1},
+            "equipped": [NO_SUCH_ITEM, REVOLVER_R1],
+            "materials": {str(BRONZE_PIPE): 4},
+        }}
+        self.store.import_account(payload)
+        _, account = self.store.get_account("carol")
+        self.assertEqual([REVOLVER_R1], owned_item_ids(account))
+        self.assertEqual([REVOLVER_R1], equipped_items(account))
+        self.assertEqual({BRONZE_PIPE: 4}, material_counts(account))
+        # 上传的是人用记事本改过的文件 —— 脏条目不该落到磁盘上。
+        self.assertNotIn(str(NO_SUCH_ITEM),
+                         self.saved()["accounts"]["carol"]["inventory"])
+
+    def test_export_carries_the_item_fields(self):
+        self.store.add_item("alice", REVOLVER_R1)
+        self.store.equip_item("alice", REVOLVER_R1)
+        self.store.add_materials("alice", {BRONZE_PIPE: 2})
+        payload = self.store.export_account("alice")["account"]
+        self.assertIn(str(REVOLVER_R1), payload["inventory"])
+        self.assertEqual([REVOLVER_R1], payload["equipped"])
+        self.assertEqual({str(BRONZE_PIPE): 2}, payload["materials"])
+
+
+class AdminAccountTests(unittest.TestCase):
+    """管理页的管理员表（D3：明文口令，和玩家账号一个口径）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "accounts.json")
+        self.store = AccountStore(self.path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def saved(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def write_raw(self, data):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        return AccountStore(self.path)
+
+    def test_default_admin_is_created_once(self):
+        self.assertEqual([], self.store.admin_names())
+        report = self.store.ensure_item_fields()
+        self.assertEqual(DEFAULT_ADMIN_NAME, report["admin_created"])
+        self.assertEqual([DEFAULT_ADMIN_NAME], self.store.admin_names())
+        # 再跑一遍不该冒出第二个，也不该把改过的口令盖回默认值。
+        self.store.admin_set_password(DEFAULT_ADMIN_NAME, "NewPass1")
+        self.assertIsNone(self.store.ensure_item_fields()["admin_created"])
+        self.assertEqual(AUTH_OK,
+                         self.store.admin_verify(DEFAULT_ADMIN_NAME, "NewPass1"))
+
+    def test_an_empty_admin_table_means_the_page_is_off(self):
+        # ★ 「键不在」和「键在但是空的」是两回事（D13）：后者是用户主动
+        #   关掉了管理页，不该被我们又塞一个弱口令账号回去。
+        store = self.write_raw({"schema_version": 2, "accounts": {},
+                                ADMIN_ACCOUNTS_KEY: {}})
+        self.assertIsNone(store.ensure_item_fields()["admin_created"])
+        self.assertEqual([], store.admin_names())
+
+    def test_verify_reports_the_three_states(self):
+        self.store.ensure_item_fields()
+        self.assertEqual(
+            AUTH_OK,
+            self.store.admin_verify(DEFAULT_ADMIN_NAME, DEFAULT_ADMIN_PASSWORD))
+        self.assertEqual(AUTH_BAD_PASSWORD,
+                         self.store.admin_verify(DEFAULT_ADMIN_NAME, "wrong"))
+        self.assertEqual(AUTH_NO_SUCH_USER,
+                         self.store.admin_verify("nobody", "whatever"))
+
+    def test_add_and_remove(self):
+        self.store.ensure_item_fields()
+        self.assertEqual([DEFAULT_ADMIN_NAME, "carol"],
+                         self.store.admin_add("carol", "SecretPw"))
+        self.assertEqual(AUTH_OK, self.store.admin_verify("carol", "SecretPw"))
+        self.assertEqual({"password": "SecretPw"},
+                         self.saved()[ADMIN_ACCOUNTS_KEY]["carol"])
+        self.assertEqual(["carol"], self.store.admin_remove(DEFAULT_ADMIN_NAME))
+
+    def test_add_refuses_a_duplicate(self):
+        self.store.ensure_item_fields()
+        with self.assertRaises(AccountError) as caught:
+            self.store.admin_add(DEFAULT_ADMIN_NAME, "whatever")
+        self.assertEqual("admin_exists", caught.exception.code)
+
+    def test_cannot_remove_the_last_admin(self):
+        # ★ 拦在存档层，不只拦前端 —— 前端拦得住鼠标，拦不住直接 POST。
+        self.store.ensure_item_fields()
+        with self.assertRaises(AccountError) as caught:
+            self.store.admin_remove(DEFAULT_ADMIN_NAME)
+        self.assertEqual("last_admin", caught.exception.code)
+        self.assertEqual([DEFAULT_ADMIN_NAME], self.store.admin_names())
+
+    def test_remove_and_set_password_reject_unknown_names(self):
+        self.store.ensure_item_fields()
+        self.store.admin_add("carol", "SecretPw")
+        for call in (lambda: self.store.admin_remove("nobody"),
+                     lambda: self.store.admin_set_password("nobody", "x1")):
+            with self.assertRaises(AccountError) as caught:
+                call()
+            self.assertEqual("no_such_admin", caught.exception.code)
+
+    def test_admin_names_follow_the_player_username_rule(self):
+        self.store.ensure_item_fields()
+        # 管理员名同样是 JSON 的键、也要经表单往返，没理由放得更松。
+        for bad in ("x", "a" * 17, "有中文", "bad name"):
+            with self.assertRaises(AccountError) as caught:
+                self.store.admin_add(bad, "SecretPw")
+            self.assertEqual("invalid_username", caught.exception.code)
+        with self.assertRaises(AccountError) as caught:
+            self.store.admin_add("carol", "")
+        self.assertEqual("invalid_password", caught.exception.code)
+
+    def test_a_broken_table_locks_the_page_but_is_never_overwritten(self):
+        store = self.write_raw({"schema_version": 2, "accounts": {},
+                                ADMIN_ACCOUNTS_KEY: "oops"})
+        report = store.ensure_item_fields()
+        self.assertTrue(report["admin_broken"])
+        self.assertIsNone(report["admin_created"])
+        # 玩家一点感觉都没有，只是谁都登不进管理页。
+        self.assertEqual([], store.admin_names())
+        self.assertEqual(AUTH_NO_SUCH_USER, store.admin_verify("admin", "x"))
+        # ★ 不自动修：那一格里可能还留着用户自己加的管理员。
+        self.assertEqual("oops", self.saved()[ADMIN_ACCOUNTS_KEY])
+        for call in (lambda: store.admin_add("carol", "SecretPw"),
+                     lambda: store.admin_set_password("admin", "SecretPw"),
+                     lambda: store.admin_remove("admin")):
+            with self.assertRaises(AccountError) as caught:
+                call()
+            self.assertEqual("admin_table_broken", caught.exception.code)
+
+    def test_admin_table_survives_an_unrelated_account_write(self):
+        self.store.ensure_item_fields()
+        self.store.register("alice", "pw")
+        self.store.add_quest_reward("alice", money=10)
+        self.assertEqual([DEFAULT_ADMIN_NAME], self.store.admin_names())
 
 
 if __name__ == "__main__":

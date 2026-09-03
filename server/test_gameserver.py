@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import os
 import struct
+import tempfile
 import threading
 import time
 import unittest
@@ -99,9 +101,10 @@ from gameserver import (
     w_wstr,
 )
 from simple import SimpleCipher
+import account_store
 from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_STEP, LEVEL_MAX,
                            PREMIUM_CHARACTER_IDS, QUEST_DIFFICULTY_MAX,
-                           QUEST_ID_TABLE, character_item_id,
+                           QUEST_ID_TABLE, AccountStore, character_item_id,
                            character_item_ids, character_unlock_all,
                            experience_bounds, experience_for_level,
                            level_for_experience,
@@ -2653,6 +2656,147 @@ class CharacterUnlockTests(unittest.TestCase):
         self.addCleanup(lambda: gameserver._conns.__setitem__(slice(None), saved))
         gameserver.handle_control_command("equipped 0")
         self.assertEqual([], self.parse_equipped(conn.sent[0])[2])
+
+    # -- 装备也走这一发（V0.3商店 M3）--------------------------------------
+    def test_worn_gear_rides_along_with_the_character_items(self):
+        # ★ `0x030b` 是战斗加成的**唯一**来源（V0.3商店 §1）：处理器写的
+        #   `[GameSession+0x250+seat*4]` 正是 `GetEquipBonus` 读的那一格。
+        conn = self.make_conn(account={
+            "level": 1, "experience": 0, "money": 0, "character": 0,
+            "inventory": {"1120041": {"count": 1}, "1010015": {"count": 1}},
+            "equipped": [1010015, 1120041],
+        })
+        gameserver.Conn.send_slot_equipped_list(conn)
+        _seat, _masks, items = self.parse_equipped(conn.sent[0])
+        expected = [character_item_id(c) for c in PREMIUM_CHARACTER_IDS]
+        self.assertEqual(expected + [1010015, 1120041], items)
+
+    def test_the_two_id_spaces_do_not_overlap(self):
+        # 商城角色是 9 位的 `(id+1)*1e6+400001`，装备是 7 位的 ⇒ 直接接起来
+        # 就行，不用去重。这条断言守着「直接接」这个前提。
+        character_ids = set(character_item_id(c) for c in PREMIUM_CHARACTER_IDS)
+        self.assertTrue(min(character_ids) > 9999999)
+
+    def test_gear_the_player_does_not_own_never_reaches_the_client(self):
+        # 手改存档「装备了没买的东西」时就地丢掉 —— 发一个客户端查不到的 id
+        # 下去，轻则空格子，重则加成算在别人头上。
+        conn = self.make_conn(account={
+            "level": 1, "experience": 0, "money": 0, "character": 0,
+            "inventory": {}, "equipped": [1010015],
+        })
+        gameserver.Conn.send_slot_equipped_list(conn)
+        _seat, _masks, items = self.parse_equipped(conn.sent[0])
+        self.assertEqual([character_item_id(c) for c in PREMIUM_CHARACTER_IDS],
+                         items)
+
+
+class ShopControlCommandTests(unittest.TestCase):
+    """`inv` / `give` / `equip` / `unequip`（V0.3商店 M3 的实机验证工具）。
+
+    这四条是**调试命令**，但 M3 那个 spike（「穿上之后属性真的变了吗」）
+    只能靠它们做 —— 商店 UI 还没通，没有别的路把装备穿到身上。
+    """
+
+    REVOLVER_R1 = 1120041        # 리볼버 R1，武器槽 1
+    REVOLVER_R2 = 1120042        # 同一个武器槽的另一把
+    TOP_ARMOR = 1010015          # 上衣，和武器不抢槽
+    BRONZE_PIPE = 30018          # 材料
+    STOCK_ONLY = 1510001         # 只有货架条目，进不了背包
+
+    #: `CharacterUnlockTests.make_conn()` 要它。借那个假 Conn 而不是再造一个
+    #: —— 两处要是走样了，这组测试就不再是在测同一条下发路径。
+    Args = CharacterUnlockTests.Args
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = AccountStore(os.path.join(self.tmp.name, "accounts.json"))
+        self.store.register("tester", "pw")
+        self.conn = CharacterUnlockTests.make_conn(self)
+        self.conn.accounts = self.store
+        self.conn.account = self.store.get_account("tester")[1]
+        saved = list(gameserver._conns)
+        gameserver._conns[:] = [self.conn]
+        self.addCleanup(
+            lambda: gameserver._conns.__setitem__(slice(None), saved))
+
+    def run_cmd(self, line):
+        return gameserver.handle_control_command(line)
+
+    def equipped_now(self):
+        return account_store.equipped_items(
+            self.store.get_account("tester")[1])
+
+    def test_give_puts_it_in_the_warehouse(self):
+        self.assertTrue(self.run_cmd(f"give {self.REVOLVER_R1}").startswith("ok"))
+        self.assertTrue(account_store.has_item(
+            self.store.get_account("tester")[1], self.REVOLVER_R1))
+
+    def test_give_refuses_an_id_the_client_does_not_know(self):
+        reply = self.run_cmd(f"give {self.STOCK_ONLY}")
+        self.assertTrue(reply.startswith("err"), reply)
+
+    def test_give_material_refuses_an_id_the_client_does_not_know(self):
+        # `add_materials` 是「跳过不抛」的（D12），命令层要自己把它说出来，
+        # 否则 `give-material 999` 会回一句 ok 而什么都没发生。
+        self.assertTrue(self.run_cmd("give-material 9999999").startswith("err"))
+        self.assertTrue(
+            self.run_cmd(f"give-material {self.BRONZE_PIPE} 3").startswith("ok"))
+        self.assertEqual(
+            {self.BRONZE_PIPE: 3},
+            account_store.material_counts(self.store.get_account("tester")[1]))
+
+    def test_equip_adds_the_item_when_the_warehouse_is_empty(self):
+        # 调试命令的本分是省事 —— 但要在应答里说清楚它替你做了什么。
+        reply = self.run_cmd(f"equip {self.TOP_ARMOR}")
+        self.assertTrue(reply.startswith("ok"), reply)
+        self.assertIn("顺手放一件进去", reply)
+        self.assertEqual([self.TOP_ARMOR], self.equipped_now())
+
+    def test_equip_reships_0x030b_immediately(self):
+        # ★ 加成只认 `0x030b`：不重发的话客户端手里还是上一份清单。
+        self.run_cmd(f"equip {self.TOP_ARMOR}")
+        frames = [f for f in self.conn.sent
+                  if take_frame(bytearray(f))[1] == OP_SLOT_EQUIPPED_LIST]
+        self.assertEqual(1, len(frames))
+        items = CharacterUnlockTests.parse_equipped(frames[0])[2]
+        self.assertIn(self.TOP_ARMOR, items)
+
+    def test_equipping_the_same_slot_knocks_the_old_one_off(self):
+        self.run_cmd(f"equip {self.REVOLVER_R1}")
+        reply = self.run_cmd(f"equip {self.REVOLVER_R2}")
+        self.assertEqual([self.REVOLVER_R2], self.equipped_now())
+        self.assertIn(str(self.REVOLVER_R1), reply)
+
+    def test_unequip_takes_it_off_and_reships(self):
+        self.run_cmd(f"equip {self.TOP_ARMOR}")
+        self.run_cmd(f"equip {self.REVOLVER_R1}")
+        self.conn.sent.clear()
+        self.run_cmd(f"unequip {self.TOP_ARMOR}")
+        self.assertEqual([self.REVOLVER_R1], self.equipped_now())
+        items = CharacterUnlockTests.parse_equipped(self.conn.sent[0])[2]
+        self.assertNotIn(self.TOP_ARMOR, items)
+
+    def test_inv_shows_money_gear_and_materials(self):
+        self.store.add_quest_reward("tester", money=1234)
+        self.run_cmd(f"equip {self.REVOLVER_R1}")
+        self.run_cmd(f"give {self.TOP_ARMOR}")
+        self.run_cmd(f"give-material {self.BRONZE_PIPE} 5")
+        reply = self.run_cmd("inv")
+        self.assertTrue(reply.startswith("ok"), reply)
+        self.assertIn("1234", reply)
+        self.assertIn("★穿着", reply)
+        self.assertIn("青铜管 ×5", reply)          # shop.json 里的中文名
+        self.assertIn(str(self.TOP_ARMOR), reply)
+
+    def test_the_commands_report_their_usage(self):
+        for cmd in ("give", "give-material", "equip", "unequip"):
+            self.assertTrue(self.run_cmd(cmd).startswith("err 用法"), cmd)
+
+    def test_every_new_command_is_in_the_help_text(self):
+        # 命令表是给人看的唯一入口，加了命令不写进去等于没加。
+        for cmd in ("inv", "give", "give-material", "equip", "unequip"):
+            self.assertIn(cmd, gameserver.CONTROL_HELP, cmd)
 
 
 class SendBatchTests(unittest.TestCase):

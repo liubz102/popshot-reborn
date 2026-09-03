@@ -55,11 +55,13 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from simple import SimpleCipher
-from account_store import (AccountStore, BASE_CHARACTER_IDS,
+from account_store import (AccountError, AccountStore, BASE_CHARACTER_IDS,
                            PREMIUM_CHARACTER_IDS, QUEST_DIFFICULTY_MAX,
                            character_item_id, character_item_ids,
                            character_unlock_all, display_name,
-                           experience_bounds, owned_characters,
+                           equipped_items, experience_bounds, has_item,
+                           inventory_items,
+                           material_counts, owned_characters,
                            player_character, player_experience, player_level,
                            player_money, quest_cleared_difficulty,
                            quest_difficulty_records, quest_unlock_all,
@@ -81,6 +83,10 @@ from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
 from netlisten import create_listener, describe as describe_listen, tune_stream
 import relayserver
 import roomclock
+#: 商店物品表 + 运营配置（V0.3商店）。这里只用来给调试命令的输出配个人看得懂的
+#: 名字；真正的商店业务逻辑在 `shop.py`（M5）。
+import shopcfg
+import shopdata
 from tickets import TicketStore, short as short_ticket
 import udpsync
 import versioning
@@ -6226,19 +6232,31 @@ class Conn:
         """把「这个座位持有哪些物品」下发给客户端（opcode 0x030b）。
 
         ★ 不发这一发，房间右下角的「人物选择」永远只有 3 个基础角色 ——
-        11 个商城角色全部卡在客户端的持有判定上（FINDINGS §119）。
+        11 个商城角色全部卡在客户端的持有判定上（V0.1 §119）。
+
+        ★★ **这一发同时是战斗加成的唯一来源**（V0.3商店 §1）：处理器
+        `0x406ea1` 把清单写进 `[GameSession + 0x250 + seat*4]`，正是
+        `0x4070aa`（所有 `GetEquipBonus` 调用点的读取处）读的那一格。
+        清单里的每个 itemId 都会被 `EquipmentEx::Equip`（`0x414d95`）按
+        `key = itemId/1e6 - 1` 分桶，客户端自己查本地 `EquipBonus.ini`
+        算加成 —— 服务端下发不了、也不需要下发任何数值。
+        ⇒ **发的是两批 id 的并集**：商城角色的解锁物品 + 玩家穿在身上的装备。
 
         **必须排在 `0x0300` 之后**：持有判定 `0x4070da` 第一步就是
         `0x4045f9` 查「我的座位已占用吗」，那个标记只有 `0x0300` 会写。
         """
         if seat_index is None:
             seat_index = self.my_seat
-        item_ids = character_item_ids(self.account)
+        # ★ 两批 id 的 id 空间不重叠（商城角色是 9 位的 `(id+1)*1e6+400001`，
+        #   装备是 7 位的），所以直接接在一起就行，不用去重。
+        character_ids = character_item_ids(self.account)
+        equipped = equipped_items(self.account)
+        item_ids = character_ids + equipped
         characters = owned_characters(self.account)
         self.log(f"← 回 0x030b 座位 {seat_index} 物品清单("
                  f"{len(item_ids)} 件; 商城角色 {characters}"
                  f"{'，全开' if character_unlock_all(self.account) else '，按存档'}"
-                 f"){reason}")
+                 f"; 装备 {equipped}){reason}")
         try:
             payload = build_slot_equipped_list(seat_index, item_ids)
         except ValueError as error:
@@ -9595,12 +9613,40 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
                                   `quest-difficulty 3 0` 把关卡 3 锁回只剩简单。
                                   ★ 客户端只放行「已达成难度 + 1」以内的难度
   equipped [座位 物品id ...]      发 0x030b 座位物品清单 = 「人物选择里有几个
-                                  头像」。不带参数就按存档发；`equipped 0`
-                                  把座位 0 的清单清空，复现只有 3 个角色的
-                                  原始状态。★ 要在房间里发才看得出效果，
-                                  而且按钮只在进房间那一刻建一次
+                                  头像」+「战斗里吃哪些装备加成」。不带参数就
+                                  按存档发（商城角色 id + 身上的装备）；
+                                  `equipped 0` 把座位 0 的清单清空，复现只有
+                                  3 个角色的原始状态。★ 要在房间里发才看得出
+                                  效果，而且角色按钮只在进房间那一刻建一次
+  inv                             看仓库 / 身上的装备 / 材料存量 + 金币
+  give <itemId> [数量]            往仓库里塞一件（客户端不认识的 id 会被拒绝）
+  give-material <itemId> [数量]   往材料表里塞
+  equip <itemId>                  穿上并**立刻重发 0x030b**。仓库里没有的话
+                                  顺手放一件进去（会在应答里说明）。
+                                  抢同一个槽的旧装备会被自动顶下来
+  unequip <itemId>                脱下并立刻重发 0x030b
+                                  ★ 加成是**客户端**查本地 EquipBonus.ini 算的，
+                                  服务端只下发 itemId；而且攻/防加成只有 15%
+                                  概率触发，要看效果优先挑 Hp（100% 生效的加法）
   help                            这段
 """
+
+
+def _item_label(item_id):
+    """调试输出用的物品名：优先 `shop.json` 里的中文名，退回原版韩文名。
+
+    只给控制通道用 —— 玩家看到的名字是客户端自己按 itemId 查本地表画的，
+    服务端这边下发不了名字。
+    """
+    item_id = int(item_id)
+    table, _warnings = shopcfg.shop()
+    entry = table.get(item_id)
+    if entry and entry.get("name"):
+        return f"{item_id} {entry['name']}"
+    item = shopdata.get(item_id)
+    if item is not None and item.name_kr:
+        return f"{item_id} {item.name_kr}"
+    return str(item_id)
 
 
 def _control_status(conn):
@@ -9903,6 +9949,76 @@ def _dispatch_control_command(line):
             return f"err {error}"
         conn.send(build_game(OP_SLOT_EQUIPPED_LIST, payload))
         return f"ok 已发 0x030b 座位={seat} {len(item_ids)} 件 {item_ids}"
+
+    if cmd == "inv":
+        conn.reload_account()
+        account = conn.account
+        equipped = equipped_items(account)
+        inventory = inventory_items(account)
+        materials = material_counts(account)
+        lines = [f"账号 {conn.account_name}  等级 {player_level(account)}  "
+                 f"金币 {player_money(account)}",
+                 "装备(%d): %s" % (len(equipped),
+                                   "、".join(_item_label(i) for i in equipped)
+                                   or "（空）")]
+        lines.append("仓库(%d):" % len(inventory))
+        for item_id in sorted(inventory):
+            lines.append("  %s ×%d%s"
+                         % (_item_label(item_id), inventory[item_id]["count"],
+                            "  ★穿着" if item_id in equipped else ""))
+        lines.append("材料(%d):" % len(materials))
+        for item_id in sorted(materials):
+            lines.append("  %s ×%d" % (_item_label(item_id), materials[item_id]))
+        return "ok\n" + "\n".join(lines)
+
+    if cmd in ("give", "give-material"):
+        if len(words) < 2:
+            return f"err 用法: {cmd} <itemId> [数量]"
+        item_id = int(words[1], 0)
+        count = int(words[2], 0) if len(words) > 2 else 1
+        try:
+            if cmd == "give":
+                conn.account = conn.accounts.add_item(conn.account_name,
+                                                      item_id, count)
+                skipped = []
+            else:
+                conn.account, skipped = conn.accounts.add_materials(
+                    conn.account_name, {item_id: count})
+        except AccountError as error:
+            return f"err {error.message}"
+        if skipped:
+            # `add_materials` 是「跳过不抛」的（D12），所以这里要自己把它说出来。
+            return f"err {_item_label(item_id)} 客户端不认识，没给"
+        return f"ok 已给 {_item_label(item_id)} ×{count}"
+
+    if cmd in ("equip", "unequip"):
+        if len(words) < 2:
+            return f"err 用法: {cmd} <itemId>"
+        item_id = int(words[1], 0)
+        note = ""
+        if cmd == "equip":
+            # 调试命令的本分是省事：仓库里没有就顺手放一件进去，但要**说出来**
+            # —— 存档层的「不能穿没有的东西」那条不变式一点没松（D6）。
+            if not has_item(conn.account, item_id):
+                try:
+                    conn.account = conn.accounts.add_item(conn.account_name,
+                                                          item_id)
+                except AccountError as error:
+                    return f"err {error.message}"
+                note = "（仓库里本来没有，已顺手放一件进去）"
+            conn.account, dropped = conn.accounts.equip_item(conn.account_name,
+                                                             item_id)
+        else:
+            conn.account, dropped = conn.accounts.unequip_item(
+                conn.account_name, item_id)
+        # ★ 加成只认 `0x030b`（§1 / §4）—— 改完存档必须立刻重发，
+        #   否则客户端手里还是上一份清单。
+        conn.send_slot_equipped_list(reason=f"（ctl {cmd}）")
+        equipped = equipped_items(conn.account)
+        tail = f"；顶掉 {dropped}" if dropped else ""
+        return (f"ok {cmd} {_item_label(item_id)}{note}；"
+                f"现在穿着 {[_item_label(i) for i in equipped]}{tail}"
+                f"，已重发 0x030b")
 
     if cmd == "sync-account":
         # 直接改了 accounts.json 之后不用重登游戏，一条命令就能让画面跟上。
