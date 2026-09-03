@@ -349,46 +349,52 @@ class BotCommandTests(LobbyIsolated):
         self.assertTrue(all(room.seats[i].ready for i in room.bot_seats()))
 
     # -- AI 难度 -----------------------------------------------------------
-    def test_a_new_room_defaults_to_medium_and_the_three_commands_are_global(self):
+    def test_a_new_room_defaults_to_three_and_all_five_levels_are_global(self):
         room = self.open_room()
         bot.handle_command(self.host, "/a 2")
-        self.assertEqual("medium", room.bot_difficulty)
-        for text, level in (("/s", "easy"), ("/h", "hard"), ("/m", "medium")):
+        self.assertEqual(3, room.bot_difficulty)
+        for level in range(1, 6):
             self.host.sent.clear()
-            self.assertTrue(bot.handle_command(self.host, text))
+            self.assertTrue(bot.handle_command(self.host, f"/d {level}"))
             self.assertEqual(level, room.bot_difficulty)
             self.assertIn(bot.BOT_DIFFICULTY_LABELS[level],
                           "".join(chat_lines(self.host)))
+
+    def test_d_without_a_number_restores_the_default(self):
+        room = self.open_room()
+        bot.handle_command(self.host, "/d 5")
+        self.assertTrue(bot.handle_command(self.host, "/d"))
+        self.assertEqual(bot.BOT_DIFFICULTY_DEFAULT, room.bot_difficulty)
 
     def test_difficulty_changes_work_during_battle_and_survive_a_new_game(self):
         room = self.open_room()
         bot.handle_command(self.host, "/a")
         machine = room.seats[1].conn
         room.status = SESSION_STATUS_PLAYING
-        self.assertTrue(bot.handle_command(self.host, "/h"))
-        self.assertEqual("hard", room.bot_difficulty)
+        self.assertTrue(bot.handle_command(self.host, "/d 5"))
+        self.assertEqual(5, room.bot_difficulty)
         machine.reset_battle_frame()       # 换图 / 后来新开一局
-        self.assertEqual("hard", room.bot_difficulty)
-        self.assertEqual(bot.BOT_DIFFICULTY_PROFILES["hard"],
+        self.assertEqual(5, room.bot_difficulty)
+        self.assertEqual(bot.BOT_DIFFICULTY_PROFILES[5],
                          bot.difficulty_profile(room))
 
-    def test_the_two_error_probabilities_decrease_with_difficulty(self):
-        easy = bot.BOT_DIFFICULTY_PROFILES["easy"]
-        medium = bot.BOT_DIFFICULTY_PROFILES["medium"]
-        hard = bot.BOT_DIFFICULTY_PROFILES["hard"]
-        self.assertGreater(easy["aim_error"], medium["aim_error"])
-        self.assertGreater(medium["aim_error"], hard["aim_error"])
-        self.assertGreater(easy["dodge_error"], medium["dodge_error"])
-        self.assertGreater(medium["dodge_error"], hard["dodge_error"])
+    def test_the_five_profiles_match_the_requested_error_rates(self):
+        self.assertEqual({
+            1: {"aim_error": 0.85, "dodge_error": 0.50},
+            2: {"aim_error": 0.65, "dodge_error": 0.40},
+            3: {"aim_error": 0.40, "dodge_error": 0.30},
+            4: {"aim_error": 0.20, "dodge_error": 0.15},
+            5: {"aim_error": 0.10, "dodge_error": 0.05},
+        }, bot.BOT_DIFFICULTY_PROFILES)
 
-    def test_old_s_with_a_seat_argument_points_at_hold_without_freezing(self):
+    def test_d_rejects_invalid_or_per_bot_forms_without_changing_the_level(self):
         room = self.open_room()
-        bot.handle_command(self.host, "/a")
-        machine = room.seats[1].conn
-        self.host.sent.clear()
-        self.assertTrue(bot.handle_command(self.host, "/s 1"))
-        self.assertFalse(machine.holding)
-        self.assertIn("/hold", "".join(chat_lines(self.host)))
+        for text in ("/d 0", "/d 6", "/d easy", "/d 1 5"):
+            self.host.sent.clear()
+            self.assertTrue(bot.handle_command(self.host, text))
+            self.assertEqual(3, room.bot_difficulty)
+            self.assertIn("/d", "".join(chat_lines(self.host)))
+        self.assertIn("不能指定单个 bot", "".join(chat_lines(self.host)))
 
     # -- 权限 / 时机 --------------------------------------------------------
     def test_a_non_host_command_is_not_swallowed_but_gets_a_hint(self):
@@ -424,7 +430,7 @@ class BotCommandTests(LobbyIsolated):
         self.assertTrue(bot.handle_command(self.host, "/help"))
         lines = chat_lines(self.host)
         self.assertEqual(len(bot.BATTLE_HELP_LINES), len(lines))
-        self.assertIn("/s", "".join(lines))
+        self.assertIn("/d", "".join(lines))
         self.assertIn("/w", "".join(lines))
 
     def test_help_in_the_room_lists_the_room_commands(self):
@@ -435,21 +441,24 @@ class BotCommandTests(LobbyIsolated):
         self.assertEqual(len(bot.HELP_LINES), len(lines))
         self.assertIn("/a", "".join(lines))
 
-    def test_help_has_two_aliases_and_h_is_reserved_for_hard(self):
+    def test_h_help_and_question_mark_show_the_same_help(self):
         self.open_room()
-        for text in ("/help", "/?"):
+        expected = None
+        for text in ("/h", "/help", "/?"):
             self.host.sent.clear()
             self.assertTrue(bot.handle_command(self.host, text))
-            self.assertEqual(len(bot.HELP_LINES), len(chat_lines(self.host)))
-        self.host.sent.clear()
-        self.assertTrue(bot.handle_command(self.host, "/h"))
-        self.assertEqual(1, len(chat_lines(self.host)))
+            lines = chat_lines(self.host)
+            self.assertEqual(len(bot.HELP_LINES), len(lines))
+            if expected is None:
+                expected = lines
+            else:
+                self.assertEqual(expected, lines)
 
     def test_help_fits_in_the_four_visible_chat_rows(self):
         # ★ 房间聊天框一次只看得见 4 行，被顶出去的就永远看不到了（§20）。
         #   到边自己折出来的行同样占额度，所以行数和每行宽度都要卡。
         self.assertLessEqual(len(bot.HELP_LINES), 4)
-        for line in bot.HELP_LINES:
+        for line in bot.HELP_LINES + bot.BATTLE_HELP_LINES:
             width = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1
                         for c in line)
             self.assertLessEqual(width, 50, f"这行太宽会折行：{line!r}")
@@ -462,7 +471,7 @@ class BotCommandTests(LobbyIsolated):
 
     def test_ordinary_chat_and_unknown_slash_words_pass_through(self):
         self.open_room()
-        for text in ("你好", "1/2 血了", "/dance", "/ 空格", "//"):
+        for text in ("你好", "1/2 血了", "/dance", "/s", "/m", "/ 空格", "//"):
             self.assertFalse(bot.handle_command(self.host, text),
                              f"{text!r} 被当成了 bot 命令")
 

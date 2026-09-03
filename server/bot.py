@@ -127,40 +127,33 @@ BOT_DEFAULT_CHARACTERS = tuple(BASE_CHARACTER_IDS)
 #: bot 命令的前缀。普通聊天不会以它开头，所以不会误吞玩家的话。
 COMMAND_PREFIX = "/"
 
-#: ★★ 三档 AI 难度只控制用户指定的两种失误（V0.3 M5）：
+#: ★★ 五档 AI 难度只控制用户指定的两种失误（V0.3 M5）：
 #:
 #: * `aim_error`：计算移动目标提前量时故意算错的概率；
 #: * `dodge_error`：预测敌方弹道时故意判断错的概率。
 #:
-#: 其余物理、武器属性和寻路能力三档完全共用，避免“简单难度”靠违反游戏
+#: 其余物理、武器属性和寻路能力五档完全共用，避免“简单难度”靠违反游戏
 #: 规则来变笨。数值是 AI 设计参数，不冒充原版常量；集中在这里便于实机调优。
 #:
-#: ## ★★ 会话 41：三档 `aim_error` 整体 **+0.15**（用户 2026-08-30：「开枪
-#: 准确度还是太高了，三个难度的失误率再整体都调高一点点」）
-#:
-#: 校准的锚是**语料里真人自己的命中率**（§49）：4533 对几何配对的
-#: `rpFire`/`rpExplode` 里，**打中人的只有 1990 对 = 43.9%** —— 也就是说
-#: 真人**每 10 发有 5.6 发是打空的**。
-#:
-#: 而 bot 不掷失误的那一发是「弹道解得精确、提前量也解对了」，除非目标
-#: 临时变向否则基本必中 ⇒ 旧的中等档 0.22 相当于命中率 ~78%，**比真人高
-#: 一大截**，实机手感就是「隔着老远也弹无虚发」。
-#:
-#: 取值：中等 **0.40** —— 命中率约 60%，比真人的 44% **稍微聪明一点**
-#: （用户要的就是「适中又稍微偏聪明」）；简单 / 困难跟着平移同样的
-#: +0.15，保持三档之间原有的区分度。
-#: ⚠ `dodge_error` 这一轮**没动**（用户没提，而且它管的是躲不躲得开，
-#:   和「准不准」是两件事）。
+#: 会话 59（D139）由用户明确给出五档数值。档位是房间级的整数 1..5，
+#: 数字越大，瞄准和闪避失误越少；新房间和 `/d` 无参数都回到默认档 3。
 BOT_DIFFICULTY_PROFILES = {
-    "easy": {"aim_error": 0.60, "dodge_error": 0.55},
-    "medium": {"aim_error": 0.40, "dodge_error": 0.30},
-    "hard": {"aim_error": 0.23, "dodge_error": 0.12},
+    1: {"aim_error": 0.85, "dodge_error": 0.50},
+    2: {"aim_error": 0.65, "dodge_error": 0.40},
+    3: {"aim_error": 0.40, "dodge_error": 0.30},
+    4: {"aim_error": 0.20, "dodge_error": 0.15},
+    5: {"aim_error": 0.10, "dodge_error": 0.05},
 }
 BOT_DIFFICULTY_LABELS = {
-    "easy": "简单（笨）",
-    "medium": "中等",
-    "hard": "困难（聪明）",
+    1: "1（最简单）",
+    2: "2（简单）",
+    3: "3（普通，默认）",
+    4: "4（困难）",
+    5: "5（最难）",
 }
+BOT_DIFFICULTY_DEFAULT = 3
+BOT_DIFFICULTY_MIN = min(BOT_DIFFICULTY_PROFILES)
+BOT_DIFFICULTY_MAX = max(BOT_DIFFICULTY_PROFILES)
 
 
 # ---------------------------------------------------------------------------
@@ -197,10 +190,10 @@ def _tick_clock(now):
 
 
 def difficulty_profile(room):
-    """返回房间当前的两项失误概率；旧/假房间安全退回中等。"""
-    level = getattr(room, "bot_difficulty", "medium")
+    """返回房间当前的两项失误概率；旧/假房间安全退回默认档 3。"""
+    level = getattr(room, "bot_difficulty", BOT_DIFFICULTY_DEFAULT)
     return BOT_DIFFICULTY_PROFILES.get(
-        level, BOT_DIFFICULTY_PROFILES["medium"])
+        level, BOT_DIFFICULTY_PROFILES[BOT_DIFFICULTY_DEFAULT])
 
 #: ★★ **客户端自己就吃掉的斜杠前缀，起名字时必须避开**（§19）。
 #:
@@ -923,16 +916,17 @@ class BotConn(gameserver.Conn):
 #: 54 宽在框里没折，往回收一点留余量。改这张表时请用同样的口径数宽度
 #: （中文和全角标点算 2，ASCII 算 1）。
 HELP_LINES = (
-    "bot 命令（房主专用，N = 座位号，/? 重看）：",
+    "bot 命令（房主专用，N = 座位号，/h 重看）：",
     "/a [n] 加 n 个（默认 1）;  /r 全部准备（再敲取消）",
     "/c N M 换角色（M=1~3）;  /t N 换队（组队战）",
-    "/s 简单; /m 中等; /h 困难; /w 0 自动换枪",
+    "/d [1~5] 难度（无数字=默认3）;  /w 0 自动换枪",
 )
 
-#: ★ **战斗中**的 `/?`。房间里那几条会被 `MUTATING_COMMANDS` 挡掉，列出来
-#: 只会占满那 4 行的额度（§20），所以这里只放战斗中真能用的两条。
+#: ★ **战斗中**的 `/h` / `/help` / `/?`。房间里那几条会被
+#: `MUTATING_COMMANDS` 挡掉，列出来只会占满那 4 行的额度（§20），
+#: 所以这里只放战斗中真能用的命令。
 BATTLE_HELP_LINES = (
-    "AI：/s 简单; /m 中等; /h 困难; /w 0 自动",
+    "AI：/d [1~5] 难度（/d=默认3）; /h 帮助",
     "/w M 锁武器; /hold N 站住; /dash 近身开关",
     "查子弹: /noboom 只飞不炸;  /slow 降到 1/10 速",
 )
@@ -954,13 +948,12 @@ def parse_command(text):
     return parts[0].lower(), parts[1:]
 
 
-#: 命令名 -> 处理函数。`/?` 是 `/help` 的短别名；`/h` 已按用户要求改成
-#: 困难难度，不能再同时当帮助。
+#: 命令名 -> 处理函数。`/h` 和 `/?` 都是 `/help` 的短别名。
 #: 在这张表里 = 「这是一条 bot 命令」，命令层据此决定要不要吞掉这行聊天。
 #:
 #: ★ `team` 还在表里，但它**不是**换队命令，只是一行「请改用 /t」的提示
 #: —— 客户端自己把 `/team ` 当队伍聊天吃掉了，服务端根本收不到（§19）。
-COMMAND_NAMES = ("a", "c", "t", "team", "r", "s", "m", "h", "w",
+COMMAND_NAMES = ("a", "c", "t", "team", "r", "d", "h", "w",
                  "hold", "help", "?")
 
 
@@ -1205,37 +1198,31 @@ def _battle_bots(room, args):
     return ([], error) if error else ([index], None)
 
 
-def _set_difficulty(conn, room, args, level):
-    """把全房间 bot 难度切到 `level`；三条短命令共用。"""
-    command = {"easy": "/s", "medium": "/m", "hard": "/h"}[level]
-    if args:
-        extra = "（站桩诊断已迁到 /hold [座位号]）" if level == "easy" else ""
-        return f"{command} 不带参数。{extra}"
+def _cmd_difficulty(conn, room, args):
+    """`/d [1~5]` —— 统一设置全房间 bot；无参数恢复默认档 3。"""
+    usage = (f"/d 用法：/d [{BOT_DIFFICULTY_MIN}~{BOT_DIFFICULTY_MAX}]"
+             f"（不填数字恢复默认 {BOT_DIFFICULTY_DEFAULT}）。")
+    if len(args) > 1:
+        return usage + " 难度只能统一调整，不能指定单个 bot。"
+    if not args:
+        level = BOT_DIFFICULTY_DEFAULT
+    else:
+        try:
+            level = int(args[0])
+        except ValueError:
+            return usage
+        if level not in BOT_DIFFICULTY_PROFILES:
+            return usage
     room.bot_difficulty = level
     profile = difficulty_profile(room)
     label = BOT_DIFFICULTY_LABELS[level]
-    conn.log(f"   {command}: bot 难度 -> {level} "
+    conn.log(f"   /d: bot 难度 -> {level} "
              f"瞄准失误={profile['aim_error']:.0%} "
              f"闪避失误={profile['dodge_error']:.0%}")
     conn.room_system_chat(
-        f"全体 bot 已调为{label}难度（瞄准失误 {profile['aim_error']:.0%}，"
+        f"全体 bot 难度已设为 {label}（瞄准失误 {profile['aim_error']:.0%}，"
         f"闪避失误 {profile['dodge_error']:.0%}）。")
     return None
-
-
-def _cmd_easy(conn, room, args):
-    """`/s` —— 全房间 bot 切到简单（笨）难度。"""
-    return _set_difficulty(conn, room, args, "easy")
-
-
-def _cmd_medium(conn, room, args):
-    """`/m` —— 全房间 bot 切到中等难度（新房间默认）。"""
-    return _set_difficulty(conn, room, args, "medium")
-
-
-def _cmd_hard(conn, room, args):
-    """`/h` —— 全房间 bot 切到困难（聪明）难度。"""
-    return _set_difficulty(conn, room, args, "hard")
 
 
 def _cmd_hold(conn, room, args):
@@ -1536,18 +1523,17 @@ def _cmd_help(conn, room, args):
 
 #: 命令名 -> 处理函数。
 #:
-#: ★★ 名字全部是**一个字母**（用户 2026-08-28 要的，D56）：这些命令是在
-#: **游戏里的聊天框**敲的，打字要占住键盘、bot 那边还在打你 —— 每多一个
-#: 字母都是实打实的代价。`/del` 整条删掉了，踢 bot 用**客户端自带的踢人**。
+#: ★★ 常用房间命令优先用**一个字母**（用户 2026-08-28 要的，D56）：这些
+#: 命令是在游戏聊天框里敲的，打字时 bot 仍在行动。诊断命令保留可读长名；
+#: `/del` 整条删掉了，踢 bot 用**客户端自带的踢人**。
 COMMANDS = {
     "a": _cmd_add,
     "c": _cmd_char,
     "t": _cmd_team,
     "team": _cmd_team_alias,
     "r": _cmd_ready,
-    "s": _cmd_easy,
-    "m": _cmd_medium,
-    "h": _cmd_hard,
+    "d": _cmd_difficulty,
+    "h": _cmd_help,
     "w": _cmd_gun,
     "hold": _cmd_hold,
     "dash": _cmd_dash,
@@ -1557,8 +1543,8 @@ COMMANDS = {
     "?": _cmd_help,
 }
 
-#: 改房间状态的命令 —— 游戏中一律拒绝。`/help` 不在里面，随时能看。
-#: `team` 也不在里面：它只是一行「请改用 /t」的提示，什么都不改。
+#: 改座位 / 准备状态的命令 —— 游戏中一律拒绝。`/d`、`/w` 与三种帮助名
+#: 不在里面，战斗中照样能用。`team` 也不在里面：它只是一行提示，什么都不改。
 MUTATING_COMMANDS = ("a", "c", "t", "r")
 
 

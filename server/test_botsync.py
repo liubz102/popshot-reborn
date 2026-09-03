@@ -4920,16 +4920,16 @@ class BotAimLeadTests(BotFireRoom):
         self.assertNotAlmostEqual(honest, self.fired_angle(), places=4)
 
     def test_the_difficulty_is_the_only_knob(self):
-        """三档只改两个概率，物理一格都不动（M5-A 的口径）。"""
-        self.room.bot_difficulty = "easy"
-        easy = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
-        self.room.bot_difficulty = "hard"
-        hard = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
-        self.assertGreater(easy, hard)
+        """五档只改两个概率，物理一格都不动（M5-A 的口径）。"""
+        self.room.bot_difficulty = 1
+        easiest = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
+        self.room.bot_difficulty = 5
+        hardest = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
+        self.assertGreater(easiest, hardest)
 
     def test_a_hud_jam_makes_it_much_worse(self):
         """★ 别人放糊屏 ⇒ 失误概率明显上去（§121，用户的要求）。"""
-        self.room.bot_difficulty = "medium"
+        self.room.bot_difficulty = 3
         plain = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
         self.room.quest.hud_jam_until[self.bot_seat] = time.monotonic() + 8.0
         jammed = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
