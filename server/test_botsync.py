@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import io
+import contextlib
 import math
 import os
 import random
@@ -30,6 +32,8 @@ if HERE not in sys.path:
 
 import ballistics                                              # noqa: E402
 import bot                                                     # noqa: E402
+import botaim                                                  # noqa: E402
+import botarms                                                 # noqa: E402
 import botnav                                                  # noqa: E402
 import botplan                                                 # noqa: E402
 import botsync                                                 # noqa: E402
@@ -4273,22 +4277,34 @@ class BotKeepAwayTests(TerrainMixin, BotFireRoom):
                                   self.terrain, None)     # 但这一枪打不出去
         self.assertEqual(1, intent[0], "打不到就该压上去，不是往外退")
 
-    def test_outside_the_ring_it_walks_in_but_stops_before_the_ring(self):
-        """★ 「尽量避免主动进入」：环外照旧朝敌人压，可站住打那道门
-        （`BOT_HOLD_RANGE` = 616）比环（512）远 —— 它停在环外。"""
+    def test_a_conservative_bot_never_chases(self):
+        """★★★ 保守那一档**不追** —— 打得到就就地打，够不着也不往里挤。
+
+        「追不追」（`_worth_closing()`）只在**逼近**姿态下问；保守那一档的
+        规矩是「不主动进入敌人半个屏幕」（D137），追进去就把它作废了。
+        """
+        self.hurt(self.bot_seat, 0.9)           # 10% 血 -> 保守
+        self.enemy_at(900.0)
+        self.place_bot(100.0)                   # 离敌人 800，远得该追
+        self.assertTrue(
+            bot._worth_closing(self.room, self.bot_conn, self.bot_seat,
+                               self.room.seat_index_of(self.alice), 800.0),
+            "夹具自检：这把枪在 800 上压过去确实更好")
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual("retreat", self.bot_conn.stance)
+        self.assertEqual(0, intent[0], "保守姿态打得到就就地打，不追")
+
+    def test_the_ring_still_beats_the_shooting_branch(self):
+        """★ 被贴进环里时先退，不许「打得到就就地打」把它按在原地。"""
         self.hurt(self.bot_seat, 0.9)
         self.enemy_at(900.0)
-        self.place_bot(100.0)                   # 离敌人 800 > 616
+        self.place_bot(700.0)                   # 离敌人 200 < 512
         intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
                                   self.terrain, self.target_row())
-        self.assertEqual(1, intent[0], "打得到但还太远，先压近点")
-        self.place_bot(900.0 - bot.BOT_HOLD_RANGE)
-        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
-                                  self.terrain, self.target_row())
-        self.assertEqual((0, False, False, False), intent,
-                         "到了命中距离中位数就站住打，不再往环里挤")
+        self.assertEqual(-1, intent[0])
         self.assertGreater(bot.BOT_HOLD_RANGE, bot.BOT_KEEP_AWAY_SPAN,
-                           "站住打那道门必须在环外，否则保守 bot 会挤进环里")
+                           "参照距离必须在环外，否则保守 bot 会挤进环里")
 
     def test_a_healthy_bot_walks_all_the_way_to_the_enemy(self):
         """★ 血 > 50% 的一个字没变：正常进攻，目标就是敌人本人。"""
@@ -4344,21 +4360,58 @@ class BotKeepAwayTests(TerrainMixin, BotFireRoom):
                          "退无可退不该把姿态闩改写成 press")
 
 
-class BotHoldRangeTests(TerrainMixin, BotFireRoom):
-    """★★★★ 「打得到就站住打」只在**真人真的打得中的距离**之内（D137）。
+class BotLogRoomTagTests(BotFireRoom):
+    """★★ bot 的日志行要带**房间号**（用户 2026-09-03）。
 
-    用户 2026-09-03：「距离太远了 bot 就不动了。」线上 `Forest02` 那一局
-    两个 bot 隔着 **1010 像素**互相「打得到·站住打」，谁也打不中谁，
-    站了 **161 秒**到时限（§176）。
+    「bot 的 log 再加个房间号吧，以后再出问题好调查。」
 
-    `BOT_ENGAGE_RANGE`（1000 = §48 的 p99）是**开不开枪**的门；
-    `BOT_HOLD_RANGE`（616 = §48 的中位数）是**站不站住**的门。
+    bot 的日志行本来只有 `bot N`，多个房间同时开打时整份 `server.out` 混在
+    一起，事后根本分不开是谁 —— §176 那次扫描为此只能丢掉 10 局（54 局里
+    只有 44 局是独占窗口）。
+    """
+
+    def line(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.bot_conn.log("   哨兵")
+        return out.getvalue().strip()
+
+    def test_the_line_carries_the_room_id(self):
+        line = self.line()
+        self.assertIn("房#%d" % self.room.room_id, line)
+        self.assertIn(self.bot_conn.nickname, line)
+        self.assertLess(line.index("房#"), line.index(self.bot_conn.nickname),
+                        "房间号要在昵称前面，好按房间 grep")
+
+    def test_a_bot_with_no_room_still_logs(self):
+        """★ 还没进房间的 bot（协议试探 / 单测夹具）不该因此炸掉。"""
+        self.bot_conn.room_id = None
+        self.assertNotIn("房#", self.line())
+        self.assertIn(self.bot_conn.nickname, self.line())
+
+    def test_the_room_loop_keeps_it_fresh(self):
+        """★ 房间销毁重建之后号会变 —— 每格刷一次（`tick_room()`）。"""
+        self.bot_conn.room_id = 999
+        bot.tick_room(self.room, 0, time.monotonic())
+        self.assertEqual(self.room.room_id, self.bot_conn.room_id)
+
+
+class BotChaseChoiceTests(TerrainMixin, BotFireRoom):
+    """★★★★ 「追不追」由**这把枪的实际输出**说了算（D138）。
+
+    用户 2026-09-03：「用狙击枪远程打也是常见玩法。不要求非要贴上去，
+    我希望血量足够时 bot 能自己判断是否追击的策略。」
+
+    ⇒ 判据不是距离常数，是 `_seconds_to_kill()` 在**当前距离**和
+      `BOT_HOLD_RANGE`（§48 的中位命中距离 616）上各算一次，压过去之后
+      「打倒他要几秒」明显更短（`BOT_PRESS_RATIO` = 0.80）才追。
     """
 
     def setUp(self):
         super().setUp()
-        self.terrain = self.install_terrain(synth_terrain("hold_range",
+        self.terrain = self.install_terrain(synth_terrain("chase_choice",
                                                           width=4000))
+        self.alice_seat = self.room.seat_index_of(self.alice)
 
     def enemy_at(self, x, y=150.0):
         for conn in (self.alice, self.bob):
@@ -4366,31 +4419,189 @@ class BotHoldRangeTests(TerrainMixin, BotFireRoom):
             conn.sync_trail.append((x, y, 0))
 
     def target_row(self):
-        """一份「这一枪打得出去」的 `_fire_target()` 结果（只有座位号有用）。"""
-        return (self.room.seat_index_of(self.alice), None, None)
+        return (self.alice_seat, None, None)
 
-    def test_it_stands_and_shoots_inside_the_median_hit_distance(self):
+    def worth(self, span):
+        return bot._worth_closing(self.room, self.bot_conn, self.bot_seat,
+                                  self.alice_seat, span)
+
+    # ---- 判据本身 ----------------------------------------------------------
+
+    def test_inside_the_median_hit_distance_it_never_chases(self):
+        """★ 已经在真人常打中的距离里了，再压近只是白送身位。"""
         self.place_bot(600.0)
-        self.enemy_at(900.0)                    # 300 < 616
-        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
-                                  self.terrain, self.target_row())
-        self.assertEqual((0, False, False, False), intent)
+        self.enemy_at(900.0)
+        self.assertFalse(self.worth(bot.BOT_HOLD_RANGE))
+        self.assertFalse(self.worth(bot.BOT_HOLD_RANGE - 1.0))
 
-    def test_it_closes_in_instead_of_plinking_from_max_range(self):
+    def test_a_gun_that_cannot_reach_that_far_means_chase(self):
+        """★ 「够不着」正是要追的那一档：这个距离上算不出输出就该追。
+
+        （抛物线那几把在远距离上 `ballistics.solve()` 直接无解 —— 这里把
+        `_seconds_to_kill()` 钉成 `None` 复现同一个判决，不依赖具体哪把枪。）
+        """
         self.place_bot(100.0)
-        self.enemy_at(1000.0)                   # 900 > 616，仍在交战距离内
-        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
-                                  self.terrain, self.target_row())
-        self.assertEqual(1, intent[0],
-                         "比真人常打中的距离还远，该压上去边走边打")
+        self.enemy_at(1113.0)
+        original = bot._seconds_to_kill
 
-    def test_the_boundary_itself_still_stands(self):
-        """★ 严格大于才压上去：正好 616 照旧站住打。"""
-        self.place_bot(1000.0)
-        self.enemy_at(1000.0 + bot.BOT_HOLD_RANGE)
+        def stub(room, shooter, victim, span, victim_speed=None):
+            if span > bot.BOT_HOLD_RANGE:
+                return None                     # 这么远打不出输出
+            return original(room, shooter, victim, span,
+                            victim_speed=victim_speed)
+
+        bot._seconds_to_kill = stub
+        self.addCleanup(setattr, bot, "_seconds_to_kill", original)
+        self.assertTrue(self.worth(1013.0))
+
+    def test_a_gun_that_is_useless_up_close_does_not_chase(self):
+        """★ 反过来：压过去反而没输出（近处解不开弹道）就别压。"""
+        self.place_bot(100.0)
+        self.enemy_at(1113.0)
+        original = bot._seconds_to_kill
+
+        def stub(room, shooter, victim, span, victim_speed=None):
+            if span <= bot.BOT_HOLD_RANGE:
+                return None                     # 压到那儿反而打不出来
+            return original(room, shooter, victim, span,
+                            victim_speed=victim_speed)
+
+        bot._seconds_to_kill = stub
+        self.addCleanup(setattr, bot, "_seconds_to_kill", original)
+        self.assertFalse(self.worth(1013.0))
+
+    def test_it_only_chases_when_closing_really_pays(self):
+        """★★★ 门是**比值**，不是距离：压过去要让 TTK 明显更短才追。"""
+        self.place_bot(100.0)
+        self.enemy_at(1113.0)
+        span = 1013.0
+        near = bot._seconds_to_kill(self.room, self.bot_seat,
+                                    self.alice_seat, bot.BOT_HOLD_RANGE)
+        far = bot._seconds_to_kill(self.room, self.bot_seat,
+                                   self.alice_seat, span)
+        self.assertIsNotNone(near)
+        self.assertIsNotNone(far)
+        self.assertEqual(near <= far * bot.BOT_PRESS_RATIO, self.worth(span),
+                         "判据必须就是那一个比值")
+
+    def test_the_real_weapon_table_says_close_in_at_a_thousand_pixels(self):
+        """★★★★★ `Forest02` 那一局的现场：两个 bot 隔着 1013 像素互相
+        「站住打」，**161 秒零伤害**（§176 ②）。它们手上那几把枪在那个距离
+        上的输出只有中位距离的 0.3~0.6 倍 —— 远低于 `BOT_PRESS_RATIO`
+        要求的 0.80 ⇒ 该追。"""
+        for weapon_id in (1000010, 1002010, 1002030):
+            weapon = weapondata.get(weapon_id)
+            scores = []
+            for span in (bot.BOT_HOLD_RANGE, 1013.0):
+                shot = ballistics.solve(weapon, span, 0.0)
+                self.assertIsNotNone(shot, "%s 在 %.0f 上解不出弹道"
+                                     % (weapon_id, span))
+                scores.append(botarms.score(weapon, shot, 7.0, 20.0, span))
+            ratio = scores[1] / scores[0]
+            self.assertLess(ratio, bot.BOT_PRESS_RATIO,
+                            "%s 在 1013 像素上的输出是中位距离的 %.2f 倍，"
+                            "该判「压过去更好」" % (weapon_id, ratio))
+
+    # ---- 走位 --------------------------------------------------------------
+
+    def test_it_holds_and_shoots_when_closing_does_not_pay(self):
+        self.place_bot(600.0)
+        self.enemy_at(900.0)                    # 300 < 616 -> 不追
         intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
                                   self.terrain, self.target_row())
-        self.assertEqual((0, False, False, False), intent)
+        self.assertEqual(0, intent[0], "就地打，不挪窝")
+
+    def test_it_closes_in_when_it_pays(self):
+        self.place_bot(100.0)
+        self.enemy_at(1113.0)                   # 1013 -> 该追
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual(1, intent[0], "该压上去边走边打")
+
+    def test_closing_stops_at_the_median_distance_not_in_your_face(self):
+        """★ 「不代表一定要贴上去」：压到中位命中距离就停。"""
+        self.enemy_at(1113.0)
+        self.place_bot(1113.0 - bot.BOT_HOLD_RANGE)
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual(0, intent[0])
+
+
+class BotJumpShootTests(TerrainMixin, BotFireRoom):
+    """★★★★★ 「就地打」是**边跳边打**，不是站着不动（D138）。
+
+    用户 2026-09-03：「『站着不动仅开枪』我想改一改，变成边跳跃躲子弹边
+    开枪，因为真人在绝大多数情况也都是边跳跃躲子弹边开枪的。」
+
+    跳多勤照 §71 那份 144 万发心跳的**腾空占比 39%** 折算，
+    **不是**一落地就跳 —— 那样腾空会到 90%，而腾空时方向键不起作用
+    （§93），`_dodge_intent()` 整套就废了。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(synth_terrain("jump_shoot",
+                                                          width=4000))
+        self.place_bot(600.0)
+        for conn in (self.alice, self.bob):
+            conn.sync_trail.clear()
+            conn.sync_trail.append((900.0, 150.0, 0))
+
+    def test_it_never_walks_while_holding_position(self):
+        """★ 「就地」= 不挪窝：方向恒 0，起跳也不往两边送（§93）。"""
+        for draw in (0, botaim.ROLL_RESOLUTION - 1):
+            self.bot_conn.roll = lambda n, d=draw: min(d, n - 1)
+            intent = bot._shoot_move(self.bot_conn)
+            self.assertEqual(0, intent[0])
+            self.assertFalse(intent[2])
+            self.assertFalse(intent[3])
+
+    def test_a_low_draw_jumps_and_a_high_draw_does_not(self):
+        self.bot_conn.roll = lambda n: 0
+        self.assertTrue(bot._shoot_move(self.bot_conn)[1], "掷到最小该起跳")
+        self.bot_conn.roll = lambda n: n - 1
+        self.assertFalse(bot._shoot_move(self.bot_conn)[1], "掷到最大不该起跳")
+
+    def test_it_does_not_press_jump_while_airborne(self):
+        """★ 腾空中按跳 = 第二段跳（§124），这一支不许白送那一段。"""
+        self.bot_conn.roll = lambda n: 0
+        self.bot_conn.body = bot.botmove.jump(self.bot_conn.body)
+        self.assertFalse(self.bot_conn.body.on_ground)
+        self.assertEqual((0, False, False, False),
+                         bot._shoot_move(self.bot_conn))
+
+    def test_the_jump_rate_matches_the_corpus_airborne_share(self):
+        """★★★ 腾空占比要落在语料那个 39% 上 —— 逐 tick 数出来的。"""
+        who = bot._character_of(self.bot_conn)
+        draws = []
+        self.bot_conn.roll = lambda n: draws.pop(0) % n
+        rng = random.Random(20260903)
+        airborne = 0
+        total = 0
+        for _ in range(4000):
+            draws.append(rng.randrange(botaim.ROLL_RESOLUTION))
+            intent = bot._shoot_move(self.bot_conn)
+            for _ in range(bot.BOT_DECISION_TICKS):
+                self.bot_conn.body = bot.botmove.tick(
+                    self.terrain, self.bot_conn.body, who,
+                    want_jump=bool(intent[1]))
+                total += 1
+                if not self.bot_conn.body.on_ground:
+                    airborne += 1
+                intent = (0, False, False, False)   # 跳的意图用掉就作废
+        share = airborne / float(total)
+        self.assertAlmostEqual(bot.BOT_AIRBORNE_SHARE, share, delta=0.05,
+                               msg="腾空占比 %.2f，语料是 %.2f"
+                                   % (share, bot.BOT_AIRBORNE_SHARE))
+
+    def test_the_engaging_branch_uses_it(self):
+        self.bot_conn.roll = lambda n: 0
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain,
+                                  (self.room.seat_index_of(self.alice),
+                                   None, None))
+        self.assertEqual((0, True, False, False), intent,
+                         "打得到那一格该是「就地跳射」")
 
 
 class BotUnstallTests(TerrainMixin, BotFireRoom):
@@ -5446,6 +5657,9 @@ class BotSpawnPointTests(TerrainMixin, BotFireRoom):
         self.walk(self.alice, [(700.0, 150.0)])
         self.bot_conn.roll = lambda n: 0
         bot.pick_respawn_point(self.room, self.bot_seat)
+        # ★ `roll` 钉成 0 = 「永远掷到最小」，那也会让 `_shoot_move()` 每一格
+        #   都起跳（D138）。挑完出生点就还回去，这一条验的是身体搬没搬。
+        self.bot_conn.roll = self.pin_roll
         self.walk(self.alice, [(700.0, 150.0)])
         self.assertIsNone(self.bot_conn.pending_spawn)
         self.assertEqual((200.0, 150.0), self.bot_conn.battle_pos)

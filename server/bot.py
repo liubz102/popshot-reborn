@@ -324,6 +324,13 @@ class BotConn(gameserver.Conn):
         self.deaths_broadcast = 0
         self.respawn_sent = 0
         self.room = None
+        #: ★ 这个 bot 坐在**哪个房间**里 —— 只给日志用（用户 2026-09-03：
+        #:   「bot 的 log 再加个房间号吧，以后再出问题好调查」）。
+        #:   bot 的日志行本来只有 `bot N`，多个房间同时开打时整份 log 混在
+        #:   一起，事后根本分不开是谁 —— §176 那次扫描为此只能丢掉 10 局。
+        #:   `_add_one_bot()` 建它的时候写一次，`tick_room()` 每格再刷一次
+        #:   （房间销毁重建时号会变）。
+        self.room_id = None
         self.channel_code = 0
         self.channel_index = 0
         self.last_position = None
@@ -864,7 +871,8 @@ class BotConn(gameserver.Conn):
         # ★★ 异步（用户 2026-09-01）：这个函数几乎总是在 `room.sim_lock` 里面被
         #    调到（`_tick_bot` 整格持锁），同步写盘就是整个房间跟着等磁盘，
         #    而真人的 `forward_peer_data` 又在等同一把锁。见 `asynclog.py` 开头。
-        asynclog.emit(f"[{gameserver.ts()}] {self.nickname} {msg}")
+        where = "" if self.room_id is None else f"房#{self.room_id} "
+        asynclog.emit(f"[{gameserver.ts()}] {where}{self.nickname} {msg}")
 
     def online(self, msg):
         """bot 的上下线不进运营事件日志 —— `online.log` 记的是真人的流水。"""
@@ -1017,6 +1025,7 @@ def _add_one_bot(conn, room):
     if index is None:
         return None, "房间已经满了（6 个座位都有人），先把 bot 踢掉一个再加。"
     machine = BotConn(index)
+    machine.room_id = room.room_id          # ★ 日志前缀要它（用户 2026-09-03）
     # ★ 房间级 `/w` 要覆盖**后来加入**的 bot。0 = 自动，因此机器态用 None；
     # 1..3 = 锁定。房间跨游戏局保留、销毁房间后重建默认 0（Room.__init__）。
     room_slot = int(getattr(room, "bot_weapon_slot", 0) or 0)
@@ -4042,19 +4051,17 @@ BOT_HIGH_HEALTH = 0.50
 #: 半个屏幕宽 = 512。这不是我们挑的数，是用户给的规则 + 原版的分辨率。
 BOT_KEEP_AWAY_SPAN = 512.0
 
-#: ★★★ 「站住打」的最远距离 —— **真人命中距离的中位数**（§48）。
+#: ★★★ 「靠近能不能变好」这个问题里的**参照距离** —— 真人命中距离的中位数。
 #:
 #: §48 那份分布是「真人**打中了角色**的 247 发」的开火点到爆炸点距离：
 #: `p10=264 / 中位=616 / p99=1015`。`BOT_ENGAGE_RANGE`（1000）取的是 p99
-#: ——「再远就几乎打不中了」，那是**开不开枪**的门。这里取中位数，
-#: 是**站不站住**的门：比真人常打中的距离还远时，真人是**压上去**的，
-#: 不是站在原地对着 1000 像素外放空枪。
+#: ——「再远就几乎打不中了」，那是**开不开枪**的门。这里取中位数，是
+#: `_worth_closing()` 拿来问「**要是压到真人常打中的那个距离，我的输出会不会
+#: 明显变好**」的参照点 —— 它本身**不是**一道「必须走进来」的门。
 #:
-#: 用户 2026-09-03 报的「距离太远了 bot 就不动了」里有它一份：
-#: `Forest02` 那一局两个 bot 隔着 1010 像素互相「打得到·站住打」，
-#: 谁也打不中谁，站了 161 秒到时限（§176）。
-#: ★ 超过这个距离并**不**停火 —— 走位改成朝敌人压，扳机照旧由
-#:   `_fire_target()` 说了算（边走边打，真人也是这样）。
+#: ⚠ 2026-09-03 用户改过一次口径：上一版这里是「超过它就必须压上去」，
+#: 用户否掉了 ——「用狙击枪远程打也是常见玩法。不要求非要贴上去，我希望
+#: 血量足够时 bot 能自己判断是否追击的策略」。见 D138。
 BOT_HOLD_RANGE = 616.0
 
 
@@ -4218,6 +4225,100 @@ def nominal_speed(room, seat_index):
     seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
     return botmove.walk_speed(
         chrprops.get(0 if seat is None else seat.character_id))
+
+
+def _worth_closing(room, machine, seat_index, enemy_index, span):
+    """**追不追** —— 压到真人的中位交战距离上，我的输出会不会明显变好（D138）。
+
+    用户 2026-09-03：「用狙击枪远程打也是常见玩法。不要求非要贴上去，
+    我希望血量足够时 bot 能自己判断是否追击的策略，不代表一定要贴上去，
+    在远程用远程武器打也是可以的。」
+
+    ⇒ 判据**不是一个死的距离常数**，是这把枪在两个距离上的真实输出：
+    `_seconds_to_kill()`（`botarms.score()` 算的每秒有效伤害，含几何命中
+    概率、溅射、原版的伤害 / 射速 / 弹道）在**当前距离**和 `BOT_HOLD_RANGE`
+    （§48 的中位命中距离 616）上各算一次，压过去之后「打倒他要几秒」
+    **明显**更短才追。
+
+    「明显」用的是 `BOT_PRESS_RATIO`（0.80）—— 和姿态那两道迟滞门同一个数、
+    同一个意思（要明显更占便宜才改主意），不是新拍的常数。
+
+    ⇒ 狙击 / 火箭这类远距离不吃亏的，两头差不多 ⇒ **不追，就地打**；
+      散弹这类在一千像素外几乎打不着的 ⇒ **追**。
+      `Forest02` 那一局两个 bot 隔着 1013 像素站了 161 秒（§176 ②）就是
+      后一种：它们手上的枪在那个距离上根本没有输出。
+
+    ★ 已经在中位距离之内就不用再问了（再压近只是白送身位）。
+    ★ 算不出来（那把枪在这个距离上弹道无解）⇒ 追 —— 那正是「够不着」。
+    """
+    if span <= BOT_HOLD_RANGE:
+        return False
+    # ★★★ 两次都用**名义走速**（`_seconds_to_kill` 的默认），不是实测速度。
+    #   实测会形成自反馈，而且形状正是我们要治的那个：他站着不动 ⇒ 打他
+    #   不吃距离的亏 ⇒ 「压过去没好处」⇒ 我也站着不动 ⇒ 他更没理由动。
+    #   `Forest02` 那 161 秒（§176 ②）就是这个不动点。问的应该是
+    #   「**正常交火**下压过去值不值」，和 `_stance()` 对自己那一侧同一个道理。
+    now = _seconds_to_kill(room, seat_index, enemy_index, span)
+    if now is None:
+        return True                 # 这个距离上根本打不出输出 = 够不着
+    close = _seconds_to_kill(room, seat_index, enemy_index, BOT_HOLD_RANGE)
+    if close is None:
+        return False                # 压过去反而没输出 —— 那就别压
+    return close <= now * BOT_PRESS_RATIO
+
+
+#: ★★★ 真人**腾空**的时间占比 —— §71 那份 144 万发心跳量出来的：
+#: 站着不动 **39%** / 在地上走 23% / **腾空 39%**（一次跳中位 11 发心跳 ≈ 1.4 秒）。
+#: 「就地打」按这个比例掷骰子起跳。
+#:
+#: ⚠ **不能「一落地就跳」**（那一版写过，2026-09-03 当场推翻）：那样腾空占比
+#: 会到 **90%**，比真人高一倍还多；更要命的是**腾空时方向键一点用都没有**
+#: （§93）—— `_dodge_intent()` 那一整套（M5-E）会因此整局失效，bot 反而更好打。
+BOT_AIRBORNE_SHARE = 0.39
+
+#: 起跳到落回同一高度要几个 tick：`2 v0 / g`（§71 的 20 / 1.2）。
+#: 只用来把 `BOT_AIRBORNE_SHARE` 折算成「每格决策起跳的概率」，
+#: 真正的弧线还是 `botmove` 逐 tick 推的。
+BOT_JUMP_TICKS = 2.0 * botmove.JUMP_SPEED / botmove.GRAVITY
+
+
+def _shoot_move(machine):
+    """「就地打」那一格的动作 —— **边跳边打**，不是站着不动（D138）。
+
+    用户 2026-09-03：「『站着不动仅开枪』我想改一改，变成边跳跃躲子弹边
+    开枪，因为真人在绝大多数情况也都是边跳跃躲子弹边开枪的。」
+
+    ## 跳多勤：**照语料的腾空占比**，不是一落地就跳
+
+    §71 量过真人的 144 万发心跳：站着不动 39% / 地上走 23% / **腾空 39%**。
+    要让腾空占到 `share`，落地之后每一格决策起跳的概率就得是
+
+        p = share × 每格决策的 tick 数 ÷ (一次跳的 tick 数 × (1 − share))
+
+    —— 一次跳约 33 个 tick、一格决策 2 个 tick ⇒ p ≈ 3.9%，也就是大约
+    每 1.7 秒起跳一次，腾空正好占 39%。★ 这不是「每 N 毫秒跳一次」那种
+    时序阈值（铁律 10 禁的是拿观测值当阈值来掩盖竞态）；这里掷骰子是为了
+    **行为不整齐**，和瞄准失误（M5-D）、碎片角度用的是同一颗骰子。
+    ★ 一落地就跳会把腾空推到 90%，而腾空时方向键不起作用（§93），
+      `_dodge_intent()` 整套就废了 —— bot 反而更好打。
+
+    ★ 方向恒 `0`：起跳带走的是这一刻的走速（§93），站着起跳就是竖直上下
+      —— 「就地」说的就是不挪窝。真要挪窝的是别的分支。
+    ★ 扳机不归这里管：`_tick_bot()` 照旧按 `machine.aim` 扣，而真开火那一格
+      会重解一次弹道（§62），所以腾空开枪的枪口坐标是对的。
+    ★ 真有子弹飞过来时轮不到这一支 —— `_dodge_intent()` 排在它**前面**
+      （M5-E），躲避那一套自己会挑跳 / 蹲 / 走。
+    """
+    body = machine.body
+    if body is None or not body.on_ground:
+        return (0, False, False, False)
+    share = BOT_AIRBORNE_SHARE
+    chance = share * BOT_DECISION_TICKS / (BOT_JUMP_TICKS * (1.0 - share))
+    # ★ 骰子走 `machine.roll`（和瞄准失误、烟雾乱射同一颗）：只用 `roll(n)`，
+    #   单测钉得住 —— `BotFrameRoom.pin_roll` 钉成「永远掷到最大」= 永不起跳，
+    #   所以那一大批断言「站着不动」的老用例一个都不用改。
+    unit = machine.roll(botaim.ROLL_RESOLUTION) / float(botaim.ROLL_RESOLUTION)
+    return (0, unit < chance, False, False)
 
 
 def _stance(room, machine, seat_index, enemy_index, span):
@@ -4824,15 +4925,15 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
                                                           seat_index)
         if item is not None and item[0] < enemy_span:
             spot = item[1]
-    if target is not None and enemy_span <= BOT_HOLD_RANGE:
-        # ★★ 打得到就站住打（老规则，D50）—— ★ 但**只在真人真的打得中的
-        #   距离之内**（`BOT_HOLD_RANGE` = §48 的命中距离中位数）。
-        #   再远就压上去边走边打：扳机照旧归 `_fire_target()` 管，站不站住
-        #   归这一句管。用户 2026-09-03「距离太远了 bot 就不动了」里有它
-        #   一份 —— `Forest02` 那一局两个 bot 隔着 1010 像素互相「站住打」，
-        #   谁也打不中谁，站了 161 秒到时限（§176）。
+    if target is not None and (stance == "retreat" or not _worth_closing(
+            room, machine, seat_index, enemy_index, enemy_span)):
+        # ★★ 打得到就**就地打**（老规则 D50，只是不再站着不动）。
+        #   「追不追」交给 `_worth_closing()`：压到真人的中位交战距离上
+        #   输出会不会明显变好 —— 狙击枪就地打是合法玩法（D138）。
+        #   ★ 保守姿态（血 < 25%）**永远不追**：那一档的规矩是「不主动
+        #     进入敌人半个屏幕」，贴到环里的那一格已经在上面退掉了。
         _clear_navigation(machine)
-        return _src(machine, "打得到·站住打", (0, False, False, False))
+        return _src(machine, "打得到·就地打", _shoot_move(machine))
     return _src(machine, "朝目标走",
                 _unstall(room, machine, terrain, spot,
                          _walk_to(room, machine, terrain, spot, fast_run),
@@ -5563,8 +5664,10 @@ def _boss_fight_intent(room, machine, seat_index, terrain, target):
     """
     body = machine.body
     if target is not None:
+        # ★ 打得着 boss 就就地打 —— 和对战房同一条规则、同一个动作
+        #   （边跳边打，D138）。
         _clear_navigation(machine)
-        return (0, False, False, False)
+        return _shoot_move(machine)
     visible = [row for row in live_mobs(room)
                if _in_sight(machine, row[0], row[1])]
     if not visible:
@@ -9830,6 +9933,10 @@ def _tick_room_locked(room, tick, now, behind=0):
         machine = None if seat is None else seat.conn
         if not isinstance(machine, BotConn):
             continue
+        # ★ 日志前缀那个房间号每格刷一次：房间销毁重建之后号会变，
+        #   而 bot 的日志行**只有**这一个地方能分出是哪个房间的（用户
+        #   2026-09-03）。一次属性写，可忽略。
+        machine.room_id = getattr(room, "room_id", None)
         try:
             _tick_bot(room, machine, index, tick, now, behind)
         except Exception as error:          # noqa: BLE001 —— 见 docstring
