@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Sync GitHub Release to Gitee
-        uses: H-TWINKLE/sync-action@master
+        uses: liubz102/sync-action@master
         with:
             gitee_owner: liubz102
             gitee_repo: popshot-reborn
