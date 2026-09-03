@@ -1,0 +1,21 @@
+name: Sync Release to Gitee
+
+on:
+  release:
+    types: [published]   # 发布 Release 时自动触发
+  workflow_dispatch:      # 允许手动触发,方便测试
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync GitHub Release to Gitee
+        uses: liubz102/sync-action@master
+        with:
+            gitee_owner: liubz102
+            gitee_repo: popshot-reborn
+            gitee_token: ${{ secrets.GITEE_TOKEN }}
+            github_owner: liubz102
+            github_repo: popshot-reborn
+            gitee_upload_retry_times: 3
+
