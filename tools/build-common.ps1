@@ -305,7 +305,8 @@ function Copy-ServerCode {
     $webDst = Join-Path $dstDir 'web'
     Copy-TreeFiltered -Source $webSrc -Target $webDst
     foreach ($must in @('__init__.py', 'server.py', 'index.html',
-                        'admin.py', 'admin.html')) {
+                        'admin.py', 'admin.html', 'admin.css', 'admin.js',
+                        'itemicons.png', 'itemicons.json')) {
         if (-not (Test-Path -LiteralPath (Join-Path $webDst $must) -PathType Leaf)) {
             throw "网页缺文件：server\web\$must"
         }

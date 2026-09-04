@@ -6,16 +6,20 @@
 `Handler` 继承本文件的 `AdminRoutes`，路由表里 `/admin` 开头的都转进来。
 
     GET  /admin                       页面本身（`admin.html`）
+    GET  /admin/admin.css             样式（**不要登录** —— 登录页自己也要它）
+    GET  /admin/admin.js              脚本（同上）
+    GET  /admin/itemicons.png         物品图标图集（要登录）
     GET  /admin/api/session           我是谁（页面启动时问一次）
     POST /admin/api/login             {name, password}
     POST /admin/api/logout
+    GET  /admin/api/catalog           物品表 + 字段描述 + 图集元信息（登录后拿一次）
     GET  /admin/api/config/{shop|recipe|drops}     -> {ok, text, warnings}
     POST /admin/api/config/{shop|recipe|drops}     {text}
     GET  /admin/api/admins            -> {ok, names}
     POST /admin/api/admins/add        {name, password}
     POST /admin/api/admins/password   {name, password}
     POST /admin/api/admins/remove     {name}
-    GET  /admin/api/item?id=1120041   物品速查（省得对着 7 位数字猜）
+    GET  /admin/api/item?id=1120041   某件东西**现在在商店里**是什么价（选择器侧栏用）
 
 ## ★★ 口令是明文存的，而这个页面公网可达
 
@@ -26,11 +30,26 @@
 2. 页面上**明确提示「请立刻改掉默认密码」**（`admin.html` 里那条红字）；
 3. 日志里**只打名字和结果，绝不打口令**。
 
-## 为什么配置编辑器是「一个 JSON 文本框」而不是一堆表单
+## 配置编辑器是**结构化表单**（D16 取代 D14）
 
-见 `DECISIONS.md` D14。一句话：这三份文件本来就是给人手改的，
-表单化要为 141 件商品 / 35 条配方各写一套增删改，而**真正的护栏是
-存盘前的校验**（`shopcfg.validate_*`），那一层不管前台长什么样都在。
+原来是三个 `<textarea>` 直接改 JSON 原文；用户嫌「改一个价格要在几百行里找」。
+D14 当时就写明了退路：**表单化只是换一个前台生成同样的 JSON，服务端不用动。**
+所以现在：
+
+- **保存通路一个字没变** —— 前台组装出同样的 JSON，仍旧 `POST` 到
+  `/admin/api/config/{name}`，仍旧过 `shopcfg.validate_*`，不过就不落盘。
+  **真正的护栏还在那一层**，前台长什么样都绕不过去。
+- 多出来的只有两个**只读**接口：`/admin/api/catalog`（物品表 + 字段描述表）
+  和 `/admin/itemicons.png`（图标图集）。
+- 字段描述表 `shopcfg.SCHEMA` **贴着 validator 放**，两边对不上就有用例报红
+  —— 这是「以后新增的字段自动出现在画面上」的保证。
+
+## `_` 开头的键不再回写（D16）
+
+以前保存的是「解析后的对象」，`_说明` 那种注释键会原样留在文件里。
+现在唯一的编辑入口是这个页面，那几句话搬进了 `SCHEMA[...]["help"]` 直接画在面板上，
+**保存时只写 `format` + 那一个列表** —— 老文件里的 `_说明` 会在第一次保存时消失，
+这是用户要的。
 """
 from __future__ import annotations
 
@@ -50,6 +69,26 @@ import shopdata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ADMIN_PATH = os.path.join(HERE, "admin.html")
+
+#: `/admin/<名字>` 能直接取到的静态文件。
+#:
+#: ★ `admin.css` / `admin.js` **不要登录**：`/admin` 本身（登录表单）就是
+#:   未登录状态渲染的，样式再要登录，登录页就成了一堆裸标签。它们里面没有秘密。
+#: ★ `itemicons.png` **要登录**：0.62 MB 的原版美术，没理由发给路过的人。
+#:   `<img>` / CSS `url()` 是同源子请求，`Path=/admin` 的会话 cookie 会跟着走
+#:   （`SameSite=Strict` 只挡跨站，同站子请求照带）。
+STATIC_FILES = {
+    "admin.css": ("text/css; charset=utf-8", False),
+    "admin.js": ("application/javascript; charset=utf-8", False),
+    "itemicons.png": ("image/png", True),
+}
+
+#: 图集索引（`tools/shopicons.py` 的产物之一）。
+ICON_INDEX_PATH = os.path.join(HERE, "itemicons.json")
+
+#: 认得的图集格式版本。对不上就当没有图标 —— 管理页画问号占位，
+#: 而不是按错的行列切出一堆张冠李戴的图。
+ICON_FORMAT = 1
 
 #: 会话有效期。★ **只在内存里**，服务端一重启全部失效 —— 和票据同一个口径
 #: （V0.2 D097）。管理页是低频运维工具，重登一次的代价远小于把令牌落盘。
@@ -209,6 +248,88 @@ def _escape(text):
             .replace('"', "&quot;"))
 
 
+# --------------------------------------------------------------------------
+# 物品表 + 图集 —— 页面登录后拿一次，之后全在前台算
+# --------------------------------------------------------------------------
+
+_icon_index_cache = None
+_catalog_cache = None
+_catalog_lock = threading.Lock()
+
+
+def icon_index():
+    """图集索引 `{"size","cols","width","height","cells":{icon名: 格号}}`。
+
+    产物没生成 / 版本对不上 / 读坏了 ⇒ 返回 `None`，页面画问号占位。
+    **不让它把管理页带崩** —— 图标是锦上添花，配置才是正事。
+
+    只读一次：`itemicons.json` 随代码走，运行期间不会变。
+    """
+    global _icon_index_cache
+    if _icon_index_cache is not None:
+        return _icon_index_cache or None
+    try:
+        with open(ICON_INDEX_PATH, "r", encoding="utf-8") as fp:
+            index = json.load(fp)
+    except (IOError, OSError, ValueError):
+        _icon_index_cache = {}
+        return None
+    if not isinstance(index, dict) or index.get("format") != ICON_FORMAT:
+        _icon_index_cache = {}
+        return None
+    _icon_index_cache = index
+    return index
+
+
+def catalog():
+    """全部**能进背包**的物品，给管理页的选择器和图标用。
+
+    ★ 只收 `ownable` 的：`shopcfg._check_item_id()` 也只放行这一批，
+    选得到却存不进去的东西不该出现在选择器里（§11）。
+
+    算一次留着：`shop_items.json` 随代码走，运行期间不会变。约 800 件、
+    序列化后 100 KB 上下，页面登录后取一次。
+    """
+    global _catalog_cache
+    if _catalog_cache is not None:
+        return _catalog_cache
+    with _catalog_lock:
+        if _catalog_cache is not None:      # 等锁的时候别人已经算完了
+            return _catalog_cache
+        index = icon_index() or {}
+        cells = index.get("cells") or {}
+        items = []
+        for kind in shopdata.kinds():
+            for item_id in shopdata.ids_of_kind(kind):
+                item = shopdata.get(item_id)
+                if item is None or not item.ownable:
+                    continue
+                entry = {
+                    "id": item.id,
+                    "kind": item.kind,
+                    "name": shopcfg.item_name_zh(item),
+                    "cell": cells.get(item.icon),
+                }
+                # 有才带 —— 800 件里大部分字段是空的，全量带上白涨一倍体积。
+                if item.name_kr:
+                    entry["name_kr"] = item.name_kr
+                if item.character is not None:
+                    entry["character"] = item.character
+                if item.series:
+                    entry["series"] = item.series
+                if item.tier:
+                    entry["tier"] = item.tier
+                if item.part_flag:
+                    entry["part_flag"] = item.part_flag
+                if item.bonus:
+                    entry["bonus"] = item.bonus
+                if item.weapon:
+                    entry["weapon"] = item.weapon
+                items.append(entry)
+        _catalog_cache = items
+    return _catalog_cache
+
+
 class AdminRoutes:
     """混进 `web.server.Handler` 的 `/admin` 那一组接口。
 
@@ -274,6 +395,13 @@ class AdminRoutes:
             self._send(200, render_admin(self._default_password_in_use()),
                        "text/html; charset=utf-8")
             return True
+        asset = path[len("/admin/"):] if path.startswith("/admin/") else ""
+        if asset in STATIC_FILES:
+            self._admin_asset(asset)
+            return True
+        if path == "/admin/api/catalog":
+            self._admin_catalog()
+            return True
         if path == "/admin/api/session":
             name = self._admin_name()
             self._send_json({"ok": True, "name": name,
@@ -314,7 +442,72 @@ class AdminRoutes:
             return True
         return False
 
+    # ---------------------------------------------------------- 静态文件
+    def _admin_asset(self, name):
+        """把 `server/web/<name>` 原样吐出去，带 `ETag` 条件请求。
+
+        ★ 用 `ETag` + `no-cache` 而**不是** `max-age`：图集有 0.62 MB，
+        每次刷新都重下太浪费；但 `max-age` 又会让「刚跑完
+        `update-shopicons.bat`，浏览器里还是旧图」这种事出现一整天。
+        `no-cache` 的意思是「每次都问一下」—— 没变就是一个 304 空响应，
+        字节数约等于零，而且**永远不会看到旧的**。
+
+        ★ 路径是从 `STATIC_FILES` 白名单里取的常量，不是用户输入拼的
+        —— 这里不存在 `..\\..\\accounts.json` 那种走法。
+        """
+        content_type, needs_login = STATIC_FILES[name]
+        if needs_login and self._require_admin() is None:
+            return
+        path = os.path.join(HERE, name)
+        try:
+            st = os.stat(path)
+            with open(path, "rb") as fp:
+                body = fp.read()
+        except OSError:
+            # 打包漏了一个文件时，说清楚是**哪一个** —— 云上 500 而本地好好的
+            # 就是这么来的（`tools/build-common.ps1` 里那张验收清单防的也是它）。
+            self._reply(False, f"服务端少了 web/{name}（打包漏了？）", status=404)
+            return
+        etag = '"%d-%d"' % (st.st_mtime_ns, st.st_size)
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "private, no-cache")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "private, no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
     # -------------------------------------------------------------- 接口
+    def _admin_catalog(self):
+        """物品表 + 字段描述 + 图集元信息。页面登录后拿一次，之后全在前台算。"""
+        if self._require_admin() is None:
+            return
+        index = icon_index()
+        self._send_json({
+            "ok": True,
+            "items": catalog(),
+            # ★ 字段描述表直接来自 `shopcfg` —— 页面照着它生成输入框，
+            #   所以「给 validator 加一个字段」= 「画面上自动多一个框」。
+            "schema": shopcfg.SCHEMA,
+            "icons": None if index is None else {
+                "url": "/admin/itemicons.png",
+                "size": index.get("size"),
+                "cols": index.get("cols"),
+                "width": index.get("width"),
+                "height": index.get("height"),
+            },
+            "kinds": shopcfg.KIND_ZH,
+            "characters": {str(k): v for k, v in shopcfg.CHARACTER_ZH.items()},
+            "series": shopcfg.SERIES_ZH,
+            "max_materials": shopcfg.MAX_MATERIALS,
+        })
+
     def _default_password_in_use(self):
         """默认管理员还在用出厂口令吗？页面顶上那条红字看它。
 
@@ -424,9 +617,16 @@ class AdminRoutes:
             #   好的继续跑（D10）—— 用户会以为改生效了，实际没有。
             self._reply(False, f"校验没过，没有保存：{error}")
             return
-        # ★ 存**解析后的对象**而不是原始文本：`_说明` 那种注释键会原样保留
-        #   （`validate_*` 只读它认识的键），格式则统一成和自动生成时一样。
-        shopcfg.write_json(shopcfg.path_of(filename), parsed)
+        # ★ 只写 `format` + 那一个列表（D16）。以前存的是「解析后的整个对象」，
+        #   `_说明` 那种注释键会原样留下 —— 那几句话是写给**手改 json 的人**看的，
+        #   而现在唯一的编辑入口就是这个页面，说明已经画在面板上了
+        #   （`shopcfg.SCHEMA[...]["help"]`）。⇒ 老文件里的 `_说明`
+        #   会在第一次保存时消失，这是用户拍板要的。
+        list_key = shopcfg.SCHEMA[which]["list_key"]
+        shopcfg.write_json(shopcfg.path_of(filename), {
+            "format": shopcfg.FORMAT,
+            list_key: parsed.get(list_key, []),
+        })
         # 热重载本来靠 mtime，但 mtime 的粒度可能粗到看不出这一次改动
         # —— 存完直接把缓存丢掉，下一次读一定是新的。
         shopcfg.invalidate()

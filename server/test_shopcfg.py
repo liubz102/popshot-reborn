@@ -445,5 +445,88 @@ class RealDefaultsTests(unittest.TestCase):
                               % (recipe["name"], material["id"]))
 
 
+class SchemaTests(unittest.TestCase):
+    """★★ `SCHEMA` 和 `validate_*` **必须对得上**（D16）。
+
+    用户的要求是「以后新增的字段也要同步显示在画面上」。管理页照着 `SCHEMA`
+    生成输入框，所以给 validator 加一个字段却忘了登记 ⇒ 那个字段在画面上
+    就是个隐形人；反过来登记了不存在的字段 ⇒ 画面上多一个存不进去的框。
+
+    这条用例把「记得改两处」变成「漏改必然报红」—— 别改成宽松匹配。
+    """
+
+    CASES = (
+        ("shop", shopcfg.default_shop, shopcfg.validate_shop),
+        ("recipe", shopcfg.default_recipes, shopcfg.validate_recipes),
+        ("drops", shopcfg.default_drops, shopcfg.validate_drops),
+    )
+
+    @staticmethod
+    def _keys_of(parsed):
+        entries = list(parsed.values()) if isinstance(parsed, dict) else parsed
+        keys = set()
+        for entry in entries:
+            keys |= set(entry)
+        return keys
+
+    def test_every_validated_key_is_registered_and_vice_versa(self):
+        for which, build, validate in self.CASES:
+            produced = self._keys_of(validate(build()))
+            registered = shopcfg.schema_keys(which)
+            self.assertEqual(
+                produced, registered,
+                "%s：validator 有但没登记的 %s；登记了但 validator 不产出的 %s"
+                % (which, sorted(produced - registered),
+                   sorted(registered - produced)))
+
+    def test_every_config_has_a_list_key_that_actually_exists(self):
+        for which, build, _validate in self.CASES:
+            spec = shopcfg.SCHEMA[which]
+            self.assertIn(spec["list_key"], build(), which)
+            self.assertTrue(spec["title"], which)
+            self.assertTrue(spec["help"], which)      # 说明搬到页面上了，不能空
+
+    def test_field_types_are_ones_the_page_can_draw(self):
+        # 前台认得的就这几种；写错一个字，那一格会变成空白。
+        known = {"item", "text", "int", "bool", "choice", "materials"}
+        for which in shopcfg.SCHEMA:
+            for field in shopcfg.SCHEMA[which]["fields"]:
+                self.assertIn(field["type"], known,
+                              "%s.%s" % (which, field["key"]))
+                self.assertTrue(field.get("label"), field["key"])
+                if field["type"] == "choice":
+                    self.assertTrue(field.get("options"), field["key"])
+
+    def test_the_stage_dropdown_offers_exactly_the_seven_real_quests(self):
+        # ★ 客户端建房时的关卡下拉框只认静态表 `0x6dc52c` 里那七个 id
+        #   （`tools/probe_quest_list.py`）。多一个少一个都会让运营在管理页里
+        #   选出一条**永远不会命中**的掉落规则。
+        self.assertEqual(list(range(1, 8)), sorted(shopcfg.QUEST_ZH))
+        for name in shopcfg.QUEST_ZH.values():
+            self.assertTrue(name.strip(), shopcfg.QUEST_ZH)
+        field = next(f for f in shopcfg.SCHEMA["drops"]["fields"]
+                     if f["key"] == "stage")
+        self.assertEqual("choice", field["type"])
+        self.assertTrue(field["optional"])          # 留空 = 不限
+        self.assertEqual(sorted(shopcfg.QUEST_ZH),
+                         [o["value"] for o in field["options"]])
+        for option in field["options"]:
+            self.assertIn(shopcfg.QUEST_ZH[option["value"]], option["label"])
+
+    def test_the_dropdown_does_not_become_a_validation_rule(self):
+        # ★ 下拉是**方便**，不是规矩：关卡有几个是客户端的事，不该由掉落表
+        #   来立。手改进来的别的号码照样存得下去（管理页会多画一项显示它）。
+        raw = {"format": shopcfg.FORMAT, "rules": [
+            {"mode": "quest", "stage": 99, "material": 10001, "prob": 50}]}
+        self.assertEqual(99, shopcfg.validate_drops(raw)[0]["stage"])
+
+    def test_the_defaults_no_longer_carry_guidance_keys(self):
+        # ★ D16：`_说明` 搬到页面上了（`SCHEMA[...]["help"]`），不再写进文件。
+        for which, build, _validate in self.CASES:
+            leftovers = [k for k in build() if k.startswith("_")]
+            self.assertEqual([], leftovers, which)
+            self.assertTrue(shopcfg.SCHEMA[which]["help"], which)
+
+
 if __name__ == "__main__":
     unittest.main()

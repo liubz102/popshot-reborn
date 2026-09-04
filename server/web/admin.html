@@ -4,99 +4,39 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>炮炮火枪手 · 管理页</title>
-<style>
-  :root {
-    --bg: #14161b; --panel: #1c1f26; --line: #2c313b;
-    --ink: #dfe3ea; --dim: #8f97a6; --accent: #6fb1ff;
-    --ok: #4fbf7f; --bad: #ff7676; --warn: #ffb84d;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--ink);
-    font: 14px/1.6 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
-  }
-  header {
-    padding: 14px 20px; border-bottom: 1px solid var(--line);
-    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-  }
-  header h1 { margin: 0; font-size: 17px; font-weight: 600; }
-  header .who { color: var(--dim); margin-left: auto; }
-  main { max-width: 1060px; margin: 0 auto; padding: 20px; }
-  .panel {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 8px; padding: 16px 18px; margin-bottom: 18px;
-  }
-  .panel h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
-  .hint { color: var(--dim); font-size: 13px; margin: 4px 0 12px; }
-  label { display: block; margin: 10px 0 4px; font-size: 13px; color: var(--dim); }
-  input[type=text], input[type=password], input[type=number] {
-    width: 100%; max-width: 320px; padding: 7px 9px;
-    background: #12141a; color: var(--ink);
-    border: 1px solid var(--line); border-radius: 5px; font: inherit;
-  }
-  textarea {
-    width: 100%; min-height: 460px; padding: 10px;
-    background: #12141a; color: var(--ink);
-    border: 1px solid var(--line); border-radius: 5px;
-    font: 13px/1.5 Consolas, "Cascadia Mono", monospace;
-    white-space: pre; overflow-wrap: normal; overflow-x: auto;
-  }
-  button {
-    padding: 7px 15px; margin: 10px 8px 0 0; cursor: pointer;
-    background: #2a3240; color: var(--ink);
-    border: 1px solid var(--line); border-radius: 5px; font: inherit;
-  }
-  button:hover { background: #333d4e; }
-  button.primary { background: #2c5c96; border-color: #3d76b8; }
-  button.primary:hover { background: #356bad; }
-  button:disabled { opacity: .5; cursor: default; }
-  .tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
-  .tabs button { margin: 0; }
-  .tabs button.on { background: #2c5c96; border-color: #3d76b8; }
-  .msg { margin-top: 10px; font-size: 13px; min-height: 1.6em; white-space: pre-wrap; }
-  .msg.ok { color: var(--ok); }
-  .msg.bad { color: var(--bad); }
-  .banner {
-    background: #3a2020; border: 1px solid #6d3333; color: #ffc7c7;
-    padding: 10px 14px; border-radius: 6px; margin-bottom: 18px;
-  }
-  .banner.warn { background: #3a3320; border-color: #6d5c33; color: #ffe4b0; }
-  table { border-collapse: collapse; width: 100%; max-width: 520px; }
-  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
-  th { color: var(--dim); font-weight: 500; }
-  code { background: #12141a; padding: 1px 5px; border-radius: 3px; }
-  .hidden { display: none !important; }
-  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
-  .row > div { flex: 0 0 auto; }
-  pre.lookup {
-    background: #12141a; border: 1px solid var(--line); border-radius: 5px;
-    padding: 10px; margin-top: 10px; overflow-x: auto; font-size: 13px;
-  }
-</style>
+<link rel="stylesheet" href="/admin/admin.css">
+<script>
+// 服务端在 render_admin() 里把这个占位符换成 true / false。
+// ★ 用 `var` 而不是 `const`：这是个全局，admin.js 从 window 上读它。
+var DEFAULT_PASSWORD_IN_USE = __DEFAULT_PASSWORD_IN_USE__;
+</script>
+<script src="/admin/admin.js" defer></script>
 </head>
 <body>
 
-<header>
-  <h1>炮炮火枪手 · 管理页</h1>
+<header class="topbar">
+  <span class="brand">炮炮火枪手 · 管理页</span>
   <span class="who" id="who"></span>
-  <button id="logout" class="hidden">退出登录</button>
+  <button id="logout" class="btn btn-ghost hidden">退出登录</button>
 </header>
 
 <main>
 
   <!-- ========================= 登录 ========================= -->
   <section id="loginView" class="panel hidden">
-    <h2>登录</h2>
-    <p class="hint">管理员账号存在 <code>server/data/accounts.json</code> 的
-      <code>admin_accounts</code> 段里，和玩家账号一样是明文的。</p>
-    <label for="loginName">管理员名</label>
-    <input id="loginName" type="text" autocomplete="username">
-    <label for="loginPass">口令</label>
-    <input id="loginPass" type="password" autocomplete="current-password">
-    <div>
-      <button class="primary" id="loginBtn">登录</button>
+    <div class="panel-title"><h2>登录</h2></div>
+    <div class="panel-body">
+      <p class="hint">管理员账号存在 <code>server/data/accounts.json</code> 的
+        <code>admin_accounts</code> 段里，和玩家账号一样是明文的。</p>
+      <label for="loginName">管理员名</label>
+      <input id="loginName" type="text" autocomplete="username">
+      <label for="loginPass">口令</label>
+      <input id="loginPass" type="password" autocomplete="current-password">
+      <div style="margin-top:14px">
+        <button class="btn btn-primary" id="loginBtn">登录</button>
+      </div>
+      <div class="msg" id="loginMsg"></div>
     </div>
-    <div class="msg" id="loginMsg"></div>
   </section>
 
   <!-- ========================= 主界面 ========================= -->
@@ -107,309 +47,101 @@
       这个页面是公网可达的 —— 请立刻在下面「管理员账号」里改掉它。
     </div>
 
-    <!-- ---------------- 运营配置 ---------------- -->
-    <section class="panel">
-      <h2>运营配置</h2>
-      <p class="hint">
-        直接改 JSON。<b>保存前服务端会校验一遍，不合格就不落盘</b>；
-        存进去<b>即刻生效，不用重启服务端</b>。<br>
-        <code>shop.json</code> 上架 / 定价，<code>recipe.json</code> 合成配方
-        （一条最多 4 种材料），<code>drops.json</code> 材料掉落。<br>
-        以 <code>_</code> 开头的键（比如 <code>_说明</code>）是给人看的注释，
-        校验器不管它们，保存后原样保留。
-      </p>
-      <div class="tabs">
-        <button data-cfg="shop" class="on">shop.json</button>
-        <button data-cfg="recipe">recipe.json</button>
-        <button data-cfg="drops">drops.json</button>
-      </div>
-      <div class="msg" id="cfgPath"></div>
-      <textarea id="cfgText" spellcheck="false"></textarea>
-      <div>
-        <button class="primary" id="cfgSave">保存</button>
-        <button id="cfgReload">放弃修改，重新读取</button>
-      </div>
-      <div class="msg" id="cfgMsg"></div>
-    </section>
+    <nav class="tabs" id="tabs">
+      <button data-tab="shop" class="on">商店目录</button>
+      <button data-tab="recipe">合成配方</button>
+      <button data-tab="drops">材料掉落</button>
+      <button data-tab="admins">管理员账号</button>
+    </nav>
 
-    <!-- ---------------- 物品速查 ---------------- -->
-    <section class="panel">
-      <h2>物品速查</h2>
-      <p class="hint">
-        填 itemId 看它是什么。★ 查不到的 id <b>不要写进配置</b> ——
-        中文版客户端不认识它，发下去界面上就是个空格子。
-      </p>
-      <div class="row">
-        <div>
-          <label for="lookupId">itemId</label>
-          <input id="lookupId" type="text" placeholder="1120041">
-        </div>
-        <div><button id="lookupBtn">查</button></div>
+    <!-- ------- 三份运营配置共用这一套骨架，内容由 admin.js 按字段表生成 ------- -->
+    <section class="panel" id="cfgPanel">
+      <div class="panel-title">
+        <h2 id="cfgTitle"></h2>
+        <span class="count" id="cfgCount"></span>
       </div>
-      <pre class="lookup hidden" id="lookupOut"></pre>
-      <div class="msg" id="lookupMsg"></div>
+      <div class="panel-body">
+        <ul class="help" id="cfgHelp"></ul>
+        <div class="toolbar" id="cfgToolbar"></div>
+        <div id="cfgList"></div>
+        <div class="msg" id="cfgMsg"></div>
+      </div>
+      <div class="panel-foot">
+        <button class="btn" id="cfgAdd">＋ 添加一条</button>
+        <span class="dirty clean" id="cfgDirty"></span>
+        <span style="margin-left:auto"></span>
+        <button class="btn" id="cfgReset">放弃修改</button>
+        <button class="btn btn-primary" id="cfgSave">保存</button>
+      </div>
     </section>
 
     <!-- ---------------- 管理员账号 ---------------- -->
-    <section class="panel">
-      <h2>管理员账号</h2>
-      <p class="hint">
-        口令是<b>明文</b>保存的（和玩家账号一个口径）。
-        至少要保留一个管理员 —— 全删光了谁都进不来，只能上服务器改 JSON。
-      </p>
-      <table>
-        <thead><tr><th>管理员</th><th style="width:90px"></th></tr></thead>
-        <tbody id="adminRows"></tbody>
-      </table>
+    <section class="panel hidden" id="adminsPanel">
+      <div class="panel-title"><h2>管理员账号</h2></div>
+      <div class="panel-body">
+        <p class="hint">
+          口令是<b>明文</b>保存的（和玩家账号一个口径）。
+          至少要保留一个管理员 —— 全删光了谁都进不来，只能上服务器改 JSON。
+        </p>
+        <table>
+          <thead><tr><th>管理员</th><th style="width:90px"></th></tr></thead>
+          <tbody id="adminRows"></tbody>
+        </table>
 
-      <div class="row" style="margin-top:16px">
-        <div>
-          <label for="newAdminName">新管理员名</label>
-          <input id="newAdminName" type="text">
+        <div class="row" style="margin-top:18px">
+          <div>
+            <label for="newAdminName">新管理员名</label>
+            <input id="newAdminName" type="text">
+          </div>
+          <div>
+            <label for="newAdminPass">口令</label>
+            <input id="newAdminPass" type="password" autocomplete="new-password">
+          </div>
+          <div><button class="btn" id="addAdmin">添加</button></div>
         </div>
-        <div>
-          <label for="newAdminPass">口令</label>
-          <input id="newAdminPass" type="password" autocomplete="new-password">
+
+        <div class="row" style="margin-top:12px">
+          <div>
+            <label for="pwName">改谁的口令</label>
+            <input id="pwName" type="text">
+          </div>
+          <div>
+            <label for="pwValue">新口令</label>
+            <input id="pwValue" type="password" autocomplete="new-password">
+          </div>
+          <div><button class="btn" id="setPw">改口令</button></div>
         </div>
-        <div><button id="addAdmin">添加</button></div>
+
+        <p class="hint" style="margin-top:14px">
+          名字规则：__USERNAME_RULE__<br>
+          口令规则：__PASSWORD_RULE__
+        </p>
+        <div class="msg" id="adminMsg"></div>
       </div>
-
-      <div class="row" style="margin-top:10px">
-        <div>
-          <label for="pwName">改谁的口令</label>
-          <input id="pwName" type="text">
-        </div>
-        <div>
-          <label for="pwValue">新口令</label>
-          <input id="pwValue" type="password" autocomplete="new-password">
-        </div>
-        <div><button id="setPw">改口令</button></div>
-      </div>
-
-      <p class="hint" style="margin-top:12px">
-        名字规则：__USERNAME_RULE__<br>
-        口令规则：__PASSWORD_RULE__
-      </p>
-      <div class="msg" id="adminMsg"></div>
     </section>
 
   </div>
 </main>
 
-<script>
-"use strict";
-
-// 服务端在 render_admin() 里把这个占位符换成 true / false。
-var DEFAULT_PASSWORD_IN_USE = __DEFAULT_PASSWORD_IN_USE__;
-
-var $ = function (id) { return document.getElementById(id); };
-
-function say(el, text, ok) {
-  el.textContent = text || "";
-  el.className = "msg" + (text ? (ok ? " ok" : " bad") : "");
-}
-
-async function api(path, payload) {
-  var options = {credentials: "same-origin"};
-  if (payload !== undefined) {
-    options.method = "POST";
-    options.headers = {"Content-Type": "application/json"};
-    options.body = JSON.stringify(payload);
-  }
-  var response = await fetch(path, options);
-  try {
-    return await response.json();
-  } catch (error) {
-    return {ok: false, message: "服务端回了一段不是 JSON 的东西（HTTP "
-                                + response.status + "）"};
-  }
-}
-
-// ------------------------------------------------------------------ 登录
-var loggedIn = false;
-
-function showLoggedIn(name) {
-  loggedIn = true;
-  $("who").textContent = "已登录：" + name;
-  $("logout").classList.remove("hidden");
-  $("loginView").classList.add("hidden");
-  $("mainView").classList.remove("hidden");
-  if (DEFAULT_PASSWORD_IN_USE) {
-    $("defaultPwBanner").classList.remove("hidden");
-  }
-  loadConfig(currentCfg);
-  loadAdmins();
-}
-
-function showLoggedOut(message) {
-  loggedIn = false;
-  $("who").textContent = "";
-  $("logout").classList.add("hidden");
-  $("mainView").classList.add("hidden");
-  $("loginView").classList.remove("hidden");
-  if (message) { say($("loginMsg"), message, false); }
-}
-
-$("loginBtn").onclick = async function () {
-  say($("loginMsg"), "登录中……", true);
-  var result = await api("/admin/api/login", {
-    name: $("loginName").value, password: $("loginPass").value});
-  if (!result.ok) { say($("loginMsg"), result.message, false); return; }
-  $("loginPass").value = "";
-  say($("loginMsg"), "");
-  // 登录之后 banner 的状态可能变了（比如刚改完默认口令），重问一次。
-  var session = await api("/admin/api/session");
-  DEFAULT_PASSWORD_IN_USE = DEFAULT_PASSWORD_IN_USE && true;
-  showLoggedIn(session.name || result.name);
-};
-
-$("loginPass").addEventListener("keydown", function (event) {
-  if (event.key === "Enter") { $("loginBtn").click(); }
-});
-
-$("logout").onclick = async function () {
-  await api("/admin/api/logout", {});
-  showLoggedOut("已退出登录。");
-};
-
-// ------------------------------------------------------------ 运营配置
-var currentCfg = "shop";
-
-Array.prototype.forEach.call(
-  document.querySelectorAll(".tabs button"), function (button) {
-    button.onclick = function () {
-      Array.prototype.forEach.call(
-        document.querySelectorAll(".tabs button"),
-        function (other) { other.classList.remove("on"); });
-      button.classList.add("on");
-      currentCfg = button.getAttribute("data-cfg");
-      loadConfig(currentCfg);
-    };
-  });
-
-async function loadConfig(which) {
-  say($("cfgMsg"), "读取中……", true);
-  var result = await api("/admin/api/config/" + which);
-  if (!result.ok) {
-    if (result.message === "请先登录管理页") { showLoggedOut(result.message); return; }
-    say($("cfgMsg"), result.message, false);
-    return;
-  }
-  $("cfgText").value = result.text;
-  $("cfgPath").textContent = result.path || "";
-  $("cfgPath").className = "msg";
-  var warnings = result.warnings || [];
-  if (warnings.length) {
-    // 文件坏了的时候服务端会继续用上一份好的 —— 不说的话人会以为
-    // 自己刚存的那份已经生效了。
-    say($("cfgMsg"), "⚠ 服务端现在用的不是这份文件：\n" + warnings.join("\n"), false);
-  } else {
-    say($("cfgMsg"), "");
-  }
-}
-
-$("cfgReload").onclick = function () { loadConfig(currentCfg); };
-
-$("cfgSave").onclick = async function () {
-  say($("cfgMsg"), "保存中……", true);
-  var result = await api("/admin/api/config/" + currentCfg,
-                         {text: $("cfgText").value});
-  if (!result.ok && result.message === "请先登录管理页") {
-    showLoggedOut(result.message); return;
-  }
-  say($("cfgMsg"), result.message, result.ok);
-};
-
-// ------------------------------------------------------------ 物品速查
-$("lookupBtn").onclick = async function () {
-  var raw = $("lookupId").value.trim();
-  var result = await api("/admin/api/item?id=" + encodeURIComponent(raw));
-  if (!result.ok) {
-    $("lookupOut").classList.add("hidden");
-    say($("lookupMsg"), result.message, false);
-    return;
-  }
-  say($("lookupMsg"), "");
-  delete result.ok;
-  $("lookupOut").textContent = JSON.stringify(result, null, 2);
-  $("lookupOut").classList.remove("hidden");
-};
-
-$("lookupId").addEventListener("keydown", function (event) {
-  if (event.key === "Enter") { $("lookupBtn").click(); }
-});
-
-// ---------------------------------------------------------- 管理员账号
-function renderAdmins(names) {
-  var rows = $("adminRows");
-  rows.textContent = "";
-  (names || []).forEach(function (name) {
-    var tr = document.createElement("tr");
-    var td1 = document.createElement("td");
-    td1.textContent = name;
-    var td2 = document.createElement("td");
-    var button = document.createElement("button");
-    button.textContent = "删除";
-    button.style.margin = "0";
-    button.onclick = function () { removeAdmin(name); };
-    td2.appendChild(button);
-    tr.appendChild(td1);
-    tr.appendChild(td2);
-    rows.appendChild(tr);
-  });
-}
-
-async function loadAdmins() {
-  var result = await api("/admin/api/admins");
-  if (!result.ok) {
-    if (result.message === "请先登录管理页") { showLoggedOut(result.message); }
-    return;
-  }
-  renderAdmins(result.names);
-}
-
-$("addAdmin").onclick = async function () {
-  var result = await api("/admin/api/admins/add", {
-    name: $("newAdminName").value, password: $("newAdminPass").value});
-  say($("adminMsg"), result.message, result.ok);
-  if (result.ok) {
-    $("newAdminName").value = "";
-    $("newAdminPass").value = "";
-    renderAdmins(result.names);
-  }
-};
-
-$("setPw").onclick = async function () {
-  var result = await api("/admin/api/admins/password", {
-    name: $("pwName").value, password: $("pwValue").value});
-  $("pwValue").value = "";
-  if (result.ok && result.logged_out) {
-    // 改的是自己的口令 ⇒ 服务端已经把我的会话作废了，必须重登。
-    DEFAULT_PASSWORD_IN_USE = false;
-    showLoggedOut(result.message);
-    return;
-  }
-  say($("adminMsg"), result.message, result.ok);
-};
-
-async function removeAdmin(name) {
-  if (!window.confirm("确定删除管理员「" + name + "」？")) { return; }
-  var result = await api("/admin/api/admins/remove", {name: name});
-  if (result.ok && result.logged_out) {
-    showLoggedOut("你把自己删掉了，已退出登录。");
-    return;
-  }
-  say($("adminMsg"), result.message, result.ok);
-  if (result.ok) { renderAdmins(result.names); }
-}
-
-// -------------------------------------------------------------- 启动
-(async function () {
-  var session = await api("/admin/api/session");
-  if (session.logged_in) { showLoggedIn(session.name); }
-  else { showLoggedOut(""); }
-})();
-</script>
+<!-- ========================= 物品选择器 ========================= -->
+<div class="modal hidden" id="picker">
+  <div class="panel">
+    <div class="panel-title">
+      <h2>选择物品</h2>
+      <span class="count" id="pickCount"></span>
+    </div>
+    <div class="panel-body">
+      <div class="toolbar">
+        <input id="pickSearch" type="text" placeholder="搜 中文名 / 韩文名 / id">
+        <select id="pickKind"></select>
+        <span class="grow"></span>
+        <button class="btn" id="pickClose">关闭</button>
+      </div>
+      <div class="pick-grid" id="pickGrid"></div>
+      <div class="pick-detail" id="pickDetail"></div>
+    </div>
+  </div>
+</div>
 
 </body>
 </html>

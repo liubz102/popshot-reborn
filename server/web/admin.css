@@ -1,0 +1,430 @@
+/* ===========================================================================
+   admin.css —— 管理页样式（V0.3 合成与商店 M8 / D16）
+
+   配色**全部来自原版美术**，不是自己配的：
+
+   | 变量 | 出处 |
+   |---|---|
+   | --amber / --amber-dark | Images/NewUI/ShopCabinetBack.png 的琥珀橙金属板 |
+   | --cocoa / --cocoa-ink  | 同图的深棕内嵌面板、面板里的正文字色 |
+   | --gold                 | 房间界面「F5 游戏准备」那颗金黄按钮 |
+   | --crimson              | 房间界面各面板的绯红边框 → 删除 / 危险 |
+   | --teal                 | 房间界面属性条的青色 → 「已上架」开关 |
+   | 星芒格子               | Images/NewUI/ShopCabinetSlot.png 的橙色放射底 |
+
+   ★ 用户拍板的是「米白纸面 + 琥珀边框」：**琥珀当描边、米白当底**，
+     不是整屏铺橙色 —— 这是一个要读几百个数字的表单页，底色得让眼睛待得住。
+
+   ★ 一张图都不引（除了物品图集）。铆钉 / 星芒 / 斜切角全是 CSS 画的，
+     省得再往包里塞美术文件。
+   ========================================================================= */
+
+:root {
+  --paper:      #FDF6E8;   /* 页面底：暖米白 */
+  --paper-2:    #F5E7CC;   /* 次级底：工具条 / 表头 */
+  --card:       #FFFBF2;   /* 卡片面 */
+
+  --amber:      #F5A623;
+  --amber-dark: #E8901A;
+  --amber-soft: #FBD89B;
+
+  --cocoa:      #4A2C1D;   /* 标题条 */
+  --cocoa-ink:  #3E2723;   /* 正文字 */
+  --cocoa-soft: #8A6A53;   /* 次要说明字 */
+
+  --gold:       #FFC93C;
+  --gold-edge:  #D89A16;
+
+  --crimson:    #C0272D;
+  --crimson-dk: #8E1B20;
+
+  --teal:       #2FA8A0;
+  --line:       #E2CFAB;   /* 分隔线 / 输入框描边 */
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  color: var(--cocoa-ink);
+  font: 14px/1.6 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  background: var(--paper);
+  /* 极淡的斜纹，让大片米白不至于死板。透明度压到几乎看不见。 */
+  background-image:
+    repeating-linear-gradient(135deg,
+      rgba(232, 144, 26, .035) 0 2px, transparent 2px 9px);
+}
+
+.hidden { display: none !important; }
+
+/* ------------------------------------------------------------------ 顶栏 */
+.topbar {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 10px 22px;
+  background: linear-gradient(#F9B23C, var(--amber));
+  border-bottom: 3px solid var(--amber-dark);
+  box-shadow: 0 2px 6px rgba(120, 80, 20, .22);
+}
+.topbar .brand {
+  font-size: 17px; font-weight: 700; color: #fff;
+  text-shadow: 0 2px 0 rgba(120, 70, 10, .55);
+  letter-spacing: .5px;
+}
+.topbar .who { margin-left: auto; color: #5A3416; font-weight: 600; }
+
+main { max-width: 1180px; margin: 0 auto; padding: 20px 18px 60px; }
+
+/* ------------------------------------------------------------------ 面板 */
+.panel {
+  position: relative;
+  background: var(--card);
+  border: 3px solid var(--amber-dark);
+  border-radius: 12px;
+  margin-bottom: 20px;
+  box-shadow: 0 2px 0 rgba(150, 100, 20, .18),
+              0 8px 22px rgba(140, 95, 30, .12);
+}
+/* 四角铆钉 —— 照 ShopCabinetBack.png 面板角上那四颗螺丝。纯装饰，不吃点击。 */
+.panel::before {
+  content: ""; position: absolute; inset: 5px; pointer-events: none;
+  border-radius: 8px;
+  background-repeat: no-repeat;
+  background-image:
+    radial-gradient(circle 2.5px at 3px 3px,
+      rgba(255, 255, 255, .75) 45%, rgba(120, 70, 10, .45) 55%, transparent 60%),
+    radial-gradient(circle 2.5px at calc(100% - 3px) 3px,
+      rgba(255, 255, 255, .75) 45%, rgba(120, 70, 10, .45) 55%, transparent 60%),
+    radial-gradient(circle 2.5px at 3px calc(100% - 3px),
+      rgba(160, 110, 40, .55) 45%, rgba(120, 70, 10, .35) 55%, transparent 60%),
+    radial-gradient(circle 2.5px at calc(100% - 3px) calc(100% - 3px),
+      rgba(160, 110, 40, .55) 45%, rgba(120, 70, 10, .35) 55%, transparent 60%);
+}
+
+.panel-title {
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 18px;
+  background: linear-gradient(var(--cocoa), #3A2116);
+  border-bottom: 3px solid var(--amber-dark);
+  border-radius: 8px 8px 0 0;
+  /* 右上角斜切 —— 原版面板都是这种被削掉一角的金属板。 */
+  clip-path: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 0 100%);
+}
+.panel-title h2 {
+  margin: 0; font-size: 15px; font-weight: 700; color: #fff;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, .6);
+}
+.panel-title .count {
+  margin-left: auto; color: var(--amber-soft); font-size: 13px;
+  font-weight: 600; padding-right: 18px;
+}
+.panel-body { padding: 14px 18px; }
+.panel-foot {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 12px 18px;
+  background: var(--paper-2);
+  border-top: 2px solid var(--line);
+  border-radius: 0 0 8px 8px;
+}
+
+/* 面板说明（原来写在 json 里的 `_说明`，D16 之后搬到这里） */
+ul.help {
+  margin: 0 0 14px; padding: 10px 14px 10px 30px;
+  list-style: "◆ "; color: var(--cocoa-soft); font-size: 13px;
+  background: #FFF6E2; border: 2px dashed var(--amber-soft); border-radius: 8px;
+}
+ul.help li { margin: 2px 0; }
+ul.help b, .hint b { color: var(--crimson); }
+.hint { color: var(--cocoa-soft); font-size: 13px; margin: 4px 0 12px; }
+
+/* ------------------------------------------------------------------ 横幅 */
+.banner {
+  background: #FFE9E9; border: 3px solid var(--crimson); color: #7A1A1E;
+  padding: 11px 16px; border-radius: 10px; margin-bottom: 18px;
+  font-weight: 600;
+}
+
+/* ------------------------------------------------------------ 页签 / 按钮 */
+.tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.tabs button {
+  padding: 8px 20px; cursor: pointer; font: inherit; font-weight: 700;
+  color: #6B4A2E;
+  background: linear-gradient(#FFF7E6, #F0DFBE);
+  border: 3px solid var(--amber-dark);
+  border-bottom-width: 3px;
+  border-radius: 10px 10px 0 0;
+  clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 0 100%);
+}
+.tabs button:hover { background: linear-gradient(#FFFDF6, #F7EAD0); }
+.tabs button.on {
+  color: #fff;
+  background: linear-gradient(#F9B23C, var(--amber-dark));
+  text-shadow: 0 1px 0 rgba(120, 70, 10, .6);
+}
+
+.btn {
+  padding: 6px 15px; cursor: pointer; font: inherit; font-weight: 600;
+  color: var(--cocoa-ink);
+  background: linear-gradient(#FFFDF7, #F1E2C4);
+  border: 2px solid var(--amber-dark); border-radius: 8px;
+  box-shadow: 0 2px 0 #C98A1D;
+}
+.btn:hover { background: linear-gradient(#FFF, #F8EFDC); }
+.btn:active { transform: translateY(2px); box-shadow: none; }
+.btn:disabled {
+  opacity: .45; cursor: default; transform: none; box-shadow: 0 2px 0 #C98A1D;
+}
+.btn-primary {
+  background: linear-gradient(#FFDD79, var(--gold));
+  border-color: var(--gold-edge); box-shadow: 0 2px 0 #B8830F;
+}
+.btn-primary:hover { background: linear-gradient(#FFE795, #FFD255); }
+.btn-danger {
+  color: #fff; background: linear-gradient(#DE4A50, var(--crimson));
+  border-color: var(--crimson-dk); box-shadow: 0 2px 0 var(--crimson-dk);
+}
+.btn-danger:hover { background: linear-gradient(#E85C62, #CE2E34); }
+.btn-ghost { box-shadow: none; background: rgba(255, 255, 255, .55); }
+.btn-sm { padding: 3px 9px; font-size: 12px; box-shadow: 0 2px 0 #C98A1D; }
+
+/* ------------------------------------------------------------------ 表单 */
+label { display: block; margin: 10px 0 4px; font-size: 13px;
+        color: var(--cocoa-soft); font-weight: 600; }
+input[type=text], input[type=password], input[type=number], select {
+  width: 100%; max-width: 320px; padding: 5px 9px;
+  color: var(--cocoa-ink); background: #fff;
+  border: 2px solid var(--line); border-radius: 6px; font: inherit;
+}
+input:focus, select:focus {
+  outline: none; border-color: var(--amber-dark);
+  box-shadow: 0 0 0 3px rgba(245, 166, 35, .28);
+}
+input[type=number] { max-width: 100%; }
+input.bad { border-color: var(--crimson); background: #FFF2F2; }
+
+/* 字段：一个标签 + 一个控件，横着排 */
+.field { display: flex; flex-direction: column; gap: 2px; }
+.field > .lab {
+  font-size: 11px; color: var(--cocoa-soft); font-weight: 700;
+  letter-spacing: .3px; white-space: nowrap;
+}
+.field .with-suffix { display: flex; align-items: center; gap: 4px; }
+.field .with-suffix .sfx { font-size: 12px; color: var(--cocoa-soft); }
+/* 去掉上下箭头：它们白占十几个像素，而这里的格子窄，`18000` 会被挤成 `180(`。
+   键盘上下键照样能调，功能一点没少。 */
+.field input[type=number] {
+  width: 66px; -moz-appearance: textfield; appearance: textfield;
+}
+.field input[type=number]::-webkit-outer-spin-button,
+.field input[type=number]::-webkit-inner-spin-button {
+  -webkit-appearance: none; margin: 0;
+}
+.field.wide input[type=text] { width: 100%; max-width: none; }
+.field.wide { flex: 1 1 220px; }
+.field select { width: auto; min-width: 90px; }
+/* ★ 「字段表还没登记、但数据里确实有」的键。标出来，好让人想起去补 SCHEMA
+   —— 但它照样能改、照样存得回去，不会被悄悄吃掉。 */
+.field.unknown > .lab::after, .toggle.unknown > .lab::after {
+  content: " ·未登记"; color: var(--crimson); font-weight: 700;
+  font-size: 11px;
+}
+
+/* 开关 */
+.toggle {
+  display: inline-flex; align-items: center; gap: 7px;
+  cursor: pointer; user-select: none; font-size: 13px; font-weight: 600;
+  color: var(--cocoa-soft);
+}
+.toggle .track {
+  width: 40px; height: 21px; border-radius: 11px; position: relative;
+  background: #D8C7AA; border: 2px solid #BEA783; transition: background .12s;
+}
+.toggle .track::after {
+  content: ""; position: absolute; top: 1px; left: 1px;
+  width: 15px; height: 15px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .3);
+  transition: transform .12s;
+}
+.toggle.on .track { background: var(--teal); border-color: #1F7E78; }
+.toggle.on .track::after { transform: translateX(19px); }
+.toggle.on { color: #1F7E78; }
+
+/* ---------------------------------------------------------- 物品图标格子 */
+/* 照 Images/NewUI/ShopCabinetSlot.png：上架 = 橙色放射星芒 + 橙描边，
+   未上架 = 灰白底 + 灰描边。一眼看出哪些真的在卖。 */
+.slot {
+  position: relative; flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  background: #fff; border: 2px solid #CFC0A6; border-radius: 9px;
+  overflow: hidden;
+}
+.slot.on {
+  border-color: var(--amber-dark);
+  /* 放射星芒：原版是画出来的螺旋，这里用 conic 重复扇形近似，够意思了。 */
+  background: repeating-conic-gradient(from 0deg at 50% 45%,
+    #FBB63F 0deg 15deg, #F09A18 15deg 30deg);
+}
+.slot .ic { background-repeat: no-repeat; image-rendering: auto; }
+.slot .noicon {
+  font-weight: 700; color: #B9A588; font-size: 20px;
+}
+.slot.pick { cursor: pointer; }
+.slot.pick:hover { border-color: var(--crimson); }
+.slot.empty {
+  border-style: dashed; border-color: var(--amber-soft); background: #FFFDF6;
+  color: var(--amber-dark); font-size: 22px; font-weight: 700; cursor: pointer;
+}
+.slot.empty:hover { background: #FFF4DE; border-color: var(--amber-dark); }
+
+/* ------------------------------------------------------------- 工具条 */
+.toolbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 12px; margin-bottom: 14px;
+  background: var(--paper-2);
+  border: 2px solid var(--line); border-radius: 9px;
+}
+.toolbar input[type=text] { max-width: 220px; }
+.toolbar select { width: auto; }
+.toolbar .grow { margin-left: auto; }
+
+/* 删掉这一条的按钮。**画在卡片里面**（右上角）—— 挂在外面会压住上一张卡，
+   而且看着像掉出来的。平时是灰的，指上去才变红：删除不该是最显眼的东西。 */
+.kill {
+  position: absolute; top: 7px; right: 7px;
+  width: 22px; height: 22px; padding: 0; line-height: 1;
+  font: inherit; font-size: 12px; cursor: pointer;
+  color: #BFA184; background: transparent;
+  border: 2px solid transparent; border-radius: 6px;
+}
+.kill:hover {
+  color: #fff; background: var(--crimson); border-color: var(--crimson-dk);
+}
+
+/* ------------------------------------------------- 商店目录：卡片网格 */
+.grid {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(352px, 1fr));
+}
+.item-card {
+  position: relative;
+  display: flex; gap: 11px;
+  padding: 11px 34px 11px 12px;
+  background: #fff; border: 2px solid var(--line); border-radius: 10px;
+}
+.item-card.listed { border-color: var(--amber); background: #FFFCF4; }
+.item-card .col { flex: 1 1 auto; min-width: 0; }
+.item-card .nm { display: flex; gap: 6px; align-items: center; }
+.item-card .nm input { flex: 1 1 auto; max-width: none; font-weight: 600; }
+/* 一行放不下就省略号 —— 让每张卡一样高，扫一列数字时眼睛才不用重新找位置。 */
+.item-card .meta {
+  font-size: 12px; color: var(--cocoa-soft); margin: 3px 0 7px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.item-card .meta code {
+  background: var(--paper-2); border-radius: 4px; padding: 0 5px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+}
+.item-card .nums { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; }
+
+/* --------------------------------------------------- 合成配方：配方卡 */
+.recipe-card {
+  position: relative;
+  padding: 12px 34px 12px 14px; margin-bottom: 12px;
+  background: #fff; border: 2px solid var(--line); border-radius: 10px;
+}
+.recipe-card.listed { border-color: var(--amber); background: #FFFCF4; }
+.recipe-head { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.recipe-out { display: flex; gap: 10px; align-items: center; flex: 1 1 260px; }
+.recipe-out .col { min-width: 0; flex: 1 1 auto; }
+.arrow {
+  align-self: center; font-size: 22px; color: var(--amber-dark); font-weight: 700;
+}
+.mat-slots { display: flex; gap: 8px; flex-wrap: wrap; }
+.mat {
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  width: 78px;
+}
+.mat .nmz {
+  font-size: 11px; color: var(--cocoa-soft); text-align: center;
+  width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mat input[type=number] { width: 62px; text-align: center; }
+.mat .drop { padding: 0 6px; font-size: 11px; }
+.recipe-foot {
+  display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end;
+  margin-top: 11px; padding-top: 10px; border-top: 2px dashed var(--line);
+}
+.recipe-card .rid {
+  position: absolute; top: 11px; right: 36px;
+  font-size: 11px; color: #C4B195; font-weight: 700;
+}
+
+/* --------------------------------------------------- 材料掉落：规则行 */
+.rule-row {
+  position: relative;
+  display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end;
+  padding: 11px 34px 11px 14px; margin-bottom: 10px;
+  background: #fff; border: 2px solid var(--line); border-radius: 10px;
+}
+.rule-row .who { display: flex; gap: 9px; align-items: center; }
+.rule-row .who .nmz { font-size: 12px; font-weight: 600; max-width: 130px; }
+
+/* 出错时高亮那一张卡（服务端把下标写在错误里，前台定位过来） */
+.flash { animation: flash 1.6s ease-out; }
+.item-card.bad, .recipe-card.bad, .rule-row.bad {
+  border-color: var(--crimson); background: #FFF2F2;
+}
+@keyframes flash {
+  0%, 45% { box-shadow: 0 0 0 4px rgba(192, 39, 45, .38); }
+  100%    { box-shadow: 0 0 0 0 rgba(192, 39, 45, 0); }
+}
+
+/* ------------------------------------------------------------ 消息条 */
+.msg { margin-top: 10px; font-size: 13px; min-height: 1.6em; white-space: pre-wrap; }
+.msg.ok  { color: #1F7E78; font-weight: 600; }
+.msg.bad { color: var(--crimson); font-weight: 600; }
+.dirty { color: var(--crimson); font-weight: 700; }
+.dirty.clean { color: var(--cocoa-soft); font-weight: 500; }
+
+/* ------------------------------------------------------------ 表格 */
+table { border-collapse: collapse; width: 100%; max-width: 520px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 2px solid var(--line); }
+th { color: var(--cocoa-soft); font-weight: 700; background: var(--paper-2); }
+code {
+  background: var(--paper-2); padding: 1px 5px; border-radius: 4px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+}
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+.row > div { flex: 0 0 auto; }
+
+/* -------------------------------------------------------- 物品选择器 */
+.modal {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(62, 39, 35, .55); padding: 24px;
+}
+.modal .panel {
+  width: min(940px, 100%); max-height: 100%;
+  display: flex; flex-direction: column; margin: 0;
+}
+.modal .panel-body { overflow: auto; }
+.pick-grid {
+  display: grid; gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(74px, 1fr));
+}
+.pick {
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 5px 3px; cursor: pointer;
+  background: #fff; border: 2px solid var(--line); border-radius: 9px;
+}
+.pick:hover { border-color: var(--amber-dark); background: #FFF7E6; }
+.pick.sel { border-color: var(--crimson); background: #FFF0F0; }
+.pick .nmz {
+  font-size: 10px; line-height: 1.25; text-align: center; color: var(--cocoa-soft);
+  width: 100%; max-height: 2.5em; overflow: hidden;
+}
+.pick-empty { color: var(--cocoa-soft); padding: 30px; text-align: center; }
+.pick-detail {
+  border-top: 2px dashed var(--line); margin-top: 12px; padding-top: 10px;
+  font-size: 12px; color: var(--cocoa-soft); min-height: 3em;
+}
+.pick-detail b { color: var(--cocoa-ink); }

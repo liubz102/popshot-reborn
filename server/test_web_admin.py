@@ -22,6 +22,7 @@ if HERE not in sys.path:
 
 import account_store                                           # noqa: E402
 import shopcfg                                                 # noqa: E402
+import shopdata                                                # noqa: E402
 from account_store import AccountStore                         # noqa: E402
 from web import admin as web_admin                             # noqa: E402
 from web import server as web_server                           # noqa: E402
@@ -155,6 +156,8 @@ class AdminAuthTests(_AdminCase):
                 ("/admin/api/config/recipe", None),
                 ("/admin/api/config/drops", None),
                 ("/admin/api/admins", None),
+                ("/admin/api/catalog", None),
+                ("/admin/itemicons.png", None),
                 ("/admin/api/item?id=1120041", None),
                 ("/admin/api/config/shop", {"text": "{}"}),
                 ("/admin/api/admins/add", {"name": "carol", "password": "pw1"}),
@@ -302,13 +305,28 @@ class AdminConfigTests(_AdminCase):
             self.assertFalse(result["ok"], text)
         self.assertEqual(before, self.get("drops")["text"])
 
-    def test_human_notes_survive_a_save(self):
-        # 生成的三份里都有 `_说明`。校验器不认识这个键，保存不该把它吃掉
-        # —— 那是用户（和我们）留给下一个人的说明。
+    def test_the_guidance_notes_are_not_written_back(self):
+        # ★ D16：`_说明` 那几句话是写给**手改 json 的人**看的，而现在唯一的
+        #   编辑入口是管理页，说明已经画在面板上了（`SCHEMA[...]["help"]`）。
+        #   ⇒ 保存只写 `format` + 那一个列表，老文件里的 `_说明` 就此消失。
         raw = json.loads(self.get("drops")["text"])
-        self.assertIn("_说明", raw)
+        raw["_说明"] = ["旧文件里留下来的说明"]
+        raw["_随便什么"] = 1
         self.assertTrue(self.save("drops", json.dumps(raw, ensure_ascii=False))["ok"])
-        self.assertIn("_说明", json.loads(self.get("drops")["text"]))
+        saved = json.loads(self.get("drops")["text"])
+        self.assertEqual(["format", "rules"], sorted(saved))
+        # 规则本身一条不少 —— 去掉的只有注释键。
+        self.assertEqual(len(raw["rules"]), len(saved["rules"]))
+
+    def test_a_field_the_validator_ignores_still_survives_a_save(self):
+        # 管理页对「字段表还没登记」的键退回通用输入框，模型就是原对象
+        # ⇒ 它必须能原样存回去。这里从服务端这一侧钉住：**列表元素里的
+        # 未知键不会被吃掉**（被吃掉的只有最外层 `_` 开头的注释键）。
+        raw = json.loads(self.get("drops")["text"])
+        raw["rules"][0]["以后新增的字段"] = "保留我"
+        self.assertTrue(self.save("drops", json.dumps(raw, ensure_ascii=False))["ok"])
+        saved = json.loads(self.get("drops")["text"])
+        self.assertEqual("保留我", saved["rules"][0]["以后新增的字段"])
 
     def test_a_broken_file_on_disk_is_reported_when_reading(self):
         # 文件坏了时 `shopcfg` 保留上一份好的（D10）—— 页面必须说出来，
@@ -320,6 +338,104 @@ class AdminConfigTests(_AdminCase):
         result = self.get("drops")
         self.assertTrue(result["ok"])            # 文本照样给你看，好去修
         self.assertTrue(result["warnings"])
+
+
+class AdminAssetTests(_AdminCase):
+    """样式 / 脚本 / 图标图集这三个静态件（D16 的新前台靠它们）。"""
+
+    def fetch(self, path, headers=None, opener=None):
+        """返回 `(状态码, 响应头, 原始字节)` —— 图集是二进制，不能按文本读。"""
+        req = urllib.request.Request(self.url(path), headers=headers or {})
+        try:
+            with (opener or self.opener).open(req, timeout=10) as response:
+                return response.status, dict(response.headers), response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, dict(error.headers), error.read()
+
+    def test_the_stylesheet_and_script_need_no_login(self):
+        # ★ `/admin` 本身（登录表单）就是未登录状态渲染的 —— 样式和脚本
+        #   再要登录，登录页就成了一堆裸标签。它们里面没有秘密。
+        for path, marker in (("/admin/admin.css", b"--amber"),
+                             ("/admin/admin.js", b"admin.js")):
+            status, headers, body = self.fetch(path)
+            self.assertEqual(200, status, path)
+            self.assertIn(marker, body, path)
+            self.assertIn("charset=utf-8", headers["Content-Type"].lower())
+
+    def test_the_page_pulls_in_the_stylesheet_and_the_script(self):
+        # 打包漏了哪个文件，本地不一定看得出来 —— 这里钉住引用关系。
+        _status, html = self.request("/admin")
+        self.assertIn('href="/admin/admin.css"', html)
+        self.assertIn('src="/admin/admin.js"', html)
+
+    def test_the_atlas_comes_back_as_a_png_once_logged_in(self):
+        self.login()
+        status, headers, body = self.fetch("/admin/itemicons.png")
+        self.assertEqual(200, status)
+        self.assertEqual("image/png", headers["Content-Type"])
+        self.assertEqual(b"\x89PNG\r\n\x1a\n", body[:8])
+
+    def test_the_atlas_revalidates_instead_of_being_resent(self):
+        # 0.62 MB 的图，每次刷新都重下太浪费；但 `max-age` 又会让「刚跑完
+        # update-shopicons.bat，浏览器里还是旧图」出现一整天。⇒ ETag + no-cache。
+        self.login()
+        _status, headers, _body = self.fetch("/admin/itemicons.png")
+        etag = headers["ETag"]
+        self.assertIn("no-cache", headers["Cache-Control"])
+        status, _h, body = self.fetch("/admin/itemicons.png",
+                                      {"If-None-Match": etag})
+        self.assertEqual(304, status)
+        self.assertEqual(b"", body)
+
+    def test_a_missing_asset_says_which_file_is_missing(self):
+        # 打包漏一个文件时，云上 500 而本地好好的 —— 至少要说清是哪一个。
+        path = os.path.join(web_admin.HERE, "itemicons.png")
+        backup = path + ".bak"
+        os.replace(path, backup)
+        self.addCleanup(lambda: os.path.exists(backup) and os.replace(backup, path))
+        self.login()
+        status, result = self.request("/admin/itemicons.png")
+        self.assertEqual(404, status)
+        self.assertIn("itemicons.png", result["message"])
+
+
+class AdminCatalogTests(_AdminCase):
+    """`/admin/api/catalog` —— 物品表 + 字段描述表 + 图集元信息。"""
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(self.login()[1]["ok"])
+        self.catalog = self.request("/admin/api/catalog")[1]
+        self.assertTrue(self.catalog["ok"], self.catalog)
+
+    def test_it_only_lists_items_that_can_go_into_a_backpack(self):
+        # ★ 校验器只放行 `ownable` 的（§11）—— 选得到却存不进去的东西
+        #   不该出现在选择器里。
+        self.assertTrue(self.catalog["items"])
+        for entry in self.catalog["items"]:
+            self.assertTrue(shopdata.ownable(entry["id"]), entry)
+        listed = set(e["id"] for e in self.catalog["items"])
+        for item_id in shopdata.ids_of_kind("material"):
+            if shopdata.ownable(item_id):
+                self.assertIn(item_id, listed)
+
+    def test_almost_everything_has_an_icon_cell(self):
+        cells = [e for e in self.catalog["items"] if e.get("cell") is not None]
+        # 原版素材本来就缺几个图标，缺的画问号占位；但绝大多数得有。
+        self.assertGreater(len(cells), 0.95 * len(self.catalog["items"]))
+        icons = self.catalog["icons"]
+        self.assertEqual("/admin/itemicons.png", icons["url"])
+        top = max(e["cell"] for e in cells)
+        self.assertLess(top, (icons["width"] // icons["size"])
+                        * (icons["height"] // icons["size"]))
+
+    def test_the_schema_covers_all_three_config_files(self):
+        schema = self.catalog["schema"]
+        self.assertEqual(sorted(web_admin.CONFIG_FILES), sorted(schema))
+        for which, spec in schema.items():
+            self.assertTrue(spec["fields"], which)
+            self.assertTrue(spec["help"], which)
+            self.assertTrue(spec["list_key"], which)
 
 
 class AdminAccountApiTests(_AdminCase):

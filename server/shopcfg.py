@@ -137,6 +137,53 @@ SERIES_ZH = {"D": "爆裂", "R": "极速", "F": "复合"}
 #: 角色 id → 中文名（`Data/ChrProps.ini` 的前三个，V0.1 §119）。
 CHARACTER_ZH = {0: "泰尔", 1: "卡希尔", 2: "布洛克"}
 
+#: 关卡 id → 中文名。管理页的「关卡」下拉框用它。
+#:
+#: ★ **就这七个**：客户端建房时的关卡下拉框只认静态表 `0x6dc52c` 里的
+#:   `(3, 2, 1, 4, 5, 6, 7)`（`tools/probe_quest_list.py` 逆出来的）。
+#:   `drops.json` 的 `stage` 比的就是这个 id（`gameserver.quest_materials`
+#:   拿它和房间描述符的第一个参数比）。
+#:
+#: ★ 名字取的是**boss / 主题名**，不是成就名 —— 用户是按「岩浆巨龙」这种
+#:   叫法记关卡的。两个独立来源对得上，所以可以放心写死：
+#:
+#:   | id | `map.ini` 主题 → `Chinese.ini` | `Promotion-chn.ini` 的成就名 |
+#:   |---|---|---|
+#:   | 1 | 불프로그 → 机械青蛙 | [任务] 起火的村庄! |
+#:   | 2 | 드라카 → 岩浆巨龙 | [任务] 埃斯佩拉的大怪兽! |
+#:   | 3 | 비밀의 섬 → 神秘岛 | [任务] 神秘岛攻略! |
+#:   | 4 | 자미로건쉽 → 鲸鱼战舰 | [任务] 鲸鱼战舰击破! |
+#:   | 5 | 다크나이트 → 黑骑士 | [任务] 加密尔地下废墟的秘密! |
+#:   | 6 | 브레그마 → 太阳齿轮 | [任务] 突破扎米洛基地! |
+#:   | 7 | 자미로 비밀기지 → **没有中文译名** | [任务] 寻找扎米洛的痕迹! |
+#:
+#:   id 和主题的对应有两条独立佐证：`map.ini` 里几张 boss 图的
+#:   `RequiredQuestClear`（Draka=2 / Island=3 / Airship=4 / Darknight=5 /
+#:   Bregma=6），以及同一份文件里那行注释
+#:   `1:개굴 2:용 3:섬 4:비행기 5:말 6:해`。
+#:
+#: ★ 第 7 关的名字是**我们自己拼的**（原版没给中文）：「扎米洛」照第 6 关
+#:   成就名里的官方译法，「秘密基地」照韩文主题名 `자미로 비밀기지`。
+QUEST_ZH = {
+    1: "机械青蛙",
+    2: "岩浆巨龙",
+    3: "神秘岛",
+    4: "鲸鱼战舰",
+    5: "黑骑士",
+    6: "太阳齿轮",
+    7: "扎米洛秘密基地",
+}
+
+#: `shopdata` 的 `kind` → 中文。管理页的物品选择器按它分页签。
+#: ★ 键要和 `shop_items.json` 的 `by_kind` 对得上；查不到的 kind 原样显示，
+#: 不要在这里硬编码一张「全部 kind」的清单（物品表换一版就可能多出一类）。
+KIND_ZH = {
+    "armor": "铠甲", "character": "角色", "consumable": "消耗品",
+    "dash": "冲刺", "key": "钥匙", "material": "材料", "package": "礼包",
+    "pet": "宠物", "ring": "戒指", "spray": "喷漆", "title": "称号",
+    "weapon": "武器",
+}
+
 #: 套装部位后缀（韩文名的最后一段）→ 中文。
 PART_SUFFIX_ZH = {"몸": "上衣", "다리": "下装", "손": "手套",
                   "발": "鞋", "머리": "头盔"}
@@ -264,16 +311,9 @@ def default_shop():
         })
 
     entries.sort(key=lambda e: (e["kind"], e["id"]))
-    return {
-        "format": FORMAT,
-        "_说明": [
-            "商店目录。改完保存即刻生效，不用重启服务端。",
-            "listed=false 的不上架（材料和合成产物收在这里只是为了有个中文名）。",
-            "price 是金币（原版的「픽셀」，中文版译作金币）。days=0 是永久。",
-            "id 必须是客户端认识的（server/shop_items.json 里有、且能进背包）。",
-        ],
-        "items": entries,
-    }
+    # ★ 不写 `_说明`：那几句话是给**手改 json 的人**看的，而现在唯一的编辑入口
+    #   是管理页（D16）。说明文字挪进了 `SCHEMA[...]["help"]`，页面直接渲染。
+    return {"format": FORMAT, "items": entries}
 
 
 # --------------------------------------------------------------------------
@@ -372,17 +412,8 @@ def default_recipes():
                     "materials": need[:MAX_MATERIALS],
                 })
                 next_id += 1
-    return {
-        "format": FORMAT,
-        "_说明": [
-            "合成配方。改完保存即刻生效，不用重启服务端。",
-            "★ 一条配方最多 4 种材料 —— 原版合成界面只有 4 个材料槽，第 5 种玩家看不见。",
-            "★ 原版没有合成成功率（界面上没有任何概率控件），别加。",
-            "cost 是金币；character 是角色限定（0 泰尔 / 1 卡希尔 / 2 布洛克，省略 = 不限）。",
-            "原版配方随 2009 年停服的服务端一起没了，这一份是复活工程自己设计的，随便改。",
-        ],
-        "recipes": recipes,
-    }
+    # `_说明` 见 `default_shop()` 那条注释：说明文字在 `SCHEMA` 里，不写进文件。
+    return {"format": FORMAT, "recipes": recipes}
 
 
 # --------------------------------------------------------------------------
@@ -472,16 +503,8 @@ def default_drops():
             "note": "扩展：对战模式也给一点（原版珠子主要来自对战）",
         })
 
-    return {
-        "format": FORMAT,
-        "_说明": [
-            "材料掉落。改完保存即刻生效，不用重启服务端。",
-            "mode: quest 闯关 / pvp 对战。stage 和 difficulty 省略 = 不限。",
-            "prob 是百分比（100 = 必掉）。cleared_only=true 表示只有通关才给。",
-            "前几条是原版基线（Promotion.ini 里那 4 关），后面是复活工程加的扩展。",
-        ],
-        "rules": rules,
-    }
+    # `_说明` 见 `default_shop()` 那条注释：说明文字在 `SCHEMA` 里，不写进文件。
+    return {"format": FORMAT, "rules": rules}
 
 
 # --------------------------------------------------------------------------
@@ -639,6 +662,145 @@ def validate_drops(raw):
             rule["note"] = str(entry["note"])
         out.append(rule)
     return out
+
+
+# --------------------------------------------------------------------------
+# 字段描述表 —— 管理页照着它生成输入框
+# --------------------------------------------------------------------------
+#
+# ★★ **为什么放在这里，而不是放在 `web/admin.html` 里**（D16）
+#
+# 用户的要求是「以后新增的字段也要同步显示在画面上」。字段的**真相**在
+# `validate_*` 里，所以描述表就得**贴着 validator 放**：加字段的人一眼看到
+# 两边都要动。`test_shopcfg` 里有一条用例卡死这件事 ——
+# validator 产出的每个键都必须在 SCHEMA 里、反之亦然，**单边加字段测试立刻红**。
+#
+# 这不是「靠人记得改两处」，是让漏改**必然**被发现（铁律 10 的同一种思路：
+# 判据要来自掌握事实的那一方，不要靠约定）。
+#
+# ⇒ 前台还有第二道保险：**数据里有、SCHEMA 里没有**的键，管理页退回通用输入框
+#   （数字→数字框 / 字符串→文本框 / 布尔→开关），所以哪怕 SCHEMA 一时没跟上，
+#   那个字段也不会从画面上消失，更不会在保存时被吃掉。
+#
+# ## 字段类型（前台认得的全部）
+#
+#   item      物品选择器（图标 + 中文名 + #id）。`kinds` 限定只让选哪几类
+#   text      文本框
+#   int       数字框（`min` / `max`）
+#   bool      开关
+#   choice    下拉（`options`）。`optional=True` 时多一个「不限」= 键不写进 json
+#   materials 合成材料槽（固定画 `max` 格，每格 `fields`）
+#
+# `optional` = 这个键可以整个不出现在 json 里（前台留空就不写）。
+# `readonly` = 只读展示，值由别的字段推出来（比如 `kind` 由 `id` 决定）。
+
+#: 三份配置各自的：列表键、标题、页面上的说明、字段表。
+#:
+#: ★ `help` 就是原来写在 json 里那几行 `_说明` —— 用户拍板搬到页面上、
+#:   不再写进文件（D16）。
+SCHEMA = {
+    "shop": {
+        "list_key": "items",
+        "title": "商店目录",
+        "unit": "件商品",
+        "help": [
+            "改完保存即刻生效，不用重启服务端。",
+            "「上架」关掉的不摆上货架（材料和合成产物收在这里只是为了有个中文名）。",
+            "价格是金币（原版的「픽셀」，中文版译作金币）。天数 0 = 永久。",
+            "★ 只能选客户端认识、且能进背包的物品 —— 别的发下去界面上是个空格子。",
+        ],
+        "fields": [
+            {"key": "id", "label": "物品", "type": "item"},
+            {"key": "kind", "label": "类别", "type": "text", "readonly": True,
+             "help": "由物品本身决定，改不了"},
+            {"key": "name", "label": "中文名", "type": "text",
+             "help": "原版没有中文物品名，这一份是复活工程自己翻的，随便改"},
+            {"key": "price", "label": "价格", "type": "int", "min": 0,
+             "suffix": "金币"},
+            {"key": "level", "label": "等级", "type": "int", "min": 1},
+            {"key": "days", "label": "天数", "type": "int", "min": 0,
+             "help": "0 = 永久"},
+            {"key": "listed", "label": "上架", "type": "bool"},
+        ],
+    },
+    "recipe": {
+        "list_key": "recipes",
+        "title": "合成配方",
+        "unit": "条配方",
+        "help": [
+            "改完保存即刻生效，不用重启服务端。",
+            "★ 一条配方最多 4 种材料 —— 原版合成界面只有 4 个材料槽，"
+            "第 5 种玩家根本看不见，所以这里也只画 4 格。",
+            "★ 原版没有合成成功率（界面上没有任何概率控件），别加。",
+            "原版配方随 2009 年停服的服务端一起没了，这一份是复活工程自己设计的，随便改。",
+        ],
+        "fields": [
+            {"key": "id", "label": "配方号", "type": "int", "min": 1,
+             "readonly": True, "help": "自动编号"},
+            {"key": "result", "label": "产物", "type": "item"},
+            {"key": "name", "label": "中文名", "type": "text"},
+            {"key": "materials", "label": "材料", "type": "materials",
+             "max": MAX_MATERIALS, "fields": [
+                 {"key": "id", "label": "材料", "type": "item",
+                  "kinds": ["material"]},
+                 {"key": "count", "label": "数量", "type": "int",
+                  "min": 1, "max": 800},
+             ]},
+            {"key": "level", "label": "等级", "type": "int", "min": 1},
+            {"key": "cost", "label": "花费", "type": "int", "min": 0,
+             "suffix": "金币"},
+            {"key": "character", "label": "角色限定", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "options": [{"value": cid, "label": name}
+                         for cid, name in sorted(CHARACTER_ZH.items())]},
+            {"key": "days", "label": "天数", "type": "int", "min": 0,
+             "help": "0 = 永久"},
+            {"key": "listed", "label": "上架", "type": "bool",
+             "help": "关掉 = 合成界面里看不到这条"},
+        ],
+    },
+    "drops": {
+        "list_key": "rules",
+        "title": "材料掉落",
+        "unit": "条规则",
+        "help": [
+            "改完保存即刻生效，不用重启服务端。",
+            "关卡和难度留空 = 不限。概率是百分比，100 = 必掉。",
+            "前几条是原版基线（Promotion.ini 里那 4 关），后面是复活工程加的扩展。",
+            "★ 配方用到的每一种材料都得掉得出来 —— 漏一种，那条产线就永远合不出来。",
+        ],
+        "fields": [
+            {"key": "mode", "label": "模式", "type": "choice",
+             "options": [{"value": "quest", "label": "闯关"},
+                         {"value": "pvp", "label": "对战"}]},
+            # ★ 下拉里只有客户端认得的那七关（`QUEST_ZH`），但**校验器不设上限**
+            #   —— 关卡有几个是客户端的事，不该由掉落表来立规矩。手改进来的
+            #   别的号码，管理页会原样多加一项显示出来，不会被吃掉。
+            {"key": "stage", "label": "关卡", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "options": [{"value": qid, "label": "%d · %s" % (qid, name)}
+                         for qid, name in sorted(QUEST_ZH.items())]},
+            {"key": "difficulty", "label": "难度", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "options": [{"value": n, "label": "难度 %d" % n}
+                         for n in range(1, 5)]},
+            {"key": "material", "label": "材料", "type": "item",
+             "kinds": ["material"]},
+            {"key": "count", "label": "数量", "type": "int", "min": 1,
+             "max": 800},
+            {"key": "prob", "label": "概率", "type": "int", "min": 0,
+             "max": 100, "suffix": "%"},
+            {"key": "cleared_only", "label": "只有通关才给", "type": "bool"},
+            {"key": "note", "label": "备注", "type": "text", "optional": True,
+             "help": "只给人看，服务端不读它"},
+        ],
+    },
+}
+
+
+def schema_keys(which):
+    """某份配置里**一条记录**认得的全部键。给一致性用例和前台用。"""
+    return set(field["key"] for field in SCHEMA[which]["fields"])
 
 
 # --------------------------------------------------------------------------
