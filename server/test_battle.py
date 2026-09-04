@@ -93,7 +93,7 @@ ACCOUNTS = {
 
 
 class FakeAccounts:
-    """只实现结算真正会调的那两个方法。
+    """只实现结算真正会调的那三个方法。
 
     奖励要**真的加进去**：结算下发的是「已经入账的总经验」（D024），
     只有真加了才能测出「每个人各按自己的分数入账、互不串账」。
@@ -109,6 +109,21 @@ class FakeAccounts:
         account["experience"] = int(account["experience"]) + int(experience)
         account["money"] = int(account["money"]) + int(money)
         return dict(account)
+
+    def add_materials(self, username, materials):
+        """合成材料（V0.3商店 M6）。★ 真的加进去，理由同 `add_quest_reward`。
+
+        返回 `(账号, 被跳过的 id)` —— 和 `AccountStore.add_materials` 一样的
+        二元组（那边「跳过不抛」，D12）。这里不做 `ownable` 过滤：
+        测试用的 id 都是真的，要测过滤本身请去 `test_account_store.py`。
+        """
+        account = self.saved[username]
+        table = dict(account.setdefault("materials", {}))
+        for item_id, count in materials.items():
+            key = str(item_id)
+            table[key] = table.get(key, 0) + int(count)
+        account["materials"] = table
+        return dict(account), []
 
     def set_quest_cleared(self, username, quest_id, difficulty):
         self.cleared.append((username, quest_id, difficulty))
@@ -1749,6 +1764,140 @@ class QuestSettlementTests(BattleRoom):
         self.end()
         self.assertEqual({("alice", 3, 1), ("bob", 3, 1)},
                          set(self.accounts.cleared))
+
+
+def reward_fields(body):
+    """把一发 `0x041c` 解回 `(座位, 槽类型, 物品 id, 数量)`。"""
+    return struct.unpack_from("<4i", body, 0)
+
+
+class MaterialRewardSettlementTests(BattleRoom):
+    """结算时的合成材料：`0x041c` × N → `0x0309` → `0x0411`（V0.3商店 M6 / §3）。
+
+    ★ 掉落规则铺成 `prob=100`，**用例里一点随机性都没有**；概率本身在
+    `test_gameserver.MaterialDropTests` 里单独测。
+    """
+
+    BRONZE_PIPE = 30018
+    BLACK_BEAD = 10001
+
+    def setUp(self):
+        import tempfile
+        import shopcfg
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved_dir = shopcfg.DATA_DIR
+        shopcfg.DATA_DIR = self.tmp.name
+        self.addCleanup(shopcfg.invalidate)
+        self.addCleanup(setattr, shopcfg, "DATA_DIR", saved_dir)
+        shopcfg.write_json(
+            shopcfg.path_of(shopcfg.DROPS_FILENAME, self.tmp.name),
+            {"format": 1, "rules": [
+                {"mode": "quest", "material": self.BRONZE_PIPE, "count": 2,
+                 "prob": 100, "cleared_only": True},
+                {"mode": "quest", "material": self.BLACK_BEAD, "count": 1,
+                 "prob": 100, "cleared_only": False},
+            ]})
+        shopcfg.invalidate()
+        super().setUp()
+
+    def clear_quest(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_MARK_QUEST_SUCCESS,
+                                       w_i32(1))
+
+    def end(self, conn=None):
+        gameserver.Conn.on_game_packet(conn or self.alice, OP_END_QUEST, b"")
+
+    def rewards(self, conn):
+        return [reward_fields(b)
+                for b in bodies(conn, gameserver.OP_REWARD_RECEIVED)]
+
+    def test_the_material_packets_come_before_the_result_and_the_end_game(self):
+        # ★★ 这是 M6 最硬的一条：`0x041c` 和 `0x0309` 写的都是 GameContext，
+        #    关卡一结束（`0x0411`）它就变 0，那时再发是空指针（§3 / V0.1 §99）。
+        self.clear_quest()
+        self.end()
+        for conn in (self.alice, self.bob):
+            ops = [op for op in opcodes(conn)
+                   if op in (gameserver.OP_REWARD_RECEIVED,
+                             OP_REP_GAME_RESULT, OP_END_GAME)]
+            self.assertIn(gameserver.OP_REWARD_RECEIVED, ops)
+            last_reward = len(ops) - 1 - ops[::-1].index(
+                gameserver.OP_REWARD_RECEIVED)
+            self.assertLess(last_reward, ops.index(OP_REP_GAME_RESULT))
+            self.assertLess(last_reward, ops.index(OP_END_GAME))
+
+    def test_each_material_is_shipped_exactly_once(self):
+        # ★ `0x493f24` 是 `add [entry], count` ⇒ 同一个 itemId 发两次客户端会
+        #   **累加**。发重了界面上的数量就是错的（§3 约束 2）。
+        self.clear_quest()
+        self.end()
+        mine = [row for row in self.rewards(self.alice) if row[0] == 0]
+        self.assertEqual([(0, 0, self.BLACK_BEAD, 1),
+                          (0, 0, self.BRONZE_PIPE, 2)], mine)
+
+    def test_everyone_sees_every_seats_materials(self):
+        # 数据源 `[GameContext + 0x74 + seat*20]` 按座位索引（§3），和 `0x0309`
+        # 一个口径：只发自己那份的话，结算界面上队友那一行是空的。
+        self.clear_quest()
+        self.end()
+        for conn in (self.alice, self.bob):
+            self.assertEqual({0, 1}, {row[0] for row in self.rewards(conn)})
+
+    def test_the_materials_go_into_the_save(self):
+        self.clear_quest()
+        self.end()
+        for name in ("alice", "bob"):
+            self.assertEqual({str(self.BLACK_BEAD): 1, str(self.BRONZE_PIPE): 2},
+                             self.accounts.saved[name]["materials"])
+
+    def test_a_failed_quest_only_pays_the_rules_that_do_not_need_a_clear(self):
+        # ★ 手动 `endgame` 走的就是这条路（打不出通关标志）—— 所以调试时
+        #   要用 `clear` 而不是 `endgame`，否则 cleared_only 的规则一条都不中。
+        self.end()
+        mine = [row for row in self.rewards(self.alice) if row[0] == 0]
+        self.assertEqual([(0, 0, self.BLACK_BEAD, 1)], mine)
+        self.assertEqual({str(self.BLACK_BEAD): 1},
+                         self.accounts.saved["alice"]["materials"])
+
+    def test_the_slot_is_always_the_material_column(self):
+        # 槽 1 是「称号卡片」栏，本版不做 —— 一发都不该发出去。
+        self.clear_quest()
+        self.end()
+        for conn in (self.alice, self.bob):
+            for _seat, slot, _item, _count in self.rewards(conn):
+                self.assertEqual(gameserver.REWARD_SLOT_MATERIAL, slot)
+
+    def test_the_clear_command_settles_as_a_win(self):
+        # ★ `endgame` 打不出「通关」（那个标志只有客户端的 0x0417 才置得上）
+        #   ⇒ cleared_only 的规则一条都不中。`clear` 把两步合在一起，
+        #   `tools\\quest-clear.bat` 调的就是它。
+        saved = list(gameserver._conns)
+        gameserver._conns[:] = [self.alice]
+        self.addCleanup(lambda: gameserver._conns.__setitem__(slice(None), saved))
+        # `clear` 结算完会 `reload_account()` 读盘 —— 假存档没有那个方法，
+        # 而这条用例要验的是「结算按通关走」，不是重读存档。
+        self.alice.reload_account = lambda: None
+        reply = gameserver.handle_control_command("clear")
+        self.assertTrue(reply.startswith("ok"), reply)
+        mine = [row for row in self.rewards(self.alice) if row[0] == 0]
+        self.assertEqual([(0, 0, self.BLACK_BEAD, 1),
+                          (0, 0, self.BRONZE_PIPE, 2)], mine)
+        # 通关了才解锁下一个难度，这条也要跟着成立。
+        self.assertEqual({("alice", 3, 1), ("bob", 3, 1)},
+                         set(self.accounts.cleared))
+
+    def test_nothing_is_shipped_when_no_rule_matches(self):
+        import shopcfg
+        shopcfg.write_json(
+            shopcfg.path_of(shopcfg.DROPS_FILENAME, self.tmp.name),
+            {"format": 1, "rules": []})
+        shopcfg.invalidate()
+        self.clear_quest()
+        self.end()
+        # 没材料时一发都不发，结算的其余部分一个字节不变。
+        self.assertEqual([], self.rewards(self.alice))
+        self.assertEqual(2, len(bodies(self.alice, OP_REP_GAME_RESULT)))
 
 
 class PvpSettlementTests(BattleRoom):

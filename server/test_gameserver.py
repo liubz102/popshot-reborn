@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os
+import random
 import struct
 import tempfile
 import threading
@@ -111,6 +112,7 @@ from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_STEP, LEVEL_MAX,
                            owned_characters, quest_cleared_difficulty,
                            quest_difficulty_records)
 import gameserver
+import shopcfg
 
 
 class GameServerPacketTests(unittest.TestCase):
@@ -2153,11 +2155,16 @@ class QuestDifficultyTests(unittest.TestCase):
         accounts = None
 
     class FakeStore:
-        """只实现本组测试要用到的两个方法，行为跟 AccountStore 一致。"""
+        """只实现本组测试要用到的那几个方法，行为跟 AccountStore 一致。
+
+        ★ 结算路径上每多一个存档调用，这里就要跟着补一个 —— 否则整组
+        `AttributeError`。`test_battle.FakeAccounts` 是同一个道理。
+        """
 
         def __init__(self, account):
             self.account = account
-            self.calls = []
+            self.calls = []              # set_quest_cleared 的调用记录
+            self.material_calls = []     # add_materials 的调用记录
 
         def set_quest_cleared(self, username, quest_id, difficulty):
             self.calls.append((username, quest_id, difficulty))
@@ -2169,6 +2176,13 @@ class QuestDifficultyTests(unittest.TestCase):
 
         def add_quest_reward(self, username, experience=0, money=0):
             return self.account
+
+        def add_materials(self, username, materials):
+            # ★ 单独一个列表：`calls` 被断言成「`set_quest_cleared` 的调用记录」
+            #   （`assertEqual([], conn.accounts.calls)`），混进来会当场炸。
+            self.material_calls.append((username, dict(materials)))
+            # 二元组，和 `AccountStore.add_materials` 一样（它「跳过不抛」，D12）。
+            return self.account, []
 
         def get_account(self, username):
             return username, self.account
@@ -2786,8 +2800,33 @@ class ShopControlCommandTests(unittest.TestCase):
         self.assertTrue(reply.startswith("ok"), reply)
         self.assertIn("1234", reply)
         self.assertIn("★穿着", reply)
-        self.assertIn("青铜管 ×5", reply)          # shop.json 里的中文名
+        self.assertIn(f"{self.BRONZE_PIPE} 청동파이프 ×5", reply)
         self.assertIn(str(self.TOP_ARMOR), reply)
+
+    def test_the_item_label_prefers_the_chinese_name_from_shop_json(self):
+        # ★ 名字有两个来源：`shop.json` 的中文名（用户可改）优先，
+        #   退回 `shop_items.json` 里的原版韩文名。上一条用例走的是退回那一路
+        #   —— 跑测试时 `shopcfg` 指向空目录（见 `run_tests.py`），
+        #   所以这里要自己铺一份配置才测得到「优先」那一路。
+        import shopcfg
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        saved = shopcfg.DATA_DIR
+        shopcfg.DATA_DIR = tmp.name
+        self.addCleanup(shopcfg.invalidate)
+        self.addCleanup(setattr, shopcfg, "DATA_DIR", saved)
+        shopcfg.write_json(
+            shopcfg.path_of(shopcfg.SHOP_FILENAME, tmp.name),
+            {"format": 1, "items": [{"id": self.BRONZE_PIPE, "name": "青铜管",
+                                     "kind": "material", "listed": False,
+                                     "price": 0, "level": 1, "days": 0}]})
+        shopcfg.invalidate()
+        self.assertEqual(f"{self.BRONZE_PIPE} 青铜管",
+                         gameserver._item_label(self.BRONZE_PIPE))
+        # 配置里没有的，退回原版韩文名；两边都没有就只剩一个数字。
+        self.assertEqual(f"{self.REVOLVER_R1} 리볼버 R1",
+                         gameserver._item_label(self.REVOLVER_R1))
+        self.assertEqual("9999999", gameserver._item_label(9999999))
 
     def test_the_commands_report_their_usage(self):
         for cmd in ("give", "give-material", "equip", "unequip"):
@@ -2797,6 +2836,203 @@ class ShopControlCommandTests(unittest.TestCase):
         # 命令表是给人看的唯一入口，加了命令不写进去等于没加。
         for cmd in ("inv", "give", "give-material", "equip", "unequip"):
             self.assertIn(cmd, gameserver.CONTROL_HELP, cmd)
+
+
+class MaterialDropTests(unittest.TestCase):
+    """材料掉落的规则（`quest_materials`）和结算包（`build_reward_received`）。
+
+    ★ 规则全部铺成 `prob=100` / `prob=0`，**用例里一点随机性都没有** ——
+    掉落是概率的，但「哪条规则命中」是确定的，两件事分开测。
+    """
+
+    #: 真实的材料 id：`validate_drops` 会拿 `shopdata.is_material()` 卡一道。
+    BRONZE_PIPE = 30018
+    BLACK_BEAD = 10001
+    GREEN_BEAD = 10003
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved_dir = shopcfg.DATA_DIR
+        shopcfg.DATA_DIR = self.tmp.name
+        self.addCleanup(shopcfg.invalidate)
+        self.addCleanup(setattr, shopcfg, "DATA_DIR", saved_dir)
+        shopcfg.invalidate()
+
+    def write_rules(self, *rules):
+        shopcfg.write_json(shopcfg.path_of(shopcfg.DROPS_FILENAME, self.tmp.name),
+                           {"format": 1, "rules": list(rules)})
+        shopcfg.invalidate()
+
+    def rule(self, material, **kw):
+        rule = {"mode": "quest", "material": material, "count": 1,
+                "prob": 100, "cleared_only": True}
+        rule.update(kw)
+        return rule
+
+    def drops(self, quest_id=1, difficulty=1, cleared=True, mode="quest"):
+        materials, warnings = gameserver.quest_materials(
+            quest_id, difficulty, cleared, mode=mode)
+        self.assertEqual([], warnings)
+        return materials
+
+    # -- 0x041c 的线格式 ----------------------------------------------------
+    def test_the_reward_packet_is_four_int32s(self):
+        payload = gameserver.build_reward_received(
+            2, gameserver.REWARD_SLOT_MATERIAL, self.BRONZE_PIPE, 3)
+        # Deserialize `0x54c5d0` 四发「读 4 字节」，**没有 bool** ⇒ 正好 16 字节。
+        self.assertEqual(16, len(payload))
+        self.assertEqual((2, 0, self.BRONZE_PIPE, 3),
+                         struct.unpack_from("<4i", payload, 0))
+
+    def test_the_two_result_columns_have_different_slot_numbers(self):
+        # 结算界面两栏共用这一个包，靠线偏移 4 的槽类型分（§3）。
+        self.assertEqual(0, gameserver.REWARD_SLOT_MATERIAL)
+        self.assertEqual(1, gameserver.REWARD_SLOT_TITLE)
+        payload = gameserver.build_reward_received(
+            0, gameserver.REWARD_SLOT_TITLE, 560002, 1)
+        self.assertEqual(1, struct.unpack_from("<i", payload, 4)[0])
+
+    # -- 规则筛选 -----------------------------------------------------------
+    def test_a_rule_without_stage_or_difficulty_applies_everywhere(self):
+        self.write_rules(self.rule(self.BRONZE_PIPE, count=2))
+        self.assertEqual({self.BRONZE_PIPE: 2}, self.drops(quest_id=7,
+                                                           difficulty=3))
+
+    def test_stage_and_difficulty_narrow_a_rule_down(self):
+        self.write_rules(self.rule(self.BRONZE_PIPE, stage=4, difficulty=3))
+        self.assertEqual({self.BRONZE_PIPE: 1}, self.drops(4, 3))
+        self.assertEqual({}, self.drops(4, 2))
+        self.assertEqual({}, self.drops(5, 3))
+
+    def test_cleared_only_rules_pay_nothing_when_the_quest_is_failed(self):
+        # ★ `drops.json` 里**绝大多数**规则是 cleared_only ⇒ 手动 `endgame`
+        #   （打不出通关标志）一个材料都掉不出来，要用 `clear`。
+        self.write_rules(self.rule(self.BRONZE_PIPE),
+                         self.rule(self.BLACK_BEAD, cleared_only=False))
+        self.assertEqual({self.BRONZE_PIPE: 1, self.BLACK_BEAD: 1},
+                         self.drops(cleared=True))
+        self.assertEqual({self.BLACK_BEAD: 1}, self.drops(cleared=False))
+
+    def test_pvp_rules_and_quest_rules_do_not_leak_into_each_other(self):
+        self.write_rules(self.rule(self.BRONZE_PIPE),
+                         self.rule(self.BLACK_BEAD, mode="pvp"))
+        self.assertEqual({self.BRONZE_PIPE: 1}, self.drops(mode="quest"))
+        self.assertEqual({self.BLACK_BEAD: 1}, self.drops(mode="pvp"))
+
+    def test_probability_zero_never_pays_and_hundred_always_does(self):
+        self.write_rules(self.rule(self.BRONZE_PIPE, prob=0),
+                         self.rule(self.BLACK_BEAD, prob=100))
+        for _ in range(20):
+            self.assertEqual({self.BLACK_BEAD: 1}, self.drops())
+
+    def test_two_rules_on_the_same_material_add_up(self):
+        # 原版基线和我们的扩展规则会撞在同一种材料上（`drops.json` 默认就有
+        # 这种情况）—— 撞了要**相加**，不是后一条盖前一条。
+        self.write_rules(self.rule(self.BRONZE_PIPE, count=1, stage=1),
+                         self.rule(self.BRONZE_PIPE, count=2))
+        self.assertEqual({self.BRONZE_PIPE: 3}, self.drops(quest_id=1))
+
+    def test_the_odds_land_where_the_rule_says(self):
+        # 概率本身也要测一次，但用**固定种子**，不看单局看分布。
+        self.write_rules(self.rule(self.GREEN_BEAD, prob=25))
+        rng = random.Random(20260904)
+        hits = sum(1 for _ in range(2000)
+                   if gameserver.quest_materials(1, 1, True, rng=rng)[0])
+        self.assertTrue(400 <= hits <= 600, hits)
+
+    def test_a_broken_drops_file_costs_at_most_this_round_s_materials(self):
+        # D10：坏文件保留上一份好的、绝不回写。一次都没读成功过就返回空表
+        # ⇒ 最坏是「这一局没掉东西」，不会是「结算卡住」。
+        path = shopcfg.path_of(shopcfg.DROPS_FILENAME, self.tmp.name)
+        with open(path, "w", encoding="utf-8") as fp:
+            fp.write("{ this is not json")
+        shopcfg.invalidate()
+        materials, warnings = gameserver.quest_materials(1, 1, True)
+        self.assertEqual({}, materials)
+        self.assertTrue(warnings)
+
+    def test_a_junk_quest_id_does_not_raise(self):
+        # `current_quest()` 拿不到参数时会给出各种东西，掉落不该跟着炸。
+        self.write_rules(self.rule(self.BRONZE_PIPE))
+        self.assertEqual({self.BRONZE_PIPE: 1},
+                         self.drops(quest_id=None, difficulty="x"))
+
+
+class ShopProbeTests(unittest.TestCase):
+    """商店 / 合成 / 仓库段的监听器（V0.3商店 M4 第一步）。
+
+    ★ 这一步的**全部意义**是「只看不动」：整段协议是静态逆出来的，
+    先回一个猜的应答就把「客户端本来会怎么样」这个基线弄脏了。
+    所以这组用例里最重要的一条是 `test_the_probe_answers_nothing`。
+    """
+
+    Args = CharacterUnlockTests.Args
+
+    def setUp(self):
+        # 监听器**故意**把每一发都写进 `logs/online.log`（那份不会被覆盖），
+        # 但跑测试时那是纯噪音 —— 把它掐掉，只留 `conn.logged` 供断言。
+        saved = gameserver.eventlog.online
+        gameserver.eventlog.online = lambda _msg: None
+        self.addCleanup(setattr, gameserver.eventlog, "online", saved)
+
+    def make_conn(self):
+        conn = CharacterUnlockTests.make_conn(self)
+        conn.accounts = None
+        return conn
+
+    def test_the_probe_answers_nothing(self):
+        # ★★ 这条一旦红了，说明有人给这段加了应答 —— 那就不再是 M4 第一步了，
+        #    要么去更新 PLAN，要么把应答挪到第二步去。
+        for opcode in gameserver.SHOP_PROBE_OPCODES:
+            conn = self.make_conn()
+            gameserver.Conn.on_game_packet(conn, opcode, b"\x01\x00\x00\x00")
+            self.assertEqual([], conn.sent, hex(opcode))
+
+    def test_the_probe_logs_the_payload(self):
+        conn = self.make_conn()
+        gameserver.Conn.on_shop_probe(conn, gameserver.OP_REQ_ITEM_BUY,
+                                      bytes.fromhex("01000000" + "29111100"))
+        text = "\n".join(conn.logged)
+        self.assertIn("shop-probe", text)
+        self.assertIn("0x0602", text)
+        # 静态形状不一定对 ⇒ 原始的 int32 切分必须照打，别只留一句「解不出来」。
+        self.assertIn("int32 切分: [1, 1118505]", text)
+
+    def test_an_empty_payload_does_not_produce_an_empty_hexdump(self):
+        conn = self.make_conn()
+        gameserver.Conn.on_shop_probe(conn, gameserver.OP_REQ_EQUIPPED_LIST, b"")
+        self.assertIn("载荷 0 字节", conn.logged[0])
+        self.assertNotIn("0000  ", conn.logged[0])
+
+    def test_the_four_entry_requests_are_in_the_order_the_client_sends_them(self):
+        # ShopStage ctor `0x444009`~`0x44402c` 是顺序调用的，日志按这个顺序
+        # 标「第 N/4 发」，对不上就没法一眼看出客户端是不是四发都发了。
+        self.assertEqual((0x0704, 0x0605, 0x0607, 0x0700),
+                         gameserver.SHOP_ENTRY_OPCODES)
+        conn = self.make_conn()
+        for i, opcode in enumerate(gameserver.SHOP_ENTRY_OPCODES, 1):
+            gameserver.Conn.on_shop_probe(conn, opcode, b"")
+        text = "\n".join(conn.logged)
+        for i in range(1, 5):
+            self.assertIn(f"进商店第 {i}/4 发", text)
+
+    def test_every_probe_opcode_has_a_name_and_a_note(self):
+        # 日志是这一步唯一的产出，缺一句说明就等于少采一条数据。
+        for opcode in gameserver.SHOP_PROBE_OPCODES:
+            self.assertIn(opcode, gameserver.GCP_NAMES, hex(opcode))
+            self.assertIn(opcode, gameserver.SHOP_PROBE_NOTES, hex(opcode))
+
+    def test_the_probe_does_not_steal_an_opcode_that_is_already_handled(self):
+        # 这批号和已有分支重号的话，重号的那个功能会被静默吞掉。
+        handled = {value for name, value in vars(gameserver).items()
+                   if name.startswith("OP_") and isinstance(value, int)
+                   and not name.startswith(("OP_REQ_ITEM_BUY",
+                                            "OP_REQ_SHOP_", "OP_REQ_EQUIP_ITEM",
+                                            "OP_REQ_COMPOS", "OP_REQ_GIFT_LIST",
+                                            "OP_REQ_EQUIPPED_LIST"))}
+        for opcode in gameserver.SHOP_PROBE_OPCODES:
+            self.assertNotIn(opcode, handled, hex(opcode))
 
 
 class SendBatchTests(unittest.TestCase):

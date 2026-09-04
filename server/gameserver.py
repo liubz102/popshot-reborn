@@ -372,6 +372,19 @@ OP_PEER_DATA_DOWN = 0x040f      # 服务端 -> 客户端：**原样**转给同�
 OP_TOGGLE_PEER_RELAY = 0x0410   # 服务端 -> 客户端：gspToggleUdpClientCommunication
 OP_END_GAME = 0x0411
 
+#: `0x041c gspRewardReceived` —— ★ **结算界面「合成材料」那一栏的专用包**
+#: （V0.3商店 §3；纠正了 V0.1 §99「那一栏从 0x0309 里出来」的猜测）。
+#:
+#: `Chinese.ini` 的 `ITEM_클리어리절트=合成材料` → exe 里 `0x670f14` 的
+#: UTF-16 串 → xref `0x48e7cd`（画在 161,465）→ 数据源 `0x48c9be(seat)`
+#: = `[GameContext + 0x74 + seat*20]` → 写入者 `0x493ed1`
+#: → opcode 链 `0x493808` 逐条算出来就是 `0x041c`。
+OP_REWARD_RECEIVED = 0x041c
+
+#: `0x041c` 的**槽类型**（线偏移 4）。结算界面有两栏，共用这一个包。
+REWARD_SLOT_MATERIAL = 0        # `[GameContext + 0x74 + seat*20]` 合成材料栏
+REWARD_SLOT_TITLE = 1           # `[GameContext + 0xec + seat*20]` 称号卡片栏（本版不做）
+
 #: 原版 TCP 中继那一路（里程碑 J.3 / D078 / §157）。
 #: `0x0310` 是客户端要中继，`0x0210` 是我们把「连哪儿 + 拿什么认人」告诉它，
 #: `0x0211` 是唯一安全的拆连接方式（走析构，不触发 `OnDisconnected`，§158）。
@@ -456,6 +469,59 @@ OP_LADDER_START_GAME = 0x0416
 OP_REP_MOVE_INTO = 0x0701
 
 # ---------------------------------------------------------------------------
+# 商店 / 合成 / 仓库段（V0.3商店 §4）。**现在只监听，一发都不回**（M4 第一步）。
+#
+# 客户端的分发器是 `ShopStage` vft `0x666164` 槽 `+0xc4`，跳表 `@0x44434a`。
+# ★ **进商店时客户端连发四个请求**（ShopStage ctor `0x444009`~`0x44402c`
+#   顺序调用）：`0x0704` -> `0x0605` -> `0x0607` -> `0x0700`。
+#
+# ⚠ **整段都是 🔍静态结论，一发都没在线上观测过**（D1 认下的代价）。
+#   M4 第一步就是把「客户端到底发不发、载荷长什么样」升成 ✅实测 ——
+#   所以这些处理器**故意只打日志不应答**，先看客户端自己会怎么样。
+# ---------------------------------------------------------------------------
+#: 进商店第 1 发。无正文。期望应答 `0x0604 gspRepEquippedList`（处理器 `0x447278`）。
+OP_REQ_EQUIPPED_LIST = 0x0704
+#: 进商店第 2 发。`gcpReqCompositionList`，静态推出的形状是 `u8 + i32 + u16 + i32`。
+#: 期望应答 `0x0505 gspRepCompositionList`（处理器 `0x4474e4`）。
+OP_REQ_COMPOSITION_LIST = 0x0605
+#: 进商店第 3 发。`gcpReqGiftList`。本版只打算回空礼物清单（礼物系统不做）。
+OP_REQ_GIFT_LIST = 0x0607
+#: 进商店第 4 发。无正文，❓语义未查明（V0.1 §50 记过大厅也在轮询它）。
+OP_REQ_SHOP_ENTER = 0x0700
+#: **购买**（`i32 n, n×i32`，发送点 `0x446115`），期望应答 `0x0502 gspRepItemBuy`。
+OP_REQ_ITEM_BUY = 0x0602
+#: ❓（单 `i32`，发送点 `0x4466d2`，大概率回 `0x0503`）。
+OP_REQ_SHOP_UNKNOWN_0603 = 0x0603
+#: **装备 / 卸下**（`i32, i32`，发送点 `0x446f5b`）。
+#: ★ 它只落到 `[ShopStage+0x134/0x138]`（商店界面自己的显示），
+#:   **让加成生效的是 `0x030b`** —— 处理完还要重发那一发（§4）。
+OP_REQ_EQUIP_ITEM = 0x0604
+#: **合成**（单 `i32`，发送点 `0x44765c`），期望应答 `0x0506 gspRepComposeItem`。
+OP_REQ_COMPOSE_ITEM = 0x0606
+
+#: 进商店那四发，按客户端实际的发送顺序排。日志里按这个顺序对号。
+SHOP_ENTRY_OPCODES = (OP_REQ_EQUIPPED_LIST, OP_REQ_COMPOSITION_LIST,
+                      OP_REQ_GIFT_LIST, OP_REQ_SHOP_ENTER)
+
+#: 监听器负责的全部上行 opcode。
+SHOP_PROBE_OPCODES = SHOP_ENTRY_OPCODES + (
+    OP_REQ_ITEM_BUY, OP_REQ_SHOP_UNKNOWN_0603, OP_REQ_EQUIP_ITEM,
+    OP_REQ_COMPOSE_ITEM)
+
+#: 每个号「静态逆出来的形状」和「期望应答」，只用来给日志配一句人话。
+#: ★ 括号里的可信度标记就是 `re/packet_api.md` §3.8 里那一份，别在这儿升级它。
+SHOP_PROBE_NOTES = {
+    OP_REQ_EQUIPPED_LIST: ("无正文", "0x0604 gspRepEquippedList"),
+    OP_REQ_COMPOSITION_LIST: ("u8 + i32 + u16 + i32 🤔", "0x0505 gspRepCompositionList"),
+    OP_REQ_GIFT_LIST: ("❓未查", "❓（本版打算回空清单）"),
+    OP_REQ_SHOP_ENTER: ("无正文", "❓未查"),
+    OP_REQ_ITEM_BUY: ("i32 n, n×i32 🔍", "0x0502 gspRepItemBuy"),
+    OP_REQ_SHOP_UNKNOWN_0603: ("i32 🔍", "❓大概率 0x0503"),
+    OP_REQ_EQUIP_ITEM: ("i32, i32 🤔", "回显 + 重发 0x030b"),
+    OP_REQ_COMPOSE_ITEM: ("i32 🔍", "0x0506 gspRepComposeItem"),
+}
+
+# ---------------------------------------------------------------------------
 # 关卡内换图（走到地图最右边 -> 传送到下一张地图），FINDINGS §111。
 #
 # ★ 这四个号里有三个和别的**服务端方向**包同号，别记混（D028 的老规律）：
@@ -532,10 +598,19 @@ GCP_NAMES = {
     0x0414: "gcpRepFirstAidBox",
     0x0416: "rawLadderStartGame",
     0x0417: "gcpMarkQuestSuccess",
+    # ⚠⚠ **同号反向**：服务端方向的 `0x0505` 是 `gspRepCompositionList`
+    #    （合成配方清单，V0.3商店 §4）。回显 = 把配方表发成伤害统计。
     0x0505: "gcpAccumulatedWeaponDamage",
+    # -- 商店 / 合成 / 仓库段（V0.3商店 §4）。现在只监听不应答，见 M4 -------
+    0x0602: "gcpReqItemBuy",
+    0x0603: "rawShopReq0603",          # ❓ 无 RTTI 类名，裸序列化（0x4466d2）
+    0x0604: "rawEquipItem",            # ❓ 同上（0x446f5b，ret 8）
+    0x0605: "gcpReqCompositionList",
     0x0606: "gcpReqComposeItem",
     0x0607: "gcpReqGiftList",
     0x0609: "gcpReqGiftAction",
+    0x0700: "rawShopEnter0700",        # ❓ 无正文（0x5541c1）
+    0x0704: "rawReqEquippedList",      # 无正文（0x44722b）
     0x0705: "gcpReqMyInfo",
     0x0800: "gcpReqMoveChannel",
     0x0802: "gcpMoveChannelTest",
@@ -2038,6 +2113,60 @@ def pvp_reward(kills, won):
     return experience, money
 
 
+def quest_materials(quest_id, difficulty, cleared, mode="quest", rng=None):
+    """这一局掉哪些合成材料，返回 `({itemId: 数量}, 警告列表)`。纯函数，好单测。
+
+    ★ 返回二元组是**本仓库读配置的固定形状**（`versioning.load_client_filter()`
+    起头，`shopcfg` 三个读取器都这样）：配置是用户手改的，读出来的毛病必须
+    有地方说出去，不能咽掉。调用方把警告打进日志就行。
+
+    规则全部来自 `server/data/drops.json`（用户在管理页里改，改完不用重启，
+    D4 / D7）。一条规则长这样：
+
+        {mode, stage?, difficulty?, material, count, prob, cleared_only}
+
+    `stage` / `difficulty` **省略 = 不限**。`prob` 是百分比（100 = 必掉）。
+
+    ★ **每个玩家各掷各的**：调用点在结算的逐座位循环里，所以同一局里
+    两个人拿到的东西可以不一样 —— 这正是原版「合成素材」的手感。
+
+    ★ `rng` 只为可测：单测传 `random.Random(种子)` 就能把随机性钉死。
+
+    ★ 配置读坏时 `shopcfg.drops()` 返回**上一份好的**（一次都没读成功过就返回
+    空表）并给出警告，**绝不回写**（D10）⇒ 最坏情况是「这一局没掉东西」，
+    不会是「结算卡住」。
+    """
+    roll = (rng or random).randrange
+    try:
+        quest_id = int(quest_id)
+    except (TypeError, ValueError):
+        quest_id = 0
+    try:
+        difficulty = int(difficulty)
+    except (TypeError, ValueError):
+        difficulty = 0
+    rules, warnings = shopcfg.drops()
+    materials = {}
+    for rule in rules:
+        if rule.get("mode", "quest") != mode:
+            continue
+        if rule.get("cleared_only", True) and not cleared:
+            continue
+        stage = rule.get("stage")
+        if stage is not None and stage != quest_id:
+            continue
+        want_difficulty = rule.get("difficulty")
+        if want_difficulty is not None and want_difficulty != difficulty:
+            continue
+        prob = rule.get("prob", 100)
+        # `randrange(100)` 给 0..99 ⇒ `prob=100` 必中、`prob=0` 必不中。
+        if prob < 100 and roll(100) >= prob:
+            continue
+        material = rule["material"]
+        materials[material] = materials.get(material, 0) + rule.get("count", 1)
+    return materials, warnings
+
+
 def build_game_result_values(experience=0, money=0, ladder_point=0):
     """按 §116 的语义组 `gspRepGameResult` 的 12 个业务值（其余全 0）。
 
@@ -2060,6 +2189,31 @@ def build_game_result_tail(seat_id=0, cleared=False):
     if cleared and 0 <= seat_id < GAME_RESULT_TAIL_COUNT:
         tail[seat_id] = GAME_RESULT_CLEARED
     return tail
+
+
+def build_reward_received(seat_id=0, slot=REWARD_SLOT_MATERIAL,
+                          item_id=0, count=1):
+    """opcode 0x041c —— `gspRewardReceived`。结算界面「合成材料」那一栏。
+
+    线格式（Deserialize `0x54c5d0`，四发 `0x5d59ff`「读 4 字节」，**没有 bool**
+    ⇒ 线偏移 = 结构偏移 − 4）—— body 恰好 16 字节（V0.3商店 §3）：
+
+        int32  座位号
+        int32  槽类型     0 = 合成材料栏 / 1 = 称号卡片栏
+        int32  物品 id
+        int32  数量
+
+    **三条硬约束**（🔍静态，⏳ 一次都没实机跑过）：
+
+    1. ★ **必须排在 `0x0411 gspEndGame` 之前** —— 它写的是 `GameContext`，
+       关卡一结束就变 0（和 `0x0309` 同一个约束，V0.1 §99）。
+       实际顺序：**`0x041c` × N → `0x0309` → `0x0411`**。
+    2. `0x493f24` 是 `add [entry], count` ⇒ **同一个 itemId 发多次会累加**。
+       服务端每种材料发**一发**就行，不用自己合并，也不能重复发。
+    3. ★ `item_id` 必须在 `ShopItem-Chn.ini` 里真有 `[Item-*]` 节，否则
+       `0x415a94` 查不到定义、图标画不出来（`shopdata.ownable()` 守着这条）。
+    """
+    return (w_i32(seat_id) + w_i32(slot) + w_i32(item_id) + w_i32(count))
 
 
 def build_rep_game_result(seat_id=0, values=None, tail=None):
@@ -7770,6 +7924,7 @@ class Conn:
         # ---- ① 每个人先入账，并把「他那一份 0x0309 / 0x0411」备好 --------
         results = {}     # 座位 -> 0x0309 的载荷
         end_games = {}   # 座位 -> (0x0411 的载荷, 日志用的数)
+        rewards = {}     # 座位 -> [0x041c 的载荷…]（合成材料，V0.3商店 M6）
         # ★ 闯关的关卡 id / 难度：房里每个人读到的是同一份（`current_quest()`
         #   先看大厅那一份），所以在循环外取一次就够。
         quest_info = self.current_quest() if quest_mode else None
@@ -7796,6 +7951,18 @@ class Conn:
             #    同一面额真正写进账号，所以不会重复入账。
             picked_coins = quest.coins_of(seat)
             gained_money += picked_coins
+            # ★★ 合成材料（V0.3商店 M6）。**每个人各掷各的** —— 同一局里
+            #    两个人拿到的东西可以不一样，这是原版「合成素材」的手感（D4）。
+            #    对战也掉（`drops.json` 里有 `mode=pvp` 的规则）。
+            if quest_mode:
+                quest_id, difficulty = quest_info or (1, 1)
+                dropped, drop_warnings = quest_materials(
+                    quest_id, difficulty, seat_cleared)
+            else:
+                dropped, drop_warnings = quest_materials(
+                    0, 0, seat_cleared, mode="pvp")
+            for warning in drop_warnings:
+                conn.log(f"   ⚠ drops.json: {warning}")
             if conn.account_name:
                 try:
                     conn.account = conn.accounts.add_quest_reward(
@@ -7803,6 +7970,29 @@ class Conn:
                         experience=gained_exp, money=gained_money)
                 except KeyError:
                     conn.log(f"   存档里没有账号 {conn.account_name!r}；奖励未入账")
+            # ★ 材料单独入账（`add_materials` 是「跳过不抛」的，D12）——
+            #   一条配错的掉落规则不该让整局的结算包发不出去。
+            if dropped and conn.account_name:
+                try:
+                    conn.account, skipped = conn.accounts.add_materials(
+                        conn.account_name, dropped)
+                except KeyError:
+                    skipped = []
+                    conn.log(f"   存档里没有账号 {conn.account_name!r}；材料未入账")
+                if skipped:
+                    conn.log(f"   ⚠ 掉落里有客户端不认识的 id，已跳过: {skipped}")
+                    for item_id in skipped:
+                        dropped.pop(item_id, None)
+            # ★ 每种材料**发一发就够**：`0x493f24` 是 `add [entry], count`，
+            #   同一个 itemId 发两次客户端会累加（§3 约束 2）。
+            rewards[seat] = [
+                build_reward_received(seat, REWARD_SLOT_MATERIAL,
+                                      item_id, count)
+                for item_id, count in sorted(dropped.items())]
+            if dropped:
+                conn.log("   掉落材料 座位%d: %s"
+                         % (seat, "、".join("%s ×%d" % (_item_label(i), n)
+                                            for i, n in sorted(dropped.items()))))
             experience = int((conn.account or {}).get("experience", 0))
             level_start_exp, next_level_exp = experience_bounds(experience)
             #   · 业务值 9/10/11 = 界面上「经验值 / 金币 / 竞技场分数」三行的 +N
@@ -7836,6 +8026,15 @@ class Conn:
         #   后续包」时才是必须的（§120），结算这两个包不属于那一类。
         for seat, conn in sorted(seats.items()):
             try:
+                # ★★ 合成材料栏（`0x041c`）排在**最前面**（V0.3商店 §3）：
+                #    它和 `0x0309` 一样写 `GameContext`，关卡一结束就变 0。
+                #    顺序 = `0x041c` × N → `0x0309` → `0x0411`。
+                #    和 `0x0309` 同一个口径**每个在座座位一份**：数据源
+                #    `[GameContext + 0x74 + seat*20]` 是按座位索引的，
+                #    只发自己那份的话结算界面上队友那一行是空的。
+                for other_seat in sorted(rewards):
+                    for payload in rewards[other_seat]:
+                        conn.send(build_game(OP_REWARD_RECEIVED, payload))
                 # 结算界面的数据源，必须排在 0x0411 之前，且只能在 GameContext
                 # 还活着的时候发（§99）。每个在座座位一份。
                 for other_seat in sorted(results):
@@ -7851,7 +8050,9 @@ class Conn:
                 continue
             conn.settled = True
             conn.quest_success = cleared
-        self.log(f"← 已结算本局：每人各收到 {len(results)} 份"
+        reward_count = sum(len(payloads) for payloads in rewards.values())
+        self.log(f"← 已结算本局：每人各收到 {reward_count} 份"
+                 f" gspRewardReceived(0x041c，合成材料) + {len(results)} 份"
                  f" gspRepGameResult(0x0309) + {len(end_games)} 份"
                  f" gspEndGame(0x0411)（自己那份在最前）"
                  f"（{'闯关' if quest_mode else '对战'}，"
@@ -9372,6 +9573,41 @@ class Conn:
                                                      self.quest_score)))
         elif opcode in (OP_PREPARE_GAME, OP_COUNT_GAME_READY, OP_LOADING_DONE):
             self.on_start_game_packet(opcode, payload)
+        elif opcode in SHOP_PROBE_OPCODES:
+            self.on_shop_probe(opcode, payload)
+
+    def on_shop_probe(self, opcode, payload):
+        """商店 / 合成 / 仓库段的**监听器**（V0.3商店 M4 第一步）。
+
+        ★★ **故意什么都不回。** 整段协议是从反汇编逆出来的，一发都没在线上
+        观测过（D1 认下的代价）。这一步只回答三个问题：客户端**到底发不发**、
+        **发的顺序**是不是 `ShopStage` ctor 里那个、**载荷长什么样**。
+        先回一个猜的应答，就把「客户端本来会怎么样」这个基线弄脏了。
+
+        ⚠ **不回的后果本身就是要观测的东西**：商店界面可能空着、可能一直转圈、
+        也可能直接崩。看到什么记什么，别替客户端解释。
+
+        ★ 同时写一份进 `eventlog`（`logs/online.log`）—— `server.out` 每次
+        启动都会被覆盖，而这批是一次性的实机观测，丢了要重进一次游戏才能再采。
+        """
+        shape, expected = SHOP_PROBE_NOTES.get(opcode, ("❓未查", "❓未查"))
+        name = GCP_NAMES.get(opcode, "?")
+        if opcode in SHOP_ENTRY_OPCODES:
+            step = f"进商店第 {SHOP_ENTRY_OPCODES.index(opcode) + 1}/4 发；"
+        else:
+            step = ""
+        head = (f"[shop-probe] 0x{opcode:04x} {name} 载荷 {len(payload)} 字节；"
+                f"{step}静态形状「{shape}」；期望应答 {expected}"
+                f"  ★ M4 第一步只监听，不回")
+        self.log(head + (f"\n{hexdump(payload)}" if payload else ""))
+        # 顺手按 int32 切一刀。静态推出来的形状不一定对，先把原始数字摆出来
+        # —— 对不上的时候，这一行比 hexdump 更快看出「到底是几个 int」。
+        reader = Reader(payload)
+        ints = []
+        while reader.left() >= 4:
+            ints.append(reader.i32())
+        self.log(f"   int32 切分: {ints}（尾部剩 {reader.left()} 字节）")
+        eventlog.online(f"{head} hex={payload.hex()}")
 
     def on_ctrl_packet(self, payload):
         self.log(f"★ 控制包(0xFE) 载荷 {len(payload)} 字节\n{hexdump(payload)}")
@@ -9562,7 +9798,14 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
   status                          当前连接 / 开局状态 / 座位 / 分数 / 最后坐标
   raw <op> [payload-hex]          发任意游戏包，op 是十六进制（例：raw 0411 ...）
   endgame                         按存档真结算一局（记经验+金币再发 0x0411），
-                                  和客户端打完关卡发 0x040f 走同一条路
+                                  和客户端打完关卡发 0x040f 走同一条路。
+                                  ★ 打的是「**未**通关」——「通关」标志只有
+                                  客户端的 0x0417 才置得上，要通关用 clear
+  clear                           ★ **通关**并结算 = 0x0417 标志 + 0x040f 一起。
+                                  只有它能打出材料掉落（drops.json 里绝大多数
+                                  规则是 cleared_only），也只有它会解锁下一个
+                                  难度。应答里会报现在的材料存量。
+                                  一键版：tools\\quest-clear.bat
   endgame <seat> <success> [v0..v11]
                                   发原始 0x0411，自己指定每个字段（协议试探用）。
                                   success 用 0/1，业务值不足 12 个的补 0
@@ -9783,6 +10026,21 @@ def _dispatch_control_command(line):
                  f"payload={payload.hex() or '<empty>'}")
         conn.send(build_game(opcode, payload))
         return f"ok 已发 0x{opcode:04x} ({len(payload)} 字节载荷)"
+
+    if cmd == "clear":
+        # ★ 「通关」和「结算」是两件事：`endgame` 只结算，**通关标志**来自客户端的
+        #   `0x0417 gcpMarkQuestSuccess`，手工发不出来 ⇒ `endgame` 永远打的是
+        #   「未通关」，而 `drops.json` 里绝大多数规则是 `cleared_only`
+        #   —— 于是材料一个都掉不出来。这条命令把两步合在一起，是 M6 / M7 的
+        #   主力测试入口（`tools/quest-clear.bat` 调的就是它）。
+        conn.log("[ctl] ← 手动「通关并结算」（= 0x0417 标志 + 0x040f 结算）")
+        conn.send_end_game(success=True)
+        conn.reload_account()
+        materials = material_counts(conn.account)
+        detail = "、".join("%s ×%d" % (_item_label(i), n)
+                          for i, n in sorted(materials.items())) or "（空）"
+        return (f"ok 已按「通关」结算（0x041c 材料 → 0x0309 → 0x0411）；"
+                f"现在的材料存量: {detail}")
 
     if cmd == "endgame" and len(words) == 1:
         # 不带参数 = 走真正的结算路径（记账 + 按存档下发），和客户端自己

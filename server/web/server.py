@@ -22,6 +22,9 @@
     POST /api/export      {username, password}            -> {ok, message, save}
     POST /api/import      {username, password, save}      -> {ok, message}
 
+★ `/admin` 开头的那一组（管理页，V0.3商店 M8）在 `web/admin.py` 里，
+和这里**共用同一个端口、同一个 `Handler`**。路由清单见那个文件的开头。
+
 ★ 上传走 JSON 而不是 multipart：文件在浏览器里用 `FileReader` 读成文本、
 `JSON.parse` 之后再发上来。这样服务端不用手写 multipart 解析，
 也顺带把「这不是一个合法 JSON」挡在了客户端。
@@ -54,6 +57,13 @@ import asynclog
 import config as server_config
 import eventlog
 from netlisten import create_listener
+#: 管理页 `/admin`（V0.3商店 M8）。和注册页共用本文件的 `Handler` 和端口。
+#: ★ 直接跑 `python server/web/server.py` 时上面那段已经把 `server/` 补进
+#:   `sys.path` 了，所以这里按顶层模块名 import（不是 `from web import`）。
+if __package__:
+    from . import admin
+else:
+    import admin
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 INDEX_PATH = os.path.join(HERE, "index.html")
@@ -216,7 +226,14 @@ def _escape(text):
             .replace('"', "&quot;"))
 
 
-class Handler(http.server.BaseHTTPRequestHandler):
+class Handler(admin.AdminRoutes, http.server.BaseHTTPRequestHandler):
+    """注册页 + 管理页共用的一个 Handler。
+
+    ★ 管理页那一半在 `web/admin.py` 里（`AdminRoutes`）—— 它需要本类的
+    `_reply` / `_send` / `client_ip()` 这些工具，混进来最省事；反过来，
+    把管理页的十来个接口塞进本文件会让它长到看不动。
+    """
+
     server_version = "PopShotWeb/0.2"
     protocol_version = "HTTP/1.1"
 
@@ -310,7 +327,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # -------------------------------------------------------------- 路由
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        path, _, query = self.path.partition("?")
         if path in ("/", "/index.html"):
             host = self.headers.get("Host") or "localhost"
             self._send(200, render_index(host, self.limiter.cooldown),
@@ -318,6 +335,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
+            return
+        # 管理页（V0.3商店 M8）和注册页**共用这一个端口**。它自己认得
+        # `/admin` 开头的全部路径（认不出的也回 404），所以放在兜底之前。
+        try:
+            if self.admin_get(path, query):
+                return
+        except Exception as error:                      # 兜底，别让线程死掉
+            self.log_message("管理页 %s 出错: %r", path, error)
+            self._reply(False, "服务器内部错误，请看服务端日志", status=500)
             return
         self._send(404, "404 找不到这个页面", "text/plain; charset=utf-8")
 
@@ -337,7 +363,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/export": self._api_export,
             "/api/import": self._api_import,
         }.get(path)
-        if route is None:
+        is_admin = path.startswith("/admin")
+        if route is None and not is_admin:
             self._reply(False, "没有这个接口", status=404)
             return
         try:
@@ -346,9 +373,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._reply(False, str(error), status=400)
             return
         try:
-            route(data)
+            if is_admin:
+                self.admin_post(path, data)
+            else:
+                route(data)
         except AccountError as error:
             # 业务失败：状态码仍是 200，前台只看 ok 字段，浏览器控制台也干净。
+            # ★ 管理页也走这一条 —— `admin_add` / `admin_remove` 那几个的
+            #   拒绝理由（「至少要保留一个管理员」等）本来就是给人看的中文。
             self._reply(False, error.message)
         except Exception as error:                      # 兜底，别让线程死掉
             self.log_message("接口 %s 出错: %r", path, error)
@@ -505,7 +537,11 @@ def make_server(port, accounts, host="::",
     """
     handler = type("BoundHandler", (Handler,),
                    {"accounts": accounts,
-                    "limiter": RegisterRateLimiter(cooldown)})
+                    "limiter": RegisterRateLimiter(cooldown),
+                    # 管理页的两个共享对象。★ 都**只在内存里** —— 会话随进程
+                    # 走（重启即失效），限速表也一样（同 `RegisterRateLimiter`）。
+                    "admin_sessions": admin.AdminSessions(),
+                    "admin_limiter": admin.LoginRateLimiter()})
     return _PreboundHTTPServer(create_listener(host, port), handler)
 
 

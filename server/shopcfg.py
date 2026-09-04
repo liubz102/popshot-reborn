@@ -750,8 +750,10 @@ def write_json(path, data):
 def ensure_files(data_dir=None):
     """三份配置不存在就生成，**已存在一律不覆盖**（D7）。返回新建了哪几个。
 
-    ★ 这是**唯一**会写这三个文件的地方。云上升级时用户手改过的价格 /
+    ★ 这是**唯一会自动写**这三个文件的地方。云上升级时用户手改过的价格 /
     配方 / 掉落必须原样留着 —— 覆盖它们等于把运营数据抹了（铁律 11）。
+    （另一个写入点是管理页的保存按钮，`web/admin.py`：那是用户**主动**按的，
+    而且存盘前必过 `validate_*`。除此之外谁都不许写。）
     """
     created = []
     for filename, (_validate, build, _empty) in _SPECS.items():

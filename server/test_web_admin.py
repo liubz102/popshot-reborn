@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""管理页 `/admin`（V0.3商店 M8）。全部走真的 HTTP。
+
+★ 这一组里最重要的是 `test_every_api_needs_a_login` —— 漏挂一个
+`_require_admin()` 就等于把那个接口开在公网上。
+"""
+import http.cookiejar
+import json
+import os
+import shutil
+import sys
+import tempfile
+import threading
+import unittest
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import account_store                                           # noqa: E402
+import shopcfg                                                 # noqa: E402
+from account_store import AccountStore                         # noqa: E402
+from web import admin as web_admin                             # noqa: E402
+from web import server as web_server                           # noqa: E402
+
+
+#: 三份默认配置**只生成一次**，之后每个用例复制一份。
+#:
+#: ★ 不是过早优化：`ensure_files()` 要把 1870 件物品过一遍算出 141 条商品 +
+#:   35 条配方，一次约半秒；30 多个用例各生成一次就是 17 秒，
+#:   直接把全量测试拖慢三成。
+_TEMPLATE = None
+
+
+def _template_dir():
+    global _TEMPLATE
+    if _TEMPLATE is None:
+        _TEMPLATE = tempfile.TemporaryDirectory()
+        shopcfg.ensure_files(_TEMPLATE.name)
+    return _TEMPLATE.name
+
+
+class _AdminCase(unittest.TestCase):
+    """一台真的 HTTP 服务器 + 一份临时存档 + 一份临时 `server/data/`。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.accounts = AccountStore(os.path.join(self.tmp.name, "accounts.json"))
+        # 默认管理员由启动时的幂等补齐建出来（和真实开服同一条路）。
+        self.accounts.ensure_item_fields()
+
+        # ★ 配置接口走的是无参的 `shopcfg.path_of()` ⇒ 改模块级的 DATA_DIR。
+        self.data_dir = os.path.join(self.tmp.name, "data")
+        os.makedirs(self.data_dir)
+        saved_dir = shopcfg.DATA_DIR
+        shopcfg.DATA_DIR = self.data_dir
+        self.addCleanup(shopcfg.invalidate)
+        self.addCleanup(setattr, shopcfg, "DATA_DIR", saved_dir)
+        shopcfg.invalidate()
+        for filename in web_admin.CONFIG_FILES.values():
+            shutil.copyfile(os.path.join(_template_dir(), filename),
+                            os.path.join(self.data_dir, filename))
+
+        self.httpd = web_server.make_server(0, self.accounts, "127.0.0.1",
+                                            cooldown=0)
+        self.port = self.httpd.server_address[1]
+        # ★ 每个用例一台新服务器（会话表 / 限速表 / 配置都要是干净的），
+        #   所以 `shutdown()` 会被调 30 多次。`serve_forever` 默认 **0.5 秒**
+        #   轮询一次退出标志，照默认值走的话光关服务器就要 18 秒。
+        thread = threading.Thread(
+            target=lambda: self.httpd.serve_forever(poll_interval=0.02),
+            daemon=True)
+        thread.start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+        # 每个用例一个独立的 cookie 罐 = 一个独立的浏览器。
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar))
+
+    # ---------------------------------------------------------------- HTTP
+    def url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def request(self, path, payload=None, opener=None):
+        """返回 `(状态码, 解出来的 JSON 或原始文本)`。"""
+        data = None
+        headers = {}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(self.url(path), data=data, headers=headers)
+        try:
+            with (opener or self.opener).open(req, timeout=10) as response:
+                status, body = response.status, response.read()
+        except urllib.error.HTTPError as error:
+            status, body = error.code, error.read()
+        text = body.decode("utf-8")
+        try:
+            return status, json.loads(text)
+        except json.JSONDecodeError:
+            return status, text
+
+    def login(self, name=None, password=None):
+        return self.request("/admin/api/login", {
+            "name": name or account_store.DEFAULT_ADMIN_NAME,
+            "password": (password if password is not None
+                         else account_store.DEFAULT_ADMIN_PASSWORD)})
+
+
+class AdminAuthTests(_AdminCase):
+
+    def test_the_page_renders_and_warns_about_the_default_password(self):
+        status, html = self.request("/admin")
+        self.assertEqual(200, status)
+        # ★ D3 的补偿之二：弱默认口令 + 公网可达 ⇒ 页面上必须喊出来。
+        self.assertIn("请立刻在下面「管理员账号」里改掉它", html)
+        self.assertIn("var DEFAULT_PASSWORD_IN_USE = true;", html)
+        # 占位符必须被换掉，不能原样漏到页面上。
+        self.assertNotIn("__USERNAME_RULE__", html)
+        self.assertNotIn("__PASSWORD_RULE__", html)
+        self.assertNotIn("__DEFAULT_PASSWORD_IN_USE__", html)
+
+    def test_the_banner_flag_follows_the_actual_password(self):
+        self.accounts.admin_set_password(account_store.DEFAULT_ADMIN_NAME,
+                                         "SomethingElse1")
+        _status, html = self.request("/admin")
+        self.assertIn("var DEFAULT_PASSWORD_IN_USE = false;", html)
+
+    def test_login_succeeds_and_sets_an_http_only_cookie(self):
+        status, result = self.login()
+        self.assertEqual(200, status)
+        self.assertTrue(result["ok"], result)
+        cookies = [c for c in self.jar if c.name == web_admin.SESSION_COOKIE]
+        self.assertEqual(1, len(cookies))
+        # HttpOnly / SameSite 都不是 cookielib 的一等字段，从原始属性里翻。
+        self.assertIn("HttpOnly", cookies[0]._rest)
+        self.assertEqual("/admin", cookies[0].path)
+
+    def test_a_wrong_password_does_not_log_you_in(self):
+        _status, result = self.login(password="nope")
+        self.assertFalse(result["ok"])
+        _status, session = self.request("/admin/api/session")
+        self.assertFalse(session["logged_in"])
+
+    def test_every_api_needs_a_login(self):
+        # ★★ 漏挂一个 `_require_admin()` 就等于把那个接口开在公网上。
+        for path, payload in (
+                ("/admin/api/config/shop", None),
+                ("/admin/api/config/recipe", None),
+                ("/admin/api/config/drops", None),
+                ("/admin/api/admins", None),
+                ("/admin/api/item?id=1120041", None),
+                ("/admin/api/config/shop", {"text": "{}"}),
+                ("/admin/api/admins/add", {"name": "carol", "password": "pw1"}),
+                ("/admin/api/admins/password", {"name": "admin", "password": "pw1"}),
+                ("/admin/api/admins/remove", {"name": "admin"}),
+        ):
+            status, result = self.request(path, payload)
+            self.assertEqual(401, status, path)
+            self.assertFalse(result["ok"], path)
+
+    def test_logout_really_ends_the_session(self):
+        self.login()
+        self.request("/admin/api/logout", {})
+        _status, session = self.request("/admin/api/session")
+        self.assertFalse(session["logged_in"])
+        status, _result = self.request("/admin/api/admins")
+        self.assertEqual(401, status)
+
+    def test_a_malformed_cookie_does_not_blow_up(self):
+        req = urllib.request.Request(self.url("/admin/api/session"),
+                                     headers={"Cookie": "=====;;;"})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            self.assertEqual(200, response.status)
+
+    def test_an_unknown_admin_path_is_a_clean_404(self):
+        for path, payload in (("/admin/api/nope", None),
+                              ("/admin/api/nope", {})):
+            status, result = self.request(path, payload)
+            self.assertEqual(404, status)
+            self.assertFalse(result["ok"])
+
+    def test_the_register_page_still_works(self):
+        # 管理页是**混进同一个 Handler** 的 —— 别把注册页碰坏了。
+        status, html = self.request("/")
+        self.assertEqual(200, status)
+        self.assertIn("存档转移助手", html)
+
+
+class AdminLoginRateLimitTests(_AdminCase):
+    """D3 的补偿之一：明文弱口令 + 公网可达 ⇒ 登录必须限速。"""
+
+    def setUp(self):
+        super().setUp()
+        # 服务器是 `make_server` 建的，限速器在类属性上；换一个能控时钟的。
+        self.now = 1000.0
+        handler = self.httpd.RequestHandlerClass
+        handler.admin_limiter = web_admin.LoginRateLimiter(
+            cooldown=5, clock=lambda: self.now)
+
+    def test_a_failure_locks_the_ip_for_a_while(self):
+        self.login(password="nope")
+        status, result = self.login()          # 这次口令是对的
+        self.assertEqual(429, status)
+        self.assertIn("登录太频繁", result["message"])
+        # ★ 被限住时连「有没有这个管理员」都问不出来 —— 否则限速本身
+        #   就成了一个免费的枚举接口。
+        self.assertNotIn("尚未注册", result["message"])
+
+    def test_the_lock_expires(self):
+        self.login(password="nope")
+        self.now += 6
+        _status, result = self.login()
+        self.assertTrue(result["ok"], result)
+
+    def test_a_success_clears_the_penalty(self):
+        # 「输错一次、马上输对」的人不该在下一次登录时还要再等一轮。
+        self.login(password="nope")
+        self.now += 6
+        self.login()
+        self.assertEqual(0, self.httpd.RequestHandlerClass
+                         .admin_limiter.retry_after("127.0.0.1"))
+
+    def test_zero_cooldown_turns_it_off(self):
+        self.httpd.RequestHandlerClass.admin_limiter = \
+            web_admin.LoginRateLimiter(cooldown=0)
+        self.login(password="nope")
+        _status, result = self.login()
+        self.assertTrue(result["ok"], result)
+
+
+class AdminConfigTests(_AdminCase):
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(self.login()[1]["ok"])
+
+    def get(self, which):
+        return self.request("/admin/api/config/" + which)[1]
+
+    def save(self, which, text):
+        return self.request("/admin/api/config/" + which, {"text": text})[1]
+
+    def test_reading_gives_back_the_file_on_disk(self):
+        for which, filename in web_admin.CONFIG_FILES.items():
+            result = self.get(which)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual([], result["warnings"])
+            self.assertTrue(result["path"].endswith(filename))
+            with open(shopcfg.path_of(filename), "r", encoding="utf-8") as fp:
+                self.assertEqual(fp.read(), result["text"])
+
+    def test_an_unknown_config_name_is_a_404(self):
+        status, result = self.request("/admin/api/config/nope")
+        self.assertEqual(404, status)
+        self.assertFalse(result["ok"])
+
+    def test_saving_takes_effect_without_a_restart(self):
+        raw = json.loads(self.get("shop")["text"])
+        raw["items"][0]["price"] = 12345
+        item_id = raw["items"][0]["id"]
+        result = self.save("shop", json.dumps(raw, ensure_ascii=False))
+        self.assertTrue(result["ok"], result)
+        self.assertIn("即刻生效", result["message"])
+        # ★ 热重载：不重启服务端，下一次读就是新值。
+        table, warnings = shopcfg.shop()
+        self.assertEqual([], warnings)
+        self.assertEqual(12345, table[item_id]["price"])
+
+    def test_broken_json_is_refused_and_the_file_is_untouched(self):
+        before = self.get("shop")["text"]
+        result = self.save("shop", "{ oops not json")
+        self.assertFalse(result["ok"])
+        self.assertIn("不是合法的 JSON", result["message"])
+        self.assertIn("行", result["message"])       # 行号要报出来
+        self.assertEqual(before, self.get("shop")["text"])
+
+    def test_a_schema_error_is_refused_and_the_file_is_untouched(self):
+        # ★★ 存一份坏文件下去，服务端会退回上一份好的继续跑（D10）——
+        #    用户会以为改生效了，实际没有。所以**校验不过就不落盘**。
+        before = self.get("recipe")["text"]
+        raw = json.loads(before)
+        raw["recipes"][0]["materials"] = [
+            {"id": 10001, "count": 1}, {"id": 10002, "count": 1},
+            {"id": 10003, "count": 1}, {"id": 10004, "count": 1},
+            {"id": 20007, "count": 1}]              # 5 种 > UI 的 4 个槽
+        result = self.save("recipe", json.dumps(raw, ensure_ascii=False))
+        self.assertFalse(result["ok"])
+        self.assertIn("校验没过，没有保存", result["message"])
+        self.assertEqual(before, self.get("recipe")["text"])
+
+    def test_an_empty_body_is_refused(self):
+        before = self.get("drops")["text"]
+        for text in ("", "   ", None):
+            result = self.save("drops", text)
+            self.assertFalse(result["ok"], text)
+        self.assertEqual(before, self.get("drops")["text"])
+
+    def test_human_notes_survive_a_save(self):
+        # 生成的三份里都有 `_说明`。校验器不认识这个键，保存不该把它吃掉
+        # —— 那是用户（和我们）留给下一个人的说明。
+        raw = json.loads(self.get("drops")["text"])
+        self.assertIn("_说明", raw)
+        self.assertTrue(self.save("drops", json.dumps(raw, ensure_ascii=False))["ok"])
+        self.assertIn("_说明", json.loads(self.get("drops")["text"]))
+
+    def test_a_broken_file_on_disk_is_reported_when_reading(self):
+        # 文件坏了时 `shopcfg` 保留上一份好的（D10）—— 页面必须说出来，
+        # 否则人会以为自己看到的这份就是服务端在用的那份。
+        with open(shopcfg.path_of(shopcfg.DROPS_FILENAME), "w",
+                  encoding="utf-8") as fp:
+            fp.write("{ broken")
+        shopcfg.invalidate()
+        result = self.get("drops")
+        self.assertTrue(result["ok"])            # 文本照样给你看，好去修
+        self.assertTrue(result["warnings"])
+
+
+class AdminAccountApiTests(_AdminCase):
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(self.login()[1]["ok"])
+
+    def names(self):
+        return self.request("/admin/api/admins")[1]["names"]
+
+    def test_add_and_remove(self):
+        result = self.request("/admin/api/admins/add",
+                              {"name": "carol", "password": "SecretPw"})[1]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(["admin", "carol"], self.names())
+        result = self.request("/admin/api/admins/remove", {"name": "carol"})[1]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(["admin"], self.names())
+
+    def test_removing_the_last_admin_is_refused_by_the_server(self):
+        # ★ 拦在 `account_store` 层，不只拦前端 —— 前端拦得住鼠标，
+        #   拦不住直接 POST（这条用例就是直接 POST 的）。
+        result = self.request("/admin/api/admins/remove", {"name": "admin"})[1]
+        self.assertFalse(result["ok"])
+        self.assertIn("至少要保留一个管理员", result["message"])
+        self.assertEqual(["admin"], self.names())
+
+    def test_a_bad_name_or_password_is_refused_with_the_rule_text(self):
+        result = self.request("/admin/api/admins/add",
+                              {"name": "有中文", "password": "SecretPw"})[1]
+        self.assertFalse(result["ok"])
+        self.assertIn("用户名只能用", result["message"])
+        result = self.request("/admin/api/admins/add",
+                              {"name": "carol", "password": ""})[1]
+        self.assertFalse(result["ok"])
+        self.assertIn("密码长度", result["message"])
+
+    def test_changing_my_own_password_logs_me_out(self):
+        result = self.request("/admin/api/admins/password",
+                              {"name": "admin", "password": "NewPass1"})[1]
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["logged_out"])
+        # ★ 旧令牌必须当场作废：不然「我把密码改了」和「拿着旧密码登进来的
+        #   人还在操作」会同时成立。
+        self.assertEqual(401, self.request("/admin/api/admins")[0])
+        self.assertTrue(self.login(password="NewPass1")[1]["ok"])
+
+    def test_changing_someone_elses_password_kicks_only_them(self):
+        self.request("/admin/api/admins/add",
+                     {"name": "carol", "password": "SecretPw"})
+        other = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.request("/admin/api/login",
+                     {"name": "carol", "password": "SecretPw"}, opener=other)
+        self.assertEqual(200, self.request("/admin/api/admins",
+                                           opener=other)[0])
+        result = self.request("/admin/api/admins/password",
+                              {"name": "carol", "password": "Another1"})[1]
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["logged_out"])       # 我自己还在
+        self.assertEqual(200, self.request("/admin/api/admins")[0])
+        self.assertEqual(401, self.request("/admin/api/admins",
+                                           opener=other)[0])
+
+    def test_removing_someone_kicks_their_session_too(self):
+        self.request("/admin/api/admins/add",
+                     {"name": "carol", "password": "SecretPw"})
+        other = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.request("/admin/api/login",
+                     {"name": "carol", "password": "SecretPw"}, opener=other)
+        self.request("/admin/api/admins/remove", {"name": "carol"})
+        self.assertEqual(401, self.request("/admin/api/admins",
+                                           opener=other)[0])
+
+    def test_an_unknown_manage_action_is_a_404(self):
+        status, result = self.request("/admin/api/admins/explode", {"name": "x"})
+        self.assertEqual(404, status)
+        self.assertFalse(result["ok"])
+
+
+class AdminItemLookupTests(_AdminCase):
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(self.login()[1]["ok"])
+
+    def test_a_real_item_comes_back_with_its_slot_and_bonus(self):
+        result = self.request("/admin/api/item?id=1120041")[1]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(1120041, result["id"])
+        self.assertEqual("weapon", result["kind"])
+        self.assertEqual(1024, result["part_flag"])    # 武器槽 1
+        self.assertTrue(result["ownable"])
+        self.assertEqual("리볼버 R1", result["name_kr"])
+
+    def test_an_id_the_client_does_not_know_says_so(self):
+        # ★ 这正是这个小工具存在的理由：写错一个 id，界面上就是个空格子。
+        result = self.request("/admin/api/item?id=9999999")[1]
+        self.assertFalse(result["ok"])
+        self.assertIn("空格子", result["message"])
+
+    def test_a_non_numeric_id_is_refused(self):
+        result = self.request("/admin/api/item?id=abc")[1]
+        self.assertFalse(result["ok"])
+
+
+class AdminSessionStoreTests(unittest.TestCase):
+    """`AdminSessions` 本身（不走 HTTP）。"""
+
+    def setUp(self):
+        self.now = 100.0
+        self.sessions = web_admin.AdminSessions(ttl=60, clock=lambda: self.now)
+
+    def test_a_token_resolves_until_it_expires(self):
+        token = self.sessions.issue("admin")
+        self.assertEqual("admin", self.sessions.resolve(token))
+        self.now += 61
+        self.assertIsNone(self.sessions.resolve(token))
+
+    def test_tokens_are_unique_and_not_guessable_length(self):
+        tokens = {self.sessions.issue("admin") for _ in range(50)}
+        self.assertEqual(50, len(tokens))
+        self.assertTrue(all(len(t) >= 32 for t in tokens))
+
+    def test_dropping_is_idempotent(self):
+        token = self.sessions.issue("admin")
+        self.sessions.drop(token)
+        self.sessions.drop(token)               # 不该抛
+        self.assertIsNone(self.sessions.resolve(token))
+        self.assertIsNone(self.sessions.resolve(None))
+
+    def test_dropping_an_admin_kills_every_one_of_their_sessions(self):
+        mine = [self.sessions.issue("carol") for _ in range(3)]
+        others = self.sessions.issue("admin")
+        self.sessions.drop_admin("carol")
+        for token in mine:
+            self.assertIsNone(self.sessions.resolve(token))
+        self.assertEqual("admin", self.sessions.resolve(others))
+
+
+if __name__ == "__main__":
+    unittest.main()

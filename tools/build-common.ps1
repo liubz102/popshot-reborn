@@ -297,13 +297,17 @@ function Copy-ServerCode {
         $copied += $name
     }
 
-    # 注册页：__init__.py / server.py / index.html，同样不拷 __pycache__。
+    # 注册页 + 管理页，同样不拷 __pycache__。
+    # ★ Copy-TreeFiltered 会把 web\ 底下**所有**文件都拷过去；下面这张表是
+    #   「少了就报错」的**验收清单**，新增 web 文件要记得加进来
+    #   —— 打包缺一个 .html，页面在云上就是 500，而本地怎么试都是好的。
     $webSrc = Join-Path $srcDir 'web'
     $webDst = Join-Path $dstDir 'web'
     Copy-TreeFiltered -Source $webSrc -Target $webDst
-    foreach ($must in @('__init__.py', 'server.py', 'index.html')) {
+    foreach ($must in @('__init__.py', 'server.py', 'index.html',
+                        'admin.py', 'admin.html')) {
         if (-not (Test-Path -LiteralPath (Join-Path $webDst $must) -PathType Leaf)) {
-            throw "注册页缺文件：server\web\$must"
+            throw "网页缺文件：server\web\$must"
         }
         $copied += "web\$must"
     }
@@ -324,6 +328,8 @@ function Copy-ServerCode {
     # 角色属性表（V0.3 M5）：`server\chrprops.py` 读的就是它 —— 命中判定
     # 要知道「人有多大」（三个碰撞圆）。
     $copied += (Copy-ChrProps -Root $Root -PackageRoot $PackageRoot)
+    # 商店物品表（V0.3商店 M1）：`server\shopdata.py` 读的就是它。
+    $copied += (Copy-ShopData -Root $Root -PackageRoot $PackageRoot)
     return $copied
 }
 
@@ -376,6 +382,36 @@ function Copy-ChrProps {
     }
     Copy-One $src (Join-Path $PackageRoot 'server\bot_chrprops.json')
     return @('bot_chrprops.json')
+}
+
+function Copy-ShopData {
+    <# 把 `server\shop_items.json` 拷进包（**两个包都要**），并当场验收。
+
+       ★ 缺了它商店 / 合成 / 仓库**整个不工作**，而且是**静默**的：
+         `shopdata` 读不到文件时返回空表，于是 `ownable()` 对谁都说 false ——
+         买不到东西、合不出东西、掉不出材料、连结算界面那一栏都是空的，
+         但服务端一句错都不报。所以照 Copy-WeaponData 的风格：
+         明显不对就炸，别打出半个包。 #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$PackageRoot
+    )
+    $src = Join-Path $Root 'server\shop_items.json'
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+        throw "缺商店物品表：$src 不存在。先跑 tools\update-shopdata.bat"
+    }
+    # 中文版 ShopItem-Chn.ini 有 1870 条。少一大截说明提取跑了一半。
+    $table = Get-Content -LiteralPath $src -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($table.count -lt 1000) {
+        throw "商店物品表只有 $($table.count) 件物品，明显不对，中止打包"
+    }
+    # 格式版本对不上的话 `shopdata` 会当**没有数据**（而不是报错），
+    # 症状和「文件根本没进包」一模一样 —— 在这儿先炸出来。
+    if ($table.format -ne 1) {
+        throw "商店物品表的 format 是 $($table.format)，server\shopdata.py 只认 1，中止打包"
+    }
+    Copy-One $src (Join-Path $PackageRoot 'server\shop_items.json')
+    return @('shop_items.json')
 }
 
 function Update-ChrProps {
