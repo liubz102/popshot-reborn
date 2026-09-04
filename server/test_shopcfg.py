@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import mapdata                                                 # noqa: E402
 import shopcfg                                                 # noqa: E402
 import shopdata                                                # noqa: E402
 from test_shopdata import SYNTHETIC, make_table                # noqa: E402
@@ -512,6 +513,31 @@ class SchemaTests(unittest.TestCase):
                          [o["value"] for o in field["options"]])
         for option in field["options"]:
             self.assertIn(shopcfg.QUEST_ZH[option["value"]], option["label"])
+
+    def test_the_difficulty_dropdown_shows_the_names_from_the_game(self):
+        # ★ 难度下拉里不能再是「难度 1/2/3/4」（用户 2026-09-05）：那四个号
+        #   在游戏里各有名字，运营记的是名字不是号码。
+        # ★★ 档数不是我们定的 —— 客户端拼地图文件名那一段只认四档
+        #   （`mapdata.DIFFICULTY_SUFFIX`），校验器的上限也是 4。三处必须一致，
+        #   否则会出现「选得出来但永远命中不了」或者「存不进去」的档。
+        self.assertEqual([1, 2, 3, 4], sorted(shopcfg.DIFFICULTY_ZH))
+        self.assertEqual(mapdata.DIFFICULTY_SUFFIX.keys(),
+                         shopcfg.DIFFICULTY_ZH.keys())
+        field = next(f for f in shopcfg.SCHEMA["drops"]["fields"]
+                     if f["key"] == "difficulty")
+        self.assertEqual("choice", field["type"])
+        self.assertTrue(field["optional"])          # 留空 = 不限
+        self.assertEqual(sorted(shopcfg.DIFFICULTY_ZH),
+                         [o["value"] for o in field["options"]])
+        for option in field["options"]:
+            self.assertIn(shopcfg.DIFFICULTY_ZH[option["value"]],
+                          option["label"])
+        # 校验器卡的上限就是下拉的最大值，多一档少一档都要在这里报红。
+        raw = {"format": shopcfg.FORMAT, "rules": [
+            {"mode": "quest", "difficulty": max(shopcfg.DIFFICULTY_ZH) + 1,
+             "material": 10001, "prob": 50}]}
+        with self.assertRaises(shopcfg.ConfigError):
+            shopcfg.validate_drops(raw)
 
     def test_the_dropdown_does_not_become_a_validation_rule(self):
         # ★ 下拉是**方便**，不是规矩：关卡有几个是客户端的事，不该由掉落表

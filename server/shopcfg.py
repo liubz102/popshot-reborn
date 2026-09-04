@@ -174,6 +174,22 @@ QUEST_ZH = {
     7: "扎米洛秘密基地",
 }
 
+#: 难度号 → **游戏里的中文名**。`drops.json` 的 `difficulty` 存的就是这个号，
+#: 管理页的难度下拉框照它显示（用户 2026-09-05：「别再显示 1234」）。
+#:
+#: 号码 → 难度的对应是**客户端自己拼地图文件名**那一段定死的
+#: （`mapdata.DIFFICULTY_SUFFIX`，出处 `0x405742` 的四发 `dec edi`）：
+#: `1=#Easy 2=#Normal 3=#Hard 4=#Extreme`。
+#:
+#: 中文名取的是 `Chinese.ini` 的官方译法：
+#: `이지 모드=简单` / `노멀 모드=普通` / `하드 모드=困难`
+#: （另一处 `EASY=简单` / `NORMAL=普通` / `HARD=困难` 互相印证）。
+#:
+#: ★ 难度 4 的名字是**我们自己拼的**：中文版把 `익스트림 모드` 原样留成了
+#:   `Extreme Mode`（没翻），管理页里摆一行英文太出戏，照 `#Extreme` 译作
+#:   「极限」。和第 7 关的名字是同一种情况（见上面 `QUEST_ZH`）。
+DIFFICULTY_ZH = {1: "简单", 2: "普通", 3: "困难", 4: "极限"}
+
 #: `shopdata` 的 `kind` → 中文。管理页的物品选择器按它分页签。
 #: ★ 键要和 `shop_items.json` 的 `by_kind` 对得上；查不到的 kind 原样显示，
 #: 不要在这里硬编码一张「全部 kind」的清单（物品表换一版就可能多出一类）。
@@ -780,10 +796,13 @@ SCHEMA = {
              "optional": True, "empty_label": "不限",
              "options": [{"value": qid, "label": "%d · %s" % (qid, name)}
                          for qid, name in sorted(QUEST_ZH.items())]},
+            # ★ 难度显示成「1 · 简单」这种游戏里的叫法（`DIFFICULTY_ZH`），
+            #   和上面的关卡下拉框一个格式。校验器那边照旧卡 1..4 —— 难度
+            #   有几档是客户端拼地图文件名时定死的，不是运营配置说了算。
             {"key": "difficulty", "label": "难度", "type": "choice",
              "optional": True, "empty_label": "不限",
-             "options": [{"value": n, "label": "难度 %d" % n}
-                         for n in range(1, 5)]},
+             "options": [{"value": n, "label": "%d · %s" % (n, name)}
+                         for n, name in sorted(DIFFICULTY_ZH.items())]},
             {"key": "material", "label": "材料", "type": "item",
              "kinds": ["material"]},
             {"key": "count", "label": "数量", "type": "int", "min": 1,
