@@ -129,7 +129,7 @@ COMMAND_PREFIX = "/"
 
 #: ★★ 五档 AI 难度只控制用户指定的两种失误（V0.3 M5）：
 #:
-#: * `aim_error`：计算移动目标提前量时故意算错的概率；
+#: * `aim_error`：瞄准偏离目标、算错移动提前量的概率；
 #: * `dodge_error`：预测敌方弹道时故意判断错的概率。
 #:
 #: 其余物理、武器属性和寻路能力五档完全共用，避免“简单难度”靠违反游戏
@@ -1220,7 +1220,16 @@ def _cmd_difficulty(conn, room, args):
             return usage
         if level not in BOT_DIFFICULTY_PROFILES:
             return usage
+    changed = getattr(room, "bot_difficulty", BOT_DIFFICULTY_DEFAULT) != level
     room.bot_difficulty = level
+    if changed:
+        for index in room.bot_seats():
+            machine = room.seats[index].conn
+            if isinstance(machine, BotConn):
+                _reroll_aim_miss(machine)
+                machine.intent_tick = None
+                machine.dodge_at = None
+                machine.dodge_signature = None
     profile = difficulty_profile(room)
     label = BOT_DIFFICULTY_LABELS[level]
     conn.log(f"   /d: bot 难度 -> {level} "
@@ -6145,21 +6154,28 @@ def _path_blocked(terrain, x0, y0, shot, radius=0.0):
     """
     if terrain is None:
         return False
-    # ★ 采样点组和 `_terrain_contact()` 必须是同一套（§116）：这里判「枪口
-    #   通不通」，那边判「飞到哪儿撞上」，两边口径不一样就会出现
-    #   「开火时觉得通、结算时当场撞在枪口上」。
-    if radius and radius >= 1.0:
-        offsets = shell_probe_offsets(radius, math.cos(shot.angle),
-                                      math.sin(shot.angle))
-    else:
-        offsets = ((0, 0),)
-    if _probe_blocked(terrain, int(x0), int(y0), offsets):
+    if _muzzle_blocked(terrain, x0, y0, shot, radius):
         return True
     points = ballistics.path_points(x0, y0, shot)
     for (ax, ay), (bx, by) in zip(points, points[1:]):
         if terrain.line_blocked(ax, ay, bx, by, step=BOT_LINE_STEP):
             return True
     return False
+
+
+def _muzzle_blocked(terrain, x0, y0, shot, radius=0.0):
+    """仅查弹体能否出膛，和 `_terrain_contact()` 共用采样点（§116）。
+
+    失误弹可以途中撞地，但仍不能从埋进地形的枪口发射（§76）。
+    """
+    if terrain is None:
+        return False
+    if radius and radius >= 1.0:
+        offsets = shell_probe_offsets(radius, math.cos(shot.angle),
+                                      math.sin(shot.angle))
+    else:
+        offsets = ((0, 0),)
+    return _probe_blocked(terrain, int(x0), int(y0), offsets)
 
 
 def _shot_impact(terrain, x0, y0, shot, radius=0.0):
@@ -6541,8 +6557,8 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
     「瞄他现在站的地方」，所以这一步对静止目标没有任何行为改变。
 
     ★★ **失误**（M5-D）：`miss` 是**开火前就掷好**的一份偏差（`botaim.Miss`）。
-    给了它就把这一发弄歪，并且**用弄歪之后的点重解弹道** —— 否则包里的角度
-    还是准的，屏幕上看不出打偏。
+    先用正常弹道选目标，再把这一发弄歪并重解弹道。失误弹可以撞地形或提前
+    引爆；不能把这些发次过滤掉，否则实际打出的子弹会偏向准确的那一档。
     """
     if machine.battle_pos is None:
         return None
@@ -6550,6 +6566,7 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
     terrain = _terrain(room)
     solve = _solver_for(weapon)
     best = None
+    best_aim = None
     # ★★ **只打看得见的**（§127）：屏幕外的人真人根本不知道在哪，
     #    服务端也不该把精确坐标喂给 bot。看不见时走位归 `_rough_bearing()`。
     for index, px, py, crouched in _visible_targets(room, machine, seat_index):
@@ -6570,7 +6587,7 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
                     else _seat_velocity(room, index))
         radius = _hit_radius(room, index, weapon)
         point, shot = botaim.aim(solve, (mx, my), (tx, ty), velocity,
-                                 radius, miss)
+                                 radius)
         if shot is None:
             continue
         # ★ 提前量可能把瞄准点推到身体另一侧 —— 枪口跟着朝向翻（`_muzzle`），
@@ -6589,6 +6606,23 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
             continue
         best = Engagement(index, point, shot, span,
                           math.hypot(velocity[0], velocity[1]), radius)
+        best_aim = ((tx, ty), velocity, crouched)
+    if best is not None and miss is not None and not BOT_DIAG_FIRE_ANYWHERE:
+        target, velocity, crouched = best_aim
+        mx, my = _muzzle(x, y, target[0])
+        size_ratio = _magazine_ratios(machine)[1]
+        radius = _aim_miss_radius(room, best.seat, weapon, crouched,
+                                  size_ratio)
+        point, shot = botaim.aim(solve, (mx, my), target, velocity, radius, miss)
+        if shot is not None:
+            nx, ny = _muzzle(x, y, point[0])
+            if (nx, ny) != (mx, my):
+                shot = solve(point[0] - nx, point[1] - ny)
+            if shot is not None:
+                if _muzzle_blocked(terrain, nx, ny, shot,
+                                    float(weapon.size or 0.0) * size_ratio):
+                    return None
+                best = best._replace(point=point, shot=shot)
     if best is None and not BOT_DIAG_FIRE_ANYWHERE:
         # ★★★ 双路线规划认定的**捷径第一道门**（用户 2026-09-01）。
         #   排在真人后面：`_breaking_now()` 已经把「视野里有活敌人/活怪」
@@ -6693,8 +6727,23 @@ def _hit_radius(room, seat_index, weapon):
     return character.size_body + float(weapon.size or 0.0)
 
 
+def _aim_miss_radius(room, seat_index, weapon, crouched, size_ratio=1.0):
+    """失误要偏出整个人，不能只绕开身体圆后又打中头或腿。
+
+    以身体圆心为基准，包住当前姿势的三个碰撞圆，再加实际弹体半径。
+    换枪评分仍用 `_hit_radius()`；这里只决定失误的幅度。
+    """
+    seat = room.seats[seat_index]
+    character = chrprops.get(seat.character_id)
+    tx, ty = character.center(0.0, 0.0, crouched)
+    extent = max(math.hypot(cx - tx, cy - ty) + radius
+                 for cx, cy, radius, _region in character.circles(
+                     0.0, 0.0, crouched))
+    return extent + float(weapon.size or 0.0) * size_ratio
+
+
 def _aim_error_chance(room, machine, seat_index):
-    """这一发算错提前量的概率 —— 难度那一格（M5-D）。
+    """这一发瞄偏、算错提前量的概率 —— 难度那一格（M5-D）。
 
     ★ 道具赛里别人放的**糊屏**会把它顶上去，那条在 `_hud_jam_bonus()` 里
     （M5-F）；这里只负责把两者合起来，上限 1.0。

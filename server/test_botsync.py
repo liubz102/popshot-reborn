@@ -5045,6 +5045,115 @@ class BotAimLeadTests(BotFireRoom):
         self.assertGreater(jammed, plain + 0.3)
 
 
+class BotDifficultyAccuracyTests(TerrainMixin, BotFireRoom):
+    """难度必须改变真实碰撞结果，不能只让准星和发包角度变一下。"""
+
+    def setUp(self):
+        super().setUp()
+        self.alice_seat = self.room.seat_index_of(self.alice)
+        self.bot_conn.weapon_slot = 1
+        self.bot_conn.holding = True
+        self.bot_conn.next_fire_at = time.monotonic() + 3600.0
+        self.place_bot(100.0)
+        self.walk(self.alice, [(500.0, 150.0), (500.0, 150.0)])
+
+    def impact(self, target, terrain=None):
+        _seat, point, shot = target
+        machine = self.bot_conn
+        mx, my = bot._muzzle(*machine.battle_pos, point[0])
+        shell = bot.Shell(1, 0, machine.weapon,
+                          bot._seat_group(self.room, self.bot_seat),
+                          mx, my, shot, 0.0, math.ceil(shot.ticks) + 2)
+        shell.size_ratio = bot._magazine_ratios(machine)[1]
+        bodies = bot._battle_bodies(self.room, self.bot_seat, shell.group)
+        for _ in range(shell.max_ticks):
+            contact = bot._shell_step(self.room, shell, terrain, bodies)
+            if contact is not None:
+                return contact
+        return None
+
+    def test_a_miss_clears_head_body_and_legs_in_both_stances_and_directions(self):
+        for character in (0, 1, 2):
+            self.room.seats[self.alice_seat].character_id = character
+            for crouched in (False, True):
+                self.human_crouch(self.alice, crouched)
+                self.walk(self.alice, [(500.0, 150.0)])
+                for x in (100.0, 400.0, 600.0, 900.0):
+                    self.place_bot(x)
+                    for side in (-1.0, 1.0):
+                        with self.subTest(character=character, crouch=crouched,
+                                          x=x, side=side):
+                            target = bot._fire_target(
+                                self.room, self.bot_conn, self.bot_seat,
+                                self.bot_conn.weapon, botaim.Miss(1.0, side))
+                            self.assertIsNotNone(target)
+                            self.assertIsNone(self.impact(target))
+
+    def test_real_collision_rates_follow_all_five_difficulties(self):
+        rates = []
+        samples = 500
+        for level in range(1, 6):
+            self.assertTrue(bot.handle_command(self.alice, f"/d {level}"))
+            self.bot_conn.roll = random.Random(5).randrange
+            hits = 0
+            for _ in range(samples):
+                miss = bot._aim_miss(self.room, self.bot_conn, self.bot_seat)
+                target = bot._fire_target(self.room, self.bot_conn,
+                                          self.bot_seat, self.bot_conn.weapon,
+                                          miss)
+                self.assertIsNotNone(target)
+                contact = self.impact(target)
+                hits += contact is not None and contact[1] == self.alice_seat
+                bot._reroll_aim_miss(self.bot_conn)
+            rate = hits / samples
+            expected = 1.0 - bot.difficulty_profile(self.room)["aim_error"]
+            self.assertAlmostEqual(expected, rate, delta=0.06)
+            rates.append(rate)
+        self.assertEqual(sorted(rates), rates)
+        self.assertLess(rates[0], 0.25)
+        self.assertGreater(rates[-1], 0.80)
+
+    def test_a_ground_bound_miss_is_fired_and_resolves_without_direct_damage(self):
+        self.install_terrain(synth_terrain("flat"))
+        self.bot_conn.roll = lambda n: 0       # 最小偏差，朝脚下打
+        bot._reroll_aim_miss(self.bot_conn)
+        self.bot_conn.intent_tick = None
+        self.bot_conn.next_fire_at = 0.0
+        self.clear()
+        self.advance(1)
+        self.assertEqual(1, len(fire_frames(self.alice, self.bot_seat)))
+        self.assertEqual(1, len(self.bot_conn.pending_shots))
+        shell = self.bot_conn.pending_shots[0]
+        self.assertTrue(bot._path_blocked(bot._terrain(self.room),
+                                         shell.x0, shell.y0, shell.shot,
+                                         shell.radius))
+        self.settle()
+        frames = explode_frames(self.alice, self.bot_seat)
+        self.assertEqual(1, len(frames))
+        body = body_of(frames[0])
+        self.assertEqual(0, struct.unpack_from("<i", body, 4)[0])
+        self.assertEqual(0.0, struct.unpack_from("<f", body, 24)[0])
+
+    def test_a_miss_does_not_make_a_target_behind_a_wall_visible(self):
+        self.install_terrain(synth_terrain(
+            "difficulty_wall", walls=((280, 320, 0),)))
+        for miss in (None, botaim.Miss(1.0, -3.0)):
+            self.assertIsNone(bot._fire_target(
+                self.room, self.bot_conn, self.bot_seat,
+                self.bot_conn.weapon, miss))
+
+    def test_a_skewed_bullet_must_still_clear_the_muzzle(self):
+        # 枪口 (143, 93)，准确弹的鼻尖在 (146, 93)；向下偏后鼻尖撞 (146, 94)。
+        rows = ["0" * 800 for _ in range(180)]
+        rows[94] = "0" * 146 + "2" + "0" * 653
+        self.install_terrain(mapdata.MapTerrain(make_record(rows)))
+        self.assertIsNotNone(bot._fire_target(
+            self.room, self.bot_conn, self.bot_seat, self.bot_conn.weapon))
+        self.assertIsNone(bot._fire_target(
+            self.room, self.bot_conn, self.bot_seat, self.bot_conn.weapon,
+            botaim.Miss(1.0, 2.0)))
+
+
 class BotEntryLockMovementTests(TerrainMixin, BotFireRoom):
     """★★★ 进图那一档**连走都不许走**（§94）—— 复活那一档只拦动手。
 

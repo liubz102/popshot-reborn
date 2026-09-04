@@ -281,13 +281,24 @@ class MissTests(unittest.TestCase):
         self.assertIsNone(botaim.roll_error(lambda n: 0, 0.0))
 
     def test_a_miss_pushes_the_aim_sideways_by_a_near_miss_margin(self):
-        """★ 失误要「差一点」，不是朝天上放 —— 偏 1~3 倍命中窗口。"""
+        """失误偏出目标，并补偿射线角度；不能只检查准星坐标。"""
         miss = botaim.Miss(1.0, 2.0)
         point, solved = botaim.aim(self.solve, self.muzzle, (500.0, 0.0),
                                    (0.0, 0.0), 20.0, miss)
-        self.assertAlmostEqual(40.0, point[1])         # 2 × 20
+        self.assertGreater(point[1], 40.0)
+        self.assertLess(point[1], 43.0)                # 两倍半径 + 相切余量
         self.assertAlmostEqual(500.0, point[0])
         self.assertNotAlmostEqual(0.0, solved.angle)   # ★ 弹道跟着重解了
+
+    def test_the_smallest_miss_clears_the_target_at_close_range(self):
+        target = (50.0, 0.0)
+        for side in (-1.0, 1.0):
+            with self.subTest(side=side):
+                _point, shot = botaim.aim(
+                    self.solve, self.muzzle, target, (0.0, 0.0), 20.0,
+                    botaim.Miss(1.0, side))
+                clearance = abs(target[0] * math.sin(shot.angle))
+                self.assertGreater(clearance, 20.0)
 
     def test_a_wrong_lead_is_the_other_half_of_a_miss(self):
         straight, _shot = botaim.aim(self.solve, self.muzzle, (500.0, 0.0),

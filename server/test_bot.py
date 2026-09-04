@@ -387,6 +387,25 @@ class BotCommandTests(LobbyIsolated):
             5: {"aim_error": 0.10, "dodge_error": 0.05},
         }, bot.BOT_DIFFICULTY_PROFILES)
 
+    def test_a_changed_difficulty_refreshes_pending_aim_and_dodge_decisions(self):
+        room = self.open_room()
+        bot.handle_command(self.host, "/a 2")
+        for index in room.bot_seats():
+            machine = room.seats[index].conn
+            machine.aim_miss_rolled = True
+            machine.aim_miss = bot.botaim.Miss(1.0, 2.0)
+            machine.intent_tick = 12
+            machine.dodge_at = 3
+            machine.dodge_signature = (("shell", 100),)
+        bot.handle_command(self.host, "/d 1")
+        for index in room.bot_seats():
+            machine = room.seats[index].conn
+            self.assertFalse(machine.aim_miss_rolled)
+            self.assertIsNone(machine.aim_miss)
+            self.assertIsNone(machine.intent_tick)
+            self.assertIsNone(machine.dodge_at)
+            self.assertIsNone(machine.dodge_signature)
+
     def test_d_rejects_invalid_or_per_bot_forms_without_changing_the_level(self):
         room = self.open_room()
         for text in ("/d 0", "/d 6", "/d easy", "/d 1 5"):

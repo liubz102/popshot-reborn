@@ -17,7 +17,7 @@
 ## 失误：偏一个「差一点点」的量，不是乱打一气
 
 真人打不中通常是**擦过去**，不是朝天上放。所以失误建模成**在目标那儿横向
-偏开 1~3 倍命中窗口**（命中窗口 = 目标碰撞圆 + 弹体半径），再叠一个把提前量
+偏开 1~3 倍目标范围**（包住整个角色的碰撞圆 + 弹体半径），再叠一个把提前量
 算错的系数。这样：
 
 * 站着不动的目标也会被打偏（否则「必中」和难度设定矛盾）；
@@ -53,7 +53,7 @@ LEAD_ROUNDS = 3
 #: 被打飞时垂直速度也就 20 上下（`botmove.JUMP_SPEED`）。40 已经是它的三倍多。
 MAX_SAMPLE_SPEED = 40.0
 
-#: 失误时横向偏开几倍命中窗口：`[1, 3]` 之间。
+#: 失误时横向偏开几倍完整目标范围：`[1, 3]` 之间。
 #: 1 倍以下会「歪打正着」，3 倍以上就不像人打的了。
 MISS_SPREAD_MIN = 1.0
 MISS_SPREAD_MAX = 3.0
@@ -165,7 +165,8 @@ def aim(solve, muzzle, target, velocity, hit_radius, miss=None):
     """一次完整的瞄准：返回 `(瞄准点, Shot)`；打不到返回 `(None, None)`。
 
     `miss` 给了就按它把这一发弄歪：先把提前量乘错，解完再横着推开
-    `offset_ratio × hit_radius`。
+    `offset_ratio × hit_radius`。这里的 `hit_radius` 必须包住完整目标，
+    不能只给身体圆的半径；否则「失误」会变成打头或打腿。
 
     ⚠ 推歪之后**必须拿新的点重解一次弹道** —— 否则包里带的角度还是正确
     瞄准点的角度，弹体照样打中人，屏幕上看不出任何「打偏」。
@@ -179,7 +180,14 @@ def aim(solve, muzzle, target, velocity, hit_radius, miss=None):
     point, shot = lead_point(solve, muzzle, target, used)
     if point is None or miss is None:
         return (point, shot)
-    offset = max(1.0, float(hit_radius)) * miss.offset_ratio
+    # 一单位余量避免相切被算中；近距离还要补偿「偏移点」与射线的夹角。
+    # 对半径 R、距离 D 的圆，切线在目标截面上的偏移是 R*D/sqrt(D²-R²)。
+    radius = max(1.0, float(hit_radius)) + 1.0
+    offset = radius * miss.offset_ratio
+    span = math.hypot(point[0] - float(muzzle[0]),
+                      point[1] - float(muzzle[1]))
+    if span > radius:
+        offset *= span / math.sqrt(span * span - radius * radius)
     skewed = _offset_point(point, muzzle, offset)
     nxt = solve(skewed[0] - float(muzzle[0]), skewed[1] - float(muzzle[1]))
     if nxt is None:
