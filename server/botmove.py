@@ -308,10 +308,47 @@ def _walk_tick(terrain, body, character, direction, fast_run, crouched,
         return body.moved(nx, sy)
     if _solid(terrain, nx, body.y - 1):
         # 前面是墙（够不着的高台、图外）—— 真人也是走不过去的，原地不动。
-        return body
+        #
+        # ★★★ 但要先问一句：这一步**跨过去的那几列**里，有没有先来一道
+        #   崖边（V0.3 §177）。收方是一格一格推进的（`0x50d9a7` /
+        #   `0x50e4e9`，§169 里引的就是这几处），走到崖边人就掉下去了，
+        #   根本走不到后面那面墙上。只问落点的话会得出「原地不动」——
+        #   `Iceria03` 那个 1 像素夹层就是靠这一条把 bot 锁死 45.8 秒的：
+        #   脚下那块 1 像素的冰檐左边紧接着就是空的，可一整步（8 像素）
+        #   跨过去正好落在冰体里面，判据说「墙」，于是永远挪不动。
+        ledge = _ledge_within_step(terrain, body, nx, reach)
+        if ledge is None:
+            return body
+        return body.moved(ledge, body.y,
+                          (speed if direction > 0 else -speed), 0.0,
+                          on_ground=False)
     # ★ 走出崖边：人离地、水平速度保持这一步的走速，垂直速度从 0 开始
     #   （原版就是这样掉下去的，不是「不许走过去」）。
     return body.moved(nx, body.y, nx - body.x, 0.0, on_ground=False)
+
+
+def _ledge_within_step(terrain, body, nx, reach):
+    """这一步跨过的那几列里，第一处**脚下没路**的列；一路有路返回 `None`。
+
+    ★ 只在「落点撞墙」那一支上问 —— 那一支今天的结果是**原地不动**，
+      所以这里只可能把「不动」变成「掉下去」，一步走得动的都不碰。
+      实测 8 张真图：受影响的走位占 0.4%（`Iceria03`）~0.0%，
+      而且**全部**来自今天那 0.5%~10.2% 的「撞墙 = 不动」。
+
+    先撞上墙（这一列脚下是实心、又够不着站立面）就返回 `None`：墙在崖边
+    前面时人是真的走不过去。
+    """
+    step = 1 if nx > body.x else -1
+    span = abs(nx - body.x)
+    col = int(body.x)
+    while abs(col + step - body.x) <= span:
+        col += step
+        if surface_near(terrain, col, body.y, reach) is not None:
+            continue                   # 这一列还站得住，接着往前
+        if _solid(terrain, col, body.y - 1):
+            return None                # 先撞上墙 —— 走不到崖边
+        return float(col)
+    return None
 
 
 def _is_ledge(terrain, x, y):
@@ -445,6 +482,29 @@ def _air_tick(terrain, body):
         #   这样「贴着崖壁往下掉」不会被上面很远的崖顶勾上去。
         step = surface_near(terrain, nx, body.y, abs(vx) * CLIMB_SLOPE)
         if step is not None and step < ny:
+            # ★★★★★ **掉着掉着蹭上坡 = 落地**，不是接着飞（V0.3 §181）。
+            #
+            #   「蹭上坎」这一支是 §95 给**往上飞**的人补的（弱击退顶着缓坡
+            #   往上走）。可它没分上下：一个正在**下落**的人从斜坡上方掠过时
+            #   同样命中这里，于是脚被抬到坡面上、`on_ground` 却还是 0、
+            #   `v.y` 接着按重力空转 —— 人**贴着地面滑行**，报出去的下落速度
+            #   一路涨到 40 开外。
+            #
+            #   收方对腾空角色是拿包里的速度**逐帧积分推位置**的
+            #   （`packet_api §5.6`），于是它把角色按 40/tick 往地底下拽，
+            #   一发心跳（4 帧）拽出 170 像素，下一发再拽回来 ——
+            #   **每 128 ms 一次的大幅上下抽动**，就是用户 2026-09-04 报的
+            #   「在空中还是会有卡顿和瞬移感，尤其在空中很明显」。
+            #
+            #   `Forest02` (569,597) 那条弧线实测：从 tick 28 起滑了 20 多个
+            #   tick，`v.y` 从 16 一路涨到 41，收方偏差峰值 **178 像素**。
+            #
+            #   ★ 落地判据本来只问 `ground_below(nx, 出发时的 y)` —— 它是
+            #     **往下**找的，而这里地面是**升上来迎着人**，所以永远问不到。
+            #     `surface_near()` 已经把那个面找出来了，falling 时它就是落点。
+            #   ★ 往上飞（`v.y <= 0`）那一支一个字没动，§95 照旧。
+            if vy > 0:
+                return body.moved(nx, float(step))      # 落地
             ny = float(step)            # 蹭上坎：脚抬到坎顶，**仍然腾空**
             climbed = True
         else:
