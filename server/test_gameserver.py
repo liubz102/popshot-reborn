@@ -3058,19 +3058,103 @@ class SendCoalescingTests(StuckClientIsolationTests):
         self.assertEqual([0x0200, 0x0201, OP_SLOT_EQUIPPED_LIST, 0x0200],
                          self.frames_of(self.decrypted(conn)))
 
-    def test_the_backlog_high_water_mark_is_logged_once_per_record(self):
+    # -- 诊断：判据是「躺了多久」，不是「并走几份」（§184）-------------------
+
+    @staticmethod
+    def waits_of(conn):
+        return [line for line in conn.logged if "发送队列滞留新高" in line]
+
+    @staticmethod
+    def waited_ms(line):
+        return int(line.split("躺了 ")[1].split(" ms")[0])
+
+    def age_the_queue(self, conn, ages):
+        """把还排着的那几份的入队时刻**往前挪** `ages` 秒（队首在前）。
+
+        挪时刻而不是真等：用例的结论不该取决于这台机器跑得多快（铁律 10）。
+        顺带把纪录和日志复位 —— 第一份出队时发送线程刚起来，那点启动开销
+        不是积压。
+
+        ⚠ 下面的断言一律**留出取整余量**（挪 50 只断言 ≥40）：报出来的数是
+          `int(秒差 × 1000)`，向下取整 + 浮点误差 ⇒ 挪 0.120 可能量成 119。
+          用例要钉的是**量级**（几十毫秒 vs 零），不是那一个毫秒。
+        """
+        with conn.outbox_cv:
+            self.assertEqual(len(ages), len(conn.outbox), "该都还排着")
+            now = time.monotonic()
+            for i, ((wire, solo, _), age) in enumerate(zip(conn.outbox, ages)):
+                conn.outbox[i] = (wire, solo, now - age)
+        conn.logged.clear()
+        conn.send_wait_max_ms = 0
+
+    def test_a_burst_queued_in_one_instant_is_not_reported_as_backlog(self):
+        """★★★★★ 这次 bug 的回归（V0.3 §184）：**份数不是积压的证据**。
+
+        实机日志里报出来的三次「新高」，字节数一个不差地对上了三处
+        **同一毫秒里连着 `send()`** 的批量下发 ——
+        局末结算 12 份 936 字节（6 份 `gspRepGameResult` 90 + 6 份
+        `gspEndGame` 66）、`/a` 一次加 5 个 bot 11 份 676 字节
+        （5 ×（座位加入 64 + 系统提示 44）+ 汇总提示 136）、登录补发 4 份。
+        这些包在队里**一份都没躺过**，发送线程一醒来就一次全走 ——
+        那正是 D125 想要的行为，不是积压。
+
+        变异验证：把 `_note_send_wait` 换回按份数记纪录，这一条当场红。
+        """
+        conn = self.closable_conn()
+        conn._note_send_wait(time.monotonic(), 12, 936)
+        conn._note_send_wait(time.monotonic(), 11, 676)
+        self.assertEqual([], self.waits_of(conn))
+
+    def test_a_single_packet_that_sat_in_the_queue_is_reported(self):
+        """★★★ 老诊断的**漏报**：§166 的原始现象是「一次只走掉一个包、
+        间隔 30~50 ms」—— 份数恒为 1，只看份数的诊断对它一声不吭。
+
+        变异验证：把 `_note_send_wait` 挪回「并走 >1 份才记」，这一条当场红。
+        """
+        conn = self.stuck_conn()
+        conn.send(build_game(0x0200, build_rep_list_session()))
+        self.queued_behind_the_first(conn, [
+            lambda: conn.send(build_game(0x0201, build_rep_create_session(1))),
+        ])
+        self.age_the_queue(conn, [0.050])
+        conn.sock.gate.set()
+        self.assertTrue(self.wait_for(lambda: len(conn.sock.writes) == 2))
+        waits = self.waits_of(conn)
+        self.assertEqual(1, len(waits), waits)
+        self.assertGreaterEqual(self.waited_ms(waits[0]), 40)
+        self.assertIn("1 份", waits[0])
+
+    def test_the_send_wait_high_water_mark_is_logged_once_per_record(self):
         """★ 诊断按**刷新纪录**去重（铁律 10：状态翻转，不是次数 / 时间窗）。"""
+        conn = self.closable_conn()
+        conn._note_send_wait(time.monotonic() - 0.050, 2, 120)
+        conn._note_send_wait(time.monotonic() - 0.010, 9, 700)   # 更浅，不打
+        conn._note_send_wait(time.monotonic() - 0.120, 1, 53)    # 更深，打
+        waits = self.waits_of(conn)
+        self.assertEqual(2, len(waits), waits)
+        self.assertGreaterEqual(self.waited_ms(waits[1]), 100)
+
+    def test_the_wait_is_measured_from_the_head_of_the_queue(self):
+        """★★ 接线：量的是**队首**那份的入队时刻 —— FIFO ⇒ 它躺得最久。
+
+        队首挪早 200 ms、后面那份只挪早 20 ms：报出来的必须是 200 那个。
+
+        变异验证：改成拿 `time.monotonic()` 当入队时刻、或者取并走的最后
+        一份，这一条都当场红。
+        """
         conn = self.stuck_conn()
         conn.send(build_game(0x0200, build_rep_list_session()))
         self.queued_behind_the_first(conn, [
             lambda: conn.send(build_game(0x0201, build_rep_create_session(1))),
             lambda: conn.send(build_game(0x0200, build_rep_list_session())),
         ])
+        self.age_the_queue(conn, [0.200, 0.020])
         conn.sock.gate.set()
         self.assertTrue(self.wait_for(lambda: len(conn.sock.writes) == 2))
-        burst = [line for line in conn.logged if "发送队列积压新高" in line]
-        self.assertEqual(1, len(burst), burst)
-        self.assertIn("并走 2 份", burst[0])
+        waits = self.waits_of(conn)
+        self.assertEqual(1, len(waits), waits)
+        self.assertGreaterEqual(self.waited_ms(waits[0]), 150)   # 队尾那份是 20
+        self.assertIn("2 份", waits[0])     # 份数还在，只是降级成旁证
 
 
 if __name__ == "__main__":
