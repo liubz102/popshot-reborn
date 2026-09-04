@@ -13,7 +13,8 @@ if exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules\NetTCPIP" chcp 65
 rem ==========================================================================
 rem  PopShot dedicated server - start (normal, slim logging).
 rem
-rem  Listens on 47611 auth / 27799 game / 27798 relay / 27810 register page.
+rem  Listens on 47611 auth / 27799 game / 27810 register page.
+rem  The legacy rcp relay (27798) is OFF here (app.py --no-tcp-relay).
 rem  The debug control channel is OFF here (app.py --no-control).
 rem  Use start-debug.bat only while troubleshooting: it dumps every packet.
 rem

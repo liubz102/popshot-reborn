@@ -231,9 +231,12 @@ if [ -n "$pid" ]; then
 fi
 
 # 启动前把每一个要绑的端口都查一遍（TCP + UDP），有一个被占着就不启动。
+# ★ 关掉原版 rcp 中继服，降低复杂度，提升稳定性：27798 不再监听，
+#   所以启停、占用检查的端口表里都没有它。
 # ★ UDP 那条（位置数据）被占时不会有任何报错 —— 服务端照样起来、玩家照样
 #   能玩，只是位置数据全部投进黑洞。所以宁可现在就硬失败。
-for p in "$AUTH_PORT" "$GAME_PORT" "$RELAY_PORT" "$WEB_PORT"; do
+# for p in "$AUTH_PORT" "$GAME_PORT" "$RELAY_PORT" "$WEB_PORT"; do
+for p in "$AUTH_PORT" "$GAME_PORT" "$WEB_PORT"; do
     if port_open "$p"; then
         echo "!! 端口 TCP $p 被占用，服务端无法启动。"
         echo "   如果是上一次启动的服务端，先 sh stop.sh 再来；"
@@ -250,12 +253,16 @@ fi
 
 # ★ --no-control：调试控制通道（27800）在服务端包里默认关闭。
 #   它能直接往任意连接推包，只该在开发机上开。
+# ★ --no-tcp-relay：关掉原版 rcp 中继服，降低复杂度、提升稳定性 —— 和
+#   客户端包 tools/launch.ps1 同一个决定。$RELAY_PORT 不再监听、不回
+#   0x0210，玩家间同步整场走 0x040e/0x040f 回退路径。启动日志应出现
+#   「中继服   已关闭（--no-tcp-relay）」。
 rotate_log "$LOGDIR/server.out"
 rotate_log "$LOGDIR/server.err"
 if [ "$VERBOSE" = "--verbose" ]; then
-    nohup "$PY" "$APP" --no-control --verbose >"$LOGDIR/server.out" 2>"$LOGDIR/server.err" &
+    nohup "$PY" "$APP" --no-control --no-tcp-relay --verbose >"$LOGDIR/server.out" 2>"$LOGDIR/server.err" &
 else
-    nohup "$PY" "$APP" --no-control >"$LOGDIR/server.out" 2>"$LOGDIR/server.err" &
+    nohup "$PY" "$APP" --no-control --no-tcp-relay >"$LOGDIR/server.out" 2>"$LOGDIR/server.err" &
 fi
 NEWPID=$!
 echo "$NEWPID" > "$PIDFILE"
@@ -267,10 +274,10 @@ while [ "$i" -lt 30 ]; do
         break
     fi
     up=0
-    for p in "$AUTH_PORT" "$GAME_PORT" "$RELAY_PORT" "$WEB_PORT"; do
+    for p in "$AUTH_PORT" "$GAME_PORT" "$WEB_PORT"; do
         port_open "$p" && up=$((up + 1))
     done
-    if [ "$up" -eq 4 ]; then ok=1; break; fi
+    if [ "$up" -eq 3 ]; then ok=1; break; fi
     sleep 1
     i=$((i + 1))
 done
@@ -288,7 +295,7 @@ echo ""
 echo "  监听端口"
 echo "    $AUTH_PORT   认证服（客户端写死，不可改）"
 echo "    $GAME_PORT   游戏服（客户端写死，不可改）"
-echo "    $RELAY_PORT   战斗同步中继"
+echo "    $RELAY_PORT   战斗同步中继 —— 已关闭（--no-tcp-relay），玩家间同步走游戏服回退路径"
 echo "    $GAME_PORT   位置同步（UDP）——【和游戏服同号，但要单独放行一条 UDP 规则】"
 echo "    $WEB_PORT   用户注册页  ->  http://127.0.0.1:$WEB_PORT/"
 echo ""
@@ -304,9 +311,9 @@ else
 fi
 echo ""
 echo "  ★ 云主机还要在【安全组/防火墙】里放行这些端口，只在系统里开是不够的："
-echo "      ufw:       sudo ufw allow $AUTH_PORT,$GAME_PORT,$RELAY_PORT,$WEB_PORT/tcp"
+echo "      ufw:       sudo ufw allow $AUTH_PORT,$GAME_PORT,$WEB_PORT/tcp"
 echo "                 sudo ufw allow $GAME_PORT/udp"
-echo "      firewalld: sudo firewall-cmd --add-port=$AUTH_PORT/tcp --add-port=$GAME_PORT/tcp --add-port=$RELAY_PORT/tcp --add-port=$WEB_PORT/tcp --add-port=$GAME_PORT/udp --permanent && sudo firewall-cmd --reload"
+echo "      firewalld: sudo firewall-cmd --add-port=$AUTH_PORT/tcp --add-port=$GAME_PORT/tcp --add-port=$WEB_PORT/tcp --add-port=$GAME_PORT/udp --permanent && sudo firewall-cmd --reload"
 echo ""
 echo "    ⚠ 那条 UDP $GAME_PORT 别漏：位置数据走它，漏了不会报任何错"
 echo "      只是自动退回 TCP，等于这个功能没开。"

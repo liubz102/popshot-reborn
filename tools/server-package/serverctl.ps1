@@ -87,7 +87,10 @@ function Get-WebPort {
 }
 
 $WebPort = Get-WebPort
-$Ports = @($AuthPort, $GamePort, $RelayPort, $WebPort)
+# ★ 关掉原版 rcp 中继服，降低复杂度，提升稳定性：27798 不再监听，
+#   所以启停、占用检查的端口表里都没有它。
+#$Ports = @($AuthPort, $GamePort, $RelayPort, $WebPort)
+$Ports = @($AuthPort, $GamePort, $WebPort)
 
 # ★ 启动前要确认「全部空着」的端口。和上面 $Ports 的区别有两点：
 #   1. 多一条 **UDP** —— 位置数据走的是 UDP 27799（和游戏服 TCP 同号，
@@ -98,7 +101,7 @@ $PortSpecs = @(
     @{ Port = $AuthPort;  Proto = 'TCP'; Label = '认证服' },
     @{ Port = $GamePort;  Proto = 'TCP'; Label = '游戏服' },
     @{ Port = $GamePort;  Proto = 'UDP'; Label = '位置同步' },
-    @{ Port = $RelayPort; Proto = 'TCP'; Label = '战斗同步中继' },
+#    @{ Port = $RelayPort; Proto = 'TCP'; Label = '战斗同步中继' },
     @{ Port = $WebPort;   Proto = 'TCP'; Label = '注册页' }
 )
 
@@ -214,7 +217,11 @@ if ($busy.Count -gt 0) {
 
 # ★ --no-control：调试控制通道（27800）在服务端包里默认关闭。
 #   它能直接往任意连接推包，只该在开发机上开。
-$appArgs = @("`"$AppPy`"", '--no-control')
+# ★ --no-tcp-relay：关掉原版 rcp 中继服，降低复杂度、提升稳定性 —— 和
+#   客户端包 tools\launch.ps1 同一个决定。27798 不再监听、不回 0x0210，
+#   玩家间同步整场走 0x040e/0x040f 回退路径。启动日志应出现
+#   「中继服   已关闭（--no-tcp-relay）」。
+$appArgs = @("`"$AppPy`"", '--no-control', '--no-tcp-relay')
 if ($DebugLog) { $appArgs += '--verbose' }
 
 # ★ 上一次那份先归档，别覆盖（同一天多次重启也留得住）。见 Move-LogAside。
@@ -245,7 +252,7 @@ Say ''
 Say '  监听端口' 'Cyan'
 Say "    $AuthPort   认证服（客户端写死，不可改）"
 Say "    $GamePort   游戏服（客户端写死，不可改）"
-Say "    $RelayPort   战斗同步中继"
+Say "    $RelayPort   战斗同步中继 —— 已关闭（--no-tcp-relay），玩家间同步走游戏服回退路径"
 Say "    $GamePort   位置同步（UDP，和游戏服同号但要单独放行）"
 Say "    $WebPort   用户注册页  ->  http://127.0.0.1:$WebPort/"
 Say ''
@@ -264,7 +271,7 @@ if ($addrs.Count -gt 0) {
 Say ''
 Say '  ★ 第一次启动时 Windows 防火墙会弹窗，必须点「允许访问」，' 'Yellow'
 Say '    否则别的电脑连不进来。已经点过「取消」的话，用管理员权限执行：' 'Yellow'
-Say "      netsh advfirewall firewall add rule name=PopShot dir=in action=allow protocol=TCP localport=$AuthPort,$GamePort,$RelayPort,$WebPort" 'Yellow'
+    Say "      netsh advfirewall firewall add rule name=PopShot dir=in action=allow protocol=TCP localport=$AuthPort,$GamePort,$WebPort" 'Yellow'
 Say "      netsh advfirewall firewall add rule name=PopShot-UDP dir=in action=allow protocol=UDP localport=$GamePort" 'Yellow'
 Say '' 'Yellow'
 Say "    ⚠ 上面第二条（UDP $GamePort）别漏：位置数据走它，漏了不会报任何错" 'Yellow'
