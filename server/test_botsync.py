@@ -939,6 +939,20 @@ class BotFrameRoom(BotBattleRoom):
             return 0
         return loop.advance(ticks)
 
+    def advance_to_own_beat(self, seat=None):
+        """推到**这个座位**刚发完心跳的那一格。
+
+        ★ 心跳相位是**按座位错开**的（V0.3 §183），所以「刚发完」这件事
+          每个座位各是各的 —— 用例要对相位就得对自己那一个。
+        """
+        seat = self.bot_seat if seat is None else seat
+        for _ in range(gameserver.HEARTBEAT_TICKS):
+            self.advance(1)
+            if ((self.loop().done - 1 + seat) % gameserver.HEARTBEAT_TICKS
+                    == gameserver.HEARTBEAT_TICKS - 1):
+                return
+        raise AssertionError("推了一整个心跳窗都没对上相位")
+
     def beat(self, conn, x, y, on_ground=True, velocity=(0, 0),
              fast_run=False):
         seat = self.room.seat_index_of(conn)
@@ -3957,6 +3971,9 @@ class BotOwnMovementTests(TerrainMixin, BotFireRoom):
         self.install_terrain(synth_terrain("flat"))
         self.place_bot(200.0)
         self.beats(3, 1300.0)
+        # ★ 心跳相位按座位错开（§183）—— 推到本座位刚发完那一格再比，
+        #   否则最后那一发是 1~3 格之前的位置（那也是对的，只是没法逐字比）。
+        self.advance_to_own_beat()
         frames = [f for f in bot_frames(self.alice, self.bot_seat)
                   if udpsync.is_heartbeat(f)]
         self.assertTrue(frames)
@@ -9698,6 +9715,87 @@ class BotQuestSplashTests(BotQuestCombatTests):
         self.assertNotIn(handle, targets, "任务模式的火墙烧不到队友")
 
 
+class LandingIsAlwaysReportedTests(TerrainMixin, BotFrameRoom):
+    """★★★★★ **落地那一格必须报出去**（V0.3 §182）。
+
+    收方对远端角色只有**一个**精确归位的机会：`0x504215` 的
+    「上一发腾空 + 这一发踩地 ⇒ 硬置坐标」（§35），其余一律 0.6/0.4 插值。
+    心跳踩的是 4 格一发的固定网格，而 bot **落地的下一格就能起跳** ——
+    那次落地整个落在两发心跳之间，收方一次都没看见。
+
+    实机 2026-09-04 23:26:45 一行不差：
+
+        84405.522  (2, 1094) v=(0, 38)   ← 沿图左边界高速下坠
+        84405.586  rpJump 座位3 第1段     ← 落地了，同一窗口里又起跳
+        84405.649  (23, 1062) v=(7, -16) ← 又腾空，「落地」一发没报
+
+    同一局同一把尺子（从地上起跳里「落地从没进过心跳」的比例）：
+    **真人 0/27 = 0.0%**，bot **8.7% ~ 61.1%**，收方那一刻中位差 **63 像素**。
+    """
+
+    def beats_of(self):
+        return [f for f in bot_frames(self.alice, self.bot_seat)
+                if udpsync.is_heartbeat(f)]
+
+    def ground_flags(self):
+        out = []
+        for frame in self.beats_of():
+            field = struct.unpack_from("<i", body_of(frame), 7 + 12)[0]
+            out.append(bool(field & botsync.HEARTBEAT_BIT_ONGROUND))
+        return out
+
+    def drop_onto_the_floor(self, phase):
+        """把人摆到「再走一格就落地」的空中，落地那一格的 tick 相位是 `phase`。"""
+        while (self.loop().done % gameserver.HEARTBEAT_TICKS) != phase:
+            self.advance(1)
+        self.bot_conn.body = botmove.Body(400.0, 140.0, 0.0, 24.0,
+                                          on_ground=False)
+        self.bot_conn.on_ground = False
+        self.bot_conn.intent = (0, False, False, False)
+        before = len(self.beats_of())
+        self.advance(1)
+        return before
+
+    def test_a_landing_between_beats_still_gets_a_beat(self):
+        """★★★★★ 落地落在两发心跳中间时，**当场补一发**。"""
+        self.install_terrain(synth_terrain("land_beat"))
+        self.place_bot(400.0)
+        self.beats(1, 900.0)
+        # 相位 0/1/2 都不是心跳格（心跳落在 HEARTBEAT_TICKS - 1 那一格）
+        before = self.drop_onto_the_floor(0)
+        self.assertTrue(self.bot_conn.body.on_ground, "这一格该落地（前提）")
+        self.assertEqual(before + 1, len(self.beats_of()),
+                         "落地那一格没补心跳，收方就拿不到那次硬置")
+        field = struct.unpack_from("<i", body_of(self.beats_of()[-1]),
+                                   7 + 12)[0]
+        self.assertTrue(field & botsync.HEARTBEAT_BIT_ONGROUND,
+                        "补的这一发要说「我踩在地上」")
+
+    def test_every_landing_phase_is_reported(self):
+        """★★★★ 四个 tick 相位上各落一次地，**每一次**都得进心跳流。"""
+        self.install_terrain(synth_terrain("land_phase"))
+        self.place_bot(400.0)
+        self.beats(1, 900.0)
+        for phase in range(gameserver.HEARTBEAT_TICKS):
+            mark = self.drop_onto_the_floor(phase)
+            self.assertTrue(self.bot_conn.body.on_ground,
+                            "相位 %d：这一格该落地（前提）" % phase)
+            self.assertIn(True, self.ground_flags()[mark:],
+                          "相位 %d 的那次落地一发心跳都没报" % phase)
+            self.advance(gameserver.HEARTBEAT_TICKS)
+
+    def test_no_extra_beat_when_it_never_left_the_ground(self):
+        """★ 误伤面：一直站在地上的 bot 不许多发心跳（节拍还是 4 格一发）。"""
+        self.install_terrain(synth_terrain("land_none"))
+        self.place_bot(400.0)
+        self.bot_conn.intent = (0, False, False, False)
+        self.beats(1, 900.0)
+        before = len(self.beats_of())
+        self.advance(gameserver.HEARTBEAT_TICKS * 5)
+        self.assertEqual(5, len(self.beats_of()) - before,
+                         "站着不动的这 20 格该正好 5 发心跳")
+
+
 class AirborneSpeedIsReproducibleTests(unittest.TestCase):
     """★★★★★ 腾空时报出去的速度，收方**必须能照着复现**（V0.3 §181）。
 
@@ -10747,10 +10845,46 @@ class HeartbeatCadenceTests(BotFrameRoom):
 
     def test_three_ticks_are_not_enough_for_a_second_one(self):
         self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+        self.advance_to_own_beat()          # ★ 相位按座位错开（§183）
         self.clear()
         self.advance(gameserver.HEARTBEAT_TICKS - 1)
         self.assertEqual([], self.beats_only())
 
+    def test_the_beat_phase_follows_the_seat(self):
+        """★★★★ **心跳相位按座位错开**（V0.3 §183）：一格里不再挤好几发。
+
+        以前所有 bot 全踩 `tick % 4 == 3`，**一格正常就产十来份包**
+        （每个 bot 一发心跳 + 那一格的事件包 + 真人转发），发送线程醒一次
+        并成一次写 —— `★发送队列积压新高` 因此分不出「正常一格」和
+        「被饿住」（实机那一局：任意 32 ms 格里最多 12 份，而告警报的
+        新高也正是 12）。错开之后正常一格只剩 1~2 发心跳。
+
+        ★ 每个 bot 自己的节奏一点没变：还是 4 格一发 = 128 ms。
+        ⚠ 这**不是**在治卡顿：并走要看得见，得让**同一个角色的两发心跳**
+          落进客户端的同一帧（收方每帧 recv 一次、把包全分发完，每发心跳
+          做一次 0.6/0.4 收敛，§120 + `0x504215`），那需要队里压 84 ms
+          以上，而实测端到端最大 38 ms。见 §183。
+        """
+        self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+        self.clear()
+        seat = self.bot_seat
+        ticks = []
+        for _ in range(gameserver.HEARTBEAT_TICKS * 4):
+            seen = len(self.beats_only())
+            self.advance(1)
+            if len(self.beats_only()) > seen:
+                ticks.append(self.loop().done - 1)
+        self.assertEqual(4, len(ticks), "节奏该没变：16 格里 4 发")
+        for tick in ticks:
+            self.assertEqual(
+                gameserver.HEARTBEAT_TICKS - 1,
+                (tick + seat) % gameserver.HEARTBEAT_TICKS,
+                "座位%d 的心跳该落在 (tick + 座位) %% 4 == 3 那一格，"
+                "实际 tick=%d" % (seat, tick))
+        self.assertNotEqual(
+            [gameserver.HEARTBEAT_TICKS - 1] * len(ticks),
+            [t % gameserver.HEARTBEAT_TICKS for t in ticks],
+            "座位 %d 的相位没被错开（还踩着老的 tick %% 4 == 3）" % seat)
 
 class CatchUpHeartbeatTests(BotFrameRoom):
     """★★★★★ 追赶时**不刷位置心跳**（V0.3 §153 / D115）。
@@ -10784,7 +10918,7 @@ class CatchUpHeartbeatTests(BotFrameRoom):
     def test_a_burst_that_swallowed_no_beat_owes_nothing(self):
         """★ 追赶只跨了一两格、没吞掉任何一发时，不该凭空多补一发。"""
         self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
-        self.advance(gameserver.HEARTBEAT_TICKS)   # 相位对齐到刚发完
+        self.advance_to_own_beat()          # ★ 相位按座位错开（§183）
         self.clear()
         self.loop().advance(2, burst=True)
         self.assertEqual([], self.beats_only())
