@@ -504,12 +504,23 @@ OP_REQ_SHOP_ENTER = 0x0700
 OP_REQ_ITEM_BUY = 0x0602
 #: ❓（单 `i32`，发送点 `0x4466d2`）。`0x0503` 的处理器只读一个 bool 然后弹提示框。
 OP_REQ_SHOP_UNKNOWN_0603 = 0x0603
-#: **装备 / 卸下**（`i32, i32`，发送点 `0x446f5b`）。
-#: ★ 它只落到 `[ShopStage+0x134/0x138]`（商店界面自己的显示），
-#:   **让加成生效的是 `0x030b`** —— 处理完还要重发那一发（§23）。
-OP_REQ_EQUIP_ITEM = 0x0604
+#: **修理**（`i32 itemId, i32 210003`，发送点 `0x446f5b`）。
+#: ⚠ §4 里那句「`0x0604` 上行 = 装备 / 卸下」**是错的** —— 唯一调用点
+#: `0x45087d` 写死第二个参数 `210003`（스패너 扳手），来自「要修理吗」确认框。
+#: 真正的穿脱是 `0x0702` / `0x0703`（§24）。本版不做修理。
+OP_REQ_REPAIR_ITEM = 0x0604
 #: **合成**（单 `i32`，发送点 `0x44765c`），期望应答 `0x0506 gspRepComposeItem`。
 OP_REQ_COMPOSE_ITEM = 0x0606
+#: ★★ **穿上**（单 `i32` itemId，组包 `0x559464`）。
+#: ★★ **脱下**（单 `i32` itemId，组包 `0x55949e`）。
+#:
+#: 两发**都回 `0x0604 gspRepEquippedList`**，没有专用应答。
+#: ⚠⚠ **每一发都必须回，一发不落**：客户端换装时先把冲突的旧装备逐件
+#:    发 `0x0703`（每发一件 `inc [ShopStage+0x13c]`），最后发一发 `0x0702`；
+#:    `0x0604` 的处理器拿那个计数器决定「这一发只是减一，还是真的刷新界面」
+#:    （`0x4473e0`）。少回一发 = 界面永远不刷新（玩家看到「点了没反应」）。
+OP_REQ_EQUIP_ITEM = 0x0702
+OP_REQ_UNEQUIP_ITEM = 0x0703
 
 # -- 服务端 -> 客户端 -------------------------------------------------------
 #: 货架目录。三层嵌套，组包在 `shop.build_rep_shop_item_list`（§21）。
@@ -519,6 +530,8 @@ OP_REP_SHOP_ITEM_LIST = 0x0500
 OP_REP_EQUIPPED_LIST = 0x0604
 #: 礼物清单。本版恒发空清单。
 OP_REP_GIFT_LIST = 0x0508
+#: 购买结果（`int32 bool ok + i32 + i32`）。⚠ `ok=0` 时客户端**什么都不显示**。
+OP_REP_ITEM_BUY = 0x0502
 
 #: 进商店那五发，按客户端实际的发送顺序排。日志里按这个顺序对号。
 SHOP_ENTRY_OPCODES = (OP_REQ_SHOP_ITEM_LIST, OP_REQ_EQUIPPED_LIST,
@@ -526,9 +539,11 @@ SHOP_ENTRY_OPCODES = (OP_REQ_SHOP_ITEM_LIST, OP_REQ_EQUIPPED_LIST,
                       OP_REQ_SHOP_ENTER)
 
 #: 商店段负责的全部上行 opcode。
+#: ★ 新增上行 opcode 记得**这里和 `GCP_NAMES` 两边都加** —— `0x0600` 就是
+#:   因为只加了一边，白白多悬了一轮（§20）。
 SHOP_PROBE_OPCODES = SHOP_ENTRY_OPCODES + (
-    OP_REQ_ITEM_BUY, OP_REQ_SHOP_UNKNOWN_0603, OP_REQ_EQUIP_ITEM,
-    OP_REQ_COMPOSE_ITEM)
+    OP_REQ_ITEM_BUY, OP_REQ_SHOP_UNKNOWN_0603, OP_REQ_REPAIR_ITEM,
+    OP_REQ_COMPOSE_ITEM, OP_REQ_EQUIP_ITEM, OP_REQ_UNEQUIP_ITEM)
 
 #: 每个号「逆出来的形状」和「期望应答」，只用来给日志配一句人话。
 #: ★ 括号里的可信度标记就是 `re/packet_api.md` §3.8 里那一份，别在这儿升级它。
@@ -539,9 +554,11 @@ SHOP_PROBE_NOTES = {
     OP_REQ_GIFT_LIST: ("无正文 ✅", "0x0508 gspRepGiftList（本版恒空）"),
     OP_REQ_SHOP_ENTER: ("无正文 ✅", "❓未查（不是商店专用）"),
     OP_REQ_ITEM_BUY: ("i32 n, n×i32 🔍", "0x0502 gspRepItemBuy"),
-    OP_REQ_SHOP_UNKNOWN_0603: ("i32 🔍", "❓0x0503 是个 bool + 提示框"),
-    OP_REQ_EQUIP_ITEM: ("i32, i32 🤔", "回显 + 重发 0x030b"),
+    OP_REQ_SHOP_UNKNOWN_0603: ("i32 🔍 卖出", "❓0x0503 是个 bool + 提示框"),
+    OP_REQ_REPAIR_ITEM: ("i32 itemId + i32 210003 🔍 修理", "❓（本版不做修理）"),
     OP_REQ_COMPOSE_ITEM: ("i32 🔍", "0x0506 gspRepComposeItem"),
+    OP_REQ_EQUIP_ITEM: ("i32 itemId 🔍 穿上", "0x0604 gspRepEquippedList"),
+    OP_REQ_UNEQUIP_ITEM: ("i32 itemId 🔍 脱下", "0x0604 gspRepEquippedList"),
 }
 
 #: ★ **哪几发真的回**。M4 第 2 步是「逐个试应答，每加一发实机看一眼」——
@@ -552,6 +569,7 @@ SHOP_REPLY_ENABLED = {
     OP_REP_SHOP_ITEM_LIST: True,
     OP_REP_EQUIPPED_LIST: True,
     OP_REP_GIFT_LIST: True,
+    OP_REP_ITEM_BUY: True,
 }
 
 #: 货架包里那三个未查明字段要不要填探针值（控制通道的 `shelf-probe`）。
@@ -645,12 +663,14 @@ GCP_NAMES = {
     0x0600: "gcpReqShopItemList",      # ❓ 无 RTTI 类名，裸序列化（0x5592da）
     0x0602: "gcpReqItemBuy",
     0x0603: "rawShopReq0603",          # ❓ 无 RTTI 类名，裸序列化（0x4466d2）
-    0x0604: "rawEquipItem",            # ❓ 同上（0x446f5b，ret 8）
+    0x0604: "rawRepairItem",           # 修理，itemId + 210003 扳手（0x446f5b）
     0x0605: "gcpReqCompositionList",
     0x0606: "gcpReqComposeItem",
     0x0607: "gcpReqGiftList",
     0x0609: "gcpReqGiftAction",
     0x0700: "rawShopEnter0700",        # ❓ 无正文（0x5541c1）
+    0x0702: "rawEquipItem",            # 穿上，单 i32（0x559464，§24）
+    0x0703: "rawUnequipItem",          # 脱下，单 i32（0x55949e，§24）
     0x0704: "rawReqEquippedList",      # 无正文（0x44722b）
     0x0705: "gcpReqMyInfo",
     0x0800: "gcpReqMoveChannel",
@@ -9688,6 +9708,10 @@ class Conn:
             self.send_rep_equipped_list(reason="（进商店）")
         elif opcode == OP_REQ_GIFT_LIST:
             self.send_rep_gift_list()
+        elif opcode == OP_REQ_ITEM_BUY:
+            self.on_req_item_buy(payload)
+        elif opcode in (OP_REQ_EQUIP_ITEM, OP_REQ_UNEQUIP_ITEM):
+            self.on_req_equip_item(opcode, payload)
 
     def shop_reply_off(self, opcode, what):
         """这一发被 `shop-reply` 关掉了吗。关掉时记一行，免得日志里像是漏发。"""
@@ -9742,6 +9766,123 @@ class Conn:
                  f"（穿着 {equipped_items(self.account)}）{reason}")
         self.send(build_game(OP_REP_EQUIPPED_LIST,
                              shop.build_rep_equipped_list(owned)))
+
+    def on_req_item_buy(self, payload):
+        """客户端方向的 `0x0602` —— 购物车结账，回 `0x0502`（V0.3商店 §24）。
+
+        **顺序是「全部校验 → 一次扣钱 → 逐件入库」**：
+
+        * 一次扣钱 —— `spend_money()` 把「查余额」和「扣」放在同一把锁里，
+          拆成两步的话两笔购买挤在一起会双双看到余额够（account_store 的自述）；
+        * 校验在扣钱之前全做完 —— `add_item()` 对客户端不认识的 id 会抛，
+          扣完钱再抛就成了「钱没了东西没有」，那是最难查的一种账。
+
+        ★ 价格只信 `shop.json`，包里只有 itemId（PLAN M5）。
+        ⚠ 失败时客户端**什么都不显示**（`0x44643d` 只析构弹窗）⇒ 原因只能
+        进日志。所以这里每一条拒绝都写清是哪件、为什么。
+        """
+        if self.shop_reply_off(OP_REP_ITEM_BUY, "购买结果"):
+            return
+        try:
+            wanted = shop.parse_item_buy_request(payload)
+        except ValueError as error:
+            self.log(f"   ✗ 购买请求解不开: {error}")
+            return
+        probe = shop.SHELF_PROBE if SHELF_PROBE_ON else (0, "", 0)
+
+        def refuse(reason):
+            self.log(f"← 回 0x0502 购买失败（{reason}）"
+                     f"  ⚠ 客户端在失败路径上不显示任何提示，玩家只会觉得没反应")
+            self.send(build_game(OP_REP_ITEM_BUY,
+                                 shop.build_rep_item_buy(False)))
+
+        if not wanted:
+            return refuse("购物车是空的")
+        if self.accounts is None:
+            return refuse("没有存档层，扣不了款")
+        table, warnings = shopcfg.shop()
+        for warning in warnings:
+            self.log(f"   ⚠ shop.json: {warning}")
+        level = player_level(self.account)
+        character = player_character(self.account)
+        owned = set(owned_item_ids(self.account))
+        total = 0
+        picked = []
+        for item_id in wanted:
+            entry, why = shop.check_purchase(item_id, table, level, character,
+                                             owned)
+            if why is not None:
+                return refuse(f"{_item_label(item_id)}: {why}")
+            total += entry["price"]
+            owned.add(int(item_id))       # 同一车里买两件一样的也算重复持有
+            picked.append(entry)
+        try:
+            self.account = self.accounts.spend_money(self.account_name, total)
+        except AccountError as error:
+            return refuse(f"扣款失败: {error.message}")
+        bought = []
+        for entry in picked:
+            try:
+                self.account = self.accounts.add_item(self.account_name,
+                                                      entry["id"])
+            except AccountError as error:
+                # 校验已经过了还失败 = 存档层和 shop.json 对不上。钱已经扣了，
+                # 这行必须显眼 —— 它是唯一能把账找回来的线索。
+                self.log(f"   !! 已扣款但入库失败: {entry['id']} {error.message}")
+                continue
+            bought.append(entry)
+        self.log(f"← 回 0x0502 购买成功 {[e['id'] for e in bought]}"
+                 f" 共 {total} 金币，余额 {player_money(self.account)}")
+        self.send(build_game(OP_REP_ITEM_BUY,
+                             shop.build_rep_item_buy(True, probe[0], probe[2])))
+        # 右上角数据栏和仓库都得跟上，不然玩家要退出商店再进来才看得到。
+        self.send_rep_money(reason="（买完刷新）")
+        self.send_rep_equipped_list(reason="（买完刷新）")
+
+    def on_req_equip_item(self, opcode, payload):
+        """客户端方向的 `0x0702`（穿上）/ `0x0703`（脱下）—— 都回 `0x0604`（§24）。
+
+        ⚠⚠ **每一发都必须回，一发不落。** 换一件抢两个槽的装备时客户端会先
+        逐件发 `0x0703` 再发一发 `0x0702`，并用 `[ShopStage+0x13c]` 数着；
+        `0x0604` 的处理器靠那个计数器决定「这一发只减一，还是真的刷新界面」。
+        少回一发 ⇒ 计数器停在正数 ⇒ **仓库界面永远不刷新**。
+        ⇒ 所以下面**失败也要回一发** `0x0604`（把当前状态原样发回去）。
+
+        ★ 战斗加成的唯一来源仍然是 `0x030b`（§1 / §16）—— 存档改完顺手重发。
+        商店界面里那一发会被客户端的 stage 分发器丢掉（`0x030b` 只有大厅
+        分发器认），但玩家回房间时 `send_slot_equipped_list` 还会再发一次，
+        所以这里发不发都不影响正确性；发是为了「人在房间里改装备」也即时生效。
+        """
+        what = "穿上" if opcode == OP_REQ_EQUIP_ITEM else "脱下"
+        try:
+            item_id = shop.parse_equip_request(payload)
+        except ValueError as error:
+            self.log(f"   ✗ {what}请求解不开: {error}")
+            # ★ 解不开也要回 —— 客户端那个计数器不认「服务端没听懂」。
+            self.send_rep_equipped_list(reason=f"（{what}请求坏了，原样回）")
+            return
+        if self.accounts is None:
+            # 没有存档层（测试 / 未登录）。★ 还是要回一发 —— 那个计数器
+            #   不认「服务端这会儿没法办」。
+            self.log(f"   ✗ {what} {item_id}：没有存档层，只把当前状态回过去")
+            self.send_rep_equipped_list(reason=f"（{what}，无存档层）")
+            return
+        try:
+            if opcode == OP_REQ_EQUIP_ITEM:
+                self.account, dropped = self.accounts.equip_item(
+                    self.account_name, item_id)
+            else:
+                self.account, dropped = self.accounts.unequip_item(
+                    self.account_name, item_id)
+        except AccountError as error:
+            self.log(f"   ✗ {what} {_item_label(item_id)} 失败: {error.message}")
+            self.send_rep_equipped_list(reason=f"（{what}失败，原样回）")
+            return
+        tail = f"；顶掉 {dropped}" if dropped else ""
+        self.log(f"   {what} {_item_label(item_id)}；现在穿着 "
+                 f"{equipped_items(self.account)}{tail}")
+        self.send_rep_equipped_list(reason=f"（{what}）")
+        self.send_slot_equipped_list(reason=f"（{what}）")
 
     def send_rep_gift_list(self):
         """回 `0x0508 gspRepGiftList` 空清单。
@@ -10158,7 +10299,9 @@ def _dispatch_control_command(line):
                 % ("开：" + repr(shop.SHELF_PROBE) if SHELF_PROBE_ON else "关"))
 
     if cmd == "shelf":
-        category = int(words[1], 16) if len(words) > 1 else 0
+        # ★ 不带参数 = 全部，用 `CATEGORY_ALL` 哨兵；**别用 0** ——
+        #   分类 0 是「人物 → 英雄」标签的真 id（§22）。
+        category = int(words[1], 16) if len(words) > 1 else shop.CATEGORY_ALL
         page = int(words[2], 0) if len(words) > 2 else 0
         character = int(words[3], 0) if len(words) > 3 else shop.CHARACTER_ANY
         body, shown, warnings = shop.shelf_page(

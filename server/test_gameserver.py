@@ -2988,47 +2988,76 @@ class ShopProbeTests(unittest.TestCase):
     def opcodes_of(conn):
         return [take_frame(bytearray(frame))[1] for frame in conn.sent]
 
-    def test_only_three_of_the_uplink_packets_get_an_answer(self):
+    def test_only_the_mapped_uplink_packets_get_an_answer(self):
         # ★★ 这条一旦红了，说明有人给这段加了 / 减了应答。改之前先想清楚
         #    「多回一发会不会把界面弄崩」—— 下行仍然是 🔍静态（§21 / §23）。
         answered = {}
         for opcode in gameserver.SHOP_PROBE_OPCODES:
             conn = self.make_conn()
-            payload = (shop.build_shop_list_request()
-                       if opcode in (gameserver.OP_REQ_SHOP_ITEM_LIST,
-                                     gameserver.OP_REQ_COMPOSITION_LIST)
-                       else b"")
+            if opcode in (gameserver.OP_REQ_SHOP_ITEM_LIST,
+                          gameserver.OP_REQ_COMPOSITION_LIST):
+                payload = shop.build_shop_list_request()
+            elif opcode in (gameserver.OP_REQ_EQUIP_ITEM,
+                            gameserver.OP_REQ_UNEQUIP_ITEM):
+                payload = struct.pack("<i", 1120041)
+            elif opcode == gameserver.OP_REQ_ITEM_BUY:
+                payload = struct.pack("<i", 0)     # 空购物车
+            else:
+                payload = b""
             gameserver.Conn.on_game_packet(conn, opcode, payload)
             answered[opcode] = self.opcodes_of(conn)
         self.assertEqual(
             {gameserver.OP_REQ_SHOP_ITEM_LIST: [gameserver.OP_REP_SHOP_ITEM_LIST],
              gameserver.OP_REQ_EQUIPPED_LIST: [gameserver.OP_REP_EQUIPPED_LIST],
              gameserver.OP_REQ_GIFT_LIST: [gameserver.OP_REP_GIFT_LIST],
+             # ★★ 穿 / 脱都回 `0x0604`，**一发不落**（§24）：客户端拿它当
+             #    计数器，少回一发仓库界面就永远不刷新。
+             gameserver.OP_REQ_EQUIP_ITEM: [gameserver.OP_REP_EQUIPPED_LIST],
+             gameserver.OP_REQ_UNEQUIP_ITEM: [gameserver.OP_REP_EQUIPPED_LIST],
+             # 空购物车 -> 回一发失败的 0x0502。
+             gameserver.OP_REQ_ITEM_BUY: [gameserver.OP_REP_ITEM_BUY],
              # 合成配方清单（`0x0505`）是 M7 的活，现在还不回。
              gameserver.OP_REQ_COMPOSITION_LIST: [],
              # ★ `0x0700` 大厅和房间也发（`0x5541c1` 有 6 个调用点）——
              #   拿它触发货架下发会在大厅里乱发 `0x0500`。
              gameserver.OP_REQ_SHOP_ENTER: [],
-             gameserver.OP_REQ_ITEM_BUY: [],
              gameserver.OP_REQ_SHOP_UNKNOWN_0603: [],
-             gameserver.OP_REQ_EQUIP_ITEM: [],
+             # 修理本版不做（`0x0604` 上行 = 用扳手，不是装备，§24）。
+             gameserver.OP_REQ_REPAIR_ITEM: [],
              gameserver.OP_REQ_COMPOSE_ITEM: []},
             answered)
 
-    def test_the_shelf_reply_carries_the_listed_items(self):
-        with shop_config(items=[{"id": 1120041, "name": "左轮 R1",
-                                 "listed": True, "price": 3000},
-                                {"id": 1120051, "name": "没上架的",
-                                 "listed": False, "price": 999}]):
+    #: 真实的武器槽 1 分类（实机点「武器 → 武器1」发的就是它，§22）。
+    WEAPON_SLOT1 = 0x60001
+
+    def shelf_reply(self, category, items):
+        with shop_config(items=items):
             conn = self.make_conn()
             gameserver.Conn.on_game_packet(
                 conn, gameserver.OP_REQ_SHOP_ITEM_LIST,
-                shop.build_shop_list_request(category=0))
+                shop.build_shop_list_request(category=category))
         opcode, body = take_frame(bytearray(conn.sent[0]))[1:3]
         self.assertEqual(gameserver.OP_REP_SHOP_ITEM_LIST, opcode)
-        pages, page, groups = parse_shop_item_list(body)
+        return parse_shop_item_list(body)
+
+    def test_the_shelf_reply_carries_the_listed_items(self):
+        pages, page, groups = self.shelf_reply(
+            self.WEAPON_SLOT1,
+            [{"id": 1120041, "name": "左轮 R1", "listed": True, "price": 3000},
+             {"id": 1120051, "name": "没上架的", "listed": False, "price": 999}])
         self.assertEqual((1, 0), (pages, page))
         self.assertEqual([[(1120041, "左轮 R1", 3000)]], groups)
+
+    def test_category_zero_is_the_hero_tab_not_a_wildcard(self):
+        """★ 2026-09-05 实机 bug：点「人物 → 英雄」列出了一堆武器。
+
+        客户端在那个标签下发的分类就是 `0`（`logs/server.out` 11:56:57）。
+        当时服务端把它当「全部」⇒ 把整份货架倒了出来。正确行为是空货架。
+        """
+        pages, page, groups = self.shelf_reply(
+            0, [{"id": 1120041, "name": "左轮 R1", "listed": True,
+                 "price": 3000}])
+        self.assertEqual((1, 0, []), (pages, page, groups))
 
     def test_a_malformed_shelf_request_is_dropped_not_guessed(self):
         # 长度不对就是我们把线格式记错了（§19 记错过一次）。宁可不回 ——
@@ -3117,7 +3146,8 @@ class ShopProbeTests(unittest.TestCase):
         mine = tuple(name for name in vars(gameserver)
                      if name.startswith(("OP_REQ_SHOP_", "OP_REQ_ITEM_BUY",
                                          "OP_REQ_EQUIP_ITEM", "OP_REQ_COMPOS",
-                                         "OP_REQ_GIFT_LIST",
+                                         "OP_REQ_GIFT_LIST", "OP_REQ_UNEQUIP_",
+                                         "OP_REQ_REPAIR_ITEM",
                                          "OP_REQ_EQUIPPED_LIST")))
         server_direction = ("OP_REP_MONEY", "OP_REP_EQUIPPED_LIST",
                             "OP_REP_SHOP_ITEM_LIST", "OP_REP_GIFT_LIST")
@@ -3126,6 +3156,199 @@ class ShopProbeTests(unittest.TestCase):
                    and name not in mine and name not in server_direction}
         for opcode in gameserver.SHOP_PROBE_OPCODES:
             self.assertNotIn(opcode, handled, hex(opcode))
+
+
+class ShopBuyAndEquipTests(unittest.TestCase):
+    """`0x0602` 买 / `0x0702` 穿 / `0x0703` 脱（V0.3商店 M5，协议见 §24）。
+
+    ★ 这一组守的是两件**只在真存档上才成立**的事：钱和东西的账要对得上，
+    以及**每一发穿脱都必须回一发 `0x0604`** —— 客户端拿它当计数器。
+    """
+
+    REVOLVER_R1 = 1120041        # 武器槽 1
+    REVOLVER_R2 = 1120042        # 同一个槽的另一把（抢槽）
+    Args = CharacterUnlockTests.Args
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = AccountStore(os.path.join(self.tmp.name, "accounts.json"))
+        self.store.register("tester", "pw")
+        saved = gameserver.eventlog.online
+        gameserver.eventlog.online = lambda _msg: None
+        self.addCleanup(setattr, gameserver.eventlog, "online", saved)
+        self.conn = CharacterUnlockTests.make_conn(self)
+        self.conn.accounts = self.store
+        self.conn.account = self.store.get_account("tester")[1]
+
+    def account(self):
+        return self.store.get_account("tester")[1]
+
+    def give_money(self, amount):
+        # `add_quest_reward` 是唯一的加钱入口（服务端只在结算时给钱）。
+        self.store.add_quest_reward("tester", money=amount)
+        self.conn.account = self.account()
+
+    def send(self, opcode, payload):
+        self.conn.sent[:] = []
+        gameserver.Conn.on_game_packet(self.conn, opcode, payload)
+        return [take_frame(bytearray(f))[1:3] for f in self.conn.sent]
+
+    def buy(self, *item_ids):
+        payload = struct.pack("<i", len(item_ids))
+        payload += b"".join(struct.pack("<i", i) for i in item_ids)
+        return self.send(gameserver.OP_REQ_ITEM_BUY, payload)
+
+    @staticmethod
+    def buy_ok(frames):
+        for opcode, body in frames:
+            if opcode == gameserver.OP_REP_ITEM_BUY:
+                return struct.unpack_from("<i", body, 0)[0]
+        raise AssertionError("没有回 0x0502")
+
+    # -- 买 -----------------------------------------------------------------
+    def test_buying_takes_the_money_and_gives_the_item(self):
+        self.give_money(10000)
+        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+                           "listed": True, "price": 3000}]):
+            frames = self.buy(self.REVOLVER_R1)
+        self.assertEqual(1, self.buy_ok(frames))
+        account = self.account()
+        self.assertEqual(7000, account_store.player_money(account))
+        self.assertTrue(account_store.has_item(account, self.REVOLVER_R1))
+        # 买完要顺手刷右上角数据栏和仓库，否则玩家得退出商店再进来才看得到。
+        self.assertEqual([gameserver.OP_REP_ITEM_BUY, gameserver.OP_REP_MONEY,
+                          gameserver.OP_REP_EQUIPPED_LIST],
+                         [opcode for opcode, _ in frames])
+
+    def test_the_price_comes_from_shop_json_not_from_the_packet(self):
+        # 客户端只发 itemId，价格是我们自己查的 —— 管理页改了价，立刻生效。
+        self.give_money(10000)
+        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+                           "listed": True, "price": 9999}]):
+            self.buy(self.REVOLVER_R1)
+        self.assertEqual(1, account_store.player_money(self.account()))
+
+    def test_not_enough_money_buys_nothing(self):
+        self.give_money(100)
+        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+                           "listed": True, "price": 3000}]):
+            frames = self.buy(self.REVOLVER_R1)
+        self.assertEqual(0, self.buy_ok(frames))
+        account = self.account()
+        self.assertEqual(100, account_store.player_money(account))
+        self.assertFalse(account_store.has_item(account, self.REVOLVER_R1))
+
+    def test_a_whole_cart_is_all_or_nothing(self):
+        """★ 一车里有一件买不了，整车都不买 —— 校验全做完才扣钱。
+
+        反过来（扣完钱再发现有一件发不出去）就是「钱扣了东西没有」，
+        那是商店最难查的一种账（D12 的同一条道理）。
+        """
+        self.give_money(10000)
+        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+                           "listed": True, "price": 3000},
+                          {"id": self.REVOLVER_R2, "name": "没上架的",
+                           "listed": False, "price": 3000}]):
+            frames = self.buy(self.REVOLVER_R1, self.REVOLVER_R2)
+        self.assertEqual(0, self.buy_ok(frames))
+        account = self.account()
+        self.assertEqual(10000, account_store.player_money(account))
+        self.assertFalse(account_store.has_item(account, self.REVOLVER_R1))
+
+    def test_buying_the_same_equipment_twice_is_refused(self):
+        # 原版规则（失败文案 `이미 소지하고 있습니다`，§7）。
+        self.give_money(10000)
+        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+                           "listed": True, "price": 3000}]):
+            self.buy(self.REVOLVER_R1)
+            frames = self.buy(self.REVOLVER_R1)
+        self.assertEqual(0, self.buy_ok(frames))
+        self.assertEqual(7000, account_store.player_money(self.account()))
+
+    def test_a_level_gate_is_enforced_server_side(self):
+        self.give_money(10000)
+        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+                           "listed": True, "price": 3000, "level": 50}]):
+            frames = self.buy(self.REVOLVER_R1)
+        self.assertEqual(0, self.buy_ok(frames))
+
+    def test_an_empty_cart_still_gets_an_answer(self):
+        # 不回的话客户端那个「购买结果」弹窗会一直挂着。
+        frames = self.buy()
+        self.assertEqual(0, self.buy_ok(frames))
+
+    # -- 穿 / 脱 ------------------------------------------------------------
+    def own(self, *item_ids):
+        for item_id in item_ids:
+            self.store.add_item("tester", item_id)
+        self.conn.account = self.account()
+
+    def equip(self, item_id):
+        return self.send(gameserver.OP_REQ_EQUIP_ITEM,
+                         struct.pack("<i", item_id))
+
+    def unequip(self, item_id):
+        return self.send(gameserver.OP_REQ_UNEQUIP_ITEM,
+                         struct.pack("<i", item_id))
+
+    def test_equip_and_unequip_change_the_save(self):
+        self.own(self.REVOLVER_R1)
+        self.equip(self.REVOLVER_R1)
+        self.assertEqual([self.REVOLVER_R1],
+                         account_store.equipped_items(self.account()))
+        self.unequip(self.REVOLVER_R1)
+        self.assertEqual([], account_store.equipped_items(self.account()))
+
+    def test_a_new_weapon_pushes_the_old_one_out_of_the_slot(self):
+        self.own(self.REVOLVER_R1, self.REVOLVER_R2)
+        self.equip(self.REVOLVER_R1)
+        self.equip(self.REVOLVER_R2)
+        self.assertEqual([self.REVOLVER_R2],
+                         account_store.equipped_items(self.account()))
+
+    def test_every_equip_packet_gets_exactly_one_answer(self):
+        """★★ §24 那条最要命的：客户端拿 `0x0604` 当计数器。
+
+        换装时它先逐件发 `0x0703` 再发一发 `0x0702`，`[ShopStage+0x13c]`
+        数着还差几发。**少回一发，仓库界面就永远不刷新**（玩家看到
+        「点了没反应」），多回一发则会提前刷新。所以「一发一答」这条
+        不能只在成功路径上成立。
+        """
+        self.own(self.REVOLVER_R1)
+        cases = [
+            ("穿上已有的", self.equip, self.REVOLVER_R1),
+            ("脱下已有的", self.unequip, self.REVOLVER_R1),
+            ("脱下没穿的", self.unequip, self.REVOLVER_R2),
+            ("穿上仓库里没有的", self.equip, self.REVOLVER_R2),
+            ("穿上客户端不认识的", self.equip, 9999999),
+        ]
+        for label, action, item_id in cases:
+            frames = action(item_id)
+            opcodes = [opcode for opcode, _ in frames]
+            # ★ 判据是「**正好一发** 0x0604」——多一发和少一发同样坏。
+            self.assertEqual(1, opcodes.count(gameserver.OP_REP_EQUIPPED_LIST),
+                             "%s: %s" % (label, opcodes))
+
+    def test_a_successful_change_also_resends_the_battle_bonus_packet(self):
+        # ★ 战斗加成的唯一来源是 `0x030b`（§1 / §16）；`0x0604` 只管商店界面。
+        #   改完装备两发都要发，不然「界面变了、打起来没变」。
+        self.own(self.REVOLVER_R1)
+        self.assertIn(gameserver.OP_SLOT_EQUIPPED_LIST,
+                      [opcode for opcode, _ in self.equip(self.REVOLVER_R1)])
+
+    def test_a_malformed_equip_packet_still_gets_an_answer(self):
+        # 解不开也要回 —— 客户端那个计数器不认「服务端没听懂」。
+        frames = self.send(gameserver.OP_REQ_EQUIP_ITEM, b"\x01\x02")
+        self.assertEqual([gameserver.OP_REP_EQUIPPED_LIST],
+                         [opcode for opcode, _ in frames])
+
+    def test_the_equipped_list_reply_carries_the_warehouse(self):
+        self.own(self.REVOLVER_R1, self.REVOLVER_R2)
+        frames = self.equip(self.REVOLVER_R1)
+        body = frames[0][1]
+        self.assertEqual([self.REVOLVER_R1, self.REVOLVER_R2],
+                         sorted(parse_rep_equipped_list(body)))
 
 
 class SendBatchTests(unittest.TestCase):

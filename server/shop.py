@@ -95,18 +95,27 @@ def category_of(item_id):
     return CATEGORY_SET
 
 
+#: `shelf` 调试命令用的「不过滤」哨兵。★ **不能用 0** —— 分类 `0` 是
+#: 「人物 → 英雄」那个标签的真 id（§22），拿它当通配的后果就是
+#: 2026-09-05 实机看到的「点英雄结果列出一堆武器」。
+CATEGORY_ALL = -1
+
+
 def category_matches(requested, item_category):
     """客户端点的这个标签，要不要收这件商品。
 
     三种情况：
 
-    * `0` —— 实测出现过（`logs/server-20260904-223901.out` 22:13:33 那一发），
-      当成「全部」；
+    * `CATEGORY_ALL`（`-1`，只有调试命令会给）—— 全收；
     * `(组 << 16)` 父标签 —— 收该组下面所有子标签；
     * 具体子标签 —— 只收它自己。
+
+    ⚠ **`0` 不是通配**。它是「人物 → 英雄」标签的 id（§22 实测），
+    按父标签规则算就是「组 0」—— 我们一件商品都不归在组 0，所以它
+    自然落成空货架，这正是原版该有的样子。
     """
     requested = int(requested)
-    if requested == 0:
+    if requested == CATEGORY_ALL:
         return True
     if requested == item_category:
         return True
@@ -224,7 +233,7 @@ def build_rep_shop_item_list(total_pages, page, groups):
 # ---------------------------------------------------------------------------
 # 货架内容：从 `shop.json` 里挑出「这一页该显示什么」
 # ---------------------------------------------------------------------------
-def shelf_entries(category=0, character=CHARACTER_ANY, data_dir=None):
+def shelf_entries(category=CATEGORY_ALL, character=CHARACTER_ANY, data_dir=None):
     """该分类下**全部**上架商品，按 itemId 排序。返回 `(条目列表, 警告列表)`。
 
     三道过滤，缺一不可：
@@ -271,8 +280,8 @@ def page_count(total):
 SHELF_PROBE = (777, "※探针※", 888)
 
 
-def shelf_page(category=0, page=0, character=CHARACTER_ANY, data_dir=None,
-               probe=None):
+def shelf_page(category=CATEGORY_ALL, page=0, character=CHARACTER_ANY,
+               data_dir=None, probe=None):
     """把一页货架组成 `0x0500` 的包体。返回 `(包体, 这一页的条目, 警告)`。
 
     页号越界就夹回 `[0, 总页数-1]` —— 和客户端 `0x45b2be` 的夹法一致，
@@ -329,6 +338,81 @@ def build_rep_equipped_list(item_ids=(), slot_masks=(0, 0, 0)):
 def displayable_items(item_ids):
     """挑出「商店界面认得出来」的那些 id（`0x0604` / `0x0500` 都要过这一道）。"""
     return [int(item_id) for item_id in item_ids if shopdata.ownable(item_id)]
+
+
+# ---------------------------------------------------------------------------
+# `0x0602` 购买（客户端 → 服务端）/ `0x0502` gspRepItemBuy（回）
+# ---------------------------------------------------------------------------
+def parse_item_buy_request(payload):
+    """`0x0602` 的载荷 → `[itemId, …]`（购物车里那几件，§24）。
+
+    线格式 `i32 n + n×i32`（Ser `0x55938f`）。那些 int 是**物品 id** ——
+    客户端遍历购物车，每格取 `ShopStock+4`（`0x456923` 的 `add eax, 4`，
+    条目步长 `0x2c` = `ShopStock` 的大小）。
+    """
+    if len(payload) < 4:
+        raise ValueError("购买请求至少要有一个 int32 计数，收到 %d 字节"
+                         % len(payload))
+    count = struct.unpack_from("<i", payload, 0)[0]
+    if count < 0 or len(payload) != 4 + count * 4:
+        raise ValueError("购买请求说有 %d 件，载荷却是 %d 字节"
+                         % (count, len(payload)))
+    return list(struct.unpack_from("<%di" % count, payload, 4)) if count else []
+
+
+def build_rep_item_buy(ok, unknown1=0, unknown2=0):
+    """opcode `0x0502` 的包体 —— `int32 bool + i32 + i32`（Des `0x54c891`）。
+
+    ★ 第一格在线上是 **4 字节**（`0x5d59de` = int32 → bool），内存里才是 1 字节。
+    ⚠ 失败（`ok = 0`）时客户端**什么都不显示** —— 处理器 `0x44643d` 只是把
+    刚建好的「购买结果」弹窗析构掉。⇒ 失败原因只能进服务端日志，
+    玩家那边看到的是「点了没反应」。别指望客户端替我们解释。
+
+    后两格语义 ❓未查明（`+8` 会被购买结果弹窗 `0x4586e1` 用到）。
+    填 0；要找它们就用 `shelf-probe` 那套探针法（D19）。
+    """
+    return w_i32(1 if ok else 0) + w_i32(unknown1) + w_i32(unknown2)
+
+
+#: 买不成的原因码。★ 只进日志 —— 客户端在失败路径上不显示任何东西（见上）。
+BUY_NOT_LISTED = "not_listed"
+BUY_UNKNOWN_ITEM = "unknown_item"
+BUY_LEVEL = "level_too_low"
+BUY_CHARACTER = "wrong_character"
+BUY_ALREADY_OWNED = "already_owned"
+
+
+def check_purchase(item_id, table, level, character, owned):
+    """一件商品能不能买。返回 `(条目, 原因)`；能买时原因是 `None`。
+
+    ★ **价格和上架与否只信 `shop.json`**（`table`），包里的任何数值都不作数
+    —— 客户端发上来的只有 itemId，价格是我们自己查的（PLAN M5）。
+
+    ★ 「已拥有就不能再买」是原版规则（失败文案 `이미 소지하고 있습니다`，§7）。
+    材料类不受这条约束，但材料本来也不上架。
+    """
+    entry = table.get(int(item_id))
+    if entry is None or not entry.get("listed"):
+        return None, BUY_NOT_LISTED
+    if not shopdata.ownable(item_id):
+        return None, BUY_UNKNOWN_ITEM
+    if level is not None and level < entry.get("level", 1):
+        return entry, BUY_LEVEL
+    if character is not None and not shopdata.usable_by(item_id, character):
+        return entry, BUY_CHARACTER
+    if int(item_id) in owned and shopdata.get(item_id).part_flag != 0:
+        return entry, BUY_ALREADY_OWNED
+    return entry, None
+
+
+# ---------------------------------------------------------------------------
+# `0x0702` 穿上 / `0x0703` 脱下（客户端 → 服务端）—— 都回 `0x0604`
+# ---------------------------------------------------------------------------
+def parse_equip_request(payload):
+    """`0x0702` / `0x0703` 的载荷 → itemId。单 `i32`（Ser `0x559464` / `0x55949e`）。"""
+    if len(payload) != 4:
+        raise ValueError("穿脱请求应当是 4 字节，收到 %d" % len(payload))
+    return struct.unpack("<i", payload)[0]
 
 
 # ---------------------------------------------------------------------------

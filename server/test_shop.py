@@ -236,10 +236,19 @@ class CategoryTests(_ShopCase):
         self.assertTrue(shop.category_matches(0x60000, 0x60003))
         self.assertFalse(shop.category_matches(0x60000, 0x10001))
 
-    def test_零号分类是全部(self):
-        # 实机抓到过 `分类 = 0` 那一发，当「全部」处理。
+    def test_零号分类不是通配_它是英雄标签(self):
+        """★★ 2026-09-05 实机抓到的 bug：点「人物 → 英雄」列出一堆武器。
+
+        根因是把 `分类 = 0` 当成了「全部」。它其实是那个标签的**真 id**
+        （§22）—— 按父标签规则算就是「组 0」，我们一件商品都不归在组 0，
+        所以正确行为是**空货架**。
+        """
         for category in (0x10001, 0x60002, shop.CATEGORY_MATERIAL):
-            self.assertTrue(shop.category_matches(0, category))
+            self.assertFalse(shop.category_matches(0, category))
+        # 「全部」得用专门的哨兵，而且它只给调试命令用，线上不会出现。
+        self.assertEqual(-1, shop.CATEGORY_ALL)
+        for category in (0x10001, 0x60002, shop.CATEGORY_MATERIAL):
+            self.assertTrue(shop.category_matches(shop.CATEGORY_ALL, category))
 
     def test_具体标签只收自己(self):
         self.assertTrue(shop.category_matches(0x10001, 0x10001))
