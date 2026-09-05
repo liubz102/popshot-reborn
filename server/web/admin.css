@@ -516,11 +516,26 @@ td .btn-sm { white-space: nowrap; }
    不然在选择器里划过物品时浮窗会被弹窗吃掉。 */
 .itip {
   position: fixed; z-index: 60; pointer-events: none;
-  max-width: 280px; padding: 8px 11px;
+  max-width: 300px; padding: 8px 11px;
   background: #FFFDF4; color: var(--cocoa-ink);
   border: 2px solid var(--amber-dark); border-radius: 9px;
   box-shadow: 0 6px 18px rgba(90, 55, 15, .3);
   font-size: 12px; line-height: 1.5;
+}
+/* 顶上那张大图（D26 追加）。★ `pixelated`：176px 是 64px 原图的 2.75 倍
+   放大，默认的双线性插值会把 2007 年的像素图糊成一团。 */
+.itip .t-icon {
+  display: flex; align-items: center; justify-content: center;
+  margin: -2px 0 7px; padding-bottom: 7px;
+  border-bottom: 2px dashed var(--line);
+}
+.itip .t-icon .ic {
+  background-repeat: no-repeat;
+  image-rendering: pixelated;
+}
+.itip .t-icon .noicon {
+  width: 88px; height: 88px; line-height: 88px; text-align: center;
+  font-size: 34px; color: #C4B195;
 }
 .itip .t-name { font-weight: 700; font-size: 13px; }
 .itip .t-meta { color: var(--cocoa-soft); font-size: 11px; }

@@ -164,6 +164,15 @@ function itemMeta(itemId) {
     炸出十几张卡。这个数**该由手感定**，不是由某台机器上的观测定。 */
 var TIP_DELAY_MS = 100;
 
+/** 浮窗顶上那张大图的边长。
+    ★ **44 × 4 = 176**：44 是商店卡片和「选择物品」弹窗里格子的边长
+    （`renderShop` / `paintPicker`），也就是用户说的「原来的」那个大小；
+    用户 2026-09-05 要求在浮窗里放大到 4 倍看清楚。
+    ⚠ 图集里的原图只有 **64×64**（`itemicons.json` 的 `size`），176 是
+    2.75 倍**放大**，所以配了 `image-rendering: pixelated` —— 双线性插值
+    会把 2007 年的像素图糊成一团。 */
+var TIP_ICON_PX = 176;
+
 var TIP = {node: null, timer: 0, id: null, x: 0, y: 0};
 
 function tipHost() {
@@ -188,6 +197,15 @@ function paintTip(itemId) {
   var box = tipHost();
   var item = BYID[itemId];
   box.textContent = "";
+  var art = el("div", "t-icon");
+  var big = el("div", "ic");
+  if (item && iconStyle(big, item.cell, TIP_ICON_PX)) {
+    art.appendChild(big);
+  } else {
+    // 图集里没有它（原版素材本来就缺几个），或者图集根本没生成。
+    art.appendChild(el("div", "noicon", "?"));
+  }
+  box.appendChild(art);
   box.appendChild(el("div", "t-name", (item && item.name) || ("#" + itemId)));
   box.appendChild(el("div", "t-meta", itemMeta(itemId) + "　#" + itemId));
   if (item && item.name_kr && item.name_kr !== item.name) {
