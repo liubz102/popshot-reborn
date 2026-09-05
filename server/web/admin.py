@@ -304,7 +304,12 @@ def catalog():
     选得到却存不进去的东西不该出现在选择器里（§11）。
 
     算一次留着：`shop_items.json` 随代码走，运行期间不会变。约 800 件、
-    序列化后 100 KB 上下，页面登录后取一次。
+    序列化后 145 KB 上下，页面登录后取一次。
+
+    ★ `desc` 就是**游戏里提示框那段说明**（`shopcfg.item_desc_zh`，和
+    `0x0501` 的 `ItemInfo+0x18` / `0x0500` 的 `ShopStock+0x18` 同源）——
+    管理页的悬停浮窗直接拿它画，两边看到的是同一份数字（D26）。
+    638 件有说明，加起来才 21 KB，没必要为它多开一条按需查询的路。
     """
     global _catalog_cache
     if _catalog_cache is not None:
@@ -327,6 +332,9 @@ def catalog():
                     "cell": cells.get(item.icon),
                 }
                 # 有才带 —— 800 件里大部分字段是空的，全量带上白涨一倍体积。
+                desc = shopcfg.item_desc_zh(item)
+                if desc:
+                    entry["desc"] = desc
                 if item.name_kr:
                     entry["name_kr"] = item.name_kr
                 if item.character is not None:
@@ -851,6 +859,7 @@ class AdminRoutes:
             "kind": item.kind,
             "name": entry.get("name") or item.name_kr or "",
             "name_kr": item.name_kr or "",
+            "desc": shopcfg.item_desc_zh(item),
             "part_flag": item.part_flag,
             "character": item.character,
             "ownable": item.ownable,

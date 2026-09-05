@@ -509,3 +509,29 @@ td .btn-sm { white-space: nowrap; }
   display: flex; gap: 10px; align-items: center; margin-top: 10px;
 }
 .pager .pageno { font-size: 13px; color: var(--cocoa-soft); font-weight: 600; }
+
+/* ------------------------------------------------------ 物品浮窗（D26） */
+/* 照游戏里那张提示框的层次：名字 / 小字 / 说明 / 商店状态。
+   ★ z-index 60 —— 要盖住 sticky 顶栏（40）和物品选择器弹窗（50），
+   不然在选择器里划过物品时浮窗会被弹窗吃掉。 */
+.itip {
+  position: fixed; z-index: 60; pointer-events: none;
+  max-width: 280px; padding: 8px 11px;
+  background: #FFFDF4; color: var(--cocoa-ink);
+  border: 2px solid var(--amber-dark); border-radius: 9px;
+  box-shadow: 0 6px 18px rgba(90, 55, 15, .3);
+  font-size: 12px; line-height: 1.5;
+}
+.itip .t-name { font-weight: 700; font-size: 13px; }
+.itip .t-meta { color: var(--cocoa-soft); font-size: 11px; }
+.itip .t-body {
+  margin-top: 6px; padding-top: 6px;
+  border-top: 2px dashed var(--line);
+}
+.itip .t-shop {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  margin-top: 6px; padding-top: 6px;
+  border-top: 2px dashed var(--line);
+  color: var(--cocoa-soft); font-size: 11px;
+}
+.itip .t-shop .on { color: var(--amber-dark); font-weight: 700; }

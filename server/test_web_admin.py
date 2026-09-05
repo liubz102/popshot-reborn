@@ -440,6 +440,24 @@ class AdminCatalogTests(_AdminCase):
         self.assertLess(top, (icons["width"] // icons["size"])
                         * (icons["height"] // icons["size"]))
 
+    def test_items_carry_the_same_description_the_game_shows(self):
+        # ★ D26：管理页的悬停浮窗画的就是这一段，而它和 `0x0501` 的
+        #   `ItemInfo+0x18`（游戏内提示框下半那块）是同一个函数算的
+        #   —— 两边看到的数字必须一致。
+        _status, result = self.request("/admin/api/catalog")
+        by_id = {item["id"]: item for item in result["items"]}
+        for item_id in (1120011, 1010037):
+            self.assertEqual(
+                shopcfg.item_desc_zh(shopdata.get(item_id)),
+                by_id[item_id]["desc"], item_id)
+        # 说明是空的就不带这个键（800 件里 170 件没有，白占体积）。
+        self.assertNotIn("desc", by_id[10001])
+
+    def test_the_item_lookup_carries_the_description_too(self):
+        _status, result = self.request("/admin/api/item?id=1120011")
+        self.assertEqual(shopcfg.item_desc_zh(shopdata.get(1120011)),
+                         result["desc"])
+
     def test_the_schema_covers_all_three_config_files(self):
         schema = self.catalog["schema"]
         self.assertEqual(sorted(web_admin.CONFIG_FILES), sorted(schema))

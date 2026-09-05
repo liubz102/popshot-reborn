@@ -110,7 +110,8 @@ function slotNode(itemId, px, listed, clickable) {
     // 图集里没有它（原版素材本来就缺几个），或者图集根本没生成。
     box.appendChild(el("div", "noicon", "?"));
   }
-  box.title = itemLabel(itemId);
+  // ★ 原生 `title` 换成自绘浮窗（D26）—— 两个一起弹会叠在一块儿。
+  tipFor(box, itemId);
   return box;
 }
 
@@ -133,6 +134,152 @@ function itemMeta(itemId) {
     bits.push((CAT.series[item.series] || item.series) + (item.tier || ""));
   }
   return bits.join(" · ");
+}
+
+/* ======================================================================
+   物品浮窗 —— 鼠标停一秒，在指针旁边画一张小卡（用户 2026-09-05，D26）
+
+   ## 内容和游戏里那张是同一份
+
+   中间那段说明取的是 `catalog()` 里的 `desc`，服务端那边就是
+   `shopcfg.item_desc_zh()` —— 和 `0x0501` 的 `ItemInfo+0x18`（游戏内提示框
+   下半那块，FINDINGS §31③）同一个函数。所以管理页和游戏里看到的数字
+   一定一致，不会出现「网页说伤害 4、游戏里说 5」。
+
+   ## 谁会弹
+
+   **事件委托到 `document`**，判据是元素身上有没有 `data-item` ——
+   这样动态生成的格子（每次 `renderCurrent()` 都重建）不用各自挂监听器，
+   新加的画面只要给格子写上 `data-item` 就自动有浮窗。
+
+   挂 `data-item` 的地方：`slotNode()` 的图标格（商店卡片 / 配方产物 /
+   材料格 / 掉落规则 / 玩家页都用它）、选择器的格子、玩家页那两行名字。
+   ★ 有输入框的卡片**整张不挂** —— 正在改价格时头上冒一张卡挡着看不见。
+   ====================================================================== */
+
+/** 停多久才弹。用户要的是「1 秒左右」。
+    ★ 这不是「等一等就好了」的时序阈值（铁律 10）—— 它是**人机交互的
+    停留判据**：手从 A 划到 B 的路上会扫过一堆格子，不等一下就会一路
+    炸出十几张卡。浏览器原生 `title` 也是这个量级。 */
+var TIP_DELAY_MS = 900;
+
+var TIP = {node: null, timer: 0, id: null, x: 0, y: 0};
+
+function tipHost() {
+  if (!TIP.node) {
+    TIP.node = el("div", "itip hidden");
+    document.body.appendChild(TIP.node);
+  }
+  return TIP.node;
+}
+
+/** 这件东西现在在商店里是什么状态。★ 取**当前标签页模型**，和
+    `listedIds()` 一个口径：刚改完还没保存也照着新值说。 */
+function shopEntryOf(itemId) {
+  var found = null;
+  ((CFG.shop && CFG.shop.entries) || []).forEach(function (entry) {
+    if (entry && Number(entry.id) === Number(itemId)) { found = entry; }
+  });
+  return found;
+}
+
+function paintTip(itemId) {
+  var box = tipHost();
+  var item = BYID[itemId];
+  box.textContent = "";
+  box.appendChild(el("div", "t-name", (item && item.name) || ("#" + itemId)));
+  box.appendChild(el("div", "t-meta", itemMeta(itemId) + "　#" + itemId));
+  if (item && item.name_kr && item.name_kr !== item.name) {
+    box.appendChild(el("div", "t-meta", item.name_kr));
+  }
+  if (item && item.desc) {
+    var body = el("div", "t-body");
+    // ★ `desc` 是用 `\n` 分行的（服务端就是这么发给游戏客户端的），
+    //   一行一个 div，别指望 white-space 去还原。
+    item.desc.split("\n").forEach(function (line) {
+      body.appendChild(el("div", null, line));
+    });
+    box.appendChild(body);
+  }
+  var entry = shopEntryOf(itemId);
+  var shop = el("div", "t-shop");
+  if (!entry) {
+    shop.appendChild(el("span", null, "商店目录里没有这一条"));
+  } else if (entry.listed) {
+    shop.appendChild(el("span", "on", "★ 商店在卖"));
+    shop.appendChild(el("span", null, (entry.price || 0) + " 金币"));
+    shop.appendChild(el("span", null, "需 " + (entry.level || 1) + " 级"));
+  } else {
+    shop.appendChild(el("span", null, "没上架"));
+  }
+  box.appendChild(shop);
+}
+
+function showTip(itemId) {
+  paintTip(itemId);
+  var box = tipHost();
+  box.classList.remove("hidden");
+  TIP.id = itemId;
+  // 先画出来才量得到尺寸；量完再决定往左还是往右、往上还是往下。
+  var rect = box.getBoundingClientRect();
+  var pad = 14;
+  var x = TIP.x + pad;
+  var y = TIP.y + 18;
+  if (x + rect.width > window.innerWidth - 6) {
+    x = Math.max(6, TIP.x - pad - rect.width);
+  }
+  if (y + rect.height > window.innerHeight - 6) {
+    y = Math.max(6, TIP.y - 12 - rect.height);
+  }
+  box.style.left = Math.round(x) + "px";
+  box.style.top = Math.round(y) + "px";
+}
+
+function hideTip() {
+  window.clearTimeout(TIP.timer);
+  TIP.timer = 0;
+  TIP.id = null;
+  if (TIP.node) { TIP.node.classList.add("hidden"); }
+}
+
+function wireTips() {
+  document.addEventListener("mousemove", function (event) {
+    TIP.x = event.clientX;
+    TIP.y = event.clientY;
+  }, true);
+  document.addEventListener("mouseover", function (event) {
+    var host = event.target.closest ? event.target.closest("[data-item]") : null;
+    if (!host) { return; }
+    var itemId = Number(host.getAttribute("data-item"));
+    if (TIP.id === itemId) { return; }        // 已经在显示这一件了
+    window.clearTimeout(TIP.timer);
+    TIP.timer = window.setTimeout(function () { showTip(itemId); },
+                                  TIP_DELAY_MS);
+  });
+  document.addEventListener("mouseout", function (event) {
+    var host = event.target.closest ? event.target.closest("[data-item]") : null;
+    if (!host) { return; }
+    var to = (event.relatedTarget && event.relatedTarget.closest)
+      ? event.relatedTarget.closest("[data-item]") : null;
+    // ★ 挪到**同一件东西**的另一个挂点不算离开 —— 一行里图标和名字是两个
+    //   挂点（见 `ownNode`），不判这一条的话从图标滑到名字会闪一下、
+    //   900 ms 重新数一遍。
+    if (to && to.getAttribute("data-item") === host.getAttribute("data-item")) {
+      return;
+    }
+    hideTip();
+  });
+  // 点了、滚了、按了键 —— 一律收起来。浮窗只在「停着看」的时候有意义。
+  document.addEventListener("mousedown", hideTip, true);
+  document.addEventListener("wheel", hideTip, true);
+  document.addEventListener("scroll", hideTip, true);
+  document.addEventListener("keydown", hideTip, true);
+}
+
+/** 给一个元素挂上「悬停显示这件东西」。 */
+function tipFor(node, itemId) {
+  node.setAttribute("data-item", String(itemId));
+  return node;
 }
 
 /* ======================================================================
@@ -586,8 +733,9 @@ function renderShop(list) {
 }
 
 function metaLine(itemId, kind) {
-  var meta = el("div", "meta");
-  meta.title = itemLabel(itemId);      // 一行放不下时被省略号截掉，鼠标停上去看全
+  // 卡片上那行小字也挂浮窗：一行放不下会被省略号截掉，浮窗里看得全，
+  // 顺带把加成 / 武器数值也一起给了（D26）。
+  var meta = tipFor(el("div", "meta"), itemId);
   meta.appendChild(document.createTextNode(itemMeta(itemId) + " "));
   meta.appendChild(el("code", null, "#" + itemId));
   var item = BYID[itemId];
@@ -807,7 +955,7 @@ function paintPicker() {
     if (iconStyle(ic, item.cell, 44)) { cell.appendChild(ic); }
     else { cell.appendChild(el("div", "noicon", "?")); }
     cell.appendChild(el("div", "nmz", item.name));
-    cell.title = itemLabel(item.id);
+    tipFor(cell, item.id);
     cell.onmouseenter = function () { describe(item); };
     cell.onclick = function () {
       var pick = PICKER.onPick;
@@ -1094,11 +1242,11 @@ function ownNode(bucket, itemId) {
   var stack = ownStackable(bucket, itemId);
   var have = Number(PLAYER.edit[bucket][itemId]) > 0;
   var box = el("div", "own" + (stack || have ? "" : " off"));
-  // 名字长的会被省略号截掉 —— 全名放 title 里，鼠标停一下就看得到。
-  box.title = itemLabel(itemId);
   box.appendChild(slotNode(itemId, 26, false, false));
 
-  var col = el("div", "col");
+  // 名字那两行也挂上浮窗（被省略号截掉时全名在浮窗里）。★ 数字框和按钮
+  // **不挂** —— 正在改数量时头上冒一张卡挡着看不见。
+  var col = tipFor(el("div", "col"), itemId);
   col.appendChild(el("div", "nmz", ownName(itemId)));
   var meta = el("div", "meta", ownMeta(itemId));
   if (ownEquipped(bucket, itemId)) {
@@ -1146,9 +1294,8 @@ function ownNode(bucket, itemId) {
 
 function lockedNode(row) {
   var box = el("div", "own locked");
-  box.title = itemLabel(row.id);
   box.appendChild(slotNode(row.id, 26, true, false));
-  var col = el("div", "col");
+  var col = tipFor(el("div", "col"), row.id);
   col.appendChild(el("div", "nmz", ownName(row.id)));
   var meta = el("div", "meta",
                 row.stackable === false ? ownMeta(row.id)
@@ -1404,6 +1551,7 @@ function nextRecipeId() {
 
 (async function () {
   wire();
+  wireTips();
   var session = await api("/admin/api/session");
   if (session.logged_in) { showLoggedIn(session.name); }
   else { showLoggedOut(""); }
