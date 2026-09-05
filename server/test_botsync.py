@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import io
+import contextlib
 import math
 import os
 import random
@@ -30,6 +32,8 @@ if HERE not in sys.path:
 
 import ballistics                                              # noqa: E402
 import bot                                                     # noqa: E402
+import botaim                                                  # noqa: E402
+import botarms                                                 # noqa: E402
 import botnav                                                  # noqa: E402
 import botplan                                                 # noqa: E402
 import botsync                                                 # noqa: E402
@@ -934,6 +938,20 @@ class BotFrameRoom(BotBattleRoom):
         if loop is None:
             return 0
         return loop.advance(ticks)
+
+    def advance_to_own_beat(self, seat=None):
+        """推到**这个座位**刚发完心跳的那一格。
+
+        ★ 心跳相位是**按座位错开**的（V0.3 §183），所以「刚发完」这件事
+          每个座位各是各的 —— 用例要对相位就得对自己那一个。
+        """
+        seat = self.bot_seat if seat is None else seat
+        for _ in range(gameserver.HEARTBEAT_TICKS):
+            self.advance(1)
+            if ((self.loop().done - 1 + seat) % gameserver.HEARTBEAT_TICKS
+                    == gameserver.HEARTBEAT_TICKS - 1):
+                return
+        raise AssertionError("推了一整个心跳窗都没对上相位")
 
     def beat(self, conn, x, y, on_ground=True, velocity=(0, 0),
              fast_run=False):
@@ -3953,6 +3971,9 @@ class BotOwnMovementTests(TerrainMixin, BotFireRoom):
         self.install_terrain(synth_terrain("flat"))
         self.place_bot(200.0)
         self.beats(3, 1300.0)
+        # ★ 心跳相位按座位错开（§183）—— 推到本座位刚发完那一格再比，
+        #   否则最后那一发是 1~3 格之前的位置（那也是对的，只是没法逐字比）。
+        self.advance_to_own_beat()
         frames = [f for f in bot_frames(self.alice, self.bot_seat)
                   if udpsync.is_heartbeat(f)]
         self.assertTrue(frames)
@@ -3961,12 +3982,52 @@ class BotOwnMovementTests(TerrainMixin, BotFireRoom):
                          (x, y))
         self.assertTrue(abs(x - 1300) > 500, "不该被拽到真人身边")
 
-    def test_it_holds_its_ground_when_it_can_shoot(self):
-        """★ 打得到就打 —— 语料里真人 39% 的心跳是站着不动的。"""
+    def gun_ready(self):
+        """把手上这把枪拨成「上膛完了、弹匣里有子弹」（`_reloading()` 为假）。
+
+        ★ 顺手把真开火那一段停掉：打一发就会压上 `ReloadTime`，
+          状态当场变了，那一批「站着不动」的断言就没法连着验几发心跳。
+        """
+        self.bot_conn.next_fire_at = 0.0
+        self.bot_conn.rounds_left = 1
+        original = bot._try_fire
+        bot._try_fire = lambda *_a, **_k: None
+        self.addCleanup(setattr, bot, "_try_fire", original)
+
+    def test_it_holds_its_ground_when_the_gun_is_ready(self):
+        """★ 打得到 + 枪能开 = 就地打（语料里真人 39% 的心跳站着不动）。"""
+        self.install_terrain(synth_terrain("flat"))
+        self.place_bot(700.0)
+        self.gun_ready()
+        self.beats(4, 1000.0)
+        self.assertAlmostEqual(700.0, self.bot_conn.body.x)
+
+    def test_it_keeps_moving_while_reloading(self):
+        """★★★★ **换弹那一段不站住**（用户 2026-09-04，§178 / D141）。
+
+        「打得到」问的是几何，它随双方走动每 130 ms 翻一次；而换弹 /
+        上膛那 720~2500 ms 里站着一发也打不出来 —— 旧代码照旧站住，
+        于是 bot 走一下停一下，一段走只有 270 ms（同一局真人 525 ms），
+        屏幕上就是用户报的「一卡一卡，很像网络卡顿」。
+        """
+        self.install_terrain(synth_terrain("flat"))
+        self.place_bot(700.0)
+        original = bot._try_fire
+        bot._try_fire = lambda *_a, **_k: None
+        self.addCleanup(setattr, bot, "_try_fire", original)
+        self.bot_conn.rounds_left = None            # 弹匣不在手上 = 在换弹
+        self.beats(1, 1000.0)
+        self.bot_conn.next_fire_at = self.now() + 5.0
+        self.beats(3, 1000.0)
+        self.assertGreater(self.bot_conn.body.x, 700.0,
+                           "换弹的时候该继续朝敌人挪，实际停在 %.1f"
+                           % self.bot_conn.body.x)
+
+    def test_standing_still_is_for_shooting_not_for_idling(self):
+        """★ 端到端：就地打那几格真的把 `rpFire` 发出去了。"""
         self.install_terrain(synth_terrain("flat"))
         self.place_bot(700.0)
         self.beats(4, 1000.0)
-        self.assertAlmostEqual(700.0, self.bot_conn.body.x)
         self.assertTrue(fire_frames(self.alice, self.bot_seat),
                         "站住是为了打，不是发呆")
 
@@ -4107,6 +4168,58 @@ class BotWeaponChoiceTests(TerrainMixin, BotFireRoom):
         self.assertLessEqual(len(changes), 2,
                              "24 帧里换了 %d 次枪" % len(changes))
 
+    def unreachable_current(self):
+        """让**手上这把**解不出弹道、别的解得出 —— `_engagement()` 的边界。
+
+        `_engagement()` 回 `None` 的那一支上没有分可比，`SWITCH_MARGIN`
+        无从谈起（§178：实机 47% 的换枪决策走的就是它）。
+        """
+        original = bot._engagement
+        held = [None]
+
+        def stub(room, machine, seat_index, weapon, **kwargs):
+            if held[0] is not None and weapon.id == held[0]:
+                return None
+            return original(room, machine, seat_index, weapon, **kwargs)
+
+        bot._engagement = stub
+        self.addCleanup(setattr, bot, "_engagement", original)
+        return held
+
+    def test_a_gun_that_cannot_reach_is_swapped_when_the_trigger_is_free(self):
+        """★ 能扣扳机时「手上这把打不到、别的打得到」是个真的新事实 —— 该换。"""
+        self.install_terrain(synth_terrain("flat"))
+        self.place_bot(560.0)
+        self.beats(2, 900.0)
+        held = self.unreachable_current()
+        held[0] = self.bot_conn.weapon.id
+        self.bot_conn.next_fire_at = 0.0
+        # ★ 带溅射的枪还有弹体在飞时 `_may_fire()` 是关着的（§43 那道顺序闸）
+        #   —— 这一条验的是「扳机真的空着」，先把上一发结清。
+        self.bot_conn.pending_shots = []
+        self.assertTrue(bot._may_fire(self.bot_conn, self.bot_conn.weapon))
+        bot._choose_weapon(self.room, self.bot_conn, self.bot_seat)
+        self.assertNotEqual(held[0], self.bot_conn.weapon.id,
+                            "现在就能开火，该换成打得到的那把")
+
+    def test_a_gun_that_cannot_reach_is_kept_while_it_reloads(self):
+        """★★★★ 反过来：**开不了火的时候不换**（用户 2026-09-04，§178 / D141）。
+
+        旧代码在这一支上一点余量都不过、直接换。而 `_engagement()` 在双方
+        都在动的边界上本来就在翻 ⇒ A→B→A 来回换，`machine.weapon` 跟着翻，
+        「打不打得到」跟着翻，走位就跟着一停一走。开不了火的那一段换枪
+        只是白付 `LoadingTime` + 半个弹匣。
+        """
+        self.install_terrain(synth_terrain("flat"))
+        self.place_bot(560.0)
+        self.beats(2, 900.0)
+        held = self.unreachable_current()
+        held[0] = self.bot_conn.weapon.id
+        self.bot_conn.next_fire_at = self.now() + 5.0
+        bot._choose_weapon(self.room, self.bot_conn, self.bot_seat)
+        self.assertEqual(held[0], self.bot_conn.weapon.id,
+                         "还开不了火，不该为了一个会翻的几何判据换枪")
+
 
 class BotStanceTests(TerrainMixin, BotFireRoom):
     """★★ M5-C：按双方血量决定逼近还是拉开（用户 2026-08-29 的要求）。"""
@@ -4171,74 +4284,158 @@ class BotStanceTests(TerrainMixin, BotFireRoom):
                         "退的时候也该还手")
 
 
-class BotRetreatSpotTests(TerrainMixin, BotFireRoom):
-    """★★★★★ 后撤点不许只挑出「往后 8 像素」（V0.3 §165）。
+class BotKeepAwayTests(TerrainMixin, BotFireRoom):
+    """★★★★★ 保守姿态 = **维持半个屏幕的距离环**（D137，用户 2026-09-03）。
 
-    实机 `Esperan03` 01:11:14.989~17.815 座位 1、01:10:25.9~32.7 座位 5：
-    x 在 3/7/10/14 之间来回，`◆走位来自「朝目标走」` **每 62 ms（一次决策）
-    翻一次方向**，整局 45 段、累计 82 秒。用户 2026-09-02：「好几个 bot
-    走路都感觉一卡一卡的。」
+    「血量低于 25% 的 bot 要偏向保守，会主动拉开跟敌人的距离，尽量避免
+    主动进入敌人 1/2 屏幕范围内。」
 
-    病根是 `_retreat_spot()` 缺了 `_blind_cover_spot()` 开头那一句「已经在
-    掩体后面，当前点就是最近答案」：站着的人本来就被挡着，往后挪一个扫描格
-    （8 像素）当然还挡着 ⇒ `index=1` 立刻 `return` ⇒ `_retreat_done()`
-    一看「只差 8 像素 ≤ GOAL_X(64)」判「退到了」⇒ 下一格重挑。
-    而一次决策走 14~21 像素，**一步就迈过头**；贴到图边更是连一格都挑不出来
-    （`cx < 0` 直接 break）⇒ 改成压上去 ⇒ 走回来又够得着一格 ⇒ 再退。
+    上一版是 `_retreat_spot()`：往背离敌人的方向扫 320，第一个挡得住弹道的
+    点就躲进去 —— 而它有一句「已经在掩体后面 ⇒ 答案就是脚下这一点」，
+    于是**目标 = 自己**、走位恒为不动、还被掩体挡着开不了枪。线上四次
+    「所有 bot 卡住不动」全出在它和它框外那个孪生兄弟上（§175 / §176）。
+
+    环跟着敌人走，所以它**不可能**是静止点。
     """
 
     def setUp(self):
         super().setUp()
-        self.alice_seat = self.room.seat_index_of(self.alice)
+        self.terrain = self.install_terrain(synth_terrain("keep_away",
+                                                          width=4000))
 
     def hurt(self, seat, fraction):
         top = bot._seat_max_hp(self.room, seat)
+        bot._health(self.room).reset(seat)
         bot._health(self.room).note_damage(seat, top * fraction)
 
-    def behind_cover(self):
-        """右边有敌人、中间隔着一堵墙 —— bot 已经躲在墙后面。"""
-        terrain = self.install_terrain(synth_terrain(
-            "retreat_cover", width=4000, walls=((900, 940, 0),)))
-        self.place_bot(600.0)
-        return terrain
-
-    def test_already_behind_cover_answers_with_the_current_spot(self):
-        terrain = self.behind_cover()
-        goal = bot._retreat_spot(self.room, self.bot_conn, terrain,
-                                 (1500.0, 150.0))
-        self.assertEqual((self.bot_conn.body.x, self.bot_conn.body.y), goal,
-                         "已经在掩体后面了，答案就该是脚下这一点")
-
-    def test_an_exposed_bot_still_walks_to_real_cover(self):
-        """★ 没被挡住的时候一个字没变：照旧往背离敌人的方向扫掩体。"""
-        terrain = self.install_terrain(synth_terrain(
-            "retreat_open", width=4000, walls=((480, 520, 0),)))
-        self.place_bot(600.0)
-        goal = bot._retreat_spot(self.room, self.bot_conn, terrain,
-                                 (1500.0, 150.0))
-        self.assertIsNotNone(goal)
-        self.assertLess(goal[0], 520.0, "该走到墙的另一边去")
-
-    def test_the_direction_stops_flip_flopping_at_the_map_edge(self):
-        """★★★★★ 这条就是抖动本身 —— 贴着图边、一格决策一个来回。
-
-        照 `_own_step()` 的节奏跑：一格决策握着这份意图走
-        `BOT_DECISION_TICKS` 个 tick，再重问。改之前这里 12 格里翻 10 次
-        （离线拿 `Esperan03` 真图复现过，形态和实机逐发心跳一模一样）。
-        """
-        # 敌人要在**视野框里**（`BOT_VISION_HALF_X`），否则走的是「框外走位」
-        # 那条分支，压根到不了后撤这儿。
-        terrain = self.install_terrain(synth_terrain(
-            "retreat_edge_cover", width=4000, walls=((500, 540, 0),)))
-        enemy = (860.0, 150.0)
-        self.hurt(self.bot_seat, 0.9)          # 「照这样打下去我先倒」⇒ 后撤
-        self.bot_conn.stance = "retreat"
-        self.bot_conn.retreat_goal = None
+    def enemy_at(self, x, y=150.0):
         for conn in (self.alice, self.bob):
             conn.sync_trail.clear()
-            conn.sync_trail.append((enemy[0], enemy[1], 0))
+            conn.sync_trail.append((x, y, 0))
+
+    def spot(self, enemy=(1500.0, 150.0)):
+        return bot._keep_away_spot(self.room, self.bot_conn, self.terrain,
+                                   enemy)
+
+    # ---- 环本身 ------------------------------------------------------------
+
+    def test_the_ring_is_half_a_screen_from_the_enemy(self):
+        self.place_bot(1400.0)                  # 在敌人左边、环里面
+        goal = self.spot()
+        self.assertIsNotNone(goal)
+        self.assertAlmostEqual(1500.0 - bot.BOT_KEEP_AWAY_SPAN, goal[0],
+                               places=3)
+
+    def test_the_ring_stays_on_my_side_of_the_enemy(self):
+        self.place_bot(1600.0)                  # 换到敌人右边
+        goal = self.spot()
+        self.assertAlmostEqual(1500.0 + bot.BOT_KEEP_AWAY_SPAN, goal[0],
+                               places=3)
+
+    def test_the_ring_follows_the_enemy(self):
+        """★★★ 这就是「不是静止点」那句话本身：敌人一动目标就动。"""
+        self.place_bot(600.0)
+        first = self.spot((1500.0, 150.0))
+        second = self.spot((1200.0, 150.0))
+        self.assertNotEqual(first[0], second[0])
+        self.assertAlmostEqual(300.0, first[0] - second[0], places=3)
+
+    def test_it_never_answers_with_my_own_feet(self):
+        """★ 老 `_retreat_spot()` 躲在掩体后面时返回的就是脚下这一点。"""
+        terrain = self.install_terrain(synth_terrain(
+            "keep_away_wall", width=4000, walls=((900, 940, 0),)))
+        self.place_bot(600.0)
+        goal = bot._keep_away_spot(self.room, self.bot_conn, terrain,
+                                   (1500.0, 150.0))
+        self.assertNotEqual((600.0, 150.0), goal)
+
+    # ---- 走位 --------------------------------------------------------------
+
+    def target_row(self):
+        """一份「这一枪打得出去」的 `_fire_target()` 结果（只有座位号有用）。"""
+        return (self.room.seat_index_of(self.alice), None, None)
+
+    def test_inside_the_ring_it_backs_off(self):
+        self.hurt(self.bot_seat, 0.9)           # 10% 血 -> 保守
+        self.enemy_at(900.0)
+        self.place_bot(700.0)                   # 离敌人 200 < 512
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual(-1, intent[0], "被贴到环里了，该往外退")
+        self.assertEqual("retreat", self.bot_conn.stance)
+
+    def test_it_backs_off_to_exactly_half_a_screen(self):
+        self.hurt(self.bot_seat, 0.9)
+        self.enemy_at(900.0)
+        self.place_bot(700.0)
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, self.target_row())
+        self.assertAlmostEqual(900.0 - bot.BOT_KEEP_AWAY_SPAN,
+                               self.bot_conn.walk_goal[0], places=3)
+
+    def test_it_does_not_back_off_from_a_shot_it_cannot_take(self):
+        """★★★★★ 「保持距离」的前提是「我在这个距离上打得到他」。
+
+        不带这道门的话：退出去 → 打不到 → 压回来 → 又太近 → 再退，
+        **每格一个来回**（§174 那个型）。打不到就先压到打得到为止。
+        """
+        self.hurt(self.bot_seat, 0.9)
+        self.enemy_at(900.0)
+        self.place_bot(700.0)                   # 一样贴在环里
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, None)     # 但这一枪打不出去
+        self.assertEqual(1, intent[0], "打不到就该压上去，不是往外退")
+
+    def test_a_conservative_bot_never_chases(self):
+        """★★★ 保守那一档**不追** —— 打得到就就地打，够不着也不往里挤。
+
+        「追不追」（`_worth_closing()`）只在**逼近**姿态下问；保守那一档的
+        规矩是「不主动进入敌人半个屏幕」（D137），追进去就把它作废了。
+        """
+        self.hurt(self.bot_seat, 0.9)           # 10% 血 -> 保守
+        self.enemy_at(900.0)
+        self.place_bot(100.0)                   # 离敌人 800，远得该追
+        self.assertTrue(
+            bot._worth_closing(self.room, self.bot_conn, self.bot_seat,
+                               self.room.seat_index_of(self.alice), 800.0),
+            "夹具自检：这把枪在 800 上压过去确实更好")
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual("retreat", self.bot_conn.stance)
+        self.assertEqual(0, intent[0], "保守姿态打得到就就地打，不追")
+
+    def test_the_ring_still_beats_the_shooting_branch(self):
+        """★ 被贴进环里时先退，不许「打得到就就地打」把它按在原地。"""
+        self.hurt(self.bot_seat, 0.9)
+        self.enemy_at(900.0)
+        self.place_bot(700.0)                   # 离敌人 200 < 512
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual(-1, intent[0])
+        self.assertGreater(bot.BOT_HOLD_RANGE, bot.BOT_KEEP_AWAY_SPAN,
+                           "参照距离必须在环外，否则保守 bot 会挤进环里")
+
+    def test_a_healthy_bot_walks_all_the_way_to_the_enemy(self):
+        """★ 血 > 50% 的一个字没变：正常进攻，目标就是敌人本人。"""
+        self.hurt(self.bot_seat, 0.0)           # 满血 -> 逼近
+        self.enemy_at(900.0)
+        self.place_bot(100.0)
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, None)
+        self.assertEqual("press", self.bot_conn.stance)
+        self.assertAlmostEqual(900.0, self.bot_conn.walk_goal[0], places=3)
+
+    def test_the_direction_stops_flip_flopping_at_the_map_edge(self):
+        """★★★★★ 贴着图边、一格决策一个来回（V0.3 §165 那条抖动）。
+
+        照 `_own_step()` 的节奏跑：一格决策握着这份意图走
+        `BOT_DECISION_TICKS` 个 tick，再重问。
+        """
+        terrain = self.install_terrain(synth_terrain("keep_away_edge",
+                                                     width=4000))
+        self.hurt(self.bot_seat, 0.9)
+        self.enemy_at(860.0)
         who = bot._character_of(self.bot_conn)
-        seen = []
         for start_x in (4.0, 10.0, 16.0):
             self.place_bot(start_x)
             self.bot_conn.retreat_goal = None
@@ -4253,8 +4450,6 @@ class BotRetreatSpotTests(TerrainMixin, BotFireRoom):
                         direction=intent[0], fast_run=bool(intent[3]))
                 self.bot_conn.battle_pos = (self.bot_conn.body.x,
                                             self.bot_conn.body.y)
-            seen.append((start_x, row))
-        for start_x, row in seen:
             flips = sum(1 for i in range(len(row) - 1)
                         if row[i] and row[i + 1] == -row[i])
             self.assertEqual(0, flips,
@@ -4262,27 +4457,438 @@ class BotRetreatSpotTests(TerrainMixin, BotFireRoom):
                              % (start_x, flips, row))
 
     def test_nowhere_to_retreat_does_not_rewrite_the_stance_latch(self):
-        """★★★ 「退无可退」是**地形**事实，不是战况判断变了（§165）。
-
-        以前这儿写一句 `machine.stance = "press"`，下一格 `_stance()` 拿
-        同一组血量一算又说「该退」—— 闩每一格翻一次，两道迟滞门形同虚设。
-        """
-        terrain = self.install_terrain(synth_terrain("retreat_edge",
+        """★★★ 「退无可退」是**地形**事实，不是战况判断变了（§165）。"""
+        terrain = self.install_terrain(synth_terrain("keep_away_edge2",
                                                      width=4000))
         self.place_bot(4.0)                     # 贴着图左边缘
         self.hurt(self.bot_seat, 0.9)
-        self.bot_conn.stance = "retreat"
-        self.bot_conn.retreat_goal = None
-        for conn in (self.alice, self.bob):
-            conn.sync_trail.clear()
-            conn.sync_trail.append((900.0, 150.0, 0))
-        self.assertIsNone(bot._retreat_spot(self.room, self.bot_conn, terrain,
-                                            (900.0, 150.0)),
-                          "平地图边本来就该退无可退")
+        self.enemy_at(900.0)
         bot._move_intent(self.room, self.bot_conn, self.bot_seat, terrain,
                          None)
         self.assertEqual("retreat", self.bot_conn.stance,
                          "退无可退不该把姿态闩改写成 press")
+
+
+class BotLogRoomTagTests(BotFireRoom):
+    """★★ bot 的日志行要带**房间号**（用户 2026-09-03）。
+
+    「bot 的 log 再加个房间号吧，以后再出问题好调查。」
+
+    bot 的日志行本来只有 `bot N`，多个房间同时开打时整份 `server.out` 混在
+    一起，事后根本分不开是谁 —— §176 那次扫描为此只能丢掉 10 局（54 局里
+    只有 44 局是独占窗口）。
+    """
+
+    def line(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.bot_conn.log("   哨兵")
+        return out.getvalue().strip()
+
+    def test_the_line_carries_the_room_id(self):
+        line = self.line()
+        self.assertIn("房#%d" % self.room.room_id, line)
+        self.assertIn(self.bot_conn.nickname, line)
+        self.assertLess(line.index("房#"), line.index(self.bot_conn.nickname),
+                        "房间号要在昵称前面，好按房间 grep")
+
+    def test_a_bot_with_no_room_still_logs(self):
+        """★ 还没进房间的 bot（协议试探 / 单测夹具）不该因此炸掉。"""
+        self.bot_conn.room_id = None
+        self.assertNotIn("房#", self.line())
+        self.assertIn(self.bot_conn.nickname, self.line())
+
+    def test_the_room_loop_keeps_it_fresh(self):
+        """★ 房间销毁重建之后号会变 —— 每格刷一次（`tick_room()`）。"""
+        self.bot_conn.room_id = 999
+        bot.tick_room(self.room, 0, time.monotonic())
+        self.assertEqual(self.room.room_id, self.bot_conn.room_id)
+
+
+class BotChaseChoiceTests(TerrainMixin, BotFireRoom):
+    """★★★★ 「追不追」由**这把枪的实际输出**说了算（D138）。
+
+    用户 2026-09-03：「用狙击枪远程打也是常见玩法。不要求非要贴上去，
+    我希望血量足够时 bot 能自己判断是否追击的策略。」
+
+    ⇒ 判据不是距离常数，是 `_seconds_to_kill()` 在**当前距离**和
+      `BOT_HOLD_RANGE`（§48 的中位命中距离 616）上各算一次，压过去之后
+      「打倒他要几秒」明显更短（`BOT_PRESS_RATIO` = 0.80）才追。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(synth_terrain("chase_choice",
+                                                          width=4000))
+        self.alice_seat = self.room.seat_index_of(self.alice)
+
+    def enemy_at(self, x, y=150.0):
+        for conn in (self.alice, self.bob):
+            conn.sync_trail.clear()
+            conn.sync_trail.append((x, y, 0))
+
+    def target_row(self):
+        return (self.alice_seat, None, None)
+
+    def worth(self, span):
+        return bot._worth_closing(self.room, self.bot_conn, self.bot_seat,
+                                  self.alice_seat, span)
+
+    # ---- 判据本身 ----------------------------------------------------------
+
+    def test_inside_the_median_hit_distance_it_never_chases(self):
+        """★ 已经在真人常打中的距离里了，再压近只是白送身位。"""
+        self.place_bot(600.0)
+        self.enemy_at(900.0)
+        self.assertFalse(self.worth(bot.BOT_HOLD_RANGE))
+        self.assertFalse(self.worth(bot.BOT_HOLD_RANGE - 1.0))
+
+    def test_a_gun_that_cannot_reach_that_far_means_chase(self):
+        """★ 「够不着」正是要追的那一档：这个距离上算不出输出就该追。
+
+        （抛物线那几把在远距离上 `ballistics.solve()` 直接无解 —— 这里把
+        `_seconds_to_kill()` 钉成 `None` 复现同一个判决，不依赖具体哪把枪。）
+        """
+        self.place_bot(100.0)
+        self.enemy_at(1113.0)
+        original = bot._seconds_to_kill
+
+        def stub(room, shooter, victim, span, victim_speed=None):
+            if span > bot.BOT_HOLD_RANGE:
+                return None                     # 这么远打不出输出
+            return original(room, shooter, victim, span,
+                            victim_speed=victim_speed)
+
+        bot._seconds_to_kill = stub
+        self.addCleanup(setattr, bot, "_seconds_to_kill", original)
+        self.assertTrue(self.worth(1013.0))
+
+    def test_a_gun_that_is_useless_up_close_does_not_chase(self):
+        """★ 反过来：压过去反而没输出（近处解不开弹道）就别压。"""
+        self.place_bot(100.0)
+        self.enemy_at(1113.0)
+        original = bot._seconds_to_kill
+
+        def stub(room, shooter, victim, span, victim_speed=None):
+            if span <= bot.BOT_HOLD_RANGE:
+                return None                     # 压到那儿反而打不出来
+            return original(room, shooter, victim, span,
+                            victim_speed=victim_speed)
+
+        bot._seconds_to_kill = stub
+        self.addCleanup(setattr, bot, "_seconds_to_kill", original)
+        self.assertFalse(self.worth(1013.0))
+
+    def test_it_only_chases_when_closing_really_pays(self):
+        """★★★ 门是**比值**，不是距离：压过去要让 TTK 明显更短才追。"""
+        self.place_bot(100.0)
+        self.enemy_at(1113.0)
+        span = 1013.0
+        near = bot._seconds_to_kill(self.room, self.bot_seat,
+                                    self.alice_seat, bot.BOT_HOLD_RANGE)
+        far = bot._seconds_to_kill(self.room, self.bot_seat,
+                                   self.alice_seat, span)
+        self.assertIsNotNone(near)
+        self.assertIsNotNone(far)
+        self.assertEqual(near <= far * bot.BOT_PRESS_RATIO, self.worth(span),
+                         "判据必须就是那一个比值")
+
+    def test_the_real_weapon_table_says_close_in_at_a_thousand_pixels(self):
+        """★★★★★ `Forest02` 那一局的现场：两个 bot 隔着 1013 像素互相
+        「站住打」，**161 秒零伤害**（§176 ②）。它们手上那几把枪在那个距离
+        上的输出只有中位距离的 0.3~0.6 倍 —— 远低于 `BOT_PRESS_RATIO`
+        要求的 0.80 ⇒ 该追。"""
+        for weapon_id in (1000010, 1002010, 1002030):
+            weapon = weapondata.get(weapon_id)
+            scores = []
+            for span in (bot.BOT_HOLD_RANGE, 1013.0):
+                shot = ballistics.solve(weapon, span, 0.0)
+                self.assertIsNotNone(shot, "%s 在 %.0f 上解不出弹道"
+                                     % (weapon_id, span))
+                scores.append(botarms.score(weapon, shot, 7.0, 20.0, span))
+            ratio = scores[1] / scores[0]
+            self.assertLess(ratio, bot.BOT_PRESS_RATIO,
+                            "%s 在 1013 像素上的输出是中位距离的 %.2f 倍，"
+                            "该判「压过去更好」" % (weapon_id, ratio))
+
+    # ---- 走位 --------------------------------------------------------------
+
+    def test_it_holds_and_shoots_when_closing_does_not_pay(self):
+        self.place_bot(600.0)
+        self.enemy_at(900.0)                    # 300 < 616 -> 不追
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual(0, intent[0], "就地打，不挪窝")
+
+    def test_it_closes_in_when_it_pays(self):
+        self.place_bot(100.0)
+        self.enemy_at(1113.0)                   # 1013 -> 该追
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual(1, intent[0], "该压上去边走边打")
+
+    def test_closing_stops_at_the_median_distance_not_in_your_face(self):
+        """★ 「不代表一定要贴上去」：压到中位命中距离就停。"""
+        self.enemy_at(1113.0)
+        self.place_bot(1113.0 - bot.BOT_HOLD_RANGE)
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, self.target_row())
+        self.assertEqual(0, intent[0])
+
+
+class BotJumpShootTests(TerrainMixin, BotFireRoom):
+    """★★★★★ 「就地打」是**边跳边打**，不是站着不动（D138）。
+
+    用户 2026-09-03：「『站着不动仅开枪』我想改一改，变成边跳跃躲子弹边
+    开枪，因为真人在绝大多数情况也都是边跳跃躲子弹边开枪的。」
+
+    跳多勤照 §71 那份 144 万发心跳的**腾空占比 39%** 折算，
+    **不是**一落地就跳 —— 那样腾空会到 90%，而腾空时方向键不起作用
+    （§93），`_dodge_intent()` 整套就废了。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(synth_terrain("jump_shoot",
+                                                          width=4000))
+        self.place_bot(600.0)
+        for conn in (self.alice, self.bob):
+            conn.sync_trail.clear()
+            conn.sync_trail.append((900.0, 150.0, 0))
+
+    def test_it_never_walks_while_holding_position(self):
+        """★ 「就地」= 不挪窝：方向恒 0，起跳也不往两边送（§93）。"""
+        for draw in (0, botaim.ROLL_RESOLUTION - 1):
+            self.bot_conn.roll = lambda n, d=draw: min(d, n - 1)
+            intent = bot._shoot_move(self.bot_conn)
+            self.assertEqual(0, intent[0])
+            self.assertFalse(intent[2])
+            self.assertFalse(intent[3])
+
+    def test_a_low_draw_jumps_and_a_high_draw_does_not(self):
+        self.bot_conn.roll = lambda n: 0
+        self.assertTrue(bot._shoot_move(self.bot_conn)[1], "掷到最小该起跳")
+        self.bot_conn.roll = lambda n: n - 1
+        self.assertFalse(bot._shoot_move(self.bot_conn)[1], "掷到最大不该起跳")
+
+    def test_it_does_not_press_jump_while_airborne(self):
+        """★ 腾空中按跳 = 第二段跳（§124），这一支不许白送那一段。"""
+        self.bot_conn.roll = lambda n: 0
+        self.bot_conn.body = bot.botmove.jump(self.bot_conn.body)
+        self.assertFalse(self.bot_conn.body.on_ground)
+        self.assertEqual((0, False, False, False),
+                         bot._shoot_move(self.bot_conn))
+
+    def test_the_jump_rate_matches_the_corpus_airborne_share(self):
+        """★★★ 腾空占比要落在语料那个 39% 上 —— 逐 tick 数出来的。"""
+        who = bot._character_of(self.bot_conn)
+        draws = []
+        self.bot_conn.roll = lambda n: draws.pop(0) % n
+        rng = random.Random(20260903)
+        airborne = 0
+        total = 0
+        for _ in range(4000):
+            draws.append(rng.randrange(botaim.ROLL_RESOLUTION))
+            intent = bot._shoot_move(self.bot_conn)
+            for _ in range(bot.BOT_DECISION_TICKS):
+                self.bot_conn.body = bot.botmove.tick(
+                    self.terrain, self.bot_conn.body, who,
+                    want_jump=bool(intent[1]))
+                total += 1
+                if not self.bot_conn.body.on_ground:
+                    airborne += 1
+                intent = (0, False, False, False)   # 跳的意图用掉就作废
+        share = airborne / float(total)
+        self.assertAlmostEqual(bot.BOT_AIRBORNE_SHARE, share, delta=0.05,
+                               msg="腾空占比 %.2f，语料是 %.2f"
+                                   % (share, bot.BOT_AIRBORNE_SHARE))
+
+    def test_the_engaging_branch_uses_it(self):
+        self.bot_conn.roll = lambda n: 0
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain,
+                                  (self.room.seat_index_of(self.alice),
+                                   None, None))
+        self.assertEqual((0, True, False, False), intent,
+                         "打得到那一格该是「就地跳射」")
+
+
+class BotUnstallTests(TerrainMixin, BotFireRoom):
+    """★★★★★ 走位算不出动作时**横着挪一步去找路**（D137）。
+
+    敌人就在正上方 / 正下方时 `|Δx|` 只有几像素，而 `_walk_to()` 是个
+    bang-bang 控制器、一次决策走 14~21 像素 —— 它在 ±1 和 0 之间空转，
+    人一格都不挪。`Forest00` 那个离线复现最干净：(966, 442) 对着
+    (957, 646)，60 格决策**净位移 0**。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.terrain = self.install_terrain(synth_terrain("unstall",
+                                                          width=4000))
+        self.place_bot(1000.0)
+
+    def below(self, dy=450.0):
+        """把两个真人都摆到 bot 正下方（`|Δx| = 0`）。"""
+        for conn in (self.alice, self.bob):
+            conn.sync_trail.clear()
+            conn.sync_trail.append((1000.0, 150.0 + dy, 0))
+
+    def test_an_enemy_straight_below_no_longer_freezes_it(self):
+        self.below()
+        self.assertEqual(
+            (0, False, False, False),
+            bot._walk_to(self.room, self.bot_conn, self.terrain,
+                         (1000.0, 600.0), False),
+            "夹具自检：光靠 `_walk_to()` 这一格是不动的")
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, None)
+        self.assertNotEqual(0, intent[0], "该横着挪一步去找下去的路")
+
+    def test_the_probe_direction_is_latched(self):
+        """★★★ 不闩的话目标那点横向分量每格把它拽回来（§174 那个型）。"""
+        self.below()
+        seen = []
+        for _ in range(8):
+            intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                      self.terrain, None)
+            seen.append(intent[0])
+            self.place_bot(self.bot_conn.body.x + intent[0] * 16.0)
+        self.assertEqual(1, len(set(seen)), "方向该一直是同一个：%s" % seen)
+        self.assertNotIn(0, seen, "而且得真的在走：%s" % seen)
+
+    def test_standing_on_the_goal_is_not_a_stall(self):
+        """★ 「已经到了」不是卡住 —— 真人 39% 的心跳就是站着不动的（§71）。"""
+        for conn in (self.alice, self.bob):
+            conn.sync_trail.clear()
+            conn.sync_trail.append((1000.0, 150.0, 0))
+        intent = bot._unstall(self.room, self.bot_conn, self.terrain,
+                              (1000.0, 150.0), (0, False, False, False), None)
+        self.assertEqual((0, False, False, False), intent)
+        self.assertEqual(0, self.bot_conn.probe_side)
+
+    def test_a_shot_it_can_take_releases_the_latch(self):
+        self.below()
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, None)
+        self.assertNotEqual(0, self.bot_conn.probe_side)
+        bot._unstall(self.room, self.bot_conn, self.terrain, (1000.0, 600.0),
+                     (0, False, False, False), (0, None, None))
+        self.assertEqual(0, self.bot_conn.probe_side, "打得到就不用再找路了")
+
+    def test_a_real_way_up_releases_the_latch(self):
+        self.below()
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, None)
+        self.assertNotEqual(0, self.bot_conn.probe_side)
+        intent = bot._unstall(self.room, self.bot_conn, self.terrain,
+                              (1000.0, 600.0), (1, True, False, False), None)
+        self.assertEqual((1, True, False, False), intent, "能跳就跳，别再横挪")
+        self.assertEqual(0, self.bot_conn.probe_side)
+
+
+class BotFrozenSceneTests(TerrainMixin, TwoBotFrameRoom):
+    """★★★★★ `bug调查/14` 里三个「所有 bot 卡住不动」的现场，在**真图**上重放。
+
+    坐标 / 血量 / 地图全部照 `server.out` 抄。线上这三处分别停了
+    **129.6 / 161 / 144.9 秒**，一格没挪。
+
+    ⚠ 这三张图要 `server/bot_mapdata/` 里的真产物，不是合成地形 ——
+      抖动和卡死都只在真地形上才复现得出来。
+    """
+
+    session_type = 1
+    arguments = (1, 0, 0)
+
+    #: (标题, 图名, 甲方 (x, y, 血), 乙方 (x, y, 血))
+    SCENES = (
+        ("Iceria00 01:20:25", "Iceria00",
+         (2343.0, 836.0, 0.14), (2337.0, 832.0, 0.04)),
+        ("Forest02 09:21:48", "Forest02",
+         (1160.0, 583.0, 0.40), (147.0, 526.0, 0.40)),
+        ("Forest00 00:21:27", "Forest00",
+         (1019.0, 460.0, 0.23), (985.0, 656.0, 0.12)),
+    )
+
+    def setUp(self):
+        super().setUp()
+        alice_seat = self.room.seat_index_of(self.alice)
+        bob_seat = self.room.seat_index_of(self.bob)
+        self.room.seats[bob_seat].team = self.room.seats[alice_seat].team
+        team_a = self.room.seats[alice_seat].team
+        friends = [i for i in self.bot_seats
+                   if self.room.seats[i].team == team_a]
+        foes = [i for i in self.bot_seats if i not in friends]
+        self.seats = (friends[0], foes[0])
+        # 真人三条命都用完 —— 场上再没有会主动打破僵局的东西。
+        self.room.quest.lives_spent.update((alice_seat, bob_seat))
+
+    def arm(self, seat, spec):
+        conn = self.room.seats[seat].conn
+        conn.battle_pos = (spec[0], spec[1])
+        conn.body = botmove.Body(spec[0], spec[1])
+        conn.stance = "press"
+        conn.retreat_goal = None
+        conn.probe_side = 0
+        conn.next_fire_at = 0.0
+        ledger = bot._health(self.room)
+        ledger.reset(seat)
+        ledger.note_damage(seat, bot._seat_max_hp(self.room, seat)
+                           * (1.0 - spec[2]))
+        return conn
+
+    def test_no_scene_parks_the_bots_any_more(self):
+        for title, map_name, first, second in self.SCENES:
+            terrain = self.install_terrain(mapdata.load(map_name))
+            who = {}
+            for seat, spec in zip(self.seats, (first, second)):
+                who[seat] = bot._character_of(self.arm(seat, spec))
+            travel = {seat: 0.0 for seat in self.seats}
+            for step in range(120):
+                for seat in self.seats:
+                    conn = self.room.seats[seat].conn
+                    conn.frame_seq = step
+                    botplan.PLANNER.settle()   # A* 是后台线程，替它跑完
+                    before = conn.body.x
+                    intent = bot._decide(self.room, conn, seat, terrain,
+                                         time.monotonic(),
+                                         step * bot.BOT_DECISION_TICKS)
+                    for _ in range(bot.BOT_DECISION_TICKS):
+                        conn.body = bot.botmove.tick(
+                            terrain, conn.body, who[seat],
+                            direction=intent[0], fast_run=bool(intent[3]))
+                    conn.battle_pos = (conn.body.x, conn.body.y)
+                    travel[seat] += abs(conn.body.x - before)
+            for seat in self.seats:
+                self.assertGreater(
+                    travel[seat], 100.0,
+                    "%s 座位 %d 120 格决策只挪了 %.0f 像素"
+                    % (title, seat, travel[seat]))
+
+    def test_they_end_up_inside_engaging_distance(self):
+        """★ 不只是「在动」—— 它们得真的凑到打得着的距离上。"""
+        for title, map_name, first, second in self.SCENES:
+            terrain = self.install_terrain(mapdata.load(map_name))
+            who = {}
+            for seat, spec in zip(self.seats, (first, second)):
+                who[seat] = bot._character_of(self.arm(seat, spec))
+            for step in range(240):
+                for seat in self.seats:
+                    conn = self.room.seats[seat].conn
+                    conn.frame_seq = step
+                    botplan.PLANNER.settle()
+                    intent = bot._decide(self.room, conn, seat, terrain,
+                                         time.monotonic(),
+                                         step * bot.BOT_DECISION_TICKS)
+                    for _ in range(bot.BOT_DECISION_TICKS):
+                        conn.body = bot.botmove.tick(
+                            terrain, conn.body, who[seat],
+                            direction=intent[0], fast_run=bool(intent[3]))
+                    conn.battle_pos = (conn.body.x, conn.body.y)
+            bodies = [self.room.seats[s].conn.body for s in self.seats]
+            span = abs(bodies[0].x - bodies[1].x)
+            self.assertLessEqual(span, bot.BOT_ENGAGE_RANGE,
+                                 "%s 最后还隔着 %.0f 像素" % (title, span))
 
 
 class BotWalkOvershootTests(TerrainMixin, BotFireRoom):
@@ -4423,20 +5029,129 @@ class BotAimLeadTests(BotFireRoom):
         self.assertNotAlmostEqual(honest, self.fired_angle(), places=4)
 
     def test_the_difficulty_is_the_only_knob(self):
-        """三档只改两个概率，物理一格都不动（M5-A 的口径）。"""
-        self.room.bot_difficulty = "easy"
-        easy = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
-        self.room.bot_difficulty = "hard"
-        hard = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
-        self.assertGreater(easy, hard)
+        """五档只改两个概率，物理一格都不动（M5-A 的口径）。"""
+        self.room.bot_difficulty = 1
+        easiest = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
+        self.room.bot_difficulty = 5
+        hardest = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
+        self.assertGreater(easiest, hardest)
 
     def test_a_hud_jam_makes_it_much_worse(self):
         """★ 别人放糊屏 ⇒ 失误概率明显上去（§121，用户的要求）。"""
-        self.room.bot_difficulty = "medium"
+        self.room.bot_difficulty = 3
         plain = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
         self.room.quest.hud_jam_until[self.bot_seat] = time.monotonic() + 8.0
         jammed = bot._aim_error_chance(self.room, self.bot_conn, self.bot_seat)
         self.assertGreater(jammed, plain + 0.3)
+
+
+class BotDifficultyAccuracyTests(TerrainMixin, BotFireRoom):
+    """难度必须改变真实碰撞结果，不能只让准星和发包角度变一下。"""
+
+    def setUp(self):
+        super().setUp()
+        self.alice_seat = self.room.seat_index_of(self.alice)
+        self.bot_conn.weapon_slot = 1
+        self.bot_conn.holding = True
+        self.bot_conn.next_fire_at = time.monotonic() + 3600.0
+        self.place_bot(100.0)
+        self.walk(self.alice, [(500.0, 150.0), (500.0, 150.0)])
+
+    def impact(self, target, terrain=None):
+        _seat, point, shot = target
+        machine = self.bot_conn
+        mx, my = bot._muzzle(*machine.battle_pos, point[0])
+        shell = bot.Shell(1, 0, machine.weapon,
+                          bot._seat_group(self.room, self.bot_seat),
+                          mx, my, shot, 0.0, math.ceil(shot.ticks) + 2)
+        shell.size_ratio = bot._magazine_ratios(machine)[1]
+        bodies = bot._battle_bodies(self.room, self.bot_seat, shell.group)
+        for _ in range(shell.max_ticks):
+            contact = bot._shell_step(self.room, shell, terrain, bodies)
+            if contact is not None:
+                return contact
+        return None
+
+    def test_a_miss_clears_head_body_and_legs_in_both_stances_and_directions(self):
+        for character in (0, 1, 2):
+            self.room.seats[self.alice_seat].character_id = character
+            for crouched in (False, True):
+                self.human_crouch(self.alice, crouched)
+                self.walk(self.alice, [(500.0, 150.0)])
+                for x in (100.0, 400.0, 600.0, 900.0):
+                    self.place_bot(x)
+                    for side in (-1.0, 1.0):
+                        with self.subTest(character=character, crouch=crouched,
+                                          x=x, side=side):
+                            target = bot._fire_target(
+                                self.room, self.bot_conn, self.bot_seat,
+                                self.bot_conn.weapon, botaim.Miss(1.0, side))
+                            self.assertIsNotNone(target)
+                            self.assertIsNone(self.impact(target))
+
+    def test_real_collision_rates_follow_all_five_difficulties(self):
+        rates = []
+        samples = 500
+        for level in range(1, 6):
+            self.assertTrue(bot.handle_command(self.alice, f"/d {level}"))
+            self.bot_conn.roll = random.Random(5).randrange
+            hits = 0
+            for _ in range(samples):
+                miss = bot._aim_miss(self.room, self.bot_conn, self.bot_seat)
+                target = bot._fire_target(self.room, self.bot_conn,
+                                          self.bot_seat, self.bot_conn.weapon,
+                                          miss)
+                self.assertIsNotNone(target)
+                contact = self.impact(target)
+                hits += contact is not None and contact[1] == self.alice_seat
+                bot._reroll_aim_miss(self.bot_conn)
+            rate = hits / samples
+            expected = 1.0 - bot.difficulty_profile(self.room)["aim_error"]
+            self.assertAlmostEqual(expected, rate, delta=0.06)
+            rates.append(rate)
+        self.assertEqual(sorted(rates), rates)
+        self.assertLess(rates[0], 0.25)
+        self.assertGreater(rates[-1], 0.80)
+
+    def test_a_ground_bound_miss_is_fired_and_resolves_without_direct_damage(self):
+        self.install_terrain(synth_terrain("flat"))
+        self.bot_conn.roll = lambda n: 0       # 最小偏差，朝脚下打
+        bot._reroll_aim_miss(self.bot_conn)
+        self.bot_conn.intent_tick = None
+        self.bot_conn.next_fire_at = 0.0
+        self.clear()
+        self.advance(1)
+        self.assertEqual(1, len(fire_frames(self.alice, self.bot_seat)))
+        self.assertEqual(1, len(self.bot_conn.pending_shots))
+        shell = self.bot_conn.pending_shots[0]
+        self.assertTrue(bot._path_blocked(bot._terrain(self.room),
+                                         shell.x0, shell.y0, shell.shot,
+                                         shell.radius))
+        self.settle()
+        frames = explode_frames(self.alice, self.bot_seat)
+        self.assertEqual(1, len(frames))
+        body = body_of(frames[0])
+        self.assertEqual(0, struct.unpack_from("<i", body, 4)[0])
+        self.assertEqual(0.0, struct.unpack_from("<f", body, 24)[0])
+
+    def test_a_miss_does_not_make_a_target_behind_a_wall_visible(self):
+        self.install_terrain(synth_terrain(
+            "difficulty_wall", walls=((280, 320, 0),)))
+        for miss in (None, botaim.Miss(1.0, -3.0)):
+            self.assertIsNone(bot._fire_target(
+                self.room, self.bot_conn, self.bot_seat,
+                self.bot_conn.weapon, miss))
+
+    def test_a_skewed_bullet_must_still_clear_the_muzzle(self):
+        # 枪口 (143, 93)，准确弹的鼻尖在 (146, 93)；向下偏后鼻尖撞 (146, 94)。
+        rows = ["0" * 800 for _ in range(180)]
+        rows[94] = "0" * 146 + "2" + "0" * 653
+        self.install_terrain(mapdata.MapTerrain(make_record(rows)))
+        self.assertIsNotNone(bot._fire_target(
+            self.room, self.bot_conn, self.bot_seat, self.bot_conn.weapon))
+        self.assertIsNone(bot._fire_target(
+            self.room, self.bot_conn, self.bot_seat, self.bot_conn.weapon,
+            botaim.Miss(1.0, 2.0)))
 
 
 class BotEntryLockMovementTests(TerrainMixin, BotFireRoom):
@@ -4993,16 +5708,37 @@ class BotBossRoomTests(TerrainMixin, BotFrameRoom):
                                msg="非闯关上下文退主表那份")
 
     def test_the_leash_is_suspended_in_a_boss_room(self):
-        """★★★ boss 房里落后再远也不追人 —— 没有进度可推（§141）。"""
+        """★★★ boss 房里落后再远也不**牵引**（§141）—— 没有进度可推。
+
+        ★ 但「不牵引」不等于「站着」：boss 在哪还不知道的时候要跟着带头的
+        真人走（D137），见下一条。这里只验牵引绳本身一个字没说。
+        """
         self.enter_boss_room()
         self.place_bot(200.0)
         self.walk(self.alice, [(2000.0, 150.0), (2200.0, 150.0)])
-        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
-                                  self.terrain, None)
+        bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                         self.terrain, None)
         self.assertFalse(self.bot_conn.leash_lagging,
                          "boss 房里牵引绳一个字都不该说")
-        self.assertEqual((0, False, False, False), intent,
-                         "还不知道 boss 在哪，该站住等，不是去追人")
+
+    def test_an_unknown_boss_makes_it_follow_the_human_not_stand(self):
+        """★★★★★ boss 在哪还不知道时**跟着带头的真人**，不许站着（D137）。
+
+        用户 2026-09-03：「任务模式到了 boss 房后又不动了。」
+        服务端手上 boss 的坐标只有两个来源，**两个都要别人先动手**：
+        `note_mob_hit()`（有人打中过它）、`quest.boss_gun`（它自己开过枪）。
+        以前两个都空就站住等 —— 而 bot 站着就打不到 boss，打不到就永远
+        没有采样：**它自己就是自己解锁条件的否定**（§160 家族）。
+        """
+        self.enter_boss_room()
+        self.place_bot(200.0)
+        self.walk(self.alice, [(2000.0, 150.0), (2200.0, 150.0)])
+        self.assertIsNone(bot._nearest_mob(self.room, self.bot_conn.body),
+                          "夹具要的就是「一只都还不知道」")
+        self.assertIsNone(getattr(self.room.quest, "boss_gun", None))
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  self.terrain, None)
+        self.assertEqual(1, intent[0], "该朝带头的真人那边挪，不许站着")
 
     def test_it_walks_toward_the_boss_when_out_of_range(self):
         self.enter_boss_room()
@@ -5139,11 +5875,23 @@ class BotSpawnPointTests(TerrainMixin, BotFireRoom):
         self.walk(self.alice, [(700.0, 150.0)])
         self.bot_conn.roll = lambda n: 0
         bot.pick_respawn_point(self.room, self.bot_seat)
+        # ★ `roll` 钉成 0 = 「永远掷到最小」，那也会让 `_shoot_move()` 每一格
+        #   都起跳（D138）。挑完出生点就还回去，这一条验的是身体搬没搬。
+        self.bot_conn.roll = self.pin_roll
         self.walk(self.alice, [(700.0, 150.0)])
         self.assertIsNone(self.bot_conn.pending_spawn)
-        self.assertEqual((200.0, 150.0), self.bot_conn.battle_pos)
+        # ★ 站起来那一帧枪还在上膛（`Character::Reset` 重上三张倒计时表，§126），
+        #   所以身体搬过去之后会朝真人**挪一步**（≤ 一格心跳的走位，§178 / D141）
+        #   —— 验的是「搬到出生点了」，不是「一步没挪」。
+        x, y = self.bot_conn.battle_pos
+        self.assertEqual(150.0, y)
+        self.assertLess(abs(x - 200.0), 40.0,
+                        "身体该搬到出生点 200 附近，实际在 %.1f" % x)
         last = bot_frames(self.alice, self.bot_seat)[-1]
-        self.assertEqual((200, 150), udpsync.heartbeat_position(last))
+        wire_x, wire_y = udpsync.heartbeat_position(last)
+        self.assertLess(abs(wire_x - 200), 40,
+                        "心跳里报的也该是出生点附近，不是死亡地点 700")
+        self.assertEqual(150, wire_y)
 
     def test_the_watchdog_sends_the_map_point_not_the_humans(self):
         """★★ 端到端：看门狗补的那发 `0x0419` 填的是**地图出生点**。
@@ -5809,6 +6557,43 @@ class BotTakesKnockbackTests(HumanShotRoom):
             100002, botsync.character_handle(self.alice_seat), 30,
             600.0, 150.0, push_x=12.0, push_y=-9.0))
         self.assertTrue(self.bot_conn.body.on_ground)
+
+    # -- ★★★★★ V0.3 §179：挨一枪不许把第二段跳还回来 --------------------
+
+    def airborne(self, air_jumped):
+        self.bot_conn.body = bot.botmove.Body(600.0, 100.0, 1.0, -2.0,
+                                              on_ground=False,
+                                              air_jumped=air_jumped)
+
+    def test_a_hit_in_the_air_does_not_refund_the_second_jump(self):
+        """★★★★★ 实机 22:07:38~41：bot 5 在**一段腾空**里连发 5 发第 2 段
+        `rpJump`，一路蹦到地图顶（y=0）贴着天花板飞了 800 像素 —— 用户报的
+        「在空中的抛物线轨迹上不停的前后闪」。
+
+        根子：`_take_knockback()` 甲档重建 `Body` 时没把 `air_jumped` 带过来，
+        `Body.__init__` 的缺省值把它抹成 `False` ⇒ **白送一次二段跳**。
+        原版这一段清的是 `[char+0x128]`（「我踩在地上」），不是段号那本账。
+        """
+        for damage in (6, 10, 30):
+            self.airborne(True)
+            self.splash(damage, (4.0, -1.0))
+            self.assertTrue(self.bot_conn.body.air_jumped,
+                            "伤害 %d：挨一枪不该把第二段跳还回来" % damage)
+            self.assertFalse(self.bot_conn.body.on_ground)
+
+    def test_a_hit_in_the_air_keeps_an_unused_second_jump_unused(self):
+        """★ 反过来也要对：还没用过就该还没用过。"""
+        self.airborne(False)
+        self.splash(30, (12.0, -9.0))
+        self.assertFalse(self.bot_conn.body.air_jumped)
+
+    def test_being_knocked_off_the_ground_still_grants_a_second_jump(self):
+        """★ 站在地上被顶飞 = 新的一段腾空，第二段跳当然是满的。"""
+        self.assertTrue(self.bot_conn.body.on_ground)
+        self.splash(30, (12.0, -9.0))
+        self.assertFalse(self.bot_conn.body.on_ground)
+        self.assertFalse(self.bot_conn.body.air_jumped,
+                         "刚离地的这一段还欠着第二跳")
 
 
 if __name__ == "__main__":
@@ -7935,10 +8720,15 @@ class BotItemHuntTests(HumanShotRoom):
         self.assertGreater(self.bot_conn.body.x, 600.0)
 
     def test_it_does_not_leave_a_shot_to_grab_one(self):
-        """★ 打得到人的时候不去蹲地上那件 —— 真人也不会当着枪口去捡。"""
+        """★ 打得到人的时候不去蹲地上那件 —— 真人也不会当着枪口去捡。
+
+        ★ 断言是**方向**而不是「一步没挪」：换弹那一段照旧朝敌人挪
+          （§178 / D141），敌人在 800、道具在 500，所以往右走才是对的。
+        """
         self.drop_item(500.0)
         self.beats(4, 800.0)
-        self.assertAlmostEqual(600.0, self.bot_conn.body.x)
+        self.assertGreaterEqual(self.bot_conn.body.x, 600.0,
+                                "道具在左边，不该往它那儿去")
 
     def test_walking_onto_it_picks_it_up(self):
         self.no_shot()
@@ -8400,7 +9190,7 @@ class BotVisionTests(TerrainMixin, BotFireRoom):
 
 
 class BotBlindHealthTests(TerrainMixin, BotFireRoom):
-    """框内没敌人时的 25% / 50% 滞回与粗方向掩体。"""
+    """框外（视野里没敌人）时的 25% / 50% 姿态滞回。★ 不再有「躲掩体」这个动作（D137）。"""
 
     def setUp(self):
         super().setUp()
@@ -8420,12 +9210,20 @@ class BotBlindHealthTests(TerrainMixin, BotFireRoom):
         return bot._blind_intent(self.room, self.bot_conn, self.bot_seat,
                                  self.terrain)
 
-    def test_below_twenty_five_percent_hides(self):
+    def test_low_health_turns_conservative_but_keeps_walking(self):
+        """★★★★★ 低血量只换**姿态**，不再换动作（D137）。
+
+        以前这一条叫 `..._hides`，断言的是「低血不该继续往右送」。
+        躲掩体是个没有出口的停机状态（§175 / §176），用户 2026-09-03
+        拍板拿掉：「无论怎样，全都主动寻找并接近敌人，禁止站在一个地方
+        不动。」框外这一支于是不再看姿态 —— 血再少也朝粗方位挪，
+        「拉开距离」只在看得见敌人（有真实坐标）时才谈得上。
+        """
         self.set_health(0.24)
         self.bot_conn.stance = "press"
         intent = self.intent()
-        self.assertEqual("retreat", self.bot_conn.stance)
-        self.assertLessEqual(intent[0], 0, "敌人在右边，低血不该继续往右送")
+        self.assertEqual("retreat", self.bot_conn.stance, "姿态照旧翻")
+        self.assertEqual(1, intent[0], "但动作是朝粗方位走，不是站着躲")
 
     def test_above_fifty_percent_presses(self):
         self.set_health(0.51)
@@ -8473,25 +9271,129 @@ class BotBlindHealthTests(TerrainMixin, BotFireRoom):
         self.assertNotEqual(0, self.intent()[0],
                             "上下方位也得横着走去找上去的路")
 
-    def test_a_boss_room_never_hides(self):
-        """★ boss 房的门要**打死 boss 才开** —— 血再少也不许躲（§141）。"""
-        self.set_health(0.05)
-        self.bot_conn.stance = "retreat"
-        intent = bot._blind_intent(self.room, self.bot_conn, self.bot_seat,
-                                   self.terrain, may_hide=False)
-        self.assertEqual("press", self.bot_conn.stance)
-        self.assertEqual(1, intent[0], "血再少也要朝 boss 那个方向压过去")
+    def test_it_never_stands_still_however_low_the_health(self):
+        """★★★★★ 血再少也不许原地不动（D137）—— 以前这是 boss 房的例外
+        （`may_hide=False`），现在是**所有**房间的规矩。"""
+        for fraction in (0.01, 0.05, 0.24, 0.30, 0.51, 1.0):
+            self.set_health(fraction)
+            self.bot_conn.retreat_goal = None
+            intent = self.intent()
+            self.assertEqual(1, intent[0],
+                             "血 %.0f%% 时框外走位停住了" % (fraction * 100))
 
-    def test_low_health_uses_a_real_cover_when_available(self):
-        self.terrain = self.install_terrain(synth_terrain(
+    def test_a_wall_no_longer_parks_a_low_health_bot_behind_it(self):
+        """★★★★★ 这条以前叫 `..._uses_a_real_cover_when_available`，
+        断言的正是把 bot 停在墙后面。那就是线上四次「所有 bot 卡住不动」
+        的现场（§175 / §176）—— 现在它必须照旧往前走。"""
+        terrain = self.install_terrain(synth_terrain(
             "blind_cover", width=4000, walls=((480, 520, 0),)))
         self.place_bot(600.0)
         self.set_health(0.10)
         self.bot_conn.stance = "press"
-        self.intent()
-        self.assertIsNotNone(self.bot_conn.retreat_goal)
-        self.assertLess(self.bot_conn.retreat_goal[0], 520.0,
-                        "应该走到左边、让墙挡在自己和右方敌人之间")
+        intent = bot._blind_intent(self.room, self.bot_conn, self.bot_seat,
+                                   terrain)
+        self.assertEqual(1, intent[0], "墙不该再把它钉在原地")
+        self.assertIsNone(self.bot_conn.retreat_goal,
+                          "框外这一支不再挑后撤落脚点")
+
+    def test_the_hiding_machinery_is_gone(self):
+        """★ 哨兵：这几个函数 / 常量再出现就说明「躲」被谁改回来了。"""
+        for name in ("_blind_cover_spot", "_blind_cover_pick",
+                     "_blind_in_cover", "_retreat_spot", "_humans_all_spent",
+                     "BOT_BLIND_HIDE_BELOW", "BOT_BLIND_PRESS_ABOVE"):
+            self.assertFalse(hasattr(bot, name), "%s 又回来了" % name)
+
+
+class BotNeverParksTests(TerrainMixin, TwoBotFrameRoom):
+    """★★★★★ 「禁止站在一个地方不动」的**全局**回归（D137）。
+
+    用户 2026-09-03 报的三条（生存局真人死后全体卡住 / 距离太远就不动 /
+    任务模式进 boss 房就不动）在日志里是同一个形状：某个分支返回
+    「站住」，而它自己产生的状态恰好是自己解锁条件的否定（§160 家族）。
+
+    这个类把**最容易复发的那个现场**照实机摆出来：场上只剩 bot、
+    个个残血、谁都不在谁的视野框里 —— 线上 `Iceria00` 停了 129.6 秒、
+    `Forest02` 停了 161 秒。
+    """
+
+    session_type = 1
+    arguments = (1, 0, 0)       # 组队战 + 生存（三条命）
+
+    def setUp(self):
+        super().setUp()
+        alice_seat = self.room.seat_index_of(self.alice)
+        bob_seat = self.room.seat_index_of(self.bob)
+        self.human_seats = [alice_seat, bob_seat]
+        team_a = self.room.seats[alice_seat].team
+        self.room.seats[bob_seat].team = team_a
+        friends = [i for i in self.bot_seats
+                   if self.room.seats[i].team == team_a]
+        foes = [i for i in self.bot_seats if i not in friends]
+        self.assertTrue(friends and foes, "夹具没把两个 bot 分到两边")
+        self.friend_seat, self.foe_seat = friends[0], foes[0]
+        self.friend = self.room.seats[self.friend_seat].conn
+        self.foe = self.room.seats[self.foe_seat].conn
+        self.terrain = self.install_terrain(synth_terrain("never_parks",
+                                                          width=4000))
+        # 两个 bot 隔得远远的：谁都不在谁的视野框里 = 线上那一局的形状。
+        self.place(self.friend_seat, 600.0)
+        self.place(self.foe_seat, 600.0 + bot.BOT_VISION_HALF_X + 500.0)
+        for seat in (self.friend_seat, self.foe_seat):
+            self.set_health(seat, 0.10)
+        # 真人三条命都用完了 —— 场上再没有会主动打破僵局的东西。
+        self.room.quest.lives_spent.update(self.human_seats)
+
+    def place(self, seat, x, y=150.0):
+        conn = self.room.seats[seat].conn
+        conn.battle_pos = (x, y)
+        conn.body = botmove.Body(x, y)
+
+    def set_health(self, seat, fraction):
+        ledger = bot._health(self.room)
+        ledger.reset(seat)
+        maximum = bot._seat_max_hp(self.room, seat)
+        ledger.note_damage(seat, maximum * (1.0 - fraction))
+
+    def test_both_low_health_bots_keep_walking_toward_each_other(self):
+        """★★★★★ 死锁那一刻：两个 10% 血的 bot 谁都看不见谁。"""
+        for seat, conn, expect in ((self.friend_seat, self.friend, 1),
+                                   (self.foe_seat, self.foe, -1)):
+            intent = bot._move_intent(self.room, conn, seat, self.terrain,
+                                      None)
+            self.assertEqual(expect, intent[0], "座位 %d 停住了" % seat)
+
+    def test_they_actually_meet_instead_of_running_out_the_clock(self):
+        """★★★ 逐格跑到互相进视野框为止 —— 线上是跑满 240 秒时限。"""
+        who = {seat: bot._character_of(self.room.seats[seat].conn)
+               for seat in (self.friend_seat, self.foe_seat)}
+        for step in range(400):
+            a, b = self.friend.body, self.foe.body
+            if (abs(a.x - b.x) <= bot.BOT_VISION_HALF_X
+                    and abs(a.y - b.y) <= bot.BOT_VISION_HALF_Y):
+                break
+            for seat in (self.friend_seat, self.foe_seat):
+                conn = self.room.seats[seat].conn
+                intent = bot._move_intent(self.room, conn, seat, self.terrain,
+                                          None)
+                self.assertNotEqual(0, intent[0],
+                                    "第 %d 格座位 %d 站住了" % (step, seat))
+                for _ in range(bot.BOT_DECISION_TICKS):
+                    conn.body = bot.botmove.tick(
+                        self.terrain, conn.body, who[seat],
+                        direction=intent[0], fast_run=bool(intent[3]))
+                conn.battle_pos = (conn.body.x, conn.body.y)
+        else:
+            self.fail("400 格决策都没走到互相看得见")
+
+    def test_a_healthy_bot_does_the_same(self):
+        """★ 血量不改变「走不走」这件事，只改变**站位**。"""
+        for seat in (self.friend_seat, self.foe_seat):
+            self.set_health(seat, 1.0)
+        for seat, expect in ((self.friend_seat, 1), (self.foe_seat, -1)):
+            conn = self.room.seats[seat].conn
+            intent = bot._move_intent(self.room, conn, seat, self.terrain,
+                                      None)
+            self.assertEqual(expect, intent[0])
 
 
 class BotIdleRepositionTests(TerrainMixin, BotFireRoom):
@@ -8922,6 +9824,552 @@ class BotQuestSplashTests(BotQuestCombatTests):
         self.assertNotIn(handle, targets, "任务模式的火墙烧不到队友")
 
 
+class LandingIsAlwaysReportedTests(TerrainMixin, BotFrameRoom):
+    """★★★★★ **落地那一格必须报出去**（V0.3 §182）。
+
+    收方对远端角色只有**一个**精确归位的机会：`0x504215` 的
+    「上一发腾空 + 这一发踩地 ⇒ 硬置坐标」（§35），其余一律 0.6/0.4 插值。
+    心跳踩的是 4 格一发的固定网格，而 bot **落地的下一格就能起跳** ——
+    那次落地整个落在两发心跳之间，收方一次都没看见。
+
+    实机 2026-09-04 23:26:45 一行不差：
+
+        84405.522  (2, 1094) v=(0, 38)   ← 沿图左边界高速下坠
+        84405.586  rpJump 座位3 第1段     ← 落地了，同一窗口里又起跳
+        84405.649  (23, 1062) v=(7, -16) ← 又腾空，「落地」一发没报
+
+    同一局同一把尺子（从地上起跳里「落地从没进过心跳」的比例）：
+    **真人 0/27 = 0.0%**，bot **8.7% ~ 61.1%**，收方那一刻中位差 **63 像素**。
+    """
+
+    def beats_of(self):
+        return [f for f in bot_frames(self.alice, self.bot_seat)
+                if udpsync.is_heartbeat(f)]
+
+    def ground_flags(self):
+        out = []
+        for frame in self.beats_of():
+            field = struct.unpack_from("<i", body_of(frame), 7 + 12)[0]
+            out.append(bool(field & botsync.HEARTBEAT_BIT_ONGROUND))
+        return out
+
+    def drop_onto_the_floor(self, phase):
+        """把人摆到「再走一格就落地」的空中，落地那一格的 tick 相位是 `phase`。"""
+        while (self.loop().done % gameserver.HEARTBEAT_TICKS) != phase:
+            self.advance(1)
+        self.bot_conn.body = botmove.Body(400.0, 140.0, 0.0, 24.0,
+                                          on_ground=False)
+        self.bot_conn.on_ground = False
+        self.bot_conn.intent = (0, False, False, False)
+        before = len(self.beats_of())
+        self.advance(1)
+        return before
+
+    def test_a_landing_between_beats_still_gets_a_beat(self):
+        """★★★★★ 落地落在两发心跳中间时，**当场补一发**。"""
+        self.install_terrain(synth_terrain("land_beat"))
+        self.place_bot(400.0)
+        self.beats(1, 900.0)
+        # 相位 0/1/2 都不是心跳格（心跳落在 HEARTBEAT_TICKS - 1 那一格）
+        before = self.drop_onto_the_floor(0)
+        self.assertTrue(self.bot_conn.body.on_ground, "这一格该落地（前提）")
+        self.assertEqual(before + 1, len(self.beats_of()),
+                         "落地那一格没补心跳，收方就拿不到那次硬置")
+        field = struct.unpack_from("<i", body_of(self.beats_of()[-1]),
+                                   7 + 12)[0]
+        self.assertTrue(field & botsync.HEARTBEAT_BIT_ONGROUND,
+                        "补的这一发要说「我踩在地上」")
+
+    def test_every_landing_phase_is_reported(self):
+        """★★★★ 四个 tick 相位上各落一次地，**每一次**都得进心跳流。"""
+        self.install_terrain(synth_terrain("land_phase"))
+        self.place_bot(400.0)
+        self.beats(1, 900.0)
+        for phase in range(gameserver.HEARTBEAT_TICKS):
+            mark = self.drop_onto_the_floor(phase)
+            self.assertTrue(self.bot_conn.body.on_ground,
+                            "相位 %d：这一格该落地（前提）" % phase)
+            self.assertIn(True, self.ground_flags()[mark:],
+                          "相位 %d 的那次落地一发心跳都没报" % phase)
+            self.advance(gameserver.HEARTBEAT_TICKS)
+
+    def test_no_extra_beat_when_it_never_left_the_ground(self):
+        """★ 误伤面：一直站在地上的 bot 不许多发心跳（节拍还是 4 格一发）。"""
+        self.install_terrain(synth_terrain("land_none"))
+        self.place_bot(400.0)
+        self.bot_conn.intent = (0, False, False, False)
+        self.beats(1, 900.0)
+        before = len(self.beats_of())
+        self.advance(gameserver.HEARTBEAT_TICKS * 5)
+        self.assertEqual(5, len(self.beats_of()) - before,
+                         "站着不动的这 20 格该正好 5 发心跳")
+
+
+class MotionTransitionAnchorTests(TerrainMixin, BotFrameRoom):
+    """★★★★★ 速度/地面状态离散变化的那一格必须补运动锚（V0.3 §185）。
+
+    最新 5 局里，自由飞行按客户端同一套 ``vy += 1.2`` 外推时 p99 只差
+    5.7 px；弹跳台窗口 p90 差 116 px、撞顶 56 px、受击 55 px。病的不是
+    重力常量，是收方在这些没有连续导数的点上还拿旧速度推到下一发固定心跳。
+    """
+
+    def prepare(self, terrain):
+        self.install_terrain(terrain)
+        # 只喂位置，不推进：让 `_follow_target()` 有一个活着的真人可跟。
+        self.human_heartbeat(self.alice, 900.0, 150.0, ticks=0)
+        # 先走到本 bot 自己的固定节拍刚结束，下一格必定不是普通心跳格。
+        self.advance_to_own_beat()
+        self.clear()
+        self.bot_conn.motion_anchor_pending = False
+        self.bot_conn.motion_blocked_axes = (False, False)
+
+    def place_motion(self, body):
+        self.bot_conn.body = body
+        self.bot_conn.battle_pos = (body.x, body.y)
+        self.bot_conn.battle_pos_prev = (body.x, body.y)
+        self.bot_conn.on_ground = body.on_ground
+        self.bot_conn.intent = (0, False, False, False)
+        self.bot_conn.intent_tick = self.loop().done
+
+    def sent_beats(self):
+        return [frame for frame in bot_frames(self.alice, self.bot_seat)
+                if udpsync.is_heartbeat(frame)]
+
+    def test_free_flight_does_not_raise_the_heartbeat_rate(self):
+        terrain = synth_terrain("motion_anchor_free", floor=170, height=220)
+        self.prepare(terrain)
+        self.place_motion(botmove.Body(400.0, 100.0, 5.0, -10.0,
+                                       on_ground=False))
+        self.advance(1)
+        self.assertEqual([], self.sent_beats(),
+                         "连续的重力积分收方自己会算，不该每格都发")
+
+    def test_a_jump_carries_an_immediate_position_and_velocity_anchor(self):
+        terrain = synth_terrain("motion_anchor_jump")
+        self.prepare(terrain)
+        self.place_motion(botmove.Body(400.0, 150.0))
+        self.bot_conn.intent = (0, True, False, False)
+        self.advance(1)
+        frames = bot_frames(self.alice, self.bot_seat)
+        self.assertEqual([botsync.OP_JUMP, botsync.OP_HEARTBEAT],
+                         [udpsync.peer_opcode(frame) for frame in frames],
+                         "先发可靠跳跃事件，再用同一条 TCP 流锚运动状态")
+        self.assertFalse(udpsync.heartbeat_motion(frames[-1])[2])
+
+    def test_a_jump_pad_launch_is_anchored_without_an_rpJump_event(self):
+        width, height, floor = 1200, 220, 150
+        rows = [("0" * width if y < floor else "2" * width)
+                for y in range(height)]
+        terrain = mapdata.MapTerrain(make_record(
+            rows, jump=[[400, floor - 12, 0.0, -400.0]]))
+        self.prepare(terrain)
+        self.place_motion(botmove.Body(400.0, float(floor)))
+        self.advance(1)
+        frames = bot_frames(self.alice, self.bot_seat)
+        self.assertEqual([botsync.OP_HEARTBEAT],
+                         [udpsync.peer_opcode(frame) for frame in frames],
+                         "弹跳台原版不发 rpJump，更必须在起飞格补心跳")
+        _x, _y, ground, _vx, vy, _fast = udpsync.heartbeat_motion(frames[0])
+        self.assertFalse(ground)
+        self.assertLess(vy, -24, "台子的初速应明显大于普通跳")
+
+    def test_hitting_a_ceiling_anchors_the_zeroed_vertical_speed(self):
+        width, height, floor = 800, 220, 190
+        rows = []
+        for y in range(height):
+            rows.append("".join(
+                "2" if (y >= floor or (300 <= x < 500 and 70 <= y <= 75))
+                else "0" for x in range(width)))
+        terrain = mapdata.MapTerrain(make_record(rows))
+        self.prepare(terrain)
+        self.place_motion(botmove.Body(400.0, 90.0, 0.0, -20.0,
+                                       on_ground=False))
+        self.advance(1)
+        self.assertEqual(0.0, self.bot_conn.body.vy, "前提：这一格确实撞顶")
+        motion = udpsync.heartbeat_motion(self.sent_beats()[0])
+        self.assertEqual(0, motion[4], "撞顶清掉的 v.y 要当格报给收方")
+
+    def test_knockback_anchors_on_the_victims_next_physics_tick(self):
+        terrain = synth_terrain("motion_anchor_hit", floor=180, height=240)
+        self.prepare(terrain)
+        self.place_motion(botmove.Body(400.0, 180.0))
+        bot._knock_back_seat(self.room, self.bot_seat, 20, (8.0, -8.0),
+                             source="单测")
+        self.assertTrue(self.bot_conn.motion_anchor_pending,
+                        "受击改速度的当下就该欠下一发锚")
+        self.advance(1)
+        motion = udpsync.heartbeat_motion(self.sent_beats()[0])
+        self.assertFalse(motion[2])
+        self.assertGreater(motion[3], 0)
+        self.assertLess(motion[4], 0)
+
+    def note(self, machine, before, body, air_stepped=True, jumped=0):
+        """按 `_own_step()` 里的真实顺序走一遍：先算报出去的速度，再记锚。"""
+        reported = bot._reportable_speed(before, body, air_stepped)
+        bot._note_motion_transition(machine, before, body, reported, jumped)
+        return reported
+
+    def test_a_wall_only_anchors_when_the_blocked_state_changes(self):
+        """贴墙可持续很多格；进入/离开各发一次，不能退化成 31 Hz。"""
+        machine = self.bot_conn
+        machine.motion_anchor_pending = False
+        machine.motion_blocked_axes = (False, False)
+        before = botmove.Body(100.0, 100.0, 8.0, -5.0, on_ground=False)
+        blocked = botmove.Body(100.0, 96.2, 8.0, -3.8, on_ground=False)
+        self.note(machine, before, blocked)
+        self.assertTrue(machine.motion_anchor_pending, "刚撞墙要报一次")
+        machine.motion_anchor_pending = False
+        still_blocked = botmove.Body(100.0, 93.6, 8.0, -2.6,
+                                     on_ground=False)
+        self.note(machine, blocked, still_blocked)
+        self.assertFalse(machine.motion_anchor_pending,
+                         "还贴着同一面墙时不该每格刷心跳")
+        released = botmove.Body(108.0, 92.2, 8.0, -1.4, on_ground=False)
+        self.note(machine, still_blocked, released)
+        self.assertTrue(machine.motion_anchor_pending,
+                        "翻过墙沿重新带速度移动时也要报一次")
+
+    def test_taking_off_against_a_wall_still_reports_a_zero_x_speed(self):
+        """★★★★★ 「速度是本格新生的」这条豁免**只给弹跳台**（§185）。
+
+        贴着墙从地面起跳：`jump()` 之后 `_air_tick` 照跑，x 被墙钉住。
+        这一格如果按 `before.on_ground` 放行 `vx`，收方就会照着它往墙里
+        推 4 帧再被拽回来 —— §181 那种锯齿换了个入口而已。
+        """
+        machine = self.bot_conn
+        machine.motion_anchor_pending = False
+        machine.motion_blocked_axes = (False, False)
+        ground = botmove.Body(100.0, 100.0)
+        # 起跳那一格：`_air_tick` 跑过（air_stepped=True），x 被墙钉住。
+        takeoff = botmove.Body(100.0, 72.0, 8.0, -22.0, on_ground=False)
+        self.assertEqual((0.0, -22.0), self.note(machine, ground, takeoff),
+                         "被墙钉住的那一轴要报 0，哪怕上一格还在地上")
+        self.assertTrue(machine.motion_anchor_pending, "离地本身要补锚")
+        self.assertEqual((True, False), machine.motion_blocked_axes)
+        # 下一格还贴着同一面墙 —— 报的还是 0，状态没翻转，不该再补一发。
+        machine.motion_anchor_pending = False
+        still = botmove.Body(100.0, 51.2, 8.0, -20.8, on_ground=False)
+        self.assertEqual((0.0, -20.8), self.note(machine, takeoff, still))
+        self.assertFalse(machine.motion_anchor_pending,
+                         "同一面墙上不该每格刷心跳")
+
+    def test_a_pad_launch_keeps_its_brand_new_speed(self):
+        """★ 反过来：弹跳台那一格**没**跑空中积分，位置没动不算被钉住。"""
+        machine = self.bot_conn
+        machine.motion_anchor_pending = False
+        machine.motion_blocked_axes = (False, False)
+        ground = botmove.Body(400.0, 900.0)
+        launched = botmove.Body(400.0, 900.0, -0.9, -31.0, on_ground=False)
+        self.assertEqual((-0.9, -31.0),
+                         self.note(machine, ground, launched,
+                                   air_stepped=False),
+                         "台子刚写进去的初速必须原样发")
+        self.assertEqual((False, False), machine.motion_blocked_axes)
+        self.assertTrue(machine.motion_anchor_pending)
+
+
+class AirborneSpeedIsReproducibleTests(unittest.TestCase):
+    """★★★★★ 腾空时报出去的速度，收方**必须能照着复现**（V0.3 §181）。
+
+    收方对腾空角色是拿包里那两格**逐帧积分推位置**的
+    （`0x5073a6` 腾空 → `0x50767e` → `0x507773` → `0x50d404`；
+    `packet_api §5.6`：「腾空那一段的水平位移**完全由它决定**」）。
+    所以「位置钉住 + 速度非 0」这一对收方复现不了：它会照速度把角色推出去，
+    下一发心跳再拽回来 —— **每 128 ms 一次的锯齿**，这就是用户 2026-09-04
+    报的「在空中还是会有卡顿和瞬移感」。
+
+    同一局同一把尺子（腾空段里「位置钉住却报着速度」的占比）：
+    真人 **2.4%**，bot **3.9%~17.3%**。
+    """
+
+    #: 一个心跳窗口里偏差超过这么多就算「收方跟丢了一窗」。
+    #: 一步走位是 7~12 像素，取一步的量级。
+    DRIFT = 12.0
+
+    def replay(self, terrain, who, body, ticks=64):
+        """一边跑服务端物理，一边按收方的模型复现。
+
+        收方：每发心跳把位置和速度**硬对齐**一次，中间 4 个 tick 自己
+        `v.y += 1.2; pos += v` 地推。
+
+        返回 `(最大偏差, 跟丢的窗口数)`。
+
+        ★ 判据看的是**跟丢几窗**，不是峰值：碰撞发生在窗口中间时收方无从
+        知道，那一窗必然偏 —— 真人也一样。病的是「**每一窗都偏**」，
+        那才是每 128 ms 一次的锯齿。
+        """
+        seen = body
+        theirs = (body.x, body.y)
+        theirs_v = (body.vx, body.vy)
+        worst = window = 0.0
+        lost = 0
+        for step in range(ticks):
+            before = seen
+            seen = botmove.tick(terrain, seen, who)
+            if before.on_ground or seen.on_ground:
+                theirs = (seen.x, seen.y)          # 落地那一发是硬置（§35）
+                theirs_v = (seen.vx, seen.vy)
+                continue
+            # 收方这一帧：先加重力（`0x50769d`），再按速度挪（`0x50d404`）。
+            theirs_v = (theirs_v[0], theirs_v[1] + botmove.GRAVITY)
+            theirs = (theirs[0] + theirs_v[0], theirs[1] + theirs_v[1])
+            gap = max(abs(theirs[0] - seen.x), abs(theirs[1] - seen.y))
+            worst = max(worst, gap)
+            window = max(window, gap)
+            if (step + 1) % gameserver.HEARTBEAT_TICKS == 0:
+                if window > self.DRIFT:
+                    lost += 1
+                window = 0.0
+                theirs = (seen.x, seen.y)          # 心跳到了，对齐
+                theirs_v = bot._reportable_speed(before, seen)
+        return worst, lost
+
+    def test_a_body_pinned_against_the_map_edge_reports_no_speed(self):
+        """★★★★★ 实机最干净的现场：`Iceria00` 图左边界，座位 4 连着 5 发
+        心跳报 `x=0 v=(-9, …)` —— 位置一动不动、速度一直说往左。"""
+        terrain = mapdata.load("Iceria00")
+        if terrain is None:
+            self.skipTest("没有 Iceria00 的地形产物")
+        who = chrprops.get(2)
+        before = botmove.Body(2.0, 610.0, -9.0, 6.0, on_ground=False)
+        body = botmove.tick(terrain, before, who)
+        self.assertEqual(before.x, body.x, "这一 tick 该被图边挡住（前提）")
+        self.assertEqual(-9.0, body.vx, "★ 模拟里的速度一个字都不许动（§95）")
+        self.assertEqual((0.0, body.vy), bot._reportable_speed(before, body),
+                         "报出去的横向速度该是 0")
+
+    def test_free_flight_reports_the_real_speed(self):
+        """★ 反过来要保住：没被挡住的那些照旧报真速度。"""
+        terrain = mapdata.load("Iceria00")
+        if terrain is None:
+            self.skipTest("没有 Iceria00 的地形产物")
+        who = chrprops.get(2)
+        before = botmove.Body(900.0, 300.0, 8.0, -12.0, on_ground=False)
+        body = botmove.tick(terrain, before, who)
+        self.assertNotEqual(before.x, body.x, "这一 tick 该是自由飞行（前提）")
+        self.assertEqual((body.vx, body.vy),
+                         bot._reportable_speed(before, body))
+
+    def test_standing_on_the_ground_is_untouched(self):
+        """★ 踩在地上速度本来就恒 0（§35）—— 这一层不许插手。"""
+        terrain = mapdata.load("Iceria00")
+        if terrain is None:
+            self.skipTest("没有 Iceria00 的地形产物")
+        who = chrprops.get(2)
+        before = botmove.Body(900.0, 300.0, 8.0, 20.0, on_ground=False)
+        body = botmove.tick(terrain, before, who)
+        while not body.on_ground:
+            before, body = body, botmove.tick(terrain, body, who)
+        self.assertEqual((0.0, 0.0), bot._reportable_speed(before, body))
+
+    def test_the_receiver_can_reproduce_a_flight_into_a_wall(self):
+        """★★★★★ 端到端口径：**收方照着包复现，偏差不该超过一步**。
+
+        改之前：撞在图边上之后收方每一窗口往外推 4 × 9 = 36 像素，
+        下一发心跳再拽回来。
+        """
+        terrain = mapdata.load("Iceria00")
+        if terrain is None:
+            self.skipTest("没有 Iceria00 的地形产物")
+        who = chrprops.get(2)
+        worst, lost = self.replay(
+            terrain, who,
+            botmove.Body(40.0, 610.0, -9.0, -6.0, on_ground=False))
+        self.assertLessEqual(lost, 1,
+                             "收方跟丢了 %d 个窗口（最大偏差 %.0f 像素）——"
+                             "撞上那一窗跟丢是必然的，后面每一窗都跟丢才是病"
+                             % (lost, worst))
+
+    def test_a_falling_body_grazing_a_slope_lands(self):
+        """★★★★★ **掉着掉着蹭上坡 = 落地**（V0.3 §181）—— 这是根因。
+
+        「蹭上坎」那一支是 §95 给**往上飞**的人补的，可它没分上下：正在
+        下落的人从斜坡上方掠过时同样命中，于是脚被抬到坡面上、`on_ground`
+        却还是 0、`v.y` 接着按重力空转 —— 人**贴着地面滑行**、报出去的下落
+        速度一路涨到 40 开外，而收方拿它逐帧积分，一发心跳就把角色往地底下
+        拽 170 像素。
+
+        实机现场是 `Forest02` 那条缓坡（577→745，坡面 613→514）：
+        改之前从 tick 28 起滑了 20 多格，`v.y` 16 → 41，收方偏差峰值
+        **178 像素**；改之后第一次碰到坡面就落地。
+        """
+        terrain = mapdata.load("Forest02")
+        if terrain is None:
+            self.skipTest("没有 Forest02 的地形产物")
+        who = chrprops.get(1)
+        # 前提：这一段是**升上来迎着人**的坡，`ground_below()` 往下找是找不到的。
+        self.assertEqual([613], [s for s in terrain.surfaces(577) if 500 < s < 700])
+        self.assertEqual([607], [s for s in terrain.surfaces(585) if 500 < s < 700])
+        body = botmove.Body(577.0, 612.95, 8.0, 16.0, on_ground=False)
+        landed = botmove.tick(terrain, body, who)
+        self.assertTrue(landed.on_ground, "掉到坡面上就该落地")
+        self.assertEqual(607.0, landed.y, "落在它真的碰到的那个坡面上")
+
+    def test_a_rising_body_still_scrapes_over_the_bump(self):
+        """★★★ 反过来必须保住 §95：**往上飞**的人照旧蹭上坎、继续飞。"""
+        terrain = mapdata.load("Forest02")
+        if terrain is None:
+            self.skipTest("没有 Forest02 的地形产物")
+        who = chrprops.get(1)
+        body = botmove.Body(585.0, 610.0, 8.0, -3.0, on_ground=False)
+        step = botmove.tick(terrain, body, who)
+        self.assertFalse(step.on_ground, "往上飞的那一支不许改成落地")
+
+    def test_no_body_glides_along_the_ground_while_airborne(self):
+        """★★★★ 全图扫：**没有一个 tick** 会「报着下落、位置却没往下」。
+
+        改之前实测：`Forest02` 68 格、`Iceria03` 56 格、`Esperan03` 135 格。
+        """
+        worst = None
+        for name in ("Forest02", "Iceria03", "Camel02"):
+            terrain = mapdata.load(name)
+            if terrain is None:
+                continue
+            who = chrprops.get(1)
+            for x in range(120, terrain.width - 120, 71):
+                ys = terrain.surfaces(x)
+                if not ys:
+                    continue
+                for direction in (1, -1):
+                    body = botmove.tick(
+                        terrain, botmove.Body(float(x), float(ys[len(ys) // 2])),
+                        who, direction=direction, want_jump=True)
+                    for _ in range(80):
+                        if body.on_ground:
+                            break
+                        before, body = body, botmove.tick(terrain, body, who)
+                        if (not body.on_ground and before.vy > 0
+                                and body.y <= before.y):
+                            worst = (name, x, direction, before.y, body.y,
+                                     before.vy)
+                            break
+                    if worst:
+                        break
+                if worst:
+                    break
+        self.assertIsNone(
+            worst, "还有贴地滑行：%s" % (worst,))
+
+    def test_the_receiver_tracks_ordinary_arcs_on_real_maps(self):
+        """★ 误伤面 + 端到端：真图上随便挑一批弧线，收方跟得住。
+
+        改之前 96 条弧线跟丢 **39** 窗、峰值 **178** 像素；
+        两处修法之后 **22** 窗、峰值 **43**（剩下的全是「碰撞发生在窗口
+        中间、收方无从知道」那一窗，真人也一样）。
+        """
+        worst = 0.0
+        checked = flights = lost = 0
+        for name in ("Iceria00", "Iceria03", "Esperan03", "Forest02"):
+            terrain = mapdata.load(name)
+            if terrain is None:
+                continue
+            who = chrprops.get(1)
+            for x in range(200, min(2000, terrain.width - 200), 137):
+                ys = terrain.surfaces(x)
+                if not ys:
+                    continue
+                for direction in (1, -1):
+                    body = botmove.Body(float(x), float(ys[len(ys) // 2]))
+                    body = botmove.tick(terrain, body, who,
+                                        direction=direction, want_jump=True)
+                    checked += 1
+                    peak, missed = self.replay(terrain, who, body)
+                    worst = max(worst, peak)
+                    lost += missed
+                    flights += 1
+        self.assertGreater(checked, 20, "采样太少，这个断言没意义")
+        self.assertLess(worst, 80.0,
+                        "有弧线收方整个跟丢了，最大偏差 %.0f 像素" % worst)
+        self.assertLessEqual(lost, flights * 0.30,
+                             "%d 条弧线里收方一共跟丢 %d 个窗口"
+                             "（最大偏差 %.0f 像素）" % (flights, lost, worst))
+
+
+class BotWalkKeyMaskTests(TerrainMixin, BotFrameRoom):
+    """★★★★★ 掩码报的是**自己按着的键**，不是位移反推（V0.3 §177 / D140）。
+
+    用户 2026-09-04：「bot 的动作还是一卡一卡的，很像网络卡顿的感觉。」
+
+    一发心跳盖 **4 格**，而收方拿包里那个掩码替这个角色走的是**接下来
+    那 4 格**（`0x507660`，§39）。旧实现按位移反推，只看得见**最后一格**：
+    4 格里挪了 3 格、最后一格被地形顶住，反推出来就是「站着」——
+    收方于是画一个站姿的人、又不替它走，位置只被心跳一格一格拽过去。
+
+    同一局同一把尺子量出来（`logs/server.out` 2026-09-04 第二代）：
+
+    | | 在地心跳里「掩码 ≠ 下一窗净位移方向」|
+    |---|---|
+    | 真人（座位 0）| **2.1%**（617 个窗口里 13 个）|
+    | 5 个 bot | **20.0%**（1132 个窗口里 226 个）|
+
+    其中「掩码=站却挪了」中位 11~18 像素、最大 58 —— 那就是屏幕上的「卡」。
+    """
+
+    def keys_of(self, frame):
+        return struct.unpack_from("<H", body_of(frame), 7 + 16)[0]
+
+    def wall_room(self, key):
+        """一片平地，x ≥ 800 起是一堵爬不上去的高台。"""
+        return self.install_terrain(synth_terrain(
+            key, floor=150, width=1200, height=200,
+            walls=((800, 1200, 10),)))
+
+    def hold_intent(self, intent):
+        """装一张「这一格就按这个键」的桩（和别处停掉躲避是同一个路子）。"""
+        original = bot._move_intent
+        bot._move_intent = lambda *_a, **_k: intent
+        self.addCleanup(setattr, bot, "_move_intent", original)
+
+    def test_walking_into_a_wall_still_reports_the_key(self):
+        """★★★★★ 按着右键顶在墙上：位置一动不动，掩码照样是**右键**。
+
+        真人顶在墙角时报的就是这个（键按着、坐标不变），而收方手里有同一张
+        地形、走的是同一套走路函数（`0x50d9a7`），照样走不过去 —— 报真键
+        对得上，反推位移则报「站着」，那才是说谎。
+        """
+        terrain = self.wall_room("keymask_wall")
+        self.place_bot(797.0, 150.0)
+        self.hold_intent((1, False, False, False))
+        who = chrprops.get(self.bot_conn.character_id)
+        self.assertTrue(botmove.blocked(terrain, self.bot_conn.body, who, 1),
+                        "这一步该被墙顶住（前提没了测试就不成立）")
+        self.beats(3, 400.0, 150.0)
+        self.assertEqual(797.0, self.bot_conn.body.x, "位置该一动不动")
+        self.assertEqual(botsync.KEY_RIGHT, self.keys_of(self.last_beat()))
+
+    def test_a_bot_that_presses_nothing_reports_nothing(self):
+        """★ 反过来要保住：真站着（意图 0）就得**松开**键。"""
+        self.wall_room("keymask_stand")
+        self.place_bot(400.0, 150.0)
+        self.hold_intent((0, False, False, False))
+        self.beats(3, 400.0, 150.0)
+        self.assertEqual(0, self.keys_of(self.last_beat()))
+
+    def test_the_pressed_key_is_recorded_every_tick(self):
+        """★ `press_dir` 和 `move_down` 一个道理：物理层和心跳层同一个决定。"""
+        terrain = self.wall_room("keymask_press")
+        self.place_bot(797.0, 150.0)
+        tick = self.loop().done
+        for direction in (1, -1, 0):
+            self.bot_conn.intent = (direction, False, False, False)
+            bot._own_step(self.room, self.bot_conn, self.bot_seat, terrain,
+                          self.now(), tick)
+            self.assertEqual(direction, self.bot_conn.press_dir)
+
+    def test_being_held_reports_no_key(self):
+        """★ `/hold` 钉住的 bot 站着不动 —— 上一格的键不许留在包里。"""
+        terrain = self.wall_room("keymask_hold")
+        self.place_bot(797.0, 150.0)
+        self.bot_conn.intent = (1, False, False, False)
+        bot._own_step(self.room, self.bot_conn, self.bot_seat, terrain,
+                      self.now(), self.loop().done)
+        self.assertEqual(1, self.bot_conn.press_dir)
+        self.bot_conn.holding = True
+        self.addCleanup(setattr, self.bot_conn, "holding", False)
+        self.beats(3, 400.0, 150.0)
+        self.assertEqual(0, self.keys_of(self.last_beat()))
+
+
 class BotGapJumpTests(TerrainMixin, BotFrameRoom):
     """★★★ 坑太宽时**兜底也要会二段跳**（§144）。
 
@@ -8992,6 +10440,72 @@ class BotGapJumpTests(TerrainMixin, BotFrameRoom):
         self.assertEqual(1, pressed.count(True),
                          "第二段只该按一次，实际按了 %d 次" % pressed.count(True))
         self.assertFalse(pressed[0], "刚离地还在往上升，这时候按是浪费")
+
+    def test_spending_the_second_jump_drops_the_flag(self):
+        """★★★★ **欠的这一跳还完了，旗子当场作废**（V0.3 §179）。
+
+        它原来只在落地那一格清，于是「这一段还欠不欠第二跳」由**两个**变量
+        共同表达（`nav_double_jump` + `body.air_jumped`）。任何一处把
+        `air_jumped` 弄丢，还举着的旗子立刻又按一次 —— 实机就是这么在一段
+        腾空里连跳 5 次的。
+        """
+        terrain = self.gap_room("gap_flag_paid", 300)
+        tick = self.loop().done
+        self.bot_conn.intent = self.walk_east(terrain)
+        self.assertTrue(self.bot_conn.nav_double_jump)
+        # ★ 先真起跳（`_decide()` 在地上会把旗子清掉，所以它排在离地之后）。
+        bot._own_step(self.room, self.bot_conn, self.bot_seat, terrain,
+                      self.now(), tick)
+        self.assertFalse(self.bot_conn.body.on_ground, "这一格该离地了")
+        for step in range(1, 40):
+            bot._own_step(self.room, self.bot_conn, self.bot_seat, terrain,
+                          self.now(), tick + step)
+            if self.bot_conn.body.air_jumped:
+                break
+        else:
+            self.fail("40 格都没按出第二段跳，前提不成立")
+        self.assertFalse(self.bot_conn.nav_double_jump,
+                         "第二跳已经按下去了，旗子不该还举着")
+
+    def test_a_hit_in_mid_air_does_not_buy_another_second_jump(self):
+        """★★★★★ 端到端：**空中挨一枪不该再多跳一次**（V0.3 §179）。
+
+        实机 22:07:38~41 bot 5 一段腾空里发了 **5 发第 2 段 `rpJump`**
+        （协议上最多 1 发，§124），整局 56 段腾空里有 8 段是这样；
+        37 发「多出来的第 2 段」里 **35 发（95%）** 在前 1 秒内挨过打，
+        距离上一发命中中位 **33 ms**。
+        """
+        terrain = self.gap_room("gap_hit_midair", 300)
+        tick = self.loop().done
+        self.bot_conn.intent = self.walk_east(terrain)
+        bot._own_step(self.room, self.bot_conn, self.bot_seat, terrain,
+                      self.now(), tick)
+        for step in range(1, 40):
+            bot._own_step(self.room, self.bot_conn, self.bot_seat, terrain,
+                          self.now(), tick + step)
+            if self.bot_conn.body.air_jumped:
+                break
+        else:
+            self.fail("40 格都没按出第二段跳，前提不成立")
+        # 这会儿：人在空中、第二段已经用掉。挨一枪。
+        self.assertFalse(self.bot_conn.body.on_ground)
+        bot._knock_back_seat(self.room, self.bot_seat, 8, (4.0, -1.0),
+                             source="用例")
+        self.assertTrue(self.bot_conn.body.air_jumped,
+                        "挨一枪不该把第二段跳还回来")
+        # ★ 旗子重新举起来（实机就是这样：`nav_double_jump` 只在落地才清，
+        #   而 `_walk_to()` 腾空那一支每格都会照着它再问一次 `at_apex`）。
+        self.bot_conn.nav_double_jump = True
+        stage_two = 0
+        for step in range(40, 90):
+            point = bot._own_step(self.room, self.bot_conn, self.bot_seat,
+                                  terrain, self.now(), tick + step)
+            if point is not None and point[2] == 2:
+                stage_two += 1
+            if point is not None and point[3]:
+                break                   # 落地了，这一段结束
+        self.assertEqual(0, stage_two,
+                         "同一段腾空里又按出了 %d 次第二段跳" % stage_two)
 
     # -- ★★★ §146：「目标在上面」不等于「现在就该跳」 --------------------
 
@@ -9179,6 +10693,54 @@ class BotGapJumpTests(TerrainMixin, BotFrameRoom):
         intent = bot._walk_to(self.room, self.bot_conn, terrain,
                               (1100.0, 700.0), False)
         self.assertEqual(0, intent[0], "不该往缝里走")
+
+    # -- ★★★★★ V0.3 §177：冰塔尖尖那个 1 像素夹层，只有「掉下去」一条出路 --
+
+    def test_a_bot_on_the_ice_eaves_walks_off_it(self):
+        """★★★★★ 实机 `Iceria03` 2026-09-04 00:08:52.0~00:09:37.8：bot 3 在
+        (1213, 858) 钉了 **45.8 秒**，直到一发强度 20 的近身把它轰出 640
+        像素。心跳里的形状：位置一动不动、`on_ground` 恒 0、`v=(7, 0)`。
+
+        地形（列 1214）：`857 实心 / 858 空 / 859 实心（冰檐下尖）/ 860 空`。
+        859 是站立面、头顶只有 1 像素 ⇒ 走不动（一整步跨出去落在冰体里）、
+        跳不起来（当场撞顶）⇒ 「跳 → 撞顶 → 落回原处」两格一个周期。
+        唯一的出路是从檐口**掉下去**，那正是这一条新加的。
+        """
+        terrain = self.install_terrain(mapdata.load("Iceria03"))
+        self.bot_conn.character_id = 1
+        who = chrprops.get(self.bot_conn.character_id)
+        self.place_bot(1214.0, 859.0)
+        self.assertFalse(botmove.fits(terrain, 1214.0, 859.0, who),
+                         "这一格该是塞不进去的（前提没了测试就不成立）")
+        intent = bot._unstick_intent(self.room, self.bot_conn, terrain)
+        self.assertIsNotNone(intent, "卡住了就该有脱困动作")
+        self.assertEqual((-1, False, False, False), intent,
+                         "该往左走出檐口，不是原地蹦")
+
+    def test_the_ice_eaves_deadlock_is_gone_end_to_end(self):
+        """★★★★★ 端到端逐格重放：改之前 24 格一步没挪，改之后掉到合法地面。"""
+        terrain = self.install_terrain(mapdata.load("Iceria03"))
+        self.bot_conn.character_id = 1
+        who = chrprops.get(self.bot_conn.character_id)
+        self.place_bot(1214.0, 859.0)
+        for _ in range(24):
+            intent = bot._unstick_intent(self.room, self.bot_conn, terrain)
+            direction, jump, drop, fast = intent or (0, False, False, False)
+            for offset in range(bot.BOT_DECISION_TICKS):
+                self.bot_conn.body = botmove.tick(
+                    terrain, self.bot_conn.body, who, direction=direction,
+                    fast_run=fast, want_jump=jump and offset == 0,
+                    want_drop=drop and offset == 0)
+            if (self.bot_conn.body.on_ground
+                    and botmove.fits(terrain, self.bot_conn.body.x,
+                                     self.bot_conn.body.y, who)):
+                break
+        else:
+            self.fail("24 格决策还没脱困 —— 死锁还在")
+        self.assertTrue(botmove.fits(terrain, self.bot_conn.body.x,
+                                     self.bot_conn.body.y, who))
+        self.assertNotEqual((1214.0, 859.0),
+                            (self.bot_conn.body.x, self.bot_conn.body.y))
 
     # -- ★★★★★ V0.3 §174：躲避是 §152 那条 `fits()` 的第四个挂点 ---------
 
@@ -9555,10 +11117,47 @@ class HeartbeatCadenceTests(BotFrameRoom):
 
     def test_three_ticks_are_not_enough_for_a_second_one(self):
         self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+        self.advance_to_own_beat()          # ★ 相位按座位错开（§183）
         self.clear()
         self.advance(gameserver.HEARTBEAT_TICKS - 1)
         self.assertEqual([], self.beats_only())
 
+    def test_the_beat_phase_follows_the_seat(self):
+        """★★★★ **心跳相位按座位错开**（V0.3 §183）：一格里不再挤好几发。
+
+        以前所有 bot 全踩 `tick % 4 == 3`，**一格正常就产十来份包**
+        （每个 bot 一发心跳 + 那一格的事件包 + 真人转发），发送线程醒一次
+        并成一次写。错开之后正常一格只剩 1~2 发心跳，下行不再一阵一阵地灌。
+
+        ★ 每个 bot 自己的节奏一点没变：还是 4 格一发 = 128 ms。
+        ⚠ 这**不是**在治卡顿：并走要看得见，得让**同一个角色的两发心跳**
+          落进客户端的同一帧（收方每帧 recv 一次、把包全分发完，每发心跳
+          做一次 0.6/0.4 收敛，§120 + `0x504215`），那需要队里压 84 ms
+          以上，而实测端到端最大 38 ms。见 §183。
+        ⚠ 当初**另一半**动机是「把 `★发送队列积压新高` 那个诊断救回来」，
+          那一半已作废（§184）：份数在原理上分不开「正常一格」和「被饿住」，
+          诊断已改看「包在队里躺了多久」。这一条测的是相位本身，与诊断无关。
+        """
+        self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
+        self.clear()
+        seat = self.bot_seat
+        ticks = []
+        for _ in range(gameserver.HEARTBEAT_TICKS * 4):
+            seen = len(self.beats_only())
+            self.advance(1)
+            if len(self.beats_only()) > seen:
+                ticks.append(self.loop().done - 1)
+        self.assertEqual(4, len(ticks), "节奏该没变：16 格里 4 发")
+        for tick in ticks:
+            self.assertEqual(
+                gameserver.HEARTBEAT_TICKS - 1,
+                (tick + seat) % gameserver.HEARTBEAT_TICKS,
+                "座位%d 的心跳该落在 (tick + 座位) %% 4 == 3 那一格，"
+                "实际 tick=%d" % (seat, tick))
+        self.assertNotEqual(
+            [gameserver.HEARTBEAT_TICKS - 1] * len(ticks),
+            [t % gameserver.HEARTBEAT_TICKS for t in ticks],
+            "座位 %d 的相位没被错开（还踩着老的 tick %% 4 == 3）" % seat)
 
 class CatchUpHeartbeatTests(BotFrameRoom):
     """★★★★★ 追赶时**不刷位置心跳**（V0.3 §153 / D115）。
@@ -9592,7 +11191,7 @@ class CatchUpHeartbeatTests(BotFrameRoom):
     def test_a_burst_that_swallowed_no_beat_owes_nothing(self):
         """★ 追赶只跨了一两格、没吞掉任何一发时，不该凭空多补一发。"""
         self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
-        self.advance(gameserver.HEARTBEAT_TICKS)   # 相位对齐到刚发完
+        self.advance_to_own_beat()          # ★ 相位按座位错开（§183）
         self.clear()
         self.loop().advance(2, burst=True)
         self.assertEqual([], self.beats_only())
@@ -9606,6 +11205,13 @@ class CatchUpHeartbeatTests(BotFrameRoom):
         ticks = gameserver.HEARTBEAT_TICKS * 4
 
         def run(burst):
+            # ★ 重开一局要**先拆再搭**：`BattleRoom.setUp` 会把 `LOBBY` /
+            #   `PEER_RELAY` / `TCP_RELAY_ENABLED` 存进 `self._saved_*` 再换掉，
+            #   而框架只调一次 `tearDown`。光调 `setUp()` 的话第二次存进去的
+            #   是**第一次那个替身**，最后还原回去的也是替身 —— 于是
+            #   `gameserver.PEER_RELAY` 被永久换成一个没接 UDP 旁路的实例，
+            #   本模块之后的每一个测试模块都在那个假接线上跑（2026-09-05 查出）。
+            self.tearDown()
             self.setUp()
             self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
             self.clear()

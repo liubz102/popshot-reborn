@@ -172,6 +172,65 @@ class SlopeAndWallTests(unittest.TestCase):
         self.assertFalse(botmove.blocked(t, body, Dummy(4.0), 0))
         self.assertFalse(botmove.leaves_ground(t, body, Dummy(4.0), 0))
 
+    def ledge_then_wall(self):
+        """脚下这块檐子只有 2 列宽，檐口外是空的，再往前 4 列是一堵高墙。
+
+        一整步（4 像素）跨过去正好落在墙里 —— 只问落点的话判「墙」，
+        而收方一格一格走，第 3 列就踩空掉下去了（V0.3 §177）。
+        """
+        width, height = 40, 60
+        rows = []
+        for y in range(height):
+            row = []
+            for x in range(width):
+                if 20 <= x <= 21 and y == 30:
+                    row.append("2")          # 檐子：两列宽、一像素厚
+                elif 24 <= x <= 27 and y >= 10:
+                    row.append("2")          # 高墙
+                elif y >= 55:
+                    row.append("2")          # 谷底
+                else:
+                    row.append("0")
+            rows.append("".join(row))
+        return terrain_from(rows)
+
+    def test_a_wall_behind_a_ledge_does_not_freeze_the_walker(self):
+        """★★★ 落点在墙里、可路上先有崖边 —— 该掉下去，不是原地不动。"""
+        t = self.ledge_then_wall()
+        who = Dummy(4.0)
+        body = botmove.Body(21.0, 30.0)
+        step = botmove.tick(t, body, who, direction=1)
+        self.assertFalse(step.on_ground, "檐口外就是空的 —— 该踩空")
+        self.assertAlmostEqual(22.0, step.x, msg="停在崖口那一列")
+        self.assertAlmostEqual(4.0, step.vx, msg="踩空时保持这一步的走速")
+        self.assertTrue(botmove.leaves_ground(t, body, who, 1))
+        self.assertFalse(botmove.blocked(t, body, who, 1))
+        landed = botmove.settle(t, step, who)
+        self.assertTrue(landed.on_ground)
+        self.assertAlmostEqual(55.0, landed.y)
+
+    def test_a_solid_wall_with_no_ledge_still_freezes(self):
+        """★ 反过来要保住：墙在崖边**前面**时人是真的走不过去。"""
+        width, height = 40, 60
+        rows = []
+        for y in range(height):
+            row = []
+            for x in range(width):
+                if 22 <= x <= 27 and y >= 10:
+                    row.append("2")          # 墙从紧邻那一列就立起来
+                elif y >= 30:
+                    row.append("2")
+                else:
+                    row.append("0")
+            rows.append("".join(row))
+        t = terrain_from(rows)
+        who = Dummy(4.0)
+        body = botmove.Body(21.0, 30.0)
+        step = botmove.tick(t, body, who, direction=1)
+        self.assertTrue(step.on_ground)
+        self.assertEqual(body.x, step.x, "撞墙就该原地不动")
+        self.assertTrue(botmove.blocked(t, body, who, 1))
+
 
 class DropThroughTests(unittest.TestCase):
     """按 ↓ 穿值-1 平台；实心地面绝不能穿。"""
@@ -997,6 +1056,66 @@ class RealTrapNodeTests(unittest.TestCase):
         self.assertGreater(total, 200, "采样太少，这个断言没意义")
         self.assertLess(100.0 * bad / total, 15.0,
                         "拒掉 %d/%d 个落脚点，过滤面太大了" % (bad, total))
+
+
+class IceSpikePocketTests(unittest.TestCase):
+    """★★★★★ `Iceria03` 冰塔尖尖那个 **1 像素夹层**（V0.3 §177）。
+
+    用户 2026-09-04 实机（`Iceria03:NewPvp`，00:08:25 那一局）：bot 3 从
+    **00:08:52.0 到 00:09:37.8**（45.8 秒）钉在 (1213, 858)，直到一发
+    强度 20 的近身把它轰出 640 像素才解脱。心跳里的形状：位置一动不动、
+    `on_ground` 恒 0、`v=(7, 0)`、掩码恒 0。
+
+    地形（列 1213）：`…857 实心 / 858 空 / 859 实心 / 860 起空`。
+    859 那一像素是冰檐的**下尖**，`surfaces()` 认它是站立面，可头顶
+    只有 1 像素净空 ⇒ `fits()` 为假、跳起来当场撞天花板、两侧一整步
+    跨出去都落在冰体里 ⇒ 「跳 -> 撞顶 -> 落回原处」两格一个周期。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.terrain = mapdata.load("Iceria03")
+        if cls.terrain is None:
+            raise unittest.SkipTest("没有 Iceria03 的地形产物")
+        cls.who = chrprops.get(1)
+
+    def test_the_pocket_is_still_a_pocket(self):
+        """★ 先把地形事实钉住：这一格塞不下人，而且它确实是个站立面。"""
+        self.assertIn(859, self.terrain.surfaces(1214))
+        self.assertEqual(0, self.terrain.cell(1214, 858))
+        self.assertGreaterEqual(self.terrain.cell(1214, 857), 2)
+        self.assertFalse(botmove.fits(self.terrain, 1214.0, 859.0, self.who))
+
+    def test_flying_into_it_still_lands_there(self):
+        """★ 进得去这件事**没**改（改的是出得来）—— 别把复现路径搞丢。"""
+        body = botmove.Body(1244.0, 902.0, -10.0, -14.0, on_ground=False)
+        for _ in range(8):
+            body = botmove.tick(self.terrain, body, self.who)
+        self.assertTrue(body.on_ground)
+        self.assertAlmostEqual(1214.0, body.x)
+        self.assertAlmostEqual(859.0, body.y)
+
+    def test_walking_off_the_eaves_is_possible_now(self):
+        """★★★ 往左走一步该从檐口掉下去（改之前是原地不动）。"""
+        body = botmove.Body(1214.0, 859.0, on_ground=True)
+        step = botmove.tick(self.terrain, body, self.who, direction=-1)
+        self.assertFalse(step.on_ground, "檐口左边就是空的 —— 该踩空")
+        landed = botmove.settle(self.terrain, step, self.who)
+        self.assertTrue(landed.on_ground)
+        self.assertTrue(botmove.fits(self.terrain, landed.x, landed.y, self.who),
+                        "掉下去要落在塞得下的地方，不能换一个坑")
+
+    def test_jumping_out_is_still_impossible(self):
+        """★ 头顶 1 像素 —— 跳和二段跳都出不去，所以「掉下去」是唯一出路。"""
+        for direction in (1, -1):
+            for lands in (botmove.jump_lands, botmove.double_jump_lands):
+                landing = lands(self.terrain, botmove.Body(1214.0, 859.0),
+                                self.who, direction)
+                self.assertTrue(
+                    landing is None
+                    or not botmove.fits(self.terrain, landing.x, landing.y,
+                                        self.who),
+                    "%s 方向 %+d 居然落到了合法点？" % (lands.__name__, direction))
 
 
 if __name__ == "__main__":

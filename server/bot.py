@@ -127,40 +127,33 @@ BOT_DEFAULT_CHARACTERS = tuple(BASE_CHARACTER_IDS)
 #: bot 命令的前缀。普通聊天不会以它开头，所以不会误吞玩家的话。
 COMMAND_PREFIX = "/"
 
-#: ★★ 三档 AI 难度只控制用户指定的两种失误（V0.3 M5）：
+#: ★★ 五档 AI 难度只控制用户指定的两种失误（V0.3 M5）：
 #:
-#: * `aim_error`：计算移动目标提前量时故意算错的概率；
+#: * `aim_error`：瞄准偏离目标、算错移动提前量的概率；
 #: * `dodge_error`：预测敌方弹道时故意判断错的概率。
 #:
-#: 其余物理、武器属性和寻路能力三档完全共用，避免“简单难度”靠违反游戏
+#: 其余物理、武器属性和寻路能力五档完全共用，避免“简单难度”靠违反游戏
 #: 规则来变笨。数值是 AI 设计参数，不冒充原版常量；集中在这里便于实机调优。
 #:
-#: ## ★★ 会话 41：三档 `aim_error` 整体 **+0.15**（用户 2026-08-30：「开枪
-#: 准确度还是太高了，三个难度的失误率再整体都调高一点点」）
-#:
-#: 校准的锚是**语料里真人自己的命中率**（§49）：4533 对几何配对的
-#: `rpFire`/`rpExplode` 里，**打中人的只有 1990 对 = 43.9%** —— 也就是说
-#: 真人**每 10 发有 5.6 发是打空的**。
-#:
-#: 而 bot 不掷失误的那一发是「弹道解得精确、提前量也解对了」，除非目标
-#: 临时变向否则基本必中 ⇒ 旧的中等档 0.22 相当于命中率 ~78%，**比真人高
-#: 一大截**，实机手感就是「隔着老远也弹无虚发」。
-#:
-#: 取值：中等 **0.40** —— 命中率约 60%，比真人的 44% **稍微聪明一点**
-#: （用户要的就是「适中又稍微偏聪明」）；简单 / 困难跟着平移同样的
-#: +0.15，保持三档之间原有的区分度。
-#: ⚠ `dodge_error` 这一轮**没动**（用户没提，而且它管的是躲不躲得开，
-#:   和「准不准」是两件事）。
+#: 会话 59（D139）由用户明确给出五档数值。档位是房间级的整数 1..5，
+#: 数字越大，瞄准和闪避失误越少；新房间和 `/d` 无参数都回到默认档 3。
 BOT_DIFFICULTY_PROFILES = {
-    "easy": {"aim_error": 0.60, "dodge_error": 0.55},
-    "medium": {"aim_error": 0.40, "dodge_error": 0.30},
-    "hard": {"aim_error": 0.23, "dodge_error": 0.12},
+    1: {"aim_error": 0.85, "dodge_error": 0.50},
+    2: {"aim_error": 0.65, "dodge_error": 0.40},
+    3: {"aim_error": 0.40, "dodge_error": 0.30},
+    4: {"aim_error": 0.20, "dodge_error": 0.15},
+    5: {"aim_error": 0.10, "dodge_error": 0.05},
 }
 BOT_DIFFICULTY_LABELS = {
-    "easy": "简单（笨）",
-    "medium": "中等",
-    "hard": "困难（聪明）",
+    1: "1（最简单）",
+    2: "2（简单）",
+    3: "3（普通，默认）",
+    4: "4（困难）",
+    5: "5（最难）",
 }
+BOT_DIFFICULTY_DEFAULT = 3
+BOT_DIFFICULTY_MIN = min(BOT_DIFFICULTY_PROFILES)
+BOT_DIFFICULTY_MAX = max(BOT_DIFFICULTY_PROFILES)
 
 
 # ---------------------------------------------------------------------------
@@ -197,10 +190,10 @@ def _tick_clock(now):
 
 
 def difficulty_profile(room):
-    """返回房间当前的两项失误概率；旧/假房间安全退回中等。"""
-    level = getattr(room, "bot_difficulty", "medium")
+    """返回房间当前的两项失误概率；旧/假房间安全退回默认档 3。"""
+    level = getattr(room, "bot_difficulty", BOT_DIFFICULTY_DEFAULT)
     return BOT_DIFFICULTY_PROFILES.get(
-        level, BOT_DIFFICULTY_PROFILES["medium"])
+        level, BOT_DIFFICULTY_PROFILES[BOT_DIFFICULTY_DEFAULT])
 
 #: ★★ **客户端自己就吃掉的斜杠前缀，起名字时必须避开**（§19）。
 #:
@@ -324,6 +317,13 @@ class BotConn(gameserver.Conn):
         self.deaths_broadcast = 0
         self.respawn_sent = 0
         self.room = None
+        #: ★ 这个 bot 坐在**哪个房间**里 —— 只给日志用（用户 2026-09-03：
+        #:   「bot 的 log 再加个房间号吧，以后再出问题好调查」）。
+        #:   bot 的日志行本来只有 `bot N`，多个房间同时开打时整份 log 混在
+        #:   一起，事后根本分不开是谁 —— §176 那次扫描为此只能丢掉 10 局。
+        #:   `_add_one_bot()` 建它的时候写一次，`tick_room()` 每格再刷一次
+        #:   （房间销毁重建时号会变）。
+        self.room_id = None
         self.channel_code = 0
         self.channel_index = 0
         self.last_position = None
@@ -386,6 +386,18 @@ class BotConn(gameserver.Conn):
         #: （报了就是一串挤在几毫秒里，收方看着像瞬移）；被跳过的那一发记在
         #: 这里，追平的那一格一起还。★ 不追赶时心跳的相位一个字没变。
         self.beat_pending = False
+        #: ★★★ **运动突变之后欠着一发锚点心跳**。
+        #:
+        #: 普通腾空的 `vy += 1.2; pos += v` 收方能逐格复现；受击、弹跳台、
+        #: 撞顶、离地/落地会离散地改速度或地面状态，原协议却没有给其中几类
+        #: 单独的事件。等固定 4 格节拍才报，会让收方继续按旧速度外推最多
+        #: 128 ms，再被下一发坐标拉回（V0.3 §185）。状态翻转发生在哪一格，
+        #: 就在哪一格补锚；追赶途中仍只记账，追平再发。
+        self.motion_anchor_pending = False
+        #: 上一格有没有被地形钉住某一轴。撞墙时模拟故意保留 `vx`（§95），
+        #: 但线上速度要报 0（§181）；只在「进入/离开钉住」时补锚，避免贴墙
+        #: 的每一格都多发一份心跳。
+        self.motion_blocked_axes = (False, False)
         #: ★ M5-B 的逐帧路径执行状态。`botnav.plan()` 返回落脚点边；这里保留
         #: 尚未走完的那一串，目标/地图/身体事实变化时再重算，不按挂钟重算。
         self.nav_path = []
@@ -429,6 +441,12 @@ class BotConn(gameserver.Conn):
         #: 这一帧是否在按 ↓ 穿单向平台。物理层读 `want_drop`，心跳层把它
         #: 翻成 `botsync.KEY_DOWN`；两边必须来自同一个决定。
         self.move_down = False
+        #: ★★★ 这一帧**真按着的左右方向键**（`+1` 右 / `-1` 左 / `0` 没按）。
+        #:
+        #: 心跳里那个六位掩码就是它（§39），`_own_step()` 每一格填一次 ——
+        #: 和 `move_down` 完全一个道理：物理层和心跳层必须来自**同一个决定**，
+        #: 不许由心跳层拿位移去反推（§177 / D140）。
+        self.press_dir = 0
         #: ★ 临时诊断（会话 17）：上一次打过的「为什么不开枪」，用来做状态翻转
         #:   去重。跟 `BOT_DIAG_FIRE_ANYWHERE` 一起删。
         self.diag_last_why = ""
@@ -527,6 +545,9 @@ class BotConn(gameserver.Conn):
         self.stance = "press"
         #: 拉开时那个后退落脚点 `(x, y)`；`None` = 还没挑 / 已经到了。
         self.retreat_goal = None
+        #: ★ 「横着找路」闩（`_unstall()`）：`0` = 没在找。解闩全是事件 ——
+        #:   走位重新给得出上下动作、打得到人了、或者这一侧走不动了。
+        self.probe_side = 0
         #: ★★ 上一次**真的迈出去**的走位方向（`_walk_to()` 的兜底那一路写）。
         #:   `0` = 还没走过。判「这一次掉头是不是只为了修一个走不满的零头」
         #:   要用它，见 `_walk_to()` 里那段（V0.3 §167）。
@@ -699,8 +720,11 @@ class BotConn(gameserver.Conn):
         self.leash_gap = 0.0
         self.leash_anchor = None
         self.move_down = False
+        self.press_dir = 0
         self.down_latch = False
         self.beat_pending = False
+        self.motion_anchor_pending = False
+        self.motion_blocked_axes = (False, False)
         self.trail_mark = None
         self.trail_heading = 0
         self.load_progress = None
@@ -756,6 +780,7 @@ class BotConn(gameserver.Conn):
         self.auto_weapon_id = None
         self.stance = "press"
         self.retreat_goal = None
+        self.probe_side = 0
         self.walk_last = 0
         self.walk_goal = None
         self.dodge_signature = None
@@ -860,7 +885,8 @@ class BotConn(gameserver.Conn):
         # ★★ 异步（用户 2026-09-01）：这个函数几乎总是在 `room.sim_lock` 里面被
         #    调到（`_tick_bot` 整格持锁），同步写盘就是整个房间跟着等磁盘，
         #    而真人的 `forward_peer_data` 又在等同一把锁。见 `asynclog.py` 开头。
-        asynclog.emit(f"[{gameserver.ts()}] {self.nickname} {msg}")
+        where = "" if self.room_id is None else f"房#{self.room_id} "
+        asynclog.emit(f"[{gameserver.ts()}] {where}{self.nickname} {msg}")
 
     def online(self, msg):
         """bot 的上下线不进运营事件日志 —— `online.log` 记的是真人的流水。"""
@@ -911,16 +937,17 @@ class BotConn(gameserver.Conn):
 #: 54 宽在框里没折，往回收一点留余量。改这张表时请用同样的口径数宽度
 #: （中文和全角标点算 2，ASCII 算 1）。
 HELP_LINES = (
-    "bot 命令（房主专用，N = 座位号，/? 重看）：",
+    "bot 命令（房主专用，N = 座位号，/h 重看）：",
     "/a [n] 加 n 个（默认 1）;  /r 全部准备（再敲取消）",
     "/c N M 换角色（M=1~3）;  /t N 换队（组队战）",
-    "/s 简单; /m 中等; /h 困难; /w 0 自动换枪",
+    "/d [1~5] 难度（无数字=默认3）;  /w 0 自动换枪",
 )
 
-#: ★ **战斗中**的 `/?`。房间里那几条会被 `MUTATING_COMMANDS` 挡掉，列出来
-#: 只会占满那 4 行的额度（§20），所以这里只放战斗中真能用的两条。
+#: ★ **战斗中**的 `/h` / `/help` / `/?`。房间里那几条会被
+#: `MUTATING_COMMANDS` 挡掉，列出来只会占满那 4 行的额度（§20），
+#: 所以这里只放战斗中真能用的命令。
 BATTLE_HELP_LINES = (
-    "AI：/s 简单; /m 中等; /h 困难; /w 0 自动",
+    "AI：/d [1~5] 难度（/d=默认3）; /h 帮助",
     "/w M 锁武器; /hold N 站住; /dash 近身开关",
     "查子弹: /noboom 只飞不炸;  /slow 降到 1/10 速",
 )
@@ -942,13 +969,12 @@ def parse_command(text):
     return parts[0].lower(), parts[1:]
 
 
-#: 命令名 -> 处理函数。`/?` 是 `/help` 的短别名；`/h` 已按用户要求改成
-#: 困难难度，不能再同时当帮助。
+#: 命令名 -> 处理函数。`/h` 和 `/?` 都是 `/help` 的短别名。
 #: 在这张表里 = 「这是一条 bot 命令」，命令层据此决定要不要吞掉这行聊天。
 #:
 #: ★ `team` 还在表里，但它**不是**换队命令，只是一行「请改用 /t」的提示
 #: —— 客户端自己把 `/team ` 当队伍聊天吃掉了，服务端根本收不到（§19）。
-COMMAND_NAMES = ("a", "c", "t", "team", "r", "s", "m", "h", "w",
+COMMAND_NAMES = ("a", "c", "t", "team", "r", "d", "h", "w",
                  "hold", "help", "?")
 
 
@@ -1013,6 +1039,7 @@ def _add_one_bot(conn, room):
     if index is None:
         return None, "房间已经满了（6 个座位都有人），先把 bot 踢掉一个再加。"
     machine = BotConn(index)
+    machine.room_id = room.room_id          # ★ 日志前缀要它（用户 2026-09-03）
     # ★ 房间级 `/w` 要覆盖**后来加入**的 bot。0 = 自动，因此机器态用 None；
     # 1..3 = 锁定。房间跨游戏局保留、销毁房间后重建默认 0（Room.__init__）。
     room_slot = int(getattr(room, "bot_weapon_slot", 0) or 0)
@@ -1192,37 +1219,40 @@ def _battle_bots(room, args):
     return ([], error) if error else ([index], None)
 
 
-def _set_difficulty(conn, room, args, level):
-    """把全房间 bot 难度切到 `level`；三条短命令共用。"""
-    command = {"easy": "/s", "medium": "/m", "hard": "/h"}[level]
-    if args:
-        extra = "（站桩诊断已迁到 /hold [座位号]）" if level == "easy" else ""
-        return f"{command} 不带参数。{extra}"
+def _cmd_difficulty(conn, room, args):
+    """`/d [1~5]` —— 统一设置全房间 bot；无参数恢复默认档 3。"""
+    usage = (f"/d 用法：/d [{BOT_DIFFICULTY_MIN}~{BOT_DIFFICULTY_MAX}]"
+             f"（不填数字恢复默认 {BOT_DIFFICULTY_DEFAULT}）。")
+    if len(args) > 1:
+        return usage + " 难度只能统一调整，不能指定单个 bot。"
+    if not args:
+        level = BOT_DIFFICULTY_DEFAULT
+    else:
+        try:
+            level = int(args[0])
+        except ValueError:
+            return usage
+        if level not in BOT_DIFFICULTY_PROFILES:
+            return usage
+    changed = getattr(room, "bot_difficulty", BOT_DIFFICULTY_DEFAULT) != level
     room.bot_difficulty = level
+    if changed:
+        for index in room.bot_seats():
+            machine = room.seats[index].conn
+            if isinstance(machine, BotConn):
+                _reroll_aim_miss(machine)
+                machine.intent_tick = None
+                machine.dodge_at = None
+                machine.dodge_signature = None
     profile = difficulty_profile(room)
     label = BOT_DIFFICULTY_LABELS[level]
-    conn.log(f"   {command}: bot 难度 -> {level} "
+    conn.log(f"   /d: bot 难度 -> {level} "
              f"瞄准失误={profile['aim_error']:.0%} "
              f"闪避失误={profile['dodge_error']:.0%}")
     conn.room_system_chat(
-        f"全体 bot 已调为{label}难度（瞄准失误 {profile['aim_error']:.0%}，"
+        f"全体 bot 难度已设为 {label}（瞄准失误 {profile['aim_error']:.0%}，"
         f"闪避失误 {profile['dodge_error']:.0%}）。")
     return None
-
-
-def _cmd_easy(conn, room, args):
-    """`/s` —— 全房间 bot 切到简单（笨）难度。"""
-    return _set_difficulty(conn, room, args, "easy")
-
-
-def _cmd_medium(conn, room, args):
-    """`/m` —— 全房间 bot 切到中等难度（新房间默认）。"""
-    return _set_difficulty(conn, room, args, "medium")
-
-
-def _cmd_hard(conn, room, args):
-    """`/h` —— 全房间 bot 切到困难（聪明）难度。"""
-    return _set_difficulty(conn, room, args, "hard")
 
 
 def _cmd_hold(conn, room, args):
@@ -1523,18 +1553,17 @@ def _cmd_help(conn, room, args):
 
 #: 命令名 -> 处理函数。
 #:
-#: ★★ 名字全部是**一个字母**（用户 2026-08-28 要的，D56）：这些命令是在
-#: **游戏里的聊天框**敲的，打字要占住键盘、bot 那边还在打你 —— 每多一个
-#: 字母都是实打实的代价。`/del` 整条删掉了，踢 bot 用**客户端自带的踢人**。
+#: ★★ 常用房间命令优先用**一个字母**（用户 2026-08-28 要的，D56）：这些
+#: 命令是在游戏聊天框里敲的，打字时 bot 仍在行动。诊断命令保留可读长名；
+#: `/del` 整条删掉了，踢 bot 用**客户端自带的踢人**。
 COMMANDS = {
     "a": _cmd_add,
     "c": _cmd_char,
     "t": _cmd_team,
     "team": _cmd_team_alias,
     "r": _cmd_ready,
-    "s": _cmd_easy,
-    "m": _cmd_medium,
-    "h": _cmd_hard,
+    "d": _cmd_difficulty,
+    "h": _cmd_help,
     "w": _cmd_gun,
     "hold": _cmd_hold,
     "dash": _cmd_dash,
@@ -1544,8 +1573,8 @@ COMMANDS = {
     "?": _cmd_help,
 }
 
-#: 改房间状态的命令 —— 游戏中一律拒绝。`/help` 不在里面，随时能看。
-#: `team` 也不在里面：它只是一行「请改用 /t」的提示，什么都不改。
+#: 改座位 / 准备状态的命令 —— 游戏中一律拒绝。`/d`、`/w` 与三种帮助名
+#: 不在里面，战斗中照样能用。`team` 也不在里面：它只是一行提示，什么都不改。
 MUTATING_COMMANDS = ("a", "c", "t", "r")
 
 
@@ -2645,7 +2674,27 @@ def _knock_back_seat(room, seat_index, damage, push, source="?"):
             vy = min(vy, KNOCKBACK_MIN_LIFT)
         # ★ 甲档一定离地：`0x50f8c3` 那条尾巴无论 v.y 正负都落到
         #   `0x50f947`，把「我踩在地上」那一位清掉。
-        machine.body = botmove.Body(body.x, body.y, vx, vy, on_ground=False)
+        #
+        # ★★★★★ `air_jumped` **必须原样带过来**（V0.3 §179）。原版这一段
+        #   清的是 `[char+0x128]`（「我踩在地上」），**不是**第二段跳那本账
+        #   —— `rpJump` 的段号只有 1 / 2（§124），一段腾空里第二段用过就没了，
+        #   挨一枪不会把它还回来。这里不带的话 `Body.__init__` 的缺省值
+        #   `air_jumped=False` 会**白送一次二段跳**：
+        #   实机 22:07:38~41 bot 5 在一段腾空里连发 **5 发第 2 段 `rpJump`**，
+        #   一路蹦到地图顶（y=0）贴着天花板飞了 800 像素 —— 用户报的
+        #   「在空中的抛物线轨迹上不停的前后闪」就是每挨一枪多出来的那一脚。
+        #   ★ 本来在地上被顶飞的那一批不受影响：`Body.__init__` 对
+        #     `on_ground=True` 的身体强制 `air_jumped=False`，带过来还是 False。
+        changed = botmove.Body(body.x, body.y, vx, vy, on_ground=False,
+                               air_jumped=body.air_jumped)
+        machine.body = changed
+        if changed != body:
+            # ★ 受击是离散速度变化。`rpExplode` 的直接命中包里没有 push，
+            # 收方拿自己那颗弹体的速度现算；即使两边只差一个碰撞 tick，
+            # 下一发固定节拍心跳也会把轨迹来回拉。让受害者的下一格立即把
+            # 服务端权威运动状态锚回去（§185）。
+            machine.motion_anchor_pending = True
+            machine.motion_blocked_axes = (False, False)
         # ★ 日志里把「push 到底给没给」写清楚 —— 伤害正好 10 的那一发
         #   原版只夹 `v.y`、一点 push 都不给（`0x50f864` 的 `jle`），
         #   不标出来的话日志上写着 push 却看不见位移，下次又要查一轮。
@@ -2669,6 +2718,10 @@ def _knock_back_seat(room, seat_index, damage, push, source="?"):
                        "乙档", note="滑不过去（那一列没有够得着的站立面）")
         return
     machine.body = botmove.Body(x, float(surface), on_ground=True)
+    if machine.body != body:
+        # 乙档是在地面上瞬时滑 `push.x * 3`，同样不是普通方向键步进。
+        machine.motion_anchor_pending = True
+        machine.motion_blocked_axes = (False, False)
     _log_knockback(room, machine, source, damage, push, body, "乙档")
 
 
@@ -3535,6 +3588,17 @@ def _item_goal(room, machine, seat_index):
     一个寻路目标 —— 走过去这件事本身仍然由 `botnav` 的真实物理决定
     （够不着的高台上那件自然就规划不出路线，也就不去了）。
     """
+    row = _item_goal_row(room, machine, seat_index)
+    return None if row is None else (row[0], row[1])
+
+
+def _item_goal_row(room, machine, seat_index):
+    """`_item_goal()` 的完整答案：`(距离, 坐标, 句柄)`。
+
+    ★ 多出来的**句柄**是给「这一件还在不在地上」用的。`items_at` 会在
+    两件事上把它删掉：被谁捡走了（`claim_item`）、13 秒到期自灭
+    （`ITEM_LIFE_SECONDS`，抄客户端 `Item::Tick`）—— 两件都是**事件**。
+    """
     quest = None if room is None else room.quest
     body = machine.body
     if quest is None or body is None:
@@ -3543,13 +3607,13 @@ def _item_goal(room, machine, seat_index):
     if not items:
         return None
     best = None
-    for _handle, spot in items.items():
+    for handle, spot in items.items():
         span = math.hypot(spot[0] - body.x, spot[1] - body.y)
         if span > BOT_ENGAGE_RANGE:
             continue                      # 半张图外的东西不值得专门跑一趟
         if best is None or span < best[0]:
-            best = (span, (float(spot[0]), float(spot[1])))
-    return None if best is None else best
+            best = (span, (float(spot[0]), float(spot[1])), handle)
+    return best
 
 
 def _speed_scale(machine, now):
@@ -4000,11 +4064,45 @@ def pick_respawn_point(room, seat_index):
 BOT_VISION_HALF_X = 1024.0
 BOT_VISION_HALF_Y = 768.0
 
-#: 视野内没有敌人时的血量滞回（用户 2026-09-01 拍板）。
-#: 严格小于 25% 才转隐蔽，严格大于 50% 才转逼近；中间保持
-#: 上一姿态，治掉治疗/伤害在边界上让 bot 来回掉头。
-BOT_BLIND_HIDE_BELOW = 0.25
-BOT_BLIND_PRESS_ABOVE = 0.50
+#: ★★★★★ 血量姿态的两道门（用户 2026-09-01 给的数，2026-09-03 改的语义）。
+#:
+#: **旧语义（D119，已废）**：低于 25% 去躲掩体、高于 50% 主动接近。
+#: 躲掩体是个**没有出口的停机状态**（§175 / §176：一躲下去位置不变、
+#: 血不会自愈、粗方位也不变，于是解锁条件永远不成立），线上四次
+#: 「所有 bot 卡住不动」全是它。
+#:
+#: **新语义（D137，用户 2026-09-03）**：「无论怎样，全都主动寻找并接近
+#: 敌人，禁止站在一个地方不动。但是血量影响 bot 的战斗策略，高于 50% 的
+#: bot 无所顾忌，正常进攻，血量低于 25% 的 bot 要偏向保守，会主动拉开
+#: 跟敌人的距离，尽量避免主动进入敌人 1/2 屏幕范围内。」
+#:
+#: ⇒ 两个数一个没变，**只是不再有「躲」这个动作**：低血量改成
+#:   「维持一个距离环」（`BOT_KEEP_AWAY_SPAN`），环本身跟着敌人走，
+#:   所以它天生不是静止点。中间那一档（25%~50%）继续用 D77 的 TTK
+#:   两道迟滞门，没有新事实就不做新决定。
+#: ★ 严格不等号：恰好 25% / 50% 不翻。
+BOT_LOW_HEALTH = 0.25
+BOT_HIGH_HEALTH = 0.50
+
+#: ★★★ 保守姿态要保持的距离 —— **半个屏幕**（用户 2026-09-03：
+#: 「尽量避免主动进入敌人 1/2 屏幕范围内」）。
+#:
+#: 客户端分辨率是 **1024 × 768**（`BOT_VISION_HALF_X/Y` 就是按它定的），
+#: 半个屏幕宽 = 512。这不是我们挑的数，是用户给的规则 + 原版的分辨率。
+BOT_KEEP_AWAY_SPAN = 512.0
+
+#: ★★★ 「靠近能不能变好」这个问题里的**参照距离** —— 真人命中距离的中位数。
+#:
+#: §48 那份分布是「真人**打中了角色**的 247 发」的开火点到爆炸点距离：
+#: `p10=264 / 中位=616 / p99=1015`。`BOT_ENGAGE_RANGE`（1000）取的是 p99
+#: ——「再远就几乎打不中了」，那是**开不开枪**的门。这里取中位数，是
+#: `_worth_closing()` 拿来问「**要是压到真人常打中的那个距离，我的输出会不会
+#: 明显变好**」的参照点 —— 它本身**不是**一道「必须走进来」的门。
+#:
+#: ⚠ 2026-09-03 用户改过一次口径：上一版这里是「超过它就必须压上去」，
+#: 用户否掉了 ——「用狙击枪远程打也是常见玩法。不要求非要贴上去，我希望
+#: 血量足够时 bot 能自己判断是否追击的策略」。见 D138。
+BOT_HOLD_RANGE = 616.0
 
 
 def _in_sight(machine, x, y):
@@ -4108,15 +4206,6 @@ def _enemy_spot(room, machine, seat_index):
 BOT_RETREAT_RATIO = 1.25
 BOT_PRESS_RATIO = 0.80
 
-#: 一次后撤最多往回退多远（世界单位）。
-#:
-#: 出处是 §48 那份真人交战距离分布：命中距离 p10 = 264、中位 616。
-#: 退掉半个中位数 ≈ 一次有效的脱离，而不是「跑到图那头去」——
-#: 真人拉开距离也就是退一个屏幕宽的一半。
-BOT_RETREAT_SPAN = 320.0
-
-#: 找后撤落脚点时的扫描粒度 = A\* 的路点分辨率，省得挑出一个规划器分不开的点。
-BOT_RETREAT_STEP = botnav.KEY_X
 
 
 def _seat_weapon(room, seat_index):
@@ -4178,6 +4267,123 @@ def nominal_speed(room, seat_index):
         chrprops.get(0 if seat is None else seat.character_id))
 
 
+def _worth_closing(room, machine, seat_index, enemy_index, span):
+    """**追不追** —— 压到真人的中位交战距离上，我的输出会不会明显变好（D138）。
+
+    用户 2026-09-03：「用狙击枪远程打也是常见玩法。不要求非要贴上去，
+    我希望血量足够时 bot 能自己判断是否追击的策略，不代表一定要贴上去，
+    在远程用远程武器打也是可以的。」
+
+    ⇒ 判据**不是一个死的距离常数**，是这把枪在两个距离上的真实输出：
+    `_seconds_to_kill()`（`botarms.score()` 算的每秒有效伤害，含几何命中
+    概率、溅射、原版的伤害 / 射速 / 弹道）在**当前距离**和 `BOT_HOLD_RANGE`
+    （§48 的中位命中距离 616）上各算一次，压过去之后「打倒他要几秒」
+    **明显**更短才追。
+
+    「明显」用的是 `BOT_PRESS_RATIO`（0.80）—— 和姿态那两道迟滞门同一个数、
+    同一个意思（要明显更占便宜才改主意），不是新拍的常数。
+
+    ⇒ 狙击 / 火箭这类远距离不吃亏的，两头差不多 ⇒ **不追，就地打**；
+      散弹这类在一千像素外几乎打不着的 ⇒ **追**。
+      `Forest02` 那一局两个 bot 隔着 1013 像素站了 161 秒（§176 ②）就是
+      后一种：它们手上的枪在那个距离上根本没有输出。
+
+    ★ 已经在中位距离之内就不用再问了（再压近只是白送身位）。
+    ★ 算不出来（那把枪在这个距离上弹道无解）⇒ 追 —— 那正是「够不着」。
+    """
+    if span <= BOT_HOLD_RANGE:
+        return False
+    # ★★★ 两次都用**名义走速**（`_seconds_to_kill` 的默认），不是实测速度。
+    #   实测会形成自反馈，而且形状正是我们要治的那个：他站着不动 ⇒ 打他
+    #   不吃距离的亏 ⇒ 「压过去没好处」⇒ 我也站着不动 ⇒ 他更没理由动。
+    #   `Forest02` 那 161 秒（§176 ②）就是这个不动点。问的应该是
+    #   「**正常交火**下压过去值不值」，和 `_stance()` 对自己那一侧同一个道理。
+    now = _seconds_to_kill(room, seat_index, enemy_index, span)
+    if now is None:
+        return True                 # 这个距离上根本打不出输出 = 够不着
+    close = _seconds_to_kill(room, seat_index, enemy_index, BOT_HOLD_RANGE)
+    if close is None:
+        return False                # 压过去反而没输出 —— 那就别压
+    return close <= now * BOT_PRESS_RATIO
+
+
+#: ★★★ 真人**腾空**的时间占比 —— §71 那份 144 万发心跳量出来的：
+#: 站着不动 **39%** / 在地上走 23% / **腾空 39%**（一次跳中位 11 发心跳 ≈ 1.4 秒）。
+#: 「就地打」按这个比例掷骰子起跳。
+#:
+#: ⚠ **不能「一落地就跳」**（那一版写过，2026-09-03 当场推翻）：那样腾空占比
+#: 会到 **90%**，比真人高一倍还多；更要命的是**腾空时方向键一点用都没有**
+#: （§93）—— `_dodge_intent()` 那一整套（M5-E）会因此整局失效，bot 反而更好打。
+BOT_AIRBORNE_SHARE = 0.39
+
+#: 起跳到落回同一高度要几个 tick：`2 v0 / g`（§71 的 20 / 1.2）。
+#: 只用来把 `BOT_AIRBORNE_SHARE` 折算成「每格决策起跳的概率」，
+#: 真正的弧线还是 `botmove` 逐 tick 推的。
+BOT_JUMP_TICKS = 2.0 * botmove.JUMP_SPEED / botmove.GRAVITY
+
+
+def _reloading(machine, weapon, now):
+    """手上这把枪**这会儿正在换弹 / 上膛**吗（V0.3 §178 / D141）。
+
+    ★ 弹匣里那点冷却（`CoolingTime`，140~220 ms）**不算** —— 连打一匣中间
+      站着是原版节奏。算的是 `ReloadTime` / `LoadingTime` 那一档
+      （720~2500 ms），那一段站着一发也打不出来。
+
+    判据全部来自既有记账，**没有新常量**（§126 那三张倒计时表）：
+
+    * `rounds_left is None` = 弹匣不在手上 —— 刚打空（`_reload_after_shot()`
+      清成 None 并压上 `ReloadTime`）／这把枪本来就没有弹匣（榴弹、火箭那类
+      打一发装一次，等的就是 `ReloadTime`）／刚换过来还没打第一发；
+    * `rounds_left` 是个数 = 弹匣里还有子弹，等的是 `CoolingTime`。
+
+    ⚠ 换枪回到一个**打了一半的弹匣**上时这里说「不在换弹」，而那一段等的
+      其实是 `LoadingTime` —— 判不出来是因为 `next_fire_at` 只记「什么时候
+      能打」、不记「为什么在等」。真要分得开就得再加一格状态，眼下不值。
+    """
+    if weapon is None:
+        return False
+    return machine.rounds_left is None and now < machine.next_fire_at
+
+
+def _shoot_move(machine):
+    """「就地打」那一格的动作 —— **边跳边打**，不是站着不动（D138）。
+
+    用户 2026-09-03：「『站着不动仅开枪』我想改一改，变成边跳跃躲子弹边
+    开枪，因为真人在绝大多数情况也都是边跳跃躲子弹边开枪的。」
+
+    ## 跳多勤：**照语料的腾空占比**，不是一落地就跳
+
+    §71 量过真人的 144 万发心跳：站着不动 39% / 地上走 23% / **腾空 39%**。
+    要让腾空占到 `share`，落地之后每一格决策起跳的概率就得是
+
+        p = share × 每格决策的 tick 数 ÷ (一次跳的 tick 数 × (1 − share))
+
+    —— 一次跳约 33 个 tick、一格决策 2 个 tick ⇒ p ≈ 3.9%，也就是大约
+    每 1.7 秒起跳一次，腾空正好占 39%。★ 这不是「每 N 毫秒跳一次」那种
+    时序阈值（铁律 10 禁的是拿观测值当阈值来掩盖竞态）；这里掷骰子是为了
+    **行为不整齐**，和瞄准失误（M5-D）、碎片角度用的是同一颗骰子。
+    ★ 一落地就跳会把腾空推到 90%，而腾空时方向键不起作用（§93），
+      `_dodge_intent()` 整套就废了 —— bot 反而更好打。
+
+    ★ 方向恒 `0`：起跳带走的是这一刻的走速（§93），站着起跳就是竖直上下
+      —— 「就地」说的就是不挪窝。真要挪窝的是别的分支。
+    ★ 扳机不归这里管：`_tick_bot()` 照旧按 `machine.aim` 扣，而真开火那一格
+      会重解一次弹道（§62），所以腾空开枪的枪口坐标是对的。
+    ★ 真有子弹飞过来时轮不到这一支 —— `_dodge_intent()` 排在它**前面**
+      （M5-E），躲避那一套自己会挑跳 / 蹲 / 走。
+    """
+    body = machine.body
+    if body is None or not body.on_ground:
+        return (0, False, False, False)
+    share = BOT_AIRBORNE_SHARE
+    chance = share * BOT_DECISION_TICKS / (BOT_JUMP_TICKS * (1.0 - share))
+    # ★ 骰子走 `machine.roll`（和瞄准失误、烟雾乱射同一颗）：只用 `roll(n)`，
+    #   单测钉得住 —— `BotFrameRoom.pin_roll` 钉成「永远掷到最大」= 永不起跳，
+    #   所以那一大批断言「站着不动」的老用例一个都不用改。
+    unit = machine.roll(botaim.ROLL_RESOLUTION) / float(botaim.ROLL_RESOLUTION)
+    return (0, unit < chance, False, False)
+
+
 def _stance(room, machine, seat_index, enemy_index, span):
     """这一刻该逼近还是该拉开 —— 返回 `"press"` / `"retreat"`。
 
@@ -4197,7 +4403,19 @@ def _stance(room, machine, seat_index, enemy_index, span):
 
     算不出来（对面还没露过面、这把枪够不着）时**保持原来的姿态** ——
     没有新事实就不做新决定。
+
+    ## ★★★★★ 自己的血先说话（D137，用户 2026-09-03）
+
+    「高于 50% 的 bot 无所顾忌，正常进攻，血量低于 25% 的 bot 要偏向保守。」
+    ⇒ 两头是**硬边界**，TTK 只在中间那一档说话。以前这两个数只管框外
+    （D119 的 `BOT_BLIND_*`），框内框外两套判据 —— 于是同一个 bot 走出
+    视野框姿态就翻一次。现在**同一套**。
     """
+    health = _seat_health(room, seat_index)
+    if health > BOT_HIGH_HEALTH:
+        return _set_stance(machine, "press")
+    if health < BOT_LOW_HEALTH:
+        return _set_stance(machine, "retreat")
     # ★★★ 两边喂的速度**故意不对称**，这不是笔误：
     #   * 「我要几秒打倒他」—— 他动多快是**外生**的事实，用实测速度；
     #   * 「他要几秒打倒我」—— 我动多快是**这个决定本身的结果**，
@@ -4213,61 +4431,53 @@ def _stance(room, machine, seat_index, enemy_index, span):
         return machine.stance
     if machine.stance == "retreat":
         if mine <= theirs * BOT_PRESS_RATIO:
-            machine.stance = "press"
-            machine.retreat_goal = None
+            return _set_stance(machine, "press")
     elif mine > theirs * BOT_RETREAT_RATIO:
-        machine.stance = "retreat"
-        machine.retreat_goal = None
+        return _set_stance(machine, "retreat")
     return machine.stance
 
 
-def _retreat_spot(room, machine, terrain, enemy):
-    """挑一个「离他更远、最好还有掩体」的落脚点；挑不出来返回 `None`。
+def _set_stance(machine, stance):
+    """姿态闩翻转时顺手把上一份走位目标作废；没翻就什么都不做。"""
+    if machine.stance != stance:
+        machine.stance = stance
+        machine.retreat_goal = None
+    return stance
 
-    从自己脚下**朝背离敌人的方向**一格一格往外扫，每一格问这一列有没有
-    够得着的站立面。第一个**把弹道挡住**的点直接选中（那就是掩体，
-    躲在它后面正是真人拉开距离时干的事）；一个掩体都没有就选扫到的最远点。
 
-    ⚠ 判「挡住没有」用的是 `line_blocked`（`blocks_bullet`，单向平台不挡
-    子弹，§29）—— 拿 `is_solid` 会把一根白线当掩体。
+def _keep_away_spot(room, machine, terrain, enemy):
+    """保守姿态这一格该站在哪 —— **离敌人正好半个屏幕**的那一点。
 
-    ## ★★★★★ 已经躲在掩体后面了 —— **答案就是脚下这一点**（V0.3 §165）
+    只在**前进轴**上取：`敌人.x ± BOT_KEEP_AWAY_SPAN`，符号是「我现在在他
+    哪一边」。y 取那一列够得着的站立面，取不到就沿用敌人的 y —— 走位只吃
+    x（`_walk_to()` 里 `direction` 只看 `delta_x`），A\* 再按真实地形找路。
 
-    `_blind_cover_spot()` 开头本来就有这一句（「已经在掩体后面，当前点就是
-    最近答案」），这儿一直漏着，后果是**每一格都挑出一个只有一个扫描格
-    （8 像素）远的「掩体」**：站着的人本来就被挡住了，往后挪 8 像素当然
-    还是被挡住，于是 `index=1` 那一格立刻 `return`。
+    ## ★★★★★ 为什么不是「找掩体」了（D137，用户 2026-09-03）
 
-    接着 `_retreat_done()` 一看「离目标只有 8 像素 ≤ `GOAL_X`(64)」判「退到了」
-    ⇒ 下一格重挑 ⇒ 又是 8 像素。而 bot 一格决策走 14~21 像素，**一步就迈过头**。
-    贴到图边时更糟：`cx < 0` 直接 `break`，挑不出任何点 ⇒ 走位改成朝敌人压上去
-    ⇒ 走回来又够得着一格了 ⇒ 再退。**三格一个循环 = 12 tick = 3 发心跳**，
-    正是实机量到的周期（`Esperan03` 01:11:14.989~17.815 座位 1
-    x = 3/7/10 来回、01:10:25.9~32.7 座位 5 同样；V0.3 §164 ③ 在图两边
-    都见过）。用户 2026-09-02：「好几个 bot 走路都感觉一卡一卡的。」
+    上一版是 `_retreat_spot()`：往背离敌人的方向扫 320，第一个挡得住弹道
+    的点就躲进去。它有一句「已经在掩体后面 ⇒ 答案就是脚下这一点」——
+    于是**目标 = 自己**，走位恒为「不动」，而且被掩体挡着还开不了枪。
+    线上四次「所有 bot 卡住不动」全出在这条路和它框外那个孪生兄弟上
+    （§175 / §176）。
+
+    这一版的目标点**跟着敌人走**：敌人一动，环就动，bot 就得跟着调整。
+    它不可能是静止点 —— 除非敌人也一动不动，而那时双方相距半个屏幕、
+    都在对方的交战距离（`BOT_ENGAGE_RANGE` = 1000）之内，会互相开枪，
+    血一掉姿态就翻。
     """
     body = machine.body
-    if body is None or terrain is None:
+    if body is None or enemy is None:
         return None
-    mx, my = _muzzle(body.x, body.y, enemy[0])
-    if terrain.line_blocked(mx, my, enemy[0], enemy[1] - BOT_MUZZLE_HEIGHT):
-        return (body.x, body.y)
-    away = 1.0 if body.x >= enemy[0] else -1.0
-    reach = botmove.walk_speed(_character_of(machine)) * botmove.CLIMB_SLOPE         * botmove.TICKS_PER_BEAT
-    farthest = None
-    steps = max(1, int(BOT_RETREAT_SPAN / BOT_RETREAT_STEP))
-    for index in range(1, steps + 1):
-        cx = body.x + away * BOT_RETREAT_STEP * index
-        if cx < 0 or cx >= terrain.width:
-            break
-        sy = botmove.surface_near(terrain, cx, body.y, reach)
-        if sy is None:
-            continue
-        farthest = (cx, float(sy))
-        mx, my = _muzzle(cx, sy, enemy[0])
-        if terrain.line_blocked(mx, my, enemy[0], enemy[1] - BOT_MUZZLE_HEIGHT):
-            return farthest                # 有掩体，就近躲进去
-    return farthest
+    side = 1.0 if body.x >= enemy[0] else -1.0
+    x = enemy[0] + side * BOT_KEEP_AWAY_SPAN
+    if terrain is not None:
+        x = max(1.0, min(float(terrain.width) - 2.0, x))
+        reach = (botmove.walk_speed(_character_of(machine))
+                 * botmove.CLIMB_SLOPE * botmove.TICKS_PER_BEAT)
+        surface = botmove.surface_near(terrain, x, body.y, reach)
+        if surface is not None:
+            return (float(x), float(surface))
+    return (float(x), float(enemy[1]))
 
 
 def _clear_navigation(machine, failed=None):
@@ -4734,15 +4944,31 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
     # ★★★ 逼近还是拉开（M5-C）—— 用户 2026-08-29 要的那条「按双方血量判断」。
     #     判据在 `_stance()`：照这样打下去谁先倒。
     fast_run = False
-    if _stance(room, machine, seat_index, enemy_index,
-               enemy_span) == "retreat":
-        goal = machine.retreat_goal
-        if goal is None or _retreat_done(body, goal, spot):
-            goal = _retreat_spot(room, machine, terrain, spot)
+    stance = _stance(room, machine, seat_index, enemy_index, enemy_span)
+    if stance == "retreat":
+        # ★★★★★ **保守 = 别让自己处在半个屏幕以内**（D137，用户 2026-09-03：
+        #   「会主动拉开跟敌人的距离，尽量避免主动进入敌人 1/2 屏幕范围内」）。
+        #   以前这儿是「退 320，最好找个掩体躲进去」—— 而掩体点算出来常常
+        #   就是**自己脚下**（老 `_retreat_spot()` 开头那一句），于是走位恒为
+        #   「不动」、又被掩体挡着开不了枪，一站就是一整局（§176）。
+        #
+        # ★★★ 门上那句 `target is not None` 不是可有可无的：
+        #   **「保持距离」的前提是「我在这个距离上打得到他」**。打不到还退，
+        #   就成了「退出去 → 打不到 → 压回来 → 又太近 → 再退」每格一个
+        #   来回的极限环（§174 那个型）。打不到就先压到打得到为止，
+        #   打得到之后这一条自然把它推回半个屏幕外。
+        if target is not None and enemy_span < BOT_KEEP_AWAY_SPAN:
+            goal = _keep_away_spot(room, machine, terrain, spot)
             machine.retreat_goal = goal
-            _clear_navigation(machine)
-        if goal is None:
-            # 退无可退（图边 / 没有落脚点）——那就照旧打，别原地发呆。
+            if goal is not None:
+                # ★ 脱离时按着右键跑（`FastRunRate`）—— 体力够才跑，
+                #   这是原版的开关，不是我们加的动作。
+                return _src(machine, "拉开距离",
+                            _unstall(room, machine, terrain, goal,
+                                     _walk_to(room, machine, terrain, goal,
+                                              _may_fast_run(machine)),
+                                     None), goal=goal)
+            # 退无可退（没身体 / 没地形）——那就照旧打，别原地发呆。
             #
             # ★★★ **不改写姿态闩**（V0.3 §165）。以前这儿写一句
             #   `machine.stance = "press"`，可「退无可退」是**地形**事实，
@@ -4750,13 +4976,9 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
             #   一算，照旧说「该退」，于是闩每一格翻一次，两道迟滞门
             #   （`BOT_RETREAT_RATIO` / `BOT_PRESS_RATIO`）形同虚设。
             #   闩留在 `retreat` 上，回 `press` 就得真的「明显更占便宜」，
-            #   这才是那两个数当初的意思。走位这一格照旧朝敌人走，一个字没变。
-            pass
+            #   这才是那两个数当初的意思。走位这一格照旧朝敌人走。
         else:
-            spot = goal
-            # ★ 脱离时按着右键跑（`FastRunRate`）—— 体力够才跑，
-            #   这是原版的开关，不是我们加的动作。
-            fast_run = _may_fast_run(machine)
+            machine.retreat_goal = None
     else:
         machine.retreat_goal = None
         # ★★ **主动捡道具**（M5-F）：这一枪打不出去（`target is None`）的时候
@@ -4766,59 +4988,78 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
                                                           seat_index)
         if item is not None and item[0] < enemy_span:
             spot = item[1]
-        elif target is not None:
-            # 打得到就站住打（老规则，D50）。★ 只在**逼近**姿态下成立：
-            #   拉开的时候真人也是一边退一边打的。
-            _clear_navigation(machine)
-            return _src(machine, "打得到·站住打", (0, False, False, False))
+    if (target is not None
+            and not _reloading(machine, machine.weapon,
+                               _now() if now is None else now)
+            and (stance == "retreat" or not _worth_closing(
+                room, machine, seat_index, enemy_index, enemy_span))):
+        # ★★ 打得到就**就地打**（老规则 D50，只是不再站着不动）。
+        #   「追不追」交给 `_worth_closing()`：压到真人的中位交战距离上
+        #   输出会不会明显变好 —— 狙击枪就地打是合法玩法（D138）。
+        #   ★ 保守姿态（血 < 25%）**永远不追**：那一档的规矩是「不主动
+        #     进入敌人半个屏幕」，贴到环里的那一格已经在上面退掉了。
+        #   ★★★★ **换弹那一段不站住**（用户 2026-09-04，D141）：这一支占了
+        #     决策时长的 25%~40%，而「打得到」问的是几何（`_fire_target()`），
+        #     它随双方走动每 130 ms 翻一次 —— 于是 bot 走一下停一下，
+        #     一段走只有 270 ms（同一局真人 525 ms），屏幕上就是「一卡一卡」
+        #     （§178）。换弹 / 上膛那 720~2500 ms 里站着本来也打不出东西。
+        _clear_navigation(machine)
+        return _src(machine, "打得到·就地打", _shoot_move(machine))
     return _src(machine, "朝目标走",
-                _walk_to(room, machine, terrain, spot, fast_run), goal=spot)
+                _unstall(room, machine, terrain, spot,
+                         _walk_to(room, machine, terrain, spot, fast_run),
+                         target), goal=spot)
 
 
-def _blind_cover_spot(machine, terrain, bearing):
-    """只拿“上/下/左/右”粗方向找一个掩体点。
+def _side_toward(body, spot):
+    """`spot` 在我左边还是右边（`-1/0/1`）—— `_blind_walk()` 的探路侧。"""
+    delta = spot[0] - body.x
+    return 0 if abs(delta) < 1.0 else int(math.copysign(1, delta))
 
-    候选仍是原版地形的站立面；“躲住了没有”仍用
-    `line_blocked()`（单向平台不挡子弹）。有掩体就选离自己最近的，
-    一处都没有就选离粗方向最远的可站点；精确敌人坐标自始至终
-    没有进入这个函数。
+
+def _unstall(room, machine, terrain, spot, intent, target):
+    """走位算不出动作时**横着挪一步去找路**（D137：「禁止站在一个地方不动」）。
+
+    ## 现场
+
+    敌人就在正上方 / 正下方时 `|Δx|` 只有几像素，而 `_walk_to()` 是个
+    bang-bang 控制器、一次决策要走 14~21 像素 —— 它在 ±1 和 0 之间空转，
+    人一格都不挪。`Forest00` 那个离线复现最干净：(966, 442) 对着 (957, 646)，
+    60 格决策**净位移 0**，两个 bot 就这么杵着。A\* 这时候常常也给不出
+    上下层的路（一张图的可达分量往往只覆盖一半，§137）。
+
+    真人这时候是**横着走去找上去 / 下去的那条路**的 —— 和 D119 给框外
+    竖直粗方位补的那条出路（`_blind_probe_intent()`）是同一件事，
+    只是那条只挂在「视野里没敌人」那一支上，看得见人的这一支一直缺着。
+
+    ## 闩
+
+    方向**闩住**（`machine.probe_side`）。不闩的话目标那几像素的横向分量
+    每格把它拽回来，就成了 §174 那种极限环。解闩全是**事件**（铁律 10）：
+
+    * 走位重新给得出**跳 / 下落** —— 上下层的路找到了，走它；
+    * **打得到人了**（`target`）—— 位置已经够好，不用再挪；
+    * 这一侧**走不动了**（撞墙 / 前面是无底洞，`_blind_probe_intent`
+      返回 `None`）。
     """
     body = machine.body
-    if body is None or terrain is None or bearing is None:
-        return None
-    who = _character_of(machine)
-    # 已经在掩体后面，当前点就是最近答案。
-    mx, my = _muzzle(body.x, body.y, bearing[0])
-    if terrain.line_blocked(mx, my, bearing[0],
-                            bearing[1] - BOT_MUZZLE_HEIGHT):
-        return (body.x, body.y)
-    reach_y = (botmove.walk_speed(who) * botmove.CLIMB_SLOPE
-               * botmove.TICKS_PER_BEAT)
-    covers = []
-    fallback = []
-    steps = max(1, int(BOT_RETREAT_SPAN / BOT_RETREAT_STEP))
-    for index in range(1, steps + 1):
-        for direction in (-1, 1):
-            cx = body.x + direction * BOT_RETREAT_STEP * index
-            if cx < 0 or cx >= terrain.width:
-                continue
-            sy = botmove.surface_near(terrain, cx, body.y, reach_y)
-            if sy is None or not botmove.fits(terrain, cx, sy, who):
-                continue
-            point = (float(cx), float(sy))
-            from_here = math.hypot(point[0] - body.x, point[1] - body.y)
-            from_bearing = math.hypot(point[0] - bearing[0],
-                                      point[1] - bearing[1])
-            px, py = _muzzle(point[0], point[1], bearing[0])
-            if terrain.line_blocked(px, py, bearing[0],
-                                    bearing[1] - BOT_MUZZLE_HEIGHT):
-                covers.append((from_here, -from_bearing, point))
-            fallback.append((from_bearing, -from_here, point))
-    if covers:
-        return min(covers, key=lambda row: (row[0], row[1], row[2]))[2]
-    if fallback:
-        return max(fallback, key=lambda row: (row[0], row[1], row[2]))[2]
-    return None
+    if (body is None or intent[1] or intent[2] or target is not None
+            or (abs(spot[0] - body.x) <= botnav.GOAL_X
+                and abs(spot[1] - body.y) <= botnav.GOAL_Y)):
+        # ★ 最后那一句是「**已经到了**」：站在目标上不动不是卡住，是到位了
+        #   （真人 39% 的心跳就是站着不动的，§71）。少了它，「打不到我就
+        #   别乱动」那条会被这里带跑。
+        machine.probe_side = 0
+        return intent
+    if intent[0] and not machine.probe_side:
+        return intent                       # 正常走着，没卡住
+    side = machine.probe_side or _side_toward(machine.body, spot)
+    probe = _blind_probe_intent(room, machine, terrain, side)
+    if probe is None:
+        machine.probe_side = 0
+        return intent
+    machine.probe_side = probe[0]
+    return probe
 
 
 def _blind_probe_intent(room, machine, terrain, side):
@@ -4853,11 +5094,18 @@ def _blind_probe_intent(room, machine, terrain, side):
 
 
 def _blind_walk(room, machine, terrain, spot, side, fast_run):
-    """框外走位专用的 `_walk_to()`：算出来一动不动就横着探一步。"""
+    """框外走位专用的 `_walk_to()`：算出来一动不动就横着探一步。
+
+    ★ 探路方向和 `_unstall()` 共用同一个闩（`machine.probe_side`，D137）：
+      不闩的话每格重挑一次，目标那点横向分量会把它拽回来（§174 那个型）。
+    """
     intent = _walk_to(room, machine, terrain, spot, fast_run)
     if intent[0] or intent[1] or intent[2]:
+        machine.probe_side = 0
         return intent
-    probe = _blind_probe_intent(room, machine, terrain, side)
+    probe = _blind_probe_intent(room, machine, terrain,
+                                machine.probe_side or side)
+    machine.probe_side = 0 if probe is None else probe[0]
     return intent if probe is None else probe
 
 
@@ -4919,8 +5167,7 @@ def _note_idle(machine, why):
         machine.log("   ◆又动起来了")
 
 
-def _blind_intent(room, machine, seat_index, terrain, spawn_fallback=True,
-                  may_hide=True):
+def _blind_intent(room, machine, seat_index, terrain, spawn_fallback=True):
     """**视野里没有敌人**的那一帧往哪走（V0.3 §127 / §128）。
 
     两种情形，用户 2026-08-30 各报了一条：
@@ -4937,7 +5184,23 @@ def _blind_intent(room, machine, seat_index, terrain, spawn_fallback=True,
       提前占住那儿是有依据的走位，不是我们发明的战术评分。
 
     ★ 道具模式里地上的东西照旧优先（`_item_goal`）—— 没人打的时候正是
-      去捡道具的时候，这条本来就在（M5-F），只是以前这一帧根本走不到。
+      去捡道具的时候（M5-F）。
+
+    ## ★★★★★ 这儿**再也没有「躲」这个动作**（D137，用户 2026-09-03）
+
+    「无论怎样，全都主动寻找并接近敌人，禁止站在一个地方不动。」
+
+    以前这一支里有 D119 那条：血 < 25% 就去找掩体、蹲在后面不动。它是个
+    **没有出口的停机状态** —— 一躲下去位置不变、血不会自愈（原版里只有
+    `HpChargeItem` 能加血）、粗方位也不变，于是「什么时候不躲了」这个
+    条件永远不成立。线上四次「所有 bot 卡住不动」全是它（§175 / §176）：
+    `Iceria00` 四个 bot 停 129.6 秒、`Forest02` 三个 bot 停 161 秒、
+    `Forest00` 两个 bot 分别停 81.8 / 144.9 秒。
+
+    血量照旧影响姿态（`_stance()` 里那两道门），但**框外这一支不再据此
+    改变动作** —— 不管什么姿态都朝粗方位挪。保守那一档的「拉开距离」
+    只在**看得见敌人**的时候才有意义（要有一个真实坐标才谈得上距离），
+    那是 `_move_intent()` 里 `_keep_away_spot()` 的事。
     """
     body = machine.body
     if body is None:
@@ -4946,58 +5209,28 @@ def _blind_intent(room, machine, seat_index, terrain, spawn_fallback=True,
     rough = _rough_bearing_raw(room, machine, seat_index)
     if rough is not None:
         spot, side = rough
+        # ★ 姿态照旧按血量记（`_stance()` 同一套门）—— 一进视野框就是对的，
+        #   不用等下一次交火再翻。**但这一支的动作和姿态无关**：一律朝
+        #   粗方位挪（D137）。
         health = _seat_health(room, seat_index)
-        if not may_hide:
-            # ★ boss 房不许躲（`_boss_fight_intent` 传的）：那儿的门要打死
-            #   boss 才开，两个 bot 一起躲起来就是把这一关钉死（同 §141
-            #   「boss 房里没有推进进度这回事」的口径）。
-            machine.stance = "press"
-            machine.retreat_goal = None
-        elif health < BOT_BLIND_HIDE_BELOW:
-            machine.stance = "retreat"
-            machine.retreat_goal = None
-        elif health > BOT_BLIND_PRESS_ABOVE:
-            machine.stance = "press"
-            machine.retreat_goal = None
+        if health > BOT_HIGH_HEALTH:
+            _set_stance(machine, "press")
+        elif health < BOT_LOW_HEALTH:
+            _set_stance(machine, "retreat")
         # 25%..50% 一字不动：保持上一姿态，这就是滞回。
-        if may_hide and machine.stance == "retreat":
-            goal = machine.retreat_goal
-            if goal is None or _retreat_done(body, goal, spot):
-                goal = _blind_cover_spot(machine, terrain, spot)
-                machine.retreat_goal = goal
-                _clear_navigation(machine)
-            if goal is not None:
-                if (abs(goal[0] - body.x) <= botnav.GOAL_X
-                        and abs(goal[1] - body.y) <= botnav.GOAL_Y):
-                    # 已经蹲在掩体后面了 —— 这时候站住不动**就是**
-                    # 正确动作，别拿探路把自己从掩体后面赶出去。
-                    _clear_navigation(machine)
-                    _note_idle(machine, "躲在掩体后面（血 %.0f%%）" % (health * 100))
-                    return (0, False, False, False)
-                _note_idle(machine, None)
-                return _blind_walk(room, machine, terrain, goal, -side,
-                                   _may_fast_run(machine))
-            # 真没有任何可站候选才允许停；这是“无合法动作”，
-            # 不是视野空了就发呆。
-            _clear_navigation(machine)
-            _note_idle(machine, "低血量想躲，可一处可站的掩体候选都没有"
-                                "（血 %.0f%%）" % (health * 100))
-            return (0, False, False, False)
         _note_idle(machine, None)
-        machine.retreat_goal = None
         item = _item_goal(room, machine, seat_index)
         if item is not None and item[0] < math.hypot(spot[0] - body.x,
                                                      spot[1] - body.y):
             spot = item[1]
-            side = (0 if abs(spot[0] - body.x) < 1.0
-                    else int(math.copysign(1, spot[0] - body.x)))
+            side = _side_toward(body, spot)
         return _blind_walk(room, machine, terrain, spot, side, False)
 
     # 一个活敌人都没有：PVP 去敌方出生点等；任务模式由
     # `_coop_intent` 照带头真人/活动带继续处理，不凭空发明巡逻点。
     # ★ 姿态复位放在这里（以前在 `_move_intent` 调用点上）：没有敌人
     #   就无所谓逼近/后撤，留着上一轮的 `retreat_goal` 只会让人绕远。
-    machine.stance = "press"
+    _set_stance(machine, "press")
     machine.retreat_goal = None
     if not spawn_fallback:
         return None
@@ -5271,6 +5504,21 @@ def _unstick_intent(room, machine, terrain):
                                                           direction), who):
             machine.nav_double_jump = True
             return (direction, True, False, False)
+    # ★★★ 第三条出路：**走出崖边掉下去**（V0.3 §177）。
+    #
+    #   上面那两条都要求「挪到 / 跳到一个塞得下的落脚点」，而 1 像素夹层里
+    #   往外走一步就踩空 —— 上面那个循环把它当「踩空了，这条不算」判掉了
+    #   （`not step.on_ground` 那一句）。可**掉下去恰恰是这里唯一的出路**：
+    #   `Iceria03` (1214, 859) 那块冰檐左右都是冰、头顶 1 像素就是天花板，
+    #   走不动、跳不起来，只有从檐口掉下去。
+    #
+    #   ★ 落点照 `_landing_ok()` 验一遍：掉进另一条缝就白掉了。
+    for direction in _unstick_directions(terrain, body, who):
+        step = botmove.tick(terrain, body, who, direction=direction)
+        if step.on_ground or step.x == body.x:
+            continue
+        if _landing_ok(terrain, botmove.settle(terrain, step, who), who):
+            return (direction, False, False, False)
     # 都不成：朝宽的那一侧跳。缝里跳一下至少能换个落点，杵着永远不会变。
     return (next(iter(_unstick_directions(terrain, body, who)), 1),
             True, False, False)
@@ -5502,16 +5750,17 @@ def _boss_fight_intent(room, machine, seat_index, terrain, target):
     """
     body = machine.body
     if target is not None:
+        # ★ 打得着 boss 就就地打 —— 和对战房同一条规则、同一个动作
+        #   （边跳边打，D138）。
         _clear_navigation(machine)
-        return (0, False, False, False)
+        return _shoot_move(machine)
     visible = [row for row in live_mobs(room)
                if _in_sight(machine, row[0], row[1])]
     if not visible:
-        # ★ `may_hide=False`：boss 房的门要**打死 boss 才开**，血少了
-        #   躲起来等于把这一关钉死（§141 那条「boss 房里没有推进进度
-        #   这回事」的另一半）。粗方位照给，只是不许转隐蔽。
+        # ★ 粗方位照给。（以前这儿还要传 `may_hide=False` 把「躲」关掉，
+        #   现在框外这一支本来就不躲了，D137。）
         blind = _blind_intent(room, machine, seat_index, terrain,
-                              spawn_fallback=False, may_hide=False)
+                              spawn_fallback=False)
         if blind is not None:
             return blind
     spot = _nearest_mob(room, body)
@@ -5521,6 +5770,21 @@ def _boss_fight_intent(room, machine, seat_index, terrain, target):
         # 开不了枪（没有句柄），至少走位该朝它去。
         quest = None if room is None else room.quest
         spot = getattr(quest, "boss_gun", None)
+    if spot is None:
+        # ★★★★★ **boss 在哪还不知道 —— 跟着带头的真人走，不许站着**
+        #   （D137，用户 2026-09-03：「任务模式到了 boss 房后又不动了」）。
+        #
+        #   服务端手上 boss 的坐标只有两个来源，**两个都要别人先动手**：
+        #   `note_mob_hit()`（有人打中过它）和 `quest.boss_gun`（它自己开过
+        #   枪）。以前这儿是「两个都没有就站住等」—— 而 bot 站着就不会打到
+        #   boss，不打到就永远没有采样，**它自己就是自己解锁条件的否定**
+        #   （§160 家族）。唯一的出口是真人先打中一枪。
+        #
+        #   出口换成「跟着带头的真人」：那是闯关房本来就在用的目标
+        #   （`_coop_goal`，D103/D114），真人知道 boss 在哪、正朝它走，
+        #   跟过去必然进 boss 的视野框，然后 `live_mobs` / `boss_gun`
+        #   就有内容了。不是新战术，是把闯关房的老规则借回来一格。
+        spot = _coop_goal(room, machine, seat_index, terrain)
     if spot is None:
         _clear_navigation(machine)
         return (0, False, False, False)
@@ -5674,6 +5938,11 @@ def _leash_warp(room, machine, seat_index, terrain, spot, behind, why):
             continue
         was = machine.body
         machine.body = body
+        # ★ 瞬移归队是**离散位移**，而且没有任何事件包伴随（§185）：不锚的话
+        #   收方要等到下一发固定节拍心跳（最多 128 ms）才知道人换地方了，
+        #   在那之前还照着旧速度往老位置外推。和受击同一类事实。
+        machine.motion_anchor_pending = True
+        machine.motion_blocked_axes = (False, False)
         _clear_navigation(machine)
         machine.leash_mark = _quest_forward(terrain) * body.x
         # 「他跑了多远」从落点重新起算：瞬移完还在掉队的话，得再给他
@@ -5684,18 +5953,6 @@ def _leash_warp(room, machine, seat_index, terrain, spot, behind, why):
                       f"　落后 {behind:.0f}，{why}")
         return True
     return False
-
-
-def _retreat_done(body, goal, enemy):
-    """这个后撤落脚点是不是该换一个了。
-
-    两种情形：**已经退到了**，或者**敌人绕到了另一边**（原来的落点现在
-    是朝着他走）。判据都是位置事实，没有计时器。
-    """
-    if (abs(body.x - goal[0]) <= botnav.GOAL_X
-            and abs(body.y - goal[1]) <= botnav.GOAL_Y):
-        return True
-    return (goal[0] - body.x) * (enemy[0] - body.x) > 0.0
 
 
 def _decide(room, machine, seat_index, terrain, now, tick):
@@ -5774,6 +6031,7 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
     本来就只在某一格上生效，而现在每一格都是单独的一次调用。
     """
     machine.move_down = False
+    machine.press_dir = 0
     if terrain is None:
         return None
     who = _character_of(machine)
@@ -5799,6 +6057,10 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
     else:
         direction, want_jump, want_drop, fast_run = 0, False, False, False
     machine.move_down = bool(want_drop)
+    # ★★★ 心跳掩码报的就是这一格**真按下去的**那个方向键（§177 / D140）：
+    #   `move_down` 是怎么传的，它就怎么传。反推位移会说谎 —— 一发心跳
+    #   盖 4 格，位移反推只看得见最后那一格。
+    machine.press_dir = int(direction)
     crouched = bool(machine.dodge_crouch)
     speed_scale = _speed_scale(machine, now)
     before = machine.body
@@ -5815,11 +6077,12 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
     if (not before.on_ground and machine.nav_double_jump
             and botmove.at_apex(before)):
         want_jump = True
-    machine.body = botmove.tick(terrain, before, who,
-                                direction=direction, fast_run=fast_run,
-                                crouched=crouched,
-                                want_jump=want_jump, want_drop=want_drop,
-                                speed_scale=speed_scale)
+    # ★ 用 `step()` 而不是 `tick()`：报心跳要多知道一件事 —— 这一格到底跑没跑
+    #   过空中积分（`air_stepped`）。见 `_reportable_speed()`（§185）。
+    machine.body, air_stepped = botmove.step(
+        terrain, before, who, direction=direction, fast_run=fast_run,
+        crouched=crouched, want_jump=want_jump, want_drop=want_drop,
+        speed_scale=speed_scale)
     left_ground = before.on_ground and not machine.body.on_ground
     if machine.nav_path and left_ground:
         machine.nav_started = True
@@ -5830,13 +6093,122 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
         elif machine.body.air_jumped and not before.air_jumped:
             # ★ 第二段跳（§124）—— `rpJump` 的段号要报 2，不是 1。
             jumped = 2
+            # ★★★ **欠的这一跳还完了，旗子当场作废**（V0.3 §179）。
+            #   它原来只在落地那一格清（`_walk_to()` / `_clear_navigation()`），
+            #   于是「这一段还欠不欠第二跳」这件事实际上是由**两个**变量
+            #   共同表达的：`nav_double_jump` 和 `body.air_jumped`。
+            #   任何一处把 `air_jumped` 弄丢（§179 那个击退重建就是），
+            #   还举着的旗子立刻又按一次 —— 一段腾空里连跳 5 次。
+            #   ⇒ 谁还清谁作废，别让不变式跨两个变量。
+            machine.nav_double_jump = False
         # ★★ 跳的意图**用掉就作废**：不清的话下一格还举着 `want_jump=True`，
         #    而腾空中按跳 = 第二段跳（§124），白白多跳一段。
         if not machine.body.on_ground and machine.intent is not None:
             machine.intent = (direction, False, want_drop, fast_run)
     body = machine.body
-    return (body.x, body.y, jumped, body.on_ground, body.vx, body.vy,
+    # ★ 顺序不能反：先算**报出去的**那对速度，再拿它去记运动锚 —— 锚的
+    #   「这一轴被钉住了」必须和线上真正报出去的东西是同一件事（§185）。
+    vx, vy = _reportable_speed(before, body, air_stepped)
+    _note_motion_transition(machine, before, body, (vx, vy), jumped)
+    return (body.x, body.y, jumped, body.on_ground, vx, vy,
             bool(fast_run), crouched)
+
+
+def _note_motion_transition(machine, before, body, reported, jumped=0):
+    """记下收方不能仅靠上一份速度连续外推出来的运动状态（§185）。
+
+    自由飞行严格是 ``vy += GRAVITY; pos += velocity``，不需要额外发包。
+    这里只认离散的**状态事实**，没有距离或时间阈值：
+
+    * 一/二段跳、踩空、弹跳台、落地会翻转跳段或 ``on_ground``；
+    * 撞顶把本应继续上升的 ``vy`` 截成 0；
+    * 撞墙时模拟保留速度、位置却被钉住，线上速度由
+      :func:`_reportable_speed` 报 0。进入和离开这种状态各锚一次。
+
+    ★★ ``reported`` 是这一格**真正报出去的**那对速度。「这一轴被钉住了」
+    就定义成 **报出去的和模拟里的不一样** —— 而不是在这儿另拿一套几何判据
+    重算一遍。两处各判各的时出过错：贴着墙起跳那一格，`_reportable_speed()`
+    因为速度是本格新生的而原样报，这里却按「位置没动」记成钉住，于是下一格
+    真的报 0 时反而看不到翻转、不补锚。**判据只许有一份。**
+
+    受击发生在别的 bot 推进弹体时，已经早于这里改掉 ``machine.body``，
+    因此由 :func:`_knock_back_seat` 直接置同一面旗。
+    """
+    airborne = not body.on_ground
+    reported_vx, reported_vy = reported
+    blocked_axes = (reported_vx != body.vx, reported_vy != body.vy)
+    blocked_changed = blocked_axes != machine.motion_blocked_axes
+
+    expected_vy = before.vy + botmove.GRAVITY
+    expected_x = before.x + before.vx
+    expected_y = before.y + expected_vy
+    hit_ceiling = (not before.on_ground and airborne and before.vy < 0.0
+                   and body.vy == 0.0
+                   and (expected_vy != 0.0
+                        or body.x != expected_x or body.y != expected_y))
+
+    if (jumped or before.on_ground != body.on_ground
+            or hit_ceiling or blocked_changed):
+        machine.motion_anchor_pending = True
+    machine.motion_blocked_axes = blocked_axes
+
+
+def _reportable_speed(before, body, air_stepped=True):
+    """报进心跳的那对速度 —— **被地形挡住的那一轴要报 0**（V0.3 §181）。
+
+    `air_stepped` 是 `botmove.step()` 的第二个返回值：**这一格跑没跑过空中
+    积分**。它是「位置没动 ⇒ 被地形钉住」这条推理的**前提**，见下面第三节。
+
+    ## 为什么不能直接报 `body.vx / body.vy`
+
+    收方对**腾空**角色是拿包里这两格**逐帧积分推位置**的
+    （`0x5073a6` 腾空 → `0x50767e` 累速度 → `0x507773` → `0x50d404` 推位置；
+    `packet_api §5.6` 的原话：「腾空那一段的水平位移**完全由它决定**，
+    方向键插不上手」）。所以「**位置钉住 + 速度非 0**」这一对是收方**没法
+    复现**的状态：它会照着速度把角色一路推出去（一发心跳 4 帧 ≈ 最多 48 px），
+    下一发心跳再把它拽回来 —— **每 128 ms 一次的锯齿**。
+
+    而服务端腾空撞墙那一支恰恰产出这一对（`botmove._air_tick`）：
+
+        # 真的够不着 = 墙。这一 tick 横向过不去，**速度留着**
+        nx = body.x        ← 位置钉住，vx 却原样带进 Body
+
+    实机（2026-09-04 22:43 那一局，`Iceria00`）最干净的现场是图左边界：
+    座位 4 连着 5 发心跳报 `x=0 v=(-9, …)` —— 位置一动不动、速度一直说往左。
+
+    ## 同一局同一把尺子（腾空段里「位置钉住却报着速度」的发数占比）
+
+        真人座位 0   2.4%          ← 真客户端的位置和速度出自同一个积分器，
+        bot 1~5      3.9% ~ 17.3%     撞墙时碰撞响应会把那一轴收掉
+
+    ## 为什么只改**报**的这一份，不改模拟
+
+    `_air_tick` 留着 `vx` 是 §95 用实机日志两轮收口的：撞上只是这一 tick
+    不挪，**升过去下一 tick 接着走** —— 贴着墙往上飞、翻过高处那个沿的
+    弧线全靠它，而 `botnav` 的可达图就是拿这套物理建的边。
+    ⇒ 模拟一个字不动，只让**包**说实话。判据是几何事实（这一 tick 那一轴
+    的位移到底是不是 0），不是阈值。
+    """
+    if body.on_ground:
+        return body.vx, body.vy         # §35：踩地时本来就恒 0
+    if not air_stepped:
+        # ★★★★★ **这一格根本没按空中速度挪过位置，位置没动当然不是被钉住**
+        #   （§185）。
+        #
+        # 弹跳台在一格的末尾把速度写进角色，位置要到下一格才开始挪 ——
+        # 原版 `JumpingObj::Tick` 就是这个顺序，`botmove.tick()` 那一支也
+        # 直接 return、**不进 `_air_tick`**。旧判据只看 ``body.y == before.y``，
+        # 会把台子刚写进去的 −31 清成 0 发上网；最新 5 局里这种心跳之后的
+        # 下一发直接跨 130~157 px、速度才跳到 −30，正是用户看到的「卡住
+        # 然后瞬移」。
+        #
+        # ⚠ 判据是 `botmove.step()` 报回来的**这一格算了什么**，不是
+        #   `before.on_ground`。后者在「贴着墙从地面起跳」那一格上是错的：
+        #   `jump()` 之后 `_air_tick` 照跑，x 会被墙钉住，那时候必须报 0。
+        return body.vx, body.vy
+    vx = 0.0 if (body.vx and body.x == before.x) else body.vx
+    vy = 0.0 if (body.vy and body.y == before.y) else body.vy
+    return vx, vy
 
 
 def _path_blocked(terrain, x0, y0, shot, radius=0.0):
@@ -5874,21 +6246,28 @@ def _path_blocked(terrain, x0, y0, shot, radius=0.0):
     """
     if terrain is None:
         return False
-    # ★ 采样点组和 `_terrain_contact()` 必须是同一套（§116）：这里判「枪口
-    #   通不通」，那边判「飞到哪儿撞上」，两边口径不一样就会出现
-    #   「开火时觉得通、结算时当场撞在枪口上」。
-    if radius and radius >= 1.0:
-        offsets = shell_probe_offsets(radius, math.cos(shot.angle),
-                                      math.sin(shot.angle))
-    else:
-        offsets = ((0, 0),)
-    if _probe_blocked(terrain, int(x0), int(y0), offsets):
+    if _muzzle_blocked(terrain, x0, y0, shot, radius):
         return True
     points = ballistics.path_points(x0, y0, shot)
     for (ax, ay), (bx, by) in zip(points, points[1:]):
         if terrain.line_blocked(ax, ay, bx, by, step=BOT_LINE_STEP):
             return True
     return False
+
+
+def _muzzle_blocked(terrain, x0, y0, shot, radius=0.0):
+    """仅查弹体能否出膛，和 `_terrain_contact()` 共用采样点（§116）。
+
+    失误弹可以途中撞地，但仍不能从埋进地形的枪口发射（§76）。
+    """
+    if terrain is None:
+        return False
+    if radius and radius >= 1.0:
+        offsets = shell_probe_offsets(radius, math.cos(shot.angle),
+                                      math.sin(shot.angle))
+    else:
+        offsets = ((0, 0),)
+    return _probe_blocked(terrain, int(x0), int(y0), offsets)
 
 
 def _shot_impact(terrain, x0, y0, shot, radius=0.0):
@@ -6270,8 +6649,8 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
     「瞄他现在站的地方」，所以这一步对静止目标没有任何行为改变。
 
     ★★ **失误**（M5-D）：`miss` 是**开火前就掷好**的一份偏差（`botaim.Miss`）。
-    给了它就把这一发弄歪，并且**用弄歪之后的点重解弹道** —— 否则包里的角度
-    还是准的，屏幕上看不出打偏。
+    先用正常弹道选目标，再把这一发弄歪并重解弹道。失误弹可以撞地形或提前
+    引爆；不能把这些发次过滤掉，否则实际打出的子弹会偏向准确的那一档。
     """
     if machine.battle_pos is None:
         return None
@@ -6279,6 +6658,7 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
     terrain = _terrain(room)
     solve = _solver_for(weapon)
     best = None
+    best_aim = None
     # ★★ **只打看得见的**（§127）：屏幕外的人真人根本不知道在哪，
     #    服务端也不该把精确坐标喂给 bot。看不见时走位归 `_rough_bearing()`。
     for index, px, py, crouched in _visible_targets(room, machine, seat_index):
@@ -6299,7 +6679,7 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
                     else _seat_velocity(room, index))
         radius = _hit_radius(room, index, weapon)
         point, shot = botaim.aim(solve, (mx, my), (tx, ty), velocity,
-                                 radius, miss)
+                                 radius)
         if shot is None:
             continue
         # ★ 提前量可能把瞄准点推到身体另一侧 —— 枪口跟着朝向翻（`_muzzle`），
@@ -6318,6 +6698,23 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
             continue
         best = Engagement(index, point, shot, span,
                           math.hypot(velocity[0], velocity[1]), radius)
+        best_aim = ((tx, ty), velocity, crouched)
+    if best is not None and miss is not None and not BOT_DIAG_FIRE_ANYWHERE:
+        target, velocity, crouched = best_aim
+        mx, my = _muzzle(x, y, target[0])
+        size_ratio = _magazine_ratios(machine)[1]
+        radius = _aim_miss_radius(room, best.seat, weapon, crouched,
+                                  size_ratio)
+        point, shot = botaim.aim(solve, (mx, my), target, velocity, radius, miss)
+        if shot is not None:
+            nx, ny = _muzzle(x, y, point[0])
+            if (nx, ny) != (mx, my):
+                shot = solve(point[0] - nx, point[1] - ny)
+            if shot is not None:
+                if _muzzle_blocked(terrain, nx, ny, shot,
+                                    float(weapon.size or 0.0) * size_ratio):
+                    return None
+                best = best._replace(point=point, shot=shot)
     if best is None and not BOT_DIAG_FIRE_ANYWHERE:
         # ★★★ 双路线规划认定的**捷径第一道门**（用户 2026-09-01）。
         #   排在真人后面：`_breaking_now()` 已经把「视野里有活敌人/活怪」
@@ -6422,8 +6819,23 @@ def _hit_radius(room, seat_index, weapon):
     return character.size_body + float(weapon.size or 0.0)
 
 
+def _aim_miss_radius(room, seat_index, weapon, crouched, size_ratio=1.0):
+    """失误要偏出整个人，不能只绕开身体圆后又打中头或腿。
+
+    以身体圆心为基准，包住当前姿势的三个碰撞圆，再加实际弹体半径。
+    换枪评分仍用 `_hit_radius()`；这里只决定失误的幅度。
+    """
+    seat = room.seats[seat_index]
+    character = chrprops.get(seat.character_id)
+    tx, ty = character.center(0.0, 0.0, crouched)
+    extent = max(math.hypot(cx - tx, cy - ty) + radius
+                 for cx, cy, radius, _region in character.circles(
+                     0.0, 0.0, crouched))
+    return extent + float(weapon.size or 0.0) * size_ratio
+
+
 def _aim_error_chance(room, machine, seat_index):
-    """这一发算错提前量的概率 —— 难度那一格（M5-D）。
+    """这一发瞄偏、算错提前量的概率 —— 难度那一格（M5-D）。
 
     ★ 道具赛里别人放的**糊屏**会把它顶上去，那条在 `_hud_jam_bonus()` 里
     （M5-F）；这里只负责把两者合起来，上限 1.0。
@@ -6560,11 +6972,26 @@ def _choose_weapon(room, machine, seat_index):
         yields = scores
     best_id = max(yields, key=lambda key: (yields[key], -key))
     current_id = None if current is None else current.id
-    if current_id not in yields or botarms.better(
-            yields.get(current_id), yields[best_id]):
-        if best_id != current_id:
-            machine.auto_weapon_id = best_id
-            _log_weapon_choice(machine, current, best_id, scores, yields)
+    if current_id in yields:
+        worth = botarms.better(yields[current_id], yields[best_id])
+    else:
+        # ★★★★ 手上这把此刻**解不出弹道**（`_engagement()` 回 `None`）——
+        #   那不是「分低」，是**没有答案**，`SWITCH_MARGIN` 无从谈起。
+        #   旧代码在这一支上一点余量都不过、直接换：实机 996 次换枪决策里
+        #   **47%** 走的是它（§178），而 `_engagement()` 在双方都在动的边界上
+        #   本来就在翻 ⇒ A→B→A 来回换，`machine.weapon` 跟着翻，
+        #   「打不打得到」跟着翻，走位就跟着一停一走。
+        #
+        #   ⇒ 只有「**我这会儿真能扣扳机**」时它才是一个值得动手的新事实：
+        #   换过去能立刻打出一发。打不出来的时候换等于白付 `LoadingTime`
+        #   + 半个弹匣，而几十毫秒后这把枪的弹道自己又解出来了。
+        #   ★ 判据是**原版那三张倒计时表**（§126），不是「等 XX 毫秒再说」。
+        #   ★ 手上还没有枪（开局第一次挑）时当然要挑。
+        worth = current is None or (now >= machine.next_fire_at
+                                    and _may_fire(machine, current))
+    if worth and best_id != current_id:
+        machine.auto_weapon_id = best_id
+        _log_weapon_choice(machine, current, best_id, scores, yields)
     return machine.weapon
 
 
@@ -9250,7 +9677,22 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
     #   ⇒ 追平的那一格才报。这正是原版客户端卡了一秒之后的行为：
     #     恢复时发**一发**位置包，不是十发。事件包不受影响 —— 那是账本。
     #   ★ 判据是「还欠不欠格」这个事实，不是「落后超过 N 格」的阈值（铁律 10）。
-    due = (tick % gameserver.HEARTBEAT_TICKS) == (
+    #   ★★★★ **每个座位的心跳相位按座位号错开**（V0.3 §183）。
+    #     以前 5 个 bot 全踩 `tick % 4 == 3` 这一格：**一格正常就产 12 份**
+    #     （5 发心跳 + 那一格的事件包 + 真人转发），发送线程醒一次并成一次写。
+    #     错开之后一格最多 3~4 份 —— 下行不再一阵一阵地灌。
+    #   ★ 每个 bot 自己的节奏一点没变（还是 4 格一发 = 128 ms），变的只是
+    #     相位；真客户端之间本来就是各发各的，错开比对齐更像原版。
+    #   ⚠ 当初做这件事**还有一半是为了救那个诊断**（「12 份」既可能是正常
+    #     一格也可能是被饿住），那一半已经作废：份数在原理上就分不开这两件
+    #     事，光错开心跳也堵不住别的批量下发（结算 12 份、`/a` 加 bot 11 份）。
+    #     诊断已经改看「包在队里躺了多久」（§184），不再看份数。
+    #     错开本身留着 —— 它让下行更平、更像原版，这条理由自己站得住。
+    #   ⚠ 这**不是**为了治卡顿：机制上并走只有「同一个角色的两发心跳落进
+    #     同一帧」才看得见（收方每帧 recv 一次、把包全分发完，每发心跳做一次
+    #     0.6/0.4 收敛，§120 + `0x504215`），而那需要队里压 84 ms 以上，
+    #     实测端到端最大 38 ms。见 §183。
+    due = ((tick + seat_index) % gameserver.HEARTBEAT_TICKS) == (
         gameserver.HEARTBEAT_TICKS - 1)
     if behind > 0:
         # 还欠着格 = 正在追赶。这一发**欠下来**，追平的那一格一起还。
@@ -9307,6 +9749,10 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         machine.intent = None
         machine.intent_tick = None
         machine.aim = None
+        # 死亡广播已经让收方拆掉这个角色；死前尚未发出的运动锚没有对象可锚，
+        # 不能带到五秒后的重生。
+        machine.motion_anchor_pending = False
+        machine.motion_blocked_axes = (False, False)
         current = machine.weapon
         machine.next_fire_at = now + (
             0.0 if current is None else float(current.loading_ms or 0) / 1000.0)
@@ -9369,6 +9815,7 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         x, y = machine.battle_pos
         jumped, on_ground, vx, vy, fast_run, crouch = 0, True, 0, 0, False, False
         machine.move_down = False
+        machine.press_dir = 0
         from_trail = False
     else:
         # ★★ **自己走位**（M5 / §71）：对战房里 bot 按地形自己挪，
@@ -9395,18 +9842,77 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
     previous = machine.battle_pos
     machine.battle_pos_prev = previous
     machine.battle_pos = (x, y)
+    # ★★★★★ **落地那一格补一发心跳**（V0.3 §182）。
+    #
+    #   收方对远端角色只有**一个**「精确归位」的机会：`0x504215` 里那句
+    #   「**上一发** `[char+0x128]` == 0 **且这一发** bit2 == 1 才硬置坐标，
+    #   否则 0.6/0.4 插值」（§35）。也就是说 —— **腾空→踩地那一发心跳，
+    #   是整条同步链上唯一一次把误差清零的地方**，其余时候只能按 0.6ⁿ 慢慢滑。
+    #
+    #   心跳踩的是 4 格一发的固定网格，而 bot **落地的下一格就能起跳**
+    #   （`_own_step()` 逐格跑）。于是那次落地整个落在两发心跳之间，
+    #   收方一次都没看见 ⇒ 下坠途中攒的误差没人清。
+    #
+    #   实机（2026-09-04 23:26:45，`server.out` + `rpJump`）一行不差：
+    #       84405.522  (2, 1094) v=(0, 38)   ← 沿图左边界高速下坠
+    #       84405.586  rpJump 座位3 第1段     ← 落地了，同一窗口里又起跳
+    #       84405.649  (23, 1062) v=(7, -16) ← 又腾空，「落地」一发没报
+    #   收方按 v=38 一路外推到地底下，再被拽回来 —— 用户看到的「很明显的瞬移」。
+    #
+    #   同一局同一把尺子（从地上起跳里，「落地从没进过心跳」的比例）：
+    #       真人座位 0   0 / 27  = **0.0%**   ← 真人落地后总要停几十毫秒
+    #       bot 1~5      4~33 次 = 8.7% ~ **61.1%**，收方那一刻中位差 63 像素
+    #
+    #   ⇒ 落地是**事件**，不是网格上的一格：它发生在哪一格就在哪一格报。
+    #     ★ 起跳最早只能是落地的**下一格**（腾空中按跳 = 第二段跳，§124），
+    #       所以「落地那一格」永远存在、永远报得出去。
+    #     ★ 追赶途中照旧欠着（§153 / D115）：那一段本来就不许报位置。
+    #     ★ 判据是「**上一发报的是腾空**」，不是「现在踩着地」——
+    #       `machine.on_ground` 的初值是 `None`（这一局还没报过），
+    #       那一发不是落地，别白发一份。
+    landed_now = bool(on_ground) and machine.on_ground is False
     # ★ 记下这一格报出去的地面标志：别人那台机器上 bot 的 `[char+0x128]`
     #   就是它，而夺分模式的一条 ×0.75 按受害者这一格判（§89）。
     machine.on_ground = bool(on_ground)
+    if landed_now or machine.motion_anchor_pending:
+        if behind > 0:
+            machine.beat_pending = True
+        else:
+            beat = True
     # ★★★ **掉出地图下边界 = 死**（§143）：排在发心跳前面 —— 真人死了
     #   那一格也不发心跳，而且这一发要是发出去了，别人屏幕上的 bot 会先
     #   闪到图外再倒下。
     if _fell_out_of_the_world(room, machine, terrain):
         _report_fall_death(room, machine, seat_index)
         return
-    direction = _walk_direction(previous, x)
-    if not direction and from_trail:
-        direction = machine.trail_heading
+    # ★★★★★ 掩码的来源：**自己走位时报自己按着的键，回放真人轨迹时才反推
+    #   位移**（V0.3 §177 / D140，把 D27 收窄到轨迹回放那条老路上）。
+    #
+    #   一发心跳盖 4 格，而收方拿包里那个掩码替这个角色走的正是**接下来
+    #   那 4 格**（`0x507660`，§39）。按位移反推只看得见**最后一格** ——
+    #   4 格里挪了 3 格、最后一格被地形顶住，反推出来就是「站着」，收方
+    #   于是画一个站姿的人、又不替它走，位置只被心跳一格一格拽过去。
+    #
+    #   实机量（2026-09-04 那一局，同一把尺子同时量真人做基准）：
+    #   在地心跳「掩码 ≠ 下一窗净位移方向」真人 **2.1%**、bot **19.9%**。
+    #   报真键之后按错法拆开是这样 ——
+    #     反着挪（收方朝反方向走 128 ms 再被拽回）5.5% -> **3.9%**
+    #     站却挪了（站姿被拖 11~18 px）        10.8% -> 10.5%（★ 治不了）
+    #     走却没挪（键按着位置没动）            3.5% ->  8.4%（★ 不是卡）
+    #   ⚠ 「站却挪了」**不是口径问题**：心跳那一格的意图本来就是 0，
+    #     下一格才翻成 ±1 —— 那是走 / 停颗粒度（§178 第三节），另一条路。
+    #   ⚠ 「走却没挪」变多是预期：真人顶在墙角报的就是这个，收方手里有
+    #     同一张地形、走的是同一套走路函数，照样走不动，两边一致。
+    #
+    #   自己走位时那个键是**已知量**（`press_dir`），根本不需要反推；
+    #   而收方手里有同一张地形、走的是同一套走路函数，报真键才对得上 ——
+    #   真人走进墙角时报的也是「我按着右键、位置没动」。
+    #   `from_trail`（D16 回放）没有「自己的键」可报，那儿 D27 的理由照旧
+    #   成立（抄真人的键会说谎），仍旧按线上位移反推。
+    if from_trail:
+        direction = _walk_direction(previous, x) or machine.trail_heading
+    else:
+        direction = machine.press_dir
     if direction:
         machine.heading = direction
     # ★ 只有**踩在地上**才说「我按着方向键」：腾空那一段的动画是 `Jump`
@@ -9465,6 +9971,7 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
                 cursor=cursor, state_byte=_charge_value(machine, now))
             _emit(machine, machine.sync.heartbeat(state))
             machine.beat_pending = False
+            machine.motion_anchor_pending = False
             # ★ ↓ 报出去了就把锁松开（见 `down_latch`）。
             machine.down_latch = False
         if BOT_DIAG_FIRE_ANYWHERE:
@@ -9767,6 +10274,10 @@ def _tick_room_locked(room, tick, now, behind=0):
         machine = None if seat is None else seat.conn
         if not isinstance(machine, BotConn):
             continue
+        # ★ 日志前缀那个房间号每格刷一次：房间销毁重建之后号会变，
+        #   而 bot 的日志行**只有**这一个地方能分出是哪个房间的（用户
+        #   2026-09-03）。一次属性写，可忽略。
+        machine.room_id = getattr(room, "room_id", None)
         try:
             _tick_bot(room, machine, index, tick, now, behind)
         except Exception as error:          # noqa: BLE001 —— 见 docstring

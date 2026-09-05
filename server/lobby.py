@@ -232,10 +232,10 @@ class Room:
         #: `BotConn` 的单局机器状态：开新一局 / 换图都继续有效，后来加入的
         #: bot 也读同一份；房间对象销毁后自然恢复默认值。
         #:
-        #: `bot_difficulty` 只存档位，两个实际失误概率由 `bot.py` 的
-        #: `BOT_DIFFICULTY_PROFILES` 统一解释，避免三处各存一份互相漂移。
+        #: `bot_difficulty` 只存 1..5 的档位，两个实际失误概率由 `bot.py` 的
+        #: `BOT_DIFFICULTY_PROFILES` 统一解释，避免五处各存一份互相漂移。
         #: `bot_weapon_slot` = 0 表示 AI 自主换枪，1..3 表示房主锁定槽位。
-        self.bot_difficulty = "medium"
+        self.bot_difficulty = 3
         self.bot_weapon_slot = 0
         #: 本房间的开局握手状态（`gameserver.RoomStartGame`）。
         #: ★ `lobby.py` **只管模型不碰协议**，所以这里只留一个空槽，

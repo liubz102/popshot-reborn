@@ -308,10 +308,47 @@ def _walk_tick(terrain, body, character, direction, fast_run, crouched,
         return body.moved(nx, sy)
     if _solid(terrain, nx, body.y - 1):
         # 前面是墙（够不着的高台、图外）—— 真人也是走不过去的，原地不动。
-        return body
+        #
+        # ★★★ 但要先问一句：这一步**跨过去的那几列**里，有没有先来一道
+        #   崖边（V0.3 §177）。收方是一格一格推进的（`0x50d9a7` /
+        #   `0x50e4e9`，§169 里引的就是这几处），走到崖边人就掉下去了，
+        #   根本走不到后面那面墙上。只问落点的话会得出「原地不动」——
+        #   `Iceria03` 那个 1 像素夹层就是靠这一条把 bot 锁死 45.8 秒的：
+        #   脚下那块 1 像素的冰檐左边紧接着就是空的，可一整步（8 像素）
+        #   跨过去正好落在冰体里面，判据说「墙」，于是永远挪不动。
+        ledge = _ledge_within_step(terrain, body, nx, reach)
+        if ledge is None:
+            return body
+        return body.moved(ledge, body.y,
+                          (speed if direction > 0 else -speed), 0.0,
+                          on_ground=False)
     # ★ 走出崖边：人离地、水平速度保持这一步的走速，垂直速度从 0 开始
     #   （原版就是这样掉下去的，不是「不许走过去」）。
     return body.moved(nx, body.y, nx - body.x, 0.0, on_ground=False)
+
+
+def _ledge_within_step(terrain, body, nx, reach):
+    """这一步跨过的那几列里，第一处**脚下没路**的列；一路有路返回 `None`。
+
+    ★ 只在「落点撞墙」那一支上问 —— 那一支今天的结果是**原地不动**，
+      所以这里只可能把「不动」变成「掉下去」，一步走得动的都不碰。
+      实测 8 张真图：受影响的走位占 0.4%（`Iceria03`）~0.0%，
+      而且**全部**来自今天那 0.5%~10.2% 的「撞墙 = 不动」。
+
+    先撞上墙（这一列脚下是实心、又够不着站立面）就返回 `None`：墙在崖边
+    前面时人是真的走不过去。
+    """
+    step = 1 if nx > body.x else -1
+    span = abs(nx - body.x)
+    col = int(body.x)
+    while abs(col + step - body.x) <= span:
+        col += step
+        if surface_near(terrain, col, body.y, reach) is not None:
+            continue                   # 这一列还站得住，接着往前
+        if _solid(terrain, col, body.y - 1):
+            return None                # 先撞上墙 —— 走不到崖边
+        return float(col)
+    return None
 
 
 def _is_ledge(terrain, x, y):
@@ -445,6 +482,29 @@ def _air_tick(terrain, body):
         #   这样「贴着崖壁往下掉」不会被上面很远的崖顶勾上去。
         step = surface_near(terrain, nx, body.y, abs(vx) * CLIMB_SLOPE)
         if step is not None and step < ny:
+            # ★★★★★ **掉着掉着蹭上坡 = 落地**，不是接着飞（V0.3 §181）。
+            #
+            #   「蹭上坎」这一支是 §95 给**往上飞**的人补的（弱击退顶着缓坡
+            #   往上走）。可它没分上下：一个正在**下落**的人从斜坡上方掠过时
+            #   同样命中这里，于是脚被抬到坡面上、`on_ground` 却还是 0、
+            #   `v.y` 接着按重力空转 —— 人**贴着地面滑行**，报出去的下落速度
+            #   一路涨到 40 开外。
+            #
+            #   收方对腾空角色是拿包里的速度**逐帧积分推位置**的
+            #   （`packet_api §5.6`），于是它把角色按 40/tick 往地底下拽，
+            #   一发心跳（4 帧）拽出 170 像素，下一发再拽回来 ——
+            #   **每 128 ms 一次的大幅上下抽动**，就是用户 2026-09-04 报的
+            #   「在空中还是会有卡顿和瞬移感，尤其在空中很明显」。
+            #
+            #   `Forest02` (569,597) 那条弧线实测：从 tick 28 起滑了 20 多个
+            #   tick，`v.y` 从 16 一路涨到 41，收方偏差峰值 **178 像素**。
+            #
+            #   ★ 落地判据本来只问 `ground_below(nx, 出发时的 y)` —— 它是
+            #     **往下**找的，而这里地面是**升上来迎着人**，所以永远问不到。
+            #     `surface_near()` 已经把那个面找出来了，falling 时它就是落点。
+            #   ★ 往上飞（`v.y <= 0`）那一支一个字没动，§95 照旧。
+            if vy > 0:
+                return body.moved(nx, float(step))      # 落地
             ny = float(step)            # 蹭上坎：脚抬到坎顶，**仍然腾空**
             climbed = True
         else:
@@ -469,17 +529,34 @@ def _air_tick(terrain, body):
     return body.moved(nx, ny, vx, vy, on_ground=False)
 
 
-def tick(terrain, body, character, direction=0, fast_run=False,
+def step(terrain, body, character, direction=0, fast_run=False,
          crouched=False, want_jump=False, want_drop=False, speed_scale=1.0):
-    """走一个 tick（32 ms），返回**新的** `Body`。
+    """走一个 tick，返回 `(新 Body, 这一格跑没跑过空中积分)`。
 
-    `direction`：−1 左 / 0 不按 / +1 右，就是心跳里那个方向键掩码（§39）。
-    ★ 它**只在踩着地的时候有意义**（§93）—— 腾空那一段收方根本不读键。
-    `want_jump`：这一 tick 要不要起跳（只在踩着地时有效）。
-    `want_drop`：这一 tick 要不要按 ↓ 穿过脚下单向平台；和跳同时给时下落优先。
+    参数和 :func:`tick` 完全一样 —— `tick()` 就是它丢掉第二个返回值的简写。
+
+    ## ★★★★★ 第二个返回值是什么、给谁用的（V0.3 §185）
+
+    它回答的是**唯一**一个问题：**「某一轴位置没动」这件事，是不是地形钉住的
+    证据？**
+
+    只有 :func:`_air_tick` 会钉住某一轴（撞墙那一支 `nx = body.x`、撞顶那一支
+    把 `v.y` 截成 0）。它跑过 ⇒ `True`：位置真按空中速度推过了，推完还没动就是
+    地形挡的。它没跑 ⇒ `False`：
+
+    * **弹跳台**（`jump_pad_launch`）—— 原版 `JumpingObj::Tick` 是**本格末尾写
+      速度、下一格才按速度挪位置**，所以「刚离地、位置没变、`vy≈−31`」是完全
+      合法的一格。这时候位置没动**不能**当成撞墙；
+    * 踩在地上走（含走出崖边）—— 那一步的位移来自走速，不是空中积分；
+    * 没有地形（`terrain is None`）—— 什么都没算。
+
+    `bot._reportable_speed()` 拿它分流：`False` 时速度原样报，`True` 时才套
+    §181 那条「被钉住的那一轴报 0」。**判据由算物理的这一方说出来**，不让上层
+    按 `before.on_ground` 之类的代理去猜 —— 那个代理在「贴着墙从地面起跳」
+    这一格上是错的（`jump()` 之后 `_air_tick` 照跑，x 会被墙钉住）。
     """
     if terrain is None:
-        return body
+        return body, False
     if not body.on_ground and want_jump:
         # ★ 腾空中按跳 = 第二段跳（§124）。用掉了就什么都不做。
         body = double_jump(body)
@@ -501,8 +578,28 @@ def tick(terrain, body, character, direction=0, fast_run=False,
         #   弹出去。排在走路**之后** —— 实机那一发心跳里人是「又走了一步、
         #   同时被弹起来」的（`(1742,904) -> (1721,905) v=(0,−31)`）。
         launched = jump_pad_launch(terrain, body, character)
-        return body if launched is None else launched
-    return _air_tick(terrain, body)
+        if launched is None:
+            return body, False
+        return launched, False
+    return _air_tick(terrain, body), True
+
+
+def tick(terrain, body, character, direction=0, fast_run=False,
+         crouched=False, want_jump=False, want_drop=False, speed_scale=1.0):
+    """走一个 tick（32 ms），返回**新的** `Body`。
+
+    `direction`：−1 左 / 0 不按 / +1 右，就是心跳里那个方向键掩码（§39）。
+    ★ 它**只在踩着地的时候有意义**（§93）—— 腾空那一段收方根本不读键。
+    `want_jump`：这一 tick 要不要起跳（只在踩着地时有效）。
+    `want_drop`：这一 tick 要不要按 ↓ 穿过脚下单向平台；和跳同时给时下落优先。
+
+    ★ 这是 :func:`step` 只取新 `Body` 的简写。要**报心跳**的地方用 `step()`
+      —— 它多告诉你「位置这一格积分了没有」（§185）；寻路 / 预演那些只关心
+      落点的地方用这个就行。
+    """
+    return step(terrain, body, character, direction=direction,
+                fast_run=fast_run, crouched=crouched, want_jump=want_jump,
+                want_drop=want_drop, speed_scale=speed_scale)[0]
 
 
 def advance(terrain, body, character, ticks, direction=0, fast_run=False,

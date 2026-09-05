@@ -1192,16 +1192,19 @@ class RelayServer:
             #     1. 这一份是位置心跳（内层 0x4001）。开火/命中/伤害走的是
             #        客户端的可靠队列，丢一发就整局错位（§217），永远走 TCP；
             #     2. 收件人自证过它那边 7788 收得到，而且这条流还活着；
-            #     3. 这一发的 N 和上一发送给他的相同（`may_send_heartbeat`
-            #        里有完整推导：这一条让下行**可证明**不会造成队列错位）。
+            #     3. 这条流**本代的种子心跳已经从 TCP 走过了**
+            #        （`may_send_heartbeat` 里有完整推导 + 客户端队列模型的
+            #        证明：本代第一发走 TCP 定基线，之后整代固定 UDP）。
             #   任何一条不成立就落到下面原来的两条路上，行为和今天一样。
-            #   ⚠ 绝不「两条都发」：心跳没有任何可判新旧的原版字段，
-            #     晚到的那份会把角色拉回旧位置。
+            #   ⚠ 绝不「两条都发」，也**绝不逐包换路**：心跳没有任何可判新旧
+            #     的原版字段，晚到的那份会把角色拉回旧位置（铁律 4 / §185）。
+            #   ★ bot 和真人**同一套规则**：bot 恰恰是最吃这条路的一方
+            #     （它几乎一直在空中，收方按速度外推 4 帧，一发倒序被放大）。
             if (self._udp_sender is not None
                     and udpsync.is_heartbeat(packet)
                     and self._udp_sender.ready_for(member)
                     and self._udp_sender.may_send_heartbeat(
-                        member, sender_game_conn, packet)
+                        member, sender_game_conn, packet, send_gen)
                     and self._udp_sender.send_to(member, packet)):
                 sent += 1
                 self.delivered_udp += 1
@@ -1258,9 +1261,10 @@ class RelayServer:
         with self._lock:
             conns = list(self._conns.values())
             pending = len(self._tickets)
-        # ★ 三条出路要一起报。`delivered_udp` 现在是**主路** —— `bug调查/udp验证`
-        #   那一局 50160 人次里有 97.6% 走的是它（§225），只报「中继 / 回退」
-        #   会让人以为位置数据还在走 TCP。顺序按 `deliver()` 里的判定顺序。
+        # ★ 三条出路要一起报。`delivered_udp` 是**主路** —— `bug调查/udp验证`
+        #   那一局 50160 人次里有 97.6% 走的是位置数据的 UDP 旁路（§225），
+        #   只报「中继 / 回退」会让人以为位置数据还在走 TCP。
+        #   顺序按 `deliver()` 里的判定顺序。
         line = (f"中继：在线 {len(conns)} 条，待兑票据 {pending} 张，"
                 f"累计注册 {self.registered_total} 次；"
                 f"投递 UDP {self.delivered_udp} / 中继 {self.delivered_relay}"

@@ -1015,7 +1015,7 @@ class PktQueueModelTests(unittest.TestCase):
 class StatusLineTests(unittest.TestCase):
     """`status()` 那一行必须把**三条**出路都报出来（§225 第六节）。
 
-    ★ `delivered_udp` 现在是**主路**：`bug调查/udp验证` 那一局 50160 人次
+    ★ `delivered_udp` 是**主路**：`bug调查/udp验证` 那一局 50160 人次
       投递里 97.6% 走的是位置数据的 UDP 旁路。只报「中继 / 回退」会让人
       以为位置数据还在走 TCP，正好把排查引到反方向。
     """

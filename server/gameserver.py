@@ -5353,7 +5353,8 @@ PEER_RELAY = relayserver.RelayServer(
     generation_of=_relay_generation_of,
     # 位置数据的 UDP 旁路（bug调查/9）。`deliver()` 里它是**优先级最高、
     # 准入条件最窄**的那一条路：只有位置心跳、只有自证过能收的收件人、
-    # 而且只有 N 没变的那一发才走它。见 `udpsync.may_send_heartbeat`。
+    # 而且只有本代种子心跳已经走过 TCP 之后才走它。
+    # 见 `udpsync.may_send_heartbeat`（铁律 4 / V0.3 §185）。
     udp_sender=udpsync.SERVER,
     logger=lambda msg: asynclog.emit(f"[{ts()}] [relay] {msg}"),
 )
@@ -5584,12 +5585,26 @@ class Conn:
     #: 补建时用的类级锁。**只**在上面那一格还是 `None` 时会走到。
     _outbox_boot = threading.Lock()
 
-    #: ★ 诊断（V0.3 §166）：发送线程一次醒来最多并走过几份。**按「刷新纪录」
-    #: 去重**（铁律 10 的口径：状态翻转，不是次数也不是时间窗）——
-    #: 只有比以前更深的一次积压才打一行，所以一条连接一局最多几行。
+    #: ★ 诊断（V0.3 §166 / §184）：一份密文在发送队列里**躺过的最长时间**，
+    #: 取整到毫秒。**按「刷新纪录」去重**（铁律 10 的口径：状态翻转，不是
+    #: 次数也不是时间窗）—— 只有比以前更久的一次滞留才打一行。
     #: 它同时是「积压到底在服务端还是在中继」的分水岭：这个数一直很小
     #: 而客户端仍然收得一卡一卡，那就不是这条队列的事。
-    send_burst_max = 0
+    #:
+    #: ★★★ 判据**不是**「一次写并走了几份」（§184 把老判据判死了）：
+    #:   份数同时被两件毫不相干的事撑大 ——
+    #:   ① 发送线程被 GIL 饿住，包在队里躺了几十~几百毫秒（§166，**要抓的**）；
+    #:   ② 调用方在同一毫秒里连着 `send()` 了 N 份，发送线程一醒来就一次
+    #:      全走，队里**一份都没躺过**（结算 12 份 / `/a` 加 5 个 bot 11 份 /
+    #:      登录补发 4 份，**全是这一类**）。
+    #:   一个数字分不开这两件事，②又必然比①常见 ⇒ 老诊断报的基本全是假警报。
+    #:   而「躺了多久」是**直接**区分它们的那个事实：②不到 1 ms，①从 30 ms
+    #:   起步（§166 实测尖峰 800 ms）。取整到毫秒是因为客户端一帧 16 ms，
+    #:   亚毫秒的滞留物理上不可能被看见 —— 这是量纲，不是拍脑袋的阈值。
+    #: ★★ 顺带修好了老诊断的一个**漏报**：§166 的原始现象是「一次只走掉
+    #:   一个包、间隔 30~50 ms」，份数恒为 1，老诊断（只在并走 >1 份时才记）
+    #:   对它**一声不吭**。现在每次出队都量，一份也照报。
+    send_wait_max_ms = 0
 
     def __init__(self, sock, addr, args, accounts=None, tickets=None):
         global _seq
@@ -5674,7 +5689,7 @@ class Conn:
         # ★ 同步数据的上行现在有**三个**线程会走到：这条连接自己的线程
         #   （`0x040e`）、原版中继连接的线程（rcp opcode 3）、以及 UDP 收包
         #   线程（`udpsync`）。闸门、统计和转发必须串起来，否则两条路可能
-        #   同时判「该我转」而把同一发心跳投两次 —— 那正是铁律 4 要防的。
+        #   同时判「该我转」而把同一发上行心跳投两次 —— 那正是铁律 2 要防的。
         #   ⚠ 顺序永远是「先 peer_lock 再 send_lock」，反过来拿会死锁。
         self.peer_lock = threading.RLock()
         # 上一次看到的局号，用来判断「换代了，闸门要归零」。
@@ -5999,7 +6014,9 @@ class Conn:
                 #   是同一个 —— 「8 秒没把我们的字节收走」，那这条流已经废了。
                 start = "slow"
             if start is None:
-                self.outbox.append((wire, bool(solo)))
+                # ★ 第三格是**入队时刻**：出队时拿它算「这份在队里躺了多久」，
+                #   那才是「发送线程被饿住」的直接证据（§184）。
+                self.outbox.append((wire, bool(solo), now))
                 self.outbox_bytes += len(wire)
                 if self.writer is None or not self.writer.is_alive():
                     self.writer = threading.Thread(
@@ -6014,16 +6031,21 @@ class Conn:
         elif start == "thread":
             self.writer.start()
 
-    def _note_send_burst(self, packets, size):
-        """★ 诊断：这一次醒来并走了 `packets` 份 —— 刷新纪录才打一行（§166）。
+    def _note_send_wait(self, queued_at, packets, size):
+        """★ 诊断：这一次写的**队首**那份在队里躺了多久 —— 刷新纪录才打一行。
+
+        `queued_at` 传的是队首那份的入队时刻。队列是 FIFO、入队时刻单调不减，
+        所以队首就是这一批里躺得**最久**的那份（§166 / §184）。
 
         ⚠ 调用方已经持有 `outbox_cv`。
         """
-        if packets <= self.send_burst_max:
+        waited_ms = int((time.monotonic() - queued_at) * 1000)
+        if waited_ms <= self.send_wait_max_ms:
             return
-        self.send_burst_max = packets
-        self.log(f"   ★发送队列积压新高：一次写并走 {packets} 份"
-                 f"（{size} 字节）—— 越大说明发送线程被饿得越久（§166）")
+        self.send_wait_max_ms = waited_ms
+        self.log(f"   ★发送队列滞留新高：队首那份躺了 {waited_ms} ms"
+                 f"（这一次写 {packets} 份 {size} 字节）—— 越大说明发送线程"
+                 f"被饿得越久；份数只是旁证，别拿它当积压（§166 / §184）")
 
     def _writer_loop(self):
         """本连接的发送线程：把队列里的密文写出去。**只堵它自己。**
@@ -6072,22 +6094,27 @@ class Conn:
                     self.outbox_bytes = 0
                     cv.notify_all()
                     return
-                chunk, solo = self.outbox.popleft()
+                chunk, solo, queued_at = self.outbox.popleft()
                 self.outbox_bytes -= len(chunk)
+                packets = 1
                 if not solo:
                     # ★ 把**此刻**排在后面的非 solo 份一起取走。判据是队列
                     #   自己的状态（「还排着、而且不是 solo」），不是次数
                     #   也不是时间（铁律 10）。
                     merged = [chunk]
                     while self.outbox and not self.outbox[0][1]:
-                        more, _ = self.outbox.popleft()
+                        more, _, _ = self.outbox.popleft()
                         self.outbox_bytes -= len(more)
                         merged.append(more)
                     if len(merged) > 1:
                         chunk = b"".join(merged)
-                        self._note_send_burst(len(merged), len(chunk))
+                        packets = len(merged)
                 if not self.outbox:
                     self.outbox_bytes = 0
+                # ★ **每次**出队都量，只走 1 份也量：§166 的原始现象正是
+                #   「一次只走一个包、间隔 30~50 ms」—— 份数恒为 1，
+                #   老诊断对它一声不吭（§184）。
+                self._note_send_wait(queued_at, packets, len(chunk))
             try:
                 send_all_bounded(self.sock, chunk, GAME_SEND_DEADLINE_S)
             except OSError as error:
@@ -9351,15 +9378,24 @@ class Conn:
             #   要对的就是「谁在哪个局号发到第几号、内层是什么」（§216）。
             self.vlog(describe_peer_header(payload))
         elif VERBOSE:
+            # ★★★ **解得通才打**（V0.3 §184）。这一行是个**猜**，读不通说明
+            #   这个包压根不是那个形状 —— 那才是常态（0x0408 死亡上报、
+            #   0x030a、0x0505 累计伤害…没一个是），上一行的 hexdump 已经把
+            #   payload 原样打出来了，再补一行「试解失败: payload truncated
+            #   at offset 2: need 124514, have 4」是**零信息的误导**：它长得
+            #   像解密错位／流对不齐，用户 2026-09-05 就是被它带偏的。
+            #   （124514 = 6 字节的 0x030a 头两字节 0xf331 当成字符串长度
+            #     再 ×2 —— 猜错了而已，那一局的 opcode 从头到尾都是合法值。）
             try:
                 r = Reader(payload)
                 s = r.wstr()
                 ints = []
                 while r.left() >= 4:
                     ints.append(r.i32())
+            except Exception:       # noqa: BLE001 —— 不是这个形状，常态
+                pass
+            else:
                 self.vlog(f"   试解: str={s!r} ints={ints} 剩余={r.left()}")
-            except Exception as e:
-                self.vlog(f"   试解失败: {e}")
 
         if self.args.hold_lobby:
             self.log("   [hold-lobby] 不回应答")
