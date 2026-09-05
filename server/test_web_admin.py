@@ -14,6 +14,7 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -159,6 +160,9 @@ class AdminAuthTests(_AdminCase):
                 ("/admin/api/catalog", None),
                 ("/admin/itemicons.png", None),
                 ("/admin/api/item?id=1120041", None),
+                ("/admin/api/players?q=a", None),
+                ("/admin/api/player?name=alice", None),
+                ("/admin/api/player", {"name": "alice", "money": 1}),
                 ("/admin/api/config/shop", {"text": "{}"}),
                 ("/admin/api/admins/add", {"name": "carol", "password": "pw1"}),
                 ("/admin/api/admins/password", {"name": "admin", "password": "pw1"}),
@@ -542,6 +546,158 @@ class AdminItemLookupTests(_AdminCase):
     def test_a_non_numeric_id_is_refused(self):
         result = self.request("/admin/api/item?id=abc")[1]
         self.assertFalse(result["ok"])
+
+
+class AdminPlayerTests(_AdminCase):
+    """玩家资料页：找人、改等级/金币/材料/非商店物品（V0.3商店 D22）。
+
+    ★ 这一组里最重要的是 `test_a_shop_item_cannot_be_handed_out` ——
+    商店按**真实等级**卖东西，管理页要是能直接把 4 级才卖的枪塞进 1 级号的
+    仓库，那条等级门槛就白设了。
+    """
+
+    #: 挑几件东西当样本。材料一定不上架；`_ARMOR` 是「商店里买不到」的那一批。
+    _MATERIAL = 10001
+    _MATERIAL2 = 10002
+    _ARMOR = 1010064
+    _LISTED = 1120011
+
+    def setUp(self):
+        super().setUp()
+        self.accounts.register("alice", "pw1", display_name="爱丽丝")
+        self.accounts.register("bob", "pw2", display_name="小明")
+        self.login()
+
+    def player(self, name="alice"):
+        status, result = self.request(
+            "/admin/api/player?name=" + urllib.parse.quote(name))
+        self.assertEqual(200, status)
+        self.assertTrue(result["ok"], result)
+        return result["player"]
+
+    def save(self, **payload):
+        payload.setdefault("name", "alice")
+        return self.request("/admin/api/player", payload)
+
+    # ------------------------------------------------------------ 查找
+    def test_search_matches_the_username_and_the_nickname(self):
+        _status, by_user = self.request("/admin/api/players?q=ali")
+        self.assertEqual(["alice"], [p["username"] for p in by_user["players"]])
+        # ★ 昵称是中文 —— 查询串必须百分号编码，服务端那头 `parse_qs`
+        #   才解得回 UTF-8（浏览器的 `encodeURIComponent` 干的是同一件事）。
+        _status, by_nick = self.request(
+            "/admin/api/players?q=" + urllib.parse.quote("小明"))
+        self.assertEqual(["bob"], [p["username"] for p in by_nick["players"]])
+
+    def test_search_is_case_insensitive_and_lists_everyone_when_empty(self):
+        _status, upper = self.request("/admin/api/players?q=ALICE")
+        self.assertEqual(["alice"], [p["username"] for p in upper["players"]])
+        _status, all_of_them = self.request("/admin/api/players?q=")
+        self.assertEqual(["alice", "bob"],
+                         [p["username"] for p in all_of_them["players"]])
+
+    def test_an_unknown_player_is_a_clean_404(self):
+        status, result = self.request("/admin/api/player?name=nobody")
+        self.assertEqual(404, status)
+        self.assertFalse(result["ok"])
+
+    # -------------------------------------------------------- 等级 / 金币
+    def test_setting_the_level_moves_the_experience_with_it(self):
+        _status, result = self.save(level=7, money=1234)
+        self.assertTrue(result["ok"], result)
+        _name, account = self.accounts.get_account("alice")
+        self.assertEqual(7, account["level"])
+        self.assertEqual(account_store.experience_for_level(7),
+                         account["experience"])
+        self.assertEqual(1234, account["money"])
+
+    def test_resaving_the_same_level_keeps_the_experience_inside_that_level(self):
+        # 5 级、本级内又攒了 40 点。再按「5 级」保存一次不该把那 40 点抹掉
+        # —— 和 `experience_for_import` 中间那条是同一个道理。
+        self.accounts.add_quest_reward(
+            "alice", experience=account_store.experience_for_level(5) + 40)
+        _status, result = self.save(level=5)
+        self.assertTrue(result["ok"], result)
+        _name, account = self.accounts.get_account("alice")
+        self.assertEqual(account_store.experience_for_level(5) + 40,
+                         account["experience"])
+
+    def test_the_level_is_clamped_to_the_curve(self):
+        self.save(level=999)
+        _name, account = self.accounts.get_account("alice")
+        self.assertEqual(account_store.LEVEL_MAX, account["level"])
+
+    def test_a_non_numeric_level_is_refused(self):
+        _status, result = self.save(level="七级")
+        self.assertFalse(result["ok"])
+        self.assertIn("等级", result["message"])
+
+    def test_saving_nothing_says_so_and_touches_nothing(self):
+        before = self.player()
+        _status, result = self.save(level=before["level"], money=before["money"])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual([], result["changes"])
+
+    # ------------------------------------------------------ 材料 / 仓库
+    def test_materials_can_be_set_and_cleared(self):
+        self.save(materials={str(self._MATERIAL): 5,
+                             str(self._MATERIAL2): 3})
+        self.assertEqual(5, account_store.material_count(
+            self.accounts.get_account("alice")[1], self._MATERIAL))
+        # 0 = 把这一格删掉，另一格不受影响。
+        self.save(materials={str(self._MATERIAL): 0})
+        _name, account = self.accounts.get_account("alice")
+        self.assertEqual({self._MATERIAL2: 3},
+                         account_store.material_counts(account))
+
+    def test_an_item_the_shop_does_not_sell_can_be_handed_out(self):
+        _status, result = self.save(inventory={str(self._ARMOR): 1})
+        self.assertTrue(result["ok"], result)
+        _name, account = self.accounts.get_account("alice")
+        self.assertTrue(account_store.has_item(account, self._ARMOR))
+
+    def test_a_shop_item_cannot_be_handed_out(self):
+        # ★★ 这条是整组的重点：商店在卖的东西只能靠买。
+        status, result = self.save(inventory={str(self._LISTED): 1})
+        self.assertEqual(200, status)
+        self.assertFalse(result["ok"])
+        self.assertIn(str(self._LISTED), result["message"])
+        _name, account = self.accounts.get_account("alice")
+        self.assertFalse(account_store.has_item(account, self._LISTED))
+
+    def test_a_shop_item_the_player_owns_comes_back_locked(self):
+        self.accounts.add_item("alice", self._LISTED)
+        self.accounts.add_item("alice", self._ARMOR)
+        rows = {row["id"]: row for row in self.player()["inventory"]}
+        self.assertTrue(rows[self._LISTED]["locked"])
+        self.assertFalse(rows[self._ARMOR]["locked"])
+
+    def test_dropping_an_item_also_takes_it_off(self):
+        self.accounts.add_item("alice", self._ARMOR)
+        self.accounts.equip_item("alice", self._ARMOR)
+        self.save(inventory={str(self._ARMOR): 0})
+        _name, account = self.accounts.get_account("alice")
+        self.assertEqual([], account_store.equipped_items(account))
+        self.assertFalse(account_store.has_item(account, self._ARMOR))
+
+    def test_an_id_the_client_does_not_know_is_refused(self):
+        _status, result = self.save(inventory={"424242": 1})
+        self.assertFalse(result["ok"])
+
+    def test_a_negative_count_is_refused(self):
+        _status, result = self.save(materials={str(self._MATERIAL): -1})
+        self.assertFalse(result["ok"])
+        self.assertIn("负数", result["message"])
+
+    # ------------------------------------------------------------ 视图
+    def test_the_view_carries_what_the_page_needs(self):
+        self.accounts.add_materials("alice", {self._MATERIAL: 2})
+        view = self.player()
+        self.assertEqual("爱丽丝", view["nickname"])
+        self.assertEqual(account_store.LEVEL_MAX, view["level_max"])
+        self.assertFalse(view["online"])
+        self.assertEqual([{"id": self._MATERIAL, "count": 2, "locked": False}],
+                         view["materials"])
 
 
 class AdminSessionStoreTests(unittest.TestCase):

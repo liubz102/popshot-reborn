@@ -2323,6 +2323,158 @@ static int try_patch_map_level_gate(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* 玩家等级门槛 patch —— 对战 / 生存 / 5-6 人房 / 天梯 / 新手图                 */
+/*                              （V0.3商店 D22，接替服务端的 D120）            */
+/*                                                                            */
+/*   【为什么必须挪到 hook 里】客户端把 `gspRepLogin` 下发的等级存进全局        */
+/*   `[0x72e338]`，而这**一个**数同时被三类代码读：                            */
+/*                                                                            */
+/*     1. 界面上的等级显示（`0x41a467` 玩家数据栏、`0x465948` 房间信息栏）；    */
+/*     2. 原版那几道等级门（下面 7 处）；                                       */
+/*     3. ★ **物品的「穿上」判定** —— 商店/仓库 `0x445817` 和房间 `0x46aff1`   */
+/*        都拿 `ItemInfo+0x1c`（服务端在 `0x0501` 里发的等级要求）和它比。      */
+/*                                                                            */
+/*   V0.2 D120 的做法是把下发值抬到 4 来顶开第 2 类，代价是第 1 类（1~3 级号   */
+/*   显示成 4 级）和第 3 类（商店的等级门槛跟着放水）一起被改掉。V0.3 商店      */
+/*   要按真实等级卖东西，于是反过来：**服务端发真实等级，第 2 类逐个 patch**。 */
+/*                                                                            */
+/*   ⚠ 第 3 类那两处 (`0x445817` / `0x46aff1`) **不许动** —— 它们正是商店      */
+/*   物品等级限制在客户端这一侧的落点。                                        */
+/*                                                                            */
+/*   七处判据（全是脱壳镜像 `re/BigShot_22524.img` 上核过的唯一特征串）：       */
+/*                                                                            */
+/*   1) `0x440b08` 频道准入（V0.1 §83）                                        */
+/*        33 DB 43              xor ebx,ebx / inc ebx     ; ebx = 1            */
+/*        39 1D 38 E3 72 00     cmp [0x72e338], ebx       ; 等级**恰好** == 1  */
+/*        0F 85 88 00 00 00     jne 0x440b9c              ; != 1 -> 不拦       */
+/*      命中就弹「레벨이 맞지 않아 접속 하실 수 없습니다」（不符合等级要求，     */
+/*      无法连接）。jne -> jmp：任何等级都走「不拦」那条路。                    */
+/*                                                                            */
+/*   2) `0x440cd9` 同一个提示的第二个引用点（`0x440d2a`），判据一模一样。       */
+/*      §83 早就写明这句话有**两处**引用，只 patch 一处会漏。                   */
+/*                                                                            */
+/*   3) `0x465338` / 4) `0x465a2c` 生存模式被强制改回夺分（V0.2 §203）         */
+/*        83 3D 38 E3 72 00 04  cmp [0x72e338], 4                             */
+/*        7D 0D / 7D 0E         jge 跳过                  ; >= 4 -> 不改       */
+/*      两处都是「中国区 + 模式 0(生存) + 房主 + 等级 < 4 -> 模式写成 3(夺分)」，*/
+/*      一处在房间设定对话框、一处在房间回调；§203 当时只逆到后者。            */
+/*      jge -> jmp：永远走「不改」。                                           */
+/*                                                                            */
+/*   5) `0x4374d5` 建房(对战)「人数」下拉框                                    */
+/*        BE 70 E5 72 00        mov esi, 0x72e570         ; 人数表             */
+/*        C7 45 10 05 …         mov [ebp+0x10], 5         ; 5 条              */
+/*        3B 5E 08              cmp ebx, [esi+8]          ; 等级 vs 条目要求   */
+/*        7C 17                 jl 跳过这一条                                  */
+/*      表里 5 条 {2,3,4,5,6} 人，★ 只有 **5 人和 6 人的要求等级是 4**         */
+/*      （`0x72e594` / `0x72e5a0`，全客户端的下拉框静态表里唯一两个非 0 门槛）。*/
+/*      NOP 掉 jl：五条全部进下拉框。                                          */
+/*                                                                            */
+/*   6) `0x54f8f2` 建房结果处理器（`0x0201`）里的**新手图强制**               */
+/*        39 1D 38 E3 72 00     cmp [0x72e338], ebx       ; ebx = 1（0x54f80c）*/
+/*        0F 85 1E 01 00 00     jne 0x54fa1c                                   */
+/*      等级**恰好 1** 时，客户端自己把新建房间的地图改成 `Newbe2-1`           */
+/*      （지하유적 입구，`map.ini` 里 MaxUser=2）/ `Newbe2-1:NewPvp`。         */
+/*      ★ 这条以前从没触发过 —— D120 把 1 级顶成了 4。jne -> jmp。            */
+/*                                                                            */
+/*   7) `0x43b676` 天梯标签页（V0.1 §62）                                      */
+/*        83 3D 38 E3 72 00 06  cmp [0x72e338], 6                             */
+/*        0F 8D A6 00 00 00     jge 0x43b729              ; >= 6 -> 放行       */
+/*      不够就弹「레벨 %d이상만 플레이하실 수 있습니다」并**不发包**。         */
+/*      D120 时代等级顶到 4 也进不去，是用户 2026-09-05 拍板一并解除的。       */
+/*                                                                            */
+/*   ★ 没有动、也不该动的两处 `cmp [0x72e338], 4`：`0x44c94d` / `0x44cc00` /   */
+/*     `0x467eaa` 是角色 3 아이린 的 4 级解锁 —— 她被 `CharacterChanger` 的     */
+/*     按钮循环 `0x4f58e8` 显式跳过，界面上本来就放不出来（见                  */
+/*     `account_store.PREMIUM_CHARACTER_IDS` 的注释）；`0x43b47e` 是中国区     */
+/*     本来就跳过的新手图标。                                                  */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_PLAYER_LEVEL_LOCK=1 保留原版全部玩家等级门槛。            */
+/* -------------------------------------------------------------------------- */
+#define PLR_LVL_SITE_COUNT 7
+static const struct {
+    unsigned int va;
+    unsigned int len;
+    unsigned int off;
+    unsigned int n;
+    const unsigned char *sig;
+    const unsigned char *fix;
+    const char *what;
+} PLR_LVL_SITES[PLR_LVL_SITE_COUNT] = {
+    { 0x00440b05u, 15, 9, 6,
+      (const unsigned char *)"\x33\xDB\x43\x39\x1D\x38\xE3\x72\x00\x0F\x85\x88\x00\x00\x00",
+      (const unsigned char *)"\xE9\x89\x00\x00\x00\x90",   /* jne -> jmp 0x440b9c */
+      "对战频道准入 0x440af7 第 1 处（等级==1 不再拦）" },
+    { 0x00440cd6u, 11, 9, 2,
+      (const unsigned char *)"\x33\xF6\x46\x39\x35\x38\xE3\x72\x00\x75\x7A",
+      (const unsigned char *)"\xEB\x7A",                   /* jne -> jmp 0x440d5b */
+      "对战频道准入第 2 处 0x440cd9（同一句提示的另一个引用）" },
+    { 0x00465338u, 13, 7, 2,
+      (const unsigned char *)"\x83\x3D\x38\xE3\x72\x00\x04\x7D\x0D\x83\x7E\x04\x05",
+      (const unsigned char *)"\xEB\x0D",                   /* jge -> jmp 0x46534e */
+      "生存模式强制改夺分 0x465338（房间设定对话框）" },
+    { 0x00465a2cu, 15, 7, 2,
+      (const unsigned char *)"\x83\x3D\x38\xE3\x72\x00\x04\x7D\x0E\x8B\x86\xCC\x01\x00\x00",
+      (const unsigned char *)"\xEB\x0E",                   /* jge -> jmp 0x465a43 */
+      "生存模式强制改夺分 0x465a2c（房间回调，V0.2 §203）" },
+    { 0x004374c9u, 17, 15, 2,
+      (const unsigned char *)"\xBE\x70\xE5\x72\x00\xC7\x45\x10\x05\x00\x00\x00\x3B\x5E\x08\x7C\x17",
+      (const unsigned char *)"\x90\x90",                   /* NOP 掉 jl（5/6 人也进表） */
+      "建房(对战)人数下拉框 0x4374d5（5 人 / 6 人的要求等级 4）" },
+    { 0x0054f8f2u, 15, 6, 6,
+      (const unsigned char *)"\x39\x1D\x38\xE3\x72\x00\x0F\x85\x1E\x01\x00\x00\x8D\x4D\xC0",
+      (const unsigned char *)"\xE9\x1F\x01\x00\x00\x90",   /* jne -> jmp 0x54fa1c */
+      "1 级号建房被塞进新手图 Newbe2-1 @ 0x54f8f2" },
+    { 0x0043b676u, 13, 7, 6,
+      (const unsigned char *)"\x83\x3D\x38\xE3\x72\x00\x06\x0F\x8D\xA6\x00\x00\x00",
+      (const unsigned char *)"\xE9\xA7\x00\x00\x00\x90",   /* jge -> jmp 0x43b729 */
+      "天梯标签页等级 >=6 @ 0x43b676" },
+};
+static volatile LONG g_plr_lvl_patched = 0;
+
+static int player_level_lock_kept(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_PLAYER_LEVEL_LOCK",
+                                      buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_patch_player_level_gate(void)
+{
+    int i, done = 0;
+
+    if (g_plr_lvl_patched) return 1;
+    for (i = 0; i < PLR_LVL_SITE_COUNT; i++) {
+        unsigned char *base = (unsigned char *)PLR_LVL_SITES[i].va;
+        unsigned char *p = base + PLR_LVL_SITES[i].off;
+        DWORD oldp;
+
+        if (IsBadReadPtr(base, PLR_LVL_SITES[i].len)) continue;
+        if (memcmp(p, PLR_LVL_SITES[i].fix, PLR_LVL_SITES[i].n) == 0) { done++; continue; }
+        if (memcmp(base, PLR_LVL_SITES[i].sig, PLR_LVL_SITES[i].len) != 0)
+            continue;                            /* 还没解壳到这里，继续等 */
+
+        if (!VirtualProtect(p, PLR_LVL_SITES[i].n, PAGE_EXECUTE_READWRITE, &oldp)) {
+            bslog("PATCH   玩家等级门槛(%s): VirtualProtect 失败 err=%lu",
+                  PLR_LVL_SITES[i].what, (unsigned long)GetLastError());
+            continue;
+        }
+        memcpy(p, PLR_LVL_SITES[i].fix, PLR_LVL_SITES[i].n);
+        VirtualProtect(p, PLR_LVL_SITES[i].n, oldp, &oldp);
+        FlushInstructionCache(GetCurrentProcess(), p, PLR_LVL_SITES[i].n);
+        bslog("PATCH   ★玩家等级门槛 @ %08X: %s",
+              (unsigned)(PLR_LVL_SITES[i].va + PLR_LVL_SITES[i].off),
+              PLR_LVL_SITES[i].what);
+        done++;
+    }
+    if (done == PLR_LVL_SITE_COUNT) {
+        InterlockedExchange(&g_plr_lvl_patched, 1);
+        return 1;
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
 /* 联机闪退修复 —— 中文输入法（IME）候选窗在 stage 切换后踩已释放的聊天输入框  */
 /*                                                                            */
 /*   实测（bug调查/3，12 份 mdmp 全部同一现场）：收到 0x0402「全员加载完成，   */
@@ -4027,6 +4179,23 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_map_lvl_patched)
             bslog("PATCH   !! 超时未能 patch 地图等级门槛"
                   "（0x40b623 的特征串一直对不上）");
+    }
+
+    /* 玩家等级门槛（D22）：和地图那组同一个道理，不赶时机 —— 七处判据最早
+       也要等玩家点进大厅/建房对话框才执行。★ 这组**必须**打上，否则服务端
+       改发真实等级之后，1~3 级号会退回原版的对战锁。 */
+    if (player_level_lock_kept()) {
+        bslog("PATCH   BSHOOK_KEEP_PLAYER_LEVEL_LOCK 已设，保留原版玩家等级门槛"
+              "（1 级号会进不了对战频道、选不了生存模式和 5/6 人房）");
+    } else {
+        for (ticks = 0; !g_stop && !g_plr_lvl_patched && ticks < 2000; ticks++) {
+            if (try_patch_player_level_gate()) break;
+            Sleep(2);
+        }
+        if (!g_plr_lvl_patched)
+            bslog("PATCH   !! 超时未能 patch 玩家等级门槛"
+                  "（0x440b05 / 0x440cd6 / 0x465338 / 0x465a2c / 0x4374c9 / "
+                  "0x54f8f2 / 0x43b676 的特征串一直对不上）");
     }
 
     /* IME 闪退修复（联机主崩溃，bug调查/3 + bug调查/5）：三处配套，缺一不可。

@@ -81,18 +81,15 @@ NEW_ACCOUNT_DEFAULTS = {
 #: 客户端认为「教程已完成」的最小值。大厅 `0x43b357` 是 `cmp eax,3 / jge`（§54）。
 TUTORIAL_DONE_STATE = 3
 
-#: ★ 账号等级的下限 = **2**，这就是「解除对战等级限制」的实现。
+#: ★★ 这里**曾经**有个 `MINIMUM_PLAYER_LEVEL = 4`（V0.2 D120）：低等级账号
+#: 下发给客户端的等级被抬到 4，用来一次顶开「对战频道 / 生存模式 / 5-6 人房」
+#: 那几道原版等级门。**V0.3商店 D22 把它删了**，理由是它和商店对不上 ——
+#: 客户端的显示等级和门槛判定读的是**同一个**全局 `[0x72e338]`，抬高它就等于
+#: 让 1 级号既显示成 4 级，又能买 4 级才卖的武器（购买判定走服务端，
+#: 但服务端拿的也是这个抬过的值）。
 #:
-#: 客户端大厅点「对战」标签时判的是全局 `[0x72e338] == 1`（**恰好等于 1**，不是 `< 2`），
-#: 命中就弹「不符合等级要求，无法连接」（V0.1 §83）。房间里点开始时的
-#: 「等级太低，无法选择任务」读的是房主座位里的 u16 等级（V0.1 §77），同一个数。
-#: 此外，中国区房主在房间里选生存模式时还有一道隐藏的 `< 4` 判断；命中后
-#: 客户端会自行把模式改回夺分并回发 0x0302（V0.2 §203）。所以客户端可见等级
-#: 必须永远 >= 4，才能同时打开这三道门。
-#:
-#: 用户已授权这个方案（「可以采用在用户注册时服务端自动将用户等级提升至满足要求的等级」）。
-#: 经验值和存档等级仍然如实累计，只在向旧客户端编码时应用这个兼容下限。
-MINIMUM_PLAYER_LEVEL = 4
+#: 现在下发的是**真实等级**，那几道门改由 `hook/bshook.c` 的
+#: `try_patch_player_level_gate()` 直接 patch 掉（7 处，见那边的注释）。
 
 #: 用户名规则：2~16 个 ASCII 字母 / 数字 / 下划线 / 连字符。
 #:
@@ -1030,6 +1027,127 @@ class AccountStore:
             rest = [i for i in equipped_items(account) if i != item_id]
             return self.set_equipped(username, rest)
 
+    # ------------------------------------------------- 管理页的玩家信息修改
+    def search_accounts(self, query="", limit=30):
+        """按**用户名或昵称**找账号，返回 ``[(用户名, 账号字典), …]``。
+
+        大小写不敏感的**子串**匹配，两边任意一边命中就算（需求原文：
+        「可以通过昵称或用户名来查找具体用户」）。查询串留空 = 列前 `limit` 个。
+
+        ★ 昵称走 `nickname_key()` 归一化，和注册时的查重口径一致 ——
+        否则「全角空格」「大小写」这类差异会让管理员搜不到刚注册的人。
+        """
+        needle = str(query or "").strip().lower()
+        key_needle = nickname_key(query)
+        found = []
+        with self._lock:
+            data = self._read_unlocked()
+            for username in sorted(data["accounts"]):
+                account = self._merged_account(username,
+                                               data["accounts"][username])
+                if needle:
+                    nickname = str(account.get("display_name") or "")
+                    if (needle not in username.lower()
+                            and needle not in nickname.lower()
+                            and not (key_needle
+                                     and key_needle in nickname_key(nickname))):
+                        continue
+                found.append((username, account))
+                if limit and len(found) >= int(limit):
+                    break
+        return found
+
+    def admin_update_account(self, username, level=None, money=None,
+                             materials=None, inventory=None):
+        """管理页改一个玩家的存档，返回 ``(更新后的账号, 改了什么的清单)``。
+
+        **只动传进来的那几项**，其余一个字节不碰（铁律 11：线上数据是生产数据）。
+        四项都是 `None` 就直接把账号读回来，一次盘都不写。
+
+        | 参数 | 语义 |
+        |---|---|
+        | `level` | 目标等级，钳到 `[1, LEVEL_MAX]`。★ **改的其实是经验** —— |
+        | | 等级是派生字段（D024），所以按 `experience_for_level()` 落到该级 |
+        | | 起点。已经是这一级就**原样不动**，免得把本级内攒的经验抹掉 |
+        | | （和 `experience_for_import` 中间那条同一个道理）。 |
+        | `money` | 金币**绝对值**，钳到 >= 0 |
+        | `materials` | `{itemId: 数量}` 的**增量补丁**：只动列出来的这些 id， |
+        | | 数量 <= 0 = 把这一格删掉。不是全量替换 |
+        | `inventory` | 同上，作用在仓库上。数量 <= 0 = 删掉，**顺带脱下** |
+        | | —— 不能穿着一件仓库里没有的东西（`set_equipped` 的不变式） |
+
+        ★ 「哪些物品**允许**改」不在这一层 —— 那是业务规则，在
+        `web/admin.py` 里（商店上架的东西只能靠买，用户 2026-09-05 拍板）。
+        这里只管「id 客户端认不认识」这条存储完整性。
+        """
+        changes = []
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            if level is not None:
+                wanted = max(1, min(LEVEL_MAX, int(level)))
+                if wanted != level_for_experience(player_experience(account)):
+                    before = account["level"]
+                    account["experience"] = experience_for_level(wanted)
+                    account["level"] = wanted
+                    changes.append(f"等级 {before} -> {wanted}")
+            if money is not None:
+                wanted = max(0, int(money))
+                if wanted != player_money(account):
+                    changes.append(f"金币 {player_money(account)} -> {wanted}")
+                    account["money"] = wanted
+            if materials:
+                records = _material_records(account)
+                for key, value in materials.items():
+                    item_id, count = int(key), max(0, int(value))
+                    if count and not shopdata.ownable(item_id):
+                        raise AccountError(
+                            "unknown_item",
+                            f"物品 {item_id} 不在客户端认得的物品表里，不能发给玩家")
+                    was = records.get(item_id, 0)
+                    if count == was:
+                        continue
+                    if count:
+                        records[item_id] = count
+                    else:
+                        records.pop(item_id, None)
+                    changes.append(f"材料 {item_id} ×{was} -> ×{count}")
+                account["materials"] = {str(i): records[i]
+                                        for i in sorted(records)}
+            if inventory:
+                records = _inventory_records(account)
+                for key, value in inventory.items():
+                    item_id, count = int(key), max(0, int(value))
+                    if count and not shopdata.ownable(item_id):
+                        raise AccountError(
+                            "unknown_item",
+                            f"物品 {item_id} 不在客户端认得的物品表里，不能发给玩家")
+                    was = records.get(item_id, {}).get("count", 0)
+                    if count == was:
+                        continue
+                    if count:
+                        entry = records.get(item_id)
+                        if entry is None:
+                            records[item_id] = {"count": count, "expires": None}
+                        else:
+                            entry["count"] = count
+                    else:
+                        records.pop(item_id, None)
+                    changes.append(f"物品 {item_id} ×{was} -> ×{count}")
+                account["inventory"] = {str(i): dict(records[i])
+                                        for i in sorted(records)}
+                # 删干净的那几件如果正穿在身上，必须一起脱下来 ——
+                # 「穿着的每一件都在仓库里」是 `set_equipped()` 的不变式，
+                # 破了它以后每一次换装都会把这件悄悄丢掉，查起来莫名其妙。
+                kept = [i for i in equipped_items(account) if i in records]
+                if kept != list(equipped_items(account)):
+                    account["equipped"] = kept
+                    changes.append("顺带脱下了已经不在仓库里的装备")
+            if changes:
+                data["accounts"][username] = account
+                self._write_unlocked(data)
+            return copy.deepcopy(account), changes
+
     # ----------------------------------------------------------- 管理员
     def _admin_table_unlocked(self, data):
         """持锁状态下取可改的管理员表。**手改坏了就拒绝改，绝不覆盖**
@@ -1168,9 +1286,8 @@ _LEVEL_THRESHOLDS = [0] + [experience_for_level(lv)
 def level_for_experience(experience):
     """总经验 -> 等级（1 起步，**钳到 `LEVEL_MAX`**）。
 
-    ★ 这里**不加** `MINIMUM_PLAYER_LEVEL` 的下限：存档里记的是真实等级，
-    `experience_bounds()` 还要拿它算经验条的两端。抬等级只发生在
-    「往客户端发」的那一刻，见 `player_level()`。
+    存档里记的就是真实等级，`experience_bounds()` 还要拿它算经验条的两端。
+    下发给客户端的也是同一个数（D22 起不再套兼容下限），见 `player_level()`。
     """
     try:
         experience = max(0, int(experience))
@@ -1275,15 +1392,15 @@ def player_level(account):
     （`0x436833` 起）以及天梯标签页的等级门槛（`0x43b676` 要求 >=6）。
     闯关关卡记录的要求等级是 1，所以等级 0 会让任务下拉框整个空掉。
 
-    ★ **这里把等级抬到 `MINIMUM_PLAYER_LEVEL`（=4）以上 = 解除对战等级限制。**
-    大厅点「对战」判的是 `[0x72e338] == 1`（恰好等于 1，V0.1 §83），
-    房间里点开始判的是房主座位里的同一个数（V0.1 §77）；中国区房主选生存
-    模式还会判 `< 4`，不满足就把模式强制改成夺分（V0.2 §203）。存档里仍是
-    真实等级，只有下发这一刻抬高 —— 这样经验曲线和经验条两端
-    （`experience_bounds`）都不受影响。
+    ★★ **发的就是真实等级，不套任何下限**（V0.3商店 D22，推翻 V0.2 D120）。
 
-    等级 0（没有账号 / 存档字段坏了）仍然照实返回 0：那是「取不到账号」的信号，
-    不该被下限悄悄改成 4。
+    同一个全局 `[0x72e338]` 同时被**三类**代码读：界面上的等级显示、
+    那几道原版等级门（对战频道 / 生存模式 / 5-6 人房 / 天梯）、以及
+    **物品的「穿上」判定**（商店 `0x445817` / 房间 `0x46aff1` 拿它和
+    `ItemInfo+0x1c` 比）。抬高它就等于连商店的等级门槛一起放水，所以
+    「解锁对战」只能去 patch 客户端的判据本身，不能改这个数。
+
+    等级 0（没有账号 / 存档字段坏了）照实返回 0：那是「取不到账号」的信号。
     """
     if not account:
         return 0
@@ -1293,7 +1410,7 @@ def player_level(account):
         return 0
     if level <= 0:
         return 0
-    return max(MINIMUM_PLAYER_LEVEL, level)
+    return level
 
 
 def _non_negative(account, field):

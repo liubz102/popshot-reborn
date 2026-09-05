@@ -56,8 +56,7 @@ import threading
 import time
 import weakref
 
-from account_store import BASE_CHARACTER_IDS, MINIMUM_PLAYER_LEVEL, \
-    PREMIUM_CHARACTER_IDS
+from account_store import BASE_CHARACTER_IDS, PREMIUM_CHARACTER_IDS
 import asynclog
 import ballistics
 import botaim
@@ -89,8 +88,10 @@ BOT_NICKNAME_PREFIX = "bot "
 #:
 #: 房间里按「开始」时客户端只读**房主座位**的等级（V0.1 §77），bot 永远不是
 #: 房主，所以这个数不影响任何准入判定 —— 它纯粹是玩家列表里显示的那一格。
-#: 取 `MINIMUM_PLAYER_LEVEL`（真人下发等级的下限）是为了看起来不突兀。
-BOT_LEVEL = MINIMUM_PLAYER_LEVEL
+#: 写死 4：bot 不是账号，没有经验也没有存档，随便挑一个「看着像个正常人」
+#: 的数就行（这个数以前是 `account_store.MINIMUM_PLAYER_LEVEL`，D22 把那个
+#: 常量删掉了，见那边的注释）。
+BOT_LEVEL = 4
 
 #: 「人物选择」面板上的角色顺序 —— `/c N M` 里的 M 就是这张表的 1-based 下标。
 #:

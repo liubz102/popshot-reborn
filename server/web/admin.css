@@ -428,3 +428,32 @@ code {
   font-size: 12px; color: var(--cocoa-soft); min-height: 3em;
 }
 .pick-detail b { color: var(--cocoa-ink); }
+
+/* ---------------------------------------------------------- 玩家资料页 */
+h3.sub {
+  margin: 20px 0 8px; font-size: 14px; color: var(--cocoa-soft);
+  padding-bottom: 5px; border-bottom: 2px dashed var(--line);
+}
+.own-grid {
+  display: grid; gap: 8px; margin-bottom: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+}
+.own {
+  display: flex; gap: 9px; align-items: center;
+  padding: 7px 9px; background: #fff;
+  border: 2px solid var(--line); border-radius: 10px;
+}
+/* 商店在卖的 ⇒ 只读。橙底 + 一把锁，和「上架」那套配色一致。 */
+.own.locked { background: var(--paper-2); border-style: dashed; }
+.own .col { flex: 1 1 auto; min-width: 0; }
+.own .nmz {
+  font-size: 12px; font-weight: 600; line-height: 1.25;
+  max-height: 2.5em; overflow: hidden;
+}
+.own .meta { font-size: 11px; color: var(--cocoa-soft); }
+.own input[type=number] { width: 66px; text-align: center; }
+.own .lock { font-size: 15px; }
+.own .drop { padding: 0 6px; font-size: 11px; }
+.own-empty { color: var(--cocoa-soft); font-size: 13px; padding: 6px 2px; }
+tr.on td { background: #FFFBEF; }
+td .btn-sm { white-space: nowrap; }

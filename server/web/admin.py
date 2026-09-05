@@ -20,6 +20,22 @@
     POST /admin/api/admins/password   {name, password}
     POST /admin/api/admins/remove     {name}
     GET  /admin/api/item?id=1120041   某件东西**现在在商店里**是什么价（选择器侧栏用）
+    GET  /admin/api/players?q=名字     按用户名 / 昵称找玩家
+    GET  /admin/api/player?name=alice  一个玩家的可编辑资料
+    POST /admin/api/player            {name, level, money, materials, inventory}
+
+## 玩家资料页：**商店在卖的东西一律只读**（用户 2026-09-05 拍板）
+
+D22 之后商店按**真实等级**卖东西。管理页要是能把 4 级才卖的枪直接塞进
+1 级号的仓库，那条等级门槛就白设了。所以：
+
+- **能改**：等级、金币、材料、以及 `shop.json` 里 `listed=false` 的物品
+  （合成产物、货架上根本买不到的那批）；
+- **不能改**：`listed=true` 的物品。要给就改金币和等级，让玩家自己进商店买。
+
+判据是 `listed` 而不是「在不在 `shop.json` 里」—— 材料和合成产物本来就
+在那份表里躺着（`default_shop()` 收它们只为有个中文名），它们正是用户
+说的「商店里没有的物品」。
 
 ## ★★ 口令是明文存的，而这个页面公网可达
 
@@ -330,6 +346,122 @@ def catalog():
     return _catalog_cache
 
 
+#: 玩家搜索一次最多回多少条。
+#:
+#: 这不是「等一等就好了」的阈值（铁律 10），是**一页显示多少行**的界面取舍：
+#: 管理员看的是一份名单，翻 200 行比再敲两个字慢。回包里带 `truncated`，
+#: 页面明说「还有更多，再补几个字」。
+PLAYER_SEARCH_LIMIT = 50
+
+
+def _online_usernames():
+    """现在有哪些账号连着游戏服。拿不到（比如单跑注册页）就当没人在线。
+
+    ★ **惰性 import** `gameserver`：`web/` 这一层本来不依赖游戏服，
+    单元测试和 `--no-web` 之外的组合都不该因为它而多背一个大模块。
+    """
+    try:
+        import gameserver
+    except ImportError:
+        return set()
+    return {conn.account_name for conn in gameserver.all_conns()
+            if conn.account_name}
+
+
+def _push_account(username):
+    """改完存档立刻推给在线的那条连接，返回是否真推了。
+
+    推的这几发和控制通道的 `sync-account` 是同一套（顺序也一样，§29）：
+    `0x0600` 带着**金币 / 经验 / 等级**（等级那一格就是客户端全局
+    `[0x72e338]`，所以改完等级不用重登），`0x0501`→`0x0601` 刷仓库，
+    `0x0604` 刷穿着，`0x030b` 是装备加成的唯一来源（§1）。
+
+    不在线就什么都不做 —— 下次登录时本来就是从存档读的。
+    """
+    try:
+        import gameserver
+    except ImportError:
+        return False
+    pushed = False
+    for conn in gameserver.all_conns():
+        if conn.account_name != username:
+            continue
+        try:
+            conn.reload_account()
+            conn.send_rep_money(reason="（管理页改了资料）")
+            conn.send_slot_equipped_list(reason="（管理页改了资料）")
+            conn.send_rep_inventory(reason="（管理页改了资料）")
+            conn.send_rep_equipped_list(reason="（管理页改了资料）")
+        except (OSError, AttributeError):
+            # socket 刚断 / 还没登录完 —— 不能让它把保存这件事带崩，
+            # 存档已经落盘了，玩家重登一样能看到。
+            continue
+        pushed = True
+    return pushed
+
+
+def _optional_int(value, label):
+    """`None` / 空串 = 「这一项不改」；其余必须是整数。"""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label}要填一个整数，收到 {value!r}") from None
+
+
+def _counts_of(raw):
+    """`{itemId: 数量}` 的补丁体。不是字典就当没传。"""
+    if not isinstance(raw, dict):
+        return {}
+    counts = {}
+    for key, value in raw.items():
+        try:
+            item_id, count = int(key), int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"物品数量表里有一条读不出来：{key!r}={value!r}") from None
+        if count < 0:
+            raise ValueError(f"物品 {item_id} 的数量不能是负数")
+        counts[item_id] = count
+    return counts
+
+
+def _player_view(username, account):
+    """一个玩家的可编辑资料。名字 / 图标让前台自己按 `catalog()` 查。"""
+    table, _warnings = shopcfg.shop()
+    experience = account_store.player_experience(account)
+    start, nxt = account_store.experience_bounds(experience)
+    equipped = set(account_store.equipped_items(account))
+    inventory = account_store.inventory_items(account)
+    materials = account_store.material_counts(account)
+
+    def locked(item_id):
+        """商店在卖 ⇒ 只读。★ 判据是 `listed`，不是「在不在 shop.json 里」
+        —— 材料和合成产物本来就在那份表里躺着（`listed=false`），
+        它们正是用户说的「商店里没有的物品」。"""
+        return bool((table.get(item_id) or {}).get("listed"))
+
+    return {
+        "username": username,
+        "nickname": account_store.display_name(account),
+        "level": account_store.player_level(account),
+        "level_max": account_store.LEVEL_MAX,
+        "experience": experience,
+        "level_start_exp": start,
+        "next_level_exp": nxt,
+        "money": account_store.player_money(account),
+        "online": username in _online_usernames(),
+        "materials": [{"id": item_id, "count": materials[item_id],
+                       "locked": locked(item_id)}
+                      for item_id in sorted(materials)],
+        "inventory": [{"id": item_id,
+                       "count": inventory[item_id]["count"],
+                       "locked": locked(item_id),
+                       "equipped": item_id in equipped}
+                      for item_id in sorted(inventory)],
+    }
+
+
 class AdminRoutes:
     """混进 `web.server.Handler` 的 `/admin` 那一组接口。
 
@@ -418,6 +550,12 @@ class AdminRoutes:
         if path == "/admin/api/item":
             self._admin_item_lookup(query)
             return True
+        if path == "/admin/api/players":
+            self._admin_player_search(query)
+            return True
+        if path == "/admin/api/player":
+            self._admin_player_get(query)
+            return True
         if path.startswith("/admin"):
             self._reply(False, "没有这个接口", status=404)
             return True
@@ -436,6 +574,9 @@ class AdminRoutes:
             return True
         if path.startswith("/admin/api/admins/"):
             self._admin_manage(path.rsplit("/", 1)[-1], data)
+            return True
+        if path == "/admin/api/player":
+            self._admin_player_save(data)
             return True
         if path.startswith("/admin"):
             self._reply(False, "没有这个接口", status=404)
@@ -699,3 +840,86 @@ class AdminRoutes:
             "bonus": item.bonus,
             "weapon": item.weapon,
         })
+
+    # ------------------------------------------------------------ 玩家资料
+    def _admin_player_search(self, query):
+        """`/admin/api/players?q=…` —— 按用户名或昵称找人。"""
+        if self._require_admin() is None:
+            return
+        raw = (urllib.parse.parse_qs(query or "").get("q") or [""])[0]
+        found = self.accounts.search_accounts(raw, limit=PLAYER_SEARCH_LIMIT)
+        online = _online_usernames()
+        self._send_json({
+            "ok": True,
+            "limit": PLAYER_SEARCH_LIMIT,
+            "truncated": len(found) >= PLAYER_SEARCH_LIMIT,
+            "players": [{
+                "username": username,
+                "nickname": account_store.display_name(account),
+                "level": account_store.player_level(account),
+                "money": account_store.player_money(account),
+                "online": username in online,
+            } for username, account in found],
+        })
+
+    def _admin_player_get(self, query):
+        """`/admin/api/player?name=…` —— 一个玩家的可编辑资料。"""
+        if self._require_admin() is None:
+            return
+        username = (urllib.parse.parse_qs(query or "").get("name") or [""])[0]
+        _name, account = self.accounts.get_account(username)
+        if account is None:
+            self._reply(False, f"没有叫 {username!r} 的账号", status=404)
+            return
+        self._send_json({"ok": True, "player": _player_view(username, account)})
+
+    def _admin_player_save(self, data):
+        """`POST /admin/api/player` —— 改等级 / 金币 / 材料 / 非商店物品。
+
+        ★ **商店上架的东西（`shop.json` 里 `listed`）一律拒绝**（用户
+        2026-09-05 拍板）：那批物品带着等级门槛，直接塞进仓库就绕过了
+        「够等级才买得到」这条规则。要给就改金币和等级，让玩家自己进商店买。
+        """
+        admin = self._require_admin()
+        if admin is None:
+            return
+        username = str(data.get("name") or "").strip()
+        _name, account = self.accounts.get_account(username)
+        if account is None:
+            self._reply(False, f"没有叫 {username!r} 的账号", status=404)
+            return
+        table, _warnings = shopcfg.shop()
+        try:
+            materials = _counts_of(data.get("materials"))
+            inventory = _counts_of(data.get("inventory"))
+            level = _optional_int(data.get("level"), "等级")
+            money = _optional_int(data.get("money"), "金币")
+        except ValueError as error:
+            self._reply(False, str(error))
+            return
+        locked = sorted(item_id for item_id in
+                        list(materials) + list(inventory)
+                        if (table.get(item_id) or {}).get("listed"))
+        if locked:
+            self._reply(False,
+                        "这些是商店在卖的东西，不能直接改（改金币和等级，"
+                        "让玩家自己进商店买）：" + "、".join(
+                            f"{i} {(table.get(i) or {}).get('name') or ''}".strip()
+                            for i in locked))
+            return
+        account, changes = self.accounts.admin_update_account(
+            username, level=level, money=money,
+            materials=materials, inventory=inventory)
+        pushed = _push_account(username)
+        if changes:
+            eventlog.online(f"[admin] {admin!r} 改了玩家 {username!r}: "
+                            + "；".join(changes))
+        if not changes:
+            message = "没有任何改动"
+        else:
+            message = "已保存：" + "；".join(changes)
+            message += ("；玩家在线，已即时推给客户端"
+                        if pushed else "；玩家不在线，下次登录生效")
+        self._send_json({"ok": True, "message": message,
+                         "changes": changes, "pushed": pushed,
+                         "player": _player_view(username, account)})

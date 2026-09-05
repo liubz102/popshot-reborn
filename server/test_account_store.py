@@ -10,7 +10,6 @@ from account_store import (ADMIN_ACCOUNTS_KEY, AUTH_BAD_PASSWORD,
                            AUTH_NO_SUCH_USER, AUTH_OK,
                            DEFAULT_ADMIN_NAME, DEFAULT_ADMIN_PASSWORD,
                            EXPERIENCE_PER_LEVEL, EXPERIENCE_STEP, LEVEL_MAX,
-                           MINIMUM_PLAYER_LEVEL,
                            NEW_ACCOUNT_DEFAULTS, QUEST_DIFFICULTY_MAX,
                            QUEST_ID_TABLE, AccountError, AccountStore,
                            equipped_items, experience_bounds,
@@ -314,19 +313,26 @@ class AccountStoreTests(unittest.TestCase):
         with open(self.path, "r", encoding="utf-8") as f:
             self.assertNotIn("active_account", json.load(f))
 
-    # -- 对战等级限制（需求：默认解除）---------------------------------------
-    def test_reported_level_unlocks_survival_mode(self):
-        # 房主在中国区房间里选生存模式时，0x465a2c 会把
-        # [0x72e338] < 4 的模式强制改回夺分（§203）。
+    # -- 下发的等级 = 真实等级（V0.3商店 D22）--------------------------------
+    def test_reported_level_is_the_real_level(self):
+        # ★ 曾经这里断言的是「1 级号下发 4」（V0.2 D120 的兼容下限）。
+        #   D22 把下限删了：客户端的等级显示、原版那几道等级门、以及商店
+        #   物品的「穿上」判定读的是**同一个**全局 0x72e338，抬高它就等于
+        #   连商店的等级门槛一起放水。等级门改由 bshook 直接 patch。
         account = self.account()
-        self.assertEqual(1, account["level"])            # 存档里是真实等级
-        self.assertEqual(4, MINIMUM_PLAYER_LEVEL)
-        self.assertEqual(MINIMUM_PLAYER_LEVEL, player_level(account))
-        self.assertGreaterEqual(player_level(account), 4)
+        self.assertEqual(1, account["level"])
+        self.assertEqual(1, player_level(account))
         values = struct.unpack_from("<8i", build_gsp_rep_login(account=account), 8)
-        self.assertEqual(4, values[0])                     # 登录全局 0x72e338
+        self.assertEqual(1, values[0])                     # 登录全局 0x72e338
 
-    def test_the_level_floor_does_not_distort_the_experience_bar(self):
+    def test_reported_level_follows_the_curve(self):
+        self.account()
+        account = self.store.add_quest_reward(
+            "alice", experience=experience_for_level(7))
+        self.assertEqual(7, account["level"])
+        self.assertEqual(7, player_level(account))
+
+    def test_the_experience_bar_still_starts_at_zero(self):
         # 经验条两端由 experience_bounds 算，必须按真实等级来，
         # 否则新号一进游戏经验条就是负的。
         from account_store import experience_bounds
@@ -641,7 +647,7 @@ class AccountStoreTests(unittest.TestCase):
         account = self.store.add_quest_reward("alice",
                                               experience=EXPERIENCE_PER_LEVEL)
         self.assertEqual(2, account["level"])
-        self.assertEqual(MINIMUM_PLAYER_LEVEL, player_level(account))
+        self.assertEqual(2, player_level(account))
 
     def test_quest_reward_rejects_unknown_account(self):
         with self.assertRaises(KeyError):

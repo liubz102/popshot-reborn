@@ -51,6 +51,7 @@ var DEFAULT_PASSWORD_IN_USE = __DEFAULT_PASSWORD_IN_USE__;
       <button data-tab="shop" class="on">商店目录</button>
       <button data-tab="recipe">合成配方</button>
       <button data-tab="drops">材料掉落</button>
+      <button data-tab="players">玩家资料</button>
       <button data-tab="admins">管理员账号</button>
     </nav>
 
@@ -72,6 +73,77 @@ var DEFAULT_PASSWORD_IN_USE = __DEFAULT_PASSWORD_IN_USE__;
         <span style="margin-left:auto"></span>
         <button class="btn" id="cfgReset">放弃修改</button>
         <button class="btn btn-primary" id="cfgSave">保存</button>
+      </div>
+    </section>
+
+    <!-- ---------------- 玩家资料 ---------------- -->
+    <section class="panel hidden" id="playersPanel">
+      <div class="panel-title">
+        <h2>玩家资料</h2>
+        <span class="count" id="playerCount"></span>
+      </div>
+      <div class="panel-body">
+        <ul class="help">
+          <li>按<b>用户名或昵称</b>搜（对大小写不敏感，写一部分就行；留空列前几个）。</li>
+          <li><b>等级</b>改的其实是经验 —— 等级是从经验推出来的派生字段，
+            所以会落到该等级的起点经验。已经是这一级就不动它。</li>
+          <li>★ <b>商店在卖的东西不能直接改</b>（格子上有把锁）：那批物品带着
+            等级门槛，直接塞进仓库就绕过了「够等级才买得到」。
+            要给就<b>改金币和等级</b>，让玩家自己进商店买。</li>
+          <li>玩家<b>在线时改完即时生效</b>（金币 / 等级 / 仓库 / 装备一起推下去），
+            不用重登。</li>
+        </ul>
+
+        <div class="toolbar">
+          <input id="playerSearch" type="text" placeholder="搜 用户名 / 昵称">
+          <button class="btn" id="playerSearchBtn">查找</button>
+          <span class="grow"></span>
+          <span class="hint" id="playerHint" style="margin:0"></span>
+        </div>
+        <table>
+          <thead><tr>
+            <th>用户名</th><th>昵称</th><th style="width:64px">等级</th>
+            <th style="width:96px">金币</th><th style="width:78px"></th>
+          </tr></thead>
+          <tbody id="playerRows"></tbody>
+        </table>
+
+        <div id="playerEdit" class="hidden">
+          <div class="panel-title" style="margin-top:20px">
+            <h2 id="playerWho"></h2>
+            <span class="count" id="playerOnline"></span>
+          </div>
+          <div class="row" style="margin-top:6px">
+            <div class="field">
+              <span class="lab">等级</span>
+              <input id="playerLevel" type="number" min="1" step="1">
+            </div>
+            <div class="field">
+              <span class="lab">金币</span>
+              <input id="playerMoney" type="number" min="0" step="1">
+            </div>
+            <div class="field wide">
+              <span class="lab">经验（只读，跟着等级走）</span>
+              <input id="playerExp" type="text" readonly>
+            </div>
+          </div>
+
+          <h3 class="sub">合成材料</h3>
+          <div class="own-grid" id="playerMaterials"></div>
+          <button class="btn btn-sm" id="playerAddMaterial">＋ 加一种材料</button>
+
+          <h3 class="sub">仓库物品</h3>
+          <div class="own-grid" id="playerInventory"></div>
+          <button class="btn btn-sm" id="playerAddItem">＋ 加一件非商店物品</button>
+
+          <div class="msg" id="playerMsg"></div>
+        </div>
+      </div>
+      <div class="panel-foot hidden" id="playerFoot">
+        <span class="dirty clean" id="playerDirty"></span>
+        <span style="margin-left:auto"></span>
+        <button class="btn" id="playerReset">放弃修改</button>
+        <button class="btn btn-primary" id="playerSave">保存</button>
       </div>
     </section>
 

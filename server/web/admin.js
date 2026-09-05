@@ -756,6 +756,8 @@ function openPicker(options) {
     kinds: options.kinds || null,
     selected: options.selected,
     onPick: options.onPick,
+    // 额外的一道过滤（玩家资料页拿它挡掉「商店在卖的」）。
+    filter: options.filter || null,
     q: "",
     kind: (options.kinds && options.kinds.length === 1) ? options.kinds[0] : ""
   };
@@ -794,6 +796,7 @@ function paintPicker() {
   var hits = CAT.items.filter(function (item) {
     if (PICKER.kinds && PICKER.kinds.indexOf(item.kind) < 0) { return false; }
     if (PICKER.kind && item.kind !== PICKER.kind) { return false; }
+    if (PICKER.filter && !PICKER.filter(item)) { return false; }
     if (!query) { return true; }
     return (item.name + " " + (item.name_kr || "") + " " + item.id)
       .toLowerCase().indexOf(query) >= 0;
@@ -883,6 +886,234 @@ async function removeAdmin(name) {
 }
 
 /* ======================================================================
+   玩家资料（V0.3商店 D22 的配套：商店按真实等级卖，改数值只能从这儿改）
+
+   模型：`PLAYER.view` 是服务端那份快照，`PLAYER.edit` 是**要提交的补丁**
+   —— 两张 `{itemId: 数量}` 表 + 等级 + 金币。删掉一件东西 = 把它的数量写成 0
+   （服务端 `admin_update_account()` 就是按「数量 <= 0 删掉这一格」认的），
+   所以补丁里必须留着那个 0，不能把键删掉。
+
+   ★ 商店在卖的（`listed`）一律不进补丁 —— 服务端也会再拦一次。
+   ====================================================================== */
+
+var PLAYER = null;        // {view, edit:{level, money, materials, inventory}}
+var PLAYER_LIST = [];
+
+/** 现在商店里在卖哪些 id。★ 取的是**当前标签页模型**里的 shop 条目 ——
+    管理员刚在「商店目录」里改了上架状态还没保存时，这边跟着一起变，
+    免得画面上说「能改」、点了保存服务端说「不能改」。 */
+function listedIds() {
+  var set = {};
+  ((CFG.shop && CFG.shop.entries) || []).forEach(function (entry) {
+    if (entry && entry.listed) { set[Number(entry.id)] = true; }
+  });
+  return set;
+}
+
+async function searchPlayers() {
+  var q = $("playerSearch").value.trim();
+  var result = await api("/admin/api/players?q=" + encodeURIComponent(q));
+  if (bounced(result) || !result.ok) {
+    say($("playerMsg"), (result && result.message) || "查找失败", false);
+    return;
+  }
+  PLAYER_LIST = result.players;
+  renderPlayerRows();
+  $("playerHint").textContent = result.truncated
+    ? ("只列前 " + result.limit + " 个，再补几个字缩小范围")
+    : "";
+  $("playerCount").textContent = result.players.length + " 个账号";
+}
+
+function renderPlayerRows() {
+  var rows = $("playerRows");
+  rows.textContent = "";
+  if (!PLAYER_LIST.length) {
+    var tr = document.createElement("tr");
+    var td = el("td", "own-empty", "没有匹配的账号");
+    td.colSpan = 5;
+    tr.appendChild(td);
+    rows.appendChild(tr);
+    return;
+  }
+  PLAYER_LIST.forEach(function (row) {
+    var tr = document.createElement("tr");
+    if (PLAYER && PLAYER.view.username === row.username) { tr.className = "on"; }
+    tr.appendChild(el("td", null, row.username + (row.online ? " ●" : "")));
+    tr.appendChild(el("td", null, row.nickname));
+    tr.appendChild(el("td", null, row.level));
+    tr.appendChild(el("td", null, row.money));
+    var td = el("td");
+    var button = el("button", "btn btn-sm", "修改");
+    button.onclick = function () { openPlayer(row.username); };
+    td.appendChild(button);
+    tr.appendChild(td);
+    rows.appendChild(tr);
+  });
+}
+
+async function openPlayer(username, force) {
+  if (!force && PLAYER && playerDirty()
+      && !window.confirm("「" + PLAYER.view.username
+                         + "」还有没保存的改动，确定丢掉？")) {
+    return;
+  }
+  var result = await api("/admin/api/player?name=" + encodeURIComponent(username));
+  if (bounced(result) || !result.ok) {
+    say($("playerMsg"), (result && result.message) || "读不到这个账号", false);
+    return;
+  }
+  adoptPlayer(result.player);
+}
+
+/** 把服务端那份快照变成「快照 + 补丁」。 */
+function adoptPlayer(view) {
+  var edit = {level: view.level, money: view.money,
+              materials: {}, inventory: {}};
+  view.materials.forEach(function (row) {
+    if (!row.locked) { edit.materials[row.id] = row.count; }
+  });
+  view.inventory.forEach(function (row) {
+    if (!row.locked) { edit.inventory[row.id] = row.count; }
+  });
+  PLAYER = {view: view, edit: edit};
+  renderPlayer();
+  renderPlayerRows();
+}
+
+function playerDirty() {
+  if (!PLAYER) { return false; }
+  var edit = PLAYER.edit;
+  var view = PLAYER.view;
+  if (Number(edit.level) !== view.level) { return true; }
+  if (Number(edit.money) !== view.money) { return true; }
+  return ["materials", "inventory"].some(function (bucket) {
+    var was = {};
+    view[bucket].forEach(function (row) {
+      if (!row.locked) { was[row.id] = row.count; }
+    });
+    return Object.keys(edit[bucket]).some(function (id) {
+      return Number(edit[bucket][id]) !== (was[id] || 0);
+    }) || Object.keys(was).some(function (id) {
+      return !(id in edit[bucket]);
+    });
+  });
+}
+
+function playerTouched() {
+  var dirty = playerDirty();
+  var node = $("playerDirty");
+  node.textContent = dirty ? "有未保存的修改" : "没有未保存的修改";
+  node.className = "dirty" + (dirty ? "" : " clean");
+}
+
+function renderPlayer() {
+  var view = PLAYER.view;
+  $("playerEdit").classList.remove("hidden");
+  $("playerFoot").classList.remove("hidden");
+  $("playerWho").textContent = view.nickname + "（" + view.username + "）";
+  $("playerOnline").textContent = view.online ? "● 在线，改完即时生效" : "不在线";
+  $("playerLevel").value = PLAYER.edit.level;
+  $("playerLevel").max = view.level_max;
+  $("playerMoney").value = PLAYER.edit.money;
+  $("playerExp").value = view.experience + "（本级 " + view.level_start_exp
+    + " ~ 下一级 " + view.next_level_exp + "）";
+  paintOwned("materials", $("playerMaterials"), "还没有任何材料");
+  paintOwned("inventory", $("playerInventory"), "仓库是空的");
+  playerTouched();
+}
+
+/** 画一整格 —— 锁着的（商店在卖）只显示，不给改。 */
+function paintOwned(bucket, host, emptyText) {
+  host.textContent = "";
+  var view = PLAYER.view;
+  var lockedRows = view[bucket].filter(function (row) { return row.locked; });
+  var ids = Object.keys(PLAYER.edit[bucket]).map(Number)
+    .sort(function (a, b) { return a - b; });
+  if (!ids.length && !lockedRows.length) {
+    host.appendChild(el("div", "own-empty", emptyText));
+    return;
+  }
+  ids.forEach(function (itemId) { host.appendChild(ownNode(bucket, itemId)); });
+  lockedRows.forEach(function (row) { host.appendChild(lockedNode(row)); });
+}
+
+function ownNode(bucket, itemId) {
+  var box = el("div", "own");
+  box.appendChild(slotNode(itemId, 26, false, false));
+  var col = el("div", "col");
+  col.appendChild(el("div", "nmz", (BYID[itemId] || {}).name || ("#" + itemId)));
+  col.appendChild(el("div", "meta", "#" + itemId));
+  box.appendChild(col);
+  var input = document.createElement("input");
+  input.type = "number";
+  input.min = "0";
+  input.step = "1";
+  input.value = PLAYER.edit[bucket][itemId];
+  input.oninput = function () {
+    PLAYER.edit[bucket][itemId] = Math.max(0, Number(input.value) || 0);
+    playerTouched();
+  };
+  box.appendChild(input);
+  var drop = el("button", "btn btn-sm btn-danger drop", "清零");
+  drop.title = "把数量改成 0 —— 保存后这一格就没了";
+  drop.onclick = function () {
+    PLAYER.edit[bucket][itemId] = 0;
+    input.value = 0;
+    playerTouched();
+  };
+  box.appendChild(drop);
+  return box;
+}
+
+function lockedNode(row) {
+  var box = el("div", "own locked");
+  box.appendChild(slotNode(row.id, 26, true, false));
+  var col = el("div", "col");
+  col.appendChild(el("div", "nmz", (BYID[row.id] || {}).name || ("#" + row.id)));
+  col.appendChild(el("div", "meta", "#" + row.id + " ×" + row.count
+                                    + (row.equipped ? " · 穿着" : "")));
+  box.appendChild(col);
+  var lock = el("span", "lock", "🔒");
+  lock.title = "商店在卖的东西不能直接改 —— 改金币和等级，让玩家自己去买";
+  box.appendChild(lock);
+  return box;
+}
+
+/** 「＋ 加一种」。已经有的就把它加回 1，别加出两张一样的格子。 */
+function addOwned(bucket, kinds) {
+  var listed = listedIds();
+  openPicker({
+    kinds: kinds,
+    filter: function (item) { return !listed[item.id]; },
+    onPick: function (item) {
+      if (!Number(PLAYER.edit[bucket][item.id])) {
+        PLAYER.edit[bucket][item.id] = 1;
+      }
+      renderPlayer();
+    }
+  });
+}
+
+async function savePlayer() {
+  var payload = {
+    name: PLAYER.view.username,
+    level: Math.max(1, Number($("playerLevel").value) || 1),
+    money: Math.max(0, Number($("playerMoney").value) || 0),
+    materials: PLAYER.edit.materials,
+    inventory: PLAYER.edit.inventory
+  };
+  say($("playerMsg"), "保存中……", true);
+  var result = await api("/admin/api/player", payload);
+  if (bounced(result)) { return; }
+  say($("playerMsg"), result.message, result.ok);
+  if (result.ok && result.player) {
+    adoptPlayer(result.player);
+    searchPlayers();                 // 列表里的等级 / 金币跟着更新
+  }
+}
+
+/* ======================================================================
    登录 / 启动
    ====================================================================== */
 
@@ -899,6 +1130,10 @@ function showLoggedIn(name) {
 
 function showLoggedOut(message) {
   CAT = null;
+  PLAYER = null;
+  PLAYER_LIST = [];
+  $("playerEdit").classList.add("hidden");
+  $("playerFoot").classList.add("hidden");
   $("who").textContent = "";
   $("logout").classList.add("hidden");
   $("mainView").classList.add("hidden");
@@ -932,10 +1167,16 @@ function switchTab(tab) {
   Array.prototype.forEach.call($("tabs").children, function (button) {
     button.classList.toggle("on", button.getAttribute("data-tab") === tab);
   });
-  var isAdmins = (tab === "admins");
-  $("cfgPanel").classList.toggle("hidden", isAdmins);
-  $("adminsPanel").classList.toggle("hidden", !isAdmins);
-  if (isAdmins) { return; }
+  var isConfig = CONFIGS.indexOf(tab) >= 0;
+  $("cfgPanel").classList.toggle("hidden", !isConfig);
+  $("adminsPanel").classList.toggle("hidden", tab !== "admins");
+  $("playersPanel").classList.toggle("hidden", tab !== "players");
+  if (tab === "players") {
+    // 第一次切进来先列几个，免得画面上是一片空白。
+    if (!PLAYER_LIST.length) { searchPlayers(); }
+    return;
+  }
+  if (!isConfig) { return; }
   CURRENT = tab;
   renderCurrent();
 }
@@ -967,6 +1208,27 @@ function wire() {
     if (await loadConfig(CURRENT)) { renderCurrent(); }
   };
   $("cfgAdd").onclick = function () { addEntry(CURRENT); };
+
+  $("playerSearchBtn").onclick = searchPlayers;
+  $("playerSearch").addEventListener("keydown", function (event) {
+    if (event.key === "Enter") { searchPlayers(); }
+  });
+  $("playerLevel").oninput = function () {
+    PLAYER.edit.level = Math.max(1, Number($("playerLevel").value) || 1);
+    playerTouched();
+  };
+  $("playerMoney").oninput = function () {
+    PLAYER.edit.money = Math.max(0, Number($("playerMoney").value) || 0);
+    playerTouched();
+  };
+  $("playerAddMaterial").onclick = function () {
+    addOwned("materials", ["material"]);
+  };
+  $("playerAddItem").onclick = function () { addOwned("inventory", null); };
+  $("playerSave").onclick = savePlayer;
+  $("playerReset").onclick = function () {
+    if (PLAYER) { openPlayer(PLAYER.view.username, true); }
+  };
 
   $("pickSearch").oninput = function () {
     PICKER.q = $("pickSearch").value.trim();
@@ -1008,7 +1270,7 @@ function wire() {
 
   // 关标签页前拦一下 —— 表单页最容易「改了半天忘了按保存」。
   window.addEventListener("beforeunload", function (event) {
-    if (CAT && CONFIGS.some(isDirty)) {
+    if (CAT && (CONFIGS.some(isDirty) || playerDirty())) {
       event.preventDefault();
       event.returnValue = "";
     }
