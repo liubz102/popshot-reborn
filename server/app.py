@@ -269,6 +269,32 @@ def _report_item_fields(accounts):
                 "★ 没有自动修复 —— 请手工把它改回 {\"名字\": {\"password\": \"...\"}}")
         log(head)
         eventlog.online(head)
+    _report_default_admin_password(accounts)
+
+
+def _report_default_admin_password(accounts):
+    """默认管理员还在用出厂口令 -> 每次启动喊一声。
+
+    ★ 这句话**以前画在管理页顶上**（一条红字），用户 2026-09-05 要求页面上
+    不要显示，于是挪到了这里（D24）。它不是装饰：`/admin` 公网可达、口令
+    明文存（D3 / 铁律 9），出厂口令没改就等于那个页面没有认证。
+
+    ★ **按状态翻转说话**（铁律 10 的同一条精神）：口令改掉之后就一行都不打。
+    上面那条 `admin_created` 只在**新建**默认管理员的那一次说话，
+    这一条则是「只要还没改就一直说」—— 两句话管的不是一件事。
+    """
+    try:
+        from web import admin as web_admin
+        if not web_admin.default_admin_password_in_use(accounts):
+            return
+    except Exception as error:              # noqa: BLE001 —— 检查失败不该拦住开服
+        log(f"⚠ 管理页: 没能检查默认管理员口令（{error!r}）")
+        return
+    head = (f"⚠ 管理页: 默认管理员 {account_store.DEFAULT_ADMIN_NAME} "
+            "还在用出厂口令。/admin 是公网可达的 —— "
+            "★ 请在「管理员账号」里改掉它")
+    log(head)
+    eventlog.online(head)
 
 
 def _report_shop_config():

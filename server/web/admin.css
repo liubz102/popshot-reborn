@@ -58,12 +58,19 @@ body {
 .hidden { display: none !important; }
 
 /* ------------------------------------------------------------------ 顶栏 */
+/* ★ 顶栏 + 标签行整块钉在画面顶上，只有下面的内容跟着滚（用户 2026-09-05）。
+   `sticky` 的前提是**祖先里没有 `overflow` 不是 visible 的元素** ——
+   body / main 都没设，别顺手给它们加。 */
+.appbar {
+  position: sticky; top: 0; z-index: 40;
+  background: var(--paper);
+  box-shadow: 0 3px 10px rgba(120, 80, 20, .18);
+}
 .topbar {
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
   padding: 10px 22px;
   background: linear-gradient(#F9B23C, var(--amber));
   border-bottom: 3px solid var(--amber-dark);
-  box-shadow: 0 2px 6px rgba(120, 80, 20, .22);
 }
 .topbar .brand {
   font-size: 17px; font-weight: 700; color: #fff;
@@ -72,7 +79,7 @@ body {
 }
 .topbar .who { margin-left: auto; color: #5A3416; font-weight: 600; }
 
-main { max-width: 1180px; margin: 0 auto; padding: 20px 18px 60px; }
+main { max-width: 1180px; margin: 0 auto; padding: 16px 18px 60px; }
 
 /* ------------------------------------------------------------------ 面板 */
 .panel {
@@ -144,7 +151,11 @@ ul.help b, .hint b { color: var(--crimson); }
 }
 
 /* ------------------------------------------------------------ 页签 / 按钮 */
-.tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+/* 标签行在 `.appbar` 里，所以自己撑出 `main` 的那份左右留白和居中。 */
+.tabs {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  max-width: 1180px; margin: 0 auto; padding: 12px 18px;
+}
 .tabs button {
   padding: 8px 20px; cursor: pointer; font: inherit; font-weight: 700;
   color: #6B4A2E;
@@ -423,10 +434,17 @@ code {
   width: 100%; max-height: 2.5em; overflow: hidden;
 }
 .pick-empty { color: var(--cocoa-soft); padding: 30px; text-align: center; }
+/* ★ 高度**钉死**，不用 min-height：这一块的内容随鼠标划过的物品变
+   （1~5 行：名字 / 原名 / 加成 / 武器数值 / 在不在卖），高度一变整个
+   弹窗就跟着上下跳（用户 2026-09-05）。装不下的自己滚。 */
 .pick-detail {
   border-top: 2px dashed var(--line); margin-top: 12px; padding-top: 10px;
-  font-size: 12px; color: var(--cocoa-soft); min-height: 3em;
+  font-size: 12px; color: var(--cocoa-soft);
+  height: 7.2em; overflow-y: auto;
 }
+/* 结果网格也固定一屏：搜索时行数变化同样会让弹窗抽动。 */
+.pick-grid { min-height: 260px; align-content: start; }
+.modal .panel { height: min(640px, 100%); }
 .pick-detail b { color: var(--cocoa-ink); }
 
 /* ---------------------------------------------------------- 玩家资料页 */
@@ -434,26 +452,60 @@ h3.sub {
   margin: 20px 0 8px; font-size: 14px; color: var(--cocoa-soft);
   padding-bottom: 5px; border-bottom: 2px dashed var(--line);
 }
+/* ★ 230 不是 190：一格里要塞下 图标 + 两行名字 + 数字框 + 删除，
+   190 的时候名字只剩 50 px，「黑色小珠」直接被省略号吃掉。 */
 .own-grid {
   display: grid; gap: 8px; margin-bottom: 10px;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
 }
 .own {
   display: flex; gap: 9px; align-items: center;
   padding: 7px 9px; background: #fff;
   border: 2px solid var(--line); border-radius: 10px;
+  /* ★ grid 项默认 `min-width: auto` —— 不写这一条，名字长的格子会把自己
+     撑宽、盖到右边那一格上（用户 2026-09-05 截图里「文字被输入框挡住」）。*/
+  min-width: 0; overflow: hidden;
 }
 /* 商店在卖的 ⇒ 只读。橙底 + 一把锁，和「上架」那套配色一致。 */
 .own.locked { background: var(--paper-2); border-style: dashed; }
-.own .col { flex: 1 1 auto; min-width: 0; }
+/* 装备类「没有」的状态：淡下去，一眼看出这一件保存后就没了。 */
+.own.off { background: var(--paper-2); }
+.own.off .nmz, .own.off .meta { opacity: .55; }
+.own > .slot { flex: 0 0 auto; }
+/* ★ 三条一起才挡得住溢出：col 能缩到 0、两行文字各自单行省略号。 */
+.own .col { flex: 1 1 auto; min-width: 0; overflow: hidden; }
 .own .nmz {
   font-size: 12px; font-weight: 600; line-height: 1.25;
-  max-height: 2.5em; overflow: hidden;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.own .meta { font-size: 11px; color: var(--cocoa-soft); }
-.own input[type=number] { width: 66px; text-align: center; }
-.own .lock { font-size: 15px; }
-.own .drop { padding: 0 6px; font-size: 11px; }
+.own .meta {
+  font-size: 11px; color: var(--cocoa-soft);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.own .meta .worn {
+  margin-left: 5px; padding: 0 5px; border-radius: 7px;
+  background: var(--teal); color: #fff; font-weight: 700;
+}
+/* 右侧那一列（数字框 / 开关 / 按钮）一律不许被压扁。 */
+.own input[type=number] { flex: 0 0 auto; width: 62px; text-align: center; }
+.own .toggle { flex: 0 0 auto; font-size: 12px; gap: 5px; }
+.own .toggle .track { width: 34px; height: 18px; }
+.own .toggle .track::after { width: 12px; height: 12px; }
+.own .toggle.on .track::after { transform: translateX(16px); }
+.own .lock { flex: 0 0 auto; font-size: 15px; }
+/* 删除是个 ✕ 而不是「清零」两个字 —— 那两个字要 34 px，全给名字更值。 */
+.own .drop {
+  flex: 0 0 auto; width: 22px; height: 22px; padding: 0;
+  font-size: 12px; line-height: 1; box-shadow: 0 2px 0 #A02026;
+}
 .own-empty { color: var(--cocoa-soft); font-size: 13px; padding: 6px 2px; }
+
+/* 玩家列表：钉成 10 行高（表头 + 10 行），翻页时不忽长忽短。 */
+.player-list { min-height: 353px; }
+.player-list table { max-width: none; }
 tr.on td { background: #FFFBEF; }
 td .btn-sm { white-space: nowrap; }
+.pager {
+  display: flex; gap: 10px; align-items: center; margin-top: 10px;
+}
+.pager .pageno { font-size: 13px; color: var(--cocoa-soft); font-weight: 600; }

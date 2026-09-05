@@ -27,9 +27,6 @@
    ========================================================================= */
 "use strict";
 
-/* 服务端在 render_admin() 里把这个占位符换成 true / false。 */
-var DEFAULT_PASSWORD_IN_USE = window.DEFAULT_PASSWORD_IN_USE === true;
-
 var $ = function (id) { return document.getElementById(id); };
 
 function el(tag, cls, text) {
@@ -898,6 +895,7 @@ async function removeAdmin(name) {
 
 var PLAYER = null;        // {view, edit:{level, money, materials, inventory}}
 var PLAYER_LIST = [];
+var PLAYER_PAGE = {page: 0, pages: 1, total: 0, size: 10, q: ""};
 
 /** 现在商店里在卖哪些 id。★ 取的是**当前标签页模型**里的 shop 条目 ——
     管理员刚在「商店目录」里改了上架状态还没保存时，这边跟着一起变，
@@ -910,19 +908,22 @@ function listedIds() {
   return set;
 }
 
-async function searchPlayers() {
+/** 查一页。`page` 省略 = 回第一页（换了查询串就该从头看）。 */
+async function searchPlayers(page) {
   var q = $("playerSearch").value.trim();
-  var result = await api("/admin/api/players?q=" + encodeURIComponent(q));
+  if (page === undefined) { page = (q === PLAYER_PAGE.q) ? PLAYER_PAGE.page : 0; }
+  var result = await api("/admin/api/players?q=" + encodeURIComponent(q)
+                         + "&page=" + page);
   if (bounced(result) || !result.ok) {
     say($("playerMsg"), (result && result.message) || "查找失败", false);
     return;
   }
   PLAYER_LIST = result.players;
+  PLAYER_PAGE = {page: result.page, pages: result.pages,
+                 total: result.total, size: result.size, q: q};
   renderPlayerRows();
-  $("playerHint").textContent = result.truncated
-    ? ("只列前 " + result.limit + " 个，再补几个字缩小范围")
-    : "";
-  $("playerCount").textContent = result.players.length + " 个账号";
+  $("playerCount").textContent = result.total + " 个账号";
+  say($("playerMsg"), "");
 }
 
 function renderPlayerRows() {
@@ -934,22 +935,42 @@ function renderPlayerRows() {
     td.colSpan = 5;
     tr.appendChild(td);
     rows.appendChild(tr);
-    return;
   }
   PLAYER_LIST.forEach(function (row) {
-    var tr = document.createElement("tr");
-    if (PLAYER && PLAYER.view.username === row.username) { tr.className = "on"; }
-    tr.appendChild(el("td", null, row.username + (row.online ? " ●" : "")));
-    tr.appendChild(el("td", null, row.nickname));
-    tr.appendChild(el("td", null, row.level));
-    tr.appendChild(el("td", null, row.money));
+    var line = document.createElement("tr");
+    if (PLAYER && PLAYER.view.username === row.username) { line.className = "on"; }
+    line.appendChild(el("td", null, row.username + (row.online ? " ●" : "")));
+    line.appendChild(el("td", null, row.nickname));
+    line.appendChild(el("td", null, row.level));
+    line.appendChild(el("td", null, row.money));
     var td = el("td");
     var button = el("button", "btn btn-sm", "修改");
     button.onclick = function () { openPlayer(row.username); };
     td.appendChild(button);
-    tr.appendChild(td);
-    rows.appendChild(tr);
+    line.appendChild(td);
+    rows.appendChild(line);
   });
+  renderPlayerPager();
+}
+
+function renderPlayerPager() {
+  var host = $("playerPager");
+  host.textContent = "";
+  // ★ 只有一页时整条都不画 —— 大多数服务器就几十个号，别让翻页控件
+  //   在那儿占一行说「第 1 / 1 页」。
+  if (PLAYER_PAGE.pages <= 1) { return; }
+  function step(label, target, disabled) {
+    var button = el("button", "btn btn-sm", label);
+    button.disabled = disabled;
+    button.onclick = function () { searchPlayers(target); };
+    host.appendChild(button);
+  }
+  step("‹ 上一页", PLAYER_PAGE.page - 1, PLAYER_PAGE.page <= 0);
+  host.appendChild(el("span", "pageno",
+                      "第 " + (PLAYER_PAGE.page + 1) + " / "
+                      + PLAYER_PAGE.pages + " 页"));
+  step("下一页 ›", PLAYER_PAGE.page + 1,
+       PLAYER_PAGE.page >= PLAYER_PAGE.pages - 1);
 }
 
 async function openPlayer(username, force) {
@@ -977,6 +998,7 @@ function adoptPlayer(view) {
     if (!row.locked) { edit.inventory[row.id] = row.count; }
   });
   PLAYER = {view: view, edit: edit};
+  say($("playerMsg"), "");
   renderPlayer();
   renderPlayerRows();
 }
@@ -1023,6 +1045,18 @@ function renderPlayer() {
   playerTouched();
 }
 
+/** 名字：中文名翻不出来时退回 `#id`（`item_name_zh` 自己就这么退的）。 */
+function ownName(itemId) {
+  var item = BYID[itemId];
+  return (item && item.name) || ("#" + itemId);
+}
+
+/** 副标题：★ 名字已经是 `#id` 时别再写一遍，换成「类别 · 角色 · 系列」。 */
+function ownMeta(itemId) {
+  var name = ownName(itemId);
+  return name === ("#" + itemId) ? itemMeta(itemId) : ("#" + itemId);
+}
+
 /** 画一整格 —— 锁着的（商店在卖）只显示，不给改。 */
 function paintOwned(bucket, host, emptyText) {
   host.textContent = "";
@@ -1038,13 +1072,57 @@ function paintOwned(bucket, host, emptyText) {
   lockedRows.forEach(function (row) { host.appendChild(lockedNode(row)); });
 }
 
+/** 服务端说这件东西的数量有没有意义（装备类没有，见 admin.py 的 `stackable`）。*/
+function ownStackable(bucket, itemId) {
+  var rows = PLAYER.view[bucket] || [];
+  for (var i = 0; i < rows.length; i += 1) {
+    if (rows[i].id === itemId) { return rows[i].stackable !== false; }
+  }
+  // 新加进来的（服务端还没见过）：按物品表里的部位掩码判，口径和服务端一样。
+  return !(BYID[itemId] && BYID[itemId].part_flag);
+}
+
+function ownEquipped(bucket, itemId) {
+  var rows = PLAYER.view[bucket] || [];
+  for (var i = 0; i < rows.length; i += 1) {
+    if (rows[i].id === itemId) { return !!rows[i].equipped; }
+  }
+  return false;
+}
+
 function ownNode(bucket, itemId) {
-  var box = el("div", "own");
+  var stack = ownStackable(bucket, itemId);
+  var have = Number(PLAYER.edit[bucket][itemId]) > 0;
+  var box = el("div", "own" + (stack || have ? "" : " off"));
+  // 名字长的会被省略号截掉 —— 全名放 title 里，鼠标停一下就看得到。
+  box.title = itemLabel(itemId);
   box.appendChild(slotNode(itemId, 26, false, false));
+
   var col = el("div", "col");
-  col.appendChild(el("div", "nmz", (BYID[itemId] || {}).name || ("#" + itemId)));
-  col.appendChild(el("div", "meta", "#" + itemId));
+  col.appendChild(el("div", "nmz", ownName(itemId)));
+  var meta = el("div", "meta", ownMeta(itemId));
+  if (ownEquipped(bucket, itemId)) {
+    meta.appendChild(el("span", "worn", "穿着"));
+  }
+  col.appendChild(meta);
   box.appendChild(col);
+
+  if (!stack) {
+    // ★ 装备类只有「有 / 没有」—— 数量那一格客户端根本不读（§28），
+    //   给个数字框只会让人以为发出去了三件。
+    var toggle = el("label", "toggle" + (have ? " on" : ""));
+    toggle.appendChild(el("span", "track"));
+    toggle.appendChild(el("span", "lab", have ? "拥有" : "没有"));
+    toggle.title = "装备类只有「有」和「没有」，数量没有意义";
+    toggle.onclick = function (event) {
+      event.preventDefault();
+      PLAYER.edit[bucket][itemId] = have ? 0 : 1;
+      renderPlayer();
+    };
+    box.appendChild(toggle);
+    return box;
+  }
+
   var input = document.createElement("input");
   input.type = "number";
   input.min = "0";
@@ -1055,8 +1133,8 @@ function ownNode(bucket, itemId) {
     playerTouched();
   };
   box.appendChild(input);
-  var drop = el("button", "btn btn-sm btn-danger drop", "清零");
-  drop.title = "把数量改成 0 —— 保存后这一格就没了";
+  var drop = el("button", "btn btn-sm btn-danger drop", "✕");
+  drop.title = "清零 —— 保存后这一格就没了";
   drop.onclick = function () {
     PLAYER.edit[bucket][itemId] = 0;
     input.value = 0;
@@ -1068,11 +1146,15 @@ function ownNode(bucket, itemId) {
 
 function lockedNode(row) {
   var box = el("div", "own locked");
+  box.title = itemLabel(row.id);
   box.appendChild(slotNode(row.id, 26, true, false));
   var col = el("div", "col");
-  col.appendChild(el("div", "nmz", (BYID[row.id] || {}).name || ("#" + row.id)));
-  col.appendChild(el("div", "meta", "#" + row.id + " ×" + row.count
-                                    + (row.equipped ? " · 穿着" : "")));
+  col.appendChild(el("div", "nmz", ownName(row.id)));
+  var meta = el("div", "meta",
+                row.stackable === false ? ownMeta(row.id)
+                                        : (ownMeta(row.id) + " ×" + row.count));
+  if (row.equipped) { meta.appendChild(el("span", "worn", "穿着")); }
+  col.appendChild(meta);
   box.appendChild(col);
   var lock = el("span", "lock", "🔒");
   lock.title = "商店在卖的东西不能直接改 —— 改金币和等级，让玩家自己去买";
@@ -1080,7 +1162,7 @@ function lockedNode(row) {
   return box;
 }
 
-/** 「＋ 加一种」。已经有的就把它加回 1，别加出两张一样的格子。 */
+/** 「＋ 加一种」。已经有的就把它加回来，别加出两张一样的格子。 */
 function addOwned(bucket, kinds) {
   var listed = listedIds();
   openPicker({
@@ -1106,11 +1188,13 @@ async function savePlayer() {
   say($("playerMsg"), "保存中……", true);
   var result = await api("/admin/api/player", payload);
   if (bounced(result)) { return; }
-  say($("playerMsg"), result.message, result.ok);
   if (result.ok && result.player) {
     adoptPlayer(result.player);
-    searchPlayers();                 // 列表里的等级 / 金币跟着更新
+    await searchPlayers();           // 列表里的等级 / 金币跟着更新
   }
+  // ★ 这一句要排在最后：上面两个都会把消息条清空（它们各自也是入口），
+  //   先说再刷的话「已保存：…」会当场被擦掉。
+  say($("playerMsg"), result.message, result.ok);
 }
 
 /* ======================================================================
@@ -1122,9 +1206,8 @@ function showLoggedIn(name) {
   $("logout").classList.remove("hidden");
   $("loginView").classList.add("hidden");
   $("mainView").classList.remove("hidden");
-  if (DEFAULT_PASSWORD_IN_USE) {
-    $("defaultPwBanner").classList.remove("hidden");
-  }
+  // 标签行在顶栏那块 sticky 容器里，不跟着 `mainView` 走 —— 自己开关一次。
+  $("tabs").classList.remove("hidden");
   boot();
 }
 
@@ -1137,6 +1220,7 @@ function showLoggedOut(message) {
   $("who").textContent = "";
   $("logout").classList.add("hidden");
   $("mainView").classList.add("hidden");
+  $("tabs").classList.add("hidden");
   $("loginView").classList.remove("hidden");
   if (message) { say($("loginMsg"), message, false); }
 }
@@ -1209,9 +1293,11 @@ function wire() {
   };
   $("cfgAdd").onclick = function () { addEntry(CURRENT); };
 
-  $("playerSearchBtn").onclick = searchPlayers;
+  // ★ 不能直接把 `searchPlayers` 当 onclick —— 那会把 Event 当页码传进去。
+  //   手动查一次一律回第一页。
+  $("playerSearchBtn").onclick = function () { searchPlayers(0); };
   $("playerSearch").addEventListener("keydown", function (event) {
-    if (event.key === "Enter") { searchPlayers(); }
+    if (event.key === "Enter") { searchPlayers(0); }
   });
   $("playerLevel").oninput = function () {
     PLAYER.edit.level = Math.max(1, Number($("playerLevel").value) || 1);
@@ -1261,7 +1347,6 @@ function wire() {
       name: $("pwName").value, password: $("pwValue").value});
     $("pwValue").value = "";
     if (result.ok && result.logged_out) {
-      DEFAULT_PASSWORD_IN_USE = false;
       showLoggedOut(result.message);
       return;
     }

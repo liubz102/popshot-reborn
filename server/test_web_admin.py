@@ -117,22 +117,29 @@ class _AdminCase(unittest.TestCase):
 
 class AdminAuthTests(_AdminCase):
 
-    def test_the_page_renders_and_warns_about_the_default_password(self):
+    def test_the_page_renders_with_the_placeholders_filled_in(self):
         status, html = self.request("/admin")
         self.assertEqual(200, status)
-        # ★ D3 的补偿之二：弱默认口令 + 公网可达 ⇒ 页面上必须喊出来。
-        self.assertIn("请立刻在下面「管理员账号」里改掉它", html)
-        self.assertIn("var DEFAULT_PASSWORD_IN_USE = true;", html)
         # 占位符必须被换掉，不能原样漏到页面上。
         self.assertNotIn("__USERNAME_RULE__", html)
         self.assertNotIn("__PASSWORD_RULE__", html)
-        self.assertNotIn("__DEFAULT_PASSWORD_IN_USE__", html)
+        self.assertIn(account_store.USERNAME_RULE_TEXT, html)
 
-    def test_the_banner_flag_follows_the_actual_password(self):
+    def test_the_default_password_warning_is_not_on_the_page_any_more(self):
+        # ★ D24：用户 2026-09-05 要求页面上不显示这条，挪进了启动日志。
+        #   这条用例是防回归的 —— 别有人「顺手」把红字加回来。
+        _status, html = self.request("/admin")
+        self.assertNotIn("出厂口令", html)
+        self.assertNotIn("DEFAULT_PASSWORD_IN_USE", html)
+
+    def test_the_default_password_check_follows_the_actual_password(self):
+        # D3 的补偿之二现在长在这个函数上（`app.py` 启动时打一行警告）。
+        self.assertTrue(
+            web_admin.default_admin_password_in_use(self.accounts))
         self.accounts.admin_set_password(account_store.DEFAULT_ADMIN_NAME,
                                          "SomethingElse1")
-        _status, html = self.request("/admin")
-        self.assertIn("var DEFAULT_PASSWORD_IN_USE = false;", html)
+        self.assertFalse(
+            web_admin.default_admin_password_in_use(self.accounts))
 
     def test_login_succeeds_and_sets_an_http_only_cookie(self):
         status, result = self.login()
@@ -689,6 +696,77 @@ class AdminPlayerTests(_AdminCase):
         self.assertFalse(result["ok"])
         self.assertIn("负数", result["message"])
 
+    # ------------------------------------------------------- 分页（10 行一页）
+    def test_the_list_is_paged_ten_at_a_time(self):
+        for i in range(23):
+            self.accounts.register("p%02d" % i, "pw1")
+        _status, first = self.request("/admin/api/players?q=p")
+        self.assertEqual(23, first["total"])
+        self.assertEqual(10, first["size"])
+        self.assertEqual(3, first["pages"])
+        self.assertEqual(0, first["page"])
+        self.assertEqual(10, len(first["players"]))
+        _status, last = self.request("/admin/api/players?q=p&page=2")
+        self.assertEqual(3, len(last["players"]))
+        self.assertEqual(2, last["page"])
+
+    def test_paging_past_the_end_falls_back_to_the_last_page(self):
+        # 换了查询串却还停在第 5 页时，回一张空表会被当成「查无此人」。
+        for i in range(12):
+            self.accounts.register("p%02d" % i, "pw1")
+        _status, result = self.request("/admin/api/players?q=p&page=9")
+        self.assertEqual(1, result["page"])
+        self.assertEqual(2, len(result["players"]))
+
+    def test_a_junk_page_number_is_treated_as_the_first_page(self):
+        _status, result = self.request("/admin/api/players?q=&page=abc")
+        self.assertEqual(0, result["page"])
+
+    # -------------------------------------- 装备类只有「有 / 没有」（无数量）
+    def test_equipment_has_no_count_only_presence(self):
+        # ★ 客户端的形态标志里装备发的是 `0x08` 可装备位，**数量那一格根本
+        #   没人读**（§28）。所以 ×5 只是「有」，存成 ×1。
+        _status, result = self.save(inventory={str(self._ARMOR): 5})
+        self.assertTrue(result["ok"], result)
+        _name, account = self.accounts.get_account("alice")
+        self.assertEqual(1, account_store.inventory_items(account)
+                         [self._ARMOR]["count"])
+
+    def test_an_old_stray_count_on_equipment_is_left_alone(self):
+        # 老存档里可能躺着 ×2（早先 `give` 发过两次）。「有无没变」就一个字节
+        # 都不该动 —— 否则点开看一眼再保存，会多出一行「×2 -> ×1」，
+        # 一个客户端根本不读的数字却让人以为自己改了什么。
+        self.accounts.add_item("alice", self._ARMOR, count=2)
+        _status, result = self.save(inventory={str(self._ARMOR): 2})
+        self.assertEqual([], result["changes"])
+        _name, account = self.accounts.get_account("alice")
+        self.assertEqual(2, account_store.inventory_items(account)
+                         [self._ARMOR]["count"])
+
+    def test_turning_equipment_off_and_on_still_works_with_a_stray_count(self):
+        self.accounts.add_item("alice", self._ARMOR, count=3)
+        self.save(inventory={str(self._ARMOR): 0})
+        _name, account = self.accounts.get_account("alice")
+        self.assertFalse(account_store.has_item(account, self._ARMOR))
+        self.save(inventory={str(self._ARMOR): 1})
+        _name, account = self.accounts.get_account("alice")
+        self.assertEqual(1, account_store.inventory_items(account)
+                         [self._ARMOR]["count"])
+
+    def test_the_view_says_which_rows_have_a_meaningful_count(self):
+        self.accounts.add_materials("alice", {self._MATERIAL: 2})
+        self.accounts.add_item("alice", self._ARMOR)
+        view = self.player()
+        self.assertTrue(view["materials"][0]["stackable"])
+        rows = {row["id"]: row for row in view["inventory"]}
+        self.assertFalse(rows[self._ARMOR]["stackable"])
+
+    def test_the_view_marks_what_is_being_worn(self):
+        self.accounts.add_item("alice", self._ARMOR)
+        self.accounts.equip_item("alice", self._ARMOR)
+        rows = {row["id"]: row for row in self.player()["inventory"]}
+        self.assertTrue(rows[self._ARMOR]["equipped"])
+
     # ------------------------------------------------------------ 视图
     def test_the_view_carries_what_the_page_needs(self):
         self.accounts.add_materials("alice", {self._MATERIAL: 2})
@@ -696,7 +774,8 @@ class AdminPlayerTests(_AdminCase):
         self.assertEqual("爱丽丝", view["nickname"])
         self.assertEqual(account_store.LEVEL_MAX, view["level_max"])
         self.assertFalse(view["online"])
-        self.assertEqual([{"id": self._MATERIAL, "count": 2, "locked": False}],
+        self.assertEqual([{"id": self._MATERIAL, "count": 2,
+                           "locked": False, "stackable": True}],
                          view["materials"])
 
 

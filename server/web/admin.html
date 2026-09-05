@@ -5,20 +5,29 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>炮炮火枪手 · 管理页</title>
 <link rel="stylesheet" href="/admin/admin.css">
-<script>
-// 服务端在 render_admin() 里把这个占位符换成 true / false。
-// ★ 用 `var` 而不是 `const`：这是个全局，admin.js 从 window 上读它。
-var DEFAULT_PASSWORD_IN_USE = __DEFAULT_PASSWORD_IN_USE__;
-</script>
 <script src="/admin/admin.js" defer></script>
 </head>
 <body>
 
-<header class="topbar">
-  <span class="brand">炮炮火枪手 · 管理页</span>
-  <span class="who" id="who"></span>
-  <button id="logout" class="btn btn-ghost hidden">退出登录</button>
-</header>
+<!-- ★ 顶栏 + 标签行整块 `position: sticky`：往下滚时它俩钉在画面顶上，
+     只有标签行**下面**的内容跟着滚（用户 2026-09-05）。
+     两者必须在**同一个** sticky 容器里，否则标签行只有 `main` 那么宽，
+     滚上来的内容会从左右两边露出来。 -->
+<div class="appbar">
+  <header class="topbar">
+    <span class="brand">炮炮火枪手 · 管理页</span>
+    <span class="who" id="who"></span>
+    <button id="logout" class="btn btn-ghost hidden">退出登录</button>
+  </header>
+
+  <nav class="tabs hidden" id="tabs">
+    <button data-tab="shop" class="on">商店目录</button>
+    <button data-tab="recipe">合成配方</button>
+    <button data-tab="drops">材料掉落</button>
+    <button data-tab="players">玩家资料</button>
+    <button data-tab="admins">管理员账号</button>
+  </nav>
+</div>
 
 <main>
 
@@ -41,19 +50,6 @@ var DEFAULT_PASSWORD_IN_USE = __DEFAULT_PASSWORD_IN_USE__;
 
   <!-- ========================= 主界面 ========================= -->
   <div id="mainView" class="hidden">
-
-    <div class="banner hidden" id="defaultPwBanner">
-      ★ <b>默认管理员还在用出厂口令</b>（<code>admin</code> / <code>Admin123</code>）。
-      这个页面是公网可达的 —— 请立刻在下面「管理员账号」里改掉它。
-    </div>
-
-    <nav class="tabs" id="tabs">
-      <button data-tab="shop" class="on">商店目录</button>
-      <button data-tab="recipe">合成配方</button>
-      <button data-tab="drops">材料掉落</button>
-      <button data-tab="players">玩家资料</button>
-      <button data-tab="admins">管理员账号</button>
-    </nav>
 
     <!-- ------- 三份运营配置共用这一套骨架，内容由 admin.js 按字段表生成 ------- -->
     <section class="panel" id="cfgPanel">
@@ -97,16 +93,18 @@ var DEFAULT_PASSWORD_IN_USE = __DEFAULT_PASSWORD_IN_USE__;
         <div class="toolbar">
           <input id="playerSearch" type="text" placeholder="搜 用户名 / 昵称">
           <button class="btn" id="playerSearchBtn">查找</button>
-          <span class="grow"></span>
-          <span class="hint" id="playerHint" style="margin:0"></span>
         </div>
-        <table>
-          <thead><tr>
-            <th>用户名</th><th>昵称</th><th style="width:64px">等级</th>
-            <th style="width:96px">金币</th><th style="width:78px"></th>
-          </tr></thead>
-          <tbody id="playerRows"></tbody>
-        </table>
+        <!-- 高度按 10 行钉死：翻页时表格不会忽长忽短，下面的编辑区也就不跳。 -->
+        <div class="player-list">
+          <table>
+            <thead><tr>
+              <th>用户名</th><th>昵称</th><th style="width:64px">等级</th>
+              <th style="width:96px">金币</th><th style="width:78px"></th>
+            </tr></thead>
+            <tbody id="playerRows"></tbody>
+          </table>
+        </div>
+        <div class="pager" id="playerPager"></div>
 
         <div id="playerEdit" class="hidden">
           <div class="panel-title" style="margin-top:20px">

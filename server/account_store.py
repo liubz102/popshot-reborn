@@ -1028,18 +1028,23 @@ class AccountStore:
             return self.set_equipped(username, rest)
 
     # ------------------------------------------------- 管理页的玩家信息修改
-    def search_accounts(self, query="", limit=30):
-        """按**用户名或昵称**找账号，返回 ``[(用户名, 账号字典), …]``。
+    def search_accounts(self, query="", limit=None, offset=0):
+        """按**用户名或昵称**找账号，返回 ``([(用户名, 账号字典), …], 命中总数)``。
 
         大小写不敏感的**子串**匹配，两边任意一边命中就算（需求原文：
-        「可以通过昵称或用户名来查找具体用户」）。查询串留空 = 列前 `limit` 个。
+        「可以通过昵称或用户名来查找具体用户」）。查询串留空 = 全部。
 
         ★ 昵称走 `nickname_key()` 归一化，和注册时的查重口径一致 ——
         否则「全角空格」「大小写」这类差异会让管理员搜不到刚注册的人。
+
+        ★ **总数是「命中多少」，不是「返回多少」** —— 管理页靠它算页数。
+        所以这里先把命中的数完，再按 `offset`/`limit` 切一页出来；
+        提前 `break` 的话页码就没法算了。账号是全量读进内存的，多走一遍
+        字符串比较的代价远小于「翻到第 3 页才发现没有第 3 页」。
         """
         needle = str(query or "").strip().lower()
         key_needle = nickname_key(query)
-        found = []
+        hits = []
         with self._lock:
             data = self._read_unlocked()
             for username in sorted(data["accounts"]):
@@ -1052,10 +1057,10 @@ class AccountStore:
                             and not (key_needle
                                      and key_needle in nickname_key(nickname))):
                         continue
-                found.append((username, account))
-                if limit and len(found) >= int(limit):
-                    break
-        return found
+                hits.append((username, account))
+        offset = max(0, int(offset or 0))
+        page = hits[offset:] if limit is None else hits[offset:offset + int(limit)]
+        return page, len(hits)
 
     def admin_update_account(self, username, level=None, money=None,
                              materials=None, inventory=None):

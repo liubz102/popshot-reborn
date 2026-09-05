@@ -20,7 +20,7 @@
     POST /admin/api/admins/password   {name, password}
     POST /admin/api/admins/remove     {name}
     GET  /admin/api/item?id=1120041   某件东西**现在在商店里**是什么价（选择器侧栏用）
-    GET  /admin/api/players?q=名字     按用户名 / 昵称找玩家
+    GET  /admin/api/players?q=名字&page=0  按用户名 / 昵称找玩家（一页 10 行）
     GET  /admin/api/player?name=alice  一个玩家的可编辑资料
     POST /admin/api/player            {name, level, money, materials, inventory}
 
@@ -43,7 +43,9 @@ D22 之后商店按**真实等级**卖东西。管理页要是能把 4 级才卖
 `admin` / `Admin123`。**三条补偿是硬要求，改代码时别顺手拿掉**：
 
 1. 登录**按 IP 限速**（`LoginRateLimiter`，注意它和注册限速的极性相反）；
-2. 页面上**明确提示「请立刻改掉默认密码」**（`admin.html` 里那条红字）；
+2. **启动日志里警告「默认管理员还在用出厂口令」**（`default_admin_password_in_use()`，
+   `app.py` 启动时打一行）。★ 这一条以前是画在页面顶上的一条红字，
+   用户 2026-09-05 要求页面上不要显示，于是挪进了日志（D24）；
 3. 日志里**只打名字和结果，绝不打口令**。
 
 ## 配置编辑器是**结构化表单**（D16 取代 D14）
@@ -247,15 +249,13 @@ class LoginRateLimiter:
             del self._until[key]
 
 
-def render_admin(default_password_in_use):
-    """读 `admin.html`，把「默认口令还没改」那条警告开关填进去。"""
+def render_admin():
+    """读 `admin.html`，把名字 / 口令规则那两句话填进去。"""
     with open(ADMIN_PATH, "r", encoding="utf-8") as fp:
         html = fp.read()
     return (html
             .replace("__USERNAME_RULE__", _escape(account_store.USERNAME_RULE_TEXT))
-            .replace("__PASSWORD_RULE__", _escape(account_store.PASSWORD_RULE_TEXT))
-            .replace("__DEFAULT_PASSWORD_IN_USE__",
-                     "true" if default_password_in_use else "false"))
+            .replace("__PASSWORD_RULE__", _escape(account_store.PASSWORD_RULE_TEXT)))
 
 
 def _escape(text):
@@ -346,12 +346,26 @@ def catalog():
     return _catalog_cache
 
 
-#: 玩家搜索一次最多回多少条。
+#: 玩家列表一页几行。
 #:
-#: 这不是「等一等就好了」的阈值（铁律 10），是**一页显示多少行**的界面取舍：
-#: 管理员看的是一份名单，翻 200 行比再敲两个字慢。回包里带 `truncated`，
-#: 页面明说「还有更多，再补几个字」。
-PLAYER_SEARCH_LIMIT = 50
+#: 这不是「等一等就好了」的阈值（铁律 10），是**一页显示多少行**的界面取舍
+#: —— 用户 2026-09-05 指定 10 行，超过就翻页。分页在**服务端**做
+#: （`search_accounts` 回「这一页 + 命中总数」），所以账号再多也不会
+#: 一次性把整份名单发给浏览器。
+PLAYER_PAGE_SIZE = 10
+
+
+def default_admin_password_in_use(accounts):
+    """默认管理员还在用出厂口令吗？
+
+    ★ 只回一个布尔，**不回口令是什么**（铁律 9）。
+    `app.py` 启动时拿它打一行警告 —— 这个页面公网可达，而口令是明文存的
+    （D3），出厂口令没改就等于没有认证。以前这句话画在页面顶上，
+    用户 2026-09-05 要求拿掉，于是挪来了这里（D24）。
+    """
+    return (accounts.admin_verify(
+        account_store.DEFAULT_ADMIN_NAME,
+        account_store.DEFAULT_ADMIN_PASSWORD) == account_store.AUTH_OK)
 
 
 def _online_usernames():
@@ -398,6 +412,20 @@ def _push_account(username):
             continue
         pushed = True
     return pushed
+
+
+def stackable(item_id):
+    """这件东西的**数量有没有意义**。装备类没有 —— 只有「有」和「没有」。
+
+    判据是 `part_flag != 0`（= `shopdata.equippable`），和 `shop.py` 里
+    「装备不能重复购买」用的是同一条（`check_purchase` 的 `BUY_ALREADY_OWNED`）。
+
+    ★ 客户端那边也是这么认的：`ItemInfo+0x10` 的形态标志里，`0x01` 才是
+    「计数持有」（提示框写「소지개수 : %d개」），装备发的是 `0x08` 可装备位，
+    **数量那一格根本没人读**（FINDINGS §28）。⇒ 给一件铠甲存 ×3 是句空话，
+    管理页干脆不给填，免得管理员以为自己发了三件（用户 2026-09-05）。
+    """
+    return not shopdata.equippable(item_id)
 
 
 def _optional_int(value, label):
@@ -452,11 +480,12 @@ def _player_view(username, account):
         "money": account_store.player_money(account),
         "online": username in _online_usernames(),
         "materials": [{"id": item_id, "count": materials[item_id],
-                       "locked": locked(item_id)}
+                       "locked": locked(item_id), "stackable": True}
                       for item_id in sorted(materials)],
         "inventory": [{"id": item_id,
                        "count": inventory[item_id]["count"],
                        "locked": locked(item_id),
+                       "stackable": stackable(item_id),
                        "equipped": item_id in equipped}
                       for item_id in sorted(inventory)],
     }
@@ -524,8 +553,7 @@ class AdminRoutes:
     def admin_get(self, path, query):
         """`/admin` 开头的 GET。认识就处理并返回 True。"""
         if path in ("/admin", "/admin/"):
-            self._send(200, render_admin(self._default_password_in_use()),
-                       "text/html; charset=utf-8")
+            self._send(200, render_admin(), "text/html; charset=utf-8")
             return True
         asset = path[len("/admin/"):] if path.startswith("/admin/") else ""
         if asset in STATIC_FILES:
@@ -648,15 +676,6 @@ class AdminRoutes:
             "series": shopcfg.SERIES_ZH,
             "max_materials": shopcfg.MAX_MATERIALS,
         })
-
-    def _default_password_in_use(self):
-        """默认管理员还在用出厂口令吗？页面顶上那条红字看它。
-
-        ★ 只回一个布尔，**不回口令是什么**（铁律 9）。
-        """
-        return (self.accounts.admin_verify(
-            account_store.DEFAULT_ADMIN_NAME,
-            account_store.DEFAULT_ADMIN_PASSWORD) == account_store.AUTH_OK)
 
     def _admin_login(self, data):
         # ★ 限速放在**最前面**：被限住的时候连「有没有这个管理员」都不该
@@ -843,16 +862,31 @@ class AdminRoutes:
 
     # ------------------------------------------------------------ 玩家资料
     def _admin_player_search(self, query):
-        """`/admin/api/players?q=…` —— 按用户名或昵称找人。"""
+        """`/admin/api/players?q=…&page=N` —— 按用户名或昵称找人，一页 10 行。"""
         if self._require_admin() is None:
             return
-        raw = (urllib.parse.parse_qs(query or "").get("q") or [""])[0]
-        found = self.accounts.search_accounts(raw, limit=PLAYER_SEARCH_LIMIT)
+        fields = urllib.parse.parse_qs(query or "")
+        raw = (fields.get("q") or [""])[0]
+        try:
+            page = max(0, int((fields.get("page") or ["0"])[0]))
+        except ValueError:
+            page = 0
+        found, total = self.accounts.search_accounts(
+            raw, limit=PLAYER_PAGE_SIZE, offset=page * PLAYER_PAGE_SIZE)
+        pages = max(1, -(-total // PLAYER_PAGE_SIZE))     # 向上取整
+        if not found and page >= pages:
+            # 翻过了头（删号 / 换了查询串之后还停在第 5 页）：退回最后一页，
+            # 而不是回一张空表让人以为「没有这个人」。
+            page = pages - 1
+            found, total = self.accounts.search_accounts(
+                raw, limit=PLAYER_PAGE_SIZE, offset=page * PLAYER_PAGE_SIZE)
         online = _online_usernames()
         self._send_json({
             "ok": True,
-            "limit": PLAYER_SEARCH_LIMIT,
-            "truncated": len(found) >= PLAYER_SEARCH_LIMIT,
+            "page": page,
+            "pages": pages,
+            "size": PLAYER_PAGE_SIZE,
+            "total": total,
             "players": [{
                 "username": username,
                 "nickname": account_store.display_name(account),
@@ -907,6 +941,22 @@ class AdminRoutes:
                             f"{i} {(table.get(i) or {}).get('name') or ''}".strip()
                             for i in locked))
             return
+        # ★ 装备类只有「有 / 没有」，数量没有意义（见 `stackable()`）：
+        #   **有无没变就整条从补丁里拿掉**，有无变了才写 1 / 0。
+        #
+        #   为什么不是简单地夹成 0/1：老存档里可能躺着 ×2（早先用控制通道的
+        #   `give` 发过两次）。夹的话，管理员只是点开看一眼再按保存，就会
+        #   多出一行「物品 1010004 ×2 -> ×1」—— 一个客户端根本不读的数字，
+        #   却让人以为自己改了什么。
+        owned_before = account_store.inventory_items(account)
+        for item_id in list(inventory):
+            if stackable(item_id):
+                continue
+            want = 1 if inventory[item_id] else 0
+            if want == (1 if item_id in owned_before else 0):
+                del inventory[item_id]
+            else:
+                inventory[item_id] = want
         account, changes = self.accounts.admin_update_account(
             username, level=level, money=money,
             materials=materials, inventory=inventory)
