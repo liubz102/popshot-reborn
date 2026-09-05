@@ -60,7 +60,7 @@ from account_store import (AccountError, AccountStore, BASE_CHARACTER_IDS,
                            character_item_id, character_item_ids,
                            character_unlock_all, display_name,
                            equipped_items, experience_bounds, has_item,
-                           inventory_items,
+                           inventory_items, owned_item_ids,
                            material_counts, owned_characters,
                            player_character, player_experience, player_level,
                            player_money, quest_cleared_difficulty,
@@ -83,8 +83,9 @@ from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
 from netlisten import create_listener, describe as describe_listen, tune_stream
 import relayserver
 import roomclock
-#: 商店物品表 + 运营配置（V0.3商店）。这里只用来给调试命令的输出配个人看得懂的
-#: 名字；真正的商店业务逻辑在 `shop.py`（M5）。
+#: 商店物品表 + 运营配置 + 组包纯函数（V0.3商店）。`shop.py` 只做「字节 ↔ 数据」，
+#: 这里做「解包 -> 调它 -> 组包 -> 发」。
+import shop
 import shopcfg
 import shopdata
 from tickets import TicketStore, short as short_ticket
@@ -469,57 +470,94 @@ OP_LADDER_START_GAME = 0x0416
 OP_REP_MOVE_INTO = 0x0701
 
 # ---------------------------------------------------------------------------
-# 商店 / 合成 / 仓库段（V0.3商店 §4）。**现在只监听，一发都不回**（M4 第一步）。
+# 商店 / 合成 / 仓库段（V0.3商店 §20 ~ §23）。
 #
 # 客户端的分发器是 `ShopStage` vft `0x666164` 槽 `+0xc4`，跳表 `@0x44434a`。
-# ★ **进商店时客户端连发四个请求**（ShopStage ctor `0x444009`~`0x44402c`
-#   顺序调用）：`0x0704` -> `0x0605` -> `0x0607` -> `0x0700`。
+# ★ **进商店时客户端连发五个请求**（ShopStage ctor `0x444009`~`0x44402c`
+#   顺序调用）：`0x0600` -> `0x0704` -> `0x0605` -> `0x0607` -> `0x0700`。
+#   ⚠ 打头那发 `0x0600` 会话 03 漏掉了 —— 它没进 `SHOP_PROBE_OPCODES`，
+#     只落在通用包日志里。**新增上行 opcode 记得两边都加。**
 #
-# ⚠ **整段都是 🔍静态结论，一发都没在线上观测过**（D1 认下的代价）。
-#   M4 第一步就是把「客户端到底发不发、载荷长什么样」升成 ✅实测 ——
-#   所以这些处理器**故意只打日志不应答**，先看客户端自己会怎么样。
+# ⚠ **下行三发（`0x0500` / `0x0604` / `0x0508`）仍然是 🔍静态结论**，
+#   一发都没在线上验过（D1 认下的代价）。发归发，别在文档里升成 ✅。
 # ---------------------------------------------------------------------------
-#: 进商店第 1 发。无正文。期望应答 `0x0604 gspRepEquippedList`（处理器 `0x447278`）。
+#: ★★ 进商店第 1 发 = **货架目录请求**（`u8 角色 + i32 分类 + u16 页 + i32 标志`，
+#: 11 字节，发送点 `0x445e40`）。期望应答 `0x0500 gspRepShopItemList`。
+#:
+#: ⚠⚠ **同号反向**：服务端方向的 `0x0600` 是 `OP_REP_MONEY`（右上角数据栏）。
+#:    这两个常量值一样、方向相反，改任何一个之前先确认自己在说哪一边。
+#: ★ 客户端有 **10 秒节流**（`[ShopStage+0x144]`，`0x2710`ms），**收到 `0x0500`
+#:   才清掉** ⇒ 不回的话它每 10 秒重发一次。
+OP_REQ_SHOP_ITEM_LIST = 0x0600
+#: 进商店第 2 发。无正文。期望应答 `0x0604 gspRepEquippedList`（处理器 `0x447278`）。
 OP_REQ_EQUIPPED_LIST = 0x0704
-#: 进商店第 2 发。`gcpReqCompositionList`，静态推出的形状是 `u8 + i32 + u16 + i32`。
+#: 进商店第 3 发。`gcpReqCompositionList`，线格式和 `0x0600` **一模一样**。
 #: 期望应答 `0x0505 gspRepCompositionList`（处理器 `0x4474e4`）。
 OP_REQ_COMPOSITION_LIST = 0x0605
-#: 进商店第 3 发。`gcpReqGiftList`。本版只打算回空礼物清单（礼物系统不做）。
+#: 进商店第 4 发。`gcpReqGiftList`，无正文。本版回空礼物清单（礼物系统不做）。
 OP_REQ_GIFT_LIST = 0x0607
-#: 进商店第 4 发。无正文，❓语义未查明（V0.1 §50 记过大厅也在轮询它）。
+#: 进商店第 5 发。无正文，❓语义未查明。★ **不是商店专用** —— 大厅 / 房间也发
+#: （`0x5541c1` 有 6 个调用点，V0.1 §50 记过大厅在轮询它）⇒ **别拿它当
+#: 「进商店了」的判据**，更别用它触发货架下发。
 OP_REQ_SHOP_ENTER = 0x0700
 #: **购买**（`i32 n, n×i32`，发送点 `0x446115`），期望应答 `0x0502 gspRepItemBuy`。
 OP_REQ_ITEM_BUY = 0x0602
-#: ❓（单 `i32`，发送点 `0x4466d2`，大概率回 `0x0503`）。
+#: ❓（单 `i32`，发送点 `0x4466d2`）。`0x0503` 的处理器只读一个 bool 然后弹提示框。
 OP_REQ_SHOP_UNKNOWN_0603 = 0x0603
 #: **装备 / 卸下**（`i32, i32`，发送点 `0x446f5b`）。
 #: ★ 它只落到 `[ShopStage+0x134/0x138]`（商店界面自己的显示），
-#:   **让加成生效的是 `0x030b`** —— 处理完还要重发那一发（§4）。
+#:   **让加成生效的是 `0x030b`** —— 处理完还要重发那一发（§23）。
 OP_REQ_EQUIP_ITEM = 0x0604
 #: **合成**（单 `i32`，发送点 `0x44765c`），期望应答 `0x0506 gspRepComposeItem`。
 OP_REQ_COMPOSE_ITEM = 0x0606
 
-#: 进商店那四发，按客户端实际的发送顺序排。日志里按这个顺序对号。
-SHOP_ENTRY_OPCODES = (OP_REQ_EQUIPPED_LIST, OP_REQ_COMPOSITION_LIST,
-                      OP_REQ_GIFT_LIST, OP_REQ_SHOP_ENTER)
+# -- 服务端 -> 客户端 -------------------------------------------------------
+#: 货架目录。三层嵌套，组包在 `shop.build_rep_shop_item_list`（§21）。
+OP_REP_SHOP_ITEM_LIST = 0x0500
+#: 商店界面里「我拥有 / 我穿着什么」。和 `0x030b` 的包体只差一个座位号（§23）。
+#: ⚠ 和 `OP_REQ_EQUIP_ITEM` 同号反向。
+OP_REP_EQUIPPED_LIST = 0x0604
+#: 礼物清单。本版恒发空清单。
+OP_REP_GIFT_LIST = 0x0508
 
-#: 监听器负责的全部上行 opcode。
+#: 进商店那五发，按客户端实际的发送顺序排。日志里按这个顺序对号。
+SHOP_ENTRY_OPCODES = (OP_REQ_SHOP_ITEM_LIST, OP_REQ_EQUIPPED_LIST,
+                      OP_REQ_COMPOSITION_LIST, OP_REQ_GIFT_LIST,
+                      OP_REQ_SHOP_ENTER)
+
+#: 商店段负责的全部上行 opcode。
 SHOP_PROBE_OPCODES = SHOP_ENTRY_OPCODES + (
     OP_REQ_ITEM_BUY, OP_REQ_SHOP_UNKNOWN_0603, OP_REQ_EQUIP_ITEM,
     OP_REQ_COMPOSE_ITEM)
 
-#: 每个号「静态逆出来的形状」和「期望应答」，只用来给日志配一句人话。
+#: 每个号「逆出来的形状」和「期望应答」，只用来给日志配一句人话。
 #: ★ 括号里的可信度标记就是 `re/packet_api.md` §3.8 里那一份，别在这儿升级它。
 SHOP_PROBE_NOTES = {
-    OP_REQ_EQUIPPED_LIST: ("无正文", "0x0604 gspRepEquippedList"),
-    OP_REQ_COMPOSITION_LIST: ("u8 + i32 + u16 + i32 🤔", "0x0505 gspRepCompositionList"),
-    OP_REQ_GIFT_LIST: ("❓未查", "❓（本版打算回空清单）"),
-    OP_REQ_SHOP_ENTER: ("无正文", "❓未查"),
+    OP_REQ_SHOP_ITEM_LIST: ("u8 + i32 + u16 + i32 ✅", "0x0500 gspRepShopItemList"),
+    OP_REQ_EQUIPPED_LIST: ("无正文 ✅", "0x0604 gspRepEquippedList"),
+    OP_REQ_COMPOSITION_LIST: ("u8 + i32 + u16 + i32 ✅", "0x0505 gspRepCompositionList"),
+    OP_REQ_GIFT_LIST: ("无正文 ✅", "0x0508 gspRepGiftList（本版恒空）"),
+    OP_REQ_SHOP_ENTER: ("无正文 ✅", "❓未查（不是商店专用）"),
     OP_REQ_ITEM_BUY: ("i32 n, n×i32 🔍", "0x0502 gspRepItemBuy"),
-    OP_REQ_SHOP_UNKNOWN_0603: ("i32 🔍", "❓大概率 0x0503"),
+    OP_REQ_SHOP_UNKNOWN_0603: ("i32 🔍", "❓0x0503 是个 bool + 提示框"),
     OP_REQ_EQUIP_ITEM: ("i32, i32 🤔", "回显 + 重发 0x030b"),
     OP_REQ_COMPOSE_ITEM: ("i32 🔍", "0x0506 gspRepComposeItem"),
 }
+
+#: ★ **哪几发真的回**。M4 第 2 步是「逐个试应答，每加一发实机看一眼」——
+#: 这个集合就是那个开关，控制通道的 `shop-reply` 命令可以在**不重启服务端**
+#: 的前提下把某一发关掉（铁律 7 只要求改代码要重启，改这个不用）。
+#: ⇒ 实机一旦发现界面不对，直接关掉一发再进一次商店就能二分到是哪一发。
+SHOP_REPLY_ENABLED = {
+    OP_REP_SHOP_ITEM_LIST: True,
+    OP_REP_EQUIPPED_LIST: True,
+    OP_REP_GIFT_LIST: True,
+}
+
+#: 货架包里那三个未查明字段要不要填探针值（控制通道的 `shelf-probe`）。
+#: `None` = 照常填 0 / 空串。★ 开着它进商店，界面上哪儿冒出 `777` / `888` /
+#: 「※探针※」，那一格就是哪个字段 —— 一轮实机就能把 §21 的三个 ❓ 填掉。
+SHELF_PROBE_ON = False
 
 # ---------------------------------------------------------------------------
 # 关卡内换图（走到地图最右边 -> 传送到下一张地图），FINDINGS §111。
@@ -601,7 +639,10 @@ GCP_NAMES = {
     # ⚠⚠ **同号反向**：服务端方向的 `0x0505` 是 `gspRepCompositionList`
     #    （合成配方清单，V0.3商店 §4）。回显 = 把配方表发成伤害统计。
     0x0505: "gcpAccumulatedWeaponDamage",
-    # -- 商店 / 合成 / 仓库段（V0.3商店 §4）。现在只监听不应答，见 M4 -------
+    # -- 商店 / 合成 / 仓库段（V0.3商店 §20 ~ §23）-------------------------
+    # ⚠⚠ **同号反向**：服务端方向的 `0x0600` 是 `gspRepMoney`（右上角数据栏）。
+    #    客户端方向的 `0x0600` 是**货架目录请求**，进商店第 1 发（§20）。
+    0x0600: "gcpReqShopItemList",      # ❓ 无 RTTI 类名，裸序列化（0x5592da）
     0x0602: "gcpReqItemBuy",
     0x0603: "rawShopReq0603",          # ❓ 无 RTTI 类名，裸序列化（0x4466d2）
     0x0604: "rawEquipItem",            # ❓ 同上（0x446f5b，ret 8）
@@ -9577,30 +9618,26 @@ class Conn:
             self.on_shop_probe(opcode, payload)
 
     def on_shop_probe(self, opcode, payload):
-        """商店 / 合成 / 仓库段的**监听器**（V0.3商店 M4 第一步）。
+        """商店 / 合成 / 仓库段的入口：**先照旧记一笔，再看要不要应答**。
 
-        ★★ **故意什么都不回。** 整段协议是从反汇编逆出来的，一发都没在线上
-        观测过（D1 认下的代价）。这一步只回答三个问题：客户端**到底发不发**、
-        **发的顺序**是不是 `ShopStage` ctor 里那个、**载荷长什么样**。
-        先回一个猜的应答，就把「客户端本来会怎么样」这个基线弄脏了。
+        ★ 监听那一半保留着（M4 第一步留下的）—— 下行还是 🔍静态，实机出问题
+        时第一手证据就是这些行。★ 同时写一份进 `eventlog`（`logs/online.log`）：
+        `server.out` 每次启动都会被覆盖，而实机观测丢了要重进一次游戏才能再采。
 
-        ⚠ **不回的后果本身就是要观测的东西**：商店界面可能空着、可能一直转圈、
-        也可能直接崩。看到什么记什么，别替客户端解释。
-
-        ★ 同时写一份进 `eventlog`（`logs/online.log`）—— `server.out` 每次
-        启动都会被覆盖，而这批是一次性的实机观测，丢了要重进一次游戏才能再采。
+        ⚠ **`0x0700` 不在应答之列** —— 它不是商店专用的（`0x5541c1` 有 6 个
+        调用点，大厅和房间也发），拿它触发货架下发会在大厅里乱发 `0x0500`。
         """
         shape, expected = SHOP_PROBE_NOTES.get(opcode, ("❓未查", "❓未查"))
         name = GCP_NAMES.get(opcode, "?")
         if opcode in SHOP_ENTRY_OPCODES:
-            step = f"进商店第 {SHOP_ENTRY_OPCODES.index(opcode) + 1}/4 发；"
+            step = (f"进商店第 {SHOP_ENTRY_OPCODES.index(opcode) + 1}/"
+                    f"{len(SHOP_ENTRY_OPCODES)} 发；")
         else:
             step = ""
-        head = (f"[shop-probe] 0x{opcode:04x} {name} 载荷 {len(payload)} 字节；"
-                f"{step}静态形状「{shape}」；期望应答 {expected}"
-                f"  ★ M4 第一步只监听，不回")
+        head = (f"[shop] 0x{opcode:04x} {name} 载荷 {len(payload)} 字节；"
+                f"{step}形状「{shape}」；期望应答 {expected}")
         self.log(head + (f"\n{hexdump(payload)}" if payload else ""))
-        # 顺手按 int32 切一刀。静态推出来的形状不一定对，先把原始数字摆出来
+        # 顺手按 int32 切一刀。逆出来的形状不一定对，先把原始数字摆出来
         # —— 对不上的时候，这一行比 hexdump 更快看出「到底是几个 int」。
         reader = Reader(payload)
         ints = []
@@ -9608,6 +9645,79 @@ class Conn:
             ints.append(reader.i32())
         self.log(f"   int32 切分: {ints}（尾部剩 {reader.left()} 字节）")
         eventlog.online(f"{head} hex={payload.hex()}")
+
+        if opcode == OP_REQ_SHOP_ITEM_LIST:
+            self.on_req_shop_item_list(payload)
+        elif opcode == OP_REQ_EQUIPPED_LIST:
+            self.send_rep_equipped_list(reason="（进商店）")
+        elif opcode == OP_REQ_GIFT_LIST:
+            self.send_rep_gift_list()
+
+    def shop_reply_off(self, opcode, what):
+        """这一发被 `shop-reply` 关掉了吗。关掉时记一行，免得日志里像是漏发。"""
+        if SHOP_REPLY_ENABLED.get(opcode, True):
+            return False
+        self.log(f"   ✗ {what}（0x{opcode:04x}）被 shop-reply 关掉了，本次不回")
+        return True
+
+    def on_req_shop_item_list(self, payload):
+        """客户端方向的 `0x0600` —— 货架目录请求，回 `0x0500`（V0.3商店 §20/§21）。
+
+        ⚠⚠ **别和服务端方向的 `0x0600 gspRepMoney` 搞混**，那是右上角数据栏。
+
+        ★ 不回的后果是**客户端每 10 秒重发一次**（`[ShopStage+0x144]` 的节流
+        只有收到 `0x0500` 才清）—— 实机日志里那三发间隔 10 秒的 `0x0600`
+        就是这么来的，别当成客户端在抽风。
+
+        ★ 价格 / 上架与否**只信 `shop.json`**，包里的任何数值都不作数（PLAN M5）。
+        """
+        if self.shop_reply_off(OP_REP_SHOP_ITEM_LIST, "货架目录"):
+            return
+        try:
+            request = shop.parse_shop_list_request(payload)
+        except ValueError as error:
+            self.log(f"   ✗ 货架请求解不开: {error}")
+            return
+        body, shown, warnings = shop.shelf_page(
+            request.category, request.page, request.character,
+            probe=shop.SHELF_PROBE if SHELF_PROBE_ON else None)
+        for warning in warnings:
+            self.log(f"   ⚠ shop.json: {warning}")
+        labels = [f"{entry['id']}×{entry['price']}" for entry in shown]
+        self.log(f"← 回 0x0500 货架 {request!r} → {len(shown)} 件 {labels}")
+        self.send(build_game(OP_REP_SHOP_ITEM_LIST, body))
+
+    def send_rep_equipped_list(self, reason=""):
+        """回 `0x0604 gspRepEquippedList` —— 商店 / 仓库界面里的「我有什么」。
+
+        ★ **和 `0x030b` 是两条独立的路**（§23）：这一发只落到
+        `[ShopStage+0x134/0x138]`，只影响商店界面的显示；**战斗加成的唯一来源
+        仍然是 `0x030b`**。改了装备两发都要发。
+
+        ⚠ 客户端对**自己表里查不到的 id** 会收集起来弹提示框（`0x447406`）
+        ⇒ 发之前过一遍 `shopdata.ownable()`。商城角色那批 9 位 id
+        （`character_item_ids`）**不往这儿发** —— 它们是给 `0x030b` 的角色
+        持有判定用的，不是商店界面的持有物。
+        """
+        if self.shop_reply_off(OP_REP_EQUIPPED_LIST, "装备清单"):
+            return
+        owned = shop.displayable_items(owned_item_ids(self.account))
+        self.log(f"← 回 0x0604 装备清单 {len(owned)} 件"
+                 f"（穿着 {equipped_items(self.account)}）{reason}")
+        self.send(build_game(OP_REP_EQUIPPED_LIST,
+                             shop.build_rep_equipped_list(owned)))
+
+    def send_rep_gift_list(self):
+        """回 `0x0508 gspRepGiftList` 空清单。
+
+        本版不做礼物系统（PLAN「本版不做」），但**空清单还是要回** ——
+        「界面等一个永远不来的应答」和「界面收到了空清单」是两种现象，
+        不回的话下次实机看到礼物页转圈，还得先排除是不是我们没回。
+        """
+        if self.shop_reply_off(OP_REP_GIFT_LIST, "礼物清单"):
+            return
+        self.log("← 回 0x0508 礼物清单（空，本版不做礼物）")
+        self.send(build_game(OP_REP_GIFT_LIST, shop.build_rep_gift_list()))
 
     def on_ctrl_packet(self, payload):
         self.log(f"★ 控制包(0xFE) 载荷 {len(payload)} 字节\n{hexdump(payload)}")
@@ -9871,6 +9981,19 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
                                   ★ 加成是**客户端**查本地 EquipBonus.ini 算的，
                                   服务端只下发 itemId；而且攻/防加成只有 15%
                                   概率触发，要看效果优先挑 Hp（100% 生效的加法）
+  shop-reply [on|off <opcode>]    商店界面那三发应答的**总闸**，不带参数就看现状。
+                                  opcode 写 0500（货架）/ 0604（装备清单）/
+                                  0508（礼物清单）。★ 下行三发全是静态逆出来的，
+                                  实机万一界面不对，关掉一发再进一次商店就能
+                                  二分到是哪一发 —— 不用改代码、不用重启
+  shelf-probe [on|off]            把货架包里三个**还没查明**的字段填成
+                                  777 / ※探针※ / 888（§21）。开着它进商店，
+                                  界面上哪儿冒出这几个值，那一格就是哪个字段。
+                                  ★ 客户端 10 秒重发一次货架请求，所以人在
+                                  商店里的时候开关它也来得及生效
+  shelf [分类] [页] [角色]        不进游戏也能看「货架这一页会发什么」。
+                                  分类写 0 = 全部、60001 = 武器槽1（十六进制，
+                                  见 FINDINGS §22）；角色 0/1/2，省略 = 不限
   help                            这段
 """
 
@@ -9967,6 +10090,52 @@ def _dispatch_control_command(line):
             return "ok 当前没有活动连接"
         return "ok " + "; ".join(
             f"#{c.seq} {c.account_name or '(未登录)'}" for c in conns)
+
+    # -- 商店（V0.3商店 M4 第 2 步）：这两条不需要连接 ----------------------
+    if cmd == "shop-reply":
+        if len(words) == 1:
+            return "ok " + "；".join(
+                f"0x{op:04x} {'开' if on else '关'}"
+                for op, on in sorted(SHOP_REPLY_ENABLED.items()))
+        if len(words) < 3 or words[1].lower() not in ("on", "off"):
+            return "err 用法: shop-reply [on|off <opcode>]"
+        try:
+            opcode = int(words[2], 16)
+        except ValueError:
+            return f"err opcode 要写十六进制，收到 {words[2]!r}"
+        if opcode not in SHOP_REPLY_ENABLED:
+            return ("err 只认 " + " / ".join(f"{op:04x}"
+                                             for op in sorted(SHOP_REPLY_ENABLED)))
+        SHOP_REPLY_ENABLED[opcode] = words[1].lower() == "on"
+        return (f"ok 0x{opcode:04x} 现在"
+                f"{'开' if SHOP_REPLY_ENABLED[opcode] else '关'}"
+                "（下一次进商店生效，不用重启）")
+
+    if cmd == "shelf-probe":
+        global SHELF_PROBE_ON
+        if len(words) > 1:
+            if words[1].lower() not in ("on", "off"):
+                return "err 用法: shelf-probe [on|off]"
+            SHELF_PROBE_ON = words[1].lower() == "on"
+        return ("ok 探针%s（下一次货架请求生效；客户端有 10 秒节流，"
+                "在商店界面里等一会儿或者点一下标签就会重发）"
+                % ("开：" + repr(shop.SHELF_PROBE) if SHELF_PROBE_ON else "关"))
+
+    if cmd == "shelf":
+        category = int(words[1], 16) if len(words) > 1 else 0
+        page = int(words[2], 0) if len(words) > 2 else 0
+        character = int(words[3], 0) if len(words) > 3 else shop.CHARACTER_ANY
+        body, shown, warnings = shop.shelf_page(
+            category, page, character,
+            probe=shop.SHELF_PROBE if SHELF_PROBE_ON else None)
+        lines = [f"ok 分类 {category:#x} 第 {page} 页；包体 {len(body)} 字节"]
+        lines += [f"  ⚠ {w}" for w in warnings]
+        for entry in shown:
+            lines.append("  %s  %d 金币"
+                         % (_item_label(entry["id"]), entry["price"]))
+        if not shown:
+            lines.append("  （这一页没有商品）")
+        return "\n".join(lines)
 
     # -- 房间（里程碑 I）：这几条不需要连接，放在 pick_conn 之前 ------------
     if cmd == "rooms":

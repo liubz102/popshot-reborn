@@ -271,7 +271,8 @@ function Get-ServerSourceFile([string]$Root) {
                         'simple.py', 'udpsync.py', 'bot.py', 'botsync.py',
                         'botmove.py', 'botnav.py', 'mapdata.py', 'weapondata.py',
                         'ballistics.py', 'chrprops.py',
-                        'bothp.py', 'botarms.py', 'botaim.py', 'botthreat.py')) {
+                        'bothp.py', 'botarms.py', 'botaim.py', 'botthreat.py',
+                        'shop.py', 'shopcfg.py', 'shopdata.py')) {
         if ($files -notcontains $must) { throw "server\$must 没被选中，打包脚本的过滤规则坏了" }
     }
     return $files

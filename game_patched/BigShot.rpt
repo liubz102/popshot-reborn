@@ -288,3 +288,55 @@ Address   Frame
 75ECFCC9  0019FF80  BaseThreadInitThunk+19
 772B82AE  0019FFDC  RtlGetAppContainerNamedObjectPath+11E
 772B827E  0019FFEC  RtlGetAppContainerNamedObjectPath+EE
+
+
+
+==================   logged at 09/05/26, 05:52:01    ==========================
+
+Version: 311
+Dump File Name: D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\Dump\BigShotV0311N009.mdmp
+Exception code: C0000005 ACCESS_VIOLATION
+Fault address:  005CEDC9 01:001CDDC9 D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+
+Registers:
+EAX:0019ED58
+EBX:FFFFFFFF
+ECX:00000100
+EDX:00000000
+ESI:00000100
+EDI:0019EF68
+CS:EIP:0023:005CEDC9
+SS:ESP:002B:0019ED44  EBP:0019EF78
+DS:002B  ES:002B  FS:0053  GS:002B
+Flags:00210216
+
+Call stack:
+Address   Frame
+005CEDC9  0019EF78  0001:001CDDC9 D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+005BD018  0019EFC0  0001:001BC018 D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+00424B53  0019F550  0001:00023B53 D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+0040F0CC  0019F5DC  0001:0000E0CC D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+75F01C0B  0019F608  AddClipboardFormatListener+4B
+75EF82CA  0019F6F0  GetClassLongW+83A
+75EF7EE0  0019F754  GetClassLongW+450
+75EFC3AF  0019F790  CallNextHookEx+19F
+77E956CD  0019F81C  KiUserCallbackDispatcher+4D
+75EFC52E  0019F858  PeekMessageW+DE
+5CA0E70F  0019F8AC  Ordinal107+6ADF
+5CA0DD9C  0019F8C8  Ordinal107+616C
+5CA0DB9C  0019F8E4  Ordinal107+5F6C
+5C979AC0  0019F900  UninitializeLocalHtmlEngine+7A150
+5D8EA406  0019F924  SetQueryNetSessionCount+41A6
+5D8EA0D7  0019F948  SetQueryNetSessionCount+3E77
+5D8E29DE  0019F974  Ordinal319+261E
+75F01C0B  0019F9A0  AddClipboardFormatListener+4B
+75EF82CA  0019FA88  GetClassLongW+83A
+75EF7EE0  0019FAEC  GetClassLongW+450
+75EFC3AF  0019FB28  CallNextHookEx+19F
+77E956CD  0019FB7C  KiUserCallbackDispatcher+4D
+0040D9C7  0019FE20  0001:0000C9C7 D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+0040A68E  0019FE48  0001:0000968E D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+005F7B9E  0019FF70  0001:001F6B9E D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+7609FCC9  0019FF80  BaseThreadInitThunk+19
+77E882AE  0019FFDC  RtlGetAppContainerNamedObjectPath+11E
+77E8827E  0019FFEC  RtlGetAppContainerNamedObjectPath+EE

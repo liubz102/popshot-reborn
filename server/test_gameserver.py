@@ -112,7 +112,10 @@ from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_STEP, LEVEL_MAX,
                            owned_characters, quest_cleared_difficulty,
                            quest_difficulty_records)
 import gameserver
+import shop
 import shopcfg
+from test_shop import (parse_rep_equipped_list, parse_shop_item_list,
+                       shop_config)
 
 
 class GameServerPacketTests(unittest.TestCase):
@@ -2960,77 +2963,167 @@ class MaterialDropTests(unittest.TestCase):
 
 
 class ShopProbeTests(unittest.TestCase):
-    """商店 / 合成 / 仓库段的监听器（V0.3商店 M4 第一步）。
+    """商店 / 合成 / 仓库段（V0.3商店 M4 第 2 步 —— 开始回包）。
 
-    ★ 这一步的**全部意义**是「只看不动」：整段协议是静态逆出来的，
-    先回一个猜的应答就把「客户端本来会怎么样」这个基线弄脏了。
-    所以这组用例里最重要的一条是 `test_the_probe_answers_nothing`。
+    ★ 这一组守的是**「谁回、谁不回」**这条线：下行三发全是静态逆出来的，
+    多回一发就可能把界面弄崩，少回一发就是界面空着。哪一发该回、哪一发
+    坚决不回（`0x0700` 不是商店专用的），都在这儿钉死。
     """
 
     Args = CharacterUnlockTests.Args
 
     def setUp(self):
-        # 监听器**故意**把每一发都写进 `logs/online.log`（那份不会被覆盖），
+        # 这一段**故意**把每一发都写进 `logs/online.log`（那份不会被覆盖），
         # 但跑测试时那是纯噪音 —— 把它掐掉，只留 `conn.logged` 供断言。
         saved = gameserver.eventlog.online
         gameserver.eventlog.online = lambda _msg: None
         self.addCleanup(setattr, gameserver.eventlog, "online", saved)
 
-    def make_conn(self):
-        conn = CharacterUnlockTests.make_conn(self)
+    def make_conn(self, account=None):
+        conn = CharacterUnlockTests.make_conn(self, account)
         conn.accounts = None
         return conn
 
-    def test_the_probe_answers_nothing(self):
-        # ★★ 这条一旦红了，说明有人给这段加了应答 —— 那就不再是 M4 第一步了，
-        #    要么去更新 PLAN，要么把应答挪到第二步去。
+    @staticmethod
+    def opcodes_of(conn):
+        return [take_frame(bytearray(frame))[1] for frame in conn.sent]
+
+    def test_only_three_of_the_uplink_packets_get_an_answer(self):
+        # ★★ 这条一旦红了，说明有人给这段加了 / 减了应答。改之前先想清楚
+        #    「多回一发会不会把界面弄崩」—— 下行仍然是 🔍静态（§21 / §23）。
+        answered = {}
         for opcode in gameserver.SHOP_PROBE_OPCODES:
             conn = self.make_conn()
-            gameserver.Conn.on_game_packet(conn, opcode, b"\x01\x00\x00\x00")
-            self.assertEqual([], conn.sent, hex(opcode))
+            payload = (shop.build_shop_list_request()
+                       if opcode in (gameserver.OP_REQ_SHOP_ITEM_LIST,
+                                     gameserver.OP_REQ_COMPOSITION_LIST)
+                       else b"")
+            gameserver.Conn.on_game_packet(conn, opcode, payload)
+            answered[opcode] = self.opcodes_of(conn)
+        self.assertEqual(
+            {gameserver.OP_REQ_SHOP_ITEM_LIST: [gameserver.OP_REP_SHOP_ITEM_LIST],
+             gameserver.OP_REQ_EQUIPPED_LIST: [gameserver.OP_REP_EQUIPPED_LIST],
+             gameserver.OP_REQ_GIFT_LIST: [gameserver.OP_REP_GIFT_LIST],
+             # 合成配方清单（`0x0505`）是 M7 的活，现在还不回。
+             gameserver.OP_REQ_COMPOSITION_LIST: [],
+             # ★ `0x0700` 大厅和房间也发（`0x5541c1` 有 6 个调用点）——
+             #   拿它触发货架下发会在大厅里乱发 `0x0500`。
+             gameserver.OP_REQ_SHOP_ENTER: [],
+             gameserver.OP_REQ_ITEM_BUY: [],
+             gameserver.OP_REQ_SHOP_UNKNOWN_0603: [],
+             gameserver.OP_REQ_EQUIP_ITEM: [],
+             gameserver.OP_REQ_COMPOSE_ITEM: []},
+            answered)
+
+    def test_the_shelf_reply_carries_the_listed_items(self):
+        with shop_config(items=[{"id": 1120041, "name": "左轮 R1",
+                                 "listed": True, "price": 3000},
+                                {"id": 1120051, "name": "没上架的",
+                                 "listed": False, "price": 999}]):
+            conn = self.make_conn()
+            gameserver.Conn.on_game_packet(
+                conn, gameserver.OP_REQ_SHOP_ITEM_LIST,
+                shop.build_shop_list_request(category=0))
+        opcode, body = take_frame(bytearray(conn.sent[0]))[1:3]
+        self.assertEqual(gameserver.OP_REP_SHOP_ITEM_LIST, opcode)
+        pages, page, groups = parse_shop_item_list(body)
+        self.assertEqual((1, 0), (pages, page))
+        self.assertEqual([[(1120041, "左轮 R1", 3000)]], groups)
+
+    def test_a_malformed_shelf_request_is_dropped_not_guessed(self):
+        # 长度不对就是我们把线格式记错了（§19 记错过一次）。宁可不回 ——
+        # 客户端会 10 秒后重发，日志里那一行足够定位。
+        conn = self.make_conn()
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_REQ_SHOP_ITEM_LIST,
+                                       b"\x00\x01\x02")
+        self.assertEqual([], conn.sent)
+        self.assertIn("货架请求解不开", "\n".join(conn.logged))
+
+    def test_the_equipped_list_only_carries_items_the_client_knows(self):
+        account = {"level": 1, "experience": 0, "money": 0, "character": 0,
+                   "inventory": {"1120041": {"count": 1},
+                                 "1510001": {"count": 1}},   # 只有货架，进不了背包
+                   "equipped": [1120041]}
+        conn = self.make_conn(account)
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_REQ_EQUIPPED_LIST, b"")
+        opcode, body = take_frame(bytearray(conn.sent[0]))[1:3]
+        self.assertEqual(gameserver.OP_REP_EQUIPPED_LIST, opcode)
+        self.assertEqual([1120041], parse_rep_equipped_list(body))
+
+    def test_the_gift_list_is_answered_empty_not_ignored(self):
+        # 不做礼物系统 ≠ 不回：「等一个永远不来的应答」和「收到了空清单」
+        # 是两种现象，下次实机看到礼物页转圈时不用再排除我们这一侧。
+        conn = self.make_conn()
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_REQ_GIFT_LIST, b"")
+        opcode, body = take_frame(bytearray(conn.sent[0]))[1:3]
+        self.assertEqual(gameserver.OP_REP_GIFT_LIST, opcode)
+        self.assertEqual(b"\x00\x00\x00\x00", body)
+
+    def test_shop_reply_can_switch_one_answer_off_without_a_restart(self):
+        # 实机万一界面不对，这条命令是二分工具（改代码要重启，改它不用）。
+        self.addCleanup(gameserver.SHOP_REPLY_ENABLED.update,
+                        dict(gameserver.SHOP_REPLY_ENABLED))
+        reply = gameserver.handle_control_command(
+            "shop-reply off %04x" % gameserver.OP_REP_GIFT_LIST)
+        self.assertTrue(reply.startswith("ok"), reply)
+        conn = self.make_conn()
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_REQ_GIFT_LIST, b"")
+        self.assertEqual([], conn.sent)
+        self.assertIn("shop-reply", "\n".join(conn.logged))
 
     def test_the_probe_logs_the_payload(self):
         conn = self.make_conn()
         gameserver.Conn.on_shop_probe(conn, gameserver.OP_REQ_ITEM_BUY,
                                       bytes.fromhex("01000000" + "29111100"))
         text = "\n".join(conn.logged)
-        self.assertIn("shop-probe", text)
+        self.assertIn("[shop]", text)
         self.assertIn("0x0602", text)
-        # 静态形状不一定对 ⇒ 原始的 int32 切分必须照打，别只留一句「解不出来」。
+        # 逆出来的形状不一定对 ⇒ 原始的 int32 切分必须照打，别只留一句「解不出来」。
         self.assertIn("int32 切分: [1, 1118505]", text)
 
     def test_an_empty_payload_does_not_produce_an_empty_hexdump(self):
         conn = self.make_conn()
-        gameserver.Conn.on_shop_probe(conn, gameserver.OP_REQ_EQUIPPED_LIST, b"")
+        gameserver.Conn.on_shop_probe(conn, gameserver.OP_REQ_SHOP_ENTER, b"")
         self.assertIn("载荷 0 字节", conn.logged[0])
         self.assertNotIn("0000  ", conn.logged[0])
 
-    def test_the_four_entry_requests_are_in_the_order_the_client_sends_them(self):
+    def test_the_entry_requests_are_in_the_order_the_client_sends_them(self):
         # ShopStage ctor `0x444009`~`0x44402c` 是顺序调用的，日志按这个顺序
-        # 标「第 N/4 发」，对不上就没法一眼看出客户端是不是四发都发了。
-        self.assertEqual((0x0704, 0x0605, 0x0607, 0x0700),
+        # 标「第 N/5 发」，对不上就没法一眼看出客户端是不是五发都发了。
+        # ★ 打头那发 `0x0600` 会话 03 漏掉了（它没进这张表，只落在通用包
+        #   日志里），害得「货架走哪个 opcode」多悬了一整轮 —— 钉死顺序。
+        self.assertEqual((0x0600, 0x0704, 0x0605, 0x0607, 0x0700),
                          gameserver.SHOP_ENTRY_OPCODES)
         conn = self.make_conn()
-        for i, opcode in enumerate(gameserver.SHOP_ENTRY_OPCODES, 1):
+        for opcode in gameserver.SHOP_ENTRY_OPCODES:
             gameserver.Conn.on_shop_probe(conn, opcode, b"")
         text = "\n".join(conn.logged)
-        for i in range(1, 5):
-            self.assertIn(f"进商店第 {i}/4 发", text)
+        for index in range(1, len(gameserver.SHOP_ENTRY_OPCODES) + 1):
+            self.assertIn(f"进商店第 {index}/5 发", text)
 
-    def test_every_probe_opcode_has_a_name_and_a_note(self):
-        # 日志是这一步唯一的产出，缺一句说明就等于少采一条数据。
+    def test_every_shop_opcode_has_a_name_and_a_note(self):
+        # 日志是实机唯一的产出，缺一句说明就等于少采一条数据。
         for opcode in gameserver.SHOP_PROBE_OPCODES:
             self.assertIn(opcode, gameserver.GCP_NAMES, hex(opcode))
             self.assertIn(opcode, gameserver.SHOP_PROBE_NOTES, hex(opcode))
 
-    def test_the_probe_does_not_steal_an_opcode_that_is_already_handled(self):
-        # 这批号和已有分支重号的话，重号的那个功能会被静默吞掉。
+    def test_the_shop_opcodes_do_not_collide_with_another_client_branch(self):
+        """这批号被别的**客户端方向**分支占了的话，那个功能会被静默吞掉。
+
+        ★ **服务端方向的同号不算** —— `0x0600` 是 `gspRepMoney`、`0x0604` 是
+          `gspRepEquippedList`，方向不同，压根不走同一条分发链
+          （`re/packet_api.md` §1.5 同号反向表）。
+        """
+        mine = tuple(name for name in vars(gameserver)
+                     if name.startswith(("OP_REQ_SHOP_", "OP_REQ_ITEM_BUY",
+                                         "OP_REQ_EQUIP_ITEM", "OP_REQ_COMPOS",
+                                         "OP_REQ_GIFT_LIST",
+                                         "OP_REQ_EQUIPPED_LIST")))
+        server_direction = ("OP_REP_MONEY", "OP_REP_EQUIPPED_LIST",
+                            "OP_REP_SHOP_ITEM_LIST", "OP_REP_GIFT_LIST")
         handled = {value for name, value in vars(gameserver).items()
                    if name.startswith("OP_") and isinstance(value, int)
-                   and not name.startswith(("OP_REQ_ITEM_BUY",
-                                            "OP_REQ_SHOP_", "OP_REQ_EQUIP_ITEM",
-                                            "OP_REQ_COMPOS", "OP_REQ_GIFT_LIST",
-                                            "OP_REQ_EQUIPPED_LIST"))}
+                   and name not in mine and name not in server_direction}
         for opcode in gameserver.SHOP_PROBE_OPCODES:
             self.assertNotIn(opcode, handled, hex(opcode))
 
