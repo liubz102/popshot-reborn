@@ -8,6 +8,7 @@
 import http.cookiejar
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -150,6 +151,11 @@ class AdminAuthTests(_AdminCase):
         # HttpOnly / SameSite 都不是 cookielib 的一等字段，从原始属性里翻。
         self.assertIn("HttpOnly", cookies[0]._rest)
         self.assertEqual("/admin", cookies[0].path)
+        # ★ **有 `expires` 才是持久 cookie** —— 会话 cookie（`expires is None`）
+        #   一关标签页就没了，用户「一小时内重新打开页面该跳过登录页」
+        #   就落空了（D29）。
+        self.assertIsNotNone(cookies[0].expires)
+        self.assertFalse(cookies[0].discard)
 
     def test_a_wrong_password_does_not_log_you_in(self):
         _status, result = self.login(password="nope")
@@ -378,6 +384,22 @@ class AdminAssetTests(_AdminCase):
         _status, html = self.request("/admin")
         self.assertIn('href="/admin/admin.css"', html)
         self.assertIn('src="/admin/admin.js"', html)
+
+    #: `admin.js` 自己 `el.id = "…"` 建出来的节点，html 里当然没有。
+    #: 加控件时如果又多了一个，往这儿补一行，别把下面那条用例关掉。
+    JS_MADE_IDS = {"cfgShown"}
+
+    def test_every_id_the_script_looks_up_exists_in_the_page(self):
+        """★ `$("拼错的id")` 返回 `null`，**浏览器不报错**，只是那个按钮
+        再也不响应 —— 页面看上去好好的，功能悄悄没了。加控件时最容易
+        只改一半（写了 `onclick` 忘了加 `<button>`，或者反过来）。
+        """
+        _status, _h, js = self.fetch("/admin/admin.js")
+        _status, html = self.request("/admin")
+        page_ids = set(re.findall(r'id="([A-Za-z0-9_-]+)"', html))
+        wanted = set(re.findall(r'\$\("([A-Za-z0-9_-]+)"\)',
+                                js.decode("utf-8")))
+        self.assertLessEqual(wanted - self.JS_MADE_IDS, page_ids)
 
     def test_the_atlas_comes_back_as_a_png_once_logged_in(self):
         self.login()
@@ -829,6 +851,50 @@ class AdminSessionStoreTests(unittest.TestCase):
         for token in mine:
             self.assertIsNone(self.sessions.resolve(token))
         self.assertEqual("admin", self.sessions.resolve(others))
+
+    # ------------------------------------------------- 滑动过期（D29）
+    def test_every_request_slides_the_deadline(self):
+        """★ 用户 2026-09-05 要的：**最后一次操作**之后一小时才登出。
+
+        判据是「有请求就算有操作」—— 隔一会儿摸一下，永远不掉线。
+        """
+        token = self.sessions.issue("admin")
+        for _ in range(10):
+            self.now += 59
+            self.assertEqual("admin", self.sessions.resolve(token))
+        self.now += 61
+        self.assertIsNone(self.sessions.resolve(token))
+
+    def test_a_slide_does_not_revive_an_already_expired_token(self):
+        # 过期了就是过期了，续期只对还活着的令牌成立。
+        token = self.sessions.issue("admin")
+        self.now += 61
+        self.assertIsNone(self.sessions.resolve(token))
+        self.now += 1
+        self.assertIsNone(self.sessions.resolve(token))
+
+    def test_sliding_one_token_does_not_touch_another(self):
+        keep = self.sessions.issue("admin")
+        idle = self.sessions.issue("carol")
+        self.now += 59
+        self.assertEqual("admin", self.sessions.resolve(keep))
+        self.now += 2                       # idle 的到期时刻已经过了
+        self.assertEqual("admin", self.sessions.resolve(keep))
+        self.assertIsNone(self.sessions.resolve(idle))
+
+    def test_the_shipped_idle_timeout_is_one_hour(self):
+        # 用户拍板的数。改它之前先确认是用户又说了话，不是谁顺手调的。
+        self.assertEqual(3600, web_admin.SESSION_TTL_SECONDS)
+
+    def test_the_cookie_outlives_the_session_on_purpose(self):
+        """★ cookie 的 `Max-Age` 故意比会话 ttl 长（D29）。
+
+        写成一样的话，「登录后连续操作两小时」到第 60 分钟浏览器会自己
+        把 cookie 丢掉 —— 明明一直在用却被踢出去。cookie 只负责
+        「关掉页面别消失」，真正说了算的是服务端那份滑动到期时刻。
+        """
+        self.assertGreater(web_admin.SESSION_COOKIE_MAX_AGE,
+                           web_admin.SESSION_TTL_SECONDS)
 
 
 if __name__ == "__main__":

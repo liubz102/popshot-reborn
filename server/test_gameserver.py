@@ -114,9 +114,9 @@ from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_STEP, LEVEL_MAX,
 import gameserver
 import shop
 import shopcfg
-from test_shop import (parse_rep_equipped_list, parse_rep_inventory,
-                       parse_rep_item_info, parse_shop_item_list,
-                       shop_config)
+from test_shop import (parse_rep_composition_list, parse_rep_equipped_list,
+                       parse_rep_inventory, parse_rep_item_info,
+                       parse_shop_item_list, recipe_config, shop_config)
 
 
 class GameServerPacketTests(unittest.TestCase):
@@ -3040,12 +3040,16 @@ class ShopProbeTests(unittest.TestCase):
              gameserver.OP_REQ_UNEQUIP_ITEM: [gameserver.OP_REP_EQUIPPED_LIST],
              # 空购物车 -> 回一发失败的 0x0502。
              gameserver.OP_REQ_ITEM_BUY: [gameserver.OP_REP_ITEM_BUY],
-             # 合成配方清单（`0x0505`）是 M7 的活，现在还不回。
-             gameserver.OP_REQ_COMPOSITION_LIST: [],
+             # 合成配方清单。这条用例的 `recipe.json` 是空的 ⇒ 前面那发
+             # `0x0501` 没有定义可发，只剩清单本身。
+             gameserver.OP_REQ_COMPOSITION_LIST:
+                 [gameserver.OP_REP_COMPOSITION_LIST],
              gameserver.OP_REQ_SHOP_UNKNOWN_0603: [],
              # 修理本版不做（`0x0604` 上行 = 用扳手，不是装备，§24）。
              gameserver.OP_REQ_REPAIR_ITEM: [],
-             gameserver.OP_REQ_COMPOSE_ITEM: []},
+             # ★ 合成：空载荷解不开，**还是要回一发**失败的 `0x0506` ——
+             #   不回的话玩家点了确定界面什么都不发生。
+             gameserver.OP_REQ_COMPOSE_ITEM: [gameserver.OP_REP_COMPOSE_ITEM]},
             answered)
 
     #: 真实的武器槽 1 分类（实机点「武器 → 武器1」发的就是它，§22）。
@@ -3479,6 +3483,254 @@ class ShopBuyAndEquipTests(unittest.TestCase):
                   if opcode == gameserver.OP_REP_EQUIPPED_LIST]
         self.assertEqual([self.REVOLVER_R1],
                          sorted(parse_rep_equipped_list(bodies[0])))
+
+
+class ShopComposeTests(unittest.TestCase):
+    """`0x0605` 配方列表 / `0x0606` 合成（V0.3商店 M7，协议见 §27 / §33）。
+
+    ★ 这一组守的是三件事：
+
+    1. **配方列表前面要有物品定义** —— 产物**和每一种材料**都得喂，
+       否则四个材料槽是没名字的空格子（`0x4475ad` 逐条查 ItemDB）；
+    2. **合成是一次原子交易** —— 金币、材料、产物要么一起动要么都不动；
+    3. **结果码要挑对** —— `0x0506` 只认 0/1/2/4 四档，别的一律
+       「未知的错误」，跟没说一样。
+    """
+
+    ARMOR = 1010015              # 上衣，能穿、进得了背包
+    OTHER_ARMOR = 1020001        # 下装（另一个部位，不抢槽）
+    PIPE = 30018                 # 청동파이프 青铜管
+    BEAD = 10001                 # 검은구슬 黑珠
+    Args = CharacterUnlockTests.Args
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = AccountStore(os.path.join(self.tmp.name, "accounts.json"))
+        self.store.register("tester", "pw")
+        saved = gameserver.eventlog.online
+        gameserver.eventlog.online = lambda _msg: None
+        self.addCleanup(setattr, gameserver.eventlog, "online", saved)
+        self.conn = CharacterUnlockTests.make_conn(self)
+        self.conn.accounts = self.store
+        self.conn.account = self.store.get_account("tester")[1]
+
+    # -- 夹具 ---------------------------------------------------------------
+    def account(self):
+        return self.store.get_account("tester")[1]
+
+    def stocked(self, money=10000, materials=None):
+        self.store.add_quest_reward("tester", money=money)
+        self.store.add_materials("tester",
+                                 materials or {self.PIPE: 5, self.BEAD: 5})
+        self.conn.account = self.account()
+
+    def recipe(self, result=None, **over):
+        entry = {"id": 1, "result": result or self.ARMOR, "cost": 500,
+                 "listed": True, "level": 1,
+                 "materials": [{"id": self.PIPE, "count": 2},
+                               {"id": self.BEAD, "count": 1}]}
+        entry.update(over)
+        return entry
+
+    def send(self, opcode, payload):
+        self.conn.sent[:] = []
+        gameserver.Conn.on_game_packet(self.conn, opcode, payload)
+        return [take_frame(bytearray(f))[1:3] for f in self.conn.sent]
+
+    #: 「상의 上衣」标签 —— `ARMOR` 的分类，也是玩家真会点的那一格。
+    #: ★ 别用 `0` 当「全部」：那是「人物 → 英雄」标签的真 id（§22）。
+    TAB = 0x10001
+
+    def ask_list(self, **kw):
+        kw.setdefault("category", self.TAB)
+        return self.send(gameserver.OP_REQ_COMPOSITION_LIST,
+                         shop.build_shop_list_request(**kw))
+
+    def compose(self, item_id):
+        return self.send(gameserver.OP_REQ_COMPOSE_ITEM,
+                         struct.pack("<i", item_id))
+
+    @staticmethod
+    def result_code(frames):
+        for opcode, body in frames:
+            if opcode == gameserver.OP_REP_COMPOSE_ITEM:
+                return struct.unpack("<i", body)[0]
+        raise AssertionError("没有回 0x0506")
+
+    @staticmethod
+    def rules_of(frames):
+        for opcode, body in frames:
+            if opcode == gameserver.OP_REP_COMPOSITION_LIST:
+                return parse_rep_composition_list(body)[2]
+        raise AssertionError("没有回 0x0505")
+
+    # -- 配方列表 -----------------------------------------------------------
+    def test_the_recipe_list_comes_back_with_cost_and_materials(self):
+        with recipe_config([self.recipe()]):
+            frames = self.ask_list()
+        self.assertEqual([{"result": self.ARMOR, "cost": 500,
+                           "materials": [(self.PIPE, 2), (self.BEAD, 1)],
+                           "days": 0}],
+                         self.rules_of(frames))
+
+    def test_the_definitions_cover_the_materials_too(self):
+        """⚠ 处理器 `0x4475ad` 逐条拿**材料**的 id 去查 ItemDB —— 只喂产物的话
+        四个材料槽是没名字的空格子（和 §28 同一条道理）。"""
+        with recipe_config([self.recipe()]):
+            frames = self.ask_list()
+        defined = set()
+        for opcode, body in frames:
+            if opcode == gameserver.OP_REP_ITEM_INFO:
+                defined.update(r["id"] for r in parse_rep_item_info(body)[0])
+        self.assertLessEqual({self.ARMOR, self.PIPE, self.BEAD}, defined)
+        # ★ 定义必须排在配方前面 —— 面板是在收到配方那一刻建的。
+        opcodes = [opcode for opcode, _ in frames]
+        self.assertLess(opcodes.index(gameserver.OP_REP_ITEM_INFO),
+                        opcodes.index(gameserver.OP_REP_COMPOSITION_LIST))
+
+    def test_a_high_level_recipe_is_still_listed_to_a_low_level_player(self):
+        """★★ D27（2026-09-05 实机推翻的那一版）：原版合成**没有等级门** ——
+        面板不读玩家等级，`0x0506` 也没有「等级太低」这一档。假账号是 1 级，
+        配方上写着 99 也照样列出来；穿不穿得上由客户端在**装备**时判。"""
+        self.assertEqual(1, account_store.player_level(self.account()))
+        with recipe_config([self.recipe(level=99)]):
+            self.assertEqual(1, len(self.rules_of(self.ask_list())))
+
+    def test_a_high_level_recipe_can_still_be_composed(self):
+        self.stocked()
+        with recipe_config([self.recipe(level=99)]):
+            frames = self.compose(self.ARMOR)
+        self.assertEqual(shop.COMPOSE_OK, self.result_code(frames))
+
+    def test_an_empty_recipe_table_still_reports_one_page(self):
+        # 总页数发 0 会让客户端把当前页夹成 -1（`0x45efb9`）。
+        with recipe_config([]):
+            frames = self.ask_list()
+        for opcode, body in frames:
+            if opcode == gameserver.OP_REP_COMPOSITION_LIST:
+                self.assertEqual((1, 0, []), parse_rep_composition_list(body))
+
+    def test_a_malformed_list_request_is_not_guessed(self):
+        self.assertEqual([], self.send(gameserver.OP_REQ_COMPOSITION_LIST,
+                                       b"\x00\x01\x02"))
+
+    def test_category_zero_is_not_a_wildcard(self):
+        """⚠⚠ `0` 是「人物 → 英雄」标签的真 id（§22）—— 拿它当通配的后果
+        就是 2026-09-05 实机看到的「点英雄结果列出一堆武器」。合成面板同理。"""
+        with recipe_config([self.recipe()]):
+            self.assertEqual([], self.rules_of(self.ask_list(category=0)))
+            self.assertEqual(1, len(self.rules_of(self.ask_list())))
+
+    # -- 合成 ---------------------------------------------------------------
+    def test_composing_takes_the_money_and_materials_and_gives_the_item(self):
+        self.stocked()
+        with recipe_config([self.recipe()]):
+            frames = self.compose(self.ARMOR)
+        self.assertEqual(shop.COMPOSE_OK, self.result_code(frames))
+        account = self.account()
+        self.assertEqual(9500, account_store.player_money(account))
+        self.assertEqual({self.PIPE: 3, self.BEAD: 4},
+                         account_store.material_counts(account))
+        self.assertTrue(account_store.has_item(account, self.ARMOR))
+
+    def test_the_result_packet_comes_last(self):
+        """⚠⚠ 和买东西同一条理由（§30②）：结果框一弹，玩家眼里这笔交易就
+        结束了 —— 那一刻仓库、金币、配方页都得已经是新的。"""
+        self.stocked()
+        with recipe_config([self.recipe()]):
+            self.ask_list()                      # 先让服务端记下当前是哪一页
+            frames = self.compose(self.ARMOR)
+        opcodes = [opcode for opcode, _ in frames]
+        self.assertEqual(gameserver.OP_REP_COMPOSE_ITEM, opcodes[-1])
+        for earlier in (gameserver.OP_REP_INVENTORY, gameserver.OP_REP_MONEY,
+                        gameserver.OP_REP_COMPOSITION_LIST):
+            self.assertIn(earlier, opcodes[:-1])
+
+    def test_the_recipe_page_is_replayed_only_if_the_client_asked_for_one(self):
+        """★ 重放的是客户端**真发过**的那一页 —— 没发过就不发，
+        别自己猜一页塞给它（玩家会被莫名其妙翻到别的分类去）。"""
+        self.stocked()
+        with recipe_config([self.recipe()]):
+            frames = self.compose(self.ARMOR)     # 没先要过配方列表
+        self.assertNotIn(gameserver.OP_REP_COMPOSITION_LIST,
+                         [opcode for opcode, _ in frames])
+
+    def test_the_new_item_is_in_the_inventory_packet(self):
+        # 「合成成功。请在我的仓库里装备道具。」—— 那一刻仓库里就得有它。
+        self.stocked()
+        with recipe_config([self.recipe()]):
+            frames = self.compose(self.ARMOR)
+        bodies = [body for opcode, body in frames
+                  if opcode == gameserver.OP_REP_INVENTORY]
+        self.assertIn(self.ARMOR, [e[0] for e in parse_rep_inventory(bodies[-1])])
+
+    def test_not_enough_materials_changes_nothing(self):
+        self.stocked(materials={self.PIPE: 1})
+        with recipe_config([self.recipe()]):
+            frames = self.compose(self.ARMOR)
+        self.assertEqual(shop.COMPOSE_NO_MATERIAL, self.result_code(frames))
+        account = self.account()
+        self.assertEqual(10000, account_store.player_money(account))
+        self.assertEqual({self.PIPE: 1}, account_store.material_counts(account))
+        self.assertFalse(account_store.has_item(account, self.ARMOR))
+
+    def test_not_enough_money_changes_nothing(self):
+        self.stocked(money=100)
+        with recipe_config([self.recipe()]):
+            frames = self.compose(self.ARMOR)
+        self.assertEqual(shop.COMPOSE_NO_MONEY, self.result_code(frames))
+        self.assertEqual({self.PIPE: 5, self.BEAD: 5},
+                         account_store.material_counts(self.account()))
+
+    def test_composing_something_you_already_have_is_refused(self):
+        self.stocked()
+        self.store.add_item("tester", self.ARMOR)
+        self.conn.account = self.account()
+        with recipe_config([self.recipe()]):
+            frames = self.compose(self.ARMOR)
+        self.assertEqual(shop.COMPOSE_ALREADY_OWNED, self.result_code(frames))
+        self.assertEqual(10000, account_store.player_money(self.account()))
+
+    def test_a_recipe_the_admin_turned_off_cannot_be_composed(self):
+        """⚠ 管理页关掉一条 = 界面上看不到它 —— 那就不该还能靠一发手搓的
+        `0x0606` 合出来。"""
+        self.stocked()
+        with recipe_config([self.recipe(listed=False)]):
+            frames = self.compose(self.ARMOR)
+        self.assertEqual(shop.COMPOSE_UNKNOWN, self.result_code(frames))
+        self.assertFalse(account_store.has_item(self.account(), self.ARMOR))
+
+    def test_an_item_with_no_recipe_at_all_is_refused(self):
+        self.stocked()
+        with recipe_config([self.recipe()]):
+            frames = self.compose(self.OTHER_ARMOR)
+        self.assertEqual(shop.COMPOSE_UNKNOWN, self.result_code(frames))
+
+    def test_a_malformed_compose_packet_still_gets_an_answer(self):
+        """不回 = 玩家点了确定界面**什么都不发生**，比「未知的错误」更难查
+        （购买那边 §30 已经栽过一次）。"""
+        frames = self.send(gameserver.OP_REQ_COMPOSE_ITEM, b"\x01\x02")
+        self.assertEqual([gameserver.OP_REP_COMPOSE_ITEM],
+                         [opcode for opcode, _ in frames])
+        self.assertEqual(shop.COMPOSE_UNKNOWN, self.result_code(frames))
+
+    def test_zero_is_success_so_the_fallback_must_not_be_zero(self):
+        """★★ 这一发和 `0x0502` 极性相反：那边 0 是「未定义的错误」，
+        这边 **0 是「合成成功」** —— 兜底填 0 会让玩家看到「合成成功」
+        然后发现仓库里什么都没有。"""
+        self.stocked()
+        with recipe_config([self.recipe(listed=False)]):
+            self.assertNotEqual(shop.COMPOSE_OK,
+                                self.result_code(self.compose(self.ARMOR)))
+
+    def test_the_cost_comes_from_recipe_json_not_from_the_packet(self):
+        # 上行只有一个产物 id，花费是我们自己查的 ⇒ 管理页改完立刻生效。
+        self.stocked()
+        with recipe_config([self.recipe(cost=7777)]):
+            self.compose(self.ARMOR)
+        self.assertEqual(10000 - 7777,
+                         account_store.player_money(self.account()))
 
 
 class SendBatchTests(unittest.TestCase):

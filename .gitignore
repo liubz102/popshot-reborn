@@ -109,6 +109,8 @@
 /server/data/recipe.json.*.tmp
 /server/data/drops.json
 /server/data/drops.json.*.tmp
+# `shop-backfill apply` 写盘前留下的那一份原件（shopcfg.backfill_defaults）。
+/server/data/*.bak-*
 
 # config\server.config 是**本机玩家自己填的**联机服务器地址（可能是内网 IP 或
 # 私人域名），不进仓库。模板在 server/config.py 的 DEFAULT_CONFIG_TEXT 里：

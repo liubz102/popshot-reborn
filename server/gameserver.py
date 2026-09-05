@@ -548,6 +548,14 @@ OP_REP_ITEM_INFO = 0x0501
 #: 客户端收到就整份换掉背包 `[0x72e41c]` 并重建仓库面板 ⇒ 每次发全量。
 #: ⚠⚠ 和 `OP_REQ_ITEM_INFO` 同号反向。
 OP_REP_INVENTORY = 0x0601
+#: 合成配方列表（`i32 总页数 + i32 当前页 + i32 n + n×CompositionRule`，
+#: 处理器 `0x4474e4`，§27）。
+#: ⚠⚠ **同号反向**：客户端方向的 `0x0505` 是 `gcpAccumulatedWeaponDamage`
+#:    （一局结束时的累计伤害上报）。这两个常量值一样、方向相反。
+OP_REP_COMPOSITION_LIST = 0x0505
+#: 合成结果（单 `i32` 结果码，处理器 `0x4476c4`，§33）。
+#: `0` 成功 / `1` 金币不足 / `2` 材料不足 / `4` 已拥有 / 其余「未知的错误」。
+OP_REP_COMPOSE_ITEM = 0x0506
 
 #: 进商店那五发，按客户端实际的发送顺序排。日志里按这个顺序对号。
 SHOP_ENTRY_OPCODES = (OP_REQ_SHOP_ITEM_LIST, OP_REQ_EQUIPPED_LIST,
@@ -574,7 +582,7 @@ SHOP_PROBE_NOTES = {
     OP_REQ_ITEM_BUY: ("i32 n, n×i32 🔍", "0x0502 gspRepItemBuy"),
     OP_REQ_SHOP_UNKNOWN_0603: ("i32 🔍 卖出", "❓0x0503 是个 bool + 提示框"),
     OP_REQ_REPAIR_ITEM: ("i32 itemId + i32 210003 🔍 修理", "❓（本版不做修理）"),
-    OP_REQ_COMPOSE_ITEM: ("i32 🔍", "0x0506 gspRepComposeItem"),
+    OP_REQ_COMPOSE_ITEM: ("i32 **产物 itemId** 🔍", "0x0506 gspRepComposeItem"),
     OP_REQ_EQUIP_ITEM: ("i32 itemId 🔍 穿上", "0x0604 gspRepEquippedList"),
     OP_REQ_UNEQUIP_ITEM: ("i32 itemId 🔍 脱下", "0x0604 gspRepEquippedList"),
 }
@@ -590,6 +598,8 @@ SHOP_REPLY_ENABLED = {
     OP_REP_ITEM_BUY: True,
     OP_REP_ITEM_INFO: True,
     OP_REP_INVENTORY: True,
+    OP_REP_COMPOSITION_LIST: True,
+    OP_REP_COMPOSE_ITEM: True,
 }
 
 #: 剩下那两个未查明字段（`ShopStock+0x1c`、`0x0502` 第三格）要不要填探针值
@@ -5605,6 +5615,8 @@ class Conn:
     # 版本门禁的两个状态同理（见 __init__ 里的说明）。
     client_version = None
     version_rejected = False
+    # 客户端最后一次要的那一页合成配方，同理（见 __init__ 里的说明）。
+    last_composition_request = None
     # ★ 位置轨迹同理，但它是**每条连接一份的可变对象** —— 类上放一个共享的
     #   deque 会让所有实例往同一条轨迹里写。所以类级默认放一个空元组当哨兵，
     #   `note_sync_position()` 碰到它时现建一个（只有 `Conn.__new__` 造的
@@ -5685,6 +5697,12 @@ class Conn:
         self.my_seat = 0
         # gcpUpdateQuestScore(0x0410) 报上来的累计分数，结算时用。
         self.quest_score = 0
+        # 客户端最后一次要的那一页合成配方（`0x0605` 的载荷）。合成成功之后
+        # 拿它**原样重放**一发 `0x0505`，好让材料槽的「持有量」当场变对
+        # —— 客户端自己不会再要（`0x4476c4` 里没有 `0x447467` 的调用点）。
+        # ★ 存的是客户端**真发过**的请求，不是我们猜的页 —— 猜的话玩家会被
+        #   莫名其妙翻到别的分类去。
+        self.last_composition_request = None
         # 本局是不是通关了。唯一来源是客户端的 0x0417 gcpMarkQuestSuccess ——
         # 打死关底时关卡脚本调 GameContextQuest::vf_e4(1) 发出（0x4a3faa），
         # 实测比 0x040f 早 30 秒到，所以结算时这个标志一定已经就位。
@@ -9734,6 +9752,8 @@ class Conn:
             self.on_req_shop_item_list(payload)
         elif opcode == OP_REQ_EQUIPPED_LIST:
             self.send_rep_equipped_list(reason="（进商店）")
+        elif opcode == OP_REQ_COMPOSITION_LIST:
+            self.on_req_composition_list(payload)
         elif opcode == OP_REQ_GIFT_LIST:
             self.send_rep_gift_list()
         elif opcode == OP_REQ_INVENTORY:
@@ -9742,6 +9762,8 @@ class Conn:
             self.on_req_item_info(payload)
         elif opcode == OP_REQ_ITEM_BUY:
             self.on_req_item_buy(payload)
+        elif opcode == OP_REQ_COMPOSE_ITEM:
+            self.on_req_compose_item(payload)
         elif opcode in (OP_REQ_EQUIP_ITEM, OP_REQ_UNEQUIP_ITEM):
             self.on_req_equip_item(opcode, payload)
 
@@ -9959,6 +9981,122 @@ class Conn:
                  f" 共 {total} 金币，余额 {player_money(self.account)}")
         self.send(build_game(OP_REP_ITEM_BUY,
                              shop.build_rep_item_buy(True, 0, probe)))
+
+    def on_req_composition_list(self, payload):
+        """客户端方向的 `0x0605` —— 合成配方列表请求，回 `0x0505`（§27）。
+
+        ★ 载荷和货架请求 `0x0600` **一模一样**（角色 / 分类 / 页 / 排序），
+        所以解包直接复用 `parse_shop_list_request`。
+
+        ⚠⚠ **同号反向**：服务端方向的 `0x0505` 是 `gcpAccumulatedWeaponDamage`
+           （一局结束时的累计伤害上报）。这里说的是服务端**发**的那一边。
+        """
+        try:
+            request = shop.parse_shop_list_request(payload)
+        except ValueError as error:
+            self.log(f"   ✗ 配方列表请求解不开: {error}")
+            return
+        # ★ 记下来，合成成功之后原样重放一发（见 `on_req_compose_item`）。
+        self.last_composition_request = request
+        self.send_rep_composition_list(request)
+
+    def send_rep_composition_list(self, request, reason=""):
+        """发 `0x0505 gspRepCompositionList` —— 合成面板的唯一数据源。
+
+        ★ **先补定义再发配方**（D20）：处理器 `0x4474e4` 逐条拿产物
+        `rule+4` **和每一种材料** `mat+4` 去查 ItemDB（`0x447575` / `0x4475bf`），
+        查不到就攒起来发一发 `0x0601`（用途标志 3）。不先喂定义 = 产物没名字、
+        四个材料槽是空的。
+
+        ⚠ **不按等级过滤**（D27）—— 原版的合成面板不看等级，上架的配方
+        谁都看得到；装备的等级门槛在**穿的时候**由客户端自己判。
+        """
+        if self.shop_reply_off(OP_REP_COMPOSITION_LIST, "合成配方"):
+            return
+        body, shown, warnings = shop.composition_page(
+            request.category, request.page, request.character,
+            order=request.flag)
+        for warning in warnings:
+            self.log(f"   ⚠ recipe.json: {warning}")
+        self.send_item_definitions(shop.composition_item_ids(shown),
+                                   reason="（合成配方要用）")
+        labels = [f"{r['result']}×{r.get('cost', 0)}" for r in shown]
+        self.log(f"← 回 0x0505 合成配方 {request!r}"
+                 f" → {len(shown)} 条 {labels}{reason}")
+        self.send(build_game(OP_REP_COMPOSITION_LIST, body))
+
+    def on_req_compose_item(self, payload):
+        """客户端方向的 `0x0606` —— 合成，回 `0x0506`（§27 / §33）。
+
+        ⚠⚠ **载荷里那个 i32 是产物 itemId，不是配方号**
+        （`0x45d738: push [rule+4]`）⇒ 一个产物只能有一条配方，
+        `shopcfg.validate_recipes` 会拒收撞车的 `recipe.json`。
+
+        ★ **原版没有成功率**（合成界面上没有任何概率控件，§7 / 铁律 12）——
+        校验过了就一定成。
+
+        ★ **扣钱 / 扣材料 / 入库是一次原子交易**（`AccountStore.compose_item`）：
+        拆成三步的话中间崩一次就是「金币和材料没了、东西没到手」。
+        这里 `check_compose` 那一轮只为**挑错误码** —— 客户端的失败框只认
+        金币不足 / 材料不足 / 已拥有三种说法，别的一律「未知的错误」。
+
+        ⚠⚠ **成功时的顺序是硬要求**（和买东西同一条理由，§30②）：
+        仓库 `0x0601`、金币 `0x0600`、配方列表 `0x0505` 都排在结果
+        `0x0506` **前面** —— 结果框一弹，玩家眼里这笔交易就结束了，
+        那一刻界面必须已经是新的。
+        """
+        if self.shop_reply_off(OP_REP_COMPOSE_ITEM, "合成结果"):
+            return
+
+        def refuse(why, reason=None):
+            code = shop.compose_reason_code(reason)
+            self.log(f"← 回 0x0506 合成失败（{why}）→ 界面结果码 {code}")
+            self.send(build_game(OP_REP_COMPOSE_ITEM,
+                                 shop.build_rep_compose_item(code)))
+
+        try:
+            item_id = shop.parse_compose_request(payload)
+        except ValueError as error:
+            # ★ 解不开也回一发。不回 = 玩家点了确定之后界面**什么都不发生**，
+            #   比「未知的错误」更难查（那正是 §30 在购买那边踩过的坑）。
+            return refuse(f"请求解不开: {error}")
+
+        if self.accounts is None:
+            return refuse("没有存档层，合不了")
+        table, warnings = shopcfg.recipes()
+        for warning in warnings:
+            self.log(f"   ⚠ recipe.json: {warning}")
+        recipe, why = shop.check_compose(
+            item_id, table, set(owned_item_ids(self.account)),
+            player_money(self.account), material_counts(self.account))
+        if why is not None:
+            return refuse(f"{_item_label(item_id)}: {why}", why)
+        need = shop.recipe_material_map(recipe)
+        cost = int(recipe.get("cost", 0))
+        try:
+            self.account = self.accounts.compose_item(
+                self.account_name, recipe["result"], cost, need)
+        except AccountError as error:
+            # 走到这儿 = 上面那轮校验和存档层看到的不是同一份数据（同一个号
+            # 开了两个客户端，或者 recipe.json 刚被管理页改过）。原因码照存档层
+            # 说的挑 —— 它才是真正说了算的那一层。
+            self.log(f"   ✗ 合成 {_item_label(item_id)} 被存档层拒绝: "
+                     f"{error.message}")
+            return refuse(f"存档层拒绝: {error.message}", error.code)
+        self.log(f"   合成 {_item_label(recipe['result'])} 成功；"
+                 f"花掉 {cost} 金币 + 材料 {need}")
+        # ★ 先把仓库 / 数据栏 / 配方页刷到位，**最后**才回结果 —— 顺序理由见上。
+        #   客户端合成完不会自己再要一次（`0x4476c4` 里没有 `0x5541c1` 也没有
+        #   `0x447467` 的调用点）⇒ 这三发只能服务端主动推。
+        self.send_rep_inventory(reason="（合成完刷新）")
+        self.send_rep_money(reason="（合成完刷新）")
+        if self.last_composition_request is not None:
+            self.send_rep_composition_list(self.last_composition_request,
+                                           reason="（合成完刷新）")
+        self.log(f"← 回 0x0506 合成成功 {recipe['result']}，"
+                 f"余额 {player_money(self.account)}")
+        self.send(build_game(OP_REP_COMPOSE_ITEM,
+                             shop.build_rep_compose_item(shop.COMPOSE_OK)))
 
     def on_req_equip_item(self, opcode, payload):
         """客户端方向的 `0x0702`（穿上）/ `0x0703`（脱下）—— 都回 `0x0604`（§24）。
@@ -10300,6 +10438,17 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
                                   见 FINDINGS §22）；★ 写 0 不是全部，是「人物→
                                   英雄」标签。角色 0/1/2，省略 = 不限；
                                   排序 0 = 基本顺序 / 1 = 上市顺序（§25）
+  shop-backfill [apply]           把默认表里有、`server/data/*.json` 里没有的
+                                  条目**补进去**（只增不改，已有的一个字节都
+                                  不动）。不带 apply = 只试算不写盘。
+                                  ★ 用在「后来发现少收了一批物品」上 ——
+                                  `ensure_files` 只在文件不存在时生成一次。
+  recipes [分类] [页] [角色] [排序] 同上，看「合成这一页会发什么」。
+                                  ★ 合成界面只有 8 个标签：2 新商品 /
+                                  10005 头 / 10001 上衣 / 10002 下装 /
+                                  10003 手套 / 10004 鞋 / 40001 装饰 /
+                                  40002 其他 —— 武器和套装产物玩家点不到。
+                                  ⚠ 合成**不看等级**（D27），所以没有等级参数
   help                            这段
 """
 
@@ -10445,6 +10594,45 @@ def _dispatch_control_command(line):
                          % (_item_label(entry["id"]), entry["price"]))
         if not shown:
             lines.append("  （这一页没有商品）")
+        return "\n".join(lines)
+
+    if cmd == "shop-backfill":
+        # ★ 默认只看不写。要真写得多打一个 `apply` —— 动的是用户的运营配置。
+        apply = len(words) > 1 and words[1].lower() == "apply"
+        try:
+            added = shopcfg.backfill_defaults(apply=apply)
+        except Exception as error:            # noqa: BLE001 —— 说清楚是哪一步
+            return f"err 补齐失败（什么都没写）: {error}"
+        if not added:
+            return "ok 没有要补的条目（默认表里的东西现有配置里都有）"
+        lines = ["ok 已补齐" if apply else "ok 试算（**没有写盘**，要写加 apply）"]
+        for filename in sorted(added):
+            lines.append(f"  {filename}: {len(added[filename])} 条")
+            for entry in added[filename]:
+                item_id = entry.get("id" if filename == shopcfg.SHOP_FILENAME
+                                    else "result")
+                lines.append(f"    {_item_label(item_id)}")
+        return "\n".join(lines)
+
+    if cmd == "recipes":
+        # ★ 和 `shelf` 一个用法。⚠ 没有等级参数 —— 合成不看等级（D27）。
+        category = int(words[1], 16) if len(words) > 1 else shop.CATEGORY_ALL
+        page = int(words[2], 0) if len(words) > 2 else 0
+        character = int(words[3], 0) if len(words) > 3 else shop.CHARACTER_ANY
+        order = int(words[4], 0) if len(words) > 4 else shop.SORT_BASIC
+        body, shown, warnings = shop.composition_page(
+            category, page, character, order=order)
+        lines = [f"ok 分类 {category:#x} 第 {page} 页 按{shop.sort_name(order)}；"
+                 f"包体 {len(body)} 字节"]
+        lines += [f"  ⚠ {w}" for w in warnings]
+        for recipe in shown:
+            need = "＋".join("%s×%d" % (_item_label(m["id"]), m["count"])
+                             for m in recipe.get("materials", ()))
+            lines.append("  %s  %d 金币 ← %s"
+                         % (_item_label(recipe["result"]),
+                            recipe.get("cost", 0), need))
+        if not shown:
+            lines.append("  （这一页没有配方）")
         return "\n".join(lines)
 
     # -- 房间（里程碑 I）：这几条不需要连接，放在 pick_conn 之前 ------------

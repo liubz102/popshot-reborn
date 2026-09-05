@@ -970,6 +970,81 @@ class AccountStore:
             self._write_unlocked(data)
             return copy.deepcopy(account)
 
+    def compose_item(self, username, item_id, cost=0, materials=None,
+                     expires=None):
+        """合成：**一把锁里**扣金币 + 扣材料 + 入库，返回更新后的账号。
+
+        ★ **为什么不能拿现成的三个方法拼**（`spend_money` + `consume_materials`
+        + `add_item`）：那是三次「读盘 → 改 → 写盘」。中间崩一次，玩家的金币
+        和材料就没了、东西没到手 —— 铁律 11 说的「崩在中间老数据还在不在」
+        问的正是这个。合成是一次**原子交易**，要么三样一起成，要么一个字节
+        都不写。
+
+        ★ 校验也全在锁里重做一遍。`shop.check_compose()` 那一轮是为了**挑
+        错误码**（客户端只认 4 种说法），不是并发保护 —— 同一个号开两个客户端
+        各点一次，两边都会看到「材料够」。真正说了算的是这里。
+
+        `materials` = `{itemId: 数量}`。失败一律抛 `AccountError`，
+        `code` 和 `shop.COMPOSE_*` 那几个原因字符串对得上，调用方直接拿去查码表。
+        """
+        item_id = int(item_id)
+        cost = int(cost)
+        if cost < 0:
+            raise AccountError("invalid_amount", "合成花费不能是负数")
+        if not shopdata.ownable(item_id):
+            raise AccountError(
+                "unknown_item",
+                f"物品 {item_id} 不在客户端认得的物品表里，不能发给玩家")
+        wanted = {}
+        for key, value in (materials or {}).items():
+            try:
+                material_id, count = int(key), int(value)
+            except (TypeError, ValueError):
+                raise AccountError(
+                    "invalid_material",
+                    f"材料条目不合法: {key!r}={value!r}") from None
+            if count < 0:
+                raise AccountError("invalid_material", "材料数量不能是负数")
+            if count:
+                wanted[material_id] = wanted.get(material_id, 0) + count
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            # ① 已经有了就不能再合（原版失败文案 `이미 소지하고 있습니다`）。
+            if has_item(account, item_id):
+                raise AccountError("already_owned",
+                                   f"仓库里已经有 {item_id} 了")
+            # ② 材料。★ 先报材料再报金币 —— 和 `shop.check_compose()` 同序，
+            #    免得两层校验挑出不一样的原因码。
+            records = _material_records(account)
+            short = [(i, n, records.get(i, 0))
+                     for i, n in sorted(wanted.items()) if records.get(i, 0) < n]
+            if short:
+                detail = "、".join(f"{i} 需要 {n} 现有 {have}"
+                                  for i, n, have in short)
+                raise AccountError("not_enough_materials", f"材料不足：{detail}")
+            # ③ 金币。
+            balance = player_money(account)
+            if balance < cost:
+                raise AccountError(
+                    "not_enough_money",
+                    f"金币不足：需要 {cost}，现有 {balance}")
+            for material_id, count in wanted.items():
+                left = records[material_id] - count
+                if left > 0:
+                    records[material_id] = left
+                else:
+                    del records[material_id]      # 用光了就把这一格删掉
+            inventory = _inventory_records(account)
+            inventory[item_id] = {"count": 1, "expires": expires}
+            account["materials"] = {str(i): records[i] for i in sorted(records)}
+            account["inventory"] = {str(i): dict(inventory[i])
+                                    for i in sorted(inventory)}
+            account["money"] = balance - cost
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return copy.deepcopy(account)
+
     def set_equipped(self, username, item_ids):
         """整套换装，返回 ``(更新后的账号, 被丢掉的 id 列表)``。
 

@@ -93,6 +93,9 @@
         <div class="toolbar">
           <input id="playerSearch" type="text" placeholder="搜 用户名 / 昵称">
           <button class="btn" id="playerSearchBtn">查找</button>
+          <!-- 玩家自己在游戏里也会改这些数（打完一局就涨经验和金币），
+               所以这一页随时会过期。刷新 = 重读列表 + 重读正在改的那个人。 -->
+          <button class="btn" id="playerRefreshBtn" title="重新读一遍列表和下面这个人的资料">↻ 刷新</button>
         </div>
         <!-- 高度按 10 行钉死：翻页时表格不会忽长忽短，下面的编辑区也就不跳。 -->
         <div class="player-list">

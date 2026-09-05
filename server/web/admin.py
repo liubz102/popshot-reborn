@@ -108,12 +108,23 @@ ICON_INDEX_PATH = os.path.join(HERE, "itemicons.json")
 #: 而不是按错的行列切出一堆张冠李戴的图。
 ICON_FORMAT = 1
 
-#: 会话有效期。★ **只在内存里**，服务端一重启全部失效 —— 和票据同一个口径
-#: （V0.2 D097）。管理页是低频运维工具，重登一次的代价远小于把令牌落盘。
-SESSION_TTL_SECONDS = 8 * 3600
+#: 会话**闲置**有效期（用户 2026-09-05 拍板：一小时）。
+#:
+#: ★ 这是**滑动**的：每一次带着有效令牌的请求都把到期时刻推到「现在 + 1 小时」
+#:   （`AdminSessions.resolve`）⇒ 一直在操作就永远不掉线，撂下一小时不动才登出。
+#: ★ **只在内存里**，服务端一重启全部失效 —— 和票据同一个口径（V0.2 D097）。
+#:   管理页是低频运维工具，重登一次的代价远小于把令牌落盘。
+SESSION_TTL_SECONDS = 3600
 
 #: 会话 cookie 的名字。`HttpOnly` + `SameSite=Strict`，JS 读不到也带不出去。
 SESSION_COOKIE = "popshot_admin"
+
+#: cookie 的 `Max-Age`。**故意和 `SESSION_TTL_SECONDS` 脱钩**（D29）：
+#: 浏览器不知道服务端在滑动到期时刻，写 1 小时的话「登录后连续操作两小时」
+#: 到第 60 分钟就会把 cookie 丢掉，明明还在用却被踢出去。
+#: ⇒ cookie 只负责「**别在关掉页面时消失**」，真正说了算的是服务端那份到期时刻；
+#:   cookie 活得比会话久没有风险 —— 令牌一过期，服务端认不出来就是没登录。
+SESSION_COOKIE_MAX_AGE = 7 * 24 * 3600
 
 #: 登录失败后，同一个 IP 要等的秒数。
 #:
@@ -163,14 +174,23 @@ class AdminSessions:
         return token
 
     def resolve(self, token):
-        """令牌对应哪个管理员；没有 / 过期都返回 `None`。"""
+        """令牌对应哪个管理员；没有 / 过期都返回 `None`。
+
+        ★ **认出来就顺手续期**（滑动过期，用户 2026-09-05 拍板）：到期时刻
+        推到「现在 + ttl」。判据是「这一发请求本身」—— 有请求就是有人在操作，
+        不需要前台额外报「我还在」（那种心跳会让页面开着就永不登出，
+        正好和用户要的「撂下一小时就登出」相反）。
+        """
         if not token:
             return None
         now = self._clock()
         with self._lock:
             self._prune(now)
             entry = self._sessions.get(token)
-        return entry[0] if entry else None
+            if entry is None:
+                return None
+            self._sessions[token] = (entry[0], now + self.ttl)
+            return entry[0]
 
     def drop(self, token):
         """退出登录。已经不在了也当成功 —— 幂等，前台不用分情况。"""
@@ -546,10 +566,12 @@ class AdminRoutes:
     def _set_session_cookie(self, token):
         # HttpOnly：JS 读不到，XSS 也偷不走。SameSite=Strict：别的站点发过来的
         # 请求不带它，顺手把 CSRF 也挡了（管理页没有跨站使用的场景）。
+        # ★ `Max-Age` 用 `SESSION_COOKIE_MAX_AGE`，**不是**会话 ttl —— 理由
+        #   写在那个常量上面：服务端的到期时刻是滑动的，浏览器不知道。
         self.send_header(
             "Set-Cookie",
             "%s=%s; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=%d"
-            % (SESSION_COOKIE, token, self.admin_sessions.ttl))
+            % (SESSION_COOKIE, token, SESSION_COOKIE_MAX_AGE))
 
     def _clear_session_cookie(self):
         self.send_header(

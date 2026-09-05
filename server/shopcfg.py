@@ -38,7 +38,9 @@
 """
 import json
 import os
+import shutil
 import threading
+import time
 
 import shopdata
 
@@ -201,8 +203,27 @@ KIND_ZH = {
 }
 
 #: 套装部位后缀（韩文名的最后一段）→ 中文。
-PART_SUFFIX_ZH = {"몸": "上衣", "다리": "下装", "손": "手套",
-                  "발": "鞋", "머리": "头盔"}
+#:
+#: ⚠⚠ **同一个部位有两种写法**，原版自己就不统一（2026-09-05 实机发现）：
+#: 下装在 카실 / 프로코 身上叫 `다리`（腿），在 타이 身上叫 `바지`（裤子）；
+#: 鞋一律叫 `신발`，`발`（脚）从来没单独出现过。
+#: 漏掉 `바지` 的后果是**泰尔的四条下装全部不进合成配方**，而且中文名翻不出来
+#: —— 用户 2026-09-05 报的「泰尔只能看到上衣和手套」就是它。
+PART_SUFFIX_ZH = {"몸": "上衣", "다리": "下装", "바지": "下装", "손": "手套",
+                  "신발": "鞋", "발": "鞋", "머리": "头盔"}
+
+
+def _split_part_suffix(name):
+    """`타이_마스터리아머 신발` → `("타이_마스터리아머", "鞋")`；没后缀就 `(原样, "")`。
+
+    ★ **按长度从长到短试**：`신발` 也以 `발` 结尾，先撞上 `발` 会把它切成
+    `…아머 신`，套装名对不上、那一件就悄悄消失（正是上面那个 bug 的机制）。
+    dict 的插入顺序在这儿不该成为正确性的一部分 —— 排一下就不用记住了。
+    """
+    for suffix in sorted(PART_SUFFIX_ZH, key=len, reverse=True):
+        if name.endswith(suffix):
+            return name[:-len(suffix)].strip().rstrip("_"), PART_SUFFIX_ZH[suffix]
+    return name, ""
 
 
 def weapon_name_zh(item):
@@ -222,13 +243,8 @@ def weapon_name_zh(item):
 
 def armor_name_zh(item):
     """`타이_메이져피닉스아머 몸` → `泰尔 高阶凤凰铠甲·上衣`。"""
-    name = (item.name_kr or "").strip()
-    part = ""
-    for suffix, zh in PART_SUFFIX_ZH.items():
-        if name.endswith(suffix):
-            name = name[:-len(suffix)].strip().rstrip("_")
-            part = "·" + zh
-            break
+    name, part_zh = _split_part_suffix((item.name_kr or "").strip())
+    part = ("·" + part_zh) if part_zh else ""
     # 套装名前面常带角色名（`타이_` / `카실_` / `프로코_`），去掉后再查表。
     for korean in ("타이", "카실", "프로코"):
         if name.startswith(korean):
@@ -370,8 +386,11 @@ def default_shop():
             "days": 0,
         })
 
+    # ★ 合成产物的 `level` 就是**穿上它**的等级要求（客户端 `0x445817` 拿
+    #   `ItemInfo+0x1c` 和玩家等级比）—— 合成本身没有等级门（D27），
+    #   所以那个数只在这里、只进 `shop.json`。
     seen = set(entry["id"] for entry in entries)
-    for recipe in default_recipes()["recipes"]:
+    for recipe, level in _recipe_seed():
         item_id = recipe["result"]
         if item_id in seen:
             continue
@@ -385,7 +404,7 @@ def default_shop():
             "kind": item.kind,
             "listed": False,
             "price": 0,
-            "level": recipe.get("level", 1),
+            "level": level,
             "days": 0,
         })
 
@@ -443,27 +462,27 @@ def _armor_sets():
             name = (item.name_kr or "").strip()
             if not name or not item.bonus:
                 continue
-            for suffix in PART_SUFFIX_ZH:
-                if name.endswith(suffix):
-                    base = name[:-len(suffix)].strip().rstrip("_")
-                    for korean in ("타이", "카실", "프로코"):
-                        if base.startswith(korean):
-                            base = base[len(korean):].strip("_ ")
-                            break
-                    groups.setdefault((item.character, base), []).append(item)
+            base, part_zh = _split_part_suffix(name)
+            if not part_zh:            # 名字里没有部位后缀 = 不是套装的一件
+                continue
+            for korean in ("타이", "카실", "프로코"):
+                if base.startswith(korean):
+                    base = base[len(korean):].strip("_ ")
                     break
+            groups.setdefault((item.character, base), []).append(item)
     return groups
 
 
-def default_recipes():
-    """从 `shop_items.json` 生成一份默认 `recipe.json`。
+def _recipe_seed():
+    """`[(配方, 产物的装备等级)]` —— `default_recipes` 和 `default_shop` 共用。
 
-    ★ **原版配方在客户端里彻底不存在**（FINDINGS §7），这一份是**我们自己
-    设计的**（D2）。用户会在管理页里调，所以这里追求的是「一眼看得懂、
-    改起来容易」，不是「一次到位」。
+    ★ **等级不进 `recipe.json`**（D27）：合成本身**没有等级门**（原版的合成
+    面板从头到尾不读玩家等级，FINDINGS §33），`RECIPE_LINES` 里那个数是
+    **产物穿上时**的要求，归 `shop.json` 管。两处各留一份的话，改了一处
+    另一处不动，很快就对不上。
     """
     sets = _armor_sets()
-    recipes = []
+    seed = []
     next_id = 1
     for korean, level, gold_per_point, materials in RECIPE_LINES:
         for character in (0, 1, 2):
@@ -479,20 +498,30 @@ def default_recipes():
                                  "count": max(1, int(round(weight * ratio)))})
                 if not need:
                     continue
-                recipes.append({
+                seed.append(({
                     "id": next_id,
                     "result": item.id,
                     "name": item_name_zh(item),
                     "listed": True,
-                    "level": level,
                     "character": character,
                     "cost": weight * gold_per_point,
                     "days": 0,
                     "materials": need[:MAX_MATERIALS],
-                })
+                }, level))
                 next_id += 1
+    return seed
+
+
+def default_recipes():
+    """从 `shop_items.json` 生成一份默认 `recipe.json`。
+
+    ★ **原版配方在客户端里彻底不存在**（FINDINGS §7），这一份是**我们自己
+    设计的**（D2）。用户会在管理页里调，所以这里追求的是「一眼看得懂、
+    改起来容易」，不是「一次到位」。
+    """
     # `_说明` 见 `default_shop()` 那条注释：说明文字在 `SCHEMA` 里，不写进文件。
-    return {"format": FORMAT, "recipes": recipes}
+    return {"format": FORMAT,
+            "recipes": [recipe for recipe, _level in _recipe_seed()]}
 
 
 # --------------------------------------------------------------------------
@@ -650,6 +679,7 @@ def validate_recipes(raw):
         raise ConfigError("recipe.json 缺少 recipes 列表")
     out = []
     seen_ids = set()
+    seen_results = {}
     for index, entry in enumerate(recipes):
         where = "recipes[%d]" % index
         if not isinstance(entry, dict):
@@ -661,6 +691,15 @@ def validate_recipes(raw):
 
         result = _as_int(entry.get("result"), where + ".result", low=1)
         _check_item_id(result, where)
+        # ★★ **一个产物只能有一条配方** —— `0x0606` 上行带的是**产物 itemId**
+        #    而不是配方号（`0x45d738: push [rule+4]`，FINDINGS §27）⇒ 两条配方
+        #    同产物时服务端根本分不清玩家点的是哪一条。这条不是我们的规矩，
+        #    是协议的形状决定的，所以宁可拒收也不能「取第一条」。
+        if result in seen_results:
+            raise ConfigError(
+                "%s：产物 %d 已经在 %s 里有配方了 —— 合成请求只带产物 id，"
+                "一个产物只能有一条配方" % (where, result, seen_results[result]))
+        seen_results[result] = where
 
         materials = entry.get("materials")
         if not isinstance(materials, list) or not materials:
@@ -691,12 +730,16 @@ def validate_recipes(raw):
         if character is not None:
             character = _as_int(character, where + ".character", low=0, high=2)
 
+        # ★ **配方没有 `level`**（D27）：原版的合成面板从头到尾不读玩家等级，
+        #   `0x0506` 的结果码里也没有「等级太低」这一档 —— 服务端拿等级拦，
+        #   客户端只能显示成「未知的错误」。装备的等级要求在 `shop.json`
+        #   里（那份才是发给客户端 `ItemInfo` 的），穿的时候由客户端自己判。
+        #   老 `recipe.json` 里残留的 `level` 键在这里被丢掉，不报错。
         out.append({
             "id": recipe_id,
             "result": result,
             "name": str(entry.get("name") or item_name_zh(shopdata.get(result))),
             "listed": bool(entry.get("listed", True)),
-            "level": _as_int(entry.get("level", 1), where + ".level", low=1),
             "character": character,
             "cost": _as_int(entry.get("cost", 0), where + ".cost", low=0),
             "days": _as_int(entry.get("days", 0), where + ".days", low=0),
@@ -811,6 +854,12 @@ SCHEMA = {
             "★ 一条配方最多 4 种材料 —— 原版合成界面只有 4 个材料槽，"
             "第 5 种玩家根本看不见，所以这里也只画 4 格。",
             "★ 原版没有合成成功率（界面上没有任何概率控件），别加。",
+            "★ 一个产物只能有一条配方 —— 合成请求只带产物 id，两条同产物服务端分不清。",
+            "★ 合成界面只有「新商品 / 头 / 上衣 / 下装 / 手套 / 鞋 / 装饰 / 其他」"
+            "八个标签，武器和套装产物玩家点不到、永远看不见。",
+            "★ 配方**没有等级要求** —— 原版的合成面板不看等级，"
+            "上架的配方所有人都看得到、也合得出来。"
+            "产物穿上时的等级门槛在「商店目录」那一份里改。",
             "原版配方随 2009 年停服的服务端一起没了，这一份是复活工程自己设计的，随便改。",
         ],
         "fields": [
@@ -825,7 +874,6 @@ SCHEMA = {
                  {"key": "count", "label": "数量", "type": "int",
                   "min": 1, "max": 800},
              ]},
-            {"key": "level", "label": "等级", "type": "int", "min": 1},
             {"key": "cost", "label": "花费", "type": "int", "min": 0,
              "suffix": "金币"},
             {"key": "character", "label": "角色限定", "type": "choice",
@@ -1009,3 +1057,81 @@ def ensure_files(data_dir=None):
     if created:
         invalidate(data_dir)
     return created
+
+
+# --------------------------------------------------------------------------
+# 补齐（只增不改）
+# --------------------------------------------------------------------------
+
+#: 哪两份配置补得了，以及「一条记录的身份」是哪个键。
+#:
+#: ★ `drops.json` 不在里面：一条掉落规则没有天然主键（同一种材料可以有
+#:   好几条不同关卡 / 难度的规则），「有没有」判不出来，补齐只会补出重复。
+BACKFILL_KEYS = {
+    SHOP_FILENAME: ("items", "id"),
+    #: ★ 配方按**产物**认身份，不是配方号 —— 一个产物只能有一条配方
+    #:   （`0x0606` 只带产物 id，FINDINGS §27），配方号只是行号。
+    RECIPE_FILENAME: ("recipes", "result"),
+}
+
+
+def backfill_defaults(data_dir=None, apply=False):
+    """把默认表里有、现有文件里**没有**的条目补进去。返回 `{文件名: [新条目]}`。
+
+    ★ **只增不改**：已经在文件里的条目一个字节都不动（用户改过的价格 /
+    花费 / 上架开关全部原样留着，铁律 11）。**幂等** —— 补完再跑一次是空的。
+
+    ★ 为什么需要它：`ensure_files` 只在文件**不存在**时生成一份（D7），
+    所以「我们后来发现少收了一批物品」这种事没有别的出口。
+    2026-09-05 就撞上一次：`PART_SUFFIX_ZH` 漏了 `바지` / `신발`，
+    泰尔的四条下装和四双鞋从来没进过默认配方。
+
+    `apply=False`（默认）只算不写 —— 先看清楚要加什么再决定。
+    真写的时候先把原文件复制一份 `*.bak-<时刻>` 放在旁边。
+    """
+    added = {}
+    for filename, (list_key, id_key) in BACKFILL_KEYS.items():
+        path = path_of(filename, data_dir)
+        if not os.path.exists(path):
+            continue                    # 没有就该由 `ensure_files` 去生成
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                raw = json.load(fp)
+        except (OSError, ValueError):
+            # 读不了就跳过。**绝不拿默认值盖掉一份读不懂的文件**（D10）。
+            continue
+        entries = raw.get(list_key)
+        if not isinstance(entries, list):
+            continue
+        have = set()
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get(id_key) is not None:
+                have.add(int(entry[id_key]))
+        build = _SPECS[filename][1]
+        fresh = [entry for entry in build().get(list_key, [])
+                 if int(entry[id_key]) not in have]
+        if not fresh:
+            continue
+        if filename == RECIPE_FILENAME:
+            # 配方号接着现有的往下数，别和已有的撞（撞了整份文件都不合法）。
+            top = 0
+            for entry in entries:
+                try:
+                    top = max(top, int(entry.get("id", 0)))
+                except (TypeError, ValueError):
+                    pass
+            for offset, entry in enumerate(fresh, start=1):
+                entry["id"] = top + offset
+        added[filename] = fresh
+        if not apply:
+            continue
+        merged = dict(raw)
+        merged[list_key] = list(entries) + fresh
+        # 存盘前必过校验：宁可什么都不写，也不要写出一份服务端读不了的文件。
+        _SPECS[filename][0](merged)
+        shutil.copyfile(path, "%s.bak-%s"
+                        % (path, time.strftime("%Y%m%d-%H%M%S")))
+        write_json(path, merged)
+    if apply and added:
+        invalidate(data_dir)
+    return added

@@ -24,6 +24,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import mapdata                                                 # noqa: E402
+import shop                                                    # noqa: E402
 import shopcfg                                                 # noqa: E402
 import shopdata                                                # noqa: E402
 from test_shopdata import SYNTHETIC, make_table                # noqa: E402
@@ -103,6 +104,115 @@ class EnsureFilesTests(_CfgCase):
         for loader in (shopcfg.shop, shopcfg.recipes, shopcfg.drops):
             _parsed, warnings = loader(self.dir)
             self.assertEqual([], warnings)
+
+
+class BackfillTests(_CfgCase):
+    """`backfill_defaults()` —— 只增不改、幂等（2026-09-05 的 `바지` 事故）。"""
+
+    def test_dry_run_writes_nothing(self):
+        shopcfg.ensure_files(self.dir)
+        path = shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir)
+        raw = open(path, "rb").read()
+        # 先删掉一条，制造「默认表里有、文件里没有」。
+        data = json.loads(raw.decode("utf-8"))
+        dropped = data["items"].pop(0)
+        shopcfg.write_json(path, data)
+        before = open(path, "rb").read()
+        added = shopcfg.backfill_defaults(self.dir)          # apply 默认 False
+        self.assertEqual([dropped["id"]],
+                         [e["id"] for e in added[shopcfg.SHOP_FILENAME]])
+        self.assertEqual(before, open(path, "rb").read())
+
+    def test_apply_adds_only_what_is_missing(self):
+        shopcfg.ensure_files(self.dir)
+        path = shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir)
+        data = json.load(open(path, encoding="utf-8"))
+        full = len(data["items"])
+        dropped = data["items"].pop(0)
+        # ★ 用户手改过的那一条必须原样留着 —— 这是整个函数存在的意义。
+        data["items"][0] = dict(data["items"][0], price=12345, name="我改的")
+        mine = data["items"][0]["id"]
+        # ★ 用户自己加的、默认表里根本没有的那一条也不能被吃掉。
+        data["items"].append({"id": 1990001, "name": "我加的", "listed": True,
+                              "price": 7, "level": 1, "days": 0})
+        shopcfg.write_json(path, data)
+        shopcfg.backfill_defaults(self.dir, apply=True)
+        after = {e["id"]: e for e in
+                 json.load(open(path, encoding="utf-8"))["items"]}
+        self.assertIn(dropped["id"], after)                  # 补回来了
+        self.assertEqual(12345, after[mine]["price"])        # 改过的没被盖
+        self.assertEqual("我改的", after[mine]["name"])
+        self.assertEqual("我加的", after[1990001]["name"])   # 自己加的还在
+        self.assertEqual(full + 1, len(after))
+
+    #: 小物品表里没有成套的铠甲（韩文名带部位后缀的那种），所以
+    #: `default_recipes()` 在这儿是空的 —— 配方那两条用例自带一份「默认表」。
+    FAKE_RECIPES = {"format": shopcfg.FORMAT, "recipes": [
+        {"id": 1, "result": 1010001, "listed": True, "cost": 100,
+         "materials": [{"id": 30018, "count": 1}]},
+        {"id": 2, "result": 1020001, "listed": True, "cost": 200,
+         "materials": [{"id": 30018, "count": 2}]},
+    ]}
+
+    def fake_recipe_defaults(self):
+        """把 `recipe.json` 的默认生成器换成上面那两条，用完还原。"""
+        spec = shopcfg._SPECS[shopcfg.RECIPE_FILENAME]
+        patched = (spec[0], lambda: json.loads(json.dumps(self.FAKE_RECIPES)),
+                   spec[2])
+        shopcfg._SPECS[shopcfg.RECIPE_FILENAME] = patched
+        self.addCleanup(shopcfg._SPECS.__setitem__,
+                        shopcfg.RECIPE_FILENAME, spec)
+
+    def test_apply_is_idempotent(self):
+        self.fake_recipe_defaults()
+        shopcfg.ensure_files(self.dir)
+        path = shopcfg.path_of(shopcfg.RECIPE_FILENAME, self.dir)
+        data = json.load(open(path, encoding="utf-8"))
+        data["recipes"].pop(0)
+        shopcfg.write_json(path, data)
+        self.assertTrue(shopcfg.backfill_defaults(self.dir, apply=True))
+        self.assertEqual({}, shopcfg.backfill_defaults(self.dir, apply=True))
+
+    def test_backfilled_recipe_ids_do_not_collide(self):
+        """★ 配方号撞车会让**整份文件**判非法（一条都读不出来）。"""
+        self.fake_recipe_defaults()
+        shopcfg.ensure_files(self.dir)
+        path = shopcfg.path_of(shopcfg.RECIPE_FILENAME, self.dir)
+        data = json.load(open(path, encoding="utf-8"))
+        data["recipes"].pop(0)
+        # 剩下那条占掉一个很大的号，逼补齐去接着往下数。
+        data["recipes"][0]["id"] = 9000
+        shopcfg.write_json(path, data)
+        shopcfg.backfill_defaults(self.dir, apply=True)
+        parsed, warnings = shopcfg.recipes(self.dir, _reload=True)
+        self.assertEqual([], warnings)
+        ids = [r["id"] for r in parsed]
+        self.assertEqual(2, len(ids))
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_apply_leaves_a_backup(self):
+        shopcfg.ensure_files(self.dir)
+        path = shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir)
+        data = json.load(open(path, encoding="utf-8"))
+        data["items"].pop(0)
+        shopcfg.write_json(path, data)
+        shopcfg.backfill_defaults(self.dir, apply=True)
+        backups = [n for n in os.listdir(self.dir)
+                   if n.startswith(shopcfg.SHOP_FILENAME + ".bak-")]
+        self.assertEqual(1, len(backups), backups)
+
+    def test_a_broken_file_is_skipped_not_overwritten(self):
+        # D10 的同一条：读不懂的文件**绝不**拿默认值盖掉。
+        path = shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir)
+        with open(path, "w", encoding="utf-8", newline="\n") as fp:
+            fp.write("{ 这不是 json")
+        raw = open(path, "rb").read()
+        shopcfg.backfill_defaults(self.dir, apply=True)
+        self.assertEqual(raw, open(path, "rb").read())
+
+    def test_drops_are_not_backfilled(self):
+        # 一条掉落规则没有天然主键 ⇒ 补齐只会补出重复。
+        self.assertNotIn(shopcfg.DROPS_FILENAME, shopcfg.BACKFILL_KEYS)
 
 
 class HotReloadTests(_CfgCase):
@@ -319,6 +429,23 @@ class ValidateRecipeTests(_CfgCase):
         with self.assertRaises(shopcfg.ConfigError):
             shopcfg.validate_recipes({"recipes": [entry, dict(entry)]})
 
+    def test_rejects_two_recipes_for_the_same_result(self):
+        """★★ `0x0606` 上行带的是**产物 itemId**，不是配方号
+        （`0x45d738: push [rule+4]`，FINDINGS §27）—— 同产物两条配方，
+        服务端根本分不清玩家点的是哪一条。这条不是我们的规矩，是协议的形状。
+        """
+        with self.assertRaises(shopcfg.ConfigError) as ctx:
+            shopcfg.validate_recipes({"recipes": [
+                dict(self.BASE, id=1),
+                dict(self.BASE, id=2, cost=999)]})
+        self.assertIn("一个产物只能有一条配方", str(ctx.exception))
+
+    def test_different_results_are_fine(self):
+        got = shopcfg.validate_recipes({"recipes": [
+            dict(self.BASE, id=1),
+            dict(self.BASE, id=2, result=1020001)]})
+        self.assertEqual([1010001, 1020001], [r["result"] for r in got])
+
 
 class ValidateDropsTests(_CfgCase):
 
@@ -434,6 +561,45 @@ class RealDefaultsTests(unittest.TestCase):
         # FINDINGS §12：原版给材料的 4 关（三个角色线去重后）
         self.assertEqual({(7, 1, 30018), (1, 2, 30018),
                           (4, 3, 30019), (1, 3, 30018)}, baseline)
+
+    def test_the_two_spellings_of_每个部位_are_both_recognised(self):
+        """★★ 原版自己就不统一（2026-09-05 实机撞上的）：
+
+        下装在 카실 / 프로코 身上叫 `다리`，在 타이 身上叫 `바지`；
+        鞋一律叫 `신발`。漏掉 `바지` 的后果是**泰尔的四条下装一件都不进配方**，
+        中文名也翻不出来 —— 用户报的「泰尔只能看到上衣和手套」就是它。
+
+        ⚠ `신발` 也以 `발` 结尾 ⇒ 后缀必须**从长到短**试，否则会被切成
+        `…아머 신`，套装名对不上，那一件照样消失（只是换个死法）。
+        """
+        for item_id, expected in ((1020067, "泰尔 佣兵铠甲·下装"),
+                                  (1020064, "泰尔 大师铠甲·下装"),
+                                  (2020067, "卡希尔 佣兵铠甲·下装"),
+                                  (1040067, "泰尔 佣兵铠甲·鞋"),
+                                  (2040064, "卡希尔 大师铠甲·鞋"),
+                                  (1010067, "泰尔 佣兵铠甲·上衣")):
+            self.assertEqual(expected,
+                             shopcfg.item_name_zh(shopdata.get(item_id)),
+                             item_id)
+
+    def test_the_default_recipes_cover_每个角色_每个存在的部位(self):
+        made = {r["result"] for r in shopcfg.default_recipes()["recipes"]}
+        # 泰尔的下装（`바지`）和鞋（`신발`）—— 漏了后缀时这几条一件都没有。
+        for item_id in (1020064, 1020065, 1020066, 1020067,
+                        1040064, 1040067, 2040064, 2040067):
+            self.assertIn(item_id, made, shopcfg.item_name_zh(
+                shopdata.get(item_id)))
+
+    def test_every_recipe_result_has_a_tab_in_the_composition_ui(self):
+        """★★ 合成界面的标签树只有 8 个（`0x45e42f` 逐条读出来的，§33）——
+        **没有武器、没有套装**。产物落在别的分类下 = 玩家在合成面板上永远
+        点不到那一格，配方等于不存在（而且不会有任何报错）。
+        """
+        for recipe in shopcfg.validate_recipes(shopcfg.default_recipes()):
+            category = shop.category_of(recipe["result"])
+            self.assertIn(category, shop.COMPOSITION_CATEGORIES,
+                          "配方「%s」的产物归在 %#x，合成界面里点不到"
+                          % (recipe["name"], category))
 
     def test_every_recipe_material_can_actually_drop(self):
         """★ 配方要的材料必须有地方掉，否则那条配方永远合不出来。"""

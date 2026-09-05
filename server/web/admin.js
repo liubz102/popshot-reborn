@@ -1083,7 +1083,7 @@ async function searchPlayers(page) {
                          + "&page=" + page);
   if (bounced(result) || !result.ok) {
     say($("playerMsg"), (result && result.message) || "查找失败", false);
-    return;
+    return false;
   }
   PLAYER_LIST = result.players;
   PLAYER_PAGE = {page: result.page, pages: result.pages,
@@ -1091,6 +1091,31 @@ async function searchPlayers(page) {
   renderPlayerRows();
   $("playerCount").textContent = result.total + " 个账号";
   say($("playerMsg"), "");
+  return true;
+}
+
+/** 「↻ 刷新」：重读列表 + 重读正在改的那个人（用户 2026-09-05 要的）。
+ *
+ * ★ **停在当前页、保留搜索串** —— 刷新不该把人弹回第一页。
+ * ★ 有没保存的改动先问一句：刷新会拿服务端那份盖掉编辑区，和 `openPlayer`
+ *   同一个口径（那边已经这么问了，两处别不一致）。
+ */
+async function refreshPlayers() {
+  if (PLAYER && playerDirty()
+      && !window.confirm("「" + PLAYER.view.username
+                         + "」还有没保存的改动，刷新会丢掉，确定？")) {
+    return;
+  }
+  var open = PLAYER ? PLAYER.view.username : null;
+  say($("playerMsg"), "刷新中……", true);
+  // 不带页码 = `searchPlayers` 自己那套：搜索串没变就停在当前页，
+  // 变了（用户改了输入框但没按查找）就回第一页。
+  var ok = await searchPlayers();
+  // ★ `force` = 别再问一次「确定丢掉改动」—— 上面已经问过了。
+  if (ok && open) { ok = await openPlayer(open, true); }
+  // ★ 失败时**不要**盖掉错误信息 —— 「已刷新」压在「请先登录」上面，
+  //   用户看到的就是「点了刷新，然后什么都没变」。
+  if (ok) { say($("playerMsg"), "已刷新", true); }
 }
 
 function renderPlayerRows() {
@@ -1149,9 +1174,10 @@ async function openPlayer(username, force) {
   var result = await api("/admin/api/player?name=" + encodeURIComponent(username));
   if (bounced(result) || !result.ok) {
     say($("playerMsg"), (result && result.message) || "读不到这个账号", false);
-    return;
+    return false;
   }
   adoptPlayer(result.player);
+  return true;
 }
 
 /** 把服务端那份快照变成「快照 + 补丁」。 */
@@ -1465,6 +1491,8 @@ function wire() {
   $("playerSearch").addEventListener("keydown", function (event) {
     if (event.key === "Enter") { searchPlayers(0); }
   });
+  // 同上：不能直接挂 `refreshPlayers`（Event 会被当第一个参数）。
+  $("playerRefreshBtn").onclick = function () { refreshPlayers(); };
   $("playerLevel").oninput = function () {
     PLAYER.edit.level = Math.max(1, Number($("playerLevel").value) || 1);
     playerTouched();

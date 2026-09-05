@@ -559,6 +559,286 @@ def check_purchase(item_id, table, level, owned):
 
 
 # ---------------------------------------------------------------------------
+# `0x0505` gspRepCompositionList（服务端 → 客户端）—— `0x0605` 的应答
+#
+# ★ 请求 `0x0605` 的线格式和 `0x0600` **一模一样**（含排序位），所以它复用
+#   上面的 `parse_shop_list_request`。这里只管应答那一半。
+# ---------------------------------------------------------------------------
+#: 合成面板一页几条。`0x45f011` 的循环走 `0 .. 0x100` 步长 `0x20`（一条
+#: `CompositionRule` 的内存大小）⇒ **8 格**，和货架一样。
+COMPOSITION_PAGE_SIZE = 8
+
+#: 合成界面的标签树（`0x45e42f` 逐条读出来的，§33）。**没有武器、没有套装**
+#: —— 玩家在合成面板上根本点不到那两类，配方产物落在那儿就永远看不见。
+COMPOSITION_CATEGORIES = (
+    2,          # 신상품 新商品
+    0x10005,    # 머리 头
+    0x10001,    # 상의 上衣
+    0x10002,    # 하의 下装
+    0x10003,    # 장갑 手套
+    0x10004,    # 신발 鞋
+    0x40001,    # 치장 装饰
+    0x40002,    # 기타 其他
+)
+
+
+def build_composition_material(item_id, count):
+    """一格材料（`CompositionMaterial`，vft `0x666104`，Des `0x4438dc`）。
+
+    ★ 数量是 **i16**，不是 i32（确认框 `0x45d6xx` 是 `movsx eax, word [mat+8]`）。
+    线上 6 字节，内存里步长 `0xc`。
+    """
+    return w_i32(item_id) + w_i16(count)
+
+
+def build_composition_rule(result, cost, materials=(), days=0, unknown=0):
+    """一条配方（`CompositionRule`，Des `0x44394d`，内存 `0x20`）。
+
+    | 线上 | 含义 |
+    |---|---|
+    | i32 | ★ **产物 itemId** —— 图标 / 名字都拿它查 ItemDB，**`0x0606` 发回来的就是它** |
+    | i32 | ★ **合成费用**（金币）—— 客户端**自己**拿 `[0x72e330]` 和它比，算得起买不起 |
+    | i32 m + m×`CompositionMaterial` | 材料，**最多 4 种**（界面只有 4 个槽，§7）|
+    | i32 | 产物有效天数：`>0` 显示「기간:%d일」，`<=0` 走 ItemDB 的修理次数 |
+    | i32 | ❌ 死字段（五个消费点一个都没读，§27）|
+
+    ★ **等级 / 角色限定不在包里** —— 提示框上那两行是客户端查 ItemDB 得到的，
+    和货架同款（§21）。
+    """
+    materials = list(materials)
+    if len(materials) > shopcfg.MAX_MATERIALS:
+        raise ValueError("一条配方最多 %d 种材料，给了 %d 种"
+                         % (shopcfg.MAX_MATERIALS, len(materials)))
+    out = [w_i32(result), w_i32(cost), w_i32(len(materials))]
+    for material in materials:
+        out.append(build_composition_material(material["id"],
+                                              material["count"]))
+    out.append(w_i32(days))
+    out.append(w_i32(unknown))
+    return b"".join(out)
+
+
+def build_rep_composition_list(total_pages, page, rules):
+    """opcode `0x0505` 的包体 —— 和 `0x0500` 一个骨架（Des `0x443ae1`）。
+
+    `i32 总页数 + i32 当前页 + i32 n + n×CompositionRule`。
+    ★ 总页数写进面板 `+0x144`、当前页写进 `+0x140`，客户端会把当前页
+    夹到 `[0, 总页数-1]`（`0x45efb9`）⇒ **一条配方都没有也得说「1 页」**。
+    """
+    rules = list(rules)
+    return (w_i32(total_pages) + w_i32(page) + w_i32(len(rules))
+            + b"".join(rules))
+
+
+def recipe_entries(category=CATEGORY_ALL, character=CHARACTER_ANY,
+                   data_dir=None, order=SORT_BASIC):
+    """这个标签下**全部**能合成的配方，按 `order` 排。返回 `(配方, 警告)`。
+
+    三道过滤：
+
+    1. `listed` —— 管理页里那个开关；
+    2. `shopdata.ownable()` 的产物 —— 和货架同一条约束（§11）：客户端表里
+       查不到的 id 发下去是个空格子，处理器 `0x447575` 还会去要一遍定义；
+    3. 分类 —— 合成面板的标签树只有 8 个（`COMPOSITION_CATEGORIES`）；
+    4. 角色 —— 配方自己写了 `character` 就按它，没写就退回产物的角色限定。
+
+    ⚠⚠ **故意没有等级过滤**（D27，2026-09-05 实机推翻了自己的第一版）：
+    原版的合成面板**从头到尾不读玩家等级**（§32 那 49 处引用里
+    `0x45c000`~`0x45f000` 一处都没有），`0x0506` 的结果码里也没有
+    「等级太低」这一档 ⇒ 原版合成压根没有等级门。装备的等级要求在
+    **穿的时候**由客户端自己判（`0x445817`，数来自 `shop.json`）。
+    ★ 加过一版「等级不到就不列」，用户实机报「管理页明明上架了却看不到」
+      —— 那正是这种发明出来的规则的典型症状。别再加回来。
+    """
+    table, warnings = shopcfg.recipes(data_dir)
+    out = []
+    for recipe in table:
+        if not recipe.get("listed"):
+            continue
+        result = recipe["result"]
+        if not shopdata.ownable(result):
+            continue
+        if not category_matches(category, category_of(result)):
+            continue
+        if character != CHARACTER_ANY:
+            want = recipe.get("character")
+            if want is None:
+                if not shopdata.usable_by(result, character):
+                    continue
+            elif int(want) != int(character):
+                continue
+        out.append(recipe)
+    return sort_recipes(out, order), warnings
+
+
+def sort_recipes(recipes, order=SORT_BASIC):
+    """按玩家选的顺序排配方 —— 和货架同一套规矩（`sort_entries`），
+    只是键取的是**产物 id**。★ 一律再按配方号兜底，排序必须是全序。"""
+    try:
+        order = int(order)
+    except (TypeError, ValueError):
+        order = SORT_BASIC
+    if order == SORT_RELEASE:
+        return sorted(recipes,
+                      key=lambda r: (-shopdata.catalog_index(r["result"]),
+                                     int(r["result"]), int(r["id"])))
+    return sorted(recipes, key=lambda r: (int(r["result"]), int(r["id"])))
+
+
+def composition_page(category=CATEGORY_ALL, page=0, character=CHARACTER_ANY,
+                     data_dir=None, order=SORT_BASIC):
+    """把一页配方组成 `0x0505` 的包体。返回 `(包体, 这一页的配方, 警告)`。
+
+    页号的夹法和货架一致（`0x45efb9` 自己也会再夹一次），这样「服务端说
+    第几页」和「客户端显示第几页」永远一样。
+    """
+    entries, warnings = recipe_entries(category, character, data_dir, order)
+    pages = page_count(len(entries))
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        page = 0
+    page = max(0, min(page, pages - 1))
+    shown = entries[page * COMPOSITION_PAGE_SIZE:
+                    (page + 1) * COMPOSITION_PAGE_SIZE]
+    rules = [build_composition_rule(r["result"], r.get("cost", 0),
+                                    r.get("materials", ()), r.get("days", 0))
+             for r in shown]
+    return build_rep_composition_list(pages, page, rules), shown, warnings
+
+
+def composition_item_ids(recipes):
+    """一页配方要用到的**全部** itemId（产物 + 材料），去重保序。
+
+    ⚠ **材料也要**：`0x0505` 的处理器 `0x4475ad` 逐条把 `mat+4` 拿去查
+    ItemDB，查不到就攒起来发一发 `0x0601`（用途标志 **3**）——
+    不先喂定义，材料槽就是四个没名字的空格子。
+    """
+    seen = []
+    for recipe in recipes:
+        for item_id in [recipe["result"]] + [m["id"] for m
+                                             in recipe.get("materials", ())]:
+            if item_id not in seen:
+                seen.append(int(item_id))
+    return seen
+
+
+# ---------------------------------------------------------------------------
+# `0x0606` 合成（客户端 → 服务端）/ `0x0506` gspRepComposeItem
+# ---------------------------------------------------------------------------
+def parse_compose_request(payload):
+    """`0x0606` 的载荷 → **产物 itemId**。单 `i32`（SetType `0x44768a`）。
+
+    ⚠⚠ **它不是配方号**（`0x45d738: push [rule+4]` —— push 的是 `CompositionRule`
+    的第一个字段，也就是产物）⇒ **一个产物只能有一条配方**，
+    `recipe.json` 里 `result` 撞车 `shopcfg.validate_recipes` 会拒收。
+    """
+    if len(payload) != 4:
+        raise ValueError("合成请求应当是 4 字节，收到 %d" % len(payload))
+    return struct.unpack("<i", payload)[0]
+
+
+#: `0x0506` 那一个 i32 = **结果码**（🔍静态，处理器 `0x4476c4` 的
+#: `sub eax,0 / dec eax` 链逐档解出来的，§33）：
+#:
+#: | 码 | 标题 | 正文（中文版对应的话）|
+#: |---|---|---|
+#: | 0 | 合成成功 | 「合成成功。请在我的仓库里装备道具。」（产物有天数时多一行期限）|
+#: | 1 | 合成失败 | 「金币不足…」|
+#: | 2 | 合成失败 | 「材料不足…」|
+#: | 4 | 合成失败 | 「要合成的道具已经在我的仓库里了。」|
+#: | 其余（含 **3**）| 合成失败 | 「未知的错误」|
+#:
+#: ⚠ **没有「等级太低」这一档** —— 这就是为什么等级只当列表过滤用（D27）。
+COMPOSE_OK = 0
+COMPOSE_NO_MONEY = 1
+COMPOSE_NO_MATERIAL = 2
+COMPOSE_ALREADY_OWNED = 4
+COMPOSE_UNKNOWN = 3           # 客户端在这一档上写「未知的错误」
+
+
+def build_rep_compose_item(code=COMPOSE_OK):
+    """opcode `0x0506` 的包体 —— 单 `i32` 结果码（Des `0x66623c` 那一族）。"""
+    return w_i32(code)
+
+
+#: 合不成的原因（服务端自己的说法，进日志）→ 客户端的结果码。
+#: ★ 和购买那一套一样分两层：日志要看得出是哪条规则拦的，界面只有 4 种说法。
+COMPOSE_NOT_LISTED = "not_listed"
+COMPOSE_UNKNOWN_ITEM = "unknown_item"
+COMPOSE_OWNED = "already_owned"
+COMPOSE_MATERIAL = "not_enough_materials"
+COMPOSE_MONEY = "not_enough_money"
+
+COMPOSE_REASON_CODE = {
+    COMPOSE_NOT_LISTED: COMPOSE_UNKNOWN,
+    COMPOSE_UNKNOWN_ITEM: COMPOSE_UNKNOWN,
+    COMPOSE_OWNED: COMPOSE_ALREADY_OWNED,
+    COMPOSE_MATERIAL: COMPOSE_NO_MATERIAL,
+    COMPOSE_MONEY: COMPOSE_NO_MONEY,
+}
+
+
+def compose_reason_code(reason):
+    """服务端的拒绝理由 → 客户端认得的结果码；认不出来一律「未知的错误」。
+
+    ★ 兜底和购买那边不一样：`0x0506` **没有「内部错误」这一档**，
+    能挑的只有那三个具体原因和一个「未知」。
+    """
+    return COMPOSE_REASON_CODE.get(reason, COMPOSE_UNKNOWN)
+
+
+def find_recipe(item_id, recipes):
+    """产物 itemId → 那一条配方；没有就 `None`。
+
+    ⚠ 只认 `listed` 的：管理页把一条关掉 = 合成界面里看不到它，
+    那就不该还能靠一发手搓的 `0x0606` 合出来。
+    """
+    item_id = int(item_id)
+    for recipe in recipes:
+        if int(recipe["result"]) == item_id and recipe.get("listed"):
+            return recipe
+    return None
+
+
+def check_compose(item_id, recipes, owned, money, materials):
+    """这一条能不能合。返回 `(配方, 原因)`；能合时原因是 `None`。
+
+    ★ **校验全做完再动存档** —— 和购买同一条理由（§30）：扣完钱才发现材料
+    不够就成了「钱没了东西没有」，那是最难查的一种账。真正的原子性由
+    `AccountStore.compose_item()` 在同一把锁里保证，这里只负责**挑原因码**。
+
+    ★ 顺序是「不存在 → 已拥有 → 材料 → 金币」：客户端的错误框一次
+    只显示一条，先报**玩家自己能补上**的那个（材料比金币更常见）。
+
+    ⚠ **没有等级这一条**（D27）—— 原版合成不看等级，见 `recipe_entries`。
+    """
+    recipe = find_recipe(item_id, recipes)
+    if recipe is None:
+        return None, COMPOSE_NOT_LISTED
+    result = int(recipe["result"])
+    if not shopdata.ownable(result):
+        return recipe, COMPOSE_UNKNOWN_ITEM
+    if result in owned:
+        return recipe, COMPOSE_OWNED
+    for material in recipe.get("materials", ()):
+        if int(materials.get(int(material["id"]), 0)) < int(material["count"]):
+            return recipe, COMPOSE_MATERIAL
+    if money is not None and money < int(recipe.get("cost", 0)):
+        return recipe, COMPOSE_MONEY
+    return recipe, None
+
+
+def recipe_material_map(recipe):
+    """一条配方的材料 → `{itemId: 数量}`（`AccountStore.consume_materials` 的入参）。"""
+    out = {}
+    for material in recipe.get("materials", ()):
+        item_id = int(material["id"])
+        out[item_id] = out.get(item_id, 0) + int(material["count"])
+    return out
+
+
+# ---------------------------------------------------------------------------
 # `0x0702` 穿上 / `0x0703` 脱下（客户端 → 服务端）—— 都回 `0x0604`
 # ---------------------------------------------------------------------------
 def parse_equip_request(payload):
@@ -612,6 +892,7 @@ REPAIR_UNLIMITED = -1
 ITEM_INFO_FOR_SHELF = 0       # 货架 0x0500 里有不认识的 id
 ITEM_INFO_FOR_INVENTORY = 1   # 持有物 0x0601 里有不认识的 id
 ITEM_INFO_FOR_EQUIPPED = 2    # ★ 装备清单 0x0604 里有不认识的 id
+ITEM_INFO_FOR_COMPOSITION = 3  # 合成配方 0x0505 里有不认识的 id（`0x447603: push 3`）
 ITEM_INFO_FOR_RESULT = 5      # 结算界面
 
 

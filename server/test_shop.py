@@ -13,8 +13,9 @@
 3. **发下去的 itemId 必须是客户端认得的**（`ownable`）—— 不然界面上是空格子
    或者一个提示框，比报错难查得多（§11 / §21）。
 
-★ 本模块还导出三个给 `test_gameserver` 用的东西：
-`parse_shop_item_list` / `parse_rep_equipped_list` / `shop_config`。
+★ 本模块还导出几个给 `test_gameserver` 用的东西：
+`parse_shop_item_list` / `parse_rep_equipped_list` / `parse_rep_composition_list`
+和 `shop_config` / `recipe_config`。
 """
 import contextlib
 import json
@@ -184,6 +185,55 @@ def shop_config(items=(), data_dir=None):
         finally:
             shopcfg.DATA_DIR = saved
             shopcfg.invalidate()
+
+
+@contextlib.contextmanager
+def recipe_config(recipes=(), data_dir=None):
+    """临时把 `shopcfg` 指到一份现搓的 `recipe.json` 上。
+
+    和 `shop_config` 同一套路数、同一个理由 —— 合成界面里有什么，
+    不该取决于开发机上那份用户随时在改的 `recipe.json`。
+    """
+    saved = shopcfg.DATA_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        target = data_dir or tmp
+        path = shopcfg.path_of(shopcfg.RECIPE_FILENAME, target)
+        with open(path, "w", encoding="utf-8", newline="\n") as fp:
+            json.dump({"format": 1, "recipes": list(recipes)}, fp,
+                      ensure_ascii=False)
+        shopcfg.DATA_DIR = target
+        shopcfg.invalidate()
+        # ★ 立刻读一遍确认它过得了校验。配置读坏时 `shopcfg` 是**返回空表 +
+        #   警告**（D10），用例看到的就是「一条配方都没有」—— 和「过滤器把
+        #   它们滤掉了」长得一模一样。踩过一次（配方号撞车），所以在这儿拦。
+        _, warnings = shopcfg.recipes(target)
+        assert not warnings, "用例铺的 recipe.json 自己就不合法: %r" % (warnings,)
+        try:
+            yield target
+        finally:
+            shopcfg.DATA_DIR = saved
+            shopcfg.invalidate()
+
+
+def parse_rep_composition_list(body):
+    """`0x0505` 的包体 → `(总页数, 当前页, [配方…])`。
+
+    照 `gspRepCompositionList::Deserialize 0x443ae1` → `CompositionRule
+    0x44394d` → `CompositionMaterial 0x4438dc` 逐层写的（§27）。
+    ★ 材料数量是 **i16** —— 写成 i32 的话这里第一个读歪。
+    """
+    wire = _Wire(body)
+    pages, page, count = wire.i32(), wire.i32(), wire.i32()
+    rules = []
+    for _ in range(count):
+        rule = {"result": wire.i32(), "cost": wire.i32()}
+        rule["materials"] = [(wire.i32(), wire.i16())
+                             for _ in range(wire.i32())]
+        rule["days"] = wire.i32()
+        wire.i32()                            # ❌ 死字段
+        rules.append(rule)
+    wire.done()
+    return pages, page, rules
 
 
 class _ShopCase(unittest.TestCase):
@@ -744,6 +794,257 @@ class InventoryTests(_ShopCase):
     def test_空仓库也是一个合法包体(self):
         # 不发的话仓库面板等一个永远不来的应答。
         self.assertEqual([], parse_rep_inventory(shop.build_rep_inventory([])))
+
+
+class CompositionListTests(_ShopCase):
+    """`0x0605` 上行配方列表请求 / `0x0505` 下行配方（§27 / M7）。"""
+
+    #: 小表里能当产物的三件（上衣 / 下装 / 武器），和一种材料。
+    #: ★ 配方号自己往上数 —— 撞车的话 `validate_recipes` 直接拒收整份文件，
+    #:   用例会退化成「配方表是空的」，看上去像过滤器写错了。
+    def setUp(self):
+        super().setUp()
+        self.next_recipe_id = 0
+
+    def recipe(self, result, cost=100, materials=None, **kw):
+        self.next_recipe_id += 1
+        entry = {"id": kw.pop("id", self.next_recipe_id), "result": result,
+                 "cost": cost, "listed": kw.pop("listed", True),
+                 "materials": materials or [{"id": 30018, "count": 2}]}
+        entry.update(kw)
+        return entry
+
+    def test_线格式能被照客户端写的解析器读回来(self):
+        body = shop.build_rep_composition_list(
+            3, 1, [shop.build_composition_rule(
+                1010001, 2500,
+                [{"id": 30018, "count": 2}, {"id": 1020001, "count": 1}],
+                days=7)])
+        pages, page, rules = parse_rep_composition_list(body)
+        self.assertEqual((3, 1), (pages, page))
+        self.assertEqual([{"result": 1010001, "cost": 2500,
+                           "materials": [(30018, 2), (1020001, 1)],
+                           "days": 7}], rules)
+
+    def test_材料数量是_i16_不是_i32(self):
+        """★ 确认框读的是 `movsx eax, word [mat+8]`（§27）——
+        写成 i32 的话「要 2 个」会被读成 2，但**下一格材料 id 整体错位**。"""
+        raw = shop.build_composition_material(30018, 300)
+        self.assertEqual(6, len(raw))
+        self.assertEqual((30018, 300), struct.unpack("<ih", raw))
+
+    def test_超过四种材料要抛(self):
+        # 界面只有 4 个槽，第 5 种玩家根本看不见 —— 静默发出去等于骗人。
+        with self.assertRaises(ValueError):
+            shop.build_composition_rule(
+                1010001, 100, [{"id": 30018, "count": 1}] * 5)
+
+    def test_只列上架的(self):
+        with recipe_config([self.recipe(1010001),
+                            self.recipe(1020001, listed=False)]):
+            shown, _ = shop.recipe_entries()
+        self.assertEqual([1010001], [r["result"] for r in shown])
+
+    def test_物品表变了之后运行时还有第二道闸(self):
+        """产物进不了背包（§11）的一律不列 —— 发下去客户端查不到定义。
+
+        ★ 写配置那会儿 `validate_recipes` 已经挡了一道，这条守的是**后来**
+        `shop_items.json` 变了的情况（和货架那条同源，理由见
+        `ShelfTests.test_物品表变了之后运行时还有第二道闸`）。
+        """
+        with recipe_config([self.recipe(1010001),
+                            self.recipe(1020001)]) as data_dir:
+            before, _ = shop.recipe_entries(data_dir=data_dir)
+            self.assertEqual([1010001, 1020001],
+                             [r["result"] for r in before])
+            table = dict(SYNTHETIC)
+            table["1020001"] = dict(table["1020001"], ownable=False)
+            path = os.path.join(self.tmp.name, "shrunk.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as fp:
+                json.dump(make_table(table), fp, ensure_ascii=False)
+            shopdata.STORE = shopdata._Store(path)
+            shown, _ = shop.recipe_entries(data_dir=data_dir)
+        self.assertEqual([1010001], [r["result"] for r in shown])
+
+    def test_按标签过滤(self):
+        with recipe_config([self.recipe(1010001), self.recipe(1020001)]):
+            上衣, _ = shop.recipe_entries(category=0x10001)
+            下装, _ = shop.recipe_entries(category=0x10002)
+            整组, _ = shop.recipe_entries(category=0x10000)
+        self.assertEqual([1010001], [r["result"] for r in 上衣])
+        self.assertEqual([1020001], [r["result"] for r in 下装])
+        self.assertEqual([1010001, 1020001], [r["result"] for r in 整组])
+
+    def test_配方没有等级门(self):
+        """★★ D27：原版的合成面板**从头到尾不读玩家等级**，`0x0506` 也没有
+        「等级太低」这一档。加过一版「等级不到就不列」，2026-09-05 实机被
+        用户报「管理页明明上架了，游戏里看不到」—— 那是发明出来的规则。
+
+        判据：`level` 键**根本进不了解析结果**（老 `recipe.json` 里残留的
+        会被 `validate_recipes` 丢掉），所以过滤器不可能再用上它。
+        """
+        with recipe_config([dict(self.recipe(1010001), level=99),
+                            dict(self.recipe(1020001), level=1)]):
+            shown, _ = shop.recipe_entries()
+        self.assertEqual([1010001, 1020001], [r["result"] for r in shown])
+        self.assertNotIn("level", shown[0])
+
+    def test_配方自己写了角色就按它_没写才看产物(self):
+        with recipe_config([self.recipe(1010001, character=1),
+                            self.recipe(1020001)]):
+            角色0, _ = shop.recipe_entries(character=0)
+            角色1, _ = shop.recipe_entries(character=1)
+            不限, _ = shop.recipe_entries(character=shop.CHARACTER_ANY)
+        # 1010001 本身是角色 0 的装备，但配方写死了角色 1 -> 按配方走。
+        self.assertEqual([1020001], [r["result"] for r in 角色0])
+        self.assertEqual([1010001], [r["result"] for r in 角色1])
+        self.assertEqual([1010001, 1020001], [r["result"] for r in 不限])
+
+    def test_一页八条_和货架一样(self):
+        """★ 判据是 `0x45f011` 的循环走 `0..0x100` 步长 `0x20`（8 格），
+        不是「货架是 8 所以合成也是 8」。"""
+        self.assertEqual(8, shop.COMPOSITION_PAGE_SIZE)
+
+    def test_分页与总页数(self):
+        recipes = [self.recipe(1010001, id=1), self.recipe(1020001, id=2),
+                   self.recipe(1120041, id=3)]
+        with recipe_config(recipes):
+            body, shown, _ = shop.composition_page()
+            pages, page, rules = parse_rep_composition_list(body)
+        self.assertEqual((1, 0), (pages, page))
+        self.assertEqual(3, len(rules))
+        self.assertEqual([r["result"] for r in shown],
+                         [r["result"] for r in rules])
+
+    def test_一条配方都没有也报一页(self):
+        """★ 总页数发 0 会让客户端把当前页夹成 -1（`0x45efb9` 的 `dec ecx`）。"""
+        with recipe_config([]):
+            body, shown, _ = shop.composition_page()
+        self.assertEqual([], shown)
+        self.assertEqual((1, 0, []), parse_rep_composition_list(body))
+
+    def test_越界的页号被夹回来(self):
+        with recipe_config([self.recipe(1010001)]):
+            body, _, _ = shop.composition_page(page=9)
+        self.assertEqual((1, 0), parse_rep_composition_list(body)[:2])
+
+    def test_排序是全序(self):
+        # 同产物排序键会撞车时靠配方号兜底 —— 不然翻页会重复或漏格。
+        first = self.recipe(1010001, id=7)
+        second = self.recipe(1020001, id=3)
+        self.assertEqual([1010001, 1020001],
+                         [r["result"] for r in
+                          shop.sort_recipes([second, first])])
+        self.assertEqual([1010001, 1020001],
+                         [r["result"] for r in
+                          shop.sort_recipes([first, second])])
+
+    def test_产物和材料的_id_都要喂定义(self):
+        """⚠ `0x0505` 的处理器逐条查产物 `rule+4` **和每一种材料** `mat+4`
+        （`0x447575` / `0x4475bf`）—— 少喂材料，四个槽就是没名字的空格子。"""
+        recipes = [self.recipe(1010001,
+                               materials=[{"id": 30018, "count": 2},
+                                          {"id": 1020001, "count": 1}]),
+                   self.recipe(1120041, materials=[{"id": 30018, "count": 1}])]
+        self.assertEqual([1010001, 30018, 1020001, 1120041],
+                         shop.composition_item_ids(recipes))
+
+    def test_合成的用途标志是三(self):
+        # `0x447603: push 3` —— 客户端问定义时带的就是它。
+        self.assertEqual(3, shop.ITEM_INFO_FOR_COMPOSITION)
+
+
+class ComposeTests(_ShopCase):
+    """`0x0606` 上行合成 / `0x0506` 下行结果码（§27 / §33）。"""
+
+    RECIPE = {"id": 1, "result": 1010001, "cost": 500, "listed": True,
+              "character": None, "days": 0,
+              "materials": [{"id": 30018, "count": 2}]}
+
+    def test_上行带的是产物_id_不是配方号(self):
+        self.assertEqual(1010001,
+                         shop.parse_compose_request(struct.pack("<i", 1010001)))
+        for payload in (b"", b"\x00" * 3, b"\x00" * 8):
+            with self.assertRaises(ValueError):
+                shop.parse_compose_request(payload)
+
+    def test_结果码就是那一个_i32(self):
+        for code in (shop.COMPOSE_OK, shop.COMPOSE_NO_MONEY,
+                     shop.COMPOSE_NO_MATERIAL, shop.COMPOSE_ALREADY_OWNED):
+            body = shop.build_rep_compose_item(code)
+            self.assertEqual(4, len(body))
+            self.assertEqual(code, struct.unpack("<i", body)[0])
+
+    def test_客户端认得的四档就是这四个数(self):
+        """★ 处理器 `0x4476c4` 的 `sub eax,0 / dec eax` 链（§33）：
+        0 成功 / 1 金币不足 / 2 材料不足 / 4 已拥有，**3 落进「未知的错误」**。"""
+        self.assertEqual((0, 1, 2, 4),
+                         (shop.COMPOSE_OK, shop.COMPOSE_NO_MONEY,
+                          shop.COMPOSE_NO_MATERIAL, shop.COMPOSE_ALREADY_OWNED))
+        self.assertEqual(3, shop.COMPOSE_UNKNOWN)
+
+    def test_每条拒绝理由都挑得出码(self):
+        self.assertEqual(shop.COMPOSE_NO_MONEY,
+                         shop.compose_reason_code(shop.COMPOSE_MONEY))
+        self.assertEqual(shop.COMPOSE_NO_MATERIAL,
+                         shop.compose_reason_code(shop.COMPOSE_MATERIAL))
+        self.assertEqual(shop.COMPOSE_ALREADY_OWNED,
+                         shop.compose_reason_code(shop.COMPOSE_OWNED))
+        # 认不出来的兜底不是 0（0 在这一发上是「成功」！）。
+        self.assertEqual(shop.COMPOSE_UNKNOWN,
+                         shop.compose_reason_code("没见过的理由"))
+        self.assertNotEqual(shop.COMPOSE_OK,
+                            shop.compose_reason_code("没见过的理由"))
+
+    def check(self, owned=(), money=10000, materials=None,
+              recipes=None, item_id=1010001):
+        return shop.check_compose(item_id, recipes or [self.RECIPE],
+                                  set(owned), money,
+                                  materials if materials is not None
+                                  else {30018: 5})
+
+    def test_全都够就放行(self):
+        recipe, why = self.check()
+        self.assertIsNone(why)
+        self.assertEqual(1010001, recipe["result"])
+
+    def test_没有这条配方(self):
+        self.assertEqual(shop.COMPOSE_NOT_LISTED, self.check(item_id=999999)[1])
+
+    def test_下架的配方合不出来(self):
+        """⚠ 管理页关掉一条 = 界面上看不到它，那就不该还能靠手搓的
+        `0x0606` 合出来。"""
+        closed = dict(self.RECIPE, listed=False)
+        self.assertEqual(shop.COMPOSE_NOT_LISTED, self.check(recipes=[closed])[1])
+
+    def test_已经有了(self):
+        self.assertEqual(shop.COMPOSE_OWNED, self.check(owned=[1010001])[1])
+
+    def test_材料不够(self):
+        self.assertEqual(shop.COMPOSE_MATERIAL,
+                         self.check(materials={30018: 1})[1])
+        self.assertEqual(shop.COMPOSE_MATERIAL, self.check(materials={})[1])
+
+    def test_金币不够(self):
+        self.assertEqual(shop.COMPOSE_MONEY, self.check(money=499)[1])
+        self.assertIsNone(self.check(money=500)[1])
+
+    def test_材料比金币先报(self):
+        """两样都缺时先说材料 —— 客户端的错误框一次只显示一条，
+        先报玩家自己攒得出来的那个。"""
+        self.assertEqual(shop.COMPOSE_MATERIAL,
+                         self.check(money=0, materials={})[1])
+
+    def test_同一种材料写两格会合并(self):
+        recipe = dict(self.RECIPE,
+                      materials=[{"id": 30018, "count": 2},
+                                 {"id": 30018, "count": 3}])
+        self.assertEqual({30018: 5}, shop.recipe_material_map(recipe))
+
+    def test_按产物找配方只认上架的(self):
+        self.assertIsNone(shop.find_recipe(
+            1010001, [dict(self.RECIPE, listed=False)]))
+        self.assertIsNotNone(shop.find_recipe(1010001, [self.RECIPE]))
 
 
 if __name__ == "__main__":

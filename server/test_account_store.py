@@ -956,6 +956,80 @@ class ItemFieldTests(unittest.TestCase):
                 self.store.consume_materials("alice", bad)
             self.assertEqual("invalid_material", caught.exception.code)
 
+    # ------------------------------------------------------------ 合成（M7）
+    def stocked(self, money=1000, materials=None):
+        """给 alice 铺一份「合得起」的家底。"""
+        self.store.add_quest_reward("alice", money=money)
+        self.store.add_materials("alice",
+                                 materials or {BRONZE_PIPE: 3, BLACK_BEAD: 2})
+
+    def test_compose_deducts_money_and_materials_and_adds_the_item(self):
+        self.stocked()
+        account = self.store.compose_item(
+            "alice", TOP_ARMOR, 400, {BRONZE_PIPE: 2, BLACK_BEAD: 1})
+        self.assertEqual(600, player_money(account))
+        self.assertEqual({BRONZE_PIPE: 1, BLACK_BEAD: 1},
+                         material_counts(account))
+        self.assertEqual({TOP_ARMOR: 1}, {k: v["count"] for k, v
+                                          in inventory_items(account).items()})
+        # 落盘了，不只是内存里的那份。
+        saved = self.saved()["accounts"]["alice"]
+        self.assertEqual(600, saved["money"])
+        self.assertIn(str(TOP_ARMOR), saved["inventory"])
+
+    def test_compose_is_atomic_when_money_is_short(self):
+        """★★ 铁律 11：崩在中间老数据还得在。金币不够时**一个字节都不写**
+        —— 拿 `spend_money` + `consume_materials` + `add_item` 拼出来的话，
+        材料已经没了才发现钱不够。"""
+        self.stocked(money=100)
+        before = self.raw_bytes()
+        with self.assertRaises(AccountError) as caught:
+            self.store.compose_item("alice", TOP_ARMOR, 400, {BRONZE_PIPE: 2})
+        self.assertEqual("not_enough_money", caught.exception.code)
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_compose_is_atomic_when_materials_are_short(self):
+        self.stocked()
+        before = self.raw_bytes()
+        with self.assertRaises(AccountError) as caught:
+            self.store.compose_item("alice", TOP_ARMOR, 400, {BRONZE_PIPE: 9})
+        self.assertEqual("not_enough_materials", caught.exception.code)
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_compose_refuses_when_already_owned(self):
+        """原版失败文案 `이미 소지하고 있습니다`（§7）。★ 这道闸在锁里，
+        `shop.check_compose` 那一轮只是为了挑错误码。"""
+        self.stocked()
+        self.store.add_item("alice", TOP_ARMOR)
+        before = self.raw_bytes()
+        with self.assertRaises(AccountError) as caught:
+            self.store.compose_item("alice", TOP_ARMOR, 400, {BRONZE_PIPE: 2})
+        self.assertEqual("already_owned", caught.exception.code)
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_compose_rejects_ids_the_client_does_not_know(self):
+        self.stocked()
+        for bad in (STOCK_ONLY, NO_SUCH_ITEM):
+            with self.assertRaises(AccountError) as caught:
+                self.store.compose_item("alice", bad, 0, {})
+            self.assertEqual("unknown_item", caught.exception.code)
+
+    def test_compose_deletes_a_material_slot_when_used_up(self):
+        self.stocked(materials={BRONZE_PIPE: 2})
+        self.store.compose_item("alice", TOP_ARMOR, 0, {BRONZE_PIPE: 2})
+        self.assertNotIn(str(BRONZE_PIPE),
+                         self.saved()["accounts"]["alice"]["materials"])
+
+    def test_compose_without_cost_or_materials_still_works(self):
+        # 管理页把花费和材料都清成 0 是合法配置，别让它抛。
+        account = self.store.compose_item("alice", TOP_ARMOR, 0, {})
+        self.assertIn(TOP_ARMOR, inventory_items(account))
+
+    def test_compose_rejects_a_negative_cost(self):
+        with self.assertRaises(AccountError) as caught:
+            self.store.compose_item("alice", TOP_ARMOR, -1, {})
+        self.assertEqual("invalid_amount", caught.exception.code)
+
     # ------------------------------------------------------- 幂等补齐（D5）
     def test_ensure_item_fields_backfills_an_old_save(self):
         store = self.write_raw({
