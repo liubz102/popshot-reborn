@@ -58,11 +58,11 @@ class _CfgCase(unittest.TestCase):
 
 class EnsureFilesTests(_CfgCase):
 
-    def test_creates_three_files(self):
+    def test_creates_every_config_file(self):
+        # ★ 拿 `_SPECS` 当判据，不写死一张清单 —— 加一份配置时这条要么
+        #   自动跟上，要么在别处红，总之不会悄悄漏掉新文件。
         created = shopcfg.ensure_files(self.dir)
-        self.assertEqual(sorted(created),
-                         sorted([shopcfg.SHOP_FILENAME, shopcfg.RECIPE_FILENAME,
-                                 shopcfg.DROPS_FILENAME]))
+        self.assertEqual(sorted(created), sorted(shopcfg._SPECS))
         for name in created:
             self.assertTrue(os.path.isfile(os.path.join(self.dir, name)))
 
@@ -91,8 +91,7 @@ class EnsureFilesTests(_CfgCase):
     def test_generated_files_are_lf_without_bom(self):
         # 铁律 3：.json 一律 LF 无 BOM（服务端包要在 Linux 上跑）。
         shopcfg.ensure_files(self.dir)
-        for name in (shopcfg.SHOP_FILENAME, shopcfg.RECIPE_FILENAME,
-                     shopcfg.DROPS_FILENAME):
+        for name in shopcfg._SPECS:
             with open(os.path.join(self.dir, name), "rb") as fp:
                 raw = fp.read()
             self.assertNotIn(b"\r", raw, name + " 里有 CR")
@@ -101,7 +100,8 @@ class EnsureFilesTests(_CfgCase):
     def test_generated_files_pass_their_own_validators(self):
         # 生成出来的东西必须自己能读回去 —— 否则第一次启动就是坏的。
         shopcfg.ensure_files(self.dir)
-        for loader in (shopcfg.shop, shopcfg.recipes, shopcfg.drops):
+        for loader in (shopcfg.items, shopcfg.shop, shopcfg.recipes,
+                       shopcfg.drops):
             _parsed, warnings = loader(self.dir)
             self.assertEqual([], warnings)
 
@@ -418,9 +418,6 @@ class ValidateRecipeTests(_CfgCase):
     def test_rejects_unknown_result(self):
         self.bad("不在 shop_items.json", result=999999)
 
-    def test_rejects_bad_character(self):
-        self.bad("character", character=9)
-
     def test_rejects_zero_count(self):
         self.bad("count", materials=[{"id": 30018, "count": 0}])
 
@@ -445,6 +442,53 @@ class ValidateRecipeTests(_CfgCase):
             dict(self.BASE, id=1),
             dict(self.BASE, id=2, result=1020001)]})
         self.assertEqual([1010001, 1020001], [r["result"] for r in got])
+
+
+class ValidateItemsTests(_CfgCase):
+    """物品库 `items.json` —— 等级门槛 + 角色限定的唯一出处（D31）。"""
+
+    BASE = {"id": 1120041, "level": 5}
+
+    def ok(self, **over):
+        entry = dict(self.BASE)
+        entry.update(over)
+        return shopcfg.validate_items({"items": [entry]})
+
+    def bad(self, fragment=None, **over):
+        with self.assertRaises(shopcfg.ConfigError) as ctx:
+            self.ok(**over)
+        if fragment:
+            self.assertIn(fragment, str(ctx.exception))
+
+    def test_minimal(self):
+        got = self.ok()
+        self.assertEqual(5, got[1120041]["level"])
+        self.assertIsNone(got[1120041]["character"])   # 没写 = 不限
+        self.assertEqual("weapon", got[1120041]["kind"])
+
+    def test_character_is_optional_but_bounded(self):
+        self.assertEqual(2, self.ok(character=2)[1120041]["character"])
+        self.bad("character", character=9)
+        self.bad("character", character=-1)
+
+    def test_rejects_a_level_below_one(self):
+        self.bad("level", level=0)
+
+    def test_rejects_duplicate(self):
+        with self.assertRaises(shopcfg.ConfigError):
+            shopcfg.validate_items({"items": [dict(self.BASE),
+                                              dict(self.BASE)]})
+
+    def test_rejects_things_you_cannot_wear(self):
+        """★ 材料 / 消耗品没有「几级能穿」这回事 —— 客户端根本不读那两格。
+
+        收进来的唯一后果是让人以为设了个门槛，实际什么都没发生。
+        """
+        self.bad("不占装备槽", id=30018)                # 青铜管（材料）
+
+    def test_rejects_unknown_and_stock_only_ids(self):
+        self.bad("不在 shop_items.json", id=999999)
+        self.bad("进不了背包", id=1510001)
 
 
 class ValidateDropsTests(_CfgCase):

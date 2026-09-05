@@ -73,10 +73,10 @@ function bounced(result) {
 var CAT = null;             // /admin/api/catalog 的结果
 var BYID = {};              // itemId -> 物品
 var CFG = {};               // {shop: {format, entries, snapshot, warnings, hadNotes}}
-var CURRENT = "shop";       // 当前标签页
+var CURRENT = "items";      // 当前标签页（物品库是另外两份的地基，排最前）
 var FILTER = {};            // 每个标签页各自的筛选条件
 
-var CONFIGS = ["shop", "recipe", "drops"];
+var CONFIGS = ["items", "shop", "recipe", "drops"];
 
 /* ======================================================================
    物品图标 —— 一张图集切出来
@@ -220,18 +220,66 @@ function paintTip(itemId) {
     });
     box.appendChild(body);
   }
-  var entry = shopEntryOf(itemId);
+  // ---- 等级 / 角色限定：取**物品库**那一份（D31），没登记就说清楚 ----
+  var rule = itemRuleOf(itemId);
+  var line = el("div", "t-meta");
+  line.appendChild(document.createTextNode(
+    (rule.character === null ? "不限角色"
+      : (CAT.characters[String(rule.character)] || ("角色" + rule.character)))
+    + "　" + (rule.level > 1 ? ("需 " + rule.level + " 级") : "不限等级")
+    + (rule.known ? "" : "（物品库里没登记）")));
+  box.appendChild(line);
+
+  // ---- 上架状态：商店 / 合成 / 未上架（互斥），带上代价 ----
+  var where = listingOf(itemId);
   var shop = el("div", "t-shop");
-  if (!entry) {
-    shop.appendChild(el("span", null, "商店目录里没有这一条"));
-  } else if (entry.listed) {
+  if (where === "shop") {
+    var entry = shopEntryOf(itemId);
     shop.appendChild(el("span", "on", "★ 商店在卖"));
-    shop.appendChild(el("span", null, (entry.price || 0) + " 金币"));
-    shop.appendChild(el("span", null, "需 " + (entry.level || 1) + " 级"));
+    shop.appendChild(el("span", null, ((entry && entry.price) || 0) + " 金币"));
+  } else if (where === "recipe") {
+    var recipe = recipeOf(itemId);
+    shop.appendChild(el("span", "on", "★ 合成产出"));
+    shop.appendChild(el("span", null, ((recipe && recipe.cost) || 0) + " 金币"));
+    ((recipe && recipe.materials) || []).forEach(function (need) {
+      var name = (BYID[need.id] && BYID[need.id].name) || ("#" + need.id);
+      shop.appendChild(el("span", null, name + "×" + need.count));
+    });
   } else {
-    shop.appendChild(el("span", null, "没上架"));
+    shop.appendChild(el("span", null, "未上架"));
   }
   box.appendChild(shop);
+}
+
+/** 这件东西现在**上架在哪条配方**里；没有就 `null`。 */
+function recipeOf(itemId) {
+  var found = null;
+  ((CFG.recipe && CFG.recipe.entries) || []).forEach(function (entry) {
+    if (entry && entry.listed && Number(entry.result) === Number(itemId)) {
+      found = entry;
+    }
+  });
+  return found;
+}
+
+/** 物品库里登记的等级 / 角色限定。没登记就退回原版数据（和服务端
+    `shopcfg.rule_of()` 同一条退路），并且**说出来是退回来的**。 */
+function itemRuleOf(itemId) {
+  var found = null;
+  ((CFG.items && CFG.items.entries) || []).forEach(function (entry) {
+    if (entry && Number(entry.id) === Number(itemId)) { found = entry; }
+  });
+  if (found) {
+    return {level: Number(found.level) || 1,
+            character: (found.character === undefined
+                        || found.character === null) ? null : found.character,
+            known: true};
+  }
+  var item = BYID[itemId];
+  return {level: 1,
+          character: (item && item.character !== undefined)
+            ? item.character : null,
+          known: false};
 }
 
 function showTip(itemId) {
@@ -509,22 +557,71 @@ function collect(which) {
   return payload;
 }
 
-async function saveConfig(which) {
+/** 商店和合成**互斥**（用户 2026-09-06）：一件东西不能两边都上架。
+ *
+ * 返回 `true` = 可以往下存。撞车时弹一句话问清楚，管理员点「确定」就
+ * **把另一边那些条目的 `listed` 关掉**（连带那一份也一起存）。
+ *
+ * ★ 为什么在前台做而不是让服务端拒收：服务端一次只收一份文件，
+ *   「先存哪一份」都会在中间那一刻出现「两边都上架」而被拒 —— 那是个
+ *   解不开的死结。前台手里两份都有，能一次把话说完再一起存。
+ *   （服务端那道 `validate_*` 一个字没动，还是最后的护栏。）
+ */
+async function resolveListingClash(which) {
+  var other = (which === "shop") ? "recipe" : "shop";
+  if (!CFG[other]) { return true; }
+  var mine = {};
+  CFG[which].entries.forEach(function (entry) {
+    if (entry && entry.listed) {
+      mine[Number(which === "shop" ? entry.id : entry.result)] = true;
+    }
+  });
+  var clash = [];
+  CFG[other].entries.forEach(function (entry) {
+    if (!entry || !entry.listed) { return; }
+    var id = Number(other === "shop" ? entry.id : entry.result);
+    if (mine[id]) { clash.push({entry: entry, id: id}); }
+  });
+  if (!clash.length) { return true; }
+  var names = clash.map(function (row) {
+    return "· " + ((BYID[row.id] && BYID[row.id].name) || ("#" + row.id));
+  }).join("\n");
+  var question = (which === "shop")
+    ? "以下物品已在合成中上架，若继续选择在商店上架，则自动下架合成。\n\n"
+    : "以下物品已在商店上架，若继续选择在合成中上架，则自动下架商店。\n\n";
+  if (!window.confirm(question + names)) { return false; }
+  clash.forEach(function (row) { row.entry.listed = false; });
+  // ★ **先存另一边**：这一份存进去之后，另一份如果存失败，画面上还留着
+  //   「有未保存的修改」，人看得见。反过来（先存自己）失败的那一份是
+  //   刚被我们改过的，用户根本没动过，更容易被忽略。
+  var saved = await saveConfig(other, true);
+  if (!saved) { return false; }
+  return true;
+}
+
+async function saveConfig(which, skipClashCheck) {
+  if (!skipClashCheck && (which === "shop" || which === "recipe")) {
+    if (!(await resolveListingClash(which))) {
+      say($("cfgMsg"), "已取消，什么都没保存。", false);
+      return false;
+    }
+  }
   say($("cfgMsg"), "保存中……", true);
   clearBadCards();
   var result = await api("/admin/api/config/" + which,
                          {text: JSON.stringify(collect(which), null, 2)});
-  if (bounced(result)) { return; }
+  if (bounced(result)) { return false; }
   if (result.ok) {
     CFG[which].snapshot = snapshot(which);
     CFG[which].hadNotes = false;
     CFG[which].warnings = [];
     renderCurrent();
     say($("cfgMsg"), result.message, true);
-    return;
+    return true;
   }
-  say($("cfgMsg"), result.message, false);
-  markBadCard(result.message);
+  say($("cfgMsg"), which + "：" + result.message, false);
+  if (which === CURRENT) { markBadCard(result.message); }
+  return false;
 }
 
 /** 服务端的错误里带着下标（`recipes[3].materials[1].id：…`），定位过去。 */
@@ -582,7 +679,7 @@ function renderCurrent() {
   renderToolbar(which);
   var list = $("cfgList");
   list.textContent = "";
-  var render = {shop: renderShop, recipe: renderRecipe, drops: renderDrops}[which];
+  var render = RENDERERS[which];
   render(list);
   touched();
 }
@@ -601,13 +698,26 @@ function renderToolbar(which) {
   search.oninput = function () { filter.q = search.value.trim(); repaintList(); };
   bar.appendChild(search);
 
-  if (which === "shop") {
+  if (which === "items" || which === "shop") {
+    // ★ 物品库的类别下拉列**全部类别**（和「选择物品」弹窗一个口径），
+    //   不是「这份文件里出现过的类别」—— 筛出空列表也是有用的信息
+    //   （「原来一件宠物都没登记」）。
+    var kinds = (which === "items")
+      ? Object.keys(CAT.kinds).sort()
+      : uniq(CFG[which].entries.map(function (e) { return e.kind; }));
     bar.appendChild(selectFilter(filter, "kind", "全部类别",
-      uniq(CFG.shop.entries.map(function (e) { return e.kind; }))
-        .map(function (k) { return {value: k, label: CAT.kinds[k] || k}; })));
+      kinds.map(function (k) { return {value: k, label: CAT.kinds[k] || k}; })));
     bar.appendChild(selectFilter(filter, "character", "全部角色",
       Object.keys(CAT.characters).map(function (k) {
         return {value: k, label: CAT.characters[k]}; })));
+  }
+  if (which === "items") {
+    // 上架状态：一件东西要么在商店卖、要么靠合成拿、要么都不是（互斥）。
+    bar.appendChild(selectFilter(filter, "listing", "全部", [
+      {value: "shop", label: "只看上架商店"},
+      {value: "recipe", label: "只看上架合成"},
+      {value: "any", label: "只看已上架"},
+      {value: "none", label: "只看未上架"}]));
   }
   if (which === "recipe") {
     bar.appendChild(selectFilter(filter, "character", "全部角色",
@@ -618,7 +728,7 @@ function renderToolbar(which) {
     bar.appendChild(selectFilter(filter, "mode", "全部模式",
       [{value: "quest", label: "闯关"}, {value: "pvp", label: "对战"}]));
   }
-  if (which !== "drops") {
+  if (which === "shop" || which === "recipe") {
     var only = el("label", "toggle" + (filter.listedOnly ? " on" : ""));
     only.appendChild(el("span", "track"));
     only.appendChild(el("span", null, "只看上架"));
@@ -657,10 +767,15 @@ function uniq(values) {
   return out.sort();
 }
 
+//: 每个配置标签页画成什么样。★ 加一份配置时只要在这儿登记一行。
+//  （函数声明会被提升，所以写在它们前面没问题。）
+var RENDERERS = {items: renderItems, shop: renderShop,
+                 recipe: renderRecipe, drops: renderDrops};
+
 function repaintList() {
   var list = $("cfgList");
   list.textContent = "";
-  ({shop: renderShop, recipe: renderRecipe, drops: renderDrops})[CURRENT](list);
+  RENDERERS[CURRENT](list);
   touched();
 }
 
@@ -668,6 +783,13 @@ function repaintList() {
 function matches(which, entry) {
   var filter = FILTER[which] || {};
   if (filter.listedOnly && !entry.listed) { return false; }
+  if (filter.listing) {
+    var where = listingOf(entry.id);          // "shop" / "recipe" / ""
+    if (filter.listing === "any" && !where) { return false; }
+    if (filter.listing === "none" && where) { return false; }
+    if ((filter.listing === "shop" || filter.listing === "recipe")
+        && where !== filter.listing) { return false; }
+  }
   if (filter.mode && (entry.mode || "quest") !== filter.mode) { return false; }
   var itemId = entry.id || entry.result || entry.material;
   var item = BYID[itemId];
@@ -711,6 +833,84 @@ function killButton(which, index) {
     repaintList();
   };
   return button;
+}
+
+/* -------------------------------------------------- 物品库：卡片网格 */
+
+/** 这件东西现在**上架在哪儿**：`"shop"` / `"recipe"` / `""`（都没有）。
+ *
+ * ★ 取的是**当前页面模型**（还没保存的改动也算）—— 和 `listedIds()`
+ *   一个口径：管理员刚把一件东西勾上，浮窗和筛选就该跟着说。
+ * ★ 商店和合成**互斥**（用户 2026-09-06）；真出现两边都上架的脏数据时
+ *   先说商店 —— 保存时那道确认框会把它掰回互斥。
+ */
+function listingOf(itemId) {
+  var id = Number(itemId);
+  var where = "";
+  ((CFG.recipe && CFG.recipe.entries) || []).forEach(function (entry) {
+    if (entry && entry.listed && Number(entry.result) === id) { where = "recipe"; }
+  });
+  ((CFG.shop && CFG.shop.entries) || []).forEach(function (entry) {
+    if (entry && entry.listed && Number(entry.id) === id) { where = "shop"; }
+  });
+  return where;
+}
+
+var LISTING_ZH = {shop: "商店", recipe: "合成", "": "未上架"};
+
+/** 物品库一页最多画几张卡。
+ *
+ * ★ 全表有 700 多件能穿的东西，一次全画出来 DOM 会卡（和「选择物品」弹窗
+ *   `PICK_LIMIT` 同一个理由）。超出的用上面的筛选缩小范围 —— 筛选条件
+ *   在服务端那边不存在，纯粹是画面上的事，所以这个数**是界面取舍，
+ *   不是铁律 10 说的那种时序阈值**。
+ */
+var ITEM_LIMIT = 120;
+
+function renderItems(list) {
+  var grid = el("div", "grid");
+  var drawn = 0;
+  var over = 0;
+  eachVisible("items", function (entry, index) {
+    if (drawn >= ITEM_LIMIT) { over += 1; return; }
+    drawn += 1;
+    var where = listingOf(entry.id);
+    var card = el("div", "item-card" + (where ? " listed" : ""));
+    card.setAttribute("data-index", index);
+    card.appendChild(killButton("items", index));
+
+    var slot = slotNode(entry.id, 44, !!where, true);
+    slot.onclick = function () {
+      openPicker({selected: entry.id, onPick: function (item) {
+        adoptItem(entry, "id", item);
+        repaintList();
+      }});
+    };
+    card.appendChild(slot);
+
+    var col = el("div", "col");
+    var nm = el("div", "nm");
+    nm.appendChild(fieldNode({key: "name", label: "中文名", type: "text"},
+                             entry, touched).lastChild);
+    col.appendChild(nm);
+    var meta = metaLine(entry.id, entry.kind);
+    meta.appendChild(el("b", "where", "　" + LISTING_ZH[where]));
+    col.appendChild(meta);
+
+    var nums = el("div", "nums");
+    restFields("items", entry, ["id", "name", "kind"], touched)
+      .forEach(function (node) { nums.appendChild(node); });
+    col.appendChild(nums);
+
+    card.appendChild(col);
+    grid.appendChild(card);
+  });
+  list.appendChild(grid);
+  if (over) {
+    // ★ 说清楚「没画完」，别让人以为剩下的被删了。
+    list.appendChild(el("p", "hint", "还有 " + over + " 件没画出来（一次最多画 "
+                        + ITEM_LIMIT + " 张）—— 用上面的筛选缩小范围。"));
+  }
 }
 
 /* -------------------------------------------------- 商店目录：卡片网格 */
@@ -1560,6 +1760,10 @@ function wire() {
 function addEntry(which) {
   openPicker({
     kinds: (which === "drops") ? ["material"] : null,
+    // ★ 物品库只收**占装备槽**的东西 —— 材料 / 消耗品没有「几级能穿」
+    //   这回事，服务端的 `validate_items` 也会拒收（D31）。
+    filter: (which === "items")
+      ? function (item) { return !!item.part_flag; } : null,
     onPick: function (item) {
       var entry = {};
       (CAT.schema[which].fields || []).forEach(function (spec) {
@@ -1576,6 +1780,10 @@ function addEntry(which) {
       if ("kind" in entry) { entry.kind = item.kind; }
       if ("name" in entry) { entry.name = item.name; }
       if ("id" in entry && which === "recipe") { entry.id = nextRecipeId(); }
+      // 物品库新加一条：角色限定按**原版数据**填进去，别让人从头猜。
+      if (which === "items" && item.character !== undefined) {
+        entry.character = item.character;
+      }
       CFG[which].entries.push(entry);
       // 新加的那条一定要看得见 —— 否则筛选开着的时候「加了没反应」。
       FILTER[which] = {q: "", kind: "", character: "", listedOnly: false};

@@ -110,6 +110,16 @@ def category_of(item_id):
 #: 2026-09-05 实机看到的「点英雄结果列出一堆武器」。
 CATEGORY_ALL = -1
 
+#: 「신상품 / 新商品」标签（商店和合成面板都有，而且**合成面板打开时默认
+#: 停在这一格**）。
+#:
+#: ★ **它收全部** —— 用户 2026-09-06 拍板：「对复活项目的玩家来说所有物品
+#:   都是新的」。原版按什么定「新」随 2009 年停服的服务端 DB 一起没了，
+#:   而这一格空着的代价很实在：玩家打开合成界面第一眼就是空白。
+#: ★ 排序照旧听请求里那个标志位（§25）：想看「最新的」就点「上市顺序」，
+#:   那是 `shopdata.catalog_index()` 倒序（原版目录行序，新的在前）。
+CATEGORY_NEW = 2
+
 
 def category_matches(requested, item_category):
     """客户端点的这个标签，要不要收这件商品。
@@ -127,6 +137,8 @@ def category_matches(requested, item_category):
     requested = int(requested)
     if requested == CATEGORY_ALL:
         return True
+    if requested == CATEGORY_NEW:
+        return True                 # 「新商品」= 全收，见 `CATEGORY_NEW`
     if requested == item_category:
         return True
     if requested & 0xFFFF == 0:
@@ -310,6 +322,7 @@ def shelf_entries(category=CATEGORY_ALL, character=CHARACTER_ANY, data_dir=None,
     空表）并给出警告，**绝不回写**（D10）⇒ 最坏情况是「货架空着」。
     """
     table, warnings = shopcfg.shop(data_dir)
+    rules, more = shopcfg.items(data_dir)
     out = []
     for item_id in table:
         entry = table[item_id]
@@ -319,10 +332,14 @@ def shelf_entries(category=CATEGORY_ALL, character=CHARACTER_ANY, data_dir=None,
             continue
         if not category_matches(category, category_of(item_id)):
             continue
-        if character != CHARACTER_ANY and not shopdata.usable_by(item_id, character):
-            continue
+        # ★ 角色限定问**物品库**，不问 `shopdata`（D31）—— 管理员在物品库里
+        #   把一件东西改成「不限」，货架上就该三个角色都看得到。
+        if character != CHARACTER_ANY:
+            limit = shopcfg.rule_of(rules, item_id)[1]
+            if limit is not None and int(limit) != int(character):
+                continue
         out.append(entry)
-    return sort_entries(out, order), warnings
+    return sort_entries(out, order), warnings + more
 
 
 def page_count(total):
@@ -533,7 +550,7 @@ def buy_reason_code(reason):
     return BUY_REASON_CODE.get(reason, BUY_REASON_INTERNAL)
 
 
-def check_purchase(item_id, table, level, owned):
+def check_purchase(item_id, table, level, owned, data_dir=None):
     """一件商品能不能买。返回 `(条目, 原因)`；能买时原因是 `None`。
 
     ★ **价格和上架与否只信 `shop.json`**（`table`），包里的任何数值都不作数
@@ -551,7 +568,8 @@ def check_purchase(item_id, table, level, owned):
         return None, BUY_NOT_LISTED
     if not shopdata.ownable(item_id):
         return None, BUY_UNKNOWN_ITEM
-    if level is not None and level < entry.get("level", 1):
+    # ★ 等级门槛问**物品库**（D31）—— `shop.json` 里已经没有这个字段了。
+    if level is not None and level < shopcfg.item_rule(item_id, data_dir)[0]:
         return entry, BUY_LEVEL
     if int(item_id) in owned and shopdata.get(item_id).part_flag != 0:
         return entry, BUY_ALREADY_OWNED
@@ -568,17 +586,25 @@ def check_purchase(item_id, table, level, owned):
 #: `CompositionRule` 的内存大小）⇒ **8 格**，和货架一样。
 COMPOSITION_PAGE_SIZE = 8
 
-#: 合成界面的标签树（`0x45e42f` 逐条读出来的，§33）。**没有武器、没有套装**
-#: —— 玩家在合成面板上根本点不到那两类，配方产物落在那儿就永远看不见。
+#: 合成界面点得到的**子标签**（`0x45e42f` 逐条读出来的，§33）。
+#:
+#: 顶级标签有 5 个（`0x45e2f0` 那张表，索引 0/1/2/8/9）：
+#: **新商品 / 道具 / 装备 / 称号 / 活动** —— ✅ 2026-09-06 用户实机确认。
+#: 「装备」下面是 头 / 上衣 / 下装 / 手套 / 鞋，「道具」下面是 装饰 / 其他；
+#: 「称号」和「活动」这一版没有内容。
+#:
+#: ⚠ **没有武器、没有套装**（商店那棵树有 `0x60000` 和 `0x10006`，这棵没有）
+#: ⇒ 产物归在那两类的配方，玩家只能在**新商品**那一格找到它
+#: （`CATEGORY_NEW` 收全部，用户 2026-09-06 拍板）。
 COMPOSITION_CATEGORIES = (
-    2,          # 신상품 新商品
-    0x10005,    # 머리 头
-    0x10001,    # 상의 上衣
-    0x10002,    # 하의 下装
-    0x10003,    # 장갑 手套
-    0x10004,    # 신발 鞋
-    0x40001,    # 치장 装饰
-    0x40002,    # 기타 其他
+    CATEGORY_NEW,   # 신상품 新商品（顶级，收全部）
+    0x10005,        # 머리 头
+    0x10001,        # 상의 上衣
+    0x10002,        # 하의 下装
+    0x10003,        # 장갑 手套
+    0x10004,        # 신발 鞋
+    0x40001,        # 치장 装饰
+    0x40002,        # 기타 其他
 )
 
 
@@ -651,6 +677,7 @@ def recipe_entries(category=CATEGORY_ALL, character=CHARACTER_ANY,
       —— 那正是这种发明出来的规则的典型症状。别再加回来。
     """
     table, warnings = shopcfg.recipes(data_dir)
+    rules, more = shopcfg.items(data_dir)
     out = []
     for recipe in table:
         if not recipe.get("listed"):
@@ -660,15 +687,14 @@ def recipe_entries(category=CATEGORY_ALL, character=CHARACTER_ANY,
             continue
         if not category_matches(category, category_of(result)):
             continue
+        # ★ 角色限定是**产物自己的**属性，问物品库（D31）——
+        #   配方里不再有 `character` 那个字段。
         if character != CHARACTER_ANY:
-            want = recipe.get("character")
-            if want is None:
-                if not shopdata.usable_by(result, character):
-                    continue
-            elif int(want) != int(character):
+            limit = shopcfg.rule_of(rules, result)[1]
+            if limit is not None and int(limit) != int(character):
                 continue
         out.append(recipe)
-    return sort_recipes(out, order), warnings
+    return sort_recipes(out, order), warnings + more
 
 
 def sort_recipes(recipes, order=SORT_BASIC):
@@ -883,6 +909,11 @@ ITEM_FLAG_GAMES = 0x40        # 按局数 ->「%d게임」
 #: 拿 `0xffff` 判不限，其余值当角色下标）。
 CHARACTER_UNLIMITED = -1
 
+#: `item_info_of(character=…)` 的「没传」哨兵。★ **不能用 `None`** ——
+#: `None` 在这个字段上是有意义的值（「不限角色」），拿它当「没传」就没法
+#: 表达「管理员在物品库里把这件东西改成了不限」（D31）。
+_ORIGINAL = object()
+
 #: 修理次数上限的「不限」。`< 0` 时客户端跳过「修够次数了」那条分支
 #: （`0x412934: test eax,eax / jl`）。本版不做修理，一律发它。
 REPAIR_UNLIMITED = -1
@@ -953,13 +984,14 @@ def build_rep_item_info(records, purpose=ITEM_INFO_FOR_SHELF):
     return body + w_byte(purpose)
 
 
-def item_info_of(item_id, name=None, level=0, desc=""):
+def item_info_of(item_id, name=None, level=0, character=_ORIGINAL, desc=""):
     """按 `shopdata` 的物品表派生一条 `ItemInfo`；表里没有返回 `None`。
 
     * `name` 不给就退回韩文名（`shopcfg.item_name_zh` 由调用方决定要不要用）；
     * **形态标志**：占槽位的发 `ITEM_FLAG_EQUIPPABLE`，其余（材料 / 消耗品）
       发 `ITEM_FLAG_COUNTED`。本版不卖期限物，一件都不发 `ITEM_FLAG_TIMED`；
-    * **角色限定**：`shopdata` 的 `None` 要翻成 `-1`，**不能是 0**（§28）；
+    * **角色限定**：`None`（不限）要翻成 `-1`，**不能是 0**（§28）。
+      不传 `character` 就照原版数据；管理员在物品库里改过就传那一份（D31）；
     * `desc` 是提示框下半那块（`+0x18`，`|` 分段最多 3 段，§31）。
     """
     item = shopdata.get(item_id)
@@ -969,7 +1001,8 @@ def item_info_of(item_id, name=None, level=0, desc=""):
         flags = ITEM_FLAG_EQUIPPABLE
     else:
         flags = ITEM_FLAG_COUNTED
-    character = item.character
+    if character is _ORIGINAL:
+        character = item.character          # 不给就照原版数据
     if character is None:
         character = CHARACTER_UNLIMITED
     return build_item_info(item.id,
@@ -991,6 +1024,8 @@ def item_info_records(item_ids, data_dir=None):
     （`0x445817`），发大了会让玩家「买到了却穿不上」。
     """
     table, warnings = shopcfg.shop(data_dir)
+    rules, more = shopcfg.items(data_dir)
+    warnings = warnings + more
     records = []
     skipped = []
     for raw in item_ids:
@@ -1004,13 +1039,13 @@ def item_info_records(item_ids, data_dir=None):
         if item is None:
             skipped.append(item_id)
             continue
-        if entry is not None:
-            name = entry.get("name") or shopcfg.item_name_zh(item)
-            level = int(entry.get("level", 0) or 0)
-        else:
-            name = shopcfg.item_name_zh(item)
-            level = 0
+        # 名字优先取商店目录里那份（管理页能改），再退回物品库，最后自己翻。
+        rule = rules.get(item_id)
+        name = ((entry or {}).get("name") or (rule or {}).get("name")
+                or shopcfg.item_name_zh(item))
+        level, character = shopcfg.rule_of(rules, item_id)
         record = item_info_of(item_id, name=name, level=level,
+                              character=character,
                               desc=shopcfg.item_desc_zh(item))
         if record is None:
             skipped.append(item_id)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""管理页 `/admin` —— 改三份运营配置，管管理员账号（V0.3商店 M8）。
+"""管理页 `/admin` —— 改四份运营配置，管管理员账号（V0.3商店 M8）。
 
 和注册页**共用同一个 27810 端口、同一个 `Handler`**：`web/server.py` 的
 `Handler` 继承本文件的 `AdminRoutes`，路由表里 `/admin` 开头的都转进来。
@@ -13,8 +13,8 @@
     POST /admin/api/login             {name, password}
     POST /admin/api/logout
     GET  /admin/api/catalog           物品表 + 字段描述 + 图集元信息（登录后拿一次）
-    GET  /admin/api/config/{shop|recipe|drops}     -> {ok, text, warnings}
-    POST /admin/api/config/{shop|recipe|drops}     {text}
+    GET  /admin/api/config/{items|shop|recipe|drops}  -> {ok, text, warnings}
+    POST /admin/api/config/{items|shop|recipe|drops}  {text}
     GET  /admin/api/admins            -> {ok, names}
     POST /admin/api/admins/add        {name, password}
     POST /admin/api/admins/password   {name, password}
@@ -136,6 +136,8 @@ LOGIN_COOLDOWN_SECONDS = 5
 
 #: URL 里的名字 → `server/data/` 里的文件名。
 CONFIG_FILES = {
+    # ★ 物品库排最前面 —— 页面上的标签顺序照这个字典走，它是另外两份的地基。
+    "items": shopcfg.ITEMS_FILENAME,
     "shop": shopcfg.SHOP_FILENAME,
     "recipe": shopcfg.RECIPE_FILENAME,
     "drops": shopcfg.DROPS_FILENAME,
@@ -144,6 +146,7 @@ CONFIG_FILES = {
 #: 每份配置的校验器。★ **存盘前必过这一关**，不过就不落盘（D10 的同一个道理：
 #: 宁可让用户看到「第 3 条配方的材料有 5 种」，也不要让服务端读到半份坏文件）。
 CONFIG_VALIDATORS = {
+    "items": shopcfg.validate_items,
     "shop": shopcfg.validate_shop,
     "recipe": shopcfg.validate_recipes,
     "drops": shopcfg.validate_drops,

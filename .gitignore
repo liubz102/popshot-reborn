@@ -103,6 +103,8 @@
 # 它们是**运营配置，不是产物** —— 服务端首次启动时按内置默认生成，
 # 之后由用户手改或在管理页 /admin 里改，升级时**绝不覆盖**。
 # ★ 原版数据的只读镜像是 server/shop_items.json，那个要进 git、进包，别混。
+/server/data/items.json
+/server/data/items.json.*.tmp
 /server/data/shop.json
 /server/data/shop.json.*.tmp
 /server/data/recipe.json

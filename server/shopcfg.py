@@ -2,13 +2,18 @@
 # -*- coding: utf-8 -*-
 """shopcfg.py —— 商店 / 合成 / 掉落的**运行时配置**（V0.3 合成与商店 M1）。
 
-三份 JSON，都在 `server/data/`，**用户随时手改，改完不用重启**：
+四份 JSON，都在 `server/data/`，**用户随时手改，改完不用重启**：
 
 | 文件 | 管什么 |
 |---|---|
-| `shop.json` | 哪些东西上架、卖多少钱、要几级、中文名 |
-| `recipe.json` | 合成配方（产物 / 花费 / 等级 / **最多 4 种材料**） |
+| `items.json` | ★ **物品库**：等级门槛 + 角色限定的**唯一**出处（D31）|
+| `shop.json` | 哪些东西上架、卖多少钱、中文名 |
+| `recipe.json` | 合成配方（产物 / 花费 / **最多 4 种材料**）|
 | `drops.json` | 打完一局掉什么材料 |
+
+⚠ **等级和角色限定只在 `items.json` 里**。它们是**物品自己的**属性
+（客户端在「穿上」那一刻才读，`ItemInfo+0x1c` / `+0x24`），不是「这次买卖」
+或「这条配方」的属性 —— 分两处存必然对不上。
 
 ## 和 `shopdata.py` 的分工（别搞混）
 
@@ -49,6 +54,11 @@ FORMAT = 1
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
+#: ★ **物品库**：等级门槛和角色限定的**唯一**出处（D31）。
+#: 以前这两样散在 `shop.json`（等级）和 `recipe.json`（角色）里，
+#: 结果「同一件东西在商店卖和靠合成拿，等级要求可以不一样」—— 那是没有意义的，
+#: 客户端只认 `ItemInfo` 里的一份。用户 2026-09-06 拍板搬到这里。
+ITEMS_FILENAME = "items.json"
 SHOP_FILENAME = "shop.json"
 RECIPE_FILENAME = "recipe.json"
 DROPS_FILENAME = "drops.json"
@@ -346,6 +356,115 @@ WEAPON_PRICE = {1: 3000, 2: 8000, 3: 18000}
 WEAPON_LEVEL = {1: 5, 2: 10, 3: 18}
 
 
+# --------------------------------------------------------------------------
+# 物品库 items.json —— 等级门槛 + 角色限定的唯一出处（D31）
+# --------------------------------------------------------------------------
+
+#: 哪些物品有「等级 / 角色限定」这两栏。
+#:
+#: ★ 判据是 **`part_flag != 0`（占装备槽）**，不是「铠甲和武器」这两个类别名
+#:   —— 客户端在**穿的那一刻**才读这两个字段（`0x445817` 比等级、
+#:   `0x5584ab` 比角色掩码），穿不上身的东西（材料 / 消耗品 / 钥匙 / 礼包）
+#:   读了也没人用。按 `part_flag` 分正好把 `ring`（戒指）/ `dash`（冲刺）/
+#:   `pet` / `spray` / `title`（称号）这几类也一起收进来 —— 它们同样占槽位，
+#:   同样要这两栏，按类别名列白名单会漏掉它们。
+def has_level_and_character(item):
+    """这件东西要不要「等级 / 角色限定」两栏。"""
+    return bool(item is not None and item.ownable and item.part_flag)
+
+
+def default_items():
+    """从 `shop_items.json` + 我们自己的定价表生成一份默认 `items.json`。
+
+    等级的来路（**都是复活工程定的**，原版的随服务端 DB 一起没了）：
+
+    * 武器 —— 按档次 `WEAPON_LEVEL`（和 `default_shop` 的价格表配套）；
+    * 合成产物 —— `RECIPE_LINES` 里那条产线的档位；
+    * 其余 —— `1`（不限）。
+
+    角色限定取原版数据（`shopdata` 的 `character`），`None` = 不限。
+    """
+    levels = {}
+    for _recipe, level in _recipe_seed():
+        levels[_recipe["result"]] = level
+    entries = []
+    for kind in shopdata.kinds():
+        for item_id in shopdata.ids_of_kind(kind):
+            item = shopdata.get(item_id)
+            if not has_level_and_character(item):
+                continue
+            if item_id in levels:
+                level = levels[item_id]
+            elif item.kind == "weapon" and item.series:
+                level = WEAPON_LEVEL.get(item.tier or 1, 5)
+            else:
+                level = 1
+            entry = {"id": item.id, "name": item_name_zh(item), "level": level}
+            if item.character is not None:
+                entry["character"] = int(item.character)
+            entries.append(entry)
+    entries.sort(key=lambda e: e["id"])
+    return {"format": FORMAT, "items": entries}
+
+
+def validate_items(raw):
+    """`items.json` → `{itemId: 条目}`；有一条不对就抛 `ConfigError`。"""
+    if not isinstance(raw, dict):
+        raise ConfigError("items.json 的最外层必须是一个对象")
+    listing = raw.get("items")
+    if not isinstance(listing, list):
+        raise ConfigError("items.json 缺少 items 列表")
+    out = {}
+    for index, entry in enumerate(listing):
+        where = "items[%d]" % index
+        if not isinstance(entry, dict):
+            raise ConfigError("%s 不是对象" % where)
+        item_id = _as_int(entry.get("id"), where + ".id", low=1)
+        _check_item_id(item_id, where)
+        if item_id in out:
+            raise ConfigError("%s：物品 %d 出现了两次" % (where, item_id))
+        item = shopdata.get(item_id)
+        # ★ 穿不上身的东西没有等级 / 角色限定这回事 —— 收进来只会让人以为
+        #   「给材料设个 5 级就要 5 级才能捡」，而客户端根本不看。
+        if not has_level_and_character(item):
+            raise ConfigError(
+                "%s：%d（%s）不占装备槽，没有等级 / 角色限定这两栏"
+                % (where, item_id, KIND_ZH.get(item.kind, item.kind)))
+        character = entry.get("character")
+        if character is not None:
+            character = _as_int(character, where + ".character", low=0, high=2)
+        out[item_id] = {
+            "id": item_id,
+            "name": str(entry.get("name") or item_name_zh(item)),
+            "kind": item.kind,
+            "level": _as_int(entry.get("level", 1), where + ".level", low=1),
+            "character": character,
+        }
+    return out
+
+
+def rule_of(table, item_id):
+    """一件东西的「等级 + 角色限定」，返回 `(等级, 角色 或 None)`。
+
+    `table` 是 `items()` 的结果。**物品库里没登记就退回原版数据**：
+    不限等级（1）、角色照 `shop_items.json`。
+
+    ★ 这是全服务端唯一该问「这件东西几级能穿 / 谁能穿」的地方（D31）——
+    `shop.json` / `recipe.json` 里都没有这两个字段了。
+    """
+    entry = (table or {}).get(int(item_id))
+    if entry is not None:
+        return entry["level"], entry["character"]
+    item = shopdata.get(item_id)
+    return 1, (None if item is None else item.character)
+
+
+def item_rule(item_id, data_dir=None):
+    """`rule_of` 的独立版本（自己去读一次配置）。**警告会被丢掉** ——
+    要在日志里看到「配置读坏了」的调用点请自己调 `items()`。"""
+    return rule_of(items(data_dir)[0], item_id)
+
+
 def default_shop():
     """从 `shop_items.json` 生成一份默认 `shop.json`。
 
@@ -368,7 +487,6 @@ def default_shop():
             "kind": "weapon",
             "listed": True,
             "price": WEAPON_PRICE.get(tier, 3000),
-            "level": WEAPON_LEVEL.get(tier, 5),
             "days": 0,
         })
 
@@ -382,15 +500,13 @@ def default_shop():
             "kind": "material",
             "listed": False,
             "price": 0,
-            "level": 1,
             "days": 0,
         })
 
-    # ★ 合成产物的 `level` 就是**穿上它**的等级要求（客户端 `0x445817` 拿
-    #   `ItemInfo+0x1c` 和玩家等级比）—— 合成本身没有等级门（D27），
-    #   所以那个数只在这里、只进 `shop.json`。
+    # ★ 合成产物收进商店目录只是为了**有个中文名**，一律不上架
+    #   （`listed=False`）—— 它们靠合成拿，不卖。等级在 `items.json`（D31）。
     seen = set(entry["id"] for entry in entries)
-    for recipe, level in _recipe_seed():
+    for recipe, _level in _recipe_seed():
         item_id = recipe["result"]
         if item_id in seen:
             continue
@@ -404,7 +520,6 @@ def default_shop():
             "kind": item.kind,
             "listed": False,
             "price": 0,
-            "level": level,
             "days": 0,
         })
 
@@ -503,7 +618,6 @@ def _recipe_seed():
                     "result": item.id,
                     "name": item_name_zh(item),
                     "listed": True,
-                    "character": character,
                     "cost": weight * gold_per_point,
                     "days": 0,
                     "materials": need[:MAX_MATERIALS],
@@ -642,14 +756,20 @@ def _check_item_id(item_id, name):
 
 
 def validate_shop(raw):
-    """`shop.json` → `{itemId: 条目}`；有一条不对就抛 `ConfigError`。"""
+    """`shop.json` → `{itemId: 条目}`；有一条不对就抛 `ConfigError`。
+
+    ⚠ **这里没有 `level`**（D31）：等级门槛搬去 `items.json` 了 ——
+    同一件东西在商店买和靠合成拿，等级要求不可能不一样，客户端只认一份。
+    """
     if not isinstance(raw, dict):
         raise ConfigError("shop.json 的最外层必须是一个对象")
-    items = raw.get("items")
-    if not isinstance(items, list):
+    # ★ 局部名别叫 `items` —— 模块级的 `items()` 是读物品库的入口，撞名之后
+    #   在这个函数里就再也调不到它了（以后想在这儿查等级会当场踩坑）。
+    listing = raw.get("items")
+    if not isinstance(listing, list):
         raise ConfigError("shop.json 缺少 items 列表")
     out = {}
-    for index, entry in enumerate(items):
+    for index, entry in enumerate(listing):
         where = "items[%d]" % index
         if not isinstance(entry, dict):
             raise ConfigError("%s 不是对象" % where)
@@ -664,7 +784,6 @@ def validate_shop(raw):
             "kind": item.kind,
             "listed": bool(entry.get("listed", False)),
             "price": _as_int(entry.get("price", 0), where + ".price", low=0),
-            "level": _as_int(entry.get("level", 1), where + ".level", low=1),
             "days": _as_int(entry.get("days", 0), where + ".days", low=0),
         }
     return out
@@ -726,21 +845,17 @@ def validate_recipes(raw):
                                  spot + ".count", low=1, high=800),
             })
 
-        character = entry.get("character")
-        if character is not None:
-            character = _as_int(character, where + ".character", low=0, high=2)
-
-        # ★ **配方没有 `level`**（D27）：原版的合成面板从头到尾不读玩家等级，
-        #   `0x0506` 的结果码里也没有「等级太低」这一档 —— 服务端拿等级拦，
-        #   客户端只能显示成「未知的错误」。装备的等级要求在 `shop.json`
-        #   里（那份才是发给客户端 `ItemInfo` 的），穿的时候由客户端自己判。
-        #   老 `recipe.json` 里残留的 `level` 键在这里被丢掉，不报错。
+        # ★ **配方既没有 `level` 也没有 `character`**：
+        #   · 等级 —— 原版的合成面板从头到尾不读玩家等级，`0x0506` 的结果码里
+        #     也没有「等级太低」这一档（D27）；
+        #   · 角色限定 —— 那是**物品自己的**属性，不是「这条配方」的属性
+        #     （D31）。两处各存一份必然对不上。
+        #   两个键都在 `items.json` 里；老文件里残留的在这儿被丢掉，不报错。
         out.append({
             "id": recipe_id,
             "result": result,
             "name": str(entry.get("name") or item_name_zh(shopdata.get(result))),
             "listed": bool(entry.get("listed", True)),
-            "character": character,
             "cost": _as_int(entry.get("cost", 0), where + ".cost", low=0),
             "days": _as_int(entry.get("days", 0), where + ".days", low=0),
             "materials": need,
@@ -821,6 +936,36 @@ def validate_drops(raw):
 #: ★ `help` 就是原来写在 json 里那几行 `_说明` —— 用户拍板搬到页面上、
 #:   不再写进文件（D16）。
 SCHEMA = {
+    "items": {
+        "list_key": "items",
+        "title": "物品库",
+        "unit": "件物品",
+        "help": [
+            "改完保存即刻生效，不用重启服务端。",
+            "★ 这里是**等级门槛和角色限定的唯一出处** —— 「商店目录」和"
+            "「合成配方」里都不再有这两栏。同一件东西不管是买来的还是合成的，"
+            "穿上它的条件只有一份。",
+            "★ 只收**占装备槽**的东西（铠甲 / 武器 / 戒指 / 冲刺 / 宠物 / "
+            "喷漆 / 称号）。材料、消耗品这些穿不上身，客户端根本不看这两个字段。",
+            "等级是**穿上时**的门槛，由客户端自己判（买和合成都不拦）；"
+            "角色限定留空 = 谁都能穿。",
+            "⚠ 角色限定改宽了只是让别的角色**能穿**，模型和贴图还是原来那个"
+            "角色的 —— 原版的装备本来就是一人一套。",
+        ],
+        "fields": [
+            {"key": "id", "label": "物品", "type": "item"},
+            {"key": "kind", "label": "类别", "type": "text", "readonly": True,
+             "help": "由物品本身决定，改不了"},
+            {"key": "name", "label": "中文名", "type": "text",
+             "help": "原版没有中文物品名，这一份是复活工程自己翻的，随便改"},
+            {"key": "level", "label": "等级", "type": "int", "min": 1,
+             "help": "穿上它要几级。1 = 不限"},
+            {"key": "character", "label": "角色限定", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "options": [{"value": cid, "label": name}
+                         for cid, name in sorted(CHARACTER_ZH.items())]},
+        ],
+    },
     "shop": {
         "list_key": "items",
         "title": "商店目录",
@@ -830,6 +975,8 @@ SCHEMA = {
             "「上架」关掉的不摆上货架（材料和合成产物收在这里只是为了有个中文名）。",
             "价格是金币（原版的「픽셀」，中文版译作金币）。天数 0 = 永久。",
             "★ 只能选客户端认识、且能进背包的物品 —— 别的发下去界面上是个空格子。",
+            "★ **等级和角色限定在「物品库」里改**，这一页没有那两栏（D31）。",
+            "★ 商店和合成**二选一**：一件东西在这里上架，就会自动从合成里下架。",
         ],
         "fields": [
             {"key": "id", "label": "物品", "type": "item"},
@@ -839,7 +986,6 @@ SCHEMA = {
              "help": "原版没有中文物品名，这一份是复活工程自己翻的，随便改"},
             {"key": "price", "label": "价格", "type": "int", "min": 0,
              "suffix": "金币"},
-            {"key": "level", "label": "等级", "type": "int", "min": 1},
             {"key": "days", "label": "天数", "type": "int", "min": 0,
              "help": "0 = 永久"},
             {"key": "listed", "label": "上架", "type": "bool"},
@@ -855,11 +1001,13 @@ SCHEMA = {
             "第 5 种玩家根本看不见，所以这里也只画 4 格。",
             "★ 原版没有合成成功率（界面上没有任何概率控件），别加。",
             "★ 一个产物只能有一条配方 —— 合成请求只带产物 id，两条同产物服务端分不清。",
-            "★ 合成界面只有「新商品 / 头 / 上衣 / 下装 / 手套 / 鞋 / 装饰 / 其他」"
-            "八个标签，武器和套装产物玩家点不到、永远看不见。",
+            "★ 合成界面的标签是「新商品 / 道具 / 装备 / 称号 / 活动」五个大类"
+            "（装备下面还有 头 / 上衣 / 下装 / 手套 / 鞋，道具下面有 装饰 / 其他）"
+            "—— **没有武器**，武器产物只能在「新商品」里找得到。",
             "★ 配方**没有等级要求** —— 原版的合成面板不看等级，"
             "上架的配方所有人都看得到、也合得出来。"
-            "产物穿上时的等级门槛在「商店目录」那一份里改。",
+            "产物穿上时的等级门槛和角色限定在「物品库」那一页改（D31）。",
+            "★ 商店和合成**二选一**：一件东西在这里上架，就会自动从商店里下架。",
             "原版配方随 2009 年停服的服务端一起没了，这一份是复活工程自己设计的，随便改。",
         ],
         "fields": [
@@ -876,10 +1024,6 @@ SCHEMA = {
              ]},
             {"key": "cost", "label": "花费", "type": "int", "min": 0,
              "suffix": "金币"},
-            {"key": "character", "label": "角色限定", "type": "choice",
-             "optional": True, "empty_label": "不限",
-             "options": [{"value": cid, "label": name}
-                         for cid, name in sorted(CHARACTER_ZH.items())]},
             {"key": "days", "label": "天数", "type": "int", "min": 0,
              "help": "0 = 永久"},
             {"key": "listed", "label": "上架", "type": "bool",
@@ -938,6 +1082,8 @@ def schema_keys(which):
 # --------------------------------------------------------------------------
 
 _SPECS = {
+    # ★ 物品库排最前面 —— 另外两份都要问它「这件东西几级 / 谁能穿」（D31）。
+    ITEMS_FILENAME: (validate_items, default_items, {}),
     SHOP_FILENAME: (validate_shop, default_shop, {}),
     RECIPE_FILENAME: (validate_recipes, default_recipes, []),
     DROPS_FILENAME: (validate_drops, default_drops, []),
@@ -983,6 +1129,11 @@ def _load(filename, data_dir=None, _reload=False):
     with _lock:
         _cache[path] = result
     return parsed, []
+
+
+def items(data_dir=None, _reload=False):
+    """物品库 `{itemId: 条目}` —— 等级门槛 + 角色限定（D31）。"""
+    return _load(ITEMS_FILENAME, data_dir, _reload)
 
 
 def shop(data_dir=None, _reload=False):

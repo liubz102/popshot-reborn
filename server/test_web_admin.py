@@ -166,6 +166,7 @@ class AdminAuthTests(_AdminCase):
     def test_every_api_needs_a_login(self):
         # ★★ 漏挂一个 `_require_admin()` 就等于把那个接口开在公网上。
         for path, payload in (
+                ("/admin/api/config/items", None),
                 ("/admin/api/config/shop", None),
                 ("/admin/api/config/recipe", None),
                 ("/admin/api/config/drops", None),
@@ -480,7 +481,7 @@ class AdminCatalogTests(_AdminCase):
         self.assertEqual(shopcfg.item_desc_zh(shopdata.get(1120011)),
                          result["desc"])
 
-    def test_the_schema_covers_all_three_config_files(self):
+    def test_the_schema_covers_every_config_file(self):
         schema = self.catalog["schema"]
         self.assertEqual(sorted(web_admin.CONFIG_FILES), sorted(schema))
         for which, spec in schema.items():

@@ -164,22 +164,46 @@ def parse_rep_inventory(body):
 
 
 @contextlib.contextmanager
-def shop_config(items=(), data_dir=None):
-    """临时把 `shopcfg` 指到一份现搓的 `shop.json` 上。
+def config_dir(shop=(), recipe=(), items=(), drops=(), data_dir=None,
+               allow_bad=False):
+    """临时把 `shopcfg` 指到一份现搓的**四份**配置上。
 
     ★ 全量测试默认把 `shopcfg.DATA_DIR` 指向**空目录**（`run_tests.py`），
     这样「货架上有什么」就不取决于开发机上那份用户随时在改的运营配置。
-    要具体商品的用例用这个上下文管理器自己铺。
+    要具体内容的用例用这个上下文管理器自己铺。
+
+    ⚠ **四份一起铺，一份都不能少**：`shelf_entries` / `item_info_records`
+    这些函数会把**每一份**读到的警告都带出来（物品库读不到 = 等级和角色
+    限定全按原版走，那是个该说出来的事），少铺一份用例就会收到
+    「没有找到 xxx.json」而看上去像是过滤器写错了。
     """
     saved = shopcfg.DATA_DIR
     with tempfile.TemporaryDirectory() as tmp:
         target = data_dir or tmp
-        path = shopcfg.path_of(shopcfg.SHOP_FILENAME, target)
-        with open(path, "w", encoding="utf-8", newline="\n") as fp:
-            json.dump({"format": 1, "items": list(items)}, fp,
-                      ensure_ascii=False)
+        for filename, key, rows in (
+                (shopcfg.SHOP_FILENAME, "items", shop),
+                (shopcfg.RECIPE_FILENAME, "recipes", recipe),
+                (shopcfg.ITEMS_FILENAME, "items", items),
+                (shopcfg.DROPS_FILENAME, "rules", drops)):
+            with open(shopcfg.path_of(filename, target), "w",
+                      encoding="utf-8", newline="\n") as fp:
+                json.dump({"format": 1, key: list(rows)}, fp,
+                          ensure_ascii=False)
         shopcfg.DATA_DIR = target
         shopcfg.invalidate()
+        # ★ 立刻读一遍确认它们过得了校验。配置读坏时 `shopcfg` 是**返回空表 +
+        #   警告**（D10），用例看到的就是「一条都没有」—— 和「过滤器把它们
+        #   滤掉了」长得一模一样。踩过一次（配方号撞车），所以在这儿拦。
+        # `allow_bad=True` 是给「**故意**铺一份坏配置，看服务端 fail-safe」
+        # 那几条用例开的口子。
+        if not allow_bad:
+            for name, load in (("shop", shopcfg.shop),
+                               ("recipe", shopcfg.recipes),
+                               ("items", shopcfg.items),
+                               ("drops", shopcfg.drops)):
+                _, warnings = load(target)
+                assert not warnings, "用例铺的 %s.json 自己就不合法: %r" % (
+                    name, warnings)
         try:
             yield target
         finally:
@@ -187,32 +211,14 @@ def shop_config(items=(), data_dir=None):
             shopcfg.invalidate()
 
 
-@contextlib.contextmanager
-def recipe_config(recipes=(), data_dir=None):
-    """临时把 `shopcfg` 指到一份现搓的 `recipe.json` 上。
+def shop_config(items=(), data_dir=None, **rest):
+    """只关心商店目录时的简写。`items` 是**商店条目**（沿用老签名）。"""
+    return config_dir(shop=items, data_dir=data_dir, **rest)
 
-    和 `shop_config` 同一套路数、同一个理由 —— 合成界面里有什么，
-    不该取决于开发机上那份用户随时在改的 `recipe.json`。
-    """
-    saved = shopcfg.DATA_DIR
-    with tempfile.TemporaryDirectory() as tmp:
-        target = data_dir or tmp
-        path = shopcfg.path_of(shopcfg.RECIPE_FILENAME, target)
-        with open(path, "w", encoding="utf-8", newline="\n") as fp:
-            json.dump({"format": 1, "recipes": list(recipes)}, fp,
-                      ensure_ascii=False)
-        shopcfg.DATA_DIR = target
-        shopcfg.invalidate()
-        # ★ 立刻读一遍确认它过得了校验。配置读坏时 `shopcfg` 是**返回空表 +
-        #   警告**（D10），用例看到的就是「一条配方都没有」—— 和「过滤器把
-        #   它们滤掉了」长得一模一样。踩过一次（配方号撞车），所以在这儿拦。
-        _, warnings = shopcfg.recipes(target)
-        assert not warnings, "用例铺的 recipe.json 自己就不合法: %r" % (warnings,)
-        try:
-            yield target
-        finally:
-            shopcfg.DATA_DIR = saved
-            shopcfg.invalidate()
+
+def recipe_config(recipes=(), data_dir=None, **rest):
+    """只关心合成配方时的简写。"""
+    return config_dir(recipe=recipes, data_dir=data_dir, **rest)
 
 
 def parse_rep_composition_list(body):
@@ -357,6 +363,19 @@ class CategoryTests(_ShopCase):
         for category in (0x10001, 0x60002, shop.CATEGORY_MATERIAL):
             self.assertTrue(shop.category_matches(shop.CATEGORY_ALL, category))
 
+    def test_新商品标签收全部(self):
+        """★ 用户 2026-09-06 拍板：「对复活项目的玩家来说所有物品都是新的」。
+
+        判据不是「哪个好看」，是**这一格空着的代价很实在** —— 客户端打开
+        合成界面默认就停在「新商品」上（`0x45e2f0` 那张顶级标签表的第一项），
+        空的话玩家第一眼看到的就是一片空白。
+        """
+        self.assertEqual(2, shop.CATEGORY_NEW)
+        for category in (0x10001, 0x60001, shop.CATEGORY_MATERIAL,
+                         shop.CATEGORY_SET, shop.CATEGORY_OTHER):
+            self.assertTrue(shop.category_matches(shop.CATEGORY_NEW, category),
+                            hex(category))
+
     def test_具体标签只收自己(self):
         self.assertTrue(shop.category_matches(0x10001, 0x10001))
         self.assertFalse(shop.category_matches(0x10001, 0x10002))
@@ -386,7 +405,7 @@ class ShelfTests(_ShopCase):
         「货架空着 + 日志里写明哪一行不对」比「悄悄少一件」好查得多。
         """
         self.assertFalse(shopdata.ownable(1510001))
-        with shop_config(self.listed(1510001, 1120041)):
+        with shop_config(self.listed(1510001, 1120041), allow_bad=True):
             entries, warnings = shop.shelf_entries()
         self.assertEqual([], entries)
         self.assertTrue(any("1510001" in w for w in warnings), warnings)
@@ -743,14 +762,30 @@ class ItemInfoTests(_ShopCase):
         record = parse_rep_item_info(shop.build_rep_item_info(records))[0][0]
         self.assertEqual(shop.CHARACTER_UNLIMITED, record["character"])
 
-    def test_名字和等级取自_shop_json(self):
-        with shop_config([{"id": 1120041, "name": "左轮 爆裂1",
-                           "listed": True, "price": 3000, "level": 5}]):
+    def test_名字取自_shop_json_等级和角色取自物品库(self):
+        """★ D31：等级和角色限定的唯一出处是 `items.json`。
+
+        名字仍然优先取商店目录里那份（管理页在那儿改），但**等级和角色
+        限定只认物品库** —— 同一件东西买来的和合成的不可能是两个门槛。
+        """
+        with config_dir(shop=[{"id": 1120041, "name": "左轮 爆裂1",
+                               "listed": True, "price": 3000}],
+                        items=[{"id": 1120041, "level": 5, "character": 1}]):
             records, _, _ = shop.item_info_records([1120041])
         record = parse_rep_item_info(shop.build_rep_item_info(records))[0][0]
         self.assertEqual("左轮 爆裂1", record["name"])
         # ★ 客户端拿它挡「穿上」（`0x445817`）—— 发大了玩家买到了却穿不上。
         self.assertEqual(5, record["level"])
+        # ★ 物品库改成 1 = 卡希尔专用，即使原版数据里它是泰尔的（0）。
+        self.assertEqual(1, record["character"])
+
+    def test_物品库没登记就退回原版数据(self):
+        with config_dir(shop=[{"id": 1120041, "name": "左轮 爆裂1",
+                               "listed": True, "price": 3000}]):
+            records, _, _ = shop.item_info_records([1120041])
+        record = parse_rep_item_info(shop.build_rep_item_info(records))[0][0]
+        self.assertEqual(1, record["level"])          # 不限等级
+        self.assertEqual(0, record["character"])      # 原版数据里的角色
 
     def test_表里没有的_id_跳过而不是抛(self):
         records, skipped, _ = shop.item_info_records([1120041, 9999999, "abc"])
@@ -889,16 +924,31 @@ class CompositionListTests(_ShopCase):
         self.assertEqual([1010001, 1020001], [r["result"] for r in shown])
         self.assertNotIn("level", shown[0])
 
-    def test_配方自己写了角色就按它_没写才看产物(self):
-        with recipe_config([self.recipe(1010001, character=1),
-                            self.recipe(1020001)]):
+    def test_角色限定问物品库_不问配方(self):
+        """★ D31：角色限定是**产物自己的**属性。配方里写 `character`
+        没有用（`validate_recipes` 直接丢掉），要改去物品库改。"""
+        with config_dir(recipe=[self.recipe(1010001, character=1),
+                                self.recipe(1020001)],
+                        items=[{"id": 1010001, "level": 1, "character": 1}]):
             角色0, _ = shop.recipe_entries(character=0)
             角色1, _ = shop.recipe_entries(character=1)
             不限, _ = shop.recipe_entries(character=shop.CHARACTER_ANY)
-        # 1010001 本身是角色 0 的装备，但配方写死了角色 1 -> 按配方走。
+        # 1010001 原版数据里是角色 0 的装备，物品库改成 1 -> 按物品库走。
+        # 1020001 没登记 -> 退回原版数据（角色 0）。
         self.assertEqual([1020001], [r["result"] for r in 角色0])
         self.assertEqual([1010001], [r["result"] for r in 角色1])
         self.assertEqual([1010001, 1020001], [r["result"] for r in 不限])
+
+    def test_新商品那一格列全部配方(self):
+        # 合成面板打开时默认停在这一格 —— 空的话玩家以为功能坏了。
+        with recipe_config([self.recipe(1010001), self.recipe(1120041)]):
+            新商品, _ = shop.recipe_entries(category=shop.CATEGORY_NEW)
+            上衣, _ = shop.recipe_entries(category=0x10001)
+        self.assertEqual([1010001, 1120041],
+                         [r["result"] for r in 新商品])
+        # ★ 武器产物在「装备」那几个标签下**点不到**（合成面板没有武器标签），
+        #   现在靠「新商品」兜住了。
+        self.assertEqual([1010001], [r["result"] for r in 上衣])
 
     def test_一页八条_和货架一样(self):
         """★ 判据是 `0x45f011` 的循环走 `0..0x100` 步长 `0x20`（8 格），

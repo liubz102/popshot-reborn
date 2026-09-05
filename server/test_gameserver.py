@@ -114,9 +114,10 @@ from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_STEP, LEVEL_MAX,
 import gameserver
 import shop
 import shopcfg
-from test_shop import (parse_rep_composition_list, parse_rep_equipped_list,
-                       parse_rep_inventory, parse_rep_item_info,
-                       parse_shop_item_list, recipe_config, shop_config)
+from test_shop import (config_dir, parse_rep_composition_list,
+                       parse_rep_equipped_list, parse_rep_inventory,
+                       parse_rep_item_info, parse_shop_item_list,
+                       recipe_config, shop_config)
 
 
 class GameServerPacketTests(unittest.TestCase):
@@ -3353,9 +3354,11 @@ class ShopBuyAndEquipTests(unittest.TestCase):
         self.assertEqual(7000, account_store.player_money(self.account()))
 
     def test_a_level_gate_is_enforced_server_side(self):
+        """★ D31：等级门槛来自**物品库**，不是商店目录。"""
         self.give_money(10000)
-        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
-                           "listed": True, "price": 3000, "level": 50}]):
+        with config_dir(shop=[{"id": self.REVOLVER_R1, "name": "左轮 R1",
+                               "listed": True, "price": 3000}],
+                        items=[{"id": self.REVOLVER_R1, "level": 50}]):
             frames = self.buy(self.REVOLVER_R1)
         self.assertEqual(0, self.buy_ok(frames))
 
@@ -3371,10 +3374,11 @@ class ShopBuyAndEquipTests(unittest.TestCase):
         兜底也不能是 0，得是 6「内部错误」。
         """
         self.give_money(10000)
-        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
-                           "listed": True, "price": 3000, "level": 50},
-                          {"id": self.REVOLVER_R2, "name": "没上架的",
-                           "listed": False, "price": 3000}]):
+        with config_dir(shop=[{"id": self.REVOLVER_R1, "name": "左轮 R1",
+                               "listed": True, "price": 3000},
+                              {"id": self.REVOLVER_R2, "name": "没上架的",
+                               "listed": False, "price": 3000}],
+                        items=[{"id": self.REVOLVER_R1, "level": 50}]):
             self.assertEqual(shop.BUY_REASON_LEVEL_LOW,
                              self.buy_reason(self.buy(self.REVOLVER_R1)))
             self.assertEqual(shop.BUY_REASON_INTERNAL,

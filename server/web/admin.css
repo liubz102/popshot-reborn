@@ -334,6 +334,10 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
   background: var(--paper-2); border-radius: 4px; padding: 0 5px;
   font-family: Consolas, "Cascadia Mono", monospace;
 }
+/* 物品库卡片上那行「商店 / 合成 / 未上架」。上架的用琥珀色标出来，
+   和卡片边框、格子星芒是同一套信号（一眼扫得出哪些已经在卖）。 */
+.item-card .meta .where { color: var(--cocoa-soft); font-weight: 600; }
+.item-card.listed .meta .where { color: var(--amber-dark); }
 .item-card .nums { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; }
 
 /* --------------------------------------------------- 合成配方：配方卡 */
