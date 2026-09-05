@@ -519,7 +519,7 @@ class LiveSocketTests(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------------
-# ★★ 下行选路 —— 「N 不变才走 UDP」那条判据
+# ★★ 下行选路 —— 「本代播一次 TCP 种子，之后整代走 UDP」那条判据（铁律 4）
 # ----------------------------------------------------------------------------
 class DownlinkRouteTests(unittest.TestCase):
     def setUp(self):
@@ -551,49 +551,69 @@ class DownlinkRouteTests(unittest.TestCase):
         self.hello(downlink=True)
         self.assertTrue(self.server.ready_for(self.member))
 
-    def test_only_a_heartbeat_whose_N_is_unchanged_may_take_udp(self):
+    def may(self, n, gen=7, sender=None):
+        return self.server.may_send_heartbeat(
+            self.member, sender or self.sender, heartbeat(n), gen)
+
+    def test_the_first_beat_of_a_generation_seeds_tcp_then_udp_takes_over(self):
         """★★★ 下行的全部安全性都压在这一条上（推导见 `may_send_heartbeat`）。
 
-        N 一变，那一发必须走 TCP —— 它要排在推高 N 的那些事件包**后面**，
-        和今天逐字节相同。N 不变的那些怎么乱序都无害，因为 `FlushTo(N)` /
-        `Grow(N-1)` 对同一个 N 是幂等的。
+        本代第一发走 TCP：它排在本代所有事件包**前面**，给收方队列定基线
+        （`FlushTo(N)`，§216）。之后整代固定走 UDP —— 激活之后心跳只做
+        `Grow(N-1)`，而 `grow()` 对更小的 n 直接 return，旧包对队列无害。
         """
         self.hello()
-        may = lambda n: self.server.may_send_heartbeat(   # noqa: E731
-            self.member, self.sender, heartbeat(n))
-        self.assertFalse(may(0))      # 第一发：N 是新的 -> TCP
-        self.assertTrue(may(0))       # N 没变 -> UDP
-        self.assertTrue(may(0))
-        self.assertFalse(may(1))      # 刚开了枪，N 变了 -> TCP
-        self.assertTrue(may(1))       # 之后又可以走 UDP 了
+        self.assertFalse(self.may(0))     # 种子 -> TCP
+        for _ in range(5):
+            self.assertTrue(self.may(0))  # 之后整代 UDP
 
-    def test_a_new_epoch_sends_its_first_heartbeat_over_tcp(self):
-        """★ 换代时 N 回到 0 ⇒ 判据自动把「复位后第一发」交给 TCP。
+    def test_a_changing_N_does_not_switch_the_route_back_to_tcp(self):
+        """★★★★★ 这就是和旧判据的分水岭（V0.3 §185）。
 
-        那一发正是给收方队列**定基线**的（`FlushTo(N)`，§216），
-        它必须是有序的那一份，否则就是 §217 的整局零伤害。
-        这里不需要任何额外的换代逻辑 —— 判据本身就覆盖了。
+        旧判据「N 一变就退回 TCP」会把同一条位置流劈成两条互相超车的路：
+        TCP 那一发被队头阻塞卡住之后，后发的 UDP 先到、旧 TCP 后到，
+        角色被拉回旧位置。`bug调查/15` 量到 4182 次这种换路。
+        N 是**可靠事件进度**，不是位置版本，不能拿它当选路依据。
         """
         self.hello()
-        may = lambda n: self.server.may_send_heartbeat(   # noqa: E731
-            self.member, self.sender, heartbeat(n))
-        self.assertFalse(may(0))
-        self.assertTrue(may(0))
-        for n in (1, 2, 3):           # 打了几枪
-            self.assertFalse(may(n))
-            self.assertTrue(may(n))
-        self.assertFalse(may(0))      # ★ 换代：N 回到 0，这一发走 TCP
+        self.assertFalse(self.may(0))
+        for n in (0, 1, 1, 2, 9, 9, 31):
+            self.assertTrue(self.may(n), f"N={n} 不该把这条流拽回 TCP")
+
+    def test_a_new_generation_seeds_tcp_again(self):
+        """★ 换代要重新播种：那一发定的是收方**新**队列的基线（§217）。"""
+        self.hello()
+        self.assertFalse(self.may(0))
+        self.assertTrue(self.may(3))
+        self.assertFalse(self.may(0, gen=8), "新一代的第一发要重新走 TCP")
+        self.assertTrue(self.may(0, gen=8))
+
+    def test_an_unknown_generation_never_takes_udp(self):
+        """★ 分不清这一发属于哪一代时不冒险 —— 一律 TCP。"""
+        self.hello()
+        for _ in range(3):
+            self.assertFalse(self.may(0, gen=None))
 
     def test_two_senders_are_tracked_separately(self):
         self.hello()
         other = FakeGameConn("carol")
-        self.assertFalse(self.server.may_send_heartbeat(
-            self.member, self.sender, heartbeat(5)))
-        self.assertTrue(self.server.may_send_heartbeat(
-            self.member, self.sender, heartbeat(5)))
+        self.assertFalse(self.may(5))
+        self.assertTrue(self.may(5))
         # 另一个发送方的第一发仍然要走 TCP（各记各的账）
-        self.assertFalse(self.server.may_send_heartbeat(
-            self.member, other, heartbeat(5)))
+        self.assertFalse(self.may(5, sender=other))
+        self.assertTrue(self.may(5, sender=other))
+
+    def test_the_route_switch_is_counted_once_per_generation(self):
+        """★ `flips` 是这条改动的回归指标：每代每个发送方**最多 1 次**。"""
+        self.hello()
+        endpoint = self.server.endpoint_for(self.member)
+        self.assertFalse(self.may(0))
+        for n in (0, 1, 2, 3, 4, 5):
+            self.may(n)
+        self.assertEqual(1, endpoint.flips)
+        self.assertFalse(self.may(0, gen=8))
+        self.may(0, gen=8)
+        self.assertEqual(2, endpoint.flips)
 
     def test_a_failed_send_is_pulled_back_out_of_the_redundancy_buffer(self):
         """★ 发失败 -> 调用方改走 TCP -> 这一份**不能**再被冗余捎带出去。
@@ -685,10 +705,52 @@ class DeliverRoutingTests(unittest.TestCase):
         return self.server.deliver(self.alice, packet)
 
     def test_a_heartbeat_goes_udp_to_the_new_client_and_tcp_to_the_old_one(self):
-        self.deliver(heartbeat(0))                 # 第一发 N 是新的 -> 都走 TCP
-        self.deliver(heartbeat(0))                 # 第二发 N 没变 -> 新客户端走 UDP
+        self.deliver(heartbeat(0))                 # 本代第一发 = 种子 -> 都走 TCP
+        self.deliver(heartbeat(0))                 # 之后新客户端整代走 UDP
         self.assertEqual([m for m, _ in self.fallback], [self.oldie])
         self.assertEqual(len(self.udp_sent), 1)
+
+    def test_only_the_first_beat_of_a_generation_takes_the_tcp_seed(self):
+        """★★★★★ 铁律 4：本代播一次种，之后整代不再换路（§185）。
+
+        旧判据是「N 一变就退回 TCP」，于是同一条位置流被劈成两条会互相超车
+        的路（`bug调查/15` 量到 4182 次换路）。N 变了也不许改路 —— 队列在
+        本代第一发心跳上就激活了，之后心跳只做 `grow()`，旧包无害。
+        """
+        self.deliver(heartbeat(0))
+        self.assertEqual([], self.udp_sent, "种子那一发必须走 TCP")
+        for nxt in (0, 1, 1, 7, 7, 7, 9):          # N 一路在变
+            self.deliver(heartbeat(nxt))
+            self.assertEqual([m for m, _ in self.fallback], [self.oldie],
+                             f"N={nxt} 这一发不该把新客户端拽回 TCP")
+            self.assertEqual(1, len(self.udp_sent))
+
+    def test_a_new_generation_seeds_the_tcp_path_again(self):
+        """★ 换代要重新播种：那一发定的是收方队列的基线（§217）。"""
+        self.deliver(heartbeat(0))
+        self.deliver(heartbeat(0))
+        self.assertEqual(1, len(self.udp_sent))    # 前提：已经切到 UDP 了
+        gen = self.relayserver.next_generation()
+        for conn in self.room:
+            self.relayserver.epoch_state(conn).assign(1, gen)
+        self.deliver(heartbeat(3, game_id=1))
+        self.assertEqual([], self.udp_sent, "新一代的第一发要重新走 TCP")
+        self.deliver(heartbeat(3, game_id=1))
+        self.assertEqual(1, len(self.udp_sent))
+
+    def test_a_bot_uses_the_very_same_route_rule_as_a_human(self):
+        """★ bot 不搞特例 —— 它恰恰是最吃这条路的一方。
+
+        收方对**腾空**角色是按速度逐帧外推的（`packet_api §5.6`），而 bot
+        因为导航几乎一直在空中、速度又大（弹跳台 −31/帧），一发倒序会被
+        放大成 4 帧的错位。整代单路正是为它准备的。
+        """
+        self.alice.is_bot_conn = lambda: True
+        self.deliver(heartbeat(0))
+        self.assertEqual([], self.udp_sent)
+        self.deliver(heartbeat(0))
+        self.assertEqual([m for m, _ in self.fallback], [self.oldie])
+        self.assertEqual(1, len(self.udp_sent))
 
     def test_an_event_always_goes_tcp_to_everyone(self):
         """★ 铁律 1：开火/命中/伤害**任何时候**都不走 UDP。
@@ -718,6 +780,20 @@ class DeliverRoutingTests(unittest.TestCase):
         plain.deliver(self.alice, heartbeat(0))
         self.assertEqual(sorted(m.account_name for m, _ in self.fallback),
                          ["newbie", "oldie"])
+
+    def test_production_wires_the_udp_downlink_to_the_singleton(self):
+        """★ 生产接线上下行**两个方向都走 UDP**（§185）。
+
+        接反了不会有任何报错 —— 只是下行悄悄退回纯 TCP，跨境线路上的队头
+        阻塞原样吃回来，而且没人看得出来。所以这条接线要有断言看着。
+        """
+        import gameserver                                       # noqa: PLC0415
+        self.assertIs(udpsync.SERVER, gameserver.PEER_RELAY._udp_sender)
+
+    def test_a_route_needs_a_generation_to_be_known(self):
+        """★ 分不清这一发属于哪一代时不冒险，一律走 TCP。"""
+        self.assertFalse(self.udp.may_send_heartbeat(
+            self.newbie, self.alice, heartbeat(0), None))
 
 
 # ----------------------------------------------------------------------------

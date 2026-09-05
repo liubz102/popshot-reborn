@@ -386,6 +386,18 @@ class BotConn(gameserver.Conn):
         #: （报了就是一串挤在几毫秒里，收方看着像瞬移）；被跳过的那一发记在
         #: 这里，追平的那一格一起还。★ 不追赶时心跳的相位一个字没变。
         self.beat_pending = False
+        #: ★★★ **运动突变之后欠着一发锚点心跳**。
+        #:
+        #: 普通腾空的 `vy += 1.2; pos += v` 收方能逐格复现；受击、弹跳台、
+        #: 撞顶、离地/落地会离散地改速度或地面状态，原协议却没有给其中几类
+        #: 单独的事件。等固定 4 格节拍才报，会让收方继续按旧速度外推最多
+        #: 128 ms，再被下一发坐标拉回（V0.3 §185）。状态翻转发生在哪一格，
+        #: 就在哪一格补锚；追赶途中仍只记账，追平再发。
+        self.motion_anchor_pending = False
+        #: 上一格有没有被地形钉住某一轴。撞墙时模拟故意保留 `vx`（§95），
+        #: 但线上速度要报 0（§181）；只在「进入/离开钉住」时补锚，避免贴墙
+        #: 的每一格都多发一份心跳。
+        self.motion_blocked_axes = (False, False)
         #: ★ M5-B 的逐帧路径执行状态。`botnav.plan()` 返回落脚点边；这里保留
         #: 尚未走完的那一串，目标/地图/身体事实变化时再重算，不按挂钟重算。
         self.nav_path = []
@@ -711,6 +723,8 @@ class BotConn(gameserver.Conn):
         self.press_dir = 0
         self.down_latch = False
         self.beat_pending = False
+        self.motion_anchor_pending = False
+        self.motion_blocked_axes = (False, False)
         self.trail_mark = None
         self.trail_heading = 0
         self.load_progress = None
@@ -2671,8 +2685,16 @@ def _knock_back_seat(room, seat_index, damage, push, source="?"):
         #   「在空中的抛物线轨迹上不停的前后闪」就是每挨一枪多出来的那一脚。
         #   ★ 本来在地上被顶飞的那一批不受影响：`Body.__init__` 对
         #     `on_ground=True` 的身体强制 `air_jumped=False`，带过来还是 False。
-        machine.body = botmove.Body(body.x, body.y, vx, vy, on_ground=False,
-                                    air_jumped=body.air_jumped)
+        changed = botmove.Body(body.x, body.y, vx, vy, on_ground=False,
+                               air_jumped=body.air_jumped)
+        machine.body = changed
+        if changed != body:
+            # ★ 受击是离散速度变化。`rpExplode` 的直接命中包里没有 push，
+            # 收方拿自己那颗弹体的速度现算；即使两边只差一个碰撞 tick，
+            # 下一发固定节拍心跳也会把轨迹来回拉。让受害者的下一格立即把
+            # 服务端权威运动状态锚回去（§185）。
+            machine.motion_anchor_pending = True
+            machine.motion_blocked_axes = (False, False)
         # ★ 日志里把「push 到底给没给」写清楚 —— 伤害正好 10 的那一发
         #   原版只夹 `v.y`、一点 push 都不给（`0x50f864` 的 `jle`），
         #   不标出来的话日志上写着 push 却看不见位移，下次又要查一轮。
@@ -2696,6 +2718,10 @@ def _knock_back_seat(room, seat_index, damage, push, source="?"):
                        "乙档", note="滑不过去（那一列没有够得着的站立面）")
         return
     machine.body = botmove.Body(x, float(surface), on_ground=True)
+    if machine.body != body:
+        # 乙档是在地面上瞬时滑 `push.x * 3`，同样不是普通方向键步进。
+        machine.motion_anchor_pending = True
+        machine.motion_blocked_axes = (False, False)
     _log_knockback(room, machine, source, damage, push, body, "乙档")
 
 
@@ -5912,6 +5938,11 @@ def _leash_warp(room, machine, seat_index, terrain, spot, behind, why):
             continue
         was = machine.body
         machine.body = body
+        # ★ 瞬移归队是**离散位移**，而且没有任何事件包伴随（§185）：不锚的话
+        #   收方要等到下一发固定节拍心跳（最多 128 ms）才知道人换地方了，
+        #   在那之前还照着旧速度往老位置外推。和受击同一类事实。
+        machine.motion_anchor_pending = True
+        machine.motion_blocked_axes = (False, False)
         _clear_navigation(machine)
         machine.leash_mark = _quest_forward(terrain) * body.x
         # 「他跑了多远」从落点重新起算：瞬移完还在掉队的话，得再给他
@@ -6046,11 +6077,12 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
     if (not before.on_ground and machine.nav_double_jump
             and botmove.at_apex(before)):
         want_jump = True
-    machine.body = botmove.tick(terrain, before, who,
-                                direction=direction, fast_run=fast_run,
-                                crouched=crouched,
-                                want_jump=want_jump, want_drop=want_drop,
-                                speed_scale=speed_scale)
+    # ★ 用 `step()` 而不是 `tick()`：报心跳要多知道一件事 —— 这一格到底跑没跑
+    #   过空中积分（`air_stepped`）。见 `_reportable_speed()`（§185）。
+    machine.body, air_stepped = botmove.step(
+        terrain, before, who, direction=direction, fast_run=fast_run,
+        crouched=crouched, want_jump=want_jump, want_drop=want_drop,
+        speed_scale=speed_scale)
     left_ground = before.on_ground and not machine.body.on_ground
     if machine.nav_path and left_ground:
         machine.nav_started = True
@@ -6074,13 +6106,58 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
         if not machine.body.on_ground and machine.intent is not None:
             machine.intent = (direction, False, want_drop, fast_run)
     body = machine.body
-    vx, vy = _reportable_speed(before, body)
+    # ★ 顺序不能反：先算**报出去的**那对速度，再拿它去记运动锚 —— 锚的
+    #   「这一轴被钉住了」必须和线上真正报出去的东西是同一件事（§185）。
+    vx, vy = _reportable_speed(before, body, air_stepped)
+    _note_motion_transition(machine, before, body, (vx, vy), jumped)
     return (body.x, body.y, jumped, body.on_ground, vx, vy,
             bool(fast_run), crouched)
 
 
-def _reportable_speed(before, body):
+def _note_motion_transition(machine, before, body, reported, jumped=0):
+    """记下收方不能仅靠上一份速度连续外推出来的运动状态（§185）。
+
+    自由飞行严格是 ``vy += GRAVITY; pos += velocity``，不需要额外发包。
+    这里只认离散的**状态事实**，没有距离或时间阈值：
+
+    * 一/二段跳、踩空、弹跳台、落地会翻转跳段或 ``on_ground``；
+    * 撞顶把本应继续上升的 ``vy`` 截成 0；
+    * 撞墙时模拟保留速度、位置却被钉住，线上速度由
+      :func:`_reportable_speed` 报 0。进入和离开这种状态各锚一次。
+
+    ★★ ``reported`` 是这一格**真正报出去的**那对速度。「这一轴被钉住了」
+    就定义成 **报出去的和模拟里的不一样** —— 而不是在这儿另拿一套几何判据
+    重算一遍。两处各判各的时出过错：贴着墙起跳那一格，`_reportable_speed()`
+    因为速度是本格新生的而原样报，这里却按「位置没动」记成钉住，于是下一格
+    真的报 0 时反而看不到翻转、不补锚。**判据只许有一份。**
+
+    受击发生在别的 bot 推进弹体时，已经早于这里改掉 ``machine.body``，
+    因此由 :func:`_knock_back_seat` 直接置同一面旗。
+    """
+    airborne = not body.on_ground
+    reported_vx, reported_vy = reported
+    blocked_axes = (reported_vx != body.vx, reported_vy != body.vy)
+    blocked_changed = blocked_axes != machine.motion_blocked_axes
+
+    expected_vy = before.vy + botmove.GRAVITY
+    expected_x = before.x + before.vx
+    expected_y = before.y + expected_vy
+    hit_ceiling = (not before.on_ground and airborne and before.vy < 0.0
+                   and body.vy == 0.0
+                   and (expected_vy != 0.0
+                        or body.x != expected_x or body.y != expected_y))
+
+    if (jumped or before.on_ground != body.on_ground
+            or hit_ceiling or blocked_changed):
+        machine.motion_anchor_pending = True
+    machine.motion_blocked_axes = blocked_axes
+
+
+def _reportable_speed(before, body, air_stepped=True):
     """报进心跳的那对速度 —— **被地形挡住的那一轴要报 0**（V0.3 §181）。
+
+    `air_stepped` 是 `botmove.step()` 的第二个返回值：**这一格跑没跑过空中
+    积分**。它是「位置没动 ⇒ 被地形钉住」这条推理的**前提**，见下面第三节。
 
     ## 为什么不能直接报 `body.vx / body.vy`
 
@@ -6114,6 +6191,21 @@ def _reportable_speed(before, body):
     """
     if body.on_ground:
         return body.vx, body.vy         # §35：踩地时本来就恒 0
+    if not air_stepped:
+        # ★★★★★ **这一格根本没按空中速度挪过位置，位置没动当然不是被钉住**
+        #   （§185）。
+        #
+        # 弹跳台在一格的末尾把速度写进角色，位置要到下一格才开始挪 ——
+        # 原版 `JumpingObj::Tick` 就是这个顺序，`botmove.tick()` 那一支也
+        # 直接 return、**不进 `_air_tick`**。旧判据只看 ``body.y == before.y``，
+        # 会把台子刚写进去的 −31 清成 0 发上网；最新 5 局里这种心跳之后的
+        # 下一发直接跨 130~157 px、速度才跳到 −30，正是用户看到的「卡住
+        # 然后瞬移」。
+        #
+        # ⚠ 判据是 `botmove.step()` 报回来的**这一格算了什么**，不是
+        #   `before.on_ground`。后者在「贴着墙从地面起跳」那一格上是错的：
+        #   `jump()` 之后 `_air_tick` 照跑，x 会被墙钉住，那时候必须报 0。
+        return body.vx, body.vy
     vx = 0.0 if (body.vx and body.x == before.x) else body.vx
     vy = 0.0 if (body.vy and body.y == before.y) else body.vy
     return vx, vy
@@ -9657,6 +9749,10 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         machine.intent = None
         machine.intent_tick = None
         machine.aim = None
+        # 死亡广播已经让收方拆掉这个角色；死前尚未发出的运动锚没有对象可锚，
+        # 不能带到五秒后的重生。
+        machine.motion_anchor_pending = False
+        machine.motion_blocked_axes = (False, False)
         current = machine.weapon
         machine.next_fire_at = now + (
             0.0 if current is None else float(current.loading_ms or 0) / 1000.0)
@@ -9778,7 +9874,7 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
     # ★ 记下这一格报出去的地面标志：别人那台机器上 bot 的 `[char+0x128]`
     #   就是它，而夺分模式的一条 ×0.75 按受害者这一格判（§89）。
     machine.on_ground = bool(on_ground)
-    if landed_now:
+    if landed_now or machine.motion_anchor_pending:
         if behind > 0:
             machine.beat_pending = True
         else:
@@ -9875,6 +9971,7 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
                 cursor=cursor, state_byte=_charge_value(machine, now))
             _emit(machine, machine.sync.heartbeat(state))
             machine.beat_pending = False
+            machine.motion_anchor_pending = False
             # ★ ↓ 报出去了就把锁松开（见 `down_latch`）。
             machine.down_latch = False
         if BOT_DIAG_FIRE_ANYWHERE:

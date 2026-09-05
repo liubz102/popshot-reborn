@@ -5152,7 +5152,8 @@ PEER_RELAY = relayserver.RelayServer(
     generation_of=_relay_generation_of,
     # 位置数据的 UDP 旁路（bug调查/9）。`deliver()` 里它是**优先级最高、
     # 准入条件最窄**的那一条路：只有位置心跳、只有自证过能收的收件人、
-    # 而且只有 N 没变的那一发才走它。见 `udpsync.may_send_heartbeat`。
+    # 而且只有本代种子心跳已经走过 TCP 之后才走它。
+    # 见 `udpsync.may_send_heartbeat`（铁律 4 / V0.3 §185）。
     udp_sender=udpsync.SERVER,
     logger=lambda msg: asynclog.emit(f"[{ts()}] [relay] {msg}"),
 )
@@ -5487,7 +5488,7 @@ class Conn:
         # ★ 同步数据的上行现在有**三个**线程会走到：这条连接自己的线程
         #   （`0x040e`）、原版中继连接的线程（rcp opcode 3）、以及 UDP 收包
         #   线程（`udpsync`）。闸门、统计和转发必须串起来，否则两条路可能
-        #   同时判「该我转」而把同一发心跳投两次 —— 那正是铁律 4 要防的。
+        #   同时判「该我转」而把同一发上行心跳投两次 —— 那正是铁律 2 要防的。
         #   ⚠ 顺序永远是「先 peer_lock 再 send_lock」，反过来拿会死锁。
         self.peer_lock = threading.RLock()
         # 上一次看到的局号，用来判断「换代了，闸门要归零」。

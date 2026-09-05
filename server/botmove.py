@@ -529,17 +529,34 @@ def _air_tick(terrain, body):
     return body.moved(nx, ny, vx, vy, on_ground=False)
 
 
-def tick(terrain, body, character, direction=0, fast_run=False,
+def step(terrain, body, character, direction=0, fast_run=False,
          crouched=False, want_jump=False, want_drop=False, speed_scale=1.0):
-    """走一个 tick（32 ms），返回**新的** `Body`。
+    """走一个 tick，返回 `(新 Body, 这一格跑没跑过空中积分)`。
 
-    `direction`：−1 左 / 0 不按 / +1 右，就是心跳里那个方向键掩码（§39）。
-    ★ 它**只在踩着地的时候有意义**（§93）—— 腾空那一段收方根本不读键。
-    `want_jump`：这一 tick 要不要起跳（只在踩着地时有效）。
-    `want_drop`：这一 tick 要不要按 ↓ 穿过脚下单向平台；和跳同时给时下落优先。
+    参数和 :func:`tick` 完全一样 —— `tick()` 就是它丢掉第二个返回值的简写。
+
+    ## ★★★★★ 第二个返回值是什么、给谁用的（V0.3 §185）
+
+    它回答的是**唯一**一个问题：**「某一轴位置没动」这件事，是不是地形钉住的
+    证据？**
+
+    只有 :func:`_air_tick` 会钉住某一轴（撞墙那一支 `nx = body.x`、撞顶那一支
+    把 `v.y` 截成 0）。它跑过 ⇒ `True`：位置真按空中速度推过了，推完还没动就是
+    地形挡的。它没跑 ⇒ `False`：
+
+    * **弹跳台**（`jump_pad_launch`）—— 原版 `JumpingObj::Tick` 是**本格末尾写
+      速度、下一格才按速度挪位置**，所以「刚离地、位置没变、`vy≈−31`」是完全
+      合法的一格。这时候位置没动**不能**当成撞墙；
+    * 踩在地上走（含走出崖边）—— 那一步的位移来自走速，不是空中积分；
+    * 没有地形（`terrain is None`）—— 什么都没算。
+
+    `bot._reportable_speed()` 拿它分流：`False` 时速度原样报，`True` 时才套
+    §181 那条「被钉住的那一轴报 0」。**判据由算物理的这一方说出来**，不让上层
+    按 `before.on_ground` 之类的代理去猜 —— 那个代理在「贴着墙从地面起跳」
+    这一格上是错的（`jump()` 之后 `_air_tick` 照跑，x 会被墙钉住）。
     """
     if terrain is None:
-        return body
+        return body, False
     if not body.on_ground and want_jump:
         # ★ 腾空中按跳 = 第二段跳（§124）。用掉了就什么都不做。
         body = double_jump(body)
@@ -561,8 +578,28 @@ def tick(terrain, body, character, direction=0, fast_run=False,
         #   弹出去。排在走路**之后** —— 实机那一发心跳里人是「又走了一步、
         #   同时被弹起来」的（`(1742,904) -> (1721,905) v=(0,−31)`）。
         launched = jump_pad_launch(terrain, body, character)
-        return body if launched is None else launched
-    return _air_tick(terrain, body)
+        if launched is None:
+            return body, False
+        return launched, False
+    return _air_tick(terrain, body), True
+
+
+def tick(terrain, body, character, direction=0, fast_run=False,
+         crouched=False, want_jump=False, want_drop=False, speed_scale=1.0):
+    """走一个 tick（32 ms），返回**新的** `Body`。
+
+    `direction`：−1 左 / 0 不按 / +1 右，就是心跳里那个方向键掩码（§39）。
+    ★ 它**只在踩着地的时候有意义**（§93）—— 腾空那一段收方根本不读键。
+    `want_jump`：这一 tick 要不要起跳（只在踩着地时有效）。
+    `want_drop`：这一 tick 要不要按 ↓ 穿过脚下单向平台；和跳同时给时下落优先。
+
+    ★ 这是 :func:`step` 只取新 `Body` 的简写。要**报心跳**的地方用 `step()`
+      —— 它多告诉你「位置这一格积分了没有」（§185）；寻路 / 预演那些只关心
+      落点的地方用这个就行。
+    """
+    return step(terrain, body, character, direction=direction,
+                fast_run=fast_run, crouched=crouched, want_jump=want_jump,
+                want_drop=want_drop, speed_scale=speed_scale)[0]
 
 
 def advance(terrain, body, character, ticks, direction=0, fast_run=False,

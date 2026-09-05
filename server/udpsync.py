@@ -15,11 +15,13 @@
 正常一步 36）。**在 TCP 上无解** —— 队头阻塞是 TCP 自己的事，和内容冗余无关。
 
 所以位置数据额外走一条 UDP：丢了就丢了，0.13 秒后下一发自然补上，
-**永远不会因为丢一份而把后面的全卡住**。
+**永远不会因为丢一份而把后面的全卡住**。上下行**两个方向都走**，
+只是两个方向的安全办法不一样：上行双发 + 服务端合流（铁律 2），
+下行整代单路（铁律 4）。
 
 ## 铁律 1：只有位置走 UDP，其余一律 TCP
 
-    内层 opcode 0x4001（心跳，位置就在它 body 里）   -> UDP + TCP 双发
+    内层 opcode 0x4001（心跳，位置就在它 body 里）   -> 上行双发 / 下行择一
     内层 opcode < 0x4000（rpFire / rpExplode / …）    -> **只走 TCP**
     0x4002 讨重传 / 0x4003 / 0x4004 / 0x4005          -> **只走 TCP**
     所有 gsp/gcp 包（死亡、结算、换图…）              -> **只走 TCP**
@@ -58,12 +60,27 @@
 所以绝大部分时间 UDP 该省的都省到了；一旦刚开完枪，那一两发心跳老老实实等 TCP。
 **宁可少省一发，也不许错位一局。**
 
-## 铁律 4：一个收件人同一时刻只有一条路
+## ★★★★★ 铁律 4：下行**每（收件人 × 发送方 × 代）整代只走一条路**
 
-下行（服务端 → 客户端）**绝不**双发：心跳要么走 UDP 要么走 `0x040f`，
-由 `relayserver.RelayServer.deliver()` 逐人选一条。原因还是排序 ——
-心跳没有任何可用来判新旧的原版字段（`UdpPacket +8` 的序列号对心跳**恒为 0**，
-实测 4527 发只有 1 个取值），两条路同时送就一定会有旧的盖掉新的、角色被拉回去。
+下行**绝不双发**：心跳没有任何可用来判位置新旧的原版字段（`UdpPacket +8`
+的序列号对心跳**恒为 0**，实测 4527 发只有 1 个取值），两条路同时送就一定
+会有旧的盖掉新的。
+
+★★ 但「不双发」还不够 —— **逐包换路和双发一样危险**（V0.3 §185）。
+旧判据是「N 变走 TCP、N 不变走 UDP」，于是同一条位置流被劈成两条会互相
+超车的路：TCP 那一发被队头阻塞卡住（实测停 0.43 秒）之后，后发的 UDP 先到、
+旧 TCP 后到，角色被拉回旧位置。`bug调查/15` 量到 **4182 次**这种换路。
+
+⇒ 现在的做法：**本代第一发心跳走 TCP 当种子，之后整代固定走 UDP。**
+只有换代、以及 UDP 端点失效能改路，两个都是事件。完整推导（含拿客户端
+`PktQueue` 模型证明「激活之后旧心跳对队列完全无害」）在
+`UdpSyncServer.may_send_heartbeat` 的 docstring 里。
+
+★ 原版本来就是 TCP + UDP **双发**下行的（`GameSession::SendToAll`
+`0x4077c2` 先走通道 A、紧接着 for 循环走通道 B，UDP 开关 `[session+0x3f8]`
+构造时写死 1；V0.2 §149/§153），两条路在收侧汇到同一个入口 `0x407869`。
+原版能这么干是因为通道 B 是**局域网 P2P 直连**、恒比中继快，顺序天然稳定；
+我们两条路都从同一台服务器出去，顺序不稳，所以才要这条铁律。
 
 ## 线格式（**我们自己的**，和游戏协议无关）
 
@@ -581,7 +598,7 @@ class Endpoint:
     """一条**已经认出来是谁**的 UDP 流。"""
 
     __slots__ = ("game_conn", "addr", "last_seen", "created_at",
-                 "downlink_ok", "out_index", "recent", "last_n",
+                 "downlink_ok", "out_index", "recent", "seeded",
                  "tcp_at", "flips", "flip_gap_min")
 
     def __init__(self, game_conn, addr, now):
@@ -595,17 +612,21 @@ class Endpoint:
         #: 下行的索引和最近几份（冗余捎带用）。
         self.out_index = 0
         self.recent = []
-        #: `发送方 id -> 已经送给本收件人的最新 N`。铁律 3 的下行版本靠它。
-        self.last_n = {}
-        #: ★★ 换路倒序的**曝光计量**（V0.3 §154）。`发送方 id -> 上一发被
-        #: 逼回 TCP 的时刻`；`flips` = 「TCP 之后紧接着一发走 UDP」发生过几次；
-        #: `flip_gap_min` = 这两发之间**最短**的间隔（秒）。
+        #: `发送方 id -> 已经在哪一代给它播过 TCP 种子`（铁律 4）。
+        #: 值就是那一代的代号；代变了就要重新播一发。
+        self.seeded = {}
+        #: ★★ 换路倒序的**曝光计量**（V0.3 §154 / §185）。`发送方 id -> 那一代
+        #: 的种子心跳发出去的时刻`；`flips` = 「TCP 之后紧接着一发走 UDP」
+        #: 发生过几次；`flip_gap_min` = 这两发之间**最短**的间隔（秒）。
         #:
         #: 危险的形状只有这一种：先发的那一发走了慢的 TCP、后发的那一发走了
         #: 快的 UDP，后发的先到 —— 心跳没有任何可判新旧的原版字段，收方拦不住，
         #: 角色被拉回上一发的位置（用户 2026-09-01：「位置跳来跳去」）。
         #: 间隔比两条路的时延差还小时才可能翻车，所以量的就是这个间隔。
-        #: ★ 只计数不改行为：这一版先把事实量出来，够不够危险由数据说了算。
+        #:
+        #: ★ 铁律 4 改成「每代每流只播一次种」之后，`flips` 的量纲从
+        #:   「每换一次 N 一次」（`bug调查/15` 量到 4182 次）变成
+        #:   **每代每个发送方最多 1 次** —— 它现在正好是这条改动的回归指标。
         self.tcp_at = {}
         self.flips = 0
         self.flip_gap_min = None
@@ -688,43 +709,63 @@ class UdpSyncServer:
             return False
         return endpoint.alive(time.monotonic())
 
-    def may_send_heartbeat(self, member, sender, udp_packet):
-        """★★★ 下行选路的判据（铁律 3 的下行版本）。**改这里前先读完这段。**
+    def may_send_heartbeat(self, member, sender, udp_packet, gen=None):
+        """★★★ 下行选路的判据（铁律 4）。**改这里前先读完这段。**
 
-        危险在哪：心跳里的 N 会让收方在**队列还没激活时**做 `FlushTo(N)`，
-        把 `base` 钉到 N 且只进不退，之后 `seq < base` 的事件包被静默丢弃 ——
-        整局零伤害（§217）。UDP 比 TCP 快 300~400 ms，一发心跳要是越过了
-        还在 TCP 路上的事件包，就正好构成这个死法。
+        一句话：**这条流（收件人 × 发送方 × 代）本代的第一发心跳走 TCP 当
+        「种子」，之后整代固定走 UDP。** 只有换代和 UDP 端点失效能改路，
+        两个都是事件，没有任何次数 / 时间阈值。
 
-        判据只有一条，但它把问题变成了**可证明**的：
+        ## 为什么不再逐包选路（V0.3 §185）
 
-            **只有「N 和上一发送给他的心跳相同」的心跳才走 UDP。**
-            N 一变，那一发必须走 TCP。
+        旧判据是「N 和上一发相同才走 UDP，N 一变就退回 TCP」。它保住了队列，
+        却把**位置流劈成了两条会互相超车的路**：TCP 那一发要是被队头阻塞卡住
+        （`bug调查/9` 实测停 0.43 秒），后发的 UDP 先到、旧 TCP 后到，
+        收方把坐标、速度、踩地状态一起倒回去。心跳没有任何可判新旧的原版字段
+        （`UdpPacket +8` 的序列号对心跳**恒为 0**，实测 4527 发只有 1 个取值），
+        收方拦不住。`bug调查/15` 的云端日志量到 **4182 次**这种换路。
 
-        为什么这就够了：
+        ## 为什么整代固定一条路就够安全（拿客户端模型证的）
 
-        * N 变大的那一发走 TCP ⇒ 它**排在**推高 N 的那些事件包后面（同一条
-          有序流），和今天的行为逐字节相同；
-        * 之后 N 不变的那些心跳，`FlushTo(N)` / `Grow(N-1)` 对同一个 N 是
-          幂等的 —— 早到晚到、到几次，收方队列的状态**完全一样**。
-          所以它们怎么乱序都不可能造成 §217 那个错位。
-        * 换代时 N 回到 0（≠ 上一代的值）⇒ 新一代第一发自动走 TCP，
-          「复位后第一发心跳定基线」那一发因此永远是有序的那一份。
+        `test_relayserver.py` 的 `PktQueue` 模型是会话 34 在**真客户端**上逐条
+        验过的（§216）。心跳那一支只有两句：
 
-        代价：实测相邻心跳 N 相同的比例是 **88.3%**，所以约 12% 的心跳
-        （刚开完枪的那一两发）退回 TCP，其余照走 UDP。
-        **拿 12% 换「可证明不会错位」，这个价值得付。**
+            queue.grow(N - 1)
+            if not queue.live: queue.flush_to(N)     # ★ 基线一次定死
+
+        * **`flush_to` 只在队列还没激活时发生** —— 也就是每一代 reset 之后
+          **第一发到达的心跳**。那一发是本条规则里的种子，走 TCP，排在本代所有
+          事件包**前面**（同一条有序流），所以基线可证明就是那一刻的 N。
+        * **激活之后心跳只做 `grow(N-1)`，而 `grow(n)` 对 `n < high` 直接
+          return** ⇒ **旧心跳对队列完全无害**。倒序之后剩下的唯一影响是位置，
+          而位置由「整代单路」保证不会倒序。
+
+        ⇒ 铁律 3 真正要保护的窗口只有「每代第一发心跳」，旧判据却为了它
+        **每一发都在切路**。
+
+        ## 还剩下的那个窗口（不假装它没有）
+
+        种子那一发被 TCP 卡住、**同时**该发送方在本代头 128 ms 内就发过事件包、
+        **且**某发 UDP 心跳抢先到达 ⇒ 收方按那一发定基线，之前的事件包被丢。
+        这个窗口**旧判据同样存在**（它每次 N 变都要重新播一次种，暴露面更大），
+        新判据只是把它收窄到每代一次。要彻底关掉得在客户端侧过滤 TCP 那一路，
+        而游戏 TCP 是 SNOW 2.0 加密的、`relay.py` 只是字节泵，代价不成比例。
+
+        `gen` 是这一发所属的**代号**（`relayserver.RelayServer.deliver()` 已经
+        算好了）。拿不到代号就一律走 TCP —— 分不清代的时候不冒险。
         """
-        want = heartbeat_next_event_seq(udp_packet)
-        if want is None:
+        if gen is None:
             return False
+        if heartbeat_next_event_seq(udp_packet) is None:
+            return False                    # 解不出 N = 不是一发正常心跳
         endpoint = self.endpoint_for(member)
         if endpoint is None:
             return False
         key = id(sender)
-        if endpoint.last_n.get(key) == want:
-            # ★ 上一发刚被逼回 TCP、这一发走 UDP —— 就是「换路」那一下
-            #   （V0.3 §154）。量它，不改行为，见 `Endpoint.tcp_at`。
+        if endpoint.seeded.get(key) == gen:
+            # ★ 本代的种子已经从 TCP 走过了，从这一发起整代固定 UDP。
+            #   紧挨着种子的那一发是这一代唯一一次「TCP 之后紧接着走 UDP」，
+            #   量一下它的间隔当曝光指标（V0.3 §154），不改行为。
             since = endpoint.tcp_at.pop(key, None)
             if since is not None:
                 gap = time.monotonic() - since
@@ -732,8 +773,8 @@ class UdpSyncServer:
                 if endpoint.flip_gap_min is None or gap < endpoint.flip_gap_min:
                     endpoint.flip_gap_min = gap
             return True
-        # N 变了：这一发交给 TCP，并记下新值 —— 下一发起就能走 UDP 了。
-        endpoint.last_n[key] = want
+        # 本代还没播种：这一发交给 TCP，并记下代号 —— 下一发起就走 UDP 了。
+        endpoint.seeded[key] = gen
         endpoint.tcp_at[key] = time.monotonic()
         return False
 
@@ -744,12 +785,14 @@ class UdpSyncServer:
             if endpoint is not None:
                 self._by_addr.pop(endpoint.addr, None)
         if endpoint is not None and endpoint.flips:
-            # ★ 换路的曝光量，走的时候报一次（V0.3 §154）。间隔越短越危险 ——
-            #   先发的那一发走慢的 TCP、后发的走快的 UDP，后发的先到就会把
-            #   角色拉回旧位置，而心跳没有可判新旧的字段，收方拦不住。
+            # ★ 换路的曝光量，走的时候报一次（V0.3 §154 / §185）。间隔越短
+            #   越危险 —— 先发的那一发走慢的 TCP、后发的走快的 UDP，后发的
+            #   先到就会把角色拉回旧位置，而心跳没有可判新旧的字段，收方拦不住。
+            #   ★ 铁律 4 之后这个数应该 ≈「本局代数 × 房里发送方数」；
+            #     远大于它就说明有人把选路改回逐包了。
             gap = endpoint.flip_gap_min
-            self.log(f"位置UDP  这条流一共 {endpoint.flips} 次「TCP 之后紧接着走"
-                     f" UDP」，最短间隔 "
+            self.log(f"位置UDP  这条流一共 {endpoint.flips} 次「TCP 种子之后"
+                     f"接着走 UDP」（每代每个发送方该只有 1 次），最短间隔 "
                      f"{'—' if gap is None else '%.0f ms' % (gap * 1000.0)}"
                      f"（间隔小于两条路的时延差时，后发的那一发会先到）")
 

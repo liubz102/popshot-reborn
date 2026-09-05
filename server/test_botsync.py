@@ -9905,6 +9905,169 @@ class LandingIsAlwaysReportedTests(TerrainMixin, BotFrameRoom):
                          "站着不动的这 20 格该正好 5 发心跳")
 
 
+class MotionTransitionAnchorTests(TerrainMixin, BotFrameRoom):
+    """★★★★★ 速度/地面状态离散变化的那一格必须补运动锚（V0.3 §185）。
+
+    最新 5 局里，自由飞行按客户端同一套 ``vy += 1.2`` 外推时 p99 只差
+    5.7 px；弹跳台窗口 p90 差 116 px、撞顶 56 px、受击 55 px。病的不是
+    重力常量，是收方在这些没有连续导数的点上还拿旧速度推到下一发固定心跳。
+    """
+
+    def prepare(self, terrain):
+        self.install_terrain(terrain)
+        # 只喂位置，不推进：让 `_follow_target()` 有一个活着的真人可跟。
+        self.human_heartbeat(self.alice, 900.0, 150.0, ticks=0)
+        # 先走到本 bot 自己的固定节拍刚结束，下一格必定不是普通心跳格。
+        self.advance_to_own_beat()
+        self.clear()
+        self.bot_conn.motion_anchor_pending = False
+        self.bot_conn.motion_blocked_axes = (False, False)
+
+    def place_motion(self, body):
+        self.bot_conn.body = body
+        self.bot_conn.battle_pos = (body.x, body.y)
+        self.bot_conn.battle_pos_prev = (body.x, body.y)
+        self.bot_conn.on_ground = body.on_ground
+        self.bot_conn.intent = (0, False, False, False)
+        self.bot_conn.intent_tick = self.loop().done
+
+    def sent_beats(self):
+        return [frame for frame in bot_frames(self.alice, self.bot_seat)
+                if udpsync.is_heartbeat(frame)]
+
+    def test_free_flight_does_not_raise_the_heartbeat_rate(self):
+        terrain = synth_terrain("motion_anchor_free", floor=170, height=220)
+        self.prepare(terrain)
+        self.place_motion(botmove.Body(400.0, 100.0, 5.0, -10.0,
+                                       on_ground=False))
+        self.advance(1)
+        self.assertEqual([], self.sent_beats(),
+                         "连续的重力积分收方自己会算，不该每格都发")
+
+    def test_a_jump_carries_an_immediate_position_and_velocity_anchor(self):
+        terrain = synth_terrain("motion_anchor_jump")
+        self.prepare(terrain)
+        self.place_motion(botmove.Body(400.0, 150.0))
+        self.bot_conn.intent = (0, True, False, False)
+        self.advance(1)
+        frames = bot_frames(self.alice, self.bot_seat)
+        self.assertEqual([botsync.OP_JUMP, botsync.OP_HEARTBEAT],
+                         [udpsync.peer_opcode(frame) for frame in frames],
+                         "先发可靠跳跃事件，再用同一条 TCP 流锚运动状态")
+        self.assertFalse(udpsync.heartbeat_motion(frames[-1])[2])
+
+    def test_a_jump_pad_launch_is_anchored_without_an_rpJump_event(self):
+        width, height, floor = 1200, 220, 150
+        rows = [("0" * width if y < floor else "2" * width)
+                for y in range(height)]
+        terrain = mapdata.MapTerrain(make_record(
+            rows, jump=[[400, floor - 12, 0.0, -400.0]]))
+        self.prepare(terrain)
+        self.place_motion(botmove.Body(400.0, float(floor)))
+        self.advance(1)
+        frames = bot_frames(self.alice, self.bot_seat)
+        self.assertEqual([botsync.OP_HEARTBEAT],
+                         [udpsync.peer_opcode(frame) for frame in frames],
+                         "弹跳台原版不发 rpJump，更必须在起飞格补心跳")
+        _x, _y, ground, _vx, vy, _fast = udpsync.heartbeat_motion(frames[0])
+        self.assertFalse(ground)
+        self.assertLess(vy, -24, "台子的初速应明显大于普通跳")
+
+    def test_hitting_a_ceiling_anchors_the_zeroed_vertical_speed(self):
+        width, height, floor = 800, 220, 190
+        rows = []
+        for y in range(height):
+            rows.append("".join(
+                "2" if (y >= floor or (300 <= x < 500 and 70 <= y <= 75))
+                else "0" for x in range(width)))
+        terrain = mapdata.MapTerrain(make_record(rows))
+        self.prepare(terrain)
+        self.place_motion(botmove.Body(400.0, 90.0, 0.0, -20.0,
+                                       on_ground=False))
+        self.advance(1)
+        self.assertEqual(0.0, self.bot_conn.body.vy, "前提：这一格确实撞顶")
+        motion = udpsync.heartbeat_motion(self.sent_beats()[0])
+        self.assertEqual(0, motion[4], "撞顶清掉的 v.y 要当格报给收方")
+
+    def test_knockback_anchors_on_the_victims_next_physics_tick(self):
+        terrain = synth_terrain("motion_anchor_hit", floor=180, height=240)
+        self.prepare(terrain)
+        self.place_motion(botmove.Body(400.0, 180.0))
+        bot._knock_back_seat(self.room, self.bot_seat, 20, (8.0, -8.0),
+                             source="单测")
+        self.assertTrue(self.bot_conn.motion_anchor_pending,
+                        "受击改速度的当下就该欠下一发锚")
+        self.advance(1)
+        motion = udpsync.heartbeat_motion(self.sent_beats()[0])
+        self.assertFalse(motion[2])
+        self.assertGreater(motion[3], 0)
+        self.assertLess(motion[4], 0)
+
+    def note(self, machine, before, body, air_stepped=True, jumped=0):
+        """按 `_own_step()` 里的真实顺序走一遍：先算报出去的速度，再记锚。"""
+        reported = bot._reportable_speed(before, body, air_stepped)
+        bot._note_motion_transition(machine, before, body, reported, jumped)
+        return reported
+
+    def test_a_wall_only_anchors_when_the_blocked_state_changes(self):
+        """贴墙可持续很多格；进入/离开各发一次，不能退化成 31 Hz。"""
+        machine = self.bot_conn
+        machine.motion_anchor_pending = False
+        machine.motion_blocked_axes = (False, False)
+        before = botmove.Body(100.0, 100.0, 8.0, -5.0, on_ground=False)
+        blocked = botmove.Body(100.0, 96.2, 8.0, -3.8, on_ground=False)
+        self.note(machine, before, blocked)
+        self.assertTrue(machine.motion_anchor_pending, "刚撞墙要报一次")
+        machine.motion_anchor_pending = False
+        still_blocked = botmove.Body(100.0, 93.6, 8.0, -2.6,
+                                     on_ground=False)
+        self.note(machine, blocked, still_blocked)
+        self.assertFalse(machine.motion_anchor_pending,
+                         "还贴着同一面墙时不该每格刷心跳")
+        released = botmove.Body(108.0, 92.2, 8.0, -1.4, on_ground=False)
+        self.note(machine, still_blocked, released)
+        self.assertTrue(machine.motion_anchor_pending,
+                        "翻过墙沿重新带速度移动时也要报一次")
+
+    def test_taking_off_against_a_wall_still_reports_a_zero_x_speed(self):
+        """★★★★★ 「速度是本格新生的」这条豁免**只给弹跳台**（§185）。
+
+        贴着墙从地面起跳：`jump()` 之后 `_air_tick` 照跑，x 被墙钉住。
+        这一格如果按 `before.on_ground` 放行 `vx`，收方就会照着它往墙里
+        推 4 帧再被拽回来 —— §181 那种锯齿换了个入口而已。
+        """
+        machine = self.bot_conn
+        machine.motion_anchor_pending = False
+        machine.motion_blocked_axes = (False, False)
+        ground = botmove.Body(100.0, 100.0)
+        # 起跳那一格：`_air_tick` 跑过（air_stepped=True），x 被墙钉住。
+        takeoff = botmove.Body(100.0, 72.0, 8.0, -22.0, on_ground=False)
+        self.assertEqual((0.0, -22.0), self.note(machine, ground, takeoff),
+                         "被墙钉住的那一轴要报 0，哪怕上一格还在地上")
+        self.assertTrue(machine.motion_anchor_pending, "离地本身要补锚")
+        self.assertEqual((True, False), machine.motion_blocked_axes)
+        # 下一格还贴着同一面墙 —— 报的还是 0，状态没翻转，不该再补一发。
+        machine.motion_anchor_pending = False
+        still = botmove.Body(100.0, 51.2, 8.0, -20.8, on_ground=False)
+        self.assertEqual((0.0, -20.8), self.note(machine, takeoff, still))
+        self.assertFalse(machine.motion_anchor_pending,
+                         "同一面墙上不该每格刷心跳")
+
+    def test_a_pad_launch_keeps_its_brand_new_speed(self):
+        """★ 反过来：弹跳台那一格**没**跑空中积分，位置没动不算被钉住。"""
+        machine = self.bot_conn
+        machine.motion_anchor_pending = False
+        machine.motion_blocked_axes = (False, False)
+        ground = botmove.Body(400.0, 900.0)
+        launched = botmove.Body(400.0, 900.0, -0.9, -31.0, on_ground=False)
+        self.assertEqual((-0.9, -31.0),
+                         self.note(machine, ground, launched,
+                                   air_stepped=False),
+                         "台子刚写进去的初速必须原样发")
+        self.assertEqual((False, False), machine.motion_blocked_axes)
+        self.assertTrue(machine.motion_anchor_pending)
+
+
 class AirborneSpeedIsReproducibleTests(unittest.TestCase):
     """★★★★★ 腾空时报出去的速度，收方**必须能照着复现**（V0.3 §181）。
 
@@ -11042,6 +11205,13 @@ class CatchUpHeartbeatTests(BotFrameRoom):
         ticks = gameserver.HEARTBEAT_TICKS * 4
 
         def run(burst):
+            # ★ 重开一局要**先拆再搭**：`BattleRoom.setUp` 会把 `LOBBY` /
+            #   `PEER_RELAY` / `TCP_RELAY_ENABLED` 存进 `self._saved_*` 再换掉，
+            #   而框架只调一次 `tearDown`。光调 `setUp()` 的话第二次存进去的
+            #   是**第一次那个替身**，最后还原回去的也是替身 —— 于是
+            #   `gameserver.PEER_RELAY` 被永久换成一个没接 UDP 旁路的实例，
+            #   本模块之后的每一个测试模块都在那个假接线上跑（2026-09-05 查出）。
+            self.tearDown()
             self.setUp()
             self.walk(self.alice, [(0.0, 100.0), (200.0, 100.0)])
             self.clear()
