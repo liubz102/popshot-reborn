@@ -255,6 +255,69 @@ def item_name_zh(item):
 
 
 # --------------------------------------------------------------------------
+# 物品说明（商店 / 仓库提示框下半那块，V0.3商店 §31）
+# --------------------------------------------------------------------------
+#: 装备加成的键 → (中文名, 是不是百分比)。★ 名字和算法都照客户端来
+#: （§2 的 `Attack %+d%%` / `HP %+d` 那一组；界面上写的就是这五个词）。
+BONUS_ZH = {
+    "hp": ("生命", False),
+    "sp": ("体力", False),
+    "attack": ("攻击", True),
+    "defense": ("防御", True),
+    "movespd": ("速度", True),
+}
+#: 上面那张表之外的稀有加成（`antighostcnt` / `heartboost` 之类，全表 7 件）。
+#: 客户端界面上根本没有它们的格子，说明里也就不提。
+
+#: 说明最多几行。★ 客户端把这串按 `|` 切成**最多 3 段**（`0x45c4c9` 的
+#: `cmp .., 2`）分给三个标签，我们只用第一段（240×88 那个大框），
+#: 段内换行用 `\n`。
+ITEM_DESC_MAX_LINES = 4
+
+
+def item_desc_zh(item):
+    """物品说明。**从本地数据现算**，原版那份说明随服务端 DB 一起没了。
+
+    ⚠ 这不是「发明玩法」（铁律 12）—— 里面每个数都是客户端**自己也查得到**
+    的（武器数值来自 `weapon.ini`、装备加成来自 `EquipBonus-Chn.ini`），
+    只是原版把它们写在服务端下发的说明里，我们照着重新拼一遍。
+
+    翻不出内容就返回空串（提示框那块留白，和以前一样）。
+    """
+    if item is None:
+        return ""
+    lines = []
+    weapon = item.weapon or {}
+    if weapon:
+        damage = weapon.get("damage")
+        head = weapon.get("head_damage")
+        if damage is not None:
+            lines.append("伤害 %d%s" % (damage,
+                                       "（爆头 %d）" % head if head else ""))
+        magazine = weapon.get("magazine")
+        reload_ms = weapon.get("reload_ms")
+        parts = []
+        if magazine:
+            parts.append("弹匣 %d 发" % magazine)
+        if reload_ms:
+            parts.append("换弹 %.2f 秒" % (reload_ms / 1000.0))
+        if parts:
+            lines.append("　".join(parts))
+        velocity = weapon.get("velocity")
+        if velocity:
+            lines.append("初速 %d" % velocity)
+    for key, value in sorted((item.bonus or {}).items()):
+        label = BONUS_ZH.get(key)
+        if label is None or not value:
+            continue
+        lines.append("%s %+d%s" % (label[0], value, "%" if label[1] else ""))
+    if item.bonus_lua:
+        # 条件加成（Lua 源码）客户端自己会算，服务端解释不了 —— 只提一句。
+        lines.append("（附带条件加成）")
+    return "\n".join(lines[:ITEM_DESC_MAX_LINES])
+
+
+# --------------------------------------------------------------------------
 # 默认 shop.json
 # --------------------------------------------------------------------------
 

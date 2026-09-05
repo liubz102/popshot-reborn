@@ -114,7 +114,8 @@ from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_STEP, LEVEL_MAX,
 import gameserver
 import shop
 import shopcfg
-from test_shop import (parse_rep_equipped_list, parse_shop_item_list,
+from test_shop import (parse_rep_equipped_list, parse_rep_inventory,
+                       parse_rep_item_info, parse_shop_item_list,
                        shop_config)
 
 
@@ -851,6 +852,8 @@ class ControlChannelTests(unittest.TestCase):
             self.money_sent = 0
             self.difficulty_sent = 0
             self.equipped_sent = 0
+            self.inventory_sent = 0
+            self.shop_equipped_sent = 0
             self.my_seat = 0
             self.quest_score = 64
             self.last_position = (3225.0, 635.0)
@@ -887,6 +890,12 @@ class ControlChannelTests(unittest.TestCase):
 
         def send_slot_equipped_list(self, seat_index=None, reason=""):
             self.equipped_sent += 1
+
+        def send_rep_inventory(self, reason=""):
+            self.inventory_sent += 1
+
+        def send_rep_equipped_list(self, reason=""):
+            self.shop_equipped_sent += 1
 
         def current_quest(self):
             return gameserver.Conn.current_quest(self)
@@ -967,13 +976,15 @@ class ControlChannelTests(unittest.TestCase):
 
     def test_sync_account_rereads_the_store_before_sending(self):
         # 顺序要紧：先重读盘上的存档，再按它下发，否则发的还是旧值。
-        # 数据栏（0x0600）、难度解锁表（0x020c）和角色解锁表（0x030b）
-        # 都要跟着刷。
+        # 数据栏（0x0600）、难度解锁表（0x020c）、角色解锁表（0x030b）
+        # 和商店三件套（0x0501 / 0x0601 / 0x0604）都要跟着刷。
         reply = gameserver.handle_control_command("sync-account")
-        self.assertTrue(reply.startswith("ok"))
-        self.assertEqual((1, 1, 1, 1),
+        self.assertTrue(reply.startswith("ok"), reply)
+        self.assertEqual((1, 1, 1, 1, 1, 1),
                          (self.conn.reloaded, self.conn.money_sent,
-                          self.conn.difficulty_sent, self.conn.equipped_sent))
+                          self.conn.difficulty_sent, self.conn.equipped_sent,
+                          self.conn.inventory_sent,
+                          self.conn.shop_equipped_sent))
 
     def test_quest_difficulty_without_arguments_follows_the_save(self):
         reply = gameserver.handle_control_command("quest-difficulty")
@@ -3002,14 +3013,26 @@ class ShopProbeTests(unittest.TestCase):
                 payload = struct.pack("<i", 1120041)
             elif opcode == gameserver.OP_REQ_ITEM_BUY:
                 payload = struct.pack("<i", 0)     # 空购物车
+            elif opcode == gameserver.OP_REQ_ITEM_INFO:
+                # 「这个 id 我不认识」——真的挑一个物品表里有的，否则
+                # 回不出定义，这条就退化成「什么都没发」。
+                payload = struct.pack("<ii", 1, 1120041) + b"\x02"
             else:
                 payload = b""
             gameserver.Conn.on_game_packet(conn, opcode, payload)
             answered[opcode] = self.opcodes_of(conn)
         self.assertEqual(
+            # ★ 货架 / 装备清单里**只要有东西**，前面就多一发 `0x0501`
+            #   物品定义 —— 客户端的 `ItemInfo` 表开机是空的，不先喂它就弹
+            #   「无法从服务器读取道具信息」（§28）。这条用例的 `shop.json`
+            #   和假账号的仓库都是空的 ⇒ 两路都没有定义可发。
             {gameserver.OP_REQ_SHOP_ITEM_LIST: [gameserver.OP_REP_SHOP_ITEM_LIST],
              gameserver.OP_REQ_EQUIPPED_LIST: [gameserver.OP_REP_EQUIPPED_LIST],
              gameserver.OP_REQ_GIFT_LIST: [gameserver.OP_REP_GIFT_LIST],
+             # ★ `0x0700` = 「给我持有物清单」（§29）。空仓库也要回 ——
+             #   不回的话仓库面板等一个永远不来的应答。
+             gameserver.OP_REQ_INVENTORY: [gameserver.OP_REP_INVENTORY],
+             gameserver.OP_REQ_ITEM_INFO: [gameserver.OP_REP_ITEM_INFO],
              # ★★ 穿 / 脱都回 `0x0604`，**一发不落**（§24）：客户端拿它当
              #    计数器，少回一发仓库界面就永远不刷新。
              gameserver.OP_REQ_EQUIP_ITEM: [gameserver.OP_REP_EQUIPPED_LIST],
@@ -3018,9 +3041,6 @@ class ShopProbeTests(unittest.TestCase):
              gameserver.OP_REQ_ITEM_BUY: [gameserver.OP_REP_ITEM_BUY],
              # 合成配方清单（`0x0505`）是 M7 的活，现在还不回。
              gameserver.OP_REQ_COMPOSITION_LIST: [],
-             # ★ `0x0700` 大厅和房间也发（`0x5541c1` 有 6 个调用点）——
-             #   拿它触发货架下发会在大厅里乱发 `0x0500`。
-             gameserver.OP_REQ_SHOP_ENTER: [],
              gameserver.OP_REQ_SHOP_UNKNOWN_0603: [],
              # 修理本版不做（`0x0604` 上行 = 用扳手，不是装备，§24）。
              gameserver.OP_REQ_REPAIR_ITEM: [],
@@ -3036,9 +3056,12 @@ class ShopProbeTests(unittest.TestCase):
             gameserver.Conn.on_game_packet(
                 conn, gameserver.OP_REQ_SHOP_ITEM_LIST,
                 shop.build_shop_list_request(category=category))
-        opcode, body = take_frame(bytearray(conn.sent[0]))[1:3]
-        self.assertEqual(gameserver.OP_REP_SHOP_ITEM_LIST, opcode)
-        return parse_shop_item_list(body)
+        # ★ 货架前面还有一发 `0x0501` 物品定义（§28）—— 挑出货架那一发。
+        frames = [take_frame(bytearray(f))[1:3] for f in conn.sent]
+        bodies = [body for opcode, body in frames
+                  if opcode == gameserver.OP_REP_SHOP_ITEM_LIST]
+        self.assertEqual(1, len(bodies), [hex(op) for op, _ in frames])
+        return parse_shop_item_list(bodies[0])
 
     def test_the_shelf_reply_carries_the_listed_items(self):
         pages, page, groups = self.shelf_reply(
@@ -3075,9 +3098,50 @@ class ShopProbeTests(unittest.TestCase):
                    "equipped": [1120041]}
         conn = self.make_conn(account)
         gameserver.Conn.on_game_packet(conn, gameserver.OP_REQ_EQUIPPED_LIST, b"")
+        frames = [take_frame(bytearray(f))[1:3] for f in conn.sent]
+        # ★ 定义（`0x0501`）必须排在装备清单前面 —— 客户端查不到定义就弹
+        #   「无法从服务器读取道具信息」，而且那一发还会跳过界面刷新（§28）。
+        self.assertEqual([gameserver.OP_REP_ITEM_INFO,
+                          gameserver.OP_REP_EQUIPPED_LIST],
+                         [opcode for opcode, _ in frames])
+        self.assertEqual([1120041], parse_rep_equipped_list(frames[1][1]))
+
+    def test_the_inventory_reply_carries_equipment_and_materials(self):
+        """★ `0x0700` = 「给我持有物清单」，回 `0x0601`（§29）。
+
+        这一发不发，仓库界面就是空的 —— 2026-09-05 实机报的那个
+        「`gs_ctl.py inv` 有东西，仓库里什么都没有」就是它。
+        """
+        account = {"level": 1, "experience": 0, "money": 0, "character": 0,
+                   "inventory": {"1120041": {"count": 1}},
+                   "materials": {"30018": 3},
+                   "equipped": [1120041]}
+        conn = self.make_conn(account)
+        gameserver.Conn.on_game_packet(conn, gameserver.OP_REQ_INVENTORY, b"")
+        frames = [take_frame(bytearray(f))[1:3] for f in conn.sent]
+        # ⚠⚠ 顺序不能换：仓库面板是在收到 `0x0601` 的那一刻建的，那会儿
+        #    ItemDB 还空着就建成空的，补发的定义不会让它再刷一次（§29）。
+        self.assertEqual([gameserver.OP_REP_ITEM_INFO,
+                          gameserver.OP_REP_INVENTORY],
+                         [opcode for opcode, _ in frames])
+        self.assertEqual([(30018, 3, 0.0, 0), (1120041, 1, 0.0, 0)],
+                         parse_rep_inventory(frames[1][1]))
+        # 定义两件都得有，否则仓库格子是空的。
+        records, purpose = parse_rep_item_info(frames[0][1])
+        self.assertEqual([30018, 1120041], sorted(r["id"] for r in records))
+        self.assertEqual(shop.ITEM_INFO_FOR_SHELF, purpose)
+
+    def test_an_item_info_request_is_answered_with_the_same_purpose_byte(self):
+        """⚠⚠ 用途标志回错 = 人物模型不刷新（`0x44602a` 只认 `2`，§28）。"""
+        conn = self.make_conn()
+        gameserver.Conn.on_game_packet(
+            conn, gameserver.OP_REQ_ITEM_INFO,
+            struct.pack("<ii", 1, 1120041) + b"\x02")
         opcode, body = take_frame(bytearray(conn.sent[0]))[1:3]
-        self.assertEqual(gameserver.OP_REP_EQUIPPED_LIST, opcode)
-        self.assertEqual([1120041], parse_rep_equipped_list(body))
+        self.assertEqual(gameserver.OP_REP_ITEM_INFO, opcode)
+        records, purpose = parse_rep_item_info(body)
+        self.assertEqual([1120041], [r["id"] for r in records])
+        self.assertEqual(shop.ITEM_INFO_FOR_EQUIPPED, purpose)
 
     def test_the_gift_list_is_answered_empty_not_ignored(self):
         # 不做礼物系统 ≠ 不回：「等一个永远不来的应答」和「收到了空清单」
@@ -3112,7 +3176,7 @@ class ShopProbeTests(unittest.TestCase):
 
     def test_an_empty_payload_does_not_produce_an_empty_hexdump(self):
         conn = self.make_conn()
-        gameserver.Conn.on_shop_probe(conn, gameserver.OP_REQ_SHOP_ENTER, b"")
+        gameserver.Conn.on_shop_probe(conn, gameserver.OP_REQ_INVENTORY, b"")
         self.assertIn("载荷 0 字节", conn.logged[0])
         self.assertNotIn("0000  ", conn.logged[0])
 
@@ -3145,12 +3209,14 @@ class ShopProbeTests(unittest.TestCase):
         """
         mine = tuple(name for name in vars(gameserver)
                      if name.startswith(("OP_REQ_SHOP_", "OP_REQ_ITEM_BUY",
+                                         "OP_REQ_ITEM_INFO", "OP_REQ_INVENTORY",
                                          "OP_REQ_EQUIP_ITEM", "OP_REQ_COMPOS",
                                          "OP_REQ_GIFT_LIST", "OP_REQ_UNEQUIP_",
                                          "OP_REQ_REPAIR_ITEM",
                                          "OP_REQ_EQUIPPED_LIST")))
         server_direction = ("OP_REP_MONEY", "OP_REP_EQUIPPED_LIST",
-                            "OP_REP_SHOP_ITEM_LIST", "OP_REP_GIFT_LIST")
+                            "OP_REP_SHOP_ITEM_LIST", "OP_REP_GIFT_LIST",
+                            "OP_REP_INVENTORY")
         handled = {value for name, value in vars(gameserver).items()
                    if name.startswith("OP_") and isinstance(value, int)
                    and name not in mine and name not in server_direction}
@@ -3206,6 +3272,14 @@ class ShopBuyAndEquipTests(unittest.TestCase):
                 return struct.unpack_from("<i", body, 0)[0]
         raise AssertionError("没有回 0x0502")
 
+    @staticmethod
+    def buy_reason(frames):
+        """`0x0502` 第二格 = 失败原因码（客户端拿它挑「购买失败」框的正文）。"""
+        for opcode, body in frames:
+            if opcode == gameserver.OP_REP_ITEM_BUY:
+                return struct.unpack_from("<i", body, 4)[0]
+        raise AssertionError("没有回 0x0502")
+
     # -- 买 -----------------------------------------------------------------
     def test_buying_takes_the_money_and_gives_the_item(self):
         self.give_money(10000)
@@ -3216,9 +3290,16 @@ class ShopBuyAndEquipTests(unittest.TestCase):
         account = self.account()
         self.assertEqual(7000, account_store.player_money(account))
         self.assertTrue(account_store.has_item(account, self.REVOLVER_R1))
-        # 买完要顺手刷右上角数据栏和仓库，否则玩家得退出商店再进来才看得到。
-        self.assertEqual([gameserver.OP_REP_ITEM_BUY, gameserver.OP_REP_MONEY,
-                          gameserver.OP_REP_EQUIPPED_LIST],
+        # ★★ **顺序是硬要求**：仓库（`0x0601`）要排在购买结果（`0x0502`）前面。
+        #    `0x0502` 的处理器会弹「要不要直接穿上」，点确定时它去**本地背包**
+        #    里找刚买的那件（`0x4463f0`），找不到就什么都不做 —— 那正是
+        #    2026-09-05 实机看到的「选了装备却没装上」（§30）。
+        #    定义（`0x0501`）又必须排在持有物清单前面（§29）。
+        self.assertEqual([gameserver.OP_REP_ITEM_INFO,
+                          gameserver.OP_REP_INVENTORY,
+                          gameserver.OP_REP_EQUIPPED_LIST,
+                          gameserver.OP_REP_MONEY,
+                          gameserver.OP_REP_ITEM_BUY],
                          [opcode for opcode, _ in frames])
 
     def test_the_price_comes_from_shop_json_not_from_the_packet(self):
@@ -3277,6 +3358,47 @@ class ShopBuyAndEquipTests(unittest.TestCase):
         # 不回的话客户端那个「购买结果」弹窗会一直挂着。
         frames = self.buy()
         self.assertEqual(0, self.buy_ok(frames))
+
+    def test_every_refusal_carries_a_reason_the_client_can_show(self):
+        """★ `0x0502` 第二格是**失败原因码**（§30，2026-09-05 实机落锤）。
+
+        填 0 = 玩家看到「未定义的错误」—— 我们明明知道原因却不说。
+        兜底也不能是 0，得是 6「内部错误」。
+        """
+        self.give_money(10000)
+        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+                           "listed": True, "price": 3000, "level": 50},
+                          {"id": self.REVOLVER_R2, "name": "没上架的",
+                           "listed": False, "price": 3000}]):
+            self.assertEqual(shop.BUY_REASON_LEVEL_LOW,
+                             self.buy_reason(self.buy(self.REVOLVER_R1)))
+            self.assertEqual(shop.BUY_REASON_INTERNAL,
+                             self.buy_reason(self.buy(self.REVOLVER_R2)))
+        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+                           "listed": True, "price": 3000}]):
+            self.buy(self.REVOLVER_R1)                 # 第一次买成
+            self.assertEqual(shop.BUY_REASON_ALREADY_OWNED,
+                             self.buy_reason(self.buy(self.REVOLVER_R1)))
+        with shop_config([{"id": self.REVOLVER_R2, "name": "左轮 R2",
+                           "listed": True, "price": 999999}]):   # 买不起
+            self.assertEqual(shop.BUY_REASON_NO_PIXEL,
+                             self.buy_reason(self.buy(self.REVOLVER_R2)))
+        # 空车走的是「认不出的理由」那条路 ⇒ 兜底必须是 6，不是 0。
+        self.assertEqual(shop.BUY_REASON_INTERNAL, self.buy_reason(self.buy()))
+
+    def test_you_can_buy_another_characters_weapon(self):
+        """★ 2026-09-05 实机 bug：泰尔买布洛克的火箭筒被服务端拦下。
+
+        商店上方那排角色箭头就是给「替别的角色买装备」用的
+        （货架本来就按**预览角色**过滤）。「按玩家当前角色拦」是我们自己
+        加的规矩，原版没有。
+        """
+        self.give_money(10000)
+        with shop_config([{"id": 2120041, "name": "卡希尔的左轮",
+                           "listed": True, "price": 3000}]):
+            frames = self.buy(2120041)          # 假账号的角色是 0（泰尔）
+        self.assertEqual(1, self.buy_ok(frames))
+        self.assertTrue(account_store.has_item(self.account(), 2120041))
 
     # -- 穿 / 脱 ------------------------------------------------------------
     def own(self, *item_ids):
@@ -3343,12 +3465,19 @@ class ShopBuyAndEquipTests(unittest.TestCase):
         self.assertEqual([gameserver.OP_REP_EQUIPPED_LIST],
                          [opcode for opcode, _ in frames])
 
-    def test_the_equipped_list_reply_carries_the_warehouse(self):
+    def test_the_equipped_list_reply_carries_only_what_is_worn(self):
+        """★ `0x0604` 发的是**穿在身上的**，不是全部持有物（§29）。
+
+        处理器 `0x447278` 把清单里每件可装备的都 `Equip` 进
+        `[ShopStage+0x134]` —— 那是左侧人物模型的数据源。发全部仓库的话，
+        玩家会看到自己同时穿着所有装备。仓库里「我有什么」走 `0x0601`。
+        """
         self.own(self.REVOLVER_R1, self.REVOLVER_R2)
         frames = self.equip(self.REVOLVER_R1)
-        body = frames[0][1]
-        self.assertEqual([self.REVOLVER_R1, self.REVOLVER_R2],
-                         sorted(parse_rep_equipped_list(body)))
+        bodies = [body for opcode, body in frames
+                  if opcode == gameserver.OP_REP_EQUIPPED_LIST]
+        self.assertEqual([self.REVOLVER_R1],
+                         sorted(parse_rep_equipped_list(bodies[0])))
 
 
 class SendBatchTests(unittest.TestCase):

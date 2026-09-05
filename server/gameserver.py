@@ -496,10 +496,17 @@ OP_REQ_EQUIPPED_LIST = 0x0704
 OP_REQ_COMPOSITION_LIST = 0x0605
 #: 进商店第 4 发。`gcpReqGiftList`，无正文。本版回空礼物清单（礼物系统不做）。
 OP_REQ_GIFT_LIST = 0x0607
-#: 进商店第 5 发。无正文，❓语义未查明。★ **不是商店专用** —— 大厅 / 房间也发
-#: （`0x5541c1` 有 6 个调用点，V0.1 §50 记过大厅在轮询它）⇒ **别拿它当
-#: 「进商店了」的判据**，更别用它触发货架下发。
-OP_REQ_SHOP_ENTER = 0x0700
+#: 进商店第 5 发。无正文。★★ **它是「给我持有物清单」**（V0.3商店 §29）——
+#: 期望应答 `0x0601`（服务端方向）。大厅 / 房间也发（`0x5541c1` 有 6 个调用点），
+#: 因为哪儿都要用持有物 ⇒ **仍然别拿它当「进商店了」的判据**。
+OP_REQ_INVENTORY = 0x0700
+#: ★★ **「这些 itemId 我不认识，给我定义」**（`i32 n + n×i32 + u8 用途标志`，
+#: 组包 `0x559318`，发送函数 `0x55403a`）。期望应答 `0x0501`。
+#:
+#: ⚠⚠ **同号反向**：服务端方向的 `0x0601` 是**持有物清单**（`OP_REP_INVENTORY`）。
+#: ⚠⚠ 载荷最后那个字节是**用途标志**，回的时候**必须原样带回去** ——
+#:    `ShopStage::vft[0xb4]`（`0x44602a`）只在它 == 2 时重建左侧人物模型。
+OP_REQ_ITEM_INFO = 0x0601
 #: **购买**（`i32 n, n×i32`，发送点 `0x446115`），期望应答 `0x0502 gspRepItemBuy`。
 OP_REQ_ITEM_BUY = 0x0602
 #: ❓（单 `i32`，发送点 `0x4466d2`）。`0x0503` 的处理器只读一个 bool 然后弹提示框。
@@ -532,18 +539,28 @@ OP_REP_EQUIPPED_LIST = 0x0604
 OP_REP_GIFT_LIST = 0x0508
 #: 购买结果（`int32 bool ok + i32 + i32`）。⚠ `ok=0` 时客户端**什么都不显示**。
 OP_REP_ITEM_BUY = 0x0502
+#: ★★ **物品定义**（`i32 n + n×ItemInfo + u8 用途标志`，处理器 `0x554136`）。
+#: 客户端的 `ItemInfo` 表 `[0x72e1dc]` 开机是空的，**只有这一发能填**（§28）。
+#: 不发的后果：穿装备 / 买东西 / 仓库列表 / 左侧人物模型全废，
+#: 界面弹「无法从服务器读取道具信息」。
+OP_REP_ITEM_INFO = 0x0501
+#: ★★ **持有物清单**（`i32 n + n×条目`，处理器 `0x55420e`，§29）。
+#: 客户端收到就整份换掉背包 `[0x72e41c]` 并重建仓库面板 ⇒ 每次发全量。
+#: ⚠⚠ 和 `OP_REQ_ITEM_INFO` 同号反向。
+OP_REP_INVENTORY = 0x0601
 
 #: 进商店那五发，按客户端实际的发送顺序排。日志里按这个顺序对号。
 SHOP_ENTRY_OPCODES = (OP_REQ_SHOP_ITEM_LIST, OP_REQ_EQUIPPED_LIST,
                       OP_REQ_COMPOSITION_LIST, OP_REQ_GIFT_LIST,
-                      OP_REQ_SHOP_ENTER)
+                      OP_REQ_INVENTORY)
 
 #: 商店段负责的全部上行 opcode。
 #: ★ 新增上行 opcode 记得**这里和 `GCP_NAMES` 两边都加** —— `0x0600` 就是
 #:   因为只加了一边，白白多悬了一轮（§20）。
 SHOP_PROBE_OPCODES = SHOP_ENTRY_OPCODES + (
-    OP_REQ_ITEM_BUY, OP_REQ_SHOP_UNKNOWN_0603, OP_REQ_REPAIR_ITEM,
-    OP_REQ_COMPOSE_ITEM, OP_REQ_EQUIP_ITEM, OP_REQ_UNEQUIP_ITEM)
+    OP_REQ_ITEM_INFO, OP_REQ_ITEM_BUY, OP_REQ_SHOP_UNKNOWN_0603,
+    OP_REQ_REPAIR_ITEM, OP_REQ_COMPOSE_ITEM,
+    OP_REQ_EQUIP_ITEM, OP_REQ_UNEQUIP_ITEM)
 
 #: 每个号「逆出来的形状」和「期望应答」，只用来给日志配一句人话。
 #: ★ 括号里的可信度标记就是 `re/packet_api.md` §3.8 里那一份，别在这儿升级它。
@@ -552,7 +569,8 @@ SHOP_PROBE_NOTES = {
     OP_REQ_EQUIPPED_LIST: ("无正文 ✅", "0x0604 gspRepEquippedList"),
     OP_REQ_COMPOSITION_LIST: ("u8 + i32 + u16 + i32 ✅", "0x0505 gspRepCompositionList"),
     OP_REQ_GIFT_LIST: ("无正文 ✅", "0x0508 gspRepGiftList（本版恒空）"),
-    OP_REQ_SHOP_ENTER: ("无正文 ✅", "❓未查（不是商店专用）"),
+    OP_REQ_INVENTORY: ("无正文 ✅ 要持有物清单", "0x0601 持有物清单（同号反向）"),
+    OP_REQ_ITEM_INFO: ("i32 n, n×i32, u8 用途 ✅", "0x0501 物品定义"),
     OP_REQ_ITEM_BUY: ("i32 n, n×i32 🔍", "0x0502 gspRepItemBuy"),
     OP_REQ_SHOP_UNKNOWN_0603: ("i32 🔍 卖出", "❓0x0503 是个 bool + 提示框"),
     OP_REQ_REPAIR_ITEM: ("i32 itemId + i32 210003 🔍 修理", "❓（本版不做修理）"),
@@ -570,11 +588,13 @@ SHOP_REPLY_ENABLED = {
     OP_REP_EQUIPPED_LIST: True,
     OP_REP_GIFT_LIST: True,
     OP_REP_ITEM_BUY: True,
+    OP_REP_ITEM_INFO: True,
+    OP_REP_INVENTORY: True,
 }
 
-#: 货架包里那三个未查明字段要不要填探针值（控制通道的 `shelf-probe`）。
-#: `None` = 照常填 0 / 空串。★ 开着它进商店，界面上哪儿冒出 `777` / `888` /
-#: 「※探针※」，那一格就是哪个字段 —— 一轮实机就能把 §21 的三个 ❓ 填掉。
+#: 剩下那两个未查明字段（`ShopStock+0x1c`、`0x0502` 第三格）要不要填探针值
+#: （控制通道的 `shelf-probe`）。关掉 = 照常填 0。
+#: ★ 开着它进商店，界面上哪儿冒出 `888`，那一格就是哪个字段。
 SHELF_PROBE_ON = False
 
 # ---------------------------------------------------------------------------
@@ -661,6 +681,9 @@ GCP_NAMES = {
     # ⚠⚠ **同号反向**：服务端方向的 `0x0600` 是 `gspRepMoney`（右上角数据栏）。
     #    客户端方向的 `0x0600` 是**货架目录请求**，进商店第 1 发（§20）。
     0x0600: "gcpReqShopItemList",      # ❓ 无 RTTI 类名，裸序列化（0x5592da）
+    # ⚠⚠ **同号反向**：服务端方向的 `0x0601` 是**持有物清单**（§29）。
+    #    客户端方向的 `0x0601` 是「这些 id 我不认识，给我定义」（§28）。
+    0x0601: "rawReqItemInfo",          # ❓ 无 RTTI 类名，裸序列化（0x559318）
     0x0602: "gcpReqItemBuy",
     0x0603: "rawShopReq0603",          # ❓ 无 RTTI 类名，裸序列化（0x4466d2）
     0x0604: "rawRepairItem",           # 修理，itemId + 210003 扳手（0x446f5b）
@@ -668,7 +691,7 @@ GCP_NAMES = {
     0x0606: "gcpReqComposeItem",
     0x0607: "gcpReqGiftList",
     0x0609: "gcpReqGiftAction",
-    0x0700: "rawShopEnter0700",        # ❓ 无正文（0x5541c1）
+    0x0700: "rawReqInventory",         # 「给我持有物清单」，无正文（0x5541c1，§29）
     0x0702: "rawEquipItem",            # 穿上，单 i32（0x559464，§24）
     0x0703: "rawUnequipItem",          # 脱下，单 i32（0x55949e，§24）
     0x0704: "rawReqEquippedList",      # 无正文（0x44722b）
@@ -1547,7 +1570,7 @@ def build_session_members(host_seat=0, seats=()):
 EQUIPPED_SLOT_MASK_COUNT = 3
 
 
-def build_slot_equipped_list(seat_index, item_ids=(), slot_masks=(0, 0, 0)):
+def build_slot_equipped_list(seat_index, item_ids=(), slot_masks=None):
     """opcode 0x030b —— 某个座位的背包/装备物品清单。
 
     ★ **这是「房间『人物选择』里能出现几个头像」的唯一开关**（FINDINGS §119）。
@@ -1588,6 +1611,11 @@ def build_slot_equipped_list(seat_index, item_ids=(), slot_masks=(0, 0, 0)):
     """
     if not 0 <= seat_index < ROOM_SEAT_COUNT:
         raise ValueError(f"seat {seat_index} is out of range")
+    # ★ 12 字节掩码**不是死字段**（§31）：房间里那个「卸下」按钮拿它判
+    #   「这件穿着没有」（`0x5584ab`），全 0 = 客户端认为你什么都没穿，
+    #   点卸下只会弹「已卸下。」然后什么都不做。
+    if slot_masks is None:
+        slot_masks = shop.equipment_slot_masks(item_ids)
     masks = tuple(slot_masks)
     if len(masks) != EQUIPPED_SLOT_MASK_COUNT:
         raise ValueError(
@@ -9708,6 +9736,10 @@ class Conn:
             self.send_rep_equipped_list(reason="（进商店）")
         elif opcode == OP_REQ_GIFT_LIST:
             self.send_rep_gift_list()
+        elif opcode == OP_REQ_INVENTORY:
+            self.send_rep_inventory(reason="（客户端要的）")
+        elif opcode == OP_REQ_ITEM_INFO:
+            self.on_req_item_info(payload)
         elif opcode == OP_REQ_ITEM_BUY:
             self.on_req_item_buy(payload)
         elif opcode in (OP_REQ_EQUIP_ITEM, OP_REQ_UNEQUIP_ITEM):
@@ -9748,28 +9780,106 @@ class Conn:
         for warning in warnings:
             self.log(f"   ⚠ shop.json: {warning}")
         labels = [f"{entry['id']}×{entry['price']}" for entry in shown]
+        # ★ 先补定义再发货架：格子里的名字 / 价格在包里，但「买」按钮按下去
+        #   要查 ItemDB（`0x444547` 那条「无法从服务器读取道具信息」），§28。
+        self.send_item_definitions([entry["id"] for entry in shown],
+                                   reason="（货架要用）")
         self.log(f"← 回 0x0500 货架 {request!r} → {len(shown)} 件 {labels}")
         self.send(build_game(OP_REP_SHOP_ITEM_LIST, body))
 
-    def send_rep_equipped_list(self, reason=""):
-        """回 `0x0604 gspRepEquippedList` —— 商店 / 仓库界面里的「我有什么」。
+    def send_item_definitions(self, item_ids,
+                              purpose=shop.ITEM_INFO_FOR_SHELF, reason=""):
+        """发 `0x0501` 物品定义 —— 填客户端那张**开机是空的** `ItemInfo` 表（§28）。
 
-        ★ **和 `0x030b` 是两条独立的路**（§23）：这一发只落到
-        `[ShopStage+0x134/0x138]`，只影响商店界面的显示；**战斗加成的唯一来源
-        仍然是 `0x030b`**。改了装备两发都要发。
+        ★ **每一份要发下去的 id 清单，都得先走一遍这里。** 客户端的
+        `[0x72e1dc]` 只有服务端能填；查不到定义时它会弹
+        「无法从服务器读取道具信息」，而且**弹完就把 id 记成「已请求」**
+        （`0x55403a` 的 `[db+0x14]`）—— 我们不回，它就再也不问了。
+
+        `purpose` 是请求里那个用途标志：**回请求时必须原样带回去**
+        （只有 `2` 会让 `ShopStage` 重建左侧人物模型，`0x44602a`）；
+        主动下发用默认的 `0`（客户端只入表、不动界面）。
+        """
+        if self.shop_reply_off(OP_REP_ITEM_INFO, "物品定义"):
+            return
+        wanted = list(item_ids)
+        if not wanted:
+            return
+        records, skipped, warnings = shop.item_info_records(wanted)
+        for warning in warnings:
+            self.log(f"   ⚠ shop.json: {warning}")
+        if skipped:
+            # 客户端问过的 id 我们答不上来 = 它会一直缺这条定义。显眼地记一行。
+            self.log(f"   ⚠ 物品表里没有这些 id，定义发不出去: {skipped}")
+        if not records:
+            return
+        self.log(f"← 回 0x0501 物品定义 {len(records)} 条 用途={purpose}{reason}")
+        self.send(build_game(OP_REP_ITEM_INFO,
+                             shop.build_rep_item_info(records, purpose)))
+
+    def on_req_item_info(self, payload):
+        """客户端方向的 `0x0601` —— 「这些 id 我不认识，给我定义」（§28）。
+
+        ⚠⚠ 别和服务端方向的 `0x0601`（持有物清单）搞混，两者同号反向。
+        ⚠⚠ **载荷末尾那个用途标志要原样回**：客户端拿它区分「这批定义是给谁
+        要的」，`2` = 装备清单要的 ⇒ 回来之后重建左侧人物模型。
+        """
+        try:
+            wanted, purpose = shop.parse_item_info_request(payload)
+        except ValueError as error:
+            self.log(f"   ✗ 物品定义请求解不开: {error}")
+            return
+        labels = [_item_label(item_id) for item_id in wanted]
+        self.log(f"   客户端不认识 {len(wanted)} 个 id（用途={purpose}）: {labels}")
+        self.send_item_definitions(wanted, purpose, reason="（客户端问的）")
+
+    def send_rep_inventory(self, reason=""):
+        """发 `0x0601`（服务端方向）持有物清单 —— **仓库界面的唯一数据源**（§29）。
+
+        客户端收到就整份换掉背包 `[0x72e41c]`，再让当前 Stage 重建仓库面板
+        （`ShopStage` 是 `0x446f8a`）⇒ **每次都发全量**，没有增量形态。
+
+        ⚠⚠ **必须先发 `0x0501` 定义再发这一发**：仓库面板是在收到清单的那一刻
+        建的，那会儿 ItemDB 还空着就建成空的；补发的定义标志位不是 2，
+        `ShopStage` 不会再刷第二次。
+        """
+        if self.shop_reply_off(OP_REP_INVENTORY, "持有物清单"):
+            return
+        inventory = inventory_items(self.account)
+        materials = material_counts(self.account)
+        entries, skipped = shop.inventory_records(inventory, materials)
+        self.send_item_definitions(
+            shop.inventory_item_ids(inventory, materials),
+            reason="（持有物清单要用）")
+        if skipped:
+            self.log(f"   ⚠ 客户端认不出来，没往仓库发: {skipped}")
+        self.log(f"← 回 0x0601 持有物清单 {len(entries)} 件"
+                 f"（装备 {len(inventory)} + 材料 {len(materials)}）{reason}")
+        self.send(build_game(OP_REP_INVENTORY, shop.build_rep_inventory(entries)))
+
+    def send_rep_equipped_list(self, reason=""):
+        """回 `0x0604 gspRepEquippedList` —— **穿在身上的那几件**。
+
+        ★ **发的是 `equipped_items()`，不是全部持有物**（§29）：处理器
+        `0x447278` 把清单里每个「可装备」的条目 `Equip` 进
+        `[ShopStage+0x134]`，那正是**左侧人物模型的数据源** ——
+        发全部持有物的话玩家会看到自己同时穿着所有装备。
+        仓库里「我有什么」是另一发（`0x0601`，`send_rep_inventory`）。
+
+        ★ **和 `0x030b` 是两条独立的路**（§23）：这一发只影响商店界面的显示；
+        **战斗加成的唯一来源仍然是 `0x030b`**。改了装备两发都要发。
 
         ⚠ 客户端对**自己表里查不到的 id** 会收集起来弹提示框（`0x447406`）
-        ⇒ 发之前过一遍 `shopdata.ownable()`。商城角色那批 9 位 id
-        （`character_item_ids`）**不往这儿发** —— 它们是给 `0x030b` 的角色
-        持有判定用的，不是商店界面的持有物。
+        ⇒ 先补一发 `0x0501` 定义。商城角色那批 9 位 id（`character_item_ids`）
+        **不往这儿发** —— 它们是给 `0x030b` 的角色持有判定用的。
         """
         if self.shop_reply_off(OP_REP_EQUIPPED_LIST, "装备清单"):
             return
-        owned = shop.displayable_items(owned_item_ids(self.account))
-        self.log(f"← 回 0x0604 装备清单 {len(owned)} 件"
-                 f"（穿着 {equipped_items(self.account)}）{reason}")
+        equipped = shop.displayable_items(equipped_items(self.account))
+        self.send_item_definitions(equipped, reason="（装备清单要用）")
+        self.log(f"← 回 0x0604 装备清单（穿着 {equipped}）{reason}")
         self.send(build_game(OP_REP_EQUIPPED_LIST,
-                             shop.build_rep_equipped_list(owned)))
+                             shop.build_rep_equipped_list(equipped)))
 
     def on_req_item_buy(self, payload):
         """客户端方向的 `0x0602` —— 购物车结账，回 `0x0502`（V0.3商店 §24）。
@@ -9782,8 +9892,14 @@ class Conn:
           扣完钱再抛就成了「钱没了东西没有」，那是最难查的一种账。
 
         ★ 价格只信 `shop.json`，包里只有 itemId（PLAN M5）。
-        ⚠ 失败时客户端**什么都不显示**（`0x44643d` 只析构弹窗）⇒ 原因只能
-        进日志。所以这里每一条拒绝都写清是哪件、为什么。
+        ⚠⚠ **失败要带原因码**（`0x0502` 的第二格，§30）—— 客户端会弹
+        「购买失败」框并按这一格挑正文，填 0 就是「未定义的错误」。
+
+        ⚠⚠ **成功时四发的顺序是硬要求**：仓库（`0x0601`）必须排在购买结果
+        （`0x0502`）**前面**。`0x0502` 的处理器会弹「要不要直接穿上」，
+        点「确定」时它去**本地背包**里找刚买的那件（`0x4463f0`），
+        找不到就**什么都不做**（§30）—— 那正是 2026-09-05 实机看到的
+        「选了装备却没装上」。
         """
         if self.shop_reply_off(OP_REP_ITEM_BUY, "购买结果"):
             return
@@ -9792,13 +9908,13 @@ class Conn:
         except ValueError as error:
             self.log(f"   ✗ 购买请求解不开: {error}")
             return
-        probe = shop.SHELF_PROBE if SHELF_PROBE_ON else (0, "", 0)
+        probe = shop.BUY_RESULT_PROBE if SHELF_PROBE_ON else 0
 
-        def refuse(reason):
-            self.log(f"← 回 0x0502 购买失败（{reason}）"
-                     f"  ⚠ 客户端在失败路径上不显示任何提示，玩家只会觉得没反应")
+        def refuse(why, reason=None):
+            code = shop.buy_reason_code(reason)
+            self.log(f"← 回 0x0502 购买失败（{why}）→ 界面原因码 {code}")
             self.send(build_game(OP_REP_ITEM_BUY,
-                                 shop.build_rep_item_buy(False)))
+                                 shop.build_rep_item_buy(False, code)))
 
         if not wanted:
             return refuse("购物车是空的")
@@ -9808,22 +9924,20 @@ class Conn:
         for warning in warnings:
             self.log(f"   ⚠ shop.json: {warning}")
         level = player_level(self.account)
-        character = player_character(self.account)
         owned = set(owned_item_ids(self.account))
         total = 0
         picked = []
         for item_id in wanted:
-            entry, why = shop.check_purchase(item_id, table, level, character,
-                                             owned)
+            entry, why = shop.check_purchase(item_id, table, level, owned)
             if why is not None:
-                return refuse(f"{_item_label(item_id)}: {why}")
+                return refuse(f"{_item_label(item_id)}: {why}", why)
             total += entry["price"]
             owned.add(int(item_id))       # 同一车里买两件一样的也算重复持有
             picked.append(entry)
         try:
             self.account = self.accounts.spend_money(self.account_name, total)
         except AccountError as error:
-            return refuse(f"扣款失败: {error.message}")
+            return refuse(f"扣款失败: {error.message}", shop.BUY_NO_MONEY)
         bought = []
         for entry in picked:
             try:
@@ -9835,13 +9949,16 @@ class Conn:
                 self.log(f"   !! 已扣款但入库失败: {entry['id']} {error.message}")
                 continue
             bought.append(entry)
+        # ★ 先把仓库 / 穿着 / 数据栏刷到位，**最后**才回购买结果 —— 顺序理由见上。
+        #   客户端买完不会自己再要一次持有物清单（`0x44615b` 里没有
+        #   `0x5541c1` 的调用点）⇒ 这三发只能服务端主动推。
+        self.send_rep_inventory(reason="（买完刷新）")
+        self.send_rep_equipped_list(reason="（买完刷新）")
+        self.send_rep_money(reason="（买完刷新）")
         self.log(f"← 回 0x0502 购买成功 {[e['id'] for e in bought]}"
                  f" 共 {total} 金币，余额 {player_money(self.account)}")
         self.send(build_game(OP_REP_ITEM_BUY,
-                             shop.build_rep_item_buy(True, probe[0], probe[2])))
-        # 右上角数据栏和仓库都得跟上，不然玩家要退出商店再进来才看得到。
-        self.send_rep_money(reason="（买完刷新）")
-        self.send_rep_equipped_list(reason="（买完刷新）")
+                             shop.build_rep_item_buy(True, 0, probe)))
 
     def on_req_equip_item(self, opcode, payload):
         """客户端方向的 `0x0702`（穿上）/ `0x0703`（脱下）—— 都回 `0x0604`（§24）。
@@ -10139,8 +10256,10 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
   back-to-room                    发 0x0403（服务端方向 = 切回 stage 5 房间）
   sync-account                    重读 accounts.json 并发 0x0600 gspRepMoney
                                   + 0x020c gspQuestReachedDifficulty
-                                  + 0x030b gspSlotEquippedList，
-                                  把数据栏、难度解锁和角色解锁刷成存档里的样子
+                                  + 0x030b gspSlotEquippedList
+                                  + 0x0501 物品定义 / 0x0601 持有物 / 0x0604 穿着，
+                                  把数据栏、难度解锁、角色解锁和商店三个面板
+                                  一次刷成存档里的样子（人在商店里也能看到）
   quest-difficulty [id 难度 ...]  发 0x020c 全量快照 = 「每关打到第几个难度」。
                                   不带参数就按存档发（和登录时那一发一样）；
                                   带参数就发指定的表（协议试探用），例如
@@ -10162,15 +10281,20 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
                                   ★ 加成是**客户端**查本地 EquipBonus.ini 算的，
                                   服务端只下发 itemId；而且攻/防加成只有 15%
                                   概率触发，要看效果优先挑 Hp（100% 生效的加法）
-  shop-reply [on|off <opcode>]    商店界面那三发应答的**总闸**，不带参数就看现状。
-                                  opcode 写 0500（货架）/ 0604（装备清单）/
-                                  0508（礼物清单）。★ 下行三发全是静态逆出来的，
-                                  实机万一界面不对，关掉一发再进一次商店就能
-                                  二分到是哪一发 —— 不用改代码、不用重启
-  shelf-probe [on|off]            把货架包里三个**还没查明**的字段填成
-                                  777 / ※探针※ / 888（§21）。★ 2026-09-05
-                                  实机跑过一轮：界面上一个都没冒出来，那三格
-                                  商店面板压根不读（§25）。留着是给别的面板用的
+  shop-reply [on|off <opcode>]    商店段下行应答的**总闸**，不带参数就看现状。
+                                  opcode 写 0500（货架）/ 0604（穿着的装备）/
+                                  0508（礼物清单）/ 0502（购买结果）/
+                                  0501（物品定义）/ 0601（持有物清单）。
+                                  ★ 这些全是静态逆出来的，实机万一界面不对，
+                                  关掉一发再进一次商店就能二分到是哪一发
+                                  —— 不用改代码、不用重启。
+                                  ⚠ 关掉 0501 = 客户端弹「无法从服务器读取
+                                  道具信息」，那正是 2026-09-05 报的那个 bug
+  shelf-probe [on|off]            把货架包 / 购买结果里**还没查明**的那两格
+                                  填成 888（§21）。★ 原来是三格，2026-09-05
+                                  实机把其中两格钉死了（划线原价 + 商品说明，
+                                  §31），剩下 `ShopStock+0x1c` 和
+                                  `0x0502` 第三格两个 ❓，还没找到它们画在哪
   shelf [分类] [页] [角色] [排序] 不进游戏也能看「货架这一页会发什么」。
                                   分类**省略**=全部、60001 = 武器槽1（十六进制，
                                   见 FINDINGS §22）；★ 写 0 不是全部，是「人物→
@@ -10639,7 +10763,11 @@ def _dispatch_control_command(line):
         conn.send_rep_money(reason="（sync-account）")
         conn.send_quest_reached_difficulty(reason="（sync-account）")
         conn.send_slot_equipped_list(reason="（sync-account）")
-        return "ok 已重读存档并发 0x0600 + 0x020c + 0x030b " + _control_status(conn)
+        # ★ 商店那三件套也一起刷：定义 -> 持有物 -> 穿着（顺序不能换，§29）。
+        conn.send_rep_inventory(reason="（sync-account）")
+        conn.send_rep_equipped_list(reason="（sync-account）")
+        return ("ok 已重读存档并发 0x0600 + 0x020c + 0x030b + 0x0501/0x0601/0x0604 "
+                + _control_status(conn))
 
     return f"err 未知命令 {cmd!r}；用 help 看命令表"
 

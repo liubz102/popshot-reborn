@@ -40,6 +40,16 @@ def w_byte(v):
     return struct.pack("<B", int(v) & 0xFF)
 
 
+def w_i16(v):
+    """写 2 字节有符号（流原语 `0x5d59f1` 读 2 字节 + `movsx`）。"""
+    return struct.pack("<h", int(v))
+
+
+def w_f64(v):
+    """写 8 字节 double（流原语 `0x5d5a0d` 读 8 字节）。"""
+    return struct.pack("<d", float(v))
+
+
 def w_wstr(s):
     """`u16 字符数 + UTF-16LE`（流原语 `0x5d5a5a`）。"""
     text = "" if s is None else str(s)
@@ -173,20 +183,27 @@ def build_shop_list_request(character=0, category=0, page=0, flag=0):
 # ---------------------------------------------------------------------------
 # `0x0500` gspRepShopItemList（服务端 → 客户端）
 # ---------------------------------------------------------------------------
-def build_shop_stock(item_id, name, price, currency=0, unknown1=0,
+def build_shop_stock(item_id, name, price, currency=0, list_price=None,
                      note="", unknown2=0, grants=()):
     """一档买法的详情（`ShopStock`，Des `0x44360a`）。
 
-    | 线上 | 含义 |
-    |---|---|
-    | i32 | 物品 id（图标就是拿它查 ItemDB 的）|
-    | wstr | 商品名，画在格子上 |
-    | i32 | **价格**（旁边的标签是 `가격`）|
-    | i32 | ❓ 未查明，填 0 |
-    | i32 | 货币：`0` = 픽셀（中文版叫「金币」）/ 非 0 = 캐시（「游戏币」）|
-    | wstr | ❓ 未查明，填空串 |
-    | i32 | ❓ 未查明，填 0 |
-    | i32 n + n×`Item@ShopStock` | **买了到手的东西** |
+    | 线上 | 结构偏移 | 含义 |
+    |---|---|---|
+    | i32 | `+0x04` | 物品 id（图标就是拿它查 ItemDB 的）|
+    | wstr | `+0x08` | 商品名，画在格子上 |
+    | i32 | `+0x0c` | **价格**（旁边的标签是 `가격`）|
+    | i32 | `+0x10` | ★ **划线原价**（提示框里「原价 → 现价」左边那个数）|
+    | i32 | `+0x14` | 货币：`0` = 픽셀（中文版叫「金币」）/ 非 0 = 캐시（「游戏币」）|
+    | wstr | `+0x18` | ★ **商品说明**（提示框下半那三行，`\\|` 分段，最多 3 段）|
+    | i32 | `+0x1c` | ❓ 未查明，填 0 |
+    | i32 n + n×`Item@ShopStock` | `+0x20` | **买了到手的东西** |
+
+    ⚠⚠ **`list_price` 不给就等于 `price`** —— 提示框拿它和价格比
+    （`0x45c354`），**不相等就画成「原价 → 现价」**。填 0 的话玩家看到的是
+    「0 → 3000」（2026-09-05 实机现象）。要做打折就把原价填上去。
+
+    ★ §26 那轮探针把 `+0x10` / `+0x18` 判成「死字段」，**那只对货架格子成立**
+    —— 提示框（`0x45c302` 起）两个都读。§26 结尾自己写过这个坑。
 
     `grants` 不给就默认「买什么到手什么」= `[item_id]`。
     ★ 每个 `Item@ShopStock` 是 3 个 int，只有第一个（物品 id）被客户端读
@@ -196,7 +213,7 @@ def build_shop_stock(item_id, name, price, currency=0, unknown1=0,
     body = (w_i32(item_id)
             + w_wstr(name)
             + w_i32(price)
-            + w_i32(unknown1)
+            + w_i32(price if list_price is None else list_price)
             + w_i32(currency)
             + w_wstr(note)
             + w_i32(unknown2)
@@ -316,13 +333,16 @@ def page_count(total):
     return (total + PAGE_SIZE - 1) // PAGE_SIZE
 
 
-#: 「那三个还没查明的字段」的探针值（`shelf-probe on` 用）。
+#: 「还没查明的字段」的探针值（`shelf-probe on` 用）。
 #:
-#: `ShopStock` 里有三格语义未查明（一个 i32、一个 wstr、又一个 i32，§21）。
-#: 与其对着反汇编再啃一天，不如**在界面上找它们** —— 填成一眼认得出的值，
-#: 实机看一下哪个数字 / 哪串字冒出来在哪儿，一轮就对上了。
-#: ★ 挑的值要「一看就不是正常数据」：`777` / `888` 不会和价格等级撞车。
-SHELF_PROBE = (777, "※探针※", 888)
+#: 原来是三格（`ShopStock` 的 `+0x10` / `+0x18` / `+0x1c`，§21）。2026-09-05
+#: 实机把前两格钉死了 —— `+0x10` = 划线原价、`+0x18` = 商品说明（§31），
+#: **只剩 `+0x1c` 一格**，探针就缩成一个数。
+#: ★ 挑的值要「一看就不是正常数据」：`888` 不会和价格 / 等级撞车。
+SHELF_PROBE = 888
+
+#: `0x0502` 第三格（`gspRepItemBuy` 的 `+0x0c`）也还没查明，同一套探针。
+BUY_RESULT_PROBE = 888
 
 
 def shelf_page(category=CATEGORY_ALL, page=0, character=CHARACTER_ANY,
@@ -333,8 +353,12 @@ def shelf_page(category=CATEGORY_ALL, page=0, character=CHARACTER_ANY,
     这样「服务端说第几页」和「客户端显示第几页」永远一致。
 
     `order` 是请求里那个标志位（`SORT_BASIC` / `SORT_RELEASE`）。
-    `probe` 给 `SHELF_PROBE` 那样的三元组时，把 `ShopStock` 里三个未查明的
-    字段填成探针值（默认 `None` = 全填 0 / 空串）。
+    `probe` 给 `SHELF_PROBE` 时，把 `ShopStock` 里**仅剩那一格**未查明的字段
+    （`+0x1c`）填成探针值（默认 `None` = 填 0）。
+
+    ★ **划线原价一律等于售价** —— 我们不做打折，填别的会让提示框画出
+    「原价 → 现价」两个数（§31）。**说明**取 `shop.json` 里的中文名那一套
+    （`shopcfg.item_desc_zh`），翻不出来就发空串（提示框那块留白）。
     """
     entries, warnings = shelf_entries(category, character, data_dir, order)
     pages = page_count(len(entries))
@@ -344,34 +368,74 @@ def shelf_page(category=CATEGORY_ALL, page=0, character=CHARACTER_ANY,
         page = 0
     page = max(0, min(page, pages - 1))
     shown = entries[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
-    unknown1, note, unknown2 = probe or (0, "", 0)
     groups = []
     for entry in shown:
         stock = build_shop_stock(entry["id"], entry.get("name") or "",
                                  entry.get("price", 0),
-                                 unknown1=unknown1, note=note,
-                                 unknown2=unknown2)
+                                 note=shopcfg.item_desc_zh(
+                                     shopdata.get(entry["id"])),
+                                 unknown2=0 if probe is None else int(probe))
         groups.append(build_shop_stock_group([("", stock)]))
     return build_rep_shop_item_list(pages, page, groups), shown, warnings
 
 
 # ---------------------------------------------------------------------------
+# `Equipment` 头上那 12 字节 = **每个角色的槽位掩码**（§31）
+# ---------------------------------------------------------------------------
+#: 三个角色（泰尔 / 卡希尔 / 布洛克）各一个 `PartFlag` 掩码。
+EQUIPPED_SLOT_MASK_COUNT = 3
+
+
+def equipment_slot_masks(item_ids):
+    """一串穿着中的 itemId → 客户端要的三个槽位掩码。
+
+    照客户端自己的 `Equipment::Equip`（`0x5583d3`）算：
+
+    * 角色限定是 `0/1/2` 的，只点亮**那个角色**的掩码；
+    * 角色限定是 `-1`（不限）的，**三个掩码全点亮**。
+
+    ⚠⚠ **不能全发 0**（§23 原来那句「处理器不读它」是错的）：
+    房间里的「卸下」按钮拿 `0x5584ab` 判「这件穿着没有」，判据正是
+    `(掩码[角色] & PartFlag) == PartFlag`。掩码是 0 ⇒ 它认为你没穿 ⇒
+    弹「已卸下。」然后**什么都不做**（2026-09-05 实机现象）。
+    """
+    masks = [0] * EQUIPPED_SLOT_MASK_COUNT
+    for raw in item_ids or ():
+        item = shopdata.get(raw)
+        if item is None or not item.part_flag:
+            continue
+        character = item.character
+        if character is None:
+            for index in range(EQUIPPED_SLOT_MASK_COUNT):
+                masks[index] |= item.part_flag
+        elif 0 <= int(character) < EQUIPPED_SLOT_MASK_COUNT:
+            masks[int(character)] |= item.part_flag
+    return tuple(masks)
+
+
+# ---------------------------------------------------------------------------
 # `0x0604` gspRepEquippedList（服务端 → 客户端）
 # ---------------------------------------------------------------------------
-#: `Equipment` 前面那 12 个字节（3 个槽位掩码）。**处理器 `0x447278` 不读它**
-#: （`0x404c3f` 原样读 12 字节存进 `Equipment+0x0c` 就再没人碰过）⇒ 填 0。
+#: `Equipment` 前面那 12 个字节 = **3 个槽位掩码**（每个角色一个，§31）。
+#: ⚠ §23 原来写「处理器不读它 ⇒ 填 0 就行」，**那是错的** ——
+#: `0x5584ab`「这件穿着没有」就是拿它判的。用 `equipment_slot_masks()` 算。
 EQUIPPED_SLOT_MASK_BYTES = 12
 
 
-def build_rep_equipped_list(item_ids=(), slot_masks=(0, 0, 0)):
+def build_rep_equipped_list(item_ids=(), slot_masks=None):
     """opcode `0x0604` 的包体 —— 和 `0x030b` **只差一个座位号**。
 
         12 字节 掩码×3 + i32 物品数 + 物品数 × i32 物品 id
+
+    `slot_masks` 不给就按 `item_ids` 算（`equipment_slot_masks`）——
+    **这是默认行为**，全 0 会让客户端认为「什么都没穿」（§31）。
 
     ⚠ 客户端对**查不到的 id** 会收集起来弹提示框（`0x447406`）⇒ 调用方要先
     过一遍 `shopdata.ownable()`。这里不替它过滤：本函数是纯组包，
     「发什么」的判断留在调用点（和 `build_slot_equipped_list` 一个口径）。
     """
+    if slot_masks is None:
+        slot_masks = equipment_slot_masks(item_ids)
     masks = tuple(slot_masks)
     if len(masks) * 4 != EQUIPPED_SLOT_MASK_BYTES:
         raise ValueError("装备清单需要正好 3 个槽位掩码，收到 %d 个" % len(masks))
@@ -406,29 +470,70 @@ def parse_item_buy_request(payload):
     return list(struct.unpack_from("<%di" % count, payload, 4)) if count else []
 
 
-def build_rep_item_buy(ok, unknown1=0, unknown2=0):
-    """opcode `0x0502` 的包体 —— `int32 bool + i32 + i32`（Des `0x54c891`）。
+#: `0x0502` 第二格 = **失败原因码**（✅实测：填 0 时界面写「未定义的错误」）。
+#: 客户端 `0x4586e1` 的 `switch ([ebp+0xc])`（`0x45915f`）逐个对出来的：
+#:
+#: | 码 | 界面文案（中文版）|
+#: |---|---|
+#: | 1 | 还缺少 %d 金币 —— **%d 是客户端自己算的**（`0x457dae`），不在包里 |
+#: | 2 | 还差 %d 游戏币 |
+#: | 3 | 等级太低 |
+#: | 4 | 等级太高 |
+#: | 5 | 购物车已满 |
+#: | 6 | 内部错误 |
+#: | 7 | 已拥有的道具 |
+#: | 其余（含 **0**）| 未定义的错误 |
+BUY_REASON_NO_PIXEL = 1        # 金币不够
+BUY_REASON_NO_CASH = 2         # 游戏币不够（本版不卖 캐시 商品）
+BUY_REASON_LEVEL_LOW = 3
+BUY_REASON_LEVEL_HIGH = 4
+BUY_REASON_FULL = 5
+BUY_REASON_INTERNAL = 6
+BUY_REASON_ALREADY_OWNED = 7
+
+
+def build_rep_item_buy(ok, reason=0, unknown2=0):
+    """opcode `0x0502` 的包体 —— `int32 bool + i32 原因码 + i32 ❓`（Des `0x54c891`）。
 
     ★ 第一格在线上是 **4 字节**（`0x5d59de` = int32 → bool），内存里才是 1 字节。
-    ⚠ 失败（`ok = 0`）时客户端**什么都不显示** —— 处理器 `0x44643d` 只是把
-    刚建好的「购买结果」弹窗析构掉。⇒ 失败原因只能进服务端日志，
-    玩家那边看到的是「点了没反应」。别指望客户端替我们解释。
 
-    后两格语义 ❓未查明（`+8` 会被购买结果弹窗 `0x4586e1` 用到）。
-    填 0；要找它们就用 `shelf-probe` 那套探针法（D19）。
+    ⚠⚠ **`reason` 不是「未查明字段」** —— 2026-09-05 实机落锤：失败时客户端
+    **会弹「购买失败」框**，正文就是拿这一格查表（`0x45915f` 的 switch）。
+    填 0 = 玩家看到「未定义的错误」，等于我们知道原因却不说。
+    ⇒ 每条拒绝都要挑一个 `BUY_REASON_*`。
+
+    第三格语义仍然 ❓未查明，填 0；要找它就用 `shelf-probe` 那套探针法（D19）。
     """
-    return w_i32(1 if ok else 0) + w_i32(unknown1) + w_i32(unknown2)
+    return w_i32(1 if ok else 0) + w_i32(reason) + w_i32(unknown2)
 
 
-#: 买不成的原因码。★ 只进日志 —— 客户端在失败路径上不显示任何东西（见上）。
+#: 买不成的原因（服务端自己的说法，进日志）→ 客户端的原因码。
+#: ★ 两套分开：日志要看得出「是哪一条规则拦的」，界面只有 7 种说法。
 BUY_NOT_LISTED = "not_listed"
 BUY_UNKNOWN_ITEM = "unknown_item"
 BUY_LEVEL = "level_too_low"
-BUY_CHARACTER = "wrong_character"
 BUY_ALREADY_OWNED = "already_owned"
+BUY_NO_MONEY = "not_enough_money"
+
+BUY_REASON_CODE = {
+    BUY_NOT_LISTED: BUY_REASON_INTERNAL,
+    BUY_UNKNOWN_ITEM: BUY_REASON_INTERNAL,
+    BUY_LEVEL: BUY_REASON_LEVEL_LOW,
+    BUY_ALREADY_OWNED: BUY_REASON_ALREADY_OWNED,
+    BUY_NO_MONEY: BUY_REASON_NO_PIXEL,
+}
 
 
-def check_purchase(item_id, table, level, character, owned):
+def buy_reason_code(reason):
+    """服务端的拒绝理由 → 客户端认得的原因码；认不出来一律「内部错误」。
+
+    ★ 兜底**不是 0** —— 0 在界面上是「未定义的错误」，那句话对玩家毫无信息，
+    对我们也一样（分不清是新加了一条拒绝理由还是真的出了内部错误）。
+    """
+    return BUY_REASON_CODE.get(reason, BUY_REASON_INTERNAL)
+
+
+def check_purchase(item_id, table, level, owned):
     """一件商品能不能买。返回 `(条目, 原因)`；能买时原因是 `None`。
 
     ★ **价格和上架与否只信 `shop.json`**（`table`），包里的任何数值都不作数
@@ -436,6 +541,10 @@ def check_purchase(item_id, table, level, character, owned):
 
     ★ 「已拥有就不能再买」是原版规则（失败文案 `이미 소지하고 있습니다`，§7）。
     材料类不受这条约束，但材料本来也不上架。
+
+    ⚠ **不按「玩家当前是哪个角色」拦** —— 商店上方那排角色箭头就是给
+    「给别的角色买装备」用的（货架本来就按预览角色过滤，`shelf_entries`）。
+    2026-09-05 实机：拿泰尔买布洛克的火箭筒被拦下，那是我们多加的规矩。
     """
     entry = table.get(int(item_id))
     if entry is None or not entry.get("listed"):
@@ -444,8 +553,6 @@ def check_purchase(item_id, table, level, character, owned):
         return None, BUY_UNKNOWN_ITEM
     if level is not None and level < entry.get("level", 1):
         return entry, BUY_LEVEL
-    if character is not None and not shopdata.usable_by(item_id, character):
-        return entry, BUY_CHARACTER
     if int(item_id) in owned and shopdata.get(item_id).part_flag != 0:
         return entry, BUY_ALREADY_OWNED
     return entry, None
@@ -474,3 +581,242 @@ def build_rep_gift_list(gifts=()):
     if gifts:
         raise ValueError("Gift 的线格式还没逆出来，本版只支持空礼物清单")
     return w_i32(0)
+
+
+# ---------------------------------------------------------------------------
+# `0x0601` 上行「这些 id 我不认识」/ `0x0501` 下行物品定义（§28）
+#
+# ★★ 客户端的 `ItemInfo` 表 `[0x72e1dc]` **开机是空的，只有服务端能填**。
+#    本地 `ShopItem-Chn.ini` 填的是另一张表（图标 + PartFlag，`[0x72e1e0]`）。
+#    ⇒ 不发这一发，「穿装备 / 买东西 / 仓库列表 / 左侧人物模型」全废，
+#      客户端弹的是「无法从服务器读取道具信息」。
+# ---------------------------------------------------------------------------
+#: `ItemInfo+0x10` 的形态标志位（`0x443444` 按位挑提示文案，§28）。
+ITEM_FLAG_COUNTED = 0x01      # 计数持有 ->「소지개수 : %d개」，数字取条目 +0x08
+ITEM_FLAG_TIMED = 0x02        # 期限持有 ->「%d일」，天数取条目 +0x0c
+ITEM_FLAG_EQUIPPABLE = 0x08   # ★ 可装备 —— `0x0604` 的处理器只认这一位
+ITEM_FLAG_PERCENT = 0x10      # 和 TIMED 一起 =「100%」
+ITEM_FLAG_MARK = 0x20         # ❓ 仓库格子上多画一个标记
+ITEM_FLAG_GAMES = 0x40        # 按局数 ->「%d게임」
+
+#: 角色限定的「不限」。★ **不能用 0** —— `0` 是「泰尔专用」（`0x44e1b8`
+#: 拿 `0xffff` 判不限，其余值当角色下标）。
+CHARACTER_UNLIMITED = -1
+
+#: 修理次数上限的「不限」。`< 0` 时客户端跳过「修够次数了」那条分支
+#: （`0x412934: test eax,eax / jl`）。本版不做修理，一律发它。
+REPAIR_UNLIMITED = -1
+
+#: 请求里那个用途标志的取值（§28）。**必须原样回**，`ShopStage` 只在
+#: 标志 == `ITEM_INFO_FOR_EQUIPPED` 时重建左侧人物模型（`0x44602a`）。
+ITEM_INFO_FOR_SHELF = 0       # 货架 0x0500 里有不认识的 id
+ITEM_INFO_FOR_INVENTORY = 1   # 持有物 0x0601 里有不认识的 id
+ITEM_INFO_FOR_EQUIPPED = 2    # ★ 装备清单 0x0604 里有不认识的 id
+ITEM_INFO_FOR_RESULT = 5      # 结算界面
+
+
+def parse_item_info_request(payload):
+    """`0x0601`（**客户端方向**）的载荷 → `([itemId, …], 用途标志)`。
+
+    线格式 `i32 n + n×i32 + u8`（Ser `0x559318` + `0x5540cd` 那个尾字节）。
+
+    ⚠⚠ 和服务端方向的 `0x0601`（持有物清单，`build_rep_inventory`）**同号反向**。
+    """
+    if len(payload) < 5:
+        raise ValueError("物品定义请求至少要 i32 计数 + 1 字节标志，收到 %d 字节"
+                         % len(payload))
+    count = struct.unpack_from("<i", payload, 0)[0]
+    if count < 0 or len(payload) != 5 + count * 4:
+        raise ValueError("物品定义请求说有 %d 个 id，载荷却是 %d 字节"
+                         % (count, len(payload)))
+    ids = list(struct.unpack_from("<%di" % count, payload, 4)) if count else []
+    return ids, payload[-1]
+
+
+def build_item_info(item_id, name="", part_flag=0, flags=0, level=0,
+                    character=CHARACTER_UNLIMITED, durability=0,
+                    repairs=REPAIR_UNLIMITED, desc=""):
+    """一条 `ItemInfo`（Des `0x5586a6`）。字段表和出处见 FINDINGS §28。
+
+    ★ 四个 ❓字段（结构偏移 `+0x08` / `+0x20` / `+0x28` / `+0x2c`）
+    全镜像找不到消费点，和 `ShopStock` 剩下那格同款 —— 填 0。
+    ★ `desc`（`+0x18`）是**仓库提示框下半那三行**（`0x4554e7` 按 `|` 切成
+    最多 3 段，§31）。原版的说明文字随服务端 DB 一起没了。
+    """
+    return (w_i32(item_id)          # +0x04 itemId（map 的 key）
+            + w_i32(0)              # +0x08 ❓
+            + w_i32(part_flag)      # +0x0c PartFlag 部位掩码
+            + w_i32(flags)          # +0x10 形态标志
+            + w_wstr(name)          # +0x14 物品名
+            + w_wstr(desc)          # +0x18 ★ 物品说明（| 分段，最多 3 段）
+            + w_i32(level)          # +0x1c ★ 等级要求（> 玩家等级就穿不上）
+            + w_i32(0)              # +0x20 ❓
+            + w_i16(character)      # +0x24 ★ 角色限定，-1 = 不限
+            + w_i32(0)              # +0x28 ❓
+            + w_i32(0)              # +0x2c ❓
+            + w_i32(durability)     # +0x30 最大耐久
+            + w_i32(repairs))       # +0x34 修理次数上限，< 0 = 不限
+
+
+def build_rep_item_info(records, purpose=ITEM_INFO_FOR_SHELF):
+    """opcode `0x0501` 的包体 —— `i32 n + n×ItemInfo + u8 用途标志`。
+
+    ⚠⚠ `purpose` **必须是请求里那个字节的原值**：`ShopStage::vft[0xb4]`
+    （`0x44602a`）第一句就是 `cmp byte, 2`，只有 `2` 才重建左侧人物模型。
+    主动下发（没人问就发）时用 `ITEM_INFO_FOR_SHELF`（0）—— 它在客户端
+    那边是「只入表，不动界面」。
+    """
+    body = w_i32(len(records))
+    for record in records:
+        body += record
+    return body + w_byte(purpose)
+
+
+def item_info_of(item_id, name=None, level=0, desc=""):
+    """按 `shopdata` 的物品表派生一条 `ItemInfo`；表里没有返回 `None`。
+
+    * `name` 不给就退回韩文名（`shopcfg.item_name_zh` 由调用方决定要不要用）；
+    * **形态标志**：占槽位的发 `ITEM_FLAG_EQUIPPABLE`，其余（材料 / 消耗品）
+      发 `ITEM_FLAG_COUNTED`。本版不卖期限物，一件都不发 `ITEM_FLAG_TIMED`；
+    * **角色限定**：`shopdata` 的 `None` 要翻成 `-1`，**不能是 0**（§28）；
+    * `desc` 是提示框下半那块（`+0x18`，`|` 分段最多 3 段，§31）。
+    """
+    item = shopdata.get(item_id)
+    if item is None:
+        return None
+    if item.part_flag:
+        flags = ITEM_FLAG_EQUIPPABLE
+    else:
+        flags = ITEM_FLAG_COUNTED
+    character = item.character
+    if character is None:
+        character = CHARACTER_UNLIMITED
+    return build_item_info(item.id,
+                           name=name if name is not None else (item.name_kr or ""),
+                           part_flag=item.part_flag,
+                           flags=flags,
+                           level=level,
+                           character=int(character),
+                           desc=desc)
+
+
+def item_info_records(item_ids, data_dir=None):
+    """一串 id → `(ItemInfo 字节表, 认不出来被跳掉的 id)`。
+
+    名字和等级门槛优先取 `shop.json`（管理页能改的那份），没有条目就退回
+    `shopcfg.item_name_zh()` 翻的中文名 + 等级 0。
+
+    ⚠ **等级发的是 `shop.json` 里那个购买门槛** —— 客户端拿它挡「穿上」
+    （`0x445817`），发大了会让玩家「买到了却穿不上」。
+    """
+    table, warnings = shopcfg.shop(data_dir)
+    records = []
+    skipped = []
+    for raw in item_ids:
+        try:
+            item_id = int(raw)
+        except (TypeError, ValueError):
+            skipped.append(raw)
+            continue
+        entry = table.get(item_id)
+        item = shopdata.get(item_id)
+        if item is None:
+            skipped.append(item_id)
+            continue
+        if entry is not None:
+            name = entry.get("name") or shopcfg.item_name_zh(item)
+            level = int(entry.get("level", 0) or 0)
+        else:
+            name = shopcfg.item_name_zh(item)
+            level = 0
+        record = item_info_of(item_id, name=name, level=level,
+                              desc=shopcfg.item_desc_zh(item))
+        if record is None:
+            skipped.append(item_id)
+            continue
+        records.append(record)
+    return records, skipped, warnings
+
+
+# ---------------------------------------------------------------------------
+# `0x0700` 上行「给我持有物清单」/ `0x0601` 下行持有物清单（§29）
+# ---------------------------------------------------------------------------
+#: 「永久持有」在线上就是 `0.0` 分钟。★ 处理器 `0x554273` 拿它和 `0.0` 比，
+#: 不等于才把它换算成「到期时刻」。⇒ 永久物一定要发 0.0，发个大数会变成
+#: 「还剩 N 天」，界面上就多出一行期限。
+PERMANENT_MINUTES = 0.0
+
+
+def build_inventory_entry(item_id, count=1, minutes=PERMANENT_MINUTES,
+                          repairs=0):
+    """一条持有物（Des `0x412621`，内存步长 `0x20`）。
+
+    | 线上 | 结构偏移 | 含义 |
+    |---|---|---|
+    | i32 | `+0x04` | 物品 id |
+    | i32 | `+0x08` | 数量 / 剩余局数 |
+    | f64 | `+0x10` | **剩余分钟数**，`0` = 永久 |
+    | i32 | `+0x18` | 已修理次数 |
+    """
+    return (w_i32(item_id) + w_i32(count) + w_f64(minutes) + w_i32(repairs))
+
+
+def build_rep_inventory(entries):
+    """opcode `0x0601`（**服务端方向**）的包体 —— `i32 n + n×持有物条目`。
+
+    ⚠⚠ 和客户端方向的 `0x0601`（物品定义请求）**同号反向**。
+    ★ 客户端收到它就**整份换掉**全局背包并重建仓库面板（`0x4126cb` →
+    `ShopStage::vft[0xb8] = 0x446f8a`）⇒ 每次都要发全量，不能发增量。
+    """
+    body = w_i32(len(entries))
+    return body + b"".join(entries)
+
+
+def inventory_records(inventory, materials=None):
+    """存档的 `inventory` + `materials` → `(条目字节表, 认不出来的 id)`。
+
+    `inventory` 是 `{itemId: {"count", "expires"}}`（`account_store`
+    的形状），`materials` 是 `{itemId: 数量}`。
+
+    ★ 两份合成**一张**清单：原版的仓库面板有「재료 材料」标签（分类
+    `0x50001`，§22），材料就是从这张清单里按 `PartFlag == 0` 分出去的。
+    ⚠ 客户端认不出来的 id 一律不发（`shopdata.ownable()`）—— 它会收集起来
+    弹「无法从服务器读取道具信息」。
+    """
+    entries = []
+    skipped = []
+    merged = {}
+    for source in (inventory or {}, materials or {}):
+        for raw, value in source.items():
+            try:
+                item_id = int(raw)
+            except (TypeError, ValueError):
+                skipped.append(raw)
+                continue
+            if isinstance(value, dict):
+                count = int(value.get("count", 1) or 0)
+            else:
+                count = int(value or 0)
+            if count <= 0:
+                continue
+            merged[item_id] = merged.get(item_id, 0) + count
+    for item_id in sorted(merged):
+        if not shopdata.ownable(item_id):
+            skipped.append(item_id)
+            continue
+        entries.append(build_inventory_entry(item_id, merged[item_id]))
+    return entries, skipped
+
+
+def inventory_item_ids(inventory, materials=None):
+    """`inventory_records` 会真的发出去的那些 id（定义要先于清单下发）。"""
+    ids = set()
+    for source in (inventory or {}, materials or {}):
+        for raw in source:
+            try:
+                item_id = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if shopdata.ownable(item_id):
+                ids.add(item_id)
+    return sorted(ids)

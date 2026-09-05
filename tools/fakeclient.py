@@ -124,6 +124,29 @@ from gameserver import (                                 # noqa: E402
     describe_peer_header, parse_session_slot, take_frame, w_i32, w_wstr,
 )
 
+import versioning                                        # noqa: E402
+
+
+def handshake_version():
+    """握手第一发那个裸 int32。
+
+    ★ **不能再发原版的 311 了** —— V0.2 给服务端加了版本门禁
+    （`server-ClientFilter.config` / `resolve_min_client_version`），
+    311 = 「旧版客户端」，会被 0xFE 控制帧顶回来（「客户端版本过旧」），
+    连 `0x0100` 都不会被处理。⇒ 照 `hook/bshook.c` 的做法读包根 `BUILD.ver`。
+
+    读不出来就退回 `CLIENT_VERSION`，让门禁的报错自己说话 ——
+    在这儿伪造一个大版本号只会把「门禁配错了」这种问题藏起来。
+    """
+    version, _warnings = versioning.load_own_version(ROOT)
+    if version is None:
+        return CLIENT_VERSION
+    try:
+        return versioning.encode_wire(version)
+    except ValueError:
+        return CLIENT_VERSION
+
+
 #: 玩家角色的对象句柄 = **座位 × 100000 + 100001**（客户端 `0x405f02`
 #: 写死的公式，§161）。`0x0408` 死亡上报里的那个句柄就是它，六台机器上
 #: 算出来的值一模一样 —— 假客户端也照这个公式算，服务端才认得出是谁死了。
@@ -339,7 +362,7 @@ class FakeClient:
         self.reader = threading.Thread(target=self._recv_loop, daemon=True)
         self.reader.start()
         # 客户端连上来的第一件事是报版本号（明文 int32，服务端回一个 0xFE 控制帧）
-        self.send_raw(w_i32(CLIENT_VERSION))
+        self.send_raw(w_i32(handshake_version()))
         self.send_game(0x0100, w_wstr(ticket))         # gcpReqLogin
 
     # -- 发

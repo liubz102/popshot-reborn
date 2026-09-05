@@ -56,6 +56,15 @@ class _Wire(object):
     def i32(self):
         return struct.unpack("<i", self.take(4))[0]
 
+    def i16(self):
+        return struct.unpack("<h", self.take(2))[0]
+
+    def u8(self):
+        return struct.unpack("<B", self.take(1))[0]
+
+    def f64(self):
+        return struct.unpack("<d", self.take(8))[0]
+
     def u16(self):
         return struct.unpack("<H", self.take(2))[0]
 
@@ -96,13 +105,61 @@ def parse_shop_item_list(body):
 
 
 def parse_rep_equipped_list(body):
-    """`0x0604` 的包体 → `[物品 id]`（掩码那 12 字节顺手断言是 0）。"""
+    """`0x0604` 的包体 → `[物品 id]`。掩码用 `parse_equipped_masks` 单独看。"""
+    return parse_equipped_masks(body)[1]
+
+
+def parse_equipped_masks(body):
+    """`0x0604` 的包体 → `([三个槽位掩码], [物品 id])`。
+
+    ★ 那 12 字节**不是死字段**（§31）：客户端拿 `(掩码[角色] & PartFlag)`
+    判「这件穿着没有」。全 0 = 「什么都没穿」。
+    """
     wire = _Wire(body)
     masks = [wire.i32() for _ in range(3)]
-    assert masks == [0, 0, 0], masks
     items = [wire.i32() for _ in range(wire.i32())]
     wire.done()
-    return items
+    return masks, items
+
+
+def parse_rep_item_info(body):
+    """`0x0501` 的包体 → `([物品定义 dict], 用途标志)`。
+
+    照 `ItemInfo::Deserialize 0x5586a6` 逐格写的（§28）：
+    四个 i32、两个 wstr、两个 i32、一个 **i16**、四个 i32。
+    """
+    wire = _Wire(body)
+    records = []
+    for _ in range(wire.i32()):
+        record = {"id": wire.i32()}
+        wire.i32()                              # +0x08 ❓
+        record["part_flag"] = wire.i32()
+        record["flags"] = wire.i32()
+        record["name"] = wire.wstr()
+        wire.wstr()                             # +0x18 ❓
+        record["level"] = wire.i32()
+        wire.i32()                              # +0x20 ❓
+        record["character"] = wire.i16()
+        wire.i32()                              # +0x28 ❓
+        wire.i32()                              # +0x2c ❓
+        record["durability"] = wire.i32()
+        record["repairs"] = wire.i32()
+        records.append(record)
+    purpose = wire.u8()
+    wire.done()
+    return records, purpose
+
+
+def parse_rep_inventory(body):
+    """`0x0601`（服务端方向）的包体 → `[(id, 数量, 剩余分钟, 修理次数)]`。
+
+    照持有物条目的 `Deserialize 0x412621` 写的（§29）。
+    """
+    wire = _Wire(body)
+    entries = [(wire.i32(), wire.i32(), wire.f64(), wire.i32())
+               for _ in range(wire.i32())]
+    wire.done()
+    return entries
 
 
 @contextlib.contextmanager
@@ -345,18 +402,42 @@ class ShelfTests(_ShopCase):
         self.assertEqual((1, 0), (pages, page))
         self.assertEqual([1120041], [e["id"] for e in shown])
 
-    def test_探针不开的时候三个未查明字段全是空的(self):
+    def test_探针不开的时候那格未查明字段是零(self):
         # 默认必须是「什么都不填」—— 探针是**找字段**用的临时手段，
         # 平时挂着会往界面上糊一堆假数据。
         with shop_config(self.listed(1120041)):
             body, _, _ = shop.shelf_page()
-        self.assertNotIn("※探针※".encode("utf-16le"), body)
+        self.assertNotIn(struct.pack("<i", shop.SHELF_PROBE), body)
         with shop_config(self.listed(1120041)):
             probed, _, _ = shop.shelf_page(probe=shop.SHELF_PROBE)
-        self.assertIn("※探针※".encode("utf-16le"), probed)
-        # 探针只动那三格，商品本身照旧 ⇒ 开着它也能正常买东西。
+        self.assertIn(struct.pack("<i", shop.SHELF_PROBE), probed)
+        # 探针只动那一格，商品本身照旧 ⇒ 开着它也能正常买东西。
         self.assertEqual(parse_shop_item_list(body)[2],
                          parse_shop_item_list(probed)[2])
+
+    def test_划线原价默认等于售价(self):
+        """★ 2026-09-05 实机：提示框写成「0 → 3000」。
+
+        `ShopStock+0x10` 是**划线原价**，客户端拿它和售价比，不相等就画成
+        「原价 → 现价」（`0x45c354`）。不做打折就得如实等于售价（§31）。
+        """
+        with shop_config([{"id": 1120041, "name": "左轮", "listed": True,
+                           "price": 3000}]):
+            body, _, _ = shop.shelf_page()
+        wire = _Wire(body)
+        wire.i32(), wire.i32(), wire.i32(), wire.i32()   # 页数/当前页/n/档位数
+        wire.wstr()                                      # 档位名
+        wire.i32(), wire.wstr()                          # itemId, 名字
+        self.assertEqual(3000, wire.i32())               # +0x0c 售价
+        self.assertEqual(3000, wire.i32())               # +0x10 划线原价
+
+    def test_货架条目带说明(self):
+        # 提示框下半那块（`ShopStock+0x18`，§31）。原版的说明随服务端 DB
+        # 没了，这里发的是**从本地数据现算**的（伤害 / 加成）。
+        with shop_config([{"id": 1120041, "name": "左轮", "listed": True,
+                           "price": 3000}]):
+            body, _, _ = shop.shelf_page()
+        self.assertIn("伤害 4".encode("utf-16le"), body)
 
     def test_价格和名字来自_shop_json(self):
         # ★ PLAN M5：价格只信 `shop.json`，包里的任何数值都不作数。
@@ -462,13 +543,51 @@ class PacketTests(_ShopCase):
         theirs = gameserver.build_slot_equipped_list(0, items)
         self.assertEqual(theirs[4:], mine)
 
-    def test_装备清单的掩码是十二个零字节(self):
-        # 处理器 `0x447278` 压根不读这 12 字节（`0x404c3f` 读进
-        # `Equipment+0x0c` 就再没人碰过）⇒ 填 0，别自作主张塞东西。
+    def test_没穿东西时掩码才是十二个零字节(self):
         body = shop.build_rep_equipped_list([])
         self.assertEqual(b"\x00" * 12, body[:12])
         self.assertEqual(shop.EQUIPPED_SLOT_MASK_BYTES, 12)
         self.assertEqual([], parse_rep_equipped_list(body))
+
+    def test_掩码按角色分开点亮(self):
+        """★★ §31：这 12 字节**不是死字段**（§23 那句话是错的）。
+
+        房间里的「卸下」按钮拿 `(掩码[角色] & PartFlag) == PartFlag` 判
+        「这件穿着没有」（`0x5584ab`）。全 0 ⇒ 它认为你没穿 ⇒ 弹「已卸下。」
+        然后什么都不做（2026-09-05 实机现象）。
+        """
+        # 1120041 是泰尔（角色 0）的武器槽 1；2120041 是卡希尔（角色 1）的。
+        masks, items = parse_equipped_masks(
+            shop.build_rep_equipped_list([1120041, 2120041]))
+        self.assertEqual([1024, 1024, 0], masks)
+        self.assertEqual([1120041, 2120041], items)
+
+    def test_不限角色的装备三个掩码都点亮(self):
+        # 客户端自己就是这么做的（`0x5583f8` 那个三次循环）。
+        original = shopdata.get
+
+        def unlimited(item_id):
+            item = original(item_id)
+            if item is not None:
+                item.character = None      # 「不限角色」
+            return item
+
+        shopdata.get = unlimited
+        self.addCleanup(setattr, shopdata, "get", original)
+        self.assertEqual((1024, 1024, 1024),
+                         shop.equipment_slot_masks([1120041]))
+
+    def test_材料不进掩码(self):
+        # `part_flag == 0` 的东西不占槽位，掩码里不该有它。
+        self.assertEqual((0, 0, 0), shop.equipment_slot_masks([30018]))
+        self.assertEqual((0, 0, 0), shop.equipment_slot_masks([9999999]))
+
+    def test_0x030b_的掩码和_0x0604_一样(self):
+        # 两边都得算，不然「商店里穿上了、房间里说没穿」。
+        import gameserver
+        items = [1120041, 2120041]
+        self.assertEqual(shop.build_rep_equipped_list(items),
+                         gameserver.build_slot_equipped_list(0, items)[4:])
 
     def test_掩码个数不对就抛(self):
         with self.assertRaises(ValueError):
@@ -479,11 +598,152 @@ class PacketTests(_ShopCase):
         self.assertEqual([1120041],
                          shop.displayable_items([1120041, 1510001, 9999999]))
 
+    def test_购买失败的原因码认不出来也不能填零(self):
+        """★ `0x0502` 第二格是**失败原因码**（§30）：`0` 在界面上是
+        「未定义的错误」—— 那句话对玩家和对我们都是零信息。兜底要 6「内部错误」。"""
+        self.assertEqual(shop.BUY_REASON_LEVEL_LOW,
+                         shop.buy_reason_code(shop.BUY_LEVEL))
+        self.assertEqual(shop.BUY_REASON_ALREADY_OWNED,
+                         shop.buy_reason_code(shop.BUY_ALREADY_OWNED))
+        self.assertEqual(shop.BUY_REASON_NO_PIXEL,
+                         shop.buy_reason_code(shop.BUY_NO_MONEY))
+        for junk in (None, "", "以后新加的一条理由"):
+            self.assertEqual(shop.BUY_REASON_INTERNAL,
+                             shop.buy_reason_code(junk))
+
+    def test_购买结果的第二格就是原因码(self):
+        self.assertEqual(bytes.fromhex("00000000" "03000000" "00000000"),
+                         shop.build_rep_item_buy(False,
+                                                 shop.BUY_REASON_LEVEL_LOW))
+        self.assertEqual(bytes.fromhex("01000000" "00000000" "00000000"),
+                         shop.build_rep_item_buy(True))
+
+    def test_买别的角色的装备不拦(self):
+        """商店上方那排角色箭头就是给「替别的角色买」用的（§30）。"""
+        table = {2120041: {"id": 2120041, "name": "卡希尔的枪",
+                           "listed": True, "price": 100, "level": 1}}
+        entry, why = shop.check_purchase(2120041, table, level=10, owned=set())
+        self.assertIsNone(why)
+        self.assertIs(table[2120041], entry)
+
     def test_礼物清单只支持空的(self):
         self.assertEqual(b"\x00\x00\x00\x00", shop.build_rep_gift_list())
         with self.assertRaises(ValueError):
             # `Gift` 的线格式还没逆 —— 静默发个半成品比不发更难查。
             shop.build_rep_gift_list([{"id": 1}])
+
+
+class ItemInfoTests(_ShopCase):
+    """`0x0601` 上行「给我定义」/ `0x0501` 下行物品定义（§28）。
+
+    ★ 这一段守的是 2026-09-05 那四个实机 bug 的根因：**客户端的
+    `ItemInfo` 表开机是空的**，不发 `0x0501` 就「无法从服务器读取道具信息」。
+    """
+
+    def test_请求就是实机抓到的那串字节(self):
+        # `logs/server.out` 14:01:17.503 那一发（进商店后问 6 件穿着的）。
+        raw = bytes.fromhex("06000000" "75690f00" "9e900f00" "aab70f00"
+                            "a5de0f00" "b5051000" "0c171100" "02")
+        ids, purpose = shop.parse_item_info_request(raw)
+        self.assertEqual([1010037, 1020062, 1030058, 1040037, 1050037,
+                          1120012], ids)
+        # ★ 尾字节 = 用途标志，`2` = 装备清单要的 ⇒ 回去之后重建人物模型。
+        self.assertEqual(shop.ITEM_INFO_FOR_EQUIPPED, purpose)
+
+    def test_空请求也解得开(self):
+        self.assertEqual(([], 0), shop.parse_item_info_request(b"\0\0\0\0\0"))
+
+    def test_长度对不上就抛(self):
+        for junk in (b"", b"\x01\0\0\0", b"\x01\0\0\0\x01\0\0\0"):
+            with self.assertRaises(ValueError):
+                shop.parse_item_info_request(junk)
+
+    def test_用途标志原样回(self):
+        """⚠⚠ `ShopStage::vft[0xb4]`（`0x44602a`）只在标志 == 2 时重建
+        左侧人物模型。回错了 = 「买完 / 穿完人物不刷新」。"""
+        for purpose in (0, 1, 2, 5, 255):
+            body = shop.build_rep_item_info([], purpose)
+            self.assertEqual(([], purpose), parse_rep_item_info(body))
+
+    def test_装备的定义(self):
+        records, _, _ = shop.item_info_records([1120041])
+        record, purpose = parse_rep_item_info(
+            shop.build_rep_item_info(records, 2))
+        self.assertEqual(2, purpose)
+        self.assertEqual(1, len(record))
+        record = record[0]
+        self.assertEqual(1120041, record["id"])
+        self.assertEqual(1024, record["part_flag"])       # 武器槽 1
+        # ★ 可装备那一位是硬要求：`0x0604` 的处理器只有它为 1 才 `Equip`。
+        self.assertEqual(shop.ITEM_FLAG_EQUIPPABLE, record["flags"])
+        self.assertEqual(0, record["character"])          # 泰尔专用
+        self.assertEqual(shop.REPAIR_UNLIMITED, record["repairs"])
+
+    def test_材料发计数位不发期限位(self):
+        # 期限位会让提示框写「%d일」，天数取自持有物条目里那格 —— 我们
+        # 不卖期限物，发下去就是「剩 0 天」。
+        records, _, _ = shop.item_info_records([30018])
+        record = parse_rep_item_info(shop.build_rep_item_info(records))[0][0]
+        self.assertEqual(shop.ITEM_FLAG_COUNTED, record["flags"])
+        self.assertEqual(0, record["part_flag"])
+
+    def test_不限角色发的是负一不是零(self):
+        """⚠ `0` 是「泰尔专用」，不限只能是 `-1`（`0x44e1b8` 拿 `0xffff` 判）。"""
+        records, _, _ = shop.item_info_records([30018])   # 材料，不限角色
+        record = parse_rep_item_info(shop.build_rep_item_info(records))[0][0]
+        self.assertEqual(shop.CHARACTER_UNLIMITED, record["character"])
+
+    def test_名字和等级取自_shop_json(self):
+        with shop_config([{"id": 1120041, "name": "左轮 爆裂1",
+                           "listed": True, "price": 3000, "level": 5}]):
+            records, _, _ = shop.item_info_records([1120041])
+        record = parse_rep_item_info(shop.build_rep_item_info(records))[0][0]
+        self.assertEqual("左轮 爆裂1", record["name"])
+        # ★ 客户端拿它挡「穿上」（`0x445817`）—— 发大了玩家买到了却穿不上。
+        self.assertEqual(5, record["level"])
+
+    def test_表里没有的_id_跳过而不是抛(self):
+        records, skipped, _ = shop.item_info_records([1120041, 9999999, "abc"])
+        self.assertEqual(1, len(records))
+        self.assertEqual([9999999, "abc"], skipped)
+
+
+class InventoryTests(_ShopCase):
+    """`0x0700` 上行「给我持有物」/ `0x0601` 下行持有物清单（§29）。"""
+
+    def test_装备和材料合成一张清单(self):
+        entries, skipped = shop.inventory_records(
+            {"1120041": {"count": 1, "expires": None}}, {"30018": 3})
+        self.assertEqual([], skipped)
+        self.assertEqual([(30018, 3, 0.0, 0), (1120041, 1, 0.0, 0)],
+                         parse_rep_inventory(shop.build_rep_inventory(entries)))
+
+    def test_永久物的剩余分钟必须是零(self):
+        """★ 处理器 `0x554273` 拿它和 `0.0` 比，不等于才换算成到期时刻 ——
+        发个大数会让界面上多出一行「还剩 N 天」。"""
+        entries, _ = shop.inventory_records({"1120041": {"count": 1}})
+        self.assertEqual(shop.PERMANENT_MINUTES,
+                         parse_rep_inventory(
+                             shop.build_rep_inventory(entries))[0][2])
+
+    def test_只有货架的_id_不往仓库发(self):
+        entries, skipped = shop.inventory_records(
+            {"1120041": {"count": 1}, "1510001": {"count": 1}})
+        self.assertEqual([1510001], skipped)
+        self.assertEqual([1120041],
+                         [e[0] for e in parse_rep_inventory(
+                             shop.build_rep_inventory(entries))])
+        self.assertEqual([1120041], shop.inventory_item_ids(
+            {"1120041": {"count": 1}, "1510001": {"count": 1}}))
+
+    def test_数量为零的不发(self):
+        entries, _ = shop.inventory_records({"1120041": {"count": 0}},
+                                            {"30018": 0})
+        self.assertEqual([], entries)
+
+    def test_空仓库也是一个合法包体(self):
+        # 不发的话仓库面板等一个永远不来的应答。
+        self.assertEqual([], parse_rep_inventory(shop.build_rep_inventory([])))
 
 
 if __name__ == "__main__":
