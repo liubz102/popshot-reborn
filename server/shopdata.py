@@ -91,6 +91,7 @@ class _Store(object):
         self.path = path
         self._table = None
         self._cache = {}
+        self._order = None
 
     def table(self):
         if self._table is None:
@@ -131,6 +132,13 @@ class _Store(object):
 
     def count(self):
         return len(self.table().get("items", {}))
+
+    def catalog_order(self):
+        """`{id 字符串: 在原版 ini 里的行号}`。★ 只建一次，跟着表一起失效。"""
+        if self._order is None:
+            self._order = dict((key, index) for index, key
+                               in enumerate(self.table().get("items", {})))
+        return self._order
 
 
 STORE = _Store()
@@ -230,6 +238,29 @@ def promotions():
 
 def count():
     return STORE.count()
+
+
+#: `catalog_index()` 给表外 id 的名次。★ 比任何真实名次都大 ⇒ 它们排在最后，
+#: 而不是插到最前面（`-1` 就会那样）。
+CATALOG_LAST = 1 << 30
+
+
+def catalog_index(item_id):
+    """这件东西在**原版 `ShopItem-Chn.ini` 里的行号**（0 起）。
+
+    `tools/shopdata.py` 抽表时是**按 ini 的行序**往 `items` 里塞的，JSON 对象
+    又保序 ⇒ 这个名次就是原版目录顺序。商店右下角那个「上市顺序」按钮
+    （`0x0600` 的标志位 = 1，V0.3商店 §25）就是拿它排的 —— 我们手上**没有
+    真正的上市日期**（随 2009 年停服的服务端 DB 一起没了），目录顺序是
+    唯一一个不用自己编的近似。
+
+    表里没有的 id 返回 `CATALOG_LAST`（排最后）。
+    """
+    try:
+        key = str(int(item_id))
+    except (TypeError, ValueError):
+        return CATALOG_LAST
+    return STORE.catalog_order().get(key, CATALOG_LAST)
 
 
 def resolve_equipped(item_ids):

@@ -144,9 +144,10 @@ class ShopListRequest(object):
                 == (other.character, other.category, other.page, other.flag))
 
     def __repr__(self):
-        return ("<ShopListRequest 角色=%s 分类=%#x 页=%d 标志=%d>"
+        return ("<ShopListRequest 角色=%s 分类=%#x 页=%d 排序=%s>"
                 % ("不限" if self.character == CHARACTER_ANY else self.character,
-                   self.category & 0xFFFFFFFF, self.page, self.flag))
+                   self.category & 0xFFFFFFFF, self.page,
+                   sort_name(self.flag)))
 
 
 #: `0x0600` / `0x0605` 的载荷长度。★ **`u8 + i32 + u16 + i32`**，
@@ -233,8 +234,52 @@ def build_rep_shop_item_list(total_pages, page, groups):
 # ---------------------------------------------------------------------------
 # 货架内容：从 `shop.json` 里挑出「这一页该显示什么」
 # ---------------------------------------------------------------------------
-def shelf_entries(category=CATEGORY_ALL, character=CHARACTER_ANY, data_dir=None):
-    """该分类下**全部**上架商品，按 itemId 排序。返回 `(条目列表, 警告列表)`。
+#: 货架右下角那两个排序按钮（`0x0600` 载荷最后那个标志位，§25）。
+#: 客户端把它当 bool：面板 `+0x160`，点第一个按钮写 0、点第二个写 1
+#: （`0x45b5c4` / `0x45b5d5`），然后重发一发 `0x0600`。
+#: **排序是服务端的活** —— 一页只发 8 件，客户端没有全表可排。
+SORT_BASIC = 0        # 「基本顺序」= 进商店的默认状态（面板那个字节是 0）
+SORT_RELEASE = 1      # 「上市顺序」
+
+
+def sort_name(order):
+    """日志用的中文名。★ 认不出来的值照原样印 —— 别悄悄当成默认排序，
+    那样实机看日志时会以为「客户端只发过 0 和 1」。"""
+    try:
+        order = int(order)
+    except (TypeError, ValueError):
+        return repr(order)
+    if order == SORT_BASIC:
+        return "基本顺序"
+    if order == SORT_RELEASE:
+        return "上市顺序"
+    return "未知(%d)" % order
+
+
+def sort_entries(entries, order=SORT_BASIC):
+    """按玩家选的顺序排货架。
+
+    * `SORT_BASIC`「基本顺序」—— itemId 升序。id 是 `角色·部位·系列·档次`
+      编出来的（§6），升序排出来同系列相邻、由低到高，就是玩家看惯的那个样子。
+    * `SORT_RELEASE`「上市顺序」—— **原版目录顺序倒过来**（新的在前）。
+      出处和「为什么只能这么近似」写在 `shopdata.catalog_index()` 里。
+
+    ⚠ 名次相同的一律再按 id 兜底 —— 排序必须**全序**，否则同一批商品
+    两次请求可能给出不同的页，玩家翻页会看到重复或漏掉的格子。
+    """
+    try:
+        order = int(order)
+    except (TypeError, ValueError):
+        order = SORT_BASIC
+    if order == SORT_RELEASE:
+        return sorted(entries, key=lambda e: (-shopdata.catalog_index(e["id"]),
+                                              int(e["id"])))
+    return sorted(entries, key=lambda e: int(e["id"]))
+
+
+def shelf_entries(category=CATEGORY_ALL, character=CHARACTER_ANY, data_dir=None,
+                  order=SORT_BASIC):
+    """该分类下**全部**上架商品，按 `order` 指定的顺序排。返回 `(条目, 警告)`。
 
     三道过滤，缺一不可：
 
@@ -249,7 +294,7 @@ def shelf_entries(category=CATEGORY_ALL, character=CHARACTER_ANY, data_dir=None)
     """
     table, warnings = shopcfg.shop(data_dir)
     out = []
-    for item_id in sorted(table):
+    for item_id in table:
         entry = table[item_id]
         if not entry.get("listed"):
             continue
@@ -260,7 +305,7 @@ def shelf_entries(category=CATEGORY_ALL, character=CHARACTER_ANY, data_dir=None)
         if character != CHARACTER_ANY and not shopdata.usable_by(item_id, character):
             continue
         out.append(entry)
-    return out, warnings
+    return sort_entries(out, order), warnings
 
 
 def page_count(total):
@@ -281,16 +326,17 @@ SHELF_PROBE = (777, "※探针※", 888)
 
 
 def shelf_page(category=CATEGORY_ALL, page=0, character=CHARACTER_ANY,
-               data_dir=None, probe=None):
+               data_dir=None, probe=None, order=SORT_BASIC):
     """把一页货架组成 `0x0500` 的包体。返回 `(包体, 这一页的条目, 警告)`。
 
     页号越界就夹回 `[0, 总页数-1]` —— 和客户端 `0x45b2be` 的夹法一致，
     这样「服务端说第几页」和「客户端显示第几页」永远一致。
 
+    `order` 是请求里那个标志位（`SORT_BASIC` / `SORT_RELEASE`）。
     `probe` 给 `SHELF_PROBE` 那样的三元组时，把 `ShopStock` 里三个未查明的
     字段填成探针值（默认 `None` = 全填 0 / 空串）。
     """
-    entries, warnings = shelf_entries(category, character, data_dir)
+    entries, warnings = shelf_entries(category, character, data_dir, order)
     pages = page_count(len(entries))
     try:
         page = int(page)

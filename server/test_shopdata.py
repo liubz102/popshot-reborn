@@ -127,6 +127,24 @@ class SyntheticTests(_TableCase):
         for junk in (None, "", "abc", [], {}):
             self.assertIsNone(shopdata.get(junk))
 
+    def test_catalog_index_是原版_ini_的行序(self):
+        """★ 商店「上市顺序」按钮唯一的排序依据（V0.3商店 §25）。
+
+        判据是**表里的插入顺序**，不是 id 大小 —— 小表里 `1990001`
+        排在 `1120041` 前面，正好和 id 升序反着，能把两者区分开。
+        """
+        self.assertEqual(0, shopdata.catalog_index(1010001))
+        self.assertEqual(2, shopdata.catalog_index(1990001))
+        self.assertEqual(3, shopdata.catalog_index(1120041))
+        self.assertLess(shopdata.catalog_index(1990001),
+                        shopdata.catalog_index(1120041))
+
+    def test_表外的_id_排最后而不是排最前(self):
+        # 给 -1 之类的负数名次会让不认识的东西插到货架最前面。
+        self.assertEqual(shopdata.CATALOG_LAST, shopdata.catalog_index(999999))
+        self.assertEqual(shopdata.CATALOG_LAST, shopdata.catalog_index("abc"))
+        self.assertGreater(shopdata.CATALOG_LAST, shopdata.catalog_index(1010001))
+
     def test_string_id_works(self):
         # 存档里的 key 是字符串，包里解出来的是 int —— 两边都得认。
         self.assertIsNotNone(shopdata.get("1120041"))

@@ -9730,6 +9730,9 @@ class Conn:
         就是这么来的，别当成客户端在抽风。
 
         ★ 价格 / 上架与否**只信 `shop.json`**，包里的任何数值都不作数（PLAN M5）。
+
+        ★ 载荷最后那个标志位是**右下角的排序开关**（「基本顺序」/「上市顺序」，
+        §25）。排序只能在服务端做 —— 一页只发 8 件，客户端手里没有全表。
         """
         if self.shop_reply_off(OP_REP_SHOP_ITEM_LIST, "货架目录"):
             return
@@ -9740,7 +9743,8 @@ class Conn:
             return
         body, shown, warnings = shop.shelf_page(
             request.category, request.page, request.character,
-            probe=shop.SHELF_PROBE if SHELF_PROBE_ON else None)
+            probe=shop.SHELF_PROBE if SHELF_PROBE_ON else None,
+            order=request.flag)
         for warning in warnings:
             self.log(f"   ⚠ shop.json: {warning}")
         labels = [f"{entry['id']}×{entry['price']}" for entry in shown]
@@ -10164,13 +10168,14 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
                                   实机万一界面不对，关掉一发再进一次商店就能
                                   二分到是哪一发 —— 不用改代码、不用重启
   shelf-probe [on|off]            把货架包里三个**还没查明**的字段填成
-                                  777 / ※探针※ / 888（§21）。开着它进商店，
-                                  界面上哪儿冒出这几个值，那一格就是哪个字段。
-                                  ★ 客户端 10 秒重发一次货架请求，所以人在
-                                  商店里的时候开关它也来得及生效
-  shelf [分类] [页] [角色]        不进游戏也能看「货架这一页会发什么」。
-                                  分类写 0 = 全部、60001 = 武器槽1（十六进制，
-                                  见 FINDINGS §22）；角色 0/1/2，省略 = 不限
+                                  777 / ※探针※ / 888（§21）。★ 2026-09-05
+                                  实机跑过一轮：界面上一个都没冒出来，那三格
+                                  商店面板压根不读（§25）。留着是给别的面板用的
+  shelf [分类] [页] [角色] [排序] 不进游戏也能看「货架这一页会发什么」。
+                                  分类**省略**=全部、60001 = 武器槽1（十六进制，
+                                  见 FINDINGS §22）；★ 写 0 不是全部，是「人物→
+                                  英雄」标签。角色 0/1/2，省略 = 不限；
+                                  排序 0 = 基本顺序 / 1 = 上市顺序（§25）
   help                            这段
 """
 
@@ -10304,10 +10309,12 @@ def _dispatch_control_command(line):
         category = int(words[1], 16) if len(words) > 1 else shop.CATEGORY_ALL
         page = int(words[2], 0) if len(words) > 2 else 0
         character = int(words[3], 0) if len(words) > 3 else shop.CHARACTER_ANY
+        order = int(words[4], 0) if len(words) > 4 else shop.SORT_BASIC
         body, shown, warnings = shop.shelf_page(
             category, page, character,
-            probe=shop.SHELF_PROBE if SHELF_PROBE_ON else None)
-        lines = [f"ok 分类 {category:#x} 第 {page} 页；包体 {len(body)} 字节"]
+            probe=shop.SHELF_PROBE if SHELF_PROBE_ON else None, order=order)
+        lines = [f"ok 分类 {category:#x} 第 {page} 页 按{shop.sort_name(order)}；"
+                 f"包体 {len(body)} 字节"]
         lines += [f"  ⚠ {w}" for w in warnings]
         for entry in shown:
             lines.append("  %s  %d 金币"

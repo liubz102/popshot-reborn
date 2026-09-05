@@ -367,6 +367,68 @@ class ShelfTests(_ShopCase):
         self.assertEqual([[(1120041, "左轮 极速1", 3000)]], groups)
 
 
+class SortTests(_ShopCase):
+    """右下角那两个排序按钮（`0x0600` 的标志位，§25）。
+
+    ★ 排序只能在服务端做：一页只发 8 件，客户端手里没有全表可排。
+    """
+
+    def listed(self, *ids):
+        return [{"id": i, "name": "商品%d" % i, "listed": True, "price": 100}
+                for i in ids]
+
+    #: 小表的插入顺序（= `catalog_index`）：1010001 · 1020001 · 1990001 ·
+    #: 1120041 · 1120051 · 2120041 · 30018 · 1510001。
+    IDS = (1120041, 1010001, 2120041)
+
+    def test_默认是基本顺序_按_id_升序(self):
+        # 进商店时面板那个字节是 0（实测：11:55 那一串请求全是 标志=0）。
+        self.assertEqual(0, shop.SORT_BASIC)
+        with shop_config(self.listed(*self.IDS)):
+            entries, _ = shop.shelf_entries(order=shop.SORT_BASIC)
+        self.assertEqual([1010001, 1120041, 2120041], [e["id"] for e in entries])
+
+    def test_上市顺序_按原版目录倒序(self):
+        with shop_config(self.listed(*self.IDS)):
+            entries, _ = shop.shelf_entries(order=shop.SORT_RELEASE)
+        # 目录名次 0 / 3 / 5 ⇒ 新的在前。
+        self.assertEqual([2120041, 1120041, 1010001], [e["id"] for e in entries])
+
+    def test_两种顺序真的不一样(self):
+        """★ 这一条是给「点了没反应」兜底的 —— 只要两边排出来一样，
+        玩家点了按钮界面纹丝不动，和没实现是一个观感。"""
+        with shop_config(self.listed(*self.IDS)):
+            basic, _ = shop.shelf_entries(order=shop.SORT_BASIC)
+            release, _ = shop.shelf_entries(order=shop.SORT_RELEASE)
+        self.assertNotEqual([e["id"] for e in basic], [e["id"] for e in release])
+
+    def test_顺序一路传到包体(self):
+        with shop_config(self.listed(*self.IDS)):
+            body, shown, _ = shop.shelf_page(order=shop.SORT_RELEASE)
+        _, _, groups = parse_shop_item_list(body)
+        self.assertEqual([2120041, 1120041, 1010001],
+                         [options[0][0] for options in groups])
+        self.assertEqual([2120041, 1120041, 1010001], [e["id"] for e in shown])
+
+    def test_认不出来的标志位当基本顺序(self):
+        """客户端只发过 0 和 1；真冒出第三个值也不能让货架空掉或炸掉。"""
+        with shop_config(self.listed(*self.IDS)):
+            odd, _ = shop.shelf_entries(order=7)
+            basic, _ = shop.shelf_entries(order=shop.SORT_BASIC)
+        self.assertEqual([e["id"] for e in basic], [e["id"] for e in odd])
+        # 但日志要如实印出来，不能悄悄写成「基本顺序」。
+        self.assertIn("7", shop.sort_name(7))
+
+    def test_排序是全序_不然翻页会重复或漏格(self):
+        """目录名次相同（两件都不在物品表里）时还要按 id 兜底。"""
+        entries = [{"id": 999999002, "name": "甲", "listed": True, "price": 1},
+                   {"id": 999999001, "name": "乙", "listed": True, "price": 1}]
+        self.assertEqual(shopdata.catalog_index(999999001),
+                         shopdata.catalog_index(999999002))
+        ordered = shop.sort_entries(entries, shop.SORT_RELEASE)
+        self.assertEqual([999999001, 999999002], [e["id"] for e in ordered])
+
+
 class PacketTests(_ShopCase):
     """三发下行包的字节。★ 全是 🔍静态结论，没在线上验过。"""
 
