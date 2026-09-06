@@ -137,8 +137,19 @@ SAVE_FORMAT_VERSION = 1
 SCHEMA_VERSION = 2
 
 #: 管理页（`/admin`）的管理员账号表，和 `accounts` 在存档里平级。
-#: 值的形状是 `{"password": "明文"}` —— 和玩家账号一个口径（D3 / 铁律 9）。
+#: 值的形状是 `{"password": "明文", "role": "system"|"operator"}`
+#: —— 口令和玩家账号一个口径（D3 / 铁律 9）。
 ADMIN_ACCOUNTS_KEY = "admin_accounts"
+
+#: 管理员的两种权限（用户 2026-09-06 拍板，D34）。
+#:
+#: * `system` **系统管理员** —— 管理页所有标签页都能进；
+#: * `operator` **运营** —— 只能进 物品库 / 商店货架 / 合成配方 / 材料掉落
+#:   这四个配置页，看不到「玩家资料」和「管理员账号」。
+ADMIN_ROLE_SYSTEM = "system"
+ADMIN_ROLE_OPERATOR = "operator"
+ADMIN_ROLES = (ADMIN_ROLE_SYSTEM, ADMIN_ROLE_OPERATOR)
+ADMIN_ROLE_ZH = {ADMIN_ROLE_SYSTEM: "系统管理员", ADMIN_ROLE_OPERATOR: "运营"}
 
 #: 首次生成的默认管理员。★ **弱密码是明知故犯**：管理页公网可达，
 #: 所以配套的补偿是「登录按 IP 限速」+「页面上提示立刻改掉」（D3）。
@@ -431,7 +442,8 @@ class AccountStore:
             admin_broken = False
             if ADMIN_ACCOUNTS_KEY not in data:
                 data[ADMIN_ACCOUNTS_KEY] = {
-                    DEFAULT_ADMIN_NAME: {"password": DEFAULT_ADMIN_PASSWORD}}
+                    DEFAULT_ADMIN_NAME: {"password": DEFAULT_ADMIN_PASSWORD,
+                                         "role": ADMIN_ROLE_SYSTEM}}
                 admin_created = DEFAULT_ADMIN_NAME
             elif not isinstance(data[ADMIN_ACCOUNTS_KEY], dict):
                 # 手改坏了。★ **不自动修**：这一格里可能还留着用户自己加的
@@ -1247,6 +1259,40 @@ class AccountStore:
         with self._lock:
             return sorted(admin_accounts(self._read_unlocked()))
 
+    def admin_list(self):
+        """`[{"name", "role"}, …]`（按名字排序）—— 管理员账号页用它画表。"""
+        with self._lock:
+            table = admin_accounts(self._read_unlocked())
+        return [{"name": name, "role": admin_role_of(table[name])}
+                for name in sorted(table)]
+
+    def admin_role(self, name):
+        """这个管理员是什么权限；没有这个人返回 `None`。
+
+        ★ **每一发请求都现查**，不缓存进会话：改了权限要**立刻**生效，
+        不该等对方重新登录（那期间他手里的令牌还带着旧权限）。
+        """
+        with self._lock:
+            table = admin_accounts(self._read_unlocked())
+        entry = table.get(str(name or "").strip())
+        return None if entry is None else admin_role_of(entry)
+
+    @staticmethod
+    def _check_role(role):
+        role = str(role or "").strip().lower()
+        if role not in ADMIN_ROLES:
+            raise AccountError(
+                "bad_role",
+                "权限只能是「%s」或「%s」" % (ADMIN_ROLE_ZH[ADMIN_ROLE_SYSTEM],
+                                             ADMIN_ROLE_ZH[ADMIN_ROLE_OPERATOR]))
+        return role
+
+    @staticmethod
+    def _system_admins(table, exclude=None):
+        """表里还有哪些**系统管理员**（可以排掉一个正要被删 / 被降的）。"""
+        return [name for name, entry in table.items()
+                if name != exclude and admin_role_of(entry) == ADMIN_ROLE_SYSTEM]
+
     def admin_verify(self, name, password):
         """校验管理员口令，返回 `AUTH_OK` / `AUTH_NO_SUCH_USER` / `AUTH_BAD_PASSWORD`。
 
@@ -1264,22 +1310,54 @@ class AccountStore:
             return AUTH_BAD_PASSWORD
         return AUTH_OK
 
-    def admin_add(self, name, password):
+    def admin_add(self, name, password, role=None):
         """加一个管理员，返回新的名字表。
 
         名字和口令走玩家账号那套规则 —— 管理员名同样是 JSON 的键、
         也要经表单往返，没理由放得更松。
+
+        `role` 不给 = **系统管理员**，和「老存档里没有 `role` 这个键」
+        同一个口径（`admin_role_of`）—— 全局只有一条规则要记：
+        **没有这条信息就是系统管理员**。管理页上那个下拉框会明确传值。
         """
         name = check_username(name)
         password = check_password(password)
+        role = self._check_role(ADMIN_ROLE_SYSTEM if role is None else role)
         with self._lock:
             data = self._read_unlocked()
             table = self._admin_table_unlocked(data)
             if name in table:
                 raise AccountError("admin_exists", f"管理员「{name}」已经存在")
-            table[name] = {"password": password}
+            table[name] = {"password": password, "role": role}
             self._write_unlocked(data)
             return sorted(table)
+
+    def admin_set_role(self, name, role):
+        """改一个管理员的权限，返回它的新权限。
+
+        ★ **最后一个系统管理员不能降成运营** —— 和 `admin_remove` 是同一条
+        不变式（运营看不到「管理员账号」这一页，降完就没人能改回来了）。
+        拦在**存档层**，不只拦在前端。
+        """
+        name = str(name or "").strip()
+        role = self._check_role(role)
+        with self._lock:
+            data = self._read_unlocked()
+            table = self._admin_table_unlocked(data)
+            if name not in table:
+                raise AccountError("no_such_admin", f"没有名为「{name}」的管理员")
+            entry = table[name]
+            if not isinstance(entry, dict):
+                entry = {}
+                table[name] = entry
+            if (role != ADMIN_ROLE_SYSTEM
+                    and not self._system_admins(table, exclude=name)):
+                raise AccountError(
+                    "last_system_admin",
+                    "至少要保留一个系统管理员，这是最后一个，不能改成运营")
+            entry["role"] = role
+            self._write_unlocked(data)
+            return role
 
     def admin_set_password(self, name, password):
         """改管理员口令。★ 默认管理员那个弱口令就靠它换掉（D3）。"""
@@ -1301,9 +1379,10 @@ class AccountStore:
     def admin_remove(self, name):
         """删一个管理员，返回剩下的名字表。
 
-        ★ **只剩一个时拒绝删**：删光了谁都进不去管理页，只能上服务器手改 JSON
-        才救得回来。这一条拦在**存档层**，不只拦在前端 —— 前端拦得住鼠标，
-        拦不住直接 POST。
+        ★ **最后一个系统管理员不能删**：删光了谁都进不去「管理员账号」页，
+        只能上服务器手改 JSON 才救得回来。**运营不算数**（用户 2026-09-06）
+        —— 留一屋子运营和「没人能管账号」是一回事。
+        这一条拦在**存档层**，不只拦在前端 —— 前端拦得住鼠标，拦不住直接 POST。
         """
         name = str(name or "").strip()
         with self._lock:
@@ -1311,9 +1390,10 @@ class AccountStore:
             table = self._admin_table_unlocked(data)
             if name not in table:
                 raise AccountError("no_such_admin", f"没有名为「{name}」的管理员")
-            if len(table) <= 1:
+            if (admin_role_of(table[name]) == ADMIN_ROLE_SYSTEM
+                    and not self._system_admins(table, exclude=name)):
                 raise AccountError("last_admin",
-                                   "至少要保留一个管理员，不能全部删掉")
+                                   "至少要保留一个系统管理员，不能把它删掉")
             del table[name]
             self._write_unlocked(data)
             return sorted(table)
@@ -1755,7 +1835,7 @@ def normalize_item_fields(raw):
 
 
 def admin_accounts(data):
-    """存档顶层的管理员表 `{名字: {"password": ...}}`。
+    """存档顶层的管理员表 `{名字: {"password": ..., "role": ...}}`。
 
     ★ **坏了就当没有，不抛异常** —— 管理页是运维功能，一条手改坏的
     `admin_accounts` 不该把整个游戏服拖住（铁律 11）。失败模式是
@@ -1770,3 +1850,21 @@ def admin_accounts(data):
             continue
         table[str(name)] = value
     return table
+
+
+def admin_role_of(entry):
+    """一条管理员记录的权限（D34）。
+
+    ★ 两条规则，都别改：
+
+    1. **没有 `role` 这个键 = 系统管理员**。权限是 2026-09-06 才加的，
+       在那之前建的账号（包括默认的 `admin`）文件里一个 `role` 都没有
+       —— 把它们当成运营，第一件事就是**没人进得去「管理员账号」页**，
+       连改回来的入口都没有了。
+    2. **写了但不认识 = 运营**（最小权限）。`"sysadmin"` 这种手滑要是当成
+       系统管理员，一个拼写错误就等于全放行。
+    """
+    if not isinstance(entry, dict) or "role" not in entry:
+        return ADMIN_ROLE_SYSTEM
+    role = str(entry.get("role") or "").strip().lower()
+    return role if role in ADMIN_ROLES else ADMIN_ROLE_OPERATOR

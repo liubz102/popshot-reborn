@@ -310,7 +310,7 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
   color: #fff; background: var(--crimson); border-color: var(--crimson-dk);
 }
 
-/* ------------------------------------------------- 商店目录：卡片网格 */
+/* ------------------------------------------------- 商店货架：卡片网格 */
 .grid {
   display: grid; gap: 12px;
   grid-template-columns: repeat(auto-fill, minmax(352px, 1fr));
@@ -325,7 +325,7 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 .item-card .col { flex: 1 1 auto; min-width: 0; }
 .item-card .nm { display: flex; gap: 6px; align-items: center; }
 .item-card .nm input { flex: 1 1 auto; max-width: none; font-weight: 600; }
-/* 「商店目录」和「合成配方」上的中文名是**只读**的（改它去物品库，D31）：
+/* 「商店货架」和「合成配方」上的中文名是**只读**的（改它去物品库，D31）：
    画成一行加粗文字，别做成看着能点、点了没反应的输入框。 */
 .item-card .nm.ro, .recipe-out .nm.ro {
   display: block; font-weight: 600; font-size: 15px;

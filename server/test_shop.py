@@ -212,7 +212,7 @@ def config_dir(shop=(), recipe=(), items=(), drops=(), data_dir=None,
 
 
 def shop_config(items=(), data_dir=None, **rest):
-    """只关心商店目录时的简写。`items` 是**商店条目**（沿用老签名）。"""
+    """只关心商店货架时的简写。`items` 是**商店条目**（沿用老签名）。"""
     return config_dir(shop=items, data_dir=data_dir, **rest)
 
 

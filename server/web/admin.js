@@ -1026,7 +1026,7 @@ function renderItems(list) {
   }
 }
 
-/* -------------------------------------------------- 商店目录：卡片网格 */
+/* -------------------------------------------------- 商店货架：卡片网格 */
 function renderShop(list) {
   var grid = el("div", "grid");
   eachVisible("shop", function (entry, index) {
@@ -1326,17 +1326,35 @@ async function describe(item) {
    管理员账号
    ====================================================================== */
 
-function renderAdmins(names) {
+var ROLE_ZH = {system: "系统管理员", operator: "运营"};
+
+function renderAdmins(admins) {
   var rows = $("adminRows");
   rows.textContent = "";
-  (names || []).forEach(function (name) {
+  (admins || []).forEach(function (row) {
+    var name = row.name;
     var tr = document.createElement("tr");
     tr.appendChild(el("td", null, name));
+
+    // 权限下拉：改了当场提交（这一格只有两个值，再加一个「保存」按钮
+    // 只会让人忘了按）。服务端会拦「最后一个系统管理员降成运营」。
     var td = el("td");
+    var select = document.createElement("select");
+    ["system", "operator"].forEach(function (value) {
+      var option = el("option", null, ROLE_ZH[value]);
+      option.value = value;
+      select.appendChild(option);
+    });
+    select.value = row.role;
+    select.onchange = function () { setAdminRole(name, select.value); };
+    td.appendChild(select);
+    tr.appendChild(td);
+
+    var actions = el("td");
     var button = el("button", "btn btn-danger btn-sm", "删除");
     button.onclick = function () { removeAdmin(name); };
-    td.appendChild(button);
-    tr.appendChild(td);
+    actions.appendChild(button);
+    tr.appendChild(actions);
     rows.appendChild(tr);
   });
 }
@@ -1344,7 +1362,22 @@ function renderAdmins(names) {
 async function loadAdmins() {
   var result = await api("/admin/api/admins");
   if (bounced(result) || !result.ok) { return; }
-  renderAdmins(result.names);
+  renderAdmins(result.admins);
+}
+
+async function setAdminRole(name, role) {
+  var result = await api("/admin/api/admins/role", {name: name, role: role});
+  say($("adminMsg"), result.message, result.ok);
+  // ★ 失败也要重画一次 —— 下拉框已经跳到新值了，不拉回去的话画面上写着
+  //   「运营」而服务端还是「系统管理员」。
+  if (result.admins) { renderAdmins(result.admins); }
+  else { loadAdmins(); }
+  if (result.ok && result.self_demoted) {
+    // 把自己降成运营 ⇒ 这一页和「玩家资料」当场就该消失。
+    ROLE = "operator";
+    $("who").textContent = "已登录：" + name + "（运营）";
+    applyRoleToTabs();
+  }
 }
 
 async function removeAdmin(name) {
@@ -1355,7 +1388,7 @@ async function removeAdmin(name) {
     return;
   }
   say($("adminMsg"), result.message, result.ok);
-  if (result.ok) { renderAdmins(result.names); }
+  if (result.ok) { renderAdmins(result.admins); }
 }
 
 /* ======================================================================
@@ -1374,7 +1407,7 @@ var PLAYER_LIST = [];
 var PLAYER_PAGE = {page: 0, pages: 1, total: 0, size: 10, q: ""};
 
 /** 现在商店里在卖哪些 id。★ 取的是**当前标签页模型**里的 shop 条目 ——
-    管理员刚在「商店目录」里改了上架状态还没保存时，这边跟着一起变，
+    管理员刚在「商店货架」里改了上架状态还没保存时，这边跟着一起变，
     免得画面上说「能改」、点了保存服务端说「不能改」。 */
 function listedIds() {
   var set = {};
@@ -1701,18 +1734,59 @@ async function savePlayer() {
    登录 / 启动
    ====================================================================== */
 
-function showLoggedIn(name) {
-  $("who").textContent = "已登录：" + name;
+/* ---------------------------------------------------------------- 权限
+   两档（D34）：`system` 系统管理员 = 全部标签页；
+                `operator` 运营 = 只有那四个配置页。
+
+   ★ 这里做的**只是把标签藏起来**，不是安全边界 —— 藏掉的按钮拦不住直接
+     POST。真正的门在服务端 `_require_system_admin()` 里，两边都要有。
+   ------------------------------------------------------------------- */
+var ROLE = null;                       // "system" / "operator" / null（没登录）
+
+//: 现在停在哪个标签页。★ 和 `CURRENT` 不是一回事 —— `CURRENT` 只记那四个
+//  **配置**页（渲染要用），「玩家资料」和「管理员账号」不在里面。
+var TAB = "items";
+
+//: 只有系统管理员能进的标签页。
+var SYSTEM_ONLY_TABS = ["players", "admins"];
+
+function isSystemAdmin() { return ROLE === "system"; }
+
+function canOpenTab(tab) {
+  return isSystemAdmin() || SYSTEM_ONLY_TABS.indexOf(tab) < 0;
+}
+
+/** 按当前权限决定哪几个标签露出来。 */
+function applyRoleToTabs() {
+  Array.prototype.forEach.call($("tabs").children, function (button) {
+    var tab = button.getAttribute("data-tab");
+    button.classList.toggle("hidden", !canOpenTab(tab));
+  });
+  // 权限被现场降级时，人可能正停在一个已经不该看的页上 —— 拉回物品库。
+  // ★ `CAT` 还没到手就别切：`switchTab` 会去 `renderCurrent()`，
+  //   那一步读 `CAT.schema`（登录的那一瞬间它还是 null）。
+  if (CAT && !canOpenTab(TAB)) { switchTab("items"); }
+}
+
+function showLoggedIn(name, role) {
+  ROLE = role || null;
+  $("who").textContent = "已登录：" + name
+    + (isSystemAdmin() ? "（系统管理员）" : "（运营）");
   $("logout").classList.remove("hidden");
   $("loginView").classList.add("hidden");
   $("mainView").classList.remove("hidden");
   // 标签行在顶栏那块 sticky 容器里，不跟着 `mainView` 走 —— 自己开关一次。
   $("tabs").classList.remove("hidden");
+  applyRoleToTabs();
   boot();
 }
 
 function showLoggedOut(message) {
   CAT = null;
+  ROLE = null;
+  // 下一个登进来的人可能权限不同 —— 停在哪一页得跟着回到起点。
+  TAB = "items";
+  CURRENT = "items";
   PLAYER = null;
   PLAYER_LIST = [];
   $("playerEdit").classList.add("hidden");
@@ -1744,10 +1818,14 @@ async function boot() {
   }
   if (!CFG[CURRENT]) { return; }
   renderCurrent();
-  loadAdmins();
+  // ★ 运营根本进不去这一页，也别去要那份名单（服务端会回 403）。
+  if (isSystemAdmin()) { loadAdmins(); }
 }
 
 function switchTab(tab) {
+  // ★ 第二道保险：标签已经藏起来了，但键盘 / 脚本还是点得到。
+  if (!canOpenTab(tab)) { tab = "items"; }
+  TAB = tab;
   Array.prototype.forEach.call($("tabs").children, function (button) {
     button.classList.toggle("on", button.getAttribute("data-tab") === tab);
   });
@@ -1773,7 +1851,7 @@ function wire() {
     if (!result.ok) { say($("loginMsg"), result.message, false); return; }
     $("loginPass").value = "";
     say($("loginMsg"), "");
-    showLoggedIn(result.name);
+    showLoggedIn(result.name, result.role);
   };
   $("loginPass").addEventListener("keydown", function (event) {
     if (event.key === "Enter") { $("loginBtn").click(); }
@@ -1835,13 +1913,16 @@ function wire() {
   });
 
   $("addAdmin").onclick = async function () {
+    // ★ 权限**永远明确传**，不指望服务端的默认值 —— 页面上那个下拉框
+    //   默认是「运营」（加人先给最小权限，要全权得自己点一下）。
     var result = await api("/admin/api/admins/add", {
-      name: $("newAdminName").value, password: $("newAdminPass").value});
+      name: $("newAdminName").value, password: $("newAdminPass").value,
+      role: $("newAdminRole").value});
     say($("adminMsg"), result.message, result.ok);
     if (result.ok) {
       $("newAdminName").value = "";
       $("newAdminPass").value = "";
-      renderAdmins(result.names);
+      renderAdmins(result.admins);
     }
   };
   $("setPw").onclick = async function () {
@@ -1907,6 +1988,6 @@ function nextRecipeId() {
   wire();
   wireTips();
   var session = await api("/admin/api/session");
-  if (session.logged_in) { showLoggedIn(session.name); }
+  if (session.logged_in) { showLoggedIn(session.name, session.role); }
   else { showLoggedOut(""); }
 }());

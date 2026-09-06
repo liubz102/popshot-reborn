@@ -15,14 +15,25 @@
     GET  /admin/api/catalog           物品表 + 字段描述 + 图集元信息（登录后拿一次）
     GET  /admin/api/config/{items|shop|recipe|drops}  -> {ok, text, warnings}
     POST /admin/api/config/{items|shop|recipe|drops}  {text}
-    GET  /admin/api/admins            -> {ok, names}
-    POST /admin/api/admins/add        {name, password}
-    POST /admin/api/admins/password   {name, password}
-    POST /admin/api/admins/remove     {name}
+    GET  /admin/api/admins            -> {ok, names, admins:[{name,role}]}  ★系统
+    POST /admin/api/admins/add        {name, password, role}                ★系统
+    POST /admin/api/admins/password   {name, password}                      ★系统
+    POST /admin/api/admins/role       {name, role}                          ★系统
+    POST /admin/api/admins/remove     {name}                                ★系统
     GET  /admin/api/item?id=1120041   某件东西**现在在商店里**是什么价（选择器侧栏用）
-    GET  /admin/api/players?q=名字&page=0  按用户名 / 昵称找玩家（一页 10 行）
-    GET  /admin/api/player?name=alice  一个玩家的可编辑资料
-    POST /admin/api/player            {name, level, money, materials, inventory}
+    GET  /admin/api/players?q=名字&page=0  按用户名 / 昵称找玩家（一页 10 行）★系统
+    GET  /admin/api/player?name=alice  一个玩家的可编辑资料                 ★系统
+    POST /admin/api/player            {name, level, money, ...}             ★系统
+
+## 权限分两档（用户 2026-09-06 拍板，D34）
+
+- **系统管理员**（`system`）—— 全部标签页；
+- **运营**（`operator`）—— 只有 物品库 / 商店货架 / 合成配方 / 材料掉落
+  这四个配置页，看不到「玩家资料」和「管理员账号」。
+
+上面标了 ★系统 的接口走 `_require_system_admin()`。**前台把标签藏起来
+只是画面**，真正的门在那个函数里 —— `test_web_admin` 有一条用例拿运营
+身份逐个路径打一遍，确认全是 403。
 
 ## 玩家资料页：**商店在卖的东西一律只读**（用户 2026-09-05 拍板）
 
@@ -33,9 +44,9 @@ D22 之后商店按**真实等级**卖东西。管理页要是能把 4 级才卖
   （合成产物、货架上根本买不到的那批）；
 - **不能改**：`listed=true` 的物品。要给就改金币和等级，让玩家自己进商店买。
 
-判据是 `listed` 而不是「在不在 `shop.json` 里」—— 材料和合成产物本来就
-在那份表里躺着（`default_shop()` 收它们只为有个中文名），它们正是用户
-说的「商店里没有的物品」。
+判据是 `listed` 而不是「在不在 `shop.json` 里」—— `shop.json` 现在只是**货架**
+（D31 之后 `default_shop()` 只收上架的武器），材料和合成产物根本不在里面，
+它们正是用户说的「商店里没有的物品」。
 
 ## ★★ 口令是明文存的，而这个页面公网可达
 
@@ -496,7 +507,7 @@ def _player_view(username, account):
 
     def locked(item_id):
         """商店在卖 ⇒ 只读。★ 判据是 `listed`，不是「在不在 shop.json 里」
-        —— 材料和合成产物本来就在那份表里躺着（`listed=false`），
+        —— 不在那份表里的（材料、合成产物）就是没上架，
         它们正是用户说的「商店里没有的物品」。"""
         return bool((table.get(item_id) or {}).get("listed"))
 
@@ -566,6 +577,23 @@ class AdminRoutes:
             return None
         return name
 
+    def _require_system_admin(self):
+        """**系统管理员**专用（D34）：运营回 403 并返回 `None`。
+
+        ★ 前台会把「玩家资料」和「管理员账号」两个标签藏起来，但那只是画面
+        —— 藏掉的按钮拦不住直接 POST，**真正的门在这儿**。
+        ★ 权限**每一发都现查**（`accounts.admin_role`），不从会话里读：
+        把一个人降成运营之后，他手里那个令牌应该**立刻**失去这两页，
+        不该等他重新登录。
+        """
+        name = self._require_admin()
+        if name is None:
+            return None
+        if self.accounts.admin_role(name) != account_store.ADMIN_ROLE_SYSTEM:
+            self._reply(False, "这一页只有系统管理员能用", status=403)
+            return None
+        return name
+
     def _set_session_cookie(self, token):
         # HttpOnly：JS 读不到，XSS 也偷不走。SameSite=Strict：别的站点发过来的
         # 请求不带它，顺手把 CSRF 也挡了（管理页没有跨站使用的场景）。
@@ -598,15 +626,19 @@ class AdminRoutes:
         if path == "/admin/api/session":
             name = self._admin_name()
             self._send_json({"ok": True, "name": name,
-                             "logged_in": name is not None})
+                             "logged_in": name is not None,
+                             "role": (None if name is None
+                                      else self.accounts.admin_role(name))})
             return True
         if path.startswith("/admin/api/config/"):
             self._admin_config_get(path.rsplit("/", 1)[-1])
             return True
         if path == "/admin/api/admins":
-            if self._require_admin() is None:
+            if self._require_system_admin() is None:
                 return True
-            self._send_json({"ok": True, "names": self.accounts.admin_names()})
+            self._send_json({"ok": True,
+                             "names": self.accounts.admin_names(),
+                             "admins": self.accounts.admin_list()})
             return True
         if path == "/admin/api/item":
             self._admin_item_lookup(query)
@@ -733,8 +765,12 @@ class AdminRoutes:
             return
         self.admin_limiter.clear(host)
         token = self.admin_sessions.issue(name)
-        eventlog.online(f"[admin] 登录成功 {name!r} 来自 {self.client_label()}")
-        body = json.dumps({"ok": True, "message": "登录成功", "name": name},
+        role = self.accounts.admin_role(name)
+        eventlog.online(f"[admin] 登录成功 {name!r}"
+                        f"（{account_store.ADMIN_ROLE_ZH.get(role, role)}）"
+                        f" 来自 {self.client_label()}")
+        body = json.dumps({"ok": True, "message": "登录成功", "name": name,
+                           "role": role},
                           ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -839,15 +875,22 @@ class AdminRoutes:
                          "message": f"已保存 {filename}，即刻生效（不用重启）"})
 
     def _admin_manage(self, action, data):
-        name = self._require_admin()
+        # ★ 整个「管理员账号」页只有**系统管理员**能用（D34）。
+        name = self._require_system_admin()
         if name is None:
             return
         target = str(data.get("name") or "").strip()
         if action == "add":
-            names = self.accounts.admin_add(target, data.get("password"))
-            eventlog.online(f"[admin] {name!r} 添加了管理员 {target!r}")
+            names = self.accounts.admin_add(target, data.get("password"),
+                                            data.get("role"))
+            # ★ 打**存下来的**那个权限，不是请求里那个 —— 没传时存的是
+            #   系统管理员，日志里写「None」谁也看不懂。
+            added = self.accounts.admin_role(target)
+            eventlog.online(f"[admin] {name!r} 添加了管理员 {target!r}"
+                            f"（{account_store.ADMIN_ROLE_ZH.get(added, added)}）")
             self._send_json({"ok": True, "message": f"已添加管理员 {target}",
-                             "names": names})
+                             "names": names,
+                             "admins": self.accounts.admin_list()})
             return
         if action == "password":
             self.accounts.admin_set_password(target, data.get("password"))
@@ -861,14 +904,30 @@ class AdminRoutes:
                 "message": ("已改口令" + ("，请用新口令重新登录" if logged_out
                                           else f"（{target} 需要重新登录）"))})
             return
+        if action == "role":
+            # 「至少保留一个系统管理员」拦在 `account_store` 层（D34）。
+            # ★ **不作废对方的会话**：权限是每一发请求现查的
+            #   （`_require_system_admin`），降完立刻生效，没必要踢他重登。
+            role = self.accounts.admin_set_role(target, data.get("role"))
+            zh = account_store.ADMIN_ROLE_ZH.get(role, role)
+            eventlog.online(f"[admin] {name!r} 把 {target!r} 的权限改成了 {zh}")
+            self._send_json({
+                "ok": True, "admins": self.accounts.admin_list(),
+                # 把自己降成运营 ⇒ 前台要立刻把那两个标签收起来。
+                "self_demoted": (target == name
+                                 and role != account_store.ADMIN_ROLE_SYSTEM),
+                "message": f"{target} 现在是{zh}"})
+            return
         if action == "remove":
-            # 「至少保留一个管理员」拦在 `account_store` 层（不只前端），
+            # 「至少保留一个系统管理员」拦在 `account_store` 层（不只前端），
             # 这里直接让它抛 `AccountError`，宿主的 `do_POST` 会转成友好提示。
             names = self.accounts.admin_remove(target)
             self.admin_sessions.drop_admin(target)
             eventlog.online(f"[admin] {name!r} 删除了管理员 {target!r}")
             self._send_json({"ok": True, "message": f"已删除管理员 {target}",
-                             "names": names, "logged_out": target == name})
+                             "names": names,
+                             "admins": self.accounts.admin_list(),
+                             "logged_out": target == name})
             return
         self._reply(False, "没有这个操作", status=404)
 
@@ -909,8 +968,11 @@ class AdminRoutes:
 
     # ------------------------------------------------------------ 玩家资料
     def _admin_player_search(self, query):
-        """`/admin/api/players?q=…&page=N` —— 按用户名或昵称找人，一页 10 行。"""
-        if self._require_admin() is None:
+        """`/admin/api/players?q=…&page=N` —— 按用户名或昵称找人，一页 10 行。
+
+        ★ **系统管理员专用**（D34）：玩家资料整页对运营不开放。
+        """
+        if self._require_system_admin() is None:
             return
         fields = urllib.parse.parse_qs(query or "")
         raw = (fields.get("q") or [""])[0]
@@ -944,8 +1006,8 @@ class AdminRoutes:
         })
 
     def _admin_player_get(self, query):
-        """`/admin/api/player?name=…` —— 一个玩家的可编辑资料。"""
-        if self._require_admin() is None:
+        """`/admin/api/player?name=…` —— 一个玩家的可编辑资料。★ 系统管理员专用。"""
+        if self._require_system_admin() is None:
             return
         username = (urllib.parse.parse_qs(query or "").get("name") or [""])[0]
         _name, account = self.accounts.get_account(username)
@@ -961,7 +1023,7 @@ class AdminRoutes:
         2026-09-05 拍板）：那批物品带着等级门槛，直接塞进仓库就绕过了
         「够等级才买得到」这条规则。要给就改金币和等级，让玩家自己进商店买。
         """
-        admin = self._require_admin()
+        admin = self._require_system_admin()
         if admin is None:
             return
         username = str(data.get("name") or "").strip()

@@ -3357,7 +3357,7 @@ class ShopBuyAndEquipTests(unittest.TestCase):
         self.assertEqual(7000, account_store.player_money(self.account()))
 
     def test_a_level_gate_is_enforced_server_side(self):
-        """★ D31：等级门槛来自**物品库**，不是商店目录。"""
+        """★ D31：等级门槛来自**物品库**，不是商店货架。"""
         self.give_money(10000)
         with config_dir(shop=[{"id": self.REVOLVER_R1,
                                "listed": True, "price": 3000}],

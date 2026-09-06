@@ -142,7 +142,7 @@ class BackfillTests(_CfgCase):
         self.assertEqual(full, len(after))
 
     def test_apply_keeps_entries_the_default_table_never_had(self):
-        """★ 用户自己在商店目录里加的东西不能被补齐吃掉（铁律 11）。
+        """★ 用户自己在商店货架里加的东西不能被补齐吃掉（铁律 11）。
 
         `default_shop()` 只生成 D/R/F 武器，所以「一件自己加进去卖的铠甲」
         正是默认表里没有的那种条目。

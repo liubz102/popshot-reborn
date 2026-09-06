@@ -180,6 +180,7 @@ class AdminAuthTests(_AdminCase):
                 ("/admin/api/config/shop", {"text": "{}"}),
                 ("/admin/api/admins/add", {"name": "carol", "password": "pw1"}),
                 ("/admin/api/admins/password", {"name": "admin", "password": "pw1"}),
+                ("/admin/api/admins/role", {"name": "admin", "role": "operator"}),
                 ("/admin/api/admins/remove", {"name": "admin"}),
         ):
             status, result = self.request(path, payload)
@@ -513,7 +514,7 @@ class AdminAccountApiTests(_AdminCase):
         #   拦不住直接 POST（这条用例就是直接 POST 的）。
         result = self.request("/admin/api/admins/remove", {"name": "admin"})[1]
         self.assertFalse(result["ok"])
-        self.assertIn("至少要保留一个管理员", result["message"])
+        self.assertIn("至少要保留一个系统管理员", result["message"])
         self.assertEqual(["admin"], self.names())
 
     def test_a_bad_name_or_password_is_refused_with_the_rule_text(self):
@@ -568,6 +569,130 @@ class AdminAccountApiTests(_AdminCase):
         status, result = self.request("/admin/api/admins/explode", {"name": "x"})
         self.assertEqual(404, status)
         self.assertFalse(result["ok"])
+
+    # ------------------------------------------------------------ 权限
+    def test_the_list_carries_everybody_s_role(self):
+        self.request("/admin/api/admins/add",
+                     {"name": "carol", "password": "SecretPw",
+                      "role": "operator"})
+        result = self.request("/admin/api/admins")[1]
+        self.assertEqual([{"name": "admin", "role": "system"},
+                          {"name": "carol", "role": "operator"}],
+                         result["admins"])
+
+    def test_login_and_session_report_the_role(self):
+        # 前台靠它决定藏哪两个标签页。
+        self.assertEqual("system", self.login()[1]["role"])
+        self.assertEqual("system", self.request("/admin/api/session")[1]["role"])
+
+    def test_changing_a_role_takes_effect_without_a_relogin(self):
+        """★ 权限是**每一发请求现查**的：把一个人降成运营，他手里那个令牌
+        应该当场失去「玩家资料」和「管理员账号」，不该等他重新登录。"""
+        self.request("/admin/api/admins/add",
+                     {"name": "carol", "password": "SecretPw",
+                      "role": "system"})
+        other = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.request("/admin/api/login",
+                     {"name": "carol", "password": "SecretPw"}, opener=other)
+        self.assertEqual(200, self.request("/admin/api/admins",
+                                           opener=other)[0])
+        result = self.request("/admin/api/admins/role",
+                              {"name": "carol", "role": "operator"})[1]
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["self_demoted"])       # 降的不是我自己
+        # 同一个 cookie，没重登，直接就进不去了。
+        self.assertEqual(403, self.request("/admin/api/admins",
+                                           opener=other)[0])
+        # 但配置页照常能用 —— 运营的活儿一点没少。
+        self.assertEqual(200, self.request("/admin/api/config/shop",
+                                           opener=other)[0])
+
+    def test_demoting_myself_is_reported_so_the_page_can_react(self):
+        self.request("/admin/api/admins/add",
+                     {"name": "carol", "password": "SecretPw",
+                      "role": "system"})
+        result = self.request("/admin/api/admins/role",
+                              {"name": "admin", "role": "operator"})[1]
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["self_demoted"])
+        self.assertEqual(403, self.request("/admin/api/admins")[0])
+
+    def test_demoting_the_last_system_admin_is_refused_by_the_server(self):
+        self.request("/admin/api/admins/add",
+                     {"name": "carol", "password": "SecretPw",
+                      "role": "operator"})
+        result = self.request("/admin/api/admins/role",
+                              {"name": "admin", "role": "operator"})[1]
+        self.assertFalse(result["ok"])
+        self.assertIn("至少要保留一个系统管理员", result["message"])
+        self.assertEqual("system", self.request("/admin/api/session")[1]["role"])
+
+    def test_operators_do_not_count_when_removing_the_last_system_admin(self):
+        self.request("/admin/api/admins/add",
+                     {"name": "carol", "password": "SecretPw",
+                      "role": "operator"})
+        result = self.request("/admin/api/admins/remove", {"name": "admin"})[1]
+        self.assertFalse(result["ok"])
+        self.assertIn("至少要保留一个系统管理员", result["message"])
+
+
+class OperatorPermissionTests(_AdminCase):
+    """运营（`operator`）能碰什么、不能碰什么（D34，用户 2026-09-06 拍板）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(self.login()[1]["ok"])          # 先用系统管理员建人
+        self.assertTrue(self.request(
+            "/admin/api/admins/add",
+            {"name": "carol", "password": "SecretPw",
+             "role": "operator"})[1]["ok"])
+        self.request("/admin/api/logout", {})
+        self.assertTrue(self.login("carol", "SecretPw")[1]["ok"])
+
+    def test_the_session_says_operator(self):
+        self.assertEqual("operator", self.request(
+            "/admin/api/session")[1]["role"])
+
+    def test_the_four_config_pages_all_work(self):
+        """运营的活儿就是这四页 —— 读得到、也存得进去。"""
+        for which in ("items", "shop", "recipe", "drops"):
+            status, result = self.request("/admin/api/config/" + which)
+            self.assertEqual(200, status, which)
+            self.assertTrue(result["ok"], which)
+            status, saved = self.request("/admin/api/config/" + which,
+                                         {"text": result["text"]})
+            self.assertEqual(200, status, which)
+            self.assertTrue(saved["ok"], which)
+        # 物品选择器和图集也要能用，否则那四页画不出来。
+        self.assertTrue(self.request("/admin/api/catalog")[1]["ok"])
+        self.assertTrue(self.request("/admin/api/item?id=1120041")[1]["ok"])
+
+    def test_every_system_only_api_is_403(self):
+        """★★ 前台把那两个标签藏起来只是画面 —— 这条用例是**直接 POST**，
+        证明藏掉的按钮背后真的有一道门。"""
+        for path, payload in (
+                ("/admin/api/players?q=a", None),
+                ("/admin/api/player?name=alice", None),
+                ("/admin/api/player", {"name": "alice", "money": 1}),
+                ("/admin/api/admins", None),
+                ("/admin/api/admins/add", {"name": "dave", "password": "pw12345"}),
+                ("/admin/api/admins/password", {"name": "carol",
+                                                "password": "Another1"}),
+                ("/admin/api/admins/role", {"name": "carol", "role": "system"}),
+                ("/admin/api/admins/remove", {"name": "admin"}),
+        ):
+            status, result = self.request(path, payload)
+            self.assertEqual(403, status, path)
+            self.assertFalse(result["ok"], path)
+            self.assertIn("系统管理员", result["message"], path)
+
+    def test_an_operator_cannot_promote_himself(self):
+        # 上面那条已经覆盖了，但这一条是**最要命**的一种越权，单独立一条。
+        self.assertEqual(403, self.request(
+            "/admin/api/admins/role", {"name": "carol", "role": "system"})[0])
+        self.assertEqual("operator", self.request(
+            "/admin/api/session")[1]["role"])
 
 
 class AdminItemLookupTests(_AdminCase):

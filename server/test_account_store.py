@@ -6,6 +6,7 @@ import struct
 import tempfile
 import unittest
 
+import account_store
 from account_store import (ADMIN_ACCOUNTS_KEY, AUTH_BAD_PASSWORD,
                            AUTH_NO_SUCH_USER, AUTH_OK,
                            DEFAULT_ADMIN_NAME, DEFAULT_ADMIN_PASSWORD,
@@ -1181,7 +1182,9 @@ class AdminAccountTests(unittest.TestCase):
         self.assertEqual([DEFAULT_ADMIN_NAME, "carol"],
                          self.store.admin_add("carol", "SecretPw"))
         self.assertEqual(AUTH_OK, self.store.admin_verify("carol", "SecretPw"))
-        self.assertEqual({"password": "SecretPw"},
+        # ★ 不传 role = 系统管理员（和「老存档里没有 role 这个键」同一个
+        #   口径，D34）—— 所以下一句删掉默认管理员才允许。
+        self.assertEqual({"password": "SecretPw", "role": "system"},
                          self.saved()[ADMIN_ACCOUNTS_KEY]["carol"])
         self.assertEqual(["carol"], self.store.admin_remove(DEFAULT_ADMIN_NAME))
 
@@ -1242,6 +1245,113 @@ class AdminAccountTests(unittest.TestCase):
         self.store.register("alice", "pw")
         self.store.add_quest_reward("alice", money=10)
         self.assertEqual([DEFAULT_ADMIN_NAME], self.store.admin_names())
+
+
+class AdminRoleTests(unittest.TestCase):
+    """管理员权限两档：系统管理员 / 运营（D34，用户 2026-09-06 拍板）。"""
+
+    SYSTEM = account_store.ADMIN_ROLE_SYSTEM
+    OPERATOR = account_store.ADMIN_ROLE_OPERATOR
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "accounts.json")
+        self.store = AccountStore(self.path)
+        self.store.ensure_item_fields()
+
+    def saved(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_a_record_without_a_role_is_a_system_admin(self):
+        """★★ 老存档里一个 `role` 都没有 —— 当成运营的话，第一件事就是
+        **没人进得去「管理员账号」页**，连改回来的入口都没有了。"""
+        self.assertEqual(self.SYSTEM, account_store.admin_role_of({}))
+        self.assertEqual(self.SYSTEM,
+                         account_store.admin_role_of({"password": "x"}))
+
+    def test_a_role_we_do_not_recognise_is_an_operator(self):
+        """★ 最小权限：`"sysadmin"` 这种手滑要是当成系统管理员，
+        一个拼写错误就等于全放行。"""
+        for bad in ("sysadmin", "admin", "", None, 7, []):
+            self.assertEqual(self.OPERATOR,
+                             account_store.admin_role_of({"role": bad}), bad)
+        # 大小写和空格是手滑，不是另一种权限。
+        self.assertEqual(self.SYSTEM,
+                         account_store.admin_role_of({"role": " System "}))
+
+    def test_add_records_the_role_and_list_reports_it(self):
+        self.store.admin_add("carol", "SecretPw", self.OPERATOR)
+        self.assertEqual({"password": "SecretPw", "role": self.OPERATOR},
+                         self.saved()[ADMIN_ACCOUNTS_KEY]["carol"])
+        self.assertEqual([{"name": DEFAULT_ADMIN_NAME, "role": self.SYSTEM},
+                          {"name": "carol", "role": self.OPERATOR}],
+                         self.store.admin_list())
+        self.assertEqual(self.OPERATOR, self.store.admin_role("carol"))
+        self.assertIsNone(self.store.admin_role("nobody"))
+
+    def test_add_refuses_a_role_it_does_not_know(self):
+        with self.assertRaises(AccountError) as caught:
+            self.store.admin_add("carol", "SecretPw", "boss")
+        self.assertEqual("bad_role", caught.exception.code)
+        self.assertEqual([DEFAULT_ADMIN_NAME], self.store.admin_names())
+
+    def test_set_role_promotes_and_demotes(self):
+        self.store.admin_add("carol", "SecretPw", self.OPERATOR)
+        self.assertEqual(self.SYSTEM,
+                         self.store.admin_set_role("carol", self.SYSTEM))
+        self.assertEqual(self.SYSTEM, self.store.admin_role("carol"))
+        self.assertEqual(self.OPERATOR,
+                         self.store.admin_set_role("carol", self.OPERATOR))
+        self.assertEqual(self.OPERATOR, self.store.admin_role("carol"))
+
+    def test_set_role_rejects_unknown_names_and_roles(self):
+        with self.assertRaises(AccountError) as caught:
+            self.store.admin_set_role("nobody", self.SYSTEM)
+        self.assertEqual("no_such_admin", caught.exception.code)
+        with self.assertRaises(AccountError) as caught:
+            self.store.admin_set_role(DEFAULT_ADMIN_NAME, "boss")
+        self.assertEqual("bad_role", caught.exception.code)
+
+    def test_the_last_system_admin_cannot_be_demoted(self):
+        """★ 和「不能删掉最后一个」是同一条不变式：运营看不到这一页，
+        降完就没人能改回来了。"""
+        self.store.admin_add("carol", "SecretPw", self.OPERATOR)
+        with self.assertRaises(AccountError) as caught:
+            self.store.admin_set_role(DEFAULT_ADMIN_NAME, self.OPERATOR)
+        self.assertEqual("last_system_admin", caught.exception.code)
+        self.assertEqual(self.SYSTEM, self.store.admin_role(DEFAULT_ADMIN_NAME))
+        # 有了第二个系统管理员之后就放行。
+        self.store.admin_set_role("carol", self.SYSTEM)
+        self.store.admin_set_role(DEFAULT_ADMIN_NAME, self.OPERATOR)
+        self.assertEqual(self.OPERATOR,
+                         self.store.admin_role(DEFAULT_ADMIN_NAME))
+
+    def test_operators_do_not_count_towards_the_last_system_admin(self):
+        """★★ 用户 2026-09-06 明说的：「运营权限的人排除在数量统计外」。
+
+        一屋子运营 + 一个系统管理员，那个系统管理员照样删不掉。
+        """
+        self.store.admin_add("carol", "SecretPw", self.OPERATOR)
+        self.store.admin_add("dave", "SecretPw", self.OPERATOR)
+        with self.assertRaises(AccountError) as caught:
+            self.store.admin_remove(DEFAULT_ADMIN_NAME)
+        self.assertEqual("last_admin", caught.exception.code)
+        # 运营随便删，几个都行。
+        self.assertEqual([DEFAULT_ADMIN_NAME, "dave"],
+                         self.store.admin_remove("carol"))
+        self.assertEqual([DEFAULT_ADMIN_NAME], self.store.admin_remove("dave"))
+
+    def test_a_second_system_admin_makes_the_first_removable(self):
+        self.store.admin_add("carol", "SecretPw", self.SYSTEM)
+        self.assertEqual(["carol"], self.store.admin_remove(DEFAULT_ADMIN_NAME))
+
+    def test_the_default_admin_is_created_as_a_system_admin(self):
+        # 新装的服务器第一次跑起来就得有人能进「管理员账号」页。
+        self.assertEqual(self.SYSTEM,
+                         self.saved()[ADMIN_ACCOUNTS_KEY][DEFAULT_ADMIN_NAME]
+                         ["role"])
 
 
 if __name__ == "__main__":

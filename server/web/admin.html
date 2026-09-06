@@ -22,7 +22,7 @@
 
   <nav class="tabs hidden" id="tabs">
     <button data-tab="items" class="on">物品库</button>
-    <button data-tab="shop">商店目录</button>
+    <button data-tab="shop">商店货架</button>
     <button data-tab="recipe">合成配方</button>
     <button data-tab="drops">材料掉落</button>
     <button data-tab="players">玩家资料</button>
@@ -155,10 +155,21 @@
       <div class="panel-body">
         <p class="hint">
           口令是<b>明文</b>保存的（和玩家账号一个口径）。
-          至少要保留一个管理员 —— 全删光了谁都进不来，只能上服务器改 JSON。
+          至少要保留一个<b>系统管理员</b> —— 全删光了（或者全降成运营）
+          就没人进得来这一页，只能上服务器改 JSON。
         </p>
+        <ul class="help">
+          <li><b>系统管理员</b>：管理页所有标签页都能进，包括「玩家资料」和这一页。</li>
+          <li><b>运营</b>：只能进 物品库 / 商店货架 / 合成配方 / 材料掉落
+            这四页，看不到「玩家资料」和「管理员账号」。</li>
+          <li>改权限<b>立刻生效</b>，对方不用重新登录。</li>
+        </ul>
         <table>
-          <thead><tr><th>管理员</th><th style="width:90px"></th></tr></thead>
+          <thead><tr>
+            <th>管理员</th>
+            <th style="width:170px">权限</th>
+            <th style="width:90px"></th>
+          </tr></thead>
           <tbody id="adminRows"></tbody>
         </table>
 
@@ -170,6 +181,13 @@
           <div>
             <label for="newAdminPass">口令</label>
             <input id="newAdminPass" type="password" autocomplete="new-password">
+          </div>
+          <div>
+            <label for="newAdminRole">权限</label>
+            <select id="newAdminRole">
+              <option value="operator">运营</option>
+              <option value="system">系统管理员</option>
+            </select>
           </div>
           <div><button class="btn" id="addAdmin">添加</button></div>
         </div>
