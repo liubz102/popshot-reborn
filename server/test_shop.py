@@ -1008,7 +1008,7 @@ class ComposeTests(_ShopCase):
     """`0x0606` 上行合成 / `0x0506` 下行结果码（§27 / §33）。"""
 
     RECIPE = {"id": 1, "result": 1010001, "cost": 500, "listed": True,
-              "character": None, "days": 0,
+              "character": None,
               "materials": [{"id": 30018, "count": 2}]}
 
     def test_上行带的是产物_id_不是配方号(self):

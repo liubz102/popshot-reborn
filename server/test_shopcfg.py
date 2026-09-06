@@ -150,8 +150,7 @@ class BackfillTests(_CfgCase):
         shopcfg.ensure_files(self.dir)
         path = shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir)
         data = json.load(open(path, encoding="utf-8"))
-        data["items"].append({"id": 1010001, "listed": True,
-                              "price": 7, "days": 0})
+        data["items"].append({"id": 1010001, "listed": True, "price": 7})
         shopcfg.write_json(path, data)
         shopcfg.backfill_defaults(self.dir, apply=True)
         after = {e["id"]: e for e in
@@ -600,12 +599,7 @@ class RealDefaultsTests(unittest.TestCase):
             self.assertGreater(entry["price"], 0, "上架的东西不能白送")
 
     def test_every_item_name_is_chinese(self):
-        """★ 中文名的唯一出处是**物品库**（D31），所以这一条查的是它。
-
-        物品库收全部 808 件能进背包的东西 —— 韩文名翻不出来的那几件
-        （原版数据里就没进 `NAME_ZH`）会退回韩文，这里只保证**默认表里
-        真的翻出来了中文**的那些不回退。
-        """
+        """★ 中文名的唯一出处是**物品库**（D31），所以这一条查的是它。"""
         items = shopcfg.validate_items(shopcfg.default_items())
         self.assertEqual(808, len(items), "物品库要收全部能进背包的东西")
         for item_id in shopdata.ids_of_kind("weapon"):
@@ -615,6 +609,23 @@ class RealDefaultsTests(unittest.TestCase):
             name = items[item_id]["name"]
             self.assertTrue(any("一" <= ch <= "鿿" for ch in name),
                             "%d 的名字里没有中文：%s" % (item_id, name))
+
+    def test_没有一件东西的默认中文名还是韩文(self):
+        """★★ 用户 2026-09-06：管理页上不该再出现韩文物品名。
+
+        **这一条是「翻漏了必然报红」的那道门**（§34 的教训：`NAME_ZH` 的键
+        是**观察到的**词汇，不是规范 —— 补完必须反查一遍还剩几件）。
+        物品表换一版、多出几件带韩文名的东西，也会在这里当场撞出来。
+
+        ⚠ 原版**根本没给名字**的那 477 件（图标就是 `ch00B0015` 这种模型编号）
+        不在管辖范围：它们退回 `#id` 或者原样的模型编号，没有韩文可翻，
+        用户 2026-09-06 拍板保持原样。
+        """
+        hangul = [(entry["id"], entry["name"])
+                  for entry in shopcfg.default_items()["items"]
+                  if any("가" <= ch <= "힣" for ch in entry["name"])]
+        self.assertEqual([], hangul,
+                         "这几件还是韩文名 —— 往 shopcfg.NAME_ZH 里补")
 
     def test_recipes_are_valid_and_bounded(self):
         recipes = shopcfg.validate_recipes(shopcfg.default_recipes())

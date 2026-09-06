@@ -732,8 +732,10 @@ def composition_page(category=CATEGORY_ALL, page=0, character=CHARACTER_ANY,
     page = max(0, min(page, pages - 1))
     shown = entries[page * COMPOSITION_PAGE_SIZE:
                     (page + 1) * COMPOSITION_PAGE_SIZE]
+    # ★ 天数恒发 0（D35）：本版一件期限物品都不卖，`recipe.json` 里也没有这个
+    #   字段了。线上那一格还得占着 —— 包结构是客户端定的。
     rules = [build_composition_rule(r["result"], r.get("cost", 0),
-                                    r.get("materials", ()), r.get("days", 0))
+                                    r.get("materials", ()), days=0)
              for r in shown]
     return build_rep_composition_list(pages, page, rules), shown, warnings
 

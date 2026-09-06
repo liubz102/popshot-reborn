@@ -457,6 +457,36 @@ code {
 .modal .panel { height: min(640px, 100%); }
 .pick-detail b { color: var(--cocoa-ink); }
 
+/* ------------------------------------------------------ 确认对话框（D38） */
+/* 替掉 `window.confirm` —— 那个框的样式跟这一页完全不搭，而且装不下
+   「冲突 / 未冲突」两张清单。复用 `.modal` 的遮罩和 `.panel` 的外壳，
+   只把尺寸掰回「按内容长」。 */
+.modal.dialog .panel {
+  /* ⚠ 上面那行 `.modal .panel { height: min(640px,100%) }` 是给选择器弹窗的
+     —— 不覆盖的话，一句「确定删除？」也会撑成 640 px 高。 */
+  height: auto; width: min(560px, 100%);
+}
+.dialog .panel-body { padding-top: 14px; padding-bottom: 4px; }
+.dialog .lead { white-space: pre-wrap; line-height: 1.65; margin: 0 0 4px; }
+.dialog .dlg-list { margin: 14px 0 0; }
+.dialog .dlg-list > b {
+  display: block; font-size: 13px; color: var(--cocoa-soft);
+  padding-bottom: 5px; border-bottom: 2px dashed var(--line);
+}
+/* 清单可能很长（一次改了几十件东西）—— 自己滚，别把按钮顶到屏幕外。 */
+.dialog .dlg-list ul {
+  list-style: none; margin: 0; padding: 6px 0 0;
+  max-height: 168px; overflow-y: auto;
+}
+.dialog .dlg-list li {
+  font-size: 13px; line-height: 1.55; padding: 2px 0 2px 14px;
+  text-indent: -14px;
+}
+.dialog .dlg-list li::before { content: "· "; color: var(--amber-dark); }
+.dialog .dlg-list li .why { color: var(--crimson); }
+.dialog .dlg-list.bad > b { color: var(--crimson); }
+.dialog .panel-foot { justify-content: flex-end; gap: 10px; }
+
 /* ---------------------------------------------------------- 玩家资料页 */
 h3.sub {
   margin: 20px 0 8px; font-size: 14px; color: var(--cocoa-soft);

@@ -57,6 +57,75 @@ async function api(path, payload) {
   }
 }
 
+/* ======================================================================
+   确认对话框（D38）—— 替掉 `window.confirm`
+
+   `window.confirm` 的样式跟这一页完全不搭，而且装不下「冲突 / 未冲突」
+   两张清单（用户 2026-09-06）。这里画一个自己的，返回 Promise。
+
+   ⚠ 唯一换不掉的是 `beforeunload` 那一发：关标签页时只有浏览器自己那个框，
+     页面无权画东西。
+   ====================================================================== */
+
+var DIALOG = null;            // {resolve} —— 正开着的那一个
+
+/** 弹一个对话框。返回 `Promise<boolean>`（确定 = true）。
+ *
+ *  options = {title, lead, lists: [{label, bad, rows: [{label, reason}]}],
+ *             ok, cancel}
+ *  `cancel` 传 `null` = 只有一个「知道了」，一定 resolve(false)。
+ */
+function ask(options) {
+  closeDialog(false);         // 上一个还开着就当它被取消了
+  hideTip();                  // 物品浮窗 z-index 60，不收起来会盖住对话框
+  $("dialogTitle").textContent = options.title || "确认";
+
+  var body = $("dialogBody");
+  body.textContent = "";
+  if (options.lead) { body.appendChild(el("p", "lead", options.lead)); }
+  (options.lists || []).forEach(function (spec) {
+    if (!spec.rows || !spec.rows.length) { return; }
+    var box = el("div", "dlg-list" + (spec.bad ? " bad" : ""));
+    box.appendChild(el("b", null, spec.label));
+    var ul = document.createElement("ul");
+    spec.rows.forEach(function (row) {
+      var li = el("li", null, row.label);
+      // 「为什么撞了」跟在名字后面 —— 只说「冲突」人猜不到是哪种冲突。
+      if (row.reason) {
+        li.appendChild(el("span", "why", "　—— " + row.reason));
+      }
+      ul.appendChild(li);
+    });
+    box.appendChild(ul);
+    body.appendChild(box);
+  });
+
+  var buttons = $("dialogButtons");
+  buttons.textContent = "";
+  if (options.cancel !== null) {
+    var no = el("button", "btn", options.cancel || "取消");
+    no.onclick = function () { closeDialog(false); };
+    buttons.appendChild(no);
+  }
+  var yes = el("button", "btn btn-primary", options.ok || "确定");
+  yes.onclick = function () { closeDialog(true); };
+  buttons.appendChild(yes);
+
+  $("dialog").classList.remove("hidden");
+  yes.focus();
+  return new Promise(function (resolve) {
+    DIALOG = {resolve: resolve, single: options.cancel === null};
+  });
+}
+
+function closeDialog(answer) {
+  if (!DIALOG) { return; }
+  var open = DIALOG;
+  DIALOG = null;
+  $("dialog").classList.add("hidden");
+  open.resolve(open.single ? false : !!answer);
+}
+
 /* 每个接口都可能因为会话过期回这一句 —— 统一在这里踢回登录页。 */
 function bounced(result) {
   if (result && !result.ok && result.message === "请先登录管理页") {
@@ -560,9 +629,20 @@ async function loadConfig(which) {
   var result = await api("/admin/api/config/" + which);
   if (bounced(result)) { return false; }
   if (!result.ok) { say($("cfgMsg"), result.message, false); return false; }
+  return adoptConfig(which, result.text, result.warnings, result.path);
+}
+
+/** 把服务端给的那份**原文**变成页面模型。读一份配置和保存成功后走同一条路。
+ *
+ * ★★ `base` 记的就是这份原文 —— 保存时把它带回去做三方合并（D36）。
+ *    必须是**服务端那一份**，不是 `fillItems()` 补过的模型：base 的含义是
+ *    「磁盘上当时是什么样」，掺了前台补的东西就不是了，服务端会把补出来的
+ *    几百条当成「我改的」，一改就撞车。
+ */
+function adoptConfig(which, text, warnings, path) {
   var raw;
   try {
-    raw = JSON.parse(result.text);
+    raw = JSON.parse(text);
   } catch (error) {
     say($("cfgMsg"), "服务端上那份 " + which + ".json 不是合法 JSON："
                      + error.message, false);
@@ -571,9 +651,11 @@ async function loadConfig(which) {
   var entries = raw[listKey(which)];
   CFG[which] = {
     format: raw.format,
+    base: text,
     entries: Array.isArray(entries) ? entries : [],
-    warnings: result.warnings || [],
-    path: result.path || "",
+    warnings: warnings || [],
+    // 保存的回文里没有 path（它不会变），沿用上一次读到的。
+    path: (path === undefined) ? ((CFG[which] || {}).path || "") : (path || ""),
     // 老文件里可能还留着 `_说明`。保存后它会消失（D16），先说一声。
     hadNotes: Object.keys(raw).some(function (k) { return k.charAt(0) === "_"; })
   };
@@ -641,8 +723,11 @@ function collect(which) {
  *   解不开的死结。前台手里两份都有，能一次把话说完再一起存。
  *   （服务端那道 `validate_*` 一个字没动，还是最后的护栏。）
  */
+//: 商店 ⇄ 合成互斥，另一边是谁。★ 和服务端 `cfgmerge.OTHER_LISTING` 同一张表。
+var OTHER_LISTING = {shop: "recipe", recipe: "shop"};
+
 function listingClash(which) {
-  var other = (which === "shop") ? "recipe" : "shop";
+  var other = OTHER_LISTING[which];
   if (!CFG[other]) { return []; }
   var mine = {};
   CFG[which].entries.forEach(function (entry) {
@@ -661,39 +746,94 @@ function listingClash(which) {
 
 /** 撞车了就问一句；管理员点「取消」返回 `false`。 */
 function confirmClash(which, clash) {
-  var names = clash.map(function (row) {
-    return "· " + itemName(row.id);
-  }).join("\n");
-  var question = (which === "shop")
-    ? "以下物品已在合成中上架，若继续选择在商店上架，则自动下架合成。\n\n"
-    : "以下物品已在商店上架，若继续选择在合成中上架，则自动下架商店。\n\n";
-  return window.confirm(question + names);
+  var rows = clash.map(function (row) { return {label: itemName(row.id)}; });
+  return ask({
+    title: CAT.schema[which].title + "：和另一边撞了",
+    lead: (which === "shop")
+      ? "以下物品已在合成中上架，若继续选择在商店上架，则自动下架合成。"
+      : "以下物品已在商店上架，若继续选择在合成中上架，则自动下架商店。",
+    lists: [{label: "会被自动下架的：", rows: rows}],
+    ok: "继续", cancel: "取消"});
+}
+
+/** 真正发保存请求的那一发。`only` = 「只提交这几条」（单独提交未冲突物品）。
+ *
+ * ★ 保存**不是**整份覆盖了（D36）：带上 `base`（我打开这一页时服务端给我的
+ *   那份），服务端拿它和磁盘上最新那份做三方合并。商店 / 合成还要带
+ *   `cross_base` —— 「我在商店上架、对方同时在合成上架」这种撞车，
+ *   我手上那份另一边的副本是旧的，**只有服务端看得见**。
+ */
+async function postConfig(which, only) {
+  var payload = {text: JSON.stringify(collect(which), null, 2),
+                 base: CFG[which].base};
+  var other = OTHER_LISTING[which];
+  if (other && CFG[other]) { payload.cross_base = CFG[other].base; }
+  if (only) { payload.only = only; }
+  var result = await api("/admin/api/config/" + which, payload);
+  if (bounced(result)) { return false; }
+  if (result.conflict) { return await onConflict(which, result); }
+  if (!result.ok) {
+    say($("cfgMsg"), CAT.schema[which].title + "：" + result.message, false);
+    if (which === CURRENT) { markBadCard(result.message); }
+    return false;
+  }
+  // ★ 换成**落盘后的那一份** —— 别人改的东西这一刻就出现在画面上
+  //   （用户 2026-09-06：「保存后画面直接更新显示 merge 后的最新状态」）。
+  adoptConfig(which, result.text, []);
+  if (which === CURRENT) { renderCurrent(); }
+  say($("cfgMsg"), result.message, true);
+  return true;
+}
+
+/** 服务端说撞车了：按用户给的那段话问一句，确定就单独提交未冲突的那些。 */
+async function onConflict(which, result) {
+  var conflicts = result.conflicts || [];
+  var mergeable = result.mergeable || [];
+  var bad = {label: "冲突的物品：", bad: true, rows: conflicts};
+  if (!mergeable.length) {
+    // 一件能单独提交的都没有 ⇒ 别问「是否单独提交」，那是个没有答案的问题。
+    await ask({
+      title: CAT.schema[which].title + "：保存冲突",
+      lead: "刚才有另一个人修改了相同的物品，冲突物品需要刷新页面后重新修改。",
+      lists: [bad], ok: "知道了", cancel: null});
+    say($("cfgMsg"), "没有保存 —— 另一个人刚改了同样的东西，"
+                     + "按「放弃修改」拿最新的那份再改一次。", false);
+    return false;
+  }
+  var go = await ask({
+    title: CAT.schema[which].title + "：保存冲突",
+    lead: "刚才有另一个人修改了相同的物品，冲突物品需要刷新页面后重新修改，"
+        + "未冲突的物品可以自动合并，是否单独提交未冲突物品？",
+    lists: [bad, {label: "未冲突的物品：", rows: mergeable}],
+    ok: "单独提交未冲突物品", cancel: "取消"});
+  if (!go) {
+    say($("cfgMsg"), "已取消，什么都没保存。", false);
+    return false;
+  }
+  // ★ **重新发一次，服务端会重新判一遍** —— 从我按下确定到这一发落地之间，
+  //   第三个人可能刚好也改了同一条（用户 2026-09-06 明确要求）。
+  var ok = await postConfig(which, mergeable.map(function (row) {
+    return row.key;
+  }));
+  if (ok) {
+    say($("cfgMsg"), "已单独提交 " + mergeable.length + " 件未冲突的；冲突的 "
+        + conflicts.length + " 件已换成服务端上最新的内容，请重新修改。", false);
+  }
+  return ok;
 }
 
 async function saveConfig(which, skipClashCheck) {
   var clash = [];
-  if (!skipClashCheck && (which === "shop" || which === "recipe")) {
+  if (!skipClashCheck && OTHER_LISTING[which]) {
     clash = listingClash(which);
-    if (clash.length && !confirmClash(which, clash)) {
+    if (clash.length && !(await confirmClash(which, clash))) {
       say($("cfgMsg"), "已取消，什么都没保存。", false);
       return false;
     }
   }
   say($("cfgMsg"), "保存中……", true);
   clearBadCards();
-  var result = await api("/admin/api/config/" + which,
-                         {text: JSON.stringify(collect(which), null, 2)});
-  if (bounced(result)) { return false; }
-  if (!result.ok) {
-    say($("cfgMsg"), CAT.schema[which].title + "：" + result.message, false);
-    if (which === CURRENT) { markBadCard(result.message); }
-    return false;
-  }
-  CFG[which].snapshot = snapshot(which);
-  CFG[which].hadNotes = false;
-  CFG[which].warnings = [];
-  renderCurrent();
-  say($("cfgMsg"), result.message, true);
+  if (!(await postConfig(which, null))) { return false; }
 
   // ★ **这一份存成功了才去动另一边**（2026-09-06 改的顺序）：
   //   反过来先存另一边的话，只要自己这一份存失败（文件被编辑器占着就会），
@@ -701,7 +841,7 @@ async function saveConfig(which, skipClashCheck) {
   //   而管理员看到的只是一句报错，根本想不到东西已经从合成里没了。
   //   现在最坏的结果是「两边都还上着架」，下次按保存会再问一遍、还能救。
   if (clash.length) {
-    var other = (which === "shop") ? "recipe" : "shop";
+    var other = OTHER_LISTING[which];
     clash.forEach(function (row) { row.entry.listed = false; });
     if (!(await saveConfig(other, true))) {
       say($("cfgMsg"), CAT.schema[which].title + "已保存，但「"
@@ -715,14 +855,37 @@ async function saveConfig(which, skipClashCheck) {
   return true;
 }
 
-/** 服务端的错误里带着下标（`recipes[3].materials[1].id：…`），定位过去。 */
+/** 服务端的错误里带着下标（`recipes[3].materials[1].id：…`），定位过去。
+ *
+ * ★ 那张卡可能在**别的页上**、甚至被筛选挡住了 —— 分页之后不翻过去的话
+ *   「报了个错但画面上什么都没高亮」，比不报还难查。
+ */
 function markBadCard(message) {
   var match = /\[(\d+)\]/.exec(message || "");
   if (!match) { return; }
-  var card = $("cfgList").querySelector('[data-index="' + match[1] + '"]');
+  var index = Number(match[1]);
+  var at = positionOf(CURRENT, index);
+  if (at < 0) {
+    FILTER[CURRENT] = emptyFilter();     // 被筛掉了，先把筛选清掉
+    renderToolbar(CURRENT);
+    at = positionOf(CURRENT, index);
+  }
+  if (at < 0) { return; }
+  FILTER[CURRENT].page = Math.floor(at / PAGE_SIZE);
+  repaintList();
+  var card = $("cfgList").querySelector('[data-index="' + index + '"]');
   if (!card) { return; }
   card.classList.add("bad", "flash");
   card.scrollIntoView({block: "center", behavior: "smooth"});
+}
+
+/** 原数组下标 `index` 的那一条，排在**当前筛选结果**的第几位；筛没了就 -1。 */
+function positionOf(which, index) {
+  var at = -1;
+  visibleEntries(which).forEach(function (row, position) {
+    if (row.index === index) { at = position; }
+  });
+  return at;
 }
 
 function clearBadCards() {
@@ -771,25 +934,25 @@ function renderCurrent() {
   $("cfgAdd").classList.toggle("hidden", which === "items");
 
   renderToolbar(which);
-  var list = $("cfgList");
-  list.textContent = "";
-  var render = RENDERERS[which];
-  render(list);
-  touched();
+  repaintList();
 }
 
 /* ------------------------------------------------------------ 工具条 */
 function renderToolbar(which) {
   var bar = $("cfgToolbar");
   bar.textContent = "";
-  if (!FILTER[which]) { FILTER[which] = {q: "", kind: "", character: "", listedOnly: false}; }
+  if (!FILTER[which]) { FILTER[which] = emptyFilter(); }
   var filter = FILTER[which];
 
   var search = document.createElement("input");
   search.type = "text";
   search.placeholder = "搜 中文名 / 韩文名 / id";
   search.value = filter.q;
-  search.oninput = function () { filter.q = search.value.trim(); repaintList(); };
+  search.oninput = function () {
+    filter.q = search.value.trim();
+    resetPage(which);
+    repaintList();
+  };
   bar.appendChild(search);
 
   if (which === "items" || which === "shop") {
@@ -830,6 +993,7 @@ function renderToolbar(which) {
       event.preventDefault();
       filter.listedOnly = !filter.listedOnly;
       only.classList.toggle("on", filter.listedOnly);
+      resetPage(which);
       repaintList();
     };
     bar.appendChild(only);
@@ -851,8 +1015,17 @@ function selectFilter(filter, key, allLabel, options) {
     select.appendChild(node);
   });
   select.value = filter[key] || "";
-  select.onchange = function () { filter[key] = select.value; repaintList(); };
+  select.onchange = function () {
+    filter[key] = select.value;
+    filter.page = 0;               // 换了筛选条件就回第一页
+    repaintList();
+  };
   return select;
+}
+
+/** 一份空的筛选条件。★ 加字段时只改这一处 —— 页面上有三个地方要「清筛选」。 */
+function emptyFilter() {
+  return {q: "", kind: "", character: "", listedOnly: false, page: 0};
 }
 
 function uniq(values) {
@@ -869,7 +1042,12 @@ var RENDERERS = {items: renderItems, shop: renderShop,
 function repaintList() {
   var list = $("cfgList");
   list.textContent = "";
-  RENDERERS[CURRENT](list);
+  var view = pageRows(CURRENT);
+  // ★ 换页栏只有**列表上面这一条**（D37b）。只有一页时 `pagerNode` 回 null
+  //   —— 空的 `.pager` 也占一截外边距，短列表上多出一条空白很显眼。
+  var pager = pagerNode(CURRENT, view);
+  if (pager) { list.appendChild(pager); }
+  RENDERERS[CURRENT](list, view.rows);
   touched();
 }
 
@@ -907,20 +1085,79 @@ function matches(which, entry) {
   return true;
 }
 
-function eachVisible(which, run) {
-  var shown = 0;
+/** 过了筛选的那些记录，`[{entry, index}]`。**下标一律用原数组的**。 */
+function visibleEntries(which) {
+  var rows = [];
   CFG[which].entries.forEach(function (entry, index) {
-    if (!matches(which, entry)) { return; }
-    shown += 1;
-    run(entry, index);
+    if (matches(which, entry)) { rows.push({entry: entry, index: index}); }
   });
+  return rows;
+}
+
+/** 一页画几条（D37）。★ 这是**界面取舍**（一次铺 800 张卡 DOM 会卡手），
+ *  不是铁律 10 说的那种时序阈值 —— 超出的翻页，不再是「剩下的不画了」。 */
+var PAGE_SIZE = 120;
+
+function pageCount(total) {
+  return Math.max(1, Math.ceil(total / PAGE_SIZE));
+}
+
+/** 这一页要画的那些记录，顺带把「筛出 x / y　第 m / n 页」写上。 */
+function pageRows(which) {
+  var all = visibleEntries(which);
+  var pages = pageCount(all.length);
+  var filter = FILTER[which] || (FILTER[which] = {});
+  // 筛完变短了、或者删掉了最后一条 ⇒ 当前页可能已经不存在了，夹回来。
+  var page = Math.min(Math.max(0, filter.page || 0), pages - 1);
+  filter.page = page;
   var label = $("cfgShown");
   if (label) {
     var total = CFG[which].entries.length;
-    label.textContent = shown === total ? ""
-      : ("筛出 " + shown + " / " + total);
+    var parts = [];
+    if (all.length !== total) {
+      parts.push("筛出 " + all.length + " / " + total);
+    }
+    if (pages > 1) { parts.push("第 " + (page + 1) + " / " + pages + " 页"); }
+    label.textContent = parts.join("　");
   }
-  return shown;
+  return {rows: all.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE),
+          pages: pages, page: page, total: all.length};
+}
+
+/** 换页栏，**只放在列表上面这一条**（D37b）。只有一页时整条不画。
+ *
+ *  ★ 换页**一律不动滚动条**：点哪个按钮都只换内容，画面停在原处。
+ *    列表下面原来还有一条，删掉了 —— 在底下换到末页（末页是半页，列表
+ *    真的变短）时，原位置越过新的底，浏览器一夹画面就是一跳，怎么写都
+ *    躲不掉。栏子只留在顶上，点它的时候人本来就在顶上，没得可夹。 */
+function pagerNode(which, view) {
+  if (view.pages <= 1) { return null; }
+  var host = el("div", "pager");
+  function step(text, target, disabled) {
+    var button = el("button", "btn btn-sm", text);
+    button.disabled = disabled;
+    button.onclick = function () {
+      var keep = window.scrollY;
+      FILTER[which].page = target;
+      repaintList();
+      // 清空再填是同一个任务里做完的，浏览器本来就不会动滚动条；这一发
+      // 是把「不许动」写死，免得日后谁往重画里插一句读版面的代码，位置
+      // 就被夹没了。末页比整页短、原位置越界时浏览器自己会夹回来。
+      window.scrollTo(0, keep);
+    };
+    host.appendChild(button);
+  }
+  step("‹ 上一页", view.page - 1, view.page <= 0);
+  host.appendChild(el("span", "pageno",
+                      "第 " + (view.page + 1) + " / " + view.pages + " 页　共 "
+                      + view.total + " 条"));
+  step("下一页 ›", view.page + 1, view.page >= view.pages - 1);
+  return host;
+}
+
+/** 筛选条件一变就回第一页 —— 停在第 5 页而新结果只有 2 页会变成一片空白。 */
+function resetPage(which) {
+  if (FILTER[which]) { FILTER[which].page = 0; }
 }
 
 function killButton(which, index) {
@@ -956,15 +1193,6 @@ function listingOf(itemId) {
 
 var LISTING_ZH = {shop: "商店", recipe: "合成", "": "未上架"};
 
-/** 物品库一页最多画几张卡。
- *
- * ★ 全表有 800 多件东西，一次全画出来 DOM 会卡（和「选择物品」弹窗
- *   `PICK_LIMIT` 同一个理由）。超出的用上面的筛选缩小范围 —— 筛选条件
- *   在服务端那边不存在，纯粹是画面上的事，所以这个数**是界面取舍，
- *   不是铁律 10 说的那种时序阈值**。
- */
-var ITEM_LIMIT = 120;
-
 /** 这件东西要不要「等级 / 角色限定」两栏。
     ★ 和服务端 `shopcfg.has_level_and_character()` **同一条判据**：
     `part_flag != 0`（占装备槽）。两边对不上的话，页面上填得进去、
@@ -974,13 +1202,10 @@ function wearable(itemId) {
   return !!(item && item.part_flag);
 }
 
-function renderItems(list) {
+function renderItems(list, rows) {
   var grid = el("div", "grid");
-  var drawn = 0;
-  var over = 0;
-  eachVisible("items", function (entry, index) {
-    if (drawn >= ITEM_LIMIT) { over += 1; return; }
-    drawn += 1;
+  rows.forEach(function (row) {
+    var entry = row.entry, index = row.index;
     var where = listingOf(entry.id);
     var card = el("div", "item-card" + (where ? " listed" : ""));
     card.setAttribute("data-index", index);
@@ -1019,17 +1244,13 @@ function renderItems(list) {
     grid.appendChild(card);
   });
   list.appendChild(grid);
-  if (over) {
-    // ★ 说清楚「没画完」，别让人以为剩下的被删了。
-    list.appendChild(el("p", "hint", "还有 " + over + " 件没画出来（一次最多画 "
-                        + ITEM_LIMIT + " 张）—— 用上面的筛选缩小范围。"));
-  }
 }
 
 /* -------------------------------------------------- 商店货架：卡片网格 */
-function renderShop(list) {
+function renderShop(list, rows) {
   var grid = el("div", "grid");
-  eachVisible("shop", function (entry, index) {
+  rows.forEach(function (row) {
+    var entry = row.entry, index = row.index;
     var card = el("div", "item-card" + (entry.listed ? " listed" : ""));
     card.setAttribute("data-index", index);
     card.appendChild(killButton("shop", index));
@@ -1087,8 +1308,9 @@ function adoptItem(entry, key, item) {
 }
 
 /* -------------------------------------------------- 合成配方：配方卡 */
-function renderRecipe(list) {
-  eachVisible("recipe", function (entry, index) {
+function renderRecipe(list, rows) {
+  rows.forEach(function (row) {
+    var entry = row.entry, index = row.index;
     var card = el("div", "recipe-card" + (entry.listed ? " listed" : ""));
     card.setAttribute("data-index", index);
     card.appendChild(killButton("recipe", index));
@@ -1184,8 +1406,9 @@ function materialSlots(entry, card) {
 }
 
 /* -------------------------------------------------- 材料掉落：规则行 */
-function renderDrops(list) {
-  eachVisible("drops", function (entry, index) {
+function renderDrops(list, rows) {
+  rows.forEach(function (line) {
+    var entry = line.entry, index = line.index;
     var row = el("div", "rule-row");
     row.setAttribute("data-index", index);
     row.appendChild(killButton("drops", index));
@@ -1230,6 +1453,7 @@ function openPicker(options) {
     // 额外的一道过滤（玩家资料页拿它挡掉「商店在卖的」）。
     filter: options.filter || null,
     q: "",
+    page: 0,
     kind: (options.kinds && options.kinds.length === 1) ? options.kinds[0] : ""
   };
   $("pickSearch").value = "";
@@ -1257,8 +1481,33 @@ function closePicker() {
   $("picker").classList.add("hidden");
 }
 
-/** 一次最多画这么多格。808 件全铺出来是几千像素高的一张网，搜索框会卡手。 */
-var PICK_LIMIT = 200;
+/** 弹窗里一页画这么多格（D37）。808 件全铺出来是几千像素高的一张网，搜索框会卡手
+ *  —— 超出的**翻页**（用户 2026-09-06），不再是「剩下的不画了」。 */
+var PICK_PAGE_SIZE = 200;
+
+/** 弹窗的换页栏，也**只有网格上面这一条**（D37b）。只有一页时整条不画。
+ *  规矩和列表那边一模一样（见 `pagerNode`），只是这里滚的是弹窗自己那个
+ *  `.panel-body`，不是整页。 */
+function paintPickPager(host, pages) {
+  host.textContent = "";
+  if (pages <= 1) { return; }
+  function step(text, target, disabled) {
+    var button = el("button", "btn btn-sm", text);
+    button.disabled = disabled;
+    button.onclick = function () {
+      var body = $("picker").querySelector(".panel-body");
+      var keep = body ? body.scrollTop : 0;
+      PICKER.page = target;
+      paintPicker();
+      if (body) { body.scrollTop = keep; }
+    };
+    host.appendChild(button);
+  }
+  step("‹ 上一页", PICKER.page - 1, PICKER.page <= 0);
+  host.appendChild(el("span", "pageno",
+                      "第 " + (PICKER.page + 1) + " / " + pages + " 页"));
+  step("下一页 ›", PICKER.page + 1, PICKER.page >= pages - 1);
+}
 
 function paintPicker() {
   var grid = $("pickGrid");
@@ -1277,7 +1526,11 @@ function paintPicker() {
   if (!hits.length) {
     grid.appendChild(el("div", "pick-empty", "没有匹配的物品"));
   }
-  hits.slice(0, PICK_LIMIT).forEach(function (item) {
+  var pages = Math.max(1, Math.ceil(hits.length / PICK_PAGE_SIZE));
+  // 搜索串一变结果就短了 —— 当前页可能已经不存在，夹回来。
+  PICKER.page = Math.min(Math.max(0, PICKER.page || 0), pages - 1);
+  hits.slice(PICKER.page * PICK_PAGE_SIZE,
+             (PICKER.page + 1) * PICK_PAGE_SIZE).forEach(function (item) {
     var cell = el("div", "pick" + (item.id === PICKER.selected ? " sel" : ""));
     var ic = el("div", "ic");
     if (iconStyle(ic, item.cell, 44)) { cell.appendChild(ic); }
@@ -1292,8 +1545,10 @@ function paintPicker() {
     };
     grid.appendChild(cell);
   });
-  $("pickCount").textContent = hits.length > PICK_LIMIT
-    ? ("共 " + hits.length + " 件，先画 " + PICK_LIMIT + " 件，搜一下缩小范围")
+  paintPickPager($("pickPagerTop"), pages);
+  $("pickCount").textContent = pages > 1
+    ? ("共 " + hits.length + " 件 · 第 " + (PICKER.page + 1) + " / "
+       + pages + " 页")
     : (hits.length + " 件");
 }
 
@@ -1381,7 +1636,9 @@ async function setAdminRole(name, role) {
 }
 
 async function removeAdmin(name) {
-  if (!window.confirm("确定删除管理员「" + name + "」？")) { return; }
+  if (!(await ask({title: "删除管理员",
+                   lead: "确定删除管理员「" + name + "」？",
+                   ok: "删除"}))) { return; }
   var result = await api("/admin/api/admins/remove", {name: name});
   if (result.ok && result.logged_out) {
     showLoggedOut("你把自己删掉了，已退出登录。");
@@ -1444,8 +1701,10 @@ async function searchPlayers(page) {
  */
 async function refreshPlayers() {
   if (PLAYER && playerDirty()
-      && !window.confirm("「" + PLAYER.view.username
-                         + "」还有没保存的改动，刷新会丢掉，确定？")) {
+      && !(await ask({title: "还有没保存的改动",
+                      lead: "「" + PLAYER.view.username
+                            + "」还有没保存的改动，刷新会丢掉，确定？",
+                      ok: "刷新"}))) {
     return;
   }
   var open = PLAYER ? PLAYER.view.username : null;
@@ -1509,8 +1768,10 @@ function renderPlayerPager() {
 
 async function openPlayer(username, force) {
   if (!force && PLAYER && playerDirty()
-      && !window.confirm("「" + PLAYER.view.username
-                         + "」还有没保存的改动，确定丢掉？")) {
+      && !(await ask({title: "还有没保存的改动",
+                      lead: "「" + PLAYER.view.username
+                            + "」还有没保存的改动，确定丢掉？",
+                      ok: "丢掉"}))) {
     return;
   }
   var result = await api("/admin/api/player?name=" + encodeURIComponent(username));
@@ -1898,17 +2159,30 @@ function wire() {
 
   $("pickSearch").oninput = function () {
     PICKER.q = $("pickSearch").value.trim();
+    PICKER.page = 0;
     paintPicker();
   };
   $("pickKind").onchange = function () {
     PICKER.kind = $("pickKind").value;
+    PICKER.page = 0;
     paintPicker();
   };
   $("pickClose").onclick = closePicker;
   $("picker").onclick = function (event) {
     if (event.target === $("picker")) { closePicker(); }
   };
+  // 点遮罩 = 取消（和选择器一个手感）。
+  $("dialog").onclick = function (event) {
+    if (event.target === $("dialog")) { closeDialog(false); }
+  };
   document.addEventListener("keydown", function (event) {
+    // ★ 对话框排在选择器前面：它是**盖在**选择器上面的那一层
+    //   （「加一种材料」的弹窗上再弹确认框时，Esc 该先关掉上面那个）。
+    if (DIALOG) {
+      if (event.key === "Escape") { closeDialog(false); }
+      else if (event.key === "Enter") { closeDialog(true); }
+      return;
+    }
     if (event.key === "Escape" && PICKER) { closePicker(); }
   });
 
@@ -1966,7 +2240,9 @@ function addEntry(which) {
       if ("id" in entry && which === "recipe") { entry.id = nextRecipeId(); }
       CFG[which].entries.push(entry);
       // 新加的那条一定要看得见 —— 否则筛选开着的时候「加了没反应」。
-      FILTER[which] = {q: "", kind: "", character: "", listedOnly: false};
+      // ★ 它追加在末尾 ⇒ 清掉筛选之后还得**翻到最后一页**。
+      FILTER[which] = emptyFilter();
+      FILTER[which].page = pageCount(CFG[which].entries.length) - 1;
       renderCurrent();
       var card = $("cfgList").querySelector(
         '[data-index="' + (CFG[which].entries.length - 1) + '"]');

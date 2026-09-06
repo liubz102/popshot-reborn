@@ -229,9 +229,23 @@
         <span class="grow"></span>
         <button class="btn" id="pickClose">关闭</button>
       </div>
+      <!-- 换页栏只有网格**上面**这一条（D37b）：800 多件东西一页放不下。
+           下面那条删了 —— 在底下换到末页时画面会被夹着跳。 -->
+      <div class="pager" id="pickPagerTop"></div>
       <div class="pick-grid" id="pickGrid"></div>
       <div class="pick-detail" id="pickDetail"></div>
     </div>
+  </div>
+</div>
+
+<!-- ========================= 确认对话框 =========================
+     替掉 `window.confirm`：那个框的样式跟管理页完全不搭，而且装不下
+     「冲突 / 未冲突」两张清单（用户 2026-09-06）。按钮由 admin.js 生成。 -->
+<div class="modal dialog hidden" id="dialog">
+  <div class="panel">
+    <div class="panel-title"><h2 id="dialogTitle"></h2></div>
+    <div class="panel-body" id="dialogBody"></div>
+    <div class="panel-foot" id="dialogButtons"></div>
   </div>
 </div>
 

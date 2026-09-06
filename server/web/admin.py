@@ -14,7 +14,8 @@
     POST /admin/api/logout
     GET  /admin/api/catalog           物品表 + 字段描述 + 图集元信息（登录后拿一次）
     GET  /admin/api/config/{items|shop|recipe|drops}  -> {ok, text, warnings}
-    POST /admin/api/config/{items|shop|recipe|drops}  {text}
+    POST /admin/api/config/{items|shop|recipe|drops}
+         {text, base, cross_base, only}  -> {ok, text, adopted} | {conflict…}
     GET  /admin/api/admins            -> {ok, names, admins:[{name,role}]}  ★系统
     POST /admin/api/admins/add        {name, password, role}                ★系统
     POST /admin/api/admins/password   {name, password}                      ★系统
@@ -73,6 +74,22 @@ D14 当时就写明了退路：**表单化只是换一个前台生成同样的 J
 - 字段描述表 `shopcfg.SCHEMA` **贴着 validator 放**，两边对不上就有用例报红
   —— 这是「以后新增的字段自动出现在画面上」的保证。
 
+## 保存是**三方合并**，不是整份覆盖（D36）
+
+两个运营同时开着页面，后按保存的会把前一个人的改动无声抹掉。所以保存时
+前台把「我打开这一页时你给我的那份」当 `base` 一起送回来，服务端拿
+`base` / `mine` / **此刻磁盘上那份** 做一次三方合并（`cfgmerge`）：
+
+- 改的**不是同一条** ⇒ 直接合并，不提示，回文里带上落盘后的整份内容，
+  前台当场换成最新状态；
+- 改的**是同一条** ⇒ 一个字节都不写，回 `{conflict: true, conflicts, mergeable}`，
+  由运营决定要不要「单独提交未冲突的」（带 `only` 再发一次，**重新判一遍**）；
+- **商店 ⇄ 合成互斥**也算冲突：我让 X 在商店上架、对方同时让 X 在合成上架
+  —— 我手上那份 `recipe` 是旧的，只有服务端看得见（`cross_base` 就是为它带的）。
+  和 D33 分工：前台那道管「我自己两边都勾了」，这道管「对方刚上架的」。
+
+`base` 不带 = 脚本 / 老页面 ⇒ 退回整份覆盖的老行为。
+
 ## `_` 开头的键不再回写（D16）
 
 以前保存的是「解析后的对象」，`_说明` 那种注释键会原样留在文件里。
@@ -92,6 +109,7 @@ import time
 import urllib.parse
 
 import account_store
+import cfgmerge
 import eventlog
 import shopcfg
 import shopdata
@@ -167,6 +185,14 @@ CONFIG_VALIDATORS = {
 #: `web/server.py` 的 `MAX_BODY_BYTES` 是 1 MB —— 那是**请求体**的上限，
 #: 比这里更严，所以实际卡住的是那一个。留着这条只为让错误话说得更清楚。
 MAX_CONFIG_BYTES = 4 << 20
+
+#: 每份配置一把锁，护住「读磁盘 → 合并 → 写盘」这一段（D36）。
+#:
+#: ★ 服务器是 `ThreadingMixIn`，两个运营同时按保存就是两个线程。三方合并
+#:   只解决「谁的改动被吃了」，解决不了「两发同时读到同一份 theirs、后写的
+#:   把先写的盖掉」—— 那是同一件事的另一半，只有锁能解。
+#: ★ 锁按**文件**分，不是一把全局锁：改物品库的人不该挡住改掉落的人。
+_config_locks = dict((which, threading.Lock()) for which in CONFIG_FILES)
 
 
 class AdminSessions:
@@ -454,6 +480,24 @@ def _push_account(username):
             continue
         pushed = True
     return pushed
+
+
+def _parse_side(raw):
+    """`base` / `cross_base` 那两个字段 → json 对象；没带或读不懂就是 `None`。
+
+    ★ 前台送的是**服务端当初发给它的那份原文**（字符串），所以只可能是
+    合法 JSON；读不懂时当「没带」处理 = 退回整份覆盖，而不是报错
+    —— 保存这条路上不该因为一个辅助字段坏掉就存不了东西。
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def stackable(item_id):
@@ -817,6 +861,15 @@ class AdminRoutes:
         self._send_json({"ok": True, "text": text, "warnings": warnings,
                          "path": path})
 
+    def _read_config_entries(self, which):
+        """磁盘上那一份的记录列表。读不出来就当空的（合并时等于「对方那份是空的」）。"""
+        path = shopcfg.path_of(CONFIG_FILES[which])
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                return cfgmerge.entries_of(which, json.load(fp))
+        except (OSError, ValueError):
+            return []
+
     def _admin_config_post(self, which, data):
         name = self._require_admin()
         if name is None:
@@ -844,35 +897,110 @@ class AdminRoutes:
         except shopcfg.ConfigError as error:
             # ★ **校验不过就不落盘。** 存一份坏文件下去，服务端会退回上一份
             #   好的继续跑（D10）—— 用户会以为改生效了，实际没有。
+            #   ★ 先校验**我这一份**，错误里的 `[下标]` 才对得上我的编辑器。
             self._reply(False, f"校验没过，没有保存：{error}")
             return
-        # ★ 只写 `format` + 那一个列表（D16）。以前存的是「解析后的整个对象」，
-        #   `_说明` 那种注释键会原样留下 —— 那几句话是写给**手改 json 的人**看的，
-        #   而现在唯一的编辑入口就是这个页面，说明已经画在面板上了
-        #   （`shopcfg.SCHEMA[...]["help"]`）。⇒ 老文件里的 `_说明`
-        #   会在第一次保存时消失，这是用户拍板要的。
+
+        base = _parse_side(data.get("base"))
+        cross_base = _parse_side(data.get("cross_base"))
+        only = data.get("only")
+        only = set(only) if isinstance(only, list) else None
         list_key = shopcfg.SCHEMA[which]["list_key"]
-        try:
-            shopcfg.write_json(shopcfg.path_of(filename), {
-                "format": shopcfg.FORMAT,
-                list_key: parsed.get(list_key, []),
-            })
-        except OSError as error:
-            # ★ 写不进去**不是**「服务器内部错误」，是一句人看得懂的话。
-            #   Windows 上最常见的一种：文件正开在编辑器里（サクラエディタ
-            #   默认独占打开），`os.replace` 当场 `PermissionError(13)`。
-            #   兜底那层只会打一行日志、回一句「请看服务端日志」——
-            #   用户根本猜不到要去关编辑器（2026-09-06 踩过）。
-            self._reply(False, f"写不进 {filename}（{error.strerror or error}）"
-                               "，没有保存。这个文件多半正被别的程序占着"
-                               "（编辑器打开了它？），关掉再存一次。")
-            return
-        # 热重载本来靠 mtime，但 mtime 的粒度可能粗到看不出这一次改动
-        # —— 存完直接把缓存丢掉，下一次读一定是新的。
-        shopcfg.invalidate()
+        mine = parsed.get(list_key, [])
+
+        with _config_locks[which]:
+            if base is None:
+                # 没带 base = 脚本 / 老页面 ⇒ 照老样子整份覆盖，不做冲突检测。
+                merged, adopted = mine, []
+            else:
+                outcome = self._merge_config(
+                    which, cfgmerge.entries_of(which, base), mine,
+                    cross_base, only)
+                if outcome is None:
+                    return                        # 撞车了，回文已经发出去了
+                merged, adopted = outcome
+                try:
+                    CONFIG_VALIDATORS[which]({list_key: merged})
+                except shopcfg.ConfigError as error:
+                    # 我这一份自己是好的（上面刚校验过），合起来才违规
+                    # —— 多半是另一个人刚加了一条撞车的记录。
+                    self._reply(False, f"合并后没过校验，没有保存：{error}"
+                                       "。多半是另一个人刚加了和你冲突的条目，"
+                                       "刷新页面看一眼再改。")
+                    return
+            # ★ 只写 `format` + 那一个列表（D16）。以前存的是「解析后的整个对象」，
+            #   `_说明` 那种注释键会原样留下 —— 那几句话是写给**手改 json 的人**
+            #   看的，而现在唯一的编辑入口就是这个页面，说明已经画在面板上了
+            #   （`shopcfg.SCHEMA[...]["help"]`）。⇒ 老文件里的 `_说明`
+            #   会在第一次保存时消失，这是用户拍板要的。
+            body = {"format": shopcfg.FORMAT, list_key: merged}
+            try:
+                shopcfg.write_json(shopcfg.path_of(filename), body)
+            except OSError as error:
+                # ★ 写不进去**不是**「服务器内部错误」，是一句人看得懂的话。
+                #   Windows 上最常见的一种：文件正开在编辑器里（サクラエディタ
+                #   默认独占打开），`os.replace` 当场 `PermissionError(13)`。
+                #   兜底那层只会打一行日志、回一句「请看服务端日志」——
+                #   用户根本猜不到要去关编辑器（2026-09-06 踩过）。
+                self._reply(False,
+                            f"写不进 {filename}（{error.strerror or error}）"
+                            "，没有保存。这个文件多半正被别的程序占着"
+                            "（编辑器打开了它？），关掉再存一次。")
+                return
+            # 热重载本来靠 mtime，但 mtime 的粒度可能粗到看不出这一次改动
+            # —— 存完直接把缓存丢掉，下一次读一定是新的。
+            shopcfg.invalidate()
+
         eventlog.online(f"[admin] {name!r} 保存了 {filename}")
-        self._send_json({"ok": True,
-                         "message": f"已保存 {filename}，即刻生效（不用重启）"})
+        message = f"已保存 {filename}，即刻生效（不用重启）"
+        if adopted:
+            # ★ 自动合并**不用弹框**（用户 2026-09-06），但得说一声 ——
+            #   画面上凭空多出几条改动，不说人会以为自己看花了眼。
+            message += f"。另外合并了另一个人改的 {len(adopted)} 条"
+        # ★ 回**落盘后的整份内容**：前台拿它当场换成合并后的最新状态，
+        #   不用再多一次 GET（用户要的「保存后画面直接更新」）。
+        self._send_json({
+            "ok": True, "message": message,
+            "text": json.dumps(body, ensure_ascii=False, indent=2) + "\n",
+            "adopted": [cfgmerge.key_text(key) for key in adopted]})
+
+    def _merge_config(self, which, base, mine, cross_base, only):
+        """三方合并 + 互斥检测。撞车时**自己把回文发出去**并返回 `None`。
+
+        `cross_base` 是**另一边那份配置**打开时的原文（json 对象）。
+        商店 / 合成才有另一边，物品库和掉落传不传都一样。
+        """
+        theirs = self._read_config_entries(which)
+        result = cfgmerge.merge(which, base, mine, theirs, only)
+        clashes = []
+        other = cfgmerge.OTHER_LISTING.get(which)
+        # ★ **合并撞车了也要算互斥**：两种撞车要在同一个提示框里一次说完，
+        #   否则运营点了「单独提交未冲突的」，第二轮才发现里面还有互斥的。
+        if other is not None and cross_base is not None:
+            clashes = cfgmerge.listing_conflicts(
+                which, base, result.entries,
+                cfgmerge.entries_of(other, cross_base),
+                self._read_config_entries(other))
+        if result.clean and not clashes:
+            return result.entries, result.adopted
+
+        mine_map = cfgmerge.as_map(which, mine)
+        conflicts = [cfgmerge.describe(which, key, reason, mine_map.get(key))
+                     for key, reason in result.conflicts]
+        blocked = set(key for key, _reason in result.conflicts)
+        for key, _item_id in clashes:
+            if key in blocked:
+                continue
+            blocked.add(key)
+            conflicts.append(cfgmerge.describe(
+                which, key, cfgmerge.listing_reason(which), mine_map.get(key)))
+        mergeable = [cfgmerge.describe(which, key, None, mine_map.get(key))
+                     for key in result.applied if key not in blocked]
+        self._send_json({
+            "ok": False, "conflict": True,
+            "conflicts": conflicts, "mergeable": mergeable,
+            "message": "另一个人刚改了同样的东西，没有保存"})
+        return None
 
     def _admin_manage(self, action, data):
         # ★ 整个「管理员账号」页只有**系统管理员**能用（D34）。

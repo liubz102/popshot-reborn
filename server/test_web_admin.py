@@ -23,6 +23,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import account_store                                           # noqa: E402
+import cfgmerge                                                  # noqa: E402
 import shopcfg                                                 # noqa: E402
 import shopdata                                                # noqa: E402
 from account_store import AccountStore                         # noqa: E402
@@ -357,6 +358,262 @@ class AdminConfigTests(_AdminCase):
         result = self.get("drops")
         self.assertTrue(result["ok"])            # 文本照样给你看，好去修
         self.assertTrue(result["warnings"])
+
+
+class AdminConfigConflictTests(_AdminCase):
+    """两个管理员同时改同一份配置（D36）。
+
+    ★ 这一组关心的**只有两件事**：撞车时到底有没有写盘、没撞车时对方的改动
+    有没有跟着进来。合并算法本身在 `test_cfgmerge` 里逐条钉。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(self.login()[1]["ok"])
+        # 第二个浏览器 = 第二个 cookie 罐。用同一个账号就行 —— 冲突检测
+        # 认的是「哪一份 base」，不是「谁」。
+        self.other = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.assertTrue(self.request("/admin/api/login", {
+            "name": account_store.DEFAULT_ADMIN_NAME,
+            "password": account_store.DEFAULT_ADMIN_PASSWORD},
+            opener=self.other)[1]["ok"])
+
+    # -------------------------------------------------------------- 小工具
+    def open_page(self, which, opener=None):
+        """一个浏览器打开这一页拿到的原文（这就是它的 `base`）。"""
+        result = self.request("/admin/api/config/" + which, opener=opener)[1]
+        self.assertTrue(result["ok"], result)
+        return result["text"]
+
+    def save(self, which, base, entries, opener=None, **extra):
+        payload = {"text": json.dumps(
+            {"format": shopcfg.FORMAT,
+             shopcfg.SCHEMA[which]["list_key"]: entries}, ensure_ascii=False),
+            "base": base}
+        payload.update(extra)
+        return self.request("/admin/api/config/" + which, payload,
+                            opener=opener)[1]
+
+    @staticmethod
+    def rows(text, which="shop"):
+        return json.loads(text)[shopcfg.SCHEMA[which]["list_key"]]
+
+    def on_disk(self, which="shop"):
+        with open(shopcfg.path_of(web_admin.CONFIG_FILES[which]),
+                  "r", encoding="utf-8") as fp:
+            return self.rows(fp.read(), which)
+
+    # ------------------------------------------------------------ 自动合并
+    def test_改了不同的物品直接合并而且不提示(self):
+        base = self.open_page("shop")
+        rows = self.rows(base)
+        mine, theirs = [dict(r) for r in rows], [dict(r) for r in rows]
+        mine[0]["price"] = 111
+        theirs[1]["price"] = 222
+
+        self.assertTrue(self.save("shop", base, theirs,
+                                  opener=self.other)["ok"])
+        result = self.save("shop", base, mine)
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("conflict", result)
+        # ★ 回文里就是合并后的最新状态 —— 前台拿它当场刷新画面。
+        merged = dict((r["id"], r["price"]) for r in self.rows(result["text"]))
+        self.assertEqual(111, merged[rows[0]["id"]])
+        self.assertEqual(222, merged[rows[1]["id"]], "对方那一条要跟着进来")
+        self.assertEqual(1, len(result["adopted"]))
+
+    def test_对方新加的条目我没动就跟着进来(self):
+        base = self.open_page("shop")
+        rows = self.rows(base)
+        theirs = [dict(r) for r in rows] + [
+            {"id": 1010064, "kind": "armor", "price": 50, "listed": False}]
+        self.assertTrue(self.save("shop", base, theirs,
+                                  opener=self.other)["ok"])
+        mine = [dict(r) for r in rows]
+        mine[0]["price"] = 111
+        result = self.save("shop", base, mine)
+        self.assertTrue(result["ok"], result)
+        self.assertIn(1010064, [r["id"] for r in self.rows(result["text"])])
+
+    # ---------------------------------------------------------------- 撞车
+    def test_改了同一个物品就撞车而且一个字节都不写(self):
+        base = self.open_page("shop")
+        rows = self.rows(base)
+        mine, theirs = [dict(r) for r in rows], [dict(r) for r in rows]
+        mine[0]["price"] = 111
+        mine[1]["price"] = 333          # 这一条没人碰，应该进「未冲突」
+        theirs[0]["price"] = 222
+
+        self.assertTrue(self.save("shop", base, theirs,
+                                  opener=self.other)["ok"])
+        before = self.on_disk()
+        result = self.save("shop", base, mine)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["conflict"])
+        self.assertEqual(before, self.on_disk(), "撞车时文件不该动")
+
+        self.assertEqual(1, len(result["conflicts"]))
+        self.assertEqual(1, len(result["mergeable"]))
+        # 提示框里要写清楚是哪一件、为什么撞了。
+        self.assertIn(str(rows[0]["id"]), result["conflicts"][0]["label"])
+        self.assertTrue(result["conflicts"][0]["reason"])
+        self.assertIn(str(rows[1]["id"]), result["mergeable"][0]["label"])
+
+    def test_单独提交未冲突物品(self):
+        base = self.open_page("shop")
+        rows = self.rows(base)
+        mine, theirs = [dict(r) for r in rows], [dict(r) for r in rows]
+        mine[0]["price"] = 111
+        mine[1]["price"] = 333
+        theirs[0]["price"] = 222
+        self.assertTrue(self.save("shop", base, theirs,
+                                  opener=self.other)["ok"])
+        clash = self.save("shop", base, mine)
+
+        # 管理员点了「单独提交未冲突物品」—— 原样再发一次，加 only。
+        again = self.save("shop", base, mine,
+                          only=[row["key"] for row in clash["mergeable"]])
+        self.assertTrue(again["ok"], again)
+        prices = dict((r["id"], r["price"]) for r in self.rows(again["text"]))
+        self.assertEqual(222, prices[rows[0]["id"]], "冲突那件要回到对方的值")
+        self.assertEqual(333, prices[rows[1]["id"]], "未冲突那件才是我的")
+
+    def test_单独提交时第三个人又插进来了还要再报一次(self):
+        # ★ 用户 2026-09-06 明确要求：单独提交前重新检测一次。
+        base = self.open_page("shop")
+        rows = self.rows(base)
+        mine = [dict(r) for r in rows]
+        mine[1]["price"] = 333
+        third = [dict(r) for r in rows]
+        third[1]["price"] = 444
+        self.assertTrue(self.save("shop", base, third,
+                                  opener=self.other)["ok"])
+        result = self.save("shop", base, mine,
+                           only=[cfgmerge.key_text(((rows[1]["id"],), 0))])
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["conflict"])
+
+    # ------------------------------------------------ 商店 ⇄ 合成互斥的撞车
+    def unlist_first_recipe(self):
+        """默认配方全是上架的 —— 先下架一条，好当「谁把它重新上架」的起点。"""
+        base = self.open_page("recipe")
+        rows = [dict(r) for r in self.rows(base, "recipe")]
+        rows[0]["listed"] = False
+        self.assertTrue(self.save("recipe", base, rows)["ok"])
+        return rows[0]["result"]
+
+    def test_我在商店上架对方同时在合成上架也算撞车(self):
+        product = self.unlist_first_recipe()
+        shop_base = self.open_page("shop")
+        recipe_base = self.open_page("recipe")       # 我看到的：它没上架
+
+        # 对方刚把这件东西在合成里上架（我手上那份 recipe 还是旧的，看不见）。
+        theirs = [dict(r) for r in self.rows(recipe_base, "recipe")]
+        theirs[0]["listed"] = True
+        self.assertTrue(self.save("recipe", recipe_base, theirs,
+                                  opener=self.other)["ok"])
+
+        # 我把同一件东西摆上商店货架。
+        mine = [dict(r) for r in self.rows(shop_base)]
+        mine.append({"id": product, "kind": "armor",
+                     "price": 500, "listed": True})
+        before = self.on_disk("shop")
+        result = self.save("shop", shop_base, mine, cross_base=recipe_base)
+        self.assertFalse(result["ok"], "对方刚在合成里上架，这该算撞车")
+        self.assertTrue(result["conflict"])
+        self.assertEqual(before, self.on_disk("shop"))
+        self.assertIn("合成", result["conflicts"][0]["reason"])
+        self.assertIn(str(product), result["conflicts"][0]["label"])
+
+    def test_对方本来就在合成上架的走前台那道确认框不在这儿报(self):
+        # 我手上那份 recipe 已经显示它上架了 ⇒ D33 的 `listingClash()`
+        # 会先问一句、然后自动下架合成。服务端不该再拦一次。
+        recipe_base = self.open_page("recipe")       # 默认全是上架的
+        product = self.rows(recipe_base, "recipe")[0]["result"]
+        shop_base = self.open_page("shop")
+        mine = [dict(r) for r in self.rows(shop_base)]
+        mine.append({"id": product, "kind": "armor",
+                     "price": 500, "listed": True})
+        result = self.save("shop", shop_base, mine, cross_base=recipe_base)
+        self.assertTrue(result["ok"], result)
+
+    def test_两种撞车一次说完(self):
+        """★ 合并撞车 + 互斥撞车同时发生时，要在**同一个**清单里全列出来。
+        分两轮的话运营点了「单独提交未冲突的」，第二轮才发现里面还有互斥的。
+        """
+        product = self.unlist_first_recipe()
+        shop_base = self.open_page("shop")
+        recipe_base = self.open_page("recipe")
+        rows = self.rows(shop_base)
+
+        # 对方干了两件事：改了商店里第 0 条、把 product 在合成里上架。
+        theirs = [dict(r) for r in rows]
+        theirs[0]["price"] = 222
+        self.assertTrue(self.save("shop", shop_base, theirs,
+                                  opener=self.other)["ok"])
+        listed = [dict(r) for r in self.rows(recipe_base, "recipe")]
+        listed[0]["listed"] = True
+        self.assertTrue(self.save("recipe", recipe_base, listed,
+                                  opener=self.other)["ok"])
+
+        # 我也改了第 0 条（合并撞车）、把 product 摆上货架（互斥撞车）、
+        # 顺手改了第 1 条（这条谁也没碰，该进「未冲突」）。
+        mine = [dict(r) for r in rows]
+        mine[0]["price"] = 111
+        mine[1]["price"] = 333
+        mine.append({"id": product, "kind": "armor",
+                     "price": 500, "listed": True})
+        result = self.save("shop", shop_base, mine, cross_base=recipe_base)
+        self.assertFalse(result["ok"])
+        reasons = sorted(row["reason"] for row in result["conflicts"])
+        self.assertEqual(2, len(reasons), result["conflicts"])
+        self.assertTrue(any("合成" in r for r in reasons), reasons)
+        self.assertTrue(any("也改了" in r for r in reasons), reasons)
+        # 未冲突清单里**只有**那一条，不该混进互斥撞车的。
+        self.assertEqual(1, len(result["mergeable"]))
+        self.assertIn(str(rows[1]["id"]), result["mergeable"][0]["label"])
+
+    def test_对方在合成里上架的是别的东西不算撞车(self):
+        first = self.unlist_first_recipe()
+        shop_base = self.open_page("shop")
+        recipe_base = self.open_page("recipe")
+        theirs = [dict(r) for r in self.rows(recipe_base, "recipe")]
+        theirs[0]["listed"] = True                   # 对方上架的是 first
+        self.assertTrue(self.save("recipe", recipe_base, theirs,
+                                  opener=self.other)["ok"])
+        other_product = theirs[1]["result"]
+        self.assertNotEqual(first, other_product)
+        mine = [dict(r) for r in self.rows(shop_base)]
+        mine.append({"id": other_product, "kind": "armor",
+                     "price": 500, "listed": True})
+        self.assertTrue(self.save("shop", shop_base, mine,
+                                  cross_base=recipe_base)["ok"])
+
+    # ------------------------------------------------------------ 退路
+    def test_不带_base_就是老行为整份覆盖(self):
+        # 脚本 / 老页面还能用；`test_saving_takes_effect_without_a_restart`
+        # 那一组走的就是这条路。
+        base = self.open_page("shop")
+        rows = self.rows(base)
+        theirs = [dict(r) for r in rows]
+        theirs[0]["price"] = 222
+        self.assertTrue(self.save("shop", base, theirs,
+                                  opener=self.other)["ok"])
+        mine = [dict(r) for r in rows]
+        mine[0]["price"] = 111
+        result = self.request("/admin/api/config/shop", {"text": json.dumps(
+            {"format": shopcfg.FORMAT, "items": mine}, ensure_ascii=False)})[1]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(111, dict((r["id"], r["price"])
+                                   for r in self.on_disk())[rows[0]["id"]])
+
+    def test_坏掉的_base_退回整份覆盖而不是报错(self):
+        base = self.open_page("shop")
+        mine = [dict(r) for r in self.rows(base)]
+        mine[0]["price"] = 111
+        result = self.save("shop", "{ 这不是 json", mine)
+        self.assertTrue(result["ok"], result)
 
 
 class AdminAssetTests(_AdminCase):
