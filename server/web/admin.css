@@ -325,6 +325,12 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 .item-card .col { flex: 1 1 auto; min-width: 0; }
 .item-card .nm { display: flex; gap: 6px; align-items: center; }
 .item-card .nm input { flex: 1 1 auto; max-width: none; font-weight: 600; }
+/* 「商店目录」和「合成配方」上的中文名是**只读**的（改它去物品库，D31）：
+   画成一行加粗文字，别做成看着能点、点了没反应的输入框。 */
+.item-card .nm.ro, .recipe-out .nm.ro {
+  display: block; font-weight: 600; font-size: 15px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 /* 一行放不下就省略号 —— 让每张卡一样高，扫一列数字时眼睛才不用重新找位置。 */
 .item-card .meta {
   font-size: 12px; color: var(--cocoa-soft); margin: 3px 0 7px;

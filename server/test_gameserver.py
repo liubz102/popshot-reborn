@@ -2816,13 +2816,14 @@ class ShopControlCommandTests(unittest.TestCase):
         self.assertTrue(reply.startswith("ok"), reply)
         self.assertIn("1234", reply)
         self.assertIn("★穿着", reply)
-        self.assertIn(f"{self.BRONZE_PIPE} 청동파이프 ×5", reply)
+        # 没铺配置时退回 `item_name_zh()` 自己翻的那一份（韩文翻不出来才留韩文）。
+        self.assertIn(f"{self.BRONZE_PIPE} 青铜管 ×5", reply)
         self.assertIn(str(self.TOP_ARMOR), reply)
 
-    def test_the_item_label_prefers_the_chinese_name_from_shop_json(self):
-        # ★ 名字有两个来源：`shop.json` 的中文名（用户可改）优先，
-        #   退回 `shop_items.json` 里的原版韩文名。上一条用例走的是退回那一路
-        #   —— 跑测试时 `shopcfg` 指向空目录（见 `run_tests.py`），
+    def test_the_item_label_prefers_the_chinese_name_from_the_library(self):
+        # ★ 名字有两个来源：**物品库**里的中文名（管理页可改）优先，
+        #   退回 `item_name_zh()` 自己翻的那一份（翻不出来才是原版韩文名）。
+        #   跑测试时 `shopcfg` 指向空目录（见 `run_tests.py`），
         #   所以这里要自己铺一份配置才测得到「优先」那一路。
         import shopcfg
         tmp = tempfile.TemporaryDirectory()
@@ -2832,15 +2833,14 @@ class ShopControlCommandTests(unittest.TestCase):
         self.addCleanup(shopcfg.invalidate)
         self.addCleanup(setattr, shopcfg, "DATA_DIR", saved)
         shopcfg.write_json(
-            shopcfg.path_of(shopcfg.SHOP_FILENAME, tmp.name),
-            {"format": 1, "items": [{"id": self.BRONZE_PIPE, "name": "青铜管",
-                                     "kind": "material", "listed": False,
-                                     "price": 0, "level": 1, "days": 0}]})
+            shopcfg.path_of(shopcfg.ITEMS_FILENAME, tmp.name),
+            {"format": 1, "items": [{"id": self.BRONZE_PIPE,
+                                     "name": "我改的管子"}]})
         shopcfg.invalidate()
-        self.assertEqual(f"{self.BRONZE_PIPE} 青铜管",
+        self.assertEqual(f"{self.BRONZE_PIPE} 我改的管子",
                          gameserver._item_label(self.BRONZE_PIPE))
-        # 配置里没有的，退回原版韩文名；两边都没有就只剩一个数字。
-        self.assertEqual(f"{self.REVOLVER_R1} 리볼버 R1",
+        # 物品库里没有的，退回自动翻译；物品表里都没有的只剩一个数字。
+        self.assertEqual(f"{self.REVOLVER_R1} 左轮 极速1",
                          gameserver._item_label(self.REVOLVER_R1))
         self.assertEqual("9999999", gameserver._item_label(9999999))
 
@@ -3056,8 +3056,8 @@ class ShopProbeTests(unittest.TestCase):
     #: 真实的武器槽 1 分类（实机点「武器 → 武器1」发的就是它，§22）。
     WEAPON_SLOT1 = 0x60001
 
-    def shelf_reply(self, category, items):
-        with shop_config(items=items):
+    def shelf_reply(self, category, items, library=()):
+        with config_dir(shop=items, items=library):
             conn = self.make_conn()
             gameserver.Conn.on_game_packet(
                 conn, gameserver.OP_REQ_SHOP_ITEM_LIST,
@@ -3070,10 +3070,13 @@ class ShopProbeTests(unittest.TestCase):
         return parse_shop_item_list(bodies[0])
 
     def test_the_shelf_reply_carries_the_listed_items(self):
+        """★ 货架上的名字取**物品库**（D31）—— `shop.json` 里没有这个字段。"""
         pages, page, groups = self.shelf_reply(
             self.WEAPON_SLOT1,
-            [{"id": 1120041, "name": "左轮 R1", "listed": True, "price": 3000},
-             {"id": 1120051, "name": "没上架的", "listed": False, "price": 999}])
+            [{"id": 1120041, "listed": True, "price": 3000},
+             {"id": 1120051, "listed": False, "price": 999}],
+            library=[{"id": 1120041, "name": "左轮 R1", "level": 1},
+                     {"id": 1120051, "name": "没上架的", "level": 1}])
         self.assertEqual((1, 0), (pages, page))
         self.assertEqual([[(1120041, "左轮 R1", 3000)]], groups)
 
@@ -3084,7 +3087,7 @@ class ShopProbeTests(unittest.TestCase):
         当时服务端把它当「全部」⇒ 把整份货架倒了出来。正确行为是空货架。
         """
         pages, page, groups = self.shelf_reply(
-            0, [{"id": 1120041, "name": "左轮 R1", "listed": True,
+            0, [{"id": 1120041, "listed": True,
                  "price": 3000}])
         self.assertEqual((1, 0, []), (pages, page, groups))
 
@@ -3289,7 +3292,7 @@ class ShopBuyAndEquipTests(unittest.TestCase):
     # -- 买 -----------------------------------------------------------------
     def test_buying_takes_the_money_and_gives_the_item(self):
         self.give_money(10000)
-        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+        with shop_config([{"id": self.REVOLVER_R1,
                            "listed": True, "price": 3000}]):
             frames = self.buy(self.REVOLVER_R1)
         self.assertEqual(1, self.buy_ok(frames))
@@ -3311,14 +3314,14 @@ class ShopBuyAndEquipTests(unittest.TestCase):
     def test_the_price_comes_from_shop_json_not_from_the_packet(self):
         # 客户端只发 itemId，价格是我们自己查的 —— 管理页改了价，立刻生效。
         self.give_money(10000)
-        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+        with shop_config([{"id": self.REVOLVER_R1,
                            "listed": True, "price": 9999}]):
             self.buy(self.REVOLVER_R1)
         self.assertEqual(1, account_store.player_money(self.account()))
 
     def test_not_enough_money_buys_nothing(self):
         self.give_money(100)
-        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+        with shop_config([{"id": self.REVOLVER_R1,
                            "listed": True, "price": 3000}]):
             frames = self.buy(self.REVOLVER_R1)
         self.assertEqual(0, self.buy_ok(frames))
@@ -3333,9 +3336,9 @@ class ShopBuyAndEquipTests(unittest.TestCase):
         那是商店最难查的一种账（D12 的同一条道理）。
         """
         self.give_money(10000)
-        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+        with shop_config([{"id": self.REVOLVER_R1,
                            "listed": True, "price": 3000},
-                          {"id": self.REVOLVER_R2, "name": "没上架的",
+                          {"id": self.REVOLVER_R2,
                            "listed": False, "price": 3000}]):
             frames = self.buy(self.REVOLVER_R1, self.REVOLVER_R2)
         self.assertEqual(0, self.buy_ok(frames))
@@ -3346,7 +3349,7 @@ class ShopBuyAndEquipTests(unittest.TestCase):
     def test_buying_the_same_equipment_twice_is_refused(self):
         # 原版规则（失败文案 `이미 소지하고 있습니다`，§7）。
         self.give_money(10000)
-        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+        with shop_config([{"id": self.REVOLVER_R1,
                            "listed": True, "price": 3000}]):
             self.buy(self.REVOLVER_R1)
             frames = self.buy(self.REVOLVER_R1)
@@ -3356,7 +3359,7 @@ class ShopBuyAndEquipTests(unittest.TestCase):
     def test_a_level_gate_is_enforced_server_side(self):
         """★ D31：等级门槛来自**物品库**，不是商店目录。"""
         self.give_money(10000)
-        with config_dir(shop=[{"id": self.REVOLVER_R1, "name": "左轮 R1",
+        with config_dir(shop=[{"id": self.REVOLVER_R1,
                                "listed": True, "price": 3000}],
                         items=[{"id": self.REVOLVER_R1, "level": 50}]):
             frames = self.buy(self.REVOLVER_R1)
@@ -3374,21 +3377,21 @@ class ShopBuyAndEquipTests(unittest.TestCase):
         兜底也不能是 0，得是 6「内部错误」。
         """
         self.give_money(10000)
-        with config_dir(shop=[{"id": self.REVOLVER_R1, "name": "左轮 R1",
+        with config_dir(shop=[{"id": self.REVOLVER_R1,
                                "listed": True, "price": 3000},
-                              {"id": self.REVOLVER_R2, "name": "没上架的",
+                              {"id": self.REVOLVER_R2,
                                "listed": False, "price": 3000}],
                         items=[{"id": self.REVOLVER_R1, "level": 50}]):
             self.assertEqual(shop.BUY_REASON_LEVEL_LOW,
                              self.buy_reason(self.buy(self.REVOLVER_R1)))
             self.assertEqual(shop.BUY_REASON_INTERNAL,
                              self.buy_reason(self.buy(self.REVOLVER_R2)))
-        with shop_config([{"id": self.REVOLVER_R1, "name": "左轮 R1",
+        with shop_config([{"id": self.REVOLVER_R1,
                            "listed": True, "price": 3000}]):
             self.buy(self.REVOLVER_R1)                 # 第一次买成
             self.assertEqual(shop.BUY_REASON_ALREADY_OWNED,
                              self.buy_reason(self.buy(self.REVOLVER_R1)))
-        with shop_config([{"id": self.REVOLVER_R2, "name": "左轮 R2",
+        with shop_config([{"id": self.REVOLVER_R2,
                            "listed": True, "price": 999999}]):   # 买不起
             self.assertEqual(shop.BUY_REASON_NO_PIXEL,
                              self.buy_reason(self.buy(self.REVOLVER_R2)))
@@ -3403,7 +3406,7 @@ class ShopBuyAndEquipTests(unittest.TestCase):
         加的规矩，原版没有。
         """
         self.give_money(10000)
-        with shop_config([{"id": 2120041, "name": "卡希尔的左轮",
+        with shop_config([{"id": 2120041,
                            "listed": True, "price": 3000}]):
             frames = self.buy(2120041)          # 假账号的角色是 0（泰尔）
         self.assertEqual(1, self.buy_ok(frames))

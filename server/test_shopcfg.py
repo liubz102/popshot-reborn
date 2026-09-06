@@ -77,8 +77,7 @@ class EnsureFilesTests(_CfgCase):
         path = shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir)
         with open(path, "r", encoding="utf-8") as fp:
             data = json.load(fp)
-        data["items"] = [{"id": 1120041, "name": "我改过的名字",
-                          "listed": True, "price": 12345, "level": 7}]
+        data["items"] = [{"id": 1120041, "listed": True, "price": 12345}]
         shopcfg.write_json(path, data)
 
         self.assertEqual([], shopcfg.ensure_files(self.dir))
@@ -86,7 +85,7 @@ class EnsureFilesTests(_CfgCase):
         parsed, warnings = shopcfg.shop(self.dir)
         self.assertEqual([], warnings)
         self.assertEqual(12345, parsed[1120041]["price"])
-        self.assertEqual("我改过的名字", parsed[1120041]["name"])
+        self.assertTrue(parsed[1120041]["listed"])
 
     def test_generated_files_are_lf_without_bom(self):
         # 铁律 3：.json 一律 LF 无 BOM（服务端包要在 Linux 上跑）。
@@ -124,26 +123,40 @@ class BackfillTests(_CfgCase):
         self.assertEqual(before, open(path, "rb").read())
 
     def test_apply_adds_only_what_is_missing(self):
+        """★ 拿**物品库**试：它是最需要补齐的一份（用户 2026-09-06 报的
+        「材料 / 礼包筛出来是 0」就是这份文件少收了一批东西）。"""
         shopcfg.ensure_files(self.dir)
-        path = shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir)
+        path = shopcfg.path_of(shopcfg.ITEMS_FILENAME, self.dir)
         data = json.load(open(path, encoding="utf-8"))
         full = len(data["items"])
         dropped = data["items"].pop(0)
         # ★ 用户手改过的那一条必须原样留着 —— 这是整个函数存在的意义。
-        data["items"][0] = dict(data["items"][0], price=12345, name="我改的")
+        data["items"][0] = dict(data["items"][0], name="我改的")
         mine = data["items"][0]["id"]
-        # ★ 用户自己加的、默认表里根本没有的那一条也不能被吃掉。
-        data["items"].append({"id": 1990001, "name": "我加的", "listed": True,
-                              "price": 7, "level": 1, "days": 0})
         shopcfg.write_json(path, data)
         shopcfg.backfill_defaults(self.dir, apply=True)
         after = {e["id"]: e for e in
                  json.load(open(path, encoding="utf-8"))["items"]}
         self.assertIn(dropped["id"], after)                  # 补回来了
-        self.assertEqual(12345, after[mine]["price"])        # 改过的没被盖
-        self.assertEqual("我改的", after[mine]["name"])
-        self.assertEqual("我加的", after[1990001]["name"])   # 自己加的还在
-        self.assertEqual(full + 1, len(after))
+        self.assertEqual("我改的", after[mine]["name"])       # 改过的没被盖
+        self.assertEqual(full, len(after))
+
+    def test_apply_keeps_entries_the_default_table_never_had(self):
+        """★ 用户自己在商店目录里加的东西不能被补齐吃掉（铁律 11）。
+
+        `default_shop()` 只生成 D/R/F 武器，所以「一件自己加进去卖的铠甲」
+        正是默认表里没有的那种条目。
+        """
+        shopcfg.ensure_files(self.dir)
+        path = shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir)
+        data = json.load(open(path, encoding="utf-8"))
+        data["items"].append({"id": 1010001, "listed": True,
+                              "price": 7, "days": 0})
+        shopcfg.write_json(path, data)
+        shopcfg.backfill_defaults(self.dir, apply=True)
+        after = {e["id"]: e for e in
+                 json.load(open(path, encoding="utf-8"))["items"]}
+        self.assertEqual(7, after[1010001]["price"])
 
     #: 小物品表里没有成套的铠甲（韩文名带部位后缀的那种），所以
     #: `default_recipes()` 在这儿是空的 —— 配方那两条用例自带一份「默认表」。
@@ -343,9 +356,14 @@ class ValidateShopTests(_CfgCase):
         self.assertFalse(got[1120041]["listed"])       # 默认不上架
         self.assertEqual(0, got[1120041]["price"])
 
-    def test_name_defaults_to_translation(self):
-        got = self.ok({"id": 1120041})
-        self.assertEqual("左轮 极速1", got[1120041]["name"])
+    def test_no_name_here(self):
+        """★ D31：中文名的唯一出处是物品库，`shop.json` 里没有这个字段。
+
+        老文件里残留的 `name` 要被**丢掉**，不能原样带出来 —— 带出来的话
+        「在物品库里改了名字，商店里还是老名字」又会回来。
+        """
+        got = self.ok({"id": 1120041, "name": "老文件里的名字"})
+        self.assertNotIn("name", got[1120041])
 
     def test_kind_comes_from_shop_items_not_the_file(self):
         # 用户写错 kind 不该影响服务端判断 —— 以原版镜像为准。
@@ -479,12 +497,18 @@ class ValidateItemsTests(_CfgCase):
             shopcfg.validate_items({"items": [dict(self.BASE),
                                               dict(self.BASE)]})
 
-    def test_rejects_things_you_cannot_wear(self):
-        """★ 材料 / 消耗品没有「几级能穿」这回事 —— 客户端根本不读那两格。
+    def test_things_you_cannot_wear_keep_only_their_name(self):
+        """★ 物品库**收全部**能进背包的东西（用户 2026-09-06）—— 材料 / 礼包 /
+        消耗品也要有中文名，也要能在这一页上按类别筛出来。
 
-        收进来的唯一后果是让人以为设了个门槛，实际什么都没发生。
+        但「几级能穿 / 谁能穿」对它们没有意义（客户端根本不读那两格），
+        所以文件里就算写了也当没看见：等级一律 1，角色一律不限。
         """
-        self.bad("不占装备槽", id=30018)                # 青铜管（材料）
+        got = shopcfg.validate_items({"items": [
+            {"id": 30018, "name": "青铜管", "level": 5, "character": 1}]})
+        self.assertEqual("青铜管", got[30018]["name"])
+        self.assertEqual(1, got[30018]["level"])
+        self.assertIsNone(got[30018]["character"])
 
     def test_rejects_unknown_and_stock_only_ids(self):
         self.bad("不在 shop_items.json", id=999999)
@@ -575,11 +599,22 @@ class RealDefaultsTests(unittest.TestCase):
             self.assertEqual("weapon", entry["kind"])
             self.assertGreater(entry["price"], 0, "上架的东西不能白送")
 
-    def test_every_shop_name_is_chinese(self):
-        shop = shopcfg.validate_shop(shopcfg.default_shop())
-        for entry in shop.values():
-            self.assertTrue(any("一" <= ch <= "鿿" for ch in entry["name"]),
-                            "%d 的名字里没有中文：%s" % (entry["id"], entry["name"]))
+    def test_every_item_name_is_chinese(self):
+        """★ 中文名的唯一出处是**物品库**（D31），所以这一条查的是它。
+
+        物品库收全部 808 件能进背包的东西 —— 韩文名翻不出来的那几件
+        （原版数据里就没进 `NAME_ZH`）会退回韩文，这里只保证**默认表里
+        真的翻出来了中文**的那些不回退。
+        """
+        items = shopcfg.validate_items(shopcfg.default_items())
+        self.assertEqual(808, len(items), "物品库要收全部能进背包的东西")
+        for item_id in shopdata.ids_of_kind("weapon"):
+            item = shopdata.get(item_id)
+            if not item.ownable or not item.series:
+                continue
+            name = items[item_id]["name"]
+            self.assertTrue(any("一" <= ch <= "鿿" for ch in name),
+                            "%d 的名字里没有中文：%s" % (item_id, name))
 
     def test_recipes_are_valid_and_bounded(self):
         recipes = shopcfg.validate_recipes(shopcfg.default_recipes())
@@ -589,8 +624,8 @@ class RealDefaultsTests(unittest.TestCase):
             self.assertGreater(recipe["cost"], 0)
             # 一件装备的材料总量得在「刷十几局能凑齐」的量级，别劝退。
             total = sum(m["count"] for m in recipe["materials"])
-            self.assertLessEqual(total, 30, "%s 要 %d 个材料，太肝了"
-                                 % (recipe["name"], total))
+            self.assertLessEqual(total, 30, "配方 #%d 要 %d 个材料，太肝了"
+                                 % (recipe["id"], total))
 
     def test_recipe_results_are_equippable_armor(self):
         for recipe in shopcfg.validate_recipes(shopcfg.default_recipes()):
@@ -642,8 +677,8 @@ class RealDefaultsTests(unittest.TestCase):
         for recipe in shopcfg.validate_recipes(shopcfg.default_recipes()):
             category = shop.category_of(recipe["result"])
             self.assertIn(category, shop.COMPOSITION_CATEGORIES,
-                          "配方「%s」的产物归在 %#x，合成界面里点不到"
-                          % (recipe["name"], category))
+                          "配方 #%d 的产物归在 %#x，合成界面里点不到"
+                          % (recipe["id"], category))
 
     def test_every_recipe_material_can_actually_drop(self):
         """★ 配方要的材料必须有地方掉，否则那条配方永远合不出来。"""
@@ -652,8 +687,8 @@ class RealDefaultsTests(unittest.TestCase):
         for recipe in shopcfg.validate_recipes(shopcfg.default_recipes()):
             for material in recipe["materials"]:
                 self.assertIn(material["id"], droppable,
-                              "配方「%s」要 %d，但 drops.json 里没有任何规则掉它"
-                              % (recipe["name"], material["id"]))
+                              "配方 #%d 要 %d，但 drops.json 里没有任何规则掉它"
+                              % (recipe["id"], material["id"]))
 
 
 class SchemaTests(unittest.TestCase):

@@ -816,10 +816,21 @@ class AdminRoutes:
         #   （`shopcfg.SCHEMA[...]["help"]`）。⇒ 老文件里的 `_说明`
         #   会在第一次保存时消失，这是用户拍板要的。
         list_key = shopcfg.SCHEMA[which]["list_key"]
-        shopcfg.write_json(shopcfg.path_of(filename), {
-            "format": shopcfg.FORMAT,
-            list_key: parsed.get(list_key, []),
-        })
+        try:
+            shopcfg.write_json(shopcfg.path_of(filename), {
+                "format": shopcfg.FORMAT,
+                list_key: parsed.get(list_key, []),
+            })
+        except OSError as error:
+            # ★ 写不进去**不是**「服务器内部错误」，是一句人看得懂的话。
+            #   Windows 上最常见的一种：文件正开在编辑器里（サクラエディタ
+            #   默认独占打开），`os.replace` 当场 `PermissionError(13)`。
+            #   兜底那层只会打一行日志、回一句「请看服务端日志」——
+            #   用户根本猜不到要去关编辑器（2026-09-06 踩过）。
+            self._reply(False, f"写不进 {filename}（{error.strerror or error}）"
+                               "，没有保存。这个文件多半正被别的程序占着"
+                               "（编辑器打开了它？），关掉再存一次。")
+            return
         # 热重载本来靠 mtime，但 mtime 的粒度可能粗到看不出这一次改动
         # —— 存完直接把缓存丢掉，下一次读一定是新的。
         shopcfg.invalidate()
@@ -878,11 +889,13 @@ class AdminRoutes:
             return
         table, _warnings = shopcfg.shop()
         entry = table.get(item_id) or {}
+        # ★ 名字问**物品库**（D31）—— `shop.json` 里已经没有这个字段了。
+        rules, _more = shopcfg.items()
         self._send_json({
             "ok": True,
             "id": item.id,
             "kind": item.kind,
-            "name": entry.get("name") or item.name_kr or "",
+            "name": shopcfg.name_of(rules, item_id) or item.name_kr or "",
             "name_kr": item.name_kr or "",
             "desc": shopcfg.item_desc_zh(item),
             "part_flag": item.part_flag,
@@ -969,10 +982,12 @@ class AdminRoutes:
                         list(materials) + list(inventory)
                         if (table.get(item_id) or {}).get("listed"))
         if locked:
+            # 名字问**物品库**（D31）—— `shop.json` 里已经没有这个字段了。
+            rules, _more = shopcfg.items()
             self._reply(False,
                         "这些是商店在卖的东西，不能直接改（改金币和等级，"
                         "让玩家自己进商店买）：" + "、".join(
-                            f"{i} {(table.get(i) or {}).get('name') or ''}".strip()
+                            f"{i} {shopcfg.name_of(rules, i)}".strip()
                             for i in locked))
             return
         # ★ 装备类只有「有 / 没有」，数量没有意义（见 `stackable()`）：

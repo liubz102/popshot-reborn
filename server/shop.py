@@ -374,10 +374,14 @@ def shelf_page(category=CATEGORY_ALL, page=0, character=CHARACTER_ANY,
     （`+0x1c`）填成探针值（默认 `None` = 填 0）。
 
     ★ **划线原价一律等于售价** —— 我们不做打折，填别的会让提示框画出
-    「原价 → 现价」两个数（§31）。**说明**取 `shop.json` 里的中文名那一套
-    （`shopcfg.item_desc_zh`），翻不出来就发空串（提示框那块留白）。
+    「原价 → 现价」两个数（§31）。**名字**取物品库（`items.json`，D31），
+    **说明**取自动生成的那一套（`shopcfg.item_desc_zh`），翻不出来就发空串
+    （提示框那块留白）。
     """
     entries, warnings = shelf_entries(category, character, data_dir, order)
+    # ★ 警告不在这儿再收一遍 —— `shelf_entries` 已经把物品库那份带出来了，
+    #   加两次的话日志里同一句话会打两行。
+    rules, _more = shopcfg.items(data_dir)
     pages = page_count(len(entries))
     try:
         page = int(page)
@@ -387,7 +391,8 @@ def shelf_page(category=CATEGORY_ALL, page=0, character=CHARACTER_ANY,
     shown = entries[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
     groups = []
     for entry in shown:
-        stock = build_shop_stock(entry["id"], entry.get("name") or "",
+        stock = build_shop_stock(entry["id"],
+                                 shopcfg.name_of(rules, entry["id"]),
                                  entry.get("price", 0),
                                  note=shopcfg.item_desc_zh(
                                      shopdata.get(entry["id"])),
@@ -1017,15 +1022,13 @@ def item_info_of(item_id, name=None, level=0, character=_ORIGINAL, desc=""):
 def item_info_records(item_ids, data_dir=None):
     """一串 id → `(ItemInfo 字节表, 认不出来被跳掉的 id)`。
 
-    名字和等级门槛优先取 `shop.json`（管理页能改的那份），没有条目就退回
-    `shopcfg.item_name_zh()` 翻的中文名 + 等级 0。
+    名字、等级门槛、角色限定**全部取物品库**（`items.json`，D31）；物品库里
+    没登记就退回 `shopcfg.item_name_zh()` 翻的中文名 + 不限等级 + 原版角色。
 
-    ⚠ **等级发的是 `shop.json` 里那个购买门槛** —— 客户端拿它挡「穿上」
+    ⚠ **等级发的是物品库里那个门槛** —— 客户端拿它挡「穿上」
     （`0x445817`），发大了会让玩家「买到了却穿不上」。
     """
-    table, warnings = shopcfg.shop(data_dir)
-    rules, more = shopcfg.items(data_dir)
-    warnings = warnings + more
+    rules, warnings = shopcfg.items(data_dir)
     records = []
     skipped = []
     for raw in item_ids:
@@ -1034,15 +1037,11 @@ def item_info_records(item_ids, data_dir=None):
         except (TypeError, ValueError):
             skipped.append(raw)
             continue
-        entry = table.get(item_id)
         item = shopdata.get(item_id)
         if item is None:
             skipped.append(item_id)
             continue
-        # 名字优先取商店目录里那份（管理页能改），再退回物品库，最后自己翻。
-        rule = rules.get(item_id)
-        name = ((entry or {}).get("name") or (rule or {}).get("name")
-                or shopcfg.item_name_zh(item))
+        name = shopcfg.name_of(rules, item_id)
         level, character = shopcfg.rule_of(rules, item_id)
         record = item_info_of(item_id, name=name, level=level,
                               character=character,

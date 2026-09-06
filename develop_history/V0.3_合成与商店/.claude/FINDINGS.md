@@ -1419,3 +1419,26 @@ M7 动手前补的一轮（🔍静态，判据全在脱壳镜像上）。§27 �
 ★ **教训**：从原版资源里按名字分组时，「后缀表」是**观察到的**词汇，不是
 规范。写完要拿全表反查一遍「有多少件一个后缀都没匹配上」，别等界面上少了
 东西才发现 —— 这一条漏了 8 件，从 M1 一直躺到 M7 实机。
+
+---
+
+## §35 ★★★ 管理页「服务器内部错误」十有八九是**编辑器把 json 独占打开了**
+
+**结论**：`POST /admin/api/config/*` 回 500、日志里写
+`PermissionError(13, '拒绝访问。')`，原因不是代码，是 **`server/data/*.json`
+正开在 サクラエディタ 里**（它默认独占打开），`write_json` 的
+`os.replace` 撞上 Windows 的共享冲突。关掉编辑器里那个文件就好了。
+
+**怎么确认是哪个进程占着**（不用装 Sysinternals）：PowerShell 里调
+Restart Manager（`rstrtmgr.dll` 的 `RmStartSession` /
+`RmRegisterResources` / `RmGetList`），它直接回进程号 + 程序名。
+.NET 的 `[System.IO.File]::Open($p,'Open','ReadWrite','None')` 只能告诉你
+「被别的进程占着」，说不出是谁。
+
+**改了什么**：`_admin_config_post` 现在自己接住 `OSError`，回一句
+「写不进 xxx.json（…），这个文件多半正被别的程序占着（编辑器打开了它？）」。
+兜底那层 `except Exception` 只会打一行日志 + 回「请看服务端日志」——
+用户根本猜不到要去关编辑器。
+
+★ **教训**：凡是「写文件」的接口，`OSError` 都该有一句自己的话。
+把它交给通用兜底 = 把一个**用户能自己解决**的问题变成一个要看日志的问题。

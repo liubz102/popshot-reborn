@@ -6,14 +6,15 @@
 
 | 文件 | 管什么 |
 |---|---|
-| `items.json` | ★ **物品库**：等级门槛 + 角色限定的**唯一**出处（D31）|
-| `shop.json` | 哪些东西上架、卖多少钱、中文名 |
+| `items.json` | ★ **物品库**：中文名 + 等级门槛 + 角色限定的**唯一**出处（D31）|
+| `shop.json` | 哪些东西上架、卖多少钱 |
 | `recipe.json` | 合成配方（产物 / 花费 / **最多 4 种材料**）|
 | `drops.json` | 打完一局掉什么材料 |
 
-⚠ **等级和角色限定只在 `items.json` 里**。它们是**物品自己的**属性
-（客户端在「穿上」那一刻才读，`ItemInfo+0x1c` / `+0x24`），不是「这次买卖」
-或「这条配方」的属性 —— 分两处存必然对不上。
+⚠ **中文名、等级、角色限定只在 `items.json` 里**。它们是**物品自己的**属性
+（后两个客户端在「穿上」那一刻才读，`ItemInfo+0x1c` / `+0x24`），不是
+「这次买卖」或「这条配方」的属性 —— 分两处存必然对不上。
+查名字一律走 `name_of()` / `item_name()`，查门槛一律走 `rule_of()` / `item_rule()`。
 
 ## 和 `shopdata.py` 的分工（别搞混）
 
@@ -54,10 +55,10 @@ FORMAT = 1
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
-#: ★ **物品库**：等级门槛和角色限定的**唯一**出处（D31）。
-#: 以前这两样散在 `shop.json`（等级）和 `recipe.json`（角色）里，
-#: 结果「同一件东西在商店卖和靠合成拿，等级要求可以不一样」—— 那是没有意义的，
-#: 客户端只认 `ItemInfo` 里的一份。用户 2026-09-06 拍板搬到这里。
+#: ★ **物品库**：中文名、等级门槛、角色限定的**唯一**出处（D31）。
+#: 以前这几样散在 `shop.json`（等级 + 名字）和 `recipe.json`（角色 + 名字）里，
+#: 结果「同一件东西在商店卖和靠合成拿，等级要求和名字可以不一样」—— 那是没有
+#: 意义的，客户端只认 `ItemInfo` 里的一份。用户 2026-09-06 拍板搬到这里。
 ITEMS_FILENAME = "items.json"
 SHOP_FILENAME = "shop.json"
 RECIPE_FILENAME = "recipe.json"
@@ -82,8 +83,8 @@ class ConfigError(Exception):
 
 #: 韩文 → 中文。原版**没有中文物品名**：`ShopItem.ini` 一个名字字段都没有，
 #: 名字藏在图标文件名里，`Chinese.ini` 里也查不到（FINDINGS §5）。
-#: 所以这张表是**我们自己翻的**，用户可以在管理页里改（改的是 `shop.json`
-#: 的 `name`，这张表只在**首次生成**时用一次）。
+#: 所以这张表是**我们自己翻的**，用户可以在管理页的「物品库」里改（改的是
+#: `items.json` 的 `name`，这张表只在**首次生成**和「物品库里没登记」时用）。
 #:
 #: 有出处的两个：`초록구슬 = 绿色小珠`（`Chinese.ini` 里一整句消息里带出来的）、
 #: `청동파이프 = 青铜管`（`Promotion-chn.ini` 的 `TextReward`；同一个词在
@@ -357,7 +358,7 @@ WEAPON_LEVEL = {1: 5, 2: 10, 3: 18}
 
 
 # --------------------------------------------------------------------------
-# 物品库 items.json —— 等级门槛 + 角色限定的唯一出处（D31）
+# 物品库 items.json —— 中文名 + 等级门槛 + 角色限定的唯一出处（D31）
 # --------------------------------------------------------------------------
 
 #: 哪些物品有「等级 / 角色限定」这两栏。
@@ -368,6 +369,9 @@ WEAPON_LEVEL = {1: 5, 2: 10, 3: 18}
 #:   读了也没人用。按 `part_flag` 分正好把 `ring`（戒指）/ `dash`（冲刺）/
 #:   `pet` / `spray` / `title`（称号）这几类也一起收进来 —— 它们同样占槽位，
 #:   同样要这两栏，按类别名列白名单会漏掉它们。
+#:
+#: ⚠ 这**只决定有没有那两栏**，不决定「收不收进物品库」——
+#:   物品库收**全部**能进背包的东西（808 件），因为中文名人人都要一个。
 def has_level_and_character(item):
     """这件东西要不要「等级 / 角色限定」两栏。"""
     return bool(item is not None and item.ownable and item.part_flag)
@@ -376,13 +380,17 @@ def has_level_and_character(item):
 def default_items():
     """从 `shop_items.json` + 我们自己的定价表生成一份默认 `items.json`。
 
+    ★ **收全部能进背包的东西**（`ownable`，808 件）—— 中文名是每一件都有的
+    （材料、礼包、消耗品在管理页上也要认得出来）。等级和角色限定只给
+    **占装备槽**的那 734 件写（`has_level_and_character`）。
+
     等级的来路（**都是复活工程定的**，原版的随服务端 DB 一起没了）：
 
     * 武器 —— 按档次 `WEAPON_LEVEL`（和 `default_shop` 的价格表配套）；
     * 合成产物 —— `RECIPE_LINES` 里那条产线的档位；
     * 其余 —— `1`（不限）。
 
-    角色限定取原版数据（`shopdata` 的 `character`），`None` = 不限。
+    角色限定取原版数据（`shopdata` 的 `character`），键不写 = 不限。
     """
     levels = {}
     for _recipe, level in _recipe_seed():
@@ -391,17 +399,18 @@ def default_items():
     for kind in shopdata.kinds():
         for item_id in shopdata.ids_of_kind(kind):
             item = shopdata.get(item_id)
-            if not has_level_and_character(item):
+            if item is None or not item.ownable:
                 continue
-            if item_id in levels:
-                level = levels[item_id]
-            elif item.kind == "weapon" and item.series:
-                level = WEAPON_LEVEL.get(item.tier or 1, 5)
-            else:
-                level = 1
-            entry = {"id": item.id, "name": item_name_zh(item), "level": level}
-            if item.character is not None:
-                entry["character"] = int(item.character)
+            entry = {"id": item.id, "name": item_name_zh(item)}
+            if has_level_and_character(item):
+                if item_id in levels:
+                    entry["level"] = levels[item_id]
+                elif item.kind == "weapon" and item.series:
+                    entry["level"] = WEAPON_LEVEL.get(item.tier or 1, 5)
+                else:
+                    entry["level"] = 1
+                if item.character is not None:
+                    entry["character"] = int(item.character)
             entries.append(entry)
     entries.sort(key=lambda e: e["id"])
     return {"format": FORMAT, "items": entries}
@@ -424,20 +433,21 @@ def validate_items(raw):
         if item_id in out:
             raise ConfigError("%s：物品 %d 出现了两次" % (where, item_id))
         item = shopdata.get(item_id)
-        # ★ 穿不上身的东西没有等级 / 角色限定这回事 —— 收进来只会让人以为
-        #   「给材料设个 5 级就要 5 级才能捡」，而客户端根本不看。
-        if not has_level_and_character(item):
-            raise ConfigError(
-                "%s：%d（%s）不占装备槽，没有等级 / 角色限定这两栏"
-                % (where, item_id, KIND_ZH.get(item.kind, item.kind)))
-        character = entry.get("character")
-        if character is not None:
-            character = _as_int(character, where + ".character", low=0, high=2)
+        # ★ 穿不上身的东西（材料 / 消耗品 / 钥匙 / 礼包 / 角色卡）**只有中文名**
+        #   —— 文件里就算留着 level / character 也当没看见，免得有人以为
+        #   「给材料设个 5 级就要 5 级才能捡」，而客户端根本不看这两个字段。
+        level, character = 1, None
+        if has_level_and_character(item):
+            character = entry.get("character")
+            if character is not None:
+                character = _as_int(character, where + ".character",
+                                    low=0, high=2)
+            level = _as_int(entry.get("level", 1), where + ".level", low=1)
         out[item_id] = {
             "id": item_id,
             "name": str(entry.get("name") or item_name_zh(item)),
             "kind": item.kind,
-            "level": _as_int(entry.get("level", 1), where + ".level", low=1),
+            "level": level,
             "character": character,
         }
     return out
@@ -459,20 +469,39 @@ def rule_of(table, item_id):
     return 1, (None if item is None else item.character)
 
 
+def name_of(table, item_id):
+    """一件东西的中文名。★ **全服务端唯一该问名字的地方**（D31）。
+
+    `table` 是 `items()` 的结果；物品库里没登记就退回 `item_name_zh()`
+    自己翻的那一份（再翻不出来就是韩文名）。
+    """
+    entry = (table or {}).get(int(item_id))
+    if entry is not None and entry.get("name"):
+        return entry["name"]
+    return item_name_zh(shopdata.get(item_id))
+
+
 def item_rule(item_id, data_dir=None):
     """`rule_of` 的独立版本（自己去读一次配置）。**警告会被丢掉** ——
     要在日志里看到「配置读坏了」的调用点请自己调 `items()`。"""
     return rule_of(items(data_dir)[0], item_id)
 
 
+def item_name(item_id, data_dir=None):
+    """`name_of` 的独立版本（自己去读一次配置）。警告同样会被丢掉。"""
+    return name_of(items(data_dir)[0], item_id)
+
+
 def default_shop():
     """从 `shop_items.json` 生成一份默认 `shop.json`。
 
-    收三类东西（**都得 `ownable`**，只有货架条目的进不了背包，§11）：
+    ★ **只收 63 件 D/R/F 武器**（都得 `ownable`，只有货架条目的进不了背包，
+    §11）—— 这是本版商店的主体，也是唯一真的摆上货架的东西。
 
-    1. **63 件 D/R/F 武器** —— 上架，这是本版商店的主体；
-    2. **全部材料** —— 不上架（`listed=false`），收进来只是为了有个中文名；
-    3. **合成产物** —— 不上架，同上（它们靠合成获得，不卖）。
+    ⚠ 以前这里还会把**全部材料**和**合成产物**收进来（`listed=false`），
+    理由只有一个：「给它们一个中文名」。中文名搬进 `items.json` 之后
+    （D31）那个理由没了，再收 86 条空条目只会让「商店目录」这一页
+    看上去像个全物品表。要卖它们的话在管理页上「＋ 添加一条」就行。
     """
     entries = []
 
@@ -483,43 +512,9 @@ def default_shop():
         tier = item.tier or 1
         entries.append({
             "id": item.id,
-            "name": item_name_zh(item),
             "kind": "weapon",
             "listed": True,
             "price": WEAPON_PRICE.get(tier, 3000),
-            "days": 0,
-        })
-
-    for item_id in shopdata.ids_of_kind("material"):
-        item = shopdata.get(item_id)
-        if not item.ownable:
-            continue
-        entries.append({
-            "id": item.id,
-            "name": item_name_zh(item),
-            "kind": "material",
-            "listed": False,
-            "price": 0,
-            "days": 0,
-        })
-
-    # ★ 合成产物收进商店目录只是为了**有个中文名**，一律不上架
-    #   （`listed=False`）—— 它们靠合成拿，不卖。等级在 `items.json`（D31）。
-    seen = set(entry["id"] for entry in entries)
-    for recipe, _level in _recipe_seed():
-        item_id = recipe["result"]
-        if item_id in seen:
-            continue
-        item = shopdata.get(item_id)
-        if item is None:
-            continue
-        seen.add(item_id)
-        entries.append({
-            "id": item_id,
-            "name": recipe["name"],
-            "kind": item.kind,
-            "listed": False,
-            "price": 0,
             "days": 0,
         })
 
@@ -589,12 +584,12 @@ def _armor_sets():
 
 
 def _recipe_seed():
-    """`[(配方, 产物的装备等级)]` —— `default_recipes` 和 `default_shop` 共用。
+    """`[(配方, 产物的装备等级)]` —— `default_recipes` 和 `default_items` 共用。
 
     ★ **等级不进 `recipe.json`**（D27）：合成本身**没有等级门**（原版的合成
     面板从头到尾不读玩家等级，FINDINGS §33），`RECIPE_LINES` 里那个数是
-    **产物穿上时**的要求，归 `shop.json` 管。两处各留一份的话，改了一处
-    另一处不动，很快就对不上。
+    **产物穿上时**的要求，归 `items.json` 管（D31）。两处各留一份的话，
+    改了一处另一处不动，很快就对不上。
     """
     sets = _armor_sets()
     seed = []
@@ -616,7 +611,6 @@ def _recipe_seed():
                 seed.append(({
                     "id": next_id,
                     "result": item.id,
-                    "name": item_name_zh(item),
                     "listed": True,
                     "cost": weight * gold_per_point,
                     "days": 0,
@@ -758,8 +752,10 @@ def _check_item_id(item_id, name):
 def validate_shop(raw):
     """`shop.json` → `{itemId: 条目}`；有一条不对就抛 `ConfigError`。
 
-    ⚠ **这里没有 `level`**（D31）：等级门槛搬去 `items.json` 了 ——
-    同一件东西在商店买和靠合成拿，等级要求不可能不一样，客户端只认一份。
+    ⚠ **这里没有 `level`、也没有 `name`**（D31）：等级门槛和中文名都搬去
+    `items.json` 了 —— 同一件东西在商店买和靠合成拿，穿上它的条件和它叫
+    什么名字都只有一份，客户端也只认一份。老文件里残留的键在这儿被丢掉，
+    不报错。
     """
     if not isinstance(raw, dict):
         raise ConfigError("shop.json 的最外层必须是一个对象")
@@ -780,7 +776,6 @@ def validate_shop(raw):
         item = shopdata.get(item_id)
         out[item_id] = {
             "id": item_id,
-            "name": str(entry.get("name") or item_name_zh(item)),
             "kind": item.kind,
             "listed": bool(entry.get("listed", False)),
             "price": _as_int(entry.get("price", 0), where + ".price", low=0),
@@ -845,16 +840,15 @@ def validate_recipes(raw):
                                  spot + ".count", low=1, high=800),
             })
 
-        # ★ **配方既没有 `level` 也没有 `character`**：
+        # ★ **配方没有 `level`、没有 `character`、也没有 `name`**：
         #   · 等级 —— 原版的合成面板从头到尾不读玩家等级，`0x0506` 的结果码里
         #     也没有「等级太低」这一档（D27）；
-        #   · 角色限定 —— 那是**物品自己的**属性，不是「这条配方」的属性
-        #     （D31）。两处各存一份必然对不上。
-        #   两个键都在 `items.json` 里；老文件里残留的在这儿被丢掉，不报错。
+        #   · 角色限定 —— 那是**物品自己的**属性，不是「这条配方」的属性；
+        #   · 中文名 —— 同上，「产物叫什么」不随「怎么拿到它」变（D31）。
+        #   三个键都在 `items.json` 里；老文件里残留的在这儿被丢掉，不报错。
         out.append({
             "id": recipe_id,
             "result": result,
-            "name": str(entry.get("name") or item_name_zh(shopdata.get(result))),
             "listed": bool(entry.get("listed", True)),
             "cost": _as_int(entry.get("cost", 0), where + ".cost", low=0),
             "days": _as_int(entry.get("days", 0), where + ".days", low=0),
@@ -931,7 +925,7 @@ def validate_drops(raw):
 # `optional` = 这个键可以整个不出现在 json 里（前台留空就不写）。
 # `readonly` = 只读展示，值由别的字段推出来（比如 `kind` 由 `id` 决定）。
 
-#: 三份配置各自的：列表键、标题、页面上的说明、字段表。
+#: 四份配置各自的：列表键、标题、页面上的说明、字段表。
 #:
 #: ★ `help` 就是原来写在 json 里那几行 `_说明` —— 用户拍板搬到页面上、
 #:   不再写进文件（D16）。
@@ -942,15 +936,19 @@ SCHEMA = {
         "unit": "件物品",
         "help": [
             "改完保存即刻生效，不用重启服务端。",
-            "★ 这里是**等级门槛和角色限定的唯一出处** —— 「商店目录」和"
-            "「合成配方」里都不再有这两栏。同一件东西不管是买来的还是合成的，"
-            "穿上它的条件只有一份。",
-            "★ 只收**占装备槽**的东西（铠甲 / 武器 / 戒指 / 冲刺 / 宠物 / "
-            "喷漆 / 称号）。材料、消耗品这些穿不上身，客户端根本不看这两个字段。",
+            "★ 这里是**中文名、等级门槛、角色限定的唯一出处** —— 「商店目录」"
+            "和「合成配方」里都不再有这三栏。同一件东西不管是买来的还是合成的，"
+            "它叫什么、几级能穿、谁能穿，都只有一份。",
+            "★ 这一页收**全部能进背包的物品**（包括材料 / 礼包 / 消耗品 / "
+            "角色卡）。但 等级 和 角色限定 只给**占装备槽**的东西"
+            "（铠甲 / 武器 / 戒指 / 冲刺 / 宠物 / 喷漆 / 称号）—— 别的穿不上身，"
+            "客户端根本不看这两个字段，所以那些卡片上没有这两个框。",
             "等级是**穿上时**的门槛，由客户端自己判（买和合成都不拦）；"
             "角色限定留空 = 谁都能穿。",
             "⚠ 角色限定改宽了只是让别的角色**能穿**，模型和贴图还是原来那个"
             "角色的 —— 原版的装备本来就是一人一套。",
+            "每张卡片右上角写着它现在在哪儿上架（商店 / 合成 / 未上架），"
+            "上架内容在「商店目录」和「合成配方」两页改。",
         ],
         "fields": [
             {"key": "id", "label": "物品", "type": "item"},
@@ -972,18 +970,18 @@ SCHEMA = {
         "unit": "件商品",
         "help": [
             "改完保存即刻生效，不用重启服务端。",
-            "「上架」关掉的不摆上货架（材料和合成产物收在这里只是为了有个中文名）。",
+            "这一页就是**货架**：列在这儿的才有可能被卖，「上架」关掉的收着不摆。"
+            "要卖新东西按下面的「＋ 添加一条」挑。",
             "价格是金币（原版的「픽셀」，中文版译作金币）。天数 0 = 永久。",
             "★ 只能选客户端认识、且能进背包的物品 —— 别的发下去界面上是个空格子。",
-            "★ **等级和角色限定在「物品库」里改**，这一页没有那两栏（D31）。",
+            "★ **中文名、等级、角色限定都在「物品库」里改**，这一页没有那三栏"
+            "（D31）。卡片上的名字是物品库里那一份，点不动。",
             "★ 商店和合成**二选一**：一件东西在这里上架，就会自动从合成里下架。",
         ],
         "fields": [
             {"key": "id", "label": "物品", "type": "item"},
             {"key": "kind", "label": "类别", "type": "text", "readonly": True,
              "help": "由物品本身决定，改不了"},
-            {"key": "name", "label": "中文名", "type": "text",
-             "help": "原版没有中文物品名，这一份是复活工程自己翻的，随便改"},
             {"key": "price", "label": "价格", "type": "int", "min": 0,
              "suffix": "金币"},
             {"key": "days", "label": "天数", "type": "int", "min": 0,
@@ -1006,7 +1004,8 @@ SCHEMA = {
             "—— **没有武器**，武器产物只能在「新商品」里找得到。",
             "★ 配方**没有等级要求** —— 原版的合成面板不看等级，"
             "上架的配方所有人都看得到、也合得出来。"
-            "产物穿上时的等级门槛和角色限定在「物品库」那一页改（D31）。",
+            "产物的中文名、穿上时的等级门槛和角色限定都在「物品库」那一页改"
+            "（D31）；卡片上的名字是物品库里那一份，点不动。",
             "★ 商店和合成**二选一**：一件东西在这里上架，就会自动从商店里下架。",
             "原版配方随 2009 年停服的服务端一起没了，这一份是复活工程自己设计的，随便改。",
         ],
@@ -1014,7 +1013,6 @@ SCHEMA = {
             {"key": "id", "label": "配方号", "type": "int", "min": 1,
              "readonly": True, "help": "自动编号"},
             {"key": "result", "label": "产物", "type": "item"},
-            {"key": "name", "label": "中文名", "type": "text"},
             {"key": "materials", "label": "材料", "type": "materials",
              "max": MAX_MATERIALS, "fields": [
                  {"key": "id", "label": "材料", "type": "item",
@@ -1191,7 +1189,7 @@ def write_json(path, data):
 
 
 def ensure_files(data_dir=None):
-    """三份配置不存在就生成，**已存在一律不覆盖**（D7）。返回新建了哪几个。
+    """四份配置不存在就生成，**已存在一律不覆盖**（D7）。返回新建了哪几个。
 
     ★ 这是**唯一会自动写**这三个文件的地方。云上升级时用户手改过的价格 /
     配方 / 掉落必须原样留着 —— 覆盖它们等于把运营数据抹了（铁律 11）。
@@ -1219,6 +1217,9 @@ def ensure_files(data_dir=None):
 #: ★ `drops.json` 不在里面：一条掉落规则没有天然主键（同一种材料可以有
 #:   好几条不同关卡 / 难度的规则），「有没有」判不出来，补齐只会补出重复。
 BACKFILL_KEYS = {
+    #: ★ 物品库尤其要它：物品表里加进来的东西、以前漏收的类别，
+    #:   都只能靠这里补 —— 「物品库列不全」正是用户 2026-09-06 报的问题。
+    ITEMS_FILENAME: ("items", "id"),
     SHOP_FILENAME: ("items", "id"),
     #: ★ 配方按**产物**认身份，不是配方号 —— 一个产物只能有一条配方
     #:   （`0x0606` 只带产物 id，FINDINGS §27），配方号只是行号。

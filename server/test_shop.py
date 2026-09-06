@@ -386,12 +386,12 @@ class ShelfTests(_ShopCase):
 
     def listed(self, *ids, **kw):
         price = kw.pop("price", 100)
-        return [{"id": i, "name": "商品%d" % i, "listed": True, "price": price}
+        return [{"id": i, "listed": True, "price": price}
                 for i in ids]
 
     def test_只发上架的(self):
         items = self.listed(1120041) + [
-            {"id": 1120051, "name": "下架的", "listed": False, "price": 1}]
+            {"id": 1120051, "listed": False, "price": 1}]
         with shop_config(items):
             entries, warnings = shop.shelf_entries()
         self.assertEqual([], warnings)
@@ -490,7 +490,7 @@ class ShelfTests(_ShopCase):
         `ShopStock+0x10` 是**划线原价**，客户端拿它和售价比，不相等就画成
         「原价 → 现价」（`0x45c354`）。不做打折就得如实等于售价（§31）。
         """
-        with shop_config([{"id": 1120041, "name": "左轮", "listed": True,
+        with shop_config([{"id": 1120041, "listed": True,
                            "price": 3000}]):
             body, _, _ = shop.shelf_page()
         wire = _Wire(body)
@@ -503,14 +503,14 @@ class ShelfTests(_ShopCase):
     def test_货架条目带说明(self):
         # 提示框下半那块（`ShopStock+0x18`，§31）。原版的说明随服务端 DB
         # 没了，这里发的是**从本地数据现算**的（伤害 / 加成）。
-        with shop_config([{"id": 1120041, "name": "左轮", "listed": True,
+        with shop_config([{"id": 1120041, "listed": True,
                            "price": 3000}]):
             body, _, _ = shop.shelf_page()
         self.assertIn("伤害 4".encode("utf-16le"), body)
 
     def test_价格和名字来自_shop_json(self):
         # ★ PLAN M5：价格只信 `shop.json`，包里的任何数值都不作数。
-        with shop_config([{"id": 1120041, "name": "左轮 极速1",
+        with shop_config([{"id": 1120041,
                            "listed": True, "price": 3000}]):
             body, _, _ = shop.shelf_page()
         _, _, groups = parse_shop_item_list(body)
@@ -524,7 +524,7 @@ class SortTests(_ShopCase):
     """
 
     def listed(self, *ids):
-        return [{"id": i, "name": "商品%d" % i, "listed": True, "price": 100}
+        return [{"id": i, "listed": True, "price": 100}
                 for i in ids]
 
     #: 小表的插入顺序（= `catalog_index`）：1010001 · 1020001 · 1990001 ·
@@ -571,8 +571,8 @@ class SortTests(_ShopCase):
 
     def test_排序是全序_不然翻页会重复或漏格(self):
         """目录名次相同（两件都不在物品表里）时还要按 id 兜底。"""
-        entries = [{"id": 999999002, "name": "甲", "listed": True, "price": 1},
-                   {"id": 999999001, "name": "乙", "listed": True, "price": 1}]
+        entries = [{"id": 999999002, "listed": True, "price": 1},
+                   {"id": 999999001, "listed": True, "price": 1}]
         self.assertEqual(shopdata.catalog_index(999999001),
                          shopdata.catalog_index(999999002))
         ordered = shop.sort_entries(entries, shop.SORT_RELEASE)
@@ -689,8 +689,7 @@ class PacketTests(_ShopCase):
 
     def test_买别的角色的装备不拦(self):
         """商店上方那排角色箭头就是给「替别的角色买」用的（§30）。"""
-        table = {2120041: {"id": 2120041, "name": "卡希尔的枪",
-                           "listed": True, "price": 100, "level": 1}}
+        table = {2120041: {"id": 2120041, "listed": True, "price": 100}}
         entry, why = shop.check_purchase(2120041, table, level=10, owned=set())
         self.assertIsNone(why)
         self.assertIs(table[2120041], entry)
@@ -762,15 +761,16 @@ class ItemInfoTests(_ShopCase):
         record = parse_rep_item_info(shop.build_rep_item_info(records))[0][0]
         self.assertEqual(shop.CHARACTER_UNLIMITED, record["character"])
 
-    def test_名字取自_shop_json_等级和角色取自物品库(self):
-        """★ D31：等级和角色限定的唯一出处是 `items.json`。
+    def test_名字等级和角色全都取自物品库(self):
+        """★ D31：中文名、等级门槛、角色限定的唯一出处都是 `items.json`。
 
-        名字仍然优先取商店目录里那份（管理页在那儿改），但**等级和角色
-        限定只认物品库** —— 同一件东西买来的和合成的不可能是两个门槛。
+        `shop.json` 里就算还留着一个老名字也不作数 —— 同一件东西买来的和
+        合成的不可能是两个名字、两个门槛。
         """
-        with config_dir(shop=[{"id": 1120041, "name": "左轮 爆裂1",
+        with config_dir(shop=[{"id": 1120041, "name": "老名字",
                                "listed": True, "price": 3000}],
-                        items=[{"id": 1120041, "level": 5, "character": 1}]):
+                        items=[{"id": 1120041, "name": "左轮 爆裂1",
+                                "level": 5, "character": 1}]):
             records, _, _ = shop.item_info_records([1120041])
         record = parse_rep_item_info(shop.build_rep_item_info(records))[0][0]
         self.assertEqual("左轮 爆裂1", record["name"])
@@ -780,10 +780,10 @@ class ItemInfoTests(_ShopCase):
         self.assertEqual(1, record["character"])
 
     def test_物品库没登记就退回原版数据(self):
-        with config_dir(shop=[{"id": 1120041, "name": "左轮 爆裂1",
-                               "listed": True, "price": 3000}]):
+        with config_dir(shop=[{"id": 1120041, "listed": True, "price": 3000}]):
             records, _, _ = shop.item_info_records([1120041])
         record = parse_rep_item_info(shop.build_rep_item_info(records))[0][0]
+        self.assertEqual("左轮 极速1", record["name"])   # 自动翻的那一份
         self.assertEqual(1, record["level"])          # 不限等级
         self.assertEqual(0, record["character"])      # 原版数据里的角色
 

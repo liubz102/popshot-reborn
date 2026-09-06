@@ -10454,16 +10454,15 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
 
 
 def _item_label(item_id):
-    """调试输出用的物品名：优先 `shop.json` 里的中文名，退回原版韩文名。
+    """调试输出用的物品名：优先**物品库**里的中文名（D31），退回原版韩文名。
 
     只给控制通道用 —— 玩家看到的名字是客户端自己按 itemId 查本地表画的，
     服务端这边下发不了名字。
     """
     item_id = int(item_id)
-    table, _warnings = shopcfg.shop()
-    entry = table.get(item_id)
-    if entry and entry.get("name"):
-        return f"{item_id} {entry['name']}"
+    name = shopcfg.item_name(item_id)
+    if name:
+        return f"{item_id} {name}"
     item = shopdata.get(item_id)
     if item is not None and item.name_kr:
         return f"{item_id} {item.name_kr}"

@@ -118,16 +118,22 @@ function slotNode(itemId, px, listed, clickable) {
 function itemLabel(itemId) {
   var item = BYID[itemId];
   if (!item) { return "#" + itemId + "（物品表里没有这个 id）"; }
-  var bits = [item.name];
-  if (item.name_kr && item.name_kr !== item.name) { bits.push(item.name_kr); }
+  var bits = [itemName(itemId)];
+  if (item.name_kr && item.name_kr !== itemName(itemId)) { bits.push(item.name_kr); }
   return bits.join(" / ") + "  #" + item.id;
 }
 
-function itemMeta(itemId) {
+/** 「类别 · 角色 · 系列级别」。
+ *
+ * `skipCharacter` 给**物品库**用：那一页的卡片上就摆着「角色限定」下拉框，
+ * 这行小字再写一个原版角色，两个数对不上时人只会更糊涂（管理员刚把它
+ * 改成「不限」，小字还写着「泰尔」）。
+ */
+function itemMeta(itemId, skipCharacter) {
   var item = BYID[itemId];
   if (!item) { return "★ 物品表里没有这个 id"; }
   var bits = [CAT.kinds[item.kind] || item.kind];
-  if (item.character !== undefined) {
+  if (item.character !== undefined && !skipCharacter) {
     bits.push(CAT.characters[String(item.character)] || ("角色" + item.character));
   }
   if (item.series) {
@@ -206,9 +212,11 @@ function paintTip(itemId) {
     art.appendChild(el("div", "noicon", "?"));
   }
   box.appendChild(art);
-  box.appendChild(el("div", "t-name", (item && item.name) || ("#" + itemId)));
+  box.appendChild(el("div", "t-name", itemName(itemId)));
   box.appendChild(el("div", "t-meta", itemMeta(itemId) + "　#" + itemId));
-  if (item && item.name_kr && item.name_kr !== item.name) {
+  // ★ 韩文原名**只在浮窗里**画：物品库的卡片上那一行放不下，会把上架状态
+  //   挤掉（用户 2026-09-06）。要看原名把鼠标停上去就有。
+  if (item && item.name_kr && item.name_kr !== itemName(itemId)) {
     box.appendChild(el("div", "t-meta", item.name_kr));
   }
   if (item && item.desc) {
@@ -242,7 +250,7 @@ function paintTip(itemId) {
     shop.appendChild(el("span", "on", "★ 合成产出"));
     shop.appendChild(el("span", null, ((recipe && recipe.cost) || 0) + " 金币"));
     ((recipe && recipe.materials) || []).forEach(function (need) {
-      var name = (BYID[need.id] && BYID[need.id].name) || ("#" + need.id);
+      var name = itemName(need.id);
       shop.appendChild(el("span", null, name + "×" + need.count));
     });
   } else {
@@ -262,13 +270,36 @@ function recipeOf(itemId) {
   return found;
 }
 
+/** `itemId` → 物品库里那一条。
+ *
+ * ★ 这是一张**索引**，不是每次现扫一遍 —— 物品库有 800 多条，而
+ *   `matches()` 会对每一条记录问一次「它的角色限定是什么」，现扫就是
+ *   80 万次比较。索引在 `loadConfig("items")` 里重建（那是**唯一**会
+ *   换掉 `entries` 数组的地方）；卡片上改名字 / 改等级是**就地改**同一个
+ *   对象，索引里指着的就是它，不会过期。
+ */
+var ITEMS_BY_ID = {};
+
+function reindexItems() {
+  ITEMS_BY_ID = {};
+  ((CFG.items && CFG.items.entries) || []).forEach(function (entry) {
+    if (entry && entry.id !== undefined) { ITEMS_BY_ID[Number(entry.id)] = entry; }
+  });
+}
+
+/** 这件东西的中文名。★ **唯一出处是物品库**（D31）；物品库里没登记就退回
+    物品表里自动翻的那一份（和服务端 `shopcfg.name_of()` 同一条退路）。 */
+function itemName(itemId) {
+  var entry = ITEMS_BY_ID[Number(itemId)];
+  if (entry && entry.name) { return entry.name; }
+  var item = BYID[itemId];
+  return (item && item.name) || ("#" + itemId);
+}
+
 /** 物品库里登记的等级 / 角色限定。没登记就退回原版数据（和服务端
     `shopcfg.rule_of()` 同一条退路），并且**说出来是退回来的**。 */
 function itemRuleOf(itemId) {
-  var found = null;
-  ((CFG.items && CFG.items.entries) || []).forEach(function (entry) {
-    if (entry && Number(entry.id) === Number(itemId)) { found = entry; }
-  });
+  var found = ITEMS_BY_ID[Number(itemId)];
   if (found) {
     return {level: Number(found.level) || 1,
             character: (found.character === undefined
@@ -546,8 +577,50 @@ async function loadConfig(which) {
     // 老文件里可能还留着 `_说明`。保存后它会消失（D16），先说一声。
     hadNotes: Object.keys(raw).some(function (k) { return k.charAt(0) === "_"; })
   };
+  if (which === "items") {
+    fillItems();
+    reindexItems();
+  }
   CFG[which].snapshot = snapshot(which);
   return true;
+}
+
+/** 物品库**永远是全物品表**：文件里缺的那几条现补一条默认的，
+ *  穿不上身却带着 `level` / `character` 的把那两个键抹掉。
+ *
+ * ★ 为什么在前台补而不是让服务端补：服务端**从不回写配置**（D10）——
+ *   文件是用户的，它只读、只校验。而页面必须能列出全部 808 件东西
+ *   （用户 2026-09-06：「材料 / 礼包 / 消耗品筛出来是 0」），
+ *   所以缺的这一段只能在这儿补齐，等用户按保存时一起落盘。
+ * ★ 在 `snapshot()` **之前**做完 ⇒ 一进页面不会莫名其妙显示「有未保存的修改」。
+ */
+function fillItems() {
+  var have = {};
+  // ★ **文件里原来的顺序原样留着**，缺的补在末尾 —— 保存时才不会平白
+  //   把整份 json 重排一遍（那种 diff 谁也看不出到底改了什么）。
+  CFG.items.entries.forEach(function (entry) {
+    if (entry && entry.id !== undefined) { have[Number(entry.id)] = entry; }
+  });
+  CAT.items.forEach(function (item) {
+    if (have[item.id] === undefined) {
+      CFG.items.entries.push({id: item.id, name: item.name});
+      have[item.id] = null;               // 占个位，别重复补
+    }
+  });
+  CFG.items.entries.forEach(function (entry) {
+    if (!entry || entry.id === undefined) { return; }
+    var item = BYID[Number(entry.id)];
+    if (item && item.part_flag) {
+      if (entry.level === undefined) { entry.level = 1; }
+    } else {
+      // 穿不上身的东西客户端根本不读这两个字段
+      // （`shopcfg.has_level_and_character`），留在文件里只会让人以为它有用。
+      delete entry.level;
+      delete entry.character;
+    }
+  });
+  // ★ 物品表里没有的 id **不偷偷删**：服务端会拒收整份文件并指出是哪一条，
+  //   比它从页面上悄悄消失强。
 }
 
 function collect(which) {
@@ -559,17 +632,18 @@ function collect(which) {
 
 /** 商店和合成**互斥**（用户 2026-09-06）：一件东西不能两边都上架。
  *
- * 返回 `true` = 可以往下存。撞车时弹一句话问清楚，管理员点「确定」就
- * **把另一边那些条目的 `listed` 关掉**（连带那一份也一起存）。
+ * 这一发只**找出**另一边那些跟着撞车的条目（`[{entry, id}]`），
+ * 关不关它们的 `listed` 由 `saveConfig` 在**自己这一份存成功之后**决定
+ * （D33 —— 顺序反过来的话，写不进文件时会落到「两边都没有」）。
  *
  * ★ 为什么在前台做而不是让服务端拒收：服务端一次只收一份文件，
  *   「先存哪一份」都会在中间那一刻出现「两边都上架」而被拒 —— 那是个
  *   解不开的死结。前台手里两份都有，能一次把话说完再一起存。
  *   （服务端那道 `validate_*` 一个字没动，还是最后的护栏。）
  */
-async function resolveListingClash(which) {
+function listingClash(which) {
   var other = (which === "shop") ? "recipe" : "shop";
-  if (!CFG[other]) { return true; }
+  if (!CFG[other]) { return []; }
   var mine = {};
   CFG[which].entries.forEach(function (entry) {
     if (entry && entry.listed) {
@@ -582,26 +656,25 @@ async function resolveListingClash(which) {
     var id = Number(other === "shop" ? entry.id : entry.result);
     if (mine[id]) { clash.push({entry: entry, id: id}); }
   });
-  if (!clash.length) { return true; }
+  return clash;
+}
+
+/** 撞车了就问一句；管理员点「取消」返回 `false`。 */
+function confirmClash(which, clash) {
   var names = clash.map(function (row) {
-    return "· " + ((BYID[row.id] && BYID[row.id].name) || ("#" + row.id));
+    return "· " + itemName(row.id);
   }).join("\n");
   var question = (which === "shop")
     ? "以下物品已在合成中上架，若继续选择在商店上架，则自动下架合成。\n\n"
     : "以下物品已在商店上架，若继续选择在合成中上架，则自动下架商店。\n\n";
-  if (!window.confirm(question + names)) { return false; }
-  clash.forEach(function (row) { row.entry.listed = false; });
-  // ★ **先存另一边**：这一份存进去之后，另一份如果存失败，画面上还留着
-  //   「有未保存的修改」，人看得见。反过来（先存自己）失败的那一份是
-  //   刚被我们改过的，用户根本没动过，更容易被忽略。
-  var saved = await saveConfig(other, true);
-  if (!saved) { return false; }
-  return true;
+  return window.confirm(question + names);
 }
 
 async function saveConfig(which, skipClashCheck) {
+  var clash = [];
   if (!skipClashCheck && (which === "shop" || which === "recipe")) {
-    if (!(await resolveListingClash(which))) {
+    clash = listingClash(which);
+    if (clash.length && !confirmClash(which, clash)) {
       say($("cfgMsg"), "已取消，什么都没保存。", false);
       return false;
     }
@@ -611,17 +684,35 @@ async function saveConfig(which, skipClashCheck) {
   var result = await api("/admin/api/config/" + which,
                          {text: JSON.stringify(collect(which), null, 2)});
   if (bounced(result)) { return false; }
-  if (result.ok) {
-    CFG[which].snapshot = snapshot(which);
-    CFG[which].hadNotes = false;
-    CFG[which].warnings = [];
-    renderCurrent();
-    say($("cfgMsg"), result.message, true);
-    return true;
+  if (!result.ok) {
+    say($("cfgMsg"), CAT.schema[which].title + "：" + result.message, false);
+    if (which === CURRENT) { markBadCard(result.message); }
+    return false;
   }
-  say($("cfgMsg"), which + "：" + result.message, false);
-  if (which === CURRENT) { markBadCard(result.message); }
-  return false;
+  CFG[which].snapshot = snapshot(which);
+  CFG[which].hadNotes = false;
+  CFG[which].warnings = [];
+  renderCurrent();
+  say($("cfgMsg"), result.message, true);
+
+  // ★ **这一份存成功了才去动另一边**（2026-09-06 改的顺序）：
+  //   反过来先存另一边的话，只要自己这一份存失败（文件被编辑器占着就会），
+  //   那件东西就变成「合成里已经下架、商店里没存上」—— 两头都没有，
+  //   而管理员看到的只是一句报错，根本想不到东西已经从合成里没了。
+  //   现在最坏的结果是「两边都还上着架」，下次按保存会再问一遍、还能救。
+  if (clash.length) {
+    var other = (which === "shop") ? "recipe" : "shop";
+    clash.forEach(function (row) { row.entry.listed = false; });
+    if (!(await saveConfig(other, true))) {
+      say($("cfgMsg"), CAT.schema[which].title + "已保存，但「"
+          + CAT.schema[other].title + "」的自动下架没能存进去 —— "
+          + "这件东西现在两边都上着架。切到那一页按一次保存。", false);
+      return false;
+    }
+    say($("cfgMsg"), "已保存，并把 " + clash.length + " 件东西从「"
+        + CAT.schema[other].title + "」下架了。", true);
+  }
+  return true;
 }
 
 /** 服务端的错误里带着下标（`recipes[3].materials[1].id：…`），定位过去。 */
@@ -675,6 +766,9 @@ function renderCurrent() {
                + "下次保存会把它从文件里去掉。");
   }
   say($("cfgMsg"), notes.join("\n"), false);
+
+  // ★ 物品库没有「＋ 添加一条」：条目由 `shop_items.json` 定死，加不出新物品。
+  $("cfgAdd").classList.toggle("hidden", which === "items");
 
   renderToolbar(which);
   var list = $("cfgList");
@@ -796,12 +890,16 @@ function matches(which, entry) {
   if (filter.kind && entry.kind !== filter.kind
       && (!item || item.kind !== filter.kind)) { return false; }
   if (filter.character !== undefined && filter.character !== "") {
-    var who = (entry.character !== undefined && entry.character !== null)
-      ? entry.character : (item ? item.character : undefined);
-    if (String(who) !== filter.character) { return false; }
+    // ★ 按**物品库里那份角色限定**筛（D31），不看条目自己带的键 ——
+    //   在物品库里把一件东西改成「不限」之后，它就不该再出现在
+    //   「泰尔」这一档里（`character` 那个键是**删掉**表示不限的，
+    //   拿 `undefined` 退回原版数据会让「改成不限」看上去没生效）。
+    if (String(itemRuleOf(itemId).character) !== filter.character) {
+      return false;
+    }
   }
   if (filter.q) {
-    var hay = [entry.name, entry.note, String(itemId),
+    var hay = [itemName(itemId), entry.note, String(itemId),
                item ? item.name_kr : "", item ? item.name : ""]
       .join(" ").toLowerCase();
     if (hay.indexOf(filter.q.toLowerCase()) < 0) { return false; }
@@ -860,12 +958,21 @@ var LISTING_ZH = {shop: "商店", recipe: "合成", "": "未上架"};
 
 /** 物品库一页最多画几张卡。
  *
- * ★ 全表有 700 多件能穿的东西，一次全画出来 DOM 会卡（和「选择物品」弹窗
+ * ★ 全表有 800 多件东西，一次全画出来 DOM 会卡（和「选择物品」弹窗
  *   `PICK_LIMIT` 同一个理由）。超出的用上面的筛选缩小范围 —— 筛选条件
  *   在服务端那边不存在，纯粹是画面上的事，所以这个数**是界面取舍，
  *   不是铁律 10 说的那种时序阈值**。
  */
 var ITEM_LIMIT = 120;
+
+/** 这件东西要不要「等级 / 角色限定」两栏。
+    ★ 和服务端 `shopcfg.has_level_and_character()` **同一条判据**：
+    `part_flag != 0`（占装备槽）。两边对不上的话，页面上填得进去、
+    服务端存进去又当没看见 —— 那种「改了没反应」最难查。 */
+function wearable(itemId) {
+  var item = BYID[itemId];
+  return !!(item && item.part_flag);
+}
 
 function renderItems(list) {
   var grid = el("div", "grid");
@@ -877,30 +984,36 @@ function renderItems(list) {
     var where = listingOf(entry.id);
     var card = el("div", "item-card" + (where ? " listed" : ""));
     card.setAttribute("data-index", index);
-    card.appendChild(killButton("items", index));
+    // ★ 物品库**没有 ✕ 也没有「＋ 添加」**：这一页就是全物品表，条目由
+    //   `shop_items.json` 决定，删掉一条只会让那件东西从页面上消失
+    //   （等级和角色限定悄悄退回默认），没有人会想要这个。
 
-    var slot = slotNode(entry.id, 44, !!where, true);
-    slot.onclick = function () {
-      openPicker({selected: entry.id, onPick: function (item) {
-        adoptItem(entry, "id", item);
-        repaintList();
-      }});
-    };
-    card.appendChild(slot);
+    card.appendChild(slotNode(entry.id, 44, !!where, false));
 
     var col = el("div", "col");
     var nm = el("div", "nm");
     nm.appendChild(fieldNode({key: "name", label: "中文名", type: "text"},
                              entry, touched).lastChild);
     col.appendChild(nm);
-    var meta = metaLine(entry.id, entry.kind);
-    meta.appendChild(el("b", "where", "　" + LISTING_ZH[where]));
+    // ★ 上架状态排在**最前面**、韩文名一个字都不画：这一行放不下就会被
+    //   省略号截掉，而「这东西现在在哪儿卖」比韩文原名重要得多
+    //   （用户 2026-09-06：韩文太长，把上架信息挤没了）。韩文名在浮窗里看。
+    var meta = el("div", "meta");
+    meta.appendChild(el("b", "where", LISTING_ZH[where]));
+    tipFor(meta, entry.id);
+    meta.appendChild(document.createTextNode(
+      "　" + itemMeta(entry.id, wearable(entry.id)) + " "));
+    meta.appendChild(el("code", null, "#" + entry.id));
     col.appendChild(meta);
 
-    var nums = el("div", "nums");
-    restFields("items", entry, ["id", "name", "kind"], touched)
-      .forEach(function (node) { nums.appendChild(node); });
-    col.appendChild(nums);
+    // 穿不上身的东西（材料 / 礼包 / 消耗品 / 角色卡）没有这两栏 ——
+    // 客户端根本不读，画出来只会让人以为「给材料设个 5 级就要 5 级才能捡」。
+    if (wearable(entry.id)) {
+      var nums = el("div", "nums");
+      restFields("items", entry, ["id", "name", "kind"], touched)
+        .forEach(function (node) { nums.appendChild(node); });
+      col.appendChild(nums);
+    }
 
     card.appendChild(col);
     grid.appendChild(card);
@@ -931,10 +1044,8 @@ function renderShop(list) {
     card.appendChild(slot);
 
     var col = el("div", "col");
-    var nm = el("div", "nm");
-    nm.appendChild(fieldNode({key: "name", label: "中文名", type: "text"},
-                             entry, touched).lastChild);
-    col.appendChild(nm);
+    // ★ 中文名在**物品库**那一页改（D31），这里只显示。
+    col.appendChild(el("div", "nm ro", itemName(entry.id)));
     col.appendChild(metaLine(entry.id, entry.kind));
 
     var nums = el("div", "nums");
@@ -967,15 +1078,11 @@ function metaLine(itemId, kind) {
   return meta;
 }
 
-/** 换了物品之后，跟着它走的那几个字段一起更新。 */
+/** 换了物品之后，跟着它走的那几个字段一起更新。
+ *  ★ 名字不在这里跟 —— 中文名归物品库（D31），这两页只是显示它。 */
 function adoptItem(entry, key, item) {
-  var old = BYID[entry[key]];
   entry[key] = item.id;
   if ("kind" in entry) { entry.kind = item.kind; }
-  // 名字只在「还是上一件的默认名 / 空」时才跟着换 —— 用户自己改过的不动。
-  if ("name" in entry && (!entry.name || (old && entry.name === old.name))) {
-    entry.name = item.name;
-  }
   touched();
 }
 
@@ -1001,8 +1108,8 @@ function renderRecipe(list) {
     };
     out.appendChild(slot);
     var col = el("div", "col");
-    col.appendChild(fieldNode({key: "name", label: "中文名", type: "text"},
-                              entry, touched).lastChild);
+    // ★ 中文名在**物品库**那一页改（D31），这里只显示。
+    col.appendChild(el("div", "nm ro", itemName(entry.result)));
     col.appendChild(metaLine(entry.result));
     out.appendChild(col);
     head.appendChild(out);
@@ -1162,7 +1269,9 @@ function paintPicker() {
     if (PICKER.kind && item.kind !== PICKER.kind) { return false; }
     if (PICKER.filter && !PICKER.filter(item)) { return false; }
     if (!query) { return true; }
-    return (item.name + " " + (item.name_kr || "") + " " + item.id)
+    // 中文名按**物品库**里那一份搜（D31）—— 在物品库里改过名字之后，
+    // 用新名字搜不到才叫奇怪。
+    return (itemName(item.id) + " " + (item.name_kr || "") + " " + item.id)
       .toLowerCase().indexOf(query) >= 0;
   });
   if (!hits.length) {
@@ -1173,7 +1282,7 @@ function paintPicker() {
     var ic = el("div", "ic");
     if (iconStyle(ic, item.cell, 44)) { cell.appendChild(ic); }
     else { cell.appendChild(el("div", "noicon", "?")); }
-    cell.appendChild(el("div", "nmz", item.name));
+    cell.appendChild(el("div", "nmz", itemName(item.id)));
     tipFor(cell, item.id);
     cell.onmouseenter = function () { describe(item); };
     cell.onclick = function () {
@@ -1193,7 +1302,7 @@ async function describe(item) {
   var box = $("pickDetail");
   box.textContent = "";
   var line = el("div");
-  line.appendChild(el("b", null, item.name));
+  line.appendChild(el("b", null, itemName(item.id)));
   line.appendChild(document.createTextNode(
     "  #" + item.id + "  " + itemMeta(item.id)));
   box.appendChild(line);
@@ -1440,8 +1549,7 @@ function renderPlayer() {
 
 /** 名字：中文名翻不出来时退回 `#id`（`item_name_zh` 自己就这么退的）。 */
 function ownName(itemId) {
-  var item = BYID[itemId];
-  return (item && item.name) || ("#" + itemId);
+  return itemName(itemId);
 }
 
 /** 副标题：★ 名字已经是 `#id` 时别再写一遍，换成「类别 · 角色 · 系列」。 */
@@ -1760,10 +1868,6 @@ function wire() {
 function addEntry(which) {
   openPicker({
     kinds: (which === "drops") ? ["material"] : null,
-    // ★ 物品库只收**占装备槽**的东西 —— 材料 / 消耗品没有「几级能穿」
-    //   这回事，服务端的 `validate_items` 也会拒收（D31）。
-    filter: (which === "items")
-      ? function (item) { return !!item.part_flag; } : null,
     onPick: function (item) {
       var entry = {};
       (CAT.schema[which].fields || []).forEach(function (spec) {
@@ -1778,12 +1882,7 @@ function addEntry(which) {
         } else { entry[spec.key] = ""; }
       });
       if ("kind" in entry) { entry.kind = item.kind; }
-      if ("name" in entry) { entry.name = item.name; }
       if ("id" in entry && which === "recipe") { entry.id = nextRecipeId(); }
-      // 物品库新加一条：角色限定按**原版数据**填进去，别让人从头猜。
-      if (which === "items" && item.character !== undefined) {
-        entry.character = item.character;
-      }
       CFG[which].entries.push(entry);
       // 新加的那条一定要看得见 —— 否则筛选开着的时候「加了没反应」。
       FILTER[which] = {q: "", kind: "", character: "", listedOnly: false};
