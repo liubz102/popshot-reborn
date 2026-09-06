@@ -762,10 +762,13 @@ class ItemInfoTests(_ShopCase):
         self.assertEqual(shop.CHARACTER_UNLIMITED, record["character"])
 
     def test_名字等级和角色全都取自物品库(self):
-        """★ D31：中文名、等级门槛、角色限定的唯一出处都是 `items.json`。
+        """★ D31：中文名和等级门槛的唯一出处是 `items.json`。
 
         `shop.json` 里就算还留着一个老名字也不作数 —— 同一件东西买来的和
         合成的不可能是两个名字、两个门槛。
+
+        ⚠ **角色限定不在此列**（D31a，用户 2026-09-06）：它只认原版数据，
+        物品库里写了也当没看见 —— 改宽了别的角色穿上去会闪退。
         """
         with config_dir(shop=[{"id": 1120041, "name": "老名字",
                                "listed": True, "price": 3000}],
@@ -776,8 +779,8 @@ class ItemInfoTests(_ShopCase):
         self.assertEqual("左轮 爆裂1", record["name"])
         # ★ 客户端拿它挡「穿上」（`0x445817`）—— 发大了玩家买到了却穿不上。
         self.assertEqual(5, record["level"])
-        # ★ 物品库改成 1 = 卡希尔专用，即使原版数据里它是泰尔的（0）。
-        self.assertEqual(1, record["character"])
+        # ★ 物品库里写着 1（卡希尔），但发下去的还是原版那个 0（泰尔）。
+        self.assertEqual(0, record["character"])
 
     def test_物品库没登记就退回原版数据(self):
         with config_dir(shop=[{"id": 1120041, "listed": True, "price": 3000}]):
@@ -924,20 +927,25 @@ class CompositionListTests(_ShopCase):
         self.assertEqual([1010001, 1020001], [r["result"] for r in shown])
         self.assertNotIn("level", shown[0])
 
-    def test_角色限定问物品库_不问配方(self):
-        """★ D31：角色限定是**产物自己的**属性。配方里写 `character`
-        没有用（`validate_recipes` 直接丢掉），要改去物品库改。"""
+    def test_角色限定问原版数据_不问配方也不问物品库(self):
+        """★ 角色限定是**产物自己的**属性，而且只认**原版数据**。
+
+        配方里写 `character` 没有用（`validate_recipes` 直接丢掉）；
+        ★ D31a（用户 2026-09-06）：物品库里写了也没有用 —— 改宽了让别的
+        角色穿上去，游戏里会闪退。
+        """
         with config_dir(recipe=[self.recipe(1010001, character=1),
-                                self.recipe(1020001)],
-                        items=[{"id": 1010001, "level": 1, "character": 1}]):
+                                self.recipe(2120041)],
+                        items=[{"id": 1010001, "level": 1, "character": 1},
+                               {"id": 2120041, "level": 1, "character": 0}]):
             角色0, _ = shop.recipe_entries(character=0)
             角色1, _ = shop.recipe_entries(character=1)
             不限, _ = shop.recipe_entries(character=shop.CHARACTER_ANY)
-        # 1010001 原版数据里是角色 0 的装备，物品库改成 1 -> 按物品库走。
-        # 1020001 没登记 -> 退回原版数据（角色 0）。
-        self.assertEqual([1020001], [r["result"] for r in 角色0])
-        self.assertEqual([1010001], [r["result"] for r in 角色1])
-        self.assertEqual([1010001, 1020001], [r["result"] for r in 不限])
+        # 1010001 原版是角色 0（泰尔）的，物品库写 1 也不作数；
+        # 2120041 原版是角色 1 的，物品库写 0 也不作数。
+        self.assertEqual([1010001], [r["result"] for r in 角色0])
+        self.assertEqual([2120041], [r["result"] for r in 角色1])
+        self.assertEqual([1010001, 2120041], [r["result"] for r in 不限])
 
     def test_新商品那一格列全部配方(self):
         # 合成面板打开时默认停在这一格 —— 空的话玩家以为功能坏了。

@@ -21,6 +21,7 @@
     POST /admin/api/admins/password   {name, password}                      ★系统
     POST /admin/api/admins/role       {name, role}                          ★系统
     POST /admin/api/admins/remove     {name}                                ★系统
+    POST /admin/api/admins/from_player {name}  把玩家收成运营（D40）        ★系统
     GET  /admin/api/item?id=1120041   某件东西**现在在商店里**是什么价（选择器侧栏用）
     GET  /admin/api/players?q=名字&page=0  按用户名 / 昵称找玩家（一页 10 行）★系统
     GET  /admin/api/player?name=alice  一个玩家的可编辑资料                 ★系统
@@ -36,18 +37,12 @@
 只是画面**，真正的门在那个函数里 —— `test_web_admin` 有一条用例拿运营
 身份逐个路径打一遍，确认全是 403。
 
-## 玩家资料页：**商店在卖的东西一律只读**（用户 2026-09-05 拍板）
+## 玩家资料页：**仓库里什么都能改**（用户 2026-09-06 拍板，D23a）
 
-D22 之后商店按**真实等级**卖东西。管理页要是能把 4 级才卖的枪直接塞进
-1 级号的仓库，那条等级门槛就白设了。所以：
-
-- **能改**：等级、金币、材料、以及 `shop.json` 里 `listed=false` 的物品
-  （合成产物、货架上根本买不到的那批）；
-- **不能改**：`listed=true` 的物品。要给就改金币和等级，让玩家自己进商店买。
-
-判据是 `listed` 而不是「在不在 `shop.json` 里」—— `shop.json` 现在只是**货架**
-（D31 之后 `default_shop()` 只收上架的武器），材料和合成产物根本不在里面，
-它们正是用户说的「商店里没有的物品」。
+原来商店在卖的那批东西是只读的（怕绕过「够等级才买得到」）。
+**这条 2026-09-06 撤了**：等级门槛在**穿上**那一刻客户端还要再判一次，
+东西躺在仓库里穿不上身，塞进去并不等于绕过门槛。⇒ 等级、金币、材料、
+仓库物品**一律可改**，`_player_view` 里也没有「锁着的」那一类了。
 
 ## ★★ 口令是明文存的，而这个页面公网可达
 
@@ -541,19 +536,15 @@ def _counts_of(raw):
 
 
 def _player_view(username, account):
-    """一个玩家的可编辑资料。名字 / 图标让前台自己按 `catalog()` 查。"""
-    table, _warnings = shopcfg.shop()
+    """一个玩家的可编辑资料。名字 / 图标让前台自己按 `catalog()` 查。
+
+    ★ 2026-09-06 之后**每一格都能改**，没有「锁着的」那一类了（D23a）。
+    """
     experience = account_store.player_experience(account)
     start, nxt = account_store.experience_bounds(experience)
     equipped = set(account_store.equipped_items(account))
     inventory = account_store.inventory_items(account)
     materials = account_store.material_counts(account)
-
-    def locked(item_id):
-        """商店在卖 ⇒ 只读。★ 判据是 `listed`，不是「在不在 shop.json 里」
-        —— 不在那份表里的（材料、合成产物）就是没上架，
-        它们正是用户说的「商店里没有的物品」。"""
-        return bool((table.get(item_id) or {}).get("listed"))
 
     return {
         "username": username,
@@ -566,11 +557,10 @@ def _player_view(username, account):
         "money": account_store.player_money(account),
         "online": username in _online_usernames(),
         "materials": [{"id": item_id, "count": materials[item_id],
-                       "locked": locked(item_id), "stackable": True}
+                       "stackable": True}
                       for item_id in sorted(materials)],
         "inventory": [{"id": item_id,
                        "count": inventory[item_id]["count"],
-                       "locked": locked(item_id),
                        "stackable": stackable(item_id),
                        "equipped": item_id in equipped}
                       for item_id in sorted(inventory)],
@@ -1025,11 +1015,11 @@ class AdminRoutes:
             # ★ 改完口令要把那个人**已有的会话全部作废** —— 否则「我把密码
             #   改了」和「拿着旧密码登进来的人还在操作」会同时成立。
             self.admin_sessions.drop_admin(target)
-            eventlog.online(f"[admin] {name!r} 改了 {target!r} 的口令")
+            eventlog.online(f"[admin] {name!r} 改了 {target!r} 的密码")
             logged_out = (target == name)
             self._send_json({
                 "ok": True, "logged_out": logged_out,
-                "message": ("已改口令" + ("，请用新口令重新登录" if logged_out
+                "message": ("已改密码" + ("，请用新密码重新登录" if logged_out
                                           else f"（{target} 需要重新登录）"))})
             return
         if action == "role":
@@ -1045,6 +1035,18 @@ class AdminRoutes:
                 "self_demoted": (target == name
                                  and role != account_store.ADMIN_ROLE_SYSTEM),
                 "message": f"{target} 现在是{zh}"})
+            return
+        if action == "from_player":
+            # 「玩家资料」页那个「设为管理员（运营）」（D40）。
+            # ★ 请求里**只有用户名**：密码由存档层自己照搬，既不经过浏览器
+            #   也不经过这里的任何一个变量（铁律 9）。
+            names = self.accounts.admin_add_from_player(
+                target, account_store.ADMIN_ROLE_OPERATOR)
+            eventlog.online(f"[admin] {name!r} 把玩家 {target!r} 设成了运营")
+            self._send_json({
+                "ok": True,
+                "message": f"已把玩家 {target} 设为管理员（运营）",
+                "names": names, "admins": self.accounts.admin_list()})
             return
         if action == "remove":
             # 「至少保留一个系统管理员」拦在 `account_store` 层（不只前端），
@@ -1118,6 +1120,11 @@ class AdminRoutes:
             found, total = self.accounts.search_accounts(
                 raw, limit=PLAYER_PAGE_SIZE, offset=page * PLAYER_PAGE_SIZE)
         online = _online_usernames()
+        # 「设为管理员（运营）」那个按钮要知道这个人**现在是什么权限**（D40）：
+        # 已经是了就把按钮换成灰的、写上他的实际权限。★ 一次取整张表再查，
+        # 别对着 10 行各问一次 `admin_role()`（那是 10 次加锁 + 10 次读盘）。
+        admin_roles = {row["name"]: row["role"]
+                       for row in self.accounts.admin_list()}
         self._send_json({
             "ok": True,
             "page": page,
@@ -1130,6 +1137,8 @@ class AdminRoutes:
                 "level": account_store.player_level(account),
                 "money": account_store.player_money(account),
                 "online": username in online,
+                # 不是管理员就是 None —— 前台按「有没有值」决定按钮画哪一种。
+                "admin_role": admin_roles.get(username),
             } for username, account in found],
         })
 
@@ -1145,11 +1154,11 @@ class AdminRoutes:
         self._send_json({"ok": True, "player": _player_view(username, account)})
 
     def _admin_player_save(self, data):
-        """`POST /admin/api/player` —— 改等级 / 金币 / 材料 / 非商店物品。
+        """`POST /admin/api/player` —— 改等级 / 金币 / 材料 / 仓库物品。
 
-        ★ **商店上架的东西（`shop.json` 里 `listed`）一律拒绝**（用户
-        2026-09-05 拍板）：那批物品带着等级门槛，直接塞进仓库就绕过了
-        「够等级才买得到」这条规则。要给就改金币和等级，让玩家自己进商店买。
+        ★ **商店在卖的东西也能直接发**（用户 2026-09-06 推翻了 D23，见
+        D23a）：等级门槛在**穿上**那一刻还要再判一次，塞进仓库并不等于
+        绕过了它 —— 等级不够就是穿不上。
         """
         admin = self._require_system_admin()
         if admin is None:
@@ -1159,7 +1168,6 @@ class AdminRoutes:
         if account is None:
             self._reply(False, f"没有叫 {username!r} 的账号", status=404)
             return
-        table, _warnings = shopcfg.shop()
         try:
             materials = _counts_of(data.get("materials"))
             inventory = _counts_of(data.get("inventory"))
@@ -1167,18 +1175,6 @@ class AdminRoutes:
             money = _optional_int(data.get("money"), "金币")
         except ValueError as error:
             self._reply(False, str(error))
-            return
-        locked = sorted(item_id for item_id in
-                        list(materials) + list(inventory)
-                        if (table.get(item_id) or {}).get("listed"))
-        if locked:
-            # 名字问**物品库**（D31）—— `shop.json` 里已经没有这个字段了。
-            rules, _more = shopcfg.items()
-            self._reply(False,
-                        "这些是商店在卖的东西，不能直接改（改金币和等级，"
-                        "让玩家自己进商店买）：" + "、".join(
-                            f"{i} {shopcfg.name_of(rules, i)}".strip()
-                            for i in locked))
             return
         # ★ 装备类只有「有 / 没有」，数量没有意义（见 `stackable()`）：
         #   **有无没变就整条从补丁里拿掉**，有无变了才写 1 / 0。

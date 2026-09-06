@@ -44,8 +44,15 @@
 
 * { box-sizing: border-box; }
 
+/* ★ 整页是一张**撑满窗口的壳**（D39）：`body` 竖着排「顶栏 / main」两段，
+   滚动条长在 `main` 里而不是窗口上。配置页再往下分一层，只让物品列表自己滚
+   —— 筛选条、换页栏就能钉住不动（用户 2026-09-06）。 */
+html, body { height: 100%; }
+
 body {
   margin: 0;
+  display: flex; flex-direction: column;
+  overflow: hidden;
   color: var(--cocoa-ink);
   font: 14px/1.6 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
   background: var(--paper);
@@ -58,11 +65,11 @@ body {
 .hidden { display: none !important; }
 
 /* ------------------------------------------------------------------ 顶栏 */
-/* ★ 顶栏 + 标签行整块钉在画面顶上，只有下面的内容跟着滚（用户 2026-09-05）。
-   `sticky` 的前提是**祖先里没有 `overflow` 不是 visible 的元素** ——
-   body / main 都没设，别顺手给它们加。 */
+/* ★ 顶栏 + 标签行永远在画面顶上（用户 2026-09-05）。以前靠 `position: sticky`，
+   D39 之后整页是 flex 壳，它就是壳里第一段、按自己的高度占位，比 sticky
+   稳当（不用操心「祖先有没有 overflow」）。 */
 .appbar {
-  position: sticky; top: 0; z-index: 40;
+  flex: 0 0 auto; z-index: 40;
   background: var(--paper);
   box-shadow: 0 3px 10px rgba(120, 80, 20, .18);
 }
@@ -79,7 +86,40 @@ body {
 }
 .topbar .who { margin-left: auto; color: #5A3416; font-weight: 600; }
 
-main { max-width: 1180px; margin: 0 auto; padding: 16px 18px 60px; }
+/* 壳里第二段：剩下的高度全给它，滚动条也在它身上。★ `min-height: 0` 少一句，
+   flex 项就按内容撑高，整页又会长回窗口外面去。 */
+main {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  width: 100%; max-width: 1180px; margin: 0 auto; padding: 16px 18px 60px;
+}
+
+/* ★ 配置页（物品库 / 商店货架 / 合成配方 / 材料掉落）：整块面板撑满 `main`，
+   滚动条一路交到 `#cfgList` 手里 —— 说明块、筛选条、换页栏都钉住不动，
+   只有物品列表滚（用户 2026-09-06，D39）。`switchTab` 负责挂 `.fit`。
+   ★ 每一层都要 `min-height: 0` —— flex 项的默认最小高度是内容高度，
+   漏一层它就把滚动条又顶回外面那层去了。 */
+main.fit { overflow: hidden; padding-bottom: 16px; }
+main.fit, main.fit > #mainView, main.fit #cfgPanel,
+main.fit #cfgPanel > .panel-body {
+  display: flex; flex-direction: column; min-height: 0;
+}
+main.fit > #mainView, main.fit #cfgPanel,
+main.fit #cfgPanel > .panel-body { flex: 1 1 auto; }
+main.fit #cfgPanel { margin-bottom: 0; }
+main.fit #cfgList {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  /* 滚动条别压在卡片边框上 */
+  padding-right: 4px;
+}
+/* ★ 列表**以外**的都按自己的高度占位，别参与收缩 —— flex 项默认
+   `flex-shrink: 1`，装不下时它会去压那些「能压」的（说明块自己带
+   `overflow: auto`，第一个被压成一条缝）。 */
+main.fit #cfgPanel > .panel-body > ul.help,
+main.fit #cfgPanel > .panel-body > .toolbar,
+main.fit #cfgPanel > .panel-body > .pager { flex: 0 0 auto; }
+/* 说明块也钉住不动 ⇒ 不能让它把画面吃光（合成配方那份有 9 条）。
+   超过这么高它自己滚，条数再多也只占这一截。 */
+main.fit #cfgHelp { max-height: 9.2em; overflow-y: auto; }
 
 /* ------------------------------------------------------------------ 面板 */
 .panel {
@@ -124,6 +164,23 @@ main { max-width: 1180px; margin: 0 auto; padding: 16px 18px 60px; }
   margin-left: auto; color: var(--amber-soft); font-size: 13px;
   font-weight: 600; padding-right: 18px;
 }
+/* 标题栏右端那个圆箭头（「管理员账号」页的刷新，D43）—— 单给它一行太突兀，
+   而这一页没有筛选条可以搭。深棕底上画成浅描边的圆钮，别用米黄色的 `.btn`
+   （那是给纸面底用的，压在标题栏上太抢眼）。
+   ★ `margin-right` 是躲标题栏右上角那个 16px 斜切（`clip-path`）——
+   和 `.count` 的 `padding-right` 防的是同一件事。 */
+.panel-title .icon-btn {
+  margin-left: auto; margin-right: 14px; flex: 0 0 auto;
+  width: 26px; height: 26px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  font: inherit; font-size: 15px; line-height: 1; cursor: pointer;
+  color: var(--amber-soft); background: rgba(255, 255, 255, .08);
+  border: 2px solid var(--amber-soft); border-radius: 50%;
+}
+.panel-title .icon-btn:hover {
+  color: #fff; background: var(--amber-dark); border-color: var(--amber);
+}
+.panel-title .icon-btn:active { transform: translateY(1px); }
 .panel-body { padding: 14px 18px; }
 .panel-foot {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -196,6 +253,19 @@ ul.help b, .hint b { color: var(--crimson); }
 .btn-danger:hover { background: linear-gradient(#E85C62, #CE2E34); }
 .btn-ghost { box-shadow: none; background: rgba(255, 255, 255, .55); }
 .btn-sm { padding: 3px 9px; font-size: 12px; box-shadow: 0 2px 0 #C98A1D; }
+/* 「设为管理员（运营）」（D40）—— 旁边就是「修改背包」，两个钮**一眼要能
+   分出来**（用户 2026-09-06）。用青色：这一页上金色是「保存」、红色是
+   「删除」，青色本来就是这套配色里「状态 / 开关」那一档（上架开关也是它），
+   给权限正合适。已经是管理员时按钮 `disabled`，靠 `.btn:disabled` 淡下去。
+   ★ 必须排在 `.btn-sm` **后面** —— 两条选择器权重一样，写在前面那条的
+   `box-shadow` 会被后面那条覆盖掉，钮底下就成了琥珀色的影子。 */
+.btn-admin {
+  color: #fff;
+  background: linear-gradient(#45C0B7, var(--teal));
+  border-color: #1F7E78; box-shadow: 0 2px 0 #1F7E78;
+}
+.btn-admin:hover { background: linear-gradient(#57CCC3, #2BA096); }
+.btn-admin:disabled { box-shadow: 0 2px 0 #1F7E78; }
 
 /* ------------------------------------------------------------------ 表单 */
 label { display: block; margin: 10px 0 4px; font-size: 13px;
@@ -228,6 +298,12 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 .field input[type=number]::-webkit-outer-spin-button,
 .field input[type=number]::-webkit-inner-spin-button {
   -webkit-appearance: none; margin: 0;
+}
+/* 只读字段的值（类别 / 角色限定）：画成一行字，别做成看着能点、
+   点了没反应的控件。高度对齐旁边那些输入框。 */
+.field > .ro {
+  font-size: 13px; font-weight: 600; color: var(--cocoa-ink);
+  padding: 5px 2px; white-space: nowrap;
 }
 .field.wide input[type=text] { width: 100%; max-width: none; }
 .field.wide { flex: 1 1 220px; }
@@ -296,6 +372,20 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 .toolbar input[type=text] { max-width: 220px; }
 .toolbar select { width: auto; }
 .toolbar .grow { margin-left: auto; }
+
+/* ★ 配置页那一条：左边筛选、右边「添加 / 放弃修改 / 保存」，**同一行**
+   （用户 2026-09-06，D39 —— 原来那三个按钮在面板最底下，一屏物品之后
+   得滚到头才够得着）。窄屏放不下就整组折到第二行，不会互相挤扁。 */
+.cfg-bar .filters {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  flex: 1 1 320px; min-width: 0;
+}
+.cfg-bar .acts {
+  display: flex; align-items: center; gap: 10px; flex: 0 0 auto; margin-left: auto;
+}
+/* 只有一页时 `pagerNode` 什么都不画 —— 空的 `.pager` 还占着 10px 外边距，
+   短列表上会多出一条看不出来源的空白。 */
+.pager:empty { display: none; }
 
 /* 删掉这一条的按钮。**画在卡片里面**（右上角）—— 挂在外面会压住上一张卡，
    而且看着像掉出来的。平时是灰的，指上去才变红：删除不该是最显眼的东西。 */
@@ -444,18 +534,16 @@ code {
   width: 100%; max-height: 2.5em; overflow: hidden;
 }
 .pick-empty { color: var(--cocoa-soft); padding: 30px; text-align: center; }
-/* ★ 高度**钉死**，不用 min-height：这一块的内容随鼠标划过的物品变
-   （1~5 行：名字 / 原名 / 加成 / 武器数值 / 在不在卖），高度一变整个
-   弹窗就跟着上下跳（用户 2026-09-05）。装不下的自己滚。 */
-.pick-detail {
-  border-top: 2px dashed var(--line); margin-top: 12px; padding-top: 10px;
-  font-size: 12px; color: var(--cocoa-soft);
-  height: 7.2em; overflow-y: auto;
-}
-/* 结果网格也固定一屏：搜索时行数变化同样会让弹窗抽动。 */
-.pick-grid { min-height: 260px; align-content: start; }
+/* ★ 弹窗里只有网格自己滚（用户 2026-09-06，D39）：搜索 / 类别 / 角色
+   那一条和换页栏钉住不动。★ 底下那条详情侧栏 2026-09-06 删了 ——
+   它和浮窗写的是同一批东西，而且「在不在卖」还是现问服务端的旧值。 */
+#picker .panel-body { overflow: hidden; display: flex; flex-direction: column; }
+#picker .panel-body > .toolbar,
+#picker .panel-body > .pager { flex: 0 0 auto; }
+#pickGrid { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+/* 网格自己滚（见上面 `#pickGrid`）⇒ 内容对不齐时靠上排，别在竖向摊开。 */
+.pick-grid { align-content: start; }
 .modal .panel { height: min(640px, 100%); }
-.pick-detail b { color: var(--cocoa-ink); }
 
 /* ------------------------------------------------------ 确认对话框（D38） */
 /* 替掉 `window.confirm` —— 那个框的样式跟这一页完全不搭，而且装不下
@@ -506,8 +594,6 @@ h3.sub {
      撑宽、盖到右边那一格上（用户 2026-09-05 截图里「文字被输入框挡住」）。*/
   min-width: 0; overflow: hidden;
 }
-/* 商店在卖的 ⇒ 只读。橙底 + 一把锁，和「上架」那套配色一致。 */
-.own.locked { background: var(--paper-2); border-style: dashed; }
 /* 装备类「没有」的状态：淡下去，一眼看出这一件保存后就没了。 */
 .own.off { background: var(--paper-2); }
 .own.off .nmz, .own.off .meta { opacity: .55; }
@@ -532,7 +618,6 @@ h3.sub {
 .own .toggle .track { width: 34px; height: 18px; }
 .own .toggle .track::after { width: 12px; height: 12px; }
 .own .toggle.on .track::after { transform: translateX(16px); }
-.own .lock { flex: 0 0 auto; font-size: 15px; }
 /* 删除是个 ✕ 而不是「清零」两个字 —— 那两个字要 34 px，全给名字更值。 */
 .own .drop {
   flex: 0 0 auto; width: 22px; height: 22px; padding: 0;
@@ -545,6 +630,14 @@ h3.sub {
 .player-list table { max-width: none; }
 tr.on td { background: #FFFBEF; }
 td .btn-sm { white-space: nowrap; }
+/* 一行两个按钮（「修改背包」+「设为管理员（运营）」，D40）—— 挤不下就折行，
+   别把名字那几列压扁。 */
+/* 一行两个按钮（左「设为管理员（运营）」+ 右「修改背包」，D40），
+   整组**右对齐** —— 那一列宽度随权限文字长短变，靠右才对得齐。 */
+td .acts {
+  display: flex; gap: 6px; flex-wrap: wrap;
+  align-items: center; justify-content: flex-end;
+}
 .pager {
   display: flex; gap: 10px; align-items: center; margin-top: 10px;
 }
@@ -590,3 +683,31 @@ td .btn-sm { white-space: nowrap; }
   color: var(--cocoa-soft); font-size: 11px;
 }
 .itip .t-shop .on { color: var(--amber-dark); font-weight: 700; }
+
+/* ------------------------------------------------ 右上角浮条 toast（D39） */
+/* 「已保存」这类回执原来是列表底下那条 `.msg` —— 列表下面现在什么都不放，
+   而且那个位置离「保存」按钮十万八千里，存完根本看不见。改成右上角浮条：
+   **不挡操作**（容器 `pointer-events: none`，只有浮条本身吃点击）。
+   ★ z-index 80 —— 要压过物品浮窗（60）和两种弹窗（50）。 */
+.toasts {
+  position: fixed; top: 12px; right: 16px; z-index: 80;
+  display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
+  pointer-events: none;
+  width: min(420px, calc(100vw - 32px));
+}
+.toast {
+  pointer-events: auto; cursor: pointer;
+  max-width: 100%; padding: 9px 13px;
+  background: #F0FBF8; color: #14615C;
+  border: 2px solid var(--teal); border-left-width: 7px; border-radius: 10px;
+  box-shadow: 0 6px 18px rgba(90, 55, 15, .32);
+  font-size: 13px; font-weight: 600; line-height: 1.5; white-space: pre-wrap;
+  transition: opacity .18s ease-out, transform .18s ease-out;
+}
+.toast.bad {
+  background: #FFF2F2; color: #7A1A1E; border-color: var(--crimson);
+}
+.toast .x { float: right; margin-left: 12px; color: var(--cocoa-soft); }
+/* 进场从右边滑进来、退场滑回去。JS 只负责加 / 去掉 `.in`。 */
+.toast { opacity: 0; transform: translateX(18px); }
+.toast.in { opacity: 1; transform: none; }

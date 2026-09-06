@@ -581,10 +581,10 @@ def validate_items(raw):
         #   「给材料设个 5 级就要 5 级才能捡」，而客户端根本不看这两个字段。
         level, character = 1, None
         if has_level_and_character(item):
-            character = entry.get("character")
-            if character is not None:
-                character = _as_int(character, where + ".character",
-                                    low=0, high=2)
+            # ★ 角色限定**只认原版数据**（D31a，用户 2026-09-06）：文件里
+            #   写了什么都当没看见。改宽了让别的角色穿上去，客户端会闪退
+            #   —— 模型和贴图本来就是一人一套的。管理页上那一栏是只读的。
+            character = item.character
             level = _as_int(entry.get("level", 1), where + ".level", low=1)
         out[item_id] = {
             "id": item_id,
@@ -1088,10 +1088,10 @@ SCHEMA = {
             "角色卡）。但 等级 和 角色限定 只给**占装备槽**的东西"
             "（铠甲 / 武器 / 戒指 / 冲刺 / 宠物 / 喷漆 / 称号）—— 别的穿不上身，"
             "客户端根本不看这两个字段，所以那些卡片上没有这两个框。",
-            "等级是**穿上时**的门槛，由客户端自己判（买和合成都不拦）；"
-            "角色限定留空 = 谁都能穿。",
-            "⚠ 角色限定改宽了只是让别的角色**能穿**，模型和贴图还是原来那个"
-            "角色的 —— 原版的装备本来就是一人一套。",
+            "等级是**穿上时**的门槛，由客户端自己判（买和合成都不拦），随便改。",
+            "★ **角色限定是只读的，照原版**（用户 2026-09-06）：改宽了让别的"
+            "角色穿上去，游戏里**会闪退** —— 模型和贴图本来就是一人一套的。"
+            "文件里手改也没用，服务端只认原版那份。",
             "每张卡片右上角写着它现在在哪儿上架（商店 / 合成 / 未上架），"
             "上架内容在「商店货架」和「合成配方」两页改。",
         ],
@@ -1103,8 +1103,10 @@ SCHEMA = {
              "help": "原版没有中文物品名，这一份是复活工程自己翻的，随便改"},
             {"key": "level", "label": "等级", "type": "int", "min": 1,
              "help": "穿上它要几级。1 = 不限"},
+            # ★ **只读**（D31a）：照原版，改宽了游戏里会闪退。
             {"key": "character", "label": "角色限定", "type": "choice",
-             "optional": True, "empty_label": "不限",
+             "optional": True, "empty_label": "不限", "readonly": True,
+             "help": "原版定死的，改不了 —— 让别的角色穿上去会闪退",
              "options": [{"value": cid, "label": name}
                          for cid, name in sorted(CHARACTER_ZH.items())]},
         ],

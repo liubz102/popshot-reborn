@@ -480,13 +480,20 @@ class ValidateItemsTests(_CfgCase):
     def test_minimal(self):
         got = self.ok()
         self.assertEqual(5, got[1120041]["level"])
-        self.assertIsNone(got[1120041]["character"])   # 没写 = 不限
+        # 角色限定照**原版数据**（这一把枪是泰尔的），文件里没写也一样。
+        self.assertEqual(0, got[1120041]["character"])
         self.assertEqual("weapon", got[1120041]["kind"])
 
-    def test_character_is_optional_but_bounded(self):
-        self.assertEqual(2, self.ok(character=2)[1120041]["character"])
-        self.bad("character", character=9)
-        self.bad("character", character=-1)
+    def test_the_character_lock_comes_from_the_stock_data_only(self):
+        """★ D31a（用户 2026-09-06）：角色限定**只认原版**，文件里写了当没看见。
+
+        改宽了让别的角色穿上去，游戏里会闪退 —— 模型和贴图一人一套。
+        ⇒ 手改 `items.json` 也没用，**也不报错**（这不是「填错了」，
+        是「这一栏本来就轮不到你填」，和管理页上那一栏只读是同一件事）。
+        """
+        for wrote in (1, 2, 9, -1, None, "泰尔"):
+            self.assertEqual(0, self.ok(character=wrote)[1120041]["character"],
+                             wrote)
 
     def test_rejects_a_level_below_one(self):
         self.bad("level", level=0)

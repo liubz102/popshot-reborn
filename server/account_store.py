@@ -1332,6 +1332,34 @@ class AccountStore:
             self._write_unlocked(data)
             return sorted(table)
 
+    def admin_add_from_player(self, username, role=ADMIN_ROLE_OPERATOR):
+        """把一个**玩家账号**原样收进管理员表：用户名和明文密码照搬。
+
+        管理页「玩家资料」那一页的「设为管理员（运营）」走这一发（D40）。
+
+        ★ **密码不出这一层**：调用方（管理页）只传用户名过来，页面从头到尾
+        看不见密码，也就不会跑到日志、截图和浏览器历史里去（铁律 9）。
+        ★ **不重新校验密码**：那串东西这个玩家一直在用，`check_password`
+        再拦一道只会拦出「你的号能玩、但设不了管理员」这种解释不清的结果。
+        名字倒是天然合规 —— 注册时就走过 `check_username` 了。
+        """
+        username = str(username or "").strip()
+        role = self._check_role(role)
+        with self._lock:
+            data = self._read_unlocked()
+            if not username or username not in data["accounts"]:
+                raise AccountError("no_such_user",
+                                   AUTH_MESSAGES[AUTH_NO_SUCH_USER])
+            account = self._merged_account(username, data["accounts"][username])
+            table = self._admin_table_unlocked(data)
+            if username in table:
+                raise AccountError("admin_exists",
+                                   f"管理员「{username}」已经存在")
+            table[username] = {"password": str(account.get("password", "")),
+                               "role": role}
+            self._write_unlocked(data)
+            return sorted(table)
+
     def admin_set_role(self, name, role):
         """改一个管理员的权限，返回它的新权限。
 

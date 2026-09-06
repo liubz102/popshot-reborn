@@ -41,6 +41,45 @@ function say(node, text, ok) {
   node.className = "msg" + (text ? (ok ? " ok" : " bad") : "");
 }
 
+/* ------------------------------------------- 右上角浮条 toast（D39）
+   配置页的回执（「已保存」「保存中……」「哪一条不合规」）原来是列表底下
+   那条 `.msg` —— 列表下面现在什么都不放了，而且那个位置离「保存」按钮
+   十万八千里，存完根本看不见。改成右上角浮条（用户 2026-09-06）：
+   **不挡操作**（容器 `pointer-events: none`，只有浮条本身吃点击）。
+
+   ★ **一次只留一条**，和原来那条 `.msg` 一个口径 —— 它本来就是被后一条
+     盖掉的，攒一摞在角上没人看。
+   ★ 成功的过几秒自己走，**出错的一直留着**等人点掉：报错里写着是哪一条
+     字段不合规，几秒钟读不完，而且它常常还配着一张高亮的卡片。
+   ⚠ `TOAST_MS` 是**停留时长**，不是铁律 10 说的那种时序阈值 —— 它不用来
+     判断任何事情的先后，早一秒晚一秒都不改变程序的结论。 */
+var TOAST_MS = 3600;
+
+function toast(text, ok) {
+  var host = $("toasts");
+  host.textContent = "";
+  if (!text) { return null; }
+  var node = el("div", "toast" + (ok ? "" : " bad"));
+  node.appendChild(el("span", "x", "✕"));
+  node.appendChild(document.createTextNode(text));
+  host.appendChild(node);
+  // 下一帧才加 `.in` —— 同一帧里加上，浏览器看不到「从右边滑进来」这个变化。
+  requestAnimationFrame(function () { node.classList.add("in"); });
+  var timer = 0;
+  function close() {
+    if (timer) { clearTimeout(timer); timer = 0; }
+    // ★ 先断掉点击再淡出：万一 `transitionend` 没来（浏览器设了「减少动效」），
+    //   留在角上的那个空壳也不会挡住底下的东西。
+    node.style.pointerEvents = "none";
+    node.classList.remove("in");
+    node.addEventListener("transitionend", function () { node.remove(); },
+                          {once: true});
+  }
+  node.onclick = close;
+  if (ok) { timer = setTimeout(close, TOAST_MS); }
+  return node;
+}
+
 async function api(path, payload) {
   var options = {credentials: "same-origin"};
   if (payload !== undefined) {
@@ -258,8 +297,8 @@ function tipHost() {
   return TIP.node;
 }
 
-/** 这件东西现在在商店里是什么状态。★ 取**当前标签页模型**，和
-    `listedIds()` 一个口径：刚改完还没保存也照着新值说。 */
+/** 这件东西现在在商店里是什么状态。★ 取**当前标签页模型**：
+    刚改完还没保存也照着新值说。 */
 function shopEntryOf(itemId) {
   var found = null;
   ((CFG.shop && CFG.shop.entries) || []).forEach(function (entry) {
@@ -474,7 +513,11 @@ function fieldNode(spec, entry, onChange) {
   wrap.appendChild(lab);
 
   if (spec.readonly) {
-    wrap.appendChild(el("span", "ro", format(entry[spec.key])));
+    // ★ `choice` 的只读展示要写**选项的名字**，不是它的值 ——
+    //   「角色限定：1」谁也看不出那是瑞娜。
+    wrap.appendChild(el("span", "ro", spec.type === "choice"
+                                      ? choiceLabel(spec, entry[spec.key])
+                                      : format(entry[spec.key])));
     return wrap;
   }
   if (spec.type === "json") {
@@ -531,6 +574,20 @@ function fieldNode(spec, entry, onChange) {
     wrap.appendChild(input);
   }
   return wrap;
+}
+
+/** 一个 `choice` 字段当前值的**显示名**。表里没有这一项就原样写值
+ *  —— 和 `choiceNode` 里那句「表里没有这一项」是同一条思路：
+ *  「看到的」和「存着的」必须对得上。 */
+function choiceLabel(spec, value) {
+  if (value === undefined || value === null) {
+    return spec.empty_label || "不限";
+  }
+  var found = "";
+  (spec.options || []).forEach(function (option) {
+    if (String(option.value) === String(value)) { found = option.label; }
+  });
+  return found || String(value);
 }
 
 function choiceNode(spec, entry, onChange) {
@@ -628,7 +685,7 @@ function isDirty(which) {
 async function loadConfig(which) {
   var result = await api("/admin/api/config/" + which);
   if (bounced(result)) { return false; }
-  if (!result.ok) { say($("cfgMsg"), result.message, false); return false; }
+  if (!result.ok) { toast(result.message, false); return false; }
   return adoptConfig(which, result.text, result.warnings, result.path);
 }
 
@@ -644,8 +701,8 @@ function adoptConfig(which, text, warnings, path) {
   try {
     raw = JSON.parse(text);
   } catch (error) {
-    say($("cfgMsg"), "服务端上那份 " + which + ".json 不是合法 JSON："
-                     + error.message, false);
+    toast("服务端上那份 " + which + ".json 不是合法 JSON："
+          + error.message, false);
     return false;
   }
   var entries = raw[listKey(which)];
@@ -694,6 +751,13 @@ function fillItems() {
     var item = BYID[Number(entry.id)];
     if (item && item.part_flag) {
       if (entry.level === undefined) { entry.level = 1; }
+      // ★ 角色限定**只认原版**（D31a）：文件里写歪了就在这儿掰回来，
+      //   下次保存一起落盘。服务端也不看文件里那份，两边一个口径。
+      if (item.character === undefined || item.character === null) {
+        delete entry.character;
+      } else {
+        entry.character = item.character;
+      }
     } else {
       // 穿不上身的东西客户端根本不读这两个字段
       // （`shopcfg.has_level_and_character`），留在文件里只会让人以为它有用。
@@ -773,7 +837,7 @@ async function postConfig(which, only) {
   if (bounced(result)) { return false; }
   if (result.conflict) { return await onConflict(which, result); }
   if (!result.ok) {
-    say($("cfgMsg"), CAT.schema[which].title + "：" + result.message, false);
+    toast(CAT.schema[which].title + "：" + result.message, false);
     if (which === CURRENT) { markBadCard(result.message); }
     return false;
   }
@@ -781,7 +845,7 @@ async function postConfig(which, only) {
   //   （用户 2026-09-06：「保存后画面直接更新显示 merge 后的最新状态」）。
   adoptConfig(which, result.text, []);
   if (which === CURRENT) { renderCurrent(); }
-  say($("cfgMsg"), result.message, true);
+  toast(result.message, true);
   return true;
 }
 
@@ -796,8 +860,8 @@ async function onConflict(which, result) {
       title: CAT.schema[which].title + "：保存冲突",
       lead: "刚才有另一个人修改了相同的物品，冲突物品需要刷新页面后重新修改。",
       lists: [bad], ok: "知道了", cancel: null});
-    say($("cfgMsg"), "没有保存 —— 另一个人刚改了同样的东西，"
-                     + "按「放弃修改」拿最新的那份再改一次。", false);
+    toast("没有保存 —— 另一个人刚改了同样的东西，"
+          + "按「放弃修改」拿最新的那份再改一次。", false);
     return false;
   }
   var go = await ask({
@@ -807,7 +871,7 @@ async function onConflict(which, result) {
     lists: [bad, {label: "未冲突的物品：", rows: mergeable}],
     ok: "单独提交未冲突物品", cancel: "取消"});
   if (!go) {
-    say($("cfgMsg"), "已取消，什么都没保存。", false);
+    toast("已取消，什么都没保存。", false);
     return false;
   }
   // ★ **重新发一次，服务端会重新判一遍** —— 从我按下确定到这一发落地之间，
@@ -816,8 +880,8 @@ async function onConflict(which, result) {
     return row.key;
   }));
   if (ok) {
-    say($("cfgMsg"), "已单独提交 " + mergeable.length + " 件未冲突的；冲突的 "
-        + conflicts.length + " 件已换成服务端上最新的内容，请重新修改。", false);
+    toast("已单独提交 " + mergeable.length + " 件未冲突的；冲突的 "
+          + conflicts.length + " 件已换成服务端上最新的内容，请重新修改。", false);
   }
   return ok;
 }
@@ -827,11 +891,11 @@ async function saveConfig(which, skipClashCheck) {
   if (!skipClashCheck && OTHER_LISTING[which]) {
     clash = listingClash(which);
     if (clash.length && !(await confirmClash(which, clash))) {
-      say($("cfgMsg"), "已取消，什么都没保存。", false);
+      toast("已取消，什么都没保存。", false);
       return false;
     }
   }
-  say($("cfgMsg"), "保存中……", true);
+  toast("保存中……", true);
   clearBadCards();
   if (!(await postConfig(which, null))) { return false; }
 
@@ -844,15 +908,51 @@ async function saveConfig(which, skipClashCheck) {
     var other = OTHER_LISTING[which];
     clash.forEach(function (row) { row.entry.listed = false; });
     if (!(await saveConfig(other, true))) {
-      say($("cfgMsg"), CAT.schema[which].title + "已保存，但「"
-          + CAT.schema[other].title + "」的自动下架没能存进去 —— "
-          + "这件东西现在两边都上着架。切到那一页按一次保存。", false);
+      toast(CAT.schema[which].title + "已保存，但「"
+            + CAT.schema[other].title + "」的自动下架没能存进去 —— "
+            + "这件东西现在两边都上着架。切到那一页按一次保存。", false);
       return false;
     }
-    say($("cfgMsg"), "已保存，并把 " + clash.length + " 件东西从「"
-        + CAT.schema[other].title + "」下架了。", true);
+    toast("已保存，并把 " + clash.length + " 件东西从「"
+          + CAT.schema[other].title + "」下架了。", true);
   }
   return true;
+}
+
+/** 「↻ 刷新」：把**四份配置全部**重新读一遍（用户 2026-09-06）。
+ *
+ * ★ 为什么不只读当前这一页：这四份**不是各管各的**。
+ *   ① 商店和合成**互斥**（D33）—— 别人刚在商店里上架了一件东西，服务端
+ *      已经把它从合成里下掉了；只刷新合成那一页的话，商店那份还是旧的，
+ *      画面上两边都写着「上架」，按一次保存就撞车。
+ *   ② 中文名 / 等级 / 角色限定的唯一出处是**物品库**（D31），另外三页
+ *      画的全是它 —— 物品库不跟着刷，名字就还是旧的。
+ *
+ * ★ 有没保存的改动先问一句（和 `refreshAccounts` 同一个口径）。
+ */
+async function refreshConfigs() {
+  var dirty = CONFIGS.filter(isDirty);
+  if (dirty.length) {
+    var go = await ask({
+      title: "还有没保存的改动",
+      lead: "刷新会拿服务端上那份盖掉，以下几页的改动会丢：",
+      lists: [{label: "有未保存改动的：", bad: true,
+               rows: dirty.map(function (which) {
+                 return {label: CAT.schema[which].title};
+               })}],
+      ok: "刷新"});
+    if (!go) { return; }
+  }
+  toast("刷新中……", true);
+  var ok = true;
+  for (var i = 0; i < CONFIGS.length; i += 1) {
+    ok = (await loadConfig(CONFIGS[i])) && ok;
+  }
+  if (!CFG[CURRENT]) { return; }
+  renderCurrent();
+  // ★ 失败时**不要**盖掉 `loadConfig` 报的那句 —— 「已刷新」压在「读不到
+  //   drops.json」上面，用户看到的就是「点了刷新，然后什么都没变」。
+  if (ok) { toast("已刷新：四份配置都换成服务端上最新的了。", true); }
 }
 
 /** 服务端的错误里带着下标（`recipes[3].materials[1].id：…`），定位过去。
@@ -928,9 +1028,11 @@ function renderCurrent() {
     notes.push("这份文件里还留着旧的 _说明 —— 那几句话已经画在上面了，"
                + "下次保存会把它从文件里去掉。");
   }
-  say($("cfgMsg"), notes.join("\n"), false);
+  // ★ 只在**真有话说**的时候弹 —— 这一发每次重画（换标签、存完盘）都会走到，
+  //   无条件调 `toast("")` 会把刚弹出来的「已保存」清掉。
+  if (notes.length) { toast(notes.join("\n"), false); }
 
-  // ★ 物品库没有「＋ 添加一条」：条目由 `shop_items.json` 定死，加不出新物品。
+  // ★ 物品库没有「添加」：条目由 `shop_items.json` 定死，加不出新物品。
   $("cfgAdd").classList.toggle("hidden", which === "items");
 
   renderToolbar(which);
@@ -977,6 +1079,13 @@ function renderToolbar(which) {
       {value: "none", label: "只看未上架"}]));
   }
   if (which === "recipe") {
+    // ★ 类别取的是**产物**的类别（配方条目自己没有 `kind` 这一栏）——
+    //   和「商店货架」一个口径：只列这份文件里真出现过的那几类。
+    bar.appendChild(selectFilter(filter, "kind", "全部类别",
+      uniq(CFG.recipe.entries.map(function (entry) {
+        return (BYID[entry && entry.result] || {}).kind;
+      }).filter(Boolean)).map(function (k) {
+        return {value: k, label: CAT.kinds[k] || k}; })));
     bar.appendChild(selectFilter(filter, "character", "全部角色",
       Object.keys(CAT.characters).map(function (k) {
         return {value: k, label: CAT.characters[k]}; })));
@@ -998,6 +1107,13 @@ function renderToolbar(which) {
     };
     bar.appendChild(only);
   }
+
+  // ★ 「↻ 刷新」排在筛选控件**后面**，**四个配置页都有**（用户 2026-09-06）
+  //   —— 点哪一页的都是把四份一起重读，见 `refreshConfigs()`。
+  var refresh = el("button", "btn btn-sm", "↻ 刷新");
+  refresh.title = "重新读一遍服务端上的四份配置（不只是这一页）";
+  refresh.onclick = function () { refreshConfigs(); };
+  bar.appendChild(refresh);
 
   var shown = el("span", "grow");
   shown.id = "cfgShown";
@@ -1043,12 +1159,23 @@ function repaintList() {
   var list = $("cfgList");
   list.textContent = "";
   var view = pageRows(CURRENT);
-  // ★ 换页栏只有**列表上面这一条**（D37b）。只有一页时 `pagerNode` 回 null
-  //   —— 空的 `.pager` 也占一截外边距，短列表上多出一条空白很显眼。
-  var pager = pagerNode(CURRENT, view);
-  if (pager) { list.appendChild(pager); }
+  // ★ 换页栏画在 `#cfgPager` 里，**在滚动区外面**（D39）—— 它得跟筛选条
+  //   一起钉住不动。只有一页时整条不画（`.pager:empty` 连外边距一起收掉）。
+  paintPager(CURRENT, view);
   RENDERERS[CURRENT](list, view.rows);
   touched();
+}
+
+/** 这一条说的是**哪件物品**。
+ *
+ *  ★ 合成配方的 `id` 是**配方号**不是物品 id（`SCHEMA.recipe` 里那一栏叫
+ *    「配方号」），它的物品在 `result` 上 —— 一起当 `entry.id` 用的话，
+ *    「按角色筛 / 按名字搜合成配方」拿去查的是编号 1、2、3 那几件东西，
+ *    筛出来的全是错的。
+ */
+function entryItemId(which, entry) {
+  if (which === "recipe") { return entry.result; }
+  return (entry.id === undefined) ? entry.material : entry.id;
 }
 
 /** 一条记录过不过筛选。**下标一律用原数组的**，服务端报错才对得上。 */
@@ -1063,7 +1190,7 @@ function matches(which, entry) {
         && where !== filter.listing) { return false; }
   }
   if (filter.mode && (entry.mode || "quest") !== filter.mode) { return false; }
-  var itemId = entry.id || entry.result || entry.material;
+  var itemId = entryItemId(which, entry);
   var item = BYID[itemId];
   if (filter.kind && entry.kind !== filter.kind
       && (!item || item.kind !== filter.kind)) { return false; }
@@ -1124,26 +1251,31 @@ function pageRows(which) {
           pages: pages, page: page, total: all.length};
 }
 
-/** 换页栏，**只放在列表上面这一条**（D37b）。只有一页时整条不画。
+/** 换页栏。**只有列表上面这一条**（D37b），而且画在滚动区**外面**
+ *  （D39：`#cfgPager` 和筛选条一起钉住，滚列表的时候它不动）。
+ *  只有一页时整条不画。
  *
  *  ★ 换页**一律不动滚动条**：点哪个按钮都只换内容，画面停在原处。
  *    列表下面原来还有一条，删掉了 —— 在底下换到末页（末页是半页，列表
  *    真的变短）时，原位置越过新的底，浏览器一夹画面就是一跳，怎么写都
  *    躲不掉。栏子只留在顶上，点它的时候人本来就在顶上，没得可夹。 */
-function pagerNode(which, view) {
-  if (view.pages <= 1) { return null; }
-  var host = el("div", "pager");
+function paintPager(which, view) {
+  var host = $("cfgPager");
+  host.textContent = "";
+  if (view.pages <= 1) { return; }
   function step(text, target, disabled) {
     var button = el("button", "btn btn-sm", text);
     button.disabled = disabled;
     button.onclick = function () {
-      var keep = window.scrollY;
+      // ★ 滚动条现在长在 `#cfgList` 上（D39），不是窗口上。
+      var list = $("cfgList");
+      var keep = list.scrollTop;
       FILTER[which].page = target;
       repaintList();
       // 清空再填是同一个任务里做完的，浏览器本来就不会动滚动条；这一发
       // 是把「不许动」写死，免得日后谁往重画里插一句读版面的代码，位置
       // 就被夹没了。末页比整页短、原位置越界时浏览器自己会夹回来。
-      window.scrollTo(0, keep);
+      list.scrollTop = keep;
     };
     host.appendChild(button);
   }
@@ -1152,7 +1284,6 @@ function pagerNode(which, view) {
                       "第 " + (view.page + 1) + " / " + view.pages + " 页　共 "
                       + view.total + " 条"));
   step("下一页 ›", view.page + 1, view.page >= view.pages - 1);
-  return host;
 }
 
 /** 筛选条件一变就回第一页 —— 停在第 5 页而新结果只有 2 页会变成一片空白。 */
@@ -1174,8 +1305,8 @@ function killButton(which, index) {
 
 /** 这件东西现在**上架在哪儿**：`"shop"` / `"recipe"` / `""`（都没有）。
  *
- * ★ 取的是**当前页面模型**（还没保存的改动也算）—— 和 `listedIds()`
- *   一个口径：管理员刚把一件东西勾上，浮窗和筛选就该跟着说。
+ * ★ 取的是**当前页面模型**（还没保存的改动也算）——
+ *   管理员刚把一件东西勾上，浮窗和筛选就该跟着说。
  * ★ 商店和合成**互斥**（用户 2026-09-06）；真出现两边都上架的脏数据时
  *   先说商店 —— 保存时那道确认框会把它掰回互斥。
  */
@@ -1450,11 +1581,10 @@ function openPicker(options) {
     kinds: options.kinds || null,
     selected: options.selected,
     onPick: options.onPick,
-    // 额外的一道过滤（玩家资料页拿它挡掉「商店在卖的」）。
-    filter: options.filter || null,
     q: "",
     page: 0,
-    kind: (options.kinds && options.kinds.length === 1) ? options.kinds[0] : ""
+    kind: (options.kinds && options.kinds.length === 1) ? options.kinds[0] : "",
+    character: ""
   };
   $("pickSearch").value = "";
   var kindSelect = $("pickKind");
@@ -1469,9 +1599,21 @@ function openPicker(options) {
     kindSelect.appendChild(node);
   });
   kindSelect.value = PICKER.kind;
+  // 角色下拉（用户 2026-09-06）。★ 列**全部角色**而不是「这批候选里出现过的」
+  //   —— 筛出空网格也是有用的信息（「原来泰尔一件鞋都没有」）。
+  var whoSelect = $("pickCharacter");
+  whoSelect.textContent = "";
+  var anyone = el("option", null, "全部角色");
+  anyone.value = "";
+  whoSelect.appendChild(anyone);
+  Object.keys(CAT.characters).forEach(function (cid) {
+    var node = el("option", null, CAT.characters[cid]);
+    node.value = cid;
+    whoSelect.appendChild(node);
+  });
+  whoSelect.value = "";
   kindSelect.disabled = !!(PICKER.kinds && PICKER.kinds.length === 1);
   $("picker").classList.remove("hidden");
-  $("pickDetail").textContent = "";
   paintPicker();
   $("pickSearch").focus();
 }
@@ -1495,11 +1637,12 @@ function paintPickPager(host, pages) {
     var button = el("button", "btn btn-sm", text);
     button.disabled = disabled;
     button.onclick = function () {
-      var body = $("picker").querySelector(".panel-body");
-      var keep = body ? body.scrollTop : 0;
+      // ★ 滚的是网格自己（D39），不再是整个 `.panel-body`。
+      var grid = $("pickGrid");
+      var keep = grid.scrollTop;
       PICKER.page = target;
       paintPicker();
-      if (body) { body.scrollTop = keep; }
+      grid.scrollTop = keep;
     };
     host.appendChild(button);
   }
@@ -1516,7 +1659,12 @@ function paintPicker() {
   var hits = CAT.items.filter(function (item) {
     if (PICKER.kinds && PICKER.kinds.indexOf(item.kind) < 0) { return false; }
     if (PICKER.kind && item.kind !== PICKER.kind) { return false; }
-    if (PICKER.filter && !PICKER.filter(item)) { return false; }
+    // ★ 角色按**物品库里那份角色限定**筛（D31），和 `matches()` 同一条判据
+    //   —— 在物品库里改成「不限」之后，这儿也不该再把它算进那个角色。
+    if (PICKER.character
+        && String(itemRuleOf(item.id).character) !== PICKER.character) {
+      return false;
+    }
     if (!query) { return true; }
     // 中文名按**物品库**里那一份搜（D31）—— 在物品库里改过名字之后，
     // 用新名字搜不到才叫奇怪。
@@ -1536,8 +1684,10 @@ function paintPicker() {
     if (iconStyle(ic, item.cell, 44)) { cell.appendChild(ic); }
     else { cell.appendChild(el("div", "noicon", "?")); }
     cell.appendChild(el("div", "nmz", itemName(item.id)));
+    // ★ 详情**只走浮窗**（`tipFor`，用户 2026-09-06）：弹窗底下原来还有一条
+    //   侧栏，写的是同一批东西，而且「在不在卖」是现问服务端的 —— 管理员
+    //   刚在货架上改完还没保存时，那一行说的是磁盘上那份旧的，和浮窗打架。
     tipFor(cell, item.id);
-    cell.onmouseenter = function () { describe(item); };
     cell.onclick = function () {
       var pick = PICKER.onPick;
       closePicker();
@@ -1552,36 +1702,16 @@ function paintPicker() {
     : (hits.length + " 件");
 }
 
-/** 侧栏：这件东西是什么、**现在在商店里卖不卖**。 */
-async function describe(item) {
-  var box = $("pickDetail");
-  box.textContent = "";
-  var line = el("div");
-  line.appendChild(el("b", null, itemName(item.id)));
-  line.appendChild(document.createTextNode(
-    "  #" + item.id + "  " + itemMeta(item.id)));
-  box.appendChild(line);
-  if (item.name_kr) { box.appendChild(el("div", null, "原名：" + item.name_kr)); }
-  if (item.bonus) {
-    box.appendChild(el("div", null, "加成：" + JSON.stringify(item.bonus)));
-  }
-  if (item.weapon) {
-    var w = item.weapon;
-    box.appendChild(el("div", null, "伤害 " + w.damage + " / 爆头 "
-      + w.head_damage + " / 换弹 " + w.reload_ms + "ms"));
-  }
-  var result = await api("/admin/api/item?id=" + encodeURIComponent(item.id));
-  if (!PICKER || !result.ok) { return; }
-  box.appendChild(el("div", null, result.listed
-    ? ("★ 商店里在卖，" + result.price + " 金币")
-    : "商店里没上架"));
-}
-
 /* ======================================================================
    管理员账号
    ====================================================================== */
 
 var ROLE_ZH = {system: "系统管理员", operator: "运营"};
+
+//: 玩家列表上那个灰钮写什么（D40）。★ 和 `ROLE_ZH` **故意不一样**：
+//  那张表用在「管理员账号」页的下拉框里，那儿上下文已经写着「权限」了；
+//  玩家列表上只有一个钮，光写「运营」看不出这是管理页的权限。
+var ADMIN_BADGE_ZH = {system: "系统管理员", operator: "管理员（运营）"};
 
 function renderAdmins(admins) {
   var rows = $("adminRows");
@@ -1616,8 +1746,9 @@ function renderAdmins(admins) {
 
 async function loadAdmins() {
   var result = await api("/admin/api/admins");
-  if (bounced(result) || !result.ok) { return; }
+  if (bounced(result) || !result.ok) { return false; }
   renderAdmins(result.admins);
+  return true;
 }
 
 async function setAdminRole(name, role) {
@@ -1656,23 +1787,12 @@ async function removeAdmin(name) {
    （服务端 `admin_update_account()` 就是按「数量 <= 0 删掉这一格」认的），
    所以补丁里必须留着那个 0，不能把键删掉。
 
-   ★ 商店在卖的（`listed`）一律不进补丁 —— 服务端也会再拦一次。
+   ★ 2026-09-06 之后**仓库里什么都能改**（D23a），没有「锁着的」那一类了。
    ====================================================================== */
 
 var PLAYER = null;        // {view, edit:{level, money, materials, inventory}}
 var PLAYER_LIST = [];
 var PLAYER_PAGE = {page: 0, pages: 1, total: 0, size: 10, q: ""};
-
-/** 现在商店里在卖哪些 id。★ 取的是**当前标签页模型**里的 shop 条目 ——
-    管理员刚在「商店货架」里改了上架状态还没保存时，这边跟着一起变，
-    免得画面上说「能改」、点了保存服务端说「不能改」。 */
-function listedIds() {
-  var set = {};
-  ((CFG.shop && CFG.shop.entries) || []).forEach(function (entry) {
-    if (entry && entry.listed) { set[Number(entry.id)] = true; }
-  });
-  return set;
-}
 
 /** 查一页。`page` 省略 = 回第一页（换了查询串就该从头看）。 */
 async function searchPlayers(page) {
@@ -1693,13 +1813,17 @@ async function searchPlayers(page) {
   return true;
 }
 
-/** 「↻ 刷新」：重读列表 + 重读正在改的那个人（用户 2026-09-05 要的）。
+/** 「↻ 刷新」——「玩家资料」和「管理员账号」两页**共用这一发**
+ *  （用户 2026-09-06，D43）：点哪一个按钮都把两页一起刷。
  *
+ * ★ 为什么两页一起：它们是同一份 `accounts.json` 的两个视图。把一个玩家
+ *   设成运营（D40）之后两边都变了 —— 只刷一边就会出现「玩家列表上写着
+ *   已是管理员、管理员名单里还没有他」。
  * ★ **停在当前页、保留搜索串** —— 刷新不该把人弹回第一页。
  * ★ 有没保存的改动先问一句：刷新会拿服务端那份盖掉编辑区，和 `openPlayer`
  *   同一个口径（那边已经这么问了，两处别不一致）。
  */
-async function refreshPlayers() {
+async function refreshAccounts() {
   if (PLAYER && playerDirty()
       && !(await ask({title: "还有没保存的改动",
                       lead: "「" + PLAYER.view.username
@@ -1708,15 +1832,16 @@ async function refreshPlayers() {
     return;
   }
   var open = PLAYER ? PLAYER.view.username : null;
-  say($("playerMsg"), "刷新中……", true);
+  toast("刷新中……", true);
   // 不带页码 = `searchPlayers` 自己那套：搜索串没变就停在当前页，
   // 变了（用户改了输入框但没按查找）就回第一页。
   var ok = await searchPlayers();
   // ★ `force` = 别再问一次「确定丢掉改动」—— 上面已经问过了。
   if (ok && open) { ok = await openPlayer(open, true); }
+  ok = (await loadAdmins()) && ok;
   // ★ 失败时**不要**盖掉错误信息 —— 「已刷新」压在「请先登录」上面，
   //   用户看到的就是「点了刷新，然后什么都没变」。
-  if (ok) { say($("playerMsg"), "已刷新", true); }
+  if (ok) { toast("已刷新：玩家资料和管理员账号都是最新的。", true); }
 }
 
 function renderPlayerRows() {
@@ -1737,13 +1862,53 @@ function renderPlayerRows() {
     line.appendChild(el("td", null, row.level));
     line.appendChild(el("td", null, row.money));
     var td = el("td");
-    var button = el("button", "btn btn-sm", "修改");
+    // ★ 权限那个钮在**左**、「修改背包」在**右**，整组**右对齐**
+    //   （用户 2026-09-06）。两个钮颜色不一样（`.btn-admin` 是青的）——
+    //   一个改这个人的背包、一个给他管理页的权限，不能长得像同一个东西。
+    var acts = el("div", "acts");
+    // 已经是管理员的：同一个位置换成**点不动的灰钮**，上面写他的实际权限，
+    // 别给一个点下去必然报「已经存在」的按钮。
+    var promote = el("button", "btn btn-sm btn-admin",
+                     row.admin_role ? (ADMIN_BADGE_ZH[row.admin_role]
+                                       || row.admin_role)
+                                    : "设为管理员（运营）");
+    if (row.admin_role) {
+      promote.disabled = true;
+      promote.title = "这个玩家已经能登管理页了，权限在「管理员账号」页改";
+    } else {
+      promote.onclick = function () { promoteToAdmin(row.username); };
+    }
+    acts.appendChild(promote);
+    var button = el("button", "btn btn-sm", "修改背包");
     button.onclick = function () { openPlayer(row.username); };
-    td.appendChild(button);
+    acts.appendChild(button);
+    td.appendChild(acts);
     line.appendChild(td);
     rows.appendChild(line);
   });
   renderPlayerPager();
+}
+
+/** 把一个玩家账号收进管理员表，权限给**运营**（用户 2026-09-06，D40）。
+ *
+ * ★ 请求里**只有用户名** —— 密码由服务端自己从那个账号里取，页面从头到尾
+ *   看不见它，也就不会跑到日志、截图和浏览器历史里去（铁律 9）。
+ */
+async function promoteToAdmin(username) {
+  var go = await ask({
+    title: "设为管理员（运营）",
+    lead: "把玩家「" + username + "」加成「运营」权限的管理员？\n"
+        + "用户名和密码原样照搬 —— 他以后就用游戏里那套账号登管理页。\n"
+        + "运营只看得到 物品库 / 商店货架 / 合成配方 / 材料掉落 四页。",
+    ok: "设为运营"});
+  if (!go) { return; }
+  var result = await api("/admin/api/admins/from_player", {name: username});
+  if (bounced(result)) { return; }
+  say($("playerMsg"), result.message, result.ok);
+  if (!result.ok) { return; }
+  if (result.admins) { renderAdmins(result.admins); }
+  // 那一格要变成「已是管理员」—— 停在当前页重查一次。
+  searchPlayers(PLAYER_PAGE.page);
 }
 
 function renderPlayerPager() {
@@ -1787,12 +1952,8 @@ async function openPlayer(username, force) {
 function adoptPlayer(view) {
   var edit = {level: view.level, money: view.money,
               materials: {}, inventory: {}};
-  view.materials.forEach(function (row) {
-    if (!row.locked) { edit.materials[row.id] = row.count; }
-  });
-  view.inventory.forEach(function (row) {
-    if (!row.locked) { edit.inventory[row.id] = row.count; }
-  });
+  view.materials.forEach(function (row) { edit.materials[row.id] = row.count; });
+  view.inventory.forEach(function (row) { edit.inventory[row.id] = row.count; });
   PLAYER = {view: view, edit: edit};
   say($("playerMsg"), "");
   renderPlayer();
@@ -1807,9 +1968,7 @@ function playerDirty() {
   if (Number(edit.money) !== view.money) { return true; }
   return ["materials", "inventory"].some(function (bucket) {
     var was = {};
-    view[bucket].forEach(function (row) {
-      if (!row.locked) { was[row.id] = row.count; }
-    });
+    view[bucket].forEach(function (row) { was[row.id] = row.count; });
     return Object.keys(edit[bucket]).some(function (id) {
       return Number(edit[bucket][id]) !== (was[id] || 0);
     }) || Object.keys(was).some(function (id) {
@@ -1852,19 +2011,17 @@ function ownMeta(itemId) {
   return name === ("#" + itemId) ? itemMeta(itemId) : ("#" + itemId);
 }
 
-/** 画一整格 —— 锁着的（商店在卖）只显示，不给改。 */
+/** 画一整格。★ 2026-09-06 之后**每一格都能改**（D23a）——
+ *  原来商店在卖的那批画成锁着的只读格，那条限制撤了。 */
 function paintOwned(bucket, host, emptyText) {
   host.textContent = "";
-  var view = PLAYER.view;
-  var lockedRows = view[bucket].filter(function (row) { return row.locked; });
   var ids = Object.keys(PLAYER.edit[bucket]).map(Number)
     .sort(function (a, b) { return a - b; });
-  if (!ids.length && !lockedRows.length) {
+  if (!ids.length) {
     host.appendChild(el("div", "own-empty", emptyText));
     return;
   }
   ids.forEach(function (itemId) { host.appendChild(ownNode(bucket, itemId)); });
-  lockedRows.forEach(function (row) { host.appendChild(lockedNode(row)); });
 }
 
 /** 服务端说这件东西的数量有没有意义（装备类没有，见 admin.py 的 `stackable`）。*/
@@ -1939,29 +2096,11 @@ function ownNode(bucket, itemId) {
   return box;
 }
 
-function lockedNode(row) {
-  var box = el("div", "own locked");
-  box.appendChild(slotNode(row.id, 26, true, false));
-  var col = tipFor(el("div", "col"), row.id);
-  col.appendChild(el("div", "nmz", ownName(row.id)));
-  var meta = el("div", "meta",
-                row.stackable === false ? ownMeta(row.id)
-                                        : (ownMeta(row.id) + " ×" + row.count));
-  if (row.equipped) { meta.appendChild(el("span", "worn", "穿着")); }
-  col.appendChild(meta);
-  box.appendChild(col);
-  var lock = el("span", "lock", "🔒");
-  lock.title = "商店在卖的东西不能直接改 —— 改金币和等级，让玩家自己去买";
-  box.appendChild(lock);
-  return box;
-}
-
-/** 「＋ 加一种」。已经有的就把它加回来，别加出两张一样的格子。 */
+/** 「＋ 加一种」。已经有的就把它加回来，别加出两张一样的格子。
+ *  ★ **不再挡掉「商店在卖的」**（D23a）—— 那条限制 2026-09-06 撤了。 */
 function addOwned(bucket, kinds) {
-  var listed = listedIds();
   openPicker({
     kinds: kinds,
-    filter: function (item) { return !listed[item.id]; },
     onPick: function (item) {
       if (!Number(PLAYER.edit[bucket][item.id])) {
         PLAYER.edit[bucket][item.id] = 1;
@@ -2036,8 +2175,11 @@ function showLoggedIn(name, role) {
   $("logout").classList.remove("hidden");
   $("loginView").classList.add("hidden");
   $("mainView").classList.remove("hidden");
-  // 标签行在顶栏那块 sticky 容器里，不跟着 `mainView` 走 —— 自己开关一次。
+  // 标签行在顶栏那块壳里，不跟着 `mainView` 走 —— 自己开关一次。
   $("tabs").classList.remove("hidden");
+  // 登进来默认停在物品库 ⇒ 直接进「撑满 + 列表自己滚」那套（D39）。
+  // 之后换标签由 `switchTab` 管。
+  $("mainArea").classList.toggle("fit", CONFIGS.indexOf(TAB) >= 0);
   applyRoleToTabs();
   boot();
 }
@@ -2056,22 +2198,23 @@ function showLoggedOut(message) {
   $("logout").classList.add("hidden");
   $("mainView").classList.add("hidden");
   $("tabs").classList.add("hidden");
+  // 登录页是普通页面，别让它继承配置页那套「撑满 + 内部滚动」（D39）。
+  $("mainArea").classList.remove("fit");
   $("loginView").classList.remove("hidden");
   if (message) { say($("loginMsg"), message, false); }
 }
 
 async function boot() {
-  say($("cfgMsg"), "读取中……", true);
+  toast("读取中……", true);
   var result = await api("/admin/api/catalog");
   if (bounced(result)) { return; }
-  if (!result.ok) { say($("cfgMsg"), result.message, false); return; }
+  if (!result.ok) { toast(result.message, false); return; }
   CAT = result;
   BYID = {};
   CAT.items.forEach(function (item) { BYID[item.id] = item; });
   if (!CAT.icons) {
-    say($("cfgMsg"), "图标图集没生成（server/web/itemicons.png）——"
-                     + "先跑 tools\\update-shopicons.bat，格子里会一直是问号。",
-        false);
+    toast("图标图集没生成（server/web/itemicons.png）——"
+          + "先跑 tools\\update-shopicons.bat，格子里会一直是问号。", false);
   }
   var ok = true;
   for (var i = 0; i < CONFIGS.length; i += 1) {
@@ -2091,6 +2234,9 @@ function switchTab(tab) {
     button.classList.toggle("on", button.getAttribute("data-tab") === tab);
   });
   var isConfig = CONFIGS.indexOf(tab) >= 0;
+  // ★ 只有那四个配置页是「面板撑满、列表自己滚」（D39）；玩家资料 /
+  //   管理员账号是普通长页面，整块跟着 `main` 滚。
+  $("mainArea").classList.toggle("fit", isConfig);
   $("cfgPanel").classList.toggle("hidden", !isConfig);
   $("adminsPanel").classList.toggle("hidden", tab !== "admins");
   $("playersPanel").classList.toggle("hidden", tab !== "players");
@@ -2138,8 +2284,10 @@ function wire() {
   $("playerSearch").addEventListener("keydown", function (event) {
     if (event.key === "Enter") { searchPlayers(0); }
   });
-  // 同上：不能直接挂 `refreshPlayers`（Event 会被当第一个参数）。
-  $("playerRefreshBtn").onclick = function () { refreshPlayers(); };
+  // 同上：不能直接挂 `refreshAccounts`（Event 会被当第一个参数）。
+  // ★ 两页共用一发（D43）—— 点哪个都刷两边。
+  $("playerRefreshBtn").onclick = function () { refreshAccounts(); };
+  $("adminRefreshBtn").onclick = function () { refreshAccounts(); };
   $("playerLevel").oninput = function () {
     PLAYER.edit.level = Math.max(1, Number($("playerLevel").value) || 1);
     playerTouched();
@@ -2164,6 +2312,11 @@ function wire() {
   };
   $("pickKind").onchange = function () {
     PICKER.kind = $("pickKind").value;
+    PICKER.page = 0;
+    paintPicker();
+  };
+  $("pickCharacter").onchange = function () {
+    PICKER.character = $("pickCharacter").value;
     PICKER.page = 0;
     paintPicker();
   };

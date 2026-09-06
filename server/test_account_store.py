@@ -1177,6 +1177,25 @@ class AdminAccountTests(unittest.TestCase):
         self.assertEqual(AUTH_NO_SUCH_USER,
                          self.store.admin_verify("nobody", "whatever"))
 
+    def test_a_player_can_be_taken_in_as_an_operator(self):
+        """`admin_add_from_player`：用户名和明文密码原样照搬（D40）。"""
+        self.store.register("alice", "pw1")
+        self.assertEqual(["alice"], self.store.admin_add_from_player("alice"))
+        self.assertEqual("operator", self.store.admin_role("alice"))
+        self.assertEqual(AUTH_OK, self.store.admin_verify("alice", "pw1"))
+        # 玩家那一边一个字节都没动。
+        self.assertEqual(AUTH_OK, self.store.verify("alice", "pw1")[0])
+
+    def test_taking_in_a_player_twice_or_a_stranger_is_refused(self):
+        self.store.register("alice", "pw1")
+        self.store.admin_add_from_player("alice")
+        with self.assertRaises(AccountError):
+            self.store.admin_add_from_player("alice")
+        with self.assertRaises(AccountError):
+            self.store.admin_add_from_player("nobody")
+        # 两次都失败了 ⇒ 表里还是只有那一个。
+        self.assertEqual(["alice"], self.store.admin_names())
+
     def test_add_and_remove(self):
         self.store.ensure_item_fields()
         self.assertEqual([DEFAULT_ADMIN_NAME, "carol"],

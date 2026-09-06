@@ -9,9 +9,10 @@
 </head>
 <body>
 
-<!-- ★ 顶栏 + 标签行整块 `position: sticky`：往下滚时它俩钉在画面顶上，
-     只有标签行**下面**的内容跟着滚（用户 2026-09-05）。
-     两者必须在**同一个** sticky 容器里，否则标签行只有 `main` 那么宽，
+<!-- ★ 整页是一张**撑满窗口的壳**（D39）：`body` 竖着排三段，顶栏 + 标签行
+     占自己那点高度，剩下的全给 `main`，滚动条长在里面。这样顶栏永远在
+     画面顶上，而配置页还能再往下分一层「筛选条 / 换页栏钉住、只有列表滚」。
+     顶栏和标签行必须在**同一个**容器里，否则标签行只有 `main` 那么宽，
      滚上来的内容会从左右两边露出来。 -->
 <div class="appbar">
   <header class="topbar">
@@ -30,7 +31,7 @@
   </nav>
 </div>
 
-<main>
+<main id="mainArea">
 
   <!-- ========================= 登录 ========================= -->
   <section id="loginView" class="panel hidden">
@@ -40,7 +41,7 @@
         <code>admin_accounts</code> 段里，和玩家账号一样是明文的。</p>
       <label for="loginName">管理员名</label>
       <input id="loginName" type="text" autocomplete="username">
-      <label for="loginPass">口令</label>
+      <label for="loginPass">密码</label>
       <input id="loginPass" type="password" autocomplete="current-password">
       <div style="margin-top:14px">
         <button class="btn btn-primary" id="loginBtn">登录</button>
@@ -60,16 +61,21 @@
       </div>
       <div class="panel-body">
         <ul class="help" id="cfgHelp"></ul>
-        <div class="toolbar" id="cfgToolbar"></div>
+        <!-- ★ 筛选条件和「添加 / 放弃修改 / 保存」**同一行**，跟换页栏一起
+             钉在列表上面（用户 2026-09-06，D39）：往下滚只滚列表，这两条
+             永远看得见。列表**下面一个元素都不放** —— 原来的 `panel-foot`
+             搬到了这儿，消息条改成右上角自己消失的浮条（`toast`）。 -->
+        <div class="toolbar cfg-bar">
+          <div class="filters" id="cfgToolbar"></div>
+          <div class="acts">
+            <button class="btn" id="cfgAdd">添加</button>
+            <span class="dirty clean" id="cfgDirty"></span>
+            <button class="btn" id="cfgReset">放弃修改</button>
+            <button class="btn btn-primary" id="cfgSave">保存</button>
+          </div>
+        </div>
+        <div class="pager" id="cfgPager"></div>
         <div id="cfgList"></div>
-        <div class="msg" id="cfgMsg"></div>
-      </div>
-      <div class="panel-foot">
-        <button class="btn" id="cfgAdd">＋ 添加一条</button>
-        <span class="dirty clean" id="cfgDirty"></span>
-        <span style="margin-left:auto"></span>
-        <button class="btn" id="cfgReset">放弃修改</button>
-        <button class="btn btn-primary" id="cfgSave">保存</button>
       </div>
     </section>
 
@@ -84,9 +90,9 @@
           <li>按<b>用户名或昵称</b>搜（对大小写不敏感，写一部分就行；留空列前几个）。</li>
           <li><b>等级</b>改的其实是经验 —— 等级是从经验推出来的派生字段，
             所以会落到该等级的起点经验。已经是这一级就不动它。</li>
-          <li>★ <b>商店在卖的东西不能直接改</b>（格子上有把锁）：那批物品带着
-            等级门槛，直接塞进仓库就绕过了「够等级才买得到」。
-            要给就<b>改金币和等级</b>，让玩家自己进商店买。</li>
+          <li>仓库里<b>什么都能加、什么都能改</b>，商店在卖的也一样
+            —— 等级门槛在<b>穿上</b>那一刻客户端还会再判一次，
+            等级不够的东西塞进仓库也穿不上身。</li>
           <li>玩家<b>在线时改完即时生效</b>（金币 / 等级 / 仓库 / 装备一起推下去），
             不用重登。</li>
         </ul>
@@ -103,7 +109,7 @@
           <table>
             <thead><tr>
               <th>用户名</th><th>昵称</th><th style="width:64px">等级</th>
-              <th style="width:96px">金币</th><th style="width:78px"></th>
+              <th style="width:96px">金币</th><th style="width:236px"></th>
             </tr></thead>
             <tbody id="playerRows"></tbody>
           </table>
@@ -136,7 +142,7 @@
 
           <h3 class="sub">仓库物品</h3>
           <div class="own-grid" id="playerInventory"></div>
-          <button class="btn btn-sm" id="playerAddItem">＋ 加一件非商店物品</button>
+          <button class="btn btn-sm" id="playerAddItem">＋ 加一件物品</button>
 
           <div class="msg" id="playerMsg"></div>
         </div>
@@ -151,10 +157,16 @@
 
     <!-- ---------------- 管理员账号 ---------------- -->
     <section class="panel hidden" id="adminsPanel">
-      <div class="panel-title"><h2>管理员账号</h2></div>
+      <!-- ★ 刷新钮放在标题栏右端、只画一个圆箭头（用户 2026-09-06）——
+           单给它一行太突兀，这一页又没有筛选条可以搭。 -->
+      <div class="panel-title">
+        <h2>管理员账号</h2>
+        <button class="icon-btn" id="adminRefreshBtn" aria-label="刷新"
+                title="重新读一遍管理员名单和玩家列表">↻</button>
+      </div>
       <div class="panel-body">
         <p class="hint">
-          口令是<b>明文</b>保存的（和玩家账号一个口径）。
+          密码是<b>明文</b>保存的（和玩家账号一个口径）。
           至少要保留一个<b>系统管理员</b> —— 全删光了（或者全降成运营）
           就没人进得来这一页，只能上服务器改 JSON。
         </p>
@@ -179,7 +191,7 @@
             <input id="newAdminName" type="text">
           </div>
           <div>
-            <label for="newAdminPass">口令</label>
+            <label for="newAdminPass">密码</label>
             <input id="newAdminPass" type="password" autocomplete="new-password">
           </div>
           <div>
@@ -194,19 +206,19 @@
 
         <div class="row" style="margin-top:12px">
           <div>
-            <label for="pwName">改谁的口令</label>
+            <label for="pwName">改谁的密码</label>
             <input id="pwName" type="text">
           </div>
           <div>
-            <label for="pwValue">新口令</label>
+            <label for="pwValue">新密码</label>
             <input id="pwValue" type="password" autocomplete="new-password">
           </div>
-          <div><button class="btn" id="setPw">改口令</button></div>
+          <div><button class="btn" id="setPw">改密码</button></div>
         </div>
 
         <p class="hint" style="margin-top:14px">
           名字规则：__USERNAME_RULE__<br>
-          口令规则：__PASSWORD_RULE__
+          密码规则：__PASSWORD_RULE__
         </p>
         <div class="msg" id="adminMsg"></div>
       </div>
@@ -226,14 +238,17 @@
       <div class="toolbar">
         <input id="pickSearch" type="text" placeholder="搜 中文名 / 韩文名 / id">
         <select id="pickKind"></select>
+        <!-- 角色按**物品库里那份角色限定**筛（D31），和物品库那一页一个口径。 -->
+        <select id="pickCharacter"></select>
         <span class="grow"></span>
         <button class="btn" id="pickClose">关闭</button>
       </div>
       <!-- 换页栏只有网格**上面**这一条（D37b）：800 多件东西一页放不下。
            下面那条删了 —— 在底下换到末页时画面会被夹着跳。 -->
       <div class="pager" id="pickPagerTop"></div>
+      <!-- 详情**只走浮窗**（用户 2026-09-06）：网格底下原来还有一条侧栏，
+           写的是同一批东西，而「在不在卖」还是现问服务端的旧值。 -->
       <div class="pick-grid" id="pickGrid"></div>
-      <div class="pick-detail" id="pickDetail"></div>
     </div>
   </div>
 </div>
@@ -248,6 +263,11 @@
     <div class="panel-foot" id="dialogButtons"></div>
   </div>
 </div>
+
+<!-- ========================= 右上角浮条（D39） =========================
+     「已保存」这类回执原来写在列表下面 —— 那儿现在什么都不放了。浮条不挡
+     操作（容器不吃点击），成功的几秒后自己走，出错的留着等人点掉。 -->
+<div class="toasts" id="toasts"></div>
 
 </body>
 </html>

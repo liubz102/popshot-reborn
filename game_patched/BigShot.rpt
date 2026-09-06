@@ -392,3 +392,57 @@ Address   Frame
 7609FCC9  0019FF80  BaseThreadInitThunk+19
 77E882AE  0019FFDC  RtlGetAppContainerNamedObjectPath+11E
 77E8827E  0019FFEC  RtlGetAppContainerNamedObjectPath+EE
+
+
+
+==================   logged at 09/06/26, 21:47:06    ==========================
+
+Version: 311
+Dump File Name: D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\Dump\BigShotV0311N011.mdmp
+Exception code: C0000005 ACCESS_VIOLATION
+Fault address:  0058CBFF 01:0018BBFF D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+
+Registers:
+EAX:3CCEEB14
+EBX:3CD619A0
+ECX:00000058
+EDX:0019FA70
+ESI:00000000
+EDI:3CDBED18
+CS:EIP:0023:0058CBFF
+SS:ESP:002B:0019FA50  EBP:0019FA50
+DS:002B  ES:002B  FS:0053  GS:002B
+Flags:00010206
+
+Call stack:
+Address   Frame
+0058CBFF  0019FA50  0001:0018BBFF D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+005D280D  0019FB04  0001:001D180D D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+3D5C0800  BFA38768  0000:00000000 
+
+
+
+==================   logged at 09/06/26, 21:47:44    ==========================
+
+Version: 311
+Dump File Name: D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\Dump\BigShotV0311N012.mdmp
+Exception code: C0000005 ACCESS_VIOLATION
+Fault address:  0058CBFF 01:0018BBFF D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+
+Registers:
+EAX:3D47BC34
+EBX:3D5306F8
+ECX:00000058
+EDX:0019FA70
+ESI:00000000
+EDI:3D537008
+CS:EIP:0023:0058CBFF
+SS:ESP:002B:0019FA50  EBP:0019FA50
+DS:002B  ES:002B  FS:0053  GS:002B
+Flags:00010202
+
+Call stack:
+Address   Frame
+0058CBFF  0019FA50  0001:0018BBFF D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+005D280D  0019FB04  0001:001D180D D:\git\popshot-reborn\develop\3_Shop_Craft\game_patched\BigShot.exe
+3D5C0800  BFA38768  0000:00000000 

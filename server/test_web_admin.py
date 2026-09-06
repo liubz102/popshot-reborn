@@ -938,6 +938,7 @@ class OperatorPermissionTests(_AdminCase):
                                                 "password": "Another1"}),
                 ("/admin/api/admins/role", {"name": "carol", "role": "system"}),
                 ("/admin/api/admins/remove", {"name": "admin"}),
+                ("/admin/api/admins/from_player", {"name": "alice"}),
         ):
             status, result = self.request(path, payload)
             self.assertEqual(403, status, path)
@@ -979,14 +980,13 @@ class AdminItemLookupTests(_AdminCase):
 
 
 class AdminPlayerTests(_AdminCase):
-    """玩家资料页：找人、改等级/金币/材料/非商店物品（V0.3商店 D22）。
+    """玩家资料页：找人、改等级 / 金币 / 材料 / 仓库物品（V0.3商店 D22）。
 
-    ★ 这一组里最重要的是 `test_a_shop_item_cannot_be_handed_out` ——
-    商店按**真实等级**卖东西，管理页要是能直接把 4 级才卖的枪塞进 1 级号的
-    仓库，那条等级门槛就白设了。
+    ★ **商店在卖的东西也能直接发**（D23a，用户 2026-09-06 推翻了 D23）：
+    等级门槛在**穿上**那一刻还要再判一次，塞进仓库不等于绕过它。
     """
 
-    #: 挑几件东西当样本。材料一定不上架；`_ARMOR` 是「商店里买不到」的那一批。
+    #: 挑几件东西当样本。材料一定不上架；`_LISTED` 是货架上在卖的那一批。
     _MATERIAL = 10001
     _MATERIAL2 = 10002
     _ARMOR = 1010064
@@ -1086,21 +1086,31 @@ class AdminPlayerTests(_AdminCase):
         _name, account = self.accounts.get_account("alice")
         self.assertTrue(account_store.has_item(account, self._ARMOR))
 
-    def test_a_shop_item_cannot_be_handed_out(self):
-        # ★★ 这条是整组的重点：商店在卖的东西只能靠买。
+    def test_a_shop_item_can_be_handed_out_too(self):
+        """★★ D23a：商店在卖的东西**也能直接发**（用户 2026-09-06 拍板）。
+
+        以前这一条是反的（拒收 + 报「这些是商店在卖的东西」）。撤掉的理由：
+        等级门槛在**穿上**那一刻客户端还会再判一次，塞进仓库穿不上身。
+        """
         status, result = self.save(inventory={str(self._LISTED): 1})
         self.assertEqual(200, status)
-        self.assertFalse(result["ok"])
-        self.assertIn(str(self._LISTED), result["message"])
+        self.assertTrue(result["ok"], result)
         _name, account = self.accounts.get_account("alice")
-        self.assertFalse(account_store.has_item(account, self._LISTED))
+        self.assertTrue(account_store.has_item(account, self._LISTED))
 
-    def test_a_shop_item_the_player_owns_comes_back_locked(self):
+    def test_nothing_in_the_view_is_read_only_any_more(self):
+        # 「锁着的」那一类连字段都没有了 —— 前台照着它画只读格子。
         self.accounts.add_item("alice", self._LISTED)
         self.accounts.add_item("alice", self._ARMOR)
-        rows = {row["id"]: row for row in self.player()["inventory"]}
-        self.assertTrue(rows[self._LISTED]["locked"])
-        self.assertFalse(rows[self._ARMOR]["locked"])
+        for row in self.player()["inventory"]:
+            self.assertNotIn("locked", row)
+
+    def test_a_shop_item_can_be_taken_away_again(self):
+        self.accounts.add_item("alice", self._LISTED)
+        _status, result = self.save(inventory={str(self._LISTED): 0})
+        self.assertTrue(result["ok"], result)
+        _name, account = self.accounts.get_account("alice")
+        self.assertFalse(account_store.has_item(account, self._LISTED))
 
     def test_dropping_an_item_also_takes_it_off(self):
         self.accounts.add_item("alice", self._ARMOR)
@@ -1198,8 +1208,66 @@ class AdminPlayerTests(_AdminCase):
         self.assertEqual(account_store.LEVEL_MAX, view["level_max"])
         self.assertFalse(view["online"])
         self.assertEqual([{"id": self._MATERIAL, "count": 2,
-                           "locked": False, "stackable": True}],
+                           "stackable": True}],
                          view["materials"])
+
+
+class AdminPromotePlayerTests(_AdminCase):
+    """「设为管理员（运营）」：把玩家账号原样收进管理员表（D40）。
+
+    ★ 这一组里最重要的是 `test_the_password_never_travels_through_the_page`
+    —— 这个功能的全部意义就是「不用手抄密码」，抄一遍还不如手动加。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.accounts.register("alice", "pw1", display_name="爱丽丝")
+        self.login()
+
+    def test_a_player_becomes_an_operator_with_his_own_password(self):
+        status, result = self.request("/admin/api/admins/from_player",
+                                      {"name": "alice"})
+        self.assertEqual(200, status)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual("operator", self.accounts.admin_role("alice"))
+        # ★ 真正的判据：**用游戏里那套用户名密码**就能登进管理页。
+        self.request("/admin/api/logout", {})
+        self.assertTrue(self.login("alice", "pw1")[1]["ok"])
+        self.assertEqual("operator",
+                         self.request("/admin/api/session")[1]["role"])
+
+    def test_the_password_never_travels_through_the_page(self):
+        """请求里只有用户名，回文里一个密码字都不许有（铁律 9）。"""
+        _status, result = self.request("/admin/api/admins/from_player",
+                                       {"name": "alice"})
+        self.assertNotIn("pw1", json.dumps(result, ensure_ascii=False))
+
+    def test_the_player_list_says_what_role_he_already_has(self):
+        """列表上那个钮要变成灰的、写上实际权限，靠的就是这个字段。"""
+        rows = self.request("/admin/api/players?q=")[1]["players"]
+        self.assertEqual([None], [row["admin_role"] for row in rows])
+        self.request("/admin/api/admins/from_player", {"name": "alice"})
+        rows = self.request("/admin/api/players?q=")[1]["players"]
+        self.assertEqual(["operator"], [row["admin_role"] for row in rows])
+        # 后来在「管理员账号」页升成系统管理员 ⇒ 钮上的字也跟着变。
+        self.request("/admin/api/admins/role",
+                     {"name": "alice", "role": "system"})
+        rows = self.request("/admin/api/players?q=")[1]["players"]
+        self.assertEqual(["system"], [row["admin_role"] for row in rows])
+
+    def test_promoting_the_same_player_twice_is_refused(self):
+        self.assertTrue(self.request("/admin/api/admins/from_player",
+                                     {"name": "alice"})[1]["ok"])
+        _status, again = self.request("/admin/api/admins/from_player",
+                                      {"name": "alice"})
+        self.assertFalse(again["ok"])
+        self.assertIn("已经存在", again["message"])
+
+    def test_a_player_who_does_not_exist_is_refused(self):
+        _status, result = self.request("/admin/api/admins/from_player",
+                                       {"name": "nobody"})
+        self.assertFalse(result["ok"])
+        self.assertIsNone(self.accounts.admin_role("nobody"))
 
 
 class AdminSessionStoreTests(unittest.TestCase):
