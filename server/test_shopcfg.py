@@ -778,14 +778,16 @@ class SchemaTests(unittest.TestCase):
             self.assertIn(shopcfg.QUEST_ZH[option["value"]], option["label"])
 
     def test_the_difficulty_dropdown_shows_the_names_from_the_game(self):
-        # ★ 难度下拉里不能再是「难度 1/2/3/4」（用户 2026-09-05）：那四个号
+        # ★ 难度下拉里不能再是「难度 1/2/3」（用户 2026-09-05）：那几个号
         #   在游戏里各有名字，运营记的是名字不是号码。
-        # ★★ 档数不是我们定的 —— 客户端拼地图文件名那一段只认四档
-        #   （`mapdata.DIFFICULTY_SUFFIX`），校验器的上限也是 4。三处必须一致，
-        #   否则会出现「选得出来但永远命中不了」或者「存不进去」的档。
-        self.assertEqual([1, 2, 3, 4], sorted(shopcfg.DIFFICULTY_ZH))
-        self.assertEqual(mapdata.DIFFICULTY_SUFFIX.keys(),
-                         shopcfg.DIFFICULTY_ZH.keys())
+        # ★★ 档数不是我们定的 —— **玩家选得到的只有三档**：引擎里有第 4 档
+        #   （`mapdata.DIFFICULTY_SUFFIX` 四个后缀都在，bot 读地形要用），但
+        #   中国区客户端选难度时一到 4 就绕回 1（`0x466496`，V0.3商店 §38；
+        #   用户 2026-09-06 实机报「游戏里没有极限」）。下拉和校验器只认
+        #   选得到的那三档，否则运营会配出一条**永远命中不了**的规则。
+        self.assertEqual([1, 2, 3], sorted(shopcfg.DIFFICULTY_ZH))
+        self.assertTrue(set(shopcfg.DIFFICULTY_ZH) < set(mapdata.DIFFICULTY_SUFFIX),
+                        "下拉里的每一档都得是客户端拼地图文件名认得的那几档之一")
         field = next(f for f in shopcfg.SCHEMA["drops"]["fields"]
                      if f["key"] == "difficulty")
         self.assertEqual("choice", field["type"])

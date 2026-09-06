@@ -64,6 +64,20 @@ def w_wstr(s):
 # ---------------------------------------------------------------------------
 #: `part_flag`（单件）→ 分类 id。★ 判据只能是 `part_flag`，不能是 id 里的
 #: 部位码 —— §14 已经踩过一次（`1_08_0039` 的 `08` 实际是鞋）。
+#: 스킬 技能（组 2）—— 商店顶级标签「技能」发 `0x20000`（§22，消去法），
+#: 下面没有子标签，所以只要落在组 2 里就能被父标签收下。突击技（`dash`）归这儿。
+CATEGORY_SKILL = 0x20001
+#: 치장 装饰（道具 → 装饰）。喷漆 / 头饰 / 尾饰 / 翅膀 / 戒指 / 宠物这些
+#: 「不占五个衣服槽、也不是武器」的可穿戴物都归这儿 —— 商店的「道具」标签
+#: 发 `0x40000`，合成面板也有 `0x40001` 这一格（§33）。
+CATEGORY_DECOR = 0x40001
+#: 타이틀 称号（组 7）。**只有合成面板有这个标签**：2026-09-04 的实机日志里
+#: 用户从左到右点合成面板的五个顶级标签，`0x0605` 依次发了
+#: `2` / `0x40000` / `0x10000` / **`0x70000`** / `0x50003` —— 第四个就是「称号」
+#: （第五个「活动」= `0x50003`，和仓库那棵树上的 이벤트 同号）。
+#: 商店面板没有称号标签，所以称号只能靠合成拿（§7 说的原版设计也是如此）。
+CATEGORY_TITLE = 0x70001
+
 PART_FLAG_CATEGORY = {
     1: 0x10001,      # 상의 上衣
     2: 0x10002,      # 하의 下装
@@ -73,13 +87,34 @@ PART_FLAG_CATEGORY = {
     1024: 0x60001,   # 武器槽 1
     2048: 0x60002,   # 武器槽 2
     4096: 0x60003,   # 武器槽 3
+    32: CATEGORY_SKILL,      # 돌진기 突击技
+    64: CATEGORY_DECOR,      # 喷漆（染色剂）
+    128: CATEGORY_DECOR,     # 头饰
+    256: CATEGORY_DECOR,     # 尾饰
+    512: CATEGORY_DECOR,     # 翅膀
+    32768: CATEGORY_DECOR,   # 宠物
+    8192: CATEGORY_TITLE,    # 称号
 }
 #: 套装：`part_flag` 是组合值（上衣+下装+头+鞋+手套 = 31 这类）。
-CATEGORY_SET = 0x10006
+#:
+#: ★★ **id 是 `3`，不是 `0x10006`**（✅ 2026-09-06 实机：用户点商店「装备 → 套装」，
+#:   `0x0600` 发的是 `分类=0x3`，`logs/server.out` 23:43:38 / 23:49:56）。
+#:   和「新商品 = 2」「英雄 = 0」一样是不按 `(组 << 16) | 序号` 编码的小号；
+#:   §22 里被当成「误命中」划掉的那条「세트 = 3」其实是对的。
+#:   按 `0x10006` 发的后果就是用户报的「套装标签里没内容、装备父标签下却有」。
+CATEGORY_SET = 3
 #: 재료 材料。
 CATEGORY_MATERIAL = 0x50001
 #: 기타 其他 —— 兜底用，凡是归不进上面几档的都落这儿。
+#: ★ 戒指也归这儿（用户 2026-09-06）：它有属性加成，不是「装饰」。
 CATEGORY_OTHER = 0x40002
+PART_FLAG_CATEGORY[16384] = CATEGORY_OTHER   # 戒指
+
+#: 父标签**额外**收下的、不按组编码的子标签。套装（`3`）挂在「装备」
+#: （`0x10000`）下面，但 `3 >> 16 == 0`，按组算永远归不进去 —— 点「装备」
+#: 父标签时得把它一起列出来（用户 2026-09-06 看到的就是这个行为，只是
+#: 子标签那一格空着）。
+PARENT_EXTRA = {0x10000: (CATEGORY_SET,)}
 
 #: 客户端一页画 8 个格子（商店面板的槽位循环 `0x45b397: cmp .., 0x80` 步长 0x10）。
 #: ⇒ 服务端必须按 8 条一页切，多发的画不出来。
@@ -142,8 +177,31 @@ def category_matches(requested, item_category):
     if requested == item_category:
         return True
     if requested & 0xFFFF == 0:
+        if int(item_category) in PARENT_EXTRA.get(requested, ()):
+            return True             # 装备 → 套装（`3`，不按组编码）
+        if int(item_category) < 0x10000:
+            # ★ 小号 id（英雄 0 / 新商品 2 / 套装 3）不按组编码：`3 >> 16 == 0`
+            #   会让「英雄」标签（`0`）把套装全列出来。它们只走精确匹配和
+            #   `PARENT_EXTRA`。
+            return False
         return (requested >> 16) == (int(item_category) >> 16)
     return False
+
+
+def composition_category_matches(requested, item_category):
+    """合成面板版的 `category_matches` —— 只有「新商品」一格不一样。
+
+    ★ 合成面板的「新商品」不是顶级标签，它是「装备」下面的**第一个子标签**
+    （✅ 2026-09-06 实机：用户点了「装备」之后依次点子标签，`0x0605` 发的是
+    `0x10000 → 2 → 0x10005 → 0x10001 → …`；商店那边同一格是「套装 = 3」）。
+    既然挂在「装备」下面，就只该列**装备**的新东西（用户 2026-09-06）——
+    宠物 / 戒指那些在「道具」下面自己有格子。商店的「新商品」仍是顶级标签，
+    照 D32 收全部。
+    """
+    requested = int(requested)
+    if requested == CATEGORY_NEW:
+        return category_matches(0x10000, item_category)
+    return category_matches(requested, item_category)
 
 
 # ---------------------------------------------------------------------------
@@ -591,12 +649,15 @@ def check_purchase(item_id, table, level, owned, data_dir=None):
 #: `CompositionRule` 的内存大小）⇒ **8 格**，和货架一样。
 COMPOSITION_PAGE_SIZE = 8
 
-#: 合成界面点得到的**子标签**（`0x45e42f` 逐条读出来的，§33）。
+#: 合成界面点得到的**标签**（子标签是 `0x45e42f` 逐条读出来的，§33；
+#: 「称号」那一格的 id 是 2026-09-04 实机日志里抓到的，见 `CATEGORY_TITLE`）。
 #:
 #: 顶级标签有 5 个（`0x45e2f0` 那张表，索引 0/1/2/8/9）：
 #: **新商品 / 道具 / 装备 / 称号 / 活动** —— ✅ 2026-09-06 用户实机确认。
-#: 「装备」下面是 头 / 上衣 / 下装 / 手套 / 鞋，「道具」下面是 装饰 / 其他；
-#: 「称号」和「活动」这一版没有内容。
+#: 「装备」下面是 **新商品(2)** / 头 / 上衣 / 下装 / 手套 / 鞋（第一格实机发 `2`，
+#: 见 `composition_category_matches`），「道具」下面是 装饰 / 其他；
+#: 「称号」（`0x70000`）没有子标签，按父标签规则收整个组 7；
+#: 「活动」（`0x50003`）这一版没有内容。
 #:
 #: ⚠ **没有武器、没有套装**（商店那棵树有 `0x60000` 和 `0x10006`，这棵没有）
 #: ⇒ 产物归在那两类的配方，玩家只能在**新商品**那一格找到它
@@ -608,8 +669,9 @@ COMPOSITION_CATEGORIES = (
     0x10002,        # 하의 下装
     0x10003,        # 장갑 手套
     0x10004,        # 신발 鞋
-    0x40001,        # 치장 装饰
+    CATEGORY_DECOR,  # 치장 装饰（戒指 / 宠物 / 喷漆 / 头饰 / 尾饰 / 翅膀）
     0x40002,        # 기타 其他
+    CATEGORY_TITLE,  # 타이틀 称号（顶级标签 `0x70000`，无子标签）
 )
 
 
@@ -690,7 +752,8 @@ def recipe_entries(category=CATEGORY_ALL, character=CHARACTER_ANY,
         result = recipe["result"]
         if not shopdata.ownable(result):
             continue
-        if not category_matches(category, category_of(result)):
+        # ★ 合成面板的「新商品」只收装备（`composition_category_matches`）。
+        if not composition_category_matches(category, category_of(result)):
             continue
         # ★ 角色限定是**产物自己的**属性，问物品库（D31）——
         #   配方里不再有 `character` 那个字段。

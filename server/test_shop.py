@@ -324,6 +324,85 @@ class CategoryTests(_ShopCase):
         self.assertEqual(31, shopdata.part_flag(1990001))
         self.assertEqual(shop.CATEGORY_SET, shop.category_of(1990001))
 
+    def test_不占衣服槽的可穿戴物各有各的标签(self):
+        """★ 2026-09-06 全量上架时补的：以前这几类都掉进「套装」（`CATEGORY_SET`
+        是兜底），商店里点「装备 → 套装」会列出一堆喷漆和宠物。
+
+        判据是原版三棵标签树的形状（§22 / §33）：突击技是「技能」（组 2，
+        没有子标签），喷漆 / 头饰 / 尾饰 / 翅膀 / 戒指 / 宠物是「道具 → 装饰」，
+        称号是合成面板独有的「称号」（组 7，2026-09-04 实机日志里抓到的 `0x70000`）。
+        """
+        # 小表里没有这几类，照 `test_判据是_part_flag…` 的做法临时拼一张。
+        wearables = {
+            1060002: ("dash", 32), 1070001: ("spray", 64), 1110001: ("armor", 128),
+            1080013: ("armor", 256), 1090053: ("armor", 512),
+            1130059: ("ring", 16384), 220001: ("pet", 32768),
+            560001: ("title", 8192),
+        }
+        table = dict(SYNTHETIC)
+        for item_id, (kind, flag) in wearables.items():
+            table[str(item_id)] = {"id": item_id, "kind": kind, "part_flag": flag,
+                                   "ownable": True, "stock": True}
+        path = os.path.join(self.tmp.name, "wearables.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as fp:
+            json.dump(make_table(table), fp, ensure_ascii=False)
+        saved = shopdata.STORE
+        shopdata.STORE = shopdata._Store(path)
+        try:
+            self.assertEqual(shop.CATEGORY_SKILL, shop.category_of(1060002))    # 突击技
+            self.assertEqual(shop.CATEGORY_DECOR, shop.category_of(1070001))    # 喷漆
+            self.assertEqual(shop.CATEGORY_DECOR, shop.category_of(1110001))    # 头饰
+            self.assertEqual(shop.CATEGORY_DECOR, shop.category_of(1080013))    # 尾饰
+            self.assertEqual(shop.CATEGORY_DECOR, shop.category_of(1090053))    # 翅膀
+            # 戒指有属性加成，不是装饰 —— 归「其他」（用户 2026-09-06）。
+            self.assertEqual(shop.CATEGORY_OTHER, shop.category_of(1130059))    # 戒指
+            self.assertEqual(shop.CATEGORY_DECOR, shop.category_of(220001))     # 宠物
+            self.assertEqual(shop.CATEGORY_TITLE, shop.category_of(560001))     # 称号
+        finally:
+            shopdata.STORE = saved
+        # 这几个都归在各自的**组**里：父标签要收得下。
+        self.assertTrue(shop.category_matches(0x20000, shop.CATEGORY_SKILL))
+        self.assertTrue(shop.category_matches(0x40000, shop.CATEGORY_DECOR))
+        self.assertTrue(shop.category_matches(0x70000, shop.CATEGORY_TITLE))
+        self.assertFalse(shop.category_matches(0x10000, shop.CATEGORY_DECOR))
+        # 合成面板上「装饰」和「称号」两格都点得到 —— 戒指 / 宠物 / 称号的配方
+        # 不能只靠「新商品」兜着。
+        self.assertIn(shop.CATEGORY_DECOR, shop.COMPOSITION_CATEGORIES)
+        self.assertIn(shop.CATEGORY_TITLE, shop.COMPOSITION_CATEGORIES)
+
+    def test_套装标签的_id_是_3_装备父标签也收它(self):
+        """★ 2026-09-06 实机：用户点商店「装备 → 套装」，客户端发的是 `分类=0x3`
+        （和「新商品 = 2」「英雄 = 0」一样，不按组编码）。以前按组推成
+        `0x10006`，后果是「套装标签里空的、装备父标签下却有」。
+        父标签「装备」（`0x10000`）要把它一起收下 —— `3 >> 16` 是 0，按组算
+        永远归不进去，得靠 `PARENT_EXTRA`。
+        """
+        self.assertEqual(3, shop.CATEGORY_SET)
+        self.assertTrue(shop.category_matches(3, shop.CATEGORY_SET))
+        self.assertTrue(shop.category_matches(0x10000, shop.CATEGORY_SET))
+        self.assertFalse(shop.category_matches(0x10001, shop.CATEGORY_SET))
+        self.assertFalse(shop.category_matches(0x40000, shop.CATEGORY_SET))
+        self.assertFalse(shop.category_matches(0, shop.CATEGORY_SET))
+
+    def test_合成面板的新商品只收装备(self):
+        """★ 合成面板的「新商品」是「装备」下面的第一个子标签（实机：点了装备
+        之后 `0x0605` 依次发 `2 → 0x10005 → 0x10001 …`），既然挂在装备下面就
+        只列装备（用户 2026-09-06）。商店的「新商品」是顶级标签，仍收全部（D32）。
+        """
+        for category in (0x10001, 0x10004, 0x10005, shop.CATEGORY_SET):
+            self.assertTrue(shop.composition_category_matches(shop.CATEGORY_NEW,
+                                                              category), hex(category))
+        for category in (shop.CATEGORY_DECOR, shop.CATEGORY_OTHER,
+                         shop.CATEGORY_TITLE, 0x60001, shop.CATEGORY_MATERIAL):
+            self.assertFalse(shop.composition_category_matches(shop.CATEGORY_NEW,
+                                                               category), hex(category))
+        # 别的标签和商店一个口径。
+        self.assertTrue(shop.composition_category_matches(0x40000, shop.CATEGORY_OTHER))
+        self.assertTrue(shop.composition_category_matches(0x40002, shop.CATEGORY_OTHER))
+        self.assertFalse(shop.composition_category_matches(0x40001, shop.CATEGORY_OTHER))
+        # 商店那边的「新商品」没变。
+        self.assertTrue(shop.category_matches(shop.CATEGORY_NEW, shop.CATEGORY_DECOR))
+
     def test_材料和不认识的落到各自的兜底(self):
         self.assertEqual(shop.CATEGORY_MATERIAL, shop.category_of(30018))
         self.assertEqual(shop.CATEGORY_OTHER, shop.category_of(9999999))
@@ -947,16 +1026,21 @@ class CompositionListTests(_ShopCase):
         self.assertEqual([2120041], [r["result"] for r in 角色1])
         self.assertEqual([1010001, 2120041], [r["result"] for r in 不限])
 
-    def test_新商品那一格列全部配方(self):
-        # 合成面板打开时默认停在这一格 —— 空的话玩家以为功能坏了。
+    def test_新商品那一格只列装备的配方(self):
+        """★ 合成面板的「新商品」是「装备」下面的第一个子标签（实机 `0x0605`
+        序列 `0x10000 → 2 → 0x10005 → …`），所以只列**装备**（用户 2026-09-06，
+        推翻 D32 里合成那一半）—— 商店的「新商品」是顶级标签，仍收全部。
+
+        ⚠ 武器产物在合成面板上因此**哪儿都点不到**（没有武器标签）：
+        本版不合成武器（D44），要合成的话先想清楚放哪儿。
+        """
         with recipe_config([self.recipe(1010001), self.recipe(1120041)]):
             新商品, _ = shop.recipe_entries(category=shop.CATEGORY_NEW)
             上衣, _ = shop.recipe_entries(category=0x10001)
-        self.assertEqual([1010001, 1120041],
-                         [r["result"] for r in 新商品])
-        # ★ 武器产物在「装备」那几个标签下**点不到**（合成面板没有武器标签），
-        #   现在靠「新商品」兜住了。
+            全部, _ = shop.recipe_entries()
+        self.assertEqual([1010001], [r["result"] for r in 新商品])
         self.assertEqual([1010001], [r["result"] for r in 上衣])
+        self.assertEqual([1010001, 1120041], [r["result"] for r in 全部])
 
     def test_一页八条_和货架一样(self):
         """★ 判据是 `0x45f011` 的循环走 `0..0x100` 步长 `0x20`（8 格），

@@ -976,7 +976,7 @@ function markBadCard(message) {
   var card = $("cfgList").querySelector('[data-index="' + index + '"]');
   if (!card) { return; }
   card.classList.add("bad", "flash");
-  card.scrollIntoView({block: "center", behavior: "smooth"});
+  revealIfHidden(card);
 }
 
 /** 原数组下标 `index` 的那一条，排在**当前筛选结果**的第几位；筛没了就 -1。 */
@@ -1157,13 +1157,30 @@ var RENDERERS = {items: renderItems, shop: renderShop,
 
 function repaintList() {
   var list = $("cfgList");
+  // ★ 重画**一律不动滚动条**（用户 2026-09-07）：清空再填是同一个任务里做完的，
+  //   浏览器本来就不会动它；这一发是把「不许动」写死，免得日后谁往重画里插
+  //   一句读版面的代码，位置就被夹没了。
+  var keep = list.scrollTop;
   list.textContent = "";
   var view = pageRows(CURRENT);
   // ★ 换页栏画在 `#cfgPager` 里，**在滚动区外面**（D39）—— 它得跟筛选条
   //   一起钉住不动。只有一页时整条不画（`.pager:empty` 连外边距一起收掉）。
   paintPager(CURRENT, view);
   RENDERERS[CURRENT](list, view.rows);
+  list.scrollTop = keep;
   touched();
+}
+
+/** 只在这张卡**不在可视区里**时才把它挪进来，而且挪最少的距离（`nearest`，
+ *  不做动画）；已经在视野里就一动不动。★ 全页只剩两处会主动动滚动条 ——
+ *  保存报错定位到出错那张卡、「添加」定位到新卡 —— 都走这儿
+ *  （用户 2026-09-07：不要自动调整滚动条，能删的都删）。 */
+function revealIfHidden(card) {
+  var list = $("cfgList");
+  var box = list.getBoundingClientRect();
+  var it = card.getBoundingClientRect();
+  if (it.top >= box.top && it.bottom <= box.bottom) { return; }
+  card.scrollIntoView({block: "nearest"});
 }
 
 /** 这一条说的是**哪件物品**。
@@ -1218,7 +1235,53 @@ function visibleEntries(which) {
   CFG[which].entries.forEach(function (entry, index) {
     if (matches(which, entry)) { rows.push({entry: entry, index: index}); }
   });
+  if (which === "drops") {
+    rows.sort(function (a, b) {
+      return (dropRank(a.entry) - dropRank(b.entry)) || (a.index - b.index);
+    });
+  }
   return rows;
+}
+
+/** 材料掉落的显示顺序：模式 → 关卡 → 难度 → 材料 递增（用户 2026-09-06），
+ *  「不限」排在具体号码前面，闯关排在对战前面。
+ *
+ *  ★★ **只在整份数据换掉时排一次**（读盘 / 刷新 / 保存回执都会换掉
+ *  `CFG.drops.entries` 这个数组），之后编辑**不再重排**：改完材料那一行
+ *  当场跳到别处，视野里的内容整体换一截，看上去就是「滚动条自己滚了」
+ *  （用户 2026-09-07）。名次按条目**对象**记（WeakMap），删条目不影响，
+ *  新加的没有名次 ⇒ 排最后。`index` 仍是原数组的下标 —— 服务端报错、
+ *  三方合并（D36）认的都是它。 */
+var DROP_ORDER = {entries: null, rank: null};
+
+function dropSortKey(entry) {
+  function num(v) {
+    return (v === undefined || v === null || v === "") ? 0 : (Number(v) || 0);
+  }
+  return [(entry.mode || "quest") === "quest" ? 0 : 1,
+          num(entry.stage), num(entry.difficulty), num(entry.material)];
+}
+
+function dropRank(entry) {
+  if (DROP_ORDER.entries !== CFG.drops.entries) {
+    DROP_ORDER.entries = CFG.drops.entries;
+    DROP_ORDER.rank = new WeakMap();
+    CFG.drops.entries.map(function (item, index) {
+      return {entry: item, index: index, key: dropSortKey(item)};
+    }).sort(function (a, b) {
+      for (var i = 0; i < a.key.length; i++) {
+        if (a.key[i] !== b.key[i]) { return a.key[i] - b.key[i]; }
+      }
+      return a.index - b.index;
+    }).forEach(function (row, at) {
+      if (row.entry && typeof row.entry === "object") {
+        DROP_ORDER.rank.set(row.entry, at);
+      }
+    });
+  }
+  var at = (entry && typeof entry === "object") ? DROP_ORDER.rank.get(entry)
+                                                : undefined;
+  return (at === undefined) ? Infinity : at;
 }
 
 /** 一页画几条（D37）。★ 这是**界面取舍**（一次铺 800 张卡 DOM 会卡手），
@@ -1229,7 +1292,9 @@ function pageCount(total) {
   return Math.max(1, Math.ceil(total / PAGE_SIZE));
 }
 
-/** 这一页要画的那些记录，顺带把「筛出 x / y　第 m / n 页」写上。 */
+/** 这一页要画的那些记录，顺带把「筛出 x / y　第 m / n 页」写上。
+ *  （掉落页的显示顺序在 `visibleEntries` 里定，这里不再另排 —— 翻页、
+ *  报错定位用的 `positionOf` 才和画面一致。） */
 function pageRows(which) {
   var all = visibleEntries(which);
   var pages = pageCount(all.length);
@@ -1520,8 +1585,10 @@ function materialSlots(entry, card) {
           onPick: function (item) { material.id = item.id; repaintList(); }});
       };
       cell.appendChild(slot);
-      cell.appendChild(el("div", "nmz", (BYID[material.id] || {}).name
-                                        || ("#" + material.id)));
+      // ★ 名字问物品库（`itemName`，D31）—— 以前读的是物品表里自动翻的那份，
+      //   在物品库里把「龙之泪」改成「龙之血」之后，这一格还写着旧名字
+      //   （用户 2026-09-06 报的）。
+      cell.appendChild(el("div", "nmz", itemName(material.id)));
       var count = fieldNode(countSpec, material, touched);
       cell.appendChild(count.lastChild);
       var drop = el("button", "btn btn-sm drop", "移除");
@@ -1552,8 +1619,8 @@ function renderDrops(list, rows) {
                                   repaintList(); }});
     };
     who.appendChild(slot);
-    who.appendChild(el("div", "nmz", (BYID[entry.material] || {}).name
-                                     || ("#" + entry.material)));
+    // ★ 同上：名字只认物品库那一份（D31）。
+    who.appendChild(el("div", "nmz", itemName(entry.material)));
 
     var placed = false;
     restFields("drops", entry, ["material"], touched).forEach(function (node) {
@@ -2399,7 +2466,7 @@ function addEntry(which) {
       renderCurrent();
       var card = $("cfgList").querySelector(
         '[data-index="' + (CFG[which].entries.length - 1) + '"]');
-      if (card) { card.scrollIntoView({block: "center", behavior: "smooth"}); }
+      if (card) { revealIfHidden(card); }
     }
   });
 }
