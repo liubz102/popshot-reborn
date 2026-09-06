@@ -535,8 +535,8 @@ def character_state(x, y, vx=0, vy=0, facing=FACING_RIGHT, on_ground=True,
       （用户 2026-08-26 第三轮实机报的症状）；
     * 走的时候按 `walk_keys(方向)` 置起对应的位，动画和位移就都对了。
 
-    ★ **腾空时调用方应当填 0**：那一段动画是 `Jump`（不看掩码），而收方
-    `0x507402` 会拿按键**覆写**空中速度（`× 1.5`），把抄来的抛体速度冲掉。
+    腾空仍报告实际按键。普通空中积分不读键，但 Jump 会读（§186）；
+    BSM1 客户端保留事件的动画副作用，由服务端独占事件造成的运动变化。
 
     ## ★★ `fast_run`：真人按着右键跑的那一段（§40）
 
@@ -926,7 +926,7 @@ class BotSyncStream:
             self.events = 0
 
     # -- 组包 ---------------------------------------------------------------
-    def heartbeat(self, state):
+    def heartbeat(self, state, motion=None):
         """一发心跳。**N 恒等于已发出的事件包数**（不变式 2）。
 
         ⚠ 心跳的 N **不是**「收方什么时候执行事件包」的开关（旧 §50 是这么
@@ -937,6 +937,9 @@ class BotSyncStream:
         with self._lock:
             self._sync_epoch()
             body = heartbeat_body(self.events, self.conn.my_seat, state)
+            if motion is not None:
+                import botmotion
+                body += botmotion.trailer(*motion)
             # ★ 心跳的头 `+8` 恒 0（语料 67186 发只有这一个取值）——
             #   它没有任何可判新旧的原版字段，所以下行也绝不能双发。
             return build_peer_packet(self.conn.my_seat, OP_HEARTBEAT, body,

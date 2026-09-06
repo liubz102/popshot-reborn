@@ -421,6 +421,8 @@ static void *install_inline_hook(void *target, void *detour, const char *name)
     return tramp;
 }
 
+#include "bot_motion.inc"
+
 /* 主模块地址范围，用来在栈里筛出「自己人」的返回地址 */
 static UINT_PTR g_mod_lo = 0, g_mod_hi = 0;
 
@@ -2950,6 +2952,151 @@ static int try_patch_proj_diag(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* ★ 远端角色逐帧诊断（V0.3 会话 68 / §191）                                     */
+/*                                                                            */
+/*   每帧每个**远端座位**的角色打一行：位置 / 速度 / 踩地 / 走路方向 / 方向键 /   */
+/*   冲刺 / 运动约束。hook 在 0x50d404（`Character` 每帧按速度推位置的那一发，    */
+/*   0x507775 直接 call，__thiscall ecx=角色）：它在本帧的行走（0x507660）之后、  */
+/*   腾空积分之前跑。心跳解码器 0x5041e1（esi=角色）再打一行「收到心跳前」的     */
+/*   快照 —— 和它后面那行 CHAR. 一比，就是这一发心跳把角色拽了多远。            */
+/*                                                                            */
+/*   这是 bot 卡顿调查缺了十几轮的那份「收方到底画在哪」的证据：以前只有开火     */
+/*   那一刻的位置（FIRE>，一局几百发），这个是每帧的。                          */
+/*   默认跟日志级别走（同 PROJ.）；`BSHOOK_CHAR_DIAG=1` 在精简模式下也能强制开。  */
+/* -------------------------------------------------------------------------- */
+#define CHAR_TICK_VA  0x0050D404u   /* push ebp; mov ebp,esp; sub esp,38; push esi; mov esi,ecx */
+static const unsigned char CHAR_TICK_SIG[] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x38, 0x56, 0x8B, 0xF1 };
+#define CHAR_READ_VA  0x005041E1u   /* push ebp; mov ebp,esp; sub esp,1c; push 18 */
+static const unsigned char CHAR_READ_SIG[] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x1C, 0x6A, 0x18 };
+static void *g_char_tick_tramp = NULL;
+static void *g_char_read_tramp = NULL;
+static volatile LONG g_char_diag_patched = 0;
+
+static int char_diag_enabled(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_CHAR_DIAG", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return g_verbose ? 1 : 0;   /* 没设 = 跟日志级别 */
+    return buf[0] != '0';
+}
+
+/* 这个对象是不是「座位表里登记着的远端角色」：会话 +0x1d0+座位*4 指着它，
+   而且座位不是我的。掉落物 / 弹体 / 怪也走 0x50d404，一律不打。 */
+static int char_remote_seat(unsigned char *p)
+{
+    UINT_PTR *pp = (UINT_PTR *)MYSEAT_PP;
+    UINT_PTR ctx;
+    int seat, mine;
+    if (IsBadReadPtr(pp, 4)) return -1;
+    ctx = *pp;
+    if (!ctx || IsBadReadPtr((void *)(ctx + 0x1CC), 4 + 4 * 6)) return -1;
+    seat = *(int *)(p + 0x2AC);
+    mine = *(int *)(ctx + 0x1CC);
+    if (seat < 0 || seat >= 6 || seat == mine) return -1;
+    if (*(UINT_PTR *)(ctx + 0x1D0 + seat * 4) != (UINT_PTR)p) return -1;
+    return seat;
+}
+
+#define CF(off) (*(float *)(p + (off)))
+#define CI(off) (*(int   *)(p + (off)))
+#define CB(off) (*(unsigned char *)(p + (off)))
+
+static void __cdecl char_tick_log(void *obj)
+{
+    unsigned char *p = (unsigned char *)obj;
+    int seat;
+    if (!p || IsBadReadPtr(p, 0x4D0)) return;
+    seat = char_remote_seat(p);
+    if (seat < 0) return;
+    /* 走 bsvlog：每帧 × 每个远端角色，占不起 flush + DebugView 那一档。 */
+    bsvlog("CHAR.   座位 %d 角色 %08X 位置(+34,38) (%.2f, %.2f) 速度(+120,124)"
+           " (%.3f, %.3f) 踩地(+128) %d 走向(+4b4) %d 键 %c%c%c%c 冲刺(+4bc) %d"
+           " 约束(+164) %d/%d 蹲(+2b5) %d",
+           seat, (unsigned)(UINT_PTR)p, CF(0x34), CF(0x38), CF(0x120), CF(0x124),
+           CB(0x128), CI(0x4B4),
+           (CB(0x2B8) & 1) ? 'L' : '-', (CB(0x2BC) & 1) ? 'U' : '-',
+           (CB(0x2C0) & 1) ? 'R' : '-', (CB(0x2C4) & 1) ? 'D' : '-',
+           CB(0x4BC), CI(0x164), CI(0x168), CB(0x2B5));
+}
+
+static void __cdecl char_read_log(void *obj)
+{
+    unsigned char *p = (unsigned char *)obj;
+    int seat;
+    if (!p || IsBadReadPtr(p, 0x4D0)) return;
+    seat = char_remote_seat(p);
+    if (seat < 0) return;
+    bsvlog("HB<     座位 %d 角色 %08X 收心跳前 位置 (%.2f, %.2f) 速度 (%.3f, %.3f)"
+           " 踩地 %d 约束 %d",
+           seat, (unsigned)(UINT_PTR)p, CF(0x34), CF(0x38), CF(0x120), CF(0x124),
+           CB(0x128), CI(0x164));
+}
+#undef CF
+#undef CI
+#undef CB
+
+/* 0x50d404 是 __thiscall(ecx=角色)，没有栈参数；pushad 不动 ecx。 */
+static __declspec(naked) void char_tick_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push ecx
+        call char_tick_log
+        add  esp, 4
+        popfd
+        popad
+        jmp  dword ptr [g_char_tick_tramp]
+    }
+}
+
+/* 0x5041e1 的 this 在 esi（0x5041f2 起全程 `[esi+…]`），栈上是解码器自己的参数。 */
+static __declspec(naked) void char_read_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push esi
+        call char_read_log
+        add  esp, 4
+        popfd
+        popad
+        jmp  dword ptr [g_char_read_tramp]
+    }
+}
+
+static int try_patch_char_diag(void)
+{
+    unsigned char *t = (unsigned char *)CHAR_TICK_VA;
+    unsigned char *r = (unsigned char *)CHAR_READ_VA;
+
+    if (g_char_diag_patched) return 1;
+    if (IsBadReadPtr(t, sizeof(CHAR_TICK_SIG))
+        || IsBadReadPtr(r, sizeof(CHAR_READ_SIG))) return 0;
+    if (g_char_tick_tramp == NULL) {
+        if (memcmp(t, CHAR_TICK_SIG, sizeof(CHAR_TICK_SIG)) != 0)
+            return 0;                      /* 还没解壳到这里，或不是这个版本 */
+        g_char_tick_tramp = install_inline_hook((void *)CHAR_TICK_VA,
+                                                char_tick_detour,
+                                                "远端角色逐帧诊断");
+        if (!g_char_tick_tramp) return 0;
+    }
+    if (g_char_read_tramp == NULL) {
+        if (memcmp(r, CHAR_READ_SIG, sizeof(CHAR_READ_SIG)) != 0)
+            return 0;
+        g_char_read_tramp = install_inline_hook((void *)CHAR_READ_VA,
+                                                char_read_detour,
+                                                "远端角色收心跳诊断");
+        if (!g_char_read_tramp) return 0;
+    }
+    InterlockedExchange(&g_char_diag_patched, 1);
+    bslog("PATCH   ★远端角色逐帧诊断已装 @ %08X / %08X：每帧每个远端座位打一行"
+          " CHAR.，每收一发心跳打一行 HB<（BSHOOK_CHAR_DIAG=0 可关）",
+          (unsigned)CHAR_TICK_VA, (unsigned)CHAR_READ_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* IME 闪退修复 3/3 —— 候选窗布局 0x430102 里 SumRect 之后还有一处裸解引用    */
 /*                                                                            */
 /*   bug调查/5：6 份 mdmp 全部 C0000005 @ 0x4301BD，读 0x110。0x430102 是      */
@@ -4045,6 +4192,10 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x4269AB / 0x42515E / 0x4301B4 特征串一直对不上）");
     }
 
+    /* BSM1 is a functional patch, independent of diagnostic log settings. */
+    if (!try_patch_bot_motion())
+        bslog("BSM1    !! 运动 hook 特征不匹配，保留原版处理；需要检查客户端版本");
+
     /* ★ M3b 诊断：弹体全字段快照（临时，查完「看不见 bot 的子弹」就删）。
        两个 hook 的目标函数都在战斗里才第一次跑，远晚于解壳窗口。 */
     if (!proj_diag_enabled()) {
@@ -4058,6 +4209,20 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_proj_diag_patched)
             bslog("PATCH   !! 超时未能装弹体诊断"
                   "（0x473e7c / 0x47de6a 的特征串一直对不上）");
+    }
+
+    /* ★ 远端角色逐帧诊断（V0.3 会话 68）：查 bot 卡顿要的「收方到底画在哪」。 */
+    if (!char_diag_enabled()) {
+        bslog("PATCH   不装远端角色逐帧诊断 hook（每帧每个远端角色一行，精简模式"
+              "默认关；要查 bot 同步设 BSHOOK_CHAR_DIAG=1）");
+    } else {
+        for (ticks = 0; !g_stop && !g_char_diag_patched && ticks < 2000; ticks++) {
+            if (try_patch_char_diag()) break;
+            Sleep(2);
+        }
+        if (!g_char_diag_patched)
+            bslog("PATCH   !! 超时未能装远端角色逐帧诊断"
+                  "（0x50d404 / 0x5041e1 的特征串一直对不上）");
     }
 
     /* ★ 反弹法线诊断（临时，V0.3 §102）：查 Move 的调用方是谁。 */
