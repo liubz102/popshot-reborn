@@ -11,7 +11,10 @@
 #include "sha256.h"
 
 /* 进度回调：done/total 字节（total=0 表示服务器没给长度）。
-   返回 0 = 玩家点了取消，中断下载。 */
+   返回 0 = 玩家点了取消，中断下载。
+   ★ 调用节拍是**看门狗的 200ms**，不是网络分块 —— 快源一秒能收几千块，
+   逐块回调会把界面线程的 post 队列灌满、饿死鼠标输入（见 net_http.c 头
+   注释）。回调里可以放心刷界面，但别指望每一块都通知到。 */
 typedef int (*net_progress_fn)(void *user,
                                unsigned long long done,
                                unsigned long long total);
@@ -27,9 +30,9 @@ int net_get_memory(const wchar_t *url, char *buf, size_t cap, size_t *out_len,
                    unsigned window_ms, net_cancel_fn cancel,
                    wchar_t *err_out, size_t err_cap);
 
-/* 大文件下载到 dest，边下边喂哈希（hash 可 NULL）+ 进度回调（可 NULL）。
-   expected_size>=0 时按它校验长度。返回 1 成功。取消（回调返 0）返回 0，
-   err_out = L"cancelled"。 */
+/* 大文件下载到 dest，边下边喂哈希（hash 可 NULL）+ 进度回调（可 NULL，
+   每 <=200ms 调一次，见上）。expected_size>=0 时按它校验长度。返回 1 成功。
+   取消（回调返 0）返回 0，err_out = L"cancelled"。 */
 int net_download_file(const wchar_t *url, const wchar_t *dest,
                       long long expected_size,
                       Sha256 *hash, net_progress_fn progress, void *user,

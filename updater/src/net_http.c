@@ -40,6 +40,7 @@ typedef struct Sink {
     net_progress_fn progress;
     void *user;
     int cancelled;
+    int watching;                 /* 1 = 看门狗已在跑，由它报进度 */
     /* 测速探针专用：deadline（GetTickCount64 绝对值，0 = 不设）一到，
        看门狗关句柄收工并置 expired；timeout_ms 是各阶段超时（0 = 默认
        10/10/30/30 秒）；cancel 是不带进度的取消探针。 */
@@ -57,12 +58,20 @@ typedef struct Sink {
    0.5s，但 >0.5s 的正常到货间隙会把请求毒化（ReadData 回 12019），
    慢速真下载直接报错 —— 弃。改为看门狗线程：每 200ms 查一次取消，
    发现取消就主动 Close 请求句柄，把阻塞中的读解锁（<=0.5s 生效）。
-   测速探针复用同一条狗：到 deadline 那一毫秒同样关句柄收工。 */
+   测速探针复用同一条狗：到 deadline 那一毫秒同样关句柄收工。
+
+   ★ 进度回调也只走这条狗（真机踩坑 2026-09-08）：原先 sink_write 每收一块
+   就调一次 progress，而 progress 一路通到 PostMessage。快源下 40 MiB/s 的
+   下载一秒五千块，就是一秒五千条 post；Windows 的 GetMessage 把
+   post 队列排在鼠标键盘输入前面，队列一直不空→点击永远排不上队，
+   玩家看到的就是「下载中点取消没反应」（实测：51249 次回调 / 10 秒，
+   点下去的取消直到下载跑完才生效）。界面刷新本来就不该跟网络分块
+   走，现在让看门狗节拍（= 取消节拍）当唯一的报进度人，sink_write 只数字节。 */
 typedef struct NetWatch {
     HANDLE thread;
     HANDLE stop;                  /* net_fetch 收尾时叫停看门狗 */
     HINTERNET req;                /* 取消时要撬开的句柄（可为 NULL） */
-    Sink *sink;                   /* 看门狗自己也按节拍跑进度回调 */
+    Sink *sink;                   /* ★ 进度回调只由这条狗按节拍调 */
     volatile LONG req_closed;     /* 1 = 句柄已被看门狗关掉，主人别再关 */
 } NetWatch;
 
@@ -138,7 +147,10 @@ static int sink_write(Sink *s, const void *data, DWORD len)
         if (s->hash && !sha256_update(s->hash, data, len)) return 0;
     }
     s->done += len;
-    if (s->progress && !s->progress(s->user, s->done, s->total))
+    /* 进度不在这里报（见文件头注释）：看门狗没起来的极少数情况下才
+       退回逐块报，别把进度和取消一块丢了。 */
+    if (!s->watching && s->progress &&
+        !s->progress(s->user, s->done, s->total))
         s->cancelled = 1;
     return 1;
 }
@@ -274,6 +286,7 @@ static int net_fetch(const wchar_t *url, Sink *s, unsigned long long *total_out,
             watch.sink = s;
             watch.req_closed = 0;
             watch.thread = CreateThread(NULL, 0, net_watch_dog, &watch, 0, NULL);
+            if (watch.thread) s->watching = 1;
         }
     }
 

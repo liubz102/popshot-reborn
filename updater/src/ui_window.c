@@ -1109,6 +1109,7 @@ static void window_finish_or_close(struct UiWindow *w)
 static void on_button(void *user, const wchar_t *id)
 {
     struct UiWindow *w = (struct UiWindow *)user;
+    log_line("ui: button %ls stage=%d", id, (int)g_stage);
     if (wide_ieq(id, L"btnClose")) {
         window_finish_or_close(w);
         return;
