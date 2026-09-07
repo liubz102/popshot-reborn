@@ -9780,3 +9780,57 @@ BSM1 的 `Character::Dash` 守卫只还原调用那一刻的运动状态；冲�
   一次都没点着；而夹具收尾的 `CloseMainWindow()` 自己会触发取消，所以照样绿。
 * 「一看到下载开始就点」测不出这个 bug：那会儿队列还没堆起来，坏版本也能过（实测）。
   要在**下载流到一半**时点才暴露。
+
+## §196 ★★★ 更新器的请求头长什么样 + 10 个代理的实测（2026-09-08）
+
+**更新器发出去的原始请求**（本地 echo 服务器抓的，`--noui` 取 manifest）：
+
+```
+GET /manifest.json HTTP/1.1
+Connection: Keep-Alive
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,...
+Accept-Language: zh-CN,zh;q=0.9
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ...
+Host: ...
+```
+
+* UA **一直是有的**（`WinHttpOpen` 的第一个参数就是 UA），原来发的是
+  `PopShotUpdater/3.0`；D154 改成了 Chrome UA。
+* WinHTTP 默认**只发** Host / Connection / User-Agent —— 没有 Accept，
+  也没有 Accept-Encoding。Accept 是 D154 加的；**Accept-Encoding 故意不加**
+  （WinHTTP 不自动解压，Win7 连 `WINHTTP_OPTION_DECOMPRESSION` 都没有，
+  真被 gzip 了落盘就是压缩流，sha256 必挂）。
+
+**10 个代理 + 直连的实测**（`BsPatcherChn.exe --check-proxies`，每源真连 2 秒，
+2026-09-08 01:25，开发机）：
+
+| 来源 | 结果 | 峰值 |
+|---|---|---|
+| 直连 GitHub | OK | 55.7 MiB/s |
+| `cdn.gh-proxy.com` | OK | 45.2 |
+| `github-proxy.memory-echoes.cn` | OK | 53.5 |
+| `githubdog.com` | OK | 45.2 |
+| **`gh.acmsz.top`** | **403** | — |
+| `github.dpik.top` | OK | 54.1 |
+| `gh-proxy.com` | OK | 46.9 |
+| `ghfile.geekertao.top` | OK | 48.7 |
+| `gh.927223.xyz` | OK | 44.9 |
+| `jiashu.1win.eu.org` | OK | 61.8 |
+| `github.mxw.qzz.io` | OK | 52.5 |
+
+★ 用户当天就把 `gh.acmsz.top` 从列表里删了，**重测 9 个代理 + 直连全通**
+（`--check-proxies` 退出码 0）。
+
+★ **`gh.acmsz.top` 的 403 不是 UA 的问题**：响应头带
+`Cf-Mitigated: challenge` + `Server: cloudflare` + 指向 `challenges.cloudflare.com`
+的 CSP —— 是 **Cloudflare 人机挑战**，要浏览器跑 JS 才过得去。换任何 UA 都没用，
+程序化下载器过不去这一关。留着它只是在慢网测速时白扔 10 秒，建议从列表里去掉。
+（换 UA 前后用 curl 各扫过一遍，两次都是同样的 9 通 1 挂 —— 这批代理目前**都不看
+UA**；改 UA 是防着以后遇到看 UA 的站，不是修好了什么。）
+
+★ 顺带一个踩坑：GUI 子系统程序想往控制台写字，**别照抄 selftest 的
+`freopen("CONOUT$", "w", stdout)`** —— CRT 那一下会把 `STD_OUTPUT_HANDLE` 一起改掉，
+于是 `> out.txt` 和管道全成了空文件（`--check-proxies` 第一版就这样，只有日志有内容）。
+正确顺序是：先 `GetStdHandle(STD_OUTPUT_HANDLE)`，拿不到才
+`AttachConsole` + 自己开 `CONOUT$`；写的时候先试 `WriteConsoleW`（宽字符不看代码页），
+失败再按 UTF-8 `WriteFile`。

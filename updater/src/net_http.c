@@ -25,7 +25,23 @@
 #define WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3 0x00002000
 #endif
 
-static const wchar_t *USER_AGENT = L"PopShotUpdater/3.0";
+/* ★ 冒充普通浏览器（用户 2026-09-08 拍板）：GitHub 代理站多半带 WAF，
+   对非浏览器 UA 直接 403 / 限流。原来发的是 L"PopShotUpdater/3.0"。
+   版本号会过时，但代理只看「像不像浏览器」，不比对版本；哪天要更新，
+   照抄一个当下的 Chrome UA 即可（这行是唯一出处）。 */
+static const wchar_t *USER_AGENT =
+    L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    L"(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
+
+/* 跟着 UA 一起像浏览器：WinHTTP 默认只发 Host / Connection / User-Agent，
+   缺 Accept 的裸请求同样会被 WAF 挑出来。
+   ★ 故意**不发 Accept-Encoding**：WinHTTP 不会自动解压（Win8.1 才有
+   WINHTTP_OPTION_DECOMPRESSION，Win7 没有），一旦服务器真的 gzip 了，
+   落盘的就是压缩流，sha256 必然对不上。不声明就不会被压。 */
+static const wchar_t *EXTRA_HEADERS =
+    L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,"
+    L"image/avif,image/webp,image/apng,*/*;q=0.8\r\n"
+    L"Accept-Language: zh-CN,zh;q=0.9\r\n";
 
 typedef struct Sink {
     /* 三种形态：内存 / 文件+哈希 / 丢弃只数字节（测速探针）。 */
@@ -247,7 +263,7 @@ static int net_fetch(const wchar_t *url, Sink *s, unsigned long long *total_out,
     WinHttpSetOption(hreq, WINHTTP_OPTION_SECURE_PROTOCOLS,
                      &secure, sizeof(secure));
 
-    if (!WinHttpSendRequest(hreq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+    if (!WinHttpSendRequest(hreq, EXTRA_HEADERS, (DWORD)-1,
                             WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(hreq, NULL)) {
         set_err(err_out, err_cap, L"网络请求失败（%ls）(%lu)",

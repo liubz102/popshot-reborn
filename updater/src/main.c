@@ -19,6 +19,8 @@
      --ui-mode 1|2|3   （测试）强制渲染链某一档
      --noui            无界面跑（自动化测试；等价 POPSHOT_UPDATER_NOUI=1）
      --selftest        回归自检（构建闸门）
+     --check-proxies   代理体检：config\update.config 里每个代理真连 2 秒，
+                       报「连不连得上 / 出不出数据 / 多快」（控制台 + 日志）
    -------------------------------------------------------------------------- */
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
@@ -783,6 +785,126 @@ static void single_lock_release(SingleLock *lk)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  --check-proxies —— 代理体检（用户 2026-09-08 要「实测这些代理能不能下」）*/
+/*  代理站点常换常挂，出问题时要能当场用**更新器自己的 WinHTTP 链路**       */
+/*  （同一套 UA / 请求头 / TLS / 超时）逐个真连一次 —— curl 的头和 TLS 都   */
+/*  不一样，结果不能直接当数。                                             */
+/* ------------------------------------------------------------------ */
+
+/* 每个来源真连这么久：够看出「连得上、在出数据、速度大概多少」，
+   又不至于把玩家的流量喝掉太多（11 个来源 × 2 秒）。 */
+#define CHECK_WINDOW_MS 2000
+
+/* 控制台 + updater.log 双写。控制台走 WriteConsoleW（宽字符，不看代码页，
+   中文不会乱）；被重定向到文件/管道时退回 UTF-8 字节。
+   ★ GUI 子系统程序不一定拿得到继承来的 stdout（从 Git Bash 起就没有），
+   那时借 AttachConsole 挂上的那个控制台自己开 CONOUT$。 */
+static HANDLE check_out(void)
+{
+    static HANDLE h = NULL;
+    if (!h) {
+        h = GetStdHandle(STD_OUTPUT_HANDLE);       /* 继承来的管道 / 重定向文件 */
+        if (!h || h == INVALID_HANDLE_VALUE) {
+            AttachConsole(ATTACH_PARENT_PROCESS);  /* 没有就借父进程的控制台 */
+            h = CreateFileW(L"CONOUT$", GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                            OPEN_EXISTING, 0, NULL);
+        }
+    }
+    return (h == INVALID_HANDLE_VALUE) ? NULL : h;
+}
+
+static void check_say(const wchar_t *fmt, ...)
+{
+    wchar_t line[1024];
+    HANDLE out = check_out();
+    DWORD wrote = 0;
+    va_list ap;
+
+    va_start(ap, fmt);
+    _vsnwprintf(line, 1024, fmt, ap);
+    line[1023] = 0;
+    va_end(ap);
+
+    if (out && !WriteConsoleW(out, line, (DWORD)wcslen(line), &wrote, NULL)) {
+        char utf8[2048];
+        if (wide_to_utf8(line, utf8, sizeof(utf8)) >= 0)
+            WriteFile(out, utf8, (DWORD)strlen(utf8), &wrote, NULL);
+    }
+    {   /* 日志里去掉行尾换行，log_line 自己会加 */
+        wchar_t *nl = wcschr(line, L'\n');
+        if (nl) *nl = 0;
+        if (line[0]) log_line("check: %ls", line);
+    }
+}
+
+/* 返回 0 = 这个源能用；1 = 不能用。 */
+static int check_one(const wchar_t *label, const wchar_t *url)
+{
+    SpeedSample s;
+    wchar_t peak[32], got[32];
+    int ok;
+
+    memset(&s, 0, sizeof(s));
+    net_probe_speed(url, CHECK_WINDOW_MS, SPEED_BUCKET_MS, NULL,
+                    &s.bytes, &s.elapsed_ms, &s.trace, s.note, 128);
+    /* 窗口到点还在出数据（expired）或整包收完（complete）都算能下；
+       其余（状态码非 200、连不上、TLS 失败）都是不能用。 */
+    ok = s.bytes > 0 &&
+         (wide_ieq(s.note, L"expired") || wide_ieq(s.note, L"complete"));
+    mib_to_wide(speed_bps(&s), peak, 32);
+    mib_to_wide(s.bytes, got, 32);
+    check_say(L"%ls  %-38ls  %ls MiB  %ls MiB/s  (%ls)\n",
+              ok ? L"[ OK ]" : L"[FAIL]", label, got, peak,
+              s.note[0] ? s.note : L"-");
+    return ok ? 0 : 1;
+}
+
+static int check_proxies_run(void)
+{
+    wchar_t root[MAX_PATH * 2];
+    Manifest m;
+    wchar_t err[512];
+    const wchar_t *file_url;
+    int i, bad = 0;
+
+    /* ★ 这里别学 selftest 去 freopen("CONOUT$", stdout)：CRT 那一下会连
+       STD_OUTPUT_HANDLE 一起改掉，`> out.txt` 和管道就全成了空文件。
+       出口交给 check_out() 按序挑（继承的 stdout 优先）。 */
+    package_root(root, MAX_PATH * 2);
+    wcscpy(g_ctx.root, root);
+    log_init(root, "start (--check-proxies)");
+    ui_init(root, 0, 1);                    /* 无界面 */
+
+    cfg_proxy_list(root, &g_ctx.proxies);
+    check_say(L"=== 代理体检 ===\n");
+    check_say(L"config\\update.config：%d 个可用，%d 行被忽略\n",
+              g_ctx.proxies.count, g_ctx.proxies.skipped);
+
+    if (!fetch_manifest(&m, err, 512)) {
+        check_say(L"取不到更新清单，没法拿到测试地址：%ls\n", err);
+        ui_shutdown();
+        return 2;
+    }
+    file_url = m.entries[0].url;
+    check_say(L"测试地址：%ls\n", file_url);
+    check_say(L"每个来源真连 %d 秒（不下完，看得出连不连得上、出不出数据）\n\n",
+              CHECK_WINDOW_MS / 1000);
+
+    bad += check_one(L"直连 GitHub", file_url);
+    for (i = 0; i < g_ctx.proxies.count; i++) {
+        wchar_t url[1200];
+        speed_compose_url(g_ctx.proxies.url[i], file_url, url, 1200);
+        bad += check_one(g_ctx.proxies.url[i], url);
+    }
+    check_say(L"\n=== %d 个来源，%d 个不能用 ===\n",
+              g_ctx.proxies.count + 1, bad);
+    ui_shutdown();
+    FreeConsole();
+    return bad ? 1 : 0;
+}
+
 int WINAPI wWinMain(HINSTANCE me, HINSTANCE prev, PWSTR cmd, int show)
 {
     wchar_t root[MAX_PATH * 2];
@@ -818,6 +940,8 @@ int WINAPI wWinMain(HINSTANCE me, HINSTANCE prev, PWSTR cmd, int show)
         extern int selftest_run(int preview);
         return selftest_run(wcsstr(cmdline, L"--preview") != NULL);
     }
+    if (wcsstr(cmdline, L"--check-proxies"))
+        return check_proxies_run();
 
     package_root(root, MAX_PATH * 2);
     wcscpy(g_ctx.root, root);
