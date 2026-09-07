@@ -116,43 +116,9 @@
           </table>
         </div>
         <div class="pager" id="playerPager"></div>
-
-        <div id="playerEdit" class="hidden">
-          <div class="panel-title" style="margin-top:20px">
-            <h2 id="playerWho"></h2>
-            <span class="count" id="playerOnline"></span>
-          </div>
-          <div class="row" style="margin-top:6px">
-            <div class="field">
-              <span class="lab">等级</span>
-              <input id="playerLevel" type="number" min="1" step="1">
-            </div>
-            <div class="field">
-              <span class="lab">金币</span>
-              <input id="playerMoney" type="number" min="0" step="1">
-            </div>
-            <div class="field wide">
-              <span class="lab">经验（只读，跟着等级走）</span>
-              <input id="playerExp" type="text" readonly>
-            </div>
-          </div>
-
-          <h3 class="sub">合成材料</h3>
-          <div class="own-grid" id="playerMaterials"></div>
-          <button class="btn btn-sm" id="playerAddMaterial">＋ 加一种材料</button>
-
-          <h3 class="sub">仓库物品</h3>
-          <div class="own-grid" id="playerInventory"></div>
-          <button class="btn btn-sm" id="playerAddItem">＋ 加一件物品</button>
-
-          <div class="msg" id="playerMsg"></div>
-        </div>
-      </div>
-      <div class="panel-foot hidden" id="playerFoot">
-        <span class="dirty clean" id="playerDirty"></span>
-        <span style="margin-left:auto"></span>
-        <button class="btn" id="playerReset">放弃修改</button>
-        <button class="btn btn-primary" id="playerSave">保存</button>
+        <!-- 编辑区 2026-09-07 起是弹窗（#playerModal，在页面底部），这里只剩
+             查找出错时那一句。 -->
+        <div class="msg" id="playerMsg"></div>
       </div>
     </section>
 
@@ -291,6 +257,58 @@
   </div>
 </main>
 
+<!-- ========================= 玩家背包弹窗（用户 2026-09-07） =========================
+     「修改背包」点开的编辑窗。★ 只有右上角的 ✕ 能关它 —— 点遮罩不关
+     （admin.js 里故意没给它挂 onclick）。物品按**游戏仓库界面**那棵标签树分类
+     （§41），前面多一个「全部」；只有物品区滚，上面的都钉住。
+     ★ 必须排在 #picker 前面：两个都是 .modal（z-index 50），后面的压上面 ——
+     「添加物品」弹出的选择器要盖在这个窗上面。 -->
+<div class="modal hidden" id="playerModal">
+  <div class="panel player-panel">
+    <div class="panel-title">
+      <h2 id="playerWho"></h2>
+      <span class="online-note" id="playerOnline"></span>
+      <button class="icon-btn" id="playerClose" aria-label="关闭"
+              title="关闭（有没保存的改动会先问一句）">✕</button>
+    </div>
+    <div class="panel-body">
+      <div class="row player-stats">
+        <div class="field">
+          <span class="lab">等级</span>
+          <input id="playerLevel" type="number" min="1" step="1">
+        </div>
+        <div class="field">
+          <span class="lab">金币</span>
+          <input id="playerMoney" type="number" min="0" step="1">
+        </div>
+        <div class="field wide">
+          <span class="lab">经验（只读，跟着等级走）</span>
+          <input id="playerExp" type="text" readonly>
+        </div>
+      </div>
+      <div class="toolbar cfg-bar">
+        <div class="filters">
+          <button class="btn" id="playerAddItem">＋ 添加物品</button>
+          <button class="btn" id="playerPopupRefresh"
+                  title="重新读一遍这个玩家的资料和物品表 / 四份运营配置">↻ 刷新</button>
+        </div>
+        <div class="acts">
+          <span class="dirty clean" id="playerDirty"></span>
+          <button class="btn" id="playerReset">放弃修改</button>
+          <button class="btn btn-primary" id="playerSave">保存</button>
+        </div>
+      </div>
+      <!-- 分类标签：上一行大分类（照游戏仓库界面从左到右），下一行当前大分类的小分类 -->
+      <div class="cat-tabs" id="playerCats"></div>
+      <div class="cat-tabs sub hidden" id="playerSubCats"></div>
+      <!-- 只有这一块滚 -->
+      <div class="own-scroll" id="playerOwned">
+        <div class="own-grid" id="playerOwnedGrid"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ========================= 物品选择器 ========================= -->
 <div class="modal hidden" id="picker">
   <div class="panel">
@@ -313,6 +331,13 @@
       <!-- 详情**只走浮窗**（用户 2026-09-06）：网格底下原来还有一条侧栏，
            写的是同一批东西，而「在不在卖」还是现问服务端的旧值。 -->
       <div class="pick-grid" id="pickGrid"></div>
+    </div>
+    <!-- 批量模式（玩家背包弹窗的「添加物品」）才显示：勾多件，一次加进去。 -->
+    <div class="panel-foot hidden" id="pickFoot">
+      <span class="pageno" id="pickChosen">已选 0 件</span>
+      <button class="btn btn-sm" id="pickClear">清空</button>
+      <span class="grow"></span>
+      <button class="btn btn-primary" id="pickConfirm" disabled>确认添加</button>
     </div>
   </div>
 </div>

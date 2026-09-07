@@ -748,6 +748,24 @@ class AdminCatalogTests(_AdminCase):
             self.assertEqual(
                 shopcfg.item_desc_zh(shopdata.get(item_id)),
                 by_id[item_id]["desc"], item_id)
+
+    def test_items_carry_their_warehouse_tab_and_the_tree_comes_along(self):
+        # 玩家背包弹窗按游戏仓库界面那棵树分类（§41）：每件带 `wh`，树随物品表发。
+        tree = self.catalog["warehouse"]
+        self.assertEqual(["武器", "道具", "装备", "人物", "技能", "收集品", "称号"],
+                         [tab["label"] for tab in tree])
+        gear = [tab for tab in tree if tab["label"] == "装备"][0]
+        self.assertEqual(["套装", "头部", "上衣", "下衣", "手套", "鞋子"],
+                         [child["label"] for child in gear["children"]])
+        self.assertEqual(0x10006, gear["children"][0]["id"])     # 仓库的套装不是商店的 3
+        by_id = {item["id"]: item for item in self.catalog["items"]}
+        for entry in self.catalog["items"]:
+            self.assertIn("wh", entry, entry["id"])
+        self.assertEqual(0x10001, by_id[1010037]["wh"])          # 上衣
+        self.assertEqual(0x60001, by_id[1120011]["wh"])          # 武器槽 1
+        for item_id in shopdata.ids_of_kind("material"):
+            if item_id in by_id:
+                self.assertIn(by_id[item_id]["wh"], (0x50001, 0x50002), item_id)
         # 说明是空的就不带这个键（800 件里 170 件没有，白占体积）。
         self.assertNotIn("desc", by_id[10001])
 

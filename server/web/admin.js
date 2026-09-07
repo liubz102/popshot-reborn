@@ -55,10 +55,20 @@ function say(node, text, ok) {
      判断任何事情的先后，早一秒晚一秒都不改变程序的结论。 */
 var TOAST_MS = 3600;
 
+/** 浮条钉在**标题栏下面**、靠右（用户 2026-09-07：原来贴着窗口顶，会压住
+ *  「退出登录」）。标题栏多高只有浏览器知道（字体、窗口窄了换行都会变），
+ *  所以量一下再放；窗口一变宽窄再量一次（`wire()` 里挂了 resize）。 */
+function placeToasts() {
+  var bar = document.querySelector(".topbar");
+  var top = bar ? Math.round(bar.getBoundingClientRect().bottom) + 8 : 64;
+  $("toasts").style.top = top + "px";
+}
+
 function toast(text, ok) {
   var host = $("toasts");
   host.textContent = "";
   if (!text) { return null; }
+  placeToasts();
   var node = el("div", "toast" + (ok ? "" : " bad"));
   node.appendChild(el("span", "x", "✕"));
   node.appendChild(document.createTextNode(text));
@@ -992,11 +1002,12 @@ async function refreshConfigs(force) {
   for (var i = 0; i < CONFIGS.length; i += 1) {
     ok = (await loadConfig(CONFIGS[i])) && ok;
   }
-  if (!CFG[CURRENT]) { return; }
+  if (!CFG[CURRENT]) { return false; }
   renderCurrent();
   // ★ 失败时**不要**盖掉 `loadConfig` 报的那句 —— 「已刷新」压在「读不到
   //   drops.json」上面，用户看到的就是「点了刷新，然后什么都没变」。
   if (ok) { toast("已刷新：四份配置都换成服务端上最新的了。", true); }
+  return ok;
 }
 
 /** 服务端的错误里带着下标（`recipes[3].materials[1].id：…`），定位过去。
@@ -1687,11 +1698,22 @@ function renderDrops(list, rows) {
 
 var PICKER = null;
 
+/** 打开选择器。
+ *
+ *  单选（配置页「添加」）：`{kinds, selected, onPick(item)}`，点一格就选中并关闭。
+ *  批量（玩家背包弹窗「添加物品」，用户 2026-09-07）：`{multi: true, owned,
+ *  onPickMany(items)}` —— 格子点了打勾、再点取消，底下「确认添加」一次全给；
+ *  `owned` 里的画成「已有」、点不动。
+ */
 function openPicker(options) {
   PICKER = {
     kinds: options.kinds || null,
     selected: options.selected,
     onPick: options.onPick,
+    multi: !!options.multi,
+    onPickMany: options.onPickMany,
+    owned: options.owned || {},
+    chosen: {},
     q: "",
     page: 0,
     kind: (options.kinds && options.kinds.length === 1) ? options.kinds[0] : "",
@@ -1724,9 +1746,18 @@ function openPicker(options) {
   });
   whoSelect.value = "";
   kindSelect.disabled = !!(PICKER.kinds && PICKER.kinds.length === 1);
+  $("pickFoot").classList.toggle("hidden", !PICKER.multi);
   $("picker").classList.remove("hidden");
   paintPicker();
   $("pickSearch").focus();
+}
+
+/** 批量模式底下那条：已选几件、「确认添加」能不能点。 */
+function paintPickFoot() {
+  if (!PICKER || !PICKER.multi) { return; }
+  var count = Object.keys(PICKER.chosen).length;
+  $("pickChosen").textContent = "已选 " + count + " 件";
+  $("pickConfirm").disabled = !count;
 }
 
 function closePicker() {
@@ -1790,16 +1821,37 @@ function paintPicker() {
   PICKER.page = Math.min(Math.max(0, PICKER.page || 0), pages - 1);
   hits.slice(PICKER.page * PICK_PAGE_SIZE,
              (PICKER.page + 1) * PICK_PAGE_SIZE).forEach(function (item) {
-    var cell = el("div", "pick" + (item.id === PICKER.selected ? " sel" : ""));
+    var owned = PICKER.multi && PICKER.owned[item.id];
+    var chosen = PICKER.multi && PICKER.chosen[item.id];
+    var cell = el("div", "pick" + (item.id === PICKER.selected ? " sel" : "")
+                         + (owned ? " owned" : "") + (chosen ? " chosen" : ""));
     var ic = el("div", "ic");
     if (iconStyle(ic, item.cell, 44)) { cell.appendChild(ic); }
     else { cell.appendChild(el("div", "noicon", "?")); }
     cell.appendChild(el("div", "nmz", itemName(item.id)));
+    if (owned) { cell.appendChild(el("span", "have", "已有")); }
+    if (chosen) { cell.appendChild(el("span", "chk", "✓")); }
     // ★ 详情**只走浮窗**（`tipFor`，用户 2026-09-06）：弹窗底下原来还有一条
     //   侧栏，写的是同一批东西，而且「在不在卖」是现问服务端的 —— 管理员
     //   刚在货架上改完还没保存时，那一行说的是磁盘上那份旧的，和浮窗打架。
     tipFor(cell, item.id);
     cell.onclick = function () {
+      if (PICKER.multi) {
+        if (owned) { return; }             // 已经在仓库里，勾了也没意义
+        // 只翻这一格，不重画整张网格 —— 滚动位置和浮窗都别动（D37b）。
+        if (PICKER.chosen[item.id]) {
+          delete PICKER.chosen[item.id];
+          cell.classList.remove("chosen");
+          var mark = cell.querySelector(".chk");
+          if (mark) { mark.remove(); }
+        } else {
+          PICKER.chosen[item.id] = true;
+          cell.classList.add("chosen");
+          cell.appendChild(el("span", "chk", "✓"));
+        }
+        paintPickFoot();
+        return;
+      }
       var pick = PICKER.onPick;
       closePicker();
       pick(item);
@@ -1811,6 +1863,7 @@ function paintPicker() {
     ? ("共 " + hits.length + " 件 · 第 " + (PICKER.page + 1) + " / "
        + pages + " 页")
     : (hits.length + " 件");
+  paintPickFoot();
 }
 
 /* ======================================================================
@@ -2278,12 +2331,14 @@ function renderPlayerRows() {
     line.appendChild(el("td", null, row.money));
     var td = el("td");
     // ★ 权限那个钮在**左**、「修改背包」在**右**，整组**右对齐**
-    //   （用户 2026-09-06）。两个钮颜色不一样（`.btn-admin` 是青的）——
-    //   一个改这个人的背包、一个给他管理页的权限，不能长得像同一个东西。
+    //   （用户 2026-09-06）。两个钮**长得不一样**（D40）：一个改这个人的背包、
+    //   一个给他管理页的权限，不能像同一个东西 —— 但靠的是**轻重**不是色相
+    //   （D40a，用户 2026-09-07）：「修改背包」是这一行的主动作，金色主钮；
+    //   「设为管理员」少用、米黄默认钮。原来的青色是整页唯一的冷色，太突兀。
     var acts = el("div", "acts");
     // 已经是管理员的：同一个位置换成**点不动的灰钮**，上面写他的实际权限，
     // 别给一个点下去必然报「已经存在」的按钮。
-    var promote = el("button", "btn btn-sm btn-admin",
+    var promote = el("button", "btn btn-sm",
                      row.admin_role ? (ADMIN_BADGE_ZH[row.admin_role]
                                        || row.admin_role)
                                     : "设为管理员（运营）");
@@ -2294,7 +2349,7 @@ function renderPlayerRows() {
       promote.onclick = function () { promoteToAdmin(row.username); };
     }
     acts.appendChild(promote);
-    var button = el("button", "btn btn-sm", "修改背包");
+    var button = el("button", "btn btn-sm btn-primary", "修改背包");
     button.onclick = function () { openPlayer(row.username); };
     acts.appendChild(button);
     td.appendChild(acts);
@@ -2363,16 +2418,35 @@ async function openPlayer(username, force) {
   return true;
 }
 
-/** 把服务端那份快照变成「快照 + 补丁」。 */
+/** 把服务端那份快照变成「快照 + 补丁」，并打开（或刷新）编辑弹窗。
+ *  同一个人重读（保存回执 / 刷新）时停在原来的分类标签上，别跳回「全部」。 */
 function adoptPlayer(view) {
   var edit = {level: view.level, money: view.money,
               materials: {}, inventory: {}};
   view.materials.forEach(function (row) { edit.materials[row.id] = row.count; });
   view.inventory.forEach(function (row) { edit.inventory[row.id] = row.count; });
-  PLAYER = {view: view, edit: edit};
+  var tab = (PLAYER && PLAYER.view.username === view.username)
+    ? PLAYER.tab : {big: -1, sub: null};
+  PLAYER = {view: view, edit: edit, tab: tab};
   say($("playerMsg"), "");
   renderPlayer();
   renderPlayerRows();
+}
+
+/** 右上角那个 ✕ —— **唯一**能关掉弹窗的地方（用户 2026-09-07：点遮罩不关）。
+ *  有没保存的改动先问一句。 */
+async function closePlayerModal() {
+  if (!PLAYER) { return; }
+  if (playerDirty()
+      && !(await ask({title: "还有没保存的改动",
+                      lead: "「" + PLAYER.view.username
+                            + "」还有没保存的改动，关掉就丢了，确定？",
+                      ok: "丢掉并关闭"}))) {
+    return;
+  }
+  PLAYER = null;
+  $("playerModal").classList.add("hidden");
+  renderPlayerRows();                       // 列表里那一行的高亮收掉
 }
 
 function playerDirty() {
@@ -2401,17 +2475,137 @@ function playerTouched() {
 
 function renderPlayer() {
   var view = PLAYER.view;
-  $("playerEdit").classList.remove("hidden");
-  $("playerFoot").classList.remove("hidden");
   $("playerWho").textContent = view.nickname + "（" + view.username + "）";
-  $("playerOnline").textContent = view.online ? "● 在线，改完即时生效" : "不在线";
+  // 在线状态紧跟在名字后面（用户 2026-09-07），不再放标题栏右端。
+  $("playerOnline").textContent = view.online ? "● 在线，改完即时生效" : "○ 不在线";
   $("playerLevel").value = PLAYER.edit.level;
   $("playerLevel").max = view.level_max;
   $("playerMoney").value = PLAYER.edit.money;
   $("playerExp").value = view.experience + "（本级 " + view.level_start_exp
     + " ~ 下一级 " + view.next_level_exp + "）";
-  paintOwned("materials", $("playerMaterials"), "还没有任何材料");
-  paintOwned("inventory", $("playerInventory"), "仓库是空的");
+  $("playerModal").classList.remove("hidden");
+  repaintOwned();
+}
+
+/* ---------------------------------------------------------- 仓库分类
+   照**游戏仓库界面**那棵标签树（§41，服务端 `shop.WAREHOUSE_TABS` 随物品表
+   一起发）：7 个大分类，每个下面几个小分类；前面多一个「全部」。
+   每件物品落在哪一格由服务端算好放在 `item.wh` 里（客户端自己的两个分类
+   函数翻过来的），这儿只做匹配：精确相等，或大分类按高半字收。
+   材料和仓库物品**不再分两块**（用户 2026-09-07）—— 游戏里它们本来就在
+   同一个仓库面板里（材料在「收集品 → 材料」）。 */
+
+function whTabs() {
+  return (CAT && CAT.warehouse) || [];
+}
+
+/** 这件东西在游戏仓库里的标签 id；物品表里没有的当 `0`（哪个标签都不收）。 */
+function whCategory(itemId) {
+  var item = BYID[itemId];
+  return item && item.wh !== undefined ? item.wh : 0;
+}
+
+/** 客户端 `0x412852~0x412868` 那条规则：`-1` 全收；`0` 两边都不通配；
+ *  精确相等；父标签（低半字为 0）按高半字收。 */
+function whMatches(requested, cat) {
+  if (requested === -1) { return true; }
+  if (!cat || !requested) { return false; }
+  if (requested === cat) { return true; }
+  if ((requested & 0xFFFF) !== 0) { return false; }
+  return (requested >>> 16) === (cat >>> 16);
+}
+
+/** 现在选中的是哪一格：小分类优先，没选小分类就是大分类（或「全部」= -1）。 */
+function playerRequested() {
+  return PLAYER.tab.sub !== null ? PLAYER.tab.sub : PLAYER.tab.big;
+}
+
+/** 两桶合成一张表：`{bucket, id, cat}`，按 id 排。数量为 0 的也在（装备类
+ *  「没有」那一格要留着让人翻回来）。 */
+function ownedEntries() {
+  var out = [];
+  ["materials", "inventory"].forEach(function (bucket) {
+    Object.keys(PLAYER.edit[bucket]).forEach(function (id) {
+      var itemId = Number(id);
+      out.push({bucket: bucket, id: itemId, cat: whCategory(itemId)});
+    });
+  });
+  out.sort(function (a, b) { return a.id - b.id; });
+  return out;
+}
+
+function switchOwnedTab(big, sub) {
+  PLAYER.tab = {big: big, sub: sub};
+  renderPlayerTabs();
+  renderOwnedList();
+}
+
+/** 两行标签。件数只数「有」的（数量 > 0）。「人物 → 英雄」是 `0`，客户端遇到
+ *  0 直接返回空 —— 永远是空格子，不画。 */
+function renderPlayerTabs() {
+  var have = ownedEntries().filter(function (entry) {
+    return Number(PLAYER.edit[entry.bucket][entry.id]) > 0;
+  });
+  function count(id) {
+    return have.filter(function (entry) { return whMatches(id, entry.cat); }).length;
+  }
+  function tabButton(id, label, on, onclick) {
+    var button = el("button", "cat" + (on ? " on" : ""), label);
+    var n = count(id);
+    if (n) { button.appendChild(el("span", "n", String(n))); }
+    button.onclick = onclick;
+    return button;
+  }
+  var host = $("playerCats");
+  host.textContent = "";
+  host.appendChild(tabButton(-1, "全部", PLAYER.tab.big === -1, function () {
+    switchOwnedTab(-1, null);
+  }));
+  whTabs().forEach(function (tab) {
+    host.appendChild(tabButton(tab.id, tab.label, PLAYER.tab.big === tab.id,
+                               function () { switchOwnedTab(tab.id, null); }));
+  });
+
+  var sub = $("playerSubCats");
+  sub.textContent = "";
+  var big = whTabs().filter(function (tab) { return tab.id === PLAYER.tab.big; })[0];
+  var children = big ? (big.children || []).filter(function (child) {
+    return child.id !== 0;
+  }) : [];
+  sub.classList.toggle("hidden", !children.length);
+  if (!children.length) { return; }
+  sub.appendChild(tabButton(big.id, "全部" + big.label, PLAYER.tab.sub === null,
+                            function () { switchOwnedTab(big.id, null); }));
+  children.forEach(function (child) {
+    sub.appendChild(tabButton(child.id, child.label, PLAYER.tab.sub === child.id,
+                              function () { switchOwnedTab(big.id, child.id); }));
+  });
+}
+
+/** 画当前分类下的格子。★ 重画一律不动滚动条（D37b）。 */
+function renderOwnedList() {
+  var box = $("playerOwned");
+  var keep = box.scrollTop;
+  var grid = $("playerOwnedGrid");
+  grid.textContent = "";
+  var requested = playerRequested();
+  var rows = ownedEntries().filter(function (entry) {
+    return whMatches(requested, entry.cat);
+  });
+  if (!rows.length) {
+    grid.appendChild(el("div", "own-empty",
+                        requested === -1 ? "仓库是空的 —— 点「＋ 添加物品」"
+                                         : "这个分类下没有东西"));
+  }
+  rows.forEach(function (entry) {
+    grid.appendChild(ownNode(entry.bucket, entry.id));
+  });
+  box.scrollTop = keep;
+}
+
+function repaintOwned() {
+  renderPlayerTabs();
+  renderOwnedList();
   playerTouched();
 }
 
@@ -2424,19 +2618,6 @@ function ownName(itemId) {
 function ownMeta(itemId) {
   var name = ownName(itemId);
   return name === ("#" + itemId) ? itemMeta(itemId) : ("#" + itemId);
-}
-
-/** 画一整格。★ 2026-09-06 之后**每一格都能改**（D23a）——
- *  原来商店在卖的那批画成锁着的只读格，那条限制撤了。 */
-function paintOwned(bucket, host, emptyText) {
-  host.textContent = "";
-  var ids = Object.keys(PLAYER.edit[bucket]).map(Number)
-    .sort(function (a, b) { return a - b; });
-  if (!ids.length) {
-    host.appendChild(el("div", "own-empty", emptyText));
-    return;
-  }
-  ids.forEach(function (itemId) { host.appendChild(ownNode(bucket, itemId)); });
 }
 
 /** 服务端说这件东西的数量有没有意义（装备类没有，见 admin.py 的 `stackable`）。*/
@@ -2484,7 +2665,7 @@ function ownNode(bucket, itemId) {
     toggle.onclick = function (event) {
       event.preventDefault();
       PLAYER.edit[bucket][itemId] = have ? 0 : 1;
-      renderPlayer();
+      repaintOwned();
     };
     box.appendChild(toggle);
     return box;
@@ -2498,6 +2679,7 @@ function ownNode(bucket, itemId) {
   input.oninput = function () {
     PLAYER.edit[bucket][itemId] = Math.max(0, Number(input.value) || 0);
     playerTouched();
+    renderPlayerTabs();                 // 标签上的件数跟着变；格子本身不重画
   };
   box.appendChild(input);
   var drop = el("button", "btn btn-sm btn-danger drop", "✕");
@@ -2506,21 +2688,40 @@ function ownNode(bucket, itemId) {
     PLAYER.edit[bucket][itemId] = 0;
     input.value = 0;
     playerTouched();
+    renderPlayerTabs();
   };
   box.appendChild(drop);
   return box;
 }
 
-/** 「＋ 加一种」。已经有的就把它加回来，别加出两张一样的格子。
- *  ★ **不再挡掉「商店在卖的」**（D23a）—— 那条限制 2026-09-06 撤了。 */
-function addOwned(bucket, kinds) {
+/** 「＋ 添加物品」：批量选择器（用户 2026-09-07），勾多件一次加进来。
+ *  材料进 `materials` 桶、其余进 `inventory` 桶（存档就是这么分的，服务端接口
+ *  不变）；已经有的画成「已有」点不动。加进来的东西不在当前分类里就切到「全部」，
+ *  免得「加了没反应」。★ **不挡「商店在卖的」**（D23a）。 */
+function addOwnedMany() {
+  var owned = {};
+  ownedEntries().forEach(function (entry) {
+    if (Number(PLAYER.edit[entry.bucket][entry.id]) > 0) { owned[entry.id] = true; }
+  });
   openPicker({
-    kinds: kinds,
-    onPick: function (item) {
-      if (!Number(PLAYER.edit[bucket][item.id])) {
-        PLAYER.edit[bucket][item.id] = 1;
-      }
-      renderPlayer();
+    multi: true,
+    owned: owned,
+    onPickMany: function (items) {
+      var added = 0;
+      var hidden = 0;
+      var requested = playerRequested();
+      items.forEach(function (item) {
+        var bucket = item.kind === "material" ? "materials" : "inventory";
+        if (!Number(PLAYER.edit[bucket][item.id])) {
+          PLAYER.edit[bucket][item.id] = 1;
+          added += 1;
+        }
+        if (!whMatches(requested, whCategory(item.id))) { hidden += 1; }
+      });
+      if (hidden) { PLAYER.tab = {big: -1, sub: null}; }
+      repaintOwned();
+      toast("已加入 " + added + " 件，按「保存」才真的发给玩家"
+            + (hidden ? "；有的不在刚才那个分类里，已切到「全部」" : ""), true);
     }
   });
 }
@@ -2533,16 +2734,46 @@ async function savePlayer() {
     materials: PLAYER.edit.materials,
     inventory: PLAYER.edit.inventory
   };
-  say($("playerMsg"), "保存中……", true);
+  toast("保存中……", true);
   var result = await api("/admin/api/player", payload);
   if (bounced(result)) { return; }
   if (result.ok && result.player) {
     adoptPlayer(result.player);
     await searchPlayers();           // 列表里的等级 / 金币跟着更新
   }
-  // ★ 这一句要排在最后：上面两个都会把消息条清空（它们各自也是入口），
-  //   先说再刷的话「已保存：…」会当场被擦掉。
-  say($("playerMsg"), result.message, result.ok);
+  toast(result.message, result.ok);
+}
+
+/** 弹窗里的「↻ 刷新」：玩家资料 + 物品表 + 四份运营配置（名字 / 等级门槛的出处）
+ *  全部重读（用户 2026-09-07：「取得最新的用户信息和运营物品信息」）。
+ *  有没保存的改动先问一句；失败时不用「已刷新」盖掉错误。 */
+async function refreshPlayerPopup() {
+  if (!PLAYER) { return; }
+  if (playerDirty()
+      && !(await ask({title: "还有没保存的改动",
+                      lead: "「" + PLAYER.view.username
+                            + "」还有没保存的改动，刷新会丢掉，确定？",
+                      ok: "刷新"}))) {
+    return;
+  }
+  var name = PLAYER.view.username;
+  toast("刷新中……", true);
+  var ok = await loadCatalog();
+  ok = (await refreshConfigs(true)) && ok;
+  ok = (await openPlayer(name, true)) && ok;
+  ok = (await searchPlayers()) && ok;
+  if (ok) { toast("已刷新：玩家资料和物品信息都是最新的。", true); }
+}
+
+/** 物品表（`/admin/api/catalog`）：登录后拿一次，玩家弹窗的刷新再拿一次。 */
+async function loadCatalog() {
+  var result = await api("/admin/api/catalog");
+  if (bounced(result)) { return false; }
+  if (!result.ok) { toast(result.message, false); return false; }
+  CAT = result;
+  BYID = {};
+  CAT.items.forEach(function (item) { BYID[item.id] = item; });
+  return true;
 }
 
 /* ======================================================================
@@ -2609,8 +2840,7 @@ function showLoggedOut(message) {
   PLAYER_LIST = [];
   BACKUP = null;
   BACKUP_PAGE = 0;
-  $("playerEdit").classList.add("hidden");
-  $("playerFoot").classList.add("hidden");
+  $("playerModal").classList.add("hidden");
   $("who").textContent = "";
   $("logout").classList.add("hidden");
   $("mainView").classList.add("hidden");
@@ -2623,12 +2853,7 @@ function showLoggedOut(message) {
 
 async function boot() {
   toast("读取中……", true);
-  var result = await api("/admin/api/catalog");
-  if (bounced(result)) { return; }
-  if (!result.ok) { toast(result.message, false); return; }
-  CAT = result;
-  BYID = {};
-  CAT.items.forEach(function (item) { BYID[item.id] = item; });
+  if (!(await loadCatalog())) { return; }
   if (!CAT.icons) {
     toast("图标图集没生成（server/web/itemicons.png）——"
           + "先跑 tools\\update-shopicons.bat，格子里会一直是问号。", false);
@@ -2740,10 +2965,11 @@ function wire() {
     PLAYER.edit.money = Math.max(0, Number($("playerMoney").value) || 0);
     playerTouched();
   };
-  $("playerAddMaterial").onclick = function () {
-    addOwned("materials", ["material"]);
-  };
-  $("playerAddItem").onclick = function () { addOwned("inventory", null); };
+  // 玩家背包弹窗（用户 2026-09-07）：只有 ✕ 能关，点遮罩不关 —— 所以
+  // `#playerModal` 故意**没有** onclick。
+  $("playerAddItem").onclick = function () { addOwnedMany(); };
+  $("playerPopupRefresh").onclick = function () { refreshPlayerPopup(); };
+  $("playerClose").onclick = function () { closePlayerModal(); };
   $("playerSave").onclick = savePlayer;
   $("playerReset").onclick = function () {
     if (PLAYER) { openPlayer(PLAYER.view.username, true); }
@@ -2766,7 +2992,22 @@ function wire() {
   };
   $("pickClose").onclick = closePicker;
   $("picker").onclick = function (event) {
-    if (event.target === $("picker")) { closePicker(); }
+    // 批量模式点遮罩不关：勾了二十件被一次误点全丢掉太亏；单选照旧。
+    if (event.target === $("picker") && !(PICKER && PICKER.multi)) { closePicker(); }
+  };
+  $("pickClear").onclick = function () {
+    if (!PICKER) { return; }
+    PICKER.chosen = {};
+    paintPicker();
+  };
+  $("pickConfirm").onclick = function () {
+    if (!PICKER || !PICKER.multi) { return; }
+    var items = Object.keys(PICKER.chosen)
+      .map(function (id) { return BYID[id]; })
+      .filter(Boolean);
+    var done = PICKER.onPickMany;
+    closePicker();
+    if (items.length && done) { done(items); }
   };
   // 点遮罩 = 取消（和选择器一个手感）。
   $("dialog").onclick = function (event) {
@@ -2807,6 +3048,9 @@ function wire() {
     }
     say($("adminMsg"), result.message, result.ok);
   };
+
+  // 浮条的位置跟着标题栏走：窗口变窄标题栏可能换行变高，重新量一次。
+  window.addEventListener("resize", placeToasts);
 
   // 关标签页前拦一下 —— 表单页最容易「改了半天忘了按保存」。
   window.addEventListener("beforeunload", function (event) {

@@ -1189,5 +1189,90 @@ class ComposeTests(_ShopCase):
         self.assertIsNotNone(shop.find_recipe(1010001, [self.RECIPE]))
 
 
+class WarehouseCategoryTests(unittest.TestCase):
+    """游戏**仓库界面**那棵树（§41）：管理页玩家背包弹窗按它分类。
+    用的是真的 `shop_items.json`（不换小表）—— 要钉的正是全表的分布。"""
+
+    def first_of(self, kind, want=None):
+        for item_id in shopdata.ids_of_kind(kind):
+            item = shopdata.get(item_id)
+            if item.ownable and (want is None or want(item)):
+                return item_id
+        self.fail("物品表里找不到 %s" % kind)
+
+    def test_the_tree_matches_the_client(self):
+        labels = [tab["label"] for tab in shop.WAREHOUSE_TABS]
+        self.assertEqual(["武器", "道具", "装备", "人物", "技能", "收集品", "称号"], labels)
+        gear = shop.WAREHOUSE_TABS[2]
+        self.assertEqual([0x10006, 0x10005, 0x10001, 0x10002, 0x10003, 0x10004],
+                         [child["id"] for child in gear["children"]])
+        # 「人物 → 英雄」是 0：客户端遇到 0 直接返回空，前端不画它。
+        self.assertEqual(0, shop.WAREHOUSE_TABS[3]["children"][1]["id"])
+        # 技能 / 称号在仓库里没有子标签。
+        self.assertEqual((), shop.WAREHOUSE_TABS[4]["children"])
+        self.assertEqual((), shop.WAREHOUSE_TABS[6]["children"])
+
+    def test_the_set_tab_is_0x10006_not_the_shops_3(self):
+        # 真表里的套装：`part_flag` 是组合值（不在单件表里、也不是 0）。
+        a_set = self.first_of("armor", lambda item: item.part_flag
+                              and item.part_flag not in shop.PART_FLAG_CATEGORY)
+        self.assertEqual(shop.CATEGORY_SET, shop.category_of(a_set))              # 商店：3
+        self.assertEqual(0x10006, shop.warehouse_category_of(a_set))              # 仓库：0x10006
+
+    def test_each_kind_lands_where_the_client_puts_it(self):
+        self.assertEqual(0x10001, shop.warehouse_category_of(1010001))            # 上衣
+        self.assertEqual(0x60001, shop.warehouse_category_of(1120041))            # 武器槽 1
+        self.assertEqual(0x20000, shop.warehouse_category_of(self.first_of("dash")))
+        self.assertEqual(0x70000, shop.warehouse_category_of(self.first_of("title")))
+        self.assertEqual(0x40001, shop.warehouse_category_of(self.first_of("pet")))
+        self.assertEqual(0x40001, shop.warehouse_category_of(self.first_of("spray")))
+        self.assertEqual(0x40002, shop.warehouse_category_of(self.first_of("ring")))
+        self.assertEqual(0x40002, shop.warehouse_category_of(self.first_of("consumable")))
+        self.assertEqual(0x50003, shop.warehouse_category_of(self.first_of("package")))
+        self.assertEqual(0x30001, shop.warehouse_category_of(self.first_of("character")))
+        self.assertEqual(0, shop.warehouse_category_of(self.first_of("key")))
+        # 材料按 id 的部位码分材料 / 卡片（6~8、11~13 是卡片）。
+        self.assertEqual(0x50001, shop.warehouse_category_of(10001))
+        card = self.first_of("material", lambda item: (item.id // 10000) % 50 in (6, 7, 8))
+        self.assertEqual(0x50002, shop.warehouse_category_of(card))
+
+    def test_every_ownable_item_has_a_tab_except_the_keys(self):
+        known = set()
+        for tab in shop.WAREHOUSE_TABS:
+            known.add(tab["id"])
+            for child in tab["children"]:
+                known.add(child["id"])
+        counts = {}
+        for kind in shopdata.kinds():
+            for item_id in shopdata.ids_of_kind(kind):
+                item = shopdata.get(item_id)
+                if not item.ownable:
+                    continue
+                cat = shop.warehouse_category_of(item_id)
+                self.assertIn(cat, known, (item_id, kind))
+                if cat == 0:
+                    self.assertEqual("key", kind, item_id)
+                counts[cat] = counts.get(cat, 0) + 1
+        # 和逆向出来的分布对表（§41）：这几格一变就说明分类规则走样了。
+        self.assertEqual(18, counts[0x10006])      # 套装
+        self.assertEqual(15, counts[0x20000])      # 技能
+        self.assertEqual(26, counts[0x50001])      # 材料
+        self.assertEqual(17, counts[0x50002])      # 卡片
+        self.assertEqual(12, counts[0x50003])      # 活动（礼包）
+        self.assertEqual(3, counts[0])             # 钥匙
+
+    def test_matching_follows_the_client_filter(self):
+        self.assertTrue(shop.warehouse_category_matches(-1, 0x10001))
+        self.assertTrue(shop.warehouse_category_matches(0x10000, 0x10006))    # 父标签按组收
+        self.assertTrue(shop.warehouse_category_matches(0x10001, 0x10001))
+        self.assertFalse(shop.warehouse_category_matches(0x10001, 0x10002))
+        self.assertFalse(shop.warehouse_category_matches(0x60000, 0x10001))
+        # 0 两边都不通配：英雄标签永远空，钥匙哪都不显示。
+        self.assertFalse(shop.warehouse_category_matches(0, 0x10001))
+        self.assertFalse(shop.warehouse_category_matches(0x10000, 0))
+        # 管理页的「全部」连钥匙也列 —— 运营要看得全，不照游戏里「哪都不显示」。
+        self.assertTrue(shop.warehouse_category_matches(-1, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

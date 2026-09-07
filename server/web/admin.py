@@ -112,6 +112,7 @@ import account_store
 import cfgmerge
 import databackup
 import eventlog
+import shop
 import shopcfg
 import shopdata
 
@@ -394,6 +395,9 @@ def catalog():
                     "kind": item.kind,
                     "name": shopcfg.item_name_zh(item),
                     "cell": cells.get(item.icon),
+                    # 游戏**仓库界面**里它在哪个标签（§41）—— 玩家背包弹窗
+                    # 按这个分类筛，和游戏里逐格对得上。
+                    "wh": shop.warehouse_category_of(item.id),
                 }
                 # 有才带 —— 800 件里大部分字段是空的，全量带上白涨一倍体积。
                 desc = shopcfg.item_desc_zh(item)
@@ -857,6 +861,8 @@ class AdminRoutes:
             "characters": {str(k): v for k, v in shopcfg.CHARACTER_ZH.items()},
             "series": shopcfg.SERIES_ZH,
             "max_materials": shopcfg.MAX_MATERIALS,
+            # 仓库界面那棵标签树（§41）：玩家背包弹窗照它画分类，再加一个「全部」。
+            "warehouse": shop.WAREHOUSE_TABS,
         })
 
     def _admin_login(self, data):

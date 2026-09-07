@@ -188,6 +188,96 @@ def category_matches(requested, item_category):
     return False
 
 
+# ---------------------------------------------------------------------------
+# 仓库界面那棵树（§41）—— 管理页的玩家背包弹窗按它分类
+#
+# 仓库标签是**纯客户端过滤**（`0x4127d7`），没有对应的包；这里只是把客户端
+# 自己的两个分类函数（`0x55bb57` 按 part_flag / `0x55ba64` 按 id 部位码）
+# 翻过来，好让管理页和游戏里逐格对得上。商店 / 合成的口径（上面那些）一点不动。
+# ---------------------------------------------------------------------------
+#: ★★ 仓库的「套装」是 `0x10006`，**不是商店的 `3`**（§41：`0x45309e` vs
+#:   `0x45a74c`）。两棵树在这一格真的不同号。
+WAREHOUSE_SET = 0x10006
+#: 仓库那棵树上技能 / 称号都是**顶级**标签、没有子标签，客户端把突击技和
+#: 称号直接归到 `0x20000` / `0x70000`（商店 / 合成口径是 `0x20001` / `0x70001`）。
+WAREHOUSE_SKILL = 0x20000
+WAREHOUSE_TITLE = 0x70000
+WAREHOUSE_MERCENARY = 0x30001
+WAREHOUSE_CARD = 0x50002
+WAREHOUSE_EVENT = 0x50003
+#: 「人物 → 英雄」= `0`，客户端遇到 0 直接返回空 —— 钥匙那 3 件归这儿，
+#: 意思是「哪个标签都看不到」。
+WAREHOUSE_NOWHERE = 0
+
+#: 仓库界面从左到右的 7 个大分类和它们的小分类（§41，中文名照 `Chinese.ini`
+#: 原版用词：「下衣」「其它」「鞋子」）。管理页原样画，只多一个「全部」。
+WAREHOUSE_TABS = (
+    {"id": 0x60000, "label": "武器", "children": (
+        {"id": 0x60001, "label": "武器1"}, {"id": 0x60002, "label": "武器2"},
+        {"id": 0x60003, "label": "武器3"})},
+    {"id": 0x40000, "label": "道具", "children": (
+        {"id": 0x40001, "label": "装饰"}, {"id": 0x40002, "label": "其它"})},
+    {"id": 0x10000, "label": "装备", "children": (
+        {"id": WAREHOUSE_SET, "label": "套装"}, {"id": 0x10005, "label": "头部"},
+        {"id": 0x10001, "label": "上衣"}, {"id": 0x10002, "label": "下衣"},
+        {"id": 0x10003, "label": "手套"}, {"id": 0x10004, "label": "鞋子"})},
+    {"id": 0x30000, "label": "人物", "children": (
+        {"id": WAREHOUSE_MERCENARY, "label": "佣兵"},
+        {"id": WAREHOUSE_NOWHERE, "label": "英雄"})},
+    {"id": WAREHOUSE_SKILL, "label": "技能", "children": ()},
+    {"id": 0x50000, "label": "收集品", "children": (
+        {"id": CATEGORY_MATERIAL, "label": "材料"}, {"id": WAREHOUSE_CARD, "label": "卡片"},
+        {"id": WAREHOUSE_EVENT, "label": "活动"})},
+    {"id": WAREHOUSE_TITLE, "label": "称号", "children": ()},
+)
+
+_WAREHOUSE_PART_FLAG = dict(PART_FLAG_CATEGORY)
+_WAREHOUSE_PART_FLAG[32] = WAREHOUSE_SKILL
+_WAREHOUSE_PART_FLAG[8192] = WAREHOUSE_TITLE
+
+#: `part_flag == 0` 的物品客户端按 **id 的部位码** `(id // 10000) % 50` 分
+#: （`0x55ba64`）。材料 / 卡片这一刀就在这儿：6~8、11~13 是卡片，其余是材料。
+_CARD_PART_CODES = frozenset((6, 7, 8, 11, 12, 13))
+
+
+def warehouse_category_of(item_id):
+    """这件东西在**游戏仓库界面**里落在哪个标签（§41）。"""
+    item = shopdata.get(item_id)
+    if item is None:
+        return CATEGORY_OTHER
+    flag = item.part_flag
+    if flag:
+        known = _WAREHOUSE_PART_FLAG.get(flag)
+        return known if known is not None else WAREHOUSE_SET
+    kind = item.kind
+    if kind == "material":
+        part = (int(item.id) // 10000) % 50
+        return WAREHOUSE_CARD if part in _CARD_PART_CODES else CATEGORY_MATERIAL
+    if kind == "package":
+        return WAREHOUSE_EVENT          # 礼包在「收集品 → 活动」
+    if kind == "character":
+        return WAREHOUSE_MERCENARY      # 角色卡在「人物 → 佣兵」
+    if kind == "key":
+        return WAREHOUSE_NOWHERE        # 客户端就是这么判的：哪都不显示
+    return CATEGORY_OTHER               # 消耗品之类：「道具 → 其它」
+
+
+def warehouse_category_matches(requested, item_category):
+    """仓库界面版的 `category_matches`（客户端 `0x412852~0x412868`）：
+    精确相等，或父标签（低半字为 0）按组收；`0` 两边都不通配；没有「新商品」。"""
+    requested = int(requested)
+    item_category = int(item_category)
+    if requested == CATEGORY_ALL:
+        return True
+    if requested == WAREHOUSE_NOWHERE or item_category == WAREHOUSE_NOWHERE:
+        return False
+    if requested == item_category:
+        return True
+    if requested & 0xFFFF == 0:
+        return (requested >> 16) == (item_category >> 16)
+    return False
+
+
 def composition_category_matches(requested, item_category):
     """合成面板版的 `category_matches` —— 只有「新商品」一格不一样。
 
