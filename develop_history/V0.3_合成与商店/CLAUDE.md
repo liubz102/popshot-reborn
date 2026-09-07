@@ -120,7 +120,7 @@ V0.2 的 `FINDINGS.md` 有 41 万字符、V0.3bot 的有 45 万，**别整份翻
 | `Pack_decrypt/` | 解开的 `Pack\*.pkn` 资源树，**只读**。★ 本版的数据源：`Data/ShopItem-Chn.ini` / `EquipBonus-Chn.ini` / `weapon.ini` / `Promotion-chn.ini` / `Ui/*.ui` |
 | `re/` | 逆向产物：`BigShot_22524.exe` / `.img`、`vftables.json`（机械生成，**别手改**）、★ **`packet_api.md`** |
 | `tools/` | 便携逆向工具 + 自写探针 + 启停脚本。★ 逆向工具箱是 **`re_bs.py`**；★ 本版新增 `shopdata.py` + `update-shopdata.bat`、`quest-clear.bat` |
-| `server/` | Python 服务端（**单机假服务器和云端是同一套代码**）。★ 本版新增 `shopdata.py` / `shopcfg.py` / `shop.py` / `web/admin.html`，产物 `shop_items.json` |
+| `server/` | Python 服务端（**单机假服务器和云端是同一套代码**）。★ 本版新增 `shopdata.py` / `shopcfg.py` / **`shopdefaults.py`（四份配置的模板 = 设计表，D50）** / `shop.py` / `web/admin.html`，产物 `shop_items.json` |
 | `server/data/` | **只装用户数据**（`accounts.json`，`.gitignore`）。★ 本版新增 `shop.json` / `recipe.json` / `drops.json` —— 运行时生成、用户可手改、**也要进 `.gitignore`** |
 | `runtime/python/` | 内置 CPython 3.14.3 x64 |
 | `runtime-win7/python/` | **Win7 兼容运行时** 3.8.10 win32。★ 改完服务端顺手跑一遍，别把 3.8 兼容性弄丢 |

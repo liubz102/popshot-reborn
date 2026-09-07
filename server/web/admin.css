@@ -9,8 +9,17 @@
    | --cocoa / --cocoa-ink  | 同图的深棕内嵌面板、面板里的正文字色 |
    | --gold                 | 房间界面「F5 游戏准备」那颗金黄按钮 |
    | --crimson              | 房间界面各面板的绯红边框 → 删除 / 危险 |
-   | --teal                 | 房间界面属性条的青色 → 「已上架」开关 |
+   | --teal                 | 房间界面属性条的青色 → 「已穿戴」徽标、成功消息 |
    | 星芒格子               | Images/NewUI/ShopCabinetSlot.png 的橙色放射底 |
+
+   唯一一个**不是**原版取色的是 `--moss`：原版这套 UI 里没有绿。
+   **全页所有开关（`.toggle.on`）和备份页的「自动」徽标走它**（用户 2026-09-07）。
+
+   原来这些地方用的是 `--teal`，可这一整页是琥珀 + 米白 + 深棕的暖调，青是
+   全页唯一一点冷色，开关一开就跳出来。换成暖调的苔绿：既不跟琥珀撞（琥珀
+   在这页是「可点的钮」，**状态**不该跟钮同色），又保住「开 = 通」这个一眼
+   能认的常规语义。⇒ **别再把开关改回 `--teal`** —— 那个青现在只剩
+   「已穿戴」徽标和成功消息两处在用。
 
    ★ 用户拍板的是「米白纸面 + 琥珀边框」：**琥珀当描边、米白当底**，
      不是整屏铺橙色 —— 这是一个要读几百个数字的表单页，底色得让眼睛待得住。
@@ -39,6 +48,10 @@
   --crimson-dk: #8E1B20;
 
   --teal:       #2FA8A0;
+
+  --moss:       #7C9A4B;   /* 苔绿：开着的开关（拨轨） */
+  --moss-dk:    #5F7A34;   /* 同色深一档：描边 / 字 / 白字徽标底 */
+
   --line:       #E2CFAB;   /* 分隔线 / 输入框描边 */
 }
 
@@ -312,7 +325,9 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
   font-size: 11px;
 }
 
-/* 开关 */
+/* 开关 —— 关 = 浅棕拨轨，开 = 苔绿（配色说明见文件头，用户 2026-09-07）。
+   页面上**每一个**开关都走这一档：备份页「每天自动备份」、配置页「已上架」
+   之类的布尔字段、筛选条「只看已上架」、玩家背包的「拥有 / 没有」。 */
 .toggle {
   display: inline-flex; align-items: center; gap: 7px;
   cursor: pointer; user-select: none; font-size: 13px; font-weight: 600;
@@ -328,9 +343,9 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
   background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .3);
   transition: transform .12s;
 }
-.toggle.on .track { background: var(--teal); border-color: #1F7E78; }
+.toggle.on .track { background: var(--moss); border-color: var(--moss-dk); }
 .toggle.on .track::after { transform: translateX(19px); }
-.toggle.on { color: #1F7E78; }
+.toggle.on { color: var(--moss-dk); }
 
 /* ---------------------------------------------------------- 物品图标格子 */
 /* 照 Images/NewUI/ShopCabinetSlot.png：上架 = 橙色放射星芒 + 橙描边，
@@ -589,12 +604,12 @@ code {
 .backup-list thead th { position: sticky; top: 0; z-index: 1; }
 .backup-list td { vertical-align: middle; }
 .backup-list .bk-label { word-break: break-all; }
-/* 类型徽标：自动 = 青（状态那一档）、手动 = 琥珀、回滚前 = 棕。 */
+/* 类型徽标：自动 = 苔绿（跟上面那个开关同色）、手动 = 琥珀、回滚前 = 棕。 */
 .kind {
   display: inline-block; padding: 1px 8px; border-radius: 8px;
   font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap;
 }
-.kind.auto { background: var(--teal); }
+.kind.auto { background: var(--moss-dk); }
 .kind.manual { background: var(--amber-dark); }
 .kind.prerollback { background: var(--cocoa-soft); }
 /* 设置条 / 手动条：控件横着排，脏标和「保存设置」靠右。 */

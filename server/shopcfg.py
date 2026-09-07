@@ -22,6 +22,8 @@
   随代码走、进 git、进包。回答「这个 id 客户端认不认识、占哪个槽、加多少」。
 - `shopcfg.py`（本文件）读 `server/data/*.json` —— **用户的运营配置**，
   运行时生成、`.gitignore`、**打包时不拷**（D7）。回答「卖不卖、多少钱、怎么合」。
+- `shopdefaults.py` 算四份配置的**默认内容**（模板）—— 第一次开服 `ensure_files()`
+  写出来的就是它，`default_*()` 只是它的切片（D50）。改默认数值去那边改表。
 
 ## 热重载（用户要求：改完不重启即刻生效）
 
@@ -529,42 +531,18 @@ def has_level_and_character(item):
 
 
 def default_items():
-    """从 `shop_items.json` + 我们自己的定价表生成一份默认 `items.json`。
+    """默认 `items.json` = `shopdefaults.build_all()["items"]`（设计表在那边，D50）。
 
     ★ **收全部能进背包的东西**（`ownable`，808 件）—— 中文名是每一件都有的
     （材料、礼包、消耗品在管理页上也要认得出来）。等级和角色限定只给
-    **占装备槽**的那 734 件写（`has_level_and_character`）。
+    **占装备槽**的那些写（`has_level_and_character`）。
 
     等级的来路（**都是复活工程定的**，原版的随服务端 DB 一起没了）：
-
-    * 武器 —— 按档次 `WEAPON_LEVEL`（和 `default_shop` 的价格表配套）；
-    * 合成产物 —— `RECIPE_LINES` 里那条产线的档位；
-    * 其余 —— `1`（不限）。
-
-    角色限定取原版数据（`shopdata` 的 `character`），键不写 = 不限。
+    商店卖的按定价档（武器按级别、散装铠甲按加成）、合成产物按产线档位、
+    其余 `1`（不限）。角色限定取原版数据（`shopdata` 的 `character`），键不写 = 不限。
     """
-    levels = {}
-    for _recipe, level in _recipe_seed():
-        levels[_recipe["result"]] = level
-    entries = []
-    for kind in shopdata.kinds():
-        for item_id in shopdata.ids_of_kind(kind):
-            item = shopdata.get(item_id)
-            if item is None or not item.ownable:
-                continue
-            entry = {"id": item.id, "name": item_name_zh(item)}
-            if has_level_and_character(item):
-                if item_id in levels:
-                    entry["level"] = levels[item_id]
-                elif item.kind == "weapon" and item.series:
-                    entry["level"] = WEAPON_LEVEL.get(item.tier or 1, 5)
-                else:
-                    entry["level"] = 1
-                if item.character is not None:
-                    entry["character"] = int(item.character)
-            entries.append(entry)
-    entries.sort(key=lambda e: e["id"])
-    return {"format": FORMAT, "items": entries}
+    import shopdefaults          # 只在这儿 import：模块加载阶段两边互不依赖（见那边的文件头）
+    return shopdefaults.default_items()
 
 
 def validate_items(raw):
@@ -644,235 +622,40 @@ def item_name(item_id, data_dir=None):
 
 
 def default_shop():
-    """从 `shop_items.json` 生成一份默认 `shop.json`。
+    """默认 `shop.json` = `shopdefaults.build_all()["shop"]`（D44 / D50）。
 
-    ★ **只收 63 件 D/R/F 武器**（都得 `ownable`，只有货架条目的进不了背包，
-    §11）—— 这是本版商店的主体，也是唯一真的摆上货架的东西。
-
-    ⚠ 以前这里还会把**全部材料**和**合成产物**收进来（`listed=false`），
-    理由只有一个：「给它们一个中文名」。中文名搬进 `items.json` 之后
-    （D31）那个理由没了，再收 86 条空条目只会让「商店货架」这一页
-    看上去像个全物品表。要卖它们的话在管理页上「＋ 添加一条」就行。
+    散件在商店买：63 件 D/R/F + 特别版武器、没有名字的散装铠甲、装饰件、
+    染色剂、突击技、外观套装、强攻套装，共 484 件。材料 / 消耗品 / 礼包 /
+    角色卡 / 称号不卖。价格和等级门槛的算法在 `shopdefaults`。
     """
-    entries = []
-
-    for item_id in shopdata.ids_of_kind("weapon"):
-        item = shopdata.get(item_id)
-        if not item.ownable or not item.series or item.character is None:
-            continue
-        tier = item.tier or 1
-        entries.append({
-            "id": item.id,
-            "kind": "weapon",
-            "listed": True,
-            "price": WEAPON_PRICE.get(tier, 3000),
-        })
-
-    entries.sort(key=lambda e: (e["kind"], e["id"]))
-    # ★ 不写 `_说明`：那几句话是给**手改 json 的人**看的，而现在唯一的编辑入口
-    #   是管理页（D16）。说明文字挪进了 `SCHEMA[...]["help"]`，页面直接渲染。
-    return {"format": FORMAT, "items": entries}
+    import shopdefaults
+    return shopdefaults.default_shop()
 
 
 # --------------------------------------------------------------------------
-# 默认 recipe.json
+# 默认 recipe.json / drops.json
 # --------------------------------------------------------------------------
-
-#: 合成配方的三条产线。每条 = `(套装韩文名, 档位)`。
-#:
-#: **主题是照原版材料的名字定的**（D2 / FINDINGS §7）：
-#: 原版材料里有「不死鸟之羽 / 不死鸟之泪」，装备里正好有一整条
-#: 「피닉스아머（凤凰铠甲）」产线 —— 这两个对得上不是巧合。
-#: 「머시너리아머（佣兵铠甲）」是纯防御向，配铁 / 管一类的工业材料。
-#:
-#: 每档的材料 = 一种「主题材料」+ 一种「通用矿料」+ 一种「珠子」，最多 4 种
-#: （UI 只有 4 个槽）。数量和花费按那一件的加成大小缩放。
-#:
-#: ★ 系数是**照掉落速度倒推的**，不是拍脑袋：`drops.json` 默认一局最多掉
-#: 1 个材料、概率 25%~100%，所以「一件中档装备 ≈ 10 局左右」才不至于劝退。
-#: 一件加成合计 9 点的上衣按下面的系数是 4+2+5 = 11 个材料。
-#: 觉得快了慢了直接在管理页改 `recipe.json`，不用动代码。
-RECIPE_LINES = (
-    # (套装韩文名, 等级门槛, 每点加成的金币, 材料表)
-    ("머시너리아머", 10, 260, ((20007, 0.40), (30018, 0.25), (10001, 0.60))),
-    ("마스터리아머", 14, 320, ((20007, 0.40), (30005, 0.25), (10002, 0.60))),
-    ("마이너피닉스아머", 18, 420, ((30016, 0.30), (30006, 0.40), (10002, 0.55))),
-    ("메이져피닉스아머", 24, 560, ((30016, 0.30), (30017, 0.25),
-                                   (30006, 0.40), (10002, 0.55))),
-)
-
-
-def _bonus_weight(item):
-    """一件装备「有多强」—— 拿它缩放材料数量和花费。
-
-    ★ 用**绝对值之和**：有几件是「攻 -2 防 +9」这种，负的那格也是设计的一
-    部分（防御向套装故意扣攻击），当成 0 会把它们算得太便宜。
-    """
-    return sum(abs(int(v)) for v in (item.bonus or {}).values()) or 1
-
-
-def _armor_sets():
-    """`{(角色, 套装韩文名): [Item, …]}` —— 只收三个初期角色、能进背包的。"""
-    groups = {}
-    for kind in ("armor", "ring"):
-        for item_id in shopdata.ids_of_kind(kind):
-            item = shopdata.get(item_id)
-            if item.timed or not item.ownable or item.character not in (0, 1, 2):
-                continue
-            name = (item.name_kr or "").strip()
-            if not name or not item.bonus:
-                continue
-            base, part_zh = _split_part_suffix(name)
-            if not part_zh:            # 名字里没有部位后缀 = 不是套装的一件
-                continue
-            for korean in ("타이", "카실", "프로코"):
-                if base.startswith(korean):
-                    base = base[len(korean):].strip("_ ")
-                    break
-            groups.setdefault((item.character, base), []).append(item)
-    return groups
-
-
-def _recipe_seed():
-    """`[(配方, 产物的装备等级)]` —— `default_recipes` 和 `default_items` 共用。
-
-    ★ **等级不进 `recipe.json`**（D27）：合成本身**没有等级门**（原版的合成
-    面板从头到尾不读玩家等级，FINDINGS §33），`RECIPE_LINES` 里那个数是
-    **产物穿上时**的要求，归 `items.json` 管（D31）。两处各留一份的话，
-    改了一处另一处不动，很快就对不上。
-    """
-    sets = _armor_sets()
-    seed = []
-    next_id = 1
-    for korean, level, gold_per_point, materials in RECIPE_LINES:
-        for character in (0, 1, 2):
-            pieces = sorted(sets.get((character, korean), ()),
-                            key=lambda it: it.id)
-            for item in pieces:
-                weight = _bonus_weight(item)
-                need = []
-                for material_id, ratio in materials:
-                    if not shopdata.exists(material_id):
-                        continue        # 中文版没有这种材料就跳过这一格
-                    need.append({"id": material_id,
-                                 "count": max(1, int(round(weight * ratio)))})
-                if not need:
-                    continue
-                seed.append(({
-                    "id": next_id,
-                    "result": item.id,
-                    "listed": True,
-                    "cost": weight * gold_per_point,
-                    "materials": need[:MAX_MATERIALS],
-                }, level))
-                next_id += 1
-    return seed
-
 
 def default_recipes():
-    """从 `shop_items.json` 生成一份默认 `recipe.json`。
+    """默认 `recipe.json` = `shopdefaults.build_all()["recipes"]`。
 
     ★ **原版配方在客户端里彻底不存在**（FINDINGS §7），这一份是**我们自己
-    设计的**（D2）。用户会在管理页里调，所以这里追求的是「一眼看得懂、
-    改起来容易」，不是「一次到位」。
+    设计的**（D2 / D49）：同风格的装备用同风格的材料，一条配方只用一个难度档的
+    特殊材料，矿料和珠子从同一关拿。用户会在管理页里调。
     """
-    # `_说明` 见 `default_shop()` 那条注释：说明文字在 `SCHEMA` 里，不写进文件。
-    return {"format": FORMAT,
-            "recipes": [recipe for recipe, _level in _recipe_seed()]}
-
-
-# --------------------------------------------------------------------------
-# 默认 drops.json
-# --------------------------------------------------------------------------
-
-#: 原版基线：`Promotion.ini` 里给材料的 4 关（三个角色线一模一样，
-#: 所以按 `(quest_stage, difficulty)` 去重后就这 4 条，FINDINGS §12）。
-#: `prob=100` = 必掉。
-#:
-#: 扩展部分：任务模式按**难度**掉材料。原版珠子主要来自对战模式
-#: （新浪 2007 攻略页），但用户的期望是「打任务掉材料」，所以两边都给（D4）。
-#:
-#: ★★ **这张表必须覆盖 `RECIPE_LINES` 用到的每一种材料** —— 漏一种，
-#: 那条产线就永远合不出来。`test_every_recipe_material_can_actually_drop`
-#: 守着这一条（会话 01 就是被它抓出来的：配方要铁矿石，掉落表里没有）。
-#:
-#: 难度越高、材料越好：珠子人人有份，不死鸟系只有最高难度掉。
-#: ★ 最高难度是 **3（困难）**，没有第 4 档（`DIFFICULTY_ZH` 上面的说明）——
-#:   以前写在第 4 档上的那几条（黑珠 / 不死鸟）全挪到了第 3 档，否则那几条
-#:   产线在中国区客户端上永远合不出来。
-DEFAULT_MATERIAL_DROPS = (
-    # (材料 id, {难度: 概率%})            用在哪条产线
-    (10003, {1: 25}),                     # 绿珠   —— 低难度的保底产出
-    (10004, {2: 40}),                     # 蓝珠
-    (10002, {3: 60}),                     # 红珠   —— 大师 / 凤凰两条线
-    (10001, {3: 40}),                     # 黑珠   —— 佣兵线
-    (20007, {2: 30, 3: 40}),              # 铁矿石 —— 佣兵 + 大师
-    (30005, {2: 25, 3: 35}),              # 水管   —— 大师
-    (30018, {3: 20}),                     # 青铜管 —— 佣兵（原版基线只在 3 张图给，
-                                          #           光靠那个凑不出一套）
-    (30006, {3: 30}),                     # 火焰碎片 —— 凤凰两档
-    (30016, {3: 25}),                     # 不死鸟之羽 —— 凤凰
-    (30017, {3: 15}),                     # 不死鸟之泪 —— 高阶凤凰，最稀有
-)
+    import shopdefaults
+    return shopdefaults.default_recipes()
 
 
 def default_drops():
-    """从 `shop_items.json` 的 `promotions` 生成一份默认 `drops.json`。"""
-    rules = []
-    seen = set()
-    for promo in shopdata.promotions():
-        stage = promo.get("quest_stage")
-        difficulty = promo.get("difficulty")
-        if stage is None or difficulty is None:
-            continue
-        for reward in promo.get("rewards", ()):
-            if reward.get("kind") != "item":
-                continue
-            item_id = reward.get("item_id")
-            if not shopdata.is_material(item_id):
-                continue
-            key = (stage, difficulty, item_id)
-            if key in seen:
-                continue        # 三个角色线一模一样，去重
-            seen.add(key)
-            rules.append({
-                "mode": "quest",
-                "stage": stage,
-                "difficulty": difficulty,
-                "material": item_id,
-                "count": 1,
-                "prob": 100,
-                "cleared_only": True,
-                "note": "原版基线（Promotion.ini %s）" % promo.get("promotion_id", ""),
-            })
-    rules.sort(key=lambda r: (r["stage"], r["difficulty"], r["material"]))
+    """默认 `drops.json` = `shopdefaults.build_all()["drops"]`（D49）。
 
-    for material, by_difficulty in DEFAULT_MATERIAL_DROPS:
-        if not shopdata.exists(material):
-            continue
-        for difficulty in sorted(by_difficulty):
-            rules.append({
-                "mode": "quest",
-                "difficulty": difficulty,
-                "material": material,
-                "count": 1,
-                "prob": by_difficulty[difficulty],
-                "cleared_only": True,
-                "note": "扩展：任务模式按难度掉材料",
-            })
-
-    if shopdata.exists(10001):
-        rules.append({
-            "mode": "pvp",
-            "material": 10001,
-            "count": 1,
-            "prob": 15,
-            "cleared_only": False,
-            "note": "扩展：对战模式也给一点（原版珠子主要来自对战）",
-        })
-
-    # `_说明` 见 `default_shop()` 那条注释：说明文字在 `SCHEMA` 里，不写进文件。
-    return {"format": FORMAT, "rules": rules}
+    每关每档正好两样、全 100%：简单 = 本关独占矿料 + 珠子，普通 = 本关低档特殊
+    材料 + 矿料，困难 = 高档 + 矿料；对战按概率给珠子和矿料。
+    `test_every_recipe_material_can_actually_drop` 守着「配方要的材料都掉得出来」。
+    """
+    import shopdefaults
+    return shopdefaults.default_drops()
 
 
 # --------------------------------------------------------------------------

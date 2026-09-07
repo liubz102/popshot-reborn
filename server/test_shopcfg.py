@@ -13,6 +13,7 @@
 外加一批校验用例。校验的意义是「**别把客户端认不出来的 id 发下去**」
 —— 那种 id 在界面上就是个空格子，比报错难查得多。
 """
+import collections
 import json
 import os
 import sys
@@ -144,18 +145,19 @@ class BackfillTests(_CfgCase):
     def test_apply_keeps_entries_the_default_table_never_had(self):
         """★ 用户自己在商店货架里加的东西不能被补齐吃掉（铁律 11）。
 
-        `default_shop()` 只生成 D/R/F 武器，所以「一件自己加进去卖的铠甲」
-        正是默认表里没有的那种条目。
+        `1120051` 是小表里一把没有系列号的武器 —— 默认表只上架 D/R/F 和
+        登记过的特别版，所以它正是「默认表里没有、用户自己加进去卖」的那种条目。
         """
         shopcfg.ensure_files(self.dir)
         path = shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir)
         data = json.load(open(path, encoding="utf-8"))
-        data["items"].append({"id": 1010001, "listed": True, "price": 7})
+        self.assertNotIn(1120051, [e["id"] for e in data["items"]])
+        data["items"].append({"id": 1120051, "listed": True, "price": 7})
         shopcfg.write_json(path, data)
         shopcfg.backfill_defaults(self.dir, apply=True)
         after = {e["id"]: e for e in
                  json.load(open(path, encoding="utf-8"))["items"]}
-        self.assertEqual(7, after[1010001]["price"])
+        self.assertEqual(7, after[1120051]["price"])
 
     #: 小物品表里没有成套的铠甲（韩文名带部位后缀的那种），所以
     #: `default_recipes()` 在这儿是空的 —— 配方那两条用例自带一份「默认表」。
@@ -597,13 +599,21 @@ class RealDefaultsTests(unittest.TestCase):
         shopcfg.invalidate()
         self.tmp.cleanup()
 
-    def test_shop_lists_the_63_weapons(self):
+    def test_shop_lists_the_whole_catalogue(self):
+        """★ 全量上架（D44 / D44b）：散件在商店买 —— 63 件 D/R/F 一件不少，
+        加上特别版武器、散装铠甲、装饰、染色剂、突击技、外观套和强攻套。
+        材料 / 消耗品 / 礼包 / 角色卡 / 称号不卖（D44 那张表）。"""
         shop = shopcfg.validate_shop(shopcfg.default_shop())
         listed = [e for e in shop.values() if e["listed"]]
-        self.assertEqual(63, len(listed), "上架的应该正好是那 63 件 D/R/F")
+        self.assertEqual(484, len(listed), "上架件数变了 —— 改了 shopdefaults 的表就把这个数跟着改")
+        kinds = {e["kind"] for e in listed}
+        self.assertEqual({"weapon", "armor", "spray", "dash"}, kinds)
         for entry in listed:
-            self.assertEqual("weapon", entry["kind"])
             self.assertGreater(entry["price"], 0, "上架的东西不能白送")
+        for item_id in shopdata.ids_of_kind("weapon"):
+            item = shopdata.get(item_id)
+            if item.ownable and item.series and item.character is not None:
+                self.assertIn(item_id, shop, "D/R/F 武器 %d 没上架" % item_id)
 
     def test_every_item_name_is_chinese(self):
         """★ 中文名的唯一出处是**物品库**（D31），所以这一条查的是它。"""
@@ -645,19 +655,54 @@ class RealDefaultsTests(unittest.TestCase):
             self.assertLessEqual(total, 30, "配方 #%d 要 %d 个材料，太肝了"
                                  % (recipe["id"], total))
 
-    def test_recipe_results_are_equippable_armor(self):
-        for recipe in shopcfg.validate_recipes(shopcfg.default_recipes()):
+    def test_recipe_results_are_equippable(self):
+        """产物都占装备槽（铠甲 / 戒指 / 宠物）；铠甲和戒指还得有加成 ——
+        宠物里有纯外观的（熊猫），那是原版数据，不是我们漏了。"""
+        recipes = shopcfg.validate_recipes(shopcfg.default_recipes())
+        self.assertEqual(122, len(recipes), "配方条数变了 —— 改了 shopdefaults 的表就把这个数跟着改")
+        kinds = collections.Counter()
+        for recipe in recipes:
             item = shopdata.get(recipe["result"])
+            kinds[item.kind] += 1
             self.assertTrue(item.equippable, "%d 不占装备槽" % item.id)
-            self.assertTrue(item.bonus, "%d 一点加成都没有，合它干嘛" % item.id)
+            if item.kind != "pet":
+                self.assertTrue(item.bonus, "%d 一点加成都没有，合它干嘛" % item.id)
+        self.assertEqual({"armor": 109, "ring": 6, "pet": 7}, dict(kinds))
 
     def test_drops_include_the_original_baseline(self):
         rules = shopcfg.validate_drops(shopcfg.default_drops())
         baseline = {(r.get("stage"), r.get("difficulty"), r["material"])
                     for r in rules if r.get("stage") is not None}
-        # FINDINGS §12：原版给材料的 4 关（三个角色线去重后）
-        self.assertEqual({(7, 1, 30018), (1, 2, 30018),
-                          (4, 3, 30019), (1, 3, 30018)}, baseline)
+        # FINDINGS §12：原版给材料的 4 关（三个角色线去重后）。★ 第 7 关简单那条
+        # 青铜管**故意不在**：用户 2026-09-07 把青铜管定成机械青蛙独占的通用材料，
+        # 秘密基地改掉橡皮管（D49 第二轮）。
+        for key in ((1, 2, 30018), (4, 3, 30019), (1, 3, 30018)):
+            self.assertIn(key, baseline)
+        self.assertNotIn((7, 1, 30018), baseline)
+
+    def test_drops_follow_the_original_tiering(self):
+        """★★ D49 的口径：每关每档正好两样、简单只通用、普通低档 / 困难高档、
+        特殊材料只在本关掉、不进对战 —— `check_tiering` 一条条核。"""
+        import shopdefaults
+        rules = shopcfg.validate_drops(shopcfg.default_drops())
+        self.assertEqual([], shopdefaults.check_tiering(rules))
+        recipes = shopcfg.validate_recipes(shopcfg.default_recipes())
+        self.assertEqual([], shopdefaults.check_recipes(rules, recipes))
+        self.assertEqual(52, len(rules))
+
+    def test_every_material_except_cards_has_a_recipe_and_a_drop(self):
+        """材料掉了没人用、或有人用却掉不出来，都是「两张表各自对、合起来不成立」。
+        卡片（6xxxx / 11~13xxxx）不算：原版按成就给，本版不上架（D44a）。"""
+        droppable = {r["material"] for r in
+                     shopcfg.validate_drops(shopcfg.default_drops())}
+        used = set()
+        for recipe in shopcfg.validate_recipes(shopcfg.default_recipes()):
+            used |= {m["id"] for m in recipe["materials"]}
+        for material in shopdata.ids_of_kind("material"):
+            if material >= 60000:
+                continue
+            self.assertIn(material, droppable, "%d 没有地方掉" % material)
+            self.assertIn(material, used, "%d 掉了但没有配方用它" % material)
 
     def test_the_two_spellings_of_每个部位_are_both_recognised(self):
         """★★ 原版自己就不统一（2026-09-05 实机撞上的）：
