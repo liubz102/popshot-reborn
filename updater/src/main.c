@@ -328,8 +328,9 @@ static void measure_source(void *user, const wchar_t *url, SpeedSample *out)
 {
     (void)user;
     memset(out, 0, sizeof(*out));
-    if (!net_probe_speed(url, SPEED_WINDOW_MS, ui_cancel_requested,
-                         &out->bytes, &out->elapsed_ms, out->note, 128))
+    if (!net_probe_speed(url, SPEED_WINDOW_MS, SPEED_BUCKET_MS,
+                         ui_cancel_requested, &out->bytes, &out->elapsed_ms,
+                         &out->trace, out->note, 128))
         out->cancelled = 1;
 }
 

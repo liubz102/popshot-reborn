@@ -7,14 +7,17 @@
         /manifest-a.json  /manifest-b.json   目标 V0.2.201 / V0.2.202
         /update-a.zip（4 MB）/update-b.zip（1 MB）「直连」= 限速 256 KB/s（< 1 MiB/s）
         /fast/<原地址>    全速          —— 该被选中的代理
-        /fast2/<原地址>   全速          —— 排在第二组，不该被测到
+        /fast2/<原地址>   全速          —— 排在第二组（第 6 个），不该被测到
         /slow/<原地址>    128 KB/s      —— 不达标
         /stall/<原地址>   发 64 KB 就挂住 —— 断流
-        http://127.0.0.1:1 连不上       —— 死代理
+        http://127.0.0.1:1 / :2 连不上   —— 死代理
 
-场景 A：直连慢 → 第一组 [死, 断流, 慢, 快] 里「快」达标 → 用它下载，第二组
+测速窗口 = 每个来源 10 秒、5 个一组（speedtest.h 的 SPEED_WINDOW_MS / SPEED_GROUP）；
+manifest 兜底仍是 5 秒（MANIFEST_ATTEMPT_MS）。改了宏记得改这里的 WINDOW_MS / GROUP。
+
+场景 A：直连慢 → 第一组 [死, 断流, 慢, 快, 死2] 里「快」达标 → 用它下载，第二组
        （fast2）一个请求都不该有；下载地址 = 代理前缀 + 原地址。
-       顺带验窗口：直连那一测该是 ~5000 ms、~1.25 MB（256 KB/s × 5 s）。
+       顺带验窗口：直连那一测该是 ~10000 ms、~2.5 MB（256 KB/s × 10 s）。
 场景 B：直连慢、代理只有 [死, 慢] → 全不达标 → 相对最快 = 直连（256 > 128 KB/s），
        日志 best-effort，包照样装上。
 场景 C：manifest 的代理兜底 —— 直连的 /manifest-c.json 有头没身挂住，更新器 5 秒
@@ -46,6 +49,8 @@ OLD_VERSION = "0.2.7"
 CHUNK = 64 * 1024
 DIRECT_BPS = 256 * 1024          # 「直连」限速：0.25 MiB/s，不达标
 SLOW_BPS = 128 * 1024
+WINDOW_MS = 10000                # = speedtest.h SPEED_WINDOW_MS
+GROUP = 5                        # = speedtest.h SPEED_GROUP
 
 REQUESTS = []                    # 服务器收到的所有请求路径（断言第二组没被测）
 REQ_LOCK = threading.Lock()
@@ -235,14 +240,17 @@ def need(cond, msg, log):
 def scenario_a(tmp):
     with REQ_LOCK:
         REQUESTS.clear()
+    # 第一组正好 GROUP 个（快的排第 4），fast2 是第 GROUP+1 个 = 第二组的头一个。
     proxies = ["http://127.0.0.1:1", BASE + "/stall", BASE + "/slow",
-               BASE + "/fast", BASE + "/fast2"]
+               BASE + "/fast", "http://127.0.0.1:2"]
+    assert len(proxies) == GROUP
+    proxies.append(BASE + "/fast2")
     sandbox = build_sandbox(tmp, "a", proxies)
     clear_cache("0.2.201")
     rc, dt, log = run_updater(sandbox, "manifest-a.json")
     print("A: exit=%d %.1fs" % (rc, dt))
     need(rc == 0, "A: 更新器退出码 %d" % rc, log)
-    need("proxy list: 5 usable, 0 lines ignored" in log,
+    need("proxy list: %d usable, 0 lines ignored" % (GROUP + 1) in log,
          "A: 代理列表没读对", log)
     need("speedtest pick: proxy[3] %s/fast (" % BASE in log and
          "qualified)" in log, "A: 没选中「快」代理", log)
@@ -253,9 +261,12 @@ def scenario_a(tmp):
     need(m is not None, "A: 日志里没有直连测速结果", log)
     d_bytes, d_ms = int(m.group(1)), int(m.group(2))
     print("A: direct probe %d B in %d ms" % (d_bytes, d_ms))
-    need(4000 <= d_ms <= 5000, "A: 直连测速窗口不是 ~5 s（%d ms）" % d_ms, log)
-    need(512 * 1024 <= d_bytes <= 2 * 1024 * 1024,
-         "A: 直连 5 秒收到 %d B，不像 256 KB/s" % d_bytes, log)
+    need(WINDOW_MS - 1000 <= d_ms <= WINDOW_MS,
+         "A: 直连测速窗口不是 ~%d s（%d ms）" % (WINDOW_MS // 1000, d_ms), log)
+    expect = DIRECT_BPS * WINDOW_MS // 1000
+    need(expect * 0.6 <= d_bytes <= expect * 1.4,
+         "A: 直连 %d 秒收到 %d B，不像 256 KB/s（期望 ~%d）"
+         % (WINDOW_MS // 1000, d_bytes, expect), log)
     m = re.search(r"speedtest proxy\[1\] \S+: (\d+) B / (\d+) ms", log)
     need(m is not None and int(m.group(1)) == CHUNK,
          "A: 断流代理该只收到 64 KB", log)

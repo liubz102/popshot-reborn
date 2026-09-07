@@ -10,6 +10,7 @@
      * 代理列表 —— config\update.config 的解析规则（config.c）
      * 选源     —— speedtest.c 的编排规则，用假测速函数钉住
                    （直连够快不测代理 / 组内取最快 / 达标即停 / 全不达标取相对最快 / 取消）
+     * 峰值     —— 峰值秒速（滑动 1 秒窗 / 不足 1 秒按平均 / 跨整秒边界的突发）
      * 兜底     —— manifest 的代理兜底（直连败 → 随机顺序逐个试、每个一次 / 全败 / 取消）
      * 资源     —— updater.rc 嵌的界面素材逐个 FindResource
 
@@ -394,36 +395,42 @@ static void speedtest_tests(void)
     check(rc == 1 && pick.index == -1 && pick.qualified && pick.measured == 1 &&
           f.calls == 1, "speedtest: fast direct -> direct, proxies untouched");
 
-    /* 直连慢，第一组里两个达标 -> 组内最快；第二组一个都没测。 */
+    /* 直连慢，第一组（SPEED_GROUP 个）里两个达标 -> 组内最快；第二组一个都没测。 */
     memset(&f, 0, sizeof(f)); f.base = base; f.direct_bytes = MIB / 5;
     f.proxy_bytes[0] = MIB / 2; f.proxy_bytes[1] = 3 * MIB;
     f.proxy_bytes[2] = 2 * MIB; f.proxy_bytes[3] = 0;
-    f.proxy_bytes[4] = 9 * MIB; f.proxy_bytes[5] = 9 * MIB;
-    fake_proxies(&pl, 6);
+    f.proxy_bytes[4] = MIB * 9 / 10;
+    f.proxy_bytes[SPEED_GROUP] = 9 * MIB; f.proxy_bytes[SPEED_GROUP + 1] = 9 * MIB;
+    fake_proxies(&pl, SPEED_GROUP + 2);
     rc = speedtest_pick(base, &pl, fake_measure, NULL, &f, &pick);
     check(rc == 1 && pick.index == 1 && pick.qualified && pick.bps == 3 * MIB,
           "speedtest: group 1 has two qualified -> fastest of the group");
-    check(pick.measured == 5 && f.called[5] == 0 && f.called[6] == 0,
+    check(pick.measured == 1 + SPEED_GROUP && f.called[SPEED_GROUP + 1] == 0 &&
+          f.called[SPEED_GROUP + 2] == 0,
           "speedtest: group 2 never measured once group 1 qualified");
-    check(f.called[1] == 1 && f.called[2] == 1 && f.called[3] == 1 &&
-          f.called[4] == 1, "speedtest: each proxy of group 1 measured once");
+    {
+        int i, once = 1;
+        for (i = 0; i < SPEED_GROUP; i++) if (f.called[i + 1] != 1) once = 0;
+        check(once, "speedtest: each proxy of group 1 measured once");
+    }
 
     /* 第一组全不行、第二组达标。 */
     memset(&f, 0, sizeof(f)); f.base = base; f.direct_bytes = MIB / 5;
-    f.proxy_bytes[4] = 5 * MIB;
-    fake_proxies(&pl, 6);
+    f.proxy_bytes[SPEED_GROUP] = 5 * MIB;
+    fake_proxies(&pl, SPEED_GROUP + 2);
     rc = speedtest_pick(base, &pl, fake_measure, NULL, &f, &pick);
-    check(rc == 1 && pick.index == 4 && pick.qualified && pick.measured == 7,
+    check(rc == 1 && pick.index == SPEED_GROUP && pick.qualified &&
+          pick.measured == 1 + SPEED_GROUP + 2,
           "speedtest: group 1 all slow -> group 2 picks");
 
-    /* 全不达标：所有来源里相对最快（代理 4 在第二组）。 */
+    /* 全不达标：所有来源里相对最快（那个代理在第二组）。 */
     memset(&f, 0, sizeof(f)); f.base = base; f.direct_bytes = MIB * 3 / 10;
     f.proxy_bytes[0] = MIB / 2; f.proxy_bytes[1] = MIB / 10;
-    f.proxy_bytes[3] = MIB * 4 / 10; f.proxy_bytes[4] = MIB * 9 / 10;
-    fake_proxies(&pl, 5);
+    f.proxy_bytes[3] = MIB * 4 / 10; f.proxy_bytes[SPEED_GROUP] = MIB * 9 / 10;
+    fake_proxies(&pl, SPEED_GROUP + 1);
     rc = speedtest_pick(base, &pl, fake_measure, NULL, &f, &pick);
-    check(rc == 1 && pick.index == 4 && !pick.qualified && pick.measured == 6 &&
-          pick.bps == MIB * 9 / 10,
+    check(rc == 1 && pick.index == SPEED_GROUP && !pick.qualified &&
+          pick.measured == 1 + SPEED_GROUP + 1 && pick.bps == MIB * 9 / 10,
           "speedtest: none qualified -> best-effort fastest overall (proxy)");
 
     /* 全不达标且直连最快。 */
@@ -455,19 +462,83 @@ static void speedtest_tests(void)
     check(speedtest_pick(base, &pl, fake_measure, NULL, &f, &pick) == 0,
           "speedtest: cancel during direct probe -> 0");
     memset(&f, 0, sizeof(f)); f.base = base; f.cancel_from = 3;
-    fake_proxies(&pl, 8);
+    fake_proxies(&pl, 2 * SPEED_GROUP);
     check(speedtest_pick(base, &pl, fake_measure, NULL, &f, &pick) == 0 &&
-          f.calls == 5,
+          f.calls == 1 + SPEED_GROUP,
           "speedtest: cancel inside group 1 -> 0, group 2 never started");
 
     {
         SpeedSample s;
         memset(&s, 0, sizeof(s));
         s.bytes = 5000; s.elapsed_ms = 0;
-        check(speed_bps(&s) == 5000000ULL, "speed_bps: 0 ms counts as 1 ms");
+        check(speed_bps(&s) == 5000000ULL, "speed_bps (no trace): 0 ms counts as 1 ms");
         s.elapsed_ms = 5000; s.bytes = 5 * MIB;
-        check(speed_bps(&s) == MIB, "speed_bps: 5 MiB in 5 s = 1 MiB/s");
+        check(speed_bps(&s) == MIB, "speed_bps (no trace): 5 MiB in 5 s = 1 MiB/s");
     }
+}
+
+/* ---- 峰值秒速（speed_bps 带分格记录时）：手搭 100 ms 格的 trace ---------- */
+
+static void peak_sample(SpeedSample *s, unsigned elapsed_ms)
+{
+    memset(s, 0, sizeof(*s));
+    s->trace.bucket_ms = 100;
+    s->trace.nbuckets = 101;
+    s->elapsed_ms = elapsed_ms;
+}
+
+static void peak_tests(void)
+{
+    SpeedSample s;
+    int i;
+
+    /* 突发在中间：第 3~4 秒每格 1 MiB，其它 0 —— 平均 1 MiB/s，峰值 10 MiB/s。 */
+    peak_sample(&s, 10000);
+    for (i = 30; i < 40; i++) s.trace.bucket[i] = MIB;
+    s.bytes = 10 * MIB;
+    check(speed_avg_bps(&s) == MIB && speed_bps(&s) == 10 * MIB,
+          "peak: burst in the middle -> 10 MiB/s while avg is 1");
+
+    /* 突发跨整秒边界（0.5~1.5 s 每格 512 KiB）：滑动窗抓到整段 5 MiB；
+       按整秒分格只能看到 2.5。 */
+    peak_sample(&s, 10000);
+    for (i = 5; i < 15; i++) s.trace.bucket[i] = MIB / 2;
+    s.bytes = 5 * MIB;
+    check(speed_bps(&s) == 5 * MIB,
+          "peak: sliding window catches a burst across the 1 s boundary");
+
+    /* 不足 1 秒收完（小文件）：按整段平均。 */
+    peak_sample(&s, 40);
+    s.trace.bucket[0] = 4 * MIB;
+    s.bytes = 4 * MIB;
+    check(speed_bps(&s) == 4 * MIB * 1000 / 40,
+          "peak: finished within 1 s -> whole-run average");
+
+    /* 3.4 秒收完、字节全在最后一格：最后那 1 秒也算。 */
+    peak_sample(&s, 3400);
+    s.trace.bucket[33] = 2 * MIB;
+    s.bytes = 2 * MIB;
+    check(speed_bps(&s) == 2 * MIB,
+          "peak: the second ending at completion counts");
+
+    /* 断流：64 KB 在第一格，之后到点。 */
+    peak_sample(&s, 10000);
+    s.trace.bucket[0] = 65536;
+    s.bytes = 65536;
+    check(speed_bps(&s) == 65536, "peak: stalled stream -> 64 KB/s");
+
+    /* 匀速：峰值 == 平均。 */
+    peak_sample(&s, 10000);
+    for (i = 0; i < 100; i++) s.trace.bucket[i] = 25600;
+    s.bytes = 2560000;
+    check(speed_bps(&s) == 256000 && speed_avg_bps(&s) == 256000,
+          "peak: steady stream -> peak == avg");
+
+    /* 到点那一刻卡进第 101 格的字节不参与（span 只到 100 格）。 */
+    peak_sample(&s, 10000);
+    s.trace.bucket[100] = 50 * MIB;
+    s.bytes = 50 * MIB;
+    check(speed_bps(&s) == 0, "peak: bytes stamped past the window are ignored");
 }
 
 /* ---- manifest 的代理兜底（proxy_fetch_fallback）：假取件函数 -------------
@@ -706,6 +777,7 @@ int selftest_run(int preview)
     util_tests();
     proxylist_tests();
     speedtest_tests();
+    peak_tests();
     fallback_tests();
     {
         int missing = ui_missing_resources();

@@ -9734,3 +9734,12 @@ BSM1 的 `Character::Dash` 守卫只还原调用那一刻的运动状态；冲�
 * e2e 场景 C：直连 manifest 有头没身挂住，`net_get_memory` 的 5 秒 deadline 准点
   触发（日志 `manifest direct: failed (5 秒内没取到)`），换代理取到后整条更新
   5.2 秒跑完。
+* 窗口改 10 秒（D152-0）后重跑：直连探针 **2,621,440 B / 10000 ms**，仍正好
+  10 × 256 KB —— deadline 精度和窗口长短无关。场景 A 整条 20.2 秒、B 16.2 秒、C 7.2 秒。
+* 峰值秒速（D152-1）真网一跑（同日 23:57，直连 GitHub 10 秒收 302,265,981 B）：
+  **peak 43.5 MiB/s、avg 28.8 MiB/s** —— 平均被建连 + 302 跳转那头一两秒拖低了三成，
+  峰值才是这条线真正的带宽。e2e 里 256 KB/s 限速流 peak ≈ avg（匀速），断流代理
+  peak = 64 KB/s。
+* 用户 2026-09-07 换进来的五个代理中转 zip 的快照（curl，`--limit-rate 2M` 采 6 秒）：
+  `github.dpik.top` / `ghfile.geekertao.top` / `gh.927223.xyz` / `jiashu.1win.eu.org` /
+  `github.mxw.qzz.io` **全部 200**。

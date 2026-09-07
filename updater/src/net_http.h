@@ -35,15 +35,26 @@ int net_download_file(const wchar_t *url, const wchar_t *dest,
                       Sha256 *hash, net_progress_fn progress, void *user,
                       wchar_t *err_out, size_t err_cap);
 
+/* 测速探针的分格记录：格 i = [i*bucket_ms, (i+1)*bucket_ms) 内收到的字节
+   （从探针开始、建连前起算）。speedtest.c 拿它算「任意连续 1 秒的最大字节数」。 */
+#define NET_TRACE_BUCKETS 128
+typedef struct NetTrace {
+    unsigned bucket_ms;                        /* 每格多少毫秒（0 = 没记） */
+    int nbuckets;                              /* 有效格数 = window/bucket + 1 */
+    unsigned long long bucket[NET_TRACE_BUCKETS];
+} NetTrace;
+
 /* 测速探针（speedtest.c 的注入实现）：从 url 下载，window_ms 一到就停
    （窗口含建连；解析 / 连接 / 发送 / 接收各阶段超时也都是 window_ms），
-   回窗口内收到的字节数与实际用时（min(窗口, 提前收完的用时)）。
+   回窗口内收到的字节数、实际用时（min(窗口, 提前收完的用时)）和按 bucket_ms
+   分格的字节记录（trace_out 可 NULL；格数超过 NET_TRACE_BUCKETS 时格自动加倍）。
    cancel 每 <=200ms 问一次。note_out（可 NULL）收结束原因：
    complete / expired / cancelled / 出错文案。
    返回 1 = 有结果（到点、收完、出错都算一个结果）；0 = 被取消。
-   ★ 每次调用自己开 WinHTTP 会话，几路并行互不相干（一组 4 个同时测）。 */
-int net_probe_speed(const wchar_t *url, unsigned window_ms, net_cancel_fn cancel,
+   ★ 每次调用自己开 WinHTTP 会话，几路并行互不相干（一组几个同时测）。 */
+int net_probe_speed(const wchar_t *url, unsigned window_ms, unsigned bucket_ms,
+                    net_cancel_fn cancel,
                     unsigned long long *bytes_out, unsigned *elapsed_out,
-                    wchar_t *note_out, size_t note_cap);
+                    NetTrace *trace_out, wchar_t *note_out, size_t note_cap);
 
 #endif /* UPDATER_NET_HTTP_H */

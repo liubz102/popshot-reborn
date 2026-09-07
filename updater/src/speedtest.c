@@ -11,10 +11,34 @@
 #include "util.h"
 #include "log.h"
 
-unsigned long long speed_bps(const SpeedSample *s)
+unsigned long long speed_avg_bps(const SpeedSample *s)
 {
     unsigned elapsed = s->elapsed_ms ? s->elapsed_ms : 1;
     return s->bytes * 1000ULL / elapsed;
+}
+
+/* 峰值秒速：滑动 1 秒窗（per 格）在有数据的那 span 格上扫一遍取最大和。
+   选滑动不选「按整秒分格」：分格结果随对齐而变，一个跨了整秒边界的突发会被
+   劈成两半；滑动窗对齐无关。 */
+unsigned long long speed_bps(const SpeedSample *s)
+{
+    const NetTrace *t = &s->trace;
+    unsigned long long best = 0, sum = 0;
+    int per, span, i;
+
+    if (t->nbuckets <= 0 || t->bucket_ms == 0 || s->elapsed_ms < 1000)
+        return speed_avg_bps(s);
+    per = (int)(1000 / t->bucket_ms);                       /* 一秒几格 */
+    if (per <= 0) per = 1;
+    span = (int)((s->elapsed_ms + t->bucket_ms - 1) / t->bucket_ms);   /* 有数据的格 */
+    if (span > t->nbuckets) span = t->nbuckets;
+    if (span < per) return speed_avg_bps(s);
+    for (i = 0; i < span; i++) {
+        sum += t->bucket[i];
+        if (i >= per) sum -= t->bucket[i - per];
+        if (i >= per - 1 && sum > best) best = sum;
+    }
+    return best;                                            /* 1 秒的字节数 = B/s */
 }
 
 void speed_compose_url(const wchar_t *proxy, const wchar_t *url,
@@ -65,10 +89,11 @@ static void run_group(Probe *probes, int count)
 static void log_sample(const wchar_t *label, const wchar_t *url,
                        const SpeedSample *s)
 {
-    wchar_t mib[32];
-    mib_to_wide(speed_bps(s), mib, 32);
-    log_line("speedtest %ls %ls: %llu B / %lu ms = %ls MiB/s (%ls)",
-             label, url, s->bytes, (unsigned long)s->elapsed_ms, mib,
+    wchar_t peak[32], avg[32];
+    mib_to_wide(speed_bps(s), peak, 32);
+    mib_to_wide(speed_avg_bps(s), avg, 32);
+    log_line("speedtest %ls %ls: %llu B / %lu ms = peak %ls MiB/s (avg %ls) (%ls)",
+             label, url, s->bytes, (unsigned long)s->elapsed_ms, peak, avg,
              s->note[0] ? s->note : L"-");
 }
 

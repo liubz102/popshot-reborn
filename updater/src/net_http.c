@@ -47,6 +47,9 @@ typedef struct Sink {
     unsigned timeout_ms;
     net_cancel_fn cancel;
     int expired;
+    /* 测速探针的分格记录（可 NULL）：每收一块按到达时刻记进对应的格。 */
+    NetTrace *trace;
+    ULONGLONG trace_start;
 } Sink;
 
 /* 下载期取消节拍（用户拍板 0.5s 内）：WinHttpQueryDataAvailable 会一直
@@ -117,7 +120,13 @@ static int sink_open_file(Sink *s, const wchar_t *dest, Sha256 *hash,
 static int sink_write(Sink *s, const void *data, DWORD len)
 {
     if (s->discard) {
-        /* 测速探针：只数字节，什么都不存。 */
+        /* 测速探针：只数字节，什么都不存；按到达时刻记进分格。 */
+        if (s->trace && s->trace->bucket_ms) {
+            ULONGLONG idx = (GetTickCount64() - s->trace_start) / s->trace->bucket_ms;
+            if (idx >= (ULONGLONG)s->trace->nbuckets)
+                idx = (ULONGLONG)s->trace->nbuckets - 1;   /* 卡在到点那一刻的 */
+            s->trace->bucket[idx] += len;
+        }
     } else if (s->mem) {
         if (s->mem_len + len > s->mem_cap) return 0;
         memcpy(s->mem + s->mem_len, data, len);
@@ -374,9 +383,10 @@ int net_download_file(const wchar_t *url, const wchar_t *dest,
     return 1;
 }
 
-int net_probe_speed(const wchar_t *url, unsigned window_ms, net_cancel_fn cancel,
+int net_probe_speed(const wchar_t *url, unsigned window_ms, unsigned bucket_ms,
+                    net_cancel_fn cancel,
                     unsigned long long *bytes_out, unsigned *elapsed_out,
-                    wchar_t *note_out, size_t note_cap)
+                    NetTrace *trace_out, wchar_t *note_out, size_t note_cap)
 {
     Sink s;
     unsigned long long total = 0;
@@ -390,6 +400,15 @@ int net_probe_speed(const wchar_t *url, unsigned window_ms, net_cancel_fn cancel
     s.timeout_ms = window_ms;
     s.deadline = start + window_ms;      /* 窗口从建连前就开始算 */
     s.cancel = cancel;
+    if (trace_out) {
+        memset(trace_out, 0, sizeof(*trace_out));
+        if (!bucket_ms) bucket_ms = 100;
+        while (window_ms / bucket_ms + 1 > NET_TRACE_BUCKETS) bucket_ms *= 2;
+        trace_out->bucket_ms = bucket_ms;
+        trace_out->nbuckets = (int)(window_ms / bucket_ms) + 1;
+        s.trace = trace_out;
+        s.trace_start = start;
+    }
     reason[0] = 0;
     ok = net_fetch(url, &s, &total, reason, 256);
     elapsed = GetTickCount64() - start;
