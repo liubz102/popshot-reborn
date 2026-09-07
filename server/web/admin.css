@@ -93,20 +93,22 @@ main {
   width: 100%; max-width: 1180px; margin: 0 auto; padding: 16px 18px 60px;
 }
 
-/* ★ 配置页（物品库 / 商店货架 / 合成配方 / 材料掉落）：整块面板撑满 `main`，
-   滚动条一路交到 `#cfgList` 手里 —— 说明块、筛选条、换页栏都钉住不动，
-   只有物品列表滚（用户 2026-09-06，D39）。`switchTab` 负责挂 `.fit`。
+/* ★ 配置页（物品库 / 商店货架 / 合成配方 / 材料掉落）和数据备份页：整块面板
+   撑满 `main`，滚动条一路交到列表（`.fit-list`）手里 —— 说明块、筛选条、
+   换页栏都钉住不动，只有列表滚（用户 2026-09-06，D39）。`switchTab` 负责挂
+   `.fit`；哪块面板 / 哪个列表参与，靠 `.fit-panel` / `.fit-list` / `.fit-help`
+   三个类标出来（原来写死 `#cfgPanel`，数据备份页加进来时改成了类）。
    ★ 每一层都要 `min-height: 0` —— flex 项的默认最小高度是内容高度，
    漏一层它就把滚动条又顶回外面那层去了。 */
 main.fit { overflow: hidden; padding-bottom: 16px; }
-main.fit, main.fit > #mainView, main.fit #cfgPanel,
-main.fit #cfgPanel > .panel-body {
+main.fit, main.fit > #mainView, main.fit .fit-panel,
+main.fit .fit-panel > .panel-body {
   display: flex; flex-direction: column; min-height: 0;
 }
-main.fit > #mainView, main.fit #cfgPanel,
-main.fit #cfgPanel > .panel-body { flex: 1 1 auto; }
-main.fit #cfgPanel { margin-bottom: 0; }
-main.fit #cfgList {
+main.fit > #mainView, main.fit .fit-panel,
+main.fit .fit-panel > .panel-body { flex: 1 1 auto; }
+main.fit .fit-panel { margin-bottom: 0; }
+main.fit .fit-list {
   flex: 1 1 auto; min-height: 0; overflow-y: auto;
   /* 滚动条别压在卡片边框上 */
   padding-right: 4px;
@@ -114,12 +116,13 @@ main.fit #cfgList {
 /* ★ 列表**以外**的都按自己的高度占位，别参与收缩 —— flex 项默认
    `flex-shrink: 1`，装不下时它会去压那些「能压」的（说明块自己带
    `overflow: auto`，第一个被压成一条缝）。 */
-main.fit #cfgPanel > .panel-body > ul.help,
-main.fit #cfgPanel > .panel-body > .toolbar,
-main.fit #cfgPanel > .panel-body > .pager { flex: 0 0 auto; }
+main.fit .fit-panel > .panel-body > ul.help,
+main.fit .fit-panel > .panel-body > .toolbar,
+main.fit .fit-panel > .panel-body > .hint,
+main.fit .fit-panel > .panel-body > .pager { flex: 0 0 auto; }
 /* 说明块也钉住不动 ⇒ 不能让它把画面吃光（合成配方那份有 9 条）。
    超过这么高它自己滚，条数再多也只占这一截。 */
-main.fit #cfgHelp { max-height: 9.2em; overflow-y: auto; }
+main.fit .fit-help { max-height: 9.2em; overflow-y: auto; }
 
 /* ------------------------------------------------------------------ 面板 */
 .panel {
@@ -270,7 +273,8 @@ ul.help b, .hint b { color: var(--crimson); }
 /* ------------------------------------------------------------------ 表单 */
 label { display: block; margin: 10px 0 4px; font-size: 13px;
         color: var(--cocoa-soft); font-weight: 600; }
-input[type=text], input[type=password], input[type=number], select {
+input[type=text], input[type=password], input[type=number], input[type=time],
+select {
   width: 100%; max-width: 320px; padding: 5px 9px;
   color: var(--cocoa-ink); background: #fff;
   border: 2px solid var(--line); border-radius: 6px; font: inherit;
@@ -574,6 +578,40 @@ code {
 .dialog .dlg-list li .why { color: var(--crimson); }
 .dialog .dlg-list.bad > b { color: var(--crimson); }
 .dialog .panel-foot { justify-content: flex-end; gap: 10px; }
+/* 回滚对话框的复选框（`ask()` 的 `checks`）：一格一行，警告红字挂在名字下面。 */
+.dialog .checks { margin: 14px 0 4px; display: flex; flex-direction: column; gap: 9px; }
+.dialog .checks label {
+  display: flex; align-items: flex-start; gap: 9px; margin: 0;
+  font-size: 13px; font-weight: 600; color: var(--cocoa-ink); cursor: pointer;
+}
+.dialog .checks input[type=checkbox] { margin: 3px 0 0; flex: 0 0 auto; }
+.dialog .checks .warn {
+  display: block; margin-top: 2px; font-size: 12px; font-weight: 500;
+  color: var(--crimson); line-height: 1.5;
+}
+
+/* ---------------------------------------------------------- 数据备份页 */
+.backup-list table { max-width: none; }
+/* 表头钉在滚动框顶上：列表滚起来时还看得见「说明 / 类型 / …」是哪一列。 */
+.backup-list thead th { position: sticky; top: 0; z-index: 1; }
+.backup-list td { vertical-align: middle; }
+.backup-list .bk-label { word-break: break-all; }
+/* 类型徽标：自动 = 青（状态那一档）、手动 = 琥珀、回滚前 = 棕。 */
+.kind {
+  display: inline-block; padding: 1px 8px; border-radius: 8px;
+  font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap;
+}
+.kind.auto { background: var(--teal); }
+.kind.manual { background: var(--amber-dark); }
+.kind.prerollback { background: var(--cocoa-soft); }
+/* 设置条 / 手动条：控件横着排，脏标和「保存设置」靠右。 */
+.backup-bar { margin-bottom: 10px; }
+.backup-bar .field select, .backup-bar input[type=time] { width: auto; }
+.backup-bar input[type=number] { width: 88px; }
+.backup-bar input[type=text] { max-width: 420px; flex: 1 1 240px; }
+.backup-bar .dirty { margin-left: 4px; }
+/* 状态那几行（下次 / 上次 / 目录）各占一行。 */
+.backup-status { white-space: pre-line; margin: 0 0 12px; line-height: 1.7; }
 
 /* ---------------------------------------------------------- 玩家资料页 */
 h3.sub {

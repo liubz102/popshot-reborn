@@ -98,6 +98,23 @@ class ConfigTests(unittest.TestCase):
                 values["register_cooldown_seconds"], text)
             self.assertEqual(1, len(warnings), text)
 
+    def test_backup_keys_parse(self):
+        # 数据备份的三个键（V0.3商店）：开关 / 每天几点 / 保留天数（0 = 永不删）。
+        values, warnings = server_config.parse_text(
+            "backup_enabled = off\nbackup_time = 4:5\nbackup_keep_days = 0\n")
+        self.assertEqual([], warnings)
+        self.assertEqual((0, "04:05", 0), (values["backup_enabled"],
+                                           values["backup_time"],
+                                           values["backup_keep_days"]))
+
+    def test_a_bad_backup_time_falls_back_to_the_default(self):
+        for text in ("backup_time = 25:00", "backup_time = 四点",
+                     "backup_time = 4", "backup_time = 04:60"):
+            values, warnings = server_config.parse_text(text)
+            self.assertEqual(server_config.DEFAULT_BACKUP_TIME,
+                             values["backup_time"], text)
+            self.assertEqual(1, len(warnings), text)
+
     def test_register_url_brackets_ipv6_only(self):
         self.assertEqual("http://127.0.0.1:27810/",
                          server_config.register_url("127.0.0.1", 27810))

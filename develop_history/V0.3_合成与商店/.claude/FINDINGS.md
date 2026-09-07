@@ -1560,3 +1560,31 @@ bot 读地形还要它。`account_store.QUEST_DIFFICULTY_MAX = 4` 没动：
 鞋（布洛克是手套）。id 尾号 27/28、38/39（以及 29/30、36/37、40~43）
 是**同图同属性的复制品** —— 全表按（类别 · 角色 · 槽位 · 图标 · 加成 · 武器数值）
 去重共 108 件，只留 id 最小的那一件上架。
+
+---
+
+## §40 ★★★ 数据备份要知道的五件硬事（2026-09-07，D46）
+
+1. **`server.config` 原本只有读没有写回**：`config.parse_text` / `load`，
+   `ensure_exists` 只在缺文件时整份写模板。现在的 `save_keys` 逐行替换、缺键追加
+   带说明、每行沿用原有行尾；`ensure_keys` 幂等（不缺就不开写句柄）。
+   ⚠ `parse_text` 同键取**最后一次** ⇒ 写回时同键出现几次就全换。
+2. **`web/admin._config_locks` 只护管理页保存那条路**；`ensure_files` /
+   `backfill_defaults` / 外部脚本都不持锁；存档另有 `AccountStore._lock`（RLock）。
+   现有代码没有任何一条路同时持两套 ⇒ 备份按固定顺序（`shopcfg._SPECS` 的顺序 →
+   存档锁）拿两套不会死锁。
+3. **Windows 上读文件会挡住别人的 `os.replace`**（Python `open()` 无 FILE_SHARE_DELETE）
+   —— 备份拷贝期间必须持锁，否则游戏线程写存档 `PermissionError`、结算奖励丢；
+   和 §35 编辑器独占是同一个物理现象。
+4. **回滚一份等大小的旧文件会骗过 `shopcfg` 的热重载**（缓存键 `(st_mtime_ns, st_size)`）
+   ⇒ 回滚后必须 `shopcfg.invalidate()`（`test_backup.RestoreTests` 钉住）。
+   `accounts.json` 存储层零缓存（每次操作现读盘），但 `Conn.account` 是登录时抓的
+   **视图**，写盘不会把它盖回去，只是玩家看到的数过期 ⇒ 回滚后 `reload_account`
+   + `_push_account`。
+5. **管理员账号在 `accounts.json` 的 `admin_accounts` 段里** ⇒ 回滚老存档能把自己锁在
+   管理页外面（更老的连这一段都没有）；`databackup.admin_survives` 在写盘前拦，
+   回滚后再跑一遍 `ensure_item_fields` + `realign_levels`（启动那两步，幂等）。
+
+**打包**：自检真跑一次包内 `app.py`，`build-common.ps1` 的 `$argList` 加了 `--no-backup`
+（照 `--no-log-cleanup`），否则备份会被打进发布包。`.gitignore` 加了
+`/server/data/backups/`（备份含明文口令）。

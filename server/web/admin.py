@@ -26,6 +26,11 @@
     GET  /admin/api/players?q=名字&page=0  按用户名 / 昵称找玩家（一页 10 行）★系统
     GET  /admin/api/player?name=alice  一个玩家的可编辑资料                 ★系统
     POST /admin/api/player            {name, level, money, ...}             ★系统
+    GET  /admin/api/backups           数据备份：{settings, status, backups, online, playing} ★系统
+    POST /admin/api/backups/settings  {enabled, time, keep_days} 写回 server.config，即刻生效 ★系统
+    POST /admin/api/backups/create    {label}  立刻备份一份（手动）              ★系统
+    POST /admin/api/backups/restore   {id, files}  回滚（先自动留一份「回滚前」）  ★系统
+    POST /admin/api/backups/remove    {id}                                    ★系统
 
 ## 权限分两档（用户 2026-09-06 拍板，D34）
 
@@ -105,6 +110,7 @@ import urllib.parse
 
 import account_store
 import cfgmerge
+import databackup
 import eventlog
 import shopcfg
 import shopdata
@@ -187,7 +193,10 @@ MAX_CONFIG_BYTES = 4 << 20
 #:   只解决「谁的改动被吃了」，解决不了「两发同时读到同一份 theirs、后写的
 #:   把先写的盖掉」—— 那是同一件事的另一半，只有锁能解。
 #: ★ 锁按**文件**分，不是一把全局锁：改物品库的人不该挡住改掉落的人。
-_config_locks = dict((which, threading.Lock()) for which in CONFIG_FILES)
+#: ★ 锁对象本身住在 `shopcfg`（`write_lock`）—— 数据备份拷贝 / 回滚时要把
+#:   这几把和存档锁一起拿，而它是数据层的东西，不该反过来 import 这里。
+_config_locks = dict((which, shopcfg.write_lock(filename))
+                     for which, filename in CONFIG_FILES.items())
 
 
 class AdminSessions:
@@ -445,6 +454,69 @@ def _online_usernames():
             if conn.account_name}
 
 
+def _online_summary():
+    """备份页画回滚确认框要的两个数：谁在线、谁正在战斗。拿不到就当没人。"""
+    try:
+        import gameserver
+    except ImportError:
+        return {"online": [], "playing": []}
+    online, playing = set(), set()
+    for conn in gameserver.all_conns():
+        if not conn.account_name:
+            continue
+        online.add(conn.account_name)
+        if gameserver.conn_is_playing(conn):
+            playing.add(conn.account_name)
+    return {"online": sorted(online), "playing": sorted(playing)}
+
+
+def _reload_online_accounts():
+    """回滚完存档（**还持着存档锁**）让每条在线连接把 `Conn.account` 重读一遍。
+
+    `Conn.account` 是登录时抓的视图（金币 / 仓库 / 「已持有」判定都看它），
+    写盘倒不会把它盖回去（存档层每次都现读盘），但不刷的话玩家看到的还是
+    回滚前的数。同线程再拿存档锁是可重入的（RLock）。
+    """
+    try:
+        import gameserver
+    except ImportError:
+        return
+    for conn in gameserver.all_conns():
+        if not conn.account_name:
+            continue
+        try:
+            conn.reload_account()
+        except (OSError, AttributeError):
+            continue
+
+
+def _push_all_online(accounts):
+    """回滚完存档：在线的逐个推四发下行；备份里已经不存在的账号踢下线
+    （他们下一次写盘会找不到自己，不如现在就断，重登时客户端自会提示）。
+    返回 ``(推了几个, 踢了谁)``。"""
+    try:
+        import gameserver
+    except ImportError:
+        return 0, []
+    pushed, kicked = 0, []
+    for conn in gameserver.all_conns():
+        username = conn.account_name
+        if not username:
+            continue
+        if not accounts.has_account(username):
+            try:
+                conn.online(f"⚠ 被踢下线 账号={username!r} "
+                            f"原因=管理页回滚了存档，这个账号在那份备份里不存在")
+                conn.close_now()
+            except (OSError, AttributeError):
+                pass
+            kicked.append(username)
+            continue
+        if _push_account(username):
+            pushed += 1
+    return pushed, kicked
+
+
 def _push_account(username):
     """改完存档立刻推给在线的那条连接，返回是否真推了。
 
@@ -580,6 +652,11 @@ class AdminRoutes:
     admin_sessions: AdminSessions = None
     admin_limiter: LoginRateLimiter = None
 
+    #: 数据备份服务（`databackup.BackupService`），`app.py` 建好后经
+    #: `make_server(backup=…)` 塞进来。单跑注册页 / 测试没塞 ⇒ 那几个接口
+    #: 回「备份功能没有启动」。
+    backup = None
+
     # ------------------------------------------------------------ 会话工具
     def _admin_token(self):
         """从 Cookie 头里取会话令牌。没有就 `None`。"""
@@ -683,6 +760,9 @@ class AdminRoutes:
         if path == "/admin/api/player":
             self._admin_player_get(query)
             return True
+        if path == "/admin/api/backups":
+            self._admin_backups_get()
+            return True
         if path.startswith("/admin"):
             self._reply(False, "没有这个接口", status=404)
             return True
@@ -704,6 +784,9 @@ class AdminRoutes:
             return True
         if path == "/admin/api/player":
             self._admin_player_save(data)
+            return True
+        if path.startswith("/admin/api/backups/"):
+            self._admin_backup(path.rsplit("/", 1)[-1], data)
             return True
         if path.startswith("/admin"):
             self._reply(False, "没有这个接口", status=404)
@@ -1060,6 +1143,152 @@ class AdminRoutes:
                              "logged_out": target == name})
             return
         self._reply(False, "没有这个操作", status=404)
+
+    # ------------------------------------------------------------ 数据备份
+    def _backup_service(self):
+        """`app.py` 注进来的 `BackupService`；没注入（单跑注册页 / 测试）就回一句话。"""
+        if self.backup is None:
+            self._reply(False, "备份功能没有启动（这个进程不是 app.py 起的）")
+            return None
+        return self.backup
+
+    def _backup_reply(self, service, message, **extra):
+        """成功回执：一律把最新的 设置 + 状态 + 列表 带回去，前台不用再 GET。"""
+        payload = service.overview()
+        payload.update(_online_summary())
+        payload.update(extra)
+        payload["ok"] = True
+        payload["message"] = message
+        self._send_json(payload)
+
+    def _admin_backups_get(self):
+        """`GET /admin/api/backups` —— 设置 + 状态 + 列表 + 在线情况。★ 系统管理员专用。"""
+        if self._require_system_admin() is None:
+            return
+        service = self._backup_service()
+        if service is None:
+            return
+        payload = service.overview()
+        payload.update(_online_summary())
+        payload["ok"] = True
+        self._send_json(payload)
+
+    def _admin_backup(self, action, data):
+        # ★ 整个「数据备份」页只有**系统管理员**能用（D34 的同一档）。
+        name = self._require_system_admin()
+        if name is None:
+            return
+        service = self._backup_service()
+        if service is None:
+            return
+        try:
+            if action == "settings":
+                self._backup_settings(service, name, data)
+            elif action == "create":
+                self._backup_create(service, name, data)
+            elif action == "restore":
+                self._backup_restore(service, name, data)
+            elif action == "remove":
+                self._backup_remove(service, name, data)
+            else:
+                self._reply(False, "没有这个操作", status=404)
+        except databackup.BackupError as error:
+            self._reply(False, str(error))
+        except OSError as error:
+            # 和配置保存同一个口径（§35）：写不进去**不是**「服务器内部错误」。
+            self._reply(False, f"写不进去（{error.strerror or error}）。"
+                               "文件多半正被别的程序占着（编辑器打开了它？），"
+                               "关掉再试。")
+
+    def _backup_settings(self, service, name, data):
+        settings, removed, failed = service.update_settings(
+            self._as_bool(data.get("enabled"), default=True),
+            data.get("time"), data.get("keep_days"))
+        zh = "开" if settings["enabled"] else "关"
+        eventlog.online(f"[admin] {name!r} 改了数据备份设置：自动备份={zh} "
+                        f"时刻={settings['time']} 保留={settings['keep_days']} 天")
+        message = "已保存，即刻生效（不用重启）"
+        if removed:
+            message += f"；按新的保留天数清掉了 {len(removed)} 份过期备份"
+        if failed:
+            message += f"；另有 {len(failed)} 份没删成（正被占用）"
+        self._backup_reply(service, message, removed=removed)
+
+    def _backup_create(self, service, name, data):
+        manifest = service.create(databackup.KIND_MANUAL, data.get("label"),
+                                  created_by=name)
+        eventlog.online(f"[admin] {name!r} 手动备份了 {manifest['id']}"
+                        f"（{manifest['label']}）")
+        self._backup_reply(service, f"已备份 {manifest['id']}"
+                                    f"（{len(manifest['files'])} 个文件）",
+                           created=manifest["id"])
+
+    def _backup_remove(self, service, name, data):
+        backup_id = str(data.get("id") or "")
+        service.remove(backup_id)
+        eventlog.online(f"[admin] {name!r} 删掉了备份 {backup_id}")
+        self._backup_reply(service, f"已删除备份 {backup_id}")
+
+    def _backup_restore(self, service, name, data):
+        backup_id = str(data.get("id") or "")
+        files = data.get("files")
+        if not isinstance(files, list):
+            self._reply(False, "要带 files（要回滚的文件名列表）")
+            return
+        files = [str(item) for item in files]
+        touches_accounts = databackup.ACCOUNTS_FILENAME in files
+        if touches_accounts:
+            # ★ 有人正在战斗就拒绝：结算那一发写盘会落在回滚后的存档上，
+            #   一局横跨回滚等于两份存档拼在一起。判据是状态，不是阈值。
+            playing = _online_summary()["playing"]
+            if playing:
+                self._reply(False, f"有 {len(playing)} 人正在战斗"
+                                   f"（{'、'.join(playing)}），结算会写存档"
+                                   " —— 等这局打完再回滚玩家存档")
+                return
+
+        def after_write(restored):
+            if databackup.ACCOUNTS_FILENAME in restored:
+                _reload_online_accounts()
+
+        result = service.restore(backup_id, files, expect_admin=name,
+                                 created_by=name, after_write=after_write)
+        restored = result["restored"]
+        notes = []
+        kicked = []
+        if databackup.ACCOUNTS_FILENAME in restored:
+            # 启动时那两步幂等补齐再跑一遍（`app.py` 的顺序）：老存档缺字段 /
+            # 等级曲线换过代，都在这儿收敛，不用等下次重启。
+            report = self.accounts.ensure_item_fields()
+            realigned = self.accounts.realign_levels()
+            if report["accounts"] or report["admin_created"]:
+                eventlog.online(f"[admin] 回滚存档后补齐了 {len(report['accounts'])} "
+                                f"个账号的物品字段"
+                                + (f"，并建了默认管理员 {report['admin_created']}"
+                                   if report["admin_created"] else ""))
+            if realigned:
+                eventlog.online("[admin] 回滚存档后按当前曲线重算了等级："
+                                + "；".join(f"{row['username']} {row['old']}→{row['new']}"
+                                            for row in realigned))
+            pushed, kicked = _push_all_online(self.accounts)
+            if pushed:
+                notes.append(f"在线 {pushed} 人已即时推送")
+            if kicked:
+                notes.append(f"备份里不存在的账号已踢下线：{'、'.join(kicked)}")
+        eventlog.online(f"[admin] {name!r} 回滚到 {backup_id}（{'、'.join(restored)}）"
+                        f"，回滚前留了 {result['pre_backup_id']}"
+                        + (f"，没回滚成：{'、'.join(n for n, _e in result['failed'])}"
+                           if result["failed"] else ""))
+        message = f"已回滚到 {backup_id}：{'、'.join(restored)}"
+        if result["failed"]:
+            message += "；没回滚成的：" + "、".join(
+                f"{n}（{e}）" for n, e in result["failed"])
+        message += f"。回滚前的状态留在 {result['pre_backup_id']}"
+        if notes:
+            message += "。" + "；".join(notes)
+        self._backup_reply(service, message, restored=restored,
+                           failed=[list(item) for item in result["failed"]],
+                           pre_backup_id=result["pre_backup_id"], kicked=kicked)
 
     def _admin_item_lookup(self, query):
         """按 itemId 查一件东西。省得对着 7 位数字猜这是啥。"""

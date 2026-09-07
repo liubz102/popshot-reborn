@@ -1224,6 +1224,59 @@ _SPECS = {
     DROPS_FILENAME: (validate_drops, default_drops, []),
 }
 
+#: ★ 每份配置一把**写锁**，护住「读盘 → 合并 → 写盘」这一段（D36）。
+#:
+#: 以前住在 `web/admin.py`（`_config_locks`），只护管理页保存那条路。
+#: 数据备份（`databackup`）拷贝 / 回滚时要把**所有**写盘方一起挡住，而它是
+#: 数据层的东西，不该反过来 import `web/` —— 所以锁搬到这儿，管理页照旧
+#: 拿同一批锁对象。
+#: ★ `_SPECS` 的插入顺序（items → shop → recipe → drops）就是全项目**唯一**
+#:   的加锁顺序：谁要一次拿好几把，都按 `all_write_locks()` 给的顺序拿。
+#:   两处顺序不一致才会死锁，所以顺序只在这一个地方定。
+#: ★ Windows 上还有一层物理原因：Python `open()` 不带 `FILE_SHARE_DELETE`，
+#:   备份线程正读着 `shop.json` 的那一瞬，管理页保存的 `os.replace` 会当场
+#:   `PermissionError`（和 §35「编辑器打开了它？」是同一个现象）。
+#:   持锁之后这件事不可能发生。
+_file_locks = dict((filename, threading.Lock()) for filename in _SPECS)
+
+
+def write_lock(filename):
+    """某份配置的写锁。不认识的文件名也给一把（以后新加的配置自动有）。"""
+    with _lock:
+        lock = _file_locks.get(filename)
+        if lock is None:
+            lock = _file_locks[filename] = threading.Lock()
+        return lock
+
+
+def all_write_locks():
+    """全部写锁，**按固定顺序**。一次要拿好几把时只许按这个顺序拿。"""
+    with _lock:
+        return [_file_locks[filename] for filename in _file_locks]
+
+
+#: 文件名 → `SCHEMA` 的键。数据备份的回滚对话框用它把「互相关联的那一组」
+#: 写成人话（「物品库 · 商店货架 · …」），不用把标题再抄一遍。
+_WHICH_OF = {ITEMS_FILENAME: "items", SHOP_FILENAME: "shop",
+             RECIPE_FILENAME: "recipe", DROPS_FILENAME: "drops"}
+
+
+def config_filenames():
+    """互相关联、**必须一起回滚**的那一组运营配置（`_SPECS` 登记的全部）。"""
+    return list(_SPECS)
+
+
+def config_title(filename):
+    """某份配置在页面上叫什么（物品库 / 商店货架 / …）；不认识就回文件名。"""
+    which = _WHICH_OF.get(filename)
+    return SCHEMA[which]["title"] if which in SCHEMA else filename
+
+
+def validator_of(filename):
+    """某份配置的校验器；不是运营配置就 `None`。回滚前要拿它过一遍。"""
+    spec = _SPECS.get(filename)
+    return spec[0] if spec else None
+
 
 def path_of(filename, data_dir=None):
     return os.path.join(data_dir or DATA_DIR, filename)
@@ -1328,10 +1381,12 @@ def write_json(path, data):
 def ensure_files(data_dir=None):
     """四份配置不存在就生成，**已存在一律不覆盖**（D7）。返回新建了哪几个。
 
-    ★ 这是**唯一会自动写**这三个文件的地方。云上升级时用户手改过的价格 /
+    ★ 这是**唯一会自动生成**这几份文件的地方。云上升级时用户手改过的价格 /
     配方 / 掉落必须原样留着 —— 覆盖它们等于把运营数据抹了（铁律 11）。
-    （另一个写入点是管理页的保存按钮，`web/admin.py`：那是用户**主动**按的，
-    而且存盘前必过 `validate_*`。除此之外谁都不许写。）
+    另外只有两个写入点，都是用户**主动**按的：管理页的保存按钮
+    （`web/admin.py`，存盘前必过 `validate_*`）和管理页「数据备份」的回滚
+    （`databackup.restore`，写盘前同样过今天的 `validate_*`）。
+    除此之外谁都不许写。
     """
     created = []
     for filename, (_validate, build, _empty) in _SPECS.items():
@@ -1418,9 +1473,11 @@ def backfill_defaults(data_dir=None, apply=False):
         merged[list_key] = list(entries) + fresh
         # 存盘前必过校验：宁可什么都不写，也不要写出一份服务端读不了的文件。
         _SPECS[filename][0](merged)
-        shutil.copyfile(path, "%s.bak-%s"
-                        % (path, time.strftime("%Y%m%d-%H%M%S")))
-        write_json(path, merged)
+        # 和管理页保存 / 数据备份拿同一把写锁：别在备份线程拷到一半时换掉文件。
+        with write_lock(filename):
+            shutil.copyfile(path, "%s.bak-%s"
+                            % (path, time.strftime("%Y%m%d-%H%M%S")))
+            write_json(path, merged)
     if apply and added:
         invalidate(data_dir)
     return added

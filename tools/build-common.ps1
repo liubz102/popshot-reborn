@@ -272,7 +272,7 @@ function Get-ServerSourceFile([string]$Root) {
                         'botmove.py', 'botnav.py', 'mapdata.py', 'weapondata.py',
                         'ballistics.py', 'chrprops.py',
                         'bothp.py', 'botarms.py', 'botaim.py', 'botthreat.py',
-                        'shop.py', 'shopcfg.py', 'shopdata.py')) {
+                        'shop.py', 'shopcfg.py', 'shopdata.py', 'databackup.py')) {
         if ($files -notcontains $must) { throw "server\$must 没被选中，打包脚本的过滤规则坏了" }
     }
     return $files
@@ -745,8 +745,11 @@ function Invoke-ServerSmokeTest {
 
     # --no-log-cleanup：自检不是「一次真的开服」，绝不该顺手把打包机
     # logs\ 里的东西删掉（D113 的清理是挂在服务端启动路径上的）。
+    # --no-backup：同理，不起数据备份的调度线程（V0.3商店 databackup.py），
+    # 免得往包里的 server\data\ 写备份或清理备份。
     $argList = @(
         "`"$app`"", '--no-control', '--no-online-log', '--no-log-cleanup',
+        '--no-backup',
         '--auth-port',  "$authPort",
         '--game-port',  "$gamePort",
         '--relay-port', "$relayPort",

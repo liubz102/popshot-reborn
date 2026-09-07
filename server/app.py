@@ -41,6 +41,7 @@ import authserver
 #   连接。在这里显式 import 一次，把它变成**启动就炸**。
 import bot                                                     # noqa: F401
 import config as server_config
+import databackup
 import eventlog
 import gameserver
 import logcleanup
@@ -137,6 +138,9 @@ def build_arg_parser():
                          "默认读 server.config 的 log_retention_days")
     ap.add_argument("--no-log-cleanup", action="store_true",
                     help="这次启动完全不清理日志（等价于 --log-retention-days 0）")
+    ap.add_argument("--no-backup", action="store_true",
+                    help="这次启动不起数据备份的调度线程（打包自检用：自检不是"
+                         "一次真的开服，不该往包里写备份、也不该清理备份）")
     # 游戏服那边的排查开关，原样透传。
     ap.add_argument("--hold-lobby", action="store_true",
                     help="游戏包一律不应答（纯抓包）")
@@ -330,6 +334,16 @@ def main(argv=None):
 
     config_path = args.config or server_config.config_path()
     server_config.ensure_exists(config_path)
+    # 数据备份那三个键（V0.3商店）：老文件里没有就补上默认值，都在就一个
+    # 字节都不写（幂等）。只补这三个 —— `proxy_*` 缺了是有含义的（= 直连）。
+    try:
+        added = server_config.ensure_keys(config_path)
+    except OSError as error:
+        added = []
+        log(f"server.config: 补不进数据备份的默认设置（{error}），本次按默认值跑")
+    if added:
+        log("server.config: 补上了 " + " / ".join(added)
+            + "（默认 开 / 04:00 / 保留 7 天；管理页「数据备份」里可改）")
     cfg, warnings = server_config.load(config_path)
     for warning in warnings:
         log(f"server.config: {warning}")
@@ -393,6 +407,25 @@ def main(argv=None):
             f"{logcleanup.DAILY_HOUR} 点清一次；后台线程，不挡游戏）")
     # 关掉时那句「已关闭」由 `logcleanup.start` 自己说，免得打两遍。
     logcleanup.start(days=retention, log=log)
+
+    # 数据备份（V0.3商店，管理页「数据备份」页）：每天到点把 server/data/*.json
+    # 拷一份，按保留天数清理。设置在 server.config 里，管理页改完即刻生效。
+    # 服务对象不管起不起线程都要建 —— 手动备份 / 回滚走的是它，不靠线程。
+    backup = databackup.BackupService(config_path=config_path, accounts=accounts,
+                                      log=log)
+    if os.path.dirname(accounts.path) != os.path.abspath(shopcfg.DATA_DIR):
+        log(f"⚠ 数据备份 只备 {shopcfg.DATA_DIR} 下的 json；"
+            f"账号存档在别处（{accounts.path}），不在备份范围内")
+    if args.no_backup:
+        log("数据备份 调度线程未启动（--no-backup）；管理页里手动备份照常可用")
+    else:
+        settings = backup.settings()
+        backup.start()
+        log("数据备份 " + (f"每天 {settings['time']} 自动备份" if settings["enabled"]
+                        else "自动备份已关闭（backup_enabled = 0）")
+            + f"，保留 {settings['keep_days']} 天"
+            + ("" if settings["keep_days"] else "（0 = 永不自动删除）")
+            + f"；备份在 {backup.backup_dir()}，管理页「数据备份」里改")
 
     auth_args = _AuthArgs(accounts=args.accounts, verbose=args.verbose,
                           ticket_field=args.ticket_field,
@@ -462,7 +495,8 @@ def main(argv=None):
                     else cfg["register_cooldown_seconds"])
         _start("web", web_server.serve,
                kwargs={"port": web_port, "accounts": accounts,
-                       "host": args.host, "cooldown": cooldown},
+                       "host": args.host, "cooldown": cooldown,
+                       "backup": backup},
                port=web_port)
         log(f"注册页   {describe_listen(args.host, web_port)}"
             f" —— 本机打开 http://127.0.0.1:{web_port}/")

@@ -24,6 +24,8 @@ if HERE not in sys.path:
 
 import account_store                                           # noqa: E402
 import cfgmerge                                                  # noqa: E402
+import config as server_config                                 # noqa: E402
+import databackup                                              # noqa: E402
 import shopcfg                                                 # noqa: E402
 import shopdata                                                # noqa: E402
 from account_store import AccountStore                         # noqa: E402
@@ -53,13 +55,14 @@ class _AdminCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.accounts = AccountStore(os.path.join(self.tmp.name, "accounts.json"))
+        # ★ 配置接口走的是无参的 `shopcfg.path_of()` ⇒ 改模块级的 DATA_DIR。
+        #   存档也放进这份 data 目录 —— 和真实布局一样，数据备份才会把它卷进去。
+        self.data_dir = os.path.join(self.tmp.name, "data")
+        os.makedirs(self.data_dir)
+        self.accounts = AccountStore(os.path.join(self.data_dir, "accounts.json"))
         # 默认管理员由启动时的幂等补齐建出来（和真实开服同一条路）。
         self.accounts.ensure_item_fields()
 
-        # ★ 配置接口走的是无参的 `shopcfg.path_of()` ⇒ 改模块级的 DATA_DIR。
-        self.data_dir = os.path.join(self.tmp.name, "data")
-        os.makedirs(self.data_dir)
         saved_dir = shopcfg.DATA_DIR
         shopcfg.DATA_DIR = self.data_dir
         self.addCleanup(shopcfg.invalidate)
@@ -69,8 +72,15 @@ class _AdminCase(unittest.TestCase):
             shutil.copyfile(os.path.join(_template_dir(), filename),
                             os.path.join(self.data_dir, filename))
 
+        # 数据备份服务（V0.3商店）：指到这份临时 data 目录和一份临时 server.config。
+        self.config_path = os.path.join(self.tmp.name, "server.config")
+        server_config.ensure_exists(self.config_path)
+        self.backup = databackup.BackupService(
+            data_dir=self.data_dir, config_path=self.config_path,
+            accounts=self.accounts)
+
         self.httpd = web_server.make_server(0, self.accounts, "127.0.0.1",
-                                            cooldown=0)
+                                            cooldown=0, backup=self.backup)
         self.port = self.httpd.server_address[1]
         # ★ 每个用例一台新服务器（会话表 / 限速表 / 配置都要是干净的），
         #   所以 `shutdown()` 会被调 30 多次。`serve_forever` 默认 **0.5 秒**
@@ -183,6 +193,13 @@ class AdminAuthTests(_AdminCase):
                 ("/admin/api/admins/password", {"name": "admin", "password": "pw1"}),
                 ("/admin/api/admins/role", {"name": "admin", "role": "operator"}),
                 ("/admin/api/admins/remove", {"name": "admin"}),
+                ("/admin/api/backups", None),
+                ("/admin/api/backups/settings", {"enabled": True, "time": "04:00",
+                                                 "keep_days": 7}),
+                ("/admin/api/backups/create", {"label": "x"}),
+                ("/admin/api/backups/restore", {"id": "20260907-040000-auto",
+                                                "files": ["shop.json"]}),
+                ("/admin/api/backups/remove", {"id": "20260907-040000-auto"}),
         ):
             status, result = self.request(path, payload)
             self.assertEqual(401, status, path)
@@ -939,6 +956,14 @@ class OperatorPermissionTests(_AdminCase):
                 ("/admin/api/admins/role", {"name": "carol", "role": "system"}),
                 ("/admin/api/admins/remove", {"name": "admin"}),
                 ("/admin/api/admins/from_player", {"name": "alice"}),
+                # 数据备份页也是系统管理员档：它能回滚玩家存档。
+                ("/admin/api/backups", None),
+                ("/admin/api/backups/settings", {"enabled": True, "time": "04:00",
+                                                 "keep_days": 7}),
+                ("/admin/api/backups/create", {"label": "x"}),
+                ("/admin/api/backups/restore", {"id": "20260907-040000-auto",
+                                                "files": ["shop.json"]}),
+                ("/admin/api/backups/remove", {"id": "20260907-040000-auto"}),
         ):
             status, result = self.request(path, payload)
             self.assertEqual(403, status, path)
@@ -951,6 +976,188 @@ class OperatorPermissionTests(_AdminCase):
             "/admin/api/admins/role", {"name": "carol", "role": "system"})[0])
         self.assertEqual("operator", self.request(
             "/admin/api/session")[1]["role"])
+
+
+class AdminBackupApiTests(_AdminCase):
+    """管理页「数据备份」页的五个接口（V0.3商店，用户 2026-09-07）。
+    备份 / 回滚本身的规则在 `test_backup` 里钉；这儿只看接口这一层。"""
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(self.login()[1]["ok"])
+
+    def overview(self):
+        status, result = self.request("/admin/api/backups")
+        self.assertEqual(200, status)
+        self.assertTrue(result["ok"], result)
+        return result
+
+    def create(self, label):
+        result = self.request("/admin/api/backups/create", {"label": label})[1]
+        self.assertTrue(result["ok"], result)
+        return result
+
+    def test_defaults_and_an_empty_list(self):
+        result = self.overview()
+        self.assertEqual({"enabled": True, "time": "04:00", "keep_days": 7},
+                         result["settings"])
+        self.assertEqual([], result["backups"])
+        self.assertTrue(result["status"]["enabled"])
+        self.assertTrue(result["status"]["dir"].endswith("backups"))
+        self.assertEqual("stopped", result["status"]["thread"])   # 测试里不起线程
+        self.assertEqual([], result["online"])
+        self.assertIn("accounts.json", result["current_files"])
+
+    def test_create_lists_and_removes(self):
+        result = self.create("调价前")
+        self.assertIn("已备份", result["message"])
+        self.assertEqual(1, len(result["backups"]))
+        row = result["backups"][0]
+        self.assertEqual(result["created"], row["id"])
+        self.assertEqual(("manual", "手动", "调价前", "admin"),
+                         (row["kind"], row["kind_zh"], row["label"], row["created_by"]))
+        self.assertIn("accounts.json", row["files"])
+        self.assertIn("shop.json", row["files"])
+        self.assertEqual(["config", "accounts"],
+                         [group["key"] for group in row["groups"]])
+        self.assertTrue(row["groups"][0]["checked"])
+        self.assertFalse(row["groups"][1]["checked"])
+        # 目录真的在磁盘上。
+        self.assertTrue(os.path.isdir(os.path.join(self.data_dir, "backups", row["id"])))
+        result = self.request("/admin/api/backups/remove", {"id": row["id"]})[1]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual([], result["backups"])
+        self.assertFalse(os.path.exists(os.path.join(self.data_dir, "backups", row["id"])))
+
+    def test_an_empty_label_gets_a_default(self):
+        row = self.create("")["backups"][0]
+        self.assertEqual("手动备份", row["label"])
+
+    def test_settings_are_written_back_and_take_effect(self):
+        result = self.request("/admin/api/backups/settings",
+                              {"enabled": False, "time": "5:07", "keep_days": 3})[1]
+        self.assertTrue(result["ok"], result)
+        self.assertIn("即刻生效", result["message"])
+        self.assertEqual({"enabled": False, "time": "05:07", "keep_days": 3},
+                         result["settings"])
+        self.assertFalse(result["status"]["enabled"])
+        self.assertIsNone(result["status"]["next_at"])
+        with open(self.config_path, "r", encoding="utf-8") as fp:
+            text = fp.read()
+        self.assertIn("backup_enabled = 0\n", text)
+        self.assertIn("backup_time = 05:07\n", text)
+        self.assertIn("backup_keep_days = 3\n", text)
+        self.assertIn("远程服务器地址", text)        # 模板的注释还在
+        # 再 GET 一次是同样的值（从文件重读）。
+        self.assertEqual(result["settings"], self.overview()["settings"])
+
+    def test_bad_settings_are_refused(self):
+        before = self.overview()["settings"]
+        for payload in ({"enabled": True, "time": "25:00", "keep_days": 7},
+                        {"enabled": True, "time": "04:00", "keep_days": -1},
+                        {"enabled": True, "time": "04:00", "keep_days": "七"},
+                        {"enabled": True, "time": "", "keep_days": 7}):
+            status, result = self.request("/admin/api/backups/settings", payload)
+            self.assertEqual(200, status, payload)
+            self.assertFalse(result["ok"], payload)
+        self.assertEqual(before, self.overview()["settings"])
+
+    def test_restoring_config_takes_effect_and_keeps_a_prerollback(self):
+        created = self.create("原价")["backups"][0]
+        raw = json.loads(self.request("/admin/api/config/shop")[1]["text"])
+        item_id = raw["items"][0]["id"]
+        old_price = raw["items"][0]["price"]
+        raw["items"][0]["price"] = old_price + 1
+        self.assertTrue(self.request("/admin/api/config/shop",
+                                     {"text": json.dumps(raw)})[1]["ok"])
+        self.assertEqual(old_price + 1, shopcfg.shop()[0][item_id]["price"])
+
+        files = created["groups"][0]["files"]
+        result = self.request("/admin/api/backups/restore",
+                              {"id": created["id"], "files": files})[1]
+        self.assertTrue(result["ok"], result)
+        self.assertIn("已回滚到 " + created["id"], result["message"])
+        self.assertIn("回滚前的状态留在", result["message"])
+        self.assertEqual(sorted(files), sorted(result["restored"]))
+        self.assertEqual([], result["failed"])
+        self.assertEqual(old_price, shopcfg.shop()[0][item_id]["price"])
+        kinds = [row["kind"] for row in result["backups"]]
+        self.assertEqual(["prerollback", "manual"], kinds)
+        self.assertEqual(result["pre_backup_id"], result["backups"][0]["id"])
+        # 配置接口读回来的也是旧价（磁盘上那份换了）。
+        again = json.loads(self.request("/admin/api/config/shop")[1]["text"])
+        self.assertEqual(old_price, again["items"][0]["price"])
+
+    def test_a_split_config_group_is_refused(self):
+        created = self.create("x")["backups"][0]
+        status, result = self.request("/admin/api/backups/restore",
+                                      {"id": created["id"], "files": ["shop.json"]})
+        self.assertEqual(200, status)
+        self.assertFalse(result["ok"])
+        self.assertIn("一起回滚", result["message"])
+        self.assertEqual(["manual"], [row["kind"] for row in self.overview()["backups"]])
+
+    def test_restoring_accounts_rolls_the_admin_table_back(self):
+        created = self.create("只有 admin")["backups"][0]
+        self.assertTrue(self.request("/admin/api/admins/add",
+                                     {"name": "carol", "password": "SecretPw",
+                                      "role": "operator"})[1]["ok"])
+        result = self.request("/admin/api/backups/restore",
+                              {"id": created["id"], "files": ["accounts.json"]})[1]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(["accounts.json"], result["restored"])
+        self.assertEqual([], result["kicked"])
+        self.assertEqual(["admin"], self.request("/admin/api/admins")[1]["names"])
+
+    def test_restoring_accounts_that_lack_me_is_refused(self):
+        created = self.create("只有 admin")["backups"][0]
+        self.assertTrue(self.request("/admin/api/admins/add",
+                                     {"name": "carol", "password": "SecretPw",
+                                      "role": "system"})[1]["ok"])
+        self.request("/admin/api/logout", {})
+        self.assertTrue(self.login("carol", "SecretPw")[1]["ok"])
+        result = self.request("/admin/api/backups/restore",
+                              {"id": created["id"], "files": ["accounts.json"]})[1]
+        self.assertFalse(result["ok"])
+        self.assertIn("锁在管理页外面", result["message"])
+        self.assertIn("carol", self.request("/admin/api/admins")[1]["names"])
+
+    def test_unknown_ids_are_a_polite_no(self):
+        for path, payload in (
+                ("/admin/api/backups/restore", {"id": "20260101-000000-manual",
+                                                "files": ["shop.json"]}),
+                ("/admin/api/backups/remove", {"id": "20260101-000000-manual"}),
+                ("/admin/api/backups/remove", {"id": "../data"}),
+                ("/admin/api/backups/restore", {"id": "x", "files": "shop.json"}),
+        ):
+            status, result = self.request(path, payload)
+            self.assertEqual(200, status, path)
+            self.assertFalse(result["ok"], path)
+        status, result = self.request("/admin/api/backups/explode", {})
+        self.assertEqual(404, status)
+
+    def test_without_a_service_the_page_says_so(self):
+        httpd = web_server.make_server(0, self.accounts, "127.0.0.1", cooldown=0)
+        port = httpd.server_address[1]
+        thread = threading.Thread(
+            target=lambda: httpd.serve_forever(poll_interval=0.02), daemon=True)
+        thread.start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/admin/api/login",
+            data=json.dumps({"name": account_store.DEFAULT_ADMIN_NAME,
+                             "password": account_store.DEFAULT_ADMIN_PASSWORD}).encode(),
+            headers={"Content-Type": "application/json"})
+        with opener.open(req, timeout=10) as response:
+            self.assertTrue(json.loads(response.read())["ok"])
+        with opener.open(f"http://127.0.0.1:{port}/admin/api/backups",
+                         timeout=10) as response:
+            result = json.loads(response.read())
+        self.assertFalse(result["ok"])
+        self.assertIn("没有启动", result["message"])
 
 
 class AdminItemLookupTests(_AdminCase):

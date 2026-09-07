@@ -146,19 +146,22 @@ def cleanup(logdir: str = None, days: int = 3, now: float | None = None,
     return removed, freed
 
 
-def seconds_until_daily(now: float | None = None, hour: int = DAILY_HOUR) -> float:
-    """距离下一个「凌晨 `hour` 点」还有几秒。
+def seconds_until_daily(now: float | None = None, hour: int = DAILY_HOUR,
+                        minute: int = 0) -> float:
+    """距离下一个「每天 `hour`:`minute`」还有几秒（默认凌晨 4 点整）。
 
     用 `time.localtime` 而不是自己算 86400 的倍数：这样夏令时 / 手工改时区
     之后也仍然落在当地的 4 点，而不是慢慢漂走。
+    `minute` 是给数据备份（`databackup`，时刻可配到分钟）用的；日志清理
+    照旧整点。
     """
     now = time.time() if now is None else now
     tm = time.localtime(now)
-    target = time.mktime((tm.tm_year, tm.tm_mon, tm.tm_mday, hour, 0, 0,
+    target = time.mktime((tm.tm_year, tm.tm_mon, tm.tm_mday, hour, minute, 0,
                           0, 0, -1))
     if target <= now:
         target = time.mktime((tm.tm_year, tm.tm_mon, tm.tm_mday + 1, hour,
-                              0, 0, 0, 0, -1))
+                              minute, 0, 0, 0, -1))
     # `mktime` 允许 mday 溢出（32 号自动进位到下个月），所以上面那句是安全的。
     return max(1.0, target - now)
 

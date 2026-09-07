@@ -106,13 +106,17 @@ async function api(path, payload) {
      页面无权画东西。
    ====================================================================== */
 
-var DIALOG = null;            // {resolve} —— 正开着的那一个
+var DIALOG = null;            // {resolve, single, danger, picked} —— 正开着的那一个
 
 /** 弹一个对话框。返回 `Promise<boolean>`（确定 = true）。
  *
  *  options = {title, lead, lists: [{label, bad, rows: [{label, reason}]}],
- *             ok, cancel}
+ *             ok, cancel, danger, checks: [{key, label, checked, warn}]}
  *  `cancel` 传 `null` = 只有一个「知道了」，一定 resolve(false)。
+ *  `danger: true` = 确定钮是红的，**焦点给取消钮、Enter 不算确定**
+ *    （回滚 / 删备份这种手一抖就没法挽回的事，别让回车替人做决定）。
+ *  `checks` = 正文里画几个复选框；这时 resolve 的是 `false | [勾了的 key]`，
+ *    一个都没勾时确定钮点不动。
  */
 function ask(options) {
   closeDialog(false);         // 上一个还开着就当它被取消了
@@ -141,28 +145,67 @@ function ask(options) {
 
   var buttons = $("dialogButtons");
   buttons.textContent = "";
+  var no = null;
   if (options.cancel !== null) {
-    var no = el("button", "btn", options.cancel || "取消");
+    no = el("button", "btn", options.cancel || "取消");
     no.onclick = function () { closeDialog(false); };
     buttons.appendChild(no);
   }
-  var yes = el("button", "btn btn-primary", options.ok || "确定");
+  var yes = el("button", "btn " + (options.danger ? "btn-danger" : "btn-primary"),
+               options.ok || "确定");
   yes.onclick = function () { closeDialog(true); };
   buttons.appendChild(yes);
 
+  var boxes = [];
+  if (options.checks && options.checks.length) {
+    var checks = el("div", "checks");
+    options.checks.forEach(function (spec) {
+      var label = document.createElement("label");
+      var input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = !!spec.checked;
+      input.setAttribute("data-key", spec.key);
+      input.onchange = function () {
+        yes.disabled = !boxes.some(function (box) { return box.checked; });
+      };
+      label.appendChild(input);
+      var text = el("span", null, spec.label);
+      if (spec.warn) { text.appendChild(el("span", "warn", spec.warn)); }
+      label.appendChild(text);
+      checks.appendChild(label);
+      boxes.push(input);
+    });
+    body.appendChild(checks);
+    yes.disabled = !boxes.some(function (box) { return box.checked; });
+  }
+
   $("dialog").classList.remove("hidden");
-  yes.focus();
+  // 危险操作把焦点给「取消」：回车落在它身上什么都不会发生。
+  if (options.danger && no) { no.focus(); } else { yes.focus(); }
   return new Promise(function (resolve) {
-    DIALOG = {resolve: resolve, single: options.cancel === null};
+    DIALOG = {
+      resolve: resolve, single: options.cancel === null,
+      danger: !!options.danger,
+      picked: boxes.length ? function () {
+        return boxes.filter(function (box) { return box.checked; })
+                    .map(function (box) { return box.getAttribute("data-key"); });
+      } : null,
+    };
   });
 }
 
 function closeDialog(answer) {
   if (!DIALOG) { return; }
   var open = DIALOG;
+  var value = false;
+  if (!open.single && answer) {
+    value = open.picked ? open.picked() : true;
+    // 带复选框的框一个都没勾 = 没有可确定的东西，当取消。
+    if (open.picked && !value.length) { value = false; }
+  }
   DIALOG = null;
   $("dialog").classList.add("hidden");
-  open.resolve(open.single ? false : !!answer);
+  open.resolve(value);
 }
 
 /* 每个接口都可能因为会话过期回这一句 —— 统一在这里踢回登录页。 */
@@ -929,9 +972,10 @@ async function saveConfig(which, skipClashCheck) {
  *      画的全是它 —— 物品库不跟着刷，名字就还是旧的。
  *
  * ★ 有没保存的改动先问一句（和 `refreshAccounts` 同一个口径）。
+ *   `force` = 别问（数据备份页回滚完调它：回滚确认框里已经列过会丢的那几页）。
  */
-async function refreshConfigs() {
-  var dirty = CONFIGS.filter(isDirty);
+async function refreshConfigs(force) {
+  var dirty = force ? [] : CONFIGS.filter(isDirty);
   if (dirty.length) {
     var go = await ask({
       title: "还有没保存的改动",
@@ -1847,6 +1891,310 @@ async function removeAdmin(name) {
 }
 
 /* ======================================================================
+   数据备份（V0.3商店，用户 2026-09-07）
+
+   服务端 `databackup.py` 的门面：设置区（开关 / 时刻 / 保留天数）、
+   手动备份、备份列表（每页 10 行，前端分页）、回滚 / 删除。
+
+   ★ 列表是**一次全给**、前端分页：数量被保留天数封顶（7 天也就十几份），
+     不值得像玩家列表那样做服务端分页；一次 GET 把 设置 + 状态 + 列表 +
+     在线情况 全带回来，正好对应「刷新 = 重取列表 + server.config 的设置」。
+   ★ 每个写操作的回执里都带着最新的整份（`_backup_reply`），拿到就整页重画，
+     不用再 GET 一次。
+   ★ 只有系统管理员看得到这一页（`SYSTEM_ONLY_TABS`），门在服务端。
+   ====================================================================== */
+
+var BACKUP = null;            // {settings, status, backups, online, playing, edit}
+var BACKUP_PAGE = 0;
+//: 一页几行（用户定的 10）。★ 界面取舍，不是铁律 10 那种时序阈值。
+var BACKUP_PAGE_SIZE = 10;
+
+/** 把一份 GET / 回执塞进页面模型并整页重画。设置区的编辑值一律换成服务端那份。 */
+function adoptBackups(result) {
+  var settings = result.settings || {};
+  BACKUP = {
+    settings: settings, status: result.status || {},
+    backups: result.backups || [],
+    online: result.online || [], playing: result.playing || [],
+    edit: {enabled: !!settings.enabled, time: settings.time || "04:00",
+           keep_days: settings.keep_days},
+  };
+  renderBackupSettings();
+  renderBackupStatus();
+  renderBackupRows();
+}
+
+async function loadBackups() {
+  var result = await api("/admin/api/backups");
+  if (bounced(result)) { return false; }
+  if (!result.ok) { toast(result.message, false); return false; }
+  adoptBackups(result);
+  return true;
+}
+
+function renderBackupSettings() {
+  var edit = BACKUP.edit;
+  $("backupEnabled").classList.toggle("on", edit.enabled);
+  $("backupTime").value = edit.time;
+  $("backupKeepDays").value = edit.keep_days;
+  backupTouched();
+}
+
+function backupSettingsDirty() {
+  if (!BACKUP) { return false; }
+  var s = BACKUP.settings, e = BACKUP.edit;
+  return !!s.enabled !== !!e.enabled || s.time !== e.time
+    || Number(s.keep_days) !== Number(e.keep_days);
+}
+
+function backupTouched() {
+  var dirty = backupSettingsDirty();
+  var node = $("backupDirty");
+  node.textContent = dirty ? "有未保存的改动" : "";
+  node.className = "dirty" + (dirty ? "" : " clean");
+}
+
+function renderBackupStatus() {
+  var st = BACKUP.status;
+  var lines = [];
+  if (st.enabled) { lines.push("下次自动备份：" + (st.next_text || "—")); }
+  else { lines.push("自动备份已关闭（手动备份和按天清理照常）"); }
+  if (st.last_auto) {
+    lines.push("上次自动备份（本次启动以来）：" + st.last_auto.text
+               + (st.last_auto.ok ? "，成功" : "，失败：" + st.last_auto.message));
+  } else if (st.newest_auto) {
+    lines.push("最近一份自动备份：" + st.newest_auto.text);
+  } else {
+    lines.push("还没有过自动备份");
+  }
+  if (st.thread !== "running") {
+    lines.push("⚠ 调度线程没在跑（--no-backup，或这个进程不是 app.py 起的）"
+               + "，到点不会自动备份；手动备份照常");
+  }
+  lines.push("备份目录：" + (st.dir || ""));
+  $("backupStatus").textContent = lines.join("\n");
+}
+
+async function saveBackupSettings() {
+  if (!BACKUP) { return; }
+  var edit = BACKUP.edit;
+  var days = Number(edit.keep_days);
+  if (!isFinite(days) || days < 0 || days > 3650 || Math.floor(days) !== days) {
+    toast("保留天数要是 0 ~ 3650 的整数（0 = 永不自动删除）", false);
+    return;
+  }
+  if (!/^\d{1,2}:\d{2}$/.test(edit.time || "")) {
+    toast("备份时刻要写成 HH:MM（比如 04:00）", false);
+    return;
+  }
+  // 保留天数一改，服务端会**立刻**清一次 —— 先按手上这份列表算出会删几份，
+  // 问过再存。用浏览器的时钟估算，和服务端差个几秒无所谓，这是确认不是判据。
+  var doomed = [];
+  if (days > 0) {
+    var deadline = Date.now() / 1000 - days * 86400;
+    doomed = BACKUP.backups.filter(function (row) { return row.created_at < deadline; });
+  }
+  if (doomed.length) {
+    var go = await ask({
+      title: "保留天数改小了",
+      lead: "保存后会立刻删掉 " + doomed.length + " 份早于 " + days + " 天的备份：",
+      lists: [{label: "将被删除：", bad: true,
+               rows: doomed.map(function (row) {
+                 return {label: row.created_text + "　" + row.label};
+               })}],
+      ok: "保存并删除", danger: true});
+    if (!go) { return; }
+  }
+  toast("保存中……", true);
+  var result = await api("/admin/api/backups/settings",
+                         {enabled: edit.enabled, time: edit.time, keep_days: days});
+  if (bounced(result)) { return; }
+  if (!result.ok) { toast(result.message, false); return; }
+  adoptBackups(result);
+  toast(result.message, true);
+}
+
+async function createBackup() {
+  var label = $("backupLabel").value.trim();
+  toast("备份中……", true);
+  var result = await api("/admin/api/backups/create", {label: label});
+  if (bounced(result)) { return; }
+  if (!result.ok) { toast(result.message, false); return; }
+  $("backupLabel").value = "";
+  BACKUP_PAGE = 0;              // 新的一份排最前，翻到第一页才看得见
+  adoptBackups(result);
+  toast(result.message, true);
+}
+
+function backupPageCount() {
+  var total = BACKUP ? BACKUP.backups.length : 0;
+  return Math.max(1, Math.ceil(total / BACKUP_PAGE_SIZE));
+}
+
+/** 画当前页。★ 重画一律不动滚动条（D37b）：滚动条长在 `#backupList` 上。 */
+function renderBackupRows() {
+  var list = $("backupList");
+  var keep = list.scrollTop;
+  var rows = $("backupRows");
+  rows.textContent = "";
+  var all = BACKUP.backups;
+  var pages = backupPageCount();
+  BACKUP_PAGE = Math.min(Math.max(0, BACKUP_PAGE), pages - 1);
+  if (!all.length) {
+    var tr = document.createElement("tr");
+    var td = el("td", "own-empty",
+                "还没有备份 —— 点上面的「立即备份」，或者等每天的自动备份。");
+    td.colSpan = 5;
+    tr.appendChild(td);
+    rows.appendChild(tr);
+  }
+  all.slice(BACKUP_PAGE * BACKUP_PAGE_SIZE, (BACKUP_PAGE + 1) * BACKUP_PAGE_SIZE)
+     .forEach(function (row) {
+    var line = document.createElement("tr");
+    line.appendChild(el("td", "bk-label", row.label));
+    var kind = el("td");
+    kind.appendChild(el("span", "kind " + row.kind, row.kind_zh));
+    line.appendChild(kind);
+    line.appendChild(el("td", null, row.created_text));
+    var what = el("td", null, row.file_count + " 个文件 · " + row.size_text);
+    what.title = (row.files || []).join("\n");
+    line.appendChild(what);
+    var td = el("td");
+    // ★ 两个钮颜色必须不一样（用户 2026-09-07）：金 = 回滚（动作），红 = 删除。
+    var acts = el("div", "acts");
+    var restore = el("button", "btn btn-sm btn-primary", "回滚到此版本");
+    restore.onclick = function () { confirmRestore(row); };
+    acts.appendChild(restore);
+    var remove = el("button", "btn btn-sm btn-danger", "删除备份");
+    remove.onclick = function () { confirmRemove(row); };
+    acts.appendChild(remove);
+    td.appendChild(acts);
+    line.appendChild(td);
+    rows.appendChild(line);
+  });
+  $("backupCount").textContent = all.length ? all.length + " 份备份" : "";
+  paintBackupPager(pages);
+  list.scrollTop = keep;
+}
+
+/** 换页栏。只有列表上面这一条、只有多页才画、换页不动滚动条（D37a）。 */
+function paintBackupPager(pages) {
+  var host = $("backupPager");
+  host.textContent = "";
+  if (pages <= 1) { return; }
+  function step(text, target, disabled) {
+    var button = el("button", "btn btn-sm", text);
+    button.disabled = disabled;
+    button.onclick = function () {
+      var list = $("backupList");
+      var keep = list.scrollTop;
+      BACKUP_PAGE = target;
+      renderBackupRows();
+      list.scrollTop = keep;
+    };
+    host.appendChild(button);
+  }
+  step("‹ 上一页", BACKUP_PAGE - 1, BACKUP_PAGE <= 0);
+  host.appendChild(el("span", "pageno",
+                      "第 " + (BACKUP_PAGE + 1) + " / " + pages + " 页　共 "
+                      + BACKUP.backups.length + " 份"));
+  step("下一页 ›", BACKUP_PAGE + 1, BACKUP_PAGE >= pages - 1);
+}
+
+/** 「回滚到此版本」：先重取一次（在线 / 战斗中的人数要最新的，那份备份也可能
+ *  刚被别人删了），再弹带复选框的红钮确认框。
+ *
+ *  复选框是服务端分好的组（`databackup.groups_of`）：四份运营配置**一个格子**
+ *  （用户 2026-09-07：互相关联，不许拆开），玩家存档单独一格、默认不勾。
+ */
+async function confirmRestore(row) {
+  var fresh = await api("/admin/api/backups");
+  if (bounced(fresh)) { return; }
+  if (!fresh.ok) { toast(fresh.message, false); return; }
+  adoptBackups(fresh);
+  var latest = null;
+  BACKUP.backups.forEach(function (item) { if (item.id === row.id) { latest = item; } });
+  if (!latest) {
+    toast("这份备份已经不在了（刚被删掉？），列表已经刷新。", false);
+    return;
+  }
+  row = latest;
+  var lead = "用「" + row.created_text + " · " + row.label + "」覆盖现在的数据。\n"
+           + "回滚前会先把现在的状态自动备份一份（类型「回滚前」），回错了还能回来。";
+  var lists = [];
+  var dirty = CONFIGS.filter(isDirty);
+  if (dirty.length) {
+    lists.push({label: "这几页还有没保存的改动，回滚后会被丢掉：", bad: true,
+                rows: dirty.map(function (which) {
+                  return {label: CAT.schema[which].title};
+                })});
+  }
+  var checks = (row.groups || []).map(function (group) {
+    var warn = group.warn || "";
+    if (group.key === "accounts" && BACKUP.online.length) {
+      warn += (warn ? "　" : "") + "现在有 " + BACKUP.online.length + " 人在线（"
+            + BACKUP.online.join("、") + "），他们的进度会一起倒回去；"
+            + "备份里没有的账号会被踢下线。";
+    }
+    return {key: group.key, label: group.label, checked: !!group.checked,
+            warn: warn || null, files: group.files || []};
+  });
+  var picked = await ask({title: "回滚到此版本", lead: lead, lists: lists,
+                          checks: checks, ok: "回滚", danger: true});
+  if (!picked) { return; }
+  var files = [];
+  checks.forEach(function (check) {
+    if (picked.indexOf(check.key) >= 0) { files = files.concat(check.files); }
+  });
+  toast("回滚中……", true);
+  var result = await api("/admin/api/backups/restore", {id: row.id, files: files});
+  if (bounced(result)) { return; }
+  if (!result.ok) { toast(result.message, false); return; }
+  adoptBackups(result);
+  var restored = result.restored || [];
+  // ★ 磁盘上的配置换了，页面上那份（连同它的 `base`）必须跟着换 —— 否则下一次
+  //   保存做三方合并时，会把回滚掉的内容当成「对方的改动」（D36）。
+  if (restored.some(function (name) { return name !== "accounts.json"; })) {
+    await refreshConfigs(true);
+  }
+  if (restored.indexOf("accounts.json") >= 0) {
+    await loadAdmins();
+    if (PLAYER_LIST.length) { await searchPlayers(); }
+    if (PLAYER) { await openPlayer(PLAYER.view.username, true); }
+  }
+  // 回滚的回执最后说，别被上面那几发「已刷新」盖掉；没全回滚成的留着等人点掉。
+  toast(result.message, !(result.failed && result.failed.length));
+}
+
+async function confirmRemove(row) {
+  var go = await ask({
+    title: "删除备份",
+    lead: "确定删除「" + row.created_text + " · " + row.label + "」？\n"
+        + "删掉就找不回来了（" + row.file_count + " 个文件，" + row.size_text + "）。",
+    ok: "删除", danger: true});
+  if (!go) { return; }
+  var result = await api("/admin/api/backups/remove", {id: row.id});
+  if (bounced(result)) { return; }
+  if (!result.ok) { toast(result.message, false); return; }
+  adoptBackups(result);
+  toast(result.message, true);
+}
+
+/** 标题栏那个 ↻：重取 列表 + 设置 + 状态。设置区有没保存的改动先问一句
+ *  （和 `refreshAccounts` / `refreshConfigs` 同一个口径）；
+ *  失败时不用「已刷新」盖掉错误。 */
+async function refreshBackups() {
+  if (backupSettingsDirty()
+      && !(await ask({title: "还有没保存的改动",
+                      lead: "备份设置还没保存，刷新会拿 server.config 里那份盖掉，确定？",
+                      ok: "刷新"}))) {
+    return;
+  }
+  toast("刷新中……", true);
+  if (await loadBackups()) { toast("已刷新：备份列表和设置都是最新的。", true); }
+}
+
+/* ======================================================================
    玩家资料（V0.3商店 D22 的配套：商店按真实等级卖，改数值只能从这儿改）
 
    模型：`PLAYER.view` 是服务端那份快照，`PLAYER.edit` 是**要提交的补丁**
@@ -2214,8 +2562,8 @@ var ROLE = null;                       // "system" / "operator" / null（没登�
 //  **配置**页（渲染要用），「玩家资料」和「管理员账号」不在里面。
 var TAB = "items";
 
-//: 只有系统管理员能进的标签页。
-var SYSTEM_ONLY_TABS = ["players", "admins"];
+//: 只有系统管理员能进的标签页（数据备份也是：它能回滚玩家存档）。
+var SYSTEM_ONLY_TABS = ["players", "backup", "admins"];
 
 function isSystemAdmin() { return ROLE === "system"; }
 
@@ -2259,6 +2607,8 @@ function showLoggedOut(message) {
   CURRENT = "items";
   PLAYER = null;
   PLAYER_LIST = [];
+  BACKUP = null;
+  BACKUP_PAGE = 0;
   $("playerEdit").classList.add("hidden");
   $("playerFoot").classList.add("hidden");
   $("who").textContent = "";
@@ -2301,15 +2651,21 @@ function switchTab(tab) {
     button.classList.toggle("on", button.getAttribute("data-tab") === tab);
   });
   var isConfig = CONFIGS.indexOf(tab) >= 0;
-  // ★ 只有那四个配置页是「面板撑满、列表自己滚」（D39）；玩家资料 /
+  // ★ 四个配置页和数据备份页是「面板撑满、列表自己滚」（D39）；玩家资料 /
   //   管理员账号是普通长页面，整块跟着 `main` 滚。
-  $("mainArea").classList.toggle("fit", isConfig);
+  $("mainArea").classList.toggle("fit", isConfig || tab === "backup");
   $("cfgPanel").classList.toggle("hidden", !isConfig);
   $("adminsPanel").classList.toggle("hidden", tab !== "admins");
   $("playersPanel").classList.toggle("hidden", tab !== "players");
+  $("backupPanel").classList.toggle("hidden", tab !== "backup");
   if (tab === "players") {
     // 第一次切进来先列几个，免得画面上是一片空白。
     if (!PLAYER_LIST.length) { searchPlayers(); }
+    return;
+  }
+  if (tab === "backup") {
+    // 同上：第一次切进来才去要（运营根本进不来，`boot()` 里不预取）。
+    if (!BACKUP) { loadBackups(); }
     return;
   }
   if (!isConfig) { return; }
@@ -2355,6 +2711,27 @@ function wire() {
   // ★ 两页共用一发（D43）—— 点哪个都刷两边。
   $("playerRefreshBtn").onclick = function () { refreshAccounts(); };
   $("adminRefreshBtn").onclick = function () { refreshAccounts(); };
+
+  // 数据备份页。同上：包一层，别把 Event 当参数传进去。
+  $("backupRefreshBtn").onclick = function () { refreshBackups(); };
+  $("backupCreate").onclick = function () { createBackup(); };
+  $("backupLabel").addEventListener("keydown", function (event) {
+    if (event.key === "Enter") { createBackup(); }
+  });
+  $("backupSettingsSave").onclick = function () { saveBackupSettings(); };
+  $("backupEnabled").onclick = function (event) {
+    event.preventDefault();
+    if (!BACKUP) { return; }
+    BACKUP.edit.enabled = !BACKUP.edit.enabled;
+    $("backupEnabled").classList.toggle("on", BACKUP.edit.enabled);
+    backupTouched();
+  };
+  $("backupTime").oninput = function () {
+    if (BACKUP) { BACKUP.edit.time = $("backupTime").value; backupTouched(); }
+  };
+  $("backupKeepDays").oninput = function () {
+    if (BACKUP) { BACKUP.edit.keep_days = $("backupKeepDays").value; backupTouched(); }
+  };
   $("playerLevel").oninput = function () {
     PLAYER.edit.level = Math.max(1, Number($("playerLevel").value) || 1);
     playerTouched();
@@ -2400,7 +2777,8 @@ function wire() {
     //   （「加一种材料」的弹窗上再弹确认框时，Esc 该先关掉上面那个）。
     if (DIALOG) {
       if (event.key === "Escape") { closeDialog(false); }
-      else if (event.key === "Enter") { closeDialog(true); }
+      // 危险操作（红钮）的框不认回车 —— 焦点在「取消」上，让它自己走。
+      else if (event.key === "Enter" && !DIALOG.danger) { closeDialog(true); }
       return;
     }
     if (event.key === "Escape" && PICKER) { closePicker(); }
@@ -2432,7 +2810,7 @@ function wire() {
 
   // 关标签页前拦一下 —— 表单页最容易「改了半天忘了按保存」。
   window.addEventListener("beforeunload", function (event) {
-    if (CAT && (CONFIGS.some(isDirty) || playerDirty())) {
+    if (CAT && (CONFIGS.some(isDirty) || playerDirty() || backupSettingsDirty())) {
       event.preventDefault();
       event.returnValue = "";
     }

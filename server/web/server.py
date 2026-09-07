@@ -529,11 +529,14 @@ class _PreboundHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def make_server(port, accounts, host="::",
-                cooldown=server_config.DEFAULT_REGISTER_COOLDOWN_SECONDS):
+                cooldown=server_config.DEFAULT_REGISTER_COOLDOWN_SECONDS,
+                backup=None):
     """建好 HTTP 服务器但不开始服务，方便测试拿到真实端口。
 
     `cooldown` = 注册冷却秒数（`server.config` 的 `register_cooldown_seconds`）。
     默认值就是「开着」—— 漏传参数时应当**多限一点**而不是不限。
+    `backup` = `databackup.BackupService`（管理页「数据备份」页用）；
+    不传时那几个接口回「备份功能没有启动」。
     """
     handler = type("BoundHandler", (Handler,),
                    {"accounts": accounts,
@@ -541,14 +544,16 @@ def make_server(port, accounts, host="::",
                     # 管理页的两个共享对象。★ 都**只在内存里** —— 会话随进程
                     # 走（重启即失效），限速表也一样（同 `RegisterRateLimiter`）。
                     "admin_sessions": admin.AdminSessions(),
-                    "admin_limiter": admin.LoginRateLimiter()})
+                    "admin_limiter": admin.LoginRateLimiter(),
+                    "backup": backup})
     return _PreboundHTTPServer(create_listener(host, port), handler)
 
 
 def serve(port, accounts, host="::", ready=None,
-          cooldown=server_config.DEFAULT_REGISTER_COOLDOWN_SECONDS):
+          cooldown=server_config.DEFAULT_REGISTER_COOLDOWN_SECONDS,
+          backup=None):
     """阻塞地提供注册页服务。`app.py` 会把它丢进一个线程。"""
-    httpd = make_server(port, accounts, host, cooldown)
+    httpd = make_server(port, accounts, host, cooldown, backup=backup)
     if ready is not None:
         ready.set()
     httpd.serve_forever()

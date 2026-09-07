@@ -27,6 +27,7 @@
     <button data-tab="recipe">合成配方</button>
     <button data-tab="drops">材料掉落</button>
     <button data-tab="players">玩家资料</button>
+    <button data-tab="backup">数据备份</button>
     <button data-tab="admins">管理员账号</button>
   </nav>
 </div>
@@ -54,13 +55,13 @@
   <div id="mainView" class="hidden">
 
     <!-- ------- 三份运营配置共用这一套骨架，内容由 admin.js 按字段表生成 ------- -->
-    <section class="panel" id="cfgPanel">
+    <section class="panel fit-panel" id="cfgPanel">
       <div class="panel-title">
         <h2 id="cfgTitle"></h2>
         <span class="count" id="cfgCount"></span>
       </div>
       <div class="panel-body">
-        <ul class="help" id="cfgHelp"></ul>
+        <ul class="help fit-help" id="cfgHelp"></ul>
         <!-- ★ 筛选条件和「添加 / 放弃修改 / 保存」**同一行**，跟换页栏一起
              钉在列表上面（用户 2026-09-06，D39）：往下滚只滚列表，这两条
              永远看得见。列表**下面一个元素都不放** —— 原来的 `panel-foot`
@@ -75,7 +76,7 @@
           </div>
         </div>
         <div class="pager" id="cfgPager"></div>
-        <div id="cfgList"></div>
+        <div class="fit-list" id="cfgList"></div>
       </div>
     </section>
 
@@ -152,6 +153,69 @@
         <span style="margin-left:auto"></span>
         <button class="btn" id="playerReset">放弃修改</button>
         <button class="btn btn-primary" id="playerSave">保存</button>
+      </div>
+    </section>
+
+    <!-- ---------------- 数据备份（V0.3商店，用户 2026-09-07） ----------------
+         服务端 databackup.py 的门面。★ 和四个配置页一样走「面板撑满、只有
+         列表滚」那套壳（D39）：设置条 / 手动备份条 / 换页栏钉住不动。
+         ★ 只有系统管理员看得到（SYSTEM_ONLY_TABS），门在服务端。 -->
+    <section class="panel hidden fit-panel" id="backupPanel">
+      <div class="panel-title">
+        <h2>数据备份</h2>
+        <span class="count" id="backupCount"></span>
+        <button class="icon-btn" id="backupRefreshBtn" aria-label="刷新"
+                title="重新读一遍备份列表和 server.config 里的设置">↻</button>
+      </div>
+      <div class="panel-body">
+        <ul class="help fit-help">
+          <li>备份的是 <code>server/data/</code> 下的<b>全部 json</b>
+            （物品库 / 商店货架 / 合成配方 / 材料掉落 + 玩家存档
+            <code>accounts.json</code>，以后新加的也算），存在
+            <code>server/data/backups/</code> 里，一份一个目录，可以直接打开看。</li>
+          <li><b>自动备份</b>每天到设定时刻做一次（服务器本地时间）；服务端那时没开着
+            就没有那一天的。<b>保留天数</b>对手动备份、回滚前的备份一样有效，
+            0 = 永不自动删除。</li>
+          <li><b>回滚</b>会先把现在的状态自动备份一份，再用那份覆盖。
+            四份运营配置互相关联，只能一起回滚；玩家存档默认<b>不</b>回滚，
+            勾了会把所有玩家的进度倒回去。</li>
+          <li>这里改的设置会立刻生效并写回 <code>config/server.config</code>，不用重启。</li>
+        </ul>
+        <div class="toolbar backup-bar">
+          <label class="toggle" id="backupEnabled">
+            <span class="track"></span><span>每天自动备份</span>
+          </label>
+          <span class="field">
+            <span class="lab">时刻</span>
+            <input id="backupTime" type="time" step="60">
+          </span>
+          <span class="field">
+            <span class="lab">保留天数（0 = 永不自动删除）</span>
+            <input id="backupKeepDays" type="number" min="0" max="3650" step="1">
+          </span>
+          <span class="dirty clean" id="backupDirty"></span>
+          <span class="grow"></span>
+          <button class="btn btn-primary" id="backupSettingsSave">保存设置</button>
+        </div>
+        <p class="hint backup-status" id="backupStatus"></p>
+        <div class="toolbar backup-bar">
+          <input id="backupLabel" type="text" maxlength="200"
+                 placeholder="这次备份的说明（可不填，例如：调价前）">
+          <button class="btn btn-primary" id="backupCreate">立即备份</button>
+        </div>
+        <div class="pager" id="backupPager"></div>
+        <div class="backup-list fit-list" id="backupList">
+          <table>
+            <thead><tr>
+              <th>说明</th>
+              <th style="width:72px">类型</th>
+              <th style="width:170px">备份时间</th>
+              <th style="width:150px">内容</th>
+              <th style="width:236px"></th>
+            </tr></thead>
+            <tbody id="backupRows"></tbody>
+          </table>
+        </div>
       </div>
     </section>
 

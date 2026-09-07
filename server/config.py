@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 
 #: 认证服端口。客户端硬编码（V0.1 §24：原服 222.73.1.42:47611），不可配置。
@@ -134,6 +135,15 @@ DEFAULT_LOG_RETENTION_DAYS = 3
 #: 保留天数的上限。10 年 —— 再大就等于「不清理」，那该填 0 而不是填 99999。
 MAX_LOG_RETENTION_DAYS = 3650
 
+#: 数据自动备份（管理页「数据备份」标签页，V0.3商店）：每天 `backup_time`
+#: 把 `server/data/*.json` 拷一份到 `server/data/backups/`，早于
+#: `backup_keep_days` 天的备份自动删掉（0 = 永不自动删除，和日志保留天数
+#: 的 0 同一个口径）。用户 2026-09-07 定的默认值：开 / 凌晨 4 点 / 7 天。
+#: 实现在 `databackup.py`；这三个键管理页改完会**写回**文件（`save_keys`）。
+DEFAULT_BACKUP_ENABLED = 1
+DEFAULT_BACKUP_TIME = "04:00"
+DEFAULT_BACKUP_KEEP_DAYS = 7
+
 #: 每个 UDP 数据报最多捎带几份**历史**位置包（0 = 只发当前这一份）。
 #: 上限 4：位置包只有 43 字节，捎 4 份也才 ~250 字节/报，再多就纯属浪费上行了。
 MAX_UDP_SYNC_REDUNDANCY = 4
@@ -167,6 +177,10 @@ DEFAULTS = {
     #   比 online.log 里的到达间隔」是判断这套东西到底有没有用的唯一办法。
     "udp_sync": 1,
     "udp_sync_redundancy": 2,
+    # ★ 数据备份（管理页「数据备份」页）。在管理页里改会立刻生效并写回文件。
+    "backup_enabled": DEFAULT_BACKUP_ENABLED,
+    "backup_time": DEFAULT_BACKUP_TIME,
+    "backup_keep_days": DEFAULT_BACKUP_KEEP_DAYS,
 }
 
 #: 值要按**端口**解析的键（1~65535）。
@@ -177,13 +191,20 @@ _PORT_KEYS = ("server_register_port", "local_register_port", "proxy_port")
 _SECOND_KEYS = ("register_cooldown_seconds",)
 
 #: 值要按**天数**解析的键（0 ~ MAX_LOG_RETENTION_DAYS，0 = 关闭）。
-_DAY_KEYS = ("log_retention_days",)
+_DAY_KEYS = ("log_retention_days", "backup_keep_days")
 
 #: 值要按**开关**解析的键（0/1；也认 on/off、true/false、yes/no）。
-_FLAG_KEYS = ("udp_sync",)
+_FLAG_KEYS = ("udp_sync", "backup_enabled")
+
+#: 值要按**每天几点**解析的键（`HH:MM`，本地时间）。
+_TIME_KEYS = ("backup_time",)
 
 #: 值要按**冗余份数**解析的键（0 ~ MAX_UDP_SYNC_REDUNDANCY，0 = 不捎带）。
 _REDUNDANCY_KEYS = ("udp_sync_redundancy",)
+
+#: 管理页「数据备份」会写回的那几个键。`ensure_keys` 只补这几个 ——
+#: `proxy_*` 那种「缺了有含义（= 直连）」的键不能顺手补。
+BACKUP_KEYS = ("backup_enabled", "backup_time", "backup_keep_days")
 
 
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -242,6 +263,36 @@ def _clean_flag(value, key, warnings):
     return DEFAULTS[key]
 
 
+#: `HH:MM`。顺手认全角冒号和 `4:00` 这种不补零的写法 —— 用记事本改的人不该
+#: 因为少打一个 0 就被打回默认值。
+_TIME_PATTERN = re.compile(r"^(\d{1,2})\s*[:：]\s*(\d{1,2})$")
+
+
+def parse_clock(value):
+    """`"4:00"` / `"04:00"` / `"04：00"` → `(4, 0)`；认不出返回 `None`。"""
+    match = _TIME_PATTERN.match(str(value or "").strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
+def format_clock(hour, minute):
+    return "%02d:%02d" % (hour, minute)
+
+
+def _clean_time(value, key, warnings):
+    """每天几点 -> 规范的 `HH:MM`。认不出来用默认值 + 一条警告。"""
+    clock = parse_clock(value)
+    if clock is None:
+        warnings.append(f"{key} 要写成 HH:MM（比如 04:00），填的是 {value!r}，"
+                        f"改用默认值 {DEFAULTS[key]}")
+        return DEFAULTS[key]
+    return format_clock(*clock)
+
+
 def parse_text(text: str):
     """配置文本 -> ``(配置字典, 警告列表)``。
 
@@ -274,6 +325,8 @@ def parse_text(text: str):
                                        MAX_LOG_RETENTION_DAYS)
         elif key in _FLAG_KEYS:
             values[key] = _clean_flag(value, key, warnings)
+        elif key in _TIME_KEYS:
+            values[key] = _clean_time(value, key, warnings)
         elif key in _REDUNDANCY_KEYS:
             values[key] = _clean_count(value, key, warnings,
                                        MAX_UDP_SYNC_REDUNDANCY)
@@ -457,6 +510,23 @@ udp_sync = 1
 udp_sync_redundancy = 2
 
 # ---------------------------------------------------------------------------
+# 数据自动备份（管理页「数据备份」标签页，只有系统管理员看得到）
+#
+# 每天到 backup_time（本地时间）把 server\\data\\ 下的全部 json —— 账号存档
+# accounts.json 和 物品库 / 商店货架 / 合成配方 / 材料掉落 —— 原样拷一份到
+# server\\data\\backups\\<时刻-类型>\\，早于 backup_keep_days 天的备份自动删掉
+# （手动备份、回滚前的自动备份也算在内；填 0 = 永不自动删除）。
+# 服务端在那个时刻没开着，那天就没有自动备份（不补做）。
+#
+# ⚠ 备份里的 accounts.json 含明文密码，和它本体一样敏感，别随包分发。
+# ★ 在管理页里改这三项会立刻生效并写回这里；直接改这个文件的话，
+#   要打开一次「数据备份」标签页（或等到备份时刻）才会被读到。
+# ---------------------------------------------------------------------------
+backup_enabled = 1
+backup_time = 04:00
+backup_keep_days = 7
+
+# ---------------------------------------------------------------------------
 # 说明：
 #   * 认证服（47611）和游戏服（27799）的端口是客户端写死的，不需要也不能配置。
 #   * 监听地址固定为 ::（IPv4 和 IPv6 都能连进来），不需要配置。
@@ -476,6 +546,151 @@ def ensure_exists(path: str | None = None, root: str | None = None) -> str:
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(DEFAULT_CONFIG_TEXT)
     return path
+
+
+# ---------------------------------------------------------------------------
+# 写回（只有管理页「数据备份」用；其它键至今没有写回的需求）
+# ---------------------------------------------------------------------------
+
+#: `save_keys` 往老文件末尾**追加**缺失的键时，配在前面的说明。老文件里没有
+#: 模板那一大段注释，光秃秃一行 `backup_time = 04:00` 没人看得懂。
+KEY_COMMENTS = {
+    "backup_enabled": (
+        "数据自动备份：1 = 每天自动把 server\\data\\*.json 备份到 "
+        "server\\data\\backups\\，0 = 关。",
+        "管理页「数据备份」里改会写回这里；直接改文件要打开一次那个标签页才会被读到。",
+    ),
+    "backup_time": ("每天几点自动备份（本地时间，HH:MM）。",),
+    "backup_keep_days": (
+        "备份保留几天，早于它的自动删掉（手动备份也算；0 = 永不自动删除）。",
+    ),
+}
+
+
+def format_value(key, value):
+    """写回文件时一个值长什么样（和 `parse_text` 读回来要对得上）。"""
+    if key in _FLAG_KEYS:
+        return "1" if _clean_flag(value, key, []) else "0"
+    if key in _TIME_KEYS:
+        clock = parse_clock(value)
+        return format_clock(*clock) if clock else str(DEFAULTS[key])
+    return str(value).strip()
+
+
+def present_keys(text: str):
+    """文件里**实际写了**哪些键（不管值合不合法）。
+
+    `parse_text` 一上来就把默认值填满了，从它的结果看不出哪个键是文件里
+    没有的 —— `ensure_keys` 要的正是这个区别。
+    """
+    found = set()
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("﻿")
+        if not line or line[0] in "#;":
+            continue
+        key, sep, _value = line.partition("=")
+        if sep:
+            found.add(key.strip().lower())
+    return found
+
+
+def _write_text_atomic(path, text):
+    """tmp → fsync → replace（和 `shopcfg.write_json` 同款）。
+
+    `newline=""`：行尾由调用方定（`save_keys` 保留了原文件的行尾），
+    别让文本层再翻译一遍。无 BOM（铁律 3）。
+    """
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def save_keys(path, values):
+    """把几个键的值写回 `server.config`，**其它每一行原样不动**。
+
+    ★ 为什么不是「重新生成整份文件」：用户会直接改这个文件（注释里就是这么
+      教的），里面还有他自己的地址、代理密码和注释；整份重写等于把那些抹了。
+    ★ 命中的行整行换成 `key = 新值`；**同一个键出现几次就全换**（`parse_text`
+      取的是最后一次，只换一处会被另一处顶掉，或者留下两行互相矛盾的值）。
+    ★ 缺的键追加到文件末尾，前面配一段说明（`KEY_COMMENTS`）。
+    ★ 行尾照原文件：每一行沿用自己原来的行尾，追加的行沿用最后一个非空行的
+      —— LF 的模板还是 LF，记事本存成 CRLF 的就还是 CRLF，不混用。
+    ★ `utf-8-sig` 读（吞掉记事本的 BOM）、无 BOM 写（铁律 3）。
+
+    返回 ``(换掉的键, 追加的键)``。写不进去时 `OSError` 原样抛给调用方
+    （管理页会把它变成一句人话）。
+    """
+    values = dict((str(key).strip().lower(), value)
+                  for key, value in values.items())
+    for key in values:
+        if key not in DEFAULTS:
+            raise ValueError(f"不认识的配置项 {key!r}")
+    try:
+        with open(path, "rb") as f:
+            text = f.read().decode("utf-8-sig")
+    except FileNotFoundError:
+        text = DEFAULT_CONFIG_TEXT
+    replaced = set()
+    out = []
+    last_eol = "\n"
+    for raw in text.splitlines(keepends=True):
+        body = raw.rstrip("\r\n")
+        eol = raw[len(body):]
+        if body.strip() and eol:
+            last_eol = eol
+        line = body.strip().lstrip("﻿")
+        if line and line[0] not in "#;":
+            key, sep, _old = line.partition("=")
+            key = key.strip().lower()
+            if sep and key in values:
+                out.append("%s = %s%s" % (key, format_value(key, values[key]),
+                                          eol or last_eol))
+                replaced.add(key)
+                continue
+        out.append(raw)
+    appended = [key for key in DEFAULTS if key in values and key not in replaced]
+    if appended:
+        if out and not out[-1].endswith(("\n", "\r")):
+            out[-1] += last_eol
+        for key in appended:
+            out.append(last_eol)
+            for comment in KEY_COMMENTS.get(key, ()):
+                out.append("# %s%s" % (comment, last_eol))
+            out.append("%s = %s%s" % (key, format_value(key, values[key]),
+                                      last_eol))
+    _write_text_atomic(path, "".join(out))
+    return sorted(replaced), appended
+
+
+def ensure_keys(path, keys=BACKUP_KEYS):
+    """文件里缺哪个键就补上默认值；一个都不缺时**不写盘**（幂等，不改 mtime）。
+
+    只补 `keys` 里列的（默认是数据备份那三个）。返回补了哪些键。
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = ""
+    have = present_keys(text)
+    missing = [key for key in keys if key not in have]
+    if not missing:
+        return []
+    save_keys(path, dict((key, DEFAULTS[key]) for key in missing))
+    return missing
 
 
 if __name__ == "__main__":

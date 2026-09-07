@@ -301,6 +301,29 @@ class AccountStore:
         self._lock = threading.RLock()
         self.ensure_exists()
 
+    @property
+    def lock(self):
+        """存档的读写锁（可重入）。
+
+        ★ 只给数据备份用（`databackup`）：拷贝或覆盖 `accounts.json` 期间要把
+        本类所有读写都挡在外面 —— Windows 上一边 `open()` 着读、另一边
+        `os.replace` 会直接 `PermissionError`，结算奖励就丢了。
+        业务代码不该拿它，走本类的方法就够。
+        """
+        return self._lock
+
+    @staticmethod
+    def check_document(data):
+        """一份存档 JSON 的根结构对不对。不对就抛 `ValueError`。
+
+        和 `_read_unlocked` 是同一套判断：数据备份回滚一份 `accounts.json`
+        之前先过这一关，免得把一份服务端读不了的文件写回去。
+        """
+        if not isinstance(data, dict):
+            raise ValueError("账号文件根节点必须是对象")
+        if not isinstance(data.get("accounts", {}), dict):
+            raise ValueError("accounts 必须是对象")
+
     @staticmethod
     def _empty():
         return {"schema_version": SCHEMA_VERSION, "accounts": {}}
@@ -311,15 +334,15 @@ class AccountStore:
                 data = json.load(f)
         except FileNotFoundError:
             return self._empty()
-        if not isinstance(data, dict):
-            raise ValueError(f"账号文件根节点必须是对象: {self.path}")
+        try:
+            self.check_document(data)
+        except ValueError as error:
+            raise ValueError(f"{error}: {self.path}") from None
         # V0.1 的存档带 `active_account`（单活动账号的遗物）。读得进来，
         # 但下次写盘就把它丢掉 —— 身份现在由票据传递（D064）。
         data.pop("active_account", None)
         data["schema_version"] = SCHEMA_VERSION
-        accounts = data.setdefault("accounts", {})
-        if not isinstance(accounts, dict):
-            raise ValueError(f"accounts 必须是对象: {self.path}")
+        data.setdefault("accounts", {})
         return data
 
     def _write_unlocked(self, data):
