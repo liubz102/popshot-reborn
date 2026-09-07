@@ -3,7 +3,9 @@
 
    玩家看到的样子（原版 BsPatcherChn/NGM 的交互）：
      客户端被版本门禁拒绝 -> 拉起 game_patched\BsPatcherChn.exe（本程序）->
-     原版风格更新窗口（双进度条「目前/全部」）自动跑：检查 -> 下载 ->
+     原版风格更新窗口（双进度条「目前/全部」）自动跑：检查（manifest 直连
+     5 秒没取到就随机换 config\update.config 里的代理取）-> 测速选源
+     （GitHub 直连 vs 同一份代理列表，speedtest.c）-> 下载 ->
      停本机服务端 -> 覆盖 -> 「更新完成，请重新启动游戏」。用户拍板：
      完成后只提示手动重启（start.bat / start-debug.bat），不自动拉起。
 
@@ -33,6 +35,7 @@
 #include "sha256.h"
 #include "manifest.h"
 #include "net_http.h"
+#include "speedtest.h"
 #include "probe.h"
 #include "procs.h"
 #include "apply.h"
@@ -64,6 +67,7 @@ typedef struct Ctx {
     Args args;
     Ver local;
     int local_valid;
+    ProxyList proxies;            /* config\update.config，worker 开头读一次 */
 } Ctx;
 
 static Ctx g_ctx;
@@ -125,17 +129,72 @@ static int elevate_and_rerun(const wchar_t *zip, const wchar_t *target_version)
 /*  manifest 取用与目标选择（update_client.py fetch/pick 的移植）          */
 /* ------------------------------------------------------------------ */
 
+/* manifest 走代理兜底（用户 2026-09-07 第二条，不测速）：直连 5 秒没取到 →
+   随机挑代理逐个试（每个 5 秒）→ 全败才报「取不到更新清单」走手动下载提示。
+   编排在 speedtest.c: proxy_fetch_fallback()，这里只提供一次取件和界面文字。 */
+
+typedef struct ManifestFetch {
+    char *buf;
+    size_t cap;
+    size_t len;
+} ManifestFetch;
+
+static int manifest_try(void *user, const wchar_t *url, wchar_t *err,
+                        size_t err_cap)
+{
+    ManifestFetch *mf = (ManifestFetch *)user;
+    mf->len = 0;
+    if (net_get_memory(url, mf->buf, mf->cap, &mf->len, MANIFEST_ATTEMPT_MS,
+                       ui_cancel_requested, err, err_cap))
+        return 1;
+    if (wide_ieq(err, L"expired"))
+        _snwprintf(err, err_cap, L"%d 秒内没取到", MANIFEST_ATTEMPT_MS / 1000);
+    err[err_cap - 1] = 0;
+    return 0;
+}
+
+static void manifest_notify(void *user, int attempt, int total, int index)
+{
+    wchar_t text[400];
+    (void)user;
+    if (index < 0) {
+        ui_status(L"正在获取更新清单……");
+        return;
+    }
+    _snwprintf(text, 400,
+               L"正在获取更新清单……直连 GitHub 没取到，正在尝试第 %d/%d 个代理：%ls",
+               attempt - 1, total, g_ctx.proxies.url[index]);
+    text[399] = 0;
+    ui_status(text);
+}
+
 static int fetch_manifest(Manifest *m, wchar_t *err, size_t err_cap)
 {
     const wchar_t *url = g_ctx.args.manifest_url[0]
                              ? g_ctx.args.manifest_url : MANIFEST_URL;
     static char buf[262144];
-    size_t len = 0;
+    ManifestFetch mf;
     wchar_t net_err[256];
+    int picked = -1, attempts = 0;
+    unsigned seed = (unsigned)GetTickCount64() ^ (GetCurrentProcessId() << 16);
 
-    ui_status(L"正在获取更新清单……");
-    if (!net_get_memory(url, buf, sizeof(buf), &len, net_err, 256)) {
-        _snwprintf(err, err_cap, L"取不到更新清单（%ls）", net_err);
+    mf.buf = buf;
+    mf.cap = sizeof(buf);
+    mf.len = 0;
+    if (!proxy_fetch_fallback(L"manifest", url, &g_ctx.proxies, seed,
+                              manifest_try, manifest_notify, &mf,
+                              &picked, &attempts, net_err, 256)) {
+        if (wide_ieq(net_err, L"cancelled")) {
+            _snwprintf(err, err_cap, L"cancelled");
+            return 0;
+        }
+        if (attempts > 1)
+            _snwprintf(err, err_cap,
+                       L"取不到更新清单：GitHub 直连和 %d 个代理都没取到"
+                       L"（最后一次：%ls）", attempts - 1, net_err);
+        else
+            _snwprintf(err, err_cap, L"取不到更新清单（%ls）", net_err);
+        err[err_cap - 1] = 0;
         return 0;
     }
     if (!manifest_parse(buf, m)) {
@@ -197,14 +256,6 @@ static void overall_from(int step_base, int step_end, int frac)
 /*  下载（进度/速度/剩余时间；「目前」=下载字节%、「全部」=全流程）      */
 /* ------------------------------------------------------------------ */
 
-/* 字节数 -> MiB 一位小数的宽串。 */
-static void mib_wide(unsigned long long bytes, wchar_t *out, size_t cap)
-{
-    unsigned long long mib_x10 = bytes * 10 / (1ULL << 20);
-    _snwprintf(out, cap, L"%llu.%llu", mib_x10 / 10, mib_x10 % 10);
-    out[cap - 1] = 0;
-}
-
 static int file_size_is(const wchar_t *path, unsigned long long want)
 {
     WIN32_FILE_ATTRIBUTE_DATA fad;
@@ -257,8 +308,8 @@ static int download_progress(void *user, unsigned long long done,
             unsigned long long speed = done * 1000 / elapsed;   /* B/s */
             unsigned long long eta = (total - done) / (speed ? speed : 1);
             wchar_t got[32], spd[32], remain[128];
-            mib_wide(done, got, 32);
-            mib_wide(speed, spd, 32);
+            mib_to_wide(done, got, 32);
+            mib_to_wide(speed, spd, 32);
             _snwprintf(remain, 128,
                        L"已下载 %ls MiB  %ls MiB/s  剩余约 %llu 秒",
                        got, spd, (unsigned long long)(eta > 99999 ? 99999 : eta));
@@ -269,10 +320,64 @@ static int download_progress(void *user, unsigned long long done,
     return 1;
 }
 
+/* ------------------------------------------------------------------ */
+/*  测速选源（规则和编排在 speedtest.c；这里只提供 WinHTTP 探针和界面文字） */
+/* ------------------------------------------------------------------ */
+
+static void measure_source(void *user, const wchar_t *url, SpeedSample *out)
+{
+    (void)user;
+    memset(out, 0, sizeof(*out));
+    if (!net_probe_speed(url, SPEED_WINDOW_MS, ui_cancel_requested,
+                         &out->bytes, &out->elapsed_ms, out->note, 128))
+        out->cancelled = 1;
+}
+
+static void speed_phase(void *user, int first, int count, int total)
+{
+    wchar_t text[160];
+    (void)user;
+    if (first < 0)
+        _snwprintf(text, 160, L"正在测速：GitHub 直连（%d 秒）",
+                   SPEED_WINDOW_MS / 1000);
+    else
+        _snwprintf(text, 160,
+                   L"正在测速：第 %d~%d 个代理（共 %d 个，每组 %d 秒）",
+                   first + 1, first + count, total, SPEED_WINDOW_MS / 1000);
+    text[159] = 0;
+    ui_remaining(text);
+}
+
+/* 选下载源：直连 or 代理拼前缀。返回 1 = url/label 有效；0 = 玩家取消。 */
+static int choose_download_source(const ReleaseEntry *e, wchar_t *url_out,
+                                  size_t url_cap, wchar_t *label_out,
+                                  size_t label_cap)
+{
+    const ProxyList *proxies = &g_ctx.proxies;   /* worker 开头读过 */
+    SpeedPick pick;
+
+    if (proxies->count > 0)
+        ui_status(L"正在寻找最快的下载源......");
+    if (!speedtest_pick(e->url, proxies, measure_source, speed_phase, NULL,
+                        &pick))
+        return 0;
+    ui_remaining(NULL);
+    if (pick.index < 0) {
+        speed_compose_url(NULL, e->url, url_out, url_cap);
+        _snwprintf(label_out, label_cap, L"直连Github");
+    } else {
+        speed_compose_url(proxies->url[pick.index], e->url, url_out, url_cap);
+        _snwprintf(label_out, label_cap, L"%ls", proxies->url[pick.index]);
+    }
+    label_out[label_cap - 1] = 0;
+    return 1;
+}
+
 static int fetch_zip_cached(const ReleaseEntry *e, wchar_t *zip_out,
                             size_t cap, wchar_t *err, size_t err_cap)
 {
     wchar_t base[MAX_PATH], name[96];
+    wchar_t dl_url[1200];                 /* 代理 256 + 原地址 512 */
     ULONGLONG started;
     DownloadUi du;
 
@@ -299,8 +404,29 @@ static int fetch_zip_cached(const ReleaseEntry *e, wchar_t *zip_out,
         DeleteFileW(zip_out);
     }
 
-    ui_status(L"正在从 Github 下载客户端包（约 400 MB），如果网络不通或速度缓慢，可以从QQ群文件手动下载并更新。");
-    log_line("download %ls", e->url);
+    /* --- 测速选源（用户拍板 2026-09-07）：直连够快就直连，否则挑代理 ---
+       在缓存判定之后：包已经在手就不必测速。 */
+    {
+        wchar_t label[PROXY_URL_CAP];
+        wchar_t text[400];
+        wchar_t size_text[32];
+        if (!choose_download_source(e, dl_url, 1200, label, PROXY_URL_CAP)) {
+            _snwprintf(err, err_cap, L"cancelled");
+            return 0;
+        }
+        if (e->size)
+            u64_to_wide((e->size + (1u << 20) - 1) >> 20, size_text, 32);
+        else
+            wcscpy(size_text, L"400");
+        /* 状态行两行 455px（模板 CurrentTxt 覆盖样式，break-all）：最长的
+           代理地址也放得下。用户要求直连也要写「代理地址：直连Github」。 */
+        _snwprintf(text, 400,
+                   L"正在下载客户端包（约 %ls MB），网络不通或太慢时可从QQ群文件手动下载。"
+                   L"代理地址：%ls", size_text, label);
+        text[399] = 0;
+        ui_status(text);
+    }
+    log_line("download %ls", dl_url);
     started = GetTickCount64();
     du.started = started;
     du.last_percent = -1;
@@ -313,7 +439,7 @@ static int fetch_zip_cached(const ReleaseEntry *e, wchar_t *zip_out,
             _snwprintf(err, err_cap, L"初始化哈希失败");
             return 0;
         }
-        ok = net_download_file(e->url, zip_out,
+        ok = net_download_file(dl_url, zip_out,
                                e->size ? (long long)e->size : -1,
                                &s, download_progress, &du, err, err_cap);
         if (!ok) {
@@ -363,6 +489,11 @@ static DWORD WINAPI worker_main(LPVOID param)
         wchar_t host[256];
         int need_update = 0;
 
+        /* --- 代理列表：manifest 兜底和下载测速共用这一份 ---------------- */
+        cfg_proxy_list(g_ctx.root, &g_ctx.proxies);
+        log_line("proxy list: %d usable, %d lines ignored",
+                 g_ctx.proxies.count, g_ctx.proxies.skipped);
+
         /* --- 探针：问服务器「该升到哪版」 ---------------------------- */
         ui_status(L"正在探测服务器，确认需要的版本……");
         cfg_server_address(g_ctx.root, host, 256);
@@ -386,6 +517,10 @@ static DWORD WINAPI worker_main(LPVOID param)
 
         /* --- manifest 与目标版本 -------------------------------------- */
         if (!fetch_manifest(&manifest, err, 512)) {
+            if (wide_ieq(err, L"cancelled")) {
+                finish_ok(L"已取消更新。可以关闭本窗口。");
+                return 0;
+            }
             finish_fail(err);
             return 1;
         }

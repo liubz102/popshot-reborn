@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <wchar.h>
 #include <string.h>
+#include <stdlib.h>
 #include "net_http.h"
 #include "util.h"
 
@@ -27,24 +28,33 @@
 static const wchar_t *USER_AGENT = L"PopShotUpdater/3.0";
 
 typedef struct Sink {
-    /* 两种形态：内存 or 文件+哈希。 */
+    /* 三种形态：内存 / 文件+哈希 / 丢弃只数字节（测速探针）。 */
     char   *mem;
     size_t  mem_cap;
     size_t  mem_len;
     HANDLE  file;
     Sha256 *hash;
+    int     discard;
     unsigned long long done;
     unsigned long long total;      /* 0 = 服务器没给长度 */
     net_progress_fn progress;
     void *user;
     int cancelled;
+    /* 测速探针专用：deadline（GetTickCount64 绝对值，0 = 不设）一到，
+       看门狗关句柄收工并置 expired；timeout_ms 是各阶段超时（0 = 默认
+       10/10/30/30 秒）；cancel 是不带进度的取消探针。 */
+    ULONGLONG deadline;
+    unsigned timeout_ms;
+    net_cancel_fn cancel;
+    int expired;
 } Sink;
 
 /* 下载期取消节拍（用户拍板 0.5s 内）：WinHttpQueryDataAvailable 会一直
    堵到有数据 —— 慢链路/断流时取消没机会被检查。试过把接收超时压到
    0.5s，但 >0.5s 的正常到货间隙会把请求毒化（ReadData 回 12019），
    慢速真下载直接报错 —— 弃。改为看门狗线程：每 200ms 查一次取消，
-   发现取消就主动 Close 请求句柄，把阻塞中的读解锁（<=0.5s 生效）。 */
+   发现取消就主动 Close 请求句柄，把阻塞中的读解锁（<=0.5s 生效）。
+   测速探针复用同一条狗：到 deadline 那一毫秒同样关句柄收工。 */
 typedef struct NetWatch {
     HANDLE thread;
     HANDLE stop;                  /* net_fetch 收尾时叫停看门狗 */
@@ -53,19 +63,35 @@ typedef struct NetWatch {
     volatile LONG req_closed;     /* 1 = 句柄已被看门狗关掉，主人别再关 */
 } NetWatch;
 
+static void net_watch_cut(NetWatch *w)
+{
+    InterlockedExchange(&w->req_closed, 1);
+    WinHttpCloseHandle(w->req);       /* 撬开阻塞中的读 */
+}
+
 static DWORD WINAPI net_watch_dog(LPVOID param)
 {
     NetWatch *w = (NetWatch *)param;
-    while (WaitForSingleObject(w->stop, 200) == WAIT_TIMEOUT) {
-        if (w->sink->progress &&
-            !w->sink->progress(w->sink->user, w->sink->done, w->sink->total)) {
-            w->sink->cancelled = 1;
-            InterlockedExchange(&w->req_closed, 1);
-            WinHttpCloseHandle(w->req);   /* 撬开阻塞中的读 */
+    Sink *s = w->sink;
+    for (;;) {
+        DWORD wait = 200;
+        if (s->deadline) {
+            ULONGLONG now = GetTickCount64();
+            if (now >= s->deadline) {
+                s->expired = 1;
+                net_watch_cut(w);
+                return 0;
+            }
+            if (s->deadline - now < wait) wait = (DWORD)(s->deadline - now);
+        }
+        if (WaitForSingleObject(w->stop, wait) != WAIT_TIMEOUT) return 0;
+        if ((s->progress && !s->progress(s->user, s->done, s->total)) ||
+            (s->cancel && s->cancel())) {
+            s->cancelled = 1;
+            net_watch_cut(w);
             return 0;
         }
     }
-    return 0;
 }
 
 static int sink_open_mem(Sink *s, char *buf, size_t cap)
@@ -90,7 +116,9 @@ static int sink_open_file(Sink *s, const wchar_t *dest, Sha256 *hash,
 
 static int sink_write(Sink *s, const void *data, DWORD len)
 {
-    if (s->mem) {
+    if (s->discard) {
+        /* 测速探针：只数字节，什么都不存。 */
+    } else if (s->mem) {
         if (s->mem_len + len > s->mem_cap) return 0;
         memcpy(s->mem + s->mem_len, data, len);
         s->mem_len += len;
@@ -118,6 +146,20 @@ static void set_err(wchar_t *err_out, size_t err_cap, const wchar_t *fmt, ...)
     }
 }
 
+/* 读循环里的失败：先分清是不是看门狗动的手（取消 / 到点），再当真错误。
+   ★ 紧跟失败的那个 WinHttp 调用之后调，中间别插别的 Win32 调用
+   （GetLastError 要还是它的）。 */
+static void read_failed(const Sink *s, wchar_t *err_out, size_t err_cap,
+                        const wchar_t *what)
+{
+    DWORD code = GetLastError();
+    if (s->cancelled)     set_err(err_out, err_cap, L"cancelled");
+    else if (s->expired)  set_err(err_out, err_cap, L"expired");
+    else                  set_err(err_out, err_cap, L"%ls (%lu)", what, code);
+}
+
+#define READ_CHUNK (1 << 20)
+
 /* 公共下载管线：把 url 的内容整段读进 sink。
    total_out 拿服务器给的 Content-Length（0=没给）。 */
 static int net_fetch(const wchar_t *url, Sink *s, unsigned long long *total_out,
@@ -133,6 +175,8 @@ static int net_fetch(const wchar_t *url, Sink *s, unsigned long long *total_out,
     DWORD status = 0, status_size = sizeof(status);
     unsigned long long total = 0;
     int result = 0;
+    unsigned char *buf = NULL;       /* ★ 每次调用自己的读缓冲：几路测速探针
+                                        并行跑，共用 static 缓冲会互相踩 */
 
     memset(&watch, 0, sizeof(watch));
 
@@ -153,7 +197,11 @@ static int net_fetch(const wchar_t *url, Sink *s, unsigned long long *total_out,
         set_err(err_out, err_cap, L"WinHttpOpen 失败 (%lu)", GetLastError());
         return 0;
     }
-    WinHttpSetTimeouts(hnet, 10000, 10000, 30000, 30000);
+    if (s->timeout_ms)
+        WinHttpSetTimeouts(hnet, (int)s->timeout_ms, (int)s->timeout_ms,
+                           (int)s->timeout_ms, (int)s->timeout_ms);
+    else
+        WinHttpSetTimeouts(hnet, 10000, 10000, 30000, 30000);
 
     hconn = WinHttpConnect(hnet, host,
                            (INTERNET_PORT)uc.nPort, 0);
@@ -208,9 +256,9 @@ static int net_fetch(const wchar_t *url, Sink *s, unsigned long long *total_out,
     if (s->progress && total)
         s->progress(s->user, 0, total);       /* 先报一次总量，UI 能算百分比 */
 
-    /* 看门狗只陪「带进度回调的下载」（= 大文件、可取消）；manifest 这类
-       小取（progress == NULL）用不着。 */
-    if (s->progress) {
+    /* 看门狗陪「带进度回调的下载」（= 大文件、可取消）和测速探针
+       （有 deadline / cancel）；manifest 这类小取用不着。 */
+    if (s->progress || s->deadline || s->cancel) {
         watch.stop = CreateEventW(NULL, FALSE, FALSE, NULL);
         if (watch.stop) {
             watch.req = hreq;
@@ -220,25 +268,21 @@ static int net_fetch(const wchar_t *url, Sink *s, unsigned long long *total_out,
         }
     }
 
+    buf = (unsigned char *)malloc(READ_CHUNK);
+    if (!buf) {
+        set_err(err_out, err_cap, L"内存不足");
+        goto done;
+    }
     for (;;) {
         DWORD got = 0;
-        static unsigned char buf[1 << 20];
         if (!WinHttpQueryDataAvailable(hreq, &got)) {
-            if (s->cancelled) {
-                set_err(err_out, err_cap, L"cancelled");
-                goto done;
-            }
-            set_err(err_out, err_cap, L"读取数据失败 (%lu)", GetLastError());
+            read_failed(s, err_out, err_cap, L"读取数据失败");
             goto done;
         }
         if (!got) break;                      /* 流结束 */
-        if (got > sizeof(buf)) got = sizeof(buf);
+        if (got > READ_CHUNK) got = READ_CHUNK;
         if (!WinHttpReadData(hreq, buf, got, &got)) {
-            if (s->cancelled) {
-                set_err(err_out, err_cap, L"cancelled");
-                goto done;
-            }
-            set_err(err_out, err_cap, L"读取数据失败 (%lu)", GetLastError());
+            read_failed(s, err_out, err_cap, L"读取数据失败");
             goto done;
         }
         if (!got) break;
@@ -249,8 +293,8 @@ static int net_fetch(const wchar_t *url, Sink *s, unsigned long long *total_out,
                 set_err(err_out, err_cap, L"写入本地文件失败（磁盘满？）");
             goto done;
         }
-        if (s->cancelled) {
-            set_err(err_out, err_cap, L"cancelled");
+        if (s->cancelled || s->expired) {
+            set_err(err_out, err_cap, s->cancelled ? L"cancelled" : L"expired");
             goto done;
         }
     }
@@ -268,16 +312,23 @@ done:
     if (hreq && !watch.req_closed) WinHttpCloseHandle(hreq);
     if (hconn) WinHttpCloseHandle(hconn);
     if (hnet) WinHttpCloseHandle(hnet);
+    free(buf);
     return result;
 }
 
 int net_get_memory(const wchar_t *url, char *buf, size_t cap, size_t *out_len,
+                   unsigned window_ms, net_cancel_fn cancel,
                    wchar_t *err_out, size_t err_cap)
 {
     Sink s;
     unsigned long long total;
     int ok;
     sink_open_mem(&s, buf, cap);
+    if (window_ms) {
+        s.timeout_ms = window_ms;
+        s.deadline = GetTickCount64() + window_ms;   /* 窗口含建连 */
+    }
+    s.cancel = cancel;
     ok = net_fetch(url, &s, &total, err_out, err_cap);
     if (!ok) return 0;
     if (s.mem_len + 1 > cap) {
@@ -321,4 +372,34 @@ int net_download_file(const wchar_t *url, const wchar_t *dest,
         return 0;
     }
     return 1;
+}
+
+int net_probe_speed(const wchar_t *url, unsigned window_ms, net_cancel_fn cancel,
+                    unsigned long long *bytes_out, unsigned *elapsed_out,
+                    wchar_t *note_out, size_t note_cap)
+{
+    Sink s;
+    unsigned long long total = 0;
+    wchar_t reason[256];
+    ULONGLONG start = GetTickCount64();
+    ULONGLONG elapsed;
+    int ok;
+
+    memset(&s, 0, sizeof(s));
+    s.discard = 1;
+    s.timeout_ms = window_ms;
+    s.deadline = start + window_ms;      /* 窗口从建连前就开始算 */
+    s.cancel = cancel;
+    reason[0] = 0;
+    ok = net_fetch(url, &s, &total, reason, 256);
+    elapsed = GetTickCount64() - start;
+    if (elapsed > window_ms) elapsed = window_ms;   /* 到点关句柄那几毫秒不算 */
+    if (!elapsed) elapsed = 1;
+    *bytes_out = s.done;
+    *elapsed_out = (unsigned)elapsed;
+    if (note_out && note_cap) {
+        if (ok) set_err(note_out, note_cap, L"complete");
+        else    set_err(note_out, note_cap, L"%ls", reason);
+    }
+    return s.cancelled ? 0 : 1;
 }

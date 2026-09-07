@@ -299,6 +299,13 @@ python tools/gs_ctl.py help
   - 2. 从 GitHub Release 取 `manifest.json`（`releases/latest/download/manifest.json`
    固定地址，含全部历史版本的 sha256/大小/下载地址），WinHTTP 下载全量 zip
    边下边校验（若找不到「服务器要求的版本」则下载最新版本）。
+  -  **下载前先测速选源**：先单独测 GitHub 直连 5 秒，速度超过 1 MB/s 就直连；
+   否则把 `config/update.config` 里的代理每 4 个一组并行测速（每个 5 秒），一组里
+   有达标的就选组内最快的，全部不达标就用所有来源里相对最快的。选中的代理直接
+   拼在 GitHub 网址前面（`https://gh-proxy.com/https://github.com/…`），界面底部
+   显示「代理地址：直连Github」或代理网址。代理列表可以手动增删；文件不存在或
+   为空时只用直连。第 2 步的 `manifest.json` 也用这份列表兜底但不测速：直连 5 秒
+   没取到就随机挑一个代理试，5 秒不成再随机换一个，全都不成才提示手动下载。
   - 3. 等游戏进程退出，自动停掉本机服务端/中继（按「exe 路径 = 本包 runtime」
    精确匹配，解除文件占用），解压覆盖（`config/server.config`、`UserConfig.ini`、账号、
    日志等玩家数据**永不覆盖**）。

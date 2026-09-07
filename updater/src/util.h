@@ -57,6 +57,8 @@ void file_url_from_path(const wchar_t *path, wchar_t *out, size_t cap);
 int  base64_encode(const unsigned char *src, size_t len, char *dst, size_t cap);
 /* 64 位整数 -> 十进制宽串。 */
 void u64_to_wide(unsigned long long v, wchar_t *out, size_t cap);
+/* 字节数 -> MiB 一位小数的宽串（"123.4"），界面/日志的速度、大小都用它。 */
+void mib_to_wide(unsigned long long bytes, wchar_t *out, size_t cap);
 /* 时间格式 "YYYY-MM-DD HH:MM:SS"。 */
 void now_stamp(wchar_t *out, size_t cap);
 

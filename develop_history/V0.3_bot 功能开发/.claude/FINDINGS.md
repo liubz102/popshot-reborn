@@ -9690,3 +9690,47 @@ BSM1 的 `Character::Dash` 守卫只还原调用那一刻的运动状态；冲�
 几帧由动作系统推的，没拦。服务端 `_advance_dash()` 只结算伤害，身体不跟着冲，
 连走位都没锁。⇒ 下一轮：服务端把身体沿冲刺动作推、冲刺期间锁走位 / 起跳
 （每帧位移要从客户端动作数据逆，`0x5020d9` 起）。
+
+---
+
+## §194 ★★ 更新器测速选源（D152）：两个并行坑 + 真网 / 真代理的实测数字
+
+**结论**：`<代理>/<GitHub 完整地址>` 这个拼法在传输层没有障碍；六个初始代理里
+四个当场可用、两个回错误码（会被当 0 B 自然淘汰）；开发机 GitHub 直连 27.6 MiB/s，
+代理那条路在真网上**没被触发**，只在本地假代理上端到端验过。
+
+* **坑 1**：`net_http.c: net_fetch()` 原来的读缓冲是**进程级 `static` 1 MB**。单路下载
+  没事，4 路并行探针会互相踩。已改成每次调用自己 `malloc(READ_CHUNK)`。
+* **坑 2**：`log.c: log_vline()` 每行 `CreateFileW(GENERIC_WRITE, FILE_SHARE_READ)`
+  开一次文件 —— 两个线程同时写，后开的那个 sharing violation，那一行**静默丢掉**。
+  所以探针线程不写日志，结束原因带回 `SpeedSample.note` 由编排线程落盘。
+* WinHTTP 把 `/fast/http://127.0.0.1:8126/update-a.zip` 这种嵌着 `http://` 的路径
+  **原样**发出去（e2e 服务器收到的 `self.path` 就是它）。
+* 到点看门狗的精度：256 KB/s 限速下直连探针收到 **1,310,720 B / 5000 ms**，
+  正好 5 × 256 KB；断流代理正好 65,536 B（服务器只发了这么多）；`http://127.0.0.1:1`
+  0 B（连不上）。
+* 真网（开发机，2026-09-07 08:48，`--noui` 跑到下载开始就杀）：GitHub 直连 5 秒收
+  144,830,611 B = **27.6 MiB/s**（302 → objects.githubusercontent.com 由 WinHTTP 自动跟）
+  → 直接达标，代理一个没测。
+* 六个初始代理对同一地址的响应（curl，同一时刻，`--limit-rate 2M` 采 6 秒；
+  更新器要求状态码 200，非 200 = 0 B）：
+
+  | 代理 | 状态 | 备注 |
+  |---|---|---|
+  | `https://cdn.gh-proxy.com` | 200 | 302 到 `cdn.gh-proxy.org/https:/github.com/…`（`//` 被它收成 `/`，照样出数据） |
+  | `https://github-proxy.memory-echoes.cn` | **429** | 限流拒绝 |
+  | `https://githubdog.com` | 200 | |
+  | `https://cdn.akaere.online` | **403** | 拒绝 |
+  | `https://tvv.tw` | 200 | |
+  | `https://gh-proxy.com` | 200 | |
+
+  这只是一个时刻的快照，代理站点常换 —— 所以列表放 `config/update.config` 且更新会
+  刷新它（D152-6）。
+* 同一批代理中转 **manifest**（`releases/latest/download/manifest.json`，GitHub 先
+  302 再给文件，682 B）的快照（curl，2026-09-07 09:0x）：`gh-proxy.com` /
+  `githubdog.com` / `cdn.gh-proxy.com` 200，**`tvv.tw` 回 502** —— 它几分钟前中转
+  zip 还是 200。同一个代理对不同文件、不同时刻的可用性都在变，这就是 manifest 兜底
+  要「随机挑、不成就换下一个」而不是固定顺序的理由（D152-7）。
+* e2e 场景 C：直连 manifest 有头没身挂住，`net_get_memory` 的 5 秒 deadline 准点
+  触发（日志 `manifest direct: failed (5 秒内没取到)`），换代理取到后整条更新
+  5.2 秒跑完。

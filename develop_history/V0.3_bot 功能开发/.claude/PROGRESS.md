@@ -2,9 +2,48 @@
 
 **只保留当前状态。** 做完的事从「正在做」挪走，不留历史；流水账进 `sessions/`。
 
-最后更新：2026-09-07（会话 69：三局逐帧数据证实 D149 / D150 生效（§192），
+最后更新：2026-09-07（会话 70：更新器加「测速选源」+ 代理列表，见下一节；
+会话 69：三局逐帧数据证实 D149 / D150 生效（§192），
 剩下的「头嵌进顶里一卡一卡」= 服务端脚点 vs 收方三圆 —— 服务端空中碰撞已改成
 三圆扫掠（D151）；**等实机验证**。下一个已量出来的残余是 bot 冲刺（§193））。
+
+## ★ 会话 70（2026-09-07）：更新器「测速选源」+ `config/update.config`（D152 / §194）
+
+用户要求：GitHub 国内直连太慢，更新器下载前先测速 —— 直连 > 1 MB/s 就直连，否则
+代理每 4 个一组并行测（每个 5 秒），一组里有达标的取最快、后面不再测，全不达标取
+相对最快；代理直接拼在 GitHub 网址前面；界面显示「代理地址：直连Github / 代理网址」。
+第二条（同日）：manifest 也走代理但不测速 —— 直连 5 秒没取到就随机挑代理试、每个 5 秒、
+全败才走原来的手动下载提示。
+
+已做（**工作区未提交**，用户自己 commit）：
+
+- 新 `updater/src/speedtest.{h,c}`：编排（测速函数注入）；`net_http.c` 加
+  `net_probe_speed()`（到点看门狗 + 只数字节的 sink；读缓冲改成每次调用自己 malloc，
+  原来的 static 并行会踩）；`config.c` 解析 `config/update.config`；`main.c` 在缓存
+  判定之后接选源，下载状态行末尾带「代理地址：…」；`build.bat` 加了 speedtest.c
+  并转成 CRLF；`game_patched/BsPatcherChn.exe` 已重编。
+- 新 `config/update.config`（六个初始代理，进 git、进客户端包：`build-portable.ps1`
+  已加拷贝 + 自检；`.gitignore` 加了显式 `!`）。**不进**更新器保护清单（D152-6）。
+- manifest 兜底：`speedtest.c: proxy_fetch_fallback()`（直连 → 随机顺序逐个试代理、
+  每个一次 → 全败），`net_get_memory()` 加 window / cancel 两个参数（5 秒到点 =
+  `expired`），`main.c: fetch_manifest()` 改走它；代理列表 worker 开头读一次进
+  `g_ctx.proxies`。顺带 manifest 阶段从此可取消。
+- 测试：selftest 80 项全绿（+35）；新 `updater/scripts/test_proxy_e2e.py` 三个场景全过
+  （A 选中快代理 / B 全不达标退回直连 / C manifest 直连挂住 5 秒后换代理取到）；
+  原 `test_e2e.py` 照旧过。真网跑了一次测速阶段：本机 GitHub 直连 27.6 MiB/s 直接
+  达标，代理没被触发（§194）。
+- README「自动更新」一节加了 2½ 步。
+
+### ⏳ 待用户验证（真机、真代理 —— 开发机直连太快，代理那条路只在本地假代理上验过）
+
+1. 拿 `dist` 的客户端包拷一份到别处，把那份的 `BUILD.ver` 改成 `V0.2.7`，双击
+   `game_patched\BsPatcherChn.exe`。期望：状态行先出「正在寻找最快的下载源......」，
+   下面小字轮流报「正在测速：GitHub 直连（5 秒）」→「正在测速：第 1~4 个代理…」，
+   然后进下载，状态行末尾「代理地址：直连Github」或代理网址。下载开始后点「取消」
+   即可，不用下完。
+2. 把 `logs\updater.log` 里的 `speedtest` 行发回来（每个来源一行：字节 / 毫秒 /
+   MiB/s / 结束原因，最后一行 `speedtest pick:`）。
+3. 网速本来就 > 1 MB/s 的机器上代理不会被测；要看代理那条路得在慢网（或限速）下跑。
 
 ## 当前状态：空中碰撞形状已对齐收方，等一局实机
 

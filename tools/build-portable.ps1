@@ -101,7 +101,7 @@ try {
     Write-Host ''
 
     # --- 1. 根目录的脚本和配置 ---------------------------------------------
-    Write-Host '  [1/6] 启停脚本 + server.config'
+    Write-Host '  [1/6] 启停脚本 + config\（server.config / update.config）'
     foreach ($file in @('start.bat', 'start-debug.bat', 'stop.bat')) {
         Copy-TextFile -Source (Join-Path $Root $file) -Target (Join-Path $OutputDirectory $file) -Kind 'bat'
         Test-AsciiOnly (Join-Path $OutputDirectory $file)
@@ -126,6 +126,13 @@ try {
             throw '生成 server.config 失败（server\config.py 的模板出问题了？）'
         }
     }
+
+    # update.config：自动更新的下载加速代理列表（更新器 BsPatcherChn.exe 读包根
+    # config\update.config，先测速再选直连还是代理）。进 git、进包；玩家能手改，
+    # 但**不在**更新器的保护清单里 —— 代理站点常换，新版本带来的新列表比留住
+    # 玩家的手改更值（V0.3 D152）。仓库里没有就是 checkout 坏了，直接 throw。
+    Copy-TextFile -Source (Join-Path $Root 'config\update.config') `
+                  -Target (Join-Path $OutputDirectory 'config\update.config') -Kind 'unix'
 
     # --- 2. 运行时 / 注入件 / 探针 ------------------------------------------
     Write-Host '  [2/6] runtime + runtime-win7 + hook\bin + tools'
@@ -201,7 +208,7 @@ try {
             '版本过旧被服务器拒绝时会自动更新：game_patched\BsPatcherChn.exe 是自研更新器（updater\src，原版风格界面，全逻辑进 exe）。'
         )
     foreach ($must in @('BUILD.ver', 'config\server.config',
-                        'config\server-ClientFilter.config')) {
+                        'config\server-ClientFilter.config', 'config\update.config')) {
         if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory $must) -PathType Leaf)) {
             throw "自检失败：$must 没写进包根"
         }

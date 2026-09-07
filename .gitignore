@@ -167,6 +167,10 @@ env/
 !/tools/build-ver.config
 !/config/server-ClientFilter.config
 
+# 自动更新的下载加速代理列表（V0.3 D152）：打进客户端包，更新器
+# game_patched\BsPatcherChn.exe 测速时读它。同上，显式 ! 防宽泛规则误伤。
+!/config/update.config
+
 # 打包时的版本号，由打包脚本根据 /tools/build-ver.config 自动生成，不需要上传git
 /BUILD.ver
 
