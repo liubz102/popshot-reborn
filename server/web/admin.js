@@ -561,6 +561,8 @@ function fieldNode(spec, entry, onChange) {
   }
   var wrap = el("div", "field" + (spec.unknown ? " unknown" : "")
                        + (spec.type === "text" ? " wide" : ""));
+  // 哪个字段：掉落行要按它找到「模式 / 关卡 / 难度」那三个下拉（`dropRow`）。
+  wrap.setAttribute("data-key", spec.key);
   var lab = el("span", "lab", spec.label || spec.key);
   if (spec.help) { lab.title = spec.help; }
   wrap.appendChild(lab);
@@ -1146,8 +1148,36 @@ function renderToolbar(which) {
         return {value: k, label: CAT.characters[k]}; })));
   }
   if (which === "drops") {
-    bar.appendChild(selectFilter(filter, "mode", "全部模式",
-      [{value: "quest", label: "闯关"}, {value: "pvp", label: "对战"}]));
+    var modeSelect = selectFilter(filter, "mode", "全部模式",
+      [{value: "quest", label: "闯关"}, {value: "pvp", label: "对战"}]);
+    bar.appendChild(modeSelect);
+    // ★ 关卡 / 难度两个筛选（用户 2026-09-07）。选项照规则行上那两个下拉
+    //   （`SCHEMA.drops`，一个出处），前面多一项「不限」= 只看没指定关卡 /
+    //   难度的规则。对战没有关卡和难度（`PVP_LOCKED_KEYS`）⇒ 模式筛成「对战」
+    //   时这两个下拉清空并锁住，和规则行上的表现一致。
+    var scoped = PVP_LOCKED_KEYS.map(function (key) {
+      var spec = dropSpec(key);
+      var options = [{value: "none", label: spec.empty_label || "不限"}];
+      (spec.options || []).forEach(function (option) { options.push(option); });
+      var select = selectFilter(filter, key, "全部" + (spec.label || key), options);
+      bar.appendChild(select);
+      return select;
+    });
+    var lockForPvp = function () {
+      var pvp = filter.mode === "pvp";
+      scoped.forEach(function (select, at) {
+        if (pvp) { filter[PVP_LOCKED_KEYS[at]] = ""; select.value = ""; }
+        select.disabled = pvp;
+        select.title = pvp ? "对战没有关卡和难度" : "";
+      });
+    };
+    // `selectFilter` 自己的 onchange 先跑（写 `filter.mode` + 重画），这一发
+    // 排在它后面：清掉两个子筛选再重画一次。
+    modeSelect.addEventListener("change", function () {
+      lockForPvp();
+      repaintList();
+    });
+    lockForPvp();
   }
   if (which === "shop" || which === "recipe") {
     var only = el("label", "toggle" + (filter.listedOnly ? " on" : ""));
@@ -1196,7 +1226,26 @@ function selectFilter(filter, key, allLabel, options) {
 
 /** 一份空的筛选条件。★ 加字段时只改这一处 —— 页面上有三个地方要「清筛选」。 */
 function emptyFilter() {
-  return {q: "", kind: "", character: "", listedOnly: false, page: 0};
+  return {q: "", kind: "", character: "", listedOnly: false,
+          mode: "", stage: "", difficulty: "", page: 0};
+}
+
+/** `SCHEMA.drops` 里某个字段的描述（下拉选项从这儿取，不另抄一份）。 */
+function dropSpec(key) {
+  var found = null;
+  (CAT.schema.drops.fields || []).forEach(function (spec) {
+    if (spec.key === key) { found = spec; }
+  });
+  return found || {key: key};
+}
+
+/** 掉落页的关卡 / 难度筛选：`""` = 不筛；`"none"` = 只看没指定的
+ *  （规则行上显示「不限」）；其余 = 号码相等。 */
+function dropFieldMatches(value, wanted) {
+  if (!wanted) { return true; }
+  var unset = (value === undefined || value === null || value === "");
+  if (wanted === "none") { return unset; }
+  return !unset && String(value) === wanted;
 }
 
 function uniq(values) {
@@ -1262,6 +1311,10 @@ function matches(which, entry) {
         && where !== filter.listing) { return false; }
   }
   if (filter.mode && (entry.mode || "quest") !== filter.mode) { return false; }
+  if (which === "drops") {
+    if (!dropFieldMatches(entry.stage, filter.stage)) { return false; }
+    if (!dropFieldMatches(entry.difficulty, filter.difficulty)) { return false; }
+  }
   var itemId = entryItemId(which, entry);
   var item = BYID[itemId];
   if (filter.kind && entry.kind !== filter.kind
@@ -1360,12 +1413,10 @@ function pageRows(which) {
   var label = $("cfgShown");
   if (label) {
     var total = CFG[which].entries.length;
-    var parts = [];
-    if (all.length !== total) {
-      parts.push("筛出 " + all.length + " / " + total);
-    }
-    if (pages > 1) { parts.push("第 " + (page + 1) + " / " + pages + " 页"); }
-    label.textContent = parts.join("　");
+    // ★ 只写「筛出 x / y」。页码**只在换页栏上写一次**（用户 2026-09-07：
+    //   筛选条和换页栏各写一遍「第 m / n 页」是重复的）。
+    label.textContent = (all.length !== total)
+      ? ("筛出 " + all.length + " / " + total) : "";
   }
   return {rows: all.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE),
           pages: pages, page: page, total: all.length};
@@ -1661,35 +1712,66 @@ function materialSlots(entry, card) {
 /* -------------------------------------------------- 材料掉落：规则行 */
 function renderDrops(list, rows) {
   rows.forEach(function (line) {
-    var entry = line.entry, index = line.index;
-    var row = el("div", "rule-row");
-    row.setAttribute("data-index", index);
-    row.appendChild(killButton("drops", index));
-
-    var who = el("div", "who");
-    var slot = slotNode(entry.material, 36, true, true);
-    slot.onclick = function () {
-      openPicker({kinds: ["material"], selected: entry.material,
-        onPick: function (item) { adoptItem(entry, "material", item);
-                                  repaintList(); }});
-    };
-    who.appendChild(slot);
-    // ★ 同上：名字只认物品库那一份（D31）。
-    who.appendChild(el("div", "nmz", itemName(entry.material)));
-
-    var placed = false;
-    restFields("drops", entry, ["material"], touched).forEach(function (node) {
-      // 材料格子插在「难度」后面，和原来 json 里的字段顺序一致。
-      row.appendChild(node);
-      if (!placed && node.querySelector
-          && node.firstChild && node.firstChild.textContent === "难度") {
-        row.appendChild(who);
-        placed = true;
-      }
-    });
-    if (!placed) { row.appendChild(who); }
-    list.appendChild(row);
+    list.appendChild(dropRow(line.entry, line.index));
   });
+}
+
+//: 对战局结算时是拿 `quest_id=0, difficulty=0` 去匹配规则的
+//  （`gameserver.quest_materials` 的调用点）—— 一条对战规则只要写了关卡
+//  或难度就**永远不掉**。所以模式选成「对战」时这两栏自动清成「不限」并
+//  锁住（用户 2026-09-07）。筛选条上的那两个下拉也照这张表锁。
+var PVP_LOCKED_KEYS = ["stage", "difficulty"];
+
+/** 一条掉落规则那一行。改「模式」时整行重画一遍 —— 关卡 / 难度锁不锁
+ *  只在这一处决定，别在别处再写一份。 */
+function dropRow(entry, index) {
+  var row = el("div", "rule-row");
+  row.setAttribute("data-index", index);
+  row.appendChild(killButton("drops", index));
+
+  var who = el("div", "who");
+  var slot = slotNode(entry.material, 36, true, true);
+  slot.onclick = function () {
+    openPicker({kinds: ["material"], selected: entry.material,
+      onPick: function (item) { adoptItem(entry, "material", item);
+                                repaintList(); }});
+  };
+  who.appendChild(slot);
+  // ★ 同上：名字只认物品库那一份（D31）。
+  who.appendChild(el("div", "nmz", itemName(entry.material)));
+
+  var pvp = entry.mode === "pvp";
+  var placed = false;
+  restFields("drops", entry, ["material"], touched).forEach(function (node) {
+    var key = node.getAttribute("data-key");
+    var select = node.querySelector ? node.querySelector("select") : null;
+    if (key === "mode" && select) {
+      // `choiceNode` 自己的 onchange 先跑（写 `entry.mode`），这一发排在它
+      // 后面：切成对战就把关卡 / 难度删掉，然后整行按新模式重画。
+      select.addEventListener("change", function () {
+        if (entry.mode === "pvp") {
+          PVP_LOCKED_KEYS.forEach(function (locked) { delete entry[locked]; });
+        }
+        row.parentNode.replaceChild(dropRow(entry, index), row);
+        touched();
+      });
+    }
+    if (pvp && select && PVP_LOCKED_KEYS.indexOf(key) >= 0) {
+      // ★ 只锁不改：磁盘上要是有一条手改出来的「对战 + 关卡 3」，这儿照实
+      //   显示那个 3（锁着）—— 渲染时悄悄删掉它会让页面一打开就「有未保存
+      //   的修改」。切一次模式它就清掉了。
+      select.disabled = true;
+      select.title = "对战没有关卡和难度 —— 模式改成「闯关」才能选";
+    }
+    // 材料格子插在「难度」后面，和原来 json 里的字段顺序一致。
+    row.appendChild(node);
+    if (!placed && key === "difficulty") {
+      row.appendChild(who);
+      placed = true;
+    }
+  });
+  if (!placed) { row.appendChild(who); }
+  return row;
 }
 
 /* ======================================================================
@@ -1859,10 +1941,9 @@ function paintPicker() {
     grid.appendChild(cell);
   });
   paintPickPager($("pickPagerTop"), pages);
-  $("pickCount").textContent = pages > 1
-    ? ("共 " + hits.length + " 件 · 第 " + (PICKER.page + 1) + " / "
-       + pages + " 页")
-    : (hits.length + " 件");
+  // 标题栏只写件数，页码归换页栏（用户 2026-09-07，和配置页一个口径：
+  // 「第 m / n 页」只写一处）。
+  $("pickCount").textContent = hits.length + " 件";
   paintPickFoot();
 }
 
@@ -2268,8 +2349,11 @@ async function searchPlayers(page) {
   if (page === undefined) { page = (q === PLAYER_PAGE.q) ? PLAYER_PAGE.page : 0; }
   var result = await api("/admin/api/players?q=" + encodeURIComponent(q)
                          + "&page=" + page);
-  if (bounced(result) || !result.ok) {
-    say($("playerMsg"), (result && result.message) || "查找失败", false);
+  if (bounced(result)) { return false; }
+  if (!result.ok) {
+    // 回执走右上角浮条（D39）：列表下面那条 `.msg` 2026-09-07 拿掉了 ——
+    // 这一页改成「只有列表滚」的壳之后，列表下面什么都不放。
+    toast((result && result.message) || "查找失败", false);
     return false;
   }
   PLAYER_LIST = result.players;
@@ -2277,7 +2361,6 @@ async function searchPlayers(page) {
                  total: result.total, size: result.size, q: q};
   renderPlayerRows();
   $("playerCount").textContent = result.total + " 个账号";
-  say($("playerMsg"), "");
   return true;
 }
 
@@ -2374,7 +2457,7 @@ async function promoteToAdmin(username) {
   if (!go) { return; }
   var result = await api("/admin/api/admins/from_player", {name: username});
   if (bounced(result)) { return; }
-  say($("playerMsg"), result.message, result.ok);
+  toast(result.message, result.ok);
   if (!result.ok) { return; }
   if (result.admins) { renderAdmins(result.admins); }
   // 那一格要变成「已是管理员」—— 停在当前页重查一次。
@@ -2410,8 +2493,9 @@ async function openPlayer(username, force) {
     return;
   }
   var result = await api("/admin/api/player?name=" + encodeURIComponent(username));
-  if (bounced(result) || !result.ok) {
-    say($("playerMsg"), (result && result.message) || "读不到这个账号", false);
+  if (bounced(result)) { return false; }
+  if (!result.ok) {
+    toast((result && result.message) || "读不到这个账号", false);
     return false;
   }
   adoptPlayer(result.player);
@@ -2428,7 +2512,6 @@ function adoptPlayer(view) {
   var tab = (PLAYER && PLAYER.view.username === view.username)
     ? PLAYER.tab : {big: -1, sub: null};
   PLAYER = {view: view, edit: edit, tab: tab};
-  say($("playerMsg"), "");
   renderPlayer();
   renderPlayerRows();
 }
@@ -2876,9 +2959,11 @@ function switchTab(tab) {
     button.classList.toggle("on", button.getAttribute("data-tab") === tab);
   });
   var isConfig = CONFIGS.indexOf(tab) >= 0;
-  // ★ 四个配置页和数据备份页是「面板撑满、列表自己滚」（D39）；玩家资料 /
-  //   管理员账号是普通长页面，整块跟着 `main` 滚。
-  $("mainArea").classList.toggle("fit", isConfig || tab === "backup");
+  // ★ 四个配置页、数据备份页和玩家资料页是「面板撑满、列表自己滚」（D39；
+  //   玩家资料页 2026-09-07 加进来）；管理员账号是普通长页面，整块跟着
+  //   `main` 滚。
+  $("mainArea").classList.toggle("fit",
+                                 isConfig || tab === "backup" || tab === "players");
   $("cfgPanel").classList.toggle("hidden", !isConfig);
   $("adminsPanel").classList.toggle("hidden", tab !== "admins");
   $("playersPanel").classList.toggle("hidden", tab !== "players");

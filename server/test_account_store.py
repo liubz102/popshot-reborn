@@ -525,6 +525,85 @@ class AccountStoreTests(unittest.TestCase):
             self.store.import_account(payload)
         self.assertEqual("password_required", ctx.exception.code)
 
+    # -- V0.3 商店：仓库 / 穿着 / 材料三件套也要跟着存档走 --------------------
+    def test_export_carries_the_item_fields_and_they_land_on_the_other_server(self):
+        # 这三个字段是 V0.3 商店加的（D5）。导出要带上、导到另一台原样落地
+        # —— 管理页和游戏里看到的仓库就是它们。
+        self.store.register("alice", "pw")
+        self.store.add_item("alice", REVOLVER_R1)
+        self.store.set_equipped("alice", [REVOLVER_R1])
+        self.store.add_materials("alice", {BRONZE_PIPE: 3})
+        payload = self.store.export_account("alice")
+        exported = payload["account"]
+        self.assertEqual({str(REVOLVER_R1): {"count": 1, "expires": None}},
+                         exported["inventory"])
+        self.assertEqual([REVOLVER_R1], exported["equipped"])
+        self.assertEqual({str(BRONZE_PIPE): 3}, exported["materials"])
+
+        other = AccountStore(os.path.join(self.tmp.name, "other.json"))
+        other.import_account(payload)
+        _, moved = other.get_account("alice")
+        for key in ("inventory", "equipped", "materials"):
+            self.assertEqual(exported[key], moved[key], key)
+        # 磁盘上也是这个形状，不是只在内存视图里补出来的。
+        with open(other.path, "r", encoding="utf-8") as f:
+            on_disk = json.load(f)["accounts"]["alice"]
+        for key in ("inventory", "equipped", "materials"):
+            self.assertEqual(exported[key], on_disk[key], key)
+
+    def test_import_cleans_hand_edited_item_fields(self):
+        # 上传的是玩家用记事本改过的文件：`"id": 数量` 的简写、数量 0、
+        # 穿着但仓库里没有的装备、客户端不认识的 id、写成字符串的数量 ——
+        # 全部当场洗干净，和 `ensure_item_fields` 启动时洗盘一个口径
+        # （不然脏条目要等下次启动才收敛，中间游戏里发下去的就是脏的）。
+        payload = {"popshot_save": 1, "username": "alice",
+                   "account": {"password": "pw",
+                               "inventory": {str(REVOLVER_R1): 2,
+                                             "999999999": 1,
+                                             str(TOP_ARMOR): 0},
+                               "equipped": [REVOLVER_R1, TOP_ARMOR, 999999999],
+                               "materials": {str(BRONZE_PIPE): "4",
+                                             "999999999": 1, "abc": 2}}}
+        self.store.import_account(payload)
+        _, account = self.store.get_account("alice")
+        self.assertEqual({str(REVOLVER_R1): {"count": 2, "expires": None}},
+                         account["inventory"])
+        self.assertEqual([REVOLVER_R1], account["equipped"])
+        self.assertEqual({str(BRONZE_PIPE): 4}, account["materials"])
+
+    def test_import_of_an_old_save_resets_the_item_fields_to_empty(self):
+        # 旧版（V0.2）导出的存档没有这三个字段。导入是「覆盖」不是「合并」
+        # （`test_import_resets_fields_missing_from_the_upload` 那条需求），
+        # 所以传回来仓库就是空的 —— 注册页上写明了这一点。
+        self.store.register("alice", "pw")
+        self.store.add_item("alice", REVOLVER_R1)
+        self.store.add_materials("alice", {BRONZE_PIPE: 3})
+        old_save = {"popshot_save": 1, "username": "alice",
+                    "account": {"password": "pw", "money": 12,
+                                "level": 1, "experience": 0}}
+        self.store.import_account(old_save, "alice", "pw")
+        _, account = self.store.get_account("alice")
+        self.assertEqual(({}, [], {}), (account["inventory"],
+                                        account["equipped"],
+                                        account["materials"]))
+        self.assertEqual(12, account["money"])
+
+    def test_import_leaves_the_admin_accounts_section_alone(self):
+        # V0.3 商店在 accounts.json 顶层加了 `admin_accounts`（D3）。存档转移
+        # 只动 `accounts[用户名]` 这一格，顶层别的段一个字都不能碰。
+        self.store.register("alice", "pw")
+        self.store.ensure_item_fields()          # 键不在 ⇒ 建出默认管理员（D13）
+        with open(self.path, "r", encoding="utf-8") as f:
+            before = json.load(f)[ADMIN_ACCOUNTS_KEY]
+        self.assertTrue(before)
+        payload = {"popshot_save": 1, "username": "bob",
+                   "account": {"password": "pw", "money": 1}}
+        self.store.import_account(payload)
+        with open(self.path, "r", encoding="utf-8") as f:
+            after = json.load(f)
+        self.assertEqual(before, after[ADMIN_ACCOUNTS_KEY])
+        self.assertIn("bob", after["accounts"])
+
     def test_import_rejects_a_file_that_is_not_a_save(self):
         for bad in (None, [], {"hello": "world"}, {"account": {"money": 1}}):
             with self.assertRaises(AccountError, msg=repr(bad)) as ctx:

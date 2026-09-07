@@ -93,11 +93,12 @@ main {
   width: 100%; max-width: 1180px; margin: 0 auto; padding: 16px 18px 60px;
 }
 
-/* ★ 配置页（物品库 / 商店货架 / 合成配方 / 材料掉落）和数据备份页：整块面板
-   撑满 `main`，滚动条一路交到列表（`.fit-list`）手里 —— 说明块、筛选条、
-   换页栏都钉住不动，只有列表滚（用户 2026-09-06，D39）。`switchTab` 负责挂
-   `.fit`；哪块面板 / 哪个列表参与，靠 `.fit-panel` / `.fit-list` / `.fit-help`
-   三个类标出来（原来写死 `#cfgPanel`，数据备份页加进来时改成了类）。
+/* ★ 配置页（物品库 / 商店货架 / 合成配方 / 材料掉落）、数据备份页和玩家资料页：
+   整块面板撑满 `main`，滚动条一路交到列表（`.fit-list`）手里 —— 说明块、
+   筛选条、换页栏都钉住不动，只有列表滚（用户 2026-09-06，D39；玩家资料页
+   2026-09-07 加进来）。`switchTab` 负责挂 `.fit`；哪块面板 / 哪个列表参与，
+   靠 `.fit-panel` / `.fit-list` / `.fit-help` 三个类标出来
+   （原来写死 `#cfgPanel`，数据备份页加进来时改成了类）。
    ★ 每一层都要 `min-height: 0` —— flex 项的默认最小高度是内容高度，
    漏一层它就把滚动条又顶回外面那层去了。 */
 main.fit { overflow: hidden; padding-bottom: 16px; }
@@ -379,7 +380,7 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 .cfg-bar .acts {
   display: flex; align-items: center; gap: 10px; flex: 0 0 auto; margin-left: auto;
 }
-/* 只有一页时 `pagerNode` 什么都不画 —— 空的 `.pager` 还占着 10px 外边距，
+/* 只有一页时换页栏什么都不画 —— 空的 `.pager` 还占着 12px 外边距，
    短列表上会多出一条看不出来源的空白。 */
 .pager:empty { display: none; }
 
@@ -719,9 +720,12 @@ h3.sub {
 }
 .own-empty { color: var(--cocoa-soft); font-size: 13px; padding: 6px 2px; }
 
-/* 玩家列表：钉成 10 行高（表头 + 10 行），翻页时不忽长忽短。 */
-.player-list { min-height: 353px; }
+/* 玩家列表：滚动条长在它身上（`.fit-list`，用户 2026-09-07）。以前钉成
+   10 行高是为了让底下的编辑区不跳 —— 编辑区改成弹窗之后用不着了。 */
 .player-list table { max-width: none; }
+/* 表头钉在滚动框顶上，和数据备份页的列表一个做法。 */
+.player-list thead th { position: sticky; top: 0; z-index: 1; }
+.player-list td { vertical-align: middle; }
 tr.on td { background: #FFFBEF; }
 td .btn-sm { white-space: nowrap; }
 /* 一行两个按钮（「修改背包」+「设为管理员（运营）」，D40）—— 挤不下就折行，
@@ -732,8 +736,12 @@ td .acts {
   display: flex; gap: 6px; flex-wrap: wrap;
   align-items: center; justify-content: flex-end;
 }
+/* 换页栏夹在筛选条和列表之间（四个配置页 / 选择物品弹窗 / 数据备份 /
+   玩家资料都是这个位置）：上面靠筛选条自己的下边距隔开，下面再留 12px
+   才接列表。原来是 `margin-top: 10px` 叠在筛选条的 14px 上、底下又贴着
+   列表 —— 上远下近（用户 2026-09-07）。 */
 .pager {
-  display: flex; gap: 10px; align-items: center; margin-top: 10px;
+  display: flex; gap: 10px; align-items: center; margin: 0 0 12px;
 }
 .pager .pageno { font-size: 13px; color: var(--cocoa-soft); font-weight: 600; }
 

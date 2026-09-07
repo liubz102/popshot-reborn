@@ -1078,6 +1078,34 @@ class RegisterWebTests(unittest.TestCase):
         self.assertFalse(reply["ok"])
         self.assertIn("存档", reply["message"])
 
+    def test_import_carries_the_item_fields_through_the_page(self):
+        # V0.3 商店加的仓库 / 穿着 / 材料要能从注册页这条路进来、再导出来
+        # （走真的 HTTP：JSON 的对象键只能是字符串，这里验的就是那个形状）。
+        revolver, pipe = 1120041, 30018
+        save = {"popshot_save": 1, "username": self.who,
+                "account": {"password": "pw",
+                            "inventory": {str(revolver): 1},
+                            "equipped": [revolver],
+                            "materials": {str(pipe): 2}}}
+        reply = self.post("/api/import", {"save": save})
+        self.assertTrue(reply["ok"], reply)
+        account = self.accounts.get_account(self.who)[1]
+        self.assertEqual({str(revolver): {"count": 1, "expires": None}},
+                         account["inventory"])
+        self.assertEqual([revolver], account["equipped"])
+        self.assertEqual({str(pipe): 2}, account["materials"])
+        exported = self.post("/api/export",
+                             {"username": self.who, "password": "pw"})
+        self.assertTrue(exported["ok"], exported)
+        for key in ("inventory", "equipped", "materials"):
+            self.assertEqual(account[key], exported["save"]["account"][key], key)
+        # 覆盖导入时没人在线 ⇒ 回执里不能自称「游戏里已即时生效」。
+        replaced = self.post("/api/import",
+                             {"save": save, "username": self.who,
+                              "password": "pw"})
+        self.assertTrue(replaced["ok"], replaced)
+        self.assertNotIn("即时生效", replaced["message"])
+
     def test_an_unknown_api_is_a_clean_404(self):
         # ★ 「clean」是字面意思：404 也必须先把请求体读干净再回。
         #   不读的话，keep-alive 的下一次解析会撞上剩下的 body，连接被掐掉，

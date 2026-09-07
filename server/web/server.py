@@ -496,12 +496,19 @@ class Handler(admin.AdminRoutes, http.server.BaseHTTPRequestHandler):
         summary = (f"（当前等级 {account.get('level')}、"
                    f"经验 {account.get('experience')}、"
                    f"金币 {account.get('money')}）") if account else ""
+        # ★ 他正在游戏里的话把新存档当场推下去 —— 和管理页改完玩家资料那
+        #   四发是同一套（`admin._push_account`：金币 / 等级 / 仓库 / 穿着）。
+        #   不推的话客户端手里还是登录时抓的那份，要重登才看得到。
+        #   没在线就什么都不做（新建的账号必然没在线）。
+        pushed = admin._push_account(username)
+        live = "游戏里已即时生效，不用重新登录。" if pushed else ""
         if action == "created":
             self._reply(True, f"上传成功！服务器上新建了账号「{username}」，"
                               f"现在可以在游戏登录界面用它登录了。{summary}")
         else:
             self._reply(True,
-                        f"上传成功！账号「{username}」的存档已被覆盖更新。{summary}")
+                        f"上传成功！账号「{username}」的存档已被覆盖更新。"
+                        f"{summary}{live}")
 
 
 class _PreboundHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
