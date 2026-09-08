@@ -1028,7 +1028,7 @@ function markBadCard(message) {
     at = positionOf(CURRENT, index);
   }
   if (at < 0) { return; }
-  FILTER[CURRENT].page = Math.floor(at / PAGE_SIZE);
+  FILTER[CURRENT].page = Math.floor(at / pageSize(CURRENT));
   repaintList();
   var card = $("cfgList").querySelector('[data-index="' + index + '"]');
   if (!card) { return; }
@@ -1396,8 +1396,17 @@ function dropRank(entry) {
  *  不是铁律 10 说的那种时序阈值 —— 超出的翻页，不再是「剩下的不画了」。 */
 var PAGE_SIZE = 120;
 
-function pageCount(total) {
-  return Math.max(1, Math.ceil(total / PAGE_SIZE));
+/** 按标签页改口径的那几个。★ 合成配方一条**横占一整行**（4 个材料格 + 花费
+ *  + 产物），不像物品库 / 商店那样一屏并排好几张卡 ⇒ 120 条一页要滚到天荒
+ *  地老，改成 10 条一页（用户 2026-09-08）。没登记的照 `PAGE_SIZE` 走。 */
+var PAGE_SIZE_BY_TAB = {recipe: 10};
+
+function pageSize(which) {
+  return PAGE_SIZE_BY_TAB[which] || PAGE_SIZE;
+}
+
+function pageCount(which, total) {
+  return Math.max(1, Math.ceil(total / pageSize(which)));
 }
 
 /** 这一页要画的那些记录，顺带把「筛出 x / y　第 m / n 页」写上。
@@ -1405,7 +1414,8 @@ function pageCount(total) {
  *  报错定位用的 `positionOf` 才和画面一致。） */
 function pageRows(which) {
   var all = visibleEntries(which);
-  var pages = pageCount(all.length);
+  var pages = pageCount(which, all.length);
+  var size = pageSize(which);
   var filter = FILTER[which] || (FILTER[which] = {});
   // 筛完变短了、或者删掉了最后一条 ⇒ 当前页可能已经不存在了，夹回来。
   var page = Math.min(Math.max(0, filter.page || 0), pages - 1);
@@ -1418,7 +1428,7 @@ function pageRows(which) {
     label.textContent = (all.length !== total)
       ? ("筛出 " + all.length + " / " + total) : "";
   }
-  return {rows: all.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE),
+  return {rows: all.slice(page * size, (page + 1) * size),
           pages: pages, page: page, total: all.length};
 }
 
@@ -1610,6 +1620,21 @@ function adoptItem(entry, key, item) {
 }
 
 /* -------------------------------------------------- 合成配方：配方卡 */
+
+/** 字段表里叫 `key` 的那一栏；没登记就 `null`。
+ *
+ * 给「要把某一栏从 `restFields` 里拿出来单独摆」用（配方卡的
+ * 花费 / 上架）。拿不到时**别自己编一份 spec**：直接返回 `null`，
+ * 让调用方把这个键留给 `restFields`（它会当「未登记字段」画出来），
+ * 否则字段表一改名，那个键就从页面上悄悄消失、又被原样存回去。 */
+function fieldSpec(which, key) {
+  var found = null;
+  ((CAT.schema[which] || {}).fields || []).forEach(function (spec) {
+    if (spec.key === key) { found = spec; }
+  });
+  return found;
+}
+
 function renderRecipe(list, rows) {
   rows.forEach(function (row) {
     var entry = row.entry, index = row.index;
@@ -1619,10 +1644,20 @@ function renderRecipe(list, rows) {
     card.appendChild(el("span", "rid", "配方 #" + (entry.id === undefined ? "?" : entry.id)));
 
     var head = el("div", "recipe-head");
-    head.appendChild(materialSlots(entry, card));
-    head.appendChild(el("span", "arrow", "➜"));
 
+    // 代价那一侧：4 个材料格 + 花费。金币和材料是**同一侧**的代价，
+    // 摆在一块儿才读得出「材料 + 金币 ➜ 产物」（用户 2026-09-08）。
+    var into = el("div", "recipe-in");
+    into.appendChild(materialSlots(entry, card));
+    var costSpec = fieldSpec("recipe", "cost");
+    if (costSpec) { into.appendChild(fieldNode(costSpec, entry, touched)); }
+    head.appendChild(into);
+
+    // ★ 箭头是**产物那一侧**的头一个，不是 `head` 的直接子节点：窄屏上这一行
+    //   要折的时候，得让「➜ 产物」一起掉到第二行去，别把一个光秃秃的箭头
+    //   留在材料那一行的末尾。
     var out = el("div", "recipe-out");
+    out.appendChild(el("span", "arrow", "➜"));
     var slot = slotNode(entry.result, 52, entry.listed, true);
     slot.onclick = function () {
       openPicker({selected: entry.result, onPick: function (item) {
@@ -1637,16 +1672,28 @@ function renderRecipe(list, rows) {
     col.appendChild(metaLine(entry.result));
     out.appendChild(col);
     head.appendChild(out);
+
+    var relist = function () {
+      card.classList.toggle("listed", !!entry.listed);
+      slot.classList.toggle("on", !!entry.listed);
+      touched();
+    };
+    // 上架是整条配方的总开关，不属于「材料」也不属于「产物」——
+    // 甩到整行最右边（CSS 里的 `margin-left: auto`）。
+    var listedSpec = fieldSpec("recipe", "listed");
+    if (listedSpec) { head.appendChild(fieldNode(listedSpec, entry, relist)); }
     card.appendChild(head);
 
-    var foot = el("div", "recipe-foot");
-    restFields("recipe", entry, ["id", "result", "name", "materials"],
-      function () {
-        card.classList.toggle("listed", !!entry.listed);
-        slot.classList.toggle("on", !!entry.listed);
-        touched();
-      }).forEach(function (node) { foot.appendChild(node); });
-    card.appendChild(foot);
+    // 第二行只剩**字段表之外的键**；一个都没就不画，别留一条空虚线。
+    var skip = ["id", "result", "name", "materials"];
+    if (costSpec) { skip.push("cost"); }
+    if (listedSpec) { skip.push("listed"); }
+    var extra = restFields("recipe", entry, skip, relist);
+    if (extra.length) {
+      var foot = el("div", "recipe-foot");
+      extra.forEach(function (node) { foot.appendChild(node); });
+      card.appendChild(foot);
+    }
     list.appendChild(card);
   });
 }
@@ -1655,10 +1702,7 @@ function renderRecipe(list, rows) {
 function materialSlots(entry, card) {
   var box = el("div", "mat-slots");
   if (!Array.isArray(entry.materials)) { entry.materials = []; }
-  var spec = null;
-  (CAT.schema.recipe.fields || []).forEach(function (field) {
-    if (field.key === "materials") { spec = field; }
-  });
+  var spec = fieldSpec("recipe", "materials");
   var max = (spec && spec.max) || CAT.max_materials || 4;
   var countSpec = {key: "count", label: "数量", type: "int", min: 1, max: 800};
   (spec && spec.fields || []).forEach(function (field) {
@@ -3177,7 +3221,7 @@ function addEntry(which) {
       // 新加的那条一定要看得见 —— 否则筛选开着的时候「加了没反应」。
       // ★ 它追加在末尾 ⇒ 清掉筛选之后还得**翻到最后一页**。
       FILTER[which] = emptyFilter();
-      FILTER[which].page = pageCount(CFG[which].entries.length) - 1;
+      FILTER[which].page = pageCount(which, CFG[which].entries.length) - 1;
       renderCurrent();
       var card = $("cfgList").querySelector(
         '[data-index="' + (CFG[which].entries.length - 1) + '"]');

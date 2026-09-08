@@ -455,12 +455,16 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
   display: block; font-weight: 600; font-size: 15px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-/* 一行放不下就省略号 —— 让每张卡一样高，扫一列数字时眼睛才不用重新找位置。 */
-.item-card .meta {
-  font-size: 12px; color: var(--cocoa-soft); margin: 3px 0 7px;
+/* 一行放不下就省略号 —— 让每张卡一样高，扫一列数字时眼睛才不用重新找位置。
+   ★ 合成配方的产物也走这一套：2026-09-08 把整条配方并成一行之后，产物那块
+     变窄了，不截就会折成两行、把配方卡又撑高一截（正是这次要去掉的那截）。 */
+.item-card .meta, .recipe-out .meta {
+  font-size: 12px; color: var(--cocoa-soft);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.item-card .meta code {
+.item-card .meta { margin: 3px 0 7px; }
+.recipe-out .meta { margin: 2px 0 0; }
+.item-card .meta code, .recipe-out .meta code {
   background: var(--paper-2); border-radius: 4px; padding: 0 5px;
   font-family: Consolas, "Cascadia Mono", monospace;
 }
@@ -477,12 +481,49 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
   background: #fff; border: 2px solid var(--line); border-radius: 10px;
 }
 .recipe-card.listed { border-color: var(--amber); background: #FFFCF4; }
-.recipe-head { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
-.recipe-out { display: flex; gap: 10px; align-items: center; flex: 1 1 260px; }
-.recipe-out .col { min-width: 0; flex: 1 1 auto; }
-.arrow {
-  align-self: center; font-size: 22px; color: var(--amber-dark); font-weight: 700;
+
+/* 一条配方**一整行**读完（用户 2026-09-08）：
+      [材料 ×4  花费]  ➜  [产物]  ……………………  [上架]
+   花费跟材料同属「代价」这一侧，所以贴着材料格；上架是整条配方的总开关，
+   两边都不属于，甩到最右边。原来这两栏单占虚线分隔的第二行，配方那一行
+   右半边空着，白白高出一截。第二行现在只在出现**字段表之外的键**时才画。 */
+.recipe-head {
+  display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  /* 右上角浮着「配方 #N」（`.rid`），给它让出一条 —— 材料少的配方整行很矮，
+     不留这一条，最右边那个开关就会和它贴到一起。 */
+  padding-top: 5px;
 }
+/* 代价那一侧：材料格 + 花费。窄屏先在这里面折行（花费掉到材料格下面），
+   别越过箭头跑到产物那一侧去 —— 「箭头左边是代价」这条得一直成立。 */
+.recipe-in {
+  display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  flex: 0 1 auto; min-width: 0;
+}
+/* 花费：紧挨着四个材料格，所以圈成一格，按工具条那一套（米黄底 + 实线
+   描边 + 圆角）画。★ 别改成虚线 —— 虚线在这一页是「空着的、点一下能加」
+   （`.slot.empty`），而那种格子就在它左边挨着。 */
+.recipe-in > .field {
+  flex: 0 0 auto;
+  padding: 5px 10px 6px; border-radius: 9px;
+  background: var(--paper-2); border: 2px solid var(--line);
+}
+.arrow {
+  flex: 0 0 auto; font-size: 22px; color: var(--amber-dark); font-weight: 700;
+}
+/* 产物（连它前面那个箭头）：吃掉中间剩下的空档，顺带把上架开关顶到整行最右。
+   ★ `min-width` 要**写死一个数**，两头的毛病它都治：
+     ① 不写（`auto`）时这一块的最小宽度 = 里头那行 `nowrap` 小字的整行宽度，
+        撑得开关直接被挤到第二行；
+     ② 写 0 又会在窄窗口里把产物名压成「炎…」，认不出是哪件东西。
+     写 200px = 「产物名至少留得下几个字，否则宁可让开关折到第二行去」。 */
+.recipe-out {
+  display: flex; gap: 10px; align-items: center;
+  flex: 1 1 200px; min-width: 200px;
+}
+.recipe-out .col { min-width: 0; flex: 1 1 auto; }
+/* 上架开关：整行最右。产物那块已经 `flex: 1` 吃掉了空档，`margin-left: auto`
+   是给「产物那块没撑开」时兜底的。 */
+.recipe-head > .toggle { flex: 0 0 auto; margin-left: auto; }
 .mat-slots { display: flex; gap: 8px; flex-wrap: wrap; }
 .mat {
   display: flex; flex-direction: column; align-items: center; gap: 3px;
@@ -494,6 +535,8 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 }
 .mat input[type=number] { width: 62px; text-align: center; }
 .mat .drop { padding: 0 6px; font-size: 11px; }
+/* 第二行。花费 / 上架搬进上面那一行之后，这里**只剩字段表之外的键**
+   （`renderRecipe` 里一个都没有就干脆不画这个节点，别留一条空虚线）。 */
 .recipe-foot {
   display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end;
   margin-top: 11px; padding-top: 10px; border-top: 2px dashed var(--line);
