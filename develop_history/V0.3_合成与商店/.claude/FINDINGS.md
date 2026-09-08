@@ -1669,3 +1669,35 @@ bot 读地形还要它。`account_store.QUEST_DIFFICULTY_MAX = 4` 没动：
   （§22 的表）；`shop.category_of` 原来按 `part_flag == 0` 一律兜进「道具 → 其他」。
 - 11 张卡的图标各不相同（`엘리어스_셋트1` / `진` / `발키리` … / `시리아 마스`），
   `shopdefaults.dedupe` 不会把它们合并；同角色的 `1019000xx` 三件只有货架条目，不 ownable。
+
+## §44 ★★★★★ 拿**真的云服存档**（71 个号）跑完迁移：一个字段都没丢（✅实测）
+
+2026-09-08 用 `server/data-云服/accounts.json`（线上取下来的真件，`schema_version 2`、
+71 个号）复刻 `app.py` 的三步开服跑了一遍。**结论：干净，可以上线。**
+
+- **丢失 0 / 值被改 0**；只新增 `inventory` / `equipped` / `materials` 三个空字段，
+  旧键 `character_unlock_all` / `owned_characters` 71 个号全部删干净。
+- ★ **等级重算 0 个** —— 云上已经在跑当前的等级曲线了，
+  「上线那一刻等级数字会跳」这条担心（PROGRESS 里那句）在**这份数据上不成立**。
+- **36 个号选着付费角色**（100~110，`character` 分布 109×9、110×5、101×6…），
+  迁移后 `player_character()` 全部退回 0 泰尔，存档里的 `character` 字段**原样留着**
+  （D51 的设计：不改存档，只在读的时候退回）。`owned_characters` 云上 71 个号全是空表
+  ⇒ 迁移后**没有任何人**手里有角色卡，都得去商店买。
+- 四份运营配置：云上一份都没有 ⇒ `ensure_files()` 按模板生成，
+  和开发机 `server/data/` 的四份**逐字节相同**（808 物品 / 495 上架含 11 张角色卡 /
+  122 配方 / 52 掉落，零警告）⇒ D50「模板 = 现在的数据」是真的。
+  `_report_character_shelf()` 不会喊。
+- **连开三次服**：第 2、3 次 `realign=0` / `item_fields=0` / `ensure_files=[]`，
+  `accounts.json` 的 sha256 **和 mtime 都没变**（真的没写盘，不只是内容一样）。
+- 改一件商品价格再开服，`shop.json` 没被盖（D7）。建出 `admin` / `Admin123`（系统管理员）。
+- 演练脚本在 scratchpad，不进仓库；要复跑就照这三步：
+  `AccountStore.realign_levels()` → `.ensure_item_fields()` → `shopcfg.ensure_files(dir)`。
+
+## §45 ★★ 「凌晨 4 点自动备份」**不用等到 4 点**也能验（🔍代码）
+
+`databackup.BackupService._run()` 每一圈都重读设置再算下一次到点时刻，
+而 `update_settings()` 写完 `server.config` 就 `self._wake.set()` ⇒
+**管理页「数据备份」里把时刻改成两分钟后、保存**，线程当场被叫醒重排，
+到点就会多出一份「自动 · 每日自动备份」。验完改回 `04:00` 即可。
+（这是铁律 10 说的那个例外：等的是时钟，物理上没有别的事件可等 ——
+但「设置变了」是有事件的，所以那一头是事件驱动的。）

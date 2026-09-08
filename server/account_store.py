@@ -143,7 +143,8 @@ ADMIN_ACCOUNTS_KEY = "admin_accounts"
 #:
 #: * `system` **系统管理员** —— 管理页所有标签页都能进；
 #: * `operator` **运营** —— 只能进 物品库 / 商店货架 / 合成配方 / 材料掉落
-#:   这四个配置页，看不到「玩家资料」和「管理员账号」。
+#:   这四个配置页，看不到「玩家资料」「数据备份」和「管理员账号」
+#:   （前台那张表是 `web/admin.js` 的 `SYSTEM_ONLY_TABS`）。
 ADMIN_ROLE_SYSTEM = "system"
 ADMIN_ROLE_OPERATOR = "operator"
 ADMIN_ROLES = (ADMIN_ROLE_SYSTEM, ADMIN_ROLE_OPERATOR)
