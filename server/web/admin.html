@@ -26,7 +26,7 @@
     <button data-tab="shop">商店货架</button>
     <button data-tab="recipe">合成配方</button>
     <button data-tab="drops">材料掉落</button>
-    <button data-tab="players">玩家资料</button>
+    <button data-tab="players">玩家仓库</button>
     <button data-tab="backup">数据备份</button>
     <button data-tab="admins">管理员账号</button>
   </nav>
@@ -80,14 +80,14 @@
       </div>
     </section>
 
-    <!-- ---------------- 玩家资料 ----------------
+    <!-- ---------------- 玩家仓库 ----------------
          ★ 和配置页一样走「面板撑满、只有列表滚」那套壳（D39；用户 2026-09-07）：
          说明块 / 搜索条 / 换页栏钉住不动，滚动条长在玩家列表身上，
          换页栏在列表**上面**。查找出错 / 设为管理员的回执走右上角浮条，
          列表下面什么都不放。 -->
     <section class="panel hidden fit-panel" id="playersPanel">
       <div class="panel-title">
-        <h2>玩家资料</h2>
+        <h2>玩家仓库</h2>
         <span class="count" id="playerCount"></span>
       </div>
       <div class="panel-body">
@@ -206,9 +206,9 @@
           就没人进得来这一页，只能上服务器改 JSON。
         </p>
         <ul class="help">
-          <li><b>系统管理员</b>：管理页所有标签页都能进，包括「玩家资料」和这一页。</li>
+          <li><b>系统管理员</b>：管理页所有标签页都能进，包括「玩家仓库」和这一页。</li>
           <li><b>运营</b>：只能进 物品库 / 商店货架 / 合成配方 / 材料掉落
-            这四页，看不到「玩家资料」和「管理员账号」。</li>
+            这四页，看不到「玩家仓库」和「管理员账号」。</li>
           <li>改权限<b>立刻生效</b>，对方不用重新登录。</li>
         </ul>
         <table>
@@ -262,8 +262,8 @@
   </div>
 </main>
 
-<!-- ========================= 玩家背包弹窗（用户 2026-09-07） =========================
-     「修改背包」点开的编辑窗。★ 只有右上角的 ✕ 能关它 —— 点遮罩不关
+<!-- ========================= 玩家仓库弹窗（用户 2026-09-07） =========================
+     「修改仓库」点开的编辑窗。★ 只有右上角的 ✕ 能关它 —— 点遮罩不关
      （admin.js 里故意没给它挂 onclick）。物品按**游戏仓库界面**那棵标签树分类
      （§41），前面多一个「全部」；只有物品区滚，上面的都钉住。
      ★ 必须排在 #picker 前面：两个都是 .modal（z-index 50），后面的压上面 ——
@@ -327,6 +327,11 @@
         <select id="pickKind"></select>
         <!-- 角色按**物品库里那份角色限定**筛（D31），和物品库那一页一个口径。 -->
         <select id="pickCharacter"></select>
+        <!-- 上架状态（用户 2026-09-09）。选项和判据都和物品库那一页**共用同一份**
+             （`LISTING_FILTER_OPTIONS` / `listingMatches`）：「已上架」= 商店
+             或合成，两边任意一边算数。看的是**当前页面模型**，还没保存的改动
+             也算（`listingOf`）。 -->
+        <select id="pickListing"></select>
         <span class="grow"></span>
         <button class="btn" id="pickClose">关闭</button>
       </div>
@@ -337,7 +342,7 @@
            写的是同一批东西，而「在不在卖」还是现问服务端的旧值。 -->
       <div class="pick-grid" id="pickGrid"></div>
     </div>
-    <!-- 批量模式（玩家背包弹窗的「添加物品」）才显示：勾多件，一次加进去。 -->
+    <!-- 批量模式（玩家仓库弹窗的「添加物品」）才显示：勾多件，一次加进去。 -->
     <div class="panel-foot hidden" id="pickFoot">
       <span class="pageno" id="pickChosen">已选 0 件</span>
       <button class="btn btn-sm" id="pickClear">清空</button>

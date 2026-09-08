@@ -36,13 +36,13 @@
 
 - **系统管理员**（`system`）—— 全部标签页；
 - **运营**（`operator`）—— 只有 物品库 / 商店货架 / 合成配方 / 材料掉落
-  这四个配置页，看不到「玩家资料」和「管理员账号」。
+  这四个配置页，看不到「玩家仓库」和「管理员账号」。
 
 上面标了 ★系统 的接口走 `_require_system_admin()`。**前台把标签藏起来
 只是画面**，真正的门在那个函数里 —— `test_web_admin` 有一条用例拿运营
 身份逐个路径打一遍，确认全是 403。
 
-## 玩家资料页：**仓库里什么都能改**（用户 2026-09-06 拍板，D23a）
+## 玩家仓库页：**仓库里什么都能改**（用户 2026-09-06 拍板，D23a）
 
 原来商店在卖的那批东西是只读的（怕绕过「够等级才买得到」）。
 **这条 2026-09-06 撤了**：等级门槛在**穿上**那一刻客户端还要再判一次，
@@ -395,7 +395,7 @@ def catalog():
                     "kind": item.kind,
                     "name": shopcfg.item_name_zh(item),
                     "cell": cells.get(item.icon),
-                    # 游戏**仓库界面**里它在哪个标签（§41）—— 玩家背包弹窗
+                    # 游戏**仓库界面**里它在哪个标签（§41）—— 玩家仓库弹窗
                     # 按这个分类筛，和游戏里逐格对得上。
                     "wh": shop.warehouse_category_of(item.id),
                 }
@@ -699,7 +699,7 @@ class AdminRoutes:
     def _require_system_admin(self):
         """**系统管理员**专用（D34）：运营回 403 并返回 `None`。
 
-        ★ 前台会把「玩家资料」和「管理员账号」两个标签藏起来，但那只是画面
+        ★ 前台会把「玩家仓库」和「管理员账号」两个标签藏起来，但那只是画面
         —— 藏掉的按钮拦不住直接 POST，**真正的门在这儿**。
         ★ 权限**每一发都现查**（`accounts.admin_role`），不从会话里读：
         把一个人降成运营之后，他手里那个令牌应该**立刻**失去这两页，
@@ -865,7 +865,7 @@ class AdminRoutes:
             "characters": {str(k): v for k, v in shopcfg.CHARACTER_ZH.items()},
             "series": shopcfg.SERIES_ZH,
             "max_materials": shopcfg.MAX_MATERIALS,
-            # 仓库界面那棵标签树（§41）：玩家背包弹窗照它画分类，再加一个「全部」。
+            # 仓库界面那棵标签树（§41）：玩家仓库弹窗照它画分类，再加一个「全部」。
             "warehouse": shop.WAREHOUSE_TABS,
         })
 
@@ -1130,7 +1130,7 @@ class AdminRoutes:
                 "message": f"{target} 现在是{zh}"})
             return
         if action == "from_player":
-            # 「玩家资料」页那个「设为管理员（运营）」（D40）。
+            # 「玩家仓库」页那个「设为管理员（运营）」（D40）。
             # ★ 请求里**只有用户名**：密码由存档层自己照搬，既不经过浏览器
             #   也不经过这里的任何一个变量（铁律 9）。
             names = self.accounts.admin_add_from_player(
@@ -1335,11 +1335,11 @@ class AdminRoutes:
             "weapon": item.weapon,
         })
 
-    # ------------------------------------------------------------ 玩家资料
+    # ------------------------------------------------------------ 玩家仓库
     def _admin_player_search(self, query):
         """`/admin/api/players?q=…&page=N` —— 按用户名或昵称找人，一页 10 行。
 
-        ★ **系统管理员专用**（D34）：玩家资料整页对运营不开放。
+        ★ **系统管理员专用**（D34）：玩家仓库整页对运营不开放。
         """
         if self._require_system_admin() is None:
             return

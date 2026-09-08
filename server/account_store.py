@@ -143,7 +143,7 @@ ADMIN_ACCOUNTS_KEY = "admin_accounts"
 #:
 #: * `system` **系统管理员** —— 管理页所有标签页都能进；
 #: * `operator` **运营** —— 只能进 物品库 / 商店货架 / 合成配方 / 材料掉落
-#:   这四个配置页，看不到「玩家资料」「数据备份」和「管理员账号」
+#:   这四个配置页，看不到「玩家仓库」「数据备份」和「管理员账号」
 #:   （前台那张表是 `web/admin.js` 的 `SYSTEM_ONLY_TABS`）。
 ADMIN_ROLE_SYSTEM = "system"
 ADMIN_ROLE_OPERATOR = "operator"
@@ -285,7 +285,7 @@ def owned_characters(account):
 
     ★ 基础的 0/1/2 不在里面 —— 客户端对它们根本不查背包。
     ★ **只有这一个来源**（V0.3商店 D51）：角色要在商店买（1000 金币），
-      或者管理员在「修改背包」里塞一张角色卡。以前的全开开关和手写列表都作废了。
+      或者管理员在「修改仓库」里塞一张角色卡。以前的全开开关和手写列表都作废了。
     """
     picked = set()
     for item_id in _inventory_records(account):
@@ -1378,7 +1378,7 @@ class AccountStore:
     def admin_add_from_player(self, username, role=ADMIN_ROLE_OPERATOR):
         """把一个**玩家账号**原样收进管理员表：用户名和明文密码照搬。
 
-        管理页「玩家资料」那一页的「设为管理员（运营）」走这一发（D40）。
+        管理页「玩家仓库」那一页的「设为管理员（运营）」走这一发（D40）。
 
         ★ **密码不出这一层**：调用方（管理页）只传用户名过来，页面从头到尾
         看不见密码，也就不会跑到日志、截图和浏览器历史里去（铁律 9）。

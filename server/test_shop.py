@@ -1199,7 +1199,7 @@ class ComposeTests(_ShopCase):
 
 
 class WarehouseCategoryTests(unittest.TestCase):
-    """游戏**仓库界面**那棵树（§41）：管理页玩家背包弹窗按它分类。
+    """游戏**仓库界面**那棵树（§41）：管理页玩家仓库弹窗按它分类。
     用的是真的 `shop_items.json`（不换小表）—— 要钉的正是全表的分布。"""
 
     def first_of(self, kind, want=None):

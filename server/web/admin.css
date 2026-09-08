@@ -106,9 +106,9 @@ main {
   width: 100%; max-width: 1180px; margin: 0 auto; padding: 16px 18px 60px;
 }
 
-/* ★ 配置页（物品库 / 商店货架 / 合成配方 / 材料掉落）、数据备份页和玩家资料页：
+/* ★ 配置页（物品库 / 商店货架 / 合成配方 / 材料掉落）、数据备份页和玩家仓库页：
    整块面板撑满 `main`，滚动条一路交到列表（`.fit-list`）手里 —— 说明块、
-   筛选条、换页栏都钉住不动，只有列表滚（用户 2026-09-06，D39；玩家资料页
+   筛选条、换页栏都钉住不动，只有列表滚（用户 2026-09-06，D39；玩家仓库页
    2026-09-07 加进来）。`switchTab` 负责挂 `.fit`；哪块面板 / 哪个列表参与，
    靠 `.fit-panel` / `.fit-list` / `.fit-help` 三个类标出来
    （原来写死 `#cfgPanel`，数据备份页加进来时改成了类）。
@@ -270,7 +270,7 @@ ul.help b, .hint b { color: var(--crimson); }
 .btn-danger:hover { background: linear-gradient(#E85C62, #CE2E34); }
 .btn-ghost { box-shadow: none; background: rgba(255, 255, 255, .55); }
 .btn-sm { padding: 3px 9px; font-size: 12px; box-shadow: 0 2px 0 #C98A1D; }
-/* 玩家列表那两个钮（D40 / D40a）：「修改背包」金色主钮、「设为管理员（运营）」
+/* 玩家列表那两个钮（D40 / D40a）：「修改仓库」金色主钮、「设为管理员（运营）」
    米黄默认钮 —— 靠轻重分，不靠色相。原来给权限钮画的青色 `.btn-admin` 是整页
    唯一的冷色，用户 2026-09-07 说太突兀，删了；按钮样式全用上面那几档。
    ★ 以后再加按钮颜色，记得排在 `.btn-sm` **后面**：两条选择器权重一样，
@@ -327,7 +327,7 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 
 /* 开关 —— 关 = 浅棕拨轨，开 = 苔绿（配色说明见文件头，用户 2026-09-07）。
    页面上**每一个**开关都走这一档：备份页「每天自动备份」、配置页「已上架」
-   之类的布尔字段、筛选条「只看已上架」、玩家背包的「拥有 / 没有」。 */
+   之类的布尔字段、筛选条「只看已上架」、玩家仓库的「拥有 / 没有」。 */
 .toggle {
   display: inline-flex; align-items: center; gap: 7px;
   cursor: pointer; user-select: none; font-size: 13px; font-weight: 600;
@@ -385,14 +385,25 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 .toolbar select { width: auto; }
 .toolbar .grow { margin-left: auto; }
 
-/* 「玩家资料」工具条右端的「● 当前在线：N 人」（用户 2026-09-08）。
+/* 「玩家仓库」工具条右端的「● 当前在线：N 人」（用户 2026-09-08）。
 
-   ★ 这是**状态**不是钮，所以不碰琥珀（这一页琥珀 = 可点的东西），走苔绿
-     —— 全页「开 / 通」那个语义色（开关、备份「自动」徽标都是它）。
+   ★ 圆点走**琥珀**，不走苔绿 —— 用户 2026-09-08 第二轮说那颗绿点「突兀」。
+     和 D40a 拿掉青色权限钮是同一个道理：这一页是琥珀 + 米白 + 深棕的暖调，
+     苔绿是**开关**那一档的语义色（`.toggle.on` / 备份页「自动」徽标），
+     摊到工具条上就成了整条里唯一一块异色。琥珀本来就是这一页「在线」的颜色
+     —— 玩家弹窗标题那句 `● 在线，改完即时生效` 用的就是 `--amber-soft`
+     （那儿底是深棕所以取浅档，这儿底是米白，取正色 `--amber` + 深一档描边）。
+     ⇒ **别再改回绿**。「琥珀 = 可点的钮」那条只管**钮**：9px 的圆点后面
+     直接跟着文字，不会被当成按钮。
    ★ 实心 / 空心跟玩家弹窗那个 `● 在线 / ○ 不在线` 一个口径：有人在线亮
-     实心点，一个人都没有就只剩描边的空心点，别让绿灯一直亮着。
-   ★ 底是 `--paper-2` 的工具条，所以正文走次要说明字、只有数字用苔绿深一档
-     加粗顶出来；数字比正文大一号也撑不高这一条（旁边是输入框和按钮）。 */
+     实心点，一个人都没有就只剩描边的空心点，别让灯一直亮着。
+   ★ 底是 `--paper-2` 的工具条，所以正文走次要说明字，数字用 `--gold-edge`
+     加粗大一号顶出来 —— 用户 2026-09-08 第三轮说数字也要黄的，并且在
+     「2.0 / 2.7 / 3.4 / 4.2 / 5.5 对比度」五档里**看过效果之后挑的这一档**
+     （最浅、最黄的那一支，金钮描边同色）。
+     ⇒ **别自作主张压深**：它在米白上只有 2:1，比旁边那行说明字还淡，
+     这是用户要的观感，不是漏了没调；同理**别把这支当正文字色的先例**
+     —— 这里能成立，靠的是加粗 + 大一号 + 只有一两个字符。 */
 .online-tally {
   margin-left: auto;
   color: var(--cocoa-soft); font-size: 13px; font-weight: 600;
@@ -401,10 +412,10 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 .online-tally .dot {
   display: inline-block; width: 9px; height: 9px; margin-right: 6px;
   vertical-align: 1px;                     /* 圆点中心对齐中文的视觉中线 */
-  background: var(--moss); border: 1px solid var(--moss-dk); border-radius: 50%;
+  background: var(--amber); border: 1px solid var(--amber-dark); border-radius: 50%;
 }
 .online-tally.zero .dot { background: transparent; border-color: var(--cocoa-soft); }
-.online-tally b { color: var(--moss-dk); font-size: 15px; }
+.online-tally b { color: var(--gold-edge); font-size: 15px; }
 .online-tally.zero b { color: var(--cocoa-soft); }
 
 /* ★ 配置页那一条：左边筛选、右边「添加 / 放弃修改 / 保存」，**同一行**
@@ -611,8 +622,8 @@ code {
   width: 100%; max-height: 2.5em; overflow: hidden;
 }
 .pick-empty { color: var(--cocoa-soft); padding: 30px; text-align: center; }
-/* ★ 弹窗里只有网格自己滚（用户 2026-09-06，D39）：搜索 / 类别 / 角色
-   那一条和换页栏钉住不动。★ 底下那条详情侧栏 2026-09-06 删了 ——
+/* ★ 弹窗里只有网格自己滚（用户 2026-09-06，D39）：搜索 / 类别 / 角色 /
+   上架状态那一条和换页栏钉住不动。★ 底下那条详情侧栏 2026-09-06 删了 ——
    它和浮窗写的是同一批东西，而且「在不在卖」还是现问服务端的旧值。 */
 #picker .panel-body { overflow: hidden; display: flex; flex-direction: column; }
 #picker .panel-body > .toolbar,
@@ -686,7 +697,7 @@ code {
 /* 状态那几行（下次 / 上次 / 目录）各占一行。 */
 .backup-status { white-space: pre-line; margin: 0 0 12px; line-height: 1.7; }
 
-/* ---------------------------------------------- 玩家背包弹窗（用户 2026-09-07） */
+/* ---------------------------------------------- 玩家仓库弹窗（用户 2026-09-07） */
 #playerModal .panel { width: min(1020px, 100%); height: min(780px, 100%); }
 /* 壳照配置页那套：只有物品区滚，数值 / 按钮条 / 分类标签钉住。 */
 #playerModal .panel-body { overflow: hidden; display: flex; flex-direction: column; }
@@ -731,7 +742,7 @@ code {
 .cat-tabs button.cat.on .n { background: rgba(255, 255, 255, .35); color: #fff; }
 .cat-tabs.sub button.cat.on .n { background: rgba(120, 70, 10, .15); color: var(--cocoa-ink); }
 
-/* 选择器的批量模式（玩家背包弹窗「添加物品」）：勾选的格子金边 + 右上角 ✓，
+/* 选择器的批量模式（玩家仓库弹窗「添加物品」）：勾选的格子金边 + 右上角 ✓，
    已经在仓库里的画成灰的「已有」、点不动。 */
 .pick { position: relative; }
 .pick.chosen { border-color: var(--gold-edge); background: #FFF3C4; }
@@ -750,7 +761,7 @@ code {
 }
 .panel-foot .grow { margin-left: auto; }
 
-/* ---------------------------------------------------------- 玩家资料页 */
+/* ---------------------------------------------------------- 玩家仓库页 */
 h3.sub {
   margin: 20px 0 8px; font-size: 14px; color: var(--cocoa-soft);
   padding-bottom: 5px; border-bottom: 2px dashed var(--line);
@@ -808,16 +819,16 @@ h3.sub {
 .player-list td { vertical-align: middle; }
 tr.on td { background: #FFFBEF; }
 td .btn-sm { white-space: nowrap; }
-/* 一行两个按钮（「修改背包」+「设为管理员（运营）」，D40）—— 挤不下就折行，
+/* 一行两个按钮（「修改仓库」+「设为管理员（运营）」，D40）—— 挤不下就折行，
    别把名字那几列压扁。 */
-/* 一行两个按钮（左「设为管理员（运营）」+ 右「修改背包」，D40），
+/* 一行两个按钮（左「设为管理员（运营）」+ 右「修改仓库」，D40），
    整组**右对齐** —— 那一列宽度随权限文字长短变，靠右才对得齐。 */
 td .acts {
   display: flex; gap: 6px; flex-wrap: wrap;
   align-items: center; justify-content: flex-end;
 }
 /* 换页栏夹在筛选条和列表之间（四个配置页 / 选择物品弹窗 / 数据备份 /
-   玩家资料都是这个位置）：上面靠筛选条自己的下边距隔开，下面再留 12px
+   玩家仓库都是这个位置）：上面靠筛选条自己的下边距隔开，下面再留 12px
    才接列表。原来是 `margin-top: 10px` 叠在筛选条的 14px 上、底下又贴着
    列表 —— 上远下近（用户 2026-09-07）。 */
 .pager {

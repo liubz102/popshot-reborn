@@ -750,7 +750,7 @@ class AdminCatalogTests(_AdminCase):
                 by_id[item_id]["desc"], item_id)
 
     def test_items_carry_their_warehouse_tab_and_the_tree_comes_along(self):
-        # 玩家背包弹窗按游戏仓库界面那棵树分类（§41）：每件带 `wh`，树随物品表发。
+        # 玩家仓库弹窗按游戏仓库界面那棵树分类（§41）：每件带 `wh`，树随物品表发。
         tree = self.catalog["warehouse"]
         self.assertEqual(["武器", "道具", "装备", "人物", "技能", "收集品", "称号"],
                          [tab["label"] for tab in tree])
@@ -879,7 +879,7 @@ class AdminAccountApiTests(_AdminCase):
 
     def test_changing_a_role_takes_effect_without_a_relogin(self):
         """★ 权限是**每一发请求现查**的：把一个人降成运营，他手里那个令牌
-        应该当场失去「玩家资料」和「管理员账号」，不该等他重新登录。"""
+        应该当场失去「玩家仓库」和「管理员账号」，不该等他重新登录。"""
         self.request("/admin/api/admins/add",
                      {"name": "carol", "password": "SecretPw",
                       "role": "system"})
@@ -1205,7 +1205,7 @@ class AdminItemLookupTests(_AdminCase):
 
 
 class AdminPlayerTests(_AdminCase):
-    """玩家资料页：找人、改等级 / 金币 / 材料 / 仓库物品（V0.3商店 D22）。
+    """玩家仓库页：找人、改等级 / 金币 / 材料 / 仓库物品（V0.3商店 D22）。
 
     ★ **商店在卖的东西也能直接发**（D23a，用户 2026-09-06 推翻了 D23）：
     等级门槛在**穿上**那一刻还要再判一次，塞进仓库不等于绕过它。

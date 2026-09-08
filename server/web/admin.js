@@ -1129,11 +1129,10 @@ function renderToolbar(which) {
   }
   if (which === "items") {
     // 上架状态：一件东西要么在商店卖、要么靠合成拿、要么都不是（互斥）。
-    bar.appendChild(selectFilter(filter, "listing", "全部", [
-      {value: "shop", label: "只看上架商店"},
-      {value: "recipe", label: "只看上架合成"},
-      {value: "any", label: "只看已上架"},
-      {value: "none", label: "只看未上架"}]));
+    // ★ 选项和「选择物品」弹窗共用 `LISTING_FILTER_OPTIONS`（判据也共用，
+    //   见 `listingMatches`）—— 同一个筛选两处画，别抄两份。
+    bar.appendChild(selectFilter(filter, "listing", "全部",
+                                 LISTING_FILTER_OPTIONS));
   }
   if (which === "recipe") {
     // ★ 类别取的是**产物**的类别（配方条目自己没有 `kind` 这一栏）——
@@ -1303,13 +1302,7 @@ function entryItemId(which, entry) {
 function matches(which, entry) {
   var filter = FILTER[which] || {};
   if (filter.listedOnly && !entry.listed) { return false; }
-  if (filter.listing) {
-    var where = listingOf(entry.id);          // "shop" / "recipe" / ""
-    if (filter.listing === "any" && !where) { return false; }
-    if (filter.listing === "none" && where) { return false; }
-    if ((filter.listing === "shop" || filter.listing === "recipe")
-        && where !== filter.listing) { return false; }
-  }
+  if (!listingMatches(entry.id, filter.listing)) { return false; }
   if (filter.mode && (entry.mode || "quest") !== filter.mode) { return false; }
   if (which === "drops") {
     if (!dropFieldMatches(entry.stage, filter.stage)) { return false; }
@@ -1504,6 +1497,31 @@ function listingOf(itemId) {
 }
 
 var LISTING_ZH = {shop: "商店", recipe: "合成", "": "未上架"};
+
+/** 「上架状态」筛选的四个选项。★ 物品库那一页的筛选条和「选择物品」弹窗
+ *  **共用这一份**（弹窗那个是用户 2026-09-09 要的）—— 同一个筛选出现在两处，
+ *  抄两份迟早会分岔（选项名、顺序、判据各歪一点）。
+ *  空值（下拉第一项）= 不筛。 */
+var LISTING_FILTER_OPTIONS = [
+  {value: "none", label: "只看未上架"},
+  {value: "any", label: "只看已上架"},
+  {value: "shop", label: "只看上架商店"},
+  {value: "recipe", label: "只看上架合成"}];
+
+/** 这件东西过不过「上架状态」筛选。
+ *
+ * ★ 「已上架」= **商店或合成**，哪一边都算。两边互斥是保存时那道确认框的事
+ *   （D33），筛选这儿只问「上没上」。
+ * ★ `want` 为空就直接放行 —— 不筛的时候一次 `listingOf` 都不跑
+ *   （它要把货架和配方两份从头扫一遍，弹窗里每敲一个字都会重画）。
+ */
+function listingMatches(itemId, want) {
+  if (!want) { return true; }
+  var where = listingOf(itemId);              // "shop" / "recipe" / ""
+  if (want === "any") { return !!where; }
+  if (want === "none") { return !where; }
+  return where === want;
+}
 
 /** 这件东西要不要「等级 / 角色限定」两栏。
     ★ 和服务端 `shopcfg.has_level_and_character()` **同一条判据**：
@@ -1827,7 +1845,7 @@ var PICKER = null;
 /** 打开选择器。
  *
  *  单选（配置页「添加」）：`{kinds, selected, onPick(item)}`，点一格就选中并关闭。
- *  批量（玩家背包弹窗「添加物品」，用户 2026-09-07）：`{multi: true, owned,
+ *  批量（玩家仓库弹窗「添加物品」，用户 2026-09-07）：`{multi: true, owned,
  *  onPickMany(items)}` —— 格子点了打勾、再点取消，底下「确认添加」一次全给；
  *  `owned` 里的画成「已有」、点不动。
  */
@@ -1843,7 +1861,8 @@ function openPicker(options) {
     q: "",
     page: 0,
     kind: (options.kinds && options.kinds.length === 1) ? options.kinds[0] : "",
-    character: ""
+    character: "",
+    listing: ""
   };
   $("pickSearch").value = "";
   var kindSelect = $("pickKind");
@@ -1871,6 +1890,20 @@ function openPicker(options) {
     whoSelect.appendChild(node);
   });
   whoSelect.value = "";
+  // 上架状态下拉（用户 2026-09-09）。选项和物品库那一页共用
+  // `LISTING_FILTER_OPTIONS` —— 每次打开都从「全部上架状态」起，和搜索串、
+  // 角色一样不跨次记忆（上一次筛剩三件，这一次打开又空网格最难查）。
+  var listingSelect = $("pickListing");
+  listingSelect.textContent = "";
+  var anyListing = el("option", null, "全部上架状态");
+  anyListing.value = "";
+  listingSelect.appendChild(anyListing);
+  LISTING_FILTER_OPTIONS.forEach(function (option) {
+    var node = el("option", null, option.label);
+    node.value = option.value;
+    listingSelect.appendChild(node);
+  });
+  listingSelect.value = "";
   kindSelect.disabled = !!(PICKER.kinds && PICKER.kinds.length === 1);
   $("pickFoot").classList.toggle("hidden", !PICKER.multi);
   $("picker").classList.remove("hidden");
@@ -1933,6 +1966,9 @@ function paintPicker() {
         && String(itemRuleOf(item.id).character) !== PICKER.character) {
       return false;
     }
+    // 上架状态和物品库那一页同一条判据（`listingMatches`）：「已上架」
+    // = 商店或合成；看的是当前页面模型，还没保存的改动也算。
+    if (!listingMatches(item.id, PICKER.listing)) { return false; }
     if (!query) { return true; }
     // 中文名按**物品库**里那一份搜（D31）—— 在物品库里改过名字之后，
     // 用新名字搜不到才叫奇怪。
@@ -2048,7 +2084,7 @@ async function setAdminRole(name, role) {
   if (result.admins) { renderAdmins(result.admins); }
   else { loadAdmins(); }
   if (result.ok && result.self_demoted) {
-    // 把自己降成运营 ⇒ 这一页和「玩家资料」当场就该消失。
+    // 把自己降成运营 ⇒ 这一页和「玩家仓库」当场就该消失。
     ROLE = "operator";
     $("who").textContent = "已登录：" + name + "（运营）";
     applyRoleToTabs();
@@ -2373,7 +2409,7 @@ async function refreshBackups() {
 }
 
 /* ======================================================================
-   玩家资料（V0.3商店 D22 的配套：商店按真实等级卖，改数值只能从这儿改）
+   玩家仓库（V0.3商店 D22 的配套：商店按真实等级卖，改数值只能从这儿改）
 
    模型：`PLAYER.view` 是服务端那份快照，`PLAYER.edit` 是**要提交的补丁**
    —— 两张 `{itemId: 数量}` 表 + 等级 + 金币。删掉一件东西 = 把它的数量写成 0
@@ -2416,7 +2452,7 @@ async function searchPlayers(page) {
   return true;
 }
 
-/** 「↻ 刷新」——「玩家资料」和「管理员账号」两页**共用这一发**
+/** 「↻ 刷新」——「玩家仓库」和「管理员账号」两页**共用这一发**
  *  （用户 2026-09-06，D43）：点哪一个按钮都把两页一起刷。
  *
  * ★ 为什么两页一起：它们是同一份 `accounts.json` 的两个视图。把一个玩家
@@ -2444,7 +2480,7 @@ async function refreshAccounts() {
   ok = (await loadAdmins()) && ok;
   // ★ 失败时**不要**盖掉错误信息 —— 「已刷新」压在「请先登录」上面，
   //   用户看到的就是「点了刷新，然后什么都没变」。
-  if (ok) { toast("已刷新：玩家资料和管理员账号都是最新的。", true); }
+  if (ok) { toast("已刷新：玩家仓库和管理员账号都是最新的。", true); }
 }
 
 function renderPlayerRows() {
@@ -2465,10 +2501,10 @@ function renderPlayerRows() {
     line.appendChild(el("td", null, row.level));
     line.appendChild(el("td", null, row.money));
     var td = el("td");
-    // ★ 权限那个钮在**左**、「修改背包」在**右**，整组**右对齐**
-    //   （用户 2026-09-06）。两个钮**长得不一样**（D40）：一个改这个人的背包、
+    // ★ 权限那个钮在**左**、「修改仓库」在**右**，整组**右对齐**
+    //   （用户 2026-09-06）。两个钮**长得不一样**（D40）：一个改这个人的仓库、
     //   一个给他管理页的权限，不能像同一个东西 —— 但靠的是**轻重**不是色相
-    //   （D40a，用户 2026-09-07）：「修改背包」是这一行的主动作，金色主钮；
+    //   （D40a，用户 2026-09-07）：「修改仓库」是这一行的主动作，金色主钮；
     //   「设为管理员」少用、米黄默认钮。原来的青色是整页唯一的冷色，太突兀。
     var acts = el("div", "acts");
     // 已经是管理员的：同一个位置换成**点不动的灰钮**，上面写他的实际权限，
@@ -2484,7 +2520,7 @@ function renderPlayerRows() {
       promote.onclick = function () { promoteToAdmin(row.username); };
     }
     acts.appendChild(promote);
-    var button = el("button", "btn btn-sm btn-primary", "修改背包");
+    var button = el("button", "btn btn-sm btn-primary", "修改仓库");
     button.onclick = function () { openPlayer(row.username); };
     acts.appendChild(button);
     td.appendChild(acts);
@@ -2879,7 +2915,7 @@ async function savePlayer() {
   toast(result.message, result.ok);
 }
 
-/** 弹窗里的「↻ 刷新」：玩家资料 + 物品表 + 四份运营配置（名字 / 等级门槛的出处）
+/** 弹窗里的「↻ 刷新」：玩家仓库 + 物品表 + 四份运营配置（名字 / 等级门槛的出处）
  *  全部重读（用户 2026-09-07：「取得最新的用户信息和运营物品信息」）。
  *  有没保存的改动先问一句；失败时不用「已刷新」盖掉错误。 */
 async function refreshPlayerPopup() {
@@ -2897,7 +2933,7 @@ async function refreshPlayerPopup() {
   ok = (await refreshConfigs(true)) && ok;
   ok = (await openPlayer(name, true)) && ok;
   ok = (await searchPlayers()) && ok;
-  if (ok) { toast("已刷新：玩家资料和物品信息都是最新的。", true); }
+  if (ok) { toast("已刷新：玩家仓库和物品信息都是最新的。", true); }
 }
 
 /** 物品表（`/admin/api/catalog`）：登录后拿一次，玩家弹窗的刷新再拿一次。 */
@@ -2925,7 +2961,7 @@ async function loadCatalog() {
 var ROLE = null;                       // "system" / "operator" / null（没登录）
 
 //: 现在停在哪个标签页。★ 和 `CURRENT` 不是一回事 —— `CURRENT` 只记那四个
-//  **配置**页（渲染要用），「玩家资料」和「管理员账号」不在里面。
+//  **配置**页（渲染要用），「玩家仓库」和「管理员账号」不在里面。
 var TAB = "items";
 
 //: 只有系统管理员能进的标签页（数据备份也是：它能回滚玩家存档）。
@@ -3011,8 +3047,8 @@ function switchTab(tab) {
     button.classList.toggle("on", button.getAttribute("data-tab") === tab);
   });
   var isConfig = CONFIGS.indexOf(tab) >= 0;
-  // ★ 四个配置页、数据备份页和玩家资料页是「面板撑满、列表自己滚」（D39；
-  //   玩家资料页 2026-09-07 加进来）；管理员账号是普通长页面，整块跟着
+  // ★ 四个配置页、数据备份页和玩家仓库页是「面板撑满、列表自己滚」（D39；
+  //   玩家仓库页 2026-09-07 加进来）；管理员账号是普通长页面，整块跟着
   //   `main` 滚。
   $("mainArea").classList.toggle("fit",
                                  isConfig || tab === "backup" || tab === "players");
@@ -3102,7 +3138,7 @@ function wire() {
     PLAYER.edit.money = Math.max(0, Number($("playerMoney").value) || 0);
     playerTouched();
   };
-  // 玩家背包弹窗（用户 2026-09-07）：只有 ✕ 能关，点遮罩不关 —— 所以
+  // 玩家仓库弹窗（用户 2026-09-07）：只有 ✕ 能关，点遮罩不关 —— 所以
   // `#playerModal` 故意**没有** onclick。
   $("playerAddItem").onclick = function () { addOwnedMany(); };
   $("playerPopupRefresh").onclick = function () { refreshPlayerPopup(); };
@@ -3124,6 +3160,11 @@ function wire() {
   };
   $("pickCharacter").onchange = function () {
     PICKER.character = $("pickCharacter").value;
+    PICKER.page = 0;
+    paintPicker();
+  };
+  $("pickListing").onchange = function () {
+    PICKER.listing = $("pickListing").value;
     PICKER.page = 0;
     paintPicker();
   };
