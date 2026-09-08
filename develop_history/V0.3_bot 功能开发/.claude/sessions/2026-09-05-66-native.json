@@ -1,0 +1,90 @@
+{
+  "image_sha256": "81e66c3eeb193560da2b59cb0924ba0d725e2ad405435f1b6389511af1fa8d1b",
+  "native_jump_replays": [
+    {
+      "stage": 1,
+      "after_heartbeat": {
+        "x": 404.0,
+        "y": 142.90001,
+        "vx": 10.0,
+        "vy": -18.0
+      },
+      "after_queued_jump": {
+        "x": 404.0,
+        "y": 142.90001,
+        "vx": 0.0,
+        "vy": -20.78461
+      },
+      "four_ticks_horizontal_divergence_px": 42.0
+    },
+    {
+      "stage": 2,
+      "after_heartbeat": {
+        "x": 404.0,
+        "y": 141.3,
+        "vx": 10.0,
+        "vy": -22.0
+      },
+      "after_queued_jump": {
+        "x": 404.0,
+        "y": 141.3,
+        "vx": 0.0,
+        "vy": -24.0
+      },
+      "four_ticks_horizontal_divergence_px": 42.0
+    }
+  ],
+  "control_right_key_after_jump": {
+    "x": 404.0,
+    "y": 141.3,
+    "vx": 1.75,
+    "vy": -24.0
+  },
+  "previous_airborne_heartbeat_then_jump": {
+    "x": 400.0,
+    "y": 150.5,
+    "vx": 0.0,
+    "vy": -24.0
+  },
+  "control_jump_flushed_before_heartbeat": {
+    "x": 404.0,
+    "y": 141.3,
+    "vx": 10.0,
+    "vy": -22.0
+  },
+  "hit_anchor_then_queued_hit": {
+    "before": {
+      "x": 403.20001,
+      "y": 147.7,
+      "vx": 8.0,
+      "vy": -6.0
+    },
+    "after": {
+      "x": 403.20001,
+      "y": 147.7,
+      "vx": 16.0,
+      "vy": -14.0
+    }
+  },
+  "bound_heartbeat_replay": {
+    "before": {
+      "x": 1535.77002,
+      "y": 902.71002,
+      "vx": 0.0,
+      "vy": 0.0
+    },
+    "after_five_heartbeats": {
+      "x": 1535.77002,
+      "y": 902.71002,
+      "vx": 0.0,
+      "vy": 0.0
+    },
+    "after_release_and_heartbeat": {
+      "x": 1582.66211,
+      "y": 847.32605,
+      "vx": 0.0,
+      "vy": -5.0
+    }
+  },
+  "scope": "Native state/jump blocks; no live game, network or collision."
+}

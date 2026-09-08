@@ -1152,15 +1152,14 @@ class BotWalkAnimationTests(BotFrameRoom):
         self.assertEqual(0,
                          self.keys_of(bot_frames(self.alice, self.bot_seat)[-1]))
 
-    def test_a_bot_in_the_air_holds_no_key(self):
-        """★ 腾空那一段不按键（§39）：动画是 `Jump`（不看掩码），而收方
-        `0x507402` 会拿按键**覆写**空中速度，把抄来的抛体速度冲掉。"""
+    def test_a_bot_in_the_air_keeps_its_direction_input(self):
+        """普通空中积分不读键，但 Jump/动画会读；腾空不等于松键（§186）。"""
         self.walk(self.alice, [(0, 0), (200, 0)])
         self.human_heartbeat(self.alice, 400, -50, on_ground=False,
                              velocity=(9, -20))
         self.human_heartbeat(self.alice, 600, -50, on_ground=False,
                              velocity=(9, -20))
-        self.assertEqual(0,
+        self.assertEqual(botsync.KEY_RIGHT,
                          self.keys_of(bot_frames(self.alice, self.bot_seat)[-1]))
 
     def test_a_bot_that_has_not_moved_yet_holds_no_key(self):
@@ -5110,8 +5109,12 @@ class BotDifficultyAccuracyTests(TerrainMixin, BotFireRoom):
             self.assertAlmostEqual(expected, rate, delta=0.06)
             rates.append(rate)
         self.assertEqual(sorted(rates), rates)
+        # ★ 这两条是**观感**下限，不是上面那张表的复述：最简单档得让玩家
+        #   明显觉得「它打不中」，最难档得明显觉得「它很准」。会话 72（D155）
+        #   把表整体调高之后 5 档的期望命中率正好落在 0.80，所以这里给取样
+        #   噪声留出余量，别写成 0.80 —— 那是一半概率红的判据。
         self.assertLess(rates[0], 0.25)
-        self.assertGreater(rates[-1], 0.80)
+        self.assertGreater(rates[-1], 0.70)
 
     def test_a_ground_bound_miss_is_fired_and_resolves_without_direct_damage(self):
         self.install_terrain(synth_terrain("flat"))
@@ -6069,7 +6072,9 @@ class BotBreakableShortcutTests(TerrainMixin, BotFireRoom):
         self.assertTrue(choice.shortcut)
         self.assertTrue(choice.reached)
         self.assertEqual(55, choice.blocker)
-        self.assertEqual(1, len(choice.prefix))
+        # 脚点模型先走一步到 413 再撞上罐子；三圆扫掠（§192）第一条跳跃边的
+        # 身圆就碰到它 —— 罐子前面最多一步，站在原地打也是同一件罐子。
+        self.assertLessEqual(len(choice.prefix), 1)
         self.assertEqual((526, 840),
                          (self.terrain.breakables[choice.blocker].x,
                           self.terrain.breakables[choice.blocker].y))
@@ -9935,14 +9940,59 @@ class MotionTransitionAnchorTests(TerrainMixin, BotFrameRoom):
         return [frame for frame in bot_frames(self.alice, self.bot_seat)
                 if udpsync.is_heartbeat(frame)]
 
-    def test_free_flight_does_not_raise_the_heartbeat_rate(self):
+    def test_free_flight_reports_every_tick(self):
+        """★★★★★ 腾空**每格一发**（V0.3 §191 / D150）。
+
+        收方那份腾空角色是它自己的三圆扫掠在挡（`0x50d58a` → `0x50e759`），
+        服务端这份是脚下一个点 —— 头顶那片实心只挡得住收方那份。两发心跳
+        之间它自己积分几格，分歧就能攒几格；实机空中滞后 p99 71 px 全是
+        这种地方，装了 BSM1 前后一样。⇒ 让它最多自己积分 `AIR_HEARTBEAT_TICKS` 格。
+        """
         terrain = synth_terrain("motion_anchor_free", floor=170, height=220)
         self.prepare(terrain)
         self.place_motion(botmove.Body(400.0, 100.0, 5.0, -10.0,
                                        on_ground=False))
+        self.advance(3)
+        beats = self.sent_beats()
+        self.assertEqual(3, len(beats), "腾空三格该三发，一格都不许攒")
+        for beat in beats:
+            self.assertFalse(udpsync.heartbeat_motion(beat)[2],
+                             "前提：这三格都还在空中")
+
+    def test_a_key_flip_on_the_ground_is_anchored_the_same_tick(self):
+        """★★★★★ 踩地时方向键 / 冲刺位一翻转就当格补锚（V0.3 §190 / D149）。
+
+        决策格 `(tick+座位) % 2 == 0` 和心跳格 `% 4 == 3` 相位锁死，翻转永远
+        落不到心跳格上；实机 750 次翻转里同格 0 次、p90 晚 96 ms —— 收方那
+        1~3 格朝旧方向走 7~36 px 再被拽回来。判据是**报出去的状态翻转**。
+        """
+        terrain = synth_terrain("motion_anchor_keys")
+        self.prepare(terrain)
+        # `prepare()` 那一发踩地心跳报的是「没按键」—— 这就是基线。
+        self.assertEqual((0, False), self.bot_conn.walk_reported)
+        self.place_motion(botmove.Body(400.0, 150.0))
+        self.bot_conn.intent = (1, False, False, False)
         self.advance(1)
-        self.assertEqual([], self.sent_beats(),
-                         "连续的重力积分收方自己会算，不该每格都发")
+        beats = self.sent_beats()
+        self.assertEqual(1, len(beats), "开始按右键的那一格就该补一发")
+        self.assertEqual(botsync.KEY_RIGHT, udpsync.heartbeat_keys(beats[0]))
+        self.assertTrue(udpsync.heartbeat_motion(beats[0])[2], "前提：还踩在地上")
+        self.clear()
+        self.bot_conn.intent_tick = self.loop().done
+        self.advance(1)
+        self.assertEqual([], self.sent_beats(), "同一个方向接着走，不许每格刷")
+        self.bot_conn.intent = (1, False, False, True)
+        self.bot_conn.intent_tick = self.loop().done
+        self.advance(1)
+        self.assertEqual(1, len(self.sent_beats()), "起跑（冲刺位翻转）也要当格报")
+        self.assertTrue(udpsync.heartbeat_motion(self.sent_beats()[0])[5])
+        self.clear()
+        self.bot_conn.intent = (0, False, False, False)
+        self.bot_conn.intent_tick = self.loop().done
+        self.advance(1)
+        self.assertEqual(1, len(self.sent_beats()), "松键那一格也要报")
+        self.assertEqual(0, udpsync.heartbeat_keys(self.sent_beats()[0]))
+        self.assertEqual((0, False), self.bot_conn.walk_reported)
 
     def test_a_jump_carries_an_immediate_position_and_velocity_anchor(self):
         terrain = synth_terrain("motion_anchor_jump")
@@ -10089,8 +10139,11 @@ class AirborneSpeedIsReproducibleTests(unittest.TestCase):
     def replay(self, terrain, who, body, ticks=64):
         """一边跑服务端物理，一边按收方的模型复现。
 
-        收方：每发心跳把位置和速度**硬对齐**一次，中间 4 个 tick 自己
-        `v.y += 1.2; pos += v` 地推。
+        收方：每发心跳把位置和速度**硬对齐**一次，中间自己
+        `v.y += 1.2; pos += v` 地推。腾空的心跳节拍是
+        `gameserver.AIR_HEARTBEAT_TICKS`（D150 之后是 1 格；D149 之前是 4 格，
+        那时一窗攒 4 格的分歧）—— 这里照生产的节拍对齐，量的才是收方真会
+        看到的那一窗。
 
         返回 `(最大偏差, 跟丢的窗口数)`。
 
@@ -10116,7 +10169,7 @@ class AirborneSpeedIsReproducibleTests(unittest.TestCase):
             gap = max(abs(theirs[0] - seen.x), abs(theirs[1] - seen.y))
             worst = max(worst, gap)
             window = max(window, gap)
-            if (step + 1) % gameserver.HEARTBEAT_TICKS == 0:
+            if (step + 1) % gameserver.AIR_HEARTBEAT_TICKS == 0:
                 if window > self.DRIFT:
                     lost += 1
                 window = 0.0

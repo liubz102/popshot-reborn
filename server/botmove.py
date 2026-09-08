@@ -438,8 +438,118 @@ def _ceiling_between(terrain, x0, y0, x1, y1):
     return None
 
 
-def _air_tick(terrain, body):
+def _body_probes(character, ux, uy):
+    """收方扫掠用的那组探测点（V0.3 §191 / §192）—— **头圆和身圆**各取
+    「圆心 + 单位方向 × 半径」，相对脚点的偏移，**整数截断**（照抄 `0x50e759`：
+    每个形状 `+0x10/+0x14` 是圆心偏移、`+0x18` 是半径，方向向量是归一化的
+    `(vx, vy)`；圆心高度照抄 `chrprops.Character.circles()`）。
+
+    腿那个圆**不在这里**：脚点那套老逻辑（撞墙 / 蹭坎 / 落地 / `_ceiling_between`）
+    管的就是它，两处都管会让落地那一格被扫掠抢先「挡住」而永远落不下去。
+    """
+    legs, body_r, head_r = _shape_sizes(character)
+    body_cy = -2.0 * legs - body_r
+    head_cy = body_cy - body_r - head_r
+    return ((int(ux * head_r), int(head_cy + uy * head_r)),
+            (int(ux * body_r), int(body_cy + uy * body_r)))
+
+
+def _shape_sizes(character):
+    """`(腿, 身, 头)` 三个半径，带缺省（同 `fits()`）。
+
+    ★ 记在角色对象上：预热一张可达图要问几十万次，三次 `getattr` 带缺省
+      在那条热路径上占了扫掠本身三成的时间。角色对象不让挂属性（`__slots__`）
+      就每次算，行为一样。
+    """
+    cached = getattr(character, "_botmove_shape", None)
+    if cached is None:
+        cached = (float(getattr(character, "size_legs", 12.0) or 12.0),
+                  float(getattr(character, "size_body", 13.0) or 13.0),
+                  float(getattr(character, "size_head", 10.0) or 10.0))
+        try:
+            character._botmove_shape = cached
+        except (AttributeError, TypeError):
+            pass
+    return cached
+
+
+def _shape_hit(terrain, character, x0, y0, x1, y1, escape=False):
+    """脚点从 `(x0, y0)` 挪到 `(x1, y1)`，头圆 / 身圆的前沿点撞没撞上实心。
+
+    返回 `None`（一路畅通）或「撞之前最后一个安全脚点」`(x, y)`。
+
+    ## 为什么要有它（V0.3 §191 / §192）
+
+    这个文件其余部分把角色当**脚下一个点**；真客户端腾空推位置是
+    `Character` vf+0x70 = `0x50d58a` → `0x50e759`：沿速度方向逐格走，每格拿
+    三个碰撞圆沿运动方向的前沿点去问 `0x473969`，头一格挡住就整个停下、把速度
+    收掉。冰洞顶、悬崖下沿、图顶这种「脚过得去、头过不去」的地方，服务端这份
+    飞过去、收方那份被顶住 —— 实机三局 4%~21% 的腾空心跳头 / 身嵌在实心里，
+    一段最长 20~28 格，那段时间收方逐帧跳变是平时的 2~4 倍，画面上就是
+    「头嵌进障碍物、一卡一卡、掉出来才好」（用户 2026-09-07）。
+
+    ## 口径
+
+    * 挡得住的是 `cell >= 2`（实心 + 左右图外；`mapdata.cell()` 出界返回 2）。
+      单向平台（1）**不挡**头 / 身：它只挡往下落的脚（老逻辑的 `ground_below`）。
+    * ★ **图顶不挡头**。收方那份远端角色到不了头顶出图（实机 `CHAR.` 行：
+      `Iceria02` 脚 y=72.9 往上一格就被顶住），可真人**自己**的角色在语料里
+      脚 y 到过 38（头顶伸出图顶 32 px）—— 本机物理和远端复现在图顶上本来就
+      不一样，bot 照真人自己那套（铁律 11）；远端那一下顶住是原版对真人一样有
+      的显示误差。`Quest02_1` 第二个岩浆坑走速二段跳就靠这段「顶上的弧线」，
+      挡了就过不去。
+    * 逐整数格推进（`n = max(|dx|, |dy|)` 步），坐标整数截断，同 `0x50e759`。
+    * `escape=True` 且**往下走**时，出发时就嵌在实心里的探测点从出土起才认
+      （同 `_ceiling_between` 的「人已经陷在地形里」）：头嵌在顶里的人要能掉
+      出来。**往上 / 横着走不豁免**：头已经在顶里还往上顶、往旁边挪，收方那份
+      是不会动的（实机 `CHAR.` 行：位置原地不动、速度收掉、等重力带出来）。
+    * 大多数腾空 tick 头顶是开阔的：先拿粗网格证明整块空，证不了才逐格。
+    """
+    dx = x1 - x0
+    dy = y1 - y0
+    steps = int(math.ceil(max(abs(dx), abs(dy))))
+    if steps <= 0:
+        return None
+    norm = math.hypot(dx, dy)
+    probes = _body_probes(character, dx / norm, dy / norm)
+    ix0, iy0 = int(x0), int(y0)
+    ix1, iy1 = int(x1), int(y1)
+    (hx, hy), (bx, by) = probes
+    clear = getattr(terrain, "coarse_clear", None)
+    if clear is not None and clear(min(ix0, ix1) + min(hx, bx),
+                                   min(iy0, iy1) + min(hy, by),
+                                   max(ix0, ix1) + max(hx, bx),
+                                   max(iy0, iy1) + max(hy, by)):
+        return None
+    # ★ 热路径（预热一张图要跑几十万个 tick）：两个探测点手工展开，不套循环 /
+    #   闭包 —— 实测比通用写法快一成；`y < 0` 是图顶，不挡（见上）。
+    cell = terrain.cell
+    dig_h = escape and dy > 0 and iy0 + hy >= 0 and cell(ix0 + hx, iy0 + hy) >= 2
+    dig_b = escape and dy > 0 and iy0 + by >= 0 and cell(ix0 + bx, iy0 + by) >= 2
+    prev = (x0, y0)
+    for s in range(1, steps + 1):
+        px = x0 + dx * s / steps
+        py = y0 + dy * s / steps
+        ipx, ipy = int(px), int(py)
+        y = ipy + hy
+        if y < 0 or cell(ipx + hx, y) < 2:
+            dig_h = False
+        elif not dig_h:
+            return prev
+        y = ipy + by
+        if y < 0 or cell(ipx + bx, y) < 2:
+            dig_b = False
+        elif not dig_b:
+            return prev
+        prev = (px, py)
+    return None
+
+
+def _air_tick(terrain, body, character=None):
     """腾空走一个 tick：先加重力，再走，撞上什么就停什么。
+
+    ★★★★★ 传了 `character` 才带**头圆 / 身圆**的扫掠（`_shape_hit`，V0.3 §192）；
+    不传就是老的脚点模型（只给不知道角色是谁的兜底调用）。
 
     ★★★ **方向键在这里一点用都没有**（§93）。原来这儿按 §71 抄了一句
     「按方向键 -> 水平速度 = 走速 × 1.5」，出处是 `0x507473` —— 可那一段
@@ -525,7 +635,29 @@ def _air_tick(terrain, body):
         #   横向也跟着停（两个轴是一起推进的，不是各走各的）。
         hit = _ceiling_between(terrain, body.x, body.y, nx, ny)
         if hit is not None:
-            return body.moved(hit[0], hit[1], vx, 0.0, on_ground=False)
+            nx, ny, vy = hit[0], hit[1], 0.0
+    # ★★★★★ 头圆 / 身圆的扫掠（V0.3 §191 / §192）—— 脚点那套算完之后，再问
+    #   「收方那份的头和身子过得去吗」。蹭上坎那一格不扫：脚是贴着地形抬上去的
+    #   （§95 两轮实机收口的），收方那份差一格就被逐格心跳拉回来了。
+    if character is not None and not climbed:
+        hit = _shape_hit(terrain, character, body.x, body.y, nx, ny)
+        if hit is not None:
+            # 和脚点撞墙那一支同一种响应（§95）：只是这一 tick 横向过不去，
+            # 竖直照走、速度留着 —— 先问一句是不是「墙在旁边」。竖直这一问带
+            # `escape`：头已经嵌在顶里的人，往下这一段要放它出来。
+            if nx != body.x and _shape_hit(terrain, character, body.x, body.y,
+                                           body.x, ny, escape=True) is None:
+                if vy > 0:
+                    # 横向钉住之后落点换了一列：这一列的地面照旧要认。
+                    landing = terrain.ground_below(int(body.x), int(body.y))
+                    if landing is not None and landing <= ny:
+                        return body.moved(body.x, landing)
+                return body.moved(body.x, ny, vx, vy, on_ground=False)
+            # 顶在头上：停在撞之前那一点，v.y 截成 0（同 `_ceiling_between`）；
+            # 收方 `CHAR.` 行实测就是「位置不动、v.y 归零」。往下走被挡只可能是
+            # 出发时就嵌着（豁免了还挡 = 两个圆都嵌着），停一格等重力把它带出来。
+            return body.moved(hit[0], hit[1], vx,
+                              0.0 if vy < 0 else vy, on_ground=False)
     return body.moved(nx, ny, vx, vy, on_ground=False)
 
 
@@ -581,7 +713,7 @@ def step(terrain, body, character, direction=0, fast_run=False,
         if launched is None:
             return body, False
         return launched, False
-    return _air_tick(terrain, body), True
+    return _air_tick(terrain, body, character), True
 
 
 def tick(terrain, body, character, direction=0, fast_run=False,

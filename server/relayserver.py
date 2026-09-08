@@ -1158,6 +1158,11 @@ class RelayServer:
         校验和（头 `+6`）从 `+0x0c` 起算、不覆盖局号，所以改写这两个字节
         不用重算（`peer_game_id` 的注释里有逐指令依据）。
         """
+        # A human peer must not be able to label another character server-owned.
+        import botmotion
+        if (botmotion.metadata(udp_packet) is not None
+                and not getattr(sender_game_conn, "is_bot_conn", lambda: False)()):
+            return 0
         sent = 0
         # ★ 转成带符号：客户端「还没进过任何一局」时盖的是 0xFFFF = -1。
         game_id = as_signed_epoch(peer_game_id(udp_packet))

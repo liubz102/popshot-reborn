@@ -280,6 +280,13 @@ void u64_to_wide(unsigned long long v, wchar_t *out, size_t cap)
     out[cap - 1] = 0;
 }
 
+void mib_to_wide(unsigned long long bytes, wchar_t *out, size_t cap)
+{
+    unsigned long long mib_x10 = bytes * 10 / (1ULL << 20);
+    _snwprintf(out, cap, L"%llu.%llu", mib_x10 / 10, mib_x10 % 10);
+    out[cap - 1] = 0;
+}
+
 void now_stamp(wchar_t *out, size_t cap)
 {
     SYSTEMTIME t;

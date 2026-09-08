@@ -1,0 +1,331 @@
+{
+  "server_log": "logs/server-20260905-114002.out",
+  "client_log": "logs/bshook_20260905_104126_pid29956.log",
+  "rejected_incomplete_send_dumps": 0,
+  "bot_packet_counts": {
+    "0x4005": 50,
+    "0x4001": 32313,
+    "0x6": 2454,
+    "0x1": 539,
+    "0x2": 4238,
+    "0x3": 5775,
+    "0x7": 164,
+    "0x4": 487,
+    "0xb": 175,
+    "0x5": 95
+  },
+  "heartbeat_counts": {
+    "total": 32313,
+    "air": 23291,
+    "air_zero_keys": 23291
+  },
+  "jumps_by_stage": {
+    "1": 1805,
+    "2": 649
+  },
+  "upstream_binding_events": 2,
+  "binding_examples": [
+    {
+      "time": "11:28:19.165",
+      "t": 41299.165,
+      "line": 198107,
+      "victim_handle": 200001,
+      "owner_handle": 100001
+    },
+    {
+      "time": "11:31:17.342",
+      "t": 41477.342,
+      "line": 259311,
+      "victim_handle": 200001,
+      "owner_handle": 100001
+    }
+  ],
+  "jump_to_next_heartbeat_ms": {
+    "n": 2454,
+    "min": 0.0,
+    "p50": 0.0,
+    "p90": 0.0,
+    "p99": 1.0,
+    "max": 28.0
+  },
+  "jumps_previous_air_zero_keys": 675,
+  "jump_examples": [
+    {
+      "time": "10:43:59.591",
+      "line": 1497,
+      "seat": 1,
+      "stage": 1,
+      "heartbeat_line": 1500,
+      "next_heartbeat_ms": 0.0,
+      "next_vx": -8,
+      "next_keys": 0,
+      "previous_air_zero_keys": false
+    },
+    {
+      "time": "10:44:01.576",
+      "line": 2224,
+      "seat": 1,
+      "stage": 1,
+      "heartbeat_line": 2227,
+      "next_heartbeat_ms": 0.0,
+      "next_vx": -8,
+      "next_keys": 0,
+      "previous_air_zero_keys": false
+    },
+    {
+      "time": "10:44:02.598",
+      "line": 2681,
+      "seat": 1,
+      "stage": 1,
+      "heartbeat_line": 2684,
+      "next_heartbeat_ms": 0.0,
+      "next_vx": 8,
+      "next_keys": 0,
+      "previous_air_zero_keys": false
+    },
+    {
+      "time": "10:44:03.141",
+      "line": 2945,
+      "seat": 1,
+      "stage": 2,
+      "heartbeat_line": 2948,
+      "next_heartbeat_ms": 0.0,
+      "next_vx": 8,
+      "next_keys": 0,
+      "previous_air_zero_keys": true
+    },
+    {
+      "time": "10:44:04.774",
+      "line": 3608,
+      "seat": 1,
+      "stage": 1,
+      "heartbeat_line": 3611,
+      "next_heartbeat_ms": 0.0,
+      "next_vx": 12,
+      "next_keys": 0,
+      "previous_air_zero_keys": false
+    },
+    {
+      "time": "10:44:06.501",
+      "line": 4222,
+      "seat": 1,
+      "stage": 1,
+      "heartbeat_line": 4225,
+      "next_heartbeat_ms": 0.0,
+      "next_vx": -8,
+      "next_keys": 0,
+      "previous_air_zero_keys": false
+    },
+    {
+      "time": "10:44:07.046",
+      "line": 4392,
+      "seat": 1,
+      "stage": 2,
+      "heartbeat_line": 4395,
+      "next_heartbeat_ms": 0.0,
+      "next_vx": -8,
+      "next_keys": 0,
+      "previous_air_zero_keys": true
+    },
+    {
+      "time": "10:44:08.806",
+      "line": 4877,
+      "seat": 1,
+      "stage": 1,
+      "heartbeat_line": 4880,
+      "next_heartbeat_ms": 0.0,
+      "next_vx": -12,
+      "next_keys": 0,
+      "previous_air_zero_keys": false
+    }
+  ],
+  "matched_fire_latency_ms": {
+    "n": 3671,
+    "min": 0.0,
+    "p50": 3.0,
+    "p90": 31.0,
+    "p99": 36.0,
+    "max": 71.0
+  },
+  "actual_client_y_error_px": {
+    "n": 3671,
+    "min": 0.0,
+    "p50": 3.79,
+    "p90": 15.05,
+    "p99": 46.7,
+    "max": 139.51
+  },
+  "actual_client_position_error_lower_bound_px": {
+    "n": 3671,
+    "min": 0.0,
+    "p50": 7.03,
+    "p90": 26.72,
+    "p99": 62.33,
+    "max": 143.15
+  },
+  "largest_actual_client_errors": [
+    {
+      "time": "11:28:19.356",
+      "seat": 1,
+      "client_line": 337579,
+      "server_line": 198167,
+      "latency_ms": 3.0,
+      "y_error": 139.51,
+      "x_error_lower_bound": 32.08,
+      "position_error_lower_bound": 143.15,
+      "server_y": 763.2,
+      "client_y": 902.71,
+      "recent_binding_event": {
+        "time": "11:28:19.165",
+        "t": 41299.165,
+        "line": 198107,
+        "victim_handle": 200001,
+        "owner_handle": 100001
+      }
+    },
+    {
+      "time": "11:33:31.184",
+      "seat": 4,
+      "client_line": 449159,
+      "server_line": 274668,
+      "latency_ms": 1.0,
+      "y_error": 106.6,
+      "x_error_lower_bound": 69.04,
+      "position_error_lower_bound": 127.0,
+      "server_y": 755.2,
+      "client_y": 861.8,
+      "recent_binding_event": null
+    },
+    {
+      "time": "10:46:08.427",
+      "seat": 3,
+      "client_line": 117666,
+      "server_line": 43723,
+      "latency_ms": 4.0,
+      "y_error": 89.07,
+      "x_error_lower_bound": 51.17,
+      "position_error_lower_bound": 102.72,
+      "server_y": 807.6,
+      "client_y": 896.67,
+      "recent_binding_event": null
+    },
+    {
+      "time": "11:31:07.645",
+      "seat": 1,
+      "client_line": 410682,
+      "server_line": 256304,
+      "latency_ms": 3.0,
+      "y_error": -91.89,
+      "x_error_lower_bound": 37.89,
+      "position_error_lower_bound": 99.4,
+      "server_y": 948.2,
+      "client_y": 856.31,
+      "recent_binding_event": null
+    },
+    {
+      "time": "11:25:58.922",
+      "seat": 5,
+      "client_line": 270103,
+      "server_line": 158666,
+      "latency_ms": 1.0,
+      "y_error": -88.38,
+      "x_error_lower_bound": 29.69,
+      "position_error_lower_bound": 93.23,
+      "server_y": 620.48,
+      "client_y": 532.1,
+      "recent_binding_event": null
+    },
+    {
+      "time": "10:45:06.923",
+      "seat": 5,
+      "client_line": 94161,
+      "server_line": 23926,
+      "latency_ms": 3.0,
+      "y_error": -80.52,
+      "x_error_lower_bound": 45.37,
+      "position_error_lower_bound": 92.42,
+      "server_y": 575.4,
+      "client_y": 494.88,
+      "recent_binding_event": null
+    },
+    {
+      "time": "10:44:26.602",
+      "seat": 4,
+      "client_line": 78945,
+      "server_line": 10942,
+      "latency_ms": 3.0,
+      "y_error": 9.07,
+      "x_error_lower_bound": 91.3,
+      "position_error_lower_bound": 91.75,
+      "server_y": 1020.6,
+      "client_y": 1029.67,
+      "recent_binding_event": null
+    },
+    {
+      "time": "10:44:01.706",
+      "seat": 5,
+      "client_line": 65970,
+      "server_line": 2303,
+      "latency_ms": 2.0,
+      "y_error": 63.69,
+      "x_error_lower_bound": 64.98,
+      "position_error_lower_bound": 90.99,
+      "server_y": 813.8,
+      "client_y": 877.49,
+      "recent_binding_event": null
+    },
+    {
+      "time": "11:28:40.252",
+      "seat": 4,
+      "client_line": 345563,
+      "server_line": 204826,
+      "latency_ms": 1.0,
+      "y_error": 81.95,
+      "x_error_lower_bound": 35.75,
+      "position_error_lower_bound": 89.41,
+      "server_y": 873.6,
+      "client_y": 955.55,
+      "recent_binding_event": null
+    },
+    {
+      "time": "11:29:38.684",
+      "seat": 1,
+      "client_line": 369164,
+      "server_line": 223898,
+      "latency_ms": 3.0,
+      "y_error": -81.58,
+      "x_error_lower_bound": 33.6,
+      "position_error_lower_bound": 88.23,
+      "server_y": 916.6,
+      "client_y": 835.02,
+      "recent_binding_event": null
+    },
+    {
+      "time": "11:28:07.485",
+      "seat": 5,
+      "client_line": 331264,
+      "server_line": 193425,
+      "latency_ms": 4.0,
+      "y_error": -59.65,
+      "x_error_lower_bound": 61.0,
+      "position_error_lower_bound": 85.32,
+      "server_y": 411.95,
+      "client_y": 352.3,
+      "recent_binding_event": null
+    },
+    {
+      "time": "11:34:57.456",
+      "seat": 1,
+      "client_line": 488174,
+      "server_line": 305145,
+      "latency_ms": 2.0,
+      "y_error": -46.92,
+      "x_error_lower_bound": 69.82,
+      "position_error_lower_bound": 84.12,
+      "server_y": 727.0,
+      "client_y": 680.08,
+      "recent_binding_event": null
+    }
+  ],
+  "scope": "FIRE-time position difference is observed; attribution to individual causes requires per-frame character traces. Time includes quantization to a client frame."
+}

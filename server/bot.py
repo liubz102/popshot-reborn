@@ -64,6 +64,7 @@ import botarms
 import botbreak
 import bothp
 import botmove
+import botmotion
 import botnav
 import botplan
 import botsync
@@ -136,14 +137,20 @@ COMMAND_PREFIX = "/"
 #: 其余物理、武器属性和寻路能力五档完全共用，避免“简单难度”靠违反游戏
 #: 规则来变笨。数值是 AI 设计参数，不冒充原版常量；集中在这里便于实机调优。
 #:
-#: 会话 59（D139）由用户明确给出五档数值。档位是房间级的整数 1..5，
-#: 数字越大，瞄准和闪避失误越少；新房间和 `/d` 无参数都回到默认档 3。
+#: 档位是房间级的整数 1..5，数字越大，瞄准和闪避失误越少；新房间和 `/d`
+#: 无参数都回到默认档 3（会话 59 / D139 定的口径，没变）。
+#:
+#: ★ 数值本身在会话 72（D155）被用户整体调过一轮：**每一档都比原来更容易
+#: 失误**（`aim_error` 依次 +0.10 / +0.15 / +0.20 / +0.20 / +0.10；
+#: `dodge_error` 只有 4 / 5 两档各 +0.05，1~3 档没动）。意思是「bot 整体
+#: 打弱一点」，不是改语义 —— 五档的相对关系、默认档、生命周期全部照旧。
+#: 要再调就只改下面这张表。
 BOT_DIFFICULTY_PROFILES = {
-    1: {"aim_error": 0.85, "dodge_error": 0.50},
-    2: {"aim_error": 0.65, "dodge_error": 0.40},
-    3: {"aim_error": 0.40, "dodge_error": 0.30},
-    4: {"aim_error": 0.20, "dodge_error": 0.15},
-    5: {"aim_error": 0.10, "dodge_error": 0.05},
+    1: {"aim_error": 0.95, "dodge_error": 0.50},
+    2: {"aim_error": 0.80, "dodge_error": 0.40},
+    3: {"aim_error": 0.60, "dodge_error": 0.30},
+    4: {"aim_error": 0.40, "dodge_error": 0.20},
+    5: {"aim_error": 0.20, "dodge_error": 0.10},
 }
 BOT_DIFFICULTY_LABELS = {
     1: "1（最简单）",
@@ -395,10 +402,18 @@ class BotConn(gameserver.Conn):
         #: 128 ms，再被下一发坐标拉回（V0.3 §185）。状态翻转发生在哪一格，
         #: 就在哪一格补锚；追赶途中仍只记账，追平再发。
         self.motion_anchor_pending = False
+        self.motion_identity = botmotion.new_identity()
+        self.motion_revision = 0
+        self.motion_constraint = None
         #: 上一格有没有被地形钉住某一轴。撞墙时模拟故意保留 `vx`（§95），
         #: 但线上速度要报 0（§181）；只在「进入/离开钉住」时补锚，避免贴墙
         #: 的每一格都多发一份心跳。
         self.motion_blocked_axes = (False, False)
+        #: 上一发**踩地**心跳报出去的 `(方向键, 冲刺位)`。收方拿这两样替 bot
+        #: 走接下来那一段（`0x507660`），所以它们一翻转就是收方复现不出来的
+        #: 运动突变，当格补锚（V0.3 §190 / D149）。腾空时记 `None`（腾空收方
+        #: 不读键，§93），落地那一发锚重新定基线。
+        self.walk_reported = None
         #: ★ M5-B 的逐帧路径执行状态。`botnav.plan()` 返回落脚点边；这里保留
         #: 尚未走完的那一串，目标/地图/身体事实变化时再重算，不按挂钟重算。
         self.nav_path = []
@@ -725,7 +740,10 @@ class BotConn(gameserver.Conn):
         self.down_latch = False
         self.beat_pending = False
         self.motion_anchor_pending = False
+        self.motion_identity = botmotion.new_identity()
+        self.motion_constraint = None
         self.motion_blocked_axes = (False, False)
+        self.walk_reported = None
         self.trail_mark = None
         self.trail_heading = 0
         self.load_progress = None
@@ -2508,6 +2526,110 @@ def _note_peer_breakable(room, handle, damage):
     return True
 
 
+def _note_motion_event(room, conn, opcode, body, sequence):
+    """Track original melee lifetimes and 0x0017 dependencies (D148).
+
+    Lifetimes come from ChrProps TotalFrame, not an arbitrary timeout. Duplicate
+    event packets must not restart an action or prolong a dependency.
+    """
+    if room is None:
+        return
+    gen = relayserver.epoch_state(conn).gen
+    mark = (gen, sequence)
+    if opcode in (botsync.OP_DASH, 0x0008):
+        if len(body) != 11 or body[0] != conn.my_seat:
+            return
+        previous = getattr(conn, "motion_action_mark", None)
+        if (previous is not None and previous[0] == gen
+                and not 0 < ((sequence - previous[1]) & 0xffff) < 0x8000):
+            return
+        conn.motion_action_mark = mark
+        _, direction, index = struct.unpack_from("<Bbb", body)
+        if direction not in (-1, 1) or index < 0:
+            return
+        seat = room.seats[conn.my_seat]
+        if seat is None or seat.conn is not conn:
+            return
+        who = chrprops.get(seat.character_id)
+        name = ("dash" if opcode == botsync.OP_DASH else "jab") + str(index)
+        move = who.move(name)
+        if move is not None and move.get("total_frame", 0) > 0:
+            conn.motion_action = (gen, _now() + move["total_frame"] * BOT_DASH_FRAME_MS / 1000.0,
+                                  direction)
+            conn.motion_facing = (gen, direction)
+        return
+    if len(body) != 8:
+        return
+    victim, owner = struct.unpack("<ii", body)
+    seat_index, owner_index = botsync.handle_seat(victim), botsync.handle_seat(owner)
+    if (seat_index is None or owner_index is None or seat_index == owner_index
+            or owner_index != room.seat_index_of(conn)
+            or victim != botsync.character_handle(seat_index)
+            or owner != botsync.character_handle(owner_index)):
+        return
+    seat = room.seats[seat_index]
+    target = None if seat is None else seat.conn
+    if not isinstance(target, BotConn):
+        return
+    previous = getattr(target, "motion_constraint_mark", None)
+    if (previous is not None and previous[0] is conn and previous[1][0] == gen
+            and not 0 < ((sequence - previous[1][1]) & 0xffff) < 0x8000):
+        return
+    target.motion_constraint_mark = (conn, mark)
+    target.motion_constraint = (conn, gen, owner_index)
+    target.motion_anchor_pending = True
+
+
+def _apply_motion_constraint(room, machine, terrain, now):
+    """0x50e654's horizontal projection, using our existing terrain solver.
+
+    Body continues its ordinary integration, then is pushed beyond the owner's
+    facing boundary. It is not snapped to the owner's y or turned into a follower.
+    Owner action completion/death/seat replacement/epoch change releases it.
+    """
+    link = machine.motion_constraint
+    if link is None or machine.body is None:
+        return
+    owner, gen, index = link
+    seat = room.seats[index]
+    action = getattr(owner, "motion_action", None)
+    active = (seat is not None and seat.conn is owner
+              and relayserver.epoch_state(owner).gen == gen
+              and action is not None and action[0] == gen and now < action[1]
+              and not _lying_dead(room, index))
+    if not active:
+        machine.motion_constraint = None
+        machine.motion_anchor_pending = True
+        return
+    point = _seat_body(room, index)
+    if point is None:
+        return
+    body = machine.body
+    facing = getattr(owner, "motion_facing", (gen, action[2]))
+    nx = botmotion.constrained_x(body.x, point[0], facing[1] if facing[0] == gen else action[2])
+    span = nx - body.x
+    if not span or terrain is None:
+        return
+    # The original calls the same horizontal terrain routine as walking.
+    # Sweep using that solver instead of teleporting through an intervening wall.
+    current = body
+    direction = 1 if span > 0 else -1
+    remaining = abs(span)
+    who = _character_of(machine)
+    while remaining > 0:
+        distance = min(remaining, botmove.walk_speed(who))
+        moved = botmove._walk_tick(terrain, botmove.Body(current.x, current.y), who,
+                                   direction, False, False, distance / who.speed)
+        if moved.x == current.x:
+            break
+        current = current.moved(moved.x, moved.y, body.vx, body.vy,
+                                on_ground=body.on_ground)
+        remaining -= distance
+    if current != body:
+        machine.body = current
+        machine.motion_anchor_pending = True
+
+
 def note_peer_hit(room, conn, payload):
     """真人发来的一发同步包 —— 打到 bot 身上就替它挨这一下击退（§92）。
 
@@ -2524,6 +2646,15 @@ def note_peer_hit(room, conn, payload):
       （`+13/+17`），照抄就行，一点都不用猜。
     """
     opcode = udpsync.peer_opcode(payload)
+    if opcode == botsync.OP_HEARTBEAT:
+        if udpsync.heartbeat_motion(payload) is not None:
+            facing = ((struct.unpack_from('<I', payload, 31)[0] & 3) ^ 2) - 2
+            conn.motion_facing = (relayserver.epoch_state(conn).gen, facing)
+        return
+    if opcode in (botsync.OP_DASH, 0x0008, 0x0017):
+        _note_motion_event(room, conn, opcode, payload[udpsync.PEER_HEADER_SIZE:],
+                           udpsync.peer_sequence(payload))
+        return
     if opcode == botsync.OP_FIRE:
         note_peer_fire(conn, payload[udpsync.PEER_HEADER_SIZE:], room)
         return
@@ -2663,6 +2794,10 @@ def _knock_back_seat(room, seat_index, damage, push, source="?"):
     machine = None if seat is None else seat.conn
     if not isinstance(machine, BotConn) or machine.body is None:
         return
+    # Original OnHit releases the dependency through 0x50e636 at 0x50f954.
+    if machine.motion_constraint is not None:
+        machine.motion_constraint = None
+        machine.motion_anchor_pending = True
     body = machine.body
     damage = int(damage)
     if damage >= KNOCKBACK_MIN_DAMAGE or not body.on_ground:
@@ -3478,9 +3613,14 @@ def _take_freeze(room, machine, seat_index, now):
 #: ★★ 被糊屏罩住时**瞄准失误概率**加多少（V0.3 §121）。
 #:
 #: 用户 2026-08-29：「别人使用了干扰道具，bot 的发射子弹的失误概率应该
-#: **明显增加**。」中等难度 0.22 + 0.40 = 0.62 —— 三发里有将近两发歪，
-#: 屏幕上看得出来「它被糊住了」。★ 没有原版出处（原版那条压根不生效，
-#: §121），觉得太狠 / 太轻就改这一个数。
+#: **明显增加**。」★ 没有原版出处（原版那条压根不生效，§121），
+#: 觉得太狠 / 太轻就改这一个数。
+#:
+#: ⚠ 会话 72（D155）把难度表整体调高之后，`_aim_error_chance()` 那个
+#: **上限 1.0** 开始咬人了：1~3 档（0.95 / 0.80 / 0.60）加这 0.40 全部顶到
+#: 1.00 —— 糊屏期间**发发必歪**，而且这三档被糊住的样子完全一样。
+#: 只有 4 档（0.40→0.80）和 5 档（0.20→0.60）还看得出「被糊住了多少」。
+#: 用户没要求动这一个数，所以先照原样留着；嫌一刀切就把它调小。
 BOT_HUD_JAM_AIM_ERROR = 0.40
 
 
@@ -6084,6 +6224,7 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
         terrain, before, who, direction=direction, fast_run=fast_run,
         crouched=crouched, want_jump=want_jump, want_drop=want_drop,
         speed_scale=speed_scale)
+    _apply_motion_constraint(room, machine, terrain, now)
     left_ground = before.on_ground and not machine.body.on_ground
     if machine.nav_path and left_ground:
         machine.nav_started = True
@@ -9789,6 +9930,8 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
     spawn = machine.pending_spawn
     if spawn is not None:
         machine.pending_spawn = None
+        machine.motion_identity = botmotion.new_identity()
+        machine.motion_constraint = None
         machine.battle_pos = (spawn[0], spawn[1])
         machine.body = botmove.Body(spawn[0], spawn[1], on_ground=True)
         _clear_navigation(machine)
@@ -9875,7 +10018,18 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
     # ★ 记下这一格报出去的地面标志：别人那台机器上 bot 的 `[char+0x128]`
     #   就是它，而夺分模式的一条 ×0.75 按受害者这一格判（§89）。
     machine.on_ground = bool(on_ground)
-    if landed_now or machine.motion_anchor_pending:
+    # ★★★★★ **腾空每格报**（V0.3 §191 / D150）。收方那份腾空角色是它自己的
+    #   三圆扫掠在挡（`0x50d58a` → `0x50e759`），服务端这份是脚下一个点：
+    #   头顶 20~75 px 的冰洞顶 / 悬崖下沿只挡得住收方那份。分歧发生在收方那台
+    #   机器上，这边**没有事件可等**，只能把「收方要自己积分多少格」压到
+    #   `AIR_HEARTBEAT_TICKS`。实机 849 发开火两端对齐：空中滞后 p90 32 px、
+    #   p99 71 px，全是这种地方（§191）；装了 BSM1 前后一样。
+    #   ★ `from_trail`（没地形、回放真人轨迹）那条老路例外：轨迹点 8 Hz 才换
+    #     一个，逐格重发同一个点只会把收方那份钉住。
+    air_due = (not on_ground and not from_trail
+               and (tick + seat_index) % gameserver.AIR_HEARTBEAT_TICKS
+               == gameserver.AIR_HEARTBEAT_TICKS - 1)
+    if landed_now or air_due or machine.motion_anchor_pending:
         if behind > 0:
             machine.beat_pending = True
         else:
@@ -9916,9 +10070,8 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         direction = machine.press_dir
     if direction:
         machine.heading = direction
-    # ★ 只有**踩在地上**才说「我按着方向键」：腾空那一段的动画是 `Jump`
-    #   （不看掩码），而收方会拿按键覆写空中速度，把抄来的抛体速度冲掉（§39）。
-    keys = botsync.walk_keys(direction if on_ground else 0)
+    # Jump/animation also read input; being airborne does not mean keys are up.
+    keys = botsync.walk_keys(direction)
     if machine.move_down:
         machine.down_latch = True
     if machine.down_latch:
@@ -9926,7 +10079,25 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
     # ★★ 冲刺位（§40）：**在地上、真的在走**才算数（`0x515ced` 进冲刺就要求
     #   走路方向非 0），否则会出现真客户端里不存在的组合（站着冲刺）。
     horizontal_keys = keys & (botsync.KEY_LEFT | botsync.KEY_RIGHT)
-    fast_run = bool(fast_run) and bool(horizontal_keys)
+    fast_run = bool(fast_run) and bool(horizontal_keys) and bool(on_ground)
+    # ★★★★★ **踩地时按键 / 冲刺位一翻转就当格补锚**（V0.3 §190 / D149）。
+    #   收方拿心跳里的方向键替 bot 走**接下来那一段**（`0x507660`），所以
+    #   「这一格开始按 / 松开 / 掉头 / 起跑 / 收腿」都是它复现不出来的运动突变。
+    #   决策格是 `(tick + 座位) % 2 == 0`、心跳格是 `% 4 == 3`，两张网格相位
+    #   锁死 —— 翻转**永远**落不到心跳格上，等下一发要晚 1 或 3 格
+    #   （实机 750 次翻转：p50 32 ms、p90 96 ms，同格 0 次）。收方那 1~3 格
+    #   朝着旧方向走 7~36 px，再按 0.6ⁿ 拽回来 = 地面上「走一下退一下」。
+    #   判据是**报出去的状态翻转**（和上一发踩地心跳比），没有时间阈值。
+    #   ★ `from_trail`（没地形、回放真人轨迹）那条老路不参与：它的方向是从
+    #     8 Hz 换一次的轨迹点反推的，翻转本来就和轨迹点同步，老口径照旧。
+    walk_state = ((int(direction), bool(fast_run))
+                  if on_ground and not from_trail else None)
+    if (walk_state is not None and machine.walk_reported is not None
+            and walk_state != machine.walk_reported):
+        if behind > 0:
+            machine.beat_pending = True
+        else:
+            beat = True
 
     # ★ 起跳**按状态翻转去重**：只有「这一格真的往前挪了」才补 `rpJump`
     #   （铁律 10 说的那种去重口径）。`rpJump` 是**事件包**，每发都要吃掉
@@ -9970,9 +10141,12 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
                 x, y, vx=vx, vy=vy, on_ground=on_ground,
                 facing=machine.heading, keys=keys, fast_run=fast_run,
                 cursor=cursor, state_byte=_charge_value(machine, now))
-            _emit(machine, machine.sync.heartbeat(state))
+            machine.motion_revision += 1
+            _emit(machine, machine.sync.heartbeat(
+                state, motion=(machine.motion_identity, machine.motion_revision, tick)))
             machine.beat_pending = False
             machine.motion_anchor_pending = False
+            machine.walk_reported = walk_state
             # ★ ↓ 报出去了就把锁松开（见 `down_latch`）。
             machine.down_latch = False
         if BOT_DIAG_FIRE_ANYWHERE:

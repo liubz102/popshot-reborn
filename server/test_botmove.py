@@ -296,9 +296,10 @@ class JumpTests(unittest.TestCase):
     """起跳初速 20、重力 1.2 —— 顶点 `v²/2g ≈ 167`（语料中位 170）。"""
 
     def setUp(self):
-        self.t = flat(width=200, floor=200, height=256)
+        # ★ 地面 300：顶点 167 + 头顶 70 = 237，整个人都留在图里（§192）。
+        self.t = flat(width=200, floor=300, height=340)
         self.who = Dummy(4.0)
-        self.body = botmove.Body(100.0, 200.0)
+        self.body = botmove.Body(100.0, 300.0)
 
     def test_apex_matches_the_closed_form(self):
         self.assertAlmostEqual(166.67, botmove.jump_apex(), places=1)
@@ -313,7 +314,7 @@ class JumpTests(unittest.TestCase):
             top = min(top, body.y)
             beats += 1
         self.assertTrue(body.on_ground, "跳起来总得落回地面")
-        self.assertAlmostEqual(200.0, body.y)
+        self.assertAlmostEqual(self.body.y, body.y)
         rise = self.body.y - top
         self.assertTrue(150.0 <= rise <= 175.0, "顶点高 %.1f" % rise)
 
@@ -356,18 +357,20 @@ class JumpTests(unittest.TestCase):
 
 
 class CeilingAndPlatformTests(unittest.TestCase):
+    """★ 这一组的图比老版高 80 行（地面 120、板 100 上下）：角色的头在脚上 70
+    （`_body_probes`），图留够高度，板才是人撞上的第一样东西（V0.3 §192）。"""
 
     def test_a_ceiling_stops_the_rise(self):
         rows = []
-        for y in range(64):
-            if y >= 40:
+        for y in range(144):
+            if y >= 120:
                 rows.append("2" * 40)
-            elif y in (20, 21):
+            elif y in (100, 101):
                 rows.append("2" * 40)
             else:
                 rows.append("0" * 40)
         t = terrain_from(rows)
-        body = botmove.jump(botmove.Body(20.0, 40.0))
+        body = botmove.jump(botmove.Body(20.0, 120.0))
         who = Dummy(4.0)
         top = body.y
         for _ in range(40):
@@ -375,31 +378,31 @@ class CeilingAndPlatformTests(unittest.TestCase):
             top = min(top, body.y)
             if body.on_ground:
                 break
-        self.assertTrue(top >= 21.0, "撞了天花板就不该再上去（到了 %.1f）" % top)
+        self.assertTrue(top >= 101.0, "撞了天花板就不该再上去（到了 %.1f）" % top)
 
     def test_a_one_way_platform_can_be_jumped_through(self):
         """★ 值 1 的薄板往上跳穿得过去（§29），落下来的时候踩得住。"""
         rows = []
-        for y in range(64):
-            if y >= 40:
+        for y in range(144):
+            if y >= 120:
                 rows.append("2" * 40)
-            elif y == 20:
+            elif y == 100:
                 rows.append("1" * 40)
             else:
                 rows.append("0" * 40)
         t = terrain_from(rows)
         who = Dummy(4.0)
-        body = botmove.jump(botmove.Body(20.0, 40.0))
+        body = botmove.jump(botmove.Body(20.0, 120.0))
         top = body.y
         for _ in range(60):
             body = botmove.tick(t, body, who)
             top = min(top, body.y)
             if body.on_ground:
                 break
-        self.assertTrue(top < 20.0, "单向平台不该挡住上升（只到了 %.1f）" % top)
-        self.assertAlmostEqual(20.0, body.y, msg="落下来该踩在薄板上")
+        self.assertTrue(top < 100.0, "单向平台不该挡住上升（只到了 %.1f）" % top)
+        self.assertAlmostEqual(100.0, body.y, msg="落下来该踩在薄板上")
 
-    def slab(self, rows_of_slab, floor=40, width=40, height=64):
+    def slab(self, rows_of_slab, floor=120, width=40, height=144):
         """一张平地 + 一块**薄天花板**（`rows_of_slab` 那几行整条实心）。"""
         rows = []
         for y in range(height):
@@ -419,14 +422,14 @@ class CeilingAndPlatformTests(unittest.TestCase):
     def test_a_thin_ceiling_is_not_tunnelled_through(self):
         """★★★ **一个 tick 跨过整块板**也得撞上（V0.3 §169）。
 
-        板在 25~26、地面在 40 —— 起跳第一个 tick 就从 40 升到 21.2，
-        **落点（21）是空气**。只判落点的旧代码于是一声不响地穿过去，
-        脚最后停在板**上面**；现在逐格扫，停在板底下沿之下那一格（27）。
+        板在 105~106、地面在 120 —— 起跳第一个 tick 就从 120 升到 101.2，
+        **落点（101）是空气**。只判落点的旧代码于是一声不响地穿过去，
+        脚最后停在板**上面**；现在逐格扫，停在板底下沿之下那一格（107）。
         """
-        t = self.slab((25, 26))
+        t = self.slab((105, 106))
         who = Dummy(4.0)
-        top = self.rise(t, botmove.jump(botmove.Body(20.0, 40.0)), who)
-        self.assertGreaterEqual(top, 27.0,
+        top = self.rise(t, botmove.jump(botmove.Body(20.0, 120.0)), who)
+        self.assertGreaterEqual(top, 107.0,
                                 "薄天花板被穿过去了（升到了 %.1f）" % top)
 
     def test_it_rises_all_the_way_up_to_the_ceiling(self):
@@ -435,10 +438,10 @@ class CeilingAndPlatformTests(unittest.TestCase):
         只判落点的旧代码撞上时把脚留在**出发点**，一次跳等于白跳；
         收方是一格一格推上去的，挡住之前那一格才是终点。
         """
-        t = self.slab((25, 26))
+        t = self.slab((105, 106))
         who = Dummy(4.0)
-        top = self.rise(t, botmove.jump(botmove.Body(20.0, 40.0)), who)
-        self.assertAlmostEqual(27.0, top, places=3)
+        top = self.rise(t, botmove.jump(botmove.Body(20.0, 120.0)), who)
+        self.assertAlmostEqual(107.0, top, places=3)
 
     def test_a_ledge_grazed_on_the_way_up_is_still_not_a_ceiling(self):
         """★ 逐格扫**不许**把台阶的上沿当成天花板（§95 那一条要保住）。
@@ -447,12 +450,12 @@ class CeilingAndPlatformTests(unittest.TestCase):
         路上必然掠过右边那个站立面。它是台阶不是板 —— 照旧飞过去。
         """
         rows = []
-        for y in range(64):
-            rows.append("".join("2" if y >= (36 if x >= 24 else 40) else "0"
+        for y in range(144):
+            rows.append("".join("2" if y >= (116 if x >= 24 else 120) else "0"
                                 for x in range(64)))
         t = terrain_from(rows)
         who = Dummy(4.0)
-        start = botmove.Body(20.0, 40.0, 4.0, -6.0, on_ground=False)
+        start = botmove.Body(20.0, 120.0, 4.0, -6.0, on_ground=False)
         body = start
         for _ in range(60):
             body = botmove.tick(t, body, who)
@@ -472,35 +475,143 @@ class CeilingAndPlatformTests(unittest.TestCase):
         这么红的）。只判落点的旧代码天然放行 —— 这一条把它保住。
         """
         rows = []
-        for y in range(64):
-            rows.append("".join("2" if y >= 40 else "0" for _x in range(40)))
+        for y in range(144):
+            rows.append("".join("2" if y >= 120 else "0" for _x in range(40)))
         t = terrain_from(rows)
         who = Dummy(4.0)
-        buried = botmove.jump(botmove.Body(20.0, 49.0))   # 埋在地面下 9 格
+        buried = botmove.jump(botmove.Body(20.0, 129.0))   # 埋在地面下 9 格
         body = buried
         for _ in range(10):
             body = botmove.tick(t, body, who)
             if body.on_ground:
                 break
-        self.assertLess(body.y, 49.0,
+        self.assertLess(body.y, 129.0,
                         "陷在地里的人跳不出来了（还在 %.1f）" % body.y)
 
     def test_the_sweep_never_lands_the_feet_inside_a_slab(self):
         """★★ 变异防线：停下来的那一点必须是**空气**，不能嵌在板里。
 
-        板从 25 到 30（6 像素厚），各种初速各扫一遍。
+        板从 105 到 110（6 像素厚），各种初速各扫一遍。
         """
-        t = self.slab((25, 26, 27, 28, 29, 30))
+        t = self.slab((105, 106, 107, 108, 109, 110))
         who = Dummy(4.0)
         for vy in range(-24, 0):
-            body = botmove.Body(20.0, 40.0, 0.0, float(vy), on_ground=False)
+            body = botmove.Body(20.0, 120.0, 0.0, float(vy), on_ground=False)
             for _ in range(40):
                 body = botmove.tick(t, body, who)
                 self.assertFalse(
-                    25 <= int(body.y) <= 30,
+                    105 <= int(body.y) <= 110,
                     "vy=%d 时脚停在了板里 (%.1f, %.1f)" % (vy, body.x, body.y))
                 if body.on_ground:
                     break
+
+
+class ShapeSweepTests(unittest.TestCase):
+    """★★★★★ 头圆 / 身圆的扫掠（V0.3 §191 / §192 / D151）。
+
+    真客户端腾空推位置是 vf+0x70 = `0x50d58a` → `0x50e759`：每格拿三个碰撞圆
+    沿运动方向的前沿点去问地形，头一格挡住就停、把速度收掉。服务端以前只有
+    脚下一个点 —— 冰洞顶、悬崖下沿、图顶这种「脚过得去、头过不去」的地方，
+    实机三局 4%~21% 的腾空心跳头嵌在实心里，收方那份被顶住、逐格心跳再往里拽，
+    用户 2026-09-07：「头会嵌入障碍物里，动作一卡一卡，掉出来之后就不卡了」。
+    """
+
+    def setUp(self):
+        self.who = chrprops.get(1)          # 头 10 / 身 13 / 腿 12：头顶在脚上 70
+
+    def terrain(self, solid):
+        """`solid(x, y)` 为真的格子实心；图 400 宽 400 高，地面 300。"""
+        rows = []
+        for y in range(400):
+            rows.append("".join("2" if (y >= 300 or solid(x, y)) else "0"
+                                for x in range(400)))
+        return terrain_from(rows)
+
+    def rise(self, terrain, body, ticks=60):
+        top, stopped = body.y, None
+        for _ in range(ticks):
+            nxt = botmove.tick(terrain, body, self.who)
+            if nxt.vy == 0.0 and body.vy < 0.0 and stopped is None:
+                stopped = nxt
+            body = nxt
+            top = min(top, body.y)
+            if body.on_ground:
+                break
+        return top, stopped, body
+
+    def test_a_low_overhang_stops_the_head_not_the_feet(self):
+        """板底在 205、地面 300：脚点模型会升到 206，头却早在脚到 275 时就顶上了。"""
+        t = self.terrain(lambda x, y: 200 <= y <= 205)
+        top, stopped, body = self.rise(t, botmove.jump(botmove.Body(100.0, 300.0)))
+        self.assertGreaterEqual(top, 276.0, "头穿进板里了（脚升到 %.1f）" % top)
+        self.assertLessEqual(top, 279.0, "该一路升到头顶贴板才停（只到 %.1f）" % top)
+        self.assertIsNotNone(stopped, "撞顶那一格 v.y 要截成 0")
+        self.assertTrue(body.on_ground, "撞顶之后照样落回地面")
+
+    def test_the_map_top_does_not_block_the_head(self):
+        """★ 图顶不挡头（铁律 11）：真人自己的角色在语料里脚 y 到过 38、头顶伸出
+        图顶 32 px；`Quest02_1` 第二个岩浆坑走速二段跳全靠这段弧线。收方那份远端
+        角色会在图顶被顶住，那是原版对真人一样有的显示误差，不是 bot 的物理。"""
+        t = self.terrain(lambda x, y: False)
+        # 脚从 120 起、初速 16：顶点 107，脚到 13、头顶到 −57 —— 脚留在图里，
+        # 只有头出图（脚出图那一支归 `_ceiling_between` 的老口径管）。
+        body = botmove.Body(100.0, 120.0, 0.0, -16.0, on_ground=False)
+        top, stopped, _body = self.rise(t, body)
+        self.assertLess(top, 70.0, "头到图顶就被挡住了（脚只升到 %.1f）" % top)
+        self.assertIsNone(stopped, "没有板，v.y 不该被截成 0")
+
+    def test_the_side_of_the_map_still_blocks_the_body(self):
+        """左右图外照旧算墙（真人顶在图左边界的心跳就是 x=0 不动，§181）。"""
+        t = self.terrain(lambda x, y: False)
+        body = botmove.Body(12.0, 296.0, -8.0, 0.0, on_ground=False)   # 身圆前沿 12−13 < 0
+        nxt = botmove.tick(t, body, self.who)
+        self.assertEqual(12.0, nxt.x, "身圆前沿出了左边界，横向该钉住")
+        self.assertGreater(nxt.y, body.y)
+
+    def test_a_wall_at_body_height_pins_x_but_the_fall_goes_on(self):
+        """柱子只挡身子（脚上 30~60），脚点模型会横着穿过去；现在横向钉住、竖直照掉，
+        和脚点撞墙那一支同一种响应（§95：速度留着，报出去的 vx 才是 0）。"""
+        t = self.terrain(lambda x, y: x >= 150 and 240 <= y <= 270)
+        body = botmove.Body(134.0, 296.0, 8.0, 0.0, on_ground=False)
+        nxt = botmove.tick(t, body, self.who)
+        self.assertEqual(134.0, nxt.x, "身子撞柱子，这一格横向不许过去")
+        self.assertGreater(nxt.y, body.y, "竖直照掉")
+        self.assertEqual(8.0, nxt.vx, "模拟里的速度留着（§95）")
+        self.assertFalse(nxt.on_ground)
+
+    def test_an_embedded_head_falls_out_instead_of_sticking(self):
+        """头已经嵌在厚板里（谁把它放进去的都一样）：往上顶不动、横着挪不动，
+        重力把它带出来 —— 和收方 `CHAR.` 行看到的一样，不许卡成永动机。"""
+        t = self.terrain(lambda x, y: 180 <= y <= 230)
+        body = botmove.Body(100.0, 260.0, 8.0, -10.0, on_ground=False)   # 头 190~210 在板里
+        up = botmove.tick(t, body, self.who)
+        self.assertEqual((100.0, 260.0), (up.x, up.y), "头在板里还往上顶：原地不动")
+        self.assertEqual(0.0, up.vy, "顶住了 v.y 截成 0")
+        body = up
+        for _ in range(30):
+            body = botmove.tick(t, body, self.who)
+            if body.y > 260.0 + 60.0:
+                break
+        self.assertGreater(body.y, 300.0 - 1.0, "该掉出板、落回地面（还在 %.1f）" % body.y)
+        self.assertTrue(body.on_ground)
+
+    def test_open_air_is_untouched(self):
+        """头顶开阔时一格都不许变：和脚点模型逐 tick 逐位一致（粗网格早退那条路）。"""
+        t = self.terrain(lambda x, y: False)
+        body = botmove.jump(botmove.Body(100.0, 300.0), 4.0)
+        old = botmove._shape_hit
+        try:
+            with_shape = []
+            for _ in range(40):
+                body = botmove.tick(t, body, self.who)
+                with_shape.append(body)
+            botmove._shape_hit = lambda *args, **kwargs: None
+            body = botmove.jump(botmove.Body(100.0, 300.0), 4.0)
+            for expect in with_shape:
+                body = botmove.tick(t, body, self.who)
+                self.assertEqual(expect, body)
+        finally:
+            botmove._shape_hit = old
 
 
 class KnockedBackOverBumpsTests(unittest.TestCase):
@@ -846,6 +957,9 @@ class RealPitCrossingTests(unittest.TestCase):
 
         决策每 `BOT_DECISION_TICKS`（2）格一次、相位由 `phase` 定 —— 这正是
         `bot._decide()` 的节奏（座位号决定相位）。物理每格都推。
+        ★ 第二段跳**在顶点那一格按**，和 `bot._own_step()` 一样（V0.3 §151 把它
+          挪进了物理层）；以前这里在决策格才按，晚一格弧线就差 7 px ——
+          三圆扫掠之后（§192）图顶 / 平台沿多挡一格，27 例就因此掉坑。
         """
         terrain, who = self.terrain, self.who
         surfaces = terrain.surfaces(start_x)
@@ -875,8 +989,9 @@ class RealPitCrossingTests(unittest.TestCase):
                     else:
                         intent = (1, False, False, fast_run)
                 else:
-                    intent = (1, double and botmove.at_apex(body), False,
-                              fast_run)
+                    intent = (1, False, False, fast_run)
+            if not body.on_ground and double and botmove.at_apex(body):
+                intent = (intent[0], True, intent[2], intent[3])
             direction, jump, drop, fast = intent
             body = botmove.tick(terrain, body, who, direction=direction,
                                 fast_run=fast, want_jump=jump)
@@ -1086,12 +1201,26 @@ class IceSpikePocketTests(unittest.TestCase):
         self.assertGreaterEqual(self.terrain.cell(1214, 857), 2)
         self.assertFalse(botmove.fits(self.terrain, 1214.0, 859.0, self.who))
 
-    def test_flying_into_it_still_lands_there(self):
-        """★ 进得去这件事**没**改（改的是出得来）—— 别把复现路径搞丢。"""
-        body = botmove.Body(1244.0, 902.0, -10.0, -14.0, on_ground=False)
+    def test_flying_into_it_no_longer_fits_through_the_ice(self):
+        """★★ 三圆扫掠之后（V0.3 §192 / D151）**进都进不去了**：身子 26 宽，
+        飞向那道冰檐时身圆先撞上冰体，横向被钉住、竖直照掉。收方那份本来就是
+        这么被挡住的（§177 那 45.8 秒是服务端把它送进去、客户端跟着卡）。
+        脚点模型的老路径留作对照：关掉扫掠它照旧落进口袋。"""
+        start = botmove.Body(1244.0, 902.0, -10.0, -14.0, on_ground=False)
+        body = start
         for _ in range(8):
             body = botmove.tick(self.terrain, body, self.who)
-        self.assertTrue(body.on_ground)
+        self.assertNotEqual((1214.0, 859.0), (body.x, body.y),
+                            "身子 26 宽，不该再飞进 1 像素的夹层")
+        old = botmove._shape_hit
+        botmove._shape_hit = lambda *args, **kwargs: None
+        try:
+            body = start
+            for _ in range(8):
+                body = botmove.tick(self.terrain, body, self.who)
+        finally:
+            botmove._shape_hit = old
+        self.assertTrue(body.on_ground, "对照：脚点模型确实会落进去")
         self.assertAlmostEqual(1214.0, body.x)
         self.assertAlmostEqual(859.0, body.y)
 

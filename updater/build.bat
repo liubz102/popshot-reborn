@@ -23,7 +23,8 @@ rem    * vendor\miniz      -- zip extraction (public domain).
 rem
 rem  Gates: after linking, BsPatcherChn.exe --selftest must pass (cipher
 rem  vectors vs server\simple.py, 0xFE frame parsing, version math, sha256,
-rem  manifest parsing, protected-path matching, embedded resources).
+rem  manifest parsing, protected-path matching, proxy-list parsing and
+rem  download-source picking rules, embedded resources).
 rem
 rem  ASCII ONLY in this file (D074 / FINDINGS 135): under `chcp 65001`
 rem  cmd.exe counts characters but seeks bytes. Keep this file plain ASCII.
@@ -81,6 +82,7 @@ cl /nologo /W3 /O2 /MT /utf-8 /DUNICODE /D_UNICODE ^
    src\main.c src\util.c src\log.c src\config.c src\cipher.c src\sha256.c ^
    src\manifest.c src\net_http.c src\probe.c src\procs.c src\zip.c src\apply.c ^
    src\ui_external.c src\ui_native.c src\ui_window.c src\selftest.c ^
+   src\speedtest.c ^
    vendor\miniz\miniz.c ^
    "%OUT%\updater.res" ^
    /Fe:"%OUT%\BsPatcherChn.exe" /Fo:"%OUT%\\" /link /SUBSYSTEM:WINDOWS ^

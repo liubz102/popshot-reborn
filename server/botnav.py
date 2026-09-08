@@ -216,18 +216,24 @@ class _Trace(object):
           上方 `2 × 腿半径 + 身半径`；
         * `surface_near()` 的 reach 是 `速度 × CLIMB_SLOPE` —— 走路那一步
           用走速，腾空那一步用 `|vx|`（弹跳台能给出比走速大的 `vx`，
-          所以这里取「实际见过的最大值」和冲刺走速里大的那个）。
+          所以这里取「实际见过的最大值」和冲刺走速里大的那个）；
+        * ★ `_shape_hit()` 的头圆前沿在脚上方 `2 腿 + 2 身 + 2 头`（V0.3 §192）
+          —— 头顶上那 70 像素里的破坏物碎没碎，决定这条弧线撞不撞头。
 
         ★ 列方向必须放够：`surfaces(x)` / `ground_below(x, y)` 问的是**整列**，
           只要那一列没变，这一列上的每一问答案都一样。
         """
         legs = float(getattr(character, "size_legs", 12.0) or 12.0)
         body_r = float(getattr(character, "size_body", 13.0) or 13.0)
+        head_r = float(getattr(character, "size_head", 10.0) or 10.0)
         speed = botmove.walk_speed(character, True)
         margin = max(2.0 * legs, 2.0 * body_r, 2.0 * legs + body_r,
                      max(self.vmax, speed) * botmove.CLIMB_SLOPE) + 1.0
+        # ★ 头圆只往**上**伸：探测点全在脚上方，往下 / 两侧照旧 —— 依赖区放大
+        #   一圈就多重算一批边（`test_it_really_reuses…` 钉着复用率）。
+        up = max(margin, 2.0 * legs + 2.0 * body_r + 2.0 * head_r + 1.0)
         return (_block(self.x0 - margin), _block(self.x1 + margin),
-                _block(self.y0 - margin), _block(self.y1 + margin))
+                _block(self.y0 - up), _block(self.y1 + margin))
 
 
 def _finish_air(terrain, body, character, trace, ticks=AIR_TICKS):
