@@ -5109,8 +5109,12 @@ class BotDifficultyAccuracyTests(TerrainMixin, BotFireRoom):
             self.assertAlmostEqual(expected, rate, delta=0.06)
             rates.append(rate)
         self.assertEqual(sorted(rates), rates)
+        # ★ 这两条是**观感**下限，不是上面那张表的复述：最简单档得让玩家
+        #   明显觉得「它打不中」，最难档得明显觉得「它很准」。会话 72（D155）
+        #   把表整体调高之后 5 档的期望命中率正好落在 0.80，所以这里给取样
+        #   噪声留出余量，别写成 0.80 —— 那是一半概率红的判据。
         self.assertLess(rates[0], 0.25)
-        self.assertGreater(rates[-1], 0.80)
+        self.assertGreater(rates[-1], 0.70)
 
     def test_a_ground_bound_miss_is_fired_and_resolves_without_direct_damage(self):
         self.install_terrain(synth_terrain("flat"))

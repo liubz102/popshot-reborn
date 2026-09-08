@@ -380,11 +380,11 @@ class BotCommandTests(LobbyIsolated):
 
     def test_the_five_profiles_match_the_requested_error_rates(self):
         self.assertEqual({
-            1: {"aim_error": 0.85, "dodge_error": 0.50},
-            2: {"aim_error": 0.65, "dodge_error": 0.40},
-            3: {"aim_error": 0.40, "dodge_error": 0.30},
-            4: {"aim_error": 0.20, "dodge_error": 0.15},
-            5: {"aim_error": 0.10, "dodge_error": 0.05},
+            1: {"aim_error": 0.95, "dodge_error": 0.50},
+            2: {"aim_error": 0.80, "dodge_error": 0.40},
+            3: {"aim_error": 0.60, "dodge_error": 0.30},
+            4: {"aim_error": 0.40, "dodge_error": 0.20},
+            5: {"aim_error": 0.20, "dodge_error": 0.10},
         }, bot.BOT_DIFFICULTY_PROFILES)
 
     def test_a_changed_difficulty_refreshes_pending_aim_and_dodge_decisions(self):
