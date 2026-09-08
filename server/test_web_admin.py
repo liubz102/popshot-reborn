@@ -686,7 +686,7 @@ class AdminAssetTests(_AdminCase):
 
     def test_the_atlas_revalidates_instead_of_being_resent(self):
         # 0.62 MB 的图，每次刷新都重下太浪费；但 `max-age` 又会让「刚跑完
-        # update-shopicons.bat，浏览器里还是旧图」出现一整天。⇒ ETag + no-cache。
+        # update-gamedata.bat，浏览器里还是旧图」出现一整天。⇒ ETag + no-cache。
         self.login()
         _status, headers, _body = self.fetch("/admin/itemicons.png")
         etag = headers["ETag"]

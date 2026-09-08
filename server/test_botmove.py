@@ -789,7 +789,7 @@ class RealMapTests(unittest.TestCase):
         cls.names = cls.store.available()
         if not cls.names:
             raise unittest.SkipTest(
-                "没有 bot_mapdata/ 产物，先跑 tools\\update-mapdata.bat")
+                "没有 bot_mapdata/ 产物，先跑 tools\\update-gamedata.bat")
 
     def walkable_start(self, terrain):
         """找一个真站得住的起点：某列的第一个站立面。"""

@@ -247,9 +247,9 @@ try {
 
     # --- 2. server 代码（和客户端包同一份，铁律 8）--------------------------
     Write-Host '  [2/6] server（和客户端包同一份代码）'
-    Update-MapData -Root $Root
-    Update-WeaponData -Root $Root
-    Update-ChrProps -Root $Root
+    # ★ 打包**不重跑**原版数据的提取（D53）：那几份产物在仓库里，要更新就自己
+    #   跑 tools\update-gamedata.bat（唯一那一个）。Copy-* 仍然会核对条数和
+    #   format，对不上就中止打包。
     $serverFiles = Copy-ServerCode -Root $Root -PackageRoot $OutputDirectory
     Write-Host ("        $($serverFiles.Count) 个文件（不含 relay.py —— 那是客户端连远端用的本机一跳）") -ForegroundColor DarkGray
 

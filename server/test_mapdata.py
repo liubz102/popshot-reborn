@@ -348,7 +348,7 @@ class RealDataTests(unittest.TestCase):
         cls.names = cls.store.available()
         if not cls.names:
             raise unittest.SkipTest(
-                "没有 bot_mapdata/ 产物，先跑 tools\\update-mapdata.bat")
+                "没有 bot_mapdata/ 产物，先跑 tools\\update-gamedata.bat")
 
     def test_every_map_loads(self):
         bad = []

@@ -28,7 +28,7 @@
 ## ★ 本脚本要 Pillow
 
 `C:\\Python314` 里有；`runtime\\python` 里**没有**（那是给服务端跑的便携运行时）。
-`tools\\update-shopicons.bat` 会先探测再决定用谁。
+`tools\\update-gamedata.bat` 会先探测再决定用谁。
 
 ## 产物（都进 git、进服务端包）
 
@@ -237,7 +237,7 @@ def main(argv=None):
         names = wanted_icons(items_path)
         if not names:
             raise IconError("%s 里一个 ownable 物品都没有 —— 先跑"
-                            " tools\\update-shopdata.bat" % items_path)
+                            " tools\\update-gamedata.bat" % items_path)
         sheet, placed, missing = build_atlas(Image, src_dir, names)
     except IconError as exc:
         raise SystemExit("[x] %s" % exc)

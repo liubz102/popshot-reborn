@@ -31,14 +31,6 @@ $script:ServerExcludePattern = @(
 # 任何地方都不拷的目录/文件名。
 $script:JunkNames = @('__pycache__', '.pytest_cache', '.mypy_cache')
 
-# 三份产物的提取一次构建只跑一次（build-menu 会连着调两个 builder）。
-# ★★ **必须在这里先声明**：本文件开头是 `Set-StrictMode -Version 2.0`，
-#    没赋过值的 `$script:Xxx` 读出来会直接抛 `VariableIsUndefined`
-#    —— `Update-WeaponData` 原来就漏了这一句（整包回归还没跑过，所以没暴露）。
-$script:MapDataUpdated = $false
-$script:WeaponDataUpdated = $false
-$script:ChrPropsUpdated = $false
-
 # ---------------------------------------------------------------------------
 #  基础工具
 # ---------------------------------------------------------------------------
@@ -348,7 +340,7 @@ function Copy-WeaponData {
     )
     $src = Join-Path $Root 'server\bot_weapons.json'
     if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
-        throw "缺武器表：$src 不存在。先跑 tools\update-weapondata.bat"
+        throw "缺武器表：$src 不存在。先跑 tools\update-gamedata.bat"
     }
     # 原版 weapon.ini 有 228 把武器。少一大截说明提取跑了一半或者产物被删过。
     $table = Get-Content -LiteralPath $src -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -357,6 +349,12 @@ function Copy-WeaponData {
     }
     if (@($table.usable).Count -lt 10) {
         throw "武器表里 bot 能用的武器只有 $(@($table.usable).Count) 把，明显不对，中止打包"
+    }
+    # format 对不上的话 `weapondata` 会当**没有数据**（返回空表，不报错），
+    # 症状和「文件根本没进包」一模一样 —— 在这儿先炸出来。
+    $want = Get-ServerFormatVersion -Root $Root -Module 'weapondata'
+    if ($table.format -ne $want) {
+        throw "武器表的 format 是 $($table.format)，server\weapondata.py 只认 $want。先跑 tools\update-gamedata.bat 重新提取"
     }
     Copy-One $src (Join-Path $PackageRoot 'server\bot_weapons.json')
     return @('bot_weapons.json')
@@ -375,12 +373,17 @@ function Copy-ChrProps {
     )
     $src = Join-Path $Root 'server\bot_chrprops.json'
     if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
-        throw "缺角色属性表：$src 不存在。先跑 tools\update-chrprops.bat"
+        throw "缺角色属性表：$src 不存在。先跑 tools\update-gamedata.bat"
     }
     # 原版 ChrProps.ini 有 17 个角色。少一大截说明提取跑了一半。
     $table = Get-Content -LiteralPath $src -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($table.count -lt 10) {
         throw "角色属性表只有 $($table.count) 个角色，明显不对，中止打包"
+    }
+    # 同 Copy-WeaponData：format 对不上 `chrprops` 会静默退回默认尺寸。
+    $want = Get-ServerFormatVersion -Root $Root -Module 'chrprops'
+    if ($table.format -ne $want) {
+        throw "角色属性表的 format 是 $($table.format)，server\chrprops.py 只认 $want。先跑 tools\update-gamedata.bat 重新提取"
     }
     Copy-One $src (Join-Path $PackageRoot 'server\bot_chrprops.json')
     return @('bot_chrprops.json')
@@ -400,7 +403,7 @@ function Copy-ShopData {
     )
     $src = Join-Path $Root 'server\shop_items.json'
     if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
-        throw "缺商店物品表：$src 不存在。先跑 tools\update-shopdata.bat"
+        throw "缺商店物品表：$src 不存在。先跑 tools\update-gamedata.bat"
     }
     # 中文版 ShopItem-Chn.ini 有 1870 条。少一大截说明提取跑了一半。
     $table = Get-Content -LiteralPath $src -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -416,78 +419,31 @@ function Copy-ShopData {
     return @('shop_items.json')
 }
 
-function Update-ChrProps {
-    <# 打包前重跑一次角色属性表提取（对称于 Update-WeaponData）。
+function Get-ServerFormatVersion {
+    <# 从 `server\<模块>.py` 里读出 `FORMAT = N`（产物格式版本号）。
 
-       素材 `Pack_decrypt\Data\ChrProps.ini` 不在本工作副本里 ——
-       **找不到不算失败**（产物在仓库里，直接用）；素材在而解析失败就中止打包。 #>
-    param([Parameter(Mandatory = $true)][string]$Root)
+       ★ 为什么要有它：打包**不再自动重跑提取**（D53），于是「产物是不是跟
+         当前代码对得上」没人管了。而 `mapdata` / `weapondata` / `chrprops`
+         三个读取侧在 format 对不上时是**返回空表**、不报错的 ——
+         症状和「文件根本没进包」一模一样（bot 不找路 / 不开枪 /
+         所有角色一样大），本机完全看不出来。所以在打包这一步先炸出来。
 
-    if ($script:ChrPropsUpdated) { return }
-    $script:ChrPropsUpdated = $true
-
-    $py = 'C:\Python314\python.exe'
-    if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
-        $py = Join-Path $Root 'runtime\python\python.exe'
-    }
-    $script = Join-Path $Root 'tools\chrprops.py'
-    if (-not (Test-Path -LiteralPath $py -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $script -PathType Leaf)) {
-        Write-Host '        跳过角色属性提取：没有 Python 或 tools\chrprops.py' -ForegroundColor DarkGray
-        return
-    }
-    $probe = @(
-        (Join-Path $Root 'Pack_decrypt\Data\ChrProps.ini'),
-        (Join-Path $Root '..\..\main\Pack_decrypt\Data\ChrProps.ini')
+       ★ 比对的是 **server\ 那一侧**的常量，不是 tools\ 那一侧：
+         真正在运行时读产物的是它。 #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Module
     )
-    $found = $false
-    foreach ($p in $probe) { if (Test-Path -LiteralPath $p -PathType Leaf) { $found = $true } }
-    if (-not $found) {
-        Write-Host '        跳过角色属性提取：这台机器上没有 Pack_decrypt\Data\ChrProps.ini，用仓库里现成的产物' -ForegroundColor DarkGray
-        return
+    $path = Join-Path $Root "server\$Module.py"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "缺 server\$Module.py，没法核对产物的 format"
     }
-    & $py $script --quiet
-    if ($LASTEXITCODE -ne 0) {
-        throw "角色属性提取失败（tools\chrprops.py 退出码 $LASTEXITCODE），中止打包"
+    $text = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+    $m = [regex]::Match($text, '(?m)^FORMAT\s*=\s*(\d+)')
+    if (-not $m.Success) {
+        throw "server\$Module.py 里找不到 FORMAT = N 那一行，没法核对产物的 format"
     }
-    Write-Host '        角色属性表已重新提取' -ForegroundColor DarkGray
-}
-
-function Update-WeaponData {
-    <# 打包前重跑一次武器表提取（对称于 Update-MapData）。
-
-       素材 `Pack_decrypt\Data\weapon.ini` 不在本工作副本里 ——
-       **找不到不算失败**（产物在仓库里，直接用）；素材在而解析失败就中止打包。 #>
-    param([Parameter(Mandatory = $true)][string]$Root)
-
-    if ($script:WeaponDataUpdated) { return }
-    $script:WeaponDataUpdated = $true
-
-    $py = 'C:\Python314\python.exe'
-    if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
-        $py = Join-Path $Root 'runtime\python\python.exe'
-    }
-    $script = Join-Path $Root 'tools\weapondata.py'
-    if (-not (Test-Path -LiteralPath $py -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $script -PathType Leaf)) {
-        Write-Host '        跳过武器表提取：没有 Python 或 tools\weapondata.py' -ForegroundColor DarkGray
-        return
-    }
-    $probe = @(
-        (Join-Path $Root 'Pack_decrypt\Data\weapon.ini'),
-        (Join-Path $Root '..\..\main\Pack_decrypt\Data\weapon.ini')
-    )
-    $found = $false
-    foreach ($p in $probe) { if (Test-Path -LiteralPath $p -PathType Leaf) { $found = $true } }
-    if (-not $found) {
-        Write-Host '        跳过武器表提取：这台机器上没有 Pack_decrypt\Data\weapon.ini，用仓库里现成的产物' -ForegroundColor DarkGray
-        return
-    }
-    & $py $script --quiet
-    if ($LASTEXITCODE -ne 0) {
-        throw "武器表提取失败（tools\weapondata.py 退出码 $LASTEXITCODE），中止打包"
-    }
-    Write-Host '        武器表已重新提取' -ForegroundColor DarkGray
+    return [int]$m.Groups[1].Value
 }
 
 function Copy-MapData {
@@ -506,12 +462,18 @@ function Copy-MapData {
     $srcDir = Join-Path $Root 'server\bot_mapdata'
     $index  = Join-Path $srcDir 'index.json'
     if (-not (Test-Path -LiteralPath $index -PathType Leaf)) {
-        throw "缺地图地形数据：$index 不存在。先跑 tools\update-mapdata.bat"
+        throw "缺地图地形数据：$index 不存在。先跑 tools\update-gamedata.bat"
     }
     $files = @(Get-ChildItem -LiteralPath $srcDir -Filter '*.json' -File)
     # 原版一共 174 张图。少一大截说明提取跑了一半或者产物被删过。
     if ($files.Count -lt 150) {
         throw "地图地形数据只有 $($files.Count) 个 .json，明显不对，中止打包"
+    }
+    # 同 Copy-WeaponData：format 对不上 `mapdata` 会当一张图都没有（返回空表）。
+    $want = Get-ServerFormatVersion -Root $Root -Module 'mapdata'
+    $idx = Get-Content -LiteralPath $index -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($idx.format -ne $want) {
+        throw "地图地形数据的 format 是 $($idx.format)，server\mapdata.py 只认 $want。先跑 tools\update-gamedata.bat 重新提取"
     }
     $dstDir = Join-Path $PackageRoot 'server\bot_mapdata'
     New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
@@ -521,45 +483,6 @@ function Copy-MapData {
         $copied += "bot_mapdata\$($f.Name)"
     }
     return $copied
-}
-
-function Update-MapData {
-    <# 打包前重跑一次地形提取，让产物和原版 `.map` 保持一致。
-
-       ★ 素材 `Pack_decrypt\` 太大，没进本工作副本（只在 main worktree 里）。
-         **找不到素材不算失败** —— 产物本来就在仓库里，直接用它。
-         但素材在而解析失败，那就是产物要变脏了：**中止打包**。 #>
-    param([Parameter(Mandatory = $true)][string]$Root)
-
-    # build-menu 一次构建两个包，两个 builder 各调一次 —— 提取一次就够了。
-    if ($script:MapDataUpdated) { return }
-    $script:MapDataUpdated = $true
-
-    $py = 'C:\Python314\python.exe'
-    if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
-        $py = Join-Path $Root 'runtime\python\python.exe'
-    }
-    $script = Join-Path $Root 'tools\mapdata.py'
-    if (-not (Test-Path -LiteralPath $py -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $script -PathType Leaf)) {
-        Write-Host '        跳过地形提取：没有 Python 或 tools\mapdata.py' -ForegroundColor DarkGray
-        return
-    }
-    $probe = @(
-        (Join-Path $Root 'Pack_decrypt\Maps'),
-        (Join-Path $Root '..\..\main\Pack_decrypt\Maps')
-    )
-    $found = $false
-    foreach ($p in $probe) { if (Test-Path -LiteralPath $p -PathType Container) { $found = $true } }
-    if (-not $found) {
-        Write-Host '        跳过地形提取：这台机器上没有 Pack_decrypt\Maps，用仓库里现成的产物' -ForegroundColor DarkGray
-        return
-    }
-    & $py $script --quiet
-    if ($LASTEXITCODE -ne 0) {
-        throw "地形提取失败（tools\mapdata.py 退出码 $LASTEXITCODE），中止打包"
-    }
-    Write-Host '        地形数据已重新提取' -ForegroundColor DarkGray
 }
 
 function Get-ServerCodeHash([string]$PackageRoot) {

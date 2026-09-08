@@ -807,7 +807,7 @@ class AdminRoutes:
 
         ★ 用 `ETag` + `no-cache` 而**不是** `max-age`：图集有 0.62 MB，
         每次刷新都重下太浪费；但 `max-age` 又会让「刚跑完
-        `update-shopicons.bat`，浏览器里还是旧图」这种事出现一整天。
+        `update-gamedata.bat`，浏览器里还是旧图」这种事出现一整天。
         `no-cache` 的意思是「每次都问一下」—— 没变就是一个 304 空响应，
         字节数约等于零，而且**永远不会看到旧的**。
 
