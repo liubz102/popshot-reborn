@@ -1251,6 +1251,28 @@ class AdminPlayerTests(_AdminCase):
         self.assertEqual(["alice", "bob"],
                          [p["username"] for p in all_of_them["players"]])
 
+    def test_the_online_tally_counts_the_whole_server(self):
+        """工具条右端那个「当前在线：N 人」（用户 2026-09-08）。
+
+        ★ 这个数是**全服**的，不跟着搜索串 / 页码缩水 —— 每行那个 `online`
+          才是「这一页里谁在线」。两者同源（一次 `_online_usernames()`），
+          所以列表里那些 ● 和右边那个总数永远对得上。
+        """
+        real = web_admin._online_usernames
+        web_admin._online_usernames = lambda: {"alice", "bob"}
+        self.addCleanup(setattr, web_admin, "_online_usernames", real)
+        _status, everyone = self.request("/admin/api/players?q=")
+        self.assertEqual(2, everyone["online_total"])
+        self.assertEqual({"alice": True, "bob": True},
+                         {p["username"]: p["online"]
+                          for p in everyone["players"]})
+        # 筛掉一个人之后，总数**不变** —— 这正是它和 `total` 的区别。
+        _status, only_alice = self.request("/admin/api/players?q=alice")
+        self.assertEqual(["alice"],
+                         [p["username"] for p in only_alice["players"]])
+        self.assertEqual(1, only_alice["total"])
+        self.assertEqual(2, only_alice["online_total"])
+
     def test_an_unknown_player_is_a_clean_404(self):
         status, result = self.request("/admin/api/player?name=nobody")
         self.assertEqual(404, status)

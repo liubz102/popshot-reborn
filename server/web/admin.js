@@ -2361,6 +2361,14 @@ async function searchPlayers(page) {
                  total: result.total, size: result.size, q: q};
   renderPlayerRows();
   $("playerCount").textContent = result.total + " 个账号";
+  // 工具条右端的「当前在线：N 人」（用户 2026-09-08）。★ 这个数是**全服**的，
+  // 跟搜索串和页码都无关 —— 列表里那些 ● 只是这一页里在线的那几个。
+  // 拿到过一次才显示：没查过就写「0 人」会被当成「现在没人在线」。
+  $("playerOnlineNum").textContent = result.online_total;
+  var tally = $("playerOnlineTally");
+  // `zero` = 一个人都没有：圆点变空心（和弹窗那个 `● 在线 / ○ 不在线` 同口径）。
+  tally.classList.toggle("zero", !result.online_total);
+  tally.classList.remove("hidden");
   return true;
 }
 

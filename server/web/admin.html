@@ -107,6 +107,11 @@
           <!-- 玩家自己在游戏里也会改这些数（打完一局就涨经验和金币），
                所以这一页随时会过期。刷新 = 重读列表 + 重读正在改的那个人。 -->
           <button class="btn" id="playerRefreshBtn" title="重新读一遍列表和下面这个人的资料">↻ 刷新</button>
+          <!-- 全服在线人数（用户 2026-09-08），钉在这一条的最右端。数来自
+               `/admin/api/players` 的 `online_total`，跟列表里那些 ● 是同一份
+               快照 —— 跟着列表一起刷新，不另外轮询。 -->
+          <span class="online-tally hidden" id="playerOnlineTally">
+            <i class="dot"></i>当前在线：<b id="playerOnlineNum">0</b> 人</span>
         </div>
         <!-- 换页栏只有列表上面这一条（D37b），和列表一起钉在滚动区外面。 -->
         <div class="pager" id="playerPager"></div>

@@ -385,6 +385,28 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 .toolbar select { width: auto; }
 .toolbar .grow { margin-left: auto; }
 
+/* 「玩家资料」工具条右端的「● 当前在线：N 人」（用户 2026-09-08）。
+
+   ★ 这是**状态**不是钮，所以不碰琥珀（这一页琥珀 = 可点的东西），走苔绿
+     —— 全页「开 / 通」那个语义色（开关、备份「自动」徽标都是它）。
+   ★ 实心 / 空心跟玩家弹窗那个 `● 在线 / ○ 不在线` 一个口径：有人在线亮
+     实心点，一个人都没有就只剩描边的空心点，别让绿灯一直亮着。
+   ★ 底是 `--paper-2` 的工具条，所以正文走次要说明字、只有数字用苔绿深一档
+     加粗顶出来；数字比正文大一号也撑不高这一条（旁边是输入框和按钮）。 */
+.online-tally {
+  margin-left: auto;
+  color: var(--cocoa-soft); font-size: 13px; font-weight: 600;
+  white-space: nowrap;
+}
+.online-tally .dot {
+  display: inline-block; width: 9px; height: 9px; margin-right: 6px;
+  vertical-align: 1px;                     /* 圆点中心对齐中文的视觉中线 */
+  background: var(--moss); border: 1px solid var(--moss-dk); border-radius: 50%;
+}
+.online-tally.zero .dot { background: transparent; border-color: var(--cocoa-soft); }
+.online-tally b { color: var(--moss-dk); font-size: 15px; }
+.online-tally.zero b { color: var(--cocoa-soft); }
+
 /* ★ 配置页那一条：左边筛选、右边「添加 / 放弃修改 / 保存」，**同一行**
    （用户 2026-09-06，D39 —— 原来那三个按钮在面板最底下，一屏物品之后
    得滚到头才够得着）。窄屏放不下就整组折到第二行，不会互相挤扁。 */

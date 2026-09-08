@@ -1370,6 +1370,10 @@ class AdminRoutes:
             "pages": pages,
             "size": PLAYER_PAGE_SIZE,
             "total": total,
+            # 全服在线人数（用户 2026-09-08）：和下面每行那个 `online` 是
+            # **同一次** `_online_usernames()` 的结果，所以工具条上的总数
+            # 跟列表里那些 ● 天生对得上，不会出现「三个 ●、写着五人」。
+            "online_total": len(online),
             "players": [{
                 "username": username,
                 "nickname": account_store.display_name(account),
