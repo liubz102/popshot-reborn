@@ -34,6 +34,15 @@ STOCK_ONLY = 1510001         # ★ 只有 `[Stock-]` 的期限售卖形态，进
 BRONZE_PIPE = 30018          # 청동파이프 青铜管（材料）
 BLACK_BEAD = 10001           # 검은구슬 黑珠（材料）
 NO_SUCH_ITEM = 9999999       # 物品表里根本没有
+#: 三个基础角色各一套装备槽（§46）：同一个部位、不同角色，**不抢槽**。
+TYR_TOP = 1010001            # 泰尔的上衣（part_flag 1，角色 0）
+KASIL_TOP = 2010001          # 卡希尔的上衣（角色 1）—— 和 TYR_TOP 同一个部位
+KASIL_TOP_2 = 2010002        # 卡希尔的另一件上衣 —— 和 KASIL_TOP 抢槽
+BROCK_TOP = 3010001          # 布洛克的上衣（角色 2）
+KASIL_GUN = 2120041          # 卡希尔的武器槽 1（和 REVOLVER_R1 同槽、不同角色）
+BROCK_GUN = 3120041          # 布洛克的武器槽 1
+TYR_DASH, KASIL_DASH, BROCK_DASH = 1060002, 2060002, 3060002   # 突击技（part_flag 32）
+TYR_RING, KASIL_RING, BROCK_RING = 1130059, 2130059, 3130059   # 戒指（part_flag 16384）
 
 
 class AccountStoreTests(unittest.TestCase):
@@ -830,6 +839,18 @@ class ItemFieldTests(unittest.TestCase):
         self.assertTrue(shopdata.conflicts(REVOLVER_R1, REVOLVER_R2))
         self.assertTrue(shopdata.ownable(TOP_ARMOR))
         self.assertFalse(shopdata.conflicts(REVOLVER_R1, TOP_ARMOR))
+        # ★ 三个角色各一套槽（§46）：下面几组是「同一个部位、不同角色」。
+        for tyr, kasil, brock in ((TYR_TOP, KASIL_TOP, BROCK_TOP),
+                                  (REVOLVER_R1, KASIL_GUN, BROCK_GUN),
+                                  (TYR_DASH, KASIL_DASH, BROCK_DASH),
+                                  (TYR_RING, KASIL_RING, BROCK_RING)):
+            trio = (tyr, kasil, brock)
+            self.assertEqual([0, 1, 2], [shopdata.character_of(i) for i in trio])
+            self.assertEqual({shopdata.part_flag(tyr)},
+                             {shopdata.part_flag(i) for i in trio})
+            self.assertTrue(all(shopdata.ownable(i) for i in trio))
+            self.assertFalse(shopdata.conflicts(tyr, kasil))
+        self.assertTrue(shopdata.conflicts(KASIL_TOP, KASIL_TOP_2))
         # 只有货架条目的塞进背包，客户端查不到定义，仓库里是空格子。
         self.assertFalse(shopdata.ownable(STOCK_ONLY))
         self.assertFalse(shopdata.exists(NO_SUCH_ITEM))
@@ -980,6 +1001,41 @@ class ItemFieldTests(unittest.TestCase):
         account = {"inventory": {str(REVOLVER_R1): 1, str(REVOLVER_R2): 1},
                    "equipped": [REVOLVER_R2, REVOLVER_R1]}
         self.assertEqual([REVOLVER_R2], equipped_items(account))
+
+    def test_one_character_dressing_does_not_undress_the_other_two(self):
+        """★★ 2026-09-09 实机：泰尔穿上铠甲，卡希尔和布洛克的铠甲被「顶掉」了。
+
+        槽位是**每个角色一套**（§46 / D54）—— 铠甲、武器、突击技、戒指都一样。
+        """
+        gear = [TYR_TOP, KASIL_TOP, BROCK_TOP,
+                REVOLVER_R1, KASIL_GUN, BROCK_GUN,
+                TYR_DASH, KASIL_DASH, BROCK_DASH,
+                TYR_RING, KASIL_RING, BROCK_RING]
+        for item_id in gear:
+            self.store.add_item("alice", item_id)
+        for item_id in gear:
+            account, dropped = self.store.equip_item("alice", item_id)
+            self.assertEqual([], dropped, item_id)
+        self.assertEqual(set(gear), set(equipped_items(account)))
+
+    def test_swapping_within_one_character_leaves_the_others_dressed(self):
+        for item_id in (TYR_TOP, KASIL_TOP, KASIL_TOP_2, BROCK_TOP):
+            self.store.add_item("alice", item_id)
+        for item_id in (TYR_TOP, KASIL_TOP, BROCK_TOP):
+            self.store.equip_item("alice", item_id)
+        account, dropped = self.store.equip_item("alice", KASIL_TOP_2)
+        self.assertEqual([KASIL_TOP], dropped)
+        self.assertEqual({TYR_TOP, KASIL_TOP_2, BROCK_TOP},
+                         set(equipped_items(account)))
+
+    def test_a_hand_edited_save_keeps_every_characters_gear(self):
+        # 读的时候就地收敛那一步也得按角色分槽 —— 不然开服一次
+        # （`ensure_item_fields`）就把两个角色脱光，还写回磁盘。
+        account = {"inventory": {str(TYR_TOP): 1, str(KASIL_TOP): 1,
+                                 str(BROCK_TOP): 1},
+                   "equipped": [TYR_TOP, KASIL_TOP, BROCK_TOP]}
+        self.assertEqual([TYR_TOP, KASIL_TOP, BROCK_TOP],
+                         equipped_items(account))
 
     # ---------------------------------------------------------------- 材料
     def test_add_materials_accumulates(self):

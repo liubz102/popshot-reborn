@@ -559,8 +559,9 @@ def shelf_page(category=CATEGORY_ALL, page=0, character=CHARACTER_ANY,
 # ---------------------------------------------------------------------------
 # `Equipment` 头上那 12 字节 = **每个角色的槽位掩码**（§31）
 # ---------------------------------------------------------------------------
-#: 三个角色（泰尔 / 卡希尔 / 布洛克）各一个 `PartFlag` 掩码。
-EQUIPPED_SLOT_MASK_COUNT = 3
+#: 三个角色（泰尔 / 卡希尔 / 布洛克）各一个 `PartFlag` 掩码。★ 数字定在
+#: `shopdata`（装备冲突判定也按它分组，§46），这里只是别名。
+EQUIPPED_SLOT_MASK_COUNT = shopdata.SLOT_MASK_COUNT
 
 
 def equipment_slot_masks(item_ids):
@@ -571,6 +572,9 @@ def equipment_slot_masks(item_ids):
     * 角色限定是 `0/1/2` 的，只点亮**那个角色**的掩码；
     * 角色限定是 `-1`（不限）的，**三个掩码全点亮**。
 
+    ★ 「哪件点亮哪几个掩码」在 `shopdata.slot_owners()` 一处定 —— 装备冲突
+    判定（`resolve_equipped`）用的是同一个答案，两边不会各算各的（§46）。
+
     ⚠⚠ **不能全发 0**（§23 原来那句「处理器不读它」是错的）：
     房间里的「卸下」按钮拿 `0x5584ab` 判「这件穿着没有」，判据正是
     `(掩码[角色] & PartFlag) == PartFlag`。掩码是 0 ⇒ 它认为你没穿 ⇒
@@ -579,14 +583,8 @@ def equipment_slot_masks(item_ids):
     masks = [0] * EQUIPPED_SLOT_MASK_COUNT
     for raw in item_ids or ():
         item = shopdata.get(raw)
-        if item is None or not item.part_flag:
-            continue
-        character = item.character
-        if character is None:
-            for index in range(EQUIPPED_SLOT_MASK_COUNT):
-                masks[index] |= item.part_flag
-        elif 0 <= int(character) < EQUIPPED_SLOT_MASK_COUNT:
-            masks[int(character)] |= item.part_flag
+        for index in shopdata.slot_owners(item):
+            masks[index] |= item.part_flag
     return tuple(masks)
 
 

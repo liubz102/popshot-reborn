@@ -12,8 +12,9 @@
 
 ★ 这里最要命的两条：
 
-- **`conflicts` / `resolve_equipped`**：装备槽算错 = 一个人同时穿两件上衣，
-  或者换了装备旧的没脱掉。判据只能是 `part_flag` 按位与（D6）。
+- **`conflicts` / `resolve_equipped`**：装备槽算错 = 一个人同时穿两件上衣、
+  换了装备旧的没脱掉，或者**泰尔穿上铠甲卡希尔就被脱光**（2026-09-09 实机）。
+  判据是 `part_flag` 按位与 + **每个角色各一套槽**（D6 / D54，§46）。
 - **`exists`**：中文版客户端不认识的 id 一旦发下去，界面上就是空格子
   （结算界面那一栏更直接，`0x415a94` 查不到整件跳过，§3）。
 """
@@ -85,6 +86,15 @@ SYNTHETIC = {
                 "character": 0, "stock": True, "ownable": True, "slot": 2},
     "2120041": {"id": 2120041, "kind": "weapon", "part_flag": 1024, "part": 12,
                 "character": 1, "stock": True, "ownable": True, "slot": 1},
+    # 卡希尔 / 布洛克的上衣：和 1010001 同一个部位、不同角色（§46：各占各的槽）。
+    "2010001": {"id": 2010001, "kind": "armor", "part_flag": 1, "part": 1,
+                "character": 1, "stock": True, "ownable": True},
+    "3010001": {"id": 3010001, "kind": "armor", "part_flag": 1, "part": 1,
+                "character": 2, "stock": True, "ownable": True},
+    # ★ 不限角色的上衣。原版表里没有这种东西（不限角色的只有称号 / 宠物），
+    #   只为钉住「不限角色 = 三个掩码都占」这条规则。
+    "990001": {"id": 990001, "kind": "armor", "part_flag": 1, "part": 1,
+               "character": None, "stock": True, "ownable": True},
     "30018": {"id": 30018, "kind": "material", "part_flag": 0,
               "icon": "청동파이프", "name_kr": "청동파이프",
               "stock": False, "ownable": True},
@@ -184,7 +194,22 @@ class SyntheticTests(_TableCase):
         self.assertTrue(shopdata.conflicts(1010001, 1990001))     # 上衣 vs 全身套装
         self.assertTrue(shopdata.conflicts(1020001, 1990001))     # 下装 vs 全身套装
         self.assertFalse(shopdata.conflicts(1120041, 1120051))    # 武器槽 1 vs 2
-        self.assertTrue(shopdata.conflicts(1120041, 2120041))     # 都占武器槽 1
+
+    def test_conflicts_are_per_character(self):
+        """★★ 槽位是每个角色一套（§46 / D54）：同一个槽、不同角色，不冲突。"""
+        self.assertFalse(shopdata.conflicts(1120041, 2120041))    # 武器槽 1：泰尔 vs 卡希尔
+        self.assertFalse(shopdata.conflicts(1010001, 2010001))    # 上衣：泰尔 vs 卡希尔
+        self.assertFalse(shopdata.conflicts(1990001, 2010001))    # 泰尔的全身套装 vs 卡希尔的上衣
+        # 不限角色的三个掩码都占（`0x5583d3`）⇒ 和谁的上衣都冲突。
+        self.assertTrue(shopdata.conflicts(990001, 1010001))
+        self.assertTrue(shopdata.conflicts(2010001, 990001))
+
+    def test_slot_owners(self):
+        self.assertEqual((0,), shopdata.slot_owners(shopdata.get(1010001)))
+        self.assertEqual((1,), shopdata.slot_owners(shopdata.get(2010001)))
+        self.assertEqual((0, 1, 2), shopdata.slot_owners(shopdata.get(990001)))
+        self.assertEqual((), shopdata.slot_owners(shopdata.get(30018)))   # 材料不占槽
+        self.assertEqual((), shopdata.slot_owners(None))
 
     def test_materials_never_conflict(self):
         # part_flag = 0，想拿多少拿多少。
@@ -232,6 +257,27 @@ class ResolveEquippedTests(_TableCase):
         kept, dropped = shopdata.resolve_equipped([1010001, 1990001])
         self.assertEqual([1010001], kept)
         self.assertEqual([1990001], dropped)
+
+    def test_each_character_has_its_own_slots(self):
+        """★★ 一个角色穿铠甲，另外两个不能被脱掉（2026-09-09 实机，§46）。"""
+        kept, dropped = shopdata.resolve_equipped(
+            [2010001, 1010001, 2120041, 1120041])
+        self.assertEqual([2010001, 1010001, 2120041, 1120041], kept)
+        self.assertEqual([], dropped)
+        # 同一个角色、同一个槽照样先到先得：泰尔的全身套装顶掉泰尔的上衣，
+        # 卡希尔的上衣不受影响。
+        kept, dropped = shopdata.resolve_equipped([1990001, 2010001, 1010001])
+        self.assertEqual([1990001, 2010001], kept)
+        self.assertEqual([1010001], dropped)
+
+    def test_unlimited_gear_takes_the_slot_on_every_character(self):
+        # 客户端给不限角色的装备点亮三个掩码（`0x5583d3`），它和谁的上衣都抢。
+        kept, dropped = shopdata.resolve_equipped([990001, 1010001, 2010001])
+        self.assertEqual([990001], kept)
+        self.assertEqual([1010001, 2010001], dropped)
+        kept, dropped = shopdata.resolve_equipped([2010001, 990001])
+        self.assertEqual([2010001], kept)
+        self.assertEqual([990001], dropped)
 
     def test_drops_unknown_ids(self):
         # 客户端表里没有的 id 发下去只会画出空格子。

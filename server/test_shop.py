@@ -739,6 +739,14 @@ class PacketTests(_ShopCase):
         self.assertEqual((0, 0, 0), shop.equipment_slot_masks([30018]))
         self.assertEqual((0, 0, 0), shop.equipment_slot_masks([9999999]))
 
+    def test_三个角色各占各的槽(self):
+        # 同一个部位、三个角色 ⇒ 三个掩码各亮一位。装备冲突判定
+        # （`shopdata.resolve_equipped`）按同一份 `slot_owners` 分组（§46）：
+        # 三件上衣一件都不会被顶掉。
+        tops = [1010001, 2010001, 3010001]
+        self.assertEqual((1, 1, 1), shop.equipment_slot_masks(tops))
+        self.assertEqual((tops, []), shopdata.resolve_equipped(tops))
+
     def test_0x030b_的掩码和_0x0604_一样(self):
         # 两边都得算，不然「商店里穿上了、房间里说没穿」。
         import gameserver

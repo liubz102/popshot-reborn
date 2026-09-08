@@ -114,7 +114,8 @@ from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_STEP, LEVEL_MAX,
 import gameserver
 import shop
 import shopcfg
-from test_shop import (config_dir, parse_rep_composition_list,
+from test_shop import (config_dir, parse_equipped_masks,
+                       parse_rep_composition_list,
                        parse_rep_equipped_list, parse_rep_inventory,
                        parse_rep_item_info, parse_shop_item_list,
                        recipe_config, shop_config)
@@ -3608,6 +3609,25 @@ class ShopBuyAndEquipTests(unittest.TestCase):
                   if opcode == gameserver.OP_REP_EQUIPPED_LIST]
         self.assertEqual([self.REVOLVER_R1],
                          sorted(parse_rep_equipped_list(bodies[0])))
+
+    def test_one_character_dressing_does_not_undress_the_other_two(self):
+        """★★ 2026-09-09 实机：泰尔穿上铠甲，另外两个角色的铠甲被「顶掉」。
+
+        槽位是**每个角色一套**（§46 / D54）。`0x0604` 里那三个掩码也得各亮
+        各的，不然房间里的「卸下」会说「已卸下。」（§31）。
+        """
+        tops = (1010001, 2010001, 3010001)      # 泰尔 / 卡希尔 / 布洛克的上衣
+        self.own(*tops)
+        frames = []
+        for item_id in tops:
+            frames = self.equip(item_id)
+        self.assertEqual(sorted(tops),
+                         sorted(account_store.equipped_items(self.account())))
+        bodies = [body for opcode, body in frames
+                  if opcode == gameserver.OP_REP_EQUIPPED_LIST]
+        masks, items = parse_equipped_masks(bodies[0])
+        self.assertEqual([1, 1, 1], masks)
+        self.assertEqual(sorted(tops), sorted(items))
 
 
 class ShopComposeTests(unittest.TestCase):

@@ -8,8 +8,9 @@
 
 ## 这张表回答什么
 
-    part_flag(id)      这件东西占哪个装备槽 —— ★ 装备冲突判定的唯一依据
-    conflicts(a, b)    两件能不能同时穿
+    part_flag(id)      这件东西占哪个装备槽 —— ★ 装备冲突判定的依据（和角色一起看）
+    slot_owners(item)  这件东西点亮哪几个角色的槽位掩码 —— ★ 槽是每个角色一套（§46）
+    conflicts(a, b)    两件能不能同时穿（同一个角色的同一个槽才算抢）
     bonus(id)          装备加成（**只用于展示**，真正生效的是客户端自己算的，§1）
     kind(id)           weapon / armor / material / …  商店分类和校验
     exists(id)         ★ 这个 id 中文版客户端认不认识 —— 不认识就别发下去
@@ -40,6 +41,10 @@ _EMPTY = {"items": {}, "by_kind": {}, "promotions": [], "bonus_index": {}}
 
 #: 武器槽的三个 `PartFlag`（`part_flag` 里的位）。
 WEAPON_SLOT_FLAGS = (1024, 2048, 4096)
+
+#: 客户端 `Equipment` 头上的三个槽位掩码 —— **一个角色一个**（0/1/2 = 泰尔 /
+#: 卡希尔 / 布洛克，V0.3商店 §31）。装备槽是按角色分的，不是整个账号一套（§46）。
+SLOT_MASK_COUNT = 3
 
 
 class Item(object):
@@ -195,14 +200,46 @@ def ownable(item_id):
     return bool(item and item.ownable)
 
 
-def conflicts(a, b):
-    """两件装备是不是抢同一个槽。
+def slot_owners(item):
+    """这件东西点亮**哪几个角色**的槽位掩码（下标表）。
 
-    ★ 判据是 `part_flag` **按位与非 0** —— 套装的 `part_flag` 是组合值
-    （上衣+下装+头+鞋+手套 = 31），这一条规则同时覆盖单件和套装（D6）。
+    照客户端 `Equipment::Equip`（`0x5583d3`，§31）：角色限定 `0/1/2` → 只有
+    那一个；不限（`None`）→ 三个全点。不占槽的（`part_flag == 0`）一个都不点。
+
+    ★★ 装备冲突**只在同一个掩码里**才算（§46）：泰尔的上衣和卡希尔的上衣
+    `part_flag` 一样，但各占各的掩码，能同时穿着。`resolve_equipped` /
+    `conflicts` / `shop.equipment_slot_masks` 都从这里拿答案，别再各写一份。
+    """
+    if item is None or not item.part_flag:
+        return ()
+    character = item.character
+    if character is None:
+        return tuple(range(SLOT_MASK_COUNT))
+    try:
+        index = int(character)
+    except (TypeError, ValueError):
+        return ()
+    if 0 <= index < SLOT_MASK_COUNT:
+        return (index,)
+    return ()
+
+
+def conflicts(a, b):
+    """两件装备能不能同时穿 —— 抢的是**同一个角色的**同一个槽才算冲突。
+
+    ★ 两个判据缺一不可（D6 / D54）：
+    1. `part_flag` **按位与非 0** —— 套装的 `part_flag` 是组合值
+       （上衣+下装+头+鞋+手套 = 31），这一条同时覆盖单件和套装；
+    2. 两件点亮的角色掩码**有交集**（`slot_owners`）—— 泰尔的上衣和卡希尔的
+       上衣同为 `part_flag == 1`，但各在各的掩码里，不冲突；不限角色的
+       三个掩码都占，和谁都冲突。
     ★ 非装备（`part_flag == 0`）永远不冲突：材料想拿多少拿多少。
     """
-    return bool(part_flag(a) & part_flag(b))
+    x = STORE.get(a)
+    y = STORE.get(b)
+    if x is None or y is None or not (x.part_flag & y.part_flag):
+        return False
+    return bool(set(slot_owners(x)) & set(slot_owners(y)))
 
 
 def character_of(item_id):
@@ -270,6 +307,10 @@ def resolve_equipped(item_ids):
     调用方（`set_equipped`）应当把「玩家刚点的那件」放在最前面，
     这样「换装」天然表现为「新的顶掉旧的」。
 
+    ★★ 槽位是**每个角色一套**（三个掩码，`slot_owners`，§46）：泰尔穿了上衣
+      不影响卡希尔 / 布洛克的上衣。以前这里只用一个总掩码，结果一个角色穿
+      铠甲另外两个就被「顶掉」了（2026-09-09 实机）。客户端自己也是这么判的
+      （`0x55832c` 只查角色限定那一个掩码），别再收回去。
     ★ 不在物品表里的 id 一律丢掉：发下去客户端查不到图标（见模块开头）。
     ★ **不占槽的（`part_flag == 0`：材料 / 消耗品 / 角色卡）也丢掉**——它们
       穿不上身，留在 `equipped` 里只会让 `0x030b` 把角色卡发两遍、`0x0604`
@@ -277,16 +318,17 @@ def resolve_equipped(item_ids):
     """
     kept = []
     dropped = []
-    used = 0
+    masks = [0] * SLOT_MASK_COUNT
     for raw in item_ids or ():
         item = STORE.get(raw)
         if item is None or not item.ownable or not item.part_flag:
             dropped.append(raw)
             continue
-        flag = item.part_flag
-        if flag and (flag & used):
+        owners = slot_owners(item)
+        if any(masks[index] & item.part_flag for index in owners):
             dropped.append(raw)
             continue
-        used |= flag
+        for index in owners:
+            masks[index] |= item.part_flag
         kept.append(item.id)
     return kept, dropped
