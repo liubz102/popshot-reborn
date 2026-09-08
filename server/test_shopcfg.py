@@ -601,19 +601,50 @@ class RealDefaultsTests(unittest.TestCase):
 
     def test_shop_lists_the_whole_catalogue(self):
         """★ 全量上架（D44 / D44b）：散件在商店买 —— 63 件 D/R/F 一件不少，
-        加上特别版武器、散装铠甲、装饰、染色剂、突击技、外观套和强攻套。
-        材料 / 消耗品 / 礼包 / 角色卡 / 称号不卖（D44 那张表）。"""
+        加上特别版武器、散装铠甲、装饰、染色剂、突击技、外观套和强攻套，
+        再加 11 张商城角色卡（D51：1000 金币、不限等级）。
+        材料 / 消耗品 / 礼包 / 称号不卖（D44 那张表）。"""
         shop = shopcfg.validate_shop(shopcfg.default_shop())
         listed = [e for e in shop.values() if e["listed"]]
-        self.assertEqual(484, len(listed), "上架件数变了 —— 改了 shopdefaults 的表就把这个数跟着改")
+        self.assertEqual(495, len(listed), "上架件数变了 —— 改了 shopdefaults 的表就把这个数跟着改")
         kinds = {e["kind"] for e in listed}
-        self.assertEqual({"weapon", "armor", "spray", "dash"}, kinds)
+        self.assertEqual({"weapon", "armor", "spray", "dash", "character"}, kinds)
         for entry in listed:
             self.assertGreater(entry["price"], 0, "上架的东西不能白送")
+        cards = [e for e in listed if e["kind"] == "character"]
+        self.assertEqual(11, len(cards))
+        self.assertEqual({1000}, {e["price"] for e in cards}, "角色卡统一 1000 金币")
+        rules = shopcfg.validate_items(shopcfg.default_items())
+        for entry in cards:
+            self.assertEqual((1, None), shopcfg.rule_of(rules, entry["id"]),
+                             "角色卡不限等级、不限角色")
         for item_id in shopdata.ids_of_kind("weapon"):
             item = shopdata.get(item_id)
             if item.ownable and item.series and item.character is not None:
                 self.assertIn(item_id, shop, "D/R/F 武器 %d 没上架" % item_id)
+
+    def test_the_mercenary_tab_of_the_real_shelf_is_exactly_the_eleven_cards(self):
+        """★ 用户要的是「商店 → 人物 → 佣兵 里有 11 张卡」（D51）—— 把上架 /
+        ownable / 分类 / 角色过滤四道过滤合在一起对真模板算一遍。"""
+        import shop
+        from account_store import PREMIUM_CHARACTER_IDS, character_item_id
+        shopcfg.ensure_files(self.tmp.name)
+        expected = [character_item_id(c) for c in PREMIUM_CHARACTER_IDS]
+        cards, warnings = shop.shelf_entries(category=0x30001, data_dir=self.tmp.name)
+        self.assertEqual([], warnings)
+        self.assertEqual(expected, [e["id"] for e in cards])
+        # 父标签「人物」也收；预览角色是泰尔（0）时照样全列（卡不限角色）。
+        parent, _ = shop.shelf_entries(category=0x30000, data_dir=self.tmp.name)
+        self.assertEqual(expected, [e["id"] for e in parent])
+        tai, _ = shop.shelf_entries(category=0x30001, character=0,
+                                    data_dir=self.tmp.name)
+        self.assertEqual(expected, [e["id"] for e in tai])
+        # 「人物 → 英雄」= 0 永远是空的（§22）；「道具 → 其他」不再兜住角色卡。
+        heroes, _ = shop.shelf_entries(category=0, data_dir=self.tmp.name)
+        self.assertEqual([], heroes)
+        other, _ = shop.shelf_entries(category=shop.CATEGORY_OTHER,
+                                      data_dir=self.tmp.name)
+        self.assertEqual([], [e for e in other if e["kind"] == "character"])
 
     def test_every_item_name_is_chinese(self):
         """★ 中文名的唯一出处是**物品库**（D31），所以这一条查的是它。"""

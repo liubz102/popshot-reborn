@@ -51,11 +51,6 @@ NEW_ACCOUNT_DEFAULTS = {
     #: True = 三个难度直接全开，不要求逐级通关（默认）。
     #: 置 False 就恢复原版的逐级解锁：通关简单才能选普通，通关普通才能选困难。
     "quest_unlock_all": True,
-    #: True = 房间「人物选择」里把 11 个商城角色全部放出来（默认）。
-    #: 置 False 就只放 `owned_characters` 里列着的那几个（原版是花钱买）。
-    "character_unlock_all": True,
-    #: 手动持有的商城角色 id 列表（`character_unlock_all` 为 False 时才看它）。
-    "owned_characters": [],
     #: 仓库里的持有物 `{itemId 字符串: {"count": 数量, "expires": 到期或 None}}`
     #: （V0.3商店 M2）。键写成字符串是因为 JSON 的对象键只能是字符串。
     #:
@@ -63,8 +58,11 @@ NEW_ACCOUNT_DEFAULTS = {
     #: 留着这个键是因为原版真有期限制装备（`ShopItem.ini` 的 `5x` 段），
     #: 将来要做时不用再动一次线上存档的结构（铁律 11）。
     #:
-    #: ★ **不含商城角色物品** —— 那一批是从 `owned_characters` 派生的
-    #: （`character_item_ids()`），两条路各管各的。
+    #: ★ **商城角色也在这里**（V0.3商店 D51）：买角色 = 买一张 9 位 id 的
+    #:   角色卡（`character_item_id()`），`owned_characters()` 从这张表派生。
+    #:   以前的 `character_unlock_all`（全开开关）/ `owned_characters`（手写
+    #:   列表）两个键作废，`ensure_item_fields()` 开服时把列表转成角色卡、
+    #:   把两个键删掉（`LEGACY_CHARACTER_KEYS`）。
     "inventory": {},
     #: 当前穿在身上的 itemId **列表**（不是「部位 -> id」字典，D6）。
     #: `0x030b gspSlotEquippedList` 的线格式本来就是一个 id 列表，客户端拿它
@@ -258,37 +256,46 @@ def character_item_id(character_id):
             + CHARACTER_ITEM_SUFFIX)
 
 
-def character_unlock_all(account):
-    """账号是否「商城角色全开」。存档里没写就按 True。"""
-    if not account:
-        return True
-    return bool(account.get("character_unlock_all", True))
+def character_id_of_item(item_id):
+    """角色卡的物品 id -> 商城角色 id；不是那 11 张角色卡就返回 `None`。
+
+    `character_item_id()` 的反函数：只认 `(id + 1) * 1e6 + 400001` 这个形状，
+    `101900001` 那种同角色的别的商品不算（原版 `ShopItem.ini` 里它们只有货架
+    条目，进不了背包）。
+    """
+    try:
+        item_id = int(item_id)
+    except (TypeError, ValueError):
+        return None
+    if item_id % ITEM_ID_CHARACTER_STRIDE != CHARACTER_ITEM_SUFFIX:
+        return None
+    character_id = item_id // ITEM_ID_CHARACTER_STRIDE - 1
+    return character_id if character_id in PREMIUM_CHARACTER_IDS else None
+
+
+#: D51 之前存档里管商城角色的两个键。`ensure_item_fields()` 开服时把
+#: `owned_characters` 列表转成仓库里的角色卡，然后把两个键都删掉；
+#: `character_unlock_all` 那个「全开」开关**不转** —— 角色改成要去商店买了。
+LEGACY_CHARACTER_KEYS = ("character_unlock_all", "owned_characters")
 
 
 def owned_characters(account):
-    """要放进「人物选择」的商城角色 id（已排序、去重、只留已知的那 11 个）。
+    """已买到的商城角色 id（从仓库里的角色卡派生；已排序、去重、只留已知的那 11 个）。
 
     ★ 基础的 0/1/2 不在里面 —— 客户端对它们根本不查背包。
+    ★ **只有这一个来源**（V0.3商店 D51）：角色要在商店买（1000 金币），
+      或者管理员在「修改背包」里塞一张角色卡。以前的全开开关和手写列表都作废了。
     """
-    if character_unlock_all(account):
-        return list(PREMIUM_CHARACTER_IDS)
-    raw = (account or {}).get("owned_characters")
-    if not isinstance(raw, (list, tuple)):
-        return []
-    known = set(PREMIUM_CHARACTER_IDS)
     picked = set()
-    for value in raw:
-        try:
-            character_id = int(value)
-        except (TypeError, ValueError):
-            continue
-        if character_id in known:
+    for item_id in _inventory_records(account):
+        character_id = character_id_of_item(item_id)
+        if character_id is not None:
             picked.add(character_id)
     return sorted(picked)
 
 
 def character_item_ids(account):
-    """要用 `0x030b gspSlotEquippedList` 下发的背包物品 id 列表。"""
+    """要用 `0x030b gspSlotEquippedList` 下发的角色卡 id 列表（仓库里有的那些）。"""
     return [character_item_id(character_id)
             for character_id in owned_characters(account)]
 
@@ -423,7 +430,7 @@ class AccountStore:
         不写盘，所以每次启动都可以跑，不需要 schema 版本号；以后有人手工丢一份
         旧 JSON 进来也会被自动补上。
 
-        管四件事：
+        管五件事：
 
         1. 老账号缺 `inventory` / `equipped` / `materials` 时补空的。
            逻辑上 `_merged_account()` 每次读都会补，但**磁盘上**那三个键要等
@@ -431,7 +438,10 @@ class AccountStore:
         2. 洗掉脏条目：数量 <= 0 的、id 解析不出来的、客户端不认识的。
         3. 让 `equipped` 满足两条不变式（不抢槽 + 必须是自己的）。
            `shop_items.json` 换代（某件装备被移出中文版）之后靠它收敛。
-        4. 顶层的 `admin_accounts`：**键不存在**时建一个默认管理员。
+        4. D51 之前的 `owned_characters` 列表转成仓库里的角色卡，然后连同
+           `character_unlock_all` 一起删掉（`LEGACY_CHARACTER_KEYS`）——
+           留着会让翻存档的人以为「全开」还管用。
+        5. 顶层的 `admin_accounts`：**键不存在**时建一个默认管理员。
            键在但是空字典 = 用户主动关掉了管理页，**不碰**（D13）。
 
         返回 ``{"accounts": [{"username", "notes"}, ...],
@@ -447,13 +457,17 @@ class AccountStore:
                 # ★ 必须从**原始字典**算。走 `_merged_account()` 的话三个键
                 #   在读的那一刻就已经被补上了，永远看不出磁盘上缺什么。
                 inventory, equipped, materials, notes = normalize_item_fields(raw)
+                legacy = [key for key in LEGACY_CHARACTER_KEYS if key in raw]
                 if (raw.get("inventory") == inventory
                         and raw.get("equipped") == equipped
-                        and raw.get("materials") == materials):
+                        and raw.get("materials") == materials
+                        and not legacy):
                     continue
                 raw["inventory"] = inventory
                 raw["equipped"] = equipped
                 raw["materials"] = materials
+                for key in legacy:
+                    del raw[key]
                 changed.append({
                     "username": username,
                     # 形状变了但没丢东西（比如手写的 `"1010015": 2` 简写）
@@ -687,8 +701,10 @@ class AccountStore:
             raise AccountError(
                 "bad_save",
                 f"存档文件里没有可用的用户名（{USERNAME_RULE_TEXT}）") from None
+        # ★ `owned_characters` 是 D51 之前的旧键，放行只为让 `normalize_item_fields`
+        #   把它转成角色卡（旧版导出的存档里可能有）；`import_account` 转完就删。
         fields = {key: value for key, value in raw.items()
-                  if key in NEW_ACCOUNT_DEFAULTS}
+                  if key in NEW_ACCOUNT_DEFAULTS or key == "owned_characters"}
         return username, fields
 
     def import_account(self, payload, auth_username="", auth_password=""):
@@ -754,6 +770,8 @@ class AccountStore:
             # —— 上传的文件是玩家用记事本改过的，脏条目不该落到磁盘上。
             (account["inventory"], account["equipped"],
              account["materials"], _notes) = normalize_item_fields(account)
+            for key in LEGACY_CHARACTER_KEYS:      # 旧键转成角色卡之后就不再落盘
+                account.pop(key, None)
             data["accounts"][username] = account
             self._write_unlocked(data)
             return username, ("created" if existing is None else "replaced")
@@ -1087,7 +1105,8 @@ class AccountStore:
         所以调用方要把「玩家刚点的那件」放在最前面 —— 换装于是天然表现为
         「新的顶掉旧的」，不用在每个调用点重写一遍「先找出同槽的再卸下」。
 
-        丢掉的有两类，都在 `dropped` 里：抢了槽的、和不在仓库里的。
+        丢掉的有三类，都在 `dropped` 里：抢了槽的、穿不上身的（`part_flag == 0`，
+        材料 / 角色卡）、和不在仓库里的。
         """
         with self._lock:
             data = self._read_unlocked()
@@ -1644,8 +1663,16 @@ def player_character(account):
 
     客户端 `0x406520`（`0x0301` 的 action 4）拿它去 `0x557128` 查角色名，
     房间中下那个 3D 预览也按它换模型。存档里没有就退回 0（第一个角色）。
+
+    ★ 记的是一个**没买**的商城角色时也退回 0（V0.3商店 D51）：全开时代选的
+    角色留在存档里，改成要买之后不该还坐在那个角色上 —— 客户端的「人物选择」
+    列不出它，玩家自己换不回来，服务端替他换成泰尔。
     """
-    return _non_negative(account, "character")
+    character_id = _non_negative(account, "character")
+    if (character_id in PREMIUM_CHARACTER_IDS
+            and character_id not in owned_characters(account)):
+        return 0
+    return character_id
 
 
 def _quest_records(account):
@@ -1766,9 +1793,9 @@ def inventory_items(account):
 def owned_item_ids(account):
     """持有物的 itemId 列表（已排序）。
 
-    ★ **不含商城角色物品** —— 那一批由 `character_item_ids()` 从
-    `owned_characters` 派生（V0.1 §119），不落在 `inventory` 里。
-    要往 `0x030b` 里塞的是这两份的**并集**。
+    ★ 角色卡也在里面（V0.3商店 D51）—— 买角色就是买一张 9 位 id 的卡。
+    `0x030b` 要的是 `character_item_ids()`（这里面的角色卡）+ `equipped_items()`
+    （穿着的装备），不是整份持有物。
     """
     return sorted(_inventory_records(account))
 
@@ -1858,6 +1885,30 @@ def normalize_item_fields(raw):
     if unknown:
         notes.append("丢掉客户端不认识的持有物 "
                      + "/".join(str(i) for i in unknown))
+
+    # ★ D51 之前手写在 `owned_characters` 里的商城角色转成角色卡（已有的不重复）。
+    #   `character_unlock_all` 那个「全开」开关不转 —— 角色改成要去商店买了，
+    #   全开时代白拿的不算持有。
+    legacy = raw.get("owned_characters")
+    converted = []
+    if isinstance(legacy, (list, tuple)):
+        for value in legacy:
+            try:
+                character_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if character_id not in PREMIUM_CHARACTER_IDS:
+                continue
+            item_id = character_item_id(character_id)
+            if item_id not in inventory:
+                inventory[item_id] = {"count": 1, "expires": None}
+                converted.append(item_id)
+    if converted:
+        notes.append("旧存档里手写的商城角色转成角色卡 "
+                     + "/".join(str(i) for i in converted))
+    dropped_keys = [key for key in LEGACY_CHARACTER_KEYS if key in raw]
+    if dropped_keys:
+        notes.append("删掉作废的 " + " / ".join(dropped_keys))
 
     materials = _material_records(raw)
     unknown_material = sorted(i for i in materials if not shopdata.ownable(i))

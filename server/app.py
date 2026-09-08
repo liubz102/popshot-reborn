@@ -314,10 +314,34 @@ def _report_shop_config():
     except Exception as error:              # noqa: BLE001 —— 配置写不出也不该拦住开服
         log(f"⚠ 商店配置生成失败（{error!r}）；商店会是空的，游戏其余部分照常")
         return
-    if not created:
+    if created:
+        head = ("商店配置: 新建了 " + "、".join(created)
+                + f"（在 {shopcfg.DATA_DIR}；改完保存即刻生效，不用重启）")
+        log(head)
+        eventlog.online(head)
+    _report_character_shelf()
+
+
+def _report_character_shelf():
+    """货架上一张角色卡都没有就喊一声（V0.3商店 D51）。
+
+    ★ 为什么要单独查这一条：D51 把「商城角色全开」删了，角色改成在商店买；
+    存档迁移是开服自动跑的（`ensure_item_fields`），但 `shop.json` 已存在时
+    `ensure_files` 一律不碰（D7）—— 拿着 D51 之前的 `shop.json` 升级，玩家会
+    掉到 3 个角色而货架上**没有卡可买**。补卡是运营的决定，不自动写文件：
+    控制通道 `shop-backfill apply`、`tools/gen_listing.py --apply --all`、
+    或管理页「商店货架 → 添加」都行。**按状态翻转说话**：有卡就一行不打。
+    """
+    try:
+        table, _warnings = shopcfg.shop()
+    except Exception:                       # noqa: BLE001 —— 读坏了别的地方会报
         return
-    head = ("商店配置: 新建了 " + "、".join(created)
-            + f"（在 {shopcfg.DATA_DIR}；改完保存即刻生效，不用重启）")
+    if any(entry.get("kind") == "character" and entry.get("listed")
+           for entry in table.values()):
+        return
+    head = ("⚠ 商店货架上没有角色卡（D51 起商城角色要在商店买）：玩家只有 3 个基础角色"
+            "且买不到别的 —— 用控制通道 `shop-backfill apply` 或 "
+            "`tools/gen_listing.py --apply --all` 把 11 张卡补上")
     log(head)
     eventlog.online(head)
 

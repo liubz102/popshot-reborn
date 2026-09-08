@@ -476,8 +476,6 @@ class AccountStoreTests(unittest.TestCase):
             "character": 7,
             "quest_difficulty": {"5": 2},
             "quest_unlock_all": False,
-            "character_unlock_all": False,
-            "owned_characters": [101, 105],
             # ★ 这三个写的是**规范形态**：`import_account` 会当场洗一遍
             #   （上传的是人手改过的文件），洗完要和写进去的一模一样。
             "inventory": {str(REVOLVER_R1): {"count": 1, "expires": None}},
@@ -1128,14 +1126,106 @@ class ItemFieldTests(unittest.TestCase):
         before = {"password": "pw", "display_name": "爱丽丝", "money": 8800,
                   "experience": 4200, "level": 9, "tutorial_completed": True,
                   "tutorial_progress": 5, "character": 2,
-                  "quest_difficulty": {"3": 2}, "quest_unlock_all": False,
-                  "character_unlock_all": False, "owned_characters": [100, 104]}
+                  "quest_difficulty": {"3": 2}, "quest_unlock_all": False}
         store = self.write_raw({"schema_version": 2,
                                 "accounts": {"old": dict(before)}})
         store.ensure_item_fields()
         after = self.saved()["accounts"]["old"]
         for key, value in before.items():
             self.assertEqual(value, after[key], key)
+
+    # ------------------------------------------- D51：旧的商城角色键搬进仓库
+    def test_ensure_item_fields_turns_a_legacy_owned_characters_list_into_cards(self):
+        """D51 之前手写的 `owned_characters` 是玩家真持有的角色，不能丢（铁律 11）
+        —— 转成仓库里的角色卡；转完两个旧键都删掉。"""
+        store = self.write_raw({"schema_version": 2, "accounts": {"old": {
+            "password": "pw", "character_unlock_all": False,
+            "owned_characters": [100, 104, "x", 7, 104],
+            "inventory": {str(REVOLVER_R1): {"count": 1, "expires": None}}}}})
+        report = store.ensure_item_fields()
+        after = self.saved()["accounts"]["old"]
+        self.assertEqual({str(REVOLVER_R1): {"count": 1, "expires": None},
+                          "101400001": {"count": 1, "expires": None},
+                          "105400001": {"count": 1, "expires": None}},
+                         after["inventory"])
+        self.assertNotIn("owned_characters", after)
+        self.assertNotIn("character_unlock_all", after)
+        notes = " ".join(report["accounts"][0]["notes"])
+        self.assertIn("101400001", notes)
+        self.assertIn("owned_characters", notes)
+        # 第二遍什么都不改、文件一个字节不动（幂等，D5）。
+        before = self.raw_bytes()
+        self.assertEqual([], store.ensure_item_fields()["accounts"])
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_ensure_item_fields_drops_the_dead_unlock_all_flag_without_granting_anything(self):
+        # 「全开」是服务端白送的，不算持有：开关删掉，仓库还是空的。
+        store = self.write_raw({"schema_version": 2, "accounts": {"old": {
+            "password": "pw", "character_unlock_all": True, "owned_characters": []}}})
+        store.ensure_item_fields()
+        after = self.saved()["accounts"]["old"]
+        self.assertEqual({}, after["inventory"])
+        self.assertNotIn("character_unlock_all", after)
+        self.assertNotIn("owned_characters", after)
+        self.assertEqual([], account_store.owned_characters(after))
+
+    def test_a_legacy_card_already_in_the_warehouse_is_not_doubled(self):
+        store = self.write_raw({"schema_version": 2, "accounts": {"old": {
+            "password": "pw", "owned_characters": [100],
+            "inventory": {"101400001": {"count": 1, "expires": None}}}}})
+        store.ensure_item_fields()
+        after = self.saved()["accounts"]["old"]
+        self.assertEqual({"101400001": {"count": 1, "expires": None}},
+                         after["inventory"])
+
+    def test_import_converts_a_legacy_owned_characters_list(self):
+        # 旧版导出的存档里带 `owned_characters`：转成角色卡，旧键不落盘。
+        self.store.import_account(
+            {"popshot_save": 1, "username": "bob",
+             "account": {"password": "pw", "character_unlock_all": True,
+                         "owned_characters": [102]}})
+        saved = self.saved()["accounts"]["bob"]
+        self.assertEqual({"103400001": {"count": 1, "expires": None}},
+                         saved["inventory"])
+        self.assertNotIn("owned_characters", saved)
+        self.assertNotIn("character_unlock_all", saved)
+        self.assertEqual([102], account_store.owned_characters(saved))
+
+    def test_a_character_card_in_the_warehouse_is_the_character(self):
+        # D51：`owned_characters()` 只看仓库；`player_character()` 没卡退回 0。
+        self.assertEqual(101, account_store.character_id_of_item(102400001))
+        self.assertIsNone(account_store.character_id_of_item(101900001))
+        self.assertIsNone(account_store.character_id_of_item(REVOLVER_R1))
+        self.assertIsNone(account_store.character_id_of_item("abc"))
+        self.store.add_item("alice", 102400001)
+        _, account = self.store.get_account("alice")
+        self.assertEqual([101], account_store.owned_characters(account))
+        self.assertEqual([102400001], account_store.character_item_ids(account))
+        self.assertEqual(101, player_character(self.store.set_character("alice", 101)))
+        self.assertEqual(0, player_character(self.store.set_character("alice", 110)))
+        # 边界：角色 99（랜덤）和 111 都不是那 11 个；最后一张是 110。
+        self.assertIsNone(account_store.character_id_of_item(100400001))
+        self.assertIsNone(account_store.character_id_of_item(112400001))
+        self.assertEqual(110, account_store.character_id_of_item(111400001))
+
+    def test_a_character_card_cannot_be_worn(self):
+        # 角色卡 `part_flag == 0`：留在 equipped 里会让 0x030b 发两遍、0x0604 把卡
+        # 当衣服发。`resolve_equipped` 把不占槽的一律丢掉（D51）。
+        self.store.add_item("alice", 102400001)
+        account, dropped = self.store.set_equipped("alice", [102400001, REVOLVER_R1])
+        self.assertEqual([], equipped_items(account))
+        self.assertIn(102400001, dropped)
+        self.store.add_item("alice", REVOLVER_R1)
+        account, dropped = self.store.equip_item("alice", 102400001)
+        self.assertEqual([], equipped_items(account))
+        self.assertEqual([102400001], dropped)
+        # 手改存档把卡写进 equipped，开服洗掉。
+        store = self.write_raw({"schema_version": 2, "accounts": {"old": {
+            "password": "pw",
+            "inventory": {"102400001": {"count": 1, "expires": None}},
+            "equipped": [102400001]}}})
+        store.ensure_item_fields()
+        self.assertEqual([], self.saved()["accounts"]["old"]["equipped"])
 
     def test_ensure_item_fields_is_idempotent_and_does_not_rewrite_the_file(self):
         store = self.write_raw({

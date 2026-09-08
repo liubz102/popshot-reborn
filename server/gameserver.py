@@ -58,7 +58,7 @@ from simple import SimpleCipher
 from account_store import (AccountError, AccountStore, BASE_CHARACTER_IDS,
                            PREMIUM_CHARACTER_IDS, QUEST_DIFFICULTY_MAX,
                            character_item_id, character_item_ids,
-                           character_unlock_all, display_name,
+                           display_name,
                            equipped_items, experience_bounds, has_item,
                            inventory_items, owned_item_ids,
                            material_counts, owned_characters,
@@ -6521,6 +6521,8 @@ class Conn:
 
         ★ 不发这一发，房间右下角的「人物选择」永远只有 3 个基础角色 ——
         11 个商城角色全部卡在客户端的持有判定上（V0.1 §119）。
+        ★ 发的角色卡只有**玩家买到的**那几张（仓库里的 9 位 id，V0.3商店 D51）；
+        没买的角色客户端自然就不列出来。
 
         ★★ **这一发同时是战斗加成的唯一来源**（V0.3商店 §1）：处理器
         `0x406ea1` 把清单写进 `[GameSession + 0x250 + seat*4]`，正是
@@ -6536,14 +6538,14 @@ class Conn:
         if seat_index is None:
             seat_index = self.my_seat
         # ★ 两批 id 的 id 空间不重叠（商城角色是 9 位的 `(id+1)*1e6+400001`，
-        #   装备是 7 位的），所以直接接在一起就行，不用去重。
+        #   装备是 7 位的），所以直接接在一起就行，不用去重 —— 角色卡进不了
+        #   `equipped`（`shopdata.resolve_equipped` 丢掉 `part_flag == 0` 的）。
         character_ids = character_item_ids(self.account)
         equipped = equipped_items(self.account)
         item_ids = character_ids + equipped
         characters = owned_characters(self.account)
         self.log(f"← 回 0x030b 座位 {seat_index} 物品清单("
-                 f"{len(item_ids)} 件; 商城角色 {characters}"
-                 f"{'，全开' if character_unlock_all(self.account) else '，按存档'}"
+                 f"{len(item_ids)} 件; 已买的商城角色 {characters}"
                  f"; 装备 {equipped}){reason}")
         try:
             payload = build_slot_equipped_list(seat_index, item_ids)
@@ -6633,6 +6635,12 @@ class Conn:
         # ---- 剩下的都当换角色 --------------------------------------------
         self.log(f"   换角色: 座位 {seat_index} -> 角色 id {character} "
                  f"(昵称={slot.get('nickname')!r} 等级={slot.get('level')})")
+        if (int(character) in PREMIUM_CHARACTER_IDS
+                and int(character) not in owned_characters(self.account)):
+            # 客户端的「人物选择」只列 `0x030b` 里有卡的角色，正常点不到这儿；
+            # 存下来没关系，`player_character()` 读的时候会退回 0（D51）。
+            self.log(f"   角色 {character} 没买（仓库里没有它的角色卡），"
+                     f"座位按 0 泰尔处理")
         if self.account_name:
             try:
                 self.account = self.accounts.set_character(self.account_name,
@@ -9977,6 +9985,10 @@ class Conn:
         self.send_rep_inventory(reason="（买完刷新）")
         self.send_rep_equipped_list(reason="（买完刷新）")
         self.send_rep_money(reason="（买完刷新）")
+        if any(e["kind"] == "character" for e in bought):
+            # ★ 买了角色卡：房间的「人物选择」读的是 `0x030b` 那份座位清单
+            #   （V0.1 §119），和穿脱装备一样顺手整份重发（幂等，D51）。
+            self.send_slot_equipped_list(reason="（买了角色）")
         self.log(f"← 回 0x0502 购买成功 {[e['id'] for e in bought]}"
                  f" 共 {total} 金币，余额 {player_money(self.account)}")
         self.send(build_game(OP_REP_ITEM_BUY,
@@ -10490,7 +10502,6 @@ def _control_status(conn):
             f"quest_unlock_all={quest_unlock_all(account)} "
             f"quest_difficulty={ {qid: lv for qid, lv in sorted(quest_difficulty_records(account).items())} } "
             f"character={player_character(account)} "
-            f"character_unlock_all={character_unlock_all(account)} "
             f"owned_characters={owned_characters(account)}")
 
 

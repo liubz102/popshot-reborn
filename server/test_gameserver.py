@@ -106,7 +106,7 @@ import account_store
 from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_STEP, LEVEL_MAX,
                            PREMIUM_CHARACTER_IDS, QUEST_DIFFICULTY_MAX,
                            QUEST_ID_TABLE, AccountStore, character_item_id,
-                           character_item_ids, character_unlock_all,
+                           character_item_ids,
                            experience_bounds, experience_for_level,
                            level_for_experience,
                            owned_characters, quest_cleared_difficulty,
@@ -2546,32 +2546,62 @@ class CharacterUnlockTests(unittest.TestCase):
             low = (character_id + 1) * 1000000
             self.assertTrue(low <= item_id < low + 1000000, item_id)
 
+    @staticmethod
+    def cards(*character_ids, **extra):
+        """一份「仓库里有这几张角色卡」的账号（D51：角色 = 仓库里的角色卡）。"""
+        account = {"level": 1, "experience": 0, "money": 0, "character": 0,
+                   "inventory": {str(character_item_id(c)): {"count": 1}
+                                 for c in character_ids},
+                   "equipped": []}
+        account.update(extra)
+        return account
+
     def test_base_characters_are_never_shipped_as_items(self):
         # 0/1/2 在 0x55853c 里 `cmp eax,3 / jl -> return true`，白送。
         self.assertEqual((0, 1, 2), BASE_CHARACTER_IDS)
         self.assertEqual(set(), set(BASE_CHARACTER_IDS)
-                         & set(owned_characters({"character_unlock_all": True})))
+                         & set(owned_characters(self.cards(*PREMIUM_CHARACTER_IDS))))
 
-    # -- 存档 -> 下发 -------------------------------------------------------
-    def test_unlock_all_is_the_default(self):
-        self.assertTrue(character_unlock_all({}))
-        self.assertEqual(list(PREMIUM_CHARACTER_IDS), owned_characters({}))
-        self.assertEqual(11, len(character_item_ids({})))
+    # -- 存档 -> 下发（D51：角色只有一个来源 —— 仓库里的角色卡）------------
+    def test_nothing_bought_means_nothing_shipped(self):
+        # ★ 以前默认「全开」；现在角色要在商店买，新号一张卡都没有。
+        self.assertEqual([], owned_characters({}))
+        self.assertEqual([], character_item_ids({}))
+        self.assertEqual([], character_item_ids(self.cards()))
 
-    def test_unlock_all_off_only_ships_what_the_save_lists(self):
-        account = {"character_unlock_all": False, "owned_characters": [102, 100]}
+    def test_only_the_cards_in_the_warehouse_are_shipped(self):
+        account = self.cards(102, 100)
         self.assertEqual([100, 102], owned_characters(account))
         self.assertEqual([character_item_id(100), character_item_id(102)],
                          character_item_ids(account))
 
-    def test_a_dirty_save_entry_never_kills_the_whole_list(self):
-        account = {"character_unlock_all": False,
-                   "owned_characters": [100, "oops", None, 100, 7, 999]}
+    def test_other_warehouse_items_are_not_characters(self):
+        # 武器 / 同角色的别的货架商品（`101900001`）都不算角色卡。
+        account = self.cards(100)
+        account["inventory"]["1120041"] = {"count": 1}
+        account["inventory"]["101900001"] = {"count": 1}
         self.assertEqual([100], owned_characters(account))
 
-    def test_unlock_all_off_with_nothing_owned_ships_an_empty_list(self):
-        account = {"character_unlock_all": False, "owned_characters": []}
-        self.assertEqual([], character_item_ids(account))
+    def test_a_dirty_save_entry_never_kills_the_whole_list(self):
+        account = self.cards(100)
+        account["inventory"]["oops"] = {"count": 1}
+        account["inventory"]["999400001"] = {"count": 1}     # 角色 998，不存在
+        account["inventory"]["104400001"] = {"count": 0}     # 数量 0 = 没有
+        self.assertEqual([100], owned_characters(account))
+
+    def test_the_old_unlock_all_flag_is_dead(self):
+        # D51 之前存档里的「全开」开关和手写列表都不再作数 —— 读的时候
+        # 只看仓库；旧列表由 `ensure_item_fields()` 开服时转成角色卡。
+        self.assertEqual([], owned_characters({"character_unlock_all": True}))
+        self.assertEqual([], owned_characters({"character_unlock_all": False,
+                                               "owned_characters": [100, 102]}))
+
+    def test_a_stored_character_you_have_not_bought_falls_back_to_the_first(self):
+        # 全开时代选的商城角色留在存档里：没卡就当泰尔，有卡照旧；基础角色不管。
+        self.assertEqual(0, account_store.player_character({"character": 105}))
+        self.assertEqual(105, account_store.player_character(
+            self.cards(105, character=105)))
+        self.assertEqual(2, account_store.player_character({"character": 2}))
 
     # -- 线格式 -------------------------------------------------------------
     def test_wire_format_is_seat_masks_then_a_counted_vector(self):
@@ -2604,14 +2634,19 @@ class CharacterUnlockTests(unittest.TestCase):
 
     # -- 建房时下发 ---------------------------------------------------------
     def test_creating_a_room_ships_the_equipped_list(self):
-        conn = self.make_conn()
+        conn = self.make_conn(self.cards(100, 110))
         gameserver.Conn.send_slot_equipped_list(conn)
         frames = self.sent_with(conn, OP_SLOT_EQUIPPED_LIST)
         self.assertEqual(1, len(frames))
         seat, masks, items = self.parse_equipped(frames[0])
         self.assertEqual((0, (0, 0, 0)), (seat, masks))
-        self.assertEqual([character_item_id(c) for c in PREMIUM_CHARACTER_IDS],
-                         items)
+        self.assertEqual([character_item_id(100), character_item_id(110)], items)
+
+    def test_a_fresh_account_ships_an_empty_list(self):
+        # 没买角色 = 原版「只有 3 个角色」的状态（D51）。
+        conn = self.make_conn()
+        gameserver.Conn.send_slot_equipped_list(conn)
+        self.assertEqual([], self.parse_equipped(conn.sent[0])[2])
 
     def test_the_equipped_list_follows_my_seat(self):
         conn = self.make_conn()
@@ -2658,7 +2693,7 @@ class CharacterUnlockTests(unittest.TestCase):
         # 防御性重发：`0x406e4e`（把座位清单重建成空的）有三个调用点在切
         # stage 的路上，没有逐条读到底。实测这条路清单没被清，但整份替换是
         # 幂等的，漏了的代价是「人物选择」缩回 3 个头像。
-        conn = self.make_conn()
+        conn = self.make_conn(self.cards(*PREMIUM_CHARACTER_IDS))
         conn.quest_score = 0
         conn.quest_success = False
         conn.settled = False
@@ -2691,14 +2726,13 @@ class CharacterUnlockTests(unittest.TestCase):
     def test_worn_gear_rides_along_with_the_character_items(self):
         # ★ `0x030b` 是战斗加成的**唯一**来源（V0.3商店 §1）：处理器写的
         #   `[GameSession+0x250+seat*4]` 正是 `GetEquipBonus` 读的那一格。
-        conn = self.make_conn(account={
-            "level": 1, "experience": 0, "money": 0, "character": 0,
-            "inventory": {"1120041": {"count": 1}, "1010015": {"count": 1}},
-            "equipped": [1010015, 1120041],
-        })
+        account = self.cards(100, 101, equipped=[1010015, 1120041])
+        account["inventory"]["1120041"] = {"count": 1}
+        account["inventory"]["1010015"] = {"count": 1}
+        conn = self.make_conn(account=account)
         gameserver.Conn.send_slot_equipped_list(conn)
         _seat, _masks, items = self.parse_equipped(conn.sent[0])
-        expected = [character_item_id(c) for c in PREMIUM_CHARACTER_IDS]
+        expected = [character_item_id(100), character_item_id(101)]
         self.assertEqual(expected + [1010015, 1120041], items)
 
     def test_the_two_id_spaces_do_not_overlap(self):
@@ -2710,14 +2744,10 @@ class CharacterUnlockTests(unittest.TestCase):
     def test_gear_the_player_does_not_own_never_reaches_the_client(self):
         # 手改存档「装备了没买的东西」时就地丢掉 —— 发一个客户端查不到的 id
         # 下去，轻则空格子，重则加成算在别人头上。
-        conn = self.make_conn(account={
-            "level": 1, "experience": 0, "money": 0, "character": 0,
-            "inventory": {}, "equipped": [1010015],
-        })
+        conn = self.make_conn(account=self.cards(100, equipped=[1010015]))
         gameserver.Conn.send_slot_equipped_list(conn)
         _seat, _masks, items = self.parse_equipped(conn.sent[0])
-        self.assertEqual([character_item_id(c) for c in PREMIUM_CHARACTER_IDS],
-                         items)
+        self.assertEqual([character_item_id(100)], items)
 
 
 class ShopControlCommandTests(unittest.TestCase):
@@ -3355,6 +3385,94 @@ class ShopBuyAndEquipTests(unittest.TestCase):
             frames = self.buy(self.REVOLVER_R1)
         self.assertEqual(0, self.buy_ok(frames))
         self.assertEqual(7000, account_store.player_money(self.account()))
+
+    # -- 买角色（D51）-------------------------------------------------------
+    CHARACTER_CARD = 102400001       # 진 京（角色 101）的角色卡
+
+    def test_buying_a_character_card_unlocks_the_character(self):
+        """★ D51：角色 = 仓库里的角色卡。买完 `0x030b` 要整份重发，房间的
+        「人物选择」读的是那份座位清单（V0.1 §119）。"""
+        self.give_money(1500)
+        with shop_config([{"id": self.CHARACTER_CARD,
+                           "listed": True, "price": 1000}]):
+            frames = self.buy(self.CHARACTER_CARD)
+        self.assertEqual(1, self.buy_ok(frames))
+        account = self.account()
+        self.assertEqual(500, account_store.player_money(account))
+        self.assertTrue(account_store.has_item(account, self.CHARACTER_CARD))
+        self.assertEqual([101], owned_characters(account))
+        opcodes = [opcode for opcode, _ in frames]
+        self.assertIn(OP_SLOT_EQUIPPED_LIST, opcodes)
+        # 结果 `0x0502` 仍然排最后（§30 ②）；定义 `0x0501` 仍在仓库 `0x0601` 前（§29）。
+        self.assertEqual(gameserver.OP_REP_ITEM_BUY, opcodes[-1])
+        self.assertLess(opcodes.index(gameserver.OP_REP_ITEM_INFO),
+                        opcodes.index(gameserver.OP_REP_INVENTORY))
+        bodies = dict(frames)
+        # 仓库清单里有这张卡（仓库「人物 → 佣兵」那一格，§41），定义也补了。
+        self.assertIn((self.CHARACTER_CARD, 1, 0.0, 0),
+                      parse_rep_inventory(bodies[gameserver.OP_REP_INVENTORY]))
+        records, _purpose = parse_rep_item_info(bodies[gameserver.OP_REP_ITEM_INFO])
+        self.assertIn(self.CHARACTER_CARD, [r["id"] for r in records])
+        # 穿着清单里**没有**它（卡不是衣服）；座位清单里正好一张。
+        self.assertEqual([], parse_rep_equipped_list(
+            bodies[gameserver.OP_REP_EQUIPPED_LIST]))
+        body = bodies[OP_SLOT_EQUIPPED_LIST]
+        count = struct.unpack_from("<i", body, 16)[0]
+        self.assertEqual([self.CHARACTER_CARD],
+                         list(struct.unpack_from("<%di" % count, body, 20)))
+
+    def test_two_of_the_same_card_in_one_cart_buy_nothing(self):
+        # 同一车里两张同一张卡：整车拒收，钱一分不扣（和装备一样，§30）。
+        self.give_money(3000)
+        with shop_config([{"id": self.CHARACTER_CARD,
+                           "listed": True, "price": 1000}]):
+            frames = self.buy(self.CHARACTER_CARD, self.CHARACTER_CARD)
+        self.assertEqual(0, self.buy_ok(frames))
+        self.assertEqual(shop.BUY_REASON_ALREADY_OWNED, self.buy_reason(frames))
+        account = self.account()
+        self.assertEqual(3000, account_store.player_money(account))
+        self.assertFalse(account_store.has_item(account, self.CHARACTER_CARD))
+
+    def pick_character(self, character_id):
+        """客户端方向的 `0x0301`（房间里点头像）：座位 0 换成 `character_id`。"""
+        payload = w_i32(0) + build_session_slot(
+            occupied=True, nickname="tester", level=1, character_id=character_id)
+        frames = self.send(OP_SESSION_MEMBER_UPDATE, payload)
+        replies = [body for opcode, body in frames
+                   if opcode == OP_SESSION_MEMBER_UPDATE]
+        self.assertEqual(1, len(replies), frames)
+        self.assertEqual(SEAT_ACTION_CHANGE_CHARACTER, replies[0][0])
+        _seat, slot = parse_seat_change_request(replies[0][1:])
+        return slot["character_id"]
+
+    def test_picking_a_character_you_have_not_bought_seats_you_as_the_first(self):
+        # 客户端本来列不出没买的角色；手搓包 / 全开时代的存档选它时回 0 泰尔（D51）。
+        self.assertEqual(0, self.pick_character(101))
+        self.assertEqual(2, self.pick_character(2))          # 基础角色照旧
+        self.give_money(1000)
+        with shop_config([{"id": self.CHARACTER_CARD,
+                           "listed": True, "price": 1000}]):
+            self.buy(self.CHARACTER_CARD)
+        self.assertEqual(101, self.pick_character(101))      # 买了就回真的
+
+    def test_buying_the_same_character_twice_is_refused(self):
+        # 角色卡 `part_flag == 0`，但「一个角色只买一次」和装备一样是原版规则。
+        self.give_money(3000)
+        with shop_config([{"id": self.CHARACTER_CARD,
+                           "listed": True, "price": 1000}]):
+            self.buy(self.CHARACTER_CARD)
+            frames = self.buy(self.CHARACTER_CARD)
+        self.assertEqual(0, self.buy_ok(frames))
+        self.assertEqual(shop.BUY_REASON_ALREADY_OWNED, self.buy_reason(frames))
+        self.assertEqual(2000, account_store.player_money(self.account()))
+
+    def test_buying_gear_does_not_reship_the_seat_list(self):
+        # 只有角色卡才顺手重发 `0x030b`；买装备还是原来那四发。
+        self.give_money(10000)
+        with shop_config([{"id": self.REVOLVER_R1,
+                           "listed": True, "price": 3000}]):
+            frames = self.buy(self.REVOLVER_R1)
+        self.assertNotIn(OP_SLOT_EQUIPPED_LIST, [opcode for opcode, _ in frames])
 
     def test_a_level_gate_is_enforced_server_side(self):
         """★ D31：等级门槛来自**物品库**，不是商店货架。"""

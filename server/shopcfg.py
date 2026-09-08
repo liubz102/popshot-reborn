@@ -625,8 +625,9 @@ def default_shop():
     """默认 `shop.json` = `shopdefaults.build_all()["shop"]`（D44 / D50）。
 
     散件在商店买：63 件 D/R/F + 特别版武器、没有名字的散装铠甲、装饰件、
-    染色剂、突击技、外观套装、强攻套装，共 484 件。材料 / 消耗品 / 礼包 /
-    角色卡 / 称号不卖。价格和等级门槛的算法在 `shopdefaults`。
+    染色剂、突击技、外观套装、强攻套装，再加 11 张商城角色卡（1000 金币、
+    不限等级，D51），共 495 件。材料 / 消耗品 / 礼包 / 称号不卖。
+    价格和等级门槛的算法在 `shopdefaults`。
     """
     import shopdefaults
     return shopdefaults.default_shop()

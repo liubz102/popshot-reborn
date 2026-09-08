@@ -245,10 +245,12 @@ class ResolveEquippedTests(_TableCase):
         self.assertEqual([], kept)
         self.assertEqual([1510001], dropped)
 
-    def test_materials_pass_through(self):
-        # part_flag=0 不占槽，多少件都留得下（虽然实际不会拿材料当装备发）。
-        kept, _ = shopdata.resolve_equipped([30018, 1010001])
-        self.assertEqual([30018, 1010001], kept)
+    def test_things_that_take_no_slot_are_dropped(self):
+        # part_flag=0（材料 / 角色卡）穿不上身：留在 equipped 里只会让 0x030b
+        # 把角色卡发两遍（D51）。以前这一条是「多少件都留得下」，反过来了。
+        kept, dropped = shopdata.resolve_equipped([30018, 1010001])
+        self.assertEqual([1010001], kept)
+        self.assertEqual([30018], dropped)
 
     def test_empty_and_none(self):
         self.assertEqual(([], []), shopdata.resolve_equipped([]))

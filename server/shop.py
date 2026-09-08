@@ -109,6 +109,11 @@ CATEGORY_MATERIAL = 0x50001
 #: ★ 戒指也归这儿（用户 2026-09-06）：它有属性加成，不是「装饰」。
 CATEGORY_OTHER = 0x40002
 PART_FLAG_CATEGORY[16384] = CATEGORY_OTHER   # 戒指
+#: 용병 佣兵（人物 → 佣兵）：11 张商城角色卡归这儿（V0.3商店 D51）。
+#: 客户端在这个组下面把「角色过滤」字节强制填 `0xff`（`CHARACTER_ANY`），
+#: 所以货架不按预览角色过滤 —— 角色卡本来也不限角色。「人物 → 英雄」= `0`
+#: 永远是空的（§22）。
+CATEGORY_MERCENARY = 0x30001
 
 #: 父标签**额外**收下的、不按组编码的子标签。套装（`3`）挂在「装备」
 #: （`0x10000`）下面，但 `3 >> 16 == 0`，按组算永远归不进去 —— 点「装备」
@@ -130,6 +135,8 @@ def category_of(item_id):
     item = shopdata.get(item_id)
     if item is None:
         return CATEGORY_OTHER
+    if item.kind == "character":
+        return CATEGORY_MERCENARY       # 角色卡：人物 → 佣兵（D51）
     flag = item.part_flag
     if flag == 0:
         return CATEGORY_MATERIAL if item.kind == "material" else CATEGORY_OTHER
@@ -710,7 +717,8 @@ def check_purchase(item_id, table, level, owned, data_dir=None):
     —— 客户端发上来的只有 itemId，价格是我们自己查的（PLAN M5）。
 
     ★ 「已拥有就不能再买」是原版规则（失败文案 `이미 소지하고 있습니다`，§7）。
-    材料类不受这条约束，但材料本来也不上架。
+    占槽位的装备和**角色卡**都受这条约束（一个角色只买一次，D51）；
+    材料类不受，但材料本来也不上架。
 
     ⚠ **不按「玩家当前是哪个角色」拦** —— 商店上方那排角色箭头就是给
     「给别的角色买装备」用的（货架本来就按预览角色过滤，`shelf_entries`）。
@@ -724,7 +732,8 @@ def check_purchase(item_id, table, level, owned, data_dir=None):
     # ★ 等级门槛问**物品库**（D31）—— `shop.json` 里已经没有这个字段了。
     if level is not None and level < shopcfg.item_rule(item_id, data_dir)[0]:
         return entry, BUY_LEVEL
-    if int(item_id) in owned and shopdata.get(item_id).part_flag != 0:
+    item = shopdata.get(item_id)
+    if int(item_id) in owned and (item.part_flag != 0 or item.kind == "character"):
         return entry, BUY_ALREADY_OWNED
     return entry, None
 

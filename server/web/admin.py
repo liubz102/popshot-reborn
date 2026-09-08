@@ -574,14 +574,18 @@ def _parse_side(raw):
 def stackable(item_id):
     """这件东西的**数量有没有意义**。装备类没有 —— 只有「有」和「没有」。
 
-    判据是 `part_flag != 0`（= `shopdata.equippable`），和 `shop.py` 里
-    「装备不能重复购买」用的是同一条（`check_purchase` 的 `BUY_ALREADY_OWNED`）。
+    判据是 `part_flag != 0`（= `shopdata.equippable`）**或者是角色卡**，和
+    `shop.py` 里「不能重复购买」用的是同一条（`check_purchase` 的
+    `BUY_ALREADY_OWNED`）—— 角色卡 `part_flag == 0` 但一个角色只有「有 / 没有」
+    （`account_store.owned_characters()` 只看在不在仓库里，不看数量，D51）。
 
     ★ 客户端那边也是这么认的：`ItemInfo+0x10` 的形态标志里，`0x01` 才是
     「计数持有」（提示框写「소지개수 : %d개」），装备发的是 `0x08` 可装备位，
     **数量那一格根本没人读**（FINDINGS §28）。⇒ 给一件铠甲存 ×3 是句空话，
     管理页干脆不给填，免得管理员以为自己发了三件（用户 2026-09-05）。
     """
+    if shopdata.kind(item_id) == "character":
+        return False
     return not shopdata.equippable(item_id)
 
 

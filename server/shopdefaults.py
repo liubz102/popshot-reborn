@@ -11,6 +11,8 @@
 
 * 商店卖「散件」：D/R/F + 特别版武器、没有名字的散装铠甲（#id / 模型编号）、
   装饰件（头饰 / 尾饰 / 翅膀 / 礼物）、染色剂、突击技、纯外观套装、强攻套装。
+* ★ 11 张**商城角色卡**也在商店卖（用户 2026-09-07 拍板，D51）：统一 1000 金币、
+  不限等级，放「人物 → 佣兵」。以前服务端把角色全开，现在要玩家自己买。
 * 合成出「成套的、有名字的」东西：四条原有产线 + 金 / 银骑士甲 + 三个角色
   各自的三套（尾号 61 / 62 / 63）、戒指、宠物。
 * ★ 材料掉落照**原版口径**（用户 2026-09-07 拍板，D49）：
@@ -226,6 +228,8 @@ DECOR_BASE = 800          # 头饰 / 尾饰 / 翅膀
 GIFT_PRICE = 500          # 선물 礼物（一件没有加成的上衣）
 COSMETIC_SET_PRICE = {539: 6000, 11: 2000, 9: 2000, 19: 2000}
 SPRAY_PRICE = 1500
+#: 商城角色卡：统一一个价、不限等级（用户 2026-09-07 拍板，D51）。
+CHARACTER_PRICE = 1000
 #: 突击技按 id 尾号：(价格, 等级)
 DASH_PRICE = {2: (2000, 1), 3: (3000, 4), 4: (4500, 7), 5: (3500, 5), 6: (6000, 10)}
 #: 强攻套装（+30% 攻击的全身套）：**商店卖**，放「装备 → 套装」（用户 2026-09-06：
@@ -563,6 +567,8 @@ def build_all():
                 skipped["armor?"] += 1
         elif item.kind == "spray":
             sell(item, SPRAY_PRICE, 1)
+        elif item.kind == "character":
+            sell(item, CHARACTER_PRICE, 1)
         elif item.kind == "dash" and item.id % 10 in DASH_PRICE:
             sell(item, *DASH_PRICE[item.id % 10])
         elif item.kind == "ring" and item.id % 100 in RING:

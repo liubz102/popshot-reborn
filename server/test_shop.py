@@ -338,6 +338,7 @@ class CategoryTests(_ShopCase):
             1080013: ("armor", 256), 1090053: ("armor", 512),
             1130059: ("ring", 16384), 220001: ("pet", 32768),
             560001: ("title", 8192),
+            101400001: ("character", 0),        # 角色卡：part_flag 0，靠 kind 分
         }
         table = dict(SYNTHETIC)
         for item_id, (kind, flag) in wearables.items():
@@ -358,6 +359,14 @@ class CategoryTests(_ShopCase):
             self.assertEqual(shop.CATEGORY_OTHER, shop.category_of(1130059))    # 戒指
             self.assertEqual(shop.CATEGORY_DECOR, shop.category_of(220001))     # 宠物
             self.assertEqual(shop.CATEGORY_TITLE, shop.category_of(560001))     # 称号
+            # 角色卡归「人物 → 佣兵」`0x30001`（D51）；「人物」父标签收得下，
+            # 「英雄 = 0」照旧一件都不收（§22）。
+            self.assertEqual(0x30001, shop.CATEGORY_MERCENARY)
+            self.assertEqual(shop.CATEGORY_MERCENARY, shop.category_of(101400001))
+            self.assertTrue(shop.category_matches(0x30000, shop.CATEGORY_MERCENARY))
+            self.assertTrue(shop.category_matches(0x30001, shop.CATEGORY_MERCENARY))
+            self.assertFalse(shop.category_matches(0, shop.CATEGORY_MERCENARY))
+            self.assertFalse(shop.category_matches(0x40000, shop.CATEGORY_MERCENARY))
         finally:
             shopdata.STORE = saved
         # 这几个都归在各自的**组**里：父标签要收得下。

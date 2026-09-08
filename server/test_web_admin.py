@@ -1323,6 +1323,24 @@ class AdminPlayerTests(_AdminCase):
         _name, account = self.accounts.get_account("alice")
         self.assertTrue(account_store.has_item(account, self._LISTED))
 
+    _CARD = 102400001        # 京（角色 101）的角色卡
+
+    def test_handing_out_a_character_card_is_handing_out_the_character(self):
+        """★ D51：角色 = 仓库里的角色卡，管理页塞一张卡就等于送一个角色；
+        卡和装备一样只有「有 / 没有」，数量框不给填（`stackable` False）。"""
+        _status, result = self.save(inventory={str(self._CARD): 3})
+        self.assertTrue(result["ok"], result)
+        _name, account = self.accounts.get_account("alice")
+        self.assertEqual([101], account_store.owned_characters(account))
+        self.assertEqual(1, account_store.inventory_items(account)[self._CARD]["count"])
+        rows = {row["id"]: row for row in self.player()["inventory"]}
+        self.assertFalse(rows[self._CARD]["stackable"])
+        self.assertFalse(rows[self._CARD]["equipped"])
+        # 拿走这张卡 = 收回角色。
+        self.save(inventory={str(self._CARD): 0})
+        _name, account = self.accounts.get_account("alice")
+        self.assertEqual([], account_store.owned_characters(account))
+
     def test_nothing_in_the_view_is_read_only_any_more(self):
         # 「锁着的」那一类连字段都没有了 —— 前台照着它画只读格子。
         self.accounts.add_item("alice", self._LISTED)

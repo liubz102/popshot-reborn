@@ -271,13 +271,16 @@ def resolve_equipped(item_ids):
     这样「换装」天然表现为「新的顶掉旧的」。
 
     ★ 不在物品表里的 id 一律丢掉：发下去客户端查不到图标（见模块开头）。
+    ★ **不占槽的（`part_flag == 0`：材料 / 消耗品 / 角色卡）也丢掉**——它们
+      穿不上身，留在 `equipped` 里只会让 `0x030b` 把角色卡发两遍、`0x0604`
+      把一张卡当衣服发（V0.3商店 D51 之后角色卡真的会进仓库）。
     """
     kept = []
     dropped = []
     used = 0
     for raw in item_ids or ():
         item = STORE.get(raw)
-        if item is None or not item.ownable:
+        if item is None or not item.ownable or not item.part_flag:
             dropped.append(raw)
             continue
         flag = item.part_flag
