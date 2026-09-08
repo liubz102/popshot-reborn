@@ -174,6 +174,16 @@ class AdminAuthTests(_AdminCase):
         _status, session = self.request("/admin/api/session")
         self.assertFalse(session["logged_in"])
 
+    def test_an_unknown_name_is_told_to_ask_for_admin_rights(self):
+        # 管理员**没有注册页**（`admin_accounts` 只能由系统管理员在这一页上加），
+        # 所以这里绝不能拿玩家那句「请先在注册页面注册」打发人（用户 2026-09-09）。
+        _status, result = self.login(name="nobody", password="nope")
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            account_store.ADMIN_AUTH_MESSAGES[account_store.AUTH_NO_SUCH_USER],
+            result["message"])
+        self.assertNotIn("注册", result["message"])
+
     def test_every_api_needs_a_login(self):
         # ★★ 漏挂一个 `_require_admin()` 就等于把那个接口开在公网上。
         for path, payload in (
@@ -251,7 +261,12 @@ class AdminLoginRateLimitTests(_AdminCase):
         self.assertIn("登录太频繁", result["message"])
         # ★ 被限住时连「有没有这个管理员」都问不出来 —— 否则限速本身
         #   就成了一个免费的枚举接口。
-        self.assertNotIn("尚未注册", result["message"])
+        # ★ 引常量而不是抄一句文案：这句话 2026-09-09 已经改过一次
+        #   （「请先在注册页面注册」→「请联系系统管理员」），当时这条断言
+        #   因为写死了旧词，一夜之间变成永远成立、什么也守不住。
+        self.assertNotIn(
+            account_store.ADMIN_AUTH_MESSAGES[account_store.AUTH_NO_SUCH_USER],
+            result["message"])
 
     def test_the_lock_expires(self):
         self.login(password="nope")

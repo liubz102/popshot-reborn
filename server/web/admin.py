@@ -887,7 +887,10 @@ class AdminRoutes:
             # 「没这个人」和「密码错」对**攻击者**是两条不同的信息，但玩家账号
             # 那边本来就分开说（`AUTH_MESSAGES`），管理页人少、限速也在，
             # 保持同一套文案比自作聪明地含糊其辞更好查。
-            self._reply(False, account_store.AUTH_MESSAGES.get(result, "登录失败")
+            # ★ 用的是 `ADMIN_AUTH_MESSAGES` 而不是玩家那份：管理员没有注册页，
+            #   跟人说「请先在注册页面注册」等于指错路（用户 2026-09-09）。
+            self._reply(False,
+                        account_store.ADMIN_AUTH_MESSAGES.get(result, "登录失败")
                         + (f"（{wait} 秒后才能再试）" if wait else ""))
             return
         self.admin_limiter.clear(host)

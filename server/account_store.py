@@ -124,6 +124,16 @@ AUTH_MESSAGES = {
     AUTH_BAD_PASSWORD: "密码错误，请重新输入",
 }
 
+#: 管理页（`/admin`）登录的说明。三态和玩家登录**共用**（`admin_verify`），
+#: 但「没这个人」的**出路完全不同**，所以文案得单开一份（用户 2026-09-09）：
+#: 玩家自己去注册页注册就有号，管理员却**没有注册页** —— `admin_accounts`
+#: 只能由已有的系统管理员在管理页上加，所以这里只能指路「去找系统管理员」。
+#: ★ 密码错那条两边一个意思，直接沿用 —— 别为了「凑齐一张表」抄一遍，
+#:   抄了就有两处要一起改。
+ADMIN_AUTH_MESSAGES = dict(AUTH_MESSAGES, **{
+    AUTH_NO_SUCH_USER: "该用户没有管理权限，请联系系统管理员以获得管理权限",
+})
+
 #: 导出的存档文件里的格式标记。导入时用它认一眼，避免用户传错文件。
 SAVE_FORMAT_KEY = "popshot_save"
 SAVE_FORMAT_VERSION = 1

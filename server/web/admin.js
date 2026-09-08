@@ -36,6 +36,11 @@ function el(tag, cls, text) {
   return node;
 }
 
+/** 嵌在页面里的那条 `.msg`。★ **只剩登录页**在用（用户 2026-09-09：
+ *  「管理员账号」页原来把回执写在面板最底下，那儿离「删除」「添加」
+ *  「改密码」三个钮都隔着好几栏，删完人根本看不见 —— 全改成右上角浮条了）。
+ *  登录框那条留着：它就贴在「登录」按钮下面，本来就在视线里；而且没登录时
+ *  标题栏是空的，浮条钉在标题栏下面反倒像飘着。 */
 function say(node, text, ok) {
   node.textContent = text || "";
   node.className = "msg" + (text ? (ok ? " ok" : " bad") : "");
@@ -2078,7 +2083,7 @@ async function loadAdmins() {
 
 async function setAdminRole(name, role) {
   var result = await api("/admin/api/admins/role", {name: name, role: role});
-  say($("adminMsg"), result.message, result.ok);
+  toast(result.message, result.ok);
   // ★ 失败也要重画一次 —— 下拉框已经跳到新值了，不拉回去的话画面上写着
   //   「运营」而服务端还是「系统管理员」。
   if (result.admins) { renderAdmins(result.admins); }
@@ -2100,7 +2105,7 @@ async function removeAdmin(name) {
     showLoggedOut("你把自己删掉了，已退出登录。");
     return;
   }
-  say($("adminMsg"), result.message, result.ok);
+  toast(result.message, result.ok);
   if (result.ok) { renderAdmins(result.admins); }
 }
 
@@ -3209,7 +3214,7 @@ function wire() {
     var result = await api("/admin/api/admins/add", {
       name: $("newAdminName").value, password: $("newAdminPass").value,
       role: $("newAdminRole").value});
-    say($("adminMsg"), result.message, result.ok);
+    toast(result.message, result.ok);
     if (result.ok) {
       $("newAdminName").value = "";
       $("newAdminPass").value = "";
@@ -3224,7 +3229,7 @@ function wire() {
       showLoggedOut(result.message);
       return;
     }
-    say($("adminMsg"), result.message, result.ok);
+    toast(result.message, result.ok);
   };
 
   // 浮条的位置跟着标题栏走：窗口变窄标题栏可能换行变高，重新量一次。
