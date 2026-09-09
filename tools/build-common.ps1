@@ -671,6 +671,15 @@ function Invoke-ServerSmokeTest {
     # logs\ 里的东西删掉（D113 的清理是挂在服务端启动路径上的）。
     # --no-backup：同理，不起数据备份的调度线程（V0.3商店 databackup.py），
     # 免得往包里的 server\data\ 写备份或清理备份。
+    # --data-dir：★ 运营配置也得挪到临时目录去。启动路径上的
+    #   `shopcfg.ensure_files()` 是「缺文件就地生成一份默认的」，而
+    #   `shopcfg.DATA_DIR` 钉死在 `shopcfg.py` 同级 —— 不挪的话自检跑完，
+    #   包里的 `server\data\` 就躺着 items / shop / recipe / drops 四份默认
+    #   配置了（V0.3.0 的包就是这么带出去的）。那个目录随包发出去，开服的人
+    #   解压覆盖升级时会把管理页改过的定价和配方盖掉（D7 / 铁律 11）。
+    #   跟 `--accounts` 指同一个临时目录：下面 finally 里一起删掉，也顺带
+    #   免掉 app.py 那句「账号存档不在备份范围内」的告警。
+    #   ★ 光挪走不算完 —— 挪没挪干净由 `Assert-PackageDataClean` 验收。
     $argList = @(
         "`"$app`"", '--no-control', '--no-online-log', '--no-log-cleanup',
         '--no-backup',
@@ -678,7 +687,8 @@ function Invoke-ServerSmokeTest {
         '--game-port',  "$gamePort",
         '--relay-port', "$relayPort",
         '--web-port',   "$webPort",
-        '--accounts',   "`"$accounts`""
+        '--accounts',   "`"$accounts`"",
+        '--data-dir',   "`"$work`""
     )
 
     $proc = $null
@@ -738,6 +748,41 @@ function Invoke-ServerSmokeTest {
         Get-ChildItem -LiteralPath $PackageRoot -Recurse -Directory -Force -Filter '__pycache__' -ErrorAction SilentlyContinue |
             Sort-Object { $_.FullName.Length } -Descending |
             ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Assert-PackageDataClean {
+    <# `server\data\` 里除了 `-AllowNames` 点名的，一个文件都不该有。
+
+       ★ 为什么要有它：那个目录装的是**用户数据**（运营配置 / 账号 / 备份），
+         随包发出去就意味着开服的人「解压覆盖老目录」升级时，管理页改过的
+         定价、配方、掉落会被包里的默认模板盖掉（`app.py._report_shop_config`
+         的 D7 / 铁律 11）。
+
+       ★ 而弄脏它的恰恰是打包自己：自检会把包里的服务端真的跑起来，启动路径上
+         凡是「缺文件就地生成一份」的东西都会落在包里。V0.3.0 的包就这么带出去了
+         四份默认配置 —— 而这事在打包机上一点症状都没有，装到别人机器上才发作。
+         `Invoke-ServerSmokeTest` 现在用 `--data-dir` 把落脚点挪去了临时目录；
+         这个函数是那道改动的**验收**：以后谁再往启动路径上挂一个「缺文件就
+         生成」而忘了跟着走，在这儿炸出来，而不是等开服的人丢配置。 #>
+    param(
+        [Parameter(Mandatory = $true)][string]$PackageRoot,
+        [string[]]$AllowNames = @()      # 客户端包的 -IncludeSave 会带 accounts.json
+    )
+    $dataDir = Join-Path $PackageRoot 'server\data'
+    if (-not (Test-Path -LiteralPath $dataDir -PathType Container)) {
+        throw "自检失败：包里没有 server\data 目录"
+    }
+    # 不递归：多出来的要是个目录（`backups\`），报目录名就够了。
+    $extra = @(Get-ChildItem -LiteralPath $dataDir -Force |
+               Where-Object { $AllowNames -notcontains $_.Name })
+    if ($extra.Count) {
+        $names = (($extra | ForEach-Object { $_.Name }) -join '、')
+        throw ("自检失败：server\data 里多了不该进包的东西（$names）。" +
+               "那个目录只装运行时生成的用户数据 —— 随包发出去，开服的人" +
+               "解压覆盖升级时会盖掉他改过的运营配置（D7 / 铁律 11）。" +
+               "多半是启动路径上又多了个「缺文件就地生成」的东西，" +
+               "让它跟着 --data-dir 走。")
     }
 }
 

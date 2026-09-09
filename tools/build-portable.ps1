@@ -226,6 +226,14 @@ try {
         $smoke = Invoke-ServerSmokeTest -PackageRoot $OutputDirectory -PythonRelative 'runtime\python\python.exe'
         Write-Host ("        OK —— 认证 $($smoke.AuthPort) / 游戏 $($smoke.GamePort) / 中继 $($smoke.RelayPort) / 注册页 $($smoke.WebPort) 全部起来，注册页 200") -ForegroundColor Green
     }
+    # 自检跑没跑都验一遍：拷贝那一步同样可能把用户数据带进包。
+    # `-IncludeSave` 的「带服务器设置」变体是**故意**带 accounts.json 的
+    # （上面 [3/6] 拷的），除它以外一个文件都不许有。
+    $allowInData = @()
+    $dataNote = '是空的'
+    if ($IncludeSave) { $allowInData = @('accounts.json'); $dataNote = '只有 accounts.json' }
+    Assert-PackageDataClean -PackageRoot $OutputDirectory -AllowNames $allowInData
+    Write-Host "        server\data $dataNote（用户数据不进包）" -ForegroundColor DarkGray
 
     $size = Get-DirectorySize $OutputDirectory
     Write-Host ''

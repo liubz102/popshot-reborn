@@ -2883,16 +2883,41 @@ static int try_patch_dash_visual_guard(void)
 /*                                                                            */
 /*   设 BSHOOK_KEEP_CLIENT_BONUS_TEXT=1 保留原版那行绿字（对照用）。          */
 /* -------------------------------------------------------------------------- */
-#define BONUS_TEXT_SIG_VA   0x0041414Du
-#define BONUS_TEXT_SIG_LEN  19
-#define BONUS_TEXT_JE_OFF   17            /* 那个 `74 20` 在特征串里的位置    */
-static const unsigned char BONUS_TEXT_SIG[BONUS_TEXT_SIG_LEN] = {
-    0xB8, 0x40, 0xE4, 0x72, 0x00,       /* mov  eax, 0x72e440               */
-    0x89, 0x5D, 0xFC,                   /* mov  [ebp-4], ebx                */
-    0xE8, 0x1C, 0x39, 0x00, 0x00,       /* call 0x417a76（map.find）        */
-    0x8B, 0x30,                         /* mov  esi, [eax]                  */
-    0x85, 0xF6,                         /* test esi, esi                    */
-    0x74, 0x20                          /* je   0x414180  ★ 要改的就是这个  */
+/*   ★★ **有两个生成器，两个都要堵**（2026-09-09 实机漏了一个）：            */
+/*                                                                            */
+/*     0x414128(out, itemId)        单件  -> 仓库提示框 / 合成提示框 / 修理界面 */
+/*     0x4141AC(out, id列表)        累加  -> ★ **商店提示框**（礼包/套装那种   */
+/*                                   「买了会得到这些」的合计加成）             */
+/*                                                                            */
+/*   两个的循环体一模一样：`map.find(itemId)` -> `test esi/ecx` -> `je 跳过`。 */
+/*   前者跳过就返回空表；后者跳过就不往累加器里加，累加器保持全 0，而          */
+/*   `0x4136AF` 对**每一项都判零**（`0x41379D` / `0x413A7F` 两条分支都判），    */
+/*   全 0 时一条都不输出 ⇒ 同样是空表。                                        */
+#define BONUS_TEXT_SITE_COUNT 2
+#define BONUS_TEXT_SIG_LEN    19
+#define BONUS_TEXT_JE_OFF     17          /* 那个 `74 xx` 在特征串里的位置    */
+
+static const struct {
+    UINT_PTR va;                          /* 特征串起点                       */
+    unsigned char sig[BONUS_TEXT_SIG_LEN];
+    const char *what;
+} BONUS_TEXT_SITES[BONUS_TEXT_SITE_COUNT] = {
+    { 0x0041414Du, {                      /* 0x414128 里：单件               */
+        0xB8, 0x40, 0xE4, 0x72, 0x00,     /* mov  eax, 0x72e440              */
+        0x89, 0x5D, 0xFC,                 /* mov  [ebp-4], ebx               */
+        0xE8, 0x1C, 0x39, 0x00, 0x00,     /* call 0x417a76（map.find）       */
+        0x8B, 0x30,                       /* mov  esi, [eax]                 */
+        0x85, 0xF6,                       /* test esi, esi                   */
+        0x74, 0x20                        /* je 0x414180  ★ 改这个           */
+      }, "仓库 / 合成提示框 / 修理界面" },
+    { 0x004141F7u, {                      /* 0x4141AC 里：累加               */
+        0xB8, 0x40, 0xE4, 0x72, 0x00,     /* mov  eax, 0x72e440              */
+        0x83, 0xC3, 0x04,                 /* add  ebx, 4                     */
+        0xE8, 0x72, 0x38, 0x00, 0x00,     /* call 0x417a76（map.find）       */
+        0x8B, 0x08,                       /* mov  ecx, [eax]                 */
+        0x85, 0xC9,                       /* test ecx, ecx                   */
+        0x74, 0x07                        /* je 0x414211  ★ 改这个           */
+      }, "商店提示框" },
 };
 
 static volatile LONG g_bonus_text_patched = 0;
@@ -2906,33 +2931,42 @@ static int client_bonus_text_keep_original(void)
 
 static int try_patch_hide_client_bonus_text(void)
 {
-    unsigned char *p = (unsigned char *)BONUS_TEXT_SIG_VA;
-    unsigned char *je = p + BONUS_TEXT_JE_OFF;
-    DWORD oldp;
+    int i, done = 0;
 
     if (g_bonus_text_patched) return 1;
-    if (IsBadReadPtr(p, BONUS_TEXT_SIG_LEN)) return 0;
-    /* 幂等：已经改成 EB 了就直接认账（前 17 字节仍要对得上）。 */
-    if (je[0] == 0xEB && je[1] == 0x20
-        && memcmp(p, BONUS_TEXT_SIG, BONUS_TEXT_JE_OFF) == 0) {
-        InterlockedExchange(&g_bonus_text_patched, 1);
-        return 1;
-    }
-    if (memcmp(p, BONUS_TEXT_SIG, BONUS_TEXT_SIG_LEN) != 0)
-        return 0;                          /* 还没解壳到这里，或不是已确认的版本 */
 
-    if (!VirtualProtect(je, 1, PAGE_EXECUTE_READWRITE, &oldp)) {
-        bslog("PATCH   客户端加成绿字: VirtualProtect 失败 err=%lu",
-              (unsigned long)GetLastError());
-        return 0;
+    for (i = 0; i < BONUS_TEXT_SITE_COUNT; i++) {
+        unsigned char *p = (unsigned char *)BONUS_TEXT_SITES[i].va;
+        unsigned char *je = p + BONUS_TEXT_JE_OFF;
+        const unsigned char *sig = BONUS_TEXT_SITES[i].sig;
+        DWORD oldp;
+
+        if (IsBadReadPtr(p, BONUS_TEXT_SIG_LEN)) return 0;
+        /* 幂等：已经改成 EB 了就算数（前 17 字节仍要对得上）。 */
+        if (je[0] == 0xEB && je[1] == sig[BONUS_TEXT_JE_OFF + 1]
+            && memcmp(p, sig, BONUS_TEXT_JE_OFF) == 0) {
+            done++;
+            continue;
+        }
+        if (memcmp(p, sig, BONUS_TEXT_SIG_LEN) != 0)
+            return 0;                      /* 还没解壳到这里，或不是已确认的版本 */
+
+        if (!VirtualProtect(je, 1, PAGE_EXECUTE_READWRITE, &oldp)) {
+            bslog("PATCH   客户端加成绿字: VirtualProtect 失败 err=%lu",
+                  (unsigned long)GetLastError());
+            return 0;
+        }
+        je[0] = 0xEB;                      /* je -> jmp，永远跳过 */
+        VirtualProtect(je, 1, oldp, &oldp);
+        FlushInstructionCache(GetCurrentProcess(), je, 1);
+        bslog("PATCH   ★客户端加成绿字已关 @ %08X（%s）",
+              (unsigned)(BONUS_TEXT_SITES[i].va + BONUS_TEXT_JE_OFF),
+              BONUS_TEXT_SITES[i].what);
+        done++;
     }
-    je[0] = 0xEB;                          /* je -> jmp，永远返回空表 */
-    VirtualProtect(je, 1, oldp, &oldp);
-    FlushInstructionCache(GetCurrentProcess(), je, 1);
+
+    if (done != BONUS_TEXT_SITE_COUNT) return 0;
     InterlockedExchange(&g_bonus_text_patched, 1);
-    bslog("PATCH   ★客户端加成绿字已关 @ %08X: 仓库 / 合成提示框那行绿色加成"
-          "摘要不再画（和服务端下发的说明文重复，且原版有错字/漏翻/溢出）",
-          (unsigned)(BONUS_TEXT_SIG_VA + BONUS_TEXT_JE_OFF));
     return 1;
 }
 

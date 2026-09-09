@@ -328,6 +328,10 @@ SHA-256   $sha
         $smoke = Invoke-ServerSmokeTest -PackageRoot $OutputDirectory -PythonRelative 'runtime-win\python\python.exe'
         Write-Host ("        OK —— 认证 $($smoke.AuthPort) / 游戏 $($smoke.GamePort) / 中继 $($smoke.RelayPort) / 注册页 $($smoke.WebPort) 全部起来，注册页 200") -ForegroundColor Green
     }
+    # 自检跑没跑都验一遍：拷贝那一步同样可能把用户数据带进包。
+    # 服务端包里 `server\data\` 必须是**空的**，一个文件都不许有。
+    Assert-PackageDataClean -PackageRoot $OutputDirectory
+    Write-Host '        server\data 是空的（用户数据不进包）' -ForegroundColor DarkGray
 
     $size = Get-DirectorySize $OutputDirectory
     Write-Host ''

@@ -122,6 +122,12 @@ def build_arg_parser():
                     help="调试控制通道端口，只绑 127.0.0.1")
     ap.add_argument("--accounts", default=None,
                     help="账号 JSON 路径（默认 server/data/accounts.json）")
+    ap.add_argument("--data-dir", default=None,
+                    help="运营配置（物品库 / 商店 / 合成 / 掉落）和备份的落脚点，"
+                         "默认 server/data。★ 不含账号存档 —— 那个走 --accounts。"
+                         "打包自检用：自检会把包里的服务端真的跑起来，不挪走的话"
+                         "启动路径上的 shopcfg.ensure_files() 就把四份默认配置"
+                         "生成在包里了")
     ap.add_argument("--config", default=None,
                     help="server.config 路径（默认包根 config\\server.config）")
     ap.add_argument("--ticket-field", choices=("s1", "s2"), default="s2",
@@ -349,6 +355,18 @@ def _report_character_shelf():
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
+
+    # 运营配置和备份的落脚点。**必须排在所有人碰它之前** —— `ensure_files` /
+    # `BackupService` / 管理页都是**每次现取** `shopcfg.DATA_DIR`（谁都没在
+    # import 时抓快照，见 databackup.py `_data_dir`），所以在这儿改就全体生效。
+    # ★ 只有打包自检会用它：自检把包里的服务端真的跑起来，而 `DATA_DIR` 钉在
+    #   `shopcfg.py` 同级 —— 不挪走的话四份默认配置就生成在包里，随包发出去，
+    #   开服的人解压覆盖升级时会盖掉管理页改过的定价和配方（D7 / 铁律 11）。
+    if args.data_dir:
+        shopcfg.DATA_DIR = os.path.abspath(args.data_dir)
+        os.makedirs(shopcfg.DATA_DIR, exist_ok=True)
+        log(f"运营配置目录: {shopcfg.DATA_DIR}（--data-dir 指过来的，"
+            f"不是默认的 server/data）")
 
     gameserver.VERBOSE = args.verbose
     authserver.VERBOSE = args.verbose

@@ -121,7 +121,7 @@ V0.2 的 `FINDINGS.md` 有 41 万字符、V0.3bot 的有 45 万，**别整份翻
 | `re/` | 逆向产物：`BigShot_22524.exe` / `.img`、`vftables.json`（机械生成，**别手改**）、★ **`packet_api.md`** |
 | `tools/` | 便携逆向工具 + 自写探针 + 启停脚本。★ 逆向工具箱是 **`re_bs.py`**；★ 本版新增 `shopdata.py` / `shopicons.py`、`quest-clear.bat`。★ **更新原版数据只有一个入口：`update-gamedata.bat`**（五份产物一次全提，D53；以前那五个 `update-*.bat` 已合并删除）|
 | `server/` | Python 服务端（**单机假服务器和云端是同一套代码**）。★ 本版新增 `shopdata.py` / `shopcfg.py` / **`shopdefaults.py`（四份配置的模板 = 设计表，D50）** / `shop.py` / `web/admin.html`，产物 `shop_items.json` |
-| `server/data/` | **只装用户数据**（`accounts.json`，`.gitignore`）。★ 本版新增 `shop.json` / `recipe.json` / `drops.json` —— 运行时生成、用户可手改、**也要进 `.gitignore`** |
+| `server/data/` | **只装用户数据**（`accounts.json`，`.gitignore`）。★ 本版新增 `items.json` / `shop.json` / `recipe.json` / `drops.json` —— 运行时生成、用户可手改、**也要进 `.gitignore`**。★★ **打出来的包里这个目录必须是空的**：随包发出去的话，开服的人「解压覆盖老目录」升级时会拿默认模板盖掉他改过的运营配置（D7 / 铁律 11）。而弄脏它的是打包**自检**（它把包里的服务端真的跑起来，`ensure_files()` 就地生成四份）—— 自检用 `app.py --data-dir` 把落脚点挪去临时目录，`build-common.ps1` 的 `Assert-PackageDataClean` 收尾验收。V0.3.0 的包就是这么带出去过一次的 |
 | `runtime/python/` | 内置 CPython 3.14.3 x64 |
 | `runtime-win7/python/` | **Win7 兼容运行时** 3.8.10 win32。★ 改完服务端顺手跑一遍，别把 3.8 兼容性弄丢 |
 | `dist/` | 打包产物（客户端包 + 服务端包，两个） |
