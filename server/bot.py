@@ -1077,6 +1077,12 @@ def _add_one_bot(conn, room):
     #   自己** —— 房主的客户端和别人一样，只认这一发。
     conn.broadcast_seat_slot(room, index, gameserver.SEAT_ACTION_JOIN,
                              reason=f"：座位 {index} 加入 bot")
+    # ★ 紧跟一发**空的** `0x030b`（V0.3商店 §63）：清单存在客户端 LobbyStage
+    #   那个跨房间活着的全局里，上一个坐这一格的真人留下的那份不覆盖就还在，
+    #   而 action 0 建完 3D 角色马上就拿它去挂装备（`0x406f42`）——
+    #   不发的话 bot 会穿着上一个人的装备站在那儿。
+    conn.broadcast_seat_equipped_list(room, index,
+                                      reason=f"：座位 {index} 是 bot，空清单")
     conn.room_system_chat(f"{seat.nickname} 加入了房间。")
     return index, None
 

@@ -11,6 +11,7 @@ import collections
 import os
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -42,6 +43,8 @@ from gameserver import (                                       # noqa: E402
     read_session_descriptor,
     take_frame, w_i32, w_wstr,
 )
+from account_store import AccountStore                         # noqa: E402
+import bot                                                     # noqa: E402
 from lobby import (Lobby, MOVE_INTO_ALREADY_PLAYING, MOVE_INTO_BAD_PASSWORD,
                    MOVE_INTO_FULL, MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_OK,
                    TEAM_A, TEAM_B, TEAM_LAYOUT_COOP, TEAM_LAYOUT_FREE,
@@ -448,12 +451,35 @@ class JoinFlowTests(LobbyIsolated):
                                        move_into_payload(self.room.room_id))
         # ★ 顺序是硬约束（§140 / V0.1 §119）：
         #   0x0303 -> 0x0202 -> 0x0300 -> 0x030b
+        # ★ `0x030b` 是**每个有人的座位各一发**（§63）：房里已经有 Alice 了，
+        #   所以 Alice 一发 + Bob 自己一发。少发 Alice 那一发的话，Bob 眼里的
+        #   Alice 就是没穿装备的样子。
         # 末尾那发 0x0410 是「房里够两个人了，玩家间同步开」（§150），
-        # 必须排在四连发**之后**。
+        # 必须排在这一串**之后**。
         self.assertEqual([OP_UPDATE_SESSION, OP_MOVE_INTO_SESSION,
-                          OP_SESSION_MEMBERS, OP_SLOT_EQUIPPED_LIST,
+                          OP_SESSION_MEMBERS,
+                          OP_SLOT_EQUIPPED_LIST, OP_SLOT_EQUIPPED_LIST,
                           OP_TOGGLE_PEER_RELAY],
                          opcodes(self.bob))
+
+    def test_join_ships_one_equipped_list_per_occupied_seat(self):
+        # ★ §63：别人的装备外观 / 加成只有 `0x030b` 一个来源，而它是**按座位**
+        #   的 —— 进房的人必须拿到房里每一格的清单，不是只有自己那一格。
+        self.alice.account["inventory"] = {"1010015": {"count": 1}}
+        self.alice.account["equipped"] = [1010015]
+        gameserver.Conn.on_game_packet(self.bob, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        got = {}
+        for blob in self.bob.sent:
+            for _, op, payload in frames(blob):
+                if op == OP_SLOT_EQUIPPED_LIST:
+                    reader = Reader(payload)
+                    seat = reader.i32()
+                    for _ in range(gameserver.EQUIPPED_SLOT_MASK_COUNT):
+                        reader.i32()
+                    got[seat] = [reader.i32() for _ in range(reader.i32())]
+        # 座位 0 = Alice（穿着 1010015），座位 1 = Bob（什么都没穿）。
+        self.assertEqual({0: [1010015], 1: []}, got)
 
     def test_join_reply_carries_the_room_id_and_seat(self):
         gameserver.Conn.on_game_packet(self.bob, OP_MOVE_INTO_SESSION,
@@ -484,12 +510,29 @@ class JoinFlowTests(LobbyIsolated):
         gameserver.Conn.on_game_packet(self.bob, OP_MOVE_INTO_SESSION,
                                        move_into_payload(self.room.room_id))
         got = opcodes(self.alice)
-        self.assertEqual([OP_SESSION_MEMBER_UPDATE, OP_CHAT,
-                          OP_TOGGLE_PEER_RELAY], got)
+        # ★ `0x030b` 必须紧跟在 action 0 **之后**（§63）：action 0 只建那个
+        #   座位的 3D 角色，穿什么由 `0x030b` 说了算。
+        self.assertEqual([OP_SESSION_MEMBER_UPDATE, OP_SLOT_EQUIPPED_LIST,
+                          OP_CHAT, OP_TOGGLE_PEER_RELAY], got)
         payload = [p for blob in self.alice.sent for _, op, p in frames(blob)
                    if op == OP_SESSION_MEMBER_UPDATE][0]
         self.assertEqual(SEAT_ACTION_JOIN, payload[0])
         self.assertEqual(1, Reader(payload[1:]).i32())
+
+    def test_the_newcomers_equipment_reaches_everyone_already_in_the_room(self):
+        # ★ §63：房里的人不会自己再要一次清单，新人穿了什么只能服务端推。
+        self.bob.account["inventory"] = {"1020062": {"count": 1}}
+        self.bob.account["equipped"] = [1020062]
+        gameserver.Conn.on_game_packet(self.bob, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        payload = [p for blob in self.alice.sent for _, op, p in frames(blob)
+                   if op == OP_SLOT_EQUIPPED_LIST][0]
+        reader = Reader(payload)
+        self.assertEqual(1, reader.i32())          # 新人坐的是 1 号座
+        for _ in range(gameserver.EQUIPPED_SLOT_MASK_COUNT):
+            reader.i32()
+        self.assertEqual([1020062],
+                         [reader.i32() for _ in range(reader.i32())])
 
     def test_wrong_password_gets_the_password_error_code(self):
         self.lobby.update_room(self.room, password="1234")
@@ -524,7 +567,8 @@ class JoinFlowTests(LobbyIsolated):
         gameserver.Conn.on_game_packet(self.bob, 0x0205,
                                        w_i32(2) + w_i32(3) + w_i32(1))
         self.assertEqual([OP_UPDATE_SESSION, OP_MOVE_INTO_SESSION,
-                          OP_SESSION_MEMBERS, OP_SLOT_EQUIPPED_LIST,
+                          OP_SESSION_MEMBERS,
+                          OP_SLOT_EQUIPPED_LIST, OP_SLOT_EQUIPPED_LIST,
                           OP_TOGGLE_PEER_RELAY],
                          opcodes(self.bob))
         self.assertIs(self.room, self.lobby.room_of(self.bob))
@@ -575,8 +619,10 @@ class JoinBatchTests(LobbyIsolated):
         self.assertEqual(2, len(bob.sock.writes))
         cipher = SimpleCipher.server_to_client()
         plain = cipher.decrypt(bob.sock.writes[0])
+        # ★ 房里已有 Alice ⇒ `0x030b` 两发（一格一发，§63），全在同一批里。
         self.assertEqual([OP_UPDATE_SESSION, OP_MOVE_INTO_SESSION,
-                          OP_SESSION_MEMBERS, OP_SLOT_EQUIPPED_LIST],
+                          OP_SESSION_MEMBERS,
+                          OP_SLOT_EQUIPPED_LIST, OP_SLOT_EQUIPPED_LIST],
                          [op for _, op, _ in frames(plain)])
         self.assertEqual([OP_TOGGLE_PEER_RELAY],
                          [op for _, op, _ in
@@ -707,6 +753,130 @@ class ChatFlowTests(LobbyIsolated):
         self.assertEqual([], opcodes(self.alice))
         payload = [p for blob in carol.sent for _, _op, p in frames(blob)][0]
         self.assertEqual(CHAT_NO_SEAT, Reader(payload).u16())
+
+
+class EquipmentVisibilityTests(LobbyIsolated):
+    """§63：**自己穿的装备，房里别人也得看得见。**
+
+    别人客户端上「那一格穿了什么」的唯一来源，是发给**他**的那一发
+    `0x030b`：处理器 `0x406ea1` 把清单写进 `[LobbyStage + 座位*4 + 0x250]`，
+    `0x406f42` 再逐件调 `0x505bb9` 挂到那一格的 3D 角色上（itemId → 模型
+    那张表是客户端自己从 pak 里的 `ShopItem-Chn.ini` 读的，服务端只给 id）。
+    战斗里同一份：`0x493258` 建完座位角色紧接着就是 `0x406f42`。
+
+    ⇒ 判据只有一条：**「谁穿了什么」一变，房里每个人都要收到那一格的
+    `0x030b`**；只回给本人就是「别人看不见」。
+    """
+
+    TOP_ARMOR = 1010015          # 泰尔的上衣（客户端认识的真 id）
+    REVOLVER = 1120041           # 武器槽 1
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = AccountStore(os.path.join(self.tmp.name, "accounts.json"))
+        self.alice = self.player("alice")
+        gameserver.Conn.on_game_packet(self.alice, 0x0201,
+                                       create_session_payload())
+        self.room = self.lobby.room_of(self.alice)
+        self.bob = self.player("bob")
+        gameserver.Conn.on_game_packet(self.bob, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        for conn in (self.alice, self.bob):
+            conn.sent.clear()
+
+    def player(self, username):
+        """一条挂着**真存档**的假连接 —— 穿脱要走 `AccountStore`。"""
+        conn = make_conn(username)
+        self.store.register(username, "pw")
+        conn.accounts = self.store
+        conn.account = self.store.get_account(username)[1]
+        return conn
+
+    def give(self, conn, *item_ids):
+        for item_id in item_ids:
+            conn.account = self.store.add_item(conn.account_name, item_id)
+
+    @staticmethod
+    def equipped_lists(conn):
+        """这条连接收到的全部 `0x030b`，拆成 `[(座位, [物品 id]), ...]`。"""
+        out = []
+        for blob in conn.sent:
+            for _, op, payload in frames(blob):
+                if op != OP_SLOT_EQUIPPED_LIST:
+                    continue
+                reader = Reader(payload)
+                seat = reader.i32()
+                for _ in range(gameserver.EQUIPPED_SLOT_MASK_COUNT):
+                    reader.i32()
+                out.append((seat, [reader.i32()
+                                   for _ in range(reader.i32())]))
+        return out
+
+    def test_putting_gear_on_in_a_room_reaches_everyone_else(self):
+        # 房里改装备走的是 `0x0702` -> `0x0604` + `0x030b`；不广播那一发的话
+        # Alice 手里 Bob 那一格的清单还停在进房时的空表。
+        self.give(self.bob, self.TOP_ARMOR)
+        gameserver.Conn.on_game_packet(self.bob, gameserver.OP_REQ_EQUIP_ITEM,
+                                       w_i32(self.TOP_ARMOR))
+        self.assertEqual([(1, [self.TOP_ARMOR])],
+                         self.equipped_lists(self.alice))
+        # 本人那一份不能因为加了广播就丢了（加成也认它，§1 / §16）。
+        self.assertEqual([(1, [self.TOP_ARMOR])], self.equipped_lists(self.bob))
+
+    def test_taking_gear_off_in_a_room_reaches_everyone_else(self):
+        self.give(self.bob, self.TOP_ARMOR)
+        gameserver.Conn.on_game_packet(self.bob, gameserver.OP_REQ_EQUIP_ITEM,
+                                       w_i32(self.TOP_ARMOR))
+        self.alice.sent.clear()
+        gameserver.Conn.on_game_packet(self.bob, gameserver.OP_REQ_UNEQUIP_ITEM,
+                                       w_i32(self.TOP_ARMOR))
+        self.assertEqual([(1, [])], self.equipped_lists(self.alice))
+
+    def test_a_third_player_gets_everyones_gear_on_the_way_in(self):
+        self.give(self.alice, self.TOP_ARMOR)
+        self.give(self.bob, self.REVOLVER)
+        for conn, item_id in ((self.alice, self.TOP_ARMOR),
+                              (self.bob, self.REVOLVER)):
+            gameserver.Conn.on_game_packet(conn, gameserver.OP_REQ_EQUIP_ITEM,
+                                           w_i32(item_id))
+        carol = self.player("carol")
+        gameserver.Conn.on_game_packet(carol, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        self.assertEqual([(0, [self.TOP_ARMOR]), (1, [self.REVOLVER]), (2, [])],
+                         self.equipped_lists(carol))
+
+    def test_back_to_room_resyncs_every_seat_not_just_mine(self):
+        # 结算看完切回 stage 5，房间 UI 整个重建（`0x0403` 的处理器末尾就是
+        # ChangeStage(5)）—— 补发也要补**每一格**，不然回房间后别人又光了。
+        self.give(self.alice, self.TOP_ARMOR)
+        gameserver.Conn.on_game_packet(self.alice, gameserver.OP_REQ_EQUIP_ITEM,
+                                       w_i32(self.TOP_ARMOR))
+        self.bob.sent.clear()
+        # 结算界面停够时间后客户端发 `0x0405`；`settled` 是「本局结算包发过了」。
+        self.bob.settled = True
+        gameserver.Conn.on_game_packet(self.bob, gameserver.OP_LEAVE_RESULT,
+                                       b"")
+        self.assertEqual([(0, [self.TOP_ARMOR]), (1, [])],
+                         self.equipped_lists(self.bob))
+
+    def test_a_bot_taking_a_used_seat_gets_an_empty_list(self):
+        """★ 清单存在客户端**跨房间活着**的 LobbyStage 上（`[0x72e29c]`）。
+
+        Bob 穿着装备走人、bot 坐进同一格时，`0x0301` action 0 建完 3D 角色
+        马上就拿那一格的旧清单去挂装备（`0x406f42`）—— 不发一发空的，
+        bot 就穿着 Bob 的装备站在那儿。
+        """
+        self.give(self.bob, self.TOP_ARMOR)
+        gameserver.Conn.on_game_packet(self.bob, gameserver.OP_REQ_EQUIP_ITEM,
+                                       w_i32(self.TOP_ARMOR))
+        gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
+        self.alice.sent.clear()
+        index, error = bot._add_one_bot(self.alice, self.room)
+        self.assertIsNone(error, error)
+        self.assertEqual(1, index)              # 正好是 Bob 空出来的那一格
+        self.assertEqual([(1, [])], self.equipped_lists(self.alice))
 
 
 class CharacterChangeTests(LobbyIsolated):

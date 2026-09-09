@@ -855,6 +855,7 @@ class ControlChannelTests(unittest.TestCase):
             self.money_sent = 0
             self.difficulty_sent = 0
             self.equipped_sent = 0
+            self.equipped_broadcast = 0
             self.inventory_sent = 0
             self.shop_equipped_sent = 0
             self.my_seat = 0
@@ -893,6 +894,11 @@ class ControlChannelTests(unittest.TestCase):
 
         def send_slot_equipped_list(self, seat_index=None, reason=""):
             self.equipped_sent += 1
+
+        def broadcast_slot_equipped_list(self, reason=""):
+            # 控制通道推的是单人协议试探（`lobby_room()` 恒为 None），
+            # 真的 `broadcast_slot_equipped_list` 会当场返回 0。数一下就够。
+            self.equipped_broadcast += 1
 
         def send_rep_inventory(self, reason=""):
             self.inventory_sent += 1
@@ -981,11 +987,14 @@ class ControlChannelTests(unittest.TestCase):
         # 顺序要紧：先重读盘上的存档，再按它下发，否则发的还是旧值。
         # 数据栏（0x0600）、难度解锁表（0x020c）、角色解锁表（0x030b）
         # 和商店三件套（0x0501 / 0x0601 / 0x0604）都要跟着刷。
+        # ★ `0x030b` 还要**广播**一份给房里其他人（§63）—— 管理员在网页上
+        #   改了仓库、再 sync-account 的话，别人看见的还是旧装备。
         reply = gameserver.handle_control_command("sync-account")
         self.assertTrue(reply.startswith("ok"), reply)
-        self.assertEqual((1, 1, 1, 1, 1, 1),
+        self.assertEqual((1, 1, 1, 1, 1, 1, 1),
                          (self.conn.reloaded, self.conn.money_sent,
                           self.conn.difficulty_sent, self.conn.equipped_sent,
+                          self.conn.equipped_broadcast,
                           self.conn.inventory_sent,
                           self.conn.shop_equipped_sent))
 

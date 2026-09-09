@@ -6531,6 +6531,38 @@ class Conn:
         self.send(build_game(OP_SESSION_MEMBERS,
                              build_session_members(host_seat, seats)))
 
+    def build_seat_equipped_frame(self, seat_index, account, reason=""):
+        """组一发 `0x030b`：座位号 `seat_index`，清单取自 **`account`** 这份存档。
+
+        ★★ `account` 是**坐在那一格的那个人**的存档，不一定是 `self.account`。
+        发别人的座位时拿自己的存档组包就等于「谁都穿着我的装备」；而只发自己
+        那一格就是「谁都看不见别人的装备」—— 后者正是 §63 那个 bug。
+
+        `account is None`（bot 座位 / 调试通道造的假座位）= **空清单**，
+        不是「不发」，理由见 `broadcast_seat_equipped_list`。
+        """
+        # ★ 两批 id 的 id 空间不重叠（商城角色是 9 位的 `(id+1)*1e6+400001`，
+        #   装备是 7 位的），所以直接接在一起就行，不用去重 —— 角色卡进不了
+        #   `equipped`（`shopdata.resolve_equipped` 丢掉 `part_flag == 0` 的）。
+        equipped = equipped_items(account)
+        item_ids = character_item_ids(account) + equipped
+        self.log(f"← 回 0x030b 座位 {seat_index} 物品清单("
+                 f"{len(item_ids)} 件; 已买的商城角色 {owned_characters(account)}"
+                 f"; 装备 {equipped}){reason}")
+        try:
+            payload = build_slot_equipped_list(seat_index, item_ids)
+        except ValueError as error:
+            self.log(f"   无法下发 0x030b: {error}")
+            return None
+        return build_game(OP_SLOT_EQUIPPED_LIST, payload)
+
+    @staticmethod
+    def seat_account(seat):
+        """座位上那个人的存档；bot 和调试通道造的假座位是 `None`（= 空清单）。"""
+        if seat is None or seat.is_bot or seat.conn is None:
+            return None
+        return seat.conn.account
+
     def send_slot_equipped_list(self, seat_index=None, reason=""):
         """把「这个座位持有哪些物品」下发给客户端（opcode 0x030b）。
 
@@ -6549,25 +6581,85 @@ class Conn:
 
         **必须排在 `0x0300` 之后**：持有判定 `0x4070da` 第一步就是
         `0x4045f9` 查「我的座位已占用吗」，那个标记只有 `0x0300` 会写。
+
+        ★ 这一发**只管我自己那一格**。房里别人那几格要用
+        `send_room_equipped_lists()` / `broadcast_slot_equipped_list()`（§63）。
         """
         if seat_index is None:
             seat_index = self.my_seat
-        # ★ 两批 id 的 id 空间不重叠（商城角色是 9 位的 `(id+1)*1e6+400001`，
-        #   装备是 7 位的），所以直接接在一起就行，不用去重 —— 角色卡进不了
-        #   `equipped`（`shopdata.resolve_equipped` 丢掉 `part_flag == 0` 的）。
-        character_ids = character_item_ids(self.account)
-        equipped = equipped_items(self.account)
-        item_ids = character_ids + equipped
-        characters = owned_characters(self.account)
-        self.log(f"← 回 0x030b 座位 {seat_index} 物品清单("
-                 f"{len(item_ids)} 件; 已买的商城角色 {characters}"
-                 f"; 装备 {equipped}){reason}")
-        try:
-            payload = build_slot_equipped_list(seat_index, item_ids)
-        except ValueError as error:
-            self.log(f"   无法下发 0x030b: {error}")
+        frame = self.build_seat_equipped_frame(seat_index, self.account, reason)
+        if frame is not None:
+            self.send(frame)
+
+    def send_room_equipped_lists(self, room=None, reason=""):
+        """把房里**每一个有人的座位**的 `0x030b` 都发给我自己（§63）。
+
+        ★★ **别人的装备长什么样，只有这一发说了算。** 客户端把清单存进
+        `[LobbyStage + 座位*4 + 0x250]`，`0x406f42` 再逐件调 `0x505bb9` 挂到
+        那个座位的 3D 角色上；itemId → 模型的那张表 `[0x72e1e0]` 是客户端**自己**
+        从 pak 里的 `ShopItem-Chn.ini` 读的（`0x41652d` 启动时加载），所以服务端
+        只要给 itemId 就够，不用下发任何资源路径。
+        战斗里也是同一份：`0x493258` 建完座位角色紧接着就调 `0x406f42`。
+
+        ⇒ 只发自己那一格的话，房里每个人看见的别人都是没穿装备的样子 ——
+        这就是「自己装备的装备别人看不见」的全部原因。
+
+        座位号从包里来（处理器 `0x406ea1` 拿它算 `0x250` 的下标），客户端**不**
+        校验「这是不是我自己的座位」，所以六格都能发。
+        """
+        if room is None:
+            room = self.lobby_room()
+        if room is None:
+            # 不在大厅房间里（协议试探 / 控制通道）：只有「我」这一个座位。
+            self.send_slot_equipped_list(reason=reason)
             return
-        self.send(build_game(OP_SLOT_EQUIPPED_LIST, payload))
+        for index, seat in enumerate(room.seats):
+            if seat is None:
+                continue                    # 空座位没有 3D 角色，没人渲染
+            # bot 那一格发**空清单**：`[+0x250]` 是 LobbyStage 上的全局，
+            # 上一个房间 / 上一个人留下的清单还在那儿（见下面那个方法）。
+            frame = self.build_seat_equipped_frame(
+                index, self.seat_account(seat), reason)
+            if frame is not None:
+                self.send(frame)
+
+    def broadcast_seat_equipped_list(self, room, seat_index, reason="",
+                                     to_self=True):
+        """把房里某一格的 `0x030b` 发给房里的人（`to_self` 决定含不含自己，§63）。
+
+        ★★ **每次这一格换人都要发一次，bot 也要发（空清单）。**
+        清单存在客户端的 `[LobbyStage + 座位*4 + 0x250]` 里，而 `LobbyStage`
+        是**跨房间活着的全局**（`[0x72e29c]`）—— 上一个坐这一格的人留下的那份
+        不覆盖就还在。座位一被重新占用，`0x0301` action 0 建完 3D 角色
+        （`0x405e1c`）紧接着就调 `0x406f42` 拿那一格的清单去挂装备，
+        于是 bot / 新人会穿着**上一个人**的装备站在那儿。
+        """
+        seat = (room.seats[seat_index]
+                if room is not None and 0 <= seat_index < ROOM_SEAT_COUNT
+                else None)
+        if seat is None:
+            return 0
+        frame = self.build_seat_equipped_frame(
+            seat_index, self.seat_account(seat), reason)
+        if frame is None:
+            return 0
+        if to_self:
+            self.send(frame)
+        return self.broadcast(frame,
+                              reason=f"：座位 {seat_index} 的装备清单{reason}")
+
+    def broadcast_slot_equipped_list(self, reason=""):
+        """把**我这个座位**的 `0x030b` 广播给房里其他人（§63）。
+
+        进房时那一轮（`send_room_equipped_lists`）只是把当时的快照对齐；
+        之后我每换一件装备，别人手里的那份就过期了 —— 外观和加成一起过期，
+        因为客户端两件事读的是同一格 `[LobbyStage + 座位*4 + 0x250]`。
+
+        `to_self=False`：我自己那一份由调用方各自发（进房那一批 / `0x0604`
+        那一串都有顺序约束，混进来会打乱）。
+        """
+        return self.broadcast_seat_equipped_list(
+            self.lobby_room(), self.my_seat, reason, to_self=False)
 
     def broadcast_seat_slot(self, room, seat_index, action, reason):
         """把某个座位**当前的服务端快照**用 `0x0301` 发给房里每一个人（含自己）。
@@ -8261,7 +8353,10 @@ class Conn:
             0x0300 座位快照  -> 必须在 0x0202 **之后**（0x54f815 会清座位 0 的角色 id）
             0x030b 物品清单  -> 必须在 0x0300 **之后**（持有判定先查座位已占用）
 
-        四个包**合并成一次 sendall**，否则「人物选择」会小概率缩回 3 个头像。
+        ★ 最后那一发是**每个有人的座位各一发**，不是只发自己那一格 ——
+        房里别人身上穿了什么，进房的人只能从这里知道（§63）。
+
+        这些包**合并成一次 sendall**，否则「人物选择」会小概率缩回 3 个头像。
         """
         self.my_seat = seat_index
         # `self.room` 是「下发 0x0303 用的那份描述符」，进别人的房间时要按
@@ -8289,7 +8384,7 @@ class Conn:
                 build_rep_move_into_session(MOVE_INTO_OK, room.room_id,
                                             seat_index)))
             self.send_session_members()
-            self.send_slot_equipped_list(reason="（进房后下发）")
+            self.send_room_equipped_lists(room, reason="（进房后下发）")
 
     def announce_join(self, room, seat_index):
         """把「有人进来了」广播给房里的其他人（`0x0301` action 0）。
@@ -8298,6 +8393,11 @@ class Conn:
         「我」的座位 IP 写成 127.0.0.1 —— 两个包同时发时 `0x0301` 必须排在
         `0x0300` **前面**。这里只发 `0x0301`，房里其他人的 `0x0300` 不用重发
         （他们的座位表由这一发增量更新）。
+
+        ★★ 再补一发我这一格的 `0x030b`（§63）：action 0 只**建**那个座位的
+        3D 角色（`0x405e1c`），身上穿什么由 `0x030b` 说了算，两发缺一不可。
+        必须排在 action 0 **之后** —— 角色对象没建出来时 `0x406f42` 在
+        `0x406f6c` 处直接跳过挂载（清单还是存下了，等下一次重建时才生效）。
         """
         seat = room.seats[seat_index]
         if seat is None:
@@ -8305,6 +8405,7 @@ class Conn:
         packet = build_game(OP_SESSION_MEMBER_UPDATE, build_session_member_update(
             seat_index, SEAT_ACTION_JOIN, **seat.snapshot()))
         self.broadcast(packet, reason=f"：座位 {seat_index} 加入")
+        self.broadcast_slot_equipped_list(reason="（新人进房，把他的装备告诉房里）")
 
     def on_move_into_session(self, payload):
         """`0x0202 gcpReqMoveInto` —— 加入指定房间（§140）。"""
@@ -9373,7 +9474,8 @@ class Conn:
         唯独金币这一格被清掉。补一发 `0x0600` 就好了，顺带也让经验/等级和存档
         重新对齐一次。
 
-        座位的物品清单也顺手补一发 `0x030b`。这一发是**防御性**的：
+        座位的物品清单也顺手补一发 `0x030b`（★ **每个有人的座位各一发**，
+        §63 —— 别人那几格和自己那一格同样会被清）。这一发是**防御性**的：
         `0x406e4e`（把某个座位的清单重建成空的）有五个调用点，其中
         `0x40f55c` / `0x40f619` / `0x40f7b9` 都在切 stage 的路上，
         没有逐条读到底。实测走「关卡 → 结算 → 回房间」这条路清单**没被清**，
@@ -9388,7 +9490,8 @@ class Conn:
             self.log("← 回 0x0403（结算看完 -> 切回 stage 5 房间）")
             self.send(build_game(OP_LOADING_DONE, b""))
             self.send_rep_money(reason="（回房间后金币会被清 0，重新同步）")
-            self.send_slot_equipped_list(reason="（回房间后清单会被重建，重新同步）")
+            self.send_room_equipped_lists(
+                reason="（回房间后清单会被重建，重新同步）")
         # 回到房间就可以再开一局，把开局状态机和本局的关卡状态复位。
         self.reset_room_for_next_round()
         self.reset_quest_state()
@@ -10136,8 +10239,11 @@ class Conn:
 
         ★ 战斗加成的唯一来源仍然是 `0x030b`（§1 / §16）—— 存档改完顺手重发。
         商店界面里那一发会被客户端的 stage 分发器丢掉（`0x030b` 只有大厅
-        分发器认），但玩家回房间时 `send_slot_equipped_list` 还会再发一次，
+        分发器认），但玩家回房间时 `send_room_equipped_lists` 还会再发一次，
         所以这里发不发都不影响正确性；发是为了「人在房间里改装备」也即时生效。
+
+        ★★ 同一发还要**广播给房里其他人**（§63）：他们那边我这一格的清单
+        停在进房时的快照，不重发的话我换的装备别人看不见（外观和加成一起）。
         """
         what = "穿上" if opcode == OP_REQ_EQUIP_ITEM else "脱下"
         try:
@@ -10169,6 +10275,7 @@ class Conn:
                  f"{equipped_items(self.account)}{tail}")
         self.send_rep_equipped_list(reason=f"（{what}）")
         self.send_slot_equipped_list(reason=f"（{what}）")
+        self.broadcast_slot_equipped_list(reason=f"（{what}）")
 
     def send_rep_gift_list(self):
         """回 `0x0508 gspRepGiftList` 空清单。
@@ -10962,8 +11069,9 @@ def _dispatch_control_command(line):
             conn.account, dropped = conn.accounts.unequip_item(
                 conn.account_name, item_id)
         # ★ 加成只认 `0x030b`（§1 / §4）—— 改完存档必须立刻重发，
-        #   否则客户端手里还是上一份清单。
+        #   否则客户端手里还是上一份清单。房里其他人手里那份同理（§63）。
         conn.send_slot_equipped_list(reason=f"（ctl {cmd}）")
+        conn.broadcast_slot_equipped_list(reason=f"（ctl {cmd}）")
         equipped = equipped_items(conn.account)
         tail = f"；顶掉 {dropped}" if dropped else ""
         return (f"ok {cmd} {_item_label(item_id)}{note}；"
@@ -10976,6 +11084,7 @@ def _dispatch_control_command(line):
         conn.send_rep_money(reason="（sync-account）")
         conn.send_quest_reached_difficulty(reason="（sync-account）")
         conn.send_slot_equipped_list(reason="（sync-account）")
+        conn.broadcast_slot_equipped_list(reason="（sync-account）")
         # ★ 商店那三件套也一起刷：定义 -> 持有物 -> 穿着（顺序不能换，§29）。
         conn.send_rep_inventory(reason="（sync-account）")
         conn.send_rep_equipped_list(reason="（sync-account）")
