@@ -439,6 +439,10 @@ def item_name_zh(item):
 # --------------------------------------------------------------------------
 #: 装备加成的键 → (中文名, 是不是百分比)。★ 名字和算法都照客户端来
 #: （§2 的 `Attack %+d%%` / `HP %+d` 那一组；界面上写的就是这五个词）。
+#:
+#: ★ 客户端一共认 **13 种**加成（名字表 `0x732c00..0x732c30`，解析边界
+#:   `0x41328f`）。这里只放**原版加成面板也画**的那 5 种，它们进说明的第 1 段；
+#:   剩下 8 种见 `SPECIAL_BONUS_ZH` / `DEAD_BONUS_KEYS`。
 BONUS_ZH = {
     "hp": ("生命", False),
     "sp": ("体力", False),
@@ -446,55 +450,226 @@ BONUS_ZH = {
     "defense": ("防御", True),
     "movespd": ("速度", True),
 }
-#: 上面那张表之外的稀有加成（`antighostcnt` / `heartboost` 之类，全表 7 件）。
-#: 客户端界面上根本没有它们的格子，说明里也就不提。
 
-#: 说明最多几行。★ 客户端把这串按 `|` 切成**最多 3 段**（`0x45c4c9` 的
-#: `cmp .., 2`）分给三个标签，我们只用第一段（240×88 那个大框），
-#: 段内换行用 `\n`。
-ITEM_DESC_MAX_LINES = 4
+#: 数值行的排列顺序。★ **不是字母序** —— 照客户端加成面板（`0x4136af`）
+#: 那七个格式串的读取顺序：攻 → 防 → 速 → 生命 → 体力，这里把「速度」挪到
+#: 最后，让「攻防」和「生命体力」各自挨着，压行时同类才在一行上。
+BONUS_ORDER = ("attack", "defense", "hp", "sp", "movespd")
+
+#: ★★ 剩下 7 种「特效加成」→ 一句人话。**原版任何界面都不显示它们**
+#: （加成面板 `0x4136af` 只画 7 个格式串 `0x65fdac~0x65fee8`，稀有属性一个
+#: 格子都没有）—— 火焰蝙蝠 `220003` 的溅射加成就是这么被漏掉的，直到它
+#: 引发闪退（§47 / D55）才被发现。逐条的出处：
+#:
+#:   teamdmg        0x4807b8 → 0x48084a  同队且非自己时 dmg×(100+x)/100
+#:   selfdmg        0x4807cc → 0x480884  命中自己时     dmg×(100+x)/100
+#:   antighostcnt   0x508635  本局已挡次数 < x 才生效，inc 计数 + 护盾特效
+#:   heartboost     0x522ac0 掷 0.15 → 0x522ae3 → 0x493af5(self, 10316, x)
+#:   incsplashrange 0x47e71d 掷 0.15 + 武器要真有溅射 → flags 0x200；
+#:                  收方 0x4927c0 把溅射范围 ×(1+x/100)
+#:   dashattack     0x481e40  dmg×(1+x/100)，flags 0x400，**没有概率门**
+#:   teamreflection 0x50b64e → 0x50b4ef：`imul x, 1000` + 道具 10303「反射」
+#:                  ⇒ 给同队队友挂 x 秒反射
+SPECIAL_BONUS_ZH = {
+    "teamdmg": "对队友造成的伤害 %+d%%",
+    "selfdmg": "自己炸到自己的伤害 %+d%%",
+    "antighostcnt": "每局可挡下 %d 次「幽灵」干扰",
+    "heartboost": "捡到「心」时 15%% 概率额外回复 %d 点生命",
+    "incsplashrange": "溅射武器有 15%% 概率范围扩大 %d%%",
+    "dashattack": "突击技伤害 %+d%%",
+    "teamreflection": "为同队队友附加 %d 秒反射效果",
+}
+
+#: 死属性：名字表里有、`EquipBonus` 三份 INI 里零条、`GetEquipBonus` 零调用点，
+#: 连 flags `0x02` 的产生点全镜像都找不到 ⇒ **原版永远不会触发**，不写进说明。
+DEAD_BONUS_KEYS = ("critical",)
+
+#: 按 itemId **硬编码在 exe 里**的特殊效果 —— `EquipBonus.ini` / `weapon.ini`
+#: 里一个字都查不到，只能逆向。
+#:
+#: ★ 全表 1870 件的 id 逐个在代码段里搜过 4 字节立即数，**按 id 写死的效果
+#:   只有称号槽这三条**（取称号都走 `0x50a167` → `0x41528b(-1, 0x2000)`，
+#:   `0x2000` = 称号的 `PartFlag`）。上架物品里唯一被写死的 `220004` 那一处
+#:   （`0x48e6c1`）是画图标，不是加成。详见 §53 ⑤。
+SPECIAL_EFFECT_BY_ID = {
+    # 0x480995 掷 0.5f（`[0x69371c]`）→ 0x4809a4 取**受害者**的称号 →
+    # 0x4809a9 cmp 0x88b84 → 0x4809b4 `and [esi],0` 把伤害清零，
+    # 同时置 flags 0x100（收方画「LUCKY!」+ LuckyGuy.efx）。
+    560004: "受到伤害时 50%% 概率完全免疫",
+    # 发放：`0x49136e`，在 `GameContext` 虚表槽 `+0xc`（`0x491244`，进入游戏
+    #   上下文时跑的那一发）里逐座位查称号，命中就 `0x50b31c(角色, 45)` ——
+    #   往 `[角色+0x728]` 存 45 点额度并挂 `Effects/ROH/Efx/FireTime00.efx`。
+    # 生效：伤害函数尾巴 `0x4808cd → 0x50b3bd`，且要求**射手就是本地玩家自己**；
+    #   `新伤害 = min(原伤害 × 2, 剩余额度)`，额度按**翻倍后**的值扣。
+    # 结束：额度 ≤ 0 就摘掉特效，并**一次性**（`[角色+0x71c]` 去重）上行一发
+    #   `0x0415`（1 个 int32 = 座位）。复活只重挂特效（`0x502fde`），不重发。
+    560005: "开局起伤害翻倍，累计 45 点后失效",
+    # 触发：**自己**捡到「心」（`0x5229e1` 座位 == 我）→ 15%% 掷点（`0x522a1a`，
+    #   和宠物 `heartboost` 那道门是**两次独立掷点**）→ `0x522a3a cmp 0x88b86`。
+    # 效果：遍历 6 个座位，对**同队且活着**（`[角色+0x2b4] == 0`）的角色各发一发
+    #   `0x493af5(座位, 10315 하트, 5, 我的座位)`。★ 含自己。
+    #   `游戏类型 == 3` 或 `[session+0x1c] == 5` 的模式下量翻成 10（`0x522a4e`）。
+    560006: "捡到「心」时 15%% 概率让全队各回 5 点生命",
+}
+
+#: 条件加成（Lua 源码，`EquipBonus-Chn.ini` 里值不以数字开头的那 12 条）→ 一句人话。
+#: 客户端是真的跑 Lua（胶水在 `0x66005d`，`SetEquipBonusFunction` /
+#: `CallEquipBonusFunction`），取值时 `0x4133f2` 把静态数值和脚本返回值**相加**。
+#:
+#: `GetLastBulletROHIdx()` 比的是**武器族号**（`weapon.ini` 的 `ROH`）：
+#: `11xxxx` 泰尔 / `12xxxx` 卡希尔 / `13xxxx` 布洛克，末位 1/2/3 = 武器槽 1/2/3。
+#: ⚠ `560002` / `560003` 里 `GetPvpMode()==2` 到底是不是「格斗」**没有实证**，
+#:   是按这两个称号的原名（격투의 달인 / 슈팅의 달인）反推的。
+BONUS_LUA_ZH = {
+    610001: "使用左轮系武器时攻击 +15%%",      # ROH 110001
+    610002: "使用苹果雷系武器时攻击 +5%%",     # ROH 110002
+    610003: "使用狙击枪系武器时攻击 +3%%",     # ROH 110003
+    620001: "使用骆驼骑士系武器时攻击 +15%%",  # ROH 120001
+    620002: "使用火焰弹系武器时攻击 +5%%",     # ROH 120002
+    620003: "使用加农炮系武器时攻击 +3%%",     # ROH 120003
+    630001: "使用机关枪系武器时攻击 +15%%",    # ROH 130001
+    630002: "使用螺旋炮系武器时攻击 +5%%",     # ROH 130002
+    630003: "使用火箭筒系武器时攻击 +3%%",     # ROH 130003
+    560001: "生命 -10%%（按角色基础上限算）",
+    560002: "格斗模式对战时防御 +2%%",
+    560003: "射击模式对战时防御 +2%%",
+}
+
+#: 一条加成都查不到时，按类别写「用途 + 明说没有加成」（用户 2026-09-09 拍板：
+#: 留白分不清「真没有」和「漏写了」）。
+#:
+#: ⚠ 只收**占装备槽**的类别。材料 / 消耗品 / 钥匙 / 礼包**故意不收** ——
+#:   它们本来就不是装备，说明留白和以前一样（`test_web_admin` 钉着材料不带
+#:   `desc` 键）；`title`（称号）也不收，因为 `560005` / `560006` 在 exe 里
+#:   另有按 id 硬编码的行为、只是没查实，不能替它们断言「无属性加成」。
+KIND_USAGE_ZH = {
+    "spray": "染色剂，改变装备颜色。无属性加成。",
+    "character": "角色卡，解锁该角色。无属性加成。",
+    "dash": "突击技，改变冲刺攻击的动作。无属性加成。",
+    "pet": "宠物，跟随角色。无属性加成。",
+    "armor": "外观装备。无属性加成。",
+    "ring": "戒指。无属性加成。",
+}
+
+#: ★ 客户端把说明按 `|` 切开，**实际只画前 2 段**（`0x45c4c9` / `0x455534` /
+#: `0x45ff65` 都是循环**顶部**的 `cmp i,2 / je 出口`，`i` 只取 0 和 1；
+#: 第 3 个标签 `ItemInfo2Txt` 根本不参与切分，它画的是「买了到手的东西」那行绿字）。
+#:
+#:   第 1 段 `ItemInfo0Txt` 234×82 px ≈ 6 行  ← 数值
+#:   第 2 段 `ItemInfo1Txt` 232×45 px ≈ 3 行  ← 特殊效果 / 用途
+#:
+#: 各留一行余量。段内换行用 `\n`。
+#: ⚠ **说明里绝对不能出现裸 `|`** —— 它被 `wcstok`（`0x5fa904`）当分隔符吃掉。
+ITEM_DESC_MAX_LINES = 5
+ITEM_DESC_MAX_LINES_2 = 3
+
+#: 说明的段分隔符（客户端 `0x668274` 就是这个字符）。
+DESC_SEPARATOR = "|"
+
+#: 压行：数值加成一行最多摆几项。234 px / 字号 10 大约放得下 3 项
+#: （「攻击 +3%　防御 +2%　生命 +2」）。★ 这个数要实机核对。
+BONUS_PER_LINE = 3
+
+
+def _weapon_lines(weapon):
+    """武器数值那几行。`weapon` 是 `shop_items.json` 里那个 dict。"""
+    lines = []
+    damage = weapon.get("damage")
+    if damage is not None:
+        # 伤害按**部位**分档，没有随机数（§17）。爆头 / 腿部两档不一定都有。
+        parts = []
+        if weapon.get("head_damage"):
+            parts.append("爆头 %d" % weapon["head_damage"])
+        if weapon.get("legs_damage"):
+            parts.append("腿部 %d" % weapon["legs_damage"])
+        lines.append("伤害 %d%s"
+                     % (damage, "（%s）" % " / ".join(parts) if parts else ""))
+    # ★ 溅射两格原来一直没画出来 —— 榴弹类真正的杀伤在这
+    splash = []
+    if weapon.get("splash_damage"):
+        splash.append("溅射 %d" % weapon["splash_damage"])
+    if weapon.get("splash_range"):
+        splash.append("范围 %d" % weapon["splash_range"])
+    if splash:
+        lines.append("　".join(splash))
+    handling = []
+    if weapon.get("magazine"):
+        handling.append("弹匣 %d 发" % weapon["magazine"])
+    if weapon.get("reload_ms"):
+        handling.append("换弹 %.2f 秒" % (weapon["reload_ms"] / 1000.0))
+    if handling:
+        lines.append("　".join(handling))
+    if weapon.get("velocity"):
+        lines.append("初速 %d" % weapon["velocity"])
+    return lines
+
+
+def _bonus_lines(bonus):
+    """数值加成压成一行最多 `BONUS_PER_LINE` 项。"""
+    cells = []
+    for key in BONUS_ORDER:
+        value = bonus.get(key)
+        label = BONUS_ZH.get(key)
+        if not value or label is None:
+            continue
+        cells.append("%s %+d%s" % (label[0], value, "%" if label[1] else ""))
+    return ["　".join(cells[i:i + BONUS_PER_LINE])
+            for i in range(0, len(cells), BONUS_PER_LINE)]
+
+
+def _effect_lines(item):
+    """第 2 段：特殊效果 / 条件加成 / 「无属性加成」兜底。"""
+    lines = []
+    hardcoded = SPECIAL_EFFECT_BY_ID.get(item.id)
+    if hardcoded:
+        lines.append(hardcoded % ())
+    for key, value in sorted((item.bonus or {}).items()):
+        if key in DEAD_BONUS_KEYS or not value:
+            continue
+        template = SPECIAL_BONUS_ZH.get(key)
+        if template is not None:
+            lines.append(template % value)
+    if item.bonus_lua:
+        text = BONUS_LUA_ZH.get(item.id)
+        # 翻不出来的条件加成只提一句 —— 客户端自己会算，服务端解释不了。
+        lines.append(text % () if text else "（附带条件加成）")
+    return lines
 
 
 def item_desc_zh(item):
     """物品说明。**从本地数据现算**，原版那份说明随服务端 DB 一起没了。
 
     ⚠ 这不是「发明玩法」（铁律 12）—— 里面每个数都是客户端**自己也查得到**
-    的（武器数值来自 `weapon.ini`、装备加成来自 `EquipBonus-Chn.ini`），
-    只是原版把它们写在服务端下发的说明里，我们照着重新拼一遍。
+    的（武器数值来自 `weapon.ini`、装备加成来自 `EquipBonus-Chn.ini`、
+    特效的语义来自 14 个 `GetEquipBonus` 调用点），只是原版把它们写在服务端
+    下发的说明里，我们照着重新拼一遍。
 
-    翻不出内容就返回空串（提示框那块留白，和以前一样）。
+    分两段（中间一个 `|`，客户端画成上下两块）：
+
+        第 1 段  武器数值 / 装备加成 —— 同类压在一行上
+        第 2 段  特殊效果 / 条件加成 / 「无属性加成」
+
+    两段都空就返回空串；只有第 2 段有内容时**不发 `|`**（省得切出一个空段）。
     """
     if item is None:
         return ""
-    lines = []
-    weapon = item.weapon or {}
-    if weapon:
-        damage = weapon.get("damage")
-        head = weapon.get("head_damage")
-        if damage is not None:
-            lines.append("伤害 %d%s" % (damage,
-                                       "（爆头 %d）" % head if head else ""))
-        magazine = weapon.get("magazine")
-        reload_ms = weapon.get("reload_ms")
-        parts = []
-        if magazine:
-            parts.append("弹匣 %d 发" % magazine)
-        if reload_ms:
-            parts.append("换弹 %.2f 秒" % (reload_ms / 1000.0))
-        if parts:
-            lines.append("　".join(parts))
-        velocity = weapon.get("velocity")
-        if velocity:
-            lines.append("初速 %d" % velocity)
-    for key, value in sorted((item.bonus or {}).items()):
-        label = BONUS_ZH.get(key)
-        if label is None or not value:
-            continue
-        lines.append("%s %+d%s" % (label[0], value, "%" if label[1] else ""))
-    if item.bonus_lua:
-        # 条件加成（Lua 源码）客户端自己会算，服务端解释不了 —— 只提一句。
-        lines.append("（附带条件加成）")
-    return "\n".join(lines[:ITEM_DESC_MAX_LINES])
+    stats = []
+    if item.weapon:
+        stats.extend(_weapon_lines(item.weapon))
+    stats.extend(_bonus_lines(item.bonus or {}))
+    notes = _effect_lines(item)
+    if not stats and not notes:
+        # 一条加成都查不到 —— 按类别写用途，让玩家分得清「真没有」和「漏写了」
+        usage = KIND_USAGE_ZH.get(item.kind)
+        if not usage:
+            return ""
+        notes = [usage]
+    if not notes:
+        return "\n".join(stats[:ITEM_DESC_MAX_LINES])
+    notes = "\n".join(notes[:ITEM_DESC_MAX_LINES_2])
+    if not stats:
+        return notes
+    return "\n".join(stats[:ITEM_DESC_MAX_LINES]) + DESC_SEPARATOR + notes
 
 
 # --------------------------------------------------------------------------

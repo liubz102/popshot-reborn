@@ -2736,6 +2736,116 @@ static int try_patch_splash_visual_guard(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* ★ 「突击技加成」提示的空指针 —— 和上面那个**完全同型**（V0.3 §53）        */
+/*                                                                            */
+/*   2026-09-09 顺着「把 13 种加成全写进说明文」那一轮扫出来的：              */
+/*   `DashDamage` 有自己的一对虚表槽（0x66d5dc：+0x128 = 0x481dfd 置位、      */
+/*   +0x12c = 0x481e73 绘制）。0x481dfd 那一支在 `GetEquipBonus(射手, 12 =    */
+/*   DashAttack)` > 0 时把伤害 ×(1+x/100) 并置 flags 0x400（**没有概率门**）， */
+/*   全 `EquipBonus-Chn.ini` 只有 `220004` 迷你机械青蛙带 DashAttack ——       */
+/*   而它**已经上架、可合成**。                                               */
+/*                                                                            */
+/*   绘制那一支和 0x47e778 一模一样，而且**连头射那道判空都没有**：           */
+/*                                                                            */
+/*     00481e92  test byte [ebp+0xd], 4        ; flags & 0x400 ?               */
+/*     00481e96  je 0x481fe1                   ; 函数尾（没加成就不画）        */
+/*     00481e9c  [[0x72e320]] == 2 ?           ; 中国区 -> 0x481ef3            */
+/*     00481ea7  韩国区：文字画在爆炸点，不碰目标 —— 没事                       */
+/*     00481ef3  中国区：取图 Images/Chinese/Img…（有目标才有地方挂）         */
+/*     00481f3d  mov eax, [edi] ; call [eax+8] ; ★★ edi = NULL -> 和 0x47ea6c  */
+/*                                               同一个形状                    */
+/*                                                                            */
+/*   ⚠ **可达性没查实**：`DashDamage` 会不会真以「目标 = 0」进 0x492715       */
+/*   `OnExplode`（句柄表 0x474225 里登不登记）没查证 —— 所以这是**兜底**，     */
+/*   不是复现过的 bug。代价 6 字节，和 splash 那处一样，按 D55 同一套做法。    */
+/*                                                                            */
+/*   ★ 和 splash 的三处差别：① 补丁点头一条是 `push ebx`（**调用实参**，不是  */
+/*   保存寄存器 —— 这个函数的尾巴 0x481fe1 只 `pop edi; pop esi`），所以要盖  */
+/*   **6** 字节（E9 rel32 + 一个 NOP）、detour 里三条原指令都要补回；          */
+/*   ② 回跳点 0x481EF9；③ 无目标时的出口是 0x481FE1（= 0x481e96 那条 je 去的  */
+/*   同一个地方，中间一个 push 都没有、SEH 状态也没变）。                      */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_DASH_VISUAL_CRASH=1 保留原版行为（对照用）。              */
+/* -------------------------------------------------------------------------- */
+#define DASH_VISUAL_VA        0x00481EF3u
+#define DASH_VISUAL_PATCH_LEN 6             /* E9 rel32 + NOP，凑够指令边界   */
+#define DASH_VISUAL_SIG_LEN   18
+static const unsigned char DASH_VISUAL_SIG[DASH_VISUAL_SIG_LEN] = {
+    0x53,                               /* push ebx                          */
+    0x6A, 0x07,                         /* push 7                            */
+    0x8D, 0x45, 0x0C,                   /* lea  eax, [ebp+0xC]               */
+    0x50,                               /* push eax                          */
+    0xFF, 0x35, 0xA0, 0x9A, 0x6E, 0x00, /* push [0x6e9aa0]                   */
+    0xE8, 0xBB, 0xE0, 0xFF, 0xFF        /* call 0x47ffc0（取第 7 号图片名）  */
+};
+
+/* detour 里要用的立即数不带后缀（MSVC 内联汇编不吃 0x…u 这种写法） */
+#define DASH_VISUAL_RETURN_TO 0x00481EF9   /* 补回三条原指令后接着跑          */
+#define DASH_VISUAL_EXIT      0x00481FE1   /* 函数尾：mov ecx,[ebp-0xC] … ret 0xC */
+
+static __declspec(naked) void dash_visual_guard_detour(void)
+{
+    __asm {
+        test edi, edi                       /* edi = 命中的角色指针（arg0） */
+        jz   dvg_skip
+        push ebx                            /* 被偷走的三条原指令，逐条补回 */
+        push 7
+        lea  eax, [ebp + 0xC]
+        push DASH_VISUAL_RETURN_TO
+        ret
+    dvg_skip:
+        push DASH_VISUAL_EXIT               /* 没有目标：不画，走原有出口 */
+        ret
+    }
+}
+
+static volatile LONG g_dash_visual_patched = 0;
+
+static int dash_visual_crash_keep_original(void)
+{
+    /* 语义和 splash_visual_crash_keep_original() 一样：设了才是「保留原版」。 */
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_DASH_VISUAL_CRASH", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_patch_dash_visual_guard(void)
+{
+    unsigned char *p = (unsigned char *)DASH_VISUAL_VA;
+    DWORD oldp;
+
+    if (g_dash_visual_patched) return 1;
+    if (IsBadReadPtr(p, DASH_VISUAL_SIG_LEN)) return 0;
+    /* 幂等：已打过就是「E9 <跳到我们 detour 的 rel32>」 */
+    if (p[0] == 0xE9
+        && (DWORD)(*(int *)(p + 1))
+               == (DWORD)((UINT_PTR)&dash_visual_guard_detour
+                          - (UINT_PTR)(p + 5))) {
+        InterlockedExchange(&g_dash_visual_patched, 1);
+        return 1;
+    }
+    if (memcmp(p, DASH_VISUAL_SIG, DASH_VISUAL_SIG_LEN) != 0)
+        return 0;                          /* 还没解壳到这里，或不是已确认的版本 */
+
+    if (!VirtualProtect(p, DASH_VISUAL_PATCH_LEN, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   突击技加成提示判空: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    p[0] = 0xE9;
+    *(DWORD *)(p + 1) = (DWORD)((UINT_PTR)&dash_visual_guard_detour
+                                - (UINT_PTR)(p + 5));
+    p[5] = 0x90;                           /* 第 6 字节补 NOP，别留半条指令   */
+    VirtualProtect(p, DASH_VISUAL_PATCH_LEN, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, DASH_VISUAL_PATCH_LEN);
+    InterlockedExchange(&g_dash_visual_patched, 1);
+    bslog("PATCH   ★突击技加成提示判空 @ %08X: rpExplode 目标句柄查不到（打空）"
+          "且 flags 带 0x400 时不再读空指针（原版 0x481f3d 和 0x47ea6c 同型）",
+          (unsigned)DASH_VISUAL_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* ★ `BigShot.rpt` 里三种旧闪退的守护（V0.3 合成与商店 §48 / §49 / §50，D56）  */
 /*                                                                            */
 /*   三处都是原版少一个判空，各补一个：                                       */
@@ -4646,6 +4756,20 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_splash_visual_patched)
             bslog("PATCH   !! 超时未能 patch 溅射加成提示判空"
                   "（0x47EA21 特征串一直对不上）");
+    }
+
+    /* 突击技加成提示判空（§53）：和上面那个完全同型，只是补丁点在 DashDamage
+       的绘制虚表槽里。带 DashAttack 的只有已上架的 220004 迷你机械青蛙。 */
+    if (dash_visual_crash_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_DASH_VISUAL_CRASH 已设，保留原版突击技加成提示");
+    } else {
+        for (ticks = 0; !g_stop && !g_dash_visual_patched && ticks < 2000; ticks++) {
+            if (try_patch_dash_visual_guard()) break;
+            Sleep(2);
+        }
+        if (!g_dash_visual_patched)
+            bslog("PATCH   !! 超时未能 patch 突击技加成提示判空"
+                  "（0x481EF3 特征串一直对不上）");
     }
 
     /* BigShot.rpt 里三种旧闪退的守护（§48 / §49 / §50，D56）：教程弹窗时大厅为空、

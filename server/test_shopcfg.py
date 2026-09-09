@@ -587,6 +587,187 @@ class NameTests(_CfgCase):
         self.assertEqual("", shopcfg.item_name_zh(None))
 
 
+def _all_item_ids():
+    """真产物里的全部 id。★ 走 `ids_of_kind()`，别自己拼 —— 新加一类
+    （比如以后收进礼包 / 钥匙）时这里自动跟上。"""
+    ids = []
+    for kind in shopdata.kinds():
+        ids.extend(shopdata.ids_of_kind(kind))
+    return sorted(ids)
+
+
+@unittest.skipUnless(os.path.isfile(shopdata.DATA_PATH), "shop_items.json 不在")
+class ItemDescTests(unittest.TestCase):
+    """物品说明（`item_desc_zh`）—— 守的是「**别再漏掉一种加成**」（§53）。
+
+    火焰蝙蝠 `220003` 的溅射加成在提示框里空了大半年，直到它引发闪退才被发现，
+    根因就是这里的翻译表只覆盖了 13 种加成中的 5 种。下面这批用例把
+    「13 种一个都不能少」和「客户端那几道显示硬闸」一起钉住。
+    """
+
+    #: 客户端认得的 13 种加成（名字表 `0x732c00..0x732c30`）。
+    ALL_BONUS_KEYS = (
+        "attack", "defense", "critical", "movespd", "hp", "sp",
+        "teamdmg", "selfdmg", "antighostcnt", "heartboost",
+        "incsplashrange", "dashattack", "teamreflection",
+    )
+
+    #: 「玩家能穿 / 能拿在手上」的那几类。★ 判据故意**不用** `part_flag != 0`
+    #: —— 角色卡的 `part_flag` 是 0，但它照样出现在仓库格子里；当前上架的
+    #: 617 件正好落在前 7 类里。拿类别判而不是拿 `shop.json` 判，是因为测试跑在
+    #: 一个**空的** data 目录上（`run_tests` 特意指开的，别让测试跟着运营数据变）。
+    #:
+    #: ★ `title`（称号）现在**也收进来**：它整类还没上架（D44a），但用户
+    #: 2026-09-09 说了将来要上，所以 20 个称号的说明文提前全部查好了（§53 ⑤）。
+    EQUIPMENT_KINDS = ("armor", "weapon", "spray", "dash",
+                       "character", "pet", "ring", "title")
+
+    def test_every_bonus_the_client_knows_has_a_translation(self):
+        # ★ 这一条就是防止「火焰蝙蝠」重演：新加成必须落在三张表之一里，
+        #   落不进去就说明有人加了键却忘了写说明文。
+        for key in self.ALL_BONUS_KEYS:
+            known = (key in shopcfg.BONUS_ZH
+                     or key in shopcfg.SPECIAL_BONUS_ZH
+                     or key in shopcfg.DEAD_BONUS_KEYS)
+            self.assertTrue(known, "加成 %s 没有中文说明" % key)
+
+    def test_the_three_tables_do_not_overlap(self):
+        numeric = set(shopcfg.BONUS_ZH)
+        special = set(shopcfg.SPECIAL_BONUS_ZH)
+        dead = set(shopcfg.DEAD_BONUS_KEYS)
+        self.assertEqual(set(), numeric & special)
+        self.assertEqual(set(), (numeric | special) & dead)
+        # 数值行的排序表必须正好覆盖数值那一档，少一个就会在界面上消失。
+        self.assertEqual(numeric, set(shopcfg.BONUS_ORDER))
+
+    def test_no_bonus_key_in_the_real_table_is_unknown(self):
+        # 产物里真出现过的键，一个都不能是三张表之外的。
+        seen = set()
+        for item_id in _all_item_ids():
+            item = shopdata.get(item_id)
+            seen.update(item.bonus or {})
+            seen.update(item.bonus_lua or {})
+        self.assertEqual(set(), seen - set(self.ALL_BONUS_KEYS))
+
+    def test_the_hand_written_tables_point_at_real_items(self):
+        for table in (shopcfg.SPECIAL_EFFECT_BY_ID, shopcfg.BONUS_LUA_ZH):
+            for item_id in table:
+                self.assertIsNotNone(shopdata.get(item_id),
+                                     "说明表里的 %d 在物品表里不存在" % item_id)
+
+    def test_every_lua_bonus_item_is_translated(self):
+        # 12 条条件加成全部要有人话；漏一条就退回「（附带条件加成）」那句废话。
+        for item_id in _all_item_ids():
+            item = shopdata.get(item_id)
+            if item.bonus_lua:
+                self.assertIn(item_id, shopcfg.BONUS_LUA_ZH,
+                              "%d 的条件加成没翻译" % item_id)
+
+    def test_the_fire_bat_finally_says_what_it_does(self):
+        # §47 / D55 那件事的回归护栏。
+        self.assertEqual("溅射武器有 15% 概率范围扩大 10%",
+                         shopcfg.item_desc_zh(shopdata.get(220003)))
+
+    def test_the_three_exe_only_titles_are_documented(self):
+        """★ 三个**任何数据文件里都查不到**的称号（§53 ⑤）。
+
+        它们在 `EquipBonus-Chn.ini` 里连节都没有，效果全写死在 exe 里。
+        用户 2026-09-09 说称号将来要上架，所以提前查好钉住 —— 这三条要是
+        被人当成「没有加成」删掉，上架当天就会重演火焰蝙蝠那件事。
+        """
+        self.assertEqual("受到伤害时 50% 概率完全免疫",
+                         shopcfg.item_desc_zh(shopdata.get(560004)))
+        self.assertEqual("开局起伤害翻倍，累计 45 点后失效",
+                         shopcfg.item_desc_zh(shopdata.get(560005)))
+        self.assertEqual("捡到「心」时 15% 概率让全队各回 5 点生命",
+                         shopcfg.item_desc_zh(shopdata.get(560006)))
+        # 这三件在物品表里确实一条加成都没有 —— 说明只可能来自手写表。
+        for item_id in (560004, 560005, 560006):
+            item = shopdata.get(item_id)
+            self.assertEqual({}, item.bonus, item_id)
+            self.assertEqual({}, item.bonus_lua, item_id)
+
+    def test_every_title_says_what_it_does(self):
+        # 20 个称号一个不落（上架前就得全查清，别等上架当天再踩）。
+        blank = [i for i in shopdata.ids_of_kind("title")
+                 if not shopcfg.item_desc_zh(shopdata.get(i)).strip()]
+        self.assertEqual([], blank)
+
+    def test_rare_bonuses_land_in_the_second_segment(self):
+        # 防护装置：数值进第 1 段、特效进第 2 段，中间正好一个 `|`。
+        desc = shopcfg.item_desc_zh(shopdata.get(220002))
+        self.assertEqual(["防御 +2%", "每局可挡下 1 次「幽灵」干扰"],
+                         desc.split("|"))
+
+    def test_five_stat_armor_no_longer_loses_a_line(self):
+        # 原来上限 4 行 + 字母序 ⇒ 满 5 项的铠甲「体力」被砍掉了。
+        desc = shopcfg.item_desc_zh(shopdata.get(1010063))
+        self.assertIn("体力", desc)
+        self.assertEqual(2, len(desc.split("\n")))     # 3 项 + 2 项，压成两行
+
+    def test_grenades_show_their_splash(self):
+        # 榴弹真正的杀伤在溅射上，`weapon.ini` 有这两格但一直没画出来。
+        desc = shopcfg.item_desc_zh(shopdata.get(1120022))
+        self.assertIn("溅射 28　范围 100", desc)
+
+    def test_cosmetics_say_so_instead_of_going_blank(self):
+        # 用户 2026-09-09：留白分不清「真没有」和「漏写了」。
+        for item_id, expected in ((1070001, "染色剂"),
+                                  (101400001, "角色卡"),
+                                  (1060002, "突击技"),
+                                  (220007, "宠物")):
+            desc = shopcfg.item_desc_zh(shopdata.get(item_id))
+            self.assertIn(expected, desc)
+            self.assertIn("无属性加成", desc)
+
+    def test_materials_stay_blank(self):
+        # 材料不是装备，说明照旧留白（`test_web_admin` 钉着它不带 desc 键）。
+        self.assertEqual("", shopcfg.item_desc_zh(shopdata.get(10001)))
+
+    def test_none_is_empty(self):
+        self.assertEqual("", shopcfg.item_desc_zh(None))
+
+    def test_nothing_breaks_the_client_side_limits(self):
+        """客户端那几道硬闸，全表一件都不能碰到（§53）。
+
+        ① 最多 **2 段**（`0x45c4c9` 的 `cmp i,2` 是循环顶部，`i` 只取 0/1）；
+        ② 段内行数 ≤ 各自框子放得下的行数；
+        ③ 单段 ≤ 511 字符（`_vsnwprintf` 的 `0x1ff`）、整串 ≤ 999
+           （split 的栈缓冲 `wcsncpy 0x3e7`）。
+        """
+        limits = (shopcfg.ITEM_DESC_MAX_LINES, shopcfg.ITEM_DESC_MAX_LINES_2)
+        for item_id in _all_item_ids():
+            desc = shopcfg.item_desc_zh(shopdata.get(item_id))
+            if not desc:
+                continue
+            segments = desc.split("|")
+            self.assertLessEqual(len(segments), 2, item_id)
+            self.assertLess(len(desc), 999, item_id)
+            for index, segment in enumerate(segments):
+                self.assertTrue(segment, "%d 切出了空段" % item_id)
+                self.assertLess(len(segment), 511, item_id)
+                self.assertLessEqual(len(segment.split("\n")), limits[index],
+                                     item_id)
+
+    def test_every_equippable_item_says_something(self):
+        """★ 用户这一轮要的就是这个：能穿能拿的东西**没有一件**是空说明。
+
+        改动前这几类里有 226 件空白（当前上架的 617 件里空 102 件）。
+
+        `ownable` 那道过滤不能省：`1120220` 那批「售卖变体」只有 `[Stock-]`
+        节、进不了背包（§11），压根没有提示框，也没有武器数值可写。
+
+        ★ 称号也在里面 —— 20 个一个不落，包括 `560004` / `560005` / `560006`
+        那三个**只在 exe 里写死、任何数据文件都查不到**的（§53 ⑤）。
+        """
+        blank = [item_id
+                 for kind in self.EQUIPMENT_KINDS
+                 for item_id in shopdata.ids_of_kind(kind)
+                 if shopdata.ownable(item_id)
+                 and not shopcfg.item_desc_zh(shopdata.get(item_id)).strip()]
+        self.assertEqual([], blank)
+
+
 @unittest.skipUnless(os.path.isfile(shopdata.DATA_PATH), "shop_items.json 不在")
 class RealDefaultsTests(unittest.TestCase):
     """拿**真产物**生成一遍默认配置，看内容站不站得住。"""

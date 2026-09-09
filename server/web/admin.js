@@ -386,13 +386,19 @@ function paintTip(itemId) {
     box.appendChild(el("div", "t-meta", item.name_kr));
   }
   if (item && item.desc) {
-    var body = el("div", "t-body");
-    // ★ `desc` 是用 `\n` 分行的（服务端就是这么发给游戏客户端的），
-    //   一行一个 div，别指望 white-space 去还原。
-    item.desc.split("\n").forEach(function (line) {
-      body.appendChild(el("div", null, line));
+    // ★ `desc` 有两层分隔，别只切一层（切漏了浮窗里就直接冒出裸竖线）：
+    //   `|`  = **分段**，客户端把它画成上下两个独立的文本框
+    //          （`ItemInfo0Txt` 数值 / `ItemInfo1Txt` 特殊效果，V0.3商店 §31③）
+    //          —— 这里一段一个 `.t-body`，虚线边框天然把两块隔开；
+    //   `\n` = 段内**换行**，一行一个 div，别指望 white-space 去还原。
+    item.desc.split("|").forEach(function (segment) {
+      if (!segment) { return; }
+      var body = el("div", "t-body");
+      segment.split("\n").forEach(function (line) {
+        body.appendChild(el("div", null, line));
+      });
+      box.appendChild(body);
     });
-    box.appendChild(body);
   }
   // ---- 等级 / 角色限定：取**物品库**那一份（D31），没登记就说清楚 ----
   var rule = itemRuleOf(itemId);
