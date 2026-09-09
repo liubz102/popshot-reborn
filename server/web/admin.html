@@ -75,7 +75,13 @@
             <button class="btn btn-primary" id="cfgSave">保存</button>
           </div>
         </div>
-        <div class="pager" id="cfgPager"></div>
+        <!-- ★ 分类标签两行（用户 2026-09-09，D68）：照游戏仓库界面那棵树，和
+             「修改仓库」弹窗同一套（上一行大分类、下一行当前大分类的小分类，
+             admin.js 的 `paintCatTabs`）。钉在滚动区外面，原来换页栏的位置 ——
+             换页栏删了：筛完剩多少画多少，滚动条在列表上。
+             材料掉落页整块藏起来（它按 模式 / 关卡 / 难度 筛，不按物品分类）。 -->
+        <div class="cat-tabs hidden" id="cfgCats"></div>
+        <div class="cat-tabs sub hidden" id="cfgSubCats"></div>
         <div class="fit-list" id="cfgList"></div>
       </div>
     </section>
@@ -293,6 +299,10 @@
       <div class="toolbar cfg-bar">
         <div class="filters">
           <button class="btn" id="playerAddItem">＋ 添加物品</button>
+          <!-- 角色 / 上架状态两个下拉（用户 2026-09-09，D68）：和配置页、「选择物品」
+               弹窗同一份选项、同一条判据（admin.js 的 `dropdownsMatch`）。 -->
+          <select id="playerCharacter"></select>
+          <select id="playerListing"></select>
           <button class="btn" id="playerPopupRefresh"
                   title="重新读一遍这个玩家的资料和物品表 / 四份运营配置">↻ 刷新</button>
         </div>
@@ -323,20 +333,21 @@
     <div class="panel-body">
       <div class="toolbar">
         <input id="pickSearch" type="text" placeholder="搜 中文名 / 韩文名 / id">
-        <select id="pickKind"></select>
-        <!-- 角色按**物品库里那份角色限定**筛（D31），和物品库那一页一个口径。 -->
+        <!-- 角色 / 上架状态两个下拉：和配置页、「修改仓库」弹窗**共用同一份**选项和
+             判据（`characterOptions` / `LISTING_FILTER_OPTIONS` / `dropdownsMatch`，
+             D68）。角色按物品库里那份角色限定筛（D31）；上架状态「已上架」= 商店
+             或合成任意一边，看的是**当前页面模型**，还没保存的改动也算（D42a）。
+             原来这儿还有个「类别」下拉，2026-09-09 让位给下面的分类标签。 -->
         <select id="pickCharacter"></select>
-        <!-- 上架状态（用户 2026-09-09）。选项和判据都和物品库那一页**共用同一份**
-             （`LISTING_FILTER_OPTIONS` / `listingMatches`）：「已上架」= 商店
-             或合成，两边任意一边算数。看的是**当前页面模型**，还没保存的改动
-             也算（`listingOf`）。 -->
         <select id="pickListing"></select>
         <span class="grow"></span>
         <button class="btn" id="pickClose">关闭</button>
       </div>
-      <!-- 换页栏只有网格**上面**这一条（D37b）：800 多件东西一页放不下。
-           下面那条删了 —— 在底下换到末页时画面会被夹着跳。 -->
-      <div class="pager" id="pickPagerTop"></div>
+      <!-- 分类标签两行（D68），和「修改仓库」弹窗同一套。换页栏删了（原来 200 格
+           一页）：筛完剩多少画多少，只有网格自己滚。只挑材料的那种选择器不画
+           这两行（材料全在一格里，见 `pickerNeedsTabs`）。 -->
+      <div class="cat-tabs" id="pickCats"></div>
+      <div class="cat-tabs sub hidden" id="pickSubCats"></div>
       <!-- 详情**只走浮窗**（用户 2026-09-06）：网格底下原来还有一条侧栏，
            写的是同一批东西，而「在不在卖」还是现问服务端的旧值。 -->
       <div class="pick-grid" id="pickGrid"></div>

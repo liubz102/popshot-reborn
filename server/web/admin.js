@@ -1025,35 +1025,26 @@ async function refreshConfigs(force) {
 
 /** 服务端的错误里带着下标（`recipes[3].materials[1].id：…`），定位过去。
  *
- * ★ 那张卡可能在**别的页上**、甚至被筛选挡住了 —— 分页之后不翻过去的话
- *   「报了个错但画面上什么都没高亮」，比不报还难查。
+ * ★ 那张卡可能被筛选挡住了（搜索串、下拉、分类标签任何一样都可能）——
+ *   不清掉筛选的话「报了个错但画面上什么都没高亮」，比不报还难查。
+ *   没有换页栏了（D68）⇒ 清完筛选它一定在列表里，滚过去就行。
  */
 function markBadCard(message) {
   var match = /\[(\d+)\]/.exec(message || "");
   if (!match) { return; }
   var index = Number(match[1]);
-  var at = positionOf(CURRENT, index);
-  if (at < 0) {
+  var list = $("cfgList");
+  var selector = '[data-index="' + index + '"]';
+  var card = list.querySelector(selector);
+  if (!card) {
     FILTER[CURRENT] = emptyFilter();     // 被筛掉了，先把筛选清掉
     renderToolbar(CURRENT);
-    at = positionOf(CURRENT, index);
+    repaintList();
+    card = list.querySelector(selector);
   }
-  if (at < 0) { return; }
-  FILTER[CURRENT].page = Math.floor(at / pageSize(CURRENT));
-  repaintList();
-  var card = $("cfgList").querySelector('[data-index="' + index + '"]');
   if (!card) { return; }
   card.classList.add("bad", "flash");
   revealIfHidden(card);
-}
-
-/** 原数组下标 `index` 的那一条，排在**当前筛选结果**的第几位；筛没了就 -1。 */
-function positionOf(which, index) {
-  var at = -1;
-  visibleEntries(which).forEach(function (row, position) {
-    if (row.index === index) { at = position; }
-  });
-  return at;
 }
 
 function clearBadCards() {
@@ -1071,6 +1062,91 @@ function touched() {
   $("cfgReset").disabled = !dirty;
   $("cfgCount").textContent =
     CFG[CURRENT].entries.length + " " + CAT.schema[CURRENT].unit;
+}
+
+/* ======================================================================
+   分类标签 —— 两行按钮，四处共用（用户 2026-09-09，D68）
+
+   照**游戏仓库界面**那棵标签树（§41，服务端 `shop.WAREHOUSE_TABS` 随物品表
+   一起发）：上一行 7 个大分类 + 前面一个「全部」，下一行当前大分类的小分类。
+   2026-09-07 先给「修改仓库」弹窗做的（D47）；用户 2026-09-09 说这套比下拉框
+   顺手，物品库 / 商店货架 / 合成配方 / 「选择物品」弹窗全换成它 ——
+   原来的「类别」下拉（`kind`，shopdata 的抽表口径）和「只看上架」开关一起删了。
+   材料掉落页**不换**：它按 模式 / 关卡 / 难度 筛，不按物品分类。
+
+   每件物品落在哪一格由服务端算好放在 `item.wh` 里（客户端自己的两个分类
+   函数翻过来的），这儿只做匹配：精确相等，或大分类按高半字收。
+   ★ 标签上的件数是**过了其它筛选之后**的数（搜索串 / 角色 / 上架状态）——
+     标签是筛选的一维，不是独立的目录；「泰尔 · 未上架」一选，一眼看得出
+     每个分类里还剩几件，点过去不会是空的。
+   ====================================================================== */
+
+function whTabs() {
+  return (CAT && CAT.warehouse) || [];
+}
+
+/** 这件东西在游戏仓库里的标签 id；物品表里没有的当 `0`（哪个标签都不收）。 */
+function whCategory(itemId) {
+  var item = BYID[itemId];
+  return item && item.wh !== undefined ? item.wh : 0;
+}
+
+/** 客户端 `0x412852~0x412868` 那条规则：`-1` 全收；`0` 两边都不通配；
+ *  精确相等；父标签（低半字为 0）按高半字收。 */
+function whMatches(requested, cat) {
+  if (requested === -1) { return true; }
+  if (!cat || !requested) { return false; }
+  if (requested === cat) { return true; }
+  if ((requested & 0xFFFF) !== 0) { return false; }
+  return (requested >>> 16) === (cat >>> 16);
+}
+
+/** 一份「什么都没选」的标签状态：大分类「全部」（-1），没选小分类。 */
+function anyTab() {
+  return {big: -1, sub: null};
+}
+
+/** 现在选中的是哪一格：小分类优先，没选小分类就是大分类（或「全部」= -1）。 */
+function tabRequested(sel) {
+  return sel.sub !== null ? sel.sub : sel.big;
+}
+
+/** 画两行标签。`sel` = {big, sub}（点了**就地改**它）；`count(id)` = 这一格里
+ *  有几件；点了哪格叫 `onPick()`（那时 `sel` 已经改好了）。
+ *  件数为 0 的格子照画、只是不带角标 —— 「原来一件宠物都没登记」也是信息。
+ *  「人物 → 英雄」是 `0`，客户端遇到 0 直接返回空 —— 永远是空格子，不画。 */
+function paintCatTabs(bigHost, subHost, sel, count, onPick) {
+  function tabButton(id, label, on, big, sub) {
+    var button = el("button", "cat" + (on ? " on" : ""), label);
+    var n = count(id);
+    if (n) { button.appendChild(el("span", "n", String(n))); }
+    button.onclick = function () {
+      sel.big = big;
+      sel.sub = sub;
+      onPick();
+    };
+    return button;
+  }
+  bigHost.textContent = "";
+  bigHost.appendChild(tabButton(-1, "全部", sel.big === -1, -1, null));
+  whTabs().forEach(function (tab) {
+    bigHost.appendChild(tabButton(tab.id, tab.label, sel.big === tab.id,
+                                  tab.id, null));
+  });
+
+  subHost.textContent = "";
+  var big = whTabs().filter(function (tab) { return tab.id === sel.big; })[0];
+  var children = big ? (big.children || []).filter(function (child) {
+    return child.id !== 0;
+  }) : [];
+  subHost.classList.toggle("hidden", !children.length);
+  if (!children.length) { return; }
+  subHost.appendChild(tabButton(big.id, "全部" + big.label, sel.sub === null,
+                                big.id, null));
+  children.forEach(function (child) {
+    subHost.appendChild(tabButton(child.id, child.label, sel.sub === child.id,
+                                  big.id, child.id));
+  });
 }
 
 /* ======================================================================
@@ -1107,7 +1183,10 @@ function renderCurrent() {
   repaintList();
 }
 
-/* ------------------------------------------------------------ 工具条 */
+/* ------------------------------------------------------------ 工具条
+   一行：搜索框 + 两个下拉（角色 / 上架状态，D68）+「↻ 刷新」+「筛出 x / y」；
+   分类走下面那两行标签（`paintCfgTabs`）。材料掉落页例外：它没有分类标签，
+   两个下拉换成 模式 / 关卡 / 难度（D48）。 */
 function renderToolbar(which) {
   var bar = $("cfgToolbar");
   bar.textContent = "";
@@ -1120,42 +1199,25 @@ function renderToolbar(which) {
   search.value = filter.q;
   search.oninput = function () {
     filter.q = search.value.trim();
-    resetPage(which);
     repaintList();
   };
   bar.appendChild(search);
 
-  if (which === "items" || which === "shop") {
-    // ★ 物品库的类别下拉列**全部类别**（和「选择物品」弹窗一个口径），
-    //   不是「这份文件里出现过的类别」—— 筛出空列表也是有用的信息
-    //   （「原来一件宠物都没登记」）。
-    var kinds = (which === "items")
-      ? Object.keys(CAT.kinds).sort()
-      : uniq(CFG[which].entries.map(function (e) { return e.kind; }));
-    bar.appendChild(selectFilter(filter, "kind", "全部类别",
-      kinds.map(function (k) { return {value: k, label: CAT.kinds[k] || k}; })));
+  if (which !== "drops") {
+    // ★ 角色 / 上架状态两个下拉（用户 2026-09-09，D68）：和「选择物品」弹窗、
+    //   「修改仓库」弹窗**同一份选项、同一条判据**（`characterOptions` /
+    //   `LISTING_FILTER_OPTIONS` / `dropdownsMatch`）。「类别」下拉（shopdata 的
+    //   抽表口径）让位给游戏仓库那棵树的分类标签，商店 / 合成的「只看上架」开关
+    //   也一起删了。
     bar.appendChild(selectFilter(filter, "character", "全部角色",
-      Object.keys(CAT.characters).map(function (k) {
-        return {value: k, label: CAT.characters[k]}; })));
+                                 characterOptions()));
   }
   if (which === "items") {
-    // 上架状态：一件东西要么在商店卖、要么靠合成拿、要么都不是（互斥）。
-    // ★ 选项和「选择物品」弹窗共用 `LISTING_FILTER_OPTIONS`（判据也共用，
-    //   见 `listingMatches`）—— 同一个筛选两处画，别抄两份。
-    bar.appendChild(selectFilter(filter, "listing", "全部",
+    // ★ 上架状态**只有物品库有**（用户 2026-09-09 第三轮，D68b）：商店货架 /
+    //   合成配方两页本来就是「上架了什么」的清单，在那儿按上架状态筛没有意义
+    //   —— 一选别的档位就是空的。
+    bar.appendChild(selectFilter(filter, "listing", "全部上架状态",
                                  LISTING_FILTER_OPTIONS));
-  }
-  if (which === "recipe") {
-    // ★ 类别取的是**产物**的类别（配方条目自己没有 `kind` 这一栏）——
-    //   和「商店货架」一个口径：只列这份文件里真出现过的那几类。
-    bar.appendChild(selectFilter(filter, "kind", "全部类别",
-      uniq(CFG.recipe.entries.map(function (entry) {
-        return (BYID[entry && entry.result] || {}).kind;
-      }).filter(Boolean)).map(function (k) {
-        return {value: k, label: CAT.kinds[k] || k}; })));
-    bar.appendChild(selectFilter(filter, "character", "全部角色",
-      Object.keys(CAT.characters).map(function (k) {
-        return {value: k, label: CAT.characters[k]}; })));
   }
   if (which === "drops") {
     var modeSelect = selectFilter(filter, "mode", "全部模式",
@@ -1189,19 +1251,6 @@ function renderToolbar(which) {
     });
     lockForPvp();
   }
-  if (which === "shop" || which === "recipe") {
-    var only = el("label", "toggle" + (filter.listedOnly ? " on" : ""));
-    only.appendChild(el("span", "track"));
-    only.appendChild(el("span", null, "只看上架"));
-    only.onclick = function (event) {
-      event.preventDefault();
-      filter.listedOnly = !filter.listedOnly;
-      only.classList.toggle("on", filter.listedOnly);
-      resetPage(which);
-      repaintList();
-    };
-    bar.appendChild(only);
-  }
 
   // ★ 「↻ 刷新」排在筛选控件**后面**，**四个配置页都有**（用户 2026-09-06）
   //   —— 点哪一页的都是把四份一起重读，见 `refreshConfigs()`。
@@ -1215,8 +1264,22 @@ function renderToolbar(which) {
   bar.appendChild(shown);
 }
 
+/** 绑在筛选条件 `filter[key]` 上的一个下拉。改了就重画列表
+ *  （分类标签上的件数跟着变，见 `paintCfgTabs`）。 */
 function selectFilter(filter, key, allLabel, options) {
-  var select = document.createElement("select");
+  var select = fillSelect(document.createElement("select"), allLabel, options,
+                          filter[key]);
+  select.onchange = function () {
+    filter[key] = select.value;
+    repaintList();
+  };
+  return select;
+}
+
+/** 往一个 `<select>` 里填「全部…」+ 选项并选中 `value`（空串 = 第一项）。
+ *  筛选条和两个弹窗里的下拉都从这儿出 —— 选项怎么写只有一处。 */
+function fillSelect(select, allLabel, options, value) {
+  select.textContent = "";
   var first = el("option", null, allLabel);
   first.value = "";
   select.appendChild(first);
@@ -1225,19 +1288,38 @@ function selectFilter(filter, key, allLabel, options) {
     node.value = String(option.value);
     select.appendChild(node);
   });
-  select.value = filter[key] || "";
-  select.onchange = function () {
-    filter[key] = select.value;
-    filter.page = 0;               // 换了筛选条件就回第一页
-    repaintList();
-  };
+  select.value = value || "";
   return select;
 }
 
-/** 一份空的筛选条件。★ 加字段时只改这一处 —— 页面上有三个地方要「清筛选」。 */
+/** 「角色」下拉的选项：泰尔 / 卡希尔 / 布洛克（`CAT.characters`，服务端
+ *  `shopcfg.CHARACTER_ZH`）。★ 列**全部角色**而不是「这批条目里出现过的」
+ *  —— 筛出空列表也是有用的信息（「原来泰尔一件鞋都没有」）。 */
+function characterOptions() {
+  return Object.keys(CAT.characters).map(function (cid) {
+    return {value: cid, label: CAT.characters[cid]};
+  });
+}
+
+/** 角色 / 上架状态两个下拉共用的判据（D68）—— 四处筛的是同一件事，写一处。
+ *  `want` = {character, listing}，空串 = 不筛。
+ *  ★ 角色按**物品库里那份角色限定**筛（D31），不看条目自己带的键 ——
+ *    在物品库里把一件东西改成「不限」之后，它就不该再出现在「泰尔」这一档里
+ *    （`character` 那个键是**删掉**表示不限的，拿 `undefined` 退回原版数据
+ *    会让「改成不限」看上去没生效）。
+ *  ★ 上架状态看**当前页面模型**（D42a）：没保存的改动也算。 */
+function dropdownsMatch(itemId, want) {
+  if (want.character && String(itemRuleOf(itemId).character) !== want.character) {
+    return false;
+  }
+  return listingMatches(itemId, want.listing);
+}
+
+/** 一份空的筛选条件。★ 加字段时只改这一处 —— 页面上有三个地方要「清筛选」。
+ *  `big` / `sub` 是分类标签（`anyTab()` 那两个字段），掉落页用不上但留着不碍事。 */
 function emptyFilter() {
-  return {q: "", kind: "", character: "", listedOnly: false,
-          mode: "", stage: "", difficulty: "", page: 0};
+  return {q: "", character: "", listing: "", big: -1, sub: null,
+          mode: "", stage: "", difficulty: ""};
 }
 
 /** `SCHEMA.drops` 里某个字段的描述（下拉选项从这儿取，不另抄一份）。 */
@@ -1258,12 +1340,6 @@ function dropFieldMatches(value, wanted) {
   return !unset && String(value) === wanted;
 }
 
-function uniq(values) {
-  var seen = {}, out = [];
-  values.forEach(function (v) { if (!seen[v]) { seen[v] = 1; out.push(v); } });
-  return out.sort();
-}
-
 //: 每个配置标签页画成什么样。★ 加一份配置时只要在这儿登记一行。
 //  （函数声明会被提升，所以写在它们前面没问题。）
 var RENDERERS = {items: renderItems, shop: renderShop,
@@ -1276,13 +1352,45 @@ function repaintList() {
   //   一句读版面的代码，位置就被夹没了。
   var keep = list.scrollTop;
   list.textContent = "";
-  var view = pageRows(CURRENT);
-  // ★ 换页栏画在 `#cfgPager` 里，**在滚动区外面**（D39）—— 它得跟筛选条
-  //   一起钉住不动。只有一页时整条不画（`.pager:empty` 连外边距一起收掉）。
-  paintPager(CURRENT, view);
-  RENDERERS[CURRENT](list, view.rows);
+  // 先过筛选条（搜索 / 下拉），分类标签上的件数从这儿数；再按当前标签收一遍
+  // 才是画出来的那批。★ 换页栏没有了（D68）：筛完剩多少画多少，滚动条在列表上。
+  var filtered = filteredEntries(CURRENT);
+  paintCfgTabs(CURRENT, filtered);
+  var rows = narrowToTab(CURRENT, filtered);
+  var total = CFG[CURRENT].entries.length;
+  var label = $("cfgShown");
+  if (label) {
+    // ★ 「筛出 x / y」**只有掉落页写**（用户 2026-09-09，D68a）：另外三页的
+    //   分类标签上已经带着件数，再写一遍是重复的。一样多就什么都不写。
+    label.textContent = (CURRENT === "drops" && rows.length !== total)
+      ? ("筛出 " + rows.length + " / " + total) : "";
+  }
+  if (!rows.length) {
+    list.appendChild(el("div", "list-empty",
+                        total ? "没有符合筛选条件的条目" : "还没有条目 —— 点「添加」"));
+  }
+  RENDERERS[CURRENT](list, rows);
   list.scrollTop = keep;
   touched();
+}
+
+/** 配置页那两行分类标签，钉在筛选条和列表之间（滚动区外面，原来换页栏的
+ *  位置）。掉落页整块藏起来 —— 它不按物品分类。 */
+function paintCfgTabs(which, filtered) {
+  var bigHost = $("cfgCats");
+  var subHost = $("cfgSubCats");
+  var hide = (which === "drops");
+  bigHost.classList.toggle("hidden", hide);
+  if (hide) {
+    bigHost.textContent = "";
+    subHost.textContent = "";
+    subHost.classList.add("hidden");
+    return;
+  }
+  if (!FILTER[which]) { FILTER[which] = emptyFilter(); }
+  paintCatTabs(bigHost, subHost, FILTER[which], function (id) {
+    return filtered.filter(function (row) { return whMatches(id, row.cat); }).length;
+  }, repaintList);
 }
 
 /** 只在这张卡**不在可视区里**时才把它挪进来，而且挪最少的距离（`nearest`，
@@ -1309,28 +1417,18 @@ function entryItemId(which, entry) {
   return (entry.id === undefined) ? entry.material : entry.id;
 }
 
-/** 一条记录过不过筛选。**下标一律用原数组的**，服务端报错才对得上。 */
+/** 一条记录过不过**筛选条**（搜索串 / 下拉；分类标签另算，见 `narrowToTab`）。 */
 function matches(which, entry) {
   var filter = FILTER[which] || {};
-  if (filter.listedOnly && !entry.listed) { return false; }
-  if (!listingMatches(entry.id, filter.listing)) { return false; }
+  var itemId = entryItemId(which, entry);
+  var item = BYID[itemId];
+  // ★ 拿 `entryItemId` 不拿 `entry.id`：合成配方的 `id` 是配方号。以前这一句
+  //   写的是 `entry.id`，那时只有物品库有「上架状态」筛选，没暴露出来。
+  if (!dropdownsMatch(itemId, filter)) { return false; }
   if (filter.mode && (entry.mode || "quest") !== filter.mode) { return false; }
   if (which === "drops") {
     if (!dropFieldMatches(entry.stage, filter.stage)) { return false; }
     if (!dropFieldMatches(entry.difficulty, filter.difficulty)) { return false; }
-  }
-  var itemId = entryItemId(which, entry);
-  var item = BYID[itemId];
-  if (filter.kind && entry.kind !== filter.kind
-      && (!item || item.kind !== filter.kind)) { return false; }
-  if (filter.character !== undefined && filter.character !== "") {
-    // ★ 按**物品库里那份角色限定**筛（D31），不看条目自己带的键 ——
-    //   在物品库里把一件东西改成「不限」之后，它就不该再出现在
-    //   「泰尔」这一档里（`character` 那个键是**删掉**表示不限的，
-    //   拿 `undefined` 退回原版数据会让「改成不限」看上去没生效）。
-    if (String(itemRuleOf(itemId).character) !== filter.character) {
-      return false;
-    }
   }
   if (filter.q) {
     var hay = [itemName(itemId), entry.note, String(itemId),
@@ -1341,18 +1439,30 @@ function matches(which, entry) {
   return true;
 }
 
-/** 过了筛选的那些记录，`[{entry, index}]`。**下标一律用原数组的**。 */
-function visibleEntries(which) {
+/** 过了筛选条的那些记录，`[{entry, index, cat}]`，**还没按分类标签收**
+ *  （标签上的件数要从这儿数）。**下标一律用原数组的**，服务端报错才对得上。 */
+function filteredEntries(which) {
   var rows = [];
   CFG[which].entries.forEach(function (entry, index) {
-    if (matches(which, entry)) { rows.push({entry: entry, index: index}); }
+    if (matches(which, entry)) {
+      rows.push({entry: entry, index: index,
+                 cat: whCategory(entryItemId(which, entry))});
+    }
   });
+  return rows;
+}
+
+/** 再按当前分类标签收一遍 = 画面上那份。掉落页的标签一直是「全部」，
+ *  它只做排序（顺序在 `dropRank` 里定）。 */
+function narrowToTab(which, rows) {
+  var requested = tabRequested(FILTER[which] || anyTab());
+  var out = rows.filter(function (row) { return whMatches(requested, row.cat); });
   if (which === "drops") {
-    rows.sort(function (a, b) {
+    out.sort(function (a, b) {
       return (dropRank(a.entry) - dropRank(b.entry)) || (a.index - b.index);
     });
   }
-  return rows;
+  return out;
 }
 
 /** 材料掉落的显示顺序：模式 → 关卡 → 难度 → 材料 递增（用户 2026-09-06），
@@ -1394,86 +1504,6 @@ function dropRank(entry) {
   var at = (entry && typeof entry === "object") ? DROP_ORDER.rank.get(entry)
                                                 : undefined;
   return (at === undefined) ? Infinity : at;
-}
-
-/** 一页画几条（D37）。★ 这是**界面取舍**（一次铺 800 张卡 DOM 会卡手），
- *  不是铁律 10 说的那种时序阈值 —— 超出的翻页，不再是「剩下的不画了」。 */
-var PAGE_SIZE = 120;
-
-/** 按标签页改口径的那几个。★ 合成配方一条**横占一整行**（4 个材料格 + 花费
- *  + 产物），不像物品库 / 商店那样一屏并排好几张卡 ⇒ 120 条一页要滚到天荒
- *  地老，改成 10 条一页（用户 2026-09-08）。没登记的照 `PAGE_SIZE` 走。 */
-var PAGE_SIZE_BY_TAB = {recipe: 10};
-
-function pageSize(which) {
-  return PAGE_SIZE_BY_TAB[which] || PAGE_SIZE;
-}
-
-function pageCount(which, total) {
-  return Math.max(1, Math.ceil(total / pageSize(which)));
-}
-
-/** 这一页要画的那些记录，顺带把「筛出 x / y　第 m / n 页」写上。
- *  （掉落页的显示顺序在 `visibleEntries` 里定，这里不再另排 —— 翻页、
- *  报错定位用的 `positionOf` 才和画面一致。） */
-function pageRows(which) {
-  var all = visibleEntries(which);
-  var pages = pageCount(which, all.length);
-  var size = pageSize(which);
-  var filter = FILTER[which] || (FILTER[which] = {});
-  // 筛完变短了、或者删掉了最后一条 ⇒ 当前页可能已经不存在了，夹回来。
-  var page = Math.min(Math.max(0, filter.page || 0), pages - 1);
-  filter.page = page;
-  var label = $("cfgShown");
-  if (label) {
-    var total = CFG[which].entries.length;
-    // ★ 只写「筛出 x / y」。页码**只在换页栏上写一次**（用户 2026-09-07：
-    //   筛选条和换页栏各写一遍「第 m / n 页」是重复的）。
-    label.textContent = (all.length !== total)
-      ? ("筛出 " + all.length + " / " + total) : "";
-  }
-  return {rows: all.slice(page * size, (page + 1) * size),
-          pages: pages, page: page, total: all.length};
-}
-
-/** 换页栏。**只有列表上面这一条**（D37b），而且画在滚动区**外面**
- *  （D39：`#cfgPager` 和筛选条一起钉住，滚列表的时候它不动）。
- *  只有一页时整条不画。
- *
- *  ★ 换页**一律不动滚动条**：点哪个按钮都只换内容，画面停在原处。
- *    列表下面原来还有一条，删掉了 —— 在底下换到末页（末页是半页，列表
- *    真的变短）时，原位置越过新的底，浏览器一夹画面就是一跳，怎么写都
- *    躲不掉。栏子只留在顶上，点它的时候人本来就在顶上，没得可夹。 */
-function paintPager(which, view) {
-  var host = $("cfgPager");
-  host.textContent = "";
-  if (view.pages <= 1) { return; }
-  function step(text, target, disabled) {
-    var button = el("button", "btn btn-sm", text);
-    button.disabled = disabled;
-    button.onclick = function () {
-      // ★ 滚动条现在长在 `#cfgList` 上（D39），不是窗口上。
-      var list = $("cfgList");
-      var keep = list.scrollTop;
-      FILTER[which].page = target;
-      repaintList();
-      // 清空再填是同一个任务里做完的，浏览器本来就不会动滚动条；这一发
-      // 是把「不许动」写死，免得日后谁往重画里插一句读版面的代码，位置
-      // 就被夹没了。末页比整页短、原位置越界时浏览器自己会夹回来。
-      list.scrollTop = keep;
-    };
-    host.appendChild(button);
-  }
-  step("‹ 上一页", view.page - 1, view.page <= 0);
-  host.appendChild(el("span", "pageno",
-                      "第 " + (view.page + 1) + " / " + view.pages + " 页　共 "
-                      + view.total + " 条"));
-  step("下一页 ›", view.page + 1, view.page >= view.pages - 1);
-}
-
-/** 筛选条件一变就回第一页 —— 停在第 5 页而新结果只有 2 页会变成一片空白。 */
-function resetPage(which) {
-  if (FILTER[which]) { FILTER[which].page = 0; }
 }
 
 function killButton(which, index) {
@@ -1802,7 +1832,8 @@ function dropRow(entry, index) {
   row.setAttribute("data-index", index);
   row.appendChild(killButton("drops", index));
 
-  var who = el("div", "who");
+  // 整块挂浮窗：材料格是定宽的（D68b），名字太长会截成省略号，停上去看全名。
+  var who = tipFor(el("div", "who"), entry.material);
   var slot = slotNode(entry.material, 36, true, true);
   slot.onclick = function () {
     openPicker({kinds: ["material"], selected: entry.material,
@@ -1869,57 +1900,36 @@ function openPicker(options) {
     onPickMany: options.onPickMany,
     owned: options.owned || {},
     chosen: {},
+    // ★ 筛选每次打开都从头起（搜索串空、两个下拉「全部」、分类「全部」），
+    //   不跨次记忆 —— 上一次筛剩三件，这一次打开又是空网格最难查。
     q: "",
-    page: 0,
-    kind: (options.kinds && options.kinds.length === 1) ? options.kinds[0] : "",
     character: "",
-    listing: ""
+    listing: "",
+    big: -1,
+    sub: null,
+    tabs: pickerNeedsTabs(options.kinds)
   };
   $("pickSearch").value = "";
-  var kindSelect = $("pickKind");
-  kindSelect.textContent = "";
-  var all = el("option", null, "全部类别");
-  all.value = "";
-  kindSelect.appendChild(all);
-  var kinds = PICKER.kinds || uniq(CAT.items.map(function (i) { return i.kind; }));
-  kinds.forEach(function (kind) {
-    var node = el("option", null, CAT.kinds[kind] || kind);
-    node.value = kind;
-    kindSelect.appendChild(node);
-  });
-  kindSelect.value = PICKER.kind;
-  // 角色下拉（用户 2026-09-06）。★ 列**全部角色**而不是「这批候选里出现过的」
-  //   —— 筛出空网格也是有用的信息（「原来泰尔一件鞋都没有」）。
-  var whoSelect = $("pickCharacter");
-  whoSelect.textContent = "";
-  var anyone = el("option", null, "全部角色");
-  anyone.value = "";
-  whoSelect.appendChild(anyone);
-  Object.keys(CAT.characters).forEach(function (cid) {
-    var node = el("option", null, CAT.characters[cid]);
-    node.value = cid;
-    whoSelect.appendChild(node);
-  });
-  whoSelect.value = "";
-  // 上架状态下拉（用户 2026-09-09）。选项和物品库那一页共用
-  // `LISTING_FILTER_OPTIONS` —— 每次打开都从「全部上架状态」起，和搜索串、
-  // 角色一样不跨次记忆（上一次筛剩三件，这一次打开又空网格最难查）。
-  var listingSelect = $("pickListing");
-  listingSelect.textContent = "";
-  var anyListing = el("option", null, "全部上架状态");
-  anyListing.value = "";
-  listingSelect.appendChild(anyListing);
-  LISTING_FILTER_OPTIONS.forEach(function (option) {
-    var node = el("option", null, option.label);
-    node.value = option.value;
-    listingSelect.appendChild(node);
-  });
-  listingSelect.value = "";
-  kindSelect.disabled = !!(PICKER.kinds && PICKER.kinds.length === 1);
+  // 角色 / 上架状态两个下拉：和配置页、「修改仓库」弹窗同一份选项（D68）。
+  fillSelect($("pickCharacter"), "全部角色", characterOptions(), "");
+  fillSelect($("pickListing"), "全部上架状态", LISTING_FILTER_OPTIONS, "");
   $("pickFoot").classList.toggle("hidden", !PICKER.multi);
   $("picker").classList.remove("hidden");
   paintPicker();
   $("pickSearch").focus();
+}
+
+/** 受限的选择器（`kinds`，现在只有「只挑材料」一种）要不要画分类标签：
+ *  候选落在**不止一个大分类**里才画。材料全在「收集品 → 材料」一格，两行标签
+ *  只剩一个能点的格子，纯占地方（而且这个弹窗常常只是给一格材料换个东西，
+ *  越短越好）。不受限的照画。 */
+function pickerNeedsTabs(kinds) {
+  if (!kinds) { return true; }
+  var groups = {};
+  CAT.items.forEach(function (item) {
+    if (kinds.indexOf(item.kind) >= 0) { groups[whCategory(item.id) >>> 16] = true; }
+  });
+  return Object.keys(groups).length > 1;
 }
 
 /** 批量模式底下那条：已选几件、「确认添加」能不能点。 */
@@ -1935,65 +1945,50 @@ function closePicker() {
   $("picker").classList.add("hidden");
 }
 
-/** 弹窗里一页画这么多格（D37）。808 件全铺出来是几千像素高的一张网，搜索框会卡手
- *  —— 超出的**翻页**（用户 2026-09-06），不再是「剩下的不画了」。 */
-var PICK_PAGE_SIZE = 200;
-
-/** 弹窗的换页栏，也**只有网格上面这一条**（D37b）。只有一页时整条不画。
- *  规矩和列表那边一模一样（见 `pagerNode`），只是这里滚的是弹窗自己那个
- *  `.panel-body`，不是整页。 */
-function paintPickPager(host, pages) {
-  host.textContent = "";
-  if (pages <= 1) { return; }
-  function step(text, target, disabled) {
-    var button = el("button", "btn btn-sm", text);
-    button.disabled = disabled;
-    button.onclick = function () {
-      // ★ 滚的是网格自己（D39），不再是整个 `.panel-body`。
-      var grid = $("pickGrid");
-      var keep = grid.scrollTop;
-      PICKER.page = target;
-      paintPicker();
-      grid.scrollTop = keep;
-    };
-    host.appendChild(button);
+/** 弹窗那两行分类标签（D68）。受限的选择器不画（见 `pickerNeedsTabs`）。 */
+function paintPickTabs(candidates) {
+  var bigHost = $("pickCats");
+  var subHost = $("pickSubCats");
+  bigHost.classList.toggle("hidden", !PICKER.tabs);
+  if (!PICKER.tabs) {
+    subHost.classList.add("hidden");
+    return;
   }
-  step("‹ 上一页", PICKER.page - 1, PICKER.page <= 0);
-  host.appendChild(el("span", "pageno",
-                      "第 " + (PICKER.page + 1) + " / " + pages + " 页"));
-  step("下一页 ›", PICKER.page + 1, PICKER.page >= pages - 1);
+  paintCatTabs(bigHost, subHost, PICKER, function (id) {
+    return candidates.filter(function (item) {
+      return whMatches(id, whCategory(item.id));
+    }).length;
+  }, paintPicker);
 }
 
+/** 画网格。★ 换页栏没有了（D68，原来 200 格一页）：筛完剩多少画多少，
+ *  只有网格自己滚（`#pickGrid`）；重画不动滚动条（D37b）。 */
 function paintPicker() {
   var grid = $("pickGrid");
+  var keep = grid.scrollTop;
   grid.textContent = "";
   var query = PICKER.q.toLowerCase();
-  var hits = CAT.items.filter(function (item) {
+  // 先过筛选条（受限的种类 / 两个下拉 / 搜索串），标签上的件数从这儿数；
+  // 再按当前分类标签收一遍才是画出来的那批（和配置页 `repaintList` 一个套路）。
+  var candidates = CAT.items.filter(function (item) {
     if (PICKER.kinds && PICKER.kinds.indexOf(item.kind) < 0) { return false; }
-    if (PICKER.kind && item.kind !== PICKER.kind) { return false; }
-    // ★ 角色按**物品库里那份角色限定**筛（D31），和 `matches()` 同一条判据
-    //   —— 在物品库里改成「不限」之后，这儿也不该再把它算进那个角色。
-    if (PICKER.character
-        && String(itemRuleOf(item.id).character) !== PICKER.character) {
-      return false;
-    }
-    // 上架状态和物品库那一页同一条判据（`listingMatches`）：「已上架」
-    // = 商店或合成；看的是当前页面模型，还没保存的改动也算。
-    if (!listingMatches(item.id, PICKER.listing)) { return false; }
+    // 角色 / 上架状态和配置页、「修改仓库」弹窗同一条判据（`dropdownsMatch`）。
+    if (!dropdownsMatch(item.id, PICKER)) { return false; }
     if (!query) { return true; }
     // 中文名按**物品库**里那一份搜（D31）—— 在物品库里改过名字之后，
     // 用新名字搜不到才叫奇怪。
     return (itemName(item.id) + " " + (item.name_kr || "") + " " + item.id)
       .toLowerCase().indexOf(query) >= 0;
   });
+  paintPickTabs(candidates);
+  var requested = tabRequested(PICKER);
+  var hits = candidates.filter(function (item) {
+    return whMatches(requested, whCategory(item.id));
+  });
   if (!hits.length) {
     grid.appendChild(el("div", "pick-empty", "没有匹配的物品"));
   }
-  var pages = Math.max(1, Math.ceil(hits.length / PICK_PAGE_SIZE));
-  // 搜索串一变结果就短了 —— 当前页可能已经不存在，夹回来。
-  PICKER.page = Math.min(Math.max(0, PICKER.page || 0), pages - 1);
-  hits.slice(PICKER.page * PICK_PAGE_SIZE,
-             (PICKER.page + 1) * PICK_PAGE_SIZE).forEach(function (item) {
+  hits.forEach(function (item) {
     var owned = PICKER.multi && PICKER.owned[item.id];
     var chosen = PICKER.multi && PICKER.chosen[item.id];
     var cell = el("div", "pick" + (item.id === PICKER.selected ? " sel" : "")
@@ -2031,11 +2026,10 @@ function paintPicker() {
     };
     grid.appendChild(cell);
   });
-  paintPickPager($("pickPagerTop"), pages);
-  // 标题栏只写件数，页码归换页栏（用户 2026-09-07，和配置页一个口径：
-  // 「第 m / n 页」只写一处）。
+  // 标题栏只写件数（用户 2026-09-07）—— 是当前分类下筛出来的那个数。
   $("pickCount").textContent = hits.length + " 件";
   paintPickFoot();
+  grid.scrollTop = keep;
 }
 
 /* ======================================================================
@@ -2602,15 +2596,17 @@ async function openPlayer(username, force) {
 }
 
 /** 把服务端那份快照变成「快照 + 补丁」，并打开（或刷新）编辑弹窗。
- *  同一个人重读（保存回执 / 刷新）时停在原来的分类标签上，别跳回「全部」。 */
+ *  同一个人重读（保存回执 / 刷新）时停在原来的分类标签和两个下拉上，
+ *  别跳回「全部」。 */
 function adoptPlayer(view) {
   var edit = {level: view.level, money: view.money,
               materials: {}, inventory: {}};
   view.materials.forEach(function (row) { edit.materials[row.id] = row.count; });
   view.inventory.forEach(function (row) { edit.inventory[row.id] = row.count; });
-  var tab = (PLAYER && PLAYER.view.username === view.username)
-    ? PLAYER.tab : {big: -1, sub: null};
-  PLAYER = {view: view, edit: edit, tab: tab};
+  var same = !!(PLAYER && PLAYER.view.username === view.username);
+  PLAYER = {view: view, edit: edit,
+            tab: same ? PLAYER.tab : anyTab(),
+            filter: same ? PLAYER.filter : {character: "", listing: ""}};
   renderPlayer();
   renderPlayerRows();
 }
@@ -2665,42 +2661,26 @@ function renderPlayer() {
   $("playerMoney").value = PLAYER.edit.money;
   $("playerExp").value = view.experience + "（本级 " + view.level_start_exp
     + " ~ 下一级 " + view.next_level_exp + "）";
+  renderPlayerFilters();
   $("playerModal").classList.remove("hidden");
   repaintOwned();
 }
 
+/** 弹窗里角色 / 上架状态两个下拉（用户 2026-09-09，D68）：选项和配置页、
+ *  「选择物品」弹窗同一份，值照 `PLAYER.filter`。选项每次重填 —— 弹窗里的
+ *  「↻ 刷新」会重读物品表，角色表跟着它走。 */
+function renderPlayerFilters() {
+  fillSelect($("playerCharacter"), "全部角色", characterOptions(),
+             PLAYER.filter.character);
+  fillSelect($("playerListing"), "全部上架状态", LISTING_FILTER_OPTIONS,
+             PLAYER.filter.listing);
+}
+
 /* ---------------------------------------------------------- 仓库分类
-   照**游戏仓库界面**那棵标签树（§41，服务端 `shop.WAREHOUSE_TABS` 随物品表
-   一起发）：7 个大分类，每个下面几个小分类；前面多一个「全部」。
-   每件物品落在哪一格由服务端算好放在 `item.wh` 里（客户端自己的两个分类
-   函数翻过来的），这儿只做匹配：精确相等，或大分类按高半字收。
+   分类标签那一套（`whTabs` / `whMatches` / `paintCatTabs`）2026-09-09 起
+   四处共用，搬到「分类标签」那一节去了（D68）。
    材料和仓库物品**不再分两块**（用户 2026-09-07）—— 游戏里它们本来就在
    同一个仓库面板里（材料在「收集品 → 材料」）。 */
-
-function whTabs() {
-  return (CAT && CAT.warehouse) || [];
-}
-
-/** 这件东西在游戏仓库里的标签 id；物品表里没有的当 `0`（哪个标签都不收）。 */
-function whCategory(itemId) {
-  var item = BYID[itemId];
-  return item && item.wh !== undefined ? item.wh : 0;
-}
-
-/** 客户端 `0x412852~0x412868` 那条规则：`-1` 全收；`0` 两边都不通配；
- *  精确相等；父标签（低半字为 0）按高半字收。 */
-function whMatches(requested, cat) {
-  if (requested === -1) { return true; }
-  if (!cat || !requested) { return false; }
-  if (requested === cat) { return true; }
-  if ((requested & 0xFFFF) !== 0) { return false; }
-  return (requested >>> 16) === (cat >>> 16);
-}
-
-/** 现在选中的是哪一格：小分类优先，没选小分类就是大分类（或「全部」= -1）。 */
-function playerRequested() {
-  return PLAYER.tab.sub !== null ? PLAYER.tab.sub : PLAYER.tab.big;
-}
 
 /** 两桶合成一张表：`{bucket, id, cat}`，按 id 排。数量为 0 的也在（装备类
  *  「没有」那一格要留着让人翻回来）。 */
@@ -2716,51 +2696,24 @@ function ownedEntries() {
   return out;
 }
 
-function switchOwnedTab(big, sub) {
-  PLAYER.tab = {big: big, sub: sub};
-  renderPlayerTabs();
-  renderOwnedList();
+/** 过了角色 / 上架状态两个下拉的那些（D68）；分类标签在 `renderOwnedList`
+ *  里再收一遍，标签上的件数从这儿数（和配置页一个套路）。 */
+function ownedFiltered() {
+  return ownedEntries().filter(function (entry) {
+    return dropdownsMatch(entry.id, PLAYER.filter);
+  });
 }
 
-/** 两行标签。件数只数「有」的（数量 > 0）。「人物 → 英雄」是 `0`，客户端遇到
- *  0 直接返回空 —— 永远是空格子，不画。 */
+/** 两行标签。件数只数「有」的（数量 > 0）。 */
 function renderPlayerTabs() {
-  var have = ownedEntries().filter(function (entry) {
+  var have = ownedFiltered().filter(function (entry) {
     return Number(PLAYER.edit[entry.bucket][entry.id]) > 0;
   });
-  function count(id) {
+  paintCatTabs($("playerCats"), $("playerSubCats"), PLAYER.tab, function (id) {
     return have.filter(function (entry) { return whMatches(id, entry.cat); }).length;
-  }
-  function tabButton(id, label, on, onclick) {
-    var button = el("button", "cat" + (on ? " on" : ""), label);
-    var n = count(id);
-    if (n) { button.appendChild(el("span", "n", String(n))); }
-    button.onclick = onclick;
-    return button;
-  }
-  var host = $("playerCats");
-  host.textContent = "";
-  host.appendChild(tabButton(-1, "全部", PLAYER.tab.big === -1, function () {
-    switchOwnedTab(-1, null);
-  }));
-  whTabs().forEach(function (tab) {
-    host.appendChild(tabButton(tab.id, tab.label, PLAYER.tab.big === tab.id,
-                               function () { switchOwnedTab(tab.id, null); }));
-  });
-
-  var sub = $("playerSubCats");
-  sub.textContent = "";
-  var big = whTabs().filter(function (tab) { return tab.id === PLAYER.tab.big; })[0];
-  var children = big ? (big.children || []).filter(function (child) {
-    return child.id !== 0;
-  }) : [];
-  sub.classList.toggle("hidden", !children.length);
-  if (!children.length) { return; }
-  sub.appendChild(tabButton(big.id, "全部" + big.label, PLAYER.tab.sub === null,
-                            function () { switchOwnedTab(big.id, null); }));
-  children.forEach(function (child) {
-    sub.appendChild(tabButton(child.id, child.label, PLAYER.tab.sub === child.id,
-                              function () { switchOwnedTab(big.id, child.id); }));
+  }, function () {
+    renderPlayerTabs();
+    renderOwnedList();
   });
 }
 
@@ -2770,14 +2723,14 @@ function renderOwnedList() {
   var keep = box.scrollTop;
   var grid = $("playerOwnedGrid");
   grid.textContent = "";
-  var requested = playerRequested();
-  var rows = ownedEntries().filter(function (entry) {
+  var requested = tabRequested(PLAYER.tab);
+  var rows = ownedFiltered().filter(function (entry) {
     return whMatches(requested, entry.cat);
   });
   if (!rows.length) {
     grid.appendChild(el("div", "own-empty",
-                        requested === -1 ? "仓库是空的 —— 点「＋ 添加物品」"
-                                         : "这个分类下没有东西"));
+                        ownedEntries().length ? "这个分类 / 筛选条件下没有东西"
+                                              : "仓库是空的 —— 点「＋ 添加物品」"));
   }
   rows.forEach(function (entry) {
     grid.appendChild(ownNode(entry.bucket, entry.id));
@@ -2891,19 +2844,26 @@ function addOwnedMany() {
     onPickMany: function (items) {
       var added = 0;
       var hidden = 0;
-      var requested = playerRequested();
+      var requested = tabRequested(PLAYER.tab);
       items.forEach(function (item) {
         var bucket = item.kind === "material" ? "materials" : "inventory";
         if (!Number(PLAYER.edit[bucket][item.id])) {
           PLAYER.edit[bucket][item.id] = 1;
           added += 1;
         }
-        if (!whMatches(requested, whCategory(item.id))) { hidden += 1; }
+        // 分类标签和两个下拉任何一样挡住它都算「看不见」。
+        if (!whMatches(requested, whCategory(item.id))
+            || !dropdownsMatch(item.id, PLAYER.filter)) { hidden += 1; }
       });
-      if (hidden) { PLAYER.tab = {big: -1, sub: null}; }
+      if (hidden) {
+        PLAYER.tab = anyTab();
+        PLAYER.filter = {character: "", listing: ""};
+        renderPlayerFilters();
+      }
       repaintOwned();
       toast("已加入 " + added + " 件，按「保存」才真的发给玩家"
-            + (hidden ? "；有的不在刚才那个分类里，已切到「全部」" : ""), true);
+            + (hidden ? "；有的不在刚才那个分类 / 筛选里，已切回「全部」" : ""),
+            true);
     }
   });
 }
@@ -3152,6 +3112,17 @@ function wire() {
   // 玩家仓库弹窗（用户 2026-09-07）：只有 ✕ 能关，点遮罩不关 —— 所以
   // `#playerModal` 故意**没有** onclick。
   $("playerAddItem").onclick = function () { addOwnedMany(); };
+  // 角色 / 上架状态两个下拉（D68）：改了只重画标签行和格子区（D47 的口径）。
+  $("playerCharacter").onchange = function () {
+    if (!PLAYER) { return; }
+    PLAYER.filter.character = $("playerCharacter").value;
+    repaintOwned();
+  };
+  $("playerListing").onchange = function () {
+    if (!PLAYER) { return; }
+    PLAYER.filter.listing = $("playerListing").value;
+    repaintOwned();
+  };
   $("playerPopupRefresh").onclick = function () { refreshPlayerPopup(); };
   $("playerClose").onclick = function () { closePlayerModal(); };
   $("playerSave").onclick = savePlayer;
@@ -3161,22 +3132,14 @@ function wire() {
 
   $("pickSearch").oninput = function () {
     PICKER.q = $("pickSearch").value.trim();
-    PICKER.page = 0;
-    paintPicker();
-  };
-  $("pickKind").onchange = function () {
-    PICKER.kind = $("pickKind").value;
-    PICKER.page = 0;
     paintPicker();
   };
   $("pickCharacter").onchange = function () {
     PICKER.character = $("pickCharacter").value;
-    PICKER.page = 0;
     paintPicker();
   };
   $("pickListing").onchange = function () {
     PICKER.listing = $("pickListing").value;
-    PICKER.page = 0;
     paintPicker();
   };
   $("pickClose").onclick = closePicker;
@@ -3271,9 +3234,8 @@ function addEntry(which) {
       if ("id" in entry && which === "recipe") { entry.id = nextRecipeId(); }
       CFG[which].entries.push(entry);
       // 新加的那条一定要看得见 —— 否则筛选开着的时候「加了没反应」。
-      // ★ 它追加在末尾 ⇒ 清掉筛选之后还得**翻到最后一页**。
+      // ★ 它追加在末尾 ⇒ 清掉筛选（连分类标签一起）再滚过去。
       FILTER[which] = emptyFilter();
-      FILTER[which].page = pageCount(which, CFG[which].entries.length) - 1;
       renderCurrent();
       var card = $("cfgList").querySelector(
         '[data-index="' + (CFG[which].entries.length - 1) + '"]');

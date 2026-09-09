@@ -103,7 +103,12 @@ body {
    flex 项就按内容撑高，整页又会长回窗口外面去。 */
 main {
   flex: 1 1 auto; min-height: 0; overflow-y: auto;
-  width: 100%; max-width: 1180px; margin: 0 auto; padding: 16px 18px 60px;
+  /* ★ 1320 不是 1180（用户 2026-09-09，D68a）：掉落页的筛选条 搜索 + 三个下拉 +
+     刷新 +「筛出 x / y」+ 右边四个钮，在 1180 里正好一个像素都不剩（实测需要
+     1074、可用 1074），「筛出」一出现整条就折成两行、筛选条变高。放宽到 1320
+     多出 140 px 余量；窗口比这窄时就撑满窗口。★ 下面 `.tabs` 的宽度要跟着一起改，
+     标签行和面板才对得齐。 */
+  width: 100%; max-width: 1320px; margin: 0 auto; padding: 16px 18px 60px;
 }
 
 /* ★ 配置页（物品库 / 商店货架 / 合成配方 / 材料掉落）、数据备份页和玩家仓库页：
@@ -133,6 +138,7 @@ main.fit .fit-list {
 main.fit .fit-panel > .panel-body > ul.help,
 main.fit .fit-panel > .panel-body > .toolbar,
 main.fit .fit-panel > .panel-body > .hint,
+main.fit .fit-panel > .panel-body > .cat-tabs,
 main.fit .fit-panel > .panel-body > .pager { flex: 0 0 auto; }
 /* 说明块也钉住不动 ⇒ 不能让它把画面吃光（合成配方那份有 9 条）。
    超过这么高它自己滚，条数再多也只占这一截。 */
@@ -228,7 +234,7 @@ ul.help b, .hint b { color: var(--crimson); }
 /* 标签行在 `.appbar` 里，所以自己撑出 `main` 的那份左右留白和居中。 */
 .tabs {
   display: flex; gap: 8px; flex-wrap: wrap;
-  max-width: 1180px; margin: 0 auto; padding: 12px 18px;
+  max-width: 1320px; margin: 0 auto; padding: 12px 18px;   /* 和 `main` 一样宽 */
 }
 .tabs button {
   padding: 8px 20px; cursor: pointer; font: inherit; font-weight: 700;
@@ -383,7 +389,8 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 }
 .toolbar input[type=text] { max-width: 220px; }
 .toolbar select { width: auto; }
-.toolbar .grow { margin-left: auto; }
+/* 「筛出 x / y」那一小段（只有掉落页写，D68a）：靠右、不许在自己中间断行。 */
+.toolbar .grow { margin-left: auto; white-space: nowrap; }
 
 /* 「玩家仓库」工具条右端的「● 当前在线：N 人」（用户 2026-09-08）。
 
@@ -564,8 +571,16 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
   padding: 11px 34px 11px 14px; margin-bottom: 10px;
   background: #fff; border: 2px solid var(--line); border-radius: 10px;
 }
-.rule-row .who { display: flex; gap: 9px; align-items: center; }
-.rule-row .who .nmz { font-size: 12px; font-weight: 600; max-width: 130px; }
+/* ★ 材料那一格**定宽**（用户 2026-09-09，D68b）：这一行里只有它的宽度随名字变
+   （「青铜管」和「绿色小珠」差 16 px），后面的 数量 / 概率 / 开关 / 备注 就跟着
+   上下错位。156 = 图标格 42 + 间距 9 + 名字 105 —— 物品表里最长的材料类名字
+   「华尔兹加农炮卡片」在 600 12px 微软雅黑下是 96 px，全都放得下；再长的截成
+   省略号，鼠标停上去浮窗里有全名（`dropRow` 给整块挂了 `data-item`）。 */
+.rule-row .who { display: flex; gap: 9px; align-items: center; flex: 0 0 156px; }
+.rule-row .who .nmz {
+  font-size: 12px; font-weight: 600; flex: 1 1 auto; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 /* 出错时高亮那一张卡（服务端把下标写在错误里，前台定位过来） */
 .flash { animation: flash 1.6s ease-out; }
@@ -621,13 +636,15 @@ code {
   font-size: 10px; line-height: 1.25; text-align: center; color: var(--cocoa-soft);
   width: 100%; max-height: 2.5em; overflow: hidden;
 }
-.pick-empty { color: var(--cocoa-soft); padding: 30px; text-align: center; }
-/* ★ 弹窗里只有网格自己滚（用户 2026-09-06，D39）：搜索 / 类别 / 角色 /
-   上架状态那一条和换页栏钉住不动。★ 底下那条详情侧栏 2026-09-06 删了 ——
-   它和浮窗写的是同一批东西，而且「在不在卖」还是现问服务端的旧值。 */
+/* 「没有匹配的物品」那一行：选择器网格和配置页列表共用一个样子。 */
+.pick-empty, .list-empty { color: var(--cocoa-soft); padding: 30px; text-align: center; }
+/* ★ 弹窗里只有网格自己滚（用户 2026-09-06，D39）：搜索 / 角色 / 上架状态
+   那一条和两行分类标签（D68，原来是换页栏）钉住不动。★ 底下那条详情侧栏
+   2026-09-06 删了 —— 它和浮窗写的是同一批东西，而且「在不在卖」还是现问
+   服务端的旧值。 */
 #picker .panel-body { overflow: hidden; display: flex; flex-direction: column; }
 #picker .panel-body > .toolbar,
-#picker .panel-body > .pager { flex: 0 0 auto; }
+#picker .panel-body > .cat-tabs { flex: 0 0 auto; }
 #pickGrid { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 /* 网格自己滚（见上面 `#pickGrid`）⇒ 内容对不齐时靠上排，别在竖向摊开。 */
 .pick-grid { align-content: start; }
@@ -827,10 +844,11 @@ td .acts {
   display: flex; gap: 6px; flex-wrap: wrap;
   align-items: center; justify-content: flex-end;
 }
-/* 换页栏夹在筛选条和列表之间（四个配置页 / 选择物品弹窗 / 数据备份 /
-   玩家仓库都是这个位置）：上面靠筛选条自己的下边距隔开，下面再留 12px
-   才接列表。原来是 `margin-top: 10px` 叠在筛选条的 14px 上、底下又贴着
-   列表 —— 上远下近（用户 2026-09-07）。 */
+/* 换页栏夹在筛选条和列表之间（数据备份 / 玩家仓库两页还在用；四个配置页
+   和选择物品弹窗的换页栏 2026-09-09 删了，那个位置换成两行分类标签，D68）：
+   上面靠筛选条自己的下边距隔开，下面再留 12px 才接列表。原来是
+   `margin-top: 10px` 叠在筛选条的 14px 上、底下又贴着列表 —— 上远下近
+   （用户 2026-09-07）。 */
 .pager {
   display: flex; gap: 10px; align-items: center; margin: 0 0 12px;
 }
