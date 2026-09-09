@@ -91,8 +91,13 @@
 # 运行时输出和本地存档
 # logs 可能含明文登录口令、内网 IP、MAC、抓包及大量截图。
 # accounts.json 是可变的本地账号/游戏存档，程序缺失时会自动创建。
+#
+# logs_client_crash 是玩家客户端闪退后自动传上来的崩溃现场（crashstore.py）。
+# 里面是内存转储和客户端日志，一份十几 MB，而且**含玩家机器的信息**，
+# 和 logs/ 一样绝不进仓库。
 # ---------------------------------------------------------------------------
 /logs/
+/logs_client_crash/
 /server/data/accounts.json
 /server/data/accounts.json.*.tmp
 # tickets.json：会话 12 中途试过把票据落盘，用户拍板改回纯内存（D097），

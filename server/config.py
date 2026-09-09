@@ -135,6 +135,31 @@ DEFAULT_LOG_RETENTION_DAYS = 3
 #: 保留天数的上限。10 年 —— 再大就等于「不清理」，那该填 0 而不是填 99999。
 MAX_LOG_RETENTION_DAYS = 3650
 
+#: 客户端崩溃日志自动上传（`crashwatch.py` / `crashstore.py`）。
+#: ★ 这一组里 **`crash_upload` 是客户端侧用的**（本机中继进程读它），
+#:   另外三个是**服务端侧用的**（收包那一头读它们）—— 和 `server_address`
+#:   与 `local_register_port` 的分工一个道理，同一份配置两边共用（铁律 8）。
+#:
+#: `crash_upload`：玩家在登录界面选「远程服务器」时，客户端崩了要不要自动把
+#: 崩溃现场传给那台服务器。0 = 不传（崩溃现场仍然留在本机）。
+DEFAULT_CRASH_UPLOAD = 1
+
+#: 单个崩溃包的大小上限（MB）。0 = 不接收任何上传。
+#: 默认 64：实测一份 35 MB 的 minidump 压完约 8.6 MB，64 MB 给日志留足了余量，
+#: 又不至于让一个请求把云主机的磁盘吃掉一大块。
+DEFAULT_CRASH_MAX_UPLOAD_MB = 64
+
+#: 大小上限的上限。1 GB —— 再大就不该走 HTTP 了。
+MAX_CRASH_UPLOAD_MB = 1024
+
+#: 同一个 IP 两次崩溃上传之间的最小间隔（秒）。0 = 不限制。
+#: 和注册冷却同一个口径、同一个默认值（20 秒）。
+DEFAULT_CRASH_UPLOAD_COOLDOWN_SECONDS = 20
+
+#: 收到的崩溃包保留多少天（`logs_client_crash/`）。0 = 永不自动删除。
+#: 用户 2026-09-09 定的默认值：3 天。
+DEFAULT_CRASH_KEEP_DAYS = 3
+
 #: 数据自动备份（管理页「数据备份」标签页，V0.3商店）：每天 `backup_time`
 #: 把 `server/data/*.json` 拷一份到 `server/data/backups/`，早于
 #: `backup_keep_days` 天的备份自动删掉（0 = 永不自动删除，和日志保留天数
@@ -181,6 +206,12 @@ DEFAULTS = {
     "backup_enabled": DEFAULT_BACKUP_ENABLED,
     "backup_time": DEFAULT_BACKUP_TIME,
     "backup_keep_days": DEFAULT_BACKUP_KEEP_DAYS,
+    # ★ 客户端崩溃日志自动上传。crash_upload 是**客户端侧**读的，
+    #   其余三个是**服务端侧**读的（见上面那组常量的注释）。
+    "crash_upload": DEFAULT_CRASH_UPLOAD,
+    "crash_max_upload_mb": DEFAULT_CRASH_MAX_UPLOAD_MB,
+    "crash_upload_cooldown_seconds": DEFAULT_CRASH_UPLOAD_COOLDOWN_SECONDS,
+    "crash_keep_days": DEFAULT_CRASH_KEEP_DAYS,
 }
 
 #: 值要按**端口**解析的键（1~65535）。
@@ -188,13 +219,17 @@ _PORT_KEYS = ("server_register_port", "local_register_port", "proxy_port")
 
 #: 值要按**秒数**解析的键（0 ~ MAX_REGISTER_COOLDOWN_SECONDS，0 = 关闭）。
 #: 和端口分开是因为两者的合法区间不一样：秒数允许 0，端口不允许。
-_SECOND_KEYS = ("register_cooldown_seconds",)
+_SECOND_KEYS = ("register_cooldown_seconds", "crash_upload_cooldown_seconds")
 
 #: 值要按**天数**解析的键（0 ~ MAX_LOG_RETENTION_DAYS，0 = 关闭）。
-_DAY_KEYS = ("log_retention_days", "backup_keep_days")
+_DAY_KEYS = ("log_retention_days", "backup_keep_days", "crash_keep_days")
 
 #: 值要按**开关**解析的键（0/1；也认 on/off、true/false、yes/no）。
-_FLAG_KEYS = ("udp_sync", "backup_enabled")
+_FLAG_KEYS = ("udp_sync", "backup_enabled", "crash_upload")
+
+#: 值要按**兆字节**解析的键（0 ~ MAX_CRASH_UPLOAD_MB，0 = 不接收）。
+#: 单独一组是因为上限和秒数 / 天数都不一样。
+_MEGABYTE_KEYS = ("crash_max_upload_mb",)
 
 #: 值要按**每天几点**解析的键（`HH:MM`，本地时间）。
 _TIME_KEYS = ("backup_time",)
@@ -327,6 +362,9 @@ def parse_text(text: str):
             values[key] = _clean_flag(value, key, warnings)
         elif key in _TIME_KEYS:
             values[key] = _clean_time(value, key, warnings)
+        elif key in _MEGABYTE_KEYS:
+            values[key] = _clean_count(value, key, warnings,
+                                       MAX_CRASH_UPLOAD_MB)
         elif key in _REDUNDANCY_KEYS:
             values[key] = _clean_count(value, key, warnings,
                                        MAX_UDP_SYNC_REDUNDANCY)
@@ -525,6 +563,42 @@ udp_sync_redundancy = 2
 backup_enabled = 1
 backup_time = 04:00
 backup_keep_days = 7
+
+# ---------------------------------------------------------------------------
+# 客户端崩溃后自动上传诊断日志
+#
+# 【下面这一项是玩家这边用的】
+# crash_upload —— 在登录界面选了「远程服务器」，游戏中途崩溃（闪退）时，
+# 要不要自动把这次崩溃的现场打包上传给那台服务器，方便服主查原因。
+#
+#   上传的内容：game_patched\\Dump\\ 里【这一次】的崩溃报告和内存转储、
+#               BigShot.rpt 的【最后一段】、game_patched\\Debug\\ 当天的日志、
+#               以及 logs\\ 里本次运行的日志。压缩后通常 10 MB 上下。
+#   ⚠ 内存转储是游戏进程当时的内存快照，理论上可能含有你刚输入的内容
+#     （包括密码）。它只会发给你自己在上面那行 server_address 里填的服务器。
+#     不想传就把这里改成 0 —— 崩溃现场仍然会留在你自己电脑的 game_patched\\Dump\\ 里。
+#
+#   选「本机服务器」时【永远不上传】（本机中继根本没参与，无从上传）。
+#   上传失败会隔几秒重试，连续失败就先攒在 logs\\ 里，下次启动时再补传。
+# ---------------------------------------------------------------------------
+crash_upload = 1
+
+# ---------------------------------------------------------------------------
+# 【下面三项是开服那边用的】收到的崩溃包存在 logs_client_crash\\ 下，
+# 每收到一份新建一个子目录，目录名是「账号_安装码_崩溃时刻」，
+# 这样按名称排序时同一个客户端的历次崩溃会挨在一起。收到的压缩包不自动解压。
+#
+#   crash_max_upload_mb           —— 单个崩溃包的大小上限（MB）。超过直接拒收。
+#                                    填 0 = 不接收任何崩溃上传。
+#   crash_upload_cooldown_seconds —— 同一个 IP 两次上传之间至少隔多少秒。
+#                                    填 0 = 不限制。记录只在内存里，重启就清空。
+#   crash_keep_days               —— 崩溃包保留多少天，过期自动删。
+#                                    清理时机和上面的日志清理一样（启动时一次 +
+#                                    每天凌晨 4 点一次）。填 0 = 永不自动删除。
+# ---------------------------------------------------------------------------
+crash_max_upload_mb = 64
+crash_upload_cooldown_seconds = 20
+crash_keep_days = 3
 
 # ---------------------------------------------------------------------------
 # 说明：

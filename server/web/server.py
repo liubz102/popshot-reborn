@@ -21,6 +21,12 @@
                                                             -> {ok, message}
     POST /api/export      {username, password}            -> {ok, message, save}
     POST /api/import      {username, password, save}      -> {ok, message}
+    POST /api/crash-report  <zip 原始字节>                -> {ok, message, saved}
+
+★ `/api/crash-report` 和上面那几个**完全不是一路货**：它的 body 是几 MB 到
+几十 MB 的二进制 zip，不走 `_read_body()`（那里有 1 MB 的全局上限），也不解析
+JSON。元数据放在 `X-Crash-*` 请求头里。发送那一头在 `server/crashwatch.py`，
+落地那一头在 `server/crashstore.py`。
 
 ★ `/admin` 开头的那一组（管理页，V0.3商店 M8）在 `web/admin.py` 里，
 和这里**共用同一个端口、同一个 `Handler`**。路由清单见那个文件的开头。
@@ -55,6 +61,7 @@ from account_store import (AUTH_MESSAGES, AUTH_OK, NICKNAME_RULE_TEXT,
                            USERNAME_RULE_TEXT, AccountError, AccountStore)
 import asynclog
 import config as server_config
+import crashstore
 import eventlog
 from netlisten import create_listener
 #: 管理页 `/admin`（V0.3商店 M8）。和注册页共用本文件的 `Handler` 和端口。
@@ -70,7 +77,16 @@ INDEX_PATH = os.path.join(HERE, "index.html")
 
 #: 请求体上限。注册表单几百字节，存档几 KB；给 1 MB 足够，
 #: 又不至于让人一发请求就把服务端的内存吃掉。
+#: ★ 崩溃包上传（`/api/crash-report`）**不受这一条管** —— 它一份就有十几 MB，
+#:   走的是流式落盘那条路，上限另有一个 `crash_max_upload_mb`。
 MAX_BODY_BYTES = 1 << 20
+
+#: 崩溃包上传的路径。★ 在 `do_POST()` 的**最前面**拦，比 `_read_body()` 还早。
+CRASH_UPLOAD_PATH = "/api/crash-report"
+
+#: 流式收包时一次读多少。64 KiB：小到不会让一个请求占住大块内存，
+#: 大到不至于把 10 MB 的包拆成几十万次系统调用。
+CRASH_CHUNK_BYTES = 64 * 1024
 
 
 def _as_ip(text):
@@ -243,6 +259,16 @@ class Handler(admin.AdminRoutes, http.server.BaseHTTPRequestHandler):
     #: 注册频率限制器（按 IP，只在内存里）。同样由 `make_server` 塞进来。
     limiter: RegisterRateLimiter = None
 
+    #: 崩溃包落地（`crashstore.Store`）。`None` = 这台服务器不收崩溃日志。
+    crash_store = None
+
+    #: 崩溃包上传的频率限制器。和注册那个是**两套**：注册的口径是「成功才记」，
+    #: 这里的口径是「传上来就记」—— 崩溃包本来就该是稀客，连着来就是不正常。
+    crash_limiter: RegisterRateLimiter = None
+
+    #: 单个崩溃包的字节上限（`crash_max_upload_mb` 换算过的）。0 = 不接收。
+    crash_max_bytes = 0
+
     # ------------------------------------------------------------ 客户端身份
     def client_ip(self):
         """这次请求真正的客户端 IP（挂在 frp / nginx 后面也对）。
@@ -349,6 +375,12 @@ class Handler(admin.AdminRoutes, http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
+        # ★ 崩溃包上传必须在 `_read_body()` **之前**拦下来：它的 body 有十几 MB，
+        #   而 `_read_body()` 会先撞上 1 MB 的 MAX_BODY_BYTES，还会把整个包
+        #   读进内存。这条路自己流式落盘。
+        if path == CRASH_UPLOAD_PATH:
+            self._api_crash_report()
+            return
         try:
             raw = self._read_body()      # 先读干净，再谈路由（见 _read_body）
         except ValueError as error:
@@ -511,6 +543,136 @@ class Handler(admin.AdminRoutes, http.server.BaseHTTPRequestHandler):
                         f"{summary}{live}")
 
 
+    # ------------------------------------------------- 崩溃日志上传（客户端 → 服务端）
+    def _crash_fail(self, status, message, detail="", pending=0):
+        """拒收。回一句人话，然后**关掉这条连接**（不 keep-alive）。
+
+        HTTP/1.1 + keep-alive 下「不读干净就回包」会让残留 body 被当成下一个
+        请求行（见 `_read_body` 的注释）—— 拒收时我们干脆不复用这条连接，
+        所以那个问题不存在。
+
+        ★ 但**还是要把已经在路上的 body 读掉一部分**：一个字节都不读就关，
+        对方多半正卡在 `send` 上、被 RST 打断，**连我们刚回的那句「包太大」
+        都读不到**，这条错误信息就白说了。
+
+        上限取 `crash_max_bytes` —— 也就是「我们本来就愿意收的那个大小」。
+        读多少完全由发的人决定，没上限等于陪着他灌；而取这个数意味着
+        **不多花一分本来不肯花的成本**。超出这么多的，连接直接断，
+        对方看到的是连接错误而不是 413（我们自己的上传器在发之前就会
+        自己量一次大小，走不到这里）。
+        """
+        self.close_connection = True
+        if detail:
+            self.log_message("崩溃日志上传被拒: %s（%s）", message, detail)
+        self._reply(False, message, status=status)
+        left = min(int(pending or 0), max(0, self.crash_max_bytes))
+        while left > 0:
+            try:
+                chunk = self.rfile.read(min(CRASH_CHUNK_BYTES, left))
+            except OSError:
+                break
+            if not chunk:
+                break
+            left -= len(chunk)
+
+    def _api_crash_report(self):
+        """收一份崩溃现场压缩包。发送那一头是 `server/crashwatch.py`。
+
+        **只做必须同步的那一段**：把字节收进 `.tmp-<id>/`、边收边算 sha256、
+        回包。落位（`os.replace`）、写 `receipt.json`、清理全甩给
+        `crashstore.Store` 的后台线程 —— 这个进程里还跑着认证服和游戏服，
+        请求线程一等磁盘，同进程的战斗转发就跟着等（V0.3bot D109 / §150）。
+        """
+        import hashlib
+
+        # 先把声明的长度读出来 —— 每一条拒收路径都要拿它决定「还愿意读掉多少」。
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+
+        store = self.crash_store
+        if store is None or self.crash_max_bytes <= 0:
+            self._crash_fail(403, "这台服务器没有开启崩溃日志接收",
+                             pending=length)
+            return
+
+        client_ip = self.client_ip()
+        wait = self.crash_limiter.retry_after(client_ip)
+        if wait > 0:
+            self._crash_fail(429, f"上传太频繁，请等 {wait} 秒后再试",
+                             f"ip={client_ip}", pending=length)
+            return
+
+        crash_id = (self.headers.get("X-Crash-Client") or "").strip()
+        want_sha = (self.headers.get("X-Crash-Sha256") or "").strip().lower()
+        try:
+            crashstore.check_id(crash_id)
+        except crashstore.CrashUploadError as error:
+            # ★ 故意不把 crash_id 原样回给对方，也不拿它拼日志之外的任何东西。
+            self._crash_fail(error.status, error.message, repr(crash_id)[:80],
+                             pending=length)
+            return
+
+        if length <= 0:
+            self._crash_fail(400, "缺少 Content-Length")
+            return
+        if length > self.crash_max_bytes:
+            self._crash_fail(413, "崩溃包太大（上限 %d MB）"
+                                  % (self.crash_max_bytes // 1048576),
+                             f"{length} 字节", pending=length)
+            return
+
+        tmp = name = None
+        written = 0
+        try:
+            tmp, name = store.begin(crash_id)
+            digest = hashlib.sha256()
+            with open(os.path.join(tmp, crash_id + ".zip"), "wb") as fp:
+                while written < length:
+                    chunk = self.rfile.read(min(CRASH_CHUNK_BYTES,
+                                                length - written))
+                    if not chunk:
+                        raise ConnectionError("上传中断")
+                    fp.write(chunk)
+                    digest.update(chunk)
+                    written += len(chunk)
+            got_sha = digest.hexdigest()
+        except crashstore.CrashUploadError as error:
+            store.abandon(tmp)
+            self._crash_fail(error.status, error.message,
+                             pending=length - written)
+            return
+        except (OSError, ConnectionError) as error:
+            store.abandon(tmp)
+            self._crash_fail(400, "上传没有完成", repr(error))
+            return
+
+        if want_sha and want_sha != got_sha:
+            # 校验和是**边收边算**的，所以对不上仍然能当场回 400，不用等落位。
+            store.abandon(tmp)
+            self._crash_fail(400, "校验和对不上，包在路上坏了")
+            return
+
+        receipt = {
+            "id": name,
+            "sent_id": crash_id,
+            "bytes": written,
+            "sha256": got_sha,
+            "sha256_verified": bool(want_sha),
+            "from": client_ip,
+            "received_at": crashstore.format_time(),
+            "crash_time_text": (self.headers.get("X-Crash-Time") or "").strip(),
+        }
+        if not store.submit(tmp, name, receipt):
+            self._crash_fail(503, "服务器正忙，稍后再传")
+            return
+        self.crash_limiter.mark(client_ip)
+        eventlog.online(f"崩溃日志 ✓ 收到 {name}（{written / 1048576.0:.1f} MB）"
+                        f" ip={self.client_label()}")
+        self._reply(True, "收到", saved=name)
+
+
 class _PreboundHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     """socket 由 `netlisten.create_listener` 建好后交进来。
 
@@ -537,13 +699,18 @@ class _PreboundHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def make_server(port, accounts, host="::",
                 cooldown=server_config.DEFAULT_REGISTER_COOLDOWN_SECONDS,
-                backup=None):
+                backup=None, crash=None,
+                crash_max_mb=server_config.DEFAULT_CRASH_MAX_UPLOAD_MB,
+                crash_cooldown=(
+                    server_config.DEFAULT_CRASH_UPLOAD_COOLDOWN_SECONDS)):
     """建好 HTTP 服务器但不开始服务，方便测试拿到真实端口。
 
     `cooldown` = 注册冷却秒数（`server.config` 的 `register_cooldown_seconds`）。
     默认值就是「开着」—— 漏传参数时应当**多限一点**而不是不限。
     `backup` = `databackup.BackupService`（管理页「数据备份」页用）；
     不传时那几个接口回「备份功能没有启动」。
+    `crash` = `crashstore.Store`；不传时 `/api/crash-report` 一律回 403
+    （同上：漏传参数时应当**不收**，而不是默默往磁盘上写）。
     """
     handler = type("BoundHandler", (Handler,),
                    {"accounts": accounts,
@@ -552,15 +719,23 @@ def make_server(port, accounts, host="::",
                     # 走（重启即失效），限速表也一样（同 `RegisterRateLimiter`）。
                     "admin_sessions": admin.AdminSessions(),
                     "admin_limiter": admin.LoginRateLimiter(),
-                    "backup": backup})
+                    "backup": backup,
+                    "crash_store": crash,
+                    "crash_limiter": RegisterRateLimiter(crash_cooldown),
+                    "crash_max_bytes": max(0, int(crash_max_mb)) * 1048576})
     return _PreboundHTTPServer(create_listener(host, port), handler)
 
 
 def serve(port, accounts, host="::", ready=None,
           cooldown=server_config.DEFAULT_REGISTER_COOLDOWN_SECONDS,
-          backup=None):
+          backup=None, crash=None,
+          crash_max_mb=server_config.DEFAULT_CRASH_MAX_UPLOAD_MB,
+          crash_cooldown=(
+              server_config.DEFAULT_CRASH_UPLOAD_COOLDOWN_SECONDS)):
     """阻塞地提供注册页服务。`app.py` 会把它丢进一个线程。"""
-    httpd = make_server(port, accounts, host, cooldown, backup=backup)
+    httpd = make_server(port, accounts, host, cooldown, backup=backup,
+                        crash=crash, crash_max_mb=crash_max_mb,
+                        crash_cooldown=crash_cooldown)
     if ready is not None:
         ready.set()
     httpd.serve_forever()

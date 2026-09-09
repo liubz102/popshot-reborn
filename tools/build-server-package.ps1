@@ -14,6 +14,7 @@
         ├─ runtime-win/python/        Windows 独立运行时
         ├─ runtime-linux/*.tar.gz     Linux 独立运行时（可选，第一次启动时自解）
         ├─ logs/
+        ├─ logs_client_crash/         玩家客户端闪退后自动传上来的崩溃现场
         ├─ BUILD.ver / README.md
 
     用法：
@@ -294,6 +295,9 @@ SHA-256   $sha
     }
 
     New-Item -ItemType Directory -Path (Join-Path $OutputDirectory 'logs') -Force | Out-Null
+    # 玩家客户端闪退后自动传上来的崩溃现场落在这儿（server\crashstore.py）。
+    # 包里只放一个空目录 —— 里面的东西是运行时才有的，和 logs\ 一个道理。
+    New-Item -ItemType Directory -Path (Join-Path $OutputDirectory 'logs_client_crash') -Force | Out-Null
 
     # --- 5. server-ClientFilter.config + BUILD.ver --------------------------
     Write-Host '  [5/6] server-ClientFilter.config + BUILD.ver'

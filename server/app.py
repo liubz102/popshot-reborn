@@ -41,6 +41,7 @@ import authserver
 #   连接。在这里显式 import 一次，把它变成**启动就炸**。
 import bot                                                     # noqa: F401
 import config as server_config
+import crashstore
 import databackup
 import eventlog
 import gameserver
@@ -517,16 +518,33 @@ def main(argv=None):
         from web import server as web_server
         cooldown = (args.register_cooldown if args.register_cooldown is not None
                     else cfg["register_cooldown_seconds"])
+        # 客户端崩溃日志接收（V0.3商店）。★ 落位和清理都在它自己的后台线程上
+        # 做 —— 这个进程里还跑着认证服和游戏服，收包的线程一等磁盘，
+        # 同进程的战斗转发就跟着等（D109 / §150 是同一条教训）。
+        crash_max_mb = cfg["crash_max_upload_mb"]
+        crash = crashstore.Store(keep_days=cfg["crash_keep_days"], log=log)
+        crash.start()
+        atexit.register(crash.stop)
         _start("web", web_server.serve,
                kwargs={"port": web_port, "accounts": accounts,
                        "host": args.host, "cooldown": cooldown,
-                       "backup": backup},
+                       "backup": backup, "crash": crash,
+                       "crash_max_mb": crash_max_mb,
+                       "crash_cooldown": cfg["crash_upload_cooldown_seconds"]},
                port=web_port)
         log(f"注册页   {describe_listen(args.host, web_port)}"
             f" —— 本机打开 http://127.0.0.1:{web_port}/")
         log("注册冷却 " + (f"{cooldown} 秒（同一 IP 注册成功后要等这么久；"
                           f"注册页上的按钮也锁这么久）" if cooldown
                           else "已关闭（register_cooldown_seconds = 0）"))
+        if crash_max_mb > 0:
+            keep = cfg["crash_keep_days"]
+            log(f"崩溃日志 收在 {crashstore.DIRNAME}\\（单包上限 "
+                f"{crash_max_mb} MB，同一 IP 冷却 "
+                f"{cfg['crash_upload_cooldown_seconds']} 秒，"
+                + (f"保留 {keep} 天）" if keep > 0 else "永不自动删除）"))
+        else:
+            log("崩溃日志 不接收（crash_max_upload_mb = 0）")
     else:
         log("注册页   已关闭（--no-web）")
 

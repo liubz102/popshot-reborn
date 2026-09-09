@@ -2064,3 +2064,90 @@ LF 处断行（Format `0x100 = DT_NOCLIP`，没有 `DT_SINGLELINE`）。**代价
 
 ⚠ **可达性没查实**（`DashDamage` 会不会真以「目标 = 0」进 `0x492715 OnExplode`、
 在句柄表 `0x474225` 里登不登记，没查证）⇒ 补丁是**兜底**，不是复现过的 bug。
+
+---
+
+## §54 ★★★★★ `0x0103` **本身就是崩溃报告包**，而且客户端上报完会**把文件删掉**（✅实测，2026-09-09）
+
+原来记的是「客户端先把 `LastCrashReport.txt` 发上来，再发 `0x0103` 收尾」
+（V0.1 §44）。**不对。** `0x0103` 自己就是那一发：
+
+```text
+int32  有没有报告：0 = 没有，1 = 有
+int32  正文字节数
+byte[] Dump\LastCrashReport.txt 的正文，原样字节
+```
+
+证据（`logs/server-20260909-122222.out`）：12:09 那次登录的 `0x0103` 载荷 **1890 字节**
+= `int32(1) + int32(0x756=1878) + 正文`，而 1878 正是当时那个文件的大小；
+其余每次登录都是 **8 字节** 的 `int32(0)+int32(0)`。
+
+★★ **上报完客户端就把 `Dump\LastCrashReport.txt` 删了** —— 12:09 之后文件消失，
+`BigShot.rpt` 和 `.mdmp` 都不受影响。⇒ 那个文本是**一次性**的。
+`crashwatch` 因此在**客户端进程退出的那一刻**就把它读进内存（`read_crash_report`），
+打包时用内存里那份，不再读文件（`test_report_text_comes_from_memory_not_from_disk`）。
+
+★ 正文里换行是 `0d 0d 0a`：文件本身 CRLF，客户端又按文本模式读，`\n` 被二次转换。
+
+⚠ 澄清 V0.2 §208 的矛盾：那 14 份云端崩溃遥测来自**这一发**，不是 `0x0b01`
+（后者至今未观测）。`re/packet_api.md` 的 `0x0103` 一节已按本条重写。
+
+## §55 ★★★★ 崩溃现场三份文件的关系，以及「哪一份属于这一次」怎么定
+
+| 文件 | 性质 | 这一次的那份怎么取 |
+|---|---|---|
+| `Dump/LastCrashReport.txt` | **只有最后一次**，下次登录被上报并删除 | 就是它本身 |
+| `Dump/BigShot<版本>N<序号>.mdmp` | 累积，`.gitignore` 注释说攒到过 249 MB | ★ 读 `LastCrashReport.txt` 里的 `Dump File Name:` 那一行 |
+| `BigShot.rpt` | **追加式**，一份文件里躺着历次崩溃（本机现有 13 段，跨 4 个不同目录） | 按 `==================   logged at ` 切块**取最后一块** |
+
+★ `Dump File Name:` 写的是**绝对路径**，而 `BigShot.rpt` 里躺着别的机器 / 别的目录
+留下的历史路径（`D:\work\popshot\`、`D:\git\popshot-reborn\develop\3_Shop_Craft\`）。
+⇒ **只取 basename，在本机的 `Dump\` 里找**，不要直接用那个路径。
+
+`logged at` 的格式是 `MM/DD/YY, HH:MM:SS`（美式）。认不出时退回文件 mtime ——
+**绝不拿一个畸形字符串去拼目录名**。
+
+★ 读这两份文本必须 `encoding="latin-1", newline=""`：原版是按 **ANSI（CP936）** 写的
+（UTF-8 解码会抛异常），而通用换行会把 `\r\n` 悄悄变成 `\n`，包里那份就不再和玩家
+机器上那份逐字节相同了。
+
+## §56 ★★★ 认「哪个进程是本次客户端」和「它死了没有」，事件都是现成的
+
+* **PID**：中继 `accept` 到 `127.0.0.1:<peer>` 的连接后，`GetExtendedTcpTable`
+  (`AF_INET=2`, `TCP_TABLE_OWNER_PID_ALL=5`) 按 (本地口=peer, 远端口=中继监听口)
+  查 owning PID。表里端口是**网络字节序塞在 DWORD 低 16 位**。
+* **死了没有**：`OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION)` +
+  `WaitForSingleObject(INFINITE)`。ctypes 调用期间放开 GIL，干等着不挡别的线程。
+* **会话起点**：同一个句柄 `GetProcessTimes`，FILETIME 减 `116444736000000000`
+  再除 `1e7` = Unix 时刻。**挑「本次运行的日志」的那条边界就是它**，不是拍的时间窗。
+* **退出码**：同一个句柄 `GetExitCodeProcess`（崩溃时是 `0xC0000005` 之类）。
+
+★★ **进程对象被置位 ⇒ 进程已完全终止 ⇒ 它所有文件句柄都被 OS 关闭**
+⇒ `.mdmp` / `.rpt` / `LastCrashReport.txt` 必定写完且没被占着。
+**这条排除了「读到半截文件」的竞态，所以整条链上一个 `sleep` 都不需要。**
+
+`hook/bsloader.c:383` 早就在做同一件事（`WaitForSingleObject` + `GetExitCodeProcess`），
+但它把结果只打进 `logs/bsloader.out`，没人读。
+
+## §57 ★★★ `logs/bshook_*_pid<PID>.log` 的文件名里带游戏进程 PID
+
+`hook/bshook.c:4956` 的格式串是 `bshook_%Y%m%d_%H%M%S_pid%u.log`。
+⇒ 「挑出本次会话的客户端日志」是**精确匹配**，不用按时间窗猜。
+
+同理 `game_patched/UserConfig.ini` 里有 `LastLoginId=<上次登录框里输的内容>`：
+⚠ **它不是注册账号名** —— 原版**登录失败也会写**，内容可以是中文、空格、`../`、`*:|`，
+而且是 ANSI 编码。当客户端 ID 用之前必须过白名单清洗（见 D59）。
+
+## §58 ★★ minidump 的压缩比实测（2026-09-09，本机那份 35.2 MB 的 `BigShotV0311N001.mdmp`）
+
+| 方式 | 结果 | 用时 |
+|---|---|---|
+| `zlib` level 6 | 8.6 MB | 0.4 s |
+| `zlib` level 9 | 8.4 MB | 1.1 s |
+| `lzma` preset 6 | 5.7 MB | 7.7 s |
+
+⇒ 取 `ZIP_DEFLATED` + `compresslevel=6`：lzma 只多省 2.9 MB 却要多花 7 秒 CPU。
+
+整包实测（mdmp 35.2 MB + 崩溃那局的 bshook 日志 11 MB + 其余）
+→ **11.6 MB / 0.5 秒**；本机环回上传 **0.36 秒（32 MB/s）**。
+

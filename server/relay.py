@@ -47,6 +47,7 @@ from dataclasses import dataclass
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import asynclog
 import config as server_config
+import crashwatch
 import udpsync
 from netlisten import create_listener, tune_stream
 
@@ -77,6 +78,16 @@ CONNECT_TIMEOUT = 6.0
 VERBOSE = False
 _seq = 0
 _seq_lock = threading.Lock()
+
+#: 崩溃日志上传的看门人（`crashwatch.py`）。默认是一个**关着的**占位对象，
+#: `main()` 按 `server.config` 换成真的。
+#:
+#: ★ 它挂在中继上而不是挂在本机服务端上，是因为「玩家选的是远程服务器」这件事
+#: 只有中继知道 —— 而且是**由构造知道**的：本机模式下 `bshook` 压根不连中继
+#: （见本文件开头那张图），所以中继收到过连接就等价于「这一局是联机」。
+#: 反过来让服务端按「连接是不是从 loopback 来的」去猜，V0.2 **D079 明确禁止**。
+CRASH_WATCHER = crashwatch.CrashWatcher(host="", port=0, connect=None,
+                                        enabled=False)
 
 
 class ProxyError(OSError):
@@ -343,7 +354,8 @@ def _pump(src, dst, tag, counter):
         vlog(f"{tag} 方向结束，共 {counter[0]} 字节")
 
 
-def handle(client, addr, target_host, target_port, label, proxy=None):
+def handle(client, addr, target_host, target_port, label, proxy=None,
+           local_port=0):
     global _seq
     with _seq_lock:
         _seq += 1
@@ -370,6 +382,12 @@ def handle(client, addr, target_host, target_port, label, proxy=None):
         return
     route = "直连" if proxy is None else proxy.route
     log(f"#{seq} ✓ {label}服 {addr[0]}:{addr[1]} → {shown}:{target_port}（{route}）")
+    # ★ 「有客户端经中继连出去了」= 玩家选的是**远程服务器**（本机模式下
+    #   bshook 压根不连中继）。崩溃日志上传只在这种情况下才发生 ——
+    #   这是**由构造保证**的，不是判出来的（D079 禁止按 loopback 猜模式）。
+    #   ★★ 这一句必须是 O(1) 的入队：后面紧接着就是 `_pump` 转发游戏字节，
+    #      在这里多花的每一微秒都直接压在玩家的延迟上。
+    CRASH_WATCHER.note_client(addr, local_port)
     remote.settimeout(None)
     client.settimeout(None)
     # 两个方向都要关 Nagle：`remote` 在 connect_remote 里已经关过，这里补上
@@ -400,7 +418,8 @@ def serve_one(local_port, target_host, target_port, label, ready=None, proxy=Non
     while True:
         client, addr = listener.accept()
         threading.Thread(target=handle,
-                         args=(client, addr, target_host, target_port, label, proxy),
+                         args=(client, addr, target_host, target_port, label,
+                               proxy, local_port),
                          daemon=True).start()
 
 
@@ -850,6 +869,22 @@ def main():
         return 1
     start_udp_sync(target, proxy=proxy, enabled=bool(cfg["udp_sync"]),
                    redundancy=cfg["udp_sync_redundancy"])
+
+    # 客户端崩溃后自动上传诊断日志（V0.3商店）。★ 出站连接复用本文件的
+    # `connect_remote`，所以 SOCKS5 / HTTP CONNECT 代理自动生效 ——
+    # 崩溃包和游戏流量走的是同一条出口。
+    global CRASH_WATCHER
+    CRASH_WATCHER = crashwatch.CrashWatcher(
+        host=target, port=cfg["server_register_port"],
+        connect=lambda host, port: connect_remote(host, port, proxy),
+        enabled=bool(cfg["crash_upload"]),
+        max_bytes=cfg["crash_max_upload_mb"] * 1048576,
+        keep_days=cfg["crash_keep_days"], log=log)
+    CRASH_WATCHER.start()
+    if cfg["crash_upload"]:
+        log(f"崩溃上传 开着：客户端闪退时把崩溃现场传到 "
+            f"{server_config.http_host(target)}:{cfg['server_register_port']}"
+            f"（选「本机服务器」时不传；server.config 的 crash_upload = 0 可关掉）")
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
