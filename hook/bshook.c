@@ -2633,6 +2633,277 @@ static int try_patch_sum_rect_guard(void)
     return 1;
 }
 
+/* -------------------------------------------------------------------------- */
+/* ★ 「溅射范围加成」提示的空指针闪退（V0.3 合成与商店 §47 / D55）            */
+/*                                                                            */
+/*   `Projectile::OnExplode`（0x492715）处理一发 `rpExplode` 的最后一步是叫   */
+/*   虚表槽 +0x12c = 0x47e776（this=弹体，arg0=命中的角色指针，arg1=flags，    */
+/*   arg2=爆炸点）画两种加成提示：flags 0x20「HEAD SHOT!」、                  */
+/*   flags 0x200「ESPERAN SPLASH!」（= 射手穿的 IncSplashRange 装备那道 15%   */
+/*   门开了，0x47e76b 置位）。目标句柄查不到（`+4` = 0：打空 / 打地形）时      */
+/*   arg0 是 NULL，而两支的判空不对称：                                       */
+/*                                                                            */
+/*     0047e79d  cmp edi, esi ; je 0x47e9be     ; 头射那一支：没目标就不画     */
+/*     0047e9be  test byte [ebp+0xd], 2         ; flags & 0x200 ?              */
+/*     0047e9c8  [[0x72e320]] == 2 ?            ; 中国区 -> 0x47ea21           */
+/*     0047e9d3  韩国区：文字画在爆炸点，不碰目标 —— 没事                       */
+/*     0047ea21  中国区：取图 Images/Chinese/Img…（有目标才有地方挂）          */
+/*     0047ea6c  mov eax, [edi] ; call [eax+8]  ; ★★ edi = NULL -> 读 0 闪退   */
+/*                                                                            */
+/*   自己发的 `rpExplode` 也会本地回环处理（V0.2 §151 的 0x405a5d），所以     */
+/*   射手自己先崩；服务端在转发时改 flags 救不了他，而且 0x200 在收方还决定    */
+/*   溅射范围倍率（0x492785），不能抹。只能在客户端补那一个判空：               */
+/*                                                                            */
+/*   0x47ea21 头 5 字节（push 7; lea eax,[ebp+0xc] —— 正好 5 字节，都不带      */
+/*   相对地址）换成 E9 跳 detour：edi 为空就直接走函数尾 0x47eb0e（和          */
+/*   0x47e9c2 那条 je 去的同一个出口，中间没有多压栈），否则补回两条原指令      */
+/*   跳回 0x47ea26。表现：打空的那一发不画「溅射加成」图，其余一字不改。        */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_SPLASH_VISUAL_CRASH=1 保留原版行为（闪退复现 / 对照用）。  */
+/* -------------------------------------------------------------------------- */
+#define SPLASH_VISUAL_VA        0x0047EA21u
+#define SPLASH_VISUAL_SIG_LEN   17
+static const unsigned char SPLASH_VISUAL_SIG[SPLASH_VISUAL_SIG_LEN] = {
+    0x6A, 0x07,                         /* push 7                            */
+    0x8D, 0x45, 0x0C,                   /* lea  eax, [ebp+0xC]               */
+    0x50,                               /* push eax                          */
+    0xFF, 0x35, 0xA0, 0x9A, 0x6E, 0x00, /* push [0x6e9aa0]                   */
+    0xE8, 0x8E, 0x15, 0x00, 0x00        /* call 0x47ffc0（取第 7 号图片名）  */
+};
+
+/* detour 里要用的立即数不带后缀（MSVC 内联汇编不吃 0x…u 这种写法） */
+#define SPLASH_VISUAL_RETURN_TO 0x0047EA26   /* 补回两条原指令后接着跑        */
+#define SPLASH_VISUAL_EXIT      0x0047EB0E   /* 函数尾：mov ecx,[ebp-0xC] … ret 0xC */
+
+static __declspec(naked) void splash_visual_guard_detour(void)
+{
+    __asm {
+        test edi, edi                       /* edi = 命中的角色指针（arg0） */
+        jz   svg_skip
+        push 7                              /* 被偷走的两条原指令，逐条补回 */
+        lea  eax, [ebp + 0xC]
+        push SPLASH_VISUAL_RETURN_TO
+        ret
+    svg_skip:
+        push SPLASH_VISUAL_EXIT             /* 没有目标：不画，走原有出口 */
+        ret
+    }
+}
+
+static volatile LONG g_splash_visual_patched = 0;
+
+static int splash_visual_crash_keep_original(void)
+{
+    /* 语义和 ime_crash_fix_keep_original() 一样：设了才是「保留原版」。 */
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_SPLASH_VISUAL_CRASH", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_patch_splash_visual_guard(void)
+{
+    unsigned char *p = (unsigned char *)SPLASH_VISUAL_VA;
+    DWORD oldp;
+
+    if (g_splash_visual_patched) return 1;
+    if (IsBadReadPtr(p, SPLASH_VISUAL_SIG_LEN)) return 0;
+    /* 幂等：已打过就是「E9 <跳到我们 detour 的 rel32>」 */
+    if (p[0] == 0xE9
+        && (DWORD)(*(int *)(p + 1))
+               == (DWORD)((UINT_PTR)&splash_visual_guard_detour
+                          - (UINT_PTR)(p + 5))) {
+        InterlockedExchange(&g_splash_visual_patched, 1);
+        return 1;
+    }
+    if (memcmp(p, SPLASH_VISUAL_SIG, SPLASH_VISUAL_SIG_LEN) != 0)
+        return 0;                          /* 还没解壳到这里，或不是已确认的版本 */
+
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   溅射加成提示判空: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    p[0] = 0xE9;
+    *(DWORD *)(p + 1) = (DWORD)((UINT_PTR)&splash_visual_guard_detour
+                                - (UINT_PTR)(p + 5));
+    VirtualProtect(p, 5, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    InterlockedExchange(&g_splash_visual_patched, 1);
+    bslog("PATCH   ★溅射加成提示判空 @ %08X: rpExplode 目标句柄查不到（打空）"
+          "且 flags 带 0x200 时不再读空指针（原版 0x47ea6c 会闪退）",
+          (unsigned)SPLASH_VISUAL_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★ `BigShot.rpt` 里三种旧闪退的守护（V0.3 合成与商店 §48 / §49 / §50，D56）  */
+/*                                                                            */
+/*   三处都是原版少一个判空，各补一个：                                       */
+/*                                                                            */
+/*   A. 0x40f4df StartTutorial(App)：新手教程弹窗点「确认」后写               */
+/*      `[[0x72e29c]+0x40]`（LobbyStage），LobbyStage 为空就崩（08-11 那次，   */
+/*      C0000005 @ 0x40f4ef，EAX=0）。弹窗是模态的，弹着的时候大厅被拆掉       */
+/*      （掉线 / 服务端重启）再点确认就是这条路。为空 → 直接走函数尾 0x40f57b。 */
+/*                                                                            */
+/*   B. 0x40ed98 主窗口 WndProc 的 WM_CLOSE 分支（0x40ef90 起）：弹「종료 확인」*/
+/*      要建字体（0x4249d6 `[0x6e9400]`）。App 析构时先删字体管理器           */
+/*      （0x40dbef 置 NULL）再拆内嵌 IE 控件，后者会泵一轮消息 —— 这时队列里   */
+/*      还有一条 WM_CLOSE（用户多点了一下 X）就崩在 0x5cedc9（09-05 两次，      */
+/*      栈上全是 mshtml / urlmon）。字体管理器为空 → 当「确认框已经在弹」处理，  */
+/*      走 0x40f119 返回 0。                                                   */
+/*                                                                            */
+/*   C. 0x5d2702 CPU 蒙皮循环：每条蒙皮记录 `[表+4+i*4]` 配一个骨骼指针       */
+/*      `[表+0x25c+i*4]`（0x5c2556 的构造函数把两段各 0x258 字节清零）。       */
+/*      骨骼按名字在角色骨架里找，找不到就是 NULL，0x5d27f1 拿它 +0x58 喂        */
+/*      D3DXMatrixMultiply 崩在 0x58cbff（09-06 两次，ECX=0x58）。触发条件是   */
+/*      「网格属于别的角色」—— `Bone_Spine_01` / `Bone_Pelvis_01` 只有布洛克   */
+/*      的骨架有，把 ch02 的铠甲挂到泰尔身上就全空。数据层 D31a 已经堵住        */
+/*      （角色限定只认原版），这里再兜一层：骨骼为空的记录跳过不算              */
+/*      （顶点留在原点，模型缺一块，但不崩），退出时打一行计数。               */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_RPT_CRASHES=1 保留原版三处行为（复现 / 对照用）。          */
+/* -------------------------------------------------------------------------- */
+#define TUTORIAL_START_VA        0x0040F4EAu
+#define TUTORIAL_START_SIG_LEN   16
+static const unsigned char TUTORIAL_START_SIG[TUTORIAL_START_SIG_LEN] = {
+    0xA1, 0x9C, 0xE2, 0x72, 0x00,       /* mov eax, [0x72e29c]  LobbyStage    */
+    0xC6, 0x40, 0x40, 0x01,             /* mov byte [eax+0x40], 1            */
+    0x83, 0x60, 0x4C, 0x00,             /* and dword [eax+0x4c], 0           */
+    0x8D, 0x48, 0x44                    /* lea ecx, [eax+0x44]               */
+};
+#define TUTORIAL_START_RETURN_TO 0x0040F4EF
+#define TUTORIAL_START_EXIT      0x0040F57B   /* mov ecx,[ebp-0xC] ; mov fs:[0],ecx ; leave ; ret 4 */
+#define LOBBY_STAGE_GLOBAL       0x0072E29C
+
+static __declspec(naked) void tutorial_start_guard_detour(void)
+{
+    __asm {
+        mov  eax, LOBBY_STAGE_GLOBAL        /* 被偷走的原指令：eax = [0x72e29c] */
+        mov  eax, dword ptr [eax]
+        test eax, eax
+        jz   tsg_bail
+        push TUTORIAL_START_RETURN_TO       /* 大厅在：接着写 [eax+0x40] */
+        ret
+    tsg_bail:
+        push TUTORIAL_START_EXIT            /* 大厅不在：什么都不做，走原有函数尾 */
+        ret
+    }
+}
+
+#define WM_CLOSE_GUARD_VA        0x0040EF90u
+#define WM_CLOSE_GUARD_SIG_LEN   16
+static const unsigned char WM_CLOSE_GUARD_SIG[WM_CLOSE_GUARD_SIG_LEN] = {
+    0x80, 0x3D, 0x5C, 0xE9, 0x72, 0x00, 0x00,   /* cmp byte [0x72e95c], 0  确认框已在弹？ */
+    0x0F, 0x85, 0x7C, 0x01, 0x00, 0x00,         /* jne 0x40f119                        */
+    0xA1, 0x9C, 0xE2                            /* mov eax, [0x72e29c] ...             */
+};
+#define WM_CLOSE_GUARD_RETURN_TO 0x0040EF97   /* 那条 jne：靠我们留下的标志位分流 */
+#define WM_CLOSE_GUARD_EXIT      0x0040F119   /* xor eax,eax … ret 0x10（已处理） */
+#define FONT_MANAGER_GLOBAL      0x006E9400
+#define QUIT_BOX_SHOWING_FLAG    0x0072E95C
+
+static __declspec(naked) void wm_close_guard_detour(void)
+{
+    __asm {
+        mov  eax, FONT_MANAGER_GLOBAL
+        mov  eax, dword ptr [eax]
+        test eax, eax
+        jz   wcg_bail
+        mov  eax, QUIT_BOX_SHOWING_FLAG     /* 被偷走的原指令 cmp byte [0x72e95c],0 —— */
+        cmp  byte ptr [eax], 0              /* 标志位语义不变，eax 在 0x40ef97 之后立刻被覆盖 */
+        push WM_CLOSE_GUARD_RETURN_TO       /* push/ret 不动标志位 */
+        ret
+    wcg_bail:
+        push WM_CLOSE_GUARD_EXIT            /* 字体管理器已经没了：当作「确认框在弹」，返回 0 */
+        ret
+    }
+}
+
+#define SKIN_BONE_GUARD_VA       0x005D27F1u
+#define SKIN_BONE_GUARD_SIG_LEN  16
+static const unsigned char SKIN_BONE_GUARD_SIG[SKIN_BONE_GUARD_SIG_LEN] = {
+    0x8B, 0x88, 0x58, 0x02, 0x00, 0x00,   /* mov ecx, [eax+0x258]  这条记录的骨骼 */
+    0x8B, 0x00,                           /* mov eax, [eax]                       */
+    0x83, 0xC1, 0x58,                     /* add ecx, 0x58        骨骼的世界矩阵   */
+    0x51,                                 /* push ecx                             */
+    0x83, 0xC0, 0x10,                     /* add eax, 0x10        记录自己的矩阵   */
+    0x50                                  /* push eax                             */
+};
+#define SKIN_BONE_GUARD_RETURN_TO 0x005D27F7
+#define SKIN_BONE_GUARD_CONTINUE  0x005D2909   /* 循环尾：inc [ebp+0x68] ; add [ebp+0x6c],4 ; cmp ; jl */
+
+static volatile LONG g_skin_null_bone_skips = 0;
+
+static __declspec(naked) void skin_bone_guard_detour(void)
+{
+    __asm {
+        mov  ecx, dword ptr [eax + 0x258]   /* 被偷走的原指令 */
+        test ecx, ecx
+        jz   sbg_skip
+        push SKIN_BONE_GUARD_RETURN_TO
+        ret
+    sbg_skip:
+        inc  dword ptr [g_skin_null_bone_skips]
+        push SKIN_BONE_GUARD_CONTINUE       /* 这条记录没有骨骼：跳过，去下一条 */
+        ret
+    }
+}
+
+static volatile LONG g_rpt_guards_patched = 0;
+
+static int rpt_crashes_keep_original(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_RPT_CRASHES", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+/* 三处共用：签名对上就把头 5 字节换成 E9 跳 detour，多出来的字节补 NOP。
+   幂等：已经是「E9 <到我们 detour 的 rel32>」就当打过。 */
+static int install_jmp_guard(unsigned int va, const unsigned char *sig, int sig_len,
+                             int stolen, void *detour, const char *what)
+{
+    unsigned char *p = (unsigned char *)va;
+    DWORD oldp;
+    int i;
+
+    if (IsBadReadPtr(p, sig_len)) return 0;
+    if (p[0] == 0xE9
+        && (DWORD)(*(int *)(p + 1)) == (DWORD)((UINT_PTR)detour - (UINT_PTR)(p + 5)))
+        return 1;
+    if (memcmp(p, sig, sig_len) != 0)
+        return 0;                          /* 还没解壳到这里，或不是已确认的版本 */
+    if (!VirtualProtect(p, stolen, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   %s: VirtualProtect 失败 err=%lu", what, (unsigned long)GetLastError());
+        return 0;
+    }
+    p[0] = 0xE9;
+    *(DWORD *)(p + 1) = (DWORD)((UINT_PTR)detour - (UINT_PTR)(p + 5));
+    for (i = 5; i < stolen; i++) p[i] = 0x90;
+    VirtualProtect(p, stolen, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, stolen);
+    return 1;
+}
+
+static int try_patch_rpt_crash_guards(void)
+{
+    int a, b, c;
+
+    if (g_rpt_guards_patched) return 1;
+    a = install_jmp_guard(TUTORIAL_START_VA, TUTORIAL_START_SIG, TUTORIAL_START_SIG_LEN,
+                          5, tutorial_start_guard_detour, "教程弹窗判空");
+    b = install_jmp_guard(WM_CLOSE_GUARD_VA, WM_CLOSE_GUARD_SIG, WM_CLOSE_GUARD_SIG_LEN,
+                          7, wm_close_guard_detour, "退出中关窗判空");
+    c = install_jmp_guard(SKIN_BONE_GUARD_VA, SKIN_BONE_GUARD_SIG, SKIN_BONE_GUARD_SIG_LEN,
+                          6, skin_bone_guard_detour, "蒙皮骨骼判空");
+    if (!(a && b && c)) return 0;
+    InterlockedExchange(&g_rpt_guards_patched, 1);
+    bslog("PATCH   ★旧闪退守护 x3: 教程弹窗大厅为空 @ %08X / 退出中收到 WM_CLOSE @ %08X"
+          " / 蒙皮记录没绑上骨骼 @ %08X（BigShot.rpt 08-11 / 09-05 / 09-06 那三种）",
+          (unsigned)TUTORIAL_START_VA, (unsigned)WM_CLOSE_GUARD_VA, (unsigned)SKIN_BONE_GUARD_VA);
+    return 1;
+}
+
 /* ========================================================================== */
 /* ★ M3b 诊断：弹体全字段快照 —— 查「bot 的子弹别人看不见」（V0.3 §53~§56）   */
 /*                                                                            */
@@ -4361,6 +4632,36 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x4269AB / 0x42515E / 0x4301B4 特征串一直对不上）");
     }
 
+    /* 溅射加成提示判空（V0.3 合成与商店 §47 / D55）：穿着 IncSplashRange 装备
+       （火焰蝙蝠 220003）用溅射武器打空，15% 概率整个客户端闪退。
+       和 IME 那组一样不赶时机，只等特征串出现。 */
+    if (splash_visual_crash_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_SPLASH_VISUAL_CRASH 已设，保留原版溅射加成提示"
+              "（打空会闪退）");
+    } else {
+        for (ticks = 0; !g_stop && !g_splash_visual_patched && ticks < 2000; ticks++) {
+            if (try_patch_splash_visual_guard()) break;
+            Sleep(2);
+        }
+        if (!g_splash_visual_patched)
+            bslog("PATCH   !! 超时未能 patch 溅射加成提示判空"
+                  "（0x47EA21 特征串一直对不上）");
+    }
+
+    /* BigShot.rpt 里三种旧闪退的守护（§48 / §49 / §50，D56）：教程弹窗时大厅为空、
+       退出拆到一半又收到 WM_CLOSE、蒙皮记录没绑上骨骼。同样只等特征串出现。 */
+    if (rpt_crashes_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_RPT_CRASHES 已设，保留原版三处空指针行为");
+    } else {
+        for (ticks = 0; !g_stop && !g_rpt_guards_patched && ticks < 2000; ticks++) {
+            if (try_patch_rpt_crash_guards()) break;
+            Sleep(2);
+        }
+        if (!g_rpt_guards_patched)
+            bslog("PATCH   !! 超时未能 patch 旧闪退守护"
+                  "（0x40F4EA / 0x40EF90 / 0x5D27F1 特征串一直对不上）");
+    }
+
     /* BSM1 is a functional patch, independent of diagnostic log settings. */
     if (!try_patch_bot_motion())
         bslog("BSM1    !! 运动 hook 特征不匹配，保留原版处理；需要检查客户端版本");
@@ -4662,6 +4963,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             RemoveVectoredExceptionHandler(g_gg_veh);
             g_gg_veh = NULL;
         }
+        if (g_skin_null_bone_skips)
+            bslog("PATCH   蒙皮骨骼判空：这次运行跳过了 %ld 条没绑上骨骼的蒙皮记录"
+                  "（有装备模型和角色骨架不配，查 items.json 的角色限定 / D31a）",
+                  (long)g_skin_null_bone_skips);
         bslog("================ process detach ================");
         /* ★ 写线程这时候多半已经被系统干掉了（进程退出时先杀线程再 DETACH），
            所以在**当前**线程上就地把环排空 —— 否则最后那几条永远出不去。 */
