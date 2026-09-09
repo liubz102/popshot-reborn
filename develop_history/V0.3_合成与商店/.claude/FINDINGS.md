@@ -2292,3 +2292,73 @@ D7「已存在的一律不覆盖」要防的那件事（铁律 11）。全新部
 都要先问一句「它写到哪儿去、那个位置在不在包里」。这类漏子在打包机上**一点症状都没有**
 —— 包打出来一切正常，装到别人机器上覆盖升级才发作。处理见 D66。
 
+## §61 ★★★ `server.config` 随包发出去的模板**有两份**，服务端包那份是手写的（2026-09-09）
+
+**结论**：加了服务端侧的配置项只改 `server/config.py` 的 `DEFAULT_CONFIG_TEXT`
+是**不够**的 —— 那只喂客户端包。服务端包发的是
+`tools/server-package/server.config`，一个**独立手写**的文件，没有任何东西
+从前者生成它、也没有任何东西核对两者。
+
+**证据**：
+
+- `build-portable.ps1`（客户端包）拷 `config\server.config`，那个文件
+  `.gitignore` 掉了，没有时照 `config.py` 的 `DEFAULT_CONFIG_TEXT` 现生成
+  —— 所以客户端包那份**永远是新的**。
+- `build-server-package.ps1` 拷的是 `$Template\server.config`，
+  `$Template = tools\server-package\` —— 和 `config.py` 毫无关系。
+- 实测：`config/server.config` 与 `DEFAULT_CONFIG_TEXT` 逐字节相同；
+  同一时刻服务端包模板里 `crash_max_upload_mb` / `crash_upload_cooldown_seconds` /
+  `crash_keep_days` 三个键**一个都没有**（服务端因此一直吃默认值，
+  开服的人看不到也改不了）。
+
+**这不是第一次**：`log_retention_days`、`backup_*` 当初也是隔了一轮才补上，
+头部注释到 2026-09-09 都还写着「只有两个需要改的东西」。**分开维护 + 没人核对
+= 必然漏**，靠记性堵不住。
+
+**⚠ 反过来也不对**：不是「把 `DEFAULTS` 里的键全抄进服务端包模板」就完事。
+`server_address` / `proxy_*` / `crash_upload` 是**客户端侧**读的，写进去只会误导
+开服的人；`udp_sync` / `udp_sync_redundancy` 服务端确实读，但**故意不写**
+—— 它是对照测试用的开关，README 的端口表对开服的人只说「UDP 27799 必须放行」。
+所以判据得**逐键说明**，不能靠猜。处理见 D67（铁律 13）。
+
+## §62 ★★★★ `tools/server-package/` 里**几乎每样东西都有「另一边」**，只有三样是单源（2026-09-09）
+
+**结论**：`server.config`（§61）不是孤例。服务端包的模板目录里十个文件，
+**只有一个**（`server.config`）现在有守卫，其余全靠人记得。逐条清点如下 ——
+✅ = 单源或有测试盯着，❌ = 分开维护、没人核对。
+
+| 服务端包里的东西 | 另一边是谁 | 防漏 |
+|---|---|---|
+| `server.config` | 客户端包那份（= `config.py` 的 `DEFAULT_CONFIG_TEXT`） | ✅ `SERVER_PACKAGE_KEYS` + `test_online.py` 两条（D67） |
+| `README.md` | 仓库根 `README.md`（客户端包发的就是它） | ❌ 崩溃上传那一节就只写进了根 README |
+| `start.bat` / `start-debug.bat` / `stop.bat` | 仓库根同名三个 | ❌ 开头 11 行 `chcp 65001` 探测块**六个文件逐字节相同**，改一处要改六处 |
+| `start.sh` / `start-debug.sh` / `stop.sh` | 同目录的三个 `.bat` | ❌ 同一组入口的两个平台版本 |
+| `serverctl.ps1` | `serverctl.sh` | ❌ 同一件事两种语言各写一遍：挑 Python、日志归档、端口占用检查、读注册页端口、拼 `app.py` 参数 |
+| 读 `local_register_port` 的那段解析 | `launch.ps1` / `shutdown.ps1` / `serverctl.ps1` / `serverctl.sh` **四份**手写，其中三处注释明写着「解析规则和 `server/config.py` 一致」 | ❌ |
+| `app.py --no-tcp-relay` | `launch.ps1` 也必须传（客户端的本机服务端） | ❌ 少传一边就变成「一边有 27798 一边没有」 |
+| 端口号 | `server/config.py` 唯一源，`serverctl.*` 走 `python config.py --ports` | 🟡 `test_ports.py` 只盯 `ports.h` / `bshook.c` / CLI；**PowerShell 和 sh 里有没有写死字面量没人查** |
+| `server-ClientFilter.config` | 两个包都从仓库根 `config/` 拷同一份 | ✅ 单源 |
+| `wincompat.ps1` | 两个包都从仓库 `tools/` 拷同一份（`Move-LogAside` 等就在里面） | ✅ 单源 |
+| `server/` 代码 | `Copy-ServerCode` 拷同一份（铁律 8） | ✅ 单源 |
+
+**⚠ 清点时发现两处**已经**漂了的**（都不是这次改动引入的）：
+
+1. **27798 其实早就不监听了，三处文档还让人放行它。**
+   `serverctl.ps1` / `serverctl.sh` / `launch.ps1` 现在**都**传 `--no-tcp-relay`
+   （`0c0d7bac`「关掉原版 rcp 中继服」），`app.py:495` 走的是 `log("中继服 已关闭")`
+   那一支，根本没有 `_start("relay", ...)`。但
+   `tools/server-package/README.md` 的 `netsh` 命令行（第 28 行）和端口表
+   （第 62 行）、根 `README.md`（第 32 / 468 行）、`build-server-package.ps1`
+   写进 `BUILD.ver` 的说明，四处都还写着「要放行 TCP 27798」。
+   ⇒ 那次改动只动了脚本，四份文档一份没跟。放行一个没人听的口不会出故障，
+   所以**至今没人发现** —— 正是这一类漏子的典型症状。
+2. **`tools/shutdown.ps1` 里还有 7 个端口字面量**
+   （`@(47611, 27799, 27798, 27800, 47621, 27809, 27808)`）。
+   `launch.ps1` 头上明写着「以前这个脚本里有 9 个端口字面量……现在只有一个源」，
+   统一那一轮**漏了 `shutdown.ps1`**，`test_ports.py` 又只管 C 那边，于是留到现在。
+   值目前和 `port_table()` 一致，但没有任何东西保证它继续一致。
+
+**教训**：判断「这个文件要不要跟着改」的正确问法不是「它在哪个目录」，
+而是**「这份包和另一份包，哪些东西必须说同一句话」**。上面那张表就是答案，
+加东西时对着它过一遍。处理见 D67。
+

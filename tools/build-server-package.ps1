@@ -8,7 +8,7 @@
         ├─ start.bat / start-debug.bat / stop.bat     Windows
         ├─ start.sh  / start-debug.sh  / stop.sh      Linux
         ├─ tools/serverctl.ps1  tools/serverctl.sh    启停实现（中文都在这里）
-        ├─ config/server.config                      只有注册页端口要改
+        ├─ config/server.config                      注册页端口 / 冷却 / 日志 / 备份 / 崩溃包
         ├─ config/server-ClientFilter.config         允许的最低客户端版本（0=不限制）
         ├─ server/                    和客户端包【同一份】代码（铁律 8）
         ├─ runtime-win/python/        Windows 独立运行时

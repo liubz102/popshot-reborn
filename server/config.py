@@ -242,6 +242,46 @@ _REDUNDANCY_KEYS = ("udp_sync_redundancy",)
 BACKUP_KEYS = ("backup_enabled", "backup_time", "backup_keep_days")
 
 
+# ---------------------------------------------------------------------------
+# ★ 两份模板的分工（铁律 13）
+#
+# 同一份 `server.config` 两边共用（铁律 8），但**随包发出去的模板有两份**：
+#   * 客户端包 —— 下面的 `DEFAULT_CONFIG_TEXT`（`config/server.config` 就是
+#     照它生成的），玩家看的；
+#   * 服务端包 —— `tools/server-package/server.config`，一个**手写**的文件，
+#     开服的人看的。
+# 加一个新键时只改前者、忘了后者，包就发出去了 —— 已经发生过不止一次
+# （2026-09-09 的 crash_* 三个键）。所以下面把每个键归到一个桶里，
+# `test_online.py` 会钉住「DEFAULTS 里的每个键都必须被归类」，
+# 漏归类直接红，逼着加键的人当场想清楚它属于哪一边。
+# ---------------------------------------------------------------------------
+
+#: 只有**客户端侧**读的键 —— 服务端包模板里不该出现。
+#: `crash_upload` 在这里：它是玩家自己决定「我崩了要不要传」，收包那一头
+#: 读的是 `crash_max_upload_mb` 那三个。
+CLIENT_ONLY_KEYS = (
+    "server_address", "server_register_port",
+    "proxy_type", "proxy_address", "proxy_port",
+    "proxy_username", "proxy_password",
+    "crash_upload",
+)
+
+#: 服务端读、但**故意不写进服务端包模板**的键。
+#: `udp_sync` / `udp_sync_redundancy` 是给**对照测试**用的开关，对开服的人
+#: 只有一句话「UDP 27799 要放行」（README 的端口表写着「不能改」）。
+#: 键缺了就是默认值 1 —— 正是希望的行为。
+SERVER_HIDDEN_KEYS = ("udp_sync", "udp_sync_redundancy")
+
+#: ★ **服务端包模板里必须写出来**的键。加了新的服务端侧配置项，
+#: 除了改 `DEFAULT_CONFIG_TEXT`，还要把它加进这里**并**写进
+#: `tools/server-package/server.config`，否则测试红。
+SERVER_PACKAGE_KEYS = (
+    "local_register_port", "register_cooldown_seconds", "log_retention_days",
+    "backup_enabled", "backup_time", "backup_keep_days",
+    "crash_max_upload_mb", "crash_upload_cooldown_seconds", "crash_keep_days",
+)
+
+
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_ROOT = os.path.dirname(SERVER_DIR)
 

@@ -45,6 +45,36 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(server_config.DEFAULTS, values)
         self.assertEqual([], warnings)
 
+    def test_every_key_is_classified_client_or_server(self):
+        # ★ 铁律 13 的第一道闸：加了新键却没归类 -> 这里就红，
+        #   逼着加键的人当场决定它要不要进服务端包模板。
+        buckets = (server_config.CLIENT_ONLY_KEYS
+                   + server_config.SERVER_HIDDEN_KEYS
+                   + server_config.SERVER_PACKAGE_KEYS)
+        self.assertEqual(len(buckets), len(set(buckets)), "有键被归了两次")
+        self.assertEqual(set(server_config.DEFAULTS), set(buckets))
+
+    def test_the_server_package_template_carries_every_server_key(self):
+        # ★ 铁律 13 的第二道闸：两份模板是分开维护的（客户端包照
+        #   DEFAULT_CONFIG_TEXT 生成，服务端包用 tools\server-package\
+        #   server.config 那份手写的），只改前者的话开服的人就拿不到新设置项。
+        #   2026-09-09 的 crash_* 三个键就是这么漏掉的。
+        path = os.path.join(server_config.PACKAGE_ROOT,
+                            "tools", "server-package", "server.config")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        values, warnings = server_config.parse_text(text)
+        self.assertEqual([], warnings)
+        for key in server_config.SERVER_PACKAGE_KEYS:
+            # 「写出来了」和「值等于默认值」是两件事，都要 —— 只在注释里
+            # 提一句它的话，玩家改的是一行注释，服务端读到的还是默认值。
+            self.assertRegex(text, rf"(?m)^{key}\s*=", f"{key} 没写进模板")
+            self.assertEqual(server_config.DEFAULTS[key], values[key], key)
+        for key in (server_config.CLIENT_ONLY_KEYS
+                    + server_config.SERVER_HIDDEN_KEYS):
+            self.assertNotRegex(text, rf"(?m)^{key}\s*=",
+                                f"{key} 不该出现在服务端包模板里")
+
     def test_ipv4_ipv6_and_domain_all_parse(self):
         for text, expected in (
                 ("server_address = 192.168.1.100", "192.168.1.100"),

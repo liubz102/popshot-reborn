@@ -176,6 +176,27 @@ D:\git\popshot-reborn\main\Pack_decrypt\Images\Shop\  ← 物品图标（韩文�
     合成没有成功率（原版 UI 上没有任何概率控件）、攻防加成就是 15% 概率触发、
     换弹速度就是不受装备影响。**照原版做，把「合不合理」留给用户判断。**
     唯一允许自己设计的是**合成配方**（原版配方随服务端 DB 一起没了，见 D2）。
+13. ★ **本版新增：打的是【两个包】，`tools/server-package/` 里几乎每样东西
+    都有「另一边」，改一边必须改另一边。**
+    `server/` 代码是单源（铁律 8），但**随包发出去的脚本和文档是分开维护的**。
+    **完整清单在 §62**（十个文件逐条列了「另一边是谁 / 有没有守卫」），
+    动 `tools/server-package/` 下任何文件之前对着它过一遍。最常踩的三条：
+
+    - **`server.config`**：客户端包照 `server/config.py` 的
+      `DEFAULT_CONFIG_TEXT` 生成，服务端包用
+      `tools/server-package/server.config` 那份**手写**的。加/改一个**服务端侧**
+      的键要动四处：`DEFAULT_CONFIG_TEXT`、`config.py` 的 `SERVER_PACKAGE_KEYS`、
+      那份手写模板、`tools/server-package/README.md`。
+      ✅ `test_online.py` 的 `test_every_key_is_classified_client_or_server` /
+      `test_the_server_package_template_carries_every_server_key` 钉着 ——
+      新键没归类、或归了服务端却没写进手写模板，测试直接红。
+    - **两份 README**：服务端包发 `tools/server-package/README.md`，
+      客户端包发**仓库根**的 `README.md`。❌ 没有守卫。
+    - **`serverctl.ps1` ↔ `serverctl.sh`**：同一件事两种语言各写一遍。❌ 没有守卫。
+
+    只改一边的话包照样打得出来、服务端也照跑，**症状是「某一边的人就是拿不到 /
+    看不到」，不是报错** —— 2026-09-09 的 `crash_*` 三个键、以及「27798 早就
+    不监听了但四处文档还让人放行」都是这么留下的（§61 / §62 / D67）。
 
 ---
 
