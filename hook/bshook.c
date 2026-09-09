@@ -2846,6 +2846,97 @@ static int try_patch_dash_visual_guard(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* ★ 关掉客户端自己画的那行**绿色加成文字**（V0.3 合成与商店 §59 / D65）      */
+/*                                                                            */
+/*   原版在仓库 / 合成提示框的 `ItemInfo2Txt` 里画一行亮绿色（0xFF22C701）的   */
+/*   加成摘要，内容是客户端**自己**按 itemId 查本地 `EquipBonus-Chn.ini` 生成的 */
+/*   （0x414128 -> 0x4136af）。它和服务端下发的说明文（`ItemInfo+0x18`）**重复**，*/
+/*   而且原版这一行有三个毛病，全在客户端 pak 里、服务端一个字都改不了：       */
+/*                                                                            */
+/*     1. `Chinese.ini` 错字：`Spd%+d%%=速度+d%%`（漏了 d 前面的 %）           */
+/*        -> 画出来是「速度+d%」；                                            */
+/*     2. `Team %d%% %s` / `Self %d%% %s` / `Down` 三条**漏翻**               */
+/*        -> 称号上画出来是「Team 5% Down」这种英文；                          */
+/*     3. `ItemInfo2Txt` 在 .ui 里只有 240x14（**一行**），属性一多就换行溢出   */
+/*        到下面那个框上。                                                    */
+/*                                                                            */
+/*   我们发的说明文是它的**严格超集**（13 种加成 vs 它的 7 种，外加武器数值、   */
+/*   条件加成、exe 里写死的特效），且三个提示框都有 —— 原版商店提示框压根不画   */
+/*   加成。所以用户 2026-09-09 拍板：**关掉绿字，白字统一管**。               */
+/*                                                                            */
+/*   ★ 打在**生成器**上，不是四个绘制点上：                                   */
+/*                                                                            */
+/*     0041414D  mov  eax, 0x72e440        ; EquipBonus 显示表                */
+/*     00414155  call 0x417a76             ; map.find(itemId)                 */
+/*     0041415A  mov  esi, [eax]                                              */
+/*     0041415C  test esi, esi                                                */
+/*     0041415E  je   0x414180             ; ← 查不到就跳过，vector 保持空     */
+/*                                                                            */
+/*   把这个 `je`（74）改成 `jmp`（EB）**一个字节**，`0x414128` 就永远返回空表， */
+/*   四个消费点（仓库提示框 0x455628、合成提示框 0x460059、修理界面           */
+/*   0x450614 / 0x45078D）一起哑火。                                          */
+/*                                                                            */
+/*   ★★ 为什么这一刀几乎零风险：走的就是**原版每天都在走**的那条路 ——         */
+/*   武器 / 材料 / 纯外观装备在 `EquipBonus-Chn.ini` 里都没有条目，本来就走     */
+/*   `je` 这一支。SEH 状态（`[ebp-4]`）在两条路上完全一样，vector 的构造 /      */
+/*   拷贝 / 析构一步不少。                                                    */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_CLIENT_BONUS_TEXT=1 保留原版那行绿字（对照用）。          */
+/* -------------------------------------------------------------------------- */
+#define BONUS_TEXT_SIG_VA   0x0041414Du
+#define BONUS_TEXT_SIG_LEN  19
+#define BONUS_TEXT_JE_OFF   17            /* 那个 `74 20` 在特征串里的位置    */
+static const unsigned char BONUS_TEXT_SIG[BONUS_TEXT_SIG_LEN] = {
+    0xB8, 0x40, 0xE4, 0x72, 0x00,       /* mov  eax, 0x72e440               */
+    0x89, 0x5D, 0xFC,                   /* mov  [ebp-4], ebx                */
+    0xE8, 0x1C, 0x39, 0x00, 0x00,       /* call 0x417a76（map.find）        */
+    0x8B, 0x30,                         /* mov  esi, [eax]                  */
+    0x85, 0xF6,                         /* test esi, esi                    */
+    0x74, 0x20                          /* je   0x414180  ★ 要改的就是这个  */
+};
+
+static volatile LONG g_bonus_text_patched = 0;
+
+static int client_bonus_text_keep_original(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_CLIENT_BONUS_TEXT", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_patch_hide_client_bonus_text(void)
+{
+    unsigned char *p = (unsigned char *)BONUS_TEXT_SIG_VA;
+    unsigned char *je = p + BONUS_TEXT_JE_OFF;
+    DWORD oldp;
+
+    if (g_bonus_text_patched) return 1;
+    if (IsBadReadPtr(p, BONUS_TEXT_SIG_LEN)) return 0;
+    /* 幂等：已经改成 EB 了就直接认账（前 17 字节仍要对得上）。 */
+    if (je[0] == 0xEB && je[1] == 0x20
+        && memcmp(p, BONUS_TEXT_SIG, BONUS_TEXT_JE_OFF) == 0) {
+        InterlockedExchange(&g_bonus_text_patched, 1);
+        return 1;
+    }
+    if (memcmp(p, BONUS_TEXT_SIG, BONUS_TEXT_SIG_LEN) != 0)
+        return 0;                          /* 还没解壳到这里，或不是已确认的版本 */
+
+    if (!VirtualProtect(je, 1, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   客户端加成绿字: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    je[0] = 0xEB;                          /* je -> jmp，永远返回空表 */
+    VirtualProtect(je, 1, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), je, 1);
+    InterlockedExchange(&g_bonus_text_patched, 1);
+    bslog("PATCH   ★客户端加成绿字已关 @ %08X: 仓库 / 合成提示框那行绿色加成"
+          "摘要不再画（和服务端下发的说明文重复，且原版有错字/漏翻/溢出）",
+          (unsigned)(BONUS_TEXT_SIG_VA + BONUS_TEXT_JE_OFF));
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* ★ `BigShot.rpt` 里三种旧闪退的守护（V0.3 合成与商店 §48 / §49 / §50，D56）  */
 /*                                                                            */
 /*   三处都是原版少一个判空，各补一个：                                       */
@@ -4770,6 +4861,20 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_dash_visual_patched)
             bslog("PATCH   !! 超时未能 patch 突击技加成提示判空"
                   "（0x481EF3 特征串一直对不上）");
+    }
+
+    /* 关掉客户端自己画的那行绿色加成文字（§59 / D65）：和服务端下发的说明文重复，
+       而且原版那一行有错字（速度+d%）/ 漏翻（Team…Down）/ 溢出三个毛病。 */
+    if (client_bonus_text_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_CLIENT_BONUS_TEXT 已设，保留原版那行绿色加成文字");
+    } else {
+        for (ticks = 0; !g_stop && !g_bonus_text_patched && ticks < 2000; ticks++) {
+            if (try_patch_hide_client_bonus_text()) break;
+            Sleep(2);
+        }
+        if (!g_bonus_text_patched)
+            bslog("PATCH   !! 超时未能 patch 客户端加成绿字"
+                  "（0x41414D 特征串一直对不上）");
     }
 
     /* BigShot.rpt 里三种旧闪退的守护（§48 / §49 / §50，D56）：教程弹窗时大厅为空、
