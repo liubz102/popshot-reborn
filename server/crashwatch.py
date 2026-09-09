@@ -106,6 +106,7 @@ MAX_PENDING_NOTES = 64
 RECORD_HEAD = "==================   logged at "
 _RECORD_RE = re.compile(r"^=+\s+logged at\s+(.+?)\s+=+\s*$")
 _DUMPNAME_RE = re.compile(r"^Dump File Name:\s*(.+?)\s*$", re.MULTILINE)
+_VERSION_RE = re.compile(r"^Version:\s*(.+?)\s*$", re.MULTILINE)
 _EXCEPTION_RE = re.compile(r"^Exception code:\s*(.+?)\s*$", re.MULTILINE)
 _FAULT_RE = re.compile(r"^Fault address:\s*(.+?)\s*$", re.MULTILINE)
 
@@ -234,6 +235,10 @@ class CrashReport:
         #:   别的目录**的绝对路径（`D:\work\popshot\...`），那些路径在这台
         #:   机器上要么不存在、要么指向不相干的东西。
         self.dump_name = os.path.basename(match.group(1)) if match else ""
+        #: 原版客户端自己的版本号（报告第二行 `Version: 311`）。
+        #: 和我们这一版的 `BUILD.ver` 是两回事，两个都要记。
+        version = _VERSION_RE.search(text)
+        self.client_version = version.group(1) if version else ""
         exc = _EXCEPTION_RE.search(text)
         self.exception = exc.group(1) if exc else ""
         fault = _FAULT_RE.search(text)
@@ -243,6 +248,45 @@ class CrashReport:
     def stamp(self):
         """目录名里那一段 `YYYYMMDD-HHMMSS`。"""
         return time.strftime("%Y%m%d-%H%M%S", time.localtime(self.epoch))
+
+
+#: `BUILD.ver` 里对查崩溃真正有用的那几项。
+#:
+#: ★ **不要把整个文件原样塞进 `meta.json`**：客户端包里那份是一份富 JSON，
+#: 带一大段中文 `notes`（几百字节，对查崩溃毫无用处）和打包机器名。
+#: 这里只挑「是哪个 build、hook 和加载器是哪一版」——
+#: `bshookHash` 尤其要紧：崩溃十有八九和注入层的补丁版本有关。
+BUILD_FIELDS = ("version", "versionWire", "kind", "buildId", "time",
+                "bshookHash", "bsloaderHash", "serverCodeHash")
+
+
+def read_build_info(root):
+    """`<包根>/BUILD.ver` -> 给崩溃报告用的那几项。
+
+    三种形态都要认：
+
+    * **客户端 / 服务端包**里的那份是富 JSON（`version` / `buildId` / 各种 hash）；
+    * **仓库工作区**里那份只有 `{"version": "V0.3.0"}`；
+    * 文件不在、或者根本不是 JSON。
+
+    ★ 读不到时**明说读不到**，不要静默回一个空串 —— 看包的人得能分清
+    「这个 build 没版本号」和「我们没读着」。
+    """
+    path = os.path.join(root, "BUILD.ver")
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fp:
+            text = fp.read()
+    except OSError as error:
+        return {"error": "读不到 BUILD.ver：%s" % (error,)}
+    try:
+        got = json.loads(text)
+    except ValueError:
+        # 不是 JSON 也别丢掉 —— 截一段原文，让人自己看。
+        return {"error": "BUILD.ver 不是合法 JSON", "raw": text[:200]}
+    if not isinstance(got, dict):
+        return {"error": "BUILD.ver 不是一个对象", "raw": text[:200]}
+    info = {key: got[key] for key in BUILD_FIELDS if key in got}
+    return info or {"error": "BUILD.ver 里没有认得的字段"}
 
 
 def read_crash_report(gamedir):
@@ -505,7 +549,10 @@ class Collector:
             "session_start": time.strftime("%Y-%m-%d %H:%M:%S",
                                            time.localtime(session_start)),
             "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "build_ver": self._read_text(os.path.join(self.root, "BUILD.ver")),
+            # 我们这一版的构建信息（版本号 / buildId / hook 和加载器的 hash）。
+            "build": read_build_info(self.root),
+            # 原版客户端自己的版本号，崩溃报告第一行就写着（现在是 311）。
+            "client_version": report.client_version,
             "skipped": [],
         }
         if extra_meta:

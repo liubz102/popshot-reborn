@@ -187,6 +187,10 @@ try {
         Copy-Item -LiteralPath $item.FullName -Destination $targetGame -Recurse -Force
     }
     New-Item -ItemType Directory -Path (Join-Path $OutputDirectory 'logs') -Force | Out-Null
+    # ★ 客户端包里也带着完整的 server\，可以当服务器让别人连（README「当前状态」）。
+    #   别人的客户端闪退后会把崩溃现场传到这里来 —— 和服务端包**同一套代码**
+    #   （铁律 8），所以这个目录两个包都要有。空目录，内容是运行时才有的。
+    New-Item -ItemType Directory -Path (Join-Path $OutputDirectory 'logs_client_crash') -Force | Out-Null
 
     # --- 5. server-ClientFilter.config + BUILD.ver --------------------------
     Write-Host '  [5/6] server-ClientFilter.config + BUILD.ver'

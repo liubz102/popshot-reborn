@@ -161,6 +161,8 @@ class ReportParsingTests(unittest.TestCase):
         self.assertEqual("20260909-013642", report.stamp)
         self.assertEqual("C0000005 ACCESS_VIOLATION", report.exception)
         self.assertTrue(report.fault.startswith("0047EA6C"))
+        # 原版客户端自己的版本号，和我们的 BUILD.ver 是两回事。
+        self.assertEqual("311", report.client_version)
 
     def test_dump_name_keeps_only_the_basename(self):
         # ★ 报告里写的是**绝对路径**，而 rpt 里躺着别的机器 / 别的目录留下的
@@ -191,6 +193,60 @@ class ReportParsingTests(unittest.TestCase):
         report = crashwatch.read_crash_report(self.game)
         self.assertEqual("", report.logged_at_text)
         self.assertEqual("", report.dump_name)
+
+
+class BuildInfoTests(unittest.TestCase):
+    """`BUILD.ver` 有三种形态，三种都要认；读不到要**明说**读不到。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def write(self, text):
+        with open(os.path.join(self.tmp.name, "BUILD.ver"), "w",
+                  encoding="utf-8") as fp:
+            fp.write(text)
+
+    def test_the_rich_package_build_ver(self):
+        """包里那份带 buildId 和几个 hash —— 查崩溃最想知道的就是这些。"""
+        self.write(json.dumps({
+            "version": "V0.3.0", "versionWire": 3000, "kind": "客户端包",
+            "buildId": "20260909-005031", "time": "2026-09-09 00:50:32",
+            "machine": "MSI-GP76",
+            "bshookHash": "FB" * 32, "bsloaderHash": "1B" * 32,
+            "serverCodeHash": "2B" * 32,
+            "notes": ["一大段中文说明", "对查崩溃毫无用处"],
+        }, ensure_ascii=False))
+        got = crashwatch.read_build_info(self.tmp.name)
+        self.assertEqual("V0.3.0", got["version"])
+        self.assertEqual("20260909-005031", got["buildId"])
+        self.assertEqual("FB" * 32, got["bshookHash"])
+        # ★ notes 和打包机器名不该进包 —— 前者几百字节没用，后者是噪声。
+        self.assertNotIn("notes", got)
+        self.assertNotIn("machine", got)
+
+    def test_the_thin_worktree_build_ver(self):
+        self.write('{"version": "V0.3.0"}')
+        self.assertEqual({"version": "V0.3.0"},
+                         crashwatch.read_build_info(self.tmp.name))
+
+    def test_missing_says_so_instead_of_going_quiet(self):
+        got = crashwatch.read_build_info(self.tmp.name)
+        self.assertIn("error", got)
+        self.assertIn("读不到", got["error"])
+
+    def test_garbage_keeps_a_snippet_of_the_original(self):
+        self.write("这不是 JSON")
+        got = crashwatch.read_build_info(self.tmp.name)
+        self.assertIn("error", got)
+        self.assertIn("这不是 JSON", got["raw"])
+
+    def test_a_bom_does_not_break_it(self):
+        # 有人拿记事本改过就会带 BOM。
+        with open(os.path.join(self.tmp.name, "BUILD.ver"), "wb") as fp:
+            fp.write(b"\xef\xbb\xbf" + b'{"version": "V0.3.1"}')
+        self.assertEqual({"version": "V0.3.1"},
+                         crashwatch.read_build_info(self.tmp.name))
 
 
 class RptSplitTests(unittest.TestCase):
@@ -299,6 +355,12 @@ class _Fixture:
             fp.write(RPT_TEXT)
         with open(os.path.join(self.game, "UserConfig.ini"), "wb") as fp:
             fp.write(b"LastLoginId=testuser1\r\nVer=311\r\n")
+        # ★ `BUILD.ver` 在**包根**，不在 game_patched 里。
+        with open(os.path.join(base, "BUILD.ver"), "w", encoding="utf-8") as fp:
+            json.dump({"version": "V0.3.0", "buildId": "20260909-005031",
+                       "bshookHash": "FB" * 32,
+                       "notes": ["不该进包的一大段说明"]}, fp,
+                      ensure_ascii=False)
         with open(os.path.join(self.logs, "relay.out"), "w",
                   encoding="utf-8") as fp:
             fp.write("中继日志\n")
@@ -356,6 +418,21 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(0xC0000005, got["exit_code"])
         self.assertEqual([], got["skipped"])
         self.assertEqual(meta["crash_time"], "20260909-013642")
+        # ★ 构建信息要真的填上（曾经这里是个静默的空串），而且只挑有用的几项。
+        self.assertEqual("V0.3.0", got["build"]["version"])
+        self.assertEqual("20260909-005031", got["build"]["buildId"])
+        self.assertEqual("FB" * 32, got["build"]["bshookHash"])
+        self.assertNotIn("notes", got["build"])
+        self.assertNotIn("error", got["build"])
+        # 原版客户端自己的版本号（和上面那个是两回事）。
+        self.assertEqual("311", got["client_version"])
+
+    def test_a_missing_build_ver_says_so_instead_of_an_empty_string(self):
+        os.remove(os.path.join(self.tmp.name, "BUILD.ver"))
+        out, _meta, _ = self.build()
+        with zipfile.ZipFile(out) as zf:
+            got = json.loads(zf.read("meta.json").decode("utf-8"))
+        self.assertIn("读不到", got["build"]["error"])
 
     def test_report_text_comes_from_memory_not_from_disk(self):
         """★ 原版客户端下次登录会把 `LastCrashReport.txt` 当 0x0103 的载荷发走

@@ -436,6 +436,37 @@ class RateLimitTests(unittest.TestCase):
         self.assertEqual(200, self.post("abc_a1b2c3d4_20260909-013642"))
 
 
+class LayoutTests(unittest.TestCase):
+    """落地目录的位置 —— **客户端包和服务端包必须是同一个相对位置**。
+
+    客户端包里也带着完整的 `server/`，可以当服务器让别人连（铁律 8：两个包是
+    同一套代码）。所以「别人传上来的崩溃包落在哪」这件事不能依赖包的种类，
+    只能依赖「`server/` 的上一级」。
+    """
+
+    def test_the_crash_dir_sits_next_to_logs_at_the_package_root(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(
+            crashstore.__file__)))
+        self.assertEqual(os.path.join(root, "logs_client_crash"),
+                         crashstore.DEFAULT_CRASH_DIR)
+        # `logs/` 就在旁边 —— 两个包的这一层布局是一样的。
+        import logcleanup
+
+        self.assertEqual(os.path.dirname(logcleanup.DEFAULT_LOGDIR),
+                         os.path.dirname(crashstore.DEFAULT_CRASH_DIR))
+
+    def test_nothing_is_created_just_by_importing_or_starting(self):
+        """★ 打包自检会把包里的服务端跑一遍：**不该因此在包里长出目录**。"""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        target = os.path.join(tmp.name, crashstore.DIRNAME)
+        store = crashstore.Store(directory=target, keep_days=3)
+        store.start()
+        self.addCleanup(store.stop)
+        store.cleanup()
+        self.assertFalse(os.path.exists(target))
+
+
 class ConfigTests(unittest.TestCase):
     def test_the_shipped_template_carries_the_crash_keys(self):
         values, warnings = server_config.parse_text(
