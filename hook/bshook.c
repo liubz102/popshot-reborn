@@ -2971,6 +2971,369 @@ static int try_patch_hide_client_bonus_text(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* ★★ 岩浆巨龙（Quest02 / 드라카）**永远无敌卡关**                            */
+/*                                                                            */
+/*   用户 2026-09-10 报的线上现象：闯关「岩浆巨龙」进 boss 房后，**有时**       */
+/*   boss 一直无敌、子弹全弹开，那段「布洛克分析出弱点」的剧情不放，关卡        */
+/*   再也推不下去。服务端日志（bug调查/16）：当天进 `Quest02_2` 的五局里，      */
+/*   四局都在进图 17~22 秒后开始出 `0x0410`（只在打到怪身上才发），出事那局     */
+/*   3 分 12 秒**一发都没有** ⇒ 全程零伤害。服务端在 boss 房里既没收也没发     */
+/*   别的包 ⇒ 病在客户端。                                                    */
+/*                                                                            */
+/*   ## 病根（静态逆向，addr 均为 BigShot 内存镜像 VA；会话 27 逐条复核过）     */
+/*                                                                            */
+/*   boss 的**阶段**在 `[boss+0x2a8]`：构造函数 `0x4b1812` 把它置 **-1** 并调   */
+/*   `vf_124(-1)`（所有部件标成「弹开」= 免疫），随后 `0x4b1837` 把状态名        */
+/*   `[boss+0x2b0]` 置 `"birth"`。把 -1 抬成 0（= 可以打）的**全客户端只有一处**：*/
+/*   任务脚本命令 `$공략포인트`（处理器 `0x4a76ad`，写在 `0x4a76c9`：           */
+/*   `[boss+0x2a8]=0` + `vf_124(0)`），而它**只出现在                          */
+/*   `Data/Quest/Quest02/Quest02Tracing`** 这一份剧情里。                      */
+/*                                                                            */
+/*   放那份剧情的是关卡舞台的检查 `0x4a706b`（舞台 vf_80 = `0x4a74f5` 在关卡    */
+/*   状态 `[+0x3b0]==2` 时调它），四道门缺一不可：                              */
+/*                                                                            */
+/*     ① `[stage+0x560] != 0`             boss 已经生成                       */
+/*     ② `[0x72e260]->[+0x14] == 0`       **当前没有剧情在播**                 */
+/*     ③ `0x4e71c0(...) == 3`             剧情播放器状态                       */
+/*     ④ `[stage+0x5fc] == 0` 且 `boss->vf_154(4)`                            */
+/*                                                                            */
+/*   而 Quest02 那只 boss 的 `vf_154(4)`（`0x4b5a04`）判的是                    */
+/*   **`[boss+0x2b0] == L"birth"`** —— 一个只活 `BirthTick`(=120) 个游戏刻的   */
+/*   **瞬时状态**。刻长 `[0x6dc528]` = 32 ms（和服务端的 32ms 循环同源），      */
+/*   120 刻 = **3.84 秒**；刻数追墙钟（`0x42b4c3`，落后就在同一帧里无上限补跑）。*/
+/*   出生一结束，`vf_140("think")` 在 `0x4b1c54` 看见阶段还是 -1，把状态切成    */
+/*   `"idle1"` —— 从此 `vf_154(4)` 恒假，**Tracing 永远不会再放，阶段永远 -1**。 */
+/*                                                                            */
+/*   ★ 「有时」到底是谁吃掉了那 3.84 秒，**没有查清**（会话 27）。两条看上去    */
+/*   成立的解释已被证伪：                                                      */
+/*     · 不是 `Quest02Boss` 的尾巴。`$createboss` 后面那几行 `fadeout 3000` /    */
+/*       `clear` / `fadein 3000` / `wideoff` 的 `Wait=` 都是空的，脚本引擎里     */
+/*       `fadeout` / `fadein`（`0x4e6507` / `0x4e653d`）只是把参数交给画面管理器 */
+/*       `[0x72e2d8]` 就返回，**不等**；剧情几帧内就结束。真要阻塞 6 秒，窗口   */
+/*       会**每次**错过，和四局成功矛盾。                                       */
+/*     · 不是 `Quest02Lava` 插队。全代码字符串和地图文件里都没有引用它；       */
+/*       Quest02 舞台代码只放 Tracing / Shell / Change / Phase2 / Phase3 /       */
+/*       Clear / Intro，`Quest02Boss` 由地图当开场脚本引用。                    */
+/*   一个还没证实的候选：`$createboss` 同步加载 boss 模型 / 特效造成卡帧，      */
+/*   追赶循环一帧内补跑 ≥120 刻，出生在检查跑到之前就过期了。下面的 DRAKA       */
+/*   诊断日志就是为了下次出事时把这一点钉死。                                   */
+/*                                                                            */
+/*   ★ 别的关卡：Quest01 判的是 `vf_154(0)` = `[boss+0x2f0] > 5`（计数，不过期）；*/
+/*     Quest03 的检查 `0x4a7ee0` 不问 boss 状态；Quest05 / Quest06 的            */
+/*     `$공략포인트` 在 `Phase2` 里（判 `阶段==1`，持久事实）；Quest01 / Quest04  */
+/*     的 boss 没有 `$createboss`。Quest07 的 Map02 / Map03 是 `$createboss` 和   */
+/*     `$공략포인트` 同一份脚本挨着写；**Map01 不是**（`Map01Intro` 末尾         */
+/*     `$createboss`，`$공략포인트` 在 `Map01Phase2`），那只 boss 是否同形没验。  */
+/*                                                                            */
+/*   ## 改法：把判据从**瞬时状态**换成**持久事实**（铁律 10 的口径）           */
+/*                                                                            */
+/*   真正区分「该放 Tracing」和「不该放」的事实是「**弱点还没被点出来**」，     */
+/*   也就是 `[boss+0x2a8] == -1`，不是「此刻正在播出生动画」。20 字节原地改：   */
+/*                                                                            */
+/*     0x4b5a04  push "birth" / lea ecx,[esi+0x2b0] / call 0x4040f5            */
+/*               / test eax,eax / jne 0x4b5a00        （20 字节）              */
+/*        ->     cmp dword [esi+0x2a8], -1 / je 0x4b5a00 / nop×11              */
+/*                                                                            */
+/*   新判据是旧判据的严格超集（出生期间阶段本来就是 -1），正常那一路一帧不差；  */
+/*   错过窗口的那一路，门②③一开就补放 Tracing，boss 晚几秒变成可打，不再永久   */
+/*   卡关。放几次由舞台自己的一次性标志 `[stage+0x5fc]` 管，不动。它对「窗口   */
+/*   被谁吃掉」不敏感，所以触发条件没查清也照样有效；但如果线上失败其实是      */
+/*   「Tracing 放了 boss 仍无敌」这一类，它就不管用 —— 靠 DRAKA 日志分辨。       */
+/*                                                                            */
+/*   `vf_154(4)` 的其余调用点（0x4a8a2c / 0x4a9571 / 0x4aa187 / 0x4f71bb）都是  */
+/*   别的关卡查自己的 boss 类，不经过这 20 字节。                               */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_DRAKA_TRACING_RACE=1 保留原版行为（复现 / 对照用）。       */
+/* -------------------------------------------------------------------------- */
+#define DRAKA_TRACING_VA      0x004B5A04u
+#define DRAKA_TRACING_LEN     20
+
+/* 原版：push offset "birth"; lea ecx,[esi+0x2B0]; call 0x4040F5;
+         test eax,eax; jne 0x4B5A00                                          */
+static const unsigned char DRAKA_TRACING_SIG[DRAKA_TRACING_LEN] = {
+    0x68, 0xAC, 0x92, 0x67, 0x00,
+    0x8D, 0x8E, 0xB0, 0x02, 0x00, 0x00,
+    0xE8, 0xE1, 0xE6, 0xF4, 0xFF,
+    0x85, 0xC0,
+    0x75, 0xE8
+};
+
+/* 修好：cmp dword ptr [esi+0x2A8], -1; je 0x4B5A00; 剩下补 NOP 落到
+         0x4B5A18 的 `xor al,al`（= 返回假），长度一字节不差。               */
+static const unsigned char DRAKA_TRACING_FIX[DRAKA_TRACING_LEN] = {
+    0x83, 0xBE, 0xA8, 0x02, 0x00, 0x00, 0xFF,
+    0x74, 0xF3,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+};
+
+static volatile LONG g_draka_tracing_patched = 0;
+
+static int draka_tracing_keep_original(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_DRAKA_TRACING_RACE",
+                                      buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_patch_draka_tracing_gate(void)
+{
+    unsigned char *p = (unsigned char *)DRAKA_TRACING_VA;
+    DWORD oldp;
+
+    if (g_draka_tracing_patched) return 1;
+    if (IsBadReadPtr(p, DRAKA_TRACING_LEN)) return 0;
+    /* 幂等：已经是修好的那 20 字节就算数。 */
+    if (memcmp(p, DRAKA_TRACING_FIX, DRAKA_TRACING_LEN) == 0) {
+        InterlockedExchange(&g_draka_tracing_patched, 1);
+        return 1;
+    }
+    if (memcmp(p, DRAKA_TRACING_SIG, DRAKA_TRACING_LEN) != 0)
+        return 0;                      /* 还没解壳到这里，或不是已确认的版本 */
+
+    if (!VirtualProtect(p, DRAKA_TRACING_LEN, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   岩浆巨龙弱点剧情: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    memcpy(p, DRAKA_TRACING_FIX, DRAKA_TRACING_LEN);
+    VirtualProtect(p, DRAKA_TRACING_LEN, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, DRAKA_TRACING_LEN);
+    InterlockedExchange(&g_draka_tracing_patched, 1);
+    bslog("PATCH   ★岩浆巨龙弱点剧情 @ %08X: 判据由「boss 正在放出生动画」"
+          "改成「弱点还没点出来（阶段 == -1）」—— 错过那 3.84 秒出生窗口时"
+          "不再永久卡关",
+          (unsigned)DRAKA_TRACING_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★ 岩浆巨龙诊断日志（DRAKA，会话 27）                                        */
+/*                                                                            */
+/*   目的：下次再卡关时能分辨「Tracing 没放」还是「放了但弱点没点出来」，      */
+/*   并量出出生窗口被吃掉了多少。服务端日志分不清这两种，只有客户端能。       */
+/*                                                                            */
+/*   四个中途内联 hook，每个都只偷**一整条**指令（不存在跳进被偷区中间的      */
+/*   问题），一局只打一两行，走 bslog（任何日志级别都记）：                    */
+/*                                                                            */
+/*     0x4b1812  boss 构造函数 `or [edi+0x2a8],-1`（edi=boss）→ 记创建刻      */
+/*     0x4a70b4  舞台检查过了门①②③、Tracing 未放 `mov ecx,[edi+0x560]`        */
+/*               （edi=stage）→ 打「门开」那一刻 boss 的状态名 / 阶段 /          */
+/*               距创建多少刻。按**状态名翻转**去重（铁律 10）。               */
+/*     0x4a712d  真的去排 Tracing `push offset "…Quest02Tracing"`（stage 在      */
+/*               [ebp+8]，edi 已被 movsd 用掉）→ 打「Tracing 入队」             */
+/*     0x4a76c9  `$공략포인트` 处理器 `mov [ecx+0x2a8],esi`（ecx=boss）→ 打     */
+/*               「弱点点出」                                                   */
+/*                                                                            */
+/*   判读：门开那行若 `状态=idle1`，就是出生窗口在检查跑到之前已过期            */
+/*   （原版会永久卡关，补丁会接着放 Tracing）；有 Tracing 入队却没有弱点点出，   */
+/*   病就在别处。`BSHOOK_DRAKA_DIAG=0` 可关。                                   */
+/* -------------------------------------------------------------------------- */
+#define DRAKA_CTOR_VA     0x004B1812u   /* or dword ptr [edi+0x2a8], -1 ; push -1 */
+static const unsigned char DRAKA_CTOR_SIG[]  = { 0x83, 0x8F, 0xA8, 0x02, 0x00, 0x00, 0xFF, 0x6A, 0xFF };
+#define DRAKA_GATE_VA     0x004A70B4u   /* mov ecx,[edi+0x560]; mov eax,[ecx]; push 4 */
+static const unsigned char DRAKA_GATE_SIG[]  = { 0x8B, 0x8F, 0x60, 0x05, 0x00, 0x00, 0x8B, 0x01, 0x6A, 0x04 };
+#define DRAKA_QUEUE_VA    0x004A712Du   /* push offset "Data/Quest/Quest02/Quest02Tracing"; call */
+static const unsigned char DRAKA_QUEUE_SIG[] = { 0x68, 0xA8, 0x4D, 0x67, 0x00, 0xE8 };
+#define DRAKA_POINT_VA    0x004A76C9u   /* mov [ecx+0x2a8], esi; mov eax,[eax] */
+static const unsigned char DRAKA_POINT_SIG[] = { 0x89, 0xB1, 0xA8, 0x02, 0x00, 0x00, 0x8B, 0x00 };
+#define DRAKA_CTX_PP      0x0072E2B4u   /* [[0x72e2b4]+8] = GameContext，[+0xd4] = 游戏刻（0x409f0e） */
+
+static void *g_draka_ctor_tramp  = NULL;
+static void *g_draka_gate_tramp  = NULL;
+static void *g_draka_queue_tramp = NULL;
+static void *g_draka_point_tramp = NULL;
+static volatile LONG g_draka_diag_patched = 0;
+
+static void *g_draka_boss = NULL;        /* 最近创建的那只 boss */
+static int   g_draka_birth_tick = 0;     /* 它创建时的游戏刻 */
+static char  g_draka_gate_last[32];      /* 门开时上一次打过的状态名（翻转去重） */
+
+static int draka_diag_enabled(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_DRAKA_DIAG", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return 1;   /* 没设 = 开：一局才几行 */
+    return buf[0] != '0';
+}
+
+static int draka_tick(void)
+{
+    unsigned char *root, *ctx;
+    if (IsBadReadPtr((void *)DRAKA_CTX_PP, 4)) return -1;
+    root = *(unsigned char **)DRAKA_CTX_PP;
+    if (!root || IsBadReadPtr(root + 8, 4)) return -1;
+    ctx = *(unsigned char **)(root + 8);
+    if (!ctx || IsBadReadPtr(ctx + 0xD4, 4)) return -1;
+    return *(int *)(ctx + 0xD4);
+}
+
+/* [boss+0x2b0] 是宽字符串对象，头 4 字节就是字符缓冲区指针（0x4040f5 就这么读）。 */
+static const char *draka_state_name(unsigned char *boss, char *out, int outsz)
+{
+    const wchar_t *ws;
+    out[0] = 0;
+    if (!boss || IsBadReadPtr(boss + 0x2B0, 4)) return "?";
+    ws = *(const wchar_t **)(boss + 0x2B0);
+    if (!ws || IsBadReadPtr(ws, 2)) return "?";
+    w2u8(ws, out, outsz);
+    return out;
+}
+
+static int draka_phase(unsigned char *boss)
+{
+    if (!boss || IsBadReadPtr(boss + 0x2A8, 4)) return -999;
+    return *(int *)(boss + 0x2A8);
+}
+
+static int draka_since_birth(unsigned char *boss, int tick)
+{
+    return (boss && boss == g_draka_boss && tick >= 0) ? tick - g_draka_birth_tick : -1;
+}
+
+static void __cdecl draka_ctor_log(void *obj)
+{
+    g_draka_boss = obj;
+    g_draka_birth_tick = draka_tick();
+    g_draka_gate_last[0] = 0;
+    bslog("DRAKA   boss 创建 @%08X 刻=%d（阶段 -1 = 石壳免疫；状态 birth 只活 120 刻 = 3.84 s）",
+          (unsigned)(UINT_PTR)obj, g_draka_birth_tick);
+}
+
+static void __cdecl draka_gate_log(void *stage)
+{
+    unsigned char *s = (unsigned char *)stage;
+    unsigned char *boss;
+    char name[32];
+    int tick;
+    if (!s || IsBadReadPtr(s + 0x560, 4)) return;
+    boss = *(unsigned char **)(s + 0x560);
+    draka_state_name(boss, name, sizeof(name));
+    if (strcmp(name, g_draka_gate_last) == 0) return;      /* 状态没翻转就不重复 */
+    lstrcpynA(g_draka_gate_last, name, sizeof(g_draka_gate_last));
+    tick = draka_tick();
+    bslog("DRAKA   门开（无剧情在播、Tracing 未放）刻=%d 距创建 %d 刻  boss 状态=%s 阶段=%d%s",
+          tick, draka_since_birth(boss, tick), name, draka_phase(boss),
+          (strcmp(name, "birth") == 0) ? "" : "  ← 出生窗口已过，原版到此永久卡关");
+}
+
+static void __cdecl draka_queue_log(void *stage)
+{
+    unsigned char *s = (unsigned char *)stage;
+    unsigned char *boss = NULL;
+    char name[32];
+    int tick = draka_tick();
+    if (s && !IsBadReadPtr(s + 0x560, 4)) boss = *(unsigned char **)(s + 0x560);
+    bslog("DRAKA   Tracing 入队 刻=%d 距创建 %d 刻  boss 状态=%s 阶段=%d",
+          tick, draka_since_birth(boss, tick),
+          draka_state_name(boss, name, sizeof(name)), draka_phase(boss));
+}
+
+static void __cdecl draka_point_log(void *obj)
+{
+    unsigned char *boss = (unsigned char *)obj;
+    char name[32];
+    int tick = draka_tick();
+    bslog("DRAKA   $공략포인트：阶段 %d→0，弱点点出 刻=%d 距创建 %d 刻  boss 状态=%s",
+          draka_phase(boss), tick, draka_since_birth(boss, tick),
+          draka_state_name(boss, name, sizeof(name)));
+}
+
+/* 0x4b1812：this 在 edi。 */
+static __declspec(naked) void draka_ctor_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push edi
+        call draka_ctor_log
+        add  esp, 4
+        popfd
+        popad
+        jmp  dword ptr [g_draka_ctor_tramp]
+    }
+}
+
+/* 0x4a70b4：stage 在 edi。 */
+static __declspec(naked) void draka_gate_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push edi
+        call draka_gate_log
+        add  esp, 4
+        popfd
+        popad
+        jmp  dword ptr [g_draka_gate_tramp]
+    }
+}
+
+/* 0x4a712d：edi 已被 movsd 用掉，stage 是函数参数 [ebp+8]（0x4a7153 就这么取）。 */
+static __declspec(naked) void draka_queue_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push dword ptr [ebp+8]
+        call draka_queue_log
+        add  esp, 4
+        popfd
+        popad
+        jmp  dword ptr [g_draka_queue_tramp]
+    }
+}
+
+/* 0x4a76c9：boss 在 ecx。 */
+static __declspec(naked) void draka_point_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push ecx
+        call draka_point_log
+        add  esp, 4
+        popfd
+        popad
+        jmp  dword ptr [g_draka_point_tramp]
+    }
+}
+
+static int draka_diag_install_one(unsigned int va, const unsigned char *sig, int sig_len,
+                                  void *detour, void **tramp, const char *name)
+{
+    unsigned char *p = (unsigned char *)va;
+    if (*tramp) return 1;
+    if (IsBadReadPtr(p, sig_len)) return 0;
+    if (memcmp(p, sig, sig_len) != 0) return 0;   /* 还没解壳到这里，或不是这个版本 */
+    *tramp = install_inline_hook((void *)va, detour, name);
+    return *tramp != NULL;
+}
+
+static int try_patch_draka_diag(void)
+{
+    if (g_draka_diag_patched) return 1;
+    if (!draka_diag_install_one(DRAKA_CTOR_VA, DRAKA_CTOR_SIG, sizeof(DRAKA_CTOR_SIG),
+                                draka_ctor_detour, &g_draka_ctor_tramp,
+                                "岩浆巨龙诊断:boss 创建")) return 0;
+    if (!draka_diag_install_one(DRAKA_GATE_VA, DRAKA_GATE_SIG, sizeof(DRAKA_GATE_SIG),
+                                draka_gate_detour, &g_draka_gate_tramp,
+                                "岩浆巨龙诊断:门开")) return 0;
+    if (!draka_diag_install_one(DRAKA_QUEUE_VA, DRAKA_QUEUE_SIG, sizeof(DRAKA_QUEUE_SIG),
+                                draka_queue_detour, &g_draka_queue_tramp,
+                                "岩浆巨龙诊断:Tracing 入队")) return 0;
+    if (!draka_diag_install_one(DRAKA_POINT_VA, DRAKA_POINT_SIG, sizeof(DRAKA_POINT_SIG),
+                                draka_point_detour, &g_draka_point_tramp,
+                                "岩浆巨龙诊断:弱点点出")) return 0;
+    InterlockedExchange(&g_draka_diag_patched, 1);
+    bslog("PATCH   ★岩浆巨龙诊断已装 @ %08X / %08X / %08X / %08X：boss 创建 / 门开 /"
+          " Tracing 入队 / 弱点点出各打一行 DRAKA（BSHOOK_DRAKA_DIAG=0 可关）",
+          (unsigned)DRAKA_CTOR_VA, (unsigned)DRAKA_GATE_VA,
+          (unsigned)DRAKA_QUEUE_VA, (unsigned)DRAKA_POINT_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* ★ `BigShot.rpt` 里三种旧闪退的守护（V0.3 合成与商店 §48 / §49 / §50，D56）  */
 /*                                                                            */
 /*   三处都是原版少一个判空，各补一个：                                       */
@@ -4909,6 +5272,36 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_bonus_text_patched)
             bslog("PATCH   !! 超时未能 patch 客户端加成绿字"
                   "（0x41414D 特征串一直对不上）");
+    }
+
+    /* 岩浆巨龙（Quest02）弱点剧情的窗口（用户 2026-09-10 线上报的卡关）：
+       原版只在 boss 正放出生动画那 3.84 秒里才肯放 Tracing，窗口一错过
+       boss 从此免疫伤害。判据换成「弱点还没点出来」。 */
+    if (draka_tracing_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_DRAKA_TRACING_RACE 已设，保留原版岩浆巨龙"
+              "弱点剧情窗口（有概率永久卡关）");
+    } else {
+        for (ticks = 0; !g_stop && !g_draka_tracing_patched && ticks < 2000; ticks++) {
+            if (try_patch_draka_tracing_gate()) break;
+            Sleep(2);
+        }
+        if (!g_draka_tracing_patched)
+            bslog("PATCH   !! 超时未能 patch 岩浆巨龙弱点剧情"
+                  "（0x4B5A04 特征串一直对不上）");
+    }
+
+    /* 岩浆巨龙诊断日志（会话 27）：boss 创建 / 门开 / Tracing 入队 / 弱点点出，
+       一局几行、任何日志级别都记 —— 下次卡关靠它分辨病在哪、窗口被吃掉多少。 */
+    if (!draka_diag_enabled()) {
+        bslog("PATCH   不装岩浆巨龙诊断（BSHOOK_DRAKA_DIAG=0）");
+    } else {
+        for (ticks = 0; !g_stop && !g_draka_diag_patched && ticks < 2000; ticks++) {
+            if (try_patch_draka_diag()) break;
+            Sleep(2);
+        }
+        if (!g_draka_diag_patched)
+            bslog("PATCH   !! 超时未能装岩浆巨龙诊断"
+                  "（0x4B1812 / 0x4A70B4 / 0x4A712D / 0x4A76C9 特征串一直对不上）");
     }
 
     /* BigShot.rpt 里三种旧闪退的守护（§48 / §49 / §50，D56）：教程弹窗时大厅为空、
