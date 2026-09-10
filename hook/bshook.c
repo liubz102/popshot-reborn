@@ -4047,141 +4047,247 @@ static int try_patch_mapchange_dangling(void)
 }
 
 /* -------------------------------------------------------------------------- */
-/* ★★★★ 关掉 NEXON 那套信使 —— `nmconew.dll` 一律不让加载                     */
-/*        （V0.3 §80，bug调查/18；根治 §68 那一族崩溃，用户 2026-09-10 拍板）  */
+/* ★★★ bug调查/18 里「各只出现一次」的三种散崩（V0.3 §81）                    */
 /*                                                                            */
-/*   §79 里 23 份线上崩溃有 4 份栈**整条都在 `nmconew.dll` 里**（两个落点：    */
-/*   `+0x98D62` 自制互斥体 `Enter()` 醒来往已析构的锁里写、`+0x26591`）。      */
-/*   触发条件这次看清楚了：**同一个账号在本机重新登录**（新连接把旧的顶掉），  */
-/*   新登进来那个客户端 17~31 秒后崩 —— 信使那套东西在拆了重建的缝里翻车。     */
+/*   三份都有完整 minidump，逐份查到根因了 —— 不是「查不出」，是上一轮只做了   */
+/*   一遍浅的。三处都补在**原版自己就漏掉的那一句判断**上。                    */
 /*                                                                            */
-/*   §68 当时不敢动它（基址随机、锁对象已经没了，跳过那两句只是把崩溃挪一行）。 */
-/*   ★ 换个位置就干净了：**根本别让它加载**。这套信使连的是停机 15 年的        */
-/*   `platform.tiancity.com` / `ngm.nexon.net`，功能早就是零。                 */
-/*                                                                            */
-/*   为什么这么做是安全的（全部静态坐实，不是「试试看」）：                    */
-/*                                                                            */
-/*     1. `nmconew.dll` **只有一个加载点** —— `nmcogame.dll` 的                */
-/*        `NMCO_CallNMFunc`（`0x10002005` / `0x1000201E` 调它的               */
-/*        `DynamicLib::Load`，路径是 `GetModuleFileNameA` + 目录 + 文件名，    */
-/*        文件名由 `0x10006AD0` 返回 = `"nmconew.dll"`）。                     */
-/*     2. 那个 `Load` 对 `LoadLibraryA` 返回 NULL **判空**（`0x10001458`），   */
-/*        `NMCO_CallNMFunc` 随后 `[0x10036168] == 0` 走                       */
-/*        `0x1000204F` 那条**设计好的退路**：往日志文件写一行                  */
-/*        `"Fail to load messenger module! Version file URL: …"`              */
-/*        （`0x10003870` 是写文件的记录器，不是弹框 —— 全模块唯一那个          */
-/*        MessageBox 包装 `0x10027CCF` 只被 `0x1002330E` / `0x10025908` 调）， */
-/*        然后 `xor eax,eax` **返回 0**。                                     */
-/*     3. 客户端侧 `0x5441DB` 拿到返回值就 `cmp eax,1 / jne` 走失败分支、      */
-/*        整个包装函数返回 false —— 一条**原版自己就有**的普通失败路径。       */
-/*     4. `NMService.exe` 的 exe 名和 `"%s" -domain:%s` 命令行模板             */
-/*        **只存在于 `nmconew.dll` 里**（`nmcogame.dll` 里一个字都没有）       */
-/*        ⇒ 不加载它，那个进程自然也不会被拉起来。用户要的「不要 NMService」   */
-/*        这一条同时就做到了，不用再去拦 `CreateProcess`。                     */
-/*                                                                            */
-/*   做法：**只改 `nmcogame.dll` 自己的 IAT**（RVA `0x2C030` = 它导入的        */
-/*   `kernel32!LoadLibraryA`），换成一个按文件名过滤的桩。不去 inline hook     */
-/*   `kernel32!LoadLibraryA` —— 那是全进程的热路径，为了一个 DLL 去动它        */
-/*   波及面太大。写之前先核对「这一格现在正好等于                              */
-/*   `GetProcAddress(kernel32,"LoadLibraryA")`」，对不上就不写（这比字节特征   */
-/*   串更硬：它直接证明这一格就是那个导入槽）。                                */
-/*                                                                            */
-/*   设 BSHOOK_KEEP_NM=1 保留原版行为（要用信使 / 要复现 §68 时）。            */
+/*   ★ 这三份 dump 的异常 `CONTEXT` 大半是坏的（`Eip=0`、`Esp` 指在栈顶），     */
+/*     结论靠的是**栈扫描 + `ExceptionInformation` + 镜像里的静态事实**。      */
 /* -------------------------------------------------------------------------- */
-#define NMCOGAME_LOADLIBRARYA_IAT_RVA  0x0002C030u
 
-typedef HMODULE (WINAPI *LoadLibraryA_t)(LPCSTR);
-static LoadLibraryA_t s_nm_LoadLibraryA = NULL;   /* 真的那一个 */
-static volatile LONG g_nm_block_hits = 0;
-static volatile LONG g_nm_blocked = 0;
+/* --- A. 胜负条件析构时走的是**已经释放掉的** LobbyStage ------------------- */
+/*                                                                            */
+/*   现场（306052979 2026-09-10 19:37:10）。栈（外 -> 内）：                   */
+/*     WinMain 0x40A60B -> 主循环 0x40DE91 -> 切 stage 0x40DDF5 -> …           */
+/*       -> Stage 析构 0x477D06 -> GameContext 析构 0x48CF57                   */
+/*       -> QuestVictoryCondition 析构 0x55E0D9（尾跳基类 0x55C25A）           */
+/*       -> 0x55C284 call 0x55C809 -> 0055C811 `mov edi,[eax]`  ★ 崩          */
+/*                                                                            */
+/*   dump 里的硬事实：**`[0x72e29c]`（LobbyStage 全局）已经是 0**，            */
+/*   而 `[胜负条件+0x174]` 还是 `0x2023CFE8`。那一格就是 LobbyStage：          */
+/*   基类构造 `0x55C218 mov [esi+0x174], edi` 存的就是入参，而同一个入参在     */
+/*   构造里被 `0x4045F9` / `0x40462C`（**已知的 LobbyStage 座位取值器**）用着。 */
+/*   析构里 `0x55C27A call 0x404D42` 算的是 `表基 + 座位*0x3C + 0x40`          */
+/*   —— 逐字节就是 LobbyStage 的座位槽布局。                                  */
+/*                                                                            */
+/*   ⇒ **拆除顺序 bug**：`LobbyStage::~LobbyStage`（`0x40545B` 把全局清 0）    */
+/*   先跑，之后 GameContext 才拆，而胜负条件握着一个**裸指针**，               */
+/*   到这一步去遍历六个座位里的链表 —— 表头读出来是堆垃圾（`0x46EA816B`）。    */
+/*                                                                            */
+/*   补法：偷 `0x55C260`（`mov [esi],虚表`，正好一条 6 字节指令），            */
+/*   LobbyStage 已经没了、或者和自己记的那个对不上，就**整段逐座位循环跳过**   */
+/*   （去 `0x55C294` 的收尾）。这不是兜底，这就是正确语义：**我登记的那个      */
+/*   LobbyStage 都不在了，没有任何东西需要反注册**。                          */
+/*   栈是平的：入口 `push ebx/ebp/esi/edi` 四个，`0x55C294` 正好四个 pop。     */
 
-/* 大小写无关地找子串（不用 CRT 的 _stricmp/strstr 组合，短小自证）。 */
-static int name_has_ci(const char *hay, const char *needle)
+/* --- B. UTF-16 资源文件的缓冲区**少一个终止字节** ------------------------- */
+/*                                                                            */
+/*   现场（1119646014 2026-09-10 20:59:34，`读 0x5375D000`）。                */
+/*   `0x5D9DE7` 读文本资源：                                                  */
+/*                                                                            */
+/*     005d9e00  lea eax,[ebx+1]  / call malloc      ★ 只多分配 1 字节        */
+/*     005d9e0b  lea eax,[ebx+1]  / call memset(0)                            */
+/*     005d9e20  call [obj+0x18]                     读 ebx 字节进来          */
+/*     005d9e23  cmp byte [edi],0xFF / [edi+1],0xFE  ★ 认 UTF-16LE BOM        */
+/*     005d9e35  call 0x4012ED                       ★ wcslen(buf+2) —— 崩这  */
+/*                                                                            */
+/*   宽字符终止符要 **2 个** 0 字节，`malloc(len+1)` 只给了 1 个。             */
+/*   `len` 是偶数时 `buf[len]` 是那唯一的 0，`buf[len+1]` 已经出界 ——          */
+/*   后面那个字节非 0 就一路扫下去，撞上未提交页才崩。                        */
+/*                                                                            */
+/*   算得严丝合缝：`ebx=0x1A2C`(6700) ⇒ 分配 6701；`esi=0xD2F`(3375) 个宽字符  */
+/*   × 2 + 2 = 6752，`edi=0x5375B5A0` + 6752 = `0x5375D000` = 出错地址。       */
+/*   6700 字节的 UTF-16 资源全 `Pack_decrypt` 只有一个：                      */
+/*   `Data/Ui/CompositionToolTipNewUI.ui`（合成界面提示框）。                 */
+/*   ★ 而那 272 个 UTF-16 `.ui` **字节数全是偶数** ⇒ 每一个都踩在这上面，     */
+/*     只是堆里紧跟着的那个字节通常正好是 0，才没天天崩。                     */
+/*                                                                            */
+/*   补法：两处 `lea eax,[ebx+1]` 的立即数 `01` 改成 `02`，**各一个字节**。   */
+/*   多要 1 字节、`memset` 也多清 1 字节，两个 0 齐了。缓冲区在 `0x5D9E72`    */
+/*   `free` 掉，长度不外传，没有别的地方依赖它。                              */
+
+/* --- C. UI 向量的 `_First` 为空时照样取元素 ------------------------------- */
+/*                                                                            */
+/*   现场（306052979 2026-09-10 21:44:35，`读 0x00000000`）。                 */
+/*     0x438BC1  ecx=&vec ; eax=[ecx+4]-[ecx] >>2   元素个数                  */
+/*     0x438BC9  cmp ebx,ecx / jge 出口             ★ 只用「个数」判空        */
+/*     0x438BD3  mov eax,[eax]                      _First                    */
+/*     0x438BD5  mov eax,[eax+ebx*4]                ★ _First == 0 -> 崩       */
+/*                                                                            */
+/*   `_Last != 0` 而 `_First == 0` = **被拆到一半的向量**。栈上能看到          */
+/*   `0x428122 -> 0x40DE91 -> DispatchMessage -> WndProc(0x40EF4F)` ——         */
+/*   外层代码开了一个**嵌套消息泵**，泵出来的窗口消息又回到这个 UI 对象上，    */
+/*   正撞在它重建 `[esi+0x568+i*12]` 那几个向量的中间。                       */
+/*                                                                            */
+/*   ★ 这一处是**兜底**（只有一份现场，重入的源头没查到）：`_First` 为空就当  */
+/*   这张表是空的，跳到 `0x438BF2`（和原版「个数不够」走的是同一个出口）。     */
+/*   地址 0 永远不可能是合法的 `_First`，所以判空不会误伤。触发时打一行日志。  */
+/* -------------------------------------------------------------------------- */
+
+/* --- A --- */
+#define VCDTOR_VA          0x0055C260u
+#define VCDTOR_SIG_LEN     14
+static const unsigned char VCDTOR_SIG[VCDTOR_SIG_LEN] = {
+    0xC7, 0x06, 0x04, 0x35, 0x69, 0x00,   /* mov dword [esi],0x693504        */
+    0x33, 0xED,                           /* xor ebp,ebp                     */
+    0x8D, 0x7E, 0x54,                     /* lea edi,[esi+0x54]              */
+    0x80, 0x3F, 0x00                      /* cmp byte [edi],0                */
+};
+#define VCDTOR_RETURN_TO   0x0055C266     /* xor ebp,ebp …（照常清理）        */
+#define VCDTOR_SKIP_TO     0x0055C294     /* pop edi/esi/ebp/ebx ; ret        */
+#define VCDTOR_VFTABLE     0x00693504
+#define LOBBY_STAGE_GLOBAL 0x0072E29C
+#define VC_LOBBY_OFF       0x174
+
+static volatile LONG g_vcdtor_hits = 0;
+
+static void __stdcall vcdtor_note(unsigned int stale, unsigned int live)
 {
-    size_t i, j;
-    if (!hay || !needle) return 0;
-    for (i = 0; hay[i]; i++) {
-        for (j = 0; needle[j]; j++) {
-            char a = hay[i + j], b = needle[j];
-            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
-            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
-            if (a != b) break;
-        }
-        if (!needle[j]) return 1;
+    LONG n = InterlockedIncrement(&g_vcdtor_hits);
+    bslog("★拆除   胜负条件析构时 LobbyStage 已经没了（它记的 %08X，现在的 %08X）"
+          "—— 逐座位反注册整段跳过（第 %ld 次；不跳就是 bug调查/18 §81-A 那个"
+          "退出时闪退）", stale, live, (long)n);
+}
+
+static __declspec(naked) void vcdtor_guard_detour(void)
+{
+    __asm {
+        mov  dword ptr [esi], VCDTOR_VFTABLE    /* 被偷走的原指令 */
+        mov  eax, LOBBY_STAGE_GLOBAL
+        mov  eax, dword ptr [eax]
+        test eax, eax
+        jz   vcd_skip                           /* LobbyStage 已经析构 */
+        cmp  dword ptr [esi + VC_LOBBY_OFF], eax
+        jne  vcd_skip                           /* 记的是另一个（也是陈的） */
+        push VCDTOR_RETURN_TO
+        ret
+    vcd_skip:
+        pushad
+        push eax
+        push dword ptr [esi + VC_LOBBY_OFF]
+        call vcdtor_note
+        popad
+        push VCDTOR_SKIP_TO
+        ret
     }
-    return 0;
 }
 
-static HMODULE WINAPI det_nmcogame_LoadLibraryA(LPCSTR name)
+/* --- B --- */
+#define UTF16BUF_A_VA  0x005D9E00u        /* lea eax,[ebx+1]  (malloc 的长度) */
+#define UTF16BUF_B_VA  0x005D9E0Bu        /* lea eax,[ebx+1]  (memset 的长度) */
+
+/* --- C --- */
+#define UIVEC_VA           0x00438BD3u
+#define UIVEC_SIG_LEN      10
+static const unsigned char UIVEC_SIG[UIVEC_SIG_LEN] = {
+    0x8B, 0x00,                           /* mov eax,[eax]      _First       */
+    0x8B, 0x04, 0x98,                     /* mov eax,[eax+ebx*4]             */
+    0x85, 0xC0,                           /* test eax,eax                    */
+    0x74, 0x11,                           /* je  0x438BED                    */
+    0x8B                                  /* mov …                           */
+};
+#define UIVEC_RETURN_TO    0x00438BD8     /* test eax,eax …（原路）           */
+#define UIVEC_SKIP_TO      0x00438BF2     /* pop edi ; pop ebx ; leave ; ret  */
+
+static volatile LONG g_uivec_hits = 0;
+
+static void __stdcall uivec_note(unsigned int vec)
 {
-    if (name_has_ci(name, "nmconew")) {
-        LONG n = InterlockedIncrement(&g_nm_block_hits);
-        bslog("★NM     挡下 nmcogame 加载信使模块：\"%s\"（第 %ld 次）—— "
-              "NMCO_CallNMFunc 会走它自己的「模块不可用」退路返回 0，"
-              "NMService.exe 也不会被拉起来（bug调查/18 §80）",
-              name ? name : "(null)", (long)n);
-        SetLastError(ERROR_MOD_NOT_FOUND);
-        return NULL;
+    LONG n = InterlockedIncrement(&g_uivec_hits);
+    bslog("★UI     向量 %08X 的 _First 是空的（_Last 非空 = 拆到一半），"
+          "当成空表跳过（第 %ld 次，bug调查/18 §81-C —— 嵌套消息泵重入）",
+          vec, (long)n);
+}
+
+static __declspec(naked) void uivec_guard_detour(void)
+{
+    __asm {
+        mov  eax, dword ptr [eax]           /* 被偷走的原指令：_First */
+        test eax, eax
+        jz   uiv_skip
+        mov  eax, dword ptr [eax + ebx*4]   /* 被偷走的第二条 */
+        push UIVEC_RETURN_TO
+        ret
+    uiv_skip:
+        pushad
+        push eax
+        call uivec_note
+        popad
+        push UIVEC_SKIP_TO
+        ret
     }
-    return s_nm_LoadLibraryA(name);
 }
 
-static int nm_keep_original(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_NM", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
+static volatile LONG g_crash18_guards_patched = 0;
 
-static int try_block_nexon_messenger(void)
+/* 把 0x5D9E02 / 0x5D9E0D 那两个 `01` 立即数改成 `02`（只改一个字节）。 */
+static int poke_imm8(unsigned int va, unsigned char expect, unsigned char want,
+                     const char *what)
 {
-    HMODULE nmcogame, k32;
-    LoadLibraryA_t real;
-    LoadLibraryA_t *slot;
+    unsigned char *p = (unsigned char *)va;
     DWORD oldp;
-
-    if (g_nm_blocked) return 1;
-    nmcogame = GetModuleHandleA("nmcogame.dll");
-    if (!nmcogame) return 0;                     /* 还没加载，下一轮再来 */
-    k32 = GetModuleHandleA("kernel32.dll");
-    if (!k32) return 0;
-    real = (LoadLibraryA_t)GetProcAddress(k32, "LoadLibraryA");
-    if (!real) return 0;
-
-    slot = (LoadLibraryA_t *)((UINT_PTR)nmcogame + NMCOGAME_LOADLIBRARYA_IAT_RVA);
-    if (IsBadReadPtr(slot, sizeof(*slot))) {
-        bslog("★NM     nmcogame IAT %08X 读不了，放弃拦截（保留原版行为）",
-              (unsigned)(UINT_PTR)slot);
-        InterlockedExchange(&g_nm_blocked, 1);   /* 别再重试 */
-        return 1;
-    }
-    if (*slot == det_nmcogame_LoadLibraryA) {    /* 幂等 */
-        InterlockedExchange(&g_nm_blocked, 1);
-        return 1;
-    }
-    if (*slot != real) {
-        bslog("★NM     nmcogame IAT %08X = %08X，不是 kernel32!LoadLibraryA(%08X)"
-              " —— 版本对不上，不动它",
-              (unsigned)(UINT_PTR)slot, (unsigned)(UINT_PTR)*slot,
-              (unsigned)(UINT_PTR)real);
-        InterlockedExchange(&g_nm_blocked, 1);
-        return 1;
-    }
-    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &oldp)) {
-        bslog("★NM     nmcogame IAT VirtualProtect 失败 err=%lu",
-              (unsigned long)GetLastError());
+    if (IsBadReadPtr(p, 1)) return 0;
+    if (*p == want) return 1;                    /* 幂等 */
+    if (*p != expect) return 0;                  /* 还没解壳 / 版本对不上 */
+    if (!VirtualProtect(p, 1, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   %s: VirtualProtect 失败 err=%lu",
+              what, (unsigned long)GetLastError());
         return 0;
     }
-    s_nm_LoadLibraryA = real;
-    *slot = det_nmcogame_LoadLibraryA;
-    VirtualProtect(slot, sizeof(*slot), oldp, &oldp);
-    InterlockedExchange(&g_nm_blocked, 1);
-    bslog("PATCH   ★NEXON 信使已关（bug调查/18）: nmcogame.dll base=%08X "
-          "IAT %08X 的 LoadLibraryA 换成过滤桩 —— nmconew.dll 不再加载，"
-          "NMService.exe 也不会起（BSHOOK_KEEP_NM=1 可退回原版）",
-          (unsigned)(UINT_PTR)nmcogame, (unsigned)(UINT_PTR)slot);
+    *p = want;
+    VirtualProtect(p, 1, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, 1);
     return 1;
 }
+
+static int try_patch_crash18_guards(void)
+{
+    int a, b1, b2, c;
+
+    if (g_crash18_guards_patched) return 1;
+    a = install_jmp_guard(VCDTOR_VA, VCDTOR_SIG, VCDTOR_SIG_LEN,
+                          6, vcdtor_guard_detour, "胜负条件析构判 LobbyStage");
+    /* ★ 这两句的字节完全一样（8D 43 01），所以按**地址**分别 poke，
+       不用特征串定位 —— 地址是从镜像上量出来的，签名就是那个 01 本身。 */
+    b1 = poke_imm8(UTF16BUF_A_VA + 2, 0x01, 0x02, "UTF-16 缓冲区 malloc 长度");
+    b2 = poke_imm8(UTF16BUF_B_VA + 2, 0x01, 0x02, "UTF-16 缓冲区 memset 长度");
+    c  = install_jmp_guard(UIVEC_VA, UIVEC_SIG, UIVEC_SIG_LEN,
+                           5, uivec_guard_detour, "UI 向量 _First 判空");
+    if (!(a && b1 && b2 && c)) return 0;
+    InterlockedExchange(&g_crash18_guards_patched, 1);
+    bslog("PATCH   ★散崩守护 x3（bug调查/18 §81）: 胜负条件析构判 LobbyStage @ %08X"
+          " / UTF-16 资源缓冲区 len+1 -> len+2 @ %08X %08X"
+          " / UI 向量 _First 判空 @ %08X",
+          (unsigned)VCDTOR_VA, (unsigned)(UTF16BUF_A_VA + 2),
+          (unsigned)(UTF16BUF_B_VA + 2), (unsigned)UIVEC_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★★★★★ 【试过，不行】拦 `nmconew.dll` 的加载会让**登录直接失败**         */
+/*        （V0.3 §80，2026-09-11 实机推翻）                                */
+/*                                                                            */
+/*   为了根治 §68 那一族崩溃（4/23 份，全在 `nmconew.dll` 的工作线程里），    */
+/*   本轮试过「把 `nmcogame.dll` 自己那一格 `LoadLibraryA`（IAT RVA 0x2C030） */
+/*   换成过滤桩，见到 nmconew.dll 就回 NULL」。静态看是干净的：               */
+/*   `DynamicLib::Load` 判空、`NMCO_CallNMFunc` 有「模块不可用」退路、        */
+/*   不弹框不下载、`NMService.exe` 也确实只由 nmconew 拉起。                  */
+/*                                                                            */
+/*   ★ **实机一登就翻**：点「登录」后 **9 毫秒**弹「登录失败 /               */
+/*     认证服务器失败 (20000)」，**一个网络包都没发**（本机认证服的连接       */
+/*     计数器一直是 0）。时间线：按钮 -> 6 发 `NMCO_CallNMFunc` 全被挡下      */
+/*     -> 立刻弹框。而且 nmcogame 会把「模块不可用」记住，**后面每一次       */
+/*     登录都直接失败**（第二次起连 LoadLibrary 都不再试）。                  */
+/*                                                                            */
+/*   ⇒ 登录路径**确实依赖** `NMCO_CallNMFunc` 返回 1。平时能登录不是因为      */
+/*     信使能用（它连的服务器停机 15 年了），而是因为**那一发返回了 1** ——    */
+/*     模块在、调用被派发出去就算成功，后面连不上是异步的事，客户端不管。     */
+/*                                                                            */
+/*   ⇒ 要再试，只能在**更外面**下手（例如把 BigShot 那一格 IAT               */
+/*     `0x63751C`（`NMCO_CallNMFunc`）换掉、直接返回 1，让 nmcogame 压根      */
+/*     不进去）。**没验过，别当结论。** §68 目前仍是未修。                    */
+/* -------------------------------------------------------------------------- */
 
 /* ========================================================================== */
 /* ★ M3b 诊断：弹体全字段快照 —— 查「bot 的子弹别人看不见」（V0.3 §53~§56）   */
@@ -6043,20 +6149,21 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x4790CB 特征串一直对不上）");
     }
 
-    /* bug调查/18（§80）：把 NEXON 那套信使整个关掉 —— `nmconew.dll` 不让加载，
-       `NMService.exe` 跟着就不会被拉起来。用户 2026-09-10 拍板「没用可以不要」。
-       ★ 等的是 `nmcogame.dll` 出现（它是 BigShot.exe 的静态导入，解壳后就在），
-       而真正要拦的那一发发生在**玩家点登录**的时候，远在后面。 */
-    if (nm_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_NM 已设，保留 NEXON 信使（nmconew.dll 照常加载）");
+    /* bug调查/18（§81）：三种「各出现一次」的散崩 —— 胜负条件析构走已释放的
+       LobbyStage / UTF-16 资源缓冲区少一个终止字节 / UI 向量 `_First` 不判空。
+       和上面那几批共用 BSHOOK_KEEP_RPT_CRASHES 开关。 */
+    if (rpt_crashes_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_RPT_CRASHES 已设，bug调查/18 那三处散崩守护也不装");
     } else {
-        for (ticks = 0; !g_stop && !g_nm_blocked && ticks < 2000; ticks++) {
-            if (try_block_nexon_messenger()) break;
+        for (ticks = 0; !g_stop && !g_crash18_guards_patched && ticks < 2000; ticks++) {
+            if (try_patch_crash18_guards()) break;
             Sleep(2);
         }
-        if (!g_nm_blocked)
-            bslog("PATCH   !! 超时未能关掉 NEXON 信使（nmcogame.dll 一直没出现）");
+        if (!g_crash18_guards_patched)
+            bslog("PATCH   !! 超时未能 patch bug调查/18 的散崩守护"
+                  "（0x55C260 / 0x5D9E02 / 0x5D9E0D / 0x438BD3 特征对不上）");
     }
+
 
     /* BSM1 is a functional patch, independent of diagnostic log settings. */
     if (!try_patch_bot_motion())
