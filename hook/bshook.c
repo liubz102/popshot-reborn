@@ -3502,6 +3502,321 @@ static int try_patch_rpt_crash_guards(void)
     return 1;
 }
 
+/* -------------------------------------------------------------------------- */
+/* ★★★ 崩溃报告器自己会崩 —— 出错地址不在任何已加载模块里就死在 0x5D76CD      */
+/*      （V0.3 合成与商店 §65，bug调查/17）                                    */
+/*                                                                            */
+/*   原版写 `Dump\LastCrashReport.txt` / `BigShot.rpt` 的函数 0x5d7b90：       */
+/*                                                                            */
+/*     …写完 "Exception code: %08X %s"                                        */
+/*     005d7ca5  call 0x5d7695(出错地址, 名字缓冲区, 0x104, &节号, &节内偏移)  */
+/*     005d7cad  写 "Fault address:  %08X %02X:%08X %s"                       */
+/*                                                                            */
+/*   而 0x5d7695 这么找模块：                                                 */
+/*                                                                            */
+/*     005d76a6  VirtualQuery(addr, &mbi, 0x1c)   ; 失败 -> 返回 0            */
+/*     005d76b8  edi = mbi.AllocationBase                                      */
+/*     005d76bf  GetModuleFileNameA(edi, 缓冲区, 0x104)  ; 失败 -> 返回 0     */
+/*     005d76cd  eax = [edi+0x3c]                 ; ★★ edi == 0 时读空指针    */
+/*                                                                            */
+/*   出错地址落在**已释放 / 从未提交**的页上时（= 通过野函数指针 call 过去，   */
+/*   最常见的崩法），`AllocationBase` 就是 0，而 `GetModuleFileNameA(NULL,…)`  */
+/*   按 Win32 语义返回的是**主模块路径**、非 0 ⇒ 判断放行 ⇒ `[0+0x3c]` 崩。   */
+/*   崩在异常过滤器里 = 报告写到一半没了、`.mdmp` 根本没生成。                 */
+/*                                                                            */
+/*   ✅ 实证（bug调查/17 的 5 份现场）：3 份的 `LastCrashReport.txt` 正好断在   */
+/*   "Exception code: C0000005 ACCESS_VIOLATION\r\r\n" 之后一个字节不多，      */
+/*   `Dump File Name:` 那一行点名的 `.mdmp` 都不存在 —— 全断在这一句上。       */
+/*   ⇒ **这三次崩溃的现场我们一个字都没拿到**，修它是拿到后续证据的前提。       */
+/*                                                                            */
+/*   另一半毛病：三个出参（名字 / 节号 / 节内偏移）原版**从不初始化**，        */
+/*   两条失败路径都直接 return，调用方照样把它们打出去 —— 于是 09930195 那份    */
+/*   打出来的是 `4DB8E501 00:00C5022C \x02`（栈上的垃圾）。                    */
+/*                                                                            */
+/*   补法（偷 0x5d76b4 起的 7 字节 = 三条原指令）：                            */
+/*     ① 先把三个出参填成「不在模块里」的合法值：名字 = 空串、节号 = 0、       */
+/*        节内偏移 = 出错地址本身 —— 之后任何一条失败路径打出来的都是          */
+/*        `<地址> 00:<地址>`，不再是垃圾，也不会因为缓冲区没有结尾 0 而跑飞；  */
+/*     ② `AllocationBase == 0` 就直接走原版的失败出口 0x5d76c9                */
+/*        （`xor al,al ; jmp 0x5d7712` = `pop edi; pop esi; leave; ret`）。    */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_RPT_CRASHES=1 一并保留原版行为（和上面三处同一个开关）。   */
+/* -------------------------------------------------------------------------- */
+#define CRASH_RPT_GUARD_VA       0x005D76B4u
+#define CRASH_RPT_GUARD_SIG_LEN  17
+static const unsigned char CRASH_RPT_GUARD_SIG[CRASH_RPT_GUARD_SIG_LEN] = {
+    0x57,                                 /* push edi                          */
+    0xFF, 0x75, 0x10,                     /* push [ebp+0x10]   nSize           */
+    0x8B, 0x7D, 0xE4,                     /* mov  edi,[ebp-0x1c]  AllocationBase*/
+    0xFF, 0x75, 0x0C,                     /* push [ebp+0xc]    名字缓冲区       */
+    0x57,                                 /* push edi          hModule          */
+    0xFF, 0x15, 0xAC, 0x71, 0x63, 0x00    /* call [0x6371ac]  GetModuleFileNameA*/
+};
+#define CRASH_RPT_GUARD_STOLEN     7
+#define CRASH_RPT_GUARD_RETURN_TO  0x005D76BB   /* push [ebp+0xc] —— 接着原路   */
+#define CRASH_RPT_GUARD_EXIT       0x005D76C9   /* xor al,al ; jmp 0x5d7712     */
+
+static volatile LONG g_crash_rpt_guard_hits = 0;
+
+static __declspec(naked) void crash_rpt_guard_detour(void)
+{
+    __asm {
+        /* ① 三个出参先填成「不在任何模块里」的合法值 —— 原版一条失败路径都不填 */
+        push eax
+        push ecx
+        mov  eax, dword ptr [ebp + 0x0C]    /* 模块名缓冲区 */
+        mov  byte ptr [eax], 0              /* 空串，保证 %s 有结尾            */
+        mov  eax, dword ptr [ebp + 0x14]    /* &节号                           */
+        mov  dword ptr [eax], 0
+        mov  ecx, dword ptr [ebp + 0x08]    /* 出错地址                        */
+        mov  eax, dword ptr [ebp + 0x18]    /* &节内偏移                       */
+        mov  dword ptr [eax], ecx           /* 填原始地址，比垃圾有用           */
+        pop  ecx
+        pop  eax
+        /* ② 三条被偷走的原指令 */
+        push edi
+        push dword ptr [ebp + 0x10]
+        mov  edi, dword ptr [ebp - 0x1C]
+        test edi, edi
+        jz   crg_bail
+        push CRASH_RPT_GUARD_RETURN_TO
+        ret
+    crg_bail:
+        /* 地址不在任何映射里：别去 GetModuleFileNameA(NULL) 骗过判断再读 [0+0x3c] */
+        add  esp, 4                         /* 丢掉刚压的 nSize（不调那个 API） */
+        inc  dword ptr [g_crash_rpt_guard_hits]
+        push CRASH_RPT_GUARD_EXIT
+        ret
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★★★ `DashDamage`（突击技对象）野指针守护（V0.3 §66，bug调查/17 崩溃 A）    */
+/*                                                                            */
+/*   现场（09930195 2026-09-10 10:12:48，`C0000096 PRIV_INSTRUCTION`）：       */
+/*   栈是 `GameContext::Process`(0x4904cc) → `Character::ProcessMove`(0x506fed)*/
+/*   → `Character::ProcessDash`(0x5077c6) → 0x4814f2，崩在                    */
+/*                                                                            */
+/*     00481a51  mov eax,[esi]      ; esi = [Character+0x57c] = DashDamage*    */
+/*     00481a53  call [eax+0x78]    ; ★ eax = 0x425DECA0（堆地址，不是虚表）   */
+/*                                                                            */
+/*   ⇒ `[Character+0x57c]` **非空但已经不是对象了**（对象被释放 / 内存被复用）。*/
+/*   DEP 对这个 2007 年的 exe 是关的，于是 call 直接跳进堆里执行垃圾字节，      */
+/*   撞上特权指令就是 `PRIV_INSTRUCTION`；跳进未提交页就是 `ACCESS_VIOLATION`  */
+/*   —— 后者正是上面那三份「报告写到一半」的现场。                             */
+/*                                                                            */
+/*   `[Character+0x57c]` 全 exe 只有三处解引用，三处都不校验，全补上：          */
+/*                                                                            */
+/*     0x502182  Character::StartDash  开新的之前先拆旧的（`call [eax+0x20]`） */
+/*     0x50794a  Character::ProcessDash 画拖影（`call 0x4814f2`）★ 崩的就是它  */
+/*     0x5079aa  Character::ProcessDash 冲刺结束时拆掉（`call [eax+0x20]`）    */
+/*                                                                            */
+/*   判据是**虚表指针**：`DashDamage` 的主虚表恒为 0x66d5dc（构造函数          */
+/*   0x481389 / 0x4813e6 都写这个值，`re/vftables.json` 也认得）。对不上就      */
+/*   当「这一格已经没了」跳过 —— 不写回、不释放：万一是 `Character` 自己成了    */
+/*   野指针，往 `[ebx+0x57c]` 写回去等于二次破坏。`StartDash` 那一处跳过之后    */
+/*   原版自己会在 0x5021f0 用新对象覆盖这一格，所以不会一直卡着。              */
+/*                                                                            */
+/*   ★ 这是**兜底 + 探针**，不是根因修复：谁把对象放掉的还没查到。触发时按     */
+/*   「指针值翻转」去重打一行日志（同一个野指针只报一次，换了才再报），        */
+/*   下次现场靠它就能分辨「真的踩到了」还是「另有病灶」。                      */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_DASH_STALE_CRASH=1 保留原版行为（复现 / 对照用）。         */
+/* -------------------------------------------------------------------------- */
+#define DASHOBJ_VFTABLE          0x0066D5DC   /* DashDamage 主虚表             */
+
+#define DASHOBJ_START_VA         0x00502182  /* StartDash：拆旧的             */
+#define DASHOBJ_START_SIG_LEN    15
+static const unsigned char DASHOBJ_START_SIG[DASHOBJ_START_SIG_LEN] = {
+    0x8B, 0x8F, 0x7C, 0x05, 0x00, 0x00,   /* mov ecx,[edi+0x57c]              */
+    0x85, 0xC9,                           /* test ecx,ecx                     */
+    0x74, 0x0C,                           /* je  0x502198                     */
+    0x8B, 0x01,                           /* mov eax,[ecx]                    */
+    0xFF, 0x50, 0x20                      /* call [eax+0x20]                  */
+};
+#define DASHOBJ_START_RETURN_TO  0x00502188   /* test ecx,ecx …（原路）        */
+#define DASHOBJ_START_SKIP_TO    0x00502198   /* push 0x30c …（直接建新的）    */
+
+#define DASHOBJ_DRAW_VA          0x0050794A  /* ProcessDash：画拖影           */
+#define DASHOBJ_DRAW_SIG_LEN     16
+static const unsigned char DASHOBJ_DRAW_SIG[DASHOBJ_DRAW_SIG_LEN] = {
+    0x83, 0xBB, 0x7C, 0x05, 0x00, 0x00, 0x00, /* cmp dword [ebx+0x57c],0      */
+    0x74, 0x22,                               /* je  0x507975                 */
+    0x8B, 0x03,                               /* mov eax,[ebx]                */
+    0x8D, 0x4D, 0xDC,                         /* lea ecx,[ebp-0x24]           */
+    0x51,                                     /* push ecx                     */
+    0x8B                                      /* mov ecx,ebx                  */
+};
+#define DASHOBJ_DRAW_RETURN_TO   0x00507953   /* `je` 之后那一条（有对象）      */
+#define DASHOBJ_DRAW_SKIP_TO     0x00507975   /* `je` 的目标（没对象）          */
+
+#define DASHOBJ_KILL_VA          0x005079AA  /* ProcessDash：冲刺结束拆掉      */
+#define DASHOBJ_KILL_SIG_LEN     14
+static const unsigned char DASHOBJ_KILL_SIG[DASHOBJ_KILL_SIG_LEN] = {
+    0x8B, 0xB3, 0x7C, 0x05, 0x00, 0x00,       /* mov esi,[ebx+0x57c]          */
+    0x85, 0xF6,                               /* test esi,esi                 */
+    0x0F, 0x84, 0xDE, 0x00, 0x00, 0x00        /* je  0x507a96                 */
+};
+#define DASHOBJ_KILL_RETURN_TO   0x005079B0   /* test esi,esi …（原路）        */
+#define DASHOBJ_KILL_SKIP_TO     0x00507A96   /* mov al,1 ; jmp 0x507ab1      */
+
+/* 「说过了就不再说，直到指针真的变了」—— 按状态翻转去重，不按次数 / 时间窗。 */
+static volatile LONG g_dashobj_stale_ptr = 0;
+static volatile LONG g_dashobj_stale_hits = 0;
+
+static void __stdcall dashobj_stale_note(unsigned int obj, unsigned int site)
+{
+    InterlockedIncrement(&g_dashobj_stale_hits);
+    if ((LONG)obj == InterlockedExchange(&g_dashobj_stale_ptr, (LONG)obj))
+        return;                            /* 同一个野指针，别刷屏 */
+    bslog("★DASH   [Character+0x57C] 指着的不是 DashDamage（虚表 %08X != %08X）"
+          "@ %08X —— 已跳过不用它（累计 %ld 次）；这一格本该在冲刺结束时清掉",
+          obj ? *(unsigned int *)obj : 0u, (unsigned)DASHOBJ_VFTABLE,
+          site, (long)g_dashobj_stale_hits);
+}
+
+static __declspec(naked) void dashobj_start_guard_detour(void)
+{
+    __asm {
+        mov  ecx, dword ptr [edi + 0x57C]   /* 被偷走的原指令 */
+        test ecx, ecx
+        jz   dsg_skip                       /* 本来就是空：原版也是跳过 */
+        cmp  dword ptr [ecx], DASHOBJ_VFTABLE
+        je   dsg_ok
+        pushad
+        push DASHOBJ_START_VA
+        push ecx
+        call dashobj_stale_note
+        popad
+        jmp  dsg_skip
+    dsg_ok:
+        push DASHOBJ_START_RETURN_TO
+        ret
+    dsg_skip:
+        push DASHOBJ_START_SKIP_TO
+        ret
+    }
+}
+
+static __declspec(naked) void dashobj_draw_guard_detour(void)
+{
+    __asm {
+        mov  eax, dword ptr [ebx + 0x57C]   /* 原指令是 cmp …,0；我们直接取值 */
+        test eax, eax
+        jz   ddg_skip
+        cmp  dword ptr [eax], DASHOBJ_VFTABLE
+        je   ddg_ok
+        pushad
+        push DASHOBJ_DRAW_VA
+        push eax
+        call dashobj_stale_note
+        popad
+        jmp  ddg_skip
+    ddg_ok:
+        push DASHOBJ_DRAW_RETURN_TO         /* 越过那条 je，不依赖标志位 */
+        ret
+    ddg_skip:
+        push DASHOBJ_DRAW_SKIP_TO
+        ret
+    }
+}
+
+static __declspec(naked) void dashobj_kill_guard_detour(void)
+{
+    __asm {
+        mov  esi, dword ptr [ebx + 0x57C]   /* 被偷走的原指令 */
+        test esi, esi
+        jz   dkg_skip
+        cmp  dword ptr [esi], DASHOBJ_VFTABLE
+        je   dkg_ok
+        pushad
+        push DASHOBJ_KILL_VA
+        push esi
+        call dashobj_stale_note
+        popad
+        jmp  dkg_skip
+    dkg_ok:
+        push DASHOBJ_KILL_RETURN_TO
+        ret
+    dkg_skip:
+        push DASHOBJ_KILL_SKIP_TO
+        ret
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★★ `0x0411 gspEndGame` 处理器不判空：没有 GameContext 时读空指针           */
+/*     （V0.3 §67，本机 `BigShot.rpt` 2026-09-10 00:05:39 那次）              */
+/*                                                                            */
+/*     005518de  mov esi,[0x72e2dc]   ; 当前 GameContext（不在关卡里 = NULL）  */
+/*     005518e4  call 0x4913fc        ; 弹结算界面，第一句就是                 */
+/*     0049140c    cmp byte [esi+4], bl   ★ esi == 0 -> C0000005              */
+/*                                                                            */
+/*   `[0x72e2dc]` 只在关卡里非空 —— `Character::StartDash`(0x5020e6) 自己就先   */
+/*   判了空，这条路上原版忘了。任何一发在关卡外到达的 `0x0411` 都会闪退：      */
+/*   控制通道的 `clear` / `endgame`（`tools/quest-clear.bat` 调的就是它）在     */
+/*   人不在关卡里时发一发就能复现，线上则是「结算包比舞台拆除晚到」。          */
+/*                                                                            */
+/*   补法：偷 0x5518de 起 6 字节，GameContext 为空就跳过那一发，直接去          */
+/*   0x5518e9（后面 `0x4087f0` 那一发只读 `[0x72e29c]`，和 GameContext 无关）。 */
+/* -------------------------------------------------------------------------- */
+#define ENDGAME_GUARD_VA         0x005518DEu
+#define ENDGAME_GUARD_SIG_LEN    12
+static const unsigned char ENDGAME_GUARD_SIG[ENDGAME_GUARD_SIG_LEN] = {
+    0x8B, 0x35, 0xDC, 0xE2, 0x72, 0x00,   /* mov esi,[0x72e2dc]  GameContext  */
+    0xE8, 0x13, 0xFB, 0xF3, 0xFF, 0xFF    /* call 0x4913fc                    */
+};
+#define ENDGAME_GUARD_RETURN_TO  0x005518E4   /* call 0x4913fc（原路）         */
+#define ENDGAME_GUARD_SKIP_TO    0x005518E9   /* push [0x72e29c] ; call 0x4087f0 */
+#define GAME_CONTEXT_GLOBAL      0x0072E2DC
+
+static volatile LONG g_endgame_guard_hits = 0;
+
+static __declspec(naked) void endgame_guard_detour(void)
+{
+    __asm {
+        mov  esi, GAME_CONTEXT_GLOBAL       /* 被偷走的原指令 mov esi,[0x72e2dc] */
+        mov  esi, dword ptr [esi]
+        test esi, esi
+        jz   egg_skip
+        push ENDGAME_GUARD_RETURN_TO
+        ret
+    egg_skip:
+        inc  dword ptr [g_endgame_guard_hits]
+        push ENDGAME_GUARD_SKIP_TO
+        ret
+    }
+}
+
+static volatile LONG g_crash17_guards_patched = 0;
+
+/* bug调查/17 那一批守护共用一个开关（和 §48~§50 那三处是同一类东西）。 */
+static int try_patch_crash17_guards(void)
+{
+    int a, b, c, d, e;
+
+    if (g_crash17_guards_patched) return 1;
+    a = install_jmp_guard(CRASH_RPT_GUARD_VA, CRASH_RPT_GUARD_SIG, CRASH_RPT_GUARD_SIG_LEN,
+                          CRASH_RPT_GUARD_STOLEN, crash_rpt_guard_detour,
+                          "崩溃报告器找模块判空");
+    b = install_jmp_guard(DASHOBJ_START_VA, DASHOBJ_START_SIG, DASHOBJ_START_SIG_LEN,
+                          6, dashobj_start_guard_detour, "突击技对象校验(StartDash)");
+    c = install_jmp_guard(DASHOBJ_DRAW_VA, DASHOBJ_DRAW_SIG, DASHOBJ_DRAW_SIG_LEN,
+                          7, dashobj_draw_guard_detour, "突击技对象校验(绘制)");
+    d = install_jmp_guard(DASHOBJ_KILL_VA, DASHOBJ_KILL_SIG, DASHOBJ_KILL_SIG_LEN,
+                          6, dashobj_kill_guard_detour, "突击技对象校验(销毁)");
+    e = install_jmp_guard(ENDGAME_GUARD_VA, ENDGAME_GUARD_SIG, ENDGAME_GUARD_SIG_LEN,
+                          6, endgame_guard_detour, "gspEndGame 判空");
+    if (!(a && b && c && d && e)) return 0;
+    InterlockedExchange(&g_crash17_guards_patched, 1);
+    bslog("PATCH   ★崩溃守护 x5（bug调查/17）: 报告器找模块判空 @ %08X"
+          " / 突击技对象校验 @ %08X %08X %08X / gspEndGame 判空 @ %08X",
+          (unsigned)CRASH_RPT_GUARD_VA, (unsigned)DASHOBJ_START_VA,
+          (unsigned)DASHOBJ_DRAW_VA, (unsigned)DASHOBJ_KILL_VA,
+          (unsigned)ENDGAME_GUARD_VA);
+    return 1;
+}
+
 /* ========================================================================== */
 /* ★ M3b 诊断：弹体全字段快照 —— 查「bot 的子弹别人看不见」（V0.3 §53~§56）   */
 /*                                                                            */
@@ -5318,6 +5633,21 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x40F4EA / 0x40EF90 / 0x5D27F1 特征串一直对不上）");
     }
 
+    /* bug调查/17 那一批（§65 / §66 / §67）：崩溃报告器自己判空（拿得到现场的前提）、
+       突击技对象野指针校验、gspEndGame 没有 GameContext 时判空。
+       和上面三处共用 BSHOOK_KEEP_RPT_CRASHES 开关。 */
+    if (rpt_crashes_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_RPT_CRASHES 已设，bug调查/17 那五处守护一并不装");
+    } else {
+        for (ticks = 0; !g_stop && !g_crash17_guards_patched && ticks < 2000; ticks++) {
+            if (try_patch_crash17_guards()) break;
+            Sleep(2);
+        }
+        if (!g_crash17_guards_patched)
+            bslog("PATCH   !! 超时未能 patch bug调查/17 的崩溃守护"
+                  "（0x5D76B4 / 0x502182 / 0x50794A / 0x5079AA / 0x5518DE 特征串一直对不上）");
+    }
+
     /* BSM1 is a functional patch, independent of diagnostic log settings. */
     if (!try_patch_bot_motion())
         bslog("BSM1    !! 运动 hook 特征不匹配，保留原版处理；需要检查客户端版本");
@@ -5435,6 +5765,35 @@ static DWORD WINAPI patch_thread(LPVOID param)
     return 0;
 }
 
+/* -------------------------------------------------------------------------- */
+/* 地址空间快照 —— 心跳里带一行，用来判「是不是 32 位地址空间吃紧了」          */
+/*                                                                            */
+/*   bug调查/17 那五次线上闪退里，09930195 那份 dump 的线程栈一路铺到          */
+/*   0x4F09xxxx、崩的那个对象落在 0x3CB7xxxx —— 看着像地址空间已经用到 1.2 GB，*/
+/*   但**当时没有任何一个数能证实**（Vista 起线程栈本来就是随机落位的）。      */
+/*   32 位进程只有 2 GB，真正先出事的是「最大连续空闲块」而不是总量：块一小，  */
+/*   new 就开始返回 NULL，而这个 2007 年的引擎有大把地方不判 NULL。            */
+/*   心跳本来就每 30 秒一行，顺手把三个数带上，下次崩溃前后一眼可判。          */
+/* -------------------------------------------------------------------------- */
+static void vm_snapshot(SIZE_T *commit, SIZE_T *reserve, SIZE_T *largest_free)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    unsigned char *p = NULL;
+    SIZE_T c = 0, r = 0, f = 0;
+
+    while (VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        if (mbi.State == MEM_COMMIT)       c += mbi.RegionSize;
+        else if (mbi.State == MEM_RESERVE) r += mbi.RegionSize;
+        else if (mbi.State == MEM_FREE && mbi.RegionSize > f) f = mbi.RegionSize;
+        if (mbi.RegionSize == 0) break;
+        if ((SIZE_T)(p + mbi.RegionSize) <= (SIZE_T)p) break;   /* 走到顶了 */
+        p += mbi.RegionSize;
+    }
+    *commit = c;
+    *reserve = r;
+    *largest_free = f;
+}
+
 static DWORD WINAPI watch_thread(LPVOID param)
 {
     int ticks = 0;
@@ -5451,7 +5810,14 @@ static DWORD WINAPI watch_thread(LPVOID param)
         poll_login_dialog();   /* V0.2：分区单选钮 + 注册链接（里程碑 H）*/
         poll_unpack();
         Sleep(100);
-        if (++ticks % 300 == 0) bslog("--- still alive (%d s) ---", ticks / 10);
+        if (++ticks % 300 == 0) {
+            SIZE_T commit = 0, reserve = 0, largest = 0;
+            vm_snapshot(&commit, &reserve, &largest);
+            bslog("--- still alive (%d s)；地址空间 已提交 %u MB / 已保留 %u MB"
+                  " / 最大空闲块 %u MB ---",
+                  ticks / 10, (unsigned)(commit >> 20),
+                  (unsigned)(reserve >> 20), (unsigned)(largest >> 20));
+        }
     }
     return 0;
 }
