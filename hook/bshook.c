@@ -3721,11 +3721,16 @@ static __declspec(naked) void crash_rpt_guard_detour(void)
 /*   野指针，往 `[ebx+0x57c]` 写回去等于二次破坏。`StartDash` 那一处跳过之后    */
 /*   原版自己会在 0x5021f0 用新对象覆盖这一格，所以不会一直卡着。              */
 /*                                                                            */
-/*   ★ 这是**兜底 + 探针**，不是根因修复：谁把对象放掉的还没查到。触发时按     */
-/*   「指针值翻转」去重打一行日志（同一个野指针只报一次，换了才再报），        */
+/*   ★ 这三处是**兜底 + 探针**。**根因已经查到了**（V0.3 §78，bug调查/18）：   */
+/*   关卡内换图会把世界的对象表整片析构掉，而 `[Character+0x57C]` 不跟着清 ——  */
+/*   见下面 `try_patch_mapchange_dangling()`。三处校验保留，当最后一道网。      */
+/*                                                                            */
+/*   触发时按「指针值翻转」去重打一行日志（同一个野指针只报一次，换了才再报）， */
 /*   下次现场靠它就能分辨「真的踩到了」还是「另有病灶」。                      */
 /*                                                                            */
-/*   设 BSHOOK_KEEP_DASH_STALE_CRASH=1 保留原版行为（复现 / 对照用）。         */
+/*   逃生门：`BSHOOK_KEEP_RPT_CRASHES=1` 连同 bug调查/17 那五处一起不装；      */
+/*   只想复现野指针、又要留着能用的崩溃报告器时用                              */
+/*   `BSHOOK_KEEP_DASH_STALE_CRASH=1`（只关掉换图那一处根因修复）。            */
 /* -------------------------------------------------------------------------- */
 #define DASHOBJ_VFTABLE          0x0066D5DC   /* DashDamage 主虚表             */
 
@@ -3918,6 +3923,126 @@ static int try_patch_crash17_guards(void)
           (unsigned)CRASH_RPT_GUARD_VA, (unsigned)DASHOBJ_START_VA,
           (unsigned)DASHOBJ_DRAW_VA, (unsigned)DASHOBJ_KILL_VA,
           (unsigned)ENDGAME_GUARD_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★★★★★ 换图（进 boss 房）把突击技对象连同场景一起放掉了 —— 这就是            */
+/*         §66 那个野指针的**来路**（V0.3 §78，bug调查/18）                    */
+/*                                                                            */
+/*   现象：闯关走到地图最右边换下一张图（Quest03_6 / Quest06_boss / …），       */
+/*   进新图后 1~3 秒**整个房间的人同时**闪退或黑屏未响应。云端 9-10 一天       */
+/*   107 条游戏服连接里有 20 条断在这儿，23 份崩溃报告里 13 份是它。            */
+/*                                                                            */
+/*   链路（全部静态坐实）：                                                    */
+/*                                                                            */
+/*     Character::StartDash 0x5020d9                                          */
+/*       0x5021f0  [Character+0x57C] = new(0x30C)      ← 突击技伤害对象        */
+/*       0x502229  call 0x473e7c(世界 [0x72e2d4], 它)  ← ★ 登记进世界          */
+/*      （兄弟函数 0x5024ac / 0x5024e2 对 [Character+0x580] 做同样的事）        */
+/*                                                                            */
+/*     关卡内换图 0x47900a                                                     */
+/*       0x479058  call 0x474029  把 6 个角色**摘出**世界（只摘角色）          */
+/*       0x4790be  call GameContext::vft+8 = 0x48d2ad                         */
+/*                   └ 0x48d326 call 0x473692 ← ★ 把世界的对象表整片清掉      */
+/*                     （0x4736a2/0x4736b6/0x4736ca 三轮 list 析构）           */
+/*       0x4790d2  call 0x473e7c  把**同一批**角色指针原样挂回去               */
+/*                                                                            */
+/*   ⇒ 角色对象跨图活着，可它身上那两格指着的东西已经被世界析构了。            */
+/*     原版**没有任何一处**在换图时清这两格（全 exe 只有 0x502191 /            */
+/*     0x5079d8 / 0x507a8f 三处写 0，都在冲刺自己的状态机里）。                */
+/*     下一次 `Character::ProcessDash` 走到 0x50794a 看见「非空」就用：        */
+/*                                                                            */
+/*       00507970  call 0x4814f2                                              */
+/*         00481a51  mov eax,[esi]     ; esi = 已经被释放的那块内存            */
+/*         00481a53  call [eax+0x78]   ; ★ 跳进堆里执行垃圾（exe 没开 DEP）    */
+/*                                                                            */
+/*   **为什么是一屋子人一起死**：每台客户端都在本地模拟全部 6 个角色，         */
+/*   那一格在**每台机器上**都同样悬着 ⇒ 谁在换图那一刻正冲刺，全场一起崩。     */
+/*   **为什么有时是黑屏而不是闪退**：跳飞的落点在未提交页时，原版崩溃报告器    */
+/*   自己也会崩（§65），进程要挂 40~90 秒才退 —— 窗口就一直停在换图加载那一帧  */
+/*   （「正在载入 100% / 正在等待其他玩家」）显示「未响应」。                   */
+/*                                                                            */
+/*   修法：在换图**卸完场景、重挂角色之前**把这两格清零。清零是安全的：        */
+/*   对象此刻已经被世界析构掉了，我们只是丢掉一个悬空指针，不释放、不回调；    */
+/*   而 `NULL` 本来就是这两格的合法取值（`StartDash` 在 `new` 失败时就写       */
+/*   `NULL`，`ProcessDash` 三处解引用前全都判空）。                            */
+/*                                                                            */
+/*   偷 0x4790cb 起 6 字节（`mov ecx,[0x72e2d4]`，正好一条指令），edi 就是这   */
+/*   一轮的角色（0x4790c7 刚判过非空），补完把 ecx 装回去再回 0x4790d1。       */
+/*                                                                            */
+/*   ★ §66 那三处虚表校验**保留**：它们是最后一道网（万一还有别的路子放掉      */
+/*   这个对象），而这里是根因修复。设 BSHOOK_KEEP_DASH_STALE_CRASH=1 时        */
+/*   这一处也不装（复现 / 对照用，和三处校验同一个开关）。                     */
+/* -------------------------------------------------------------------------- */
+#define MAPCHG_CLEAR_VA        0x004790CBu   /* 换图：重新挂回角色的循环体      */
+#define MAPCHG_CLEAR_SIG_LEN   13
+static const unsigned char MAPCHG_CLEAR_SIG[MAPCHG_CLEAR_SIG_LEN] = {
+    0x8B, 0x0D, 0xD4, 0xE2, 0x72, 0x00,   /* mov ecx,[0x72e2d4]  世界        */
+    0x57,                                 /* push edi            这个角色    */
+    0xE8, 0xA5, 0xAD, 0xFF, 0xFF,         /* call 0x473e7c       挂回世界    */
+    0x57                                  /* push edi                        */
+};
+#define MAPCHG_CLEAR_RETURN_TO 0x004790D1     /* push edi ; call 0x473e7c     */
+#define WORLD_MGR_GLOBAL       0x0072E2D4     /* 世界 / 句柄管理器            */
+#define CHAR_DASHOBJ_OFF       0x57C          /* 突击技伤害对象               */
+#define CHAR_DASHOBJ2_OFF      0x580          /* 突击技的第二个对象           */
+
+static volatile LONG g_mapchg_clear_hits = 0;
+
+static void __stdcall mapchg_clear_note(unsigned int chr, unsigned int a, unsigned int b)
+{
+    InterlockedIncrement(&g_mapchg_clear_hits);
+    bslog("★换图   角色 %08X 跨图还挂着突击技对象（+0x57C=%08X +0x580=%08X）——"
+          " 场景已卸，这两格现在是野指针，已清零（累计 %ld 次；不清就是"
+          " bug调查/18 那个「进 boss 房全场一起崩」）",
+          chr, a, b, (long)g_mapchg_clear_hits);
+}
+
+static __declspec(naked) void mapchg_clear_detour(void)
+{
+    __asm {
+        pushad
+        mov  eax, dword ptr [edi + CHAR_DASHOBJ_OFF]
+        mov  edx, dword ptr [edi + CHAR_DASHOBJ2_OFF]
+        mov  ecx, eax
+        or   ecx, edx
+        jz   mcc_done                       /* 两格都空：这一局没人冲刺过 */
+        push edx
+        push eax
+        push edi
+        call mapchg_clear_note
+        and  dword ptr [edi + CHAR_DASHOBJ_OFF], 0
+        and  dword ptr [edi + CHAR_DASHOBJ2_OFF], 0
+    mcc_done:
+        popad
+        mov  ecx, WORLD_MGR_GLOBAL          /* 被偷走的 mov ecx,[0x72e2d4] */
+        mov  ecx, dword ptr [ecx]
+        push MAPCHG_CLEAR_RETURN_TO
+        ret
+    }
+}
+
+static volatile LONG g_mapchg_clear_patched = 0;
+
+/* 只关掉这一处根因修复（崩溃报告器那几处照装）—— 想在本机复现「进 boss 房
+   全场一起崩」并拿一份完整 dump 时用。 */
+static int dash_stale_keep_original(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_DASH_STALE_CRASH", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_patch_mapchange_dangling(void)
+{
+    if (g_mapchg_clear_patched) return 1;
+    if (!install_jmp_guard(MAPCHG_CLEAR_VA, MAPCHG_CLEAR_SIG, MAPCHG_CLEAR_SIG_LEN,
+                           6, mapchg_clear_detour, "换图清突击技野指针"))
+        return 0;
+    InterlockedExchange(&g_mapchg_clear_patched, 1);
+    bslog("PATCH   ★换图野指针根治（bug调查/18）: 卸完场景后清 [角色+0x57C/0x580]"
+          " @ %08X —— 进 boss 房不再全场一起崩", (unsigned)MAPCHG_CLEAR_VA);
     return 1;
 }
 
@@ -5765,6 +5890,20 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_crash17_guards_patched)
             bslog("PATCH   !! 超时未能 patch bug调查/17 的崩溃守护"
                   "（0x5D76B4 / 0x502182 / 0x50794A / 0x5079AA / 0x5518DE 特征串一直对不上）");
+    }
+
+    /* bug调查/18（§78）：换图卸完场景后清掉 [角色+0x57C/0x580] —— §66 那个野指针
+       的根因。和上面那五处共用 BSHOOK_KEEP_DASH_STALE_CRASH / KEEP_RPT_CRASHES 开关。 */
+    if (rpt_crashes_keep_original() || dash_stale_keep_original()) {
+        bslog("PATCH   逃生门已设，不装「换图清突击技野指针」（bug调查/18）");
+    } else {
+        for (ticks = 0; !g_stop && !g_mapchg_clear_patched && ticks < 2000; ticks++) {
+            if (try_patch_mapchange_dangling()) break;
+            Sleep(2);
+        }
+        if (!g_mapchg_clear_patched)
+            bslog("PATCH   !! 超时未能 patch 换图野指针根治"
+                  "（0x4790CB 特征串一直对不上）");
     }
 
     /* BSM1 is a functional patch, independent of diagnostic log settings. */
