@@ -4265,6 +4265,300 @@ static int try_patch_crash18_guards(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* ★★★★★ 根治 §68：让 `nmconew.dll` 自己那两个崩溃点**走它原版就有的失败出口** */
+/*         （V0.3 §82，bug调查/18；2026-09-11）                                */
+/*                                                                            */
+/*   §80 那条路（不让它加载）被实机推翻之后换的下手点：**模块照常加载、        */
+/*   `NMCO_CallNMFunc` 照常返回** —— 登录路径一个字节都不碰，只把它内部        */
+/*   那两处补掉。⇒ **这一处不可能弄坏登录**。                                  */
+/*                                                                            */
+/*   §68 当时说「跳过那两句只是把崩溃挪到下一句」—— 真去读代码，**不是**：      */
+/*   两处的**原版自己就有干净的失败出口**，判一下跳过去就完事。                */
+/*                                                                            */
+/*   ── 崩溃点 A：自制互斥体 `Enter()`（RVA `0x98C20`）──────────────────      */
+/*                                                                            */
+/*     10098D53  call WaitForSingleObject([this], 10s 或 300s)                */
+/*     10098D59  mov edx,[ebp-0xC]      ; this                                */
+/*     10098D5C  mov eax,[edx+8]        ; ★ 共享状态对象：等待期间被别人析构了  */
+/*     10098D62  mov [eax+0xC], ecx     ; ★ 崩（写自己的 tid）                 */
+/*     …后面 +0x10 / [eax] 全部继续用它                                        */
+/*     10098DBB  mov esp,ebp / pop ebp / ret   ← ★ **函数自己的干净出口**      */
+/*                                                                            */
+/*   `0x10098C35` 那条「我已经持有这把锁了」的路走的就是 `0x98DBB`             */
+/*   ⇒ 从等醒之后跳过去，栈是平的、没有要清理的东西、返回值也没人看。          */
+/*                                                                            */
+/*   判据：`VirtualQuery` 看 `[this+8]` 那一页还**提交着且可写**吗。           */
+/*   不是「跳过一句」，是**发现锁已经没了就当这一轮没抢到，干净地回去**。       */
+/*   ★ 只在**真的阻塞过**的那条路上跑（抢到锁的快路径是另一段一模一样的代码）， */
+/*   不是热路径。                                                             */
+/*                                                                            */
+/*   ── 崩溃点 B：魔数校验前不判指针（RVA `0x26570` 那个函数）────────────      */
+/*                                                                            */
+/*     10026591  cmp dword [eax], 0x1FCA34   ; ★ eax 是野的 -> 崩             */
+/*     10026597  jne 0x1002666C              ; 魔数不符 -> 收尾 return 0      */
+/*     1002666C  mov ecx,[ebp-4] / call 0x10026700 / xor eax,eax / … ret 8    */
+/*                                                                            */
+/*   原版**已经在用魔数校验这个对象了**，只是忘了先看指针读不读得到。          */
+/*   ⇒ 读不到就走它自己那条「魔数不符」的路，语义完全一致。                    */
+/*                                                                            */
+/*   ── 实现 ────────────────────────────────────────────────────────────      */
+/*                                                                            */
+/*   `nmconew.dll` 是**运行时加载、基址随机**的（这正是 §68 当时不敢动的理由）， */
+/*   所以：hook **`nmcogame.dll` 自己那一格 `LoadLibraryA`**（IAT RVA         */
+/*   `0x2C030`，§80 查明那是唯一加载点），**放行**之后拿到真实基址再打补丁。   */
+/*   两处偷的字节里**一个重定位项都没有**（对着 `.reloc` 逐项查过）           */
+/*   ⇒ 文件字节 == 内存字节，特征串可以直接从磁盘那份量出来。                  */
+/*                                                                            */
+/*   逃生门：`BSHOOK_KEEP_NM=1` 两处都不打（要复现 §68 时用）。                */
+/* -------------------------------------------------------------------------- */
+#define NMCOGAME_LOADLIBRARYA_IAT_RVA  0x0002C030u
+
+#define NMCONEW_LOCK_RVA        0x00098D59u   /* 等醒之后取共享状态           */
+#define NMCONEW_LOCK_CONT_RVA   0x00098D5Fu   /* mov ecx,[ebp-4] …（原路）    */
+#define NMCONEW_LOCK_EXIT_RVA   0x00098DBBu   /* mov esp,ebp / pop ebp / ret  */
+#define NMCONEW_LOCK_SIG_LEN    12
+static const unsigned char NMCONEW_LOCK_SIG[NMCONEW_LOCK_SIG_LEN] = {
+    0x8B, 0x55, 0xF4,         /* mov edx,[ebp-0xC]                            */
+    0x8B, 0x42, 0x08,         /* mov eax,[edx+8]                              */
+    0x8B, 0x4D, 0xFC,         /* mov ecx,[ebp-4]                              */
+    0x89, 0x48, 0x0C          /* mov [eax+0xC],ecx   ★ 崩的就是这一句          */
+};
+
+#define NMCONEW_MAGIC_RVA       0x00026591u   /* cmp [eax],0x1FCA34           */
+#define NMCONEW_MAGIC_CONT_RVA  0x00026597u   /* jne 0x2666C（原路，看标志位）*/
+#define NMCONEW_MAGIC_BAD_RVA   0x0002666Cu   /* 魔数不符：收尾 return 0      */
+#define NMCONEW_MAGIC_SIG_LEN   12
+static const unsigned char NMCONEW_MAGIC_SIG[NMCONEW_MAGIC_SIG_LEN] = {
+    0x81, 0x38, 0x34, 0xCA, 0x1F, 0x00,   /* cmp dword [eax],0x1FCA34         */
+    0x0F, 0x85, 0xCF, 0x00, 0x00, 0x00    /* jne 0x1002666C                   */
+};
+#define NMCONEW_MAGIC           0x001FCA34
+
+typedef HMODULE (WINAPI *LoadLibraryA_t)(LPCSTR);
+static LoadLibraryA_t s_nm_LoadLibraryA = NULL;
+
+/* 基址随机 ⇒ detour 的回跳目标只能在运行时算出来放这儿。 */
+static volatile UINT_PTR g_nm_lock_cont = 0;
+static volatile UINT_PTR g_nm_lock_exit = 0;
+static volatile UINT_PTR g_nm_magic_cont = 0;
+static volatile UINT_PTR g_nm_magic_bad = 0;
+static volatile LONG g_nm_lock_hits = 0;
+static volatile LONG g_nm_magic_hits = 0;
+static volatile LONG g_nmconew_patched = 0;
+
+/* 那一页还提交着、而且够得到我们要碰的字节吗。用 VirtualQuery 而不是
+   IsBadWritePtr —— 后者是拿真写去探的，会踩到守护页。 */
+static int nm_addr_usable(const void *p, SIZE_T need, int want_write)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    UINT_PTR a = (UINT_PTR)p;
+    DWORD ok_r = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
+               | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    DWORD ok_w = PAGE_READWRITE | PAGE_WRITECOPY
+               | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (!p) return 0;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return 0;
+    if (!(mbi.Protect & (want_write ? ok_w : ok_r))) return 0;
+    /* 要碰的字节不能跨出这一段（跨了就再查一次太啰嗦，直接当不可用） */
+    if (a + need > (UINT_PTR)mbi.BaseAddress + mbi.RegionSize) return 0;
+    return 1;
+}
+
+static int __stdcall nm_lock_state_alive(void *state)
+{
+    /* `Enter()` 醒来之后要写 [state+0xC] 和 [state+0x10]，还要读 [state] */
+    if (nm_addr_usable(state, 0x14, 1)) return 1;
+    if (InterlockedIncrement(&g_nm_lock_hits) == 1)
+        bslog("★信使锁 nmconew 的互斥体在等待期间被析构了（共享状态 %p 已经不可写）"
+              "—— 按原版「已持有」那条路干净返回，不再往野指针里写"
+              "（bug调查/18 §82-A；这就是 §68 那个崩溃）", state);
+    return 0;
+}
+
+static int __stdcall nm_magic_obj_readable(void *obj)
+{
+    if (nm_addr_usable(obj, 4, 0)) return 1;
+    if (InterlockedIncrement(&g_nm_magic_hits) == 1)
+        bslog("★信使   nmconew 的魔数校验拿到一个读不了的对象 %p —— "
+              "按原版「魔数不符」那条路返回（bug调查/18 §82-B）", obj);
+    return 0;
+}
+
+static __declspec(naked) void nmconew_lock_detour(void)
+{
+    __asm {
+        mov  edx, dword ptr [ebp - 0x0C]    /* 被偷走的原指令 */
+        mov  eax, dword ptr [edx + 8]       /* 被偷走的原指令 */
+        pushad
+        push eax
+        call nm_lock_state_alive
+        test al, al
+        popad                               /* POPAD 不动标志位 */
+        jz   nml_dead
+        jmp  dword ptr [g_nm_lock_cont]
+    nml_dead:
+        jmp  dword ptr [g_nm_lock_exit]
+    }
+}
+
+static __declspec(naked) void nmconew_magic_detour(void)
+{
+    __asm {
+        pushad
+        push eax
+        call nm_magic_obj_readable
+        test al, al
+        popad
+        jz   nmm_bad
+        cmp  dword ptr [eax], NMCONEW_MAGIC /* 被偷走的原指令（标志位靠它） */
+        jmp  dword ptr [g_nm_magic_cont]    /* jmp 不动标志位 */
+    nmm_bad:
+        jmp  dword ptr [g_nm_magic_bad]
+    }
+}
+
+static void patch_nmconew(HMODULE mod)
+{
+    UINT_PTR b = (UINT_PTR)mod;
+    int a, c;
+    if (!mod || InterlockedCompareExchange(&g_nmconew_patched, 0, 0)) return;
+    g_nm_lock_cont  = b + NMCONEW_LOCK_CONT_RVA;
+    g_nm_lock_exit  = b + NMCONEW_LOCK_EXIT_RVA;
+    g_nm_magic_cont = b + NMCONEW_MAGIC_CONT_RVA;
+    g_nm_magic_bad  = b + NMCONEW_MAGIC_BAD_RVA;
+    a = install_jmp_guard((unsigned int)(b + NMCONEW_LOCK_RVA),
+                          NMCONEW_LOCK_SIG, NMCONEW_LOCK_SIG_LEN,
+                          6, nmconew_lock_detour, "nmconew 互斥体判活");
+    c = install_jmp_guard((unsigned int)(b + NMCONEW_MAGIC_RVA),
+                          NMCONEW_MAGIC_SIG, NMCONEW_MAGIC_SIG_LEN,
+                          6, nmconew_magic_detour, "nmconew 魔数校验判空");
+    if (a && c) {
+        InterlockedExchange(&g_nmconew_patched, 1);
+        bslog("PATCH   ★信使崩溃守护 x2（bug调查/18 §82）: nmconew.dll base=%08X"
+              " 互斥体判活 @ +%05X / 魔数校验判空 @ +%05X —— §68 那一族到此为止",
+              (unsigned)b, (unsigned)NMCONEW_LOCK_RVA, (unsigned)NMCONEW_MAGIC_RVA);
+    } else {
+        bslog("PATCH   !! nmconew.dll base=%08X 的特征串对不上（锁=%d 魔数=%d）"
+              "—— 不动它，保留原版行为", (unsigned)b, a, c);
+        InterlockedExchange(&g_nmconew_patched, 1);   /* 别每次加载都重试 */
+    }
+}
+
+static int name_has_ci(const char *hay, const char *needle)
+{
+    size_t i, j;
+    if (!hay || !needle) return 0;
+    for (i = 0; hay[i]; i++) {
+        for (j = 0; needle[j]; j++) {
+            char x = hay[i + j], y = needle[j];
+            if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+            if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+            if (x != y) break;
+        }
+        if (!needle[j]) return 1;
+    }
+    return 0;
+}
+
+static HMODULE WINAPI det_nmcogame_LoadLibraryA(LPCSTR name)
+{
+    HMODULE h = s_nm_LoadLibraryA(name);       /* ★ 照常放行，一个字节不改 */
+    if (h && name_has_ci(name, "nmconew")) {
+        bslog("★信使   nmcogame 加载了 \"%s\" -> base=%08X，去打两处崩溃守护",
+              name, (unsigned)(UINT_PTR)h);
+        patch_nmconew(h);
+    }
+    return h;
+}
+
+static int nm_keep_original(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_NM", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static volatile LONG g_nm_loadhook_done = 0;
+
+static int try_guard_nexon_messenger(void)
+{
+    HMODULE nmcogame, k32, already;
+    LoadLibraryA_t real, *slot;
+    DWORD oldp;
+
+    if (g_nm_loadhook_done) return 1;
+    nmcogame = GetModuleHandleA("nmcogame.dll");
+    if (!nmcogame) return 0;                       /* 还没加载，下一轮再来 */
+    k32 = GetModuleHandleA("kernel32.dll");
+    if (!k32) return 0;
+    real = (LoadLibraryA_t)GetProcAddress(k32, "LoadLibraryA");
+    if (!real) return 0;
+
+    slot = (LoadLibraryA_t *)((UINT_PTR)nmcogame + NMCOGAME_LOADLIBRARYA_IAT_RVA);
+    if (IsBadReadPtr(slot, sizeof(*slot))) {
+        bslog("★信使   nmcogame IAT %08X 读不了，放弃（保留原版行为）",
+              (unsigned)(UINT_PTR)slot);
+        InterlockedExchange(&g_nm_loadhook_done, 1);
+        return 1;
+    }
+    if (*slot != real && *slot != det_nmcogame_LoadLibraryA) {
+        bslog("★信使   nmcogame IAT %08X = %08X，不是 kernel32!LoadLibraryA(%08X)"
+              " —— 版本对不上，不动它", (unsigned)(UINT_PTR)slot,
+              (unsigned)(UINT_PTR)*slot, (unsigned)(UINT_PTR)real);
+        InterlockedExchange(&g_nm_loadhook_done, 1);
+        return 1;
+    }
+    if (*slot == real) {
+        if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &oldp)) {
+            bslog("★信使   nmcogame IAT VirtualProtect 失败 err=%lu",
+                  (unsigned long)GetLastError());
+            return 0;
+        }
+        s_nm_LoadLibraryA = real;
+        *slot = det_nmcogame_LoadLibraryA;
+        VirtualProtect(slot, sizeof(*slot), oldp, &oldp);
+    }
+    InterlockedExchange(&g_nm_loadhook_done, 1);
+    bslog("PATCH   ★信使加载钩子已装（bug调查/18 §82）: nmcogame.dll base=%08X"
+          " IAT %08X —— nmconew.dll **照常加载**（登录路径不动），"
+          "加载完立刻给它打两处崩溃守护（BSHOOK_KEEP_NM=1 可关）",
+          (unsigned)(UINT_PTR)nmcogame, (unsigned)(UINT_PTR)slot);
+    /* 万一它已经在了（理论上不会：登录才加载），补一次。 */
+    already = GetModuleHandleA("nmconew.dll");
+    if (already) patch_nmconew(already);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★★★★★ 【第二次试，还是不行】把 `NMCO_CallNMFunc` 换成「直接回 1」的桩      */
+/*        （V0.3 §83，2026-09-11 实机推翻；用户拍板试过一轮）                  */
+/*                                                                            */
+/*   思路：换 BigShot 那一格 IAT `0x63751C`，`nmcogame` 压根不进去，          */
+/*   `nmconew.dll` 不加载、`NMService.exe` 不起 —— 铁律 5 真的落地。          */
+/*                                                                            */
+/*   ★ **实机结果：还是「登录失败 / 认证服务器失败 (20000)」，认证服          */
+/*     一条连接都没收到**（`+++ 连接#N` 计数器全程 0）。日志里                */
+/*     `★NM桩 NMCO_CallNMFunc 直接回 1` 之后紧跟着就是那个弹框                */
+/*     （`caller=0x423E1F`，和 §80 那次同一个）。                             */
+/*                                                                            */
+/*   ⇒ 事前担心的那一点被坐实了：客户端那一发**不是只看返回值** ——            */
+/*     `0x5441CB` 传的是**出参**，成功之后 `vf_10`（`0x544200`）要解析里面的   */
+/*     **应答**，包装函数真正返回给登录逻辑的是 `[esi+0x24]`（**解析结果**）。 */
+/*     桩不填出参 ⇒ `vf_10` 拿到的是请求不是应答 ⇒ 解析不出来 ⇒ 20000。       */
+/*                                                                            */
+/*   ⇒⇒ **登录真的需要 `nmconew.dll` 产出一份应答**。NEXON 的服务器停机 15 年， */
+/*      所以那份应答一定是**它自己在本地造出来的** —— 这就是这个 DLL           */
+/*      拿不掉的原因。要拿掉就得把那份应答的格式逆出来自己造，                */
+/*      **代价远大于收益**：§82 已经把 §68 那一族崩溃从另一头堵死了。          */
+/*                                                                            */
+/*   ⇒ 代码整个删掉，默认走 §82（放行加载 + 补它自己那两个失败出口）。         */
+/*     `NMService.exe` 还是会起 —— 铁律 5 那条**依然只是写在纸上**，          */
+/*     但它已经不再是崩溃来源了。                                             */
+/* -------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------- */
 /* ★★★★★ 【试过，不行】拦 `nmconew.dll` 的加载会让**登录直接失败**         */
 /*        （V0.3 §80，2026-09-11 实机推翻）                                */
 /*                                                                            */
@@ -6162,6 +6456,21 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_crash18_guards_patched)
             bslog("PATCH   !! 超时未能 patch bug调查/18 的散崩守护"
                   "（0x55C260 / 0x5D9E02 / 0x5D9E0D / 0x438BD3 特征对不上）");
+    }
+
+    /* bug调查/18（§82）：给 NEXON 信使装加载钩子 —— **放行** nmconew.dll，
+       加载完立刻打它自己那两处崩溃守护（§68 那一族的根治）。
+       ★ 登录路径一个字节都不碰，所以这一处不可能弄坏登录。
+       ★ §83 那条「整个不要、直接回 1」**两次实机都不成立**，代码已删。 */
+    if (nm_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_NM 已设，信使那两处崩溃守护不装（保留 §68 行为）");
+    } else {
+        for (ticks = 0; !g_stop && !g_nm_loadhook_done && ticks < 2000; ticks++) {
+            if (try_guard_nexon_messenger()) break;
+            Sleep(2);
+        }
+        if (!g_nm_loadhook_done)
+            bslog("PATCH   !! 超时未能装信使加载钩子（nmcogame.dll 一直没出现）");
     }
 
 
