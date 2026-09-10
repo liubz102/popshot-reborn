@@ -1224,6 +1224,14 @@ function renderCurrent() {
 
   var help = $("cfgHelp");
   help.textContent = "";
+  // ★ 只读身份先说一句（D74）：下面那几条说明里满是「随便改」「改完保存
+  //   即刻生效」，不先讲清楚「你这个身份改不了」，人会以为是页面坏了。
+  if (isReadOnly()) {
+    help.appendChild(el("li", "ro-note",
+                        "★ 你现在是用游戏账号登录的「只读」身份 —— "
+                        + "下面这几页随便看，但一个字都改不了"
+                        + "（要能改请联系系统管理员开权限）。"));
+  }
   (schema.help || []).forEach(function (line) {
     help.appendChild(el("li", null, line));
   });
@@ -1454,6 +1462,7 @@ function repaintList() {
     var shownLabel = $("cfgShown");
     if (shownLabel) { shownLabel.textContent = ""; }
     RENDERERS.rewards(list, CFG.rewards.entries);
+    lockList();
     list.scrollTop = keep;
     touched();
     return;
@@ -1472,12 +1481,59 @@ function repaintList() {
       ? ("筛出 " + rows.length + " / " + total) : "";
   }
   if (!rows.length) {
+    // ★ 只读身份下不能写「点『添加』」—— 那个钮在他画面上根本没有（D74）。
     list.appendChild(el("div", "list-empty",
-                        total ? "没有符合筛选条件的条目" : "还没有条目 —— 点「添加」"));
+                        total ? "没有符合筛选条件的条目"
+                              : (isReadOnly() ? "这一份配置还是空的"
+                                              : "还没有条目 —— 点「添加」")));
   }
   RENDERERS[CURRENT](list, rows);
+  lockList();
   list.scrollTop = keep;
   touched();
+}
+
+/** 只读身份下，把刚画出来的列表**整个锁掉**（D74）。
+ *
+ * ★★ 为什么是「画完统一扫一遍」，而不是在每个控件工厂里各加一句
+ *    `if (isReadOnly())`：这一页有 6 个渲染器、十几处生成控件的地方
+ *    （`fieldNode` / `choiceNode` / `toggleNode` / `killButton` /
+ *    `materialSlots` / `slotNode` 的选择器格子 / 奖励表的格子……），
+ *    漏一个的症状是**玩家改得动、按不了保存、也不会收到任何报错**。
+ *    扫一遍的判据是「结果」而不是「谁记得加那一句」—— 以后新加的控件
+ *    自动被收进来。
+ * ★ 判据成立的前提：`#cfgList` 里**只有编辑控件**。筛选条 / 分类标签 /
+ *   「↻ 刷新」都在它外面（`#cfgToolbar` / `#cfgCats`），那些是「看」的东西，
+ *   一个都不能动。
+ * ★ 浮窗（`tipFor`）不受影响：它挂在 `mouseover` 上，也是「看」的东西。
+ */
+function lockList() {
+  if (!isReadOnly()) { return; }
+  var host = $("cfgList");
+  function each(sel, fn) {
+    Array.prototype.forEach.call(host.querySelectorAll(sel), fn);
+  }
+  // 输入框 / 下拉：**锁住**而不是换成纯文字 —— 用户要的是「看得见、
+  // 改不了」，值还得原样摆在原来的位置上。
+  each("input, select, textarea", function (node) { node.disabled = true; });
+  // 按钮：整个拿掉。列表里的按钮没有一个是「看」的（✕ 删掉这一条、
+  // 「移除」一种材料），留着灰的只会让人一直去点。
+  each("button", function (node) { node.parentNode.removeChild(node); });
+  // 「＋ 加一种材料」那个空格子：整格拿掉（它就是个「添加」按钮）。
+  each(".slot.empty", function (node) {
+    var cell = node.parentNode;                    // `.mat`
+    cell.parentNode.removeChild(cell);
+  });
+  // 点了会弹「选择物品」的格子：摘掉 onclick，顺手去掉手型和「可点」的样子。
+  each(".slot.pick", function (node) {
+    node.onclick = null;
+    node.classList.remove("pick");
+  });
+  // 布尔开关是个 `<label>`（不是 `<input>`），上面那一遍收不到它。
+  each(".toggle", function (node) {
+    node.onclick = null;
+    node.classList.add("locked");
+  });
 }
 
 /** 配置页那两行分类标签，钉在筛选条和列表之间（滚动区外面，原来换页栏的
@@ -2486,8 +2542,10 @@ async function setAdminRole(name, role) {
   else { loadAdmins(); }
   if (result.ok && result.self_demoted) {
     // 把自己降成运营 ⇒ 这一页和「玩家仓库」当场就该消失。
+    // ★ 括号里那句话走 `ROLE_BADGE_ZH`，别在这儿再写一遍「（运营）」——
+    //   三档身份的说法只该有一个出处（D74）。
     ROLE = "operator";
-    $("who").textContent = "已登录：" + name + "（运营）";
+    $("who").textContent = "已登录：" + name + "（" + ROLE_BADGE_ZH[ROLE] + "）";
     applyRoleToTabs();
   }
 }
@@ -2822,14 +2880,28 @@ async function refreshBackups() {
 
 var PLAYER = null;        // {view, edit:{level, money, materials, inventory}}
 var PLAYER_LIST = [];
-var PLAYER_PAGE = {page: 0, pages: 1, total: 0, size: 10, q: ""};
+var PLAYER_PAGE = {page: 0, pages: 1, total: 0, size: 10, q: "", online: "all"};
 
-/** 查一页。`page` 省略 = 回第一页（换了查询串就该从头看）。 */
+//: 在线筛选那三档的中文名（D75）。值和服务端 `admin.ONLINE_FILTERS` 一样，
+//  下拉本身在 `admin.html` 里 —— 这份表只给「N 个账号（不在线）」那句话用。
+var ONLINE_FILTER_ZH = {on: "在线", off: "不在线"};
+
+/** 查一页。`page` 省略 = **筛选条件没变**就停在当前页，变了就回第一页。
+ *
+ * ★ 「变了没有」按 `q` + 在线筛选**一起**判（D75）：只看 `q` 的话，在第 3 页
+ *   把筛选从「全部」改成「在线」会停在第 3 页 —— 而筛完可能一共就一页，
+ *   人看到的是一张空表。
+ */
 async function searchPlayers(page) {
   var q = $("playerSearch").value.trim();
-  if (page === undefined) { page = (q === PLAYER_PAGE.q) ? PLAYER_PAGE.page : 0; }
+  var online = $("playerOnline").value;
+  if (page === undefined) {
+    page = (q === PLAYER_PAGE.q && online === PLAYER_PAGE.online)
+      ? PLAYER_PAGE.page : 0;
+  }
   var result = await api("/admin/api/players?q=" + encodeURIComponent(q)
-                         + "&page=" + page);
+                         + "&page=" + page
+                         + "&online=" + encodeURIComponent(online));
   if (bounced(result)) { return false; }
   if (!result.ok) {
     // 回执走右上角浮条（D39）：列表下面那条 `.msg` 2026-09-07 拿掉了 ——
@@ -2839,9 +2911,12 @@ async function searchPlayers(page) {
   }
   PLAYER_LIST = result.players;
   PLAYER_PAGE = {page: result.page, pages: result.pages,
-                 total: result.total, size: result.size, q: q};
+                 total: result.total, size: result.size, q: q, online: online};
   renderPlayerRows();
-  $("playerCount").textContent = result.total + " 个账号";
+  // ★ 筛了在线状态就把口径写在数后面（D75）—— 不写的话「2 个账号」会被
+  //   当成「全服就俩号」，而它其实是「筛出来俩」。
+  $("playerCount").textContent = result.total + " 个账号"
+    + (online === "all" ? "" : "（" + ONLINE_FILTER_ZH[online] + "）");
   // 工具条右端的「当前在线：N 人」（用户 2026-09-08）。★ 这个数是**全服**的，
   // 跟搜索串和页码都无关 —— 列表里那些 ● 只是这一页里在线的那几个。
   // 拿到过一次才显示：没查过就写「0 人」会被当成「现在没人在线」。
@@ -2889,7 +2964,12 @@ function renderPlayerRows() {
   rows.textContent = "";
   if (!PLAYER_LIST.length) {
     var tr = document.createElement("tr");
-    var td = el("td", "own-empty", "没有匹配的账号");
+    // 筛了在线状态就把它写进这句话（D75）：「没有匹配的账号」会被当成
+    // 「搜索串打错了」，而实际常常是「这会儿一个人都不在线」。
+    var td = el("td", "own-empty",
+                PLAYER_PAGE.online === "all"
+                  ? "没有匹配的账号"
+                  : "没有" + ONLINE_FILTER_ZH[PLAYER_PAGE.online] + "的匹配账号");
     td.colSpan = 5;
     tr.appendChild(td);
     rows.appendChild(tr);
@@ -3322,16 +3402,18 @@ async function loadCatalog() {
    ====================================================================== */
 
 /* ---------------------------------------------------------------- 权限
-   两档（D34）：`system` 系统管理员 = 全部标签页；
-                `operator` 运营 = 只有 `CONFIGS` 那几个配置页。
+   三档：`system` 系统管理员 = 全部标签页；
+        `operator` 运营 = 只有 `CONFIGS` 那几个配置页（D34）；
+        `player` 普通玩家 = 同样那几页，但**只读**（D74）。
 
-   ★ 这里做的**只是把标签藏起来**，不是安全边界 —— 藏掉的按钮拦不住直接
-     POST。真正的门在服务端 `_require_system_admin()` 里，两边都要有。
+   ★ 这里做的**只是把标签藏起来、把控件锁上**，不是安全边界 —— 藏掉的按钮
+     和锁住的输入框都拦不住直接 POST。真正的门在服务端
+     `_require_system_admin()` / `_require_editor()` 里，两边都要有。
    ------------------------------------------------------------------- */
-var ROLE = null;                       // "system" / "operator" / null（没登录）
+var ROLE = null;              // "system" / "operator" / "player" / null（没登录）
 
-//: 现在停在哪个标签页。★ 和 `CURRENT` 不是一回事 —— `CURRENT` 只记那四个
-//  **配置**页（渲染要用），「玩家仓库」和「管理员账号」不在里面。
+//: 现在停在哪个标签页。★ 和 `CURRENT` 不是一回事 —— `CURRENT` 只记那几个
+//  **配置**页（渲染要用），「玩家仓库」「数据备份」「管理员账号」不在里面。
 var TAB = "items";
 
 //: 只有系统管理员能进的标签页（数据备份也是：它能回滚玩家存档）。
@@ -3339,7 +3421,15 @@ var SYSTEM_ONLY_TABS = ["players", "backup", "admins"];
 
 function isSystemAdmin() { return ROLE === "system"; }
 
+//: 只读身份（D74）。★ 判据是**角色**，不是「有没有某个按钮」—— 页面上
+//  凡是「能改东西」的地方都问它，一处一处地判「这个钮该不该画」迟早漏。
+function isReadOnly() { return ROLE === "player"; }
+
 function canOpenTab(tab) {
+  // ★ 只读玩家看得见的就是**那几个配置页**，照 `CONFIGS` 现取（不是照
+  //   `SYSTEM_ONLY_TABS` 取反）：以后加一个既不是配置页、又不属于系统管理员
+  //   专档的新标签，取反那种写法会**默认放行**给玩家 —— 白名单不会。
+  if (isReadOnly()) { return CONFIGS.indexOf(tab) >= 0; }
   return isSystemAdmin() || SYSTEM_ONLY_TABS.indexOf(tab) < 0;
 }
 
@@ -3349,34 +3439,65 @@ function applyRoleToTabs() {
     var tab = button.getAttribute("data-tab");
     button.classList.toggle("hidden", !canOpenTab(tab));
   });
-  // 权限被现场降级时，人可能正停在一个已经不该看的页上 —— 拉回物品库。
-  // ★ `CAT` 还没到手就别切：`switchTab` 会去 `renderCurrent()`，
-  //   那一步读 `CAT.schema`（登录的那一瞬间它还是 null）。
-  if (CAT && !canOpenTab(TAB)) { switchTab("items"); }
+  // 权限被现场降级时，人可能正停在一个已经不该看的页上 —— 拉回第一页。
+  // ★ 「`CAT` 还没到手就别切」那道保险挪进了 `switchTab`（它最后那一句
+  //   `renderCurrent()` 才是要 `CAT` 的）—— 留在这儿的话，登录那一瞬间
+  //   面板不会跟着切，人就停在上一个人那一页上了。
+  if (!canOpenTab(TAB)) { switchTab(CONFIGS[0]); }
 }
+
+//: 顶栏那句「已登录：xxx（…）」括号里写什么。
+//  ★ 和服务端 `web/admin.py` 的 `ROLE_ZH` 是同一套说法，别各写各的。
+var ROLE_BADGE_ZH = {system: "系统管理员", operator: "运营",
+                     player: "玩家 · 只读"};
 
 function showLoggedIn(name, role) {
   ROLE = role || null;
   $("who").textContent = "已登录：" + name
-    + (isSystemAdmin() ? "（系统管理员）" : "（运营）");
+    + "（" + (ROLE_BADGE_ZH[ROLE] || ROLE) + "）";
   $("logout").classList.remove("hidden");
   $("loginView").classList.add("hidden");
   $("mainView").classList.remove("hidden");
   // 标签行在顶栏那块壳里，不跟着 `mainView` 走 —— 自己开关一次。
   $("tabs").classList.remove("hidden");
-  // 登进来默认停在物品库 ⇒ 直接进「撑满 + 列表自己滚」那套（D39）。
-  // 之后换标签由 `switchTab` 管。
-  $("mainArea").classList.toggle("fit", CONFIGS.indexOf(TAB) >= 0);
+  // 登进来停在 `TAB`（`showLoggedOut` 已经把它归到第一个配置页）：
+  // 标签高亮、露哪个面板、外壳撑不撑满，一次摆正。之后换标签由 `switchTab` 管。
+  paintTabChrome(TAB);
   applyRoleToTabs();
+  applyReadOnly();
   boot();
+}
+
+/** 只读身份下，把「改东西」的入口从画面上收起来（D74）。
+ *
+ * ★ 这一发管的是**面板外壳**那几个固定按钮（添加 / 放弃修改 / 保存）；
+ *   列表**里面**每次重画都会新生成一批控件，那批由 `lockList()` 收 ——
+ *   两处分工：这里一次就够（DOM 不重建），那里必须跟着每一次重画走。
+ * ★ `body.readonly` 只给 CSS 用（锁住的控件长什么样），**不当判据** ——
+ *   判据永远是 `isReadOnly()`。
+ */
+function applyReadOnly() {
+  var ro = isReadOnly();
+  document.body.classList.toggle("readonly", ro);
+  // 「添加 / ●有未保存的修改 / 放弃修改 / 保存」整组 —— 一个只能看的人，
+  // 这四样没有一样是有意义的。
+  var acts = document.querySelector("#cfgPanel .acts");
+  if (acts) { acts.classList.toggle("hidden", ro); }
 }
 
 function showLoggedOut(message) {
   CAT = null;
   ROLE = null;
+  // 下一个登进来的可能是管理员 —— 把只读那身衣服脱干净（D74）。
+  applyReadOnly();
   // 下一个登进来的人可能权限不同 —— 停在哪一页得跟着回到起点。
-  TAB = "items";
-  CURRENT = "items";
+  // ★★ 光把 `TAB` 改回去**不够**：标签上那个 `.on` 和「哪个面板露出来」
+  //   是 `switchTab` 顺手做的，退出登录时没人做。症状是管理员停在
+  //   「玩家仓库」退出之后，下一个登进来的人看到的还是那一页 ——
+  //   只读玩家连门都没有的那一页（实测过，D74）。
+  TAB = CONFIGS[0];
+  CURRENT = CONFIGS[0];
+  paintTabChrome(TAB);
   PLAYER = null;
   PLAYER_LIST = [];
   BACKUP = null;
@@ -3421,10 +3542,13 @@ function paintOperatorPages() {
                      + " 页，看不到「玩家仓库」和「管理员账号」。";
 }
 
-function switchTab(tab) {
-  // ★ 第二道保险：标签已经藏起来了，但键盘 / 脚本还是点得到。
-  if (!canOpenTab(tab)) { tab = "items"; }
-  TAB = tab;
+/** 标签行的高亮 + 露哪个面板 + 外壳撑不撑满。返回「这是不是配置页」。
+ *
+ * ★ `switchTab` 和「退出登录回到起点」共用这一段（D74）。分两份写的话，
+ *   加一个标签页就注定有一处会忘 —— 而忘掉的症状不是报错，是「上一个人
+ *   停的那一页还留在屏幕上」。
+ */
+function paintTabChrome(tab) {
   Array.prototype.forEach.call($("tabs").children, function (button) {
     button.classList.toggle("on", button.getAttribute("data-tab") === tab);
   });
@@ -3438,6 +3562,14 @@ function switchTab(tab) {
   $("adminsPanel").classList.toggle("hidden", tab !== "admins");
   $("playersPanel").classList.toggle("hidden", tab !== "players");
   $("backupPanel").classList.toggle("hidden", tab !== "backup");
+  return isConfig;
+}
+
+function switchTab(tab) {
+  // ★ 第二道保险：标签已经藏起来了，但键盘 / 脚本还是点得到。
+  if (!canOpenTab(tab)) { tab = CONFIGS[0]; }
+  TAB = tab;
+  var isConfig = paintTabChrome(tab);
   if (tab === "players") {
     // 第一次切进来先列几个，免得画面上是一片空白。
     if (!PLAYER_LIST.length) { searchPlayers(); }
@@ -3450,7 +3582,10 @@ function switchTab(tab) {
   }
   if (!isConfig) { return; }
   CURRENT = tab;
-  renderCurrent();
+  // ★ `CAT` 还没到手（登录那一瞬间 `applyRoleToTabs` 可能就调进来了）就
+  //   先别画：`renderCurrent()` 头一句读的就是 `CAT.schema`。目录到手之后
+  //   `boot()` 会补画一次。
+  if (CAT) { renderCurrent(); }
 }
 
 function wire() {
@@ -3487,6 +3622,9 @@ function wire() {
   $("playerSearch").addEventListener("keydown", function (event) {
     if (event.key === "Enter") { searchPlayers(0); }
   });
+  // 在线筛选（D75）：下拉一改当场重查，回第一页 —— 和配置页那几个筛选
+  // 下拉一个手感，不用再点一次「查找」。
+  $("playerOnline").onchange = function () { searchPlayers(0); };
   // 同上：不能直接挂 `refreshAccounts`（Event 会被当第一个参数）。
   // ★ 两页共用一发（D43）—— 点哪个都刷两边。
   $("playerRefreshBtn").onclick = function () { refreshAccounts(); };

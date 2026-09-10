@@ -125,13 +125,18 @@ AUTH_MESSAGES = {
 }
 
 #: 管理页（`/admin`）登录的说明。三态和玩家登录**共用**（`admin_verify`），
-#: 但「没这个人」的**出路完全不同**，所以文案得单开一份（用户 2026-09-09）：
-#: 玩家自己去注册页注册就有号，管理员却**没有注册页** —— `admin_accounts`
-#: 只能由已有的系统管理员在管理页上加，所以这里只能指路「去找系统管理员」。
+#: 但「没这个人」的**出路完全不同**，所以文案得单开一份（用户 2026-09-09）。
 #: ★ 密码错那条两边一个意思，直接沿用 —— 别为了「凑齐一张表」抄一遍，
 #:   抄了就有两处要一起改。
+#:
+#: ★★ 2026-09-10（D74）改写了「没这个人」这一句。原来是「该用户没有管理权限，
+#:   请联系系统管理员以获得管理权限」—— 那时管理页只有管理员进得去，唯一的
+#:   出路就是找人开权限。现在**游戏账号也能登进来（只读）**，于是这一句变成
+#:   了半句话：一个把自己的游戏用户名敲错了的玩家，会被指去找系统管理员。
+#:   两条出路都写上，谁看都对得上号。
 ADMIN_AUTH_MESSAGES = dict(AUTH_MESSAGES, **{
-    AUTH_NO_SUCH_USER: "该用户没有管理权限，请联系系统管理员以获得管理权限",
+    AUTH_NO_SUCH_USER: "没有这个账号 —— 用游戏账号登录可以只读查看，"
+                       "要能修改请联系系统管理员开权限",
 })
 
 #: 导出的存档文件里的格式标记。导入时用它认一眼，避免用户传错文件。
@@ -1168,7 +1173,7 @@ class AccountStore:
             return self.set_equipped(username, rest)
 
     # ------------------------------------------------- 管理页的玩家信息修改
-    def search_accounts(self, query="", limit=None, offset=0):
+    def search_accounts(self, query="", limit=None, offset=0, keep=None):
         """按**用户名或昵称**找账号，返回 ``([(用户名, 账号字典), …], 命中总数)``。
 
         大小写不敏感的**子串**匹配，两边任意一边命中就算（需求原文：
@@ -1181,6 +1186,13 @@ class AccountStore:
         所以这里先把命中的数完，再按 `offset`/`limit` 切一页出来；
         提前 `break` 的话页码就没法算了。账号是全量读进内存的，多走一遍
         字符串比较的代价远小于「翻到第 3 页才发现没有第 3 页」。
+
+        ★ `keep(用户名, 账号) -> bool` 是**再收一道**的过滤，管理页拿它筛
+        「在线 / 不在线」。**必须在数总数之前跑**（就在这一遍扫描里）——
+        换成「取回一页再在外面滤掉几行」的话，「不在线」那一档会变成
+        「这一页只剩两行、页脚却写着共 5 页」，翻页整个错位。
+        ★ 这一层不认识「在线」是什么意思（那是游戏服的事）：判据由调用方
+        传进来，存储层只管把它套进同一遍扫描。
         """
         needle = str(query or "").strip().lower()
         key_needle = nickname_key(query)
@@ -1197,6 +1209,8 @@ class AccountStore:
                             and not (key_needle
                                      and key_needle in nickname_key(nickname))):
                         continue
+                if keep is not None and not keep(username, account):
+                    continue
                 hits.append((username, account))
         offset = max(0, int(offset or 0))
         page = hits[offset:] if limit is None else hits[offset:offset + int(limit)]

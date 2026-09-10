@@ -121,11 +121,13 @@ class _AdminCase(unittest.TestCase):
         except json.JSONDecodeError:
             return status, text
 
-    def login(self, name=None, password=None):
+    def login(self, name=None, password=None, opener=None):
+        """默认拿出厂系统管理员登。`opener` = 换一个 cookie 罐（= 另一个人）。"""
         return self.request("/admin/api/login", {
             "name": name or account_store.DEFAULT_ADMIN_NAME,
             "password": (password if password is not None
-                         else account_store.DEFAULT_ADMIN_PASSWORD)})
+                         else account_store.DEFAULT_ADMIN_PASSWORD)},
+            opener=opener)
 
 
 class AdminAuthTests(_AdminCase):
@@ -175,15 +177,22 @@ class AdminAuthTests(_AdminCase):
         _status, session = self.request("/admin/api/session")
         self.assertFalse(session["logged_in"])
 
-    def test_an_unknown_name_is_told_to_ask_for_admin_rights(self):
-        # 管理员**没有注册页**（`admin_accounts` 只能由系统管理员在这一页上加），
-        # 所以这里绝不能拿玩家那句「请先在注册页面注册」打发人（用户 2026-09-09）。
+    def test_an_unknown_name_is_told_both_ways_in(self):
+        """「没这个人」这一句要把**两条出路**都说了（D74）。
+
+        ★ 玩家那句「请先在注册页面注册」不能用（用户 2026-09-09）：管理员
+        没有注册页，指过去是错的。
+        ★ 但只说「联系系统管理员开权限」也不对了（D74 起游戏账号能登进来
+        只读）—— 一个把自己游戏用户名敲错的玩家会被指去找管理员要权限。
+        """
         _status, result = self.login(name="nobody", password="nope")
         self.assertFalse(result["ok"])
         self.assertIn(
             account_store.ADMIN_AUTH_MESSAGES[account_store.AUTH_NO_SUCH_USER],
             result["message"])
-        self.assertNotIn("注册", result["message"])
+        self.assertNotIn("请先在注册页面注册", result["message"])
+        self.assertIn("游戏账号", result["message"])
+        self.assertIn("系统管理员", result["message"])
 
     def test_every_api_needs_a_login(self):
         # ★★ 漏挂一个 `_require_admin()` 就等于把那个接口开在公网上。
@@ -781,6 +790,70 @@ class AdminAssetTests(_AdminCase):
         self.assertEqual(set(), hidden & set(web_admin.CONFIG_FILES),
                          "这几个配置页被藏起来了，运营进不去")
 
+    def js_list(self, js, name):
+        """从 `admin.js` 里抠一个字符串数组常量出来。"""
+        match = re.search(r"var %s\s*=\s*\[([^\]]*)\]" % name, js)
+        self.assertIsNotNone(match, "admin.js 里找不到 " + name)
+        return set(re.findall(r'"([A-Za-z0-9_-]+)"', match.group(1)))
+
+    def test_every_tab_in_the_page_is_classified(self):
+        """★★ 每个标签都得落进「配置页」或「系统管理员专档」二者之一（D74）。
+
+        漏分类的那个：`canOpenTab` 对运营是**取反**判的（不在
+        `SYSTEM_ONLY_TABS` 里就放行），于是新标签会**默认对运营开着**，
+        而服务端那一侧多半根本没给他开门 —— 症状是点进去一片红，
+        不是「看不到」。只读玩家那一档走的是白名单，反过来会**默认看不到**。
+        两种错都不会有人报，所以在这儿钉死。
+        """
+        _status, _h, raw = self.fetch("/admin/admin.js")
+        js = raw.decode("utf-8")
+        _status, html = self.request("/admin")
+        tabs = set(re.findall(r'data-tab="([A-Za-z0-9_-]+)"', html))
+        self.assertTrue(tabs, "页面上一个标签都没有？")
+        known = self.js_list(js, "CONFIGS") | self.js_list(js, "SYSTEM_ONLY_TABS")
+        self.assertEqual(set(), tabs - known,
+                         "这些标签没归档：既不在 CONFIGS 里，也不在 "
+                         "SYSTEM_ONLY_TABS 里")
+        # 反过来也钉一下：归了档却在页面上找不到 = 名字拼错了。
+        self.assertEqual(set(), known - tabs, "这些名字在页面上没有对应的标签")
+
+    def test_the_config_tabs_in_the_page_match_the_server(self):
+        # 前台 `CONFIGS` 和服务端 `CONFIG_FILES` 是同一份清单的两半 ——
+        # 加一份配置只改一边的话，页面上不是少一个标签就是多一个死标签。
+        _status, _h, raw = self.fetch("/admin/admin.js")
+        self.assertEqual(set(web_admin.CONFIG_FILES),
+                         self.js_list(raw.decode("utf-8"), "CONFIGS"))
+
+    def test_every_render_path_locks_the_list_for_read_only_viewers(self):
+        """★★ `repaintList()` 每一条出路都要 `lockList()` 一次（D74）。
+
+        漏一条的症状是**玩家改得动、按不了保存、还收不到任何报错** ——
+        他只会觉得这页坏了。判据是「渲染了几次就锁几次」（结构对不对），
+        不是「我点过一遍」（那取决于点的是哪一页）。
+        """
+        _status, _h, raw = self.fetch("/admin/admin.js")
+        js = raw.decode("utf-8")
+        body = re.search(r"\nfunction repaintList\(\) \{(.*?)\n\}\n", js,
+                         re.S)
+        self.assertIsNotNone(body, "admin.js 里找不到 repaintList()")
+        text = body.group(1)
+        self.assertGreater(text.count("RENDERERS"), 0)
+        self.assertEqual(text.count("RENDERERS"), text.count("lockList()"),
+                         "repaintList() 里有渲染出路没跟着 lockList()")
+
+    def test_the_login_page_says_players_can_look_around(self):
+        """★ 登录页那句话是普通玩家能不能**想到**「我也能进」的唯一入口
+        —— 页面上没有第二个地方提过这件事（D74）。
+        ★ 页名由服务端照 `CONFIG_FILES` 现填，不写死在 html 里（同 D72c）：
+          加第六份配置时漏改不报错，只会一直骗人。
+        """
+        _status, html = self.request("/admin")
+        self.assertNotIn("__CONFIG_TITLES__", html, "占位符没被填上")
+        self.assertIn(web_admin.config_titles_text(), html)
+        for which in web_admin.CONFIG_FILES:
+            self.assertIn(shopcfg.SCHEMA[which]["title"],
+                          web_admin.config_titles_text(), which)
+
     def test_the_atlas_comes_back_as_a_png_once_logged_in(self):
         self.login()
         status, headers, body = self.fetch("/admin/itemicons.png")
@@ -1104,6 +1177,173 @@ class OperatorPermissionTests(_AdminCase):
             "/admin/api/session")[1]["role"])
 
 
+class PlayerReadOnlyTests(_AdminCase):
+    """普通玩家拿**游戏账号**登管理页（用户 2026-09-10，D74）。
+
+    看得到那几个配置页，**一个字都改不了**；后面三页（玩家仓库 / 数据备份 /
+    管理员账号）连门都没有。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 这一组里有好几条要「先登失败、紧接着登成功」（那正是要验的东西）。
+        # 登录限速本身在 `AdminLoginRateLimitTests` 里钉着，这儿把冷却关掉，
+        # 免得 429 把真正要看的回执盖住。
+        self.httpd.RequestHandlerClass.admin_limiter = \
+            web_admin.LoginRateLimiter(cooldown=0)
+        self.accounts.register("alice", "PlayerPw1", display_name="爱丽丝")
+        self.assertTrue(self.login("alice", "PlayerPw1")[1]["ok"])
+
+    def other_browser(self):
+        """另开一个 cookie 罐 = 另一个人的浏览器。"""
+        jar = http.cookiejar.CookieJar()
+        return urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(jar))
+
+    # ------------------------------------------------------------ 登录
+    def test_the_session_says_player(self):
+        _status, result = self.request("/admin/api/session")
+        self.assertTrue(result["logged_in"])
+        self.assertEqual("alice", result["name"])
+        self.assertEqual(web_admin.ROLE_PLAYER, result["role"])
+
+    def test_the_login_reply_already_says_player(self):
+        # 前台照**登录回执**直接画界面（`showLoggedIn(result.name, result.role)`），
+        # 不会再问一发 session。这里说错的话，只读的人会先看到一整排
+        # 「添加 / 保存」，下一次刷新才收回去。
+        self.request("/admin/api/logout", {})
+        _status, result = self.login("alice", "PlayerPw1")
+        self.assertEqual(web_admin.ROLE_PLAYER, result["role"])
+
+    def test_a_wrong_game_password_does_not_get_in(self):
+        self.request("/admin/api/logout", {})
+        _status, result = self.login("alice", "nope")
+        self.assertFalse(result["ok"])
+        self.assertFalse(self.request("/admin/api/session")[1]["logged_in"])
+
+    def test_an_admin_name_never_falls_back_to_the_game_password(self):
+        """★★ 管理员表里有这个名字 ⇒ **只认**管理员那一份口令（D74）。
+
+        「设为管理员（运营）」照搬的是**当时**那份游戏口令
+        （`admin_add_from_player`）。玩家之后在游戏里改了密码，新口令绝不能
+        拿来登运营档 —— 那等于管理员口令这道门根本不存在。
+        """
+        boss = self.other_browser()
+        self.assertTrue(self.login(opener=boss)[1]["ok"])
+        self.assertTrue(self.request("/admin/api/admins/from_player",
+                                     {"name": "alice"}, opener=boss)[1]["ok"])
+        self.accounts.change_password("alice", "PlayerPw1", "BrandNew1")
+        self.request("/admin/api/logout", {})
+        # 新的游戏口令：管理员表里有 alice，所以走的是管理员那一路 ⇒ 密码错。
+        _status, refused = self.login("alice", "BrandNew1")
+        self.assertFalse(refused["ok"], refused)
+        # 收人那一刻照搬的那份还是好使的，而且这一次是**运营**不是只读。
+        _status, ok = self.login("alice", "PlayerPw1")
+        self.assertTrue(ok["ok"], ok)
+        self.assertEqual(account_store.ADMIN_ROLE_OPERATOR, ok["role"])
+
+    def test_a_live_player_session_does_not_get_promoted_behind_his_back(self):
+        """★★ 玩家档的令牌**永远**是只读的（D74）。
+
+        管理员名和玩家名在同一个命名空间里。不记「你是拿哪一种口令进来的」
+        的话，一个正开着页面的玩家会在系统管理员建出同名管理员账号的那一
+        瞬间当场升权 —— 他从没输过那份管理员口令。
+        """
+        boss = self.other_browser()
+        self.assertTrue(self.login(opener=boss)[1]["ok"])
+        self.assertTrue(self.request(
+            "/admin/api/admins/add",
+            {"name": "alice", "password": "AdminPw1", "role": "system"},
+            opener=boss)[1]["ok"])
+        # 手里那个令牌还是只读的。
+        self.assertEqual(web_admin.ROLE_PLAYER,
+                         self.request("/admin/api/session")[1]["role"])
+        self.assertEqual(403, self.request("/admin/api/admins")[0])
+        # 重新拿**管理员口令**登，才是系统管理员。
+        self.request("/admin/api/logout", {})
+        _status, result = self.login("alice", "AdminPw1")
+        self.assertEqual(account_store.ADMIN_ROLE_SYSTEM, result["role"])
+
+    # ------------------------------------------------------------ 看得到
+    def test_every_config_page_is_readable(self):
+        """★ 清单从 `CONFIG_FILES` 现取：以后再加一份配置却忘了给玩家开门
+        （或者反过来，新页面对玩家可写），这条和下面那条立刻红。"""
+        for which in sorted(web_admin.CONFIG_FILES):
+            status, result = self.request("/admin/api/config/" + which)
+            self.assertEqual(200, status, which)
+            self.assertTrue(result["ok"], which)
+        # 那几页要画得出来，物品表和「这件东西现在什么价」也得给。
+        self.assertTrue(self.request("/admin/api/catalog")[1]["ok"])
+        self.assertTrue(self.request("/admin/api/item?id=1120041")[1]["ok"])
+
+    def test_the_icon_atlas_is_readable(self):
+        # 图集不给的话，每一格都是问号 —— 那一页等于没法看。
+        req = urllib.request.Request(self.url("/admin/itemicons.png"))
+        with self.opener.open(req, timeout=10) as response:
+            self.assertEqual(200, response.status)
+            self.assertEqual(b"\x89PNG\r\n\x1a\n", response.read(8))
+
+    # ------------------------------------------------------------ 改不了
+    def test_saving_any_config_is_403(self):
+        """★★ 前台把「添加 / 保存 / 删除」整排收起来、把输入框锁上**只是画面**
+        —— 这一条是直接 POST，证明背后真有一道门（`_require_editor`）。"""
+        for which in sorted(web_admin.CONFIG_FILES):
+            _status, readable = self.request("/admin/api/config/" + which)
+            status, result = self.request("/admin/api/config/" + which,
+                                          {"text": readable["text"]})
+            self.assertEqual(403, status, which)
+            self.assertFalse(result["ok"], which)
+            self.assertIn("只能看", result["message"], which)
+
+    def test_a_refused_save_does_not_touch_the_file(self):
+        # 403 不能只是「回了个错」—— 那一发要**一个字节都没写下去**。
+        path = shopcfg.path_of(web_admin.CONFIG_FILES["shop"])
+        with open(path, "r", encoding="utf-8") as fp:
+            before = fp.read()
+        self.assertEqual(403, self.request("/admin/api/config/shop",
+                                           {"text": '{"format": 1, "items": []}'})[0])
+        with open(path, "r", encoding="utf-8") as fp:
+            self.assertEqual(before, fp.read())
+
+    def test_every_system_only_api_is_403(self):
+        """后面三页（玩家仓库 / 数据备份 / 管理员账号）一个接口都不给。
+
+        ★ 和 `OperatorPermissionTests` 那条**故意是两份清单**：两种身份走的
+        不是同一条判断，一份挂了另一份不一定挂得住。
+        """
+        for path, payload in (
+                ("/admin/api/players?q=a", None),
+                ("/admin/api/player?name=alice", None),
+                ("/admin/api/player", {"name": "alice", "money": 999999}),
+                ("/admin/api/admins", None),
+                ("/admin/api/admins/add", {"name": "dave", "password": "pw12345"}),
+                ("/admin/api/admins/password", {"name": "admin",
+                                                "password": "Another1"}),
+                ("/admin/api/admins/role", {"name": "admin", "role": "operator"}),
+                ("/admin/api/admins/remove", {"name": "admin"}),
+                ("/admin/api/admins/from_player", {"name": "alice"}),
+                ("/admin/api/backups", None),
+                ("/admin/api/backups/settings", {"enabled": True, "time": "04:00",
+                                                 "keep_days": 7}),
+                ("/admin/api/backups/create", {"label": "x"}),
+                ("/admin/api/backups/restore", {"id": "20260907-040000-auto",
+                                                "files": ["shop.json"]}),
+                ("/admin/api/backups/remove", {"id": "20260907-040000-auto"}),
+        ):
+            status, result = self.request(path, payload)
+            self.assertEqual(403, status, path)
+            self.assertFalse(result["ok"], path)
+
+    def test_a_player_cannot_give_himself_money(self):
+        # 上面那条已经覆盖了，但这一条是**最要命**的一种越权，单独立一条。
+        before = account_store.player_money(self.accounts.get_account("alice")[1])
+        self.assertEqual(403, self.request(
+            "/admin/api/player", {"name": "alice", "money": 99999999})[0])
+        self.assertEqual(
+            before,
+            account_store.player_money(self.accounts.get_account("alice")[1]))
+
+
 class AdminBackupApiTests(_AdminCase):
     """管理页「数据备份」页的五个接口（V0.3商店，用户 2026-09-07）。
     备份 / 回滚本身的规则在 `test_backup` 里钉；这儿只看接口这一层。"""
@@ -1380,6 +1620,78 @@ class AdminPlayerTests(_AdminCase):
                          [p["username"] for p in only_alice["players"]])
         self.assertEqual(1, only_alice["total"])
         self.assertEqual(2, only_alice["online_total"])
+
+    # ------------------------------------------------- 在线筛选（D75）
+    def fake_online(self, *names):
+        """把「谁在线」按住不动。真实来源是游戏服的连接表，测里没有连接。"""
+        real = web_admin._online_usernames
+        web_admin._online_usernames = lambda: set(names)
+        self.addCleanup(setattr, web_admin, "_online_usernames", real)
+
+    def usernames(self, query):
+        _status, result = self.request("/admin/api/players?" + query)
+        self.assertTrue(result["ok"], result)
+        return [p["username"] for p in result["players"]], result
+
+    def test_the_online_filter_has_three_settings(self):
+        """「全部」「在线」「不在线」（用户 2026-09-10）。
+
+        ★ 三档从 `ONLINE_FILTERS` 现取，不写死清单 —— 前台那个下拉照同一
+        份值发过来。
+        """
+        self.fake_online("alice")
+        self.assertEqual(("all", "on", "off"), web_admin.ONLINE_FILTERS)
+        expected = {"all": ["alice", "bob"], "on": ["alice"], "off": ["bob"]}
+        for wanted in web_admin.ONLINE_FILTERS:
+            found, _result = self.usernames("q=&online=" + wanted)
+            self.assertEqual(expected[wanted], found, wanted)
+
+    def test_the_filter_also_narrows_the_count_and_the_page_number(self):
+        """★★ 筛在**服务端**、在数总数**之前**（D75）。
+
+        「取回一页再在前台滤掉几行」的话，选「不在线」会变成
+        「这一页只剩两行、页脚却写着共 5 页」，翻页整个错位。
+        """
+        for at in range(30):
+            self.accounts.register("p%02d" % at, "pw1")
+        self.fake_online("p00", "p01", "p02")
+        _found, everyone = self.usernames("q=&online=all")
+        self.assertEqual(32, everyone["total"])          # 30 + alice + bob
+        self.assertEqual(4, everyone["pages"])
+        _found, on = self.usernames("q=&online=on")
+        self.assertEqual(3, on["total"])
+        self.assertEqual(1, on["pages"])
+        _found, off = self.usernames("q=&online=off")
+        self.assertEqual(29, off["total"])
+        self.assertEqual(3, off["pages"])
+        # 全服在线人数**不跟着筛选缩水** —— 它答的是另一个问题。
+        for result in (everyone, on, off):
+            self.assertEqual(3, result["online_total"])
+
+    def test_the_filter_stacks_on_top_of_the_search_string(self):
+        self.fake_online("alice")
+        found, result = self.usernames("q=ali&online=off")
+        self.assertEqual([], found)
+        self.assertEqual(0, result["total"])
+        found, _result = self.usernames("q=ali&online=on")
+        self.assertEqual(["alice"], found)
+
+    def test_a_page_past_the_end_falls_back_to_the_last_one(self):
+        # 在第 3 页把筛选从「全部」改成「在线」时最容易撞上（前台会回第一页，
+        # 但脚本 / 刷新按钮不一定）。回一张空表会被当成「没有这个人」。
+        self.fake_online("alice")
+        found, result = self.usernames("q=&online=on&page=5")
+        self.assertEqual(["alice"], found)
+        self.assertEqual(0, result["page"])
+
+    def test_an_unknown_filter_value_lists_everyone(self):
+        # ★ 认不出来的值当「全部」，**不是**报错、更不是空表：筛选是个
+        #   「看」的东西，多给几行没有代价，空表会让人以为一个号都没有。
+        self.fake_online("alice")
+        found, _result = self.usernames("q=&online=%E5%9C%A8%E7%BA%BF")
+        self.assertEqual(["alice", "bob"], found)
+        found, _result = self.usernames("q=")           # 干脆不带这个参数
+        self.assertEqual(["alice", "bob"], found)
 
     def test_an_unknown_player_is_a_clean_404(self):
         status, result = self.request("/admin/api/player?name=nobody")
@@ -1675,6 +1987,26 @@ class AdminSessionStoreTests(unittest.TestCase):
         for token in mine:
             self.assertIsNone(self.sessions.resolve(token))
         self.assertEqual("admin", self.sessions.resolve(others))
+
+    # ------------------------------------------------- 口令种类（D74）
+    def test_a_token_remembers_which_password_opened_it(self):
+        boss = self.sessions.issue("carol")
+        guest = self.sessions.issue("carol", web_admin.SESSION_KIND_PLAYER)
+        self.assertEqual(("carol", web_admin.SESSION_KIND_ADMIN),
+                         self.sessions.resolve_full(boss))
+        self.assertEqual(("carol", web_admin.SESSION_KIND_PLAYER),
+                         self.sessions.resolve_full(guest))
+        self.assertEqual((None, None), self.sessions.resolve_full("nope"))
+
+    def test_dropping_an_admin_leaves_the_read_only_session_alone(self):
+        """★ 同名玩家那份只读会话认的是**另一份**口令（游戏账号那份）——
+        改管理员口令 / 删管理员跟它没关系。一起砍掉的话，「把某人降权」
+        会顺手把他正开着的只读页面也踢下线。"""
+        boss = self.sessions.issue("carol")
+        guest = self.sessions.issue("carol", web_admin.SESSION_KIND_PLAYER)
+        self.sessions.drop_admin("carol")
+        self.assertIsNone(self.sessions.resolve(boss))
+        self.assertEqual("carol", self.sessions.resolve(guest))
 
     # ------------------------------------------------- 滑动过期（D29）
     def test_every_request_slides_the_deadline(self):

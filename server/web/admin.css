@@ -1030,3 +1030,23 @@ td .acts {
 /* 进场从右边滑进来、退场滑回去。JS 只负责加 / 去掉 `.in`。 */
 .toast { opacity: 0; transform: translateX(18px); }
 .toast.in { opacity: 1; transform: none; }
+
+/* ------------------------------------------------------- 只读身份（D74）
+   普通玩家拿游戏账号登进来只能看 —— 「添加 / 放弃修改 / 保存」整组由
+   `applyReadOnly()` 收走，列表里的控件由 `lockList()` 锁上。这一节只管
+   **锁上之后长什么样**：既要一眼看出「这是锁着的」，又不能糊到读不出值来
+   （他来就是为了看这些数的）。 */
+
+/* 说明块最上面那一句「你现在是只读身份」。比下面几条重一档。 */
+ul.help li.ro-note { color: var(--crimson); font-weight: 700; }
+
+/* 锁住的输入框 / 下拉：底色压成次级底、字**不变淡**（浏览器默认的灰字在
+   这身米黄配色里几乎读不出来），光标改成默认箭头。 */
+.readonly #cfgList input:disabled,
+.readonly #cfgList select:disabled {
+  background: var(--paper-2); color: var(--cocoa-ink);
+  border-style: dashed; cursor: default; opacity: 1;
+}
+/* 锁住的开关：拨轨照旧（开 / 关一眼看得出），只是点不动了。 */
+.readonly .toggle.locked { cursor: default; }
+.readonly .toggle.locked .track { filter: grayscale(.35); }

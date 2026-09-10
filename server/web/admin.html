@@ -42,9 +42,17 @@
   <section id="loginView" class="panel hidden">
     <div class="panel-title"><h2>登录</h2></div>
     <div class="panel-body">
+      <!-- ★ 三档权限（D34 / D74）：这段话是普通玩家能不能想到「我也能进」的
+           唯一入口 —— 页面本身没有任何别的地方提过这件事。 -->
       <p class="hint">管理员账号存在 <code>server/data/accounts.json</code> 的
         <code>admin_accounts</code> 段里，和玩家账号一样是明文的。</p>
-      <label for="loginName">管理员名</label>
+      <!-- ★ 页名由服务端照 `CONFIG_FILES` + `shopcfg.SCHEMA` 现填
+           （`__CONFIG_TITLES__`），不写死在这儿：这句话在**登录之前**就要
+           说出来，前台那份 `configTitles()` 那时还没拿到 catalog。加第六份
+           配置时漏改不会报错，只会一直骗人（同 D72c）。 -->
+      <p class="hint"><b>普通玩家用游戏里那套账号密码就能登</b> ——
+        看得到 __CONFIG_TITLES__，<b>只能看，改不了</b>。</p>
+      <label for="loginName">账号名</label>
       <input id="loginName" type="text" autocomplete="username">
       <label for="loginPass">密码</label>
       <input id="loginPass" type="password" autocomplete="current-password">
@@ -118,6 +126,15 @@
 
         <div class="toolbar">
           <input id="playerSearch" type="text" placeholder="搜 用户名 / 昵称">
+          <!-- 在线筛选（用户 2026-09-10，D75）。★ 筛在**服务端**：命中总数和
+               页数都按筛完的算，所以选「在线」时每一页照样是满 10 行、翻页
+               也不会翻到空页。改了下拉当场重查（回第一页），不用再点「查找」
+               —— 和配置页那几个筛选下拉一个手感。 -->
+          <select id="playerOnline">
+            <option value="all">全部</option>
+            <option value="on">在线</option>
+            <option value="off">不在线</option>
+          </select>
           <button class="btn" id="playerSearchBtn">查找</button>
           <!-- 玩家自己在游戏里也会改这些数（打完一局就涨经验和金币），
                所以这一页随时会过期。刷新 = 重读列表 + 重读正在改的那个人。 -->

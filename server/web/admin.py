@@ -23,7 +23,7 @@
     POST /admin/api/admins/remove     {name}                                ★系统
     POST /admin/api/admins/from_player {name}  把玩家收成运营（D40）        ★系统
     GET  /admin/api/item?id=1120041   某件东西**现在在商店里**是什么价（选择器侧栏用）
-    GET  /admin/api/players?q=名字&page=0  按用户名 / 昵称找玩家（一页 10 行）★系统
+    GET  /admin/api/players?q=名字&page=0&online=all|on|off  找玩家（一页 10 行）★系统
     GET  /admin/api/player?name=alice  一个玩家的可编辑资料                 ★系统
     POST /admin/api/player            {name, level, money, ...}             ★系统
     GET  /admin/api/backups           数据备份：{settings, status, backups, online, playing} ★系统
@@ -32,15 +32,23 @@
     POST /admin/api/backups/restore   {id, files}  回滚（先自动留一份「回滚前」）  ★系统
     POST /admin/api/backups/remove    {id}                                    ★系统
 
-## 权限分两档（用户 2026-09-06 拍板，D34）
+## 权限分三档（`system` / `operator` 两档见 D34；`player` 见 D74）
 
-- **系统管理员**（`system`）—— 全部标签页；
-- **运营**（`operator`）—— 只有 物品库 / 商店货架 / 合成配方 / 材料掉落 /
-  金币 / 经验获取 这五个配置页，看不到「玩家仓库」和「管理员账号」。
+| 档 | 拿什么口令进来 | 能看什么 | 能改什么 |
+|---|---|---|---|
+| **系统管理员** `system` | `admin_accounts` 里那份 | 全部标签页 | 全部 |
+| **运营** `operator` | 同上 | 只有 `CONFIG_FILES` 那几个配置页 | 那几页 |
+| **玩家** `player` | **游戏账号**那份（`accounts`）| 同上，**只读** | 一个字都不能改 |
 
-上面标了 ★系统 的接口走 `_require_system_admin()`。**前台把标签藏起来
-只是画面**，真正的门在那个函数里 —— `test_web_admin` 有一条用例拿运营
-身份逐个路径打一遍，确认全是 403。
+上面标了 ★系统 的接口走 `_require_system_admin()`，写配置那一发走
+`_require_editor()`。**前台把标签藏起来、把输入框锁上只是画面**，真正的门
+在这两个函数里 —— `test_web_admin` 有两条用例分别拿运营和玩家身份逐个路径
+打一遍，确认该 403 的全是 403。
+
+★ **会话记着「你是拿哪一种口令进来的」**（`AdminSessions` 的 `kind`）：
+拿玩家口令进来的令牌**永远**是只读的，哪怕之后有人在管理员表里建了一个
+同名账号也不会当场升权。反过来，管理员档的权限仍旧**每一发现查**（D34）
+—— 降权立刻生效，不用等他重登。
 
 ## 玩家仓库页：**仓库里什么都能改**（用户 2026-09-06 拍板，D23a）
 
@@ -150,6 +158,26 @@ SESSION_TTL_SECONDS = 3600
 #: 会话 cookie 的名字。`HttpOnly` + `SameSite=Strict`，JS 读不到也带不出去。
 SESSION_COOKIE = "popshot_admin"
 
+#: 会话是拿**哪一种口令**换来的（D74）。
+#:
+#: ★ 为什么要记：管理员名和玩家名在同一个命名空间里（「设为管理员（运营）」
+#:   就是照搬玩家的用户名和口令）。不记的话，一个正拿玩家口令看着页面的人，
+#:   会在系统管理员建出同名管理员账号的那一瞬间**当场升权** —— 他从没输过
+#:   那份管理员口令。记下来之后，玩家档的令牌**永远**是只读的。
+SESSION_KIND_ADMIN = "admin"
+SESSION_KIND_PLAYER = "player"
+
+#: 第三档权限：普通玩家，只读（D74）。
+#:
+#: ★ 它**不存在于 `admin_accounts` 里** —— 不是给谁配的角色，而是「凡是能
+#:   用游戏账号登录的人」都有。所以它不进 `account_store.ADMIN_ROLES`
+#:   （那张表是「管理员表里 `role` 字段允许写什么」，加进去等于允许
+#:   把一个管理员设成玩家，那是一句说不通的话）。
+ROLE_PLAYER = "player"
+
+#: 三档权限的中文名。前两档直接用 `account_store` 那份，别抄第二遍。
+ROLE_ZH = dict(account_store.ADMIN_ROLE_ZH, **{ROLE_PLAYER: "玩家（只读）"})
+
 #: cookie 的 `Max-Age`。**故意和 `SESSION_TTL_SECONDS` 脱钩**（D29）：
 #: 浏览器不知道服务端在滑动到期时刻，写 1 小时的话「登录后连续操作两小时」
 #: 到第 60 分钟就会把 cookie 丢掉，明明还在用却被踢出去。
@@ -203,7 +231,11 @@ _config_locks = dict((which, shopcfg.write_lock(filename))
 
 
 class AdminSessions:
-    """`{token: (管理员名, 到期时刻)}`。只在内存里，服务端一重启就全没了。"""
+    """`{token: (名字, 口令种类, 到期时刻)}`。只在内存里，服务端一重启就全没了。
+
+    「口令种类」是 `SESSION_KIND_ADMIN` / `SESSION_KIND_PLAYER`（D74）——
+    理由写在那两个常量上面。
+    """
 
     def __init__(self, ttl=SESSION_TTL_SECONDS, clock=time.monotonic):
         self.ttl = max(1, int(ttl))
@@ -211,17 +243,17 @@ class AdminSessions:
         self._sessions = {}
         self._lock = threading.Lock()
 
-    def issue(self, name):
+    def issue(self, name, kind=SESSION_KIND_ADMIN):
         """发一个新令牌。★ `secrets` 不是 `random` —— 这是认证凭据。"""
         token = secrets.token_urlsafe(32)
         now = self._clock()
         with self._lock:
             self._prune(now)
-            self._sessions[token] = (str(name), now + self.ttl)
+            self._sessions[token] = (str(name), kind, now + self.ttl)
         return token
 
-    def resolve(self, token):
-        """令牌对应哪个管理员；没有 / 过期都返回 `None`。
+    def resolve_full(self, token):
+        """令牌对应 `(名字, 口令种类)`；没有 / 过期都返回 `(None, None)`。
 
         ★ **认出来就顺手续期**（滑动过期，用户 2026-09-05 拍板）：到期时刻
         推到「现在 + ttl」。判据是「这一发请求本身」—— 有请求就是有人在操作，
@@ -229,15 +261,19 @@ class AdminSessions:
         正好和用户要的「撂下一小时就登出」相反）。
         """
         if not token:
-            return None
+            return None, None
         now = self._clock()
         with self._lock:
             self._prune(now)
             entry = self._sessions.get(token)
             if entry is None:
-                return None
-            self._sessions[token] = (entry[0], now + self.ttl)
-            return entry[0]
+                return None, None
+            self._sessions[token] = (entry[0], entry[1], now + self.ttl)
+            return entry[0], entry[1]
+
+    def resolve(self, token):
+        """令牌对应哪个名字；没有 / 过期都返回 `None`。"""
+        return self.resolve_full(token)[0]
 
     def drop(self, token):
         """退出登录。已经不在了也当成功 —— 幂等，前台不用分情况。"""
@@ -249,15 +285,18 @@ class AdminSessions:
 
         ★ 改密码和删账号之后必须调它：不然那个人手里的旧令牌还能继续用，
         「我把他删了」和「他还在操作」会同时成立。
+        ★ 只砍**管理员档**的会话（D74）：同名玩家那份只读会话认的是另一份
+        口令（游戏账号那份），改管理员口令跟它没关系 —— 一起砍掉的话，
+        「把某人降权」会顺手把他正开着的只读页面也踢下线。
         """
         with self._lock:
-            for token in [t for t, (who, _) in self._sessions.items()
-                          if who == name]:
+            for token in [t for t, (who, kind, _) in self._sessions.items()
+                          if who == name and kind == SESSION_KIND_ADMIN]:
                 del self._sessions[token]
 
     def _prune(self, now):
         """清掉过期的。**调用方持锁。**"""
-        for token in [t for t, (_, deadline) in self._sessions.items()
+        for token in [t for t, (_, _kind, deadline) in self._sessions.items()
                       if deadline <= now]:
             del self._sessions[token]
 
@@ -316,13 +355,26 @@ class LoginRateLimiter:
             del self._until[key]
 
 
+def config_titles_text():
+    """那几份运营配置分别叫什么，「、」隔开。
+
+    ★ 和前台 `configTitles()` 是同一件事，但登录页在**拿到 catalog 之前**
+      就要说这句话（「玩家能看到哪几页」），那时前台还没有标题可用 ⇒
+      服务端照 `CONFIG_FILES` 的顺序 + `shopcfg.SCHEMA` 的标题现填。
+    ★ 分隔符是「、」不是「 / 」—— 页名自己就带斜杠（「金币 / 经验获取」），
+      用斜杠隔开会被读成多出来一页（D72c 踩过）。
+    """
+    return "、".join(shopcfg.SCHEMA[which]["title"] for which in CONFIG_FILES)
+
+
 def render_admin():
-    """读 `admin.html`，把名字 / 口令规则那两句话填进去。"""
+    """读 `admin.html`，把名字 / 口令规则、配置页名那几句话填进去。"""
     with open(ADMIN_PATH, "r", encoding="utf-8") as fp:
         html = fp.read()
     return (html
             .replace("__USERNAME_RULE__", _escape(account_store.USERNAME_RULE_TEXT))
-            .replace("__PASSWORD_RULE__", _escape(account_store.PASSWORD_RULE_TEXT)))
+            .replace("__PASSWORD_RULE__", _escape(account_store.PASSWORD_RULE_TEXT))
+            .replace("__CONFIG_TITLES__", _escape(config_titles_text())))
 
 
 def _escape(text):
@@ -458,6 +510,27 @@ def _online_usernames():
         return set()
     return {conn.account_name for conn in gameserver.all_conns()
             if conn.account_name}
+
+
+#: 玩家仓库那条「在线」筛选的三档（用户 2026-09-10，D75）。前台那个下拉照
+#: 这三个值发，`test_web_admin` 拿它当清单逐档打一遍。
+ONLINE_FILTERS = ("all", "on", "off")
+
+
+def _online_filter(wanted, online):
+    """把 `online=` 那个查询参数翻成 `search_accounts(keep=…)` 要的判据。
+
+    `all` 返回 `None` = 不筛。
+
+    ★ **认不出来的值也当「全部」**（不是当错误）：筛选是个「看」的东西，
+    多给几行没有代价，回一张空表却会让人以为「一个号都没有」。
+    """
+    wanted = str(wanted or "all").strip().lower()
+    if wanted == "on":
+        return lambda username, _account: username in online
+    if wanted == "off":
+        return lambda username, _account: username not in online
+    return None
 
 
 def _online_summary():
@@ -682,15 +755,36 @@ class AdminRoutes:
         morsel = jar.get(SESSION_COOKIE)
         return morsel.value if morsel else None
 
+    def _admin_identity(self):
+        """当前登录的是 `(谁, 什么权限)`；没登录返回 `(None, None)`。
+
+        ★ 权限从两处合出来（D74）：
+        ① 会话记着的**口令种类** —— 玩家口令进来的永远是 `ROLE_PLAYER`；
+        ② 管理员档才去 `accounts.admin_role()` **现查**（D34：降权立刻生效）。
+        ★ 管理员档但表里查无此人 ⇒ 当**没登录**。正常删人会调 `drop_admin()`，
+          但「回滚了一份旧备份」「手改了 accounts.json」这两条路绕得过它 ——
+          这时候放行的话，一个查无此人的令牌还能接着写配置。
+        """
+        name, kind = self.admin_sessions.resolve_full(self._admin_token())
+        if name is None:
+            return None, None
+        if kind == SESSION_KIND_PLAYER:
+            return name, ROLE_PLAYER
+        role = self.accounts.admin_role(name)
+        return (None, None) if role is None else (name, role)
+
     def _admin_name(self):
         """当前登录的是谁；没登录返回 `None`。"""
-        return self.admin_sessions.resolve(self._admin_token())
+        return self._admin_identity()[0]
 
     def _require_admin(self):
         """没登录就回 401 并返回 `None`；登录了就返回名字。
 
         ★ **每个接口第一句都调它**（`login` 除外）。漏一个就等于把那个接口
         开在公网上 —— `test_web_admin` 有一条用例逐个路径检查这件事。
+        ★ 它只问「登没登录」，**不问权限** —— 只读的玩家也过得去，
+          所以凡是会**改**东西的接口都得再挂一道（`_require_editor` /
+          `_require_system_admin`）。
         """
         name = self._admin_name()
         if name is None:
@@ -698,19 +792,35 @@ class AdminRoutes:
             return None
         return name
 
-    def _require_system_admin(self):
-        """**系统管理员**专用（D34）：运营回 403 并返回 `None`。
+    def _require_editor(self):
+        """**改得动东西的人**（系统管理员 / 运营）：只读的玩家回 403（D74）。
 
-        ★ 前台会把「玩家仓库」和「管理员账号」两个标签藏起来，但那只是画面
-        —— 藏掉的按钮拦不住直接 POST，**真正的门在这儿**。
-        ★ 权限**每一发都现查**（`accounts.admin_role`），不从会话里读：
-        把一个人降成运营之后，他手里那个令牌应该**立刻**失去这两页，
+        ★ 前台会把「添加 / 保存 / 删除」整排收起来、把输入框锁上，但那只是
+        画面 —— 锁住的输入框拦不住直接 POST，**真正的门在这儿**。
+        """
+        name, role = self._admin_identity()
+        if name is None:
+            self._reply(False, "请先登录管理页", status=401)
+            return None
+        if role == ROLE_PLAYER:
+            self._reply(False, "普通玩家只能看，不能改", status=403)
+            return None
+        return name
+
+    def _require_system_admin(self):
+        """**系统管理员**专用（D34）：运营和只读玩家一律 403 并返回 `None`。
+
+        ★ 前台会把「玩家仓库」「数据备份」「管理员账号」三个标签藏起来，
+        但那只是画面 —— 藏掉的按钮拦不住直接 POST，**真正的门在这儿**。
+        ★ 权限**每一发都现查**（见 `_admin_identity`），不从会话里读：
+        把一个人降成运营之后，他手里那个令牌应该**立刻**失去这几页，
         不该等他重新登录。
         """
-        name = self._require_admin()
+        name, role = self._admin_identity()
         if name is None:
+            self._reply(False, "请先登录管理页", status=401)
             return None
-        if self.accounts.admin_role(name) != account_store.ADMIN_ROLE_SYSTEM:
+        if role != account_store.ADMIN_ROLE_SYSTEM:
             self._reply(False, "这一页只有系统管理员能用", status=403)
             return None
         return name
@@ -745,11 +855,10 @@ class AdminRoutes:
             self._admin_catalog()
             return True
         if path == "/admin/api/session":
-            name = self._admin_name()
+            name, role = self._admin_identity()
             self._send_json({"ok": True, "name": name,
                              "logged_in": name is not None,
-                             "role": (None if name is None
-                                      else self.accounts.admin_role(name))})
+                             "role": role})
             return True
         if path.startswith("/admin/api/config/"):
             self._admin_config_get(path.rsplit("/", 1)[-1])
@@ -879,6 +988,24 @@ class AdminRoutes:
             "warehouse": shop.WAREHOUSE_TABS,
         })
 
+    def _verify_login(self, name, password):
+        """管理页登录的两条路，返回 `(口令种类, 三态)`（D74）。
+
+        先查管理员表；**表里没这个名字**才退回游戏账号，认出来就是只读的
+        `player` 档。
+
+        ★ 只有 `AUTH_NO_SUCH_USER` 往下走，`AUTH_BAD_PASSWORD` **就地失败**：
+          管理员表里有这个名字的时候，说了算的只能是那一份口令。放行的话，
+          一个被「设为管理员（运营）」之后又在游戏里改过密码的人，就能拿
+          **新的游戏口令**登进运营档（`admin_add_from_player` 照搬的是改密码
+          之前那一份）—— 管理员口令这道门等于没有。
+        """
+        result = self.accounts.admin_verify(name, password)
+        if result != account_store.AUTH_NO_SUCH_USER:
+            return SESSION_KIND_ADMIN, result
+        player, _account = self.accounts.verify(name, password)
+        return SESSION_KIND_PLAYER, player
+
     def _admin_login(self, data):
         # ★ 限速放在**最前面**：被限住的时候连「有没有这个管理员」都不该
         #   问得出来，否则限速就成了一个免费的枚举接口（同 `_api_register`）。
@@ -888,7 +1015,7 @@ class AdminRoutes:
             self._reply(False, f"登录太频繁，请 {wait} 秒后再试", status=429)
             return
         name = str(data.get("name") or "").strip()
-        result = self.accounts.admin_verify(name, data.get("password"))
+        kind, result = self._verify_login(name, data.get("password"))
         if result != account_store.AUTH_OK:
             wait = self.admin_limiter.mark_failure(host)
             # ★ 只打名字和结果，**绝不打口令**（铁律 9）。
@@ -897,17 +1024,19 @@ class AdminRoutes:
             # 「没这个人」和「密码错」对**攻击者**是两条不同的信息，但玩家账号
             # 那边本来就分开说（`AUTH_MESSAGES`），管理页人少、限速也在，
             # 保持同一套文案比自作聪明地含糊其辞更好查。
-            # ★ 用的是 `ADMIN_AUTH_MESSAGES` 而不是玩家那份：管理员没有注册页，
-            #   跟人说「请先在注册页面注册」等于指错路（用户 2026-09-09）。
+            # ★ 用的是 `ADMIN_AUTH_MESSAGES` 而不是玩家那份：这一页的「没这个
+            #   人」有**两条**出路（游戏账号能进来只读、要改得找系统管理员开
+            #   权限），玩家那句只说了一半（D74 改写了这条，原文见 D74）。
             self._reply(False,
                         account_store.ADMIN_AUTH_MESSAGES.get(result, "登录失败")
                         + (f"（{wait} 秒后才能再试）" if wait else ""))
             return
         self.admin_limiter.clear(host)
-        token = self.admin_sessions.issue(name)
-        role = self.accounts.admin_role(name)
+        token = self.admin_sessions.issue(name, kind)
+        role = (ROLE_PLAYER if kind == SESSION_KIND_PLAYER
+                else self.accounts.admin_role(name))
         eventlog.online(f"[admin] 登录成功 {name!r}"
-                        f"（{account_store.ADMIN_ROLE_ZH.get(role, role)}）"
+                        f"（{ROLE_ZH.get(role, role)}）"
                         f" 来自 {self.client_label()}")
         body = json.dumps({"ok": True, "message": "登录成功", "name": name,
                            "role": role},
@@ -967,7 +1096,9 @@ class AdminRoutes:
             return []
 
     def _admin_config_post(self, which, data):
-        name = self._require_admin()
+        # ★ 这是整个 `/admin` 里**唯一**一发「非系统管理员也能改东西」的接口，
+        #   所以只读玩家那道门开在这儿（D74）。
+        name = self._require_editor()
         if name is None:
             return
         filename = CONFIG_FILES.get(which)
@@ -1350,7 +1481,9 @@ class AdminRoutes:
 
     # ------------------------------------------------------------ 玩家仓库
     def _admin_player_search(self, query):
-        """`/admin/api/players?q=…&page=N` —— 按用户名或昵称找人，一页 10 行。
+        """`/admin/api/players?q=…&page=N&online=…` —— 找人，一页 10 行。
+
+        `online` 是 `all`（默认）/ `on` / `off`（用户 2026-09-10，D75）。
 
         ★ **系统管理员专用**（D34）：玩家仓库整页对运营不开放。
         """
@@ -1362,16 +1495,21 @@ class AdminRoutes:
             page = max(0, int((fields.get("page") or ["0"])[0]))
         except ValueError:
             page = 0
+        # ★ 这一份快照要在搜索**之前**取：下面那个筛选判据、每行那个 `online`、
+        #   和工具条上的「当前在线：N 人」用的是**同一份**，三者天生对得上。
+        online = _online_usernames()
+        keep = _online_filter((fields.get("online") or ["all"])[0], online)
         found, total = self.accounts.search_accounts(
-            raw, limit=PLAYER_PAGE_SIZE, offset=page * PLAYER_PAGE_SIZE)
+            raw, limit=PLAYER_PAGE_SIZE, offset=page * PLAYER_PAGE_SIZE,
+            keep=keep)
         pages = max(1, -(-total // PLAYER_PAGE_SIZE))     # 向上取整
         if not found and page >= pages:
-            # 翻过了头（删号 / 换了查询串之后还停在第 5 页）：退回最后一页，
-            # 而不是回一张空表让人以为「没有这个人」。
+            # 翻过了头（删号 / 换了查询串或筛选之后还停在第 5 页）：退回最后
+            # 一页，而不是回一张空表让人以为「没有这个人」。
             page = pages - 1
             found, total = self.accounts.search_accounts(
-                raw, limit=PLAYER_PAGE_SIZE, offset=page * PLAYER_PAGE_SIZE)
-        online = _online_usernames()
+                raw, limit=PLAYER_PAGE_SIZE, offset=page * PLAYER_PAGE_SIZE,
+                keep=keep)
         # 「设为管理员（运营）」那个按钮要知道这个人**现在是什么权限**（D40）：
         # 已经是了就把按钮换成灰的、写上他的实际权限。★ 一次取整张表再查，
         # 别对着 10 行各问一次 `admin_role()`（那是 10 次加锁 + 10 次读盘）。
@@ -1386,6 +1524,8 @@ class AdminRoutes:
             # 全服在线人数（用户 2026-09-08）：和下面每行那个 `online` 是
             # **同一次** `_online_usernames()` 的结果，所以工具条上的总数
             # 跟列表里那些 ● 天生对得上，不会出现「三个 ●、写着五人」。
+            # ★ 它**不跟着搜索串 / 页码 / 在线筛选缩水** —— 选了「不在线」
+            #   之后这一格照样写全服在线多少人（`total` 才是筛出来几个）。
             "online_total": len(online),
             "players": [{
                 "username": username,
