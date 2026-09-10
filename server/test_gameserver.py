@@ -2111,7 +2111,7 @@ class ResultScreenNumbersTests(unittest.TestCase):
         screen_score = sum(end_values[i] for i in END_GAME_SCORE_PARTS)
         # `conn.room` 没带 arguments -> `current_quest()` 取不到 -> 按 1 级关卡、
         # 难度 1 算；`quest_success` 是 False，所以基础奖励打 QUEST_FAILED_RATIO 折。
-        want_exp, want_money = gameserver.quest_reward(1, 1, 1289, False)
+        want_exp, want_money, _w = gameserver.quest_reward(1, 1, 1289, False)
         self.assertEqual(want_exp, values[GAME_RESULT_EXPERIENCE])
         self.assertEqual(want_money, values[GAME_RESULT_MONEY])
         self.assertEqual(1289, screen_score)
@@ -2132,7 +2132,7 @@ class ResultScreenNumbersTests(unittest.TestCase):
         conn = self.make_conn(score=0)
         gameserver.Conn.on_game_packet(conn, gameserver.OP_END_QUEST, b"")
         values = self.result_values(self.sent_with(conn, OP_REP_GAME_RESULT))
-        want_exp, want_money = gameserver.quest_reward(1, 1, 0, False)
+        want_exp, want_money, _w = gameserver.quest_reward(1, 1, 0, False)
         self.assertEqual(want_exp, values[GAME_RESULT_EXPERIENCE])
         self.assertEqual(want_money, values[GAME_RESULT_MONEY])
         self.assertEqual(0, values[GAME_RESULT_LADDER_POINT])
@@ -3013,6 +3013,140 @@ class MaterialDropTests(unittest.TestCase):
         self.write_rules(self.rule(self.BRONZE_PIPE))
         self.assertEqual({self.BRONZE_PIPE: 1},
                          self.drops(quest_id=None, difficulty="x"))
+
+
+class RewardLookupTests(unittest.TestCase):
+    """金币 / 经验现在是**查 `rewards.json`**，不是算公式了（D72）。
+
+    这里只测「查哪一档、查不到怎么办」。「默认表等于老公式」在
+    `test_shopcfg.RewardDefaultsTests` 里，两件事分开。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved_dir = shopcfg.DATA_DIR
+        shopcfg.DATA_DIR = self.tmp.name
+        self.addCleanup(shopcfg.invalidate)
+        self.addCleanup(setattr, shopcfg, "DATA_DIR", saved_dir)
+        shopcfg.invalidate()
+
+    def write(self, *rules):
+        shopcfg.write_json(
+            shopcfg.path_of(shopcfg.REWARDS_FILENAME, self.tmp.name),
+            {"format": 1, "rules": list(rules)})
+        shopcfg.invalidate()
+
+    @staticmethod
+    def pvp(pvp_mode=0, item_mode=False, team=0, **kw):
+        row = {"mode": "pvp", "pvp_mode": pvp_mode, "item_mode": item_mode,
+               "team": team, "win_money": 0, "lose_money": 0,
+               "win_exp": 0, "lose_exp": 0}
+        row.update(kw)
+        return row
+
+    @staticmethod
+    def quest(stage=1, difficulty=1, **kw):
+        row = {"mode": "quest", "stage": stage, "difficulty": difficulty,
+               "win_money": 0, "lose_money": 0, "win_exp": 0, "lose_exp": 0}
+        row.update(kw)
+        return row
+
+    BONUS = {"mode": "bonus", "quest_score_per_exp": 20, "pvp_exp_per_kill": 3}
+
+    # -- 闯关 ---------------------------------------------------------------
+
+    def test_the_quest_slot_decides_the_numbers(self):
+        self.write(self.quest(3, 2, win_money=777, win_exp=55,
+                              lose_money=11, lose_exp=2), self.BONUS)
+        self.assertEqual((55, 777, []), gameserver.quest_reward(3, 2, 0, True))
+        self.assertEqual((2, 11, []), gameserver.quest_reward(3, 2, 0, False))
+
+    def test_the_score_bonus_is_added_on_top_of_the_experience(self):
+        self.write(self.quest(1, 1, win_exp=10),
+                   dict(self.BONUS, quest_score_per_exp=7))
+        # 30 // 7 = 4
+        self.assertEqual(14, gameserver.quest_reward(1, 1, 30, True)[0])
+
+    def test_money_still_ignores_the_score(self):
+        # D152 没变：金币不吃分数，只有经验吃。
+        self.write(self.quest(1, 1, win_money=100, win_exp=10), self.BONUS)
+        self.assertEqual(gameserver.quest_reward(1, 1, 0, True)[1],
+                         gameserver.quest_reward(1, 1, 9999, True)[1])
+
+    # -- 对战：模式 / 道具战 / 组队战 各查各的 --------------------------------
+
+    def test_each_pvp_combination_reads_its_own_slot(self):
+        """★ 2026-09-10 之前八种组合给的钱一模一样，现在各是各的。"""
+        self.write(
+            self.pvp(0, False, 0, win_money=1),
+            self.pvp(0, False, 1, win_money=2),
+            self.pvp(0, True, 0, win_money=3),
+            self.pvp(0, True, 1, win_money=4),
+            self.pvp(3, False, 0, win_money=5),
+            self.pvp(3, False, 1, win_money=6),
+            self.pvp(3, True, 0, win_money=7),
+            self.pvp(3, True, 1, win_money=8),
+            self.BONUS)
+        want = 0
+        for game_mode in (0, 3):
+            for item_mode in (False, True):
+                for team_mode in (False, True):
+                    want += 1
+                    self.assertEqual(
+                        want,
+                        gameserver.pvp_reward(0, True, game_mode,
+                                              item_mode, team_mode)[1],
+                        (game_mode, item_mode, team_mode))
+
+    def test_the_kill_bonus_is_added_on_top_of_the_experience(self):
+        self.write(self.pvp(0, win_exp=10),
+                   dict(self.BONUS, pvp_exp_per_kill=4))
+        self.assertEqual(10 + 4 * 3, gameserver.pvp_reward(3, True, 0)[0])
+
+    def test_a_draw_pays_the_losing_column(self):
+        # 尾部数组那一格是 0（谁都不判）时 `won` 是 False —— 走「输」那一列。
+        self.write(self.pvp(0, win_money=99, lose_money=7), self.BONUS)
+        self.assertEqual(7, gameserver.pvp_reward(0, False, 0)[1])
+
+    def test_unlisted_game_modes_are_filed_by_their_victory_condition(self):
+        """★ 表里只有生存(0) / 夺分(3)。模式 2 和 0 共用生存的胜负条件 ⇒ 归生存；
+        模式 1（计时）和一切没见过的号归夺分，和 `pvp_game_mode()` 的兜底一致。"""
+        self.write(self.pvp(0, win_money=100), self.pvp(3, win_money=300),
+                   self.BONUS)
+        for game_mode, want in ((0, 100), (2, 100), (1, 300), (3, 300),
+                                (None, 300), (99, 300)):
+            self.assertEqual(want, gameserver.pvp_reward(0, True, game_mode)[1],
+                             game_mode)
+
+    # -- 缺一档 / 坏文件：退回内置默认值，**不是 0** --------------------------
+
+    def test_a_missing_slot_falls_back_to_the_built_in_default(self):
+        """★★ 缺一档不能按 0 算 —— 那是让玩家白打一局，而他看不出是配置问题。"""
+        self.write(self.quest(1, 1, win_money=1), self.BONUS)
+        experience, money, warnings = gameserver.quest_reward(7, 3, 0, True)
+        self.assertEqual((200, 1000), (experience, money))   # 默认表里那一档
+        self.assertTrue(any("扎米洛秘密基地" in w for w in warnings), warnings)
+
+    def test_a_broken_file_still_pays_the_default_amounts(self):
+        path = shopcfg.path_of(shopcfg.REWARDS_FILENAME, self.tmp.name)
+        with open(path, "w", encoding="utf-8") as fp:
+            fp.write("{ this is not json")
+        shopcfg.invalidate()
+        experience, money, warnings = gameserver.quest_reward(1, 1, 0, True)
+        self.assertEqual((20, 100), (experience, money))
+        self.assertTrue(warnings)
+
+    def test_a_missing_bonus_row_still_pays_the_kill_bonus(self):
+        self.write(self.pvp(0, win_exp=10))
+        experience, _money, warnings = gameserver.pvp_reward(2, True, 0)
+        self.assertEqual(10 + 3 * 2, experience)          # 默认 每杀 3 点
+        self.assertTrue(any("加成系数" in w for w in warnings), warnings)
+
+    def test_a_junk_quest_id_does_not_raise(self):
+        # `current_quest()` 拿不到参数时会给出各种东西，发奖不该跟着炸。
+        self.write(self.quest(1, 1, win_money=42), self.BONUS)
+        self.assertEqual(42, gameserver.quest_reward(None, "x", 0, True)[1])
 
 
 class ShopProbeTests(unittest.TestCase):

@@ -2141,42 +2141,93 @@ GAME_RESULT_LADDER_POINT = 11   # 「竞技场分数 +N」（闯关模式没有�
 #: 132 条 `RewardN=类型,数值`：类型 0=金币 100~1000、2=经验 20~120）——
 #: 我们只借它的**量纲**，不照搬语义。
 #:
-#: 闯关基础奖励按关卡 id 递增：经验 20/30/…/80，金币 100/150/…/400。
-QUEST_BASE_EXPERIENCE = 20
-QUEST_BASE_EXPERIENCE_STEP = 10
-QUEST_BASE_MONEY = 100
-QUEST_BASE_MONEY_STEP = 50
+#: ★★ **2026-09-10 起这些数不写在代码里了**（D72）。
+#:
+#: 原来这儿有 12 个常量（关卡基数 / 难度系数 / 未通关折扣 / 对战底薪…），
+#: 改一个数就得动代码 + 重启服务端（铁律 7）。现在它们搬去
+#: `shopdefaults.build_rewards()` 当**默认表**，运行时读
+#: `server/data/rewards.json` —— 运营在管理页「金币 / 经验获取」那一页改，
+#: 改完**即刻生效**。这里只剩「怎么查表」和「查不到怎么办」。
+#:
+#: ★ 一档 = 表里的一条记录：
+#:     对战 `(游戏模式, 道具战, 组队战)`  —— 8 档
+#:     闯关 `(关卡, 难度)`               —— 21 档
+#:   每档写着**赢 / 输**各给多少金币和经验（闯关的「赢」= 通关）。
 
-#: 难度加成。闯关房描述符的第二个参数就是难度（1=简单 / 2=普通 / 3=困难，§68）。
-#: 表外的难度按 1.0 处理（别为一个没见过的数把奖励算成 0）。
-QUEST_DIFFICULTY_BONUS = {1: 1.0, 2: 1.6, 3: 2.5}
 
-#: 没通关时基础奖励打几折。**不是 0** —— 打了半天不能一无所获，
-#: 而且客户端在「未完成」时照样弹结算界面。
-QUEST_FAILED_RATIO = 0.3
+def _split_rewards(rules):
+    """奖励表 → `(对战档, 闯关档, 加成系数)` 三张查得动的表。"""
+    pvp_rows, quest_rows, bonus = {}, {}, {}
+    for rule in rules:
+        mode = rule.get("mode")
+        if mode == "pvp":
+            pvp_rows[(rule.get("pvp_mode"), bool(rule.get("item_mode")),
+                      int(rule.get("team", 0)))] = rule
+        elif mode == "quest":
+            quest_rows[(rule.get("stage"), rule.get("difficulty"))] = rule
+        elif mode == "bonus":
+            bonus = rule
+    return pvp_rows, quest_rows, bonus
 
-#: 关卡分数换成**经验**的除数。分数常见几百~上千，按 1/20 折成经验 ——
-#: 打得好有回报，但主导项仍然是「打的是哪一关、什么难度」。
-QUEST_SCORE_PER_EXPERIENCE = 20
 
-#: 对战一局的奖励。经验：参战底薪 + 每杀 + 胜方加成；金币：只有底薪 + 胜方加成。
-#: 对战一局比闯关短得多，数值也就小一档。
-PVP_BASE_EXPERIENCE = 10
-PVP_EXPERIENCE_PER_KILL = 3
-PVP_WIN_EXPERIENCE = 15
-PVP_BASE_MONEY = 30
-PVP_WIN_MONEY = 50
+def _default_rewards():
+    """内置默认表，拆成和 `_split_rewards` 一样的三张。文件里缺档位时兜底。"""
+    pvp_rows, quest_rows, bonus = _split_rewards(
+        shopcfg.validate_rewards(shopcfg.default_rewards()))
+    return {"pvp": pvp_rows, "quest": quest_rows, "bonus": bonus}
+
+
+def _reward_row(rows, key, kind, what):
+    """查一档奖励。文件里没有这一档就退回**内置默认表**，并给一句警告。
+
+    ★ 为什么不按 0 算：缺一档等于让玩家白打一局，而他看不出这是配置问题
+    ——「少给了钱」比「商店空着」难发现得多，而且那一局补不回来（D72）。
+    """
+    row = rows.get(key)
+    if row is not None:
+        return row, []
+    head = "没有「%s」这一档" % what
+    fallback = _default_rewards()[kind].get(key)
+    if fallback is None:
+        return {}, [head + "，内置默认表里也没有 —— 这一局按 0 算"]
+    return fallback, [head + "，先按内置默认值发"]
+
+
+def _reward_bonus(bonus):
+    """加成系数那一条；文件里没有就退回内置默认值。"""
+    if bonus:
+        return bonus, []
+    return (_default_rewards()["bonus"],
+            ["没有「经验加成系数」那一条，先按内置默认值算"])
+
+
+def _pvp_row_name(key):
+    """对战那一档写成人话，给警告日志用：「对战 · 生存模式 · 道具战 · 组队战」。"""
+    game_mode, item_mode, team = key
+    parts = ["对战", shopcfg.PVP_MODE_ZH.get(game_mode, "模式 %s" % game_mode)]
+    if item_mode:
+        parts.append("道具战")
+    parts.append(shopcfg.TEAM_ZH.get(team, "队伍 %s" % team))
+    return " · ".join(parts)
 
 
 def quest_reward(quest_id, difficulty, score, cleared):
-    """闯关一局的 `(经验, 金币)`。纯函数，好单测。
+    """闯关一局的 `(经验, 金币, 警告列表)`。
 
+    数值全部来自 `server/data/rewards.json`（管理页「金币 / 经验获取」那一页，
+    改完不用重启，D72）：一档 = 一个 `(关卡, 难度)`，里面写着**通关 / 未通关**
+    各给多少金币和经验。
     `quest_id` / `difficulty` 来自 `Conn.current_quest()`（闯关房描述符的两个
     参数）；拿不到（不是闯关房、参数不全）时按 1 级关卡、难度 1 算。
 
-    ★★ **金币不吃分数加成**（D152）：它 = 关卡固定奖励 × 难度系数，**就这些**。
+    ★★ **金币不吃分数加成**（D152）：它就是表里那个数，**就这些**。
     本局在地上捡到的金币由 `settle_quest` 另加（`RoomQuest.coins`）——
     「打得好」的回报走经验，「捡得勤」的回报走地上那些金币，两条线分开。
+    经验那一头还留着「每 N 分额外 +1」，N 在 `mode:"bonus"` 那一条里。
+
+    ★ 返回三元组（多一个警告列表）是**本仓库读配置的固定形状**
+    （`quest_materials` 和 `shopcfg` 几个读取器都这样）：配置是用户手改的，
+    读出来的毛病必须有地方说出去，不能咽掉。调用方打进日志就行。
     """
     try:
         quest_id = max(1, int(quest_id))
@@ -2187,29 +2238,56 @@ def quest_reward(quest_id, difficulty, score, cleared):
     except (TypeError, ValueError):
         difficulty = 1
     score = max(0, int(score))
-    bonus = QUEST_DIFFICULTY_BONUS.get(difficulty, 1.0)
-    ratio = bonus if cleared else bonus * QUEST_FAILED_RATIO
-    base_exp = QUEST_BASE_EXPERIENCE + QUEST_BASE_EXPERIENCE_STEP * (quest_id - 1)
-    base_money = QUEST_BASE_MONEY + QUEST_BASE_MONEY_STEP * (quest_id - 1)
-    experience = int(base_exp * ratio) + score // QUEST_SCORE_PER_EXPERIENCE
-    money = int(base_money * ratio)
-    return experience, money
+    rules, warnings = shopcfg.rewards()
+    warnings = list(warnings)
+    _pvp_rows, quest_rows, bonus = _split_rewards(rules)
+    what = "闯关 · 关卡%d %s · %s" % (
+        quest_id, shopcfg.QUEST_ZH.get(quest_id, ""),
+        shopcfg.DIFFICULTY_ZH.get(difficulty, "难度 %d" % difficulty))
+    row, missing = _reward_row(quest_rows, (quest_id, difficulty),
+                               "quest", what.strip())
+    warnings += missing
+    bonus, missing = _reward_bonus(bonus)
+    warnings += missing
+    money = int(row.get("win_money" if cleared else "lose_money", 0))
+    experience = int(row.get("win_exp" if cleared else "lose_exp", 0))
+    per_exp = int(bonus.get("quest_score_per_exp", 0))
+    if per_exp > 0:
+        experience += score // per_exp
+    return experience, money, warnings
 
 
-def pvp_reward(kills, won):
-    """对战一局的 `(经验, 金币)`。`won` 就是尾部数组里那一格 == 1。
+def pvp_reward(kills, won, game_mode=None, item_mode=False, team_mode=False):
+    """对战一局的 `(经验, 金币, 警告列表)`。`won` 就是尾部数组里那一格 == 1。
+
+    ★★ **哪一档由 `(游戏模式, 道具战, 组队战)` 三样决定**（D72）——
+    2026-09-10 之前这三样对奖励**毫无影响**，八种组合给的钱一模一样。
+    `game_mode` 是房间描述符的 `arguments[1]`（`Conn.pvp_game_mode()`），
+    经 `PVP_MODE_ROW` 归档到表里那两行。
 
     ★ 输了也给底薪：对战的一局可能就几分钟，一分不给会逼人挂机刷闯关。
+      表里「输」那一列就是这个底薪。**平局**（尾部数组那一格是 0、谁都不判）
+      也走「输」那一列 —— `won` 只在那一格 == 1 时为真。
 
     ★★ **金币不吃杀敌数**（D152，和闯关同一条口径）：杀敌数就是对战的分数，
-    所以金币只剩「参战底薪 + 胜方加成」这两个固定值，再由 `settle_quest`
-    加上本局捡到的金币。经验仍然按杀敌数走 —— 技术好照样有回报。
+    所以金币只剩表里那个固定值，再由 `settle_quest` 加上本局捡到的金币。
+    经验仍然按杀敌数走（每杀 +N，N 在 `mode:"bonus"` 那一条里）——
+    技术好照样有回报。
     """
     kills = max(0, int(kills))
-    experience = (PVP_BASE_EXPERIENCE + PVP_EXPERIENCE_PER_KILL * kills
-                  + (PVP_WIN_EXPERIENCE if won else 0))
-    money = PVP_BASE_MONEY + (PVP_WIN_MONEY if won else 0)
-    return experience, money
+    key = (PVP_MODE_ROW.get(game_mode, PVP_MODE_DEATHMATCH),
+           bool(item_mode), 1 if team_mode else 0)
+    rules, warnings = shopcfg.rewards()
+    warnings = list(warnings)
+    pvp_rows, _quest_rows, bonus = _split_rewards(rules)
+    row, missing = _reward_row(pvp_rows, key, "pvp", _pvp_row_name(key))
+    warnings += missing
+    bonus, missing = _reward_bonus(bonus)
+    warnings += missing
+    money = int(row.get("win_money" if won else "lose_money", 0))
+    experience = int(row.get("win_exp" if won else "lose_exp", 0))
+    experience += int(bonus.get("pvp_exp_per_kill", 0)) * kills
+    return experience, money, warnings
 
 
 def quest_materials(quest_id, difficulty, cleared, mode="quest", rng=None):
@@ -3576,6 +3654,25 @@ PVP_MODE_SURVIVAL = 0
 PVP_MODE_TIME_ATTACK = 1
 PVP_MODE_FIGHT = 2
 PVP_MODE_DEATHMATCH = 3
+
+#: 游戏模式号 → **奖励表里的哪一行**（`pvp_reward`，D72）。
+#:
+#: 表里只有生存(0) 和 夺分(3)：中国区建房下拉框就这两种，低等级号选了生存
+#: 还会被客户端自己改回夺分（`hook/bshook.c` 的 `try_patch_player_level_gate`
+#: 第 3 / 4 处）。剩下两个号照**引擎里的胜负条件**归档 ——
+#: 模式 2 和模式 0 共用 `SurvivalVictoryCondition`（上面那个工厂分流）⇒ 归生存；
+#: 模式 1（计时）没有对应行，和「参数缺不全」一样归夺分，
+#: 和 `Conn.pvp_game_mode()` 的兜底一个口径。
+#:
+#: ★ 天梯房 / 练习房（`session_type` 5 / 6）也落到这条路上 —— 它们的
+#: `arguments` 根本不是对战那套含义，一律按夺分那一行发钱。真要给天梯单独
+#: 定价，得先在房间描述符那边把「这是天梯」传下来，别在这儿猜。
+PVP_MODE_ROW = {
+    PVP_MODE_SURVIVAL: PVP_MODE_SURVIVAL,
+    PVP_MODE_TIME_ATTACK: PVP_MODE_DEATHMATCH,
+    PVP_MODE_FIGHT: PVP_MODE_SURVIVAL,
+    PVP_MODE_DEATHMATCH: PVP_MODE_DEATHMATCH,
+}
 
 #: 生存类构造函数 `0x55e018` 给每个在座角色写死三条命；模式 0 的时限是
 #: 240000 ms，模式 2 复用同一个胜负类但时限是 300000 ms（`0x55e2da`）。
@@ -8078,9 +8175,12 @@ class Conn:
     def send_end_game(self, success=None):
         """结算这一局：把所得记进存档，再把新的经验/金币下发（0x0411）。
 
-        奖励取客户端 `0x0410 gcpUpdateQuestScore` 报上来的**累计分数**
-        （实测一局 4→12→…→64）。真服务器怎么换算不可知，这里 1 分 = 1 点经验
-        = 1 金币，够让「打一局有长进」这件事成立；要调直接改这里。
+        ★ **分数 / 经验 / 金币是三件事**（§227 / D148）。分数取客户端
+        `0x0410 gcpUpdateQuestScore` 报上来的累计分（对战那边客户端从不发它，
+        改数服务端自己从 `0x0408` 的凶手字段里数出来的杀敌数）；
+        经验和金币各按 `quest_reward()` / `pvp_reward()` 查
+        `server/data/rewards.json`（管理页「金币 / 经验获取」，D72）。
+        **要调数值去管理页改那份文件，不用动这里、也不用重启。**
 
         存档写在下发**之前**：客户端拿到的必须是已经入账的总经验，
         否则重登一次就退回去了（D024，JSON 是真源）。
@@ -8131,6 +8231,9 @@ class Conn:
         seats = self.settlement_seats()
         quest_mode = self.quest_mode()
         pvp_mode = None if quest_mode else self.pvp_game_mode()
+        # 道具战开关（`arguments[2]`）—— 奖励表的三个坐标之一（D72）。
+        # 和 `pvp_mode` 一样是**房间级**的，在循环外取一次就够。
+        item_mode = False if quest_mode else self.item_mode()
         # ★ 对战里客户端**从不发 `0x0410 gcpUpdateQuestScore`**（实机整局日志里
         #   一发都没有），所以 `quest_score` 恒为 0，光靠它排名会永远判成
         #   「全场 0 分不判」。对战的分数就是杀敌数，服务端自己从 `0x0408`
@@ -8188,12 +8291,18 @@ class Conn:
             # ★★ 分数 / 经验 / 金币是**三件事**（§227 / D148）。以前它们是同一个
             #    `score`，于是结算界面三行数一模一样、而且一局能给上千经验。
             #    分数栏仍然发本局分数，经验和金币各按自己的公式算。
+            #    ★ 数值来自 `rewards.json`（管理页「金币 / 经验获取」，D72）——
+            #      对战那一路把 模式 / 道具战 / 组队战 一起传进去，八种组合各查
+            #      各的那一档；以前它们给的钱一模一样。
             if quest_mode:
                 quest_id, difficulty = quest_info or (1, 1)
-                gained_exp, gained_money = quest_reward(
+                gained_exp, gained_money, reward_warnings = quest_reward(
                     quest_id, difficulty, score, seat_cleared)
             else:
-                gained_exp, gained_money = pvp_reward(score, seat_cleared)
+                gained_exp, gained_money, reward_warnings = pvp_reward(
+                    score, seat_cleared, pvp_mode, item_mode, team_mode)
+            for warning in reward_warnings:
+                conn.log(f"   ⚠ rewards.json: {warning}")
             # ★★ 再加上**本局在地上捡到的金币**。闯关里怪和 boss 掉的、对战里
             #    偶尔掉的，都在 `RoomQuest.claim_item()` 那一步按座位记好了。
             #    客户端的 1 / 5 累加只用于战局内浮字，不改持久账户余额；这里才把

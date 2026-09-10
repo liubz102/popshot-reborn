@@ -1541,6 +1541,26 @@ def level_for_experience(experience):
     return max(1, min(LEVEL_MAX, level))
 
 
+def level_table():
+    """整条等级曲线：`[{level, need, total}…]`，1 ~ `LEVEL_MAX`（D72a）。
+
+    `need` = 从这一级升到下一级要挣多少（满级那一行是 `None`）；
+    `total` = 到达这一级的**累计**经验。
+
+    ★ 给管理页「金币 / 经验获取」当**只读参照表**用：运营在那儿调「一局给多少
+    经验」，得看得见这些经验换算下来是多少级。曲线**只有上面那一处定义**，
+    页面照这份表画，不许自己再算一遍公式（算重了迟早对不上）。
+    """
+    return [{"level": level,
+             # ★ 满级没有「下一级」：`level_for_experience()` 钳在 LEVEL_MAX。
+             #   `experience_for_level(LEVEL_MAX + 1)` 确实存在，但那只是
+             #   `experience_bounds()` 在满级时拿来当**除法分母**的（见那边），
+             #   不是玩家挣得到的一级 —— 别把它当成「还能再升」画出来。
+             "need": None if level >= LEVEL_MAX else EXPERIENCE_STEP * level,
+             "total": experience_for_level(level)}
+            for level in range(1, LEVEL_MAX + 1)]
+
+
 def experience_for_import(account, provided=None):
     """导入存档时该存多少总经验 —— ★ **等级说了算**。
 

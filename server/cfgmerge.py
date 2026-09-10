@@ -54,6 +54,11 @@ KEY_FIELDS = {
     "shop": ("id",),
     "recipe": ("id",),
     "drops": ("mode", "stage", "difficulty", "material"),
+    #: ★ 奖励表也没有天然主键，身份就是「哪一档」（D72）。六个字段里
+    #:   对战那三个（`pvp_mode` / `item_mode` / `team`）和闯关那两个
+    #:   （`stage` / `difficulty`）互斥地各出现一半，缺的那半是 `None`，
+    #:   `mode:"bonus"` 那一条六个全 `None` —— 全表唯一，正好当它的身份。
+    "rewards": ("mode", "pvp_mode", "item_mode", "team", "stage", "difficulty"),
 }
 
 #: 商店 ⇄ 合成互斥时，「这条记录说的是哪件物品」看哪个字段。
@@ -321,6 +326,23 @@ def label_of(which, key, entry=None):
         result = (entry or {}).get("result")
         head = _item_label(result) if result is not None else "（产物未知）"
         return "%s　配方 #%s" % (head, nat[0])
+    if which == "rewards":
+        # 「对战 · 生存模式 · 道具战 · 组队战」/「闯关 · 关卡3 神秘岛 · 困难」
+        mode, pvp_mode, item_mode, team, stage, difficulty = nat
+        if mode == "bonus":
+            return "经验加成系数"
+        if mode == "pvp":
+            parts = ["对战",
+                     shopcfg.PVP_MODE_ZH.get(pvp_mode, "模式 %s" % pvp_mode)]
+            if item_mode:
+                parts.append("道具战")
+            parts.append(shopcfg.TEAM_ZH.get(team, "队伍 %s" % team))
+            return " · ".join(parts)
+        return " · ".join([
+            "闯关",
+            "关卡%s %s" % (stage, shopcfg.QUEST_ZH.get(stage, "")),
+            shopcfg.DIFFICULTY_ZH.get(difficulty, "难度 %s" % difficulty),
+        ]).strip()
     # drops：「铁矿石（#20007）　闯关 · 关卡5 岩浆巨龙 · 困难」
     mode, stage, difficulty, material = nat
     parts = [_item_label(material),

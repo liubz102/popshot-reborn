@@ -275,6 +275,22 @@ ul.help b, .hint b { color: var(--crimson); }
 }
 .btn-danger:hover { background: linear-gradient(#E85C62, #CE2E34); }
 .btn-ghost { box-shadow: none; background: rgba(255, 255, 255, .55); }
+/* 「▤ 等级经验对应表」（D72b）：和旁边那两个 `.cat` **不是一类东西** ——
+   那两个是「切到哪一半」的开关，这一个是「弹一张只读的表出来」。
+   ★ 但也不能自己发明一种颜色（用户第二轮：白底太突兀）。这里穿的是
+   **面板标题栏那身衣服** —— 深棕底 + 琥珀边 + 琥珀软色字，全页现成的组合
+   （`.panel-title` 和它右端的 `.count` / `.icon-btn` 就是这一套）。
+   于是它既明显不是那两个米黄琥珀钮，又还在这一页的配色里。 */
+.btn.btn-ref {
+  color: var(--amber-soft);
+  background: linear-gradient(#5C3A26, var(--cocoa));
+  border-color: var(--amber-dark);
+  box-shadow: 0 2px 0 #2A1710;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, .45);
+}
+.btn.btn-ref:hover {
+  color: #fff; background: linear-gradient(#6E4832, #4A2C1D);
+}
 .btn-sm { padding: 3px 9px; font-size: 12px; box-shadow: 0 2px 0 #C98A1D; }
 /* 玩家列表那两个钮（D40 / D40a）：「修改仓库」金色主钮、「设为管理员（运营）」
    米黄默认钮 —— 靠轻重分，不靠色相。原来给权限钮画的青色 `.btn-admin` 是整页
@@ -582,11 +598,79 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
+/* ---------------------------------------- 金币 / 经验获取：两张表格
+   用户 2026-09-10（D72）。别的配置页是一条一张卡，这一页是两张**固定的**
+   二维表格：对战 = 模式 × 个人/组队，闯关 = 关卡 × 难度，一格里两个数
+   （输 / 赢）。顶上「金币 / 经验」切换复用 `.cat-tabs` 那排按钮。 */
+.reward-block { margin-bottom: 22px; }
+.reward-block h3 {
+  margin: 0 0 9px; font-size: 14px; color: var(--cocoa);
+  letter-spacing: .5px;
+}
+/* 宽表在自己身上横滚，别把整页撑出横条（`main` 是 1320 定宽的）。 */
+.reward-scroll { overflow-x: auto; }
+/* 通用 `table` 那条限了 `max-width:520px`（那是管理员名单用的），这儿要放开。 */
+.reward-table {
+  max-width: none; width: auto; background: #fff;
+  border: 2px solid var(--line); border-radius: 10px;
+}
+.reward-table th, .reward-table td {
+  text-align: center; padding: 6px 8px; border-bottom: 2px solid var(--line);
+}
+.reward-table tbody tr:last-child th,
+.reward-table tbody tr:last-child td { border-bottom: none; }
+/* 行首那一列（模式名 / 关卡名）左对齐、和数字格拉开距离 */
+.reward-table th.rowhead {
+  text-align: left; white-space: nowrap; padding-right: 16px;
+  color: var(--cocoa-ink);
+}
+/* 每两列一组（一个队伍 / 一个难度），组与组之间画一条竖线 */
+.reward-table th.grp, .reward-table td.grp { border-left: 2px solid var(--line); }
+.reward-table thead th { background: var(--paper-2); }
+.reward-table thead tr:first-child th.grp { color: var(--cocoa-ink); }
+.reward-table td > input {
+  width: 84px; text-align: right; padding: 4px 7px;
+}
+/* 经验那一半下面的加成系数。输入框跟表格里的格子一样宽，别一枝独秀。 */
+.reward-bonus { margin: -8px 0 22px 2px; }
+.reward-bonus input { width: 84px; text-align: right; }
+
+/* ---- 「等级与经验」参照表（只读，D72a）：60 级分三栏并排 ----
+   和上面两张表同一套边框 / 表头底色，但它没有输入框：数字右对齐好上下扫，
+   等级那一列窄一点、当行首。行高压紧 —— 20 行 × 3 栏本来就占地方。 */
+.level-table td, .level-table th { padding: 3px 10px; font-size: 12px; }
+.level-table td { text-align: right; min-width: 84px; color: var(--cocoa-ink); }
+.level-table th.lv, .level-table td.lv {
+  text-align: right; min-width: 0; padding-right: 14px;
+}
+/* 弹窗里那一张（D72b）：按内容高，别硬撑成选择器那个 640。 */
+#levelModal .panel { width: min(780px, 100%); height: auto; max-height: 100%; }
+/* ★ 表格**撑满弹窗**（用户第六轮）：原来它按内容宽（641px），右边空出一大片、
+   左右不对称。`width: 100%` 让三栏把余量均分掉。
+   ★ `min-width: max-content` 是配套的护栏 —— 窗口窄到放不下时**宁可横滚**
+   （`.reward-scroll` 管着），也不许把列压成挤成一团的窄条。 */
+#levelModal .level-table { width: 100%; min-width: max-content; }
+/* 弹窗里就这一块，底下不用再留间距。 */
+#levelModal .reward-block { margin-bottom: 0; }
+/* ★ 窗口矮到要竖滚时，滚动条会从右边吃掉 15px、把表挤得左右不对称
+   （用户第六轮要的就是「左右居中」）。两边都预留出滚动条的位置：
+   有没有滚动条，表都在正中间。浏览器不认这个属性时退回旧行为，不会更糟。 */
+#levelModal .panel-body { scrollbar-gutter: stable both-edges; }
+/* 隔行浅底：三栏并排时全靠它把视线锁在同一行上 */
+.level-table tbody tr:nth-child(even) td { background: #FFFDF7; }
+/* ★ 等级那一列**恒定**用米黄底当「行首」—— 跟着隔行变的话三条栏界
+   断断续续，反而更难数。 */
+.level-table tbody th.lv { background: var(--paper-2); }
+.level-table tbody tr th, .level-table tbody tr td { border-bottom: none; }
+.reward-note { margin: -8px 0 4px 2px; }
+
 /* 出错时高亮那一张卡（服务端把下标写在错误里，前台定位过来） */
 .flash { animation: flash 1.6s ease-out; }
 .item-card.bad, .recipe-card.bad, .rule-row.bad {
   border-color: var(--crimson); background: #FFF2F2;
 }
+/* 奖励表里出错的是**一格**（一行里有好几条记录），高亮那一格就够 */
+.reward-table td.bad, .reward-bonus.bad { background: #FFF2F2; }
 @keyframes flash {
   0%, 45% { box-shadow: 0 0 0 4px rgba(192, 39, 45, .38); }
   100%    { box-shadow: 0 0 0 0 rgba(192, 39, 45, 0); }
@@ -732,16 +816,32 @@ code {
 }
 /* 分类标签：大分类一行（照商店标签的样子缩小一号），小分类一行（金色）。 */
 .cat-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
-.cat-tabs button.cat {
+/* ★ 选择器**不带 `.cat-tabs` 前缀**（用户 2026-09-10，D72b）：「金币 / 经验获取」
+   页那个「金币 / 经验」切换挪进了工具条（`.toolbar .seg`），干的还是「现在看
+   哪一档」这件事，就该长同一个样子 —— 复制一份样式出来迟早两边跑偏。
+   `.cat` 这个类全页只挂在这类按钮上。 */
+button.cat {
   padding: 4px 12px; cursor: pointer; font: inherit; font-size: 13px; font-weight: 700;
   color: #6B4A2E; background: linear-gradient(#FFF7E6, #F0DFBE);
   border: 2px solid var(--amber-dark); border-radius: 9px;
 }
-.cat-tabs button.cat:hover { background: linear-gradient(#FFFDF6, #F7EAD0); }
-.cat-tabs button.cat.on {
+button.cat:hover { background: linear-gradient(#FFFDF6, #F7EAD0); }
+button.cat.on {
   color: #fff; background: linear-gradient(#F9B23C, var(--amber-dark));
   text-shadow: 0 1px 0 rgba(120, 70, 10, .6);
 }
+/* 工具条里的分段控件（D72b）：两个 `.cat` 挨在一起，不占整行。
+   ★ 用户第三轮：**中间连在一起、接缝处不要圆角、一条竖线分开** ——
+   让人一眼看出这两个是「二选一」，不是两个各管各的钮。
+   做法：整段只有外面两个角是圆的；后一个往左压 2px，把两条边框叠成
+   **一条** 2px 的竖线（不然接缝处会是 4px 的粗黑杠）。 */
+.toolbar .seg { display: inline-flex; margin-right: 2px; }
+.toolbar .seg button.cat { border-radius: 0; }
+.toolbar .seg button.cat:first-child { border-radius: 9px 0 0 9px; }
+.toolbar .seg button.cat:last-child { border-radius: 0 9px 9px 0; }
+.toolbar .seg button.cat + button.cat { margin-left: -2px; }
+/* 选中那个要压在邻居上面，否则它自己的边框被下一个盖掉半条。 */
+.toolbar .seg button.cat.on { position: relative; z-index: 1; }
 .cat-tabs.sub { margin-top: -2px; }
 .cat-tabs.sub button.cat {
   padding: 2px 10px; font-size: 12px; font-weight: 600;
@@ -844,7 +944,7 @@ td .acts {
   display: flex; gap: 6px; flex-wrap: wrap;
   align-items: center; justify-content: flex-end;
 }
-/* 换页栏夹在筛选条和列表之间（数据备份 / 玩家仓库两页还在用；四个配置页
+/* 换页栏夹在筛选条和列表之间（数据备份 / 玩家仓库两页还在用；各配置页
    和选择物品弹窗的换页栏 2026-09-09 删了，那个位置换成两行分类标签，D68）：
    上面靠筛选条自己的下边距隔开，下面再留 12px 才接列表。原来是
    `margin-top: 10px` 叠在筛选条的 14px 上、底下又贴着列表 —— 上远下近

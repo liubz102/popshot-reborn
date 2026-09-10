@@ -1681,7 +1681,7 @@ class QuestSettlementTests(BattleRoom):
         self.end(self.bob)
         self.assertEqual([], opcodes(self.alice))
         self.assertEqual([], opcodes(self.bob))
-        exp, _money = gameserver.quest_reward(3, 1, 40, False)
+        exp, _money, _warn = gameserver.quest_reward(3, 1, 40, False)
         self.assertEqual(200 + exp, self.accounts.saved["alice"]["experience"])
 
     def test_each_player_is_paid_their_own_score(self):
@@ -1691,8 +1691,8 @@ class QuestSettlementTests(BattleRoom):
         self.score(self.alice, 0, 40)
         self.score(self.bob, 1, 25)
         self.end()
-        alice_exp, alice_money = gameserver.quest_reward(3, 1, 40, False)
-        bob_exp, bob_money = gameserver.quest_reward(3, 1, 25, False)
+        alice_exp, alice_money, _w = gameserver.quest_reward(3, 1, 40, False)
+        bob_exp, bob_money, _w = gameserver.quest_reward(3, 1, 25, False)
         self.assertEqual(200 + alice_exp, self.accounts.saved["alice"]["experience"])
         self.assertEqual(400 + bob_exp, self.accounts.saved["bob"]["experience"])
         self.assertEqual(10 + alice_money, self.accounts.saved["alice"]["money"])
@@ -1712,7 +1712,7 @@ class QuestSettlementTests(BattleRoom):
         quest.add_coins(0, 250)
         quest.add_coins(1, 10)
         self.end()
-        base_exp, base_money = gameserver.quest_reward(3, 1, 40, False)
+        base_exp, base_money, _w = gameserver.quest_reward(3, 1, 40, False)
         self.assertEqual(10 + base_money + 250,
                          self.accounts.saved["alice"]["money"])
         self.assertEqual(20 + base_money + 10,
@@ -1728,7 +1728,7 @@ class QuestSettlementTests(BattleRoom):
                 if result_seat(b) == 0][0]
         values = struct.unpack_from(
             f"<{gameserver.GAME_RESULT_VALUE_COUNT}i", body, 4)
-        _exp, base_money = gameserver.quest_reward(3, 1, 0, False)
+        _exp, base_money, _w = gameserver.quest_reward(3, 1, 0, False)
         self.assertEqual(base_money + 250,
                          values[gameserver.GAME_RESULT_MONEY])
 
@@ -1962,7 +1962,7 @@ class PvpSettlementTests(BattleRoom):
         self.score(self.alice, 0, 40)
         self.alice.quest_state().add_coins(0, 17)
         gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
-        win_exp, win_money = gameserver.pvp_reward(40, True)
+        win_exp, win_money, _w = gameserver.pvp_reward(40, True)
         self.assertEqual(10 + win_money + 17, self.accounts.saved["alice"]["money"])
         self.assertEqual(200 + win_exp, self.accounts.saved["alice"]["experience"])
 
@@ -1977,8 +1977,8 @@ class PvpSettlementTests(BattleRoom):
         self.score(self.alice, 0, 40)
         self.score(self.bob, 1, 25)
         gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
-        win_exp, win_money = gameserver.pvp_reward(40, True)
-        lose_exp, lose_money = gameserver.pvp_reward(25, False)
+        win_exp, win_money, _w = gameserver.pvp_reward(40, True)
+        lose_exp, lose_money, _w = gameserver.pvp_reward(25, False)
         self.assertEqual(200 + win_exp, self.accounts.saved["alice"]["experience"])
         self.assertEqual(400 + lose_exp, self.accounts.saved["bob"]["experience"])
         self.assertEqual(10 + win_money, self.accounts.saved["alice"]["money"])

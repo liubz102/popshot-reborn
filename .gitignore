@@ -116,6 +116,8 @@
 /server/data/recipe.json.*.tmp
 /server/data/drops.json
 /server/data/drops.json.*.tmp
+/server/data/rewards.json
+/server/data/rewards.json.*.tmp
 # `shop-backfill apply` 写盘前留下的那一份原件（shopcfg.backfill_defaults）。
 /server/data/*.bak-*
 # 管理页「数据备份」的备份目录（databackup.py）：每份一个子目录，里面是

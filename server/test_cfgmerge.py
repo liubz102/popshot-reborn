@@ -15,6 +15,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import cfgmerge                                                  # noqa: E402
+import shopcfg                                                   # noqa: E402
 
 
 def shop(item_id, price=100, listed=True):
@@ -281,6 +282,50 @@ class LabelTests(unittest.TestCase):
         self.assertIn("对战", label)
         self.assertIn("不限关卡", label)
         self.assertIn("不限难度", label)
+
+    def test_奖励档位写清楚是哪一档(self):
+        pvp = cfgmerge.label_of("rewards", (("pvp", 3, 1, 1, None, None), 0))
+        self.assertIn("对战", pvp)
+        self.assertIn("夺分模式", pvp)
+        self.assertIn("道具战", pvp)
+        self.assertIn("组队战", pvp)
+        quest = cfgmerge.label_of("rewards",
+                                  (("quest", None, None, None, 5, 3), 0))
+        self.assertIn("闯关", quest)
+        self.assertIn("黑骑士", quest)           # 关卡 5
+        self.assertIn("困难", quest)             # 难度 3
+        self.assertIn("加成系数", cfgmerge.label_of(
+            "rewards", (("bonus", None, None, None, None, None), 0)))
+
+
+class RewardKeyTests(unittest.TestCase):
+    """★ 奖励表**每一档的身份都得是唯一的**，否则三方合并会把两档配成一对
+    （一个人改生存、另一个人改夺分，后按保存的那个把前一个抹掉，谁也发现不了）。
+    """
+
+    def test_默认表三十档的身份两两不同(self):
+        keys = [cfgmerge.natural_key("rewards", rule)
+                for rule in shopcfg.reward_defaults()]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_道具战开关和队伍都算身份的一部分(self):
+        def key(**kw):
+            row = {"mode": "pvp", "pvp_mode": 0, "item_mode": False, "team": 0}
+            row.update(kw)
+            return cfgmerge.natural_key("rewards", row)
+        self.assertNotEqual(key(), key(item_mode=True))
+        self.assertNotEqual(key(), key(team=1))
+        self.assertNotEqual(key(), key(pvp_mode=3))
+        # False 和 0 是同一档（json 里两种写法都有人手写）
+        self.assertEqual(key(), key(item_mode=0))
+
+    def test_闯关和对战的身份不会撞上(self):
+        pvp = cfgmerge.natural_key(
+            "rewards", {"mode": "pvp", "pvp_mode": 1, "item_mode": False,
+                        "team": 1})
+        quest = cfgmerge.natural_key(
+            "rewards", {"mode": "quest", "stage": 1, "difficulty": 1})
+        self.assertNotEqual(pvp, quest)
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ import logcleanup
 import shopcfg
 from account_store import AccountStore
 
-#: 四份默认配置只生成一次（约半秒），之后每个用例复制一份。
+#: 五份默认配置只生成一次（约半秒），之后每个用例复制一份。
 _TEMPLATE = None
 
 
@@ -38,7 +38,7 @@ def _read(path):
 
 
 class _BackupCase(unittest.TestCase):
-    """一份临时 `server/data/`（四份配置 + 存档）+ 一份临时 `server.config`。"""
+    """一份临时 `server/data/`（五份配置 + 存档）+ 一份临时 `server.config`。"""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -390,6 +390,56 @@ class RestoreTests(_BackupCase):
         self.assertEqual([old_price + 1], prices)
         # 存档没被碰。
         self.assertNotIn("accounts.json", result["restored"])
+
+    def _make_it_an_old_backup(self, backup_id, dropped):
+        """把一份备份改造成「上一版那会儿做的」：删掉某一份配置和 manifest 里那条。"""
+        path = self.backup_path(backup_id, dropped)
+        os.remove(path)
+        manifest_path = self.backup_path(backup_id, "manifest.json")
+        manifest = json.loads(_read(manifest_path).decode("utf-8"))
+        manifest["files"] = [entry for entry in manifest["files"]
+                             if entry.get("name") != dropped]
+        with open(manifest_path, "w", encoding="utf-8", newline="\n") as fp:
+            json.dump(manifest, fp, ensure_ascii=False, indent=2)
+        return manifest
+
+    def test_an_old_backup_without_the_newest_config_still_rolls_back(self):
+        """★★ **升级之后回滚到升级之前那份备份**（铁律 11）。
+
+        线上先跑着 V0.3.0，备份里只有那时的四份配置；升级后这一版多了一份
+        （`rewards.json`）。这时回滚必须：
+        ① 回滚框里**只列备份里真有的那几份**，并说清少的那份「保持现状」；
+        ② 真回滚下去不报错、不把现在这份新配置删掉或清空。
+
+        ⚠ 不写死文件名 —— 拿 `config_filenames()` 的最后一份当「新加的那份」，
+        下次再加配置这条自动跟着走。
+        """
+        newest = self.config_files()[-1]
+        older = [name for name in self.config_files() if name != newest]
+        backup = self.svc.create("manual", "假装是上一版做的", "admin")
+        manifest = self._make_it_an_old_backup(backup["id"], newest)
+
+        # ① 回滚框：那一格只列老的几份，并把少的那份说出来。
+        row = databackup.describe(manifest, self.config_files())
+        group = [g for g in row["groups"]
+                 if g["key"] == databackup.GROUP_CONFIG][0]
+        self.assertEqual(older, group["files"])
+        self.assertIn(shopcfg.config_title(newest), group["warn"] or "")
+        self.assertIn("保持现状", group["warn"] or "")
+
+        # ② 升级后运营在新那一页改了点东西，回滚不该动它。
+        newest_path = os.path.join(self.data_dir, newest)
+        mine = _read(newest_path)
+        item_id, old_price = self.shop_price()
+        self.set_shop_price(item_id, old_price + 1)
+
+        result = self.svc.restore(backup["id"], group["files"],
+                                  expect_admin="admin", created_by="admin")
+        self.assertEqual(sorted(older), sorted(result["restored"]))
+        self.assertEqual([], result["failed"])
+        self.assertEqual(old_price, self.shop_price()[1], "老那几份没回滚回来")
+        self.assertEqual(mine, _read(newest_path),
+                         newest + " 被回滚动过了（备份里根本没有它）")
 
     def test_restore_invalidates_the_hot_reload_cache(self):
         # 缓存键是 (mtime, size)；回滚回来的旧文件很可能大小一样。这条钉住

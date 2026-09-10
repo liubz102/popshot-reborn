@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""管理页 `/admin` —— 改四份运营配置，管管理员账号（V0.3商店 M8）。
+"""管理页 `/admin` —— 改五份运营配置，管管理员账号（V0.3商店 M8）。
 
 和注册页**共用同一个 27810 端口、同一个 `Handler`**：`web/server.py` 的
 `Handler` 继承本文件的 `AdminRoutes`，路由表里 `/admin` 开头的都转进来。
@@ -13,8 +13,8 @@
     POST /admin/api/login             {name, password}
     POST /admin/api/logout
     GET  /admin/api/catalog           物品表 + 字段描述 + 图集元信息（登录后拿一次）
-    GET  /admin/api/config/{items|shop|recipe|drops}  -> {ok, text, warnings}
-    POST /admin/api/config/{items|shop|recipe|drops}
+    GET  /admin/api/config/{items|shop|recipe|drops|rewards} -> {ok, text, warnings}
+    POST /admin/api/config/{items|shop|recipe|drops|rewards}
          {text, base, cross_base, only}  -> {ok, text, adopted} | {conflict…}
     GET  /admin/api/admins            -> {ok, names, admins:[{name,role}]}  ★系统
     POST /admin/api/admins/add        {name, password, role}                ★系统
@@ -35,8 +35,8 @@
 ## 权限分两档（用户 2026-09-06 拍板，D34）
 
 - **系统管理员**（`system`）—— 全部标签页；
-- **运营**（`operator`）—— 只有 物品库 / 商店货架 / 合成配方 / 材料掉落
-  这四个配置页，看不到「玩家仓库」和「管理员账号」。
+- **运营**（`operator`）—— 只有 物品库 / 商店货架 / 合成配方 / 材料掉落 /
+  金币 / 经验获取 这五个配置页，看不到「玩家仓库」和「管理员账号」。
 
 上面标了 ★系统 的接口走 `_require_system_admin()`。**前台把标签藏起来
 只是画面**，真正的门在那个函数里 —— `test_web_admin` 有一条用例拿运营
@@ -172,6 +172,7 @@ CONFIG_FILES = {
     "shop": shopcfg.SHOP_FILENAME,
     "recipe": shopcfg.RECIPE_FILENAME,
     "drops": shopcfg.DROPS_FILENAME,
+    "rewards": shopcfg.REWARDS_FILENAME,
 }
 
 #: 每份配置的校验器。★ **存盘前必过这一关**，不过就不落盘（D10 的同一个道理：
@@ -181,9 +182,10 @@ CONFIG_VALIDATORS = {
     "shop": shopcfg.validate_shop,
     "recipe": shopcfg.validate_recipes,
     "drops": shopcfg.validate_drops,
+    "rewards": shopcfg.validate_rewards,
 }
 
-#: 配置正文上限。三份加起来现在约 45 KB，给 4 MB 足够宽裕。
+#: 配置正文上限。五份加起来现在约 50 KB，给 4 MB 足够宽裕。
 #: `web/server.py` 的 `MAX_BODY_BYTES` 是 1 MB —— 那是**请求体**的上限，
 #: 比这里更严，所以实际卡住的是那一个。留着这条只为让错误话说得更清楚。
 MAX_CONFIG_BYTES = 4 << 20
@@ -865,6 +867,14 @@ class AdminRoutes:
             "characters": {str(k): v for k, v in shopcfg.CHARACTER_ZH.items()},
             "series": shopcfg.SERIES_ZH,
             "max_materials": shopcfg.MAX_MATERIALS,
+            # ★ 奖励表的**完整档位清单**（D72）：管理页的 `fillRewards()` 照它
+            #   把文件里缺的档位补出来（和物品库的 `fillItems()` 一个套路）——
+            #   那一页是两张固定的二维表格，格子不能因为文件里少一行就没了。
+            "reward_defaults": shopcfg.reward_defaults(),
+            # ★ 等级曲线（D72a）：「金币 / 经验获取」的经验那一页拿它画一张
+            #   **只读**参照表 —— 调「一局给多少经验」的人要看得见这些经验
+            #   换算成多少级。曲线只在 `account_store` 定义一处，页面不自己算。
+            "level_curve": account_store.level_table(),
             # 仓库界面那棵标签树（§41）：玩家仓库弹窗照它画分类，再加一个「全部」。
             "warehouse": shop.WAREHOUSE_TABS,
         })

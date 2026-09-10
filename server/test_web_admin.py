@@ -26,6 +26,7 @@ import account_store                                           # noqa: E402
 import cfgmerge                                                  # noqa: E402
 import config as server_config                                 # noqa: E402
 import databackup                                              # noqa: E402
+import gameserver                                             # noqa: E402
 import shopcfg                                                 # noqa: E402
 import shopdata                                                # noqa: E402
 from account_store import AccountStore                         # noqa: E402
@@ -186,11 +187,11 @@ class AdminAuthTests(_AdminCase):
 
     def test_every_api_needs_a_login(self):
         # ★★ 漏挂一个 `_require_admin()` 就等于把那个接口开在公网上。
-        for path, payload in (
-                ("/admin/api/config/items", None),
-                ("/admin/api/config/shop", None),
-                ("/admin/api/config/recipe", None),
-                ("/admin/api/config/drops", None),
+        # ★ 配置页那几条**从 `CONFIG_FILES` 现取**，不写死清单 ——
+        #   以后再加一份配置，忘了挂门这条用例立刻红。
+        config_paths = tuple(("/admin/api/config/" + which, None)
+                             for which in sorted(web_admin.CONFIG_FILES))
+        for path, payload in config_paths + (
                 ("/admin/api/admins", None),
                 ("/admin/api/catalog", None),
                 ("/admin/itemicons.png", None),
@@ -390,6 +391,52 @@ class AdminConfigTests(_AdminCase):
         result = self.get("drops")
         self.assertTrue(result["ok"])            # 文本照样给你看，好去修
         self.assertTrue(result["warnings"])
+
+    # -- 金币 / 经验获取（D72）------------------------------------------------
+
+    def test_a_reward_edit_lands_on_disk_and_takes_effect_at_once(self):
+        """★ 这一页存下去之后**不用重启**就该按新数发钱（和另外四份一个口径）。"""
+        raw = json.loads(self.get("rewards")["text"])
+        for rule in raw["rules"]:
+            if rule.get("mode") == "quest" and rule["stage"] == 1 \
+                    and rule["difficulty"] == 1:
+                rule["win_money"] = 12345
+        self.assertTrue(
+            self.save("rewards", json.dumps(raw, ensure_ascii=False))["ok"])
+        shopcfg.invalidate()
+        self.assertEqual(12345, gameserver.quest_reward(1, 1, 0, True)[1])
+
+    def test_a_reward_out_of_range_is_refused_and_says_which_slot(self):
+        before = self.get("rewards")["text"]
+        raw = json.loads(before)
+        raw["rules"][0]["win_money"] = -1
+        result = self.save("rewards", json.dumps(raw, ensure_ascii=False))
+        self.assertFalse(result["ok"])
+        # 前台照 `rules[N]` 把那一格闪出来（`markBadCard`）——
+        # 错误里没有下标的话它就定位不到。
+        self.assertIn("rules[0]", result["message"])
+        self.assertIn("win_money", result["message"])
+        self.assertEqual(before, self.get("rewards")["text"])
+
+    def test_two_slots_written_twice_is_refused(self):
+        raw = json.loads(self.get("rewards")["text"])
+        raw["rules"].append(dict(raw["rules"][0]))
+        result = self.save("rewards", json.dumps(raw, ensure_ascii=False))
+        self.assertFalse(result["ok"])
+        self.assertIn("写了两遍", result["message"])
+
+    def test_the_catalog_ships_every_reward_slot_for_the_page_to_fill_in(self):
+        # ★ 管理页那两张表是**固定**的格子：文件里少一行，`fillRewards()`
+        #   照这份默认清单补出来。少发了它，页面上就会缺格子。
+        catalog = self.request("/admin/api/catalog")[1]
+        self.assertEqual(shopcfg.reward_defaults(), catalog["reward_defaults"])
+        self.assertIn("rewards", catalog["schema"])
+
+    def test_the_catalog_ships_the_level_curve_for_the_read_only_table(self):
+        # ★ 经验那一页最下面那张「等级与经验」照它画（D72a）。页面**不自己
+        #   套公式** —— 少发了它，那张表就整块不见。
+        catalog = self.request("/admin/api/catalog")[1]
+        self.assertEqual(account_store.level_table(), catalog["level_curve"])
 
 
 class AdminConfigConflictTests(_AdminCase):
@@ -692,6 +739,48 @@ class AdminAssetTests(_AdminCase):
                                 js.decode("utf-8")))
         self.assertLessEqual(wanted - self.JS_MADE_IDS, page_ids)
 
+    #: 「几份配置 / 几个配置页」这种**写死的份数**。
+    #:
+    #: ★★ 2026-09-10 加第五份配置（金币 / 经验获取）时，页面上有四处白纸黑字
+    #:   写着「四份」「四页」：刷新的回执、刷新钮的提示、「设为运营」的说明、
+    #:   数据备份页的说明。**漏改不会报错，只会一直骗人** —— 用户点一下刷新，
+    #:   页面说「四份配置都换成最新的了」，其实换了五份。
+    #: ⇒ 份数一律从 `CONFIGS` 现数（`configCount()` / `configTitles()`），
+    #:   文案里不许再出现汉字数字。这条用例把「记得回来改」变成「漏改就报红」。
+    #: ★ 「一份配置」是「某一份」的意思，不是总数，所以 `一` 不在里面。
+    STALE_COUNT = re.compile(
+        r"[二三四五六七八九十]\s*(?:份配置|份运营配置|个配置页|页配置)"
+        r"|这\s*[二三四五六七八九十]\s*页")
+
+    def test_no_page_text_hardcodes_how_many_configs_there_are(self):
+        _status, html = self.request("/admin")
+        _status, _h, js = self.fetch("/admin/admin.js")
+        _status, _h, css = self.fetch("/admin/admin.css")
+        for name, text in (("admin.html", html),
+                           ("admin.js", js.decode("utf-8")),
+                           ("admin.css", css.decode("utf-8"))):
+            for number, line in enumerate(text.splitlines(), 1):
+                self.assertIsNone(
+                    self.STALE_COUNT.search(line),
+                    "%s:%d 把配置份数写死了，改成 `configCount()` / "
+                    "`configTitles()` 现数：%s" % (name, number, line.strip()))
+
+    def test_no_config_page_is_hidden_from_operators(self):
+        """★★ 运营的活儿就是这几个配置页 —— 一个都不许藏（D34）。
+
+        服务端那一侧有 `test_every_config_page_works` 钉着（GET / POST 都 200）。
+        这一条钉的是**前台**：`SYSTEM_ONLY_TABS` 里混进一个配置页名字的话，
+        服务端照样放行、页面上却看不到那个标签 —— 运营只会觉得「功能没了」，
+        不会收到任何报错。加一份配置时最容易顺手抄错的就是这张表。
+        """
+        _status, _h, js = self.fetch("/admin/admin.js")
+        match = re.search(r"var SYSTEM_ONLY_TABS\s*=\s*\[([^\]]*)\]",
+                          js.decode("utf-8"))
+        self.assertIsNotNone(match, "admin.js 里找不到 SYSTEM_ONLY_TABS")
+        hidden = set(re.findall(r'"([A-Za-z0-9_-]+)"', match.group(1)))
+        self.assertEqual(set(), hidden & set(web_admin.CONFIG_FILES),
+                         "这几个配置页被藏起来了，运营进不去")
+
     def test_the_atlas_comes_back_as_a_png_once_logged_in(self):
         self.login()
         status, headers, body = self.fetch("/admin/itemicons.png")
@@ -961,9 +1050,13 @@ class OperatorPermissionTests(_AdminCase):
         self.assertEqual("operator", self.request(
             "/admin/api/session")[1]["role"])
 
-    def test_the_four_config_pages_all_work(self):
-        """运营的活儿就是这四页 —— 读得到、也存得进去。"""
-        for which in ("items", "shop", "recipe", "drops"):
+    def test_every_config_page_works(self):
+        """运营的活儿就是这几页 —— 读得到、也存得进去。
+
+        ★ 清单从 `CONFIG_FILES` 现取：以后再加一份配置却忘了给运营开门
+        （或者新页面存不进去），这条用例立刻红。
+        """
+        for which in sorted(web_admin.CONFIG_FILES):
             status, result = self.request("/admin/api/config/" + which)
             self.assertEqual(200, status, which)
             self.assertTrue(result["ok"], which)
@@ -971,7 +1064,7 @@ class OperatorPermissionTests(_AdminCase):
                                          {"text": result["text"]})
             self.assertEqual(200, status, which)
             self.assertTrue(saved["ok"], which)
-        # 物品选择器和图集也要能用，否则那四页画不出来。
+        # 物品选择器和图集也要能用，否则那几页画不出来。
         self.assertTrue(self.request("/admin/api/catalog")[1]["ok"])
         self.assertTrue(self.request("/admin/api/item?id=1120041")[1]["ok"])
 

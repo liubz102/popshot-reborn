@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""shopdefaults.py —— 四份运营配置的**默认内容**（模板），从原版物品表程序化生成。
+"""shopdefaults.py —— 五份运营配置的**默认内容**（模板），从原版物品表程序化生成。
 
 `shopcfg.default_items()` / `default_shop()` / `default_recipes()` / `default_drops()`
-都是这里 `build_all()` 的切片；第一次开服 `ensure_files()` 写出来的就是它，
+都是这里 `build_all()` 的切片（`default_rewards()` 另走 `build_rewards()` ——
+奖励表和物品表没关系）；第一次开服 `ensure_files()` 写出来的就是它，
 所以**新下载发布包的人拿到的默认数据 = 这张设计表**（用户 2026-09-07 拍板，D50）。
 `tools/gen_listing.py` 是它的命令行壳：试算、自洽检查、把现有 `server/data/` 重新生成。
 
@@ -419,6 +420,100 @@ def build_drops():
     return {"format": FORMAT, "rules": rules}
 
 
+# ---------------------------------------------------------------------------
+# 金币 / 经验（rewards.json）
+# ---------------------------------------------------------------------------
+#: ★★ 下面这一组常量**原来写死在 `gameserver.py`**（V0.2 D148 / D150 / D152），
+#: 2026-09-10 搬到这儿当**设计表**：从此它们只是 `rewards.json` 的**初值**，
+#: 谁要调数值都在管理页里改那份文件，服务端一行代码都不用动（D50 的口径）。
+#:
+#: ★★★ 展开成表格时**必须照抄 `quest_reward()` 原来那个表达式**，
+#: 不许自己手抄成一张数字表 —— `int()` 是向零取整，而且
+#: `bonus * 0.3` 先乘和 `base * bonus` 先乘的浮点尾数不一定一样。
+#: 抄错一次，老玩家账上就再也对不上了（`test_shopdefaults` 有一条平价用例守着）。
+QUEST_BASE_EXPERIENCE = 20
+QUEST_BASE_EXPERIENCE_STEP = 10
+QUEST_BASE_MONEY = 100
+QUEST_BASE_MONEY_STEP = 50
+
+#: 难度加成。闯关房描述符的第二个参数就是难度（1=简单 / 2=普通 / 3=困难，§68）。
+QUEST_DIFFICULTY_BONUS = {1: 1.0, 2: 1.6, 3: 2.5}
+
+#: 没通关时基础奖励打几折。**不是 0** —— 打了半天不能一无所获，
+#: 而且客户端在「未完成」时照样弹结算界面。
+QUEST_FAILED_RATIO = 0.3
+
+#: 关卡分数换成**经验**的除数（`mode:"bonus"` 那一条的初值）。
+QUEST_SCORE_PER_EXPERIENCE = 20
+
+#: 对战一局：参战底薪 + 胜方加成。对战一局比闯关短得多，数值也就小一档。
+PVP_BASE_EXPERIENCE = 10
+PVP_EXPERIENCE_PER_KILL = 3
+PVP_WIN_EXPERIENCE = 15
+PVP_BASE_MONEY = 30
+PVP_WIN_MONEY = 50
+
+#: 奖励表里列出来的对战游戏模式：**只有生存(0) 和 夺分(3)**。
+#:
+#: 中国区建房下拉框就这两种 —— 低等级号选了生存还会被客户端自己改回夺分
+#: （`hook/bshook.c` 的 `try_patch_player_level_gate` 第 3 / 4 处，
+#: `0x465338` / `0x465a2c`）。剩下两个模式号（1 计时 / 2 无투전）玩家碰不到，
+#: 真收到了由 `gameserver.PVP_MODE_ROW` 归档到这两行里，表里不占位置。
+PVP_ROW_MODES = (0, 3)
+
+#: 道具战开关（`arguments[2]`）和 组队战开关（`arguments[0]`）。
+PVP_ROW_ITEM_MODES = (False, True)
+PVP_ROW_TEAMS = (0, 1)
+
+
+def build_rewards():
+    """默认 `rewards.json` —— **8 条对战 + 21 条闯关 + 1 条加成系数**。
+
+    ★ 初值**逐个等于 2026-09-10 之前那两个硬编码公式算出来的数**，
+    所以这一版上线时玩家的收入一分钱不变。
+    """
+    rules = []
+    for pvp_mode in PVP_ROW_MODES:
+        for item_mode in PVP_ROW_ITEM_MODES:
+            for team in PVP_ROW_TEAMS:
+                rules.append({
+                    "mode": "pvp",
+                    "pvp_mode": pvp_mode,
+                    "item_mode": item_mode,
+                    "team": team,
+                    "win_money": PVP_BASE_MONEY + PVP_WIN_MONEY,
+                    "lose_money": PVP_BASE_MONEY,
+                    "win_exp": PVP_BASE_EXPERIENCE + PVP_WIN_EXPERIENCE,
+                    "lose_exp": PVP_BASE_EXPERIENCE,
+                })
+    for stage in sorted(shopcfg.QUEST_ZH):
+        base_money = QUEST_BASE_MONEY + QUEST_BASE_MONEY_STEP * (stage - 1)
+        base_exp = QUEST_BASE_EXPERIENCE + QUEST_BASE_EXPERIENCE_STEP * (stage - 1)
+        for difficulty in DIFFICULTIES:
+            bonus = QUEST_DIFFICULTY_BONUS[difficulty]
+            # ★ 和老 `quest_reward()` **一模一样**的两步：先算 ratio，再乘基数。
+            win_ratio = bonus
+            lose_ratio = bonus * QUEST_FAILED_RATIO
+            rules.append({
+                "mode": "quest",
+                "stage": stage,
+                "difficulty": difficulty,
+                "win_money": int(base_money * win_ratio),
+                "lose_money": int(base_money * lose_ratio),
+                "win_exp": int(base_exp * win_ratio),
+                "lose_exp": int(base_exp * lose_ratio),
+            })
+    # ★ 两个加成系数是**列表里的一条记录**，不是文件顶层的两个键 ——
+    #   管理页保存时只写 `format` + 那个列表（`web/admin.py` 的
+    #   `_admin_config_post`，D16），放顶层等于「一保存就没了」。
+    rules.append({
+        "mode": "bonus",
+        "quest_score_per_exp": QUEST_SCORE_PER_EXPERIENCE,
+        "pvp_exp_per_kill": PVP_EXPERIENCE_PER_KILL,
+    })
+    return {"format": FORMAT, "rules": rules}
+
+
 def expected_yield(rules, material, stage, difficulty, mode="quest"):
     """通关一局 `(关卡, 难度)` 这种材料的期望个数（`quest_materials` 的规则口径）。"""
     total = 0.0
@@ -630,6 +725,11 @@ def default_recipes():
 
 def default_drops():
     return build_all()["drops"]
+
+
+def default_rewards():
+    """★ 不走 `build_all()` —— 奖励表和物品表毫无关系，没必要为它算 808 件东西。"""
+    return build_rewards()
 
 
 def problems(built):

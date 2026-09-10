@@ -26,6 +26,10 @@
     <button data-tab="shop">商店货架</button>
     <button data-tab="recipe">合成配方</button>
     <button data-tab="drops">材料掉落</button>
+    <!-- ★ 这一页不是卡片列表，是两张二维表格（用户 2026-09-10，D72）——
+         对战 = 模式 × 个人/组队，闯关 = 关卡 × 难度，顶上一个「金币 / 经验」
+         切换让两张表复用同一套行列。渲染器是 admin.js 的 `renderRewards`。 -->
+    <button data-tab="rewards">金币 / 经验</button>
     <button data-tab="players">玩家仓库</button>
     <button data-tab="backup">数据备份</button>
     <button data-tab="admins">管理员账号</button>
@@ -54,7 +58,10 @@
   <!-- ========================= 主界面 ========================= -->
   <div id="mainView" class="hidden">
 
-    <!-- ------- 三份运营配置共用这一套骨架，内容由 admin.js 按字段表生成 ------- -->
+    <!-- ------- 各份运营配置共用这一套骨架，内容由 admin.js 按字段表生成 -------
+         ★ 前四份画成卡片 / 规则行的列表，「金币 / 经验获取」画成两张二维
+           表格（D72）—— 骨架、脏标记、保存 / 放弃修改、三方合并全共用，
+           只有 `#cfgList` 里面长得不一样（admin.js 的 `RENDERERS`）。 -->
     <section class="panel fit-panel" id="cfgPanel">
       <div class="panel-title">
         <h2 id="cfgTitle"></h2>
@@ -79,7 +86,9 @@
              「修改仓库」弹窗同一套（上一行大分类、下一行当前大分类的小分类，
              admin.js 的 `paintCatTabs`）。钉在滚动区外面，原来换页栏的位置 ——
              换页栏删了：筛完剩多少画多少，滚动条在列表上。
-             材料掉落页整块藏起来（它按 模式 / 关卡 / 难度 筛，不按物品分类）。 -->
+             材料掉落页和「金币 / 经验获取」页整块藏起来 —— 前者按 模式 /
+             关卡 / 难度 筛，后者的「金币 / 经验」切换 2026-09-10 挪进了
+             工具条（D72b，`rewardViewSwitch`）。 -->
         <div class="cat-tabs hidden" id="cfgCats"></div>
         <div class="cat-tabs sub hidden" id="cfgSubCats"></div>
         <div class="fit-list" id="cfgList"></div>
@@ -135,7 +144,7 @@
     </section>
 
     <!-- ---------------- 数据备份（V0.3商店，用户 2026-09-07） ----------------
-         服务端 databackup.py 的门面。★ 和四个配置页一样走「面板撑满、只有
+         服务端 databackup.py 的门面。★ 和各配置页一样走「面板撑满、只有
          列表滚」那套壳（D39）：设置条 / 手动备份条 / 换页栏钉住不动。
          ★ 只有系统管理员看得到（SYSTEM_ONLY_TABS），门在服务端。 -->
     <section class="panel hidden fit-panel" id="backupPanel">
@@ -148,14 +157,14 @@
       <div class="panel-body">
         <ul class="help fit-help">
           <li>备份的是 <code>server/data/</code> 下的<b>全部 json</b>
-            （物品库 / 商店货架 / 合成配方 / 材料掉落 + 玩家存档
+            （物品库 / 商店货架 / 合成配方 / 材料掉落 / 金币经验 + 玩家存档
             <code>accounts.json</code>，以后新加的也算），存在
             <code>server/data/backups/</code> 里，一份一个目录，可以直接打开看。</li>
           <li><b>自动备份</b>每天到设定时刻做一次（服务器本地时间）；服务端那时没开着
             就没有那一天的。<b>保留天数</b>对手动备份、回滚前的备份一样有效，
             0 = 永不自动删除。</li>
           <li><b>回滚</b>会先把现在的状态自动备份一份，再用所选的那份覆盖当前的。
-            四份运营配置互相关联，只能一起回滚；玩家存档默认<b>不</b>回滚，
+            运营配置那几份互相关联，只能一起回滚；玩家存档默认<b>不</b>回滚，
             勾了会把所有玩家的进度倒回去。</li>
         </ul>
         <div class="toolbar backup-bar">
@@ -213,8 +222,12 @@
         </p>
         <ul class="help">
           <li><b>系统管理员</b>：管理页所有标签页都能进，包括「玩家仓库」和这一页。</li>
-          <li><b>运营</b>：只能进 物品库 / 商店货架 / 合成配方 / 材料掉落
-            这四页，看不到「玩家仓库」和「管理员账号」。</li>
+          <!-- ★ 这一句由 admin.js 照 `CONFIGS` 现填（`paintOperatorPages`）——
+               页名和页数写死在这儿的话，加一份配置就得记得回来改，
+               而漏改不会报错、只会一直骗人（`test_web_admin` 那条静态检查钉着）。
+               下面这行是**没跑到那一步时**的兜底，不带数字。 -->
+          <li><b>运营</b>：<span id="operatorPages">只能进那几个运营配置页，
+            看不到「玩家仓库」和「管理员账号」。</span></li>
           <li>改权限<b>立刻生效</b>，对方不用重新登录。</li>
         </ul>
         <table>
@@ -304,7 +317,7 @@
           <select id="playerCharacter"></select>
           <select id="playerListing"></select>
           <button class="btn" id="playerPopupRefresh"
-                  title="重新读一遍这个玩家的资料和物品表 / 四份运营配置">↻ 刷新</button>
+                  title="重新读一遍这个玩家的资料和物品表 / 全部运营配置">↻ 刷新</button>
         </div>
         <div class="acts">
           <span class="dirty clean" id="playerDirty"></span>
@@ -359,6 +372,23 @@
       <span class="grow"></span>
       <button class="btn btn-primary" id="pickConfirm" disabled>确认添加</button>
     </div>
+  </div>
+</div>
+
+<!-- ============= 等级与经验对应表（用户 2026-09-10，D72b） =============
+     「金币 / 经验获取」页工具条上那个「▤ 等级经验对应表」点开的**只读**弹窗。
+     ★ 点遮罩和右上角 ✕ 都能关 —— 它是只读的，关掉不会丢东西。
+       （「修改仓库」那个窗故意**不**认遮罩，因为里面有没保存的改动。）
+     ★ 表格由 admin.js 的 `levelCurveBlock()` 打开时现画，数来自
+       `/admin/api/catalog` 的 `level_curve`，页面里不留静态表格。 -->
+<div class="modal hidden" id="levelModal">
+  <div class="panel">
+    <div class="panel-title">
+      <h2>等级与经验对应表</h2>
+      <button class="icon-btn" id="levelClose" aria-label="关闭"
+              title="关闭（点旁边的空白处也行）">✕</button>
+    </div>
+    <div class="panel-body" id="levelBody"></div>
   </div>
 </div>
 

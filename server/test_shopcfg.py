@@ -33,6 +33,12 @@ from test_shopdata import SYNTHETIC, make_table                # noqa: E402
 import tempfile                                                # noqa: E402
 
 
+def _read_bytes(path):
+    """原样读字节 —— 「一个字节都没动」这种断言不能经过 json 往返。"""
+    with open(path, "rb") as fp:
+        return fp.read()
+
+
 class _CfgCase(unittest.TestCase):
     """临时 data 目录 + 一张合成物品表。"""
 
@@ -87,6 +93,45 @@ class EnsureFilesTests(_CfgCase):
         self.assertEqual([], warnings)
         self.assertEqual(12345, parsed[1120041]["price"])
         self.assertTrue(parsed[1120041]["listed"])
+
+    def test_an_old_data_dir_only_gets_the_files_it_is_missing(self):
+        """★★ **老版本升上来**的那条路（铁律 11）。
+
+        线上跑着的服务端，`server/data/` 里是**上一版**那几份配置。这一版新加
+        一份（2026-09-10 的 `rewards.json` 就是），升级后第一次启动必须：
+        **只补新的那一份，老的一个字节都不动**。
+
+        ⚠ 用例故意**不写死**「少的是 rewards.json」—— 它拿 `_SPECS` 的最后一份
+        当「新加的那份」，下次再加配置时这条自动跟着走。
+        """
+        shopcfg.ensure_files(self.dir)
+        newest = list(shopcfg._SPECS)[-1]
+        older = [name for name in shopcfg._SPECS if name != newest]
+        os.remove(os.path.join(self.dir, newest))          # 回到「上一版」的样子
+        before = dict((name, _read_bytes(os.path.join(self.dir, name)))
+                      for name in older)
+
+        self.assertEqual([newest], shopcfg.ensure_files(self.dir))
+
+        for name in older:
+            self.assertEqual(before[name],
+                             _read_bytes(os.path.join(self.dir, name)),
+                             name + " 被升级动过了")
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, newest)))
+
+    def test_rewards_pay_out_even_before_the_file_is_generated(self):
+        """★ `ensure_files` 之前 / 写盘失败时也得照常发钱（D72）。
+
+        `app.py._report_shop_config` 把生成包在 try 里 —— 目录只读、盘满都不该
+        拦住开服。那种情况下奖励表读不到，**必须退回内置默认值**，
+        不能变成「打完一局一分钱不给」。
+        """
+        self.assertFalse(os.path.exists(
+            shopcfg.path_of(shopcfg.REWARDS_FILENAME, self.dir)))
+        shopcfg.invalidate(self.dir)
+        parsed, warnings = shopcfg.rewards(self.dir)
+        self.assertEqual(len(shopcfg.reward_defaults()), len(parsed))
+        self.assertTrue(warnings)
 
     def test_generated_files_are_lf_without_bom(self):
         # 铁律 3：.json 一律 LF 无 BOM（服务端包要在 Linux 上跑）。
@@ -565,6 +610,187 @@ class ValidateDropsTests(_CfgCase):
         self.bad("difficulty", difficulty=5)
 
 
+class ValidateRewardsTests(_CfgCase):
+    """`rewards.json` 的校验器（D72）。"""
+
+    PVP = {"mode": "pvp", "pvp_mode": 0, "item_mode": False, "team": 0,
+           "win_money": 80, "lose_money": 30, "win_exp": 25, "lose_exp": 10}
+    QUEST = {"mode": "quest", "stage": 1, "difficulty": 1,
+             "win_money": 100, "lose_money": 30, "win_exp": 20, "lose_exp": 6}
+    BONUS = {"mode": "bonus", "quest_score_per_exp": 20, "pvp_exp_per_kill": 3}
+
+    def ok(self, *rules):
+        return shopcfg.validate_rewards({"rules": list(rules)})
+
+    def bad(self, fragment, *rules):
+        with self.assertRaises(shopcfg.ConfigError) as ctx:
+            self.ok(*rules)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def over(self, base, **kw):
+        entry = dict(base)
+        entry.update(kw)
+        return entry
+
+    def test_three_shapes_all_pass(self):
+        got = self.ok(self.PVP, self.QUEST, self.BONUS)
+        self.assertEqual(["pvp", "quest", "bonus"], [r["mode"] for r in got])
+
+    def test_missing_numbers_default_to_zero(self):
+        # 缺一格不报错（用户手写一半也能存），按 0 算。
+        got = self.ok({"mode": "quest", "stage": 3, "difficulty": 2})
+        self.assertEqual(0, got[0]["win_money"])
+        self.assertEqual(0, got[0]["lose_exp"])
+
+    def test_rejects_an_unknown_mode(self):
+        self.bad("mode", self.over(self.PVP, mode="乱来"))
+
+    def test_rejects_negative_and_absurd_amounts(self):
+        self.bad("win_money", self.over(self.QUEST, win_money=-1))
+        self.bad("lose_exp", self.over(self.QUEST,
+                                       lose_exp=shopcfg.MAX_REWARD + 1))
+
+    def test_rejects_difficulty_four(self):
+        # 中国区客户端选不到第 4 档 —— 存进去就是一档永远发不出的钱。
+        self.bad("difficulty", self.over(self.QUEST, difficulty=4))
+
+    def test_the_score_divisor_cannot_be_zero(self):
+        # `分数 // 它` —— 0 会当场把结算炸掉。
+        self.bad("quest_score_per_exp",
+                 self.over(self.BONUS, quest_score_per_exp=0))
+
+    def test_rejects_the_same_slot_twice(self):
+        """★ 掉落规则可以重复（各掷各的），奖励不行 —— 「按哪条给钱」说不清。"""
+        self.bad("写了两遍", self.QUEST, self.over(self.QUEST, win_money=999))
+        self.bad("写了两遍", self.PVP, self.over(self.PVP, win_exp=1))
+        self.bad("写了两遍", self.BONUS, self.BONUS)
+
+    def test_the_same_stage_at_another_difficulty_is_a_different_slot(self):
+        self.assertEqual(2, len(self.ok(
+            self.QUEST, self.over(self.QUEST, difficulty=2))))
+
+    def test_team_and_item_mode_split_the_slots(self):
+        self.assertEqual(4, len(self.ok(
+            self.PVP,
+            self.over(self.PVP, team=1),
+            self.over(self.PVP, item_mode=True),
+            self.over(self.PVP, item_mode=True, team=1))))
+
+    # -- fail-safe：这一份和别的四份**不一样** --------------------------------
+
+    def test_a_missing_file_falls_back_to_the_defaults_not_to_nothing(self):
+        """★★ 别的配置读不到退回空表，奖励表退回**内置默认值**（D72）。
+
+        空表的后果是「打完一局一分钱不给」—— 玩家看不出那是配置问题，
+        而且那一局是白打的、补不回来。
+        """
+        shopcfg.invalidate()
+        parsed, warnings = shopcfg.rewards(self.dir)
+        self.assertEqual(len(shopcfg.reward_defaults()), len(parsed))
+        self.assertTrue(warnings)
+
+    def test_a_broken_file_from_the_start_also_falls_back(self):
+        path = shopcfg.path_of(shopcfg.REWARDS_FILENAME, self.dir)
+        with open(path, "w", encoding="utf-8", newline="\n") as fp:
+            fp.write("{ 我正在编辑")
+        shopcfg.invalidate()
+        parsed, warnings = shopcfg.rewards(self.dir)
+        self.assertEqual(len(shopcfg.reward_defaults()), len(parsed))
+        self.assertTrue(warnings)
+
+
+class RewardDefaultsTests(unittest.TestCase):
+    """★★★ 默认表**逐格等于 2026-09-10 之前那两个硬编码公式**算出来的数。
+
+    这一版把公式换成了查表（D72）。上线那一刻玩家的收入必须一分不变，
+    否则老玩家会觉得「怎么突然给少了」，而且再也对不回去。
+    这条用例把老公式原样抄在下面当**独立的第二个实现**——
+    默认表哪天被人顺手改了一个数，它立刻红。
+    """
+
+    # 老 `gameserver.quest_reward` / `pvp_reward` 里那 12 个常量，原样照抄。
+    QUEST_BASE_EXPERIENCE = 20
+    QUEST_BASE_EXPERIENCE_STEP = 10
+    QUEST_BASE_MONEY = 100
+    QUEST_BASE_MONEY_STEP = 50
+    QUEST_DIFFICULTY_BONUS = {1: 1.0, 2: 1.6, 3: 2.5}
+    QUEST_FAILED_RATIO = 0.3
+    QUEST_SCORE_PER_EXPERIENCE = 20
+    PVP_BASE_EXPERIENCE = 10
+    PVP_EXPERIENCE_PER_KILL = 3
+    PVP_WIN_EXPERIENCE = 15
+    PVP_BASE_MONEY = 30
+    PVP_WIN_MONEY = 50
+
+    def old_quest(self, quest_id, difficulty, cleared):
+        """老公式的闯关那一半（`score` 那一项另算，见 `bonus`）。"""
+        bonus = self.QUEST_DIFFICULTY_BONUS.get(difficulty, 1.0)
+        ratio = bonus if cleared else bonus * self.QUEST_FAILED_RATIO
+        base_exp = (self.QUEST_BASE_EXPERIENCE
+                    + self.QUEST_BASE_EXPERIENCE_STEP * (quest_id - 1))
+        base_money = (self.QUEST_BASE_MONEY
+                      + self.QUEST_BASE_MONEY_STEP * (quest_id - 1))
+        return int(base_exp * ratio), int(base_money * ratio)
+
+    def setUp(self):
+        self.rules = shopcfg.validate_rewards(shopcfg.default_rewards())
+        self.by_key = {}
+        for rule in self.rules:
+            if rule["mode"] == "pvp":
+                key = ("pvp", rule["pvp_mode"], rule["item_mode"], rule["team"])
+            elif rule["mode"] == "quest":
+                key = ("quest", rule["stage"], rule["difficulty"])
+            else:
+                key = ("bonus",)
+            self.assertNotIn(key, self.by_key, "同一档出现了两次")
+            self.by_key[key] = rule
+
+    def test_the_table_has_exactly_the_slots_the_page_draws(self):
+        # 8 档对战 + 21 档闯关 + 1 条加成系数 = 30。少一档，管理页上就少一格。
+        self.assertEqual(8 + len(shopcfg.QUEST_ZH) * len(shopcfg.DIFFICULTY_ZH) + 1,
+                         len(self.rules))
+        for mode in sorted(shopcfg.PVP_MODE_ZH):
+            for item_mode in (False, True):
+                for team in sorted(shopcfg.TEAM_ZH):
+                    self.assertIn(("pvp", mode, item_mode, team), self.by_key)
+        for stage in shopcfg.QUEST_ZH:
+            for difficulty in shopcfg.DIFFICULTY_ZH:
+                self.assertIn(("quest", stage, difficulty), self.by_key)
+        self.assertIn(("bonus",), self.by_key)
+
+    def test_every_quest_slot_equals_the_old_formula(self):
+        for stage in shopcfg.QUEST_ZH:
+            for difficulty in shopcfg.DIFFICULTY_ZH:
+                row = self.by_key[("quest", stage, difficulty)]
+                where = "关卡%d 难度%d" % (stage, difficulty)
+                win_exp, win_money = self.old_quest(stage, difficulty, True)
+                lose_exp, lose_money = self.old_quest(stage, difficulty, False)
+                self.assertEqual(win_money, row["win_money"], where)
+                self.assertEqual(lose_money, row["lose_money"], where)
+                self.assertEqual(win_exp, row["win_exp"], where)
+                self.assertEqual(lose_exp, row["lose_exp"], where)
+
+    def test_every_pvp_slot_equals_the_old_formula(self):
+        # ★ 老公式里对战**八种组合给的钱一模一样** —— 默认表也必须如此，
+        #   差异是留给运营去调的，不是我们替他先调好。
+        for key, row in self.by_key.items():
+            if key[0] != "pvp":
+                continue
+            self.assertEqual(self.PVP_BASE_MONEY + self.PVP_WIN_MONEY,
+                             row["win_money"], key)
+            self.assertEqual(self.PVP_BASE_MONEY, row["lose_money"], key)
+            self.assertEqual(self.PVP_BASE_EXPERIENCE + self.PVP_WIN_EXPERIENCE,
+                             row["win_exp"], key)
+            self.assertEqual(self.PVP_BASE_EXPERIENCE, row["lose_exp"], key)
+
+    def test_the_two_bonus_numbers_are_the_old_ones(self):
+        bonus = self.by_key[("bonus",)]
+        self.assertEqual(self.QUEST_SCORE_PER_EXPERIENCE,
+                         bonus["quest_score_per_exp"])
+        self.assertEqual(self.PVP_EXPERIENCE_PER_KILL,
+                         bonus["pvp_exp_per_kill"])
+
+
 class NameTests(_CfgCase):
 
     def test_weapon_name(self):
@@ -982,6 +1208,7 @@ class SchemaTests(unittest.TestCase):
         ("shop", shopcfg.default_shop, shopcfg.validate_shop),
         ("recipe", shopcfg.default_recipes, shopcfg.validate_recipes),
         ("drops", shopcfg.default_drops, shopcfg.validate_drops),
+        ("rewards", shopcfg.default_rewards, shopcfg.validate_rewards),
     )
 
     @staticmethod

@@ -242,7 +242,32 @@ var CFG = {};               // {shop: {format, entries, snapshot, warnings, hadN
 var CURRENT = "items";      // 当前标签页（物品库是另外两份的地基，排最前）
 var FILTER = {};            // 每个标签页各自的筛选条件
 
-var CONFIGS = ["items", "shop", "recipe", "drops"];
+//: 走 `#cfgPanel` 那套壳的标签页（读 / 存 / 脏标记 / 三方合并全共用）。
+//  ★ `rewards` 也在里面 —— 它画的是两张二维表格而不是卡片列表，但
+//    「读一份 json、改、保存、撞车了合并」这一整条链一个字都不用改（D72）。
+var CONFIGS = ["items", "shop", "recipe", "drops", "rewards"];
+
+/** 一共几份运营配置 / 分别叫什么。
+ *
+ * ★★ **文案里的份数一律现数，别写死**（D72c）。2026-09-10 加第五份
+ *   （金币 / 经验获取）时，页面上还有四处白纸黑字写着「四份」「四页」——
+ *   刷新的回执、按钮提示、「设为运营」的说明。数字写死在文案里，加一份配置
+ *   就得记得回来改，而漏改**不会报错**，只会一直骗人。
+ */
+function configCount() { return CONFIGS.length; }
+
+function configTitles() {
+  return CONFIGS.map(function (which) {
+    return ((CAT && CAT.schema[which]) || {}).title || which;
+  });
+}
+
+//: 「金币 / 经验获取」页顶上那两个切换按钮。两张表的行列完全一样，
+//: 切的只是格子里填哪一对字段（用户 2026-09-10）。
+var REWARD_VIEWS = [
+  {id: "money", label: "金币", win: "win_money", lose: "lose_money"},
+  {id: "exp", label: "经验", win: "win_exp", lose: "lose_exp"}
+];
 
 /* ======================================================================
    物品图标 —— 一张图集切出来
@@ -786,6 +811,7 @@ function adoptConfig(which, text, warnings, path) {
     fillItems();
     reindexItems();
   }
+  if (which === "rewards") { fillRewards(); }
   CFG[which].snapshot = snapshot(which);
   return true;
 }
@@ -833,6 +859,42 @@ function fillItems() {
   });
   // ★ 物品表里没有的 id **不偷偷删**：服务端会拒收整份文件并指出是哪一条，
   //   比它从页面上悄悄消失强。
+}
+
+/** 奖励表：文件里缺的档位按内置默认表补出来（D72）。
+ *
+ * ★ 和 `fillItems()` 一个套路、一个理由：这一页是两张**固定的**二维表格，
+ *   文件里少一行不能让画面上少一格 —— 那一格就再也改不回来了。
+ *   服务端那边同样按内置默认值兜底（`gameserver._reward_row`），两边一个口径。
+ * ★ 必须在 `snapshot()` **之前**跑完，否则一进页面就显示「有未保存的修改」。
+ */
+function fillRewards() {
+  var have = {};
+  CFG.rewards.entries.forEach(function (entry) {
+    have[rewardKey(entry)] = true;
+  });
+  (CAT.reward_defaults || []).forEach(function (row) {
+    var key = rewardKey(row);
+    if (have[key]) { return; }
+    // ★ 拷一份：`CAT.reward_defaults` 是全页共用的那一份，直接塞进模型的话
+    //   改一个格子会把「默认值」也改掉，「放弃修改」就退不回去了。
+    var copy = {};
+    Object.keys(row).forEach(function (name) { copy[name] = row[name]; });
+    CFG.rewards.entries.push(copy);
+    have[key] = true;
+  });
+}
+
+/** 奖励表里一条记录的**身份**。★ 和服务端 `cfgmerge.KEY_FIELDS.rewards`
+ *  是同一套口径（模式 / 对战模式 / 道具战 / 队伍 / 关卡 / 难度）。 */
+function rewardKey(entry) {
+  if (!entry) { return ""; }
+  if (entry.mode === "bonus") { return "bonus"; }
+  if (entry.mode === "pvp") {
+    return ["pvp", entry.pvp_mode, entry.item_mode ? 1 : 0,
+            Number(entry.team) || 0].join("|");
+  }
+  return ["quest", entry.stage, entry.difficulty].join("|");
 }
 
 function collect(which) {
@@ -985,9 +1047,9 @@ async function saveConfig(which, skipClashCheck) {
   return true;
 }
 
-/** 「↻ 刷新」：把**四份配置全部**重新读一遍（用户 2026-09-06）。
+/** 「↻ 刷新」：把**几份配置全部**重新读一遍（用户 2026-09-06）。
  *
- * ★ 为什么不只读当前这一页：这四份**不是各管各的**。
+ * ★ 为什么不只读当前这一页：它们**不是各管各的**。
  *   ① 商店和合成**互斥**（D33）—— 别人刚在商店里上架了一件东西，服务端
  *      已经把它从合成里下掉了；只刷新合成那一页的话，商店那份还是旧的，
  *      画面上两边都写着「上架」，按一次保存就撞车。
@@ -1019,7 +1081,9 @@ async function refreshConfigs(force) {
   renderCurrent();
   // ★ 失败时**不要**盖掉 `loadConfig` 报的那句 —— 「已刷新」压在「读不到
   //   drops.json」上面，用户看到的就是「点了刷新，然后什么都没变」。
-  if (ok) { toast("已刷新：四份配置都换成服务端上最新的了。", true); }
+  if (ok) {
+    toast("已刷新：" + configCount() + " 份配置都换成服务端上最新的了。", true);
+  }
   return ok;
 }
 
@@ -1177,7 +1241,10 @@ function renderCurrent() {
   if (notes.length) { toast(notes.join("\n"), false); }
 
   // ★ 物品库没有「添加」：条目由 `shop_items.json` 定死，加不出新物品。
-  $("cfgAdd").classList.toggle("hidden", which === "items");
+  //   「金币 / 经验获取」也没有：档位是 8 + 21 + 1 三十格固定的表格，
+  //   加一条出来在画面上根本没有位置放（D72）。
+  $("cfgAdd").classList.toggle("hidden",
+                               which === "items" || which === "rewards");
 
   renderToolbar(which);
   repaintList();
@@ -1193,17 +1260,22 @@ function renderToolbar(which) {
   if (!FILTER[which]) { FILTER[which] = emptyFilter(); }
   var filter = FILTER[which];
 
-  var search = document.createElement("input");
-  search.type = "text";
-  search.placeholder = "搜 中文名 / 韩文名 / id";
-  search.value = filter.q;
-  search.oninput = function () {
-    filter.q = search.value.trim();
-    repaintList();
-  };
-  bar.appendChild(search);
+  // ★ 「金币 / 经验获取」页没有筛选条（D72）：档位固定 30 格，一屏就画完了，
+  //   搜什么、筛什么都没有意义。工具条上只留下面那个「↻ 刷新」。
+  //   金币 / 经验的切换在下一行（`paintCfgTabs`），不挤在这儿。
+  if (which !== "rewards") {
+    var search = document.createElement("input");
+    search.type = "text";
+    search.placeholder = "搜 中文名 / 韩文名 / id";
+    search.value = filter.q;
+    search.oninput = function () {
+      filter.q = search.value.trim();
+      repaintList();
+    };
+    bar.appendChild(search);
+  }
 
-  if (which !== "drops") {
+  if (which !== "drops" && which !== "rewards") {
     // ★ 角色 / 上架状态两个下拉（用户 2026-09-09，D68）：和「选择物品」弹窗、
     //   「修改仓库」弹窗**同一份选项、同一条判据**（`characterOptions` /
     //   `LISTING_FILTER_OPTIONS` / `dropdownsMatch`）。「类别」下拉（shopdata 的
@@ -1251,11 +1323,29 @@ function renderToolbar(which) {
     });
     lockForPvp();
   }
+  if (which === "rewards") {
+    // ★ 「金币 / 经验」切换挪进工具条、放**最左边**（用户 2026-09-10，D72b）。
+    //   原来它独占分类标签那一整行 —— 一行只放两个钮太浪费版面。
+    bar.appendChild(rewardViewSwitch());
+  }
 
-  // ★ 「↻ 刷新」排在筛选控件**后面**，**四个配置页都有**（用户 2026-09-06）
-  //   —— 点哪一页的都是把四份一起重读，见 `refreshConfigs()`。
+  // ★ 「↻ 刷新」排在筛选控件**后面**，**每个配置页都有**（用户 2026-09-06）
+  //   —— 点哪一页的都是把 `CONFIGS` 那几份一起重读，见 `refreshConfigs()`。
+  if (which === "rewards") {
+    // ★ 这一钮**故意长得不一样**（用户 2026-09-10，D72b）：它不是「切到哪一半」
+    //   的开关，是「弹一张只读的表出来」—— 深棕底 + 琥珀边（照面板标题栏那身
+    //   衣服），一眼就能和左边那两个分开，又还在这一页的配色里。
+    // ★ 排在「↻ 刷新」**前面**（用户第二轮）：它和左边那两个都是「看什么」，
+    //   刷新是「重读一遍」，两类事分开摆。
+    var curve = el("button", "btn btn-sm btn-ref", "▤ 等级经验对应表");
+    curve.title = "打开等级与经验的对应表（只读）";
+    curve.onclick = openLevelModal;
+    bar.appendChild(curve);
+  }
+
   var refresh = el("button", "btn btn-sm", "↻ 刷新");
-  refresh.title = "重新读一遍服务端上的四份配置（不只是这一页）";
+  refresh.title = "重新读一遍服务端上的 " + configCount()
+                  + " 份配置（不只是这一页）";
   refresh.onclick = function () { refreshConfigs(); };
   bar.appendChild(refresh);
 
@@ -1319,7 +1409,9 @@ function dropdownsMatch(itemId, want) {
  *  `big` / `sub` 是分类标签（`anyTab()` 那两个字段），掉落页用不上但留着不碍事。 */
 function emptyFilter() {
   return {q: "", character: "", listing: "", big: -1, sub: null,
-          mode: "", stage: "", difficulty: ""};
+          mode: "", stage: "", difficulty: "",
+          // 「金币 / 经验获取」页当前看的是哪一半（`REWARD_VIEWS`）。
+          view: REWARD_VIEWS[0].id};
 }
 
 /** `SCHEMA.drops` 里某个字段的描述（下拉选项从这儿取，不另抄一份）。 */
@@ -1343,7 +1435,8 @@ function dropFieldMatches(value, wanted) {
 //: 每个配置标签页画成什么样。★ 加一份配置时只要在这儿登记一行。
 //  （函数声明会被提升，所以写在它们前面没问题。）
 var RENDERERS = {items: renderItems, shop: renderShop,
-                 recipe: renderRecipe, drops: renderDrops};
+                 recipe: renderRecipe, drops: renderDrops,
+                 rewards: renderRewards};
 
 function repaintList() {
   var list = $("cfgList");
@@ -1352,6 +1445,19 @@ function repaintList() {
   //   一句读版面的代码，位置就被夹没了。
   var keep = list.scrollTop;
   list.textContent = "";
+  // ★ 「金币 / 经验获取」页从这儿分岔（D72）：它没有筛选、没有分类、也不排序
+  //   —— 档位是固定的两张表，画的永远是全部。下面那一整套（`filteredEntries`
+  //   / `narrowToTab` / 「筛出 x / y」）全是**按物品**算的，这一页一件物品
+  //   都没有，走进去只会拿 `undefined` 去查物品表。
+  if (CURRENT === "rewards") {
+    paintCfgTabs(CURRENT, []);
+    var shownLabel = $("cfgShown");
+    if (shownLabel) { shownLabel.textContent = ""; }
+    RENDERERS.rewards(list, CFG.rewards.entries);
+    list.scrollTop = keep;
+    touched();
+    return;
+  }
   // 先过筛选条（搜索 / 下拉），分类标签上的件数从这儿数；再按当前标签收一遍
   // 才是画出来的那批。★ 换页栏没有了（D68）：筛完剩多少画多少，滚动条在列表上。
   var filtered = filteredEntries(CURRENT);
@@ -1379,7 +1485,9 @@ function repaintList() {
 function paintCfgTabs(which, filtered) {
   var bigHost = $("cfgCats");
   var subHost = $("cfgSubCats");
-  var hide = (which === "drops");
+  // ★ 奖励页两行都藏起来：它不按物品分类，而「金币 / 经验」那个切换
+  //   2026-09-10 挪进工具条了（D72b，见 `rewardViewSwitch`）。
+  var hide = (which === "drops" || which === "rewards");
   bigHost.classList.toggle("hidden", hide);
   if (hide) {
     bigHost.textContent = "";
@@ -1878,6 +1986,294 @@ function dropRow(entry, index) {
   return row;
 }
 
+/* -------------------------------------------- 金币 / 经验获取：两张表格
+   用户 2026-09-10 点的题（D72）：
+     · 第一张 = 对战模式（生存 / 夺分 × 道具战）× 个人战 / 组队战，格子里
+       填输 / 赢各给多少；
+     · 第二张 = 闯关的 7 个关卡 × 简单 / 普通 / 困难，格子里填未通关 / 通关。
+   顶上「金币 / 经验」一切换，同两张表换填另一对字段 —— 行列不变，
+   人不用重新找位置。经验那一半下面多两个加成系数的输入框。
+
+   ★ 行列标题**一个都不在这儿写死**：对战模式名 / 队伍名 / 关卡名 / 难度名
+     全部来自 `SCHEMA.rewards` 里那几个 `options`（服务端的
+     `shopcfg.PVP_MODE_ZH` / `TEAM_ZH` / `QUEST_ZH` / `DIFFICULTY_ZH`），
+     输 / 赢两列的字来自 `SCHEMA.rewards.outcomes`。以后加一关、改一个译名，
+     这一页跟着变，不用两头改。 */
+
+/** 当前看的是金币还是经验。 */
+function rewardView() {
+  return (FILTER.rewards || {}).view || REWARD_VIEWS[0].id;
+}
+
+/** 工具条最左边那个「金币 / 经验」分段控件（D72b）。
+ *
+ *  ★ 复用分类标签那套 `button.cat` 的样子 —— 它在这一页里干的是同一件事
+ *    （「现在看哪一档」），换个地方摆而已，没必要另造一种控件。
+ */
+function rewardViewSwitch() {
+  var seg = el("span", "seg");
+  REWARD_VIEWS.forEach(function (view) {
+    var button = el("button", "cat" + (rewardView() === view.id ? " on" : ""),
+                    view.label);
+    button.title = "两张表的行列一样，切的是格子里填哪一对数";
+    button.onclick = function () {
+      FILTER.rewards.view = view.id;
+      // ★ 整条工具条重画一遍 —— 选中态在按钮自己身上（`.on`），
+      //   只重画列表的话左边这两个钮不会跟着变。
+      renderToolbar("rewards");
+      repaintList();
+    };
+    seg.appendChild(button);
+  });
+  return seg;
+}
+
+/** `SCHEMA.rewards` 里某个字段的描述（下拉选项从这儿取，不另抄一份）。 */
+function rewardSpec(key) {
+  var found = null;
+  (((CAT.schema || {}).rewards || {}).fields || []).forEach(function (spec) {
+    if (spec.key === key) { found = spec; }
+  });
+  return found || {key: key, label: key, type: "int", options: []};
+}
+
+function rewardOptions(key) {
+  return rewardSpec(key).options || [];
+}
+
+/** 表格里的一个数字格。
+ *
+ * ★ 校验和红框走 `fieldNode` **同一段代码**，只是把 `.field` 外壳和标签丢掉
+ *   —— 表头上已经写着这一格是什么了。`optional` 也去掉：在这张表里每一格
+ *   都得有个数，留空不是「不限」，是填错了（红框 + 服务端拒收）。
+ */
+function rewardCell(entry, key) {
+  var spec = rewardSpec(key);
+  var cell = el("td", null);
+  if (!entry) {
+    // 理论上到不了（`fillRewards` 会把缺的补齐），但真到了要看得出来。
+    cell.appendChild(el("span", "ro", "—"));
+    return cell;
+  }
+  var node = fieldNode({key: key, label: spec.label, type: "int",
+                        min: spec.min, max: spec.max}, entry, touched);
+  var input = node.querySelector("input");
+  input.title = spec.label;
+  cell.appendChild(input);
+  // ★ 服务端拒收时回的是「rules[12].win_money 不能小于 0」——
+  //   `markBadCard` 照 `data-index` 找那一格并闪一下。表格里一行有好几条
+  //   记录（个人战 / 组队战各一条），所以这个属性挂在**格子**上，不是行上。
+  cell.setAttribute("data-index", CFG.rewards.entries.indexOf(entry));
+  return cell;
+}
+
+/** 两层表头 + 一批数据行 = 一张表。
+ *
+ *  `groups` = [{label, key}]（上一行的分组，每组两列）；
+ *  `rows`   = [{label, entryOf(groupKey)}]。
+ */
+function rewardTable(title, headLabel, groups, outcomes, rows) {
+  var view = REWARD_VIEWS.filter(function (v) {
+    return v.id === rewardView();
+  })[0] || REWARD_VIEWS[0];
+
+  var block = el("div", "reward-block");
+  block.appendChild(el("h3", null, title));
+  var table = el("table", "reward-table");
+
+  var head = el("thead");
+  var top = el("tr");
+  var corner = el("th", "rowhead", headLabel);
+  corner.rowSpan = 2;
+  top.appendChild(corner);
+  var sub = el("tr");
+  groups.forEach(function (group) {
+    var cell = el("th", "grp", group.label);
+    cell.colSpan = 2;
+    top.appendChild(cell);
+    // 输在前、赢在后 —— 和用户写的顺序一致。
+    sub.appendChild(el("th", "grp", outcomes.lose));
+    sub.appendChild(el("th", null, outcomes.win));
+  });
+  head.appendChild(top);
+  head.appendChild(sub);
+  table.appendChild(head);
+
+  var body = el("tbody");
+  rows.forEach(function (row) {
+    var tr = el("tr");
+    tr.appendChild(el("th", "rowhead", row.label));
+    groups.forEach(function (group) {
+      var entry = row.entryOf(group);
+      var lose = rewardCell(entry, view.lose);
+      lose.className = "grp";
+      tr.appendChild(lose);
+      tr.appendChild(rewardCell(entry, view.win));
+    });
+    body.appendChild(tr);
+  });
+  table.appendChild(body);
+
+  // 宽表在自己身上横滚，别把整页撑出横条（版面约束和别的页一致）。
+  var scroller = el("div", "reward-scroll");
+  scroller.appendChild(table);
+  block.appendChild(scroller);
+  return block;
+}
+
+/** 经验那一半下面的加成系数（`mode:"bonus"` 那一条记录）。 */
+function rewardBonusField(bonus, key) {
+  var spec = rewardSpec(key);
+  var wrap = el("div", "reward-bonus");
+  if (!bonus) {
+    wrap.appendChild(el("span", "hint", "（配置里没有加成系数那一条）"));
+    return wrap;
+  }
+  wrap.setAttribute("data-index", CFG.rewards.entries.indexOf(bonus));
+  wrap.appendChild(fieldNode({key: key, label: spec.label, type: "int",
+                              min: spec.min, max: spec.max, help: spec.help},
+                             bonus, touched));
+  return wrap;
+}
+
+//: 等级曲线那张参照表分几栏并排（用户 2026-09-10，D72a）。
+//  60 级拉成一列要滚半天；三栏 20 行既看得全，宽度也还在 1320 里。
+var LEVEL_COLUMNS = 3;
+
+//: 「等级经验对应表」弹窗开着没有。★ Esc 要知道该关谁。
+var LEVEL_MODAL = false;
+
+/** 打开「等级与经验对应表」弹窗（D72b）。表现画现丢，页面里不留静态副本。 */
+function openLevelModal() {
+  var body = $("levelBody");
+  body.textContent = "";
+  var block = levelCurveBlock();
+  body.appendChild(block || el("div", "list-empty", "服务端没有给等级曲线"));
+  $("levelModal").classList.remove("hidden");
+  LEVEL_MODAL = true;
+}
+
+function closeLevelModal() {
+  $("levelModal").classList.add("hidden");
+  $("levelBody").textContent = "";
+  LEVEL_MODAL = false;
+}
+
+/** 「等级与经验」参照表 —— **只读**，曲线写在服务端的 `account_store` 里。
+ *
+ *  ★ 2026-09-10 第二轮起它住在**弹窗**里（D72b），不再摆在经验那一页最下面：
+ *    60 级的表比上面两张要改的表还高，天天看着碍事，要看时点开就行。
+ *  数全部来自 `/admin/api/catalog` 的 `level_curve`，
+ *  **页面不自己套公式**（算重了迟早和服务端对不上）。
+ */
+function levelCurveBlock() {
+  var rows = CAT.level_curve || [];
+  if (!rows.length) { return null; }
+  var per = Math.ceil(rows.length / LEVEL_COLUMNS);
+  var block = el("div", "reward-block");
+  // 标题不写在这儿 —— 弹窗自己的标题栏已经写了「等级与经验对应表」。
+  block.appendChild(el(
+    "p", "hint reward-note",
+    "升到下一级要挣「100 × 当前等级」点经验，满 " + rows.length + " 级封顶。"
+    + "这条曲线写在服务端里、管理页改不了 —— 放在这儿是为了对着上面那两张表"
+    + "换算：一局给这么多经验，打几局升一级。"));
+
+  var table = el("table", "reward-table level-table");
+  var head = el("thead");
+  var headRow = el("tr");
+  var column;
+  for (column = 0; column < LEVEL_COLUMNS; column += 1) {
+    headRow.appendChild(el("th", column ? "grp" : null, "等级"));
+    headRow.appendChild(el("th", null, "升到下一级"));
+    headRow.appendChild(el("th", null, "累计总经验"));
+  }
+  head.appendChild(headRow);
+  table.appendChild(head);
+
+  var body = el("tbody");
+  for (var line = 0; line < per; line += 1) {
+    var tr = el("tr");
+    for (column = 0; column < LEVEL_COLUMNS; column += 1) {
+      var row = rows[line + column * per];
+      var edge = column ? " grp" : "";
+      if (!row) {
+        // 级数不能被栏数整除时最后一栏会短一截，补空格子把表撑方正。
+        tr.appendChild(el("td", "lv" + edge, ""));
+        tr.appendChild(el("td", null, ""));
+        tr.appendChild(el("td", null, ""));
+        continue;
+      }
+      tr.appendChild(el("th", "rowhead lv" + edge, row.level));
+      tr.appendChild(el("td", null,
+                        row.need === null ? "满级" : String(row.need)));
+      tr.appendChild(el("td", null, String(row.total)));
+    }
+    body.appendChild(tr);
+  }
+  table.appendChild(body);
+
+  var scroller = el("div", "reward-scroll");
+  scroller.appendChild(table);
+  block.appendChild(scroller);
+  return block;
+}
+
+function renderRewards(list, entries) {
+  var byKey = {};
+  entries.forEach(function (entry) { byKey[rewardKey(entry)] = entry; });
+  var outcomes = ((CAT.schema.rewards || {}).outcomes) || {};
+  var isExp = (rewardView() === "exp");
+
+  // ---- 对战：行 = 模式 ×（有没有道具战），列 = 个人战 / 组队战 ----
+  var teams = rewardOptions("team").map(function (option) {
+    return {label: option.label, key: option.value};
+  });
+  var pvpRows = [];
+  // ★ 行序照用户写的：生存 / 夺分 / 生存道具战 / 夺分道具战
+  //   —— 先按「有没有道具」分两批，每批里按模式排。
+  [false, true].forEach(function (itemMode) {
+    rewardOptions("pvp_mode").forEach(function (mode) {
+      pvpRows.push({
+        label: mode.label + (itemMode ? "道具战" : ""),
+        entryOf: function (group) {
+          return byKey[["pvp", mode.value, itemMode ? 1 : 0,
+                        Number(group.key) || 0].join("|")];
+        }
+      });
+    });
+  });
+  list.appendChild(rewardTable("对战模式", "对战模式", teams,
+                               outcomes.pvp || {win: "赢", lose: "输"},
+                               pvpRows));
+  if (isExp) {
+    list.appendChild(rewardBonusField(byKey.bonus, "pvp_exp_per_kill"));
+  }
+
+  // ---- 闯关：行 = 关卡，列 = 难度 ----
+  var difficulties = rewardOptions("difficulty").map(function (option) {
+    return {label: option.label, key: option.value};
+  });
+  var questRows = rewardOptions("stage").map(function (stage) {
+    return {
+      label: stage.label,
+      entryOf: function (group) {
+        return byKey[["quest", stage.value, group.key].join("|")];
+      }
+    };
+  });
+  list.appendChild(rewardTable("闯关模式", "关卡", difficulties,
+                               outcomes.quest || {win: "通关", lose: "未通关"},
+                               questRows));
+  if (isExp) {
+    list.appendChild(rewardBonusField(byKey.bonus, "quest_score_per_exp"));
+  } else {
+    // 切到金币时那两个框会消失 —— 说一句为什么，别让人以为是画丢了。
+    list.appendChild(el("p", "hint reward-note",
+                        "金币不吃分数和杀敌数，所以只有「经验」那一半有加成系数。"
+                        + "实际到账还要加上本局在地上捡到的金币。"));
+  }
+}
+
 /* ======================================================================
    物品选择器
    ====================================================================== */
@@ -2323,7 +2719,7 @@ function paintBackupPager(pages) {
 /** 「回滚到此版本」：先重取一次（在线 / 战斗中的人数要最新的，那份备份也可能
  *  刚被别人删了），再弹带复选框的红钮确认框。
  *
- *  复选框是服务端分好的组（`databackup.groups_of`）：四份运营配置**一个格子**
+ *  复选框是服务端分好的组（`databackup.groups_of`）：运营配置那几份**一个格子**
  *  （用户 2026-09-07：互相关联，不许拆开），玩家存档单独一格、默认不勾。
  */
 async function confirmRestore(row) {
@@ -2545,7 +2941,10 @@ async function promoteToAdmin(username) {
     title: "设为管理员（运营）",
     lead: "把玩家「" + username + "」加成「运营」权限的管理员？\n"
         + "用户名和密码原样照搬 —— 他以后就用游戏里那套账号登管理页。\n"
-        + "运营只看得到 物品库 / 商店货架 / 合成配方 / 材料掉落 四页。",
+        // ★ 分隔符用「、」不用「 / 」—— 页名自己就带斜杠（「金币 / 经验获取」），
+        //   用斜杠隔开会读成六页。
+        + "运营只看得到 " + configTitles().join("、")
+        + " 这 " + configCount() + " 页。",
     ok: "设为运营"});
   if (!go) { return; }
   var result = await api("/admin/api/admins/from_player", {name: username});
@@ -2886,7 +3285,7 @@ async function savePlayer() {
   toast(result.message, result.ok);
 }
 
-/** 弹窗里的「↻ 刷新」：玩家仓库 + 物品表 + 四份运营配置（名字 / 等级门槛的出处）
+/** 弹窗里的「↻ 刷新」：玩家仓库 + 物品表 + 全部运营配置（名字 / 等级门槛的出处）
  *  全部重读（用户 2026-09-07：「取得最新的用户信息和运营物品信息」）。
  *  有没保存的改动先问一句；失败时不用「已刷新」盖掉错误。 */
 async function refreshPlayerPopup() {
@@ -2924,7 +3323,7 @@ async function loadCatalog() {
 
 /* ---------------------------------------------------------------- 权限
    两档（D34）：`system` 系统管理员 = 全部标签页；
-                `operator` 运营 = 只有那四个配置页。
+                `operator` 运营 = 只有 `CONFIGS` 那几个配置页。
 
    ★ 这里做的**只是把标签藏起来**，不是安全边界 —— 藏掉的按钮拦不住直接
      POST。真正的门在服务端 `_require_system_admin()` 里，两边都要有。
@@ -3006,8 +3405,20 @@ async function boot() {
   }
   if (!CFG[CURRENT]) { return; }
   renderCurrent();
+  paintOperatorPages();
   // ★ 运营根本进不去这一页，也别去要那份名单（服务端会回 403）。
   if (isSystemAdmin()) { loadAdmins(); }
+}
+
+/** 「管理员账号」页上那句「运营能进哪几页」—— 照 `CONFIGS` 现填。
+ *  和「设为运营」确认框里那句是同一份数据、同一个分隔符（页名自带斜杠，
+ *  所以用「、」隔开，不用「 / 」）。 */
+function paintOperatorPages() {
+  var host = $("operatorPages");
+  if (!host) { return; }
+  host.textContent = "只能进 " + configTitles().join("、")
+                     + " 这 " + configCount()
+                     + " 页，看不到「玩家仓库」和「管理员账号」。";
 }
 
 function switchTab(tab) {
@@ -3018,7 +3429,7 @@ function switchTab(tab) {
     button.classList.toggle("on", button.getAttribute("data-tab") === tab);
   });
   var isConfig = CONFIGS.indexOf(tab) >= 0;
-  // ★ 四个配置页、数据备份页和玩家仓库页是「面板撑满、列表自己滚」（D39；
+  // ★ 配置页、数据备份页和玩家仓库页是「面板撑满、列表自己滚」（D39；
   //   玩家仓库页 2026-09-07 加进来）；管理员账号是普通长页面，整块跟着
   //   `main` 滚。
   $("mainArea").classList.toggle("fit",
@@ -3165,6 +3576,14 @@ function wire() {
   $("dialog").onclick = function (event) {
     if (event.target === $("dialog")) { closeDialog(false); }
   };
+
+  // 「等级经验对应表」（D72b）：✕ 和点旁边的空白都能关。
+  // ★ 它是**只读**的，关掉不丢东西 ⇒ 认遮罩；「修改仓库」那个窗故意不认，
+  //   因为里面有没保存的改动，点歪一下就白改了。
+  $("levelClose").onclick = closeLevelModal;
+  $("levelModal").onclick = function (event) {
+    if (event.target === $("levelModal")) { closeLevelModal(); }
+  };
   document.addEventListener("keydown", function (event) {
     // ★ 对话框排在选择器前面：它是**盖在**选择器上面的那一层
     //   （「加一种材料」的弹窗上再弹确认框时，Esc 该先关掉上面那个）。
@@ -3174,7 +3593,9 @@ function wire() {
       else if (event.key === "Enter" && !DIALOG.danger) { closeDialog(true); }
       return;
     }
-    if (event.key === "Escape" && PICKER) { closePicker(); }
+    if (event.key === "Escape" && PICKER) { closePicker(); return; }
+    // 只读那一张（D72b）排最后：它不会盖在选择器上面。
+    if (event.key === "Escape" && LEVEL_MODAL) { closeLevelModal(); }
   });
 
   $("addAdmin").onclick = async function () {

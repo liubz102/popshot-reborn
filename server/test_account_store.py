@@ -342,6 +342,31 @@ class AccountStoreTests(unittest.TestCase):
         self.assertEqual(7, account["level"])
         self.assertEqual(7, player_level(account))
 
+    # -- 管理页那张只读参照表（D72a）----------------------------------------
+    def test_the_level_table_is_the_curve_itself_not_a_second_copy(self):
+        """★ 管理页照这份表画「等级与经验」，它必须和曲线**同一个出处**。
+
+        自己再套一遍公式（无论在 Python 还是 JS 里）迟早对不上 ——
+        这条把「表里的数」和 `experience_for_level` / `level_for_experience`
+        逐级对死。
+        """
+        from account_store import level_table, level_for_experience
+        table = level_table()
+        self.assertEqual(LEVEL_MAX, len(table))
+        for row in table:
+            level = row["level"]
+            self.assertEqual(experience_for_level(level), row["total"], level)
+            # 攒够这一级的累计经验，反查回来就该是这一级。
+            self.assertEqual(level, level_for_experience(row["total"]), level)
+            if level < LEVEL_MAX:
+                # 「升到下一级要挣多少」= 两级累计经验之差，表自己要自洽。
+                self.assertEqual(experience_for_level(level + 1) - row["total"],
+                                 row["need"], level)
+            else:
+                # ★ 满级没有「下一级」。`experience_for_level(61)` 确实算得出来，
+                #   但那只是 `experience_bounds()` 的除法分母，不是能挣到的一级。
+                self.assertIsNone(row["need"])
+
     def test_the_experience_bar_still_starts_at_zero(self):
         # 经验条两端由 experience_bounds 算，必须按真实等级来，
         # 否则新号一进游戏经验条就是负的。

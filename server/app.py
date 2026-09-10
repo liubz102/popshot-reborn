@@ -126,7 +126,7 @@ def build_arg_parser():
                     help="运营配置（物品库 / 商店 / 合成 / 掉落）和备份的落脚点，"
                          "默认 server/data。★ 不含账号存档 —— 那个走 --accounts。"
                          "打包自检用：自检会把包里的服务端真的跑起来，不挪走的话"
-                         "启动路径上的 shopcfg.ensure_files() 就把四份默认配置"
+                         "启动路径上的 shopcfg.ensure_files() 就把五份默认配置"
                          "生成在包里了")
     ap.add_argument("--config", default=None,
                     help="server.config 路径（默认包根 config\\server.config）")
@@ -309,10 +309,18 @@ def _report_default_admin_password(accounts):
 
 
 def _report_shop_config():
-    """三份运营配置（商店 / 合成 / 掉落）缺文件就生成一份默认的。
+    """五份运营配置（物品库 / 商店 / 合成 / 掉落 / 金币经验）缺哪份生成哪份。
 
-    ★ **已存在的一律不覆盖**（V0.3商店 D7）：这三份是用户手改或在
+    ★ **已存在的一律不覆盖**（V0.3商店 D7）：这几份是用户手改或在
     `/admin` 里改的运营数据，升级时盖掉等于把定价和配方抹了（铁律 11）。
+
+    ★★ **老版本升上来只补新加的那一份**：`ensure_files` 逐份看「在不在」，
+    所以 V0.3.0 的目录升到带 `rewards.json` 的这一版时，只会多出那一个文件，
+    另外四份一个字节都不动（`test_shopcfg` 的
+    `test_an_old_data_dir_only_gets_the_files_it_is_missing` 钉着）。
+
+    ★ 生成**失败也不拦着开服**：目录只读 / 盘满时照样往下走 —— 奖励表读不到
+    会退回内置默认值（`shopcfg._USE_DEFAULT`），玩家不会「打完一局一分钱不给」。
 
     ★ **按状态翻转说话**：生成过一次之后每次启动都是空结果，一行都不打。
     """
@@ -360,7 +368,7 @@ def main(argv=None):
     # `BackupService` / 管理页都是**每次现取** `shopcfg.DATA_DIR`（谁都没在
     # import 时抓快照，见 databackup.py `_data_dir`），所以在这儿改就全体生效。
     # ★ 只有打包自检会用它：自检把包里的服务端真的跑起来，而 `DATA_DIR` 钉在
-    #   `shopcfg.py` 同级 —— 不挪走的话四份默认配置就生成在包里，随包发出去，
+    #   `shopcfg.py` 同级 —— 不挪走的话五份默认配置就生成在包里，随包发出去，
     #   开服的人解压覆盖升级时会盖掉管理页改过的定价和配方（D7 / 铁律 11）。
     if args.data_dir:
         shopcfg.DATA_DIR = os.path.abspath(args.data_dir)

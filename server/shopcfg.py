@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""shopcfg.py —— 商店 / 合成 / 掉落的**运行时配置**（V0.3 合成与商店 M1）。
+"""shopcfg.py —— 商店 / 合成 / 掉落 / 奖励的**运行时配置**（V0.3 合成与商店 M1）。
 
-四份 JSON，都在 `server/data/`，**用户随时手改，改完不用重启**：
+五份 JSON，都在 `server/data/`，**用户随时手改，改完不用重启**：
 
 | 文件 | 管什么 |
 |---|---|
@@ -10,6 +10,7 @@
 | `shop.json` | 哪些东西上架、卖多少钱 |
 | `recipe.json` | 合成配方（产物 / 花费 / **最多 4 种材料**）|
 | `drops.json` | 打完一局掉什么材料 |
+| `rewards.json` | 打完一局给多少金币 / 经验（D72）|
 
 ⚠ **中文名、等级、角色限定只在 `items.json` 里**。它们是**物品自己的**属性
 （后两个客户端在「穿上」那一刻才读，`ItemInfo+0x1c` / `+0x24`），不是
@@ -22,7 +23,7 @@
   随代码走、进 git、进包。回答「这个 id 客户端认不认识、占哪个槽、加多少」。
 - `shopcfg.py`（本文件）读 `server/data/*.json` —— **用户的运营配置**，
   运行时生成、`.gitignore`、**打包时不拷**（D7）。回答「卖不卖、多少钱、怎么合」。
-- `shopdefaults.py` 算四份配置的**默认内容**（模板）—— 第一次开服 `ensure_files()`
+- `shopdefaults.py` 算五份配置的**默认内容**（模板）—— 第一次开服 `ensure_files()`
   写出来的就是它，`default_*()` 只是它的切片（D50）。改默认数值去那边改表。
 
 ## 热重载（用户要求：改完不重启即刻生效）
@@ -38,6 +39,9 @@
 1. JSON 解析不了 / 校验不过 → **保留上一份好的**，只记警告；
 2. 一次都没读成功过 → 返回**空目录**（商店空着，其余照常），不是内置默认值
    —— 「商店突然多出一堆没上架的东西」比「商店空着」更难查；
+   ★ **`rewards.json` 是唯一的例外**：它读不到时退回**内置默认值**。
+   别的配置空着最坏是「这局不掉东西」，奖励表空着是「打完一局一分钱不给」——
+   那不是 fail-safe，是把玩家的一局白打掉（D72）。
 3. **任何情况下都不回写文件**。生成只发生在「文件不存在」那一次（`ensure_files`）。
 
 ## 铁律：只用标准库
@@ -65,6 +69,9 @@ ITEMS_FILENAME = "items.json"
 SHOP_FILENAME = "shop.json"
 RECIPE_FILENAME = "recipe.json"
 DROPS_FILENAME = "drops.json"
+#: ★ 打完一局给多少金币 / 经验（D72）。以前这些数写死在 `gameserver.py` 里，
+#: 调一次就得改代码 + 重启服务端；现在和另外四份一样，管理页改完即刻生效。
+REWARDS_FILENAME = "rewards.json"
 
 #: ★ 合成界面只有 4 个材料槽（`ComposeItemNewUI.ui` 的 `ImgBar0~3`，§7）。
 #: 配方写第 5 种材料，玩家在界面上根本看不见 —— 校验时直接拒绝。
@@ -355,6 +362,22 @@ QUEST_ZH = {
 #:   `Chinese.ini` 把 `익스트림 모드` 原样留成 `Extreme Mode` 没翻，大概也是
 #:   因为中国区根本看不到它。校验器的上限跟着这张表走（`validate_drops`）。
 DIFFICULTY_ZH = {1: "简单", 2: "普通", 3: "困难"}
+
+#: 对战的**游戏模式号**（房间描述符 `arguments[1]`）→ 游戏里的中文名。
+#: 奖励表（D72）的行标题用它。
+#:
+#: ★ **只列玩家选得到的两种**。引擎里一共四个号
+#: （`gameserver.PVP_MODE_*`：0 生存 / 1 计时 / 2 무투전 / 3 夺分），
+#: 但中国区建房下拉框只给生存和夺分 —— 低等级号选了生存还会被客户端自己
+#: 改回夺分（`hook/bshook.c` 的 `try_patch_player_level_gate` 第 3 / 4 处）。
+#: 列上 1 / 2 只会让运营配出两行永远命中不到的数；真收到那两个号，
+#: 由 `gameserver.PVP_MODE_ROW` 归档到这两行里。
+#:
+#: 中文名照 `Chinese.ini` 的官方译法：`서바이벌=生存模式` / `맥스=夺分模式`。
+PVP_MODE_ZH = {0: "生存模式", 3: "夺分模式"}
+
+#: 组队开关（`arguments[0]`，`lobby.NORMAL_ARGUMENT_TEAM_MODE`）→ 中文。
+TEAM_ZH = {0: "个人战", 1: "组队战"}
 
 #: `shopdata` 的 `kind` → 中文。管理页的物品选择器按它分页签。
 #: ★ 键要和 `shop_items.json` 的 `by_kind` 对得上；查不到的 kind 原样显示，
@@ -834,6 +857,16 @@ def default_drops():
     return shopdefaults.default_drops()
 
 
+def default_rewards():
+    """默认 `rewards.json` = `shopdefaults.build_rewards()`（D72）。
+
+    ★ 30 档的初值**逐个等于 2026-09-10 之前那两个硬编码公式算出来的数**
+    （`test_shopdefaults` 的平价用例守着），所以这一版上线时玩家收入一分不变。
+    """
+    import shopdefaults
+    return shopdefaults.default_rewards()
+
+
 # --------------------------------------------------------------------------
 # 校验
 # --------------------------------------------------------------------------
@@ -1013,6 +1046,98 @@ def validate_drops(raw):
     return out
 
 
+#: 一档奖励最多给多少。正常值最大是「第 7 关困难通关」的 1000 金币，
+#: 留三个数量级余量；再大基本就是**多打了几个 0**。
+#: 顺带把 `0x0309` 的值 10 和 `0x0411` 的 `money_gained` 稳稳留在 int32 里
+#: （客户端那两处是 `+=` 进全局，溢出了会显示成负数）。
+MAX_REWARD = 1000000
+
+#: 奖励表里一条记录的三种形状。★ 顺序 = 管理页上从上到下的顺序。
+REWARD_MODES = ("pvp", "quest", "bonus")
+
+
+def validate_rewards(raw):
+    """`rewards.json` → `[档位…]`；有一条不对就抛 `ConfigError`（D72）。
+
+    三种形状共用一个列表（`mode` 分流）：
+
+        {mode:"pvp",   pvp_mode, item_mode, team,  win_*/lose_*}   对战 8 条
+        {mode:"quest", stage, difficulty,          win_*/lose_*}   闯关 21 条
+        {mode:"bonus", quest_score_per_exp, pvp_exp_per_kill}      加成系数 1 条
+
+    ★ **不要求写全**：缺的档位由 `gameserver` 退回内置默认值，管理页打开时
+    也会照 `SCHEMA["rewards"]["defaults"]` 把缺的补出来。但**同一个档位不许
+    出现两次** —— 那样「到底按哪条给钱」就说不清了（掉落规则可以重复，
+    因为那是「各掷各的」，奖励不是）。
+    """
+    if not isinstance(raw, dict):
+        raise ConfigError("rewards.json 的最外层必须是一个对象")
+    rules = raw.get("rules")
+    if not isinstance(rules, list):
+        raise ConfigError("rewards.json 缺少 rules 列表")
+    out = []
+    seen = set()
+    for index, entry in enumerate(rules):
+        where = "rules[%d]" % index
+        if not isinstance(entry, dict):
+            raise ConfigError("%s 不是对象" % where)
+        mode = entry.get("mode")
+        if mode not in REWARD_MODES:
+            raise ConfigError("%s.mode 只能是 %s：%r"
+                              % (where, " / ".join(REWARD_MODES), mode))
+        if mode == "bonus":
+            rule = {
+                "mode": mode,
+                # ★ 除数，**不许是 0**（`分数 // 它`）。
+                "quest_score_per_exp": _as_int(
+                    entry.get("quest_score_per_exp",
+                              _default_bonus("quest_score_per_exp")),
+                    where + ".quest_score_per_exp", low=1, high=MAX_REWARD),
+                "pvp_exp_per_kill": _as_int(
+                    entry.get("pvp_exp_per_kill",
+                              _default_bonus("pvp_exp_per_kill")),
+                    where + ".pvp_exp_per_kill", low=0, high=MAX_REWARD),
+            }
+            key = ("bonus",)
+        else:
+            rule = {"mode": mode}
+            if mode == "pvp":
+                # ★ 校验器**不限**游戏模式号：模式有几种是客户端的事。表里只放
+                #   生存(0) / 夺分(3)，别的号在结算时由 `PVP_MODE_ROW` 归档过来。
+                rule["pvp_mode"] = _as_int(entry.get("pvp_mode"),
+                                           where + ".pvp_mode", low=0)
+                rule["item_mode"] = bool(entry.get("item_mode", False))
+                rule["team"] = _as_int(entry.get("team", 0),
+                                       where + ".team", low=0, high=1)
+                key = ("pvp", rule["pvp_mode"], rule["item_mode"], rule["team"])
+            else:
+                # 关卡不设上限（同 `validate_drops` 的理由）；难度上限跟着
+                # `DIFFICULTY_ZH` 走 —— 中国区选不到第 4 档。
+                rule["stage"] = _as_int(entry.get("stage"),
+                                        where + ".stage", low=1)
+                rule["difficulty"] = _as_int(entry.get("difficulty"),
+                                             where + ".difficulty",
+                                             low=1, high=max(DIFFICULTY_ZH))
+                key = ("quest", rule["stage"], rule["difficulty"])
+            for field in ("win_money", "lose_money", "win_exp", "lose_exp"):
+                rule[field] = _as_int(entry.get(field, 0),
+                                      "%s.%s" % (where, field),
+                                      low=0, high=MAX_REWARD)
+        if key in seen:
+            raise ConfigError("%s：这一档奖励写了两遍（%s）" % (where, key))
+        seen.add(key)
+        out.append(rule)
+    return out
+
+
+def _default_bonus(key):
+    """加成系数缺省值 —— 从默认表里取，别在两处各写一个数字。"""
+    for rule in default_rewards()["rules"]:
+        if rule.get("mode") == "bonus":
+            return rule[key]
+    raise ConfigError("默认奖励表里没有 bonus 那一条")        # 到不了
+
+
 # --------------------------------------------------------------------------
 # 字段描述表 —— 管理页照着它生成输入框
 # --------------------------------------------------------------------------
@@ -1043,7 +1168,7 @@ def validate_drops(raw):
 # `optional` = 这个键可以整个不出现在 json 里（前台留空就不写）。
 # `readonly` = 只读展示，值由别的字段推出来（比如 `kind` 由 `id` 决定）。
 
-#: 四份配置各自的：列表键、标题、页面上的说明、字段表。
+#: 五份配置各自的：列表键、标题、页面上的说明、字段表。
 #:
 #: ★ `help` 就是原来写在 json 里那几行 `_说明` —— 用户拍板搬到页面上、
 #:   不再写进文件（D16）。
@@ -1163,7 +1288,79 @@ SCHEMA = {
              "help": "只给人看，服务端不读它"},
         ],
     },
+    # ----------------------------------------------------------------- 奖励
+    # ★ 这一页**不是**卡片列表，是两张二维表格（用户 2026-09-10 点的题）：
+    #   对战 = 模式 × 个人/组队，闯关 = 关卡 × 难度，格子里填输 / 赢两个数；
+    #   顶上一个「金币 / 经验」切换让两张表复用同一套行列。
+    #   ⇒ `fields` 在这儿的用处是**校验器的契约 + 行列标题的唯一出处**
+    #     （`admin.js` 的 `renderRewards` 从这几个 `options` 拼行列），
+    #     不是「一条记录画成一行输入框」。
+    "rewards": {
+        "list_key": "rules",
+        "title": "金币 / 经验获取",
+        "unit": "档",
+        # ★ 说明是**纯文本**（`admin.js` 用 `textContent` 画的），别写 Markdown
+        #   记号 —— `**这样**` 会连星号一起显示出来。
+        "help": [
+            "表里填的是「基准值」。实际到手还要加上本局在地上捡到的金币"
+            "（怪掉的、通关金币雨、打碎场景物掉的）—— 那部分不受这张表影响。",
+            "对战的平局（没分出胜负那一档）按「输」算；"
+            "闯关是合作，所以那张表两列写的是「未通关 / 通关」。",
+            "★「经验」那一页下面两个系数是额外加成：闯关按本局分数、"
+            "对战按杀敌数，加在表里那个基准值上面。金币不吃这两个（D152）。",
+            # "改完保存即刻生效，不用重启服务端。",
+        ],
+        "fields": [
+            {"key": "mode", "label": "类型", "type": "choice",
+             "options": [{"value": "pvp", "label": "对战"},
+                         {"value": "quest", "label": "闯关"},
+                         {"value": "bonus", "label": "加成系数"}]},
+            # 下面六个各自只出现在一种形状的记录里 ⇒ 全是 optional。
+            {"key": "pvp_mode", "label": "对战模式", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "options": [{"value": n, "label": name}
+                         for n, name in sorted(PVP_MODE_ZH.items())]},
+            {"key": "item_mode", "label": "道具战", "type": "bool",
+             "optional": True},
+            {"key": "team", "label": "队伍", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "options": [{"value": n, "label": name}
+                         for n, name in sorted(TEAM_ZH.items())]},
+            {"key": "stage", "label": "关卡", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "options": [{"value": qid, "label": "%d · %s" % (qid, name)}
+                         for qid, name in sorted(QUEST_ZH.items())]},
+            {"key": "difficulty", "label": "难度", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "options": [{"value": n, "label": name}
+                         for n, name in sorted(DIFFICULTY_ZH.items())]},
+            {"key": "win_money", "label": "赢 · 金币", "type": "int",
+             "optional": True, "min": 0, "max": MAX_REWARD},
+            {"key": "lose_money", "label": "输 · 金币", "type": "int",
+             "optional": True, "min": 0, "max": MAX_REWARD},
+            {"key": "win_exp", "label": "赢 · 经验", "type": "int",
+             "optional": True, "min": 0, "max": MAX_REWARD},
+            {"key": "lose_exp", "label": "输 · 经验", "type": "int",
+             "optional": True, "min": 0, "max": MAX_REWARD},
+            {"key": "quest_score_per_exp", "label": "闯关：每多少分额外 +1 经验",
+             "type": "int", "optional": True, "min": 1, "max": MAX_REWARD,
+             "help": "本局分数 ÷ 它，商加进经验。不能填 0（它是除数）"},
+            {"key": "pvp_exp_per_kill", "label": "对战：每杀敌 +N 经验",
+             "type": "int", "optional": True, "min": 0, "max": MAX_REWARD},
+        ],
+        #: ★ 两列表头在这儿定，管理页不另抄一份。
+        "outcomes": {"pvp": {"win": "赢", "lose": "输"},
+                     "quest": {"win": "通关", "lose": "未通关"}},
+    },
 }
+
+#: ★ 奖励表的**完整档位清单**发给管理页（`fillRewards()` 照它把文件里缺的
+#: 档位补出来，和物品库的 `fillItems()` 一个套路）。放在 SCHEMA 定义之后
+#: 是因为 `default_rewards()` 要 `import shopdefaults`，而那边 `import shopcfg`
+#: —— 加载阶段谁都不许调对方（模块头的「别绕成环」）。
+def reward_defaults():
+    """默认的 30 档（含 `mode:"bonus"` 那一条）。给 `/admin/api/catalog` 用。"""
+    return default_rewards()["rules"]
 
 
 def schema_keys(which):
@@ -1175,12 +1372,20 @@ def schema_keys(which):
 # 读盘（带热重载）
 # --------------------------------------------------------------------------
 
+#: 「这份配置读不到时退回**内置默认值**」的记号（第三格填它）。
+#:
+#: ★ 只有 `rewards.json` 用它。别的配置退回空表最坏是「商店空着 / 这局不掉
+#: 东西」，一眼就看得出不对；奖励表退回空表是**打完一局一分钱不给**，
+#: 玩家只会觉得「这游戏坏了」，而且那一局是白打的、补不回来（D72）。
+_USE_DEFAULT = object()
+
 _SPECS = {
     # ★ 物品库排最前面 —— 另外两份都要问它「这件东西几级 / 谁能穿」（D31）。
     ITEMS_FILENAME: (validate_items, default_items, {}),
     SHOP_FILENAME: (validate_shop, default_shop, {}),
     RECIPE_FILENAME: (validate_recipes, default_recipes, []),
     DROPS_FILENAME: (validate_drops, default_drops, []),
+    REWARDS_FILENAME: (validate_rewards, default_rewards, _USE_DEFAULT),
 }
 
 #: ★ 每份配置一把**写锁**，护住「读盘 → 合并 → 写盘」这一段（D36）。
@@ -1217,7 +1422,8 @@ def all_write_locks():
 #: 文件名 → `SCHEMA` 的键。数据备份的回滚对话框用它把「互相关联的那一组」
 #: 写成人话（「物品库 · 商店货架 · …」），不用把标题再抄一遍。
 _WHICH_OF = {ITEMS_FILENAME: "items", SHOP_FILENAME: "shop",
-             RECIPE_FILENAME: "recipe", DROPS_FILENAME: "drops"}
+             RECIPE_FILENAME: "recipe", DROPS_FILENAME: "drops",
+             REWARDS_FILENAME: "rewards"}
 
 
 def config_filenames():
@@ -1244,6 +1450,11 @@ def path_of(filename, data_dir=None):
 def _load(filename, data_dir=None, _reload=False):
     """`(解析结果, 警告列表)`。**坏文件保留上一份好的，绝不回写。**"""
     validate, _build, empty = _SPECS[filename]
+
+    def fallback():
+        """一次都没读成功过时给什么。见 `_USE_DEFAULT`。"""
+        return validate(_build()) if empty is _USE_DEFAULT else empty
+
     path = path_of(filename, data_dir)
     try:
         st = os.stat(path)
@@ -1254,7 +1465,9 @@ def _load(filename, data_dir=None, _reload=False):
         if cached:
             # 文件被删了/暂时读不到：保留上一份，别让商店突然清空。
             return cached[1], ["读不到 %s，继续用上一次读到的内容" % path]
-        return empty, ["没有找到 %s，%s 是空的" % (path, filename)]
+        return fallback(), [
+            "没有找到 %s，%s" % (path, "退回内置默认值"
+                                if empty is _USE_DEFAULT else "是空的")]
 
     with _lock:
         cached = _cache.get(path)
@@ -1270,7 +1483,8 @@ def _load(filename, data_dir=None, _reload=False):
         warning = "%s 读不了或不合法（%s）；" % (path, exc)
         if cached:
             return cached[1], [warning + "继续用上一次读到的内容"]
-        return empty, [warning + "当它是空的"]
+        return fallback(), [
+            warning + ("退回内置默认值" if empty is _USE_DEFAULT else "当它是空的")]
 
     result = (stamp, parsed, [])
     with _lock:
@@ -1296,6 +1510,11 @@ def recipes(data_dir=None, _reload=False):
 def drops(data_dir=None, _reload=False):
     """`[掉落规则…]`。"""
     return _load(DROPS_FILENAME, data_dir, _reload)
+
+
+def rewards(data_dir=None, _reload=False):
+    """`[奖励档位…]`（D72）。★ 读不到 / 读坏了退回**内置默认值**，不是空表。"""
+    return _load(REWARDS_FILENAME, data_dir, _reload)
 
 
 def invalidate(data_dir=None):
@@ -1338,7 +1557,7 @@ def write_json(path, data):
 
 
 def ensure_files(data_dir=None):
-    """四份配置不存在就生成，**已存在一律不覆盖**（D7）。返回新建了哪几个。
+    """五份配置不存在就生成，**已存在一律不覆盖**（D7）。返回新建了哪几个。
 
     ★ 这是**唯一会自动生成**这几份文件的地方。云上升级时用户手改过的价格 /
     配方 / 掉落必须原样留着 —— 覆盖它们等于把运营数据抹了（铁律 11）。
@@ -1363,10 +1582,15 @@ def ensure_files(data_dir=None):
 # 补齐（只增不改）
 # --------------------------------------------------------------------------
 
-#: 哪两份配置补得了，以及「一条记录的身份」是哪个键。
+#: 哪三份配置补得了，以及「一条记录的身份」是哪个键。
 #:
 #: ★ `drops.json` 不在里面：一条掉落规则没有天然主键（同一种材料可以有
 #:   好几条不同关卡 / 难度的规则），「有没有」判不出来，补齐只会补出重复。
+#: ★ `rewards.json` 也不在里面，但理由相反 —— 它的身份是个**元组**
+#:   （模式 / 对战模式 / 道具战 / 队伍 / 关卡 / 难度），这里这套「一个键」的
+#:   形状装不下。而且它根本不需要：管理页一打开就照
+#:   `SCHEMA["rewards"]` 的默认档位把缺的补齐（`admin.js` 的 `fillRewards`），
+#:   服务端这边缺档位时直接退回内置默认值（`_USE_DEFAULT`）。
 BACKFILL_KEYS = {
     #: ★ 物品库尤其要它：物品表里加进来的东西、以前漏收的类别，
     #:   都只能靠这里补 —— 「物品库列不全」正是用户 2026-09-06 报的问题。
