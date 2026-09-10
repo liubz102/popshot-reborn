@@ -139,17 +139,26 @@
           <!-- 玩家自己在游戏里也会改这些数（打完一局就涨经验和金币），
                所以这一页随时会过期。刷新 = 重读列表 + 重读正在改的那个人。 -->
           <button class="btn" id="playerRefreshBtn" title="重新读一遍列表和下面这个人的资料">↻ 刷新</button>
-          <!-- 批量发奖励（用户 2026-09-10，D76）：弹窗里选一批人 + 选物品 / 经验 /
-               金币，发到每个人**游戏里的礼物盒**，玩家自己领。放在「当前在线」
-               **左边** —— `.online-tally{margin-left:auto}` 会把它右边的东西一起
-               顶到最右端。 -->
-          <button class="btn btn-primary" id="rewardOpenBtn"
-                  title="给一批玩家发物品 / 经验 / 金币，进他们游戏里的礼物盒">发送奖励</button>
-          <!-- 全服在线人数（用户 2026-09-08），钉在这一条的最右端。数来自
-               `/admin/api/players` 的 `online_total`，跟列表里那些 ● 是同一份
-               快照 —— 跟着列表一起刷新，不另外轮询。 -->
-          <span class="online-tally hidden" id="playerOnlineTally">
-            <i class="dot"></i>当前在线：<b id="playerOnlineNum">0</b> 人</span>
+          <!-- ★ 右半边是**一整块**（用户 2026-09-10 第二轮：两个钮要挨着
+               「当前在线」贴在最右端）。靠右只在 `.tool-right` 上写一次
+               `margin-left:auto` —— 以前是 `.online-tally` 自己写的，
+               再给它前面塞一个也带 `auto` 的东西，两个 auto 会**平分**中间的
+               空隙，钮和字就被拆到两处去了。 -->
+          <div class="tool-right">
+            <!-- 批量发奖励（用户 2026-09-10，D76）：弹窗里选一批人 + 选物品 /
+                 经验 / 金币，发到每个人**游戏里的礼物盒**，玩家自己领。 -->
+            <button class="btn btn-primary" id="rewardOpenBtn"
+                    title="给一批玩家发物品 / 经验 / 金币，进他们游戏里的礼物盒">批量发送奖励</button>
+            <!-- 发送记录（用户 2026-09-10 第二轮）：发过哪几次、每次发给了谁、
+                 发了什么。记录在 `server/data/gift_history.json`（gifthistory.py）。 -->
+            <button class="btn" id="rewardHistoryBtn"
+                    title="翻发过的每一次奖励：时间 / 发送者 / 玩家名单 / 奖励物品">发送记录</button>
+            <!-- 全服在线人数（用户 2026-09-08），钉在这一条的最右端。数来自
+                 `/admin/api/players` 的 `online_total`，跟列表里那些 ● 是同一份
+                 快照 —— 跟着列表一起刷新，不另外轮询。 -->
+            <span class="online-tally hidden" id="playerOnlineTally">
+              <i class="dot"></i>当前在线：<b id="playerOnlineNum">0</b> 人</span>
+          </div>
         </div>
         <!-- 换页栏只有列表上面这一条（D37b），和列表一起钉在滚动区外面。 -->
         <div class="pager" id="playerPager"></div>
@@ -448,6 +457,37 @@
       <span class="pageno" id="rewardSummary"></span>
       <span class="grow"></span>
       <button class="btn btn-primary" id="rewardSend" disabled>确认发送奖励</button>
+    </div>
+  </div>
+</div>
+
+<!-- ========================= 发送记录弹窗（用户 2026-09-10 第二轮） =========================
+     「玩家仓库」工具条上「发送记录」点开的翻账窗。左右分屏：左栏是发过的每一次
+     （发送时间 + 发送者），点一条右栏画那一次的详细 —— 时间 / 发送者 / 留言 /
+     「奖励玩家名单」/「奖励物品」。左栏列表上方一个「清空记录」。
+     记录住在 `server/data/gift_history.json`（`server/gifthistory.py`），
+     不进 git、不进包。
+     ★ 这一个**点遮罩就能关**：里面全是只读的旧账，关掉不丢任何东西
+       —— 和 `#rewardModal`「只有 ✕ 能关」的理由（勾了一半的人和东西）不一样。 -->
+<div class="modal hidden" id="historyModal">
+  <div class="panel history-panel">
+    <div class="panel-title">
+      <h2>发送记录</h2>
+      <span class="count" id="historyCount"></span>
+      <button class="icon-btn" id="historyClose" aria-label="关闭" title="关闭">✕</button>
+    </div>
+    <div class="panel-body history-body">
+      <div class="history-left">
+        <div class="toolbar history-bar">
+          <span class="pageno" id="historyTally">还没读到</span>
+          <span class="grow"></span>
+          <button class="btn btn-sm btn-danger" id="historyClear"
+                  title="把保存的发送记录全部删掉（已经发出去的礼物不受影响）">清空记录</button>
+        </div>
+        <!-- 只有这一块滚 -->
+        <div class="history-list" id="historyList"></div>
+      </div>
+      <div class="history-right" id="historyDetail"></div>
     </div>
   </div>
 </div>

@@ -13,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -27,6 +28,7 @@ import cfgmerge                                                  # noqa: E402
 import config as server_config                                 # noqa: E402
 import databackup                                              # noqa: E402
 import gameserver                                             # noqa: E402
+import gifthistory                                           # noqa: E402
 import shopcfg                                                 # noqa: E402
 import shopdata                                                # noqa: E402
 from account_store import AccountStore                         # noqa: E402
@@ -210,6 +212,8 @@ class AdminAuthTests(_AdminCase):
                 ("/admin/api/player", {"name": "alice", "money": 1}),
                 ("/admin/api/reward/players?q=a", None),
                 ("/admin/api/reward/send", {"players": ["alice"], "exp": 1}),
+                ("/admin/api/reward/history", None),
+                ("/admin/api/reward/history/clear", {}),
                 ("/admin/api/config/shop", {"text": "{}"}),
                 ("/admin/api/admins/add", {"name": "carol", "password": "pw1"}),
                 ("/admin/api/admins/password", {"name": "admin", "password": "pw1"}),
@@ -1170,6 +1174,8 @@ class OperatorPermissionTests(_AdminCase):
                 ("/admin/api/player", {"name": "alice", "money": 1}),
                 ("/admin/api/reward/players?q=a", None),
                 ("/admin/api/reward/send", {"players": ["alice"], "exp": 1}),
+                ("/admin/api/reward/history", None),
+                ("/admin/api/reward/history/clear", {}),
                 ("/admin/api/admins", None),
                 ("/admin/api/admins/add", {"name": "dave", "password": "pw12345"}),
                 ("/admin/api/admins/password", {"name": "carol",
@@ -1339,6 +1345,8 @@ class PlayerReadOnlyTests(_AdminCase):
                 ("/admin/api/player", {"name": "alice", "money": 999999}),
                 ("/admin/api/reward/players?q=a", None),
                 ("/admin/api/reward/send", {"players": ["alice"], "money": 999999}),
+                ("/admin/api/reward/history", None),
+                ("/admin/api/reward/history/clear", {}),
                 ("/admin/api/admins", None),
                 ("/admin/api/admins/add", {"name": "dave", "password": "pw12345"}),
                 ("/admin/api/admins/password", {"name": "admin",
@@ -2074,6 +2082,157 @@ class AdminRewardTests(_AdminCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(1, len(alice.arrived))
         self.assertEqual(0, result["total"])
+
+
+    # -------------------------------------------------------- 发送记录
+    def history(self):
+        _status, result = self.request("/admin/api/reward/history")
+        return result
+
+    def test_every_send_leaves_one_history_record(self):
+        self.fake_online("alice")
+        _status, result = self.send(
+            players=["alice", "bob"],
+            items={str(self._MATERIAL): 5, str(self._ARMOR): 1},
+            exp=500, money=3000, message="干得漂亮")
+        self.assertTrue(result["ok"], result)
+
+        got = self.history()
+        self.assertTrue(got["ok"], got)
+        self.assertEqual(gifthistory.HISTORY_MAX, got["max"])
+        self.assertEqual(1, len(got["records"]))
+        row = got["records"][0]
+        self.assertEqual("admin", row["sender"], "发送者 = 登录管理页那个 GM 账号")
+        self.assertEqual("干得漂亮", row["message"])
+        self.assertEqual(result["message"], row["summary"])
+        # 时间：epoch 给排序、`time_text` 给页面直接画（服务端时区）。
+        self.assertLessEqual(abs(time.time() - row["time"]), 60)
+        self.assertRegex(row["time_text"], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+        # 奖励物品：物品名在**发送那一刻**查好存下来，经验 / 金币各自一行。
+        self.assertEqual(
+            [("item", self._MATERIAL, 5), ("item", self._ARMOR, 1),
+             ("exp", None, 500), ("money", None, 3000)],
+            [(r["kind"], r.get("id"), r["count"]) for r in row["rewards"]])
+        self.assertEqual(shopcfg.item_name(self._MATERIAL),
+                         row["rewards"][0]["name"])
+        # 奖励玩家名单：昵称也留一份（记录要能单独看懂，别逼人再去查账号表）。
+        self.assertEqual([("alice", "爱丽丝", True, 4, True),
+                          ("bob", "小明", True, 4, False)],
+                         [(p["username"], p["nickname"], p["ok"], p["gifts"],
+                           p["pushed"]) for p in row["players"]])
+
+    def test_the_newest_record_comes_first(self):
+        for money in (100, 200, 300):
+            self.assertTrue(self.send(players=["alice"], money=money)[1]["ok"])
+        rows = self.history()["records"]
+        self.assertEqual(3, len(rows))
+        self.assertEqual([300, 200, 100],
+                         [row["rewards"][0]["count"] for row in rows])
+        self.assertEqual(3, len(set(row["id"] for row in rows)),
+                         "同一秒里发三次也要有三个不同的 id")
+
+    def test_the_ones_that_failed_or_were_skipped_stay_on_the_list(self):
+        """★ 记录要回答的是「那一次到底谁拿到了什么」——
+        只留成功的，等于把最该翻的那几行抹掉。"""
+        self.accounts.add_item("bob", self._ARMOR)
+        _status, result = self.send(players=["alice", "bob", "nobody"],
+                                    items={str(self._ARMOR): 1})
+        self.assertTrue(result["ok"], result)
+        rows = {p["username"]: p for p in self.history()["records"][0]["players"]}
+        self.assertEqual([], rows["alice"]["skipped"])
+        self.assertEqual([{"id": self._ARMOR,
+                           "name": shopcfg.item_name(self._ARMOR)}],
+                         rows["bob"]["skipped"])
+        self.assertEqual(0, rows["bob"]["gifts"])
+        self.assertFalse(rows["nobody"]["ok"])
+        self.assertIn("没有这个账号", rows["nobody"]["error"])
+
+    def test_a_request_that_sent_nothing_leaves_no_record(self):
+        """载荷不合法 = 一份都没发（`_reward_request` 抛在最前面）⇒ 没什么可记。"""
+        _status, result = self.send(players=["alice"])
+        self.assertFalse(result["ok"])
+        self.assertEqual([], self.history()["records"])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.data_dir, gifthistory.FILENAME)),
+            "一次都没发过就不该有这个文件")
+
+    def test_the_history_lands_on_one_file_in_the_data_dir(self):
+        self.assertTrue(self.send(players=["alice"], exp=1)[1]["ok"])
+        target = os.path.join(self.data_dir, gifthistory.FILENAME)
+        self.assertTrue(os.path.exists(target))
+        with open(target, encoding="utf-8") as fp:
+            raw = json.load(fp)
+        self.assertEqual(gifthistory.FORMAT, raw["format"])
+        self.assertEqual(1, len(raw["records"]))
+
+    def test_clearing_only_drops_the_records_never_the_gifts(self):
+        self.assertTrue(self.send(players=["alice"], exp=5)[1]["ok"])
+        self.assertEqual(1, len(self.gifts_of("alice")))
+        _status, result = self.request("/admin/api/reward/history/clear", {})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(1, result["count"])
+        self.assertEqual([], self.history()["records"])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.data_dir, gifthistory.FILENAME)),
+            "清空 = 把文件删掉，不留空壳")
+        # ★ 真正的判据：已经发出去的礼物还在。
+        self.assertEqual(1, len(self.gifts_of("alice")))
+        # 清完还能接着发，接着记。
+        self.assertTrue(self.send(players=["alice"], exp=6)[1]["ok"])
+        self.assertEqual(1, len(self.history()["records"]))
+
+    def test_clearing_an_empty_history_is_not_an_error(self):
+        _status, result = self.request("/admin/api/reward/history/clear", {})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(0, result["count"])
+
+
+class GiftHistoryStoreTests(unittest.TestCase):
+    """`server/gifthistory.py` 本身：条数上限、坏文件、目录跟着 `DATA_DIR` 走。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved = shopcfg.DATA_DIR
+        shopcfg.DATA_DIR = self.tmp.name
+        self.addCleanup(setattr, shopcfg, "DATA_DIR", saved)
+        self.target = os.path.join(self.tmp.name, gifthistory.FILENAME)
+
+    def test_the_file_follows_the_data_dir(self):
+        """★ 打包自检的 `--data-dir` 靠这一条把它挪出包外（`Assert-PackageDataClean`）。"""
+        self.assertEqual(self.target, gifthistory.path())
+        gifthistory.append({"sender": "admin"})
+        self.assertTrue(os.path.exists(self.target))
+
+    def test_the_oldest_rows_fall_off_the_end(self):
+        saved = gifthistory.HISTORY_MAX
+        gifthistory.HISTORY_MAX = 3
+        self.addCleanup(setattr, gifthistory, "HISTORY_MAX", saved)
+        for n in range(5):
+            gifthistory.append({"sender": "admin", "summary": str(n)})
+        self.assertEqual(["4", "3", "2"],
+                         [row["summary"] for row in gifthistory.load()])
+
+    def test_a_file_that_cannot_be_read_is_set_aside_not_overwritten(self):
+        """记录的意义就是「以后翻得到」—— 解析失败就当它不存在、下一发顺手抹掉，
+        等于悄悄销毁证据。"""
+        with open(self.target, "w", encoding="utf-8") as fp:
+            fp.write("{ 这不是 json")
+        said = []
+        self.assertEqual([], gifthistory.load(log=said.append))
+        spare = [name for name in os.listdir(self.tmp.name)
+                 if name.startswith(gifthistory.FILENAME + ".bad-")]
+        self.assertEqual(1, len(spare), os.listdir(self.tmp.name))
+        self.assertTrue(said and "读不了" in said[0], said)
+        # 挪走之后照常能接着记。
+        gifthistory.append({"sender": "admin"})
+        self.assertEqual(1, len(gifthistory.load()))
+
+    def test_a_bare_list_from_an_older_format_still_reads(self):
+        """格式以后可能再变；读的一侧认旧的，写的一侧只写新的。"""
+        with open(self.target, "w", encoding="utf-8") as fp:
+            json.dump([{"id": "x", "sender": "admin"}], fp)
+        self.assertEqual(["x"], [row["id"] for row in gifthistory.load()])
 
 
 class AdminPromotePlayerTests(_AdminCase):

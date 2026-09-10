@@ -198,7 +198,8 @@ X-Forwarded-For  →  X-Real-IP  →  TCP 对端
 ### 数据会自动备份，改坏了能回滚
 
 `server/data/` 下的**全部 json**（账号存档 `accounts.json` + 物品库 / 商店货架 /
-合成配方 / 材料掉落 / 金币经验）每天到 `config/server.config` 的 `backup_time`
+合成配方 / 材料掉落 / 金币经验 + 发奖记录 `gift_history.json`）每天到
+`config/server.config` 的 `backup_time`
 （默认凌晨 4 点，
 服务器本地时间）原样拷一份到 `server/data/backups/<时刻-类型>/`，早于
 `backup_keep_days`（默认 7）天的自动删掉，`0` = 永不自动删除。服务端在那个时刻

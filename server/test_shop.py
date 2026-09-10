@@ -876,6 +876,45 @@ class PacketTests(_ShopCase):
         ids = [_Wire(record).i32() for record in records]
         self.assertEqual([shop.VOUCHER_EXP, shop.VOUCHER_MONEY], ids)
 
+    def test_礼物带上物品说明_提示框那两块才有字(self):
+        """★ 礼物盒的提示框（`UiShopToolTip`）下半那两块画的是 **`ShopStock+0x18`**，
+        **不是** `ItemInfo+0x18`（§77）—— 留空的话玩家看到两个空绿框，而同一个框里的
+        等级 / 角色 / 修理次数照样是对的（那三行才走 `ItemInfo`）。
+        说明和**货架**提示框同一个来源，不另写一套（铁律 12）。"""
+        weapon = 1120041                       # 小表里那把左轮：有武器数值 ⇒ 说明非空
+        want = shopcfg.item_desc_zh(shopdata.get(weapon))
+        self.assertTrue(want, "这件武器本来就该有说明，换个 id 再钉这条用例")
+        wire = _Wire(shop.build_gift({"id": 1, "item": weapon, "count": 1},
+                                     lambda i: "左轮 R1"))
+        parsed = self.parse_gift(wire)
+        wire.done()
+        self.assertEqual(want, parsed["note"])
+        # 客户端按 `|` 切、**只画前 2 段**（`0x45c4c9` 的 `cmp i,2`）⇒ 不许超过 2 段。
+        self.assertLessEqual(parsed["note"].count(shopcfg.DESC_SEPARATOR), 1)
+
+    def test_经验金币礼物的说明和它们的定义是同一句(self):
+        """凭证在两个提示框里各读一个字段（`ItemInfo+0x18` / `ShopStock+0x18`），
+        两处必须是同一句话 —— 抄第二遍迟早改一处忘一处。"""
+        for gift in ({"id": 1, "item": 0, "exp": 500},
+                     {"id": 2, "item": 0, "money": 3000}):
+            wire = _Wire(shop.build_gift(gift))
+            parsed = self.parse_gift(wire)
+            wire.done()
+            self.assertEqual(shop.VOUCHER_DESC, parsed["note"], gift)
+        # `0x0501` 那一份也是它。
+        record = shop.voucher_item_info(shop.VOUCHER_EXP)
+        self.assertIn(shop.VOUCHER_DESC.encode("utf-16le"), record)
+
+    def test_说明可以由调用方顶掉_但默认不再是空串(self):
+        gift = {"id": 1, "item": 1120041, "count": 1}
+        wire = _Wire(shop.build_gift(gift, note="自己写的一句"))
+        self.assertEqual("自己写的一句", self.parse_gift(wire)["note"])
+        wire.done()
+        # 显式空串仍旧发空串（探针要发空的时候得发得出去）。
+        wire = _Wire(shop.build_gift(gift, note=""))
+        self.assertEqual("", self.parse_gift(wire)["note"])
+        wire.done()
+
     def test_礼物动作请求和应答(self):
         self.assertEqual((7, shop.GIFT_ACTION_OPEN),
                          shop.parse_gift_action(struct.pack("<ii", 7, 2)))

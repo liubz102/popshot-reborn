@@ -2847,3 +2847,82 @@ i32         礼物 id  +0x4c  → 0x0609 回发的就是它（0x46359d 读 [gift
 礼物盒打得开、8 格 + 翻页、礼物槽 / 接收弹窗 / 合并弹窗都画出来了，发送人 GM、日期 `2026/9/10`、
 留言都对 ⇒ `Gift` 线格式和 `0x0508` **✅**；露出来两处：数量字段填 0（上面已改）、材料图标查错表
 （hook 补了）。领取 / 丢弃 / `0x0507` 还没看到结果（X-66）。
+
+## §76 ★ 管理页的界面验证：Claude 的浏览器面板**立不起会话**，别在登录上耗时间（2026-09-10 实测）
+
+**结论**：`mcp__Claude_Browser__*` 那个面板把页面套在一个跨站 iframe 里，
+**cookie 罐是只读的** —— 登录接口返回 200、`Set-Cookie` 收不下，
+`document.cookie = "..."` 写进去也没反应（读得到旧值，写不进新值）。
+于是每一发都还带着上一台服务器留下的死令牌，`/admin/api/session` 永远
+`logged_in: false`，页面卡在登录框。**和 `SameSite` 无关**：改成 `Lax` 一样不行。
+
+**验管理页界面的正确姿势**（别改 `server/web/admin.py` 去迁就面板）：
+
+1. 用户的正式服务端和游戏客户端可能正开着 —— **不要 `stop.bat`**，
+   另起一台**临时**服务端：临时 `data` 目录（`shopcfg.DATA_DIR`）+ 空闲端口，
+   照 `test_web_admin._AdminCase` 那套拼（`AccountStore` + `shopcfg.ensure_files`
+   + `databackup.BackupService` + `web_server.make_server`）。
+2. 在那个**一次性脚本**里 monkeypatch 掉身份：
+   `web_admin.AdminRoutes._admin_identity = lambda self: ("admin", "system")`。
+   仓库里的代码一个字不改。
+3. 数据用 `urllib` 直接打接口造（发几次奖励）。
+
+**另一半坑**：用户在全屏玩游戏时 Claude 的窗口被遮住，
+`computer{action:"screenshot"}` 直接超时、`left_click` 报「viewport 0x0」。
+这时候**照样能验**，而且比截图更硬：
+
+- `read_page` / `get_page_text` 看结构和文案；
+- `javascript_tool` 里 `.click()` 驱动页面、`getBoundingClientRect()` 读**实际布局**
+  （「两个钮在不在最右端、顺序对不对」用左右边界的数字判，比看图准）。
+
+⇒ 「看不了截图」不是「验不了」。**别拿「代码写对了」当验收，也别为截图去打断用户。**
+
+## §77 ★★★ 礼物盒的提示框读的是 `Gift` 自带那份 `ShopStock` 的说明，**不是** `ItemInfo+0x18`（2026-09-10 实机 + 🔍静态）
+
+**现象**（用户实机截图）：礼物盒里的装备鼠标指上去，提示框**弹得出来**、
+标题 / 图标 / `★Lv.18 以上` / `泰尔专用` / `修理次数无限制` **全对**，
+但下半那**两个绿框空的**。
+
+**结论**：那两个框画的是 **`Gift+0x04` 那份 `ShopStock` 的说明字段**
+（`ShopStock+0x18`），我们一直发的是空串（`build_gift` 的 `note=""` 默认值）。
+
+**链路**（全静态逆出，`tools/re_bs.py`）：
+
+| 地址 | 干什么 |
+|---|---|
+| `UiGiftStockTab::Update` `0x44b84f`（vft+0x0c）| 按 `[tab+0xf8]×8` 定位这一页的 `Gift`（步长 **0x54**）；`test byte [gift+0x48],1` —— **未打开的礼物喂空清单**（框直接隐藏），打开过的 `lea edi,[gift+4]` 把那份 `ShopStock` 现造成 `ShopStockGroupItem`（`0x44b11b`）|
+| `0x45bc53` | `UiShopToolTip::SetStockList` —— 存进 `+0xcc`（`vector<ShopStockGroupItem>` 的 begin） |
+| `UiShopToolTip::Draw` `0x45c254` | `begin == end` 就隐藏；`0x45c302` 取 `ebx = &elem[0]` |
+| `0x45c308` | `cmp [ebx+0x14], 0; jle 0x45c485` ⇒ **价格 ≤ 0 整段价格行跳过**（礼物价格是 0，所以框里没有价格 —— 这是对的，不是 bug）|
+| `0x45c485` | `lea eax,[ebx+0x20]` 按 `\|`（`0x668274`）切开，**最多画 2 段**（`0x45c4c9` 的 `cmp i,2`）|
+
+`ShopStockGroupItem` 一个元素 **0x34 字节**（`0x448b89` 的 `idiv 0x34` 钉死）：
+`+0x00` vft、`+0x04` 档位名 wstr、`+0x08` 起是内嵌的 `ShopStock`
+⇒ **itemId `+0x0c` / 名字 `+0x10` / 价格 `+0x14` / 划线原价 `+0x18` / 货币 `+0x1c` / 说明 `+0x20`**。
+
+**★ 为什么这个 bug 特别迷惑**：同一个框里的 **等级 / 角色 / 修理次数**走的是
+`ItemInfo`（按 itemId 查 `[0x72e1dc]`，`0x0501` 填的），那份我们一直发得好好的
+⇒ 框「弹出来了、有一半是对的、就是没字」，很容易往「客户端没收到定义」上想。
+
+**★ 三个提示框是三个类，读的字段各不相同**（别再混）：
+
+| 类 | 谁在用 | 说明取自 |
+|---|---|---|
+| `UiShopToolTip` `0x668dc4` | 商店货架 · **礼物盒** | `ShopStock+0x18`（**包里带的**）|
+| `UiCabinetToolTip` `0x6681ec` | 仓库格子 | `ItemInfo+0x18`（`0x454b23` 拿 `CabinetItem+4` 查 `[0x72e1dc]`）|
+| `UiCompositionToolTip` `0x669154` | 合成 | 同上一路 |
+
+三个都是「按 `\|` 切、最多 2 段」；`ItemInfo2Txt` 那第三个标签不参与切分。
+
+**修法**：`shop.gift_note()` —— 和**货架**同一个来源 `shopcfg.item_desc_zh()`，
+不给礼物另写一套文案（铁律 12）；经验 / 金币凭证用 `shop.VOUCHER_DESC`，
+和它们 `ItemInfo` 里那句是**同一个常量**（两个字段、一句话）。
+`build_gift(note=None)` **默认现算**，不是让调用方记得传 —— 这个 bug 的成因
+恰恰是「多一个可选参数、唯一的调用方没传」。显式传 `note=""` 仍旧发空串（探针要用）。
+
+**★ 还空着的（不是这个 bug）**：**材料**（珠子 / 矿料这类）`item_desc_zh` 本来就返回空串
+（`KIND_USAGE_ZH` 里没有 `material` 这一档），所以它们在**合成 / 仓库 / 礼物盒三处都是空的**
+—— 是「材料从来没有说明」，不是礼物盒漏发。要不要给材料写一句由用户定。
+
+**验证状态**：单测两套运行时全绿（新增 3 项，钉住「礼物带说明」「凭证两处同一句」
+「调用方仍能顶掉」）。⏳ **实机还没看**（X-68）—— 服务端改了要 `stop.bat` → `start.bat`。

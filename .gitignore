@@ -118,6 +118,14 @@
 /server/data/drops.json.*.tmp
 /server/data/rewards.json
 /server/data/rewards.json.*.tmp
+# gift_history.json：管理页「批量发送奖励」的发送记录（server/gifthistory.py）。
+# 它是**运行时记录**，不是配置也不是产物 —— 谁在什么时候给谁发了什么，
+# 每台服务器各是各的，进仓库没有意义（而且名单里全是玩家的账号名和昵称）。
+# ★ 打包也带不出去：包里的 server\data 是空目录，Assert-PackageDataClean 守着。
+/server/data/gift_history.json
+/server/data/gift_history.json.*.tmp
+# 记录文件读不动时 gifthistory 会把它挪到一边留着（不直接覆盖）。
+/server/data/gift_history.json.bad-*
 # `shop-backfill apply` 写盘前留下的那一份原件（shopcfg.backfill_defaults）。
 /server/data/*.bak-*
 # 管理页「数据备份」的备份目录（databackup.py）：每份一个子目录，里面是

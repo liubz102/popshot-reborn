@@ -3720,6 +3720,210 @@ async function sendReward() {
   if (result.ok) { closeRewardModal(); }
 }
 
+/* ======================================================================
+   发送记录（用户 2026-09-10 第二轮）
+
+   「玩家仓库」工具条上「发送记录」点开的翻账窗：左栏是发过的每一次
+   （发送时间 + 发送者），点一条右栏画那一次的详细；左栏上方一个「清空记录」。
+   数据来自 `/admin/api/reward/history`，落在服务端的
+   `server/data/gift_history.json`（`server/gifthistory.py`）。
+
+   ★ 整窗**只读** —— 除了「清空记录」不改任何东西，所以点遮罩 / Esc 都能关。
+   ★ 时间是**服务端**格式化好的 `time_text`：管理员和服务器不一定在同一个时区，
+     而「那一次是几点发的」说的是服务器上的几点（数据备份页同一个口径）。
+   ====================================================================== */
+var HISTORY = null;   // {records: [...], picked: 记录 id}
+
+async function openHistoryModal() {
+  HISTORY = {records: [], picked: null};
+  $("historyModal").classList.remove("hidden");
+  $("historyCount").textContent = "";
+  $("historyTally").textContent = "读取中……";
+  $("historyList").textContent = "";
+  renderHistoryDetail();
+  await loadHistory();
+}
+
+function closeHistoryModal() {
+  HISTORY = null;
+  $("historyModal").classList.add("hidden");
+  $("historyList").textContent = "";
+  $("historyDetail").textContent = "";
+}
+
+/** 读一遍记录。`keep` = 读完还想停在哪一条（清空之后传 null）。 */
+async function loadHistory(keep) {
+  if (!HISTORY) { return false; }
+  var result = await api("/admin/api/reward/history");
+  if (bounced(result)) { return false; }
+  if (!HISTORY) { return false; }              // 等回包期间弹窗被关了
+  if (!result.ok) {
+    toast((result && result.message) || "读不到发送记录", false);
+    return false;
+  }
+  HISTORY.records = result.records || [];
+  // 默认停在最新的那一条 —— 打开就想看的十有八九是刚发的那次。
+  var want = keep === undefined ? (HISTORY.records[0] || {}).id : keep;
+  HISTORY.picked = historyById(want) ? want : ((HISTORY.records[0] || {}).id || null);
+  $("historyCount").textContent = HISTORY.records.length
+    ? HISTORY.records.length + " 次发送" : "";
+  $("historyTally").textContent = HISTORY.records.length
+    ? "共 " + HISTORY.records.length + " 次（最多留 " + result.max + " 次）"
+    : "还没有记录";
+  renderHistoryList();
+  renderHistoryDetail();
+  return true;
+}
+
+function historyById(id) {
+  var found = null;
+  (HISTORY.records || []).forEach(function (row) {
+    if (row.id === id) { found = row; }
+  });
+  return found;
+}
+
+function renderHistoryList() {
+  var host = $("historyList");
+  var keepTop = host.scrollTop;
+  host.textContent = "";
+  if (!HISTORY.records.length) {
+    host.appendChild(el("div", "own-empty", "还没发过奖励"));
+    return;
+  }
+  HISTORY.records.forEach(function (row) {
+    var line = el("div", "history-row" + (row.id === HISTORY.picked ? " on" : ""));
+    line.appendChild(el("div", "when", row.time_text || row.id));
+    line.appendChild(el("div", "who", "发送者：" + (row.sender || "（不详）")));
+    line.appendChild(el("div", "what", historyGist(row)));
+    line.onclick = function () {
+      HISTORY.picked = row.id;
+      renderHistoryList();
+      renderHistoryDetail();
+    };
+    host.appendChild(line);
+  });
+  host.scrollTop = keepTop;
+}
+
+/** 列表里那一行的第三句：「3 名玩家 · 5 样奖励」。 */
+function historyGist(row) {
+  return (row.players || []).length + " 名玩家 · "
+       + (row.rewards || []).length + " 样奖励";
+}
+
+/** 一样奖励的名字。物品名存的是**发送那一刻**的（服务端写死在记录里），
+    不拿 `itemName()` 现查 —— 那件东西今天可能已经改名或从物品库里删了。 */
+function historyRewardName(reward) {
+  if (reward.kind === "exp") { return "经验"; }
+  if (reward.kind === "money") { return "金币"; }
+  return reward.name || ("#" + reward.id);
+}
+
+/** 「奖励物品」那一格：图标 + 名字 + ×N。 */
+function historyRewardNode(reward) {
+  var box = el("div", "own");
+  if (reward.kind === "item") {
+    box.appendChild(slotNode(reward.id, 26, false, false));
+  } else {
+    // 经验 / 金币在礼物里走的是**凭证**（D76）：物品表里根本不存在这两个 id，
+    // 图集里自然也没有图标 —— 拿一个字顶上，别画成「?」让人以为图挂了。
+    var slot = el("div", "slot");
+    slot.style.width = "30px";
+    slot.style.height = "30px";
+    slot.appendChild(el("div", "noicon zh", reward.kind === "exp" ? "经" : "币"));
+    box.appendChild(slot);
+  }
+  var col = el("div", "col");
+  col.appendChild(el("div", "nmz", historyRewardName(reward)));
+  col.appendChild(el("div", "meta", reward.kind === "item" ? "#" + reward.id : "每人一份"));
+  box.appendChild(col);
+  box.appendChild(el("span", "fixed", "×" + reward.count));
+  return box;
+}
+
+/** 名单里的一个人。发失败 / 有跳过的，把原因写在名字后面。 */
+function historyPlayerChip(player) {
+  var bad = !player.ok || !player.gifts;
+  var chip = el("span", "chip" + (bad ? " bad" : ""),
+                (player.nickname || player.username) + "（" + player.username + "）");
+  var note = "";
+  if (!player.ok) {
+    note = "没发出去：" + (player.error || "原因不详");
+  } else if (!player.gifts) {
+    note = "一份都没发（全被跳过）";
+  } else if ((player.skipped || []).length) {
+    note = "跳过 " + player.skipped.map(function (item) {
+      return item.name || ("#" + item.id);
+    }).join("、");
+  }
+  if (note) { chip.appendChild(el("span", "note", "· " + note)); }
+  return chip;
+}
+
+function renderHistoryDetail() {
+  var host = $("historyDetail");
+  host.textContent = "";
+  var row = HISTORY && HISTORY.picked ? historyById(HISTORY.picked) : null;
+  if (!row) {
+    host.appendChild(el("div", "own-empty",
+                        HISTORY && HISTORY.records.length
+                          ? "点左边的一条记录看详细"
+                          : "还没有发送记录 —— 发过一次「批量发送奖励」就会记在这里"));
+    return;
+  }
+  var meta = el("dl", "history-meta");
+  [["发送时间", row.time_text || row.id],
+   ["发送者", row.sender || "（不详）"],
+   ["留言", row.message || ""],
+   ["结果", row.summary || ""]].forEach(function (pair) {
+    if (!pair[1]) { return; }
+    meta.appendChild(el("dt", null, pair[0]));
+    meta.appendChild(el("dd", null, pair[1]));
+  });
+  host.appendChild(meta);
+
+  var players = row.players || [];
+  var block = el("div", "history-sec");
+  var head = el("h3", null, "奖励玩家名单");
+  head.appendChild(el("span", "n", "（" + players.length + " 人）"));
+  block.appendChild(head);
+  var chips = el("div", "chips");
+  if (!players.length) { chips.appendChild(el("div", "own-empty", "（没有名单）")); }
+  players.forEach(function (player) { chips.appendChild(historyPlayerChip(player)); });
+  block.appendChild(chips);
+  host.appendChild(block);
+
+  var rewards = row.rewards || [];
+  var items = el("div", "history-sec");
+  var head2 = el("h3", null, "奖励物品");
+  head2.appendChild(el("span", "n", "（" + rewards.length + " 样，每人各一份）"));
+  items.appendChild(head2);
+  var grid = el("div", "own-grid");
+  if (!rewards.length) { grid.appendChild(el("div", "own-empty", "（没有奖励）")); }
+  rewards.forEach(function (reward) { grid.appendChild(historyRewardNode(reward)); });
+  items.appendChild(grid);
+  host.appendChild(items);
+  host.scrollTop = 0;
+}
+
+/** 「清空记录」：先弹确认框（红钮）。★ 只删记录，礼物盒里的东西一件都不动。 */
+async function clearHistory() {
+  if (!HISTORY) { return; }
+  if (!HISTORY.records.length) { toast("本来就没有记录", true); return; }
+  var ok = await ask({
+    title: "清空发送记录",
+    lead: "把保存的 " + HISTORY.records.length + " 条发送记录全部删掉，删了找不回来。\n"
+          + "已经发出去的礼物不受影响 —— 它们还在玩家的礼物盒里。",
+    ok: "清空", danger: true
+  });
+  if (!ok || !HISTORY) { return; }
+  var result = await api("/admin/api/reward/history/clear", {});
+  if (bounced(result)) { return; }
+  toast(result.message, result.ok);
+  if (result.ok) { await loadHistory(null); }
+}
+
 /** 物品表（`/admin/api/catalog`）：登录后拿一次，玩家弹窗的刷新再拿一次。 */
 async function loadCatalog() {
   var result = await api("/admin/api/catalog");
@@ -4052,6 +4256,16 @@ function wire() {
   });
   $("rewardSend").onclick = function () { sendReward(); };
 
+  // 发送记录弹窗（用户 2026-09-10 第二轮）。整窗只读 ⇒ 点遮罩就能关，
+  // Esc 也认（下面那个 keydown 里）—— 和 `#rewardModal` 相反，那里面
+  // 是勾了一半的人和东西，误关一次代价太大。
+  $("rewardHistoryBtn").onclick = function () { openHistoryModal(); };
+  $("historyClose").onclick = closeHistoryModal;
+  $("historyModal").onclick = function (event) {
+    if (event.target === $("historyModal")) { closeHistoryModal(); }
+  };
+  $("historyClear").onclick = function () { clearHistory(); };
+
   $("pickSearch").oninput = function () {
     PICKER.q = $("pickSearch").value.trim();
     paintPicker();
@@ -4105,8 +4319,9 @@ function wire() {
       return;
     }
     if (event.key === "Escape" && PICKER) { closePicker(); return; }
-    // 只读那一张（D72b）排最后：它不会盖在选择器上面。
-    if (event.key === "Escape" && LEVEL_MODAL) { closeLevelModal(); }
+    // 只读那两张排最后：它们不会盖在选择器上面。
+    if (event.key === "Escape" && LEVEL_MODAL) { closeLevelModal(); return; }
+    if (event.key === "Escape" && HISTORY) { closeHistoryModal(); }
   });
 
   $("addAdmin").onclick = async function () {

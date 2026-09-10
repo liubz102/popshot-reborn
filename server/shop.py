@@ -1090,13 +1090,18 @@ def is_voucher(item_id):
         return False
 
 
+#: 凭证的说明。★ `ItemInfo+0x18`（仓库那档提示框）和礼物 `ShopStock+0x18`
+#: （礼物盒那档提示框）**是两个字段、同一句话**，所以提成一个常量。
+VOUCHER_DESC = "管理员发放的奖励，领取后直接到账"
+
+
 def voucher_item_info(item_id):
     """凭证的 `ItemInfo`：形态标志 0（接收弹窗括号里落在「无期限」那一档）、
     不可装备、不限角色、不限等级。"""
     item_id = int(item_id)
     return build_item_info(item_id, name=VOUCHER_NAMES[item_id], flags=0,
                            level=0, character=CHARACTER_UNLIMITED,
-                           desc="管理员发放的奖励，领取后直接到账")
+                           desc=VOUCHER_DESC)
 
 
 def gift_item_id(gift):
@@ -1139,7 +1144,20 @@ def build_systemtime(sent):
                        when.day, when.hour, when.minute, when.second, 0)
 
 
-def build_gift(gift, item_name=None, note=""):
+def gift_note(gift):
+    """礼物提示框下半那两块（`Gift` 里那份 `ShopStock+0x18`）。
+
+    ★ **和货架提示框同一个来源**（`shopcfg.item_desc_zh`，见 `build_rep_shop_item_list`）
+    —— 不是给礼物另写一套文案（铁律 12）。经验 / 金币凭证走 `VOUCHER_DESC`，
+    和它们 `ItemInfo` 里那句是同一个常量。
+    """
+    item_id = gift_item_id(gift)
+    if is_voucher(item_id):
+        return VOUCHER_DESC
+    return shopcfg.item_desc_zh(shopdata.get(item_id))
+
+
+def build_gift(gift, item_name=None, note=None):
     """一份礼物（`Gift`，Ser `0x44381a` / Des `0x443868`，内存 0x54）。
 
     | 线上 | 结构偏移 | 含义 |
@@ -1156,8 +1174,18 @@ def build_gift(gift, item_name=None, note=""):
     「（N个）」，合并弹窗拿它算「道具数量增加为 N 个」）—— 物品礼物填真实数量，
     凭证填 1（它的形态标志是 0，括号里不显示数量）。
     价格 / 划线原价一律 0（礼物没有价格），货币 0 = 金币。
+
+    ⚠⚠ **`note` 不给就自己现算**（`gift_note`），别再默认空串 —— 礼物盒里
+    鼠标指上去弹的那个提示框（`UiShopToolTip`，`UiGiftStockTab::Update`
+    `0x44b84f` 拿 `Gift+0x04` 那份 `ShopStock` 现造一个 `ShopStockGroupItem`
+    喂给它）下半那两块画的**就是这个字段**（`0x45c485` 按 `|` 切、最多 2 段），
+    **不是** `ItemInfo+0x18`。留空 = 两个绿框全空（用户 2026-09-10 实机，§77）。
+    ★ 同一个框里的 等级 / 角色 / 修理次数 走的才是 `ItemInfo`，所以那三行一直
+    是对的 —— 「有一半是对的」正是这个 bug 最迷惑的地方。
     """
     item_id = gift_item_id(gift)
+    if note is None:
+        note = gift_note(gift)
     count = int(gift.get("count") or 0) if int(gift.get("item") or 0) else 1
     stock = build_shop_stock(item_id, gift_display_name(gift, item_name),
                              price=0, list_price=0, note=note,

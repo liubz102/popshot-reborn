@@ -427,8 +427,12 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
      ⇒ **别自作主张压深**：它在米白上只有 2:1，比旁边那行说明字还淡，
      这是用户要的观感，不是漏了没调；同理**别把这支当正文字色的先例**
      —— 这里能成立，靠的是加粗 + 大一号 + 只有一两个字符。 */
+/* ★ 靠右**只在 `.tool-right` 上写一次** `margin-left:auto`（用户 2026-09-10
+   第二轮把两个钮也挪到了右端）。以前是 `.online-tally` 自己写的 —— 再给它
+   前面塞一个同样带 `auto` 的东西，flex 会把中间的空隙在两个 auto 之间
+   **平分**，钮和字就被拆到两处去了。 */
+.tool-right { display: flex; align-items: center; gap: 10px; margin-left: auto; }
 .online-tally {
-  margin-left: auto;
   color: var(--cocoa-soft); font-size: 13px; font-weight: 600;
   white-space: nowrap;
 }
@@ -887,6 +891,73 @@ code {
   flex: 1 1 auto; min-height: 0; overflow-y: auto; padding-right: 4px;
 }
 #rewardModal .own-grid { margin-bottom: 0; }
+
+/* ------------------------------------------ 发送记录弹窗（用户 2026-09-10 第二轮）
+   左右分屏：左栏「清空记录」条 + 发过的每一次（时间 / 发送者），右栏那一次的详细。
+   壳照发奖弹窗那套 —— 每栏各自只有列表 / 详细区滚，条钉住。
+   ★ 比发奖窗窄 140：左栏只放一行时间加一个名字，320 就够，宽度让给右栏的名单。 */
+#historyModal .panel { width: min(1100px, 100%); height: min(760px, 100%); }
+#historyModal .panel-body {
+  flex: 1 1 auto; min-height: 0;
+  overflow: hidden; display: flex; flex-direction: row; gap: 16px;
+}
+.history-left {
+  flex: 0 0 320px; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column;
+}
+.history-left > * { flex: 0 0 auto; }
+#historyModal .history-bar { margin-bottom: 10px; }
+.history-bar .pageno { font-size: 13px; color: var(--cocoa-soft); font-weight: 600; }
+.history-list {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  background: #fff; border: 2px solid var(--line); border-radius: 9px;
+}
+.history-row {
+  padding: 8px 11px; border-bottom: 1px solid var(--line);
+  cursor: pointer; font-size: 13px;
+}
+.history-row:last-child { border-bottom: 0; }
+.history-row:hover { background: #FFFBEF; }
+/* 选中那一条：底色 + 左边一道琥珀。★ 用 `box-shadow: inset` 而不是
+   `border-left` —— 后者会把这一行的内容往右推 4 px，点一下整列都在抖。 */
+.history-row.on { background: #FFF7E6; box-shadow: inset 4px 0 0 var(--amber); }
+.history-row .when { font-weight: 700; }
+.history-row .who { color: var(--cocoa-soft); font-size: 12px; margin-top: 2px; }
+.history-row .what { color: var(--cocoa-soft); font-size: 12px; margin-top: 2px; }
+.history-list .own-empty { padding: 14px 10px; }
+
+/* 右栏：一整块滚。里面是「时间 / 发送者 / 留言」三行 + 两个小节。 */
+.history-right {
+  flex: 1 1 auto; min-width: 0; min-height: 0; overflow-y: auto; padding-right: 4px;
+}
+.history-right .own-empty { padding: 24px 10px; }
+.history-meta {
+  display: grid; grid-template-columns: auto 1fr; gap: 6px 12px;
+  padding: 10px 12px; margin-bottom: 14px;
+  background: var(--paper-2); border: 2px solid var(--line); border-radius: 9px;
+  font-size: 13px;
+}
+.history-meta dt { color: var(--cocoa-soft); font-weight: 600; white-space: nowrap; }
+.history-meta dd { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+.history-sec { margin-bottom: 14px; }
+.history-sec > h3 {
+  margin: 0 0 8px; padding-bottom: 5px; font-size: 14px; color: var(--cocoa-soft);
+  border-bottom: 2px dashed var(--line);
+}
+.history-sec > h3 .n { margin-left: 6px; font-weight: 600; }
+/* 名单的 chip 不折叠（旧账要看全），所以这一处解开 `.chips` 的 96 px 上限。 */
+.history-sec .chips { max-height: none; }
+/* 一次没发成 / 被跳过的人：说清楚是哪一种，别只画个名字让人以为都发到了。 */
+.chip.bad { border-color: var(--crimson); color: var(--crimson-dk); }
+.chip .note { color: var(--cocoa-soft); font-weight: 600; }
+.chip.bad .note { color: var(--crimson-dk); }
+/* 奖励物品那一格：图标 + 名字 + 「×N」，比仓库那一格窄一档（没有数字框和 ✕）。 */
+.history-sec .own-grid { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
+.history-sec .own .fixed { font-size: 12px; color: var(--cocoa-ink); }
+/* 经验 / 金币是凭证（D76），物品表里没有它们、图集里也没有图标 —— 格子里
+   顶一个汉字。`.noicon` 那 20 px 是给「?」定的，一个汉字要小一档才塞得下。 */
+.slot .noicon.zh { font-size: 13px; }
+
 /* 装备类那一格右边写死的「×1」：和数字框一样不许被压扁。 */
 .own .fixed { flex: 0 0 auto; font-size: 12px; font-weight: 700; color: var(--cocoa-soft); }
 /* 分类标签：大分类一行（照商店标签的样子缩小一号），小分类一行（金色）。 */

@@ -26,6 +26,10 @@
     GET  /admin/api/players?q=名字&page=0&online=all|on|off  找玩家（一页 10 行）★系统
     GET  /admin/api/player?name=alice  一个玩家的可编辑资料                 ★系统
     POST /admin/api/player            {name, level, money, ...}             ★系统
+    GET  /admin/api/reward/players?q=名字&online=all|on|off  发奖弹窗左栏的名单 ★系统
+    POST /admin/api/reward/send       {players, items, exp, money, message}  ★系统
+    GET  /admin/api/reward/history    发奖记录：{ok, records, max}           ★系统
+    POST /admin/api/reward/history/clear  清空发奖记录                       ★系统
     GET  /admin/api/backups           数据备份：{settings, status, backups, online, playing} ★系统
     POST /admin/api/backups/settings  {enabled, time, keep_days} 写回 server.config，即刻生效 ★系统
     POST /admin/api/backups/create    {label}  立刻备份一份（手动）              ★系统
@@ -120,6 +124,7 @@ import account_store
 import cfgmerge
 import databackup
 import eventlog
+import gifthistory
 import shop
 import shopcfg
 import shopdata
@@ -772,6 +777,51 @@ def _reward_summary(results, total, pushed):
     return "；".join(parts)
 
 
+def _reward_rows(specs):
+    """礼物规格 → 发奖记录里的「奖励物品」那一栏。
+
+    ★ 物品名在**这一刻**查好存进去（`gifthistory` 的开头写了为什么）：
+    翻旧账要的是「当时发出去的是什么」，不是「那个 id 今天叫什么」。
+    """
+    rows = []
+    for spec in specs:
+        item_id = spec.get("item")
+        if item_id:
+            rows.append({"kind": "item", "id": item_id,
+                         "name": shopcfg.item_name(item_id) or "#%d" % item_id,
+                         "count": int(spec.get("count") or 1)})
+        elif spec.get("exp"):
+            rows.append({"kind": "exp", "count": int(spec["exp"])})
+        elif spec.get("money"):
+            rows.append({"kind": "money", "count": int(spec["money"])})
+    return rows
+
+
+def _reward_record(sender, message, specs, results, summary):
+    """一次「确认发送奖励」→ 一条发奖记录（`gifthistory.append` 的载荷）。
+
+    名单里**每个人**都留一行，包括发失败和被跳过的 —— 记录要回答的是
+    「那一次到底谁拿到了什么」，只留成功的等于把最该查的那几行抹掉。
+    """
+    return {
+        "sender": sender,
+        "message": message,
+        "summary": summary,
+        "rewards": _reward_rows(specs),
+        "players": [{
+            "username": row["username"],
+            "nickname": row.get("nickname") or row["username"],
+            "ok": bool(row["ok"]),
+            "gifts": int(row["gifts"]),
+            "skipped": [{"id": item_id,
+                         "name": shopcfg.item_name(item_id) or "#%d" % item_id}
+                        for item_id in row["skipped"]],
+            "pushed": bool(row["pushed"]),
+            "error": "" if row["ok"] else row.get("message", ""),
+        } for row in results],
+    }
+
+
 def _player_view(username, account):
     """一个玩家的可编辑资料。名字 / 图标让前台自己按 `catalog()` 查。
 
@@ -964,6 +1014,9 @@ class AdminRoutes:
         if path == "/admin/api/reward/players":
             self._admin_reward_players(query)
             return True
+        if path == "/admin/api/reward/history":
+            self._admin_reward_history()
+            return True
         if path == "/admin/api/backups":
             self._admin_backups_get()
             return True
@@ -991,6 +1044,9 @@ class AdminRoutes:
             return True
         if path == "/admin/api/reward/send":
             self._admin_reward_send(data)
+            return True
+        if path == "/admin/api/reward/history/clear":
+            self._admin_reward_history_clear()
             return True
         if path.startswith("/admin/api/backups/"):
             self._admin_backup(path.rsplit("/", 1)[-1], data)
@@ -1744,10 +1800,12 @@ class AdminRoutes:
         for username in players:
             _name, account = self.accounts.get_account(username)
             if account is None:
-                results.append({"username": username, "ok": False,
+                results.append({"username": username, "nickname": username,
+                                "ok": False,
                                 "message": "没有这个账号", "gifts": 0,
                                 "skipped": [], "pushed": False})
                 continue
+            nickname = account_store.display_name(account)
             owned = account_store.inventory_items(account)
             mine, skipped = [], []
             for spec in specs:
@@ -1763,18 +1821,56 @@ class AdminRoutes:
                         username, mine, sender=account_store.GIFT_SENDER_GM,
                         message=message)
                 except account_store.AccountError as error:
-                    results.append({"username": username, "ok": False,
+                    results.append({"username": username, "nickname": nickname,
+                                    "ok": False,
                                     "message": error.message, "gifts": 0,
                                     "skipped": skipped, "pushed": False})
                     continue
             told = _notify_gift(username) if created else False
             total += len(created)
             pushed += 1 if told else 0
-            results.append({"username": username, "ok": True,
+            results.append({"username": username, "nickname": nickname,
+                            "ok": True,
                             "gifts": len(created), "skipped": skipped,
                             "pushed": told})
         summary = _reward_summary(results, total, pushed)
         eventlog.online(f"[admin] {admin!r} 发奖励 {[s for s in specs]} 留言={message!r}："
                         f"{summary}")
+        # 发奖记录（用户 2026-09-10 第二轮）：礼物已经进了别人的礼物盒，
+        # 这一条**追记**下来即可 —— 记不下来不该让已经发出去的奖励算失败，
+        # 所以只警告一行，回执照常是成功。
+        try:
+            gifthistory.append(
+                _reward_record(admin, message, specs, results, summary),
+                log=eventlog.online)
+        except (IOError, OSError) as error:
+            eventlog.online(f"⚠ [admin] 发奖记录写不进去（{error}）；奖励已经发出去了")
         self._send_json({"ok": True, "message": summary, "total": total,
                          "results": results})
+
+    def _admin_reward_history(self):
+        """`GET /admin/api/reward/history` —— 发过哪几次（新的在前）。★ 系统管理员专用。"""
+        if self._require_system_admin() is None:
+            return
+        # 时间在**服务端**格成人话（和数据备份页同一个口径）：管理员和服务器
+        # 不一定在同一个时区，而「那一次是几点发的」说的是**服务器上**的几点。
+        records = []
+        for row in gifthistory.load(log=eventlog.online):
+            row = dict(row)
+            row["time_text"] = databackup.format_time(row.get("time") or 0)
+            records.append(row)
+        self._send_json({"ok": True, "max": gifthistory.HISTORY_MAX,
+                         "records": records})
+
+    def _admin_reward_history_clear(self):
+        """`POST /admin/api/reward/history/clear` —— 把发奖记录全删掉。★ 系统管理员专用。
+
+        只删**记录**：已经发出去的礼物还躺在玩家的礼物盒里，这里碰不到它们。
+        """
+        admin = self._require_system_admin()
+        if admin is None:
+            return
+        count = gifthistory.clear(log=eventlog.online)
+        eventlog.online(f"[admin] {admin!r} 清空发奖记录，删掉 {count} 条")
+        self._reply(True, f"已清空发送记录（{count} 条）" if count else "本来就没有记录",
+                    count=count)

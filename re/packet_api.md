@@ -2189,6 +2189,23 @@ i32    礼物 id       -> 0x0609 回发的就是它
 处理器 `0x44798d` 把清单整份换进 `[ShopStage+0x104]`，不认识的 id 会再发一发定义请求 ⇒ **先发 `0x0501` 再发它**。
 礼物页 8 格一页、自带翻页。组包：`server/shop.py: build_gift / build_rep_gift_list`。
 
+⚠⚠ **`Gift` 里那份 `ShopStock` 的「说明」不是死字段** —— 礼物盒里鼠标指上去弹的那个提示框
+（**`UiShopToolTip`**，和商店货架**同一个类**）下半那两块画的**就是它**，
+**不是** `ItemInfo+0x18`（V0.3商店 §77，2026-09-10 实机）：
+
+* `UiGiftStockTab::Update`（`0x44b84f`，vft+0x0c）按页号 `[tab+0xf8]×8` 找到这一格的 `Gift`，
+  `test byte [gift+0x48], 1` —— **未打开的礼物喂空清单**（提示框直接隐藏），打开过的把
+  `gift+0x04` 那份 `ShopStock` 现造成一个 `ShopStockGroupItem`（`0x44b11b`）喂给提示框（`0x45bc53`）；
+* `UiShopToolTip::Draw`（`0x45c254`）：`ShopStockGroupItem` 元素 0x34 字节，
+  `+0x14` 价格 / `+0x18` 划线原价 / **`+0x20` 说明**（= `ShopStock+0x18` 再偏 8）。
+  **`价格 <= 0` 时整段价格行跳过**（`0x45c30c`）⇒ 礼物（价格 0）不显示价格，这是对的；
+  说明在 `0x45c485` 按 `|` 切、**最多画 2 段**（`0x45c4c9` 的 `cmp i,2`）。
+* 同一个框里的 **等级 / 角色限定 / 修理次数**走的是 `ItemInfo`（按 itemId 查 `[0x72e1dc]`）
+  ⇒ **说明留空时那三行照样是对的**，看起来「弹出来了、就是里面没字」。
+
+⇒ 服务端发礼物**必须把说明填进这份 `ShopStock`**（`shop.gift_note()`，和货架同一个来源
+`shopcfg.item_desc_zh`；经验 / 金币凭证用 `shop.VOUCHER_DESC`）。
+
 #### `0x0609` gcpReqGiftAction（客户端 → 服务端）/ `0x050a` gspRepGiftAction（Des `0x443b9e`，处理器 `0x448072`）
 
 `0x0609` = `i32 礼物id + i32 动作`（Ser `0x54cfa0`）：**2** 打开看看（槽上点「领取」先发，`0x46356a`）、
