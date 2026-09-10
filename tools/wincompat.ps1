@@ -391,6 +391,41 @@ function Get-ProcessIdListText {
     return ((@($Processes) | ForEach-Object { $_.Id }) -join ',')
 }
 
+function Format-ProcessIdentityText {
+    <#
+        一个进程对象 -> 「pid=43000 用户=PC01\小明 路径=D:\...\BigShot.exe」。
+
+        ★ 为什么要有它：「这个进程杀不掉」的时候，属主和 exe 路径是唯一能分辨
+          「上次是提权跑的」/「另一个账户起的」/「点的是开始菜单那份带 GameGuard
+          的只读原版」的事实。光有一个 pid 只能跟玩家来回猜。
+
+        ★ 别用 $Process.Path：那个访问器走 MainModule，要
+          PROCESS_QUERY_INFORMATION | VM_READ —— 「进程提权了而我们没提权」时它
+          自己就抛「拒绝访问」，而那恰恰是唯一需要它的场景。Win32_Process 走 WMI
+          （服务是 SYSTEM 在跑），同样的场景读得到。
+
+        ★ Get-WmiObject 而不是 Get-CimInstance：后者是 PowerShell 3.0 才有的，
+          Win7 SP1 出厂自带的 2.0 上没有。
+
+        读不到就写「<读不到>」，绝不往外抛 —— 调用方全在错误路径上，
+        这时候再炸一次只会把真正的原因盖掉。
+    #>
+    param($Process)
+    if (-not $Process) { return '' }
+    $user = '<读不到>'
+    $path = '<读不到>'
+    $wmi  = $null
+    try { $wmi = Get-WmiObject Win32_Process -Filter "ProcessId=$($Process.Id)" -ErrorAction Stop } catch { }
+    if ($wmi) {
+        try {
+            $owner = $wmi.GetOwner()
+            if ($owner -and $owner.User) { $user = "$($owner.Domain)\$($owner.User)" }
+        } catch { }
+        if ($wmi.ExecutablePath) { $path = $wmi.ExecutablePath }
+    }
+    return "pid=$($Process.Id) 用户=$user 路径=$path"
+}
+
 function Format-ErrorLocationText {
     <#
         错误记录 -> 「位置 文件:行  语句」+「异常 类型」两行说明，给 launch.ps1 /

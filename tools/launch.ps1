@@ -457,13 +457,60 @@ $env:POPSHOT_LOCAL_REG_PORT    = $localReg
 # --- 5. 残留客户端 ----------------------------------------------------------
 # 互斥体 BigShot_Assa 决定了同时只能有一个实例，残留的会让新实例秒退，
 # 而那个现象非常像「注入被检测」—— 骗过我们一次了（V0.1 §9）。
-$old = Get-Process BigShot -ErrorAction SilentlyContinue
+$old = @(Get-Process BigShot -ErrorAction SilentlyContinue)
 if ($old) {
     # ★ 别写 `$old.Id -join ','`：数组的成员枚举是 PowerShell 3.0 才有的，
     #   2.0 上 `$数组.Id` 是 $null，日志里 pid 会变成空。
     Say "[客户端] 先清掉残留实例 pid=$(Get-ProcessIdListText $old)" 'Yellow'
-    $old | Stop-Process -Force
-    Start-Sleep -Milliseconds 500
+    # 「有残留」本身已经是不正常的路径了，所以这里可以放心去查属主 + exe 路径
+    # （WMI 一次上百毫秒，正常启动根本走不进这个 if）。路径能当场认出
+    # 「玩家点的是开始菜单里那份带 GameGuard 的只读原版」—— 杀成功了也值得知道。
+    $idTexts = @{}
+    foreach ($p in $old) {
+        $idTexts[$p.Id] = Format-ProcessIdentityText $p
+        Say "           $($idTexts[$p.Id])" 'DarkGray'
+    }
+    foreach ($p in $old) {
+        # ★ 这里必须自己接住错。Stop-Process 的失败本来是**非终止**错误，但本
+        #   脚本开头是 $ErrorActionPreference = 'Stop'（第 26 行），不接就直接
+        #   落进 trap —— 玩家只看到一句 ProcessCommandException 和「Access is
+        #   denied」，既不知道该干什么，也不知道该跟谁说（2026-09-10 实机）。
+        #   杀不掉的原因（提权 / 别的账户 / 安全软件 / GameGuard 驱动）脚本判断
+        #   不了，所以下面把事实摆给玩家，让他自己处理。
+        try {
+            Stop-Process -Id $p.Id -Force -ErrorAction Stop
+            # ★ 等的是「进程句柄变成已终止」这个事件本身，不是拍脑袋的毫秒数：
+            #   Stop-Process 只是发出终止请求，返回时互斥体可能还没放掉。
+            #   那个 10 秒不是判据，是防挂死的兜底（真卡在内核里等 I/O 的进程会
+            #   让无参 WaitForExit 永远不返回，控制台就那么冻住）；判据是下面
+            #   重新 Get-Process 的复核。拿不到 SYNCHRONIZE 权限时它会抛，
+            #   一样交给复核兜底。
+            try { [void]$p.WaitForExit(10000) } catch { }
+        } catch { }
+    }
+    # 判据是「还在不在」，不是「Stop-Process 报没报错」—— 报了错却自己退了、
+    # 没报错却还在，两种都见得到。
+    $left = @(Get-Process BigShot -ErrorAction SilentlyContinue)
+    if ($left) {
+        Say ''
+        Say '!! 残留的 BigShot.exe 结束不掉，启动中止：' 'Red'
+        foreach ($p in $left) {
+            $text = $idTexts[$p.Id]
+            if (-not $text) { $text = Format-ProcessIdentityText $p }
+            Say "     $text" 'Red'
+        }
+        Say '   （单实例互斥体 BigShot_Assa 还被它占着，硬拉新的也是秒退）' 'DarkGray'
+        Say '   处理办法，按顺序试：' 'Yellow'
+        Say '     1. Ctrl+Shift+Esc 打开任务管理器 →「详细信息」→ 选中 BigShot.exe → 结束任务；' 'Yellow'
+        Say '     2. 结束不掉就关了任务管理器，右键「以管理员身份运行」再来一次；' 'Yellow'
+        Say '     3. 还结束不掉就重启电脑 —— 这一步一定清得掉。' 'Yellow'
+        Say '   ★ 别改成「用管理员身份运行 start.bat」：那样拉起来的游戏也是管理员权限的，' 'Yellow'
+        Say '     下次正常启动照样卡在这儿，等于把毛病焊死。' 'Yellow'
+        Say '   常见原因：上次是用管理员身份启动的 / 安全软件拦着结束操作 / 从开始菜单那个' 'DarkGray'
+        Say '   原版快捷方式启动过（那份带 GameGuard，它的驱动不让别人结束它）。' 'DarkGray'
+        Say ''
+        exit 1
+    }
 }
 
 # --- 6. 拉起客户端 ----------------------------------------------------------

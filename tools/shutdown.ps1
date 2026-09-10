@@ -57,8 +57,16 @@ foreach ($name in @('BigShot', 'bsloader')) {
     if ($procs) {
         # ★ 别写 `$procs.Id -join ','`（数组成员枚举是 PowerShell 3.0 才有的）。
         Say "[客户端] 停止 $name pid=$(Get-ProcessIdListText $procs)" 'Yellow'
-        $procs | Stop-Process -Force -ErrorAction SilentlyContinue
-        $stopped += @($procs).Count
+        # ★ 逐个停、并且把失败原因打出来（和下面服务端那段一个待遇）。
+        #   以前这里是 `-ErrorAction SilentlyContinue`：杀不掉时原因被整个吞掉，
+        #   玩家只在最后看到一句「还有没停干净的：BigShot.exe」，不知道为什么，
+        #   也不知道该干什么。属主 + exe 路径就是那个「为什么」。
+        foreach ($p in @($procs)) {
+            try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; $stopped++ }
+            catch {
+                Say "         停不掉 $(Format-ProcessIdentityText $p) : $($_.Exception.Message)" 'Red'
+            }
+        }
     }
 }
 
@@ -102,6 +110,11 @@ if (Get-Process BigShot -ErrorAction SilentlyContinue) { $left += 'BigShot.exe' 
 Say ''
 if ($left) {
     Say "!! 还有没停干净的：$($left -join ', ')" 'Red'
+    if ($left -contains 'BigShot.exe') {
+        # 上面那句「停不掉 …」已经说了是谁、为什么；这里只补「那我该干嘛」。
+        Say '   BigShot.exe 结束不掉的话：Ctrl+Shift+Esc 打开任务管理器 →「详细信息」→' 'Yellow'
+        Say '   选中它 → 结束任务；不行就用管理员身份重开任务管理器，再不行就重启电脑。' 'Yellow'
+    }
     exit 1
 }
 if ($stopped -eq 0) {

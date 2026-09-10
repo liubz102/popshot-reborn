@@ -2747,3 +2747,51 @@ V0.1 那次 `0x09180000`），而且锁对象已经没了，跳过那两句写�
 的最后一份」当新加的那份），所以**下次再加第六份配置时自动跟着走**：
 `test_shopcfg.test_an_old_data_dir_only_gets_the_files_it_is_missing`、
 `test_backup.test_an_old_backup_without_the_newest_config_still_rolls_back`。
+
+---
+
+## §74 ★★ `$ErrorActionPreference='Stop'` 下，裸奔的 `Stop-Process` 会把「杀不掉一个进程」升格成「整个启动中止」（2026-09-10 玩家实机）
+
+**现场**：玩家跑 `start.bat`，服务端和中继都起来了，最后一句
+`[启动失败] Cannot stop process "BigShot (43000)" ... Access is denied.` +
+`ProcessCommandException`，游戏没起来。
+
+**这跟执行策略没关系**（第一反应会往那儿想）。`start.bat` 一直带
+`-ExecutionPolicy Bypass`；真被策略拦住的话第一行就报「禁止运行脚本」，
+屏幕上不会有任何游戏输出。这里的 `Access is denied` 是 Win32 的
+`ERROR_ACCESS_DENIED`——拿不到那个进程的 `PROCESS_TERMINATE`。
+
+**放大机制**：`Stop-Process` 的失败本来是**非终止**错误，可以接着往下走；
+但 `launch.ps1` 开头是 `$ErrorActionPreference = 'Stop'`，于是它被升格成终止
+错误，直接落进 trap → `exit 1`。**全库唯一一处没包 try/catch 的 Stop-Process**，
+其余四处（`launch.ps1` 的 `Stop-ListenerOn`、`shutdown.ps1` 两处、
+`build-common.ps1`）都包了 ⇒ 是漏网，不是设计。
+
+★ **教训**：本仓库任何 `.ps1` 里的 `Stop-Process` / `Remove-Item` / `Start-Process`
+这类「失败很正常」的命令，都必须自己接住错。`$ErrorActionPreference='Stop'`
+是个**全局**开关，它把「这一步没成」和「这次跑不下去了」变成了同一件事。
+
+**「拒绝访问」有四种来源，脚本判断不了，只能把事实摆给玩家**：
+① 残留进程是提权跑的而当前不是；② 属于另一个用户账户；③ 安全软件拦着；
+④ GameGuard 驱动在保护它（玩家点了开始菜单那份**只读原版**的快捷方式——
+`Get-Process BigShot` 是按**进程名**匹配的，原版那个 exe 也叫 BigShot，会被
+一起捞进来；而铁律 2 的自检只看 `game_patched\GameGuard.des`，管不到玩家
+自己那份原版）。分辨这四种的事实只有两个：**进程属主 + exe 完整路径**。
+⇒ `wincompat.ps1` 加了 `Format-ProcessIdentityText`。
+
+★ 拿属主/路径**别用 `$proc.Path`**：那个访问器走 `MainModule`，要
+`PROCESS_QUERY_INFORMATION | VM_READ`——「进程提权了而我们没提权」时它自己
+就抛「拒绝访问」，**而那恰恰是唯一需要它的场景**。`Get-WmiObject Win32_Process`
+的 `ExecutablePath` / `GetOwner()` 走 WMI（服务是 SYSTEM 在跑），同样的场景
+读得到。（`Get-CimInstance` 是 PowerShell 3.0 才有的，Win7 上没有。）
+
+★ **别把「用管理员身份运行 start.bat」当解法**：情况 ③④ 根本不管用
+（GameGuard 是内核层剥权限，SYSTEM 一样被拒）；就算是情况 ①，提权拉起来的
+新 BigShot **也是管理员权限的**，玩家下次正常启动照样卡在这儿——
+等于把毛病焊死，从此必须一直提权跑。正确的解法是**用管理员的任务管理器
+结束那个进程**（不改变新游戏的权限级别），再正常启动；再不行重启电脑。
+
+**判据用「还在不在」，不是「Stop-Process 报没报错」**：报了错却自己退了、
+没报错但还在，两种都见得到。杀完等的是 `WaitForExit()` 这个**事件**
+（`Stop-Process` 只是发出终止请求就返回，互斥体那会儿可能还没放），
+上面那个 10 秒不是判据、是防挂死的兜底，真正的判据是重新 `Get-Process` 复核。
