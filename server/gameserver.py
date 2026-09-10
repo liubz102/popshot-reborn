@@ -59,9 +59,9 @@ from account_store import (AccountError, AccountStore, BASE_CHARACTER_IDS,
                            PREMIUM_CHARACTER_IDS, QUEST_DIFFICULTY_MAX,
                            character_item_id, character_item_ids,
                            display_name,
-                           equipped_items, experience_bounds, has_item,
+                           equipped_items, experience_bounds, gift_seq, has_item,
                            inventory_items, owned_item_ids,
-                           material_counts, owned_characters,
+                           material_counts, owned_characters, pending_gifts,
                            player_character, player_experience, player_level,
                            player_money, quest_cleared_difficulty,
                            quest_difficulty_records, quest_unlock_all,
@@ -494,7 +494,8 @@ OP_REQ_EQUIPPED_LIST = 0x0704
 #: 进商店第 3 发。`gcpReqCompositionList`，线格式和 `0x0600` **一模一样**。
 #: 期望应答 `0x0505 gspRepCompositionList`（处理器 `0x4474e4`）。
 OP_REQ_COMPOSITION_LIST = 0x0605
-#: 进商店第 4 发。`gcpReqGiftList`，无正文。本版回空礼物清单（礼物系统不做）。
+#: 进商店第 4 发。`gcpReqGiftList`，无正文。回 `0x0508` 礼物清单（§75 / D76：
+#: 管理页发的奖励就住在这里；收到 `0x0507` 到货通知时商店界面也会再发一次）。
 OP_REQ_GIFT_LIST = 0x0607
 #: 进商店第 5 发。无正文。★★ **它是「给我持有物清单」**（V0.3商店 §29）——
 #: 期望应答 `0x0601`（服务端方向）。大厅 / 房间也发（`0x5541c1` 有 6 个调用点），
@@ -528,6 +529,12 @@ OP_REQ_COMPOSE_ITEM = 0x0606
 #:    （`0x4473e0`）。少回一发 = 界面永远不刷新（玩家看到「点了没反应」）。
 OP_REQ_EQUIP_ITEM = 0x0702
 OP_REQ_UNEQUIP_ITEM = 0x0703
+#: ★ **礼物动作**（`i32 礼物id + i32 动作`，Ser `0x54cfa0`，§75）：`2` = 打开看看
+#: （礼物槽上点「领取」时**先**发它，然后本地开接收弹窗）、`0` = 接收（弹窗里
+#: 按「接收礼物」）、`1` = 丢弃（确认框按确定）。期望应答 `0x050a`。
+#: ⚠⚠ **同号反向**：服务端方向的 `0x0609` 是耐久更新（处理器 `0x552593`），
+#:    **别把这个号往下发**。
+OP_REQ_GIFT_ACTION = 0x0609
 
 # -- 服务端 -> 客户端 -------------------------------------------------------
 #: 货架目录。三层嵌套，组包在 `shop.build_rep_shop_item_list`（§21）。
@@ -535,8 +542,15 @@ OP_REP_SHOP_ITEM_LIST = 0x0500
 #: 商店界面里「我拥有 / 我穿着什么」。和 `0x030b` 的包体只差一个座位号（§23）。
 #: ⚠ 和 `OP_REQ_EQUIP_ITEM` 同号反向。
 OP_REP_EQUIPPED_LIST = 0x0604
-#: 礼物清单。本版恒发空清单。
+#: 礼物清单（`i32 n + n×Gift`，处理器 `0x44798d`，§75）。组包在 `shop.build_gift`。
 OP_REP_GIFT_LIST = 0x0508
+#: 礼物动作结果（`i32 礼物id + i32 动作 + i32 bool`，处理器 `0x448072`，§75）。
+#: 成功 + 动作 0/1 客户端弹「已接收礼物 / 丢弃礼物」并本地删掉那一份；失败**什么都不显示**。
+OP_REP_GIFT_ACTION = 0x050a
+#: ★ 「收到礼物」通知（**无正文**，主分发树 → `0x553dc9`，§75）：客户端弹一句
+#: 「收到礼物。」、点亮任务栏礼物盒钮；人在商店 / 仓库界面时还会自己再要一次
+#: 清单（`ShopStage::vft+0xb0 = 0x4485ee`）。四个 Stage 都有这个钩子 ⇒ 随时能推。
+OP_GIFT_ARRIVED = 0x0507
 #: 购买结果（`int32 bool ok + i32 + i32`）。⚠ `ok=0` 时客户端**什么都不显示**。
 OP_REP_ITEM_BUY = 0x0502
 #: ★★ **物品定义**（`i32 n + n×ItemInfo + u8 用途标志`，处理器 `0x554136`）。
@@ -568,7 +582,7 @@ SHOP_ENTRY_OPCODES = (OP_REQ_SHOP_ITEM_LIST, OP_REQ_EQUIPPED_LIST,
 SHOP_PROBE_OPCODES = SHOP_ENTRY_OPCODES + (
     OP_REQ_ITEM_INFO, OP_REQ_ITEM_BUY, OP_REQ_SHOP_UNKNOWN_0603,
     OP_REQ_REPAIR_ITEM, OP_REQ_COMPOSE_ITEM,
-    OP_REQ_EQUIP_ITEM, OP_REQ_UNEQUIP_ITEM)
+    OP_REQ_EQUIP_ITEM, OP_REQ_UNEQUIP_ITEM, OP_REQ_GIFT_ACTION)
 
 #: 每个号「逆出来的形状」和「期望应答」，只用来给日志配一句人话。
 #: ★ 括号里的可信度标记就是 `re/packet_api.md` §3.8 里那一份，别在这儿升级它。
@@ -576,7 +590,9 @@ SHOP_PROBE_NOTES = {
     OP_REQ_SHOP_ITEM_LIST: ("u8 + i32 + u16 + i32 ✅", "0x0500 gspRepShopItemList"),
     OP_REQ_EQUIPPED_LIST: ("无正文 ✅", "0x0604 gspRepEquippedList"),
     OP_REQ_COMPOSITION_LIST: ("u8 + i32 + u16 + i32 ✅", "0x0505 gspRepCompositionList"),
-    OP_REQ_GIFT_LIST: ("无正文 ✅", "0x0508 gspRepGiftList（本版恒空）"),
+    OP_REQ_GIFT_LIST: ("无正文 ✅", "0x0508 gspRepGiftList（礼物盒里的东西）"),
+    OP_REQ_GIFT_ACTION: ("i32 礼物id + i32 动作(2 打开/0 领取/1 丢弃) 🔍",
+                         "0x050a gspRepGiftAction"),
     OP_REQ_INVENTORY: ("无正文 ✅ 要持有物清单", "0x0601 持有物清单（同号反向）"),
     OP_REQ_ITEM_INFO: ("i32 n, n×i32, u8 用途 ✅", "0x0501 物品定义"),
     OP_REQ_ITEM_BUY: ("i32 n, n×i32 🔍", "0x0502 gspRepItemBuy"),
@@ -600,6 +616,7 @@ SHOP_REPLY_ENABLED = {
     OP_REP_INVENTORY: True,
     OP_REP_COMPOSITION_LIST: True,
     OP_REP_COMPOSE_ITEM: True,
+    OP_REP_GIFT_ACTION: True,
 }
 
 #: 剩下那两个未查明字段（`ShopStock+0x1c`、`0x0502` 第三格）要不要填探针值
@@ -5815,6 +5832,10 @@ class Conn:
         # ★ 存的是客户端**真发过**的请求，不是我们猜的页 —— 猜的话玩家会被
         #   莫名其妙翻到别的分类去。
         self.last_composition_request = None
+        # 上一次给这条连接推「收到礼物」（`0x0507`）时账号的 `gift_seq`。
+        # ★ 提醒按**礼物盒变没变**去重（铁律 10）：`gift_seq` 只增不减，和它不等
+        #   = 自上次提醒后又进过礼物；不按次数、不按时间。
+        self.gift_notice_seq = 0
         # 本局是不是通关了。唯一来源是客户端的 0x0417 gcpMarkQuestSuccess ——
         # 打死关底时关卡脚本调 GameContextQuest::vf_e4(1) 发出（0x4a3faa），
         # 实测比 0x040f 早 30 秒到，所以结算时这个标志一定已经就位。
@@ -7045,8 +7066,11 @@ class Conn:
             pass
 
     def reload_account(self):
-        """从盘上重读当前账号。用户手改 accounts.json 之后不必重登游戏。"""
-        if not self.account_name:
+        """从盘上重读当前账号。用户手改 accounts.json 之后不必重登游戏。
+
+        没登录 / 没有存档层（协议试探的假连接）时什么都不做。
+        """
+        if not self.account_name or getattr(self, "accounts", None) is None:
             return
         name, account = self.accounts.get_account(self.account_name)
         if account is not None:
@@ -9990,9 +10014,13 @@ class Conn:
         elif opcode == OP_REQ_COMPOSITION_LIST:
             self.on_req_composition_list(payload)
         elif opcode == OP_REQ_GIFT_LIST:
-            self.send_rep_gift_list()
+            self.send_rep_gift_list(reason="（客户端要的）")
+        elif opcode == OP_REQ_GIFT_ACTION:
+            self.on_req_gift_action(payload)
         elif opcode == OP_REQ_INVENTORY:
             self.send_rep_inventory(reason="（客户端要的）")
+            # 进大厅 / 进商店都会要一次持有物 —— 顺手看一眼礼物盒有没有新东西（§75）。
+            self.notify_gifts_if_new()
         elif opcode == OP_REQ_ITEM_INFO:
             self.on_req_item_info(payload)
         elif opcode == OP_REQ_ITEM_BUY:
@@ -10386,17 +10414,116 @@ class Conn:
         self.send_slot_equipped_list(reason=f"（{what}）")
         self.broadcast_slot_equipped_list(reason=f"（{what}）")
 
-    def send_rep_gift_list(self):
-        """回 `0x0508 gspRepGiftList` 空清单。
+    # ------------------------------------------------------------ 礼物盒（§75 / D76）
+    def gift_names(self):
+        """`itemId -> 中文名` 的查询函数：一次读物品库，给整份清单用。"""
+        rules, warnings = shopcfg.items()
+        for warning in warnings:
+            self.log(f"   ⚠ items.json: {warning}")
+        return lambda item_id: shopcfg.name_of(rules, item_id)
 
-        本版不做礼物系统（PLAN「本版不做」），但**空清单还是要回** ——
-        「界面等一个永远不来的应答」和「界面收到了空清单」是两种现象，
-        不回的话下次实机看到礼物页转圈，还得先排除是不是我们没回。
+    def send_rep_gift_list(self, reason=""):
+        """回 `0x0508 gspRepGiftList`：礼物盒里现在有什么。
+
+        空清单还是照回（2026-09-04 实测界面不崩）——「界面等一个永远不来的
+        应答」和「收到了空清单」是两种现象。
+        ★ 先 `reload_account()` —— 礼物是管理页那条线程写进存档的，这条连接
+          手里的 `self.account` 可能还是旧的。
+        ★ 先补 `0x0501` 定义再发清单（D20 那条顺序）：处理器 `0x44798d` 对不认识
+          的 id 会再发一发定义请求，能答但没必要多一个来回；凭证 id 的定义由
+          `shop.item_info_records` 现造。
         """
         if self.shop_reply_off(OP_REP_GIFT_LIST, "礼物清单"):
             return
-        self.log("← 回 0x0508 礼物清单（空，本版不做礼物）")
-        self.send(build_game(OP_REP_GIFT_LIST, shop.build_rep_gift_list()))
+        self.reload_account()
+        gifts = pending_gifts(self.account)
+        name_of = self.gift_names() if gifts else None
+        self.send_item_definitions(
+            sorted({shop.gift_item_id(gift) for gift in gifts}),
+            reason="（礼物清单要用）")
+        body = shop.build_rep_gift_list(
+            shop.build_gift(gift, name_of) for gift in gifts)
+        labels = [_gift_label(gift, name_of) for gift in gifts]
+        self.log(f"← 回 0x0508 礼物清单 {len(gifts)} 份"
+                 f"{(' ' + str(labels)) if labels else ''}{reason}")
+        self.send(build_game(OP_REP_GIFT_LIST, body))
+
+    def on_req_gift_action(self, payload):
+        """客户端方向的 `0x0609` —— 打开 / 领取 / 丢弃一份礼物，回 `0x050a`（§75）。
+
+        ⚠⚠ **同号反向**：服务端方向的 `0x0609` 是耐久更新，这里只说客户端**发**的那一边。
+        ★ 领取时先把仓库 / 数据栏推到位，**最后**才回结果（D28 / §30 那条顺序）：
+          客户端收到成功应答只是弹一句「请在我的仓库中确认」并本地删掉这一份，
+          **不会**自己把东西塞进背包 —— 仓库靠 `0x0501`→`0x0601`，经验金币靠 `0x0600`。
+        ★ **每一发都回**：找不到那份礼物也回 `ok=0`（客户端什么都不显示，但不会
+          捏着一份删不掉的礼物等应答）。
+        """
+        if self.shop_reply_off(OP_REP_GIFT_ACTION, "礼物动作结果"):
+            return
+        try:
+            gift_id, action = shop.parse_gift_action(payload)
+        except ValueError as error:
+            self.log(f"   ✗ 礼物动作请求解不开: {error}")
+            return
+
+        def answer(ok, why=""):
+            self.log(f"← 回 0x050a 礼物 {gift_id} 动作 {action} → "
+                     f"{'成功' if ok else '失败'}{why}")
+            self.send(build_game(OP_REP_GIFT_ACTION,
+                                 shop.build_rep_gift_action(gift_id, action, ok)))
+
+        if self.accounts is None or not self.account_name:
+            return answer(False, "（没有存档层）")
+        try:
+            if action == shop.GIFT_ACTION_OPEN:
+                self.account, gift = self.accounts.open_gift(self.account_name, gift_id)
+                return answer(True, f"，打开了 {_gift_label(gift)}")
+            if action == shop.GIFT_ACTION_DISCARD:
+                self.account, gift = self.accounts.discard_gift(self.account_name, gift_id)
+                eventlog.online(f"礼物盒 {self.account_name!r} 丢弃了 {_gift_label(gift)}")
+                return answer(True, f"，丢掉了 {_gift_label(gift)}")
+            if action == shop.GIFT_ACTION_RECEIVE:
+                self.account, gift, note = self.accounts.claim_gift(
+                    self.account_name, gift_id)
+                eventlog.online(f"礼物盒 {self.account_name!r} 领取了 "
+                                f"{_gift_label(gift)}：{note}")
+                self.log(f"   领取 {_gift_label(gift)}：{note}")
+                # ★ 先刷画面，结果包排最后（D28）。物品 → 仓库那一对；经验 / 金币 →
+                #   数据栏（等级那一格也在里面，§32）。
+                if gift["item"]:
+                    self.send_rep_inventory(reason="（领了礼物）")
+                else:
+                    self.send_rep_money(reason="（领了礼物）")
+                return answer(True, f"，{note}")
+        except AccountError as error:
+            return answer(False, f"（{error.message}）")
+        return answer(False, f"（不认识的动作 {action}）")
+
+    def send_gift_arrived(self, reason=""):
+        """推 `0x0507`「收到礼物」（无正文，§75）。
+
+        客户端弹一句「收到礼物。」、点亮任务栏礼物盒钮；人在商店 / 仓库界面时
+        还会自己再要一次清单。大厅 / 房间 / 战斗 / 商店四个 Stage 都实现了这个
+        钩子（`vft+0xb0`），当前 Stage 为空也判过 ⇒ 任何时候推都安全。
+        """
+        self.log(f"← 推 0x0507 收到礼物{reason}")
+        self.send(build_game(OP_GIFT_ARRIVED))
+        self.gift_notice_seq = gift_seq(self.account)
+
+    def notify_gifts_if_new(self):
+        """客户端要持有物（`0x0700`，进大厅 / 进商店都发）时顺手看一眼礼物盒：
+        有**还没打开**的礼物、且礼物盒自上次提醒后**变过**（`gift_seq` 翻转）
+        就推一发 `0x0507`。登录后的第一发 `0x0700` 来自大厅（`0x43b5c4`），
+        那时任务栏已经在了，通知落得到实处。"""
+        self.reload_account()
+        seq = gift_seq(self.account)
+        # `getattr`：协议试探的假连接绕过了 `__init__`。
+        if seq == getattr(self, "gift_notice_seq", 0):
+            return
+        if not any(gift["unread"] for gift in pending_gifts(self.account)):
+            self.gift_notice_seq = seq
+            return
+        self.send_gift_arrived(reason="（礼物盒里有没打开的）")
 
     def on_ctrl_packet(self, payload):
         self.log(f"★ 控制包(0xFE) 载荷 {len(payload)} 字节\n{hexdump(payload)}")
@@ -10655,6 +10782,10 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
   inv                             看仓库 / 身上的装备 / 材料存量 + 金币
   give <itemId> [数量]            往仓库里塞一件（客户端不认识的 id 会被拒绝）
   give-material <itemId> [数量]   往材料表里塞
+  gift item <itemId> [数量]       往**礼物盒**塞一份物品礼物（发送人 GM）。★ 不进
+  gift exp <经验>                 仓库 —— 要玩家自己在游戏里的礼物盒领（§75）。
+  gift money <金币>               塞完立刻推一发 0x0507「收到礼物」
+  gifts                           看礼物盒里现在有什么（未打开的会标出来）
   equip <itemId>                  穿上并**立刻重发 0x030b**。仓库里没有的话
                                   顺手放一件进去（会在应答里说明）。
                                   抢同一个槽的旧装备会被自动顶下来
@@ -10664,8 +10795,9 @@ CONTROL_HELP = """命令（一行一条，大小写不敏感）：
                                   概率触发，要看效果优先挑 Hp（100% 生效的加法）
   shop-reply [on|off <opcode>]    商店段下行应答的**总闸**，不带参数就看现状。
                                   opcode 写 0500（货架）/ 0604（穿着的装备）/
-                                  0508（礼物清单）/ 0502（购买结果）/
-                                  0501（物品定义）/ 0601（持有物清单）。
+                                  0508（礼物清单）/ 050a（礼物动作结果）/
+                                  0502（购买结果）/ 0501（物品定义）/
+                                  0601（持有物清单）。
                                   ★ 这些全是静态逆出来的，实机万一界面不对，
                                   关掉一发再进一次商店就能二分到是哪一发
                                   —— 不用改代码、不用重启。
@@ -10710,6 +10842,19 @@ def _item_label(item_id):
     if item is not None and item.name_kr:
         return f"{item_id} {item.name_kr}"
     return str(item_id)
+
+
+def _gift_label(gift, name_of=None):
+    """调试输出用的礼物名：`#礼物号 名字 ×数量`（名字走物品库，同 `_item_label`）。
+
+    ★ 数量在这儿自己补 —— `gift_display_name` 给客户端的名字不带数量（弹窗自己会画）。
+    """
+    if name_of is None:
+        name_of = shopcfg.item_name
+    label = f"#{gift.get('id')} {shop.gift_display_name(gift, name_of)}"
+    if int(gift.get("item") or 0) and int(gift.get("count") or 1) > 1:
+        label += f" ×{int(gift['count'])}"
+    return label
 
 
 def _control_status(conn):
@@ -11156,6 +11301,38 @@ def _dispatch_control_command(line):
             # `add_materials` 是「跳过不抛」的（D12），所以这里要自己把它说出来。
             return f"err {_item_label(item_id)} 客户端不认识，没给"
         return f"ok 已给 {_item_label(item_id)} ×{count}"
+
+    if cmd == "gifts":
+        conn.reload_account()
+        gifts = pending_gifts(conn.account)
+        if not gifts:
+            return "ok 礼物盒是空的"
+        return "ok " + "；".join(
+            _gift_label(gift) + ("（未打开）" if gift["unread"] else "")
+            for gift in gifts)
+
+    if cmd == "gift":
+        usage = "err 用法: gift item <itemId> [数量] | gift exp <经验> | gift money <金币>"
+        if len(words) < 3:
+            return usage
+        what = words[1].lower()
+        try:
+            if what == "item":
+                spec = {"item": int(words[2], 0),
+                        "count": int(words[3], 0) if len(words) > 3 else 1}
+            elif what in ("exp", "money"):
+                spec = {what: int(words[2], 0)}
+            else:
+                return usage
+            conn.account, created = conn.accounts.add_gifts(
+                conn.account_name, [spec], message="控制通道塞的礼物")
+        except ValueError:
+            return usage
+        except AccountError as error:
+            return f"err {error.message}"
+        # 和管理页发奖同一条路：塞完就提醒（人在商店界面时清单会自己刷出来）。
+        conn.send_gift_arrived(reason="（控制通道塞了礼物）")
+        return f"ok 已塞进礼物盒 {_gift_label(created[0])}，已推 0x0507"
 
     if cmd in ("equip", "unequip"):
         if len(words) < 2:

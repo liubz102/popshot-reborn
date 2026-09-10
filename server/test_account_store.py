@@ -515,6 +515,11 @@ class AccountStoreTests(unittest.TestCase):
             "inventory": {str(REVOLVER_R1): {"count": 1, "expires": None}},
             "equipped": [REVOLVER_R1],
             "materials": {str(BRONZE_PIPE): 3},
+            # 礼物盒（D76）同样写规范形态：一份完整的礼物 + 不小于最大礼物号的计数器。
+            "gifts": [{"id": 3, "item": BRONZE_PIPE, "count": 2, "exp": 0,
+                       "money": 0, "sender": "GM", "message": "导入测试",
+                       "sent": "2026-09-10 12:00:00", "unread": True}],
+            "gift_seq": 3,
         }
         self.assertEqual(sorted(changed), sorted(NEW_ACCOUNT_DEFAULTS),
                          "存档新增字段了？这条用例要跟着补")
@@ -1376,6 +1381,139 @@ class ItemFieldTests(unittest.TestCase):
         self.assertIn(str(REVOLVER_R1), payload["inventory"])
         self.assertEqual([REVOLVER_R1], payload["equipped"])
         self.assertEqual({str(BRONZE_PIPE): 2}, payload["materials"])
+
+
+class GiftBoxTests(unittest.TestCase):
+    """礼物盒（V0.3商店 D76）：管理页批量发的奖励先落在 `gifts` 里，玩家在游戏里
+    领了才进仓库 / 加经验金币。守的是：礼物号永不复用、领取是一把锁里的原子
+    交易、装备已拥有不放第二件、老存档幂等补齐。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "accounts.json")
+        self.store = AccountStore(self.path)
+        self.store.register("alice", "pw")
+
+    def gifts(self):
+        return account_store.pending_gifts(self.store.get_account("alice")[1])
+
+    def test_a_new_account_has_an_empty_gift_box(self):
+        account = self.store.get_account("alice")[1]
+        self.assertEqual([], account["gifts"])
+        self.assertEqual(0, account["gift_seq"])
+        self.assertEqual([], account_store.pending_gifts(account))
+
+    def test_add_gifts_gives_each_reward_its_own_number(self):
+        _account, created = self.store.add_gifts(
+            "alice", [{"item": BRONZE_PIPE, "count": 3}, {"item": TOP_ARMOR, "count": 5},
+                      {"exp": 500}, {"money": 3000}], message="测试")
+        self.assertEqual([1, 2, 3, 4], [gift["id"] for gift in created])
+        self.assertEqual([1, 2, 3, 4], [gift["id"] for gift in self.gifts()])
+        by_id = {gift["id"]: gift for gift in created}
+        self.assertEqual((BRONZE_PIPE, 3, 0, 0),
+                         (by_id[1]["item"], by_id[1]["count"], by_id[1]["exp"], by_id[1]["money"]))
+        # ★ 装备类数量没有意义（§28）：写 5 也只存 1。
+        self.assertEqual(1, by_id[2]["count"])
+        self.assertEqual((0, 500, 0), (by_id[3]["item"], by_id[3]["exp"], by_id[3]["money"]))
+        self.assertEqual((0, 0, 3000), (by_id[4]["item"], by_id[4]["exp"], by_id[4]["money"]))
+        for gift in created:
+            self.assertEqual("GM", gift["sender"])
+            self.assertEqual("测试", gift["message"])
+            self.assertTrue(gift["unread"])
+            self.assertRegex(gift["sent"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+    def test_gift_numbers_are_never_reused(self):
+        self.store.add_gifts("alice", [{"exp": 1}, {"exp": 2}])
+        self.store.discard_gift("alice", 2)
+        self.store.claim_gift("alice", 1)
+        self.assertEqual([], self.gifts())
+        _account, created = self.store.add_gifts("alice", [{"exp": 3}])
+        # 两份都没了，新的还是 3 号 —— 客户端手里可能还捏着旧清单。
+        self.assertEqual(3, created[0]["id"])
+
+    def test_add_gifts_refuses_bad_specs_and_writes_nothing(self):
+        for bad in ({"item": NO_SUCH_ITEM}, {"item": STOCK_ONLY},
+                    {"item": BRONZE_PIPE, "count": 0}, {"exp": 0}, {}, {"money": -5}):
+            with self.assertRaises(AccountError, msg=bad):
+                self.store.add_gifts("alice", [{"exp": 10}, bad])
+        self.assertEqual([], self.gifts(), "有一条坏的就一份都不写")
+
+    def test_claiming_a_material_gift_lands_in_the_material_table(self):
+        self.store.add_gifts("alice", [{"item": BRONZE_PIPE, "count": 3}])
+        account, gift, note = self.store.claim_gift("alice", 1)
+        self.assertEqual(BRONZE_PIPE, gift["item"])
+        self.assertEqual({BRONZE_PIPE: 3}, material_counts(account))
+        self.assertEqual([], account_store.pending_gifts(account))
+        self.assertIn("材料", note)
+
+    def test_claiming_an_equipment_gift_lands_in_the_warehouse_once(self):
+        self.store.add_gifts("alice", [{"item": TOP_ARMOR}, {"item": TOP_ARMOR}])
+        account, _gift, _note = self.store.claim_gift("alice", 1)
+        self.assertEqual({TOP_ARMOR: {"count": 1, "expires": None}},
+                         inventory_items(account))
+        # 第二份照样算领掉，但仓库里不会出现 ×2（客户端根本不读那个数）。
+        account, _gift, note = self.store.claim_gift("alice", 2)
+        self.assertEqual(1, inventory_items(account)[TOP_ARMOR]["count"])
+        self.assertIn("已经拥有", note)
+        self.assertEqual([], account_store.pending_gifts(account))
+
+    def test_claiming_exp_and_money_gifts_credits_the_account(self):
+        self.store.add_gifts("alice", [{"exp": 500}, {"money": 3000}])
+        account, _gift, _note = self.store.claim_gift("alice", 1)
+        self.assertEqual(500, account["experience"])
+        self.assertEqual(level_for_experience(500), account["level"])
+        account, _gift, _note = self.store.claim_gift("alice", 2)
+        self.assertEqual(3000, player_money(account))
+        self.assertEqual({}, inventory_items(account), "凭证不进仓库")
+
+    def test_open_marks_the_gift_read_and_discard_removes_it(self):
+        self.store.add_gifts("alice", [{"exp": 5}])
+        account, gift = self.store.open_gift("alice", 1)
+        self.assertFalse(gift["unread"])
+        self.assertFalse(account_store.pending_gifts(account)[0]["unread"])
+        account, gift = self.store.discard_gift("alice", 1)
+        self.assertEqual(5, gift["exp"])
+        self.assertEqual([], account_store.pending_gifts(account))
+        self.assertEqual(0, account["experience"], "丢弃不发钱")
+
+    def test_actions_on_a_missing_gift_raise_and_write_nothing(self):
+        self.store.add_gifts("alice", [{"exp": 5}])
+        with open(self.path, "rb") as f:
+            before = f.read()
+        for action in (self.store.open_gift, self.store.claim_gift, self.store.discard_gift):
+            with self.assertRaises(AccountError):
+                action("alice", 99)
+        with open(self.path, "rb") as f:
+            self.assertEqual(before, f.read())
+
+    def test_ensure_item_fields_backfills_and_stays_idempotent(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"schema_version": 2,
+                       "accounts": {"old": {"password": "pw"},
+                                    "dirty": {"password": "pw", "gift_seq": 1,
+                                              "gifts": [
+                                                  {"id": 7, "exp": 5},      # 号比计数器大
+                                                  {"id": 8, "item": NO_SUCH_ITEM},
+                                                  "垃圾", {"id": 0, "exp": 1}]}}},
+                      f, ensure_ascii=False)
+        store = AccountStore(self.path)
+        report = store.ensure_item_fields()
+        notes = {row["username"]: row["notes"] for row in report["accounts"]}
+        self.assertIn("补上 gifts", notes["old"])
+        self.assertIn("补上 gift_seq", notes["old"])
+        self.assertIn("丢掉礼物盒里坏掉的 3 份礼物", notes["dirty"])
+        with open(self.path, "r", encoding="utf-8") as f:
+            saved = json.load(f)["accounts"]
+        self.assertEqual([], saved["old"]["gifts"])
+        self.assertEqual(0, saved["old"]["gift_seq"])
+        self.assertEqual([7], [gift["id"] for gift in saved["dirty"]["gifts"]])
+        self.assertEqual(7, saved["dirty"]["gift_seq"], "计数器不小于最大礼物号")
+        with open(self.path, "rb") as f:
+            before = f.read()
+        self.assertEqual([], store.ensure_item_fields()["accounts"])
+        with open(self.path, "rb") as f:
+            self.assertEqual(before, f.read(), "第二遍一个字节都不写")
 
 
 class AdminAccountTests(unittest.TestCase):

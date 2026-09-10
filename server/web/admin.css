@@ -814,6 +814,81 @@ code {
   margin-left: 2px; color: var(--amber-soft); font-size: 13px; font-weight: 600;
   white-space: nowrap;
 }
+
+/* ---------------------------------------------- 发送奖励弹窗（用户 2026-09-10，D76）
+   左右两栏：左栏选人（名单 / 搜索筛选 / 复选列表），右栏选奖励（经验金币留言 /
+   物品区）。壳照玩家仓库弹窗那套：每栏只有列表 / 格子区滚，其余钉住。
+   比「修改仓库」宽 220：左栏要放得下一列带昵称的人名。 */
+#rewardModal .panel { width: min(1240px, 100%); height: min(820px, 100%); }
+/* ★ 正文要**撑满**面板（`flex: 1 1 auto`）：左栏的人名列表靠它拿到整段高度，
+   底栏才会钉在面板最底下。「修改仓库」那个窗没写这一条，仓库空着时底下会留一段空白。 */
+#rewardModal .panel-body {
+  flex: 1 1 auto; min-height: 0;
+  overflow: hidden; display: flex; flex-direction: row; gap: 16px;
+}
+/* 「还没选物品」那句话横跨整个网格，别被挤在第一列 230 px 里折成两行。 */
+.own-grid .own-empty { grid-column: 1 / -1; }
+.reward-left {
+  flex: 0 0 400px; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column;
+}
+.reward-right {
+  flex: 1 1 auto; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column;
+}
+.reward-left > *, .reward-right > * { flex: 0 0 auto; }
+/* 左栏：名单 + 搜索条钉住，只有复选列表滚。 */
+.reward-players {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  background: #fff; border: 2px solid var(--line); border-radius: 9px;
+}
+.reward-row {
+  display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+  border-bottom: 1px solid var(--line); cursor: pointer; font-size: 13px;
+}
+.reward-row:last-child { border-bottom: 0; }
+.reward-row:hover { background: #FFFBEF; }
+.reward-row.on { background: #FFF7E6; }
+.reward-row input { margin: 0; }
+.reward-row .who {
+  flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-weight: 600;
+}
+.reward-row .state { color: var(--cocoa-soft); white-space: nowrap; font-size: 12px; }
+.reward-row .state.on { color: var(--amber-dark); font-weight: 700; }
+.reward-row .lv { color: var(--cocoa-soft); white-space: nowrap; font-size: 12px; width: 44px; text-align: right; }
+.reward-players .own-empty { padding: 14px 10px; }
+/* 「奖励玩家名单」：选中的人排成 chip，超过四行自己滚，别把列表挤没了。 */
+.reward-chosen {
+  margin-bottom: 10px; padding: 8px 10px;
+  background: var(--paper-2); border: 2px solid var(--line); border-radius: 9px;
+}
+.reward-chosen-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.reward-chosen-head b { font-size: 13px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; max-height: 96px; overflow-y: auto; }
+.chips .own-empty { padding: 2px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 2px 5px 2px 9px;
+  font-size: 12px; font-weight: 600; white-space: nowrap;
+  background: #fff; border: 2px solid var(--line); border-radius: 12px;
+}
+.chip.on { border-color: var(--amber-dark); }
+.chip button {
+  border: 0; background: transparent; cursor: pointer; font: inherit;
+  font-size: 12px; line-height: 1; padding: 0 2px; color: var(--cocoa-soft);
+}
+.chip button:hover { color: var(--crimson); }
+#rewardModal .reward-bar { margin-bottom: 10px; }
+#rewardModal .reward-bar input[type=text] { flex: 1 1 120px; max-width: none; }
+/* 右栏：三个数值格 + 工具条 + 分类标签钉住，只有格子区滚（和 #playerModal 同套）。 */
+#rewardModal .reward-stats { margin-bottom: 12px; }
+#rewardModal .toolbar { margin-bottom: 10px; }
+#rewardModal .own-scroll {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; padding-right: 4px;
+}
+#rewardModal .own-grid { margin-bottom: 0; }
+/* 装备类那一格右边写死的「×1」：和数字框一样不许被压扁。 */
+.own .fixed { flex: 0 0 auto; font-size: 12px; font-weight: 700; color: var(--cocoa-soft); }
 /* 分类标签：大分类一行（照商店标签的样子缩小一号），小分类一行（金色）。 */
 .cat-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 /* ★ 选择器**不带 `.cat-tabs` 前缀**（用户 2026-09-10，D72b）：「金币 / 经验获取」

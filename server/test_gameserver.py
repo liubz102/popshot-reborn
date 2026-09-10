@@ -116,7 +116,8 @@ import shop
 import shopcfg
 from test_shop import (config_dir, parse_equipped_masks,
                        parse_rep_composition_list,
-                       parse_rep_equipped_list, parse_rep_inventory,
+                       parse_rep_equipped_list, parse_rep_gift_list,
+                       parse_rep_inventory,
                        parse_rep_item_info, parse_shop_item_list,
                        recipe_config, shop_config)
 
@@ -2894,6 +2895,187 @@ class ShopControlCommandTests(unittest.TestCase):
             self.assertIn(cmd, gameserver.CONTROL_HELP, cmd)
 
 
+class _GiftCase(unittest.TestCase):
+    """真 `AccountStore` + `CharacterUnlockTests.make_conn()` 那个假连接（和
+    `ShopControlCommandTests` 同一套接线，抄一份是为了不把那一组的用例再跑一遍）。"""
+
+    Args = CharacterUnlockTests.Args
+    BRONZE_PIPE = 30018          # 材料
+    TOP_ARMOR = 1010015          # 上衣（不可堆叠）
+    STOCK_ONLY = 1510001         # 只有货架条目，进不了背包
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = AccountStore(os.path.join(self.tmp.name, "accounts.json"))
+        self.store.register("tester", "pw")
+        self.conn = CharacterUnlockTests.make_conn(self)
+        self.conn.accounts = self.store
+        self.conn.account = self.store.get_account("tester")[1]
+        saved = list(gameserver._conns)
+        gameserver._conns[:] = [self.conn]
+        self.addCleanup(
+            lambda: gameserver._conns.__setitem__(slice(None), saved))
+        # 领取 / 丢弃会写 `logs/online.log`，测试里掐掉。
+        saved_online = gameserver.eventlog.online
+        gameserver.eventlog.online = lambda _msg: None
+        self.addCleanup(setattr, gameserver.eventlog, "online", saved_online)
+
+    def run_cmd(self, line):
+        return gameserver.handle_control_command(line)
+
+    def packet(self, opcode, payload=b""):
+        gameserver.Conn.on_game_packet(self.conn, opcode, payload)
+
+    def frames(self, opcode=None):
+        out = [take_frame(bytearray(f))[1:3] for f in self.conn.sent]
+        return out if opcode is None else [f for op, f in out if op == opcode]
+
+    def opcodes(self):
+        return [op for op, _body in self.frames()]
+
+    def account(self):
+        return self.store.get_account("tester")[1]
+
+
+class GiftControlCommandTests(_GiftCase):
+    """`gift` / `gifts`（礼物盒，D76）—— 实机验 `0x0508` / `0x0507` 的工具。"""
+
+    def test_gift_item_lands_in_the_gift_box_not_the_warehouse(self):
+        reply = self.run_cmd(f"gift item {self.BRONZE_PIPE} 4")
+        self.assertTrue(reply.startswith("ok"), reply)
+        account = self.store.get_account("tester")[1]
+        self.assertEqual({}, account_store.material_counts(account))
+        gifts = account_store.pending_gifts(account)
+        self.assertEqual([(self.BRONZE_PIPE, 4)],
+                         [(g["item"], g["count"]) for g in gifts])
+        self.assertEqual("GM", gifts[0]["sender"])
+        # 塞完立刻提醒：一发无正文的 0x0507。
+        self.assertEqual([b""], self.frames(gameserver.OP_GIFT_ARRIVED))
+
+    def test_gift_exp_and_money_are_vouchers(self):
+        self.assertTrue(self.run_cmd("gift exp 500").startswith("ok"))
+        self.assertTrue(self.run_cmd("gift money 3000").startswith("ok"))
+        gifts = account_store.pending_gifts(self.store.get_account("tester")[1])
+        self.assertEqual([(0, 500, 0), (0, 0, 3000)],
+                         [(g["item"], g["exp"], g["money"]) for g in gifts])
+        listing = self.run_cmd("gifts")
+        self.assertIn("经验 ×500", listing)
+        self.assertIn("金币 ×3000", listing)
+        self.assertIn("未打开", listing)
+
+    def test_gift_refuses_an_id_the_client_does_not_know(self):
+        self.assertTrue(self.run_cmd(f"gift item {self.STOCK_ONLY}").startswith("err"))
+        self.assertTrue(self.run_cmd("gift potato 1").startswith("err"))
+        self.assertEqual("ok 礼物盒是空的", self.run_cmd("gifts"))
+
+
+class GiftFlowTests(_GiftCase):
+    """礼物盒那几发（§75 / D76）：`0x0607` → 定义 + 清单；`0x0609` 三种动作；
+    `0x0507` 到货提醒。★ 全是静态逆出来的线格式，这里钉的是「谁回、回什么、
+    什么顺序」。"""
+
+    def action(self, gift_id, action):
+        self.packet(gameserver.OP_REQ_GIFT_ACTION, struct.pack("<ii", gift_id, action))
+
+    def test_the_gift_list_is_preceded_by_the_definitions_it_needs(self):
+        self.store.add_gifts("tester", [{"item": self.BRONZE_PIPE, "count": 2},
+                                        {"exp": 500}])
+        self.packet(gameserver.OP_REQ_GIFT_LIST)
+        # ★ 定义在前（D20）：真物品 + 经验凭证各一条；然后才是清单。
+        self.assertEqual([gameserver.OP_REP_ITEM_INFO, gameserver.OP_REP_GIFT_LIST],
+                         self.opcodes())
+        records, _purpose = parse_rep_item_info(self.frames()[0][1])
+        self.assertEqual([self.BRONZE_PIPE, shop.VOUCHER_EXP],
+                         [r["id"] for r in records])
+        gifts = parse_rep_gift_list(self.frames()[1][1])
+        self.assertEqual(2, len(gifts))
+        # 数量在赠品条目那一格（弹窗自己写「（2个）」），名字里**不带** ×2；
+        # 经验凭证那一档客户端不显示数量，所以数字在名字里。
+        self.assertEqual([(self.BRONZE_PIPE, 2, 0)], gifts[0]["grants"])
+        self.assertNotIn("×", gifts[0]["name"])
+        self.assertEqual("经验 ×500", gifts[1]["name"])
+        self.assertEqual([1, 2], [g["id"] for g in gifts])
+
+    def test_the_list_is_read_from_disk_not_from_the_connection_cache(self):
+        # 礼物是管理页那条线程写的，这条连接手里的 `account` 还是旧的。
+        self.store.add_gifts("tester", [{"money": 5}])
+        self.packet(gameserver.OP_REQ_GIFT_LIST)
+        self.assertEqual(1, struct.unpack_from("<i", self.frames()[-1][1])[0])
+
+    def test_open_then_receive_an_item_gift(self):
+        self.store.add_gifts("tester", [{"item": self.BRONZE_PIPE, "count": 2}])
+        self.action(1, shop.GIFT_ACTION_OPEN)
+        self.assertEqual([gameserver.OP_REP_GIFT_ACTION], self.opcodes())
+        self.assertEqual(struct.pack("<iii", 1, shop.GIFT_ACTION_OPEN, 1),
+                         self.frames()[0][1])
+        self.assertFalse(account_store.pending_gifts(self.account())[0]["unread"])
+        self.conn.sent.clear()
+        self.action(1, shop.GIFT_ACTION_RECEIVE)
+        # ★ 顺序：先仓库那一对（定义 + 持有物），**结果排最后**（D28 / §30）。
+        self.assertEqual([gameserver.OP_REP_ITEM_INFO, gameserver.OP_REP_INVENTORY,
+                          gameserver.OP_REP_GIFT_ACTION], self.opcodes())
+        self.assertEqual(struct.pack("<iii", 1, shop.GIFT_ACTION_RECEIVE, 1),
+                         self.frames()[-1][1])
+        self.assertEqual({self.BRONZE_PIPE: 2}, account_store.material_counts(self.account()))
+        self.assertEqual([], account_store.pending_gifts(self.account()))
+
+    def test_receiving_a_voucher_pushes_the_money_bar_not_the_warehouse(self):
+        self.store.add_gifts("tester", [{"exp": 500}])
+        self.action(1, shop.GIFT_ACTION_RECEIVE)
+        self.assertEqual([gameserver.OP_REP_MONEY, gameserver.OP_REP_GIFT_ACTION],
+                         self.opcodes())
+        self.assertEqual(500, self.account()["experience"])
+        self.assertEqual({}, account_store.inventory_items(self.account()), "凭证不进仓库")
+
+    def test_discard_removes_the_gift_and_credits_nothing(self):
+        self.store.add_gifts("tester", [{"money": 7}])
+        self.action(1, shop.GIFT_ACTION_DISCARD)
+        self.assertEqual([gameserver.OP_REP_GIFT_ACTION], self.opcodes())
+        self.assertEqual(struct.pack("<iii", 1, shop.GIFT_ACTION_DISCARD, 1),
+                         self.frames()[0][1])
+        self.assertEqual(0, account_store.player_money(self.account()))
+        self.assertEqual([], account_store.pending_gifts(self.account()))
+
+    def test_a_missing_gift_or_an_unknown_action_still_gets_an_answer(self):
+        # ★ 每一发都回（§75）：失败也回，客户端才不会捏着一份删不掉的礼物等。
+        self.action(42, shop.GIFT_ACTION_RECEIVE)
+        self.store.add_gifts("tester", [{"money": 7}])
+        self.action(1, 9)
+        self.assertEqual([struct.pack("<iii", 42, shop.GIFT_ACTION_RECEIVE, 0),
+                          struct.pack("<iii", 1, 9, 0)],
+                         [body for _op, body in self.frames()])
+        self.assertEqual(1, len(account_store.pending_gifts(self.account())), "没动")
+
+    def test_the_arrival_notice_follows_the_gift_box_not_a_counter(self):
+        """`0x0700` 时看一眼礼物盒：有没打开的、且礼物盒变过才推 `0x0507`（铁律 10）。"""
+        self.packet(gameserver.OP_REQ_INVENTORY)
+        self.assertEqual([gameserver.OP_REP_INVENTORY], self.opcodes(), "没礼物不提醒")
+        self.conn.sent.clear()
+        self.store.add_gifts("tester", [{"exp": 1}])
+        self.packet(gameserver.OP_REQ_INVENTORY)
+        self.assertEqual([gameserver.OP_REP_INVENTORY, gameserver.OP_GIFT_ARRIVED],
+                         self.opcodes())
+        self.conn.sent.clear()
+        self.packet(gameserver.OP_REQ_INVENTORY)
+        self.assertEqual([gameserver.OP_REP_INVENTORY], self.opcodes(),
+                         "同一份礼物不重复提醒")
+        self.conn.sent.clear()
+        self.store.add_gifts("tester", [{"exp": 2}])
+        self.packet(gameserver.OP_REQ_INVENTORY)
+        self.assertEqual([gameserver.OP_REP_INVENTORY, gameserver.OP_GIFT_ARRIVED],
+                         self.opcodes(), "又进了新礼物就再提醒")
+        self.conn.sent.clear()
+        self.action(1, shop.GIFT_ACTION_OPEN)
+        self.action(2, shop.GIFT_ACTION_OPEN)
+        self.store.add_gifts("tester", [{"exp": 3}])
+        self.action(3, shop.GIFT_ACTION_OPEN)
+        self.conn.sent.clear()
+        self.packet(gameserver.OP_REQ_INVENTORY)
+        self.assertEqual([gameserver.OP_REP_INVENTORY], self.opcodes(),
+                         "都打开过了 = 没有要提醒的")
+
+
 class MaterialDropTests(unittest.TestCase):
     """材料掉落的规则（`quest_materials`）和结算包（`build_reward_received`）。
 
@@ -3193,6 +3375,8 @@ class ShopProbeTests(unittest.TestCase):
                 # 「这个 id 我不认识」——真的挑一个物品表里有的，否则
                 # 回不出定义，这条就退化成「什么都没发」。
                 payload = struct.pack("<ii", 1, 1120041) + b"\x02"
+            elif opcode == gameserver.OP_REQ_GIFT_ACTION:
+                payload = struct.pack("<ii", 1, shop.GIFT_ACTION_RECEIVE)
             else:
                 payload = b""
             gameserver.Conn.on_game_packet(conn, opcode, payload)
@@ -3205,6 +3389,9 @@ class ShopProbeTests(unittest.TestCase):
             {gameserver.OP_REQ_SHOP_ITEM_LIST: [gameserver.OP_REP_SHOP_ITEM_LIST],
              gameserver.OP_REQ_EQUIPPED_LIST: [gameserver.OP_REP_EQUIPPED_LIST],
              gameserver.OP_REQ_GIFT_LIST: [gameserver.OP_REP_GIFT_LIST],
+             # ★ 礼物动作**每一发都回**（§75）：没有存档层也回一发失败的
+             #   `0x050a`，客户端才不会捏着一份删不掉的礼物等应答。
+             gameserver.OP_REQ_GIFT_ACTION: [gameserver.OP_REP_GIFT_ACTION],
              # ★ `0x0700` = 「给我持有物清单」（§29）。空仓库也要回 ——
              #   不回的话仓库面板等一个永远不来的应答。
              gameserver.OP_REQ_INVENTORY: [gameserver.OP_REP_INVENTORY],
@@ -3394,7 +3581,7 @@ class ShopProbeTests(unittest.TestCase):
                      if name.startswith(("OP_REQ_SHOP_", "OP_REQ_ITEM_BUY",
                                          "OP_REQ_ITEM_INFO", "OP_REQ_INVENTORY",
                                          "OP_REQ_EQUIP_ITEM", "OP_REQ_COMPOS",
-                                         "OP_REQ_GIFT_LIST", "OP_REQ_UNEQUIP_",
+                                         "OP_REQ_GIFT_", "OP_REQ_UNEQUIP_",
                                          "OP_REQ_REPAIR_ITEM",
                                          "OP_REQ_EQUIPPED_LIST")))
         server_direction = ("OP_REP_MONEY", "OP_REP_EQUIPPED_LIST",

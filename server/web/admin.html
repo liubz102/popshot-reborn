@@ -139,6 +139,12 @@
           <!-- 玩家自己在游戏里也会改这些数（打完一局就涨经验和金币），
                所以这一页随时会过期。刷新 = 重读列表 + 重读正在改的那个人。 -->
           <button class="btn" id="playerRefreshBtn" title="重新读一遍列表和下面这个人的资料">↻ 刷新</button>
+          <!-- 批量发奖励（用户 2026-09-10，D76）：弹窗里选一批人 + 选物品 / 经验 /
+               金币，发到每个人**游戏里的礼物盒**，玩家自己领。放在「当前在线」
+               **左边** —— `.online-tally{margin-left:auto}` 会把它右边的东西一起
+               顶到最右端。 -->
+          <button class="btn btn-primary" id="rewardOpenBtn"
+                  title="给一批玩家发物品 / 经验 / 金币，进他们游戏里的礼物盒">发送奖励</button>
           <!-- 全服在线人数（用户 2026-09-08），钉在这一条的最右端。数来自
                `/admin/api/players` 的 `online_total`，跟列表里那些 ● 是同一份
                快照 —— 跟着列表一起刷新，不另外轮询。 -->
@@ -307,7 +313,10 @@
   <div class="panel player-panel">
     <div class="panel-title">
       <h2 id="playerWho"></h2>
-      <span class="online-note" id="playerOnline"></span>
+      <!-- ★ id 不能叫 `playerOnline`：那是工具条上在线筛选下拉的 id（D75）。
+           2026-09-10 曾经撞名，`$("playerOnline")` 拿到的是排在前面的下拉，
+           一打开这个弹窗就把下拉的三个选项抹成一行字。 -->
+      <span class="online-note" id="playerOnlineNote"></span>
       <button class="icon-btn" id="playerClose" aria-label="关闭"
               title="关闭（有没保存的改动会先问一句）">✕</button>
     </div>
@@ -349,6 +358,96 @@
       <div class="own-scroll" id="playerOwned">
         <div class="own-grid" id="playerOwnedGrid"></div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========================= 发送奖励弹窗（用户 2026-09-10，D76） =========================
+     「玩家仓库」工具条上「发送奖励」点开的批量发奖窗。左栏选人（搜索 / 在线筛选 /
+     逐个勾或全选，选中的列在「奖励玩家名单」里），右栏选奖励（经验 / 金币 / 留言 +
+     物品区 —— 物品区照「修改仓库」弹窗那套：分类标签 + 角色 / 上架状态两个下拉 +
+     格子，只是没有等级 / 经验 / 金币那三格）。「确认发送奖励」先弹确认框，再
+     POST /admin/api/reward/send：服务端把每一样各写成一份礼物塞进目标玩家的
+     礼物盒，玩家自己在游戏里领。
+     ★ 只有 ✕ 能关（点遮罩不关，Esc 也不关）—— 选了一堆人一堆东西被误点丢掉太亏。
+     ★ 和 #playerModal 一样必须排在 #picker 前面：「添加物品」的选择器要盖在它上面。 -->
+<div class="modal hidden" id="rewardModal">
+  <div class="panel reward-panel">
+    <div class="panel-title">
+      <h2>发送奖励</h2>
+      <span class="count" id="rewardCount"></span>
+      <button class="icon-btn" id="rewardClose" aria-label="关闭"
+              title="关闭（还没发出去的选择会丢掉）">✕</button>
+    </div>
+    <div class="panel-body reward-body">
+      <div class="reward-left">
+        <!-- 选中的人。列表翻着筛着，这里始终是「到底要发给谁」的全名单。 -->
+        <div class="reward-chosen">
+          <div class="reward-chosen-head">
+            <b>奖励玩家名单</b>
+            <span class="pageno" id="rewardChosenCount">还没选人</span>
+            <span class="grow"></span>
+            <button class="btn btn-sm" id="rewardChosenClear" title="把名单清空">清空</button>
+          </div>
+          <div class="chips" id="rewardChosen"></div>
+        </div>
+        <div class="toolbar reward-bar">
+          <input id="rewardSearch" type="text" placeholder="搜 用户名 / 昵称">
+          <!-- 在线筛选：和玩家仓库那一页同三档（D75），值照 `ONLINE_FILTERS` 发。 -->
+          <select id="rewardOnline">
+            <option value="all">全部</option>
+            <option value="on">在线</option>
+            <option value="off">不在线</option>
+          </select>
+          <button class="btn btn-sm" id="rewardSelectAll"
+                  title="把下面列表里的人全部加进名单（搜完 / 筛完再点，就是「全选筛出来的」）">全选</button>
+          <button class="btn btn-sm" id="rewardSelectNone"
+                  title="把下面列表里的人从名单里去掉">取消全选</button>
+        </div>
+        <!-- 只有这一块滚 -->
+        <div class="reward-players" id="rewardPlayers"></div>
+      </div>
+      <div class="reward-right">
+        <div class="row reward-stats">
+          <div class="field">
+            <span class="lab">经验（每人）</span>
+            <input id="rewardExp" type="number" min="0" step="1" value="0">
+          </div>
+          <div class="field">
+            <span class="lab">金币（每人）</span>
+            <input id="rewardMoney" type="number" min="0" step="1" value="0">
+          </div>
+          <!-- 留言（用户 2026-09-10）：玩家在礼物的接收弹窗里看到的那句话，
+               可以整个改掉；留空按默认值发。默认值和服务端 `REWARD_MESSAGE_DEFAULT`
+               是同一句（test_web_admin 钉着）。 -->
+          <div class="field wide">
+            <span class="lab">留言（玩家在礼物里看到）</span>
+            <input id="rewardMessage" type="text" maxlength="50" value="管理员发送的奖励">
+          </div>
+        </div>
+        <div class="toolbar cfg-bar">
+          <div class="filters">
+            <button class="btn" id="rewardAddItem">＋ 添加物品</button>
+            <select id="rewardCharacter"></select>
+            <select id="rewardListing"></select>
+          </div>
+          <div class="acts">
+            <button class="btn" id="rewardItemsClear" title="把下面的奖励物品全部拿掉">清空物品</button>
+          </div>
+        </div>
+        <!-- 分类标签两行（D68），和「修改仓库」弹窗同一套。 -->
+        <div class="cat-tabs" id="rewardCats"></div>
+        <div class="cat-tabs sub hidden" id="rewardSubCats"></div>
+        <!-- 只有这一块滚 -->
+        <div class="own-scroll" id="rewardOwned">
+          <div class="own-grid" id="rewardOwnedGrid"></div>
+        </div>
+      </div>
+    </div>
+    <div class="panel-foot">
+      <span class="pageno" id="rewardSummary"></span>
+      <span class="grow"></span>
+      <button class="btn btn-primary" id="rewardSend" disabled>确认发送奖励</button>
     </div>
   </div>
 </div>

@@ -2736,6 +2736,110 @@ static int try_patch_splash_visual_guard(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* ★ 礼物盒里的材料没图标 —— 图标查错了表（V0.3商店 §75，2026-09-10 实机）   */
+/*                                                                            */
+/*   客户端启动时从 ShopItem-Chn.ini 建了**两张** id→图标路径的表，挂在同一个   */
+/*   对象 [0x72e1e0] 上：+0x00 那张来自 `[Stock-N]` 节（商店在卖的 1817 件），   */
+/*   +0x14 那张来自 `[Item-N]` 节（全部 808 件，材料 / 卡片都在）。            */
+/*   0x4169e9 查第一张、0x416a1a 查第二张（两个函数除了 `add ecx,0x14` 逐字节  */
+/*   一样）。礼物槽（0x463289）和接收礼物弹窗（0x461aeb）走的是 0x4169e9 ——    */
+/*   原版礼物只能是商店买来的东西，够用；我们从管理页发**材料**，第一张表查   */
+/*   不到就回空串，画出来是「(FileNotFound)」。合成 / 仓库 / 结算界面走的是     */
+/*   0x416a1a，所以那几处材料图标一直是好的。                                  */
+/*                                                                            */
+/*   补法：0x4169e9 查不到时不再返回空串，改去查第二张 —— 把 miss 分支头一条   */
+/*   `push offset L""`（5 字节，0x4169ff）换成 jmp，detour 里                  */
+/*   `mov ecx,[0x72e1e0]; push [ebp+8]; call 0x416a1a; jmp 0x416a14`。          */
+/*   0x416a1a 自己会 +0x14 选表、拿栈上那个 id、往 esi 指的字符串里写 ——       */
+/*   这几样在 0x4169e9 的栈帧里原样都在（esi 是调用方给的出参，0x4169e9 没动   */
+/*   它；ebp 还是它自己的帧），回来 `ret 4` 把 id 弹掉，栈正好平。             */
+/*   商店货架 / 浮窗（0x45bd5f 等）也走 0x4169e9，它们查的本来就命中，不受影响。 */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_GIFT_ICON_MISS=1 保留原版行为（对照用）。                 */
+/* -------------------------------------------------------------------------- */
+#define ICON_LOOKUP_VA          0x004169E9u
+#define ICON_LOOKUP_MISS_VA     0x004169FFu   /* push offset L"" —— 换成 jmp */
+#define ICON_LOOKUP_SIG_LEN     47
+static const unsigned char ICON_LOOKUP_SIG[ICON_LOOKUP_SIG_LEN] = {
+    0x55, 0x8B, 0xEC, 0x51,                   /* push ebp; mov ebp,esp; push ecx */
+    0x83, 0x65, 0xFC, 0x00,                   /* and [ebp-4], 0                  */
+    0x8D, 0x45, 0x08,                         /* lea eax, [ebp+8]  (&itemId)     */
+    0xE8, 0xC6, 0xED, 0xFF, 0xFF,             /* call 0x4157bf     (map find)    */
+    0x85, 0xC0,                               /* test eax, eax                   */
+    0x8B, 0xCE,                               /* mov ecx, esi                    */
+    0x75, 0x0C,                               /* jne 0x416a0b                    */
+    0x68, 0xFC, 0xDA, 0x65, 0x00,             /* push offset L""   ← 补丁点      */
+    0xE8, 0x70, 0xAF, 0xFE, 0xFF,             /* call 0x401979     (string ctor) */
+    0xEB, 0x09,                               /* jmp 0x416a14                    */
+    0x83, 0xC0, 0x08, 0x50,                   /* add eax, 8; push eax            */
+    0xE8, 0xAA, 0xC2, 0xFE, 0xFF,             /* call 0x402cbe     (copy ctor)   */
+    0x8B, 0xC6, 0xC9, 0xC2                    /* mov eax, esi; leave; ret 4      */
+};
+
+/* detour 里的立即数不带后缀（MSVC 内联汇编不吃 0x…u） */
+#define ICON_LOOKUP_TABLE_PTR   0x0072E1E0    /* [它] = 那个两张表的对象           */
+#define ICON_LOOKUP_MAP2_FN     0x00416A1A    /* 查第二张表（[Item-N]）的函数      */
+#define ICON_LOOKUP_EXIT        0x00416A14    /* 函数尾：mov eax,esi; leave; ret 4 */
+
+static __declspec(naked) void icon_lookup_fallback_detour(void)
+{
+    __asm {
+        mov  ecx, ICON_LOOKUP_TABLE_PTR
+        mov  ecx, dword ptr [ecx]           /* 两张表的宿主对象（调用方就是这么传的） */
+        push dword ptr [ebp + 8]            /* itemId（0x4169e9 自己的实参）         */
+        mov  eax, ICON_LOOKUP_MAP2_FN
+        call eax                            /* 0x416a1a：查 [Item-N] 那张，写进 esi */
+        push ICON_LOOKUP_EXIT
+        ret
+    }
+}
+
+static volatile LONG g_icon_lookup_patched = 0;
+
+static int gift_icon_miss_keep_original(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_GIFT_ICON_MISS", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_patch_gift_icon_fallback(void)
+{
+    unsigned char *fn = (unsigned char *)ICON_LOOKUP_VA;
+    unsigned char *p = (unsigned char *)ICON_LOOKUP_MISS_VA;
+    DWORD oldp;
+
+    if (g_icon_lookup_patched) return 1;
+    if (IsBadReadPtr(fn, ICON_LOOKUP_SIG_LEN)) return 0;
+    /* 幂等：已打过就是「E9 <跳到我们 detour 的 rel32>」 */
+    if (p[0] == 0xE9
+        && (DWORD)(*(int *)(p + 1))
+               == (DWORD)((UINT_PTR)&icon_lookup_fallback_detour
+                          - (UINT_PTR)(p + 5))) {
+        InterlockedExchange(&g_icon_lookup_patched, 1);
+        return 1;
+    }
+    if (memcmp(fn, ICON_LOOKUP_SIG, ICON_LOOKUP_SIG_LEN) != 0)
+        return 0;                          /* 还没解壳到这里，或不是已确认的版本 */
+
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   礼物盒图标退回物品表: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    p[0] = 0xE9;
+    *(DWORD *)(p + 1) = (DWORD)((UINT_PTR)&icon_lookup_fallback_detour
+                                - (UINT_PTR)(p + 5));
+    VirtualProtect(p, 5, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    InterlockedExchange(&g_icon_lookup_patched, 1);
+    bslog("PATCH   ★礼物盒图标退回物品表 @ %08X: 图标按 id 在商店货那张表查不到时"
+          "改查 [Item-] 那张（材料 / 卡片的图标在那儿），原版回空串画成 (FileNotFound)",
+          (unsigned)ICON_LOOKUP_MISS_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* ★ 「突击技加成」提示的空指针 —— 和上面那个**完全同型**（V0.3 §53）        */
 /*                                                                            */
 /*   2026-09-09 顺着「把 13 种加成全写进说明文」那一轮扫出来的：              */
@@ -5587,6 +5691,21 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_bonus_text_patched)
             bslog("PATCH   !! 超时未能 patch 客户端加成绿字"
                   "（0x41414D 特征串一直对不上）");
+    }
+
+    /* 礼物盒里材料没图标（V0.3商店 §75，2026-09-10 实机）：礼物槽 / 接收弹窗按 id
+       查图标查的是 [Stock-] 那张表，材料只在 [Item-] 那张。查不到就退回第二张。 */
+    if (gift_icon_miss_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_GIFT_ICON_MISS 已设，保留原版礼物盒图标查表"
+              "（材料礼物画成 (FileNotFound)）");
+    } else {
+        for (ticks = 0; !g_stop && !g_icon_lookup_patched && ticks < 2000; ticks++) {
+            if (try_patch_gift_icon_fallback()) break;
+            Sleep(2);
+        }
+        if (!g_icon_lookup_patched)
+            bslog("PATCH   !! 超时未能 patch 礼物盒图标退回物品表"
+                  "（0x4169E9 特征串一直对不上）");
     }
 
     /* 岩浆巨龙（Quest02）弱点剧情的窗口（用户 2026-09-10 线上报的卡关）：

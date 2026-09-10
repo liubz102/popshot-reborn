@@ -200,6 +200,22 @@ def ownable(item_id):
     return bool(item and item.ownable)
 
 
+def stackable(item_id):
+    """这件东西的**数量有没有意义**。装备类和角色卡没有 —— 只有「有」和「没有」。
+
+    判据是 `part_flag != 0`（= `equippable`）**或者是角色卡**，和 `shop.py` 里
+    「不能重复购买」用的是同一条（`check_purchase` 的 `BUY_ALREADY_OWNED`）——
+    角色卡 `part_flag == 0` 但一个角色只有「有 / 没有」（D51）。
+    客户端那边也是这么认的：`ItemInfo+0x10` 的形态标志里 `0x01` 才是「计数持有」，
+    装备发的是 `0x08` 可装备位，**数量那一格根本没人读**（FINDINGS §28）。
+    ⇒ 管理页「修改仓库」不给装备画数量框、发奖励时装备一律 ×1、
+    领礼物时已经有的装备不再放第二件，三处共用这一条。
+    """
+    if kind(item_id) == "character":
+        return False
+    return not equippable(item_id)
+
+
 def slot_owners(item):
     """这件东西点亮**哪几个角色**的槽位掩码（下标表）。
 

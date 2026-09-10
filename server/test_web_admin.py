@@ -208,6 +208,8 @@ class AdminAuthTests(_AdminCase):
                 ("/admin/api/players?q=a", None),
                 ("/admin/api/player?name=alice", None),
                 ("/admin/api/player", {"name": "alice", "money": 1}),
+                ("/admin/api/reward/players?q=a", None),
+                ("/admin/api/reward/send", {"players": ["alice"], "exp": 1}),
                 ("/admin/api/config/shop", {"text": "{}"}),
                 ("/admin/api/admins/add", {"name": "carol", "password": "pw1"}),
                 ("/admin/api/admins/password", {"name": "admin", "password": "pw1"}),
@@ -748,6 +750,24 @@ class AdminAssetTests(_AdminCase):
                                 js.decode("utf-8")))
         self.assertLessEqual(wanted - self.JS_MADE_IDS, page_ids)
 
+    def test_no_id_appears_twice_in_the_page(self):
+        """★ 撞名比拼错更阴：`$("x")` 拿到的是**排在前面**的那一个，另一个
+        再也不响应。2026-09-10 玩家弹窗里的在线状态和工具条上的在线筛选下拉
+        都叫 `playerOnline`，一打开弹窗就把下拉的三个选项抹成一行字。"""
+        _status, html = self.request("/admin")
+        ids = re.findall(r'\bid="([A-Za-z0-9_-]+)"', html)
+        dupes = sorted({name for name in ids if ids.count(name) > 1})
+        self.assertEqual([], dupes)
+
+    def test_the_reward_message_default_matches_the_server(self):
+        # 弹窗输入框里预填的那句和服务端「留空就用它」的那句必须是同一句 ——
+        # 两边各改一处就会出现「页面上写 A、实际发的是 B」。
+        _status, html = self.request("/admin")
+        match = re.search(r'id="rewardMessage"[^>]*value="([^"]*)"', html)
+        self.assertIsNotNone(match)
+        self.assertEqual(web_admin.REWARD_MESSAGE_DEFAULT, match.group(1))
+        self.assertIn('maxlength="%d"' % web_admin.REWARD_MESSAGE_MAX, match.group(0))
+
     #: 「几份配置 / 几个配置页」这种**写死的份数**。
     #:
     #: ★★ 2026-09-10 加第五份配置（金币 / 经验获取）时，页面上有四处白纸黑字
@@ -1148,6 +1168,8 @@ class OperatorPermissionTests(_AdminCase):
                 ("/admin/api/players?q=a", None),
                 ("/admin/api/player?name=alice", None),
                 ("/admin/api/player", {"name": "alice", "money": 1}),
+                ("/admin/api/reward/players?q=a", None),
+                ("/admin/api/reward/send", {"players": ["alice"], "exp": 1}),
                 ("/admin/api/admins", None),
                 ("/admin/api/admins/add", {"name": "dave", "password": "pw12345"}),
                 ("/admin/api/admins/password", {"name": "carol",
@@ -1315,6 +1337,8 @@ class PlayerReadOnlyTests(_AdminCase):
                 ("/admin/api/players?q=a", None),
                 ("/admin/api/player?name=alice", None),
                 ("/admin/api/player", {"name": "alice", "money": 999999}),
+                ("/admin/api/reward/players?q=a", None),
+                ("/admin/api/reward/send", {"players": ["alice"], "money": 999999}),
                 ("/admin/api/admins", None),
                 ("/admin/api/admins/add", {"name": "dave", "password": "pw12345"}),
                 ("/admin/api/admins/password", {"name": "admin",
@@ -1895,6 +1919,161 @@ class AdminPlayerTests(_AdminCase):
         self.assertEqual([{"id": self._MATERIAL, "count": 2,
                            "stackable": True}],
                          view["materials"])
+
+
+class AdminRewardTests(_AdminCase):
+    """「发送奖励」（用户 2026-09-10，D76）：批量发到玩家的礼物盒，玩家自己领。
+
+    ★ 这一页**不改任何人的仓库**：礼物落在 `gifts` 里，`0x0609` 领取时才入库。
+    """
+
+    _MATERIAL = 10001
+    _ARMOR = 1010064
+
+    class FakeConn:
+        """`_notify_gift` 只用得到这三样：账号名、重读存档、推 0x0507。"""
+
+        def __init__(self, name):
+            self.account_name = name
+            self.reloaded = 0
+            self.arrived = []
+
+        def reload_account(self):
+            self.reloaded += 1
+
+        def send_gift_arrived(self, reason=""):
+            self.arrived.append(reason)
+
+    def setUp(self):
+        super().setUp()
+        self.accounts.register("alice", "pw1", display_name="爱丽丝")
+        self.accounts.register("bob", "pw2", display_name="小明")
+        self.accounts.register("carol", "pw3", display_name="卡罗尔")
+        self.login()
+
+    def fake_online(self, *names):
+        real = web_admin._online_usernames
+        web_admin._online_usernames = lambda: set(names)
+        self.addCleanup(setattr, web_admin, "_online_usernames", real)
+        conns = [self.FakeConn(name) for name in names]
+        saved = list(gameserver._conns)
+        gameserver._conns[:] = conns
+        self.addCleanup(lambda: gameserver._conns.__setitem__(slice(None), saved))
+        return conns
+
+    def gifts_of(self, name):
+        return account_store.pending_gifts(self.accounts.get_account(name)[1])
+
+    def send(self, **payload):
+        return self.request("/admin/api/reward/send", payload)
+
+    # ------------------------------------------------------------ 名单
+    def test_the_player_list_is_not_paged_and_carries_the_online_flag(self):
+        self.fake_online("bob")
+        _status, result = self.request("/admin/api/reward/players?q=")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(3, result["total"])
+        self.assertFalse(result["truncated"])
+        self.assertEqual(1, result["online_total"])
+        self.assertEqual([("alice", "爱丽丝", False), ("bob", "小明", True),
+                          ("carol", "卡罗尔", False)],
+                         [(p["username"], p["nickname"], p["online"])
+                          for p in result["players"]])
+        _status, only = self.request("/admin/api/reward/players?q=&online=on")
+        self.assertEqual(["bob"], [p["username"] for p in only["players"]])
+        _status, by_nick = self.request(
+            "/admin/api/reward/players?q=" + urllib.parse.quote("小明"))
+        self.assertEqual(["bob"], [p["username"] for p in by_nick["players"]])
+
+    # ------------------------------------------------------------ 发送
+    def test_every_reward_becomes_one_gift_per_player(self):
+        _status, result = self.send(
+            players=["alice", "bob"],
+            items={str(self._MATERIAL): 5, str(self._ARMOR): 3},
+            exp=500, money=3000, message="干得漂亮")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(8, result["total"])
+        for name in ("alice", "bob"):
+            gifts = self.gifts_of(name)
+            self.assertEqual([(self._MATERIAL, 5, 0, 0), (self._ARMOR, 1, 0, 0),
+                              (0, 0, 500, 0), (0, 0, 0, 3000)],
+                             [(g["item"], g["count"], g["exp"], g["money"])
+                              for g in gifts], name)
+            for gift in gifts:
+                self.assertEqual("GM", gift["sender"])
+                self.assertEqual("干得漂亮", gift["message"])
+                self.assertTrue(gift["unread"])
+            account = self.accounts.get_account(name)[1]
+            # ★ 仓库 / 经验 / 金币一个字都没动 —— 要玩家自己去礼物盒领。
+            self.assertEqual({}, account_store.inventory_items(account))
+            self.assertEqual({}, account_store.material_counts(account))
+            self.assertEqual(0, account["experience"])
+            self.assertEqual(0, account_store.player_money(account))
+        self.assertEqual([], self.gifts_of("carol"), "没选的人一份都没有")
+        self.assertIn("2 名玩家", result["message"])
+        self.assertIn("8 份礼物", result["message"])
+
+    def test_the_message_falls_back_to_the_default_and_has_a_cap(self):
+        _status, result = self.send(players=["alice"], exp=1, message="   ")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(web_admin.REWARD_MESSAGE_DEFAULT,
+                         self.gifts_of("alice")[0]["message"])
+        _status, result = self.send(players=["alice"], exp=1,
+                                    message="长" * (web_admin.REWARD_MESSAGE_MAX + 1))
+        self.assertFalse(result["ok"])
+        self.assertIn("留言", result["message"])
+        self.assertEqual(1, len(self.gifts_of("alice")), "太长的那一发一份都不发")
+
+    def test_an_equipment_the_player_already_owns_is_skipped_and_named(self):
+        self.accounts.add_item("bob", self._ARMOR)
+        _status, result = self.send(players=["alice", "bob"],
+                                    items={str(self._ARMOR): 1}, exp=10)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(2, len(self.gifts_of("alice")))
+        bob = self.gifts_of("bob")
+        self.assertEqual([(0, 10)], [(g["item"], g["exp"]) for g in bob])
+        rows = {row["username"]: row for row in result["results"]}
+        self.assertEqual([self._ARMOR], rows["bob"]["skipped"])
+        self.assertEqual([], rows["alice"]["skipped"])
+        self.assertIn("已经有了", result["message"])
+        self.assertIn("bob", result["message"])
+
+    def test_bad_requests_send_nothing(self):
+        for payload, hint in ((dict(players=[], exp=5), "玩家"),
+                              (dict(players=["alice"]), "奖励"),
+                              (dict(players=["alice"], exp=-1), "负数"),
+                              (dict(players=["alice"], items={"9999999": 1}), "不认识"),
+                              (dict(players=["alice"], items={str(self._MATERIAL): -1}),
+                               "负数")):
+            _status, result = self.send(**payload)
+            self.assertFalse(result["ok"], payload)
+            self.assertIn(hint, result["message"], payload)
+        self.assertEqual([], self.gifts_of("alice"))
+        # 名单里有个不存在的号：其余照发，回执里点名。
+        _status, result = self.send(players=["alice", "nobody"], exp=5)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(1, len(self.gifts_of("alice")))
+        rows = {row["username"]: row for row in result["results"]}
+        self.assertFalse(rows["nobody"]["ok"])
+        self.assertIn("nobody", result["message"])
+
+    def test_online_players_get_the_arrival_notice_at_once(self):
+        alice, = self.fake_online("alice")
+        _status, result = self.send(players=["alice", "bob"], money=100)
+        self.assertTrue(result["ok"], result)
+        # 在线的那条连接：先重读存档（礼物是这条线程写的），再推一发 0x0507。
+        self.assertEqual(1, alice.reloaded)
+        self.assertEqual(1, len(alice.arrived))
+        rows = {row["username"]: row for row in result["results"]}
+        self.assertTrue(rows["alice"]["pushed"])
+        self.assertFalse(rows["bob"]["pushed"])
+        self.assertIn("1 人在线", result["message"])
+        # 一份都没发出去（装备已拥有）的人不提醒。
+        self.accounts.add_item("alice", self._ARMOR)
+        _status, result = self.send(players=["alice"], items={str(self._ARMOR): 1})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(1, len(alice.arrived))
+        self.assertEqual(0, result["total"])
 
 
 class AdminPromotePlayerTests(_AdminCase):

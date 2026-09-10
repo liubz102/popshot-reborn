@@ -17,6 +17,7 @@
 ⚠ 下行三发（`0x0500` / `0x0604` / `0x0508`）**一次都没在线上验过**，
 全是静态反汇编结论。别在文档里把它们升成 ✅。
 """
+import datetime
 import struct
 
 import shopdata
@@ -373,10 +374,13 @@ def build_shop_stock(item_id, name, price, currency=0, list_price=None,
     —— 提示框（`0x45c302` 起）两个都读。§26 结尾自己写过这个坑。
 
     `grants` 不给就默认「买什么到手什么」= `[item_id]`。
-    ★ 每个 `Item@ShopStock` 是 3 个 int，只有第一个（物品 id）被客户端读
-    （`0x4159e7` 拿它查 ItemDB），后两个语义未查明，填 0。
+    ★ 每个 `Item@ShopStock` 是 3 个 int：**物品 id、数量、期限天数**（§75，2026-09-10
+    实机 + `0x443444`：接收弹窗括号里那个「N个」读的是 `+0x08`、「N일」读 `+0x0c`）。
+    货架上客户端只读 id（`0x4159e7` 查 ItemDB）；礼物盒的接收 / 合并弹窗**读数量**
+    —— 填 0 玩家看到的是「（0个）」和「道具数量增加为 <原数>个」（用户 2026-09-10 实机）。
+    `grants` 的元素可以是 `id`（数量 1、无期限）或 `(id, 数量, 天数)`。
     """
-    ids = list(grants) if grants else [int(item_id)]
+    entries = list(grants) if grants else [int(item_id)]
     body = (w_i32(item_id)
             + w_wstr(name)
             + w_i32(price)
@@ -384,9 +388,13 @@ def build_shop_stock(item_id, name, price, currency=0, list_price=None,
             + w_i32(currency)
             + w_wstr(note)
             + w_i32(unknown2)
-            + w_i32(len(ids)))
-    for granted in ids:
-        body += w_i32(granted) + w_i32(0) + w_i32(0)
+            + w_i32(len(entries)))
+    for granted in entries:
+        if isinstance(granted, (tuple, list)):
+            gid, count, days = (list(granted) + [1, 0])[:3]
+        else:
+            gid, count, days = granted, 1, 0
+        body += w_i32(gid) + w_i32(count) + w_i32(days)
     return body
 
 
@@ -1042,18 +1050,155 @@ def parse_equip_request(payload):
 
 
 # ---------------------------------------------------------------------------
-# `0x0508` gspRepGiftList（服务端 → 客户端）
+# 礼物盒（FINDINGS §75，2026-09-10 静态逆出，**一发都没在线上验过**）
+#
+#   `0x0607` 要清单 → `0x0508 gspRepGiftList`
+#   `0x0609 gcpReqGiftAction`（礼物 id + 动作）→ `0x050a gspRepGiftAction`
+#   `0x0507`（服务端主动、无正文）= 「收到礼物」通知，任何界面都能收
+#
+# ★ 一份 `Gift` 内嵌的就是货架那个 `ShopStock`（同一个类、同一个 Des），
+#   所以「礼物能装什么」= 「货架能卖什么」= 一个 itemId。经验 / 金币走凭证 id（D76）。
 # ---------------------------------------------------------------------------
-def build_rep_gift_list(gifts=()):
-    """opcode `0x0508` 的包体 = 单个 `vector<Gift>`（Des `0x443b33`）。
+#: `0x0609` 的动作码（Ser `0x54cfa0`：`i32 礼物id + i32 动作`）。三处组包点：
+#: 礼物槽上点「받기」先发 **2**（`0x46356a`，打开看看），接收弹窗按「接收礼物」
+#: 发 **0**（`0x445189`），「丢弃后无法复原，真的要丢弃吗」按确定发 **1**（`0x44539d`）。
+GIFT_ACTION_RECEIVE = 0
+GIFT_ACTION_DISCARD = 1
+GIFT_ACTION_OPEN = 2
 
-    ★ **本版不做礼物**（PLAN「本版不做」），所以只支持空清单 = 4 个 0 字节。
-    留这个参数是为了让「以后要做」时函数签名不用改；给了非空就抛 ——
-    `Gift` 的线格式还没逆，静默发个半成品比不发更难查。
+#: `Gift+0x48` 的标志位。bit0 = **还没打开过**：槽上按钮写「받기 领取」；客户端收到
+#: 动作 2 的成功应答后自己 `and ~1`（`0x44baea`），按钮变「확인하기 查看」。
+GIFT_FLAG_UNREAD = 0x01
+
+#: 经验 / 金币在礼物盒里的**凭证物品 id**（D76）。原版礼物只能装物品，物品表里又
+#: 没有任何货币类物品 ⇒ 借两个**物品表里不存在**的 id 当凭证：`shopdata.exists()`
+#: 为假、永远进不了仓库；领取时服务端直接加经验 / 金币。`0x0501` 定义由
+#: `item_info_records()` 就地生成；客户端本地图标表查不到这个 id
+#: （`0x4169e9` 回空串）⇒ 接收弹窗里图标空白，不崩；礼物槽画的本来就是礼物盒图标。
+#: ★ 挑 7 位的 `99xxxxx`：真表里 `9000000~9999999` 一个都没有（2026-09-10 核过），
+#:   `test_shopdata` 那张合成小表也不占这一段（它用了 `990001`，所以别用 6 位的）。
+VOUCHER_EXP = 9900001
+VOUCHER_MONEY = 9900002
+VOUCHER_NAMES = {VOUCHER_EXP: "经验", VOUCHER_MONEY: "金币"}
+
+
+def is_voucher(item_id):
+    """这个 id 是不是经验 / 金币凭证（不是真物品，绝不能进仓库）。"""
+    try:
+        return int(item_id) in VOUCHER_NAMES
+    except (TypeError, ValueError):
+        return False
+
+
+def voucher_item_info(item_id):
+    """凭证的 `ItemInfo`：形态标志 0（接收弹窗括号里落在「无期限」那一档）、
+    不可装备、不限角色、不限等级。"""
+    item_id = int(item_id)
+    return build_item_info(item_id, name=VOUCHER_NAMES[item_id], flags=0,
+                           level=0, character=CHARACTER_UNLIMITED,
+                           desc="管理员发放的奖励，领取后直接到账")
+
+
+def gift_item_id(gift):
+    """礼物在 `ShopStock+0x04` 里报的 itemId：物品礼物就是那件物品，经验 / 金币走凭证。"""
+    item = int(gift.get("item") or 0)
+    if item:
+        return item
+    if int(gift.get("exp") or 0) > 0:
+        return VOUCHER_EXP
+    return VOUCHER_MONEY
+
+
+def gift_display_name(gift, item_name=None):
+    """礼物名 —— 接收弹窗「礼物名称」栏画的就是这个 wstr。
+
+    物品礼物**只写名字**：数量客户端自己按赠品条目那一格在括号里写「（5个）」
+    （用户 2026-09-10 实机：名字里再带「×5」就重复了）。经验 / 金币凭证的形态标志
+    是 0，括号里不显示数量，所以数字写进名字（「经验 ×500」）。
+    `item_name(itemId) -> str` 由调用方给（`shopcfg.name_of` 那一类），不给就 `#id`。"""
+    item = int(gift.get("item") or 0)
+    if item:
+        return (item_name(item) if item_name else None) or ("#%d" % item)
+    exp = int(gift.get("exp") or 0)
+    if exp > 0:
+        return "经验 ×%d" % exp
+    return "金币 ×%d" % int(gift.get("money") or 0)
+
+
+def build_systemtime(sent):
+    """`Gift+0x38` 那 16 字节 = Win32 `SYSTEMTIME`（8 个 u16：年 月 星期 日 时 分 秒 毫秒）。
+
+    接收弹窗只拿年 / 月 / 日拼 `%d/%d/%d`（`0x461c83` 起，读的是第 0 / 1 / 3 个 u16）。
+    `sent` 是存档里的 `YYYY-MM-DD HH:MM:SS`；解不开就全 0（弹窗写 0/0/0，不崩）。
     """
-    if gifts:
-        raise ValueError("Gift 的线格式还没逆出来，本版只支持空礼物清单")
-    return w_i32(0)
+    try:
+        when = datetime.datetime.strptime(str(sent), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return bytes(16)
+    return struct.pack("<8H", when.year, when.month, (when.weekday() + 1) % 7,
+                       when.day, when.hour, when.minute, when.second, 0)
+
+
+def build_gift(gift, item_name=None, note=""):
+    """一份礼物（`Gift`，Ser `0x44381a` / Des `0x443868`，内存 0x54）。
+
+    | 线上 | 结构偏移 | 含义 |
+    |---|---|---|
+    | `ShopStock` | `+0x04` | 和货架条目**同一个类**（`build_shop_stock`）：itemId / 名字 / 价格 / 说明 / 赠品清单 |
+    | wstr | `+0x30` | 发送人 → 接收弹窗「发送人」栏。== `"GM"` 时客户端跳过「向朋友致谢」的写纸条流程（`0x4482f0`）|
+    | wstr | `+0x34` | 留言 → 「信息」栏 |
+    | 16 B | `+0x38` | `SYSTEMTIME` → 「发送日期」= 年/月/日 |
+    | i32 | `+0x48` | 标志，bit0 = 未打开（`GIFT_FLAG_UNREAD`）|
+    | i32 | `+0x4c` | 礼物 id —— `0x0609` 回发的就是它 |
+
+    ⚠ 赠品清单**至少一项**：接收弹窗 `0x461b2e` 直接读 `grant[0]+4` 查 ItemDB，
+    空清单 = 空指针。★ 赠品条目的**第二个 int 是数量**（`0x443444` 读 `+0x08` 拼
+    「（N个）」，合并弹窗拿它算「道具数量增加为 N 个」）—— 物品礼物填真实数量，
+    凭证填 1（它的形态标志是 0，括号里不显示数量）。
+    价格 / 划线原价一律 0（礼物没有价格），货币 0 = 金币。
+    """
+    item_id = gift_item_id(gift)
+    count = int(gift.get("count") or 0) if int(gift.get("item") or 0) else 1
+    stock = build_shop_stock(item_id, gift_display_name(gift, item_name),
+                             price=0, list_price=0, note=note,
+                             grants=[(item_id, max(1, count), 0)])
+    flags = GIFT_FLAG_UNREAD if gift.get("unread", True) else 0
+    return (stock
+            + w_wstr(gift.get("sender") or "")
+            + w_wstr(gift.get("message") or "")
+            + build_systemtime(gift.get("sent"))
+            + w_i32(flags)
+            + w_i32(int(gift.get("id") or 0)))
+
+
+def build_rep_gift_list(gifts=()):
+    """opcode `0x0508` 的包体 = 单个 `vector<Gift>`（Des `0x443b33`）：`i32 n + n × Gift`。
+
+    `gifts` 是**已经组好的 `Gift` 字节**（`build_gift`）。空清单 = 4 个 0 字节
+    （2026-09-04 实测界面不崩）。
+    ⚠ 发之前先把每份礼物的 itemId 走一遍 `0x0501` 定义 —— 处理器 `0x44798d`
+    对查不到的 id 会再发一发定义请求，能答但没必要多一个来回。
+    """
+    gifts = list(gifts)
+    return w_i32(len(gifts)) + b"".join(gifts)
+
+
+def parse_gift_action(payload):
+    """`0x0609 gcpReqGiftAction` 的载荷 → `(礼物 id, 动作)`（Ser `0x54cfa0`：两个 i32）。"""
+    if len(payload) != 8:
+        raise ValueError("礼物动作请求应当是 8 字节，收到 %d" % len(payload))
+    return struct.unpack("<ii", payload)
+
+
+def build_rep_gift_action(gift_id, action, ok):
+    """opcode `0x050a gspRepGiftAction` 的包体（Des `0x443b9e`）：
+    `i32 礼物id + i32 动作 + i32 bool 成功`（bool 线上 4 字节，`0x5d59de`）。
+
+    处理器 `0x448072`：成功 + 动作 0 / 1 → 弹「已接收礼物[%s]。请在我的仓库中确认。」/
+    「丢弃礼物 [%s]。」并**本地删掉这一份**（`0x44bb6a`）；动作 2 → 只清未打开位；
+    **失败什么都不显示**（和 `0x0502` 的 ok=0 一个脾气）。
+    """
+    return w_i32(gift_id) + w_i32(action) + w_i32(1 if ok else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1198,6 +1343,12 @@ def item_info_records(item_ids, data_dir=None):
             item_id = int(raw)
         except (TypeError, ValueError):
             skipped.append(raw)
+            continue
+        if item_id in VOUCHER_NAMES:
+            # ★ 礼物盒里的经验 / 金币凭证（D76）：物品表里没有，定义在这儿现造。
+            #   客户端看见礼物清单里有不认识的 id 会自己来问（`0x0601` 上行），
+            #   这一条让那一问也答得上。
+            records.append(voucher_item_info(item_id))
             continue
         item = shopdata.get(item_id)
         if item is None:

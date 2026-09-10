@@ -19,6 +19,7 @@ import json
 import os
 import re
 import threading
+import time
 
 #: 物品表（V0.3商店 M1）。存档层要它只为回答两个**存储完整性**问题：
 #: 「这个 id 客户端认不认识」和「这两件抢不抢同一个槽」。
@@ -74,7 +75,22 @@ NEW_ACCOUNT_DEFAULTS = {
     "equipped": [],
     #: 合成材料的存量 `{itemId 字符串: 数量}`。★ 和 `inventory` 分开存（D11）。
     "materials": {},
+    #: 礼物盒（V0.3商店 D76）：管理页批量发的奖励先落在这里，玩家在游戏里的
+    #: 礼物盒领取之后才真的进仓库 / 加经验金币。一份礼物 = **一件物品（含数量）
+    #: 或一笔经验或一笔金币**，三者只占其一：
+    #:   {"id": 每账号递增的礼物号, "item": itemId 或 0, "count": 数量,
+    #:    "exp": 经验, "money": 金币, "sender": "GM", "message": 留言,
+    #:    "sent": "YYYY-MM-DD HH:MM:SS", "unread": 还没在游戏里打开过}
+    #: ★ `id` 是客户端领取 / 丢弃（`0x0609`）时回发的键，**永不复用** ——
+    #:   `gift_seq` 只增不减，客户端手里可能还捏着一份已经领走的旧清单。
+    "gifts": [],
+    "gift_seq": 0,
 }
+
+#: 管理页 / 控制通道发的礼物统一用这个发送人。★ 客户端拿它判「是不是 GM 送的」：
+#: 领取成功后 `0x4482f0` 拿发送人和 `"GM"` 比，相等就跳过「向朋友致谢」的写
+#: 纸条流程（FINDINGS §75）。改成别的字，玩家领完奖会被拉去给「GM」写纸条。
+GIFT_SENDER_GM = "GM"
 
 #: 客户端认为「教程已完成」的最小值。大厅 `0x43b357` 是 `cmp eax,3 / jge`（§54）。
 TUTORIAL_DONE_STATE = 3
@@ -473,15 +489,22 @@ class AccountStore:
                 # ★ 必须从**原始字典**算。走 `_merged_account()` 的话三个键
                 #   在读的那一刻就已经被补上了，永远看不出磁盘上缺什么。
                 inventory, equipped, materials, notes = normalize_item_fields(raw)
+                # 礼物盒（D76）同一条路：缺了补空的、坏条目洗掉、计数器不小于最大号。
+                gifts, seq, gift_notes = normalize_gift_fields(raw)
+                notes = notes + gift_notes
                 legacy = [key for key in LEGACY_CHARACTER_KEYS if key in raw]
                 if (raw.get("inventory") == inventory
                         and raw.get("equipped") == equipped
                         and raw.get("materials") == materials
+                        and raw.get("gifts") == gifts
+                        and raw.get("gift_seq") == seq
                         and not legacy):
                     continue
                 raw["inventory"] = inventory
                 raw["equipped"] = equipped
                 raw["materials"] = materials
+                raw["gifts"] = gifts
+                raw["gift_seq"] = seq
                 for key in legacy:
                     del raw[key]
                 changed.append({
@@ -786,6 +809,8 @@ class AccountStore:
             # —— 上传的文件是玩家用记事本改过的，脏条目不该落到磁盘上。
             (account["inventory"], account["equipped"],
              account["materials"], _notes) = normalize_item_fields(account)
+            # 礼物盒（D76）同理：坏条目洗掉、计数器不小于最大礼物号。
+            account["gifts"], account["gift_seq"], _gift_notes = normalize_gift_fields(account)
             for key in LEGACY_CHARACTER_KEYS:      # 旧键转成角色卡之后就不再落盘
                 account.pop(key, None)
             data["accounts"][username] = account
@@ -1306,6 +1331,151 @@ class AccountStore:
                 data["accounts"][username] = account
                 self._write_unlocked(data)
             return copy.deepcopy(account), changes
+
+    # ------------------------------------------------------------ 礼物盒
+    def add_gifts(self, username, specs, sender=GIFT_SENDER_GM, message=""):
+        """往礼物盒里塞几份礼物，返回 ``(更新后的账号, 新建的礼物列表)``。
+
+        `specs` 里一条 = 一份：`{"item": itemId, "count": 数量}` /
+        `{"exp": 经验}` / `{"money": 金币}`。**先全部校验再一次写盘** ——
+        客户端不认识的 id（`shopdata.ownable`）、数量 / 金额不是正数都抛
+        `AccountError`，一份都不写：批量发奖时半份到手比整份失败难查。
+        装备类（`shopdata.stackable()` 为假）一律 ×1，数量那一格客户端根本不读（§28）。
+        礼物号从 `gift_seq` 往上数，**永不复用**。
+        """
+        wanted = []
+        for spec in specs or ():
+            spec = spec or {}
+            try:
+                item = int(spec.get("item") or 0)
+                # ★ 不写 `or 1`：`count: 0` 是一条要拒绝的坏数据，不是「没写」。
+                count = spec.get("count")
+                count = 1 if count is None else int(count)
+                exp = int(spec.get("exp") or 0)
+                money = int(spec.get("money") or 0)
+            except (TypeError, ValueError):
+                raise AccountError("invalid_gift", f"礼物条目不合法: {spec!r}") from None
+            if item:
+                if not shopdata.ownable(item):
+                    raise AccountError(
+                        "unknown_item",
+                        f"物品 {item} 不在客户端认得的物品表里，不能发给玩家")
+                if count <= 0:
+                    raise AccountError("invalid_count", f"物品 {item} 的数量必须是正数")
+                wanted.append({"item": item,
+                               "count": count if shopdata.stackable(item) else 1,
+                               "exp": 0, "money": 0})
+            elif exp > 0:
+                wanted.append({"item": 0, "count": 0, "exp": exp, "money": 0})
+            elif money > 0:
+                wanted.append({"item": 0, "count": 0, "exp": 0, "money": money})
+            else:
+                raise AccountError("invalid_gift", "一份礼物得是一件物品、一笔经验或一笔金币")
+        sent = time.strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            if not wanted:
+                return copy.deepcopy(account), []
+            gifts = pending_gifts(account)
+            seq = gift_seq(account)
+            created = []
+            for spec in wanted:
+                seq += 1
+                gift = dict(spec, id=seq, sender=str(sender or GIFT_SENDER_GM),
+                            message=str(message or ""), sent=sent, unread=True)
+                gifts.append(gift)
+                created.append(dict(gift))
+            account["gifts"] = gifts
+            account["gift_seq"] = seq
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return copy.deepcopy(account), created
+
+    def _gift_unlocked(self, account, gift_id):
+        """持锁状态下找一份礼物；没有就 `AccountError("no_such_gift")`。"""
+        gift_id = int(gift_id)
+        for gift in pending_gifts(account):
+            if gift["id"] == gift_id:
+                return gift
+        raise AccountError("no_such_gift", f"礼物盒里没有 {gift_id} 号礼物")
+
+    def open_gift(self, username, gift_id):
+        """玩家在游戏里点开了一份礼物（`0x0609` 动作 2）：清掉「未打开」标记。
+        返回 ``(账号, 那份礼物)``；标记本来就清了就不写盘。"""
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            gift = self._gift_unlocked(account, gift_id)
+            if gift["unread"]:
+                gifts = pending_gifts(account)
+                for entry in gifts:
+                    if entry["id"] == gift["id"]:
+                        entry["unread"] = False
+                account["gifts"] = gifts
+                data["accounts"][username] = account
+                self._write_unlocked(data)
+                gift["unread"] = False
+            return copy.deepcopy(account), gift
+
+    def claim_gift(self, username, gift_id):
+        """领取一份礼物（`0x0609` 动作 0）：**一把锁里**入库 / 加经验金币 + 从礼物盒
+        删掉，一次写盘。返回 ``(账号, 那份礼物, 一句说明)``。
+
+        * 材料进 `materials`、其余物品进 `inventory`（和「修改仓库」一个分法）；
+        * 不可堆叠的装备**已经有了就不放第二件**（`shopdata.stackable`），礼物
+          照样算领掉 —— 客户端那边「数量」根本没人读，放第二件只是句空话；
+        * 经验 / 金币直接加，等级由经验重算（和 `add_quest_reward` 同一条路）。
+        礼物不存在抛 `AccountError("no_such_gift")`，一个字节不写。
+        """
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            gift = self._gift_unlocked(account, gift_id)
+            if gift["item"]:
+                item_id, count = gift["item"], gift["count"]
+                if shopdata.is_material(item_id):
+                    records = _material_records(account)
+                    records[item_id] = records.get(item_id, 0) + count
+                    account["materials"] = {str(i): records[i] for i in sorted(records)}
+                    note = f"材料 {item_id} ×{count} 进了材料表"
+                else:
+                    records = _inventory_records(account)
+                    entry = records.get(item_id)
+                    if entry is None:
+                        records[item_id] = {"count": count, "expires": None}
+                        note = f"物品 {item_id} ×{count} 进了仓库"
+                    elif shopdata.stackable(item_id):
+                        entry["count"] += count
+                        note = f"物品 {item_id} +{count}，现在 ×{entry['count']}"
+                    else:
+                        note = f"物品 {item_id} 已经拥有，没有再放第二件"
+                    account["inventory"] = {str(i): dict(records[i])
+                                            for i in sorted(records)}
+            else:
+                account["experience"] = (max(0, int(account.get("experience", 0)))
+                                         + gift["exp"])
+                account["money"] = max(0, int(account.get("money", 0))) + gift["money"]
+                account["level"] = level_for_experience(account["experience"])
+                note = (f"经验 +{gift['exp']}，现在 {account['experience']}（{account['level']} 级）"
+                        if gift["exp"] else
+                        f"金币 +{gift['money']}，现在 {account['money']}")
+            account["gifts"] = [g for g in pending_gifts(account) if g["id"] != gift["id"]]
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return copy.deepcopy(account), gift, note
+
+    def discard_gift(self, username, gift_id):
+        """丢弃一份礼物（`0x0609` 动作 1）：从礼物盒删掉，**什么都不发**。
+        返回 ``(账号, 那份礼物)``。"""
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            gift = self._gift_unlocked(account, gift_id)
+            account["gifts"] = [g for g in pending_gifts(account) if g["id"] != gift["id"]]
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return copy.deepcopy(account), gift
 
     # ----------------------------------------------------------- 管理员
     def _admin_table_unlocked(self, data):
@@ -1883,6 +2053,98 @@ def material_count(account, item_id):
         return _material_records(account).get(int(item_id), 0)
     except (TypeError, ValueError):
         return 0
+
+
+# ==========================================================================
+# 礼物盒（V0.3商店 D76）。发送人常量 `GIFT_SENDER_GM` 在文件头（类定义要用它当默认值）。
+# ==========================================================================
+
+#: 一份礼物在存档里的全部键（`NEW_ACCOUNT_DEFAULTS["gifts"]` 那段注释）。
+GIFT_KEYS = ("id", "item", "count", "exp", "money", "sender", "message",
+             "sent", "unread")
+
+
+def _gift_records(account):
+    """存档里的 `gifts` -> 洗干净的礼物列表（逐条容错，和别的读取器一个道理）。
+
+    丢掉：没有 id / id 重复的、既不是物品也没有经验金币的、物品客户端不认识的
+    （`shopdata.ownable`，和 `_inventory_records` 同一条）。三种内容互斥：
+    有物品就清掉经验金币，没物品就按「先经验后金币」只留一样。
+    """
+    if not account:
+        return []
+    raw = account.get("gifts")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    records = []
+    seen = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            gift_id = int(entry.get("id") or 0)
+            item = int(entry.get("item") or 0)
+            count = int(entry.get("count") or 0)
+            exp = int(entry.get("exp") or 0)
+            money = int(entry.get("money") or 0)
+        except (TypeError, ValueError):
+            continue
+        if gift_id <= 0 or gift_id in seen:
+            continue
+        if item:
+            if item < 0 or not shopdata.ownable(item):
+                continue
+            count = max(1, count)
+            exp = money = 0
+        elif exp > 0:
+            count, money = 0, 0
+        elif money > 0:
+            count = 0
+        else:
+            continue
+        seen.add(gift_id)
+        records.append({
+            "id": gift_id, "item": item, "count": count,
+            "exp": exp, "money": money,
+            "sender": str(entry.get("sender") or GIFT_SENDER_GM),
+            "message": str(entry.get("message") or ""),
+            "sent": str(entry.get("sent") or ""),
+            "unread": bool(entry.get("unread", True)),
+        })
+    return records
+
+
+def pending_gifts(account):
+    """礼物盒里现在有什么（已洗干净、按礼物号排好）。"""
+    return sorted(_gift_records(account), key=lambda gift: gift["id"])
+
+
+def gift_seq(account):
+    """这个账号发到第几号礼物了。★ 至少是现存礼物的最大号 —— 手改存档把
+    计数器改小了也不会发出重号。"""
+    try:
+        seq = int((account or {}).get("gift_seq") or 0)
+    except (TypeError, ValueError):
+        seq = 0
+    return max(seq, max((gift["id"] for gift in _gift_records(account)), default=0))
+
+
+def normalize_gift_fields(raw):
+    """把一个**原始**账号字典里的礼物盒洗成可以直接写回 JSON 的形态。
+
+    返回 ``(gifts, gift_seq, notes)``，和 `normalize_item_fields` 一个脾气：
+    `notes` 是给人看的改动说明，空表 = 本来就是干净的。
+    """
+    notes = []
+    for field in ("gifts", "gift_seq"):
+        if field not in raw:
+            notes.append("补上 " + field)
+    gifts = pending_gifts(raw)
+    before = raw.get("gifts")
+    had = len(before) if isinstance(before, (list, tuple)) else 0
+    if had > len(gifts):
+        notes.append("丢掉礼物盒里坏掉的 %d 份礼物" % (had - len(gifts)))
+    return gifts, gift_seq(raw), notes
 
 
 def equipped_items(account):

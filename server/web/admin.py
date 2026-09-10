@@ -484,6 +484,16 @@ def catalog():
 #: 一次性把整份名单发给浏览器。
 PLAYER_PAGE_SIZE = 10
 
+#: 「发送奖励」弹窗左栏一次最多列多少人（D76）。这不是等待阈值（铁律 10），是
+#: 「一次发给浏览器多少行」的界面取舍：勾人要看全的，所以不分页；线上一共几十个号，
+#: 全列出来最顺手。真超过这个数，回执里会写「只列了前 N 个，请缩小搜索范围」。
+REWARD_LIST_MAX = 1000
+#: 礼物里那句留言的默认值和长度上限（用户 2026-09-10：弹窗里可以自由改，留空就
+#: 用默认值）。接收弹窗的「信息」栏只有一行（517 px 宽），太长会被截掉。
+#: ★ `admin.html` 里那个输入框的 `value` 也写着同一句，`test_web_admin` 钉着两边一致。
+REWARD_MESSAGE_DEFAULT = "管理员发送的奖励"
+REWARD_MESSAGE_MAX = 50
+
 
 def default_admin_password_in_use(accounts):
     """默认管理员还在用出厂口令吗？
@@ -628,6 +638,26 @@ def _push_account(username):
     return pushed
 
 
+def _notify_gift(username):
+    """礼物进了礼物盒之后给在线的那条连接推一发 `0x0507`「收到礼物」（§75），
+    返回是否真推了。不在线就什么都不做 —— 登录后进大厅那一发 `0x0700` 会补提醒。"""
+    try:
+        import gameserver
+    except ImportError:
+        return False
+    pushed = False
+    for conn in gameserver.all_conns():
+        if conn.account_name != username:
+            continue
+        try:
+            conn.reload_account()
+            conn.send_gift_arrived(reason="（管理页发了奖励）")
+        except (OSError, AttributeError):
+            continue
+        pushed = True
+    return pushed
+
+
 def _parse_side(raw):
     """`base` / `cross_base` 那两个字段 → json 对象；没带或读不懂就是 `None`。
 
@@ -649,19 +679,14 @@ def _parse_side(raw):
 def stackable(item_id):
     """这件东西的**数量有没有意义**。装备类没有 —— 只有「有」和「没有」。
 
-    判据是 `part_flag != 0`（= `shopdata.equippable`）**或者是角色卡**，和
-    `shop.py` 里「不能重复购买」用的是同一条（`check_purchase` 的
-    `BUY_ALREADY_OWNED`）—— 角色卡 `part_flag == 0` 但一个角色只有「有 / 没有」
-    （`account_store.owned_characters()` 只看在不在仓库里，不看数量，D51）。
-
+    判据在 `shopdata.stackable()`（D76 起三处共用：这里、发奖励、领礼物）：
+    `part_flag != 0` 或角色卡 ⇒ 不可堆叠。
     ★ 客户端那边也是这么认的：`ItemInfo+0x10` 的形态标志里，`0x01` 才是
     「计数持有」（提示框写「소지개수 : %d개」），装备发的是 `0x08` 可装备位，
     **数量那一格根本没人读**（FINDINGS §28）。⇒ 给一件铠甲存 ×3 是句空话，
     管理页干脆不给填，免得管理员以为自己发了三件（用户 2026-09-05）。
     """
-    if shopdata.kind(item_id) == "character":
-        return False
-    return not shopdata.equippable(item_id)
+    return shopdata.stackable(item_id)
 
 
 def _optional_int(value, label):
@@ -688,6 +713,63 @@ def _counts_of(raw):
             raise ValueError(f"物品 {item_id} 的数量不能是负数")
         counts[item_id] = count
     return counts
+
+
+def _reward_request(data):
+    """`POST /admin/api/reward/send` 的载荷 → `(玩家列表, 礼物规格列表, 留言)`。
+
+    哪一样不合法就抛 `ValueError`，**一份都不发**（半批到手比整批失败难查）。
+    每样物品一份、经验一份、金币一份（D76：一份礼物 = 一件东西）；装备类
+    数量一律 1（`stackable()`）。
+    """
+    raw_players = data.get("players")
+    if not isinstance(raw_players, (list, tuple)):
+        raise ValueError("要先选玩家")
+    players = []
+    for name in raw_players:
+        name = str(name or "").strip()
+        if name and name not in players:
+            players.append(name)
+    if not players:
+        raise ValueError("要先选至少一个玩家")
+    specs = []
+    for item_id, count in sorted(_counts_of(data.get("items")).items()):
+        if count <= 0:
+            continue
+        if not shopdata.ownable(item_id):
+            raise ValueError(f"物品 {item_id} 客户端不认识，发不了")
+        specs.append({"item": item_id, "count": count if stackable(item_id) else 1})
+    exp = _optional_int(data.get("exp"), "经验") or 0
+    money = _optional_int(data.get("money"), "金币") or 0
+    if exp < 0 or money < 0:
+        raise ValueError("经验 / 金币不能是负数")
+    if exp:
+        specs.append({"exp": exp})
+    if money:
+        specs.append({"money": money})
+    if not specs:
+        raise ValueError("要先选至少一样奖励（物品、经验或金币）")
+    message = str(data.get("message") or "").strip() or REWARD_MESSAGE_DEFAULT
+    if len(message) > REWARD_MESSAGE_MAX:
+        raise ValueError(f"留言最多 {REWARD_MESSAGE_MAX} 个字，现在 {len(message)} 个")
+    return players, specs, message
+
+
+def _reward_summary(results, total, pushed):
+    """发奖回执的那一句人话（浮条 + 审计日志共用）。"""
+    sent_to = [row for row in results if row["ok"] and row["gifts"]]
+    parts = [f"已向 {len(sent_to)} 名玩家发出 {total} 份礼物，进了他们的礼物盒"]
+    if pushed:
+        parts.append(f"{pushed} 人在线，已当场提醒")
+    missing = [row["username"] for row in results if not row["ok"]]
+    if missing:
+        parts.append("没发出去：" + "、".join(missing))
+    skipped = ["%s（已拥有 %s）" % (row["username"], "、".join(
+        shopcfg.item_name(item_id) or str(item_id) for item_id in row["skipped"]))
+        for row in results if row["ok"] and row["skipped"]]
+    if skipped:
+        parts.append("装备已经有了、没重复发：" + "；".join(skipped))
+    return "；".join(parts)
 
 
 def _player_view(username, account):
@@ -879,6 +961,9 @@ class AdminRoutes:
         if path == "/admin/api/player":
             self._admin_player_get(query)
             return True
+        if path == "/admin/api/reward/players":
+            self._admin_reward_players(query)
+            return True
         if path == "/admin/api/backups":
             self._admin_backups_get()
             return True
@@ -903,6 +988,9 @@ class AdminRoutes:
             return True
         if path == "/admin/api/player":
             self._admin_player_save(data)
+            return True
+        if path == "/admin/api/reward/send":
+            self._admin_reward_send(data)
             return True
         if path.startswith("/admin/api/backups/"):
             self._admin_backup(path.rsplit("/", 1)[-1], data)
@@ -1604,3 +1692,89 @@ class AdminRoutes:
         self._send_json({"ok": True, "message": message,
                          "changes": changes, "pushed": pushed,
                          "player": _player_view(username, account)})
+
+    # -------------------------------------------------------- 发送奖励（D76）
+    def _admin_reward_players(self, query):
+        """`/admin/api/reward/players?q=…&online=…` —— 发奖弹窗左栏的名单。
+
+        **不分页**（勾人要看全的），最多 `REWARD_LIST_MAX` 行；`q` / `online`
+        和玩家仓库那一页同一套判据（`search_accounts` + `_online_filter`）。
+        ★ 系统管理员专用（和 `_admin_player_search` 同一档）。
+        """
+        if self._require_system_admin() is None:
+            return
+        fields = urllib.parse.parse_qs(query or "")
+        raw = (fields.get("q") or [""])[0]
+        online = _online_usernames()
+        keep = _online_filter((fields.get("online") or ["all"])[0], online)
+        found, total = self.accounts.search_accounts(
+            raw, limit=REWARD_LIST_MAX, offset=0, keep=keep)
+        self._send_json({
+            "ok": True,
+            "total": total,
+            "truncated": total > len(found),
+            "online_total": len(online),
+            "players": [{
+                "username": username,
+                "nickname": account_store.display_name(account),
+                "level": account_store.player_level(account),
+                "online": username in online,
+            } for username, account in found],
+        })
+
+    def _admin_reward_send(self, data):
+        """`POST /admin/api/reward/send` —— 批量发奖励到礼物盒（D76）。
+
+        载荷 `{players: [...], items: {id: 数量}, exp, money, message}`。每个玩家：
+        每样奖励各成**一份礼物**（`add_gifts`）；不可堆叠的装备**已经拥有就跳过**
+        并在回执里点名（塞第二件是句空话，§28）；在线的当场推 `0x0507` 提醒。
+        ★ 系统管理员专用。
+        """
+        admin = self._require_system_admin()
+        if admin is None:
+            return
+        try:
+            players, specs, message = _reward_request(data)
+        except ValueError as error:
+            self._reply(False, str(error))
+            return
+        results = []
+        total = 0
+        pushed = 0
+        for username in players:
+            _name, account = self.accounts.get_account(username)
+            if account is None:
+                results.append({"username": username, "ok": False,
+                                "message": "没有这个账号", "gifts": 0,
+                                "skipped": [], "pushed": False})
+                continue
+            owned = account_store.inventory_items(account)
+            mine, skipped = [], []
+            for spec in specs:
+                item_id = spec.get("item")
+                if item_id and not stackable(item_id) and item_id in owned:
+                    skipped.append(item_id)
+                    continue
+                mine.append(spec)
+            created = []
+            if mine:
+                try:
+                    _account, created = self.accounts.add_gifts(
+                        username, mine, sender=account_store.GIFT_SENDER_GM,
+                        message=message)
+                except account_store.AccountError as error:
+                    results.append({"username": username, "ok": False,
+                                    "message": error.message, "gifts": 0,
+                                    "skipped": skipped, "pushed": False})
+                    continue
+            told = _notify_gift(username) if created else False
+            total += len(created)
+            pushed += 1 if told else 0
+            results.append({"username": username, "ok": True,
+                            "gifts": len(created), "skipped": skipped,
+                            "pushed": told})
+        summary = _reward_summary(results, total, pushed)
+        eventlog.online(f"[admin] {admin!r} 发奖励 {[s for s in specs]} 留言={message!r}："
+                        f"{summary}")
+        self._send_json({"ok": True, "message": summary, "total": total,
+                         "results": results})

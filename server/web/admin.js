@@ -3134,7 +3134,9 @@ function renderPlayer() {
   var view = PLAYER.view;
   $("playerWho").textContent = view.nickname + "（" + view.username + "）";
   // 在线状态紧跟在名字后面（用户 2026-09-07），不再放标题栏右端。
-  $("playerOnline").textContent = view.online ? "● 在线，改完即时生效" : "○ 不在线";
+  // ★ 是 `playerOnlineNote` 不是 `playerOnline` —— 后者是工具条上那个在线筛选
+  //   下拉（D75），2026-09-10 撞过名：这一句把下拉的三个选项抹成了一行字。
+  $("playerOnlineNote").textContent = view.online ? "● 在线，改完即时生效" : "○ 不在线";
   $("playerLevel").value = PLAYER.edit.level;
   $("playerLevel").max = view.level_max;
   $("playerMoney").value = PLAYER.edit.money;
@@ -3384,6 +3386,338 @@ async function refreshPlayerPopup() {
   ok = (await openPlayer(name, true)) && ok;
   ok = (await searchPlayers()) && ok;
   if (ok) { toast("已刷新：玩家仓库和物品信息都是最新的。", true); }
+}
+
+/* ======================================================================
+   发送奖励（用户 2026-09-10，D76）
+
+   「玩家仓库」工具条上「发送奖励」点开的批量发奖窗：左栏选人、右栏选奖励，
+   「确认发送奖励」→ 确认框 → POST /admin/api/reward/send。服务端把每一样奖励
+   各写成一份礼物塞进目标玩家的**游戏内礼物盒**，玩家自己在游戏里领 ——
+   这里不改任何人的仓库。
+   右栏物品区照「修改仓库」弹窗那套（分类标签 / 两个下拉 / 格子 / 批量选择器），
+   只是没有等级 / 经验 / 金币三格 —— 经验金币在这儿是「每人发多少」，不是改存档。
+   ====================================================================== */
+var REWARD = null;   // {chosen:{username: row}, list:[row], items:{id: 数量}, tab, filter, q, online}
+
+async function openRewardModal() {
+  // ★ 每次打开都从头起（名单空、物品空、筛选「全部」、留言回默认值）——
+  //   上一次发过的人和东西留在这儿最容易「再发一遍」。
+  REWARD = {chosen: {}, list: [], items: {}, tab: anyTab(),
+            filter: {character: "", listing: ""}, q: "", online: "all",
+            truncated: false};
+  $("rewardSearch").value = "";
+  $("rewardOnline").value = "all";
+  $("rewardExp").value = 0;
+  $("rewardMoney").value = 0;
+  $("rewardMessage").value = $("rewardMessage").defaultValue;
+  $("rewardCount").textContent = "";
+  fillSelect($("rewardCharacter"), "全部角色", characterOptions(), "");
+  fillSelect($("rewardListing"), "全部上架状态", LISTING_FILTER_OPTIONS, "");
+  $("rewardModal").classList.remove("hidden");
+  renderRewardChosen();
+  repaintRewardItems();
+  await loadRewardPlayers();
+  $("rewardSearch").focus();
+}
+
+function closeRewardModal() {
+  REWARD = null;
+  $("rewardModal").classList.add("hidden");
+}
+
+/** 还有没发出去的选择（关标签页前拦一下用）。 */
+function rewardDirty() {
+  return !!(REWARD && (Object.keys(REWARD.chosen).length
+                       || Object.keys(REWARD.items).length));
+}
+
+/** 左栏名单：`/admin/api/reward/players`，不分页（勾人要看全的）。
+ *
+ * ★ 搜索框**边打边查**（用户 2026-09-10：打完字没反应，得去动一下在线下拉才刷）。
+ *   每次击键发一发，不设延时（铁律 10）；回包可能乱序 —— 每发带一个递增序号，
+ *   只认**最后发出去的那一发**的回包，早发晚到的直接丢掉。 */
+var REWARD_QUERY_SEQ = 0;
+
+async function loadRewardPlayers() {
+  if (!REWARD) { return false; }
+  var q = $("rewardSearch").value.trim();
+  var online = $("rewardOnline").value;
+  var seq = ++REWARD_QUERY_SEQ;
+  var result = await api("/admin/api/reward/players?q=" + encodeURIComponent(q)
+                         + "&online=" + encodeURIComponent(online));
+  if (bounced(result)) { return false; }
+  if (!REWARD) { return false; }               // 等回包期间弹窗被关了
+  if (seq !== REWARD_QUERY_SEQ) { return false; }   // 后面又发过了，这一发作废
+  if (!result.ok) {
+    toast((result && result.message) || "读不到玩家名单", false);
+    return false;
+  }
+  REWARD.list = result.players;
+  REWARD.q = q;
+  REWARD.online = online;
+  REWARD.truncated = !!result.truncated;
+  $("rewardCount").textContent = result.total + " 个账号"
+    + (online === "all" ? "" : "（" + ONLINE_FILTER_ZH[online] + "）")
+    + " · 全服在线 " + result.online_total + " 人";
+  renderRewardPlayers();
+  return true;
+}
+
+function renderRewardPlayers() {
+  var host = $("rewardPlayers");
+  var keep = host.scrollTop;
+  host.textContent = "";
+  if (!REWARD.list.length) {
+    host.appendChild(el("div", "own-empty",
+                        REWARD.online === "all"
+                          ? "没有匹配的账号"
+                          : "没有" + ONLINE_FILTER_ZH[REWARD.online] + "的匹配账号"));
+    return;
+  }
+  REWARD.list.forEach(function (row) {
+    var line = el("label", "reward-row" + (REWARD.chosen[row.username] ? " on" : ""));
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = !!REWARD.chosen[row.username];
+    box.onchange = function () {
+      if (box.checked) { REWARD.chosen[row.username] = row; }
+      else { delete REWARD.chosen[row.username]; }
+      line.classList.toggle("on", box.checked);
+      renderRewardChosen();
+    };
+    line.appendChild(box);
+    line.appendChild(el("span", "who", row.nickname + "（" + row.username + "）"));
+    line.appendChild(el("span", "state" + (row.online ? " on" : ""),
+                        row.online ? "● 在线" : "○ 不在线"));
+    line.appendChild(el("span", "lv", "Lv." + row.level));
+    host.appendChild(line);
+  });
+  if (REWARD.truncated) {
+    host.appendChild(el("div", "own-empty",
+                        "账号太多，只列了前 " + REWARD.list.length
+                        + " 个 —— 请缩小搜索范围"));
+  }
+  host.scrollTop = keep;
+}
+
+/** 「奖励玩家名单」那一排 chip：按用户名排，每个带 ✕。 */
+function renderRewardChosen() {
+  var host = $("rewardChosen");
+  host.textContent = "";
+  var names = Object.keys(REWARD.chosen).sort();
+  $("rewardChosenCount").textContent = names.length ? "已选 " + names.length + " 人" : "还没选人";
+  if (!names.length) {
+    host.appendChild(el("div", "own-empty", "在下面的列表里勾人，或者「全选」"));
+  }
+  names.forEach(function (username) {
+    var row = REWARD.chosen[username];
+    var chip = el("span", "chip" + (row.online ? " on" : ""),
+                  row.nickname + "（" + username + "）");
+    var drop = el("button", null, "✕");
+    drop.title = "从名单里去掉";
+    drop.onclick = function () {
+      delete REWARD.chosen[username];
+      renderRewardChosen();
+      renderRewardPlayers();              // 列表里那一行的勾也收掉
+    };
+    chip.appendChild(drop);
+    host.appendChild(chip);
+  });
+  paintRewardFoot();
+}
+
+/** 把当前列表里的人整批加进 / 移出名单。 */
+function rewardSelectListed(on) {
+  REWARD.list.forEach(function (row) {
+    if (on) { REWARD.chosen[row.username] = row; }
+    else { delete REWARD.chosen[row.username]; }
+  });
+  renderRewardPlayers();
+  renderRewardChosen();
+}
+
+/* ------------------------------------------------------------ 右栏物品 */
+
+/** 数量有没有意义（和服务端 `shopdata.stackable` 同一条：装备类 / 角色卡没有）。 */
+function rewardStackable(itemId) {
+  var item = BYID[itemId];
+  return !(item && (item.part_flag || item.kind === "character"));
+}
+
+function rewardEntries() {
+  return Object.keys(REWARD.items).map(Number).sort(function (a, b) { return a - b; })
+    .map(function (id) { return {id: id, cat: whCategory(id)}; });
+}
+
+function rewardFiltered() {
+  return rewardEntries().filter(function (entry) {
+    return dropdownsMatch(entry.id, REWARD.filter);
+  });
+}
+
+function renderRewardTabs() {
+  var rows = rewardFiltered();
+  paintCatTabs($("rewardCats"), $("rewardSubCats"), REWARD.tab, function (id) {
+    return rows.filter(function (entry) { return whMatches(id, entry.cat); }).length;
+  }, function () {
+    renderRewardTabs();
+    renderRewardItemList();
+  });
+}
+
+/** 一格奖励物品：图标 + 名字 + 数量框（装备类只画「×1」）+ ✕。 */
+function rewardItemNode(itemId) {
+  var box = el("div", "own");
+  box.appendChild(slotNode(itemId, 26, false, false));
+  var col = tipFor(el("div", "col"), itemId);
+  col.appendChild(el("div", "nmz", itemName(itemId)));
+  col.appendChild(el("div", "meta", ownMeta(itemId)));
+  box.appendChild(col);
+  if (!rewardStackable(itemId)) {
+    // 装备类只有「有 / 没有」（§28）—— 每人一件，数量没有意义。
+    var fixed = el("span", "fixed", "×1");
+    fixed.title = "装备类每人一件，数量没有意义";
+    box.appendChild(fixed);
+  } else {
+    var input = document.createElement("input");
+    input.type = "number";
+    input.min = "1";
+    input.step = "1";
+    input.value = REWARD.items[itemId];
+    input.oninput = function () {
+      REWARD.items[itemId] = Math.max(1, Number(input.value) || 1);
+      paintRewardFoot();
+    };
+    box.appendChild(input);
+  }
+  var drop = el("button", "btn btn-sm btn-danger drop", "✕");
+  drop.title = "从奖励里拿掉";
+  drop.onclick = function () {
+    delete REWARD.items[itemId];
+    repaintRewardItems();
+  };
+  box.appendChild(drop);
+  return box;
+}
+
+/** 画当前分类下的格子。★ 重画不动滚动条（D37b）。 */
+function renderRewardItemList() {
+  var box = $("rewardOwned");
+  var keep = box.scrollTop;
+  var grid = $("rewardOwnedGrid");
+  grid.textContent = "";
+  var requested = tabRequested(REWARD.tab);
+  var rows = rewardFiltered().filter(function (entry) {
+    return whMatches(requested, entry.cat);
+  });
+  if (!rows.length) {
+    grid.appendChild(el("div", "own-empty",
+                        rewardEntries().length ? "这个分类 / 筛选条件下没有东西"
+                                               : "还没选物品 —— 点「＋ 添加物品」；只发经验 / 金币也行"));
+  }
+  rows.forEach(function (entry) { grid.appendChild(rewardItemNode(entry.id)); });
+  box.scrollTop = keep;
+}
+
+function repaintRewardItems() {
+  renderRewardTabs();
+  renderRewardItemList();
+  paintRewardFoot();
+}
+
+/** 「＋ 添加物品」：和「修改仓库」同一个批量选择器；已经在奖励里的画成「已有」点不动。 */
+function rewardAddMany() {
+  openPicker({
+    multi: true,
+    owned: REWARD.items,
+    onPickMany: function (items) {
+      if (!REWARD) { return; }
+      var added = 0;
+      var hidden = 0;
+      var requested = tabRequested(REWARD.tab);
+      items.forEach(function (item) {
+        if (!REWARD.items[item.id]) {
+          REWARD.items[item.id] = 1;
+          added += 1;
+        }
+        if (!whMatches(requested, whCategory(item.id))
+            || !dropdownsMatch(item.id, REWARD.filter)) { hidden += 1; }
+      });
+      if (hidden) {
+        REWARD.tab = anyTab();
+        REWARD.filter = {character: "", listing: ""};
+        fillSelect($("rewardCharacter"), "全部角色", characterOptions(), "");
+        fillSelect($("rewardListing"), "全部上架状态", LISTING_FILTER_OPTIONS, "");
+      }
+      repaintRewardItems();
+      toast("已加入 " + added + " 件奖励物品，按「确认发送奖励」才真的发"
+            + (hidden ? "；有的不在刚才那个分类 / 筛选里，已切回「全部」" : ""),
+            true);
+    }
+  });
+}
+
+/* ------------------------------------------------------------ 发送 */
+
+/** 要 POST 的东西：人 + 物品数量表 + 经验 / 金币 + 留言（留空由服务端填默认值）。 */
+function rewardPayload() {
+  return {
+    players: Object.keys(REWARD.chosen).sort(),
+    items: REWARD.items,
+    exp: Math.max(0, Number($("rewardExp").value) || 0),
+    money: Math.max(0, Number($("rewardMoney").value) || 0),
+    message: $("rewardMessage").value.trim()
+  };
+}
+
+/** 奖励清单的人话：「黑色小珠 ×5」「经验 ×500」…… */
+function rewardParts(payload) {
+  var parts = Object.keys(payload.items).map(Number)
+    .sort(function (a, b) { return a - b; })
+    .map(function (id) { return itemName(id) + " ×" + payload.items[id]; });
+  if (payload.exp) { parts.push("经验 ×" + payload.exp); }
+  if (payload.money) { parts.push("金币 ×" + payload.money); }
+  return parts;
+}
+
+/** 底栏那句「N 名玩家 · M 样奖励」+ 发送钮能不能点。 */
+function paintRewardFoot() {
+  if (!REWARD) { return; }
+  var payload = rewardPayload();
+  var parts = rewardParts(payload);
+  var people = payload.players.length;
+  $("rewardSummary").textContent = (people ? people + " 名玩家" : "还没选人")
+    + " · " + (parts.length ? parts.length + " 样奖励，每人各一份" : "还没选奖励");
+  $("rewardSend").disabled = !(people && parts.length);
+}
+
+async function sendReward() {
+  if (!REWARD) { return; }
+  var payload = rewardPayload();
+  var parts = rewardParts(payload);
+  if (!payload.players.length || !parts.length) { return; }
+  var message = payload.message || $("rewardMessage").defaultValue;
+  var chosen = REWARD.chosen;
+  var ok = await ask({
+    title: "确认发送奖励",
+    lead: "给下面 " + payload.players.length + " 名玩家各发一份下列奖励，进他们游戏里的"
+          + "礼物盒，由玩家自己领取。\n留言：「" + message + "」",
+    lists: [
+      {label: "玩家（" + payload.players.length + "）",
+       rows: payload.players.map(function (username) {
+         return {label: chosen[username].nickname + "（" + username + "）"};
+       })},
+      {label: "奖励（每人各一份）",
+       rows: parts.map(function (part) { return {label: part}; })}],
+    ok: "发送"
+  });
+  if (!ok || !REWARD) { return; }
+  toast("发送中……", true);
+  var result = await api("/admin/api/reward/send", payload);
+  if (bounced(result)) { return; }
+  toast(result.message, result.ok);
+  if (result.ok) { closeRewardModal(); }
 }
 
 /** 物品表（`/admin/api/catalog`）：登录后拿一次，玩家弹窗的刷新再拿一次。 */
@@ -3679,6 +4013,45 @@ function wire() {
     if (PLAYER) { openPlayer(PLAYER.view.username, true); }
   };
 
+  // 发送奖励弹窗（D76）。和「修改仓库」一样只有 ✕ 能关：`#rewardModal`
+  // 故意**没有** onclick，也不认 Esc —— 里面是勾了一半的人和东西。
+  $("rewardOpenBtn").onclick = function () { openRewardModal(); };
+  $("rewardClose").onclick = closeRewardModal;
+  // 搜索框边打边查（回车也行）；在线下拉一改当场重查。
+  $("rewardSearch").oninput = function () { loadRewardPlayers(); };
+  $("rewardSearch").addEventListener("keydown", function (event) {
+    if (event.key === "Enter") { loadRewardPlayers(); }
+  });
+  $("rewardOnline").onchange = function () { loadRewardPlayers(); };
+  $("rewardSelectAll").onclick = function () { if (REWARD) { rewardSelectListed(true); } };
+  $("rewardSelectNone").onclick = function () { if (REWARD) { rewardSelectListed(false); } };
+  $("rewardChosenClear").onclick = function () {
+    if (!REWARD) { return; }
+    REWARD.chosen = {};
+    renderRewardChosen();
+    renderRewardPlayers();
+  };
+  $("rewardAddItem").onclick = function () { if (REWARD) { rewardAddMany(); } };
+  $("rewardItemsClear").onclick = function () {
+    if (!REWARD) { return; }
+    REWARD.items = {};
+    repaintRewardItems();
+  };
+  $("rewardCharacter").onchange = function () {
+    if (!REWARD) { return; }
+    REWARD.filter.character = $("rewardCharacter").value;
+    repaintRewardItems();
+  };
+  $("rewardListing").onchange = function () {
+    if (!REWARD) { return; }
+    REWARD.filter.listing = $("rewardListing").value;
+    repaintRewardItems();
+  };
+  ["rewardExp", "rewardMoney", "rewardMessage"].forEach(function (id) {
+    $(id).oninput = paintRewardFoot;
+  });
+  $("rewardSend").onclick = function () { sendReward(); };
+
   $("pickSearch").oninput = function () {
     PICKER.q = $("pickSearch").value.trim();
     paintPicker();
@@ -3765,7 +4138,8 @@ function wire() {
 
   // 关标签页前拦一下 —— 表单页最容易「改了半天忘了按保存」。
   window.addEventListener("beforeunload", function (event) {
-    if (CAT && (CONFIGS.some(isDirty) || playerDirty() || backupSettingsDirty())) {
+    if (CAT && (CONFIGS.some(isDirty) || playerDirty() || backupSettingsDirty()
+                || rewardDirty())) {
       event.preventDefault();
       event.returnValue = "";
     }

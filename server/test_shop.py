@@ -105,6 +105,31 @@ def parse_shop_item_list(body):
     return pages, page, groups
 
 
+def parse_gift(wire):
+    """照 `Gift::Des 0x443868` 读一份：ShopStock + 两个 wstr + 16 字节 + 两个 i32（§75）。"""
+    item_id = wire.i32()
+    name = wire.wstr()
+    price, list_price, currency = wire.i32(), wire.i32(), wire.i32()
+    note = wire.wstr()
+    wire.i32()                                    # ShopStock+0x1c ❓
+    grants = [(wire.i32(), wire.i32(), wire.i32()) for _ in range(wire.i32())]
+    sender, message = wire.wstr(), wire.wstr()
+    systemtime = struct.unpack("<8H", wire.take(16))
+    flags, gift_id = wire.i32(), wire.i32()
+    return {"item": item_id, "name": name, "price": price, "list_price": list_price,
+            "currency": currency, "note": note, "grants": grants,
+            "sender": sender, "message": message, "systemtime": systemtime,
+            "flags": flags, "id": gift_id}
+
+
+def parse_rep_gift_list(body):
+    """`0x0508` 的包体 → 礼物字典列表（`i32 n + n × Gift`，Des `0x443b33`）。"""
+    wire = _Wire(body)
+    gifts = [parse_gift(wire) for _ in range(wire.i32())]
+    wire.done()
+    return gifts
+
+
 def parse_rep_equipped_list(body):
     """`0x0604` 的包体 → `[物品 id]`。掩码用 `parse_equipped_masks` 单独看。"""
     return parse_equipped_masks(body)[1]
@@ -790,11 +815,77 @@ class PacketTests(_ShopCase):
         self.assertIsNone(why)
         self.assertIs(table[2120041], entry)
 
-    def test_礼物清单只支持空的(self):
+    def test_空礼物清单还是四个零字节(self):
+        # 2026-09-04 实测：回空清单界面不崩。做了礼物之后空清单的形状不能变。
         self.assertEqual(b"\x00\x00\x00\x00", shop.build_rep_gift_list())
+        self.assertEqual(b"\x00\x00\x00\x00", shop.build_rep_gift_list([]))
+
+    # ------------------------------------------------------------ 礼物盒（§75）
+    @staticmethod
+    def parse_gift(wire):
+        return parse_gift(wire)
+
+    def test_一份礼物的线格式(self):
+        gift = {"id": 7, "item": 10001, "count": 5, "exp": 0, "money": 0,
+                "sender": "GM", "message": "干得漂亮", "sent": "2026-09-10 15:04:05",
+                "unread": True}
+        gifts = parse_rep_gift_list(
+            shop.build_rep_gift_list([shop.build_gift(gift, lambda i: "黑色小珠")]))
+        self.assertEqual(1, len(gifts))
+        parsed = gifts[0]
+        self.assertEqual(10001, parsed["item"])
+        # ★ 名字**不带数量**：客户端自己按赠品条目在括号里写「（5个）」，名字里再写
+        #   「×5」就重复了（用户 2026-09-10 实机）。
+        self.assertEqual("黑色小珠", parsed["name"])
+        self.assertEqual((0, 0, 0), (parsed["price"], parsed["list_price"], parsed["currency"]))
+        # ★ 赠品清单至少一项：接收弹窗直接读 grant[0]（`0x461b2e`），空清单是空指针。
+        #   第二个 int 是**数量**（2026-09-10 实机：填 0 弹窗写「（0个）」）。
+        self.assertEqual([(10001, 5, 0)], parsed["grants"])
+        self.assertEqual(("GM", "干得漂亮"), (parsed["sender"], parsed["message"]))
+        # SYSTEMTIME：年 月 星期 日 时 分 秒 毫秒；2026-09-10 是星期四（wDayOfWeek=4）。
+        self.assertEqual((2026, 9, 4, 10, 15, 4, 5, 0), parsed["systemtime"])
+        self.assertEqual(shop.GIFT_FLAG_UNREAD, parsed["flags"])
+        self.assertEqual(7, parsed["id"])
+
+    def test_打开过的礼物不带未读位_日期坏了填零(self):
+        gift = {"id": 2, "item": 0, "count": 0, "exp": 500, "money": 0,
+                "sender": "GM", "message": "", "sent": "昨天", "unread": False}
+        wire = _Wire(shop.build_gift(gift))
+        parsed = self.parse_gift(wire)
+        wire.done()
+        self.assertEqual(shop.VOUCHER_EXP, parsed["item"], "经验走凭证 id")
+        self.assertEqual("经验 ×500", parsed["name"])
+        self.assertEqual([(shop.VOUCHER_EXP, 1, 0)], parsed["grants"])
+        self.assertEqual((0,) * 8, parsed["systemtime"])
+        self.assertEqual(0, parsed["flags"])
+
+    def test_经验金币凭证不是真物品但有定义(self):
+        self.assertTrue(shop.is_voucher(shop.VOUCHER_EXP))
+        self.assertTrue(shop.is_voucher(shop.VOUCHER_MONEY))
+        self.assertFalse(shop.is_voucher(10001))
+        self.assertFalse(shopdata.exists(shop.VOUCHER_EXP), "凭证 id 绝不能落在真物品表里")
+        self.assertFalse(shopdata.ownable(shop.VOUCHER_MONEY))
+        self.assertEqual("金币 ×3000",
+                         shop.gift_display_name({"item": 0, "exp": 0, "money": 3000}))
+        self.assertEqual(shop.VOUCHER_MONEY,
+                         shop.gift_item_id({"item": 0, "exp": 0, "money": 3000}))
+        # `0x0501` 定义：物品表里没有也答得上，和真物品混在一起也行。
+        records, skipped, _warnings = shop.item_info_records(
+            [shop.VOUCHER_EXP, 9999999, shop.VOUCHER_MONEY])
+        self.assertEqual([9999999], skipped)
+        ids = [_Wire(record).i32() for record in records]
+        self.assertEqual([shop.VOUCHER_EXP, shop.VOUCHER_MONEY], ids)
+
+    def test_礼物动作请求和应答(self):
+        self.assertEqual((7, shop.GIFT_ACTION_OPEN),
+                         shop.parse_gift_action(struct.pack("<ii", 7, 2)))
         with self.assertRaises(ValueError):
-            # `Gift` 的线格式还没逆 —— 静默发个半成品比不发更难查。
-            shop.build_rep_gift_list([{"id": 1}])
+            shop.parse_gift_action(b"\x07\x00\x00\x00")
+        # `0x050a` = i32 礼物id + i32 动作 + i32 bool（bool 线上 4 字节，`0x5d59de`）。
+        self.assertEqual(bytes.fromhex("07000000" "00000000" "01000000"),
+                         shop.build_rep_gift_action(7, shop.GIFT_ACTION_RECEIVE, True))
+        self.assertEqual(bytes.fromhex("07000000" "01000000" "00000000"),
+                         shop.build_rep_gift_action(7, shop.GIFT_ACTION_DISCARD, False))
 
 
 class ItemInfoTests(_ShopCase):
