@@ -3003,7 +3003,7 @@ Character::ProcessDash 0x5077c6
 | 归因 | 份数 | 状态 |
 |---|---|---|
 | §78 换图野指针 | **16** | ✅ 本轮根治（hook） |
-| §68 `nmconew.dll` 自制锁在等待期间被析构 | 4 | ❌ 没修 |
+| §68 `nmconew.dll` 自制锁在等待期间被析构 | 4 | ✅ 本轮根治（**§80**：整套信使不让加载）|
 | 结算/关卡销毁时逐座位走链表，表头是野值（`0x55C811`，栈 `0x48CFB7 → 0x55E05F → 0x55C289`）| 1 | ❌ 无复现 |
 | 宽字符串没有结尾 0，`0x4012ED` 的 `wcslen` 扫到未映射页（扫了 3375 个字才撞墙，栈 `0x40EF4F → 0x425629 → …`）| 1 | ❌ 无复现 |
 | UI 环形表越界（`0x438BD5`，`[esi+0x3ca0]` 当下标取 `[esi+eax*12+0x568]`，栈 `0x40EF4F → 0x426BE8 → 0x42D12D → 0x42D250 → 0x438ACF`）| 1 | ❌ 无复现 |
@@ -3012,9 +3012,50 @@ Character::ProcessDash 0x5077c6
 **同一个账号在本机重新登录**（新连接把旧连接顶掉，`online.log` 里是同一毫秒的
 「✓ 登录 / - 断开」），新登进来的那个客户端 **17~31 秒后**崩在 `nmconew`。
 9-10 一天里这个形状出现 5 次（09:57:59 / 12:27:19 / 12:53:33 / 15:52:39 …），
-其中 4 次上报到了崩溃日志。要修得先拍板动不动 `NMService.exe`（D71 ④）。
+其中 4 次上报到了崩溃日志。★ 用户 2026-09-10 拍板「没用可以不要」⇒ **§80 整套关掉**。
 
 ★ **归因时先对时钟**：崩溃报告里的时刻是**玩家那台机器**的本地时间。
 `d314010739` 快约 4 分钟、`concon` / `306052979` 基本准。
 判据用 `receipt.json` 的 `received_at`（服务端时刻）去和 `online.log` 对，
 别拿 `crash_time_text` 直接配。
+
+## §80 ★★★★ NEXON 那套信使整个关掉：`nmconew.dll` 不让加载，`NMService.exe` 跟着就没了（🔍静态落锤 + ✅本机装上，2026-09-10，bug调查/18）
+
+**结论**：把 `nmcogame.dll` 自己那一格 `LoadLibraryA` 换成过滤桩、见到 `nmconew.dll`
+就回 `NULL`，**§68 那一族崩溃从根上消失**，而且是**原版自己设计好的失败路径**，
+不弹框、不下载、不卡。`NMService.exe` 是 `nmconew.dll` 拉起来的，也一起没了。
+
+### 为什么不是「拿运气换心安」（§68 当时不敢动的理由已经不成立）
+
+§68 想的是**改 `nmconew` 里那两句写**——那确实只是把崩溃挪一行。
+换个位置就干净了：**根本别让它加载**。逐条静态坐实：
+
+| # | 事实 | 证据 |
+|---|---|---|
+| 1 | `nmconew.dll` **全进程只有一个加载点** | `nmcogame!NMCO_CallNMFunc` 的 `0x10002005` / `0x1000201E` 调 `DynamicLib::Load(0x10001430)`；路径 = `GetModuleFileNameA` + `PathRemoveFileSpec` + `0x10006AD0` 返回的 `"nmconew.dll"`（`0x10001D62..0x10001D8A`）|
+| 2 | 那个 `Load` **判空** | `0x10001452 call LoadLibraryA` → `0x10001458 cmp eax,edi(0)` → `je 0x10001482` 直接返回，`[this+4]=[this+8]=0` |
+| 3 | `NMCO_CallNMFunc` 有**设计好的退路** | `0x10002023` 取 `[0x10036168]`（proc 指针），`test/je 0x1000204F` → 往日志**文件**写一行 `"Fail to load messenger module! Version file URL: …"`（`0x10003870` 是文件记录器）→ `0x1000209E xor eax,eax` **返回 0** |
+| 4 | **不会弹框** | 全模块唯一那个 MessageBox 包装 `0x10027CCF` 只被 `0x1002330E` / `0x10025908` 调，和这条路无关 |
+| 5 | **不会去下载** | `RemoteFilePath` / `MessengerModule/nmconew.dll` 那套是按 `http://ngm.nexon.com` 上的版本文件决定的，和 `LoadLibrary` 成败无关；那个 URL 停机 15 年，本来每次就已经在失败 |
+| 6 | 客户端侧接得住 | `0x5441DB` 拿返回值 `cmp eax,1 / jne` 走失败分支，包装函数返回 false；而登录路上那个初始化 `0x532FC4 call 0x544738` **连返回值都没测**（下一条是 `cmp ebx,1`，`ebx` 是入参） |
+| 7 | `NMService.exe` **只由 `nmconew.dll` 起** | exe 名（`nmconew.dll` file `0xD0E60`）和命令行模板 `"%s" -domain:%s`（file `0xD70BD`）**只在 `nmconew.dll` 里**，`nmcogame.dll` 里一个字都没有 ⇒ 不用再去拦 `CreateProcess` |
+
+### 做法
+
+**只改 `nmcogame.dll` 自己的 IAT**（RVA `0x2C030` = 它导入的 `kernel32!LoadLibraryA`），
+不 inline hook `kernel32!LoadLibraryA` —— 那是全进程热路径，为一个 DLL 动它波及面太大。
+
+写之前先核对「这一格现在正好 == `GetProcAddress(kernel32,"LoadLibraryA")`」，
+对不上就不写并打一行日志。**这比字节特征串更硬**：它直接证明这一格就是那个导入槽。
+
+★ `nmcogame` 的另外几处 `LoadLibraryA` 加载的是 `user32.dll`（为了 `MessageBoxA`）
+和 `wship6`（为了 `getaddrinfo`），过滤桩按文件名放行，一个字节没动。
+
+**逃生门**：`BSHOOK_KEEP_NM=1` 保留原版（要用信使 / 要复现 §68 时）。
+
+**自证过的**（本机真客户端）：`PATCH ★NEXON 信使已关 … nmcogame.dll base=00F60000
+IAT 00F8C030` 那行在（说明「== kernel32!LoadLibraryA」那道核对通过了）；
+从**活进程**回读 `00F8C030`，值落在 `bshook.dll+0x37E0` = 过滤桩。
+**没自证的**：⏳ **没真的登录过一次** —— `nmconew.dll` 是**点登录那一刻**才加载的
+（云端日志里：`connect 47611` 之后 72 ms 加载，再 790 ms 起 `NMService.exe`），
+所以那一行 `★NM 挡下…` 要实机登录才会出现（Z-70）。

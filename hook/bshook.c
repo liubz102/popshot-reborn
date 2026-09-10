@@ -4046,6 +4046,143 @@ static int try_patch_mapchange_dangling(void)
     return 1;
 }
 
+/* -------------------------------------------------------------------------- */
+/* ★★★★ 关掉 NEXON 那套信使 —— `nmconew.dll` 一律不让加载                     */
+/*        （V0.3 §80，bug调查/18；根治 §68 那一族崩溃，用户 2026-09-10 拍板）  */
+/*                                                                            */
+/*   §79 里 23 份线上崩溃有 4 份栈**整条都在 `nmconew.dll` 里**（两个落点：    */
+/*   `+0x98D62` 自制互斥体 `Enter()` 醒来往已析构的锁里写、`+0x26591`）。      */
+/*   触发条件这次看清楚了：**同一个账号在本机重新登录**（新连接把旧的顶掉），  */
+/*   新登进来那个客户端 17~31 秒后崩 —— 信使那套东西在拆了重建的缝里翻车。     */
+/*                                                                            */
+/*   §68 当时不敢动它（基址随机、锁对象已经没了，跳过那两句只是把崩溃挪一行）。 */
+/*   ★ 换个位置就干净了：**根本别让它加载**。这套信使连的是停机 15 年的        */
+/*   `platform.tiancity.com` / `ngm.nexon.net`，功能早就是零。                 */
+/*                                                                            */
+/*   为什么这么做是安全的（全部静态坐实，不是「试试看」）：                    */
+/*                                                                            */
+/*     1. `nmconew.dll` **只有一个加载点** —— `nmcogame.dll` 的                */
+/*        `NMCO_CallNMFunc`（`0x10002005` / `0x1000201E` 调它的               */
+/*        `DynamicLib::Load`，路径是 `GetModuleFileNameA` + 目录 + 文件名，    */
+/*        文件名由 `0x10006AD0` 返回 = `"nmconew.dll"`）。                     */
+/*     2. 那个 `Load` 对 `LoadLibraryA` 返回 NULL **判空**（`0x10001458`），   */
+/*        `NMCO_CallNMFunc` 随后 `[0x10036168] == 0` 走                       */
+/*        `0x1000204F` 那条**设计好的退路**：往日志文件写一行                  */
+/*        `"Fail to load messenger module! Version file URL: …"`              */
+/*        （`0x10003870` 是写文件的记录器，不是弹框 —— 全模块唯一那个          */
+/*        MessageBox 包装 `0x10027CCF` 只被 `0x1002330E` / `0x10025908` 调）， */
+/*        然后 `xor eax,eax` **返回 0**。                                     */
+/*     3. 客户端侧 `0x5441DB` 拿到返回值就 `cmp eax,1 / jne` 走失败分支、      */
+/*        整个包装函数返回 false —— 一条**原版自己就有**的普通失败路径。       */
+/*     4. `NMService.exe` 的 exe 名和 `"%s" -domain:%s` 命令行模板             */
+/*        **只存在于 `nmconew.dll` 里**（`nmcogame.dll` 里一个字都没有）       */
+/*        ⇒ 不加载它，那个进程自然也不会被拉起来。用户要的「不要 NMService」   */
+/*        这一条同时就做到了，不用再去拦 `CreateProcess`。                     */
+/*                                                                            */
+/*   做法：**只改 `nmcogame.dll` 自己的 IAT**（RVA `0x2C030` = 它导入的        */
+/*   `kernel32!LoadLibraryA`），换成一个按文件名过滤的桩。不去 inline hook     */
+/*   `kernel32!LoadLibraryA` —— 那是全进程的热路径，为了一个 DLL 去动它        */
+/*   波及面太大。写之前先核对「这一格现在正好等于                              */
+/*   `GetProcAddress(kernel32,"LoadLibraryA")`」，对不上就不写（这比字节特征   */
+/*   串更硬：它直接证明这一格就是那个导入槽）。                                */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_NM=1 保留原版行为（要用信使 / 要复现 §68 时）。            */
+/* -------------------------------------------------------------------------- */
+#define NMCOGAME_LOADLIBRARYA_IAT_RVA  0x0002C030u
+
+typedef HMODULE (WINAPI *LoadLibraryA_t)(LPCSTR);
+static LoadLibraryA_t s_nm_LoadLibraryA = NULL;   /* 真的那一个 */
+static volatile LONG g_nm_block_hits = 0;
+static volatile LONG g_nm_blocked = 0;
+
+/* 大小写无关地找子串（不用 CRT 的 _stricmp/strstr 组合，短小自证）。 */
+static int name_has_ci(const char *hay, const char *needle)
+{
+    size_t i, j;
+    if (!hay || !needle) return 0;
+    for (i = 0; hay[i]; i++) {
+        for (j = 0; needle[j]; j++) {
+            char a = hay[i + j], b = needle[j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+            if (a != b) break;
+        }
+        if (!needle[j]) return 1;
+    }
+    return 0;
+}
+
+static HMODULE WINAPI det_nmcogame_LoadLibraryA(LPCSTR name)
+{
+    if (name_has_ci(name, "nmconew")) {
+        LONG n = InterlockedIncrement(&g_nm_block_hits);
+        bslog("★NM     挡下 nmcogame 加载信使模块：\"%s\"（第 %ld 次）—— "
+              "NMCO_CallNMFunc 会走它自己的「模块不可用」退路返回 0，"
+              "NMService.exe 也不会被拉起来（bug调查/18 §80）",
+              name ? name : "(null)", (long)n);
+        SetLastError(ERROR_MOD_NOT_FOUND);
+        return NULL;
+    }
+    return s_nm_LoadLibraryA(name);
+}
+
+static int nm_keep_original(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_NM", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_block_nexon_messenger(void)
+{
+    HMODULE nmcogame, k32;
+    LoadLibraryA_t real;
+    LoadLibraryA_t *slot;
+    DWORD oldp;
+
+    if (g_nm_blocked) return 1;
+    nmcogame = GetModuleHandleA("nmcogame.dll");
+    if (!nmcogame) return 0;                     /* 还没加载，下一轮再来 */
+    k32 = GetModuleHandleA("kernel32.dll");
+    if (!k32) return 0;
+    real = (LoadLibraryA_t)GetProcAddress(k32, "LoadLibraryA");
+    if (!real) return 0;
+
+    slot = (LoadLibraryA_t *)((UINT_PTR)nmcogame + NMCOGAME_LOADLIBRARYA_IAT_RVA);
+    if (IsBadReadPtr(slot, sizeof(*slot))) {
+        bslog("★NM     nmcogame IAT %08X 读不了，放弃拦截（保留原版行为）",
+              (unsigned)(UINT_PTR)slot);
+        InterlockedExchange(&g_nm_blocked, 1);   /* 别再重试 */
+        return 1;
+    }
+    if (*slot == det_nmcogame_LoadLibraryA) {    /* 幂等 */
+        InterlockedExchange(&g_nm_blocked, 1);
+        return 1;
+    }
+    if (*slot != real) {
+        bslog("★NM     nmcogame IAT %08X = %08X，不是 kernel32!LoadLibraryA(%08X)"
+              " —— 版本对不上，不动它",
+              (unsigned)(UINT_PTR)slot, (unsigned)(UINT_PTR)*slot,
+              (unsigned)(UINT_PTR)real);
+        InterlockedExchange(&g_nm_blocked, 1);
+        return 1;
+    }
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &oldp)) {
+        bslog("★NM     nmcogame IAT VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    s_nm_LoadLibraryA = real;
+    *slot = det_nmcogame_LoadLibraryA;
+    VirtualProtect(slot, sizeof(*slot), oldp, &oldp);
+    InterlockedExchange(&g_nm_blocked, 1);
+    bslog("PATCH   ★NEXON 信使已关（bug调查/18）: nmcogame.dll base=%08X "
+          "IAT %08X 的 LoadLibraryA 换成过滤桩 —— nmconew.dll 不再加载，"
+          "NMService.exe 也不会起（BSHOOK_KEEP_NM=1 可退回原版）",
+          (unsigned)(UINT_PTR)nmcogame, (unsigned)(UINT_PTR)slot);
+    return 1;
+}
+
 /* ========================================================================== */
 /* ★ M3b 诊断：弹体全字段快照 —— 查「bot 的子弹别人看不见」（V0.3 §53~§56）   */
 /*                                                                            */
@@ -5904,6 +6041,21 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_mapchg_clear_patched)
             bslog("PATCH   !! 超时未能 patch 换图野指针根治"
                   "（0x4790CB 特征串一直对不上）");
+    }
+
+    /* bug调查/18（§80）：把 NEXON 那套信使整个关掉 —— `nmconew.dll` 不让加载，
+       `NMService.exe` 跟着就不会被拉起来。用户 2026-09-10 拍板「没用可以不要」。
+       ★ 等的是 `nmcogame.dll` 出现（它是 BigShot.exe 的静态导入，解壳后就在），
+       而真正要拦的那一发发生在**玩家点登录**的时候，远在后面。 */
+    if (nm_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_NM 已设，保留 NEXON 信使（nmconew.dll 照常加载）");
+    } else {
+        for (ticks = 0; !g_stop && !g_nm_blocked && ticks < 2000; ticks++) {
+            if (try_block_nexon_messenger()) break;
+            Sleep(2);
+        }
+        if (!g_nm_blocked)
+            bslog("PATCH   !! 超时未能关掉 NEXON 信使（nmcogame.dll 一直没出现）");
     }
 
     /* BSM1 is a functional patch, independent of diagnostic log settings. */
