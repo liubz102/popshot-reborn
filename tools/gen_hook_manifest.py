@@ -27,8 +27,9 @@
 
 ## 为什么放在 `server/` 里
 
-两个打包脚本本来就**整个 `server/` 递归拷**（铁律 8：客户端包和服务端包共用
-同一份服务端代码），放这儿零打包改动就同时进了两个包。
+客户端包和服务端包共用同一份服务端代码（铁律 8），两个打包脚本都经
+`Copy-ServerCode` -> `Copy-HookManifest`（`tools/build-common.ps1`）把它带进包
+—— ★ 打包**只拷 `*.py`**，JSON 是显式拷的，不是「递归拷 server/ 顺带的」。
 
 ## 累积 + 幂等（同 `update_manifest.py`）
 
@@ -37,14 +38,36 @@
 
 同一个版本再打一次包时**原位刷新**，不新增条目：开发期同一个版本号会反复
 重打包，母本必须是「一条命令重跑不坏」的状态。
-⚠ 反过来说：**同一个版本号下重编过 hook，就等于作废了已经发出去的那一批**
-（它们的 sha256 对不上了，会被强制更新）。重编就顺手抬版本号。
+
+## ★ 同一个版本号下重编 hook：**最新版本随便刷，老版本冻结**（退出码 2）
+
+开发机上对**最新版本**「改 -> 打包 -> 测」是反复来的，清单同版本原位刷新，
+这一档不设闸门。本地没有「这一版是否已经上传 GitHub」这个事实
+（`tools/update-manifest.json` 是打包时就写的，不等于发出去了），所以不能拿
+「在不在里面」当判据 —— 2026-09-11 review 加过这么一道，用户否掉，改成：
+
+**`update-manifest.json` 里版本号最大的那条（正常流程里就是第一条）允许刷新，
+比它老的一律冻结。** 老版本已经被更新的版本盖过去、那批玩家早发出去了，它的
+hook 再变只会让他们全被判「改过」；而正在做的最新版本本来就要反复打。
+冻结的版本 hash 变了 -> 拒绝写、退出码 2；打包脚本见到直接中断，
+`hook/build.bat` 打大字警告。真要重发一个老版本（并替换 GitHub 上它的 zip）
+才用 `--force`。
+
+最新版本这一档的代价照旧要清楚：**发出去之后再重编 = 那一批 sha256 全对不上**，
+会被判「改过」而强制更新。所以发出去之后再重编，必须**整包重新上传 GitHub
+并覆盖服务端**：新更新器（V0.3.2 起）被拒后无视版本比较重下同版本（§90 一），
+zip 换了就自愈；只覆盖服务端不换 zip，老那批就会反复重装同一份 -> 死循环。
+
+★ 表里**只能有带校验码的那些版本**（V0.3.2 起）。V0.3.1 及更早发出去的
+hook 没有这段代码，给它们加条目 = 宣布那批玩家「本该带校验位却没带」-> 全被拒，
+而他们那版更新器又不会重装同版本 -> 卡死（2026-09-11 review 抓到过一条）。
 
 ## 用法
 
     python tools/gen_hook_manifest.py                  # 版本号取 build-ver.config
     python tools/gen_hook_manifest.py --version V0.3.2
     python tools/gen_hook_manifest.py --check          # 只检查不写
+    python tools/gen_hook_manifest.py --force          # 冻结的老版本也硬改（见上）
 """
 from __future__ import annotations
 
@@ -67,6 +90,42 @@ MANIFEST_PATH = os.path.join(ROOT, "server", versioning.HOOK_MANIFEST_FILENAME)
 DEFAULT_DLL = os.path.join(ROOT, "hook", "bin", versioning.HOOK_BINARY_NAME)
 #: 版本号的唯一源（打包脚本读的也是它）。
 VER_CONFIG = os.path.join(HERE, "build-ver.config")
+#: GitHub Release 的累积母本（`update_manifest.py` 打包时往里加一条）。
+#: 用它分「正在做的最新版本」和「已被盖过去的老版本」：老版本的 hook 冻结。
+RELEASE_MANIFEST_PATH = os.path.join(HERE, "update-manifest.json")
+
+#: 退出码：这一版已经被更新的版本盖过去了、hook 却变了（见模块说明）。
+#: 打包脚本按这个值中断，`hook/build.bat` 按它打警告；别和「一般失败」的 1 混用。
+EXIT_SUPERSEDED = 2
+
+
+def newest_release_version(path=RELEASE_MANIFEST_PATH):
+    """`tools/update-manifest.json` 里版本号最大的那条；读不到 / 空表 -> ``None``。
+
+    条目是「新版本前插、同版本原位替换」（`update_manifest.merge_manifest`），
+    正常流程里第一条就是最大的；这里按版本号取，手动调过顺序也不受影响。
+    """
+    try:
+        with io.open(path, "r", encoding="utf-8-sig", newline="") as f:
+            obj = json.load(f)
+    except (OSError, ValueError):
+        return None
+    releases = obj.get("releases") if isinstance(obj, dict) else None
+    versions = []
+    for entry in releases if isinstance(releases, list) else []:
+        if isinstance(entry, dict):
+            version = versioning.parse_version_text(entry.get("version"))
+            if version is not None:
+                versions.append(version)
+    return max(versions) if versions else None
+
+
+def existing_digest(obj, version):
+    """母本里这一版现在记的 sha256；没有条目 -> ``None``。"""
+    for entry in obj["hooks"]:
+        if versioning.parse_version_text(entry.get("version")) == version:
+            return entry.get("sha256")
+    return None
 
 
 def default_version():
@@ -148,13 +207,39 @@ def main(argv=None):
                     help=f"bshook.dll 的路径（默认 {DEFAULT_DLL}）")
     ap.add_argument("--check", action="store_true",
                     help="只检查母本是不是最新的，不写文件")
+    ap.add_argument("--force", action="store_true",
+                    help="冻结的老版本也允许改 hash（只在确实要重发那个老版本、"
+                         "并会替换 GitHub 上它的 zip 时用）")
     args = ap.parse_args(argv)
     version_text = args.version or default_version()
+    version = versioning.parse_version_text(version_text)
+    if version is None:
+        raise SystemExit(f"[hookman] !! 认不出版本号 {version_text!r}")
+    version_text = versioning.format_version(version)
 
     if not os.path.exists(args.dll):
         raise SystemExit(f"[hookman] !! 找不到 {args.dll}，先跑 hook\\build.bat")
     digest = sha256_file(args.dll)
-    obj, changed = upsert(load(), version_text, digest)
+    obj = load()
+
+    # ★ 老版本的 hook 冻结（用户 2026-09-11 定的规矩，理由见模块说明）：
+    #   update-manifest.json 里版本号最大的那条是「正在做的」，随便刷；比它老的
+    #   都已经被盖过去了。放在 --check 之前：两种模式下这都是错误状态。
+    newest = newest_release_version()
+    have = existing_digest(obj, version)
+    if (have != digest and not args.force
+            and newest is not None and version < newest):
+        newest_text = versioning.format_version(newest)
+        print(f"[hookman] !! {version_text} 已经被更新的版本 {newest_text} 盖过去了"
+              f"（{RELEASE_MANIFEST_PATH}），而 {args.dll} 和清单里记的那份不一样"
+              f"（清单 {have[:16] + '…' if have else '没有条目'} / 现在 {digest[:16]}…）。\n"
+              f"          老版本的 hook 冻结：那批玩家早已发出去，hash 一变全被判「改过」。"
+              f"要改 hook 请把 tools/build-ver.config 抬到 {newest_text} 或更新；\n"
+              f"          确实要重发这个老版本（并替换 GitHub 上它的 zip）才加 --force。",
+              file=sys.stderr)
+        return EXIT_SUPERSEDED
+
+    obj, changed = upsert(obj, version_text, digest)
 
     if args.check:
         if changed:
