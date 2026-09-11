@@ -4309,7 +4309,7 @@ static int try_patch_crash18_guards(void)
 /*   两处偷的字节里**一个重定位项都没有**（对着 `.reloc` 逐项查过）           */
 /*   ⇒ 文件字节 == 内存字节，特征串可以直接从磁盘那份量出来。                  */
 /*                                                                            */
-/*   逃生门：`BSHOOK_KEEP_NM=1` 两处都不打（要复现 §68 时用）。                */
+/*   逃生门：`BSHOOK_KEEP_NM=1` 四处都不打（要复现 §68 时用）。                */
 /* -------------------------------------------------------------------------- */
 #define NMCOGAME_LOADLIBRARYA_IAT_RVA  0x0002C030u
 
@@ -4334,6 +4334,84 @@ static const unsigned char NMCONEW_MAGIC_SIG[NMCONEW_MAGIC_SIG_LEN] = {
 };
 #define NMCONEW_MAGIC           0x001FCA34
 
+/* -------------------------------------------------------------------------- */
+/*   ── 崩溃点 C：工作线程的循环回边跳过了它自己的判空（bug调查/19）──────      */
+/*                                                                            */
+/*   §82-A 装上之后线上又崩一次（iorikexue 2026-09-11 02:01:56，              */
+/*   `nmconew+0x75CDA` 读 `[NULL+0x100034]`）。**§82-A 没修错，是没修完** ——   */
+/*   它让 `Enter()` 干净返回了，调用方于是走到下一句，那一句同样在解引用       */
+/*   同一批已经被拆掉的字段。                                                 */
+/*                                                                            */
+/*   工作线程主函数 `0x754A0`（线程入口 `0xB4543` -> `0x75480` -> 它）：       */
+/*                                                                            */
+/*     000754D1  if ([this+0x20510] == 0) jmp 0x75EE2   ← 序言逐个判空，       */
+/*     000754E5  if ([this+0x2051C] == 0) jmp 0x75EE2      七个字段里任何       */
+/*     000754F9  if ([this+0x20518] == 0) jmp 0x75EE2      一个是 0 就直接      */
+/*     0007550D  if ([this+0x20514] == 0) jmp 0x75EE2      收尾返回            */
+/*     00075521  if ([this+0x20930] == 0) jmp 0x75EE2                         */
+/*     00075535  if ([this+0x20934] == 0) jmp 0x75EE2      （互斥体）          */
+/*     00075549  if ([this+0x20528] == 0) jmp 0x75EE2      （共享内存视图）    */
+/*     00075557  ┌ 主体                                                       */
+/*     00075CAF  │  ScopedLock lk([this+0x20934])  ← Enter 里等 10 秒          */
+/*     00075CD4  │  ecx = [this+0x20528]           ← ★ 这里不判空了            */
+/*     00075CDA  │  edx = [ecx+0x100034]           ← ★★ 崩                     */
+/*     00075C86  │  jmp 0x75557 ┐                                             */
+/*     00075D76  │  jmp 0x75C8B ├ ★ 三条回边**全部跳到序言判空之后**           */
+/*     00075D83  └  jmp 0x75557 ┘                                             */
+/*                                                                            */
+/*   玩家「返回登录画面 / 重新登录」时主线程把这个对象整个关掉                */
+/*   （`0x75EF0` UnmapViewOfFile + `[+0x20528]=0`；`0x76000` CloseHandle +     */
+/*   `[+0x20934]=0`），而工作线程此刻正卡在 `Enter()` 的 10 秒等待里。         */
+/*   崩溃 dump 里序言判的那 7 个字段**全是 0**、`[this+0x20530]` 已经被写成    */
+/*   "NULL" —— 对象拆得干干净净，线程还在跑。                                 */
+/*                                                                            */
+/*   ⇒ 判据不是「这一句别崩」，是「**这个线程该结束了**」——                    */
+/*   而「该结束」这句话是原版自己在序言里写的：`jmp 0x75EE2`。                 */
+/*   我们只是在拿到锁之后把 `0x75549` 那一判**重做一遍**，为空就走             */
+/*   **同一个出口**。`0x75EE2` = `mov ecx,[ebp-0xC] / mov fs:[0],ecx /         */
+/*   mov esp,ebp / pop ebp / ret`：自己摘 SEH 帧、自己按 ebp 平栈，            */
+/*   三条回边处 `[ebp-4]` 都是 -1（没有活着的局部对象要析构），                */
+/*   从 `0x75CCE` 跳过去唯一被跳过的是 `~ScopedLock` —— 而它要 Leave 的        */
+/*   那把锁**本来就已经被 CloseHandle 掉了**，不去碰它才是对的。               */
+/*                                                                            */
+/*   ★ 判的是「那一页读不读得到」，不是「指针是不是 NULL」：                   */
+/*   `0x75F0F` 先 `UnmapViewOfFile(p)`、`0x75F18` 才把指针置 0，               */
+/*   中间那一小段指针非空但视图已经没了。                                      */
+/*                                                                            */
+/*   ── 崩溃点 D：`Mutex::Leave` 是 `Enter` 的孪生兄弟，§82-A 只修了一半 ──    */
+/*                                                                            */
+/*     00098EE7  mov eax,[ebp-4]        ; this                                */
+/*     00098EEA  mov ecx,[eax+8]        ; ★ 共享状态，和 Enter 崩的是同一块     */
+/*     00098EED  mov edx,[ecx+0x10]     ; ★ 读 / 写它                          */
+/*     00098F90  mov esp,ebp / pop ebp / ret   ← ★ 函数自己的干净出口          */
+/*                                                                            */
+/*   为什么必须一起补：`ScopedLock` 的析构函数**无条件**调 `Leave()`。         */
+/*   §82-A 每命中一次（= 共享状态在等待期间被析构），作用域退出时就一定        */
+/*   跟着一发往同一块死内存写的 `Leave` —— 这次是 `0x75CDA` 先崩，            */
+/*   把它挡在了前面而已。`ScopedLock` 在这个 DLL 里被用了 54 处。              */
+/* -------------------------------------------------------------------------- */
+#define NMCONEW_WORKER_RVA      0x00075CCEu   /* mov eax,[ebp-0xB0]（this）   */
+#define NMCONEW_WORKER_CONT_RVA 0x00075CD4u   /* mov ecx,[eax+0x20528]（原路）*/
+#define NMCONEW_WORKER_EXIT_RVA 0x00075EE2u   /* 序言判空走的那个收尾出口     */
+#define NMCONEW_WORKER_SHM_OFF  0x00020528u   /* 共享内存视图那一格           */
+#define NMCONEW_WORKER_PEEK_OFF 0x00100034u   /* 循环要读的 +0x100034/+0x10003C */
+#define NMCONEW_WORKER_SIG_LEN  12
+static const unsigned char NMCONEW_WORKER_SIG[NMCONEW_WORKER_SIG_LEN] = {
+    0x8B, 0x85, 0x50, 0xFF, 0xFF, 0xFF,   /* mov eax,[ebp-0xB0]               */
+    0x8B, 0x88, 0x28, 0x05, 0x02, 0x00    /* mov ecx,[eax+0x20528]  ★ 下一句崩 */
+};
+
+#define NMCONEW_LEAVE_RVA       0x00098EE7u   /* mov eax,[ebp-4]              */
+#define NMCONEW_LEAVE_CONT_RVA  0x00098EEDu   /* mov edx,[ecx+0x10]（原路）   */
+#define NMCONEW_LEAVE_EXIT_RVA  0x00098F90u   /* mov esp,ebp / pop ebp / ret  */
+#define NMCONEW_LEAVE_SIG_LEN   12
+static const unsigned char NMCONEW_LEAVE_SIG[NMCONEW_LEAVE_SIG_LEN] = {
+    0x8B, 0x45, 0xFC,         /* mov eax,[ebp-4]                              */
+    0x8B, 0x48, 0x08,         /* mov ecx,[eax+8]                              */
+    0x8B, 0x51, 0x10,         /* mov edx,[ecx+0x10]  ★ 崩的就是这一句           */
+    0x83, 0xEA, 0x01          /* sub edx,1                                    */
+};
+
 typedef HMODULE (WINAPI *LoadLibraryA_t)(LPCSTR);
 static LoadLibraryA_t s_nm_LoadLibraryA = NULL;
 
@@ -4342,8 +4420,14 @@ static volatile UINT_PTR g_nm_lock_cont = 0;
 static volatile UINT_PTR g_nm_lock_exit = 0;
 static volatile UINT_PTR g_nm_magic_cont = 0;
 static volatile UINT_PTR g_nm_magic_bad = 0;
+static volatile UINT_PTR g_nm_worker_cont = 0;
+static volatile UINT_PTR g_nm_worker_exit = 0;
+static volatile UINT_PTR g_nm_leave_cont = 0;
+static volatile UINT_PTR g_nm_leave_exit = 0;
 static volatile LONG g_nm_lock_hits = 0;
 static volatile LONG g_nm_magic_hits = 0;
+static volatile LONG g_nm_worker_hits = 0;
+static volatile LONG g_nm_leave_hits = 0;
 static volatile LONG g_nmconew_patched = 0;
 
 /* 那一页还提交着、而且够得到我们要碰的字节吗。用 VirtualQuery 而不是
@@ -4386,6 +4470,37 @@ static int __stdcall nm_magic_obj_readable(void *obj)
     return 0;
 }
 
+/* 工作线程这一圈还该不该跑：把序言 0x75549 那一判重做一遍。
+   判的是「共享内存视图那一页还读得到吗」而不是「指针是不是 NULL」——
+   `close` 是先 UnmapViewOfFile 再置 0 的，中间那一小段指针非空但视图已经没了。 */
+static int __stdcall nm_worker_shm_alive(void *self)
+{
+    unsigned char *shm;
+    if (!nm_addr_usable((unsigned char *)self + NMCONEW_WORKER_SHM_OFF, 4, 0))
+        goto dead;
+    shm = *(unsigned char **)((unsigned char *)self + NMCONEW_WORKER_SHM_OFF);
+    if (!shm) goto dead;
+    /* 循环紧接着要读 +0x100034 和 +0x10003C */
+    if (!nm_addr_usable(shm + NMCONEW_WORKER_PEEK_OFF, 0xC, 0)) goto dead;
+    return 1;
+dead:
+    if (InterlockedIncrement(&g_nm_worker_hits) == 1)
+        bslog("★信使   nmconew 的工作线程醒来时对象已经被关掉了（共享内存视图没了）"
+              "—— 按原版序言判空那条路收尾结束线程，不再往野指针里读"
+              "（bug调查/19；§82-A 之后崩在 +75CDA 的那一发）");
+    return 0;
+}
+
+static int __stdcall nm_leave_state_alive(void *state)
+{
+    /* `Leave()` 要读改 [state+0x10]、读 [state]，和 Enter 用的是同一块 */
+    if (nm_addr_usable(state, 0x14, 1)) return 1;
+    if (InterlockedIncrement(&g_nm_leave_hits) == 1)
+        bslog("★信使锁 nmconew 的互斥体在解锁之前就被析构了（共享状态 %p 已经不可写）"
+              "—— 按原版的收尾出口干净返回（bug调查/19；§82-A 的孪生兄弟）", state);
+    return 0;
+}
+
 static __declspec(naked) void nmconew_lock_detour(void)
 {
     __asm {
@@ -4419,32 +4534,85 @@ static __declspec(naked) void nmconew_magic_detour(void)
     }
 }
 
+/* 崩溃点 C：拿到锁之后、解引用共享内存之前，重做一遍序言 0x75549 的判空。
+   偷的 6 字节就是 `mov eax,[ebp-0xB0]`（把 this 装进 eax），
+   所以 detour 先把它原样跑一遍，eax 就是要判的那个 this。 */
+static __declspec(naked) void nmconew_worker_detour(void)
+{
+    __asm {
+        mov  eax, dword ptr [ebp - 0xB0]    /* 被偷走的原指令：eax = this */
+        pushad
+        push eax
+        call nm_worker_shm_alive
+        test al, al
+        popad                               /* POPAD 不动标志位 */
+        jz   nmw_dead
+        jmp  dword ptr [g_nm_worker_cont]
+    nmw_dead:
+        jmp  dword ptr [g_nm_worker_exit]   /* 0x75EE2：自己摘 SEH、自己平栈 */
+    }
+}
+
+/* 崩溃点 D：`Mutex::Leave` —— 和 §82-A 的 `Enter` 判的是同一块共享状态。 */
+static __declspec(naked) void nmconew_leave_detour(void)
+{
+    __asm {
+        mov  eax, dword ptr [ebp - 4]       /* 被偷走的原指令：eax = this   */
+        mov  ecx, dword ptr [eax + 8]       /* 被偷走的原指令：ecx = 共享状态 */
+        pushad
+        push ecx
+        call nm_leave_state_alive
+        test al, al
+        popad
+        jz   nml2_dead
+        jmp  dword ptr [g_nm_leave_cont]
+    nml2_dead:
+        jmp  dword ptr [g_nm_leave_exit]    /* 0x98F90：mov esp,ebp/pop ebp/ret */
+    }
+}
+
 static void patch_nmconew(HMODULE mod)
 {
     UINT_PTR b = (UINT_PTR)mod;
-    int a, c;
+    int a, c, w, v;
     if (!mod || InterlockedCompareExchange(&g_nmconew_patched, 0, 0)) return;
-    g_nm_lock_cont  = b + NMCONEW_LOCK_CONT_RVA;
-    g_nm_lock_exit  = b + NMCONEW_LOCK_EXIT_RVA;
-    g_nm_magic_cont = b + NMCONEW_MAGIC_CONT_RVA;
-    g_nm_magic_bad  = b + NMCONEW_MAGIC_BAD_RVA;
+    g_nm_lock_cont   = b + NMCONEW_LOCK_CONT_RVA;
+    g_nm_lock_exit   = b + NMCONEW_LOCK_EXIT_RVA;
+    g_nm_magic_cont  = b + NMCONEW_MAGIC_CONT_RVA;
+    g_nm_magic_bad   = b + NMCONEW_MAGIC_BAD_RVA;
+    g_nm_worker_cont = b + NMCONEW_WORKER_CONT_RVA;
+    g_nm_worker_exit = b + NMCONEW_WORKER_EXIT_RVA;
+    g_nm_leave_cont  = b + NMCONEW_LEAVE_CONT_RVA;
+    g_nm_leave_exit  = b + NMCONEW_LEAVE_EXIT_RVA;
     a = install_jmp_guard((unsigned int)(b + NMCONEW_LOCK_RVA),
                           NMCONEW_LOCK_SIG, NMCONEW_LOCK_SIG_LEN,
                           6, nmconew_lock_detour, "nmconew 互斥体判活");
     c = install_jmp_guard((unsigned int)(b + NMCONEW_MAGIC_RVA),
                           NMCONEW_MAGIC_SIG, NMCONEW_MAGIC_SIG_LEN,
                           6, nmconew_magic_detour, "nmconew 魔数校验判空");
-    if (a && c) {
+    w = install_jmp_guard((unsigned int)(b + NMCONEW_WORKER_RVA),
+                          NMCONEW_WORKER_SIG, NMCONEW_WORKER_SIG_LEN,
+                          6, nmconew_worker_detour, "nmconew 工作线程判空");
+    v = install_jmp_guard((unsigned int)(b + NMCONEW_LEAVE_RVA),
+                          NMCONEW_LEAVE_SIG, NMCONEW_LEAVE_SIG_LEN,
+                          6, nmconew_leave_detour, "nmconew 解锁判活");
+    if (a && c && w && v) {
         InterlockedExchange(&g_nmconew_patched, 1);
-        bslog("PATCH   ★信使崩溃守护 x2（bug调查/18 §82）: nmconew.dll base=%08X"
-              " 互斥体判活 @ +%05X / 魔数校验判空 @ +%05X —— §68 那一族到此为止",
-              (unsigned)b, (unsigned)NMCONEW_LOCK_RVA, (unsigned)NMCONEW_MAGIC_RVA);
+        bslog("PATCH   ★信使崩溃守护 x4（bug调查/18 §82 + bug调查/19）: nmconew.dll"
+              " base=%08X 互斥体判活 @ +%05X / 魔数校验判空 @ +%05X /"
+              " 工作线程判空 @ +%05X / 解锁判活 @ +%05X",
+              (unsigned)b, (unsigned)NMCONEW_LOCK_RVA, (unsigned)NMCONEW_MAGIC_RVA,
+              (unsigned)NMCONEW_WORKER_RVA, (unsigned)NMCONEW_LEAVE_RVA);
     } else {
-        bslog("PATCH   !! nmconew.dll base=%08X 的特征串对不上（锁=%d 魔数=%d）"
-              "—— 不动它，保留原版行为", (unsigned)b, a, c);
+        bslog("PATCH   !! nmconew.dll base=%08X 的特征串对不上"
+              "（锁=%d 魔数=%d 工作线程=%d 解锁=%d）—— 不动它，保留原版行为",
+              (unsigned)b, a, c, w, v);
         InterlockedExchange(&g_nmconew_patched, 1);   /* 别每次加载都重试 */
     }
 }
+
+/* §85：信使四格 IAT 已经换成我们自己的桩了吗（定义在下面 §85 那一段）。 */
+static volatile LONG g_nm_killed;
 
 static int name_has_ci(const char *hay, const char *needle)
 {
@@ -4462,11 +4630,22 @@ static int name_has_ci(const char *hay, const char *needle)
     return 0;
 }
 
+/* 信使已经整个拆掉（§85）时，这个钩子就只剩**绊线**作用：四格 IAT 都换成
+   我们自己的桩之后，nmcogame 一次都不会被调到，也就永远走不到这条加载。
+   真走到了 = 拆漏了一条路，挡下来并打一行日志，别让 nmconew 再跑起来。 */
 static HMODULE WINAPI det_nmcogame_LoadLibraryA(LPCSTR name)
 {
-    HMODULE h = s_nm_LoadLibraryA(name);       /* ★ 照常放行，一个字节不改 */
+    HMODULE h;
+    if (name_has_ci(name, "nmconew")
+        && InterlockedCompareExchange(&g_nm_killed, 0, 0)) {
+        bslog("★信使   !! 信使已拆，但 nmcogame 还是来加载 \"%s\" —— 挡下了。"
+              "这说明还有一条路没堵住，请把这一行发回去", name);
+        SetLastError(ERROR_MOD_NOT_FOUND);
+        return NULL;
+    }
+    h = s_nm_LoadLibraryA(name);               /* ★ 照常放行，一个字节不改 */
     if (h && name_has_ci(name, "nmconew")) {
-        bslog("★信使   nmcogame 加载了 \"%s\" -> base=%08X，去打两处崩溃守护",
+        bslog("★信使   nmcogame 加载了 \"%s\" -> base=%08X，去打四处崩溃守护",
               name, (unsigned)(UINT_PTR)h);
         patch_nmconew(h);
     }
@@ -4521,13 +4700,650 @@ static int try_guard_nexon_messenger(void)
         VirtualProtect(slot, sizeof(*slot), oldp, &oldp);
     }
     InterlockedExchange(&g_nm_loadhook_done, 1);
-    bslog("PATCH   ★信使加载钩子已装（bug调查/18 §82）: nmcogame.dll base=%08X"
-          " IAT %08X —— nmconew.dll **照常加载**（登录路径不动），"
-          "加载完立刻给它打两处崩溃守护（BSHOOK_KEEP_NM=1 可关）",
-          (unsigned)(UINT_PTR)nmcogame, (unsigned)(UINT_PTR)slot);
+    if (InterlockedCompareExchange(&g_nm_killed, 0, 0))
+        bslog("PATCH   ★信使加载钩子已装（当绊线用）: nmcogame.dll base=%08X IAT %08X"
+              " —— 信使已整个拆掉（§85），这条路本来就走不到；真走到了会挡下并报警",
+              (unsigned)(UINT_PTR)nmcogame, (unsigned)(UINT_PTR)slot);
+    else
+        bslog("PATCH   ★信使加载钩子已装（bug调查/18 §82）: nmcogame.dll base=%08X"
+              " IAT %08X —— nmconew.dll **照常加载**（登录路径不动），"
+              "加载完立刻给它打四处崩溃守护",
+              (unsigned)(UINT_PTR)nmcogame, (unsigned)(UINT_PTR)slot);
     /* 万一它已经在了（理论上不会：登录才加载），补一次。 */
     already = GetModuleHandleA("nmconew.dll");
     if (already) patch_nmconew(already);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★ NM 通道诊断 —— 为「整个拆掉信使」摸底（`BSHOOK_NM_DIAG=1` 才装）          */
+/*                                                                            */
+/*   BigShot 自己那个「发一发 NM 包」的公共函数 `0x544168`（30 个包装函数      */
+/*   全走它），把 nmcogame 的四个导入里唯一有内容的那个包起来：                */
+/*                                                                            */
+/*     00544168  __thiscall  ecx = NM 包对象, edi = NM 通道（含 1 MB 缓冲区）  */
+/*     005441BE  call [vft+4]        ← Serialize：请求写进栈上的 str           */
+/*     005441DB  call [0x63751C]     ← NMCO_CallNMFunc(func, 请求, &应答, &长度)*/
+/*     00544200  call [vft+0x10]     ← Deserialize：解析应答，填回包对象       */
+/*     00544208  mov ebx,[esi+0x24]  ← ★ 真正返回给调用方的就是这一格          */
+/*                                                                            */
+/*   诊断打两行：进函数时打「哪个包、func 号、谁调的」，                      */
+/*   `vf_10` 解析完打「结果 [+0x24] 是多少、应答多长、头 32 字节长什么样」。   */
+/*   ⇒ 登录到底要哪几发、每一发要回什么，一次就问清楚了。                     */
+/* -------------------------------------------------------------------------- */
+#define NMCALL_VA       0x00544168u   /* 发 NM 包的公共函数入口               */
+#define NMCALL_REQ_VA   0x005441DBu   /* call [0x63751C] —— 请求就在栈上      */
+#define NMCALL_RET_VA   0x00544203u   /* vf_10 解析完、取 [esi+0x24] 之前     */
+#define NMCO_IAT_SLOT   0x0063751Cu   /* NMCO_CallNMFunc                      */
+static const unsigned char NMCALL_SIG[5] = {
+    0xB8, 0x4E, 0xBF, 0x61, 0x00      /* mov eax,0x61bf4e（__SEH_prolog 的表）*/
+};
+static const unsigned char NMCALL_REQ_SIG[6] = {
+    0xFF, 0x15, 0x1C, 0x75, 0x63, 0x00   /* call dword ptr [0x63751C]         */
+};
+static const unsigned char NMCALL_RET_SIG[5] = {
+    0x8B, 0x45, 0xF0,                 /* mov eax,[ebp-0x10]                   */
+    0x3B, 0x07                        /* cmp eax,[edi]                        */
+};
+static void *g_nmcall_tramp = NULL;
+static volatile UINT_PTR g_nmcall_req_cont = 0x005441E1u;  /* add esp,0x10       */
+static volatile UINT_PTR g_nmcall_ret_cont = 0x00544208u;  /* mov ebx,[esi+0x24] */
+static volatile LONG g_nm_diag_patched = 0;
+
+/* NM 的报文是自描述的：`34 ca 1f 00 | u32 长度 | …载荷… | 9e 11 8a 00`，
+   总长 = 4 + 4 + 长度 + 4。头对不上就只打固定的一小段。 */
+static unsigned int nm_msg_len(const unsigned char *p)
+{
+    unsigned int n;
+    if (!p || IsBadReadPtr(p, 8)) return 0;
+    if (*(const unsigned int *)p != NMCONEW_MAGIC) return 0;
+    n = *(const unsigned int *)(p + 4);
+    if (n > 0x4000) return 0;
+    return n + 12;
+}
+
+static void nm_hexlog(const char *what, unsigned int func,
+                      const unsigned char *p, unsigned int len)
+{
+    char hex[3 * 160 + 8];
+    unsigned int i, show;
+    int n = 0;
+    hex[0] = 0;
+    show = len > 160 ? 160 : len;
+    for (i = 0; i < show && p && !IsBadReadPtr(p + i, 1); i++)
+        n += wsprintfA(hex + n, "%02x ", p[i]);
+    bslog("NMCALL  %s func=%u(0x%X) 共 %u 字节: %s%s",
+          what, func, func, len, hex, len > show ? "…" : "");
+}
+
+static int nm_diag_enabled(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_NM_DIAG", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] == '1';
+}
+
+static void __cdecl nmcall_enter_log(void *pkt, void *chan, void *retaddr)
+{
+    unsigned char *p = (unsigned char *)pkt;
+    unsigned int vft = 0, func = 0, mode = 0;
+    if (p && !IsBadReadPtr(p, 0x28)) {
+        vft  = *(unsigned int *)p;
+        func = *(unsigned int *)(p + 8);
+        mode = *(unsigned int *)(p + 0x0C);
+    }
+    bslog("NMCALL  → this=%08X vft=%08X func=%u(0x%X) [+0xC]=%u 通道=%08X 调用点=%08X",
+          (unsigned)(UINT_PTR)pkt, vft, func, func, mode,
+          (unsigned)(UINT_PTR)chan, (unsigned)(UINT_PTR)retaddr);
+}
+
+static void __cdecl nmcall_req_log(unsigned int func, const unsigned char *req)
+{
+    unsigned int n = nm_msg_len(req);
+    nm_hexlog("请求", func, req, n ? n : 32);
+}
+
+static void __cdecl nmcall_ret_log(void *pkt, unsigned char *resp, unsigned int len)
+{
+    unsigned char *p = (unsigned char *)pkt;
+    unsigned int result = 0, func = 0;
+    if (p && !IsBadReadPtr(p, 0x28)) {
+        func   = *(unsigned int *)(p + 8);
+        result = *(unsigned int *)(p + 0x24);
+    }
+    bslog("NMCALL  ← func=%u(0x%X) 结果[+0x24]=%u(0x%X)", func, func, result, result);
+    nm_hexlog("应答", func, resp, len);
+}
+
+/* 入口：ecx = 包对象，edi = 通道，[esp] = 返回地址。 */
+static __declspec(naked) void nmcall_enter_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        mov  eax, dword ptr [esp + 36]   /* pushad 32 + pushfd 4 = 原 [esp] */
+        push eax
+        push edi
+        push ecx
+        call nmcall_enter_log
+        add  esp, 12
+        popfd
+        popad
+        jmp  dword ptr [g_nmcall_tramp]
+    }
+}
+
+/* 0x5441DB：`call [0x63751C]` 之前，四个 cdecl 参数已经在栈上：
+   [esp+0]=func [esp+4]=请求 [esp+8]=&应答缓冲区 [esp+12]=&长度。
+   偷走的就是那一句 call，detour 自己把它执行掉，再跳回 0x5441E1。 */
+static __declspec(naked) void nmcall_req_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push dword ptr [esp + 40]      /* 请求 = pushad32+pushfd4 之后的 [esp+4] */
+        push dword ptr [esp + 40]      /* func —— 上一句 push 完 esp 又降了 4     */
+        call nmcall_req_log
+        add  esp, 8
+        popfd
+        popad
+        mov  eax, NMCO_IAT_SLOT        /* eax 是返回值寄存器，调用前随便用 */
+        call dword ptr [eax]           /* 被偷走的原指令 call [0x63751C] */
+        jmp  dword ptr [g_nmcall_req_cont]
+    }
+}
+
+/* 0x544203：esi = 包对象，[ebp-0x10] = 应答缓冲区，[ebp-0x14] = 应答长度。
+   偷的 5 字节自己补回来 —— `install_inline_hook` 的长度解码器不认 `3b`，
+   而这两句都是位置无关的，照抄就行。★ `cmp` 设的标志位要留给 0x54420B 的
+   `je`：日志调用全包在 pushfd/popfd 里，`jmp` 也不动标志位。 */
+static __declspec(naked) void nmcall_ret_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push dword ptr [ebp - 0x14]
+        push dword ptr [ebp - 0x10]
+        push esi
+        call nmcall_ret_log
+        add  esp, 12
+        popfd
+        popad
+        mov  eax, dword ptr [ebp - 0x10]   /* 被偷走的原指令 */
+        cmp  eax, dword ptr [edi]          /* 被偷走的原指令（标志位给 0x54420B）*/
+        jmp  dword ptr [g_nmcall_ret_cont]
+    }
+}
+
+static int try_patch_nm_diag(void)
+{
+    if (g_nm_diag_patched) return 1;
+    if (IsBadReadPtr((void *)NMCALL_VA, 5)
+        || memcmp((void *)NMCALL_VA, NMCALL_SIG, 5) != 0)
+        return 0;                               /* 还没解壳到这里 */
+    if (!install_jmp_guard(NMCALL_REQ_VA, NMCALL_REQ_SIG, 6, 6,
+                           nmcall_req_detour, "NM 包请求"))
+        return 0;
+    if (!install_jmp_guard(NMCALL_RET_VA, NMCALL_RET_SIG, 5, 5,
+                           nmcall_ret_detour, "NM 包解析完"))
+        return 0;
+    g_nmcall_tramp = install_inline_hook((void *)NMCALL_VA, nmcall_enter_detour,
+                                         "NM 包发送入口");
+    if (!g_nmcall_tramp) return 0;
+    InterlockedExchange(&g_nm_diag_patched, 1);
+    bslog("PATCH   ★NM 通道诊断已装 @ %08X / %08X / %08X（BSHOOK_NM_DIAG=1）",
+          (unsigned)NMCALL_VA, (unsigned)NMCALL_REQ_VA, (unsigned)NMCALL_RET_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★★★★★ 把 NEXON 信使**整个拆掉**：登录那一发我们自己走（§85 / D83）        */
+/*        （用户 2026-09-11 拍板：「本来就没用的东西，完全拆掉比较保险」）      */
+/*                                                                            */
+/*   §80（不让 `nmconew.dll` 加载）和 §83（`NMCO_CallNMFunc` 直接回 1）        */
+/*   两次都被实机推翻，原因是同一个：**登录真的需要一份应答**。                */
+/*   §83 已经把话说到位了 —— 「要拿掉就得把那份应答的格式逆出来自己造」。      */
+/*   这一版就是去把它造出来。                                                 */
+/*                                                                            */
+/*   ── 一、BigShot 那一侧长什么样（`BSHOOK_NM_DIAG=1` 实测出来的）─────       */
+/*                                                                            */
+/*   30 个「发一发 NM 包」的包装函数全走 `0x544168`：                         */
+/*     序列化 -> `NMCO_CallNMFunc(func, 请求, &应答, &长度)` -> 反序列化       */
+/*     -> 调用方拿走 `[包对象+0x24]`。                                        */
+/*                                                                            */
+/*   报文是**自描述**的，请求和应答同一个格式：                               */
+/*                                                                            */
+/*     34 ca 1f 00      魔数 0x001FCA34（就是 §82-B 那个魔数）                */
+/*     <u32 bodylen>    = 8 + innerlen                                        */
+/*     01 01 6f 66      类标签（高 16 位要等于包对象的 [+4]，读取器 0x5382A5  */
+/*                      就判这一条；不等就整包作废、字段全读成 0）            */
+/*     <u32 innerlen>                                                         */
+/*     <u32 字段0>      ★ 这一格就是 `[包对象+0x24]`                          */
+/*     …后续字段…       u32 直读；字符串 = `u8(字符数<<2)` + UTF-16LE         */
+/*     9e 11 8a 00      尾部魔数 0x008A119E                                   */
+/*                                                                            */
+/*   ★ 读原语 `0x537F30` 是**带边界检查**的（`pos+4 > size+8` 就返回 0        */
+/*   且不推进）⇒ **应答短了只会把后面的字段读成 0，不会越界**。               */
+/*   这条决定了「不认识的 func 回一个最小应答」是安全的。                     */
+/*                                                                            */
+/*   ── 二、登录只用到两发 ────────────────────────────────────────────       */
+/*                                                                            */
+/*   | func | 干什么 | 请求字段 | 应答字段 |                                  */
+/*   |---|---|---|---|                                                        */
+/*   | `0x110F` | 登录 | u32 0 / u32 2 / 空串 / 用户名 / 密码 | u32 成功?1:0 / u32 错误码 | */
+/*   | `0x2105` | 取「域」 | u32 0 | u32 1 / 字符串 = **票据** |              */
+/*                                                                            */
+/*   ★★ `0x2105` 返回的那 32 位十六进制串**就是认证服发的票据** ——            */
+/*   客户端拿它去 `gcpReqLogin`（游戏服认的就是它），也拿它当                  */
+/*   `NMService.exe -domain:`。实测对得上：认证服 09:00:33.579 发             */
+/*   `f9ce8ec3…`，`0x2105` 09:00:33.819 原样回来。                            */
+/*   ⇒ **票据不是信使造的，是我们自己的认证服发的** —— 信使只是个传声筒。     */
+/*                                                                            */
+/*   错误码也是直通的：认证服回 20026（密码错误）⇒ NM 应答字段1 = 0x4E3A。    */
+/*   ⇒ `字段0 = (认证结果 == 0)`，`字段1 = 认证结果`，**原样透传**。          */
+/*                                                                            */
+/*   ── 三、于是我们做的事 ────────────────────────────────────────────       */
+/*                                                                            */
+/*   把 BigShot 那 4 格 nmcogame 的 IAT（`0x637510..0x63751C`）全换成自己的桩：*/
+/*   `NMCO_CallNMFunc` 由 `nmco_call_stub` 接管，登录那一发自己连认证服        */
+/*   （协议见 `server/protocol.py` / `re/packet_api.md` §7，**服务端一行没动**），*/
+/*   其余的回一个「成功、没数据」的最小应答。                                 */
+/*   ⇒ nmcogame 一次都不被调用 ⇒ `nmconew.dll` 不加载 ⇒ `NMService.exe` 不起。 */
+/*   `nmconew.dll` 的加载钩子留着当**绊线**：真有谁去加载就挡下来并打日志。    */
+/*                                                                            */
+/*   逃生门：`BSHOOK_KEEP_NM=1` = 回到 §82/§84 那一档（信使照常跑 + 四处守护）。*/
+/* -------------------------------------------------------------------------- */
+#define NM_MAGIC_HEAD    0x001FCA34u
+#define NM_MAGIC_TAIL    0x008A119Eu
+#define NM_TAG_DEFAULT   0x666F0101u
+#define NMF_LOGIN        0x0000110Fu   /* 登录：请求里带用户名 / 密码 */
+#define NMF_GET_DOMAIN   0x00002105u   /* 取「域」：应答里是票据      */
+
+#define NMCO_IAT_FREE    0x00637510u   /* NMCO_MemoryFree        */
+#define NMCO_IAT_PATCH   0x00637514u   /* NMCO_SetPatchOption    */
+#define NMCO_IAT_LOCALE  0x00637518u   /* NMCO_SetLocale         */
+/* NMCO_IAT_SLOT（0x63751C = NMCO_CallNMFunc）在上面 NM 诊断那一段定义过 */
+
+/* 认证服那条链路的常量，和 `server/protocol.py` 一一对应。 */
+#define NMCO_FRAME_TAG   0x18
+#define NMCO_FLAG_ENC    0x02
+#define NMCO_MSG_ID      0x7d4bb435u
+#define NMCO_OP_LOGIN    0x000f
+#define NMCO_OP_LOGIN_REPLY 0x000c
+/* `nmconew.dll` VA 0x100EF548 的 64 字节常量表，按小端 dword 取。 */
+static const unsigned int NM_FW[16] = {
+    0x40FC1578u, 0x113B6C1Fu, 0x8389CA19u, 0xE2196CD8u,
+    0x74901489u, 0x4AAB1566u, 0x7B8C12A0u, 0x0018FFCDu,
+    0xCCAB704Bu, 0x7B5A8C0Fu, 0xAA13B891u, 0xDE419807u,
+    0x12FFBCAEu, 0x5F5FBA34u, 0x10F5AC99u, 0xB1C1DD01u
+};
+/* 登录请求载荷的尾部：空 wstring + 12 字节（4 个样本完全一致，见 §7.3）。 */
+static const unsigned char NM_LOGIN_TAIL[14] = {
+    0x00, 0x00, 0x03, 0x22, 0x01, 0x01, 0x56, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+typedef SOCKET_T (WINAPI *nm_socket_t)(int, int, int);
+typedef int (WINAPI *nm_send_t)(SOCKET_T, const char *, int, int);
+typedef int (WINAPI *nm_recv_t)(SOCKET_T, char *, int, int);
+typedef int (WINAPI *nm_closesocket_t)(SOCKET_T);
+typedef int (WINAPI *nm_setsockopt_t)(SOCKET_T, int, int, const char *, int);
+
+static wchar_t g_nm_ticket[64];          /* 上一次登录成功拿到的票据 */
+static volatile LONG g_nm_killed = 0;    /* IAT 四格换完了没有（上面已前置声明）*/
+
+/* C[i] = P[i] ^ P[i-1] ^ key ^ Fw[i&15]（明文反馈，只处理整 dword，尾部余数不动）*/
+static void nm_crypt(unsigned char *b, int len, unsigned int key, int decrypting)
+{
+    int i, n = len >> 2;
+    unsigned int prev = 0, v, mask;
+    for (i = 0; i < n; i++) {
+        mask = key ^ NM_FW[i & 15] ^ prev;
+        memcpy(&v, b + i * 4, 4);
+        if (decrypting) { v ^= mask; prev = v; }
+        else            { prev = v; v ^= mask; }
+        memcpy(b + i * 4, &v, 4);
+    }
+}
+
+static void nm_put_be16(unsigned char *p, unsigned int v)
+{
+    p[0] = (unsigned char)((v >> 8) & 0xff); p[1] = (unsigned char)(v & 0xff);
+}
+static void nm_put_be24(unsigned char *p, unsigned int v)
+{
+    p[0] = (unsigned char)((v >> 16) & 0xff);
+    p[1] = (unsigned char)((v >> 8) & 0xff);
+    p[2] = (unsigned char)(v & 0xff);
+}
+static void nm_put_be32(unsigned char *p, unsigned int v)
+{
+    p[0] = (unsigned char)((v >> 24) & 0xff);
+    p[1] = (unsigned char)((v >> 16) & 0xff);
+    p[2] = (unsigned char)((v >> 8) & 0xff);
+    p[3] = (unsigned char)(v & 0xff);
+}
+static unsigned int nm_get_be16(const unsigned char *p)
+{
+    return ((unsigned int)p[0] << 8) | p[1];
+}
+static unsigned int nm_get_be24(const unsigned char *p)
+{
+    return ((unsigned int)p[0] << 16) | ((unsigned int)p[1] << 8) | p[2];
+}
+static unsigned int nm_get_be32(const unsigned char *p)
+{
+    return ((unsigned int)p[0] << 24) | ((unsigned int)p[1] << 16)
+         | ((unsigned int)p[2] << 8) | p[3];
+}
+
+/* ---- NM 报文（BigShot ⇄ 信使）的字段编解码 ---------------------------- */
+
+/* 紧凑长度：低 2 位是宽度码，值 = 字符数。实测全是「1 字节 + 低 2 位为 0」
+   这一种（用户名 9 字符 -> 0x24，票据 32 字符 -> 0x80）。别的宽度没见过，
+   见到就当解不出来，宁可失败也不猜。 */
+static int nm_read_wstr(const unsigned char **pp, const unsigned char *end,
+                        wchar_t *out, int out_cch)
+{
+    const unsigned char *p = *pp;
+    unsigned int n;
+    if (p >= end || (p[0] & 3) != 0) return 0;
+    n = (unsigned int)(p[0] >> 2);
+    p += 1;
+    if (p + n * 2 > end || (int)n >= out_cch) return 0;
+    memcpy(out, p, n * 2);
+    out[n] = 0;
+    *pp = p + n * 2;
+    return 1;
+}
+
+static unsigned int nm_write_wstr(unsigned char *p, const wchar_t *s)
+{
+    unsigned int n = 0;
+    while (s[n] && n < 63) n++;
+    p[0] = (unsigned char)(n << 2);
+    memcpy(p + 1, s, n * 2);
+    return 1 + n * 2;
+}
+
+/* 造一条应答：魔数 + **请求那份类标签** + innerlen + 字段区 + 尾部魔数。
+   标签抄请求的，因为读取器 0x5382A5 要拿它和包对象的 [+4] 比对。 */
+static unsigned int nm_build_reply(unsigned char *out, const unsigned char *req,
+                                   const unsigned char *fields, unsigned int flen)
+{
+    unsigned int tag = NM_TAG_DEFAULT;
+    if (req && !IsBadReadPtr((void *)req, 12)) memcpy(&tag, req + 8, 4);
+    *(unsigned int *)(out + 0)  = NM_MAGIC_HEAD;
+    *(unsigned int *)(out + 4)  = 8 + flen;
+    *(unsigned int *)(out + 8)  = tag;
+    *(unsigned int *)(out + 12) = flen;
+    if (flen) memcpy(out + 16, fields, flen);
+    *(unsigned int *)(out + 16 + flen) = NM_MAGIC_TAIL;
+    return 20 + flen;
+}
+
+/* ---- 认证服那一跳（协议 = `server/protocol.py`，服务端一行没动）------- */
+
+/* 收满 n 字节。阻塞 socket + SO_RCVTIMEO —— ★ 这是「物理上等不到事件」的
+   那一类（对端可能一个字节都不发），铁律 10 的例外，超时值只当兜底。 */
+static int nm_recv_all(SOCKET_T s, nm_recv_t fn, unsigned char *buf, int n)
+{
+    int got = 0, r;
+    while (got < n) {
+        r = fn(s, (char *)buf + got, n - got, 0);
+        if (r <= 0) return 0;
+        got += r;
+    }
+    return 1;
+}
+
+/* 返回 1 = 这一跳走通了（`*result` 里是认证服的结果码，0 = 登录成功）。
+   返回 0 = 根本没连上 / 应答读不出来，调用方按 20000 报「认证服务器失败」。 */
+static int nm_auth_login(const wchar_t *user, const wchar_t *pass,
+                         int *result, wchar_t *ticket, int ticket_cch)
+{
+    HMODULE ws2 = GetModuleHandleA("ws2_32.dll");
+    nm_socket_t fn_socket;
+    nm_send_t fn_send;
+    nm_recv_t fn_recv;
+    nm_closesocket_t fn_close;
+    nm_setsockopt_t fn_setopt;
+    SOCKET_T s;
+    struct sockaddr_in_min addr;
+    /* 载荷上限：用户名 / 密码各最多 127 字符（解请求那边 wchar_t[128] 卡死），
+       2+254 + 2+254 + 14 = 526 字节；缓冲区按 1024 留足，收应答也用同一套尺寸。 */
+    unsigned char frame[1024], head[4], *m;
+    unsigned char pay[1024];
+    unsigned int paylen = 0, key, plen, flags, msglen, total;
+    unsigned int ulen = 0, plen_w = 0;
+    unsigned port = popshot_map_port(g_auth_port);
+    int timeout_ms = 15000;
+    int ok = 0, off, n, i;
+
+    *result = 20000;
+    if (ticket_cch > 0) ticket[0] = 0;
+    if (!ws2) { bslog("★信使桩 ws2_32 还没加载，登录没法走"); return 0; }
+    fn_socket = (nm_socket_t)GetProcAddress(ws2, "socket");
+    fn_send   = (nm_send_t)GetProcAddress(ws2, "send");
+    fn_recv   = (nm_recv_t)GetProcAddress(ws2, "recv");
+    fn_close  = (nm_closesocket_t)GetProcAddress(ws2, "closesocket");
+    fn_setopt = (nm_setsockopt_t)GetProcAddress(ws2, "setsockopt");
+    if (!fn_socket || !fn_send || !fn_recv || !fn_close || !s_connect) {
+        bslog("★信使桩 ws2_32 的函数取不到，登录没法走");
+        return 0;
+    }
+
+    while (user[ulen] && ulen < 127) ulen++;
+    while (pass[plen_w] && plen_w < 127) plen_w++;
+    /* 载荷：u16 LE 字符数 + UTF-16LE，用户名、密码，再接 14 字节尾部。 */
+    *(unsigned short *)(pay + paylen) = (unsigned short)ulen; paylen += 2;
+    memcpy(pay + paylen, user, ulen * 2); paylen += ulen * 2;
+    *(unsigned short *)(pay + paylen) = (unsigned short)plen_w; paylen += 2;
+    memcpy(pay + paylen, pass, plen_w * 2); paylen += plen_w * 2;
+    memcpy(pay + paylen, NM_LOGIN_TAIL, sizeof(NM_LOGIN_TAIL));
+    paylen += sizeof(NM_LOGIN_TAIL);
+
+    key = GetTickCount() ^ 0x5f54ca13u;
+    nm_crypt(pay, (int)paylen, key, 0);
+
+    /* 帧：u16BE 消息长 / u16BE opcode / 0x18 / u24BE 载荷+12 / flags /
+           u24BE 载荷 / u32BE key / u32BE msgid / 载荷 */
+    m = frame + 4;
+    m[0] = NMCO_FRAME_TAG;
+    nm_put_be24(m + 1, paylen + 12);
+    m[4] = NMCO_FLAG_ENC;
+    nm_put_be24(m + 5, paylen);
+    nm_put_be32(m + 8, key);
+    nm_put_be32(m + 12, NMCO_MSG_ID);
+    memcpy(m + 16, pay, paylen);
+    msglen = 16 + paylen;
+    nm_put_be16(frame, msglen);
+    nm_put_be16(frame + 2, NMCO_OP_LOGIN);
+    total = 4 + msglen;
+
+    s = fn_socket(AF_INET_MIN, 1, 6);            /* SOCK_STREAM / IPPROTO_TCP */
+    if (s == (SOCKET_T)~(UINT_PTR)0) return 0;
+    if (fn_setopt) {
+        fn_setopt(s, 0xffff, 0x1006, (const char *)&timeout_ms, 4);  /* SO_RCVTIMEO */
+        fn_setopt(s, 0xffff, 0x1005, (const char *)&timeout_ms, 4);  /* SO_SNDTIMEO */
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET_MIN;
+    addr.sin_port[0] = (unsigned char)((port >> 8) & 0xff);
+    addr.sin_port[1] = (unsigned char)(port & 0xff);
+    addr.sin_addr[0] = 127; addr.sin_addr[3] = 1;
+    /* ★ 走 `s_connect`（蹦床）而不是被 hook 的那一份：地址我们自己算好了，
+       再过一次重定向会把端口二次映射。 */
+    if (s_connect(s, (const struct sockaddr_min *)&addr, sizeof(addr)) != 0) {
+        bslog("★信使桩 连不上认证服 127.0.0.1:%u", port);
+        fn_close(s);
+        return 0;
+    }
+    if (fn_send(s, (const char *)frame, (int)total, 0) != (int)total) {
+        fn_close(s); return 0;
+    }
+
+    /* 应答：先 4 字节头（长度 + opcode），再按长度收满。 */
+    if (!nm_recv_all(s, fn_recv, head, 4)) { fn_close(s); return 0; }
+    msglen = nm_get_be16(head);
+    if (msglen < 16 || msglen > sizeof(frame) - 4) { fn_close(s); return 0; }
+    if (!nm_recv_all(s, fn_recv, frame, (int)msglen)) { fn_close(s); return 0; }
+    fn_close(s);
+
+    if (nm_get_be16(head + 2) != NMCO_OP_LOGIN_REPLY || frame[0] != NMCO_FRAME_TAG) {
+        bslog("★信使桩 认证服回的不是 0x000C 登录应答（opcode=0x%04X tag=0x%02X）",
+              nm_get_be16(head + 2), frame[0]);
+        return 0;
+    }
+    flags = frame[4];
+    plen  = nm_get_be24(frame + 5);
+    key   = nm_get_be32(frame + 8);
+    if (plen > msglen - 16 || plen > sizeof(pay)) return 0;
+    memcpy(pay, frame + 16, plen);
+    if (flags & NMCO_FLAG_ENC) nm_crypt(pay, (int)plen, key, 1);
+
+    /* 载荷：i32 结果 / wstring s1 / wstring s2(=票据) / 3 个 i32 */
+    if (plen < 8) return 0;
+    memcpy(result, pay, 4);
+    off = 4;
+    for (i = 0; i < 2; i++) {
+        unsigned int cch;
+        if ((unsigned)off + 2 > plen) return 0;
+        cch = *(unsigned short *)(pay + off);
+        off += 2;
+        if ((unsigned)off + cch * 2 > plen) return 0;
+        if (i == 1) {                      /* s2 = 票据 */
+            if ((int)cch >= ticket_cch) cch = (unsigned)ticket_cch - 1;
+            memcpy(ticket, pay + off, cch * 2);
+            ticket[cch] = 0;
+        }
+        off += cch * 2;
+    }
+    ok = 1;
+    (void)n;
+    return ok;
+}
+
+/* ---- 四个桩 ----------------------------------------------------------- */
+
+static int __cdecl nmco_call_stub(unsigned int func, const unsigned char *req,
+                                  unsigned char **pbuf, unsigned int *plen)
+{
+    unsigned char fields[256];
+    unsigned int flen = 0, innerlen = 0;
+    unsigned char *out;
+
+    /* 应答最长 20 + 4 + 1 + 127*2 = 279 字节，写的是调用方那块 1 MB 缓冲区；
+       还是显式判一下它报的容量，别信「一定是 1 MB」。 */
+    if (!pbuf || !*pbuf || !plen || *plen < 512) return 0;
+    out = *pbuf;
+    if (req && !IsBadReadPtr((void *)req, 16)) memcpy(&innerlen, req + 12, 4);
+
+    if (func == NMF_LOGIN) {
+        const unsigned char *p = req + 16, *end;
+        wchar_t skip[4], user[128], pass[128];
+        int result = 20000, got = 0;
+        end = req + 16 + (innerlen > 0x1000 ? 0 : innerlen);
+        user[0] = pass[0] = 0;
+        /* 字段区：u32 / u32 / 空串 / 用户名 / 密码 */
+        if (innerlen >= 9 && innerlen <= 0x1000) {
+            p += 8;
+            if (nm_read_wstr(&p, end, skip, 4)
+                && nm_read_wstr(&p, end, user, 128)
+                && nm_read_wstr(&p, end, pass, 128))
+                got = 1;
+        }
+        if (!got) {
+            bslog("★信使桩 登录请求解不出用户名 / 密码（innerlen=%u）—— 按认证服失败处理",
+                  innerlen);
+        } else if (!nm_auth_login(user, pass, &result, g_nm_ticket, 64)) {
+            result = 20000;
+        }
+        if (result == 0)
+            bslog("★信使桩 登录成功，票据 %.8ls…（认证服自己发的，信使没参与）",
+                  g_nm_ticket);
+        else
+            bslog("★信使桩 登录失败，认证服结果码 %d（客户端会自己弹中文）", result);
+        *(unsigned int *)(fields + 0) = (result == 0) ? 1u : 0u;
+        *(unsigned int *)(fields + 4) = (unsigned int)result;
+        flen = 8;
+    } else if (func == NMF_GET_DOMAIN) {
+        *(unsigned int *)(fields + 0) = g_nm_ticket[0] ? 1u : 0u;
+        flen = 4;
+        flen += nm_write_wstr(fields + 4, g_nm_ticket);
+    } else {
+        /* 其余全是信使自己的功能（好友 / 状态 / 配置）——「成功、没数据」。
+           读原语带边界检查（0x537F30），后面的字段会被读成 0，不会越界。 */
+        *(unsigned int *)(fields + 0) = 1u;
+        flen = 4;
+    }
+
+    *plen = nm_build_reply(out, req, fields, flen);
+    return 1;
+}
+
+static void __cdecl nmco_free_stub(void *p)
+{
+    (void)p;    /* 我们从不分配：应答就写在调用方那块 1 MB 缓冲区里 */
+}
+
+static int __cdecl nmco_setopt_stub(int a)
+{
+    (void)a;
+    return 1;
+}
+
+static int __cdecl nmco_setlocale_stub(int a)
+{
+    (void)a;
+    return 1;
+}
+
+/* 四格 IAT 一起换。IAT 是解壳器在运行时填的，所以要等它填完再动。 */
+static int try_kill_nm(void)
+{
+    struct { unsigned int slot; void *stub; const char *name; } t[4] = {
+        { NMCO_IAT_FREE,   (void *)nmco_free_stub,     "NMCO_MemoryFree" },
+        { NMCO_IAT_PATCH,  (void *)nmco_setopt_stub,   "NMCO_SetPatchOption" },
+        { NMCO_IAT_LOCALE, (void *)nmco_setlocale_stub,"NMCO_SetLocale" },
+        { NMCO_IAT_SLOT,   (void *)nmco_call_stub,     "NMCO_CallNMFunc" }
+    };
+    HMODULE nmcogame = GetModuleHandleA("nmcogame.dll");
+    UINT_PTR lo, hi;
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS *nt;
+    DWORD oldp;
+    int i;
+
+    if (InterlockedCompareExchange(&g_nm_killed, 0, 0)) return 1;
+    if (!nmcogame) return 0;
+    dos = (IMAGE_DOS_HEADER *)nmcogame;
+    if (IsBadReadPtr(dos, sizeof(*dos)) || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    nt = (IMAGE_NT_HEADERS *)((unsigned char *)nmcogame + dos->e_lfanew);
+    if (IsBadReadPtr(nt, sizeof(*nt)) || nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    lo = (UINT_PTR)nmcogame;
+    hi = lo + nt->OptionalHeader.SizeOfImage;
+    /* 四格都还指着 nmcogame 才算「解壳器已经填好、我们还没动过」。 */
+    for (i = 0; i < 4; i++) {
+        UINT_PTR v;
+        if (IsBadReadPtr((void *)t[i].slot, 4)) return 0;
+        v = *(UINT_PTR *)t[i].slot;
+        if (v < lo || v >= hi) return 0;
+    }
+    for (i = 0; i < 4; i++) {
+        if (!VirtualProtect((void *)t[i].slot, 4, PAGE_READWRITE, &oldp)) {
+            bslog("PATCH   !! 换 %s 那一格 IAT 失败 err=%lu",
+                  t[i].name, (unsigned long)GetLastError());
+            return 0;
+        }
+        *(void **)t[i].slot = t[i].stub;
+        VirtualProtect((void *)t[i].slot, 4, oldp, &oldp);
+    }
+    InterlockedExchange(&g_nm_killed, 1);
+    bslog("PATCH   ★NEXON 信使已整个拆掉（§85）: nmcogame.dll 的四格 IAT "
+          "%08X/%08X/%08X/%08X 全换成自己的桩 —— 登录那一发我们自己连认证服，"
+          "nmconew.dll 不会加载、NMService.exe 不会起（BSHOOK_KEEP_NM=1 可退回 §82）",
+          NMCO_IAT_FREE, NMCO_IAT_PATCH, NMCO_IAT_LOCALE, NMCO_IAT_SLOT);
     return 1;
 }
 
@@ -6400,6 +7216,16 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x4B1812 / 0x4A70B4 / 0x4A712D / 0x4A76C9 特征串一直对不上）");
     }
 
+    /* NM 通道诊断（默认关）—— 查「登录到底要哪几发 NM 包、每一发要回什么」用。 */
+    if (nm_diag_enabled()) {
+        for (ticks = 0; !g_stop && !g_nm_diag_patched && ticks < 2000; ticks++) {
+            if (try_patch_nm_diag()) break;
+            Sleep(2);
+        }
+        if (!g_nm_diag_patched)
+            bslog("PATCH   !! 超时未能装 NM 通道诊断（0x544168 / 0x544203 特征串对不上）");
+    }
+
     /* BigShot.rpt 里三种旧闪退的守护（§48 / §49 / §50，D56）：教程弹窗时大厅为空、
        退出拆到一半又收到 WM_CLOSE、蒙皮记录没绑上骨骼。同样只等特征串出现。 */
     if (rpt_crashes_keep_original()) {
@@ -6458,20 +7284,31 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x55C260 / 0x5D9E02 / 0x5D9E0D / 0x438BD3 特征对不上）");
     }
 
-    /* bug调查/18（§82）：给 NEXON 信使装加载钩子 —— **放行** nmconew.dll，
-       加载完立刻打它自己那两处崩溃守护（§68 那一族的根治）。
-       ★ 登录路径一个字节都不碰，所以这一处不可能弄坏登录。
-       ★ §83 那条「整个不要、直接回 1」**两次实机都不成立**，代码已删。 */
+    /* NEXON 信使（§85 / D83）：默认**整个拆掉** —— 四格 IAT 全换成自己的桩，
+       登录那一发我们自己连认证服。nmcogame 一次都不被调用 ⇒ nmconew.dll
+       不加载 ⇒ NMService.exe 不起（铁律 5 到这里才真的落地）。
+       加载钩子照样装，但这时它只剩**绊线**作用：真有谁来加载就挡下并打日志。
+
+       `BSHOOK_KEEP_NM=1` 退回 §82/§84 那一档：信使照常跑，只给它打四处崩溃守护。
+       ★ §80（不让加载）/ §83（直接回 1）两条老路都被实机推翻过，别再试；
+         这一版和它们的区别是**真的把应答造出来了**（§85）。 */
     if (nm_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_NM 已设，信使那两处崩溃守护不装（保留 §68 行为）");
+        bslog("PATCH   BSHOOK_KEEP_NM 已设：信使照常跑，只装 §82/§84 那四处崩溃守护");
     } else {
-        for (ticks = 0; !g_stop && !g_nm_loadhook_done && ticks < 2000; ticks++) {
-            if (try_guard_nexon_messenger()) break;
+        for (ticks = 0; !g_stop && !g_nm_killed && ticks < 2000; ticks++) {
+            if (try_kill_nm()) break;
             Sleep(2);
         }
-        if (!g_nm_loadhook_done)
-            bslog("PATCH   !! 超时未能装信使加载钩子（nmcogame.dll 一直没出现）");
+        if (!g_nm_killed)
+            bslog("PATCH   !! 超时未能拆掉信使（nmcogame.dll 那四格 IAT 一直没填好）"
+                  "—— 保留原版行为，崩溃守护照装");
     }
+    for (ticks = 0; !g_stop && !g_nm_loadhook_done && ticks < 2000; ticks++) {
+        if (try_guard_nexon_messenger()) break;
+        Sleep(2);
+    }
+    if (!g_nm_loadhook_done)
+        bslog("PATCH   !! 超时未能装信使加载钩子（nmcogame.dll 一直没出现）");
 
 
     /* BSM1 is a functional patch, independent of diagnostic log settings. */
