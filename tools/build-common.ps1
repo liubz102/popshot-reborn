@@ -79,6 +79,132 @@ function Assert-UpdaterStub {
     Write-Host '  更新器已重编并就位' -ForegroundColor Green
 }
 
+# ---------------------------------------------------------------------------
+#  hook（bshook.dll / bsloader.exe）—— 打包前必编一次
+# ---------------------------------------------------------------------------
+
+#: `hook\bin\` 里的两个产物。编译要写它们，写不进去就一步都不能往下走。
+$script:HookBinaryNames = @('bshook.dll', 'bsloader.exe')
+
+function Assert-HookWritable {
+    <# 编之前先问一句：`hook\bin\` 里那两个产物现在写得进去吗。
+
+       判据是**真的去开一次写句柄**，不是猜进程名 —— bshook.dll 被注进
+       BigShot.exe 之后是按**映像**映射的，映像段拒绝 FILE_SHARE_WRITE，
+       所以这一问失败和链接器待会儿失败是同一件事，不是另一件事的近似。
+
+       写不进去就在这里炸：等 link.exe 报 LNK1104 才知道的话，那行错误埋在
+       几十行编译输出里，打包界面上根本看不出「是游戏开着」。 #>
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $inUse = @()
+    $unwritable = @()
+    foreach ($name in $script:HookBinaryNames) {
+        $path = Join-Path $Root "hook\bin\$name"
+        # 还没编过（干净 clone）的话没人占得住，随便写。
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        try {
+            $fs = [System.IO.File]::Open(
+                $path, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+            $fs.Dispose()
+        } catch [System.IO.IOException] {
+            $inUse += $path              # 共享冲突 = 有别的进程正拿着它
+        } catch {
+            $unwritable += $path         # 只读属性 / ACL / 杀毒软件锁着
+        }
+    }
+    if ($inUse.Count -eq 0 -and $unwritable.Count -eq 0) { return }
+
+    Write-Host ''
+    Write-Host '==========================================================================' -ForegroundColor Red
+    if ($inUse.Count -gt 0) {
+        Write-Host '  hook 被占用，编译不了 —— 打包中止' -ForegroundColor Red
+    } else {
+        Write-Host '  hook 的产物写不进去，编译不了 —— 打包中止' -ForegroundColor Red
+    }
+    Write-Host '==========================================================================' -ForegroundColor Red
+    foreach ($p in @($inUse + $unwritable)) {
+        Write-Host "    $p" -ForegroundColor Yellow
+    }
+    Write-Host ''
+    if ($inUse.Count -gt 0) {
+        $running = @(Get-Process -Name 'BigShot', 'bsloader' -ErrorAction SilentlyContinue)
+        if ($running.Count -gt 0) {
+            $who = ($running | ForEach-Object { "$($_.ProcessName).exe（pid $($_.Id)）" }) -join '、'
+            Write-Host "  现在开着：$who" -ForegroundColor Yellow
+        }
+        Write-Host '  游戏开着的时候 bshook.dll 正注在 BigShot.exe 里，链接器写不进去。'
+        Write-Host '  先双击 stop.bat（或关掉游戏、关掉别的占着 hook\bin 的程序）再打包。'
+        Write-Host ''
+        throw 'hook 被占用，编译不了 —— 先关掉游戏（stop.bat）再打包'
+    }
+    Write-Host '  看看这两个文件是不是只读属性，或者被杀毒软件锁着。'
+    Write-Host ''
+    throw 'hook\bin 写不进去，编译不了 —— 打包中止'
+}
+
+function Invoke-HookBuild {
+    <# 打包前重编一次 hook（`hook\build.bat` -> bshook.dll + bsloader.exe）。
+
+       ★ 为什么并进打包（用户 2026-09-11 拍板，D87）：
+         包里那份 `server\manifest-hook.json` 记着 bshook.dll 的 SHA-256，
+         服务端拿它判「客户端的 DLL 有没有被改过」（D85）。编 hook 和打包
+         以前是两件分开的事 —— 改完 `hook\*.c` 忘了重编就打包，打出来的是
+         「DLL 是上一次编的、SHA 也是上一次的」：包自洽，和源码却对不上，
+         **一句报错都没有**，直到下一次有人按源码重编才暴露。
+         打包机就是编译机（和 `Assert-UpdaterStub` 一个道理），索性每次都编。
+
+       ★ 编不动就**不许往下走**：硬打只会得到「旧 DLL + 新 SHA」，
+         正是这一步要根治的那种不同步。
+
+       同一个 powershell 进程里只真编一次 —— `build-menu.ps1` 打「两个包」时
+       会连着调两个打包脚本。全局标志记的是「这一次构建编过了」这个事实本身，
+       不是「跳过第几次」（铁律 10）；单独跑某个打包脚本是全新进程，照编。 #>
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    if ((Test-Path 'Variable:Global:PopShotHookBuilt') -and $global:PopShotHookBuilt) {
+        Write-Host '  hook 本次构建已经编过了，跳过' -ForegroundColor DarkGray
+        return
+    }
+
+    $bat = Join-Path $Root 'hook\build.bat'
+    if (-not (Test-Path -LiteralPath $bat -PathType Leaf)) {
+        throw "找不到 $bat —— 打包前要重编 hook，这个脚本不能缺"
+    }
+    Assert-HookWritable -Root $Root
+
+    Write-Host '  重新编译 hook（hook\build.bat）…'
+    # ★ 这一句把 EAP 降成 Continue 再跑：PowerShell 5.1 下 `2>&1` 会把原生程序
+    #   写到 stderr 的每一行包成 NativeCommandError，而 EAP=Stop 时它**本身**
+    #   就是终止错误 —— 编译明明成功、只是某个生成器往 stderr 写了一行，
+    #   打包就会莫名其妙地断在这。成不成只认退出码。
+    #   函数作用域里的赋值，出了函数自动还原。
+    $ErrorActionPreference = 'Continue'
+    $log = & $bat 2>&1
+    $rc = $LASTEXITCODE
+    if ($rc -ne 0) {
+        # 再问一遍占用：pre-check 和链接之间那段时间里游戏被启动了也算数。
+        # 以「现在写不写得进去」这个事实为准，不去猜编译输出里的错误码。
+        Assert-HookWritable -Root $Root
+        Write-Host ''
+        Write-Host '  hook\build.bat 的输出：' -ForegroundColor Yellow
+        foreach ($line in $log) { Write-Host "    $line" -ForegroundColor DarkGray }
+        Write-Host ''
+        throw "hook 编译失败（hook\build.bat 退出码 $rc）—— 打包中止"
+    }
+    foreach ($name in $script:HookBinaryNames) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Root "hook\bin\$name") -PathType Leaf)) {
+            throw "hook\build.bat 报告成功，但 hook\bin\$name 不在 —— 打包中止"
+        }
+    }
+    $dll = Join-Path $Root 'hook\bin\bshook.dll'
+    $sha = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash
+    Write-Host ("  hook 已重编：bshook.dll $((Get-Item -LiteralPath $dll).Length) 字节，" +
+                "SHA-256 $($sha.Substring(0, 16))…") -ForegroundColor Green
+    $global:PopShotHookBuilt = $true
+}
+
 function Get-BuildVersion {
     <# 读 tools\build-ver.config 里的**复活项目版本号**（发版前手动改的那个文件）。
 

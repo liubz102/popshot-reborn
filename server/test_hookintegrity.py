@@ -258,5 +258,122 @@ class ManifestLoadingTests(unittest.TestCase):
             self.assertIsNotNone(versioning.format_version(version))
 
 
+class PackagingRebuildsTheHookTests(unittest.TestCase):
+    """★ 打包必须**先重编 hook 再打**（D87）。
+
+    上面那一整套校验的前提是「包里的 DLL 和包里记的 SHA 出自同一次编译」。
+    编 hook 和打包本来是两件分开的事 —— 改完 `hook/*.c` 忘了重编就打包，
+    打出来的包**自洽**（DLL 旧、SHA 也旧），却和源码对不上，**没有任何报错**。
+    所以这几条钉的是打包脚本里那个调用，以及它的位置。
+    """
+
+    TOOLS = os.path.join(ROOT, "tools")
+
+    def script(self, name):
+        path = os.path.join(self.TOOLS, name)
+        if not os.path.exists(path):
+            raise unittest.SkipTest(f"不在源码仓库里（缺 {path}），跳过")
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+            return f.read()
+
+    def test_the_helper_lives_in_build_common(self):
+        """两个打包脚本共用同一份实现（铁律 8 的调子）。"""
+        text = self.script("build-common.ps1")
+        self.assertIn("function Invoke-HookBuild", text)
+        self.assertIn("function Assert-HookWritable", text)
+
+    def test_being_locked_aborts_instead_of_warning(self):
+        """hook 被占用是**中止**，不是黄字提醒。
+
+        警告一下照打的话，打出来的正是要根治的那种包：旧 DLL + 新 SHA。
+        """
+        text = self.script("build-common.ps1")
+        head = text.index("function Assert-HookWritable")
+        tail = text.index("function Invoke-HookBuild")
+        body = text[head:tail]
+        self.assertIn("throw", body)
+        self.assertIn("被占用", body)
+
+    def test_both_builders_rebuild_before_they_delete_anything(self):
+        """★ 位置也要钉：必须在 `Assert-EmptyTarget` **之前**。
+
+        那一句带 `-Force` 会把上一次的成果物整个删掉。编不动 hook 的时候
+        （最常见：游戏开着，bshook.dll 注在 BigShot.exe 里）这一次本来就打不成，
+        旧成果物不该陪葬。
+        """
+        for name in ("build-portable.ps1", "build-server-package.ps1"):
+            text = self.script(name)
+            self.assertIn("Invoke-HookBuild -Root $Root", text,
+                          f"{name} 没有在打包前重编 hook")
+            self.assertLess(
+                text.index("Invoke-HookBuild -Root $Root"),
+                text.index("Assert-EmptyTarget -Path"),
+                f"{name} 把重编排在了删除旧成果物之后")
+
+    def test_the_menu_rebuilds_before_it_clears_the_previous_output(self):
+        """菜单那一层同理：`Clear-Stale` 之前就得知道 hook 编不编得动。
+
+        两条分支（带参数 / 走菜单）各有一次 `Clear-Stale`，所以比的是
+        **最后一次**调用的先后 —— 谁被挪到了删除动作之后，这条就红。
+        """
+        text = self.script("build-menu.ps1")
+        self.assertIn("Invoke-HookBuildOrExit", text)
+        self.assertEqual(text.count("Invoke-HookBuildOrExit"),
+                         text.count("Clear-Stale -Paths") + 1,   # +1 = 函数定义
+                         "build-menu.ps1 有一条 Clear-Stale 前面没重编 hook")
+        self.assertLess(text.rindex("Invoke-HookBuildOrExit"),
+                        text.rindex("Clear-Stale -Paths"),
+                        "build-menu.ps1 把重编排在了 Clear-Stale 之后")
+
+
+class ReproducibleBuildTests(unittest.TestCase):
+    """★ `hook/build.bat` 必须带 `/Brepro`（D87 六 / §92）。
+
+    少了它，link.exe 会把**当前时间**戳进 PE 头，于是同一份源码重编出来的
+    DLL 字节不同、SHA-256 也不同。而打包现在每次都重编 hook 并把这个 SHA
+    记进 `server/manifest-hook.json` ⇒ 后果有两条，**都不是报错**：
+
+    1. 每打一次包，`hook/bin/*` + 清单三个文件无缘无故变成改动状态；
+    2. **同版本先前发出去的客户端**，对着新打的服务端包一律校验不过。
+
+    带上 `/Brepro` 时间戳变成内容哈希，同源码 = 同字节 = 同 SHA，两条一起没有。
+    """
+
+    def build_bat_lines(self):
+        path = os.path.join(ROOT, "hook", "build.bat")
+        if not os.path.exists(path):
+            raise unittest.SkipTest(f"不在源码仓库里（缺 {path}），跳过")
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return [ln.strip() for ln in f if ln.strip().startswith("cl ")]
+
+    def test_every_compile_line_is_deterministic(self):
+        lines = self.build_bat_lines()
+        self.assertEqual(len(lines), 2,
+                         "hook/build.bat 的 cl 行数变了，这条要跟着改")
+        for line in lines:
+            self.assertIn("/link", line)
+            compile_part, link_part = line.split("/link", 1)
+            self.assertIn("/Brepro", compile_part,
+                          f"编译那半截少了 /Brepro：{line}")
+            self.assertIn("/Brepro", link_part,
+                          f"链接那半截少了 /Brepro：{line}")
+
+    def test_the_batch_file_stays_ascii(self):
+        """★ 顺手守住铁律 3：`.bat` 里一个多字节字符都不许有。
+
+        `chcp 65001` 下 cmd.exe 按**字符**计数却按**字节**定位，中文一个字差
+        2 字节，攒够了就把某一行命令拦腰截断（D074 / V0.2 §135）——
+        症状是「'xxx' 不是内部或外部命令」，或者某一段莫名其妙跑第二遍。
+        判据是「字节数 == 字符数」，不是「这次跑通了没有」。
+        """
+        path = os.path.join(ROOT, "hook", "build.bat")
+        if not os.path.exists(path):
+            raise unittest.SkipTest(f"不在源码仓库里（缺 {path}），跳过")
+        with open(path, "rb") as f:
+            raw = f.read()
+        self.assertEqual(len(raw), len(raw.decode("utf-8")),
+                         "hook/build.bat 里混进了非 ASCII 字符")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -70,6 +70,14 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 }
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 Assert-InsideDist -Path $OutputDirectory -DistRoot $DistRoot
+
+# ★ hook 在**任何破坏性动作之前**重编（D87）。服务端包里没有 bshook.dll，
+#   但**有** `server\manifest-hook.json` —— 那份 SHA 必须和客户端包里那份
+#   DLL 是同一次编译的产物（两个包本来就必须成对发，D079）。
+#   下面 Assert-EmptyTarget -Force 会删掉上一次的成果物，所以编在它前面：
+#   编不过就停在这，dist\ 里旧的那份原封不动。
+Invoke-HookBuild -Root $Root
+
 Assert-EmptyTarget -Path $OutputDirectory -Force:$Force
 
 if (-not (Test-Path -LiteralPath $Template -PathType Container)) {
@@ -253,6 +261,8 @@ try {
     #   「手改出来的版本号」而强制更新（D85 第二轮收紧）。
     #   hook\bin\bshook.dll 不在（服务端包本来就不需要它）就跳过：那时
     #   清单保持仓库里提交的那份，由客户端包那次负责。
+    #   ★ D87 起开头的 Invoke-HookBuild 已经保证它在了（编不出来就中止打包），
+    #     这个分支留着只当兜底 —— 别照它推断「服务端包可以不带最新清单」。
     #   ★★ 失败必须中断，理由和 build-portable.ps1 那边一字不差：退出码 2 =
     #   比最新发布还老的版本 hook 变了（老版本冻结，抬版本号）；其它失败 =
     #   这一版打出去校验整项关闭，不能默默发布。

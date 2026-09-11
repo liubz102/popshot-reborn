@@ -69,11 +69,29 @@ if errorlevel 1 (
 
 pushd "%OUT%"
 
+rem --------------------------------------------------------------------------
+rem  /Brepro on BOTH cl and link -- REPRODUCIBLE BUILD.  Do not remove.
+rem
+rem  Without it link.exe stamps the current time into the PE header
+rem  (COFF TimeDateStamp + the copy in the debug directory), so rebuilding
+rem  the very same sources yields a different file -- measured: identical
+rem  length, exactly 4 differing bytes, brand new SHA-256 every time.
+rem
+rem  That matters because the packaging scripts now rebuild the hook on every
+rem  run (D87) and record the DLL's SHA-256 in server\manifest-hook.json (D85).
+rem  A timestamp-only churn would mean: three files dirty in git after every
+rem  build, and every previously shipped client of the SAME version suddenly
+rem  failing the integrity check against a freshly built server package.
+rem  With /Brepro the timestamp becomes a hash of the content, so
+rem  same sources == same bytes == same SHA, and none of that happens.
+rem  (Pinned by server\test_hookintegrity.py, class ReproducibleBuildTests.)
+rem --------------------------------------------------------------------------
+
 echo [build] compiling bshook.dll ...
 rem  sha256.c is shared with the updater (CNG / bcrypt).  It is compiled in as a
 rem  second translation unit rather than copied, so there is only ONE SHA-256
 rem  implementation in the repo.  /I lets its own `#include "sha256.h"` resolve.
-cl /nologo /W3 /O2 /MT /utf-8 /LD /I "%SRC%..\updater\src" "%SRC%bshook.c" "%SRC%..\updater\src\sha256.c" /Fe:bshook.dll /link kernel32.lib user32.lib
+cl /nologo /W3 /O2 /MT /utf-8 /Brepro /LD /I "%SRC%..\updater\src" "%SRC%bshook.c" "%SRC%..\updater\src\sha256.c" /Fe:bshook.dll /link /Brepro kernel32.lib user32.lib
 if errorlevel 1 (
     echo [build] bshook.dll FAILED
     popd
@@ -81,7 +99,7 @@ if errorlevel 1 (
 )
 
 echo [build] compiling bsloader.exe ...
-cl /nologo /W3 /O2 /MT /utf-8 "%SRC%bsloader.c" /Fe:bsloader.exe /link kernel32.lib user32.lib
+cl /nologo /W3 /O2 /MT /utf-8 /Brepro "%SRC%bsloader.c" /Fe:bsloader.exe /link /Brepro kernel32.lib user32.lib
 if errorlevel 1 (
     echo [build] bsloader.exe FAILED
     popd

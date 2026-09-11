@@ -45,6 +45,15 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 }
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 Assert-InsideDist -Path $OutputDirectory -DistRoot $DistRoot
+
+# ★ hook 在**任何破坏性动作之前**重编（D87）：下面 Assert-EmptyTarget -Force
+#   会把上一次的成果物整个删掉，而 hook 编不动（最常见：游戏正开着，
+#   bshook.dll 注在 BigShot.exe 里）时这一次根本打不成 —— 先编，编不过就
+#   停在这，dist\ 里旧的那份原封不动。
+#   `build-menu.ps1` 更早的地方已经编过一次；这里是给「直接跑本脚本」的人
+#   兜底，同一个进程里不会编第二遍。
+Invoke-HookBuild -Root $Root
+
 Assert-EmptyTarget -Path $OutputDirectory -Force:$Force
 
 # --- 打包前的环境闸 ---------------------------------------------------------

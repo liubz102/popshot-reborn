@@ -86,6 +86,24 @@ function Clear-Stale([string[]]$Paths, [switch]$Ask) {
     return $true
 }
 
+function Invoke-HookBuildOrExit {
+    <# 重编 hook，编不动就带着中文提示退出（D87）。
+
+       ★ 调用点必须在 `Clear-Stale` **之前** —— 那一步会删掉 dist\ 里上一次的
+         成果物，而 hook 编不动（最常见：游戏正开着，bshook.dll 注在
+         BigShot.exe 里）时这一次本来就打不成，旧成果物不该陪葬。
+       ★ 但也**不要**提到菜单之前去：那样「只是双击进来看一眼版本号又退出」
+         也会重编一次 hook，白白换掉 hook\bin\ 和 manifest-hook.json 的内容
+         （同源码重编也会换 SHA，§92）。判据是「人已经决定要打了」。 #>
+    try {
+        Invoke-HookBuild -Root $Root
+    } catch {
+        Write-Host ''
+        Write-Host "[失败] $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+}
+
 function Build-Selected([bool]$DoClient, [bool]$DoServer, [bool]$DoZip,
                         [bool]$DoSave, [bool]$NoSmoke, [string]$Linux) {
     # ★ 两个包用同一个批次号：客户端包和服务端包必须成对使用（D079），
@@ -133,6 +151,7 @@ if ($PSBoundParameters.Count -gt 0) {
     $doClient = [bool]$Client
     $doServer = [bool]$Server
     if (-not $doClient -and -not $doServer) { $doClient = $true }   # 默认打客户端包
+    Invoke-HookBuildOrExit
     if (-not $Force) {
         $targets = @()
         if ($doClient) { $targets += @($ClientDir, "$ClientDir.zip") }
@@ -190,6 +209,8 @@ switch ($choice.Trim()) {
         exit 1
     }
 }
+
+Invoke-HookBuildOrExit
 
 $targets = @()
 if ($doClient) { $targets += @($ClientDir, "$ClientDir.zip") }
