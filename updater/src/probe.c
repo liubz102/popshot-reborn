@@ -13,6 +13,7 @@
 #include "probe.h"
 #include "cipher.h"
 #include "log.h"
+#include "sha256.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -81,8 +82,75 @@ int probe_parse_wanted(const wchar_t *message, Ver *out)
     return 0;
 }
 
+/* 把 hook 的 SHA-256 折进上报值 —— 和 `hook/bshook.c` 的 `hsver_pick_wire()`
+   同一套（布局和算法见 server/versioning.py 的 WIRE_V2_*）。
+
+   ★ 为什么探针也要算：服务端现在会校验这个校验位，探针要是照旧发「裸版本号」，
+   就会被一律判成「本该带校验位却没带」⇒ **`PROBE_OK` 永远不可能出现**，
+   「服务器已接受当前版本，无需更新」这条路就废了。探针必须和真客户端
+   **发一模一样的 4 个字节**。
+
+   算不出来（找不到 DLL 之类）就退回旧编码 —— 那会被服务端判成「对不上」
+   并要求更新，属于安全的一边（大不了多下一次包）。 */
+#define PROBE_V2_FLAG      0x80000000u
+#define PROBE_V2_VER_MAX   15999999u
+#define PROBE_V2_TAG_SHIFT 24
+#define PROBE_V2_TAG_MASK  0x7Fu
+
+static int probe_hex_nibble(wchar_t c)
+{
+    if (c >= L'0' && c <= L'9') return (int)(c - L'0');
+    if (c >= L'a' && c <= L'f') return (int)(c - L'a') + 10;
+    if (c >= L'A' && c <= L'F') return (int)(c - L'A') + 10;
+    return -1;
+}
+
+unsigned long probe_encode_wire(const Ver *v, const wchar_t *hook_dll)
+{
+    wchar_t hex[65], hex2[65];
+    unsigned char buf[36];
+    Sha256 s;
+    long plain;
+    unsigned int wire_v;
+    int i, hi, lo;
+
+    plain = v ? ver_encode_wire(v) : -1;
+    if (plain < 0) return 311u;                  /* 编不出来：按原版上报 */
+    wire_v = (unsigned int)plain;
+    if (!hook_dll || !*hook_dll || wire_v > PROBE_V2_VER_MAX) return wire_v;
+
+    if (!sha256_file(hook_dll, hex)) {
+        log_line("probe: cannot hash %ls, falling back to plain wire", hook_dll);
+        return wire_v;
+    }
+    for (i = 0; i < 32; i++) {
+        hi = probe_hex_nibble(hex[i * 2]);
+        lo = probe_hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return wire_v;
+        buf[i] = (unsigned char)((hi << 4) | lo);
+    }
+    buf[32] = (unsigned char)(wire_v & 0xffu);
+    buf[33] = (unsigned char)((wire_v >> 8) & 0xffu);
+    buf[34] = (unsigned char)((wire_v >> 16) & 0xffu);
+    buf[35] = (unsigned char)((wire_v >> 24) & 0xffu);
+
+    if (!sha256_begin(&s)) return wire_v;
+    if (!sha256_update(&s, buf, sizeof(buf)) || !sha256_finish(&s, hex2)) {
+        sha256_end(&s);
+        return wire_v;
+    }
+    sha256_end(&s);
+    hi = probe_hex_nibble(hex2[0]);
+    lo = probe_hex_nibble(hex2[1]);
+    if (hi < 0 || lo < 0) return wire_v;
+    return PROBE_V2_FLAG
+         | ((unsigned long)(((hi << 4) | lo) & PROBE_V2_TAG_MASK)
+            << PROBE_V2_TAG_SHIFT)
+         | wire_v;
+}
+
 int probe_server(const wchar_t *host, int port, const Ver *local_version,
-                 ProbeResult *out)
+                 const wchar_t *hook_dll, ProbeResult *out)
 {
     WSADATA wsa;
     SOCKET sock = INVALID_SOCKET;
@@ -144,8 +212,7 @@ int probe_server(const wchar_t *host, int port, const Ver *local_version,
 
     /* 发：编码版本号 int32 LE，整条流过 SimpleCipher（客户端->服务端 (0,1)）。
        本地版本编不出来（<0.1.0 的怪包）按旧版 311 上报。 */
-    wire = local_version ? ver_encode_wire(local_version) : -1;
-    if (wire < 0) wire = 311;
+    wire = (long)probe_encode_wire(local_version, hook_dll);
     wire_le[0] = (unsigned char)(wire & 0xFF);
     wire_le[1] = (unsigned char)((wire >> 8) & 0xFF);
     wire_le[2] = (unsigned char)((wire >> 16) & 0xFF);

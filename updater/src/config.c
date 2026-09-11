@@ -44,6 +44,25 @@ static int read_text_file_n(const wchar_t *path, wchar_t *out, size_t cap,
         /* UTF-8（BOM 有无都行）/ 其他按 UTF-8 尽力解。 */
         n = MultiByteToWideChar(CP_UTF8, 0, (const char *)raw, (int)got,
                                 out, (int)(cap - 1));
+        if (n <= 0) {
+            /* ★★ 输出缓冲放不下时 MultiByteToWideChar 返回 **0**
+               （ERROR_INSUFFICIENT_BUFFER）。原来这里一律当成读取失败，
+               于是**整个文件读不出来**、调用方悄悄退回默认值 ——
+               `config/server.config` 长到一定程度后，更新器就再也读不到
+               `server_address`，探针一直去连默认的 192.168.1.100
+               （2026-09-14 实测：日志里 `probe host 192.168.1.100:27799`）。
+               后果是「探针问不到服务器要哪个版本」，成对发布（D079）失效，
+               而且被拒的客户端会停在「已是最新版本，无需更新」。
+
+               解法：把输入截短到「一定放得下」再解一次 —— UTF-8 里一个
+               宽字符最少占 1 字节，所以 cap-1 个字节至多解出 cap-1 个宽字符。
+               截断点要退到一个 UTF-8 起始字节上，别把一个汉字切两半。 */
+            DWORD fit = got;
+            if (fit > (DWORD)(cap - 1)) fit = (DWORD)(cap - 1);
+            while (fit > 0 && (raw[fit] & 0xC0) == 0x80) fit--;
+            n = MultiByteToWideChar(CP_UTF8, 0, (const char *)raw, (int)fit,
+                                    out, (int)(cap - 1));
+        }
         if (n <= 0) n = -1;
         else out[n] = 0;
     }
@@ -51,22 +70,26 @@ static int read_text_file_n(const wchar_t *path, wchar_t *out, size_t cap,
     return n;
 }
 
-/* 老口径（server.config / BUILD.ver）：读前 8190 字节。 */
+/* server.config / BUILD.ver 用这一条。
+   ★ 原来只读前 8190 字节 —— `config/server.config` 已经长到 10 KB 以上，
+   后半截掉不说，解出来的宽字符还放不进调用方的缓冲区。
+   现在放到 64 KB；真超了也不会再整个读失败（见 read_text_file_n 里
+   那段说明）。 */
 static int read_text_file(const wchar_t *path, wchar_t *out, size_t cap)
 {
-    return read_text_file_n(path, out, cap, 8190);
+    return read_text_file_n(path, out, cap, 65536);
 }
 
 int cfg_server_address(const wchar_t *root, wchar_t *out, size_t cap)
 {
     wchar_t path[MAX_PATH * 2];
-    static wchar_t text[4096];
+    static wchar_t text[32768];
     wchar_t *line, *next;
     int found = 0;
 
     path_join(path, MAX_PATH * 2, root, L"config/server.config");
     wcscpy(out, L"192.168.1.100");                       /* config.py 同款默认 */
-    if (read_text_file(path, text, 4096) < 0) return 1;  /* 没有文件用默认 */
+    if (read_text_file(path, text, 32768) < 0) return 1;  /* 没有文件用默认 */
 
     line = text;
     while (line && *line) {

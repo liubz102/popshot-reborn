@@ -66,6 +66,19 @@ foreach ($must in @('hook\bin\bshook.dll', 'hook\bin\bsloader.exe',
 # 后只会看到 NGM 的死链报错。
 Assert-UpdaterStub -Root $Root
 
+# ★ 把这一版 hook 的 SHA-256 记进 server\manifest-hook.json（D85）。
+#   客户端握手时上报的那 4 字节里折了它自己那份 bshook.dll 的 hash，服务端
+#   拿这张表比对；对不上 = DLL 被改过（反倒卖公告被拿掉了？）-> 强制更新。
+#   ★ 必须在下面拷 server\ **之前**跑 —— 清单就放在 server\ 里，跟着那次
+#   递归拷贝一起进包，客户端包和服务端包各得一份，没有「另一边」要维护。
+#   ★ 表里没有的版本一律放行（服务端的包可能比客户端旧），所以漏跑这一步
+#   不会把人挡在外面，只是这一版白校验 —— 失败只警告，不中断打包。
+& (Join-Path $Root 'runtime\python\python.exe') `
+    (Join-Path $Root 'tools\gen_hook_manifest.py') --version $Version.Text
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ('  [warn] 更新 server\manifest-hook.json 失败，这一版不做 hook 完整性校验') -ForegroundColor Yellow
+}
+
 # ★★★ UserConfig.ini 是**构建输入**，不是本机杂项（V0.1 §49 / D021）。
 #   客户端是「登录成功那一刻」才写出它的，所以全新环境第一次跑时它不存在；
 #   文件不在就用内置默认值 = 全屏 + 16 位色 -> 走进 D3D 模式枚举分支 ->
@@ -107,6 +120,11 @@ try {
         Test-AsciiOnly (Join-Path $OutputDirectory $file)
     }
     Copy-One (Join-Path $Root 'README.md') (Join-Path $OutputDirectory 'README.md')
+    # ★ 许可证必须随包走：PolyForm Noncommercial 的 Notices 一节明确要求
+    #   「拿到软件的人也要拿到这些条款」，而且包里那句「禁止倒卖」得有个出处。
+    #   中文那份只是说明（以英文为准），一起带上，免得玩家看不懂。
+    Copy-One (Join-Path $Root 'LICENSE') (Join-Path $OutputDirectory 'LICENSE')
+    Copy-One (Join-Path $Root 'LICENSE.zh.md') (Join-Path $OutputDirectory 'LICENSE.zh.md')
 
     # server.config：本机那份是**玩家自己填的地址**，`.gitignore` 里排掉了，
     # 所以新 clone 下来的仓库根本没有它 —— 那种情况下照 `server\config.py` 的
@@ -211,6 +229,13 @@ try {
             '客户端每次启动会把本文件里的 version 上报给服务器（bshook 读它补丁握手版本号）。',
             '版本过旧被服务器拒绝时会自动更新：game_patched\BsPatcherChn.exe 是自研更新器（updater\src，原版风格界面，全逻辑进 exe）。'
         )
+    # ★ 把刚写好的 BUILD.ver 拷回仓库根（2026-09-14 起它**进 git**）。
+    #   两个理由：① 开发机上缺了它，客户端按原版 311 上报，而服务端现在会
+    #   因为「清单里没有这个版本」直接拒掉（D85）—— 调试当场卡住；
+    #   ② 它和 server\manifest-hook.json 是一对：版本号 + 那一版 hook 的
+    #   SHA-256，一起提交才说得清「仓库里这份 hook 属于哪个版本」。
+    Copy-One (Join-Path $OutputDirectory 'BUILD.ver') (Join-Path $Root 'BUILD.ver')
+
     foreach ($must in @('BUILD.ver', 'config\server.config',
                         'config\server-ClientFilter.config', 'config\update.config')) {
         if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory $must) -PathType Leaf)) {

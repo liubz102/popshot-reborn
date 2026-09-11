@@ -10562,10 +10562,12 @@ class Conn:
             ver = struct.unpack_from("<i", self.buf, 0)[0]
             del self.buf[:4]
             self.got_version = True
-            self.client_version = versioning.decode_wire(ver)
+            self.client_version, hook_tag = versioning.decode_wire_ex(ver)
             if self.client_version is not None:
                 self.log(f"★★ 握手：裸发版本号 = {ver} -> 复活项目版本 "
-                         f"{versioning.format_version(self.client_version)}")
+                         f"{versioning.format_version(self.client_version)}"
+                         + (f"，带完整性校验位 {hook_tag}" if hook_tag is not None
+                            else "（旧编码，没有完整性校验位）"))
             else:
                 why = ("原版 311，未上报复活版本 = 旧版客户端"
                        if ver == CLIENT_VERSION else "认不出的值，按旧版处理")
@@ -10593,6 +10595,30 @@ class Conn:
                     self.send(build_ctrl(w_i32(VERSION_REJECT_RESULT)
                                          + w_wstr(version_reject_message())))
                 return
+
+            # ★ 客户端 hook 完整性校验（D85）：版本号能被手改，`bshook.dll`
+            #   的 SHA-256 不能。校验位对不上 = 这份 DLL 不是我们发的那一份
+            #   （反倒卖公告被人拿掉了？）⇒ 按「版本过旧」同一条路拒，
+            #   客户端会拉起更新器自己换回正版那份。
+            #   ★ 清单里没有这个版本时**一定放行** —— 那是「服务端的包比
+            #   客户端旧」，拒了就是把玩家卡进「更新到它已经是的版本」的死循环。
+            manifest, manifest_warnings = versioning.load_hook_manifest()
+            for warning in manifest_warnings:
+                self.log(f"⚠ hook 完整性清单: {warning}")
+            verdict, why_hook = versioning.verify_client_hook(
+                self.client_version, hook_tag, manifest)
+            if verdict == versioning.HOOK_MISMATCH:
+                self.version_rejected = True
+                self.log(f"✗ hook 完整性校验失败：{why_hook}；"
+                         f"回 0xFE 控制帧（结果码 {VERSION_REJECT_RESULT}）")
+                self.online(f"✗ hook 完整性 拒绝 ip={self.peer()} "
+                            f"客户端版本={have} 原因={why_hook}")
+                if not self.args.hold and self.args.version_result == 0:
+                    self.send(build_ctrl(w_i32(VERSION_REJECT_RESULT)
+                                         + w_wstr(version_reject_message())))
+                return
+            self.log(f"hook 完整性：{why_hook}")
+
             # ★ 上下线流水里必须能查到「这条连接跑的是哪个版本」——
             #   server.out 每次启动都被覆盖，版本号要进 online.log 才留得住
             #   （这本来就是给「拿到 log 不知道对方版本」的排查场景用的）。

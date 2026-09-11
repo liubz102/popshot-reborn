@@ -245,6 +245,34 @@ try {
                   -Target (Join-Path $OutputDirectory 'config\server.config') -Kind 'unix'
     Copy-TextFile -Source (Join-Path $Template 'README.md') `
                   -Target (Join-Path $OutputDirectory 'README.md') -Kind 'unix'
+    # ★ 把这一版 hook 的 SHA-256 记进 server\manifest-hook.json（D85）——
+    #   和 build-portable.ps1 那边**同一件事、同一条命令**，两个包都要做：
+    #   清单就放在 server\ 里，跟着下面那次递归拷贝一起进包。
+    #   ★ 必须在拷 server\ **之前**跑，否则包里带的是旧清单。
+    #   只打服务端包时也要更新 —— 不然「清单里没有这个版本」会被判成
+    #   「手改出来的版本号」而强制更新（D85 第二轮收紧）。
+    #   hook\bin\bshook.dll 不在（服务端包本来就不需要它）就跳过：那时
+    #   清单保持仓库里提交的那份，由客户端包那次负责。
+    $hookDll = Join-Path $Root 'hook\bin\bshook.dll'
+    if (Test-Path -LiteralPath $hookDll -PathType Leaf) {
+        & (Join-Path $Root 'runtime\python\python.exe') `
+            (Join-Path $Root 'tools\gen_hook_manifest.py') --version $Version.Text
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host ('  [warn] 更新 server\manifest-hook.json 失败，' +
+                        '这一版不做 hook 完整性校验') -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host ('  [warn] 没有 hook\bin\bshook.dll，' +
+                    'server\manifest-hook.json 用仓库里提交的那份') `
+                   -ForegroundColor Yellow
+    }
+    # ★ 许可证必须随包走：PolyForm Noncommercial 的 Notices 一节明确要求
+    #   「拿到软件的人也要拿到这些条款」。这两份是**仓库根**那份，不是
+    #   tools\server-package\ 下的模板 —— 许可证只有一份，不存在「另一边」。
+    Copy-TextFile -Source (Join-Path $Root 'LICENSE') `
+                  -Target (Join-Path $OutputDirectory 'LICENSE') -Kind 'unix'
+    Copy-TextFile -Source (Join-Path $Root 'LICENSE.zh.md') `
+                  -Target (Join-Path $OutputDirectory 'LICENSE.zh.md') -Kind 'unix'
 
     # --- 2. server 代码（和客户端包同一份，铁律 8）--------------------------
     Write-Host '  [2/6] server（和客户端包同一份代码）'

@@ -29,6 +29,14 @@
    它由 tools/gen_ports_h.py 从 server/config.py 生成，build.bat 每次编译
    前都会重新跑一遍。要改端口只改 server/config.py 一处。 */
 #include "ports.h"
+/* ★ 登录界面公告框的文案（**已混淆**）。同样是生成物：原稿是
+   hook/notice.zh.txt，生成器 tools/gen_notice_h.py，build.bat 每次编译前
+   重新跑一遍。不要在本文件里写任何一句公告明文 —— 判据是
+   `python tools/gen_notice_h.py --verify-dll hook/bin/bshook.dll` 要 0 命中。 */
+#include "notice_blob.h"
+/* ★ 复用更新器那份 SHA-256（CNG / bcrypt，Win7+ 系统自带）—— 它本来就是
+   用来校验下载包的，不要再写第二份实现。源文件由 build.bat 一起编进来。 */
+#include "sha256.h"
 #pragma intrinsic(_ReturnAddress)
 
 /* -------------------------------------------------------------------------- */
@@ -837,6 +845,9 @@ static void hook_login_dialog(HWND dlg)
 /* 定义在下面「注册链接的点击」一段。 */
 static void hook_register_link(HWND dlg);
 
+/* 定义在下面「登录界面公告框」一段（和 MessageBox 一起装，见 install_hooks）。 */
+static void install_notice_hook(HMODULE u32);
+
 static void style_login_dialog(HWND dlg)
 {
     HWND online = GetDlgItem(dlg, IDC_RADIO_ONLINE);
@@ -1431,6 +1442,11 @@ static void install_hooks(void)
         (void *)GetProcAddress(u32, "MessageBoxW"), (void *)det_MessageBoxW, "MessageBoxW");
     s_MessageBoxA = (MsgBoxA_t)install_inline_hook(
         (void *)GetProcAddress(u32, "MessageBoxA"), (void *)det_MessageBoxA, "MessageBoxA");
+
+    /* ★ 登录公告的**触发点**（定义在下面「登录界面公告框」一段）。
+       和 MessageBox 一样是内联钩 user32 的导出函数 —— 这里装得下的前提只有
+       「user32 已加载」，上面刚判过。 */
+    install_notice_hook(u32);
 
     install_ws2_hooks();    /* ws2_32 是静态导入, 此时已加载 */
     install_shell_hooks();  /* 注册链接改写（V0.2 里程碑 H）*/
@@ -2124,6 +2140,109 @@ static int read_build_ver(void)
     return 1;
 }
 
+/* ★ 新编码（D85）：把本 DLL 自己的 SHA-256 折进上报值。
+   布局见 server/versioning.py 的 WIRE_V2_* 那一段：
+     bit31 = 1 标记 / bit30..24 校验位 / bit23..0 版本号（明着放）。
+   ★★ 校验位算法必须和 `versioning.hook_tag()` **逐位一致**：
+   对「32 个原始 hash 字节 ‖ 版本号 4 字节小端」再做一次 SHA-256，
+   取结果第一个字节的低 7 位。分叉的症状是「谁都登不上」，
+   `server/test_versioning.py` 用固定向量钉着两边。 */
+#define HS_V2_FLAG        0x80000000u
+/* ★ 合法版本码只到 15.999.999（major <= 15），不是整个 24 位 ——
+   和 versioning.py 的 WIRE_V2_VERSION_MAX 同值，理由见那边。 */
+#define HS_V2_VER_MASK    0x00FFFFFFu
+#define HS_V2_VER_MAX     15999999u
+#define HS_V2_TAG_SHIFT   24
+#define HS_V2_TAG_MASK    0x7Fu
+
+static unsigned int g_hsver_wire_out = 0;   /* 真正补丁进去的那 4 字节 */
+static char g_hsver_hash[72] = "";          /* 日志用：自己那份 DLL 的 sha256 */
+
+static int hex_nibble(wchar_t c)
+{
+    if (c >= L'0' && c <= L'9') return (int)(c - L'0');
+    if (c >= L'a' && c <= L'f') return (int)(c - L'a') + 10;
+    if (c >= L'A' && c <= L'F') return (int)(c - L'A') + 10;
+    return -1;
+}
+
+/* 算出本 DLL 的校验位。返回 1 成功。 */
+static int hsver_compute_tag(unsigned int wire_v, unsigned char *tag_out)
+{
+    wchar_t path[MAX_PATH * 2], hex[65], hex2[65];
+    unsigned char buf[36];
+    Sha256 s;
+    int i, hi, lo;
+    char u8[80];
+
+    if (!GetModuleFileNameW(GetModuleHandleA("bshook.dll"), path,
+                            MAX_PATH * 2)) {
+        bslog("PATCH   !! 取不到自己的模块路径，算不出 hook 校验位 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    if (!sha256_file(path, hex)) {
+        bslog("PATCH   !! 算不出自己这份 bshook.dll 的 SHA-256（%s）",
+              w2u8(path, u8, sizeof(u8)));
+        return 0;
+    }
+    w2u8(hex, g_hsver_hash, sizeof(g_hsver_hash));
+
+    for (i = 0; i < 32; i++) {
+        hi = hex_nibble(hex[i * 2]);
+        lo = hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return 0;
+        buf[i] = (unsigned char)((hi << 4) | lo);
+    }
+    buf[32] = (unsigned char)(wire_v & 0xffu);
+    buf[33] = (unsigned char)((wire_v >> 8) & 0xffu);
+    buf[34] = (unsigned char)((wire_v >> 16) & 0xffu);
+    buf[35] = (unsigned char)((wire_v >> 24) & 0xffu);
+
+    if (!sha256_begin(&s)) return 0;
+    if (!sha256_update(&s, buf, sizeof(buf)) || !sha256_finish(&s, hex2)) {
+        sha256_end(&s);
+        return 0;
+    }
+    sha256_end(&s);
+    hi = hex_nibble(hex2[0]);
+    lo = hex_nibble(hex2[1]);
+    if (hi < 0 || lo < 0) return 0;
+    *tag_out = (unsigned char)(((hi << 4) | lo) & HS_V2_TAG_MASK);
+    return 1;
+}
+
+/* 决定这一轮到底上报哪 4 个字节。必须在 patch_thread 的**延迟之后**调
+   —— `sha256_file` 走 CNG，会碰 bcrypt/bcryptprimitives，启动期不敢
+   （注入期禁 LoadLibrary，见 install_shell_hooks 的说明）。 */
+static void hsver_pick_wire(void)
+{
+    unsigned char tag = 0;
+
+    g_hsver_wire_out = 0;
+    if (g_hsver_wire < 1000) return;                 /* 没版本号可写 */
+    if ((unsigned int)g_hsver_wire > HS_V2_VER_MAX) {
+        bslog("PATCH   !! 版本号 %s 装不进新编码的低 24 位（major 要 <= 15），"
+              "退回旧编码上报", g_hsver_text);
+        g_hsver_wire_out = (unsigned int)g_hsver_wire;
+        return;
+    }
+    if (!hsver_compute_tag((unsigned int)g_hsver_wire, &tag)) {
+        /* ★ 退回旧编码。服务端那边「版本在清单里却没带校验位」= 拒绝并
+           强制更新（D85）—— 更新器会重下一份干净的包，属于自愈。
+           这一行必须留在日志里：真出现了就是这条路上有问题。 */
+        bslog("PATCH   !! 算不出 hook 校验位，退回旧编码上报 "
+              "—— 服务端会按「完整性对不上」拒绝并要求重新更新");
+        g_hsver_wire_out = (unsigned int)g_hsver_wire;
+        return;
+    }
+    g_hsver_wire_out = HS_V2_FLAG
+                     | ((unsigned int)tag << HS_V2_TAG_SHIFT)
+                     | (unsigned int)g_hsver_wire;
+    bslog("PATCH   hook 完整性：bshook.dll sha256=%s -> 校验位 %u",
+          g_hsver_hash, (unsigned)tag);
+}
+
 static int try_patch_handshake_version(void)
 {
     unsigned char *p = (unsigned char *)HS_VER_VA;
@@ -2131,13 +2250,13 @@ static int try_patch_handshake_version(void)
     DWORD oldp;
 
     if (g_hsver_patched) return 1;
-    if (g_hsver_wire < 1000) return 1;     /* 没版本号可写：保持 311 */
+    if (!g_hsver_wire_out) return 1;       /* 没版本号可写：保持 311 */
     if (IsBadReadPtr(p, 7)) return 0;
     memcpy(want, HS_VER_ORIG, 7);
-    want[3] = (unsigned char)(g_hsver_wire         & 0xff);
-    want[4] = (unsigned char)((g_hsver_wire >> 8)  & 0xff);
-    want[5] = (unsigned char)((g_hsver_wire >> 16) & 0xff);
-    want[6] = (unsigned char)((g_hsver_wire >> 24) & 0xff);
+    want[3] = (unsigned char)(g_hsver_wire_out         & 0xffu);
+    want[4] = (unsigned char)((g_hsver_wire_out >> 8)  & 0xffu);
+    want[5] = (unsigned char)((g_hsver_wire_out >> 16) & 0xffu);
+    want[6] = (unsigned char)((g_hsver_wire_out >> 24) & 0xffu);
     if (memcmp(p, want, 7) == 0) {         /* 已是补丁后的样子 */
         InterlockedExchange(&g_hsver_patched, 1);
         return 1;
@@ -2153,9 +2272,319 @@ static int try_patch_handshake_version(void)
     VirtualProtect(p, 7, oldp, &oldp);
     FlushInstructionCache(GetCurrentProcess(), p, 7);
     InterlockedExchange(&g_hsver_patched, 1);
-    bslog("PATCH   ★握手版本号 @ %08X: 311 -> %ld（BUILD.ver %s）",
-          (unsigned)HS_VER_VA, g_hsver_wire, g_hsver_text);
+    bslog("PATCH   ★握手版本号 @ %08X: 311 -> 0x%08X（BUILD.ver %s，版本码 %ld%s）",
+          (unsigned)HS_VER_VA, g_hsver_wire_out, g_hsver_text, g_hsver_wire,
+          (g_hsver_wire_out & HS_V2_FLAG) ? "，带完整性校验位" : "，旧编码");
     return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★ 登录界面公告框 —— 反倒卖声明                                             */
+/*                                                                            */
+/*   登录对话框顶部那块 533×260 的子控件是原版自带的 IE 宿主（类名            */
+/*   `MPlay.Control.MiniBrowser`，id=0，矩形 -1,0,533×260）。它原本指向世纪    */
+/*   天成的公告页，域名早已注销 ⇒ 框里现在是 IE 的「已取消网页导航」错误页，  */
+/*   白占全客户端最显眼的一块地方。拿它来放「本项目免费，你被骗了」。         */
+/*                                                                            */
+/*   控件创建和导航在**同一个函数**里，相隔 0x22 字节：                       */
+/*     0x424057  push 0x104 / push 0x215   ; 260 / 533 —— 就是这个框          */
+/*     0x424067  call 0x442985             ; 内含 call [0x6E6260] = CreateWindowExW */
+/*     0x424089  68 30 27 66 00            ; push 0x662730（那条死链）         */
+/*     0x42408E  call 0x443000             ; MiniBrowser::Navigate            */
+/*                                                                            */
+/*   `Navigate`(0x443000) 反出来是：                                          */
+/*     SysAllocString(arg) -> VARIANT(VT_I4, 2) -> IWebBrowser2 vft+0x2C      */
+/*   —— URL **一个字节都不校验、不补前缀**，直接进 IWebBrowser2::Navigate。   */
+/*   所以换成 `file:///` 本地路径它照单全收。                                 */
+/*                                                                            */
+/*   做法：把 0x42408A 那 4 字节立即数改成指向 `g_notice_url`，URL 指向运行时 */
+/*   在 %TEMP% 下生成的一份 HTML。HTML 来自 `notice_blob.h`（混淆后编译进本   */
+/*   DLL，生成器 tools/gen_notice_h.py）—— **发布包里没有任何一份明文**，     */
+/*   临时文件每次启动重生成，改它没有意义。                                   */
+/*                                                                            */
+/*   `68 30 27 66 00` 这 5 字节在整个脱壳镜像里**只出现这一处**，`0x662730`   */
+/*   也只被这一处引用（`re_bs.py xref` 核对过），可当唯一特征串。             */
+/*                                                                            */
+/*   ★★ 触发点是**事件**，不是时刻（铁律 10）：内联 hook                      */
+/*   `user32!CreateWindowExW`，`lpClassName == L"MPlay.Control.MiniBrowser"`  */
+/*   的那一发就是事件本身 —— **控件还没建出来，就不可能被导航**，所以这一发  */
+/*   在任何机器、任何速度下都必然早于 `0x424089`。不比时间，没有余量一说。   */
+/*                                                                            */
+/*   ★ 为什么钩 user32 的导出函数，不钩 BigShot 的 IAT 槽（0x6E6260）：       */
+/*   **那个槽是 ASProtect 惰性解析的**（§87 实测）—— 解壳完成时它还是解析桩   */
+/*   （`0x568762  push 槽; push "CreateWindowExW"; push "user32.dll";`        */
+/*   `call 解析器; jmp [槽]`），要等 BigShot **第一次真的调** CreateWindowExW */
+/*   才填上真地址，而那一刻和公告框被创建几乎是同一瞬间 ⇒ 钩子装不早，        */
+/*   事件驱动就退化成了比时间。导出函数的地址在 user32 一加载就有，和解壳     */
+/*   进度无关，所以和 `MessageBoxW` 一起在 `install_hooks` 里就装上。         */
+/*   （也不能拿解析桩当原函数链下去：桩尾 `jmp [槽]` 会再读一次槽，而槽里     */
+/*   已经是我们的 detour ⇒ 无限递归。）                                       */
+/*                                                                            */
+/*   `patch_thread` 里那一轮特征串轮询是**次要**的：打上了就省掉 detour 里    */
+/*   那一发，打不上也无所谓，事件来了照样补。两条路调同一个幂等函数。         */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_NOTICE=1 保留原版行为（还是那个「已取消网页导航」）。     */
+/* -------------------------------------------------------------------------- */
+
+#define NOTICE_NAV_VA       0x00424089u   /* push 0x662730 */
+#define NOTICE_NAV_IMM_OFF  1             /* 立即数在特征串里的偏移 */
+#define NOTICE_NAV_SIG_LEN  5
+#define NOTICE_ORIG_URL_VA  0x00662730u   /* 原来那条死链的地址 */
+static const unsigned char NOTICE_NAV_SIG[NOTICE_NAV_SIG_LEN] =
+    { 0x68, 0x30, 0x27, 0x66, 0x00 };
+
+/* 公告框控件的窗口类名（BigShot 自己的 C++ 类 MiniBrowser 注册的）。
+   出处：`0x442A9D  call [0x6E6260]`（= user32!CreateWindowExW，ASProtect 的
+   导入解析桩 0x568762 把槽地址和 "CreateWindowExW"/"user32.dll" 成对压栈）
+   之前那 12 个 push 里，lpClassName 位上是 `0x6660B4` 这个串。
+   ★ 那个 IAT 槽**不能**拿来装钩子 —— 它是惰性解析的，见 install_notice_hook。 */
+#define NOTICE_BROWSER_CLASS    L"MPlay.Control.MiniBrowser"
+
+#define NOTICE_TMP_PREFIX  L"psnotice_"
+
+static volatile LONG g_notice_patched = 0;
+static volatile LONG g_notice_cwhook_done = 0;
+/* ★ 这个缓冲区的地址会被写进游戏代码的立即数，必须**整个进程生命期有效** ——
+   静态数组正好（本 DLL 不卸载）。 */
+static wchar_t g_notice_url[MAX_PATH * 2] = L"";
+/* `try_patch_notice_url` 有两个调用线程（patch_thread / 游戏 UI 线程上的
+   CreateWindowExW detour），用它串起来。在 DllMain 里初始化。 */
+static CRITICAL_SECTION g_notice_cs;
+
+typedef HWND (WINAPI *CreateWindowExW_t)(DWORD, LPCWSTR, LPCWSTR, DWORD,
+                                         int, int, int, int,
+                                         HWND, HMENU, HINSTANCE, LPVOID);
+static CreateWindowExW_t s_CreateWindowExW = NULL;
+
+static int notice_kept(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_NOTICE", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+/* 解混淆：`p[i] = c[i] ^ keystream[i] ^ c[i-1]`（c[-1] = IV），和
+   tools/gen_notice_h.py 的 `obfuscate()` 同算法。种子和 IV 来自
+   notice_blob.h —— 生成器写进去的，是唯一真源，两边不会漂。 */
+static void notice_decode(unsigned char *out)
+{
+    unsigned int x = NOTICE_SEED;
+    unsigned int i;
+    unsigned char prev = (unsigned char)NOTICE_IV;
+    for (i = 0; i < (unsigned int)NOTICE_BLOB_LEN; i++) {
+        unsigned char c = NOTICE_BLOB[i];
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        out[i] = (unsigned char)(c ^ (unsigned char)(x & 0xffu) ^ prev);
+        prev = c;
+    }
+}
+
+/* 清掉上次留下的临时公告文件。每次启动都重生成，旧的没有用；
+   上一局的进程还开着就删不掉，无所谓，下次再清。 */
+static void notice_sweep_old(const wchar_t *dir)
+{
+    wchar_t pattern[MAX_PATH * 2], victim[MAX_PATH * 2];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+
+    _snwprintf(pattern, MAX_PATH * 2, L"%s%s*.htm", dir, NOTICE_TMP_PREFIX);
+    pattern[MAX_PATH * 2 - 1] = 0;
+    h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        _snwprintf(victim, MAX_PATH * 2, L"%s%s", dir, fd.cFileName);
+        victim[MAX_PATH * 2 - 1] = 0;
+        DeleteFileW(victim);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+/* 解出公告、落成一份临时 HTML，把 `file:///` URL 写进 `g_notice_url`。
+   返回 1 = URL 可用。幂等（已经生成过就直接回 1）。
+   ★ 调用方必须持有 `g_notice_cs`，或者确定此刻只有自己一条线程 ——
+   `try_patch_notice_url` 在临界区里调它，`patch_thread` 开头那一发是提前量。 */
+static int notice_build_url(void)
+{
+    wchar_t dir[MAX_PATH * 2], path[MAX_PATH * 2], shortp[MAX_PATH * 2];
+    const wchar_t *src;
+    wchar_t *dst, *end;
+    unsigned char *html;
+    HANDLE f;
+    LARGE_INTEGER qpc;
+    DWORD wrote = 0, n;
+    char u8[MAX_PATH * 4];
+    unsigned int tag;
+    int ok = 0;
+
+    if (g_notice_url[0]) return 1;
+
+    n = GetTempPathW(MAX_PATH * 2 - 64, dir);
+    if (n == 0 || n >= MAX_PATH * 2 - 64) {
+        bslog("NOTICE  !! 取不到 %%TEMP%% 目录 err=%lu 　—— 公告框保持原样",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    notice_sweep_old(dir);
+
+    qpc.QuadPart = 0;
+    QueryPerformanceCounter(&qpc);
+    tag = (unsigned int)GetTickCount() ^ (unsigned int)GetCurrentProcessId()
+          ^ (unsigned int)qpc.LowPart;
+    _snwprintf(path, MAX_PATH * 2, L"%s%s%08x.htm", dir, NOTICE_TMP_PREFIX, tag);
+    path[MAX_PATH * 2 - 1] = 0;
+
+    html = (unsigned char *)malloc(NOTICE_BLOB_LEN);
+    if (!html) return 0;
+    notice_decode(html);
+    f = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                    CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        bslog("NOTICE  !! 写不了临时公告文件 err=%lu 　—— 公告框保持原样",
+              (unsigned long)GetLastError());
+    } else {
+        ok = WriteFile(f, html, (DWORD)NOTICE_BLOB_LEN, &wrote, NULL)
+             && wrote == (DWORD)NOTICE_BLOB_LEN;
+        CloseHandle(f);
+    }
+    /* ★ 抹掉堆里的明文再 free：本项目会收集 minidump（logs_client_crash\），
+       不抹的话公告正文会原样躺在玩家发回来的 dump 里。 */
+    SecureZeroMemory(html, NOTICE_BLOB_LEN);
+    free(html);
+    if (!ok) return 0;
+
+    /* 路径里可能有中文和空格（玩家的用户名）。先试 8.3 短名 —— 纯 ASCII，
+       最省事；卷上关了 8.3 名生成就退回长路径：Navigate 收的是 BSTR，宽字符
+       本来就吃得下，只把 URL 里有特殊含义的几个字符转义掉。 */
+    src = path;
+    n = GetShortPathNameW(path, shortp, MAX_PATH * 2);
+    if (n > 0 && n < MAX_PATH * 2) src = shortp;
+
+    wcscpy(g_notice_url, L"file:///");
+    dst = g_notice_url + wcslen(g_notice_url);
+    end = g_notice_url + MAX_PATH * 2 - 8;
+    for (; *src && dst < end; src++) {
+        if (*src == L'\\')      { *dst++ = L'/'; }
+        else if (*src == L' ')  { *dst++ = L'%'; *dst++ = L'2'; *dst++ = L'0'; }
+        else if (*src == L'#')  { *dst++ = L'%'; *dst++ = L'2'; *dst++ = L'3'; }
+        else if (*src == L'?')  { *dst++ = L'%'; *dst++ = L'3'; *dst++ = L'F'; }
+        else                    { *dst++ = *src; }
+    }
+    *dst = 0;
+    bslog("NOTICE  公告页已生成 -> %s", w2u8(g_notice_url, u8, sizeof(u8)));
+    return 1;
+}
+
+/* 把 0x42408A 的立即数改成 `g_notice_url`。幂等；两个线程都可以调。
+   返回 1 = 这一发不用再管了（打上了 / 打不了也不必再试）；0 = 继续等。 */
+static int try_patch_notice_url(void)
+{
+    unsigned char *p = (unsigned char *)NOTICE_NAV_VA;
+    unsigned int cur, want;
+    DWORD oldp;
+    int done = 0;
+
+    if (g_notice_patched) return 1;
+
+    EnterCriticalSection(&g_notice_cs);
+    do {
+        if (g_notice_patched) { done = 1; break; }
+        if (IsBadReadPtr(p, NOTICE_NAV_SIG_LEN)) break;
+        if (p[0] != NOTICE_NAV_SIG[0]) break;      /* 连 push 都不是，还没解壳 */
+        /* ★ 按需生成，**不假设谁先谁后**：本函数有两个调用方（patch_thread 的
+           轮询、CreateWindowExW detour），哪个先到都行。`notice_build_url`
+           自己幂等，而且我们在临界区里。 */
+        if (!g_notice_url[0] && !notice_build_url()) {
+            /* 公告页生成不出来（临时目录写不了之类）。**绝不能**把导航指到
+               一个不存在的文件上 —— 保持原版行为，别越帮越忙。 */
+            bslog("NOTICE  !! 没有可用的公告页，登录框顶部保持原版行为");
+            InterlockedExchange(&g_notice_patched, 1);
+            done = 1;
+            break;
+        }
+        want = (unsigned int)(UINT_PTR)g_notice_url;
+        memcpy(&cur, p + NOTICE_NAV_IMM_OFF, 4);
+        if (cur == want) {                          /* 已经是补丁后的样子 */
+            InterlockedExchange(&g_notice_patched, 1);
+            done = 1;
+            break;
+        }
+        if (cur != NOTICE_ORIG_URL_VA) break;       /* 特征对不上，继续等 */
+
+        if (!VirtualProtect(p, NOTICE_NAV_SIG_LEN,
+                            PAGE_EXECUTE_READWRITE, &oldp)) {
+            bslog("NOTICE  登录公告: VirtualProtect 失败 err=%lu",
+                  (unsigned long)GetLastError());
+            break;
+        }
+        memcpy(p + NOTICE_NAV_IMM_OFF, &want, 4);
+        VirtualProtect(p, NOTICE_NAV_SIG_LEN, oldp, &oldp);
+        FlushInstructionCache(GetCurrentProcess(), p, NOTICE_NAV_SIG_LEN);
+        InterlockedExchange(&g_notice_patched, 1);
+        done = 1;
+        bslog("PATCH   ★登录公告 @ %08X: 导航目标 %08X -> %08X"
+              "（原版那条死链换成本地公告页）",
+              (unsigned)NOTICE_NAV_VA, (unsigned)NOTICE_ORIG_URL_VA,
+              (unsigned)want);
+    } while (0);
+    LeaveCriticalSection(&g_notice_cs);
+    return done;
+}
+
+/* 结构性触发点：公告框控件被创建的那一刻，导航一定还没发生。 */
+static HWND WINAPI det_CreateWindowExW(DWORD ex, LPCWSTR cls, LPCWSTR name,
+                                       DWORD style, int x, int y, int w, int h,
+                                       HWND parent, HMENU menu,
+                                       HINSTANCE inst, LPVOID param)
+{
+    /* `cls` 可能是 ATOM（高 16 位为 0），那种一定不是我们要认的类名。 */
+    if (!g_notice_patched && HIWORD((UINT_PTR)cls) != 0
+        && lstrcmpiW(cls, NOTICE_BROWSER_CLASS) == 0) {
+        bsvlog("NOTICE  MiniBrowser 控件正在创建（%dx%d），先把导航目标补上", w, h);
+        try_patch_notice_url();
+    }
+    return s_CreateWindowExW(ex, cls, name, style, x, y, w, h,
+                             parent, menu, inst, param);
+}
+
+/* 内联 hook `user32!CreateWindowExW`，和 `MessageBoxW` 同一套
+   （`install_inline_hook`），在 `install_hooks` 里 user32 一在就装。
+
+   ★★ 这是**主触发点**，不是兜底。判据是**事件**：「公告框控件正在被创建」。
+   控件还没建出来就不可能被导航 ⇒ 这一发在任何机器、任何速度下都必然早于
+   `0x424089`，不依赖「解壳到导航之间有多少毫秒」。
+
+   ★ 为什么不钩 BigShot 自己的 IAT 槽 `0x6E6260`（最初就是那么写的，§87 推翻）：
+   **那个槽是 ASProtect 惰性解析的** —— 解壳完成时它还是解析桩，要等 BigShot
+   第一次真的调 `CreateWindowExW` 才填上真地址，而那一刻和公告框被创建几乎是
+   同一瞬间（实测 +7.9s vs mshtml +8.2s）⇒ 钩子装不早，「事件驱动」就退化成了
+   「比谁快」。导出函数的地址和解壳进度无关，随时可装。
+   （也不能拿解析桩当原函数链下去：桩尾 `jmp [槽]` 会再读一次槽，而槽里已经是
+   我们的 detour ⇒ 无限递归。）
+
+   代价：全进程每一次 `CreateWindowExW` 都多走一次比较。detour 里第一句就是
+   「已经补过了就直接放行」，补上之后只剩一次原子读，可以忽略。 */
+static void install_notice_hook(HMODULE u32)
+{
+    void *real;
+
+    if (g_notice_cwhook_done) return;
+    InterlockedExchange(&g_notice_cwhook_done, 1);   /* 装一次就够，失败也不重试 */
+    if (notice_kept()) {
+        bslog("NOTICE  BSHOOK_KEEP_NOTICE 已设，不装公告钩子（登录框顶部保持原版）");
+        return;
+    }
+    real = (void *)GetProcAddress(u32, "CreateWindowExW");
+    if (!real) {
+        bslog("NOTICE  !! 取不到 user32!CreateWindowExW，登录公告只能靠特征串轮询");
+        return;
+    }
+    s_CreateWindowExW = (CreateWindowExW_t)install_inline_hook(
+        real, (void *)det_CreateWindowExW, "CreateWindowExW");
+    if (!s_CreateWindowExW)
+        bslog("NOTICE  !! CreateWindowExW 内联 hook 没装上，"
+              "登录公告只能靠特征串轮询");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -3584,6 +4013,234 @@ static int install_jmp_guard(unsigned int va, const unsigned char *sig, int sig_
     for (i = 5; i < stolen; i++) p[i] = 0x90;
     VirtualProtect(p, stolen, oldp, &oldp);
     FlushInstructionCache(GetCurrentProcess(), p, stolen);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★ 公告框的两处交互改造：① 文字可选中复制  ② 链接点了开系统浏览器          */
+/*                                                                            */
+/*   原版 `MiniBrowser` 把这两件事都关死了（§88 反出来的）：                  */
+/*                                                                            */
+/*   ① `IDocHostUIHandler::GetHostInfo`（vft 0x665ecc 槽 4 = 0x442f2b）：     */
+/*        0x442f35  c7 40 04 8f 00 01 00   mov [eax+4], 0x1008F              */
+/*      最低位是 **DOCHOSTUIFLAG_DIALOG** —— 就是它禁掉了文字选中。           */
+/*      清成 `0x1008E` 即可拖蓝 + Ctrl+C。                                    */
+/*      ★ 其余位一位不动，尤其 `SCROLL_NO`(0x8) 要留着：公告框只有 260 像素   */
+/*      高，冒出滚动条比什么都难看（内容是我们自己排的，本来就装得下）。      */
+/*                                                                            */
+/*   ② 链接：原版**根本不会开外部浏览器**。事件接收器                        */
+/*      `MiniBrowserEvent::Invoke`(0x443282) 里 251 NewWindow2 -> 0x46f801    */
+/*      `mov al,1; ret`（弹窗一律取消）、250 BeforeNavigate2 -> 0x44335f      */
+/*      `xor al,al; ret 4`（一律框内导航）。照原样放个 <a> 上去，点一下会把   */
+/*      公告页顶掉、换成挤在 533x260 里的 GitHub。                            */
+/*                                                                            */
+/*      ★★ **实测：那个事件接收器压根没被 Advise** —— patch 了 0x44335f 之后  */
+/*      点链接照样框内导航，而且我们的日志一行都没有（活进程里回读过，E9 在   */
+/*      位、vftable 也指着它）。所以真正管用的是另一条路：                    */
+/*      **`IDocHostUIHandler::TranslateUrl`（vft 0x665ecc 槽 16）** ——        */
+/*      它是 mshtml **直接调宿主接口**的，不经过连接点。同一张 vftable 上的   */
+/*      `GetHostInfo` 已经证明 mshtml 在用这张表（①改完选中就生效了）。       */
+/*                                                                            */
+/*      `TranslateUrl` 不能取消导航，但能**换掉目标 URL**，那就够了：         */
+/*      http(s) -> `ShellExecuteW` 开系统浏览器，同时把导航目标换回我们自己   */
+/*      那条 `file:///` 公告页 ⇒ 框里看不出有过跳转。                         */
+/*                                                                            */
+/*      ⚠ 槽 16 原值 `0x44327a` 是个**九个槽共用**的 `E_NOTIMPL` 桩，         */
+/*      **不许 patch 那个桩**（会连累 ResizeBorder / TranslateAccelerator     */
+/*      等等），只改 vftable 里那一格指针。                                   */
+/*                                                                            */
+/*      0x44335f 那一发也留着当兜底（万一别的机器上接收器是连上的）。         */
+/*      两条路**不会重复开浏览器**：谁先跑，URL 都已经被换成 `file:///` 了，  */
+/*      另一条再看到时就不匹配 http(s) 了。                                   */
+/*                                                                            */
+/*   两处都跟着 BSHOOK_KEEP_NOTICE=1 一起退回原版。                           */
+/* -------------------------------------------------------------------------- */
+
+/* ① DOCHOSTUIFLAG_DIALOG */
+#define NOTICE_UIFLAG_VA      0x00442f35u
+#define NOTICE_UIFLAG_SIG_LEN 7
+#define NOTICE_UIFLAG_OFF     3        /* 立即数低字节在特征串里的偏移 */
+static const unsigned char NOTICE_UIFLAG_SIG[NOTICE_UIFLAG_SIG_LEN] =
+    { 0xc7, 0x40, 0x04, 0x8f, 0x00, 0x01, 0x00 };
+#define NOTICE_UIFLAG_WANT    0x8e     /* 清掉 DIALOG，其余一位不动 */
+static volatile LONG g_notice_select_patched = 0;
+
+/* ② -a  IDocHostUIHandler::TranslateUrl —— 主路（mshtml 直接调宿主接口） */
+#define NOTICE_TRANSURL_SLOT_VA 0x00665f0cu   /* vft 0x665ecc 的第 16 格 */
+#define NOTICE_NOTIMPL_STUB_VA  0x0044327au   /* 原值：九槽共用的 E_NOTIMPL 桩 */
+static volatile LONG g_notice_link_patched = 0;
+
+/* ② -b  MiniBrowserEvent::BeforeNavigate2 —— 兜底（本机实测不会被调到） */
+#define NOTICE_NAV2_VA        0x0044335fu
+#define NOTICE_NAV2_SIG_LEN   7
+static const unsigned char NOTICE_NAV2_SIG[NOTICE_NAV2_SIG_LEN] =
+    { 0x8b, 0x4c, 0x24, 0x04,          /* mov ecx, [esp+4]  */
+      0x83, 0xc1, 0xec };              /* add ecx, -0x14    */
+static volatile LONG g_notice_nav2_patched = 0;
+
+/* BigShot 自己的宽字符串：数据指针减 0x14 是对象头，这是它的释放函数。 */
+typedef void (__fastcall *BsStrRelease_t)(void *self);
+#define BS_STR_RELEASE_VA  0x00403610u
+#define BS_STR_HEADER      0x14
+
+typedef void * (WINAPI *CoTaskMemAlloc_t)(SIZE_T);
+static CoTaskMemAlloc_t s_CoTaskMemAlloc = NULL;
+
+static int try_patch_notice_select(void)
+{
+    unsigned char *p = (unsigned char *)NOTICE_UIFLAG_VA;
+    DWORD oldp;
+
+    if (g_notice_select_patched) return 1;
+    if (IsBadReadPtr(p, NOTICE_UIFLAG_SIG_LEN)) return 0;
+    if (p[NOTICE_UIFLAG_OFF] == NOTICE_UIFLAG_WANT
+        && memcmp(p, NOTICE_UIFLAG_SIG, NOTICE_UIFLAG_OFF) == 0) {
+        InterlockedExchange(&g_notice_select_patched, 1);   /* 已经是改好的样子 */
+        return 1;
+    }
+    if (memcmp(p, NOTICE_UIFLAG_SIG, NOTICE_UIFLAG_SIG_LEN) != 0)
+        return 0;                                           /* 还没解壳，继续等 */
+    if (!VirtualProtect(p, NOTICE_UIFLAG_SIG_LEN, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("NOTICE  公告框文字选中: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    p[NOTICE_UIFLAG_OFF] = NOTICE_UIFLAG_WANT;
+    VirtualProtect(p, NOTICE_UIFLAG_SIG_LEN, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, NOTICE_UIFLAG_SIG_LEN);
+    InterlockedExchange(&g_notice_select_patched, 1);
+    bslog("PATCH   ★公告框文字可选中 @ %08X: DOCHOSTUIFLAG 0x1008F -> 0x1008E"
+          "（清掉 DIALOG 位；SCROLL_NO 保留）", (unsigned)NOTICE_UIFLAG_VA);
+    return 1;
+}
+
+static int notice_is_http(const wchar_t *url)
+{
+    if (!url || IsBadReadPtr(url, sizeof(wchar_t) * 8)) return 0;
+    return (_wcsnicmp(url, L"http://", 7) == 0
+            || _wcsnicmp(url, L"https://", 8) == 0) ? 1 : 0;
+}
+
+/* 交给系统浏览器。走到这里一定是玩家点了一下，进程早就起完了，
+   现加载 shell32 是安全的（同 link_wndproc 的说明）。 */
+static void notice_shell_open(const wchar_t *url)
+{
+    char u8[1024];
+
+    if (!s_ShellExecuteW_raw) {
+        HMODULE sh = GetModuleHandleA("shell32.dll");
+        if (!sh) sh = LoadLibraryA("shell32.dll");
+        if (sh) s_ShellExecuteW_raw =
+            (ShellExecuteW_t)GetProcAddress(sh, "ShellExecuteW");
+    }
+    if (!s_ShellExecuteW_raw) {
+        bslog("NOTICE  !! 没拿到 ShellExecuteW，公告里的链接打不开");
+        return;
+    }
+    s_ShellExecuteW_raw(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
+    bslog("NOTICE  公告里的链接被点开 -> 交给系统浏览器: %s",
+          w2u8(url, u8, sizeof(u8)));
+}
+
+/* mshtml 要用 CoTaskMemAlloc 出来的串，用完由它 CoTaskMemFree。 */
+static wchar_t *notice_cotask_dup(const wchar_t *s)
+{
+    size_t bytes;
+    wchar_t *copy;
+
+    if (!s_CoTaskMemAlloc) {
+        HMODULE ole = GetModuleHandleA("ole32.dll");
+        if (!ole) ole = LoadLibraryA("ole32.dll");
+        if (ole) s_CoTaskMemAlloc =
+            (CoTaskMemAlloc_t)GetProcAddress(ole, "CoTaskMemAlloc");
+    }
+    if (!s_CoTaskMemAlloc) return NULL;
+    bytes = (wcslen(s) + 1) * sizeof(wchar_t);
+    copy = (wchar_t *)s_CoTaskMemAlloc(bytes);
+    if (copy) memcpy(copy, s, bytes);
+    return copy;
+}
+
+/* IDocHostUIHandler::TranslateUrl —— 4 个参数，`ret 0x10`（同原版那个桩）。
+   S_FALSE = 不改；S_OK + *out = 换成这个 URL。 */
+static HRESULT __stdcall notice_translate_url(void *self, DWORD flags,
+                                              wchar_t *in, wchar_t **out)
+{
+    wchar_t *repl;
+    (void)self; (void)flags;
+
+    if (!out) return S_FALSE;
+    *out = NULL;
+    if (!notice_is_http(in) || !g_notice_url[0]) return S_FALSE;
+
+    notice_shell_open(in);
+    /* 把导航目标换回我们自己的公告页 —— TranslateUrl 取消不了导航，
+       但换个目标就等于「没跳走」。 */
+    repl = notice_cotask_dup(g_notice_url);
+    if (!repl) return S_FALSE;      /* 分配不出来：宁可让它跳走，也别崩 */
+    *out = repl;
+    return S_OK;
+}
+
+/* 兜底：MiniBrowserEvent 的 BeforeNavigate2 处理（0x44335f）整个换掉。
+   `__stdcall` + 一个参数 = 和原版一样 `ret 4`；返回值落在 al，调用方
+   `movzx ax, al` 后写进 `*pfCancel`（原版自己的 NewWindow2 也是回 1 取消）。 */
+static int __stdcall notice_before_navigate(wchar_t *url)
+{
+    int cancel = 0;
+
+    if (notice_is_http(url)) {
+        notice_shell_open(url);
+        cancel = 1;                      /* 取消：别让它在框里把公告顶掉 */
+    }
+    /* ★ 串照样要释放（原版无条件释放）—— 不然每点一次漏一份。 */
+    if (url)
+        ((BsStrRelease_t)(UINT_PTR)BS_STR_RELEASE_VA)(
+            (void *)((unsigned char *)url - BS_STR_HEADER));
+    return cancel;
+}
+
+/* 改 vftable 第 16 格（.rdata，要 VirtualProtect）。
+   守卫同 `try_guard_nexon_messenger`：格子里必须正好是原来那个 E_NOTIMPL 桩。 */
+static int try_patch_notice_link(void)
+{
+    void **slot = (void **)(UINT_PTR)NOTICE_TRANSURL_SLOT_VA;
+    DWORD oldp;
+
+    if (g_notice_link_patched) return 1;
+    if (IsBadReadPtr(slot, sizeof(*slot))) return 0;
+    if (*slot == (void *)notice_translate_url) {
+        InterlockedExchange(&g_notice_link_patched, 1);
+        return 1;
+    }
+    if (*slot != (void *)(UINT_PTR)NOTICE_NOTIMPL_STUB_VA)
+        return 0;                     /* 还没解壳 / 版本对不上，继续等 */
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &oldp)) {
+        bslog("NOTICE  公告框链接: vftable VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    *slot = (void *)notice_translate_url;
+    VirtualProtect(slot, sizeof(*slot), oldp, &oldp);
+    InterlockedExchange(&g_notice_link_patched, 1);
+    bslog("PATCH   ★公告框链接 @ %08X: IDocHostUIHandler::TranslateUrl 接管"
+          " —— http(s) 交给系统浏览器，导航目标换回本地公告页",
+          (unsigned)NOTICE_TRANSURL_SLOT_VA);
+    return 1;
+}
+
+/* 兜底那一发（本机实测不会被调到，留着给「接收器真被 Advise 了」的机器）。 */
+static int try_patch_notice_nav2(void)
+{
+    if (g_notice_nav2_patched) return 1;
+    if (!install_jmp_guard(NOTICE_NAV2_VA, NOTICE_NAV2_SIG, NOTICE_NAV2_SIG_LEN,
+                           NOTICE_NAV2_SIG_LEN, (void *)notice_before_navigate,
+                           "公告框链接兜底"))
+        return 0;
+    InterlockedExchange(&g_notice_nav2_patched, 1);
+    bsvlog("PATCH   公告框链接兜底 @ %08X: BeforeNavigate2 也接管了"
+           "（本机实测这个事件接收器没被 Advise，不会走到）",
+           (unsigned)NOTICE_NAV2_VA);
     return 1;
 }
 
@@ -7044,7 +7701,23 @@ static int try_hook_render_init(void)
 static DWORD WINAPI patch_thread(LPVOID param)
 {
     int ticks = 0;
+    int notice_off;
     (void)param;
+
+    /* 登录公告页在延迟之前就先解出来落盘 —— 纯粹是**提前量**：真正需要它的
+       时刻（`det_CreateWindowExW`）跑在游戏 UI 线程上，那儿不适合现写文件。
+       正确性不依赖这一发：`try_patch_notice_url` 发现还没生成会自己补，
+       两边都在 `g_notice_cs` 里。 */
+    notice_off = notice_kept();
+    if (notice_off)
+        bslog("PATCH   BSHOOK_KEEP_NOTICE 已设，登录框顶部保留原版行为"
+              "（那条死链 -> IE 的「已取消网页导航」）");
+    else {
+        EnterCriticalSection(&g_notice_cs);
+        notice_build_url();
+        LeaveCriticalSection(&g_notice_cs);
+    }
+
     /* GameGuard 已由 DR0 + VEH 在执行瞬间处理，不经过本线程，也不修改代码。
        下面仍有地区锁、挂机计时器和诊断 detour 会改游戏代码；它们必须晚于
        ASProtect 启动早期的后台完整性校验，因此暂时保留经本机验证的 2.5 秒门槛。 */
@@ -7070,6 +7743,37 @@ static DWORD WINAPI patch_thread(LPVOID param)
             bslog("PATCH   !! 超时未能 patch 地区差异"
                   "（0x40b419 / 0x4368cf / 0x4f67d1 / 0x46631d / 0x4653a8 "
                   "的特征串一直对不上）");
+    }
+
+    /* 登录公告：**这一轮是次要的**，打不上也没关系 —— 真正的保证在
+       `det_CreateWindowExW`（公告框控件被创建的那一刻，必然早于导航）。
+       在这里顺手打一发，只是为了让 detour 那条路上少做一次事，
+       顺便在日志里留一行「特征串对得上」。所以**不死等**，一轮不中就走。 */
+    if (!notice_off && !try_patch_notice_url())
+        bslog("PATCH   登录公告：0x424089 的特征串还没到位，"
+              "等公告框控件创建时再补（det_CreateWindowExW）");
+
+    /* 公告框的两处交互改造（§88）：文字可选中复制、链接点了开系统浏览器。
+       这两处**不赶时机** —— `GetHostInfo` 和 `BeforeNavigate2` 都要等 IE 控件
+       真的起来才第一次被调到，远晚于解壳；所以照常轮询特征串等就行。 */
+    if (!notice_off) {
+        for (ticks = 0; !g_stop && !g_notice_select_patched && ticks < 2000; ticks++) {
+            if (try_patch_notice_select()) break;
+            Sleep(2);
+        }
+        if (!g_notice_select_patched)
+            bslog("PATCH   !! 超时未能 patch 公告框文字选中"
+                  "（0x442f35 一直不是 c7 40 04 8f 00 01 00）—— 文字将不可选中");
+        for (ticks = 0; !g_stop && !g_notice_link_patched && ticks < 2000; ticks++) {
+            if (try_patch_notice_link()) break;
+            Sleep(2);
+        }
+        if (!g_notice_link_patched)
+            bslog("PATCH   !! 超时未能 patch 公告框链接"
+                  "（vftable 0x665f0c 一直不是那个 E_NOTIMPL 桩）"
+                  "—— 点链接会按原版在框内导航，把公告顶掉");
+        /* 兜底那一发：本机实测走不到，所以不值得为它死等，一轮不中就算了。 */
+        try_patch_notice_nav2();
     }
 
     for (ticks = 0; !g_stop && !g_reflect_visual_patched && ticks < 2000; ticks++) {
@@ -7376,8 +8080,12 @@ static DWORD WINAPI patch_thread(LPVOID param)
        ★ 无论补没补上都要在日志里留一行版本：拿到玩家 log 一眼看出版本，
        这本来就是做版本管理的初衷。 */
     if (read_build_ver()) {
-        bslog("PATCH   BUILD.ver 版本 %s -> 握手版本号 %ld"
-              "（服务端 online.log 里记的就是它）", g_hsver_text, g_hsver_wire);
+        /* ★ 必须在这里（延迟之后）才算 —— 它走 CNG，会碰 bcrypt，
+           启动期不敢加载（见 hsver_pick_wire 的说明）。 */
+        hsver_pick_wire();
+        bslog("PATCH   BUILD.ver 版本 %s -> 握手上报 0x%08X"
+              "（服务端 online.log 里记的就是它）",
+              g_hsver_text, g_hsver_wire_out);
         for (ticks = 0; !g_stop && !g_hsver_patched && ticks < 2000; ticks++) {
             if (try_patch_handshake_version()) break;
             Sleep(2);
@@ -7425,6 +8133,7 @@ static DWORD WINAPI patch_thread(LPVOID param)
     }
     if (!g_render_hooked)
         bslog("D3D     !! 未能装 RendererInit hook（序言字节不符）");
+
     return 0;
 }
 
@@ -7581,6 +8290,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(inst);
         InitializeCriticalSection(&g_cs);
+        InitializeCriticalSection(&g_notice_cs);   /* 登录公告的两个触发点串这一把 */
         g_main_thread_id = GetCurrentThreadId(); /* LoadLibrary APC 正在这条主线程上执行 */
         g_dllmain_tick = GetTickCount();
         read_log_level();

@@ -30,8 +30,16 @@ int probe_parse_frame(const unsigned char *plain, size_t len,
 /* 从拒绝文案抠版本（[vV]数字.数字[.数字]，第一个匹配）。 */
 int probe_parse_wanted(const wchar_t *message, Ver *out);
 
-/* host:port 握手探针。返回 1 = result 有效（status 也已填）。 */
+/* 上报值编码（和 hook/bshook.c 的 hsver_pick_wire 同一套）：
+   把 `hook_dll` 那份文件的 SHA-256 折进版本号当校验位。`hook_dll` 为空或
+   算不出来时退回旧编码（会被服务端判成「对不上」，属于安全的一边）。 */
+unsigned long probe_encode_wire(const Ver *v, const wchar_t *hook_dll);
+
+/* host:port 握手探针。返回 1 = result 有效（status 也已填）。
+   `hook_dll` = 本机那份 bshook.dll 的完整路径 —— ★ 探针必须和真客户端发
+   **一模一样的 4 个字节**，否则服务端会判它「没带校验位」，`PROBE_OK`
+   就永远不可能出现。 */
 int probe_server(const wchar_t *host, int port, const Ver *local_version,
-                 ProbeResult *out);
+                 const wchar_t *hook_dll, ProbeResult *out);
 
 #endif /* UPDATER_PROBE_H */

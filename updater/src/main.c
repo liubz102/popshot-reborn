@@ -206,17 +206,24 @@ static int fetch_manifest(Manifest *m, wchar_t *err, size_t err_cap)
     return 1;
 }
 
+/* `force` = 服务器**明确拒了我们**（探针回 REJECTED）。
+   ★★ 这时「本地版本号已经够新」**不能**再当成「无需更新」——
+   服务器看过这个客户端之后说的不行，版本号一样只说明**文件被改过**
+   （hook 完整性校验，D85）。原来那条 `local >= target -> return NULL` 会让
+   被篡改的客户端永远停在「已是最新版本，无需更新」，谁也修不好它。
+   重装同一个版本正好把被改掉的文件覆盖回去，属于自愈。 */
 static const ReleaseEntry *pick_target(const Manifest *m, const Ver *wanted,
-                                       int *need_update)
+                                       int force, int *need_update)
 {
     int i;
     *need_update = 0;
     if (wanted) {
         for (i = 0; i < m->count; i++)
             if (ver_cmp(&m->entries[i].version, wanted) == 0) {
-                if (g_ctx.local_valid &&
+                if (!force && g_ctx.local_valid &&
                     ver_cmp(&g_ctx.local, &m->entries[i].version) >= 0)
                     return NULL;               /* 服务器要的版本本地已有 */
+                *need_update = 1;
                 return &m->entries[i];
             }
         {
@@ -226,7 +233,8 @@ static const ReleaseEntry *pick_target(const Manifest *m, const Ver *wanted,
         }
     }
     /* 最新版 = releases[0]（update_manifest.py 前插）。 */
-    if (g_ctx.local_valid && ver_cmp(&g_ctx.local, &m->entries[0].version) >= 0)
+    if (!force && g_ctx.local_valid &&
+        ver_cmp(&g_ctx.local, &m->entries[0].version) >= 0)
         return NULL;
     *need_update = 1;
     return &m->entries[0];
@@ -490,6 +498,7 @@ static DWORD WINAPI worker_main(LPVOID param)
     if (!zip_path[0]) {
         ProbeResult pr;
         wchar_t host[256];
+        wchar_t hook_dll[MAX_PATH * 2];
         int need_update = 0;
 
         /* --- 代理列表：manifest 兜底和下载测速共用这一份 ---------------- */
@@ -500,8 +509,16 @@ static DWORD WINAPI worker_main(LPVOID param)
         /* --- 探针：问服务器「该升到哪版」 ---------------------------- */
         ui_status(L"正在探测服务器，确认需要的版本……");
         cfg_server_address(g_ctx.root, host, 256);
+        /* ★ 探针要和真客户端发**一模一样的 4 个字节**（版本号 + hook 完整性
+           校验位，D85）—— 不然服务端会判它「没带校验位」，PROBE_OK 就永远
+           不可能出现，「无需更新」那条路等于废掉。 */
+        _snwprintf(hook_dll, MAX_PATH * 2, L"%ls\\hook\\bin\\bshook.dll",
+                   g_ctx.root);
+        hook_dll[MAX_PATH * 2 - 1] = 0;
+        log_line("probe host %ls:%d (root=%ls)", host, POPSHOT_GAME_PORT,
+                 g_ctx.root);
         probe_server(host, POPSHOT_GAME_PORT,
-                     g_ctx.local_valid ? &g_ctx.local : NULL, &pr);
+                     g_ctx.local_valid ? &g_ctx.local : NULL, hook_dll, &pr);
         if (pr.status == PROBE_OK) {
             finish_ok(L"服务器已接受当前版本，无需更新。");
             return 0;
@@ -533,11 +550,15 @@ static DWORD WINAPI worker_main(LPVOID param)
                 finish_fail(L"--target-version 认不出（内部参数错误）");
                 return 1;
             }
-            target = pick_target(&manifest, &forced, &need_update);
+            /* --target-version 是提权后重跑自己带的，那时已经决定要更新了。 */
+            target = pick_target(&manifest, &forced, 1, &need_update);
         } else if (pr.status == PROBE_REJECTED && pr.wanted_valid) {
-            target = pick_target(&manifest, &pr.wanted, &need_update);
+            /* ★ force=1：服务器刚刚拒了我们，版本号一样也得重装（见 pick_target）。 */
+            target = pick_target(&manifest, &pr.wanted, 1, &need_update);
         } else {
-            target = pick_target(&manifest, NULL, &need_update);
+            /* 探针连不上 —— 没人说我们有问题，保持「已是最新就别动」。 */
+            target = pick_target(&manifest, NULL,
+                                 pr.status == PROBE_REJECTED, &need_update);
         }
         if (!target) {
             finish_ok(L"已是最新版本，无需更新。");

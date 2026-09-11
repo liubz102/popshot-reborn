@@ -45,6 +45,20 @@ if errorlevel 1 (
     echo [build] WARNING: could not regenerate ports.h; using the committed one
 )
 
+rem --------------------------------------------------------------------------
+rem  Regenerate hook\notice_blob.h from hook\notice.zh.txt before compiling.
+rem
+rem  That is the login-screen anti-resale notice.  It is obfuscated and baked
+rem  into bshook.dll so a reseller cannot just edit a text file to remove it.
+rem  The plaintext source (hook\notice.zh.txt) is NOT shipped in any package;
+rem  notice_blob.h is committed, so building without Python still works.
+rem --------------------------------------------------------------------------
+set "GENNOTICE=%SRC%..\tools\gen_notice_h.py"
+"%PYEXE%" "%GENNOTICE%"
+if errorlevel 1 (
+    echo [build] WARNING: could not regenerate notice_blob.h; using the committed one
+)
+
 if not exist "%OUT%" mkdir "%OUT%"
 
 call "%VCVARS%" >nul
@@ -56,7 +70,10 @@ if errorlevel 1 (
 pushd "%OUT%"
 
 echo [build] compiling bshook.dll ...
-cl /nologo /W3 /O2 /MT /utf-8 /LD "%SRC%bshook.c" /Fe:bshook.dll /link kernel32.lib user32.lib
+rem  sha256.c is shared with the updater (CNG / bcrypt).  It is compiled in as a
+rem  second translation unit rather than copied, so there is only ONE SHA-256
+rem  implementation in the repo.  /I lets its own `#include "sha256.h"` resolve.
+cl /nologo /W3 /O2 /MT /utf-8 /LD /I "%SRC%..\updater\src" "%SRC%bshook.c" "%SRC%..\updater\src\sha256.c" /Fe:bshook.dll /link kernel32.lib user32.lib
 if errorlevel 1 (
     echo [build] bshook.dll FAILED
     popd
@@ -74,6 +91,36 @@ if errorlevel 1 (
 del /q *.obj >nul 2>&1
 del /q *.exp >nul 2>&1
 popd
+
+rem --------------------------------------------------------------------------
+rem  Build gate: the notice must NOT be findable as plaintext in the DLL.
+rem  A DLL that leaks it is a defect, not a warning -- fail the build.
+rem  errorlevel 9009 means the interpreter itself is missing; that is the one
+rem  case we downgrade to a warning (same policy as the generators above).
+rem --------------------------------------------------------------------------
+"%PYEXE%" "%GENNOTICE%" --verify-dll "%OUT%\bshook.dll"
+if errorlevel 9009 (
+    echo [build] WARNING: python not available, skipped the notice plaintext check
+) else if errorlevel 1 (
+    echo [build] FAILED: the login notice is readable as plaintext in bshook.dll
+    exit /b 1
+)
+
+rem --------------------------------------------------------------------------
+rem  Refresh server\manifest-hook.json with the SHA-256 we just produced.
+rem
+rem  The server rejects a client whose bshook.dll hash is not the one listed for
+rem  its version -- including "version not listed at all".  So on a dev machine,
+rem  rebuilding the hook WITHOUT refreshing the manifest would lock you out of
+rem  your own server on the next launch.  Version comes from build-ver.config.
+rem --------------------------------------------------------------------------
+set "GENHOOKMAN=%SRC%..\tools\gen_hook_manifest.py"
+"%PYEXE%" "%GENHOOKMAN%"
+if errorlevel 9009 (
+    echo [build] WARNING: python not available, manifest-hook.json NOT refreshed
+) else if errorlevel 1 (
+    echo [build] WARNING: could not refresh server\manifest-hook.json
+)
 
 echo.
 echo [build] done, output: %OUT%

@@ -589,6 +589,19 @@ class VersionGateTests(GameLoginTests):
         # 元组 = 钉死的最低版本；versioning.FOLLOW_FILE = 跟配置文件热重载。
         client_min_version = None
 
+    def setUp(self):
+        """★ 把 hook 完整性校验（D85）隔离掉 —— 本类测的是**版本门禁**。
+
+        两者共用同一发握手：完整性校验开着的话，这里手搓的那些版本号
+        （V0.2.7 / V1.0.0 …）都不在 `server/manifest-hook.json` 里，会被
+        按「清单里没有 = 手改的版本号」拒掉，于是门禁本身就测不成了。
+        空清单 = 整项校验关闭（fail-open），正好用来做隔离。
+        """
+        super().setUp()
+        real = versioning.load_hook_manifest
+        versioning.load_hook_manifest = lambda *a, **k: ({}, [])
+        self.addCleanup(setattr, versioning, "load_hook_manifest", real)
+
     def feed_handshake(self, conn, wire):
         """把「客户端连上后裸发的 4 字节版本号」喂进 feed()（加密流）。
 

@@ -325,7 +325,41 @@ function Copy-ServerCode {
     $copied += (Copy-ChrProps -Root $Root -PackageRoot $PackageRoot)
     # 商店物品表（V0.3商店 M1）：`server\shopdata.py` 读的就是它。
     $copied += (Copy-ShopData -Root $Root -PackageRoot $PackageRoot)
+    # 客户端 hook 完整性清单（D85）：`server\versioning.py` 读的就是它。
+    $copied += (Copy-HookManifest -Root $Root -PackageRoot $PackageRoot)
     return $copied
+}
+
+function Copy-HookManifest {
+    <# 把 `server\manifest-hook.json` 拷进包（**两个包都要**）。
+
+       ★ 上面那圈 `Copy-ServerCode` 只拷 `*.py` + `web\` + 空的 `data\` ——
+         **JSON 不会自动跟着走**。2026-09-14 实测踩过：以为「整个 server\
+         递归拷」，结果打出来的包里根本没有这个文件。
+
+       缺了它的症状是**沉默的**：服务端读不到清单就 fail-open，完整性校验
+       整项不生效，被改过的 bshook.dll 照样能连进来 —— 服务端照常起、玩家
+       照常玩，只是那道防线等于没有。所以这里缺了就**炸**，别打出半个包。
+
+       文件不在仓库里（还没打过带校验的包）时只警告不拦：那是合法的初始状态，
+       服务端会按「清单是空的」整项关闭校验。 #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$PackageRoot
+    )
+    $name = 'manifest-hook.json'
+    $src = Join-Path $Root "server\$name"
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+        Write-Host ("        [warn] 没有 server\$name，这一版不做 hook 完整性校验") `
+                   -ForegroundColor Yellow
+        return @()
+    }
+    $dst = Join-Path $PackageRoot "server\$name"
+    Copy-One $src $dst
+    if (-not (Test-Path -LiteralPath $dst -PathType Leaf)) {
+        throw "server\$name 没拷进包（hook 完整性校验会整项失效）"
+    }
+    return @($name)
 }
 
 function Copy-WeaponData {
