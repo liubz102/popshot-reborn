@@ -128,6 +128,7 @@ import gifthistory
 import shop
 import shopcfg
 import shopdata
+import versioning
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ADMIN_PATH = os.path.join(HERE, "admin.html")
@@ -373,10 +374,15 @@ def config_titles_text():
 
 
 def render_admin():
-    """读 `admin.html`，把名字 / 口令规则、配置页名那几句话填进去。"""
+    """读 `admin.html`，把名字 / 口令规则、配置页名、服务器版本号填进去。"""
     with open(ADMIN_PATH, "r", encoding="utf-8") as fp:
         html = fp.read()
     return (html
+            # 顶栏标题旁边那枚版本号：这台服务器自己是哪一批（包根 BUILD.ver）。
+            # ★ 在**登录之前**就填 —— 换包换错了批次的时候，人往往就卡在
+            #   登录页上，那正是最需要看见版本号的一刻。
+            .replace("__SERVER_VERSION__",
+                     _escape(versioning.own_version_text()))
             .replace("__USERNAME_RULE__", _escape(account_store.USERNAME_RULE_TEXT))
             .replace("__PASSWORD_RULE__", _escape(account_store.PASSWORD_RULE_TEXT))
             .replace("__CONFIG_TITLES__", _escape(config_titles_text())))

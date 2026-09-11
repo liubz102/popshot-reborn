@@ -64,6 +64,7 @@ import config as server_config
 import crashstore
 import eventlog
 from netlisten import create_listener
+import versioning
 #: 管理页 `/admin`（V0.3商店 M8）。和注册页共用本文件的 `Handler` 和端口。
 #: ★ 直接跑 `python server/web/server.py` 时上面那段已经把 `server/` 补进
 #:   `sys.path` 了，所以这里按顶层模块名 import（不是 `from web import`）。
@@ -229,6 +230,11 @@ def render_index(server_address, cooldown=0):
         html = f.read()
     return (html
             .replace("__SERVER_ADDRESS__", _escape(server_address))
+            # 标题旁边那枚版本号：服务器自己是哪一批（包根 BUILD.ver）。
+            # ★ 和地址那一行是两回事 —— 地址来自请求的 `Host`（玩家连的是谁），
+            #   版本号来自这台服务器自己的包。
+            .replace("__SERVER_VERSION__",
+                     _escape(versioning.own_version_text()))
             .replace("__USERNAME_RULE__", _escape(USERNAME_RULE_TEXT))
             .replace("__NICKNAME_RULE__", _escape(NICKNAME_RULE_TEXT))
             # 页面上的倒计时长度。整数，直接进 JS 字面量，不用转义也转不出花来。

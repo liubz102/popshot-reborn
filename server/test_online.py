@@ -816,6 +816,23 @@ class RegisterWebTests(unittest.TestCase):
         self.assertIn("更新服务器上已有的存档时需要填入正确的用户名密码。"
                       "若本服务器上没有保存过你的账号，则不需要填入。", html)
 
+    def test_the_page_shows_the_server_version_next_to_the_title(self):
+        """标题旁边要挂着**这台服务器自己**的版本号（用户 2026-09-11）。
+
+        ★ 和地址那一行是两回事：地址来自请求的 `Host`（玩家连的是谁），
+          版本号来自服务器自己的包根 `BUILD.ver`。
+        ★ 不写死在 html 里 —— 写死的话每次发版都要记得来改一遍，
+          漏改不报错、只是一直骗人。
+        """
+        with urllib.request.urlopen(self.url("/"), timeout=10) as response:
+            html = response.read().decode("utf-8")
+        self.assertNotIn("__SERVER_VERSION__", html, "占位符没被填上")
+        # 「标题旁边」是需求的原话 ⇒ 判据是它在 <h1> 里面，不是「页面上有」。
+        title = html[html.index("<h1>"):html.index("</h1>")]
+        self.assertIn("炮炮火枪手 · 用户注册", title)
+        self.assertIn(f'<span class="ver">{versioning.own_version_text()}</span>',
+                      title)
+
     def test_the_page_escapes_a_hostile_host_header(self):
         request = urllib.request.Request(
             self.url("/"), headers={"Host": '<script>alert(1)</script>'})

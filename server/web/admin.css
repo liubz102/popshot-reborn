@@ -97,6 +97,14 @@ body {
   text-shadow: 0 2px 0 rgba(120, 70, 10, .55);
   letter-spacing: .5px;
 }
+/* 标题旁边那枚服务器版本号（用户 2026-09-11）。琥珀顶栏上压一块半透明纸白 ——
+   直接用米白实底会糊成一块补丁，字色沿用 `.who` 那个深棕，两处一个口径。 */
+.topbar .ver {
+  padding: 2px 9px; border-radius: 11px;
+  font-size: 12.5px; font-weight: 700; color: #5A3416; white-space: nowrap;
+  background: rgba(255, 253, 245, .82);
+  border: 1px solid var(--amber-dark);
+}
 .topbar .who { margin-left: auto; color: #5A3416; font-weight: 600; }
 
 /* 壳里第二段：剩下的高度全给它，滚动条也在它身上。★ `min-height: 0` 少一句，

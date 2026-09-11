@@ -31,6 +31,7 @@ import gameserver                                             # noqa: E402
 import gifthistory                                           # noqa: E402
 import shopcfg                                                 # noqa: E402
 import shopdata                                                # noqa: E402
+import versioning                                              # noqa: E402
 from account_store import AccountStore                         # noqa: E402
 from web import admin as web_admin                             # noqa: E402
 from web import server as web_server                           # noqa: E402
@@ -140,7 +141,25 @@ class AdminAuthTests(_AdminCase):
         # 占位符必须被换掉，不能原样漏到页面上。
         self.assertNotIn("__USERNAME_RULE__", html)
         self.assertNotIn("__PASSWORD_RULE__", html)
+        self.assertNotIn("__SERVER_VERSION__", html)
         self.assertIn(account_store.USERNAME_RULE_TEXT, html)
+
+    def test_the_topbar_shows_the_server_version_next_to_the_title(self):
+        """顶栏标题旁边要挂着**这台服务器自己**的版本号（用户 2026-09-11）。
+
+        ★ 判据是「在顶栏里、挨着 `.brand`」——「标题旁边」是需求的原话，
+          不是「页面上某处有」。
+        ★ **没登录也要有**：换包换错了批次的时候人往往就卡在登录页上，
+          那正是最需要看见版本号的一刻 ⇒ 这条用例不 `login()`。
+        """
+        _status, html = self.request("/admin")
+        bar = html[html.index('<header class="topbar">'):html.index("</header>")]
+        self.assertIn("炮炮火枪手 · GM管理页", bar)
+        self.assertIn(f'<span class="ver">{versioning.own_version_text()}</span>',
+                      bar)
+        # `.who` 是 margin-left:auto 顶到最右的，版本号必须排在它前面，
+        # 否则会被挤到「谁登录着」的右边去。
+        self.assertLess(bar.index('class="ver"'), bar.index('id="who"'))
 
     def test_the_default_password_warning_is_not_on_the_page_any_more(self):
         # ★ D24：用户 2026-09-05 要求页面上不显示这条，挪进了启动日志。

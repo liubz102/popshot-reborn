@@ -374,6 +374,32 @@ def load_own_version(root=None, _reload=False):
     return result
 
 
+#: 读不出自己的版本号时，页面上顶替版本号的那几个字。★ 不是空字符串 ——
+#: 徽标整个消失的话，看的人只会以为「这一版页面没有版本号」；真正的事实是
+#: 「这台服务器的包根没有 BUILD.ver」，那是一条要去查的线索，别把它藏起来。
+UNKNOWN_VERSION_TEXT = "版本未知"
+
+
+def own_version_text(root=None):
+    """这台服务器自己的版本号，**给人看的一行字**：``"V0.3.2"``。
+
+    注册页和管理页的标题旁边都挂着它（用户 2026-09-11）——「我现在连的这台
+    是哪一批」是玩家报错、运营换包时第一个要对的东西，而这两页是**唯一两个
+    不用进游戏就能看到**的地方。
+
+    读不出来既不抛也不回空，回 `UNKNOWN_VERSION_TEXT`：这两页是渲染时把
+    版本号**填死进 HTML** 的，为了一个 BUILD.ver 读不到就让整页 500 毫无
+    道理（fail-open，同 `load_own_version`）。
+    ★ 警告不在这里打印 —— 这是**每次请求**都要走的路径，打出来就是刷屏；
+      同一批警告版本门禁那条路（`gameserver.version_reject_message`）
+      已经在打了。
+    """
+    version, _warnings = load_own_version(root)
+    if version is None:
+        return UNKNOWN_VERSION_TEXT
+    return format_version(version)
+
+
 # --------------------------------------------------------------------------
 #  客户端 hook 完整性清单（manifest-hook.json）
 # --------------------------------------------------------------------------

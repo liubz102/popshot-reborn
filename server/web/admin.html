@@ -17,6 +17,10 @@
 <div class="appbar">
   <header class="topbar">
     <span class="brand">炮炮火枪手 · GM管理页</span>
+    <!-- 服务器自己是哪一批（包根 `BUILD.ver`），服务端渲染时现填
+         （`versioning.own_version_text()`）。★ 放在 `.brand` 后面、`.who`
+         前面：`.who` 是 `margin-left: auto` 顶到最右的，中间插什么都不动它。 -->
+    <span class="ver">__SERVER_VERSION__</span>
     <span class="who" id="who"></span>
     <button id="logout" class="btn btn-ghost hidden">退出登录</button>
   </header>

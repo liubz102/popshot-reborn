@@ -28,6 +28,16 @@
   }
   .wrap { max-width: 620px; margin: 0 auto; }
   h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: 1px; }
+  /* 标题旁边那枚服务器版本号（用户 2026-09-11）。小一号 + 不加粗 + 居中对齐，
+     读起来是标题的附注而不是标题的第二半；`nowrap` 防止窄屏上「V0.3.2」
+     被从小数点处折断。 */
+  h1 .ver {
+    display: inline-block; margin-left: 10px; padding: 2px 9px;
+    font-size: 12.5px; font-weight: normal; letter-spacing: 0;
+    vertical-align: middle; white-space: nowrap;
+    color: var(--accent); background: var(--warn-bg);
+    border: 1px solid var(--warn-line); border-radius: 11px;
+  }
   .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
   .card {
     background: var(--card); border: 1px solid var(--line); border-radius: 10px;
@@ -98,7 +108,9 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>炮炮火枪手 · 用户注册</h1>
+  <!-- 版本号由服务端照包根 `BUILD.ver` 现填（`versioning.own_version_text()`），
+       不写死在这儿 —— 写死的话每次发版都要记得来改一遍，漏改不报错、只骗人。 -->
+  <h1>炮炮火枪手 · 用户注册<span class="ver">__SERVER_VERSION__</span></h1>
   <p class="sub">服务器 __SERVER_ADDRESS__</p>
 
   <div class="warn">

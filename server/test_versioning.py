@@ -174,5 +174,41 @@ class ClientFilterTests(unittest.TestCase):
             self.assertTrue(warnings)
 
 
+class OwnVersionTextTests(unittest.TestCase):
+    """`own_version_text()` —— 注册页 / 管理页标题旁边那枚徽标的文字。
+
+    它是**页面渲染路径**上的东西：读不出来只能退一步显示「版本未知」，
+    绝不能抛异常把整页变成 500（fail-open，同门禁那条路）。
+    """
+
+    def _root(self, tmp, text):
+        with open(os.path.join(tmp, versioning.BUILD_VER_FILENAME),
+                  "w", encoding="utf-8") as fp:
+            fp.write(text)
+        return tmp
+
+    def test_the_package_build_ver_becomes_the_badge_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, '{"version": "V0.3.2", "kind": "服务端包"}')
+            self.assertEqual("V0.3.2", versioning.own_version_text(root))
+
+    def test_a_missing_build_ver_says_unknown_instead_of_blowing_up(self):
+        # 开发工作副本里可能根本没有 BUILD.ver（它是打包脚本写的）。
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(versioning.UNKNOWN_VERSION_TEXT,
+                             versioning.own_version_text(tmp))
+
+    def test_a_broken_build_ver_says_unknown_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, "这不是 JSON，也没有版本号")
+            self.assertEqual(versioning.UNKNOWN_VERSION_TEXT,
+                             versioning.own_version_text(root))
+
+    def test_the_unknown_text_is_not_empty(self):
+        # ★ 空字符串会让徽标整个消失，看的人只会以为「这一版页面没有版本号」；
+        #   真正的事实是「包根没有 BUILD.ver」，那是一条要去查的线索。
+        self.assertTrue(versioning.UNKNOWN_VERSION_TEXT.strip())
+
+
 if __name__ == "__main__":
     unittest.main()
