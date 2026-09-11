@@ -29,6 +29,7 @@ import config as server_config                                 # noqa: E402
 import databackup                                              # noqa: E402
 import gameserver                                             # noqa: E402
 import gifthistory                                           # noqa: E402
+import sellprice                                               # noqa: E402
 import shopcfg                                                 # noqa: E402
 import shopdata                                                # noqa: E402
 import versioning                                              # noqa: E402
@@ -233,6 +234,12 @@ class AdminAuthTests(_AdminCase):
                 ("/admin/api/reward/send", {"players": ["alice"], "exp": 1}),
                 ("/admin/api/reward/history", None),
                 ("/admin/api/reward/history/clear", {}),
+                # 装备卖出（2026-09-12）。★ 这四条**三档身份都到得了**，
+                # 但「登录」这道门一样不能少 —— 没登录就没有「卖谁的」。
+                ("/admin/api/sell/state", None),
+                ("/admin/api/sell/prices", None),
+                ("/admin/api/sell/prices", {"prices": {"bead": 1}}),
+                ("/admin/api/sell", {"items": [{"id": 10001, "count": 1}]}),
                 ("/admin/api/config/shop", {"text": "{}"}),
                 ("/admin/api/admins/add", {"name": "carol", "password": "pw1"}),
                 ("/admin/api/admins/password", {"name": "admin", "password": "pw1"}),
@@ -840,25 +847,47 @@ class AdminAssetTests(_AdminCase):
         return set(re.findall(r'"([A-Za-z0-9_-]+)"', match.group(1)))
 
     def test_every_tab_in_the_page_is_classified(self):
-        """★★ 每个标签都得落进「配置页」或「系统管理员专档」二者之一（D74）。
+        """★★ 每个标签都得落进三张表之一（D74；第三张 2026-09-12 加的）。
 
         漏分类的那个：`canOpenTab` 对运营是**取反**判的（不在
         `SYSTEM_ONLY_TABS` 里就放行），于是新标签会**默认对运营开着**，
         而服务端那一侧多半根本没给他开门 —— 症状是点进去一片红，
         不是「看不到」。只读玩家那一档走的是白名单，反过来会**默认看不到**。
         两种错都不会有人报，所以在这儿钉死。
+
+        三张表：`CONFIGS`（配置页）、`SYSTEM_ONLY_TABS`（系统管理员专档）、
+        `EVERYONE_TABS`（三档都能进，「装备卖出」就是）。
         """
         _status, _h, raw = self.fetch("/admin/admin.js")
         js = raw.decode("utf-8")
         _status, html = self.request("/admin")
         tabs = set(re.findall(r'data-tab="([A-Za-z0-9_-]+)"', html))
         self.assertTrue(tabs, "页面上一个标签都没有？")
-        known = self.js_list(js, "CONFIGS") | self.js_list(js, "SYSTEM_ONLY_TABS")
+        known = (self.js_list(js, "CONFIGS")
+                 | self.js_list(js, "SYSTEM_ONLY_TABS")
+                 | self.js_list(js, "EVERYONE_TABS"))
         self.assertEqual(set(), tabs - known,
-                         "这些标签没归档：既不在 CONFIGS 里，也不在 "
-                         "SYSTEM_ONLY_TABS 里")
+                         "这些标签没归档：CONFIGS / SYSTEM_ONLY_TABS / "
+                         "EVERYONE_TABS 三张表里都没有")
         # 反过来也钉一下：归了档却在页面上找不到 = 名字拼错了。
         self.assertEqual(set(), known - tabs, "这些名字在页面上没有对应的标签")
+
+    def test_the_three_tab_tables_do_not_overlap(self):
+        """★ 三张表**互不相交**（2026-09-12）。
+
+        同一个名字落进两张表时，`canOpenTab` 的两条分支会给出不一样的答案
+        （只读那条是白名单、运营那条是取反），于是「谁看得见」取决于你是
+        哪一档 —— 而这正是加第三张表时最容易犯的错：把「装备卖出」既写进
+        `EVERYONE_TABS` 又顺手留在 `SYSTEM_ONLY_TABS` 里。
+        """
+        _status, _h, raw = self.fetch("/admin/admin.js")
+        js = raw.decode("utf-8")
+        configs = self.js_list(js, "CONFIGS")
+        system = self.js_list(js, "SYSTEM_ONLY_TABS")
+        everyone = self.js_list(js, "EVERYONE_TABS")
+        self.assertEqual(set(), configs & system)
+        self.assertEqual(set(), configs & everyone)
+        self.assertEqual(set(), system & everyone)
 
     def test_the_config_tabs_in_the_page_match_the_server(self):
         # 前台 `CONFIGS` 和服务端 `CONFIG_FILES` 是同一份清单的两半 ——
@@ -1223,6 +1252,22 @@ class OperatorPermissionTests(_AdminCase):
         self.assertEqual("operator", self.request(
             "/admin/api/session")[1]["role"])
 
+    def test_the_sell_page_is_open_to_operators(self):
+        """★ 「装备卖出」**不是**系统管理员专页（用户 2026-09-12）。
+
+        上面那条 403 清单是黑名单式的「这些不许」，它证明不了「那些许」——
+        把卖出接口顺手挂成 `_require_system_admin()` 的话，那条清单照样全绿，
+        运营只会看到一页红。所以正面钉一条。
+        """
+        self.assertEqual(200, self.request("/admin/api/sell/state")[0])
+        # 改价和五份运营配置同一档：运营改得了（用户 2026-09-12 拍板）。
+        status, result = self.request("/admin/api/sell/prices",
+                                      {"prices": dict(sellprice.DEFAULTS,
+                                                      bead=123)})
+        self.assertEqual(200, status, result)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(123, sellprice.load()["bead"])
+
 
 class PlayerReadOnlyTests(_AdminCase):
     """普通玩家拿**游戏账号**登管理页（用户 2026-09-10，D74）。
@@ -1329,6 +1374,30 @@ class PlayerReadOnlyTests(_AdminCase):
         with self.opener.open(req, timeout=10) as response:
             self.assertEqual(200, response.status)
             self.assertEqual(b"\x89PNG\r\n\x1a\n", response.read(8))
+
+    def test_the_sell_page_is_the_one_place_a_player_can_write(self):
+        """★★ 「装备卖出」是整个 `/admin` 里**唯一一处玩家也能写**的地方
+        （用户 2026-09-12）。D74 那条「玩家档的令牌永远只读」到此改成
+        「永远只能写**自己**那个号」—— 判据落在构造上（目标从令牌推导、
+        接口连 `name` 都不收），不是「记得校验一下」。
+
+        ★ 这一条和下面那几条 403 是一对：光有「这些不许」证明不了
+        「那一处许」，而把卖出接口顺手挂成 `_require_editor()` 的话，
+        403 那几条照样全绿，玩家只会看到一页红。
+        """
+        self.accounts.admin_update_account("alice", money=0,
+                                           materials={10002: 3})
+        _status, state = self.request("/admin/api/sell/state")
+        self.assertTrue(state["ok"], state)
+        self.assertFalse(state["locked"], state)
+        self.assertEqual("alice", state["player"]["username"])
+        status, result = self.request("/admin/api/sell",
+                                      {"items": [{"id": 10002, "count": 3}]})
+        self.assertEqual(200, status, result)
+        self.assertTrue(result["ok"], result)
+        # 价格照旧改不了（那是运营的活儿）。
+        self.assertEqual(403, self.request("/admin/api/sell/prices",
+                                           {"prices": {"bead": 1}})[0])
 
     # ------------------------------------------------------------ 改不了
     def test_saving_any_config_is_403(self):
@@ -1948,6 +2017,53 @@ class AdminPlayerTests(_AdminCase):
                          view["materials"])
 
 
+class FakeGameConn:
+    """一条假的游戏服连接。
+
+    `_notify_gift` 只用得到前三样（账号名 / 重读存档 / 推 `0x0507`），
+    `_push_account` 还要另外**六**发 —— ★ 第五发
+    `broadcast_slot_equipped_list` 是 2026-09-12 补的，修的是「管理页改了
+    装备、同房间的人看不见」那个既有 bug（§63 当初挂了六处，漏了
+    `web/admin.py` 这条路）；★ 第六发 `resync_seat_character` 是同一天补的，
+    修的是「他正在用的那张商城角色卡被卖掉 / 删掉了，人物预览却还是那个
+    角色」。
+    少一个方法 `_push_account` 会吃 `AttributeError` 然后 `continue`，
+    症状是**回执里 `pushed` 悄悄变成 false**，一句报错都没有。
+    """
+
+    def __init__(self, name):
+        self.account_name = name
+        self.reloaded = 0
+        self.arrived = []
+        self.sent = []                  # 依次收到了哪几发（顺序有意义）
+
+    def reload_account(self):
+        self.reloaded += 1
+
+    def send_gift_arrived(self, reason=""):
+        self.arrived.append(reason)
+
+    def send_rep_money(self, reason=""):
+        self.sent.append("money")
+
+    def send_slot_equipped_list(self, seat_index=None, reason=""):
+        self.sent.append("slot")
+
+    def send_rep_inventory(self, reason=""):
+        self.sent.append("inventory")
+
+    def send_rep_equipped_list(self, reason=""):
+        self.sent.append("equipped")
+
+    def broadcast_slot_equipped_list(self, reason=""):
+        self.sent.append("broadcast")
+        return 0
+
+    def resync_seat_character(self, reason=""):
+        self.sent.append("character")
+        return False
+
+
 class AdminRewardTests(_AdminCase):
     """「发送奖励」（用户 2026-09-10，D76）：批量发到玩家的礼物盒，玩家自己领。
 
@@ -1957,19 +2073,7 @@ class AdminRewardTests(_AdminCase):
     _MATERIAL = 10001
     _ARMOR = 1010064
 
-    class FakeConn:
-        """`_notify_gift` 只用得到这三样：账号名、重读存档、推 0x0507。"""
-
-        def __init__(self, name):
-            self.account_name = name
-            self.reloaded = 0
-            self.arrived = []
-
-        def reload_account(self):
-            self.reloaded += 1
-
-        def send_gift_arrived(self, reason=""):
-            self.arrived.append(reason)
+    FakeConn = FakeGameConn
 
     def setUp(self):
         super().setUp()
@@ -2408,6 +2512,435 @@ class AdminSessionStoreTests(unittest.TestCase):
         """
         self.assertGreater(web_admin.SESSION_COOKIE_MAX_AGE,
                            web_admin.SESSION_TTL_SECONDS)
+
+
+class AdminSellTests(_AdminCase):
+    """装备卖出（用户 2026-09-12）。
+
+    ★ 这一页是整个 `/admin` 里**唯一一处普通玩家也能写**的地方，所以这一组
+    用例里最要紧的不是「卖对了没有」，而是**「卖的是谁的」**（见
+    `test_the_request_body_cannot_name_someone_else`）。
+    """
+
+    #: 四件有代表性的东西。`_AdminCase.setUp` 把五份真配置拷进临时目录，
+    #: 所以这几个 id 的价、配方都是线上那一份。
+    CRAFTED = 220003        # 火焰蝙蝠：配方产出（龙之血×4 + 熔岩碎片×3 + 红珠×3）
+    SHOP_ITEM = 1010001     # 商店在卖的铠甲
+    BEAD = 10002            # 红色小珠（材料 · 珠子）
+    #: ★ 可堆叠、**却不是材料** ⇒ 它住在 `inventory` 而不是 `materials`
+    #:   （消耗品 / 礼包 / 钥匙一共 20 种走这条路）。
+    POTION = 210001         # 回复药水（consumable）
+
+    def setUp(self):
+        super().setUp()
+        self.accounts.register("alice", "PlayerPw1", display_name="爱丽丝")
+        self.accounts.register("bob", "PlayerPw2", display_name="小明")
+        self.stock("alice")
+        # 默认以出厂系统管理员登着；要玩家那一档的用例自己调 `as_player()`。
+        self.login()
+
+    def stock(self, name, money=1000):
+        self.accounts.admin_update_account(
+            name, money=money,
+            inventory={self.CRAFTED: 1, self.SHOP_ITEM: 1},
+            materials={self.BEAD: 5})
+
+    def as_player(self, name="alice", password="PlayerPw1"):
+        self.request("/admin/api/logout", {})
+        return self.login(name, password)
+
+    def account(self, name="alice"):
+        return self.accounts.get_account(name)[1]
+
+    def sell(self, *lines):
+        return self.request("/admin/api/sell", {"items": list(lines)})
+
+    def line(self, item_id, count=1):
+        return {"id": item_id, "count": count}
+
+    def quiet_match(self, playing=False, *names):
+        """摆一条假的在线连接，并决定 `conn_is_playing` 回什么。
+
+        ★ 判据打在 `gameserver.conn_is_playing` 上而不是自己编一个 ——
+        真代码问的就是它（房间状态翻转，铁律 10），用例也该问它。
+        """
+        conns = [FakeGameConn(name) for name in (names or ("alice",))]
+        saved = list(gameserver._conns)
+        gameserver._conns[:] = conns
+        self.addCleanup(lambda: gameserver._conns.__setitem__(slice(None), saved))
+        real = gameserver.conn_is_playing
+        gameserver.conn_is_playing = lambda conn: playing
+        self.addCleanup(setattr, gameserver, "conn_is_playing", real)
+        return conns
+
+    # ------------------------------------------------------ 卖谁的（越权面）
+    def test_a_player_sees_his_own_warehouse(self):
+        self.as_player()
+        _status, result = self.request("/admin/api/sell/state")
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["locked"], result)
+        self.assertEqual("alice", result["player"]["username"])
+        # 普通玩家没有改价的资格 —— 前台照这个字段决定画不画那颗按钮。
+        self.assertFalse(result["can_edit_prices"])
+
+    def test_an_admin_without_a_game_account_is_locked(self):
+        # 出厂管理员 `admin` 在 `accounts` 里没有同名游戏账号。
+        _status, result = self.request("/admin/api/sell/state")
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["locked"], result)
+        self.assertIn("没有同名的游戏账号", result["reason"])
+        self.assertNotIn("player", result)
+        # ★ 锁住的不只是画面：真去 POST 一样不行。
+        status, refused = self.sell(self.line(self.BEAD, 1))
+        self.assertEqual(403, status)
+        self.assertFalse(refused["ok"])
+
+    def test_locked_out_of_selling_but_still_allowed_to_set_prices(self):
+        """★★ 卖不了 ≠ 定不了价（用户 2026-09-12 第二轮）。
+
+        改卖价的资格只看**身份**，和「他自己有没有号可卖」是两件事 ——
+        一个没有同名游戏账号的管理员卖不了东西，但照样是那个该去定价的人。
+        ⇒ 服务端这两发本来就互不相干（`_admin_sell_prices_post` 不走
+        `_sell_target()`），前台那块遮罩也只盖左右分区、不盖工具条。
+        """
+        _status, state = self.request("/admin/api/sell/state")
+        self.assertTrue(state["locked"], state)
+        # 锁着也照样告诉前台「这个人能改价」—— 那颗按钮就是照它画的。
+        self.assertTrue(state["can_edit_prices"], state)
+        status, saved = self.request("/admin/api/sell/prices",
+                                     {"prices": dict(sellprice.DEFAULTS,
+                                                     bead=42)})
+        self.assertEqual(200, status, saved)
+        self.assertEqual(42, sellprice.load()["bead"])
+
+    def test_an_admin_with_a_same_named_game_account_sells_that_one(self):
+        self.accounts.register("admin", "GamePw1", display_name="管理员的号")
+        self.stock("admin", money=50)
+        _status, result = self.request("/admin/api/sell/state")
+        self.assertFalse(result["locked"], result)
+        self.assertEqual("admin", result["player"]["username"])
+        # 管理员档改得了价（和五份运营配置同一档）。
+        self.assertTrue(result["can_edit_prices"])
+
+    def test_the_request_body_cannot_name_someone_else(self):
+        """★★ 接口连 `name` 都不收 —— 卖的永远是令牌里那个人。
+
+        这是本功能唯一的越权面：玩家档第一次能写东西（D74 那条
+        「玩家档的令牌永远只读」到此改成「永远只能写**自己**那个号」）。
+        """
+        self.stock("bob", money=7)
+        self.as_player()
+        status, result = self.request(
+            "/admin/api/sell",
+            {"name": "bob", "username": "bob", "player": "bob",
+             "items": [self.line(self.BEAD, 1)]})
+        self.assertEqual(200, status, result)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual("alice", result["player"]["username"])
+        # bob 一个字节都没动。
+        bob = self.account("bob")
+        self.assertEqual(7, account_store.player_money(bob))
+        self.assertEqual(5, account_store.material_count(bob, self.BEAD))
+        # alice 才是被卖的那个。
+        self.assertEqual(4, account_store.material_count(self.account(), self.BEAD))
+
+    # ------------------------------------------------------------ 回执的形状
+    def test_the_receipt_carries_the_whole_page_state(self):
+        """★★ 卖出回执必须和 `state` 回**同一组键**。
+
+        前台那个 `adoptSellState()` 收到回执就**整页重画** —— 它是一次
+        整页赋值，回执里少哪个键，页面上那一项当场变成默认值。只带
+        `player` / `quotes` 的话 `can_edit_prices` 会被覆盖成 false，
+        症状是「管理员卖完一单，『⚙ 卖出价格设置』自己从工具条上没了，
+        刷新一下又回来」（2026-09-12 第三轮）。⇒ 两处共用
+        `_sell_state_payload()`；这一条钉的是**共用**这件事本身，
+        不是某一个键 —— 以后再加字段自动被它收进来。
+        """
+        self.accounts.register("admin", "GamePw1", display_name="管理员的号")
+        self.stock("admin")
+        _status, state = self.request("/admin/api/sell/state")
+        self.assertTrue(state["can_edit_prices"], state)
+        _status, receipt = self.sell(self.line(self.BEAD, 1))
+        self.assertTrue(receipt["ok"], receipt)
+        self.assertLessEqual(
+            set(state), set(receipt),
+            "卖出回执少了 state 有的键：%s" % sorted(set(state) - set(receipt)))
+        self.assertTrue(receipt["can_edit_prices"], receipt)
+        self.assertEqual(state["money_max"], receipt["money_max"])
+        # 回执里那份 `player` 是**写盘之后**重新读的，不是卖之前那份。
+        self.assertEqual(4, receipt["player"]["materials"][0]["count"])
+
+    # ------------------------------------------------------------ 定价
+    def test_selling_a_material_pays_the_unit_price(self):
+        self.as_player()
+        _status, result = self.sell(self.line(self.BEAD, 2))
+        self.assertTrue(result["ok"], result)
+        # 珠子出厂单价 100（用户 2026-09-12 定）。
+        self.assertEqual(200, result["gained"])
+        self.assertEqual(1000, result["money_before"])
+        self.assertEqual(1200, result["money_after"])
+        self.assertEqual(3, account_store.material_count(self.account(), self.BEAD))
+
+    def test_selling_a_shop_item_pays_the_percentage(self):
+        self.as_player()
+        table, _warnings = shopcfg.shop()
+        price = table[self.SHOP_ITEM]["price"]
+        _status, result = self.sell(self.line(self.SHOP_ITEM))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(price * 95 // 100, result["gained"])
+        self.assertFalse(account_store.has_item(self.account(), self.SHOP_ITEM))
+
+    def test_selling_a_crafted_item_returns_the_recipe_materials(self):
+        """★ 合成得来的装备卖掉是「退材料实物 + 配方金币打折」（用户拍板）。"""
+        self.as_player()
+        recipe = [row for row in shopcfg.recipes()[0]
+                  if row["result"] == self.CRAFTED][0]
+        had = account_store.material_count(self.account(), self.BEAD)
+        _status, result = self.sell(self.line(self.CRAFTED))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(recipe["cost"] * 95 // 100, result["gained"])
+        back = {row["id"]: row["count"] for row in result["returned"]}
+        self.assertEqual({slot["id"]: slot["count"]
+                          for slot in recipe["materials"]}, back)
+        # 材料真的进了仓库（而不是折成金币）。
+        account = self.account()
+        for slot in recipe["materials"]:
+            expect = slot["count"] + (had if slot["id"] == self.BEAD else 0)
+            self.assertEqual(expect,
+                             account_store.material_count(account, slot["id"]),
+                             slot["id"])
+
+    def test_an_item_with_no_price_anywhere_falls_back_to_the_other_price(self):
+        # 称号既没上架商店也没有配方（D44a）—— 走「其他物品」兜底价。
+        title_id = sorted(shopdata.ids_of_kind("title"))[0]
+        self.accounts.admin_update_account("alice", inventory={title_id: 1})
+        self.as_player()
+        _status, result = self.sell(self.line(title_id))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(sellprice.DEFAULTS["other_price"], result["gained"])
+
+    def test_an_item_the_client_does_not_know_is_refused(self):
+        self.as_player()
+        status, result = self.sell(self.line(999999))
+        self.assertEqual(400, status)
+        self.assertFalse(result["ok"])
+
+    def test_a_stackable_item_that_lives_in_the_inventory_can_be_sold(self):
+        """★★ 「数量有没有意义」和「住在哪个桶里」是**两件独立的事**。
+
+        消耗品 / 礼包 / 钥匙这 20 种 `stackable()` 为真、`is_material()`
+        为假的东西，靠 `add_item()` 进的是 `inventory`（买、合成、领礼物、
+        控制通道 `give` 全走那条路），`materials` 里一个都没有。
+        存档层按 `stackable()` 去 `materials` 找它们的话永远找不到 ——
+        **页面上明明摆着、一按确定就说「东西不够」**，而且不报错。
+        """
+        self.accounts.add_item("alice", self.POTION, count=3)
+        self.as_player()
+        _status, state = self.request("/admin/api/sell/state")
+        # 页面确实把它摆出来了，而且报了价 —— 所以它必须卖得掉。
+        self.assertEqual(
+            [{"id": self.POTION, "count": 3, "stackable": True,
+              "equipped": False}],
+            [row for row in state["player"]["inventory"]
+             if row["id"] == self.POTION])
+        self.assertTrue(state["quotes"][str(self.POTION)]["sellable"], state)
+
+        _status, result = self.sell(self.line(self.POTION, 2))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(2 * sellprice.DEFAULTS["other_price"],
+                         result["gained"])
+        # 只扣掉卖的那两个，剩下的一个还在**原来那个桶**里。
+        account = self.account()
+        self.assertEqual(
+            1, account_store.inventory_items(account)[self.POTION]["count"])
+        self.assertEqual(0, account_store.material_count(account, self.POTION))
+
+    # ------------------------------------------------------------ 存量 / 装备
+    def test_selling_an_equipped_item_takes_it_off(self):
+        self.accounts.equip_item("alice", self.SHOP_ITEM)
+        self.assertIn(self.SHOP_ITEM,
+                      account_store.equipped_items(self.account()))
+        self.as_player()
+        _status, result = self.sell(self.line(self.SHOP_ITEM))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual([self.SHOP_ITEM], result["unequipped"])
+        self.assertEqual([], list(account_store.equipped_items(self.account())))
+
+    def test_selling_more_than_you_have_changes_nothing(self):
+        self.as_player()
+        status, result = self.sell(self.line(self.BEAD, 6))
+        self.assertEqual(400, status)
+        self.assertFalse(result["ok"])
+        account = self.account()
+        self.assertEqual(5, account_store.material_count(account, self.BEAD))
+        self.assertEqual(1000, account_store.player_money(account))
+
+    def test_one_bad_line_rejects_the_whole_order(self):
+        """★ 半单成交比整单失败难查得多 —— 有一条不够就一个字节都不写。"""
+        self.as_player()
+        # 前两条都成立，第三条是一种他压根没有的材料（黑色小珠）——
+        # 报价算得出来，存量校验过不去。
+        status, result = self.sell(self.line(self.BEAD, 2),
+                                   self.line(self.SHOP_ITEM),
+                                   self.line(10001, 3))
+        self.assertEqual(400, status)
+        self.assertFalse(result["ok"])
+        account = self.account()
+        self.assertEqual(5, account_store.material_count(account, self.BEAD))
+        self.assertTrue(account_store.has_item(account, self.SHOP_ITEM))
+        self.assertEqual(1000, account_store.player_money(account))
+
+    def test_money_is_capped_at_int32(self):
+        """★ `0x0600` 的金币那一格是 int32：超了 `struct.pack` 会当场抛，
+        把那条在线连接一起带走。"""
+        self.accounts.admin_update_account(
+            "alice", money=account_store.MONEY_MAX - 10)
+        self.as_player()
+        _status, result = self.sell(self.line(self.BEAD, 5))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(account_store.MONEY_MAX, result["money_after"])
+        self.assertEqual(490, result["capped"])     # 5×100 里只进账了 10
+        self.assertIn("上限", result["message"])
+
+    # ------------------------------------------------------------ 对局中
+    def test_selling_during_a_match_is_refused_and_writes_nothing(self):
+        self.quiet_match(playing=True)
+        self.as_player()
+        status, result = self.sell(self.line(self.BEAD, 1))
+        self.assertEqual(409, status)
+        self.assertFalse(result["ok"])
+        self.assertIn("完成这一局", result["message"])
+        account = self.account()
+        self.assertEqual(5, account_store.material_count(account, self.BEAD))
+        self.assertEqual(1000, account_store.player_money(account))
+
+    def test_the_state_says_so_while_he_is_in_a_match(self):
+        self.quiet_match(playing=True)
+        self.as_player()
+        _status, result = self.request("/admin/api/sell/state")
+        # ★ 页面**不锁**（他可以先挑），拦是拦在提交那一发上。
+        self.assertFalse(result["locked"], result)
+        self.assertTrue(result["in_match"], result)
+
+    def test_in_the_lobby_he_can_sell(self):
+        self.quiet_match(playing=False)
+        self.as_player()
+        _status, state = self.request("/admin/api/sell/state")
+        self.assertFalse(state["in_match"], state)
+        _status, result = self.sell(self.line(self.BEAD, 1))
+        self.assertTrue(result["ok"], result)
+
+    # ------------------------------------------------------------ 推送
+    def test_the_push_reaches_the_online_client_with_all_six_packets(self):
+        """★★ 后两发都是 2026-09-12 补的，**漏了都不报错**：
+
+        * 第五发 `broadcast_slot_equipped_list` —— `0x030b` 是**按座位**的
+          （§63），不广播的话房里另外五个人手里那份还是旧的，
+          **外观和战斗加成一起过期**；
+        * 第六发 `resync_seat_character` —— 卖掉 / 删掉的如果正是他**正在用**
+          的那张商城角色卡，人物预览还停在那个已经不属于他的角色上。
+        """
+        conns = self.quiet_match(playing=False)
+        self.as_player()
+        _status, result = self.sell(self.line(self.BEAD, 1))
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["pushed"])
+        self.assertEqual(
+            ["money", "slot", "inventory", "equipped", "broadcast", "character"],
+            conns[0].sent)
+        self.assertEqual(1, conns[0].reloaded)
+
+    def test_not_being_online_is_not_an_error(self):
+        self.as_player()
+        _status, result = self.sell(self.line(self.BEAD, 1))
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["pushed"])
+
+    # ------------------------------------------------------------ 价格表
+    def test_a_player_cannot_change_the_prices(self):
+        self.as_player()
+        status, result = self.request("/admin/api/sell/prices",
+                                      {"prices": {"bead": 1}})
+        self.assertEqual(403, status)
+        self.assertFalse(result["ok"])
+        # 一个字节都没落盘。
+        self.assertFalse(os.path.exists(sellprice.path()))
+
+    def test_a_player_can_still_read_the_prices(self):
+        """★ 玩家**看得到**这张价格表（用户 2026-09-12：玩家只读）——
+        那正好回答他「我这东西凭什么卖这个价」。"""
+        self.as_player()
+        _status, result = self.request("/admin/api/sell/prices")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(sellprice.DEFAULTS, result["prices"])
+        # 每个小类都得列出它装着哪些东西（弹窗照它画名字）。
+        self.assertEqual(set(sellprice.MATERIAL_CLASSES), set(result["groups"]))
+        # ★★ 「能不能改」由**这一发自己**回：弹窗照它锁输入框、收按钮。
+        #    它和 `_admin_sell_prices_post` 那道 `_require_editor()` 是同一条
+        #    判据的两面 —— 这里说 true、那里 403 的话，人会填完一屏才挨一记。
+        self.assertFalse(result["can_edit"], result)
+
+    def test_an_editor_is_told_he_can_edit_the_prices(self):
+        # 出厂管理员是系统管理员档；运营也该是 true
+        # （`_require_editor()` 放行的正好是这两档）。
+        _status, result = self.request("/admin/api/sell/prices")
+        self.assertTrue(result["can_edit"], result)
+        self.assertTrue(self.request(
+            "/admin/api/admins/add",
+            {"name": "carol", "password": "SecretPw",
+             "role": "operator"})[1]["ok"])
+        self.request("/admin/api/logout", {})
+        self.assertTrue(self.login("carol", "SecretPw")[1]["ok"])
+        _status, result = self.request("/admin/api/sell/prices")
+        self.assertTrue(result["can_edit"], result)
+
+    def test_saving_prices_changes_what_the_next_sale_pays(self):
+        _status, saved = self.request("/admin/api/sell/prices",
+                                      {"prices": dict(sellprice.DEFAULTS,
+                                                      bead=7)})
+        self.assertTrue(saved["ok"], saved)
+        self.as_player()
+        _status, result = self.sell(self.line(self.BEAD, 2))
+        self.assertEqual(14, result["gained"])
+
+    def test_a_bad_price_is_refused_and_nothing_is_written(self):
+        status, result = self.request("/admin/api/sell/prices",
+                                      {"prices": dict(sellprice.DEFAULTS,
+                                                      bead=-1)})
+        self.assertEqual(400, status)
+        self.assertFalse(result["ok"])
+        self.assertFalse(os.path.exists(sellprice.path()))
+
+    def test_the_percentage_has_a_ceiling(self):
+        status, result = self.request(
+            "/admin/api/sell/prices",
+            {"prices": dict(sellprice.DEFAULTS,
+                            equip_percent=sellprice.PERCENT_MAX + 1)})
+        self.assertEqual(400, status)
+        self.assertFalse(result["ok"])
+
+    def test_an_empty_price_table_is_refused_instead_of_resetting_everything(self):
+        """★★ 「缺项按 `DEFAULTS` 补齐」是**读盘**那一侧的规矩（铁律 11）。
+
+        放到写盘这一侧就反了：一发 `{"prices": {}}` 会被补成整张出厂表
+        **静悄悄落盘**，运营调了半天的数一次全没，回执上还写着「已保存」。
+        """
+        self.request("/admin/api/sell/prices",
+                     {"prices": dict(sellprice.DEFAULTS, bead=7)})
+        self.assertEqual(7, sellprice.load()["bead"])
+        for payload in ({"prices": {}}, {"prices": None}, {}):
+            status, result = self.request("/admin/api/sell/prices", payload)
+            self.assertEqual(400, status, payload)
+            self.assertFalse(result["ok"], payload)
+            self.assertEqual(7, sellprice.load()["bead"], payload)
+
+    def test_the_quotes_cover_everything_he_owns(self):
+        self.as_player()
+        _status, result = self.request("/admin/api/sell/state")
+        owned = {row["id"] for row in result["player"]["materials"]}
+        owned |= {row["id"] for row in result["player"]["inventory"]}
+        self.assertEqual(owned, {int(key) for key in result["quotes"]})
+        self.assertTrue(all(q["sellable"] for q in result["quotes"].values()))
 
 
 if __name__ == "__main__":

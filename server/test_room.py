@@ -928,6 +928,59 @@ class CharacterChangeTests(LobbyIsolated):
         self.assertEqual(1, Reader(payload[1:]).i32())
         self.assertEqual(1, self.bob.my_seat)
 
+    # ------------------------------------------------- 角色卡没了就换回泰尔
+    #: 一个商城角色和解锁它的那张卡（`account_store.character_item_id`）。
+    PREMIUM = 103
+    PREMIUM_CARD = 104400001
+
+    def sit_on_a_premium_character(self):
+        """让 bob 坐在一个**买来的**商城角色上（卡在仓库里）。"""
+        self.bob.account = dict(self.bob.account, character=self.PREMIUM,
+                                inventory={str(self.PREMIUM_CARD): 1})
+        seat = gameserver.Conn.refresh_seat(self.bob)
+        self.assertEqual(self.PREMIUM, seat.character_id)
+        for conn in (self.alice, self.bob):
+            conn.sent.clear()
+
+    def test_losing_the_card_puts_him_back_on_tyr_and_tells_the_room(self):
+        """★★ 卖掉 / 被删掉的正是他**在用**的那张商城角色卡 ⇒ 当场变回泰尔。
+
+        `player_character()` 读的时候本来就会把「没有卡的商城角色」退回 0
+        （D51），可**座位上那一格是进房时抄下来的快照** —— 没人去改它，
+        人物预览就一直停在那个已经不属于他的角色上，要等他重登才变回来。
+        ⇒ `_push_account()`（卖出 / 修改仓库 / 发送奖励 / 回滚存档四条路）
+        末尾补这一发。
+        """
+        self.sit_on_a_premium_character()
+        # 卡没了（管理页卖掉 / 删掉之后 `reload_account()` 读回来的那一份）。
+        self.bob.account = dict(self.bob.account, inventory={})
+
+        self.assertTrue(gameserver.Conn.resync_seat_character(self.bob))
+        self.assertEqual(0, self.room.seats[1].character_id)
+        # 房里**每一个人**都收到（含他自己 —— 他那台客户端也还停在旧角色上）。
+        for conn in (self.alice, self.bob):
+            self.assertEqual([OP_SESSION_MEMBER_UPDATE], opcodes(conn), conn)
+            payload = [p for blob in conn.sent for _, _op, p in frames(blob)][0]
+            # action 4 = 换角色：中下那个 3D 预览只认它（§103）。
+            self.assertEqual(SEAT_ACTION_CHANGE_CHARACTER, payload[0])
+            self.assertEqual(1, Reader(payload[1:]).i32())
+
+    def test_nothing_is_sent_while_the_card_is_still_there(self):
+        """★ 判据是**状态翻转**（铁律 10），不是「每次保存都发一遍」。
+
+        action 4 在客户端那边会播一次换角色的动效 —— 管理员改个金币就播一次，
+        全房间的人物预览闪一下。
+        """
+        self.sit_on_a_premium_character()
+        self.assertFalse(gameserver.Conn.resync_seat_character(self.bob))
+        self.assertEqual([], opcodes(self.alice))
+        self.assertEqual([], opcodes(self.bob))
+
+    def test_not_being_in_a_room_is_not_an_error(self):
+        alone = make_conn("carol")
+        alone.accounts = self.FakeAccounts(alone)
+        self.assertFalse(gameserver.Conn.resync_seat_character(alone))
+
 
 class TeamAndReadyTests(LobbyIsolated):
     """「变更队伍」和「游戏准备」（FINDINGS §165）。

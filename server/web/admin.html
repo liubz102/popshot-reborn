@@ -34,6 +34,10 @@
          对战 = 模式 × 个人/组队，闯关 = 关卡 × 难度，顶上一个「金币 / 经验」
          切换让两张表复用同一套行列。渲染器是 admin.js 的 `renderRewards`。 -->
     <button data-tab="rewards">金币 / 经验</button>
+    <!-- ★ 这一页**三档身份都看得见**（用户 2026-09-12）：玩家卖自己的，
+         管理员卖他那个同名游戏账号的。既不是配置页也不是系统管理员专页，
+         所以 admin.js 里给它开了第三张表 `EVERYONE_TABS`。 -->
+    <button data-tab="sell">装备卖出</button>
     <button data-tab="players">玩家仓库</button>
     <button data-tab="backup">数据备份</button>
     <button data-tab="admins">管理员账号</button>
@@ -104,6 +108,92 @@
         <div class="cat-tabs hidden" id="cfgCats"></div>
         <div class="cat-tabs sub hidden" id="cfgSubCats"></div>
         <div class="fit-list" id="cfgList"></div>
+      </div>
+    </section>
+
+    <!-- ---------------- 装备卖出（用户 2026-09-12） ----------------
+         整页左右分区：左边是「待卖出」购物车（金额实时变），右边是玩家自己的
+         仓库（分类标签 / 角色 / 上架状态三套筛选和「修改仓库」弹窗完全一样）。
+         ★ 三档身份都进得来；「⚙ 卖出价格设置」只有管理员看得见，
+           而**真正的门在服务端**（`_require_editor`）。
+         ★ 左右分区那一块可能被 `#sellLock` 盖住（管理员没有同名游戏账号），
+           但**工具条永远露着** —— 改卖价不需要有号可卖。 -->
+    <section class="panel hidden fit-panel" id="sellPanel">
+      <div class="panel-title">
+        <h2>装备卖出</h2>
+        <span class="count" id="sellWho"></span>
+      </div>
+      <div class="panel-body">
+        <div class="toolbar cfg-bar">
+          <div class="filters">
+            <!-- 昵称排在等级前面（用户 2026-09-12）—— 标题栏右端那个
+                 `#sellWho` 在最右边，眼睛先扫到的是工具条这一头。 -->
+            <span class="sell-stat">玩家 <b id="sellNick">-</b></span>
+            <span class="sell-stat">等级 <b id="sellLevel">-</b></span>
+            <span class="sell-stat">金币 <b id="sellMoney">-</b></span>
+            <button class="btn" id="sellRefresh"
+                    title="重新读一遍自己的仓库和卖出价格">↻ 刷新</button>
+          </div>
+          <div class="acts">
+            <!-- ★ 三档身份都看得见（用户 2026-09-12）：管理员能改，
+                 **玩家点开是只读的一张价格表** —— 那正好回答他
+                 「我这东西凭什么卖这个价」。锁不锁由弹窗自己按
+                 `can_edit` 决定；真正的门在服务端 `_require_editor()`。 -->
+            <button class="btn" id="sellPriceBtn">⚙ 卖出价格设置</button>
+            <button class="btn btn-primary" id="sellConfirm" disabled>确定卖出</button>
+          </div>
+        </div>
+
+        <div class="sell-split">
+          <!-- ========== 左：待卖出 ========== -->
+          <div class="sell-side sell-cart">
+            <div class="sell-head">待卖出物品</div>
+            <!-- ★★ 金额两行和「将返还的材料」**共一个边框**（用户 2026-09-12
+                 第五轮）：它们是「这一单能拿到什么」的两半 —— 金币那半 +
+                 实物那半。分成两块的话，下面那块看着像**待卖出清单的第一格**，
+                 而它俩的意思正好相反（一个要没、一个要来）。
+                 里面用一条虚线分开，别让人以为退的材料也算在金额里。 -->
+            <div class="sell-total">
+              <div class="sell-sum" id="sellSum"></div>
+              <!-- 有合成装备时才出现：它们卖掉是**把配方材料原样退回仓库**，
+                   金额那两行里不含这些材料的价值（用户 2026-09-12 拍板）。
+                   ★ 画成 `.chips`（图标 + 名字 + ×N）而不是仓库那种卡片：
+                     它只能看、点不动，一行能塞三四个，不值得一件占一格。 -->
+              <div class="sell-return hidden" id="sellReturn">
+                <div class="sell-sub-head">将返还的材料</div>
+                <div class="chips" id="sellReturnGrid"></div>
+              </div>
+            </div>
+            <div class="sell-scroll">
+              <div class="own-grid" id="sellCartGrid"></div>
+            </div>
+          </div>
+          <!-- ========== 右：玩家仓库 ========== -->
+          <div class="sell-side sell-bag">
+            <div class="sell-head">我的仓库</div>
+            <div class="toolbar cfg-bar">
+              <div class="filters">
+                <select id="sellCharacter"></select>
+                <select id="sellListing"></select>
+              </div>
+            </div>
+            <div class="cat-tabs" id="sellCats"></div>
+            <div class="cat-tabs sub hidden" id="sellSubCats"></div>
+            <div class="sell-scroll">
+              <div class="own-grid" id="sellOwnedGrid"></div>
+            </div>
+          </div>
+
+          <!-- 遮罩。理由由服务端给（`state` 的 `reason`），前台不自己编。
+               ★★ 它**只盖住这块左右分区，不盖工具条**（用户 2026-09-12 第二轮）：
+               一个没有同名游戏账号的管理员照样要能点「⚙ 卖出价格设置」——
+               改卖价是运营的活儿，和「他自己有没有号可卖」是两件事。
+               所以它是 `.sell-split` 的孩子，不是 `.panel-body` 的。
+               ★ 绝对定位 ⇒ 不参与 grid 布局，不会变成第三列。 -->
+          <div class="sell-lock hidden" id="sellLock">
+            <div class="sell-lock-box" id="sellLockText"></div>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -549,6 +639,98 @@
               title="关闭（点旁边的空白处也行）">✕</button>
     </div>
     <div class="panel-body" id="levelBody"></div>
+  </div>
+</div>
+
+<!-- ============= 卖出价格设置（用户 2026-09-12） =============
+     「装备卖出」页那颗「⚙ 卖出价格设置」点开的弹窗，**只有管理员看得见**。
+     ★ 每个价格框底下把**属于它的物品名**列出来 —— 管理员照着一眼能看见
+       「不死鸟之羽 / 之泪」归在特殊材料档里，而不是按 id 开头自己猜
+       （那正好会猜错，见 sellprice.material_class）。
+     ★ 表格由 admin.js 的 `renderSellPrices()` 打开时现画，数来自
+       `/admin/api/sell/prices`，页面里不留静态表格。
+     ★ 有没保存的改动，所以**点遮罩不关**，和「修改仓库」一个规矩。
+     ★★ 版式三条（用户 2026-09-12 第三轮）：
+       ① 顶上那三行说明**不要** —— 每个框底下那行小字已经把同一件事说了，
+          再占三行只会把七个输入框挤到滚动条外面去；
+       ② 「放弃修改 / 保存」挪到**最上面**，而且**滚动时不动** ——
+          所以正文是 `panel-body` 里单独一层 `.sell-price-scroll` 在滚，
+          工具条是它的兄弟，不参与滚动；
+       ③ 价格框**两列排**，一行一个太浪费（七个框原来要滚三屏）。 -->
+<div class="modal hidden" id="sellPriceModal">
+  <div class="panel sell-price-panel">
+    <div class="panel-title">
+      <h2>卖出价格设置</h2>
+      <button class="icon-btn" id="sellPriceClose" aria-label="关闭"
+              title="关闭（有没保存的改动会先问一句）">✕</button>
+    </div>
+    <div class="panel-body">
+      <div class="toolbar cfg-bar">
+        <!-- 工具条左半边那块空位：说清这一页**谁能改**（用户 2026-09-12）。
+             三档身份都看得到这个弹窗，但只有**管理员（系统管理员 / 运营）**
+             能改 —— 玩家进来是只读的（输入框锁住、右边那三样整组收起来）。
+             ★ 两种身份看到的是**同一句话**（用户给的原话），所以写死在这儿，
+               不由 JS 现拼。真正的门在服务端 `_require_editor()`。 -->
+        <div class="filters">
+          <span class="sell-price-who">此页内容仅管理员可以修改。普通玩家只能看不能改。</span>
+        </div>
+        <!-- 只读身份下整组藏起来（`.hidden`）—— 一个只能看的人，
+             「有未保存的修改 / 放弃修改 / 保存」没有一样是有意义的。 -->
+        <div class="acts" id="sellPriceActs">
+          <span class="dirty clean" id="sellPriceDirty"></span>
+          <button class="btn" id="sellPriceReset">放弃修改</button>
+          <button class="btn btn-primary" id="sellPriceSave">保存</button>
+        </div>
+      </div>
+      <div class="sell-price-scroll">
+        <div id="sellPriceBody"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============= 卖出数量（用户 2026-09-12） =============
+     右栏点「出售」时，可堆叠的材料弹这个小窗设数量（装备只有一件，直接进车）。
+     ★ 管理页原来没有任何「设数量」的弹窗 —— 别处的数量都是卡片里的内联输入框，
+       而这里一行只有一颗「出售」钮，没地方放常驻输入框。
+     ★ 只读没风险？不 —— 它会改购物车，所以和别的编辑窗一样点遮罩不关，
+       但 Esc 和 ✕ 都能取消（还没提交，丢掉不心疼）。 -->
+<div class="modal hidden" id="sellQtyModal">
+  <div class="panel sell-qty-panel">
+    <div class="panel-title">
+      <h2 id="sellQtyTitle"></h2>
+      <button class="icon-btn" id="sellQtyClose" aria-label="关闭" title="取消">✕</button>
+    </div>
+    <div class="panel-body">
+      <div class="row">
+        <div class="field">
+          <span class="lab" id="sellQtyLab"></span>
+          <input id="sellQtyInput" type="number" min="1" step="1">
+        </div>
+        <button class="btn" id="sellQtyAll">全部</button>
+      </div>
+      <!-- 拖动条（用户 2026-09-12）：最左 1、最右 = 还能卖的最大数，
+           打开时停在最右。★ 它和上面那个数字框是**同一个数的两个入口**，
+           改哪个另一个都跟着走（`syncSellQty`）；真正说了算的仍旧是
+           `sellQtyValue()` 从数字框读的那个值。
+           ★ 只有一个可卖时整条藏起来 —— 一根拖不动的滑杆看着像坏的。
+           ★★ `step="any"` 而不是 `step="1"`（用户 2026-09-12）：按 1 分档的话，
+             只有七个的时候整条轨道就只有七个落点，**拖起来一顿一顿的**。
+             放开步长之后拨钮是连续走的，数量由 `syncSellQty()` 四舍五入取整
+             —— 用的是「滑杆本来就能连续走」这件事，不是自己编一个
+             「分成 1000 档」的常量（铁律 10）。 -->
+      <div class="sell-qty-slider" id="sellQtySlider">
+        <span class="end">1</span>
+        <input id="sellQtyRange" type="range" min="1" step="any"
+               aria-label="卖出数量">
+        <span class="end" id="sellQtyMax">1</span>
+      </div>
+      <div class="sell-qty-sum" id="sellQtySum"></div>
+    </div>
+    <div class="panel-foot">
+      <button class="btn" id="sellQtyCancel">取消</button>
+      <button class="btn btn-primary" id="sellQtyOk">加入待卖出</button>
+    </div>
   </div>
 </div>
 

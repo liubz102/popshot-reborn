@@ -454,6 +454,28 @@ function paintTip(itemId) {
     shop.appendChild(el("span", null, "未上架"));
   }
   box.appendChild(shop);
+
+  // ---- 卖出单价（用户 2026-09-12）----
+  // ★ **只在「装备卖出」页画**：别的页面上这一行没有意义，而且报价是跟着
+  //   那一页一起取回来的（`SELL.quotes` 只有那个玩家手上那几件）。
+  if (TAB === "sell" && SELL && SELL.quotes) {
+    var quote = SELL.quotes[itemId];
+    var sell = el("div", "t-shop");
+    if (!quote) {
+      sell.appendChild(el("span", null, "卖出：不在你的仓库里"));
+    } else if (!quote.sellable) {
+      sell.appendChild(el("span", null, "暂不可出售"));
+    } else {
+      sell.appendChild(el("span", "on", "◆ 卖出单价"));
+      sell.appendChild(el("span", null, quote.unit + " 金币"));
+      Object.keys(quote.materials || {}).forEach(function (mid) {
+        sell.appendChild(el("span", null,
+                            "退 " + itemName(Number(mid))
+                            + "×" + quote.materials[mid]));
+      });
+    }
+    box.appendChild(sell);
+  }
 }
 
 /** 这件东西现在**上架在哪条配方**里；没有就 `null`。 */
@@ -3936,6 +3958,683 @@ async function loadCatalog() {
 }
 
 /* ======================================================================
+   装备卖出（用户 2026-09-12）
+
+   左右分区：左边购物车（金额实时变），右边自己的仓库。筛选那三套
+   （两行分类标签 / 角色下拉 / 上架状态下拉）和「修改仓库」弹窗**完全共用**
+   —— `paintCatTabs` / `fillSelect` / `dropdownsMatch` 一个都没重写。
+
+   ## 三件和别处不一样的事
+
+   1. **这一页普通玩家也能写**（整个 `/admin` 里唯一一处）。前台不做任何
+      「卖谁的」判断 —— 服务端从会话令牌推目标账号，接口连 `name` 都不收。
+   2. **不是「补丁 + 快照」那套**（`#playerModal` 是）。购物车是个临时的
+      `{itemId: 数量}`，不落盘、刷新就没；真正的账在服务端现算。
+   3. **金额两行实时变**，但**合成装备退的是材料实物**，不折成金币 ——
+      所以下面单独有一块「将返还的材料」（用户 2026-09-12 拍板）。
+   ====================================================================== */
+
+//: 整页状态。`null` = 还没进过这一页。
+//  {view, rows, quotes, prices, canEditPrices, moneyMax, locked, reason,
+//   inMatch, cart: {itemId: 数量}, tab: {big, sub}, filter: {character, listing}}
+var SELL = null;
+
+//: 价格设置弹窗。{meta, base, edit}
+var SELL_PRICES = null;
+
+//: 数量小弹窗。{id, max}
+var SELL_QTY = null;
+
+/** 这件东西的报价（服务端算好的）；没有就给一份「卖不掉」。 */
+function sellQuote(itemId) {
+  var found = SELL && SELL.quotes ? SELL.quotes[itemId] : null;
+  return found || {sellable: false, unit: 0, materials: {}, source: "",
+                   reason: "还没拿到这件东西的报价"};
+}
+
+/** 浮窗和卡片上那句「卖出单价」。 */
+function sellUnitText(itemId) {
+  var quote = sellQuote(itemId);
+  if (!quote.sellable) { return quote.reason || "暂不可出售"; }
+  var back = Object.keys(quote.materials || {});
+  if (quote.source === "recipe") {
+    return quote.unit + " 金币 ＋ 退回 " + back.length + " 种材料";
+  }
+  return quote.unit + " 金币";
+}
+
+/** 仓库里一共有几个（两桶合成一张表，和游戏仓库界面一个口径）。 */
+function sellOwned(itemId) {
+  var rows = (SELL && SELL.rows) || [];
+  for (var i = 0; i < rows.length; i += 1) {
+    if (rows[i].id === itemId) { return rows[i].count; }
+  }
+  return 0;
+}
+
+function sellRowOf(itemId) {
+  var rows = (SELL && SELL.rows) || [];
+  for (var i = 0; i < rows.length; i += 1) {
+    if (rows[i].id === itemId) { return rows[i]; }
+  }
+  return null;
+}
+
+/** 还剩几个可以往车里放 = 拥有量 − 已经在车里的。 */
+function sellLeft(itemId) {
+  return sellOwned(itemId) - (Number(SELL.cart[itemId]) || 0);
+}
+
+/** 车里这一单的总账：`{money, returned, lines}`。 */
+function sellTotals() {
+  var money = 0;
+  var returned = {};
+  var lines = [];
+  Object.keys(SELL.cart).forEach(function (key) {
+    var itemId = Number(key);
+    var count = Number(SELL.cart[key]) || 0;
+    if (count <= 0) { return; }
+    var quote = sellQuote(itemId);
+    money += quote.unit * count;
+    Object.keys(quote.materials || {}).forEach(function (mid) {
+      var n = quote.materials[mid] * count;
+      returned[mid] = (returned[mid] || 0) + n;
+    });
+    lines.push({id: itemId, count: count, money: quote.unit * count});
+  });
+  lines.sort(function (a, b) { return a.id - b.id; });
+  return {money: money, returned: returned, lines: lines};
+}
+
+function sellFilteredRows() {
+  return ((SELL && SELL.rows) || []).filter(function (row) {
+    return dropdownsMatch(row.id, SELL.filter);
+  });
+}
+
+function renderSellTabs() {
+  var rows = sellFilteredRows();
+  paintCatTabs($("sellCats"), $("sellSubCats"), SELL.tab, function (id) {
+    return rows.filter(function (row) {
+      return whMatches(id, whCategory(row.id));
+    }).length;
+  }, repaintSell);
+}
+
+/** 右栏一格：图标 + 名字 + （#id · 余 N）+ 「出售」钮。
+ *
+ * ★★ **卡片上不写单价**（用户 2026-09-12 第三轮）。原来右边钉着一列
+ *    96 px 的单价文字，格子因此只能一行一件、名字还是被切断 ——
+ *    而同一句话浮窗里本来就有（`paintTip` 最后那一行）。拿掉之后这一格
+ *    就跟「修改仓库」那种小格子一样宽，一行摆得下三格。
+ * ★ 余量塞进第二行小字，不单开一列：它是「还能再放几个进车」，
+ *   属于这件东西的注脚，不是一个要对齐的数值列。
+ */
+function sellBagNode(row) {
+  var left = sellLeft(row.id);
+  var quote = sellQuote(row.id);
+  var box = el("div", "own" + (left > 0 && quote.sellable ? "" : " off"));
+  box.appendChild(slotNode(row.id, 26, false, false));
+
+  var col = tipFor(el("div", "col"), row.id);
+  col.appendChild(el("div", "nmz", itemName(row.id)));
+  var meta = el("div", "meta", "#" + row.id);
+  if (row.stackable) {
+    meta.appendChild(el("span", "sep", "·"));
+    meta.appendChild(el("span", null, "余 " + left + " / " + row.count));
+  }
+  if (row.equipped) {
+    // 穿着的照样能卖 —— 服务端会先把它脱下来（用户 2026-09-12）。
+    var worn = el("span", "worn", "穿着");
+    worn.title = "卖掉时会自动脱下";
+    meta.appendChild(worn);
+  }
+  col.appendChild(meta);
+  box.appendChild(col);
+
+  var add = el("button", "btn btn-sm btn-primary sell-add", "出售");
+  if (!quote.sellable) {
+    add.disabled = true;
+    add.title = quote.reason || "这件东西暂时不可出售";
+  } else if (left <= 0) {
+    add.disabled = true;
+    add.title = "已经全部放进待卖出了";
+  } else {
+    add.title = sellUnitText(row.id);
+    add.onclick = function () {
+      // 装备类只有一件，不用问数量；材料弹小窗设数量。
+      if (row.stackable) { openSellQty(row.id); }
+      else { addToCart(row.id, 1); }
+    };
+  }
+  box.appendChild(add);
+  return box;
+}
+
+function renderSellBag() {
+  var host = $("sellOwnedGrid");
+  var keep = host.parentNode.scrollTop;       // 重画不动滚动条（D37b）
+  host.textContent = "";
+  var want = tabRequested(SELL.tab);
+  var rows = sellFilteredRows().filter(function (row) {
+    return whMatches(want, whCategory(row.id));
+  });
+  if (!rows.length) {
+    host.appendChild(el("div", "own-empty", "这一格里没有东西"));
+  }
+  rows.forEach(function (row) { host.appendChild(sellBagNode(row)); });
+  host.parentNode.scrollTop = keep;
+}
+
+/** 左栏一格：图标 + 名字 + （×数量 · 小计）+ ✕ 退回。
+ *
+ * ★ 和右栏同一个道理（见 `sellBagNode`）：数量和小计进第二行小字，
+ *   右边只留那颗 ✕ —— 购物车那一栏只有 380 宽，钉两列数值就没名字了。
+ */
+function sellCartNode(line) {
+  var box = el("div", "own");
+  box.appendChild(slotNode(line.id, 26, false, false));
+  var col = tipFor(el("div", "col"), line.id);
+  col.appendChild(el("div", "nmz", itemName(line.id)));
+  var meta = el("div", "meta", "×" + line.count);
+  meta.appendChild(el("span", "sep", "·"));
+  meta.appendChild(el("span", "gain", line.money + " 金币"));
+  col.appendChild(meta);
+  box.appendChild(col);
+  var drop = el("button", "btn btn-sm btn-danger drop", "✕");
+  drop.title = "退回仓库";
+  drop.onclick = function () {
+    delete SELL.cart[line.id];
+    repaintSell();
+  };
+  box.appendChild(drop);
+  return box;
+}
+
+/** 「将返还的材料」里的一枚（只看，点不动）⇒ 画成 `.chip`，不是仓库卡片。 */
+function sellReturnNode(itemId, count) {
+  var chip = tipFor(el("span", "chip"), itemId);
+  chip.appendChild(slotNode(itemId, 18, false, false));
+  chip.appendChild(el("span", null, itemName(itemId)));
+  chip.appendChild(el("span", "qty", "×" + count));
+  return chip;
+}
+
+function renderSellCart() {
+  var totals = sellTotals();
+  var host = $("sellCartGrid");
+  var keep = host.parentNode.scrollTop;       // 重画不动滚动条（D37b）
+  host.textContent = "";
+  if (!totals.lines.length) {
+    host.appendChild(el("div", "own-empty",
+                        "还没选东西 —— 在右边点「出售」放进来"));
+  }
+  totals.lines.forEach(function (line) {
+    host.appendChild(sellCartNode(line));
+  });
+  host.parentNode.scrollTop = keep;
+
+  var back = Object.keys(totals.returned);
+  $("sellReturn").classList.toggle("hidden", !back.length);
+  var backHost = $("sellReturnGrid");
+  backHost.textContent = "";
+  back.map(Number).sort(function (a, b) { return a - b; })
+    .forEach(function (itemId) {
+      backHost.appendChild(sellReturnNode(itemId, totals.returned[itemId]));
+    });
+
+  // 金额两行。★ 「卖出后金币」要跟着服务端那条 int32 上限钳一次，
+  //   免得画面上写着一个玩家永远拿不到的数（见 account_store.MONEY_MAX）。
+  var before = SELL.view ? SELL.view.money : 0;
+  var after = Math.min(before + totals.money, SELL.moneyMax);
+  var sum = $("sellSum");
+  sum.textContent = "";
+  var gain = el("div", "sell-sum-row");
+  gain.appendChild(el("span", "lab", "卖出得金币"));
+  gain.appendChild(el("b", null, String(totals.money)));
+  sum.appendChild(gain);
+  var wallet = el("div", "sell-sum-row");
+  wallet.appendChild(el("span", "lab", "卖出后金币"));
+  wallet.appendChild(el("b", null, before + " → " + after));
+  sum.appendChild(wallet);
+  if (before + totals.money > after) {
+    sum.appendChild(el("div", "sell-warn",
+                       "金币已经到上限，超出的 "
+                       + (before + totals.money - after) + " 不会入账"));
+  }
+  if (back.length) {
+    // 下面紧挨着就是那一排材料 chip ⇒ 这里只要说清「金额里不含它们」。
+    sum.appendChild(el("div", "sell-note",
+                       "合成得来的装备退回配方材料，上面的金额里不含它们"));
+  }
+  $("sellConfirm").disabled = !totals.lines.length || SELL.locked;
+}
+
+function repaintSell() {
+  renderSellTabs();
+  renderSellBag();
+  renderSellCart();
+}
+
+function renderSell() {
+  // 遮罩只盖左右分区那一块（它是 `.sell-split` 的孩子），工具条永远露着。
+  $("sellLock").classList.toggle("hidden", !SELL.locked);
+  $("sellLockText").textContent = SELL.reason || "";
+  // ★★ 这颗钮**三档身份都看得见**（用户 2026-09-12：玩家只读）——
+  //   玩家点开是一张锁住的价格表，正好回答他「我这东西凭什么卖这个价」。
+  //   能不能改由弹窗自己按 `can_edit` 决定（`openSellPrices`），
+  //   真正的门在服务端的 `_require_editor()`。
+  $("sellPriceBtn").title = SELL.canEditPrices
+    ? "设置各类材料的卖出单价和装备的卖出百分比"
+    : "看一眼各类东西按什么价收（改价是管理员的事）";
+  if (SELL.locked) {
+    $("sellWho").textContent = "";
+    $("sellNick").textContent = "-";
+    $("sellLevel").textContent = "-";
+    $("sellMoney").textContent = "-";
+    // ★ 锁上也要**把两边重画一遍**（`rows` / `cart` 这时都是空的）。
+    //   不画的话上一个人的仓库原封不动留在 DOM 里 —— 遮罩只有 .92 不透明，
+    //   底下那些格子隐约看得见，而那可能是**另一个账号**的东西
+    //   （玩家退出、管理员登进来的那一瞬间就是这条路）。
+    repaintSell();
+    $("sellConfirm").disabled = true;
+    return;
+  }
+  var view = SELL.view;
+  $("sellWho").textContent = view.nickname + "（" + view.username + "）"
+    + (view.online ? " · 在线" : "");
+  $("sellNick").textContent = view.nickname;
+  $("sellLevel").textContent = view.level;
+  $("sellMoney").textContent = view.money;
+  fillSelect($("sellCharacter"), "全部角色", characterOptions(),
+             SELL.filter.character);
+  fillSelect($("sellListing"), "全部上架状态", LISTING_FILTER_OPTIONS,
+             SELL.filter.listing);
+  repaintSell();
+}
+
+/** 服务端那份 `state`（或**卖出回执**）→ 整页状态。
+ *
+ * ★★ 这是一次**整页赋值**：`result` 里少哪个键，页面上那一项当场变成
+ *    默认值。所以服务端那两处回的是**同一组键** —— 回执由
+ *    `_sell_state_payload()` 起头，再补上这一单的账
+ *    （`test_the_receipt_carries_the_whole_page_state` 钉着）。
+ *    别在这儿写「回执没带就留着上一份」那种补丁：那等于把判据交给
+ *    「谁记得补哪个键」，而漏掉的症状是静悄悄的 —— 2026-09-12 第三轮
+ *    发现的那个就是「管理员卖完一单，改价按钮自己没了」。
+ */
+function adoptSellState(result, keepCart) {
+  var same = SELL && SELL.view && result.player
+             && SELL.view.username === result.player.username;
+  var cart = (keepCart && same && SELL) ? SELL.cart : {};
+  SELL = {
+    view: result.player || null,
+    rows: [],
+    quotes: result.quotes || {},
+    prices: result.prices || {},
+    canEditPrices: !!result.can_edit_prices,
+    moneyMax: Number(result.money_max) || 2147483647,
+    locked: !!result.locked,
+    reason: result.reason || "",
+    inMatch: !!result.in_match,
+    cart: cart,
+    // 同一个人重读时停在原来的分类和下拉上（照 `adoptPlayer` 的做法）。
+    tab: same ? SELL.tab : anyTab(),
+    filter: same ? SELL.filter : {character: "", listing: ""}
+  };
+  if (SELL.view) {
+    // ★ 两桶合成一张表，**同一个 id 只留一行**：正常存档里一件东西只会在
+    //   一个桶里，但手改过的存档两边都有过 —— 那时 `sellOwned()` 只认得
+    //   第一行，画面上却摆着两格，点第二格会一直「余 0」。
+    var seen = {};
+    function take(row, stackable, equipped) {
+      var have = seen[row.id];
+      if (have) {
+        have.count += row.count;
+        have.stackable = have.stackable && stackable;
+        have.equipped = have.equipped || equipped;
+        return;
+      }
+      seen[row.id] = {id: row.id, count: row.count,
+                      stackable: stackable, equipped: equipped};
+      SELL.rows.push(seen[row.id]);
+    }
+    (SELL.view.materials || []).forEach(function (row) {
+      take(row, true, false);
+    });
+    (SELL.view.inventory || []).forEach(function (row) {
+      take(row, row.stackable !== false, !!row.equipped);
+    });
+    // ★ 不可堆叠的东西只有「有 / 没有」（§28）：存档里躺着 ×2 的老账
+    //   （早先用控制通道 `give` 发过两次）也只算一件 —— 服务端 `bundle()`
+    //   就是这么算钱的，画面上摆 ×2 只会让人以为能卖两份钱。
+    SELL.rows.forEach(function (row) {
+      if (!row.stackable) { row.count = 1; }
+    });
+    SELL.rows.sort(function (a, b) { return a.id - b.id; });
+  }
+  // 车里留着的东西可能已经不在仓库里了（他在游戏里用掉了）——
+  // 按现有存量夹一下，夹到 0 的整条去掉。
+  Object.keys(SELL.cart).forEach(function (key) {
+    var owned = sellOwned(Number(key));
+    if (owned <= 0) { delete SELL.cart[key]; }
+    else if (SELL.cart[key] > owned) { SELL.cart[key] = owned; }
+  });
+  renderSell();
+  if (!SELL.locked && SELL.inMatch) {
+    toast("你现在正在游戏对局里 —— 可以先挑，但要打完这一局才卖得掉。", false);
+  }
+}
+
+async function loadSellState(keepCart) {
+  var result = await api("/admin/api/sell/state");
+  if (bounced(result)) { return false; }
+  if (!result.ok) { toast(result.message, false); return false; }
+  adoptSellState(result, keepCart);
+  return true;
+}
+
+/** 「↻ 刷新」—— 和别处那几个刷新钮一个手感（用户 2026-09-12）：
+ *  先「刷新中……」，成功了说一句「已刷新」。
+ *
+ * ★ 失败时**不要**盖掉 `loadSellState` 报的那句错 —— 「已刷新」压在
+ *   「请先登录」上面，人看到的就是「点了刷新，然后什么都没变」
+ *   （和 `refreshConfigs` / `refreshAccounts` 同一条规矩）。
+ * ★ 对局中那句提醒**并进这一句说**：`toast()` 是单条的，后来的会把
+ *   `adoptSellState()` 刚弹的那句盖掉 —— 分开发的话回执反而把提醒吞了。
+ */
+async function refreshSell() {
+  toast("刷新中……", true);
+  if (!(await loadSellState(true))) { return; }
+  if (SELL.locked) {
+    toast("已刷新。这一页没有可操作的仓库，原因见页面上那句话。", true);
+    return;
+  }
+  toast("已刷新：仓库和卖出价格都是最新的。"
+        + (SELL.inMatch
+           ? "★ 你现在正在游戏对局里，可以先挑，但要打完这一局才卖得掉。"
+           : ""),
+        !SELL.inMatch);
+}
+
+function addToCart(itemId, count) {
+  var left = sellLeft(itemId);
+  count = Math.max(0, Math.min(count, left));
+  if (!count) { return; }
+  SELL.cart[itemId] = (Number(SELL.cart[itemId]) || 0) + count;
+  repaintSell();
+}
+
+/* ----------------------------------------------------- 数量小弹窗
+   管理页原来没有这种窗：别处的数量都是卡片里的内联输入框，而这儿一行
+   只有一颗「出售」钮，没地方常驻一个输入框。 */
+
+function openSellQty(itemId) {
+  var left = sellLeft(itemId);
+  if (left <= 0) { return; }
+  SELL_QTY = {id: itemId, max: left};
+  $("sellQtyTitle").textContent = itemName(itemId);
+  $("sellQtyLab").textContent = "卖出数量（最多 " + left + "）";
+  var input = $("sellQtyInput");
+  input.max = String(left);
+  input.value = String(left);
+  var range = $("sellQtyRange");
+  range.max = String(left);
+  range.value = String(left);
+  $("sellQtyMax").textContent = String(left);
+  // 只有一个可卖 ⇒ 整条藏起来：一根拖不动的滑杆看着像坏的。
+  $("sellQtySlider").classList.toggle("hidden", left <= 1);
+  paintSellQtySum();
+  $("sellQtyModal").classList.remove("hidden");
+  input.focus();
+  input.select();
+}
+
+function sellQtyValue() {
+  if (!SELL_QTY) { return 0; }
+  var raw = Math.floor(Number($("sellQtyInput").value) || 0);
+  return Math.max(1, Math.min(raw, SELL_QTY.max));
+}
+
+/** 把当前数量写回**两个入口**（数字框 / 拖动条）并重画合计。
+ *
+ * ★ 数字框是那个数的**唯一出处**（`sellQtyValue()` 只读它），拖动条只是
+ *   另一个改法 —— 两边各存一份的话，一个改了另一个没跟上，最后按「加入
+ *   待卖出」时谁说了算就成了看运气。
+ * `from` = 刚才动的是谁，别把正在输入的那一格改掉（人打到一半会跳）。
+ */
+function syncSellQty(from) {
+  if (!SELL_QTY) { return; }
+  if (from === "range") {
+    // ★ 拨钮是**连续**走的（`step="any"`）—— 这里取整，让数字跳、拨钮不跳。
+    //   不要反过来把拨钮拉回整数位：那正是「一顿一顿」的来源。
+    $("sellQtyInput").value = String(
+      Math.max(1, Math.min(Math.round(Number($("sellQtyRange").value) || 1),
+                           SELL_QTY.max)));
+  } else {
+    // 人手敲了一个确切的数 ⇒ 拨钮就该停在那个刻度上。
+    $("sellQtyRange").value = String(sellQtyValue());
+  }
+  paintSellQtySum();
+}
+
+function paintSellQtySum() {
+  if (!SELL_QTY) { return; }
+  var quote = sellQuote(SELL_QTY.id);
+  $("sellQtySum").textContent =
+    "单价 " + quote.unit + " 金币　合计 "
+    + (quote.unit * sellQtyValue()) + " 金币";
+}
+
+function closeSellQty() {
+  SELL_QTY = null;
+  $("sellQtyModal").classList.add("hidden");
+}
+
+function confirmSellQty() {
+  if (!SELL_QTY) { return; }
+  var itemId = SELL_QTY.id;
+  var count = sellQtyValue();
+  closeSellQty();
+  addToCart(itemId, count);
+}
+
+/* ----------------------------------------------------- 确定卖出 */
+
+async function doSell() {
+  if (!SELL || SELL.locked) { return; }
+  var totals = sellTotals();
+  if (!totals.lines.length) { return; }
+  var before = SELL.view.money;
+  var after = Math.min(before + totals.money, SELL.moneyMax);
+  var lists = [{
+    label: "卖出的物品（" + totals.lines.length + "）",
+    rows: totals.lines.map(function (line) {
+      return {label: itemName(line.id) + " ×" + line.count,
+              reason: line.money + " 金币"};
+    })
+  }];
+  var back = Object.keys(totals.returned).map(Number)
+    .sort(function (a, b) { return a - b; });
+  if (back.length) {
+    lists.push({
+      label: "将返还的材料（" + back.length + " 种）",
+      rows: back.map(function (itemId) {
+        return {label: itemName(itemId) + " ×" + totals.returned[itemId]};
+      })
+    });
+  }
+  var ok = await ask({
+    title: "确认卖出",
+    lead: "一共卖出 " + totals.lines.length + " 件，得 " + totals.money
+          + " 金币。\n卖出后金币：" + before + " → " + after
+          + "\n★ 卖掉的东西拿不回来。",
+    lists: lists,
+    ok: "卖出",
+    danger: true
+  });
+  if (!ok) { return; }
+  var result = await api("/admin/api/sell", {
+    // ★ 只发清单。「卖谁的」由服务端从会话令牌推 —— 这里连用户名都不该发。
+    items: totals.lines.map(function (line) {
+      return {id: line.id, count: line.count};
+    })
+  });
+  if (bounced(result)) { return; }
+  if (!result.ok) { toast(result.message, false); return; }
+  SELL.cart = {};
+  adoptSellState(result, false);
+  toast(result.message, true);
+}
+
+/* ----------------------------------------------------- 卖出价格设置 */
+
+function sellPricesDirty() {
+  if (!SELL_PRICES) { return false; }
+  return Object.keys(SELL_PRICES.edit).some(function (key) {
+    return Number(SELL_PRICES.edit[key]) !== Number(SELL_PRICES.base[key]);
+  });
+}
+
+function paintSellPriceDirty() {
+  var dirty = sellPricesDirty();
+  var node = $("sellPriceDirty");
+  node.textContent = dirty ? "有未保存的修改" : "没有未保存的修改";
+  node.className = "dirty" + (dirty ? "" : " clean");
+}
+
+/** 一个价格格子：一行「标签 + 输入框 + 单位」，底下一行「这一档装着什么」。
+ *
+ * ★ 那行小字封成两行（CSS 的 `-webkit-line-clamp`），全文进 `title` ——
+ *   卡片那一类有 17 个名字，任它长的话这一格能撑到六行，两列的高度全带歪。
+ */
+function sellPriceField(key, label, suffix, names, max) {
+  var wrap = el("div", "sell-price-row");
+  var field = el("div", "field");
+  field.appendChild(el("span", "lab", label));
+  var input = document.createElement("input");
+  input.type = "number";
+  input.min = "0";
+  input.step = "1";
+  if (max) { input.max = String(max); }
+  input.value = String(SELL_PRICES.edit[key]);
+  // ★ 只读身份（玩家）：数就摆在原来的位置上，只是改不动 —— 和配置页
+  //   `lockList()` 一个口径（用户要的是「看得见、改不了」，不是换成一行字）。
+  input.disabled = !SELL_PRICES.canEdit;
+  input.oninput = function () {
+    // ★★ **就地钳**（而不是只在保存时报错）：百分比的上限是 100
+    //   （`sellprice.PERCENT_MAX`，用户 2026-09-12 —— 卖价不许高过买价）。
+    //   钳完写回输入框，所见即将要存下去的那个数；只在保存那一刻报错的话，
+    //   人得先填完一屏才知道哪一格不行。服务端那一道校验一点没松。
+    var value = Math.max(0, Math.floor(Number(input.value) || 0));
+    if (max) { value = Math.min(value, max); }
+    if (String(value) !== input.value) { input.value = String(value); }
+    SELL_PRICES.edit[key] = value;
+    paintSellPriceDirty();
+  };
+  field.appendChild(input);
+  if (suffix) { field.appendChild(el("span", "suffix", suffix)); }
+  wrap.appendChild(field);
+  if (names) {
+    var note = el("div", "sell-price-names", names);
+    note.title = names;
+    wrap.appendChild(note);
+  }
+  return wrap;
+}
+
+/** 一组（材料 / 装备 / 其他）：小标题 + 价格格子。返回那张格子网格。 */
+function sellPriceGroup(host, title) {
+  var group = el("div", "sell-price-group");
+  group.appendChild(el("div", "sell-head", title));
+  var grid = el("div", "sell-price-grid");
+  group.appendChild(grid);
+  host.appendChild(group);
+  return grid;
+}
+
+function renderSellPrices() {
+  var meta = SELL_PRICES.meta;
+  var host = $("sellPriceBody");
+  host.textContent = "";
+
+  var mats = sellPriceGroup(host, "材料");
+  (meta.classes || []).forEach(function (key) {
+    var ids = (meta.groups && meta.groups[key]) || [];
+    // ★ 把名字列出来：管理员照着一眼能看见「不死鸟之羽 / 之泪」归在特殊档里
+    //   （按 id 开头猜正好会猜错）。
+    var names = ids.map(itemName).join("、");
+    mats.appendChild(sellPriceField(
+      key, (meta.labels && meta.labels[key]) || key, "金币 / 个",
+      ids.length ? (ids.length + " 种：" + names) : "（没有物品归在这一类）"));
+  });
+
+  // ★★ 「装备」和「其他」是**并列的两组、摆在同一行左右**（用户 2026-09-12）。
+  //    并列是因为它们本来就是 `sellprice.quote()` 四条分支里各自独立的一条
+  //    —— 「其他」是「既没上架商店、也没有配方」那 148 件（称号 / 礼包 /
+  //    钥匙 / 消耗品）的兜底价，不是装备的一种；同一行是因为两组各只有
+  //    一个数，上下摞着白占一屏。
+  var pair = el("div", "sell-price-pair");
+  host.appendChild(pair);
+
+  sellPriceGroup(pair, "装备").appendChild(sellPriceField(
+    "equip_percent", "卖出价 = 买入价 ×", "%",
+    "商店在卖的按买入价算；靠合成得来的按配方的金币花费算，"
+    + "并且把配方里的材料原样退回仓库。",
+    meta.percent_max));
+
+  sellPriceGroup(pair, "其他").appendChild(sellPriceField(
+    "other_price", "其他物品", "金币 / 个",
+    "既没上架商店、也没有合成配方的那些东西（比如称号、礼包、钥匙、消耗品）。"));
+
+  // 「有未保存的修改 / 放弃修改 / 保存」整组：只读身份下收起来 ——
+  // 一个只能看的人，这三样没有一样是有意义的（工具条左边那句话是写死的，
+  // 两种身份看到的是同一句）。
+  $("sellPriceActs").classList.toggle("hidden", !SELL_PRICES.canEdit);
+  paintSellPriceDirty();
+}
+
+async function openSellPrices() {
+  var result = await api("/admin/api/sell/prices");
+  if (bounced(result)) { return; }
+  if (!result.ok) { toast(result.message, false); return; }
+  // ★ 「能不能改」由**这一发自己**回（`can_edit`），不去借卖出页那个
+  //   `can_edit_prices` —— 借来的字段总有「那边改口这边忘了跟」的一天。
+  //   两边都只是画面，真正的门是服务端的 `_require_editor()`。
+  SELL_PRICES = {meta: result, base: result.prices,
+                 canEdit: !!result.can_edit,
+                 edit: JSON.parse(JSON.stringify(result.prices))};
+  renderSellPrices();
+  $("sellPriceModal").classList.remove("hidden");
+}
+
+async function closeSellPrices() {
+  if (sellPricesDirty()) {
+    var ok = await ask({title: "还有没保存的改动",
+                        lead: "卖出价格还有没保存的改动，确定丢掉？",
+                        ok: "丢掉"});
+    if (!ok) { return; }
+  }
+  SELL_PRICES = null;
+  $("sellPriceModal").classList.add("hidden");
+}
+
+async function saveSellPrices() {
+  if (!SELL_PRICES) { return; }
+  var result = await api("/admin/api/sell/prices",
+                         {prices: SELL_PRICES.edit});
+  if (bounced(result)) { return; }
+  toast(result.message, result.ok);
+  if (!result.ok) { return; }
+  SELL_PRICES.base = result.prices;
+  SELL_PRICES.edit = JSON.parse(JSON.stringify(result.prices));
+  renderSellPrices();
+  // 价格一改，卖出页上每一行的单价和车里的小计都过期了 —— 重新问一次。
+  // ★ 车里的东西留着（他只是改了价，没打算把挑好的东西丢掉）。
+  if (SELL) { await loadSellState(true); }
+}
+
+/* ======================================================================
    登录 / 启动
    ====================================================================== */
 
@@ -3957,6 +4656,16 @@ var TAB = "items";
 //: 只有系统管理员能进的标签页（数据备份也是：它能回滚玩家存档）。
 var SYSTEM_ONLY_TABS = ["players", "backup", "admins"];
 
+//: **三档身份都能进**的标签页（用户 2026-09-12）。
+//  ★ 为什么要第三张表：原来页面上每个标签非「配置页」即「系统管理员专页」，
+//    `test_every_tab_in_the_page_is_classified` 就是照这两张表双向核对的。
+//    「装备卖出」两头都不是 —— 它不是运营配置（没有三方合并那一套），
+//    又必须对普通玩家开着。硬塞进 `CONFIGS` 会让配置页那条链（渲染器 /
+//    脏标记 / 三方合并 / 「共几份配置」的文案）全部把它算进去。
+//  ★ 这一页**玩家也能写**（卖自己的东西）—— 整个 `/admin` 里唯一一处。
+//    安全不靠这张表：服务端从会话令牌推「卖谁的」，接口连 `name` 都不收。
+var EVERYONE_TABS = ["sell"];
+
 function isSystemAdmin() { return ROLE === "system"; }
 
 //: 只读身份（D74）。★ 判据是**角色**，不是「有没有某个按钮」—— 页面上
@@ -3967,7 +4676,9 @@ function canOpenTab(tab) {
   // ★ 只读玩家看得见的就是**那几个配置页**，照 `CONFIGS` 现取（不是照
   //   `SYSTEM_ONLY_TABS` 取反）：以后加一个既不是配置页、又不属于系统管理员
   //   专档的新标签，取反那种写法会**默认放行**给玩家 —— 白名单不会。
-  if (isReadOnly()) { return CONFIGS.indexOf(tab) >= 0; }
+  if (isReadOnly()) {
+    return CONFIGS.indexOf(tab) >= 0 || EVERYONE_TABS.indexOf(tab) >= 0;
+  }
   return isSystemAdmin() || SYSTEM_ONLY_TABS.indexOf(tab) < 0;
 }
 
@@ -4040,7 +4751,13 @@ function showLoggedOut(message) {
   PLAYER_LIST = [];
   BACKUP = null;
   BACKUP_PAGE = 0;
+  // 下一个登进来的是另一个人 —— 他的仓库、报价和挑好的车都跟这个人无关。
+  SELL = null;
+  SELL_PRICES = null;
+  SELL_QTY = null;
   $("playerModal").classList.add("hidden");
+  $("sellPriceModal").classList.add("hidden");
+  $("sellQtyModal").classList.add("hidden");
   $("who").textContent = "";
   $("logout").classList.add("hidden");
   $("mainView").classList.add("hidden");
@@ -4095,11 +4812,13 @@ function paintTabChrome(tab) {
   //   玩家仓库页 2026-09-07 加进来）；管理员账号是普通长页面，整块跟着
   //   `main` 滚。
   $("mainArea").classList.toggle("fit",
-                                 isConfig || tab === "backup" || tab === "players");
+                                 isConfig || tab === "backup"
+                                 || tab === "players" || tab === "sell");
   $("cfgPanel").classList.toggle("hidden", !isConfig);
   $("adminsPanel").classList.toggle("hidden", tab !== "admins");
   $("playersPanel").classList.toggle("hidden", tab !== "players");
   $("backupPanel").classList.toggle("hidden", tab !== "backup");
+  $("sellPanel").classList.toggle("hidden", tab !== "sell");
   return isConfig;
 }
 
@@ -4116,6 +4835,13 @@ function switchTab(tab) {
   if (tab === "backup") {
     // 同上：第一次切进来才去要（运营根本进不来，`boot()` 里不预取）。
     if (!BACKUP) { loadBackups(); }
+    return;
+  }
+  if (tab === "sell") {
+    // 同上。★ 每次切回来都**重读**（不是「第一次才读」）：他可能刚在游戏里
+    //   花掉了金币、用掉了材料，也可能刚开了一局 —— 这一页上每个数都会过期。
+    //   车里挑好的东西留着（`keepCart`），按新存量夹一下。
+    loadSellState(true);
     return;
   }
   if (!isConfig) { return; }
@@ -4266,6 +4992,46 @@ function wire() {
   };
   $("historyClear").onclick = function () { clearHistory(); };
 
+  // ---------------------------------------------- 装备卖出（2026-09-12）
+  $("sellRefresh").onclick = function () { refreshSell(); };
+  $("sellConfirm").onclick = function () { doSell(); };
+  $("sellCharacter").onchange = function () {
+    if (!SELL) { return; }
+    SELL.filter.character = $("sellCharacter").value;
+    repaintSell();
+  };
+  $("sellListing").onchange = function () {
+    if (!SELL) { return; }
+    SELL.filter.listing = $("sellListing").value;
+    repaintSell();
+  };
+
+  // 价格设置窗：有没保存的改动 ⇒ **点遮罩不关**（和「修改仓库」一个规矩）。
+  $("sellPriceBtn").onclick = function () { openSellPrices(); };
+  $("sellPriceClose").onclick = function () { closeSellPrices(); };
+  $("sellPriceReset").onclick = function () {
+    if (!SELL_PRICES) { return; }
+    SELL_PRICES.edit = JSON.parse(JSON.stringify(SELL_PRICES.base));
+    renderSellPrices();
+  };
+  $("sellPriceSave").onclick = function () { saveSellPrices(); };
+
+  // 数量窗：还没提交，取消不心疼 ⇒ ✕ / 取消 / Esc 都能走，遮罩不认
+  // （输入框就在正中间，点歪一下把数字丢了没道理）。
+  $("sellQtyClose").onclick = closeSellQty;
+  $("sellQtyCancel").onclick = closeSellQty;
+  $("sellQtyOk").onclick = confirmSellQty;
+  $("sellQtyAll").onclick = function () {
+    if (!SELL_QTY) { return; }
+    $("sellQtyInput").value = String(SELL_QTY.max);
+    syncSellQty("input");
+  };
+  $("sellQtyInput").oninput = function () { syncSellQty("input"); };
+  $("sellQtyRange").oninput = function () { syncSellQty("range"); };
+  $("sellQtyInput").onkeydown = function (event) {
+    if (event.key === "Enter") { event.preventDefault(); confirmSellQty(); }
+  };
+
   $("pickSearch").oninput = function () {
     PICKER.q = $("pickSearch").value.trim();
     paintPicker();
@@ -4319,6 +5085,11 @@ function wire() {
       return;
     }
     if (event.key === "Escape" && PICKER) { closePicker(); return; }
+    // 数量窗排在价格窗前面：它是从卖出页弹的，两个不会同时开，但万一
+    // 有人先开价格窗再点出售，上面那个该先关。
+    if (event.key === "Escape" && SELL_QTY) { closeSellQty(); return; }
+    // ★ 价格窗有没保存的改动 ⇒ `closeSellPrices()` 会先问一句再关。
+    if (event.key === "Escape" && SELL_PRICES) { closeSellPrices(); return; }
     // 只读那两张排最后：它们不会盖在选择器上面。
     if (event.key === "Escape" && LEVEL_MODAL) { closeLevelModal(); return; }
     if (event.key === "Escape" && HISTORY) { closeHistoryModal(); }

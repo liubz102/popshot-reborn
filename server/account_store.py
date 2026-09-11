@@ -35,6 +35,12 @@ import savecrypt
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PATH = os.path.join(SERVER_DIR, "data", "accounts.json")
 
+#: 金币的**物理上限**：`0x0600 gspRepMoney` 的金币那一格是 int32
+#: （`re/packet_api.md` §3.5，客户端 `[0x72e330]` 直接 `mov`）。
+#: 超过它 `struct.pack("<i", …)` 当场抛异常，把那条在线连接一起带走 ——
+#: 所以**往账号里加钱的路子都要钳到这儿**，别让它有机会溢出。
+MONEY_MAX = 2 ** 31 - 1
+
 NEW_ACCOUNT_DEFAULTS = {
     "password": "",
     "display_name": "",
@@ -1242,6 +1248,122 @@ class AccountStore:
             self._write_unlocked(data)
             return copy.deepcopy(account)
 
+    def sell_items(self, username, plan):
+        """卖出：**一把锁里** 扣物品 + 脱装备 + 加返还材料 + 加金币。
+
+        `plan` 是 `sellprice.bundle()` 算好的那张表，每行
+        `{"id", "count", "money", "materials"}`（`materials` 已经乘过数量）。
+        返回 ``(更新后的账号, 回执)``，回执 =
+        `{"money_before", "money_after", "gained", "capped", "sold", "returned",
+        "unequipped"}`。
+
+        ★ **为什么不拿现成的 `admin_update_account()` 拼**（它能同时改
+        `money` / `inventory` / `materials`，看着刚好够用）：它的 `money` 是
+        **绝对值**，调用方得在锁外先读一次余额再加 —— 读和写之间玩家领了个
+        礼物、打完一局、或者另一个管理员改了一笔，那份收入就被这一发悄悄
+        覆盖掉了。和 `compose_item()` 那段注释说的是同一件事：一次交易要么
+        全成，要么一个字节都不写，**余额只能在锁里算**。
+
+        ★ 校验在锁里**重做一遍**。调用方那一轮（`sellprice.bundle()` +
+        管理页的存量检查）是为了挑错误文案，不是并发保护 —— 同一个号
+        开着游戏又开着管理页，两边都会看到「东西还在」。真正说了算的是这里。
+
+        ★★ **查存量看「它现在在哪个桶里」，不按 `shopdata.stackable()` 猜**。
+        两件事是**独立**的：`stackable()` 说的是「数量有没有意义」，而
+        「住哪个桶」取决于是谁放进去的 —— `add_materials()`（闯关掉落 /
+        `claim_gift` 里 `is_material()` 为真的那些）进 `materials`，
+        `add_item()`（买、合成、领礼物、控制通道 `give`）一律进 `inventory`。
+        消耗品 / 礼包 / 钥匙这 **20 种 `stackable()` 为真、`is_material()`
+        为假**的东西因此住在 `inventory` 里，按 `stackable()` 去 `materials`
+        里找它们永远找不到。症状不是报错，是「页面上明明摆着、一按确定
+        就说东西不够」。
+
+        失败一律抛 `AccountError`，`code` 可以直接拿去查码表。
+        """
+        rows = []
+        for row in plan or ():
+            item_id = int(row["id"])
+            count = int(row.get("count") or 0)
+            if count <= 0:
+                raise AccountError("invalid_amount",
+                                   f"物品 {item_id} 的卖出数量要大于 0")
+            money = int(row.get("money") or 0)
+            if money < 0:
+                raise AccountError("invalid_amount",
+                                   f"物品 {item_id} 的卖价不能是负数")
+            materials = {}
+            for key, value in (row.get("materials") or {}).items():
+                materials[int(key)] = int(value)
+            rows.append((item_id, count, money, materials))
+        if not rows:
+            raise AccountError("empty_order", "待卖出清单是空的")
+        with self._lock:
+            data = self._read_unlocked()
+            account = self._account_unlocked(data, username)
+            inventory = _inventory_records(account)
+            materials = _material_records(account)
+            # ① 先把**全部**存量校验完再动手 —— 半单成交比整单失败难查得多。
+            short = []
+            for item_id, count, _money, _back in rows:
+                have = _owned_count(inventory, materials, item_id)
+                if have < count:
+                    short.append((item_id, count, have))
+            if short:
+                detail = "、".join(f"{i} 要卖 {n} 现有 {have}"
+                                  for i, n, have in short)
+                raise AccountError("not_enough_items", f"东西不够：{detail}")
+            # ② 扣。可堆叠的按数量减（减到 0 就把那一格删掉）；
+            #    不可堆叠的整格拿掉 —— 它只有「有 / 没有」（§28），
+            #    `sellprice.bundle()` 那边同样只按一件算钱，所以老存档里
+            #    躺着的 ×2（早先用控制通道 `give` 发过两次）既不会变成
+            #    两份收入，也不会留半件在仓库里。
+            sold, gained, returned = [], 0, {}
+            for item_id, count, money, back in rows:
+                if shopdata.stackable(item_id):
+                    _take_stack(inventory, materials, item_id, count)
+                else:
+                    inventory.pop(item_id, None)
+                    materials.pop(item_id, None)
+                gained += money
+                for material_id, n in back.items():
+                    returned[material_id] = returned.get(material_id, 0) + n
+                sold.append({"id": item_id, "count": count, "money": money})
+            # ③ 返还的材料进桶。★ 这些 id 来自配方，`validate_recipes` 保证它们
+            #    在物品表里；这里仍按 `ownable` 拦一道，坏配方不该把仓库写脏。
+            for material_id, n in returned.items():
+                if not shopdata.ownable(material_id):
+                    raise AccountError(
+                        "unknown_item",
+                        f"配方里的材料 {material_id} 不在客户端认得的物品表里")
+                materials[material_id] = materials.get(material_id, 0) + n
+            # ④ 卖掉的装备如果正穿在身上，一起摘掉 —— 「穿着的每一件都在仓库里」
+            #    是 `set_equipped()` 的不变式，破了它以后每次换装都会悄悄丢东西。
+            worn = list(equipped_items(account))
+            kept = [i for i in worn if i in inventory]
+            unequipped = [i for i in worn if i not in inventory]
+            # ⑤ 金币。★ 钳到 int32：`0x0600` 装不下比这更大的数（见 MONEY_MAX）。
+            before = player_money(account)
+            after = min(before + gained, MONEY_MAX)
+            account["materials"] = {str(i): materials[i]
+                                    for i in sorted(materials)}
+            account["inventory"] = {str(i): dict(inventory[i])
+                                    for i in sorted(inventory)}
+            if kept != worn:
+                account["equipped"] = kept
+            account["money"] = after
+            data["accounts"][username] = account
+            self._write_unlocked(data)
+            return copy.deepcopy(account), {
+                "money_before": before,
+                "money_after": after,
+                "gained": gained,
+                # 钳掉了多少 —— 回执里说一声，别让玩家以为服务端吞了钱。
+                "capped": before + gained - after,
+                "sold": sold,
+                "returned": dict(sorted(returned.items())),
+                "unequipped": unequipped,
+            }
+
     def set_equipped(self, username, item_ids):
         """整套换装，返回 ``(更新后的账号, 被丢掉的 id 列表)``。
 
@@ -2149,6 +2271,47 @@ def _material_records(account):
             continue
         records[item_id] = count
     return records
+
+
+def _owned_count(inventory, materials, item_id):
+    """两个桶**加起来**有几个这件东西（V0.3商店，卖出用）。
+
+    ★ **不按 `shopdata.stackable()` 猜它住在哪个桶**：那个判据说的是
+    「数量有没有意义」，和「谁把它放进去的」是两件独立的事 ——
+    `add_materials()` 进 `materials`，`add_item()` 进 `inventory`，
+    消耗品 / 礼包 / 钥匙那 20 种可堆叠的东西走的是后者。
+    正常存档里一件东西只会在一个桶里，相加就是它的存量；
+    手改过的存档两边都有过，相加也还是「一共有几个」。
+    """
+    return (materials.get(item_id, 0)
+            + inventory.get(item_id, {}).get("count", 0))
+
+
+def _take_stack(inventory, materials, item_id, count):
+    """从两个桶里一共扣掉 `count` 个（**先材料桶、再仓库桶**）。
+
+    调用方先用 `_owned_count()` 确认过够扣。数量减到 0 的格子整条删掉，
+    别留一个 `0` 在存档里 —— `_inventory_records` / `_material_records`
+    读的时候本来就会把 0 当成「没有」，留着只会让人以为还有。
+    """
+    take = min(count, materials.get(item_id, 0))
+    if take:
+        left = materials[item_id] - take
+        if left > 0:
+            materials[item_id] = left
+        else:
+            del materials[item_id]
+        count -= take
+    if count <= 0:
+        return
+    entry = inventory.get(item_id)
+    if entry is None:
+        return
+    left = entry.get("count", 0) - count
+    if left > 0:
+        entry["count"] = left
+    else:
+        del inventory[item_id]
 
 
 def material_counts(account):

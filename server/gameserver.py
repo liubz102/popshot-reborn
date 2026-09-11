@@ -6779,6 +6779,41 @@ class Conn:
         return self.broadcast_seat_equipped_list(
             self.lobby_room(), self.my_seat, reason, to_self=False)
 
+    def resync_seat_character(self, reason=""):
+        """座位上坐着的角色**和存档现在说的对不上**就换过来并广播，回是否换了。
+
+        ★★ 干的是这件事：**他正在用的那张商城角色卡没了**（管理页卖掉了 /
+        「修改仓库」里删掉了）—— 得当场变回泰尔，而不是等他重登
+        （用户 2026-09-12）。`player_character()` 读的时候本来就会把
+        「没有卡的商城角色」退回 0（D51），所以这里不用自己判「他还有没有
+        那张卡」：**把座位刷成存档现在说的那个角色**就够了，判据只有一个出处。
+
+        ★ 判据是**状态翻转**（铁律 10）：只有「座位上写的」和「存档现在说的」
+          真的不一样时才发。每次保存都发一遍的话，客户端会把 action 4 当成
+          一次换角色去播动效 —— 管理员改个金币，全房间的人物预览闪一下。
+
+        ★ 用 `0x0301` action 4（换角色）而不是 action 3（重建）：中下那个 3D
+          预览就是靠 action 4 换模型的（§103），重建那一档不换模型。
+          `broadcast_seat_slot()` 发给**房里每一个人，含自己** —— 他自己那台
+          客户端也还停在旧角色上。
+        """
+        room = self.lobby_room()
+        if room is None:
+            return False
+        seat_index = room.seat_index_of(self)
+        if seat_index is None:
+            return False
+        seat = room.seats[seat_index]
+        want = player_character(self.account)
+        if int(getattr(seat, "character_id", 0) or 0) == int(want):
+            return False
+        self.log(f"   座位 {seat_index} 的角色 {seat.character_id} 已经不能用了"
+                 f"（卡没了），换回 {want}{reason}")
+        self.refresh_seat()
+        self.broadcast_seat_slot(room, seat_index, SEAT_ACTION_CHANGE_CHARACTER,
+                                 reason=f"：角色卡没了，换回 {want}{reason}")
+        return True
+
     def broadcast_seat_slot(self, room, seat_index, action, reason):
         """把某个座位**当前的服务端快照**用 `0x0301` 发给房里每一个人（含自己）。
 

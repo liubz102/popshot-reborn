@@ -1204,3 +1204,269 @@ ul.help li.ro-note { color: var(--crimson); font-weight: 700; }
 /* 锁住的开关：拨轨照旧（开 / 关一眼看得出），只是点不动了。 */
 .readonly .toggle.locked { cursor: default; }
 .readonly .toggle.locked .track { filter: grayscale(.35); }
+
+/* ==================================================================
+   装备卖出（用户 2026-09-12）
+
+   左右分区：左边购物车、右边仓库，**两边各自滚**。整块跟着 `.fit-panel`
+   那套「面板撑满、只有列表滚」走 —— 所以每一层都要 `min-height: 0`
+   （flex 项默认最小高度是内容高度，漏一层滚动条就跑到外面那层去了）。
+   ================================================================== */
+.sell-split {
+  flex: 1 1 auto; min-height: 0;
+  display: grid; gap: 12px;
+  /* ★★ 左边**钉死一个宽度**、右边吃掉剩下的（用户 2026-09-12 第三轮，
+     改自 `5fr / 7fr`）。判据是右栏那排**大分类标签必须一行放得下** ——
+     八个标签实测要 705 px（件数上三位数还会再宽一点），`5fr` 只分到 694，
+     必折行。左边是一张购物清单，宽度需求是固定的（图标 + 名字 + ✕），
+     不该跟着窗口一起长 ⇒ 多出来的宽度全给右边。 */
+  grid-template-columns: minmax(0, 380px) minmax(0, 1fr);
+  /* `#sellLock` 的定位基准（★ 它只盖这一块，不盖工具条，见下）。 */
+  position: relative;
+}
+/* 窗口一窄，**先从左边那栏身上要地**（右边那排标签才是宽度的硬需求）。 */
+@media (max-width: 1240px) {
+  .sell-split { grid-template-columns: minmax(0, 300px) minmax(0, 1fr); }
+}
+/* 再窄到连右栏都塞不下一行标签时，横着分反而两边都不够用 —— 改上下排。 */
+@media (max-width: 1000px) {
+  .sell-split { grid-template-columns: minmax(0, 1fr); }
+}
+.sell-side {
+  display: flex; flex-direction: column; min-height: 0;
+  background: var(--paper-2); border: 2px solid var(--line);
+  border-radius: 10px; padding: 10px;
+}
+/* 列表**以外**的都按自己的高度占位（和 `main.fit` 那套同一个道理）。 */
+.sell-side > .toolbar, .sell-side > .cat-tabs, .sell-side > .sell-head,
+.sell-side > .sell-total { flex: 0 0 auto; }
+.sell-side > .toolbar { margin-bottom: 8px; }
+/* ★★ `scrollbar-gutter: stable` 不是为了好看，是**判据**（用户 2026-09-12 第六轮）：
+   滚动条一出现就吃掉 15 px，`auto-fill` 的列数是照剩下的宽度算的 ⇒
+   「东西少的时候两列，一多出滚动条就变成一列的大格子」。实测左栏内宽 356，
+   滚动条一来只剩 337，而两列正好要 338 —— **差 1 px 就翻**。
+   预留住那条槽，列数就和「这一刻有没有滚动条」无关了。
+   （槽本身就是右边那道空隙，所以不再另写 `padding-right`。）
+   ★ 老浏览器不认这个属性 ⇒ 下面两个 `minmax` 的最小值都留了一列的余量，
+     不靠这一条也翻不了。 */
+.sell-scroll {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  scrollbar-gutter: stable; padding-right: 2px;
+}
+.sell-scroll > .own-grid { margin-bottom: 0; }
+/* 小标题：和面板标题栏同一身衣服，但矮一号 —— 它是分区标题，不是页标题。 */
+.sell-head {
+  font-size: 13px; font-weight: 700; color: var(--cocoa);
+  padding-bottom: 6px; margin-bottom: 8px;
+  border-bottom: 2px dashed var(--line);
+}
+/* 「将返还的材料」那一行小标题：比分区标题再矮一号，不画分隔线 ——
+   它是金额栏的附注，不是第三个分区。 */
+.sell-sub-head {
+  font-size: 12px; font-weight: 700; color: var(--cocoa-soft);
+  margin-bottom: 5px;
+}
+/* 「这一单能拿到什么」整块：金额两行 +（有的话）将返还的材料。
+   ★ 这是这一页最该先看到的东西 ⇒ 底色用卡片白 + 琥珀边，从灰底里跳出来。
+   ★★ **两半共一个边框**（用户 2026-09-12 第五轮）：分成两块时，下面那块
+   看着像**待卖出清单的第一格**，可它俩的意思正好相反（一个要没、一个要来）。 */
+.sell-total {
+  background: var(--card); border: 2px solid var(--amber-soft);
+  border-radius: 9px; padding: 8px 10px; margin-bottom: 10px;
+}
+.sell-sum-row {
+  display: flex; align-items: baseline; gap: 8px; line-height: 1.7;
+}
+.sell-sum-row .lab { font-size: 12px; color: var(--cocoa-soft); }
+.sell-sum-row b { margin-left: auto; font-size: 16px; color: var(--gold-edge); }
+.sell-warn { font-size: 12px; color: var(--crimson); font-weight: 700; }
+.sell-note { font-size: 11px; color: var(--cocoa-soft); line-height: 1.5; }
+/* 「将返还的材料」和金额两行之间只隔一条虚线 —— 同一块里的两半，
+   但**退的材料不算在上面那个金额里**，得看得出来是两笔账。
+   ★ 退的种类可能很多（一车合成装备）—— 封一个高度让它自己滚，
+     别把下面那张清单顶出画面。 */
+.sell-return {
+  margin-top: 8px; padding-top: 7px;
+  border-top: 2px dashed var(--amber-soft);
+}
+/* 三排整整好（chip 29 + gap 6）；再多才滚，滚的时候第四排露半截当提示。 */
+.sell-return .chips { max-height: 99px; }
+.chip .qty { color: var(--gold-edge); font-weight: 800; }
+
+/* ★★ 格子照「修改仓库」那一档的小格子来（用户 2026-09-12 第三轮）。
+   能收窄是因为右栏那两列文字（余量 / 单价）都挪走了 —— 单价本来就在
+   浮窗里写着，卡片上再写一遍只会把名字挤没。 */
+#sellOwnedGrid { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+/* 购物车那一栏只有 380 宽，格子跟着小一号（图标 + 名字 + ✕，没有按钮）。
+   ★ 150 不是 165：两列要 308，而左栏出了滚动条之后还剩 339 ——
+     165 那会儿两列要 338，**差 1 px 就掉回一列**（见 `.sell-scroll`）。
+     留 30 px 余量，以后有人动左栏宽度也不会正好卡在翻转点上。 */
+#sellCartGrid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+/* 卡片右边那颗「出售」：和数字框一样不许被压扁。 */
+.own .sell-add { flex: 0 0 auto; white-space: nowrap; }
+/* 第二行小字里那几段（#id / 余量 / 小计）用点隔开，别各写各的间距。 */
+.own .meta .sep { margin: 0 4px; opacity: .5; }
+.own .meta .gain { color: var(--gold-edge); font-weight: 700; }
+
+/* 遮罩：管理员没有同名游戏账号时盖住左右分区。理由由服务端给。
+   ★★ **只盖 `.sell-split`，不盖工具条**（用户 2026-09-12 第二轮）：
+   没有同名游戏账号的管理员照样要能点「⚙ 卖出价格设置」—— 改卖价是运营
+   的活儿，和「他自己有没有号可卖」是两回事。定位基准因此钉在
+   `.sell-split` 上（不是 `.panel-body`，更不是 `.panel` —— 那样连标题栏
+   都会被盖掉，人会分不清是哪一页出的问题）。 */
+.sell-lock {
+  position: absolute; inset: 0; border-radius: 9px;
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+  background: rgba(253, 246, 232, .92);
+}
+.sell-lock-box {
+  max-width: 620px; text-align: center; line-height: 1.8;
+  font-size: 14px; color: var(--cocoa-ink);
+  background: var(--card); border: 3px solid var(--amber-dark);
+  border-radius: 12px; padding: 22px 26px;
+}
+
+/* -------------------------------------------------- 卖出价格设置弹窗 */
+/* ⚠ 要盖掉 `.modal .panel { height: min(640px,100%) }`（两个类），选择器
+   本身也得带够类 —— `.modal .panel.sell-price-panel` 是 (0,3,0)。
+   高度**按内容长**、只封一个顶：七个框两列排完实测正文 611 px，
+   加上标题栏和工具条约 740 ⇒ 封在 820，**平时一点滚动条都不该有**
+   （用户 2026-09-12 第三轮）。窗口本身比这矮时才轮到 `100%` 生效。 */
+.modal .panel.sell-price-panel {
+  height: auto; max-height: min(820px, 100%); width: min(880px, 100%);
+}
+/* ★ 工具条钉在最上面、**滚动时不动**：`panel-body` 自己不滚（默认那条
+   `.modal .panel-body { overflow: auto }` 在这儿要关掉），真正滚的是它
+   下面那层 `.sell-price-scroll`。 */
+.sell-price-panel .panel-body {
+  overflow: hidden; display: flex; flex-direction: column; min-height: 0;
+}
+.sell-price-panel .panel-body > .toolbar { flex: 0 0 auto; margin-bottom: 12px; }
+/* 工具条左半边只有一句说明 ⇒ 收掉 `.cfg-bar .filters` 那句 `flex: 1 1 320px`，
+   免得窄窗口下它把按钮组挤下去折成两行。 */
+.sell-price-panel .toolbar .filters { flex: 0 1 auto; min-width: 0; }
+/* 「此页仅管理员……」：说的是**可见范围**，不是操作提示 ⇒ 走次要说明字色，
+   别跟右边那组按钮抢注意力。 */
+.sell-price-who { font-size: 12px; color: var(--cocoa-soft); }
+/* 同 `.sell-scroll`：预留滚动条那条槽，两列不会因为「这一刻滚不滚」而变。 */
+.sell-price-scroll {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  scrollbar-gutter: stable; padding-right: 2px;
+}
+/* 三组：材料 / 装备 / 其他。★ 「其他」**和装备平级**（用户 2026-09-12
+   第三轮）—— 它是「既没上架也没有配方」的兜底价，不是装备的一种。 */
+.sell-price-group + .sell-price-group { margin-top: 12px; }
+/* ★ 「装备」和「其他」摆**同一行左右并排**（用户 2026-09-12 第七轮）：
+   两组各只有一个数，上下摞着白占一屏。窄到放不下时 `auto-fill` 自己
+   掉回上下排。 */
+.sell-price-pair {
+  margin-top: 12px;
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+}
+/* 并排的那两组互为兄弟，上面那条 `+` 的 12px 会把右边那组往下推半格 ——
+   同一行里不要它。 */
+.sell-price-pair > .sell-price-group + .sell-price-group { margin-top: 0; }
+/* 弹窗里的分组标题比分区标题再矮一点 —— 三组标题各省几像素，
+   合起来就是「要不要滚动条」的差别。 */
+.sell-price-group > .sell-head { padding-bottom: 4px; margin-bottom: 6px; }
+.sell-price-grid {
+  display: grid; gap: 8px 12px;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+}
+.sell-price-row {
+  padding: 7px 10px; background: var(--card);
+  border: 2px solid var(--line); border-radius: 9px;
+}
+/* 「装备」「其他」各只有一个数 —— 让它横跨两列，别在右边留一个空格子。
+   顺带底下那行说明能排成一行，整个弹窗又矮了一截。 */
+.sell-price-row:only-child { grid-column: 1 / -1; }
+/* ⚠ `.field` 默认是**竖排**（`flex-direction: column`，给配置页那些窄格子用的）
+   —— 这里标签在左、输入框在右，所以得把方向掰回来，光写 `display:flex` 不够
+   （实测：标签和输入框会上下叠着，底下那行名字的缩进也就对不上了）。 */
+.sell-price-row .field { flex-direction: row; align-items: center; gap: 8px; }
+.sell-price-row .field > .lab {
+  flex: 1 1 auto; min-width: 0; font-size: 13px; font-weight: 600;
+  color: var(--cocoa-ink); white-space: normal;
+}
+/* ⚠ 同理要盖掉 `.field input[type=number] { width: 66px }`（两个选择器
+   都是 (0,2,0)，靠写在后面赢）—— 66 px 装不下五位数的卖价。 */
+.sell-price-row .field input[type=number] {
+  flex: 0 0 auto; width: 86px; text-align: center;
+}
+/* 玩家只读时那几个框：底色压成次级底、字**不变淡**（浏览器默认那种灰字
+   在这身米黄配色里几乎读不出来，而这一页的价钱正是他要看的东西），
+   光标改成默认箭头。★ 和配置页 `.readonly #cfgList input:disabled` 同一身
+   衣服 —— 「锁住的输入框」全页只该有一种样子。 */
+.sell-price-row .field input[type=number]:disabled {
+  background: var(--paper-2); color: var(--cocoa-ink);
+  border-style: dashed; cursor: default; opacity: 1;
+}
+.sell-price-row .suffix {
+  flex: 0 0 auto; font-size: 12px; color: var(--cocoa-soft); white-space: nowrap;
+}
+/* 每一格底下列出属于它的物品名 —— 管理员照着核对分类对不对。
+   ★ 封到两行（全文在 `title` 里）：卡片那一类有 17 个名字，任它长的话
+     这一格能撑到六行，把两列的高度全带歪。 */
+.sell-price-names {
+  margin-top: 4px; font-size: 11px; line-height: 1.5; color: var(--cocoa-soft);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* -------------------------------------------------- 卖出数量小弹窗 */
+/* ⚠⚠ 选择器必须写成 `.modal .panel.sell-qty-panel`（三个类），不能只写
+   `.sell-qty-panel` —— 要盖掉的那两条是 `.modal .panel { width: min(940px,…) }`
+   和 `.modal .panel { height: min(640px,…) }`，**两个类比一个类更specific**，
+   跟谁写在后面无关。只写一个类的话，一个数字输入框会撑成 940×640
+   （实测就是这样），和确认框当初那个坑一模一样。 */
+.modal .panel.sell-qty-panel { height: auto; width: min(430px, 100%); }
+/* 按钮靠右：确定在最右边，和别处的「取消 / 确定」一个手感。 */
+.sell-qty-panel .panel-foot { justify-content: flex-end; }
+.sell-qty-panel .row { display: flex; align-items: flex-end; gap: 10px; }
+.sell-qty-panel .field { flex: 1 1 auto; }
+.sell-qty-panel .field input[type=number] { width: 100%; }
+.sell-qty-sum {
+  margin-top: 12px; font-size: 13px; font-weight: 700; color: var(--gold-edge);
+}
+/* 数量拖动条（用户 2026-09-12）。两端那两个小数字是刻度（1 / 最多几个），
+   免得人要去上面那句标签里找上限。 */
+.sell-qty-slider {
+  display: flex; align-items: center; gap: 9px; margin-top: 12px;
+}
+.sell-qty-slider .end {
+  flex: 0 0 auto; min-width: 22px; text-align: center;
+  font-size: 11px; font-weight: 700; color: var(--cocoa-soft);
+}
+/* ★ 这一页原来一个 `input[type=range]` 都没有 ⇒ 这套皮是新写的。
+   浏览器默认那条是**蓝**的 —— 全页唯一一点冷色，和当初那颗绿开关
+   （见文件头 `--moss` 那段）栽的是同一个跟头，所以轨道走米黄 + 琥珀边、
+   拨钮走金黄，和 `.btn-primary` 一个身衣服。 */
+.sell-qty-slider input[type=range] {
+  flex: 1 1 auto; min-width: 0; height: 22px; margin: 0;
+  -webkit-appearance: none; appearance: none;
+  background: transparent; cursor: pointer;
+}
+.sell-qty-slider input[type=range]::-webkit-slider-runnable-track {
+  height: 10px; border-radius: 6px;
+  background: linear-gradient(#F5E7CC, #E8D5B0);
+  border: 2px solid var(--amber-dark);
+}
+.sell-qty-slider input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  /* `margin-top` = (轨道高 14 − 拨钮高 20) / 2，少了它拨钮会贴着轨道顶。 */
+  width: 20px; height: 20px; margin-top: -5px; border-radius: 50%;
+  background: linear-gradient(#FFDD79, var(--gold));
+  border: 2px solid var(--gold-edge);
+}
+.sell-qty-slider input[type=range]::-moz-range-track {
+  height: 10px; border-radius: 6px;
+  background: linear-gradient(#F5E7CC, #E8D5B0);
+  border: 2px solid var(--amber-dark);
+}
+.sell-qty-slider input[type=range]::-moz-range-thumb {
+  width: 18px; height: 18px; border-radius: 50%;
+  background: linear-gradient(#FFDD79, var(--gold));
+  border: 2px solid var(--gold-edge);
+}
+

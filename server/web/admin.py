@@ -30,6 +30,10 @@
     POST /admin/api/reward/send       {players, items, exp, money, message}  ★系统
     GET  /admin/api/reward/history    发奖记录：{ok, records, max}           ★系统
     POST /admin/api/reward/history/clear  清空发奖记录                       ★系统
+    GET  /admin/api/sell/state        装备卖出：{locked, reason, player, quotes, prices} ☆三档
+    POST /admin/api/sell              {items:[{id,count}]} 一次性卖掉         ☆三档
+    GET  /admin/api/sell/prices       卖价表 + 每个材料小类装着哪些东西       ☆三档
+    POST /admin/api/sell/prices       {prices}  存卖价表                      ★运营
     GET  /admin/api/backups           数据备份：{settings, status, backups, online, playing} ★系统
     POST /admin/api/backups/settings  {enabled, time, keep_days} 写回 server.config，即刻生效 ★系统
     POST /admin/api/backups/create    {label}  立刻备份一份（手动）              ★系统
@@ -44,10 +48,16 @@
 | **运营** `operator` | 同上 | 只有 `CONFIG_FILES` 那几个配置页 | 那几页 |
 | **玩家** `player` | **游戏账号**那份（`accounts`）| 同上，**只读** | 一个字都不能改 |
 
-上面标了 ★系统 的接口走 `_require_system_admin()`，写配置那一发走
+上面标了 ★系统 的接口走 `_require_system_admin()`，写配置和存卖价那两发走
 `_require_editor()`。**前台把标签藏起来、把输入框锁上只是画面**，真正的门
 在这两个函数里 —— `test_web_admin` 有两条用例分别拿运营和玩家身份逐个路径
 打一遍，确认该 403 的全是 403。
+
+★★ 标了 ☆三档 的是「装备卖出」那一页（用户 2026-09-12）——
+**整个 `/admin` 里唯一一处普通玩家也能写东西的地方**。上表那条
+「玩家一个字都不能改」到此要读成「**除了卖自己的东西**」。
+越权面只有一个：「卖谁的」。它由**构造**堵死 —— `_sell_target()` 只认
+会话令牌，`POST /admin/api/sell` 连 `name` 这个字段都不收。
 
 ★ **会话记着「你是拿哪一种口令进来的」**（`AdminSessions` 的 `kind`）：
 拿玩家口令进来的令牌**永远**是只读的，哪怕之后有人在管理员表里建了一个
@@ -125,6 +135,7 @@ import cfgmerge
 import databackup
 import eventlog
 import gifthistory
+import sellprice
 import shop
 import shopcfg
 import shopdata
@@ -533,6 +544,32 @@ def _online_usernames():
             if conn.account_name}
 
 
+def _in_match(username):
+    """这个账号**现在是不是在打游戏**（「装备卖出」拿它挡人，用户 2026-09-12）。
+
+    判据用现成的 `gameserver.conn_is_playing()` —— 它看的是大厅那份房间状态：
+    所有人一起进图时 `on_start_game_packet` 把房间标成
+    `SESSION_STATUS_PLAYING`，结算回房间又标回待机。**是状态翻转，不是计时器**
+    （铁律 10），而且口径正好是用户要的那句：「坐在待机中的房间里等人算待机」
+    ⇒ 大厅 / 房间里卖得动，一进图就卖不动。
+
+    ★ 为什么要挡：卖出会把穿着的装备脱下来，而战斗里那份加成是开局时
+    `0x030b` 一次性喂进 `[GameSession + 0x250 + 座位*4]` 的（§1）——
+    打到一半改它，只会让各家客户端算出不一样的伤害。
+
+    拿不到 `gameserver`（单跑注册页 / 单元测试）就当他不在打 —— 这种组合下
+    本来就没有对局。
+    """
+    try:
+        import gameserver
+    except ImportError:
+        return False
+    for conn in gameserver.all_conns():
+        if conn.account_name == username and gameserver.conn_is_playing(conn):
+            return True
+    return False
+
+
 #: 玩家仓库那条「在线」筛选的三档（用户 2026-09-10，D75）。前台那个下拉照
 #: 这三个值发，`test_web_admin` 拿它当清单逐档打一遍。
 ONLINE_FILTERS = ("all", "on", "off")
@@ -625,6 +662,15 @@ def _push_account(username):
     `[0x72e338]`，所以改完等级不用重登），`0x0501`→`0x0601` 刷仓库，
     `0x0604` 刷穿着，`0x030b` 是装备加成的唯一来源（§1）。
 
+    ★★ **最后那一发广播是 2026-09-12 补的，修的是一个既有 bug。**
+    前面四发**都只发给他自己**，可 `0x030b` 是**按座位**的（§63 / D69）：
+    房里另外五个人手里那份 `[LobbyStage + 座位*4 + 0x250]` 还是旧的，
+    外观和战斗加成**一起**过期（客户端两件事读的是同一格）。
+    ⇒ 在此之前，管理员给一个**正坐在房间里**的玩家开 / 脱一件装备，
+    只有他自己屏幕上变了，同房的人一点没变；「发送奖励」领取后、
+    「回滚存档」之后同理。`broadcast_slot_equipped_list()` 当初（§63）挂了
+    六处，偏偏漏了管理页这条路。
+
     不在线就什么都不做 —— 下次登录时本来就是从存档读的。
     """
     try:
@@ -641,6 +687,17 @@ def _push_account(username):
             conn.send_slot_equipped_list(reason="（管理页改了资料）")
             conn.send_rep_inventory(reason="（管理页改了资料）")
             conn.send_rep_equipped_list(reason="（管理页改了资料）")
+            # ★ 和穿脱 `0x0702` 走同一个出口，`to_self=False` ⇒ 不会打乱
+            #   上面那一串的顺序。不在房间里时 `broadcast()` 直接回 0，
+            #   某个目标 socket 断了它自己吞掉并记一行日志。
+            conn.broadcast_slot_equipped_list(reason="（管理页改了资料）")
+            # ★★ 第六发（2026-09-12，用户点的）：**他正在用的那张商城角色卡
+            #   没了就当场换回泰尔**。卖出和「修改仓库」都会让角色卡消失，
+            #   而上面那五发一个都不管座位上坐着谁 —— 症状是人物预览还是
+            #   那个已经不属于他的角色，要等他重登才变回来。
+            #   只在「座位上写的」和「存档现在说的」对不上时才发（状态翻转，
+            #   铁律 10），不在房间里直接回 False。
+            conn.resync_seat_character(reason="（管理页改了资料）")
         except (OSError, AttributeError):
             # socket 刚断 / 还没登录完 —— 不能让它把保存这件事带崩，
             # 存档已经落盘了，玩家重登一样能看到。
@@ -1023,6 +1080,12 @@ class AdminRoutes:
         if path == "/admin/api/reward/history":
             self._admin_reward_history()
             return True
+        if path == "/admin/api/sell/prices":
+            self._admin_sell_prices_get()
+            return True
+        if path == "/admin/api/sell/state":
+            self._admin_sell_state()
+            return True
         if path == "/admin/api/backups":
             self._admin_backups_get()
             return True
@@ -1053,6 +1116,12 @@ class AdminRoutes:
             return True
         if path == "/admin/api/reward/history/clear":
             self._admin_reward_history_clear()
+            return True
+        if path == "/admin/api/sell/prices":
+            self._admin_sell_prices_post(data)
+            return True
+        if path == "/admin/api/sell":
+            self._admin_sell(data)
             return True
         if path.startswith("/admin/api/backups/"):
             self._admin_backup(path.rsplit("/", 1)[-1], data)
@@ -1880,3 +1949,222 @@ class AdminRoutes:
         eventlog.online(f"[admin] {admin!r} 清空发奖记录，删掉 {count} 条")
         self._reply(True, f"已清空发送记录（{count} 条）" if count else "本来就没有记录",
                     count=count)
+
+    # -------------------------------------------------------- 装备卖出（2026-09-12）
+    def _sell_target(self):
+        """「装备卖出」这一页操作的是**哪个游戏账号**，回 `(用户名, 账号, 锁住的理由)`。
+
+        ★★ **只认会话令牌，不认请求体。** 这一页是整个 `/admin` 里
+        **唯一一处普通玩家也能写东西**的地方（D74 那条「玩家档的令牌永远
+        只读」到此改成「永远只能写**自己**那个号」），越权面就这一个 ——
+        所以「卖谁的东西」由**构造**决定，接口连 `name` 这个字段都不收。
+        光靠「记得校验一下」是守不住的：哪天有人顺手加一个
+        `data.get("name")` 就全漏了。
+
+        两条来路：
+
+        * 玩家档（`ROLE_PLAYER`）—— 令牌里那个名字**本来就是**游戏账号名
+          （登录时拿游戏口令验过，见 `_verify_login`）；
+        * 管理员档 —— 拿管理员名去 `accounts` 里找**同名**游戏账号
+          （用户 2026-09-12 定的口径）。管理员名和玩家名在同一个命名空间里，
+          所以这一步就是「他自己那个号」。找不到 ⇒ 整页锁定。
+
+        理由非空 = 页面锁住，什么都不给操作。
+        """
+        name, role = self._admin_identity()
+        if name is None:                     # 调用方已经 `_require_admin()` 过了
+            return None, None, "请先登录管理页"
+        _found, account = self.accounts.get_account(name)
+        if account is None:
+            if role == ROLE_PLAYER:
+                # 登录之后号被删了 / 被改名了。极少见，但不能让它变成 500。
+                return None, None, f"游戏账号 {name!r} 已经不在了，请重新登录"
+            return None, None, (
+                f"当前登录的管理员账号 {name!r} 没有同名的游戏账号，"
+                "这一页没有可操作的仓库。"
+                "要用这一页，请用你自己的游戏账号登录管理页。")
+        return name, account, ""
+
+    def _sell_quotes(self, view, prices):
+        """这个玩家**手上这些东西**各卖多少钱 —— 前台画浮窗和小计都用它。
+
+        只算他有的那几件（不是整张 808 件的表）：卖出页上除了自己仓库里的
+        东西，别的一件都画不出来，多发的部分纯属浪费带宽。
+        """
+        shop_table, recipes = sellprice.tables(log=eventlog.online)
+        out = {}
+        for row in list(view["materials"]) + list(view["inventory"]):
+            item_id = int(row["id"])
+            if item_id not in out:
+                out[item_id] = sellprice.quote(item_id, prices,
+                                               shop_table, recipes)
+        return out
+
+    def _sell_state_payload(self):
+        """「装备卖出」这一页要画的全部东西 —— `state` 和**卖出回执**共用。
+
+        ★★ **两处必须回同一组键，所以只能有这一个出处。** 前台那个
+        `adoptSellState()` 是一次**整页状态的赋值**：少回一个键，那个键
+        当场变成默认值。回执只带 `player` / `quotes` 的话，
+        `can_edit_prices` 会被覆盖成 false —— 症状是管理员卖完一单，
+        「⚙ 卖出价格设置」从工具条上消失，刷新一下又回来了（2026-09-12
+        第三轮发现）。写成「回执那边记得补上那几个键」是守不住的，
+        每加一个字段都要记一次；共用一个构造函数才是判据。
+        `test_the_receipt_carries_the_whole_page_state` 钉着这条。
+        """
+        _name, role = self._admin_identity()
+        prices = sellprice.load(log=eventlog.online)
+        username, account, locked = self._sell_target()
+        payload = {
+            "ok": True,
+            "locked": bool(locked),
+            "reason": locked,
+            "can_edit_prices": role != ROLE_PLAYER,
+            "money_max": account_store.MONEY_MAX,
+            "prices": prices,
+        }
+        if not locked:
+            view = _player_view(username, account)
+            payload["player"] = view
+            payload["quotes"] = self._sell_quotes(view, prices)
+            # ★ 每次进页面 / 刷新都现问一次「他在不在打游戏」。这只是**画面**
+            #   上的提前告知，真正拦人的是 `_admin_sell()` 里那一次 ——
+            #   页面开着的这段时间他完全可能开一局。
+            payload["in_match"] = _in_match(username)
+        return payload
+
+    def _admin_sell_state(self):
+        """`GET /admin/api/sell/state` —— 这一页要画的全部东西。
+
+        **三档身份都进得来**（只挂 `_require_admin`）：玩家卖自己的，
+        管理员卖他自己那个同名游戏账号的。
+        """
+        if self._require_admin() is None:
+            return
+        self._send_json(self._sell_state_payload())
+
+    def _admin_sell(self, data):
+        """`POST /admin/api/sell` —— 一次性把清单里的东西卖掉。
+
+        载荷只有 `{"items": [{"id", "count"}]}`。★ **没有 `name`** ——
+        卖谁的东西由令牌决定（见 `_sell_target`）。
+        """
+        if self._require_admin() is None:
+            return
+        username, _account, locked = self._sell_target()
+        if locked:
+            self._reply(False, locked, status=403)
+            return
+        # ★ 这里**必须再查一次**：页面打开到他点「确定卖出」之间隔着任意长的
+        #   时间，完全可能已经开了一局。`state` 里那个 `in_match` 只是画面。
+        if _in_match(username):
+            self._reply(False, "游戏过程中无法卖出，请完成这一局游戏后再试",
+                        status=409)
+            return
+        try:
+            order = sellprice.bundle(data.get("items"), log=eventlog.online)
+        except ValueError as error:
+            self._reply(False, str(error), status=400)
+            return
+        try:
+            # ★ 更新后的账号这里用不上：回执要的那份 `player` 由
+            #   `_sell_state_payload()` 在写盘之后**重新读一遍**取。
+            _account, receipt = self.accounts.sell_items(username,
+                                                         order["plan"])
+        except account_store.AccountError as error:
+            # 存量在锁里重校验过一遍 —— 走到这儿多半是「他刚在游戏里把东西
+            # 用掉了」。原文里点了名，直接给他看。
+            self._reply(False, str(error), status=400,
+                        code=getattr(error, "code", ""))
+            return
+        pushed = _push_account(username)
+        sold_text = "、".join(
+            "%s×%d" % (shopcfg.item_name(row["id"]), row["count"])
+            for row in receipt["sold"])
+        back_text = "、".join(
+            "%s×%d" % (shopcfg.item_name(item_id), count)
+            for item_id, count in receipt["returned"].items())
+        eventlog.online(
+            "[sell] %r 卖出 %s，得 %d 金币（%d -> %d）%s%s" % (
+                username, sold_text or "（空）", receipt["gained"],
+                receipt["money_before"], receipt["money_after"],
+                "，返还 " + back_text if back_text else "",
+                "，已推给在线客户端" if pushed else "（不在线）"))
+        parts = ["卖出 %d 件，得 %d 金币" % (len(receipt["sold"]),
+                                             receipt["gained"])]
+        if back_text:
+            parts.append("返还 " + back_text)
+        if receipt["unequipped"]:
+            parts.append("顺带脱下了 %d 件正穿着的装备"
+                         % len(receipt["unequipped"]))
+        if receipt["capped"]:
+            parts.append("金币已到上限，有 %d 没能入账" % receipt["capped"])
+        # ★★ 回执 = **整页状态** + 这一单的账（见 `_sell_state_payload`）。
+        #    前台收到它就整页重画，所以少回一个键 = 那个键当场变成默认值。
+        payload = self._sell_state_payload()
+        payload.update({
+            "message": "；".join(parts),
+            "gained": receipt["gained"],
+            "money_before": receipt["money_before"],
+            "money_after": receipt["money_after"],
+            "capped": receipt["capped"],
+            "returned": [{"id": item_id, "count": count}
+                         for item_id, count in receipt["returned"].items()],
+            "unequipped": receipt["unequipped"],
+            "pushed": pushed,
+        })
+        self._send_json(payload)
+
+    def _admin_sell_prices_get(self):
+        """`GET /admin/api/sell/prices` —— 价格表 + 每个小类都装着哪些材料。
+
+        ★ 那张 `groups` 是给弹窗把**物品名**列在每个输入框下面用的：
+        管理员照着一眼就能看见「不死鸟之羽 / 之泪」归在特殊材料档里，
+        而不是按 id 开头自己猜（那正好会猜错，见 `sellprice.material_class`）。
+
+        ★★ **三档身份都读得到**（用户 2026-09-12：玩家只读）。谁能改由
+        `can_edit` 这一格说 —— 它和 `_admin_sell_prices_post()` 那道
+        `_require_editor()` 是**同一条判据的两面**：前者决定画不画那两颗
+        按钮，后者才是门。放在这一发里回，是为了让弹窗**自带**答案，
+        不用去借别的接口的字段（借了就有「那边改口这边忘了跟」的一天）。
+        """
+        if self._require_admin() is None:
+            return
+        _name, role = self._admin_identity()
+        self._send_json({
+            "ok": True,
+            "can_edit": role != ROLE_PLAYER,
+            "prices": sellprice.load(log=eventlog.online),
+            "defaults": dict(sellprice.DEFAULTS),
+            "classes": list(sellprice.MATERIAL_CLASSES),
+            "labels": dict(sellprice.MATERIAL_CLASS_ZH),
+            "groups": sellprice.material_groups(),
+            "percent_max": sellprice.PERCENT_MAX,
+        })
+
+    def _admin_sell_prices_post(self, data):
+        """`POST /admin/api/sell/prices` —— 存价格表。★ 系统管理员 / 运营都能改。
+
+        和那五份运营配置同一档（用户 2026-09-12）：卖价本质上就是运营数值。
+        **`_require_editor()` 才是门** —— 前台不给玩家画那个按钮只是画面。
+
+        ★★ **空表 / 没有 `prices` 一律拒收，不能当成「保存」。**
+        `sellprice.validate()` 缺项按 `DEFAULTS` 补齐 —— 那是给**读盘**用的
+        （铁律 11：加字段只能走「读盘时按默认值补齐」）。放到写盘这一侧就
+        反了：一发 `{"prices": {}}` 会被补成整张出厂表**静悄悄写下去**，
+        运营调了半天的数一次没了，而回执还写着「卖出价格已保存」。
+        """
+        admin = self._require_editor()
+        if admin is None:
+            return
+        wanted = data.get("prices")
+        if not isinstance(wanted, dict) or not wanted:
+            self._reply(False, "载荷里要有一张非空的 prices 表", status=400)
+            return
+        try:
+            saved = sellprice.save(wanted, log=eventlog.online)
+        except ValueError as error:
+            self._reply(False, str(error), status=400)
+            return
+        eventlog.online(f"[admin] {admin!r} 改了卖出价格")
+        self._reply(True, "卖出价格已保存", prices=saved)

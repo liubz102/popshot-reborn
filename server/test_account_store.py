@@ -63,6 +63,10 @@ TOP_ARMOR = 1010015          # 上衣（part_flag 1），和武器不抢槽
 STOCK_ONLY = 1510001         # ★ 只有 `[Stock-]` 的期限售卖形态，进不了背包（§11）
 BRONZE_PIPE = 30018          # 청동파이프 青铜管（材料）
 BLACK_BEAD = 10001           # 검은구슬 黑珠（材料）
+#: ★ 可堆叠、**但不是材料**的那一档（消耗品 / 礼包 / 钥匙共 20 种）。
+#:   它们靠 `add_item()` 进 `inventory`，不进 `materials` —— 「数量有没有
+#:   意义」和「住哪个桶」是两件独立的事，卖出那一轮就栽在这上面。
+POTION = 210001              # 회복물약 回复药水（consumable，可堆叠）
 NO_SUCH_ITEM = 9999999       # 物品表里根本没有
 #: 三个基础角色各一套装备槽（§46）：同一个部位、不同角色，**不抢槽**。
 TYR_TOP = 1010001            # 泰尔的上衣（part_flag 1，角色 0）
@@ -1055,6 +1059,13 @@ class ItemFieldTests(unittest.TestCase):
         for material in (BRONZE_PIPE, BLACK_BEAD):
             self.assertTrue(shopdata.is_material(material))
             self.assertTrue(shopdata.ownable(material))
+        # ★ `POTION` 的全部价值就在这三条上：**可堆叠**、**不是材料**、
+        #   **进得了背包** ⇒ 它必然住在 `inventory` 而不是 `materials`。
+        #   哪天物品表把它改成材料了，卖出那几条用例就失去了意义，
+        #   让这一条先炸。
+        self.assertTrue(shopdata.ownable(POTION))
+        self.assertTrue(shopdata.stackable(POTION))
+        self.assertFalse(shopdata.is_material(POTION))
 
     def test_new_account_starts_with_empty_item_fields(self):
         _, account = self.store.get_account("alice")
@@ -1920,6 +1931,172 @@ class AdminRoleTests(unittest.TestCase):
         self.assertEqual(self.SYSTEM,
                          self.saved()[ADMIN_ACCOUNTS_KEY][DEFAULT_ADMIN_NAME]
                          ["role"])
+
+
+class SellItemsTests(unittest.TestCase):
+    """`sell_items()` —— 一把锁里 扣物品 + 脱装备 + 加返还材料 + 加金币。
+
+    ★ 这一组钉的是**交易性**（要么全成、要么一个字节都不写），定价那一半
+    在 `test_sellprice` 里；两边分开是因为它们会各自被改坏。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "accounts.json")
+        self.store = AccountStore(self.path)
+        self.store.register("alice", "pw")
+        self.store.admin_update_account(
+            "alice", money=1000,
+            inventory={REVOLVER_R1: 1, TOP_ARMOR: 1},
+            materials={BLACK_BEAD: 5})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def raw_bytes(self):
+        with open(self.path, "rb") as f:
+            return f.read()
+
+    def account(self):
+        return self.store.get_account("alice")[1]
+
+    def line(self, item_id, count=1, money=0, materials=None):
+        return {"id": item_id, "count": count, "money": money,
+                "materials": materials or {}}
+
+    def test_money_and_items_move_together(self):
+        _account, receipt = self.store.sell_items(
+            "alice", [self.line(BLACK_BEAD, 2, 300)])
+        self.assertEqual(1000, receipt["money_before"])
+        self.assertEqual(1300, receipt["money_after"])
+        self.assertEqual(300, receipt["gained"])
+        account = self.account()
+        self.assertEqual(3, account_store.material_count(account, BLACK_BEAD))
+        self.assertEqual(1300, account_store.player_money(account))
+
+    def test_a_material_used_up_loses_its_slot(self):
+        self.store.sell_items("alice", [self.line(BLACK_BEAD, 5, 1)])
+        self.assertNotIn(str(BLACK_BEAD), self.account()["materials"])
+
+    def test_equipment_is_removed_outright(self):
+        self.store.sell_items("alice", [self.line(TOP_ARMOR, 1, 40)])
+        self.assertFalse(account_store.has_item(self.account(), TOP_ARMOR))
+
+    def test_returned_materials_land_in_the_bucket(self):
+        _account, receipt = self.store.sell_items(
+            "alice", [self.line(REVOLVER_R1, 1, 50,
+                                {BLACK_BEAD: 3, BRONZE_PIPE: 2})])
+        self.assertEqual({BLACK_BEAD: 3, BRONZE_PIPE: 2}, receipt["returned"])
+        account = self.account()
+        # 原来就有 5 颗黑珠 —— 累加，不是覆盖。
+        self.assertEqual(8, account_store.material_count(account, BLACK_BEAD))
+        self.assertEqual(2, account_store.material_count(account, BRONZE_PIPE))
+
+    def test_selling_something_worn_takes_it_off(self):
+        """★ 「穿着的每一件都在仓库里」是 `set_equipped()` 的不变式。
+        破了它以后每一次换装都会把这一件悄悄丢掉，查起来莫名其妙。"""
+        self.store.equip_item("alice", TOP_ARMOR)
+        self.store.equip_item("alice", REVOLVER_R1)
+        _account, receipt = self.store.sell_items(
+            "alice", [self.line(TOP_ARMOR, 1, 40)])
+        self.assertEqual([TOP_ARMOR], receipt["unequipped"])
+        self.assertEqual([REVOLVER_R1],
+                         list(account_store.equipped_items(self.account())))
+
+    def test_not_enough_writes_nothing(self):
+        before = self.raw_bytes()
+        with self.assertRaises(account_store.AccountError) as caught:
+            self.store.sell_items("alice", [self.line(BLACK_BEAD, 6, 600)])
+        self.assertEqual("not_enough_items", caught.exception.code)
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_one_bad_line_in_a_batch_writes_nothing(self):
+        """★ 存量**先全部校验完再动手** —— 半单成交比整单失败难查得多。"""
+        before = self.raw_bytes()
+        with self.assertRaises(account_store.AccountError):
+            self.store.sell_items("alice", [
+                self.line(BLACK_BEAD, 2, 200),
+                self.line(TOP_ARMOR, 1, 40),
+                self.line(BRONZE_PIPE, 1, 100),      # 一个都没有
+            ])
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_selling_the_same_equipment_twice_in_one_order_is_refused(self):
+        # 两条都指着同一件（前台合并漏了 / 有人直接 POST）——
+        # 第二条没得扣，整单必须失败，而不是「白送一份钱」。
+        before = self.raw_bytes()
+        with self.assertRaises(account_store.AccountError):
+            self.store.sell_items("alice", [self.line(TOP_ARMOR, 2, 80)])
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_money_is_capped_at_int32(self):
+        """★ `0x0600` 的金币那一格是 int32（`re/packet_api.md` §3.5）——
+        超了 `struct.pack("<i")` 当场抛，把那条在线连接一起带走。"""
+        self.store.admin_update_account(
+            "alice", money=account_store.MONEY_MAX - 10)
+        _account, receipt = self.store.sell_items(
+            "alice", [self.line(BLACK_BEAD, 1, 1000)])
+        self.assertEqual(account_store.MONEY_MAX, receipt["money_after"])
+        self.assertEqual(990, receipt["capped"])
+        self.assertEqual(account_store.MONEY_MAX,
+                         account_store.player_money(self.account()))
+
+    def test_an_empty_order_is_refused(self):
+        for bad in ([], None, [self.line(BLACK_BEAD, 0, 0)]):
+            with self.assertRaises(account_store.AccountError):
+                self.store.sell_items("alice", bad)
+
+    def test_a_negative_price_is_refused(self):
+        with self.assertRaises(account_store.AccountError):
+            self.store.sell_items("alice", [self.line(BLACK_BEAD, 1, -1)])
+
+    def test_a_returned_material_the_client_does_not_know_is_refused(self):
+        # 坏配方不该把仓库写脏（客户端不认得的 id 进了仓库会怎样，没人知道）。
+        before = self.raw_bytes()
+        with self.assertRaises(account_store.AccountError):
+            self.store.sell_items(
+                "alice", [self.line(TOP_ARMOR, 1, 10, {NO_SUCH_ITEM: 1})])
+        self.assertEqual(before, self.raw_bytes())
+
+    # -------------------------------------- 可堆叠、却住在 `inventory` 里的那些
+    def test_a_stackable_item_that_lives_in_the_inventory_can_be_sold(self):
+        """★★ 消耗品 / 礼包 / 钥匙：`stackable()` 为真，住的却是 `inventory`。
+
+        「数量有没有意义」和「住哪个桶」是**两件独立的事**：
+        `add_materials()`（掉落）进 `materials`，`add_item()`（买 / 合成 /
+        领礼物 / 控制通道 `give`）一律进 `inventory`。全物品表里有 20 种
+        `stackable()` 为真、`is_material()` 为假的东西，它们必然住在
+        `inventory` 里 —— 按 `stackable()` 去 `materials` 找永远找不到。
+        症状不是报错，是「管理页上明明摆着，一按确定就说东西不够」。
+        """
+        self.store.add_item("alice", POTION, count=3)
+        account = self.account()
+        self.assertEqual(3, account_store.inventory_items(account)[POTION]["count"])
+        self.assertEqual(0, account_store.material_count(account, POTION))
+
+        _account, receipt = self.store.sell_items(
+            "alice", [self.line(POTION, 2, 200)])
+        self.assertEqual(200, receipt["gained"])
+        account = self.account()
+        # 只扣掉卖的那两个，剩下的一个还在**原来那个桶**里。
+        self.assertEqual(1, account_store.inventory_items(account)[POTION]["count"])
+        self.assertEqual(1200, account_store.player_money(account))
+
+    def test_selling_the_last_one_removes_the_inventory_row(self):
+        # 减到 0 的格子整条删掉，别在存档里留一个 `0`。
+        self.store.add_item("alice", POTION, count=2)
+        self.store.sell_items("alice", [self.line(POTION, 2, 200)])
+        self.assertNotIn(POTION, account_store.inventory_items(self.account()))
+
+    def test_a_stackable_inventory_item_short_by_one_fails_the_whole_order(self):
+        # 存量校验也得看对桶 —— 看错桶的话它会把「有 3 个」误判成「一个没有」。
+        self.store.add_item("alice", POTION, count=1)
+        before = self.raw_bytes()
+        with self.assertRaises(account_store.AccountError) as caught:
+            self.store.sell_items("alice", [self.line(POTION, 2, 200),
+                                            self.line(BLACK_BEAD, 1, 100)])
+        self.assertEqual("not_enough_items", caught.exception.code)
+        self.assertEqual(before, self.raw_bytes())
 
 
 if __name__ == "__main__":
