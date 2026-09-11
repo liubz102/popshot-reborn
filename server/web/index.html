@@ -126,7 +126,7 @@
         <input id="skipTut" type="checkbox" checked>
         跳过新手教程
       </label>
-      <div class="hint">勾上就直接进大厅；取消勾选则和原版一样，首次登录先走一遍新手教学关。注册后仍可在「存档转移助手」里改 <code>tutorial_completed</code> 重新开关。</div>
+      <div class="hint">勾上就直接进大厅；取消勾选则和原版一样，首次登录先走一遍新手教学关。</div>
 
       <button type="submit" id="regBtn">注册</button>
       <div class="hint" id="regCooldownHint"></div>
@@ -140,7 +140,7 @@
       <button type="button" class="ghost" id="openChangeNickname">修改昵称</button>
     </div>
     <button type="button" class="ghost full" id="openTransfer">存档转移助手</button>
-    <div class="hint">把你在某台服务器上的存档下载下来，再上传到另一台服务器。</div>
+    <div class="hint">把你在某台服务器上的存档下载下来，再上传到另一台服务器。存档里只有<b>用户名、昵称、密码</b>三项是明文、可以自己改，其余游戏数据是加密的。</div>
   </div>
 </div>
 
@@ -207,6 +207,8 @@
         <input id="du" type="text" maxlength="16" autocomplete="off">
         <label for="dp">密码</label>
         <input id="dp" type="password" maxlength="32" autocomplete="off">
+        <div class="hint">导出的文件里，只有 <code>username</code>（用户名）、<code>nickname</code>（昵称）、<code>password</code>（密码）三项是明文，可以用记事本自己改 —— 改用户名就等于用另一个名字导入。其余游戏数据（等级 / 经验 / 金币 / 仓库 / 装备 / 材料 / 礼物盒）在 <code>data</code> 那一长串里，<b>是加密的，改一个字这份存档就传不上来了</b>。</div>
+        <div class="hint">⚠ 这份存档只能导入到 <b>V0.3.2 或更高版本</b>的服务器。传到旧版服务器上，那边会把它当成一份「什么都没有的存档」导进去，<b>号会被清空而且不报错</b>。</div>
         <button type="submit">存档导出</button>
         <div class="msg" id="dlMsg"></div>
       </form>
@@ -222,8 +224,9 @@
         <label for="up">密码</label>
         <input id="up" type="password" maxlength="32" autocomplete="off">
         <div class="hint">更新服务器上已有的存档时需要填入正确的用户名密码。若本服务器上没有保存过你的账号，则不需要填入。</div>
-        <div class="hint">手改存档时注意：<b>等级说了算</b>。改 <code>level</code>（可以调大也可以调小，上限 60 级）会自动把 <code>experience</code> 重算成对应的值；<b>只改 <code>experience</code> 不改 <code>level</code> 是没用的</b>，经验最终由服务端按等级算。两个字段本来就对得上时（比如直接把导出的存档原样传回来），经验一分不动。</div>
-        <div class="hint">仓库（<code>inventory</code>）、身上穿着的装备（<code>equipped</code>）和合成材料（<code>materials</code>）也在存档里，会原样跟着转移。导入时服务器会顺手洗一遍：不认识的物品 id 丢掉，穿着但仓库里没有的装备卸下，数量为 0 的条目删掉。上传的存档里<b>没有</b>的字段一律回到默认值（旧版导出的存档没有这三项，传回来仓库就是空的）。</div>
+        <div class="hint">存档里只有 <code>username</code>（用户名）、<code>nickname</code>（昵称）、<code>password</code>（密码）三项是明文，可以用记事本改；<code>data</code> 那一长串是加密后的游戏数据，<b>改一个字这份存档就传不上来了</b>。想改等级 / 金币 / 材料 / 仓库，请找服主在 GM 管理页里改。</div>
+        <div class="hint">等级、经验、金币、仓库、穿着的装备、合成材料和礼物盒都在 <code>data</code> 里，会原样跟着转移。导入是<b>覆盖</b>不是合并：这个账号在这台服务器上原来的数据会被整份换掉。</div>
+        <div class="hint">⚠ <b>旧版（V0.3.1 及更早）导出的明文存档已经不能再导入了。</b>请在原来那台服务器升级之后重新导出一份；那台服务器已经关掉的话，请把情况告诉服主。</div>
 
         <button type="submit">存档上传</button>
         <div class="msg" id="ulMsg"></div>
@@ -463,7 +466,11 @@ document.getElementById("dl").addEventListener("submit", function (event) {
                           {type: "application/json"});
       var link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
-      link.download = "popshot-save-" + username + ".json";
+      // ★ 文件名带上格式版本：玩家手里很可能同时躺着旧的明文存档和新的加密存档，
+      //   而**旧服务端拿到新存档不会报错、会静默清档** —— 文件名是他唯一能分辨
+      //   的地方。版本号从回包里取而不是写死，以后 bump 版本时自动跟上。
+      link.download = "popshot-save-v" + r.data.save.popshot_save
+                      + "-" + username + ".json";
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);

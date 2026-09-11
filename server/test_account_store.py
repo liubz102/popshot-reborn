@@ -21,7 +21,37 @@ from account_store import (ADMIN_ACCOUNTS_KEY, AUTH_BAD_PASSWORD,
                            player_character, player_level, player_money,
                            quest_cleared_difficulty, quest_difficulty_records,
                            quest_unlock_all, tutorial_state)
+import savecrypt
 from gameserver import build_gsp_rep_login
+
+
+def sealed(username, fields=None, **plain):
+    """造一份 V0.3.2 形状的存档：三项明文 + 一段密文。
+
+    `fields` 是要封进密文的账号字段（可以只写几个 —— 导入是覆盖语义，缺的会回
+    默认值）；`plain` 覆盖明文区（`nickname` / `password`）。
+    密码默认跟着 `fields["password"]` 走，两边写法和真导出一致。
+    """
+    fields = dict(fields or {})
+    password = plain.pop("password", fields.pop("password", ""))
+    nickname = plain.pop("nickname", fields.pop("display_name", ""))
+    assert not plain, plain
+    return {account_store.SAVE_FORMAT_KEY: account_store.SAVE_FORMAT_VERSION,
+            account_store.SAVE_NOTE_KEY: account_store.SAVE_NOTE_TEXT,
+            "username": username,
+            "nickname": nickname,
+            "password": password,
+            "data": savecrypt.seal(fields)}
+
+
+def peek(payload):
+    """解开一份存档的密文，拿里面的账号字段做断言用。"""
+    return savecrypt.unseal(payload["data"])
+
+
+def legacy_save(username, account):
+    """V0.3.1 及更早那种**明文**存档的形状。现在一律被拒（D86）。"""
+    return {"popshot_save": 1, "username": username, "account": dict(account)}
 
 
 #: 下面这些 id 都来自真的 `shop_items.json`，不是编的。
@@ -380,7 +410,10 @@ class AccountStoreTests(unittest.TestCase):
         self.store.set_character("alice", 2)
         payload = self.store.export_account("alice")
         self.assertEqual("alice", payload["username"])
-        self.assertEqual("pw", payload["account"]["password"])
+        # 密码在**明文区**（玩家要能改它）；账号数据整份在密文里，
+        # 老格式那个 `account` 键已经没有了。
+        self.assertEqual("pw", payload["password"])
+        self.assertNotIn("account", payload)
 
         other = AccountStore(os.path.join(self.tmp.name, "other.json"))
         name, action = other.import_account(payload)
@@ -395,8 +428,7 @@ class AccountStoreTests(unittest.TestCase):
 
     def test_import_over_an_existing_account_needs_the_password(self):
         self.store.register("alice", "pw")
-        payload = {"popshot_save": 1, "username": "alice",
-                   "account": {"password": "pw", "money": 999}}
+        payload = sealed("alice", {"password": "pw", "money": 999})
         with self.assertRaises(AccountError) as ctx:
             self.store.import_account(payload, "alice", "wrong")
         self.assertEqual("bad_password", ctx.exception.code)
@@ -409,8 +441,7 @@ class AccountStoreTests(unittest.TestCase):
         # 「一个字都没填」和「填了但填错」必须是两句不同的话 —— 后者回
         # 「请填入用户名和密码」的话，打错密码的人只会对着填好的框发呆。
         self.store.register("alice", "pw")
-        payload = {"popshot_save": 1, "username": "alice",
-                   "account": {"password": "pw", "money": 999}}
+        payload = sealed("alice", {"password": "pw", "money": 999})
         for auth in (("bob", "pw"), ("alice", "nope"), ("", "pw"), ("alice", "")):
             with self.assertRaises(AccountError, msg=repr(auth)) as ctx:
                 self.store.import_account(payload, *auth)
@@ -418,12 +449,18 @@ class AccountStoreTests(unittest.TestCase):
             self.assertIn("用户名或密码错误", ctx.exception.message)
         self.assertEqual(0, self.store.get_account("alice")[1]["money"])
 
+    # ★★ 下面五条钉的是 `experience_for_import`（D151「等级说了算」）。
+    #    **V0.3.2 之后玩家已经改不到 `level` 了** —— 它和其余游戏数据一起在密文
+    #    里（D86），这些用例是直接封一份不自洽的密文来测存档层的规则，
+    #    不再对应任何玩家能做的操作。别看着方法名就以为手改存档还通。
+    #    真正还在替玩家干活的是
+    #    `test_import_keeps_the_experience_when_the_two_fields_agree`：
+    #    导出 → 原样导回，本级内攒的经验一分不许掉。
     def test_import_makes_a_hand_raised_level_stick(self):
-        # 玩家把导出的 JSON 里的 level 从 1 改成 5 再传上来。等级是由经验推出来的
-        # 派生字段，光改它一读回来就被打回原形 —— 导入时要把经验补到那一级。
+        # 存档里的 level 是 5、经验是 0（两者矛盾）。等级是由经验推出来的派生
+        # 字段，光有 level 一读回来就被打回原形 —— 导入时要把经验补到那一级。
         self.store.register("alice", "pw")
-        payload = {"popshot_save": 1, "username": "alice",
-                   "account": {"password": "pw", "level": 5}}
+        payload = sealed("alice", {"password": "pw", "level": 5})
         self.store.import_account(payload, "alice", "pw")
         _, account = self.store.get_account("alice")
         self.assertEqual(5, account["level"])
@@ -436,9 +473,8 @@ class AccountStoreTests(unittest.TestCase):
         # 两个字段矛盾 -> 认 level，经验被重算回那一级的起点。
         # 注册页上已经写明「只改 experience 没用」。
         self.store.register("alice", "pw")
-        payload = {"popshot_save": 1, "username": "alice",
-                   "account": {"password": "pw", "level": 1,
-                               "experience": 9999}}
+        payload = sealed("alice", {"password": "pw", "level": 1,
+                                   "experience": 9999})
         self.store.import_account(payload, "alice", "pw")
         _, account = self.store.get_account("alice")
         self.assertEqual(1, account["level"])
@@ -448,9 +484,8 @@ class AccountStoreTests(unittest.TestCase):
         # 旧规则只能往上抬（「想降级得连经验一起改小」）；现在降级也生效。
         self.store.register("alice", "pw")
         self.store.add_quest_reward("alice", experience=29900)
-        payload = {"popshot_save": 1, "username": "alice",
-                   "account": {"password": "pw", "level": 3,
-                               "experience": 29900}}
+        payload = sealed("alice", {"password": "pw", "level": 3,
+                                   "experience": 29900})
         self.store.import_account(payload, "alice", "pw")
         _, account = self.store.get_account("alice")
         self.assertEqual(3, account["level"])
@@ -459,8 +494,7 @@ class AccountStoreTests(unittest.TestCase):
     def test_import_clamps_a_hand_written_level_to_the_cap(self):
         # 手写 level: 999 只能得到 60 级，不会算出一个天文数字的经验。
         self.store.register("alice", "pw")
-        payload = {"popshot_save": 1, "username": "alice",
-                   "account": {"password": "pw", "level": 999}}
+        payload = sealed("alice", {"password": "pw", "level": 999})
         self.store.import_account(payload, "alice", "pw")
         _, account = self.store.get_account("alice")
         self.assertEqual(LEVEL_MAX, account["level"])
@@ -475,8 +509,8 @@ class AccountStoreTests(unittest.TestCase):
         self.store.register("alice", "pw")
         self.store.add_quest_reward("alice", experience=1200, money=7)
         payload = self.store.export_account("alice")
-        self.assertEqual(5, payload["account"]["level"])
-        self.assertEqual(1200, payload["account"]["experience"])
+        self.assertEqual(5, peek(payload)["level"])
+        self.assertEqual(1200, peek(payload)["experience"])
         self.store.import_account(payload, "alice", "pw")
         _, account = self.store.get_account("alice")
         self.assertEqual(5, account["level"])
@@ -487,9 +521,7 @@ class AccountStoreTests(unittest.TestCase):
         for bad in ({}, {"level": "abc"}, {"level": -5}):
             fields = {"password": "pw", "experience": 1200}
             fields.update(bad)
-            self.store.import_account(
-                {"popshot_save": 1, "username": "alice", "account": fields},
-                "alice", "pw")
+            self.store.import_account(sealed("alice", fields), "alice", "pw")
             _, account = self.store.get_account("alice")
             self.assertEqual(1200, account["experience"], bad)
             self.assertEqual(5, account["level"], bad)
@@ -523,7 +555,7 @@ class AccountStoreTests(unittest.TestCase):
         }
         self.assertEqual(sorted(changed), sorted(NEW_ACCOUNT_DEFAULTS),
                          "存档新增字段了？这条用例要跟着补")
-        payload = {"popshot_save": 1, "username": "alice", "account": changed}
+        payload = sealed("alice", changed)
         self.store.import_account(payload, "alice", "pw")
         _, account = self.store.get_account("alice")
         for key, want in changed.items():
@@ -537,8 +569,7 @@ class AccountStoreTests(unittest.TestCase):
         self.store.register("alice", "pw")
         self.store.add_quest_reward("alice", experience=500, money=500)
         self.store.set_quest_cleared("alice", 3, 2)
-        payload = {"popshot_save": 1, "username": "alice",
-                   "account": {"password": "pw", "money": 7}}
+        payload = sealed("alice", {"password": "pw", "money": 7})
         name, action = self.store.import_account(payload, "alice", "pw")
         self.assertEqual(("alice", "replaced"), (name, action))
         _, account = self.store.get_account("alice")
@@ -549,15 +580,14 @@ class AccountStoreTests(unittest.TestCase):
 
     def test_import_ignores_unknown_fields_in_the_upload(self):
         # 存档是给人手改的，多塞几个键不能让整个导入失败，但也不能被写进存档。
-        payload = {"popshot_save": 1, "username": "carol",
-                   "account": {"password": "pw", "money": 5, "cheat": True}}
+        payload = sealed("carol", {"password": "pw", "money": 5, "cheat": True})
         self.store.import_account(payload)
         _, account = self.store.get_account("carol")
         self.assertNotIn("cheat", account)
         self.assertEqual(5, account["money"])
 
     def test_import_without_a_password_anywhere_is_refused(self):
-        payload = {"popshot_save": 1, "username": "dave", "account": {"money": 1}}
+        payload = sealed("dave", {"money": 1})     # 明文区的 password 也是空的
         with self.assertRaises(AccountError) as ctx:
             self.store.import_account(payload)
         self.assertEqual("password_required", ctx.exception.code)
@@ -571,7 +601,7 @@ class AccountStoreTests(unittest.TestCase):
         self.store.set_equipped("alice", [REVOLVER_R1])
         self.store.add_materials("alice", {BRONZE_PIPE: 3})
         payload = self.store.export_account("alice")
-        exported = payload["account"]
+        exported = peek(payload)
         self.assertEqual({str(REVOLVER_R1): {"count": 1, "expires": None}},
                          exported["inventory"])
         self.assertEqual([REVOLVER_R1], exported["equipped"])
@@ -588,19 +618,21 @@ class AccountStoreTests(unittest.TestCase):
         for key in ("inventory", "equipped", "materials"):
             self.assertEqual(exported[key], on_disk[key], key)
 
-    def test_import_cleans_hand_edited_item_fields(self):
-        # 上传的是玩家用记事本改过的文件：`"id": 数量` 的简写、数量 0、
-        # 穿着但仓库里没有的装备、客户端不认识的 id、写成字符串的数量 ——
-        # 全部当场洗干净，和 `ensure_item_fields` 启动时洗盘一个口径
-        # （不然脏条目要等下次启动才收敛，中间游戏里发下去的就是脏的）。
-        payload = {"popshot_save": 1, "username": "alice",
-                   "account": {"password": "pw",
-                               "inventory": {str(REVOLVER_R1): 2,
-                                             "999999999": 1,
-                                             str(TOP_ARMOR): 0},
-                               "equipped": [REVOLVER_R1, TOP_ARMOR, 999999999],
-                               "materials": {str(BRONZE_PIPE): "4",
-                                             "999999999": 1, "abc": 2}}}
+    def test_import_cleans_dirty_item_fields(self):
+        # 脏形状：`"id": 数量` 的简写、数量 0、穿着但仓库里没有的装备、
+        # 客户端不认识的 id、写成字符串的数量 —— 全部当场洗干净，和
+        # `ensure_item_fields` 启动时洗盘一个口径（不然脏条目要等下次启动才
+        # 收敛，中间游戏里发下去的就是脏的）。
+        # ★ V0.3.2 之后来源不再是记事本，但这一关还得留着：老版本服务端导出的
+        #   存档洗法和现在不一样，拿着密钥自己封一份的人也进得来。
+        payload = sealed("alice",
+                         {"password": "pw",
+                          "inventory": {str(REVOLVER_R1): 2,
+                                        "999999999": 1,
+                                        str(TOP_ARMOR): 0},
+                          "equipped": [REVOLVER_R1, TOP_ARMOR, 999999999],
+                          "materials": {str(BRONZE_PIPE): "4",
+                                        "999999999": 1, "abc": 2}})
         self.store.import_account(payload)
         _, account = self.store.get_account("alice")
         self.assertEqual({str(REVOLVER_R1): {"count": 2, "expires": None}},
@@ -608,22 +640,29 @@ class AccountStoreTests(unittest.TestCase):
         self.assertEqual([REVOLVER_R1], account["equipped"])
         self.assertEqual({str(BRONZE_PIPE): 4}, account["materials"])
 
-    def test_import_of_an_old_save_resets_the_item_fields_to_empty(self):
-        # 旧版（V0.2）导出的存档没有这三个字段。导入是「覆盖」不是「合并」
-        # （`test_import_resets_fields_missing_from_the_upload` 那条需求），
-        # 所以传回来仓库就是空的 —— 注册页上写明了这一点。
+    def test_import_of_an_old_plaintext_save_is_refused(self):
+        """★ V0.3.1 及更早那种明文存档一律拒（D86）。
+
+        这条用例以前测的是「旧存档传回来仓库变空」。现在旧存档根本进不来 ——
+        而「缺字段回默认值」那个语义由
+        `test_import_resets_fields_missing_from_the_upload` 继续钉着。
+        ★ 被拒的时候**磁盘一个字节都不许动**：`parse_save` 在锁外就失败了。
+        """
         self.store.register("alice", "pw")
         self.store.add_item("alice", REVOLVER_R1)
         self.store.add_materials("alice", {BRONZE_PIPE: 3})
-        old_save = {"popshot_save": 1, "username": "alice",
-                    "account": {"password": "pw", "money": 12,
-                                "level": 1, "experience": 0}}
-        self.store.import_account(old_save, "alice", "pw")
+        old_save = legacy_save("alice", {"password": "pw", "money": 12,
+                                         "level": 1, "experience": 0})
+        with self.assertRaises(AccountError) as ctx:
+            self.store.import_account(old_save, "alice", "pw")
+        self.assertEqual("legacy_save", ctx.exception.code)
+        self.assertIn("旧版", ctx.exception.message)
+        self.assertIn("重新导出", ctx.exception.message)
         _, account = self.store.get_account("alice")
-        self.assertEqual(({}, [], {}), (account["inventory"],
-                                        account["equipped"],
-                                        account["materials"]))
-        self.assertEqual(12, account["money"])
+        self.assertEqual(0, account["money"])
+        self.assertEqual({str(REVOLVER_R1): {"count": 1, "expires": None}},
+                         account["inventory"])
+        self.assertEqual({str(BRONZE_PIPE): 3}, account["materials"])
 
     def test_import_leaves_the_admin_accounts_section_alone(self):
         # V0.3 商店在 accounts.json 顶层加了 `admin_accounts`（D3）。存档转移
@@ -633,8 +672,7 @@ class AccountStoreTests(unittest.TestCase):
         with open(self.path, "r", encoding="utf-8") as f:
             before = json.load(f)[ADMIN_ACCOUNTS_KEY]
         self.assertTrue(before)
-        payload = {"popshot_save": 1, "username": "bob",
-                   "account": {"password": "pw", "money": 1}}
+        payload = sealed("bob", {"password": "pw", "money": 1})
         self.store.import_account(payload)
         with open(self.path, "r", encoding="utf-8") as f:
             after = json.load(f)
@@ -642,10 +680,140 @@ class AccountStoreTests(unittest.TestCase):
         self.assertIn("bob", after["accounts"])
 
     def test_import_rejects_a_file_that_is_not_a_save(self):
-        for bad in (None, [], {"hello": "world"}, {"account": {"money": 1}}):
-            with self.assertRaises(AccountError, msg=repr(bad)) as ctx:
+        good = sealed("alice", {"password": "pw", "money": 1})
+        cases = [
+            (None, "bad_save"), ([], "bad_save"),
+            ({"hello": "world"}, "bad_save"),
+            # ★ 老代码的「退化形状」：整个文件就是账号本身。它现在必须被拒 ——
+            #   放行的话就是一次伪装成导入的清档（D86）。
+            ({"account": {"money": 1}}, "bad_save"),
+            # 版本号必须是**整数**。`"2"` 不行；`true` 更不行 ——
+            #   `isinstance(True, int)` 是 True 且 `True == 1`，不专门挡一下
+            #   就会被当成「旧版明文存档」。
+            (dict(good, popshot_save="2"), "bad_save"),
+            (dict(good, popshot_save=True), "bad_save"),
+            (dict(good, popshot_save=99), "future_save"),
+            # 密文那一段的各种坏法。
+            ({k: v for k, v in good.items() if k != "data"}, "bad_save_data"),
+            (dict(good, data=None), "bad_save_data"),
+            (dict(good, data=123), "bad_save_data"),
+            (dict(good, data="不是 base64!!!"), "bad_save_data"),
+            (dict(good, data=good["data"][:20]), "bad_save_data"),
+            # 用户名不合规（明文区玩家能改它，所以这条门一定要在）。
+            (dict(good, username="a"), "bad_save"),
+            (dict(good, username="坏名字"), "bad_save"),
+            # ★ 明文那两项必须是**字符串**：`"password": null` 不卡的话会被
+            #   `str()` 成字符串 "None"，导入提示成功、人却登不进去了。
+            (dict(good, password=None), "bad_save"),
+            (dict(good, password=12345), "bad_save"),
+            (dict(good, nickname=None), "bad_save"),
+            (dict(good, nickname=["x"]), "bad_save"),
+        ]
+        for bad, want in cases:
+            with self.assertRaises(AccountError, msg=repr(want)) as ctx:
                 self.store.import_account(bad)
-            self.assertEqual("bad_save", ctx.exception.code)
+            self.assertEqual(want, ctx.exception.code, msg=repr(want))
+
+    # -- V0.3.2：只有用户名 / 昵称 / 密码明文，其余加密（D86）------------------
+    def test_export_keeps_only_the_three_fields_in_the_clear(self):
+        """★ 需求本身的直接判据：导出的文件里除了那三项什么都看不见。"""
+        self.store.register("alice", "pw")
+        self.store.add_quest_reward("alice", experience=1200, money=987654)
+        self.store.add_item("alice", REVOLVER_R1)
+        payload = self.store.export_account("alice")
+        self.assertEqual(
+            {account_store.SAVE_FORMAT_KEY, account_store.SAVE_NOTE_KEY,
+             "username", "nickname", "password", "data"},
+            set(payload))
+        text = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("987654", text)             # 金币
+        self.assertNotIn(str(REVOLVER_R1), text)     # 仓库里那件东西
+        self.assertNotIn("1200", text)               # 经验
+        # 密文里确实是那些字段（不是「导出的时候就丢了」）。
+        self.assertEqual(987654, peek(payload)["money"])
+
+    def test_the_plain_and_secret_key_sets_cover_every_account_field(self):
+        """★ 加字段的守卫：新字段必须落进明文或密文其中一边，不能两边都没有。
+
+        `SAVE_SECRET_KEYS` 是从 `NEW_ACCOUNT_DEFAULTS` 反推的，所以这条本来就
+        自动成立 —— 它钉的是「以后别有人手写成一张固定表」。
+        """
+        plain = set(account_store.SAVE_PLAIN_KEYS)
+        secret = set(account_store.SAVE_SECRET_KEYS)
+        self.assertEqual(set(NEW_ACCOUNT_DEFAULTS), plain | secret)
+        self.assertEqual(set(), plain & secret)
+
+    def test_a_player_can_rename_the_account_by_editing_the_plain_username(self):
+        """明文可改的**正面**判据：改个名字导入 = 在目标服上建一个新号。"""
+        self.store.register("alice", "pw")
+        self.store.add_quest_reward("alice", experience=1200, money=77)
+        self.store.add_item("alice", REVOLVER_R1)
+        payload = self.store.export_account("alice")
+        payload["username"] = "alice2"
+        other = AccountStore(os.path.join(self.tmp.name, "other.json"))
+        self.assertEqual(("alice2", "created"), other.import_account(payload))
+        _, moved = other.get_account("alice2")
+        self.assertEqual((1200, 77), (moved["experience"], moved["money"]))
+        self.assertEqual({str(REVOLVER_R1): {"count": 1, "expires": None}},
+                         moved["inventory"])
+
+    def test_a_player_can_change_the_nickname_and_password_in_the_clear(self):
+        self.store.register("alice", "pw", display_name="老名字")
+        payload = self.store.export_account("alice")
+        self.assertEqual("老名字", payload["nickname"])
+        payload["nickname"] = "新名字"
+        payload["password"] = "newpw"
+        # ★ 鉴权用的仍然是**服务器上现有的**密码，文件里那个是「改成什么」。
+        self.store.import_account(payload, "alice", "pw")
+        _, account = self.store.get_account("alice")
+        self.assertEqual("新名字", account["display_name"])
+        self.assertEqual(AUTH_OK, self.store.verify("alice", "newpw")[0])
+        self.assertEqual(AUTH_BAD_PASSWORD, self.store.verify("alice", "pw")[0])
+
+    def test_a_bad_nickname_in_the_clear_is_refused(self):
+        """★ 昵称是我们**主动请玩家去改**的一格，就得在门口挡住。
+
+        控制字符会把包和 JSON 弄坏，补充平面字符会让 `w_wstr` 的长度字段少算。
+        """
+        self.store.register("alice", "pw")
+        payload = self.store.export_account("alice")
+        for bad in ("a\x00b", "x" * 100, "\U0001F600"):
+            with self.assertRaises(AccountError, msg=repr(bad)) as ctx:
+                self.store.import_account(dict(payload, nickname=bad),
+                                          "alice", "pw")
+            self.assertEqual("invalid_nickname", ctx.exception.code, repr(bad))
+        self.assertEqual("alice", self.store.get_account("alice")[1]["display_name"])
+
+    def test_editing_the_ciphertext_is_refused_and_nothing_is_written(self):
+        """改一个字符就进不来，**而且磁盘一个字节都没动**。
+
+        ★ 前提是密码填对的 —— 否则证明不了是解密先失败，可能只是被鉴权挡下。
+        """
+        self.store.register("alice", "pw")
+        self.store.add_quest_reward("alice", experience=1200, money=77)
+        payload = self.store.export_account("alice")
+        with open(self.path, "r", encoding="utf-8") as f:
+            before = f.read()
+        blob = payload["data"]
+        for spoiled in (blob[:-6] + ("A" if blob[-6] != "A" else "B") + blob[-5:],
+                        blob[:30] + ("A" if blob[30] != "A" else "B") + blob[31:]):
+            with self.assertRaises(AccountError) as ctx:
+                self.store.import_account(dict(payload, data=spoiled),
+                                          "alice", "pw")
+            self.assertEqual("save_tampered", ctx.exception.code)
+            self.assertIn("data", ctx.exception.message)
+        with open(self.path, "r", encoding="utf-8") as f:
+            self.assertEqual(before, f.read())
+
+    def test_a_handwritten_save_can_no_longer_create_an_account(self):
+        """以前手写一份 JSON 就能凭空建一个满级号（新建路径完全免鉴权）。"""
+        for bad in ({"username": "hacker", "account": {"password": "p",
+                                                       "money": 999999}},
+                    {"popshot_save": 2, "username": "hacker",
+                     "password": "p", "money": 999999}):
+            with self.assertRaises(AccountError):
+                self.store.import_account(bad)
+        self.assertFalse(self.store.has_account("hacker"))
 
     def test_tutorial_progress_below_the_threshold_does_not_complete(self):
         self.account()
@@ -1264,18 +1432,11 @@ class ItemFieldTests(unittest.TestCase):
         self.assertEqual({"101400001": {"count": 1, "expires": None}},
                          after["inventory"])
 
-    def test_import_converts_a_legacy_owned_characters_list(self):
-        # 旧版导出的存档里带 `owned_characters`：转成角色卡，旧键不落盘。
-        self.store.import_account(
-            {"popshot_save": 1, "username": "bob",
-             "account": {"password": "pw", "character_unlock_all": True,
-                         "owned_characters": [102]}})
-        saved = self.saved()["accounts"]["bob"]
-        self.assertEqual({"103400001": {"count": 1, "expires": None}},
-                         saved["inventory"])
-        self.assertNotIn("owned_characters", saved)
-        self.assertNotIn("character_unlock_all", saved)
-        self.assertEqual([102], account_store.owned_characters(saved))
+    # ★ 这里原来有一条 `test_import_converts_a_legacy_owned_characters_list`
+    #   （旧版存档里的 `owned_characters` 经导入转成角色卡）。V0.3.2 起走不到了：
+    #   v1 明文存档整个被拒，`parse_save` 也不再放行那个旧键（D86）。
+    #   线上盘里的旧键仍由启动时的 `ensure_item_fields()` 负责 ——
+    #   上面那几条 `test_a_legacy_*` 钉的就是它，那才是真正在管事的路。
 
     def test_a_character_card_in_the_warehouse_is_the_character(self):
         # D51：`owned_characters()` 只看仓库；`player_character()` 没卡退回 0。
@@ -1358,18 +1519,18 @@ class ItemFieldTests(unittest.TestCase):
         self.assertEqual([], notes)
 
     def test_import_keeps_and_cleans_the_item_fields(self):
-        payload = {"popshot_save": 1, "username": "carol", "account": {
+        payload = sealed("carol", {
             "password": "pw",
             "inventory": {str(REVOLVER_R1): 1, str(NO_SUCH_ITEM): 1},
             "equipped": [NO_SUCH_ITEM, REVOLVER_R1],
             "materials": {str(BRONZE_PIPE): 4},
-        }}
+        })
         self.store.import_account(payload)
         _, account = self.store.get_account("carol")
         self.assertEqual([REVOLVER_R1], owned_item_ids(account))
         self.assertEqual([REVOLVER_R1], equipped_items(account))
         self.assertEqual({BRONZE_PIPE: 4}, material_counts(account))
-        # 上传的是人用记事本改过的文件 —— 脏条目不该落到磁盘上。
+        # 脏条目不该落到磁盘上（来源见 `test_import_cleans_dirty_item_fields`）。
         self.assertNotIn(str(NO_SUCH_ITEM),
                          self.saved()["accounts"]["carol"]["inventory"])
 
@@ -1377,7 +1538,7 @@ class ItemFieldTests(unittest.TestCase):
         self.store.add_item("alice", REVOLVER_R1)
         self.store.equip_item("alice", REVOLVER_R1)
         self.store.add_materials("alice", {BRONZE_PIPE: 2})
-        payload = self.store.export_account("alice")["account"]
+        payload = peek(self.store.export_account("alice"))
         self.assertIn(str(REVOLVER_R1), payload["inventory"])
         self.assertEqual([REVOLVER_R1], payload["equipped"])
         self.assertEqual({str(BRONZE_PIPE): 2}, payload["materials"])

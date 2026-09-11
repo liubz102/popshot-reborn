@@ -513,12 +513,23 @@ class Handler(admin.AdminRoutes, http.server.BaseHTTPRequestHandler):
             return
         save = self.accounts.export_account(username)
         self.log_message("导出存档: %s", username)
-        self._reply(True, f"已导出「{username}」的存档，浏览器正在下载。", save=save)
+        self._reply(True,
+                    f"已导出「{username}」的存档，浏览器正在下载。"
+                    "文件里只有用户名、昵称、密码三项可以自己改，"
+                    "data 那一长串是加密的游戏数据，改了就传不回来。",
+                    save=save)
 
     def _api_import(self, data):
         save = data.get("save")
-        username, action = self.accounts.import_account(
-            save, data.get("username", ""), data.get("password", ""))
+        try:
+            username, action = self.accounts.import_account(
+                save, data.get("username", ""), data.get("password", ""))
+        except AccountError as error:
+            # ★ 拒收也记一条：过渡期里服主要看得见「有多少人还在传旧存档」。
+            #   只记错误码，不记文件内容（密文进日志没有任何用处）。
+            eventlog.online(f"注册页 ✗ 上传存档被拒 原因={error.code} "
+                            f"ip={self.client_label()}")
+            raise
         self.log_message("导入存档: %s (%s)", username, action)
         eventlog.online(f"注册页 ✓ 上传存档 账号={username!r} "
                         f"ip={self.client_label()} 结果={action}")

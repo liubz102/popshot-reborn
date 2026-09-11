@@ -3627,3 +3627,64 @@ hash 的是 `<root>\hook\bin\bshook.dll`。
 ```
 
 修之前这里是 `probe unreachable` → `已是最新版本，无需更新`。
+
+---
+
+## §91 ★★★★★ 存档转移的三条硬事实：旧服务端会**静默清档**、`popshot_save` 从来没被验过、两个运行时只有标准库（🔍代码 + ✅实测，2026-09-11）
+
+### 一、★★★ 旧服务端拿到 **V0.3.2 的新格式存档** 会把号**清空**，还报「上传成功」
+
+不是推测，是照着旧 `parse_save` 逐行推出来的，机制在 D86 六：
+
+```text
+v2 文件里没有 "account" 键
+  -> 旧 parse_save 走「退化形状」：把整个 payload 当账号
+  -> username 取到了（明文区就有）
+  -> fields = payload 里命中 NEW_ACCOUNT_DEFAULTS 的键 = 只剩 {password, display_name}
+  -> import_account 是「从默认值起手 + 覆盖」
+  => 等级 1 / 金币 0 / 仓库空 / 材料空 / 礼物盒空，**回执写的是「上传成功」**
+```
+
+**这个洞在新代码里堵不上** —— 旧服务端已经发出去了。能做的只有三件，都做了：
+
+1. 下载的文件名带上版本：`popshot-save-v2-<用户名>.json`（玩家手里很可能同时
+   躺着 v1 和 v2 两个文件，文件名是他唯一能分辨的地方）；
+2. 注册页两个 tab + 两份 README 都写死「两台服务器都要 V0.3.2+」；
+3. **发版顺序：先把服务端整体覆盖成新版，再发客户端包。**
+
+一个天然的安全网：旧服务端的回执会当场打出「（当前等级 1、经验 0、金币 0）」，
+玩家立刻看得出不对 —— 但那时数据已经被覆盖了，这只是「早点知道」，不是「没事」。
+
+### 二、`popshot_save` 这个格式标记，从 V0.2 写到 V0.3.1 **一次都没被读过**
+
+`account_store.py` 里那行注释写着「导入时用它认一眼，避免用户传错文件」，
+而老 `parse_save` 通篇没碰它，实际判据只有「有没有一个合法用户名」。
+全仓库 grep `popshot_save` 只有三处命中：定义 + 写入，以及两个测试夹具里手写
+的常量。**V0.3.2 起它是必验的第一道门**（并且要先挡布尔：`isinstance(True, int)`
+是 `True` 且 `True == 1`，一个 `"popshot_save": true` 的文件不特判就会被当成
+「旧版明文存档」）。
+
+⇒ 一般化的教训：**「写进去了」不等于「被读了」。** 加一个格式标记的同时
+就得加那条读它的用例，否则它只是一个看着让人安心的装饰。
+
+### 三、两个内置运行时**只有标准库**，但密码学够用（✅实测）
+
+`runtime/python`（3.14.3 x64）和 `runtime-win7/python`（3.8.10 win32）的
+`Lib/site-packages` **都是空的**，全仓库没有 `cryptography` / `pycryptodome`，
+连 `hmac` 在本次之前都没人 import 过。实测可用：
+
+```text
+hmac / hmac.compare_digest / hashlib.sha256（_hashlib.pyd 在）/
+secrets / base64 / struct / zlib   —— 3.8.10 上全部 OK
+```
+
+⇒ **标准库里没有 AES**，所以对称加密只能拿 HMAC 当 PRF 跑计数器模式（D86 三）。
+
+顺带两条实测数字，以后估体积用得上：
+- 400 件仓库的账号，明文 JSON 约 15 KB，zlib+base64 之后 **1472 字符**
+  —— 比原来的明文存档还小，离 `MAX_BODY_BYTES = 1<<20` 远得很；
+- `zlib.compress(b"\0" * 64MB)` 只有 **62 KB** —— 1 MB 的请求体里塞得下能把
+  内存吃光的炸弹，所以解压必须封顶（D86 五）。
+  `zlib.decompressobj().decompress(data, cap)` 的 `eof` 在「输出长度刚好等于
+  cap 而流真的结束」时**仍然是 `True`**，所以判据写 `if not eof: 拒` 就够，
+  不需要 ±1。

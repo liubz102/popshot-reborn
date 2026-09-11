@@ -23,7 +23,8 @@ import eventlog
 import gameserver
 import relay
 import versioning
-from account_store import AUTH_OK, AccountStore, tutorial_state
+import savecrypt
+from account_store import AUTH_OK, AccountStore, build_save, tutorial_state
 from simple import SimpleCipher
 from tickets import TicketStore, short
 from unittest import mock
@@ -1089,6 +1090,9 @@ class RegisterWebTests(unittest.TestCase):
         good = self.post("/api/export", {"username": self.who, "password": "pw"})
         self.assertTrue(good["ok"], good)
         self.assertEqual(self.who, good["save"]["username"])
+        # V0.3.2 的形状：三项明文 + 一段密文，老格式那个 `account` 键没有了。
+        self.assertIn("data", good["save"])
+        self.assertNotIn("account", good["save"])
 
     def test_export_of_an_unknown_user_says_so(self):
         reply = self.post("/api/export", {"username": "nosuchguy",
@@ -1097,13 +1101,12 @@ class RegisterWebTests(unittest.TestCase):
         self.assertIn("尚未注册", reply["message"])
 
     def test_import_creates_then_needs_the_password_to_replace(self):
-        save = {"popshot_save": 1, "username": self.who,
-                "account": {"password": "pw", "money": 42}}
+        save = build_save(self.who, {"password": "pw", "money": 42})
         created = self.post("/api/import", {"save": save})
         self.assertTrue(created["ok"], created)
         self.assertEqual(42, self.accounts.get_account(self.who)[1]["money"])
 
-        save["account"]["money"] = 99
+        save = build_save(self.who, {"password": "pw", "money": 99})
         refused = self.post("/api/import",
                             {"save": save, "username": self.who,
                              "password": "wrong"})
@@ -1121,15 +1124,38 @@ class RegisterWebTests(unittest.TestCase):
         self.assertFalse(reply["ok"])
         self.assertIn("存档", reply["message"])
 
+    def test_import_of_a_legacy_plaintext_save_is_reported_in_chinese(self):
+        # V0.3.1 及更早那种明文存档：拒收，而且要告诉他下一步干什么（D86）。
+        reply = self.post("/api/import", {
+            "save": {"popshot_save": 1, "username": self.who,
+                     "account": {"password": "pw", "money": 999999}}})
+        self.assertFalse(reply["ok"])
+        self.assertIn("旧版", reply["message"])
+        self.assertIn("重新导出", reply["message"])
+        self.assertFalse(self.accounts.has_account(self.who))
+
+    def test_import_of_a_tampered_save_is_reported_in_chinese(self):
+        self.post("/api/register", {"username": self.who, "password": "pw",
+                                    "password2": "pw"})
+        save = self.post("/api/export",
+                         {"username": self.who, "password": "pw"})["save"]
+        blob = save["data"]
+        save["data"] = blob[:30] + ("A" if blob[30] != "A" else "B") + blob[31:]
+        reply = self.post("/api/import", {"save": save, "username": self.who,
+                                          "password": "pw"})
+        self.assertFalse(reply["ok"])
+        self.assertIn("改过", reply["message"])
+        # 拒了就一个字节都不许写盘。
+        self.assertEqual(0, self.accounts.get_account(self.who)[1]["money"])
+
     def test_import_carries_the_item_fields_through_the_page(self):
         # V0.3 商店加的仓库 / 穿着 / 材料要能从注册页这条路进来、再导出来
         # （走真的 HTTP：JSON 的对象键只能是字符串，这里验的就是那个形状）。
         revolver, pipe = 1120041, 30018
-        save = {"popshot_save": 1, "username": self.who,
-                "account": {"password": "pw",
-                            "inventory": {str(revolver): 1},
-                            "equipped": [revolver],
-                            "materials": {str(pipe): 2}}}
+        save = build_save(self.who, {"password": "pw",
+                                     "inventory": {str(revolver): 1},
+                                     "equipped": [revolver],
+                                     "materials": {str(pipe): 2}})
         reply = self.post("/api/import", {"save": save})
         self.assertTrue(reply["ok"], reply)
         account = self.accounts.get_account(self.who)[1]
@@ -1140,8 +1166,9 @@ class RegisterWebTests(unittest.TestCase):
         exported = self.post("/api/export",
                              {"username": self.who, "password": "pw"})
         self.assertTrue(exported["ok"], exported)
+        moved = savecrypt.unseal(exported["save"]["data"])
         for key in ("inventory", "equipped", "materials"):
-            self.assertEqual(account[key], exported["save"]["account"][key], key)
+            self.assertEqual(account[key], moved[key], key)
         # 覆盖导入时没人在线 ⇒ 回执里不能自称「游戏里已即时生效」。
         replaced = self.post("/api/import",
                              {"save": save, "username": self.who,

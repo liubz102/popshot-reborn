@@ -27,6 +27,10 @@ import time
 #: 它只依赖 `json` + `os`，不会绕回来 import 本模块。
 import shopdata
 
+#: 存档密封（V0.3.2）。导出的存档里只有用户名 / 昵称 / 密码是明文，
+#: 其余字段由它封成一段改不动的密文。同样只依赖标准库，不绕回来 import 本模块。
+import savecrypt
+
 
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PATH = os.path.join(SERVER_DIR, "data", "accounts.json")
@@ -155,9 +159,68 @@ ADMIN_AUTH_MESSAGES = dict(AUTH_MESSAGES, **{
                        "要能修改请联系系统管理员开权限",
 })
 
-#: 导出的存档文件里的格式标记。导入时用它认一眼，避免用户传错文件。
+#: 导出的存档文件里的格式标记。
+#:
+#: ★ 这个键从 V0.2 起就一直写着 1、**却从来没有被读过**（老 `parse_save` 通篇
+#:   没碰它，实际判据只有「有没有合法用户名」）。V0.3.2 起它是**必验**的第一道门。
 SAVE_FORMAT_KEY = "popshot_save"
-SAVE_FORMAT_VERSION = 1
+#: 2 = V0.3.2 起：三项明文 + 一段密文。
+SAVE_FORMAT_VERSION = 2
+#: 1 = V0.3.1 及更早的**纯明文**存档，一律拒收（D86）。
+SAVE_LEGACY_VERSION = 1
+
+#: 导出文件里给人看的那几行说明。写成**数组**而不是一整段：`indent=2` 打印
+#: 出来是四行短句，比一行两百字好读。`parse_save` 完全不读它 ——
+#: 玩家删掉、改掉、加自己的备注都不影响导入。
+SAVE_NOTE_KEY = "说明"
+SAVE_NOTE_TEXT = [
+    "这是《炮炮火枪手》的账号存档。",
+    "下面三项是明文，可以用记事本直接改：username（用户名）、"
+    "nickname（游戏里显示的昵称）、password（密码）。",
+    "data 是加密后的游戏数据（等级 / 经验 / 金币 / 仓库 / 装备 / 材料 / 礼物盒 …），"
+    "改动一个字这份存档就导不进去了。",
+    "想改等级 / 金币 / 材料 / 仓库，请找服主在 GM 管理页（/admin）里改。",
+]
+
+#: 存档里**明文、玩家可以自己改**的两个账号字段。用户名不在这里 ——
+#: 它是 `accounts` 字典的键，单独放在文件顶层。
+#: ★ 昵称在文件里叫 `nickname`（和注册页上「修改昵称」的说法对齐），
+#:   存档里叫 `display_name`，两个名字的转换在 `build_save` / `parse_save`。
+SAVE_PLAIN_KEYS = ("display_name", "password")
+SAVE_NICKNAME_KEY = "nickname"
+#: 其余**全部**进密文。★ 从 `NEW_ACCOUNT_DEFAULTS` 反推而不是手写一张表 ——
+#: 以后加字段自动进密文，不会有人忘了把新字段加进来。
+SAVE_SECRET_KEYS = tuple(sorted(set(NEW_ACCOUNT_DEFAULTS) - set(SAVE_PLAIN_KEYS)))
+
+#: 拒收 V0.3.1 及更早那种明文存档时说的话。用户指定的第一句 + 一条去处 ——
+#: 只说「不支持」而不说「那我该怎么办」，服主会收到一堆没法回的求助。
+LEGACY_SAVE_TEXT = (
+    "这是旧版导出的存档，请重新导出一份。"
+    "新版服务端的存档是加密的，旧版（V0.3.1 及更早）导出的明文存档不再支持。"
+    "请在原来那台服务器升级之后用「存档下载」重新导出一份再上传；"
+    "如果那台服务器已经关掉了，请把情况告诉服主，由服主在 GM 管理页里帮你恢复。")
+
+
+def build_save(username, account):
+    """把一个账号打包成可下载的存档字典：**三项明文 + 一段密文**。
+
+    `export_account()` 用它，测试也用它造存档 —— 加密逻辑只有这一个出口，
+    不必在别处复制一遍。
+
+    ★ 密文里的字段按 `SAVE_SECRET_KEYS` **白名单**逐个取，不是「整个账号减掉
+    两项」：`_merged_account()` 是 `默认值.update(磁盘上那份)`，磁盘上残留的
+    任何野键（比如还没被 `ensure_item_fields()` 洗掉的 `owned_characters`）
+    都会穿透进来。白名单保证密文里永远只有已知字段。
+    """
+    secret = {key: account[key] for key in SAVE_SECRET_KEYS if key in account}
+    return {
+        SAVE_FORMAT_KEY: SAVE_FORMAT_VERSION,
+        SAVE_NOTE_KEY: SAVE_NOTE_TEXT,
+        "username": username,
+        SAVE_NICKNAME_KEY: account.get("display_name", ""),
+        "password": account.get("password", ""),
+        "data": savecrypt.seal(secret),
+    }
 
 #: 存档文件的 schema 版本。1 = V0.1（带 `active_account`）；2 = V0.2（票据制）。
 #:
@@ -711,39 +774,73 @@ class AccountStore:
         name, account = self.get_account(username)
         if name is None:
             raise AccountError("no_such_user", AUTH_MESSAGES[AUTH_NO_SUCH_USER])
-        return {
-            SAVE_FORMAT_KEY: SAVE_FORMAT_VERSION,
-            "username": name,
-            "account": account,
-        }
+        return build_save(name, account)
 
     @staticmethod
     def parse_save(payload):
         """把上传的 JSON 拆成 ``(用户名, 账号字段字典)``。格式不对抛 `AccountError`。
 
-        既吃 `export_account` 的完整形状，也吃「直接一个账号对象 + 里面带 username」
-        这种被人手改过的形状 —— 玩家会用记事本改存档，别为了格式洁癖把人挡在外面。
+        ★★ **只认 `build_save` 那一种形状**（V0.3.2 起，D86）。
+        V0.2 那句「玩家会用记事本改存档，别为了格式洁癖把人挡在外面」是**有意
+        反转**的：GM 管理页现在能改等级 / 金币 / 材料 / 仓库了，玩家不再需要
+        自己动存档，而只要还留着一条能吃手写 JSON 的路，加密就等于白做。
+
+        ★ 老代码里那个「取不到 `account` 就把整个 payload 当账号」的退化容忍
+        **必须删掉**，理由不是格式洁癖：加密之后，一份没有 `data` 段的文件里
+        **根本没有任何游戏数据**，退化分支会让它一路走到「从默认值起手 + 覆盖」
+        —— 结果是用户名密码都对、号还在、**东西全没了**，提示还写着「上传成功」。
+        那是一次伪装成导入的清档。
         """
         if not isinstance(payload, dict):
             raise AccountError("bad_save", "存档文件的内容必须是一个 JSON 对象")
-        raw = payload.get("account")
-        username = payload.get("username")
-        if not isinstance(raw, dict):
-            # 退化形状：整个文件就是账号本身。
-            raw = payload
-            username = username or payload.get("display_name")
-        if not isinstance(raw, dict):
-            raise AccountError("bad_save", "存档文件里找不到账号数据")
+        version = payload.get(SAVE_FORMAT_KEY)
+        # ★ 先挡布尔：`isinstance(True, int)` 是 True 且 `True == 1`，
+        #   一个 `"popshot_save": true` 的文件会被误判成「旧版存档」。
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise AccountError(
+                "bad_save",
+                "这个文件不是《炮炮火枪手》的存档。请在「存档下载」那一页重新导出"
+                "一份，直接上传下载下来的那个文件。")
+        if version == SAVE_LEGACY_VERSION:
+            raise AccountError("legacy_save", LEGACY_SAVE_TEXT)
+        if version != SAVE_FORMAT_VERSION:
+            raise AccountError(
+                "future_save",
+                "这份存档是更新版本的服务端导出的，这台服务器还看不懂。"
+                "请让服主把服务端升级到和导出那台一样的版本。")
         try:
-            username = check_username(username)
+            secret = savecrypt.unseal(payload.get("data"))
+        except savecrypt.SaveCryptError as error:
+            raise AccountError(error.code, error.message) from None
+        try:
+            username = check_username(payload.get("username"))
         except AccountError:
             raise AccountError(
                 "bad_save",
                 f"存档文件里没有可用的用户名（{USERNAME_RULE_TEXT}）") from None
-        # ★ `owned_characters` 是 D51 之前的旧键，放行只为让 `normalize_item_fields`
-        #   把它转成角色卡（旧版导出的存档里可能有）；`import_account` 转完就删。
-        fields = {key: value for key, value in raw.items()
-                  if key in NEW_ACCOUNT_DEFAULTS or key == "owned_characters"}
+        fields = {key: value for key, value in secret.items()
+                  if key in NEW_ACCOUNT_DEFAULTS}
+        # ★ 明文区的两项盖回去 —— 玩家改的就是这里，密文里压根没有它们。
+        # ★★ 必须先卡类型：`import_account` 那边是 `str(account["password"])`，
+        #    一份写着 `"password": null` 的存档会把密码悄悄变成字符串 "None"
+        #    —— 导入还会提示成功，人却登不进去了。宁可当场说不行。
+        for key in ("password", SAVE_NICKNAME_KEY):
+            if key in payload and not isinstance(payload[key], str):
+                raise AccountError(
+                    "bad_save",
+                    f"存档里的 {key} 必须是一段文字（用英文引号括起来）。"
+                    "整份文件里能改的只有 username、nickname、password 三项，"
+                    "而且它们都得是文字。")
+        if "password" in payload:
+            fields["password"] = payload["password"]
+        if SAVE_NICKNAME_KEY in payload:
+            # ★★ 这一发校验是 V0.3.2 新加的、**必须加**：以前没人特意去改昵称，
+            #   现在我们主动请玩家来改这一格，就得在门口挡住 ——
+            #   控制字符会把包和 JSON 弄坏，补充平面字符会让 `w_wstr` 的长度字段
+            #   少算（见 `NICKNAME_RULE_TEXT` 上面那段）。不校验 = 自己开一个崩溃源。
+            #   昵称**查重仍然不做**（V0.2 有意为之：导入不走查重）。
+            fields["display_name"] = check_nickname(
+                payload[SAVE_NICKNAME_KEY], username)
         return username, fields
 
     def import_account(self, payload, auth_username="", auth_password=""):
@@ -799,19 +896,25 @@ class AccountStore:
                     "password_required",
                     "存档文件里没有密码，请在上面的密码框里填一个（"
                     + PASSWORD_RULE_TEXT + "）") from None
-            # ★ 手改的等级要真的生效，见 `experience_for_import` 的说明。
-            #   `fields` = 存档里**真正写了**的字段，用来分清「他想要 1 级」
-            #   和「他压根没写 level」。
+            # ★ 见 `experience_for_import` 的说明。V0.3.2 之后玩家已经改不到
+            #   `level` 了（它在密文里），这一发守的是**另一半**：导出→原样导回
+            #   时不许把本级内攒的经验抹掉。`fields` = 存档里**真正写了**的字段。
             account["experience"] = experience_for_import(account, fields)
             account["level"] = level_for_experience(account["experience"])
             # 仓库 / 装备 / 材料照样跟着存档走（`parse_save` 按
-            # `NEW_ACCOUNT_DEFAULTS` 过滤，加字段就自动带上），但要**当场洗一遍**
-            # —— 上传的文件是玩家用记事本改过的，脏条目不该落到磁盘上。
+            # `NEW_ACCOUNT_DEFAULTS` 过滤，加字段就自动带上），但**仍然要当场洗
+            # 一遍** —— 加密之后来源不再是记事本，但还有两种脏数据：老版本服务端
+            # 导出的（那时的洗法和现在不一样），以及拿着密钥自己封了一份的人。
+            # 脏条目不该落到磁盘上。
             (account["inventory"], account["equipped"],
              account["materials"], _notes) = normalize_item_fields(account)
             # 礼物盒（D76）同理：坏条目洗掉、计数器不小于最大礼物号。
             account["gifts"], account["gift_seq"], _gift_notes = normalize_gift_fields(account)
-            for key in LEGACY_CHARACTER_KEYS:      # 旧键转成角色卡之后就不再落盘
+            # 旧键转成角色卡之后就不再落盘。★ V0.3.2 起走导入这条路已经带不进
+            # 旧键了（`parse_save` 只放 `NEW_ACCOUNT_DEFAULTS` 里的键，而 v1
+            # 明文存档整个被拒），这两行留着纯属兜底；线上盘里的旧键由启动时的
+            # `ensure_item_fields()` 负责，那条路才是真正在管事的。
+            for key in LEGACY_CHARACTER_KEYS:
                 account.pop(key, None)
             data["accounts"][username] = account
             self._write_unlocked(data)
@@ -1748,9 +1851,15 @@ def level_table():
 def experience_for_import(account, provided=None):
     """导入存档时该存多少总经验 —— ★ **等级说了算**。
 
+    ★★ **V0.3.2 起玩家已经改不到 `level` 了**（它和其余游戏数据一起在密文里，
+    D86）。这个函数**没有废** —— 它现在真正在守的是下面第三条：一份自洽的存档
+    「导出 → 原样导回」时，本级内攒的那部分经验一分都不许掉。上面那半（手改的
+    等级要真的生效）只在服务端内部和老数据上还有意义。
+
     背景：等级在服务端是由经验推出来的（D024，`_merged_account` 每次读都重算一遍），
-    存档里的 `level` 只是个派生字段。所以玩家把导出的 JSON 里的 `level` 从 1 改成 5
-    再传上来，如果不做点什么，什么都不会发生 —— 经验还是 0，一读回来等级又变回 1。
+    存档里的 `level` 只是个派生字段。所以**当年**玩家把导出的 JSON 里的 `level`
+    从 1 改成 5 再传上来，如果不做点什么，什么都不会发生 —— 经验还是 0，
+    一读回来等级又变回 1。
 
     规则（只在导入这一刻生效，D151）：
 
