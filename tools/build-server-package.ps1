@@ -253,13 +253,18 @@ try {
     #   「手改出来的版本号」而强制更新（D85 第二轮收紧）。
     #   hook\bin\bshook.dll 不在（服务端包本来就不需要它）就跳过：那时
     #   清单保持仓库里提交的那份，由客户端包那次负责。
+    #   ★★ 失败必须中断，理由和 build-portable.ps1 那边一字不差：退出码 2 =
+    #   比最新发布还老的版本 hook 变了（老版本冻结，抬版本号）；其它失败 =
+    #   这一版打出去校验整项关闭，不能默默发布。
     $hookDll = Join-Path $Root 'hook\bin\bshook.dll'
     if (Test-Path -LiteralPath $hookDll -PathType Leaf) {
         & (Join-Path $Root 'runtime\python\python.exe') `
             (Join-Path $Root 'tools\gen_hook_manifest.py') --version $Version.Text
+        if ($LASTEXITCODE -eq 2) {
+            throw ("版本 {0} 比 update-manifest.json 里最新的还老，而 hook\bin\bshook.dll 变了 —— 老版本冻结，抬 tools\build-ver.config 再打包（D85）" -f $Version.Text)
+        }
         if ($LASTEXITCODE -ne 0) {
-            Write-Host ('  [warn] 更新 server\manifest-hook.json 失败，' +
-                        '这一版不做 hook 完整性校验') -ForegroundColor Yellow
+            throw '更新 server\manifest-hook.json 失败 —— 这一版打出去将不做 hook 完整性校验，不能默默发布'
         }
     } else {
         Write-Host ('  [warn] 没有 hook\bin\bshook.dll，' +

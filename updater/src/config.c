@@ -50,7 +50,7 @@ static int read_text_file_n(const wchar_t *path, wchar_t *out, size_t cap,
                于是**整个文件读不出来**、调用方悄悄退回默认值 ——
                `config/server.config` 长到一定程度后，更新器就再也读不到
                `server_address`，探针一直去连默认的 192.168.1.100
-               （2026-09-14 实测：日志里 `probe host 192.168.1.100:27799`）。
+               （2026-09-11 实测：日志里 `probe host 192.168.1.100:27799`）。
                后果是「探针问不到服务器要哪个版本」，成对发布（D079）失效，
                而且被拒的客户端会停在「已是最新版本，无需更新」。
 

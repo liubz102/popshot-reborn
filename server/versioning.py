@@ -378,8 +378,9 @@ def load_own_version(root=None, _reload=False):
 #  客户端 hook 完整性清单（manifest-hook.json）
 # --------------------------------------------------------------------------
 
-#: 清单文件名。**就放在 `server/` 目录里** —— 两个打包脚本本来就整个
-#: `server/` 递归拷，放这儿零打包改动就同时进了客户端包和服务端包。
+#: 清单文件名。**就放在 `server/` 目录里**，两个打包脚本都经 `Copy-ServerCode`
+#: -> `Copy-HookManifest`（tools/build-common.ps1）把它带进包。★ 不是「递归拷
+#: server/ 顺带的」—— 打包只拷 *.py，JSON 要显式拷；改名的话那边要跟着改。
 HOOK_MANIFEST_FILENAME = "manifest-hook.json"
 
 #: 同 `_filter_cache` 的 mtime 热重载：加一版不用重启服务器。
@@ -491,7 +492,7 @@ def verify_client_hook(version, tag, manifest=None, root=None):
       （见 `hook_check_disabled_reason`）。
     * **MISMATCH（拒，走强制更新）** —— 三种：校验位对不上 / 本该带却没带
       （算 hash 那段被拿掉了）/ **清单里根本没有这个版本**。
-      ★ 最后这条按用户 2026-09-14 的要求改成拒：服务端由发版人自己管、
+      ★ 最后这条按用户 2026-09-11 的要求改成拒：服务端由发版人自己管、
       **保证先于客户端更新**，所以「清单里没有」只可能是手改出来的版本号。
     * **UNKNOWN（放行）** —— 对方压根没上报版本号（原版 / 很老的客户端）。
       这类交给**版本门禁**去管，不归完整性校验 —— 不然

@@ -115,9 +115,21 @@ rem  rebuilding the hook WITHOUT refreshing the manifest would lock you out of
 rem  your own server on the next launch.  Version comes from build-ver.config.
 rem --------------------------------------------------------------------------
 set "GENHOOKMAN=%SRC%..\tools\gen_hook_manifest.py"
+rem  Exit code 2 = build-ver.config names a version that is OLDER than the
+rem  newest one in tools\update-manifest.json, and the DLL we just built hashes
+rem  differently.  Old versions are frozen: their players are already out there
+rem  and a new hash would mark every one of them as "tampered".  The newest
+rem  version (the one being worked on) is always refreshed freely.
 "%PYEXE%" "%GENHOOKMAN%"
 if errorlevel 9009 (
     echo [build] WARNING: python not available, manifest-hook.json NOT refreshed
+) else if errorlevel 2 (
+    echo [build] ********************************************************************
+    echo [build] *  manifest-hook.json NOT refreshed: tools\build-ver.config names  *
+    echo [build] *  a version OLDER than the newest release and the hook changed.  *
+    echo [build] *  Old versions are frozen -- bump build-ver.config and rebuild.  *
+    echo [build] *  Until then your own server will reject this DLL ^(D85^).        *
+    echo [build] ********************************************************************
 ) else if errorlevel 1 (
     echo [build] WARNING: could not refresh server\manifest-hook.json
 )

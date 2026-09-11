@@ -334,7 +334,7 @@ function Copy-HookManifest {
     <# 把 `server\manifest-hook.json` 拷进包（**两个包都要**）。
 
        ★ 上面那圈 `Copy-ServerCode` 只拷 `*.py` + `web\` + 空的 `data\` ——
-         **JSON 不会自动跟着走**。2026-09-14 实测踩过：以为「整个 server\
+         **JSON 不会自动跟着走**。2026-09-11 实测踩过：以为「整个 server\
          递归拷」，结果打出来的包里根本没有这个文件。
 
        缺了它的症状是**沉默的**：服务端读不到清单就 fail-open，完整性校验

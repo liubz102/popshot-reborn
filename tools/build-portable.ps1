@@ -69,14 +69,22 @@ Assert-UpdaterStub -Root $Root
 # ★ 把这一版 hook 的 SHA-256 记进 server\manifest-hook.json（D85）。
 #   客户端握手时上报的那 4 字节里折了它自己那份 bshook.dll 的 hash，服务端
 #   拿这张表比对；对不上 = DLL 被改过（反倒卖公告被拿掉了？）-> 强制更新。
-#   ★ 必须在下面拷 server\ **之前**跑 —— 清单就放在 server\ 里，跟着那次
-#   递归拷贝一起进包，客户端包和服务端包各得一份，没有「另一边」要维护。
-#   ★ 表里没有的版本一律放行（服务端的包可能比客户端旧），所以漏跑这一步
-#   不会把人挡在外面，只是这一版白校验 —— 失败只警告，不中断打包。
+#   ★ 必须在下面 Copy-ServerCode **之前**跑 —— 清单就放在 server\ 里，由
+#   Copy-HookManifest 跟着一起进包，客户端包和服务端包各得一份。
+#   ★★ 失败必须中断打包，不能只警告（D85 第二轮收紧之后「清单里没有一律放行」
+#   已不成立）：
+#   · 退出码 2 = 这个版本号比 tools\update-manifest.json 里最新的还老、hook 却
+#     变了。老版本冻结（那批玩家早发出去了，hash 一变全被判「改过」）；正在做的
+#     最新版本反复打包不受影响。正解是抬 tools\build-ver.config，不是硬打。
+#   · 其它失败 = 包里清单缺自己这一版 -> 服务端整项校验自动关闭（安全阀），
+#     包照常能用，但防篡改等于没做 —— 这不是可以默默发出去的状态。
 & (Join-Path $Root 'runtime\python\python.exe') `
     (Join-Path $Root 'tools\gen_hook_manifest.py') --version $Version.Text
+if ($LASTEXITCODE -eq 2) {
+    throw ("版本 {0} 比 update-manifest.json 里最新的还老，而 hook\bin\bshook.dll 变了 —— 老版本冻结，抬 tools\build-ver.config 再打包（D85）" -f $Version.Text)
+}
 if ($LASTEXITCODE -ne 0) {
-    Write-Host ('  [warn] 更新 server\manifest-hook.json 失败，这一版不做 hook 完整性校验') -ForegroundColor Yellow
+    throw '更新 server\manifest-hook.json 失败 —— 这一版打出去将不做 hook 完整性校验，不能默默发布'
 }
 
 # ★★★ UserConfig.ini 是**构建输入**，不是本机杂项（V0.1 §49 / D021）。
@@ -229,7 +237,7 @@ try {
             '客户端每次启动会把本文件里的 version 上报给服务器（bshook 读它补丁握手版本号）。',
             '版本过旧被服务器拒绝时会自动更新：game_patched\BsPatcherChn.exe 是自研更新器（updater\src，原版风格界面，全逻辑进 exe）。'
         )
-    # ★ 把刚写好的 BUILD.ver 拷回仓库根（2026-09-14 起它**进 git**）。
+    # ★ 把刚写好的 BUILD.ver 拷回仓库根（2026-09-11 起它**进 git**）。
     #   两个理由：① 开发机上缺了它，客户端按原版 311 上报，而服务端现在会
     #   因为「清单里没有这个版本」直接拒掉（D85）—— 调试当场卡住；
     #   ② 它和 server\manifest-hook.json 是一对：版本号 + 那一版 hook 的
