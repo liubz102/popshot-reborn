@@ -326,7 +326,7 @@ IPv4 / IPv6 / 域名三种写法的示例。改完重新运行 `start.bat` 生�
 > **⚠ 玩家看得到商店价格、合成配方和掉落表。** 这一档就是给玩家当「资料站」用的
 
 五份配置就是 `server/data/` 里的 `items.json` / `shop.json` / `recipe.json` /
-`drops.json` / `rewards.json`，用记事本直接改也行，一样不用重启。
+`drops.json` / `rewards.json` / `sell_price.json`，用记事本直接改也行，一样不用重启。
 第一次开服按内置模板生成一份，
 **之后升级永远不覆盖**（价格和配方是运营数据）。
 
@@ -442,7 +442,7 @@ python tools/gs_ctl.py help
 | `server/shopdefaults.py` | ★ 商店 / 合成 / 掉落的**设计表** = 第一次开服生成的那份模板 |
 | `server/shop_items.json` | 原版物品数据的只读镜像（哪个 id 客户端认识、占哪个槽）|
 | `server/web/admin.html` | GM 管理网页（和注册页同一个端口）|
-| `server/data/` | 玩家存档 + 五份运营配置 + 卖出价格 + 发奖记录 + 备份，**都不进 Git** |
+| `server/data/` | 玩家存档 + 六份运营配置 + 发奖记录 + 备份，**都不进 Git** |
 | `config/server.config` | 联机服务器地址、注册页端口、日志与备份设置 |
 | `server/versioning.py` | 项目版本号的解析 / 编码 / 最低版本门禁（详见下面「版本号管理」）|
 | `config/server-ClientFilter.config` | 服务器允许的**最低客户端版本**（手动维护；`0` = 不限制）|

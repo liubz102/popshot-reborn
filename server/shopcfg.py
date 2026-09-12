@@ -2,15 +2,19 @@
 # -*- coding: utf-8 -*-
 """shopcfg.py —— 商店 / 合成 / 掉落 / 奖励的**运行时配置**（V0.3 合成与商店 M1）。
 
-五份 JSON，都在 `server/data/`，**用户随时手改，改完不用重启**：
+六份 JSON，都在 `server/data/`，**用户随时手改，改完不用重启**：
 
-| 文件 | 管什么 |
-|---|---|
-| `items.json` | ★ **物品库**：中文名 + 等级门槛 + 角色限定的**唯一**出处（D31）|
-| `shop.json` | 哪些东西上架、卖多少钱 |
-| `recipe.json` | 合成配方（产物 / 花费 / **最多 4 种材料**）|
-| `drops.json` | 打完一局掉什么材料 |
-| `rewards.json` | 打完一局给多少金币 / 经验（D72）|
+| 文件 | 管什么 | 在哪改 |
+|---|---|---|
+| `items.json` | ★ **物品库**：中文名 + 等级门槛 + 角色限定的**唯一**出处（D31）| 配置页 |
+| `shop.json` | 哪些东西上架、卖多少钱 | 配置页 |
+| `recipe.json` | 合成配方（产物 / 花费 / **最多 4 种材料**）| 配置页 |
+| `drops.json` | 打完一局掉什么材料 | 配置页 |
+| `rewards.json` | 打完一局给多少金币 / 经验（D72）| 配置页 |
+| `sell_price.json` | 卖东西按什么价收（D95）| ★ 「装备卖出」页上的弹窗 |
+
+★ 最后那份**没有配置标签页**，别的待遇（默认值在设计表、开服生成、热重载、
+坏文件保留上一份、回滚时同一个勾选项）和前五份一模一样。
 
 ⚠ **中文名、等级、角色限定只在 `items.json` 里**。它们是**物品自己的**属性
 （后两个客户端在「穿上」那一刻才读，`ItemInfo+0x1c` / `+0x24`），不是
@@ -23,7 +27,7 @@
   随代码走、进 git、进包。回答「这个 id 客户端认不认识、占哪个槽、加多少」。
 - `shopcfg.py`（本文件）读 `server/data/*.json` —— **用户的运营配置**，
   运行时生成、`.gitignore`、**打包时不拷**（D7）。回答「卖不卖、多少钱、怎么合」。
-- `shopdefaults.py` 算五份配置的**默认内容**（模板）—— 第一次开服 `ensure_files()`
+- `shopdefaults.py` 算六份配置的**默认内容**（模板）—— 第一次开服 `ensure_files()`
   写出来的就是它，`default_*()` 只是它的切片（D50）。改默认数值去那边改表。
 
 ## 热重载（用户要求：改完不重启即刻生效）
@@ -72,6 +76,13 @@ DROPS_FILENAME = "drops.json"
 #: ★ 打完一局给多少金币 / 经验（D72）。以前这些数写死在 `gameserver.py` 里，
 #: 调一次就得改代码 + 重启服务端；现在和另外四份一样，管理页改完即刻生效。
 REWARDS_FILENAME = "rewards.json"
+#: ★ 管理页「装备卖出」按什么价收东西（D95，**推翻 D88**）。
+#: 它和上面五份是**同一档的运营数据**：默认值住在设计表 `shopdefaults`、
+#: 开服由 `ensure_files()` 生成、回滚时和它们同一个勾选项。
+#: ★ 但它**没有配置标签页** —— 编辑入口是「装备卖出」页上那个弹窗，
+#:   所以它不在 `SCHEMA` / `web.admin.CONFIG_FILES` / `admin.js` 的 `CONFIGS` 里
+#:   （那三张表定义的是「配置页」那条链，`test_web_admin` 钉着它们一一对应）。
+SELL_PRICE_FILENAME = "sell_price.json"
 
 #: ★ 合成界面只有 4 个材料槽（`ComposeItemNewUI.ui` 的 `ImgBar0~3`，§7）。
 #: 配方写第 5 种材料，玩家在界面上根本看不见 —— 校验时直接拒绝。
@@ -867,6 +878,17 @@ def default_rewards():
     return shopdefaults.default_rewards()
 
 
+def default_sell_price():
+    """默认 `sell_price.json` = `shopdefaults.default_sell_price()`（D95）。
+
+    七个数（五个材料小类的单价 + 装备百分比 + 其他物品兜底价）由用户
+    2026-09-12 定，和另外五份一样住在设计表里 —— **新下载发布包的人
+    第一次开服拿到的就是那一份**。
+    """
+    import shopdefaults
+    return shopdefaults.default_sell_price()
+
+
 # --------------------------------------------------------------------------
 # 校验
 # --------------------------------------------------------------------------
@@ -1138,6 +1160,23 @@ def _default_bonus(key):
     raise ConfigError("默认奖励表里没有 bonus 那一条")        # 到不了
 
 
+def validate_sell_price(raw):
+    """`sell_price.json` → 七个数的表；不合法抛 `ConfigError`（D95）。
+
+    ★ 真正的规则在 `sellprice.validate()`（那边还要拿 `shopdata` 分材料小类，
+    住这儿会把本模块和物品表绑死）—— 这里只做两件事：**在 `_SPECS` 里
+    占一个位**，以及把它抛的 `ValueError` 翻成本模块的 `ConfigError`，
+    让回滚和保存那两条路拿到的异常类型和另外五份一致。
+    ★ `import` 写在函数里：`sellprice` 顶层 `import shopcfg`，
+    加载阶段两边不能互相依赖（和 `shopdefaults` 同一个办法）。
+    """
+    import sellprice
+    try:
+        return sellprice.validate(raw)
+    except ValueError as error:
+        raise ConfigError(str(error)) from None
+
+
 # --------------------------------------------------------------------------
 # 字段描述表 —— 管理页照着它生成输入框
 # --------------------------------------------------------------------------
@@ -1374,9 +1413,11 @@ def schema_keys(which):
 
 #: 「这份配置读不到时退回**内置默认值**」的记号（第三格填它）。
 #:
-#: ★ 只有 `rewards.json` 用它。别的配置退回空表最坏是「商店空着 / 这局不掉
-#: 东西」，一眼就看得出不对；奖励表退回空表是**打完一局一分钱不给**，
-#: 玩家只会觉得「这游戏坏了」，而且那一局是白打的、补不回来（D72）。
+#: ★ `rewards.json` 和 `sell_price.json` 用它。别的配置退回空表最坏是
+#: 「商店空着 / 这局不掉东西」，一眼就看得出不对；奖励表退回空表是
+#: **打完一局一分钱不给**，玩家只会觉得「这游戏坏了」，而且那一局是白打的、
+#: 补不回来（D72）；卖价表退回空表是**玩家卖东西一分钱拿不到、而东西已经
+#: 没了**（D88 三）—— 两个都是「悄悄发生、事后补不回来」的那一类。
 _USE_DEFAULT = object()
 
 _SPECS = {
@@ -1386,6 +1427,12 @@ _SPECS = {
     RECIPE_FILENAME: (validate_recipes, default_recipes, []),
     DROPS_FILENAME: (validate_drops, default_drops, []),
     REWARDS_FILENAME: (validate_rewards, default_rewards, _USE_DEFAULT),
+    # ★ 卖出价格（D95，推翻 D88）：和上面五份同一档运营数据 —— 一样由
+    #   `ensure_files()` 开服生成、一样进数据备份那**一个**勾选项、一样
+    #   在这张表里排到一把写锁。它只是**没有配置标签页**（编辑入口是
+    #   「装备卖出」页上那个弹窗），所以不进 `SCHEMA` / `CONFIG_FILES`。
+    SELL_PRICE_FILENAME: (validate_sell_price, default_sell_price,
+                          _USE_DEFAULT),
 }
 
 #: ★ 每份配置一把**写锁**，护住「读盘 → 合并 → 写盘」这一段（D36）。
@@ -1425,6 +1472,9 @@ _WHICH_OF = {ITEMS_FILENAME: "items", SHOP_FILENAME: "shop",
              RECIPE_FILENAME: "recipe", DROPS_FILENAME: "drops",
              REWARDS_FILENAME: "rewards"}
 
+#: 没有配置标签页、因而不在 `SCHEMA` 里的那些的标题（D95）。
+_TITLE_OF = {SELL_PRICE_FILENAME: "卖出价格"}
+
 
 def config_filenames():
     """互相关联、**必须一起回滚**的那一组运营配置（`_SPECS` 登记的全部）。"""
@@ -1434,7 +1484,9 @@ def config_filenames():
 def config_title(filename):
     """某份配置在页面上叫什么（物品库 / 商店货架 / …）；不认识就回文件名。"""
     which = _WHICH_OF.get(filename)
-    return SCHEMA[which]["title"] if which in SCHEMA else filename
+    if which in SCHEMA:
+        return SCHEMA[which]["title"]
+    return _TITLE_OF.get(filename, filename)
 
 
 def validator_of(filename):
@@ -1515,6 +1567,12 @@ def drops(data_dir=None, _reload=False):
 def rewards(data_dir=None, _reload=False):
     """`[奖励档位…]`（D72）。★ 读不到 / 读坏了退回**内置默认值**，不是空表。"""
     return _load(REWARDS_FILENAME, data_dir, _reload)
+
+
+def sell_price(data_dir=None, _reload=False):
+    """卖出价格表（D95）。★ 读不到 / 读坏了退回**内置默认值**，不是空表
+    —— 空表 = 玩家卖东西一分钱拿不到，而他东西已经没了。"""
+    return _load(SELL_PRICE_FILENAME, data_dir, _reload)
 
 
 def invalidate(data_dir=None):

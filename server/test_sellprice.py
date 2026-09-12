@@ -74,8 +74,8 @@ class MaterialClassTests(unittest.TestCase):
 
 
 class _PriceCase(unittest.TestCase):
-    """临时 data 目录。★ 价格表**不进** `shopcfg._SPECS`，所以这里不用
-    像 `_CfgCase` 那样铺一套配置 —— 它读不到文件时退回内置默认值。"""
+    """临时 data 目录。★ 价格表是**第六份运营配置**（`shopcfg._SPECS`，D95），
+    读不到文件时退回内置默认值（`_USE_DEFAULT`），所以这里不用先铺一份。"""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -92,6 +92,10 @@ class _PriceCase(unittest.TestCase):
     def write_raw(self, text):
         with open(sellprice.path(), "w", encoding="utf-8", newline="\n") as fp:
             fp.write(text)
+
+    def raw_bytes(self):
+        with open(sellprice.path(), "rb") as fp:
+            return fp.read()
 
 
 class LoadSaveTests(_PriceCase):
@@ -111,6 +115,49 @@ class LoadSaveTests(_PriceCase):
              "special_high": 600, "card": 200,
              "equip_percent": 95, "other_price": 500},
             sellprice.DEFAULTS)
+
+    def test_the_factory_table_lives_in_the_design_table(self):
+        """★ 出厂值住在 `shopdefaults`，和另外五份一个待遇（D95 / D50）。
+
+        `sellprice.DEFAULTS` 只是个别名 —— 两处各写一份数字的话，
+        「改了设计表、开出来的服还是老价」这种事一句报错都不会有。
+        """
+        self.assertEqual(shopdefaults.SELL_PRICE, sellprice.DEFAULTS)
+        self.assertEqual({"format": shopcfg.FORMAT,
+                          "prices": sellprice.DEFAULTS},
+                         shopcfg.default_sell_price())
+
+    def test_the_factory_table_covers_exactly_the_seven_keys(self):
+        """★ 设计表里的键名是**字面量**（那边不能 import 本模块，会绕成环）
+        ⇒ 拿这一条钉住「两边说的是同一张表」。"""
+        self.assertEqual(
+            set(sellprice.MATERIAL_CLASSES)
+            | {sellprice.KEY_PERCENT, sellprice.KEY_OTHER},
+            set(shopdefaults.SELL_PRICE))
+
+    def test_it_is_registered_as_an_operations_config(self):
+        """★★ 和那五份**同一组**（用户 2026-09-12）：开服生成、一起回滚。
+
+        判据全部**现取**，不写死文件名 —— 以后谁把它从 `_SPECS` 里摘出去，
+        这一条立刻红。
+        """
+        self.assertIn(shopcfg.SELL_PRICE_FILENAME, shopcfg.config_filenames())
+        self.assertEqual("卖出价格",
+                         shopcfg.config_title(shopcfg.SELL_PRICE_FILENAME))
+        self.assertIsNotNone(
+            shopcfg.validator_of(shopcfg.SELL_PRICE_FILENAME))
+        # ★ 但它**没有配置标签页** —— 编辑入口是「装备卖出」页上那个弹窗。
+        self.assertNotIn("sell_price", shopcfg.SCHEMA)
+
+    def test_first_boot_writes_the_file_like_the_other_five(self):
+        self.assertFalse(os.path.exists(sellprice.path()))
+        created = shopcfg.ensure_files(self.dir)
+        self.assertIn(shopcfg.SELL_PRICE_FILENAME, created)
+        self.assertEqual(sellprice.DEFAULTS, sellprice.load())
+        # D7 / 铁律 11：已存在的一律不覆盖 —— 升级不该抹掉运营改过的数。
+        sellprice.save(dict(sellprice.DEFAULTS, bead=7))
+        self.assertEqual([], shopcfg.ensure_files(self.dir))
+        self.assertEqual(7, sellprice.load()["bead"])
 
     def test_saving_then_loading_round_trips(self):
         wanted = dict(sellprice.DEFAULTS, bead=7, equip_percent=50)
@@ -132,19 +179,32 @@ class LoadSaveTests(_PriceCase):
         self.assertEqual(5, loaded["bead"])
         self.assertEqual(sellprice.DEFAULTS["card"], loaded["card"])
 
-    def test_a_broken_file_is_set_aside_not_overwritten(self):
-        """★ 价格表是人手改出来的 —— 读不动就挪到一边留着，别悄悄覆盖。"""
-        self.write_raw("{这不是 json")
-        self.assertEqual(sellprice.DEFAULTS, sellprice.load())
-        spares = [name for name in os.listdir(self.dir)
-                  if name.startswith(sellprice.FILENAME + ".bad-")]
-        self.assertEqual(1, len(spares), os.listdir(self.dir))
+    def test_a_broken_file_falls_back_but_is_never_rewritten(self):
+        """★ 和另外五份一个规矩（D95）：**坏文件原样留着，绝不回写**。
 
-    def test_a_file_that_parses_but_is_illegal_is_also_set_aside(self):
+        价格表是人手改出来的 —— 解析失败就当它不存在、下一发写盘顺手抹掉，
+        等于把他改过的数悄悄销毁。读的人拿到出厂价（不是空表），
+        文件本身一个字节不动，等人自己去看日志里那句警告。
+        """
+        self.write_raw("{这不是 json")
+        before = self.raw_bytes()
+        said = []
+        self.assertEqual(sellprice.DEFAULTS, sellprice.load(log=said.append))
+        self.assertEqual(before, self.raw_bytes())
+        self.assertTrue(said, "读坏了要往日志里说一句")
+
+    def test_a_file_that_parses_but_is_illegal_also_falls_back(self):
         self.write_raw(json.dumps({"format": 1, "prices": {"bead": -5}}))
+        before = self.raw_bytes()
         self.assertEqual(sellprice.DEFAULTS, sellprice.load())
-        self.assertTrue(any(name.startswith(sellprice.FILENAME + ".bad-")
-                            for name in os.listdir(self.dir)))
+        self.assertEqual(before, self.raw_bytes())
+
+    def test_a_good_read_keeps_working_after_a_bad_one(self):
+        """★ 「坏文件保留上一份好的」那条也一样适用（`shopcfg._load` 的缓存）。"""
+        sellprice.save(dict(sellprice.DEFAULTS, bead=7))
+        self.assertEqual(7, sellprice.load()["bead"])
+        self.write_raw("{坏了")
+        self.assertEqual(7, sellprice.load()["bead"])
 
     def test_a_bad_value_is_refused_and_nothing_is_written(self):
         for bad in ({"bead": -1}, {"bead": "很多"}, {"bead": True},

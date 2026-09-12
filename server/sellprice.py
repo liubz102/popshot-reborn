@@ -2,47 +2,39 @@
 # -*- coding: utf-8 -*-
 """卖出价格 —— 管理页「装备卖出」按什么价收东西（用户 2026-09-12）。
 
-落在 `server/data/sell_price.json`，和账号存档 / 运营配置同一个目录。
-目录**每次现取** `shopcfg.DATA_DIR`（不在 import 时抓快照）—— 打包自检的
-`--data-dir` 和测试的临时目录都靠这一条把落脚点挪走。
+落在 `server/data/sell_price.json`。★★ **它就是第六份运营配置**
+（D95，推翻 D88）：和物品库 / 商店货架 / 合成配方 / 材料掉落 / 金币经验
+**同一个待遇** —— 出厂值住在设计表 `shopdefaults.SELL_PRICE`、开服由
+`shopcfg.ensure_files()` 生成、读盘走 `shopcfg` 那套热重载 + 「坏文件保留
+上一份好的」、数据备份回滚时和它们**同一个勾选项**、写锁排在
+`shopcfg.all_write_locks()` 那条唯一的加锁顺序里。
 
-★ **它是运营数值，但故意不做成第六份「运营配置」**（不进 `shopcfg._SPECS` /
-`SCHEMA` / `web/admin.py` 的 `CONFIG_FILES` / `admin.js` 的 `CONFIGS`）：
+★ 唯一的区别：它**没有配置标签页**。编辑入口是「装备卖出」页上那个弹窗，
+所以它不进 `shopcfg.SCHEMA` / `web.admin.CONFIG_FILES` / `admin.js` 的
+`CONFIGS` —— 那三张表定义的是「配置页」那条链（渲染器 / 脏标记 / 三方合并 /
+「共几份配置」的文案），`test_web_admin` 钉着它们三张一一对应。
 
-* 那四张表是**配置标签页**那条链，进了就会多出一个标签页，而用户要的是
-  「装备卖出」页上方一个按钮弹出来的小窗；
-* `_SPECS` 的插入顺序就是 `shopcfg.all_write_locks()` 的加锁顺序，
-  没必要为七个数去动那条全项目唯一的顺序。
+★★ **读不到 / 读坏了一律退回出厂值，绝不回空表**（`shopcfg._USE_DEFAULT`）。
+空表的后果是「玩家卖东西一分钱拿不到」，而他东西已经没了 —— 和 `rewards`
+那份「打完一局一分不给」是同一类事故。
 
-不做成配置页并没有失去什么：写锁借 `shopcfg.write_lock()`（数据备份要一次
-拿齐全部写锁，住在那边才拿得到）、原子写借 `shopcfg.write_json()`（LF 无 BOM，
-铁律 3）、数据备份自己会认（`databackup.data_files` 收目录下所有 json）。
-
-★★ **读不到 / 读坏了一律退回 `DEFAULTS`，绝不回空表。** 空表的后果是
-「玩家卖东西一分钱拿不到」，而他东西已经没了 —— 这和 `rewards` 那份
-「打完一局一分不给」是同一类事故（`shopcfg._USE_DEFAULT`）。
-⇒ 启动路径上**碰都不碰它**，第一次有人按「保存」才落盘；包里
-`server\\data\\` 因此保持空目录（`Assert-PackageDataClean` 守着）。
-
-出厂默认值随代码走（就在下面的 `DEFAULTS` 里），新下载发布包的人第一次
-开服拿到的就是这一份。
+本模块自己留的是**定价逻辑**：材料的五个小类怎么分（`material_class`）、
+一件东西值多少钱（`quote`）、一车东西算成一笔交易（`bundle`）。
 """
 from __future__ import annotations
 
 import json
-import os
-import time
 
 import shop
 import shopcfg
 import shopdata
 import shopdefaults
 
-#: 文件名。★ 加了新的 `server/data/*.json` 记得同时改 `.gitignore`。
-FILENAME = "sell_price.json"
+#: 文件名。★ 真正的登记在 `shopcfg._SPECS` 里，这儿只是个别名。
+FILENAME = shopcfg.SELL_PRICE_FILENAME
 
-#: 文件格式版本。以后字段变了靠它分辨老文件。
-FORMAT = 1
+#: 文件格式版本。和另外五份共用 `shopcfg.FORMAT`。
+FORMAT = shopcfg.FORMAT
 
 #: 材料的五个小类。★ 顺序 = 价格设置弹窗上从上到下的顺序。
 CLASS_BEAD = "bead"
@@ -72,17 +64,10 @@ KEY_OTHER = "other_price"
 #: ⇒ 上限从一开始的 1000 收到 100，前台那个输入框也照这个数钳。
 PERCENT_MAX = 100
 
-#: 出厂默认值 —— **七个数全是用户 2026-09-12 定的**
-#: （`other_price` 当天先由本工程定成 100，用户当天下午改口 500）。
-DEFAULTS = {
-    CLASS_BEAD: 100,
-    CLASS_GENERIC: 200,
-    CLASS_SPECIAL_LOW: 300,
-    CLASS_SPECIAL_HIGH: 600,
-    CLASS_CARD: 200,
-    KEY_PERCENT: 95,
-    KEY_OTHER: 500,
-}
+#: 出厂默认值 —— **住在设计表里**（`shopdefaults.SELL_PRICE`，D95），
+#: 和另外五份运营配置一个待遇：新下载发布包的人第一次开服拿到的就是那一份。
+#: 这里只是个别名，别在这儿写第二份数字。
+DEFAULTS = dict(shopdefaults.SELL_PRICE)
 
 #: 卖价的来源，回给前台画浮窗用。
 SOURCE_MATERIAL = "material"
@@ -159,30 +144,15 @@ def material_groups():
 
 
 def path(data_dir=None):
-    return os.path.join(data_dir or shopcfg.DATA_DIR, FILENAME)
+    """这份文件在哪。★ 和另外五份共用 `shopcfg.path_of()` —— 目录**每次现取**
+    `shopcfg.DATA_DIR`（打包自检的 `--data-dir` 和测试的临时目录靠这一条）。"""
+    return shopcfg.path_of(FILENAME, data_dir)
 
 
 def _lock():
-    """写锁。和运营配置共用 `shopcfg` 那套按文件名分的锁 —— 数据备份拷贝时
+    """写锁。和另外五份共用 `shopcfg` 那套按文件名分的锁 —— 数据备份拷贝时
     要一次拿齐全部写锁（`all_write_locks`），住在那边才拿得到。"""
     return shopcfg.write_lock(FILENAME)
-
-
-def _set_aside(target, why, log):
-    """读不动的旧文件挪到一边，**不直接覆盖**（照 `gifthistory._set_aside`）。
-
-    价格表是人手改出来的，解析失败就当它不存在、下一发写盘顺手抹掉，
-    等于把他改过的数悄悄销毁。挪成 `sell_price.json.bad-<时刻>` 放着。
-    """
-    spare = "%s.bad-%s" % (target, time.strftime("%Y%m%d-%H%M%S"))
-    try:
-        os.replace(target, spare)
-    except OSError:
-        spare = None
-    if log:
-        log("⚠ %s 读不了（%s）%s" % (
-            target, why,
-            "，已挪到 %s" % spare if spare else "，而且挪不走，下一发会覆盖它"))
 
 
 def _as_int(raw, label, low=0, high=None):
@@ -228,33 +198,32 @@ def validate(raw):
 
 
 def load(data_dir=None, log=None):
-    """当前的价格表。★ **读不到 / 读坏了一律退回 `DEFAULTS`。**"""
-    with _lock():
-        return _load_unlocked(path(data_dir), log)
+    """当前的价格表。★ **和另外五份走同一个读取器**（D95）。
 
-
-def _load_unlocked(target, log):
-    try:
-        with open(target, "r", encoding="utf-8") as fp:
-            raw = json.load(fp)
-    except FileNotFoundError:
-        return dict(DEFAULTS)            # 还没人配过 = 用出厂价，不是「没有价」
-    except (IOError, OSError, ValueError) as exc:
-        _set_aside(target, exc, log)
-        return dict(DEFAULTS)
-    try:
-        return validate(raw)
-    except ValueError as exc:
-        _set_aside(target, exc, log)
-        return dict(DEFAULTS)
+    `shopcfg._load()` 白送三样：热重载（改完文件下一次读就生效）、
+    **坏文件保留上一份好的、绝不回写**、读不到就退回出厂值
+    （`_USE_DEFAULT`，绝不回空表）。警告照 `shop.py` 的做法只往日志里记一句，
+    不打断卖出 —— 拿到的是出厂价，不是「没有价」。
+    """
+    table, warnings = shopcfg.sell_price(data_dir)
+    if log:
+        for line in warnings:
+            log("⚠ [sell] %s" % line)
+    return dict(table)
 
 
 def save(values, data_dir=None, log=None):
-    """校验 → 原子写，返回落盘的那一份。不合法抛 `ValueError`，一个字节不写。"""
+    """校验 → 原子写，返回落盘的那一份。不合法抛 `ValueError`，一个字节不写。
+
+    ★ 和配置页那条保存路一个形状：**过校验才落盘**（不过就一个字节不写），
+    原子写借 `shopcfg.write_json()`（LF 无 BOM，铁律 3），写完把缓存丢掉
+    省得等 mtime 的粒度。
+    """
     checked = validate(values)
     with _lock():
         shopcfg.write_json(path(data_dir),
                            {"format": FORMAT, "prices": checked})
+    shopcfg.invalidate(data_dir)
     if log:
         log("[sell] 卖出价格表已更新：%s" % json.dumps(checked, sort_keys=True))
     return checked

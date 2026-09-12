@@ -127,13 +127,11 @@
 # 记录文件读不动时 gifthistory 会把它挪到一边留着（不直接覆盖）。
 /server/data/gift_history.json.bad-*
 # sell_price.json：管理页「装备卖出」的卖价设置（server/sellprice.py）。
-# 它是**运营数值**，但和那五份配置不一样 —— 出厂默认值随代码走
-# （`sellprice.DEFAULTS`），读不到就退回默认值，所以开服时**不生成**它，
-# 第一次有人按「保存」才落盘。⇒ 包里 server\data 照旧是空目录。
+# ★ 它就是**第六份运营配置**（D95）：和上面五份同一个待遇 —— 出厂值住在
+# 设计表 `shopdefaults.SELL_PRICE`、开服由 ensure_files() 生成、数据备份
+# 回滚时和它们同一个勾选项。所以和它们一样不进仓库。
 /server/data/sell_price.json
 /server/data/sell_price.json.*.tmp
-# 同 gift_history：读不动时挪到一边留着，不直接覆盖（人手改出来的数）。
-/server/data/sell_price.json.bad-*
 # `shop-backfill apply` 写盘前留下的那一份原件（shopcfg.backfill_defaults）。
 /server/data/*.bak-*
 # 管理页「数据备份」的备份目录（databackup.py）：每份一个子目录，里面是

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""shopdefaults.py —— 五份运营配置的**默认内容**（模板），从原版物品表程序化生成。
+"""shopdefaults.py —— 六份运营配置的**默认内容**（模板），从原版物品表程序化生成。
 
 `shopcfg.default_items()` / `default_shop()` / `default_recipes()` / `default_drops()`
-都是这里 `build_all()` 的切片（`default_rewards()` 另走 `build_rewards()` ——
-奖励表和物品表没关系）；第一次开服 `ensure_files()` 写出来的就是它，
+都是这里 `build_all()` 的切片（`default_rewards()` 另走 `build_rewards()`、
+`default_sell_price()` 直接照 `SELL_PRICE` 那七个数 —— 这两份和物品表没关系）；
+第一次开服 `ensure_files()` 写出来的就是它，
 所以**新下载发布包的人拿到的默认数据 = 这张设计表**（用户 2026-09-07 拍板，D50）。
 `tools/gen_listing.py` 是它的命令行壳：试算、自洽检查、把现有 `server/data/` 重新生成。
 
@@ -730,6 +731,36 @@ def default_drops():
 def default_rewards():
     """★ 不走 `build_all()` —— 奖励表和物品表毫无关系，没必要为它算 808 件东西。"""
     return build_rewards()
+
+
+# ---------------------------------------------------------------------------
+# 卖出价格（D95，**推翻 D88**）
+# ---------------------------------------------------------------------------
+
+#: 管理页「装备卖出」按什么价收东西 —— **七个数全是用户 2026-09-12 定的**
+#: （`other_price` 当天先由本工程定成 100，用户当天下午改口 500）。
+#:
+#: ★ 住在这张设计表里，和另外五份一个待遇（D50）：**新下载发布包的人第一次
+#:   开服拿到的就是这一份**，之后管理页怎么改都不会被升级覆盖（铁律 11）。
+#: ★ 键名故意写成**字面量**，不从 `sellprice` import —— 那边顶层
+#:   `import shopdefaults`，反向依赖会绕成环。两边对不对得上由
+#:   `test_sellprice.test_the_factory_table_covers_exactly_the_seven_keys` 钉着。
+#: ★ 百分比是「卖出价 = 买入价 × 百分之几」，上限 100：超过 100 的话
+#:   「买了再卖」「合成了再卖」就成了净赚的循环（D94 一）。
+SELL_PRICE = {
+    "bead": 100,               # 珠子（4 种）
+    "generic": 200,            # 通用材料 / 矿料（8 种）
+    "special_low": 300,        # 特殊材料 · 低档（7 种）
+    "special_high": 600,       # 特殊材料 · 高档（7 种）
+    "card": 200,               # 卡片（17 种）
+    "equip_percent": 95,       # 装备：买入价 / 配方金币花费的百分之几
+    "other_price": 500,        # 既没上架、也没有配方的那 148 件的兜底价
+}
+
+
+def default_sell_price():
+    """默认 `sell_price.json`。★ 和别的 `default_*()` 一样返回**落盘形态**。"""
+    return {"format": FORMAT, "prices": dict(SELL_PRICE)}
 
 
 def problems(built):

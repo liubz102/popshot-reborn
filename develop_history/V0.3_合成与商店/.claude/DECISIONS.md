@@ -3067,7 +3067,13 @@ D85 之后，包里那份 `server/manifest-hook.json` 记着 `bshook.dll` 的 SH
 
 ---
 
-## D88 · 卖出价格**单开一份 `sell_price.json`**，不进 `CONFIGS`（2026-09-12）
+## ~~D88~~ · 卖出价格**单开一份 `sell_price.json`**，不进 `CONFIGS`（2026-09-12）
+
+> ### ★★ 这一条当天就被 **D95 推翻了** —— 用户要「和运营配置放一组，同等待遇」。
+> 现在 `sell_price.json` 登记在 `shopcfg._SPECS` 里：出厂值在设计表、开服自动
+> 生成、回滚时同一个勾选项。下面这段留着是为了记住**当时的理由错在哪**
+> （尤其第三条：它把一个早就解决了的问题当成了理由）。
+> **只有「不进那三张配置页表」这半条仍然成立** —— 编辑入口是弹窗，不是标签页。
 
 **选**：新模块 `server/sellprice.py` 管一份 `server/data/sell_price.json`，
 **不**登记进 `shopcfg._SPECS` / `SCHEMA` / `web/admin.py` 的 `CONFIG_FILES` /
@@ -3267,3 +3273,39 @@ D85 之后，包里那份 `server/manifest-hook.json` 记着 `bshook.dll` 的 SH
 拨钮连续走、数量在 `syncSellQty()` 里四舍五入 —— 用的是「滑杆本来就能连续走」
 这件事，**不是自己编一个「分成 1000 档」的常量**（铁律 10）。
 反过来把拨钮拉回整数位正是那个顿挫的来源，别这么修。
+
+---
+
+## D95 · `sell_price.json` 就是**第六份运营配置** —— ★★ **推翻 D88**（用户 2026-09-12）
+
+用户原话：「**也要和运营配置放一组，同等待遇，包括初期值设定，初始生成 json，
+备份回滚逻辑等**」。
+
+⇒ 登记进 `shopcfg._SPECS`，四样待遇一次全给：
+
+| 待遇 | 从哪来 |
+|---|---|
+| 出厂值在**设计表**里 | `shopdefaults.SELL_PRICE` + `default_sell_price()`（D50 的口径：新下载发布包的人第一次开服拿到的就是这张表）|
+| 开服**自动生成** | `ensure_files()` 自己就遍历 `_SPECS`；已存在一律不覆盖（D7 / 铁律 11）|
+| 读盘 | `shopcfg._load()`：热重载、**坏文件保留上一份好的且绝不回写**、读不到退回出厂值（`_USE_DEFAULT`，和 `rewards` 同档 —— 空表 = 玩家卖东西一分钱拿不到而东西已经没了）|
+| 备份 / 回滚 | `config_filenames()` 现取 ⇒ 自动并进「运营配置」**那一个勾选项**，`validator_of()` 回滚前过一遍校验 |
+| 写锁 | `_SPECS` 的插入顺序就是 `all_write_locks()` 的顺序，它排在最后一把 |
+
+**D88 当时的三条理由现在逐条不成立**：
+
+1. 「进了就会多出一个配置标签页」—— **不会**。标签页那条链是
+   `SCHEMA` / `web.admin.CONFIG_FILES` / `admin.js` 的 `CONFIGS` 三张表
+   （`test_web_admin` 钉着它们一一对应），和 `_SPECS` 是两回事。
+   ⇒ 登记进 `_SPECS`、**不进那三张表**，编辑入口仍旧是「装备卖出」页上那个弹窗。
+2. 「没必要为七个数去动那条唯一的加锁顺序」—— 在末尾追加一把，顺序没动。
+3. 「开服不生成，包里 `server\data\` 才能是空目录」—— **本来就不冲突**：
+   打包自检早就用 `--data-dir` 把落脚点挪去临时目录了，`Assert-PackageDataClean`
+   验的是那道改动。D88 当时把一个已经解决的问题当成了理由。
+
+★ 键名（`bead` / `equip_percent` …）在设计表里写成**字面量**，不从 `sellprice`
+import —— 那边顶层 `import shopdefaults`，反向依赖会绕成环。两边对不对得上由
+`test_sellprice.test_the_factory_table_covers_exactly_the_seven_keys` 钉着。
+
+★ 顺带丢掉了 `sellprice._set_aside()`（坏文件挪成 `.bad-<时刻>`）：同等待遇
+意味着和另外五份一个规矩 —— **坏文件原样留着、日志里说一句、读的人拿上一份
+好的或出厂值**，不再多造一个只有它有的旁路文件。
