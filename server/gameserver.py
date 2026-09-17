@@ -81,6 +81,7 @@ from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
                    TEAM_LAYOUT_FREE, TEAM_LAYOUT_TEAMS, default_team,
                    item_mode_of, team_layout_of)
 from netlisten import create_listener, describe as describe_listen, tune_stream
+import questrecord
 import relayserver
 import roomclock
 #: 商店物品表 + 运营配置 + 组包纯函数（V0.3商店）。`shop.py` 只做「字节 ↔ 数据」，
@@ -406,6 +407,20 @@ REWARD_SLOT_TITLE = 1           # `[GameContext + 0xec + seat*20]` 称号卡片�
 OP_START_TCP_RELAY = 0x0310     # 客户端 -> 服务端：gcpStartTcpRelay（8 字节）
 OP_JOIN_RELAY = 0x0210          # 服务端 -> 客户端：gspJoinRelay（18 字节）
 OP_LEAVE_RELAY = 0x0211         # 服务端 -> 客户端：拆掉中继连接（载荷被无视）
+
+#: 任务通关记录 —— 待机房间右侧「全体记录 / 个人记录」两个框（V0.3商店 §126）。
+#:
+#: ★★ `0x0310` 是**同号反向**：上面那个是客户端要中继，这个是服务端下发闯关记录
+#: （`Packet_gspRepQuestRecord`，vft `0x66a37c`）。两者毫无关系，只是撞了号。
+#: 它的分发**不在大厅跳表里**，而在 `RoomStage` 的虚函数 `0x467a42`
+#: （`cmp word ptr [包+8], 0x310` → `call 0x46a127`）—— 跳表那一格 `0x4062ea`
+#: 是空转，V0.2 就是照着跳表得出「0x0310 已经查清了」这个假结论的。
+#:
+#: ★ `0x0311` 的应答有**两发**，是两回事，都要回：
+#:   `0x0311 gspRepQuestRecordInPvp` 喂六个座位头顶的段位标记（纯表现层）；
+#:   `0x0310 gspRepQuestRecord`      喂那两个记录框。
+OP_REP_QUEST_RECORD = 0x0310    # 服务端 -> 客户端：gspRepQuestRecord
+OP_REQ_QUEST_RECORD = 0x0311    # 客户端 -> 服务端：gcpReqQuestRecord（8 字节）
 OP_MARK_QUEST_SUCCESS = 0x0417
 OP_RESPAWN_CHARACTER = 0x0419
 
@@ -1987,6 +2002,54 @@ def build_rep_quest_record_in_pvp(records=None):
     return w_i32(len(records)) + b"".join(w_i32(v) for v in records)
 
 
+def _mmss(seconds):
+    """秒数 → 日志里的 `mm:ss`，和客户端 `"%02d:%02d"` 同一个拆法。
+    `None` = 之前没有成绩。"""
+    if seconds is None:
+        return "无记录"
+    return "%02d:%02d" % (seconds // 60, seconds % 60)
+
+
+def build_rep_quest_record(quest_id, difficulty, per_seat, records=()):
+    """opcode 0x0310 —— `Packet_gspRepQuestRecord`（★ 同号反向，见 `OP_REP_QUEST_RECORD`）。
+
+    待机房间右侧那两个框的数据源。Deserialize `0x466888`，处理器 `0x46a127`：
+
+        int32  questId
+        int32  difficulty
+        u32    n1
+        int32  perSeat[n1]
+        u32    n2
+        n2 × { int32 秒数; u16 字符数; wchar_t 名字[字符数] }
+
+    ## 三条硬约束，一条都不能破
+
+    1. ★ **`questId` / `difficulty` 必须原样回显请求里那一对**。处理器拿它俩和
+       `[LobbyStage+0x20]` / `[+0x24]` 硬比（`0x46a176` / `0x46a182`），
+       不等就**整包析构走人** —— 症状是「服务端明明发了，客户端那两个框纹丝不动」。
+    2. ★ **`n1` 必须正好 6**。消费循环 `0x46a1d3..0x46a1e6` 无条件跑 `i = 0..5`
+       并读 `[begin + i*4]`，**根本不看 n1** —— 少一项就是越界读。
+       客户端只取**自己座位**那一项（座位号 = `[[0x72e29c]+0x1cc]`）当「个人记录」。
+    3. ★★ **`perSeat` 里的 0 是禁用值**。刷新函数 `0x466594` 把
+       `0` 当「正在查询资料」、`99999`（`0x1869F`）当「无历史战绩」，
+       其余按 `"%02d:%02d"` 拆成分秒。**没成绩要填 99999，填 0 等于什么都没发。**
+
+    `records` 是 `[(秒数, 名字), ...]`，客户端按 `"%02d:%02d %s"`（`0x66a454`）
+    拼成「分:秒 名字」塞进 `RecordsCb` 下拉框。空列表是合法的 —— 那时客户端显示
+    兜底文本「正在查询资料」（`0x466594` 里 `ebx` 在 99999 分支没被改写），
+    这是原版行为，用户 2026-09-17 确认接受，**别为了好看去塞占位条目**。
+    """
+    if len(per_seat) != ROOM_SEAT_COUNT:
+        raise ValueError("quest record reply requires exactly %d seats"
+                         % ROOM_SEAT_COUNT)
+    body = w_i32(quest_id) + w_i32(difficulty)
+    body += w_i32(len(per_seat)) + b"".join(w_i32(v) for v in per_seat)
+    body += w_i32(len(records))
+    for seconds, name in records:
+        body += w_i32(seconds) + w_wstr(name)
+    return body
+
+
 def build_trigger_count_game(result=0):
     """opcode 0x0401 -- Packet_gspTriggerCountGame.
 
@@ -2040,9 +2103,29 @@ END_GAME_MONEY_GAINED = 4      # pkt+0x1c -> [0x72e330]  ★ 金币，客户端�
 #: 「击杀分 / 时间分 / 收集分」之类的拆分；单机把本局总分全放进第一格就够了。
 END_GAME_SCORE_PARTS = (5, 6, 7)
 
+#: ★ 破纪录播报（V0.3商店 §127）。这两格以前在 §94 的表里写着「❓未知，一律填 0」。
+#:
+#: 处理器 `0x551804` 把包里的字段搬进 `[GameContextQuest + 座位*0x34 + 0x3ec]`
+#: 那个每座位 52 字节的结构（`0x55189f: push 0xd; rep movsd` → `0x5518af call 0x4a4096`），
+#: 结算界面的播报函数再从那儿读回来：
+#:
+#:     0x4a5f94  读 [... + 0x414] = 结算表[10] → **破纪录类型**
+#:     0x4a5fb8  读 [... + 0x41c] = 结算表[12] → **用时（毫秒）**
+#:     0x5527a9  cdq/idiv 1000 → 秒 → idiv 60 → "%02d分%02d秒"，再按类型选串
+#:
+#: ⚠⚠ **结算表的槽号 ≠ 业务值索引**，别拿地址除 4 去推 —— `0x551854..0x55189d`
+#: 那段搬运是**手写逐条**的，业务值 3 被整个跳过、结算表槽 8 一次都没写过。
+#: 完整搬运表在 `re/packet_api.md` 的 `0x0411` 那一节。
+#:
+#: ★ 两个座位索引都取自 `[LobbyStage+0x1cc]` = **我自己的座位**，所以每个人只看
+#: 自己那一格 —— 我们本来就每座位发一份 `0x0411`，天生对得上，不会串台。
+END_GAME_RECORD_KIND = 9        # 0 不播 / 1 破个人记录 / 2 破全服记录
+END_GAME_ELAPSED_MS = 11        # 本局用时，**毫秒**
+
 
 def build_end_game_values(experience=0, next_level_exp=0, level_start_exp=0,
-                          money_gained=0, score=0):
+                          money_gained=0, score=0,
+                          record_kind=0, elapsed_ms=0):
     """按 §94 / §116 的语义组 `gspEndGame` 的 12 个业务值。
 
     右上角玩家数据栏那三个显示全是客户端自己做的减法：
@@ -2060,6 +2143,12 @@ def build_end_game_values(experience=0, next_level_exp=0, level_start_exp=0,
 
     `score` 落进 `END_GAME_SCORE_PARTS` 的第一格 = 结算界面「分数 / 生命」
     那一行的分数（另外两格保持 0，界面显示的是三格之和）。
+
+    `record_kind` / `elapsed_ms` 是破纪录播报那两格（见上面的常量注释）。
+    ★ **只多点亮这两格，其余 7 格继续按 D019 填 0** —— §100 那条
+    「填 201..212 会让客户端 20 毫秒内断链」的教训是 `0x0309` 的，
+    `0x0411` 全填安不安全没人验过，别顺手把别的格子也点上。
+    ★ 没破纪录时两格都是 0 ⇒ 那一局的 `0x0411` 和本版之前**逐字节相同**。
     """
     values = [0] * END_GAME_VALUE_COUNT
     values[END_GAME_EXPERIENCE] = int(experience)
@@ -2067,6 +2156,8 @@ def build_end_game_values(experience=0, next_level_exp=0, level_start_exp=0,
     values[END_GAME_LEVEL_START_EXP] = int(level_start_exp)
     values[END_GAME_MONEY_GAINED] = int(money_gained)
     values[END_GAME_SCORE_PARTS[0]] = int(score)
+    values[END_GAME_RECORD_KIND] = int(record_kind)
+    values[END_GAME_ELAPSED_MS] = int(elapsed_ms)
     return values
 
 
@@ -4135,6 +4226,63 @@ def room_system_chat(room, text):
             other.log(f"   系统提示发送失败（{error!r}），忽略")
 
 
+def broadcast_quest_record(room, quest_id, difficulty, reason=""):
+    """把 `(关卡, 难度)` 的记录 `0x0310` 发给房里**每一个人**（§126）。
+
+    ★★ 为什么必须广播、而不是「谁问答谁」：客户端只有**房主**会发 `0x0311`
+    （发送点 `0x46a0c1` 的门是 `[LobbyStage+0x1cc] == [LobbyStage+0x34]`，
+    即我的座位 == 房主座位）。客人从头到尾不问，不主动推给他，他那两个框
+    就永远停在「正在查询资料」。
+
+    三道门（都有反向用例钉着）：
+
+    1. 不是闯关房不发 —— 处理器 `0x46a127` 自己第一句就是
+       `cmp [[0x72e29c]+0x1c], 2`，非闯关房发过去纯浪费。
+    2. **这一局已经开打了就不发** —— `0x0310` 的分发在 `RoomStage` 的虚函数
+       `0x467a42` 里，而客户端一进 stage 6/7 就不是 RoomStage 了，往那儿发
+       是没验证过的动作。随机地图模式下房主那一发地图汇报 `0x0302` 恰恰
+       落在 `PREPARING`，所以这道门不是摆设。
+    3. 取不到 `(关卡, 难度)` 就不发（回显值都没有，发过去也会被丢）。
+
+    ⚠ **调用点必须排在 `0x0303 gspUpdateSession` 之后**：客户端的
+    `[LobbyStage+0x20]/[+0x24]` 是 `0x0303` 的反序列化 `0x556ed1` 直接灌进去的
+    （房主和客人走同一条路径），而 `0x0310` 的回显校验比的就是那两格。
+    先发记录、后发房间更新的话，客人手上还是旧的一对 ⇒ **整包丢弃**。
+    """
+    if room is None or room.session_type != SESSION_TYPE_QUEST:
+        return 0
+    if room_started(room):
+        return 0
+    members = [m for m in room.members(exclude=None)
+               if not getattr(m, "send_broken", False)]
+    names = [getattr(m, "account_name", None) for m in members]
+    personal, top = questrecord.board(quest_id, difficulty, [n for n in names if n])
+    per_seat = []
+    for index in range(ROOM_SEAT_COUNT):
+        seat = room.seats[index] if index < len(room.seats) else None
+        username = getattr(seat, "username", None) if seat else None
+        # ★★ 空座 / bot / 没成绩 一律填哨兵 99999 —— **绝不能填 0**，
+        #    客户端把 0 当「正在查询资料」（`0x4665bc: test eax,eax`）。
+        per_seat.append(personal.get(username, questrecord.NO_RECORD)
+                        if username else questrecord.NO_RECORD)
+    packet = build_game(OP_REP_QUEST_RECORD,
+                        build_rep_quest_record(quest_id, difficulty, per_seat, top))
+    sent = 0
+    for other in members:
+        try:
+            other.send(packet)
+            sent += 1
+        except OSError as error:
+            other.log(f"   任务记录发送失败（{error!r}），忽略")
+    if sent and members:
+        members[0].log("   ← 回 0x0310 任务记录%s 关卡 %d 难度 %d："
+                       "座位 %s，全体榜 %d 条，发给 %d 人"
+                       % (reason, quest_id, difficulty,
+                          [_mmss(v) if v != questrecord.NO_RECORD else "无记录"
+                           for v in per_seat], len(top), sent))
+    return sent
+
+
 def new_room_quest(room, seats, announce=False):
     """建这一局的 `RoomQuest`，**当场**记下 bot 受不受限（D127）。
 
@@ -4316,6 +4464,17 @@ class RoomQuest:
         #: 本局是否通关。任何人报了 `0x0417 gcpMarkQuestSuccess(1)` 就算 ——
         #: 合作模式里关底是大家一起打的，谁的脚本先喊到不重要。
         self.success = False
+        #: ★ 第一次收到 `0x0417 gcpMarkQuestSuccess(1)` 的时刻（`time.monotonic()`）。
+        #: 通关用时 = 它减 `started_at`，任务记录和结算播报共用这一个差值（§126）。
+        #:
+        #: ★★ 为什么不拿结算那一刻计时：`on_mark_quest_success` 的实测注释写死了
+        #: —— `0x0417` 在 boss 倒下后 43 毫秒就到，比 `0x040f gcpEndQuest`
+        #: **早整整 30 秒**（中间是金币雨）。用结算时刻等于给每条记录、每次播报
+        #: 都加上一段「一台机器上量出来的」30 秒常数，正是铁律 10 要防的那种事。
+        #:
+        #: 它和 `success` 同一档：只闩第一次，`begin_map_change()` 不清它
+        #: （换图和战绩一样，一整轮算一份）。
+        self.cleared_at = None
         #: 正在换的那张地图名（`0x0411` -> `0x0417`），没有换图在飞时是 None。
         self.pending_map = None
         #: 已经报过 `0x0412`（新图加载完）的连接。
@@ -5216,6 +5375,10 @@ class RoomQuest:
     def mark_success(self, ok):
         """`0x0417 gcpMarkQuestSuccess`。只会从 False 变 True，不会被冲回去。"""
         if ok:
+            # ★ 闩：合作局里六个人的关卡脚本都会喊，**先到的那一发**才是通关
+            # 时刻。和 `success` 同一个口径，后到的不许把时间往后推。
+            if not self.success:
+                self.cleared_at = time.monotonic()
             self.success = True
         return self.success
 
@@ -8036,6 +8199,36 @@ class Conn:
         except (TypeError, ValueError):
             return None
 
+    def on_req_quest_record(self, payload):
+        """`0x0311 gcpReqQuestRecord` 的记录那一半 —— 回一发 `0x0310`（§126）。
+
+        载荷是 **8 字节 = 两个 int32 `(关卡 id, 难度)`**，取自客户端的
+        `[LobbyStage+0x20]/[+0x24]`（Serialize `0x54cfa0`，组包点 `0x554911`）。
+        ⚠ `re/packet_api.md` 旧版写「载荷 ❓未观测到有意义的字段」是错的，
+        实测样本 `(3,1)` `(2,2)` `(2,3)` `(2,1)` 跟着房间的任务/难度一起变。
+
+        ★★ **回显和查榜都用请求里那一对，不是房间里那一对。** 玩家在地图面板上
+        按左右箭头选了新的任务、但还没提交 `0x0302` 时，两者会短暂不一致 ——
+        用房间那份的话回显校验 `0x46a176` 当场不过，整包被客户端丢掉。
+
+        解不出来（畸形载荷）才退回 `self.current_quest()` 兜底；连它都没有就
+        不发 —— 回显值都凑不齐，发过去也是被丢。
+        """
+        quest = None
+        if len(payload) >= 8:
+            try:
+                quest = struct.unpack_from("<ii", payload, 0)
+            except struct.error:
+                quest = None
+        if quest is None:
+            quest = self.current_quest()
+            self.log("   0x0311 载荷不是两个 int32；关卡/难度退回房间那一份"
+                     f"（{quest}）")
+        if quest is None:
+            return
+        broadcast_quest_record(self.lobby_room(), quest[0], quest[1],
+                               "（房主来问）")
+
     def record_quest_clear(self):
         """通关入账：把「这一关的这个难度打通了」记进存档并重发 0x020c。
 
@@ -9337,6 +9530,48 @@ class Conn:
                      f"经验 / 金币 / 合成材料照发）")
         else:
             self.log(f"   成就判定: 本局计入成就 —— {_bot_freedom_line(card_room)}")
+        # ---- ①a 通关用时入账 + 破纪录判定（V0.3商店 §126 / §127）----------
+        #
+        # 房间级的一句话，所以在座位循环**之前**做一次 —— `note_clear()` 一次
+        # 拿锁写一次盘，塞进循环就是六个人六次读-改-写；更要紧的是它内部那份
+        # 「写前快照」必须只取一次，否则合作局里先写进去的人会把全服最好成绩
+        # 顶掉，后面三个人明明是一起打出来的却变成「没破纪录」。
+        #
+        # ★ 四个条件都不是防刷（用户 2026-09-17 拍板：**只要通关就记**，
+        #   房里有没有 bot、bot 受没受限一律照记，别把 D127 的口径抄过来）：
+        #   闯关才有记录框 / 没通关没有用时 / 没有 (关卡,难度) 就没有桶 /
+        #   `cleared_at` 是 None 说明 `0x0417` 压根没到过（控制通道
+        #   `endgame 1` 直接盖 success 就是这一路，调试通关不该污染榜）。
+        clear_ms = 0
+        record_kinds = {}
+        if quest_mode and cleared and quest_info and quest.cleared_at is not None:
+            # ★★ 内部唯一权威值是**毫秒**，秒由它整除出来，两者同源。
+            #    必须 `//` 不能 `round`：客户端播报走 `cdq / idiv 1000`
+            #    （向零截断），201600 ms 播的是 03:21；榜上若 round 成 202 秒
+            #    就成了 03:22 —— 「播报和榜差一秒」就是这么来的。
+            #    ★ 先夹毫秒再整除：只夹秒的话 400 ms 的退化局会变成
+            #      「播报 00:00 / 榜上 00:01」，又是一次不同源。
+            clear_ms = int(round((quest.cleared_at - quest.started_at) * 1000))
+            clear_ms = max(questrecord.SECONDS_MIN * 1000,
+                           min(questrecord.SECONDS_MAX * 1000 + 999, clear_ms))
+            named = [(seat, conn) for seat, conn in seats.items()
+                     if conn.account_name]        # bot 的 account_name 是 None
+            verdicts = questrecord.note_clear(
+                quest_info[0], quest_info[1],
+                [(conn.account_name, conn.my_nickname()) for _, conn in named],
+                clear_ms // 1000, log=self.log)
+            record_kinds = {seat: verdicts.get(conn.account_name,
+                                               (questrecord.RECORD_NONE, None))[0]
+                            for seat, conn in named}
+            for seat, conn in sorted(named):
+                kind, before = verdicts.get(conn.account_name,
+                                            (questrecord.RECORD_NONE, None))
+                self.log("   通关记录: 座位 %d %s 关卡 %d 难度 %d %s -> %s（%s）"
+                         % (seat, conn.account_name, quest_info[0], quest_info[1],
+                            _mmss(before), _mmss(clear_ms // 1000),
+                            {questrecord.RECORD_GLOBAL: "破全服记录",
+                             questrecord.RECORD_PERSONAL: "破个人记录"}
+                            .get(kind, "没破，不入账")))
         for seat, conn in sorted(seats.items()):
             score = scores[seat]
             # `0x0411` 的 success 跟着尾部数组走，两个包才不会自相矛盾。
@@ -9488,6 +9723,10 @@ class Conn:
                 values=build_game_result_values(experience=gained_exp,
                                                 money=gained_money),
                 tail=tail)
+            # ★ 破纪录播报（§127）：没破的那一局两格都是 0 ⇒ `0x0411` 和本版
+            #   之前**逐字节相同**。所以 `kind == 0` 时用时那格也要发 0，
+            #   不能想着「反正没人读就顺手填上」。
+            record_kind = record_kinds.get(seat, questrecord.RECORD_NONE)
             end_games[seat] = (
                 build_end_game(seat, seat_cleared, build_end_game_values(
                     experience=experience,
@@ -9495,6 +9734,8 @@ class Conn:
                     level_start_exp=level_start_exp,
                     money_gained=gained_money,
                     score=score,
+                    record_kind=record_kind,
+                    elapsed_ms=clear_ms if record_kind else 0,
                 )),
                 (score, experience, level_start_exp, next_level_exp),
             )
@@ -11146,6 +11387,15 @@ class Conn:
             for index in regrouped:
                 self.broadcast_seat_slot(room, index, SEAT_ACTION_RESYNC,
                                          reason=f"：座位 {index} 改队伍（模式变了）")
+            # 换了任务 / 难度，右侧那两个记录框要跟着换（§126）。
+            # ★★ **必须排在上面那两发 `0x0303` 之后**：客户端的
+            #    `[LobbyStage+0x20]/[+0x24]` 是 `0x0303` 的反序列化 `0x556ed1`
+            #    灌进去的，而 `0x0310` 的回显校验比的就是那两格。顺序反过来的话
+            #    客人手上还是旧的一对，整包被丢 —— 他那两个框就永远转圈。
+            # ★ 只有房主会主动问（`0x0311`），客人从不问，所以这里得推给全房间。
+            quest = self.current_quest()
+            if quest is not None:
+                broadcast_quest_record(room, quest[0], quest[1], "（房间换图/换难度）")
         elif opcode == OP_MOVE_CHANNEL_BY_GAME_TYPE:
             try:
                 game_type = parse_move_channel_by_game_type(payload)
@@ -11174,9 +11424,15 @@ class Conn:
             # 教程跑完了。客户端自己已经切回大厅并更新了本地状态，服务端只负责
             # 把它记进存档，这样下次登录就不会再被强制拉去教学（见 parse_ 的注释）。
             self.on_first_user_result(payload)
-        elif opcode == 0x0311:
+        elif opcode == OP_REQ_QUEST_RECORD:
+            # ★ 这一发要回**两个**包，是两回事：
+            #   `0x0311` 喂六个座位头顶的段位标记（纯表现层，全 0 客户端照跑）；
+            #   `0x0310` 喂待机房间右侧那两个记录框（§126）。
+            # 先旧后新 —— 这样新增的这一路对既有行为零影响。
             self.log("← 回 gspRepQuestRecordInPvp（6 项空记录）")
-            self.send(build_game(0x0311, build_rep_quest_record_in_pvp()))
+            self.send(build_game(OP_REQ_QUEST_RECORD,
+                                 build_rep_quest_record_in_pvp()))
+            self.on_req_quest_record(payload)
         elif opcode == OP_END_QUEST:
             # 关卡结束（倒计时归零或通关）。客户端只把事件报上来就等着，
             # 服务端不回 0x0411 的话关卡永远停在原地不进结算页（FINDINGS §86）。

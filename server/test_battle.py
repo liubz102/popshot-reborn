@@ -18,6 +18,7 @@ import collections
 import os
 import struct
 import sys
+import tempfile
 import threading
 import unittest
 
@@ -48,7 +49,9 @@ from gameserver import (                                       # noqa: E402
 from lobby import (Lobby, MOVE_INTO_ALREADY_PLAYING,               # noqa: E402
                    TEAM_A, TEAM_B, TEAM_LAYOUT_TEAMS)
 import mapdata                                                      # noqa: E402
+import questrecord                                                  # noqa: E402
 import relayserver                                                  # noqa: E402
+import shopcfg                                                      # noqa: E402
 import shopdata                                                     # noqa: E402
 import test_mapdata                                                 # noqa: E402
 
@@ -1951,6 +1954,32 @@ def end_game_score(body):
     values = struct.unpack_from(
         f"<{gameserver.END_GAME_VALUE_COUNT}i", body, 8)
     return sum(values[i] for i in gameserver.END_GAME_SCORE_PARTS)
+
+
+def end_game_values(body):
+    """`0x0411` 的 12 个业务值。"""
+    return struct.unpack_from(
+        f"<{gameserver.END_GAME_VALUE_COUNT}i", body, 8)
+
+
+def end_game_record(body):
+    """`(破纪录类型, 用时毫秒)` —— 业务值索引 9 / 11（V0.3商店 §127）。"""
+    values = end_game_values(body)
+    return (values[gameserver.END_GAME_RECORD_KIND],
+            values[gameserver.END_GAME_ELAPSED_MS])
+
+
+def end_game_values(body):
+    """`0x0411` 的 12 个业务值。"""
+    return struct.unpack_from(
+        f"<{gameserver.END_GAME_VALUE_COUNT}i", body, 8)
+
+
+def end_game_record(body):
+    """`(破纪录类型, 用时毫秒)` —— 业务值索引 9 / 11（V0.3商店 §127）。"""
+    values = end_game_values(body)
+    return (values[gameserver.END_GAME_RECORD_KIND],
+            values[gameserver.END_GAME_ELAPSED_MS])
 
 
 class QuestSettlementTests(BattleRoom):
@@ -3980,6 +4009,175 @@ class RoomQuestTests(unittest.TestCase):
         self.assertIsNone(quest.handover_controller(2, [0, 1]))
         self.assertEqual(0, quest.handover_controller(2, [0, 1], force=True))
         self.assertEqual([0, 1, 0, 1, 0, 1], quest.controllers)
+
+
+# ----------------------------------------------------------------------------
+# 任务通关记录（V0.3商店 §126 / §127）
+# ----------------------------------------------------------------------------
+class QuestRecordOnClearTests(BattleRoom):
+    """通关用时入账 + 破纪录播报。
+
+    ★ 计时一律**打桩** `started_at` / `cleared_at`，绝不真等 —— 判据落在真实
+    时间上就是 §118 那个偶发红的来历。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved = shopcfg.DATA_DIR
+        shopcfg.DATA_DIR = self.tmp.name
+        self.addCleanup(setattr, shopcfg, "DATA_DIR", saved)
+
+    def clear_quest(self, seconds=214):
+        """报通关，并把这一局的钟打桩成 `seconds` 秒。"""
+        gameserver.Conn.on_game_packet(self.alice, OP_MARK_QUEST_SUCCESS, w_i32(1))
+        self.quest.started_at = 1000.0
+        self.quest.cleared_at = 1000.0 + seconds
+
+    def end(self, conn=None):
+        gameserver.Conn.on_game_packet(conn or self.alice, OP_END_QUEST, b"")
+
+    def board(self):
+        return questrecord.board(3, 1, ["alice", "bob"])
+
+    def records_of(self, conn):
+        return {end_game_seat(b): end_game_record(b)
+                for b in bodies(conn, OP_END_GAME)}
+
+    # ---- 入账 ---------------------------------------------------------------
+
+    def test_clearing_records_the_time_for_everyone_in_the_room(self):
+        self.clear_quest(214)
+        self.end()
+        self.assertEqual({"alice": 214, "bob": 214}, self.board()[0])
+
+    def test_the_clock_stops_at_the_success_report_not_at_settlement(self):
+        """★★ §126 的守门人。`0x0417` 比 `0x040f` 早整整 30 秒（中间是金币雨），
+        拿结算那一刻计时等于给每条记录都加一段 30 秒的过场。"""
+        gameserver.Conn.on_game_packet(self.alice, OP_MARK_QUEST_SUCCESS, w_i32(1))
+        self.quest.started_at = 1000.0
+        self.quest.cleared_at = 1214.0          # 通关在第 214 秒
+        self.end()                              # 结算晚得多，不该影响结果
+        self.assertEqual(214, self.board()[0]["alice"])
+
+    def test_a_run_that_was_never_cleared_records_nothing(self):
+        """★ 反向验证：没报 `0x0417` 就结算 ⇒ 连文件都不该有。"""
+        self.end()
+        self.assertEqual({}, self.board()[0])
+        self.assertEqual([], os.listdir(self.tmp.name))
+
+    def test_a_forced_clear_from_the_control_channel_is_not_recorded(self):
+        """控制通道 `endgame 1` 直接盖 `success`、绕过 `mark_success`
+        ⇒ `cleared_at` 是 None ⇒ 不写盘。调试通关不污染榜。"""
+        gameserver.Conn.send_end_game(self.alice, success=True)
+        self.assertEqual({}, self.board()[0])
+        self.assertEqual([], os.listdir(self.tmp.name))
+
+    def test_a_slower_second_clear_does_not_overwrite(self):
+        self.clear_quest(214)
+        self.end()
+        self.quest.settled = False
+        self.quest.cleared_at = self.quest.started_at + 300
+        self.end()
+        self.assertEqual(214, self.board()[0]["alice"])
+
+    def test_a_bot_seat_never_reaches_the_board(self):
+        """★ 反向验证 `account_name` 那道门（bot 的是 None）。"""
+        self.clear_quest(214)
+        self.end()
+        self.assertEqual({"alice", "bob"}, set(questrecord.load()["3:1"]))
+
+    def test_the_bucket_is_keyed_by_quest_and_difficulty(self):
+        """★ 用户点名的需求：记录要区分不同的地图、不同的难度。
+        房间是 `arguments=(3, 1)`（`create_session_payload` 的默认值）。"""
+        self.clear_quest(214)
+        self.end()
+        self.assertEqual(["3:1"], list(questrecord.load()))
+
+    # ---- 破纪录播报 ---------------------------------------------------------
+
+    def test_the_first_clear_ever_announces_a_global_record(self):
+        self.clear_quest(214)
+        self.end()
+        for conn in (self.alice, self.bob):
+            for seat, (kind, _) in self.records_of(conn).items():
+                self.assertEqual(questrecord.RECORD_GLOBAL, kind, seat)
+
+    def test_beating_only_your_own_time_announces_a_personal_record(self):
+        questrecord.note_clear(3, 1, [("someone", "Someone")], 100)
+        questrecord.note_clear(3, 1, [("alice", "Alice")], 300)
+        self.clear_quest(214)
+        self.end()
+        self.assertEqual(questrecord.RECORD_PERSONAL,
+                         self.records_of(self.alice)[0][0])
+
+    def test_a_slower_run_announces_nothing(self):
+        questrecord.note_clear(3, 1, [("alice", "Alice"), ("bob", "Bob")], 100)
+        self.clear_quest(300)
+        self.end()
+        self.assertEqual({0: (0, 0), 1: (0, 0)}, self.records_of(self.alice))
+
+    def test_each_seat_carries_its_own_verdict(self):
+        """alice 破个人记录、bob 什么都没破 —— 每座位那一份各带各的。
+
+        ★ 六份都带各自的值，客户端 `0x4a5f94` 只读 `[LobbyStage+0x1cc]`
+        那一格（= 自己的座位），所以不会串台。
+        """
+        questrecord.note_clear(3, 1, [("fast", "Fast")], 100)
+        questrecord.note_clear(3, 1, [("alice", "Alice")], 300)
+        questrecord.note_clear(3, 1, [("bob", "Bob")], 150)
+        self.clear_quest(214)
+        self.end()
+        got = self.records_of(self.alice)
+        self.assertEqual(questrecord.RECORD_PERSONAL, got[0][0])
+        self.assertEqual(questrecord.RECORD_NONE, got[1][0])
+
+    def test_a_run_that_breaks_nothing_sends_the_same_bytes_as_before(self):
+        """★ 回归：没破纪录时索引 9 / 11 都是 0 ⇒ `0x0411` 和本版之前逐字节相同。"""
+        questrecord.note_clear(3, 1, [("alice", "Alice"), ("bob", "Bob")], 100)
+        self.clear_quest(300)
+        self.end()
+        for body in bodies(self.alice, OP_END_GAME):
+            values = end_game_values(body)
+            self.assertEqual(0, values[gameserver.END_GAME_RECORD_KIND])
+            self.assertEqual(0, values[gameserver.END_GAME_ELAPSED_MS])
+
+    # ---- 同源 ---------------------------------------------------------------
+
+    def test_the_board_second_and_the_announced_millisecond_agree(self):
+        """★★ 同源守门人。客户端播报走 `idiv 1000`（向零截断），榜上走 `秒/60`。
+        两边各自取整就会出现「播报说 03:21、榜上写 03:22」。"""
+        gameserver.Conn.on_game_packet(self.alice, OP_MARK_QUEST_SUCCESS, w_i32(1))
+        self.quest.started_at = 1000.0
+        self.quest.cleared_at = 1201.6           # 201.6 秒
+        self.end()
+        kind, elapsed_ms = self.records_of(self.alice)[0]
+        self.assertEqual(questrecord.RECORD_GLOBAL, kind)
+        self.assertEqual(201600, elapsed_ms)
+        self.assertEqual(201, self.board()[0]["alice"])
+        self.assertEqual(self.board()[0]["alice"], elapsed_ms // 1000)
+
+    def test_a_sub_second_clear_never_announces_zero(self):
+        """★ 先夹毫秒再整除：只夹秒的话 0.4 秒会变成「播报 00:00 / 榜上 00:01」。
+        而 0 在记录框里是「正在查询资料」。"""
+        gameserver.Conn.on_game_packet(self.alice, OP_MARK_QUEST_SUCCESS, w_i32(1))
+        self.quest.started_at = 1000.0
+        self.quest.cleared_at = 1000.4
+        self.end()
+        self.assertEqual(1000, self.records_of(self.alice)[0][1])
+        self.assertEqual(1, self.board()[0]["alice"])
+
+    # ---- 换图 ---------------------------------------------------------------
+
+    def test_only_the_first_success_report_stops_the_clock(self):
+        """合作局六个人的脚本都会喊，**先到的那一发**才是通关时刻。"""
+        self.quest.started_at = 1000.0
+        gameserver.Conn.on_game_packet(self.alice, OP_MARK_QUEST_SUCCESS, w_i32(1))
+        first = self.quest.cleared_at
+        self.assertIsNotNone(first)
+        gameserver.Conn.on_game_packet(self.bob, OP_MARK_QUEST_SUCCESS, w_i32(1))
+        self.assertEqual(first, self.quest.cleared_at)
 
 
 if __name__ == "__main__":

@@ -88,6 +88,18 @@ def _records_of(raw):
     return [row for row in records if isinstance(row, dict)]
 
 
+def check_document(document):
+    """回滚一份备份之前：它是不是一份认得出来的记录。不是就抛 `ValueError`。
+
+    ★ 只验**顶层形状**（认 `{format, records}` 和裸列表两种，和 `_records_of`
+    同一个口径），不验每一条 —— 单条坏了本来就会被安静滤掉。但整个顶层不对的话
+    `load()` 会把文件挪成 `.bad-*` 再返回空，等于「回滚完记录全没了」。
+    `databackup.restore()` 的规矩是「任何一份校验不过就一个字节都不写」。
+    """
+    if _records_of(document) is None:
+        raise ValueError('顶层不是记录列表（要 {"format": …, "records": [...]}）')
+
+
 def load(data_dir=None, log=None):
     """全部记录，**新的在前**。文件不在 = 一次都没发过，给 `[]`。"""
     with _lock():

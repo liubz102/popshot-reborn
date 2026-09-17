@@ -16,7 +16,9 @@ from unittest import mock
 
 import config as server_config
 import databackup
+import gifthistory
 import logcleanup
+import questrecord
 import shopcfg
 from account_store import AccountStore
 
@@ -99,6 +101,105 @@ class DataFilesTests(unittest.TestCase):
     def test_a_missing_directory_is_just_empty(self):
         self.assertEqual([], databackup.data_files(
             os.path.join(tempfile.gettempdir(), "no-such-dir-for-backup")))
+
+
+class GroupsTests(unittest.TestCase):
+    """回滚对话框上的复选框分组（`databackup.groups_of`）。
+
+    ★ 前端一个字都没有自己的分组逻辑 —— label / checked / warn / files 全是
+    后端给的（`admin.js` 的 `confirmRestore`），所以这一组就是那个对话框的规格书。
+    """
+
+    def groups(self, names, current=None):
+        return {g["key"]: g for g in
+                databackup.groups_of(names, current if current is not None
+                                     else list(names))}
+
+    def test_the_two_record_files_share_one_checkbox(self):
+        """★ 用户 2026-09-17：发奖记录和任务通关记录放在同一个勾选里。"""
+        got = self.groups(["gift_history.json", "quest_record.json", "shop.json"])
+        group = got[databackup.GROUP_RECORDS]
+        self.assertEqual(["gift_history.json", "quest_record.json"],
+                         group["files"])
+        self.assertIn("发奖记录", group["label"])
+        self.assertIn("任务通关记录", group["label"])
+        # ★ 反向：不许再各自占一个裸文件名的格子
+        self.assertNotIn("gift_history.json", got)
+        self.assertNotIn("quest_record.json", got)
+
+    def test_the_record_group_is_unchecked_by_default(self):
+        """记的是真实发生过的事，回滚 = 抹掉备份之后新发生的那些。"""
+        group = self.groups(["gift_history.json", "quest_record.json"])[
+            databackup.GROUP_RECORDS]
+        self.assertFalse(group["checked"])
+        self.assertIn("一般不要勾", group["warn"])
+
+    def test_one_record_file_alone_still_gets_the_group(self):
+        """老备份里可能只有 gift_history（quest_record 是后加的）。"""
+        group = self.groups(["gift_history.json"])[databackup.GROUP_RECORDS]
+        self.assertEqual(["gift_history.json"], group["files"])
+        self.assertIn("发奖记录", group["label"])
+        self.assertNotIn("任务通关记录", group["label"])
+
+    def test_no_record_group_when_the_backup_has_none(self):
+        self.assertNotIn(databackup.GROUP_RECORDS, self.groups(["shop.json"]))
+
+    def test_a_record_missing_from_data_dir_is_called_out(self):
+        """备份里有、现在没有 —— 回滚会把它建出来，格子上说一句。"""
+        group = self.groups(["gift_history.json", "quest_record.json"],
+                            current=["gift_history.json"])[
+                                databackup.GROUP_RECORDS]
+        self.assertIn("quest_record.json", group["warn"])
+
+    def test_the_other_three_kinds_of_checkbox_still_look_the_same(self):
+        """回归：运营配置一格默认勾、存档一格默认不勾、别的 json 各自一格。"""
+        names = shopcfg.config_filenames() + ["accounts.json", "gift_history.json",
+                                              "quest_record.json", "new_thing.json"]
+        got = self.groups(names)
+        self.assertTrue(got[databackup.GROUP_CONFIG]["checked"])
+        self.assertFalse(got[databackup.GROUP_ACCOUNTS]["checked"])
+        self.assertEqual(["new_thing.json"], got["new_thing.json"]["files"])
+        self.assertEqual({databackup.GROUP_CONFIG, databackup.GROUP_ACCOUNTS,
+                          databackup.GROUP_RECORDS, "new_thing.json"}, set(got))
+
+    def test_the_records_are_not_forced_to_go_together(self):
+        """★ 和运营配置那一组**待遇不同**：那六份互相关联（名字出处在物品库、
+        商店 ⇄ 合成互斥）所以 `check_selection` 强制要么全选要么全不选；
+        发奖记录和任务通关记录**彼此毫无关系**，单独回滚一份没有一致性问题。
+        前端并成一格只是为了少占地方，不该在后端也拧成死结。
+        """
+        databackup.check_selection(
+            ["gift_history.json", "quest_record.json"], ["quest_record.json"])
+
+
+class RecordDocumentChecksTests(unittest.TestCase):
+    """回滚前的顶层校验（`gifthistory.check_document` / `questrecord.check_document`）。
+
+    没有它的话坏备份会被原样写进 `server/data/`，下一次读盘时被挪成 `.bad-*`
+    再返回空 —— 等于「回滚完记录全没了」，而且要等到那时才发现。
+    """
+
+    def test_a_good_document_passes(self):
+        gifthistory.check_document({"format": 1, "records": []})
+        gifthistory.check_document([])                    # 裸列表是老格式
+        questrecord.check_document({"format": 1, "records": {}})
+        questrecord.check_document(
+            {"format": 1, "records": {"3:1": {"a": {"seconds": 214}}}})
+
+    def test_a_broken_top_level_is_refused(self):
+        for bad in ({"records": {}}, {"records": "x"}, "text", 42, None):
+            with self.assertRaises(ValueError):
+                gifthistory.check_document(bad)
+        for bad in ({"records": []}, {"records": "x"}, "text", 42, None):
+            with self.assertRaises(ValueError):
+                questrecord.check_document(bad)
+
+    def test_bad_rows_inside_a_good_document_are_tolerated(self):
+        """★ 单条坏了是读盘时安静滤掉的事（设计好的容错），不该在这一关拦。"""
+        questrecord.check_document(
+            {"format": 1, "records": {"3:1": {"a": {"seconds": "x"}},
+                                      "abc": {}}})
+        gifthistory.check_document({"format": 1, "records": [1, 2, "x"]})
 
 
 class IdAndLabelTests(unittest.TestCase):
@@ -390,6 +491,79 @@ class RestoreTests(_BackupCase):
         self.assertEqual([old_price + 1], prices)
         # 存档没被碰。
         self.assertNotIn("accounts.json", result["restored"])
+
+    def _seed_records(self):
+        """往临时 data 目录里塞两份运行时记录（`_BackupCase` 只铺配置和存档）。
+
+        ★ 走各自模块的写入口，不手写 json —— 这样格式跟着模块走，
+        将来格式变了这条测试不会悄悄测一个早就不存在的形状。
+        """
+        gifthistory.append({"sender": "admin", "summary": "第一次发奖"},
+                           data_dir=self.data_dir)
+        questrecord.note_clear(3, 1, [("alice", "Alice")], 214,
+                               data_dir=self.data_dir)
+
+    def test_rolling_back_the_record_group_end_to_end(self):
+        """★★ 用户 2026-09-17 点的题，整条链走一遍。"""
+        self._seed_records()
+        before = self.svc.create("manual", "发奖前", "admin")
+        # 备份之后又发了一次奖、又破了一次纪录
+        gifthistory.append({"sender": "admin", "summary": "第二次发奖"},
+                           data_dir=self.data_dir)
+        questrecord.note_clear(3, 1, [("alice", "Alice")], 180,
+                               data_dir=self.data_dir)
+        self.assertEqual(2, len(gifthistory.load(data_dir=self.data_dir)))
+        self.assertEqual(
+            180, questrecord.board(3, 1, ["alice"], data_dir=self.data_dir)[0]["alice"])
+
+        result = self.svc.restore(before["id"], list(databackup.RECORD_FILENAMES),
+                                  expect_admin="admin", created_by="admin")
+        self.assertEqual(sorted(databackup.RECORD_FILENAMES),
+                         sorted(result["restored"]))
+        self.assertEqual([], result["failed"])
+        # 回到备份那一刻
+        self.assertEqual(1, len(gifthistory.load(data_dir=self.data_dir)))
+        self.assertEqual(
+            214, questrecord.board(3, 1, ["alice"], data_dir=self.data_dir)[0]["alice"])
+        # ★ 运营配置和存档一个字节都没被碰
+        for name in self.config_files() + ["accounts.json"]:
+            self.assertNotIn(name, result["restored"])
+
+    def test_one_record_can_be_rolled_back_alone(self):
+        """★ 和运营配置那一组待遇不同：这两份彼此无关，单独回滚一份是合法的。"""
+        self._seed_records()
+        before = self.svc.create("manual", "发奖前", "admin")
+        gifthistory.append({"sender": "admin", "summary": "第二次发奖"},
+                           data_dir=self.data_dir)
+        questrecord.note_clear(3, 1, [("alice", "Alice")], 180,
+                               data_dir=self.data_dir)
+        result = self.svc.restore(before["id"], [questrecord.FILENAME],
+                                  expect_admin="admin", created_by="admin")
+        self.assertEqual([questrecord.FILENAME], result["restored"])
+        self.assertEqual(
+            214, questrecord.board(3, 1, ["alice"], data_dir=self.data_dir)[0]["alice"])
+        self.assertEqual(2, len(gifthistory.load(data_dir=self.data_dir)))  # 没动
+
+    def test_a_corrupt_record_in_the_backup_blocks_the_whole_rollback(self):
+        """★★ 反向验证那一关：任何一份过不了校验 ⇒ **一个字节都不写**。
+
+        没有这一关的话坏备份会被原样写下去，下一次读盘才被挪成 `.bad-*`
+        ——「回滚完记录全没了」，而且要等到那时才发现。
+        """
+        self._seed_records()
+        before = self.svc.create("manual", "发奖前", "admin")
+        gifthistory.append({"sender": "admin", "summary": "第二次发奖"},
+                           data_dir=self.data_dir)
+        # 把备份里那一份弄坏（顶层不是记录表）
+        with open(self.backup_path(before["id"], questrecord.FILENAME),
+                  "w", encoding="utf-8") as fp:
+            json.dump({"records": []}, fp)
+        with self.assertRaises(databackup.BackupError) as caught:
+            self.svc.restore(before["id"], list(databackup.RECORD_FILENAMES),
+                             expect_admin="admin", created_by="admin")
+        self.assertIn(questrecord.FILENAME, str(caught.exception))
+        # 一个字节都没写：发奖记录仍是回滚前的两条
+        self.assertEqual(2, len(gifthistory.load(data_dir=self.data_dir)))
 
     def _make_it_an_old_backup(self, backup_id, dropped):
         """把一份备份改造成「上一版那会儿做的」：删掉某一份配置和 manifest 里那条。"""

@@ -28,6 +28,14 @@ from gameserver import (
     OP_LOADING_DONE,
     OP_MOVE_CHANNEL_BY_GAME_TYPE,
     OP_QUEST_REACHED_DIFFICULTY,
+    OP_REP_QUEST_RECORD,
+    OP_REQ_QUEST_RECORD,
+    OP_START_TCP_RELAY,
+    END_GAME_RECORD_KIND,
+    END_GAME_ELAPSED_MS,
+    END_GAME_SCORE_PARTS,
+    build_end_game_values,
+    build_rep_quest_record,
     OP_RESPAWN_CHARACTER,
     OP_PREPARE_GAME,
     OP_SESSION_MEMBERS,
@@ -114,6 +122,7 @@ from account_store import (BASE_CHARACTER_IDS, EXPERIENCE_STEP, LEVEL_MAX,
 import botsync
 import gameserver
 import lobby
+import questrecord
 import shop
 import shopcfg
 from test_shop import (config_dir, parse_equipped_masks,
@@ -186,6 +195,101 @@ class GameServerPacketTests(unittest.TestCase):
         payload = struct.pack("<7i", 6, 1, 2, 3, 4, 5, 6)
         frame = build_game(0x0311, build_rep_quest_record_in_pvp([1, 2, 3, 4, 5, 6]))
         self.assertEqual(("game", 0x0311, payload, len(frame)), take_frame(frame))
+
+    # ---- 0x0310 gspRepQuestRecord（那两个记录框，V0.3商店 §126）--------------
+
+    def test_the_two_quest_record_opcodes_are_the_same_number_reversed(self):
+        """★ `0x0310` 同号反向：客户端方向是中继请求，服务端方向是闯关记录。
+
+        两者毫无关系，只是撞了号 —— V0.2 照着大厅跳表研究完入向那一半就结案了，
+        记录框因此空了整整一版。
+        """
+        self.assertEqual(0x0310, OP_REP_QUEST_RECORD)
+        self.assertEqual(0x0310, OP_START_TCP_RELAY)
+        self.assertEqual(0x0311, OP_REQ_QUEST_RECORD)
+
+    def test_rep_quest_record_wire_layout(self):
+        payload = build_rep_quest_record(3, 1, [214, 99999, 99999, 99999,
+                                                99999, 99999],
+                                         [(214, "阿狸"), (250, "Bob")])
+        quest_id, difficulty, n1 = struct.unpack_from("<3i", payload, 0)
+        self.assertEqual((3, 1, 6), (quest_id, difficulty, n1))
+        self.assertEqual((214, 99999, 99999, 99999, 99999, 99999),
+                         struct.unpack_from("<6i", payload, 12))
+        offset = 36
+        self.assertEqual(2, struct.unpack_from("<i", payload, offset)[0])
+        offset += 4
+        got = []
+        for _ in range(2):
+            seconds, length = struct.unpack_from("<iH", payload, offset)
+            offset += 6
+            got.append((seconds, payload[offset:offset + length * 2]
+                        .decode("utf-16le")))
+            offset += length * 2       # ★ 长度字段是**字符数**，不是字节数
+        self.assertEqual([(214, "阿狸"), (250, "Bob")], got)
+        self.assertEqual(len(payload), offset)
+
+    def test_rep_quest_record_requires_exactly_six_seats(self):
+        """★ 反向验证：消费循环 `0x46a1d3` 无条件跑 i=0..5、不看 n1，
+        少一项就是客户端越界读。"""
+        for count in (0, 5, 7):
+            with self.assertRaises(ValueError):
+                build_rep_quest_record(3, 1, [0] * count)
+
+    def test_rep_quest_record_echoes_whatever_was_asked(self):
+        """★ 前两个字段和 `[LobbyStage+0x20]/[+0x24]` 硬比（`0x46a176`/`0x46a182`），
+        不等就整包析构 —— 所以回显的必须是**请求里**那一对。"""
+        payload = build_rep_quest_record(7, 3, [99999] * 6)
+        self.assertEqual((7, 3), struct.unpack_from("<2i", payload, 0))
+
+    def test_rep_quest_record_takes_an_empty_board(self):
+        """用户拍板：无记录时回空列表，不造占位条目。"""
+        payload = build_rep_quest_record(3, 1, [99999] * 6, [])
+        self.assertEqual(40, len(payload))
+        self.assertEqual(0, struct.unpack_from("<i", payload, 36)[0])
+
+    def test_rep_quest_record_frame_round_trip(self):
+        body = build_rep_quest_record(2, 2, [99999] * 6)
+        frame = build_game(OP_REP_QUEST_RECORD, body)
+        self.assertEqual(("game", 0x0310, body, len(frame)), take_frame(frame))
+
+    def test_no_record_sentinel_is_never_zero(self):
+        """★★ `0` 在客户端是「正在查询资料」，`99999` 才是「无历史战绩」。
+        任何一处漏了 0 上线，玩家看到的就和「服务端挂了」一模一样。"""
+        self.assertEqual(99999, questrecord.NO_RECORD)
+        self.assertNotEqual(0, questrecord.NO_RECORD)
+
+    # ---- 0x0411 的破纪录两格（V0.3商店 §127）--------------------------------
+
+    def test_end_game_values_carry_the_record_kind_and_elapsed_ms(self):
+        values = build_end_game_values(record_kind=2, elapsed_ms=201600)
+        self.assertEqual(2, values[END_GAME_RECORD_KIND])
+        self.assertEqual(201600, values[END_GAME_ELAPSED_MS])
+        self.assertEqual(9, END_GAME_RECORD_KIND)
+        self.assertEqual(11, END_GAME_ELAPSED_MS)
+
+    def test_end_game_touches_no_other_value_slot(self):
+        """★ 反向验证：只多点亮 9 和 11。§100 那条「填满 12 格会断链」的
+        教训是 `0x0309` 的，但「别顺手多填」这条纪律照旧。"""
+        values = build_end_game_values(record_kind=1, elapsed_ms=1000)
+        for index in (0, 8, 10):
+            self.assertEqual(0, values[index], index)
+        self.assertEqual([0] * 4, [values[i] for i in (1, 2, 3, 4)])
+        self.assertEqual([0, 0], [values[i] for i in END_GAME_SCORE_PARTS[1:]])
+
+    def test_a_run_that_breaks_nothing_looks_exactly_like_before(self):
+        """没破纪录的那一局，`0x0411` 必须和本版之前逐字节相同。"""
+        self.assertEqual(build_end_game_values(experience=5, score=7),
+                         build_end_game_values(experience=5, score=7,
+                                               record_kind=0, elapsed_ms=0))
+
+    def test_the_record_kind_constants_match_the_client_branches(self):
+        """客户端 `0x5527e3` 的 `dec/jz` 链只认 1 和 2，其余一概不播。
+        `1` → Chinese.ini:1422「您的新记录为…」（个人）；
+        `2` → Chinese.ini:1423「您的新记录更新为…」（全体）。"""
+        self.assertEqual(0, questrecord.RECORD_NONE)
+        self.assertEqual(1, questrecord.RECORD_PERSONAL)
+        self.assertEqual(2, questrecord.RECORD_GLOBAL)
 
     def test_start_game_packet_payloads_are_single_int32(self):
         self.assertEqual(struct.pack("<i", 0), build_trigger_count_game())

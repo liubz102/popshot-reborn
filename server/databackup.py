@@ -64,7 +64,9 @@ import time
 import atomicfile
 import account_store
 import config as server_config
+import gifthistory
 import logcleanup
+import questrecord
 import shopcfg
 
 BACKUP_DIRNAME = "backups"
@@ -93,6 +95,28 @@ ACCOUNTS_FILENAME = "accounts.json"
 #: 回滚对话框里复选框的分组键。
 GROUP_CONFIG = "config"
 GROUP_ACCOUNTS = "accounts"
+GROUP_RECORDS = "records"
+
+#: ★ **运行时记录** —— 回滚对话框上合成**一个**勾选项（用户 2026-09-17）。
+#:
+#: 这一档既不是运营配置（没有出厂值、开服不生成），也不是玩家存档，
+#: 但一样「记的是真实发生过的事」：谁在什么时候给谁发了奖励、谁在哪张图上
+#: 打出过多快。以前它们各自占一个裸文件名的格子，现在并成一格。
+#:
+#: 顺序就是格子里文案的顺序。加新的运行时记录 json 往这儿添一行即可，
+#: 前端不用动（复选框整个是后端 `groups_of()` 生成的）。
+RECORD_FILES = (
+    (gifthistory.FILENAME, "发奖记录"),
+    (questrecord.FILENAME, "任务通关记录"),
+)
+RECORD_FILENAMES = tuple(name for name, _title in RECORD_FILES)
+
+#: 回滚前过一遍的顶层校验器。★ 运营配置走 `shopcfg.validator_of()`、
+#: 存档走 `AccountStore.check_document()`，这一组走自己模块里的那一个。
+RECORD_VALIDATORS = {
+    gifthistory.FILENAME: gifthistory.check_document,
+    questrecord.FILENAME: questrecord.check_document,
+}
 
 SYSTEM_BY = "系统"
 
@@ -236,6 +260,9 @@ def groups_of(names, current_files):
       卖价按商店买入价 / 配方金币算，D95），
       不许拆开回滚；
     * `accounts.json` 单独一格、**默认不勾**：那是玩家存档（铁律 11）；
+    * **运行时记录**（`RECORD_FILES`：发奖记录 + 任务通关记录）**一个格子**、
+      默认不勾 —— 用户 2026-09-17。它们记的是真实发生过的事，回滚 = 把备份
+      之后新发生的那些抹掉；
     * 其它 json（将来新加的）各自一格；备份里有、现在没有的默认不勾。
     """
     config_names = shopcfg.config_filenames()
@@ -252,8 +279,23 @@ def groups_of(names, current_files):
             "warn": ("备份里没有 %s，它保持现状" % " / ".join(missing)
                      if missing else None),
         })
+    in_records = [name for name in RECORD_FILENAMES if name in names]
+    if in_records:
+        titles = " · ".join(title for name, title in RECORD_FILES
+                            if name in in_records)
+        fresh = [name for name in in_records if name not in current_files]
+        groups.append({
+            "key": GROUP_RECORDS, "label": "运行时记录（%s）" % titles,
+            "files": in_records, "checked": False,
+            # ★ 纯文本，别写 Markdown —— 前端是 `el("span", "warn", …)`
+            #   直接塞 textContent（`admin.js:216`），`**粗体**` 会原样显示成星号。
+            "warn": "记的是真实发生过的事：回滚后，这份备份之后新发出去的奖励"
+                    "和新打出来的通关成绩都会消失 —— 一般不要勾。"
+                    + ("　备份里的 %s 现在还没有，回滚会把它建出来。"
+                       % "、".join(fresh) if fresh else ""),
+        })
     for name in names:
-        if name in config_names:
+        if name in config_names or name in RECORD_FILENAMES:
             continue
         if name == ACCOUNTS_FILENAME:
             groups.append({
@@ -653,6 +695,11 @@ class BackupService(object):
                             account_store.AccountStore.check_document(parsed)
                             if expect_admin:
                                 admin_survives(parsed, expect_admin)
+                        elif name in RECORD_VALIDATORS:
+                            # ★ 只验顶层形状。不验的话坏备份会被原样写下去，
+                            #   下一次读盘时 `load()` 把它挪成 `.bad-*` 再返回空
+                            #   —— 等于「回滚完记录全没了」，而且要等到那时才发现。
+                            RECORD_VALIDATORS[name](parsed)
                     except (shopcfg.ConfigError, ValueError) as error:
                         raise BackupError("备份里的 %s 过不了现在的校验（%s），没有回滚"
                                           " —— 把它取消勾选再试" % (name, error))

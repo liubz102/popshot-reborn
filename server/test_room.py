@@ -49,7 +49,9 @@ from lobby import (Lobby, MOVE_INTO_ALREADY_PLAYING, MOVE_INTO_BAD_PASSWORD,
                    MOVE_INTO_FULL, MOVE_INTO_NO_SUCH_ROOM, MOVE_INTO_OK,
                    TEAM_A, TEAM_B, TEAM_LAYOUT_COOP, TEAM_LAYOUT_FREE,
                    TEAM_LAYOUT_TEAMS, TEAM_NONE, default_team)
+import questrecord                                                  # noqa: E402
 import relayserver                                                  # noqa: E402
+import shopcfg                                                      # noqa: E402
 from simple import SimpleCipher                                     # noqa: E402
 
 
@@ -2114,6 +2116,222 @@ class PeerHeaderTests(unittest.TestCase):
         blob = (struct.pack("<BbbB", 0xFF, 0, -1, 0)
                 + struct.pack("<HHHH", 0, 0, 0, 0x0777))
         self.assertIn("(?)", gameserver.describe_peer_header(blob))
+
+
+# ----------------------------------------------------------------------------
+# 任务记录 0x0310 的接线与广播（V0.3商店 §126）
+# ----------------------------------------------------------------------------
+class QuestRecordTests(LobbyIsolated):
+    """待机房间右侧「全体记录 / 个人记录」两个框。
+
+    ★ 整组的核心是一句话：**只有房主会发 `0x0311`**（客户端 `0x46a0c1` 的门是
+    我的座位 == 房主座位），客人从不问 —— 所以服务端必须主动推给全房间。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved = shopcfg.DATA_DIR
+        shopcfg.DATA_DIR = self.tmp.name
+        self.addCleanup(setattr, shopcfg, "DATA_DIR", saved)
+
+        self.alice = make_conn("alice")
+        gameserver.Conn.on_game_packet(
+            self.alice, 0x0201,
+            create_session_payload(session_type=2, arguments=(3, 1)))
+        self.room = self.lobby.room_of(self.alice)
+        self.bob = make_conn("bob")
+        gameserver.Conn.on_game_packet(self.bob, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(self.room.room_id))
+        self.alice.sent.clear()
+        self.bob.sent.clear()
+
+    def ask(self, quest_id=3, difficulty=1, conn=None):
+        gameserver.Conn.on_game_packet(conn or self.alice,
+                                       gameserver.OP_REQ_QUEST_RECORD,
+                                       struct.pack("<ii", quest_id, difficulty))
+
+    def change(self, quest_id, difficulty, conn=None):
+        gameserver.Conn.on_game_packet(
+            conn or self.alice, gameserver.OP_CHANGE_SESSION,
+            change_session_payload(session_type=2,
+                                   arguments=(quest_id, difficulty)))
+
+    def records(self, conn):
+        """某条连接收到的全部 `0x0310` 载荷，拆成 `(关卡, 难度, 六格, 榜)`。"""
+        out = []
+        for blob in conn.sent:
+            for _, op, payload in frames(blob):
+                if op != gameserver.OP_REP_QUEST_RECORD:
+                    continue
+                quest_id, difficulty, n1 = struct.unpack_from("<3i", payload, 0)
+                per_seat = struct.unpack_from("<%di" % n1, payload, 12)
+                offset = 12 + n1 * 4
+                count = struct.unpack_from("<i", payload, offset)[0]
+                offset += 4
+                top = []
+                for _ in range(count):
+                    seconds, length = struct.unpack_from("<iH", payload, offset)
+                    offset += 6
+                    top.append((seconds,
+                                payload[offset:offset + length * 2]
+                                .decode("utf-16le")))
+                    offset += length * 2
+                out.append((quest_id, difficulty, list(per_seat), top))
+        return out
+
+    # ---- 应答 ---------------------------------------------------------------
+
+    def test_the_host_asking_gets_both_packets_in_order(self):
+        """`0x0311` 要回**两发**：先段位标记、后记录。"""
+        self.ask()
+        ops = opcodes(self.alice)
+        self.assertEqual([gameserver.OP_REQ_QUEST_RECORD,
+                          gameserver.OP_REP_QUEST_RECORD], ops)
+
+    def test_the_answer_reaches_the_guests_too(self):
+        """★★ 整个需求的心脏：客人自己不发 `0x0311`，不推给他就永远转圈。"""
+        self.ask()
+        self.assertEqual(1, len(self.records(self.bob)))
+
+    def test_the_answer_echoes_exactly_what_was_asked(self):
+        """★ 前两个字段和 `[LobbyStage+0x20]/[+0x24]` 硬比（`0x46a176`），
+        不等就整包析构 —— 所以回显的必须是**请求里**那一对，
+        哪怕它和房间当前那一对不一样（玩家按了箭头但还没提交 `0x0302`）。"""
+        self.ask(quest_id=5, difficulty=2)
+        self.assertEqual((5, 2), self.records(self.alice)[0][:2])
+
+    def test_my_own_seat_carries_my_own_record(self):
+        questrecord.note_clear(3, 1, [("alice", "Alice")], 214)
+        self.ask()
+        per_seat = self.records(self.alice)[0][2]
+        self.assertEqual(214, per_seat[0])
+        self.assertEqual([questrecord.NO_RECORD] * 5, per_seat[1:])
+
+    def test_a_seat_with_no_record_gets_the_sentinel_not_zero(self):
+        """★★ `0` 在客户端是「正在查询资料」，`99999` 才是「无历史战绩」。"""
+        self.ask()
+        per_seat = self.records(self.alice)[0][2]
+        self.assertEqual([questrecord.NO_RECORD] * 6, per_seat)
+        self.assertNotIn(0, per_seat)
+
+    def test_the_seat_grid_is_always_exactly_six(self):
+        """★ 客户端消费循环无条件跑 i=0..5、不看 n1，少一项就是越界读。"""
+        self.ask()
+        self.assertEqual(6, len(self.records(self.alice)[0][2]))
+
+    def test_the_board_carries_names_and_times(self):
+        questrecord.note_clear(3, 1, [("alice", "阿狸")], 214)
+        questrecord.note_clear(3, 1, [("bob", "Bob")], 250)
+        self.ask()
+        self.assertEqual([(214, "阿狸"), (250, "Bob")],
+                         self.records(self.alice)[0][3])
+
+    def test_an_empty_board_is_sent_as_no_rows(self):
+        """用户拍板：无记录时照原版回空列表，不造占位条目。"""
+        self.ask()
+        self.assertEqual([], self.records(self.alice)[0][3])
+
+    def test_a_malformed_request_falls_back_to_the_room(self):
+        for payload in (b"", b"\x01\x02\x03"):
+            self.alice.sent.clear()
+            gameserver.Conn.on_game_packet(
+                self.alice, gameserver.OP_REQ_QUEST_RECORD, payload)
+            self.assertEqual((3, 1), self.records(self.alice)[0][:2])
+
+    # ---- 换图 / 换难度 ------------------------------------------------------
+
+    def test_changing_the_quest_pushes_a_fresh_record_to_everyone(self):
+        self.change(5, 2)
+        for conn in (self.alice, self.bob):
+            got = self.records(conn)
+            self.assertEqual(1, len(got), conn.account_name)
+            self.assertEqual((5, 2), got[0][:2])
+
+    def test_the_record_packet_comes_after_the_session_update(self):
+        """★★ 顺序硬约束：客人的 `[LobbyStage+0x20]/[+0x24]` 是 `0x0303`
+        灌进去的，先发 `0x0310` 的话回显校验不过、整包被丢。"""
+        self.change(5, 2)
+        for conn in (self.alice, self.bob):
+            ops = opcodes(conn)
+            self.assertLess(ops.index(gameserver.OP_UPDATE_SESSION),
+                            ops.index(gameserver.OP_REP_QUEST_RECORD),
+                            conn.account_name)
+
+    def test_each_difficulty_has_its_own_board(self):
+        """★ 用户点名的需求：记录要区分不同的地图、不同的难度。"""
+        questrecord.note_clear(3, 1, [("alice", "Alice")], 214)
+        questrecord.note_clear(3, 2, [("alice", "Alice")], 333)
+        self.ask(3, 1)
+        self.assertEqual(214, self.records(self.alice)[0][2][0])
+        self.alice.sent.clear()
+        self.ask(3, 2)
+        self.assertEqual(333, self.records(self.alice)[0][2][0])
+
+    # ---- 三道门的反向验证 ---------------------------------------------------
+
+    def test_a_pvp_room_never_gets_a_record_packet(self):
+        """★ 反向验证第 1 道门。`0x0311` 那一发照旧要有 —— 它喂的是座位
+        段位标记，和记录框是两回事。"""
+        carol = make_conn("carol")
+        gameserver.Conn.on_game_packet(
+            carol, 0x0201,
+            create_session_payload(session_type=1, arguments=(0, 3, 0)))
+        carol.sent.clear()
+        self.ask(conn=carol)
+        self.assertEqual([gameserver.OP_REQ_QUEST_RECORD], opcodes(carol))
+        self.assertEqual([], self.records(carol))
+
+    def test_the_map_report_after_the_start_pushes_nothing(self):
+        """★ 反向验证**第一层**：开局后的那一发 `0x0302` 是地图汇报，
+        `OP_CHANGE_SESSION` 分支自己就早退了，压根走不到广播。
+
+        随机地图模式下房主那一发汇报恰恰落在 `PREPARING`（§228）。
+        """
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        self.alice.sent.clear()
+        self.bob.sent.clear()
+        self.change(5, 2)
+        self.assertEqual([], self.records(self.alice))
+        self.assertEqual([], self.records(self.bob))
+
+    def test_the_broadcast_itself_refuses_once_the_run_has_started(self):
+        """★★ 反向验证**第二层**（`broadcast_quest_record` 自己那道门）。
+
+        它守的是 `0x0311` 那条路 —— 那一路没有 `0x0302` 分支的早退。
+        `0x0310` 的分发在 `RoomStage` 的虚函数 `0x467a42` 里，客户端一进
+        stage 6/7 就不是 RoomStage 了，往那儿发是没验证过的动作。
+
+        ⚠ 直接调模块级函数，绕开 `0x0302` 那一层 —— 否则第一层会把这条用例
+        挡住，第二层拆了也不会红（这一条就是那么发现的）。
+        """
+        self.assertEqual(2, gameserver.broadcast_quest_record(self.room, 3, 1))
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        self.alice.sent.clear()
+        self.bob.sent.clear()
+        self.assertEqual(0, gameserver.broadcast_quest_record(self.room, 3, 1))
+        self.assertEqual([], self.records(self.alice))
+
+    def test_asking_after_the_start_is_refused_too(self):
+        """同上，走真实的 `0x0311` 入口 —— `0x0311` 那一发照旧回
+        （段位标记），但记录那一发不发。"""
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
+        self.alice.sent.clear()
+        self.ask()
+        self.assertEqual([gameserver.OP_REQ_QUEST_RECORD], opcodes(self.alice))
+        self.assertEqual([], self.records(self.alice))
+
+    def test_the_top_list_is_capped(self):
+        for n in range(30):
+            questrecord.note_clear(3, 1, [("p%02d" % n, "P%02d" % n)],
+                                   300 - n, now=float(n))
+        self.ask()
+        self.assertEqual(questrecord.TOP_N, len(self.records(self.alice)[0][3]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -136,6 +136,13 @@
 /server/data/gift_history.json.*.tmp
 # 记录文件读不动时 gifthistory 会把它挪到一边留着（不直接覆盖）。
 /server/data/gift_history.json.bad-*
+# quest_record.json：任务通关用时记录（server/questrecord.py），待机房间右侧
+# 「全体记录 / 个人记录」两个框的数据源。★ 和 gift_history 同一档的**运行时记录**，
+# 不是运营配置 —— 没有出厂值、开服不生成、不进 ensure_files()、不进数据备份的
+# 回滚勾选项。每台服务器的榜各是各的，而且里面全是玩家账号名和昵称。
+/server/data/quest_record.json
+/server/data/quest_record.json.*.tmp
+/server/data/quest_record.json.bad-*
 # sell_price.json：管理页「装备卖出」的卖价设置（server/sellprice.py）。
 # ★ 它就是**第六份运营配置**（D95）：和上面五份同一个待遇 —— 出厂值住在
 # 设计表 `shopdefaults.SELL_PRICE`、开服由 ensure_files() 生成、数据备份
