@@ -325,6 +325,7 @@ WEAPON_FIELDS = (
     ("CoolingTime", "cooling_ms", int),
     ("Velocity", "velocity", int),
     ("ROH", "roh", int),
+    ("Desc", "desc", str),
 )
 
 

@@ -438,6 +438,7 @@ def _split_part_suffix(name):
 
 def weapon_name_zh(item):
     """`리볼버 R1` → `左轮 极速1`；翻不出来就原样返回韩文名。"""
+
     name = item.name_kr or ""
     base = name
     if item.series and item.tier:
@@ -1179,40 +1180,43 @@ CARD_CRAFT_PREFIX = "可合成："
 
 #: 压行：数值加成一行最多摆几项。234 px / 字号 10 大约放得下 3 项
 #: （「攻击 +3%　防御 +2%　生命 +2」）。★ 这个数要实机核对。
-BONUS_PER_LINE = 3
-
+BONUS_PER_LINE = 2
+# 每一项字段固定宽度10
+BONUS_PER_WIDTH = 10
 
 def _weapon_lines(weapon):
     """武器数值那几行。`weapon` 是 `shop_items.json` 里那个 dict。"""
     lines = []
     damage = weapon.get("damage")
     if damage is not None:
+        lines.append("伤害 %d " % damage)
         # 伤害按**部位**分档，没有随机数（§17）。爆头 / 腿部两档不一定都有。
-        parts = []
         if weapon.get("head_damage"):
-            parts.append("爆头 %d" % weapon["head_damage"])
-        if weapon.get("legs_damage"):
-            parts.append("腿部 %d" % weapon["legs_damage"])
-        lines.append("伤害 %d%s"
-                     % (damage, "（%s）" % " / ".join(parts) if parts else ""))
+            lines.append("爆头 %d " % weapon["head_damage"])
+        # if weapon.get("legs_damage"):
+        #     lines.append("腿部 %d" % weapon["legs_damage"])
     # ★ 溅射两格原来一直没画出来 —— 榴弹类真正的杀伤在这
-    splash = []
     if weapon.get("splash_damage"):
-        splash.append("溅射 %d" % weapon["splash_damage"])
+        lines.append("溅射 %d " % weapon["splash_damage"])
     if weapon.get("splash_range"):
-        splash.append("范围 %d" % weapon["splash_range"])
-    if splash:
-        lines.append("　".join(splash))
-    handling = []
+        lines.append("溅射范围 %d " % weapon["splash_range"])
     if weapon.get("magazine"):
-        handling.append("弹匣 %d 发" % weapon["magazine"])
+        lines.append("弹容 %d " % weapon["magazine"])
+    if weapon.get("cooling_ms"):
+        lines.append("射速 %.1f/秒 " % (1000.0 / weapon["cooling_ms"]))
     if weapon.get("reload_ms"):
-        handling.append("换弹 %.2f 秒" % (weapon["reload_ms"] / 1000.0))
-    if handling:
-        lines.append("　".join(handling))
+        lines.append("装填 %.1f秒 " % (weapon["reload_ms"] / 1000.0))
     if weapon.get("velocity"):
-        lines.append("初速 %d" % weapon["velocity"])
-    return lines
+        lines.append("飞行速度 %d " % weapon["velocity"])
+    aligned = []
+
+    for i in range(0, len(lines), BONUS_PER_LINE):
+        chunk = lines[i:i + BONUS_PER_LINE]
+        # 每一项左对齐，补空格到固定宽度
+        padded = [item.ljust(BONUS_PER_WIDTH) for item in chunk]
+        aligned_line = "".join(padded)
+        aligned.append(aligned_line)
+    return aligned
 
 
 def _bonus_lines(bonus):
@@ -1411,10 +1415,12 @@ def item_desc_zh(item, card_rules=_AUTO, recipes_table=_AUTO):
     if item is None:
         return ""
     stats = []
+    notes = _effect_lines(item)
     if item.weapon:
         stats.extend(_weapon_lines(item.weapon))
+        if not notes and item.weapon.get("desc"):
+            notes = [item.weapon["desc"]]
     stats.extend(_bonus_lines(item.bonus or {}))
-    notes = _effect_lines(item)
     if not stats and not notes and item.kind == "material":
         if card_rules is _AUTO:
             card_rules = cards()[0]
