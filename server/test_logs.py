@@ -20,6 +20,7 @@ import config as server_config
 import daylog
 import eventlog
 import logcleanup
+import testsupport
 
 
 def touch(path, days_ago=0.0, size=0):
@@ -523,10 +524,10 @@ class LiveMidnightRollTests(unittest.TestCase):
         sys.stdout = sink
         try:
             asynclog.emit("[2026-09-13 23:59:50.000] 打烊前最后一句")
-            self.assertTrue(asynclog.drain(timeout=5.0))
+            self.assertTrue(asynclog.drain(timeout=testsupport.OUTBOX_FUSE_S))
             now[0] = after                 # ← 过零点。**进程什么都没做。**
             asynclog.emit("[2026-09-14 00:00:10.000] 新一天第一句")
-            self.assertTrue(asynclog.drain(timeout=5.0))
+            self.assertTrue(asynclog.drain(timeout=testsupport.OUTBOX_FUSE_S))
         finally:
             # 断言之前先换回来：断言失败时 unittest 要往 stdout/stderr 写。
             sys.stdout = real_out

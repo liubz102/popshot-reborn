@@ -2010,6 +2010,59 @@ def _mmss(seconds):
     return "%02d:%02d" % (seconds // 60, seconds % 60)
 
 
+#: 全体榜条目里**名字**的显示宽度上限（ASCII 算 1，其余一律算 2）。
+#:
+#: `RecordsCb` 在 `Data/Ui/SelectQuestMapRecord.ui` 里宽 **193 像素**，写死的，
+#: 而条目是按 `"%02d:%02d %s"`（`0x66a454`）拼的 —— 时间前缀「01:20 」已经
+#: 吃掉 6 个半角。
+#:
+#: ★★ 2026-09-17 实机实测（用户截图）：16 个 **ASCII** 的名字显示完好，
+#: 16 个**中文**的名字把整行撑爆，而且**被裁掉的是左边的时间**、名字反倒留全了
+#: —— 那一行就只剩「0 一二三四五六七八九十甲乙丙丁戊己」，看不到成绩。
+#: 时间是这个框的核心信息，不能让它替长昵称让路，所以宁可截名字（用户拍板）。
+#:
+#: 193 ÷ 6（半角像素宽）≈ 32 个半角，减去时间前缀 6 个 ⇒ 26 个。取 **24** 留余量：
+#: 12 个中文正好不截，13 个起才截。
+BOARD_NAME_WIDTH = 24
+
+#: 截断后接的省略号。一个全角，占 2 个半角。
+BOARD_NAME_ELLIPSIS = "…"
+
+
+def board_name_width(text):
+    """名字的显示宽度（半角为 1、其余为 2）。
+
+    ★ 不用 `unicodedata.east_asian_width()`：那张表把拉丁扩展字符归成
+    「Ambiguous」，中文环境下该算 2、西文环境下该算 1，反而要再分情况。
+    注册那一侧已经把昵称限死在 BMP 内（`account_store.check_nickname`），
+    这里「ASCII 半角、其余全角」就够准了。
+    """
+    return sum(1 if ord(ch) < 0x80 else 2 for ch in str(text or ""))
+
+
+def clip_board_name(name, width=BOARD_NAME_WIDTH):
+    """把榜上的名字截到 `width` 个半角宽，超出的尾部换成省略号。
+
+    ★★ **为什么截在这儿、而不是在存储层**：盘上存的是**完整昵称**
+    （`questrecord` 那边一个字都不动）—— 管理页以后要看榜、或者哪天把 `.ui`
+    里那个框改宽了，都还要用完整的那份。这一刀纯粹是 193 像素那个框的显示适配，
+    属于「服务端 → 客户端」这条边界上的事，所以落在组包层：
+    **组包函数是唯一的出口，任何调用方都漏不掉。**
+    """
+    text = str(name or "")
+    if board_name_width(text) <= width:
+        return text
+    budget = width - board_name_width(BOARD_NAME_ELLIPSIS)
+    kept, used = [], 0
+    for ch in text:
+        step = 1 if ord(ch) < 0x80 else 2
+        if used + step > budget:
+            break
+        kept.append(ch)
+        used += step
+    return "".join(kept) + BOARD_NAME_ELLIPSIS
+
+
 def build_rep_quest_record(quest_id, difficulty, per_seat, records=()):
     """opcode 0x0310 —— `Packet_gspRepQuestRecord`（★ 同号反向，见 `OP_REP_QUEST_RECORD`）。
 
@@ -2038,6 +2091,9 @@ def build_rep_quest_record(quest_id, difficulty, per_seat, records=()):
     拼成「分:秒 名字」塞进 `RecordsCb` 下拉框。空列表是合法的 —— 那时客户端显示
     兜底文本「正在查询资料」（`0x466594` 里 `ebx` 在 99999 分支没被改写），
     这是原版行为，用户 2026-09-17 确认接受，**别为了好看去塞占位条目**。
+
+    ★ 每条的名字过 `clip_board_name()` 截到 `BOARD_NAME_WIDTH` 个半角 ——
+    否则长昵称会把那一行的**时间**挤出框外（实机实测，见那个常量的注释）。
     """
     if len(per_seat) != ROOM_SEAT_COUNT:
         raise ValueError("quest record reply requires exactly %d seats"
@@ -2046,7 +2102,8 @@ def build_rep_quest_record(quest_id, difficulty, per_seat, records=()):
     body += w_i32(len(per_seat)) + b"".join(w_i32(v) for v in per_seat)
     body += w_i32(len(records))
     for seconds, name in records:
-        body += w_i32(seconds) + w_wstr(name)
+        # ★ 名字在这里截，盘上那份仍是完整昵称（见 `clip_board_name`）。
+        body += w_i32(seconds) + w_wstr(clip_board_name(name))
     return body
 
 

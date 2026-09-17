@@ -53,6 +53,7 @@ import questrecord                                                  # noqa: E402
 import relayserver                                                  # noqa: E402
 import shopcfg                                                      # noqa: E402
 from simple import SimpleCipher                                     # noqa: E402
+from testsupport import drain                                       # noqa: E402
 
 
 # ----------------------------------------------------------------------------
@@ -614,7 +615,7 @@ class JoinBatchTests(LobbyIsolated):
         gameserver.Conn.on_game_packet(bob, OP_MOVE_INTO_SESSION,
                                        move_into_payload(room.room_id))
         # ★ D108：写发生在 bob 自己那条发送线程上，先排空再数。
-        bob.flush_outbox(timeout=5.0)
+        drain(self, bob)
         # 被客户端的 recv 切开会让「人物选择」缩回 3 个头像，这一局回不来。
         # ★ 后面那发 0x0410（玩家间同步开关）是**单独一次** sendall ——
         #   挤进这一批就等于把四连发拉长成五连发，同一条禁忌。
