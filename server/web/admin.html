@@ -43,7 +43,8 @@
          所以 admin.js 里给它开了第三张表 `EVERYONE_TABS`。 -->
     <button data-tab="sell">装备卖出</button>
     <button data-tab="players">玩家仓库</button>
-    <button data-tab="backup">数据备份</button>
+    <!-- ★ 2026-09-17 起叫「数据管理」（备份 / 回滚 + 下载日志）；内部 key 仍是 backup。 -->
+    <button data-tab="backup">数据管理</button>
     <button data-tab="admins">管理员账号</button>
   </nav>
 </div>
@@ -304,13 +305,15 @@
       </div>
     </section>
 
-    <!-- ---------------- 数据备份（V0.3商店，用户 2026-09-07） ----------------
+    <!-- ---------------- 数据管理（原「数据备份」，V0.3商店，用户 2026-09-07） ----------------
          服务端 databackup.py 的门面。★ 和各配置页一样走「面板撑满、只有
          列表滚」那套壳（D39）：设置条 / 手动备份条 / 换页栏钉住不动。
-         ★ 只有系统管理员看得到（SYSTEM_ONLY_TABS），门在服务端。 -->
+         ★ 只有系统管理员看得到（SYSTEM_ONLY_TABS），门在服务端。
+         ★ 2026-09-17 加了「⇩ 下载日志」（弹窗在文件末尾 #logsModal，D131），
+           页名跟着改成「数据管理」；id / data-tab 里的 backup 没动。 -->
     <section class="panel hidden fit-panel" id="backupPanel">
       <div class="panel-title">
-        <h2>数据备份</h2>
+        <h2>数据管理</h2>
         <span class="count" id="backupCount"></span>
         <button class="icon-btn" id="backupRefreshBtn" aria-label="刷新"
                 title="重新读一遍备份列表和 server.config 里的设置">↻</button>
@@ -330,6 +333,10 @@
           <li><b>回滚</b>会先把现在的状态自动备份一份，再用所选的那份覆盖当前的。
             运营配置那几份互相关联，只能一起回滚；玩家存档默认<b>不</b>回滚，
             勾了会把所有玩家的进度倒回去。</li>
+          <li><b>下载日志</b>把服务端的 <code>logs/</code>（第一层的全部文件，「最近
+            N 小时」按文件的最后修改时间算）或玩家客户端传上来的
+            <code>logs_client_crash/</code>（每份一个子目录）打成 zip 直接下载，
+            不用远程登录服务器；边打包边传，服务器上不留副本。</li>
         </ul>
         <div class="toolbar backup-bar">
           <label class="toggle" id="backupEnabled">
@@ -346,6 +353,11 @@
           <span class="dirty clean" id="backupDirty"></span>
           <span class="grow"></span>
           <button class="btn btn-primary" id="backupSettingsSave">保存设置</button>
+          <!-- ★ 「打开一个弹窗」的入口钮穿**深棕**（`.btn-ref`，和「▤ 等级经验
+               对应表」「⚙ 卖出价格设置」同一身），金色留给旁边那颗「保存设置」
+               —— 两颗钮挨着，靠色相分（D72b / D97f）。 -->
+          <button class="btn btn-ref" id="logsOpenBtn"
+                  title="把 logs/ 或 logs_client_crash/ 打成 zip 下载（边打包边传，服务器上不留副本）">⇩ 下载日志</button>
         </div>
         <p class="hint backup-status" id="backupStatus"></p>
         <div class="toolbar backup-bar">
@@ -387,7 +399,7 @@
                而漏改不会报错、只会一直骗人（`test_web_admin` 那条静态检查钉着）。
                下面这行是**没跑到那一步时**的兜底，不带数字。 -->
           <li><b>运营</b>：<span id="operatorPages">只能进那几个运营配置页和
-            「玩家仓库」，看不到「数据备份」和「管理员账号」。</span></li>
+            「玩家仓库」，看不到「数据管理」和「管理员账号」。</span></li>
           <li>改权限<b>立刻生效</b>，对方不用重新登录。
             至少要保留一个<b>系统管理员</b> —— 全删光了（或者全降成运营）
             就没人进得来这一页，只能上服务器改 JSON。
@@ -978,6 +990,24 @@
       <div class="toolbar" id="cardProgressBar"></div>
       <div class="card-prog-scroll" id="cardProgressBody"></div>
     </div>
+  </div>
+</div>
+
+<!-- ============ 下载日志（用户 2026-09-17，D131） ============
+     「数据管理」页工具条上「⇩ 下载日志」点开的**只读**弹窗：服务端日志 logs/ 和
+     客户端崩溃包 logs_client_crash/ 各一张卡片，数字来自 `/admin/api/logs`，
+     内容由 admin.js 的 `renderLogs()` 打开时现画，页面里不留静态副本。
+     ★ 纯只读 ⇒ 点遮罩 / Esc / ✕ 都能关（同「等级经验对应表」那一窗）；没有
+       panel-foot —— 下载钮都在卡片里，而且一律米黄 `.btn.btn-sm`（下载是只读
+       动作，没有「主钮」）。zip 由服务端边打包边发，进度在浏览器的下载栏里。 -->
+<div class="modal hidden" id="logsModal">
+  <div class="panel logs-panel">
+    <div class="panel-title">
+      <h2>下载日志</h2>
+      <button class="icon-btn" id="logsClose" aria-label="关闭"
+              title="关闭（点旁边的空白处也行）">✕</button>
+    </div>
+    <div class="panel-body" id="logsBody"></div>
   </div>
 </div>
 

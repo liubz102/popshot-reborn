@@ -5,12 +5,14 @@
 ★ 这一组里最重要的是 `test_every_api_needs_a_login` —— 漏挂一个
 `_require_admin()` 就等于把那个接口开在公网上。
 """
+import http.client
 import http.cookiejar
 import io
 import json
 import os
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -19,6 +21,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -32,6 +35,7 @@ import eventlog                                                # noqa: E402
 import gameserver                                             # noqa: E402
 import gifthistory                                           # noqa: E402
 import lobby                                                   # noqa: E402
+import logpack                                                 # noqa: E402
 import sellprice                                               # noqa: E402
 import shopcfg                                                 # noqa: E402
 import shopdata                                                # noqa: E402
@@ -160,6 +164,15 @@ class _AdminCase(unittest.TestCase):
             return status, json.loads(text)
         except json.JSONDecodeError:
             return status, text
+
+    def fetch(self, path, headers=None, opener=None):
+        """返回 `(状态码, 响应头, 原始字节)` —— 图集和 zip 是二进制，不能按文本读。"""
+        req = urllib.request.Request(self.url(path), headers=headers or {})
+        try:
+            with (opener or self.opener).open(req, timeout=10) as response:
+                return response.status, dict(response.headers), response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, dict(error.headers), error.read()
 
     def login(self, name=None, password=None, opener=None):
         """默认拿出厂系统管理员登。`opener` = 换一个 cookie 罐（= 另一个人）。"""
@@ -303,6 +316,9 @@ class AdminAuthTests(_AdminCase):
                 ("/admin/api/backups/restore", {"id": "20260907-040000-auto",
                                                 "files": ["shop.json"]}),
                 ("/admin/api/backups/remove", {"id": "20260907-040000-auto"}),
+                # 下载日志（2026-09-17）：整个 logs/ 会被发出去，门一样不能少。
+                ("/admin/api/logs", None),
+                ("/admin/api/logs/download?kind=server&scope=all", None),
         ):
             status, result = self.request(path, payload)
             self.assertEqual(401, status, path)
@@ -789,15 +805,6 @@ class AdminConfigConflictTests(_AdminCase):
 
 class AdminAssetTests(_AdminCase):
     """样式 / 脚本 / 图标图集这三个静态件（D16 的新前台靠它们）。"""
-
-    def fetch(self, path, headers=None, opener=None):
-        """返回 `(状态码, 响应头, 原始字节)` —— 图集是二进制，不能按文本读。"""
-        req = urllib.request.Request(self.url(path), headers=headers or {})
-        try:
-            with (opener or self.opener).open(req, timeout=10) as response:
-                return response.status, dict(response.headers), response.read()
-        except urllib.error.HTTPError as error:
-            return error.code, dict(error.headers), error.read()
 
     def test_the_stylesheet_and_script_need_no_login(self):
         # ★ `/admin` 本身（登录表单）就是未登录状态渲染的 —— 样式和脚本
@@ -1763,7 +1770,7 @@ class OperatorPermissionTests(_AdminCase):
                 ("/admin/api/admins/role", {"name": "carol", "role": "system"}),
                 ("/admin/api/admins/remove", {"name": "admin"}),
                 ("/admin/api/admins/from_player", {"name": "alice"}),
-                # 数据备份页也是系统管理员档：它能回滚玩家存档。
+                # 数据管理页也是系统管理员档：它能回滚玩家存档、能把整个 logs/ 下下来。
                 ("/admin/api/backups", None),
                 ("/admin/api/backups/settings", {"enabled": True, "time": "04:00",
                                                  "keep_days": 7}),
@@ -1771,6 +1778,8 @@ class OperatorPermissionTests(_AdminCase):
                 ("/admin/api/backups/restore", {"id": "20260907-040000-auto",
                                                 "files": ["shop.json"]}),
                 ("/admin/api/backups/remove", {"id": "20260907-040000-auto"}),
+                ("/admin/api/logs", None),
+                ("/admin/api/logs/download?kind=server&scope=all", None),
         ):
             status, result = self.request(path, payload)
             self.assertEqual(403, status, path)
@@ -1981,6 +1990,8 @@ class PlayerReadOnlyTests(_AdminCase):
                 ("/admin/api/backups/restore", {"id": "20260907-040000-auto",
                                                 "files": ["shop.json"]}),
                 ("/admin/api/backups/remove", {"id": "20260907-040000-auto"}),
+                ("/admin/api/logs", None),
+                ("/admin/api/logs/download?kind=server&scope=all", None),
         ):
             status, result = self.request(path, payload)
             self.assertEqual(403, status, path)
@@ -2186,6 +2197,201 @@ class AdminBackupApiTests(_AdminCase):
             result = json.loads(response.read())
         self.assertFalse(result["ok"])
         self.assertIn("没有启动", result["message"])
+
+
+class AdminLogsApiTests(_AdminCase):
+    """「数据管理」页的「下载日志」（V0.3商店，用户 2026-09-17）：两个 GET。
+
+    数据层（清单 / 打包）在 `test_logpack`；这里钉的是 HTTP 那一层 —— 权限、
+    chunked 流式响应、出错时的收场。
+    """
+
+    SUB = "alice_a1b2c3d4_20260909-013642"
+
+    def setUp(self):
+        super().setUp()
+        self.logdir = os.path.join(self.tmp.name, "logs")
+        self.crash_dir = os.path.join(self.tmp.name, "logs_client_crash")
+        os.makedirs(self.logdir)
+        os.makedirs(self.crash_dir)
+        self.write_log("server.out", b"today " * 100)
+        self.write_log("server-20260901.out", b"old " * 100, days_ago=5)
+        self.write_crash(self.SUB)
+        # `BoundHandler` 是 `make_server` 用 type() 现造的类，每个用例一份 ——
+        # 改它的类属性不会串到别的用例。
+        self.httpd.RequestHandlerClass.log_packer = logpack.LogPacker(
+            self.logdir, self.crash_dir)
+        self.assertTrue(self.login()[1]["ok"])
+
+    def write_log(self, name, data, days_ago=0):
+        path = os.path.join(self.logdir, name)
+        with open(path, "wb") as fp:
+            fp.write(data)
+        if days_ago:
+            when = time.time() - days_ago * 86400
+            os.utime(path, (when, when))
+        return path
+
+    def write_crash(self, name):
+        root = os.path.join(self.crash_dir, name)
+        os.makedirs(root)
+        with open(os.path.join(root, name + ".zip"), "wb") as fp:
+            fp.write(b"PK\x05\x06" + b"\0" * 18)          # 一个空 zip
+        with open(os.path.join(root, "receipt.json"), "wb") as fp:
+            fp.write(b"{}")
+
+    def download(self, query):
+        return self.fetch("/admin/api/logs/download?" + query)
+
+    def token(self):
+        """cookie 罐里那枚会话令牌（裸 socket 的用例要自己带 Cookie 头）。"""
+        return next(cookie.value for cookie in self.jar
+                    if cookie.name == web_admin.SESSION_COOKIE)
+
+    def test_the_overview_has_what_the_popup_paints(self):
+        status, result = self.request("/admin/api/logs")
+        self.assertEqual(200, status)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(logpack.RECENT_HOURS, result["recent_hours"])
+        self.assertEqual(2, result["server"]["total"]["files"])
+        self.assertEqual(1, result["server"]["recent"]["files"])
+        self.assertEqual("logs", result["server"]["dirname"])
+        self.assertEqual(1, result["crash"]["total"]["dirs"])
+        self.assertEqual([self.SUB], [row["name"] for row in result["crash"]["dirs"]])
+
+    def test_a_download_streams_a_valid_zip(self):
+        status, headers, body = self.download("kind=server&scope=all")
+        self.assertEqual(200, status)
+        self.assertEqual("application/zip", headers["Content-Type"])
+        self.assertRegex(headers["Content-Disposition"],
+                         r'^attachment; filename="logs_server_\d{8}-\d{6}\.zip"$')
+        # 边打包边发：没有 Content-Length，只有 chunked。
+        self.assertEqual("chunked", headers.get("Transfer-Encoding"))
+        self.assertNotIn("Content-Length", headers)
+        self.assertEqual("no-store", headers["Cache-Control"])
+        zf = zipfile.ZipFile(io.BytesIO(body))
+        self.assertIsNone(zf.testzip())
+        self.assertEqual(["logs/server-20260901.out", "logs/server.out", "MANIFEST.txt"],
+                         zf.namelist())
+        self.assertEqual(b"today " * 100, zf.read("logs/server.out"))
+        self.assertIn("下载者: admin", zf.read("MANIFEST.txt").decode("utf-8"))
+
+    def test_recent_only_packs_fresh_files_and_says_so_in_the_name(self):
+        status, headers, body = self.download("kind=server&scope=recent")
+        self.assertEqual(200, status)
+        self.assertRegex(headers["Content-Disposition"],
+                         r'logs_server_12h_\d{8}-\d{6}\.zip')
+        self.assertEqual(["logs/server.out", "MANIFEST.txt"],
+                         zipfile.ZipFile(io.BytesIO(body)).namelist())
+
+    def test_crash_packages_whole_or_one(self):
+        status, headers, body = self.download("kind=client_crash")
+        self.assertEqual(200, status)
+        self.assertRegex(headers["Content-Disposition"],
+                         r'logs_client_crash_\d{8}-\d{6}\.zip')
+        names = zipfile.ZipFile(io.BytesIO(body)).namelist()
+        self.assertIn("logs_client_crash/%s/receipt.json" % self.SUB, names)
+        status, headers, body = self.download("kind=client_crash&sub=" + self.SUB)
+        self.assertEqual(200, status)
+        self.assertIn("logs_client_crash_%s_" % self.SUB, headers["Content-Disposition"])
+        zf = zipfile.ZipFile(io.BytesIO(body))
+        # 崩溃包本身就是 zip：原样存，不再压一遍。
+        self.assertEqual(zipfile.ZIP_STORED,
+                         zf.getinfo("logs_client_crash/%s/%s.zip"
+                                    % (self.SUB, self.SUB)).compress_type)
+
+    def test_bad_requests_are_json_not_zip(self):
+        for query, status in (("kind=nope", 400),
+                              ("kind=server&scope=yesterday", 400),
+                              ("kind=client_crash&scope=recent", 400),
+                              ("kind=client_crash&sub=..", 404),
+                              ("kind=client_crash&sub=bob_deadbeef_20260910-010203", 404),
+                              ("", 400)):
+            got, result = self.request("/admin/api/logs/download?" + query)
+            self.assertEqual(status, got, query)
+            self.assertFalse(result["ok"], query)
+
+    def test_an_empty_directory_is_a_404_not_an_empty_zip(self):
+        shutil.rmtree(self.crash_dir)
+        status, result = self.request("/admin/api/logs/download?kind=client_crash")
+        self.assertEqual(404, status)
+        self.assertFalse(result["ok"])
+        self.assertIn("崩溃包", result["message"])
+
+    def test_the_audit_log_says_who_took_what(self):
+        lines = self.capture_log()
+        self.download("kind=server&scope=recent")
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn("'admin'", lines[0])
+        self.assertIn("下载了服务端日志（最近 12 小时）", lines[0])
+        self.assertIn("1 个文件", lines[0])
+
+    def test_without_a_packer_the_page_says_so(self):
+        self.httpd.RequestHandlerClass.log_packer = None
+        for path in ("/admin/api/logs",
+                     "/admin/api/logs/download?kind=server&scope=all"):
+            status, result = self.request(path)
+            self.assertEqual(200, status, path)
+            self.assertFalse(result["ok"], path)
+            self.assertIn("没有启动", result["message"], path)
+
+    def test_an_http10_client_gets_a_plain_body_and_a_closed_connection(self):
+        # `curl --http1.0` / 老 wget 不认 chunked：裸发，发完关连接。
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn._http_vsn = 10
+        conn._http_vsn_str = "HTTP/1.0"
+        conn.request("GET", "/admin/api/logs/download?kind=server&scope=recent",
+                     headers={"Cookie": "%s=%s" % (web_admin.SESSION_COOKIE, self.token())})
+        response = conn.getresponse()
+        self.assertEqual(200, response.status)
+        self.assertIsNone(response.getheader("Transfer-Encoding"))
+        self.assertEqual("close", response.getheader("Connection"))
+        body = response.read()
+        conn.close()
+        self.assertIsNone(zipfile.ZipFile(io.BytesIO(body)).testzip())
+
+    def test_a_client_that_hangs_up_mid_download_is_no_error(self):
+        """★ 浏览器取消下载 = 对面关 socket。服务端要：审计一行「中断」、**不**把
+        traceback 打进 server.err（`handle_error`）、连接收掉之后照常服务下一个请求。"""
+        # 不可压缩的 40 MB：远大于 Windows 回环上两头 socket 缓冲能吞下的量，
+        # 保证客户端关掉时服务端一定还在发（否则它会「正常发完」，这条就验不到）。
+        self.write_log("big.bin", os.urandom(40 * 1024 * 1024))
+        seen = threading.Event()
+        lines = []
+
+        def sink(line):
+            lines.append(line)
+            if "中断" in line:
+                seen.set()
+
+        real_online = web_admin.eventlog.online
+        web_admin.eventlog.online = sink
+        self.addCleanup(setattr, web_admin.eventlog, "online", real_online)
+        errors = []
+        real_handle_error = self.httpd.handle_error
+        self.httpd.handle_error = lambda request, addr: errors.append(addr)
+        self.addCleanup(setattr, self.httpd, "handle_error", real_handle_error)
+
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        sock.sendall(("GET /admin/api/logs/download?kind=server&scope=all HTTP/1.1\r\n"
+                      "Host: 127.0.0.1\r\nCookie: %s=%s\r\n\r\n"
+                      % (web_admin.SESSION_COOKIE, self.token())).encode("ascii"))
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            self.assertTrue(chunk, "头都没收到就断了")
+            head += chunk
+        self.assertIn(b"HTTP/1.1 200", head)
+        self.assertIn(b"Transfer-Encoding: chunked", head)
+        sock.close()                                    # 「取消下载」
+        # ★ 事件驱动：等的是那一行审计日志，不是固定的秒数（超时只是兜底）。
+        self.assertTrue(seen.wait(10), lines)
+        self.assertEqual([], errors, "handle_error 被调了 = traceback 进了 server.err")
+        self.assertIn("下载服务端日志（全量）中断", lines[-1])
+        # 收场之后服务器还活着。
+        status, result = self.request("/admin/api/session")
+        self.assertEqual(200, status)
+        self.assertTrue(result["logged_in"])
 
 
 class AdminItemLookupTests(_AdminCase):

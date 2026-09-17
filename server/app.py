@@ -47,6 +47,7 @@ import daylog
 import eventlog
 import gameserver
 import logcleanup
+import logpack
 import shopcfg
 import udpsync
 import versioning
@@ -612,12 +613,17 @@ def main(argv=None):
         crash = crashstore.Store(keep_days=cfg["crash_keep_days"], log=log)
         crash.start()
         atexit.register(crash.stop)
+        # 日志下载（管理页「数据管理」→「下载日志」，用户 2026-09-17）：把 logs\ 或
+        # logs_client_crash\ 打成 zip 流式发给浏览器。打包在那条 HTTP 请求线程上做，
+        # 不拿任何数据锁，zlib / 文件 IO / 发包都释放 GIL —— 不挡战斗（D131）。
+        log_packer = logpack.LogPacker(logcleanup.DEFAULT_LOGDIR, crash.dir)
         _start("web", web_server.serve,
                kwargs={"port": web_port, "accounts": accounts,
                        "host": args.host, "cooldown": cooldown,
                        "backup": backup, "crash": crash,
                        "crash_max_mb": crash_max_mb,
-                       "crash_cooldown": cfg["crash_upload_cooldown_seconds"]},
+                       "crash_cooldown": cfg["crash_upload_cooldown_seconds"],
+                       "log_packer": log_packer},
                port=web_port)
         log(f"注册页   {describe_listen(args.host, web_port)}"
             f" —— 本机打开 http://127.0.0.1:{web_port}/")
@@ -632,6 +638,8 @@ def main(argv=None):
                 + (f"保留 {keep} 天）" if keep > 0 else "永不自动删除）"))
         else:
             log("崩溃日志 不接收（crash_max_upload_mb = 0）")
+        log(f"日志下载 管理页「数据管理」→「下载日志」能把 logs\\ 和 "
+            f"{crashstore.DIRNAME}\\ 打成 zip 下载（不用远程登录）")
     else:
         log("注册页   已关闭（--no-web）")
 
