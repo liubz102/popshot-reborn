@@ -10,6 +10,8 @@
 *.css  text eol=lf
 *.html text eol=lf
 *.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
 
 # Windows 批处理一律 CRLF（铁律 3）：LF 的 .bat 在 cmd.exe 下会被拦腰切断
 # —— 它按**字节偏移**回读文件，少一个 CR 就错位。.ps1 同办，跟着它的 .bat 走。
