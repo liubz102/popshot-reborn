@@ -1,9 +1,9 @@
 {
  "format": 1,
  "packer": {"fill": 0, "key_prefix": "Pack/", "policy": "original-ext-v1", "sep": "~", "volume_cap": 16777216, "zlib_level": 9},
- "tree_hash": "31b86f2bbdf8632213de8f86ee1f01b39e280c93015eb142dded4c9260a1d131",
+ "tree_hash": "4e7c5643c1a1f5d617a298ba6d8ada7793ee7d0727981ab0e0b7e5def2691b8a",
  "volumes": {
-  "Data~.pkn": {"group": "Data", "sha256": "a7636c1927d50f4f1fb6e5067915b967bdce3dddc6e4038b8dec7daa6829efbc", "size": 538624, "source": "Data", "members": [
+  "Data~.pkn": {"group": "Data", "sha256": "94ad5f77bdd2572f9d800f38b95eac3ae8e26914aa5e2d82c8b618892c005977", "size": 538624, "source": "Data", "members": [
    ["Chinese.ini", 114250, "2ecfe16814a0d515430fdeea80c53eb7cbd5a9e0be69dcee469f360b8ba08d4e"],
    ["Chinese.ini.r19467", 103870, "6a20b3f802a68c72bc57d438ac42467940b8b4e8e0ddeafebc1a30d0ca2bb584"],
    ["Chinese.ini.r19470", 103892, "b4d3a37902c721e112a9f70ca0dc75dc6222ea0ba0cf4e5a6642871a9d2b3dd3"],
@@ -41,7 +41,7 @@
    ["map-censorship.ini", 28668, "a4c6a3b93a71b35b7e661220b6446db4352f474e8b3769a86d17070895fbd6fb"],
    ["map.ini", 43350, "d911bde05623a8499ca54d22a7c4d35c0ce671f99b501b258ea2cc8c39646b38"],
    ["weapon-censorship.ini", 95855, "7bbd0ddaf5ebaaadb8db91e32973a1efeb88a9f7238e2f35b020fa4c560dc4de"],
-   ["weapon.ini", 439032, "45d0a12c4d99db4292525b6b361674dc91d6f476978b8e1d61cffc28cd6fb3ad"]
+   ["weapon.ini", 439038, "196ed311cb927bcd8cfa0e524dabe16c96eab51346fc88c847ad0146a5d6cf5b"]
   ]},
   "Data~Quest.pkn": {"group": "Data", "sha256": "4aae0676e1a488733bfa7f0461936b9eb5bfb5274f3b972dd04c8c08d9cb4cf5", "size": 1082368, "source": "Data/Quest", "members": [
    ["Quest/ChrProps-international.ini", 54, "9c6cbc470c405f715ca4c0eaad777635310c7715391a2723f001fb0713b9ec46"],
