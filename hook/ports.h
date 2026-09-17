@@ -7,7 +7,7 @@
  *（build.bat 会自己重新生成）。
  *
  *  这里的每一个号在 Python 那边都有同名常量，两边分叉会被
- *  server/test_ports.py 当场抓住。
+ *  test/test_ports.py 当场抓住。
  * ====================================================================== */
 #ifndef POPSHOT_PORTS_H
 #define POPSHOT_PORTS_H

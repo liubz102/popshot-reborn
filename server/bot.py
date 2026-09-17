@@ -4760,7 +4760,7 @@ def _keep_away_spot(room, machine, terrain, enemy):
 
     只在**前进轴**上取：`敌人.x ± BOT_KEEP_AWAY_SPAN`，符号是「我现在在他
     哪一边」。y 取那一列够得着的站立面，取不到就沿用敌人的 y —— 走位只吃
-    x（`_walk_to()` 里 `direction` 只看 `delta_x`），A\* 再按真实地形找路。
+    x（`_walk_to()` 里 `direction` 只看 `delta_x`），A\\* 再按真实地形找路。
 
     ## ★★★★★ 为什么不是「找掩体」了（D137，用户 2026-09-03）
 
@@ -5335,7 +5335,7 @@ def _unstall(room, machine, terrain, spot, intent, target):
     敌人就在正上方 / 正下方时 `|Δx|` 只有几像素，而 `_walk_to()` 是个
     bang-bang 控制器、一次决策要走 14~21 像素 —— 它在 ±1 和 0 之间空转，
     人一格都不挪。`Forest00` 那个离线复现最干净：(966, 442) 对着 (957, 646)，
-    60 格决策**净位移 0**，两个 bot 就这么杵着。A\* 这时候常常也给不出
+    60 格决策**净位移 0**，两个 bot 就这么杵着。A\\* 这时候常常也给不出
     上下层的路（一张图的可达分量往往只覆盖一半，§137）。
 
     真人这时候是**横着走去找上去 / 下去的那条路**的 —— 和 D119 给框外
@@ -5581,7 +5581,7 @@ def _walk_to(room, machine, terrain, spot, fast_run):
     """朝 `spot` 走一步 —— 返回 `(方向, 起跳, 下落, 冲刺跑)`。
 
     地形只回答「这一步走不走得成」，不添新规则；走不成就交给
-    `botnav.plan()`（M5-B），A\* 也找不到才退回墙根跳 / 坑前停的老兜底。
+    `botnav.plan()`（M5-B），A\\* 也找不到才退回墙根跳 / 坑前停的老兜底。
     """
     body = machine.body
     machine.walk_goal = (float(spot[0]), float(spot[1]))   # ★ 诊断（§167）
@@ -6138,7 +6138,7 @@ def _coop_leash_intent(room, machine, seat_index, terrain):
     三条，任一条成立就算：
 
     * **规划器把话说死了**：`botnav.plan()` 泛洪完整个可达分量之后回了空
-      （`nav_failed` 记的就是这个判决，键是当前的空间事实）。这是 A\* 自己
+      （`nav_failed` 记的就是这个判决，键是当前的空间事实）。这是 A\\* 自己
       给的结论「从这儿一步都靠近不了目标」，不是等出来的；
     * **差距比掉队那一刻又拉开了一整根绳子**：`leash_mark` 是掉队以来自己
       走到过的**最靠前**的地方，`leash_gap` 是掉队那一刻的差距 ——

@@ -28,12 +28,17 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 # --- server/ 里【不】进发布包的东西 ----------------------------------------
 # 其余 .py 一律进包（见文件头的理由）。
+#
+# ★ 测试本身已经不在 server/ 了 —— 全在根目录的 test/ 下，而这里是按**白名单**
+#   从根目录挑东西的，test/ 压根没进名单，所以发布包里不会有它。
+#   下面这两条留着当**兜底**：哪天有人又往 server/ 里放了个 test_*.py 或
+#   run_tests.py，它也照样出不去。
 $script:ServerExcludeExact = @(
-    'run_tests.py',         # 测试入口，发布包里没有 test_*.py 可跑
+    'run_tests.py',         # 兜底：测试入口不进发布包
     'capture_server.py'     # 阶段 3/4 的抓包骨架，纯开发工具
 )
 $script:ServerExcludePattern = @(
-    'test_*.py'
+    'test_*.py'             # 兜底：同上
 )
 
 # 任何地方都不拷的目录/文件名。
@@ -981,7 +986,7 @@ function Assert-PackageDataClean {
 
 function Get-PackDirs {
     <# 三个资源目录的名字。唯一的源是 server/config.py（`--pack-dirs`），取法照端口表
-       （launch.ps1 的 `--ports`）；这里不许写目录名字面量，server/test_packdirs.py 盯着。 #>
+       （launch.ps1 的 `--ports`）；这里不许写目录名字面量，test/test_packdirs.py 盯着。 #>
     param([Parameter(Mandatory = $true)][string]$Root)
     $py = Join-Path $Root 'runtime\python\python.exe'
     if (-not (Test-Path -LiteralPath $py -PathType Leaf)) { $py = 'python' }

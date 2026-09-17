@@ -1,0 +1,307 @@
+{
+ "volume": "Effects0011.pkn",
+ "root": "Effects",
+ "stamp": 1599427792,
+ "gap": 54,
+ "header_offset": 173,
+ "data_offset": 5120,
+ "count": 37,
+ "entries": [
+  {
+   "name": "CH98/WP02/Texture/CH98_Wp031_Damage02.dds",
+   "flags": 1,
+   "blk": 0,
+   "size": 65664,
+   "stored": 24087,
+   "sha256": "9ced6fe30ce8045fa7bbc9636a8388a0bfe4a227d32f608efd1578f5a6961529"
+  },
+  {
+   "name": "CH98/WP02/Texture/CH98_Wp03_Damage00.dds",
+   "flags": 1,
+   "blk": 24,
+   "size": 4224,
+   "stored": 1188,
+   "sha256": "ab59be2bf0a35b95d7be3875bde96423204c8222360596898f3314ba63fc23fc"
+  },
+  {
+   "name": "CH98/WP02/Texture/CH98_Wp03_Damage01.dds",
+   "flags": 1,
+   "blk": 26,
+   "size": 65664,
+   "stored": 11510,
+   "sha256": "f8a196c1027c114b415748e665c13468e09f346c04b9dd8ec2771edc501105f9"
+  },
+  {
+   "name": "CH98/WP03/Efx/CH98_Wp032_BubbleBulletTail00.efx",
+   "flags": 3,
+   "blk": 38,
+   "size": 10039,
+   "stored": 1208,
+   "sha256": "09335f908df2bcd8d56f93ddc68e0ef3d87002fde115d70d61210b93346f17f2"
+  },
+  {
+   "name": "CH98/WP03/Efx/CH98_Wp032_BubbleChDamage00.efx",
+   "flags": 3,
+   "blk": 40,
+   "size": 29149,
+   "stored": 1780,
+   "sha256": "223317482746cd70ce1a79818c1fe786da77b01a77f1f51703d049ffd5672344"
+  },
+  {
+   "name": "CH98/WP03/Efx/CH98_Wp032_BubbleSpark00.efx",
+   "flags": 3,
+   "blk": 42,
+   "size": 38843,
+   "stored": 1776,
+   "sha256": "d4d5a53cd764a9c1a223fa3784260eba11b5903a750f1f2f02ee6833df03f485"
+  },
+  {
+   "name": "CH98/WP03/Efx/CH98_Wp032_BubbleStExplo00.efx",
+   "flags": 3,
+   "blk": 44,
+   "size": 28865,
+   "stored": 1748,
+   "sha256": "c569cd7d28556cf363888fd2ae228db3115186a808889f5d67f1916f763e0709"
+  },
+  {
+   "name": "CH98/WP03/Efx/CH98_Wp032_BulletTail00.efx",
+   "flags": 3,
+   "blk": 46,
+   "size": 5123,
+   "stored": 1100,
+   "sha256": "314e25cd051d5dacf27701a6edb18ff7f5d34cec5229e72415e45d800d9bf55b"
+  },
+  {
+   "name": "CH98/WP03/Efx/CH98_Wp032_Damage00.efx",
+   "flags": 3,
+   "blk": 48,
+   "size": 29130,
+   "stored": 1736,
+   "sha256": "1fa1256d972d06ba5b0a0baf9ee525e8a31f461259a4cbb6a254725b31dafe34"
+  },
+  {
+   "name": "CH98/WP03/Efx/CH98_Wp032_Spark00.efx",
+   "flags": 3,
+   "blk": 50,
+   "size": 47010,
+   "stored": 2008,
+   "sha256": "d12314795e3c6e598b6c5e8de2545ec7db5cd93054e262efcbecb7c0684e28ad"
+  },
+  {
+   "name": "CH98/WP03/Efx/CH98_Wp032_StaticExplo00.efx",
+   "flags": 3,
+   "blk": 52,
+   "size": 28871,
+   "stored": 1712,
+   "sha256": "c0770a02f7f070836733cf7dab65629541460a5f1d00c899f75657b960f85781"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Kick01.dds",
+   "flags": 1,
+   "blk": 54,
+   "size": 65664,
+   "stored": 31767,
+   "sha256": "efacad7228f1e51477c4512c429cb6db57ee66ace49546412af6244de65c830d"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Kick02.dds",
+   "flags": 1,
+   "blk": 86,
+   "size": 65664,
+   "stored": 19434,
+   "sha256": "51153bab1b8b196eb697a908c0f719e8601ce549791f592e3f4352b1bb38ab56"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_WP01_Damage02.dds",
+   "flags": 1,
+   "blk": 105,
+   "size": 4224,
+   "stored": 753,
+   "sha256": "2de47b8c3c1d0daa0ea34e58c8e6cc77b50a71705a831fe84e626a61a7f23ccc"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp01_Damage00.dds",
+   "flags": 1,
+   "blk": 106,
+   "size": 4224,
+   "stored": 1277,
+   "sha256": "5012a7be87be9325e9977e08aa8a568bd5d83cb52728210d78d7a269da511728"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp01_Spark00.dds",
+   "flags": 1,
+   "blk": 108,
+   "size": 16512,
+   "stored": 2803,
+   "sha256": "05477d9b8f92f363ba33cd19b401d3105197da77b817046831aaf4468fb91fa3"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp01_SparkGlow00.dds",
+   "flags": 1,
+   "blk": 111,
+   "size": 4224,
+   "stored": 1465,
+   "sha256": "390ded88110da8ccf34183c6d9cc897f6fbd4e41fb4c033733de813c3108b05b"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp01_SparkSmoke00.dds",
+   "flags": 1,
+   "blk": 113,
+   "size": 4224,
+   "stored": 933,
+   "sha256": "a0f943707603a8920260fb48d44c7faf9fcb125365b64dd37b045335ca2adb30"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp021_Spark00.dds",
+   "flags": 1,
+   "blk": 114,
+   "size": 65664,
+   "stored": 16285,
+   "sha256": "2db8033b76a004d50e4b57600821f76a6e3bd94e6ded9a0893742b5e407a5db9"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp02D1_GatherEnergy02.dds",
+   "flags": 1,
+   "blk": 130,
+   "size": 65664,
+   "stored": 20247,
+   "sha256": "88f75de78fac6f2a2683c0d6812ae0135008c80fa94b87eac8fe6f5837139214"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp02_ApplePieceExplo02.dds",
+   "flags": 1,
+   "blk": 150,
+   "size": 16512,
+   "stored": 1770,
+   "sha256": "a6097e785857f4331b560cdeb57cc2d0bce8fd9e62c39853c477612c1d0743f9"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp02_ApplePieceExplo03.dds",
+   "flags": 1,
+   "blk": 152,
+   "size": 65664,
+   "stored": 13151,
+   "sha256": "f7fd79c35853d89e6941a4144437579a6b5cb9e1a2064d6802001666b712daee"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp02_GatherEnergy02.dds",
+   "flags": 1,
+   "blk": 165,
+   "size": 65664,
+   "stored": 20118,
+   "sha256": "6f56686f9f854cf157e2bb96762faddee0eb34f5ae89ff28e343dcef7f7945e5"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp031P_Damage03.dds",
+   "flags": 1,
+   "blk": 185,
+   "size": 16512,
+   "stored": 6489,
+   "sha256": "b0fca84b64ea6f18ba6562a11a2c0078af752d3392728c7ea8ab15012eeea841"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp032_BulletTail00.dds",
+   "flags": 1,
+   "blk": 192,
+   "size": 8320,
+   "stored": 3055,
+   "sha256": "9b259486724effefebd35a31531ef2d5c69143a9b32c19db4bf52466fe42b4da"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp032_StaticExplo00.dds",
+   "flags": 1,
+   "blk": 195,
+   "size": 65664,
+   "stored": 27268,
+   "sha256": "8196dff2ed552e9221346c390d7df1e53aaf0fea760bb7b71590c915db07b316"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp03_Damage00.dds",
+   "flags": 1,
+   "blk": 222,
+   "size": 65664,
+   "stored": 17297,
+   "sha256": "e453c85236a21cbfb989d5786d076d37c0eacc060e468c3468ab9753716e56ab"
+  },
+  {
+   "name": "CH98/WP03/Texture/CH98_Wp03_Damage03.dds",
+   "flags": 1,
+   "blk": 239,
+   "size": 16512,
+   "stored": 3737,
+   "sha256": "c2d351413eb6e279287c62164875acc4988036c907ca3b5f339e264281b005b1"
+  },
+  {
+   "name": "Camel/Texture/333333.dds",
+   "flags": 1,
+   "blk": 243,
+   "size": 16512,
+   "stored": 3434,
+   "sha256": "8f05dd5f9e145e578cb8d14a33414240e32f6a84a93acdc404ca6eccc1639ea2"
+  },
+  {
+   "name": "Camel/Texture/4444444.dds",
+   "flags": 1,
+   "blk": 247,
+   "size": 16512,
+   "stored": 4961,
+   "sha256": "bc3e703b7839813aaf3f7cd4896a82b97c883cd02adab8de9020c3c01c6aba0b"
+  },
+  {
+   "name": "Camel/Texture/55-doll-01.dds",
+   "flags": 1,
+   "blk": 252,
+   "size": 16512,
+   "stored": 7362,
+   "sha256": "5be1c92b3d51d3f600f867276c02353ada0d23fb302e378d607bac4a502172e8"
+  },
+  {
+   "name": "Camel/Texture/55-doll-02.dds",
+   "flags": 1,
+   "blk": 260,
+   "size": 16512,
+   "stored": 7129,
+   "sha256": "8e96341cc58e7ae1e59ad7e5c59303196f0f01673437ca72ea89d80e952f97ed"
+  },
+  {
+   "name": "Camel/Texture/555.dds",
+   "flags": 1,
+   "blk": 267,
+   "size": 16512,
+   "stored": 5798,
+   "sha256": "332774c8ec1b0570f8b5bcaaca7b1629cc7968a93bc2e42a42fbc17e64b9b72b"
+  },
+  {
+   "name": "Camel/Texture/666.dds",
+   "flags": 1,
+   "blk": 273,
+   "size": 16512,
+   "stored": 5315,
+   "sha256": "93664bf98c7ca7ca573cdd1de51716040f7213f4c082a7d5948ba23c80fd5fda"
+  },
+  {
+   "name": "Camel/Texture/aaaa-03.dds",
+   "flags": 1,
+   "blk": 279,
+   "size": 16512,
+   "stored": 2303,
+   "sha256": "ea17f640d3640ad352b93faec19655c7a02ee3864a96197cae12d4652c5bdff6"
+  },
+  {
+   "name": "Camel/Texture/dest_bon_01.dds",
+   "flags": 1,
+   "blk": 282,
+   "size": 16512,
+   "stored": 6094,
+   "sha256": "f1594a97caa6ccf5e39f4a4e60168b603c65dc542db3f924a070ee865292e43b"
+  },
+  {
+   "name": "Camel/Texture/dest_bon_02.dds",
+   "flags": 1,
+   "blk": 288,
+   "size": 16512,
+   "stored": 7140,
+   "sha256": "eb1f5040b160dba822bf24eaf44cc7700f5835c22152fed21a720a0288fc8ff2"
+  }
+ ]
+}

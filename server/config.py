@@ -147,7 +147,7 @@ def port_table():
 #: * `PACK_PUBLISH_DIR` 打包器的产物（加密卷 + `pack-index.json`）：hook 把客户端的
 #:   读取重定向到这里；进 git、进发布包。
 #:
-#: `server/test_packdirs.py` 盯着 `hook/pack.h` 和各脚本有没有长出第二份。
+#: `test/test_packdirs.py` 盯着 `hook/pack.h` 和各脚本有没有长出第二份。
 PACK_LEGACY_DIR = "Pack"
 PACK_DEVELOP_DIR = "Pack_develop"
 PACK_PUBLISH_DIR = "Pack_publish"

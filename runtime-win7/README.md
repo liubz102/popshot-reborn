@@ -42,7 +42,7 @@ Win7 却要靠 **KB2999226** 这个更新才有 —— 而 Win7 早就停止更�
 ## 验过什么
 
 - `server/` 全部代码用 3.8.10 `compileall` 通过；
-- **`server/run_tests.py` 的 797 项在 3.8.10 下全绿**（和 3.14 上一样）；
+- **`test/run_tests.py` 的全量在 3.8.10 下全绿**（和 3.14 上一样）；
 - `socket / select / struct / threading / ssl / sqlite3 / hashlib` 均可导入
   （`ssl` 带的是 OpenSSL 1.1.1k）。
 

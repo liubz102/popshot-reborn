@@ -5,7 +5,7 @@
 和 `gen_ports_h.py` 是同一个模式（同一个理由）：目录名只有一个源，
 C 走生成的头文件，PowerShell 走 `python server/config.py --pack-dirs`，Python 直接 import。
 `hook/build.bat` 每次编译前都会跑一遍；生成结果**提交进仓库**，没装 Python 也能编。
-`server/test_packdirs.py` 盯着几边有没有分叉。
+`test/test_packdirs.py` 盯着几边有没有分叉。
 
 用法：
 
@@ -50,7 +50,7 @@ def render():
         " *（build.bat 会自己重新生成）。",
         " *",
         " *  每个名字都给窄串和宽串两个宏；Python 那边有同名常量，两边分叉会被",
-        " *  server/test_packdirs.py 当场抓住。",
+        " *  test/test_packdirs.py 当场抓住。",
         " * ====================================================================== */",
         "#ifndef POPSHOT_PACK_H",
         "#define POPSHOT_PACK_H",

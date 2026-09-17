@@ -157,7 +157,7 @@ V0.1/V0.2 踩过的坑里有相当一部分就是「望文生义地按名字猜�
               是给机器读的协议：客户端更新器（updater\src\probe.c 的
               探针）连 27799 重演一次握手，按 [vV]数字.数字[.数字] 从文案
               里解析目标版本 —— 成对发布（D079）的客户端/服务器靠它对准
-              批次。文案里的版本号格式被 server/test_update.py 钉住。
+              批次。文案里的版本号格式被 test/test_update.py 钉住。
 
 升级分支：     客户端拉起的 game_patched\BsPatcherChn.exe 已替换为自研更新
               引导器（tools/updater/updater.c，2026-08-22 起）—— 原版 NGM

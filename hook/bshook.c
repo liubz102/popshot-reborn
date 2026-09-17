@@ -34,7 +34,7 @@
 #include "ports.h"
 /* ★ 客户端资源目录名（Pack / Pack_publish）同样来自生成物 pack.h
    （tools/gen_pack_h.py ← server/config.py）。资源目录重定向那一段只认这里的宏，
-   不写字面量 —— server/test_packdirs.py 盯着。 */
+   不写字面量 —— test/test_packdirs.py 盯着。 */
 #include "pack.h"
 /* ★ 登录界面公告框的文案（**已混淆**）。同样是生成物：原稿是
    hook/notice.zh.txt，生成器 tools/gen_notice_h.py，build.bat 每次编译前
@@ -1191,7 +1191,7 @@ static void install_process_hooks(void)
 /*   ★ BSHOOK_KEEP_PACK_DIR=1 不装（A/B 对照，同 BSHOOK_KEEP_NOTICE）。         */
 /*                                                                            */
 /*   目录名来自 pack.h（tools/gen_pack_h.py 从 server/config.py 生成），别在    */
-/*   这里写字面量 —— server/test_packdirs.py 盯着。                             */
+/*   这里写字面量 —— test/test_packdirs.py 盯着。                               */
 /* -------------------------------------------------------------------------- */
 
 /* launch.ps1 靠这个串判断「这份 DLL 会不会重定向」，从而决定能不能删掉玩家机器上
@@ -2327,7 +2327,7 @@ static int read_build_ver(void)
    ★★ 校验位算法必须和 `versioning.hook_tag()` **逐位一致**：
    对「32 个原始 hash 字节 ‖ 版本号 4 字节小端」再做一次 SHA-256，
    取结果第一个字节的低 7 位。分叉的症状是「谁都登不上」，
-   `server/test_versioning.py` 用固定向量钉着两边。 */
+   `test/test_versioning.py` 用固定向量钉着两边。 */
 #define HS_V2_FLAG        0x80000000u
 /* ★ 合法版本码只到 15.999.999（major <= 15），不是整个 24 位 ——
    和 versioning.py 的 WIRE_V2_VERSION_MAX 同值，理由见那边。 */

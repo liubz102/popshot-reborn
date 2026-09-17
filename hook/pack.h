@@ -7,7 +7,7 @@
  *（build.bat 会自己重新生成）。
  *
  *  每个名字都给窄串和宽串两个宏；Python 那边有同名常量，两边分叉会被
- *  server/test_packdirs.py 当场抓住。
+ *  test/test_packdirs.py 当场抓住。
  * ====================================================================== */
 #ifndef POPSHOT_PACK_H
 #define POPSHOT_PACK_H

@@ -195,7 +195,7 @@ def hook_tag(sha256_hex, wire_version):
     ★ `hook/bshook.c` 的 `notice_hook_tag()` 必须**逐位同算法**：
     对「32 个原始 hash 字节 ‖ 版本号的 4 字节小端」再做一次 SHA-256，
     取结果第一个字节的低 7 位。两边分叉的症状是「谁都登不上」，
-    `server/test_versioning.py` 用固定向量钉着。
+    `test/test_versioning.py` 用固定向量钉着。
     """
     raw = bytes.fromhex(str(sha256_hex).strip())
     if len(raw) != 32:
@@ -323,7 +323,7 @@ def load_own_version(root=None, _reload=False):
     """读包根 ``BUILD.ver`` 的 ``version`` 字段 -> ``(版本元组或 None, 警告列表)``。
 
     「这台服务器自己是哪个批次」——版本门禁的拒绝文案带上它，客户端更新器
-    （``updater\src\probe.c`` 的探针）从文案里解析出该升到哪个版本，
+    （``updater\\src\\probe.c`` 的探针）从文案里解析出该升到哪个版本，
     成对发布（D079）的客户端 / 服务端靠这句话对上批次。
 
     BUILD.ver 是我们自己脚本写的 JSON（``version`` 键永远第一个）。先做

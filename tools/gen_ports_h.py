@@ -20,7 +20,7 @@
 `hook/build.bat` 和 `updater/build.bat` 每次编译前都会跑一遍本脚本，所以
 「改了 config.py 忘了重新生成」这件事在正常流程里发生不了；生成结果也
 **提交进仓库**，这样没装 Python 的人拿到源码也能直接编译。
-`server/test_ports.py` 会盯着几边有没有分叉。
+`test/test_ports.py` 会盯着几边有没有分叉。
 
 用法：
 
@@ -71,7 +71,7 @@ def render():
         " *（build.bat 会自己重新生成）。",
         " *",
         " *  这里的每一个号在 Python 那边都有同名常量，两边分叉会被",
-        " *  server/test_ports.py 当场抓住。",
+        " *  test/test_ports.py 当场抓住。",
         " * ====================================================================== */",
         "#ifndef POPSHOT_PORTS_H",
         "#define POPSHOT_PORTS_H",
@@ -98,7 +98,7 @@ def render_updater():
         " *  ports.h —— 更新器用的端口（自动生成，不要手改）。",
         " *",
         " *  源头是 server/config.py，生成器是 tools/gen_ports_h.py。",
-        " *  更新器探针只需要游戏服端口；分叉会被 server/test_ports.py 抓住。",
+        " *  更新器探针只需要游戏服端口；分叉会被 test/test_ports.py 抓住。",
         " * ====================================================================== */",
         "#ifndef POPSHOT_UPDATER_PORTS_H",
         "#define POPSHOT_UPDATER_PORTS_H",
