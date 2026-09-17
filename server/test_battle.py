@@ -3518,6 +3518,17 @@ class SurvivalFinishTests(BattleRoom):
 # ----------------------------------------------------------------------------
 # 房间生命周期
 # ----------------------------------------------------------------------------
+def dash_peer_packet(seat=0):
+    """一发 `rpDash` 的同步包（`0x040e` 的载荷）—— 12 字节头 + 11 字节 body。
+
+    人在**房间界面**里冲刺发的就是这个形状（bug调查/23 的 19:22:48 那几发）。
+    """
+    head = struct.pack("<BbbBHHHH", 0xff, seat, -1, 0, 0, 0, 0,
+                       gameserver.PEER_OP_DASH)
+    body = struct.pack("<BbBff", seat, 1, 1, 456.0, 830.0)
+    return head + body
+
+
 class RoomLifecycleTests(BattleRoom):
     """开局挡人、结算完回房间复位、第二局能再开起来。"""
 
@@ -3590,6 +3601,27 @@ class RoomLifecycleTests(BattleRoom):
         self.start_battle()
         self.assertTrue(self.loop_running(),
                         "32 ms 循环没起步 = bot 一帧都不会动")
+
+    def test_moving_in_the_room_does_not_freeze_the_next_round(self):
+        """★★ 回归（用户 2026-09-17 实机，bug调查/23：开了一局 bot 不动）。
+
+        房间界面里角色照样能跑能跳能冲刺 —— 等人的时候按两下键就够了，
+        客户端会把 `rpDash`（内层 `0x0007`）从同步通道发上来。这一发落在
+        `note_battle_stats()` 里，而它张口第一件事就是 `quest_state()`：
+        懒惰分支于是在**还没开局**的时候把 `room.quest` 建了出来。
+        和在房间里按 Ctrl 是同一个坑（§197），只是这条路好撞得多 ——
+        线上 V0.3.4（闩还在「`room.quest` 还是 None」上）那一局从开局到
+        结算 bot 一动不动也不开枪。
+        """
+        self.back_to_the_room()
+        gameserver.Conn.on_game_packet(self.alice, OP_PEER_DATA_UP,
+                                       dash_peer_packet(seat=0))
+        stale = self.room.quest      # 现在的实现会在这儿把它建出来
+        self.start_battle()
+        self.assertTrue(self.loop_running(),
+                        "32 ms 循环没起步 = bot 一帧都不会动")
+        self.assertIsNotNone(self.room.quest)
+        self.assertIsNot(stale, self.room.quest, "新一局必须重建战斗状态")
 
     def test_a_leftover_quest_does_not_skip_the_new_rounds_setup(self):
         """★ 收尾闩在**握手**上，不在 `room.quest` 上。
