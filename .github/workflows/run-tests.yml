@@ -1,0 +1,49 @@
+# 服务端测试的 CI —— 有人提 PR 就跑，红了不让合。
+#
+# ★ 这个文件只需要放在**被合入的那个分支**（base）上：`pull_request` 跑的是
+#   「PR 分支合进 base 之后」的那棵树，所以贡献者分支里没有它也照样会跑。
+#   已经用过的 base 有两个：`main`（PR #2）、`develop/X_Mod`（PR #3，来自 fork）。
+#
+# ⚠ 「必须通过」是在 GitHub 的 Settings → Rules → Rulesets 里设的，不在这个文件里。
+#   哪个分支要设必须通过，这个文件就得**先在那个分支上** —— 否则那条检查
+#   永远 pending，PR 既合不进来也永远不会变绿。
+#
+# ⚠ 不要给它加 `paths:` 过滤：必须检查的判定是「没报告 = 不算通过」，
+#   一个只改文档的 PR 会让检查永远挂着。
+name: tests
+
+on:
+  pull_request:
+    branches: ["main", "develop/**"]
+
+concurrency:                     # 同一个 PR 连推几次，只留最后一次
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read                 # PR 里的代码只给只读权限，secrets 也拿不到
+
+jobs:
+  server-tests:
+    # ★ 这个 name 展开后就是 ruleset 里要填的检查名：
+    #     server tests (py3.14) / server tests (win7-py3.8)
+    #   改了它，ruleset 里那两条要同步改，否则会一直等一个不存在的检查。
+    name: server tests (${{ matrix.name }})
+    runs-on: windows-latest      # 测试要开 socket、读 hook\*.c、导 tools\*.py，Linux 上不保证成立
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false           # 一套红了另一套也要跑完，才看得出是不是同一个原因
+      matrix:
+        include:
+          # 两套便携运行时都在仓库里，checkout 完直接能跑，不用 setup-python；
+          # 而且两套都得绿 —— 发布包里带的就是它们（CLAUDE.md「跑测试」一节）。
+          - name: py3.14
+            python: runtime\python\python.exe
+          - name: win7-py3.8
+            python: runtime-win7\python\python.exe
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: run_tests.py
+        # 默认并行，别加 -j1（串行一套就要好几分钟）。退出码 0 = OK，非 0 = 有红。
+        run: '& "${{ matrix.python }}" server\run_tests.py'
