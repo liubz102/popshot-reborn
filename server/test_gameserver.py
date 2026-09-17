@@ -36,6 +36,10 @@ from gameserver import (
     END_GAME_SCORE_PARTS,
     build_end_game_values,
     build_rep_quest_record,
+    BOARD_NAME_WIDTH,
+    BOARD_NAME_ELLIPSIS,
+    board_name_width,
+    clip_board_name,
     OP_RESPAWN_CHARACTER,
     OP_PREPARE_GAME,
     OP_SESSION_MEMBERS,
@@ -125,6 +129,8 @@ import lobby
 import questrecord
 import shop
 import shopcfg
+import testsupport
+from testsupport import drain
 from test_shop import (config_dir, parse_equipped_masks,
                        parse_rep_composition_list,
                        parse_rep_equipped_list, parse_rep_gift_list,
@@ -228,6 +234,106 @@ class GameServerPacketTests(unittest.TestCase):
             offset += length * 2       # ★ 长度字段是**字符数**，不是字节数
         self.assertEqual([(214, "阿狸"), (250, "Bob")], got)
         self.assertEqual(len(payload), offset)
+
+    def test_the_drain_helper_separates_timing_from_a_missing_packet(self):
+        """★★ `testsupport.drain()` —— 铁律 10 的那一刀落在哪儿。
+
+        判据是 `flush_outbox()` 里那个条件变量（事件驱动），超时只是保险丝。
+        关键是**返回值不许丢**：以前五处都写 `flush_outbox(timeout=5.0)` 却不看
+        结果，全量并行跑时偶尔等不满，测试接着往下走、在帧里找不到包，报的却是
+        「没有发出 gspRepLogin」—— 一次**时序超时**被说成**功能 bug**，
+        2026-09-17 照着那句错话查了半天协议。
+        """
+        class FakeConn:
+            def __init__(self, drained, left=0, broken=False):
+                self._drained = drained
+                self.outbox = [None] * left
+                self.send_broken = broken
+                self.seen_timeout = None
+
+            def flush_outbox(self, timeout=None):
+                self.seen_timeout = timeout
+                return self._drained
+
+        # 排空了 → 原样放行，而且用的是保险丝那个值
+        ok = FakeConn(True)
+        self.assertIs(ok, drain(self, ok))
+        self.assertEqual(testsupport.OUTBOX_FUSE_S, ok.seen_timeout)
+
+        # 没排空 → 当场失败，且话里说清「这是时序，不是没发包」
+        stuck = FakeConn(False, left=3)
+        with self.assertRaises(AssertionError) as caught:
+            drain(self, stuck)
+        text = str(caught.exception)
+        self.assertIn("没排空", text)
+        self.assertIn("3", text)          # 还剩几个包没写出去
+        self.assertIn("不是", text)        # 「**不是**「服务端没发这个包」」
+
+        # 顺带说清发送流死没死 —— 这两种卡法要查的地方不一样
+        for broken, word in ((True, "已废"), (False, "还活着")):
+            conn = FakeConn(False, left=1, broken=broken)
+            with self.assertRaises(AssertionError) as caught:
+                drain(self, conn)
+            self.assertIn(word, str(caught.exception))
+
+    def test_the_outbox_fuse_is_not_a_judgement(self):
+        """★ 保险丝要长到「正常机器上永远走不到」——
+        它一旦真的烧了，就说明发送线程没起来或者死锁了，不是「机器有点慢」。"""
+        self.assertGreaterEqual(testsupport.OUTBOX_FUSE_S, 30.0)
+
+    def test_a_long_name_is_clipped_so_the_time_survives(self):
+        """★★ 2026-09-17 实机实测：`RecordsCb` 宽 193 像素写死，16 个中文的
+        名字把整行撑爆，**被裁掉的是左边的时间**、名字反倒留全 ——
+        那一行就看不到成绩了。时间是这个框的核心信息，宁可截名字（用户拍板）。
+        """
+        long_name = "一二三四五六七八九十甲乙丙丁戊己"          # 16 个中文 = 32 半角
+        self.assertEqual(32, board_name_width(long_name))
+        clipped = clip_board_name(long_name)
+        self.assertTrue(clipped.endswith(BOARD_NAME_ELLIPSIS), clipped)
+        self.assertLessEqual(board_name_width(clipped), BOARD_NAME_WIDTH)
+        self.assertEqual("一二三四五六七八九十甲…", clipped)
+
+    def test_a_name_that_fits_is_left_alone(self):
+        """★ 反向：够短的一个字都不许动，**尤其是 ASCII** ——
+        16 个 ASCII 只有 16 个半角，实机显示完好，截它是平白丢信息。"""
+        for name in ("Ace", "昵称1a", "ABCDEFGHIJKLMNOP", "一二三四五六七八",
+                     "一二三四五六七八九十甲乙"):        # 12 个中文 = 24，正好不截
+            self.assertEqual(name, clip_board_name(name))
+
+    def test_the_clip_budget_matches_the_ui_box(self):
+        """12 个中文正好不截、13 个起才截 —— 临界点钉死，免得有人随手调小。"""
+        self.assertEqual(24, BOARD_NAME_WIDTH)
+        self.assertEqual("一" * 12, clip_board_name("一" * 12))
+        self.assertEqual("一" * 11 + BOARD_NAME_ELLIPSIS, clip_board_name("一" * 13))
+
+    def test_clipping_never_splits_a_character(self):
+        """奇数宽度的预算下，不许把一个全角字符切成半个。"""
+        got = clip_board_name("一二三四五六七八九十", width=7)
+        self.assertEqual("一二…", got)
+        self.assertLessEqual(board_name_width(got), 7)
+
+    def test_the_wire_carries_the_clipped_name(self):
+        """★ 截断必须发生在**组包层** —— 它是唯一的出口，调用方漏不掉。"""
+        payload = build_rep_quest_record(
+            3, 1, [99999] * 6, [(80, "一二三四五六七八九十甲乙丙丁戊己")])
+        seconds, length = struct.unpack_from("<iH", payload, 40)
+        name = payload[46:46 + length * 2].decode("utf-16le")
+        self.assertEqual(80, seconds)
+        self.assertEqual("一二三四五六七八九十甲…", name)
+        self.assertEqual(len(name), length)      # 长度字段是字符数，不是字节数
+
+    def test_the_board_keeps_the_full_name_on_disk(self):
+        """★★ 盘上那一份**不许**被这一刀碰到 —— 管理页以后要看榜、
+        或者哪天把 .ui 的框改宽了，都还要用完整昵称。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = shopcfg.DATA_DIR
+            shopcfg.DATA_DIR = tmp
+            try:
+                full = "一二三四五六七八九十甲乙丙丁戊己"
+                questrecord.note_clear(3, 1, [("u", full)], 80)
+                self.assertEqual([(80, full)], questrecord.board(3, 1)[1])
+            finally:
+                shopcfg.DATA_DIR = saved
 
     def test_rep_quest_record_requires_exactly_six_seats(self):
         """★ 反向验证：消费循环 `0x46a1d3` 无条件跑 i=0..5、不看 n1，
@@ -4985,7 +5091,7 @@ class SendBatchTests(unittest.TestCase):
         什么时候醒 —— 那是刻意换来的（§166 / D125），所以下面不再有任何
         「n 发独立的 send 就该有 n 次写」的断言。
         """
-        conn.flush_outbox(timeout=5.0)
+        drain(self, conn)
         return conn.sock.writes
 
     def decrypted(self, conn):
@@ -5154,7 +5260,17 @@ class StuckClientIsolationTests(SendBatchTests):
         conn.sock = self.ClosableSocket()
         return conn
 
-    def wait_for(self, predicate, timeout=5.0):
+    def wait_for(self, predicate, timeout=None):
+        """轮询等 `predicate()` 成真。**调用方必须 `assertTrue` 它的返回值。**
+
+        ★ 这里只能轮询：等的是任意一个条件，没有可挂的条件变量 ——
+        铁律 10 说的那个「物理上等不到事件」的例外。但超时值仍然是**保险丝**
+        而不是判据，所以跟 `testsupport.OUTBOX_FUSE_S` 走同一个数：
+        以前这儿写死 5 秒，和 `flush_outbox(timeout=5.0)` 是同一个坑
+        （全量并行 + 后台真服务端时偶尔不够，见那个常量的注释）。
+        """
+        if timeout is None:
+            timeout = testsupport.OUTBOX_FUSE_S
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if predicate():

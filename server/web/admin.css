@@ -960,6 +960,42 @@ code {
 /* 状态那几行（下次 / 上次 / 目录）各占一行。 */
 .backup-status { white-space: pre-line; margin: 0 0 12px; line-height: 1.7; }
 
+/* ------------------------------------ 下载日志弹窗（用户 2026-09-17，D131） */
+/* 只读弹窗，照「等级经验对应表」那一窗的壳；尺寸按内容长，别继承选择器那 640px。 */
+.modal .panel.logs-panel { width: min(680px, 100%); height: auto; max-height: 100%; }
+.logs-note { margin: 0 0 12px; }
+/* 一个目录一张卡片：白底 + 分隔线色描边，和「发送记录」列表同一身。 */
+.logs-group {
+  background: #fff; border: 2px solid var(--line); border-radius: 9px;
+  margin-bottom: 12px; overflow: hidden;
+}
+.logs-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; background: var(--paper-2);
+  border-bottom: 2px solid var(--line);
+}
+.logs-head b { color: var(--cocoa-ink); }
+.logs-head .logs-meta { margin-left: auto; }
+/* 一行 = 标签 / 数字 / 钮。标签那一列吃掉剩余宽度，数字和钮靠右。 */
+.logs-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center; gap: 10px; padding: 7px 12px;
+  border-top: 1px dashed var(--line);
+}
+.logs-head + .logs-row { border-top: 0; }
+.logs-lab { font-weight: 600; }
+.logs-meta { color: var(--cocoa-soft); font-size: 12px; white-space: nowrap; }
+.logs-row .btn-sm { white-space: nowrap; }
+/* 崩溃包清单：目录名是机器起的，等宽字好对；太长就断行，别把钮挤出去。
+   条数多了自己滚（一份崩溃包一行，攒上几十份很正常）。 */
+.logs-list { max-height: 260px; overflow-y: auto; border-top: 2px solid var(--line); }
+.logs-list .logs-row:first-child { border-top: 0; }
+.logs-name {
+  font-family: Consolas, "Cascadia Mono", monospace; font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.logs-list .list-empty { padding: 14px; }
+
 /* ---------------------------------------------- 玩家仓库弹窗（用户 2026-09-07） */
 #playerModal .panel { width: min(1020px, 100%); height: min(780px, 100%); }
 /* 壳照配置页那套：只有物品区滚，数值 / 按钮条 / 分类标签钉住。 */

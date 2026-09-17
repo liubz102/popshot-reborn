@@ -4159,6 +4159,161 @@ async function refreshBackups() {
 }
 
 /* ======================================================================
+   下载日志弹窗（用户 2026-09-17，D131）
+
+   「数据管理」页工具条上「⇩ 下载日志」点开的**只读**弹窗：两个目录（`logs/` /
+   `logs_client_crash/`）各一张卡片，数字全部来自 `/admin/api/logs`，页面里不留
+   静态副本；下载钮点下去就是一个 `<a href download>`，zip 由服务端**边打包边发**
+   （chunked），浏览器自己的下载栏管进度。
+
+   ★ 下载前先重取一次 overview（`loadLogs()`）：既把数字刷成最新的，也顺手当一次
+     会话检查 —— 会话过期时 `bounced()` 会把人踢回登录页，而不是让 `<a download>`
+     去下一个 401 的 JSON（Chromium 对 4xx 不落盘、只在下载栏里写「失败」，但那句
+     「失败」没人看得懂）。
+   ★ 不用 `fetch → blob → createObjectURL`：整份 zip 会先进浏览器内存，几百 MB 的
+     全量日志直接把标签页撑爆；也不用 `location.href =`，出错时会整页跳成一段 JSON。
+   ★ `a.download` 留空 —— 同源时 `Content-Disposition` 里的文件名优先，两头都写等于
+     埋一个「以后改名只改一半」的坑。
+   ★ 弹窗内所有下载钮都是米黄 `.btn.btn-sm`：下载是只读动作，没有「主钮」；
+     金色留给「按下去就改东西」的那一颗（D40a / D97f 的语言）。
+   ====================================================================== */
+
+var LOGS = null;              // {data, busy} —— 弹窗开着时非 null
+
+async function openLogsModal() {
+  LOGS = {data: null, busy: false};
+  var body = $("logsBody");
+  body.textContent = "";
+  body.appendChild(el("div", "list-empty", "读取中……"));
+  $("logsModal").classList.remove("hidden");
+  await loadLogs();
+}
+
+function closeLogsModal() {
+  LOGS = null;
+  $("logsModal").classList.add("hidden");
+  $("logsBody").textContent = "";
+}
+
+/** 重取两个目录的数字。返回「拿到了没」。 */
+async function loadLogs() {
+  if (!LOGS) { return false; }
+  var result = await api("/admin/api/logs");
+  if (bounced(result)) { return false; }
+  if (!LOGS) { return false; }                 // 等回包期间弹窗被关了
+  if (!result.ok) {
+    toast((result && result.message) || "读不到日志目录", false);
+    return false;
+  }
+  LOGS.data = result;
+  renderLogs();
+  return true;
+}
+
+/** 一张卡片：标题行（名字 + 目录 + 合计）。行由 `logsRow` 往里加。 */
+function logsGroup(title, dirname, dirPath, tally) {
+  var group = el("section", "logs-group");
+  var head = el("div", "logs-head");
+  head.appendChild(el("b", null, title));
+  var code = el("code", null, dirname + "/");
+  code.title = dirPath;                        // 服务器上的绝对路径，鼠标指上去看
+  head.appendChild(code);
+  head.appendChild(el("span", "logs-meta", tally));
+  group.appendChild(head);
+  return group;
+}
+
+function logsRow(host, label, meta, button) {
+  var row = el("div", "logs-row");
+  row.appendChild(el("span", "logs-lab", label));
+  row.appendChild(el("span", "logs-meta", meta));
+  row.appendChild(button);
+  host.appendChild(row);
+  return row;
+}
+
+function logsButton(text, files, query, label) {
+  var button = el("button", "btn btn-sm", text);
+  if (!files) {
+    button.disabled = true;                    // 没东西可打（服务端那头也会回 404）
+    button.title = "没有可下载的文件";
+  } else {
+    button.onclick = function () { downloadLogs(query, label); };
+  }
+  return button;
+}
+
+function tallyText(tally) {
+  return tally.files + " 个文件 · " + tally.size_text;
+}
+
+function renderLogs() {
+  var data = LOGS.data;
+  var body = $("logsBody");
+  body.textContent = "";
+  body.appendChild(el("p", "hint logs-note",
+    "打成 zip 直接下载，边打包边传（下载栏里看不到总大小，传完才知道）；"
+    + "服务器上不留副本。时间都是服务器本地时间。"));
+
+  var server = data.server;
+  var hours = data.recent_hours;
+  var group = logsGroup("服务端日志", server.dirname, server.dir,
+                        tallyText(server.total));
+  logsRow(group, "全部", tallyText(server.total),
+          logsButton("下载全量", server.total.files,
+                     "kind=server&scope=all", "服务端日志（全量）"));
+  logsRow(group, "最近 " + hours + " 小时", tallyText(server.recent),
+          logsButton("下载最近 " + hours + " 小时", server.recent.files,
+                     "kind=server&scope=recent",
+                     "服务端日志（最近 " + hours + " 小时）"));
+  body.appendChild(group);
+
+  var crash = data.crash;
+  var dirs = crash.dirs || [];
+  group = logsGroup("客户端崩溃包", crash.dirname, crash.dir,
+                    dirs.length + " 份 · " + crash.total.size_text);
+  logsRow(group, "全部（" + dirs.length + " 份）", tallyText(crash.total),
+          logsButton("下载全量", crash.total.files,
+                     "kind=client_crash", "客户端崩溃包（全部）"));
+  var list = el("div", "logs-list");
+  if (!dirs.length) {
+    list.appendChild(el("div", "list-empty", "还没有收到过崩溃包"));
+  }
+  dirs.forEach(function (row) {
+    var line = logsRow(list, row.name,
+                       row.files + " 个文件 · " + row.size_text + " · " + row.mtime_text,
+                       logsButton("下载", row.files,
+                                  "kind=client_crash&sub=" + encodeURIComponent(row.name),
+                                  "崩溃包 " + row.name));
+    line.firstChild.classList.add("logs-name");
+  });
+  group.appendChild(list);
+  body.appendChild(group);
+  body.appendChild(el("p", "hint logs-note", "统计时刻：" + data.generated_text
+                      + "（关掉重开、或点任一下载钮都会重算一遍）"));
+}
+
+/** 先重取一次（刷数字 + 会话检查），再让浏览器去下载。 */
+async function downloadLogs(query, label) {
+  if (!LOGS || LOGS.busy) { return; }         // 连点：上一次的预检还没回来
+  LOGS.busy = true;
+  var fresh;
+  try {
+    fresh = await loadLogs();
+  } finally {
+    if (LOGS) { LOGS.busy = false; }
+  }
+  if (!fresh) { return; }
+  var link = document.createElement("a");
+  link.href = "/admin/api/logs/download?" + query;
+  link.download = "";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  toast("已开始下载「" + label + "」，进度在浏览器的下载栏里。", true);
+}
+
+/* ======================================================================
    玩家仓库（V0.3商店 D22 的配套：商店按真实等级卖，改数值只能从这儿改）
 
    模型：`PLAYER.view` 是服务端那份快照，`PLAYER.edit` 是**要提交的补丁**
@@ -6182,10 +6337,10 @@ var ROLE = null;              // "system" / "operator" / "player" / null（没�
 var ME = {name: "", nickname: ""};
 
 //: 现在停在哪个标签页。★ 和 `CURRENT` 不是一回事 —— `CURRENT` 只记那几个
-//  **配置**页（渲染要用），「玩家仓库」「数据备份」「管理员账号」不在里面。
+//  **配置**页（渲染要用），「玩家仓库」「数据管理」「管理员账号」不在里面。
 var TAB = "items";
 
-//: 只有系统管理员能进的标签页（数据备份也是：它能回滚玩家存档）。
+//: 只有系统管理员能进的标签页（数据管理也是：它能回滚玩家存档、能下载整个 logs/）。
 var SYSTEM_ONLY_TABS = ["backup", "admins"];
 
 //: **系统管理员 + 运营**都能进、但只读玩家进不去的标签页（用户 2026-09-13）。
@@ -6314,6 +6469,8 @@ function showLoggedOut(message) {
   PLAYER_LIST = [];
   BACKUP = null;
   BACKUP_PAGE = 0;
+  // 会话过期时「下载日志」弹窗可能正开着 —— 别让它盖在登录页上。
+  LOGS = null;
   // 下一个登进来的是另一个人 —— 他的仓库、报价和挑好的车都跟这个人无关。
   SELL = null;
   SELL_PRICES = null;
@@ -6321,6 +6478,7 @@ function showLoggedOut(message) {
   $("playerModal").classList.add("hidden");
   $("sellPriceModal").classList.add("hidden");
   $("sellQtyModal").classList.add("hidden");
+  $("logsModal").classList.add("hidden");
   $("who").textContent = "";
   $("logout").classList.add("hidden");
   $("mainView").classList.add("hidden");
@@ -6494,6 +6652,12 @@ function wire() {
   };
   $("backupKeepDays").oninput = function () {
     if (BACKUP) { BACKUP.edit.keep_days = $("backupKeepDays").value; backupTouched(); }
+  };
+  // 「⇩ 下载日志」弹窗（用户 2026-09-17）：只读 ⇒ ✕ / Esc / 点遮罩都能关。
+  $("logsOpenBtn").onclick = function () { openLogsModal(); };
+  $("logsClose").onclick = closeLogsModal;
+  $("logsModal").onclick = function (event) {
+    if (event.target === $("logsModal")) { closeLogsModal(); }
   };
   $("playerLevel").oninput = function () {
     PLAYER.edit.level = Math.max(1, Number($("playerLevel").value) || 1);
@@ -6679,6 +6843,7 @@ function wire() {
     // 达成进度是**只读**的一眼看，关掉不丢东西 ⇒ 排在只读那几张里。
     if (event.key === "Escape" && CARD_PROG) { closeCardProgress(); return; }
     // 只读那几张排最后：它们不会盖在选择器上面。
+    if (event.key === "Escape" && LOGS) { closeLogsModal(); return; }
     if (event.key === "Escape" && LEVEL_MODAL) { closeLevelModal(); return; }
     if (event.key === "Escape" && PROMOTE_OPEN) { closePromoteModal(); return; }
     if (event.key === "Escape" && HISTORY) { closeHistoryModal(); }

@@ -275,6 +275,10 @@ class Handler(admin.AdminRoutes, http.server.BaseHTTPRequestHandler):
     #: 单个崩溃包的字节上限（`crash_max_upload_mb` 换算过的）。0 = 不接收。
     crash_max_bytes = 0
 
+    #: 日志打包（`logpack.LogPacker`，管理页「数据管理」→「下载日志」）。
+    #: `None` = 这个进程不是 app.py 起的（单跑注册页 / 测试），那两个接口回「没有启动」。
+    log_packer = None
+
     # ------------------------------------------------------------ 客户端身份
     def client_ip(self):
         """这次请求真正的客户端 IP（挂在 frp / nginx 后面也对）。
@@ -722,15 +726,18 @@ def make_server(port, accounts, host="::",
                 backup=None, crash=None,
                 crash_max_mb=server_config.DEFAULT_CRASH_MAX_UPLOAD_MB,
                 crash_cooldown=(
-                    server_config.DEFAULT_CRASH_UPLOAD_COOLDOWN_SECONDS)):
+                    server_config.DEFAULT_CRASH_UPLOAD_COOLDOWN_SECONDS),
+                log_packer=None):
     """建好 HTTP 服务器但不开始服务，方便测试拿到真实端口。
 
     `cooldown` = 注册冷却秒数（`server.config` 的 `register_cooldown_seconds`）。
     默认值就是「开着」—— 漏传参数时应当**多限一点**而不是不限。
-    `backup` = `databackup.BackupService`（管理页「数据备份」页用）；
+    `backup` = `databackup.BackupService`（管理页「数据管理」页用）；
     不传时那几个接口回「备份功能没有启动」。
     `crash` = `crashstore.Store`；不传时 `/api/crash-report` 一律回 403
     （同上：漏传参数时应当**不收**，而不是默默往磁盘上写）。
+    `log_packer` = `logpack.LogPacker`（同一页的「下载日志」）；不传时那两个接口
+    回「日志下载没有启动」（同上：不该让一台只跑注册页的进程把 `logs/` 发出去）。
     """
     handler = type("BoundHandler", (Handler,),
                    {"accounts": accounts,
@@ -742,7 +749,8 @@ def make_server(port, accounts, host="::",
                     "backup": backup,
                     "crash_store": crash,
                     "crash_limiter": RegisterRateLimiter(crash_cooldown),
-                    "crash_max_bytes": max(0, int(crash_max_mb)) * 1048576})
+                    "crash_max_bytes": max(0, int(crash_max_mb)) * 1048576,
+                    "log_packer": log_packer})
     return _PreboundHTTPServer(create_listener(host, port), handler)
 
 
@@ -751,11 +759,12 @@ def serve(port, accounts, host="::", ready=None,
           backup=None, crash=None,
           crash_max_mb=server_config.DEFAULT_CRASH_MAX_UPLOAD_MB,
           crash_cooldown=(
-              server_config.DEFAULT_CRASH_UPLOAD_COOLDOWN_SECONDS)):
+              server_config.DEFAULT_CRASH_UPLOAD_COOLDOWN_SECONDS),
+          log_packer=None):
     """阻塞地提供注册页服务。`app.py` 会把它丢进一个线程。"""
     httpd = make_server(port, accounts, host, cooldown, backup=backup,
                         crash=crash, crash_max_mb=crash_max_mb,
-                        crash_cooldown=crash_cooldown)
+                        crash_cooldown=crash_cooldown, log_packer=log_packer)
     if ready is not None:
         ready.set()
     httpd.serve_forever()

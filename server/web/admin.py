@@ -41,6 +41,10 @@
     POST /admin/api/backups/create    {label}  立刻备份一份（手动）              ★系统
     POST /admin/api/backups/restore   {id, files}  回滚（先自动留一份「回滚前」）  ★系统
     POST /admin/api/backups/remove    {id}                                    ★系统
+    GET  /admin/api/logs              下载日志弹窗：两个日志目录的大小 + 崩溃包清单  ★系统
+    GET  /admin/api/logs/download?kind=server&scope=all|recent   服务端日志打成 zip   ★系统
+    GET  /admin/api/logs/download?kind=client_crash[&sub=目录名]  崩溃包打成 zip      ★系统
+         （两条 download 都是 chunked 流式响应，边打包边发，见 `_admin_logs_download`）
 
 ## 权限分三档（`system` / `operator` 两档见 D34；`player` 见 D74）
 
@@ -163,6 +167,7 @@ import cfgmerge
 import databackup
 import eventlog
 import gifthistory
+import logpack
 import sellprice
 import shop
 import shopcfg
@@ -1047,6 +1052,66 @@ def _player_view(username, account):
     }
 
 
+class _ChunkedBody:
+    """把 zipfile 的 `write()` 变成 HTTP 响应体（`Transfer-Encoding: chunked` 的分块帧）。
+
+    zipfile 8 KB 一块地往外吐，而 `wfile` 是**不带缓冲**的（`StreamRequestHandler.wbufsize = 0`，
+    一次 `write` 就是一次 `sendall`）—— 直接转发等于每 8 KB 一个 chunk 帧、一次系统调用。
+    所以攒到 `CHUNK` 再发，而且**一帧拼成一个 bytes 一次写**（长度行、数据、CRLF 分三次
+    `sendall` 的话，中间断开会留下半个帧）。
+
+    `chunked=False`（HTTP/1.0 客户端）就裸写，靠关连接表示结束。
+
+    ★ `CHUNK` 是缓冲大小，不是铁律 10 说的时序阈值 —— 它不判断任何事情的先后，
+      只决定一次系统调用搬多少字节。
+    ★ `write()` 返回字节数：zipfile 里那层 `_Tellable` 靠它累加偏移。
+    ★ `flush()` 故意不发：`ZipFile.close()` 会叫一次 —— 发出去就又回到一堆小帧了。
+      真正的收尾是 `finish()`。
+    """
+
+    CHUNK = 256 * 1024
+
+    def __init__(self, wfile, chunked=True):
+        self._wfile = wfile
+        self._chunked = chunked
+        self._parts = []
+        self._buffered = 0
+        #: 交给我的字节数（= zip 内容的大小）。
+        self.total = 0
+        #: 真正写进 socket 的字节数（含分块帧头，审计日志里的「已发」）。
+        self.sent = 0
+
+    def write(self, data):
+        count = len(data)
+        if count:
+            self._parts.append(bytes(data))
+            self._buffered += count
+            self.total += count
+            if self._buffered >= self.CHUNK:
+                self._push()
+        return count
+
+    def flush(self):
+        pass
+
+    def _push(self):
+        if not self._buffered:
+            return
+        payload = b"".join(self._parts)
+        self._parts = []
+        self._buffered = 0
+        frame = (b"%x\r\n%s\r\n" % (len(payload), payload)) if self._chunked else payload
+        self._wfile.write(frame)
+        self.sent += len(frame)
+
+    def finish(self):
+        """余量推出去，再发结束块。**出错时不要调它** —— 没有结束块正是「失败」的信号。"""
+        self._push()
+        if self._chunked:
+            self._wfile.write(b"0\r\n\r\n")
+            self.sent += 5
+
+
 class AdminRoutes:
     """混进 `web.server.Handler` 的 `/admin` 那一组接口。
 
@@ -1246,6 +1311,12 @@ class AdminRoutes:
             return True
         if path == "/admin/api/backups":
             self._admin_backups_get()
+            return True
+        if path == "/admin/api/logs":
+            self._admin_logs_get()
+            return True
+        if path == "/admin/api/logs/download":
+            self._admin_logs_download(query)
             return True
         if path.startswith("/admin"):
             self._reply(False, "没有这个接口", status=404)
@@ -1877,6 +1948,112 @@ class AdminRoutes:
         self._backup_reply(service, message, restored=restored,
                            failed=[list(item) for item in result["failed"]],
                            pre_backup_id=result["pre_backup_id"], kicked=kicked)
+
+    # ------------------------------------------------------------ 下载日志
+    def _log_packer(self):
+        """`app.py` 注进来的 `logpack.LogPacker`；没注入（单跑注册页 / 测试）就回一句话。"""
+        if self.log_packer is None:
+            self._reply(False, "日志下载没有启动（这个进程不是 app.py 起的）")
+            return None
+        return self.log_packer
+
+    def _admin_logs_get(self):
+        """`GET /admin/api/logs` —— 两个目录的大小 + 崩溃包清单。★ 系统管理员专用。"""
+        if self._require_system_admin() is None:
+            return
+        packer = self._log_packer()
+        if packer is None:
+            return
+        payload = packer.overview()
+        payload["ok"] = True
+        self._send_json(payload)
+
+    def _admin_logs_download(self, query):
+        """`GET /admin/api/logs/download?kind=…` —— 打成 zip **边打包边发**。★ 系统管理员专用。
+
+        流式（HTTP/1.1 chunked，没有 Content-Length）而不是「先打成临时文件再发」（D131）：
+
+        * 请求线程本来就独立于游戏线程（`ThreadingMixIn`），zlib / 文件 IO / `sendall`
+          都释放 GIL，而且不拿任何数据锁 —— 打包不挡战斗；
+        * `sendall` 被上行带宽钉住，压缩的快慢跟着网速走，CPU 只占几个百分点；
+          先打临时文件的话会在几秒内把 CPU 打满，还得有人负责删它；
+        * 浏览器立刻看到下载在走，取消 = 断开连接，服务端这边一个 OSError 就收工。
+
+        ★★ `end_headers()` 之后的一切异常**必须在这里兜住**：头已经发出去了，
+          `do_GET` 那个兜底会再往同一条流里 `_reply` 一份 500 JSON（把 zip 尾巴弄脏，
+          或者再抛一次），而 `handle_one_request` 不接的异常会把 traceback 打进
+          `server.err`。出错就**不发结束块、直接断连接** —— 浏览器看到的是「下载失败」，
+          而不是一个自称完整的坏 zip。
+        ★ 头里只放 ASCII（`send_header` 是 latin-1 strict）：文件名由 `logpack` 保证，
+          昵称之类的中文只进审计日志。
+        ★ 不设 socket 超时：浏览器「暂停下载」是合法行为，线程在 `sendall` 上等着
+          就是了（铁律 10）；死连接由 TCP keepalive 兜底。
+        """
+        name = self._require_system_admin()
+        if name is None:
+            return
+        packer = self._log_packer()
+        if packer is None:
+            return
+        fields = urllib.parse.parse_qs(query or "")
+
+        def first(key):
+            return (fields.get(key) or [""])[0]
+
+        try:
+            plan = packer.plan(first("kind"), first("scope") or logpack.SCOPE_ALL,
+                               first("sub"))
+        except logpack.LogPackError as error:
+            self._reply(False, str(error), status=error.status)
+            return
+        # HTTP/1.0 的客户端（`curl --http1.0`、老 wget）不认 chunked：裸发，发完关连接。
+        chunked = self.request_version >= "HTTP/1.1"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition",
+                         'attachment; filename="%s"' % plan.filename)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        # 内容每次现生成、活文件还在长：没有稳定的验证器，断点续传做不了，说清楚。
+        self.send_header("Accept-Ranges", "none")
+        if chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+        else:
+            self.send_header("Connection", "close")
+        self.end_headers()
+        body = _ChunkedBody(self.wfile, chunked)
+        started = time.monotonic()
+        who = self._who(name)
+        try:
+            stats = packer.write_zip(
+                body, plan, meta={"version": versioning.own_version_text(), "by": name})
+            body.finish()
+        except logpack.PackAborted as error:
+            # 服务器自己这边读盘读到一半坏了 —— 这份 zip 交付不了，断掉让浏览器报失败。
+            self.close_connection = True
+            self.log_message("日志打包中途失败: %s", error)
+            eventlog.online(f"[admin] {who} 下载{plan.label}失败（{error}），"
+                            f"已发 {databackup.format_size(body.sent)}，连接已断开")
+            return
+        except OSError as error:
+            # 对面不要了（Windows ConnectionResetError / ConnectionAbortedError，
+            # Linux BrokenPipeError）—— 浏览器取消了下载，正常收工，不是错误。
+            self.close_connection = True
+            eventlog.online(f"[admin] {who} 下载{plan.label}中断"
+                            f"（{type(error).__name__}），已发 "
+                            f"{databackup.format_size(body.sent)}")
+            return
+        except Exception as error:                  # noqa: BLE001 —— 头已发出，只能断
+            self.close_connection = True
+            self.log_message("日志打包出错: %r", error)
+            eventlog.online(f"[admin] {who} 下载{plan.label}出错（{error!r}），连接已断开")
+            return
+        note = (f"，跳过 {len(stats['skipped'])} 个（打包时已被清理）"
+                if stats["skipped"] else "")
+        eventlog.online(f"[admin] {who} 下载了{plan.label}：{stats['files']} 个文件 "
+                        f"{databackup.format_size(stats['bytes'])} → zip "
+                        f"{databackup.format_size(body.sent)}，用时 "
+                        f"{time.monotonic() - started:.1f} 秒{note}")
 
     def _admin_item_lookup(self, query):
         """按 itemId 查一件东西。省得对着 7 位数字猜这是啥。"""

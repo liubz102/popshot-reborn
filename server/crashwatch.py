@@ -197,6 +197,30 @@ def parse_logged_at(text):
     return time.mktime(tm)
 
 
+def ansi_to_text(text):
+    """按 `latin-1` 读进来的 ANSI 文本 → 给人看的 str。**只给 `meta.json` 那几个字段用。**
+
+    这两份报告是原版客户端按 **ANSI（中文机器上是 CP936）** 写的。整份正文按
+    `latin-1` 读、再按 `latin-1` 编回去，是为了让包里那份和玩家机器上那份**逐字节
+    相同**（见 `read_crash_report` / `Collector.build`）—— 但从里面抠出来放进
+    `meta.json` 的 `fault` / `dump_name` 这几段，会被 `json.dumps` 按 **UTF-8** 写出去：
+    `latin-1` 解出来的那串「字节伪装成的字符」就这么变成了 `ø·þÎñ÷ÊèÕÃ`
+    （用户 2026-09-17 在云上收到的崩溃包里看到的）。安装目录带中文的玩家，
+    `Fault address` 那一行的 exe 路径必然中招。
+
+    ★ 用 `mbcs`（= 这台机器的 ANSI 代码页）：写这份文件的就是这台机器上的原版
+      客户端，它用的正是这一页；非 Windows（没有 `mbcs`）退回中文版客户端的 CP936。
+      `errors="replace"`：解不出来也只是一个问号，绝不让一段坏字节把整次上传打断。
+    """
+    raw = text.encode("latin-1", "replace")
+    for codec in ("mbcs", "gbk"):
+        try:
+            return raw.decode(codec, "replace")
+        except LookupError:
+            continue
+    return text
+
+
 def split_records(text):
     """把 `BigShot.rpt` 按 `==== logged at ... ====` 切成一块块，按原顺序返回。"""
     records = []
@@ -229,23 +253,29 @@ class CrashReport:
         head = _RECORD_RE.match(
             next((ln for ln in text.splitlines()
                   if _RECORD_RE.match(ln.rstrip())), "").rstrip())
-        self.logged_at_text = head.group(1) if head else ""
+        #: `text` 是按 `latin-1` 读的「字节伪装成的字符」（要和玩家机器上那份逐字节
+        #: 相同）。★ 抠出来给人看 / 进 `meta.json` 的字段一律过一遍 `ansi_to_text`，
+        #: 否则安装目录带中文的玩家，`fault` 里的路径会变成 `ø·þÎñ÷ÊèÕÃ`。
+        #: `logged_at_raw` 留着给 `Collector.build` 和 rpt 正文（也是 latin-1 的）比对。
+        self.logged_at_raw = head.group(1) if head else ""
+        self.logged_at_text = ansi_to_text(self.logged_at_raw)
         #: ★ 崩溃时刻优先用报告里写的；认不出（或那一行根本没有）就退回文件
         #:   mtime —— 绝不拿一个畸形字符串去拼目录名。
-        self.epoch = parse_logged_at(self.logged_at_text) or mtime
+        self.epoch = parse_logged_at(self.logged_at_raw) or mtime
         match = _DUMPNAME_RE.search(text)
         #: ★ 只取 basename：`BigShot.rpt` 里躺着历次崩溃留下的**别的机器、
         #:   别的目录**的绝对路径（`D:\work\popshot\...`），那些路径在这台
         #:   机器上要么不存在、要么指向不相干的东西。
-        self.dump_name = os.path.basename(match.group(1)) if match else ""
+        self.dump_name = (os.path.basename(ansi_to_text(match.group(1)))
+                          if match else "")
         #: 原版客户端自己的版本号（报告第二行 `Version: 311`）。
         #: 和我们这一版的 `BUILD.ver` 是两回事，两个都要记。
         version = _VERSION_RE.search(text)
-        self.client_version = version.group(1) if version else ""
+        self.client_version = ansi_to_text(version.group(1)) if version else ""
         exc = _EXCEPTION_RE.search(text)
-        self.exception = exc.group(1) if exc else ""
+        self.exception = ansi_to_text(exc.group(1)) if exc else ""
         fault = _FAULT_RE.search(text)
-        self.fault = fault.group(1) if fault else ""
+        self.fault = ansi_to_text(fault.group(1)) if fault else ""
 
     @property
     def stamp(self):
@@ -607,7 +637,8 @@ class Collector:
             if tail:
                 zf.writestr("BigShot.rpt.last.txt",
                             tail.encode("latin-1", "replace"))
-                if report.logged_at_text and report.logged_at_text not in tail:
+                # ★ 拿 latin-1 原样的那份比：`tail` 也是 latin-1 读的。
+                if report.logged_at_raw and report.logged_at_raw not in tail:
                     # 对不上不算错（玩家可能手工删改过 rpt），但要说清楚 ——
                     # 说在 meta.json 里，别把话混进那份要保持原样的正文。
                     meta["rpt_mismatch"] = True

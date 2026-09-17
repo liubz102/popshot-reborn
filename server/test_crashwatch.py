@@ -194,6 +194,27 @@ class ReportParsingTests(unittest.TestCase):
         self.assertEqual("", report.logged_at_text)
         self.assertEqual("", report.dump_name)
 
+    def test_chinese_paths_in_the_report_come_out_readable(self):
+        """★ 安装目录带中文的玩家（用户 2026-09-17 在云上的崩溃包里看到
+        `fault` 变成 `ø·þÎñ÷ÊèÕÃ`）。报告是 ANSI（CP936）写的、我们按 latin-1
+        整份读进来保字节，但抠出来进 `meta.json` 的字段必须是给人看的字。"""
+        path = os.path.join(self.game, "Dump", "LastCrashReport.txt")
+        raw = REPORT_TEXT.replace(
+            "D:\\git\\popshot-reborn\\main\\game_patched",
+            "F:\\百度网盘\\炮炮火枪手\\game_patched").encode("cp936")
+        with open(path, "wb") as fp:
+            fp.write(raw)
+        report = crashwatch.read_crash_report(self.game)
+        self.assertIn("F:\\百度网盘\\炮炮火枪手\\game_patched\\BigShot.exe",
+                      report.fault)
+        self.assertEqual("BigShotV0311N001.mdmp", report.dump_name)
+        self.assertEqual("C0000005 ACCESS_VIOLATION", report.exception)
+        self.assertEqual("09/09/26, 01:36:42", report.logged_at_text)
+        # 正文那份仍然是字节原样（包里要和玩家机器上的逐字节相同）。
+        self.assertEqual(raw, report.text.encode("latin-1"))
+        # `meta.json` 是 UTF-8 写的：这几个字段现在是真正的中文，不是伪装的字节。
+        self.assertIn("百度网盘", json.dumps({"fault": report.fault}, ensure_ascii=False))
+
 
 class BuildInfoTests(unittest.TestCase):
     """`BUILD.ver` 有三种形态，三种都要认；读不到要**明说**读不到。"""

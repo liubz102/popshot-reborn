@@ -5264,6 +5264,19 @@ V0.2 §142 / §152 照着跳表把 `0x0310` 当「纯入向包」研究完就结
 ⚠ 现有的 `END_GAME_SCORE_PARTS = (5,6,7)` **验不出**这种 ±1 偏移
 （界面显示的是三格之和，整体平移一格看起来一模一样）。
 
+★ **勘误（2026-09-17 实机截图）**：上面说「刷新函数只把第一条塞进去」是**错的**
+—— `RecordsCb` 展开后**整整 10 条都在**。`0x466594` 那一段只管「收起时显示哪一行」，
+真正把列表填满的在别处（没找到那个点，但不影响：服务端照发 `TOP_N` 条就对）。
+⇒ **`TOP_N = 10` 是对的，别改成 1。**
+
+★★ **长昵称会把那一行的「时间」挤出框外**（同一批截图）：`RecordsCb` 在
+`SelectQuestMapRecord.ui` 里宽 **193 像素**写死，条目按 `"%02d:%02d %s"` 拼。
+16 个 **ASCII** 的名字显示完好，16 个**中文**的名字撑爆整行，
+而且**被裁掉的是左边的时间**、名字反倒留全 ——
+那一行变成「`0 一二三四五六七八九十甲乙丙丁戊己`」，看不到成绩。
+临界点约 13 个中文。⇒ 组包层加 `clip_board_name()` 截到 24 个半角（12 个中文正好不截），
+**盘上仍存完整昵称**（截断是显示适配，不是数据）。口径在 D132。
+
 **计时口径**（客户端不上报用时：`0x040f` 载荷无有效字段、`0x0417` 只有一个 bool
 ⇒ 只能服务端自己算）：
 
@@ -5276,3 +5289,46 @@ V0.2 §142 / §152 照着跳表把 `0x0310` 当「纯入向包」研究完就结
   客户端播报走 `cdq / idiv 1000`（有符号除 = 向零截断）。`201600 ms` 播 `03:21`，
   榜上若 `round(201.6)=202` 就成了 `03:22` —— **「播报和榜差一秒」就是这么来的**。
   先夹毫秒再整除（0.4 秒的退化局否则会变成「播报 00:00 / 榜上 00:01」）。
+
+---
+
+## §128 ★★ 往 `http.server` 的响应里流式写 zip：三条硬事实（✅实测，2026-09-17）
+
+1. **`zipfile` 能往只有 `write()` / `flush()` 的对象写**（3.14 / 3.8 都验过）：发现没有
+   `tell()` 就自己包一层 `_Tellable`、改用 data descriptor（大小 / CRC 写在成员数据后面，
+   本地文件头里的三个字段置 0）。★ `write()` **必须返回字节数**，返回 None 直接
+   `TypeError`（`_Tellable` 拿它累加偏移）。它 8 KB 一块地写 ⇒ HTTP 侧要攒成大块
+   （`wfile` 是 `wbufsize = 0` 的 `_SocketWriter`，一次 `write` 就是一次 `sendall`）。
+2. **`end_headers()` 之后抛出去的异常会被 `do_GET` 的兜底接住再 `_reply` 一份 500 JSON**
+   —— 往已经发了头的流里再写一段，要么弄脏 zip 尾巴要么再抛一次；而 `handle_one_request`
+   只接 `TimeoutError`，别的一路抛到 `BaseServer.handle_error` → `traceback.print_exc()`
+   → **`logs/server.err`**。所以下载 handler 里 `end_headers()` 之后的一切都自己兜：
+   浏览器取消 = `ConnectionResetError`（Windows 10054）/ `ConnectionAbortedError`（10053）/
+   Linux `BrokenPipeError`，都是 `OSError`；收场只做 `close_connection = True` + 审计一行。
+   `test_web_admin` 的断连用例把 `httpd.handle_error` 换成记录器钉住「没被调过」。
+3. **出错时不能 `ZipFile.close()`**：它会往坏掉的输出里再写中央目录（再抛一次，或交付一个
+   自称完整的坏 zip）；而不调 close 的话 `ZipFile.__del__` 会在垃圾回收时替你调 ——
+   "Exception ignored in …" 打进 stderr。`zf.fp = None` 让两条路都当它已经关过。
+
+顺带：Windows 上 `os.scandir().stat()` 对**同进程**正开着写的文件也拿到了新大小 / mtime
+（实测，和「目录项只在关闭时更新」的传闻不符）；`logpack` 照旧用 `os.stat`（按句柄查，
+有保证），`test_logpack` 钉的是「打开着写、不关也看得到新值」。
+下载横跨本地零点时 `daylog` 那次切名会因为我们持着 `server.out` 而失败一次 —— 它自己
+「失败就原样接着写」（文件头写明了），只是那天的切分晚到下一次零点。
+
+---
+
+## §129 ★★ 「latin-1 读进来保字节」的文本，抠出来的字段不能直接进 UTF-8 的 JSON（✅实测，2026-09-17）
+
+崩溃包 `meta.json` 的 `fault` 里，带中文的安装路径显示成 `ø·þÎñ÷ÊèÕÃ`（用户在云上收到的包）。
+
+`crashwatch.read_crash_report` 按 `latin-1` 读 `LastCrashReport.txt`（原版按 ANSI / CP936 写），
+是为了包里那份能按 `latin-1` 编回去、和玩家机器上的**逐字节相同** —— 这一半没错。错在
+从这串「字节伪装的字符」里 `re` 抠出来的 `fault` / `dump_name` / `exception` / 时刻 / 版本
+原样进了 `json.dumps`：每个 CP936 字节被当成一个 U+0080~U+00FF 的字符按 UTF-8 写出去。
+GBK `D3 CE`（「游」）→ `ÓÎ`，就是那种乱码的指纹。
+
+修法只动给人看的那几个字段：`ansi_to_text()` = `encode("latin-1")` 编回字节 → `mbcs`
+（写文件的就是这台机器的 ANSI 页；非 Windows 退回 `gbk`）`errors="replace"` 解。正文和
+rpt 比对（`logged_at_raw`）仍用 latin-1 那份。★ 这段在**客户端包**里跑，要重打客户端包才生效；
+已收到的旧包里那串按同样路数就能还原。
