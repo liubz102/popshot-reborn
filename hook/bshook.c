@@ -6238,6 +6238,122 @@ static int try_kill_nm(void)
 /* -------------------------------------------------------------------------- */
 
 /* ========================================================================== */
+/* ★ 追踪弹「目标已经死了还在追」—— 爱琳 2 号武器的蝴蝶炸完不消失（§28 / §29）*/
+/*                                                                            */
+/*   `Projectile::Homing`（0x47e347）里有两条路，**判据不对等**：             */
+/*     · 还没锁定（`[弹体+0x328] == -1`）→ 方框搜索，候选回调 0x47e29d        */
+/*       逐条筛：`0x417c72`（状态 +0x54 是 3/4 = 死 / 正在死）跳过、自己跳过、*/
+/*       同队（+0x15c）跳过、`vft+0xac`（HP）≤ 0 跳过，最后才比 HomingRange。 */
+/*     · 已经锁定 → 直接跳到 0x47e3e0，只做两件事：句柄还解不解析得出对象    */
+/*       （解不出就 `[+0x328] = -2` 放弃）、距离还在不在 HomingRange 里。     */
+/*       **一个死活判据都没有。**                                             */
+/*                                                                            */
+/*   ⇒ 目标被咬住之后才死掉，追踪**不撒手**；而命中那一侧（候选回调          */
+/*     0x47e037，`0x47e05b` 那一发）**会**拿 0x417c72 把死人跳过 ——           */
+/*     于是弹体永远追得上、永远打不着，直到尸体对象被回收才解脱。             */
+/*                                                                            */
+/*   为什么全游戏只有蝴蝶（`ch03-02a`）看得出来：每帧最大转角 =               */
+/*   `HomingAngle / 7` 度（0x47e53a：`fild HomingAngle` × 1/7 × π/180），     */
+/*   稳态盘旋半径 R = v / (2·sin(θ/2))：                                      */
+/*     ch03-02a  HomingAngle=300 → 42.9°/帧 → R ≈ 1.37·v ≈ **8 ~ 11**        */
+/*     ch01-03   HomingAngle=30  → 4.3°/帧  → R ≈ 13.4·v ≈ 267 > HomingRange */
+/*                                          ⇒ 甩出 200 外，原版自己会置 -2   */
+/*     ch102-02  HomingAngle=30，但 Size=15 比自己的 R 还大 ⇒ 必定撞上        */
+/*   只有蝴蝶的圈**又小到不蹭地、又远小于 HomingRange(200) 不会脱靶**，       */
+/*   于是贴着尸体绕直径二十来像素的小圈扇翅膀 —— 就是用户看到的「在原处小幅  */
+/*   度来回飞」。2026-09-17 21:34 那一局实测：弹体 3A439A00 咬住怪物句柄      */
+/*   0x0010c8fd，服务端 21:34:42.136 收到它 HP 归零，之后该弹体连续 17 帧绕   */
+/*   (2052.5, 578) 画半径 8.4 的圆，`+0x328` 一直是 1100029 没松口。          */
+/*                                                                            */
+/*   补丁：给「保住目标」那一侧套上**命中侧同一个判据** —— 打不着的东西就不  */
+/*   该继续追。0x47e40a 的 `add esp,0x14` + `test eax,eax` 正好 5 字节、是两  */
+/*   条完整指令，且函数内没有任何分支落在这 5 字节里（全函数分支目标已核）。  */
+/*   在 `test` 之前把「已死」的目标当成「对象没了」（eax 清零），原版         */
+/*   0x47e411 那条 `[+0x328] = -2` 就会替我们把它放掉 —— 之后弹体照常按重力  */
+/*   飞、落地爆炸，走的是「一开始就没找到目标」那条**已经验过**的路。         */
+/*                                                                            */
+/*   ★ 为什么挑「状态 3/4」而不是 HP ≤ 0：判据要和**命中侧**逐字一致。HP 先  */
+/*   归零、`Character::Die()` 要等服务端 0x0406 死亡广播才调，中间那几帧命中 */
+/*   侧仍然打得着 —— 那时候就不该撒手。跟着 0x417c72 走，两侧永远同进同退。  */
+/*                                                                            */
+/*   BSHOOK_KEEP_HOMING_DEAD=1 保留原版行为（对照用）。                       */
+/* ========================================================================== */
+#define HOMING_ALIVE_VA        0x0047E40Au
+#define HOMING_ALIVE_PATCH_LEN 5             /* E9 rel32，正好吃掉两条指令    */
+#define HOMING_ALIVE_SIG_LEN   13
+/* 这 13 字节在 re/BigShot_22524.img 上**唯一**（光前 5 字节有 44 处，不够用）*/
+static const unsigned char HOMING_ALIVE_SIG[HOMING_ALIVE_SIG_LEN] = {
+    0x83, 0xC4, 0x14,                        /* add  esp, 0x14               */
+    0x85, 0xC0,                              /* test eax, eax                */
+    0x75, 0x0B,                              /* jne  0x47e41c                */
+    0xC7, 0x07, 0xFE, 0xFF, 0xFF, 0xFF       /* mov  dword ptr [edi], -2     */
+};
+#define HOMING_ALIVE_RETURN_TO 0x0047E40F    /* 补回两条原指令后接着跑        */
+
+static __declspec(naked) void homing_alive_detour(void)
+{
+    __asm {
+        add  esp, 0x14                       /* 被偷走的第一条                */
+        test eax, eax
+        jz   hal_back                        /* 对象本来就没了：原版逻辑照旧  */
+        cmp  dword ptr [eax + 0x54], 3       /* 0x417c72 认的两个「死」状态   */
+        je   hal_drop
+        cmp  dword ptr [eax + 0x54], 4
+        jne  hal_back
+    hal_drop:
+        xor  eax, eax                        /* 死了 = 当成查不到，交回原版   */
+    hal_back:
+        test eax, eax                        /* 被偷走的第二条（重设标志位）  */
+        push HOMING_ALIVE_RETURN_TO
+        ret                                  /* push / ret 都不动标志位       */
+    }
+}
+
+static volatile LONG g_homing_alive_patched = 0;
+
+static int homing_dead_keep_original(void)
+{
+    /* 语义同 dash_visual_crash_keep_original()：设了才是「保留原版」。 */
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_HOMING_DEAD", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_patch_homing_alive(void)
+{
+    unsigned char *p = (unsigned char *)HOMING_ALIVE_VA;
+    DWORD oldp;
+
+    if (g_homing_alive_patched) return 1;
+    if (IsBadReadPtr(p, HOMING_ALIVE_SIG_LEN)) return 0;
+    /* 幂等：已打过就是「E9 <跳到我们 detour 的 rel32>」 */
+    if (p[0] == 0xE9
+        && (DWORD)(*(int *)(p + 1))
+               == (DWORD)((UINT_PTR)&homing_alive_detour - (UINT_PTR)(p + 5))) {
+        InterlockedExchange(&g_homing_alive_patched, 1);
+        return 1;
+    }
+    if (memcmp(p, HOMING_ALIVE_SIG, HOMING_ALIVE_SIG_LEN) != 0)
+        return 0;                          /* 还没解壳到这里，或不是这个版本 */
+
+    if (!VirtualProtect(p, HOMING_ALIVE_PATCH_LEN, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   追踪弹撒手死目标: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    p[0] = 0xE9;
+    *(DWORD *)(p + 1) = (DWORD)((UINT_PTR)&homing_alive_detour
+                                - (UINT_PTR)(p + 5));
+    VirtualProtect(p, HOMING_ALIVE_PATCH_LEN, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, HOMING_ALIVE_PATCH_LEN);
+    InterlockedExchange(&g_homing_alive_patched, 1);
+    bslog("PATCH   ★追踪弹撒手死目标 @ %08X：锁定的目标一进「死」状态"
+          "（+0x54 = 3/4，和命中侧 0x417c72 同一个判据）就按原版「查不到对象」"
+          "那条置 -2 —— 蝴蝶不再绕着尸体转", (unsigned)HOMING_ALIVE_VA);
+    return 1;
+}
+
+/* ========================================================================== */
 /* ★ M3b 诊断：弹体全字段快照 —— 查「bot 的子弹别人看不见」（V0.3 §53~§56）   */
 /*                                                                            */
 /*   已知：bot 的弹体在收方**确实存在**（打得掉血、爆炸动画正常，而            */
@@ -6412,6 +6528,21 @@ static int proj_is_bullet(unsigned char *p)
 static void proj_track_add(void *proj, int handle)
 {
     int i = g_proj_track_next;
+    int k;
+
+    /* ★★ 2026-09-17 第二次发现「这张表在骗人」：弹体对象是**池化复用**的，
+       同一个地址一局里能被三四颗弹体先后用上（实测 3A439A00 在 13 秒里发了
+       6 次）。老那一格从不清，而 proj_tick_log 从 i=0 线性扫、撞上**第一个**
+       地址相同的格子就按它的句柄判 —— 于是新弹体永远对不上、**一行都不打**。
+       那一局 42 颗蝴蝶里 21 颗是这么「凭空消失」的，跟「被销毁了」长得一模
+       一样，差点把结论引到沟里（§28 说 64 格不够时踩的是同一类坑）。
+       ⇒ 登记新的之前，先把**所有**还指着这个地址的旧格子作废。 */
+    for (k = 0; k < PROJ_TRACK_N; k++)
+        if (g_proj_track[k].obj == proj) {
+            g_proj_track[k].obj = NULL;
+            g_proj_track[k].handle = -1;
+            g_proj_track[k].ticks = 0;
+        }
     g_proj_track_next = (g_proj_track_next + 1) % PROJ_TRACK_N;
     /* ★ 挤掉一格之前先喊一声：被挤掉的那颗从此不再出现在日志里，
        看日志的人会把它误当成「被销毁了」。表够不够用不能靠感觉。 */
@@ -6435,7 +6566,10 @@ static void __cdecl proj_tick_log(void *proj)
     if (!p || IsBadReadPtr(p, 0x340)) return;
     for (i = 0; i < PROJ_TRACK_N; i++) {
         if (g_proj_track[i].obj != proj) continue;
-        if (g_proj_track[i].handle != PI(0xD0)) return;   /* 地址被复用了 */
+        /* 地址被复用了：接着往后扫，**别 return** —— 上面 proj_track_add 已经
+           会清掉同地址的旧格，这里留 continue 当第二道网（真撞上就是漏了一处，
+           静默丢轨迹比多扫 512 格贵得多）。 */
+        if (g_proj_track[i].handle != PI(0xD0)) continue;
         g_proj_track[i].ticks++;
         /* ★ 走 bsvlog 不走 bslog：这是**每帧 × 每弹体**的，占不起 flush +
            DebugView 那一档（用户 2026-09-01 的掉帧）。 */
@@ -8439,6 +8573,21 @@ static DWORD WINAPI patch_thread(LPVOID param)
     /* BSM1 is a functional patch, independent of diagnostic log settings. */
     if (!try_patch_bot_motion())
         bslog("BSM1    !! 运动 hook 特征不匹配，保留原版处理；需要检查客户端版本");
+
+    /* ★ 追踪弹撒手死目标（§29）：功能补丁，和诊断开关无关，**一直装**。
+       目标函数 `Projectile::Homing` 只在战斗里跑，远晚于解壳窗口。 */
+    if (homing_dead_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_HOMING_DEAD 已设，保留原版「追踪弹咬住死目标"
+              "不撒手」的行为（蝴蝶会绕着尸体转）");
+    } else {
+        for (ticks = 0; !g_stop && !g_homing_alive_patched && ticks < 2000; ticks++) {
+            if (try_patch_homing_alive()) break;
+            Sleep(2);
+        }
+        if (!g_homing_alive_patched)
+            bslog("PATCH   !! 超时未能 patch 追踪弹撒手死目标"
+                  "（0x47E40A 的特征串一直对不上）");
+    }
 
     /* ★ M3b 诊断：弹体全字段快照（临时，查完「看不见 bot 的子弹」就删）。
        两个 hook 的目标函数都在战斗里才第一次跑，远晚于解壳窗口。 */
