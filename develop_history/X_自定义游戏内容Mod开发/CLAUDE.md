@@ -122,6 +122,7 @@ develop_history/V0.3_合成与商店/CLAUDE.md      + .claude/{...}.md
 | `hook/` | 注入 DLL `bshook.c` + 加载器 `bsloader.c`。**字节补丁全在这里**（`try_patch_*` + `VirtualProtect` 的范式） |
 | `server/` | Python 服务端（**单机假服务器和云端是同一套代码**） |
 | `server/data/` | **只装用户数据**，全部 `.gitignore`。★★ **打出来的包里这个目录必须是空的** |
+| `test/` | ★ **测试都在这里**：`run_tests.py` + 全部 `test_*.py`，夹具在 `test/data/<用途>/`（进 git，不进发布包） |
 | `runtime/python/` | 内置 CPython 3.14.3 x64 |
 | `runtime-win7/python/` | **Win7 兼容运行时** 3.8.10 win32。★ 改完服务端顺手跑一遍 |
 | `dist/` | 打包产物（客户端包 + 服务端包，两个） |
@@ -157,10 +158,14 @@ develop_history/V0.3_合成与商店/CLAUDE.md      + .claude/{...}.md
 ## ★ 跑测试 —— **用默认的并行，别跑串行**
 
 ```powershell
-runtime\python\python.exe server\run_tests.py            # 3.14，默认并行
-runtime-win7\python\python.exe server\run_tests.py       # Win7 的 3.8，同上
-runtime\python\python.exe server\run_tests.py test_bot   # 只跑几个模块 / 某个类
+runtime\python\python.exe test\run_tests.py            # 3.14，默认并行
+runtime-win7\python\python.exe test\run_tests.py       # Win7 的 3.8，同上
+runtime\python\python.exe test\run_tests.py test_bot   # 只跑几个模块 / 某个类
 ```
+
+- ★ 测试代码和夹具都在根目录 `test\` 下（夹具按用途分在 `test\data\` 里），
+  被测代码在 `server\`。**全量名单是现扫 `test\test_*.py` 得到的** ——
+  新加测试文件自动进全量，没有哪张手写表要去登记。
 
 - ★★ **别加 `-j1`**。两套运行时都要绿，串行跑一遍就是 7 分钟，并行 1.5 分钟。
   只有「怀疑某条红是并行引起的」才拿 `-j1` 复核一次。

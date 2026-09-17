@@ -587,3 +587,28 @@ Bip01_Spine / Spine1 / Spine2 / Neck / Head / Pelvis
 同地址一局能发 6 次；`proj_tick_log` 撞上第一个同地址的旧格就按它的句柄判并 `return`）。
 已修：`proj_track_add` 先作废同地址旧格，tick 侧 `return` 改 `continue`。
 ★ `寿命(+31c)` / `碰撞型(+32c)` 这两个偏移**猜错了**，全程恒定 33554431 / 0，别再拿它们判事。
+
+## §30 ★★★ 管理页日志下载：审计行是**发完结束块之后**才写的（✅两套运行时实测）
+
+`web/admin.py::_admin_logs_download` 的顺序是：`body.finish()` 把 chunked 结束块写进
+socket → **然后**才写 `eventlog.online(…)` 那一行审计。而 `wfile` 不带缓冲
+（`StreamRequestHandler.wbufsize = 0`，一次 `write` 就是一次 `sendall`）⇒
+客户端 `read()` 返回时那一行**还没落地**。
+
+服务端这么写是对的：审计文案里有 `stats['files']` / `body.sent` / 用时，全是写完才知道的。
+**错的是用例** —— `test_the_audit_log_says_who_took_what` 紧接着 `download()` 就
+`assertEqual(1, len(lines))`，等于赌服务端线程比客户端快。
+
+- 3.14 上赌赢，**Win7 的 3.8 并行跑全量时赌输**：`AssertionError: 1 != 0 : []`，
+  原样重跑一遍又绿 —— 典型偶发，而且报出来的错话是「审计日志一行都没有」，
+  会把人往「服务端没写日志」上引。
+- 实测钉死（2026-09-18）：把 `databackup.format_size` 拖慢 0.4 秒（它在那句 f-string 的
+  参数里，比 `eventlog.online` 先算），**两套运行时上老写法必红、新写法必绿**。
+
+⇒ 修法在测试侧，判据换成**事件**：`_CapturedLog`（`list` 子类）在 `append` 里
+`notify_all`，用例先 `wait_for()`；固定时长降级成保险丝 `AUDIT_FUSE_S = 60`，
+超时的错话必须写明「这是时序，不是服务端没写审计日志」（铁律 10 的写法，
+同 `testsupport.OUTBOX_FUSE_S`）。
+
+★ 同一个 `capture_log()` 的另外两处（登录 / 加管理员）**没有这个问题**：
+那两条 `eventlog.online(…)` 是在 `_reply()` **之前**调的，回包到手时行已经写完了。

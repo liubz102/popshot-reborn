@@ -99,7 +99,7 @@ rem  build, and every previously shipped client of the SAME version suddenly
 rem  failing the integrity check against a freshly built server package.
 rem  With /Brepro the timestamp becomes a hash of the content, so
 rem  same sources == same bytes == same SHA, and none of that happens.
-rem  (Pinned by server\test_hookintegrity.py, class ReproducibleBuildTests.)
+rem  (Pinned by test\test_hookintegrity.py, class ReproducibleBuildTests.)
 rem --------------------------------------------------------------------------
 
 echo [build] compiling bshook.dll ...

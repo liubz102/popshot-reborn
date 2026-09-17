@@ -510,22 +510,25 @@ game_patched\Pack_publish\*.pkn   和原版一模一样的加密格式，客户�
 
 ## 运行测试
 
-服务端测试使用 Python 自带的 `unittest`：
+测试代码和夹具都在根目录的 `test\` 下（被测代码在 `server\`），用 Python 自带的
+`unittest`：
 
 ```powershell
-runtime\python\python.exe server\run_tests.py
+runtime\python\python.exe test\run_tests.py
 ```
 
 内置的便携 Python 带着 `python314._pth`，其中的 `.` 指的是 python.exe 所在目录而不是
 当前工作目录，所以直接 `-m unittest test_gameserver` 会找不到模块 —— `run_tests.py`
-就是为这件事准备的。用系统 Python 的话 `cd server; python -m unittest test_account_store
-test_gameserver test_online` 也可以。
+就是为这件事准备的（它把 `test\` 和 `server\` 一起放进 `sys.path`）。
+
+★ **全量名单是现扫 `test\test_*.py` 得到的**，没有第二份手写清单：新加一个测试
+文件就自动进全量，不用去别处登记。
 
 默认按 CPU 数并行跑；`-j1` 串行，也可以只跑某几个模块或某个类：
 
 ```powershell
-runtime\python\python.exe server\run_tests.py test_shop
-runtime\python\python.exe server\run_tests.py test_shop.ShelfTests
+runtime\python\python.exe test\run_tests.py test_shop
+runtime\python\python.exe test\run_tests.py test_shop.ShelfTests
 ```
 
 
@@ -546,7 +549,8 @@ python tools/gs_ctl.py help
 | 路径 | 内容 |
 |---|---|
 | `hook/` | 注入 DLL、启动器源码及构建脚本 |
-| `server/` | 服务端：认证、游戏、注册页、GM 管理页、中继、协议和测试（单机和云端共用同一套代码）|
+| `server/` | 服务端：认证、游戏、注册页、GM 管理页、中继、协议（单机和云端共用同一套代码）|
+| `test/` | ★ **测试都在这里**：`run_tests.py` + 全部 `test_*.py`；夹具在 `test/data/<用途>/`。进 Git，不进发布包 |
 | `server/config.py` | ★ **端口号唯一的源**，以及 `server.config` 的解析器 |
 | `server/shopdefaults.py` | ★ 商店 / 合成 / 掉落的**设计表** = 第一次开服生成的那份模板 |
 | `server/shop_items.json` | 原版物品数据的只读镜像（哪个 id 客户端认识、占哪个槽）|
