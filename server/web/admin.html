@@ -1014,6 +1014,42 @@
 <!-- ========================= 确认对话框 =========================
      替掉 `window.confirm`：那个框的样式跟管理页完全不搭，而且装不下
      「冲突 / 未冲突」两张清单（用户 2026-09-06）。按钮由 admin.js 生成。 -->
+<!-- ================= 自定义属性（X3，用户 2026-09-19）=================
+     从物品库里**武器**卡片右下角的「自定义属性」打开。
+       · 自定义武器：左「任务模式（PVE）」/ 右「对战模式（PVP）」两栏数值，每格标着
+         资源包里的参考值，留空 = 用参考值；栏间一对「复制到另一侧」小钮。
+       · 原版武器：数值不可改（服务端也拒收），只剩下面的说明文。
+       · 通栏：说明文（提示框第二段，最多 3 行）+「游戏里会显示」的预览（服务端现算）。
+     保存 = 落盘 + 立刻推给在线客户端（`POST /admin/api/weapon`）。
+     有未保存改动 ⇒ **不认遮罩**，只认 ✕ / 取消 / Esc（本页约定）。
+     ★ 故意排在 `#dialog` 前面：关闭前那句「丢掉改动？」要压在它上面。 -->
+<div class="modal hidden" id="weaponModal">
+  <div class="panel weapon-panel">
+    <div class="panel-title">
+      <h2 id="weaponTitle">自定义属性</h2>
+      <button class="icon-btn" id="weaponClose" aria-label="关闭"
+              title="关闭（有没保存的改动会先问一句）">✕</button>
+    </div>
+    <div class="panel-body">
+      <div class="toolbar cfg-bar">
+        <div class="filters">
+          <span class="sell-price-who" id="weaponWho">此页内容仅管理员可以修改。普通玩家只能看不能改。</span>
+        </div>
+        <div class="acts" id="weaponActs">
+          <span class="dirty clean" id="weaponDirty"></span>
+        </div>
+      </div>
+      <div class="weapon-scroll">
+        <div id="weaponBody"></div>
+      </div>
+    </div>
+    <div class="panel-foot">
+      <button class="btn" id="weaponCancel">取消</button>
+      <button class="btn btn-primary" id="weaponSave">保存</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal dialog hidden" id="dialog">
   <div class="panel">
     <div class="panel-title"><h2 id="dialogTitle"></h2></div>

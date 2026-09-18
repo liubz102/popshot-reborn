@@ -137,6 +137,13 @@ def knight_name(item):
 
 def weapon_name(item):
     name = (item.name_kr or "").strip()
+    if getattr(item, "custom", False):
+        # 自定义武器（X3）：`리볼버 C` → 「左轮手枪 自定义」，和爆裂 / 极速 / 复合的默认名一个格式。
+        suffix = " " + shopcfg.CUSTOM_WEAPON_SUFFIX
+        base = name[:-len(suffix)] if name.endswith(suffix) else name
+        zh = WEAPON_BASE_ZH.get(base.strip())
+        if zh:
+            return "%s %s" % (zh, shopcfg.CUSTOM_WEAPON_ZH)
     if item.series and item.tier:
         suffix = " %s%d" % (item.series, item.tier)
         base = name[:-len(suffix)] if name.endswith(suffix) else name

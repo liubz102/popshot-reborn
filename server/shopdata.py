@@ -31,7 +31,8 @@ import os
 
 #: 认得的产物格式版本。对不上就当没有数据 —— 宁可商店空着，
 #: 也不要按错的布局解出一堆槽位错乱的装备。
-FORMAT = 1
+#: ★ 2（X3）：条目多了 `custom`（自定义武器），`weapon` 里没有 `desc` 了。
+FORMAT = 2
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "shop_items.json")
@@ -52,7 +53,7 @@ class Item(object):
 
     __slots__ = ("id", "kind", "part_flag", "part", "character", "timed",
                  "icon", "name_kr", "stock", "ownable", "slot", "series",
-                 "tier", "ammo_id", "weapon", "bonus", "bonus_lua")
+                 "tier", "ammo_id", "weapon", "bonus", "bonus_lua", "custom")
 
     def __init__(self, raw):
         self.id = int(raw.get("id", 0))
@@ -79,6 +80,9 @@ class Item(object):
         self.bonus = raw.get("bonus") or {}
         #: 条件加成（Lua 源码）。客户端自己会算，服务端只能原样展示。
         self.bonus_lua = raw.get("bonus_lua") or {}
+        #: ★ 自定义武器（X3，部位码 92）：数值由服务端 `weaponcfg` 说了算、
+        #: 管理页可调；游戏里显示的名字是「<原名> 自定义」。
+        self.custom = bool(raw.get("custom"))
 
     @property
     def equippable(self):

@@ -42,6 +42,7 @@ import sellprice                                               # noqa: E402
 import shopcfg                                                 # noqa: E402
 import shopdata                                                # noqa: E402
 import versioning                                              # noqa: E402
+import weaponcfg                                               # noqa: E402
 from account_store import AccountStore                         # noqa: E402
 from web import admin as web_admin                             # noqa: E402
 from web import server as web_server                           # noqa: E402
@@ -355,6 +356,9 @@ class AdminAuthTests(_AdminCase):
                 ("/admin/api/sell/prices", None),
                 ("/admin/api/sell/prices", {"prices": {"bead": 1}}),
                 ("/admin/api/sell", {"items": [{"id": 10001, "count": 1}]}),
+                # 自定义武器（X3）：读三档都到得了，写只有运营 —— 但登录这道门都得过。
+                ("/admin/api/weapon?id=1920001", None),
+                ("/admin/api/weapon", {"id": 1920001, "desc": "x"}),
                 ("/admin/api/config/shop", {"text": "{}"}),
                 ("/admin/api/admins/add", {"name": "carol", "password": "pw1"}),
                 ("/admin/api/admins/password", {"name": "admin", "password": "pw1"}),
@@ -1693,6 +1697,88 @@ class AdminAccountApiTests(_AdminCase):
         result = self.request("/admin/api/admins/remove", {"name": "admin"})[1]
         self.assertFalse(result["ok"])
         self.assertIn("至少要保留一个系统管理员", result["message"])
+
+
+class WeaponEndpointTests(_AdminCase):
+    """「自定义属性」弹窗那两发（X3，用户 2026-09-19）。"""
+
+    CUSTOM = 1920001
+    ORIGINAL = 1120011
+
+    def setUp(self):
+        super().setUp()
+        if not shopdata.exists(self.CUSTOM):
+            raise unittest.SkipTest("shop_items.json 里没有自定义武器")
+        self.assertTrue(self.login()[1]["ok"])
+
+    def test_get_returns_both_modes_with_references(self):
+        status, result = self.request("/admin/api/weapon?id=%d" % self.CUSTOM)
+        self.assertEqual(200, status)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["custom"])
+        self.assertTrue(result["can_edit"])
+        self.assertEqual(["pve", "pvp"], [m["key"] for m in result["modes"]])
+        keys = [f["key"] for f in result["fields"]]
+        self.assertEqual(list(weaponcfg.FIELD_KEYS), keys)
+        damage = result["fields"][0]
+        self.assertEqual(6, damage["reference"])           # 爆裂 3 的 Damage
+        self.assertIsNone(damage["pve"])
+        self.assertIsNone(damage["pvp"])
+        self.assertTrue(result["preview"].startswith(weaponcfg.PVP_ONLY_NOTE))
+
+    def test_an_original_weapon_only_has_a_description(self):
+        status, result = self.request("/admin/api/weapon?id=%d" % self.ORIGINAL)
+        self.assertEqual(200, status)
+        self.assertFalse(result["custom"])
+        self.assertEqual("", result["pvp_only_note"])
+        status, result = self.request("/admin/api/weapon",
+                                      {"id": self.ORIGINAL, "params": {"pve": {}, "pvp": {"damage": 1}}})
+        self.assertEqual(400, status)
+        self.assertIn("原版武器", result["message"])
+
+    def test_post_saves_and_reports_the_push(self):
+        status, result = self.request("/admin/api/weapon", {
+            "id": self.CUSTOM, "desc": "说明", "params": {"pve": {"damage": 40}, "pvp": {"damage": 2}}})
+        self.assertEqual(200, status, result)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(0, result["pushed"])               # 测试里没有游戏连接
+        self.assertEqual(40, [f for f in result["fields"] if f["key"] == "damage"][0]["pve"])
+        self.assertEqual(2, [f for f in result["fields"] if f["key"] == "damage"][0]["pvp"])
+        self.assertIn("伤害 2", result["preview"])
+        self.assertEqual("说明", result["desc"])
+        # 落盘了、serial 涨了；`/admin/api/item` 那条说明文也跟着变（catalog 已失效）
+        table = weaponcfg.load(self.data_dir)
+        self.assertEqual({"pve": {"damage": 40}, "pvp": {"damage": 2}},
+                         table["custom"][str(self.CUSTOM)])
+        self.assertEqual(1, table["serial"])
+        _status, item = self.request("/admin/api/item?id=%d" % self.CUSTOM)
+        self.assertIn("说明", item["desc"])
+
+    def test_bad_payloads_are_refused_before_touching_the_file(self):
+        for payload in ({"id": "x", "desc": "a"},
+                        {"id": self.CUSTOM},
+                        {"id": self.CUSTOM, "params": []},
+                        {"id": self.CUSTOM, "params": {"pvp": {"damage": -1}}},
+                        {"id": self.CUSTOM, "desc": "1\n2\n3\n4"},
+                        {"id": 10001, "desc": "材料不是武器"}):
+            status, result = self.request("/admin/api/weapon", payload)
+            self.assertEqual(400, status, payload)
+            self.assertFalse(result["ok"], payload)
+        self.assertEqual({}, weaponcfg.load(self.data_dir)["custom"])
+
+    def test_a_player_can_read_but_not_write(self):
+        # 先登管理员再登玩家：把登录限速关掉，免得 429 盖住真正要看的回执
+        # （同 `PlayerReadOnlyTests.setUp`）。
+        self.httpd.RequestHandlerClass.admin_limiter = \
+            web_admin.LoginRateLimiter(cooldown=0)
+        self.request("/admin/api/logout", {})
+        self.accounts.register("alice", "PlayerPw1", display_name="爱丽丝")
+        self.assertTrue(self.login("alice", "PlayerPw1")[1]["ok"])
+        status, result = self.request("/admin/api/weapon?id=%d" % self.CUSTOM)
+        self.assertEqual(200, status)
+        self.assertFalse(result["can_edit"])
+        status, result = self.request("/admin/api/weapon", {"id": self.CUSTOM, "desc": "x"})
+        self.assertEqual(403, status)
 
 
 class OperatorPermissionTests(_AdminCase):

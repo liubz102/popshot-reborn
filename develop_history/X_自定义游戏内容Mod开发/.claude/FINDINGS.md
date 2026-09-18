@@ -749,3 +749,63 @@ key 2 -> 0x480f8d push 0xc 冰冻   key 4 -> 0x480fbd push 0xe ★ 减速
 `VirtualAlloc` 一块 RWX 当代码洞，站点写 `E9` 跳过去：洞里先原样跑那三条，
 再 `cmp dword [ebp+0x58],0`，为 `NULL` 就跳到 `0x5bf73f`（**Unlock 之后** —— 压根没锁上）。
 ★ 站点 / 跳转目标 / 洞里的字节全部由 `test/test_patchsites.py` 拿脱壳镜像离线核对。
+## §36 ★★★★★ 客户端武器表：**每次进图重读 ini**，记录 596 B、按 Id 查表在 `0x4157bf`（🔍静态，类型逐条核过）
+
+**结论**：想让服务端说了算的数值真正生效，不能只在收到时写一次内存 —— `WeaponTable::Load(path) = 0x48b50d`
+有 **4 个调用点**：启动 `0x43567f`、对战 `GameContextNewPvp` 构造 `0x497cb6`、闯关场景构造 `0x4a3b7c`、
+`weapon-newpvp.ini` `0x497c5e`（明文树里没这文件，空跑）⇒ 每局开始都重新解析并**按 Id 覆盖**
+（`0x48b6ab` 查同 key → `0x41444c` 插入 / 覆盖）。所以 hook 挂在 Load 的**返回点**上再写一遍（D26）。
+
+- 容器全局 `0x72e788`；一条记录 `0x254`（`0x48b66c push 0x254`）；`0x4157bf(ecx=容器, eax=&id)` 返回哈希链节点或 0，
+  **记录在 `[节点+8]`**（收侧 `OnFire 0x491f24..0x491f4e` 铁证）。函数只用 esi/edi 且自己 push/pop，`ret` 无参。
+- 12 个可调字段的偏移 / 类型见 `packet_api.md` §6.7：`Velocity/MaxVelocity/GravityFactor` 是 **f32**
+  （解析走 `0x40b9dd` + `fstp dword`），其余 int32（`0x40b8c2`，缺省值在 `ebx`，如 ReloadTime 200）。
+- 全年龄那套 `_` 前缀键：取值函数 `0x40b8c2` 见 `[解析器+0x20]` 非零就先查 `"_"+key`；那个字节 = `[0x72e784]`，
+  由 `0x48b602` 从全局 `[0x72e358]` 抄来。**没查到谁写 `0x72e358`**（xref 全是地址比较的误命中）⇒
+  自定义小节的 `_` 键一律指向和普通键同一批资源，两种模式都看到黄金（D28）。
+- ✅ 实机（2026-09-19 02:12）：`0x0F01` 在**主线程**收到；登录那一刻武器表还是空的（启动那次 Load 是
+  **进大厅时**才跑，来源 `0x435684`），第一次施加 0/9，Load 返回点上再写就是 **9/9**；管理页保存后广播的 v2
+  当场 9/9。⇒ 「登录后下发 + Load 返回点重施加」两条缺一不可。
+- 收 0xFF 帧的主分发 `ServerConnection::vft[13] = 0x54e036`：`ecx=this`，栈上一个包对象，`[包+0xc]` = 帧首，
+  opcode 在帧 `+8`、载荷长在 `+2`；入口 9 字节（`56 / 8b f1 / 8b 0d 9c e2 72 00`）全是位置无关指令，
+  `install_inline_hook` 正好偷走这三条。**同样 9 字节在镜像里出现 2 次**（中继连接那份副本），钩子按 VA 装。
+
+## §37 ★★★★ `default.amf` 是定长记录的二进制表；`.efx` 是 CP949 明文 XML（✅整份 round-trip）
+
+- `default.amf`：`"ANIM" u32 1 u32 组数(6)`；组 = `wstr名[256B] wstr目录[256B] u32 n`；
+  条目 = `wstr名[256B] wstr路径[512B] i32 i32 i32 帧数 + 帧数×(i32 帧号, i32 毫秒)`（前两个 i32 全表恒 0）。
+  弹体全在组 0 `Game/Bullet`（原 246 条）。`tools/amftool.py` parse→write 整份 233792 B 逐字节一致；
+  加一颗 2D 弹体 = 追加一条记录 + 组计数 +1（`weapon.ini` 的 `Image=Anim,<条目名>` 指它）。
+- `.efx`：XML，声明 `ks_c_5601-1987`，CRLF。颜色是 `<ColorValue>` 的 **ARGB 有符号 int**（`-65536` = 不透明红），
+  贴图 `<TextureFileName>CH00\WP01\Texture\X.dds</TextureFileName>` **多档共用**（D1 的贴图被 D2/D3 引用），
+  9 把爆裂 3 及子弹药共引用 128 张贴图，其中 **116 张整张是红的**（不是白底靠颜色染）⇒ 改色必须做贴图副本。
+  `<MeshFileName>` 也能挂 `.msh`（弹壳 / boss 碎片），原样引用即可。
+- HUD 武器图标 `Icon=Wp01D3,c` = `Images/Game/Wp01D3.png/.smf` **3 帧 = 3 个角色**（414×114，每格 136×112）。
+- 特效贴图全是未压缩 A8R8G8B8（含 mip 链的也是），`dds_edit.save_like` 全部可写。
+
+## §38 ★★★★ 客户端收到**不认识的 opcode 无害**，三个前置分发器都带边界检查（🔍逐条）
+
+`0x54e036` 先给三个前置分发器过目再进自己的 switch：大厅 `0x4061e2`（`cmp eax,0x401; ja` + `sub 0x300; cmp 0x11; ja`）、
+当前 Stage 的 `vft+0xc4`（`ShopStage` 的 `0x4442a3`：`cmp eax,0x604; jg` + `sub 0x500; cmp 0xc; ja`）、
+`0x54b634`（只认 `0x805`）；自己的 switch 认不出走 `0x54e546: xor al,al; jmp 0x54e565` 返回 0。
+⇒ 我们自造的 `0x0F01` 发给**没装钩子 / 老版本**的客户端也只是被丢掉。服务端仍按版本门控只发给 ≥ V0.4.2。
+
+## §39 ★★★ 物品 id / 商店表 / 物品定义缓存的三条事实（✅离线核对 + 🔍静态）
+
+- 7 位物品 id = `X PP 0 SS T`：X 角色 1/2/3，PP 部位码（12 = 武器），武器的 `SS` `1x/2x/3x` = D 系 1/2/3 号槽、
+  `4x~6x` = R、`7x~9x` = F，T = 档。**本项目新定部位码 92 = 自定义武器**（`X 92 000 S`，S = 槽位），
+  `tools/shopdata.PART_KIND[92]`；尾四位 `0001..0003` 落在 `weapon_variant()` 的 `11..93` 之外。
+- 中文版 `ShopItem-Chn.ini` **没有 1/3 号槽的 D3 / R3 / F3 物品**（只有 2 号槽的），`weapon.ini` 小节和图标都在；
+  条目只有 `Image / Tag(=weapon.ini Id) / PartFlag`，UTF-16LE + BOM、**LF 行尾**。
+- 客户端 ItemDB `[0x72e1dc]` 是哈希表：`0x415aab` 插入走 `0x415c4c → 0x415ca5`，**遇重复 key 忽略新值**
+  （`0x415cff` 那条 `mov byte [edi+8],0` 分支）⇒ 重发 `0x0501` 刷不掉旧说明文，仓库提示框要重登才更新（用户认下，D29）。
+  商店提示框读的是 `0x0500` 货架包的 `ShopStock+0x18`，每次开货架重发 ⇒ 即时。
+
+## §40 ★★★ 原版 `weapon.ini` 基线与前人 PR 的实际改动范围（✅逐字节）
+
+`2245b8c7^:game_patched/Pack_develop/Data/weapon.ini` == `D:\git\popshot-reborn\main\Pack_decrypt\Data\weapon.ini`
+（sha256 `00084834adea094c8bb038ad08627886e32b2224fd08238d0d26eb0d8db81616`，221519 B，CP949 + CRLF）。
+PR 之后只改了 4 小节（`ch00-01` Size/HeadDamage、`ch00-01D1`、`ch00-01R1`、`ch00-01F1` 的数值）+ 3 条 `Desc=` +
+整份转 UTF-16LE。客户端 ini 读取器 **BOM 嗅探**（原版 `ShopItem-Chn.ini` 就是 UTF-16），两种编码都吃；
+`tools/weapondata.read_ini` 同样嗅探。现在的文件 = 原版逐字节 + `; ==== X_Mod goldwp …` 标记起的追加块
+（11 个自定义小节，CP949），`test/test_weaponini.py` 钉着前 221519 字节。

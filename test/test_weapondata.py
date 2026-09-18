@@ -339,7 +339,9 @@ class RealTableTests(unittest.TestCase):
                 continue
             tagged += 1
             self.assertIn(raw["roh"], weapondata.WEAPON_ROH, raw["section"])
-        self.assertEqual(127, tagged)      # 228 节里带 ROH 的那些
+        # 原版 228 节里带 ROH 的 127 节 + 自定义武器 11 节（X3：9 主 + 2 子弹药，
+        # `ROH` 照抄爆裂 3 ⇒ 用自定义左轮打的也算「左轮高手」那一族）。
+        self.assertEqual(138, tagged)
 
     def test_roh_of_covers_the_three_base_characters(self):
         """基础三角色的 9 把主武器**一把不落**地映射到自己那张卡片上。

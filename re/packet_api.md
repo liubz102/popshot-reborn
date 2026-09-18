@@ -33,7 +33,7 @@
 | [3](#3-游戏服服务端--客户端gsp) | **服务端 → 客户端（gsp）逐包**：参数 + 客户端拿它干什么。★ **§3.8 = 商店 / 合成 / 仓库段**（上行 ✅实测，下行 🔍静态）|
 | [4](#4-原版-tcp-中继rcp) | 原版 TCP 中继（rcp）|
 | [5](#5-udppacket-的内层-opcode) | `UdpPacket` 的内层 opcode（`rpFire` / 心跳 …）|
-| [6](#6-共享结构体) | 共享结构体：`SessionSlot` / `SessionDescriptor` / `Session` / `UserSnap` / 物件 id / 属性号 |
+| [6](#6-共享结构体) | 共享结构体：`SessionSlot` / `SessionDescriptor` / `Session` / `UserSnap` / 物件 id / 属性号 / **武器记录（§6.7）** |
 | [7](#7-认证服nmco端口-47611--不在-vftablesjson-里) | 认证服（NMCO，`nmconew.dll`）|
 | [8](#8-我们自己加的-udp-旁路psux01--和游戏协议无关) | 我们自己加的 UDP 旁路 |
 | [9](#9-自己接着往下逆的方法) | **自己接着往下逆的方法**（把 ❓ 变成 ✅ 的固定套路）|
@@ -2220,6 +2220,33 @@ opcode 出处：`0x493808` 的分发链 `sub 0x406 / dec / sub 0xb / dec / dec /
 **频道码 → 游戏类型**（抄自 `0x5545ec`）：`0/1/2/3/4/6/10 → 1`、`7 → 2`、`9 → 5`；
 表外和负数 → `-1`（客户端认为「当前不在任何可玩频道」）。
 
+#### `0x0F01` 「自定义武器表」—— ★ **我们自造的，只有 bshook 认识**（X_Mod · X3，2026-09-19）
+
+服务端 → 客户端，走 27799 的普通 `0xFF` 帧。原版客户端的主分发 `0x54e036` 认不出它，落进
+`0x54e546` 的默认分支（`xor al,al` 返回 0）什么都不做；三个前置分发器都带边界检查
+（大厅 `0x4061e2` 只吃 `0x300..0x311` + `0x401`，`ShopStage` `0x4442a3` 只吃 `0x500..0x60c`，
+`0x54b634` 只认 `0x805`）⇒ **老客户端收到也无害**（X_Mod §38）。bshook 在 `0x54e036` 头上挂钩子
+（`det_wtab_dispatch`），认出这一包就吞掉（照默认分支 `xor al,al; ret 4`），按武器 Id 把数值写进
+内存里的武器表（§6.7）；`WeaponTable::Load` 的返回点上再挂一个，每次进图重读 ini 之后重写一遍。
+
+线格式（`server/weaponcfg.build_hook_frame()` ⇄ hook 侧 `wtab_on_frame()`）：
+
+```text
+u16 format(=1) · u32 serial · u16 n
+n × { i32 武器Id · [PVE] u32 mask + 12×4B · [PVP] u32 mask + 12×4B }      每条 108 B
+```
+
+12 格按 `weaponcfg.FIELDS` 的顺序：`Damage HeadDamage LegsDamage SplashDamage SplashRange
+MagazineCount CoolingTime ReloadTime LoadingTime`（int32）`Velocity MaxVelocity GravityFactor`（f32）。
+`mask` 位 = 这一格有值（资源包参考值也算）；没在 mask 里的格 hook 写回自己存的原值。
+两套一起发，hook 按「谁在重读 `weapon.ini`」挑：闯关场景构造（返回地址 `0x4a3b81`）→ PVE，
+对战 `GameContextNewPvp` 构造（`0x497cbb` / `0x497c63`）和启动（`0x435684`）→ PVP。
+
+**什么时候发**：登录成功后一次（`on_game_login` 末尾）；管理页「自定义属性」保存后
+`gameserver.broadcast_hook_weapon_table()` 推给全部已登录连接（在线玩家不用重登）。
+只发 `client_version >= versioning.WEAPON_TABLE_MIN_VERSION`（V0.4.2）的连接。
+★ 只有 9 把自定义武器的 Id（`100C9S0`）会出现在表里，原版武器不进这条链。
+
 ---
 
 ### 3.6 服务端方向：**已知有类名、但语义未查明**的包
@@ -4078,6 +4105,28 @@ vft `0x665374`，Deserialize `0x43cf5c`，每项 0x14 字节：
 ★ 没有 `Time` 只有 `Magazine` 的那几件（三重射击 / 致命射击 / 毒弹）
 `duration` 是 **-1（无限）**，真正的结束条件是「本机玩家打完 N 发」——
 **只有他自己那台机器数得出来**，所以 `0x040d` 的转发对它们是必须的。
+
+### 6.7 武器记录（`WeaponTable`，X_Mod §36，🔍静态 + 类型逐条核过）
+
+`Data/weapon.ini` 每一节解析成一条 **`0x254`（596）B** 的记录（`0x48b66c push 0x254`），容器全局
+`0x72e788`。`WeaponTable::Load(path) = 0x48b50d`，**4 个调用点**：启动 `0x43567f`、对战
+`GameContextNewPvp` 构造 `0x497cb6`、闯关场景构造 `0x4a3b7c`、`weapon-newpvp.ini` `0x497c5e`
+（明文树里没有这个文件）⇒ **每次进图都重读、按 Id 覆盖**（`0x4157bf` 查同 key → `0x41444c` 插入 / 覆盖）。
+按 Id 查表 `0x4157bf`：`ecx = 0x72e788`，`eax = int* id` → `eax` = 哈希链节点 或 0，**记录指针在 `[节点+8]`**
+（收侧 `OnFire 0x491f24..0x491f4e` 就是这么取的）。
+
+| 偏移 | 类型 | 键 | 偏移 | 类型 | 键 |
+|---|---|---|---|---|---|
+| `+0x24` | f32 | Velocity | `+0x4c` | i32 | SplashRange |
+| `+0x28` | f32 | MaxVelocity | `+0x58` | i32 | LoadingTime |
+| `+0x30` | f32 | GravityFactor | `+0x5c` | i32 | CoolingTime |
+| `+0x34` | i32 | Damage | `+0x60` | i32 | MagazineCount |
+| `+0x38` | i32 | HeadDamage | `+0x64` | i32 | ReloadTime |
+| `+0x3c` | i32 | LegsDamage | `+0x108` | ptr | CreatingClass 工厂 |
+| `+0x48` | i32 | SplashDamage | `+0x1dc` | i32 | ROH |
+
+（其余偏移见 V0.3bot §53。浮点走 `0x40b9dd`（`fstp dword`），整数走 `0x40b8c2`。）
+★ 全年龄那套 `_` 键由 `[0x72e784]` 决定读不读（`0x48b602` 从 `[0x72e358]` 抄过来）。
 
 ---
 

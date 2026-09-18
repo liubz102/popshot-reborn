@@ -1530,6 +1530,110 @@ ul.help li.ro-note { color: var(--crimson); font-weight: 700; }
   border-radius: 12px; padding: 22px 26px;
 }
 
+/* -------------------------------------------------- 自定义属性弹窗（X3） */
+/* ⚠ 盖 `.modal .panel` 的宽高要写**三个类**（同 `#sellPriceModal` 踩过的坑）。
+   两栏数值 + 说明文 + 预览，实测正文约 700 px ⇒ 封在 860，窗口更矮时 `100%` 生效。 */
+.modal .panel.weapon-panel {
+  height: auto; max-height: min(860px, 100%); width: min(980px, 100%);
+}
+/* 工具条钉住、正文自己滚 —— 和卖价弹窗同一套骨架。 */
+.weapon-panel .panel-body {
+  overflow: hidden; display: flex; flex-direction: column; min-height: 0;
+}
+.weapon-panel .panel-body > .toolbar { flex: 0 0 auto; margin-bottom: 12px; }
+.weapon-panel .toolbar .filters { flex: 0 1 auto; min-width: 0; }
+.weapon-scroll {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  scrollbar-gutter: stable; padding-right: 2px;
+}
+/* 左 PVE / 右 PVP 两栏，中间一列「复制到另一侧」的小钮；窄到放不下就上下排。 */
+.weapon-modes {
+  display: grid; gap: 12px; align-items: start;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+}
+@media (max-width: 760px) {
+  .weapon-modes { grid-template-columns: minmax(0, 1fr); }
+  .weapon-copy { flex-direction: row; justify-content: center; }
+}
+.weapon-mode {
+  padding: 10px 12px 12px; background: var(--card);
+  border: 2px solid var(--line); border-radius: 10px;
+}
+/* 右栏（PVP）是游戏里真正画出来的那一套 —— 边框换成琥珀，和「已上架」同一种信号。 */
+.weapon-mode.live { border-color: var(--amber); background: #FFFCF4; }
+.weapon-mode > .sell-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding-bottom: 4px; margin-bottom: 8px;
+}
+.weapon-mode > .sell-head .note {
+  font-size: 11px; font-weight: 500; color: var(--amber-dark); white-space: nowrap;
+}
+.weapon-copy {
+  display: flex; flex-direction: column; gap: 8px; align-self: center;
+}
+.weapon-copy .btn { white-space: nowrap; }
+/* 四个分组：伤害 / 溅射 / 射击 / 弹道。 */
+.weapon-group + .weapon-group { margin-top: 8px; }
+.weapon-group > b {
+  display: block; font-size: 12px; color: var(--cocoa-soft);
+  padding: 2px 0 4px; border-bottom: 2px dashed var(--line); margin-bottom: 6px;
+}
+.weapon-group .rows { display: grid; gap: 4px 10px; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
+/* 一格：标签 · 输入框 · 单位 · 参考值。`.field` 默认竖排，这里掰成横排（同卖价弹窗）。 */
+.weapon-field { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.weapon-field > .lab {
+  flex: 1 1 auto; min-width: 0; font-size: 12px; font-weight: 600;
+  color: var(--cocoa-ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.weapon-field input[type=number] {
+  flex: 0 0 auto; width: 76px; text-align: center;
+  -moz-appearance: textfield; appearance: textfield;
+}
+.weapon-field input[type=number]::-webkit-outer-spin-button,
+.weapon-field input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.weapon-field input[type=number]:disabled {
+  background: var(--paper-2); color: var(--cocoa-ink);
+  border-style: dashed; cursor: default; opacity: 1;
+}
+/* 改过（和落盘那份不同）的格子：和别处「有改动」同一圈红光。 */
+.weapon-field.edited input[type=number] { box-shadow: 0 0 0 3px var(--edit-glow); }
+/* 参考值：灰小字，`—` 表示资源包里这一节没写这个键。 */
+.weapon-field .ref {
+  flex: 0 0 auto; font-size: 11px; color: var(--cocoa-soft); white-space: nowrap;
+}
+.weapon-field .unit { flex: 0 0 auto; font-size: 11px; color: var(--cocoa-soft); white-space: nowrap; }
+.weapon-mode .acts { margin-top: 8px; display: flex; justify-content: flex-end; }
+/* 说明文 + 预览通栏。 */
+.weapon-desc { margin-top: 12px; }
+.weapon-desc textarea {
+  width: 100%; max-width: none; min-height: 72px; resize: vertical;
+  font: inherit; line-height: 1.5;
+}
+.weapon-desc textarea:disabled {
+  background: var(--paper-2); color: var(--cocoa-ink); border-style: dashed; opacity: 1;
+}
+.weapon-desc .count { font-size: 11px; color: var(--cocoa-soft); margin-top: 2px; }
+.weapon-desc .count.over { color: var(--crimson); font-weight: 700; }
+.weapon-preview {
+  margin-top: 12px; padding: 10px 12px;
+  background: var(--paper-2); border: 2px solid var(--line); border-radius: 10px;
+}
+.weapon-preview > b { display: block; font-size: 12px; color: var(--cocoa-soft); margin-bottom: 4px; }
+.weapon-preview pre {
+  margin: 0; font: 13px/1.6 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  white-space: pre-wrap; word-break: break-all; color: var(--cocoa-ink);
+}
+/* 两段之间那条线：客户端把 `|` 前后画成上下两块。 */
+.weapon-preview pre + pre { border-top: 2px dashed var(--line); margin-top: 6px; padding-top: 6px; }
+.weapon-preview .empty { color: var(--cocoa-soft); }
+/* 原版武器：数值不可改，一句话代替两栏。 */
+.weapon-locked {
+  padding: 10px 12px; background: var(--paper-2); border-radius: 10px;
+  font-size: 13px; color: var(--cocoa-soft);
+}
+/* 物品库卡片右下角那颗按钮：贴着「等级 / 角色限定」那一行的右端。 */
+.item-card .nums .weapon-btn { margin-left: auto; align-self: flex-end; }
+
 /* -------------------------------------------------- 卖出价格设置弹窗 */
 /* ⚠ 要盖掉 `.modal .panel { height: min(640px,100%) }`（两个类），选择器
    本身也得带够类 —— `.modal .panel.sell-price-panel` 是 (0,3,0)。

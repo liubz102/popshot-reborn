@@ -351,7 +351,9 @@ function itemLabel(itemId) {
 function itemMeta(itemId, skipCharacter) {
   var item = BYID[itemId];
   if (!item) { return "★ 物品表里没有这个 id"; }
-  var bits = [CAT.kinds[item.kind] || item.kind];
+  // ★ 自定义武器（X3）写「武器（自定义）」—— 词是服务端发的（`custom_weapon_kind`）。
+  var bits = [item.custom ? (CAT.custom_weapon_kind || "武器（自定义）")
+                          : (CAT.kinds[item.kind] || item.kind)];
   if (item.character !== undefined && !skipCharacter) {
     bits.push(CAT.characters[String(item.character)] || ("角色" + item.character));
   }
@@ -2053,6 +2055,17 @@ function renderItems(list, rows) {
       var nums = el("div", "nums");
       restFields("items", entry, ["id", "name", "kind"], touched)
         .forEach(function (node) { nums.appendChild(node); });
+      // ★ 武器卡片右下角「自定义属性」（X3，用户 2026-09-19）：自定义武器改两套
+      //   数值 + 说明文，原版武器只改说明文 —— 弹窗里按 `custom` 分。
+      var item = BYID[entry.id];
+      if (item && item.kind === "weapon") {
+        var btn = el("button", "btn btn-sm weapon-btn", "自定义属性");
+        btn.type = "button";
+        btn.title = item.custom ? "改这把武器在任务 / 对战模式下的数值，以及说明文"
+                                : "原版武器只能改说明文";
+        btn.onclick = function () { openWeaponModal(entry.id); };
+        nums.appendChild(btn);
+      }
       col.appendChild(nums);
     }
 
@@ -6313,6 +6326,240 @@ async function saveSellPrices() {
 }
 
 /* ======================================================================
+   自定义属性弹窗（X3，用户 2026-09-19）
+
+   从物品库里武器卡片的「自定义属性」打开。服务端 `GET /admin/api/weapon?id=`
+   一发回全部：字段表（参考值 + 两套当前覆盖）、说明文、游戏里会显示的预览。
+   模型 = `WEAPON.edit`（`{pve: {}, pvp: {}, desc: ""}`），`WEAPON.base` 是落盘那份
+   的拷贝，脏 = 两份不相等。保存走 `POST /admin/api/weapon`，服务端存完就推给
+   在线客户端，回执带新的预览。
+   ★ 原版武器：`custom` 为假，两栏整体不画，只剩说明文。
+   ====================================================================== */
+var WEAPON = null;
+
+function weaponSnapshot(view) {
+  var out = {pve: {}, pvp: {}, desc: view.desc || ""};
+  (view.fields || []).forEach(function (f) {
+    ["pve", "pvp"].forEach(function (mode) {
+      if (f[mode] !== null && f[mode] !== undefined) { out[mode][f.key] = f[mode]; }
+    });
+  });
+  return out;
+}
+
+function weaponDirty() {
+  if (!WEAPON) { return false; }
+  return JSON.stringify(WEAPON.edit) !== JSON.stringify(WEAPON.base);
+}
+
+function paintWeaponDirty() {
+  var dirty = weaponDirty();
+  var node = $("weaponDirty");
+  node.textContent = dirty ? "有未保存的修改" : "";
+  node.classList.toggle("clean", !dirty);
+  $("weaponSave").disabled = !WEAPON || !WEAPON.canEdit || !dirty;
+}
+
+/** 一格数值：标签 · 输入框 · 单位 · 「参考 N」。空 = 用参考值。 */
+function weaponFieldNode(mode, spec) {
+  var wrap = el("div", "weapon-field");
+  wrap.setAttribute("data-key", spec.key);
+  var lab = el("span", "lab", spec.label);
+  wrap.appendChild(lab);
+  var input = document.createElement("input");
+  input.type = "number";
+  input.min = String(spec.min);
+  input.max = String(spec.max);
+  input.step = spec.type === "float" ? "any" : "1";
+  var value = WEAPON.edit[mode][spec.key];
+  input.value = (value === undefined || value === null) ? "" : String(value);
+  input.placeholder = spec.reference === null || spec.reference === undefined
+    ? "—" : String(spec.reference);
+  input.disabled = !WEAPON.canEdit;
+  input.oninput = function () {
+    var raw = input.value.trim();
+    input.classList.remove("bad");
+    if (raw === "") {
+      delete WEAPON.edit[mode][spec.key];
+    } else {
+      var num = Number(raw);
+      if (!isFinite(num) || (spec.type !== "float" && String(Math.trunc(num)) !== raw.replace(/^\+/, ""))) {
+        // 不擅自改：原样存回去，让服务端那句「要是数字」来说话（同 `fieldNode`）。
+        WEAPON.edit[mode][spec.key] = raw;
+        input.classList.add("bad");
+      } else {
+        WEAPON.edit[mode][spec.key] = spec.type === "float" ? num : Math.trunc(num);
+      }
+    }
+    wrap.classList.toggle("edited",
+      JSON.stringify(WEAPON.edit[mode][spec.key]) !== JSON.stringify(WEAPON.base[mode][spec.key]));
+    paintWeaponDirty();
+  };
+  wrap.classList.toggle("edited",
+    JSON.stringify(WEAPON.edit[mode][spec.key]) !== JSON.stringify(WEAPON.base[mode][spec.key]));
+  wrap.appendChild(input);
+  if (spec.unit) { wrap.appendChild(el("span", "unit", spec.unit)); }
+  var ref = el("span", "ref", "参考 " + (spec.reference === null || spec.reference === undefined
+                                          ? "—" : spec.reference));
+  ref.title = "资源包里这一把参考的爆裂 3 写的数；留空就用它";
+  wrap.appendChild(ref);
+  return wrap;
+}
+
+function weaponModeNode(mode) {
+  var view = WEAPON.view;
+  var live = mode === "pvp";
+  var box = el("div", "weapon-mode" + (live ? " live" : ""));
+  var head = el("div", "sell-head");
+  var label = "";
+  (view.modes || []).forEach(function (m) { if (m.key === mode) { label = m.label; } });
+  head.appendChild(el("span", null, label));
+  if (live) { head.appendChild(el("span", "note", "游戏内提示框只显示这一栏")); }
+  box.appendChild(head);
+  var byKey = {};
+  (view.fields || []).forEach(function (f) { byKey[f.key] = f; });
+  (view.groups || []).forEach(function (group) {
+    var g = el("div", "weapon-group");
+    g.appendChild(el("b", null, group.label));
+    var rows = el("div", "rows");
+    group.keys.forEach(function (key) {
+      if (byKey[key]) { rows.appendChild(weaponFieldNode(mode, byKey[key])); }
+    });
+    g.appendChild(rows);
+    box.appendChild(g);
+  });
+  if (WEAPON.canEdit) {
+    var acts = el("div", "acts");
+    var reset = el("button", "btn btn-sm", "恢复参考值");
+    reset.type = "button";
+    reset.title = "把这一栏全部清空 = 全部用资源包里的参考值";
+    reset.onclick = function () {
+      WEAPON.edit[mode] = {};
+      renderWeaponModal();
+    };
+    acts.appendChild(reset);
+    box.appendChild(acts);
+  }
+  return box;
+}
+
+function renderWeaponModal() {
+  var view = WEAPON.view;
+  var host = $("weaponBody");
+  host.textContent = "";
+  $("weaponTitle").textContent = "自定义属性 · " + (view.name || itemName(view.id)) + "  #" + view.id;
+
+  if (view.custom) {
+    var modes = el("div", "weapon-modes");
+    modes.appendChild(weaponModeNode("pve"));
+    var copy = el("div", "weapon-copy");
+    if (WEAPON.canEdit) {
+      var toPvp = el("button", "btn btn-sm", "复制到对战 →");
+      toPvp.type = "button";
+      toPvp.onclick = function () {
+        WEAPON.edit.pvp = JSON.parse(JSON.stringify(WEAPON.edit.pve));
+        renderWeaponModal();
+      };
+      var toPve = el("button", "btn btn-sm", "← 复制到任务");
+      toPve.type = "button";
+      toPve.onclick = function () {
+        WEAPON.edit.pve = JSON.parse(JSON.stringify(WEAPON.edit.pvp));
+        renderWeaponModal();
+      };
+      copy.appendChild(toPvp);
+      copy.appendChild(toPve);
+    }
+    modes.appendChild(copy);
+    modes.appendChild(weaponModeNode("pvp"));
+    host.appendChild(modes);
+  } else {
+    host.appendChild(el("div", "weapon-locked",
+      "原版武器的数值不可修改（客户端按资源包里的原版数值算），这里只能改说明文。"));
+  }
+
+  var desc = el("div", "field wide weapon-desc");
+  desc.appendChild(el("span", "lab", "说明文（游戏提示框的下半段，最多 "
+                      + view.desc_max_lines + " 行、" + view.desc_max_chars + " 个字；留空 = 不写）"));
+  var area = document.createElement("textarea");
+  area.value = WEAPON.edit.desc || "";
+  area.disabled = !WEAPON.canEdit;
+  area.rows = view.desc_max_lines;
+  var count = el("div", "count");
+  function paintCount() {
+    var text = area.value.replace(/\r/g, "");
+    var lines = text ? text.split("\n").length : 0;
+    count.textContent = lines + " / " + view.desc_max_lines + " 行　" + text.length + " / " + view.desc_max_chars + " 字";
+    count.classList.toggle("over", lines > view.desc_max_lines || text.length > view.desc_max_chars);
+  }
+  area.oninput = function () {
+    WEAPON.edit.desc = area.value.replace(/\r/g, "");
+    paintCount();
+    paintWeaponDirty();
+  };
+  desc.appendChild(area);
+  desc.appendChild(count);
+  paintCount();
+  host.appendChild(desc);
+
+  var preview = el("div", "weapon-preview");
+  preview.appendChild(el("b", null, "游戏里会显示（按已保存的内容现算）："));
+  var text = view.preview || "";
+  if (!text) {
+    preview.appendChild(el("div", "empty", "（这件东西没有说明）"));
+  } else {
+    text.split("|").forEach(function (segment) {
+      preview.appendChild(el("pre", null, segment));
+    });
+  }
+  host.appendChild(preview);
+
+  $("weaponActs").classList.toggle("hidden", !WEAPON.canEdit);
+  $("weaponSave").classList.toggle("hidden", !WEAPON.canEdit);
+  paintWeaponDirty();
+}
+
+async function openWeaponModal(itemId) {
+  var result = await api("/admin/api/weapon?id=" + encodeURIComponent(itemId));
+  if (bounced(result)) { return; }
+  if (!result.ok) { toast(result.message, false); return; }
+  var base = weaponSnapshot(result);
+  WEAPON = {view: result, canEdit: !!result.can_edit,
+            base: base, edit: JSON.parse(JSON.stringify(base))};
+  renderWeaponModal();
+  $("weaponModal").classList.remove("hidden");
+}
+
+async function closeWeaponModal() {
+  if (!WEAPON) { return; }
+  if (weaponDirty()) {
+    var ok = await ask({title: "还有没保存的改动",
+                        lead: "这把武器的自定义属性 / 说明文还有没保存的改动，确定丢掉？",
+                        ok: "丢掉"});
+    if (!ok) { return; }
+  }
+  WEAPON = null;
+  $("weaponModal").classList.add("hidden");
+}
+
+async function saveWeaponModal() {
+  if (!WEAPON || !WEAPON.canEdit) { return; }
+  var payload = {id: WEAPON.view.id, desc: WEAPON.edit.desc || ""};
+  if (WEAPON.view.custom) { payload.params = {pve: WEAPON.edit.pve, pvp: WEAPON.edit.pvp}; }
+  var result = await api("/admin/api/weapon", payload);
+  if (bounced(result)) { return; }
+  toast(result.message, result.ok);
+  if (!result.ok) { return; }
+  // 回执就是一份新的视图（含新的预览）—— 直接换掉，不用再 GET 一次。
+  var base = weaponSnapshot(result);
+  WEAPON.view = result;
+  WEAPON.base = base;
+  WEAPON.edit = JSON.parse(JSON.stringify(base));
+  renderWeaponModal();
+  // 浮窗里那段说明文取自 catalog（服务端已经 `invalidate_catalog()`），重取一次。
+  await loadCatalog();
+}
+
+/* ======================================================================
    登录 / 启动
    ====================================================================== */
 
@@ -6760,6 +7007,10 @@ function wire() {
     renderSellPrices();
   };
   $("sellPriceSave").onclick = function () { saveSellPrices(); };
+  // 自定义属性弹窗（X3）：有未保存改动的窗 ⇒ 不认遮罩，只认 ✕ / 取消 / Esc。
+  $("weaponClose").onclick = function () { closeWeaponModal(); };
+  $("weaponCancel").onclick = function () { closeWeaponModal(); };
+  $("weaponSave").onclick = function () { saveWeaponModal(); };
 
   // 数量窗：还没提交，取消不心疼 ⇒ ✕ / 取消 / Esc 都能走，遮罩不认
   // （输入框就在正中间，点歪一下把数字丢了没道理）。
@@ -6835,6 +7086,8 @@ function wire() {
     if (event.key === "Escape" && SELL_QTY) { closeSellQty(); return; }
     // ★ 价格窗有没保存的改动 ⇒ `closeSellPrices()` 会先问一句再关。
     if (event.key === "Escape" && SELL_PRICES) { closeSellPrices(); return; }
+    // ★ 自定义属性窗有没保存的改动 ⇒ `closeWeaponModal()` 会先问一句再关。
+    if (event.key === "Escape" && WEAPON) { closeWeaponModal(); return; }
     // 管理员账号页那两张表单窗：有没提交的输入，但 Esc 是明确的「我不填了」。
     if (event.key === "Escape" && ADD_ADMIN_OPEN) { closeAddAdmin(); return; }
     if (event.key === "Escape" && SET_PW_OPEN) { closeSetPw(); return; }

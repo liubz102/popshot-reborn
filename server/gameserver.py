@@ -101,6 +101,7 @@ import versioning
 #: 弹药 id 翻成**武器族号**，给称号卡片的 `weapon_*` 指标归账（V0.3商店）。
 #: `weapondata` 只依赖标准库，不会把 bot 那一摊拖进来（§14 的导入方向仍成立）。
 import weapondata
+import weaponcfg
 #: ★ 角色属性（`ChrProps.ini`）。这里只用两件事：突击技那一招够得着多远
 #: （`Move.reach()`）和角色的三个碰撞圆（`circles()`）—— 「突击技命中」
 #: 那一项的走廊就是拿这两样量出来的（V0.3商店，`RoomQuest.note_dash`）。
@@ -159,6 +160,12 @@ MAGIC_GAME = 0xFF
 GAME_SEND_DEADLINE_S = 8.0
 
 OP_REP_LOGIN = 0x0100
+#: ★★ 服务端 -> **bshook**（不是游戏本体）：「自定义武器表」（X_Mod · X3）。
+#: 我们自造的 opcode，原版客户端的分发树 `0x54e036` 认不出它，走 `0x54e546`
+#: 的默认分支返回 0、什么都不做；bshook 把 `0x54e036` 头上挂了钩子，认出这一包
+#: 就吞掉，按武器 Id 把数值写进客户端内存里那张武器表（`0x72e788`）。
+#: 载荷见 `weaponcfg.build_hook_frame()`；packet_api §3.5 有线格式。
+OP_HOOK_WEAPON_TABLE = 0x0F01
 #: `gspRepLogin` 的结果码 3 = 客户端 `0x54f3cf`「断开」（V0.1 §44）。
 #: 弹的框是 `Data\Chinese.ini` 里的「在无法连接的地方尝试了连接。」（§132）。
 #:
@@ -6393,6 +6400,25 @@ def all_conns():
         return list(_conns)
 
 
+def broadcast_hook_weapon_table(reason="", log=None):
+    """把「自定义武器表」（`0x0F01`）推给**全部已登录**的连接（X3）。
+
+    管理页保存之后调它 —— 在线玩家不用重登，改过的数值下一枪就生效
+    （bshook 收到就写内存）。返回推了几条连接。
+    """
+    pushed = 0
+    for conn in all_conns():
+        try:
+            if conn.send_hook_weapon_table(reason=reason):
+                pushed += 1
+        except Exception as error:  # noqa: BLE001 —— 一条连接坏了别拖累别人
+            if log:
+                log(f"⚠ 推自定义武器表给 {conn.peer()} 失败：{error}")
+    if log:
+        log(f"[weapons] 自定义武器表已推给 {pushed} 条在线连接{reason}")
+    return pushed
+
+
 def conn_is_playing(conn):
     """这条连接现在是不是**在打游戏**（而不是待在大厅/房间里）。
 
@@ -8183,6 +8209,8 @@ class Conn:
         # 登录包带得动等级和经验，唯独带不动金币（`0x54f2cc` 不写 0x72e330）。
         # 补一发 0x0600，右上角数据栏才和存档完全一致。
         self.send_rep_money(reason="（登录后补发，登录包没有金币字段）")
+        # ★ X3：自定义武器的数值由服务端说了算，登录成功就把表推给 bshook。
+        self.send_hook_weapon_table(reason="（登录后下发）")
         # 每一关的「已达成难度」。这张 map 只有服务端能填，不发就等于
         # 全部关卡只有「简单」能开局（§118）。
         self.send_quest_reached_difficulty(reason="（登录后下发）")
@@ -11743,6 +11771,25 @@ class Conn:
         self.log(f"← 回 0x0501 物品定义 {len(records)} 条 用途={purpose}{reason}")
         self.send(build_game(OP_REP_ITEM_INFO,
                              shop.build_rep_item_info(records, purpose)))
+
+    def send_hook_weapon_table(self, reason=""):
+        """发 `0x0F01`「自定义武器表」给 bshook（X3）。发了返回 True。
+
+        只发给**已登录**且 `client_version >= versioning.WEAPON_TABLE_MIN_VERSION`
+        的连接：更老的客户端没有认识它的 hook，发了也是白发（会落进分发树的默认
+        分支，不出事，但没意义）。登录成功后发一次；管理页保存后由
+        `broadcast_hook_weapon_table()` 再推一遍。
+        """
+        if not self.account_name:
+            return False
+        version = self.client_version
+        if version is None or tuple(version) < versioning.WEAPON_TABLE_MIN_VERSION:
+            return False
+        payload = weaponcfg.build_hook_frame()
+        fmt, serial, records = weaponcfg.parse_hook_frame(payload)
+        self.log(f"← 发 0x0F01 自定义武器表 serial={serial} {len(records)} 条{reason}")
+        self.send(build_game(OP_HOOK_WEAPON_TABLE, payload))
+        return True
 
     def on_req_item_info(self, payload):
         """客户端方向的 `0x0601` —— 「这些 id 我不认识，给我定义」（§28）。

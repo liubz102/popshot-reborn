@@ -73,7 +73,12 @@ read_ini = _weapondata.read_ini
 WeaponDataError = _weapondata.WeaponDataError
 
 #: 产物格式版本。加/改字段时 +1，`server/shopdata.py` 拿它判「这份产物我认不认识」。
-FORMAT = 1
+#:
+#: ★ 2（X_Mod · X3）：新增 **`custom`**（自定义武器，部位码 `92`）；去掉 `weapon.desc`
+#:   （说明文改由管理页配置，不再从 `weapon.ini` 的 `Desc=` 抽）。
+#:   ⚠⚠ 改这个数必须和重新生成 `server/shop_items.json` 在同一个提交里 ——
+#:   `server/shopdata.py` 对不上时返回空表，症状是**商店 / 仓库全空**。
+FORMAT = 2
 
 
 class ShopDataError(Exception):
@@ -183,6 +188,11 @@ PART_KIND = {
     11: "armor",    # 头饰      PartFlag 128
     12: "weapon",   # 武器      PartFlag 1024 / 2048 / 4096
     13: "ring",     # 戒指      PartFlag 16384
+    # ★ 92 = **自定义武器**（X_Mod · X3，本项目自己定的部位码，原版没有）：
+    #   `X 92 000 S`，X = 角色、S = 槽位。和 12 一样是武器（PartFlag 1024/2048/4096），
+    #   只是数值由服务端下发（管理页可调），产物里多一个 `custom: true`。
+    #   ⚠ 和期限版的 `+50` 不撞：92 - 50 = 42 不是任何部位码。
+    92: "weapon",   # 自定义武器（X3）
     21: "key",      # 金钥匙
     39: "package",  # 套装礼包
     99: "package",  # 套装打包
@@ -219,6 +229,9 @@ PREFIX_KIND_6 = {
 
 #: 武器槽 `PartFlag` -> 槽位序号。
 WEAPON_SLOT_BY_FLAG = {1024: 1, 2048: 2, 4096: 3}
+
+#: 自定义武器的部位码（见 `PART_KIND[92]`）。
+CUSTOM_WEAPON_PART = 92
 
 #: 三个武器系列。key 是 id 尾四位 `//10` 的十位段（见 `weapon_variant`）。
 SERIES_NAMES = {"D": "爆裂", "R": "极速", "F": "复合"}
@@ -325,7 +338,8 @@ WEAPON_FIELDS = (
     ("CoolingTime", "cooling_ms", int),
     ("Velocity", "velocity", int),
     ("ROH", "roh", int),
-    ("Desc", "desc", str),
+    # ★ 没有 `Desc`（X3 起）：说明文由管理页配置（`server/weaponcfg.py`），
+    #   `weapon.ini` 恢复成原版之后本来也没有这个键。
 )
 
 
@@ -440,7 +454,13 @@ def _new_item(item_id, fields, bonus_table, weapons_by_ammo, warn):
 
     if kind == "weapon":
         slot = WEAPON_SLOT_BY_FLAG.get(part_flag)
-        series, series_slot, tier = weapon_variant(item_id)
+        # ★ 自定义武器（部位码 92，X3）：没有 D/R/F 系列和档位，`weapon_variant`
+        #   对它的尾四位（0001..0003）本来就判不出变体，这里只多打一个标记。
+        if part == CUSTOM_WEAPON_PART:
+            entry["custom"] = True
+            series, series_slot, tier = None, None, None
+        else:
+            series, series_slot, tier = weapon_variant(item_id)
         if slot is not None:
             entry["slot"] = slot
         if series is not None:

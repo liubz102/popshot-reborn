@@ -36,6 +36,8 @@
     POST /admin/api/sell              {items:[{id,count}]} 一次性卖掉         ☆三档
     GET  /admin/api/sell/prices       卖价表 + 每个材料小类装着哪些东西       ☆三档
     POST /admin/api/sell/prices       {prices}  存卖价表                      ★运营
+    GET  /admin/api/weapon?id=1920001 「自定义属性」弹窗：两套数值 + 参考值 + 说明文 + 预览 ☆三档
+    POST /admin/api/weapon            {id, params:{pve,pvp}|null, desc}  存并推给在线客户端 ★运营
     GET  /admin/api/backups           数据备份：{settings, status, backups, online, playing} ★系统
     POST /admin/api/backups/settings  {enabled, time, keep_days} 写回 server.config，即刻生效 ★系统
     POST /admin/api/backups/create    {label}  立刻备份一份（手动）              ★系统
@@ -173,6 +175,7 @@ import shop
 import shopcfg
 import shopdata
 import versioning
+import weaponcfg
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ADMIN_PATH = os.path.join(HERE, "admin.html")
@@ -541,6 +544,9 @@ def catalog():
                     entry["series"] = item.series
                 if item.tier:
                     entry["tier"] = item.tier
+                if getattr(item, "custom", False):
+                    # ★ 自定义武器（X3）：卡片上写「武器（自定义）」，弹窗里能改数值。
+                    entry["custom"] = True
                 if item.part_flag:
                     entry["part_flag"] = item.part_flag
                 if item.bonus:
@@ -1306,6 +1312,9 @@ class AdminRoutes:
         if path == "/admin/api/sell/prices":
             self._admin_sell_prices_get()
             return True
+        if path == "/admin/api/weapon":
+            self._admin_weapon_get(query)
+            return True
         if path == "/admin/api/sell/state":
             self._admin_sell_state()
             return True
@@ -1348,6 +1357,9 @@ class AdminRoutes:
             return True
         if path == "/admin/api/sell/prices":
             self._admin_sell_prices_post(data)
+            return True
+        if path == "/admin/api/weapon":
+            self._admin_weapon_post(data)
             return True
         if path == "/admin/api/sell":
             self._admin_sell(data)
@@ -1421,6 +1433,9 @@ class AdminRoutes:
                 "height": index.get("height"),
             },
             "kinds": shopcfg.KIND_ZH,
+            # ★ 自定义武器（X3）卡片上的类别字样「武器（自定义）」—— 词从服务端发，
+            #   页面上不写死（和 `card_text` 同一条道理）。
+            "custom_weapon_kind": shopcfg.KIND_CUSTOM_WEAPON_ZH,
             "characters": {str(k): v for k, v in shopcfg.CHARACTER_ZH.items()},
             "series": shopcfg.SERIES_ZH,
             "max_materials": shopcfg.MAX_MATERIALS,
@@ -2644,3 +2659,80 @@ class AdminRoutes:
             return
         eventlog.online(f"[admin] {self._who(admin)} 改了卖出价格")
         self._reply(True, "卖出价格已保存", prices=saved)
+
+    # ------------------------------------------------------ 自定义武器（X3）
+    def _admin_weapon_get(self, query):
+        """`GET /admin/api/weapon?id=…` —— 「自定义属性」弹窗要的一切。
+
+        三档身份都读得到，`can_edit` 说谁能改（和 `_admin_weapon_post` 那道
+        `_require_editor()` 是同一条判据的两面，同卖价弹窗的做法）。
+        自定义武器回两套数值（PVE / PVP，每格带参考值）；原版武器 `custom=false`，
+        弹窗只画说明文。`preview` 就是游戏提示框会画的那段（`shopcfg.item_desc_zh`）。
+        """
+        if self._require_admin() is None:
+            return
+        raw = (urllib.parse.parse_qs(query or "").get("id") or [""])[0]
+        try:
+            item_id = int(raw)
+        except ValueError:
+            self._reply(False, "物品 id 要是一个整数", status=400)
+            return
+        try:
+            view = weaponcfg.admin_view(item_id)
+        except shopcfg.ConfigError as error:
+            self._reply(False, str(error), status=404)
+            return
+        _name, role = self._admin_identity()
+        view.update({"ok": True, "can_edit": role != ROLE_PLAYER})
+        self._send_json(view)
+
+    def _admin_weapon_post(self, data):
+        """`POST /admin/api/weapon` —— 存一件武器的自定义数值 / 说明文，**并立刻推给在线客户端**。
+
+        `params` = `{"pve": {...}, "pvp": {...}}`（留空的格 = 用参考值），原版武器
+        必须不带 `params`（服务端拒收「改原版数值」，前台本来也不画那两栏）；
+        `desc` = 说明文（空串 = 清掉）。存盘走 `weaponcfg.save_item()`（过校验才落盘），
+        之后 `gameserver.broadcast_hook_weapon_table()` 把整张表推给全部已登录连接
+        —— 在线玩家下一枪就是新数值，不用重登；说明文那半边商店提示框即时、
+        仓库提示框重登后更新（客户端缓存住了物品定义，packet_api §3.9）。
+        """
+        admin = self._require_editor()
+        if admin is None:
+            return
+        try:
+            item_id = int(data.get("id"))
+        except (TypeError, ValueError):
+            self._reply(False, "载荷里要有物品 id", status=400)
+            return
+        params = data.get("params")
+        if params is not None and not isinstance(params, dict):
+            self._reply(False, "params 要是 {pve: {...}, pvp: {...}} 这样的对象", status=400)
+            return
+        if params is None and "desc" not in data:
+            self._reply(False, "载荷里既没有 params 也没有 desc，没有要改的东西", status=400)
+            return
+        try:
+            table = weaponcfg.save_item(item_id, params=params, desc=data.get("desc"),
+                                        log=eventlog.online)
+        except shopcfg.ConfigError as error:
+            self._reply(False, str(error), status=400)
+            return
+        invalidate_catalog()          # 浮窗里那段说明文跟着变
+        # ★ 惰性 import `gameserver`：`web/` 这一层本来不依赖游戏服（单跑注册页 /
+        #   单元测试时拿不到），拿不到就只落盘不推 —— 下次登录照样会发。
+        pushed = 0
+        try:
+            import gameserver
+        except ImportError:
+            gameserver = None
+        if gameserver is not None:
+            pushed = gameserver.broadcast_hook_weapon_table(reason="（管理页保存）",
+                                                            log=eventlog.online)
+        eventlog.online(f"[admin] {self._who(admin)} 改了物品 {item_id} 的"
+                        f"{'自定义属性 / ' if params is not None else ''}说明文"
+                        f"（serial={table['serial']}，推给 {pushed} 条在线连接）")
+        view = weaponcfg.admin_view(item_id, table)
+        view.update({"ok": True, "can_edit": True, "pushed": pushed,
+                     "message": ("已保存，并推给 %d 位在线玩家" % pushed) if pushed
+                     else "已保存（现在没有在线玩家，下次登录生效）"})
+        self._send_json(view)

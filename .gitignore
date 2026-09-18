@@ -154,6 +154,12 @@
 # `shopdefaults.CARD_RULES`、开服由 ensure_files() 生成、数据备份回滚时
 # 和它们同一个勾选项。所以和它们一样不进仓库。
 /server/data/cards.json
+# weapons.json：自定义武器的 PVE / PVP 数值 + 全武器说明文（管理页物品库
+# 「自定义属性」弹窗，server/weaponcfg.py，X_Mod · X3）。第八份运营配置，
+# 和上面几份同一个待遇：出厂值 = 空覆盖、开服由 ensure_files() 生成、数据备份
+# 回滚同一个勾选项 —— 一样不进仓库。
+/server/data/weapons.json
+/server/data/weapons.json.*.tmp
 /server/data/cards.json.*.tmp
 # 「补齐默认值」写盘前留下的那一份原件（shopcfg.backfill_defaults）。
 /server/data/*.bak-*

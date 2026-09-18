@@ -92,6 +92,10 @@ SELL_PRICE_FILENAME = "sell_price.json"
 #: ★ 它**有配置标签页**（`SCHEMA["cards"]` / 管理页「称号卡片」），
 #:   所以七份里只有 `sell_price.json` 没有页面。
 CARDS_FILENAME = "cards.json"
+#: ★ **自定义武器的数值 + 全武器的说明文**（X_Mod · X3）：第七份运营配置，和卖价表
+#: 同一档（没有配置标签页，编辑入口是物品库卡片上的「自定义属性」弹窗）。
+#: 规则和读写都在 `weaponcfg.py`，这里只登记文件名和 `_SPECS` 那一格。
+WEAPONS_FILENAME = "weapons.json"
 
 #: ★ 合成界面只有 4 个材料槽（`ComposeItemNewUI.ui` 的 `ImgBar0~3`，§7）。
 #: 配方写第 5 种材料，玩家在界面上根本看不见 —— 校验时直接拒绝。
@@ -321,6 +325,12 @@ NAME_ZH = {
 #: 三个武器系列。★ 这三个中文名是**用户记忆里的原版叫法**，别改。
 SERIES_ZH = {"D": "爆裂", "R": "极速", "F": "复合"}
 
+#: ★ 自定义武器（X3）：韩文名的后缀字母（`리볼버 C`，`tools/goldwp/spec.SERIES`）、
+#: 名字里的中文系列词（「左轮 自定义」，用户 2026-09-19 定）和管理页卡片上的类别字样。
+CUSTOM_WEAPON_SUFFIX = "C"
+CUSTOM_WEAPON_ZH = "自定义"
+KIND_CUSTOM_WEAPON_ZH = "武器（自定义）"
+
 #: 角色 id → 中文名（`Data/ChrProps.ini` 的前三个，V0.1 §119）。
 CHARACTER_ZH = {0: "泰尔", 1: "卡希尔", 2: "布洛克"}
 
@@ -441,6 +451,12 @@ def weapon_name_zh(item):
 
     name = item.name_kr or ""
     base = name
+    if getattr(item, "custom", False):
+        # 自定义武器：`리볼버 C` → 「左轮 自定义」（X3）。翻不出基础名就把韩文基础名留着。
+        suffix = " " + CUSTOM_WEAPON_SUFFIX
+        if name.endswith(suffix):
+            base = name[:-len(suffix)]
+        return "%s %s" % (NAME_ZH.get(base.strip(), base.strip()), CUSTOM_WEAPON_ZH)
     if item.series and item.tier:
         suffix = " %s%d" % (item.series, item.tier)
         if name.endswith(suffix):
@@ -1391,7 +1407,7 @@ def _card_desc_lines(item, card_rules, recipes_table):
     return stats, notes
 
 
-def item_desc_zh(item, card_rules=_AUTO, recipes_table=_AUTO):
+def item_desc_zh(item, card_rules=_AUTO, recipes_table=_AUTO, weapons_table=None):
     """物品说明。**从本地数据现算**，原版那份说明随服务端 DB 一起没了。
 
     ⚠ 这不是「发明玩法」（铁律 12）—— 里面每个数都是客户端**自己也查得到**
@@ -1417,9 +1433,22 @@ def item_desc_zh(item, card_rules=_AUTO, recipes_table=_AUTO):
     stats = []
     notes = _effect_lines(item)
     if item.weapon:
-        stats.extend(_weapon_lines(item.weapon))
-        if not notes and item.weapon.get("desc"):
-            notes = [item.weapon["desc"]]
+        weapon = item.weapon
+        if item.kind == "weapon":
+            # ★ X3：武器的第 2 段可以由管理页配置（`weaponcfg`，任何武器）；
+            #   自定义武器的数值行画的是**对战（PVP）那一套有效值**，并在第 1 段
+            #   首行加一句「仅显示PVP属性…」（用户 2026-09-19，提示框装不下两套）。
+            #   `import` 写在函数里：`weaponcfg` 顶层 `import shopcfg`，别绕成环。
+            import weaponcfg
+            if weapons_table is None:
+                weapons_table = weaponcfg.load()
+            if getattr(item, "custom", False):
+                weapon = weaponcfg.effective_weapon_dict(item, weaponcfg.MODE_PVP, weapons_table)
+                stats.append(weaponcfg.PVP_ONLY_NOTE)
+            custom_desc = weaponcfg.desc_of(item.id, weapons_table)
+            if custom_desc:
+                notes = custom_desc.split("\n")
+        stats.extend(_weapon_lines(weapon))
     stats.extend(_bonus_lines(item.bonus or {}))
     if not stats and not notes and item.kind == "material":
         if card_rules is _AUTO:
@@ -1622,6 +1651,13 @@ def default_sell_price():
     """
     import shopdefaults
     return shopdefaults.default_sell_price()
+
+
+def default_weapons():
+    """默认 `weapons.json` = 一条覆盖都没有（X3）。规则在 `weaponcfg.default_table()`。
+    ★ `import` 写在函数里：`weaponcfg` 顶层 `import shopcfg`，加载阶段两边不能互相依赖。"""
+    import weaponcfg
+    return weaponcfg.default_table()
 
 
 def default_cards():
@@ -1920,6 +1956,14 @@ def validate_sell_price(raw):
         return sellprice.validate(raw)
     except ValueError as error:
         raise ConfigError(str(error)) from None
+
+
+def validate_weapons(raw):
+    """`weapons.json` → 校验过的表（X3）。真正的规则在 `weaponcfg.validate()`
+    （那边要问 `shopdata` 哪些是自定义武器、问 `weapondata` 参考值），这里只在
+    `_SPECS` 里占一个位；它抛的就是本模块 `ConfigError` 的子类，不用再翻译。"""
+    import weaponcfg
+    return weaponcfg.validate(raw)
 
 
 #: 阈值上限。累计指标（总伤害、总开枪数）够得着六位数，留一个数量级余量。
@@ -2481,6 +2525,10 @@ _SPECS = {
     #   「装备卖出」页上那个弹窗），所以不进 `SCHEMA` / `CONFIG_FILES`。
     SELL_PRICE_FILENAME: (validate_sell_price, default_sell_price,
                           _USE_DEFAULT),
+    # ★ 自定义武器的数值 + 全武器说明文（X3）：同一档待遇、同样没有标签页。
+    #   读不到 / 读坏了退回**出厂值**（= 没有任何覆盖，客户端拿到的就是资源包里
+    #   爆裂 3 的数）—— 空表和出厂值在这份配置上是同一个东西。
+    WEAPONS_FILENAME: (validate_weapons, default_weapons, _USE_DEFAULT),
     # ★★ 称号卡片（V0.3商店）。**必须排在最末** —— `test_shopcfg` 和
     #   `test_backup` 都拿 `list(_SPECS)[-1]` 当「最新加的那一份」，
     #   插在中间会让那两条用例验错东西。
@@ -2526,8 +2574,8 @@ _WHICH_OF = {ITEMS_FILENAME: "items", SHOP_FILENAME: "shop",
              RECIPE_FILENAME: "recipe", DROPS_FILENAME: "drops",
              REWARDS_FILENAME: "rewards", CARDS_FILENAME: "cards"}
 
-#: 没有配置标签页、因而不在 `SCHEMA` 里的那些的标题（D95）。
-_TITLE_OF = {SELL_PRICE_FILENAME: "卖出价格"}
+#: 没有配置标签页、因而不在 `SCHEMA` 里的那些的标题（D95 / X3）。
+_TITLE_OF = {SELL_PRICE_FILENAME: "卖出价格", WEAPONS_FILENAME: "自定义武器"}
 
 
 def config_filenames():
@@ -2632,6 +2680,11 @@ def sell_price(data_dir=None, _reload=False):
 def cards(data_dir=None, _reload=False):
     """`[称号卡片的获得规则…]`（V0.3商店）。读不到就是空表 = 这一版不掉卡片。"""
     return _load(CARDS_FILENAME, data_dir, _reload)
+
+
+def weapons(data_dir=None, _reload=False):
+    """自定义武器数值 + 说明文（X3，`weaponcfg`）。读不到 / 读坏了退回出厂值 = 没有覆盖。"""
+    return _load(WEAPONS_FILENAME, data_dir, _reload)
 
 
 def card_rule_of(card_id, data_dir=None):

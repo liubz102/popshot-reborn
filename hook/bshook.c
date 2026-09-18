@@ -8017,8 +8017,16 @@ static void __stdcall on_crypt_out(int kind, void *buf, int len)
         bsvlog_hex("SNOW    GT 出", (const unsigned char *)buf, n);
 }
 
+static void wtab_apply_if_main_thread(void);   /* 自定义武器表（X3），定义在下面那一段 */
+
 static void __stdcall on_crypt(int kind, void *self, void *dst, void *src, int len)
 {
+    /* ★ 自定义武器表（X3）：收到表的那一刻如果不在主线程，就攒着；游戏下一次
+       从主线程发包（Encrypt 是主线程的活）时补写 —— 这是一个事件，不是定时器。
+       正常路径的开销 = 读一个标志。 */
+    if (kind == 2)
+        wtab_apply_if_main_thread();
+
     /* ★ 位置数据的 UDP 旁路（见本文件「位置数据的 UDP 旁路」一段）。
        `kind == 2` 是 `SimpleCipher::Encrypt` —— **加密之前**，也是整个进程里
        唯一能看到出站明文帧的地方。
@@ -8370,6 +8378,342 @@ static int try_hook_render_init(void)
         (void *)RENDER_INIT_VA, (void *)det_render_init, "RendererInit");
     if (!s_render_init) return 0;
     InterlockedExchange(&g_render_hooked, 1);
+    return 1;
+}
+
+/* ========================================================================== */
+/* 自定义武器表（X_Mod · X3）—— 服务端说了算的武器数值，写进客户端内存           */
+/*                                                                            */
+/* 9 把「自定义」黄金武器的数值不在资源包里定死，而由管理页配置、服务端下发：   */
+/*   gsp 0x0F01（我们自造的 opcode，只有本 hook 认识）                          */
+/*     u16 format=1 · u32 serial · u16 n · n × { i32 武器Id                    */
+/*        · [PVE] u32 mask + 12×4B · [PVP] u32 mask + 12×4B }                  */
+/*   12 格按 `server/weaponcfg.FIELDS` 的顺序：前 9 格 int32、后 3 格 float。   */
+/*                                                                            */
+/* 客户端那边（本轮逆的，X_Mod §36）：                                          */
+/*   · WeaponTable::Load(path) = 0x48b50d，容器全局 0x72e788，一条记录 0x254 B； */
+/*     **每次进图都重读**（对战 GameContextNewPvp 构造 0x497cb6、闯关场景构造   */
+/*     0x4a3b7c，外加启动 0x43567f、weapon-newpvp.ini 0x497c5e）⇒ 写进去的数    */
+/*     每局都会被 ini 里的原值盖掉，所以要挂在 Load 的**返回点**上再写一遍。     */
+/*   · 按 Id 查表 0x4157bf：ecx=容器、eax=&id → eax=节点 或 0；记录在 [节点+8]。 */
+/*   · 收 0xFF 帧的主分发 ServerConnection::vft[13] = 0x54e036（ecx=this，      */
+/*     栈上一个包对象，[包+0xc] = 帧首，opcode 在帧 +8，载荷长在 +2）；          */
+/*     未知 opcode 走 0x54e546 `xor al,al` 返回 0。挂在它头上把 0x0F01 吞掉。    */
+/*                                                                            */
+/* 模式：PVE / PVP 两套表**由「谁在重读 ini」决定** —— 闯关场景构造 → PVE，     */
+/* 对战构造 / 启动 → PVP。这两个构造函数本身就是「这一局是闯关还是对战」的事实， */
+/* 不用服务端猜房间模式（铁律 10）。                                            */
+/*                                                                            */
+/* 逃生门：BSHOOK_KEEP_WEAPON_TABLE=1 只跳过写内存（包照样吞）；                 */
+/*         BSHOOK_WEAPON_MODE=pve|pvp 强制模式（实机核对两套表都写对时用）。     */
+/* ========================================================================== */
+#define WTAB_OPCODE        0x0F01
+#define WTAB_FORMAT        1
+#define WTAB_FIELDS        12
+#define WTAB_MAX           32
+#define WTAB_RECORD_BYTES  (4 + 2 * (4 + 4 * WTAB_FIELDS))     /* 108 */
+#define WTAB_TABLE_VA      0x0072e788u
+#define WTAB_LOOKUP_VA     0x004157bfu
+#define WTAB_DISPATCH_VA   0x0054e036u
+#define WTAB_LOAD_VA       0x0048b50du
+#define WTAB_RECORD_SIZE   0x254u
+/* Load 的返回地址 → 模式（call 0x48b50d 的下一条指令） */
+#define WTAB_RET_QUEST     0x004a3b81u   /* 闯关场景构造 */
+#define WTAB_RET_PVP       0x00497cbbu   /* GameContextNewPvp 构造 */
+#define WTAB_RET_PVP2      0x00497c63u   /* NewPvp 另一构造（读 weapon-newpvp.ini，明文树里没有那个文件） */
+#define WTAB_RET_BOOT      0x00435684u   /* 应用初始化 */
+/* 站点特征：0x54e036 `push esi / mov esi,ecx / mov ecx,[0x72e29c]`（9 B，偷走的正是这三条）；
+   0x48b50d `mov eax,0x62e808`（5 B）；0x4157bf `push esi / mov esi,[eax] / push edi`。 */
+static const unsigned char WTAB_DISPATCH_SIG[9] = { 0x56,0x8b,0xf1,0x8b,0x0d,0x9c,0xe2,0x72,0x00 };
+static const unsigned char WTAB_LOAD_SIG[5]     = { 0xb8,0x08,0xe8,0x62,0x00 };
+static const unsigned char WTAB_LOOKUP_SIG[5]   = { 0x56,0x8b,0x30,0x57,0x8b };
+
+/* 12 格的记录偏移 + 类型。顺序 == `weaponcfg.FIELDS`（test_weaponcfg 钉着那边的顺序）。 */
+static const struct { unsigned off; int is_float; const char *name; } WTAB_FIELD[WTAB_FIELDS] = {
+    { 0x34, 0, "Damage" },        { 0x38, 0, "HeadDamage" },  { 0x3c, 0, "LegsDamage" },
+    { 0x48, 0, "SplashDamage" },  { 0x4c, 0, "SplashRange" }, { 0x60, 0, "MagazineCount" },
+    { 0x5c, 0, "CoolingTime" },   { 0x64, 0, "ReloadTime" },  { 0x58, 0, "LoadingTime" },
+    { 0x24, 1, "Velocity" },      { 0x28, 1, "MaxVelocity" }, { 0x30, 1, "GravityFactor" },
+};
+
+typedef struct { unsigned mask; unsigned v[WTAB_FIELDS]; } wtab_block_t;
+typedef struct { int id; wtab_block_t mode[2]; } wtab_rec_t;          /* mode[0]=PVE mode[1]=PVP */
+typedef struct { unsigned serial; int n; wtab_rec_t rec[WTAB_MAX]; } wtab_table_t;
+typedef struct { void *rec; int id; unsigned orig[WTAB_FIELDS]; } wtab_orig_t;
+
+static CRITICAL_SECTION g_wtab_cs;
+static int g_wtab_cs_ready = 0;
+static wtab_table_t g_wtab;                 /* 最近一次收到的表（在临界区里整份换） */
+static volatile LONG g_wtab_have = 0;       /* 收到过表 */
+static volatile LONG g_wtab_dirty = 0;      /* 收到了但还没写进内存（不在主线程） */
+static int g_wtab_mode = 1;                 /* 当前模式：0 PVE / 1 PVP */
+static unsigned g_wtab_last_src = 0;        /* 最近一次 Load 的返回地址（日志用） */
+static wtab_orig_t g_wtab_orig[WTAB_MAX];   /* 写之前存下的原值，Load 之后作废 */
+static int g_wtab_orig_n = 0;
+static void *s_wtab_dispatch = NULL;        /* 蹦床 */
+static void *s_wtab_load = NULL;
+static DWORD g_wtab_load_ret = 0;           /* Load 的原返回地址（Load 不递归、只在主线程） */
+static volatile LONG g_wtab_hooked = 0;
+static unsigned g_wtab_logged_serial = 0;   /* 日志按 (serial, 模式, 写入条数) 翻转去重 */
+static int g_wtab_logged_mode = -1;
+static int g_wtab_logged_written = -1;
+
+static int wtab_keep_original(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_WEAPON_TABLE", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+/* 强制模式：返回 0/1，没设返回 -1。 */
+static int wtab_forced_mode(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_WEAPON_MODE", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return -1;
+    if ((buf[0] | 0x20) == 'p' && (buf[1] | 0x20) == 'v' && (buf[2] | 0x20) == 'e') return 0;
+    if ((buf[0] | 0x20) == 'p' && (buf[1] | 0x20) == 'v' && (buf[2] | 0x20) == 'p') return 1;
+    return -1;
+}
+
+static void *wtab_lookup(int id)
+{
+    int key = id;
+    void *node = NULL;
+    __asm {
+        lea eax, key
+        mov ecx, WTAB_TABLE_VA
+        mov edx, WTAB_LOOKUP_VA
+        call edx
+        mov node, eax
+    }
+    return node;
+}
+
+static wtab_orig_t *wtab_orig_of(void *rec, int id)
+{
+    int i;
+    for (i = 0; i < g_wtab_orig_n; i++)
+        if (g_wtab_orig[i].rec == rec && g_wtab_orig[i].id == id) return &g_wtab_orig[i];
+    if (g_wtab_orig_n >= WTAB_MAX) return NULL;
+    {
+        wtab_orig_t *o = &g_wtab_orig[g_wtab_orig_n++];
+        o->rec = rec;
+        o->id = id;
+        for (i = 0; i < WTAB_FIELDS; i++)
+            o->orig[i] = *(unsigned *)((unsigned char *)rec + WTAB_FIELD[i].off);
+        return o;
+    }
+}
+
+/* 把当前表按 `mode` 写进武器记录。**只许在主线程调**（表只在主线程重建）。 */
+static void wtab_apply(int mode, const char *why)
+{
+    wtab_table_t snap;
+    int i, f, written = 0, missing = 0;
+
+    if (!g_wtab_have) return;
+    EnterCriticalSection(&g_wtab_cs);
+    snap = g_wtab;
+    LeaveCriticalSection(&g_wtab_cs);
+    InterlockedExchange(&g_wtab_dirty, 0);
+
+    if (wtab_keep_original()) {
+        if (g_wtab_logged_serial != snap.serial) {
+            bslog("WTAB    BSHOOK_KEEP_WEAPON_TABLE 已设：收到自定义武器表 v%u 但不写内存", snap.serial);
+            g_wtab_logged_serial = snap.serial;
+        }
+        return;
+    }
+    for (i = 0; i < snap.n; i++) {
+        const wtab_rec_t *r = &snap.rec[i];
+        const wtab_block_t *b = &r->mode[mode];
+        void *node = wtab_lookup(r->id);
+        void *rec;
+        wtab_orig_t *orig;
+        if (!node || IsBadReadPtr(node, 12)) { missing++; continue; }
+        rec = *(void **)((unsigned char *)node + 8);
+        if (!rec || IsBadWritePtr(rec, WTAB_RECORD_SIZE)) { missing++; continue; }
+        orig = wtab_orig_of(rec, r->id);
+        for (f = 0; f < WTAB_FIELDS; f++) {
+            unsigned *slot = (unsigned *)((unsigned char *)rec + WTAB_FIELD[f].off);
+            if (b->mask & (1u << f))
+                *slot = b->v[f];
+            else if (orig)
+                *slot = orig->orig[f];
+        }
+        written++;
+    }
+    /* 日志按 (serial, 模式, 写入条数) 翻转去重：登录那一刻武器表还没加载（启动那次
+       Load 是进大厅时才跑，实测 0/9），Load 返回点上再写才是 9/9 —— 两次都要看得见。 */
+    if (g_wtab_logged_serial != snap.serial || g_wtab_logged_mode != mode
+            || g_wtab_logged_written != written) {
+        bslog("WTAB    自定义武器表 v%u：按【%s】写入 %d/%d 条（%s，来源 %08X）%s",
+              snap.serial, mode == 0 ? "任务" : "对战", written, snap.n, why,
+              g_wtab_last_src, missing ? "，有条目在表里查不到" : "");
+        g_wtab_logged_serial = snap.serial;
+        g_wtab_logged_mode = mode;
+        g_wtab_logged_written = written;
+    }
+}
+
+static int wtab_current_mode(void)
+{
+    int forced = wtab_forced_mode();
+    return forced >= 0 ? forced : g_wtab_mode;
+}
+
+/* 攒着的表在主线程上补写（`on_crypt` 每次出站都问一下，正常路径就一个标志）。 */
+static void wtab_apply_if_main_thread(void)
+{
+    if (!g_wtab_dirty) return;
+    if (GetCurrentThreadId() != g_main_thread_id) return;
+    wtab_apply(wtab_current_mode(), "主线程补写");
+}
+
+/* 收到一帧 0xFF：是 0x0F01 就解析 + 存表，返回 1 = 吞掉；其余返回 0 交给原分发。 */
+static int __cdecl wtab_on_frame(void *pkt)
+{
+    const unsigned char *frame;
+    unsigned opcode, len, fmt, serial, n, i, f;
+    const unsigned char *p;
+    wtab_table_t tmp;
+
+    if (!pkt || IsBadReadPtr(pkt, 0x10)) return 0;
+    frame = *(const unsigned char **)((const unsigned char *)pkt + 0xc);
+    if (!frame || IsBadReadPtr(frame, 10)) return 0;
+    if (frame[0] != 0xFF) return 0;
+    opcode = *(const unsigned short *)(frame + 8);
+    if (opcode != WTAB_OPCODE) return 0;
+
+    len = *(const unsigned short *)(frame + 2);
+    p = frame + 10;
+    if (len < 8 || IsBadReadPtr(p, len)) {
+        bslog("WTAB    !! 0x0F01 载荷太短（%u），丢弃", len);
+        return 1;
+    }
+    fmt = *(const unsigned short *)(p + 0);
+    serial = *(const unsigned *)(p + 2);
+    n = *(const unsigned short *)(p + 6);
+    if (fmt != WTAB_FORMAT || n > WTAB_MAX || len != 8 + n * WTAB_RECORD_BYTES) {
+        bslog("WTAB    !! 0x0F01 格式对不上（format=%u n=%u len=%u），丢弃", fmt, n, len);
+        return 1;
+    }
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.serial = serial;
+    tmp.n = (int)n;
+    p += 8;
+    for (i = 0; i < n; i++) {
+        int m;
+        tmp.rec[i].id = *(const int *)p;
+        p += 4;
+        for (m = 0; m < 2; m++) {
+            tmp.rec[i].mode[m].mask = *(const unsigned *)p;
+            p += 4;
+            for (f = 0; f < WTAB_FIELDS; f++) {
+                tmp.rec[i].mode[m].v[f] = *(const unsigned *)p;
+                p += 4;
+            }
+        }
+    }
+    EnterCriticalSection(&g_wtab_cs);
+    g_wtab = tmp;
+    LeaveCriticalSection(&g_wtab_cs);
+    InterlockedExchange(&g_wtab_have, 1);
+    InterlockedExchange(&g_wtab_dirty, 1);
+    bslog("WTAB    收到自定义武器表 v%u：%u 条（线程 %lu%s）", serial, n,
+          (unsigned long)GetCurrentThreadId(),
+          GetCurrentThreadId() == g_main_thread_id ? "，主线程" : "，非主线程，等主线程补写");
+    wtab_apply_if_main_thread();
+    return 1;
+}
+
+/* 0x54e036 头上的 detour：ecx=this、[esp+4]=包对象。吞掉时照默认分支 `xor al,al; ret 4`。 */
+static __declspec(naked) void det_wtab_dispatch(void)
+{
+    __asm {
+        push ecx
+        push edx
+        push dword ptr [esp+12]      /* 包对象 = 原 [esp+4]，压了两个寄存器之后是 +12 */
+        call wtab_on_frame
+        add esp, 4
+        pop edx
+        pop ecx
+        test eax, eax
+        jnz swallow
+        push s_wtab_dispatch
+        ret
+    swallow:
+        xor al, al
+        ret 4
+    }
+}
+
+/* Load 返回之后：按返回地址定模式，作废原值缓存（表是新解析的），再写一遍。 */
+static void __cdecl wtab_after_load(void)
+{
+    unsigned ret = (unsigned)g_wtab_load_ret;
+    g_wtab_last_src = ret;
+    g_wtab_orig_n = 0;
+    if (ret == WTAB_RET_QUEST) g_wtab_mode = 0;
+    else if (ret == WTAB_RET_PVP || ret == WTAB_RET_PVP2 || ret == WTAB_RET_BOOT) g_wtab_mode = 1;
+    else bslog("WTAB    ⚠ WeaponTable::Load 从不认识的地方被调（返回地址 %08X），模式沿用上一次", ret);
+    if (g_wtab_have)
+        wtab_apply(wtab_current_mode(), "进图重读后重施加");
+}
+
+static __declspec(naked) void wtab_load_stub(void)
+{
+    __asm {
+        pushad
+        pushfd
+        call wtab_after_load
+        popfd
+        popad
+        push g_wtab_load_ret
+        ret
+    }
+}
+
+/* 0x48b50d 头上的 detour：记下原返回地址、换成桩，再跳蹦床跑原函数。 */
+static __declspec(naked) void det_wtab_load(void)
+{
+    __asm {
+        push eax
+        mov eax, dword ptr [esp+4]
+        mov g_wtab_load_ret, eax
+        pop eax
+        mov dword ptr [esp], offset wtab_load_stub
+        push s_wtab_load
+        ret
+    }
+}
+
+static int try_install_weapon_table_hooks(void)
+{
+    if (g_wtab_hooked) return 1;
+    if (IsBadReadPtr((const void *)WTAB_DISPATCH_VA, sizeof(WTAB_DISPATCH_SIG)) ||
+        IsBadReadPtr((const void *)WTAB_LOAD_VA, sizeof(WTAB_LOAD_SIG)) ||
+        IsBadReadPtr((const void *)WTAB_LOOKUP_VA, sizeof(WTAB_LOOKUP_SIG)))
+        return 0;
+    if (memcmp((const void *)WTAB_DISPATCH_VA, WTAB_DISPATCH_SIG, sizeof(WTAB_DISPATCH_SIG)) != 0) return 0;
+    if (memcmp((const void *)WTAB_LOAD_VA, WTAB_LOAD_SIG, sizeof(WTAB_LOAD_SIG)) != 0) return 0;
+    if (memcmp((const void *)WTAB_LOOKUP_VA, WTAB_LOOKUP_SIG, sizeof(WTAB_LOOKUP_SIG)) != 0) return 0;
+    if (!g_wtab_cs_ready) {
+        InitializeCriticalSection(&g_wtab_cs);
+        g_wtab_cs_ready = 1;
+    }
+    s_wtab_dispatch = install_inline_hook((void *)WTAB_DISPATCH_VA, (void *)det_wtab_dispatch,
+                                          "ServerConnection::OnGameFrame(0x0F01 自定义武器表)");
+    if (!s_wtab_dispatch) return 0;
+    s_wtab_load = install_inline_hook((void *)WTAB_LOAD_VA, (void *)det_wtab_load,
+                                      "WeaponTable::Load(重读后重施加)");
+    if (!s_wtab_load) {
+        bslog("WTAB    !! Load 钩子没装上：表只在收到时写一次，进图重读后会被 ini 原值盖掉");
+    }
+    InterlockedExchange(&g_wtab_hooked, 1);
+    bslog("WTAB    ★自定义武器表钩子已装（吞 0x0F01 @ %08X，Load 返回点 @ %08X，查表 @ %08X）",
+          WTAB_DISPATCH_VA, WTAB_LOAD_VA, WTAB_LOOKUP_VA);
     return 1;
 }
 
@@ -8744,6 +9088,16 @@ static DWORD WINAPI patch_thread(LPVOID param)
             bslog("PATCH   !! 超时未能 patch 追踪弹撒手死目标"
                   "（0x47E40A 的特征串一直对不上）");
     }
+
+    /* ★ 自定义武器表（X3）：功能钩子，一直装。两个站点都在解壳后就绪的代码里；
+       0x0F01 要登录成功之后才会来，远晚于这里。 */
+    for (ticks = 0; !g_stop && !g_wtab_hooked && ticks < 2000; ticks++) {
+        if (try_install_weapon_table_hooks()) break;
+        Sleep(2);
+    }
+    if (!g_wtab_hooked)
+        bslog("PATCH   !! 超时未能装自定义武器表钩子"
+              "（0x54e036 / 0x48b50d / 0x4157bf 的特征串一直对不上）—— 9 把自定义武器只有资源包里的数值");
 
     /* ★ M3b 诊断：弹体全字段快照（临时，查完「看不见 bot 的子弹」就删）。
        两个 hook 的目标函数都在战斗里才第一次跑，远晚于解壳窗口。 */
