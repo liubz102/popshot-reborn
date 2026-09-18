@@ -788,7 +788,8 @@ key 2 -> 0x480f8d push 0xc 冰冻   key 4 -> 0x480fbd push 0xe ★ 减速
 `0x54e036` 先给三个前置分发器过目再进自己的 switch：大厅 `0x4061e2`（`cmp eax,0x401; ja` + `sub 0x300; cmp 0x11; ja`）、
 当前 Stage 的 `vft+0xc4`（`ShopStage` 的 `0x4442a3`：`cmp eax,0x604; jg` + `sub 0x500; cmp 0xc; ja`）、
 `0x54b634`（只认 `0x805`）；自己的 switch 认不出走 `0x54e546: xor al,al; jmp 0x54e565` 返回 0。
-⇒ 我们自造的 `0x0F01` 发给**没装钩子 / 老版本**的客户端也只是被丢掉。服务端仍按版本门控只发给 ≥ `versioning.WEAPON_TABLE_MIN_VERSION`（= 做 X3 时的开发版本 0.4.1）。
+⇒ 我们自造的 `0x0F01` 发给**没装钩子 / 老版本**的客户端也只是被丢掉，所以服务端对每条已登录连接都发，
+**不另设版本门控**（用户 2026-09-19：客户端版本只由 `server-ClientFilter.config` 那一道门管）。
 
 ## §39 ★★★ 物品 id / 商店表 / 物品定义缓存的三条事实（✅离线核对 + 🔍静态）
 

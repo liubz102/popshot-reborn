@@ -33,7 +33,8 @@ test_patchsites_wtab}.py` + `test_web_admin` / `test_shopcfg` / `test_weapondata
 ## 下一步
 
 0. ★★ **版本号由用户定，别擅自抬**（用户 2026-09-19 原话：「0.4.1 还没发呢，这个就是现在的开发版本」；线上是 V0.4.0）。
-   我一度抬到 0.4.2，用户全部改回。现在 `WEAPON_TABLE_MIN_VERSION = (0,4,1)`，清单里 0.4.1 = 新 DLL 的哈希。
+   我一度抬到 0.4.2，用户全部改回；顺手加的 `WEAPON_TABLE_MIN_VERSION` 门控也**删了**（用户：版本门控只有
+   `server-ClientFilter.config` 一道，别重复加）。清单里 0.4.1 = 新 DLL 的哈希。
 1. 撞色**已选 C 银白**（2026-09-19），`build.py --variant C` 已重跑、资源包重打（火墙按同一规则改色）。
 2. **实机 V26~V30**（下表）。V27 前先在管理页「金币 / 经验」页把一把自定义武器发给自己（出厂不上架）。
    ★ 服务端代码在用户登着时又改过（浮窗两套数值、提示语缩短），要 `stop.bat` / `start.bat` 一次才生效。

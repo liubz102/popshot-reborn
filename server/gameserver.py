@@ -11775,15 +11775,13 @@ class Conn:
     def send_hook_weapon_table(self, reason=""):
         """发 `0x0F01`「自定义武器表」给 bshook（X3）。发了返回 True。
 
-        只发给**已登录**且 `client_version >= versioning.WEAPON_TABLE_MIN_VERSION`
-        的连接：更老的客户端没有认识它的 hook，发了也是白发（会落进分发树的默认
-        分支，不出事，但没意义）。登录成功后发一次；管理页保存后由
-        `broadcast_hook_weapon_table()` 再推一遍。
+        发给每一条**已登录**的连接，不另设版本门控（用户 2026-09-19：客户端版本
+        只由 `server-ClientFilter.config` 那一道门管，别重复加）。能登进来的客户端
+        就是门禁放行的；万一是没装这个钩子的老版本，这一包会落进分发树的默认分支
+        （`0x54e546: xor al,al`，X_Mod §38），什么都不发生。
+        登录成功后发一次；管理页保存后由 `broadcast_hook_weapon_table()` 再推一遍。
         """
         if not self.account_name:
-            return False
-        version = self.client_version
-        if version is None or tuple(version) < versioning.WEAPON_TABLE_MIN_VERSION:
             return False
         payload = weaponcfg.build_hook_frame()
         fmt, serial, records = weaponcfg.parse_hook_frame(payload)

@@ -88,13 +88,6 @@ WIRE_V2_TAG_MASK = 0x7F
 #: 客户端包里那份 hook 的文件名（`manifest-hook.json` 记的就是它的 SHA-256）。
 HOOK_BINARY_NAME = "bshook.dll"
 
-#: ★ 从哪个客户端版本起 bshook 认识 `0x0F01`「自定义武器表」（X_Mod · X3）。
-#: 服务端只给 `client_version >= 它` 的连接发这一包。更老的客户端收到也只是
-#: 落进分发树的默认分支（`0x54e546: xor al,al`，什么都不做），门控只是省一发。
-#: ★ 0.4.1 是做 X3 时的**开发版本**（用户 2026-09-19：还没发，别擅自抬版本号），
-#:   线上跑的是 V0.4.0 —— 版本号只由用户在发版时定。
-WEAPON_TABLE_MIN_VERSION = (0, 4, 1)
-
 #: 「跟着 server-ClientFilter.config 走（每次握手热重载）」的哨兵值。
 #: app.py（统一入口）用它；单跑 gameserver.py 或测试给具体值或 0。
 FOLLOW_FILE = "auto"
