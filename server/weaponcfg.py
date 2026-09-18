@@ -65,8 +65,9 @@ FIELD_GROUPS = (
     ("弹道", ("velocity", "max_velocity", "gravity")),
 )
 
-#: 提示框第 1 段的首行（用户 2026-09-19 原话）。自定义武器只画 PVP 那套数值。
-PVP_ONLY_NOTE = "仅显示PVP属性，PVE属性请看GM管理页："
+#: 提示框第 1 段的首行（用户 2026-09-19 原话；第二版缩短 —— 第一版「…PVE属性请看GM管理页：」
+#: 在 234 px 宽的框里折行）。自定义武器只画 PVP 那套数值。
+PVP_ONLY_NOTE = "仅显示PVP属性，PVE的请看管理页"
 
 #: 说明文的上限：提示框第 2 段只有 3 行、232 px 宽（`shopcfg.ITEM_DESC_MAX_LINES_2`）。
 DESC_MAX_LINES = shopcfg.ITEM_DESC_MAX_LINES_2
@@ -361,6 +362,31 @@ def parse_hook_frame(payload):
 # 管理页要的那份视图
 # ---------------------------------------------------------------------------
 
+MODE_HEADING = {MODE_PVP: "【对战模式 PVP】", MODE_PVE: "【任务模式 PVE】"}
+
+
+def mode_lines(item, mode, table=None, data_dir=None):
+    """某模式下提示框会画的那几行数值（`shopcfg._weapon_lines` 的口径）。"""
+    return shopcfg._weapon_lines(effective_weapon_dict(item, mode, table, data_dir))
+
+
+def admin_desc(item, table=None, data_dir=None):
+    """管理页浮窗 / 弹窗要的说明：自定义武器把 **PVP 和 PVE 两套都列出来**（用户 2026-09-19：
+    管理页空间够，两种都显示；游戏内提示框装不下才只画 PVP）。原版武器和游戏里一样。"""
+    if item is None:
+        return ""
+    if not getattr(item, "custom", False):
+        return shopcfg.item_desc_zh(item, weapons_table=table)
+    if table is None:
+        table = load(data_dir)
+    blocks = []
+    for mode in (MODE_PVP, MODE_PVE):
+        blocks.append(MODE_HEADING[mode])
+        blocks.extend(mode_lines(item, mode, table))
+    text = "\n".join(blocks)
+    note = desc_of(item.id, table)
+    return text + shopcfg.DESC_SEPARATOR + note if note else text
+
 def admin_view(item_id, table=None, data_dir=None):
     """弹窗要的一切：字段表（含参考值 / 两套当前值）、说明文、游戏里会显示的预览。"""
     item_id = int(item_id)
@@ -390,5 +416,7 @@ def admin_view(item_id, table=None, data_dir=None):
         "desc_max_chars": DESC_MAX_CHARS,
         "pvp_only_note": PVP_ONLY_NOTE if item.custom else "",
         "preview": shopcfg.item_desc_zh(item, weapons_table=table),
+        # ★ 两套数值行分开给（用户 2026-09-19）：弹窗里 PVP / PVE 各画一块，游戏内那段只有 PVP。
+        "lines": {mode: mode_lines(item, mode, table) for mode in MODES} if item.custom else {},
         "serial": int(table.get("serial", 0)),
     }

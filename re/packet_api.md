@@ -2244,7 +2244,7 @@ MagazineCount CoolingTime ReloadTime LoadingTime`（int32）`Velocity MaxVelocit
 
 **什么时候发**：登录成功后一次（`on_game_login` 末尾）；管理页「自定义属性」保存后
 `gameserver.broadcast_hook_weapon_table()` 推给全部已登录连接（在线玩家不用重登）。
-只发 `client_version >= versioning.WEAPON_TABLE_MIN_VERSION`（V0.4.2）的连接。
+只发 `client_version >= versioning.WEAPON_TABLE_MIN_VERSION`（现在是开发版本 V0.4.1）的连接。
 ★ 只有 9 把自定义武器的 Id（`100C9S0`）会出现在表里，原版武器不进这条链。
 
 ---

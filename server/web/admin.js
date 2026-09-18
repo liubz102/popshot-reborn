@@ -6502,14 +6502,27 @@ function renderWeaponModal() {
   host.appendChild(desc);
 
   var preview = el("div", "weapon-preview");
-  preview.appendChild(el("b", null, "游戏里会显示（按已保存的内容现算）："));
-  var text = view.preview || "";
-  if (!text) {
-    preview.appendChild(el("div", "empty", "（这件东西没有说明）"));
-  } else {
-    text.split("|").forEach(function (segment) {
-      preview.appendChild(el("pre", null, segment));
+  if (view.custom && view.lines) {
+    // ★ 两套都列（用户 2026-09-19）：游戏内提示框只画 PVP 那套，这里空间够。
+    preview.appendChild(el("b", null, "按已保存的内容现算（游戏内提示框只画对战那一段）："));
+    ["pvp", "pve"].forEach(function (mode) {
+      var label = "";
+      (view.modes || []).forEach(function (m) { if (m.key === mode) { label = m.label; } });
+      var block = el("pre", null, "【" + label + "】\n" + (view.lines[mode] || []).join("\n"));
+      preview.appendChild(block);
     });
+    var note = (view.preview || "").split("|")[1];
+    if (note) { preview.appendChild(el("pre", null, note)); }
+  } else {
+    preview.appendChild(el("b", null, "游戏里会显示（按已保存的内容现算）："));
+    var text = view.preview || "";
+    if (!text) {
+      preview.appendChild(el("div", "empty", "（这件东西没有说明）"));
+    } else {
+      text.split("|").forEach(function (segment) {
+        preview.appendChild(el("pre", null, segment));
+      });
+    }
   }
   host.appendChild(preview);
 

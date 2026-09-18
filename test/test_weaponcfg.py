@@ -165,6 +165,23 @@ class DescriptionTests(_Case):
         after = shopcfg.item_desc_zh(shopdata.get(ORIGINAL))
         self.assertEqual(before + shopcfg.DESC_SEPARATOR + "第一行\n第二行", after)
 
+    def test_admin_desc_lists_both_modes(self):
+        """管理页浮窗 / 弹窗两套都列（用户 2026-09-19）；游戏内那段只有 PVP。"""
+        weaponcfg.save_item(CUSTOM, params={"pve": {"damage": 50}, "pvp": {"damage": 9}}, desc="说明")
+        text = weaponcfg.admin_desc(shopdata.get(CUSTOM))
+        self.assertIn("【对战模式 PVP】", text)
+        self.assertIn("【任务模式 PVE】", text)
+        self.assertIn("伤害 9", text)
+        self.assertIn("伤害 50", text)
+        self.assertTrue(text.endswith(shopcfg.DESC_SEPARATOR + "说明"))
+        self.assertNotIn(weaponcfg.PVP_ONLY_NOTE, text)
+        # 原版武器和游戏里一样
+        self.assertEqual(shopcfg.item_desc_zh(shopdata.get(ORIGINAL)),
+                         weaponcfg.admin_desc(shopdata.get(ORIGINAL)))
+        view = weaponcfg.admin_view(CUSTOM)
+        self.assertIn("伤害 50", "\n".join(view["lines"]["pve"]))
+        self.assertIn("伤害 9", "\n".join(view["lines"]["pvp"]))
+
     def test_names(self):
         self.assertEqual("左轮 自定义", shopcfg.item_name_zh(shopdata.get(CUSTOM)))
         import shopdefaults
