@@ -2919,6 +2919,29 @@ STATUS_ITEM_FREEZED = 10601
 STATUS_ITEM_HUDDED = 10602
 STATUS_ITEM_SLOWED = 10603
 
+#: ★★★ **武器自带的那个状态**：`weapon.ini` 的 `Attribute` -> 角色属性号
+#: （X_Mod §31）。全表只有 `[ch03-02a]`（爱琳 2 号炸出来的蝴蝶）写了它，
+#: 值是 `4`。
+#:
+#: ⚠⚠ `Attribute` **不是 `Status.ini` 的小节号** —— 中间隔着 exe 里
+#: `0x480f4a`（`Projectile` 虚表 `+0x130` `ApplyAttrToTarget`）那张硬编码
+#: 映射，四个 `HasAttr(key)` 分支各自 `push` 一个写死的属性号：
+#:
+#:     key 1 -> 0x480f80  push 0xb   中毒
+#:     key 2 -> 0x480f8d  push 0xc   冰冻
+#:     key 3 -> 0x480fa5  push 0xd   幽灵
+#:     key 4 -> 0x480fbd  push 0xe   ★ 减速
+#:
+#: 照小节号读会读成 `Status.ini [4] 미니비`（`SizeRatio=0.6` 缩小），
+#: 那是 `Item.ini [SizeDown]` 那件道具，和武器这条完全无关。
+#: 效果本身仍然查 `Status.ini` 同号那一节（`[14] SpeedRatio=0.3`），
+#: 只有**时长**被武器的 `AttributeTime` 覆盖（`0x508e1f`：参数 > 0 就用参数）。
+BULLET_ATTRIBUTE_CHAR_ATTR = {1: 11, 2: 12, 3: 13, 4: 14}
+
+#: 角色属性号 -> 走速倍率（`Status.ini` 的 `SpeedRatio`）。只列**会改走速**的。
+#: 12 冰冻那一条没有 `SpeedRatio`，它是整个「动不了」（见 `bot._speed_scale`）。
+CHAR_ATTR_SPEED_RATIO = {14: SLOWED_SPEED_RATIO}
+
 #: ★★★ **按「打几发」算的那三条状态**（V0.3 §117，接 §200 / §201）。
 #:
 #: `Status.ini` 里绝大多数状态有 `Time`，客户端各自倒计时、自己撤掉。
@@ -4425,6 +4448,17 @@ class RoomQuest:
         self.freeze_bursts = []
         #: ★ 地上还在飘的**烟雾**：`[(x, y, 散掉的时刻), …]`（D67）。
         self.smokes = []
+        #: ★★★ 场上的**回血图腾**（爱琳 3 号武器，X_Mod §32）：
+        #:   `[[x, y, 放的人座位, 碰撞排除组, 弹药id, 落地时刻, {座位: 上次回血时刻}], …]`
+        #:   来源是真人发的 `0x001b rpCreateTotem`（bot 用不了爱琳，
+        #:   `bot.BOT_CHARACTER_PANEL_IDS` 钉死 `(0,1,2)`）。
+        #:   只有 bot 读它 —— 真人站没站进去、回没回血，全是他自己那台算的。
+        #:   ★ 最后那本小账**按「这座图腾 × 这个人」记**，和客户端
+        #:   `0x4883c7` 的口径一样（那边也是问「这个角色上次被**这座**图腾
+        #:   治疗是什么时候」）；节奏是原版的 `TotemProofTime`，
+        #:   和 `hp_charges` 抄 `Interval=1.0` 同一个口径，不是我们挑的定时器。
+        #:   图腾到期从表里摘掉，这本账跟着一起没。
+        self.totems = []
         #: ★ 被**糊屏**（10311）罩住的座位撑到什么时候（`{座位: 时刻}`，§121）。
         #:   只有 bot 读它 —— 真人那张鬼脸是他自己客户端画的。
         self.hud_jam_until = {}

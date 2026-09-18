@@ -76,7 +76,11 @@ ROOT = os.path.dirname(HERE)
 #:   ⚠⚠ **改这个数必须和重新生成 `server/bot_weapons.json` 在同一个提交里**：
 #:   `server/weapondata._Store._read()` 在 `format` 对不上时返回**空表**，
 #:   症状是 **bot 全房间当场不开枪**，而且一句报错都没有。
-FORMAT = 12
+#: ★ 13（X_Mod · 爱琳三条线上反馈）：新增**武器附带状态**那两格
+#:   （`Attribute` / `AttributeTime`，全表只有爱琳 2 号的碎片有）和
+#:   **图腾**那六格（`Totem*`，全表只有爱琳 3 号有）。两条都是原版做好了、
+#:   服务端从来没读过的机制 —— bot 挨打不减速、bot 不会去蹭回血图腾都是它。
+FORMAT = 13
 
 #: 节名 `chNNN-MM…`：NNN = 角色 id，MM = 武器序号。
 #: ★ 后面还可能跟 `SE` / `D1` / `R1` / `F1` / `a` / `Classic` 之类的后缀 ——
@@ -168,6 +172,38 @@ _FIELDS = (
     #   `0x48be09` 每次刷新武器时判「两个都到头了就换回自己那把」。
     ("ForceTime",         "force_ms",            int),
     ("ForceCount",        "force_count",         int),
+    # ★★★ `Attribute` / `AttributeTime`：**这一发打中人会给他挂个状态**
+    #   （X_Mod §31）。全表只有 `[ch03-02a]`（爱琳 2 号炸出来的蝴蝶）有，
+    #   写的是 `Attribute=4 / AttributeTime=2100`。
+    #
+    #   ⚠⚠ `Attribute` **不是 `Status.ini` 的小节号**，中间隔着 exe 里
+    #   `0x480f4a`（`Projectile` 虚表 `+0x130`）那张硬编码映射：
+    #   `1→11 中毒 / 2→12 冰冻 / 3→13 幽灵 / 4→14 减速`。
+    #   照着小节号读会读成 `[4] 미니비`（缩小），完全是另一回事。
+    #   映射表在 `gameserver.BULLET_ATTRIBUTE_CHAR_ATTR`。
+    #
+    #   `AttributeTime`（毫秒）**覆盖** `Status.ini` 那一条的 `Time`
+    #   （`0x508e1f`：参数 > 0 就用参数）⇒ 蝴蝶的减速是 **2100 ms**，
+    #   不是 `[14]` 写的 4 秒。
+    ("Attribute",         "attribute",           int),
+    ("AttributeTime",     "attribute_ms",        int),
+    # ★★★ 图腾那一族（X_Mod §32）。全表只有爱琳 3 号有：
+    #   `[ch03-03]` 是发射器（`CreatingClass=TotemLauncher` + `TotemId`），
+    #   `TotemId` 指向的 `[ch03-03a] 포션` 才是落地那座图腾本身。
+    #
+    #   数值到 `TotemObject` 成员的搬运在 `0x487c72`~`0x487d02`：
+    #   `TotemLifeTime` / `TotemProofTime` 都要 **÷ 32**（`[0x6dc528]`）换成 tick。
+    ("TotemId",           "totem_id",            int),
+    # `TotemType=1` = **只治同队**（`0x488364`~`0x488376` 的队伍号比较）。
+    # 原版数据只用了 1，别的分支没有出处。
+    ("TotemType",         "totem_type",          int),
+    ("TotemRange",        "totem_range",         float),
+    ("TotemValue",        "totem_value",         int),
+    ("TotemLifeTime",     "totem_life_ms",       int),
+    ("TotemProofTime",    "totem_interval_ms",   int),
+    # 夺分模式（游戏模式 3）里每跳回血要再乘这个数（`0x488631` 的
+    # `cmp eax, 3` + `0x488639` 的 `fmul [esi+0x2c0]`）。
+    ("TotemValueMaxModeRatio", "totem_mode_ratio", float),
 )
 
 
@@ -388,7 +424,8 @@ TICK_MS = 32
 #: * `PlasmaCannon`（`ch109-03`）—— 它的 `vft+0xa8`（`0x4848c9`）里
 #:   **自己 `++` 了一次句柄计数器**（`0x484924`），调用路径没证明是
 #:   `IsMine` 门内的，宁可不放；
-#: * `TotemLauncher`（`ch103-03`）—— 它那把 `Damage=0`，本来也过不了第 3 条。
+#: * `TotemLauncher`（`ch03-03`，爱琳 3 号，全表唯一的一把）—— 它那把
+#:   `Damage=0`，本来也过不了第 3 条。
 SAFE_CLASSES = (
     "GeneralBullet",
     # 带引信（`SliceTime`）：飞行和基类一样，但**到点会在每一台上自爆**，

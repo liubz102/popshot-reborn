@@ -11462,3 +11462,67 @@ class RoomLoopLifecycleTests(BotFrameRoom):
                      roomclock.deadline_of(loop.t0, start + 9))
         loop.advance(loop.scheduled - loop.done)
         self.assertEqual(list(range(start, start + 10)), ran)
+
+
+class CreateTotemWireTests(unittest.TestCase):
+    """`0x001b rpCreateTotem` 的 22 字节 body（X_Mod §32）。
+
+    布局逆自组包点 `0x494150` 里那串 `call 写原语`：
+
+        +0  u8   发射者座位      +10  f32  ★ Y
+        +1  u8   碰撞排除组      +14  f32  角度
+        +2  i32  图腾弹药 id     +18  i32  发射者对象句柄（收侧不读）
+        +6  f32  ★ X
+
+    ★ 前 14 字节和 `rpFire`（packet_api §5.2）**逐格同构** —— 组包代码就是
+    照着那一份写的。这条用例把「两者同构」钉住：哪天有人按别的猜法改了这里，
+    它会先红。
+    """
+
+    #: 一发样板：2 号位、队伍 1、爱琳的图腾、落在 (512.5, -64.25)。
+    SAMPLE = struct.pack("<BBifffi", 2, 1, 1003031, 512.5, -64.25, 1.5, 0x1234)
+
+    def test_body_is_twenty_two_bytes(self):
+        self.assertEqual(22, botsync.CREATE_TOTEM_BODY_SIZE)
+        self.assertEqual(22, len(self.SAMPLE))
+
+    def test_the_opcode_is_the_one_the_client_switch_names(self):
+        self.assertEqual(0x001B, botsync.OP_CREATE_TOTEM)
+        # 挂机判定早就认得它了 —— 两边必须是同一个数。
+        self.assertEqual(botsync.OP_CREATE_TOTEM,
+                         gameserver.PEER_OP_CREATE_TOTEM)
+        self.assertIn(botsync.OP_CREATE_TOTEM, gameserver.INPUT_PEER_OPCODES)
+
+    def test_parse_reads_the_five_fields_we_care_about(self):
+        seat, group, ammo, x, y = botsync.parse_create_totem(self.SAMPLE)
+        self.assertEqual(2, seat)
+        self.assertEqual(1, group)
+        self.assertEqual(1003031, ammo)
+        self.assertAlmostEqual(512.5, x, places=3)
+        self.assertAlmostEqual(-64.25, y, places=3)
+
+    def test_the_coordinates_really_live_at_plus_six_and_plus_ten(self):
+        """★ 不靠同一个 `struct` 自证：手工按偏移塞两个特征值再读回来。"""
+        body = bytearray(self.SAMPLE)
+        body[6:10] = struct.pack("<f", 777.0)
+        body[10:14] = struct.pack("<f", -333.0)
+        _seat, _group, _ammo, x, y = botsync.parse_create_totem(bytes(body))
+        self.assertAlmostEqual(777.0, x, places=3)
+        self.assertAlmostEqual(-333.0, y, places=3)
+
+    def test_the_first_three_fields_are_shaped_like_rp_fire(self):
+        """`rpFire` 的 `+0 座位 / +1 组 / +2 弹药 id` 是 `<BBi`（§5.2）。"""
+        seat, group, ammo = struct.unpack_from("<BBi", self.SAMPLE, 0)
+        self.assertEqual((2, 1, 1003031), (seat, group, ammo))
+
+    def test_a_short_body_is_refused_instead_of_raising(self):
+        """半截包在线上是会出现的 —— 拆不开就返回 None，别把房间循环拖崩。"""
+        for size in range(0, botsync.CREATE_TOTEM_BODY_SIZE):
+            with self.subTest(size=size):
+                self.assertIsNone(
+                    botsync.parse_create_totem(self.SAMPLE[:size]))
+
+    def test_a_longer_body_still_parses(self):
+        """多出来的尾巴一律不管（和别的 parse_* 一个口径）。"""
+        self.assertIsNotNone(
+            botsync.parse_create_totem(self.SAMPLE + b"\x00" * 8))

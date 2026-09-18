@@ -16,6 +16,7 @@
 不掉」，而且一局之内不自愈（§42 / D28）。所以「不确定就返回 None、
 bot 就不用这把枪」这条口径要有用例守着。
 """
+import io
 import json
 import os
 import sys
@@ -370,6 +371,66 @@ class RealTableTests(unittest.TestCase):
         self.assertEqual(140, weapon.fire_interval_ms)
         self.assertEqual(1, weapon.handle_step)
         self.assertEqual(80.0, weapon.lockon_range)
+
+
+@unittest.skipIf(not os.path.isfile(weapondata.DATA_PATH),
+                 "server/bot_weapons.json 还没生成")
+class IreneOnlyFieldsTests(unittest.TestCase):
+    """★ `format` 13 新收的两组字段（X_Mod §31 / §32）。
+
+    两组在**全表 228 节里都只有爱琳的武器有** —— 这既是事实也是判据：
+    多出来一条就说明提取器的键名或类型写漏了，会把别的武器也带上。
+    """
+
+    #: 蝴蝶（爱琳 2 号武器炸出来的碎片）。
+    SPLINTER = 1003520
+    #: 回血图腾本体。
+    TOTEM = 1003031
+
+    def test_the_splinter_carries_the_slow(self):
+        """`Attribute=4 / AttributeTime=2100`。★ `4` 不是 `Status.ini` 的
+        小节号，是 exe `0x480f4a` 那张映射的 key，换算出来才是属性 14 减速。"""
+        weapon = weapondata.get(self.SPLINTER)
+        self.assertIsNotNone(weapon)
+        self.assertEqual(4, weapon.attribute)
+        self.assertEqual(2100, weapon.attribute_ms)
+
+    def test_the_launcher_points_at_the_totem(self):
+        launcher = weapondata.get(1003030)
+        self.assertIsNotNone(launcher)
+        self.assertEqual("TotemLauncher", launcher.creating_class)
+        self.assertEqual(self.TOTEM, launcher.totem_id)
+
+    def test_the_totem_carries_all_six_numbers(self):
+        """半径 / 时长 / 间隔 / 每跳量少一格，bot 就判不了「进没进圈」。"""
+        totem = weapondata.get(self.TOTEM)
+        self.assertIsNotNone(totem)
+        self.assertEqual(1, totem.totem_type)        # 1 = 只治同队
+        self.assertEqual(200.0, totem.totem_range)
+        self.assertEqual(3, totem.totem_value)
+        self.assertEqual(5000, totem.totem_life_ms)
+        self.assertEqual(840, totem.totem_interval_ms)
+        self.assertAlmostEqual(1.35, totem.totem_mode_ratio, places=3)
+
+    def test_nobody_else_has_these_fields(self):
+        """全表就这三条 —— 多一条就是提取器把别的武器也带上了。"""
+        table = json.load(io.open(weapondata.DATA_PATH, encoding="utf-8"))
+        attribute, totem = [], []
+        for key, record in table["weapons"].items():
+            if "attribute" in record or "attribute_ms" in record:
+                attribute.append(key)
+            if any(name.startswith("totem_") for name in record):
+                totem.append(key)
+        self.assertEqual([str(self.SPLINTER)], attribute)
+        self.assertEqual(["1003030", str(self.TOTEM)], sorted(totem))
+
+    def test_the_loader_and_the_extractor_agree_on_the_format(self):
+        """★★ 两侧的 `FORMAT` 对不上 = `_read()` 返回**空表** = 全房间 bot
+        当场不开枪，而且一句报错都没有。产物里那个数也得是同一个。"""
+        table = json.load(io.open(weapondata.DATA_PATH, encoding="utf-8"))
+        self.assertEqual(weapondata.FORMAT, table["format"])
+        if TOOL is not None:
+            self.assertEqual(weapondata.FORMAT, TOOL.FORMAT)
 
 
 if __name__ == "__main__":
