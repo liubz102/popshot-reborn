@@ -160,6 +160,47 @@ def parse_ai_message(body):
     return (handle, fields)
 
 
+#: ★★★ `0x001b rpCreateTotem` —— **有人放下了一座图腾**（X_Mod §32）。
+#:
+#: 全游戏只有爱琳 3 号武器（`[ch03-03] CreatingClass=TotemLauncher`）会发它。
+#: 服务端以前只把它当「这个人在操作」的挂机证据（`gameserver.INPUT_PEER_OPCODES`），
+#: body 一次都没解过 —— 于是服务端不知道场上有图腾，bot 也就无从去蹭。
+OP_CREATE_TOTEM = 0x001B
+
+#: `rpCreateTotem` 的 body，**22 字节**。逆自组包点 `0x494150` 里那串
+#: `call 写原语`（1 字节 = `0x5d5901`，4 字节 = `0x5d591f`）：
+#:
+#: ```
+#: +0    u8     发射者座位（`HandleToOwner`）
+#: +1    u8     ★ 队伍号（`owner->vft+0x144`）—— 图腾只治同队，判据就是它
+#: +2    i32    图腾那一节的弹药 id（= 发射器的 `TotemId`，爱琳是 1003031）
+#: +6    f32    ★ 图腾 X
+#: +10   f32    ★ 图腾 Y
+#: +14   f32    角度
+#: +18   i32    发射者的对象句柄 —— ★ 写了但**收侧不读**（`0x491d2c` 只读前 18 字节）
+#: ```
+#:
+#: ★ 前三格和 `rpFire`（packet_api §5.2）一模一样，第四、五格也同样是坐标
+#: —— 组包代码就是照着那一份写的。
+#: ★ 发送点套在 `IsMine` 门里（`0x4879bb`）⇒ **只有放的那个人发一发**，
+#:   别人收到包再各自建一座；到期不通知，每台自己数 `TotemLifeTime` 个 tick。
+_CREATE_TOTEM = struct.Struct("<BBifffi")
+CREATE_TOTEM_BODY_SIZE = _CREATE_TOTEM.size
+
+
+def parse_create_totem(body):
+    """拆一发 `rpCreateTotem`，返回 `(座位, 队伍号, 弹药id, x, y)`；不像样返回 `None`。
+
+    ★ 座位取 body `+0` 那一格。收侧 `0x491d65` 取的是**包头 `+1`**（发送方座位），
+      两者在原版里恒等（组包时 `+0` 填的就是 `HandleToOwner(自己)`）；
+      调用方拿到的 `conn` 本来就知道是谁发的，对不上时以调用方为准。
+    """
+    if len(body) < CREATE_TOTEM_BODY_SIZE:
+        return None
+    seat, team, ammo, x, y, _angle, _owner = _CREATE_TOTEM.unpack_from(body, 0)
+    return (int(seat), int(team), int(ammo), float(x), float(y))
+
+
 OP_HEARTBEAT = udpsync.OPCODE_HEARTBEAT          # 0x4001
 
 #: `0x4005` —— **加载进度**（body = 一个 int32，取值 0..100，§30）。

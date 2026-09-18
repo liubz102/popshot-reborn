@@ -2843,6 +2843,13 @@ def note_peer_hit(room, conn, payload):
             if weapon is not None:
                 conn.peer_weapon = weapon
         return
+    if opcode == botsync.OP_CREATE_TOTEM:
+        # ★★★ 「他放下了一座回血图腾」（X_Mod §32）——爱琳 3 号武器。
+        #   坐标就在 body 里，服务端以前一次都没解过。
+        parsed = botsync.parse_create_totem(payload[udpsync.PEER_HEADER_SIZE:])
+        if parsed is not None:
+            note_create_totem(room, parsed)
+        return
     if opcode not in (botsync.OP_EXPLODE, botsync.OP_SPLASH_DAMAGED):
         return
     body = payload[udpsync.PEER_HEADER_SIZE:]
@@ -2874,6 +2881,10 @@ def note_peer_hit(room, conn, payload):
             #   是它唯一的位置来源（§141）。
             note_mob_hit(room, target, bx, by, create=True)
         _note_damage(room, botsync.handle_seat(target), damage)
+        # ★★ 武器自带的状态排在**击退之前**（X_Mod §31）：下面那条
+        #    「配不上 rpFire 就不给击退」的早退会把这一段整个跳过，
+        #    而碎片（蝴蝶）的爆点本来就配不上母弹的射线。
+        _take_weapon_attribute(room, conn, botsync.handle_seat(target))
         velocity = _peer_shot_velocity(conn, bx, by)
         if velocity is None:
             # ★ 诊断：配不上开火记录 = **这一发不给击退**（§92 的取舍）。
@@ -2900,10 +2911,141 @@ def note_peer_hit(room, conn, payload):
                 return
             note_mob_hit(room, target, hit_x, hit_y, create=True)
         _note_damage(room, botsync.handle_seat(target), damage)
+        _take_weapon_attribute(room, conn, botsync.handle_seat(target))
     seat_index = botsync.handle_seat(target)
     if seat_index is None:
         return
     _knock_back_seat(room, seat_index, damage, push, source=source)
+
+
+def _weapon_attribute(weapon):
+    """这把武器打中人会挂什么状态：`(角色属性号, 秒数)`；不挂就返回 `None`。
+
+    `weapon.ini` 的 `Attribute` **不是 `Status.ini` 的小节号** —— 中间隔着
+    exe `0x480f4a` 那张硬编码映射（`gameserver.BULLET_ATTRIBUTE_CHAR_ATTR`）。
+    时长取 `AttributeTime`（毫秒），它**覆盖** `Status.ini` 那一条的 `Time`
+    （`0x508e1f`：参数 > 0 就用参数）。
+
+    ★ **顺着 `SliceId` 往下找一层**：全表唯一带 `Attribute` 的是
+    `[ch03-02a]` 那只蝴蝶（id 1003520），而玩家手上拿的是母弹
+    `[ch03-02]`（1003020）——`rpChangeWeapon` 报的永远是母弹。
+    """
+    if weapon is None:
+        return None
+    for candidate in (weapon, weapondata.get(weapon.get("slice_id"))):
+        if candidate is None:
+            continue
+        key = candidate.get("attribute")
+        millis = candidate.get("attribute_ms")
+        if not key or not millis:
+            continue
+        attr = gameserver.BULLET_ATTRIBUTE_CHAR_ATTR.get(int(key))
+        if attr is None:
+            continue
+        return (attr, float(millis) / 1000.0)
+    return None
+
+
+def _take_weapon_attribute(room, conn, seat_index, now=None):
+    """真人这一发打中 bot，**武器自带的状态**要服务端自己记一份（X_Mod §31）。
+
+    挂上了返回 `True`。
+
+    ## 为什么非做不可，以及**为什么不像胶水那样广播**
+
+    施加侧 `0x47e0f7` / `0x47ef51`（`Projectile` 的碰撞与命中处理）**没有
+    `IsMine` 门** —— 「撞上了就给他挂个状态」是**每一台机器各自算**的，
+    不走任何包。所以 bot 在**每个玩家的客户端上本来就已经减速了**，
+    缺的只有服务端自己那份走速：下一发心跳（服务端算的，满速）当场把它
+    拽回去，屏幕上看起来就是「打中了 bot 但它照常速跑」。
+
+    ⇒ 和 `_step_on_slow_mine()` **正好是镜像**：胶水那一摊只对「踩上去的
+    那台机器的本地玩家」生效（bot 没有本机 ⇒ 没有一台会算），所以那边
+    必须补广播；这边是每台都算过了，**再广播一发 `0x040a` 就成了双份**，
+    而且 `Item.ini [Slowed]` 那条走 `Status.ini [14] Time=4.0`，
+    和武器写死的 2.1 秒对不上。**所以这里只压服务端的走速，不发包。**
+
+    ## 认得出「是哪把枪打的」吗
+
+    `rpExplode` / `rpSplashDamaged` 的 body 里**没有弹药 id**，所以只能问
+    「他手上拿的是哪把」（`conn.peer_weapon`，`rpChangeWeapon` 记的）。
+    两条已知偏差，都认下（不引入「按伤害数值猜是不是碎片」那种阈值判据，
+    铁律 10）：
+
+    * 母弹 `[ch03-02]` 直接命中也会被算成减速 —— 原版只有碎片会；
+    * 蝴蝶还在空中时玩家换了枪，这一发漏掉。
+    """
+    seat = (room.seats[seat_index]
+            if seat_index is not None and 0 <= seat_index < len(room.seats)
+            else None)
+    machine = None if seat is None else seat.conn
+    if not isinstance(machine, BotConn):
+        return False
+    found = _weapon_attribute(getattr(conn, "peer_weapon", None))
+    if found is None:
+        return False
+    attr, seconds = found
+    ratio = gameserver.CHAR_ATTR_SPEED_RATIO.get(attr)
+    if ratio is None:
+        # 会改走速的只有 14 减速；别的属性（中毒 / 冰冻 / 幽灵）今天**没有
+        # 任何一把武器带**，真出现了先留一行日志，别假装处理过。
+        machine.log(f"   ⚠ 被带属性 {attr} "
+                    f"（{gameserver.CHAR_ATTR_NAMES.get(attr, '?')}）的武器打中，"
+                    f"服务端这边还没有这个状态的模型，只当没有")
+        return False
+    when = _now() if now is None else now
+    until = when + seconds
+    was = machine.slowed_until
+    if was is not None and was >= until:
+        return True                       # 已经慢着，而且慢得更久
+    machine.slowed_until = until
+    if was is None or was <= when:
+        # ★ 按**状态翻转**打日志（铁律 10）：慢着的时候被再打一发只是续期。
+        weapon = getattr(conn, "peer_weapon", None)
+        machine.log(f"   被带属性的武器打中"
+                    f"（{'?' if weapon is None else weapon.get('section', '?')}）："
+                    f"{gameserver.CHAR_ATTR_NAMES.get(attr, attr)} "
+                    f"走速 × {ratio}，{seconds:g} 秒"
+                    f"（武器自带，不广播 —— 每台客户端自己已经挂上了）")
+    return True
+
+
+def note_create_totem(room, parsed):
+    """真人放下了一座**回血图腾**（`0x001b rpCreateTotem`，X_Mod §32）。
+
+    `parsed` 是 `botsync.parse_create_totem()` 的 `(座位, 队伍号, 弹药id, x, y)`。
+
+    ## 服务端为什么要记这一笔
+
+    回血整条都在客户端本地：`0x488395` 那个循环读 HP、`0x488612` 算量、
+    `0x488432` `SetHp`，**一个发包调用都没有** ⇒ bot 站进去，每台客户端
+    上它本来就会回血。但**「bot 死没死」只认服务端那本台账**
+    （`bothp.Ledger`）—— 服务端不跟着回，就会出现「别人屏幕上血满着、
+    服务端判它死了」。而且 bot 要不要专门跑一趟，也得先知道图腾在哪。
+
+    ## 队伍号是**碰撞排除组**，不是 `Seat.team`
+
+    客户端比的是 `[图腾+0x15c]` vs `[角色+0x15c]`（`0x488370`），而那一格
+    就是 §63 那个碰撞排除组：组队 / 闯关是队伍号，**个人战是座位 + 1**。
+    ⇒ 个人战里只有放的人自己吃得到，这是原版行为，不是我们加的限制。
+    服务端这边用同一个口径（`_seat_group()`），两边必然一致。
+    """
+    quest = room.quest
+    if quest is None:
+        return
+    seat_index, group, ammo, x, y = parsed
+    totem = weapondata.get(ammo)
+    if totem is None or not totem.get("totem_range"):
+        # 不认得的图腾（原版只有爱琳这一种）—— 记了也没有半径可判，不如不记。
+        return
+    quest.totems.append([float(x), float(y), int(seat_index), int(group),
+                         int(ammo), _now(), {}])
+    asynclog.emit(f"[{gameserver.ts()}] [bot] {seat_index} 号位放下回血图腾 "
+                  f"@ ({x:.0f}, {y:.0f})：组 {group}、半径 "
+                  f"{totem.get('totem_range')}、活 "
+                  f"{totem.get('totem_life_ms')} ms、每 "
+                  f"{totem.get('totem_interval_ms')} ms 回 "
+                  f"{totem.get('totem_value')} 点")
 
 
 def _note_no_knockback(room, seat_index, shooter, source, damage, bx, by):
@@ -3735,6 +3877,126 @@ def _step_on_slow_mine(room, machine, seat_index, now):
     return False
 
 
+#: ★ `TotemValueMaxModeRatio` 只在这个游戏模式里生效（`0x488631 cmp eax, 3`
+#: —— `0x409e0a` 返回的模式号）。3 就是**夺分**，和 `BOT_LONG_SHOT_MODES` /
+#: `_damage_scale()` 认的是同一个数，但那两条是伤害侧的事，别混用。
+TOTEM_MAX_MODE = 3
+
+#: 图腾那几格在产物里的键名 -> 缺省值。缺省值只在「产物是老版本」时兜底，
+#: 正常情况下 `bot_weapons.json`（`format` >= 13）里六格全有。
+_TOTEM_DEFAULTS = {
+    "totem_type": 1,
+    "totem_range": 0.0,
+    "totem_value": 0,
+    "totem_life_ms": 0,
+    "totem_interval_ms": 0,
+    "totem_mode_ratio": 1.0,
+}
+
+
+def _totem_spec(ammo):
+    """一座图腾的参数：`{totem_*}`；不认得这个弹药 id 就返回 `None`。"""
+    weapon = weapondata.get(ammo)
+    if weapon is None:
+        return None
+    spec = {key: weapon.get(key, fallback)
+            for key, fallback in _TOTEM_DEFAULTS.items()}
+    if not spec["totem_range"] or not spec["totem_life_ms"]:
+        return None
+    return spec
+
+
+def _live_totems(quest, now):
+    """此刻**还在场上**的回血图腾（X_Mod §32）。到期的当场从表里摘掉。
+
+    到期不走任何包：每台机器收到 `rpCreateTotem` 的那一帧各自起表，
+    `TotemLifeTime / 32` 个 tick 之后各自销毁（`0x487fc6`）。服务端跟着
+    同一个数自己数就行 —— 和 `_live_slow_mines()` 摘胶水是同一个形状。
+    """
+    totems = getattr(quest, "totems", None)
+    if not totems:
+        return ()
+    live = []
+    for totem in list(totems):
+        spec = _totem_spec(totem[4])
+        if spec is None:
+            totems.remove(totem)
+            continue
+        if now - totem[5] >= spec["totem_life_ms"] / 1000.0:
+            totems.remove(totem)              # 5 秒到了，那座没了
+            continue
+        live.append((totem, spec))
+    return live
+
+
+def _totem_heals(room, seat_index, totem, spec):
+    """这座图腾治不治 `seat_index`（X_Mod §32）。
+
+    判据抄客户端 `0x488364`~`0x488376`：`TotemType == 1` 时要求
+    **碰撞排除组相同**（`[图腾+0x15c] == [角色+0x15c]`）。那一格在组队 /
+    闯关房是队伍号、个人战是座位 + 1（§63）⇒ 个人战里只有放的人自己吃得到。
+    服务端用同一个 `_seat_group()`，两边必然一致。
+
+    ★ `TotemType` 只有 1 有原版数据（爱琳那座就是 1）。别的取值 exe 里
+      虽然有分支，但没有任何一条数据走得到 —— 不猜，一律当「不治」。
+    """
+    if spec["totem_type"] != 1:
+        return False
+    return _seat_group(room, seat_index) == totem[3]
+
+
+def _stand_in_heal_totem(room, machine, seat_index, now):
+    """bot 站在同队回血图腾的圈里就回血（X_Mod §32）。回了返回 `True`。
+
+    ## 为什么服务端也得记这一笔
+
+    回血整条都在客户端本地（`0x488395` 读 HP -> `0x488612` 算量 ->
+    `0x488432` `SetHp`，**一个发包调用都没有**）⇒ bot 站进去，每台客户端
+    上它的血条本来就会涨。但**「bot 死没死」只认服务端那本台账**
+    （`bothp.Ledger`，`_lying_dead()` / `_stance()` 读的都是它）——
+    这边不跟着回，就会出现「别人屏幕上血满着、服务端判它死了」，
+    而且 bot 自己会一直以为残血、一直往回跑。
+
+    ## 节奏和数值都是原版的
+
+    * 判进没进圈：`圆心距 <= TotemRange`（`0x488329`~`0x488359`：
+      `sqrt(dx² + dy²)` 和 `fild [图腾+0x2ac]` 比）。取的是角色的位置向量
+      （`vft+0x74`），不是碰撞圆 —— 所以这里也用 `body` 那一个点。
+    * 多久一跳：`TotemProofTime`（840 ms），账按**这座图腾 × 这个人**记，
+      和 `0x4883c7` 同口径。
+    * 一跳回多少：`TotemValue`（3）；**夺分模式**（游戏模式 3）再乘
+      `TotemValueMaxModeRatio`（1.35），取整（`0x488631` 的 `cmp eax, 3`
+      + `0x488639` 的 `fmul`）。和 `_damage_scale()` 认的是同一个模式号。
+
+    ★ 这不是我们挑的定时器（铁律 10）：`Interval` 照抄原版节奏，
+      和 `_advance_hp_charges()` 抄 `Status.ini[8] Interval=1.0` 是同一档。
+    """
+    quest = room.quest
+    body = machine.body
+    ledger = _health(room)
+    if quest is None or body is None or ledger is None:
+        return False
+    healed = False
+    for totem, spec in _live_totems(quest, now):
+        if not _totem_heals(room, seat_index, totem, spec):
+            continue
+        if math.hypot(totem[0] - body.x, totem[1] - body.y) > spec["totem_range"]:
+            continue
+        last = totem[6].get(seat_index)
+        if last is not None and now - last < spec["totem_interval_ms"] / 1000.0:
+            continue
+        amount = spec["totem_value"]
+        if _pvp_game_mode(room) == TOTEM_MAX_MODE:
+            amount = int(amount * spec["totem_mode_ratio"])
+        totem[6][seat_index] = now
+        ledger.note_heal(seat_index, amount)
+        machine.log(f"   站在回血图腾里 @ ({totem[0]:.0f}, {totem[1]:.0f})："
+                    f"回 {amount} 点，现在 "
+                    f"{_seat_health(room, seat_index) * 100:.0f}%")
+        healed = True
+    return healed
+
+
 def _take_freeze(room, machine, seat_index, now):
     """别人放的冰冻把 bot 冻住（V0.3 §106）。冻上了返回 `True`。
 
@@ -3923,6 +4185,55 @@ def _item_goal_row(room, machine, seat_index):
             continue                      # 半张图外的东西不值得专门跑一趟
         if best is None or span < best[0]:
             best = (span, (float(spot[0]), float(spot[1])), handle)
+    return best
+
+
+#: ★★★ 血量低于这个比例才值得专门跑一趟回血图腾。
+#: **出处是用户 2026-09-18**：「如果自己血量低于 90%，并且视野范围内有回血
+#: 图腾，则主动尝试靠近图腾给自己回血」。和 `BOT_LOW_HEALTH` /
+#: `BOT_HIGH_HEALTH` 一样，这个数没有原版出处，觉得不对就改这里。
+BOT_TOTEM_HEALTH = 0.90
+
+
+def _totem_goal(room, machine, seat_index):
+    """要不要专门跑一趟回血图腾：`(距离, 坐标)`；不用跑就返回 `None`。
+
+    三道门，缺一不可：
+
+    1. **血量 < `BOT_TOTEM_HEALTH`**（用户给的 90%）；
+    2. 图腾**还活着、治我这一队**（`_live_totems` + `_totem_heals`）、
+       而且**在视野框里**（`_in_sight`，和「看得见敌人」同一把尺子）；
+    3. ★ **自己还在圈外**。已经站进去了就不再干预走位 —— 用户要的是
+       「回血期间也不要傻站着」，而 `_walk_to()` 到了目标点返回的恰恰是
+       「不动」。进了圈就把这一格交还给原来那条链（打得到就 `_shoot_move`
+       边打边动、打不到就照旧朝敌人挪），血照回。
+
+    ★ 走过去这件事本身仍然由 `botnav` 的真实物理决定（够不着的高台上那座
+      自然规划不出路线，也就不去了）—— 和 `_item_goal()` 同一个路数。
+
+    ★★ 不会变成「没有出口的停机状态」（§175 / §176 那个四个 bot 卡住
+      130~160 秒的教训）：图腾自己 `TotemLifeTime`（5 秒）就没了，目标必然
+      消失；血涨过 90% 也退出。两个出口都是**事实**，不是定时器。
+    """
+    body = machine.body
+    quest = None if room is None else room.quest
+    if quest is None or body is None:
+        return None
+    if not getattr(quest, "totems", None):
+        return None
+    if _seat_health(room, seat_index) >= BOT_TOTEM_HEALTH:
+        return None
+    best = None
+    for totem, spec in _live_totems(quest, _now()):
+        if not _totem_heals(room, seat_index, totem, spec):
+            continue
+        if not _in_sight(machine, totem[0], totem[1]):
+            continue
+        span = math.hypot(totem[0] - body.x, totem[1] - body.y)
+        if span <= spec["totem_range"]:
+            return None                   # 已经在圈里：这一格不干预走位
+        if best is None or span < best[0]:
+            best = (span, (float(totem[0]), float(totem[1])))
     return best
 
 
@@ -5240,6 +5551,31 @@ def _move_intent(room, machine, seat_index, terrain, target, now=None):
                                       target)
     if breaking is not None:
         return _src(machine, "破障", breaking)
+    # ★★★★ **血不够就去蹭队友的回血图腾**（用户 2026-09-18，X_Mod §32）。
+    #   三道门全在 `_totem_goal()` 里：血 < 90%、图腾活着且治我这一队且在
+    #   视野框内、**而且自己还在圈外**。
+    #
+    #   ★ 排在这个位置，三件事是**结构上保证**的，不靠约定：
+    #     ① **不打断躲子弹 / 脱困 / 牵引绳** —— 那三条都在上面，先命中先返回；
+    #     ② **不打断开枪** —— 走位和开火在 `_tick_bot` 里是分开的两段
+    #        （第 8/9 步 vs 第 13/14 步），开火只吃 `machine.aim` 和冷却，
+    #        这里一个字都没碰；
+    #     ③ **闯关房和「视野里没敌人」也生效** —— 下面那两支（`_coop_intent`
+    #        / `_blind_intent`）都在这一条后面，用不着各挂一份。
+    #
+    #   ★ 按着右键跑：图腾只活 5 秒（`TotemLifeTime`），走过去的那一段
+    #     值得花体力。`_may_fast_run()` 是原版 `FastRunRate` 的开关，
+    #     不是我们加的动作。
+    #   ★ `_unstall` 的 `target` 传 `None`（和「拉开距离」那条一样）：
+    #     那个参数的含义是「打得到人了就别再挪」，而这一条**恰恰要边打边走**。
+    totem = _totem_goal(room, machine, seat_index)
+    if totem is not None:
+        goal = totem[1]
+        return _src(machine, "去回血图腾",
+                    _unstall(room, machine, terrain, goal,
+                             _walk_to(room, machine, terrain, goal,
+                                      _may_fast_run(machine)),
+                             None), goal=goal)
     # ★★★ 闯关房（M5-G）：那儿没有「敌方座位」，走位的目标是**跟上队伍**。
     if coop:
         intent = _coop_intent(room, machine, seat_index, terrain, target)
@@ -10083,6 +10419,10 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
     #   冰冻圈里要真的动不了（§106）。
     _step_on_slow_mine(room, machine, seat_index, now)
     _take_freeze(room, machine, seat_index, now)
+    # ★ 队友放的回血图腾（X_Mod §32）：站在圈里就回血。和上面两条同一档
+    #   ——「此刻站在哪」是位置决定的事实，逐格问一次；场上没有图腾时
+    #   `quest.totems` 恒空，等于没开销。
+    _stand_in_heal_totem(room, machine, seat_index, now)
 
     # ★★ 「同一帧」的缓存键（`_dodge_intent` / `nav_planned_at` 拿它去重）。
     #    一「帧」= 一发心跳的那 4 格 —— 就是 D106 之前真人心跳的那个节奏，

@@ -2829,6 +2829,120 @@ static int try_patch_reflect_visual(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* 索引缓冲 patch —— Lock() 失败时别往 NULL 里写（§35 / D25）                  */
+/*                                                                            */
+/*   原版重建精灵批的索引缓冲，一路不看返回值：                                */
+/*                                                                            */
+/*     0x5bf6b7  call [edx+0x6c]     CreateIndexBuffer(0xc00, WRITEONLY,      */
+/*                                   INDEX16, D3DPOOL_DEFAULT)                */
+/*     0x5bf6c7  mov  [ebp+0x58],esi ppbData = NULL                           */
+/*     0x5bf6cd  call [ecx+0x2c]     IDirect3DIndexBuffer9::Lock  ← HRESULT   */
+/*                                   只存进 [ebp+0x54] 当函数返回值，填充之前  */
+/*                                   一眼都没看                                */
+/*     0x5bf6d9  循环 256 次，每次 memcpy 12 字节到 [ebp+0x58]+[ebp+0x60]      */
+/*                                                                            */
+/*   Lock 失败时 [ebp+0x58] 还是 NULL ⇒ memcpy(NULL, 栈, 12) ⇒ C0000005。     */
+/*   DEFAULT 池 + 设备丢失（独占全屏被抢焦点）必触发，2026-09-18 线上崩过一份。*/
+/*                                                                            */
+/*   ★ 为什么要跳板：0x5bf6d0 起只有 9 字节，三条指令一条都省不掉             */
+/*     （[ebp+0x54] 是函数返回值，[ebp+0x5c]/[ebp+0x60] 是循环计数），         */
+/*     加 cmp+jcc 还差 6 字节；而 0x44c000~0x452000 那一带连一个 int3 填充洞   */
+/*     都没有（§33，exe 加过壳 VirtualSize==RawSize）。⇒ VirtualAlloc 一块     */
+/*     RWX，把偷来的三条指令 + 判据放进去，站点写 E9 跳过去。                  */
+/*                                                                            */
+/*   指针为 NULL 时跳到 0x5bf73f（Unlock **之后**）：压根没锁上，就不该解锁。  */
+/*   代价是这一次索引缓冲没填好 —— 但原版在这条路上是直接崩，没得比。         */
+/* -------------------------------------------------------------------------- */
+#define D3D_IB_SIG_VA      0x005BF6C7u
+#define D3D_IB_PATCH_OFF   9                  /* 站点 = 0x005BF6D0 */
+#define D3D_IB_PATCH_LEN   9                  /* E9 rel32 + 4 个 NOP */
+#define D3D_IB_RESUME_VA   0x005BF6D9u        /* 指针有效 → 回填充循环的头 */
+#define D3D_IB_BAIL_VA     0x005BF73Fu        /* 指针为 NULL → Unlock 之后那一句 */
+
+static const unsigned char D3D_IB_SIG[28] = {
+    0x89,0x75,0x58,            /* mov  [ebp+0x58], esi     ppbData = NULL     */
+    0x8B,0x08,                 /* mov  ecx,[eax]                              */
+    0x50,                      /* push eax                                    */
+    0xFF,0x51,0x2C,            /* call [ecx+0x2c]          Lock               */
+    0x89,0x45,0x54,            /* mov  [ebp+0x54], eax   ┐                    */
+    0x89,0x75,0x5C,            /* mov  [ebp+0x5c], esi   ├ 偷走这 9 字节      */
+    0x89,0x75,0x60,            /* mov  [ebp+0x60], esi   ┘                    */
+    0x8B,0x45,0x5C,            /* mov  eax,[ebp+0x5c]      填充循环的头        */
+    0x33,0xC9,                 /* xor  ecx,ecx                                */
+    0x66,0x89,0x75,0x68,       /* mov  [ebp+0x68], si                         */
+    0x66                       /* （下一条的头一个字节，凑够唯一）            */
+};
+
+/* 代码洞的模板。两条 E9 的 rel32 在装的时候按洞的实际地址现算。 */
+static const unsigned char D3D_IB_CAVE[25] = {
+    0x89,0x45,0x54,            /* +0   mov [ebp+0x54], eax   ┐ 偷来的三条     */
+    0x89,0x75,0x5C,            /* +3   mov [ebp+0x5c], esi   ├ 原样先跑       */
+    0x89,0x75,0x60,            /* +6   mov [ebp+0x60], esi   ┘               */
+    0x83,0x7D,0x58,0x00,       /* +9   cmp dword [ebp+0x58], 0  ← Lock 填的   */
+    0x75,0x05,                 /* +13  jne +5 → +20（指针有效，走原路）      */
+    0xE9,0,0,0,0,              /* +15  jmp D3D_IB_BAIL_VA                     */
+    0xE9,0,0,0,0               /* +20  jmp D3D_IB_RESUME_VA                   */
+};
+#define D3D_IB_CAVE_BAIL_OFF    16            /* 上面两个 rel32 在洞里的偏移 */
+#define D3D_IB_CAVE_RESUME_OFF  21
+
+static volatile LONG g_d3d_ib_patched = 0;
+
+static int try_patch_d3d_ib_lock(void)
+{
+    unsigned char *base = (unsigned char *)D3D_IB_SIG_VA;
+    unsigned char *p = base + D3D_IB_PATCH_OFF;
+    unsigned char *cave;
+    unsigned char site[D3D_IB_PATCH_LEN];
+    DWORD oldp;
+
+    if (g_d3d_ib_patched) return 1;
+    if (IsBadReadPtr(base, sizeof(D3D_IB_SIG))) return 0;
+    if (p[0] == 0xE9) {                         /* 已经跳出去了 = 装过了 */
+        InterlockedExchange(&g_d3d_ib_patched, 1);
+        return 1;
+    }
+    if (memcmp(base, D3D_IB_SIG, sizeof(D3D_IB_SIG)) != 0)
+        return 0;                               /* 还没解壳，或并非已确认的客户端版本 */
+
+    cave = (unsigned char *)VirtualAlloc(NULL, sizeof(D3D_IB_CAVE),
+                                         MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE);
+    if (!cave) {
+        bslog("PATCH   索引缓冲空指针判据: VirtualAlloc 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    memcpy(cave, D3D_IB_CAVE, sizeof(D3D_IB_CAVE));
+    /* E9 的 rel32 = 目标 − 本条指令的下一字节 */
+    *(DWORD *)(cave + D3D_IB_CAVE_BAIL_OFF) =
+        (DWORD)(D3D_IB_BAIL_VA - (UINT_PTR)(cave + D3D_IB_CAVE_BAIL_OFF + 4));
+    *(DWORD *)(cave + D3D_IB_CAVE_RESUME_OFF) =
+        (DWORD)(D3D_IB_RESUME_VA - (UINT_PTR)(cave + D3D_IB_CAVE_RESUME_OFF + 4));
+
+    site[0] = 0xE9;
+    *(DWORD *)(site + 1) = (DWORD)((UINT_PTR)cave - ((UINT_PTR)p + 5));
+    memset(site + 5, 0x90, D3D_IB_PATCH_LEN - 5);
+
+    if (!VirtualProtect(p, D3D_IB_PATCH_LEN, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   索引缓冲空指针判据: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        VirtualFree(cave, 0, MEM_RELEASE);
+        return 0;
+    }
+    memcpy(p, site, D3D_IB_PATCH_LEN);
+    VirtualProtect(p, D3D_IB_PATCH_LEN, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, D3D_IB_PATCH_LEN);
+    FlushInstructionCache(GetCurrentProcess(), cave, sizeof(D3D_IB_CAVE));
+    InterlockedExchange(&g_d3d_ib_patched, 1);
+    bslog("PATCH   ★索引缓冲空指针判据 @ %08X: 跳板 @ %08X，"
+          "Lock() 没给出指针就不填（原版直接 memcpy 到 NULL）",
+          (unsigned)(D3D_IB_SIG_VA + D3D_IB_PATCH_OFF),
+          (unsigned)(UINT_PTR)cave);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* 地图等级门槛 patch —— 选图 / 开局都不再看 MinLevel（§221 / D142）           */
 /*                                                                            */
 /*   等级门槛有两道，不在同一处：                                              */
@@ -7319,34 +7433,72 @@ static int try_patch_region_lock(void)
 /*   了），中国版原来只声明 24 帧 —— 不补就**一进大厅必崩**                    */
 /*   C0000005 @ 0x430857。守卫在 `tools/mkchar.py --audit` 第 ⑦ 条。          */
 /*                                                                            */
-/*   ── 六道闸，少打一道就少一个面板 ──                                       */
+/*   ── 五道闸，少打一道就少一个面板 ──                                       */
 /*                                                                            */
 /*   客户端有**三条互相独立**的「可选角色」代码路径，每条都自带一个 0..2 的    */
 /*   基础角色循环：                                                            */
-/*       大厅左侧「人物选择」面板   0x44c8xx  循环上界 0x44caaf               */
+/*       商店顶部的角色行            0x44c6e1  循环上界 0x44caaf   ★ 故意不打 */
 /*       房间右下 6 格分页          0x4072c0  循环上界 0x407383               */
 /*       战斗内换人条               0x407168  循环上界 0x40724f               */
-/*   再加上「按钮总数」`0x40713a` 结尾的 `lea eax,[edi+3]`、战斗内那条循环里   */
-/*   **显式跳过 id 3** 的 `0x4f58f4`，以及持有判定 `0x55853c` 的               */
-/*   `cmp eax,3`（id<3 恒真 = 白送）。                                         */
+/*   再加上「按钮总数」`0x40713a` 结尾的 `lea eax,[edi+3]`（它的唯一调用者是   */
+/*   战斗换人条 `0x4f58b4`）、战斗内那条循环里**显式跳过 id 3** 的            */
+/*   `0x4f58f4`，以及持有判定 `0x55853c` 的 `cmp eax,3`（id<3 恒真 = 白送）。 */
 /*                                                                            */
 /*   ⚠ 少打一道**不会崩**（`0x4f58dc` 的 `cmp ecx,-1 / je` 兜住越界下标），    */
-/*   症状是「某个面板里就是没有她」—— 所以要么六道全打上，要么一道都别打。     */
+/*   症状是「某个面板里就是没有她」。                                          */
+/*                                                                            */
+/*   ── ★★★ 商店那条**故意留在 0..2**（用户 2026-09-18 拍板）──              */
+/*                                                                            */
+/*   `0x44caaf` 那个循环**不是大厅**（2026-09-18 查实，旧注释标错了）：它在    */
+/*   `UiShopChrSelPanel::Init`（`0x44c6e1`）里，而那个类**只由 `ShopStage`     */
+/*   构造一次**（ctor `0x44c5de` 的唯一调用者是 `0x443cd4`，Init 的唯一调用者  */
+/*   是 `0x443cf1`，两处都在 `ShopStage` ctor `0x443bcc` 里，vft `0x666164`）。*/
+/*   也就是**商店 / 合成 / 仓库那个界面顶部的那排角色按钮**。                  */
+/*                                                                            */
+/*   打开它会踩到一个**画错人**的 bug：商店左侧的模型池                        */
+/*   `UiShopKartPanel+0x118` **只有 3 格**（创建循环 `0x44dcb4 cmp …,3`），    */
+/*   而绘制 `0x44e944 mov edi,[esi+ecx*4+0x118]` **一道边界检查都没有**        */
+/*   （同一个类里另外三个按 id 取模型的入口 `0x44e89e` / `0x44e8be` /          */
+/*   `0x44e8dc` 全都有 `cmp eax,3 / jge`，唯独绘制这条没有）。id 3 于是越界读  */
+/*   到紧挨着的商城角色数组第 0 格 `+0x124` = ChrIndex 100 **艾丽亚丝** ——     */
+/*   线上玩家报的「商店里爱琳变成艾丽亚丝」就是这个。                          */
+/*                                                                            */
+/*   修不了：对象总大小 `0x16c` 已排满（`+0xd4` 14 格购物车、`+0x10c/0x110/`   */
+/*   `0x114` 三个子对象、`+0x118` 3 格、`+0x124` 11 格商城角色、`+0x150` 指针、*/
+/*   `+0x154` 子对象），**没有空成员可扩**；11 个商城槽对 11 个商城角色，      */
+/*   一格都腾不出来；`0x44c000~0x452000` 里连一个 `int3` 填充洞都没有          */
+/*   （这个 exe 加过壳，节表 VirtualSize == RawSize）。要画对只能给注入 DLL    */
+/*   加一套 detour ——**用户选择不做**，改成「商店里干脆不出现第 4 个角色」。   */
+/*                                                                            */
+/*   代价是零：爱琳在商店里**本来也什么都做不了** —— 穿装备那三条路            */
+/*   （`0x44e89e` / `0x44e8be` / `0x44e8dc`）和 `Equipment::Equip` `0x5583d3` /*/
+/*   `IsSlotUsed` `0x558501` 全都 `cmp …,3 / jge` 直接丢弃 id 3，而货架按       */
+/*   `usable_by()` 过滤后只剩「不限角色」那几件。**选角色打游戏走的是房间      */
+/*   6 格面板和战斗换人条，和这条路无关**，一点都没动。                        */
 /*                                                                            */
 /*   ── 4 级门一并解除（★ 2026-09-17 起，无条件；D2 改口径）──                */
 /*                                                                            */
 /*   `0x44c954` / `0x44cc07` / `0x467eb1` 三处 `cmp [0x72e338], 4` 是原版      */
-/*   「4 级起可用爱琳」的判据，现在**和上面六处一起、默认就打掉** ——          */
+/*   「4 级起可用爱琳」的判据，现在**和上面五处一起、默认就打掉** ——          */
 /*   爱琳从 1 级起就能选。★ **没有开关**：用户 2026-09-17 明确「去掉就是      */
 /*   固定去掉，不要搞选项」，所以别再给它加环境变量。                          */
 /*                                                                            */
-/*   设 BSHOOK_KEEP_IRENE_LOCK=1 保留原版（爱琳在三个面板里都不出现）——       */
-/*   那是「整个角色回到原版」的总开关，九处一起不打，不是 4 级门的选项。      */
+/*   ⚠ 2026-09-18 起，前两处（`0x44c954` / `0x44cc07`）**都在商店那个面板里**，*/
+/*   而商店的角色行已经不再枚举 id 3 ⇒ 这两处现在是**打了也走不到的死补丁**。 */
+/*   留着不删：零风险，而且哪天要把爱琳放回商店时它们还得在。真正起作用的      */
+/*   只剩房间面板那一处 `0x467eb1`。                                           */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_IRENE_LOCK=1 保留原版（爱琳在房间 6 格和战斗换人条里都不  */
+/*   出现）—— 那是「整个角色回到原版」的总开关，八处一起不打，               */
+/*   不是 4 级门的选项。                                                       */
 /* -------------------------------------------------------------------------- */
-#define IRENE_PATCH_COUNT 6
+#define IRENE_PATCH_COUNT 5
 /* 字段含义和 REGION_SITES 一样：特征串起始 VA / 长度 / 要改的字节在串里的偏移
    / 改几个字节 / 原始字节 / 替换字节 / 说明。
-   ★ 六条特征串都在 `re/BigShot_22524.img` 上验过**各自唯一**（各命中 1 次）。*/
+   ★ 五条特征串都在 `re/BigShot_22524.img` 上验过**各自唯一**（各命中 1 次）。
+   ★ 商店角色行那一条（原来的第 2 条，`0x0044CA9E` / `83 7D 10 03` -> `04`）
+     2026-09-18 **撤掉了**，理由见上面那一大段。要把爱琳放回商店的话，
+     把它加回来就行 —— 但记得那个画错人的 bug 会一起回来。 */
 static const struct {
     unsigned int va;
     unsigned int len;
@@ -7361,12 +7513,6 @@ static const struct {
                              "\x83\xF8\x03\x7D\x03\xB0",
       (const unsigned char *)"\x83\xF8\x04",
       "持有判定 0x55853c：id<3 恒真 -> id<4（爱琳白送，不走角色卡）" },
-    { 0x0044CA9Eu, 24, 17, 4,
-      (const unsigned char *)"\x8D\x8B\xE0\x00\x00\x00\x8D\x45\xE4\xE8"
-                             "\x05\x03\x00\x00\xFF\x45\x10\x83\x7D\x10"
-                             "\x03\x0F\x8C\x71",
-      (const unsigned char *)"\x83\x7D\x10\x04",
-      "大厅「人物选择」面板的基础角色循环 0..2 -> 0..3" },
     { 0x00407376u, 20, 13, 3,
       (const unsigned char *)"\xE8\xC4\x18\x00\x00\x8B\xC8\xE8\xBD\x77"
                              "\x1C\x00\x46\x83\xFE\x03\x7C\xC9\x83\x65",
@@ -7390,7 +7536,7 @@ static const struct {
 };
 static volatile LONG g_irene_patched = 0;
 
-/* 三处 4 级门。★ 和上面六处一样**默认就打**，没有开关（D2，2026-09-17 改口径）。 */
+/* 三处 4 级门。★ 和上面五处一样**默认就打**，没有开关（D2，2026-09-17 改口径）。 */
 #define IRENE_LVL_SITE_COUNT 3
 static const struct {
     unsigned int va;
@@ -7405,12 +7551,12 @@ static const struct {
       (const unsigned char *)"\x83\x3D\x38\xE3\x72\x00\x04"
                              "\x0F\x8C\x52\x01\x00\x00",
       (const unsigned char *)"\x90\x90\x90\x90\x90\x90",
-      "大厅面板：等级 <4 就不给爱琳建按钮" },
+      "商店面板：等级 <4 就不给爱琳建按钮（★ 商店已不枚举 id 3，现成死补丁）" },
     { 0x0044CC00u, 13, 7, 6,
       (const unsigned char *)"\x83\x3D\x38\xE3\x72\x00\x04"
                              "\x0F\x8D\x85\x00\x00\x00",
       (const unsigned char *)"\xE9\x86\x00\x00\x00\x90",
-      "大厅面板点击：等级 <4 弹提示并拒绝" },
+      "商店面板点击：等级 <4 弹提示并拒绝（★ 同上，现成死补丁）" },
     { 0x00467EAAu, 13, 7, 6,
       (const unsigned char *)"\x83\x3D\x38\xE3\x72\x00\x04"
                              "\x0F\x8D\x08\x01\x00\x00",
@@ -7426,7 +7572,7 @@ static int irene_lock_kept(void)
     return (n > 0 && n < sizeof(buf) && buf[0] != '0');
 }
 
-/* 返回 1 表示六处全都已就位（本轮打的或之前就打过）。 */
+/* 返回 1 表示五处全都已就位（本轮打的或之前就打过）。 */
 static int try_patch_irene_unlock(void)
 {
     int i, done = 0;
@@ -8275,12 +8421,12 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "的特征串一直对不上）");
     }
 
-    /* 爱琳（ChrIndex=3）解锁 —— **时机完全不急**：六处全在 UI 代码里，
+    /* 爱琳（ChrIndex=3）解锁 —— **时机完全不急**：五处全在 UI 代码里，
        最早也要等玩家进大厅才第一次执行，远晚于解壳窗口。
        不像 0x40b419 那样有「必须赶在 map.ini 加载之前」的时限。 */
     if (irene_lock_kept()) {
         bslog("PATCH   BSHOOK_KEEP_IRENE_LOCK 已设，保留原版："
-              "爱琳(id 3)在大厅 / 房间 / 战斗内三个面板里都不出现");
+              "爱琳(id 3)在房间 6 格和战斗换人条里都不出现");
     } else {
         for (ticks = 0; !g_stop && !g_irene_patched && ticks < 2000; ticks++) {
             if (try_patch_irene_unlock()) break;
@@ -8288,7 +8434,7 @@ static DWORD WINAPI patch_thread(LPVOID param)
         }
         if (!g_irene_patched)
             bslog("PATCH   !! 超时未能 patch 爱琳解锁"
-                  "（0x55853c / 0x44caaf / 0x407383 / 0x40724f / 0x407160 / "
+                  "（0x55853c / 0x407383 / 0x40724f / 0x407160 / "
                   "0x4f58f4 的特征串一直对不上）");
         /* 4 级门：★ 无条件解除，爱琳从 1 级起就能选（D2，2026-09-17 改口径）。 */
         for (ticks = 0; !g_stop && !g_irene_lvl_patched && ticks < 2000; ticks++) {
@@ -8338,6 +8484,16 @@ static DWORD WINAPI patch_thread(LPVOID param)
     if (!g_reflect_visual_patched)
         bslog("PATCH   !! 超时未能 patch 反射道具视觉"
               "（0x5090e2 的特征串一直对不上）");
+
+    /* 索引缓冲的空指针判据（§35 / D25）：不赶时机 —— 站点只有设备**重建**时
+       才跑，第一次是启动时建渲染器，之后要等设备丢失后 Reset，都远晚于解壳。 */
+    for (ticks = 0; !g_stop && !g_d3d_ib_patched && ticks < 2000; ticks++) {
+        if (try_patch_d3d_ib_lock()) break;
+        Sleep(2);
+    }
+    if (!g_d3d_ib_patched)
+        bslog("PATCH   !! 超时未能 patch 索引缓冲空指针判据"
+              "（0x5bf6c7 的特征串一直对不上）—— 设备丢失时仍可能崩在 memcpy");
 
     /* 地图等级门槛（D142）：不赶时机 —— 0x40b5d0 第一次跑要到进房选图，
        远晚于 +2.5s 的解壳窗口。 */

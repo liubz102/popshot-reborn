@@ -25,7 +25,10 @@ for _path in (HERE, SERVER):
 
 import account_store                                           # noqa: E402
 import bot                                                     # noqa: E402
+import botmove                                                 # noqa: E402
+import botsync                                                 # noqa: E402
 import gameserver                                              # noqa: E402
+import weapondata                                              # noqa: E402
 from gameserver import (                                       # noqa: E402
     OP_BROADCAST_DEATH, OP_CHANGE_CONTROLLER_SLOT, OP_CHAT,
     OP_COUNT_GAME_READY, OP_END_GAME, OP_END_QUEST, OP_LEAVE_SESSION,
@@ -46,6 +49,7 @@ from test_battle import (                                      # noqa: E402
     BattleRoom, bodies, hp_zero_payload, opcodes,
 )
 from test_relayserver import udp_packet                        # noqa: E402
+from test_botcombat import flat_terrain                        # noqa: E402
 
 #: 组队战 / 个人战 / 闯关三种房间的建房参数（`lobby.team_layout_of` 的三条路）。
 TEAMS_ROOM = dict(session_type=1, arguments=(1, 3, 0))
@@ -1030,6 +1034,267 @@ class BotPeerRelayTests(BotBattleRoom):
         """
         gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
         self.assertTrue(self.alice.peer_relay_on)
+
+
+#: 爱琳 2 号武器（母弹）和它炸出来的蝴蝶；蝴蝶带 `Attribute=4 / 2100 ms`。
+IRENE_BOMB = 1003020
+IRENE_SPLINTER = 1003520
+#: 爱琳 3 号武器放下的那座回血图腾。
+IRENE_TOTEM = 1003031
+
+
+def explode_payload(target_handle, damage=12.0, x=10.0, y=20.0):
+    """一发真人打过来的 `0x0003 rpExplode`（28 字节 body，packet_api §5.3）。"""
+    return udp_packet(inner=botsync.OP_EXPLODE,
+                      body=struct.pack("<iiffiif", 1, target_handle,
+                                       x, y, 0, 0, damage))
+
+
+def totem_payload(seat, group, x, y, ammo=IRENE_TOTEM):
+    """一发 `0x001b rpCreateTotem`（22 字节 body，X_Mod §32）。"""
+    return udp_packet(inner=botsync.OP_CREATE_TOTEM,
+                      body=struct.pack("<BBifffi", seat, group, ammo,
+                                       x, y, 0.0, 0))
+
+
+class BotWeaponAttributeTests(BotBattleRoom):
+    """★ 爱琳 2 号武器打中 bot 要**真的减速**（X_Mod §31）。
+
+    线上反馈：「击中 bot 之后，bot 不会被减速」。病根有两条，任一条都足够：
+    服务端不知道这把武器带属性（产物里没这两格），而 `machine.slowed_until`
+    全工程只有踩胶水一个赋值点。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.alice.peer_weapon = weapondata.get(IRENE_BOMB)
+
+    def test_the_splinter_slows_the_bot(self):
+        before = bot._now()
+        bot.note_peer_hit(self.room, self.alice,
+                          explode_payload(self.bot_handle))
+        self.assertIsNotNone(self.bot_conn.slowed_until)
+        # 2100 ms 来自武器的 `AttributeTime`，**不是** `Status.ini[14]` 的 4 秒。
+        self.assertAlmostEqual(2.1, self.bot_conn.slowed_until - before,
+                               delta=0.5)
+
+    def test_the_slow_actually_reaches_the_walk_speed(self):
+        bot.note_peer_hit(self.room, self.alice,
+                          explode_payload(self.bot_handle))
+        now = bot._now()
+        self.assertEqual(gameserver.SLOWED_SPEED_RATIO,
+                         bot._speed_scale(self.bot_conn, now))
+        # 到点自己恢复，不靠谁来撤。
+        self.assertEqual(1.0, bot._speed_scale(self.bot_conn, now + 9.0))
+
+    def test_nothing_is_broadcast(self):
+        """★★★ 和踩胶水**正好相反**：胶水只有「踩上去那台」算，bot 没有本机
+        所以必须补广播；而武器属性是 `0x47e0f7` / `0x47ef51` **每台都算**的
+        （那两个函数里没有 `IsMine` 门）—— 客户端早就给 bot 挂上了。
+        再发一发 `0x040a` 就成了双份，而且 `Item.ini [Slowed]` 走的是
+        `Status.ini[14] Time=4.0`，和武器写死的 2.1 秒对不上。"""
+        bot.note_peer_hit(self.room, self.alice,
+                          explode_payload(self.bot_handle))
+        self.assertNotIn(gameserver.OP_ITEM_EFFECT, opcodes(self.bob))
+        self.assertNotIn(gameserver.OP_ITEM_EFFECT, opcodes(self.alice))
+
+    def test_a_weapon_without_the_attribute_does_not_slow(self):
+        self.alice.peer_weapon = weapondata.get(1000010)      # 泰尔的左轮
+        bot.note_peer_hit(self.room, self.alice,
+                          explode_payload(self.bot_handle))
+        self.assertIsNone(self.bot_conn.slowed_until)
+
+    def test_an_unknown_weapon_does_not_crash(self):
+        """没收到过 `rpChangeWeapon` 的人 —— 不知道就当没有，别抛。"""
+        self.alice.peer_weapon = None
+        bot.note_peer_hit(self.room, self.alice,
+                          explode_payload(self.bot_handle))
+        self.assertIsNone(self.bot_conn.slowed_until)
+
+    def test_a_splash_hit_slows_too(self):
+        """溅射那一路（`rpSplashDamaged`）和直接命中同一个口径。"""
+        body = struct.pack("<iifBff", 1, self.bot_handle, 10.0, 0, 1.0, 1.0)
+        body += struct.pack("<ff", 0.0, 0.0)                   # +21 命中点
+        body += b"\x00" * (botsync.SPLASH_BODY_SIZE - len(body))
+        bot.note_peer_hit(self.room, self.alice,
+                          udp_packet(inner=botsync.OP_SPLASH_DAMAGED,
+                                     body=body))
+        self.assertIsNotNone(self.bot_conn.slowed_until)
+
+    def test_the_slow_is_extended_never_shortened(self):
+        """连着挨两发：留下的是**更远**的那个到期时刻，不是最后一发那个。"""
+        bot.note_peer_hit(self.room, self.alice,
+                          explode_payload(self.bot_handle))
+        first = self.bot_conn.slowed_until
+        self.bot_conn.slowed_until = first + 10.0             # 假装踩了胶水
+        bot.note_peer_hit(self.room, self.alice,
+                          explode_payload(self.bot_handle))
+        self.assertEqual(first + 10.0, self.bot_conn.slowed_until)
+
+    def test_the_mapping_is_not_the_status_ini_section_number(self):
+        """★ `Attribute=4` 换算出来必须是**属性 14 减速**。
+        照 `Status.ini` 小节号读会读成 `[4] 미니비`（缩小），完全是另一回事。"""
+        self.assertEqual(14, gameserver.BULLET_ATTRIBUTE_CHAR_ATTR[4])
+        self.assertEqual("减速", gameserver.CHAR_ATTR_NAMES[14])
+        self.assertEqual(
+            (14, 2.1), bot._weapon_attribute(weapondata.get(IRENE_SPLINTER)))
+        # 玩家手上拿的是母弹，要顺着 `SliceId` 往下找一层才找得到。
+        self.assertEqual(
+            (14, 2.1), bot._weapon_attribute(weapondata.get(IRENE_BOMB)))
+
+
+class BotHealTotemTests(BotBattleRoom):
+    """★ 回血图腾：服务端记账 + bot 主动去蹭（X_Mod §32，用户 2026-09-18）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.machine = self.bot_conn
+        self.machine.body = botmove.Body(500.0, 100.0, on_ground=True)
+        self.machine.battle_pos = (500.0, 100.0)
+        self.group = bot._seat_group(self.room, self.bot_seat)
+        self.enemy_group = self.group + 1
+        self.ledger = bot._health(self.room)
+
+    def hurt(self, fraction):
+        """把 bot 打到剩 `fraction` 成血。"""
+        top = bot._seat_max_hp(self.room, self.bot_seat)
+        self.ledger.reset(self.bot_seat)
+        self.ledger.note_damage(self.bot_seat, top * (1.0 - fraction))
+
+    def place(self, x, y, group=None):
+        bot.note_peer_hit(self.room, self.alice,
+                          totem_payload(0, self.group if group is None
+                                        else group, x, y))
+        return self.room.quest.totems[-1]
+
+    # --- 收包 ------------------------------------------------------------
+    def test_the_packet_puts_a_totem_on_the_board(self):
+        self.place(600.0, 100.0)
+        self.assertEqual(1, len(self.room.quest.totems))
+        totem = self.room.quest.totems[0]
+        self.assertEqual((600.0, 100.0), (totem[0], totem[1]))
+        self.assertEqual(IRENE_TOTEM, totem[4])
+
+    def test_an_unknown_ammo_id_is_not_recorded(self):
+        """不认得的图腾没有半径可判 —— 记了也用不了，不如不记。"""
+        bot.note_peer_hit(self.room, self.alice,
+                          totem_payload(0, self.group, 1.0, 2.0, ammo=999999))
+        self.assertEqual([], self.room.quest.totems)
+
+    def test_it_expires_on_its_own(self):
+        """到期不走任何包：每台机器各自数 `TotemLifeTime`（5 秒）。"""
+        totem = self.place(600.0, 100.0)
+        now = totem[5]
+        self.assertEqual(1, len(bot._live_totems(self.room.quest, now + 4.9)))
+        self.assertEqual(0, len(bot._live_totems(self.room.quest, now + 5.1)))
+        self.assertEqual([], self.room.quest.totems)   # 当场摘掉，不留垃圾
+
+    # --- 回血 ------------------------------------------------------------
+    def test_standing_in_it_heals_the_ledger(self):
+        self.hurt(0.5)
+        taken = self.ledger.taken_by(self.bot_seat)
+        self.place(560.0, 100.0)                       # 距离 60 < 半径 200
+        self.assertTrue(bot._stand_in_heal_totem(
+            self.room, self.machine, self.bot_seat, bot._now()))
+        self.assertEqual(taken - 3, self.ledger.taken_by(self.bot_seat))
+
+    def test_standing_outside_the_radius_heals_nothing(self):
+        self.hurt(0.5)
+        self.place(900.0, 100.0)                       # 距离 400 > 半径 200
+        self.assertFalse(bot._stand_in_heal_totem(
+            self.room, self.machine, self.bot_seat, bot._now()))
+
+    def test_an_enemy_totem_heals_nothing(self):
+        """`TotemType=1` 要求碰撞排除组相同（`0x488370`）——
+        个人战里那一格是「座位 + 1」，所以只有放的人自己吃得到。"""
+        self.hurt(0.5)
+        self.place(560.0, 100.0, group=self.enemy_group)
+        self.assertFalse(bot._stand_in_heal_totem(
+            self.room, self.machine, self.bot_seat, bot._now()))
+
+    def test_the_cadence_is_the_originals_proof_time(self):
+        """840 ms 一跳（`TotemProofTime`），按**这座图腾 × 这个人**记。"""
+        self.hurt(0.5)
+        totem = self.place(560.0, 100.0)
+        now = totem[5]
+        self.assertTrue(bot._stand_in_heal_totem(
+            self.room, self.machine, self.bot_seat, now))
+        self.assertFalse(bot._stand_in_heal_totem(
+            self.room, self.machine, self.bot_seat, now + 0.8))
+        self.assertTrue(bot._stand_in_heal_totem(
+            self.room, self.machine, self.bot_seat, now + 0.85))
+
+    def test_healing_stops_at_full_health(self):
+        """台账下限就是满血（`Ledger.note_heal`）——回过头不会变成负伤害。"""
+        self.hurt(0.99)
+        totem = self.place(560.0, 100.0)
+        now = totem[5]
+        for step in range(6):
+            bot._stand_in_heal_totem(self.room, self.machine, self.bot_seat,
+                                     now + step * 0.9)
+        self.assertEqual(1.0, bot._seat_health(self.room, self.bot_seat))
+
+    # --- 走位 ------------------------------------------------------------
+    def test_full_health_does_not_go_for_it(self):
+        self.place(600.0, 100.0)
+        self.assertIsNone(bot._totem_goal(self.room, self.machine,
+                                          self.bot_seat))
+
+    def test_hurt_and_in_sight_goes_for_it(self):
+        self.hurt(0.85)
+        self.place(900.0, 100.0)
+        goal = bot._totem_goal(self.room, self.machine, self.bot_seat)
+        self.assertIsNotNone(goal)
+        self.assertEqual((900.0, 100.0), goal[1])
+        self.assertAlmostEqual(400.0, goal[0], places=3)
+
+    def test_the_threshold_is_the_one_the_user_gave(self):
+        """90% 这个数没有原版出处，是用户 2026-09-18 给的 —— 钉住它。"""
+        self.assertEqual(0.90, bot.BOT_TOTEM_HEALTH)
+        self.place(900.0, 100.0)
+        self.hurt(0.95)
+        self.assertIsNone(bot._totem_goal(self.room, self.machine,
+                                          self.bot_seat))
+        self.hurt(0.89)
+        self.assertIsNotNone(bot._totem_goal(self.room, self.machine,
+                                             self.bot_seat))
+
+    def test_out_of_the_vision_box_does_not_count(self):
+        self.hurt(0.5)
+        self.place(500.0 + bot.BOT_VISION_HALF_X + 10.0, 100.0)
+        self.assertIsNone(bot._totem_goal(self.room, self.machine,
+                                          self.bot_seat))
+
+    def test_already_inside_the_radius_stops_overriding_the_walk(self):
+        """★ 用户「回血期间也不要傻站着」：`_walk_to()` 到了目标点返回的
+        恰恰是「不动」，所以一进圈就把这一格交还给原来那条链。"""
+        self.hurt(0.5)
+        self.place(560.0, 100.0)
+        self.assertIsNone(bot._totem_goal(self.room, self.machine,
+                                          self.bot_seat))
+
+    def test_an_enemy_totem_is_not_a_goal(self):
+        self.hurt(0.5)
+        self.place(900.0, 100.0, group=self.enemy_group)
+        self.assertIsNone(bot._totem_goal(self.room, self.machine,
+                                          self.bot_seat))
+
+    def test_an_expired_totem_is_not_a_goal(self):
+        self.hurt(0.5)
+        totem = self.place(900.0, 100.0)
+        totem[5] -= 99.0                               # 假装是 99 秒前放的
+        self.assertIsNone(bot._totem_goal(self.room, self.machine,
+                                          self.bot_seat))
+
+    def test_the_move_intent_really_picks_the_totem_branch(self):
+        """整条走位链走一遍：图腾那一支排在躲子弹之后、捡道具之前。"""
+        self.hurt(0.5)
+        self.place(900.0, 100.0)
+        terrain = flat_terrain()
+        self.machine.body = botmove.Body(500.0, 149.0, on_ground=True)
+        bot._move_intent(self.room, self.machine, self.bot_seat, terrain,
+                         None, bot._now())
+        self.assertEqual("去回血图腾", self.machine.diag_src[0])
 
 
 class BotMidGameLeaveTests(BotBattleRoom):

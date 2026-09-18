@@ -1,9 +1,9 @@
 {
  "format": 1,
  "packer": {"fill": 0, "key_prefix": "Pack/", "policy": "original-ext-v1", "sep": "~", "volume_cap": 16777216, "zlib_level": 9},
- "tree_hash": "4e7c5643c1a1f5d617a298ba6d8ada7793ee7d0727981ab0e0b7e5def2691b8a",
+ "tree_hash": "dd236b659049b9c27a1659fe5ac6a128778d7f3158ab8ae39bf56ee9419388ac",
  "volumes": {
-  "Data~.pkn": {"group": "Data", "sha256": "94ad5f77bdd2572f9d800f38b95eac3ae8e26914aa5e2d82c8b618892c005977", "size": 538624, "source": "Data", "members": [
+  "Data~.pkn": {"group": "Data", "sha256": "57a9ab60502b87f90551487bd2bf8b9037b18d1efa2b46a0b8ee0d81659d16a6", "size": 535552, "source": "Data", "members": [
    ["Chinese.ini", 114250, "2ecfe16814a0d515430fdeea80c53eb7cbd5a9e0be69dcee469f360b8ba08d4e"],
    ["Chinese.ini.r19467", 103870, "6a20b3f802a68c72bc57d438ac42467940b8b4e8e0ddeafebc1a30d0ca2bb584"],
    ["Chinese.ini.r19470", 103892, "b4d3a37902c721e112a9f70ca0dc75dc6222ea0ba0cf4e5a6642871a9d2b3dd3"],
@@ -41,7 +41,7 @@
    ["map-censorship.ini", 28668, "a4c6a3b93a71b35b7e661220b6446db4352f474e8b3769a86d17070895fbd6fb"],
    ["map.ini", 43350, "d911bde05623a8499ca54d22a7c4d35c0ce671f99b501b258ea2cc8c39646b38"],
    ["weapon-censorship.ini", 95855, "7bbd0ddaf5ebaaadb8db91e32973a1efeb88a9f7238e2f35b020fa4c560dc4de"],
-   ["weapon.ini", 439038, "196ed311cb927bcd8cfa0e524dabe16c96eab51346fc88c847ad0146a5d6cf5b"]
+   ["weapon.ini", 221519, "00084834adea094c8bb038ad08627886e32b2224fd08238d0d26eb0d8db81616"]
   ]},
   "Data~Quest.pkn": {"group": "Data", "sha256": "4aae0676e1a488733bfa7f0461936b9eb5bfb5274f3b972dd04c8c08d9cb4cf5", "size": 1082368, "source": "Data/Quest", "members": [
    ["Quest/ChrProps-international.ini", 54, "9c6cbc470c405f715ca4c0eaad777635310c7715391a2723f001fb0713b9ec46"],
@@ -5693,7 +5693,7 @@
    ["Wing/Efx/WingJump.efx", 9835, "ef9312302616f376a349315918607ef68ec4f76d4eeb8a1e25068f600fedaa6b"],
    ["Wing/Texture/Feather00.dds", 16512, "8b67e4f7e15234f6f7132deedca0a8231cbfee51bfd8f28db90517abb94572f7"]
   ]},
-  "Images~Chinese.pkn": {"group": "Images", "sha256": "28e3ca5424b1484a5c61f170a1dad73b8eefebf4cd3bb5369d970b6e5cf78d6e", "size": 10270720, "source": "Images/Chinese", "members": [
+  "Images~Chinese.pkn": {"group": "Images", "sha256": "795c8c3890d459eff7f89a6e9384a05c66a5a5c3182fb36212a8e26e0029ac07", "size": 10270720, "source": "Images/Chinese", "members": [
    ["Chinese/BigChrIcons_CN.png", 434319, "82b761cabc4c15cc4328c7f40576a6b3418178bff806f3b156daffb8bcce6203"],
    ["Chinese/BigChrIcons_CN.smf", 904, "e599c43aeebf20100d0096a11aff7593edd2020c280154237704a82061b0fab8"],
    ["Chinese/BigChrIcons_CN.xml", 8590, "cbb967b5103c2f3541e612857b8d31b63b87d224c4d3415ba66d9e34c89029b3"],
@@ -5717,9 +5717,9 @@
    ["Chinese/ClearResult.png", 16837, "bba5c5e67b517f76fb48504fe8b733ca5c5edc514dff53196723a8acf16ba00d"],
    ["Chinese/ClearResult.smf", 8, "d86e8112f3c4c4442126f8e9f44f16867da487f29052bf91b810457db34209a4"],
    ["Chinese/ClearResult.xml", 92, "eb8defca486b8c1eed82afad4afc9b4d0c2a3581d465fdc78d3359cf1f19c392"],
-   ["Chinese/ClearResultSlotLadder.png", 25983, "2891bc96741386e55e1480d43f33ff515883f8deba9a690055f99b9cf2ed61fa"],
-   ["Chinese/ClearResultSlotLadder.smf", 712, "53a5acf87f2a630820cf60d0c93faa6ffeea4ed19217d0b3bea6e2f217019599"],
-   ["Chinese/ClearResultSlotLadder.xml", 6785, "87faba5830edcc737cad7e7677754240d70faa1afe48fcc5b5164c90878a388a"],
+   ["Chinese/ClearResultSlotLadder.png", 26516, "81d9c084c606b11374aeca178bb06069faeb11c94778a878555aecfd8c8a3f51"],
+   ["Chinese/ClearResultSlotLadder.smf", 776, "054e508e0fb6ab786666a892971b9b3335643cdb8dfaf9c88f7494b7f8baf8ab"],
+   ["Chinese/ClearResultSlotLadder.xml", 7391, "9c5f76bd71631dec8783b3a4184ab772810ff4704cfc0d17e89ffb1e429d1a8d"],
    ["Chinese/ControlGuide.png", 86619, "15470c772b3743d3ed5b8d6d391dc878c7dde692f5e5e05f31e435efc72aed2d"],
    ["Chinese/ControlGuide.smf", 424, "90528df553e636c747806b552c029c45fff7cf1efd4ce72c568efdf9858eceb4"],
    ["Chinese/EscSkip.png", 3866, "066e40d69eaa205b52dd2317ca0509b4d1be7b06eee2194b87f62bcd0c1e4107"],

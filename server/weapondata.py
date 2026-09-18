@@ -53,7 +53,11 @@ import os
 #:   ⚠ 这个数和 `tools/weapondata.py` 的那一份**必须一起改**，
 #:   而且要和重新生成的 `bot_weapons.json` 在同一个提交里 —— 对不上时
 #:   `_read()` 返回空表，症状是 **bot 全房间不开枪**，一句报错都没有。
-FORMAT = 12
+#: ★ 13（X_Mod · 爱琳三条线上反馈）：新增 `attribute` / `attribute_ms`
+#:   （武器附带状态，X_Mod §31）和 `totem_*` 六格（回血图腾，X_Mod §32）。
+#:   两组都只有爱琳的武器有。`Weapon.__getattr__` 直接透传产物字典，
+#:   所以这边**除了这个版本号什么都不用改**。
+FORMAT = 13
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "bot_weapons.json")
