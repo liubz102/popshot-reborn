@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <SpriteSet>
   <Version>2</Version>
-  <Count>22</Count>
+  <Count>24</Count>
   <Sprite>
     <Index>0</Index>
     <Rectangle>
@@ -366,6 +366,40 @@
       <Y>236</Y>
       <Width>513</Width>
       <Height>252</Height>
+    </Rectangle>
+    <HotSpot>
+      <X>-1</X>
+      <Y>-1</Y>
+    </HotSpot>
+    <LinkSpot>
+      <X>-1</X>
+      <Y>-1</Y>
+    </LinkSpot>
+  </Sprite>
+  <Sprite>
+    <Index>22</Index>
+    <Rectangle>
+      <X>347</X>
+      <Y>254</Y>
+      <Width>39</Width>
+      <Height>17</Height>
+    </Rectangle>
+    <HotSpot>
+      <X>-1</X>
+      <Y>-1</Y>
+    </HotSpot>
+    <LinkSpot>
+      <X>-1</X>
+      <Y>-1</Y>
+    </LinkSpot>
+  </Sprite>
+  <Sprite>
+    <Index>23</Index>
+    <Rectangle>
+      <X>388</X>
+      <Y>254</Y>
+      <Width>39</Width>
+      <Height>17</Height>
     </Rectangle>
     <HotSpot>
       <X>-1</X>

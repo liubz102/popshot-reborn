@@ -65,6 +65,16 @@ for _path in (SERVER, HERE):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+# ★ 控制台是 CP936 的：断言消息里只要有一个 GBK 装不下的字（实测 `♥` U+2665），
+#   打这条失败的时候 `sys.stdout.write` 自己先 `UnicodeEncodeError` 崩掉 ——
+#   于是一条本该清清楚楚的 FAIL 变成运行器的回溯，**别的失败也一起看不见了**。
+#   编码问题只该让那个字变成 `?`，不该决定测试报告能不能打出来。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):       # 被重定向 / 不是 TextIO
+        pass
+
 
 def all_modules():
     """全量要跑的模块 = `test/` 里**所有** `test_*.py`，现扫现得。

@@ -96,19 +96,19 @@ if ($Pack) {
 $steps = @(
     [pscustomobject]@{ Label = '[1/5] 地形数据';     Out = 'server\bot_mapdata\'
                        Tool  = 'mapdata.py';    Args = @('--verify') + $packArgs.map
-                       Test  = 'test_mapdata.py';    Pil = $false },
+                       Test  = 'test_mapdata';       Pil = $false },
     [pscustomobject]@{ Label = '[2/5] 武器表';       Out = 'server\bot_weapons.json'
                        Tool  = 'weapondata.py'; Args = $packArgs.wpn
-                       Test  = 'test_weapondata.py'; Pil = $false },
+                       Test  = 'test_weapondata';    Pil = $false },
     [pscustomobject]@{ Label = '[3/5] 角色属性表';   Out = 'server\bot_chrprops.json'
                        Tool  = 'chrprops.py';   Args = $packArgs.chr
-                       Test  = 'test_chrprops.py';   Pil = $false },
+                       Test  = 'test_chrprops';      Pil = $false },
     [pscustomobject]@{ Label = '[4/5] 物品表';       Out = 'server\shop_items.json'
                        Tool  = 'shopdata.py';   Args = $packArgs.shop
-                       Test  = 'test_shopdata.py';   Pil = $false },
+                       Test  = 'test_shopdata';      Pil = $false },
     [pscustomobject]@{ Label = '[5/5] 物品图标图集'; Out = 'server\web\itemicons.png'
                        Tool  = 'shopicons.py';  Args = $packArgs.icon
-                       Test  = 'test_web_admin.py';  Pil = $true }
+                       Test  = 'test_web_admin';     Pil = $true }
 )
 
 foreach ($s in $steps) {
@@ -136,7 +136,13 @@ foreach ($s in $steps) {
         exit 1
     }
 
-    & $py (Join-Path $Root ('server\' + $s.Test))
+    # ★ 走 `test\run_tests.py <模块>`，不要直接 `python test\test_xxx.py`：
+    #   run_tests 的 `_prepare()` 会把 `shopcfg.DATA_DIR` 指到一个空目录、把
+    #   eventlog 关掉 —— 少了它，测试会去读用户随时在改的 `server\data\*.json`，
+    #   还会往真实的上下线流水 `logs\online.log` 里写。
+    #   ⇒ 2026-09-18 测试从 `server\` 搬到 `test\`（D20），这一行没跟着改，
+    #      于是 build-pack 的「明文树变了」那条路径整个断了（本次发现）。
+    & $py (Join-Path $Root 'test\run_tests.py') $s.Test
     if ($LASTEXITCODE -ne 0) {
         Write-Host ''
         Write-Host "[x] $($s.Label)：测试没过 —— 产物可能是坏的，先别打包。后面的步骤没跑。" -ForegroundColor Red

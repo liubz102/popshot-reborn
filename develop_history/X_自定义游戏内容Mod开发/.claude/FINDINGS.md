@@ -696,3 +696,56 @@ key 2 -> 0x480f8d push 0xc 冰冻   key 4 -> 0x480fbd push 0xe ★ 减速
 （撤掉 P6 那道闸，见 §2 / D22）。代价为零：爱琳在商店里本来也穿不了装备
 （`Equipment::Equip` `0x5583d3` / `IsSlotUsed` `0x558501` 都 `cmp …,3 / jge` 丢弃），
 选角色打游戏走的是房间 6 格面板和战斗换人条，和这条路无关。
+
+## §34 ★★★★★ V0.4.0 线上崩溃：回血图腾 → 结算界面取第 22 帧 → 中文版没有（✅线上 5 份崩溃包 + 🔍逐指令）
+
+**结论**：`0x48e77e` 画结算界面的「♥HEAL」标签时**直接**取
+`ClearResultSlotLadder` 的 `frames[22 + 闪烁位]`，**绕过** `ImageSet::Draw`（`0x5ccefc`）
+的边界检查；而 `Images/Chinese/ClearResultSlotLadder.smf` 只有 **22 帧**（§27 记过），
+于是读到堆里的垃圾指针，非空通过了 `cmp ecx,ebx`，下一条 `mov eax,[ecx+8]` 就 `C0000005`。
+
+触发链（每一环都核过）：
+
+1. 图腾治到**别人**（不是图腾主人自己）时，`0x510785` 给图腾主人的座位打标记：
+   `mov byte [0x72e29c + 座位 + 0x4a2], 1`。这个 6 字节数组在结算界面开场时被
+   `0x491311` 清零，全镜像**只有这两处**碰它（按字节找 `a2 04 00 00` 找出来的）。
+2. 结算界面 `0x48e763` 查这个标记 → 走到 `0x48e77e` → 崩。
+3. 全游戏只有爱琳 3 号是图腾（§32）⇒ **中文版 15 年没崩，是因为它从来没有能放图腾的角色**。
+   V0.4.0 把爱琳放出来，这条从没被走到的路第一次走到。
+
+崩的是**全房间同时**（每台机器各自模拟图腾治疗，标记都会置上），线上 4 份崩溃包正是
+两个人、两局、各自同一秒。
+
+线上证据（`bug调查/24`）：`0048E786` 或 `005CCF0A`（同一条路深一层），
+栈尾 `004A4B1C ← 0048DAA6 ← … ← 005F7B9E` 四份完全一致，`ESI=0x1A2`(=Y 418) 四份相同；
+客户端 `Debug/*.txt` 末尾都是两条 `UI-ClearResultSlotDrop.ogg`，3 秒后崩；
+★ 服务端日志里那两局 a8282999 都 `换角色 -> 角色 id 3`，且 `rpFire` 里有
+**`ammo 1003030`** —— 正是图腾发射器本尊（`[ch03-03] Id=1003030`）。
+
+**修法**（已做）：`Images/Chinese/ClearResultSlotLadder.{smf,png,xml}` 补到 24 帧 ——
+`.smf` 是原版的纯截断（前 22 帧逐字节相同）⇒ 整份抄 `NewUI2/` 那份；
+中文版 PNG 那两格是**空的**，把韩版 `(347,254)-(427,271)` 的像素搬过来（「♥HEAL」是英文，
+不用改字）。两张图除了帧 0 的中文化背景以外本来就逐像素相同。
+守卫见 `test/test_smfframes.py`（§27 的另两份**不用动**，理由见 D24）。
+
+## §35 ★★★★ 另一份线上崩溃：`IDirect3DIndexBuffer9::Lock()` 失败不检查（✅崩溃包 + 🔍逐指令）
+
+**结论**：`0x5bf6cd` 调 `Lock`，**不看返回值**，紧接着就往 `[ebp+0x58]` 指的地方
+`memcpy` 256 个 quad 的索引（`0x5bf71b`，每次 12 字节）。`Lock` 失败时那个指针保持
+`NULL`（`0x5bf6c7` 先清了零）⇒ `memcpy(NULL, 栈, 12)` ⇒ `C0000005`。
+崩点在 `memcpy` 体内 `0x5f5714`（`mov [edi+ecx*4-0xc], eax`，崩时 `EDI=0`、`ECX=3`）。
+
+- `HRESULT` 存进了 `[ebp+0x54]`，但**只在 `0x5bf749` 当函数返回值用**，填充之前没人看。
+- 这段是**设备重建**：`0x5bf689` 先 `Release` 旧的索引缓冲，`0x5bf6b7` 重新
+  `CreateIndexBuffer(0xc00, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT)`。
+  `DEFAULT` 池 + 设备丢失（`D3DERR_DEVICELOST`）⇒ `Lock` 必失败。
+- 崩的那台（concon，5 份里的 1 份）：钩子日志 `PresentParameters windowed=0`
+  **独占全屏**；崩前 4 秒进程里被塞进一堆 shell / GDI+ / WPS 外壳 DLL，
+  崩后 `ShellExecuteW("QQPYBugReport.exe")` —— **QQ 拼音注入进来弹了自己的窗口**。
+  独占全屏被抢焦点 = 设备丢失，对得上。
+
+**修法**（已做，D25）：`try_patch_d3d_ib_lock()` —— 站点 `0x5bf6d0` 只有 9 字节，
+三条指令一条都省不掉，加判据还差 6 字节，而那一带**没有 `int3` 填充洞**（同 §33）⇒
+`VirtualAlloc` 一块 RWX 当代码洞，站点写 `E9` 跳过去：洞里先原样跑那三条，
+再 `cmp dword [ebp+0x58],0`，为 `NULL` 就跳到 `0x5bf73f`（**Unlock 之后** —— 压根没锁上）。
+★ 站点 / 跳转目标 / 洞里的字节全部由 `test/test_patchsites.py` 拿脱壳镜像离线核对。

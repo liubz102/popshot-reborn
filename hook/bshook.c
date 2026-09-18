@@ -2829,6 +2829,120 @@ static int try_patch_reflect_visual(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* 索引缓冲 patch —— Lock() 失败时别往 NULL 里写（§35 / D25）                  */
+/*                                                                            */
+/*   原版重建精灵批的索引缓冲，一路不看返回值：                                */
+/*                                                                            */
+/*     0x5bf6b7  call [edx+0x6c]     CreateIndexBuffer(0xc00, WRITEONLY,      */
+/*                                   INDEX16, D3DPOOL_DEFAULT)                */
+/*     0x5bf6c7  mov  [ebp+0x58],esi ppbData = NULL                           */
+/*     0x5bf6cd  call [ecx+0x2c]     IDirect3DIndexBuffer9::Lock  ← HRESULT   */
+/*                                   只存进 [ebp+0x54] 当函数返回值，填充之前  */
+/*                                   一眼都没看                                */
+/*     0x5bf6d9  循环 256 次，每次 memcpy 12 字节到 [ebp+0x58]+[ebp+0x60]      */
+/*                                                                            */
+/*   Lock 失败时 [ebp+0x58] 还是 NULL ⇒ memcpy(NULL, 栈, 12) ⇒ C0000005。     */
+/*   DEFAULT 池 + 设备丢失（独占全屏被抢焦点）必触发，2026-09-18 线上崩过一份。*/
+/*                                                                            */
+/*   ★ 为什么要跳板：0x5bf6d0 起只有 9 字节，三条指令一条都省不掉             */
+/*     （[ebp+0x54] 是函数返回值，[ebp+0x5c]/[ebp+0x60] 是循环计数），         */
+/*     加 cmp+jcc 还差 6 字节；而 0x44c000~0x452000 那一带连一个 int3 填充洞   */
+/*     都没有（§33，exe 加过壳 VirtualSize==RawSize）。⇒ VirtualAlloc 一块     */
+/*     RWX，把偷来的三条指令 + 判据放进去，站点写 E9 跳过去。                  */
+/*                                                                            */
+/*   指针为 NULL 时跳到 0x5bf73f（Unlock **之后**）：压根没锁上，就不该解锁。  */
+/*   代价是这一次索引缓冲没填好 —— 但原版在这条路上是直接崩，没得比。         */
+/* -------------------------------------------------------------------------- */
+#define D3D_IB_SIG_VA      0x005BF6C7u
+#define D3D_IB_PATCH_OFF   9                  /* 站点 = 0x005BF6D0 */
+#define D3D_IB_PATCH_LEN   9                  /* E9 rel32 + 4 个 NOP */
+#define D3D_IB_RESUME_VA   0x005BF6D9u        /* 指针有效 → 回填充循环的头 */
+#define D3D_IB_BAIL_VA     0x005BF73Fu        /* 指针为 NULL → Unlock 之后那一句 */
+
+static const unsigned char D3D_IB_SIG[28] = {
+    0x89,0x75,0x58,            /* mov  [ebp+0x58], esi     ppbData = NULL     */
+    0x8B,0x08,                 /* mov  ecx,[eax]                              */
+    0x50,                      /* push eax                                    */
+    0xFF,0x51,0x2C,            /* call [ecx+0x2c]          Lock               */
+    0x89,0x45,0x54,            /* mov  [ebp+0x54], eax   ┐                    */
+    0x89,0x75,0x5C,            /* mov  [ebp+0x5c], esi   ├ 偷走这 9 字节      */
+    0x89,0x75,0x60,            /* mov  [ebp+0x60], esi   ┘                    */
+    0x8B,0x45,0x5C,            /* mov  eax,[ebp+0x5c]      填充循环的头        */
+    0x33,0xC9,                 /* xor  ecx,ecx                                */
+    0x66,0x89,0x75,0x68,       /* mov  [ebp+0x68], si                         */
+    0x66                       /* （下一条的头一个字节，凑够唯一）            */
+};
+
+/* 代码洞的模板。两条 E9 的 rel32 在装的时候按洞的实际地址现算。 */
+static const unsigned char D3D_IB_CAVE[25] = {
+    0x89,0x45,0x54,            /* +0   mov [ebp+0x54], eax   ┐ 偷来的三条     */
+    0x89,0x75,0x5C,            /* +3   mov [ebp+0x5c], esi   ├ 原样先跑       */
+    0x89,0x75,0x60,            /* +6   mov [ebp+0x60], esi   ┘               */
+    0x83,0x7D,0x58,0x00,       /* +9   cmp dword [ebp+0x58], 0  ← Lock 填的   */
+    0x75,0x05,                 /* +13  jne +5 → +20（指针有效，走原路）      */
+    0xE9,0,0,0,0,              /* +15  jmp D3D_IB_BAIL_VA                     */
+    0xE9,0,0,0,0               /* +20  jmp D3D_IB_RESUME_VA                   */
+};
+#define D3D_IB_CAVE_BAIL_OFF    16            /* 上面两个 rel32 在洞里的偏移 */
+#define D3D_IB_CAVE_RESUME_OFF  21
+
+static volatile LONG g_d3d_ib_patched = 0;
+
+static int try_patch_d3d_ib_lock(void)
+{
+    unsigned char *base = (unsigned char *)D3D_IB_SIG_VA;
+    unsigned char *p = base + D3D_IB_PATCH_OFF;
+    unsigned char *cave;
+    unsigned char site[D3D_IB_PATCH_LEN];
+    DWORD oldp;
+
+    if (g_d3d_ib_patched) return 1;
+    if (IsBadReadPtr(base, sizeof(D3D_IB_SIG))) return 0;
+    if (p[0] == 0xE9) {                         /* 已经跳出去了 = 装过了 */
+        InterlockedExchange(&g_d3d_ib_patched, 1);
+        return 1;
+    }
+    if (memcmp(base, D3D_IB_SIG, sizeof(D3D_IB_SIG)) != 0)
+        return 0;                               /* 还没解壳，或并非已确认的客户端版本 */
+
+    cave = (unsigned char *)VirtualAlloc(NULL, sizeof(D3D_IB_CAVE),
+                                         MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE);
+    if (!cave) {
+        bslog("PATCH   索引缓冲空指针判据: VirtualAlloc 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    memcpy(cave, D3D_IB_CAVE, sizeof(D3D_IB_CAVE));
+    /* E9 的 rel32 = 目标 − 本条指令的下一字节 */
+    *(DWORD *)(cave + D3D_IB_CAVE_BAIL_OFF) =
+        (DWORD)(D3D_IB_BAIL_VA - (UINT_PTR)(cave + D3D_IB_CAVE_BAIL_OFF + 4));
+    *(DWORD *)(cave + D3D_IB_CAVE_RESUME_OFF) =
+        (DWORD)(D3D_IB_RESUME_VA - (UINT_PTR)(cave + D3D_IB_CAVE_RESUME_OFF + 4));
+
+    site[0] = 0xE9;
+    *(DWORD *)(site + 1) = (DWORD)((UINT_PTR)cave - ((UINT_PTR)p + 5));
+    memset(site + 5, 0x90, D3D_IB_PATCH_LEN - 5);
+
+    if (!VirtualProtect(p, D3D_IB_PATCH_LEN, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   索引缓冲空指针判据: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        VirtualFree(cave, 0, MEM_RELEASE);
+        return 0;
+    }
+    memcpy(p, site, D3D_IB_PATCH_LEN);
+    VirtualProtect(p, D3D_IB_PATCH_LEN, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, D3D_IB_PATCH_LEN);
+    FlushInstructionCache(GetCurrentProcess(), cave, sizeof(D3D_IB_CAVE));
+    InterlockedExchange(&g_d3d_ib_patched, 1);
+    bslog("PATCH   ★索引缓冲空指针判据 @ %08X: 跳板 @ %08X，"
+          "Lock() 没给出指针就不填（原版直接 memcpy 到 NULL）",
+          (unsigned)(D3D_IB_SIG_VA + D3D_IB_PATCH_OFF),
+          (unsigned)(UINT_PTR)cave);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* 地图等级门槛 patch —— 选图 / 开局都不再看 MinLevel（§221 / D142）           */
 /*                                                                            */
 /*   等级门槛有两道，不在同一处：                                              */
@@ -8370,6 +8484,16 @@ static DWORD WINAPI patch_thread(LPVOID param)
     if (!g_reflect_visual_patched)
         bslog("PATCH   !! 超时未能 patch 反射道具视觉"
               "（0x5090e2 的特征串一直对不上）");
+
+    /* 索引缓冲的空指针判据（§35 / D25）：不赶时机 —— 站点只有设备**重建**时
+       才跑，第一次是启动时建渲染器，之后要等设备丢失后 Reset，都远晚于解壳。 */
+    for (ticks = 0; !g_stop && !g_d3d_ib_patched && ticks < 2000; ticks++) {
+        if (try_patch_d3d_ib_lock()) break;
+        Sleep(2);
+    }
+    if (!g_d3d_ib_patched)
+        bslog("PATCH   !! 超时未能 patch 索引缓冲空指针判据"
+              "（0x5bf6c7 的特征串一直对不上）—— 设备丢失时仍可能崩在 memcpy");
 
     /* 地图等级门槛（D142）：不赶时机 —— 0x40b5d0 第一次跑要到进房选图，
        远晚于 +2.5s 的解壳窗口。 */
