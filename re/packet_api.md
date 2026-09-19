@@ -2232,20 +2232,33 @@ opcode 出处：`0x493808` 的分发链 `sub 0x406 / dec / sub 0xb / dec / dec /
 线格式（`server/weaponcfg.build_hook_frame()` ⇄ hook 侧 `wtab_on_frame()`）：
 
 ```text
-u16 format(=1) · u32 serial · u16 n
+u16 format(=2) · u32 serial · u16 n · u8 模式                            头 9 B
 n × { i32 武器Id · [PVE] u32 mask + 12×4B · [PVP] u32 mask + 12×4B }      每条 108 B
 ```
 
 12 格按 `weaponcfg.FIELDS` 的顺序：`Damage HeadDamage LegsDamage SplashDamage SplashRange
 MagazineCount CoolingTime ReloadTime LoadingTime`（int32）`Velocity MaxVelocity GravityFactor`（f32）。
-`mask` 位 = 这一格有值（资源包参考值也算）；没在 mask 里的格 hook 写回自己存的原值。
-两套一起发，hook 按「谁在重读 `weapon.ini`」挑：闯关场景构造（返回地址 `0x4a3b81`）→ PVE，
-对战 `GameContextNewPvp` 构造（`0x497cbb` / `0x497c63`）和启动（`0x435684`）→ PVP。
+`mask` 位 = 这一格有值（资源包参考值也算）；没在 mask 里的格 hook 写回自己存的原值。两套一起发。
 
-**什么时候发**：登录成功后一次（`on_game_login` 末尾）；管理页「自定义属性」保存后
-`gameserver.broadcast_hook_weapon_table()` 推给全部已登录连接（在线玩家不用重登）。
+★★ **模式那一格（格式 2 新增，X_Mod §42 / D32）** —— 它同时是「这一局是什么」和「现在施加」两条命令：
+
+| 值 | 含义 | 谁发 |
+|---|---|---|
+| `0` | 任务（PVE）| 开局握手，**排在 `0x0400` 之前** |
+| `1` | 对战（PVP）| 同上 |
+| `0xFF` | **只换表、不写内存** | 登录成功后那一发；管理页保存后广播的那一发 |
+
+`0xFF` 的意思是「数据更新了，等下一局再套用」——所以**属性改动一律下一局生效**，
+不会把正在进行的那一局改成一半（弹匣容量在进图时就快照进持枪器了，改不动，§42）。
+开局那一发必须排在 `0x0400`（客户端切 stage 6 开始加载关卡）**之前**，这一局的快照才是新值。
+⚠ **不要**再靠 `WeaponTable::Load` 的返回地址判模式：它不在开局时跑（§42 有实测时间线）。
+返回地址那套只剩兜底（训练场 / 教程不走服务端房间），优先级最低。
+
+**什么时候发**：① 登录成功后一次（`on_game_login` 末尾，模式 `0xFF`）；
+② 管理页「自定义属性」保存后 `gameserver.broadcast_hook_weapon_table()` 推给全部已登录连接（`0xFF`）；
+③ **每一局开局**，`broadcast_start_game()` 里按 `room.session_type` 带真模式发给房里每个人。
 发给每一条已登录的连接，**不另设版本门控**（客户端版本只由 `server-ClientFilter.config` 那一道门管；没装钩子的老客户端收到也只是落进默认分支）。
-★ 只有 9 把自定义武器的 Id（`100C9S0`）会出现在表里，原版武器不进这条链。
+★ 只有 9 把自定义武器的 Id（`1 00C 3 S 5`，X_Mod §41）会出现在表里，原版武器不进这条链。
 
 ---
 

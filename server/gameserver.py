@@ -10147,6 +10147,21 @@ class Conn:
         所以 +1 之后仍然一样。
         """
         members = room.members(exclude=None)
+        # ★★ 开局这一刻把「这一局是闯关还是对战」连同整张自定义武器表推给 bshook
+        #    （X3，§42 / D32）。**必须排在 `0x0400` 之前发出去**：`0x0400` 一到
+        #    客户端就切 stage 6 开始加载关卡，加载过程里角色被建出来、弹匣容量
+        #    从武器记录**快照**进持枪器（`0x48b96e`），晚一步这一局的弹匣就还是
+        #    上一局那份。房间类型是我们自己建的房，服务端最清楚 —— 客户端那边
+        #    `WeaponTable::Load` 的调用时机根本不等于「开局」（§42）。
+        if any(op == OP_PREPARE_GAME for op, _ in replies):
+            hook_mode = (weaponcfg.HOOK_MODE_PVE
+                         if room.session_type == SESSION_TYPE_QUEST
+                         else weaponcfg.HOOK_MODE_PVP)
+            for member in members:
+                try:
+                    member.send_hook_weapon_table(reason="；开局", hook_mode=hook_mode)
+                except OSError as error:
+                    member.log(f"   开局推自定义武器表失败（{error!r}），忽略")
         for member in members:
             try:
                 with member.send_batch(f"；{why}"):
@@ -11772,20 +11787,26 @@ class Conn:
         self.send(build_game(OP_REP_ITEM_INFO,
                              shop.build_rep_item_info(records, purpose)))
 
-    def send_hook_weapon_table(self, reason=""):
+    def send_hook_weapon_table(self, reason="", hook_mode=None):
         """发 `0x0F01`「自定义武器表」给 bshook（X3）。发了返回 True。
 
         发给每一条**已登录**的连接，不另设版本门控（用户 2026-09-19：客户端版本
         只由 `server-ClientFilter.config` 那一道门管，别重复加）。能登进来的客户端
         就是门禁放行的；万一是没装这个钩子的老版本，这一包会落进分发树的默认分支
         （`0x54e546: xor al,al`，X_Mod §38），什么都不发生。
-        登录成功后发一次；管理页保存后由 `broadcast_hook_weapon_table()` 再推一遍。
+
+        `hook_mode`（默认 `NONE`）见 `weaponcfg.build_hook_frame()`：
+        登录后那一发、管理页保存后广播的那一发都是 `NONE`（**只送数据、不施加**，
+        下一局才生效）；只有开局那一发带真模式，它同时也是「现在施加」的命令。
         """
         if not self.account_name:
             return False
-        payload = weaponcfg.build_hook_frame()
-        fmt, serial, records = weaponcfg.parse_hook_frame(payload)
-        self.log(f"← 发 0x0F01 自定义武器表 serial={serial} {len(records)} 条{reason}")
+        if hook_mode is None:
+            hook_mode = weaponcfg.HOOK_MODE_NONE
+        payload = weaponcfg.build_hook_frame(hook_mode=hook_mode)
+        fmt, serial, mode, records = weaponcfg.parse_hook_frame(payload)
+        self.log(f"← 发 0x0F01 自定义武器表 serial={serial} {len(records)} 条"
+                 f" 模式={weaponcfg.HOOK_MODE_ZH.get(mode, mode)}{reason}")
         self.send(build_game(OP_HOOK_WEAPON_TABLE, payload))
         return True
 

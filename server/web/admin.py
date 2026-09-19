@@ -2695,9 +2695,14 @@ class AdminRoutes:
         `params` = `{"pve": {...}, "pvp": {...}}`（留空的格 = 用参考值），原版武器
         必须不带 `params`（服务端拒收「改原版数值」，前台本来也不画那两栏）；
         `desc` = 说明文（空串 = 清掉）。存盘走 `weaponcfg.save_item()`（过校验才落盘），
-        之后 `gameserver.broadcast_hook_weapon_table()` 把整张表推给全部已登录连接
-        —— 在线玩家下一枪就是新数值，不用重登；说明文那半边商店提示框即时、
-        仓库提示框重登后更新（客户端缓存住了物品定义，packet_api §3.9）。
+        之后 `gameserver.broadcast_hook_weapon_table()` 把整张表推给全部已登录连接。
+
+        ★★ **生效时机（用户 2026-09-19 拍板，§42 / D32）**：这一发推下去的是
+        `HOOK_MODE_NONE`，bshook **只换表、不写内存** ⇒ 数值改动**下一局才生效**，
+        不影响正在进行的那一局。（局内写内存会让准星和实际弹匣对不上：弹匣容量
+        在进图时就快照进持枪器了，改记录追不回来。）
+        说明文那半边：商店提示框即时，**仓库提示框要重新登录客户端**才更新
+        （客户端缓存住了物品定义，packet_api §3.9）。
         """
         admin = self._require_editor()
         if admin is None:
@@ -2735,7 +2740,16 @@ class AdminRoutes:
                         f"{'自定义属性 / ' if params is not None else ''}说明文"
                         f"（serial={table['serial']}，推给 {pushed} 条在线连接）")
         view = weaponcfg.admin_view(item_id, table)
+        # ★ 提示必须说清两件事（用户 2026-09-19 要求）：数值下一局生效、说明文要重登。
+        if params is not None:
+            message = (("已保存，并推给 %d 位在线玩家：属性改动下一局生效，"
+                        "不影响正在进行的对局" % pushed) if pushed
+                       else "已保存（现在没有在线玩家；属性改动下一局生效）")
+        else:
+            message = ("已保存，并推给 %d 位在线玩家" % pushed) if pushed \
+                else "已保存（现在没有在线玩家，下次登录生效）"
+        if str(data.get("desc") or ""):
+            message += "；说明文要重新登录客户端才会在仓库提示框里更新"
         view.update({"ok": True, "can_edit": True, "pushed": pushed,
-                     "message": ("已保存，并推给 %d 位在线玩家" % pushed) if pushed
-                     else "已保存（现在没有在线玩家，下次登录生效）"})
+                     "message": message})
         self._send_json(view)

@@ -8408,10 +8408,18 @@ static int try_hook_render_init(void)
 /*         BSHOOK_WEAPON_MODE=pve|pvp 强制模式（实机核对两套表都写对时用）。     */
 /* ========================================================================== */
 #define WTAB_OPCODE        0x0F01
-#define WTAB_FORMAT        1
+#define WTAB_FORMAT        2
 #define WTAB_FIELDS        12
 #define WTAB_MAX           32
 #define WTAB_RECORD_BYTES  (4 + 2 * (4 + 4 * WTAB_FIELDS))     /* 108 */
+#define WTAB_HEADER_BYTES  9        /* u16 格式 + u32 序号 + u16 条数 + u8 模式 */
+/* 载荷头那一格模式（服务端 `weaponcfg.HOOK_MODE_*`）。★ NONE = 「只更新数据、
+   别施加」：管理页改了数值不捅正在进行的那一局，**下一局才生效**（用户
+   2026-09-19 拍板）。带真模式的那一发只在开局握手之前发，它同时就是
+   「这一局是闯关还是对战」的**事实**（§42 / D32）。 */
+#define WTAB_MODE_PVE      0
+#define WTAB_MODE_PVP      1
+#define WTAB_MODE_NONE     0xFF
 #define WTAB_TABLE_VA      0x0072e788u
 #define WTAB_LOOKUP_VA     0x004157bfu
 #define WTAB_DISPATCH_VA   0x0054e036u
@@ -8446,7 +8454,8 @@ static int g_wtab_cs_ready = 0;
 static wtab_table_t g_wtab;                 /* 最近一次收到的表（在临界区里整份换） */
 static volatile LONG g_wtab_have = 0;       /* 收到过表 */
 static volatile LONG g_wtab_dirty = 0;      /* 收到了但还没写进内存（不在主线程） */
-static int g_wtab_mode = 1;                 /* 当前模式：0 PVE / 1 PVP */
+static int g_wtab_mode = 1;                 /* Load 返回地址推出来的模式：0 PVE / 1 PVP（兜底） */
+static int g_wtab_mode_server = -1;         /* ★ 服务端开局时说的模式，-1 = 还没说过 */
 static unsigned g_wtab_last_src = 0;        /* 最近一次 Load 的返回地址（日志用） */
 static wtab_orig_t g_wtab_orig[WTAB_MAX];   /* 写之前存下的原值，Load 之后作废 */
 static int g_wtab_orig_n = 0;
@@ -8557,10 +8566,16 @@ static void wtab_apply(int mode, const char *why)
     }
 }
 
+/* 模式的三级取值：环境变量强制 > ★服务端开局时说的 > Load 返回地址推的（兜底）。
+   ★ 为什么服务端优先：`WeaponTable::Load` 的调用时机**不等于开局** —— 实测闯关
+   第一局打完才跑一次，而从闯关回到对战时干脆一次都不跑（§42）。只有训练场 /
+   教程那种不走服务端房间的场合才轮得到兜底那一级。 */
 static int wtab_current_mode(void)
 {
     int forced = wtab_forced_mode();
-    return forced >= 0 ? forced : g_wtab_mode;
+    if (forced >= 0) return forced;
+    if (g_wtab_mode_server >= 0) return g_wtab_mode_server;
+    return g_wtab_mode;
 }
 
 /* 攒着的表在主线程上补写（`on_crypt` 每次出站都问一下，正常路径就一个标志）。 */
@@ -8575,7 +8590,7 @@ static void wtab_apply_if_main_thread(void)
 static int __cdecl wtab_on_frame(void *pkt)
 {
     const unsigned char *frame;
-    unsigned opcode, len, fmt, serial, n, i, f;
+    unsigned opcode, len, fmt, serial, n, mode, i, f;
     const unsigned char *p;
     wtab_table_t tmp;
 
@@ -8588,21 +8603,27 @@ static int __cdecl wtab_on_frame(void *pkt)
 
     len = *(const unsigned short *)(frame + 2);
     p = frame + 10;
-    if (len < 8 || IsBadReadPtr(p, len)) {
+    if (len < WTAB_HEADER_BYTES || IsBadReadPtr(p, len)) {
         bslog("WTAB    !! 0x0F01 载荷太短（%u），丢弃", len);
         return 1;
     }
     fmt = *(const unsigned short *)(p + 0);
     serial = *(const unsigned *)(p + 2);
     n = *(const unsigned short *)(p + 6);
-    if (fmt != WTAB_FORMAT || n > WTAB_MAX || len != 8 + n * WTAB_RECORD_BYTES) {
+    mode = *(const unsigned char *)(p + 8);
+    if (fmt != WTAB_FORMAT || n > WTAB_MAX
+            || len != WTAB_HEADER_BYTES + n * WTAB_RECORD_BYTES) {
         bslog("WTAB    !! 0x0F01 格式对不上（format=%u n=%u len=%u），丢弃", fmt, n, len);
         return 1;
+    }
+    if (mode != WTAB_MODE_PVE && mode != WTAB_MODE_PVP && mode != WTAB_MODE_NONE) {
+        bslog("WTAB    !! 0x0F01 模式位不认识（%u），当成「不施加」", mode);
+        mode = WTAB_MODE_NONE;
     }
     memset(&tmp, 0, sizeof(tmp));
     tmp.serial = serial;
     tmp.n = (int)n;
-    p += 8;
+    p += WTAB_HEADER_BYTES;
     for (i = 0; i < n; i++) {
         int m;
         tmp.rec[i].id = *(const int *)p;
@@ -8620,8 +8641,17 @@ static int __cdecl wtab_on_frame(void *pkt)
     g_wtab = tmp;
     LeaveCriticalSection(&g_wtab_cs);
     InterlockedExchange(&g_wtab_have, 1);
-    InterlockedExchange(&g_wtab_dirty, 1);
-    bslog("WTAB    收到自定义武器表 v%u：%u 条（线程 %lu%s）", serial, n,
+    /* ★★ 只有带真模式的那一发（= 开局）才置「该写内存了」。管理页保存 / 登录后
+       那两发是 NONE，**只换表不写内存** —— 数值改动因此天然「下一局生效」，
+       不会把正在进行的那一局改成一半（弹匣容量在进图时已经快照进持枪器，
+       局内改记录只会让准星和实际弹匣对不上，§42）。 */
+    if (mode != WTAB_MODE_NONE) {
+        g_wtab_mode_server = (int)mode;
+        InterlockedExchange(&g_wtab_dirty, 1);
+    }
+    bslog("WTAB    收到自定义武器表 v%u：%u 条，模式 %s（线程 %lu%s）", serial, n,
+          mode == WTAB_MODE_NONE ? "不施加（下一局生效）"
+                                 : (mode == WTAB_MODE_PVE ? "任务" : "对战"),
           (unsigned long)GetCurrentThreadId(),
           GetCurrentThreadId() == g_main_thread_id ? "，主线程" : "，非主线程，等主线程补写");
     wtab_apply_if_main_thread();
@@ -8649,7 +8679,11 @@ static __declspec(naked) void det_wtab_dispatch(void)
     }
 }
 
-/* Load 返回之后：按返回地址定模式，作废原值缓存（表是新解析的），再写一遍。 */
+/* Load 返回之后：`Load` 刚把整张表按 ini 重解析了一遍（我们写进去的值全没了），
+   所以**必须**在这儿再写一遍。原值缓存同时作废（记录是新的）。
+
+   ★ 返回地址只用来喂**兜底**的 `g_wtab_mode`：服务端说过模式的话
+   `wtab_current_mode()` 用服务端那份（§42 / D32）。 */
 static void __cdecl wtab_after_load(void)
 {
     unsigned ret = (unsigned)g_wtab_load_ret;

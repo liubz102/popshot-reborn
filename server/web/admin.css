@@ -1631,6 +1631,12 @@ ul.help li.ro-note { color: var(--crimson); font-weight: 700; }
   padding: 10px 12px; background: var(--paper-2); border-radius: 10px;
   font-size: 13px; color: var(--cocoa-soft);
 }
+/* 「什么时候生效」那条提示：和 .weapon-locked 同一档灰盒子，多一道左边框提醒。 */
+.weapon-when {
+  padding: 8px 12px; margin-top: 8px; background: var(--paper-2);
+  border-left: 3px solid var(--cocoa-soft); border-radius: 0 10px 10px 0;
+  font-size: 13px; color: var(--cocoa-soft);
+}
 /* 物品库卡片右下角那颗按钮：贴着「等级 / 角色限定」那一行的右端。 */
 .item-card .nums .weapon-btn { margin-left: auto; align-self: flex-end; }
 

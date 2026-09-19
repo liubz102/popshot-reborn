@@ -26,6 +26,7 @@ import gameserver                                              # noqa: E402
 from gameserver import (                                       # noqa: E402
     CHAT_NO_SEAT, OP_CHAT, OP_LEAVE_SESSION, OP_LIST_SESSION,
     OP_COUNT_GAME_READY, OP_LOADING_DONE,
+    OP_HOOK_WEAPON_TABLE,
     OP_JOIN_RELAY, OP_LEAVE_RELAY, OP_START_TCP_RELAY,
     OP_MOVE_INTO_SESSION, OP_PEER_DATA_DOWN, OP_PEER_DATA_UP,
     OP_REQ_USER_LIST, OP_REP_USER_LIST,
@@ -1662,8 +1663,48 @@ class StartGameRoomTests(LobbyIsolated):
         self.assertEqual([OP_TRIGGER_COUNT_GAME], opcodes(self.bob))
         self.alice.sent.clear(); self.bob.sent.clear()
         self.ready(self.alice)
-        self.assertEqual([OP_PREPARE_GAME], opcodes(self.alice))
-        self.assertEqual([OP_PREPARE_GAME], opcodes(self.bob))
+        # ★ 0x0F01（自定义武器表 + 这一局的模式）必须排在 0x0400 **之前**，
+        #   见 `test_the_weapon_table_rides_in_front_of_prepare_game`。
+        self.assertEqual([OP_HOOK_WEAPON_TABLE, OP_PREPARE_GAME], opcodes(self.alice))
+        self.assertEqual([OP_HOOK_WEAPON_TABLE, OP_PREPARE_GAME], opcodes(self.bob))
+
+    def test_the_weapon_table_rides_in_front_of_prepare_game(self):
+        """★★★ 开局那一发 `0x0F01` 必须①排在 `0x0400` 之前 ②带**这一局**的真模式。
+
+        ① 排在前面：`0x0400` 一到客户端就切 stage 6 开始加载关卡，加载过程里
+           角色被建出来、弹匣容量从武器记录**快照**进持枪器（`0x48b96e`）；
+           晚一步这一局的弹匣就还是上一局那份。
+        ② 带真模式：客户端那边 `WeaponTable::Load` 的调用时机根本不等于「开局」
+           —— 实测闯关第一局打完才跑一次，从闯关回到对战时一次都不跑（§42），
+           所以「这一局是闯关还是对战」只能由建房的服务端说（D32）。
+        """
+        import weaponcfg
+        self.ready(self.alice)
+        self.alice.sent.clear()
+        self.ready(self.alice)
+        sent = opcodes(self.alice)
+        self.assertLess(sent.index(OP_HOOK_WEAPON_TABLE), sent.index(OP_PREPARE_GAME))
+        payload = [p for b in self.alice.sent for _, op, p in frames(b)
+                   if op == OP_HOOK_WEAPON_TABLE][0]
+        _fmt, _serial, mode, _records = weaponcfg.parse_hook_frame(payload)
+        # 这个测试类建的是普通房（session_type 1）⇒ 对战。
+        self.assertEqual(gameserver.SESSION_TYPE_QUEST != self.room.session_type,
+                         mode == weaponcfg.HOOK_MODE_PVP)
+        self.assertIn(mode, (weaponcfg.HOOK_MODE_PVE, weaponcfg.HOOK_MODE_PVP))
+        self.assertNotEqual(weaponcfg.HOOK_MODE_NONE, mode)
+
+    def test_a_quest_room_starts_in_pve_mode(self):
+        """★ 闯关房开局那一发必须是 `PVE` —— 问题 3（打完闯关再开对战还在用 PVE 值）
+        就是模式跟不上导致的，判据得钉在房间类型上。"""
+        import weaponcfg
+        self.room.session_type = gameserver.SESSION_TYPE_QUEST
+        self.ready(self.alice)
+        self.alice.sent.clear()
+        self.ready(self.alice)
+        payload = [p for b in self.alice.sent for _, op, p in frames(b)
+                   if op == OP_HOOK_WEAPON_TABLE][0]
+        _fmt, _serial, mode, _records = weaponcfg.parse_hook_frame(payload)
+        self.assertEqual(weaponcfg.HOOK_MODE_PVE, mode)
 
     def test_everyone_gets_the_same_seed(self):
         # seed 不一样 = 各人生成的关卡不一样。
@@ -1729,8 +1770,9 @@ class StartGameRoomTests(LobbyIsolated):
         gameserver.Conn.on_game_packet(self.bob, OP_LEAVE_SESSION, b"")
         self.alice.sent.clear()
         self.ready(self.alice); self.ready(self.alice); self.loaded(self.alice)
-        self.assertEqual([OP_TRIGGER_COUNT_GAME, OP_PREPARE_GAME,
-                          OP_COUNT_GAME_READY], opcodes(self.alice))
+        self.assertEqual([OP_TRIGGER_COUNT_GAME, OP_HOOK_WEAPON_TABLE,
+                          OP_PREPARE_GAME, OP_COUNT_GAME_READY],
+                         opcodes(self.alice))
 
     def test_someone_leaving_mid_load_releases_the_rest(self):
         """★ 回归：等的人走了，剩下的不能永远卡在加载界面。"""
@@ -2041,8 +2083,8 @@ class EpochGenerationTests(LobbyIsolated):
         carol.sent.clear()
         gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
         gameserver.Conn.on_game_packet(self.alice, OP_COUNT_GAME_READY, b"")
-        self.assertEqual([OP_TRIGGER_COUNT_GAME, OP_PREPARE_GAME],
-                         opcodes(carol))
+        self.assertEqual([OP_TRIGGER_COUNT_GAME, OP_HOOK_WEAPON_TABLE,
+                          OP_PREPARE_GAME], opcodes(carol))
         gens = {self.epoch(c).gen for c in (self.alice, self.bob, carol)}
         values = {self.epoch(c).value for c in (self.alice, self.bob, carol)}
         self.assertEqual(1, len(gens))

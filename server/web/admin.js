@@ -6477,9 +6477,19 @@ function renderWeaponModal() {
       "原版武器的数值不可修改（客户端按资源包里的原版数值算），这里只能改说明文。"));
   }
 
+  // ★ 生效时机得写在脸上（用户 2026-09-19）：数值下一局生效、说明文要重登。
+  //   不是保守做法留下的遗憾，是有意为之 —— 局内改记录会让准星和实际弹匣对不上
+  //   （弹匣容量进图时就快照进持枪器了，§42 / D32）。
+  if (view.custom) {
+    host.appendChild(el("div", "weapon-when",
+      "⏱ 属性改动 下一局 生效，不影响正在进行的对局（保存后会立刻推给在线玩家，"
+      + "他们下一局开局时套用）。"));
+  }
+
   var desc = el("div", "field wide weapon-desc");
   desc.appendChild(el("span", "lab", "说明文（游戏提示框的下半段，最多 "
-                      + view.desc_max_lines + " 行、" + view.desc_max_chars + " 个字；留空 = 不写）"));
+                      + view.desc_max_lines + " 行、" + view.desc_max_chars + " 个字；留空 = 不写）"
+                      + "　⏱ 商店提示框即时生效，仓库提示框要重新登录客户端才更新"));
   var area = document.createElement("textarea");
   area.value = WEAPON.edit.desc || "";
   area.disabled = !WEAPON.canEdit;

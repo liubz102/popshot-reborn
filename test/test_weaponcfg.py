@@ -8,6 +8,7 @@
 3. `0x0F01` 的载荷能编能解，两套模式各自带自己的 mask，字段顺序 / 类型和 hook 侧一致。
 """
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -198,15 +199,30 @@ class HookFrameTests(_Case):
     def test_layout(self):
         self.assertEqual(12, len(weaponcfg.FIELDS))
         self.assertEqual(108, weaponcfg.RECORD_SIZE)
+        self.assertEqual(9, weaponcfg.HEADER_SIZE)
         payload = weaponcfg.build_hook_frame()
-        fmt, serial, count = struct.unpack_from("<HIH", payload, 0)
+        fmt, serial, count, mode = struct.unpack_from("<HIHB", payload, 0)
         self.assertEqual((weaponcfg.WIRE_FORMAT, 0, 9), (fmt, serial, count))
-        self.assertEqual(8 + 9 * 108, len(payload))
+        self.assertEqual(weaponcfg.HOOK_MODE_NONE, mode)     # 默认不施加
+        self.assertEqual(9 + 9 * 108, len(payload))
+
+    def test_hook_mode_rides_in_the_header(self):
+        """★ 模式那一格：默认 `NONE`（只送数据、下一局生效），开局那一发才带真模式。
+
+        hook 侧 `WTAB_MODE_*` / `WTAB_HEADER_BYTES` 照这张表写，对不上就整份丢弃。
+        """
+        for wanted in (weaponcfg.HOOK_MODE_PVE, weaponcfg.HOOK_MODE_PVP,
+                       weaponcfg.HOOK_MODE_NONE):
+            payload = weaponcfg.build_hook_frame(hook_mode=wanted)
+            fmt, serial, mode, records = weaponcfg.parse_hook_frame(payload)
+            self.assertEqual(2, fmt)                         # 格式 2 = 带模式位
+            self.assertEqual(wanted, mode)
+            self.assertEqual(9, len(records))
 
     def test_round_trip_and_masks(self):
         weaponcfg.save_item(CUSTOM, params={"pve": {"damage": 50}, "pvp": {"velocity": 10}})
         payload = weaponcfg.build_hook_frame()
-        fmt, serial, records = weaponcfg.parse_hook_frame(payload)
+        fmt, serial, mode, records = weaponcfg.parse_hook_frame(payload)
         self.assertEqual(1, serial)
         by_id = dict(records)
         # ★ 帧里的键是**武器 Id**，不是物品 id；从 `shop_items.json` 取，别写死
@@ -224,6 +240,40 @@ class HookFrameTests(_Case):
                           "magazine", "cooling_ms", "reload_ms", "loading_ms",
                           "velocity", "max_velocity", "gravity"), weaponcfg.FIELD_KEYS)
         self.assertEqual([int] * 9 + [float] * 3, [f[4] for f in weaponcfg.FIELDS])
+
+
+class HookSourceStaysInSyncTests(unittest.TestCase):
+    """★★ `0x0F01` 的线格式是**跨语言**的：服务端 `weaponcfg` 和 `hook/bshook.c`
+    两边各写一份常量。漂了不会报错，只会整份被客户端**静默丢掉**
+    （`WTAB    !! 0x0F01 格式对不上（…），丢弃`），实机才看得出来。
+    所以拿源码核一遍 —— 这条守卫的成本是零，漏掉的代价是一轮实机。
+    """
+
+    def setUp(self):
+        path = os.path.join(ROOT, "hook", "bshook.c")
+        if not os.path.isfile(path):          # 发布包里没有 hook 源码
+            raise unittest.SkipTest("没有 hook/bshook.c")
+        with open(path, "rb") as handle:
+            self.text = handle.read().decode("utf-8", "replace")
+
+    def _define(self, name):
+        found = re.search(r"^#define\s+%s\s+(0x[0-9A-Fa-f]+|\d+)" % name,
+                          self.text, re.M)
+        self.assertIsNotNone(found, "bshook.c 里找不到 #define %s" % name)
+        return int(found.group(1), 0)
+
+    def test_format_and_header(self):
+        self.assertEqual(weaponcfg.WIRE_FORMAT, self._define("WTAB_FORMAT"))
+        self.assertEqual(weaponcfg.HEADER_SIZE, self._define("WTAB_HEADER_BYTES"))
+        self.assertEqual(len(weaponcfg.FIELDS), self._define("WTAB_FIELDS"))
+
+    def test_mode_codes(self):
+        self.assertEqual(weaponcfg.HOOK_MODE_PVE, self._define("WTAB_MODE_PVE"))
+        self.assertEqual(weaponcfg.HOOK_MODE_PVP, self._define("WTAB_MODE_PVP"))
+        self.assertEqual(weaponcfg.HOOK_MODE_NONE, self._define("WTAB_MODE_NONE"))
+        # PVE / PVP 必须和 `MODES` 里 PVE 在前的顺序一致 —— 载荷里两个块就是按这个序排的。
+        self.assertEqual((weaponcfg.MODE_PVE, weaponcfg.MODE_PVP), weaponcfg.MODES)
+        self.assertEqual(0, weaponcfg.HOOK_MODE_PVE)
 
 
 if __name__ == "__main__":

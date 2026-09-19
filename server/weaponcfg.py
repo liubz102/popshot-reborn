@@ -74,7 +74,15 @@ DESC_MAX_LINES = shopcfg.ITEM_DESC_MAX_LINES_2
 DESC_MAX_CHARS = 90
 
 #: `0x0F01` 载荷的格式号。改布局就 +1，hook 侧 `WTAB_FORMAT` 同步。
-WIRE_FORMAT = 1
+#: 2 = 头上多一个「这一局是闯关还是对战」的字节（§42 / D32）。
+WIRE_FORMAT = 2
+
+#: `0x0F01` 头里那一格模式。★ `NONE` = 「只更新数据、别施加」——
+#: 数值改动**下一局才生效**，不捅正在进行的那一局（用户 2026-09-19 拍板）。
+HOOK_MODE_PVE = 0
+HOOK_MODE_PVP = 1
+HOOK_MODE_NONE = 0xFF
+HOOK_MODE_ZH = {HOOK_MODE_PVE: "任务", HOOK_MODE_PVP: "对战", HOOK_MODE_NONE: "不施加"}
 
 
 class ConfigError(shopcfg.ConfigError):
@@ -308,11 +316,20 @@ def _pack_block(values):
     return struct.pack("<I", mask) + body
 
 
-def build_hook_frame(table=None, data_dir=None):
-    """`0x0F01` 的载荷：`u16 format, u32 serial, u16 n, n × { i32 武器Id, [PVE] u32 mask + 12×4B, [PVP] 同 }`。
+def build_hook_frame(table=None, data_dir=None, hook_mode=HOOK_MODE_NONE):
+    """`0x0F01` 的载荷：`u16 format, u32 serial, u16 n, u8 模式, n × { i32 武器Id, [PVE] 块, [PVP] 块 }`。
 
     ★ 每条都把两套**有效值**整个发下去（参考值也带 mask 位）：hook 那边不用知道 ini 里写了什么，
     没在 mask 里的格它写回自己保存的原值（管理员清掉某一格 = 回到参考值）。
+
+    ★★ `hook_mode`（格式 2 新增，§42 / D32）——「这一局是闯关还是对战」：
+
+    * `HOOK_MODE_NONE`（0xFF）：**只送数据，不要施加**。登录后那一发、管理页保存后广播的那一发
+      都用它 ⇒ 改了数值不会捅进正在进行的那一局，**下一局才生效**（用户 2026-09-19 拍板）。
+    * `HOOK_MODE_PVE` / `HOOK_MODE_PVP`：开局握手 `0x0400` **之前**那一发用它。
+      房间类型是服务端自己建的房，它最清楚（铁律 10：让掌握事实的那一方明说）——
+      客户端那边 `WeaponTable::Load` 的调用时机根本不等于「开局」，靠它推断模式会慢一拍
+      甚至不动（§42）。
     """
     if table is None:
         table = load(data_dir)
@@ -325,17 +342,21 @@ def build_hook_frame(table=None, data_dir=None):
         for mode in MODES:
             rec += _pack_block(effective(item_id, mode, table, data_dir))
         records.append(rec)
-    return (struct.pack("<HIH", WIRE_FORMAT, int(table.get("serial", 0)), len(records))
+    return (struct.pack("<HIHB", WIRE_FORMAT, int(table.get("serial", 0)),
+                        len(records), int(hook_mode) & 0xFF)
             + b"".join(records))
 
 
 RECORD_SIZE = 4 + 2 * (4 + 4 * len(FIELDS))
 
+#: 载荷头的字节数（`u16 format + u32 serial + u16 n + u8 模式`）。hook 侧 `WTAB_HEADER_BYTES` 同步。
+HEADER_SIZE = 9
+
 
 def parse_hook_frame(payload):
-    """`build_hook_frame` 的逆（测试和日志用）→ `(format, serial, [(武器Id, {mode: {字段: 值}})])`。"""
-    fmt, serial, count = struct.unpack_from("<HIH", payload, 0)
-    off = 8
+    """`build_hook_frame` 的逆（测试和日志用）→ `(format, serial, 模式, [(武器Id, {mode: {字段: 值}})])`。"""
+    fmt, serial, count, hook_mode = struct.unpack_from("<HIHB", payload, 0)
+    off = HEADER_SIZE
     out = []
     for _ in range(count):
         ammo = struct.unpack_from("<i", payload, off)[0]
@@ -355,7 +376,7 @@ def parse_hook_frame(payload):
         out.append((ammo, modes))
     if off != len(payload):
         raise ValueError("0x0F01 载荷长度不对：解到 %d，共 %d" % (off, len(payload)))
-    return fmt, serial, out
+    return fmt, serial, hook_mode, out
 
 
 # ---------------------------------------------------------------------------
