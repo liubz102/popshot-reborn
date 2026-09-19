@@ -27,11 +27,12 @@ class WeaponTableHookTest(unittest.TestCase):
         cls.dispatch = base.c_define(cls.src, "WTAB_DISPATCH_VA")
         cls.load = base.c_define(cls.src, "WTAB_LOAD_VA")
         cls.lookup = base.c_define(cls.src, "WTAB_LOOKUP_VA")
+        cls.merge = base.c_define(cls.src, "WTAB_MERGE_VA")
         cls.table = base.c_define(cls.src, "WTAB_TABLE_VA")
 
     def test_the_three_signatures_are_what_the_image_has(self):
         for name, va in (("WTAB_DISPATCH_SIG", self.dispatch), ("WTAB_LOAD_SIG", self.load),
-                         ("WTAB_LOOKUP_SIG", self.lookup)):
+                         ("WTAB_LOOKUP_SIG", self.lookup), ("WTAB_MERGE_SIG", self.merge)):
             sig = base.c_byte_array(self.src, name)
             self.assertEqual(sig, base.read_va(self.img, va, len(sig)), name)
 
@@ -69,6 +70,45 @@ class WeaponTableHookTest(unittest.TestCase):
             self.assertEqual(0xe8, code[0], name)
             target = (ret + struct.unpack("<i", code[1:5])[0]) & 0xFFFFFFFF
             self.assertEqual(self.load, target, "%s 前面那条 call 不是 Load" % name)
+
+    def test_the_merge_site_is_the_other_way_into_the_weapon_table(self):
+        """★★ `0x48adb0` 是**第二条**会改写武器记录的路径（§44）：它加载一份额外的 ini
+        并把小节逐条解析进同一张表，**不经过 `WeaponTable::Load`**。
+        判据有三条，缺一条这个钩子就白挂：
+          ① 它的序言是 5 字节 `mov eax,<imm32>`（SEH 序言），偷得整整齐齐；
+          ② 它确实调那个逐节解析函数 `0x488d31`（和 Load 里那个是同一个）；
+          ③ 它确实往全局武器表 `WTAB_TABLE_VA` 上写。
+        """
+        sig = base.c_byte_array(self.src, "WTAB_MERGE_SIG")
+        self.assertEqual(5, len(sig))
+        self.assertEqual(0xB8, sig[0], "序言不是 mov eax,imm32，偷 5 字节会切断指令")
+        body = base.read_va(self.img, self.merge, 0x200)
+        # ② call 0x488d31 —— 相对调用，直接扫编码
+        want = None
+        for off in range(len(body) - 5):
+            if body[off] == 0xE8:
+                target = self.merge + off + 5 + struct.unpack_from("<i", body, off + 1)[0]
+                if target == 0x488D31:
+                    want = off
+                    break
+        self.assertIsNotNone(want, "0x48adb0 里没找到 call 0x488d31（逐节解析）")
+        # ③ 引用全局武器表
+        self.assertIn(struct.pack("<I", self.table), body,
+                      "0x48adb0 里没引用 WTAB_TABLE_VA，站点八成认错了")
+
+    def test_the_parser_has_exactly_two_ways_in(self):
+        """★ 逐节解析函数 `0x488d31` 全镜像只有**两个**调用者：`Load` 里那个
+        和 `0x48adb0`。再冒出第三个就说明还有一条我们没钩的路 —— 那正是
+        2026-09-19 闯关里「PVE 值被冲回 ini 原值」的来路。"""
+        callers = []
+        for off in range(0, len(self.img) - 5):
+            if self.img[off] != 0xE8:
+                continue
+            va = 0x400000 + off
+            if va + 5 + struct.unpack_from("<i", self.img, off + 1)[0] == 0x488D31:
+                callers.append(va)
+        self.assertEqual([0x48AEF0, 0x48B694], sorted(callers),
+                         "weapon.ini 逐节解析的调用者变了：%s" % [hex(c) for c in callers])
 
     def test_the_lookup_reads_the_table_we_pass(self):
         """`0x4157bf` 从 `[ecx+4]`/`[ecx+8]` 取桶数组，`[eax]` 取 id —— 容器指针和 id 指针传对了才有意义。"""

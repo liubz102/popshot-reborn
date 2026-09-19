@@ -8428,6 +8428,11 @@ static int try_hook_render_init(void)
 #define WTAB_LOOKUP_VA     0x004157bfu
 #define WTAB_DISPATCH_VA   0x0054e036u
 #define WTAB_LOAD_VA       0x0048b50du
+/* ★★ 第 5 条会改写武器记录的路径（§44）：`0x48adb0(路径)` 加载一份**额外的** ini
+   并把里面的小节逐条解析进同一张表 `0x72e788` —— 闯关进图时由场景代码调
+   （`0x4a3771` / `0x4a3804`，文件存在才调）。它**不经过 `WeaponTable::Load`**，
+   所以只钩 Load 的话，闯关里我们写的值会被它连带冲回 ini 原值。 */
+#define WTAB_MERGE_VA      0x0048adb0u
 #define WTAB_RECORD_SIZE   0x254u
 /* Load 的返回地址 → 模式（call 0x48b50d 的下一条指令） */
 #define WTAB_RET_QUEST     0x004a3b81u   /* 闯关场景构造 */
@@ -8438,6 +8443,7 @@ static int try_hook_render_init(void)
    0x48b50d `mov eax,0x62e808`（5 B）；0x4157bf `push esi / mov esi,[eax] / push edi`。 */
 static const unsigned char WTAB_DISPATCH_SIG[9] = { 0x56,0x8b,0xf1,0x8b,0x0d,0x9c,0xe2,0x72,0x00 };
 static const unsigned char WTAB_LOAD_SIG[5]     = { 0xb8,0x08,0xe8,0x62,0x00 };
+static const unsigned char WTAB_MERGE_SIG[5]    = { 0xb8,0x44,0xe8,0x62,0x00 };  /* mov eax,0x62e844（SEH 序言）*/
 static const unsigned char WTAB_LOOKUP_SIG[5]   = { 0x56,0x8b,0x30,0x57,0x8b };
 
 /* 12 格的记录偏移 + 类型。顺序 == `weaponcfg.FIELDS`（test_weaponcfg 钉着那边的顺序）。 */
@@ -8465,11 +8471,14 @@ static wtab_orig_t g_wtab_orig[WTAB_MAX];   /* 写之前存下的原值，Load �
 static int g_wtab_orig_n = 0;
 static void *s_wtab_dispatch = NULL;        /* 蹦床 */
 static void *s_wtab_load = NULL;
+static void *s_wtab_merge = NULL;           /* 0x48adb0 的蹦床 */
+static DWORD g_wtab_merge_ret = 0;          /* 同 g_wtab_load_ret：不递归、只在主线程 */
 static DWORD g_wtab_load_ret = 0;           /* Load 的原返回地址（Load 不递归、只在主线程） */
 static volatile LONG g_wtab_hooked = 0;
 static unsigned g_wtab_logged_serial = 0;   /* 日志按 (serial, 模式, 写入条数) 翻转去重 */
 static int g_wtab_logged_mode = -1;
 static int g_wtab_logged_written = -1;
+static unsigned g_wtab_logged_src = 0xFFFFFFFFu;   /* 去重键里也要带来源，否则两件事被合成一行 */
 
 static int wtab_keep_original(void)
 {
@@ -8524,6 +8533,7 @@ static void wtab_apply(int mode, const char *why)
 {
     wtab_table_t snap;
     int i, f, written = 0, missing = 0;
+    int sample_id = 0, sample_damage = 0, sample_magazine = 0;
 
     if (!g_wtab_have) return;
     EnterCriticalSection(&g_wtab_cs);
@@ -8555,18 +8565,37 @@ static void wtab_apply(int mode, const char *why)
             else if (orig)
                 *slot = orig->orig[f];
         }
+        /* ★ 取第一条写成功的当样本，把**真正落进内存的数**打进日志（见下面那段注释）。 */
+        if (!written) {
+            sample_id = r->id;
+            sample_damage = *(int *)((unsigned char *)rec + 0x34);
+            sample_magazine = *(int *)((unsigned char *)rec + 0x60);
+        }
         written++;
     }
-    /* 日志按 (serial, 模式, 写入条数) 翻转去重：登录那一刻武器表还没加载（启动那次
-       Load 是进大厅时才跑，实测 0/9），Load 返回点上再写才是 9/9 —— 两次都要看得见。 */
+    /* 日志按 (serial, 模式, 写入条数, **来源**) 翻转去重。
+       ★★ 2026-09-19 补上「来源」和「样本值」：上一版的去重键里没有来源，于是
+       「开局推了一次」和「进图 Load 之后又重施加了一次」两件事只要 serial/模式/条数
+       一样就被合并成一行 —— 查「PVE 到底写没写进去」时只能靠 `g_wtab_last_src`
+       事后反推，白花一轮实机。判据要么自己说出来，要么就别打这行日志。
+       样本值直接**从记录里读回来**，所以它回答的是「内存里现在到底是哪一套」，
+       不是「我打算写什么」。 */
     if (g_wtab_logged_serial != snap.serial || g_wtab_logged_mode != mode
-            || g_wtab_logged_written != written) {
-        bslog("WTAB    自定义武器表 v%u：按【%s】写入 %d/%d 条（%s，来源 %08X）%s",
-              snap.serial, mode == 0 ? "任务" : "对战", written, snap.n, why,
-              g_wtab_last_src, missing ? "，有条目在表里查不到" : "");
+            || g_wtab_logged_written != written || g_wtab_logged_src != g_wtab_last_src) {
+        if (written)
+            bslog("WTAB    自定义武器表 v%u：按【%s】写入 %d/%d 条（%s，来源 %08X）"
+                  "；回读 id=%d 身体伤害=%d 弹匣=%d%s",
+                  snap.serial, mode == 0 ? "任务" : "对战", written, snap.n, why,
+                  g_wtab_last_src, sample_id, sample_damage, sample_magazine,
+                  missing ? "，有条目在表里查不到" : "");
+        else
+            bslog("WTAB    自定义武器表 v%u：按【%s】写入 0/%d 条（%s，来源 %08X）"
+                  "—— 一条都没写，武器表这会儿还没加载",
+                  snap.serial, mode == 0 ? "任务" : "对战", snap.n, why, g_wtab_last_src);
         g_wtab_logged_serial = snap.serial;
         g_wtab_logged_mode = mode;
         g_wtab_logged_written = written;
+        g_wtab_logged_src = g_wtab_last_src;
     }
 }
 
@@ -8727,6 +8756,47 @@ static __declspec(naked) void det_wtab_load(void)
     }
 }
 
+/* ★ 关卡额外 ini 合并（`0x48adb0`）之后：它刚把一批小节按 ini 原文解析进同一张表，
+   我们写的值被连带冲掉了，所以和 `Load` 一样在返回点重写一遍（§44 / D35）。
+   原值缓存也要作废 —— 被它碰过的记录已经是新解析出来的了。 */
+static void __cdecl wtab_after_merge(void)
+{
+    /* ★ 把「来源」记成合并站点本身：`wtab_apply` 的日志去重键里带着它，不改的话这一次
+       重施加和开局那一发的键完全一样，**整行会被吃掉** —— 2026-09-19 就是这么白查了一轮
+       （§44 / D32 的教训：判据要么自己说出来，要么就别打这行日志）。
+       它同时也让日志上「谁重建了这张表」一眼可读：`来源 0048ADB0` = 关卡合并。 */
+    g_wtab_last_src = WTAB_MERGE_VA;
+    g_wtab_orig_n = 0;
+    if (g_wtab_have)
+        wtab_apply(wtab_current_mode(), "关卡武器表合并后重施加");
+}
+
+static __declspec(naked) void wtab_merge_stub(void)
+{
+    __asm {
+        pushad
+        pushfd
+        call wtab_after_merge
+        popfd
+        popad
+        push g_wtab_merge_ret
+        ret
+    }
+}
+
+static __declspec(naked) void det_wtab_merge(void)
+{
+    __asm {
+        push eax
+        mov eax, dword ptr [esp+4]
+        mov g_wtab_merge_ret, eax
+        pop eax
+        mov dword ptr [esp], offset wtab_merge_stub
+        push s_wtab_merge
+        ret
+    }
+}
+
 static int try_install_weapon_table_hooks(void)
 {
     if (g_wtab_hooked) return 1;
@@ -8749,9 +8819,19 @@ static int try_install_weapon_table_hooks(void)
     if (!s_wtab_load) {
         bslog("WTAB    !! Load 钩子没装上：表只在收到时写一次，进图重读后会被 ini 原值盖掉");
     }
+    if (!IsBadReadPtr((const void *)WTAB_MERGE_VA, sizeof(WTAB_MERGE_SIG))
+            && memcmp((const void *)WTAB_MERGE_VA, WTAB_MERGE_SIG, sizeof(WTAB_MERGE_SIG)) == 0) {
+        s_wtab_merge = install_inline_hook((void *)WTAB_MERGE_VA, (void *)det_wtab_merge,
+                                           "WeaponTable::MergeIni(关卡额外武器表)");
+    }
+    if (!s_wtab_merge) {
+        bslog("WTAB    !! 关卡合并钩子没装上：闯关进图时我们写的值会被关卡 ini 冲回原值（§44）");
+    }
     InterlockedExchange(&g_wtab_hooked, 1);
-    bslog("WTAB    ★自定义武器表钩子已装（吞 0x0F01 @ %08X，Load 返回点 @ %08X，查表 @ %08X）",
-          WTAB_DISPATCH_VA, WTAB_LOAD_VA, WTAB_LOOKUP_VA);
+    bslog("WTAB    ★自定义武器表钩子已装（吞 0x0F01 @ %08X，Load 返回点 @ %08X，"
+          "关卡合并返回点 @ %08X%s，查表 @ %08X）",
+          WTAB_DISPATCH_VA, WTAB_LOAD_VA, WTAB_MERGE_VA,
+          s_wtab_merge ? "" : "（没装上！）", WTAB_LOOKUP_VA);
     return 1;
 }
 
