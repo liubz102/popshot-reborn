@@ -325,11 +325,28 @@ NAME_ZH = {
 #: 三个武器系列。★ 这三个中文名是**用户记忆里的原版叫法**，别改。
 SERIES_ZH = {"D": "爆裂", "R": "极速", "F": "复合"}
 
-#: ★ 自定义武器（X3）：韩文名的后缀字母（`리볼버 C`，`tools/goldwp/spec.SERIES`）、
-#: 名字里的中文系列词（「左轮 自定义」，用户 2026-09-19 定）和管理页卡片上的类别字样。
-CUSTOM_WEAPON_SUFFIX = "C"
-CUSTOM_WEAPON_ZH = "自定义"
+#: ★ 自定义武器：**韩文名后缀字母 -> 名字里的中文词**（用户 2026-09-19 定）。
+#: 后缀字母由 `tools/goldwp/spec.BATCHES` 的批次字母决定，写进商店图标文件名
+#: （`무기_리볼버 C.png`），再经 `shopdata.icon_name()` 变成 `name_kr`（`리볼버 C`）。
+#:
+#: ★ **用后缀字母分批，不用部位码**：`name_kr` 本来就带着它，产物不用加字段、
+#:   `shop_items.json` 的 FORMAT 也就不用抬。加第三批时这里加一行即可。
+CUSTOM_WEAPON_ZH_BY_SUFFIX = {
+    "C": "自定义1",     # 第一批：爆裂 3 母本 · 黄金 + 银白
+    "P": "自定义2",     # 第二批：复合 3 母本 · 樱花粉 + 抹茶绿
+}
+#: 管理页卡片上的类别字样，两批共用。
 KIND_CUSTOM_WEAPON_ZH = "武器（自定义）"
+
+
+def custom_weapon_suffix(name_kr):
+    """`리볼버 C` -> `("리볼버", "自定义1")`；不是自定义武器就返回 `(原名, None)`。"""
+    name = (name_kr or "").strip()
+    for letter, zh in CUSTOM_WEAPON_ZH_BY_SUFFIX.items():
+        suffix = " " + letter
+        if name.endswith(suffix):
+            return name[:-len(suffix)].strip(), zh
+    return name, None
 
 #: 角色 id → 中文名（`Data/ChrProps.ini` 的前三个，V0.1 §119）。
 CHARACTER_ZH = {0: "泰尔", 1: "卡希尔", 2: "布洛克"}
@@ -452,11 +469,10 @@ def weapon_name_zh(item):
     name = item.name_kr or ""
     base = name
     if getattr(item, "custom", False):
-        # 自定义武器：`리볼버 C` → 「左轮 自定义」（X3）。翻不出基础名就把韩文基础名留着。
-        suffix = " " + CUSTOM_WEAPON_SUFFIX
-        if name.endswith(suffix):
-            base = name[:-len(suffix)]
-        return "%s %s" % (NAME_ZH.get(base.strip(), base.strip()), CUSTOM_WEAPON_ZH)
+        # 自定义武器：`리볼버 C` → 「左轮 自定义1」（X3 / X6）。翻不出基础名就把韩文基础名留着。
+        base, zh = custom_weapon_suffix(name)
+        if zh:
+            return "%s %s" % (NAME_ZH.get(base, base), zh)
     if item.series and item.tier:
         suffix = " %s%d" % (item.series, item.tier)
         if name.endswith(suffix):
@@ -2831,10 +2847,23 @@ def apply_first_run_upgrades(created, data_dir=None):
 #:     60005 빈대（蹭吃蹭喝的人）       厄运卡片 -> 蹭分卡片
 #:     60007 팀킬쟁이（杀队友的）       乌龙卡片 -> 误伤卡片
 #:     60008 제풀쟁이（自己把自己搞死的）信心卡片 -> 自爆卡片
+#: 第二批（用户 2026-09-19，X6）：加了第二批自定义武器之后，第一批的默认名从
+#: 「xxx 自定义」改成「xxx 自定义1」（新的那 9 把叫「xxx 自定义2」），见
+#: `CUSTOM_WEAPON_ZH_BY_SUFFIX`。这 9 条在 `data/items.json` 里是**已经落过盘的**，
+#: 而 `backfill_defaults()` 只增不改 —— 所以必须走这张表刷一遍。
 RENAMED_DEFAULT_NAMES = {
     60005: "厄运卡片",
     60007: "乌龙卡片",
     60008: "信心卡片",
+    1920001: "左轮手枪 自定义",
+    1920002: "苹果弹 自定义",
+    1920003: "狙击枪T1 自定义",
+    2920001: "复古短枪 自定义",
+    2920002: "火焰弹 自定义",
+    2920003: "华尔兹加农炮 自定义",
+    3920001: "重机枪 自定义",
+    3920002: "榴弹发射器 自定义",
+    3920003: "火箭炮 自定义",
 }
 
 

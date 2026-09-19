@@ -188,11 +188,13 @@ PART_KIND = {
     11: "armor",    # 头饰      PartFlag 128
     12: "weapon",   # 武器      PartFlag 1024 / 2048 / 4096
     13: "ring",     # 戒指      PartFlag 16384
-    # ★ 92 = **自定义武器**（X_Mod · X3，本项目自己定的部位码，原版没有）：
-    #   `X 92 000 S`，X = 角色、S = 槽位。和 12 一样是武器（PartFlag 1024/2048/4096），
+    # ★ 92 / 93 = **自定义武器**（X_Mod · X3 / X6，本项目自己定的部位码，原版没有）：
+    #   `X <部位码> 000 S`，X = 角色、S = 槽位。和 12 一样是武器（PartFlag 1024/2048/4096），
     #   只是数值由服务端下发（管理页可调），产物里多一个 `custom: true`。
-    #   ⚠ 和期限版的 `+50` 不撞：92 - 50 = 42 不是任何部位码。
-    92: "weapon",   # 自定义武器（X3）
+    #   **一批一个部位码**（92 第一批 / 93 第二批），理由见 `CUSTOM_WEAPON_PART`。
+    #   ⚠ 和期限版的 `+50` 不撞：92 - 50 = 42、93 - 50 = 43，都不是任何部位码。
+    92: "weapon",   # 自定义武器 第一批（X3，爆裂 3 母本 · 黄金）
+    93: "weapon",   # 自定义武器 第二批（X6，复合 3 母本 · 粉绿）
     21: "key",      # 金钥匙
     39: "package",  # 套装礼包
     99: "package",  # 套装打包
@@ -230,8 +232,14 @@ PREFIX_KIND_6 = {
 #: 武器槽 `PartFlag` -> 槽位序号。
 WEAPON_SLOT_BY_FLAG = {1024: 1, 2048: 2, 4096: 3}
 
-#: 自定义武器的部位码（见 `PART_KIND[92]`）。
-CUSTOM_WEAPON_PART = 92
+#: 自定义武器的部位码，**一批一个**（见 `PART_KIND`）：`92` = 第一批（爆裂 3 母本 · 黄金），
+#: `93` = 第二批（复合 3 母本 · 粉绿）。产物里两批都只打 `custom: true`，靠韩文名后缀字母
+#: （`리볼버 C` / `리볼버 P`）区分 —— 所以 `shop_items.json` 的 FORMAT 不用抬。
+#:
+#: ⚠ **别改成「共用 92、换尾号」**（如 `1920011`）：`weapon_variant()` 按尾四位落在 `11..93`
+#:   判 D/R/F，`0011` 会被判成「D 系 1 档 1 槽」。现在 `part in CUSTOM_WEAPON_PART` 会短路跳过
+#:   那次调用，但「自定义武器的尾四位天然判不出变体」这条不变式就没了（§39）。
+CUSTOM_WEAPON_PART = frozenset((92, 93))
 
 #: 三个武器系列。key 是 id 尾四位 `//10` 的十位段（见 `weapon_variant`）。
 SERIES_NAMES = {"D": "爆裂", "R": "极速", "F": "复合"}
@@ -468,9 +476,9 @@ def _new_item(item_id, fields, bonus_table, weapons_by_ammo, warn):
 
     if kind == "weapon":
         slot = WEAPON_SLOT_BY_FLAG.get(part_flag)
-        # ★ 自定义武器（部位码 92，X3）：没有 D/R/F 系列和档位，`weapon_variant`
+        # ★ 自定义武器（部位码 92 / 93，X3 / X6）：没有 D/R/F 系列和档位，`weapon_variant`
         #   对它的尾四位（0001..0003）本来就判不出变体，这里只多打一个标记。
-        if part == CUSTOM_WEAPON_PART:
+        if part in CUSTOM_WEAPON_PART:
             entry["custom"] = True
             series, series_slot, tier = None, None, None
         else:

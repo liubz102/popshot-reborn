@@ -25,9 +25,24 @@ import shopcfg  # noqa: E402
 import shopdata  # noqa: E402
 import weaponcfg  # noqa: E402
 
-CUSTOM = 1920001          # 泰尔 1 号「左轮 自定义」
+CUSTOM = 1920001          # 第一批（C · 爆裂 3 母本）泰尔 1 号「左轮手枪 自定义1」
+CUSTOM2 = 1930001         # 第二批（P · 复合 3 母本）泰尔 1 号「左轮手枪 自定义2」
 CUSTOM_GRENADE = 1920002  # 泰尔 2 号（有溅射 / 最大初速）
 ORIGINAL = 1120011        # 左轮 爆裂1（原版）
+
+_SPEC = []
+
+
+def _goldwp_spec():
+    """`tools/goldwp/spec.py` —— 自定义武器编号的唯一源头（只依赖标准库）。"""
+    if not _SPEC:
+        import importlib.util
+        path = os.path.join(ROOT, "tools", "goldwp", "spec.py")
+        s = importlib.util.spec_from_file_location("test_wc_goldwp_spec", path)
+        module = importlib.util.module_from_spec(s)
+        s.loader.exec_module(module)
+        _SPEC.append(module)
+    return _SPEC[0]
 
 
 class _Case(unittest.TestCase):
@@ -70,9 +85,15 @@ class RegistrationTests(_Case):
         self.assertEqual({}, weaponcfg.load()["custom"])
         self.assertEqual(weaponcfg.reference(CUSTOM), weaponcfg.effective(CUSTOM, "pvp"))
 
-    def test_nine_custom_weapons_are_known(self):
-        self.assertEqual([1920001, 1920002, 1920003, 2920001, 2920002, 2920003,
-                          3920001, 3920002, 3920003], weaponcfg.custom_item_ids())
+    def test_every_custom_weapon_is_known(self):
+        """两批自定义武器（X3 的 `C` · X6 的 `P`）全部认得出来。
+
+        ★ 期望值**从 `tools/goldwp/spec.py` 现取**：那儿是编号的唯一源头，
+          加第三批时这条自动跟着走，不用改常量。
+        """
+        self.assertEqual(sorted(w.item_id for w in _goldwp_spec().WEAPONS),
+                         weaponcfg.custom_item_ids())
+        self.assertEqual(18, len(weaponcfg.custom_item_ids()))   # 两批 × 9
         self.assertTrue(weaponcfg.is_custom(CUSTOM))
         self.assertFalse(weaponcfg.is_custom(ORIGINAL))
 
@@ -308,14 +329,28 @@ class DescriptionTests(_Case):
         self.assertIn("伤害 9", "\n".join(view["lines"]["pvp"]))
 
     def test_names(self):
-        self.assertEqual("左轮 自定义", shopcfg.item_name_zh(shopdata.get(CUSTOM)))
+        """两批的默认名按韩文名后缀字母分开：`C` -> 自定义1、`P` -> 自定义2（用户 2026-09-19）。"""
         import shopdefaults
-        self.assertEqual("左轮手枪 自定义", shopdefaults.name_of(shopdata.get(CUSTOM)))
+        self.assertEqual("左轮 自定义1", shopcfg.item_name_zh(shopdata.get(CUSTOM)))
+        self.assertEqual("左轮手枪 自定义1", shopdefaults.name_of(shopdata.get(CUSTOM)))
+        self.assertEqual("左轮手枪 自定义2", shopdefaults.name_of(shopdata.get(CUSTOM2)))
         items = shopcfg.validate_items(shopcfg.default_items())
-        self.assertEqual("左轮手枪 自定义", items[CUSTOM]["name"])
+        self.assertEqual("左轮手枪 自定义1", items[CUSTOM]["name"])
+        self.assertEqual("左轮手枪 自定义2", items[CUSTOM2]["name"])
         self.assertEqual(0, items[CUSTOM]["character"])
-        # ★ 出厂不上架（用户 2026-09-19）
-        self.assertNotIn(CUSTOM, shopcfg.validate_shop(shopcfg.default_shop()))
+        # ★ 出厂不上架（用户 2026-09-19），两批都是
+        shop = shopcfg.validate_shop(shopcfg.default_shop())
+        self.assertNotIn(CUSTOM, shop)
+        self.assertNotIn(CUSTOM2, shop)
+
+    def test_every_batch_has_a_chinese_word(self):
+        """★ 后缀字母 -> 中文词的表必须覆盖 `spec.BATCHES` 的每一批 —— 漏一批，
+        那 9 把的名字会静默退回韩文（`weapon_name_zh` 的兜底分支）。"""
+        for letter in _goldwp_spec().BATCHES:
+            self.assertIn(letter, shopcfg.CUSTOM_WEAPON_ZH_BY_SUFFIX, letter)
+        self.assertEqual(len(_goldwp_spec().BATCHES),
+                         len(set(shopcfg.CUSTOM_WEAPON_ZH_BY_SUFFIX.values())),
+                         "两批不能叫同一个名字")
 
 
 class HookFrameTests(_Case):
@@ -324,11 +359,14 @@ class HookFrameTests(_Case):
         self.assertEqual(12, len(weaponcfg.FIELDS))
         self.assertEqual(108, weaponcfg.RECORD_SIZE)
         self.assertEqual(9, weaponcfg.HEADER_SIZE)
+        n = len(weaponcfg.custom_item_ids())                 # 两批 = 18 条
         payload = weaponcfg.build_hook_frame()
         fmt, serial, count, mode = struct.unpack_from("<HIHB", payload, 0)
-        self.assertEqual((weaponcfg.WIRE_FORMAT, 0, 9), (fmt, serial, count))
+        self.assertEqual((weaponcfg.WIRE_FORMAT, 0, n), (fmt, serial, count))
         self.assertEqual(weaponcfg.HOOK_MODE_NONE, mode)     # 默认不施加
-        self.assertEqual(9 + 9 * 108, len(payload))
+        self.assertEqual(9 + n * 108, len(payload))
+        # ★ hook 侧 `WTAB_MAX` 是 32：条数超了整份包会被丢弃（bshook.c 的硬拦截）。
+        self.assertLessEqual(n, 32, "条数超过 bshook 的 WTAB_MAX，客户端会静默丢包")
 
     def test_hook_mode_rides_in_the_header(self):
         """★ 模式那一格：默认 `NONE`（只送数据、下一局生效），开局那一发才带真模式。
@@ -341,7 +379,7 @@ class HookFrameTests(_Case):
             fmt, serial, mode, records = weaponcfg.parse_hook_frame(payload)
             self.assertEqual(2, fmt)                         # 格式 2 = 带模式位
             self.assertEqual(wanted, mode)
-            self.assertEqual(9, len(records))
+            self.assertEqual(len(weaponcfg.custom_item_ids()), len(records))
 
     def test_round_trip_and_masks(self):
         weaponcfg.save_item(CUSTOM, params={"pve": {"damage": 50}, "pvp": {"velocity": 10}})

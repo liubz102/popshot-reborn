@@ -2258,7 +2258,10 @@ MagazineCount CoolingTime ReloadTime LoadingTime`（int32）`Velocity MaxVelocit
 ② 管理页「自定义属性」保存后 `gameserver.broadcast_hook_weapon_table()` 推给全部已登录连接（`0xFF`）；
 ③ **每一局开局**，`broadcast_start_game()` 里按 `room.session_type` 带真模式发给房里每个人。
 发给每一条已登录的连接，**不另设版本门控**（客户端版本只由 `server-ClientFilter.config` 那一道门管；没装钩子的老客户端收到也只是落进默认分支）。
-★ 只有 9 把自定义武器的 Id（`1 00C 3 S 5`，X_Mod §41）会出现在表里，原版武器不进这条链。
+★ 只有**自定义武器**的 Id 会出现在表里，原版武器不进这条链。现在是两批共 **18 条**
+（X3 的 `1 00C 3 S 5` = 1000315… · X6 的 `1 00C 4 S 5` = 1000415…，编号约束见 X_Mod §41）。
+条数写在载荷的 `u16 n` 里、服务端按 `shop_items.json` 的 `custom: true` 现数，**没有写死的常量**；
+但 hook 侧 `WTAB_MAX = 32` 是**硬拦截**（`n > 32` 整份包丢弃），所以再加批次前先看这个数。
 
 ---
 

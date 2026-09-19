@@ -1068,9 +1068,13 @@ class RealDefaultsTests(unittest.TestCase):
     def test_every_item_name_is_chinese(self):
         """★ 中文名的唯一出处是**物品库**（D31），所以这一条查的是它。"""
         items = shopcfg.validate_items(shopcfg.default_items())
-        # 808 件原版 + 9 把自定义武器（X3，`ShopItem-Chn.ini` 末尾 build.py 追加的那 9 组）
-        # + 18 件 3 级武器（X5，韩版有中文版没抄的那批，openweapons.py 补回来的，§45）
-        self.assertEqual(835, len(items), "物品库要收全部能进背包的东西")
+        # 808 件原版 + 18 件 3 级武器（X5，韩版有中文版没抄的那批，openweapons.py 补回来的，§45）
+        # + **两批**自定义武器各 9 把（X3 的 `C` / X6 的 `P`，build.py 追加进 `ShopItem-Chn.ini`）。
+        # ★ 自定义那部分按 `custom: true` 现数，加批次不用改常量。
+        custom = sum(1 for i in shopdata.ids_of_kind("weapon")
+                     if getattr(shopdata.get(i), "custom", False))
+        self.assertEqual(18, custom, "两批自定义武器各 9 把")
+        self.assertEqual(826 + custom, len(items), "物品库要收全部能进背包的东西")
         for item_id in shopdata.ids_of_kind("weapon"):
             item = shopdata.get(item_id)
             if not item.ownable or not item.series:

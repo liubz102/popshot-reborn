@@ -62,12 +62,21 @@ class WeaponIniTests(unittest.TestCase):
         for name, fields in self.sections.items():
             self.assertNotIn("Desc", fields, name)
 
+    def _installed(self):
+        """已经实装的那些批次的武器。
+
+        ★ 判据是**状态翻转**：`BATCHES[x].variant` 一填上（= 用户选定了配色、该批该生成了），
+          下面几条「资源必须在盘上」的守卫立刻开始管它。不是「跳过第 N 批」那种阈值。
+        """
+        return [w for w in self.spec.WEAPONS
+                if self.spec.BATCHES[w.batch].variant is not None]
+
     def test_every_custom_section_exists_with_its_ids(self):
-        for w in self.spec.WEAPONS:
+        for w in self._installed():
             self.assertIn(w.custom_section, self.sections)
             self.assertEqual(str(w.ammo_id), self.sections[w.custom_section]["Id"])
             self.assertEqual(str(w.mesh_idx), self.sections[w.custom_section]["WMeshIdx"])
-            self.assertEqual("%s%s,%d" % (w.icon_set, self.spec.SERIES, w.character),
+            self.assertEqual("%s%s,%d" % (w.icon_set, w.batch, w.character),
                              self.sections[w.custom_section]["Icon"])
             if w.piece_section:
                 self.assertIn(w.custom_piece_section, self.sections)
@@ -130,8 +139,9 @@ class WeaponIniTests(unittest.TestCase):
         spec = self.spec
         missing = []
         amf = _load_amf(self.root)
-        for name in [w.custom_section for w in spec.WEAPONS] + \
-                    [w.custom_piece_section for w in spec.WEAPONS if w.piece_section]:
+        installed = self._installed()
+        for name in [w.custom_section for w in installed] + \
+                    [w.custom_piece_section for w in installed if w.piece_section]:
             fields = self.sections[name]
             for key, value in fields.items():
                 kk = key.lstrip("_")
@@ -172,19 +182,39 @@ class WeaponIniTests(unittest.TestCase):
                         missing.append((name, key, value))
         self.assertEqual([], missing)
 
-    def test_shop_ini_has_the_nine_items(self):
+    def test_shop_ini_has_every_custom_item(self):
         path = os.path.join(self.root, "Data", "ShopItem-Chn.ini")
         with open(path, "rb") as fp:
             raw = fp.read()
         self.assertEqual(b"\xff\xfe", raw[:2])
         text = raw[2:].decode("utf-16le")
-        for w in self.spec.WEAPONS:
+        for w in self._installed():
             self.assertEqual(1, text.count("[Item-%d]" % w.item_id), w.item_id)
             self.assertEqual(1, text.count("[Stock-%d]" % w.item_id), w.item_id)
             self.assertIn("Tag=%d.0" % w.ammo_id, text)
-            icon = "Images/Shop/무기_%s %s.png" % (w.shop_icon_kr, self.spec.SERIES)
+            icon = "Images/Shop/무기_%s %s.png" % (w.shop_icon_kr, w.batch)
             self.assertIn("Image=" + icon, text)
             self.assertTrue(self._exists(icon), icon)
+
+    def test_the_batches_do_not_collide_with_each_other(self):
+        """两批（以及将来更多批）之间：武器 Id / 子弹药 Id / 物品 id / 网格号 / 小节名
+        / 商店图标名一个都不许撞。★ 这条不看磁盘，**没实装的批次也管**。"""
+        spec = self.spec
+        self.assertEqual(1920001, spec.WEAPONS[0].item_id,
+                         "openweapons.GOLDWP_ANCHOR 钉着 [Item-1920001]，第一条不能换")
+        for field, label in (("ammo_id", "武器 Id"), ("item_id", "物品 id"),
+                             ("custom_section", "小节名")):
+            values = [getattr(w, field) for w in spec.WEAPONS]
+            self.assertEqual(len(values), len(set(values)), "%s 有重复：%s" % (label, values))
+        pieces = [w.piece_id for w in spec.WEAPONS if w.piece_id]
+        self.assertEqual(len(pieces), len(set(pieces)), "子弹药 Id 有重复：%s" % pieces)
+        meshes = [(w.character, w.mesh_idx) for w in spec.WEAPONS]
+        self.assertEqual(len(meshes), len(set(meshes)), "手持网格号有重复：%s" % meshes)
+        icons = [(w.icon_set, w.batch) for w in spec.WEAPONS]
+        self.assertEqual(len(set(icons)), len(spec.BATCHES) * 3, "HUD 图集名有重复")
+        for letter, batch in spec.BATCHES.items():
+            self.assertEqual(9, len(spec.weapons_of(letter)), "批 %s 不是 9 把" % letter)
+            self.assertIn(batch.scheme, ("gold", "pink"), batch.scheme)
 
 
 def _load_amf(root):
