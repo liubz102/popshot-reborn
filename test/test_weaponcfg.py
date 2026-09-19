@@ -110,6 +110,114 @@ class ValidateTests(_Case):
         self.assertEqual({"pve": {}, "pvp": {}}, table["custom"][str(CUSTOM)])
 
 
+class RangeTests(_Case):
+    """管理页能填的范围（2026-09-19 收紧）vs 读盘放行的历史范围。
+
+    两句话：**新填的必须合理，旧的照样读得出来。**
+    后者是铁律 11 —— `shopcfg._load()` 对校验不过的文件是「整份退回出厂值」，
+    要是读盘也按新范围拦，一格存量的离谱数值就能让 GM 配过的全部数值一起消失。
+    """
+
+    def test_the_admin_ranges_are_the_tightened_ones(self):
+        """钉住用户 2026-09-19 拍板的那几个数（弹匣 1~100 是原话）。"""
+        limits = {f[0]: (f[5], f[6]) for f in weaponcfg.FIELDS}
+        self.assertEqual((1, 100), limits["magazine"])
+        self.assertEqual((0, 500), limits["damage"])
+        self.assertEqual((0, 500), limits["head_damage"])
+        self.assertEqual((0, 500), limits["legs_damage"])
+        self.assertEqual((0, 500), limits["splash_damage"])
+        self.assertEqual((0, 1000), limits["splash_range"])
+        self.assertEqual((1, 10000), limits["cooling_ms"])
+        self.assertEqual((0, 10000), limits["reload_ms"])
+        self.assertEqual((0, 10000), limits["loading_ms"])
+        self.assertEqual((0.0, 1000.0), limits["velocity"])
+        self.assertEqual((0.0, 1000.0), limits["max_velocity"])
+        self.assertEqual((-20.0, 20.0), limits["gravity"])
+
+    def test_every_field_has_a_legacy_range_that_is_not_narrower(self):
+        """读盘的范围必须**包住**管理页的范围，否则存不进去的值反而读得出来，反了。"""
+        self.assertEqual(set(weaponcfg.FIELD_KEYS), set(weaponcfg.LEGACY_LIMITS))
+        for key, _label, _unit, _src, _cast, low, high in weaponcfg.FIELDS:
+            llo, lhi = weaponcfg.LEGACY_LIMITS[key]
+            self.assertLessEqual(llo, low, "%s 的读盘下限比管理页还高" % key)
+            self.assertGreaterEqual(lhi, high, "%s 的读盘上限比管理页还低" % key)
+
+    def test_the_admin_range_really_covers_every_weapon_in_the_pack(self):
+        """★ 范围是照原版 `weapon.ini` 的分布定的 —— 反过来，资源包里**每一把**枪
+        的每一格都必须填得进管理页，否则「照着原版数值抄一份」这件事都做不到。"""
+        import weapondata
+        weapons = weapondata.STORE.table().get("weapons") or {}
+        if not weapons:
+            raise unittest.SkipTest("bot_weapons.json 里一把枪都没有")
+        checked = 0
+        for ammo_id in weapons:
+            weapon = weapondata.get(int(ammo_id))
+            if weapon is None:
+                continue
+            for key, label, _unit, src, cast, low, high in weaponcfg.FIELDS:
+                raw = weapon.raw.get(src)
+                if raw is None:
+                    continue
+                value = cast(raw)
+                self.assertLessEqual(value, high,
+                                     "资源包里 %s 的 %s=%s 比管理页上限 %s 还大"
+                                     % (ammo_id, label, value, high))
+                # ★ 下限只核对到 `cooling_ms` 为止：原版有 13 节 `CoolingTime=0`
+                #   （爱琳的种子炸弹那类「不靠连射节奏」的枪，加上 8 个怪物的碰撞
+                #   伤害），但管理页**一直**只让填 ≥1 —— 那是防「射速间隔 0 =
+                #   每帧一发」的有意保护，不是这次收紧范围带来的，别顺手放开。
+                if key != "cooling_ms":
+                    self.assertGreaterEqual(value, low,
+                                            "资源包里 %s 的 %s=%s 比管理页下限 %s 还小"
+                                            % (ammo_id, label, value, low))
+                checked += 1
+        self.assertGreater(checked, 100, "只核对了 %d 格，这条守卫等于没跑" % checked)
+
+    def test_the_admin_page_refuses_values_outside_the_new_range(self):
+        for bad in ({"magazine": 101}, {"magazine": 0}, {"damage": 501},
+                    {"velocity": 1000.1}, {"gravity": -20.1}, {"cooling_ms": 10001}):
+            with self.assertRaises(shopcfg.ConfigError, msg="%r 该被拒" % bad):
+                weaponcfg.save_item(CUSTOM, params={"pve": {}, "pvp": bad}, data_dir=self.dir)
+
+    def test_the_admin_page_accepts_the_new_upper_bounds(self):
+        weaponcfg.save_item(CUSTOM, params={"pve": {}, "pvp": {"magazine": 100, "damage": 500}},
+                            data_dir=self.dir)
+        self.assertEqual(100, weaponcfg.overrides_of(CUSTOM, "pvp", data_dir=self.dir)["magazine"])
+
+    def test_a_stored_legacy_value_survives_a_reload(self):
+        """★ 收紧范围之前存下的值不许因此丢失 —— 整份表也不许被拖下水。"""
+        legacy = {"custom": {str(CUSTOM): {"pve": {}, "pvp": {"magazine": 500, "damage": 20}}},
+                  "desc": {}, "serial": 3}
+        table = weaponcfg.validate(legacy)           # 读盘这条路
+        self.assertEqual(500, table["custom"][str(CUSTOM)]["pvp"]["magazine"])
+        self.assertEqual(20, table["custom"][str(CUSTOM)]["pvp"]["damage"])
+
+    def test_values_beyond_even_the_legacy_range_are_still_rejected(self):
+        with self.assertRaises(shopcfg.ConfigError):
+            weaponcfg.validate({"custom": {str(CUSTOM): {"pvp": {"magazine": 1000}}}})
+        with self.assertRaises(shopcfg.ConfigError):
+            weaponcfg.validate({"custom": {str(CUSTOM): {"pvp": {"magazine": 0}}}})
+
+    def test_saving_one_weapon_does_not_trip_over_another_ones_legacy_value(self):
+        """GM 改 A 的时候，B 那格存量的离谱值不能让保存整个失败。"""
+        path = shopcfg.path_of(weaponcfg.FILENAME, self.dir)
+        shopcfg.write_json(path, {"format": weaponcfg.FORMAT, "serial": 1, "desc": {},
+                                  "custom": {str(CUSTOM_GRENADE): {"pve": {},
+                                                                   "pvp": {"damage": 9999}}}})
+        shopcfg.invalidate(self.dir)
+        weaponcfg.save_item(CUSTOM, params={"pve": {}, "pvp": {"damage": 42}}, data_dir=self.dir)
+        self.assertEqual(42, weaponcfg.overrides_of(CUSTOM, "pvp", data_dir=self.dir)["damage"])
+        self.assertEqual(9999,
+                         weaponcfg.overrides_of(CUSTOM_GRENADE, "pvp", data_dir=self.dir)["damage"])
+
+    def test_the_admin_view_hands_the_tightened_range_to_the_page(self):
+        """弹窗里 input 的 min/max 就是 `FIELDS` 那套（`admin.js` 直接往 input 上写）。"""
+        view = weaponcfg.admin_view(CUSTOM, data_dir=self.dir)
+        row = {f["key"]: f for f in view["fields"]}
+        self.assertEqual((1, 100), (row["magazine"]["min"], row["magazine"]["max"]))
+        self.assertEqual((0, 500), (row["damage"]["min"], row["damage"]["max"]))
+
+
 class EffectiveTests(_Case):
 
     def test_reference_comes_from_the_resource_pack(self):
@@ -165,6 +273,22 @@ class DescriptionTests(_Case):
         weaponcfg.save_item(ORIGINAL, desc="第一行\n第二行")
         after = shopcfg.item_desc_zh(shopdata.get(ORIGINAL))
         self.assertEqual(before + shopcfg.DESC_SEPARATOR + "第一行\n第二行", after)
+
+    def test_admin_desc_puts_pve_first_like_everywhere_else(self):
+        """★ 顺序：**PVE 在前**（用户 2026-09-19 第三轮）。
+
+        弹窗里两栏是「PVE 在左、PVP 在右」，浮窗和预览区却反着来 —— 一处左右、
+        一处上下，看着别扭。三处统一跟 `weaponcfg.MODES` 走。
+        """
+        self.assertEqual((weaponcfg.MODE_PVE, weaponcfg.MODE_PVP), weaponcfg.MODES)
+        weaponcfg.save_item(CUSTOM, params={"pve": {"damage": 50}, "pvp": {"damage": 9}},
+                            data_dir=self.dir)
+        text = weaponcfg.admin_desc(shopdata.get(CUSTOM), data_dir=self.dir)
+        self.assertLess(text.index("【任务模式 PVE】"), text.index("【对战模式 PVP】"),
+                        "浮窗里 PVP 排到了 PVE 前面")
+        # 弹窗那边也按同一张表发顺序（`admin.js` 的预览区照 `view.modes` 画）
+        view = weaponcfg.admin_view(CUSTOM, data_dir=self.dir)
+        self.assertEqual(["pve", "pvp"], [m["key"] for m in view["modes"]])
 
     def test_admin_desc_lists_both_modes(self):
         """管理页浮窗 / 弹窗两套都列（用户 2026-09-19）；游戏内那段只有 PVP。"""

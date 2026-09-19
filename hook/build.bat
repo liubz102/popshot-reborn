@@ -74,6 +74,24 @@ if errorlevel 1 (
     echo [build] WARNING: could not regenerate pack.h; using the committed one
 )
 
+rem --------------------------------------------------------------------------
+rem  Regenerate hook\aimring.h from tools\aimring.py before compiling.
+rem
+rem  That is the "magazine size -> crosshair ring frame" table.  The same
+rem  script also PAINTS those frames into Images\Game\AimPoint.png, so the
+rem  table and the atlas can never drift apart -- but painting needs Pillow,
+rem  which the bundled runtime does not have.  --header-only regenerates just
+rem  the header and touches no image, so it runs anywhere.
+rem  Run `python tools\aimring.py` (full, needs C:\Python314) after changing
+rem  the dial range, then rebuild the resource pack.
+rem  aimring.h is committed, so building without Python still works.
+rem --------------------------------------------------------------------------
+set "GENAIM=%SRC%..\tools\aimring.py"
+"%PYEXE%" "%GENAIM%" --header-only
+if errorlevel 1 (
+    echo [build] WARNING: could not regenerate aimring.h; using the committed one
+)
+
 if not exist "%OUT%" mkdir "%OUT%"
 
 call "%VCVARS%" >nul

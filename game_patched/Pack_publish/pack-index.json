@@ -1,7 +1,7 @@
 {
  "format": 1,
  "packer": {"fill": 0, "key_prefix": "Pack/", "policy": "original-ext-v1", "sep": "~", "volume_cap": 16777216, "zlib_level": 9},
- "tree_hash": "cd363a1e394e19943d3e50044e8574fbf8b050159b600c09a33e2d08bdbfb2a7",
+ "tree_hash": "a49ef6019c4c1fd8c03c0995a200d1cc1a6a098a3aa8fa8e5780a346dde581eb",
  "volumes": {
   "Data~.pkn": {"group": "Data", "sha256": "4001281bf130b59b3c7b8b273423e95819a340a6b96980d643be1e89913f82b9", "size": 543744, "source": "Data", "members": [
    ["Chinese.ini", 114250, "2ecfe16814a0d515430fdeea80c53eb7cbd5a9e0be69dcee469f360b8ba08d4e"],
@@ -6049,11 +6049,11 @@
    ["Event/크리스마스 이벤트 아이콘.png", 8303, "4f001d7c7ee970c7476e2bb662be9f42f2383c36774f09054fc0b978759dd88e"],
    ["Event/크리스마스 이벤트 아이콘.smf", 136, "56fc573070d7ca0b46bab5326ebd421fa864ba13f878151f50ed0b7e3a314047"]
   ]},
-  "Images~Game.pkn": {"group": "Images", "sha256": "59b06663bd02249259b59420228b55ef4612c0bb399a332240892d62d6cfc73c", "size": 6249472, "source": "Images/Game", "members": [
+  "Images~Game.pkn": {"group": "Images", "sha256": "7767678a4cca922aece78430d6cadef27aa65f5b528acf0bb240c06a7a21f2d9", "size": 6279168, "source": "Images/Game", "members": [
    ["Game/AimGun.smf", 40, "4068b7cc65cb76e2793076e63e34544721fbd0b412a08afe511b2baea360762a"],
    ["Game/AimGun.tga", 8236, "35be79b642ae8f6ab5aa1872dc8e882c08a15974584c6622c9611cd95f629d80"],
-   ["Game/AimPoint.png", 40017, "263a450f1b2d9e75c3b3931083f13301f0e92db82cb0a8d9ac0029b015db6d64"],
-   ["Game/AimPoint.smf", 616, "391fb206d077a2bb3b45e7e0f241b04e9723f001c7a9aa1a86dac15efd7edd4e"],
+   ["Game/AimPoint.png", 70359, "4d20b7e25bef8ef7547ecc6ce78eb64a86527a0daafbe732c86e4a2c83b51014"],
+   ["Game/AimPoint.smf", 1032, "59e61be68c4f647157164592335a5836100b686c07b4a2f1745bc5d5499b4f3c"],
    ["Game/Apple.png", 3772, "55814673ce975a09216a7a5d82491d9eababecfdb628ef28215e9e6027415368"],
    ["Game/Apple.smf", 40, "6ce132306b0206daceeccacb0b65ad827db38aa3d3d9dab20028a1dc5cb7242f"],
    ["Game/ApplePiece.png", 1166, "a3f75cb1b1dcc18d63620ee388b8cb7593e3400933c744e090a872958ff383b4"],

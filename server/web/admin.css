@@ -337,7 +337,7 @@ input:focus, select:focus {
   box-shadow: 0 0 0 3px rgba(245, 166, 35, .28);
 }
 input[type=number] { max-width: 100%; }
-input.bad { border-color: var(--crimson); background: #FFF2F2; }
+input.bad, textarea.bad { border-color: var(--crimson); background: #FFF2F2; }
 
 /* 字段：一个标签 + 一个控件，横着排 */
 .field { display: flex; flex-direction: column; gap: 2px; }
@@ -829,6 +829,12 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 .msg.bad { color: var(--crimson); font-weight: 600; }
 .dirty { color: var(--crimson); font-weight: 700; }
 .dirty.clean { color: var(--cocoa-soft); font-weight: 500; }
+/* 「填错了」比「有改动」再进一档：同样的红字加一层粉底，和输入框的 `.bad` 呼应
+   —— 保存键这时是锁着的，得让人一眼知道为什么按不动（用户 2026-09-19）。 */
+.dirty.bad-text {
+  background: #FFF2F2; border: 1px solid var(--crimson);
+  border-radius: 6px; padding: 1px 7px;
+}
 
 /* ------------------------------------------------------------ 表格 */
 table { border-collapse: collapse; width: 100%; max-width: 520px; }
@@ -1572,21 +1578,33 @@ ul.help li.ro-note { color: var(--crimson); font-weight: 700; }
   display: flex; flex-direction: column; gap: 8px; align-self: center;
 }
 .weapon-copy .btn { white-space: nowrap; }
-/* 四个分组：伤害 / 溅射 / 射击 / 弹道。 */
-.weapon-group + .weapon-group { margin-top: 8px; }
+/* 四个分组：伤害 / 溅射 / 射击 / 弹道。
+   ★ 行距压过一轮：改单列之后一栏从 6 行变 12 行，不压的话弹窗必出滚动条。 */
+.weapon-group + .weapon-group { margin-top: 6px; }
 .weapon-group > b {
   display: block; font-size: 12px; color: var(--cocoa-soft);
-  padding: 2px 0 4px; border-bottom: 2px dashed var(--line); margin-bottom: 6px;
+  padding: 1px 0 3px; border-bottom: 2px dashed var(--line); margin-bottom: 4px;
 }
-.weapon-group .rows { display: grid; gap: 4px 10px; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
-/* 一格：标签 · 输入框 · 单位 · 参考值。`.field` 默认竖排，这里掰成横排（同卖价弹窗）。 */
-.weapon-field { display: flex; align-items: center; gap: 6px; min-width: 0; }
+/* ★ 一栏一列（用户 2026-09-19）：两列排不下「项目名 + 范围 + 输入框 + 单位 + 参考」，
+   而输入框上下对齐比省那几行高度值钱 —— 12 个字段单列排完两栏也就 500 px 上下，
+   弹窗封顶 860，平时一点滚动条都不该有。 */
+.weapon-group .rows { display: grid; gap: 3px 10px; grid-template-columns: minmax(0, 1fr); }
+/* 一格：项目名 · 「限 a ~ b」 · 输入框 · 单位 · 参考值，出错时下面再加一行红字。
+   ★ **定宽网格，不是 flex** —— 列宽写死，每一格的输入框才会上下对齐；
+     靠 flex 的话标签一长一短，输入框就参差不齐（用户 2026-09-19 提的就是这个）。
+   ★ 六列固定，所以 `weaponFieldNode()` 里**每一格都得有单位那个 span**（可以是空的）。 */
+.weapon-field {
+  display: grid;
+  grid-template-columns: 4.6em 7.4em 76px 2.4em minmax(0, 1fr);
+  align-items: center; column-gap: 6px; row-gap: 1px; min-width: 0;
+}
 .weapon-field > .lab {
-  flex: 1 1 auto; min-width: 0; font-size: 12px; font-weight: 600;
+  min-width: 0; font-size: 12px; font-weight: 600;
   color: var(--cocoa-ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* ★ 比页面上别处的输入框矮一档：整格的高度就是它撑出来的，12 行乘起来差 100 px。 */
 .weapon-field input[type=number] {
-  flex: 0 0 auto; width: 76px; text-align: center;
+  width: 76px; text-align: center; font-size: 13px; padding: 3px 6px;
   -moz-appearance: textfield; appearance: textfield;
 }
 .weapon-field input[type=number]::-webkit-outer-spin-button,
@@ -1599,9 +1617,27 @@ ul.help li.ro-note { color: var(--crimson); font-weight: 700; }
 .weapon-field.edited input[type=number] { box-shadow: 0 0 0 3px var(--edit-glow); }
 /* 参考值：灰小字，`—` 表示资源包里这一节没写这个键。 */
 .weapon-field .ref {
-  flex: 0 0 auto; font-size: 11px; color: var(--cocoa-soft); white-space: nowrap;
+  font-size: 11px; color: var(--cocoa-soft); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
 }
-.weapon-field .unit { flex: 0 0 auto; font-size: 11px; color: var(--cocoa-soft); white-space: nowrap; }
+.weapon-field .unit { font-size: 11px; color: var(--cocoa-soft); white-space: nowrap; }
+/* ★ 能填的范围（用户 2026-09-19）：排在项目名后面、输入框前面 —— 「这格叫什么、
+   能填多少、填了多少」念下来正好是一句话。比「参考 N」再淡一档：它是护栏，
+   不是建议值，平时不该抢眼。数由服务端 `weaponcfg.FIELDS` 发下来，CSS 里没有任何一个数。 */
+.weapon-field .lim {
+  font-size: 11px; color: var(--cocoa-soft); opacity: .8;
+  white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums;
+}
+/* 出错那一行：★ 就在**输入框正下方**（从第 3 列起），一行写完**不折行** ——
+   折行会把这一格撑高、把同一行别的格子顶歪。放不下就让它往右边的空白溢出，
+   那几列这一行本来就是空的。 */
+.weapon-field .err {
+  grid-column: 3 / -1; font-size: 11px; font-weight: 600; color: var(--crimson);
+  line-height: 1.5; display: none; white-space: nowrap; overflow: visible;
+}
+.weapon-field.has-err .err { display: block; }
+/* 出错的那一格连范围一起变红 —— 眼睛跟着红色走，直接看到「该填多少」。 */
+.weapon-field.has-err .lim { color: var(--crimson); opacity: 1; font-weight: 700; }
 .weapon-mode .acts { margin-top: 8px; display: flex; justify-content: flex-end; }
 /* 说明文 + 预览通栏。 */
 .weapon-desc { margin-top: 12px; }

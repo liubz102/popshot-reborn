@@ -44,6 +44,10 @@
 /* ★ 复用更新器那份 SHA-256（CNG / bcrypt，Win7+ 系统自带）—— 它本来就是
    用来校验下载包的，不要再写第二份实现。源文件由 build.bat 一起编进来。 */
 #include "sha256.h"
+/* ★ 弹匣容量 → 准星外圈帧号。生成物：tools/aimring.py 一边画那些帧、
+   一边写这张表，build.bat 每次编译前重新跑一遍（--header-only）。
+   别在本文件里写死任何帧号 —— test/test_aimring.py 盯着两边。 */
+#include "aimring.h"
 #pragma intrinsic(_ReturnAddress)
 
 /* -------------------------------------------------------------------------- */
@@ -8751,6 +8755,106 @@ static int try_install_weapon_table_hooks(void)
     return 1;
 }
 
+/* -------------------------------------------------------------------------- */
+/* ★ 准星外圈的弹格：让任意弹匣容量都有格子（X4，FINDINGS §43）              */
+/*                                                                            */
+/*   原版 0x48ca0d 是一张**精确匹配**的 switch：容量 2/3/6/10/14/18 各有一张   */
+/*   刻度盘（图集 Images/Game/AimPoint 的帧 6/5/6/8/7/9），**其余一律返回      */
+/*   帧 4 —— 一张没有任何刻度的光滑圆环**。原版玩家武器只用过那 6 个容量，     */
+/*   所以美术只画了 6 张；自定义武器一配成 15 / 20 发，外圈就退化成一个连起来   */
+/*   的圆，看不到子弹格子。                                                    */
+/*                                                                            */
+/*   补法：tools/aimring.py 把 2..20 里缺的 13 个容量补画进图集（原版那 6 张    */
+/*   一个像素不动），并生成 aimring.h 那张表；这里把 0x48ca0d **整个改写成**    */
+/*   跳到我们的实现 —— 不需要蹦床，因为新表把原来那 6 个值原样覆盖了。         */
+/*   容量 > 20 仍然走光滑圆环（用户 2026-09-19 拍板：格子太密反而糊成一片）。   */
+/*                                                                            */
+/*   ⚠ 资源和代码是一对：换了 bshook.dll 就必须同时换资源包，否则帧 19..31     */
+/*   在老图集里不存在 —— 客户端会拿越界的指针去画（§3 那类崩法）。            */
+/*   `manifest-hook.json` 和资源卷本来就是一起发的，别只换一个。               */
+/* -------------------------------------------------------------------------- */
+
+#define AIM_RING_VA        0x0048ca0du
+#define AIM_RING_SIG_LEN   10
+
+/* 0x48ca0d: `test ecx,ecx / push 4 / pop eax / je +0x2e / mov ecx,[ecx+0x60]` */
+static const unsigned char AIM_RING_SIG[AIM_RING_SIG_LEN] = {
+    0x85, 0xC9,                   /* test ecx, ecx        */
+    0x6A, 0x04,                   /* push 4               */
+    0x58,                         /* pop  eax             */
+    0x74, 0x2E,                   /* je   0x48ca42        */
+    0x8B, 0x49, 0x60              /* mov  ecx, [ecx+0x60] */
+};
+
+/* `__fastcall`：记录指针在 ecx，返回帧号在 eax（和原函数一致）。
+   `[记录+0x60]` 是 MagazineCount（WTAB_FIELD 里同一个偏移）。 */
+static int __fastcall aim_ring_frame(const unsigned char *rec)
+{
+    int cap;
+    if (rec == NULL) return POPSHOT_AIM_DEFAULT_FRAME;
+    cap = *(const int *)(rec + 0x60);
+    if (cap < POPSHOT_AIM_DIAL_MIN || cap > POPSHOT_AIM_DIAL_MAX)
+        return POPSHOT_AIM_DEFAULT_FRAME;      /* 光滑圆环 */
+    return (int)POPSHOT_AIM_FRAME[cap];
+}
+
+/* 原函数不碰 edx，我们替它守住 —— 调用约定上 edx 本来就是可破坏的，
+   但两个调用点（0x48f978 / 0x48fc5f）紧接着都还没重设它，白守一个寄存器
+   换「和原版逐寄存器等价」，值。 */
+static __declspec(naked) void aim_ring_frame_thunk(void)
+{
+    __asm {
+        push edx
+        call aim_ring_frame         /* ecx 已经是参数，fastcall 不用清栈 */
+        pop  edx
+        ret
+    }
+}
+
+static volatile LONG g_aim_ring_patched = 0;
+
+static int aim_ring_keep_original(void)
+{
+    /* 设了才是「保留原版」（和别的 KEEP_* 同一套语义）。 */
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_AIM_RING", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_patch_aim_ring(void)
+{
+    unsigned char *p = (unsigned char *)AIM_RING_VA;
+    DWORD oldp;
+
+    if (g_aim_ring_patched) return 1;
+    if (IsBadReadPtr(p, AIM_RING_SIG_LEN)) return 0;
+    /* 幂等：已打过就是「E9 <跳到 thunk 的 rel32>」 */
+    if (p[0] == 0xE9
+        && (DWORD)(*(int *)(p + 1))
+               == (DWORD)((UINT_PTR)&aim_ring_frame_thunk - (UINT_PTR)(p + 5))) {
+        InterlockedExchange(&g_aim_ring_patched, 1);
+        return 1;
+    }
+    if (memcmp(p, AIM_RING_SIG, AIM_RING_SIG_LEN) != 0)
+        return 0;                    /* 还没解壳到这里，或不是已确认的版本 */
+
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   准星弹格: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    p[0] = 0xE9;
+    *(DWORD *)(p + 1) = (DWORD)((UINT_PTR)&aim_ring_frame_thunk - (UINT_PTR)(p + 5));
+    VirtualProtect(p, 5, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    InterlockedExchange(&g_aim_ring_patched, 1);
+    bslog("PATCH   ★准星弹格 @ %08X: 弹匣 %d..%d 全部有刻度盘（原版只认 2/3/6/10/14/18），"
+          "超过 %d 发用光滑圆环；图集 %d → %d 帧",
+          (unsigned)AIM_RING_VA, POPSHOT_AIM_DIAL_MIN, POPSHOT_AIM_DIAL_MAX,
+          POPSHOT_AIM_DIAL_MAX, POPSHOT_AIM_ORIG_FRAMES, POPSHOT_AIM_TOTAL_FRAMES);
+    return 1;
+}
+
 #define CODE_PATCH_DELAY_MS 2500
 
 static DWORD WINAPI patch_thread(LPVOID param)
@@ -9132,6 +9236,21 @@ static DWORD WINAPI patch_thread(LPVOID param)
     if (!g_wtab_hooked)
         bslog("PATCH   !! 超时未能装自定义武器表钩子"
               "（0x54e036 / 0x48b50d / 0x4157bf 的特征串一直对不上）—— 9 把自定义武器只有资源包里的数值");
+
+    /* ★ 准星弹格（X4，§43）：功能补丁，一直装。目标函数只在战斗里画准星时跑，
+       远晚于解壳窗口。装不上只是「非 6 个原版容量的武器外圈没格子」，不影响别的。 */
+    if (aim_ring_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_AIM_RING 已设，保留原版行为"
+              "（弹匣不是 2/3/6/10/14/18 时准星外圈是一个没有刻度的圆）");
+    } else {
+        for (ticks = 0; !g_stop && !g_aim_ring_patched && ticks < 2000; ticks++) {
+            if (try_patch_aim_ring()) break;
+            Sleep(2);
+        }
+        if (!g_aim_ring_patched)
+            bslog("PATCH   !! 超时未能 patch 准星弹格"
+                  "（0x48ca0d 的特征串一直对不上）—— 非原版容量的武器外圈仍是光滑圆环");
+    }
 
     /* ★ M3b 诊断：弹体全字段快照（临时，查完「看不见 bot 的子弹」就删）。
        两个 hook 的目标函数都在战斗里才第一次跑，远晚于解壳窗口。 */

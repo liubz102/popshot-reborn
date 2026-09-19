@@ -6352,20 +6352,92 @@ function weaponDirty() {
   return JSON.stringify(WEAPON.edit) !== JSON.stringify(WEAPON.base);
 }
 
-function paintWeaponDirty() {
-  var dirty = weaponDirty();
-  var node = $("weaponDirty");
-  node.textContent = dirty ? "有未保存的修改" : "";
-  node.classList.toggle("clean", !dirty);
-  $("weaponSave").disabled = !WEAPON || !WEAPON.canEdit || !dirty;
+/* ---------------------------------------------------------------- 前台校验
+   ★ 和服务端 `weaponcfg.FIELDS` 的范围是**同一套**：`spec.min` / `spec.max`
+     就是 `admin_view()` 从那张表发下来的，这边不写死任何一个数。
+
+   为什么前台也要拦：服务端 `save_item()` 本来就会拒（`strict=True`），但那要
+   等一次往返、而且只回**第一条**错，GM 得靠猜。这里当场标红那一格 + 写清楚
+   要在多少之间 + 锁住保存键，省掉「填了一屏、点保存、被拒、再找是哪一格」。
+
+   ⚠ 这不是安全边界（同权限那段的说明）——拦不住直接 POST，服务端那道必须留着。
+
+   ★ 打开弹窗时**存量值**也会被扫一遍：D34 收紧范围之前存下的数照旧读得出来、
+     看得见，但它会被标红、保存键锁住 —— 想存就得先把那一格改进范围里。
+     这和服务端行为一致（`save_item` 对本次提交的那一件是严格校验）。
+   ------------------------------------------------------------------- */
+
+/** 一格数值：没问题回 `null`，有问题回一句能直接念给人听的话。空 = 用参考值，不算错。 */
+function weaponFieldError(spec, raw) {
+  var text = (raw === null || raw === undefined) ? "" : String(raw).trim();
+  if (text === "") { return null; }
+  var num = Number(text);
+  if (!isFinite(num)) { return "要填数字"; }
+  if (spec.type !== "float" && String(Math.trunc(num)) !== text.replace(/^\+/, "")) {
+    return "要填整数";
+  }
+  if (num < spec.min || num > spec.max) {
+    return "要在 " + spec.min + " ~ " + spec.max + " 之间";
+  }
+  return null;
 }
 
-/** 一格数值：标签 · 输入框 · 单位 · 「参考 N」。空 = 用参考值。 */
+/** 说明文：超行 / 超字回一句话，否则 `null`。判据和服务端 `validate_desc()` 同源。 */
+function weaponDescError(view, text) {
+  var body = String(text || "").replace(/\r/g, "");
+  var lines = body ? body.split("\n").length : 0;
+  if (lines > view.desc_max_lines) { return "最多 " + view.desc_max_lines + " 行"; }
+  if (body.length > view.desc_max_chars) { return "最多 " + view.desc_max_chars + " 个字"; }
+  return null;
+}
+
+/** 整窗扫一遍：`{fields: {"pve.damage": "…"}, desc: null|"…", count: N}`。 */
+function weaponErrors() {
+  var out = {fields: {}, desc: null, count: 0};
+  if (!WEAPON) { return out; }
+  var view = WEAPON.view || {};
+  if (view.custom) {
+    (view.fields || []).forEach(function (spec) {
+      ["pve", "pvp"].forEach(function (mode) {
+        var msg = weaponFieldError(spec, WEAPON.edit[mode][spec.key]);
+        if (msg) { out.fields[mode + "." + spec.key] = msg; out.count += 1; }
+      });
+    });
+  }
+  out.desc = weaponDescError(view, WEAPON.edit.desc);
+  if (out.desc) { out.count += 1; }
+  return out;
+}
+
+function paintWeaponDirty() {
+  var dirty = weaponDirty();
+  var bad = weaponErrors();
+  var node = $("weaponDirty");
+  // 有填错的就先说错 —— 「有未保存的修改」这时候不是 GM 最需要知道的那句。
+  node.textContent = bad.count ? ("⚠ 有 " + bad.count + " 处填得不对，改好才能保存")
+                               : (dirty ? "有未保存的修改" : "");
+  node.classList.toggle("clean", !dirty && !bad.count);
+  node.classList.toggle("bad-text", bad.count > 0);
+  $("weaponSave").disabled = !WEAPON || !WEAPON.canEdit || !dirty || bad.count > 0;
+}
+
+/** 一格数值：项目名 · 「限 a ~ b」 · 输入框 · 单位 · 「参考 N」，出错时下面再加一行红字。
+    空 = 用参考值。
+
+    ★ 六个孩子**一个都不能少**（用户 2026-09-19：输入框要上下对齐）：CSS 把这一格排成
+      定宽的网格，少一个单位格后面的东西就会整体左移一列 —— 所以没单位的字段也照样
+      塞一个空 `span`，别「优化」掉。 */
 function weaponFieldNode(mode, spec) {
   var wrap = el("div", "weapon-field");
   wrap.setAttribute("data-key", spec.key);
-  var lab = el("span", "lab", spec.label);
-  wrap.appendChild(lab);
+  wrap.appendChild(el("span", "lab", spec.label));
+
+  // ★ 能填多少，写在项目名后面、输入框前面（用户 2026-09-19）。数就是服务端那张表
+  //   发下来的，这边不写死 —— 改 `weaponcfg.FIELDS` 页面自己就跟着变。
+  var lim = el("span", "lim", "限 " + spec.min + " ~ " + spec.max);
+  lim.title = "能填的范围（留空 = 用参考值）。服务端按同一套范围校验。";
+  wrap.appendChild(lim);
+
   var input = document.createElement("input");
   input.type = "number";
   input.min = String(spec.min);
@@ -6378,31 +6450,40 @@ function weaponFieldNode(mode, spec) {
   input.disabled = !WEAPON.canEdit;
   input.oninput = function () {
     var raw = input.value.trim();
-    input.classList.remove("bad");
     if (raw === "") {
       delete WEAPON.edit[mode][spec.key];
     } else {
       var num = Number(raw);
-      if (!isFinite(num) || (spec.type !== "float" && String(Math.trunc(num)) !== raw.replace(/^\+/, ""))) {
-        // 不擅自改：原样存回去，让服务端那句「要是数字」来说话（同 `fieldNode`）。
-        WEAPON.edit[mode][spec.key] = raw;
-        input.classList.add("bad");
-      } else {
-        WEAPON.edit[mode][spec.key] = spec.type === "float" ? num : Math.trunc(num);
-      }
+      // 不擅自改：看不懂的原样存回去，由 `weaponFieldError()` 去说哪儿不对。
+      WEAPON.edit[mode][spec.key] =
+        (!isFinite(num) || (spec.type !== "float"
+                            && String(Math.trunc(num)) !== raw.replace(/^\+/, "")))
+          ? raw : (spec.type === "float" ? num : Math.trunc(num));
     }
-    wrap.classList.toggle("edited",
-      JSON.stringify(WEAPON.edit[mode][spec.key]) !== JSON.stringify(WEAPON.base[mode][spec.key]));
+    paintField();
     paintWeaponDirty();
   };
-  wrap.classList.toggle("edited",
-    JSON.stringify(WEAPON.edit[mode][spec.key]) !== JSON.stringify(WEAPON.base[mode][spec.key]));
+
   wrap.appendChild(input);
-  if (spec.unit) { wrap.appendChild(el("span", "unit", spec.unit)); }
+  wrap.appendChild(el("span", "unit", spec.unit || ""));   // ★ 空的也要占住这一列
   var ref = el("span", "ref", "参考 " + (spec.reference === null || spec.reference === undefined
                                           ? "—" : spec.reference));
   ref.title = "资源包里这一把参考的爆裂 3 写的数；留空就用它";
   wrap.appendChild(ref);
+
+  // 错误那一行：就在输入框正下方，平时不占位置（`display:none`），一行写完不折行。
+  var err = el("div", "err");
+  wrap.appendChild(err);
+
+  function paintField() {
+    var msg = weaponFieldError(spec, WEAPON.edit[mode][spec.key]);
+    input.classList.toggle("bad", !!msg);
+    wrap.classList.toggle("has-err", !!msg);
+    err.textContent = msg || "";
+    wrap.classList.toggle("edited",
+      JSON.stringify(WEAPON.edit[mode][spec.key]) !== JSON.stringify(WEAPON.base[mode][spec.key]));
+  }
+  paintField();          // ★ 打开就扫一遍：存量的超范围值当场标出来（D34）
   return wrap;
 }
 
@@ -6498,8 +6579,11 @@ function renderWeaponModal() {
   function paintCount() {
     var text = area.value.replace(/\r/g, "");
     var lines = text ? text.split("\n").length : 0;
-    count.textContent = lines + " / " + view.desc_max_lines + " 行　" + text.length + " / " + view.desc_max_chars + " 字";
-    count.classList.toggle("over", lines > view.desc_max_lines || text.length > view.desc_max_chars);
+    var msg = weaponDescError(view, text);
+    count.textContent = lines + " / " + view.desc_max_lines + " 行　" + text.length
+      + " / " + view.desc_max_chars + " 字" + (msg ? "　← " + msg : "");
+    count.classList.toggle("over", !!msg);
+    area.classList.toggle("bad", !!msg);
   }
   area.oninput = function () {
     WEAPON.edit.desc = area.value.replace(/\r/g, "");
@@ -6514,11 +6598,12 @@ function renderWeaponModal() {
   var preview = el("div", "weapon-preview");
   if (view.custom && view.lines) {
     // ★ 两套都列（用户 2026-09-19）：游戏内提示框只画 PVP 那套，这里空间够。
+    // ★★ 顺序**照 `view.modes` 走，不在这里写死** —— 那就是服务端的 `weaponcfg.MODES`
+    //    （PVE 在前），和上面两栏「PVE 在左、PVP 在右」、浮窗 `admin_desc()` 同一个方向。
+    //    用户 2026-09-19 第三轮：一处左右、一处上下反着来，看着别扭。
     preview.appendChild(el("b", null, "按已保存的内容现算（游戏内提示框只画对战那一段）："));
-    ["pvp", "pve"].forEach(function (mode) {
-      var label = "";
-      (view.modes || []).forEach(function (m) { if (m.key === mode) { label = m.label; } });
-      var block = el("pre", null, "【" + label + "】\n" + (view.lines[mode] || []).join("\n"));
+    (view.modes || []).forEach(function (m) {
+      var block = el("pre", null, "【" + m.label + "】\n" + (view.lines[m.key] || []).join("\n"));
       preview.appendChild(block);
     });
     var note = (view.preview || "").split("|")[1];

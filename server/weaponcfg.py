@@ -41,21 +41,50 @@ MODE_ZH = {MODE_PVE: "任务模式（PVE）", MODE_PVP: "对战模式（PVP）"}
 #: 可调字段：键 → (中文名, 单位, `weapondata` 记录里的键, 类型, 下限, 上限)。
 #: ★ 顺序 = 下发给 bshook 的顺序 = 弹窗里从上到下的顺序，三处共用这一张表。
 #: 类型 `int` 落到客户端武器记录的 int32 格，`float` 落到 f32 格（偏移见 hook 侧 `WTAB_FIELDS`）。
+#:
+#: ★★ 上下限是**管理页能填的范围**，2026-09-19 按原版 `weapon.ini` 的实际分布
+#: 收紧（用户原话「不能过于大的离谱」）。右边注释里的「原版 x..y」是全表 228 节
+#: 量出来的真实区间，留的余量大致是原版上限的 4~6 倍 —— 够任何合理 Mod 用，
+#: 又不至于填出让这一局没法玩的数。**改这里要同步 `test_weaponcfg` 的那条守卫。**
 FIELDS = (
-    ("damage",        "身体伤害",   "",     "damage",        int,   0, 9999),
-    ("head_damage",   "爆头伤害",   "",     "head_damage",   int,   0, 9999),
-    ("legs_damage",   "腿部伤害",   "",     "legs_damage",   int,   0, 9999),
-    ("splash_damage", "溅射伤害",   "",     "splash_damage", int,   0, 9999),
-    ("splash_range",  "溅射范围",   "",     "splash_range",  int,   0, 9999),
-    ("magazine",      "弹匣",       "发",   "magazine",      int,   1, 999),
-    ("cooling_ms",    "射速间隔",   "毫秒", "cooling_ms",    int,   1, 60000),
-    ("reload_ms",     "换弹",       "毫秒", "reload_ms",     int,   0, 60000),
-    ("loading_ms",    "切换",       "毫秒", "loading_ms",    int,   0, 60000),
-    ("velocity",      "初速",       "",     "velocity",      float, 0.0, 10000.0),
-    ("max_velocity",  "最大初速",   "",     "max_velocity",  float, 0.0, 10000.0),
-    ("gravity",       "重力系数",   "",     "gravity",       float, -100.0, 100.0),
+    #  键              中文名       单位    weapondata 键     类型   下限     上限
+    ("damage",        "身体伤害",   "",     "damage",        int,   0,      500),      # 原版 0..80（ch-nuke）
+    ("head_damage",   "爆头伤害",   "",     "head_damage",   int,   0,      500),      # 原版 4..39
+    ("legs_damage",   "腿部伤害",   "",     "legs_damage",   int,   0,      500),      # 原版 3..23
+    ("splash_damage", "溅射伤害",   "",     "splash_damage", int,   0,      500),      # 原版 0..80（ch-nuke）
+    ("splash_range",  "溅射范围",   "",     "splash_range",  int,   0,      1000),     # 原版 0..250（ch-nuke）
+    ("magazine",      "弹匣",       "发",   "magazine",      int,   1,      100),      # 原版 1..18；用户指定 1~100
+    ("cooling_ms",    "射速间隔",   "毫秒", "cooling_ms",    int,   1,      10000),    # 原版 0..5000
+    ("reload_ms",     "换弹",       "毫秒", "reload_ms",     int,   0,      10000),    # 原版 0..5300（ch03-03）
+    ("loading_ms",    "切换",       "毫秒", "loading_ms",    int,   0,      10000),    # 原版 0..2000
+    ("velocity",      "初速",       "",     "velocity",      float, 0.0,    1000.0),   # 原版 0..230（ch98-03）
+    ("max_velocity",  "最大初速",   "",     "max_velocity",  float, 0.0,    1000.0),   # 原版 20..300
+    ("gravity",       "重力系数",   "",     "gravity",       float, -20.0,  20.0),     # 原版 0..8；负数 = 上飘
 )
 FIELD_KEYS = tuple(f[0] for f in FIELDS)
+
+#: ★★ **读盘**放行的范围（比 `FIELDS` 宽），只用于已经躺在 `weapons.json` 里的值。
+#:
+#: 铁律 11。`shopcfg._load()` 对校验不过的文件是「**整份退回出厂值**」——
+#: 要是收紧输入范围的同时也收紧读盘，那么以前在旧范围里存下的一格离谱数值，
+#: 会让**整份自定义武器数值一起消失**，而且只在日志里留一行 warning。
+#: ⇒ 读盘按这套（= 收紧之前那套）放行，管理页按 `FIELDS` 拦。
+#: 存量值照旧能用、能读、能在弹窗里看到；一旦 GM 在弹窗里**保存**，
+#: 就必须落进 `FIELDS` 的范围 —— 旧值自然被换掉，不需要迁移脚本。
+LEGACY_LIMITS = {
+    "damage":        (0, 9999),
+    "head_damage":   (0, 9999),
+    "legs_damage":   (0, 9999),
+    "splash_damage": (0, 9999),
+    "splash_range":  (0, 9999),
+    "magazine":      (1, 999),
+    "cooling_ms":    (1, 60000),
+    "reload_ms":     (0, 60000),
+    "loading_ms":    (0, 60000),
+    "velocity":      (0.0, 10000.0),
+    "max_velocity":  (0.0, 10000.0),
+    "gravity":       (-100.0, 100.0),
+}
 
 #: 弹窗上的分组（只影响画面）。
 FIELD_GROUPS = (
@@ -108,8 +137,11 @@ def default_table():
     return {"format": FORMAT, "serial": 0, "custom": {}, "desc": {}}
 
 
-def _as_number(raw, spec, where):
+def _as_number(raw, spec, where, strict=True):
+    """一格数值。`strict` 决定用哪套范围 —— `FIELDS`（管理页）还是 `LEGACY_LIMITS`（读盘）。"""
     key, label, _unit, _src, cast, low, high = spec
+    if not strict:
+        low, high = LEGACY_LIMITS[key]
     if isinstance(raw, bool):
         raise ConfigError("%s.%s（%s）要是数字" % (where, key, label))
     try:
@@ -123,8 +155,12 @@ def _as_number(raw, spec, where):
     return value
 
 
-def validate_params(raw, where="params"):
-    """一套数值（某个模式的覆盖）→ 只留认得的键、类型和范围都对的 dict。空 = 全用参考值。"""
+def validate_params(raw, where="params", strict=True):
+    """一套数值（某个模式的覆盖）→ 只留认得的键、类型和范围都对的 dict。空 = 全用参考值。
+
+    `strict=True`（管理页保存）按 `FIELDS` 的范围拦；
+    `strict=False`（读盘）按 `LEGACY_LIMITS` 放行 —— 见那张表上面写的理由。
+    """
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -134,7 +170,7 @@ def validate_params(raw, where="params"):
         key = spec[0]
         if key not in raw or raw[key] is None or raw[key] == "":
             continue
-        out[key] = _as_number(raw[key], spec, where)
+        out[key] = _as_number(raw[key], spec, where, strict=strict)
     return out
 
 
@@ -180,7 +216,11 @@ def validate(raw):
             raise ConfigError("custom.%d 要是一个对象" % item_id)
         modes = {}
         for mode in MODES:
-            modes[mode] = validate_params(value.get(mode), "custom.%d.%s" % (item_id, mode))
+            # ★ 读盘一律宽容（`LEGACY_LIMITS`）：存量值不能因为我们后来收紧了
+            #   输入范围就让整份配置退回出厂值。管理页那条路走 `save_item()`，
+            #   它另外用 `strict=True` 再校一遍。
+            modes[mode] = validate_params(value.get(mode), "custom.%d.%s" % (item_id, mode),
+                                          strict=False)
         out["custom"][str(item_id)] = modes
     desc = raw.get("desc") or {}
     if not isinstance(desc, dict):
@@ -283,6 +323,12 @@ def save_item(item_id, params=None, desc=None, data_dir=None, log=None):
         if params is not None:
             if not item.custom:
                 raise ConfigError("原版武器的数值不能改，只能改说明文")
+            # ★ **管理页填进来的这一件按 `FIELDS` 的范围严格拦**（下面那发
+            #   `validate(new)` 是宽容的 —— 它要同时吃下表里其它件的存量值）。
+            #   ⇒ 新填的必须落在合理范围里，旧的照样读得出来、改一次就换掉。
+            for mode in MODES:
+                validate_params((params or {}).get(mode),
+                                "custom.%d.%s" % (item_id, mode), strict=True)
             new["custom"][str(item_id)] = {mode: (params or {}).get(mode) for mode in MODES}
         if desc is not None:
             text = validate_desc(desc, "说明文")
@@ -392,8 +438,12 @@ def mode_lines(item, mode, table=None, data_dir=None):
 
 
 def admin_desc(item, table=None, data_dir=None):
-    """管理页浮窗 / 弹窗要的说明：自定义武器把 **PVP 和 PVE 两套都列出来**（用户 2026-09-19：
-    管理页空间够，两种都显示；游戏内提示框装不下才只画 PVP）。原版武器和游戏里一样。"""
+    """管理页浮窗 / 弹窗要的说明：自定义武器把 **PVE 和 PVP 两套都列出来**（用户 2026-09-19：
+    管理页空间够，两种都显示；游戏内提示框装不下才只画 PVP）。原版武器和游戏里一样。
+
+    ★ 顺序 = `MODES`（**PVE 在前**），和弹窗里两栏「PVE 在左、PVP 在右」同一个方向
+    —— 用户 2026-09-19 第三轮：一处左右、一处上下反着来看着别扭。
+    `admin.js` 的预览区是同一个顺序，`test_weaponcfg` 钉着两边。"""
     if item is None:
         return ""
     if not getattr(item, "custom", False):
@@ -401,7 +451,7 @@ def admin_desc(item, table=None, data_dir=None):
     if table is None:
         table = load(data_dir)
     blocks = []
-    for mode in (MODE_PVP, MODE_PVE):
+    for mode in MODES:
         blocks.append(MODE_HEADING[mode])
         blocks.extend(mode_lines(item, mode, table))
     text = "\n".join(blocks)
