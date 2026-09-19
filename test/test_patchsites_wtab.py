@@ -117,7 +117,7 @@ class WeaponTableHookTest(unittest.TestCase):
         self.assertEqual(0x72e788, self.table)
 
     def test_the_field_table_matches_the_server(self):
-        """hook 的 12 格顺序 / 类型 == `server/weaponcfg.FIELDS`（那边由 test_weaponcfg 钉着）。"""
+        """hook 的 14 格顺序 / 类型 == `server/weaponcfg.FIELDS`（那边由 test_weaponcfg 钉着）。"""
         body = self.src[self.src.index("WTAB_FIELD[WTAB_FIELDS] = {"):]
         body = body[:body.index("};")]
         import re
@@ -125,8 +125,61 @@ class WeaponTableHookTest(unittest.TestCase):
         self.assertEqual([("0x34", "0", "Damage"), ("0x38", "0", "HeadDamage"), ("0x3c", "0", "LegsDamage"),
                           ("0x48", "0", "SplashDamage"), ("0x4c", "0", "SplashRange"), ("0x60", "0", "MagazineCount"),
                           ("0x5c", "0", "CoolingTime"), ("0x64", "0", "ReloadTime"), ("0x58", "0", "LoadingTime"),
-                          ("0x24", "1", "Velocity"), ("0x28", "1", "MaxVelocity"), ("0x30", "1", "GravityFactor")],
+                          ("0x24", "1", "Velocity"), ("0x28", "1", "MaxVelocity"), ("0x30", "1", "GravityFactor"),
+                          ("0x78", "0", "HomingAngle"), ("0x7c", "1", "HomingRange")],
                          rows)
+
+    def test_the_homing_offsets_and_types_are_what_the_exe_really_uses(self):
+        """★★ 追踪两格（X7）的偏移**和类型**拿脱壳镜像离线钉死。
+
+        为什么值得单写一条：`+0x78` 和 `+0x7c` 挨着，而且 ini 里两个值长得一样
+        （都是整数字面量），**写反了服务端照样发得出去、hook 照样写得进去**
+        —— 只有实机才看得出「追踪距离变成了 3.1e-43」。这三条指令一钉，
+        记错偏移或记反类型**离线就红**（§44 的教训：清单式结论漏的是清单外的东西）。
+
+        i32 / f32 从**指令**读出来，不是从注释读出来的：
+          `fild dword` 取整数、`fcomp dword` 比的是 f32、`fstp dword` 存 f32。
+        """
+        # 开关：HomingAngle == 0 就直接跳到函数尾 —— 客户端没有独立的「Homing」开关
+        self.assertEqual(bytes([0x83, 0x78, 0x78, 0x00]), base.read_va(self.img, 0x0047E35A, 4),
+                         "追踪开关不在 [记录+0x78] 上了")
+        self.assertEqual(bytes([0x0F, 0x84]), base.read_va(self.img, 0x0047E35F, 2), "开关后面不是 je")
+        # 用：HomingAngle 走 fild（i32）、HomingRange 走 fcomp（f32）
+        self.assertEqual(bytes([0xDB, 0x40, 0x78]), base.read_va(self.img, 0x0047E53A, 3),
+                         "HomingAngle 不是 `fild dword [eax+0x78]` 了（类型可能不再是 i32）")
+        self.assertEqual(bytes([0xD8, 0x58, 0x7C]), base.read_va(self.img, 0x0047E45B, 3),
+                         "HomingRange 不是 `fcomp dword [eax+0x7c]` 了（类型可能不再是 f32）")
+        # 解析：ini → 记录，同样一格 i32 一格 f32
+        self.assertEqual(bytes([0x89, 0x47, 0x78]), base.read_va(self.img, 0x00489450, 3),
+                         "解析 HomingAngle 的落点不是 `mov [edi+0x78], eax` 了")
+        self.assertEqual(bytes([0xD9, 0x5F, 0x7C]), base.read_va(self.img, 0x0048941E, 3),
+                         "解析 HomingRange 的落点不是 `fstp dword [edi+0x7c]` 了")
+
+    def test_homing_runs_for_every_projectile_class(self):
+        """★★ `Projectile::Homing`（`0x47e347`）全镜像**只有一个**调用者，
+        而且在 `BulletObj::Tick`（`0x47de6a`）里 —— 所有弹体类的 Tick 都会
+        走到它（手雷 / 火瓶那些自己有 Tick 的，头几条就 `call 0x47de6a`）。
+
+        这是「**任意**自定义武器都能开追踪」的全部依据。再冒出第二个调用者、
+        或者 `AppleGrenade` / `FlamingBottle` 不再转调基类，这条当场红。
+        """
+        def callers_of(target):
+            out = []
+            for off in range(0, len(self.img) - 5):
+                if self.img[off] != 0xE8:
+                    continue
+                va = 0x400000 + off
+                if va + 5 + struct.unpack_from("<i", self.img, off + 1)[0] == target:
+                    out.append(va)
+            return sorted(out)
+
+        self.assertEqual([0x47DF56], callers_of(0x47E347),
+                         "Projectile::Homing 的调用者变了 —— 追踪的适用范围跟着变")
+        base_tick_callers = callers_of(0x47DE6A)
+        # 18 把自定义武器只用到这三类弹体：GeneralBullet(= BulletObj 本体) /
+        # AppleGrenade（泰尔 2 号）/ FlamingBottle（卡希尔 2 号）。后两类必须转调基类。
+        for name, va in (("AppleGrenade::Tick", 0x47C91D), ("FlamingBottle::Tick", 0x482980)):
+            self.assertIn(va, base_tick_callers, "%s 不再转调 BulletObj::Tick" % name)
 
     def test_the_patch_thread_actually_installs_it(self):
         self.assertGreaterEqual(self.src.count("try_install_weapon_table_hooks"), 2, "定义了但没有人调用")

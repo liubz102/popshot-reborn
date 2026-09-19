@@ -6526,6 +6526,15 @@ async function saveSellPrices() {
    ====================================================================== */
 var WEAPON = null;
 
+//: 这一窗里每一格的重画函数。`renderWeaponModal()` 重建 DOM 时清空、
+//  `weaponFieldNode()` 建一格登记一个。**存在的理由是跨格判据** ——
+//  改「追踪转向」要让「追踪距离」那一格的红框跟着出现 / 消失。
+var WEAPON_PAINTERS = [];
+
+function paintWeaponFields() {
+  WEAPON_PAINTERS.forEach(function (paint) { paint(); });
+}
+
 function weaponSnapshot(view) {
   var out = {pve: {}, pvp: {}, desc: view.desc || ""};
   (view.fields || []).forEach(function (f) {
@@ -6580,6 +6589,40 @@ function weaponDescError(view, text) {
   return null;
 }
 
+/** 这一格此刻的**有效值**（填了用填的、留空用参考值）；不是数就回 `null`。
+
+    ★ 跨格判据必须落在**有效值**上，不是落在「填了什么」上：卡希尔 3 号槽那两把
+      自定义武器的参考值自带 `HomingRange=220`（母本抄来的），那儿只填转向、
+      距离留空是完全合法的。服务端 `weaponcfg.homing_error()` 是同一个口径。 */
+function weaponEffective(view, mode, key) {
+  var raw = WEAPON.edit[mode][key];
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    var spec = null;
+    (view.fields || []).forEach(function (f) { if (f.key === key) { spec = f; } });
+    raw = spec ? spec.reference : null;
+  }
+  if (raw === undefined || raw === null || raw === "") { return null; }
+  var num = Number(raw);
+  return isFinite(num) ? num : null;
+}
+
+/** 某一格现在错在哪（**含跨格判据**）；没问题回 `null`。
+
+    ★ 一格自己的范围先判，过了再判跨格的 —— 「追踪转向 > 0 就必须有追踪距离」。
+      规则那两行判断前后台各写一份（和 `weaponFieldError` 的 min/max 一样），
+      但**话只有服务端那一份**（`view.homing_rule.message`）。 */
+function weaponCellError(view, mode, spec) {
+  var msg = weaponFieldError(spec, WEAPON.edit[mode][spec.key]);
+  if (msg) { return msg; }
+  var rule = view.homing_rule;
+  if (rule && spec.key === rule.range) {
+    var angle = weaponEffective(view, mode, rule.angle);
+    var reach = weaponEffective(view, mode, rule.range);
+    if (angle > 0 && !(reach > 0)) { return rule.message; }
+  }
+  return null;
+}
+
 /** 整窗扫一遍：`{fields: {"pve.damage": "…"}, desc: null|"…", count: N}`。 */
 function weaponErrors() {
   var out = {fields: {}, desc: null, count: 0};
@@ -6588,7 +6631,7 @@ function weaponErrors() {
   if (view.custom) {
     (view.fields || []).forEach(function (spec) {
       ["pve", "pvp"].forEach(function (mode) {
-        var msg = weaponFieldError(spec, WEAPON.edit[mode][spec.key]);
+        var msg = weaponCellError(view, mode, spec);
         if (msg) { out.fields[mode + "." + spec.key] = msg; out.count += 1; }
       });
     });
@@ -6649,7 +6692,7 @@ function weaponFieldNode(mode, spec) {
                             && String(Math.trunc(num)) !== raw.replace(/^\+/, "")))
           ? raw : (spec.type === "float" ? num : Math.trunc(num));
     }
-    paintField();
+    paintWeaponFields();        // ★ 整窗重画：跨格判据要让另一格跟着变（见下面的登记）
     paintWeaponDirty();
   };
 
@@ -6664,14 +6707,25 @@ function weaponFieldNode(mode, spec) {
   var err = el("div", "err");
   wrap.appendChild(err);
 
+  // ★ 「这一格填 0 会怎样」的灰字（用户 2026-09-20）：和错误话同一个位置，
+  //   **错误优先** —— 有错的时候这句让位，别把两行话摞在一起把格子撑高。
+  //   话由服务端 `weaponcfg.ZERO_MEANS` 发下来，这边不写死任何一句。
+  var hint = el("div", "hint", spec.zero_note || "");
+  wrap.classList.toggle("has-hint", !!spec.zero_note);
+  wrap.appendChild(hint);
+
   function paintField() {
-    var msg = weaponFieldError(spec, WEAPON.edit[mode][spec.key]);
+    var msg = weaponCellError(WEAPON.view, mode, spec);
     input.classList.toggle("bad", !!msg);
     wrap.classList.toggle("has-err", !!msg);
     err.textContent = msg || "";
     wrap.classList.toggle("edited",
       JSON.stringify(WEAPON.edit[mode][spec.key]) !== JSON.stringify(WEAPON.base[mode][spec.key]));
   }
+  // ★★ 登记进全窗的刷新表：跨格判据（追踪转向 ↔ 追踪距离）意味着**改这一格会让
+  //   另一格的对错变**，只重画自己就会漏。改用重画整窗 —— 不走 `renderWeaponModal()`
+  //   是因为那会重建 DOM、把正在输入的焦点弄丢。
+  WEAPON_PAINTERS.push(paintField);
   paintField();          // ★ 打开就扫一遍：存量的超范围值当场标出来（D34）
   return wrap;
 }
@@ -6717,6 +6771,7 @@ function renderWeaponModal() {
   var view = WEAPON.view;
   var host = $("weaponBody");
   host.textContent = "";
+  WEAPON_PAINTERS = [];        // ★ DOM 整个重建 ⇒ 旧的重画函数指着已经丢掉的节点
   $("weaponTitle").textContent = "自定义属性 · " + (view.name || itemName(view.id)) + "  #" + view.id;
 
   if (view.custom) {

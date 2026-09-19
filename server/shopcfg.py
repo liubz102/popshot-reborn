@@ -1216,30 +1216,55 @@ BONUS_PER_LINE = 2
 # 每一项字段固定宽度10
 BONUS_PER_WIDTH = 10
 
-def _weapon_lines(weapon):
-    """武器数值那几行。`weapon` 是 `shop_items.json` 里那个 dict。"""
-    lines = []
+#: 提示框排不下时**第一个让位**的项（用户 2026-09-20）。
+#:
+#: ★ 「追踪」挤进来之前，自定义武器正好 8 项 = 4 行，加上首行
+#:   「仅显示PVP属性…」刚好把 `ITEM_DESC_MAX_LINES`(5) 占满 ——
+#:   多一项就会有一整行被 `stats[:ITEM_DESC_MAX_LINES]` **静默截掉**。
+#: ★★ 但**只在真的排不下时才丢**（用户原话「仅在显示不下时让位」）：
+#:   预算是算出来的（5 行 − 前面已经占掉的行数，再 × 每行 2 项），
+#:   不是「有追踪就固定丢飞行速度」那种写死的规则（铁律 10）。
+_WEAPON_LINE_YIELD_ORDER = ("velocity",)
+
+
+def _weapon_lines(weapon, max_lines=None):
+    """武器数值那几行。`weapon` 是 `shop_items.json` 里那个 dict。
+
+    `max_lines` = 这一段最多画几行；`None` = **不限，全都画**（管理页弹窗用的就是它，
+    用户 2026-09-20：游戏里装不下可以让位，管理页要看得到完整内容）。
+    """
+    cells = []      # [(键, 文本)] —— 带键是为了让位时认得出是哪一项
     damage = weapon.get("damage")
     if damage is not None:
-        lines.append("伤害 %d " % damage)
+        cells.append(("damage", "伤害 %d " % damage))
         # 伤害按**部位**分档，没有随机数（§17）。爆头 / 腿部两档不一定都有。
         if weapon.get("head_damage"):
-            lines.append("爆头 %d " % weapon["head_damage"])
+            cells.append(("head_damage", "爆头 %d " % weapon["head_damage"]))
         # if weapon.get("legs_damage"):
-        #     lines.append("腿部 %d" % weapon["legs_damage"])
+        #     cells.append(("legs_damage", "腿部 %d" % weapon["legs_damage"]))
     # ★ 溅射两格原来一直没画出来 —— 榴弹类真正的杀伤在这
     if weapon.get("splash_damage"):
-        lines.append("溅射 %d " % weapon["splash_damage"])
+        cells.append(("splash_damage", "溅射 %d " % weapon["splash_damage"]))
     if weapon.get("splash_range"):
-        lines.append("溅射范围 %d " % weapon["splash_range"])
+        cells.append(("splash_range", "溅射范围 %d " % weapon["splash_range"]))
     if weapon.get("magazine"):
-        lines.append("弹容 %d " % weapon["magazine"])
+        cells.append(("magazine", "弹容 %d " % weapon["magazine"]))
     if weapon.get("cooling_ms"):
-        lines.append("射速 %.1f/秒 " % (1000.0 / weapon["cooling_ms"]))
+        cells.append(("cooling_ms", "射速 %.1f/秒 " % (1000.0 / weapon["cooling_ms"])))
     if weapon.get("reload_ms"):
-        lines.append("装填 %.1f秒 " % (weapon["reload_ms"] / 1000.0))
+        cells.append(("reload_ms", "装填 %.1f秒 " % (weapon["reload_ms"] / 1000.0)))
     if weapon.get("velocity"):
-        lines.append("飞行速度 %d " % weapon["velocity"])
+        cells.append(("velocity", "飞行速度 %d " % weapon["velocity"]))
+    # ★ 追踪只在**真的开着**的时候才画（`HomingAngle = 0` 就是客户端的「不追踪」）。
+    if weapon.get("homing_angle"):
+        cells.append(("homing_angle", "追踪 %d " % weapon["homing_angle"]))
+    if max_lines is not None:
+        room = max(0, int(max_lines)) * BONUS_PER_LINE
+        for key in _WEAPON_LINE_YIELD_ORDER:
+            if len(cells) <= room:
+                break
+            cells = [cell for cell in cells if cell[0] != key]
+    lines = [text for _key, text in cells]
     aligned = []
 
     for i in range(0, len(lines), BONUS_PER_LINE):
@@ -1464,7 +1489,9 @@ def item_desc_zh(item, card_rules=_AUTO, recipes_table=_AUTO, weapons_table=None
             custom_desc = weaponcfg.desc_of(item.id, weapons_table)
             if custom_desc:
                 notes = custom_desc.split("\n")
-        stats.extend(_weapon_lines(weapon))
+        # ★ 预算 = 这一段的总行数 − 前面已经占掉的（自定义武器的首行提示）。
+        #   算出来的，不是写死的（铁律 10）—— 见 `_WEAPON_LINE_YIELD_ORDER`。
+        stats.extend(_weapon_lines(weapon, max_lines=ITEM_DESC_MAX_LINES - len(stats)))
     stats.extend(_bonus_lines(item.bonus or {}))
     if not stats and not notes and item.kind == "material":
         if card_rules is _AUTO:

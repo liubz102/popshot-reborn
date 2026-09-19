@@ -1767,6 +1767,20 @@ class WeaponEndpointTests(_AdminCase):
         self.assertIsNone(damage["pve"])
         self.assertIsNone(damage["pvp"])
         self.assertTrue(result["preview"].startswith(weaponcfg.PVP_ONLY_NOTE))
+        # ★ 弹窗要画的两样「话」也得随这一发下去（页面上不写死，X7）：
+        #   每格「0 代表…」的灰字，和追踪那条跨格判据的提示。
+        self.assertEqual(weaponcfg.ZERO_MEANS.get("homing_angle"),
+                         [f for f in result["fields"] if f["key"] == "homing_angle"][0]["zero_note"])
+        self.assertEqual({"angle": "homing_angle", "range": "homing_range",
+                          "message": weaponcfg.HOMING_RULE_MESSAGE}, result["homing_rule"])
+
+    def test_turning_without_a_reach_is_refused_by_the_server_too(self):
+        """★ 前台锁了保存键只是省一次往返 —— 真边界在服务端，直接 POST 也得被拒。"""
+        status, result = self.request("/admin/api/weapon", {
+            "id": self.CUSTOM, "params": {"pve": {}, "pvp": {"homing_angle": 300}}})
+        self.assertEqual(400, status, result)
+        self.assertIn("追踪距离", result["message"])
+        self.assertEqual({}, weaponcfg.load(self.data_dir)["custom"])   # 一个字节没落盘
 
     def test_an_original_weapon_only_has_a_description(self):
         status, result = self.request("/admin/api/weapon?id=%d" % self.ORIGINAL)

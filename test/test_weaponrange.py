@@ -105,18 +105,25 @@ process.stdout.write(JSON.stringify(out));
 """
 
 
-def _view():
-    """服务端真发下来的那份字段表（不是手抄的），省得两边分叉。"""
+def _view(reference=None):
+    """服务端真发下来的那份字段表（不是手抄的），省得两边分叉。
+
+    `reference` = `{字段: 参考值}`，默认全是 `None`（= 资源包那一节没写这个键）。
+    """
+    reference = reference or {}
     fields = []
     for key, label, unit, _src, cast, low, high in weaponcfg.FIELDS:
         fields.append({"key": key, "label": label, "unit": unit,
                        "type": "float" if cast is float else "int",
-                       "min": low, "max": high, "reference": None})
+                       "min": low, "max": high, "reference": reference.get(key),
+                       "zero_note": weaponcfg.ZERO_MEANS.get(key, "")})
     return {"id": 1920001, "custom": True, "fields": fields,
             "desc_max_lines": weaponcfg.DESC_MAX_LINES,
             "desc_max_chars": weaponcfg.DESC_MAX_CHARS,
             "modes": [{"key": "pve", "label": "任务"}, {"key": "pvp", "label": "对战"}],
-            "groups": [{"label": "全部", "keys": list(weaponcfg.FIELD_KEYS)}]}
+            "groups": [{"label": "全部", "keys": list(weaponcfg.FIELD_KEYS)}],
+            "homing_rule": {"angle": "homing_angle", "range": "homing_range",
+                            "message": weaponcfg.HOMING_RULE_MESSAGE}}
 
 
 def ask(edit=None, probe=None, desc_probe=None, dirty=True, can_edit=True, view=None):
@@ -186,6 +193,63 @@ class FieldErrorTests(unittest.TestCase):
         got = ask(probe=probe)
         for i, key in enumerate(keys):
             self.assertIsNotNone(got["perField"][str(i)], "%s 的上界没拦住" % key)
+
+
+@unittest.skipUnless(NODE, "这台机器上没有 node，跳过弹窗范围校验的拦网")
+class HomingRuleTests(unittest.TestCase):
+    """★★ 追踪那条**跨格**判据（X7）：转向 > 0 就必须有距离。
+
+    和别的判据不一样的地方有两条，都容易写错：
+    ① 它判的是**有效值**（填了用填的、留空用参考值），不是「填了什么」；
+    ② 它报在**距离**那一格上 —— 错的是「缺了距离」，不是「填了转向」。
+    服务端 `weaponcfg.homing_error()` 是同一个口径，`test_weaponcfg` 那边钉着。
+    """
+
+    def test_turning_alone_is_flagged_on_the_reach_cell(self):
+        got = ask(edit={"pve": {}, "pvp": {"homing_angle": 300}, "desc": ""})
+        self.assertEqual({"pvp.homing_range": weaponcfg.HOMING_RULE_MESSAGE},
+                         got["errors"]["fields"])
+        self.assertEqual(1, got["errors"]["count"])
+        self.assertTrue(got["saveDisabled"], "缺了追踪距离，保存键该按不动")
+
+    def test_turning_plus_reach_is_clean(self):
+        got = ask(edit={"pve": {}, "pvp": {"homing_angle": 300, "homing_range": 400}, "desc": ""})
+        self.assertEqual({}, got["errors"]["fields"])
+        self.assertFalse(got["saveDisabled"])
+
+    def test_a_reach_that_comes_from_the_reference_counts(self):
+        """★ 卡希尔 3 号槽那两把的参考值自带 `HomingRange=220` ——
+        那儿只填转向、距离留空是合法的。判在「填了什么」上就会误杀。"""
+        got = ask(view=_view({"homing_angle": 30, "homing_range": 220.0}),
+                  edit={"pve": {}, "pvp": {"homing_angle": 600}, "desc": ""})
+        self.assertEqual({}, got["errors"]["fields"])
+
+    def test_zeroing_the_reach_on_top_of_a_reference_is_flagged(self):
+        """反过来：参考值有距离，但 GM **显式填了 0** —— 那就真的锁不上了。"""
+        got = ask(view=_view({"homing_angle": 30, "homing_range": 220.0}),
+                  edit={"pve": {}, "pvp": {"homing_range": 0}, "desc": ""})
+        self.assertEqual(weaponcfg.HOMING_RULE_MESSAGE,
+                         got["errors"]["fields"].get("pvp.homing_range"))
+
+    def test_a_reach_without_turning_is_fine(self):
+        """只填距离 = 不追踪，合法。"""
+        got = ask(edit={"pve": {}, "pvp": {"homing_range": 500}, "desc": ""})
+        self.assertEqual({}, got["errors"]["fields"])
+
+    def test_zero_turning_is_fine(self):
+        got = ask(edit={"pve": {"homing_angle": 0}, "pvp": {"homing_angle": 0}, "desc": ""})
+        self.assertEqual({}, got["errors"]["fields"])
+
+    def test_both_modes_are_scanned(self):
+        got = ask(edit={"pve": {"homing_angle": 30}, "pvp": {"homing_angle": 30}, "desc": ""})
+        self.assertEqual({"pve.homing_range": weaponcfg.HOMING_RULE_MESSAGE,
+                          "pvp.homing_range": weaponcfg.HOMING_RULE_MESSAGE},
+                         got["errors"]["fields"])
+
+    def test_a_plain_range_error_still_wins_on_that_cell(self):
+        """一格自己的范围先判 —— 填了 9999 的距离，该说的是「要在 0 ~ 1000 之间」。"""
+        got = ask(edit={"pve": {}, "pvp": {"homing_angle": 30, "homing_range": 9999}, "desc": ""})
+        self.assertIn("之间", got["errors"]["fields"]["pvp.homing_range"])
 
 
 @unittest.skipUnless(NODE, "这台机器上没有 node，跳过弹窗范围校验的拦网")
@@ -330,6 +394,32 @@ class SourceGuardTests(unittest.TestCase):
                          "预览区不该写死顺序 —— 照 view.modes 画，跟服务端 MODES 走")
         self.assertIn("(view.modes || []).forEach", preview)
 
+    def test_the_hint_line_comes_from_the_server_not_from_the_page(self):
+        """★ 「0 代表不追踪」那句灰字的**话在服务端**（`weaponcfg.ZERO_MEANS`）。
+
+        前端写死一份的话，改文案要改两个地方，而漏掉的那一处不会报错。
+        """
+        with open(ADMIN_JS, "r", encoding="utf-8") as fp:
+            src = fp.read()
+        body = src[src.index("function weaponFieldNode"):src.index("function weaponModeNode")]
+        self.assertIn("spec.zero_note", body, "提示那一行没有用服务端发下来的话")
+        for text in weaponcfg.ZERO_MEANS.values():
+            self.assertNotIn(text, src, "admin.js 里写死了「%s」，该由服务端发" % text)
+        self.assertNotIn(weaponcfg.HOMING_RULE_MESSAGE, src,
+                         "跨格判据那句话也写死在页面里了")
+
+    def test_changing_one_cell_repaints_the_whole_window(self):
+        """★★ 有了跨格判据（转向 ↔ 距离），只重画自己那一格就会漏 ——
+        改「转向」时「距离」那一格的红框得跟着出现 / 消失。"""
+        with open(ADMIN_JS, "r", encoding="utf-8") as fp:
+            src = fp.read()
+        body = src[src.index("function weaponFieldNode"):src.index("function weaponModeNode")]
+        self.assertIn("paintWeaponFields();", body, "输入回调还是只重画自己那一格")
+        self.assertIn("WEAPON_PAINTERS.push(paintField)", body)
+        self.assertIn("WEAPON_PAINTERS = [];",
+                      src[src.index("function renderWeaponModal"):],
+                      "重建 DOM 时没清空重画表，旧函数会指着丢掉的节点")
+
     def test_every_cell_has_all_six_children_even_without_a_unit(self):
         """★ 定宽网格靠「孩子数一样」对齐：没单位的字段也得占住单位那一格。
 
@@ -341,10 +431,12 @@ class SourceGuardTests(unittest.TestCase):
         body = src[src.index("function weaponFieldNode"):src.index("function weaponModeNode")]
         self.assertNotIn('if (spec.unit)', body, "单位那一格又变成有条件的了，网格会错位")
         self.assertIn('el("span", "unit", spec.unit || "")', body)
-        # 顺序：项目名 → 范围 → 输入框 → 单位 → 参考 → 错误行
+        # 顺序：项目名 → 范围 → 输入框 → 单位 → 参考 → 错误行 → 「0 代表…」那行
+        # ★ 最后两个都是 `grid-column: 3 / -1` 的整行，**不占定宽那几列**，
+        #   所以它们不影响「输入框上下对齐」这件事（X7 加 hint 时确认过）。
         order = [a or b for a, b in
                  re.findall(r'appendChild\(el\("(?:span|div)", "(\w+)"|appendChild\((\w+)\)', body)]
-        self.assertEqual(["lab", "lim", "input", "unit", "ref", "err"], order,
+        self.assertEqual(["lab", "lim", "input", "unit", "ref", "err", "hint"], order,
                          "这一格的排列顺序变了：%r" % (order,))
 
 

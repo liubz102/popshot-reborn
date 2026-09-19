@@ -9,7 +9,7 @@
 「自定义属性」按钮。
 
     {"format": 1, "serial": 3,
-     "custom": {"1920001": {"pve": {"damage": 6, …}, "pvp": {…}}},   ← 只认 9 把自定义武器
+     "custom": {"1920001": {"pve": {"damage": 6, …}, "pvp": {…}}},   ← 只认自定义武器（现在 18 把）
      "desc":   {"1120011": "说明文…"}}                                 ← 任何武器都行
 
 ## 两条链
@@ -60,8 +60,33 @@ FIELDS = (
     ("velocity",      "初速",       "",     "velocity",      float, 0.0,    1000.0),   # 原版 0..230（ch98-03）
     ("max_velocity",  "最大初速",   "",     "max_velocity",  float, 0.0,    1000.0),   # 原版 20..300
     ("gravity",       "重力系数",   "",     "gravity",       float, -20.0,  20.0),     # 原版 0..8；负数 = 上飘
+    # ★★ 追踪两格（X7，§48）。类型**不能对调**：`+0x78` 是 i32（`0x47e53a fild`）、
+    #    `+0x7c` 是 f32（`0x47e45b fcomp`）—— 填反了客户端读到的是乱数。
+    ("homing_angle",  "追踪转向",   "",     "homing_angle",  int,   0,      1300),     # 原版 19..300（蝴蝶 300）
+    ("homing_range",  "追踪距离",   "",     "homing_range",  float, 0.0,    1000.0),   # 原版 50..350
 )
 FIELD_KEYS = tuple(f[0] for f in FIELDS)
+
+#: 「这一格填 0 会怎样」—— 画在输入框正下方的灰字（用户 2026-09-20）。
+#:
+#: ★★ **只写逐指令核实过的**，拿不准的宁可不写（别把推测写成事实）：
+#:
+#:   | 键 | 判据 |
+#:   |---|---|
+#:   | `splash_damage` / `splash_range` | `0x47e75f: cmp [记录+0x48],0; jle` + `0x47e765: cmp [记录+0x4c],0; jle` —— 任一 ≤ 0 就不置「有溅射」标志位 |
+#:   | `gravity` | `0x4921ce: fmul [记录+0x30]` → `[弹体+0x314]`，创建时算一次 ⇒ 0 = 弹体自己的重力就是 0 |
+#:   | `homing_angle` | `0x47e35a: cmp [记录+0x78],0; je 函数尾` —— 客户端**没有**独立的追踪开关，这一格就是开关 |
+#:   | `max_velocity` | ⚠ 不是「不限速」：`0x47ded6` 起每 tick `if (速度 >= MaxVelocity) 速度 *= MaxVelocity/速度`，**无条件**。缺省 150.0（`0x69374c`）⇒ 填 0 = 每 tick 归零 = 子弹钉在枪口 |
+#:
+#: 没写的那些（伤害三格、弹匣、射速、换弹、切换、初速）要么 0 的含义看标签就知道，
+#: 要么没核实到读点 —— **想加先去反汇编里查实**。
+ZERO_MEANS = {
+    "splash_damage": "0 = 无溅射",
+    "splash_range":  "0 = 无溅射",
+    "max_velocity":  "0 = 子弹不动（不是「不限速」）",
+    "gravity":       "0 = 不受重力（直线飞）",
+    "homing_angle":  "0 = 不追踪",
+}
 
 #: ★★ **读盘**放行的范围（比 `FIELDS` 宽），只用于已经躺在 `weapons.json` 里的值。
 #:
@@ -84,6 +109,8 @@ LEGACY_LIMITS = {
     "velocity":      (0.0, 10000.0),
     "max_velocity":  (0.0, 10000.0),
     "gravity":       (-100.0, 100.0),
+    "homing_angle":  (0, 99999),
+    "homing_range":  (0.0, 99999.0),
 }
 
 #: 弹窗上的分组（只影响画面）。
@@ -92,6 +119,7 @@ FIELD_GROUPS = (
     ("溅射", ("splash_damage", "splash_range")),
     ("射击", ("magazine", "cooling_ms", "reload_ms", "loading_ms")),
     ("弹道", ("velocity", "max_velocity", "gravity")),
+    ("追踪", ("homing_angle", "homing_range")),
 )
 
 #: 提示框第 1 段的首行（用户 2026-09-19 原话；第二版缩短 —— 第一版「…PVE属性请看GM管理页：」
@@ -104,7 +132,8 @@ DESC_MAX_CHARS = 90
 
 #: `0x0F01` 载荷的格式号。改布局就 +1，hook 侧 `WTAB_FORMAT` 同步。
 #: 2 = 头上多一个「这一局是闯关还是对战」的字节（§42 / D32）。
-WIRE_FORMAT = 2
+#: 3 = 可调字段 12 → **14**（追踪两格，X7 / §48）⇒ 一条记录 108 → 124 B。
+WIRE_FORMAT = 3
 
 #: `0x0F01` 头里那一格模式。★ `NONE` = 「只更新数据、别施加」——
 #: 数值改动**下一局才生效**，不捅正在进行的那一局（用户 2026-09-19 拍板）。
@@ -119,7 +148,7 @@ class ConfigError(shopcfg.ConfigError):
 
 
 def custom_item_ids():
-    """9 把自定义武器的物品 id（`shop_items.json` 里 `custom: true` 的），升序。"""
+    """全部自定义武器的物品 id（`shop_items.json` 里 `custom: true` 的），升序。"""
     return sorted(int(item_id) for item_id in shopdata.ids_of_kind("weapon") if is_custom(item_id))
 
 
@@ -172,6 +201,34 @@ def validate_params(raw, where="params", strict=True):
             continue
         out[key] = _as_number(raw[key], spec, where, strict=strict)
     return out
+
+
+#: ★★ 追踪那条**跨格**判据的话（前台后台同一句，`admin_view()` 发下去）。
+#:
+#: ⚠ **必须短**：它画在输入框正下方那一行（`.err`，`white-space: nowrap`），
+#: 弹窗里那一格从第 3 列到行尾只有 **192 px**。第一版写成「填了追踪转向就要填追踪距离
+#: —— 距离是 0 时一个目标也锁不上」，实测墨宽 **319 px**，直接溢出「对战模式」那张卡片
+#: 的右边框（在浏览器里量出来的，不是看着像）。改文案前先量一量。
+HOMING_RULE_MESSAGE = "追踪距离要 > 0，否则锁不上目标"
+
+
+def homing_error(values):
+    """一套**有效值**（覆盖 ∪ 参考）里追踪配得对不对；没问题返回 `None`。
+
+    ★ 为什么必须拦：`HomingRange` 决定选靶那个方框的四条边
+    （`0x47e391`~`0x47e3cd` 全用 `[记录+0x7c]`）—— 为 0 时方框退化成一个点，
+    永远选不中人，弹体当场把 `[弹体+0x328]` 写成 −2，**此后永久不再搜索**。
+    ⇒ 只填转向不填距离 = **静默不生效**，GM 在实机上看不出是哪儿错了。
+
+    ★ 判据落在**有效值**上，不是原始覆盖上：卡希尔 3 号槽那两把自定义武器
+      的参考值自带 `HomingRange=220`（母本 `ch01-03D3/F3` 抄来的），
+      那里只填转向、距离留空是完全合法的。
+
+    反过来「只填距离不填转向」是合法的 —— 那就是不追踪。
+    """
+    angle = values.get("homing_angle") or 0
+    reach = values.get("homing_range") or 0
+    return HOMING_RULE_MESSAGE if angle > 0 and reach <= 0 else None
 
 
 def validate_desc(raw, where="desc"):
@@ -326,9 +383,16 @@ def save_item(item_id, params=None, desc=None, data_dir=None, log=None):
             # ★ **管理页填进来的这一件按 `FIELDS` 的范围严格拦**（下面那发
             #   `validate(new)` 是宽容的 —— 它要同时吃下表里其它件的存量值）。
             #   ⇒ 新填的必须落在合理范围里，旧的照样读得出来、改一次就换掉。
+            ref = reference(item_id)
             for mode in MODES:
-                validate_params((params or {}).get(mode),
-                                "custom.%d.%s" % (item_id, mode), strict=True)
+                checked_mode = validate_params((params or {}).get(mode),
+                                               "custom.%d.%s" % (item_id, mode), strict=True)
+                # ★ 跨格判据要落在**有效值**（覆盖 ∪ 参考）上，见 `homing_error()`。
+                merged = dict(ref)
+                merged.update(checked_mode)
+                bad = homing_error(merged)
+                if bad:
+                    raise ConfigError("custom.%d.%s：%s" % (item_id, mode, bad))
             new["custom"][str(item_id)] = {mode: (params or {}).get(mode) for mode in MODES}
         if desc is not None:
             text = validate_desc(desc, "说明文")
@@ -349,7 +413,7 @@ def save_item(item_id, params=None, desc=None, data_dir=None, log=None):
 # ---------------------------------------------------------------------------
 
 def _pack_block(values):
-    """一个模式的 12 格：`u32 mask + 12 × 4 B`（按 FIELDS 顺序；int32 / float32）。"""
+    """一个模式的 `len(FIELDS)` 格：`u32 mask + n × 4 B`（按 FIELDS 顺序；int32 / float32）。"""
     mask = 0
     body = b""
     for bit, spec in enumerate(FIELDS):
@@ -433,7 +497,13 @@ MODE_HEADING = {MODE_PVP: "【对战模式 PVP】", MODE_PVE: "【任务模式 P
 
 
 def mode_lines(item, mode, table=None, data_dir=None):
-    """某模式下提示框会画的那几行数值（`shopcfg._weapon_lines` 的口径）。"""
+    """某模式下的数值行（`shopcfg._weapon_lines` 的口径）。
+
+    ★ **不传 `max_lines` = 不截断**（用户 2026-09-20）：游戏里那个提示框只有 5 行，
+    项数超了要让「飞行速度」让位；管理页空间够，要看得到完整内容。
+    弹窗里那块「游戏内提示框预览」走的是 `shopcfg.item_desc_zh()`，
+    **照旧是游戏里真实会显示的样子**（该让位的照样让位）。
+    """
     return shopcfg._weapon_lines(effective_weapon_dict(item, mode, table, data_dir))
 
 
@@ -471,7 +541,9 @@ def admin_view(item_id, table=None, data_dir=None):
     for key, label, unit, _src, cast, low, high in FIELDS:
         row = {"key": key, "label": label, "unit": unit,
                "type": "float" if cast is float else "int", "min": low, "max": high,
-               "reference": ref.get(key)}
+               "reference": ref.get(key),
+               # 「这一格填 0 会怎样」，没有核实过的字段就没有这一条（`ZERO_MEANS`）。
+               "zero_note": ZERO_MEANS.get(key, "")}
         for mode in MODES:
             row[mode] = overrides_of(item_id, mode, table).get(key)
         fields.append(row)
@@ -485,6 +557,9 @@ def admin_view(item_id, table=None, data_dir=None):
         "desc": desc_of(item_id, table),
         "desc_max_lines": DESC_MAX_LINES,
         "desc_max_chars": DESC_MAX_CHARS,
+        # ★ 跨格判据（追踪）：规则那两行判断前后台各写一份，**话只有这一份**。
+        "homing_rule": {"angle": "homing_angle", "range": "homing_range",
+                        "message": HOMING_RULE_MESSAGE},
         "pvp_only_note": PVP_ONLY_NOTE if item.custom else "",
         "preview": shopcfg.item_desc_zh(item, weapons_table=table),
         # ★ 两套数值行分开给（用户 2026-09-19）：弹窗里 PVP / PVE 各画一块，游戏内那段只有 PVP。

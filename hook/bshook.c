@@ -8388,11 +8388,12 @@ static int try_hook_render_init(void)
 /* ========================================================================== */
 /* 自定义武器表（X_Mod · X3）—— 服务端说了算的武器数值，写进客户端内存           */
 /*                                                                            */
-/* 9 把「自定义」黄金武器的数值不在资源包里定死，而由管理页配置、服务端下发：   */
+/* 18 把「自定义」武器的数值不在资源包里定死，而由管理页配置、服务端下发：      */
 /*   gsp 0x0F01（我们自造的 opcode，只有本 hook 认识）                          */
-/*     u16 format=1 · u32 serial · u16 n · n × { i32 武器Id                    */
-/*        · [PVE] u32 mask + 12×4B · [PVP] u32 mask + 12×4B }                  */
-/*   12 格按 `server/weaponcfg.FIELDS` 的顺序：前 9 格 int32、后 3 格 float。   */
+/*     u16 format=3 · u32 serial · u16 n · u8 模式 · n × { i32 武器Id          */
+/*        · [PVE] u32 mask + 14×4B · [PVP] u32 mask + 14×4B }                  */
+/*   14 格按 `server/weaponcfg.FIELDS` 的顺序（见下面的 WTAB_FIELD[]）；        */
+/*   format 3 起最后两格是**追踪** HomingAngle(i32) / HomingRange(f32)，X7。    */
 /*                                                                            */
 /* 客户端那边（本轮逆的，X_Mod §36）：                                          */
 /*   · WeaponTable::Load(path) = 0x48b50d，容器全局 0x72e788，一条记录 0x254 B； */
@@ -8412,10 +8413,10 @@ static int try_hook_render_init(void)
 /*         BSHOOK_WEAPON_MODE=pve|pvp 强制模式（实机核对两套表都写对时用）。     */
 /* ========================================================================== */
 #define WTAB_OPCODE        0x0F01
-#define WTAB_FORMAT        2
-#define WTAB_FIELDS        12
+#define WTAB_FORMAT        3
+#define WTAB_FIELDS        14
 #define WTAB_MAX           32
-#define WTAB_RECORD_BYTES  (4 + 2 * (4 + 4 * WTAB_FIELDS))     /* 108 */
+#define WTAB_RECORD_BYTES  (4 + 2 * (4 + 4 * WTAB_FIELDS))     /* 124 */
 #define WTAB_HEADER_BYTES  9        /* u16 格式 + u32 序号 + u16 条数 + u8 模式 */
 /* 载荷头那一格模式（服务端 `weaponcfg.HOOK_MODE_*`）。★ NONE = 「只更新数据、
    别施加」：管理页改了数值不捅正在进行的那一局，**下一局才生效**（用户
@@ -8446,12 +8447,18 @@ static const unsigned char WTAB_LOAD_SIG[5]     = { 0xb8,0x08,0xe8,0x62,0x00 };
 static const unsigned char WTAB_MERGE_SIG[5]    = { 0xb8,0x44,0xe8,0x62,0x00 };  /* mov eax,0x62e844（SEH 序言）*/
 static const unsigned char WTAB_LOOKUP_SIG[5]   = { 0x56,0x8b,0x30,0x57,0x8b };
 
-/* 12 格的记录偏移 + 类型。顺序 == `weaponcfg.FIELDS`（test_weaponcfg 钉着那边的顺序）。 */
+/* 14 格的记录偏移 + 类型。顺序 == `weaponcfg.FIELDS`（test_weaponcfg 钉着那边的顺序）。
+   ★★ 最后两格是**追踪**（X7）。类型一格都不能记反：
+       `+0x78` HomingAngle 是 **i32**（`0x47e53a: db 40 78` = `fild dword [eax+0x78]`），
+       `+0x7c` HomingRange 是 **f32**（`0x47e45b: d8 58 7c` = `fcomp dword [eax+0x7c]`）。
+       客户端没有独立的追踪开关 —— `0x47e35a: cmp [记录+0x78],0; je 函数尾` 就是开关。
+       `test_patchsites_wtab` 拿脱壳镜像把这三条指令的字节钉死了。 */
 static const struct { unsigned off; int is_float; const char *name; } WTAB_FIELD[WTAB_FIELDS] = {
     { 0x34, 0, "Damage" },        { 0x38, 0, "HeadDamage" },  { 0x3c, 0, "LegsDamage" },
     { 0x48, 0, "SplashDamage" },  { 0x4c, 0, "SplashRange" }, { 0x60, 0, "MagazineCount" },
     { 0x5c, 0, "CoolingTime" },   { 0x64, 0, "ReloadTime" },  { 0x58, 0, "LoadingTime" },
     { 0x24, 1, "Velocity" },      { 0x28, 1, "MaxVelocity" }, { 0x30, 1, "GravityFactor" },
+    { 0x78, 0, "HomingAngle" },   { 0x7c, 1, "HomingRange" },
 };
 
 typedef struct { unsigned mask; unsigned v[WTAB_FIELDS]; } wtab_block_t;

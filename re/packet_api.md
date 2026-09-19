@@ -2232,13 +2232,19 @@ opcode 出处：`0x493808` 的分发链 `sub 0x406 / dec / sub 0xb / dec / dec /
 线格式（`server/weaponcfg.build_hook_frame()` ⇄ hook 侧 `wtab_on_frame()`）：
 
 ```text
-u16 format(=2) · u32 serial · u16 n · u8 模式                            头 9 B
-n × { i32 武器Id · [PVE] u32 mask + 12×4B · [PVP] u32 mask + 12×4B }      每条 108 B
+u16 format(=3) · u32 serial · u16 n · u8 模式                            头 9 B
+n × { i32 武器Id · [PVE] u32 mask + 14×4B · [PVP] u32 mask + 14×4B }      每条 124 B
 ```
 
-12 格按 `weaponcfg.FIELDS` 的顺序：`Damage HeadDamage LegsDamage SplashDamage SplashRange
-MagazineCount CoolingTime ReloadTime LoadingTime`（int32）`Velocity MaxVelocity GravityFactor`（f32）。
+14 格按 `weaponcfg.FIELDS` 的顺序：`Damage HeadDamage LegsDamage SplashDamage SplashRange
+MagazineCount CoolingTime ReloadTime LoadingTime`（int32）`Velocity MaxVelocity GravityFactor`（f32）
+**`HomingAngle`（int32）`HomingRange`（f32）**。
 `mask` 位 = 这一格有值（资源包参考值也算）；没在 mask 里的格 hook 写回自己存的原值。两套一起发。
+
+★ **格式 3 = 追踪两格**（X_Mod · X7，2026-09-20）。`HomingAngle` 落记录 `+0x78`（i32）、
+`HomingRange` 落 `+0x7c`（f32），**类型不对称，别按「都是整数」写** —— 见 §6.7。
+⚠ 格式号一变，**装着旧 DLL 的客户端会把整份包丢掉**（`bshook.c` 那句「格式对不上，丢弃」），
+它那边全部自定义武器数值退回资源包原值 ⇒ 改格式必须连客户端包一起发。
 
 ★★ **模式那一格（格式 2 新增，X_Mod §42 / D32）** —— 它同时是「这一局是什么」和「现在施加」两条命令：
 
@@ -4140,8 +4146,25 @@ vft `0x665374`，Deserialize `0x43cf5c`，每项 0x14 字节：
 | `+0x38` | i32 | HeadDamage | `+0x64` | i32 | ReloadTime |
 | `+0x3c` | i32 | LegsDamage | `+0x108` | ptr | CreatingClass 工厂 |
 | `+0x48` | i32 | SplashDamage | `+0x1dc` | i32 | ROH |
+| `+0x78` | **i32** | **HomingAngle** | `+0x7c` | **f32** | **HomingRange** |
 
-（其余偏移见 V0.3bot §53。浮点走 `0x40b9dd`（`fstp dword`），整数走 `0x40b8c2`。）
+★★ **追踪那两格类型不对称**（X_Mod §48，逐指令核过，`test_patchsites_wtab` 钉着字节）：
+
+```text
+解析  0x489450: 89 47 78    mov  [edi+0x78], eax          ; HomingAngle 直接存 i32
+      0x48941e: d9 5f 7c    fstp dword [edi+0x7c]         ; HomingRange 先 fild 再存 f32
+用    0x47e35a: 83 78 78 00 cmp  dword [eax+0x78], 0      ; ★ == 0 就完全不追踪（这就是开关）
+      0x47e53a: db 40 78    fild dword [eax+0x78]         ; 每 tick 转 HomingAngle/7 度
+      0x47e45b: d8 58 7c    fcomp dword [eax+0x7c]        ; 每 tick 复查还在不在射程里
+```
+
+两个键**在 ini 里都写整数**（`HomingRange` 也走整数取值器 `0x40b8c2`，读完 `fild`→`fstp` 转 float），
+所以光看 ini 分不出类型；`+0x7c` 按 i32 写进去，客户端 `fcomp` 读到的是个 1e-43 量级的数。
+★ 另有一个 `Homing=` 键落 `+0x1c`（bool，`0x4893e4`），全镜像**没有读点** —— 死键，别管它。
+★ `HomingRange` 同时是**选靶方框**的四条边（`0x47e391`~`0x47e3cd`）⇒ 为 0 时框退化成一个点，
+永远锁不上，弹体把 `[弹体+0x328]` 写成 −2 后**永久**不再搜索 ⇒ 「只设转向不设距离」= 静默失效。
+
+（其余偏移见 V0.3bot §53 末尾那两个代码块和 §46 末尾。浮点走 `0x40b9dd`（`fstp dword`），整数走 `0x40b8c2`。）
 ★ 全年龄那套 `_` 键由 `[0x72e784]` 决定读不读（`0x48b602` 从 `[0x72e358]` 抄过来）。
 ★ `+0x94` = `ForceTime`、`+0x98` = `ForceCount`（地上捡来的限时 / 限次武器，见 §5.4a 的 `rpChangeWeapon`）。
 

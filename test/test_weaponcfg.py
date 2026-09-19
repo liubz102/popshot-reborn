@@ -28,6 +28,13 @@ import weaponcfg  # noqa: E402
 CUSTOM = 1920001          # 第一批（C · 爆裂 3 母本）泰尔 1 号「左轮手枪 自定义1」
 CUSTOM2 = 1930001         # 第二批（P · 复合 3 母本）泰尔 1 号「左轮手枪 自定义2」
 CUSTOM_GRENADE = 1920002  # 泰尔 2 号（有溅射 / 最大初速）
+#: 布洛克 1 号「机枪 自定义1」—— 出厂 6 项（伤害 / 爆头 / 弹容 / 射速 / 装填 / 飞行速度）。
+CUSTOM_WIDE = 3920001
+#: 给它配上溅射再加追踪 = **九项**，正好把提示框那 5 行挤爆 ——
+#: 「排不下才让位」那条只有这种配法才触发得到（出厂值下 18 把都挤不爆，见
+#: `test_out_of_the_box_nothing_has_to_yield`）。
+_WIDE_PVP = {"splash_damage": 20, "splash_range": 90,
+             "homing_angle": 250, "homing_range": 400.0}
 ORIGINAL = 1120011        # 左轮 爆裂1（原版）
 
 _SPEC = []
@@ -154,6 +161,11 @@ class RangeTests(_Case):
         self.assertEqual((0.0, 1000.0), limits["velocity"])
         self.assertEqual((0.0, 1000.0), limits["max_velocity"])
         self.assertEqual((-20.0, 20.0), limits["gravity"])
+        # 追踪两格是用户 2026-09-20 拍板的（原版全表 19~300 / 50~350）。
+        # ★ 转向留到 1300 是有由头的：每 tick 只转 `值 / 7` 度，而自定义武器的
+        #   初速 100~211，配原版那个 30 几乎看不出弯 —— 快子弹要大数值才拐得动。
+        self.assertEqual((0, 1300), limits["homing_angle"])
+        self.assertEqual((0.0, 1000.0), limits["homing_range"])
 
     def test_every_field_has_a_legacy_range_that_is_not_narrower(self):
         """读盘的范围必须**包住**管理页的范围，否则存不进去的值反而读得出来，反了。"""
@@ -239,6 +251,132 @@ class RangeTests(_Case):
         self.assertEqual((0, 500), (row["damage"]["min"], row["damage"]["max"]))
 
 
+#: 卡希尔 3 号槽的两把自定义武器 —— **母本 `ch01-03D3/F3` 本来就带追踪**
+#: （`HomingAngle=30 / HomingRange=220`，`build.py` 逐键照抄带过来的），
+#: 所以它俩的「参考值」里有追踪，别的 16 把没有。跨格判据靠这个区别才说得清。
+CUSTOM_HOMING = 2920003   # 卡希尔 3 号「加农华尔兹 自定义1」
+CUSTOM_HOMING2 = 2930003  # 同上，第二批「自定义2」
+
+
+class HomingTests(_Case):
+    """追踪两格（X7）。客户端侧的偏移 / 类型 / 开关由 `test_patchsites_wtab` 钉着，
+    这里只管服务端这半边：参考值、跨格判据、下发。"""
+
+    def test_the_two_cabins_that_already_home_keep_their_reference(self):
+        """★ 18 把里**只有卡希尔 3 号槽那两把**自带追踪，而且是抄母本抄来的。
+
+        这条同时钉住「参考值真的读得到 Homing 两格」—— `tools/weapondata.py`
+        早就在抽 `HomingRange` / `HomingAngle`，`bot_weapons.json` 不用重生成。
+        """
+        for item_id in (CUSTOM_HOMING, CUSTOM_HOMING2):
+            ref = weaponcfg.reference(item_id)
+            self.assertEqual(30, ref["homing_angle"], item_id)
+            self.assertEqual(220.0, ref["homing_range"], item_id)
+        for item_id in (CUSTOM, CUSTOM2, CUSTOM_GRENADE):
+            self.assertNotIn("homing_angle", weaponcfg.reference(item_id))
+            self.assertNotIn("homing_range", weaponcfg.reference(item_id))
+
+    def test_turning_without_a_reach_is_refused(self):
+        """★★ 只填转向不填距离 = **静默不生效**，必须当场拦下来。
+
+        判据在客户端：选靶那个方框的四条边全用 `[记录+0x7c]`
+        （`0x47e391`~`0x47e3cd`），为 0 时方框退化成一个点 ⇒ 永远锁不上 ⇒
+        弹体把 `[弹体+0x328]` 写成 −2、此后**永久**不再搜索。
+        """
+        with self.assertRaises(shopcfg.ConfigError):
+            weaponcfg.save_item(CUSTOM, params={"pve": {}, "pvp": {"homing_angle": 300}},
+                                data_dir=self.dir)
+        # 一个字节都不该落盘
+        self.assertEqual({}, weaponcfg.overrides_of(CUSTOM, "pvp", data_dir=self.dir))
+
+    def test_turning_plus_reach_is_fine(self):
+        weaponcfg.save_item(CUSTOM,
+                            params={"pve": {}, "pvp": {"homing_angle": 300, "homing_range": 400.0}},
+                            data_dir=self.dir)
+        got = weaponcfg.effective(CUSTOM, "pvp", data_dir=self.dir)
+        self.assertEqual(300, got["homing_angle"])
+        self.assertEqual(400.0, got["homing_range"])
+
+    def test_a_reach_that_comes_from_the_reference_counts(self):
+        """★ 判据落在**有效值**（覆盖 ∪ 参考）上：卡希尔 3 号槽的参考值自带 220，
+        那儿只填转向、距离留空是合法的 —— 落在原始覆盖上判就会误杀。"""
+        weaponcfg.save_item(CUSTOM_HOMING, params={"pve": {}, "pvp": {"homing_angle": 600}},
+                            data_dir=self.dir)
+        got = weaponcfg.effective(CUSTOM_HOMING, "pvp", data_dir=self.dir)
+        self.assertEqual((600, 220.0), (got["homing_angle"], got["homing_range"]))
+
+    def test_a_reach_without_turning_is_fine(self):
+        """反过来「只填距离不填转向」合法 —— 那就是不追踪。"""
+        weaponcfg.save_item(CUSTOM, params={"pve": {}, "pvp": {"homing_range": 500.0}},
+                            data_dir=self.dir)
+        self.assertEqual(500.0,
+                         weaponcfg.overrides_of(CUSTOM, "pvp", data_dir=self.dir)["homing_range"])
+
+    def test_zeroing_the_turn_switches_homing_off(self):
+        """填 0 = 关掉 —— 对自带追踪的那两把也一样（mask 位置上、值是 0）。"""
+        weaponcfg.save_item(CUSTOM_HOMING, params={"pve": {}, "pvp": {"homing_angle": 0}},
+                            data_dir=self.dir)
+        self.assertEqual(0, weaponcfg.effective(CUSTOM_HOMING, "pvp", data_dir=self.dir)["homing_angle"])
+
+    def test_the_rule_is_a_pure_function_the_page_can_share(self):
+        self.assertIsNone(weaponcfg.homing_error({}))
+        self.assertIsNone(weaponcfg.homing_error({"homing_angle": 0, "homing_range": 0}))
+        self.assertIsNone(weaponcfg.homing_error({"homing_angle": 30, "homing_range": 1}))
+        self.assertEqual(weaponcfg.HOMING_RULE_MESSAGE,
+                         weaponcfg.homing_error({"homing_angle": 30, "homing_range": 0}))
+        self.assertEqual(weaponcfg.HOMING_RULE_MESSAGE, weaponcfg.homing_error({"homing_angle": 1}))
+
+    def test_the_admin_view_hands_the_rule_and_the_zero_notes_to_the_page(self):
+        view = weaponcfg.admin_view(CUSTOM, data_dir=self.dir)
+        self.assertEqual({"angle": "homing_angle", "range": "homing_range",
+                          "message": weaponcfg.HOMING_RULE_MESSAGE}, view["homing_rule"])
+        row = {f["key"]: f for f in view["fields"]}
+        self.assertEqual((0, 1300), (row["homing_angle"]["min"], row["homing_angle"]["max"]))
+        self.assertEqual("int", row["homing_angle"]["type"])
+        self.assertEqual("float", row["homing_range"]["type"])
+        # 「0 代表不追踪」那句灰字：话在服务端，页面上不写死
+        self.assertEqual(weaponcfg.ZERO_MEANS["homing_angle"], row["homing_angle"]["zero_note"])
+        self.assertIn("不追踪", row["homing_angle"]["zero_note"])
+        self.assertEqual("", row["damage"]["zero_note"])     # 没核实过的就没有这一句
+
+    def test_every_zero_note_belongs_to_a_real_field(self):
+        """★ `ZERO_MEANS` 是另一张表 —— 键漂了页面上那句话会**静默消失**。"""
+        self.assertLessEqual(set(weaponcfg.ZERO_MEANS), set(weaponcfg.FIELD_KEYS))
+        for key, text in weaponcfg.ZERO_MEANS.items():
+            self.assertTrue(text.startswith("0 = "), "%s 的提示话不是「0 = …」的口径" % key)
+
+    def test_the_two_hint_strings_still_fit_the_cell(self):
+        """★★ 这两种话都画在输入框正下方那一行（`.err` / `.hint`，`white-space: nowrap`），
+        弹窗里那一格从第 3 列到行尾在 1280 宽下只有 **192 px**，11 px 字 ⇒ 大约 **17 个汉字**。
+
+        2026-09-20 在真页面上量过：`追踪距离要 > 0，否则锁不上目标` = 165 px、
+        `0 = 子弹不动（不是「不限速」）` = 164 px，都刚好压着线；
+        而第一版那句 28 个字的墨宽是 **319 px**，直接溢出「对战模式」那张卡片的右边框。
+
+        ⇒ 这里按**字数**兜底。不折行是有意的（折行会把这一格撑高、把同一行别的格子顶歪），
+        所以写长了不会报错、只会跑到卡片外面去 —— 改文案请先在页面上量。
+        """
+        budget = 17
+        self.assertLessEqual(len(weaponcfg.HOMING_RULE_MESSAGE), budget,
+                             "跨格判据那句话超过 %d 个字，会溢出格子" % budget)
+        for key, text in weaponcfg.ZERO_MEANS.items():
+            self.assertLessEqual(len(text), budget, "%s 的「0 = …」超过 %d 个字" % (key, budget))
+
+    def test_the_new_cabins_ride_in_the_0f01_frame(self):
+        weaponcfg.save_item(CUSTOM,
+                            params={"pve": {"homing_angle": 7, "homing_range": 111.0},
+                                    "pvp": {"homing_angle": 1300, "homing_range": 1000.0}},
+                            data_dir=self.dir)
+        payload = weaponcfg.build_hook_frame(data_dir=self.dir)
+        _fmt, _serial, _mode, records = weaponcfg.parse_hook_frame(payload)
+        rec = dict(records)[shopdata.get(CUSTOM).ammo_id]
+        self.assertEqual((7, 111.0), (rec["pve"]["homing_angle"], rec["pve"]["homing_range"]))
+        self.assertEqual((1300, 1000.0), (rec["pvp"]["homing_angle"], rec["pvp"]["homing_range"]))
+        # 没设过的那把：mask 位为 0 ⇒ hook 写回它自己存的原值（= ini 缺省 0 = 不追踪）
+        plain = dict(records)[shopdata.get(CUSTOM2).ammo_id]
+        self.assertNotIn("homing_angle", plain["pvp"])
+
+
 class EffectiveTests(_Case):
 
     def test_reference_comes_from_the_resource_pack(self):
@@ -286,6 +424,65 @@ class DescriptionTests(_Case):
         # 第 1 段（含提示行）不许超过客户端画得下的 5 行
         self.assertLessEqual(len(text.split(shopcfg.DESC_SEPARATOR)[0].split("\n")),
                              shopcfg.ITEM_DESC_MAX_LINES)
+
+    def test_the_tooltip_only_mentions_homing_when_it_is_actually_on(self):
+        """★ 「追踪」只在真的开着时才画 —— `HomingAngle = 0` 就是客户端的「不追踪」。"""
+        plain = shopcfg.item_desc_zh(shopdata.get(CUSTOM))
+        self.assertNotIn("追踪", plain)
+        weaponcfg.save_item(CUSTOM,
+                            params={"pve": {}, "pvp": {"homing_angle": 250, "homing_range": 400.0}})
+        text = shopcfg.item_desc_zh(shopdata.get(CUSTOM))
+        self.assertIn("追踪 250", text)
+        self.assertLessEqual(len(text.split(shopcfg.DESC_SEPARATOR)[0].split("\n")),
+                             shopcfg.ITEM_DESC_MAX_LINES)
+
+    def test_flight_speed_yields_only_when_the_line_budget_really_runs_out(self):
+        """★★ 用户 2026-09-20：「仅在显示不下时让『飞行速度』让位」。
+
+        `CUSTOM_WIDE`（布洛克 1 号）是 18 把里**唯一**项数满到会溢出的那种
+        —— 伤害 / 爆头 / 溅射 / 溅射范围 / 弹容 / 射速 / 装填 / 飞行速度 八项
+        已经占掉 4 行，加上首行提示正好 5 行，追踪再挤进来就超了。
+        泰尔 1 号只有 6 项，追踪进来照样装得下 ⇒ **一项都不该丢**。
+        """
+        weaponcfg.save_item(CUSTOM_WIDE, params={"pve": {}, "pvp": _WIDE_PVP})
+        tight = shopcfg.item_desc_zh(shopdata.get(CUSTOM_WIDE)).split(shopcfg.DESC_SEPARATOR)[0]
+        self.assertIn("追踪 250", tight)
+        self.assertNotIn("飞行速度", tight)         # 排不下 ⇒ 只有它让位
+        self.assertIn("弹容", tight)                # 别的一项不少
+        self.assertIn("溅射范围", tight)
+        self.assertLessEqual(len(tight.split("\n")), shopcfg.ITEM_DESC_MAX_LINES)
+
+        weaponcfg.save_item(CUSTOM,
+                            params={"pve": {}, "pvp": {"homing_angle": 250, "homing_range": 400.0}})
+        roomy = shopcfg.item_desc_zh(shopdata.get(CUSTOM)).split(shopcfg.DESC_SEPARATOR)[0]
+        self.assertIn("追踪 250", roomy)
+        self.assertIn("飞行速度", roomy)            # 装得下 ⇒ 谁都不用让
+        self.assertLessEqual(len(roomy.split("\n")), shopcfg.ITEM_DESC_MAX_LINES)
+
+    def test_out_of_the_box_nothing_has_to_yield(self):
+        """★ 出厂参考值下，18 把**没有一把**会挤到要让位（最多 7 项 = 4 行 + 首行提示
+        = 正好 5 行）。让位那条是安全网，不是天天在走的路 —— 这条钉住这个事实，
+        将来谁给提示框加一项，会先在这儿红，而不是在实机上悄悄少一行。"""
+        for item_id in weaponcfg.custom_item_ids():
+            weaponcfg.save_item(item_id,
+                                params={"pve": {}, "pvp": {"homing_angle": 30, "homing_range": 200.0}})
+            head = shopcfg.item_desc_zh(shopdata.get(item_id)).split(shopcfg.DESC_SEPARATOR)[0]
+            self.assertIn("追踪 30", head, item_id)
+            self.assertLessEqual(len(head.split("\n")), shopcfg.ITEM_DESC_MAX_LINES, item_id)
+            weapon = weaponcfg.effective_weapon_dict(shopdata.get(item_id), "pvp")
+            if weapon.get("velocity"):
+                self.assertIn("飞行速度", head, "%s 出厂就挤到要让位了" % item_id)
+
+    def test_the_admin_dialog_sees_the_lines_the_game_had_to_drop(self):
+        """★ 管理页要看得到**完整**内容（用户 2026-09-20）——
+        游戏里让位是因为提示框只有 5 行，弹窗没有这个限制。"""
+        weaponcfg.save_item(CUSTOM_WIDE, params={"pve": {}, "pvp": _WIDE_PVP})
+        lines = "".join(weaponcfg.mode_lines(shopdata.get(CUSTOM_WIDE), "pvp"))
+        self.assertIn("追踪 250", lines)
+        self.assertIn("飞行速度", lines)
+        # 而弹窗里那块「游戏内提示框预览」照旧是游戏里真实的样子（该让位的照样让位）
+        view = weaponcfg.admin_view(CUSTOM_WIDE)
+        self.assertNotIn("飞行速度", view["preview"].split(shopcfg.DESC_SEPARATOR)[0])
 
     def test_original_weapon_tooltip_is_untouched_until_a_desc_is_set(self):
         before = shopcfg.item_desc_zh(shopdata.get(ORIGINAL))
@@ -356,15 +553,15 @@ class DescriptionTests(_Case):
 class HookFrameTests(_Case):
 
     def test_layout(self):
-        self.assertEqual(12, len(weaponcfg.FIELDS))
-        self.assertEqual(108, weaponcfg.RECORD_SIZE)
+        self.assertEqual(14, len(weaponcfg.FIELDS))          # 12 + 追踪两格（X7）
+        self.assertEqual(124, weaponcfg.RECORD_SIZE)
         self.assertEqual(9, weaponcfg.HEADER_SIZE)
         n = len(weaponcfg.custom_item_ids())                 # 两批 = 18 条
         payload = weaponcfg.build_hook_frame()
         fmt, serial, count, mode = struct.unpack_from("<HIHB", payload, 0)
         self.assertEqual((weaponcfg.WIRE_FORMAT, 0, n), (fmt, serial, count))
         self.assertEqual(weaponcfg.HOOK_MODE_NONE, mode)     # 默认不施加
-        self.assertEqual(9 + n * 108, len(payload))
+        self.assertEqual(9 + n * 124, len(payload))
         # ★ hook 侧 `WTAB_MAX` 是 32：条数超了整份包会被丢弃（bshook.c 的硬拦截）。
         self.assertLessEqual(n, 32, "条数超过 bshook 的 WTAB_MAX，客户端会静默丢包")
 
@@ -377,7 +574,7 @@ class HookFrameTests(_Case):
                        weaponcfg.HOOK_MODE_NONE):
             payload = weaponcfg.build_hook_frame(hook_mode=wanted)
             fmt, serial, mode, records = weaponcfg.parse_hook_frame(payload)
-            self.assertEqual(2, fmt)                         # 格式 2 = 带模式位
+            self.assertEqual(3, fmt)                         # 格式 3 = 带模式位 + 14 格
             self.assertEqual(wanted, mode)
             self.assertEqual(len(weaponcfg.custom_item_ids()), len(records))
 
@@ -400,8 +597,14 @@ class HookFrameTests(_Case):
         """★ hook 侧 `WTAB_FIELD[]` 的顺序 / 类型照这张表写，两边对不上就是写错格。"""
         self.assertEqual(("damage", "head_damage", "legs_damage", "splash_damage", "splash_range",
                           "magazine", "cooling_ms", "reload_ms", "loading_ms",
-                          "velocity", "max_velocity", "gravity"), weaponcfg.FIELD_KEYS)
-        self.assertEqual([int] * 9 + [float] * 3, [f[4] for f in weaponcfg.FIELDS])
+                          "velocity", "max_velocity", "gravity",
+                          "homing_angle", "homing_range"), weaponcfg.FIELD_KEYS)
+        # ★★ 逐字段列，**别再写成 `[int]*9 + [float]*3` 那种「int 在前 float 在后」的
+        #   模式** —— 那是当初 12 格碰巧成立的巧合，X7 在表尾追加 int 型的
+        #   `homing_angle` 之后就不成立了，而这条要钉的本来就是「第 i 格是什么类型」。
+        self.assertEqual([int, int, int, int, int, int, int, int, int,
+                          float, float, float, int, float],
+                         [f[4] for f in weaponcfg.FIELDS])
 
 
 class HookSourceStaysInSyncTests(unittest.TestCase):

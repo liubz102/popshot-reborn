@@ -1636,6 +1636,14 @@ ul.help li.ro-note { color: var(--crimson); font-weight: 700; }
   line-height: 1.5; display: none; white-space: nowrap; overflow: visible;
 }
 .weapon-field.has-err .err { display: block; }
+/* 「这一格填 0 会怎样」：和错误话**同一个位置**（输入框正下方），灰字、同样不折行。
+   ★ 错误优先 —— 两句一起画会把格子撑高、把同一行别的格子顶歪（同 `.err` 那条理由）。 */
+.weapon-field .hint {
+  grid-column: 3 / -1; font-size: 11px; color: var(--cocoa-soft); opacity: .85;
+  line-height: 1.5; display: none; white-space: nowrap; overflow: visible;
+}
+.weapon-field.has-hint .hint { display: block; }
+.weapon-field.has-hint.has-err .hint { display: none; }
 /* 出错的那一格连范围一起变红 —— 眼睛跟着红色走，直接看到「该填多少」。 */
 .weapon-field.has-err .lim { color: var(--crimson); opacity: 1; font-weight: 700; }
 .weapon-mode .acts { margin-top: 8px; display: flex; justify-content: flex-end; }
