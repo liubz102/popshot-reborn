@@ -33,12 +33,12 @@ ORIGINAL = 1120011        # 左轮 爆裂1（原版）
 _SPEC = []
 
 
-def _goldwp_spec():
-    """`tools/goldwp/spec.py` —— 自定义武器编号的唯一源头（只依赖标准库）。"""
+def _cw_spec():
+    """`tools/custom-weapon/spec.py` —— 自定义武器编号的唯一源头（只依赖标准库）。"""
     if not _SPEC:
         import importlib.util
-        path = os.path.join(ROOT, "tools", "goldwp", "spec.py")
-        s = importlib.util.spec_from_file_location("test_wc_goldwp_spec", path)
+        path = os.path.join(ROOT, "tools", "custom-weapon", "spec.py")
+        s = importlib.util.spec_from_file_location("test_wc_cw_spec", path)
         module = importlib.util.module_from_spec(s)
         s.loader.exec_module(module)
         _SPEC.append(module)
@@ -88,10 +88,10 @@ class RegistrationTests(_Case):
     def test_every_custom_weapon_is_known(self):
         """两批自定义武器（X3 的 `C` · X6 的 `P`）全部认得出来。
 
-        ★ 期望值**从 `tools/goldwp/spec.py` 现取**：那儿是编号的唯一源头，
+        ★ 期望值**从 `tools/custom-weapon/spec.py` 现取**：那儿是编号的唯一源头，
           加第三批时这条自动跟着走，不用改常量。
         """
-        self.assertEqual(sorted(w.item_id for w in _goldwp_spec().WEAPONS),
+        self.assertEqual(sorted(w.item_id for w in _cw_spec().WEAPONS),
                          weaponcfg.custom_item_ids())
         self.assertEqual(18, len(weaponcfg.custom_item_ids()))   # 两批 × 9
         self.assertTrue(weaponcfg.is_custom(CUSTOM))
@@ -346,9 +346,9 @@ class DescriptionTests(_Case):
     def test_every_batch_has_a_chinese_word(self):
         """★ 后缀字母 -> 中文词的表必须覆盖 `spec.BATCHES` 的每一批 —— 漏一批，
         那 9 把的名字会静默退回韩文（`weapon_name_zh` 的兜底分支）。"""
-        for letter in _goldwp_spec().BATCHES:
+        for letter in _cw_spec().BATCHES:
             self.assertIn(letter, shopcfg.CUSTOM_WEAPON_ZH_BY_SUFFIX, letter)
-        self.assertEqual(len(_goldwp_spec().BATCHES),
+        self.assertEqual(len(_cw_spec().BATCHES),
                          len(set(shopcfg.CUSTOM_WEAPON_ZH_BY_SUFFIX.values())),
                          "两批不能叫同一个名字")
 

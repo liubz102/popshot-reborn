@@ -33,8 +33,8 @@
 「要补什么」是**每次现算的**：中文版里已经有这条 id 就不算缺口，第二遍跑下来是空的、
 一个字节都不写。真要重写时也先把这些 id 从文件里**整段摘掉**再插回去，不会插重。
 
-插入位置是 goldwp 的自定义武器块（`[Item-1920001]` 起）**之前** —— 两个工具因此可以
-任意顺序重跑：`goldwp/build.py` 的 `build_shop_ini()` 是「砍掉 `[Item-1920001]` 之后的
+插入位置是 自定义武器生成器的自定义武器块（`[Item-1920001]` 起）**之前** —— 两个工具因此可以
+任意顺序重跑：`custom-weapon/build.py` 的 `build_shop_ini()` 是「砍掉 `[Item-1920001]` 之后的
 一切再追加」，本工具的块在那一刀**上游**，不会被它带走。
 
 ## 跑完还要做什么
@@ -59,8 +59,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-#: goldwp 自定义武器块的第一节。本工具的块插在它**之前**（见文件头「幂等」）。
-GOLDWP_ANCHOR = "[Item-1920001]"
+#: 自定义武器块的第一节。本工具的块插在它**之前**（见文件头「幂等」）。
+CUSTOM_WEAPON_ANCHOR = "[Item-1920001]"
 
 #: 物品 id 的部位码 12 = 武器（`tools/shopdata.PART_KIND`）。
 WEAPON_PART = 12
@@ -247,8 +247,8 @@ def rebuild(root=None, candidates=None):
         return path, text, []
     chunk = "\n\n".join(block) + "\n"
 
-    # ③ 插在 goldwp 的自定义武器块之前（没有那个块就追加到末尾）
-    anchor = text.find(GOLDWP_ANCHOR)
+    # ③ 插在 自定义武器生成器的自定义武器块之前（没有那个块就追加到末尾）
+    anchor = text.find(CUSTOM_WEAPON_ANCHOR)
     if anchor >= 0:
         head, tail = text[:anchor], text[anchor:]
         if not head.endswith("\n\n"):

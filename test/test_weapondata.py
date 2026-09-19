@@ -36,12 +36,12 @@ TOOLS = os.path.join(os.path.dirname(HERE), "tools")
 _SPEC = []
 
 
-def _goldwp_spec():
-    """`tools/goldwp/spec.py` —— 自定义武器的唯一清单（只依赖标准库，便携运行时能跑）。"""
+def _cw_spec():
+    """`tools/custom-weapon/spec.py` —— 自定义武器的唯一清单（只依赖标准库，便携运行时能跑）。"""
     if not _SPEC:
         import importlib.util
-        path = os.path.join(TOOLS, "goldwp", "spec.py")
-        s = importlib.util.spec_from_file_location("test_goldwp_spec", path)
+        path = os.path.join(TOOLS, "custom-weapon", "spec.py")
+        s = importlib.util.spec_from_file_location("test_cw_spec", path)
         module = importlib.util.module_from_spec(s)
         s.loader.exec_module(module)
         _SPEC.append(module)
@@ -356,7 +356,7 @@ class RealTableTests(unittest.TestCase):
         # 原版 228 节里带 ROH 的 **127** 节 + 每批自定义武器 11 节（9 主 + 2 子弹药，
         # `ROH` 照抄各自的母本 ⇒ 用自定义左轮打的也算「左轮高手」那一族）。
         # ★ 自定义那部分**按清单算**，不写死：加一批就是 +11，改常量的活儿交给 spec。
-        custom = sum(1 + (1 if w.piece_section else 0) for w in _goldwp_spec().WEAPONS)
+        custom = sum(1 + (1 if w.piece_section else 0) for w in _cw_spec().WEAPONS)
         self.assertEqual(127 + custom, tagged)
 
     def test_roh_of_covers_the_three_base_characters(self):

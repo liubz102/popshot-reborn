@@ -12,7 +12,7 @@
 1. 那 18 条在中文版表里，且**逐字节等于韩版原文**（不是我们自己编的数值）；
 2. `[Item-]` 排在 `[Stock-]` **前面** —— `tools/shopdata.py` 的 `Tag` / `PartFlag`
    就靠这个顺序取，反过来写会静默丢掉弹药 id 和装备槽（会话里真踩过）；
-3. 工具**幂等**：拿现在这份文件再跑一遍，产出逐字节相同，而且 goldwp 的
+3. 工具**幂等**：拿现在这份文件再跑一遍，产出逐字节相同，而且 自定义武器生成器的
    自定义武器块仍然排在我们这一块**后面**（两个工具的重跑顺序才无所谓）。
 
 ⚠ 依赖明文资源树 `game_patched/Pack_develop`，发布包里没有，自动跳过。
@@ -88,17 +88,17 @@ class OpenWeaponsTests(unittest.TestCase):
             self.assertLess(order[(item_id, "item")], order[(item_id, "stock")],
                             "#%d 的 [Stock-] 排到 [Item-] 前面去了" % item_id)
 
-    def test_our_block_sits_before_the_goldwp_block(self):
-        """★ goldwp 的 `build_shop_ini()` 会砍掉 `[Item-1920001]` 之后的一切再追加
-        —— 我们的块必须在那一刀**上游**，否则重跑 goldwp 就把 18 件带走了。"""
+    def test_our_block_sits_before_the_custom_weapon_block(self):
+        """★ 自定义武器生成器的 `build_shop_ini()` 会砍掉 `[Item-1920001]` 之后的一切再追加
+        —— 我们的块必须在那一刀**上游**，否则重跑 自定义武器生成器就把 18 件带走了。"""
         text = self.ow.read_text(self.cn_path)
-        anchor = text.find(self.ow.GOLDWP_ANCHOR)
+        anchor = text.find(self.ow.CUSTOM_WEAPON_ANCHOR)
         if anchor < 0:
-            self.skipTest("这份表里没有 goldwp 的自定义武器块")
+            self.skipTest("这份表里没有 自定义武器生成器的自定义武器块")
         for item_id in EXPECTED_IDS:
             where = text.find("[Item-%d]" % item_id)
             self.assertGreater(where, 0, "#%d 不在表里" % item_id)
-            self.assertLess(where, anchor, "#%d 跑到 goldwp 的块后面去了" % item_id)
+            self.assertLess(where, anchor, "#%d 跑到 自定义武器生成器的块后面去了" % item_id)
 
     def test_rerun_changes_nothing(self):
         """★ 幂等：拿现在这份再跑一遍，产出逐字节相同。"""

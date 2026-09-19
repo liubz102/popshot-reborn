@@ -6,7 +6,7 @@
 四个左轮小节，这一条就是防止再有人「顺手」改一下。判据是最硬的那种：文件前 221519 字节
 的 sha256 必须等于原版（`2245b8c7^` 那份 == `main/Pack_decrypt/Data/weapon.ini`）。
 
-自定义武器那 11 个小节由 `tools/goldwp/build.py` 生成，追加在原版之后；这里核它们的
+自定义武器那 11 个小节由 `tools/custom-weapon/build.py` 生成，追加在原版之后；这里核它们的
 Id / 资源引用是不是都对得上磁盘上的文件（缺一个文件客户端不崩但会静默缺东西）。
 
 ⚠ 依赖明文资源树 `game_patched/Pack_develop`，发布包里没有，自动跳过。
@@ -19,11 +19,11 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-GOLDWP = os.path.join(ROOT, "tools", "goldwp")
+CW_DIR = os.path.join(ROOT, "tools", "custom-weapon")
 
 
 def _load(name):
-    spec = importlib.util.spec_from_file_location("test_" + name, os.path.join(GOLDWP, name + ".py"))
+    spec = importlib.util.spec_from_file_location("test_" + name, os.path.join(CW_DIR, name + ".py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -201,7 +201,7 @@ class WeaponIniTests(unittest.TestCase):
         / 商店图标名一个都不许撞。★ 这条不看磁盘，**没实装的批次也管**。"""
         spec = self.spec
         self.assertEqual(1920001, spec.WEAPONS[0].item_id,
-                         "openweapons.GOLDWP_ANCHOR 钉着 [Item-1920001]，第一条不能换")
+                         "openweapons.CUSTOM_WEAPON_ANCHOR 钉着 [Item-1920001]，第一条不能换")
         for field, label in (("ammo_id", "武器 Id"), ("item_id", "物品 id"),
                              ("custom_section", "小节名")):
             values = [getattr(w, field) for w in spec.WEAPONS]

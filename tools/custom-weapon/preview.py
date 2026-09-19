@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """preview.py —— 自定义武器配色的**效果图**（阶段 1：出图给用户确认，不写任何游戏资源）。
 
-    C:\\Python314\\python.exe tools/goldwp/preview.py --batch P
-    C:\\Python314\\python.exe tools/goldwp/preview.py --batch C --variants A,B,C --only models
+    C:\\Python314\\python.exe tools/custom-weapon/preview.py --batch P
+    C:\\Python314\\python.exe tools/custom-weapon/preview.py --batch C --variants A,B,C --only models
 
-产物（都在 `tools/goldwp/`，文件名带批次后缀，两批并存互不覆盖）：
+产物（都在 `tools/custom-weapon/`，文件名带批次后缀，两批并存互不覆盖）：
     preview_models_<批>.png    9 把手持件 × {原版, 各变体}，每格 front + rot35 两个视角
     preview_sprites_<批>.png   弹体精灵 / HUD 图标 / 商店图标 / 3D 弹体贴图 的 原版 → 各变体
     preview_effects_<批>.png   特效贴图里**本方案会改到**的那些 的 原版 → 各变体

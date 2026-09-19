@@ -694,6 +694,72 @@ class SortTests(_ShopCase):
         self.assertEqual([999999001, 999999002], [e["id"] for e in ordered])
 
 
+class PinnedTests(_ShopCase):
+    """「新商品」标签把自定义武器顶到最前面（用户 2026-09-20）。
+
+    ★ 「新商品」**收全部**（`CATEGORY_NEW`），本来就是「有什么新东西」该看的那一格；
+      531 件按 id 升序排下来，这一版新加的自定义武器散在第 23 / 44 / 65 页，等于看不见。
+    """
+
+    #: 两批自定义武器各一把，追加在小表**末尾** ⇒ 目录名次最高（上市顺序里最新）。
+    CUSTOM = {
+        "1920001": {"id": 1920001, "kind": "weapon", "part_flag": 1024, "part": 92,
+                    "character": 0, "name_kr": "리볼버 C", "stock": True,
+                    "ownable": True, "custom": True, "slot": 1, "ammo_id": 1000315},
+        "1930001": {"id": 1930001, "kind": "weapon", "part_flag": 1024, "part": 93,
+                    "character": 0, "name_kr": "리볼버 P", "stock": True,
+                    "ownable": True, "custom": True, "slot": 1, "ammo_id": 1000415},
+    }
+
+    def setUp(self):
+        super(PinnedTests, self).setUp()
+        table = dict(SYNTHETIC)
+        table.update(self.CUSTOM)
+        path = os.path.join(self.tmp.name, "with_custom.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as fp:
+            json.dump(make_table(table), fp, ensure_ascii=False)
+        shopdata.STORE = shopdata._Store(path)          # `_ShopCase` 的 cleanup 会还原
+
+    def listed(self, *ids):
+        return [{"id": i, "listed": True, "price": 100} for i in ids]
+
+    ALL = (1120041, 1010001, 2120041, 1920001, 1930001)
+
+    def test_自定义武器排在新商品最前面(self):
+        with shop_config(self.listed(*self.ALL)):
+            entries, _ = shop.shelf_entries(category=shop.CATEGORY_NEW)
+        self.assertEqual([1920001, 1930001, 1010001, 1120041, 2120041],
+                         [e["id"] for e in entries])
+
+    def test_别的标签照旧_没被顶(self):
+        """★ 只顶「新商品」那一格 —— 在「武器」里也顶上去的话，
+        玩家熟悉的「同系列相邻、由低到高」就乱了。"""
+        with shop_config(self.listed(*self.ALL)):
+            everything, _ = shop.shelf_entries(category=shop.CATEGORY_ALL)
+            weapons, _ = shop.shelf_entries(category=shop.category_of(1120041))
+        self.assertEqual([1010001, 1120041, 1920001, 1930001, 2120041],
+                         [e["id"] for e in everything])
+        self.assertEqual([1120041, 1920001, 1930001, 2120041],
+                         [e["id"] for e in weapons])
+
+    def test_置顶那一撮内部仍按玩家选的顺序(self):
+        """把它们整体抬到前面，**不替玩家把排序也改了** —— 点「上市顺序」
+        还是该看到最新的那把排在最前。"""
+        with shop_config(self.listed(*self.ALL)):
+            basic, _ = shop.shelf_entries(category=shop.CATEGORY_NEW,
+                                          order=shop.SORT_BASIC)
+            release, _ = shop.shelf_entries(category=shop.CATEGORY_NEW,
+                                            order=shop.SORT_RELEASE)
+        self.assertEqual([1920001, 1930001], [e["id"] for e in basic][:2])
+        self.assertEqual([1930001, 1920001], [e["id"] for e in release][:2])
+
+    def test_置顶判据(self):
+        self.assertTrue(shop.is_pinned(1920001))        # 第一批（部位码 92）
+        self.assertTrue(shop.is_pinned(1930001))        # 第二批（部位码 93）
+        self.assertFalse(shop.is_pinned(1120041))       # 原版武器
+        self.assertFalse(shop.is_pinned(999999001))     # ★ 表外的 id 不许炸
+
+
 class PacketTests(_ShopCase):
     """三发下行包的字节。★ 全是 🔍静态结论，没在线上验过。"""
 

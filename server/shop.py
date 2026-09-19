@@ -502,13 +502,30 @@ def sort_name(order):
     return "未知(%d)" % order
 
 
-def sort_entries(entries, order=SORT_BASIC):
+def is_pinned(item_id):
+    """这件东西要不要在「新商品」标签里**置顶**。
+
+    ★ 判据是 `shop_items.json` 的 `custom` —— 即本项目自己加的那批**自定义武器**
+      （部位码 92 / 93，见 `tools/shopdata.CUSTOM_WEAPON_PART`）。用户 2026-09-20 要求
+      「这个版本新加的自定义武器显示到新商品的最前面」。
+    ★ 用**派生判据**而不是 `shop.json` 里加一个开关：以后再加一批自定义武器会自动跟着置顶，
+      不用逐条去点。哪天要让别的东西置顶，把这个函数改成查配置即可 —— 调用方只有一处。
+    """
+    item = shopdata.get(item_id)
+    return bool(item is not None and getattr(item, "custom", False))
+
+
+def sort_entries(entries, order=SORT_BASIC, pinned_first=False):
     """按玩家选的顺序排货架。
 
     * `SORT_BASIC`「基本顺序」—— itemId 升序。id 是 `角色·部位·系列·档次`
       编出来的（§6），升序排出来同系列相邻、由低到高，就是玩家看惯的那个样子。
     * `SORT_RELEASE`「上市顺序」—— **原版目录顺序倒过来**（新的在前）。
       出处和「为什么只能这么近似」写在 `shopdata.catalog_index()` 里。
+
+    `pinned_first` 为真时，`is_pinned()` 的那些排在最前面，**其余照旧**；
+    置顶那一撮**内部仍按玩家选的顺序排**（只是把它们整体抬到前面，不改玩家的选择）。
+    只有「新商品」标签会开它，见 `shelf_entries`。
 
     ⚠ 名次相同的一律再按 id 兜底 —— 排序必须**全序**，否则同一批商品
     两次请求可能给出不同的页，玩家翻页会看到重复或漏掉的格子。
@@ -518,9 +535,14 @@ def sort_entries(entries, order=SORT_BASIC):
     except (TypeError, ValueError):
         order = SORT_BASIC
     if order == SORT_RELEASE:
-        return sorted(entries, key=lambda e: (-shopdata.catalog_index(e["id"]),
-                                              int(e["id"])))
-    return sorted(entries, key=lambda e: int(e["id"]))
+        def rank(entry):
+            return (-shopdata.catalog_index(entry["id"]), int(entry["id"]))
+    else:
+        def rank(entry):
+            return (int(entry["id"]),)
+    if pinned_first:
+        return sorted(entries, key=lambda e: (0 if is_pinned(e["id"]) else 1,) + rank(e))
+    return sorted(entries, key=rank)
 
 
 def shelf_entries(category=CATEGORY_ALL, character=CHARACTER_ANY, data_dir=None,
@@ -556,7 +578,10 @@ def shelf_entries(category=CATEGORY_ALL, character=CHARACTER_ANY, data_dir=None,
             if limit is not None and int(limit) != int(character):
                 continue
         out.append(entry)
-    return sort_entries(out, order), warnings + more
+    # ★ 只有「新商品」标签置顶（用户 2026-09-20）：那一格**收全部**（`CATEGORY_NEW`），
+    #   本来就是「有什么新东西」该看的地方；别的标签照旧，免得在「武器」里也被顶到前面。
+    pinned_first = int(category) == CATEGORY_NEW
+    return sort_entries(out, order, pinned_first), warnings + more
 
 
 def page_count(total):

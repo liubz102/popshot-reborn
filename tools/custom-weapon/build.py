@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """build.py —— 把全部自定义武器的资源**从各自的母本生成出来**（X_Mod · X3 / X6，阶段 2）。
 
-    C:\\Python314\\python.exe tools/goldwp/build.py                      # 全部批次一起，幂等
-    C:\\Python314\\python.exe tools/goldwp/build.py --dry-run
-    C:\\Python314\\python.exe tools/goldwp/build.py --variant P=orig     # 临时覆盖某一批（只搬运不改色）
+    C:\\Python314\\python.exe tools/custom-weapon/build.py                      # 全部批次一起，幂等
+    C:\\Python314\\python.exe tools/custom-weapon/build.py --dry-run
+    C:\\Python314\\python.exe tools/custom-weapon/build.py --variant P=orig     # 临时覆盖某一批（只搬运不改色）
 
 ★★ **一次跑全部批次**，不能只跑一批：`weapon.ini` 和 `ShopItem-Chn.ini` 都是
    「砍掉标记 / 锚点之后的一切再整块重写」，只跑一批会把另一批悄悄带走。
@@ -29,7 +29,7 @@
 * `weapon.ini` 前 221519 字节必须等于原版（sha256 见 `ORIGINAL_SHA256`），追加块以标记行开头，
   重跑先把旧块砍掉再追加 —— `test/test_weaponini.py` 盯着这一条。
 * `ShopItem-Chn.ini` 的切口是 `spec.WEAPONS[0].item_id`，`tools/openweapons.py` 的
-  `GOLDWP_ANCHOR` 钉着同一个值（那 18 件原版 3 级武器插在本块之前）。
+  `CUSTOM_WEAPON_ANCHOR` 钉着同一个值（那 18 件原版 3 级武器插在本块之前）。
 * `_` 前缀（全年龄版）的资源键**全部指向和普通键同一批资源**（`_Sound-*` 除外），
   不另做气泡版：不管客户端在哪种模式下都看到同一套颜色。
 """
@@ -65,7 +65,7 @@ INI_MARKER = spec.INI_MARKER
 
 #: 自定义武器的说明（写进 ini 注释，纯 ASCII，铁律 3）。
 INI_BANNER = (
-    "; Custom weapons + sub-ammo sections, one block per batch (see tools/goldwp/spec.BATCHES).",
+    "; Custom weapons + sub-ammo sections, one block per batch (see tools/custom-weapon/spec.BATCHES).",
     "; Numbers are copied from each batch's reference sections; the live values come from",
     "; the server (admin page -> 0x0F01 -> bshook), not from this file.",
 )

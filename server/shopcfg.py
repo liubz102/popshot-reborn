@@ -326,7 +326,7 @@ NAME_ZH = {
 SERIES_ZH = {"D": "爆裂", "R": "极速", "F": "复合"}
 
 #: ★ 自定义武器：**韩文名后缀字母 -> 名字里的中文词**（用户 2026-09-19 定）。
-#: 后缀字母由 `tools/goldwp/spec.BATCHES` 的批次字母决定，写进商店图标文件名
+#: 后缀字母由 `tools/custom-weapon/spec.BATCHES` 的批次字母决定，写进商店图标文件名
 #: （`무기_리볼버 C.png`），再经 `shopdata.icon_name()` 变成 `name_kr`（`리볼버 C`）。
 #:
 #: ★ **用后缀字母分批，不用部位码**：`name_kr` 本来就带着它，产物不用加字段、
