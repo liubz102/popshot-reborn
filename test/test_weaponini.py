@@ -81,6 +81,46 @@ class WeaponIniTests(unittest.TestCase):
                 self.assertNotIn(fields["Id"], ids, "%s 和 %s 撞 Id" % (name, ids.get(fields["Id"])))
                 ids[fields["Id"]] = name
 
+    def test_every_custom_id_decodes_to_its_slot(self):
+        """★★★ 武器 Id **不能随便编**（§41 / D31）。
+
+        客户端 `0x40a138` 把 Id 拆数位算出一个索引，直接拿去下标**只有 4 格**的
+        弹药数组，而开火 / 取弹药 / 换弹三个调用点**都只查 `>= 0`、不查上界**。
+        索引必须正好等于槽位，否则两件事同时发生：
+          ① 换弹是 `ammo[i] = maxAmmo[i]`，越界读到的是堆里的指针 → 永远减不到 0
+             ⇒ 无限开火、准星外圈那圈弹格也不画；
+          ② 每开一枪往越界处写一个 dword ⇒ 退出地图销毁 Surface 时撞上被踩坏的
+             哈希节点，主线程死循环（结算界面「未响应」）。
+        初版编号 `1 0 0C 9 S 0`（档 9、系列 0）正好两条都踩。
+        """
+        for w in self.spec.WEAPONS:
+            series, index = self.spec.decode_weapon_id(w.ammo_id)
+            self.assertTrue(3 <= series <= 5,
+                            "%s 的 Id=%d 系列位是 %d，不在 [3,5]，索引不会被归一化成槽位"
+                            % (w.custom_section, w.ammo_id, series))
+            self.assertEqual(w.slot, index,
+                             "%s 的 Id=%d 解出来的索引是 %d，不是槽位 %d —— 弹药数组会越界"
+                             % (w.custom_section, w.ammo_id, index, w.slot))
+
+    def test_the_decoder_model_matches_every_original_weapon(self):
+        """上面那条守卫只在「解码器抄对了」的前提下才有意义 —— 拿 ini 里全部原版
+        `chNN-0S…` 小节回归：Id 解出来的索引必须等于小节名里的槽位 S。
+        子弹药（`…a` 结尾）不算：原版它们本来就落在 50+，不走玩家开火那条路。
+        """
+        checked = 0
+        for name, fields in self.sections.items():
+            m = re.match(r"^ch\d\d-0(\d)(.*)$", name, re.IGNORECASE)
+            if not m or m.group(2).endswith("a") or "Id" not in fields:
+                continue
+            slot = int(m.group(1))
+            index = self.spec.weapon_slot_index(int(fields["Id"]))
+            self.assertEqual(slot, index,
+                             "%s Id=%s 解出索引 %d，和小节名里的槽位 %d 对不上 —— "
+                             "要么解码器抄错了，要么这条 Id 本来就特殊"
+                             % (name, fields["Id"], index, slot))
+            checked += 1
+        self.assertGreater(checked, 100, "只核到 %d 个小节，正则八成没匹配上" % checked)
+
     def _exists(self, rel):
         return os.path.isfile(os.path.join(self.root, rel.replace("\\", "/")))
 

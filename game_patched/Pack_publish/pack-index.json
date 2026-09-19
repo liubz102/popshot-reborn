@@ -1,9 +1,9 @@
 {
  "format": 1,
  "packer": {"fill": 0, "key_prefix": "Pack/", "policy": "original-ext-v1", "sep": "~", "volume_cap": 16777216, "zlib_level": 9},
- "tree_hash": "9de3aaa334227caad370de225733e971a92e1c9afdaf33195c78f048108b6764",
+ "tree_hash": "cd363a1e394e19943d3e50044e8574fbf8b050159b600c09a33e2d08bdbfb2a7",
  "volumes": {
-  "Data~.pkn": {"group": "Data", "sha256": "0579f475a776640317101747f5b8d48aff51409342d81e77af31e4e57be9d67e", "size": 543744, "source": "Data", "members": [
+  "Data~.pkn": {"group": "Data", "sha256": "4001281bf130b59b3c7b8b273423e95819a340a6b96980d643be1e89913f82b9", "size": 543744, "source": "Data", "members": [
    ["Chinese.ini", 114250, "2ecfe16814a0d515430fdeea80c53eb7cbd5a9e0be69dcee469f360b8ba08d4e"],
    ["Chinese.ini.r19467", 103870, "6a20b3f802a68c72bc57d438ac42467940b8b4e8e0ddeafebc1a30d0ca2bb584"],
    ["Chinese.ini.r19470", 103892, "b4d3a37902c721e112a9f70ca0dc75dc6222ea0ba0cf4e5a6642871a9d2b3dd3"],
@@ -29,7 +29,7 @@
    ["Promotion-chn.ini", 101560, "20253c775e72e0b6e93c78cd7acd59126852af89c03862434d94084ff1120d1b"],
    ["Promotion-jpn.ini", 17940, "a1d4b24eb3ac4cc215c7fab8a39a2384667cb3e9d49bbf0f59e350ef37464ec5"],
    ["Promotion.ini", 57900, "821244737538f16327cb9a0f5c9d5087f35860de4ca0fab03df07a1779be296a"],
-   ["ShopItem-Chn.ini", 330958, "b9e3c2564173c80079c3acf7f538beb804848d64a666f9a2862bfb930b9c8d93"],
+   ["ShopItem-Chn.ini", 330958, "2148bb71d71337c620dc3414d23066ed5d6c44ef084e2563c9689d43d65cff5f"],
    ["ShopItem-Jpn.ini", 332662, "3e6a8012af937ee9c8cb8223817c576b88a9c71249aa51a41eff92439f2e5c98"],
    ["ShopItem.ini", 402958, "65ebc68762f79ca4ad9ce16386e88d5b3300634d44baefd4976fe7348577a29d"],
    ["Status.ini", 1786, "94b8d5632e0a89d9991e1eecbaccbe518e83794074c3d3fed40e00c040899da1"],
@@ -41,7 +41,7 @@
    ["map-censorship.ini", 28668, "a4c6a3b93a71b35b7e661220b6446db4352f474e8b3769a86d17070895fbd6fb"],
    ["map.ini", 43350, "d911bde05623a8499ca54d22a7c4d35c0ce671f99b501b258ea2cc8c39646b38"],
    ["weapon-censorship.ini", 95855, "7bbd0ddaf5ebaaadb8db91e32973a1efeb88a9f7238e2f35b020fa4c560dc4de"],
-   ["weapon.ini", 234164, "ef23397e4c8492ff6f07c9efcd6ff70e158ca297ebf2093d44403e8c04365b5f"]
+   ["weapon.ini", 234164, "0f1fbb8ad92f5bf9321ecd60c04ed13e9a1ce707f46ad1512e9799a9664b98f5"]
   ]},
   "Data~Quest.pkn": {"group": "Data", "sha256": "4aae0676e1a488733bfa7f0461936b9eb5bfb5274f3b972dd04c8c08d9cb4cf5", "size": 1082368, "source": "Data/Quest", "members": [
    ["Quest/ChrProps-international.ini", 54, "9c6cbc470c405f715ca4c0eaad777635310c7715391a2723f001fb0713b9ec46"],

@@ -209,12 +209,14 @@ class HookFrameTests(_Case):
         fmt, serial, records = weaponcfg.parse_hook_frame(payload)
         self.assertEqual(1, serial)
         by_id = dict(records)
-        rec = by_id[1000910]
+        # ★ 帧里的键是**武器 Id**，不是物品 id；从 `shop_items.json` 取，别写死
+        #   —— 武器 Id 2026-09-19 改过一次编号（§41 / D31），写死就会烂。
+        rec = by_id[shopdata.get(CUSTOM).ammo_id]
         self.assertEqual(50, rec["pve"]["damage"])
         self.assertEqual(6, rec["pvp"]["damage"])
         self.assertEqual(10.0, rec["pvp"]["velocity"])
         self.assertNotIn("splash_damage", rec["pvp"])        # 参考值里没有的格 mask 位为 0
-        self.assertIn("splash_damage", by_id[1000920]["pvp"])
+        self.assertIn("splash_damage", by_id[shopdata.get(CUSTOM_GRENADE).ammo_id]["pvp"])
 
     def test_field_order_matches_the_hook(self):
         """★ hook 侧 `WTAB_FIELD[]` 的顺序 / 类型照这张表写，两边对不上就是写错格。"""
