@@ -399,27 +399,41 @@ _SECTION = re.compile(r"^(Stock|Item)-(\d+)$", re.IGNORECASE)
 
 
 def build_items(shop_sections, bonus_table, weapons_by_ammo, warn):
-    """把三张表拼成 `{itemId(str): 记录}`。"""
-    items = collections.OrderedDict()
+    """把三张表拼成 `{itemId(str): 记录}`。
+
+    ★★ **一件东西的字段要把它名下的小节合起来看，不能只认先遇到的那一节。**
+    `Tag` / `PartFlag` 原版只写在 `[Item-]` 里，而 `[Stock-]` 排在前面的条目
+    两份表里都有（韩版 11 组、中文版 11 组）。只读第一节的话，这种条目会
+    **悄悄丢掉弹药 id 和装备槽**（`part_flag=0` ⇒ 穿不上身），一声不吭 ——
+    X5 补 18 把 3 级武器时正是按 `[Stock-]` 在前写的，当场踩中（§45）。
+    同一个键**先到的赢**，和原先「先拿到图标就不再换」一个口径。
+    """
+    merged = collections.OrderedDict()
     for section, fields in shop_sections.items():
         match = _SECTION.match(section.strip())
         if match is None:
             continue
         kindtag = match.group(1).lower()
         item_id = int(match.group(2))
-        entry = items.get(str(item_id))
-        if entry is None:
-            entry = _new_item(item_id, fields, bonus_table, weapons_by_ammo, warn)
-            items[str(item_id)] = entry
+        slot = merged.get(item_id)
+        if slot is None:
+            slot = merged[item_id] = {"fields": collections.OrderedDict(),
+                                      "stock": False, "ownable": False}
         # `[Stock-]` = 出现在货架上过；`[Item-]` = 能进背包的持有物条目。
         # 材料只有 Item，纯期限售卖形态只有 Stock，普通商品两个都有。
-        entry["stock" if kindtag == "stock" else "ownable"] = True
-        if not entry.get("icon"):
-            stem, name = icon_name(fields.get("Image"))
-            if stem:
-                entry["icon"] = stem
-                if name:
-                    entry["name_kr"] = name
+        slot["stock" if kindtag == "stock" else "ownable"] = True
+        for key, value in fields.items():
+            # 空值不算「有」—— 否则先来的 `Image=` 空串会把后面真正的图标挡住。
+            if str(value or "").strip() and key not in slot["fields"]:
+                slot["fields"][key] = value
+
+    items = collections.OrderedDict()
+    for item_id, slot in merged.items():
+        entry = _new_item(item_id, slot["fields"], bonus_table, weapons_by_ammo, warn)
+        # `_new_item` 已经把这两个键按正确顺序占好位了，这里只是填值。
+        entry["stock"] = slot["stock"]
+        entry["ownable"] = slot["ownable"]
+        items[str(item_id)] = entry
     return items
 
 

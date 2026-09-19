@@ -1,9 +1,9 @@
 {
  "format": 1,
  "packer": {"fill": 0, "key_prefix": "Pack/", "policy": "original-ext-v1", "sep": "~", "volume_cap": 16777216, "zlib_level": 9},
- "tree_hash": "a49ef6019c4c1fd8c03c0995a200d1cc1a6a098a3aa8fa8e5780a346dde581eb",
+ "tree_hash": "d018c94e479bc7f261efabed808cd64b83b28ef77b0216da59cb3f0ec836a517",
  "volumes": {
-  "Data~.pkn": {"group": "Data", "sha256": "4001281bf130b59b3c7b8b273423e95819a340a6b96980d643be1e89913f82b9", "size": 543744, "source": "Data", "members": [
+  "Data~.pkn": {"group": "Data", "sha256": "7f0f452759c5f194f5430848330c3c95eeea468217cae5823f29d8aa19ac1534", "size": 543744, "source": "Data", "members": [
    ["Chinese.ini", 114250, "2ecfe16814a0d515430fdeea80c53eb7cbd5a9e0be69dcee469f360b8ba08d4e"],
    ["Chinese.ini.r19467", 103870, "6a20b3f802a68c72bc57d438ac42467940b8b4e8e0ddeafebc1a30d0ca2bb584"],
    ["Chinese.ini.r19470", 103892, "b4d3a37902c721e112a9f70ca0dc75dc6222ea0ba0cf4e5a6642871a9d2b3dd3"],
@@ -29,7 +29,7 @@
    ["Promotion-chn.ini", 101560, "20253c775e72e0b6e93c78cd7acd59126852af89c03862434d94084ff1120d1b"],
    ["Promotion-jpn.ini", 17940, "a1d4b24eb3ac4cc215c7fab8a39a2384667cb3e9d49bbf0f59e350ef37464ec5"],
    ["Promotion.ini", 57900, "821244737538f16327cb9a0f5c9d5087f35860de4ca0fab03df07a1779be296a"],
-   ["ShopItem-Chn.ini", 330958, "2148bb71d71337c620dc3414d23066ed5d6c44ef084e2563c9689d43d65cff5f"],
+   ["ShopItem-Chn.ini", 335484, "68d3cd72adb2453474ab7aac8d4c4141f58767c0d163402b6cfd712e7e33606b"],
    ["ShopItem-Jpn.ini", 332662, "3e6a8012af937ee9c8cb8223817c576b88a9c71249aa51a41eff92439f2e5c98"],
    ["ShopItem.ini", 402958, "65ebc68762f79ca4ad9ce16386e88d5b3300634d44baefd4976fe7348577a29d"],
    ["Status.ini", 1786, "94b8d5632e0a89d9991e1eecbaccbe518e83794074c3d3fed40e00c040899da1"],

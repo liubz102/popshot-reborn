@@ -1016,13 +1016,16 @@ class RealDefaultsTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_shop_lists_the_whole_catalogue(self):
-        """★ 全量上架（D44 / D44b）：散件在商店买 —— 63 件 D/R/F 一件不少，
+        """★ 全量上架（D44 / D44b）：散件在商店买 —— **81 件** D/R/F 一件不少，
         加上特别版武器、散装铠甲、装饰、染色剂、突击技、外观套和强攻套，
         再加 11 张商城角色卡（D51：1000 金币、不限等级）。
-        材料 / 消耗品 / 礼包 / 称号不卖（D44 那张表）。"""
+        材料 / 消耗品 / 礼包 / 称号不卖（D44 那张表）。
+
+        ★ 495 → 513：X5 把中文版漏抄的 18 件 3 级武器补回物品表（§45 / D35），
+        D/R/F 从 63 件变 81 件，全量上架自然跟着 +18。"""
         shop = shopcfg.validate_shop(shopcfg.default_shop())
         listed = [e for e in shop.values() if e["listed"]]
-        self.assertEqual(495, len(listed), "上架件数变了 —— 改了 shopdefaults 的表就把这个数跟着改")
+        self.assertEqual(513, len(listed), "上架件数变了 —— 改了 shopdefaults 的表就把这个数跟着改")
         kinds = {e["kind"] for e in listed}
         self.assertEqual({"weapon", "armor", "spray", "dash", "character"}, kinds)
         for entry in listed:
@@ -1066,7 +1069,8 @@ class RealDefaultsTests(unittest.TestCase):
         """★ 中文名的唯一出处是**物品库**（D31），所以这一条查的是它。"""
         items = shopcfg.validate_items(shopcfg.default_items())
         # 808 件原版 + 9 把自定义武器（X3，`ShopItem-Chn.ini` 末尾 build.py 追加的那 9 组）
-        self.assertEqual(817, len(items), "物品库要收全部能进背包的东西")
+        # + 18 件 3 级武器（X5，韩版有中文版没抄的那批，openweapons.py 补回来的，§45）
+        self.assertEqual(835, len(items), "物品库要收全部能进背包的东西")
         for item_id in shopdata.ids_of_kind("weapon"):
             item = shopdata.get(item_id)
             if not item.ownable or not item.series:

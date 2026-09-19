@@ -417,6 +417,30 @@ class ToolTests(unittest.TestCase):
         self.assertIsNone(TOOL.parse_reward(""))
         self.assertIsNone(TOOL.parse_reward("9,1"))
 
+    def test_build_items_does_not_care_which_section_comes_first(self):
+        """★★ 一件东西的字段要把 `[Item-]` 和 `[Stock-]` 合起来看。
+
+        `Tag` / `PartFlag` 原版只写在 `[Item-]` 里，而 `[Stock-]` 排在前面的条目
+        两份表里都有。只认先遇到的那一节 ⇒ 这种条目**静默**丢掉弹药 id 和装备槽
+        （`part_flag=0` 就是穿不上身），管理页照样列得出来，进游戏才发现装不上。
+        X5 补 3 级武器时按 `[Stock-]` 在前写，当场踩中（§45）。
+        """
+        item = {"Image": "Images/Shop/무기_머신건 D3.png",
+                "Tag": "1002215.0", "PartFlag": "1024"}
+        stock = {"Image": "Images/Shop/무기_머신건 D3.png"}
+        weapons = {1002215: {"name": "머신건 D3", "damage": 4}}
+        both = []
+        for sections in ([("Item-3120013", item), ("Stock-3120013", stock)],
+                         [("Stock-3120013", stock), ("Item-3120013", item)]):
+            built = TOOL.build_items(dict(sections), {}, weapons, lambda _m: None)
+            both.append(built["3120013"])
+        for entry in both:
+            self.assertEqual(1002215, entry["ammo_id"])
+            self.assertEqual(1024, entry["part_flag"])
+            self.assertEqual(1, entry["slot"])
+            self.assertTrue(entry["ownable"] and entry["stock"])
+        self.assertEqual(both[0], both[1], "两种小节顺序解出来的记录必须一模一样")
+
 
 @unittest.skipUnless(os.path.isfile(shopdata.DATA_PATH), "shop_items.json 不在")
 class RealTableTests(unittest.TestCase):
@@ -440,9 +464,13 @@ class RealTableTests(unittest.TestCase):
         self.assertEqual(12, index["dashattack"])
 
     def test_three_series_are_complete(self):
-        """★ 中文版实际有 63 件 D/R/F（韩版 81，砍了 3 级的 18 件）。
+        """★ D/R/F 是 81 件：3 个角色 × 3 个系列 × 3 个槽 × 3 档。
 
-        M5 的商店就卖这一批。数量对不上说明提取口径或素材版本变了。
+        ★★ 中文版 `ShopItem-Chn.ini` 原本只有 **63** 件 —— 1 号槽和 3 号槽的
+        3 级（`D3/R3/F3`）那 18 件韩版有、中文版没抄（数据和美术其实都在客户端里）。
+        X5 用 `tools/openweapons.py` 把韩版那 18 组条目原样补了回来（§45），
+        所以这里从 7 件/系列变成 **9 件/系列**。
+        数量对不上说明提取口径变了、素材换了版本，或者那 18 条又掉了。
         """
         found = {}
         for item_id in shopdata.ids_of_kind("weapon"):
@@ -451,8 +479,8 @@ class RealTableTests(unittest.TestCase):
                 found.setdefault((item.character, item.series), []).append(item_id)
         self.assertEqual(9, len(found), "应当是 3 个角色 × 3 个系列")
         for key, ids in found.items():
-            self.assertEqual(7, len(ids), "%s 系列的件数不对：%s" % (key, ids))
-        self.assertEqual(63, sum(len(v) for v in found.values()))
+            self.assertEqual(9, len(ids), "%s 系列的件数不对：%s" % (key, ids))
+        self.assertEqual(81, sum(len(v) for v in found.values()))
 
     def test_weapon_slot_matches_part_flag(self):
         """id 推出来的槽位必须和 `PartFlag` 一致 —— 这是 `0x030b` 的依据。"""
