@@ -879,7 +879,9 @@ class AdminAssetTests(_AdminCase):
 
     #: `admin.js` 自己 `el.id = "…"` 建出来的节点，html 里当然没有。
     #: 加控件时如果又多了一个，往这儿补一行，别把下面那条用例关掉。
-    JS_MADE_IDS = {"cfgShown"}
+    #: ★ 2026-09-20 空了：`cfgShown`（工具条上那句「筛出 x / y」）搬进了面板标题
+    #:   那一格现成的 `#cfgCount` —— 掉落页的筛选条加了「来源」下拉之后放不下。
+    JS_MADE_IDS = set()
 
     def test_every_id_the_script_looks_up_exists_in_the_page(self):
         """★ `$("拼错的id")` 返回 `null`，**浏览器不报错**，只是那个按钮
@@ -901,6 +903,46 @@ class AdminAssetTests(_AdminCase):
         ids = re.findall(r'\bid="([A-Za-z0-9_-]+)"', html)
         dupes = sorted({name for name in ids if ids.count(name) > 1})
         self.assertEqual([], dupes)
+
+    def test_swapping_one_item_never_turns_into_a_multi_select(self):
+        """★ 用户 2026-09-20 点名的约束：**「换掉这一格」必须是单选。**
+
+        `openPicker` 的两种形态靠 `selected` 分 —— 给了它就是「这一格现在是谁」
+        （画红框、点一下就选中并关窗）。那三处（货架换商品 / 配方换产物 /
+        掉落换材料）都是**单值字段**，多选对它们没有意义：一次勾两件，
+        到底哪一件该落进这一格说不清。
+
+        合成配方的材料格 2026-09-20 改成了整组编辑器，它**不传 `selected`**
+        （当前几种已经是 ✓ 了，再叠一层红框是两种「选中」打架）⇒ 这条不变式
+        正好还是干净的：**`selected` 和 `multi` 永不同时出现。**
+
+        ★ 按**括号配平**切出每一发调用的参数块，不用贪婪正则 ——
+        `admin.js` 七千多行，`.*?` 跨过几百行去匹配下一个 `multi` 是必然的误伤。
+        """
+        _status, _h, raw = self.fetch("/admin/admin.js")
+        js = raw.decode("utf-8")
+        checked = 0
+        start = js.find("openPicker({")
+        while start >= 0:
+            depth, at = 0, js.index("{", start)
+            while at < len(js):
+                if js[at] == "{":
+                    depth += 1
+                elif js[at] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                at += 1
+            block = js[start:at + 1]
+            if "selected:" in block:
+                checked += 1
+                self.assertNotIn(
+                    "multi", block,
+                    "这一发 openPicker 既给了 selected 又想多选：\n" + block)
+            start = js.find("openPicker({", at)
+        # 一处都没扫到 = 正则失效了（比如有人把调用写成别的样子），
+        # 那这条用例就成了永远绿的摆设。
+        self.assertGreaterEqual(checked, 3, "没找到那几处单选调用点")
 
     def test_the_online_dropdowns_offer_exactly_the_filters_the_server_knows(self):
         """★ 下拉里的值和服务端 `ONLINE_FILTERS` 必须**一个不多一个不少**。

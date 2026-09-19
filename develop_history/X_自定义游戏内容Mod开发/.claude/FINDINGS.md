@@ -976,3 +976,27 @@ smf 19 → 32 帧，原版区域逐字节未动），hook 把 `0x48ca0d` 改写�
   ⇒ **一批一个部位码**：`92` 第一批、`93` 第二批（`93−50=43` 不是任何部位码，不和期限版撞）。
 - `WMeshIdx` 的百位 = 系列（D=1 / R=2 / F=3），母本一律取各系列**第 3 档**、产物固定**第 4 档**
   ⇒ 「目标 `mesh_idx − 10` == 母本」对每一批都成立，生成器靠它找母本（`chNNW0<系>4S` / `chNND0<系>42`）。
+
+## §48 ★★★★ 「这是不是自定义的」全站只有一个判据：物品身上的 `custom`（✅实测 844 = 826 + 18）
+
+- 产物 `server/shop_items.json` 里**恰好 18 条**带 `custom: true`（两批自定义武器），
+  `tools/shopdata.py` 在 `part in CUSTOM_WEAPON_PART` 那一支打的标。服务端 `Item.custom` /
+  `weaponcfg.is_custom()` / `shop.is_pinned()` 用它，**catalog 也一直在往前端发**
+  （`admin.py` 的 `if getattr(item, "custom", False): entry["custom"] = True`）
+  ⇒ 管理页加「来源」筛选**服务端一行都不用改**，前端读 `BYID[id].custom` 就够。
+- ★ X5 那 18 把「中文版补回的 3 级武器」在产物里和普通原版武器**一个字段都不差**
+  （`openweapons.py` 是原样抄韩版条目）—— 它们**算原版**，也没法单独认出来（要认只能硬编码 18 个 id）。
+- ⚠ **隐患**：`tools/shopdata.py` 的 `entry["custom"] = True` 只写在 `kind == "weapon"` 那一支里。
+  以后加自定义**防具 / 材料**时要把它提到 `_new_item()` 的公共段并扩 `CUSTOM_WEAPON_PART`，
+  否则新东西筛不出来。**前端筛选逻辑那时一行都不用动。**
+- ★ 判据**不能**挪进 `admin.js` 的 `itemRuleOf()`：那一份是「物品库这一页管理员能改的几栏」
+  （中文名 / 等级 / 角色限定，即 `items.json`），`custom` 压根不在里面 ⇒ 永远拿到 `undefined`。
+  这和隔壁「角色」那一栏按页面模型筛的 D31 口径**正好相反**，`test_adminpicker` 钉着。
+
+## §49 ★★★ `admin.js` / `.html` / `.css` **每次请求现读磁盘** ⇒ 纯前端改动不用重启服务端（✅实测）
+
+- `render_admin()` 每次 `open(ADMIN_PATH)`，`_static()` 每次 `open(path)` + ETag/`no-cache`
+  ⇒ 改完浏览器 `Ctrl+F5` 就是新的。**铁律 7「改完 server/ 必须重启」说的是 Python 模块**，
+  `server/web/` 下这三个静态件不在其内。
+- ★ 起服务端**不必连客户端一起起**：`tools/launch.ps1` 有 `-NoGame` 开关
+  （`start.bat` 没透出来）。只验管理页时用它，省得弹出游戏窗口。

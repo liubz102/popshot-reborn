@@ -180,6 +180,7 @@
               <div class="filters">
                 <select id="sellCharacter"></select>
                 <select id="sellListing"></select>
+                <select id="sellSource"></select>
               </div>
             </div>
             <div class="cat-tabs" id="sellCats"></div>
@@ -495,6 +496,7 @@
                弹窗同一份选项、同一条判据（admin.js 的 `dropdownsMatch`）。 -->
           <select id="playerCharacter"></select>
           <select id="playerListing"></select>
+          <select id="playerSource"></select>
           <button class="btn" id="playerPopupRefresh"
                   title="重新读一遍这个玩家的资料和物品表 / 全部运营配置">↻ 刷新</button>
         </div>
@@ -583,6 +585,7 @@
             <button class="btn" id="rewardAddItem">＋ 添加物品</button>
             <select id="rewardCharacter"></select>
             <select id="rewardListing"></select>
+            <select id="rewardSource"></select>
           </div>
           <div class="acts">
             <button class="btn" id="rewardItemsClear" title="把下面的奖励物品全部拿掉">清空物品</button>
@@ -653,6 +656,9 @@
              原来这儿还有个「类别」下拉，2026-09-09 让位给下面的分类标签。 -->
         <select id="pickCharacter"></select>
         <select id="pickListing"></select>
+        <!-- 来源（用户 2026-09-20）：原版 / 本项目自己加的。判据是物品身上的
+             `custom`（随 catalog 下发），和上面两个下拉共用 `dropdownsMatch`。 -->
+        <select id="pickSource"></select>
         <span class="grow"></span>
         <button class="btn" id="pickClose">关闭</button>
       </div>

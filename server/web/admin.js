@@ -269,6 +269,10 @@ var BYID = {};              // itemId -> 物品
 var CFG = {};               // {shop: {format, entries, snapshot, warnings, hadNotes}}
 var CURRENT = "items";      // 当前标签页（物品库是另外两份的地基，排最前）
 var FILTER = {};            // 每个标签页各自的筛选条件
+//: 「筛出 x / y」—— `repaintList` 算出来、`touched` 画进面板标题那一格。
+//  `null` = 没筛掉任何一条（或者这一页不写这句话）。带着 `which` 是因为
+//  `touched()` 在切页之后也会被单独叫到，对不上就不该拿旧数字去画。
+var CFG_SHOWN = null;
 
 //: 走 `#cfgPanel` 那套壳的标签页（读 / 存 / 脏标记 / 三方合并全共用）。
 //  ★ `rewards` 也在里面 —— 它画的是两张二维表格而不是卡片列表，但
@@ -1329,9 +1333,14 @@ function touched() {
   // ★★ 写在**面板标题**那一格，不写在工具条上那句话后面：工具条是一行 flex，
   //   掉落页那一条筛选开着时在 1320 里只剩 70 px 余量（CSS 里量过的那一处），
   //   再往「有未保存的修改」后面接七个字，整条当场折成两行。
+  // ★ 「筛出 x / y」也在这一格（2026-09-20 从工具条挪过来的，理由同上 ——
+  //   掉落页那一条筛选条加了「来源」下拉之后真的放不下了，见 `repaintList`）。
   var gone = dirty ? editCounts(CURRENT).removed : 0;
+  var narrowed = (CFG_SHOWN && CFG_SHOWN.which === CURRENT) ? CFG_SHOWN : null;
   $("cfgCount").textContent =
-    CFG[CURRENT].entries.length + " " + CAT.schema[CURRENT].unit
+    (narrowed ? "筛出 " + narrowed.shown + " / " + narrowed.total
+              : String(CFG[CURRENT].entries.length))
+    + " " + CAT.schema[CURRENT].unit
     + (gone ? "（删掉 " + gone + " 条还没保存）" : "");
   paintEdited($("cfgList"), CURRENT);
 }
@@ -1515,6 +1524,15 @@ function renderToolbar(which) {
     bar.appendChild(selectFilter(filter, "listing", "全部上架状态",
                                  LISTING_FILTER_OPTIONS));
   }
+  // ★ 来源下拉（用户 2026-09-20）：**凡是有筛选条的地方都挂**，包括掉落页 ——
+  //   今天 43 件材料一件自定义的都没有、选「自定义物品」必然筛出空，但用户
+  //   点名要它（以后会加自定义材料），而且「筛出空列表也是有用的信息」本来就是
+  //   `characterOptions()` 立下的规矩。
+  //   「金币 / 经验」和「称号卡片」两页不挂：它们压根没有筛选条，只有一个视图切换。
+  if (which !== "rewards" && which !== "cards") {
+    bar.appendChild(selectFilter(filter, "source", "全部物品",
+                                 SOURCE_FILTER_OPTIONS));
+  }
   if (which === "drops") {
     var modeSelect = selectFilter(filter, "mode", "全部模式",
       [{value: "quest", label: "闯关"}, {value: "pvp", label: "对战"}]);
@@ -1582,8 +1600,9 @@ function renderToolbar(which) {
 
   // ★★ 这一行**最多只能有一个 `.grow`**（`margin-left: auto`）：两个的话
   //   flex 会把空隙在它们之间平分，两样东西被拆到两处去（`.tool-right`
-  //   那段注释里记着同一个坑）。⇒ 称号卡片页拿这一格放那颗钮，
-  //   「筛出 x / y」那一小段就不画了（用户 2026-09-13 第六轮点名删掉的）。
+  //   那段注释里记着同一个坑）。现在整条工具条上只有称号卡片页那颗钮用它。
+  //   ★ 原来这儿还有个 `#cfgShown`（「筛出 x / y」）——2026-09-20 整个搬去了
+  //     面板标题那一格 `#cfgCount`，见 `repaintList` / `touched`。
   if (which === "cards") {
     // 「查看本人达成进度」：**只看自己**。它压根不发 `name`，服务端那一句
     // （`_admin_card_progress`）才是「不能看别人」的门 ⇒ 三档身份都画。
@@ -1593,11 +1612,7 @@ function renderToolbar(which) {
     mine.title = "只看你自己那个同名游戏账号的进度";
     mine.onclick = function () { openCardProgress(null); };
     bar.appendChild(mine);
-    return;
   }
-  var shown = el("span", "grow");
-  shown.id = "cfgShown";
-  bar.appendChild(shown);
 }
 
 /** 绑在筛选条件 `filter[key]` 上的一个下拉。改了就重画列表
@@ -1637,30 +1652,49 @@ function characterOptions() {
   });
 }
 
-/** 角色 / 上架状态两个下拉共用的判据（D68）—— 四处筛的是同一件事，写一处。
- *  `want` = {character, listing}，空串 = 不筛。
+/** 角色 / 上架状态 / 来源三个下拉共用的判据（D68）—— 七处筛的是同一件事，写一处。
+ *  `want` = {character, listing, source}，空串 = 不筛。
  *  ★ 角色按**物品库里那份角色限定**筛（D31），不看条目自己带的键 ——
  *    在物品库里把一件东西改成「不限」之后，它就不该再出现在「泰尔」这一档里
  *    （`character` 那个键是**删掉**表示不限的，拿 `undefined` 退回原版数据
  *    会让「改成不限」看上去没生效）。
- *  ★ 上架状态看**当前页面模型**（D42a）：没保存的改动也算。 */
+ *  ★ 上架状态看**当前页面模型**（D42a）：没保存的改动也算。
+ *  ★ 来源看**原版数据**（`sourceMatches`）—— 和上面两条的口径都不一样，别搞混。 */
 function dropdownsMatch(itemId, want) {
   if (want.character && String(itemRuleOf(itemId).character) !== want.character) {
     return false;
   }
-  return listingMatches(itemId, want.listing);
+  if (!listingMatches(itemId, want.listing)) { return false; }
+  return sourceMatches(itemId, want.source);
+}
+
+/** 三个共用下拉的一份空状态。★ **加第四个共用下拉时只改这一处** ——
+ *  除了配置页的 `emptyFilter()`，「修改仓库」/「发送奖励」/「装备卖出」
+ *  三处也各揣着一份同形状的 `filter`，以前是四份字面量各写各的。 */
+function emptyDropdownFilter() {
+  return {character: "", listing: "", source: ""};
 }
 
 /** 一份空的筛选条件。★ 加字段时只改这一处 —— 页面上有三个地方要「清筛选」。
- *  `big` / `sub` 是分类标签（`anyTab()` 那两个字段），掉落页用不上但留着不碍事。 */
+ *  `big` / `sub` 是分类标签（`anyTab()` 那两个字段），掉落页用不上但留着不碍事。
+ *  ★ 三个共用下拉那几个键**建在 `emptyDropdownFilter()` 上面**，不并列抄一份
+ *    —— 并列的话下次加下拉必然只改一边（ES5 没有展开运算符，只能这么摊）。 */
 function emptyFilter() {
-  return {q: "", character: "", listing: "", big: -1, sub: null,
-          mode: "", stage: "", difficulty: "",
-          // 称号卡片页：武器 / 统计范围 / 能不能获得 / 看哪一组
-          // （成就 · 武器 · 全部）。
-          weapon: "", scope: "", gettable: "", group: CARD_GROUPS[0].id,
-          // 「金币 / 经验获取」页当前看的是哪一半（`REWARD_VIEWS`）。
-          view: REWARD_VIEWS[0].id};
+  var filter = emptyDropdownFilter();
+  filter.q = "";
+  filter.big = -1;
+  filter.sub = null;
+  filter.mode = "";
+  filter.stage = "";
+  filter.difficulty = "";
+  // 称号卡片页：武器 / 统计范围 / 能不能获得 / 看哪一组（成就 · 武器 · 全部）。
+  filter.weapon = "";
+  filter.scope = "";
+  filter.gettable = "";
+  filter.group = CARD_GROUPS[0].id;
+  // 「金币 / 经验获取」页当前看的是哪一半（`REWARD_VIEWS`）。
+  filter.view = REWARD_VIEWS[0].id;
+  return filter;
 }
 
 /** `SCHEMA.drops` 里某个字段的描述（下拉选项从这儿取，不另抄一份）。 */
@@ -1700,8 +1734,7 @@ function repaintList() {
   //   都没有，走进去只会拿 `undefined` 去查物品表。
   if (CURRENT === "rewards") {
     paintCfgTabs(CURRENT, []);
-    var shownLabel = $("cfgShown");
-    if (shownLabel) { shownLabel.textContent = ""; }
+    CFG_SHOWN = null;
     RENDERERS.rewards(list, CFG.rewards.entries);
     lockList();
     list.scrollTop = keep;
@@ -1714,16 +1747,16 @@ function repaintList() {
   paintCfgTabs(CURRENT, filtered);
   var rows = narrowToTab(CURRENT, filtered);
   var total = CFG[CURRENT].entries.length;
-  var label = $("cfgShown");
-  if (label) {
-    // ★ 「筛出 x / y」只有**没有分类标签**的那几页写（用户 2026-09-09，D68a）：
-    //   另外几页的分类标签上已经带着件数，再写一遍是重复的。一样多就不写。
-    //   ★ 称号卡片页 2026-09-13 第六轮不画了（用户点名删掉）——
-    //   那一格让给了「查看本人达成进度」，见 `renderToolbar`。
-    var wantsCount = (CURRENT === "drops");
-    label.textContent = (wantsCount && rows.length !== total)
-      ? ("筛出 " + rows.length + " / " + total) : "";
-  }
+  // ★ 「筛出 x / y」只有**没有分类标签**的那几页要（用户 2026-09-09，D68a）：
+  //   另外几页的分类标签上已经带着件数，再写一遍是重复的。一样多就不写。
+  //   ★ 称号卡片页 2026-09-13 第六轮不画了（用户点名删掉）——
+  //   那一格让给了「查看本人达成进度」，见 `renderToolbar`。
+  // ★★ 这句话写在**面板标题**那一格，不写在工具条上（2026-09-20 挪的）：
+  //   工具条是一行 flex，掉落页在 1320 里本来就只剩几十像素余量（CSS 里量过），
+  //   这一版又给它加了「来源」下拉 —— 实测「筛出 42 / 52」一出现整条就折成两行。
+  //   「删掉 N 条还没保存」当初为同一个理由搬过去过（见 `touched`），跟着它走。
+  CFG_SHOWN = (CURRENT === "drops" && rows.length !== total)
+    ? {which: CURRENT, shown: rows.length, total: total} : null;
   if (!rows.length) {
     // ★ 只读身份下不能写「点『添加』」—— 那个钮在他画面上根本没有（D74）。
     list.appendChild(el("div", "list-empty",
@@ -2011,6 +2044,29 @@ function listingMatches(itemId, want) {
   return where === want;
 }
 
+/** 「来源」筛选的两个选项（用户 2026-09-20）：把**本项目自己加进去的**东西
+ *  一把捞出来。现在只有那 18 把自定义武器，以后还会有自定义防具 / 材料。
+ *  下拉第一项（空值）是「全部物品」= 不筛。 */
+var SOURCE_FILTER_OPTIONS = [
+  {value: "stock",  label: "原版物品"},
+  {value: "custom", label: "自定义物品"}];
+
+/** 这件东西过不过「来源」筛选。
+ *
+ * ★★ 判据是**原版数据** `BYID[].custom`（服务端 `shop_items.json` 的 `custom`，
+ *    随 catalog 下发）—— **不要挪进 `itemRuleOf`**。那一份是「物品库这一页上
+ *    管理员能改的东西」（只有中文名 / 等级 / 角色限定），`custom` 压根不在里面，
+ *    问它只会拿到 `undefined`。这和上面「角色」那一栏的 D31 口径**正好相反**，
+ *    别顺手统一。
+ * ★ 物品表里没有的 id 一律算原版 —— 「不是我加的」这句话对它成立。
+ * ★ `want` 为空直接放行，不筛时一次 `BYID` 都不查。
+ */
+function sourceMatches(itemId, want) {
+  if (!want) { return true; }
+  var item = BYID[itemId];
+  return (want === "custom") === !!(item && item.custom);
+}
+
 /** 这件东西要不要「等级 / 角色限定」两栏。
     ★ 和服务端 `shopcfg.has_level_and_character()` **同一条判据**：
     `part_flag != 0`（占装备槽）。两边对不上的话，页面上填得进去、
@@ -2215,6 +2271,54 @@ function renderRecipe(list, rows) {
   });
 }
 
+/** 这条配方的材料**整组**编辑（用户 2026-09-20 两轮拍板）。
+ *
+ * ★ 一行 4 个格子**点哪个都是它** —— 空的「＋」和有料的那几格走同一发。
+ *   打开时当前这几种自动勾上，**取消勾选 = 把它从这条配方里拿掉**；
+ *   于是「换一种材料」= 取消旧的 + 勾上新的，而且**满 4 格时也打得开**
+ *   （原来的单选版满格就连一颗「＋」都没有了）。
+ * ★ 上限从**服务端下发的** `MAX_MATERIALS` 来，不在这儿写死 4。
+ * ★ 不给 `selected`：当前这几种已经是 ✓ 了，再叠一层红框是两种「选中」打架。
+ * ★ 回调收 `ids` 不收 `items`（见 `#pickConfirm` 那段注释）——
+ *   这儿「没勾 = 删」，`BYID` 查不到就丢一件的话，症状是「材料凭空少一种」。
+ */
+function openMaterialPicker(entry, max) {
+  openPicker({
+    kinds: ["material"],
+    multi: true,
+    max: max,
+    chosen: entry.materials.map(function (material) { return material.id; }),
+    onPickMany: function (_items, ids) {
+      entry.materials = mergeMaterials(entry.materials, ids);
+      repaintList();          // 末尾的 touched() 会刷脏标记和 `.edited`
+    }
+  });
+}
+
+/** 「这条配方原来的材料」+「弹窗里勾了哪些 id」→ 新的材料数组。纯函数。
+ *
+ * ★ **保序 + 保数量**：留下来的那几种**原对象原样带过去**，顺序照旧
+ *   —— `Object.keys(PICKER.chosen)` 对数字型键返回的是**升序**不是点击序，
+ *   照它重排的话，GM 只是想加一种材料，另外三种的位置和已经填好的数量
+ *   全被洗一遍。新勾的按 `ids` 的顺序追加，数量默认 1。
+ */
+function mergeMaterials(current, chosenIds) {
+  var want = {};
+  (chosenIds || []).forEach(function (id) { want[Number(id)] = true; });
+  var out = [];
+  var kept = {};
+  (current || []).forEach(function (material) {
+    if (want[Number(material.id)]) {
+      out.push(material);
+      kept[Number(material.id)] = true;
+    }
+  });
+  (chosenIds || []).forEach(function (id) {
+    if (!kept[Number(id)]) { out.push({id: Number(id), count: 1}); }
+  });
+  return out;
+}
+
 /** 固定画 `max_materials` 格 —— 原版合成界面只有 4 个槽，第 5 种玩家看不见。 */
 function materialSlots(entry, card) {
   var box = el("div", "mat-slots");
@@ -2231,26 +2335,23 @@ function materialSlots(entry, card) {
       var material = entry.materials[position];
       if (!material) {
         var empty = el("div", "mat");
+        // ★ class 必须还是 `slot empty` 且爹还是 `.mat` —— 只读身份靠这两个
+        //   把整格摘掉（`lockList`）。换了名字那颗加号会留在只读画面上，不报错。
         var add = el("div", "slot empty", "＋");
         add.style.width = "50px";
         add.style.height = "50px";
-        add.title = "加一种材料";
-        add.onclick = function () {
-          openPicker({kinds: ["material"], onPick: function (item) {
-            entry.materials.push({id: item.id, count: 1});
-            repaintList();
-          }});
-        };
+        add.title = "编辑这条配方的材料（可一次勾多种）";
+        add.onclick = function () { openMaterialPicker(entry, max); };
         empty.appendChild(add);
         box.appendChild(empty);
         return;
       }
       var cell = el("div", "mat");
       var slot = slotNode(material.id, 40, true, true);
-      slot.onclick = function () {
-        openPicker({kinds: ["material"], selected: material.id,
-          onPick: function (item) { material.id = item.id; repaintList(); }});
-      };
+      // ★ 有料的格子和空的「＋」**走同一发**（用户 2026-09-20 第二轮）：
+      //   整组编辑器里「取消旧的 + 勾上新的」就是换材料，所以这儿不再单选。
+      slot.title = "编辑这条配方的材料（可一次勾多种）";
+      slot.onclick = function () { openMaterialPicker(entry, max); };
       cell.appendChild(slot);
       // ★ 名字问物品库（`itemName`，D31）—— 以前读的是物品表里自动翻的那份，
       //   在物品库里把「龙之泪」改成「龙之血」之后，这一格还写着旧名字
@@ -3541,12 +3642,25 @@ var PICKER = null;
 
 /** 打开选择器。
  *
- *  单选（配置页「添加」）：`{kinds, selected, onPick(item)}`，点一格就选中并关闭。
- *  批量（玩家仓库弹窗「添加物品」，用户 2026-09-07）：`{multi: true, owned,
- *  onPickMany(items)}` —— 格子点了打勾、再点取消，底下「确认添加」一次全给；
- *  `owned` 里的画成「已有」、点不动。
+ *  **单选**（「换掉这一格」）：`{kinds, selected, onPick(item)}`，点一格就选中并关闭。
+ *    ★ `selected` 是单选的标志 —— 它画的那个红框和多选的 ✓ 是两套「选中」，
+ *      不要在同一发里既给 `selected` 又给 `multi`（`test_web_admin` 钉着）。
+ *  **批量**（「添加」/「＋ 添加物品」）：`{multi: true, owned, ownedLabel,
+ *    onPickMany(items, ids)}` —— 格子点了打勾、再点取消，底下「确认添加」一次全给；
+ *    `owned` 里的画成灰角标、点不动。
+ *  **整组编辑**（合成配方的材料，用户 2026-09-20）：批量 + `{max, chosen}` ——
+ *    `chosen` 里的**打开就是勾上的**，取消勾选就等于把它从这一组里拿掉。
+ *
+ *  | 选项 | 干什么 |
+ *  |---|---|
+ *  | `max` | 最多能勾几件（不给 = 不限）。到顶再勾会被 `pickerToggle` 拒掉 |
+ *  | `chosen` | 预先勾上的 id 数组。给了它「清空」钮就藏起来（见 `wire`） |
+ *  | `ownedLabel` | 灰角标的字，默认「已有」。★ **最多 4 个汉字**：格子最窄 74px，
+ *    `.have` 4 字右缘到 52px、`.chk` 左缘在 54px，5 个字就压上去了 |
  */
 function openPicker(options) {
+  var preset = {};
+  (options.chosen || []).forEach(function (id) { preset[Number(id)] = true; });
   PICKER = {
     kinds: options.kinds || null,
     selected: options.selected,
@@ -3554,24 +3668,56 @@ function openPicker(options) {
     multi: !!options.multi,
     onPickMany: options.onPickMany,
     owned: options.owned || {},
-    chosen: {},
-    // ★ 筛选每次打开都从头起（搜索串空、两个下拉「全部」、分类「全部」），
+    ownedLabel: options.ownedLabel || "已有",
+    max: (typeof options.max === "number") ? options.max : null,
+    preset: !!options.chosen,
+    chosen: preset,
+    // 「到上限了」那条红字是不是我们弹的（`closePicker` 关窗时收走它）。
+    limitToast: false,
+    // ★ 筛选每次打开都从头起（搜索串空、三个下拉「全部」、分类「全部」），
     //   不跨次记忆 —— 上一次筛剩三件，这一次打开又是空网格最难查。
     q: "",
     character: "",
     listing: "",
+    source: "",
     big: -1,
     sub: null,
     tabs: pickerNeedsTabs(options.kinds)
   };
   $("pickSearch").value = "";
-  // 角色 / 上架状态两个下拉：和配置页、「修改仓库」弹窗同一份选项（D68）。
+  // 角色 / 上架状态 / 来源三个下拉：和配置页、「修改仓库」弹窗同一份选项
+  // （D68 + 用户 2026-09-20）。
   fillSelect($("pickCharacter"), "全部角色", characterOptions(), "");
   fillSelect($("pickListing"), "全部上架状态", LISTING_FILTER_OPTIONS, "");
+  fillSelect($("pickSource"), "全部物品", SOURCE_FILTER_OPTIONS, "");
   $("pickFoot").classList.toggle("hidden", !PICKER.multi);
+  // ★ 整组编辑器里「清空」的意思不是「取消我这次的勾选」，而是「把这条配方的
+  //   材料全删了」—— 而删材料在卡片上本来就有一颗看得见的「移除」。
+  //   何况清空之后确认键就灰了（服务端也不收空材料的配方），点了等于死胡同。
+  $("pickClear").classList.toggle("hidden", PICKER.preset);
   $("picker").classList.remove("hidden");
   paintPicker();
   $("pickSearch").focus();
+}
+
+/** 现在还能不能再勾一件（`max` 到顶了就不能）。★ 抽成纯函数是为了**测得到**
+ *  —— node 里那层 Proxy 空壳会把 `cell.onclick = fn` 整个吞掉，判据写在
+ *  onclick 里就一条都守不住（`test_adminpicker`）。 */
+function pickerCanChoose(itemId) {
+  if (!PICKER || !PICKER.multi) { return false; }
+  if (PICKER.owned[itemId]) { return false; }          // 已经有了，勾了没意义
+  if (PICKER.chosen[itemId]) { return true; }          // 取消勾选永远允许
+  if (PICKER.max === null) { return true; }
+  return Object.keys(PICKER.chosen).length < PICKER.max;
+}
+
+/** 翻一格的勾选状态。返回**接不接受这一下** —— 调用方按它决定是翻 class
+ *  还是弹一句「到上限了」。只改 `PICKER.chosen`，一个 DOM 都不碰。 */
+function pickerToggle(itemId) {
+  if (!pickerCanChoose(itemId)) { return false; }
+  if (PICKER.chosen[itemId]) { delete PICKER.chosen[itemId]; }
+  else { PICKER.chosen[itemId] = true; }
+  return true;
 }
 
 /** 受限的选择器（`kinds`，现在只有「只挑材料」一种）要不要画分类标签：
@@ -3587,17 +3733,40 @@ function pickerNeedsTabs(kinds) {
   return Object.keys(groups).length > 1;
 }
 
-/** 批量模式底下那条：已选几件、「确认添加」能不能点。 */
+/** 批量模式底下那条：已选几件、「确认添加」能不能点。
+ *
+ * ★ 有上限时**把名字也列出来**（最多 4 个，`.panel-foot` 会换行）：网格上只画
+ *   过了筛选的那些，搜一个字就能把已勾的材料全筛没 —— 底下光写「已选 3」而
+ *   一个 ✓ 都看不见，再勾一个还被上限拦住，人完全不知道发生了什么。
+ *   「被筛掉的不丢」是对的，但得让它说得出话来。
+ * ★ `count > max` 也要灰：手改出来的 5 材料配方，第 5 种在卡片上根本看不见
+ *   （`materialSlots` 固定只画 `max` 格），进了这个弹窗才现形，别让它存回去。
+ */
 function paintPickFoot() {
   if (!PICKER || !PICKER.multi) { return; }
-  var count = Object.keys(PICKER.chosen).length;
-  $("pickChosen").textContent = "已选 " + count + " 件";
-  $("pickConfirm").disabled = !count;
+  var ids = Object.keys(PICKER.chosen);
+  var count = ids.length;
+  var text = "已选 " + count + " 件";
+  if (PICKER.max !== null) {
+    text = "已选 " + count + " / 上限 " + PICKER.max + " 件";
+    if (count) {
+      text += "：" + ids.map(function (id) { return itemName(id); }).join("、");
+    }
+  }
+  $("pickChosen").textContent = text;
+  $("pickConfirm").disabled = !count
+    || (PICKER.max !== null && count > PICKER.max);
 }
 
 function closePicker() {
+  // 「到上限了」那句是红条（`ok=false` 不自动消失，见 `toast`）—— 关了窗还挂在
+  // 角上的话，人会以为刚才那一发确认失败了。
+  // ★ 只在**确实是我们弹的**那一条时清：无脑 `toast("")` 会把开窗之前就挂着的
+  //   别人的错误信息（比如「保存失败」）一起抹掉。
+  var mine = !!(PICKER && PICKER.limitToast);
   PICKER = null;
   $("picker").classList.add("hidden");
+  if (mine) { toast(""); }
 }
 
 /** 弹窗那两行分类标签（D68）。受限的选择器不画（见 `pickerNeedsTabs`）。 */
@@ -3627,7 +3796,7 @@ function paintPicker() {
   // 再按当前分类标签收一遍才是画出来的那批（和配置页 `repaintList` 一个套路）。
   var candidates = CAT.items.filter(function (item) {
     if (PICKER.kinds && PICKER.kinds.indexOf(item.kind) < 0) { return false; }
-    // 角色 / 上架状态和配置页、「修改仓库」弹窗同一条判据（`dropdownsMatch`）。
+    // 角色 / 上架状态 / 来源和配置页、「修改仓库」弹窗同一条判据（`dropdownsMatch`）。
     if (!dropdownsMatch(item.id, PICKER)) { return false; }
     if (!query) { return true; }
     // 中文名按**物品库**里那一份搜（D31）—— 在物品库里改过名字之后，
@@ -3652,7 +3821,7 @@ function paintPicker() {
     if (iconStyle(ic, item.cell, 44)) { cell.appendChild(ic); }
     else { cell.appendChild(el("div", "noicon", "?")); }
     cell.appendChild(el("div", "nmz", itemName(item.id)));
-    if (owned) { cell.appendChild(el("span", "have", "已有")); }
+    if (owned) { cell.appendChild(el("span", "have", PICKER.ownedLabel)); }
     if (chosen) { cell.appendChild(el("span", "chk", "✓")); }
     // ★ 详情**只走浮窗**（`tipFor`，用户 2026-09-06）：弹窗底下原来还有一条
     //   侧栏，写的是同一批东西，而且「在不在卖」是现问服务端的 —— 管理员
@@ -3660,15 +3829,20 @@ function paintPicker() {
     tipFor(cell, item.id);
     cell.onclick = function () {
       if (PICKER.multi) {
-        if (owned) { return; }             // 已经在仓库里，勾了也没意义
-        // 只翻这一格，不重画整张网格 —— 滚动位置和浮窗都别动（D37b）。
-        if (PICKER.chosen[item.id]) {
-          delete PICKER.chosen[item.id];
+        if (owned) { return; }             // 已经有了，勾了也没意义
+        var was = !!PICKER.chosen[item.id];
+        if (!pickerToggle(item.id)) {
+          // 到上限了。★ **不重画整张网格** —— 滚动位置和浮窗都别动（D37b）。
+          PICKER.limitToast = true;        // 关窗时把这条红字收走
+          toast("最多选 " + PICKER.max + " 件，先取消一个再选", false);
+          return;
+        }
+        // 只翻这一格，同上。
+        if (was) {
           cell.classList.remove("chosen");
           var mark = cell.querySelector(".chk");
           if (mark) { mark.remove(); }
         } else {
-          PICKER.chosen[item.id] = true;
           cell.classList.add("chosen");
           cell.appendChild(el("span", "chk", "✓"));
         }
@@ -4735,7 +4909,7 @@ function adoptPlayer(view) {
   var same = !!(PLAYER && PLAYER.view.username === view.username);
   PLAYER = {view: view, edit: edit,
             tab: same ? PLAYER.tab : anyTab(),
-            filter: same ? PLAYER.filter : {character: "", listing: ""}};
+            filter: same ? PLAYER.filter : emptyDropdownFilter()};
   renderPlayer();
   renderPlayerRows();
 }
@@ -4830,14 +5004,16 @@ function renderPlayer() {
   repaintOwned();
 }
 
-/** 弹窗里角色 / 上架状态两个下拉（用户 2026-09-09，D68）：选项和配置页、
- *  「选择物品」弹窗同一份，值照 `PLAYER.filter`。选项每次重填 —— 弹窗里的
- *  「↻ 刷新」会重读物品表，角色表跟着它走。 */
+/** 弹窗里角色 / 上架状态 / 来源三个下拉（用户 2026-09-09 D68 + 2026-09-20）：
+ *  选项和配置页、「选择物品」弹窗同一份，值照 `PLAYER.filter`。选项每次重填
+ *  —— 弹窗里的「↻ 刷新」会重读物品表，角色表跟着它走。 */
 function renderPlayerFilters() {
   fillSelect($("playerCharacter"), "全部角色", characterOptions(),
              PLAYER.filter.character);
   fillSelect($("playerListing"), "全部上架状态", LISTING_FILTER_OPTIONS,
              PLAYER.filter.listing);
+  fillSelect($("playerSource"), "全部物品", SOURCE_FILTER_OPTIONS,
+             PLAYER.filter.source);
 }
 
 /* ---------------------------------------------------------- 仓库分类
@@ -5024,7 +5200,7 @@ function addOwnedMany() {
       });
       if (hidden) {
         PLAYER.tab = anyTab();
-        PLAYER.filter = {character: "", listing: ""};
+        PLAYER.filter = emptyDropdownFilter();
         renderPlayerFilters();
       }
       repaintOwned();
@@ -5090,7 +5266,7 @@ async function openRewardModal() {
   // ★ 每次打开都从头起（名单空、物品空、筛选「全部」、留言回默认值）——
   //   上一次发过的人和东西留在这儿最容易「再发一遍」。
   REWARD = {chosen: {}, list: [], items: {}, tab: anyTab(),
-            filter: {character: "", listing: ""}, q: "", online: "all",
+            filter: emptyDropdownFilter(), q: "", online: "all",
             truncated: false};
   $("rewardSearch").value = "";
   $("rewardOnline").value = "all";
@@ -5098,13 +5274,25 @@ async function openRewardModal() {
   $("rewardMoney").value = 0;
   $("rewardMessage").value = $("rewardMessage").defaultValue;
   $("rewardCount").textContent = "";
-  fillSelect($("rewardCharacter"), "全部角色", characterOptions(), "");
-  fillSelect($("rewardListing"), "全部上架状态", LISTING_FILTER_OPTIONS, "");
+  renderRewardFilters();
   $("rewardModal").classList.remove("hidden");
   renderRewardChosen();
   repaintRewardItems();
   await loadRewardPlayers();
   $("rewardSearch").focus();
+}
+
+/** 发奖弹窗里角色 / 上架状态 / 来源三个下拉（D68 + 用户 2026-09-20）。
+ *  ★ 抽出来是因为它**有两个调用点**：开窗时一次，`rewardAddMany` 发现
+ *  「加进来的东西被筛掉了」而清筛选时又一次。以前那两处各抄了一份 fillSelect，
+ *  加第三个下拉时正好会漏掉一处（照 `renderPlayerFilters` 的样子办）。 */
+function renderRewardFilters() {
+  fillSelect($("rewardCharacter"), "全部角色", characterOptions(),
+             REWARD.filter.character);
+  fillSelect($("rewardListing"), "全部上架状态", LISTING_FILTER_OPTIONS,
+             REWARD.filter.listing);
+  fillSelect($("rewardSource"), "全部物品", SOURCE_FILTER_OPTIONS,
+             REWARD.filter.source);
 }
 
 function closeRewardModal() {
@@ -5332,9 +5520,8 @@ function rewardAddMany() {
       });
       if (hidden) {
         REWARD.tab = anyTab();
-        REWARD.filter = {character: "", listing: ""};
-        fillSelect($("rewardCharacter"), "全部角色", characterOptions(), "");
-        fillSelect($("rewardListing"), "全部上架状态", LISTING_FILTER_OPTIONS, "");
+        REWARD.filter = emptyDropdownFilter();
+        renderRewardFilters();
       }
       repaintRewardItems();
       toast("已加入 " + added + " 件奖励物品，按「确认发送奖励」才真的发"
@@ -5930,6 +6117,8 @@ function renderSell() {
              SELL.filter.character);
   fillSelect($("sellListing"), "全部上架状态", LISTING_FILTER_OPTIONS,
              SELL.filter.listing);
+  fillSelect($("sellSource"), "全部物品", SOURCE_FILTER_OPTIONS,
+             SELL.filter.source);
   repaintSell();
 }
 
@@ -5960,7 +6149,7 @@ function adoptSellState(result, keepCart) {
     cart: cart,
     // 同一个人重读时停在原来的分类和下拉上（照 `adoptPlayer` 的做法）。
     tab: same ? SELL.tab : anyTab(),
-    filter: same ? SELL.filter : {character: "", listing: ""}
+    filter: same ? SELL.filter : emptyDropdownFilter()
   };
   if (SELL.view) {
     // ★ 两桶合成一张表，**同一个 id 只留一行**：正常存档里一件东西只会在
@@ -7036,6 +7225,11 @@ function wire() {
     PLAYER.filter.listing = $("playerListing").value;
     repaintOwned();
   };
+  $("playerSource").onchange = function () {
+    if (!PLAYER) { return; }
+    PLAYER.filter.source = $("playerSource").value;
+    repaintOwned();
+  };
   $("playerPopupRefresh").onclick = function () { refreshPlayerPopup(); };
   $("playerClose").onclick = function () { closePlayerModal(); };
   $("playerSave").onclick = savePlayer;
@@ -7077,6 +7271,11 @@ function wire() {
     REWARD.filter.listing = $("rewardListing").value;
     repaintRewardItems();
   };
+  $("rewardSource").onchange = function () {
+    if (!REWARD) { return; }
+    REWARD.filter.source = $("rewardSource").value;
+    repaintRewardItems();
+  };
   ["rewardExp", "rewardMoney", "rewardMessage"].forEach(function (id) {
     $(id).oninput = paintRewardFoot;
   });
@@ -7103,6 +7302,11 @@ function wire() {
   $("sellListing").onchange = function () {
     if (!SELL) { return; }
     SELL.filter.listing = $("sellListing").value;
+    repaintSell();
+  };
+  $("sellSource").onchange = function () {
+    if (!SELL) { return; }
+    SELL.filter.source = $("sellSource").value;
     repaintSell();
   };
 
@@ -7148,6 +7352,10 @@ function wire() {
     PICKER.listing = $("pickListing").value;
     paintPicker();
   };
+  $("pickSource").onchange = function () {
+    PICKER.source = $("pickSource").value;
+    paintPicker();
+  };
   $("pickClose").onclick = closePicker;
   $("picker").onclick = function (event) {
     // 批量模式点遮罩不关：勾了二十件被一次误点全丢掉太亏；单选照旧。
@@ -7160,12 +7368,15 @@ function wire() {
   };
   $("pickConfirm").onclick = function () {
     if (!PICKER || !PICKER.multi) { return; }
-    var items = Object.keys(PICKER.chosen)
-      .map(function (id) { return BYID[id]; })
-      .filter(Boolean);
+    // ★ 两样都给：`items` 是物品对象（加条目要用 `kind` 之类），`ids` 是**原始
+    //   id 列表**。`BYID` 查不到的 id 在 `items` 里被静默丢掉 —— 对「添加」无所谓
+    //   （加不出来就是没加），但整组编辑器的语义是「没勾 = 删」，丢一个就等于
+    //   「打开看一眼、按确认、材料没了」。⇒ 整组编辑器一律用 `ids`。
+    var ids = Object.keys(PICKER.chosen).map(Number);
+    var items = ids.map(function (id) { return BYID[id]; }).filter(Boolean);
     var done = PICKER.onPickMany;
     closePicker();
-    if (items.length && done) { done(items); }
+    if (ids.length && done) { done(items, ids); }
   };
   // 点遮罩 = 取消（和选择器一个手感）。
   $("dialog").onclick = function (event) {
@@ -7286,33 +7497,83 @@ function wire() {
   });
 }
 
-/** 「+ 添加」。新条目按字段表铺一份默认值，物品让用户当场选。 */
+/** 一条新记录：按字段表铺一份默认值，物品填 `item`。
+ *
+ * ★★ **每叫一次都 new 一个对象** —— 批量添加时循环外建一条 push N 次的话，
+ *   N 行是同一个对象：脏标记那张 WeakMap 只有一个键、`data-index` 全指向同一条、
+ *   改一格改一片、`killButton` 的 splice 也会删错。**一句报错都不会有。**
+ */
+function makeEntry(which, item) {
+  var entry = {};
+  (CAT.schema[which].fields || []).forEach(function (spec) {
+    if (spec.optional) { return; }          // 可选的一律先不写
+    if (spec.type === "item") { entry[spec.key] = item.id; }
+    else if (spec.type === "bool") { entry[spec.key] = true; }
+    else if (spec.type === "materials") { entry[spec.key] = []; }
+    else if (spec.type === "int") { entry[spec.key] = spec.min || 0; }
+    else if (spec.type === "choice") {
+      entry[spec.key] = (spec.options && spec.options[0])
+        ? spec.options[0].value : null;
+    } else { entry[spec.key] = ""; }
+  });
+  if ("kind" in entry) { entry.kind = item.kind; }
+  return entry;
+}
+
+/** 配置页已经收了这件物品没有 —— 传给选择器当 `owned`（画成灰角标、点不动）。
+ *
+ * ★ 判据照抄**服务端校验器**：`shop.json` 同一个物品 id 不许出现两次
+ *   （`validate_shop`）、`recipe.json` **一个产物只能有一条配方**
+ *   （`validate_recipes`，合成请求只带产物 id，两条同产物服务端分不清）。
+ *   放进去也是保存时被整份拒收，不如在弹窗里就点不动。
+ * ★ **掉落页返回空** —— 掉落规则**可以重复**（同一种材料好几条不同关卡 / 难度的
+ *   规则，各掷各的），在那儿灰掉才是错的。
+ */
+function listedAlready(which) {
+  var seen = {};
+  if (which !== "shop" && which !== "recipe") { return seen; }
+  (CFG[which].entries || []).forEach(function (entry) {
+    if (!entry) { return; }
+    seen[Number(which === "shop" ? entry.id : entry.result)] = true;
+  });
+  return seen;
+}
+
+//: 「添加」弹窗里那个灰角标写什么（★ 最多 4 个汉字，见 `openPicker`）。
+var ADD_OWNED_LABEL = {shop: "已上架", recipe: "有配方"};
+
+/** 「+ 添加」。**可以一次勾多件**（用户 2026-09-20）：新条目按字段表各铺一份
+ *  默认值，物品让用户当场勾。★ 落盘还是老样子 —— 这儿只往内存数组里 push，
+ *  按「保存」才一次发整份 JSON。 */
 function addEntry(which) {
   openPicker({
     kinds: (which === "drops") ? ["material"] : null,
-    onPick: function (item) {
-      var entry = {};
-      (CAT.schema[which].fields || []).forEach(function (spec) {
-        if (spec.optional) { return; }          // 可选的一律先不写
-        if (spec.type === "item") { entry[spec.key] = item.id; }
-        else if (spec.type === "bool") { entry[spec.key] = true; }
-        else if (spec.type === "materials") { entry[spec.key] = []; }
-        else if (spec.type === "int") { entry[spec.key] = spec.min || 0; }
-        else if (spec.type === "choice") {
-          entry[spec.key] = (spec.options && spec.options[0])
-            ? spec.options[0].value : null;
-        } else { entry[spec.key] = ""; }
+    multi: true,
+    owned: listedAlready(which),
+    ownedLabel: ADD_OWNED_LABEL[which],
+    onPickMany: function (items) {
+      items.forEach(function (item) {
+        var entry = makeEntry(which, item);
+        // ★ 配方号**一条算一次**：先把 N 条都造出来再统一 push 的话，
+        //   `nextRecipeId` 每次扫到的还是同一个最大值，N 条拿到同一个号 ⇒
+        //   保存时「配方号 N 出现了两次」，整份文件都进不去。
+        if ("id" in entry && which === "recipe") { entry.id = nextRecipeId(); }
+        CFG[which].entries.push(entry);
       });
-      if ("kind" in entry) { entry.kind = item.kind; }
-      if ("id" in entry && which === "recipe") { entry.id = nextRecipeId(); }
-      CFG[which].entries.push(entry);
-      // 新加的那条一定要看得见 —— 否则筛选开着的时候「加了没反应」。
-      // ★ 它追加在末尾 ⇒ 清掉筛选（连分类标签一起）再滚过去。
+      // 新加的那些一定要看得见 —— 否则筛选开着的时候「加了没反应」。
+      // ★ 它们追加在末尾 ⇒ 清掉筛选（连分类标签一起）再滚过去。
+      //   滚到**第一条**新加的：批量时看开头比看结尾有用。
       FILTER[which] = emptyFilter();
       renderCurrent();
-      var card = $("cfgList").querySelector(
-        '[data-index="' + (CFG[which].entries.length - 1) + '"]');
+      var first = CFG[which].entries.length - items.length;
+      var card = $("cfgList").querySelector('[data-index="' + first + '"]');
       if (card) { revealIfHidden(card); }
+      toast("已加入 " + items.length + " 条，按「保存」才落盘"
+            // 服务端不收没有材料的配方（`validate_recipes`），而且一次只报一条
+            // —— 一口气加十条又直接保存的话，得来回十趟才知道还差谁。
+            + (which === "recipe" ? "；空材料的配方存不进去，记得给每条加材料"
+                                  : ""),
+            true);
     }
   });
 }
