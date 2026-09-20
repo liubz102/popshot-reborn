@@ -3394,7 +3394,8 @@ class AdminRewardTests(_AdminCase):
         self.assertEqual(result["message"], row["summary"])
         # 时间：epoch 给排序、`time_text` 给页面直接画（服务端时区）。
         self.assertLessEqual(abs(time.time() - row["time"]), 60)
-        self.assertRegex(row["time_text"], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+        self.assertRegex(row["time_text"],
+                         r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC[+-]\d+(:\d\d)?$")
         # 奖励物品：物品名在**发送那一刻**查好存下来，经验 / 金币各自一行。
         self.assertEqual(
             [("item", self._MATERIAL, 5), ("item", self._ARMOR, 1),

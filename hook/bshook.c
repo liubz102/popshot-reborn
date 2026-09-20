@@ -247,17 +247,55 @@ static void bslog_shutdown(void)
     if (g_log != INVALID_HANDLE_VALUE) FlushFileBuffers(g_log);
 }
 
+/* 本机**此刻**的 UTC 偏移，写成 "UTC+8" / "UTC-3" / "UTC+5:30"（§59 / D52）。
+ *
+ *   为什么每行都算、不缓存：这份日志是**玩家机器**上的，而崩溃包的打包戳来自
+ *   开发机（UTC+9）、服务端日志来自云主机（UTC+8）—— 三台机器三个时区，
+ *   2026-09-20 就因为没写时区把因果比反过（bug调查/25）。缓存就得自己处理
+ *   夏令时切换（客户端一开十几个小时是常事，那台就跑了 17.7 小时），
+ *   而 GetSystemTime 读的是共享页，比后面那句 _vsnprintf 便宜得多。
+ *
+ *   拿本地时刻减 UTC 时刻，不读注册表 —— 夏令时自动就对了。
+ */
+static void bslog_zone(const SYSTEMTIME *lt, char *out, size_t cap)
+{
+    SYSTEMTIME ut;
+    FILETIME lf, uf;
+    LONGLONG diff, half;
+    long mins, hh, mm;
+    char sign;
+
+    if (cap) out[0] = 0;
+    GetSystemTime(&ut);
+    if (!SystemTimeToFileTime(lt, &lf) || !SystemTimeToFileTime(&ut, &uf))
+        return;
+    diff = (((LONGLONG)lf.dwHighDateTime << 32) | lf.dwLowDateTime)
+         - (((LONGLONG)uf.dwHighDateTime << 32) | uf.dwLowDateTime);
+    /* 100ns -> 分钟。两次取时刻之间差几毫秒，所以就近取整。 */
+    half = diff >= 0 ? 300000000LL : -300000000LL;
+    mins = (long)((diff + half) / 600000000LL);
+    sign = mins < 0 ? '-' : '+';
+    if (mins < 0) mins = -mins;
+    hh = mins / 60;
+    mm = mins % 60;
+    if (mm) _snprintf(out, cap, "UTC%c%ld:%02ld", sign, hh, mm);
+    else    _snprintf(out, cap, "UTC%c%ld", sign, hh);
+    out[cap - 1] = 0;
+}
+
 static void bslog_emit(int detail, const char *fmt, va_list ap)
 {
     char line[8192];
+    char zone[16];
     unsigned char hdr[BSLOG_HDR];
     SYSTEMTIME st;
     int n;
     int wake = 0;
 
     GetLocalTime(&st);
-    n = _snprintf(line, sizeof(line) - 4, "[%02u:%02u:%02u.%03u] ",
-                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    bslog_zone(&st, zone, sizeof(zone));
+    n = _snprintf(line, sizeof(line) - 4, "[%02u:%02u:%02u.%03u %s] ",
+                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, zone);
     if (n < 0) n = 0;
 
     {
@@ -2856,6 +2894,9 @@ static int try_patch_reflect_visual(void)
 /*                                                                            */
 /*   指针为 NULL 时跳到 0x5bf73f（Unlock **之后**）：压根没锁上，就不该解锁。  */
 /*   代价是这一次索引缓冲没填好 —— 但原版在这条路上是直接崩，没得比。         */
+/*                                                                            */
+/*   ★ **同一个病在镜像里有第二处站点**：静态 D3DX9 的 `ID3DXSprite::Begin`   */
+/*     `0x61186a`（bug调查/25 崩过一份）。补在 `try_patch_crash25_guards()`。 */
 /* -------------------------------------------------------------------------- */
 #define D3D_IB_SIG_VA      0x005BF6C7u
 #define D3D_IB_PATCH_OFF   9                  /* 站点 = 0x005BF6D0 */
@@ -5217,6 +5258,448 @@ static int try_patch_crash18_guards(void)
           " / UI 向量 _First 判空 @ %08X",
           (unsigned)VCDTOR_VA, (unsigned)(UTF16BUF_A_VA + 2),
           (unsigned)(UTF16BUF_B_VA + 2), (unsigned)UIVEC_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* bug调查/25 的两处线上闪退 —— 两条都是**已修过的病的第二处站点**            */
+/*                                                                            */
+/* --- A. 精灵批的索引缓冲：`Lock()` 又一处不查返回值（§57 / D49）----------- */
+/*                                                                            */
+/*   §35 / D25 补的是渲染器自己那套四边形批（`0x5bf6cd`）。V0.4.1 线上又崩了  */
+/*   一份，崩点 `0x611875`，在**静态链进来的 D3DX9** 的 `ID3DXSprite::Begin`  */
+/*   里（函数头 `0x6117f5`，`mov edi,edi` 热补丁头 + 失败返回                 */
+/*   `D3DERR_INVALIDCALL` 0x8876086c 两个特征一起认出来的）：                 */
+/*                                                                            */
+/*     00611839  jne 0x6118c4        索引缓冲已经有了就整段跳过（懒创建）     */
+/*     0061184b  call [ecx+0x6c]     CreateIndexBuffer(0xc000, WRITEONLY,     */
+/*                                   INDEX16, [esi+0x44])  ← HRESULT 查了     */
+/*     0061186a  call [ecx+0x2c]     IDirect3DIndexBuffer9::Lock  ← **没查**  */
+/*     00611872  mov edx,[ebp+8]     取 Lock 填的指针（填充循环的头）         */
+/*     00611875  mov [eax+edx-6],cx  ★ 指针是 NULL 就崩在这                  */
+/*                                                                            */
+/*   线上那份（concon 2026-09-20 19:29:37）：minidump 的异常参数是 `(1, 0)`   */
+/*   = **往地址 0 写**，EAX=6 / EDX=0 / ECX=0 = 循环第一圈，逐字对得上。      */
+/*   崩前 4 秒进程里被塞进一堆 shell / GDI+ / WPS 外壳 DLL，崩后 QQ 拼音自己  */
+/*   的 `QQPYBugReport.exe` 被拉起来 —— 和 §35 那份是同一台机器、同一种       */
+/*   外部干扰。                                                               */
+/*                                                                            */
+/*   ★ 收尾和 §35 **不一样**：这里不能只是「不填就走」。索引缓冲是懒创建的，  */
+/*   一旦 `[esi+0x14]` 非空，以后每次 `Begin` 都整段跳过 ⇒ 没填好就是一整局   */
+/*   拿**没初始化的索引**画三角形。所以判到指针为空就                         */
+/*   **Release 掉刚建的缓冲、把槽清零、走 Begin 自己的失败出口 0x611f3b**，   */
+/*   下一帧从头重来。这个收尾状态和「CreateIndexBuffer 失败」那条路           */
+/*   （`0x611858 jl 0x611f3b`，`[esi+0x14]` 同样是 0、`begun` 标志同样没置）  */
+/*   逐字节相同 —— 是 D3DX 自己就会产生、调用方（`0x5bdff8 test eax,eax /    */
+/*   jge`）本来就在处理的状态，不是我们新造的。                               */
+/*                                                                            */
+/*   站点只有 **5 个字节**可用：`0x611872` 是循环的回跳目标，多啃一个字节回跳 */
+/*   就落进指令中间。`push 6 / xor ecx,ecx / pop eax` 正好 5 字节 = E9 rel32，*/
+/*   连代码洞都不用开。                                                       */
+/*                                                                            */
+/* --- B. LoadingStage 析构时 LobbyStage 已经没了（§58 / D50）--------------- */
+/*                                                                            */
+/*   和 bug调查/18 §81-A **同一个病**：拆除顺序 —— `LobbyStage::~LobbyStage`  */
+/*   （`0x40545B`）先把全局 `[0x72e29c]` 清 0，别人还握着它往下用。§81-A 补的 */
+/*   是胜负条件的析构，这一份补的是 `LoadingStage::~LoadingStage`             */
+/*   （`0x46fd1c`，vftable `0x66b2b4`）：                                      */
+/*                                                                            */
+/*     0046fd7a  call 0x46fdf3                 「在六个座位里找第一个非空的」 */
+/*     0046fdf4  call 0x409f39                 先试另一条路，非空就直接返回   */
+/*     0046fe01  mov edi,[0x72e29c]            ★ 取 LobbyStage —— **不判空** */
+/*     0046fe0d  call 0x4045f9(this=edi, 0..5) 座位取值器                     */
+/*     004045f9  test eax,eax / cmp eax,6      只查了**下标**，没查 this      */
+/*     00404605  movzx eax,[eax+ecx+0x40]      ★ this==0 → 读 0x40 → 崩     */
+/*                                                                            */
+/*   线上那份（328800963 2026-09-20 14:31:15）：EAX=0（座位 0）、ECX=0        */
+/*   （this）、EBP=0019FD50 正是 `LoadingStage::~LoadingStage` 的帧，          */
+/*   一个寄存器都不用猜。客户端日志里同一秒还有一行                           */
+/*   「★WS2 connect -> 27799」—— **掉线重连把大厅拆了、加载画面还在析构**     */
+/*   就是那个时序。                                                           */
+/*                                                                            */
+/*   补法：偷 `0x46fe01` 那 8 个字节（`mov edi,[全局]` + `xor esi,esi`），    */
+/*   LobbyStage 已经没了就整段跳到 `0x46fe27` 的收尾。走到这里 ebx 必然是 0   */
+/*   （`0x46fdfd` 的 `jne` 没跳成才轮得到），所以函数返回 0 =「没找到」——      */
+/*   调用方 `0x46fd7f test eax,eax / je` 本来就有这条分支。                   */
+/*   **没有大厅就没有座位，找不到才是对的**，这不是兜底。                     */
+/* -------------------------------------------------------------------------- */
+
+/* --- A --- */
+#define SPRITE_IB_VA         0x0061186Du   /* 站点 = Lock 之后被偷走的那三条 */
+#define SPRITE_IB_SIG_LEN    24
+#define SPRITE_IB_STOLEN     5
+#define SPRITE_IB_RESUME_TO  0x00611872    /* 指针有效 → 填充循环的头        */
+#define SPRITE_IB_BAIL_TO    0x00611F3B    /* 指针为空 → Begin 的失败出口    */
+#define SPRITE_IB_SLOT       0x14          /* ID3DXSprite 的索引缓冲槽       */
+#define SPRITE_IB_HRESULT    0x8876086C    /* D3DERR_INVALIDCALL             */
+
+static const unsigned char SPRITE_IB_SIG[SPRITE_IB_SIG_LEN] = {
+    0x6A, 0x06,                     /* push 6              ┐                 */
+    0x33, 0xC9,                     /* xor  ecx,ecx        ├ 偷走这 5 字节   */
+    0x58,                           /* pop  eax            ┘                 */
+    0x8B, 0x55, 0x08,               /* mov  edx,[ebp+8]      填充循环的头     */
+    0x66, 0x89, 0x4C, 0x10, 0xFA,   /* mov  [eax+edx-6],cx ★ 线上崩的就是这  */
+    0x8B, 0x7D, 0x08,               /* mov  edi,[ebp+8]                      */
+    0x8D, 0x51, 0x01,               /* lea  edx,[ecx+1]                      */
+    0x66, 0x89, 0x54, 0x38, 0xFC    /* mov  [eax+edi-4],dx                   */
+};
+
+static volatile LONG g_sprite_ib_failing = 0;   /* 状态：上一次建缓冲没锁上  */
+static volatile LONG g_sprite_ib_hits    = 0;
+
+/* 锁不上会**每次重建都再来一遍**，所以按状态翻转去重（说过了就闭嘴，
+   直到真的锁上过一次）—— 不按次数、不按时间窗（铁律 10）。 */
+static void __stdcall sprite_ib_note(void)
+{
+    LONG n = InterlockedIncrement(&g_sprite_ib_hits);
+    if (InterlockedExchange(&g_sprite_ib_failing, 1)) return;
+    bslog("★精灵批 索引缓冲 Lock() 没给出指针（累计第 %ld 次）—— 把刚建的缓冲"
+          "丢掉、让 Begin 走失败出口，下一帧重建重填（不跳就是 bug调查/25 那个"
+          "0x611875 闪退）；锁上之前不再重复报", (long)n);
+}
+
+static void __stdcall sprite_ib_ok(void)
+{
+    if (!InterlockedExchange(&g_sprite_ib_failing, 0)) return;   /* 本来就好着 */
+    bslog("★精灵批 索引缓冲这次锁上了，恢复正常（之前累计失败 %ld 次）",
+          (long)g_sprite_ib_hits);
+}
+
+static __declspec(naked) void sprite_ib_guard_detour(void)
+{
+    __asm {
+        cmp  dword ptr [ebp + 8], 0         /* Lock 填进来的指针 */
+        jz   spr_bail
+        pushad
+        call sprite_ib_ok
+        popad
+        push 6                              /* 被偷走的三条，原样先跑 */
+        xor  ecx, ecx
+        pop  eax
+        push SPRITE_IB_RESUME_TO
+        ret
+    spr_bail:
+        pushad
+        call sprite_ib_note
+        popad
+        mov  eax, dword ptr [esi + SPRITE_IB_SLOT]   /* 刚建好的索引缓冲 */
+        test eax, eax
+        jz   spr_zero
+        mov  ecx, dword ptr [eax]
+        push eax
+        call dword ptr [ecx + 8]            /* IUnknown::Release */
+    spr_zero:
+        mov  dword ptr [esi + SPRITE_IB_SLOT], 0     /* 下一帧重建重填 */
+        mov  eax, SPRITE_IB_HRESULT
+        push SPRITE_IB_BAIL_TO
+        ret
+    }
+}
+
+/* --- B --- */
+#define LDSTAGE_VA          0x0046FE01u
+#define LDSTAGE_SIG_LEN     26
+#define LDSTAGE_STOLEN      8
+#define LDSTAGE_RESUME_TO   0x0046FE09    /* 六座位循环的头                  */
+#define LDSTAGE_SKIP_TO     0x0046FE27    /* pop edi/esi ; mov eax,ebx ; …   */
+
+static const unsigned char LDSTAGE_SIG[LDSTAGE_SIG_LEN] = {
+    0x8B, 0x3D, 0x9C, 0xE2, 0x72, 0x00,   /* mov  edi,[0x72e29c]  ┐ 偷 8 字节 */
+    0x33, 0xF6,                           /* xor  esi,esi         ┘           */
+    0x8B, 0xC6,                           /* mov  eax,esi           座位下标  */
+    0x8B, 0xCF,                           /* mov  ecx,edi           this      */
+    0xE8, 0xE7, 0x47, 0xF9, 0xFF,         /* call 0x4045f9          座位取值器*/
+    0x84, 0xC0,                           /* test al,al                       */
+    0x74, 0x0B,                           /* je   0x46fe21                    */
+    0xE8, 0xDB, 0x51, 0xF9, 0xFF          /* call 0x404ff6                    */
+};
+
+static volatile LONG g_ldstage_hits = 0;
+
+static void __stdcall ldstage_note(void)
+{
+    LONG n = InterlockedIncrement(&g_ldstage_hits);
+    bslog("★拆除   加载画面析构时 LobbyStage 已经没了 —— 六个座位整段跳过，"
+          "按「没找到」返回（第 %ld 次；不跳就是 bug调查/25 那个 0x404605 闪退，"
+          "和 §81-A 同一个拆除顺序病）", (long)n);
+}
+
+static __declspec(naked) void ldstage_guard_detour(void)
+{
+    __asm {
+        mov  edi, LOBBY_STAGE_GLOBAL        /* 被偷走的两条，原样先跑 */
+        mov  edi, dword ptr [edi]
+        xor  esi, esi
+        test edi, edi
+        jz   lds_skip
+        push LDSTAGE_RESUME_TO
+        ret
+    lds_skip:
+        pushad
+        call ldstage_note
+        popad
+        push LDSTAGE_SKIP_TO                /* ebx 到这里必然是 0 = 返回「没找到」*/
+        ret
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* C / D / E —— 用户 2026-09-20 要求「整体查一遍还有没有改漏的」，扫出来的     */
+/*              同族站点（§60 / D51）。前两条是 A / B 的**通用化**。          */
+/*                                                                            */
+/* --- C. 两个座位取值器：把「只查下标」改成「先查 this，再无符号查下标」---- */
+/*                                                                            */
+/*   `0x4045f9(this=ecx, idx=eax)` 有 **97 个调用点**，只有 3 处先判空 ——      */
+/*   B 那样一个个补调用方是打地鼠。原以为取值器里塞不下判据（D50），          */
+/*   **那个前提是错的**：`jl`(负数) + `jge`(≥6) 两条检查，用**无符号 `jae`**  */
+/*   一条就够（负数当无符号看必然 ≥ 6）⇒ 省出来的两个字节正好够 `test ecx,ecx`*/
+/*   ⇒ **原地改 3 个字节，长度一字不差，一次盖住 97 个调用点**：              */
+/*                                                                            */
+/*     004045f9  85 C0 -> 85 C9   test eax,eax  ->  test ecx,ecx   （查 this） */
+/*     004045fb  7C 0E -> 74 0E   jl  0x40460b  ->  jz  0x40460b               */
+/*     00404600  7D 09 -> 73 09   jge 0x40460b  ->  jae 0x40460b （无符号）    */
+/*                                                                            */
+/*   对**所有合法输入逐位等价**：idx∈[0,5] 照旧取值；idx≥6 或负数照旧返回 0； */
+/*   多出来的只有「this 为空也返回 0」。而三个二级取值器                      */
+/*   （`0x40460e` 名字 / `0x40462c` 状态 / `0x404d9e` 指针）都是**先调它、     */
+/*   `test al,al` 为假就走空分支** ⇒ **它们自动一起被保护了**。               */
+/*                                                                            */
+/*   `0x404d42(idx=ecx, base=edx)` 是同一张表的另一个取值器（§81-A 里胜负条件 */
+/*   析构走的就是它），同样的 3 字节改法，`test edx,edx` 查 base。它本来就是  */
+/*   「座位无效就返回 0」的契约，补完只是让 base 为空时也遵守这个契约。       */
+/*                                                                            */
+/*   ★ 三个字节**分三次写**，顺序挑过：先 `test`、再 `jae`、最后 `jz`。       */
+/*     每一个中间态都不比原版弱（用户态指针恒 < 0x80000000 ⇒ 改成 `test ecx`  */
+/*     之后那条 `jl` 只是永不成立，下标上界仍由 `jge` 守着）。                */
+/*                                                                            */
+/* --- D. `0x5c5dd8`：LockRect 之后无条件往 pBits 写一个 dword --------------- */
+/*                                                                            */
+/*     005c5dd5  call [ecx+0x4c]   Texture::LockRect(0, &[ebp-0x20], 0, 0)     */
+/*     005c5dd8  mov eax,[ebp-0x1c]   pBits                ★ HRESULT 一眼没看 */
+/*     005c5ddb  mov ecx,[ebp+8]                                              */
+/*     005c5dde  mov [eax],ecx        ★ 写进去                               */
+/*     005c5de6  call [eax+0x50]      UnlockRect                              */
+/*                                                                            */
+/*   ⚠ 比崩还糟：`D3DLOCKED_RECT` 是**没初始化的栈变量**，LockRect 失败时      */
+/*   `pBits` 是栈垃圾 ⇒ 往一个随机地址写 4 字节，**静默破坏内存**。           */
+/*   补法：查 HRESULT，顺带查 pBits 非空，任一不过就不写（Unlock 照旧调，     */
+/*   对没锁上的纹理调 Unlock 只是返回个错误码，无害）。                       */
+/*                                                                            */
+/* --- E. `0x61270a`：`ID3DXSprite::Flush` 的 Lock —— 和 §35 同形 ----------- */
+/*                                                                            */
+/*     00612707  call [ecx+0x2c]   Lock(&[ebp-0x14], DISCARD)  ★ HRESULT 丢弃 */
+/*     0061270a  mov eax,[ebx+0x1c]                    （eax 当场被冲掉）      */
+/*     00612733  mov ecx,[ebp-0x14]                     取指针                */
+/*     0061274e  rep movsd (0x18 dwords)                ★ 往里灌 96 字节      */
+/*                                                                            */
+/*   这是**每帧都跑**的 2D 主路径。`DISCARD` 锁很难失败，但一旦失败就是        */
+/*   `rep movsd` 打进栈垃圾指针 —— 和 §35 一个形状，只是更热。                */
+/*                                                                            */
+/*   ★ 补法故意**不**用「判空跳过」：`[ebp-0x14]` 没初始化过，失败时是栈垃圾  */
+/*   而不是 NULL，判空根本不会触发。改成 **Lock 失败就把指针改指向一块        */
+/*   VirtualAlloc 的废纸篓**，循环照跑、字节全落进废纸篓。这样只要一处补丁、  */
+/*   不需要和第二处配对，也不会有「装了一半更危险」的窗口。                   */
+/*   废纸篓 1 MB 足够：循环上界 `cmp eax,0x4000 / jae` 钉死了顶点数 < 0x4000， */
+/*   偏移最大 `0x4000*3*8 + 0x60` = 0x60060。分配不到就整个不装，退回原版。   */
+/* -------------------------------------------------------------------------- */
+
+/* --- C --- */
+#define SEATGET_VA        0x004045F9u       /* IsSeatUsed(this=ecx, idx=eax)  */
+#define SEATGET_SIG_LEN   21
+#define SEATPTR_VA        0x00404D42u       /* SeatPtr(idx=ecx, base=edx)     */
+#define SEATPTR_SIG_LEN   30
+
+static const unsigned char SEATGET_SIG[SEATGET_SIG_LEN] = {
+    0x85,0xC0,             /* test eax,eax          -> test ecx,ecx  */
+    0x7C,0x0E,             /* jl  0x40460b          -> jz            */
+    0x83,0xF8,0x06,        /* cmp eax,6                              */
+    0x7D,0x09,             /* jge 0x40460b          -> jae           */
+    0x6B,0xC0,0x3C,        /* imul eax,eax,0x3c                      */
+    0x0F,0xB6,0x44,0x08,0x40,  /* movzx eax,[eax+ecx+0x40]  ← 崩在这 */
+    0xC3,
+    0x33,0xC0,             /* xor eax,eax（返回 0 的出口）           */
+    0xC3
+};
+static const unsigned char SEATPTR_SIG[SEATPTR_SIG_LEN] = {
+    0x85,0xC9,             /* test ecx,ecx          -> test edx,edx  */
+    0x7C,0x0A,             /* jl  0x404d50          -> jz            */
+    0x83,0xF9,0x06,        /* cmp ecx,6                              */
+    0x7D,0x05,             /* jge 0x404d50          -> jae           */
+    0x33,0xC0,0x40,        /* xor eax,eax / inc eax                  */
+    0xEB,0x02,
+    0x33,0xC0,
+    0x6B,0xC9,0x3C,        /* imul ecx,ecx,0x3c                      */
+    0xF6,0xD8,             /* neg al                                 */
+    0x8D,0x4C,0x11,0x40,   /* lea ecx,[ecx+edx+0x40]   ← base = edx  */
+    0x1B,0xC0,             /* sbb eax,eax                            */
+    0x23,0xC1,             /* and eax,ecx                            */
+    0xC3                   /* ret  —— 收在这，特征串才是完整一个函数 */
+};
+
+/* --- D --- */
+#define TEXWR_VA          0x005C5DD8u
+#define TEXWR_SIG_LEN     26
+#define TEXWR_STOLEN      8
+#define TEXWR_RESUME_TO   0x005C5DE0
+#define TEXWR_PBITS       0x1C            /* [ebp-0x1c] = D3DLOCKED_RECT.pBits */
+
+static const unsigned char TEXWR_SIG[TEXWR_SIG_LEN] = {
+    0x8B,0x45,0xE4,        /* mov eax,[ebp-0x1c]   pBits   ┐ 偷这 8 字节 */
+    0x8B,0x4D,0x08,        /* mov ecx,[ebp+8]              │             */
+    0x89,0x08,             /* mov [eax],ecx                ┘ ★ 无条件写  */
+    0x8B,0x3F,             /* mov edi,[edi]                  ← 落点      */
+    0x8B,0x07,
+    0x53,0x57,
+    0xFF,0x50,0x50,        /* call [eax+0x50]  UnlockRect                */
+    0x8B,0x4D,0xEC,
+    0x56,
+    0xE8,0xB2,0xFE,0xFF,0xFF
+};
+
+/* --- E --- */
+#define FLUSH_VA          0x0061270Au
+#define FLUSH_SIG_LEN     24
+#define FLUSH_STOLEN      6
+#define FLUSH_RESUME_TO   0x00612710
+#define FLUSH_PTR         0x14            /* [ebp-0x14] = Lock 给的顶点指针 */
+#define FLUSH_SCRATCH_SZ  0x100000        /* 1 MB 废纸篓，见上面的上界推导  */
+
+static const unsigned char FLUSH_SIG[FLUSH_SIG_LEN] = {
+    0x8B,0x43,0x1C,        /* mov eax,[ebx+0x1c]   ┐ 偷这 6 字节 */
+    0x89,0x45,0xF4,        /* mov [ebp-0xc],eax    ┘             */
+    0x8B,0x43,0x20,        /* mov eax,[ebx+0x20]     ← 落点      */
+    0x89,0x45,0xF0,
+    0x8B,0x45,0xFC,
+    0xEB,0x54,             /* jmp 0x61276f                       */
+    0x8B,0x83,0xB8,0x00,0x00,0x00,
+    0x8B
+};
+
+static volatile LONG g_texwr_failing = 0, g_texwr_hits = 0;
+static volatile LONG g_flush_failing = 0, g_flush_hits = 0;
+static unsigned char *g_flush_scratch = NULL;
+
+/* 只核对特征串里**我们不改**的那一截（从 from 起）—— 改过之后还能再核一遍。 */
+static int sig_tail_ok(unsigned int va, const unsigned char *sig, int len, int from)
+{
+    const unsigned char *p = (const unsigned char *)va;
+    if (IsBadReadPtr(p, len)) return 0;
+    return memcmp(p + from, sig + from, (size_t)(len - from)) == 0;
+}
+
+static void __stdcall texwr_note(void)
+{
+    LONG n = InterlockedIncrement(&g_texwr_hits);
+    if (InterlockedExchange(&g_texwr_failing, 1)) return;   /* 状态没翻，别重复说 */
+    bslog("★纹理   LockRect 没给出像素指针（累计第 %ld 次）—— 这一次不写。"
+          "原版会拿没初始化的栈变量当指针写 4 字节（bug调查/25 审计，§60-D）"
+          "；锁上之前不再重复报", (long)n);
+}
+
+static void __stdcall flush_note(void)
+{
+    LONG n = InterlockedIncrement(&g_flush_hits);
+    if (InterlockedExchange(&g_flush_failing, 1)) return;
+    bslog("★精灵批 Flush 的顶点缓冲 Lock 失败（累计第 %ld 次）—— 这一帧的顶点"
+          "灌进废纸篓 %08X，画面会花一帧但不崩（原版是 rep movsd 打进栈垃圾"
+          "指针，§60-E）；锁上之前不再重复报",
+          (long)n, (unsigned)(UINT_PTR)g_flush_scratch);
+}
+
+static __declspec(naked) void texwr_guard_detour(void)
+{
+    __asm {
+        test eax, eax                          /* LockRect 的 HRESULT */
+        js   txw_fail
+        mov  eax, dword ptr [ebp - TEXWR_PBITS]
+        test eax, eax                          /* pBits 也顺带查一下 */
+        jz   txw_fail
+        mov  dword ptr [g_texwr_failing], 0    /* 好了，状态翻回去 */
+        mov  ecx, dword ptr [ebp + 8]
+        mov  dword ptr [eax], ecx              /* 被偷走的那一句写入 */
+        push TEXWR_RESUME_TO
+        ret
+    txw_fail:
+        pushad
+        call texwr_note
+        popad
+        push TEXWR_RESUME_TO
+        ret
+    }
+}
+
+static __declspec(naked) void flush_guard_detour(void)
+{
+    __asm {
+        test eax, eax                          /* Lock 的 HRESULT */
+        jns  flu_ok
+        pushad
+        call flush_note
+        popad
+        mov  eax, dword ptr [g_flush_scratch]
+        mov  dword ptr [ebp - FLUSH_PTR], eax  /* 顶点改灌废纸篓 */
+        jmp  flu_go
+    flu_ok:
+        mov  dword ptr [g_flush_failing], 0
+    flu_go:
+        mov  eax, dword ptr [ebx + 0x1C]       /* 被偷走的两条 */
+        mov  dword ptr [ebp - 0x0C], eax
+        push FLUSH_RESUME_TO
+        ret
+    }
+}
+
+static volatile LONG g_crash25_guards_patched = 0;
+
+static int try_patch_crash25_guards(void)
+{
+    int a, b, c1, c2, d, e;
+
+    if (g_crash25_guards_patched) return 1;
+
+    if (!g_flush_scratch)
+        g_flush_scratch = (unsigned char *)VirtualAlloc(
+            NULL, FLUSH_SCRATCH_SZ, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    a = install_jmp_guard(SPRITE_IB_VA, SPRITE_IB_SIG, SPRITE_IB_SIG_LEN,
+                          SPRITE_IB_STOLEN, sprite_ib_guard_detour,
+                          "精灵批索引缓冲 Lock 判空");
+    b = install_jmp_guard(LDSTAGE_VA, LDSTAGE_SIG, LDSTAGE_SIG_LEN,
+                          LDSTAGE_STOLEN, ldstage_guard_detour,
+                          "加载画面析构判 LobbyStage");
+    /* C：两处取值器，各 3 个字节，顺序见上。
+       站点核对只比**不动的那一截**（偏移 9 往后）—— 前 9 个字节里有我们要改的
+       三处，拿整串 memcmp 的话打完就再也对不上了（`poke_imm8` 自己是幂等的）。*/
+    c1 = sig_tail_ok(SEATGET_VA, SEATGET_SIG, SEATGET_SIG_LEN, 9)
+       && poke_imm8(SEATGET_VA + 1, 0xC0, 0xC9, "座位取值器 test this")
+       && poke_imm8(SEATGET_VA + 7, 0x7D, 0x73, "座位取值器 下标改无符号")
+       && poke_imm8(SEATGET_VA + 2, 0x7C, 0x74, "座位取值器 this 为空返回 0");
+    c2 = sig_tail_ok(SEATPTR_VA, SEATPTR_SIG, SEATPTR_SIG_LEN, 9)
+       && poke_imm8(SEATPTR_VA + 1, 0xC9, 0xD2, "座位指针取值器 test base")
+       && poke_imm8(SEATPTR_VA + 7, 0x7D, 0x73, "座位指针取值器 下标改无符号")
+       && poke_imm8(SEATPTR_VA + 2, 0x7C, 0x74, "座位指针取值器 base 为空返回 0");
+    d = install_jmp_guard(TEXWR_VA, TEXWR_SIG, TEXWR_SIG_LEN,
+                          TEXWR_STOLEN, texwr_guard_detour,
+                          "LockRect 失败不写 pBits");
+    /* 废纸篓没分配到就整个不装 —— 绕道里那条 mov 会把 NULL 写进去，更糟。 */
+    e = g_flush_scratch
+        ? install_jmp_guard(FLUSH_VA, FLUSH_SIG, FLUSH_SIG_LEN,
+                            FLUSH_STOLEN, flush_guard_detour,
+                            "Flush 顶点缓冲 Lock 判据")
+        : 0;
+
+    if (!(a && b && c1 && c2 && d && e)) return 0;
+    InterlockedExchange(&g_crash25_guards_patched, 1);
+    bslog("PATCH   ★散崩守护 x6（bug调查/25）: 精灵批索引缓冲 Lock 判空 @ %08X"
+          " / 加载画面析构判 LobbyStage @ %08X"
+          " / 座位取值器判 this @ %08X（一次盖住 97 个调用点）"
+          " / 座位指针取值器判 base @ %08X"
+          " / LockRect 失败不写 pBits @ %08X"
+          " / Flush 顶点 Lock 失败灌废纸篓 @ %08X（%08X，1 MB）",
+          (unsigned)SPRITE_IB_VA, (unsigned)LDSTAGE_VA,
+          (unsigned)SEATGET_VA, (unsigned)SEATPTR_VA,
+          (unsigned)TEXWR_VA, (unsigned)FLUSH_VA,
+          (unsigned)(UINT_PTR)g_flush_scratch);
     return 1;
 }
 
@@ -9526,6 +10009,22 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_crash18_guards_patched)
             bslog("PATCH   !! 超时未能 patch bug调查/18 的散崩守护"
                   "（0x55C260 / 0x5D9E02 / 0x5D9E0D / 0x438BD3 特征对不上）");
+    }
+
+    /* bug调查/25（§57 / §58）：两处都是已修过的病的**第二处站点** —— 精灵批
+       的索引缓冲 Lock 不查返回值（§35 那条的孪生站点）、加载画面析构时
+       LobbyStage 已经没了（§81-A 那条的孪生站点）。
+       和上面那几批共用 BSHOOK_KEEP_RPT_CRASHES 开关。 */
+    if (rpt_crashes_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_RPT_CRASHES 已设，bug调查/25 那两处散崩守护也不装");
+    } else {
+        for (ticks = 0; !g_stop && !g_crash25_guards_patched && ticks < 2000; ticks++) {
+            if (try_patch_crash25_guards()) break;
+            Sleep(2);
+        }
+        if (!g_crash25_guards_patched)
+            bslog("PATCH   !! 超时未能 patch bug调查/25 的散崩守护"
+                  "（0x61186D / 0x46FE01 特征对不上）");
     }
 
     /* NEXON 信使（§85 / D83）：默认**整个拆掉** —— 四格 IAT 全换成自己的桩，

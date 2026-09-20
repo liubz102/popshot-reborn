@@ -65,6 +65,7 @@ import zipfile
 
 #: 落位那几句 `os.replace` 的重试外壳（见 `atomicfile.py` 文件头）。
 import atomicfile
+import tzstamp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -592,15 +593,19 @@ class Collector:
         meta = {
             "format": 1,
             "crash_time": report.stamp,
-            "crash_time_text": report.logged_at_text,
+            # ★ 原样抄崩溃报告里那一行，后面补上**这台机器**的时区：
+            #   服务器和开发机看到它时没别的线索能判断它是哪个时区的
+            #   （bug调查/25 就是在这上面比反了因果）。
+            "crash_time_text": (report.logged_at_text + " " +
+                                tzstamp.utc_offset_text()
+                                if report.logged_at_text else ""),
             "exception": report.exception,
             "fault": report.fault,
             "dump_name": report.dump_name,
             "pid": pid,
             "exit_code": exit_code,
-            "session_start": time.strftime("%Y-%m-%d %H:%M:%S",
-                                           time.localtime(session_start)),
-            "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "session_start": tzstamp.stamp(session_start),
+            "collected_at": tzstamp.stamp(),
             # 我们这一版的构建信息（版本号 / buildId / hook 和加载器的 hash）。
             "build": read_build_info(self.root),
             # 原版客户端自己的版本号，崩溃报告第一行就写着（现在是 311）。

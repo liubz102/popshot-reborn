@@ -40,6 +40,7 @@ import logcleanup
 import eventlog
 from netlisten import create_listener, tune_stream
 from tickets import TicketStore, short as short_ticket
+import tzstamp
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -79,8 +80,8 @@ VERBOSE = False
 
 
 def ts():
-    """和 `gameserver.ts()` 同一个格式（带完整日期，见那边的说明）。"""
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    """和 `gameserver.ts()` 同一个格式（带完整日期 + 时区，见那边的说明）。"""
+    return tzstamp.stamp(millis=True)
 
 
 def log(msg, fh=None):

@@ -59,7 +59,9 @@ int  base64_encode(const unsigned char *src, size_t len, char *dst, size_t cap);
 void u64_to_wide(unsigned long long v, wchar_t *out, size_t cap);
 /* 字节数 -> MiB 一位小数的宽串（"123.4"），界面/日志的速度、大小都用它。 */
 void mib_to_wide(unsigned long long bytes, wchar_t *out, size_t cap);
-/* 时间格式 "YYYY-MM-DD HH:MM:SS"。 */
+/* 本机此刻的 UTC 偏移："UTC+8" / "UTC-3" / "UTC+5:30"。 */
+void utc_offset_text(wchar_t *out, size_t cap);
+/* 时间格式 "YYYY-MM-DD HH:MM:SS UTC+8"（★ 带时区，bug调查/25）。 */
 void now_stamp(wchar_t *out, size_t cap);
 
 #endif /* UPDATER_UTIL_H */

@@ -53,6 +53,7 @@ import threading
 import time
 
 import atomicfile
+import tzstamp
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_LOGDIR = os.path.join(ROOT, "logs")
@@ -265,7 +266,6 @@ def install(stem="server", logdir=None, banner=None):
     if banner:
         bar = "=" * 20
         out.write("\n%s %s %s pid=%d %s\n"
-                  % (bar, banner, time.strftime("%Y-%m-%d %H:%M:%S"),
-                     os.getpid(), bar))
+                  % (bar, banner, tzstamp.stamp(), os.getpid(), bar))
         out.flush()
     return _installed

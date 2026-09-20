@@ -287,11 +287,45 @@ void mib_to_wide(unsigned long long bytes, wchar_t *out, size_t cap)
     out[cap - 1] = 0;
 }
 
+/* 本机此刻的 UTC 偏移（`UTC+8` / `UTC-3` / `UTC+5:30`）。
+   本地时刻减 UTC 时刻现算，不读注册表 —— 夏令时自动就对。
+   和 `hook/bshook.c` 的 `bslog_zone()`、`server/tzstamp.py` 是同一套写法。 */
+void utc_offset_text(wchar_t *out, size_t cap)
+{
+    SYSTEMTIME lt, ut;
+    FILETIME lf, uf;
+    long long diff, half;
+    long mins, hh, mm;
+    wchar_t sign;
+
+    if (cap) out[0] = 0;
+    GetLocalTime(&lt);
+    GetSystemTime(&ut);
+    if (!SystemTimeToFileTime(&lt, &lf) || !SystemTimeToFileTime(&ut, &uf))
+        return;
+    diff = (((long long)lf.dwHighDateTime << 32) | lf.dwLowDateTime)
+         - (((long long)uf.dwHighDateTime << 32) | uf.dwLowDateTime);
+    half = diff >= 0 ? 300000000LL : -300000000LL;      /* 100ns -> 分钟，就近 */
+    mins = (long)((diff + half) / 600000000LL);
+    sign = mins < 0 ? L'-' : L'+';
+    if (mins < 0) mins = -mins;
+    hh = mins / 60;
+    mm = mins % 60;
+    if (mm) _snwprintf(out, cap, L"UTC%c%ld:%02ld", sign, hh, mm);
+    else    _snwprintf(out, cap, L"UTC%c%ld", sign, hh);
+    out[cap - 1] = 0;
+}
+
+/* ★ 后面那个 `UTC+8` 是 2026-09-20 加的：更新器的日志会和玩家机器上的崩溃包、
+   开发机上的打包戳摆在一起看，三台机器三个时区，不写出来会比反
+   （bug调查/25，`server/tzstamp.py` 的文件头记了那次踩坑）。 */
 void now_stamp(wchar_t *out, size_t cap)
 {
     SYSTEMTIME t;
+    wchar_t zone[16];
     GetLocalTime(&t);
-    _snwprintf(out, cap, L"%04u-%02u-%02u %02u:%02u:%02u",
-               t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    utc_offset_text(zone, 16);
+    _snwprintf(out, cap, L"%04u-%02u-%02u %02u:%02u:%02u %s",
+               t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, zone);
     out[cap - 1] = 0;
 }

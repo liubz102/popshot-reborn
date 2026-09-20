@@ -71,8 +71,8 @@ void log_init(const wchar_t *package_root, const char *tag_line)
 void log_vline(const char *fmt, va_list ap)
 {
     wchar_t path[MAX_PATH * 2];
-    wchar_t wstamp[32];
-    char stamp[32];
+    wchar_t wstamp[48];   /* "YYYY-MM-DD HH:MM:SS UTC+5:45" 也装得下 */
+    char stamp[48];
     char body[1600];
     char line[2048];
     HANDLE f;
@@ -160,7 +160,7 @@ void log_vline(const char *fmt, va_list ap)
     CreateDirectoryW(path, NULL);                       /* 不在也不报错 */
     wcscat(path, L"\\updater.log");
 
-    now_stamp(wstamp, 32);
+    now_stamp(wstamp, 48);
     stamp[0] = 0;
     wide_to_utf8(wstamp, stamp, sizeof(stamp));
     _snprintf(line, sizeof(line), "[%s] %s\r\n", stamp, body);

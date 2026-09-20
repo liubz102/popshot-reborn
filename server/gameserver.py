@@ -72,6 +72,7 @@ import eventlog
 import logcleanup
 import lobby as lobby_module
 import mapdata
+import tzstamp
 # ★ `SESSION_STATUS_WAITING` 不从 lobby 导入：本模块下面有一份带完整考据的
 #   同名常量（V0.1 §102），两处值必须一样，import 进来只会让人以为它只有一处定义。
 from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
@@ -5731,16 +5732,19 @@ NOISY_OPCODES = {
 
 
 def ts():
-    """日志行的时间戳。**带完整日期**（用户 2026-09-14）。
+    """日志行的时间戳。**带完整日期 + 时区**（用户 2026-09-14 / 2026-09-20）。
 
     以前只有 `HH:MM:SS.mmm`：玩家把几行日志贴回来、或者事后翻归档，
     都判断不出是哪一天的。`server.out` 现在按天切分（`daylog.py`），文件名
     已经带日期了，但**单独一行被复制出去时文件名就跟不过去** —— 排查问题时
     贴的恰恰就是单独几行，所以日期得写进行里。
+    ★ 后面那个 `UTC+8` 是 2026-09-20 加的：崩溃包来自玩家机器、打包戳来自
+    开发机、这份日志来自服务器，三台机器三个时区，不写出来就会比反
+    （bug调查/25，`server/tzstamp.py` 的文件头记了那次踩坑）。
     `authserver` / `relay` / `eventlog` 的 `ts()` 必须和这里一模一样，
     不然几份日志按时间对不上。
     """
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    return tzstamp.stamp(millis=True)
 
 
 def hexdump(b, maxlen=512):

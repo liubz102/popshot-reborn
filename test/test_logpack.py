@@ -192,8 +192,10 @@ class OverviewTests(_Case):
         row, = view["crash"]["dirs"]
         self.assertEqual("alice_a1b2c3d4_20260909-013642", row["name"])
         self.assertEqual((1, 300, "300 B"), (row["files"], row["size"], row["size_text"]))
-        self.assertRegex(row["mtime_text"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
-        self.assertRegex(view["generated_text"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        self.assertRegex(row["mtime_text"],
+                         r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC[+-]\d+(:\d\d)?$")
+        self.assertRegex(view["generated_text"],
+                         r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC[+-]\d+(:\d\d)?$")
 
 
 # ----------------------------------------------------------------- 计划

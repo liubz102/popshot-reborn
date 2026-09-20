@@ -47,6 +47,7 @@ import asynclog
 #: 切名那一句（内含 `os.replace` 的重试外壳，见 `atomicfile.py` 文件头）。
 #: ★ 和 `server.out` 共用同一份实现 —— 运维看 `logs/` 时不该看到两种切法。
 import daylog
+import tzstamp
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PATH = os.path.join(ROOT, "logs", "online.log")
@@ -63,10 +64,8 @@ _fh_day = None
 
 
 def ts():
-    """和 `gameserver.ts()` 同一个格式（带完整日期），好让两边的行按时间对得上。"""
-    now = time.time()
-    return (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
-            + f".{int(now % 1 * 1000):03d}")
+    """和 `gameserver.ts()` 同一个格式（带完整日期 + 时区），好让两边对得上。"""
+    return tzstamp.stamp(millis=True)
 
 
 def configure(path=None, to_file=True, to_stdout=True, verbose=None):
