@@ -342,7 +342,46 @@ def _report_shop_config():
         log(head)
         eventlog.online(head)
     _report_first_run_upgrades(created)
+    _report_new_weapons()
     _report_character_shelf()
+
+
+def _report_new_weapons():
+    """★ 这一版新加的**武器**自动补进物品库、隐藏武器顺带上架的**日志那一半**。
+
+    判断和写盘都在 `shopcfg.backfill_new_weapons()`（数据层，见 D48）；
+    这儿只负责说话，和 `_report_first_run_upgrades` 分工一样。
+
+    ★ 为什么武器要自动而别的配置不自动（D48 推翻 D35 的最后一条）：
+      玩家看不见的东西不存在 —— 云上 V0.4.0 的 `items.json` 早就落过盘，
+      `ensure_files` 对它一律不覆盖（D7），于是 V0.4.1 新加的 36 把武器
+      在老服务器上**永远不会出现**，除非运营自己想起来去敲
+      `shop-backfill apply`。用户 2026-09-20 拍板：这一类「新内容」要自动进。
+
+    ★ 失败不拦着开服：最坏是「新武器还没进物品库」，管理页物品库那一页
+      仍然列得出来（前台 `fillItems` 现补），运营保存一次也能落盘。
+    ★ **按状态翻转说话**：补完之后每次启动都是空结果，一行都不打。
+    """
+    try:
+        added = shopcfg.backfill_new_weapons(apply=True)
+    except Exception as error:              # noqa: BLE001 —— 见 docstring
+        log(f"⚠ 新武器补齐失败（{error!r}）；新加的武器可能不在物品库里，"
+            f"其余照常。补法：控制通道 `shop-backfill apply`，"
+            f"或者管理页「物品库」保存一次")
+        return
+    items = added.get(shopcfg.ITEMS_FILENAME) or []
+    if not items:
+        return
+    shelf = added.get(shopcfg.SHOP_FILENAME) or []
+    head = ("新武器: 物品库补上了 %d 件（%s）；其中 %d 件照默认摆上了货架，"
+            "其余要卖请去管理页「商店货架」上架。原件留在 %s.bak-* 里"
+            % (len(items),
+               "、".join(str(entry.get("name") or entry.get("id"))
+                         for entry in items[:6])
+               + ("…" if len(items) > 6 else ""),
+               len(shelf), shopcfg.ITEMS_FILENAME))
+    log(head)
+    eventlog.online(head)
 
 
 def _report_character_shelf():

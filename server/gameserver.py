@@ -12921,8 +12921,11 @@ def _dispatch_control_command(line):
         for filename in sorted(added):
             lines.append(f"  {filename}: {len(added[filename])} 条")
             for entry in added[filename]:
-                item_id = entry.get("id" if filename == shopcfg.SHOP_FILENAME
-                                    else "result")
+                # ★ 一条记录的身份键各份不一样（物品库 / 货架是 `id`、配方是
+                #   `result`、卡片是 `card`）—— 照 `BACKFILL_KEYS` 取，
+                #   别在这儿再写一份对照（写死过一次：物品库那份取成了
+                #   `result`，补出来的 36 件武器全打成「物品 None」）。
+                item_id = entry.get(shopcfg.BACKFILL_KEYS[filename][1])
                 lines.append(f"    {_item_label(item_id)}")
         return "\n".join(lines)
 

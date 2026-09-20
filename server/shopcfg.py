@@ -2977,54 +2977,119 @@ def backfill_defaults(data_dir=None, apply=False, only=None):
 
     `apply=False`（默认）只算不写 —— 先看清楚要加什么再决定。
     真写的时候先把原文件复制一份 `*.bak-<时刻>` 放在旁边。
+
+    ★ **这一发是「运营主动按的」**（控制通道 `shop-backfill apply`）——
+    开服自己跑的那一发是 `backfill_new_weapons()`，范围只到武器（D48）。
     """
     added = {}
-    for filename, (list_key, id_key) in BACKFILL_KEYS.items():
+    for filename in BACKFILL_KEYS:
         if only is not None and filename not in only:
             continue
-        path = path_of(filename, data_dir)
-        if not os.path.exists(path):
-            continue                    # 没有就该由 `ensure_files` 去生成
-        try:
-            with open(path, "r", encoding="utf-8") as fp:
-                raw = json.load(fp)
-        except (OSError, ValueError):
-            # 读不了就跳过。**绝不拿默认值盖掉一份读不懂的文件**（D10）。
-            continue
-        entries = raw.get(list_key)
-        if not isinstance(entries, list):
-            continue
-        have = set()
+        fresh = _backfill_one(filename, data_dir, apply)
+        if fresh:
+            added[filename] = fresh
+    if apply and added:
+        invalidate(data_dir)
+    return added
+
+
+def _backfill_one(filename, data_dir, apply, pick=None):
+    """一份配置的补齐：读盘 → 算出「默认表里有、文件里没有」→ 写盘。
+
+    返回补进去的那些条目（`apply=False` 只算不写）；读不了 / 形状不对回 `[]`。
+    `pick` 给一个 `id -> bool` 时只补它点头的那些（`backfill_new_weapons`
+    拿它把范围收到武器上）。
+
+    ★ 调用方负责 `invalidate()` —— 一次补好几份时只该失效一次。
+    """
+    list_key, id_key = BACKFILL_KEYS[filename]
+    path = path_of(filename, data_dir)
+    if not os.path.exists(path):
+        return []                       # 没有就该由 `ensure_files` 去生成
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            raw = json.load(fp)
+    except (OSError, ValueError):
+        # 读不了就跳过。**绝不拿默认值盖掉一份读不懂的文件**（D10）。
+        return []
+    entries = raw.get(list_key)
+    if not isinstance(entries, list):
+        return []
+    have = set()
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get(id_key) is not None:
+            have.add(int(entry[id_key]))
+    build = _SPECS[filename][1]
+    fresh = [entry for entry in build().get(list_key, [])
+             if int(entry[id_key]) not in have
+             and (pick is None or pick(int(entry[id_key])))]
+    if not fresh:
+        return []
+    if filename == RECIPE_FILENAME:
+        # 配方号接着现有的往下数，别和已有的撞（撞了整份文件都不合法）。
+        top = 0
         for entry in entries:
-            if isinstance(entry, dict) and entry.get(id_key) is not None:
-                have.add(int(entry[id_key]))
-        build = _SPECS[filename][1]
-        fresh = [entry for entry in build().get(list_key, [])
-                 if int(entry[id_key]) not in have]
-        if not fresh:
-            continue
-        if filename == RECIPE_FILENAME:
-            # 配方号接着现有的往下数，别和已有的撞（撞了整份文件都不合法）。
-            top = 0
-            for entry in entries:
-                try:
-                    top = max(top, int(entry.get("id", 0)))
-                except (TypeError, ValueError):
-                    pass
-            for offset, entry in enumerate(fresh, start=1):
-                entry["id"] = top + offset
-        added[filename] = fresh
-        if not apply:
-            continue
-        merged = dict(raw)
-        merged[list_key] = list(entries) + fresh
-        # 存盘前必过校验：宁可什么都不写，也不要写出一份服务端读不了的文件。
-        _SPECS[filename][0](merged)
-        # 和管理页保存 / 数据备份拿同一把写锁：别在备份线程拷到一半时换掉文件。
-        with write_lock(filename):
-            shutil.copyfile(path, "%s.bak-%s"
-                            % (path, time.strftime("%Y%m%d-%H%M%S")))
-            write_json(path, merged)
+            try:
+                top = max(top, int(entry.get("id", 0)))
+            except (TypeError, ValueError):
+                pass
+        for offset, entry in enumerate(fresh, start=1):
+            entry["id"] = top + offset
+    if not apply:
+        return fresh
+    merged = dict(raw)
+    merged[list_key] = list(entries) + fresh
+    # 存盘前必过校验：宁可什么都不写，也不要写出一份服务端读不了的文件。
+    _SPECS[filename][0](merged)
+    # 和管理页保存 / 数据备份拿同一把写锁：别在备份线程拷到一半时换掉文件。
+    with write_lock(filename):
+        shutil.copyfile(path, "%s.bak-%s"
+                        % (path, time.strftime("%Y%m%d-%H%M%S")))
+        write_json(path, merged)
+    return fresh
+
+
+def _is_weapon(item_id):
+    """这个 id 是不是**武器**（口径取原版物品表，和物品库那份配置无关）。"""
+    item = shopdata.get(item_id)
+    return bool(item) and item.kind == "weapon"
+
+
+def backfill_new_weapons(data_dir=None, apply=False):
+    """★ 这一版新加的**武器**自动进物品库；同一批里默认该上架的顺带上架。
+
+    返回 `{文件名: [新条目]}`（空 = 没什么要补的）。**每次开服都跑**，
+    因为它天然幂等：补完之后物品库里就有了，下次算出来是空的。
+
+    ## 判据：「物品库里没有」= **这台服务器从来没见过它**（不是「运营删了它」）
+
+    物品库那一页**没有删除键**（`admin.js` 只给货架 / 配方 / 掉落装了
+    `killButton`），而且每次保存都会把物品表里全部 id 补全再落盘
+    （`fillItems`，物品表里没有的 id 也不偷偷删）⇒ 一件武器缺在 `items.json`
+    里，只可能是「这台服务器上线时还没有这件东西」。补它不会盖掉任何人的决定。
+
+    ## 货架那一半为什么**只跟着刚进库的那批走**
+
+    货架有删除键 ⇒ 「`shop.json` 里没有这一行」既可能是从没有过、也可能是
+    运营亲手删的，光看文件分不出来。所以只在**同一发**里给刚进物品库的那些
+    补货架行：进过库就说明这台服务器见过它，之后货架上是什么样全是运营的事，
+    我们再也不碰（铁律 11）。⇒ 运营下架 / 删行之后**不会自己回来**。
+
+    上不上架照 `default_shop()`：原版隐藏武器在默认货架上（`listed: true`）
+    ⇒ 自动上架；自定义武器**不在默认货架里** ⇒ 一行都不加，要卖得去管理页
+    上架（X3 起就是这条口径，D53）。这张表是「该不该上架」的唯一出处，
+    这里不再抄一份名单。
+    """
+    added = {}
+    fresh = _backfill_one(ITEMS_FILENAME, data_dir, apply, pick=_is_weapon)
+    if fresh:
+        added[ITEMS_FILENAME] = fresh
+    born = set(int(entry["id"]) for entry in fresh)
+    if born:
+        shelf = _backfill_one(SHOP_FILENAME, data_dir, apply,
+                              pick=born.__contains__)
+        if shelf:
+            added[SHOP_FILENAME] = shelf
     if apply and added:
         invalidate(data_dir)
     return added
