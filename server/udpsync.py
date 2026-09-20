@@ -317,6 +317,58 @@ def parse_hello_ack(data):
     return result, note
 
 
+#: ★★ 在场证据（bug调查/25 之后加的，用户 2026-09-20）。
+#:
+#: **单人任务房里服务端是瞎的**：没有第二个人，客户端就不发 `0x040e`，
+#: 于是挂机判定的「键盘」那条判据整个不存在，只剩「打中 / 捡到 / 得分」。
+#: 而 328800963 那个号开着连点器，分数每 1.5 秒涨一次 —— 证据比真人还多，
+#: 连续 14 小时显示「游戏中·任务」。
+#:
+#: 结论不是「把得分这条证据削弱」，而是**把服务端看不见的那几件事搬过来**。
+#: 这四件事 `bshook` 站在客户端里全看得见，而服务端**结构上**看不见：
+#:
+#: | 字段 | 是什么 | 为什么它管用 |
+#: |---|---|---|
+#: | `kb_idle_ms`  | 距上次**非方向键**的 `WM_KEYUP` | 和 `INPUT_PEER_OPCODES` 同一哲学（方向键和开火都不算），单人局补上盲区 |
+#: | `mouse_idle_ms` | 距上次鼠标键 `WM_*BUTTONUP` | 单独一类：连点器产的就是它，**故意只当弱证据** |
+#: | `sys_idle_ms` | `GetLastInputInfo()` | 「这台机器前面有没有人」。`PostMessage` 类连点器伪造不了它 |
+#: | `foreground`  | 游戏窗口在不在前台 | 用户 2026-09-20 点的题：游戏丢后台还在打的一定不是真人在玩（原版自己也靠这个把 BGM 静音，`WM_ACTIVATEAPP` @ `0x40f17b`）|
+#:
+#: ★★ **这一发只运证据，不下结论**。判定留在 `gameserver`：那边的阈值是用户
+#: 拿真日志调出来的（§111），改阈值不该要求重发客户端。
+MSG_PRESENCE = 6
+
+#: `u32 键盘空闲 / u32 鼠标空闲 / u32 系统空闲 / u8 前台 / u8 标志 / u16 保留`。
+#: 空闲毫秒 `0xFFFFFFFF` = **本次连接从来没有过**（不是「刚刚有」）。
+PRESENCE = struct.Struct("<IIIBBH")
+#: 「从来没有过」。★ 和「0 毫秒」必须分得开 —— 一个是最强的挂机证据，
+#: 一个是最强的反证，混在一起这个功能就废了。
+PRESENCE_NEVER = 0xFFFFFFFF
+#: `flags` 的位。现在只用一个，其余留给以后（别复用，老服务端会解错）。
+PRESENCE_FLAG_MINIMIZED = 0x01
+
+
+def build_presence(kb_idle_ms, mouse_idle_ms, sys_idle_ms, foreground, flags=0):
+    return build_header(MSG_PRESENCE) + PRESENCE.pack(
+        kb_idle_ms & 0xFFFFFFFF, mouse_idle_ms & 0xFFFFFFFF,
+        sys_idle_ms & 0xFFFFFFFF, 1 if foreground else 0, flags & 0xFF, 0)
+
+
+def parse_presence(data):
+    """-> `(kb_idle_ms, mouse_idle_ms, sys_idle_ms, foreground, flags)`。
+
+    ★ 比结构体长的包**照收**（只解前面这些格）：以后加字段时老服务端不会
+      因为「长度对不上」把新客户端整个丢掉。反过来短了就是坏包，拒。
+    """
+    kind, _ = parse_header(data)
+    if kind != MSG_PRESENCE:
+        raise ProtocolError(f"not a PRESENCE ({kind})")
+    if len(data) < HEADER_SIZE + PRESENCE.size:
+        raise ProtocolError("PRESENCE truncated")
+    kb, mouse, sysidle, fg, flags, _pad = PRESENCE.unpack_from(data, HEADER_SIZE)
+    return kb, mouse, sysidle, bool(fg), flags
+
+
 def build_ping(kind, seq):
     return build_header(kind) + struct.pack("<I", seq & 0xFFFFFFFF)
 
@@ -929,6 +981,31 @@ class UdpSyncServer:
             except Exception as error:         # noqa: BLE001 —— 单份坏了不许带崩整条
                 self.log(f"!! 喂 UDP 心跳抛了 {error!r}")
 
+    def _on_presence(self, data, addr, now):
+        """在场证据（`MSG_PRESENCE`）—— 原样转交给那条游戏连接，**这里不判定**。
+
+        和 `_on_data` 同一套：`HELLO` 之前一律丢（认不出是谁），认得出就
+        鸭子类型地喂给 `Conn.note_presence()`。判定在 `gameserver` 那边。
+        """
+        with self._lock:
+            endpoint = self._by_addr.get(addr)
+            if endpoint is not None:
+                endpoint.last_seen = now
+        if endpoint is None:
+            self.unknown_in += 1
+            return
+        try:
+            kb, mouse, sysidle, fg, flags = parse_presence(data)
+        except ProtocolError:
+            return
+        note = getattr(endpoint.game_conn, "note_presence", None)
+        if note is None:
+            return          # 老服务端 / 单测里的假连接：当没收到
+        try:
+            note(kb, mouse, sysidle, fg, flags)
+        except Exception as error:             # noqa: BLE001 —— 不许带崩收包循环
+            self.log(f"!! 喂在场证据抛了 {error!r}")
+
     def _reply(self, data, addr):
         if self.sock is None:
             return
@@ -949,6 +1026,8 @@ class UdpSyncServer:
             self._on_data(data, addr, now)
         elif kind == MSG_HELLO:
             self._on_hello(data, addr, now)
+        elif kind == MSG_PRESENCE:
+            self._on_presence(data, addr, now)
         elif kind == MSG_PING:
             with self._lock:
                 endpoint = self._by_addr.get(addr)

@@ -188,6 +188,8 @@ class _JmpGuardSiteMixin(object):
     """
 
     PREFIX = None
+    #: 装这一处的那个函数叫什么（同一族的几处共用一个安装函数）。
+    INSTALLER = "try_patch_crash25_guards"
 
     @classmethod
     def setUpClass(cls):
@@ -216,12 +218,13 @@ class _JmpGuardSiteMixin(object):
         self.assertLessEqual(self.stolen, self.sig_len, "偷的比特征串还长")
 
     def test_the_detour_is_wired_up(self):
-        # 定义了没人装 = 白写。安装侧至少出现两次（定义 + 调用）。
-        self.assertGreaterEqual(self.src.count("try_patch_crash25_guards"), 3,
-                                "try_patch_crash25_guards 定义了但没有人调用")
+        # 定义了没人装 = 白写。至少两处：定义一次 + `patch_thread` 里调一次。
+        self.assertGreaterEqual(self.src.count(self.INSTALLER + "()"), 1,
+                                "%s 定义了但没有人调用" % self.INSTALLER)
+        self.assertIn("static int %s(void)" % self.INSTALLER, self.src)
         self.assertIn("%s_VA" % self.PREFIX, self.src.split(
-            "static int try_patch_crash25_guards(void)")[1],
-            "%s 这一处没有被 try_patch_crash25_guards 装上" % self.PREFIX)
+            "static int %s(void)" % self.INSTALLER)[1],
+            "%s 这一处没有被 %s 装上" % (self.PREFIX, self.INSTALLER))
 
 
 class SpriteIndexBufferPatchTest(_JmpGuardSiteMixin, unittest.TestCase):
@@ -416,6 +419,85 @@ class SpriteFlushGuardPatchTest(_JmpGuardSiteMixin, unittest.TestCase):
         self.assertIn("mov  dword ptr [ebp - FLUSH_PTR], eax", body)
         self.assertIn("g_flush_scratch\n        ? install_jmp_guard(FLUSH_VA",
                       self.src, "废纸篓没分配到时必须整个不装（否则会写 NULL）")
+
+
+class PresenceInputPatchTest(_JmpGuardSiteMixin, unittest.TestCase):
+    """§62 / D53（bug调查/25）—— 在场证据的采样点：窗口过程 `0x40ee1d`。
+
+    这一处和别的补丁不一样：它**不改游戏行为**，只是把服务端看不见的事实
+    （键盘 / 鼠标 / 前台）抄一份出来。所以要钉的不是「跳转落在哪」，而是
+    **「这个位置真的能看见每一条消息」**和**「标志位没被我们弄脏」**。
+    """
+
+    PREFIX = "PRESIN"
+    INSTALLER = "try_patch_presence_input"
+
+    @classmethod
+    def setUpClass(cls):
+        super(PresenceInputPatchTest, cls).setUpClass()
+        cls.resume_to = c_define(cls.src, "PRESIN_RESUME_TO")
+
+    def test_the_patch_stops_right_after_the_first_compare(self):
+        self.assertEqual(self.va + self.stolen, self.resume_to)
+        # 落点是 `je 0x40ee33` —— 它**要用**我们偷走的那条 cmp 设的标志位。
+        self.assertEqual(b"\x74\x0f", read_va(self.img, self.resume_to, 2),
+                         "落点不是那条 je —— 偷的字节数变了")
+
+    def test_the_detour_reports_before_running_the_stolen_compare(self):
+        # ★ 顺序不能反：先 cmp 再 call 的话，报事实那一串会把 ZF 冲掉，
+        #   落点那条 je 就跳错了（而且是**随机**跳错，不会当场报错）。
+        body = self.src[self.src.index("void presence_input_detour(void)"):]
+        body = body[:body.index("\n}\n")]
+        self.assertLess(body.index("call presence_note_message"),
+                        body.index("cmp  eax, esi"),
+                        "绕道先跑了 cmp 才报事实 —— 标志位会被冲掉")
+        self.assertIn("pushad", body)
+        self.assertIn("popad", body)
+        # push/ret 回落点：它俩都不动标志位，`jmp` 也行但这是本文件的惯例。
+        self.assertIn("push PRESIN_RESUME_TO", body)
+
+    def test_every_window_message_really_flows_through_this_spot(self):
+        # ① 它是 `0x40ee15 jne` 的落点；② 也是 `0x40ee17` 的直落点。
+        jne_va = 0x0040EE15
+        self.assertEqual(0x75, self.img[jne_va - IMAGE_BASE], "0x40ee15 不是 jne")
+        rel = struct.unpack("<b", self.img[jne_va + 1 - IMAGE_BASE:
+                                           jne_va + 2 - IMAGE_BASE])[0]
+        self.assertEqual(self.va, jne_va + 2 + rel, "那条 jne 不再落在采样点上")
+        self.assertEqual(b"\xff\x15", read_va(self.img, 0x0040EE17, 2),
+                         "0x40ee17 不再是那句 call（直落路径变了）")
+
+    def test_the_activateapp_switch_is_still_downstream_of_us(self):
+        # WM_ACTIVATEAPP 要能被我们看见，那张 switch 就必须在采样点**后面**。
+        self.assertEqual(b"\x83\xf8\x1c", read_va(self.img, 0x0040EF58, 3),
+                         "0x40ef58 不再是 cmp eax,0x1c")
+        self.assertLess(self.va, 0x0040EF58)
+
+    def test_the_four_messages_are_the_ones_we_hard_coded(self):
+        # 绕道里是自己按消息号分类的，所以这四个常量必须还在原地。
+        for va, msg in ((0x0040EDF9, 0x202), (0x0040EE01, 0x208),
+                        (0x0040EE06, 0x205)):
+            self.assertEqual(struct.pack("<I", msg),
+                             read_va(self.img, va + 1, 4),
+                             "%08X 那个鼠标消息号变了" % va)
+        self.assertEqual(struct.pack("<I", 0x101),
+                         read_va(self.img, 0x0040EE2C + 1, 4), "WM_KEYUP 变了")
+
+    def test_the_original_afk_timer_is_reset_right_after_us(self):
+        # ★ 这条是「为什么选这个位置」的依据：原版自己的 90 秒挂机计时器
+        #   就在这条路的末尾重置（`0x40ee3d call LobbyStage::ResetIdleTimer`）
+        #   —— 也就是说原版认的「玩家有动作」就是这四个消息。
+        call_va = 0x0040EE3D
+        self.assertEqual(0xE8, self.img[call_va - IMAGE_BASE])
+        rel = struct.unpack("<i", read_va(self.img, call_va + 1, 4))[0]
+        self.assertEqual(c_define(self.src, "AFK_TIMER_VA"), call_va + 5 + rel,
+                         "0x40ee3d 调的不再是 ResetIdleTimer —— 选点的依据没了")
+
+    def test_arrow_keys_are_excluded_like_the_server_does(self):
+        # 和服务端 `INPUT_PEER_OPCODES` 的取舍必须一致，否则两边判据不同源。
+        body = self.src[self.src.index("void __stdcall presence_note_message"):]
+        body = body[:body.index("\n}\n")]
+        for vk in ("VK_LEFT", "VK_UP", "VK_RIGHT", "VK_DOWN"):
+            self.assertIn(vk, body, "方向键 %s 没被排除" % vk)
 
 
 class SeatGetterPatchTest(unittest.TestCase):

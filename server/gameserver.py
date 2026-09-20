@@ -6535,6 +6535,53 @@ AFK_AFTER_S = 20.0
 AFK_SOLO_AFTER_S = 45.0
 
 
+#: ★ 在场证据分档（bug调查/25）。**只用来打日志和给管理页看**，
+#: `conn_is_afk()` 这一版一个字都没改（用户拍板的三步走：先记、再看数据、
+#: 最后才定线）。档位本身就是「等着被真数据推翻」的初稿。
+#:
+#: 排序是**从最像挂机到最像真人**，第一个成立的就是它的档：
+#:
+#: * `后台`   —— 游戏窗口压根不在前台。用户 2026-09-20：真人玩游戏不会把窗口
+#:   丢到后台（原版自己也认这件事：`WM_ACTIVATEAPP` 一失活就把 BGM 静音）。
+#: * `人不在` —— `GetLastInputInfo()` 说这台机器整机多久没人碰过。
+#'   `PostMessage` 类连点器伪造不了它。
+#: * `只有鼠标` —— 键盘从来没动过、只有鼠标键在响。连点器的典型形状；
+#:   和 `INPUT_PEER_OPCODES` 故意排除 `rpFire` 是同一个理由。
+#: * `在玩`   —— 键盘最近动过。
+PRESENCE_BUCKETS = ("后台", "人不在", "只有鼠标", "在玩")
+#: 分档用的两条线（**毫秒**）。⚠ 它们**现在只影响日志文字**，不影响任何判定，
+#: 所以这里放常量不违反铁律 10 —— 真正要拿真数据定的是将来接进
+#: `conn_is_afk()` 的那条线，不是这个给人看的分档。
+PRESENCE_IDLE_MS = 60_000
+PRESENCE_KB_MS = 60_000
+
+
+def presence_age_text(ms):
+    """`123456 -> "123 秒前"`，`PRESENCE_NEVER -> "从没有过"`，`None -> "?"`。"""
+    if ms is None:
+        return "?"
+    if ms == udpsync.PRESENCE_NEVER:
+        return "从没有过"
+    return "%d 秒前" % (ms // 1000)
+
+
+def presence_bucket(conn):
+    """这条连接的在场证据落在哪一档；没收到过证据回 `None`。"""
+    if getattr(conn, "presence_at", None) is None:
+        return None
+    if not conn.presence_fg:
+        return "后台"
+    sys_ms = conn.presence_sys_ms
+    if sys_ms is not None and (sys_ms == udpsync.PRESENCE_NEVER
+                               or sys_ms >= PRESENCE_IDLE_MS):
+        return "人不在"
+    kb_ms = conn.presence_kb_ms
+    if kb_ms is not None and (kb_ms == udpsync.PRESENCE_NEVER
+                              or kb_ms >= PRESENCE_KB_MS):
+        return "只有鼠标"
+    return "在玩"
+
+
 def conn_afk_clock_expired(conn, now=None):
     """光看**钟**到没到期，不管他是不是躺着。
 
@@ -6906,6 +6953,26 @@ class Conn:
     dead_since = None
     afk_when_down = False
     afk_carried = False
+    # ★★ 在场证据（bug调查/25，用户 2026-09-20）。客户端 `bshook` 每 5 秒经
+    #   UDP 旁路报一发，内容见 `udpsync.MSG_PRESENCE`。**服务端结构上看不到
+    #   这四件事** —— 单人局连 `0x040e` 都没有，键盘那条判据整个不存在。
+    #   `presence_at`     = 最后一发证据到达的 `time.monotonic()`；`None` = 从
+    #     没收到过（老客户端 / 没有中继 / UDP 被挡）⇒ **一律当没这条信息**，
+    #     绝不能当成「他挂机」。
+    #   `presence_kb_ms`  = 距上次**非方向键** `WM_KEYUP` 的毫秒；
+    #     `udpsync.PRESENCE_NEVER` = 本次连接从来没按过。
+    #   `presence_mouse_ms` / `presence_sys_ms` = 鼠标键 / 这台机器（`GetLastInputInfo`）。
+    #   `presence_fg`     = 游戏窗口在不在前台（原版靠同一个消息把 BGM 静音）。
+    #   ⚠ **这一版只记不判**：`conn_is_afk()` 一个字都没改。先拿线上一天的
+    #     真数据看分布，再照 §111 的老规矩定线（用户 2026-09-20 拍板的三步走）。
+    presence_at = None
+    presence_kb_ms = None
+    presence_mouse_ms = None
+    presence_sys_ms = None
+    presence_fg = None
+    presence_flags = 0
+    #: 上一次**打了日志**的那一档（用来按状态翻转去重，不按次数、不按时间窗）。
+    presence_logged = None
     #: ★ 诊断（`note_human_fire`）的类级默认 —— 控制通道造的假连接也得有。
     human_fire_logged = frozenset()
     #: ★ 这条连接**本图打出去、还没配上爆炸**的几发 `rpFire`（V0.3 §92）。
@@ -10956,6 +11023,39 @@ class Conn:
         if game_id != self.peer_order_epoch:
             self.peer_order_epoch = game_id
             self.peer_order.new_epoch()
+
+    def note_presence(self, kb_ms, mouse_ms, sys_ms, foreground, flags=0):
+        """在场证据到了（`udpsync.MSG_PRESENCE`，bug调查/25）。
+
+        ★★ **这一版只记不判**（用户 2026-09-20 拍板的三步走的第 2 步）：
+        存下来 + 按状态翻转打日志，`conn_is_afk()` 一个字都不改。先拿线上一天
+        的真数据看分布，再照 §111 的老规矩（在真人 / 挂机两份语料上量出来）
+        定线 —— 阈值是用户自己调的，不该由我拍。
+
+        为什么非要客户端报：**单人任务房里服务端是瞎的**。房里只有他一个人，
+        客户端就不发 `0x040e`，键盘那条判据整个不存在，只剩「打中 / 捡到 /
+        得分」。328800963 开着连点器，分数每 1.5 秒涨一次 —— 证据比真人还多，
+        连续 14 小时显示「游戏中·任务」。这四个数正是服务端够不着的那部分。
+
+        ★ 日志按**状态翻转**去重（铁律 10）：档位没变就一个字不写。一条连接
+        一天能收上万发这种包，按次数或时间窗去重都会要么刷屏要么漏掉翻转。
+        """
+        self.presence_at = time.monotonic()
+        self.presence_kb_ms = kb_ms
+        self.presence_mouse_ms = mouse_ms
+        self.presence_sys_ms = sys_ms
+        self.presence_fg = bool(foreground)
+        self.presence_flags = flags
+        bucket = presence_bucket(self)
+        if bucket == self.presence_logged:
+            return
+        self.presence_logged = bucket
+        eventlog.debug(
+            "游戏服 #%s 在场证据 账号=%r -> %s（键盘 %s / 鼠标 %s / 这台机器 %s"
+            "；窗口%s前台）"
+            % (self.cid, self.username or "?", bucket,
+               presence_age_text(kb_ms), presence_age_text(mouse_ms),
+               presence_age_text(sys_ms), "在" if self.presence_fg else "**不在**"))
 
     def feed_peer_udp(self, index, payload):
         """UDP 那条路的入口 —— `udpsync` 收到位置数据后调它。

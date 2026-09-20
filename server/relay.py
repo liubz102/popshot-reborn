@@ -652,6 +652,15 @@ class UdpSyncRelay:
                     f"{'已 bind' if downlink else '还没 bind'}）")
             self._send_hello()
             return
+        if kind == udpsync.MSG_PRESENCE:
+            # ★ 在场证据（bug调查/25）：中继**原样转发，一个字节不看**。
+            #   内容是「键盘 / 鼠标 / 这台机器多久没动过、游戏在不在前台」，
+            #   判定在游戏服那边 —— 那边的阈值是拿真日志调出来的，改阈值不该
+            #   要求重发客户端，更不该要求重发中继。
+            #   ★ 老服务端不认识这个 kind，会在 `UdpHub._handle` 里安静丢掉
+            #   ⇒ 新客户端 + 老服务端 = 「没有这条证据」，退回今天的行为。
+            self._to_remote(data)
+            return
         if kind != udpsync.MSG_DATA:
             return
         try:

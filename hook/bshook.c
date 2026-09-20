@@ -5649,6 +5649,119 @@ static __declspec(naked) void flush_guard_detour(void)
     }
 }
 
+/* -------------------------------------------------------------------------- */
+/* 在场证据的采样点 —— 窗口过程 `0x40ee1d`（§62 / D53）                       */
+/*                                                                            */
+/*   为什么是这儿：原版自己的 90 秒挂机踢出就在这条路上重置计时器             */
+/*   （`0x40ee3d call LobbyStage::ResetIdleTimer`），也就是说**原版认的       */
+/*   「玩家有动作」就是这四个消息**。我们站在它前面一格，把同样的事实抄走。   */
+/*                                                                            */
+/*     0040edf9  mov esi,0x202            WM_LBUTTONUP                        */
+/*     0040ee01  mov edi,0x208            WM_MBUTTONUP                        */
+/*     0040ee06  mov ebx,0x205            WM_RBUTTONUP                        */
+/*     0040ee1d  mov eax,[ebp+0xc]        ← uMsg      ┐ 偷这 5 字节           */
+/*     0040ee20  cmp eax,esi                          ┘                       */
+/*     0040ee2c  cmp eax,0x101            WM_KEYUP                            */
+/*     0040ee3d  call 0x4082ae            ResetIdleTimer                      */
+/*                                                                            */
+/*   ★ **每一条消息都会经过 `0x40ee1d`**：它既是 `0x40ee15 jne` 的落点，      */
+/*     也是 `0x40ee17` 的直落点，而认 `WM_ACTIVATEAPP` 的那张 switch          */
+/*     （`0x40ef58`）还在它**后面**。所以一个跳板就够看全键盘 / 鼠标 / 激活。 */
+/*   ★ `0x40ee1d` 是 `jne` 的目标，跳板的 `E9` 正好当那个落点，没问题。       */
+/*   ★ 偷来的第二条 `cmp eax,esi` 会设标志位，而紧接着的 `je` 要用它 ⇒        */
+/*     绕道里**先报事实、再跑那两条**，`push/ret` 不动标志位。                */
+/*                                                                            */
+/*   方向键不算「动作」：和服务端 `INPUT_PEER_OPCODES` 的取舍一致（方向键在   */
+/*   心跳掩码里、`rpFire` 是鼠标，两样都排除）。                              */
+/* -------------------------------------------------------------------------- */
+#define PRESIN_VA          0x0040EE1Du
+#define PRESIN_SIG_LEN     22
+#define PRESIN_STOLEN      5
+#define PRESIN_RESUME_TO   0x0040EE22
+
+static const unsigned char PRESIN_SIG[PRESIN_SIG_LEN] = {
+    0x8B, 0x45, 0x0C,              /* mov eax,[ebp+0xc]   uMsg  ┐ 偷 5 字节 */
+    0x3B, 0xC6,                    /* cmp eax,esi  (0x202)      ┘           */
+    0x74, 0x0F,                    /* je  0x40ee33              ← 落点      */
+    0x3B, 0xC7,                    /* cmp eax,edi  (0x208)                  */
+    0x74, 0x0B,                    /* je  0x40ee33                          */
+    0x3B, 0xC3,                    /* cmp eax,ebx  (0x205)                  */
+    0x74, 0x07,                    /* je  0x40ee33                          */
+    0x3D, 0x01, 0x01, 0x00, 0x00,  /* cmp eax,0x101   WM_KEYUP              */
+    0x75, 0x0F                     /* jne 0x40ee42                          */
+};
+
+#define WM_KEYUP_        0x0101
+#define WM_ACTIVATEAPP_  0x001C
+
+/* 最近一次「非方向键抬起」/「鼠标键抬起」的 GetTickCount()；0 = 从来没有。
+   ★ 声明放在**采样点**这边而不是发包那边：写它的是窗口过程的绕道（这里），
+     读它的是 5 秒一次的上报（`sync_send_presence`，在下面很远的地方）。 */
+static volatile LONG g_pres_kb_tick = 0;
+static volatile LONG g_pres_mouse_tick = 0;
+/* 上一次报出去的前台状态，用来按**状态翻转**去重日志。 */
+static volatile LONG g_pres_fg_last = -1;
+
+static int presence_disabled(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_NO_PRESENCE", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static void __stdcall presence_note_message(unsigned int msg, unsigned int wparam)
+{
+    if (msg == WM_KEYUP_) {
+        /* 方向键不算 —— 它们在心跳掩码里，服务端本来也不认（§62）。 */
+        if (wparam == VK_LEFT || wparam == VK_UP
+            || wparam == VK_RIGHT || wparam == VK_DOWN)
+            return;
+        /* 0 是「从来没有过」的哨兵，真撞上就挪一格 —— 49.7 天才一次。 */
+        InterlockedExchange(&g_pres_kb_tick, (LONG)(GetTickCount() | 1));
+        return;
+    }
+    if (msg == 0x0202 || msg == 0x0205 || msg == 0x0208) {   /* L/R/M BUTTONUP */
+        InterlockedExchange(&g_pres_mouse_tick, (LONG)(GetTickCount() | 1));
+        return;
+    }
+    /* `WM_ACTIVATEAPP` 只是顺手记一行 —— 前台状态本身由
+       `presence_foreground()` 现问，不靠这条消息维护（避免「钩子装上之前
+       窗口已经失活了」那个初值问题）。 */
+    if (msg == WM_ACTIVATEAPP_)
+        bsvlog("PRES    WM_ACTIVATEAPP wParam=%u（原版靠它把 BGM 静音）", wparam);
+}
+
+static __declspec(naked) void presence_input_detour(void)
+{
+    __asm {
+        pushad
+        push dword ptr [ebp + 0x10]         /* wParam */
+        push dword ptr [ebp + 0x0C]         /* uMsg   */
+        call presence_note_message
+        popad
+        mov  eax, dword ptr [ebp + 0x0C]    /* 被偷走的两条，原样跑 */
+        cmp  eax, esi
+        push PRESIN_RESUME_TO               /* push/ret 不动标志位 */
+        ret
+    }
+}
+
+static volatile LONG g_presence_patched = 0;
+
+static int try_patch_presence_input(void)
+{
+    if (g_presence_patched) return 1;
+    if (!install_jmp_guard(PRESIN_VA, PRESIN_SIG, PRESIN_SIG_LEN,
+                           PRESIN_STOLEN, presence_input_detour,
+                           "在场证据采样"))
+        return 0;
+    InterlockedExchange(&g_presence_patched, 1);
+    bslog("PATCH   ★在场证据采样 @ %08X: 窗口消息里认键盘（方向键除外）/ 鼠标键 /"
+          "激活，配合 GetLastInputInfo + 前台判断，每 5 秒经 UDP 旁路报给服务端"
+          "（bug调查/25；只报事实，判定在服务端）", (unsigned)PRESIN_VA);
+    return 1;
+}
+
 static volatile LONG g_crash25_guards_patched = 0;
 
 static int try_patch_crash25_guards(void)
@@ -8200,6 +8313,12 @@ static int try_hook_snow(void);
 #define SYNC_VERSION 1
 #define SYNC_MSG_HELLO 1
 #define SYNC_MSG_DATA  3
+/* ★ 在场证据（bug调查/25 / §62）。和 `server/udpsync.py` 的 `MSG_PRESENCE`
+   是同一号；老服务端不认识它，会安静丢掉（退回今天的行为）。 */
+#define SYNC_MSG_PRESENCE 6
+/* 「本次连接从来没有过」。★ 必须和「刚刚有过（0 毫秒）」分得开：
+   一个是最强的挂机证据，一个是最强的反证。 */
+#define PRESENCE_NEVER 0xFFFFFFFFu
 /* HELLO 的标志位：「游戏这边收位置数据的 UDP 口已经 bind 成功，可以往这儿投」。
    和 `server/udpsync.py` 的 `HELLO_FLAG_DOWNLINK` 是同一位。 */
 #define SYNC_FLAG_DOWNLINK 0x01
@@ -8317,6 +8436,116 @@ static void sync_send_hello(void)
     n += chars;
     buf[n++] = (unsigned char)(
         InterlockedCompareExchange(&g_sync_udp_bound, 0, 0) ? SYNC_FLAG_DOWNLINK : 0);
+    sync_send_raw(buf, n);
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★★ 在场证据 —— 把服务端**结构上看不见**的四件事报过去（§62 / D53）        */
+/*                                                                            */
+/*   出处 bug调查/25：328800963 连续 14 小时显示「游戏中·任务」。查下来不是   */
+/*   判据写错了，是**单人任务房里服务端是瞎的** —— 房里只有他一个人，客户端   */
+/*   就不发 `0x040e`，挂机判定的「键盘」那条整个不存在，只剩「打中 / 捡到 /   */
+/*   得分」；而他开着连点器，分数每 1.5 秒涨一次，证据比真人还多。            */
+/*                                                                            */
+/*   我们自己的注释早就把话说死了（「房间挂机踢出」那一段）：原版这个判定     */
+/*   「没有任何一条是收包触发的，**服务端够不着，只能改客户端**」。           */
+/*   hook 正好站在够得着的那一边。                                            */
+/*                                                                            */
+/*   报四件事，**只报事实，不下结论**（判定留在服务端，那边的阈值是用户拿真   */
+/*   日志调出来的，改阈值不该要求重发客户端）：                               */
+/*                                                                            */
+/*     kb_idle_ms     距上次**非方向键**的 WM_KEYUP。和服务端                 */
+/*                    `INPUT_PEER_OPCODES` 同一哲学（方向键、开火都不算）      */
+/*     mouse_idle_ms  距上次鼠标键 WM_*BUTTONUP。单独一类 ——                  */
+/*                    连点器产的就是它，故意只当弱证据                        */
+/*     sys_idle_ms    `GetLastInputInfo()`：**这台机器**前面有没有人。         */
+/*                    PostMessage 类连点器伪造不了它                          */
+/*     foreground     游戏窗口在不在前台（用户 2026-09-20 点的题：真人玩游戏  */
+/*                    不会把窗口丢后台。原版自己也认这件事 —— `WM_ACTIVATEAPP`*/
+/*                    一失活就把 BGM 静音，`0x40f17b` 把它存进 `[窗口对象+7]`）*/
+/*                                                                            */
+/*   ★ 前台用 `GetForegroundWindow()` 现问、不缓存：缓存就要处理「钩子装上   */
+/*     之前窗口已经失活了」这个初值问题，而现问一次比后面那次 sendto 便宜。   */
+/*   ★ 走的是**已有的**位置数据 UDP 旁路（多一个 kind），不碰游戏那条加密    */
+/*     TCP —— 那条流是有状态的，往里插包会把密钥流冲掉。                      */
+/* -------------------------------------------------------------------------- */
+
+typedef BOOL (WINAPI *get_last_input_t)(PLASTINPUTINFO);
+static get_last_input_t s_get_last_input = NULL;
+
+/* `tick` 到现在过了多久；`tick == 0`（从来没有过）回 PRESENCE_NEVER。
+   ★ GetTickCount 49.7 天回绕：用无符号相减，回绕天然是对的。 */
+static unsigned int presence_age(LONG tick)
+{
+    DWORD now;
+    if (tick == 0) return PRESENCE_NEVER;
+    now = GetTickCount();
+    return (unsigned int)(now - (DWORD)tick);
+}
+
+/* 这台机器整机多久没人碰过。取不到（老系统 / API 缺失）回 PRESENCE_NEVER 是
+   **错的**（那会被当成最强的挂机证据）—— 取不到就说「刚刚有过」，宁可漏判。 */
+static unsigned int presence_system_idle(void)
+{
+    LASTINPUTINFO lii;
+    if (!s_get_last_input) {
+        HMODULE u32 = GetModuleHandleA("user32.dll");
+        if (u32) s_get_last_input =
+            (get_last_input_t)GetProcAddress(u32, "GetLastInputInfo");
+        if (!s_get_last_input) return 0;
+    }
+    lii.cbSize = sizeof(lii);
+    lii.dwTime = 0;
+    if (!s_get_last_input(&lii)) return 0;
+    return (unsigned int)(GetTickCount() - lii.dwTime);
+}
+
+/* 游戏窗口在不在前台。★ 按**进程**比，不按 HWND：全屏 / 窗口 / 子窗口
+   各有各的 HWND，比进程号一次到位，也不用记谁是主窗口。 */
+static int presence_foreground(void)
+{
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (!fg) return 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+static void sync_send_presence(void)
+{
+    unsigned char buf[8 + 12 + 4];
+    int n;
+    unsigned int kb, mouse, sysidle;
+    int fg;
+
+    kb = presence_age(InterlockedCompareExchange(&g_pres_kb_tick, 0, 0));
+    mouse = presence_age(InterlockedCompareExchange(&g_pres_mouse_tick, 0, 0));
+    sysidle = presence_system_idle();
+    fg = presence_foreground();
+
+    /* 日志按**状态翻转**去重（铁律 10）：前台/后台变了才写一行。
+       一局能采上千次，按次数或时间窗去重要么刷屏要么漏掉翻转。
+       ★ 放在发包**之前**、也不受「登录了没有」影响：登录前采样器就该能自证
+         活着，否则装没装上只能靠猜。 */
+    if (InterlockedExchange(&g_pres_fg_last, fg) != fg)
+        bslog("PRES    游戏窗口%s前台（键盘 %u ms / 鼠标 %u ms / 这台机器 %u ms 没动过）",
+              fg ? "回到" : "**离开**", kb, mouse, sysidle);
+
+    /* 票据还没有 = 这条游戏连接还没登录，服务端认不出我们，白发。 */
+    if (!g_sync_ticket[0]) return;
+    /* ★ 这里**不调 `sync_open()`** —— 它不是线程安全的（判完 ready 才建
+       socket），而我们跑在 watch_thread 上，和游戏网络线程抢着建会漏一个
+       socket、还会把 `g_sync_sock` 覆盖掉。旁路是登录那一发开的，有票据
+       就一定已经开好了；真没开就这一发不发，下一轮再看。 */
+    if (!InterlockedCompareExchange(&g_sync_ready, 0, 0)) return;
+
+    n = sync_put_header(buf, SYNC_MSG_PRESENCE, 0);
+    memcpy(buf + n, &kb, 4);      n += 4;
+    memcpy(buf + n, &mouse, 4);   n += 4;
+    memcpy(buf + n, &sysidle, 4); n += 4;
+    buf[n++] = (unsigned char)(fg ? 1 : 0);
+    buf[n++] = 0;                 /* flags：留给以后，别复用 */
+    buf[n++] = 0; buf[n++] = 0;   /* 保留 u16 */
     sync_send_raw(buf, n);
 }
 
@@ -10027,6 +10256,22 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x61186D / 0x46FE01 特征对不上）");
     }
 
+    /* 在场证据的采样点（§62 / D53）。不赶时机 —— 窗口过程要等窗口建起来，
+       远晚于解壳窗口。装不上只是「服务端少一条证据」，不影响任何玩法，
+       所以和别的守护共用逃生门也没必要，单给一个 BSHOOK_NO_PRESENCE=1。 */
+    if (presence_disabled()) {
+        bslog("PATCH   BSHOOK_NO_PRESENCE 已设，不采集在场证据（挂机判定退回"
+              "只看服务端那几条）");
+    } else {
+        for (ticks = 0; !g_stop && !g_presence_patched && ticks < 2000; ticks++) {
+            if (try_patch_presence_input()) break;
+            Sleep(2);
+        }
+        if (!g_presence_patched)
+            bslog("PATCH   !! 超时未能 patch 在场证据采样"
+                  "（0x40EE1D 特征对不上）—— 服务端收不到键盘/前台那几条证据");
+    }
+
     /* NEXON 信使（§85 / D83）：默认**整个拆掉** —— 四格 IAT 全换成自己的桩，
        登录那一发我们自己连认证服。nmcogame 一次都不被调用 ⇒ nmconew.dll
        不加载 ⇒ NMService.exe 不起（铁律 5 到这里才真的落地）。
@@ -10277,7 +10522,15 @@ static DWORD WINAPI watch_thread(LPVOID param)
         poll_login_dialog();   /* V0.2：分区单选钮 + 注册链接（里程碑 H）*/
         poll_unpack();
         Sleep(100);
-        if (++ticks % 300 == 0) {
+        ++ticks;
+        /* ★ 在场证据（§62 / D53）：每 5 秒报一发。
+           这是**遥测采样**，不是判据 —— 判据（20 / 45 秒那两条线）在服务端，
+           5 秒只决定服务端看到的分辨率。铁律 10 管的是判据里的阈值，
+           不是「隔多久抄一次表」。前台一翻转会由 sync_send_presence 自己
+           打日志，所以这里不需要再加一条「变了就立刻发」的快路。 */
+        if (g_presence_patched && ticks % 50 == 0)
+            sync_send_presence();
+        if (ticks % 300 == 0) {
             SIZE_T commit = 0, reserve = 0, largest = 0;
             vm_snapshot(&commit, &reserve, &largest);
             bslog("--- still alive (%d s)；地址空间 已提交 %u MB / 已保留 %u MB"
