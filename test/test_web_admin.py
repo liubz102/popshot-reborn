@@ -1766,7 +1766,12 @@ class WeaponEndpointTests(_AdminCase):
         self.assertEqual(6, damage["reference"])           # 爆裂 3 的 Damage
         self.assertIsNone(damage["pve"])
         self.assertIsNone(damage["pvp"])
-        self.assertTrue(result["preview"].startswith(weaponcfg.PVP_ONLY_NOTE))
+        # 预览 = 游戏里大厅那一档（X10：商店页 / 仓库页画 PVE）
+        self.assertTrue(result["preview"].startswith(
+            weaponcfg.MODE_ONLY_NOTE[weaponcfg.MODE_PVE]))
+        # 两套的首行也要随这一发下去 —— 弹窗预览区每块的第一行就画它
+        self.assertEqual({m: weaponcfg.MODE_ONLY_NOTE[m] for m in weaponcfg.MODES},
+                         result["mode_notes"])
         # ★ 弹窗要画的两样「话」也得随这一发下去（页面上不写死，X7）：
         #   每格「0 代表…」的灰字，和追踪那条跨格判据的提示。
         self.assertEqual(weaponcfg.ZERO_MEANS.get("homing_angle"),
@@ -1786,7 +1791,7 @@ class WeaponEndpointTests(_AdminCase):
         status, result = self.request("/admin/api/weapon?id=%d" % self.ORIGINAL)
         self.assertEqual(200, status)
         self.assertFalse(result["custom"])
-        self.assertEqual("", result["pvp_only_note"])
+        self.assertEqual({}, result["mode_notes"])
         status, result = self.request("/admin/api/weapon",
                                       {"id": self.ORIGINAL, "params": {"pve": {}, "pvp": {"damage": 1}}})
         self.assertEqual(400, status)
@@ -1800,7 +1805,9 @@ class WeaponEndpointTests(_AdminCase):
         self.assertEqual(0, result["pushed"])               # 测试里没有游戏连接
         self.assertEqual(40, [f for f in result["fields"] if f["key"] == "damage"][0]["pve"])
         self.assertEqual(2, [f for f in result["fields"] if f["key"] == "damage"][0]["pvp"])
-        self.assertIn("伤害 2", result["preview"])
+        # 预览 = 大厅那一档（PVE）⇒ 画的是 40 那一套；PVP 的 2 在 `lines` 里看得到（X10）
+        self.assertIn("伤害 40", result["preview"])
+        self.assertIn("伤害 2", "\n".join(result["lines"]["pvp"]))
         self.assertEqual("说明", result["desc"])
         # 落盘了、serial 涨了；`/admin/api/item` 那条说明文也跟着变（catalog 已失效）
         table = weaponcfg.load(self.data_dir)

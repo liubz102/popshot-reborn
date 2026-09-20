@@ -2701,7 +2701,9 @@ class AdminRoutes:
         `HOOK_MODE_NONE`，bshook **只换表、不写内存** ⇒ 数值改动**下一局才生效**，
         不影响正在进行的那一局。（局内写内存会让准星和实际弹匣对不上：弹匣容量
         在进图时就快照进持枪器了，改记录追不回来。）
-        说明文那半边：商店提示框即时，**仓库提示框要重新登录客户端**才更新
+        说明文那半边：商店提示框即时；**自定义武器**的仓库提示框也即时
+        （X10 起由 bshook 在绘制点 `0x4554e7` 现取服务端推的 `0x0F02`），
+        原版武器的仓库提示框仍**要重新登录客户端**才更新
         （客户端缓存住了物品定义，packet_api §3.9）。
         """
         admin = self._require_editor()
@@ -2736,6 +2738,10 @@ class AdminRoutes:
         if gameserver is not None:
             pushed = gameserver.broadcast_hook_weapon_table(reason="（管理页保存）",
                                                             log=eventlog.online)
+            # ★ X10：数值 / 说明文变了 ⇒ 那 18 把自定义武器的仓库提示框文案也变了。
+            #   这一发让在线玩家**不用重登**就能看到新文案（bshook 在绘制点现取）。
+            gameserver.broadcast_hook_item_desc(reason="（管理页保存）",
+                                                log=eventlog.online)
         eventlog.online(f"[admin] {self._who(admin)} 改了物品 {item_id} 的"
                         f"{'自定义属性 / ' if params is not None else ''}说明文"
                         f"（serial={table['serial']}，推给 {pushed} 条在线连接）")
@@ -2749,7 +2755,11 @@ class AdminRoutes:
             message = ("已保存，并推给 %d 位在线玩家" % pushed) if pushed \
                 else "已保存（现在没有在线玩家，下次登录生效）"
         if str(data.get("desc") or ""):
-            message += "；说明文要重新登录客户端才会在仓库提示框里更新"
+            # ★ X10 起，自定义武器的仓库提示框由 bshook 在绘制点现取，**不用重登**；
+            #   原版武器仍受 ItemDB 缓存所限（§39），那一句还得留着。
+            message += ("；说明文即时生效（商店和仓库提示框都是）"
+                        if weaponcfg.is_custom(item_id)
+                        else "；说明文要重新登录客户端才会在仓库提示框里更新")
         view.update({"ok": True, "can_edit": True, "pushed": pushed,
                      "message": message})
         self._send_json(view)

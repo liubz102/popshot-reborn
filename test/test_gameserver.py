@@ -2929,7 +2929,9 @@ class CharacterUnlockTests(unittest.TestCase):
         conn.accounts = None
         gameserver.Conn.on_game_packet(conn, 0x0201, b"")
         opcodes = [take_frame(bytearray(f))[1] for f in conn.sent]
-        self.assertEqual([0x0201, OP_SESSION_MEMBERS, OP_SLOT_EQUIPPED_LIST],
+        # 末尾那一发是 X10 的 `0x0F02`（建房 = 模式定了，仓库说明文跟着换一套）
+        self.assertEqual([0x0201, OP_SESSION_MEMBERS, OP_SLOT_EQUIPPED_LIST,
+                          gameserver.OP_HOOK_ITEM_DESC],
                          opcodes)
 
     # -- 控制通道 -----------------------------------------------------------
@@ -5165,10 +5167,19 @@ class SendBatchTests(unittest.TestCase):
         request = (w_wstr("想和做朋友吗?") + w_wstr("") + w_wstr("")
                    + w_i32(0) + w_i32(2) + w_i32(3) + w_i32(1))
         gameserver.Conn.on_game_packet(conn, 0x0201, request)
-        self.assertEqual(1, len(self.writes(conn)))
+        # ★ 建房四连发是**第一次** sendall；X10 的 `0x0F02`（仓库说明文）挂在
+        #   `send_batch` 块**之外**，所以它是单独的第二次写 —— 挤进这一批
+        #   就等于把四连发拉长成五连发，同一条禁忌（§120）。
+        writes = self.writes(conn)
+        # ★ 判据落在**第一次写**上（那一批是 solo 的）。后面那发独立的 `send()`
+        #   占几次写取决于发送线程什么时候醒，不许断言（§166 / D125）。
+        self.assertGreaterEqual(len(writes), 2)
+        plain = self.decrypted(conn)        # 流密码，整串解完再按写的边界切
         self.assertEqual([OP_UPDATE_SESSION, 0x0201,
                           OP_SESSION_MEMBERS, OP_SLOT_EQUIPPED_LIST],
-                         self.frames_of(self.decrypted(conn)))
+                         self.frames_of(plain[:len(writes[0])]))
+        self.assertEqual([gameserver.OP_HOOK_ITEM_DESC],
+                         self.frames_of(plain[len(writes[0]):]))
 
     def test_returning_to_the_room_also_goes_out_in_one_write(self):
         # 结算看完回房间同样会重建 RoomStage，同一个竞态。

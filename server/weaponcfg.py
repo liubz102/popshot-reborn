@@ -123,8 +123,18 @@ FIELD_GROUPS = (
 )
 
 #: 提示框第 1 段的首行（用户 2026-09-19 原话；第二版缩短 —— 第一版「…PVE属性请看GM管理页：」
-#: 在 234 px 宽的框里折行）。自定义武器只画 PVP 那套数值。
-PVP_ONLY_NOTE = "仅显示PVP属性，PVE的请看管理页"
+#: 在 234 px 宽的框里折行）。提示框只有 5 行，两套数值装不下，所以一次只画一套。
+#:
+#: ★ 画哪一套按**玩家现在在哪**走（用户 2026-09-20，X10）：大厅的商店页 / 仓库页
+#: 模式还没定 ⇒ 画 PVE；待机房间里那个快速换装的仓库模式已经定了 ⇒ 画房间那一套。
+#: 判据在 `gameserver.Conn.weapon_desc_mode()`，文案由服务端算好推给 bshook（`0x0F02`）。
+#:
+#: ★★ 两句**字数必须相同**（各 18 个字）—— 它占掉 5 行预算里的 1 行，长度一变
+#: 「排不下才让飞行速度让位」的结论就跟着变。`test_weaponcfg` 钉着这一条。
+MODE_ONLY_NOTE = {
+    MODE_PVE: "仅显示PVE属性，PVP的请看管理页",
+    MODE_PVP: "仅显示PVP属性，PVE的请看管理页",
+}
 
 #: 说明文的上限：提示框第 2 段只有 3 行、232 px 宽（`shopcfg.ITEM_DESC_MAX_LINES_2`）。
 DESC_MAX_LINES = shopcfg.ITEM_DESC_MAX_LINES_2
@@ -463,6 +473,70 @@ RECORD_SIZE = 4 + 2 * (4 + 4 * len(FIELDS))
 HEADER_SIZE = 9
 
 
+# ---------------------------------------------------------------------------
+# 0x0F02 —— 推给 bshook 的「仓库提示框说明文表」（X10）
+# ---------------------------------------------------------------------------
+#
+# 为什么要这一发：仓库提示框的文字来自 `ItemInfo+0x18`，而客户端把 `ItemInfo`
+# 缓存在全局 ItemDB `[0x72e1dc]` 里，**插入遇重复 key 直接忽略**（§39）⇒ 重发
+# `0x0501` 刷不掉。所以「同一件武器在大厅画 PVE、在对战房画 PVP」服务端单独
+# 做不到，得由 bshook 在**绘制点**换字符串（§52 / D45）。文案仍旧全在这边算，
+# hook 那侧一个字都不拼。
+
+#: `0x0F02` 载荷的格式号。改布局就 +1，hook 侧 `IDESC_FORMAT` 同步。
+DESC_WIRE_FORMAT = 1
+
+#: 载荷头的字节数（`u16 format + u32 serial + u8 上下文 + u16 条数`）。
+#: hook 侧 `IDESC_HEADER_BYTES` 同步。
+DESC_HEADER_SIZE = 9
+
+#: 头里那一格「上下文」。★ 它**只进日志**（「按【对战】换了 18 条」）——
+#: 真正决定画什么的是每条记录里的文本本身，hook 不拿它做任何分支。
+DESC_CTX = {MODE_PVE: 0, MODE_PVP: 1}
+
+
+def build_desc_frame(mode=MODE_PVE, table=None, data_dir=None):
+    """`0x0F02` 的载荷：`u16 format, u32 serial, u8 上下文, u16 n, n × { i32 物品id, u16 字数, UTF-16LE }`。
+
+    ★★ **key 是物品 id，不是 `0x0F01` 那个武器 Id** —— ItemDB 的 key 是
+    `ItemInfo+4` = 物品 id（`X92000S` / `X93000S`）；`0x0F01` 发的是 `item.ammo_id`
+    （要按它查客户端武器表）。记混了的症状是「一条都匹配不上、提示框一个字没变」，
+    离线看不出来，所以 `test_itemdesc` 两边各钉了一条。
+
+    文本和 `0x0501` 走**同一个**拼装 + 转义（`item_desc_zh` → `shop.desc_wire`），
+    保证 hook 换上去的和服务端本来会发的逐字节同源。
+    """
+    import shop  # 函数内 import：`shop` 顶层 import `shopcfg`，别绕成环
+    if table is None:
+        table = load(data_dir)
+    records = []
+    for item_id in custom_item_ids():
+        item = shopdata.get(item_id)
+        if item is None:
+            continue
+        text = shop.desc_wire(shopcfg.item_desc_zh(item, weapons_table=table, mode=mode))
+        records.append(struct.pack("<i", int(item_id)) + shop.w_wstr(text))
+    return (struct.pack("<HIBH", DESC_WIRE_FORMAT, int(table.get("serial", 0)),
+                        DESC_CTX[mode], len(records))
+            + b"".join(records))
+
+
+def parse_desc_frame(payload):
+    """`build_desc_frame` 的逆（测试和日志用）→ `(format, serial, 上下文, [(物品id, 文本)])`。"""
+    fmt, serial, ctx, count = struct.unpack_from("<HIBH", payload, 0)
+    off = DESC_HEADER_SIZE
+    out = []
+    for _ in range(count):
+        item_id = struct.unpack_from("<i", payload, off)[0]
+        cch = struct.unpack_from("<H", payload, off + 4)[0]
+        off += 6
+        out.append((item_id, payload[off:off + cch * 2].decode("utf-16le")))
+        off += cch * 2
+    if off != len(payload):
+        raise ValueError("0x0F02 载荷长度不对：解到 %d，共 %d" % (off, len(payload)))
+    return fmt, serial, ctx, out
+
+
 def parse_hook_frame(payload):
     """`build_hook_frame` 的逆（测试和日志用）→ `(format, serial, 模式, [(武器Id, {mode: {字段: 值}})])`。"""
     fmt, serial, count, hook_mode = struct.unpack_from("<HIHB", payload, 0)
@@ -560,9 +634,12 @@ def admin_view(item_id, table=None, data_dir=None):
         # ★ 跨格判据（追踪）：规则那两行判断前后台各写一份，**话只有这一份**。
         "homing_rule": {"angle": "homing_angle", "range": "homing_range",
                         "message": HOMING_RULE_MESSAGE},
-        "pvp_only_note": PVP_ONLY_NOTE if item.custom else "",
+        # ★ 每套的首行提示（X10）：游戏里画哪一套，首行就是哪一句。
+        "mode_notes": {mode: MODE_ONLY_NOTE[mode] for mode in MODES} if item.custom else {},
         "preview": shopcfg.item_desc_zh(item, weapons_table=table),
-        # ★ 两套数值行分开给（用户 2026-09-19）：弹窗里 PVP / PVE 各画一块，游戏内那段只有 PVP。
+        # ★ 两套数值行分开给（用户 2026-09-19）：弹窗里 PVE / PVP 各画一块；
+        #   游戏内那段一次只画一套 —— 大厅（商店页 / 仓库页）画 PVE，
+        #   待机房间里的快速换装仓库画该房间的模式（X10）。
         "lines": {mode: mode_lines(item, mode, table) for mode in MODES} if item.custom else {},
         "serial": int(table.get("serial", 0)),
     }

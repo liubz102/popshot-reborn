@@ -8626,7 +8626,13 @@ static void wtab_apply_if_main_thread(void)
     wtab_apply(wtab_current_mode(), "主线程补写");
 }
 
-/* 收到一帧 0xFF：是 0x0F01 就解析 + 存表，返回 1 = 吞掉；其余返回 0 交给原分发。 */
+/* 0x0F02「仓库提示框说明文表」（X10）和 0x0F01 共用这个收包入口；
+   解析、存表和绘制点补丁都在下面「仓库提示框的说明文」那一整段里。 */
+#define WDESC_OPCODE        0x0F02
+static int wdesc_on_frame(const unsigned char *frame);
+
+/* 收到一帧 0xFF：是我们自造的 opcode 就解析 + 存表，返回 1 = 吞掉；
+   其余返回 0 交给原分发。 */
 static int __cdecl wtab_on_frame(void *pkt)
 {
     const unsigned char *frame;
@@ -8639,6 +8645,7 @@ static int __cdecl wtab_on_frame(void *pkt)
     if (!frame || IsBadReadPtr(frame, 10)) return 0;
     if (frame[0] != 0xFF) return 0;
     opcode = *(const unsigned short *)(frame + 8);
+    if (opcode == WDESC_OPCODE) return wdesc_on_frame(frame);   /* 仓库说明文（X10）*/
     if (opcode != WTAB_OPCODE) return 0;
 
     len = *(const unsigned short *)(frame + 2);
@@ -8839,6 +8846,259 @@ static int try_install_weapon_table_hooks(void)
           "关卡合并返回点 @ %08X%s，查表 @ %08X）",
           WTAB_DISPATCH_VA, WTAB_LOAD_VA, WTAB_MERGE_VA,
           s_wtab_merge ? "" : "（没装上！）", WTAB_LOOKUP_VA);
+    return 1;
+}
+
+/* ========================================================================== */
+/* 仓库提示框的说明文：按「玩家现在在哪」换那一套（X_Mod · X10，§52 / D45）    */
+/*                                                                            */
+/* 18 把自定义武器的数值分 PVE / PVP 两套，而提示框第 1 段只有 5 行、装不下     */
+/* 两套 ⇒ 一次只画一套。画哪一套按场景走（用户 2026-09-20）：                  */
+/*   · 大厅的商店页 / 仓库页 —— 这一局是闯关还是对战**还没定** ⇒ 画 PVE；      */
+/*   · 待机房间里那个快速换装的仓库 —— 模式已经由房间定死 ⇒ 画房间那一套。     */
+/*                                                                            */
+/* 为什么非得动客户端：仓库提示框的文字来自 `ItemInfo+0x18`，而 `ItemInfo` 被   */
+/* 客户端缓存在全局 ItemDB `[0x72e1dc]` 里，**插入遇重复 key 直接忽略**         */
+/* （`0x415cff`，§39）⇒ 服务端重发 `0x0501` 刷不掉。所以只能在**绘制的那一瞬间**  */
+/* 把字符串换掉。                                                             */
+/*                                                                            */
+/* 客户端那边（本轮逆的，§52）：                                               */
+/*   · `UiCabinetToolTip`（vft `0x6681ec`）**一个类通吃三处** —— 构造函数       */
+/*     `0x454572` 全镜像只有 3 个调用点：`0x44d2a2` 商店页里的仓库格、          */
+/*     `0x453be4` 大厅仓库页、`0x46ee58` **待机房间的快速换装背包**（它所在的   */
+/*     函数同时在建「교체완료 / 换装完成」那个按钮）⇒ 一处补丁全覆盖。         */
+/*   · 刷新文字的是 vft 槽 1 = `0x454dd5`；`ebx` 在 `0x454de3` 一次 `mov ebx,ecx`  */
+/*     之后全程不变 = `this`，`[this+0xd0]` 是 `ItemInfo*`（`0x454b15` 拿        */
+/*     `CabinetItem+4` 当 key 调 ItemDB 查表 `0x415a94` 存进去的），             */
+/*     函数入口 `0x454df5` 已经判过它非空。                                    */
+/*   · 补丁点 `0x4554e7`：`mov eax,[ebx+0xd0] / add eax,0x18`，紧跟着           */
+/*     `push L"|" / push eax / lea eax,[ebp-0x38] / push eax / call 0x5d5789`   */
+/*     —— 那个切分函数对第 2 个参数**只做一次** `mov eax,[arg2]; mov eax,[eax]`  */
+/*     取出 `wchar_t*`（`0x5d57c3`），随即 `wcsncpy` 进 1000 wchar 的栈缓冲。   */
+/*     ⇒ **替身只要是「首 dword 指向我们自己那串 UTF-16」的地址**就行，         */
+/*     不用构造字符串类、不碰堆所有权（游戏的 CRT 和我们的不是同一个堆）。     */
+/*   · `eax` 的活期只有一条指令（`0x4554f5 push eax`，下一条就被 `lea` 覆盖），  */
+/*     标志位从 `0x4554f0` 起没人读 ⇒ 换成 `call` 出去再回来是安全的。          */
+/*                                                                            */
+/* ⚠⚠ **同样的 9 字节还在 `0x45ff1b`** —— 那是 `UiCompositionToolTip`（合成    */
+/* 提示框，只在大厅）。**那处不打**，所以这里按「固定 VA + 字节签名」双重校验，  */
+/* **绝不按签名全图搜**。`test_patchsites_desc` 钉着这一条。                    */
+/*                                                                            */
+/* 文案全部由服务端算好整段推下来（gsp `0x0F02`），本文件一个字都不拼：         */
+/*   u16 format=1 · u32 serial · u8 模式 · u16 n                               */
+/*   n × { i32 **物品 id**（= `ItemInfo+4`，★不是 0x0F01 那个武器 Id）         */
+/*        · u16 字数 · 字数 × u16 UTF-16LE }                                   */
+/* 文本已经过服务端的 `desc_wire()`：段分隔是 `|`，段内换行是**字面** `\` + `n`。 */
+/*                                                                            */
+/* 逃生门：BSHOOK_KEEP_CABINET_DESC=1 —— 不装这个补丁（包照吞、照记日志），     */
+/*         仓库提示框回到「画 0x0501 发下来的那一套」，房间里也不换。          */
+/* ========================================================================== */
+/* WDESC_OPCODE 在上面 `wtab_on_frame` 之前就定义了（那儿要按它分流）。 */
+#define WDESC_FORMAT        1
+#define WDESC_MAX           32         /* 现在 18 把，同 WTAB_MAX 留一倍余量 */
+#define WDESC_TEXT_MAX      384        /* wchar，含结尾 NUL。实测最长 124，
+                                          顶格的自定义说明文（90 字 + 记号）最坏 ~250 */
+#define WDESC_HEADER_BYTES  9          /* u16 格式 + u32 序号 + u8 模式 + u16 条数 */
+#define WDESC_SITE_VA       0x004554e7u
+#define WDESC_SITE_LEN      9          /* E8 rel32 + 4 × NOP，正好两条原指令 */
+#define WDESC_SITE_OTHER    0x0045ff1bu /* 同签名的另一处 = 合成提示框，**不打** */
+/* 0x4554e7: `mov eax,[ebx+0xd0]` + `add eax,0x18` */
+static const unsigned char WDESC_SITE_SIG[WDESC_SITE_LEN] = {
+    0x8b, 0x83, 0xd0, 0x00, 0x00, 0x00,     /* mov eax, [ebx+0xd0] */
+    0x83, 0xc0, 0x18                        /* add eax, 0x18       */
+};
+
+typedef struct {
+    const wchar_t *box;                 /* ★ 替身本体：首 dword 指向 text */
+    int            id;                  /* 物品 id（ItemInfo+4 = ItemDB 的 key）*/
+    wchar_t        text[WDESC_TEXT_MAX];
+} wdesc_rec_t;
+
+typedef struct {
+    unsigned    serial;
+    int         mode;                   /* WTAB_MODE_PVE / PVP，只进日志 */
+    int         n;
+    wdesc_rec_t rec[WDESC_MAX];
+} wdesc_table_t;
+
+/* ★ 单独一把锁，**不和 `g_wtab_cs` 共用**：绘制函数悬停时每帧都跑，而
+   `wtab_apply` 会在 `g_wtab_cs` 里做 `IsBadWritePtr` 扫描 —— 共用就是拿 UI
+   线程去排那个队。这把锁里只做「≤32 次 int 比较 + 一次 ≤384 wchar 的拷贝」。 */
+static CRITICAL_SECTION g_wdesc_cs;          /* 在 DllMain 里初始化，见文件末尾 */
+static wdesc_table_t    g_wdesc;            /* 正在用的（读写都在锁里）*/
+static wdesc_table_t    g_wdesc_stage;      /* 解析暂存：只有收包线程碰。
+                                               ★ 不放栈上 —— 一个 25 KB 的帧太肥 */
+static volatile LONG    g_wdesc_have = 0;
+static volatile LONG    g_wdesc_patched = 0;
+/* 绘制线程用的抄写缓冲：在锁里抄一份出来再返回，这样 `0x5d5789` 在锁外读的
+   那块内存不会被收包线程改到一半。UI 只有一条线程，一份就够。 */
+static wchar_t          g_wdesc_scratch[WDESC_TEXT_MAX];
+static const wchar_t   *g_wdesc_scratch_box = g_wdesc_scratch;
+/* 日志按 (物品 id, 模式) **翻转**去重 —— 这个函数悬停时每帧都跑，
+   不上闩就是刷屏（全局规范：按状态翻转去重，不按次数/时间窗）。 */
+static int              g_wdesc_said_mode = -1;
+
+static int cabinet_desc_keep_original(void)
+{
+    /* 设了才是「保留原版」（和别的 KEEP_* 同一套语义）。 */
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_CABINET_DESC", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+/* 收到一帧 0x0F02：解析 + 存表。返回 1 = 吞掉（这个 opcode 只有我们认识）。 */
+static int wdesc_on_frame(const unsigned char *frame)
+{
+    unsigned len, fmt, serial, n, mode, i;
+    const unsigned char *p, *end;
+
+    len = *(const unsigned short *)(frame + 2);
+    p = frame + 10;
+    end = p + len;
+    if (len < WDESC_HEADER_BYTES || IsBadReadPtr(p, len)) {
+        bslog("WDESC   !! 0x0F02 载荷太短（%u），丢弃", len);
+        return 1;
+    }
+    fmt = *(const unsigned short *)(p + 0);
+    serial = *(const unsigned *)(p + 2);
+    mode = *(const unsigned char *)(p + 6);
+    n = *(const unsigned short *)(p + 7);
+    if (fmt != WDESC_FORMAT || n > WDESC_MAX) {
+        bslog("WDESC   !! 0x0F02 格式对不上（format=%u n=%u len=%u），丢弃", fmt, n, len);
+        return 1;
+    }
+    memset(&g_wdesc_stage, 0, sizeof(g_wdesc_stage));
+    g_wdesc_stage.serial = serial;
+    g_wdesc_stage.mode = (int)mode;
+    g_wdesc_stage.n = (int)n;
+    p += WDESC_HEADER_BYTES;
+    for (i = 0; i < n; i++) {
+        unsigned cch, keep;
+        if ((unsigned)(end - p) < 6) {
+            bslog("WDESC   !! 0x0F02 第 %u 条的头越界，整份丢弃", i);
+            return 1;
+        }
+        g_wdesc_stage.rec[i].id = *(const int *)p;
+        cch = *(const unsigned short *)(p + 4);
+        p += 6;
+        if ((unsigned)(end - p) < cch * 2) {
+            bslog("WDESC   !! 0x0F02 第 %u 条的正文越界（cch=%u），整份丢弃", i, cch);
+            return 1;
+        }
+        /* ★ 超长只**截断**、不丢弃：丢弃会退回 ItemDB 里那一套（可能是另一个
+           模式），玩家看到的是「模式串了」；截断只是少一截字，模式仍是对的。 */
+        keep = cch < WDESC_TEXT_MAX ? cch : WDESC_TEXT_MAX - 1;
+        if (keep != cch)
+            bslog("WDESC   !! 第 %u 条（id=%d）文案 %u 字超过上限 %u，截断",
+                  i, g_wdesc_stage.rec[i].id, cch, (unsigned)(WDESC_TEXT_MAX - 1));
+        memcpy(g_wdesc_stage.rec[i].text, p, keep * 2);
+        g_wdesc_stage.rec[i].text[keep] = 0;
+        g_wdesc_stage.rec[i].box = g_wdesc_stage.rec[i].text;
+        p += cch * 2;
+    }
+    if (p != end) {
+        bslog("WDESC   !! 0x0F02 长度对不上（解到 %u / 共 %u），整份丢弃",
+              (unsigned)(p - (frame + 10)), len);
+        return 1;
+    }
+    EnterCriticalSection(&g_wdesc_cs);
+    g_wdesc = g_wdesc_stage;
+    for (i = 0; i < n; i++)                   /* ★ 结构体整体赋值之后 box 还指着
+                                                 `g_wdesc_stage` 里的 text，要重指 */
+        g_wdesc.rec[i].box = g_wdesc.rec[i].text;
+    LeaveCriticalSection(&g_wdesc_cs);
+    InterlockedExchange(&g_wdesc_have, 1);
+    bslog("WDESC   收到仓库说明文表 v%u：%u 条，按【%s】那一套"
+          "（%s）", serial, n,
+          mode == WTAB_MODE_PVE ? "任务" : (mode == WTAB_MODE_PVP ? "对战" : "?"),
+          g_wdesc_patched ? "补丁已装，下次悬停就是新的" : "⚠ 补丁没装上，不会生效");
+    return 1;
+}
+
+/* 返回「要画的那个字符串对象」的地址：命中替换表就给替身，否则原样给
+   `ItemInfo+0x18`。★ 返回值 4 条指令之后就被 `0x5d5789` 抄进它自己的栈缓冲
+   （中间没有任何 call），所以一份 scratch 够用。 */
+static const void * __cdecl cabinet_desc_pick(unsigned char *self)
+{
+    unsigned char *info = *(unsigned char **)(self + 0xd0);
+    int id, i, mode = -1, hit = 0;
+
+    /* `info == NULL` 时原样返回 `0x18`，和被换掉的那两条指令一个语义
+       （实际到不了这儿：`0x454df5` 已经判过非空）。 */
+    if (info == NULL || !g_wdesc_have) return (const void *)(info + 0x18);
+    id = *(const int *)(info + 4);            /* ItemInfo+0x04 = 物品 id */
+    EnterCriticalSection(&g_wdesc_cs);
+    for (i = 0; i < g_wdesc.n; i++) {
+        if (g_wdesc.rec[i].id != id) continue;
+        wcsncpy(g_wdesc_scratch, g_wdesc.rec[i].text, WDESC_TEXT_MAX - 1);
+        g_wdesc_scratch[WDESC_TEXT_MAX - 1] = 0;
+        mode = g_wdesc.mode;
+        hit = 1;
+        break;
+    }
+    LeaveCriticalSection(&g_wdesc_cs);
+    if (!hit) return (const void *)(info + 0x18);
+    /* ★ 闩只看**模式**，不看 id：看 id 的话，鼠标在两个格子之间来回扫就会
+       一条一条地刷（那是「按次数」去重的变种）。模式翻转才是真的状态变化，
+       第一个被换掉的物品顺带报个 id 当样本。 */
+    if (g_wdesc_said_mode != mode) {
+        g_wdesc_said_mode = mode;
+        bslog("WDESC   仓库提示框换成【%s】那一套（样本 id=%d）",
+              mode == WTAB_MODE_PVE ? "任务" : "对战", id);
+    }
+    return (const void *)&g_wdesc_scratch_box;
+}
+
+/* `0x4554e7` 的 9 字节被换成 `call 这里` + 4 × NOP，`ret` 之后接着跑那 4 个
+   NOP 再到 `0x4554f0`。
+   ★ 返回值必须落在 **eax** —— `0x4554f5 push eax` 是它唯一的消费点。
+   ★ 要保 ecx / edx：被换掉的那两条指令不碰它们，而 C 函数会。ebx/esi/edi/ebp
+     由编译器按调用约定自己保。标志位可证明是死的（`0x4554f0` 起没人读）。 */
+static __declspec(naked) void cabinet_desc_thunk(void)
+{
+    __asm {
+        push ecx
+        push edx
+        push ebx                        /* 参数：this（ItemInfo 在 [this+0xd0]）*/
+        call cabinet_desc_pick
+        add  esp, 4
+        pop  edx
+        pop  ecx
+        ret
+    }
+}
+
+static int try_patch_cabinet_desc(void)
+{
+    unsigned char *p = (unsigned char *)WDESC_SITE_VA;
+    DWORD oldp;
+
+    if (g_wdesc_patched) return 1;
+    if (IsBadReadPtr(p, WDESC_SITE_LEN)) return 0;
+    /* 幂等：已打过就是「E8 <到 thunk 的 rel32> + 4 × 90」 */
+    if (p[0] == 0xE8
+        && (DWORD)(*(int *)(p + 1))
+               == (DWORD)((UINT_PTR)&cabinet_desc_thunk - (UINT_PTR)(p + 5))) {
+        InterlockedExchange(&g_wdesc_patched, 1);
+        return 1;
+    }
+    if (memcmp(p, WDESC_SITE_SIG, WDESC_SITE_LEN) != 0)
+        return 0;                    /* 还没解壳到这里，或不是已确认的版本 */
+
+    if (!VirtualProtect(p, WDESC_SITE_LEN, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   仓库提示框说明文: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    p[0] = 0xE8;
+    *(DWORD *)(p + 1) = (DWORD)((UINT_PTR)&cabinet_desc_thunk - (UINT_PTR)(p + 5));
+    p[5] = p[6] = p[7] = p[8] = 0x90;
+    VirtualProtect(p, WDESC_SITE_LEN, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, WDESC_SITE_LEN);
+    InterlockedExchange(&g_wdesc_patched, 1);
+    bslog("PATCH   ★仓库提示框说明文 @ %08X：按物品 id 换成服务端 0x0F02 推的那一套"
+          "（大厅 = 任务，待机房间 = 该房间的模式）；合成提示框 @ %08X 同签名，不打",
+          (unsigned)WDESC_SITE_VA, (unsigned)WDESC_SITE_OTHER);
     return 1;
 }
 
@@ -9324,6 +9584,22 @@ static DWORD WINAPI patch_thread(LPVOID param)
         bslog("PATCH   !! 超时未能装自定义武器表钩子"
               "（0x54e036 / 0x48b50d / 0x4157bf 的特征串一直对不上）—— 9 把自定义武器只有资源包里的数值");
 
+    /* ★ 仓库提示框说明文（X10，§52）：功能补丁。目标函数只在悬停物品格时跑，
+       远晚于解壳窗口。装不上只是「房间里的仓库提示框仍画大厅那一套（任务属性）」，
+       不崩、不影响别的 —— 所以超时只记一行，不重试到天荒地老。 */
+    if (cabinet_desc_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_CABINET_DESC 已设，仓库提示框保留原版行为"
+              "（画 0x0501 发下来的那一套，待机房间里也不跟着房间模式换）");
+    } else {
+        for (ticks = 0; !g_stop && !g_wdesc_patched && ticks < 2000; ticks++) {
+            if (try_patch_cabinet_desc()) break;
+            Sleep(2);
+        }
+        if (!g_wdesc_patched)
+            bslog("PATCH   !! 超时未能 patch 仓库提示框说明文"
+                  "（0x004554E7 的特征串一直对不上）—— 房间里的仓库提示框仍画大厅那一套");
+    }
+
     /* ★ 准星弹格（X4，§43）：功能补丁，一直装。目标函数只在战斗里画准星时跑，
        远晚于解壳窗口。装不上只是「非 6 个原版容量的武器外圈没格子」，不影响别的。 */
     if (aim_ring_keep_original()) {
@@ -9611,6 +9887,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         DisableThreadLibraryCalls(inst);
         InitializeCriticalSection(&g_cs);
         InitializeCriticalSection(&g_notice_cs);   /* 登录公告的两个触发点串这一把 */
+        InitializeCriticalSection(&g_wdesc_cs);    /* 仓库说明文：收包线程 ⇄ 绘制线程（X10）*/
         g_main_thread_id = GetCurrentThreadId(); /* LoadLibrary APC 正在这条主线程上执行 */
         g_dllmain_tick = GetTickCount();
         read_log_level();

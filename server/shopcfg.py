@@ -1448,7 +1448,8 @@ def _card_desc_lines(item, card_rules, recipes_table):
     return stats, notes
 
 
-def item_desc_zh(item, card_rules=_AUTO, recipes_table=_AUTO, weapons_table=None):
+def item_desc_zh(item, card_rules=_AUTO, recipes_table=_AUTO, weapons_table=None,
+                 mode=None):
     """物品说明。**从本地数据现算**，原版那份说明随服务端 DB 一起没了。
 
     ⚠ 这不是「发明玩法」（铁律 12）—— 里面每个数都是客户端**自己也查得到**
@@ -1467,7 +1468,12 @@ def item_desc_zh(item, card_rules=_AUTO, recipes_table=_AUTO, weapons_table=None
     第 1 段写**获得条件**、第 2 段写**能合成什么称号** —— 两句都来自运营配置，
     所以改完保存即刻生效。⚠ 已经在线的玩家要**重新登录**才看得到新说明：
     客户端把物品定义缓存住了（「发过就记成已请求，不回就再也不问了」，
-    packet_api §3.9）。
+    packet_api §3.9）。★ **自定义武器不受这条限制**（X10）：它那 18 条的说明文
+    由 bshook 在绘制点现换（`0x0F02`），管理页保存后即时生效。
+
+    `mode` = 自定义武器的数值行画哪一套（`weaponcfg.MODE_PVE` / `MODE_PVP`）。
+    **缺省是 PVE** —— 那是大厅的口径（商店页 / 仓库页 / 合成 / 礼物盒此刻还不知道
+    这局是闯关还是对战）。房间里那一套由 `0x0F02` 另发，不走这个缺省。
     """
     if item is None:
         return ""
@@ -1477,15 +1483,17 @@ def item_desc_zh(item, card_rules=_AUTO, recipes_table=_AUTO, weapons_table=None
         weapon = item.weapon
         if item.kind == "weapon":
             # ★ X3：武器的第 2 段可以由管理页配置（`weaponcfg`，任何武器）；
-            #   自定义武器的数值行画的是**对战（PVP）那一套有效值**，并在第 1 段
-            #   首行加一句「仅显示PVP属性…」（用户 2026-09-19，提示框装不下两套）。
+            #   自定义武器的数值行**一次只画一套**（提示框装不下两套），并在第 1 段
+            #   首行写清是哪一套（用户 2026-09-19 定文案，2026-09-20 改成按场景切）。
             #   `import` 写在函数里：`weaponcfg` 顶层 `import shopcfg`，别绕成环。
             import weaponcfg
             if weapons_table is None:
                 weapons_table = weaponcfg.load()
             if getattr(item, "custom", False):
-                weapon = weaponcfg.effective_weapon_dict(item, weaponcfg.MODE_PVP, weapons_table)
-                stats.append(weaponcfg.PVP_ONLY_NOTE)
+                if mode is None:
+                    mode = weaponcfg.MODE_PVE
+                weapon = weaponcfg.effective_weapon_dict(item, mode, weapons_table)
+                stats.append(weaponcfg.MODE_ONLY_NOTE[mode])
             custom_desc = weaponcfg.desc_of(item.id, weapons_table)
             if custom_desc:
                 notes = custom_desc.split("\n")

@@ -26,7 +26,7 @@ import gameserver                                              # noqa: E402
 from gameserver import (                                       # noqa: E402
     CHAT_NO_SEAT, OP_CHAT, OP_LEAVE_SESSION, OP_LIST_SESSION,
     OP_COUNT_GAME_READY, OP_LOADING_DONE,
-    OP_HOOK_WEAPON_TABLE,
+    OP_HOOK_WEAPON_TABLE, OP_HOOK_ITEM_DESC,
     OP_JOIN_RELAY, OP_LEAVE_RELAY, OP_START_TCP_RELAY,
     OP_MOVE_INTO_SESSION, OP_PEER_DATA_DOWN, OP_PEER_DATA_UP,
     OP_REQ_USER_LIST, OP_REP_USER_LIST,
@@ -461,11 +461,12 @@ class JoinFlowTests(LobbyIsolated):
         #   所以 Alice 一发 + Bob 自己一发。少发 Alice 那一发的话，Bob 眼里的
         #   Alice 就是没穿装备的样子。
         # 末尾那发 0x0410 是「房里够两个人了，玩家间同步开」（§150），
-        # 必须排在这一串**之后**。
+        # 必须排在这一串**之后**。再后面那发 0x0F02 是 X10 的仓库说明文
+        # （进房 = 模式定了），同样只许排在四连发**之后**。
         self.assertEqual([OP_UPDATE_SESSION, OP_MOVE_INTO_SESSION,
                           OP_SESSION_MEMBERS,
                           OP_SLOT_EQUIPPED_LIST, OP_SLOT_EQUIPPED_LIST,
-                          OP_TOGGLE_PEER_RELAY],
+                          OP_TOGGLE_PEER_RELAY, OP_HOOK_ITEM_DESC],
                          opcodes(self.bob))
 
     def test_join_ships_one_equipped_list_per_occupied_seat(self):
@@ -575,7 +576,7 @@ class JoinFlowTests(LobbyIsolated):
         self.assertEqual([OP_UPDATE_SESSION, OP_MOVE_INTO_SESSION,
                           OP_SESSION_MEMBERS,
                           OP_SLOT_EQUIPPED_LIST, OP_SLOT_EQUIPPED_LIST,
-                          OP_TOGGLE_PEER_RELAY],
+                          OP_TOGGLE_PEER_RELAY, OP_HOOK_ITEM_DESC],
                          opcodes(self.bob))
         self.assertIs(self.room, self.lobby.room_of(self.bob))
 
@@ -620,9 +621,11 @@ class JoinBatchTests(LobbyIsolated):
         # ★ D108：写发生在 bob 自己那条发送线程上，先排空再数。
         drain(self, bob)
         # 被客户端的 recv 切开会让「人物选择」缩回 3 个头像，这一局回不来。
-        # ★ 后面那发 0x0410（玩家间同步开关）是**单独一次** sendall ——
-        #   挤进这一批就等于把四连发拉长成五连发，同一条禁忌。
-        self.assertEqual(2, len(bob.sock.writes))
+        # ★ 判据只落在**第一次写**上：那一批是 `solo` 的，发送线程不许往里并别的包。
+        #   后面那两发（0x0410 玩家间同步开关、X10 的 0x0F02 仓库说明文）都是
+        #   **独立**的 `send()` —— 它俩会不会被并成一次写取决于发送线程什么时候醒，
+        #   那是刻意换来的（§166 / D125），所以这里**不许**断言它们各占一次写。
+        self.assertGreaterEqual(len(bob.sock.writes), 2)
         cipher = SimpleCipher.server_to_client()
         plain = cipher.decrypt(bob.sock.writes[0])
         # ★ 房里已有 Alice ⇒ `0x030b` 两发（一格一发，§63），全在同一批里。
@@ -630,9 +633,116 @@ class JoinBatchTests(LobbyIsolated):
                           OP_SESSION_MEMBERS,
                           OP_SLOT_EQUIPPED_LIST, OP_SLOT_EQUIPPED_LIST],
                          [op for _, op, _ in frames(plain)])
-        self.assertEqual([OP_TOGGLE_PEER_RELAY],
-                         [op for _, op, _ in
-                          frames(cipher.decrypt(bob.sock.writes[1]))])
+        rest = cipher.decrypt(b"".join(bob.sock.writes[1:]))
+        self.assertEqual([OP_TOGGLE_PEER_RELAY, OP_HOOK_ITEM_DESC],
+                         [op for _, op, _ in frames(rest)])
+
+
+class ItemDescPushTests(LobbyIsolated):
+    """`0x0F02` 仓库说明文的下发时机（X_Mod · X10）。
+
+    游戏里那个提示框一次只画一套数值，画哪一套按**玩家现在在哪**走：
+    大厅（商店页 / 仓库页）= PVE，待机房间 = 该房间的模式。
+    客户端的 ItemDB 把说明文缓存死了（重发 `0x0501` 刷不掉，§39），
+    所以由服务端在**场景翻转**的那一刻推一份现成文案给 bshook。
+
+    这里钉的是「哪些时刻发、发的是哪一套」，以及**内容没变就不发**
+    （`Conn.hook_desc_key` 那个按状态翻转的闩）。
+    """
+
+    def ctx_of(self, conn):
+        """这条连接收到的全部 `0x0F02` 的上下文字节（按发送顺序）。"""
+        import weaponcfg
+        out = []
+        for blob in conn.sent:
+            for _, op, payload in frames(blob):
+                if op == OP_HOOK_ITEM_DESC:
+                    _fmt, _serial, ctx, _recs = weaponcfg.parse_desc_frame(payload)
+                    out.append(ctx)
+        return out
+
+    def test_creating_a_battle_room_switches_to_pvp(self):
+        import weaponcfg
+        alice = make_conn("alice")
+        gameserver.Conn.on_game_packet(alice, 0x0201,
+                                       create_session_payload(session_type=1,
+                                                              arguments=(1, 3, 0)))
+        self.assertEqual([weaponcfg.DESC_CTX[weaponcfg.MODE_PVP]], self.ctx_of(alice))
+
+    def test_creating_a_quest_room_stays_on_pve(self):
+        """闯关房和大厅是同一套（PVE）—— 内容一样，**第一发**照旧要发
+        （新连接手上还没有任何一份），但不会再发第二遍。"""
+        import weaponcfg
+        alice = make_conn("alice")
+        gameserver.Conn.on_game_packet(alice, 0x0201,
+                                       create_session_payload(session_type=2))
+        self.assertEqual([weaponcfg.DESC_CTX[weaponcfg.MODE_PVE]], self.ctx_of(alice))
+
+    def test_joining_a_battle_room_and_leaving_it_again(self):
+        import weaponcfg
+        alice = make_conn("alice")
+        gameserver.Conn.on_game_packet(alice, 0x0201,
+                                       create_session_payload(session_type=1,
+                                                              arguments=(1, 3, 0)))
+        room = self.lobby.room_of(alice)
+        bob = make_conn("bob")
+        gameserver.Conn.on_game_packet(bob, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(room.room_id))
+        self.assertEqual([weaponcfg.DESC_CTX[weaponcfg.MODE_PVP]], self.ctx_of(bob))
+        bob.sent.clear()
+        gameserver.Conn.on_game_packet(bob, OP_LEAVE_SESSION, b"")
+        self.assertEqual([weaponcfg.DESC_CTX[weaponcfg.MODE_PVE]], self.ctx_of(bob))
+
+    def test_the_host_flipping_the_mode_tells_the_whole_room(self):
+        """★ 房主把「对战 ⇄ 任务」换掉 —— 房里**每个人**的提示框都要跟着换。"""
+        import weaponcfg
+        alice = make_conn("alice")
+        gameserver.Conn.on_game_packet(alice, 0x0201,
+                                       create_session_payload(session_type=1,
+                                                              arguments=(1, 3, 0)))
+        room = self.lobby.room_of(alice)
+        bob = make_conn("bob")
+        gameserver.Conn.on_game_packet(bob, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(room.room_id))
+        alice.sent.clear(); bob.sent.clear()
+        gameserver.Conn.on_game_packet(alice, 0x0302,
+                                       change_session_payload(session_type=2,
+                                                              arguments=(3, 1)))
+        pve = weaponcfg.DESC_CTX[weaponcfg.MODE_PVE]
+        self.assertEqual([pve], self.ctx_of(alice))
+        self.assertEqual([pve], self.ctx_of(bob))
+
+    def test_changing_only_the_map_sends_nothing(self):
+        """★ 闩按**内容**翻转：换图 / 换难度不动模式 ⇒ 一个字节都不该发。
+
+        这条就是「调用点可以宁多勿少」的依据 —— 没有它，`0x0302` 每来一发
+        （房主每点一下地图）就要白推 3.5 KB。
+        """
+        alice = make_conn("alice")
+        gameserver.Conn.on_game_packet(alice, 0x0201,
+                                       create_session_payload(session_type=1,
+                                                              arguments=(1, 3, 0)))
+        alice.sent.clear()
+        gameserver.Conn.on_game_packet(alice, 0x0302,
+                                       change_session_payload(session_type=1,
+                                                              map_name="Festival01:NewPvp"))
+        self.assertEqual([], self.ctx_of(alice))
+
+    def test_being_kicked_falls_back_to_pve(self):
+        """★ 踢人走的是 `LOBBY.kick`，**不经过 `leave_room()`** —— 单独挂了一处。"""
+        import weaponcfg
+        alice = make_conn("alice")
+        gameserver.Conn.on_game_packet(alice, 0x0201,
+                                       create_session_payload(session_type=1,
+                                                              arguments=(1, 3, 0)))
+        room = self.lobby.room_of(alice)
+        bob = make_conn("bob")
+        gameserver.Conn.on_game_packet(bob, OP_MOVE_INTO_SESSION,
+                                       move_into_payload(room.room_id))
+        bob.sent.clear()
+        seat = room.seat_index_of(bob)
+        gameserver.Conn.on_game_packet(alice, 0x030b, struct.pack("<ii", seat, 0))
+        self.assertEqual([weaponcfg.DESC_CTX[weaponcfg.MODE_PVE]], self.ctx_of(bob))
 
 
 class LeaveFlowTests(LobbyIsolated):

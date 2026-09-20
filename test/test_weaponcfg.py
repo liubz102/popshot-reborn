@@ -415,26 +415,51 @@ class EffectiveTests(_Case):
 
 class DescriptionTests(_Case):
 
-    def test_custom_weapon_tooltip_shows_pvp_and_the_note(self):
+    def test_custom_weapon_tooltip_defaults_to_pve_and_says_so(self):
+        """★ 缺省是 **PVE**（X10，用户 2026-09-20）—— 那是大厅的口径：
+        商店页 / 仓库页此刻还不知道这一局是闯关还是对战。"""
         weaponcfg.save_item(CUSTOM, params={"pve": {"damage": 50}, "pvp": {"damage": 9}})
         text = shopcfg.item_desc_zh(shopdata.get(CUSTOM))
-        self.assertTrue(text.startswith(weaponcfg.PVP_ONLY_NOTE + "\n"))
-        self.assertIn("伤害 9", text)
-        self.assertNotIn("伤害 50", text)
+        self.assertTrue(text.startswith(weaponcfg.MODE_ONLY_NOTE[weaponcfg.MODE_PVE] + "\n"))
+        self.assertIn("伤害 50", text)
+        self.assertNotIn("伤害 9", text)
         # 第 1 段（含提示行）不许超过客户端画得下的 5 行
         self.assertLessEqual(len(text.split(shopcfg.DESC_SEPARATOR)[0].split("\n")),
                              shopcfg.ITEM_DESC_MAX_LINES)
+
+    def test_custom_weapon_tooltip_switches_to_pvp_when_asked(self):
+        """待机房间是对战房时画的就是这一套（`0x0F02` 推给 hook 的那一份）。"""
+        weaponcfg.save_item(CUSTOM, params={"pve": {"damage": 50}, "pvp": {"damage": 9}})
+        text = shopcfg.item_desc_zh(shopdata.get(CUSTOM), mode=weaponcfg.MODE_PVP)
+        self.assertTrue(text.startswith(weaponcfg.MODE_ONLY_NOTE[weaponcfg.MODE_PVP] + "\n"))
+        self.assertIn("伤害 9", text)
+        self.assertNotIn("伤害 50", text)
+        self.assertLessEqual(len(text.split(shopcfg.DESC_SEPARATOR)[0].split("\n")),
+                             shopcfg.ITEM_DESC_MAX_LINES)
+
+    def test_the_two_first_lines_are_the_same_length(self):
+        """★★ 两句首行**必须等长**：它占掉 5 行预算里的 1 行，长度一变
+        「排不下才让飞行速度让位」的结论就跟着变（`_WEAPON_LINE_YIELD_ORDER`）。"""
+        pve = weaponcfg.MODE_ONLY_NOTE[weaponcfg.MODE_PVE]
+        pvp = weaponcfg.MODE_ONLY_NOTE[weaponcfg.MODE_PVP]
+        self.assertEqual(len(pve), len(pvp))
+        # 连字形集合都一样（只是 P/E 对调）⇒ 像素宽必然相同，不用去量字体
+        self.assertEqual(sorted(pve), sorted(pvp))
+        self.assertNotEqual(pve, pvp)
+        self.assertEqual(set(weaponcfg.MODES), set(weaponcfg.MODE_ONLY_NOTE))
 
     def test_the_tooltip_only_mentions_homing_when_it_is_actually_on(self):
         """★ 「追踪」只在真的开着时才画 —— `HomingAngle = 0` 就是客户端的「不追踪」。"""
         plain = shopcfg.item_desc_zh(shopdata.get(CUSTOM))
         self.assertNotIn("追踪", plain)
-        weaponcfg.save_item(CUSTOM,
-                            params={"pve": {}, "pvp": {"homing_angle": 250, "homing_range": 400.0}})
-        text = shopcfg.item_desc_zh(shopdata.get(CUSTOM))
-        self.assertIn("追踪 250", text)
-        self.assertLessEqual(len(text.split(shopcfg.DESC_SEPARATOR)[0].split("\n")),
-                             shopcfg.ITEM_DESC_MAX_LINES)
+        homing = {"homing_angle": 250, "homing_range": 400.0}
+        weaponcfg.save_item(CUSTOM, params={"pve": dict(homing), "pvp": dict(homing)})
+        # ★ 两套都验（X10：游戏里按场景画其中一套，两套都得站得住）
+        for mode in weaponcfg.MODES:
+            text = shopcfg.item_desc_zh(shopdata.get(CUSTOM), mode=mode)
+            self.assertIn("追踪 250", text, mode)
+            self.assertLessEqual(len(text.split(shopcfg.DESC_SEPARATOR)[0].split("\n")),
+                                 shopcfg.ITEM_DESC_MAX_LINES, mode)
 
     def test_flight_speed_yields_only_when_the_line_budget_really_runs_out(self):
         """★★ 用户 2026-09-20：「仅在显示不下时让『飞行速度』让位」。
@@ -443,50 +468,61 @@ class DescriptionTests(_Case):
         —— 伤害 / 爆头 / 溅射 / 溅射范围 / 弹容 / 射速 / 装填 / 飞行速度 八项
         已经占掉 4 行，加上首行提示正好 5 行，追踪再挤进来就超了。
         泰尔 1 号只有 6 项，追踪进来照样装得下 ⇒ **一项都不该丢**。
-        """
-        weaponcfg.save_item(CUSTOM_WIDE, params={"pve": {}, "pvp": _WIDE_PVP})
-        tight = shopcfg.item_desc_zh(shopdata.get(CUSTOM_WIDE)).split(shopcfg.DESC_SEPARATOR)[0]
-        self.assertIn("追踪 250", tight)
-        self.assertNotIn("飞行速度", tight)         # 排不下 ⇒ 只有它让位
-        self.assertIn("弹容", tight)                # 别的一项不少
-        self.assertIn("溅射范围", tight)
-        self.assertLessEqual(len(tight.split("\n")), shopcfg.ITEM_DESC_MAX_LINES)
 
-        weaponcfg.save_item(CUSTOM,
-                            params={"pve": {}, "pvp": {"homing_angle": 250, "homing_range": 400.0}})
-        roomy = shopcfg.item_desc_zh(shopdata.get(CUSTOM)).split(shopcfg.DESC_SEPARATOR)[0]
-        self.assertIn("追踪 250", roomy)
-        self.assertIn("飞行速度", roomy)            # 装得下 ⇒ 谁都不用让
-        self.assertLessEqual(len(roomy.split("\n")), shopcfg.ITEM_DESC_MAX_LINES)
+        ★ 两套首行等长 ⇒ 让位的结论在 PVE / PVP 下**必须一模一样**（X10）。
+        """
+        weaponcfg.save_item(CUSTOM_WIDE, params={"pve": dict(_WIDE_PVP), "pvp": dict(_WIDE_PVP)})
+        homing = {"homing_angle": 250, "homing_range": 400.0}
+        weaponcfg.save_item(CUSTOM, params={"pve": dict(homing), "pvp": dict(homing)})
+        for mode in weaponcfg.MODES:
+            tight = shopcfg.item_desc_zh(shopdata.get(CUSTOM_WIDE),
+                                         mode=mode).split(shopcfg.DESC_SEPARATOR)[0]
+            self.assertIn("追踪 250", tight, mode)
+            self.assertNotIn("飞行速度", tight, mode)   # 排不下 ⇒ 只有它让位
+            self.assertIn("弹容", tight, mode)          # 别的一项不少
+            self.assertIn("溅射范围", tight, mode)
+            self.assertLessEqual(len(tight.split("\n")), shopcfg.ITEM_DESC_MAX_LINES, mode)
+
+            roomy = shopcfg.item_desc_zh(shopdata.get(CUSTOM),
+                                         mode=mode).split(shopcfg.DESC_SEPARATOR)[0]
+            self.assertIn("追踪 250", roomy, mode)
+            self.assertIn("飞行速度", roomy, mode)      # 装得下 ⇒ 谁都不用让
+            self.assertLessEqual(len(roomy.split("\n")), shopcfg.ITEM_DESC_MAX_LINES, mode)
 
     def test_out_of_the_box_nothing_has_to_yield(self):
         """★ 出厂参考值下，18 把**没有一把**会挤到要让位（最多 7 项 = 4 行 + 首行提示
         = 正好 5 行）。让位那条是安全网，不是天天在走的路 —— 这条钉住这个事实，
         将来谁给提示框加一项，会先在这儿红，而不是在实机上悄悄少一行。"""
+        homing = {"homing_angle": 30, "homing_range": 200.0}
         for item_id in weaponcfg.custom_item_ids():
-            weaponcfg.save_item(item_id,
-                                params={"pve": {}, "pvp": {"homing_angle": 30, "homing_range": 200.0}})
-            head = shopcfg.item_desc_zh(shopdata.get(item_id)).split(shopcfg.DESC_SEPARATOR)[0]
-            self.assertIn("追踪 30", head, item_id)
-            self.assertLessEqual(len(head.split("\n")), shopcfg.ITEM_DESC_MAX_LINES, item_id)
-            weapon = weaponcfg.effective_weapon_dict(shopdata.get(item_id), "pvp")
-            if weapon.get("velocity"):
-                self.assertIn("飞行速度", head, "%s 出厂就挤到要让位了" % item_id)
+            weaponcfg.save_item(item_id, params={"pve": dict(homing), "pvp": dict(homing)})
+            for mode in weaponcfg.MODES:
+                head = shopcfg.item_desc_zh(shopdata.get(item_id),
+                                            mode=mode).split(shopcfg.DESC_SEPARATOR)[0]
+                self.assertIn("追踪 30", head, (item_id, mode))
+                self.assertLessEqual(len(head.split("\n")), shopcfg.ITEM_DESC_MAX_LINES,
+                                     (item_id, mode))
+                weapon = weaponcfg.effective_weapon_dict(shopdata.get(item_id), mode)
+                if weapon.get("velocity"):
+                    self.assertIn("飞行速度", head,
+                                  "%s 的 %s 出厂就挤到要让位了" % (item_id, mode))
 
     def test_the_admin_dialog_sees_the_lines_the_game_had_to_drop(self):
         """★ 管理页要看得到**完整**内容（用户 2026-09-20）——
         游戏里让位是因为提示框只有 5 行，弹窗没有这个限制。"""
-        weaponcfg.save_item(CUSTOM_WIDE, params={"pve": {}, "pvp": _WIDE_PVP})
-        lines = "".join(weaponcfg.mode_lines(shopdata.get(CUSTOM_WIDE), "pvp"))
-        self.assertIn("追踪 250", lines)
-        self.assertIn("飞行速度", lines)
-        # 而弹窗里那块「游戏内提示框预览」照旧是游戏里真实的样子（该让位的照样让位）
+        weaponcfg.save_item(CUSTOM_WIDE, params={"pve": dict(_WIDE_PVP), "pvp": dict(_WIDE_PVP)})
+        for mode in weaponcfg.MODES:
+            lines = "".join(weaponcfg.mode_lines(shopdata.get(CUSTOM_WIDE), mode))
+            self.assertIn("追踪 250", lines, mode)
+            self.assertIn("飞行速度", lines, mode)
+        # 而弹窗里那块「游戏内提示框预览」照旧是游戏里真实的样子（该让位的照样让位）。
+        # ★ 预览走的是大厅那一档（PVE），和 `item_desc_zh` 的缺省一致（X10）。
         view = weaponcfg.admin_view(CUSTOM_WIDE)
         self.assertNotIn("飞行速度", view["preview"].split(shopcfg.DESC_SEPARATOR)[0])
 
     def test_original_weapon_tooltip_is_untouched_until_a_desc_is_set(self):
         before = shopcfg.item_desc_zh(shopdata.get(ORIGINAL))
-        self.assertNotIn(weaponcfg.PVP_ONLY_NOTE, before)
+        self.assertNotIn(weaponcfg.MODE_ONLY_NOTE[weaponcfg.MODE_PVE], before)
         self.assertNotIn(shopcfg.DESC_SEPARATOR, before)
         weaponcfg.save_item(ORIGINAL, desc="第一行\n第二行")
         after = shopcfg.item_desc_zh(shopdata.get(ORIGINAL))
@@ -509,7 +545,7 @@ class DescriptionTests(_Case):
         self.assertEqual(["pve", "pvp"], [m["key"] for m in view["modes"]])
 
     def test_admin_desc_lists_both_modes(self):
-        """管理页浮窗 / 弹窗两套都列（用户 2026-09-19）；游戏内那段只有 PVP。"""
+        """管理页浮窗 / 弹窗两套都列（用户 2026-09-19）；游戏内那段一次只画一套。"""
         weaponcfg.save_item(CUSTOM, params={"pve": {"damage": 50}, "pvp": {"damage": 9}}, desc="说明")
         text = weaponcfg.admin_desc(shopdata.get(CUSTOM))
         self.assertIn("【对战模式 PVP】", text)
@@ -517,7 +553,8 @@ class DescriptionTests(_Case):
         self.assertIn("伤害 9", text)
         self.assertIn("伤害 50", text)
         self.assertTrue(text.endswith(shopcfg.DESC_SEPARATOR + "说明"))
-        self.assertNotIn(weaponcfg.PVP_ONLY_NOTE, text)
+        for note in weaponcfg.MODE_ONLY_NOTE.values():
+            self.assertNotIn(note, text)
         # 原版武器和游戏里一样
         self.assertEqual(shopcfg.item_desc_zh(shopdata.get(ORIGINAL)),
                          weaponcfg.admin_desc(shopdata.get(ORIGINAL)))

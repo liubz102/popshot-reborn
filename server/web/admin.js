@@ -6814,7 +6814,8 @@ function renderWeaponModal() {
   var desc = el("div", "field wide weapon-desc");
   desc.appendChild(el("span", "lab", "说明文（游戏提示框的下半段，最多 "
                       + view.desc_max_lines + " 行、" + view.desc_max_chars + " 个字；留空 = 不写）"
-                      + "　⏱ 商店提示框即时生效，仓库提示框要重新登录客户端才更新"));
+                      + "　⏱ 商店提示框即时生效；自定义武器的仓库提示框也即时，"
+                      + "原版武器的仓库提示框要重新登录客户端才更新"));
   var area = document.createElement("textarea");
   area.value = WEAPON.edit.desc || "";
   area.disabled = !WEAPON.canEdit;
@@ -6845,9 +6846,15 @@ function renderWeaponModal() {
     // ★★ 顺序**照 `view.modes` 走，不在这里写死** —— 那就是服务端的 `weaponcfg.MODES`
     //    （PVE 在前），和上面两栏「PVE 在左、PVP 在右」、浮窗 `admin_desc()` 同一个方向。
     //    用户 2026-09-19 第三轮：一处左右、一处上下反着来，看着别扭。
-    preview.appendChild(el("b", null, "按已保存的内容现算（游戏内提示框只画对战那一段）："));
+    // ★ X10：游戏内提示框一次只画一套 —— 大厅的商店页 / 仓库页画任务(PVE)那一套，
+    //   待机房间里那个快速换装的仓库画**该房间的模式**。首行提示跟着变，
+    //   所以这里把 `mode_notes` 画成每块的第一行，管理员看到的和游戏里逐字一致。
+    preview.appendChild(el("b", null, "按已保存的内容现算（游戏内提示框按场景只画其中一段："
+                           + "大厅商店 / 仓库 = 任务，待机房间里 = 该房间的模式）："));
     (view.modes || []).forEach(function (m) {
-      var block = el("pre", null, "【" + m.label + "】\n" + (view.lines[m.key] || []).join("\n"));
+      var note = (view.mode_notes || {})[m.key];
+      var block = el("pre", null, "【" + m.label + "】\n" + (note ? note + "\n" : "")
+                     + (view.lines[m.key] || []).join("\n"));
       preview.appendChild(block);
     });
     var note = (view.preview || "").split("|")[1];
