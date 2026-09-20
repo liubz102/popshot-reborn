@@ -52,6 +52,7 @@ import struct
 import sys
 import threading
 import time
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from simple import SimpleCipher
@@ -101,6 +102,7 @@ import versioning
 #: 弹药 id 翻成**武器族号**，给称号卡片的 `weapon_*` 指标归账（V0.3商店）。
 #: `weapondata` 只依赖标准库，不会把 bot 那一摊拖进来（§14 的导入方向仍成立）。
 import weapondata
+import weaponcfg
 #: ★ 角色属性（`ChrProps.ini`）。这里只用两件事：突击技那一招够得着多远
 #: （`Move.reach()`）和角色的三个碰撞圆（`circles()`）—— 「突击技命中」
 #: 那一项的走廊就是拿这两样量出来的（V0.3商店，`RoomQuest.note_dash`）。
@@ -159,6 +161,19 @@ MAGIC_GAME = 0xFF
 GAME_SEND_DEADLINE_S = 8.0
 
 OP_REP_LOGIN = 0x0100
+#: ★★ 服务端 -> **bshook**（不是游戏本体）：「自定义武器表」（X_Mod · X3）。
+#: 我们自造的 opcode，原版客户端的分发树 `0x54e036` 认不出它，走 `0x54e546`
+#: 的默认分支返回 0、什么都不做；bshook 把 `0x54e036` 头上挂了钩子，认出这一包
+#: 就吞掉，按武器 Id 把数值写进客户端内存里那张武器表（`0x72e788`）。
+#: 载荷见 `weaponcfg.build_hook_frame()`；packet_api §3.5 有线格式。
+OP_HOOK_WEAPON_TABLE = 0x0F01
+#: ★★ 服务端 -> **bshook**：「仓库提示框说明文表」（X_Mod · X10）。同上一条一样是
+#: 我们自造的 opcode，老客户端收到落进默认分支什么都不做。
+#: 自定义武器的数值分 PVE / PVP 两套而提示框只有 5 行，装不下两套 ⇒ 一次只画一套：
+#: **大厅（商店页 / 仓库页）画 PVE，待机房间里的快速换装仓库画房间那一套**。
+#: 仓库提示框的文字来自客户端缓存住的 `ItemInfo`（重发 `0x0501` 刷不掉，§39），
+#: 所以由 bshook 在绘制点 `0x4554e7` 按物品 id 换掉。载荷见 `weaponcfg.build_desc_frame()`。
+OP_HOOK_ITEM_DESC = 0x0F02
 #: `gspRepLogin` 的结果码 3 = 客户端 `0x54f3cf`「断开」（V0.1 §44）。
 #: 弹的框是 `Data\Chinese.ini` 里的「在无法连接的地方尝试了连接。」（§132）。
 #:
@@ -6393,6 +6408,51 @@ def all_conns():
         return list(_conns)
 
 
+def broadcast_hook_weapon_table(reason="", log=None):
+    """把「自定义武器表」（`0x0F01`）推给**全部已登录**的连接（X3）。
+
+    管理页保存之后调它 —— 在线玩家不用重登，改过的数值下一枪就生效
+    （bshook 收到就写内存）。返回推了几条连接。
+    """
+    pushed = 0
+    for conn in all_conns():
+        try:
+            if conn.send_hook_weapon_table(reason=reason):
+                pushed += 1
+        except Exception as error:  # noqa: BLE001 —— 一条连接坏了别拖累别人
+            if log:
+                log(f"⚠ 推自定义武器表给 {conn.peer()} 失败：{error}")
+    if log:
+        log(f"[weapons] 自定义武器表已推给 {pushed} 条在线连接{reason}")
+    return pushed
+
+
+def broadcast_hook_item_desc(reason="", log=None):
+    """把「仓库提示框说明文表」（`0x0F02`）推给**全部已登录**的连接（X10）。
+
+    管理页保存之后调它 —— 自定义武器那 18 把的仓库提示框**不用重登**就能看到
+    新文案（bshook 在绘制点现取）。其它物品仍受 ItemDB 缓存所限，要重登（§39）。
+
+    两套载荷**各只算一次**再喂给每条连接：`item_desc_zh()` 无缓存，
+    按人算就是 O(在线人数 × 18)。每条连接自己按所在场景挑一套（还带闩），
+    所以这里不用管谁在房间里、谁在大厅。返回真发出去了几条。
+    """
+    table = weaponcfg.load()
+    payloads = {mode: weaponcfg.build_desc_frame(mode=mode, table=table)
+                for mode in weaponcfg.MODES}
+    pushed = 0
+    for conn in all_conns():
+        try:
+            if conn.sync_hook_item_desc(reason=reason, payloads=payloads):
+                pushed += 1
+        except Exception as error:  # noqa: BLE001 —— 一条连接坏了别拖累别人
+            if log:
+                log(f"⚠ 推仓库说明文给 {conn.peer()} 失败：{error}")
+    if log:
+        log(f"[weapons] 仓库说明文表已推给 {pushed} 条在线连接{reason}")
+    return pushed
+
+
 def conn_is_playing(conn):
     """这条连接现在是不是**在打游戏**（而不是待在大厅/房间里）。
 
@@ -6802,6 +6862,14 @@ class Conn:
     #   里时 `conn_place()` 压根不看这一格，直接查大厅那份房间状态。
     #   翻转由上行包驱动，见 `enter_place()` 和 `PLACE_*` 那一节。
     place = PLACE_LOBBY
+    # ★ 上一次推给 bshook 的那份仓库说明文表（X10）：`(模式, 载荷的 crc32)`。
+    #   **按状态翻转去重** —— 说过了就不再说，直到内容真的变了。有了它，
+    #   `sync_hook_item_desc()` 就是幂等的，调用点可以宁多勿少（进房 / 建房 /
+    #   改模式 / 离房 / 被踢 各挂一处，重复的那几发自然被吃掉）。
+    #   ★★ 闩的是**载荷的 crc**而不是 `weapons.json` 的 serial：文案还依赖
+    #   `shop_items.json` 里的武器基值，拿 serial 当闩会漏掉「运营改了物品库」
+    #   那一路，症状是「就是不更新」。
+    hook_desc_key = None
     # ★ 位置轨迹同理，但它是**每条连接一份的可变对象** —— 类上放一个共享的
     #   deque 会让所有实例往同一条轨迹里写。所以类级默认放一个空元组当哨兵，
     #   `note_sync_position()` 碰到它时现建一个（只有 `Conn.__new__` 造的
@@ -7435,6 +7503,21 @@ class Conn:
     def lobby_room(self):
         """本连接当前所在的房间（`lobby.Room`），不在房间里就是 ``None``。"""
         return LOBBY.room_of(self)
+
+    def weapon_desc_mode(self):
+        """自定义武器的提示框该画哪一套数值（X10，用户 2026-09-20）。
+
+        **不在房间里**（大厅 / 商店页 / 仓库页）= 模式还没定 ⇒ 画 PVE；
+        **在房间里**（待机也好、打着也好）= 模式已经由房间定死 ⇒ 画房间那一套。
+
+        ★ `session_type == SESSION_TYPE_QUEST` 就是 PVE 这条判据全服只写两处：
+        这里和开局那一发（`broadcast_start_game`）。**别再写第三处。**
+        """
+        room = self.lobby_room()
+        if room is None:
+            return weaponcfg.MODE_PVE
+        return (weaponcfg.MODE_PVE if room.session_type == SESSION_TYPE_QUEST
+                else weaponcfg.MODE_PVP)
 
     def enter_place(self, place):
         """客户端自报「我现在在 `place`」（`PLACE_LOBBY` / `PLACE_SHOP`）。
@@ -8183,6 +8266,10 @@ class Conn:
         # 登录包带得动等级和经验，唯独带不动金币（`0x54f2cc` 不写 0x72e330）。
         # 补一发 0x0600，右上角数据栏才和存档完全一致。
         self.send_rep_money(reason="（登录后补发，登录包没有金币字段）")
+        # ★ X3：自定义武器的数值由服务端说了算，登录成功就把表推给 bshook。
+        self.send_hook_weapon_table(reason="（登录后下发）")
+        # ★ X10：仓库提示框的说明文同理。刚登录必然在大厅 ⇒ 现算出来就是 PVE 那套。
+        self.sync_hook_item_desc(reason="（登录后下发）")
         # 每一关的「已达成难度」。这张 map 只有服务端能填，不发就等于
         # 全部关卡只有「简单」能开局（§118）。
         self.send_quest_reached_difficulty(reason="（登录后下发）")
@@ -10060,6 +10147,10 @@ class Conn:
             f"{display_name(self.account) or self.account_name} 进入了房间。")
         # ★ 必须排在四连发**之后**（§150）：房里够两个人了就把玩家间同步打开。
         self.sync_peer_relay(room, reason="（有人进房）")
+        # ★ X10：进了房间 = 游戏模式定下来了 ⇒ 仓库提示框该换成这个房间那一套。
+        #   ⚠ **不能塞进 `enter_room()` 的「进房四连发」`send_batch`** —— 那一批
+        #   要整份落进客户端同一次 recv（§120），多塞一个包就改变了那次 sendall。
+        self.sync_hook_item_desc(reason="（进房后下发）")
         # 有新人进来，上一轮的开局握手作废（不清的话新人不在 `loaded` 里，
         # 房主再按开始时会等一个从没收到过 0x0400 的人）。
         # ★ 这条只在待机/倒计时阶段走得通：加载中（PREPARING）的房间在
@@ -10119,6 +10210,21 @@ class Conn:
         所以 +1 之后仍然一样。
         """
         members = room.members(exclude=None)
+        # ★★ 开局这一刻把「这一局是闯关还是对战」连同整张自定义武器表推给 bshook
+        #    （X3，§42 / D32）。**必须排在 `0x0400` 之前发出去**：`0x0400` 一到
+        #    客户端就切 stage 6 开始加载关卡，加载过程里角色被建出来、弹匣容量
+        #    从武器记录**快照**进持枪器（`0x48b96e`），晚一步这一局的弹匣就还是
+        #    上一局那份。房间类型是我们自己建的房，服务端最清楚 —— 客户端那边
+        #    `WeaponTable::Load` 的调用时机根本不等于「开局」（§42）。
+        if any(op == OP_PREPARE_GAME for op, _ in replies):
+            hook_mode = (weaponcfg.HOOK_MODE_PVE
+                         if room.session_type == SESSION_TYPE_QUEST
+                         else weaponcfg.HOOK_MODE_PVP)
+            for member in members:
+                try:
+                    member.send_hook_weapon_table(reason="；开局", hook_mode=hook_mode)
+                except OSError as error:
+                    member.log(f"   开局推自定义武器表失败（{error!r}），忽略")
         for member in members:
             try:
                 with member.send_batch(f"；{why}"):
@@ -11093,6 +11199,12 @@ class Conn:
         victim.forget_peer_relay()
         victim.reset_quest_state()
         victim.start_game.reset()
+        # ★ X10：踢人走的是 `LOBBY.kick`，**不经过 `victim.leave_room()`** ——
+        #   所以「回大厅了，仓库提示框换回 PVE」这一发要在这里单独补。
+        try:
+            victim.sync_hook_item_desc(reason="（被踢出后下发）")
+        except OSError as error:
+            victim.log(f"   被踢后推仓库说明文失败（{error!r}），忽略")
         self.after_someone_left(result, f"{victim_seat.nickname} 被房主请出了房间。")
 
     def after_someone_left(self, result, system_text=""):
@@ -11181,6 +11293,12 @@ class Conn:
         # 最迟 3 秒后就到，这一句只是把那 3 秒的空窗补上 —— 不补的话，
         # 「进房之前在商店」的人退房后会有几秒被画成还在商店界面。
         self.enter_place(PLACE_LOBBY)
+        # ★ X10：回大厅 = 模式又不确定了 ⇒ 仓库提示框换回 PVE 那一套。
+        #   断线那一路 socket 已经废了，发不出去不该拖累「把人从房里摘掉」。
+        try:
+            self.sync_hook_item_desc(reason="（离房后下发）")
+        except OSError as error:
+            self.log(f"   离房后推仓库说明文失败（{error!r}），忽略")
         self.after_someone_left(result, system_text or f"{who} 离开了房间。")
         return result
 
@@ -11390,6 +11508,9 @@ class Conn:
                 # 再补一发座位的物品清单。它决定「人物选择」里有几个头像，
                 # 而且必须排在 0x0300 之后（持有判定要先看座位已占用，§119）。
                 self.send_slot_equipped_list(reason="（建房后下发）")
+            # ★ X10：自己建的房**不走 `finish_join`**，所以这一发要单独挂。
+            #   同样放在 `send_batch` **之外** —— 那四发的原子性是硬约束（§120）。
+            self.sync_hook_item_desc(reason="（建房后下发）")
         elif opcode == OP_SESSION_MEMBER_UPDATE:
             self.on_seat_change(payload)
         elif opcode == OP_SEAT_READY:
@@ -11487,6 +11608,19 @@ class Conn:
             quest = self.current_quest()
             if quest is not None:
                 broadcast_quest_record(room, quest[0], quest[1], "（房间换图/换难度）")
+            # ★ X10：房主可能刚把「对战 ⇄ 任务」换了 —— 房里**每个人**的仓库
+            #   提示框都要跟着换。只换了图 / 难度时 `sync_hook_item_desc` 的闩
+            #   不翻转，一个包都不会发，所以这里不用自己比旧 `session_type`。
+            #   ⚠ 它排在上面那个 `room_started(room)` 的提前 return 之后：
+            #   开局后的地图汇报走不到这儿（开局之后模式也不会变）。
+            #   ★ `human_members()` 而不是 `members()`：bot 没有屏幕也没有账号，
+            #   给它算一份 18 条说明文纯属白费（`BotConn.send()` 是空操作）。
+            if room is not None:
+                for member in room.human_members():
+                    try:
+                        member.sync_hook_item_desc(reason="（房间模式变了）")
+                    except OSError as error:
+                        member.log(f"   换模式后推仓库说明文失败（{error!r}），忽略")
         elif opcode == OP_MOVE_CHANNEL_BY_GAME_TYPE:
             try:
                 game_type = parse_move_channel_by_game_type(payload)
@@ -11743,6 +11877,58 @@ class Conn:
         self.log(f"← 回 0x0501 物品定义 {len(records)} 条 用途={purpose}{reason}")
         self.send(build_game(OP_REP_ITEM_INFO,
                              shop.build_rep_item_info(records, purpose)))
+
+    def send_hook_weapon_table(self, reason="", hook_mode=None):
+        """发 `0x0F01`「自定义武器表」给 bshook（X3）。发了返回 True。
+
+        发给每一条**已登录**的连接，不另设版本门控（用户 2026-09-19：客户端版本
+        只由 `server-ClientFilter.config` 那一道门管，别重复加）。能登进来的客户端
+        就是门禁放行的；万一是没装这个钩子的老版本，这一包会落进分发树的默认分支
+        （`0x54e546: xor al,al`，X_Mod §38），什么都不发生。
+
+        `hook_mode`（默认 `NONE`）见 `weaponcfg.build_hook_frame()`：
+        登录后那一发、管理页保存后广播的那一发都是 `NONE`（**只送数据、不施加**，
+        下一局才生效）；只有开局那一发带真模式，它同时也是「现在施加」的命令。
+        """
+        if not self.account_name:
+            return False
+        if hook_mode is None:
+            hook_mode = weaponcfg.HOOK_MODE_NONE
+        payload = weaponcfg.build_hook_frame(hook_mode=hook_mode)
+        fmt, serial, mode, records = weaponcfg.parse_hook_frame(payload)
+        self.log(f"← 发 0x0F01 自定义武器表 serial={serial} {len(records)} 条"
+                 f" 模式={weaponcfg.HOOK_MODE_ZH.get(mode, mode)}{reason}")
+        self.send(build_game(OP_HOOK_WEAPON_TABLE, payload))
+        return True
+
+    def sync_hook_item_desc(self, reason="", payloads=None):
+        """把「此刻该看哪一套」的仓库说明文（`0x0F02`）推给 bshook（X10）。发了返回 True。
+
+        **自带按状态翻转的闩**（`hook_desc_key`）：模式和文案都没变就一个字节都不发
+        ⇒ 这个函数是**幂等**的，调用点宁多勿少（进房 / 建房 / 改模式 / 离房 / 被踢 /
+        登录 / 管理页保存）。没有定时刷新，没有「隔 N 次发一发」（铁律 10）。
+
+        为什么要单发一份文案、而不是重发 `0x0501`：客户端的 ItemDB 插入遇重复 key
+        直接忽略（§39），仓库提示框的文字**进程内改不掉** —— 只能让 bshook 在
+        绘制点 `0x4554e7` 按物品 id 现换（§52 / D45）。
+
+        `payloads` = 预先算好的 `{模式: 载荷}`（广播时用，省得每条连接各算 18 份说明文）。
+        """
+        if not self.account_name:
+            return False
+        mode = self.weapon_desc_mode()
+        payload = (payloads or {}).get(mode)
+        if payload is None:
+            payload = weaponcfg.build_desc_frame(mode=mode)
+        key = (mode, zlib.crc32(payload))
+        if self.hook_desc_key == key:
+            return False
+        self.hook_desc_key = key
+        _fmt, serial, _ctx, records = weaponcfg.parse_desc_frame(payload)
+        self.log(f"← 发 0x0F02 仓库说明文表 serial={serial} {len(records)} 条"
+                 f" 按【{weaponcfg.MODE_ZH[mode]}】{reason}")
+        self.send(build_game(OP_HOOK_ITEM_DESC, payload))
+        return True
 
     def on_req_item_info(self, payload):
         """客户端方向的 `0x0601` —— 「这些 id 我不认识，给我定义」（§28）。
@@ -12735,8 +12921,11 @@ def _dispatch_control_command(line):
         for filename in sorted(added):
             lines.append(f"  {filename}: {len(added[filename])} 条")
             for entry in added[filename]:
-                item_id = entry.get("id" if filename == shopcfg.SHOP_FILENAME
-                                    else "result")
+                # ★ 一条记录的身份键各份不一样（物品库 / 货架是 `id`、配方是
+                #   `result`、卡片是 `card`）—— 照 `BACKFILL_KEYS` 取，
+                #   别在这儿再写一份对照（写死过一次：物品库那份取成了
+                #   `result`，补出来的 36 件武器全打成「物品 None」）。
+                item_id = entry.get(shopcfg.BACKFILL_KEYS[filename][1])
                 lines.append(f"    {_item_label(item_id)}")
         return "\n".join(lines)
 

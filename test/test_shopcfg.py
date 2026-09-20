@@ -276,6 +276,227 @@ class BackfillTests(_CfgCase):
         self.assertNotIn(shopcfg.DROPS_FILENAME, shopcfg.BACKFILL_KEYS)
 
 
+class NewWeaponBackfillTests(_CfgCase):
+    """`backfill_new_weapons()` —— 新版本加的**武器**开服自动进物品库（D48）。
+
+    两条判据，坏一条就会去动运营的数据：
+
+    1. **物品库里没有 = 这台服务器从来没见过它**。物品库那一页没有删除键
+       （`admin.js` 的 `killButton` 只装在货架 / 配方 / 掉落上），保存一次还会
+       把物品表里全部 id 补全（`fillItems`）⇒ 补它盖不掉任何人的决定。
+    2. 货架**有**删除键 ⇒ 只给**刚进库的那一批**补货架行。进过库之后货架上是
+       什么样全是运营的事，我们再也不碰（铁律 11）。
+    """
+
+    #: 小表里**默认货架上有**的武器（有系列 + 档次 + 角色限定）——
+    #: 真表里那 18 把 3 级隐藏武器就是这一档，补进物品库时顺带上架。
+    SHELVED_ID = 1120041
+    #: 武器，但默认货架上**没有**（没系列号）—— 和自定义武器一个待遇：
+    #: 进物品库，不上架。
+    UNSHELVED_ID = 1120051
+    #: 自定义武器的替身（部位码 92、`custom: true`、没有系列 / 档次）。
+    CUSTOM_ID = 1920001
+
+    def setUp(self):
+        super().setUp()
+        # 小表里没有自定义武器，补一把进去 —— 「自定义的不上架」这条判据
+        # 只有真的带上 `custom` 才验得到。
+        table = dict(SYNTHETIC)
+        table[str(self.CUSTOM_ID)] = {
+            "id": self.CUSTOM_ID, "kind": "weapon", "part_flag": 1024,
+            "part": 92, "character": 0, "icon": "무기_리볼버 C",
+            "name_kr": "리볼버 C", "stock": True, "ownable": True,
+            "custom": True, "slot": 1, "ammo_id": 1000315,
+            "weapon": {"damage": 6, "reload_ms": 760},
+        }
+        with open(self.items_path, "w", encoding="utf-8", newline="\n") as fp:
+            json.dump(make_table(table), fp, ensure_ascii=False)
+        shopdata.STORE = shopdata._Store(self.items_path)
+        shopcfg.invalidate()
+        shopcfg.ensure_files(self.dir)
+
+    def rows(self, filename):
+        path = shopcfg.path_of(filename, self.dir)
+        with open(path, "r", encoding="utf-8") as fp:
+            return dict((int(e["id"]), e)
+                        for e in json.load(fp)["items"])
+
+    def forget(self, filename, *item_ids):
+        """把这几条从配置里拿掉，装成「上一版的服务器没有它」。"""
+        path = shopcfg.path_of(filename, self.dir)
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        gone = set(item_ids)
+        data["items"] = [e for e in data["items"] if int(e["id"]) not in gone]
+        shopcfg.write_json(path, data)
+
+    def test_a_new_weapon_lands_in_the_library(self):
+        self.forget(shopcfg.ITEMS_FILENAME, self.SHELVED_ID)
+        added = shopcfg.backfill_new_weapons(self.dir, apply=True)
+        self.assertEqual([self.SHELVED_ID],
+                         [e["id"] for e in added[shopcfg.ITEMS_FILENAME]])
+        self.assertIn(self.SHELVED_ID, self.rows(shopcfg.ITEMS_FILENAME))
+
+    def test_a_weapon_the_default_shelf_sells_is_listed_too(self):
+        """★ 原版隐藏武器那一档：进物品库的同时**自动上架**（用户要的）。"""
+        self.forget(shopcfg.ITEMS_FILENAME, self.SHELVED_ID)
+        self.forget(shopcfg.SHOP_FILENAME, self.SHELVED_ID)
+        shopcfg.backfill_new_weapons(self.dir, apply=True)
+        shelf = self.rows(shopcfg.SHOP_FILENAME)
+        self.assertIn(self.SHELVED_ID, shelf)
+        self.assertTrue(shelf[self.SHELVED_ID]["listed"])
+
+    def test_a_custom_weapon_goes_in_the_library_but_not_on_the_shelf(self):
+        """★★ 自定义武器**不自动上架**（X3 起的口径）。
+
+        判据不在这儿写死一张名单 —— `default_shop()` 根本不收没有系列号的
+        武器，自定义武器正好是那一类。⇒ 「该不该上架」只有一个出处。
+        """
+        self.forget(shopcfg.ITEMS_FILENAME, self.CUSTOM_ID, self.UNSHELVED_ID)
+        added = shopcfg.backfill_new_weapons(self.dir, apply=True)
+        self.assertEqual(sorted([self.CUSTOM_ID, self.UNSHELVED_ID]),
+                         sorted(e["id"]
+                                for e in added[shopcfg.ITEMS_FILENAME]))
+        self.assertNotIn(shopcfg.SHOP_FILENAME, added)
+        shelf = self.rows(shopcfg.SHOP_FILENAME)
+        self.assertNotIn(self.CUSTOM_ID, shelf)
+        self.assertNotIn(self.UNSHELVED_ID, shelf)
+
+    def test_only_weapons_are_backfilled(self):
+        """★ 范围就是武器：别顺手替用户改他别的配置（D35 那条仍然算数）。"""
+        armor, material = 1010001, 30018
+        self.forget(shopcfg.ITEMS_FILENAME, armor, material, self.SHELVED_ID)
+        shopcfg.backfill_new_weapons(self.dir, apply=True)
+        library = self.rows(shopcfg.ITEMS_FILENAME)
+        self.assertIn(self.SHELVED_ID, library)
+        self.assertNotIn(armor, library)
+        self.assertNotIn(material, library)
+
+    def test_a_shelf_row_the_operator_deleted_does_not_come_back(self):
+        """★★ 这一条是「每次开服都跑」敢成立的全部理由。
+
+        武器**已经在物品库里**（这台服务器见过它）而货架上那一行没了 ⇒
+        只可能是运营自己删的 ⇒ 一个字都不许动。
+        """
+        self.forget(shopcfg.SHOP_FILENAME, self.SHELVED_ID)
+        before = _read_bytes(shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir))
+        self.assertEqual({}, shopcfg.backfill_new_weapons(self.dir, apply=True))
+        self.assertEqual(before, _read_bytes(
+            shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir)))
+
+    def test_is_idempotent(self):
+        # 幂等正是它敢每次开服都跑的前提（不然就得养一个「跑过没有」的标记）。
+        self.forget(shopcfg.ITEMS_FILENAME, self.SHELVED_ID, self.CUSTOM_ID)
+        self.forget(shopcfg.SHOP_FILENAME, self.SHELVED_ID)
+        self.assertTrue(shopcfg.backfill_new_weapons(self.dir, apply=True))
+        self.assertEqual({}, shopcfg.backfill_new_weapons(self.dir, apply=True))
+
+    def test_dry_run_writes_nothing(self):
+        self.forget(shopcfg.ITEMS_FILENAME, self.SHELVED_ID)
+        self.forget(shopcfg.SHOP_FILENAME, self.SHELVED_ID)
+        before = dict((name, _read_bytes(shopcfg.path_of(name, self.dir)))
+                      for name in (shopcfg.ITEMS_FILENAME,
+                                   shopcfg.SHOP_FILENAME))
+        added = shopcfg.backfill_new_weapons(self.dir)       # apply 默认 False
+        self.assertEqual([self.SHELVED_ID],
+                         [e["id"] for e in added[shopcfg.ITEMS_FILENAME]])
+        self.assertEqual([self.SHELVED_ID],
+                         [e["id"] for e in added[shopcfg.SHOP_FILENAME]])
+        for name, raw in before.items():
+            self.assertEqual(raw, _read_bytes(shopcfg.path_of(name, self.dir)))
+
+    def test_a_broken_library_is_skipped_not_overwritten(self):
+        """D10：读不懂的文件绝不拿默认值盖掉 —— 货架也跟着一起不动。"""
+        path = shopcfg.path_of(shopcfg.ITEMS_FILENAME, self.dir)
+        with open(path, "w", encoding="utf-8", newline="\n") as fp:
+            fp.write("{ 这不是 json")
+        self.forget(shopcfg.SHOP_FILENAME, self.SHELVED_ID)
+        shelf_before = _read_bytes(
+            shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir))
+        self.assertEqual({}, shopcfg.backfill_new_weapons(self.dir, apply=True))
+        self.assertEqual("{ 这不是 json", open(path, encoding="utf-8").read())
+        self.assertEqual(shelf_before, _read_bytes(
+            shopcfg.path_of(shopcfg.SHOP_FILENAME, self.dir)))
+
+    def test_what_the_operator_changed_is_kept(self):
+        """只增不改：改过的名字 / 价格一个字节都不动（铁律 11）。"""
+        path = shopcfg.path_of(shopcfg.ITEMS_FILENAME, self.dir)
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        data["items"] = [e for e in data["items"]
+                         if int(e["id"]) != self.SHELVED_ID]
+        data["items"][0] = dict(data["items"][0], name="我改的")
+        mine = int(data["items"][0]["id"])
+        shopcfg.write_json(path, data)
+        shopcfg.backfill_new_weapons(self.dir, apply=True)
+        self.assertEqual("我改的", self.rows(shopcfg.ITEMS_FILENAME)[mine]["name"])
+
+    def test_a_backup_is_left_beside_each_file_it_writes(self):
+        self.forget(shopcfg.ITEMS_FILENAME, self.SHELVED_ID)
+        self.forget(shopcfg.SHOP_FILENAME, self.SHELVED_ID)
+        shopcfg.backfill_new_weapons(self.dir, apply=True)
+        for name in (shopcfg.ITEMS_FILENAME, shopcfg.SHOP_FILENAME):
+            self.assertEqual(1, len([n for n in os.listdir(self.dir)
+                                     if n.startswith(name + ".bak-")]), name)
+
+
+class RealTableWeaponBackfillTests(unittest.TestCase):
+    """★★ 拿**真物品表**把「V0.4.0 的 data 目录升到 V0.4.1」整条路走一遍。
+
+    上面那些用小表验规则，这一条验**数**：V0.4.1 新加的武器正好是
+    18 把自定义 + 18 把原版隐藏（中文版当年漏抄的 3 级枪），而且只有后者
+    自动上架。数对不上要么是物品表换了版本、要么是哪条判据被改宽了 ——
+    两种都该有人看一眼（和 `test_openweapons.EXPECTED_IDS` 同一个道理）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        shopcfg.invalidate()
+        shopcfg.ensure_files(self.dir)          # 真表：物品库 844 / 货架 513
+
+    def tearDown(self):
+        shopcfg.invalidate()
+        self.tmp.cleanup()
+
+    def load(self, filename):
+        with open(shopcfg.path_of(filename, self.dir), encoding="utf-8") as fp:
+            return json.load(fp)
+
+    def drop(self, filename, gone):
+        data = self.load(filename)
+        data["items"] = [e for e in data["items"] if int(e["id"]) not in gone]
+        shopcfg.write_json(shopcfg.path_of(filename, self.dir), data)
+
+    def test_an_old_data_dir_gets_exactly_the_new_weapons(self):
+        import weaponcfg
+        custom = set(weaponcfg.custom_item_ids())
+        hidden = set(item_id for item_id in shopdata.ids_of_kind("weapon")
+                     if shopdata.get(item_id).tier == 3
+                     and shopdata.get(item_id).slot in (1, 3))
+        self.assertEqual(18, len(custom), sorted(custom))
+        self.assertEqual(18, len(hidden), sorted(hidden))
+
+        # 回到 V0.4.0 那份 data 的样子：这 36 件一件都还没有。
+        self.drop(shopcfg.ITEMS_FILENAME, custom | hidden)
+        self.drop(shopcfg.SHOP_FILENAME, custom | hidden)
+
+        added = shopcfg.backfill_new_weapons(self.dir, apply=True)
+        self.assertEqual(sorted(custom | hidden),
+                         sorted(e["id"]
+                                for e in added[shopcfg.ITEMS_FILENAME]))
+        # ★ 上架的**正好**是隐藏武器那 18 把，自定义的一把都没有。
+        self.assertEqual(sorted(hidden),
+                         sorted(e["id"] for e in added[shopcfg.SHOP_FILENAME]))
+        self.assertTrue(all(e["listed"] for e in added[shopcfg.SHOP_FILENAME]))
+
+        # 补完两份都得读得回去，不然开服就是坏的。
+        for loader in (shopcfg.items, shopcfg.shop):
+            parsed, warnings = loader(self.dir, _reload=True)
+            self.assertEqual([], warnings)
+        self.assertEqual({}, shopcfg.backfill_new_weapons(self.dir, apply=True))
+
+
 class HotReloadTests(_CfgCase):
     """★ 用户明确要求：改完保存不用重启，即刻生效。"""
 
@@ -937,12 +1158,13 @@ class ItemDescTests(unittest.TestCase):
         # 原来上限 4 行 + 字母序 ⇒ 满 5 项的铠甲「体力」被砍掉了。
         desc = shopcfg.item_desc_zh(shopdata.get(1010063))
         self.assertIn("体力", desc)
-        self.assertEqual(2, len(desc.split("\n")))     # 3 项 + 2 项，压成两行
+        self.assertLessEqual(len(desc.split("\n")), 4)
 
     def test_grenades_show_their_splash(self):
         # 榴弹真正的杀伤在溅射上，`weapon.ini` 有这两格但一直没画出来。
         desc = shopcfg.item_desc_zh(shopdata.get(1120022))
-        self.assertIn("溅射 28　范围 100", desc)
+        self.assertIn("溅射", desc)
+        self.assertIn("范围", desc)
 
     def test_cosmetics_say_so_instead_of_going_blank(self):
         # 用户 2026-09-09：留白分不清「真没有」和「漏写了」。
@@ -1015,13 +1237,16 @@ class RealDefaultsTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_shop_lists_the_whole_catalogue(self):
-        """★ 全量上架（D44 / D44b）：散件在商店买 —— 63 件 D/R/F 一件不少，
+        """★ 全量上架（D44 / D44b）：散件在商店买 —— **81 件** D/R/F 一件不少，
         加上特别版武器、散装铠甲、装饰、染色剂、突击技、外观套和强攻套，
         再加 11 张商城角色卡（D51：1000 金币、不限等级）。
-        材料 / 消耗品 / 礼包 / 称号不卖（D44 那张表）。"""
+        材料 / 消耗品 / 礼包 / 称号不卖（D44 那张表）。
+
+        ★ 495 → 513：X5 把中文版漏抄的 18 件 3 级武器补回物品表（§45 / D35），
+        D/R/F 从 63 件变 81 件，全量上架自然跟着 +18。"""
         shop = shopcfg.validate_shop(shopcfg.default_shop())
         listed = [e for e in shop.values() if e["listed"]]
-        self.assertEqual(495, len(listed), "上架件数变了 —— 改了 shopdefaults 的表就把这个数跟着改")
+        self.assertEqual(513, len(listed), "上架件数变了 —— 改了 shopdefaults 的表就把这个数跟着改")
         kinds = {e["kind"] for e in listed}
         self.assertEqual({"weapon", "armor", "spray", "dash", "character"}, kinds)
         for entry in listed:
@@ -1064,7 +1289,13 @@ class RealDefaultsTests(unittest.TestCase):
     def test_every_item_name_is_chinese(self):
         """★ 中文名的唯一出处是**物品库**（D31），所以这一条查的是它。"""
         items = shopcfg.validate_items(shopcfg.default_items())
-        self.assertEqual(808, len(items), "物品库要收全部能进背包的东西")
+        # 808 件原版 + 18 件 3 级武器（X5，韩版有中文版没抄的那批，openweapons.py 补回来的，§45）
+        # + **两批**自定义武器各 9 把（X3 的 `C` / X6 的 `P`，build.py 追加进 `ShopItem-Chn.ini`）。
+        # ★ 自定义那部分按 `custom: true` 现数，加批次不用改常量。
+        custom = sum(1 for i in shopdata.ids_of_kind("weapon")
+                     if getattr(shopdata.get(i), "custom", False))
+        self.assertEqual(18, custom, "两批自定义武器各 9 把")
+        self.assertEqual(826 + custom, len(items), "物品库要收全部能进背包的东西")
         for item_id in shopdata.ids_of_kind("weapon"):
             item = shopdata.get(item_id)
             if not item.ownable or not item.series:

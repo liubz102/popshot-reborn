@@ -42,6 +42,7 @@ import sellprice                                               # noqa: E402
 import shopcfg                                                 # noqa: E402
 import shopdata                                                # noqa: E402
 import versioning                                              # noqa: E402
+import weaponcfg                                               # noqa: E402
 from account_store import AccountStore                         # noqa: E402
 from web import admin as web_admin                             # noqa: E402
 from web import server as web_server                           # noqa: E402
@@ -355,6 +356,9 @@ class AdminAuthTests(_AdminCase):
                 ("/admin/api/sell/prices", None),
                 ("/admin/api/sell/prices", {"prices": {"bead": 1}}),
                 ("/admin/api/sell", {"items": [{"id": 10001, "count": 1}]}),
+                # 自定义武器（X3）：读三档都到得了，写只有运营 —— 但登录这道门都得过。
+                ("/admin/api/weapon?id=1920001", None),
+                ("/admin/api/weapon", {"id": 1920001, "desc": "x"}),
                 ("/admin/api/config/shop", {"text": "{}"}),
                 ("/admin/api/admins/add", {"name": "carol", "password": "pw1"}),
                 ("/admin/api/admins/password", {"name": "admin", "password": "pw1"}),
@@ -875,7 +879,9 @@ class AdminAssetTests(_AdminCase):
 
     #: `admin.js` 自己 `el.id = "…"` 建出来的节点，html 里当然没有。
     #: 加控件时如果又多了一个，往这儿补一行，别把下面那条用例关掉。
-    JS_MADE_IDS = {"cfgShown"}
+    #: ★ 2026-09-20 空了：`cfgShown`（工具条上那句「筛出 x / y」）搬进了面板标题
+    #:   那一格现成的 `#cfgCount` —— 掉落页的筛选条加了「来源」下拉之后放不下。
+    JS_MADE_IDS = set()
 
     def test_every_id_the_script_looks_up_exists_in_the_page(self):
         """★ `$("拼错的id")` 返回 `null`，**浏览器不报错**，只是那个按钮
@@ -897,6 +903,46 @@ class AdminAssetTests(_AdminCase):
         ids = re.findall(r'\bid="([A-Za-z0-9_-]+)"', html)
         dupes = sorted({name for name in ids if ids.count(name) > 1})
         self.assertEqual([], dupes)
+
+    def test_swapping_one_item_never_turns_into_a_multi_select(self):
+        """★ 用户 2026-09-20 点名的约束：**「换掉这一格」必须是单选。**
+
+        `openPicker` 的两种形态靠 `selected` 分 —— 给了它就是「这一格现在是谁」
+        （画红框、点一下就选中并关窗）。那三处（货架换商品 / 配方换产物 /
+        掉落换材料）都是**单值字段**，多选对它们没有意义：一次勾两件，
+        到底哪一件该落进这一格说不清。
+
+        合成配方的材料格 2026-09-20 改成了整组编辑器，它**不传 `selected`**
+        （当前几种已经是 ✓ 了，再叠一层红框是两种「选中」打架）⇒ 这条不变式
+        正好还是干净的：**`selected` 和 `multi` 永不同时出现。**
+
+        ★ 按**括号配平**切出每一发调用的参数块，不用贪婪正则 ——
+        `admin.js` 七千多行，`.*?` 跨过几百行去匹配下一个 `multi` 是必然的误伤。
+        """
+        _status, _h, raw = self.fetch("/admin/admin.js")
+        js = raw.decode("utf-8")
+        checked = 0
+        start = js.find("openPicker({")
+        while start >= 0:
+            depth, at = 0, js.index("{", start)
+            while at < len(js):
+                if js[at] == "{":
+                    depth += 1
+                elif js[at] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                at += 1
+            block = js[start:at + 1]
+            if "selected:" in block:
+                checked += 1
+                self.assertNotIn(
+                    "multi", block,
+                    "这一发 openPicker 既给了 selected 又想多选：\n" + block)
+            start = js.find("openPicker({", at)
+        # 一处都没扫到 = 正则失效了（比如有人把调用写成别的样子），
+        # 那这条用例就成了永远绿的摆设。
+        self.assertGreaterEqual(checked, 3, "没找到那几处单选调用点")
 
     def test_the_online_dropdowns_offer_exactly_the_filters_the_server_knows(self):
         """★ 下拉里的值和服务端 `ONLINE_FILTERS` 必须**一个不多一个不少**。
@@ -1693,6 +1739,109 @@ class AdminAccountApiTests(_AdminCase):
         result = self.request("/admin/api/admins/remove", {"name": "admin"})[1]
         self.assertFalse(result["ok"])
         self.assertIn("至少要保留一个系统管理员", result["message"])
+
+
+class WeaponEndpointTests(_AdminCase):
+    """「自定义属性」弹窗那两发（X3，用户 2026-09-19）。"""
+
+    CUSTOM = 1920001
+    ORIGINAL = 1120011
+
+    def setUp(self):
+        super().setUp()
+        if not shopdata.exists(self.CUSTOM):
+            raise unittest.SkipTest("shop_items.json 里没有自定义武器")
+        self.assertTrue(self.login()[1]["ok"])
+
+    def test_get_returns_both_modes_with_references(self):
+        status, result = self.request("/admin/api/weapon?id=%d" % self.CUSTOM)
+        self.assertEqual(200, status)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["custom"])
+        self.assertTrue(result["can_edit"])
+        self.assertEqual(["pve", "pvp"], [m["key"] for m in result["modes"]])
+        keys = [f["key"] for f in result["fields"]]
+        self.assertEqual(list(weaponcfg.FIELD_KEYS), keys)
+        damage = result["fields"][0]
+        self.assertEqual(6, damage["reference"])           # 爆裂 3 的 Damage
+        self.assertIsNone(damage["pve"])
+        self.assertIsNone(damage["pvp"])
+        # 预览 = 游戏里大厅那一档（X10：商店页 / 仓库页画 PVE）
+        self.assertTrue(result["preview"].startswith(
+            weaponcfg.MODE_ONLY_NOTE[weaponcfg.MODE_PVE]))
+        # 两套的首行也要随这一发下去 —— 弹窗预览区每块的第一行就画它
+        self.assertEqual({m: weaponcfg.MODE_ONLY_NOTE[m] for m in weaponcfg.MODES},
+                         result["mode_notes"])
+        # ★ 弹窗要画的两样「话」也得随这一发下去（页面上不写死，X7）：
+        #   每格「0 代表…」的灰字，和追踪那条跨格判据的提示。
+        self.assertEqual(weaponcfg.ZERO_MEANS.get("homing_angle"),
+                         [f for f in result["fields"] if f["key"] == "homing_angle"][0]["zero_note"])
+        self.assertEqual({"angle": "homing_angle", "range": "homing_range",
+                          "message": weaponcfg.HOMING_RULE_MESSAGE}, result["homing_rule"])
+
+    def test_turning_without_a_reach_is_refused_by_the_server_too(self):
+        """★ 前台锁了保存键只是省一次往返 —— 真边界在服务端，直接 POST 也得被拒。"""
+        status, result = self.request("/admin/api/weapon", {
+            "id": self.CUSTOM, "params": {"pve": {}, "pvp": {"homing_angle": 300}}})
+        self.assertEqual(400, status, result)
+        self.assertIn("追踪距离", result["message"])
+        self.assertEqual({}, weaponcfg.load(self.data_dir)["custom"])   # 一个字节没落盘
+
+    def test_an_original_weapon_only_has_a_description(self):
+        status, result = self.request("/admin/api/weapon?id=%d" % self.ORIGINAL)
+        self.assertEqual(200, status)
+        self.assertFalse(result["custom"])
+        self.assertEqual({}, result["mode_notes"])
+        status, result = self.request("/admin/api/weapon",
+                                      {"id": self.ORIGINAL, "params": {"pve": {}, "pvp": {"damage": 1}}})
+        self.assertEqual(400, status)
+        self.assertIn("原版武器", result["message"])
+
+    def test_post_saves_and_reports_the_push(self):
+        status, result = self.request("/admin/api/weapon", {
+            "id": self.CUSTOM, "desc": "说明", "params": {"pve": {"damage": 40}, "pvp": {"damage": 2}}})
+        self.assertEqual(200, status, result)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(0, result["pushed"])               # 测试里没有游戏连接
+        self.assertEqual(40, [f for f in result["fields"] if f["key"] == "damage"][0]["pve"])
+        self.assertEqual(2, [f for f in result["fields"] if f["key"] == "damage"][0]["pvp"])
+        # 预览 = 大厅那一档（PVE）⇒ 画的是 40 那一套；PVP 的 2 在 `lines` 里看得到（X10）
+        self.assertIn("伤害 40", result["preview"])
+        self.assertIn("伤害 2", "\n".join(result["lines"]["pvp"]))
+        self.assertEqual("说明", result["desc"])
+        # 落盘了、serial 涨了；`/admin/api/item` 那条说明文也跟着变（catalog 已失效）
+        table = weaponcfg.load(self.data_dir)
+        self.assertEqual({"pve": {"damage": 40}, "pvp": {"damage": 2}},
+                         table["custom"][str(self.CUSTOM)])
+        self.assertEqual(1, table["serial"])
+        _status, item = self.request("/admin/api/item?id=%d" % self.CUSTOM)
+        self.assertIn("说明", item["desc"])
+
+    def test_bad_payloads_are_refused_before_touching_the_file(self):
+        for payload in ({"id": "x", "desc": "a"},
+                        {"id": self.CUSTOM},
+                        {"id": self.CUSTOM, "params": []},
+                        {"id": self.CUSTOM, "params": {"pvp": {"damage": -1}}},
+                        {"id": self.CUSTOM, "desc": "1\n2\n3\n4"},
+                        {"id": 10001, "desc": "材料不是武器"}):
+            status, result = self.request("/admin/api/weapon", payload)
+            self.assertEqual(400, status, payload)
+            self.assertFalse(result["ok"], payload)
+        self.assertEqual({}, weaponcfg.load(self.data_dir)["custom"])
+
+    def test_a_player_can_read_but_not_write(self):
+        # 先登管理员再登玩家：把登录限速关掉，免得 429 盖住真正要看的回执
+        # （同 `PlayerReadOnlyTests.setUp`）。
+        self.httpd.RequestHandlerClass.admin_limiter = \
+            web_admin.LoginRateLimiter(cooldown=0)
+        self.request("/admin/api/logout", {})
+        self.accounts.register("alice", "PlayerPw1", display_name="爱丽丝")
+        self.assertTrue(self.login("alice", "PlayerPw1")[1]["ok"])
+        status, result = self.request("/admin/api/weapon?id=%d" % self.CUSTOM)
+        self.assertEqual(200, status)
+        self.assertFalse(result["can_edit"])
+        status, result = self.request("/admin/api/weapon", {"id": self.CUSTOM, "desc": "x"})
+        self.assertEqual(403, status)
 
 
 class OperatorPermissionTests(_AdminCase):

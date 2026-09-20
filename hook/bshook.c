@@ -44,6 +44,10 @@
 /* ★ 复用更新器那份 SHA-256（CNG / bcrypt，Win7+ 系统自带）—— 它本来就是
    用来校验下载包的，不要再写第二份实现。源文件由 build.bat 一起编进来。 */
 #include "sha256.h"
+/* ★ 弹匣容量 → 准星外圈帧号。生成物：tools/aimring.py 一边画那些帧、
+   一边写这张表，build.bat 每次编译前重新跑一遍（--header-only）。
+   别在本文件里写死任何帧号 —— test/test_aimring.py 盯着两边。 */
+#include "aimring.h"
 #pragma intrinsic(_ReturnAddress)
 
 /* -------------------------------------------------------------------------- */
@@ -8017,8 +8021,16 @@ static void __stdcall on_crypt_out(int kind, void *buf, int len)
         bsvlog_hex("SNOW    GT 出", (const unsigned char *)buf, n);
 }
 
+static void wtab_apply_if_main_thread(void);   /* 自定义武器表（X3），定义在下面那一段 */
+
 static void __stdcall on_crypt(int kind, void *self, void *dst, void *src, int len)
 {
+    /* ★ 自定义武器表（X3）：收到表的那一刻如果不在主线程，就攒着；游戏下一次
+       从主线程发包（Encrypt 是主线程的活）时补写 —— 这是一个事件，不是定时器。
+       正常路径的开销 = 读一个标志。 */
+    if (kind == 2)
+        wtab_apply_if_main_thread();
+
     /* ★ 位置数据的 UDP 旁路（见本文件「位置数据的 UDP 旁路」一段）。
        `kind == 2` 是 `SimpleCipher::Encrypt` —— **加密之前**，也是整个进程里
        唯一能看到出站明文帧的地方。
@@ -8370,6 +8382,823 @@ static int try_hook_render_init(void)
         (void *)RENDER_INIT_VA, (void *)det_render_init, "RendererInit");
     if (!s_render_init) return 0;
     InterlockedExchange(&g_render_hooked, 1);
+    return 1;
+}
+
+/* ========================================================================== */
+/* 自定义武器表（X_Mod · X3）—— 服务端说了算的武器数值，写进客户端内存           */
+/*                                                                            */
+/* 18 把「自定义」武器的数值不在资源包里定死，而由管理页配置、服务端下发：      */
+/*   gsp 0x0F01（我们自造的 opcode，只有本 hook 认识）                          */
+/*     u16 format=3 · u32 serial · u16 n · u8 模式 · n × { i32 武器Id          */
+/*        · [PVE] u32 mask + 14×4B · [PVP] u32 mask + 14×4B }                  */
+/*   14 格按 `server/weaponcfg.FIELDS` 的顺序（见下面的 WTAB_FIELD[]）；        */
+/*   format 3 起最后两格是**追踪** HomingAngle(i32) / HomingRange(f32)，X7。    */
+/*                                                                            */
+/* 客户端那边（本轮逆的，X_Mod §36）：                                          */
+/*   · WeaponTable::Load(path) = 0x48b50d，容器全局 0x72e788，一条记录 0x254 B； */
+/*     **每次进图都重读**（对战 GameContextNewPvp 构造 0x497cb6、闯关场景构造   */
+/*     0x4a3b7c，外加启动 0x43567f、weapon-newpvp.ini 0x497c5e）⇒ 写进去的数    */
+/*     每局都会被 ini 里的原值盖掉，所以要挂在 Load 的**返回点**上再写一遍。     */
+/*   · 按 Id 查表 0x4157bf：ecx=容器、eax=&id → eax=节点 或 0；记录在 [节点+8]。 */
+/*   · 收 0xFF 帧的主分发 ServerConnection::vft[13] = 0x54e036（ecx=this，      */
+/*     栈上一个包对象，[包+0xc] = 帧首，opcode 在帧 +8，载荷长在 +2）；          */
+/*     未知 opcode 走 0x54e546 `xor al,al` 返回 0。挂在它头上把 0x0F01 吞掉。    */
+/*                                                                            */
+/* 模式：PVE / PVP 两套表**由「谁在重读 ini」决定** —— 闯关场景构造 → PVE，     */
+/* 对战构造 / 启动 → PVP。这两个构造函数本身就是「这一局是闯关还是对战」的事实， */
+/* 不用服务端猜房间模式（铁律 10）。                                            */
+/*                                                                            */
+/* 逃生门：BSHOOK_KEEP_WEAPON_TABLE=1 只跳过写内存（包照样吞）；                 */
+/*         BSHOOK_WEAPON_MODE=pve|pvp 强制模式（实机核对两套表都写对时用）。     */
+/* ========================================================================== */
+#define WTAB_OPCODE        0x0F01
+#define WTAB_FORMAT        3
+#define WTAB_FIELDS        14
+#define WTAB_MAX           32
+#define WTAB_RECORD_BYTES  (4 + 2 * (4 + 4 * WTAB_FIELDS))     /* 124 */
+#define WTAB_HEADER_BYTES  9        /* u16 格式 + u32 序号 + u16 条数 + u8 模式 */
+/* 载荷头那一格模式（服务端 `weaponcfg.HOOK_MODE_*`）。★ NONE = 「只更新数据、
+   别施加」：管理页改了数值不捅正在进行的那一局，**下一局才生效**（用户
+   2026-09-19 拍板）。带真模式的那一发只在开局握手之前发，它同时就是
+   「这一局是闯关还是对战」的**事实**（§42 / D32）。 */
+#define WTAB_MODE_PVE      0
+#define WTAB_MODE_PVP      1
+#define WTAB_MODE_NONE     0xFF
+#define WTAB_TABLE_VA      0x0072e788u
+#define WTAB_LOOKUP_VA     0x004157bfu
+#define WTAB_DISPATCH_VA   0x0054e036u
+#define WTAB_LOAD_VA       0x0048b50du
+/* ★★ 第 5 条会改写武器记录的路径（§44）：`0x48adb0(路径)` 加载一份**额外的** ini
+   并把里面的小节逐条解析进同一张表 `0x72e788` —— 闯关进图时由场景代码调
+   （`0x4a3771` / `0x4a3804`，文件存在才调）。它**不经过 `WeaponTable::Load`**，
+   所以只钩 Load 的话，闯关里我们写的值会被它连带冲回 ini 原值。 */
+#define WTAB_MERGE_VA      0x0048adb0u
+#define WTAB_RECORD_SIZE   0x254u
+/* Load 的返回地址 → 模式（call 0x48b50d 的下一条指令） */
+#define WTAB_RET_QUEST     0x004a3b81u   /* 闯关场景构造 */
+#define WTAB_RET_PVP       0x00497cbbu   /* GameContextNewPvp 构造 */
+#define WTAB_RET_PVP2      0x00497c63u   /* NewPvp 另一构造（读 weapon-newpvp.ini，明文树里没有那个文件） */
+#define WTAB_RET_BOOT      0x00435684u   /* 应用初始化 */
+/* 站点特征：0x54e036 `push esi / mov esi,ecx / mov ecx,[0x72e29c]`（9 B，偷走的正是这三条）；
+   0x48b50d `mov eax,0x62e808`（5 B）；0x4157bf `push esi / mov esi,[eax] / push edi`。 */
+static const unsigned char WTAB_DISPATCH_SIG[9] = { 0x56,0x8b,0xf1,0x8b,0x0d,0x9c,0xe2,0x72,0x00 };
+static const unsigned char WTAB_LOAD_SIG[5]     = { 0xb8,0x08,0xe8,0x62,0x00 };
+static const unsigned char WTAB_MERGE_SIG[5]    = { 0xb8,0x44,0xe8,0x62,0x00 };  /* mov eax,0x62e844（SEH 序言）*/
+static const unsigned char WTAB_LOOKUP_SIG[5]   = { 0x56,0x8b,0x30,0x57,0x8b };
+
+/* 14 格的记录偏移 + 类型。顺序 == `weaponcfg.FIELDS`（test_weaponcfg 钉着那边的顺序）。
+   ★★ 最后两格是**追踪**（X7）。类型一格都不能记反：
+       `+0x78` HomingAngle 是 **i32**（`0x47e53a: db 40 78` = `fild dword [eax+0x78]`），
+       `+0x7c` HomingRange 是 **f32**（`0x47e45b: d8 58 7c` = `fcomp dword [eax+0x7c]`）。
+       客户端没有独立的追踪开关 —— `0x47e35a: cmp [记录+0x78],0; je 函数尾` 就是开关。
+       `test_patchsites_wtab` 拿脱壳镜像把这三条指令的字节钉死了。 */
+static const struct { unsigned off; int is_float; const char *name; } WTAB_FIELD[WTAB_FIELDS] = {
+    { 0x34, 0, "Damage" },        { 0x38, 0, "HeadDamage" },  { 0x3c, 0, "LegsDamage" },
+    { 0x48, 0, "SplashDamage" },  { 0x4c, 0, "SplashRange" }, { 0x60, 0, "MagazineCount" },
+    { 0x5c, 0, "CoolingTime" },   { 0x64, 0, "ReloadTime" },  { 0x58, 0, "LoadingTime" },
+    { 0x24, 1, "Velocity" },      { 0x28, 1, "MaxVelocity" }, { 0x30, 1, "GravityFactor" },
+    { 0x78, 0, "HomingAngle" },   { 0x7c, 1, "HomingRange" },
+};
+
+typedef struct { unsigned mask; unsigned v[WTAB_FIELDS]; } wtab_block_t;
+typedef struct { int id; wtab_block_t mode[2]; } wtab_rec_t;          /* mode[0]=PVE mode[1]=PVP */
+typedef struct { unsigned serial; int n; wtab_rec_t rec[WTAB_MAX]; } wtab_table_t;
+typedef struct { void *rec; int id; unsigned orig[WTAB_FIELDS]; } wtab_orig_t;
+
+static CRITICAL_SECTION g_wtab_cs;
+static int g_wtab_cs_ready = 0;
+static wtab_table_t g_wtab;                 /* 最近一次收到的表（在临界区里整份换） */
+static volatile LONG g_wtab_have = 0;       /* 收到过表 */
+static volatile LONG g_wtab_dirty = 0;      /* 收到了但还没写进内存（不在主线程） */
+static int g_wtab_mode = 1;                 /* Load 返回地址推出来的模式：0 PVE / 1 PVP（兜底） */
+static int g_wtab_mode_server = -1;         /* ★ 服务端开局时说的模式，-1 = 还没说过 */
+static unsigned g_wtab_last_src = 0;        /* 最近一次 Load 的返回地址（日志用） */
+static wtab_orig_t g_wtab_orig[WTAB_MAX];   /* 写之前存下的原值，Load 之后作废 */
+static int g_wtab_orig_n = 0;
+static void *s_wtab_dispatch = NULL;        /* 蹦床 */
+static void *s_wtab_load = NULL;
+static void *s_wtab_merge = NULL;           /* 0x48adb0 的蹦床 */
+static DWORD g_wtab_merge_ret = 0;          /* 同 g_wtab_load_ret：不递归、只在主线程 */
+static DWORD g_wtab_load_ret = 0;           /* Load 的原返回地址（Load 不递归、只在主线程） */
+static volatile LONG g_wtab_hooked = 0;
+static unsigned g_wtab_logged_serial = 0;   /* 日志按 (serial, 模式, 写入条数) 翻转去重 */
+static int g_wtab_logged_mode = -1;
+static int g_wtab_logged_written = -1;
+static unsigned g_wtab_logged_src = 0xFFFFFFFFu;   /* 去重键里也要带来源，否则两件事被合成一行 */
+
+static int wtab_keep_original(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_WEAPON_TABLE", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+/* 强制模式：返回 0/1，没设返回 -1。 */
+static int wtab_forced_mode(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_WEAPON_MODE", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return -1;
+    if ((buf[0] | 0x20) == 'p' && (buf[1] | 0x20) == 'v' && (buf[2] | 0x20) == 'e') return 0;
+    if ((buf[0] | 0x20) == 'p' && (buf[1] | 0x20) == 'v' && (buf[2] | 0x20) == 'p') return 1;
+    return -1;
+}
+
+static void *wtab_lookup(int id)
+{
+    int key = id;
+    void *node = NULL;
+    __asm {
+        lea eax, key
+        mov ecx, WTAB_TABLE_VA
+        mov edx, WTAB_LOOKUP_VA
+        call edx
+        mov node, eax
+    }
+    return node;
+}
+
+static wtab_orig_t *wtab_orig_of(void *rec, int id)
+{
+    int i;
+    for (i = 0; i < g_wtab_orig_n; i++)
+        if (g_wtab_orig[i].rec == rec && g_wtab_orig[i].id == id) return &g_wtab_orig[i];
+    if (g_wtab_orig_n >= WTAB_MAX) return NULL;
+    {
+        wtab_orig_t *o = &g_wtab_orig[g_wtab_orig_n++];
+        o->rec = rec;
+        o->id = id;
+        for (i = 0; i < WTAB_FIELDS; i++)
+            o->orig[i] = *(unsigned *)((unsigned char *)rec + WTAB_FIELD[i].off);
+        return o;
+    }
+}
+
+/* 把当前表按 `mode` 写进武器记录。**只许在主线程调**（表只在主线程重建）。 */
+static void wtab_apply(int mode, const char *why)
+{
+    wtab_table_t snap;
+    int i, f, written = 0, missing = 0;
+    int sample_id = 0, sample_damage = 0, sample_magazine = 0;
+
+    if (!g_wtab_have) return;
+    EnterCriticalSection(&g_wtab_cs);
+    snap = g_wtab;
+    LeaveCriticalSection(&g_wtab_cs);
+    InterlockedExchange(&g_wtab_dirty, 0);
+
+    if (wtab_keep_original()) {
+        if (g_wtab_logged_serial != snap.serial) {
+            bslog("WTAB    BSHOOK_KEEP_WEAPON_TABLE 已设：收到自定义武器表 v%u 但不写内存", snap.serial);
+            g_wtab_logged_serial = snap.serial;
+        }
+        return;
+    }
+    for (i = 0; i < snap.n; i++) {
+        const wtab_rec_t *r = &snap.rec[i];
+        const wtab_block_t *b = &r->mode[mode];
+        void *node = wtab_lookup(r->id);
+        void *rec;
+        wtab_orig_t *orig;
+        if (!node || IsBadReadPtr(node, 12)) { missing++; continue; }
+        rec = *(void **)((unsigned char *)node + 8);
+        if (!rec || IsBadWritePtr(rec, WTAB_RECORD_SIZE)) { missing++; continue; }
+        orig = wtab_orig_of(rec, r->id);
+        for (f = 0; f < WTAB_FIELDS; f++) {
+            unsigned *slot = (unsigned *)((unsigned char *)rec + WTAB_FIELD[f].off);
+            if (b->mask & (1u << f))
+                *slot = b->v[f];
+            else if (orig)
+                *slot = orig->orig[f];
+        }
+        /* ★ 取第一条写成功的当样本，把**真正落进内存的数**打进日志（见下面那段注释）。 */
+        if (!written) {
+            sample_id = r->id;
+            sample_damage = *(int *)((unsigned char *)rec + 0x34);
+            sample_magazine = *(int *)((unsigned char *)rec + 0x60);
+        }
+        written++;
+    }
+    /* 日志按 (serial, 模式, 写入条数, **来源**) 翻转去重。
+       ★★ 2026-09-19 补上「来源」和「样本值」：上一版的去重键里没有来源，于是
+       「开局推了一次」和「进图 Load 之后又重施加了一次」两件事只要 serial/模式/条数
+       一样就被合并成一行 —— 查「PVE 到底写没写进去」时只能靠 `g_wtab_last_src`
+       事后反推，白花一轮实机。判据要么自己说出来，要么就别打这行日志。
+       样本值直接**从记录里读回来**，所以它回答的是「内存里现在到底是哪一套」，
+       不是「我打算写什么」。 */
+    if (g_wtab_logged_serial != snap.serial || g_wtab_logged_mode != mode
+            || g_wtab_logged_written != written || g_wtab_logged_src != g_wtab_last_src) {
+        if (written)
+            bslog("WTAB    自定义武器表 v%u：按【%s】写入 %d/%d 条（%s，来源 %08X）"
+                  "；回读 id=%d 身体伤害=%d 弹匣=%d%s",
+                  snap.serial, mode == 0 ? "任务" : "对战", written, snap.n, why,
+                  g_wtab_last_src, sample_id, sample_damage, sample_magazine,
+                  missing ? "，有条目在表里查不到" : "");
+        else
+            bslog("WTAB    自定义武器表 v%u：按【%s】写入 0/%d 条（%s，来源 %08X）"
+                  "—— 一条都没写，武器表这会儿还没加载",
+                  snap.serial, mode == 0 ? "任务" : "对战", snap.n, why, g_wtab_last_src);
+        g_wtab_logged_serial = snap.serial;
+        g_wtab_logged_mode = mode;
+        g_wtab_logged_written = written;
+        g_wtab_logged_src = g_wtab_last_src;
+    }
+}
+
+/* 模式的三级取值：环境变量强制 > ★服务端开局时说的 > Load 返回地址推的（兜底）。
+   ★ 为什么服务端优先：`WeaponTable::Load` 的调用时机**不等于开局** —— 实测闯关
+   第一局打完才跑一次，而从闯关回到对战时干脆一次都不跑（§42）。只有训练场 /
+   教程那种不走服务端房间的场合才轮得到兜底那一级。 */
+static int wtab_current_mode(void)
+{
+    int forced = wtab_forced_mode();
+    if (forced >= 0) return forced;
+    if (g_wtab_mode_server >= 0) return g_wtab_mode_server;
+    return g_wtab_mode;
+}
+
+/* 攒着的表在主线程上补写（`on_crypt` 每次出站都问一下，正常路径就一个标志）。 */
+static void wtab_apply_if_main_thread(void)
+{
+    if (!g_wtab_dirty) return;
+    if (GetCurrentThreadId() != g_main_thread_id) return;
+    wtab_apply(wtab_current_mode(), "主线程补写");
+}
+
+/* 0x0F02「仓库提示框说明文表」（X10）和 0x0F01 共用这个收包入口；
+   解析、存表和绘制点补丁都在下面「仓库提示框的说明文」那一整段里。 */
+#define WDESC_OPCODE        0x0F02
+static int wdesc_on_frame(const unsigned char *frame);
+
+/* 收到一帧 0xFF：是我们自造的 opcode 就解析 + 存表，返回 1 = 吞掉；
+   其余返回 0 交给原分发。 */
+static int __cdecl wtab_on_frame(void *pkt)
+{
+    const unsigned char *frame;
+    unsigned opcode, len, fmt, serial, n, mode, i, f;
+    const unsigned char *p;
+    wtab_table_t tmp;
+
+    if (!pkt || IsBadReadPtr(pkt, 0x10)) return 0;
+    frame = *(const unsigned char **)((const unsigned char *)pkt + 0xc);
+    if (!frame || IsBadReadPtr(frame, 10)) return 0;
+    if (frame[0] != 0xFF) return 0;
+    opcode = *(const unsigned short *)(frame + 8);
+    if (opcode == WDESC_OPCODE) return wdesc_on_frame(frame);   /* 仓库说明文（X10）*/
+    if (opcode != WTAB_OPCODE) return 0;
+
+    len = *(const unsigned short *)(frame + 2);
+    p = frame + 10;
+    if (len < WTAB_HEADER_BYTES || IsBadReadPtr(p, len)) {
+        bslog("WTAB    !! 0x0F01 载荷太短（%u），丢弃", len);
+        return 1;
+    }
+    fmt = *(const unsigned short *)(p + 0);
+    serial = *(const unsigned *)(p + 2);
+    n = *(const unsigned short *)(p + 6);
+    mode = *(const unsigned char *)(p + 8);
+    if (fmt != WTAB_FORMAT || n > WTAB_MAX
+            || len != WTAB_HEADER_BYTES + n * WTAB_RECORD_BYTES) {
+        bslog("WTAB    !! 0x0F01 格式对不上（format=%u n=%u len=%u），丢弃", fmt, n, len);
+        return 1;
+    }
+    if (mode != WTAB_MODE_PVE && mode != WTAB_MODE_PVP && mode != WTAB_MODE_NONE) {
+        bslog("WTAB    !! 0x0F01 模式位不认识（%u），当成「不施加」", mode);
+        mode = WTAB_MODE_NONE;
+    }
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.serial = serial;
+    tmp.n = (int)n;
+    p += WTAB_HEADER_BYTES;
+    for (i = 0; i < n; i++) {
+        int m;
+        tmp.rec[i].id = *(const int *)p;
+        p += 4;
+        for (m = 0; m < 2; m++) {
+            tmp.rec[i].mode[m].mask = *(const unsigned *)p;
+            p += 4;
+            for (f = 0; f < WTAB_FIELDS; f++) {
+                tmp.rec[i].mode[m].v[f] = *(const unsigned *)p;
+                p += 4;
+            }
+        }
+    }
+    EnterCriticalSection(&g_wtab_cs);
+    g_wtab = tmp;
+    LeaveCriticalSection(&g_wtab_cs);
+    InterlockedExchange(&g_wtab_have, 1);
+    /* ★★ 只有带真模式的那一发（= 开局）才置「该写内存了」。管理页保存 / 登录后
+       那两发是 NONE，**只换表不写内存** —— 数值改动因此天然「下一局生效」，
+       不会把正在进行的那一局改成一半（弹匣容量在进图时已经快照进持枪器，
+       局内改记录只会让准星和实际弹匣对不上，§42）。 */
+    if (mode != WTAB_MODE_NONE) {
+        g_wtab_mode_server = (int)mode;
+        InterlockedExchange(&g_wtab_dirty, 1);
+    }
+    bslog("WTAB    收到自定义武器表 v%u：%u 条，模式 %s（线程 %lu%s）", serial, n,
+          mode == WTAB_MODE_NONE ? "不施加（下一局生效）"
+                                 : (mode == WTAB_MODE_PVE ? "任务" : "对战"),
+          (unsigned long)GetCurrentThreadId(),
+          GetCurrentThreadId() == g_main_thread_id ? "，主线程" : "，非主线程，等主线程补写");
+    wtab_apply_if_main_thread();
+    return 1;
+}
+
+/* 0x54e036 头上的 detour：ecx=this、[esp+4]=包对象。吞掉时照默认分支 `xor al,al; ret 4`。 */
+static __declspec(naked) void det_wtab_dispatch(void)
+{
+    __asm {
+        push ecx
+        push edx
+        push dword ptr [esp+12]      /* 包对象 = 原 [esp+4]，压了两个寄存器之后是 +12 */
+        call wtab_on_frame
+        add esp, 4
+        pop edx
+        pop ecx
+        test eax, eax
+        jnz swallow
+        push s_wtab_dispatch
+        ret
+    swallow:
+        xor al, al
+        ret 4
+    }
+}
+
+/* Load 返回之后：`Load` 刚把整张表按 ini 重解析了一遍（我们写进去的值全没了），
+   所以**必须**在这儿再写一遍。原值缓存同时作废（记录是新的）。
+
+   ★ 返回地址只用来喂**兜底**的 `g_wtab_mode`：服务端说过模式的话
+   `wtab_current_mode()` 用服务端那份（§42 / D32）。 */
+static void __cdecl wtab_after_load(void)
+{
+    unsigned ret = (unsigned)g_wtab_load_ret;
+    g_wtab_last_src = ret;
+    g_wtab_orig_n = 0;
+    if (ret == WTAB_RET_QUEST) g_wtab_mode = 0;
+    else if (ret == WTAB_RET_PVP || ret == WTAB_RET_PVP2 || ret == WTAB_RET_BOOT) g_wtab_mode = 1;
+    else bslog("WTAB    ⚠ WeaponTable::Load 从不认识的地方被调（返回地址 %08X），模式沿用上一次", ret);
+    if (g_wtab_have)
+        wtab_apply(wtab_current_mode(), "进图重读后重施加");
+}
+
+static __declspec(naked) void wtab_load_stub(void)
+{
+    __asm {
+        pushad
+        pushfd
+        call wtab_after_load
+        popfd
+        popad
+        push g_wtab_load_ret
+        ret
+    }
+}
+
+/* 0x48b50d 头上的 detour：记下原返回地址、换成桩，再跳蹦床跑原函数。 */
+static __declspec(naked) void det_wtab_load(void)
+{
+    __asm {
+        push eax
+        mov eax, dword ptr [esp+4]
+        mov g_wtab_load_ret, eax
+        pop eax
+        mov dword ptr [esp], offset wtab_load_stub
+        push s_wtab_load
+        ret
+    }
+}
+
+/* ★ 关卡额外 ini 合并（`0x48adb0`）之后：它刚把一批小节按 ini 原文解析进同一张表，
+   我们写的值被连带冲掉了，所以和 `Load` 一样在返回点重写一遍（§44 / D35）。
+   原值缓存也要作废 —— 被它碰过的记录已经是新解析出来的了。 */
+static void __cdecl wtab_after_merge(void)
+{
+    /* ★ 把「来源」记成合并站点本身：`wtab_apply` 的日志去重键里带着它，不改的话这一次
+       重施加和开局那一发的键完全一样，**整行会被吃掉** —— 2026-09-19 就是这么白查了一轮
+       （§44 / D32 的教训：判据要么自己说出来，要么就别打这行日志）。
+       它同时也让日志上「谁重建了这张表」一眼可读：`来源 0048ADB0` = 关卡合并。 */
+    g_wtab_last_src = WTAB_MERGE_VA;
+    g_wtab_orig_n = 0;
+    if (g_wtab_have)
+        wtab_apply(wtab_current_mode(), "关卡武器表合并后重施加");
+}
+
+static __declspec(naked) void wtab_merge_stub(void)
+{
+    __asm {
+        pushad
+        pushfd
+        call wtab_after_merge
+        popfd
+        popad
+        push g_wtab_merge_ret
+        ret
+    }
+}
+
+static __declspec(naked) void det_wtab_merge(void)
+{
+    __asm {
+        push eax
+        mov eax, dword ptr [esp+4]
+        mov g_wtab_merge_ret, eax
+        pop eax
+        mov dword ptr [esp], offset wtab_merge_stub
+        push s_wtab_merge
+        ret
+    }
+}
+
+static int try_install_weapon_table_hooks(void)
+{
+    if (g_wtab_hooked) return 1;
+    if (IsBadReadPtr((const void *)WTAB_DISPATCH_VA, sizeof(WTAB_DISPATCH_SIG)) ||
+        IsBadReadPtr((const void *)WTAB_LOAD_VA, sizeof(WTAB_LOAD_SIG)) ||
+        IsBadReadPtr((const void *)WTAB_LOOKUP_VA, sizeof(WTAB_LOOKUP_SIG)))
+        return 0;
+    if (memcmp((const void *)WTAB_DISPATCH_VA, WTAB_DISPATCH_SIG, sizeof(WTAB_DISPATCH_SIG)) != 0) return 0;
+    if (memcmp((const void *)WTAB_LOAD_VA, WTAB_LOAD_SIG, sizeof(WTAB_LOAD_SIG)) != 0) return 0;
+    if (memcmp((const void *)WTAB_LOOKUP_VA, WTAB_LOOKUP_SIG, sizeof(WTAB_LOOKUP_SIG)) != 0) return 0;
+    if (!g_wtab_cs_ready) {
+        InitializeCriticalSection(&g_wtab_cs);
+        g_wtab_cs_ready = 1;
+    }
+    s_wtab_dispatch = install_inline_hook((void *)WTAB_DISPATCH_VA, (void *)det_wtab_dispatch,
+                                          "ServerConnection::OnGameFrame(0x0F01 自定义武器表)");
+    if (!s_wtab_dispatch) return 0;
+    s_wtab_load = install_inline_hook((void *)WTAB_LOAD_VA, (void *)det_wtab_load,
+                                      "WeaponTable::Load(重读后重施加)");
+    if (!s_wtab_load) {
+        bslog("WTAB    !! Load 钩子没装上：表只在收到时写一次，进图重读后会被 ini 原值盖掉");
+    }
+    if (!IsBadReadPtr((const void *)WTAB_MERGE_VA, sizeof(WTAB_MERGE_SIG))
+            && memcmp((const void *)WTAB_MERGE_VA, WTAB_MERGE_SIG, sizeof(WTAB_MERGE_SIG)) == 0) {
+        s_wtab_merge = install_inline_hook((void *)WTAB_MERGE_VA, (void *)det_wtab_merge,
+                                           "WeaponTable::MergeIni(关卡额外武器表)");
+    }
+    if (!s_wtab_merge) {
+        bslog("WTAB    !! 关卡合并钩子没装上：闯关进图时我们写的值会被关卡 ini 冲回原值（§44）");
+    }
+    InterlockedExchange(&g_wtab_hooked, 1);
+    bslog("WTAB    ★自定义武器表钩子已装（吞 0x0F01 @ %08X，Load 返回点 @ %08X，"
+          "关卡合并返回点 @ %08X%s，查表 @ %08X）",
+          WTAB_DISPATCH_VA, WTAB_LOAD_VA, WTAB_MERGE_VA,
+          s_wtab_merge ? "" : "（没装上！）", WTAB_LOOKUP_VA);
+    return 1;
+}
+
+/* ========================================================================== */
+/* 仓库提示框的说明文：按「玩家现在在哪」换那一套（X_Mod · X10，§52 / D45）    */
+/*                                                                            */
+/* 18 把自定义武器的数值分 PVE / PVP 两套，而提示框第 1 段只有 5 行、装不下     */
+/* 两套 ⇒ 一次只画一套。画哪一套按场景走（用户 2026-09-20）：                  */
+/*   · 大厅的商店页 / 仓库页 —— 这一局是闯关还是对战**还没定** ⇒ 画 PVE；      */
+/*   · 待机房间里那个快速换装的仓库 —— 模式已经由房间定死 ⇒ 画房间那一套。     */
+/*                                                                            */
+/* 为什么非得动客户端：仓库提示框的文字来自 `ItemInfo+0x18`，而 `ItemInfo` 被   */
+/* 客户端缓存在全局 ItemDB `[0x72e1dc]` 里，**插入遇重复 key 直接忽略**         */
+/* （`0x415cff`，§39）⇒ 服务端重发 `0x0501` 刷不掉。所以只能在**绘制的那一瞬间**  */
+/* 把字符串换掉。                                                             */
+/*                                                                            */
+/* 客户端那边（本轮逆的，§52）：                                               */
+/*   · `UiCabinetToolTip`（vft `0x6681ec`）**一个类通吃三处** —— 构造函数       */
+/*     `0x454572` 全镜像只有 3 个调用点：`0x44d2a2` 商店页里的仓库格、          */
+/*     `0x453be4` 大厅仓库页、`0x46ee58` **待机房间的快速换装背包**（它所在的   */
+/*     函数同时在建「교체완료 / 换装完成」那个按钮）⇒ 一处补丁全覆盖。         */
+/*   · 刷新文字的是 vft 槽 1 = `0x454dd5`；`ebx` 在 `0x454de3` 一次 `mov ebx,ecx`  */
+/*     之后全程不变 = `this`，`[this+0xd0]` 是 `ItemInfo*`（`0x454b15` 拿        */
+/*     `CabinetItem+4` 当 key 调 ItemDB 查表 `0x415a94` 存进去的），             */
+/*     函数入口 `0x454df5` 已经判过它非空。                                    */
+/*   · 补丁点 `0x4554e7`：`mov eax,[ebx+0xd0] / add eax,0x18`，紧跟着           */
+/*     `push L"|" / push eax / lea eax,[ebp-0x38] / push eax / call 0x5d5789`   */
+/*     —— 那个切分函数对第 2 个参数**只做一次** `mov eax,[arg2]; mov eax,[eax]`  */
+/*     取出 `wchar_t*`（`0x5d57c3`），随即 `wcsncpy` 进 1000 wchar 的栈缓冲。   */
+/*     ⇒ **替身只要是「首 dword 指向我们自己那串 UTF-16」的地址**就行，         */
+/*     不用构造字符串类、不碰堆所有权（游戏的 CRT 和我们的不是同一个堆）。     */
+/*   · `eax` 的活期只有一条指令（`0x4554f5 push eax`，下一条就被 `lea` 覆盖），  */
+/*     标志位从 `0x4554f0` 起没人读 ⇒ 换成 `call` 出去再回来是安全的。          */
+/*                                                                            */
+/* ⚠⚠ **同样的 9 字节还在 `0x45ff1b`** —— 那是 `UiCompositionToolTip`（合成    */
+/* 提示框，只在大厅）。**那处不打**，所以这里按「固定 VA + 字节签名」双重校验，  */
+/* **绝不按签名全图搜**。`test_patchsites_desc` 钉着这一条。                    */
+/*                                                                            */
+/* 文案全部由服务端算好整段推下来（gsp `0x0F02`），本文件一个字都不拼：         */
+/*   u16 format=1 · u32 serial · u8 模式 · u16 n                               */
+/*   n × { i32 **物品 id**（= `ItemInfo+4`，★不是 0x0F01 那个武器 Id）         */
+/*        · u16 字数 · 字数 × u16 UTF-16LE }                                   */
+/* 文本已经过服务端的 `desc_wire()`：段分隔是 `|`，段内换行是**字面** `\` + `n`。 */
+/*                                                                            */
+/* 逃生门：BSHOOK_KEEP_CABINET_DESC=1 —— 不装这个补丁（包照吞、照记日志），     */
+/*         仓库提示框回到「画 0x0501 发下来的那一套」，房间里也不换。          */
+/* ========================================================================== */
+/* WDESC_OPCODE 在上面 `wtab_on_frame` 之前就定义了（那儿要按它分流）。 */
+#define WDESC_FORMAT        1
+#define WDESC_MAX           32         /* 现在 18 把，同 WTAB_MAX 留一倍余量 */
+#define WDESC_TEXT_MAX      384        /* wchar，含结尾 NUL。实测最长 124，
+                                          顶格的自定义说明文（90 字 + 记号）最坏 ~250 */
+#define WDESC_HEADER_BYTES  9          /* u16 格式 + u32 序号 + u8 模式 + u16 条数 */
+#define WDESC_SITE_VA       0x004554e7u
+#define WDESC_SITE_LEN      9          /* E8 rel32 + 4 × NOP，正好两条原指令 */
+#define WDESC_SITE_OTHER    0x0045ff1bu /* 同签名的另一处 = 合成提示框，**不打** */
+/* 0x4554e7: `mov eax,[ebx+0xd0]` + `add eax,0x18` */
+static const unsigned char WDESC_SITE_SIG[WDESC_SITE_LEN] = {
+    0x8b, 0x83, 0xd0, 0x00, 0x00, 0x00,     /* mov eax, [ebx+0xd0] */
+    0x83, 0xc0, 0x18                        /* add eax, 0x18       */
+};
+
+typedef struct {
+    const wchar_t *box;                 /* ★ 替身本体：首 dword 指向 text */
+    int            id;                  /* 物品 id（ItemInfo+4 = ItemDB 的 key）*/
+    wchar_t        text[WDESC_TEXT_MAX];
+} wdesc_rec_t;
+
+typedef struct {
+    unsigned    serial;
+    int         mode;                   /* WTAB_MODE_PVE / PVP，只进日志 */
+    int         n;
+    wdesc_rec_t rec[WDESC_MAX];
+} wdesc_table_t;
+
+/* ★ 单独一把锁，**不和 `g_wtab_cs` 共用**：绘制函数悬停时每帧都跑，而
+   `wtab_apply` 会在 `g_wtab_cs` 里做 `IsBadWritePtr` 扫描 —— 共用就是拿 UI
+   线程去排那个队。这把锁里只做「≤32 次 int 比较 + 一次 ≤384 wchar 的拷贝」。 */
+static CRITICAL_SECTION g_wdesc_cs;          /* 在 DllMain 里初始化，见文件末尾 */
+static wdesc_table_t    g_wdesc;            /* 正在用的（读写都在锁里）*/
+static wdesc_table_t    g_wdesc_stage;      /* 解析暂存：只有收包线程碰。
+                                               ★ 不放栈上 —— 一个 25 KB 的帧太肥 */
+static volatile LONG    g_wdesc_have = 0;
+static volatile LONG    g_wdesc_patched = 0;
+/* 绘制线程用的抄写缓冲：在锁里抄一份出来再返回，这样 `0x5d5789` 在锁外读的
+   那块内存不会被收包线程改到一半。UI 只有一条线程，一份就够。 */
+static wchar_t          g_wdesc_scratch[WDESC_TEXT_MAX];
+static const wchar_t   *g_wdesc_scratch_box = g_wdesc_scratch;
+/* 日志按 (物品 id, 模式) **翻转**去重 —— 这个函数悬停时每帧都跑，
+   不上闩就是刷屏（全局规范：按状态翻转去重，不按次数/时间窗）。 */
+static int              g_wdesc_said_mode = -1;
+
+static int cabinet_desc_keep_original(void)
+{
+    /* 设了才是「保留原版」（和别的 KEEP_* 同一套语义）。 */
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_CABINET_DESC", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+/* 收到一帧 0x0F02：解析 + 存表。返回 1 = 吞掉（这个 opcode 只有我们认识）。 */
+static int wdesc_on_frame(const unsigned char *frame)
+{
+    unsigned len, fmt, serial, n, mode, i;
+    const unsigned char *p, *end;
+
+    len = *(const unsigned short *)(frame + 2);
+    p = frame + 10;
+    end = p + len;
+    if (len < WDESC_HEADER_BYTES || IsBadReadPtr(p, len)) {
+        bslog("WDESC   !! 0x0F02 载荷太短（%u），丢弃", len);
+        return 1;
+    }
+    fmt = *(const unsigned short *)(p + 0);
+    serial = *(const unsigned *)(p + 2);
+    mode = *(const unsigned char *)(p + 6);
+    n = *(const unsigned short *)(p + 7);
+    if (fmt != WDESC_FORMAT || n > WDESC_MAX) {
+        bslog("WDESC   !! 0x0F02 格式对不上（format=%u n=%u len=%u），丢弃", fmt, n, len);
+        return 1;
+    }
+    memset(&g_wdesc_stage, 0, sizeof(g_wdesc_stage));
+    g_wdesc_stage.serial = serial;
+    g_wdesc_stage.mode = (int)mode;
+    g_wdesc_stage.n = (int)n;
+    p += WDESC_HEADER_BYTES;
+    for (i = 0; i < n; i++) {
+        unsigned cch, keep;
+        if ((unsigned)(end - p) < 6) {
+            bslog("WDESC   !! 0x0F02 第 %u 条的头越界，整份丢弃", i);
+            return 1;
+        }
+        g_wdesc_stage.rec[i].id = *(const int *)p;
+        cch = *(const unsigned short *)(p + 4);
+        p += 6;
+        if ((unsigned)(end - p) < cch * 2) {
+            bslog("WDESC   !! 0x0F02 第 %u 条的正文越界（cch=%u），整份丢弃", i, cch);
+            return 1;
+        }
+        /* ★ 超长只**截断**、不丢弃：丢弃会退回 ItemDB 里那一套（可能是另一个
+           模式），玩家看到的是「模式串了」；截断只是少一截字，模式仍是对的。 */
+        keep = cch < WDESC_TEXT_MAX ? cch : WDESC_TEXT_MAX - 1;
+        if (keep != cch)
+            bslog("WDESC   !! 第 %u 条（id=%d）文案 %u 字超过上限 %u，截断",
+                  i, g_wdesc_stage.rec[i].id, cch, (unsigned)(WDESC_TEXT_MAX - 1));
+        memcpy(g_wdesc_stage.rec[i].text, p, keep * 2);
+        g_wdesc_stage.rec[i].text[keep] = 0;
+        g_wdesc_stage.rec[i].box = g_wdesc_stage.rec[i].text;
+        p += cch * 2;
+    }
+    if (p != end) {
+        bslog("WDESC   !! 0x0F02 长度对不上（解到 %u / 共 %u），整份丢弃",
+              (unsigned)(p - (frame + 10)), len);
+        return 1;
+    }
+    EnterCriticalSection(&g_wdesc_cs);
+    g_wdesc = g_wdesc_stage;
+    for (i = 0; i < n; i++)                   /* ★ 结构体整体赋值之后 box 还指着
+                                                 `g_wdesc_stage` 里的 text，要重指 */
+        g_wdesc.rec[i].box = g_wdesc.rec[i].text;
+    LeaveCriticalSection(&g_wdesc_cs);
+    InterlockedExchange(&g_wdesc_have, 1);
+    bslog("WDESC   收到仓库说明文表 v%u：%u 条，按【%s】那一套"
+          "（%s）", serial, n,
+          mode == WTAB_MODE_PVE ? "任务" : (mode == WTAB_MODE_PVP ? "对战" : "?"),
+          g_wdesc_patched ? "补丁已装，下次悬停就是新的" : "⚠ 补丁没装上，不会生效");
+    return 1;
+}
+
+/* 返回「要画的那个字符串对象」的地址：命中替换表就给替身，否则原样给
+   `ItemInfo+0x18`。★ 返回值 4 条指令之后就被 `0x5d5789` 抄进它自己的栈缓冲
+   （中间没有任何 call），所以一份 scratch 够用。 */
+static const void * __cdecl cabinet_desc_pick(unsigned char *self)
+{
+    unsigned char *info = *(unsigned char **)(self + 0xd0);
+    int id, i, mode = -1, hit = 0;
+
+    /* `info == NULL` 时原样返回 `0x18`，和被换掉的那两条指令一个语义
+       （实际到不了这儿：`0x454df5` 已经判过非空）。 */
+    if (info == NULL || !g_wdesc_have) return (const void *)(info + 0x18);
+    id = *(const int *)(info + 4);            /* ItemInfo+0x04 = 物品 id */
+    EnterCriticalSection(&g_wdesc_cs);
+    for (i = 0; i < g_wdesc.n; i++) {
+        if (g_wdesc.rec[i].id != id) continue;
+        wcsncpy(g_wdesc_scratch, g_wdesc.rec[i].text, WDESC_TEXT_MAX - 1);
+        g_wdesc_scratch[WDESC_TEXT_MAX - 1] = 0;
+        mode = g_wdesc.mode;
+        hit = 1;
+        break;
+    }
+    LeaveCriticalSection(&g_wdesc_cs);
+    if (!hit) return (const void *)(info + 0x18);
+    /* ★ 闩只看**模式**，不看 id：看 id 的话，鼠标在两个格子之间来回扫就会
+       一条一条地刷（那是「按次数」去重的变种）。模式翻转才是真的状态变化，
+       第一个被换掉的物品顺带报个 id 当样本。 */
+    if (g_wdesc_said_mode != mode) {
+        g_wdesc_said_mode = mode;
+        bslog("WDESC   仓库提示框换成【%s】那一套（样本 id=%d）",
+              mode == WTAB_MODE_PVE ? "任务" : "对战", id);
+    }
+    return (const void *)&g_wdesc_scratch_box;
+}
+
+/* `0x4554e7` 的 9 字节被换成 `call 这里` + 4 × NOP，`ret` 之后接着跑那 4 个
+   NOP 再到 `0x4554f0`。
+   ★ 返回值必须落在 **eax** —— `0x4554f5 push eax` 是它唯一的消费点。
+   ★ 要保 ecx / edx：被换掉的那两条指令不碰它们，而 C 函数会。ebx/esi/edi/ebp
+     由编译器按调用约定自己保。标志位可证明是死的（`0x4554f0` 起没人读）。 */
+static __declspec(naked) void cabinet_desc_thunk(void)
+{
+    __asm {
+        push ecx
+        push edx
+        push ebx                        /* 参数：this（ItemInfo 在 [this+0xd0]）*/
+        call cabinet_desc_pick
+        add  esp, 4
+        pop  edx
+        pop  ecx
+        ret
+    }
+}
+
+static int try_patch_cabinet_desc(void)
+{
+    unsigned char *p = (unsigned char *)WDESC_SITE_VA;
+    DWORD oldp;
+
+    if (g_wdesc_patched) return 1;
+    if (IsBadReadPtr(p, WDESC_SITE_LEN)) return 0;
+    /* 幂等：已打过就是「E8 <到 thunk 的 rel32> + 4 × 90」 */
+    if (p[0] == 0xE8
+        && (DWORD)(*(int *)(p + 1))
+               == (DWORD)((UINT_PTR)&cabinet_desc_thunk - (UINT_PTR)(p + 5))) {
+        InterlockedExchange(&g_wdesc_patched, 1);
+        return 1;
+    }
+    if (memcmp(p, WDESC_SITE_SIG, WDESC_SITE_LEN) != 0)
+        return 0;                    /* 还没解壳到这里，或不是已确认的版本 */
+
+    if (!VirtualProtect(p, WDESC_SITE_LEN, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   仓库提示框说明文: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    p[0] = 0xE8;
+    *(DWORD *)(p + 1) = (DWORD)((UINT_PTR)&cabinet_desc_thunk - (UINT_PTR)(p + 5));
+    p[5] = p[6] = p[7] = p[8] = 0x90;
+    VirtualProtect(p, WDESC_SITE_LEN, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, WDESC_SITE_LEN);
+    InterlockedExchange(&g_wdesc_patched, 1);
+    bslog("PATCH   ★仓库提示框说明文 @ %08X：按物品 id 换成服务端 0x0F02 推的那一套"
+          "（大厅 = 任务，待机房间 = 该房间的模式）；合成提示框 @ %08X 同签名，不打",
+          (unsigned)WDESC_SITE_VA, (unsigned)WDESC_SITE_OTHER);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★ 准星外圈的弹格：让任意弹匣容量都有格子（X4，FINDINGS §43）              */
+/*                                                                            */
+/*   原版 0x48ca0d 是一张**精确匹配**的 switch：容量 2/3/6/10/14/18 各有一张   */
+/*   刻度盘（图集 Images/Game/AimPoint 的帧 6/5/6/8/7/9），**其余一律返回      */
+/*   帧 4 —— 一张没有任何刻度的光滑圆环**。原版玩家武器只用过那 6 个容量，     */
+/*   所以美术只画了 6 张；自定义武器一配成 15 / 20 发，外圈就退化成一个连起来   */
+/*   的圆，看不到子弹格子。                                                    */
+/*                                                                            */
+/*   补法：tools/aimring.py 把 2..20 里缺的 13 个容量补画进图集（原版那 6 张    */
+/*   一个像素不动），并生成 aimring.h 那张表；这里把 0x48ca0d **整个改写成**    */
+/*   跳到我们的实现 —— 不需要蹦床，因为新表把原来那 6 个值原样覆盖了。         */
+/*   容量 > 20 仍然走光滑圆环（用户 2026-09-19 拍板：格子太密反而糊成一片）。   */
+/*                                                                            */
+/*   ⚠ 资源和代码是一对：换了 bshook.dll 就必须同时换资源包，否则帧 19..31     */
+/*   在老图集里不存在 —— 客户端会拿越界的指针去画（§3 那类崩法）。            */
+/*   `manifest-hook.json` 和资源卷本来就是一起发的，别只换一个。               */
+/* -------------------------------------------------------------------------- */
+
+#define AIM_RING_VA        0x0048ca0du
+#define AIM_RING_SIG_LEN   10
+
+/* 0x48ca0d: `test ecx,ecx / push 4 / pop eax / je +0x2e / mov ecx,[ecx+0x60]` */
+static const unsigned char AIM_RING_SIG[AIM_RING_SIG_LEN] = {
+    0x85, 0xC9,                   /* test ecx, ecx        */
+    0x6A, 0x04,                   /* push 4               */
+    0x58,                         /* pop  eax             */
+    0x74, 0x2E,                   /* je   0x48ca42        */
+    0x8B, 0x49, 0x60              /* mov  ecx, [ecx+0x60] */
+};
+
+/* `__fastcall`：记录指针在 ecx，返回帧号在 eax（和原函数一致）。
+   `[记录+0x60]` 是 MagazineCount（WTAB_FIELD 里同一个偏移）。 */
+static int __fastcall aim_ring_frame(const unsigned char *rec)
+{
+    int cap;
+    if (rec == NULL) return POPSHOT_AIM_DEFAULT_FRAME;
+    cap = *(const int *)(rec + 0x60);
+    if (cap < POPSHOT_AIM_DIAL_MIN || cap > POPSHOT_AIM_DIAL_MAX)
+        return POPSHOT_AIM_DEFAULT_FRAME;      /* 光滑圆环 */
+    return (int)POPSHOT_AIM_FRAME[cap];
+}
+
+/* 原函数不碰 edx，我们替它守住 —— 调用约定上 edx 本来就是可破坏的，
+   但两个调用点（0x48f978 / 0x48fc5f）紧接着都还没重设它，白守一个寄存器
+   换「和原版逐寄存器等价」，值。 */
+static __declspec(naked) void aim_ring_frame_thunk(void)
+{
+    __asm {
+        push edx
+        call aim_ring_frame         /* ecx 已经是参数，fastcall 不用清栈 */
+        pop  edx
+        ret
+    }
+}
+
+static volatile LONG g_aim_ring_patched = 0;
+
+static int aim_ring_keep_original(void)
+{
+    /* 设了才是「保留原版」（和别的 KEEP_* 同一套语义）。 */
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_AIM_RING", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+static int try_patch_aim_ring(void)
+{
+    unsigned char *p = (unsigned char *)AIM_RING_VA;
+    DWORD oldp;
+
+    if (g_aim_ring_patched) return 1;
+    if (IsBadReadPtr(p, AIM_RING_SIG_LEN)) return 0;
+    /* 幂等：已打过就是「E9 <跳到 thunk 的 rel32>」 */
+    if (p[0] == 0xE9
+        && (DWORD)(*(int *)(p + 1))
+               == (DWORD)((UINT_PTR)&aim_ring_frame_thunk - (UINT_PTR)(p + 5))) {
+        InterlockedExchange(&g_aim_ring_patched, 1);
+        return 1;
+    }
+    if (memcmp(p, AIM_RING_SIG, AIM_RING_SIG_LEN) != 0)
+        return 0;                    /* 还没解壳到这里，或不是已确认的版本 */
+
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   准星弹格: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    p[0] = 0xE9;
+    *(DWORD *)(p + 1) = (DWORD)((UINT_PTR)&aim_ring_frame_thunk - (UINT_PTR)(p + 5));
+    VirtualProtect(p, 5, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    InterlockedExchange(&g_aim_ring_patched, 1);
+    bslog("PATCH   ★准星弹格 @ %08X: 弹匣 %d..%d 全部有刻度盘（原版只认 2/3/6/10/14/18），"
+          "超过 %d 发用光滑圆环；图集 %d → %d 帧",
+          (unsigned)AIM_RING_VA, POPSHOT_AIM_DIAL_MIN, POPSHOT_AIM_DIAL_MAX,
+          POPSHOT_AIM_DIAL_MAX, POPSHOT_AIM_ORIG_FRAMES, POPSHOT_AIM_TOTAL_FRAMES);
     return 1;
 }
 
@@ -8745,6 +9574,47 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x47E40A 的特征串一直对不上）");
     }
 
+    /* ★ 自定义武器表（X3）：功能钩子，一直装。两个站点都在解壳后就绪的代码里；
+       0x0F01 要登录成功之后才会来，远晚于这里。 */
+    for (ticks = 0; !g_stop && !g_wtab_hooked && ticks < 2000; ticks++) {
+        if (try_install_weapon_table_hooks()) break;
+        Sleep(2);
+    }
+    if (!g_wtab_hooked)
+        bslog("PATCH   !! 超时未能装自定义武器表钩子"
+              "（0x54e036 / 0x48b50d / 0x4157bf 的特征串一直对不上）—— 9 把自定义武器只有资源包里的数值");
+
+    /* ★ 仓库提示框说明文（X10，§52）：功能补丁。目标函数只在悬停物品格时跑，
+       远晚于解壳窗口。装不上只是「房间里的仓库提示框仍画大厅那一套（任务属性）」，
+       不崩、不影响别的 —— 所以超时只记一行，不重试到天荒地老。 */
+    if (cabinet_desc_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_CABINET_DESC 已设，仓库提示框保留原版行为"
+              "（画 0x0501 发下来的那一套，待机房间里也不跟着房间模式换）");
+    } else {
+        for (ticks = 0; !g_stop && !g_wdesc_patched && ticks < 2000; ticks++) {
+            if (try_patch_cabinet_desc()) break;
+            Sleep(2);
+        }
+        if (!g_wdesc_patched)
+            bslog("PATCH   !! 超时未能 patch 仓库提示框说明文"
+                  "（0x004554E7 的特征串一直对不上）—— 房间里的仓库提示框仍画大厅那一套");
+    }
+
+    /* ★ 准星弹格（X4，§43）：功能补丁，一直装。目标函数只在战斗里画准星时跑，
+       远晚于解壳窗口。装不上只是「非 6 个原版容量的武器外圈没格子」，不影响别的。 */
+    if (aim_ring_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_AIM_RING 已设，保留原版行为"
+              "（弹匣不是 2/3/6/10/14/18 时准星外圈是一个没有刻度的圆）");
+    } else {
+        for (ticks = 0; !g_stop && !g_aim_ring_patched && ticks < 2000; ticks++) {
+            if (try_patch_aim_ring()) break;
+            Sleep(2);
+        }
+        if (!g_aim_ring_patched)
+            bslog("PATCH   !! 超时未能 patch 准星弹格"
+                  "（0x48ca0d 的特征串一直对不上）—— 非原版容量的武器外圈仍是光滑圆环");
+    }
+
     /* ★ M3b 诊断：弹体全字段快照（临时，查完「看不见 bot 的子弹」就删）。
        两个 hook 的目标函数都在战斗里才第一次跑，远晚于解壳窗口。 */
     if (!proj_diag_enabled()) {
@@ -9017,6 +9887,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         DisableThreadLibraryCalls(inst);
         InitializeCriticalSection(&g_cs);
         InitializeCriticalSection(&g_notice_cs);   /* 登录公告的两个触发点串这一把 */
+        InitializeCriticalSection(&g_wdesc_cs);    /* 仓库说明文：收包线程 ⇄ 绘制线程（X10）*/
         g_main_thread_id = GetCurrentThreadId(); /* LoadLibrary APC 正在这条主线程上执行 */
         g_dllmain_tick = GetTickCount();
         read_log_level();

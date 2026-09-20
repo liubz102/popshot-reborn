@@ -92,6 +92,10 @@ SELL_PRICE_FILENAME = "sell_price.json"
 #: ★ 它**有配置标签页**（`SCHEMA["cards"]` / 管理页「称号卡片」），
 #:   所以七份里只有 `sell_price.json` 没有页面。
 CARDS_FILENAME = "cards.json"
+#: ★ **自定义武器的数值 + 全武器的说明文**（X_Mod · X3）：第七份运营配置，和卖价表
+#: 同一档（没有配置标签页，编辑入口是物品库卡片上的「自定义属性」弹窗）。
+#: 规则和读写都在 `weaponcfg.py`，这里只登记文件名和 `_SPECS` 那一格。
+WEAPONS_FILENAME = "weapons.json"
 
 #: ★ 合成界面只有 4 个材料槽（`ComposeItemNewUI.ui` 的 `ImgBar0~3`，§7）。
 #: 配方写第 5 种材料，玩家在界面上根本看不见 —— 校验时直接拒绝。
@@ -321,6 +325,29 @@ NAME_ZH = {
 #: 三个武器系列。★ 这三个中文名是**用户记忆里的原版叫法**，别改。
 SERIES_ZH = {"D": "爆裂", "R": "极速", "F": "复合"}
 
+#: ★ 自定义武器：**韩文名后缀字母 -> 名字里的中文词**（用户 2026-09-19 定）。
+#: 后缀字母由 `tools/custom-weapon/spec.BATCHES` 的批次字母决定，写进商店图标文件名
+#: （`무기_리볼버 C.png`），再经 `shopdata.icon_name()` 变成 `name_kr`（`리볼버 C`）。
+#:
+#: ★ **用后缀字母分批，不用部位码**：`name_kr` 本来就带着它，产物不用加字段、
+#:   `shop_items.json` 的 FORMAT 也就不用抬。加第三批时这里加一行即可。
+CUSTOM_WEAPON_ZH_BY_SUFFIX = {
+    "C": "自定义1",     # 第一批：爆裂 3 母本 · 黄金 + 银白
+    "P": "自定义2",     # 第二批：复合 3 母本 · 樱花粉 + 抹茶绿
+}
+#: 管理页卡片上的类别字样，两批共用。
+KIND_CUSTOM_WEAPON_ZH = "武器（自定义）"
+
+
+def custom_weapon_suffix(name_kr):
+    """`리볼버 C` -> `("리볼버", "自定义1")`；不是自定义武器就返回 `(原名, None)`。"""
+    name = (name_kr or "").strip()
+    for letter, zh in CUSTOM_WEAPON_ZH_BY_SUFFIX.items():
+        suffix = " " + letter
+        if name.endswith(suffix):
+            return name[:-len(suffix)].strip(), zh
+    return name, None
+
 #: 角色 id → 中文名（`Data/ChrProps.ini` 的前三个，V0.1 §119）。
 CHARACTER_ZH = {0: "泰尔", 1: "卡希尔", 2: "布洛克"}
 
@@ -438,8 +465,14 @@ def _split_part_suffix(name):
 
 def weapon_name_zh(item):
     """`리볼버 R1` → `左轮 极速1`；翻不出来就原样返回韩文名。"""
+
     name = item.name_kr or ""
     base = name
+    if getattr(item, "custom", False):
+        # 自定义武器：`리볼버 C` → 「左轮 自定义1」（X3 / X6）。翻不出基础名就把韩文基础名留着。
+        base, zh = custom_weapon_suffix(name)
+        if zh:
+            return "%s %s" % (NAME_ZH.get(base, base), zh)
     if item.series and item.tier:
         suffix = " %s%d" % (item.series, item.tier)
         if name.endswith(suffix):
@@ -1179,40 +1212,68 @@ CARD_CRAFT_PREFIX = "可合成："
 
 #: 压行：数值加成一行最多摆几项。234 px / 字号 10 大约放得下 3 项
 #: （「攻击 +3%　防御 +2%　生命 +2」）。★ 这个数要实机核对。
-BONUS_PER_LINE = 3
+BONUS_PER_LINE = 2
+# 每一项字段固定宽度10
+BONUS_PER_WIDTH = 10
+
+#: 提示框排不下时**第一个让位**的项（用户 2026-09-20）。
+#:
+#: ★ 「追踪」挤进来之前，自定义武器正好 8 项 = 4 行，加上首行
+#:   「仅显示PVP属性…」刚好把 `ITEM_DESC_MAX_LINES`(5) 占满 ——
+#:   多一项就会有一整行被 `stats[:ITEM_DESC_MAX_LINES]` **静默截掉**。
+#: ★★ 但**只在真的排不下时才丢**（用户原话「仅在显示不下时让位」）：
+#:   预算是算出来的（5 行 − 前面已经占掉的行数，再 × 每行 2 项），
+#:   不是「有追踪就固定丢飞行速度」那种写死的规则（铁律 10）。
+_WEAPON_LINE_YIELD_ORDER = ("velocity",)
 
 
-def _weapon_lines(weapon):
-    """武器数值那几行。`weapon` 是 `shop_items.json` 里那个 dict。"""
-    lines = []
+def _weapon_lines(weapon, max_lines=None):
+    """武器数值那几行。`weapon` 是 `shop_items.json` 里那个 dict。
+
+    `max_lines` = 这一段最多画几行；`None` = **不限，全都画**（管理页弹窗用的就是它，
+    用户 2026-09-20：游戏里装不下可以让位，管理页要看得到完整内容）。
+    """
+    cells = []      # [(键, 文本)] —— 带键是为了让位时认得出是哪一项
     damage = weapon.get("damage")
     if damage is not None:
+        cells.append(("damage", "伤害 %d " % damage))
         # 伤害按**部位**分档，没有随机数（§17）。爆头 / 腿部两档不一定都有。
-        parts = []
         if weapon.get("head_damage"):
-            parts.append("爆头 %d" % weapon["head_damage"])
-        if weapon.get("legs_damage"):
-            parts.append("腿部 %d" % weapon["legs_damage"])
-        lines.append("伤害 %d%s"
-                     % (damage, "（%s）" % " / ".join(parts) if parts else ""))
+            cells.append(("head_damage", "爆头 %d " % weapon["head_damage"]))
+        # if weapon.get("legs_damage"):
+        #     cells.append(("legs_damage", "腿部 %d" % weapon["legs_damage"]))
     # ★ 溅射两格原来一直没画出来 —— 榴弹类真正的杀伤在这
-    splash = []
     if weapon.get("splash_damage"):
-        splash.append("溅射 %d" % weapon["splash_damage"])
+        cells.append(("splash_damage", "溅射 %d " % weapon["splash_damage"]))
     if weapon.get("splash_range"):
-        splash.append("范围 %d" % weapon["splash_range"])
-    if splash:
-        lines.append("　".join(splash))
-    handling = []
+        cells.append(("splash_range", "溅射范围 %d " % weapon["splash_range"]))
     if weapon.get("magazine"):
-        handling.append("弹匣 %d 发" % weapon["magazine"])
+        cells.append(("magazine", "弹容 %d " % weapon["magazine"]))
+    if weapon.get("cooling_ms"):
+        cells.append(("cooling_ms", "射速 %.1f/秒 " % (1000.0 / weapon["cooling_ms"])))
     if weapon.get("reload_ms"):
-        handling.append("换弹 %.2f 秒" % (weapon["reload_ms"] / 1000.0))
-    if handling:
-        lines.append("　".join(handling))
+        cells.append(("reload_ms", "装填 %.1f秒 " % (weapon["reload_ms"] / 1000.0)))
     if weapon.get("velocity"):
-        lines.append("初速 %d" % weapon["velocity"])
-    return lines
+        cells.append(("velocity", "飞行速度 %d " % weapon["velocity"]))
+    # ★ 追踪只在**真的开着**的时候才画（`HomingAngle = 0` 就是客户端的「不追踪」）。
+    if weapon.get("homing_angle"):
+        cells.append(("homing_angle", "追踪 %d " % weapon["homing_angle"]))
+    if max_lines is not None:
+        room = max(0, int(max_lines)) * BONUS_PER_LINE
+        for key in _WEAPON_LINE_YIELD_ORDER:
+            if len(cells) <= room:
+                break
+            cells = [cell for cell in cells if cell[0] != key]
+    lines = [text for _key, text in cells]
+    aligned = []
+
+    for i in range(0, len(lines), BONUS_PER_LINE):
+        chunk = lines[i:i + BONUS_PER_LINE]
+        # 每一项左对齐，补空格到固定宽度
+        padded = [item.ljust(BONUS_PER_WIDTH) for item in chunk]
+        aligned_line = "".join(padded)
+        aligned.append(aligned_line)
+    return aligned
 
 
 def _bonus_lines(bonus):
@@ -1387,7 +1448,8 @@ def _card_desc_lines(item, card_rules, recipes_table):
     return stats, notes
 
 
-def item_desc_zh(item, card_rules=_AUTO, recipes_table=_AUTO):
+def item_desc_zh(item, card_rules=_AUTO, recipes_table=_AUTO, weapons_table=None,
+                 mode=None):
     """物品说明。**从本地数据现算**，原版那份说明随服务端 DB 一起没了。
 
     ⚠ 这不是「发明玩法」（铁律 12）—— 里面每个数都是客户端**自己也查得到**
@@ -1406,15 +1468,39 @@ def item_desc_zh(item, card_rules=_AUTO, recipes_table=_AUTO):
     第 1 段写**获得条件**、第 2 段写**能合成什么称号** —— 两句都来自运营配置，
     所以改完保存即刻生效。⚠ 已经在线的玩家要**重新登录**才看得到新说明：
     客户端把物品定义缓存住了（「发过就记成已请求，不回就再也不问了」，
-    packet_api §3.9）。
+    packet_api §3.9）。★ **自定义武器不受这条限制**（X10）：它那 18 条的说明文
+    由 bshook 在绘制点现换（`0x0F02`），管理页保存后即时生效。
+
+    `mode` = 自定义武器的数值行画哪一套（`weaponcfg.MODE_PVE` / `MODE_PVP`）。
+    **缺省是 PVE** —— 那是大厅的口径（商店页 / 仓库页 / 合成 / 礼物盒此刻还不知道
+    这局是闯关还是对战）。房间里那一套由 `0x0F02` 另发，不走这个缺省。
     """
     if item is None:
         return ""
     stats = []
-    if item.weapon:
-        stats.extend(_weapon_lines(item.weapon))
-    stats.extend(_bonus_lines(item.bonus or {}))
     notes = _effect_lines(item)
+    if item.weapon:
+        weapon = item.weapon
+        if item.kind == "weapon":
+            # ★ X3：武器的第 2 段可以由管理页配置（`weaponcfg`，任何武器）；
+            #   自定义武器的数值行**一次只画一套**（提示框装不下两套），并在第 1 段
+            #   首行写清是哪一套（用户 2026-09-19 定文案，2026-09-20 改成按场景切）。
+            #   `import` 写在函数里：`weaponcfg` 顶层 `import shopcfg`，别绕成环。
+            import weaponcfg
+            if weapons_table is None:
+                weapons_table = weaponcfg.load()
+            if getattr(item, "custom", False):
+                if mode is None:
+                    mode = weaponcfg.MODE_PVE
+                weapon = weaponcfg.effective_weapon_dict(item, mode, weapons_table)
+                stats.append(weaponcfg.MODE_ONLY_NOTE[mode])
+            custom_desc = weaponcfg.desc_of(item.id, weapons_table)
+            if custom_desc:
+                notes = custom_desc.split("\n")
+        # ★ 预算 = 这一段的总行数 − 前面已经占掉的（自定义武器的首行提示）。
+        #   算出来的，不是写死的（铁律 10）—— 见 `_WEAPON_LINE_YIELD_ORDER`。
+        stats.extend(_weapon_lines(weapon, max_lines=ITEM_DESC_MAX_LINES - len(stats)))
+    stats.extend(_bonus_lines(item.bonus or {}))
     if not stats and not notes and item.kind == "material":
         if card_rules is _AUTO:
             card_rules = cards()[0]
@@ -1616,6 +1702,13 @@ def default_sell_price():
     """
     import shopdefaults
     return shopdefaults.default_sell_price()
+
+
+def default_weapons():
+    """默认 `weapons.json` = 一条覆盖都没有（X3）。规则在 `weaponcfg.default_table()`。
+    ★ `import` 写在函数里：`weaponcfg` 顶层 `import shopcfg`，加载阶段两边不能互相依赖。"""
+    import weaponcfg
+    return weaponcfg.default_table()
 
 
 def default_cards():
@@ -1914,6 +2007,14 @@ def validate_sell_price(raw):
         return sellprice.validate(raw)
     except ValueError as error:
         raise ConfigError(str(error)) from None
+
+
+def validate_weapons(raw):
+    """`weapons.json` → 校验过的表（X3）。真正的规则在 `weaponcfg.validate()`
+    （那边要问 `shopdata` 哪些是自定义武器、问 `weapondata` 参考值），这里只在
+    `_SPECS` 里占一个位；它抛的就是本模块 `ConfigError` 的子类，不用再翻译。"""
+    import weaponcfg
+    return weaponcfg.validate(raw)
 
 
 #: 阈值上限。累计指标（总伤害、总开枪数）够得着六位数，留一个数量级余量。
@@ -2475,6 +2576,10 @@ _SPECS = {
     #   「装备卖出」页上那个弹窗），所以不进 `SCHEMA` / `CONFIG_FILES`。
     SELL_PRICE_FILENAME: (validate_sell_price, default_sell_price,
                           _USE_DEFAULT),
+    # ★ 自定义武器的数值 + 全武器说明文（X3）：同一档待遇、同样没有标签页。
+    #   读不到 / 读坏了退回**出厂值**（= 没有任何覆盖，客户端拿到的就是资源包里
+    #   爆裂 3 的数）—— 空表和出厂值在这份配置上是同一个东西。
+    WEAPONS_FILENAME: (validate_weapons, default_weapons, _USE_DEFAULT),
     # ★★ 称号卡片（V0.3商店）。**必须排在最末** —— `test_shopcfg` 和
     #   `test_backup` 都拿 `list(_SPECS)[-1]` 当「最新加的那一份」，
     #   插在中间会让那两条用例验错东西。
@@ -2520,8 +2625,8 @@ _WHICH_OF = {ITEMS_FILENAME: "items", SHOP_FILENAME: "shop",
              RECIPE_FILENAME: "recipe", DROPS_FILENAME: "drops",
              REWARDS_FILENAME: "rewards", CARDS_FILENAME: "cards"}
 
-#: 没有配置标签页、因而不在 `SCHEMA` 里的那些的标题（D95）。
-_TITLE_OF = {SELL_PRICE_FILENAME: "卖出价格"}
+#: 没有配置标签页、因而不在 `SCHEMA` 里的那些的标题（D95 / X3）。
+_TITLE_OF = {SELL_PRICE_FILENAME: "卖出价格", WEAPONS_FILENAME: "自定义武器"}
 
 
 def config_filenames():
@@ -2626,6 +2731,11 @@ def sell_price(data_dir=None, _reload=False):
 def cards(data_dir=None, _reload=False):
     """`[称号卡片的获得规则…]`（V0.3商店）。读不到就是空表 = 这一版不掉卡片。"""
     return _load(CARDS_FILENAME, data_dir, _reload)
+
+
+def weapons(data_dir=None, _reload=False):
+    """自定义武器数值 + 说明文（X3，`weaponcfg`）。读不到 / 读坏了退回出厂值 = 没有覆盖。"""
+    return _load(WEAPONS_FILENAME, data_dir, _reload)
 
 
 def card_rule_of(card_id, data_dir=None):
@@ -2772,10 +2882,23 @@ def apply_first_run_upgrades(created, data_dir=None):
 #:     60005 빈대（蹭吃蹭喝的人）       厄运卡片 -> 蹭分卡片
 #:     60007 팀킬쟁이（杀队友的）       乌龙卡片 -> 误伤卡片
 #:     60008 제풀쟁이（自己把自己搞死的）信心卡片 -> 自爆卡片
+#: 第二批（用户 2026-09-19，X6）：加了第二批自定义武器之后，第一批的默认名从
+#: 「xxx 自定义」改成「xxx 自定义1」（新的那 9 把叫「xxx 自定义2」），见
+#: `CUSTOM_WEAPON_ZH_BY_SUFFIX`。这 9 条在 `data/items.json` 里是**已经落过盘的**，
+#: 而 `backfill_defaults()` 只增不改 —— 所以必须走这张表刷一遍。
 RENAMED_DEFAULT_NAMES = {
     60005: "厄运卡片",
     60007: "乌龙卡片",
     60008: "信心卡片",
+    1920001: "左轮手枪 自定义",
+    1920002: "苹果弹 自定义",
+    1920003: "狙击枪T1 自定义",
+    2920001: "复古短枪 自定义",
+    2920002: "火焰弹 自定义",
+    2920003: "华尔兹加农炮 自定义",
+    3920001: "重机枪 自定义",
+    3920002: "榴弹发射器 自定义",
+    3920003: "火箭炮 自定义",
 }
 
 
@@ -2854,54 +2977,119 @@ def backfill_defaults(data_dir=None, apply=False, only=None):
 
     `apply=False`（默认）只算不写 —— 先看清楚要加什么再决定。
     真写的时候先把原文件复制一份 `*.bak-<时刻>` 放在旁边。
+
+    ★ **这一发是「运营主动按的」**（控制通道 `shop-backfill apply`）——
+    开服自己跑的那一发是 `backfill_new_weapons()`，范围只到武器（D48）。
     """
     added = {}
-    for filename, (list_key, id_key) in BACKFILL_KEYS.items():
+    for filename in BACKFILL_KEYS:
         if only is not None and filename not in only:
             continue
-        path = path_of(filename, data_dir)
-        if not os.path.exists(path):
-            continue                    # 没有就该由 `ensure_files` 去生成
-        try:
-            with open(path, "r", encoding="utf-8") as fp:
-                raw = json.load(fp)
-        except (OSError, ValueError):
-            # 读不了就跳过。**绝不拿默认值盖掉一份读不懂的文件**（D10）。
-            continue
-        entries = raw.get(list_key)
-        if not isinstance(entries, list):
-            continue
-        have = set()
+        fresh = _backfill_one(filename, data_dir, apply)
+        if fresh:
+            added[filename] = fresh
+    if apply and added:
+        invalidate(data_dir)
+    return added
+
+
+def _backfill_one(filename, data_dir, apply, pick=None):
+    """一份配置的补齐：读盘 → 算出「默认表里有、文件里没有」→ 写盘。
+
+    返回补进去的那些条目（`apply=False` 只算不写）；读不了 / 形状不对回 `[]`。
+    `pick` 给一个 `id -> bool` 时只补它点头的那些（`backfill_new_weapons`
+    拿它把范围收到武器上）。
+
+    ★ 调用方负责 `invalidate()` —— 一次补好几份时只该失效一次。
+    """
+    list_key, id_key = BACKFILL_KEYS[filename]
+    path = path_of(filename, data_dir)
+    if not os.path.exists(path):
+        return []                       # 没有就该由 `ensure_files` 去生成
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            raw = json.load(fp)
+    except (OSError, ValueError):
+        # 读不了就跳过。**绝不拿默认值盖掉一份读不懂的文件**（D10）。
+        return []
+    entries = raw.get(list_key)
+    if not isinstance(entries, list):
+        return []
+    have = set()
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get(id_key) is not None:
+            have.add(int(entry[id_key]))
+    build = _SPECS[filename][1]
+    fresh = [entry for entry in build().get(list_key, [])
+             if int(entry[id_key]) not in have
+             and (pick is None or pick(int(entry[id_key])))]
+    if not fresh:
+        return []
+    if filename == RECIPE_FILENAME:
+        # 配方号接着现有的往下数，别和已有的撞（撞了整份文件都不合法）。
+        top = 0
         for entry in entries:
-            if isinstance(entry, dict) and entry.get(id_key) is not None:
-                have.add(int(entry[id_key]))
-        build = _SPECS[filename][1]
-        fresh = [entry for entry in build().get(list_key, [])
-                 if int(entry[id_key]) not in have]
-        if not fresh:
-            continue
-        if filename == RECIPE_FILENAME:
-            # 配方号接着现有的往下数，别和已有的撞（撞了整份文件都不合法）。
-            top = 0
-            for entry in entries:
-                try:
-                    top = max(top, int(entry.get("id", 0)))
-                except (TypeError, ValueError):
-                    pass
-            for offset, entry in enumerate(fresh, start=1):
-                entry["id"] = top + offset
-        added[filename] = fresh
-        if not apply:
-            continue
-        merged = dict(raw)
-        merged[list_key] = list(entries) + fresh
-        # 存盘前必过校验：宁可什么都不写，也不要写出一份服务端读不了的文件。
-        _SPECS[filename][0](merged)
-        # 和管理页保存 / 数据备份拿同一把写锁：别在备份线程拷到一半时换掉文件。
-        with write_lock(filename):
-            shutil.copyfile(path, "%s.bak-%s"
-                            % (path, time.strftime("%Y%m%d-%H%M%S")))
-            write_json(path, merged)
+            try:
+                top = max(top, int(entry.get("id", 0)))
+            except (TypeError, ValueError):
+                pass
+        for offset, entry in enumerate(fresh, start=1):
+            entry["id"] = top + offset
+    if not apply:
+        return fresh
+    merged = dict(raw)
+    merged[list_key] = list(entries) + fresh
+    # 存盘前必过校验：宁可什么都不写，也不要写出一份服务端读不了的文件。
+    _SPECS[filename][0](merged)
+    # 和管理页保存 / 数据备份拿同一把写锁：别在备份线程拷到一半时换掉文件。
+    with write_lock(filename):
+        shutil.copyfile(path, "%s.bak-%s"
+                        % (path, time.strftime("%Y%m%d-%H%M%S")))
+        write_json(path, merged)
+    return fresh
+
+
+def _is_weapon(item_id):
+    """这个 id 是不是**武器**（口径取原版物品表，和物品库那份配置无关）。"""
+    item = shopdata.get(item_id)
+    return bool(item) and item.kind == "weapon"
+
+
+def backfill_new_weapons(data_dir=None, apply=False):
+    """★ 这一版新加的**武器**自动进物品库；同一批里默认该上架的顺带上架。
+
+    返回 `{文件名: [新条目]}`（空 = 没什么要补的）。**每次开服都跑**，
+    因为它天然幂等：补完之后物品库里就有了，下次算出来是空的。
+
+    ## 判据：「物品库里没有」= **这台服务器从来没见过它**（不是「运营删了它」）
+
+    物品库那一页**没有删除键**（`admin.js` 只给货架 / 配方 / 掉落装了
+    `killButton`），而且每次保存都会把物品表里全部 id 补全再落盘
+    （`fillItems`，物品表里没有的 id 也不偷偷删）⇒ 一件武器缺在 `items.json`
+    里，只可能是「这台服务器上线时还没有这件东西」。补它不会盖掉任何人的决定。
+
+    ## 货架那一半为什么**只跟着刚进库的那批走**
+
+    货架有删除键 ⇒ 「`shop.json` 里没有这一行」既可能是从没有过、也可能是
+    运营亲手删的，光看文件分不出来。所以只在**同一发**里给刚进物品库的那些
+    补货架行：进过库就说明这台服务器见过它，之后货架上是什么样全是运营的事，
+    我们再也不碰（铁律 11）。⇒ 运营下架 / 删行之后**不会自己回来**。
+
+    上不上架照 `default_shop()`：原版隐藏武器在默认货架上（`listed: true`）
+    ⇒ 自动上架；自定义武器**不在默认货架里** ⇒ 一行都不加，要卖得去管理页
+    上架（X3 起就是这条口径，D53）。这张表是「该不该上架」的唯一出处，
+    这里不再抄一份名单。
+    """
+    added = {}
+    fresh = _backfill_one(ITEMS_FILENAME, data_dir, apply, pick=_is_weapon)
+    if fresh:
+        added[ITEMS_FILENAME] = fresh
+    born = set(int(entry["id"]) for entry in fresh)
+    if born:
+        shelf = _backfill_one(SHOP_FILENAME, data_dir, apply,
+                              pick=born.__contains__)
+        if shelf:
+            added[SHOP_FILENAME] = shelf
     if apply and added:
         invalidate(data_dir)
     return added

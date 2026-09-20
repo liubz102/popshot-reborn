@@ -73,7 +73,12 @@ read_ini = _weapondata.read_ini
 WeaponDataError = _weapondata.WeaponDataError
 
 #: 产物格式版本。加/改字段时 +1，`server/shopdata.py` 拿它判「这份产物我认不认识」。
-FORMAT = 1
+#:
+#: ★ 2（X_Mod · X3）：新增 **`custom`**（自定义武器，部位码 `92`）；去掉 `weapon.desc`
+#:   （说明文改由管理页配置，不再从 `weapon.ini` 的 `Desc=` 抽）。
+#:   ⚠⚠ 改这个数必须和重新生成 `server/shop_items.json` 在同一个提交里 ——
+#:   `server/shopdata.py` 对不上时返回空表，症状是**商店 / 仓库全空**。
+FORMAT = 2
 
 
 class ShopDataError(Exception):
@@ -183,6 +188,13 @@ PART_KIND = {
     11: "armor",    # 头饰      PartFlag 128
     12: "weapon",   # 武器      PartFlag 1024 / 2048 / 4096
     13: "ring",     # 戒指      PartFlag 16384
+    # ★ 92 / 93 = **自定义武器**（X_Mod · X3 / X6，本项目自己定的部位码，原版没有）：
+    #   `X <部位码> 000 S`，X = 角色、S = 槽位。和 12 一样是武器（PartFlag 1024/2048/4096），
+    #   只是数值由服务端下发（管理页可调），产物里多一个 `custom: true`。
+    #   **一批一个部位码**（92 第一批 / 93 第二批），理由见 `CUSTOM_WEAPON_PART`。
+    #   ⚠ 和期限版的 `+50` 不撞：92 - 50 = 42、93 - 50 = 43，都不是任何部位码。
+    92: "weapon",   # 自定义武器 第一批（X3，爆裂 3 母本 · 黄金）
+    93: "weapon",   # 自定义武器 第二批（X6，复合 3 母本 · 粉绿）
     21: "key",      # 金钥匙
     39: "package",  # 套装礼包
     99: "package",  # 套装打包
@@ -219,6 +231,15 @@ PREFIX_KIND_6 = {
 
 #: 武器槽 `PartFlag` -> 槽位序号。
 WEAPON_SLOT_BY_FLAG = {1024: 1, 2048: 2, 4096: 3}
+
+#: 自定义武器的部位码，**一批一个**（见 `PART_KIND`）：`92` = 第一批（爆裂 3 母本 · 黄金），
+#: `93` = 第二批（复合 3 母本 · 粉绿）。产物里两批都只打 `custom: true`，靠韩文名后缀字母
+#: （`리볼버 C` / `리볼버 P`）区分 —— 所以 `shop_items.json` 的 FORMAT 不用抬。
+#:
+#: ⚠ **别改成「共用 92、换尾号」**（如 `1920011`）：`weapon_variant()` 按尾四位落在 `11..93`
+#:   判 D/R/F，`0011` 会被判成「D 系 1 档 1 槽」。现在 `part in CUSTOM_WEAPON_PART` 会短路跳过
+#:   那次调用，但「自定义武器的尾四位天然判不出变体」这条不变式就没了（§39）。
+CUSTOM_WEAPON_PART = frozenset((92, 93))
 
 #: 三个武器系列。key 是 id 尾四位 `//10` 的十位段（见 `weapon_variant`）。
 SERIES_NAMES = {"D": "爆裂", "R": "极速", "F": "复合"}
@@ -325,6 +346,8 @@ WEAPON_FIELDS = (
     ("CoolingTime", "cooling_ms", int),
     ("Velocity", "velocity", int),
     ("ROH", "roh", int),
+    # ★ 没有 `Desc`（X3 起）：说明文由管理页配置（`server/weaponcfg.py`），
+    #   `weapon.ini` 恢复成原版之后本来也没有这个键。
 )
 
 
@@ -384,27 +407,41 @@ _SECTION = re.compile(r"^(Stock|Item)-(\d+)$", re.IGNORECASE)
 
 
 def build_items(shop_sections, bonus_table, weapons_by_ammo, warn):
-    """把三张表拼成 `{itemId(str): 记录}`。"""
-    items = collections.OrderedDict()
+    """把三张表拼成 `{itemId(str): 记录}`。
+
+    ★★ **一件东西的字段要把它名下的小节合起来看，不能只认先遇到的那一节。**
+    `Tag` / `PartFlag` 原版只写在 `[Item-]` 里，而 `[Stock-]` 排在前面的条目
+    两份表里都有（韩版 11 组、中文版 11 组）。只读第一节的话，这种条目会
+    **悄悄丢掉弹药 id 和装备槽**（`part_flag=0` ⇒ 穿不上身），一声不吭 ——
+    X5 补 18 把 3 级武器时正是按 `[Stock-]` 在前写的，当场踩中（§45）。
+    同一个键**先到的赢**，和原先「先拿到图标就不再换」一个口径。
+    """
+    merged = collections.OrderedDict()
     for section, fields in shop_sections.items():
         match = _SECTION.match(section.strip())
         if match is None:
             continue
         kindtag = match.group(1).lower()
         item_id = int(match.group(2))
-        entry = items.get(str(item_id))
-        if entry is None:
-            entry = _new_item(item_id, fields, bonus_table, weapons_by_ammo, warn)
-            items[str(item_id)] = entry
+        slot = merged.get(item_id)
+        if slot is None:
+            slot = merged[item_id] = {"fields": collections.OrderedDict(),
+                                      "stock": False, "ownable": False}
         # `[Stock-]` = 出现在货架上过；`[Item-]` = 能进背包的持有物条目。
         # 材料只有 Item，纯期限售卖形态只有 Stock，普通商品两个都有。
-        entry["stock" if kindtag == "stock" else "ownable"] = True
-        if not entry.get("icon"):
-            stem, name = icon_name(fields.get("Image"))
-            if stem:
-                entry["icon"] = stem
-                if name:
-                    entry["name_kr"] = name
+        slot["stock" if kindtag == "stock" else "ownable"] = True
+        for key, value in fields.items():
+            # 空值不算「有」—— 否则先来的 `Image=` 空串会把后面真正的图标挡住。
+            if str(value or "").strip() and key not in slot["fields"]:
+                slot["fields"][key] = value
+
+    items = collections.OrderedDict()
+    for item_id, slot in merged.items():
+        entry = _new_item(item_id, slot["fields"], bonus_table, weapons_by_ammo, warn)
+        # `_new_item` 已经把这两个键按正确顺序占好位了，这里只是填值。
+        entry["stock"] = slot["stock"]
+        entry["ownable"] = slot["ownable"]
+        items[str(item_id)] = entry
     return items
 
 
@@ -439,7 +476,13 @@ def _new_item(item_id, fields, bonus_table, weapons_by_ammo, warn):
 
     if kind == "weapon":
         slot = WEAPON_SLOT_BY_FLAG.get(part_flag)
-        series, series_slot, tier = weapon_variant(item_id)
+        # ★ 自定义武器（部位码 92 / 93，X3 / X6）：没有 D/R/F 系列和档位，`weapon_variant`
+        #   对它的尾四位（0001..0003）本来就判不出变体，这里只多打一个标记。
+        if part in CUSTOM_WEAPON_PART:
+            entry["custom"] = True
+            series, series_slot, tier = None, None, None
+        else:
+            series, series_slot, tier = weapon_variant(item_id)
         if slot is not None:
             entry["slot"] = slot
         if series is not None:

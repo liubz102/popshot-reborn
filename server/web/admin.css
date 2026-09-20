@@ -337,7 +337,7 @@ input:focus, select:focus {
   box-shadow: 0 0 0 3px rgba(245, 166, 35, .28);
 }
 input[type=number] { max-width: 100%; }
-input.bad { border-color: var(--crimson); background: #FFF2F2; }
+input.bad, textarea.bad { border-color: var(--crimson); background: #FFF2F2; }
 
 /* 字段：一个标签 + 一个控件，横着排 */
 .field { display: flex; flex-direction: column; gap: 2px; }
@@ -829,6 +829,12 @@ input.bad { border-color: var(--crimson); background: #FFF2F2; }
 .msg.bad { color: var(--crimson); font-weight: 600; }
 .dirty { color: var(--crimson); font-weight: 700; }
 .dirty.clean { color: var(--cocoa-soft); font-weight: 500; }
+/* 「填错了」比「有改动」再进一档：同样的红字加一层粉底，和输入框的 `.bad` 呼应
+   —— 保存键这时是锁着的，得让人一眼知道为什么按不动（用户 2026-09-19）。 */
+.dirty.bad-text {
+  background: #FFF2F2; border: 1px solid var(--crimson);
+  border-radius: 6px; padding: 1px 7px;
+}
 
 /* ------------------------------------------------------------ 表格 */
 table { border-collapse: collapse; width: 100%; max-width: 520px; }
@@ -1529,6 +1535,155 @@ ul.help li.ro-note { color: var(--crimson); font-weight: 700; }
   background: var(--card); border: 3px solid var(--amber-dark);
   border-radius: 12px; padding: 22px 26px;
 }
+
+/* -------------------------------------------------- 自定义属性弹窗（X3） */
+/* ⚠ 盖 `.modal .panel` 的宽高要写**三个类**（同 `#sellPriceModal` 踩过的坑）。
+   两栏数值 + 说明文 + 预览，实测正文约 700 px ⇒ 封在 860，窗口更矮时 `100%` 生效。 */
+.modal .panel.weapon-panel {
+  height: auto; max-height: min(860px, 100%); width: min(980px, 100%);
+}
+/* 工具条钉住、正文自己滚 —— 和卖价弹窗同一套骨架。 */
+.weapon-panel .panel-body {
+  overflow: hidden; display: flex; flex-direction: column; min-height: 0;
+}
+.weapon-panel .panel-body > .toolbar { flex: 0 0 auto; margin-bottom: 12px; }
+.weapon-panel .toolbar .filters { flex: 0 1 auto; min-width: 0; }
+.weapon-scroll {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  scrollbar-gutter: stable; padding-right: 2px;
+}
+/* 左 PVE / 右 PVP 两栏，中间一列「复制到另一侧」的小钮；窄到放不下就上下排。 */
+.weapon-modes {
+  display: grid; gap: 12px; align-items: start;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+}
+@media (max-width: 760px) {
+  .weapon-modes { grid-template-columns: minmax(0, 1fr); }
+  .weapon-copy { flex-direction: row; justify-content: center; }
+}
+.weapon-mode {
+  padding: 10px 12px 12px; background: var(--card);
+  border: 2px solid var(--line); border-radius: 10px;
+}
+/* ★ X10 起**两栏都会在游戏里出现**（大厅 / 任务房画 PVE，对战房画 PVP），
+   所以不再把右栏挑出来高亮 —— 原来那条 `.weapon-mode.live`（琥珀边框）已删。
+   哪一栏在哪儿画，改由栏头那行小字说（`WEAPON_MODE_WHERE`）。 */
+.weapon-mode > .sell-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding-bottom: 4px; margin-bottom: 8px;
+}
+.weapon-mode > .sell-head .note {
+  font-size: 11px; font-weight: 500; color: var(--amber-dark); white-space: nowrap;
+}
+.weapon-copy {
+  display: flex; flex-direction: column; gap: 8px; align-self: center;
+}
+.weapon-copy .btn { white-space: nowrap; }
+/* 四个分组：伤害 / 溅射 / 射击 / 弹道。
+   ★ 行距压过一轮：改单列之后一栏从 6 行变 12 行，不压的话弹窗必出滚动条。 */
+.weapon-group + .weapon-group { margin-top: 6px; }
+.weapon-group > b {
+  display: block; font-size: 12px; color: var(--cocoa-soft);
+  padding: 1px 0 3px; border-bottom: 2px dashed var(--line); margin-bottom: 4px;
+}
+/* ★ 一栏一列（用户 2026-09-19）：两列排不下「项目名 + 范围 + 输入框 + 单位 + 参考」，
+   而输入框上下对齐比省那几行高度值钱 —— 12 个字段单列排完两栏也就 500 px 上下，
+   弹窗封顶 860，平时一点滚动条都不该有。 */
+.weapon-group .rows { display: grid; gap: 3px 10px; grid-template-columns: minmax(0, 1fr); }
+/* 一格：项目名 · 「限 a ~ b」 · 输入框 · 单位 · 参考值，出错时下面再加一行红字。
+   ★ **定宽网格，不是 flex** —— 列宽写死，每一格的输入框才会上下对齐；
+     靠 flex 的话标签一长一短，输入框就参差不齐（用户 2026-09-19 提的就是这个）。
+   ★ 六列固定，所以 `weaponFieldNode()` 里**每一格都得有单位那个 span**（可以是空的）。 */
+.weapon-field {
+  display: grid;
+  grid-template-columns: 4.6em 7.4em 76px 2.4em minmax(0, 1fr);
+  align-items: center; column-gap: 6px; row-gap: 1px; min-width: 0;
+}
+.weapon-field > .lab {
+  min-width: 0; font-size: 12px; font-weight: 600;
+  color: var(--cocoa-ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* ★ 比页面上别处的输入框矮一档：整格的高度就是它撑出来的，12 行乘起来差 100 px。 */
+.weapon-field input[type=number] {
+  width: 76px; text-align: center; font-size: 13px; padding: 3px 6px;
+  -moz-appearance: textfield; appearance: textfield;
+}
+.weapon-field input[type=number]::-webkit-outer-spin-button,
+.weapon-field input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.weapon-field input[type=number]:disabled {
+  background: var(--paper-2); color: var(--cocoa-ink);
+  border-style: dashed; cursor: default; opacity: 1;
+}
+/* 改过（和落盘那份不同）的格子：和别处「有改动」同一圈红光。 */
+.weapon-field.edited input[type=number] { box-shadow: 0 0 0 3px var(--edit-glow); }
+/* 参考值：灰小字，`—` 表示资源包里这一节没写这个键。 */
+.weapon-field .ref {
+  font-size: 11px; color: var(--cocoa-soft); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.weapon-field .unit { font-size: 11px; color: var(--cocoa-soft); white-space: nowrap; }
+/* ★ 能填的范围（用户 2026-09-19）：排在项目名后面、输入框前面 —— 「这格叫什么、
+   能填多少、填了多少」念下来正好是一句话。比「参考 N」再淡一档：它是护栏，
+   不是建议值，平时不该抢眼。数由服务端 `weaponcfg.FIELDS` 发下来，CSS 里没有任何一个数。 */
+.weapon-field .lim {
+  font-size: 11px; color: var(--cocoa-soft); opacity: .8;
+  white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums;
+}
+/* 出错那一行：★ 就在**输入框正下方**（从第 3 列起），一行写完**不折行** ——
+   折行会把这一格撑高、把同一行别的格子顶歪。放不下就让它往右边的空白溢出，
+   那几列这一行本来就是空的。 */
+.weapon-field .err {
+  grid-column: 3 / -1; font-size: 11px; font-weight: 600; color: var(--crimson);
+  line-height: 1.5; display: none; white-space: nowrap; overflow: visible;
+}
+.weapon-field.has-err .err { display: block; }
+/* 「这一格填 0 会怎样」：和错误话**同一个位置**（输入框正下方），灰字、同样不折行。
+   ★ 错误优先 —— 两句一起画会把格子撑高、把同一行别的格子顶歪（同 `.err` 那条理由）。 */
+.weapon-field .hint {
+  grid-column: 3 / -1; font-size: 11px; color: var(--cocoa-soft); opacity: .85;
+  line-height: 1.5; display: none; white-space: nowrap; overflow: visible;
+}
+.weapon-field.has-hint .hint { display: block; }
+.weapon-field.has-hint.has-err .hint { display: none; }
+/* 出错的那一格连范围一起变红 —— 眼睛跟着红色走，直接看到「该填多少」。 */
+.weapon-field.has-err .lim { color: var(--crimson); opacity: 1; font-weight: 700; }
+.weapon-mode .acts { margin-top: 8px; display: flex; justify-content: flex-end; }
+/* 说明文 + 预览通栏。 */
+.weapon-desc { margin-top: 12px; }
+.weapon-desc textarea {
+  width: 100%; max-width: none; min-height: 72px; resize: vertical;
+  font: inherit; line-height: 1.5;
+}
+.weapon-desc textarea:disabled {
+  background: var(--paper-2); color: var(--cocoa-ink); border-style: dashed; opacity: 1;
+}
+.weapon-desc .count { font-size: 11px; color: var(--cocoa-soft); margin-top: 2px; }
+.weapon-desc .count.over { color: var(--crimson); font-weight: 700; }
+.weapon-preview {
+  margin-top: 12px; padding: 10px 12px;
+  background: var(--paper-2); border: 2px solid var(--line); border-radius: 10px;
+}
+.weapon-preview > b { display: block; font-size: 12px; color: var(--cocoa-soft); margin-bottom: 4px; }
+.weapon-preview pre {
+  margin: 0; font: 13px/1.6 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  white-space: pre-wrap; word-break: break-all; color: var(--cocoa-ink);
+}
+/* 两段之间那条线：客户端把 `|` 前后画成上下两块。 */
+.weapon-preview pre + pre { border-top: 2px dashed var(--line); margin-top: 6px; padding-top: 6px; }
+.weapon-preview .empty { color: var(--cocoa-soft); }
+/* 原版武器：数值不可改，一句话代替两栏。 */
+.weapon-locked {
+  padding: 10px 12px; background: var(--paper-2); border-radius: 10px;
+  font-size: 13px; color: var(--cocoa-soft);
+}
+/* 「什么时候生效」那条提示：和 .weapon-locked 同一档灰盒子，多一道左边框提醒。 */
+.weapon-when {
+  padding: 8px 12px; margin-top: 8px; background: var(--paper-2);
+  border-left: 3px solid var(--cocoa-soft); border-radius: 0 10px 10px 0;
+  font-size: 13px; color: var(--cocoa-soft);
+}
+/* 物品库卡片右下角那颗按钮：贴着「等级 / 角色限定」那一行的右端。 */
+.item-card .nums .weapon-btn { margin-left: auto; align-self: flex-end; }
 
 /* -------------------------------------------------- 卖出价格设置弹窗 */
 /* ⚠ 要盖掉 `.modal .panel { height: min(640px,100%) }`（两个类），选择器

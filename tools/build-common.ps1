@@ -588,8 +588,10 @@ function Copy-ShopData {
     }
     # 格式版本对不上的话 `shopdata` 会当**没有数据**（而不是报错），
     # 症状和「文件根本没进包」一模一样 —— 在这儿先炸出来。
-    if ($table.format -ne 1) {
-        throw "商店物品表的 format 是 $($table.format)，server\shopdata.py 只认 1，中止打包"
+    # ★ 和另外三张表一样从 server\shopdata.py 现读 FORMAT（以前写死 1，X3 抬到 2 时把打包炸了）。
+    $want = Get-ServerFormatVersion -Root $Root -Module 'shopdata'
+    if ($table.format -ne $want) {
+        throw "商店物品表的 format 是 $($table.format)，server\shopdata.py 只认 $want。先跑 tools\update-gamedata.bat 重新提取"
     }
     Copy-One $src (Join-Path $PackageRoot 'server\shop_items.json')
     return @('shop_items.json')

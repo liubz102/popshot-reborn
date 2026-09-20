@@ -43,6 +43,14 @@ op（作用在 HSV 上，然后按掩码和原图混合）：
   "sat": 固定 | "sat_mul" | "sat_add" | "sat_by_val": [亮处饱和度, 暗处饱和度]
   "val_mul" | "val_add" | "val_pow"（伽马）| "val_by_val": [亮处明度, 暗处明度]
   "val_range": [v_lo, v_hi]  *_by_val 里「亮/暗」按这个区间归一化（默认取掩码内像素的实际范围）
+  "ramp": [[t, "#RRGGBB"], ...]  **渐变映射**：按「进函数时的亮度」Y = .299R+.587G+.114B
+                            在色标表上取色（t 递增，首尾建议 0.0 / 1.0）。金属那种「暗部偏红铜
+                            → 中间调浓色 → 高光塌到近白」是条**非线性**曲线，`*_by_val` 的
+                            两端线性插值做不出来，得靠多档色标
+  "ramp_range": [lo, hi]     ★ **必填**，Y 的归一化区间。**故意不给「逐图自适应」的缺省** ——
+                            特效贴图的 Y 本来就集中在高段（实测弹道 0.30~0.83、火光 0.45~0.79），
+                            逐图拉伸会把它们整片映射到色标底端、枪口火光发褐（同 D37 那条坑）
+  "ramp_mix": 0..1           渐变映射和上面 HSV 那套结果混多少（1.0 = 纯映射，默认 1.0）
   "mix": ["#RRGGBB", 比例]   最后在 RGB 里再往某个颜色靠
 """
 from __future__ import annotations
@@ -173,9 +181,26 @@ def build_mask(spec, rgb, tex_name=None):
     return m
 
 
+def ramp_map(stops, y, lo, hi):
+    """渐变映射：按亮度 `y` 在色标表 `[[t, "#RRGGBB"], …]` 上线性取色（RGB 空间插值）。"""
+    t = np.clip((y - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    ts = np.asarray([float(a) for a, _c in stops], dtype=np.float64)
+    cs = np.asarray([hex_rgb(c) for _a, c in stops], dtype=np.float64)
+    return np.stack([np.interp(t, ts, cs[:, i]) for i in range(3)], -1)
+
+
 def apply_op(op, h, s, v, m):
     """返回变换后的 rgb（float 0..1）。`m` 只用来决定 *_by_val 的归一化范围。"""
     h, s, v = h.copy(), s.copy(), v.copy()
+    # ★ 渐变映射的键必须取**进函数时**的亮度 —— 在下面任何算子改写 h/s/v 之前算掉。
+    #   HSV 往返是精确的，所以 hsv_to_rgb(h,s,v) 就是原像素。
+    ramp_luma = None
+    if "ramp" in op:
+        if "ramp_range" not in op:
+            raise ValueError("`ramp` 必须显式给 `ramp_range`：缺省逐图自适应会把亮度本来"
+                             "就集中在高段的特效贴图整片映射到色标底端（发褐），见 recolor.py 文件头")
+        rgb0 = hsv_to_rgb(h, np.clip(s, 0, 1), np.clip(v, 0, 1))
+        ramp_luma = 0.299 * rgb0[..., 0] + 0.587 * rgb0[..., 1] + 0.114 * rgb0[..., 2]
     if "val_range" in op:
         v_lo, v_hi = op["val_range"]
     else:
@@ -209,6 +234,10 @@ def apply_op(op, h, s, v, m):
         a, b = op["val_by_val"]
         v = a + (b - a) * t_dark
     rgb = hsv_to_rgb(h % 360.0, np.clip(s, 0, 1), np.clip(v, 0, 1))
+    if ramp_luma is not None:
+        lo, hi = op["ramp_range"]
+        amount = float(op.get("ramp_mix", 1.0))
+        rgb = rgb * (1 - amount) + ramp_map(op["ramp"], ramp_luma, lo, hi) * amount
     if "mix" in op:
         color, amount = op["mix"]
         rgb = rgb * (1 - amount) + hex_rgb(color) * amount
