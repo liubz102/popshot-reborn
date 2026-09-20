@@ -4,10 +4,10 @@
   "releases": [
     {
       "version": "V0.4.1",
-      "date": "2026-09-18",
+      "date": "2026-09-20",
       "url": "https://github.com/liubz102/popshot-reborn/releases/download/V0.4.1/PopShot-portable-win64_V0-4-1.zip",
-      "size": 402864429,
-      "sha256": "1219dd5464a5f2df117eb7f247332c8c244913c6e99343ae487ef685528b4fec"
+      "size": 408030219,
+      "sha256": "1d0fec7de9e1269ca4a80dc9d34d74ca38f3085d4c186db2ad7071b64b81f7b5"
     },
     {
       "version": "V0.4.0",
