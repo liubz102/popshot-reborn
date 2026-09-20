@@ -533,8 +533,8 @@ def catalog():
                     "wh": shop.warehouse_category_of(item.id),
                 }
                 # 有才带 —— 800 件里大部分字段是空的，全量带上白涨一倍体积。
-                # ★ 自定义武器（X3）：浮窗里 PVP / PVE 两套都列（`weaponcfg.admin_desc`），
-                #   游戏内提示框装不下才只画 PVP（用户 2026-09-19）。
+                # ★ 自定义武器（X3）：浮窗里 PVE / PVP 两套都列（`weaponcfg.admin_desc`），
+                #   游戏内提示框装不下，一次只画一套（大厅 / 任务房 PVE、对战房 PVP，X10）。
                 desc = weaponcfg.admin_desc(item) if getattr(item, "custom", False) \
                     else shopcfg.item_desc_zh(item)
                 if desc:

@@ -15,7 +15,8 @@
 ## 两条链
 
 * **数值**：`effective(item_id, mode)` = 该模式的覆盖 ∪ 资源包参考值（`weapondata`，即 `weapon.ini`
-  里爆裂 3 那一节抄来的数）。它有两个消费者：`shopcfg.item_desc_zh()` 画提示框（只画 PVP 那套），
+  里爆裂 3 那一节抄来的数）。它有两个消费者：`shopcfg.item_desc_zh(mode=…)` 画提示框
+  （**一次只画一套**，按玩家在哪挑：大厅 / 任务房 = PVE，对战房 = PVP，X10），
   和 `build_hook_frame()` 组成 `0x0F01` 推给 bshook 写进客户端内存（PVE / PVP 两套一起下发，
   客户端按「这一局是闯关还是对战」自己挑）。原版武器**不在**这条链上，服务端根本不发它们的 id。
 * **说明文**：`desc_of(item_id)` 是提示框第 2 段的覆盖，`item_desc_zh()` 优先用它。
@@ -583,7 +584,8 @@ def mode_lines(item, mode, table=None, data_dir=None):
 
 def admin_desc(item, table=None, data_dir=None):
     """管理页浮窗 / 弹窗要的说明：自定义武器把 **PVE 和 PVP 两套都列出来**（用户 2026-09-19：
-    管理页空间够，两种都显示；游戏内提示框装不下才只画 PVP）。原版武器和游戏里一样。
+    管理页空间够，两种都显示；游戏内提示框装不下，一次只画一套 —— 大厅 / 任务房画 PVE、
+    对战房画 PVP，X10）。原版武器和游戏里一样。
 
     ★ 顺序 = `MODES`（**PVE 在前**），和弹窗里两栏「PVE 在左、PVP 在右」同一个方向
     —— 用户 2026-09-19 第三轮：一处左右、一处上下反着来看着别扭。

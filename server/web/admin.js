@@ -6730,15 +6730,26 @@ function weaponFieldNode(mode, spec) {
   return wrap;
 }
 
+// ★ 每一栏在**游戏里什么时候**被画出来（X10，用户 2026-09-20）。
+//   以前是「提示框只显示 PVP 这一栏」，现在两栏各有各的场合 ——
+//   判据的正身在 `gameserver.Conn.weapon_desc_mode()`，这里只是把它说给人听。
+//   ⚠ 这行字是 `white-space: nowrap` 的，和栏名挤在同一行 —— 窄窗口下会顶出去，
+//   所以写短的；完整规矩由下面那块「游戏内提示框预览」的抬头讲。
+var WEAPON_MODE_WHERE = {
+  pve: "大厅和任务房画这一栏",
+  pvp: "对战房画这一栏"
+};
+
 function weaponModeNode(mode) {
   var view = WEAPON.view;
-  var live = mode === "pvp";
-  var box = el("div", "weapon-mode" + (live ? " live" : ""));
+  var box = el("div", "weapon-mode");
   var head = el("div", "sell-head");
   var label = "";
   (view.modes || []).forEach(function (m) { if (m.key === mode) { label = m.label; } });
   head.appendChild(el("span", null, label));
-  if (live) { head.appendChild(el("span", "note", "游戏内提示框只显示这一栏")); }
+  if (WEAPON_MODE_WHERE[mode]) {
+    head.appendChild(el("span", "note", WEAPON_MODE_WHERE[mode]));
+  }
   box.appendChild(head);
   var byKey = {};
   (view.fields || []).forEach(function (f) { byKey[f.key] = f; });
@@ -6842,7 +6853,7 @@ function renderWeaponModal() {
 
   var preview = el("div", "weapon-preview");
   if (view.custom && view.lines) {
-    // ★ 两套都列（用户 2026-09-19）：游戏内提示框只画 PVP 那套，这里空间够。
+    // ★ 两套都列（用户 2026-09-19）：游戏内提示框一次只画一套，这里空间够。
     // ★★ 顺序**照 `view.modes` 走，不在这里写死** —— 那就是服务端的 `weaponcfg.MODES`
     //    （PVE 在前），和上面两栏「PVE 在左、PVP 在右」、浮窗 `admin_desc()` 同一个方向。
     //    用户 2026-09-19 第三轮：一处左右、一处上下反着来，看着别扭。

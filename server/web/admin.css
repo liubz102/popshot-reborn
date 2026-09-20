@@ -1565,8 +1565,9 @@ ul.help li.ro-note { color: var(--crimson); font-weight: 700; }
   padding: 10px 12px 12px; background: var(--card);
   border: 2px solid var(--line); border-radius: 10px;
 }
-/* 右栏（PVP）是游戏里真正画出来的那一套 —— 边框换成琥珀，和「已上架」同一种信号。 */
-.weapon-mode.live { border-color: var(--amber); background: #FFFCF4; }
+/* ★ X10 起**两栏都会在游戏里出现**（大厅 / 任务房画 PVE，对战房画 PVP），
+   所以不再把右栏挑出来高亮 —— 原来那条 `.weapon-mode.live`（琥珀边框）已删。
+   哪一栏在哪儿画，改由栏头那行小字说（`WEAPON_MODE_WHERE`）。 */
 .weapon-mode > .sell-head {
   display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
   padding-bottom: 4px; margin-bottom: 8px;
