@@ -1304,3 +1304,32 @@ shell / GDI+ / WPS 外壳 DLL，崩后 QQ 拼音的 `QQPYBugReport.exe` 被拉�
 ⚠ **抓不到的**：键盘宏按非方向键的脚本（键盘和整机空闲都会被刷新）。要再往上得读
 `WH_KEYBOARD_LL` 的 `LLKHF_INJECTED`，那是低级钩子、开始有军备竞赛味道，**先不做**。
 
+## §63 ★★★★ 日志行里写错一个属性名 = **整条遥测静默消失**，而单测替它打掩护（✅ 2026-09-21 踩到）
+
+「在场证据」那行日志（`Conn.note_presence()`）写成了
+
+```python
+eventlog.debug("游戏服 #%s 在场证据 账号=%r …" % (self.cid, self.username, …))
+```
+
+`Conn` 上**两个名字都没有**（连接号叫 `seq`、账号叫 `account_name`，`self.cid`
+在整个 `gameserver.py` 里只出现在这一行）。后果链，每一环都让它更难被发现：
+
+1. `%` 元组在 `eventlog.debug()` **调用之前**求值 ⇒ 就算没开 `--verbose`
+   （`debug()` 第一句就 `return`）也照抛 `AttributeError`；
+2. 异常被 `udpsync._on_presence` 的 `except Exception`（**为了不带崩收包循环**，
+   本身是对的）吞掉，只留一行「`!! 喂在场证据抛了 AttributeError(...)`」；
+3. ⇒ 那条日志**在真实连接上一行都没写出来过** —— 而 `PROGRESS.md` 的 V73 / V74
+   正是靠它取语料，等于「等一份永远等不到的数据」；
+4. **单测全绿**，因为夹具自己手写了 `conn.cid = 1` / `conn.username = "tester"`。
+
+三条通用的：
+
+- ★★ **夹具给一个被测对象「本来没有」的属性 = 给这个 bug 打掩护。**
+  夹具只该给真实路径上真会有的东西。现在 `test_presence.py` 有一条
+  `test_the_log_only_touches_attributes_a_bare_conn_has`，用**一格都不设**的
+  `Conn.__new__` 走一遍日志，这类错误在单测层面结构上就藏不住了。
+- ★ **别手抄前缀**：`游戏服 #N` 只有 `Conn.online_debug()` 一处在拼。
+  抄一遍就是抄了一份会漂的依赖 —— 这次抄出了两个不存在的属性名。
+- ★ `Conn` 那一组**类级默认值**（文件里已有的那段注释）是为这件事准备的：
+  `Conn.__new__` 造的实例不走 `__init__`，日志要碰的字段在类上也得有一份。

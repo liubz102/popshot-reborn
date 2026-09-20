@@ -5892,6 +5892,15 @@ def reset_sync_trails(room, why, new_match=False):
         if new_match:
             conn.dead_since = None
             conn.afk_when_down = False
+        # ★★ **在场证据那几格一个都不清**（`presence_*`，2026-09-21）：
+        #   上面两条钟要清，是因为它们的证据（`0x040e`、打中 / 捡到）本来就
+        #   **只在一张图之内有意义**；而在场证据说的是「这个人在不在机器前」，
+        #   跟换不换图、开不开新局毫无关系 —— 人没走开，换张图他也还是没走开。
+        #   清了就是 D53 说的「削弱」：挂机号每 106 秒一局（§61），每局重新攒
+        #   一遍 `PRESENCE_AFK_AFTER_S`，正好把第五轮 `afk_carried` 专门治的
+        #   那种「管理页上一局一局地闪」又造回来。
+        #   反过来「他回来了」照样是**事件驱动**的：他一动键盘，下一发上报就把
+        #   档位翻成「在玩」，`presence_since` 当场重锚，判定立刻撤销。
         # ★ 开火记录跟着清（§92）：上一张图的弹道配不上这一张图的爆点，
         #   留着只会让击退方向偶尔配错一发。
         shots = getattr(conn, "peer_shots", None)
@@ -6535,25 +6544,69 @@ AFK_AFTER_S = 20.0
 AFK_SOLO_AFTER_S = 45.0
 
 
-#: ★ 在场证据分档（bug调查/25）。**只用来打日志和给管理页看**，
-#: `conn_is_afk()` 这一版一个字都没改（用户拍板的三步走：先记、再看数据、
-#: 最后才定线）。档位本身就是「等着被真数据推翻」的初稿。
+#: ★ 在场证据分档（bug调查/25）。★★ **2026-09-21 起这几档真的参与判定了**
+#: （用户拍板的三步走的第 3 步，见 `conn_presence_afk()`）。
 #:
 #: 排序是**从最像挂机到最像真人**，第一个成立的就是它的档：
 #:
 #: * `后台`   —— 游戏窗口压根不在前台。用户 2026-09-20：真人玩游戏不会把窗口
 #:   丢到后台（原版自己也认这件事：`WM_ACTIVATEAPP` 一失活就把 BGM 静音）。
 #: * `人不在` —— `GetLastInputInfo()` 说这台机器整机多久没人碰过。
-#'   `PostMessage` 类连点器伪造不了它。
+#:   `PostMessage` 类连点器伪造不了它。
 #: * `只有鼠标` —— 键盘从来没动过、只有鼠标键在响。连点器的典型形状；
 #:   和 `INPUT_PEER_OPCODES` 故意排除 `rpFire` 是同一个理由。
 #: * `在玩`   —— 键盘最近动过。
 PRESENCE_BUCKETS = ("后台", "人不在", "只有鼠标", "在玩")
-#: 分档用的两条线（**毫秒**）。⚠ 它们**现在只影响日志文字**，不影响任何判定，
-#: 所以这里放常量不违反铁律 10 —— 真正要拿真数据定的是将来接进
-#: `conn_is_afk()` 的那条线，不是这个给人看的分档。
+
+#: 「像挂机」的那几档 —— 用户 2026-09-21 拍板**三档全判**（含「只有鼠标」，
+#: 他知道也接受那一档的误判风险：hook 报的键盘证据把方向键排除了、开火又是
+#: 鼠标，所以只用方向键 + 鼠标打满一分钟的真人会落进这一档）。
+#:
+#: ★ 从 `PRESENCE_BUCKETS` **切出来**，不手抄第二份：那张表就是按「从最像挂机
+#:   到最像真人」排的，最后一个是 `在玩`。以后往中间插一档，它要么自动进判定、
+#:   要么得有人明确把它挪到 `在玩` 后面去 —— 不会出现「新加了一档谁都不认」。
+#:   （和 `web/admin.py` 的 `_idle_places()` 是同一个套路。）
+PRESENCE_AFK_BUCKETS = frozenset(PRESENCE_BUCKETS[:-1])
+
+#: 分档用的两条线（**毫秒**）。注意它们量的是「客户端**采样那一刻**已经闲了
+#: 多久」（`GetLastInputInfo` 的回溯量），和下面 `PRESENCE_AFK_AFTER_S` 量的
+#: 「服务端**看见**这一档保持了多久」锚点不同，**不是接力、不要相加着看**。
 PRESENCE_IDLE_MS = 60_000
 PRESENCE_KB_MS = 60_000
+
+#: 客户端多久报一发在场证据（秒）。★ 这是 `hook/bshook.c` 的 `watch_thread`
+#: 里 `ticks % 50`（`Sleep(100)`）的镜像 —— 下面两条线都是从它推出来的，
+#: 不是从某台机器上量出来的观测值。改了那边这里要跟着改。
+PRESENCE_REPORT_S = 5.0
+
+#: 档位落在「像挂机」那几档上，**连续保持多久**才真的判成挂机（秒）。
+#:
+#: ★ 直接沿用 `AFK_AFTER_S` 那条线，不另立一个数：「20 秒里一个键盘事件都没有
+#:   = 挂机」是用户 2026-09-14 一天里调了三次定下来的，「20 秒里窗口一直不在
+#:   前台 = 挂机」是同一量纲、同一语义 ⇒ **不用重新标定**（D53 的「判据同源」）。
+#:
+#: ★ 真正只靠这条线的是 `后台` —— `foreground` 是个布尔，翻转是瞬时的，
+#:   不防抖的话「切出去看一眼消息再切回来」就会在管理页上闪一下。
+#:   `人不在` / `只有鼠标` 两档自己已经带了 60 秒的回溯量（见上面那两条）。
+#:
+#: ★ 这是铁律 10 那条例外的**更干净的形态**：起点是「档位翻转」这个**事件**
+#:   （`presence_since`），撤销也是「翻回 `在玩`」这个事件 —— 下一发上报一到
+#:   当场生效，不等任何定时器。只有「这一档还在持续」本身没有事件可等。
+#:   同一档重复报**不动**那个时间戳，所以丢包既不重置也不加速。
+PRESENCE_AFK_AFTER_S = AFK_AFTER_S
+
+#: 最后一发证据多旧就当**没有证据**（秒）= 连丢 6 发。
+#:
+#: ★★ 铁律 10 的例外，理由写清楚：**UDP 没有 FIN**。客户端被杀、hook 没装上、
+#:   `BSHOOK_NO_PRESENCE=1`、防火墙把旁路拦了，全都是静默的 —— 「这条流停了」
+#:   物理上没有对应事件，只能靠「该来的那几发没来」推。数字从协议自己的周期
+#:   （`PRESENCE_REPORT_S`）推，容忍连丢 6 发；同一条论证在
+#:   `udpsync.DEAD_AFTER_S` 上已经用过一次（那条是 8 Hz 心跳流，周期差一个量级）。
+#:
+#: ★ 过期一律退回「**没有证据**」，不是冻结在最后那一档：「收不到」证明不了
+#:   「他在挂机」—— 和「从没收到过」必须一个待遇，否则会出现「老客户端（从不报）
+#:   比新客户端（断流 30 秒）待遇还好」这种说不通的规矩。
+PRESENCE_STALE_AFTER_S = PRESENCE_REPORT_S * 6
 
 
 def presence_age_text(ms):
@@ -6580,6 +6633,45 @@ def presence_bucket(conn):
                               or kb_ms >= PRESENCE_KB_MS):
         return "只有鼠标"
     return "在玩"
+
+
+def conn_presence_afk(conn, now=None):
+    """**客户端**报上来的在场证据说他在不在挂机。
+
+    三态，`None` 最要紧：
+
+    * `None` —— **没有可用的证据**，这条判据整个不参与，退回服务端那两条钟。
+      老客户端 / 没有中继 / UDP 被防火墙挡 / `BSHOOK_NO_PRESENCE=1` 起的客户端
+      全都走这儿。★ 「收不到」绝不能当成「他挂机」。
+    * `False` —— 证据说他在玩。
+    * `True` —— 落在 `PRESENCE_AFK_BUCKETS` 里，**而且已经稳住了
+      `PRESENCE_AFK_AFTER_S`**。
+
+    为什么非要客户端报（§61 / §62 / D53）：**单人任务房里服务端是瞎的**。
+    房里只有他一个人，客户端就不发 `0x040e`，键盘那条判据整个不存在，只剩
+    「打中 / 捡到 / 得分」。328800963 开着连点器，分数每 1.5 秒涨一次 ——
+    证据比真人还多，连续 18 小时显示「游戏中·任务」。这四个数正是服务端
+    结构上够不着的那一维。
+
+    ★★ **断流之后退回「没有证据」，不冻在最后那一档**（`PRESENCE_STALE_AFTER_S`
+    那一段注释写了为什么）。这里**只读不清** —— 定时把字段清掉本身就是一次
+    定时器驱动的状态变更（铁律 10），而且流恢复之后还会让同一档重新刷一行日志。
+    """
+    at = getattr(conn, "presence_at", None)
+    if at is None:
+        return None                 # 从没收到过 ⇒ 当没这条信息
+    now = time.monotonic() if now is None else now
+    if (now - at) > PRESENCE_STALE_AFTER_S:
+        return None                 # 断流 ⇒ 和「从没收到过」一个待遇
+    bucket = getattr(conn, "presence_logged", None)
+    if bucket is None:
+        return None                 # 兜底：存了证据却没分出档
+    if bucket not in PRESENCE_AFK_BUCKETS:
+        return False
+    since = getattr(conn, "presence_since", None)
+    if since is None:
+        return False                # 刚翻上来还没锚住，当没稳住
+    return (now - since) > PRESENCE_AFK_AFTER_S
 
 
 def conn_afk_clock_expired(conn, now=None):
@@ -6636,10 +6728,28 @@ def conn_is_afk(conn, now=None):
 
     ★ bot 永远判不出挂机：它的同步包是服务端自己合成的，不走
     `note_player_input()` 那条路，`last_input_at` 一直是 `None`。
+    （在场证据那条同理：bot 不走 UDP 旁路，`presence_at` 恒为 `None`。）
+
+    ## ★★ 客户端在场证据这一条（2026-09-21 接上，§62 / D53）
+
+    `conn_presence_afk()` 说挂机就是挂机 —— 它看的是**服务端结构上看不见**的
+    那一维（窗口在不在前台 / 这台机器前面有没有人 / 键盘动过没有），
+    正是单人任务房里唯一还剩的证据。
+
+    **但它只补不削**：presence 回 `False`（「在玩」）时**不会**把下面两条钟
+    已经判出来的挂机洗白。理由是那两条钟问的是「他在玩**这一局**吗」，
+    而 presence 只能证明「他人在机器前按过键」—— 拿后者推翻前者，就是 D53
+    明确否掉的「削弱服务端那条」。所以这里只有 `is True` 一支。
+
+    ★ 顺序：排在 `dead_since` / `afk_carried` **后面**。躺着那一段整个判定是
+      冻住的（第四 / 第六轮定的），presence 不能把它捅开 —— 死人按不了键，
+      但他人**可能**还好好地坐在前台看着。
     """
     if getattr(conn, "dead_since", None) is not None:
         return bool(getattr(conn, "afk_when_down", False))
     if getattr(conn, "afk_carried", False):
+        return True
+    if conn_presence_afk(conn, now) is True:
         return True
     return conn_afk_clock_expired(conn, now)
 
@@ -6716,6 +6826,9 @@ def note_seat_respawned(room, seat, now=None):
     if dead_since is None or conn.last_input_at is None:
         return
     now = time.monotonic() if now is None else now
+    # ★ 只拨游戏内那条钟。**`presence_since` 不拨**（2026-09-21）：要拨是因为
+    #   「他按没按键」这件事躺着的时候被游戏暂停了；而「人在不在机器前」躺着
+    #   的时候并没有暂停 —— 他该走开还是走开了。拨了就是重复补偿。
     conn.last_input_at += max(0.0, now - dead_since)
 
 
@@ -6902,6 +7015,16 @@ class Conn:
     #   这两个标志必须在类上也有一份默认，否则新代码一碰就 AttributeError。
     send_broken = False
     last_relay_reissue_at = 0.0
+    # ★ 账号名和连接号同理 —— **这两格是拿真事故换来的**（2026-09-21）：
+    #   `note_presence()` 的日志自己手抄了一遍 `online_debug()` 的前缀，抄出
+    #   `self.cid`（`Conn` 上压根没有这个名字）和 `self.username`（应该是
+    #   `account_name`）。`%` 元组在 `eventlog.debug()` **之前**求值，于是每次
+    #   档位翻转都抛一次 AttributeError，被 `udpsync._on_presence` 的
+    #   `except Exception` 吞掉 —— 「在场证据」那行日志一行都没写出来过。
+    #   单测查不出来，是因为夹具手写了 `conn.cid` / `conn.username`。
+    #   有了这两格，「日志引用了一个裸 `Conn` 没有的属性」在单测里就藏不住了。
+    account_name = None
+    seq = None
     # 版本门禁的两个状态同理（见 __init__ 里的说明）。
     client_version = None
     version_rejected = False
@@ -6963,16 +7086,20 @@ class Conn:
     #     `udpsync.PRESENCE_NEVER` = 本次连接从来没按过。
     #   `presence_mouse_ms` / `presence_sys_ms` = 鼠标键 / 这台机器（`GetLastInputInfo`）。
     #   `presence_fg`     = 游戏窗口在不在前台（原版靠同一个消息把 BGM 静音）。
-    #   ⚠ **这一版只记不判**：`conn_is_afk()` 一个字都没改。先拿线上一天的
-    #     真数据看分布，再照 §111 的老规矩定线（用户 2026-09-20 拍板的三步走）。
+    #   ★★ 2026-09-21 起这几格**真的参与判定**（`conn_presence_afk()`），
+    #     不再是「只记不判」。
     presence_at = None
     presence_kb_ms = None
     presence_mouse_ms = None
     presence_sys_ms = None
     presence_fg = None
     presence_flags = 0
-    #: 上一次**打了日志**的那一档（用来按状态翻转去重，不按次数、不按时间窗）。
+    #: 现在这一档（`presence_bucket()` 的结果）。日志去重和「这一档保持了多久」
+    #: **共用**它，不另起一套平行状态 —— 两者认的是同一个「档位翻转」事件。
     presence_logged = None
+    #: 上面那一档是**什么时候翻上来**的（`time.monotonic()`）。
+    #: 同一档重复报**不动**它，所以丢包既不重置也不加速判定。
+    presence_since = None
     #: ★ 诊断（`note_human_fire`）的类级默认 —— 控制通道造的假连接也得有。
     human_fire_logged = frozenset()
     #: ★ 这条连接**本图打出去、还没配上爆炸**的几发 `rpFire`（V0.3 §92）。
@@ -11024,36 +11151,58 @@ class Conn:
             self.peer_order_epoch = game_id
             self.peer_order.new_epoch()
 
-    def note_presence(self, kb_ms, mouse_ms, sys_ms, foreground, flags=0):
+    def note_presence(self, kb_ms, mouse_ms, sys_ms, foreground, flags=0,
+                      now=None):
         """在场证据到了（`udpsync.MSG_PRESENCE`，bug调查/25）。
-
-        ★★ **这一版只记不判**（用户 2026-09-20 拍板的三步走的第 2 步）：
-        存下来 + 按状态翻转打日志，`conn_is_afk()` 一个字都不改。先拿线上一天
-        的真数据看分布，再照 §111 的老规矩（在真人 / 挂机两份语料上量出来）
-        定线 —— 阈值是用户自己调的，不该由我拍。
 
         为什么非要客户端报：**单人任务房里服务端是瞎的**。房里只有他一个人，
         客户端就不发 `0x040e`，键盘那条判据整个不存在，只剩「打中 / 捡到 /
         得分」。328800963 开着连点器，分数每 1.5 秒涨一次 —— 证据比真人还多，
-        连续 14 小时显示「游戏中·任务」。这四个数正是服务端够不着的那部分。
+        连续 18 小时显示「游戏中·任务」。这四个数正是服务端够不着的那部分。
 
-        ★ 日志按**状态翻转**去重（铁律 10）：档位没变就一个字不写。一条连接
-        一天能收上万发这种包，按次数或时间窗去重都会要么刷屏要么漏掉翻转。
+        判定本身在 `conn_presence_afk()`（2026-09-21 接上）。这里只负责
+        **存下来 + 认出档位翻转**。
+
+        ★ 「档位翻转」是这一整条判据唯一的**事件**（铁律 10）：
+          日志靠它去重（档位没变就一个字不写 —— 一条连接一天能收上万发，
+          按次数或时间窗去重要么刷屏要么漏掉翻转），
+          `presence_since` 也靠它锚住「这一档是什么时候开始的」。
+          两者共用同一次判断，不是两套平行状态。
+
+        ★★ **断流之后重新报 = 也算一次翻转**：中间那一段我们什么都不知道，
+          不能拿断流之前的那个起点接着数（「收不到」证明不了「他一直挂着」）。
+          所以恢复之后重新攒 `PRESENCE_AFK_AFTER_S`，和「刚连上来」一个待遇。
+
+        ★ `now` 只给测试注入用；生产路径不传，取 `time.monotonic()`。
+          和 `note_player_action()` / `note_seat_died()` 同一套约定。
+          ⚠ `udpsync._on_presence` 按位置传前 5 个参数，别往前面插形参。
         """
-        self.presence_at = time.monotonic()
+        now = time.monotonic() if now is None else now
+        was_at = self.presence_at
+        self.presence_at = now
         self.presence_kb_ms = kb_ms
         self.presence_mouse_ms = mouse_ms
         self.presence_sys_ms = sys_ms
         self.presence_fg = bool(foreground)
         self.presence_flags = flags
+        resumed = was_at is None or (now - was_at) > PRESENCE_STALE_AFTER_S
         bucket = presence_bucket(self)
-        if bucket == self.presence_logged:
+        if bucket == self.presence_logged and not resumed:
             return
         self.presence_logged = bucket
-        eventlog.debug(
-            "游戏服 #%s 在场证据 账号=%r -> %s（键盘 %s / 鼠标 %s / 这台机器 %s"
+        # ★★ 这两行必须排在下面那发日志**之前**：日志里的 `%` 元组是在调用
+        #   `eventlog.debug()` 之前求值的，它一抛，排在后面的赋值一次都跑不到
+        #   —— 2026-09-20 的 `self.username` 就是这么把整条遥测弄哑的。
+        self.presence_since = now
+        # ★ 走 `online_debug()` 而不是自己拼 `eventlog.debug("游戏服 #…")`：
+        #   `游戏服 #N` 那个前缀只有它一处在拼（用的是 `self.seq`）。
+        #   2026-09-20 那一版手抄了一遍前缀，抄出两个 `Conn` 上根本没有的
+        #   属性（`self.cid` / `self.username`），整条遥测因此哑了。
+        #   档次也正好对：频率由定时器决定的归 `online_debug`（D112）。
+        self.online_debug(
+            "在场证据 账号=%r -> %s（键盘 %s / 鼠标 %s / 这台机器 %s"
             "；窗口%s前台）"
-            % (self.cid, self.username or "?", bucket,
+            % (self.account_name or "?", bucket,
                presence_age_text(kb_ms), presence_age_text(mouse_ms),
                presence_age_text(sys_ms), "在" if self.presence_fg else "**不在**"))
 

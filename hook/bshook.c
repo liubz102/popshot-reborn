@@ -247,55 +247,87 @@ static void bslog_shutdown(void)
     if (g_log != INVALID_HANDLE_VALUE) FlushFileBuffers(g_log);
 }
 
-/* 本机**此刻**的 UTC 偏移，写成 "UTC+8" / "UTC-3" / "UTC+5:30"（§59 / D52）。
+/* 本机此刻的 UTC 偏移，**单位是分钟**（§59 / D52）。
  *
- *   为什么每行都算、不缓存：这份日志是**玩家机器**上的，而崩溃包的打包戳来自
- *   开发机（UTC+9）、服务端日志来自云主机（UTC+8）—— 三台机器三个时区，
- *   2026-09-20 就因为没写时区把因果比反过（bug调查/25）。缓存就得自己处理
- *   夏令时切换（客户端一开十几个小时是常事，那台就跑了 17.7 小时），
- *   而 GetSystemTime 读的是共享页，比后面那句 _vsnprintf 便宜得多。
+ *   为什么写时区：这份日志是**玩家机器**上的，而崩溃包的打包戳来自开发机
+ *   （UTC+9）、服务端日志来自云主机（UTC+8）—— 三台机器三个时区，
+ *   2026-09-20 就因为没写时区把因果比反过（bug调查/25）。
  *
- *   拿本地时刻减 UTC 时刻，不读注册表 —— 夏令时自动就对了。
+ *   ★★ **算一次，之后一直沿用**（用户 2026-09-20 第二轮拍板）。第一版每行都
+ *   算一遍 `GetSystemTime` + 两次 `SystemTimeToFileTime` + 一次 64 位除法 +
+ *   **一个额外的 `_snprintf`**；开 `BSHOOK_PROJ_DIAG` 时每帧每弹体一行，纯属白烧。
+ *   第二版改成了「按第几分钟失效」，为的是跨夏令时切换时后缀还能跟着变；
+ *   用户当场否掉了这个理由 —— **玩家全在中国（UTC+8，不用夏令时）**，
+ *   为一个本项目里不存在的场景留一条每行都要走的判断没有意义。
+ *
+ *   ⇒ 现在是惰性一次性：第一行日志算出来，之后每行只剩**一次整数测试**。
+ *     代价写明白：客户端一开十几个小时（bug调查/25 那台跑了 17.7 小时），
+ *     中途真换了系统时区的话后缀会停在旧值。本项目接受它，
+ *     `server/tzstamp.py` 和更新器是同一套取舍。
+ *
+ *   ★ 为什么不在 `open_log()` 里显式初始化：`bslog_emit()` 手里已经有一份
+ *     `GetLocalTime()` 的结果可以直接复用，而且环形缓冲在 `open_log()`
+ *     之前就能收到行 —— 惰性一次性没有初始化顺序问题。
+ *
+ *   ★ 返回分钟而不是字符串：调用方把它折进**已有的**那一发 `_snprintf`，
+ *     省掉第二个 `_snprintf`（那才是第一版真正贵的地方）。
+ *
+ *   ★ 多线程：两条线程同时算出的是同一个值，撞了也无害；**先写值、后写旗**，
+ *     最坏情况是某一行用了 0（还没算出来那一瞬）。两个都是对齐的 LONG，
+ *     读写天然原子。
+ *
+ *   算法：本地时刻减 UTC 时刻，不读注册表 —— 启动那一刻的夏令时自动就对。
  */
-static void bslog_zone(const SYSTEMTIME *lt, char *out, size_t cap)
+static volatile LONG g_zone_minutes = 0;
+static volatile LONG g_zone_ready = 0;       /* 0 = 还没算过 */
+
+static LONG bslog_zone_minutes(const SYSTEMTIME *lt)
 {
     SYSTEMTIME ut;
     FILETIME lf, uf;
     LONGLONG diff, half;
-    long mins, hh, mm;
-    char sign;
+    LONG mins;
 
-    if (cap) out[0] = 0;
+    if (g_zone_ready) return g_zone_minutes;           /* ★ 热路径就这一句 */
+
     GetSystemTime(&ut);
     if (!SystemTimeToFileTime(lt, &lf) || !SystemTimeToFileTime(&ut, &uf))
-        return;
+        return g_zone_minutes;              /* 算不出就先不落定，下一行再试 */
     diff = (((LONGLONG)lf.dwHighDateTime << 32) | lf.dwLowDateTime)
          - (((LONGLONG)uf.dwHighDateTime << 32) | uf.dwLowDateTime);
     /* 100ns -> 分钟。两次取时刻之间差几毫秒，所以就近取整。 */
     half = diff >= 0 ? 300000000LL : -300000000LL;
-    mins = (long)((diff + half) / 600000000LL);
-    sign = mins < 0 ? '-' : '+';
-    if (mins < 0) mins = -mins;
-    hh = mins / 60;
-    mm = mins % 60;
-    if (mm) _snprintf(out, cap, "UTC%c%ld:%02ld", sign, hh, mm);
-    else    _snprintf(out, cap, "UTC%c%ld", sign, hh);
-    out[cap - 1] = 0;
+    mins = (LONG)((diff + half) / 600000000LL);
+    g_zone_minutes = mins;
+    g_zone_ready = 1;                                   /* 先值后旗 */
+    return mins;
 }
 
 static void bslog_emit(int detail, const char *fmt, va_list ap)
 {
     char line[8192];
-    char zone[16];
     unsigned char hdr[BSLOG_HDR];
     SYSTEMTIME st;
+    LONG zone, zh, zm;
+    char zsign;
     int n;
     int wake = 0;
 
     GetLocalTime(&st);
-    bslog_zone(&st, zone, sizeof(zone));
-    n = _snprintf(line, sizeof(line) - 4, "[%02u:%02u:%02u.%03u %s] ",
-                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, zone);
+    zone = bslog_zone_minutes(&st);
+    zsign = zone < 0 ? '-' : '+';
+    if (zone < 0) zone = -zone;
+    zh = zone / 60;
+    zm = zone % 60;
+    /* 两个变体而不是先拼一个 "UTC+8" 字符串：省掉整整一个 `_snprintf`。
+       半小时时区（印度 +5:30、尼泊尔 +5:45）走下面那支。 */
+    if (zm)
+        n = _snprintf(line, sizeof(line) - 4, "[%02u:%02u:%02u.%03u UTC%c%ld:%02ld] ",
+                      st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                      zsign, zh, zm);
+    else
+        n = _snprintf(line, sizeof(line) - 4, "[%02u:%02u:%02u.%03u UTC%c%ld] ",
+                      st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, zsign, zh);
     if (n < 0) n = 0;
 
     {

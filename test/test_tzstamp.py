@@ -31,18 +31,25 @@ class _FakeZone:
 
     ★ 不去改 `TZ` 环境变量 + `time.tzset()`：Windows 上 `tzset()` 压根没有，
       而服务端要在 Windows 和 Linux 上都跑。
+
+    ★★ 换完三个全局之后**必须自己把 `ZONE_TEXT` 重算一遍**：后缀是进程启动时
+      算死的（用户 2026-09-20 第二轮），运行时改 `time.timezone` 对它没有影响。
+      这正是被测行为本身 —— 所以重算这一下只能由夹具**显式**做，
+      生产代码里没有、也不该有任何一个「重算时区」的入口。
     """
 
     def __init__(self, timezone, altzone=None, daylight=0):
         self.vals = (timezone, timezone if altzone is None else altzone, daylight)
 
     def __enter__(self):
-        self.saved = (time.timezone, time.altzone, time.daylight)
+        self.saved = (time.timezone, time.altzone, time.daylight, tzstamp.ZONE_TEXT)
         time.timezone, time.altzone, time.daylight = self.vals
+        tzstamp.ZONE_TEXT = tzstamp._zone_text()
         return self
 
     def __exit__(self, *exc):
-        time.timezone, time.altzone, time.daylight = self.saved
+        (time.timezone, time.altzone, time.daylight,
+         tzstamp.ZONE_TEXT) = self.saved
         return False
 
 
@@ -73,28 +80,88 @@ class OffsetTextTests(unittest.TestCase):
         with _FakeZone(-(5 * 3600 + 45 * 60)):
             self.assertEqual("UTC+5:45", tzstamp.utc_offset_text(0))
 
-    def test_daylight_saving_uses_the_offset_of_that_moment(self):
-        # 夏令时期间要用 altzone。缓存进程启动时的值就会在切换那天全错。
+    def test_the_startup_moment_picks_standard_or_daylight(self):
+        # 启动那一刻仍然看一眼 `tm_isdst` 选 `altzone` 还是 `timezone` ——
+        # 不花运行时代价，万一真有人在用夏令时的地方开服，启动那刻是对的。
+        summer = time.struct_time((2026, 7, 1, 12, 0, 0, 2, 182, 1))
+        winter = time.struct_time((2026, 1, 1, 12, 0, 0, 3, 1, 0))
+        saved = time.localtime
+        try:
+            time.localtime = lambda *_a: summer
+            with _FakeZone(5 * 3600, altzone=4 * 3600, daylight=1):
+                self.assertEqual("UTC-4", tzstamp.utc_offset_text(0))
+            time.localtime = lambda *_a: winter
+            with _FakeZone(5 * 3600, altzone=4 * 3600, daylight=1):
+                self.assertEqual("UTC-5", tzstamp.utc_offset_text(0))
+        finally:
+            time.localtime = saved
+
+    def test_the_zone_is_frozen_after_the_process_started(self):
+        """★ 用户 2026-09-20 第二轮拍板的那一条：**算一次，之后一直沿用**。
+
+        起来之后夏令时切换了、系统时区改了，后缀都停在启动时那个值 ——
+        玩家和服务器全在中国（UTC+8、不用夏令时），为一个本项目里不存在的
+        场景在每行日志上留一次判断不值当。换时区就重启服务端。
+        """
         with _FakeZone(5 * 3600, altzone=4 * 3600, daylight=1):
+            frozen = tzstamp.utc_offset_text(0)
             summer = time.struct_time((2026, 7, 1, 12, 0, 0, 2, 182, 1))
             winter = time.struct_time((2026, 1, 1, 12, 0, 0, 3, 1, 0))
             saved = time.localtime
             try:
-                time.localtime = lambda *_a: summer
-                self.assertEqual("UTC-4", tzstamp.utc_offset_text(0))
-                time.localtime = lambda *_a: winter
-                self.assertEqual("UTC-5", tzstamp.utc_offset_text(0))
+                for fake in (summer, winter):
+                    time.localtime = lambda *_a, _f=fake: _f
+                    self.assertEqual(frozen, tzstamp.utc_offset_text(0))
+                    self.assertEqual(frozen, tzstamp.stamp(0).rsplit(" ", 1)[1])
             finally:
                 time.localtime = saved
+
+    def test_the_zone_is_computed_exactly_once(self):
+        # ★ 用户 2026-09-20 指出第一版每行现算一遍：实测 1.35 us/行，把一个
+        #   时间戳从 1.48 抬到 3.38 us。现在热路径上**一次都不算** —— 连
+        #   第二版那次元组比较也没有了，只剩一次全局读。
+        calls = []
+        real = tzstamp._format_offset
+        tzstamp._format_offset = lambda s: (calls.append(s), real(s))[1]
+        try:
+            for _ in range(100):
+                tzstamp.utc_offset_text(0)
+                tzstamp.stamp(0)
+        finally:
+            tzstamp._format_offset = real
+        self.assertEqual([], calls, "启动之后还在算时区：%d 次" % len(calls))
+
+    def test_a_zone_change_at_runtime_is_ignored(self):
+        # 只改 `time.timezone`、不重算 `ZONE_TEXT` ⇒ 输出一个字不变。
+        # （上面那三条假时区用例之所以有效，全靠夹具自己补了那一下重算。）
+        before = tzstamp.utc_offset_text()
+        saved = (time.timezone, time.altzone, time.daylight)
+        try:
+            time.timezone, time.altzone, time.daylight = (12 * 3600, 12 * 3600, 0)
+            self.assertEqual(before, tzstamp.utc_offset_text())
+            self.assertEqual(before, tzstamp.stamp().rsplit(" ", 1)[1])
+        finally:
+            time.timezone, time.altzone, time.daylight = saved
+
+    def test_stamp_only_looks_up_localtime_once(self):
+        # 日期和时区后缀共用同一份 `localtime()` —— 调两次等于把这个函数
+        # 的开销翻倍，而它是服务端每一行日志都要走的路。
+        n = [0]
+        real = time.localtime
+        time.localtime = lambda *a: (n.__setitem__(0, n[0] + 1), real(*a))[1]
+        try:
+            tzstamp.stamp(0, millis=True)
+        finally:
+            time.localtime = real
+        self.assertEqual(1, n[0], "stamp() 调了 %d 次 localtime()" % n[0])
 
     def test_it_is_computed_not_hardcoded(self):
         # 写死成 UTC+8 / UTC+9 就是这次要防的错：玩家可能在任何时区。
         src = open(os.path.join(ROOT, "server", "tzstamp.py"),
                    encoding="utf-8").read()
-        body = src[src.index("def utc_offset_text"):]
-        self.assertNotIn('"UTC+8"', body)
-        self.assertNotIn('"UTC+9"', body)
-        self.assertIn("time.altzone", body)
+        self.assertNotIn('"UTC+8"', src)
+        self.assertNotIn('"UTC+9"', src)
+        self.assertIn("time.altzone", src)
 
 
 class StampTests(unittest.TestCase):
@@ -174,9 +241,49 @@ class ClientSideWritersTests(unittest.TestCase):
 
     def test_bshook_puts_the_zone_in_every_line(self):
         src = open(self.hook, encoding="utf-8").read()
-        self.assertIn('"[%02u:%02u:%02u.%03u %s] "', src,
+        self.assertIn('"[%02u:%02u:%02u.%03u UTC%c%ld] "', src,
                       "bslog 的行前缀没带时区")
-        self.assertIn("bslog_zone(&st, zone, sizeof(zone));", src)
+        self.assertIn('"[%02u:%02u:%02u.%03u UTC%c%ld:%02ld] "', src,
+                      "半小时时区（+5:30 / +5:45）那一支没了")
+        self.assertIn("bslog_zone_minutes(&st);", src)
+
+    def test_bshook_computes_the_offset_exactly_once(self):
+        # ★ 用户 2026-09-20 第二轮拍板：**算一次，之后一直沿用**。
+        #   第一版每行都算一遍 GetSystemTime + 两次 SystemTimeToFileTime +
+        #   64 位除法 + **一个额外的 _snprintf**；开弹体诊断时每帧每弹体一行。
+        #   第二版按「第几分钟」失效（为了跟夏令时），被否掉 —— 玩家全在中国。
+        src = open(self.hook, encoding="utf-8").read()
+        body = src[src.index("static LONG bslog_zone_minutes"):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("if (g_zone_ready) return g_zone_minutes;", body,
+                      "没有「已经算过了」的快路 —— 又变回每行现算了")
+        self.assertNotIn("wMinute", body,
+                         "又按分钟失效了 —— 说好算一次就不再算")
+        # 先写值后写旗：反过来的话别的线程可能看到旗立了、值还是 0。
+        self.assertLess(body.index("g_zone_minutes = mins;"),
+                        body.index("g_zone_ready = 1;"),
+                        "先立了旗才写值 —— 别的线程会读到 0")
+
+    def test_the_updater_computes_the_offset_exactly_once_too(self):
+        # 三侧同一套取舍（`server/tzstamp.py` / `bshook.c` / 更新器）。
+        src = open(self.util, encoding="utf-8").read()
+        body = src[src.index("void utc_offset_text"):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("if (!g_zone_ready) {", body,
+                      "更新器还在每次现算 —— 三侧的写法漂了")
+        self.assertLess(body.index("g_zone_mins = "),
+                        body.index("g_zone_ready = 1;"),
+                        "先立了旗才写值")
+
+    def test_the_prefix_only_formats_once(self):
+        # 第一版是「先 snprintf 出 "UTC+9"，再 snprintf 进行前缀」——
+        # 两个 snprintf。现在把符号/时/分折进原来那一发。
+        src = open(self.hook, encoding="utf-8").read()
+        body = src[src.index("static void bslog_emit"):]
+        body = body[:body.index("\n    hdr[0]")]
+        self.assertEqual(2, body.count("_snprintf("),
+                         "行前缀的 _snprintf 不是两支变体各一次")
+        self.assertNotIn("char zone[", body, "还在先拼一个时区字符串")
 
     def test_the_updater_stamp_carries_the_zone(self):
         src = open(self.util, encoding="utf-8").read()
@@ -184,7 +291,7 @@ class ClientSideWritersTests(unittest.TestCase):
         self.assertIn('L"%04u-%02u-%02u %02u:%02u:%02u %s"', src)
 
     def test_both_derive_the_offset_instead_of_reading_the_registry(self):
-        # 本地时刻减 UTC 时刻 ⇒ 夏令时自动就对，也不用缓存。
+        # 本地时刻减 UTC 时刻 ⇒ 启动那一刻的夏令时自动就对，不用读注册表。
         for path in (self.hook, self.util):
             src = open(path, encoding="utf-8").read()
             self.assertIn("GetSystemTime(&ut);", src, path)
