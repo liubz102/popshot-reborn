@@ -93,11 +93,20 @@ class GeneratedHeaderTests(unittest.TestCase):
         self.assertEqual(found_w, want)
 
     def test_the_generator_reports_it_is_up_to_date(self):
+        """★ 输出要**收下来放进断言消息**，不能 DEVNULL 一扔了事。
+
+        2026-09-20 CI 上这条红过，报的是「hook/pack.h 不是最新的」——
+        而头文件其实好好的，真正的死因是生成器打那句中文提示时
+        `UnicodeEncodeError`（见 `tools/gen_pack_h.py` 的 `__main__`）。
+        输出被 DEVNULL 吞了，于是报告只剩一句把人往反方向带的话。
+        """
         if not os.path.exists(GENERATOR):
             raise unittest.SkipTest("不在源码仓库里")
-        rc = subprocess.call([sys.executable, GENERATOR, "--check"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.assertEqual(rc, 0, "hook/pack.h 不是最新的：python tools/gen_pack_h.py")
+        result = subprocess.run([sys.executable, GENERATOR, "--check"],
+                                capture_output=True)
+        self.assertEqual(result.returncode, 0,
+                         "hook/pack.h 不是最新的：python tools/gen_pack_h.py\n"
+                         + (result.stdout + result.stderr).decode("utf-8", "replace"))
 
     def test_config_py_prints_the_table_for_powershell(self):
         out = subprocess.check_output([sys.executable, os.path.join(SERVER, "config.py"), "--pack-dirs"])

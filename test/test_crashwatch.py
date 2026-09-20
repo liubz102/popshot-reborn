@@ -197,14 +197,20 @@ class ReportParsingTests(unittest.TestCase):
     def test_chinese_paths_in_the_report_come_out_readable(self):
         """★ 安装目录带中文的玩家（用户 2026-09-17 在云上的崩溃包里看到
         `fault` 变成 `ø·þÎñ÷ÊèÕÃ`）。报告是 ANSI（CP936）写的、我们按 latin-1
-        整份读进来保字节，但抠出来进 `meta.json` 的字段必须是给人看的字。"""
+        整份读进来保字节，但抠出来进 `meta.json` 的字段必须是给人看的字。
+
+        ★ 夹具是 CP936 字节，所以**明说** `codec="cp936"`。生产侧默认的 `mbcs`
+          是「跑代码这台机器的代码页」—— 不说清楚，这条用例就只在中文机上
+          成立：英文机（ACP 1252）上 `百度网盘` 会解成 `°Ù¶ÈÍøÅÌ`，CI 的
+          windows-latest 正是英文机（2026-09-20 PR #4 实际红过）。
+        """
         path = os.path.join(self.game, "Dump", "LastCrashReport.txt")
         raw = REPORT_TEXT.replace(
             "D:\\git\\popshot-reborn\\main\\game_patched",
             "F:\\百度网盘\\炮炮火枪手\\game_patched").encode("cp936")
         with open(path, "wb") as fp:
             fp.write(raw)
-        report = crashwatch.read_crash_report(self.game)
+        report = crashwatch.read_crash_report(self.game, codec="cp936")
         self.assertIn("F:\\百度网盘\\炮炮火枪手\\game_patched\\BigShot.exe",
                       report.fault)
         self.assertEqual("BigShotV0311N001.mdmp", report.dump_name)

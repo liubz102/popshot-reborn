@@ -89,4 +89,10 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # ★ 和 `gen_ports_h.py` 同一个理由（那边写了完整版）：输出一被捕获，
+    #   stdout 就退回系统 ANSI 代码页 —— 英文机上是 cp1252，`是最新的`
+    #   这三个字直接 `UnicodeEncodeError`，退出码 1，而头文件其实没问题。
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
     sys.exit(main())

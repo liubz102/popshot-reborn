@@ -154,4 +154,15 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # ★ 把 stdout / stderr 钉成 utf-8。调用方一**捕获**输出（管道 / DEVNULL /
+    #   赋值给变量），CPython 就发现 stdout 不是控制台、改用 `GetACP()`：
+    #   中文机上是 cp936（中文按 GBK 落进管道、上游按 utf-8 解 = 满屏乱码），
+    #   **英文机上是 cp1252，一个中文都编不出来，直接 `UnicodeEncodeError`
+    #   把进程带崩** —— `--check` 明明查完了、两份头文件也确实是最新的，却栽在
+    #   最后这句「宣布最新」上，退出码成了 1。GitHub Actions 的 windows-latest
+    #   正是英文机：`test_ports.py` 就这么在 CI 上红过（2026-09-20，PR #4）。
+    #   完整来龙去脉见 `tools/pkn.py` 的 main()。
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
     sys.exit(main())

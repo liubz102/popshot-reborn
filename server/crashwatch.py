@@ -197,7 +197,7 @@ def parse_logged_at(text):
     return time.mktime(tm)
 
 
-def ansi_to_text(text):
+def ansi_to_text(text, codec=None):
     """按 `latin-1` 读进来的 ANSI 文本 → 给人看的 str。**只给 `meta.json` 那几个字段用。**
 
     这两份报告是原版客户端按 **ANSI（中文机器上是 CP936）** 写的。整份正文按
@@ -208,14 +208,20 @@ def ansi_to_text(text):
     （用户 2026-09-17 在云上收到的崩溃包里看到的）。安装目录带中文的玩家，
     `Fault address` 那一行的 exe 路径必然中招。
 
-    ★ 用 `mbcs`（= 这台机器的 ANSI 代码页）：写这份文件的就是这台机器上的原版
+    ★ 默认用 `mbcs`（= 这台机器的 ANSI 代码页）：写这份文件的就是这台机器上的原版
       客户端，它用的正是这一页；非 Windows（没有 `mbcs`）退回中文版客户端的 CP936。
       `errors="replace"`：解不出来也只是一个问号，绝不让一段坏字节把整次上传打断。
+
+    ★★ `codec` 是给**测试**用的：`mbcs` 解出什么字，取决于跑代码的这台机器是
+       哪个代码页 —— 夹具写死 CP936 字节的用例，在中文机上绿、在英文机（ACP
+       1252）上就把 `百度网盘` 解成 `°Ù¶ÈÍøÅÌ`（2026-09-20 GitHub Actions 的
+       windows-latest 上实际发生过，PR #4 的 CI）。测试**明说**自己那份夹具
+       是哪一页，判据就不再依赖谁来跑。生产侧一律不传，行为一个字节不变。
     """
     raw = text.encode("latin-1", "replace")
-    for codec in ("mbcs", "gbk"):
+    for name in ((codec,) if codec else ("mbcs", "gbk")):
         try:
-            return raw.decode(codec, "replace")
+            return raw.decode(name, "replace")
         except LookupError:
             continue
     return text
@@ -246,7 +252,7 @@ def last_record(text):
 class CrashReport:
     """`Dump/LastCrashReport.txt` 解析出来的东西。"""
 
-    def __init__(self, path, text, mtime):
+    def __init__(self, path, text, mtime, codec=None):
         self.path = path
         self.text = text
         self.mtime = mtime
@@ -257,8 +263,9 @@ class CrashReport:
         #: 相同）。★ 抠出来给人看 / 进 `meta.json` 的字段一律过一遍 `ansi_to_text`，
         #: 否则安装目录带中文的玩家，`fault` 里的路径会变成 `ø·þÎñ÷ÊèÕÃ`。
         #: `logged_at_raw` 留着给 `Collector.build` 和 rpt 正文（也是 latin-1 的）比对。
+        #: `codec` 见 `ansi_to_text`：生产侧是 `None`（跟着这台机器的 ANSI 代码页）。
         self.logged_at_raw = head.group(1) if head else ""
-        self.logged_at_text = ansi_to_text(self.logged_at_raw)
+        self.logged_at_text = ansi_to_text(self.logged_at_raw, codec)
         #: ★ 崩溃时刻优先用报告里写的；认不出（或那一行根本没有）就退回文件
         #:   mtime —— 绝不拿一个畸形字符串去拼目录名。
         self.epoch = parse_logged_at(self.logged_at_raw) or mtime
@@ -266,16 +273,16 @@ class CrashReport:
         #: ★ 只取 basename：`BigShot.rpt` 里躺着历次崩溃留下的**别的机器、
         #:   别的目录**的绝对路径（`D:\work\popshot\...`），那些路径在这台
         #:   机器上要么不存在、要么指向不相干的东西。
-        self.dump_name = (os.path.basename(ansi_to_text(match.group(1)))
+        self.dump_name = (os.path.basename(ansi_to_text(match.group(1), codec))
                           if match else "")
         #: 原版客户端自己的版本号（报告第二行 `Version: 311`）。
         #: 和我们这一版的 `BUILD.ver` 是两回事，两个都要记。
         version = _VERSION_RE.search(text)
-        self.client_version = ansi_to_text(version.group(1)) if version else ""
+        self.client_version = ansi_to_text(version.group(1), codec) if version else ""
         exc = _EXCEPTION_RE.search(text)
-        self.exception = ansi_to_text(exc.group(1)) if exc else ""
+        self.exception = ansi_to_text(exc.group(1), codec) if exc else ""
         fault = _FAULT_RE.search(text)
-        self.fault = ansi_to_text(fault.group(1)) if fault else ""
+        self.fault = ansi_to_text(fault.group(1), codec) if fault else ""
 
     @property
     def stamp(self):
@@ -322,8 +329,11 @@ def read_build_info(root):
     return info or {"error": "BUILD.ver 里没有认得的字段"}
 
 
-def read_crash_report(gamedir):
-    """读 `<gamedir>/Dump/LastCrashReport.txt`。没有就回 `None`。"""
+def read_crash_report(gamedir, codec=None):
+    """读 `<gamedir>/Dump/LastCrashReport.txt`。没有就回 `None`。
+
+    `codec` 只有测试会传（夹具是哪一页就写哪一页），见 `ansi_to_text`。
+    """
     path = os.path.join(gamedir, "Dump", "LastCrashReport.txt")
     try:
         mtime = os.path.getmtime(path)
@@ -333,7 +343,7 @@ def read_crash_report(gamedir):
             text = fp.read()
     except OSError:
         return None
-    return CrashReport(path, text, mtime)
+    return CrashReport(path, text, mtime, codec)
 
 
 # ================================================= Windows 专有（延迟 import）
