@@ -65,11 +65,14 @@ class WeaponIniTests(unittest.TestCase):
     def _installed(self):
         """已经实装的那些批次的武器。
 
-        ★ 判据是**状态翻转**：`BATCHES[x].variant` 一填上（= 用户选定了配色、该批该生成了），
+        ★ 判据是**状态翻转**：`BATCHES[x]` 的两格变体一填上（= 用户选定了配色、该批该生成了），
           下面几条「资源必须在盘上」的守卫立刻开始管它。不是「跳过第 N 批」那种阈值。
+        ★ **两格都要填**（`variant` 本体 / `fx_variant` 特效，D44）—— 只填一格就还没定完，
+          `build.py` 也会拒绝跑。
         """
         return [w for w in self.spec.WEAPONS
-                if self.spec.BATCHES[w.batch].variant is not None]
+                if self.spec.BATCHES[w.batch].variant is not None
+                and self.spec.BATCHES[w.batch].fx_variant is not None]
 
     def test_every_custom_section_exists_with_its_ids(self):
         for w in self._installed():

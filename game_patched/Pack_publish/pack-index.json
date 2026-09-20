@@ -1,9 +1,9 @@
 {
  "format": 1,
  "packer": {"fill": 0, "key_prefix": "Pack/", "policy": "original-ext-v1", "sep": "~", "volume_cap": 16777216, "zlib_level": 9},
- "tree_hash": "0509a5bc468d87405e73d6b90e38475b9363705cadf38a7f8caeadfd64860718",
+ "tree_hash": "0a42c25b3cf283183d198b817f8bb957772a0030770cebc598862284ca357c3c",
  "volumes": {
-  "Data~.pkn": {"group": "Data", "sha256": "1f8c9d9bc89c89da325fabcd2cd4c0d0c6d9ebb2faad3f309ff9b34846390358", "size": 550912, "source": "Data", "members": [
+  "Data~.pkn": {"group": "Data", "sha256": "6a22094947ded3af2030d8fb022fb2a96bb39548445a6d3ed8209889c5e6c318", "size": 550912, "source": "Data", "members": [
    ["Chinese.ini", 114250, "2ecfe16814a0d515430fdeea80c53eb7cbd5a9e0be69dcee469f360b8ba08d4e"],
    ["Chinese.ini.r19467", 103870, "6a20b3f802a68c72bc57d438ac42467940b8b4e8e0ddeafebc1a30d0ca2bb584"],
    ["Chinese.ini.r19470", 103892, "b4d3a37902c721e112a9f70ca0dc75dc6222ea0ba0cf4e5a6642871a9d2b3dd3"],
@@ -41,7 +41,7 @@
    ["map-censorship.ini", 28668, "a4c6a3b93a71b35b7e661220b6446db4352f474e8b3769a86d17070895fbd6fb"],
    ["map.ini", 43350, "d911bde05623a8499ca54d22a7c4d35c0ce671f99b501b258ea2cc8c39646b38"],
    ["weapon-censorship.ini", 95855, "7bbd0ddaf5ebaaadb8db91e32973a1efeb88a9f7238e2f35b020fa4c560dc4de"],
-   ["weapon.ini", 246632, "3cfefae5292aa6a6338f45f2c98a65b9edacdfe3c0544243f4cfd9ce0293466e"]
+   ["weapon.ini", 246653, "1de03aa627751530b69b00620ab1634f3bd1bedce049ac8608ecb0d640f3b17f"]
   ]},
   "Data~Quest.pkn": {"group": "Data", "sha256": "4aae0676e1a488733bfa7f0461936b9eb5bfb5274f3b972dd04c8c08d9cb4cf5", "size": 1082368, "source": "Data/Quest", "members": [
    ["Quest/ChrProps-international.ini", 54, "9c6cbc470c405f715ca4c0eaad777635310c7715391a2723f001fb0713b9ec46"],
@@ -6179,7 +6179,7 @@
    ["Event/크리스마스 이벤트 아이콘.png", 8303, "4f001d7c7ee970c7476e2bb662be9f42f2383c36774f09054fc0b978759dd88e"],
    ["Event/크리스마스 이벤트 아이콘.smf", 136, "56fc573070d7ca0b46bab5326ebd421fa864ba13f878151f50ed0b7e3a314047"]
   ]},
-  "Images~Game.pkn": {"group": "Images", "sha256": "f8758230475ff3543c2179efda7a99f459b7edfdcab830321b2b9e44d5e8db11", "size": 6514688, "source": "Images/Game", "members": [
+  "Images~Game.pkn": {"group": "Images", "sha256": "a9ab4b8507c1623a604c6858a90939f92a48dca6ec10ddc354116829d2bb146d", "size": 6514688, "source": "Images/Game", "members": [
    ["Game/AimGun.smf", 40, "4068b7cc65cb76e2793076e63e34544721fbd0b412a08afe511b2baea360762a"],
    ["Game/AimGun.tga", 8236, "35be79b642ae8f6ab5aa1872dc8e882c08a15974584c6622c9611cd95f629d80"],
    ["Game/AimPoint.png", 70359, "4d20b7e25bef8ef7547ecc6ce78eb64a86527a0daafbe732c86e4a2c83b51014"],
@@ -6727,7 +6727,7 @@
    ["Game/WP03F1.smf", 104, "995a838c52bb3178e305705c5d2caf38bdd5d9eb1ec4f23628e71c206b479063"],
    ["Game/WaterCannon.png", 16217, "e0b665a36a74e6cc2c4ff808db3487720871f4115e74f28fb2b75171fb24bc37"],
    ["Game/WaterCannon.smf", 104, "adcf2aa7bcf6f1d0bda34cd6519829d4df0b9fbfdc1c79517e61f82dc3e2bd44"],
-   ["Game/Wp01C.png", 53210, "d8cfe107e08f0dfee0a54b6eb9c1ea85be5fd263700212f391178743f3184339"],
+   ["Game/Wp01C.png", 52431, "7c15c8e4f03da1c64b3e5f63eb2426a910339e327aeaa764083fcfa5eb6dbf3f"],
    ["Game/Wp01C.smf", 104, "d75e85562c1e1a54b9f9bbf7f6bef98e66e17fdecb4cb954e5ebae22527b5568"],
    ["Game/Wp01D1.png", 51099, "9a9fb7f5808805fab43e099afc7f48f3475a28c287b3f370b8c9e7c1356d5bfd"],
    ["Game/Wp01D1.smf", 104, "5db28b91c6774331cdb0cee4c7502ed5173cfa8275e8165e1e7642fa8000ccac"],
@@ -6751,7 +6751,7 @@
    ["Game/Wp01R3.smf", 104, "7a92107a00310afbf4f2765d0a8a4bbe6165ede139c79c4822df8ffa3f1580cb"],
    ["Game/Wp01SE.png", 47272, "111b59be3286c4162a1ec5c6590081173e1729d9ef143aa3a5f8ca47c409a0a4"],
    ["Game/Wp01SE.smf", 104, "6af7cff3a5198ad50b170575c6aeb94c883f2a48b17879280eaa35b4f19918dc"],
-   ["Game/Wp02C.png", 41997, "1db00d3c61afacb4f92835f6da25ac1c905f00a3cff226caf676f009c4009cca"],
+   ["Game/Wp02C.png", 42359, "0fb1e65d7d5c4f4f87550697cea3f2767d3cdd7ac4c78bdaeaf32667515a5a5b"],
    ["Game/Wp02C.smf", 104, "43c06809450a5c6afb6a559063a067b1dd3ef2a3f8bb227b566d9f3e27555685"],
    ["Game/Wp02D1.png", 36486, "af6b8dca16af8ed0d111aaefb377a29262228f612254787614d17e46ca773e7c"],
    ["Game/Wp02D1.smf", 104, "03de37167326316d0f29bd03a44c07df6cd3b5d07dc33a145d37cda3e08494b1"],
@@ -6775,7 +6775,7 @@
    ["Game/Wp02R3.smf", 104, "2ae4064d03687bdcaba16d1fa282e6deeedf557fba321a634701788f2d3509e3"],
    ["Game/Wp02SE.png", 36779, "c76b31acc77e5a3ba62e5ddf05e1ba9013356f79120b6e073850b1ac93b3ef8a"],
    ["Game/Wp02SE.smf", 104, "66ef4a27a60861afb5985c9051253a0646ac3c69889b812dfe7352ef080bb2fa"],
-   ["Game/Wp03C.png", 52497, "d341cd8d45461176eac319cc9e65f6ecac18082b7aeb8a17662cd57eec82b739"],
+   ["Game/Wp03C.png", 52645, "8973c007b8fabd25c1f8350c4ff8ee2f1eecf889683bc8f637d1fb2ecf1f8ad6"],
    ["Game/Wp03C.smf", 104, "3f7be80850022321853621895a9064cb69ecdebad27ff42a2ddea550c1775b4b"],
    ["Game/Wp03Classics.png", 46884, "a23d8f4ed14184723f2eb1e4c37d4e4ed2db0f77a77fe625a22186c0094da51e"],
    ["Game/Wp03Classics.smf", 104, "d3687acaa5671a9fcadf0ae7979266b4946d6535b1f71fd424f474b8ac31aae3"],
@@ -7584,7 +7584,7 @@
    ["Quest/ZChip.png", 37643, "24720541a97460643d8bae65a08aeab2eea65ca957a050ec39708d0d9b736bf6"],
    ["Quest/skip.png", 3430, "673bdcd77413a19cd2fb69a0b504e19cd4393612913db18068346c373132f312"]
   ]},
-  "Images~Shop.pkn": {"group": "Images", "sha256": "b6ded7405c862ce7595eee471c8ce7046e17a572956f68d7a38c9e4a5cbaffab", "size": 14534656, "source": "Images/Shop", "members": [
+  "Images~Shop.pkn": {"group": "Images", "sha256": "756db7e716f9a386360d49e7cc1cf5d723c224c7a25ce8efa862918b6de1d204", "size": 14536704, "source": "Images/Shop", "members": [
    ["Shop/CH0000025.png", 16743, "7d16a3d06a8e4a2345156a626d41c7cd04b865f522ffd7b591f255d5069f271f"],
    ["Shop/CH0000026.png", 15893, "89710d5066c63f7312dfcb5faf9d0b040512905b943e8cff12ae9d541f5c00bf"],
    ["Shop/CH0000044.png", 10910, "f7583b5f41799b4e77308c75de00d3360e883df16df3aabf976d01437741bab3"],
@@ -8052,7 +8052,7 @@
    ["Shop/메달_브레그마.png", 19980, "be06046ab8fa542bf2620770654bf6c5f1e985b8c54be5ecd5da3fe396c3fd40"],
    ["Shop/메달_비행선.png", 18900, "acdf5922a7fdf12059f5b599b2b01c26d32e19ddf6e038b7a419608a8774d0e8"],
    ["Shop/메달_탱크.png", 19091, "8043f30402c4f40aaa60e92935f95b6ce79194acec503069a59813610af2dc06"],
-   ["Shop/무기_T1 C.png", 11432, "2a018697919ae453751e3f8f8ad2281633662b12caee54ba1e7295e16283504d"],
+   ["Shop/무기_T1 C.png", 11730, "823177ae35e9287ebef259a7d4eaa79a93aaa1887762b4ed3a05949719d55000"],
    ["Shop/무기_T1 D1.png", 14306, "30de433cec825b8f6d09cf9a49b6453b9518f36a6fa2068f078ca1df09e8da0a"],
    ["Shop/무기_T1 D2.png", 15010, "74f567a9461846391bc9ab65d1eca5ca40459aa4239879e61e8cd3fdc1a2b930"],
    ["Shop/무기_T1 D3.png", 13337, "54ebe43e051902620335ebade6b7ab5565e8b6aa3fad473b681d0eae3bf7f491"],
@@ -8067,7 +8067,7 @@
    ["Shop/무기_T2 플래티넘.png", 14566, "e56002038bb097c3ef83fe8332c7356171f2f4943020e4171b52517732df1700"],
    ["Shop/무기_T2.png", 13560, "49175077257bc9b71a1595e44145f2f8b4ee251cdb14566f9f592fe754e5a0a0"],
    ["Shop/무기_디스트로이어.png", 13854, "0f389aface4b09af12c6e570a7fdb10e171043777050e22d7c9f6847560ae90c"],
-   ["Shop/무기_리볼버 C.png", 14795, "f16cdb8aad7003ad91546ce564154d8b9f522a14f544198ac1ab009ededbb354"],
+   ["Shop/무기_리볼버 C.png", 14747, "4a41c32874fcee510466cfea1b94f1f03660242e545bfdf1e1f7fda215223990"],
    ["Shop/무기_리볼버 D1.png", 15922, "74a70f57b4b5075c05536b74c0f1c48beff6f4c58bf7889618e48b15f77b7dc6"],
    ["Shop/무기_리볼버 D2.png", 17477, "30a703895cb58a74bb04be97c56007f7a01656770910d6b722424b8b1212b132"],
    ["Shop/무기_리볼버 D3.png", 16695, "f9bbcfc0d3ca197e736acb8649350b6f2259a0584dab6435a037541eed4b7f8a"],
@@ -8079,7 +8079,7 @@
    ["Shop/무기_리볼버 R2.png", 17670, "03e01de0d7b99ef7dfedad3c1dc6d46b96417585b2c87f10340abf2a391a61ab"],
    ["Shop/무기_리볼버 R3.png", 16792, "b90d21a43cd294c1ff3e7f097b70d5ef724f891d89fc0d1baa992079a1c5d4e9"],
    ["Shop/무기_리볼버 SE.png", 14636, "b81b43ffacfd82976029dfbf72163ab0a14496fed59b6200fb8f57fb6934d2ce"],
-   ["Shop/무기_머신건 C.png", 17679, "74fa51c3dc6fb5cc274ea1f0ecbc32254fb1eb6b967dac2d1cddbda49e53b70a"],
+   ["Shop/무기_머신건 C.png", 17441, "a0abf1cf65a361082ace173e1f8a01a22c4a9a531c4628a2f0fd4a10df18b91c"],
    ["Shop/무기_머신건 D1.png", 18208, "dc6557b98ceb69a4ca923a10c679b52269a3e0562f0c879af7f9dfdeab41c3dc"],
    ["Shop/무기_머신건 D2.png", 20098, "3884f0f4e96a8f202f95ab15f5e858831423bd91f6fdebe5f62550a20de4cf6f"],
    ["Shop/무기_머신건 D3.png", 19437, "86cbfe3cd188177622406937a9952ce1798c44f0f650532305f4a41ad6396ad1"],
@@ -8091,7 +8091,7 @@
    ["Shop/무기_머신건 R2.png", 21835, "2ee9b1008d147ec9f6758cd8eb213026472916218df1077280dc4e2e10fc6407"],
    ["Shop/무기_머신건 R3.png", 14224, "041f4fbfa26a487402896ed6b197b23ebc1969fb952cb37f747a9b07166f2526"],
    ["Shop/무기_머신건 SE.png", 18082, "f9048cbb0bcfc2a1e96cadd965b4ef3e39e3ab020bc10857e887de2ec57d7ba0"],
-   ["Shop/무기_바주카 C.png", 14443, "d9bc57067a6bf36810f1c2430c334426e5923ff6bbfb65453981aeb91b626733"],
+   ["Shop/무기_바주카 C.png", 14519, "edd8dad9f85a695552b6b285a4d4221465b979aa402ec2fd0df0d391b2ef23ac"],
    ["Shop/무기_바주카 D1.png", 14883, "5f4b2aaa1ae450ad63cac6cae5bfec52b02dca607fc57074b7cb144fef6d4715"],
    ["Shop/무기_바주카 D2.png", 13409, "05bd6dac0332b63ea0a2fc65da3e280b419546d45d5a46516d4c30366f6c952e"],
    ["Shop/무기_바주카 D3.png", 16186, "e774f875b3187056ba6bebb2f1a79fb2e67e09417620972aa4ff6e8defb20cde"],
@@ -8103,7 +8103,7 @@
    ["Shop/무기_바주카 R2.png", 13737, "fd99252ff762ba624ec2f1f7ceeec62189c886ecf83cf05a4486ee09bcf3d347"],
    ["Shop/무기_바주카 R3.png", 16345, "10d0d8f263f8efbfcba936dfb7c412cfa50fc18ac6f44bf49f08f18fe6881163"],
    ["Shop/무기_바주카 클래식.png", 13753, "6cb2678d46d411133296c34a7c25c7c6a2feb7b8e03bf00c3f6e732e019316ce"],
-   ["Shop/무기_사과탄 C.png", 14409, "094f408319c791a3c821cae5400e4ec41495dccdba0074926818e1123db086ed"],
+   ["Shop/무기_사과탄 C.png", 14448, "ae550dfd2f5d141b2b422b7dcacbe8d33659f82550f6d71125c74be839dd2bf5"],
    ["Shop/무기_사과탄 D1.png", 13537, "3f7647ef1da7b3de0c967322810945b98f618836f6de7c6b2c2beced830ae78a"],
    ["Shop/무기_사과탄 D2.png", 14818, "19b4e8ff4eea0f972a417f30f9f22f5920e5ac6d70c66ef6f43d4b87ed373875"],
    ["Shop/무기_사과탄 D3.png", 17356, "2f27634a079a29b598964bc675d32bd11d246b11e8212b88462d529399971cb9"],
@@ -8115,7 +8115,7 @@
    ["Shop/무기_사과탄 R2.png", 15683, "87e7c96922833367db2835c7d65c752b57a8be360dce85aca6e1e0641262f2c8"],
    ["Shop/무기_사과탄 R3.png", 14569, "eb20defa4853a46bfd7da0692ba2c518a9a4f603a103b45dc44313f3acd2d0ac"],
    ["Shop/무기_사과탄 SE.png", 13100, "53b856618957e725f0a7aec5e42066fdc287093945c9013640c360f3509cfec7"],
-   ["Shop/무기_스크류런처 C.png", 16649, "bb1f4f629f660cf4872ffc0a1f590f7b4671a3d4a70ecb3b74b900ba5175752a"],
+   ["Shop/무기_스크류런처 C.png", 16557, "cafa945e52bc19e5db21ea69c89401dbf8548578c1b7ca13d4e0e2517188d769"],
    ["Shop/무기_스크류런처 D1.png", 14959, "be940fdc0c074699fa70208a4df56eaa208072ce4d645f03a074139e1bfb6265"],
    ["Shop/무기_스크류런처 D2.png", 15448, "b42ef8d369ce0db085536670a610625e933522326016bd54152b0de2dd07dfe8"],
    ["Shop/무기_스크류런처 D3.png", 17564, "ee7483279b837dd0271dd9daa96becb7d70939b621840cd1c5d4e0ba5ee0f7be"],
@@ -8127,7 +8127,7 @@
    ["Shop/무기_스크류런처 R2.png", 14269, "17261b8a6a9a7f49003c24e7d8a6ef8e47167cafb37b20c5396b934773afdba3"],
    ["Shop/무기_스크류런처 R3.png", 18673, "968b624c61650b2539cd3c7e137dd370253f59712339071ac68794a63c780513"],
    ["Shop/무기_스크류런처 SE.png", 13724, "ed0df8f8c7d3e851bf9468a5d5f15103320aaa2b2d4d5cdbedcea4c978a52c66"],
-   ["Shop/무기_카멜나이트 C.png", 11192, "bd46037513d088ebca11d604b477a8db9ef301f1d3e7f9f6ed1b0fc1405d5340"],
+   ["Shop/무기_카멜나이트 C.png", 11345, "0674e7b6095ecc4b922e7ce60f6b8740446bd6ea1a0a8bbbed27c6696f011cb6"],
    ["Shop/무기_카멜나이트 D1.png", 16703, "7d7a18d283158500458ad35b95108f77d6d5cac65ab9c3425f6c751b876960c9"],
    ["Shop/무기_카멜나이트 D2.png", 18572, "938ed68eb79ba27fb7b1233682968b1a21007ef13f1920ffa022d1754d61f699"],
    ["Shop/무기_카멜나이트 D3.png", 13801, "dde68dfb38078fabcc3ef8a5700ef8d911cc2b73a68495950159f3bbbc61ae25"],
@@ -8139,7 +8139,7 @@
    ["Shop/무기_카멜나이트 R2.png", 19645, "1389e4914c5deaa5935e90d7a38eda0f27b4bc9bd17012479ec76b8122b9286c"],
    ["Shop/무기_카멜나이트 R3.png", 14430, "e73ab289135028d9e3f39825e12b5cd3613242bef17f2074fa8ef524fa73513e"],
    ["Shop/무기_카멜나이트 SE.png", 15726, "0df693ea3331a723b581218b1835335bf1e2a7ba58ea5565aeead783d67c9953"],
-   ["Shop/무기_캐논왈츠 C.png", 13750, "6ef59f39178bb96a0c65cf87c3700588758e88d72ee0ca271b8af31f23313345"],
+   ["Shop/무기_캐논왈츠 C.png", 13902, "fffca0dcbfe5b6067edd34a210dfaa5ba7068ef16f0d9e2e66cced87116c9a84"],
    ["Shop/무기_캐논왈츠 D1.png", 14059, "63d0cc5bc434a07802b8d5a4a376bb6b5ab777fd4e998a43ecf2678c9d654a65"],
    ["Shop/무기_캐논왈츠 D2.png", 15589, "840b713dd59efdad304adb5ae28f84974e41c5c800b9a48faab16930bf30fd25"],
    ["Shop/무기_캐논왈츠 D3.png", 15723, "1c6b58a74968e5c1e96cf821940c66bb3e823b4e6bdc7f8325cb3079b758ef0e"],
@@ -8152,7 +8152,7 @@
    ["Shop/무기_캐논왈츠 R3.png", 16397, "d3a14826c3401d0c99942d37204e4821684d89af3e60f8b5becaa9ac6291139e"],
    ["Shop/무기_캐논왈츠 클래식.png", 15756, "d8bc9eb99bd01774ed3beace4bc6cc89f411f187c8163e98eddaf4340b4b8073"],
    ["Shop/무기_캐논왈츠2.png", 13885, "c62b75da8c24ca8d7ec9d2f0fd45078e9e6cc277fb677a64106421a85abff3b7"],
-   ["Shop/무기_화염탄 C.png", 15999, "3b5eb61ff809779bc3acd8ccc5a09c58f374456cf547130e727ea2d135f25df7"],
+   ["Shop/무기_화염탄 C.png", 16597, "b326866a6e1f6bd62ab19469a0cb2bea04a61260304468da12dba41906f97968"],
    ["Shop/무기_화염탄 D1.png", 15277, "8e76fffb2e69c9fc942dacd2b8917d632df98efc3de8c64bcf7625bf67db95cb"],
    ["Shop/무기_화염탄 D2.png", 18180, "1cf76d960e571f9992c4b9ed465ea53ed8117c7499754ae5fa7977ff0e97d902"],
    ["Shop/무기_화염탄 D3.png", 17951, "0d411dbc1c6869b48e83cffca3a78dea792012259def4a699f22cf7934737df6"],
@@ -10232,7 +10232,7 @@
    ["testnewjungle/layer/st_pvp_00_17.png", 49435, "31086a51d7a22b5b09088e5cfc5d3ed8fb69004b9aad30ef86a299f8285cff9a"],
    ["testnewjungle/layer/st_pvp_00_18.png", 171220, "2204767e5bec0fae0015995a007ac492bbf1279ced64808ed83713bbeb6ade71"]
   ]},
-  "Models~Characters~ch00.pkn": {"group": "Models", "sha256": "f0e7b5e33e7113fda668997c62226e0a438114deba7a2ce8ca9d8358015ca8d1", "size": 12688384, "source": "Models/Characters/ch00", "members": [
+  "Models~Characters~ch00.pkn": {"group": "Models", "sha256": "ba024f10f5f9b053fbd48aa0f33e58355962d30ab8fa0218fe0df8d0df0d3198", "size": 12687360, "source": "Models/Characters/ch00", "members": [
    ["Characters/ch00/Ch00@Dash02.evn", 1014, "9c7ee72e980c81111cfae2bcd3621c0858aa79469dacd0a646f5b48ff66fa392"],
    ["Characters/ch00/Ch00@Dash02.mtn", 52888, "b6c736e1e96c81eca5a42a7f5ee57be425c91978d5a044328782cdfe042db93f"],
    ["Characters/ch00/ch0000000.dds", 8320, "b809bd33ff8f5b33b06635159d6e7c111c0725c51f754eb74835c443beae8c8b"],
@@ -10921,11 +10921,11 @@
    ["Characters/ch00/ch00W0132.msh", 46346, "9b749d5967a5140bde135cba9d70f56073fa482215dafecccbd9df7c97a225a8"],
    ["Characters/ch00/ch00W0133.dds", 16512, "57019ce6a83fa6c0793adddacb77f6629fa4e1f1835fbb41e09bb41b6e60d457"],
    ["Characters/ch00/ch00W0133.msh", 62674, "81d83c4c9c6282480beeadaa7f474cbdd93bbe4aa41b511304c0b2db8f5a50c0"],
-   ["Characters/ch00/ch00W0141.dds", 16512, "3d6d77fdf65bae9cdd6c1fb023b28eb2487de8521a45babceb688cdc562701f8"],
+   ["Characters/ch00/ch00W0141.dds", 16512, "67dce9206c13f29badbbcd415100728ed6303aac636322d32dbd6177f626a756"],
    ["Characters/ch00/ch00W0141.msh", 40820, "349e6083aa13853629f0a8910eb98c3e9bb850c9cff3ac5cea2b16ff75d83e07"],
-   ["Characters/ch00/ch00W0142.dds", 16512, "f4862e7f272a20807807522e3eefcb524dd823dbbff9df2f07727c5893cc34ec"],
+   ["Characters/ch00/ch00W0142.dds", 16512, "3caeca093509c09b159dc9950f08a2fba54a885301d91303e2a24eb2695f2673"],
    ["Characters/ch00/ch00W0142.msh", 46346, "fce6b117540529145916a5c7ca8d95afb46af6e24b45e2096419647539bcf834"],
-   ["Characters/ch00/ch00W0143.dds", 16512, "8aa63c04a64c8d843b0d2c1205ca7a0927c83fb8b3b6fe257cc758742868a95c"],
+   ["Characters/ch00/ch00W0143.dds", 16512, "8aa90c33f1fe202cb7e28003ad6e3c8fb53e2e1973bec564afed8c0cb16de186"],
    ["Characters/ch00/ch00W0143.msh", 62674, "312ca84a611b269257b35239a22ce5a0293178506c536571511d60e4f6bf3bc4"],
    ["Characters/ch00/ch00W0211.dds", 16512, "ba495b484d9530ac2d4d4c229e717787a5ea525a9b91b36a136cd98ef570fbb4"],
    ["Characters/ch00/ch00W0211.msh", 33990, "72914ab1f136f9cd64c6b379e836accdd033e06eb7809c0a362cde40ad38e3e0"],
@@ -10996,7 +10996,7 @@
    ["Characters/ch00/ch00^W0053.dds", 16512, "e54ea93533a6fbb897e208ef3d5c0eb4e00cdd29203fc6370c0a41ddcf387505"],
    ["Characters/ch00/ch00^W0053.msh", 7428, "fe9e12c72257edf31f67b44bc384cadd3a10075372f384de900a99cd509c9c7a"]
   ]},
-  "Models~Characters~ch01.pkn": {"group": "Models", "sha256": "331a21f621aa217ee18d6fe9623c7b619ff23b27870a36adbc3afc6485f2d141", "size": 12951552, "source": "Models/Characters/ch01", "members": [
+  "Models~Characters~ch01.pkn": {"group": "Models", "sha256": "9e2a4935dbaf52909d97480541e7f706380897e59897fe78d3eafd4eb1aad1a0", "size": 12951552, "source": "Models/Characters/ch01", "members": [
    ["Characters/ch01/Ch01@Dash02.evn", 855, "0a20689e3686abea7749058caa24f57008cdc25f44f83b7df0ae4154dae70917"],
    ["Characters/ch01/Ch01@Dash02.mtn", 101878, "310bed1d92dd12a9f4404e5896a24f6f6e1d129e959befaf9ce3a91db6379da0"],
    ["Characters/ch01/ch0100000.dds", 8320, "0d5dfaa36019608ead2e5725f8783a83461d9cb6baf75d4196f3bc60a1522ff5"],
@@ -11612,11 +11612,11 @@
    ["Characters/ch01/ch01W0132.msh", 46698, "18fe7206fa273451cf9afbf5635c04672509383a52a11c0f5a0f6c27d72b2b05"],
    ["Characters/ch01/ch01W0133.dds", 16512, "48e2d9bcad0e9bc7b88a6988748f2c7b940a44af84083b8be9a4f24242b3d6e6"],
    ["Characters/ch01/ch01W0133.msh", 39030, "2f6ae05f8e90410901f6599b23fb21173c1b929d319e7a6fbf5919776e07fc76"],
-   ["Characters/ch01/ch01W0141.dds", 16512, "675f4d2bc001fa6d0be850b5c98f23bca6ef96fb3d329039139f7ccbe4521956"],
+   ["Characters/ch01/ch01W0141.dds", 16512, "36db412c27f16ad963074b1d5398ab4deea5ea74f0c9b43e2e1d73c58450e2e3"],
    ["Characters/ch01/ch01W0141.msh", 83878, "029c5284ea8f4952180fceb32c70fa6c13b9789edd141496d037363c48ebbd0c"],
-   ["Characters/ch01/ch01W0142.dds", 16512, "4e1ddc75d5aefb2ba55fc90afb9219fa034db740abbd30c2a43d515955838bd0"],
+   ["Characters/ch01/ch01W0142.dds", 16512, "6f7fd9f8a83db08a035d9c2b1aecd9f76a1ea9aab850d8c4817bf7722e63cf5b"],
    ["Characters/ch01/ch01W0142.msh", 46698, "edfe7559239585bfb40aa72fdd4227604f7b01479cdf5a3fb6405a2ab54db36e"],
-   ["Characters/ch01/ch01W0143.dds", 16512, "55454403e5030ad2d9d45ff13a9a1f21a458c72d97577f7239b934d2944ea5e7"],
+   ["Characters/ch01/ch01W0143.dds", 16512, "dfe1a318dc73d49370f4d04db7c5e4f70db36587829ea13cb30e30b159f3d478"],
    ["Characters/ch01/ch01W0143.msh", 39030, "98a89ebe4233baae6ae7693e05b38ae2d1dde6f72c4342dee7e74ee4a318241e"],
    ["Characters/ch01/ch01W0211.dds", 16512, "ae1fe048909499c864ce141690cf04e249928cd231bf5ea949ea9f3fcdb9714a"],
    ["Characters/ch01/ch01W0211.msh", 67718, "c80fc850324e50778ee45e9439d6f1719847873a6941cdfdc06dc611d5a9baf3"],
@@ -11685,7 +11685,7 @@
    ["Characters/ch01/ch01^W0053.dds", 16512, "e54ea93533a6fbb897e208ef3d5c0eb4e00cdd29203fc6370c0a41ddcf387505"],
    ["Characters/ch01/ch01^W0053.msh", 7428, "9d7cc05a6a827bedcdb6020c0d51cc77ec11d4cf4dad248ec5a325388eebd238"]
   ]},
-  "Models~Characters~ch02.pkn": {"group": "Models", "sha256": "1c3f53cba725270bc359cefa4d763fb7d513939c5a0ccbe138943a94749bbe06", "size": 13562880, "source": "Models/Characters/ch02", "members": [
+  "Models~Characters~ch02.pkn": {"group": "Models", "sha256": "2cbeddf91ccd8a80f8e49cde6d243686ada92544fcb8888f43156ad8352bb011", "size": 13562880, "source": "Models/Characters/ch02", "members": [
    ["Characters/ch02/Ch02@Dash02.evn", 1037, "b6c8f917232acb39bd3708745e2a2a2bd4bd2468f460e6f69ef7acb07d604a07"],
    ["Characters/ch02/Ch02@Dash02.mtn", 58770, "8daf65014d5ffaf3a27b0586933c830787fabf8a07134ad2ac44a61d70905568"],
    ["Characters/ch02/ch0200000.dds", 8320, "050aae6a427b6d8115a1d10712d717dfc52ddfd05aa208fdb84b05aa2b714026"],
@@ -12295,11 +12295,11 @@
    ["Characters/ch02/ch02W0132.msh", 53242, "e944e5a918536facdbbcc3f9b29c2e507ed1c996a474f56724302b12af21339c"],
    ["Characters/ch02/ch02W0133.dds", 16512, "202b85631af2d3256caeeaa0d63230e0f8c7fedf611dd569f7d8879bc0d28acd"],
    ["Characters/ch02/ch02W0133.msh", 66172, "f640c486445291430a91016eea457fb63f53078cbd0f3d7ec995fa25d95c5f62"],
-   ["Characters/ch02/ch02W0141.dds", 16512, "ae97cb37648d176038d2808ad61ac8fa709994d41edfe5de99962f4d4166cd5c"],
+   ["Characters/ch02/ch02W0141.dds", 16512, "357e20ce4dc5d8becaec7a27da737dd833ebcad92d14e558a2221c4fb884c666"],
    ["Characters/ch02/ch02W0141.msh", 59858, "4b6626b400c6a48216452bfaf40125a746d293ba85de5fd7225fdecffbc1d547"],
-   ["Characters/ch02/ch02W0142.dds", 16512, "6a6ddace66da50e795b32b1a9d597288a88973c7dcaf32d63635e2468ccc428e"],
+   ["Characters/ch02/ch02W0142.dds", 16512, "4200eb21aaa56dfb6b2263793896e77fb67d72e11f8d88646ac486d5e0592f0b"],
    ["Characters/ch02/ch02W0142.msh", 53242, "e2292ffb277013643db25f547b86e50869a049ff57a3bddb625c17d2a8c7b8c1"],
-   ["Characters/ch02/ch02W0143.dds", 16512, "54c08d252aa931bffe1d9e54812a0abea16a8845a2ade033c9825ed64df3c729"],
+   ["Characters/ch02/ch02W0143.dds", 16512, "ba382ed5524181720ad8a4a5708189c17b976cf036cc33a4539715b3c9cb1f3f"],
    ["Characters/ch02/ch02W0143.msh", 66172, "d4b91624fea2e25f059c5bb187d71421f95f3994ea46c77c474002b96776bbf0"],
    ["Characters/ch02/ch02W0211.dds", 16512, "d5527f1492b1fb2b11bd5ce1f0fe8cc91f44e80d2a9bec8265f663f6978504d6"],
    ["Characters/ch02/ch02W0211.msh", 31002, "1289ebe3c60789379760b8bb689eb89120c1b9ac040e923d46cd8df9b35fefae"],

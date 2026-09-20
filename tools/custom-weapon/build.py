@@ -5,20 +5,25 @@
     C:\\Python314\\python.exe tools/custom-weapon/build.py                      # 全部批次一起，幂等
     C:\\Python314\\python.exe tools/custom-weapon/build.py --dry-run
     C:\\Python314\\python.exe tools/custom-weapon/build.py --variant P=orig     # 临时覆盖某一批（只搬运不改色）
+    C:\\Python314\\python.exe tools/custom-weapon/build.py --fx-variant C=C     # 只把特效换个色，枪身不动
 
 ★★ **一次跑全部批次**，不能只跑一批：`weapon.ini` 和 `ShopItem-Chn.ini` 都是
    「砍掉标记 / 锚点之后的一切再整块重写」，只跑一批会把另一批悄悄带走。
 
+★★ **改色分两桶**（用户 2026-09-20，→ D44）：`spec.Batch` 有 `variant`（**本体**）和
+   `fx_variant`（**特效**）两格，C 批就是「枪身 `G4` + 特效仍是 `C`」。下面每行标了走哪一桶，
+   代码里每个改色出口都显式写 `plan.body_variant` / `plan.fx_variant`，**没有缺省兜底**。
+
 产出（全部落在 `game_patched/Pack_develop/`，之后跑 `tools\\build-pack.bat`）。`<字>` = 批次字母
 （`C` 爆裂 3 → 黄金 + 银白；`P` 复合 3 → 粉 + 绿），`<档>` = 该系列的第 4 档：
 
-    Models/Characters/chNN/chNNW0<系>4S.msh + .dds    手持件（等长改名，母本编号 = 目标 − 10，贴图改色）
-    Models/Characters/chNN/chNND0<系>42.msh + .dds    3D 弹体（**按 ini 的 `Image=Model,` 判有没有**）
-    Images/Game/CHnn_Wp0k<字>_*.png + .smf            2D 弹体 / 碎片精灵（改色）
-    Images/Game/Wp0k<字>.png + .smf                   HUD 武器图标（3 帧 = 3 角色，改色；`.smf` 取本批母本那份）
-    Images/Shop/무기_<韩文名> <字>.png                 商店图标（改色）
-    Effects/CHnn/WP0k/Efx/*<字>*.efx                  特效副本：贴图指向改色副本，<ColorValue> 按同一套规则换色
-    Effects/**/Texture/*_<字>.dds                     特效贴图的改色副本（本方案改得到的才做，其余共用原图）
+    Models/Characters/chNN/chNNW0<系>4S.msh + .dds    手持件（等长改名，母本编号 = 目标 − 10）【本体】
+    Models/Characters/chNN/chNND0<系>42.msh + .dds    3D 弹体（**按 ini 的 `Image=Model,` 判有没有**）【特效】
+    Images/Game/CHnn_Wp0k<字>_*.png + .smf            2D 弹体 / 碎片精灵【特效】
+    Images/Game/Wp0k<字>.png + .smf                   HUD 武器图标（3 帧 = 3 角色；`.smf` 取本批母本那份）【本体】
+    Images/Shop/무기_<韩文名> <字>.png                 商店图标【本体】
+    Effects/CHnn/WP0k/Efx/*<字>*.efx                  特效副本：贴图指向改色副本，<ColorValue> 换色【特效】
+    Effects/**/Texture/*_<字>.dds                     特效贴图副本（本方案改得到的才做，其余共用原图）【特效】
     Data/default.amf                                  追加 CHnn_WPk_<字> 条目
     Data/weapon.ini                                   末尾一整块（每批 9 主 + 子弹药），**原版部分一个字节不动**
     Data/ShopItem-Chn.ini                             末尾每批 9 组 [Item-] + [Stock-]
@@ -79,7 +84,7 @@ class Plan(object):
     """
 
     def __init__(self, variants, dry_run):
-        self.variants = dict(variants)           # 批次字母 -> 变体名
+        self.variants = dict(variants)           # 批次字母 -> (本体变体, 特效变体)
         self.batch = None                        # 当前批次（spec.Batch）
         self.dry_run = dry_run
         self.files = collections.OrderedDict()   # 目标路径 -> bytes
@@ -90,8 +95,19 @@ class Plan(object):
         self.tex_cache = {}
 
     @property
-    def variant(self):
-        return self.variants[self.batch.letter]
+    def body_variant(self):
+        """**本体**色：手持件贴图 / HUD 图标 / 商店图标 —— 「这把枪长什么样」。"""
+        return self.variants[self.batch.letter][0]
+
+    @property
+    def fx_variant(self):
+        """**特效**色：弹体 / 碎片 / 拖尾 / 特效贴图 / `.efx` 颜色 —— 「打出去的东西长什么样」。
+
+        ★ 和 `body_variant` 可以不同（C 批就是枪身 `G4` + 特效 `C`，见 spec 的 `BATCHES` / D44）。
+          **每个改色出口都必须显式说自己取哪一个**，别加「缺省跟本体走」的兜底 ——
+          以后加新资源时漏分类要当场报错看得见，不能悄悄跟着本体变色。
+        """
+        return self.variants[self.batch.letter][1]
 
     def use(self, weapon_or_batch):
         """切到某一批；返回它，方便 `plan.use(w).letter` 这样连写。"""
@@ -181,14 +197,16 @@ def build_meshes(plan):
         plan.use(w)
         d = spec.chars_dir(w.character)
         # 母本一律是各系列的第 3 档、产物是第 4 档 ⇒ 源编号 = 目标编号 − 10（见 spec 的注释）。
-        pairs = [("ch%02dW%04d" % (w.character, w.mesh_idx - 10), "ch%02dW%04d" % (w.character, w.mesh_idx))]
+        # ★ 手持件走**本体**色、3D 弹体走**特效**色 —— 弹体是「打出去的东西」，不是枪身。
+        pairs = [("ch%02dW%04d" % (w.character, w.mesh_idx - 10),
+                  "ch%02dW%04d" % (w.character, w.mesh_idx), plan.body_variant)]
         if _model_bullet(w):
             pairs.append(("ch%02dD0%03d" % (w.character, w.mesh_idx - 10),
-                          "ch%02dD0%03d" % (w.character, w.mesh_idx)))
-        for old, new in pairs:
+                          "ch%02dD0%03d" % (w.character, w.mesh_idx), plan.fx_variant))
+        for old, new, variant in pairs:
             blob = open(os.path.join(d, old + ".msh"), "rb").read()
             plan.put(os.path.join(d, new + ".msh"), rename_texture_in_msh(blob, old + ".dds", new + ".dds"))
-            recolor_dds(os.path.join(d, old + ".dds"), os.path.join(d, new + ".dds"), plan.variant, plan)
+            recolor_dds(os.path.join(d, old + ".dds"), os.path.join(d, new + ".dds"), variant, plan)
 
 
 # ---------------------------------------------------------------------------
@@ -240,13 +258,13 @@ def texture_copy(plan, tex_rel):
         plan.tex_cache[key] = tex_rel
         return tex_rel
     _hd, rgba = dds_edit.load_rgba(src)
-    if plan.variant == "orig" or not palette.has_hue(rgba, plan.variant):
+    if plan.fx_variant == "orig" or not palette.has_hue(rgba, plan.fx_variant):
         plan.tex_cache[key] = tex_rel          # 本方案改不到的颜色：共用原图
         return tex_rel
     stem, ext = os.path.splitext(os.path.basename(rel))
     new_rel = os.path.join(os.path.dirname(rel), spec.rename(stem, plan.batch) + ext).replace("/", "\\")
     dst = os.path.join(root, "Effects", new_rel.replace("\\", "/"))
-    recolor_dds(src, dst, plan.variant, plan)
+    recolor_dds(src, dst, plan.fx_variant, plan)
     plan.tex_cache[key] = new_rel
     return new_rel
 
@@ -265,7 +283,7 @@ def efx_copy(plan, efx_value):
         return b"<TextureFileName>" + texture_copy(plan, m.group(1).decode("cp949", "replace")).encode("cp949") + b"</TextureFileName>"
 
     def color_sub(m):
-        return b"<ColorValue>" + str(palette.recolor_argb(int(m.group(1)), plan.variant)).encode("ascii") + b"</ColorValue>"
+        return b"<ColorValue>" + str(palette.recolor_argb(int(m.group(1)), plan.fx_variant)).encode("ascii") + b"</ColorValue>"
 
     out = _TEX_RE.sub(tex_sub, blob)
     out = _COLOR_RE.sub(color_sub, out)
@@ -285,7 +303,7 @@ def line_texture_copy(plan, value):
         return value.strip()
     stem, ext = os.path.splitext(os.path.basename(rel))
     new_rel = os.path.join(os.path.dirname(rel), spec.rename(stem, plan.batch) + ext).replace("\\", "/")
-    recolor_dds(src, os.path.join(root, new_rel), plan.variant, plan)
+    recolor_dds(src, os.path.join(root, new_rel), plan.fx_variant, plan)
     return new_rel
 
 
@@ -306,7 +324,7 @@ def anim_copy(plan, groups, entry_name):
     new_base = spec.rename(stem, plan.batch)
     dst_png = os.path.join(os.path.dirname(src_png), new_base + ext)
     if os.path.isfile(src_png):
-        recolor_png(src_png, dst_png, plan.variant, plan)
+        recolor_png(src_png, dst_png, plan.fx_variant, plan)
         smf = os.path.splitext(src_png)[0] + ".smf"
         if os.path.isfile(smf):
             copy_file(smf, os.path.join(os.path.dirname(src_png), new_base + ".smf"), plan)
@@ -342,14 +360,14 @@ def build_icons(plan):
         for icon_set in sorted(set(w.icon_set for w in spec.weapons_of(batch.letter))):
             src = os.path.join(game, icon_set + batch.src_stem)
             dst = os.path.join(game, icon_set + batch.letter)
-            recolor_png(src + ".png", dst + ".png", plan.variant, plan)
+            recolor_png(src + ".png", dst + ".png", plan.body_variant, plan)
             # ★ `.smf` 取**本批母本自己那份**：`Wp01F3.smf` 和 `Wp01D3.smf` 的帧尺寸 / 偏移不一样
             #   （128×101 @55,20 vs 128×102 @57,16），照抄错了图标会偏。
             copy_file(src + ".smf", dst + ".smf", plan)
     for w in spec.WEAPONS:
         batch = plan.use(w)
         recolor_png(os.path.join(shop, "무기_%s %s.png" % (w.shop_icon_kr, batch.src_stem)),
-                    os.path.join(shop, "무기_%s %s.png" % (w.shop_icon_kr, batch.letter)), plan.variant, plan)
+                    os.path.join(shop, "무기_%s %s.png" % (w.shop_icon_kr, batch.letter)), plan.body_variant, plan)
 
 
 # ---------------------------------------------------------------------------
@@ -485,39 +503,52 @@ def build_shop_ini(plan):
 
 # ---------------------------------------------------------------------------
 
-def resolve_variants(overrides):
-    """`{批次字母: 变体名}`。默认取 `spec.BATCHES[x].variant`，`--variant C=orig` 这样覆盖。
+def resolve_variants(overrides, fx_overrides=None):
+    """`{批次字母: (本体变体, 特效变体)}`。默认取 `spec.BATCHES[x]` 的那两格。
 
     ★ 变体**记在 spec 里**，不在命令行默认值里：不带参数重跑就能原样重现盘上那一套。
       （X6 之前 `--variant` 默认 `A`，而线上用的是 `C` —— 忘了带参数就把第一批刷成黑曜。）
+    ★ `--variant C=G2` 把**两格一起**设成 `G2`（「整批刷成这个色」）；
+      要分开就再加一条 `--fx-variant C=C`。宽的先生效、窄的再覆盖，没有特例。
     """
-    out = {letter: b.variant for letter, b in spec.BATCHES.items()}
-    for item in overrides or ():
-        letter, _sep, variant = item.partition("=")
-        if letter not in out:
-            raise SystemExit("没有这个批次：%s（可选 %s）" % (letter, ", ".join(spec.BATCHES)))
-        palette.scheme_for(variant) if variant != "orig" else None
-        out[letter] = variant
-    missing = [k for k, v in out.items() if v is None]
+    out = {letter: [b.variant, b.fx_variant] for letter, b in spec.BATCHES.items()}
+
+    def apply(items, slots):
+        for item in items or ():
+            letter, _sep, variant = item.partition("=")
+            if letter not in out:
+                raise SystemExit("没有这个批次：%s（可选 %s）" % (letter, ", ".join(spec.BATCHES)))
+            palette.scheme_for(variant) if variant != "orig" else None
+            for i in slots:
+                out[letter][i] = variant
+
+    apply(overrides, (0, 1))
+    apply(fx_overrides, (1,))
+
+    missing = [k for k, v in out.items() if v[0] is None or v[1] is None]
     if missing:
         raise SystemExit("批次 %s 还没定配色 —— 先跑 preview.py 出效果图让用户选，"
                          "再把变体填进 spec.BATCHES（或临时 --variant %s=<变体>）"
                          % ("/".join(missing), missing[0]))
-    for letter, variant in out.items():
-        if variant != "orig" and palette.SCHEME_OF[variant] != spec.BATCHES[letter].scheme:
-            raise SystemExit("批次 %s 的方案是 %s，但变体 %s 属于 %s"
-                             % (letter, spec.BATCHES[letter].scheme, variant, palette.SCHEME_OF[variant]))
-    return out
+    for letter, pair in out.items():
+        for kind, variant in zip(("本体", "特效"), pair):
+            if variant != "orig" and palette.SCHEME_OF[variant] != spec.BATCHES[letter].scheme:
+                raise SystemExit("批次 %s 的方案是 %s，但%s变体 %s 属于 %s"
+                                 % (letter, spec.BATCHES[letter].scheme, kind,
+                                    variant, palette.SCHEME_OF[variant]))
+    return {k: tuple(v) for k, v in out.items()}
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="生成全部自定义武器的资源（所有批次一起，幂等）")
     ap.add_argument("--variant", action="append", metavar="批次=变体",
-                    help="临时覆盖某一批的配色，如 --variant P=P1；默认取 spec.BATCHES")
+                    help="临时覆盖某一批的配色（本体 + 特效一起），如 --variant P=P1；默认取 spec.BATCHES")
+    ap.add_argument("--fx-variant", action="append", metavar="批次=变体",
+                    help="只覆盖**特效**的配色（弹体 / 拖尾 / 爆炸 / efx 颜色），在 --variant 之后生效")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
-    plan = Plan(resolve_variants(args.variant), args.dry_run)
+    plan = Plan(resolve_variants(args.variant, args.fx_variant), args.dry_run)
     root = spec.develop_root()
     amf_path = os.path.join(root, "Data", "default.amf")
     version, groups = amftool.load(amf_path)
@@ -529,9 +560,11 @@ def main(argv=None):
     plan.put(amf_path, amftool.write(version, groups))
 
     wrote, same = plan.flush()
-    for letter, variant in plan.variants.items():
-        print("批次 %s（母本 %s）：%s（%s）"
-              % (letter, spec.BATCHES[letter].src_stem, variant, palette.variant_label(variant)))
+    for letter, (body, fx) in plan.variants.items():
+        print("批次 %s（母本 %s）：本体 %s（%s）／特效 %s（%s）%s"
+              % (letter, spec.BATCHES[letter].src_stem,
+                 body, palette.variant_label(body), fx, palette.variant_label(fx),
+                 "" if body == fx else "  ← 两者不同"))
     print("%s%d 个文件，%d 个已是最新" % ("（dry-run）将写 " if args.dry_run else "写入 ", wrote, same))
     kinds = collections.Counter(os.path.splitext(p)[1].lower() for p in plan.files)
     print("  " + "  ".join("%s×%d" % (k or "?", n) for k, n in sorted(kinds.items())))
