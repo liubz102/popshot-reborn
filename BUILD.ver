@@ -1,0 +1,24 @@
+{
+    "version":  "V0.4.2",
+    "versionWire":  4002,
+    "kind":  "客户端包",
+    "buildId":  "20260921-003049",
+    "time":  "2026-09-21 00:30:51 UTC+9",
+    "timeZone":  "UTC+9",
+    "machine":  "MSI-GP76",
+    "serverCodeHash":  "AF09814730FC993D5A139AB87273761005F2EA56B84CAD9E9E9C2E67D71B3D50",
+    "bsloaderHash":  "DB47DCF1DA6E4ECACC99A0558F7D803CBAEE679C39201A671993E3A8F6D8E6B2",
+    "bshookHash":  "A0CE7B5C570176477525082591798FE714BB2998354560514773B1771A04D9AF",
+    "win7Runtime":  "已包含（CPython 3.8.10 win32，Win10 以下自动启用）",
+    "notes":  [
+                  "怎么用：整个目录拷到目标电脑，双击 start.bat。",
+                  "联机：登录界面选「远程服务器」，地址改 config\\server.config 的 server_address。",
+                  "首次使用先点登录框下方的注册链接注册账号。",
+                  "客户端每次启动会把本文件里的 version 上报给服务器（bshook 读它补丁握手版本号）。",
+                  "版本过旧被服务器拒绝时会自动更新：game_patched\\BsPatcherChn.exe 是自研更新器（updater\\src，原版风格界面，全逻辑进 exe）。",
+                  "★ 客户端包和服务端包必须【成对】使用：两边的 buildId 要一致，",
+                  "  serverCodeHash 也要一模一样。批次对不上就先各自重新解压一份。",
+                  "  （原因：客户端里的端口映射表和服务端的中继端口是配套的，",
+                  "   老客户端连新服务端会在进房间时被弹回大厅，D079。）"
+              ]
+}
