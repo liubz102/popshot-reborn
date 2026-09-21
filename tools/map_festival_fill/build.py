@@ -285,23 +285,37 @@ def tr_x_33(ctx):
 #  tr_x_32：吊在彩带上的红鲤鱼灯 —— 从原版截图里抠
 # ---------------------------------------------------------------------------
 
-#: 用户 2026-09-21 找到的原版清晰截图（「云之桥」里那条鱼）。抠图的唯一来源，别删。
+#: 用户找到的原版清晰截图（「云之桥」里那条鱼），**已把站在鱼背上那个角色抹掉**
+#: （用户 2026-09-22 用图像模型清理的，鱼身和链子原样保留）。抠图的唯一来源，别删。
+#: ★ 用清理版而不是原始截图：角色的鞋正好压在**鱼鳃和鱼背交界那两个凸起**上，
+#:   自己补那一块怎么补都是平的（试过按列上拉、试过按背线横向织补，用户两次都看出来了）。
 CARP_REF = os.path.join(HERE, "ref", "festival02_carp.png")
 
 #: 截图 → 画布的仿射：`shot_x = AX·u + BX`、`shot_y = AY·v + BY`。
-#: 网格搜「截图里的鱼形 vs `.map` 掩码」的 IoU 得到（最优 0.86）；
-#: `AX/AY = 1.093 ≈ 对象的 sx/sy = 1.1/1.0`，两条独立的量法对上了，说明配准是对的。
-CARP_FIT = (2.110, 66.0, 1.930, -241.5)
+#: 网格搜「截图里的鱼形 vs `.map` 掩码」的 IoU 得到，最优 **0.916**。
+#: ★ 自洽检查：拟合出来的 `AX/AY = 1.1009`，而对象的 `sx/sy` 正好是 1.1/1.0 ——
+#:   这个比值**没有**参与拟合，它自己对上了，说明配准是对的。
+#:   （另一条独立的路：拿原始截图当模板多尺度互相关 corr 0.91，结论一致。）
+CARP_FIT = (2.9450, 99.00, 2.6750, -315.00)
 
-#: 吊链：竖段在画布正中，到 v≈298 分成 Y 形两叉搭在鱼背上（都按上面的仿射从截图量的）。
-CARP_CHAIN_U = 124.0
-CARP_CHAIN_FORK = (124.0, 298.0)
-CARP_CHAIN_ENDS = ((92.0, 329.0), (142.0, 326.0))
-#: 竖链往上循环贴的取样段（截图只拍到 v≈125 以下）；长度 68 = 链节周期的整数倍。
-CARP_CHAIN_TILE = (176, 244)
+#: 吊链：竖段在画布正中（列 119..129），到 v≈298 分成 Y 形两叉搭在鱼背上。
+#: ★ 整条链都是**拿竖段那一截去铺 / 去转**的，不是按「金色 ∧ 贴着线段」从截图里抠 ——
+#: 抠出来的两叉会把背景的亮云一起吃进去，颜色发灰、边缘还是硬的锯齿（2026-09-22 用户指出）。
+CARP_CHAIN_U, CARP_CHAIN_HALF = 124.0, 5
+#: 分叉点和两叉末端，都是在画布坐标里逐行扫金色段量的（`r−g ≥ 45 ∧ g−b ≥ 45`，
+#: 这个判据能把链条和背景那片亮云分开 —— 云的 `r−g` 只有 0~30）。
+#: ★ 两叉要**扎进鱼身里**几个像素，别停在背线上：原版就是这样，链子从鱼背后面出来。
+#: 所以链条**先画、鱼后画**，多出来的那一截自然被鱼盖住（停在背线上会看着悬空，
+#: 2026-09-22 用户指出）。
+CARP_CHAIN_FORK = (122.0, 304.0)
+CARP_CHAIN_ENDS = ((69.0, 344.0), (156.0, 333.0))
+#: 拿来铺 / 转的那一截干净竖链（截图只拍到 v≈125 以下）。
+#: ★ 长度必须是**链节周期的整数倍**，否则每铺一段就错一点相位、看得出接缝。
+#: 周期实测 11.077 px（u=124 上 14 个暗孔中心，从 v=132 到 v=276 正好 13 段）
+#: ⇒ 直接取 (132, 276) = 144 行 = 13 个链节，误差 0.001 px。
+CARP_CHAIN_TILE = (132, 276)
 
 CARP_EYE = (189.0, 346.0)          # 青色的鱼眼，不红，抠图时要单独保住
-CARP_FEET = (318, 335, 170, 215)   # 截图里站在鱼背上那个角色的鞋，要擦掉重补
 
 
 def _carp_resample(shot, Hc, Wc):
@@ -344,29 +358,38 @@ def _inpaint(rgb, keep, need, rounds=40):
     return out
 
 
-def _seg_band(Hc, Wc, p0, p1, half):
-    """到线段 p0-p1 的距离 ≤ half 的那条带。"""
-    ys, xs = np.mgrid[0:Hc, 0:Wc]
+def _chain_tile(rgb):
+    """从抠出来的竖链上截一段干净的链条当素材：中间实、两侧软边（1 px 过渡）。"""
+    v0, v1 = CARP_CHAIN_TILE
+    h = CARP_CHAIN_HALF
+    u0 = int(CARP_CHAIN_U) - h
+    tile = art.new(2 * h, v1 - v0)
+    tile[:, :, :3] = rgb[v0:v1, u0:u0 + 2 * h, :3]
+    d = np.abs(np.arange(2 * h, dtype=np.float32) + 0.5 - h)
+    tile[:, :, 3] = np.clip((h - 0.3 - d) / 1.2, 0, 1)[None, :] * 255.0
+    return tile
+
+
+def _chain_run(tile, Hc, Wc, p0, p1):
+    """把链条素材沿 p0→p1 铺一条（含旋转）。仿射按「目标 → 源」给 PIL。
+
+    源是一条竖直的 `2·half × L` 长链；目标点 P 反解成
+    `sy = (P−p0)·u`（沿链）、`sx = (P−p0)·perp + half`（跨链）。
+    """
     (x0, y0), (x1, y1) = p0, p1
     dx, dy = x1 - x0, y1 - y0
-    t = np.clip(((xs - x0) * dx + (ys - y0) * dy) / (dx * dx + dy * dy), 0, 1)
-    return np.hypot(xs - (x0 + t * dx), ys - (y0 + t * dy)) <= half
-
-
-def _smooth_in(img, mask, box, rounds):
-    """只在掩码内、只在 box 这一块做几遍 3×3 平均（抹掉按列补出来的竖条纹）。"""
-    v0, v1, u0, u1 = box
-    sl = (slice(v0, v1), slice(u0, u1))
-    for _ in range(rounds):
-        win = img[sl].copy()
-        wm = mask[sl].astype(np.float32)[:, :, None]
-        pv = np.pad(win * wm, ((1, 1), (1, 1), (0, 0)))
-        pg = np.pad(wm, ((1, 1), (1, 1), (0, 0)))
-        h, w = win.shape[:2]
-        acc = sum(pv[1 + dy:1 + dy + h, 1 + dx:1 + dx + w] for dy in (-1, 0, 1) for dx in (-1, 0, 1))
-        num = sum(pg[1 + dy:1 + dy + h, 1 + dx:1 + dx + w] for dy in (-1, 0, 1) for dx in (-1, 0, 1))
-        img[sl] = np.where(num > 0, acc / np.maximum(num, 1e-6), win)
-    return img
+    length = float(np.hypot(dx, dy))
+    ux, uy = dx / length, dy / length
+    th, tw = tile.shape[:2]
+    reps = int(np.ceil((length + th) / th))
+    strip = np.concatenate([tile] * reps, axis=0)[:int(round(length)) + 2]
+    src = Image.fromarray(np.clip(np.rint(strip), 0, 255).astype(np.uint8), "RGBA")
+    half = tw / 2.0
+    coeffs = (-uy, ux, x0 * uy - y0 * ux + half,
+              ux, uy, -(x0 * ux + y0 * uy))
+    out = src.transform((Wc, Hc), Image.AFFINE, coeffs, resample=Image.BICUBIC,
+                        fillcolor=(0, 0, 0, 0))
+    return np.array(out).astype(np.float32)
 
 
 def tr_x_32(ctx):
@@ -389,48 +412,34 @@ def tr_x_32(ctx):
     rgb, got = _carp_resample(shot, Hc, Wc)
     r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
 
-    conf = np.clip((r - np.maximum(g, b) - 62.0) / 26.0, 0, 1)
-    conf = np.maximum(conf, np.clip((120.0 - rgb.max(axis=2)) / 30.0, 0, 1))
+    d = r - np.maximum(g, b)
+    conf = np.clip((d - 35.0) / 25.0, 0, 1)
+    # 够暗的也算鱼，但**必须偏红**：清理版的背景是青绿的楼阁，暗归暗，`d` 是负的。
+    # ★ 早先只判「够暗」—— 那是照着原始截图那张**亮**背景定的，换到这张深色背景上
+    #   会把半张楼阁当成鱼（2026-09-22 踩过，IoU 从 0.92 掉到 0.37）。
+    conf = np.maximum(conf, np.clip((120.0 - rgb.max(axis=2)) / 30.0, 0, 1)
+                      * np.clip(d / 10.0, 0, 1))
     conf[~got] = 0
     ys, xs = np.mgrid[0:Hc, 0:Wc]
     conf[np.hypot(xs - CARP_EYE[0], ys - CARP_EYE[1]) <= 8.0] = 1.0
-    v0, v1, u0, u1 = CARP_FEET
-    conf[v0:v1, u0:u1] = 1.0
+    body = _inpaint(rgb, m & (conf > 0.85), m)
 
-    keep = m & (conf > 0.85)
-    keep[v0:v1, u0:u1] = False
-    body = _inpaint(rgb, keep, m)
-    # 鞋那一块：按列把下面第一行干净的鱼背色往上拉，再抹几遍。
-    # 用通用 `_inpaint` 会把鞋边缘的棕色卷进来，补出一道棕带。
-    for u in range(u0, u1):
-        col = np.nonzero(keep[v1:, u])[0]
-        if not len(col):
-            continue
-        src = body[v1 + col[0], u].copy()
-        for v in range(v0, v1):
-            if m[v, u]:
-                body[v, u] = src
-    _smooth_in(body, m, (v0 - 2, v1 + 3, u0 - 2, u1 + 3), 5)
-
+    # 吊链：竖段直接铺，Y 形两叉把同一截链条转过去铺。
+    # ★ 链条**先画**，鱼**后画**盖在上面 —— 两叉扎进鱼身的那几像素就被自然裁掉了。
+    tile = _chain_tile(rgb)
+    th = tile.shape[0]
     img = art.new(Wc, Hc)
-    img[:, :, :3] = body
-    img[:, :, 3] = m.astype(np.float32) * conf * 255.0
-
-    # 吊链
-    goldish = got & (r > 130) & (g > 88) & (r - b > 55) & (g - b > 30)
-    band = _seg_band(Hc, Wc, (CARP_CHAIN_U, 0.0), CARP_CHAIN_FORK, 7.0)
+    y = int(CARP_CHAIN_FORK[1]) + 2
+    while y > -th:
+        y -= th
+        art.over(img, tile, int(CARP_CHAIN_U) - CARP_CHAIN_HALF, y)
     for end in CARP_CHAIN_ENDS:
-        band |= _seg_band(Hc, Wc, CARP_CHAIN_FORK, end, 5.0)
-    chain = art.new(Wc, Hc)
-    chain[:, :, :3] = rgb
-    chain[:, :, 3] = (goldish & band).astype(np.float32) * 255.0
-    p0, p1 = CARP_CHAIN_TILE
-    tile = chain[p0:p1].copy()
-    y = p0
-    while y > 0:
-        y -= (p1 - p0)
-        chain[max(0, y):y + (p1 - p0)] = tile[max(0, y) - y:]
-    art.over(img, chain, 0, 0)
+        art.over(img, _chain_run(tile, Hc, Wc, CARP_CHAIN_FORK, end), 0, 0)
+
+    fish = art.new(Wc, Hc)
+    fish[:, :, :3] = body
+    fish[:, :, 3] = m.astype(np.float32) * conf * 255.0
+    art.over(img, fish, 0, 0)
     return img
 
 

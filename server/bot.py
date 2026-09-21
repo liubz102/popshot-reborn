@@ -6858,7 +6858,25 @@ def _reportable_speed(before, body, air_stepped=True):
     return vx, vy
 
 
-def _path_blocked(terrain, x0, y0, shot, radius=0.0):
+def _mover_clock(room):
+    """本局开打到现在多少毫秒 —— **移动平台的相位**（X_Mod §73）。拿不到返回 `None`。
+
+    ★ 客户端的相位原点是「**它自己把地图载完**那一刻」：`MapObject::LinkPath`
+      （`0x511d60`）在载图收尾那一遍里对每个对象记下 `t0 = 当前时刻`，之后
+      `PathFollower::GetPos`（`0x549bec`）一律算 `now − t0`。协议里**没有**
+      任何同步移动平台的包（`packet_api.md` 查遍了），所以严格说每台机器的
+      相位都差一个「它自己的载图耗时」。
+    ⇒ 服务端能拿到的、和客户端同一个事件的最近的锚点就是**开局**。误差 = 载图耗时：
+      鲤鱼 289 px 走 5000 ms，差 300 ms 也只有 17 px，比弹体本身还小。
+    ⇒ 返回 `None` 时全套判定退回「不知道有移动平台」的老行为，一格不差。
+    """
+    started = getattr(room, "started_at", None)
+    if started is None:
+        return None
+    return int((_now() - started) * 1000.0)
+
+
+def _path_blocked(terrain, x0, y0, shot, radius=0.0, t_ms=None):
     """这条弹道中途会不会撞上地形。
 
     ★ 用 `blocks_bullet()` 那一路（`mapdata.line_blocked`），**不是**
@@ -6893,16 +6911,16 @@ def _path_blocked(terrain, x0, y0, shot, radius=0.0):
     """
     if terrain is None:
         return False
-    if _muzzle_blocked(terrain, x0, y0, shot, radius):
+    if _muzzle_blocked(terrain, x0, y0, shot, radius, t_ms):
         return True
     points = ballistics.path_points(x0, y0, shot)
     for (ax, ay), (bx, by) in zip(points, points[1:]):
-        if terrain.line_blocked(ax, ay, bx, by, step=BOT_LINE_STEP):
+        if terrain.line_blocked(ax, ay, bx, by, step=BOT_LINE_STEP, t_ms=t_ms):
             return True
     return False
 
 
-def _muzzle_blocked(terrain, x0, y0, shot, radius=0.0):
+def _muzzle_blocked(terrain, x0, y0, shot, radius=0.0, t_ms=None):
     """仅查弹体能否出膛，和 `_terrain_contact()` 共用采样点（§116）。
 
     失误弹可以途中撞地，但仍不能从埋进地形的枪口发射（§76）。
@@ -6914,10 +6932,10 @@ def _muzzle_blocked(terrain, x0, y0, shot, radius=0.0):
                                       math.sin(shot.angle))
     else:
         offsets = ((0, 0),)
-    return _probe_blocked(terrain, int(x0), int(y0), offsets)
+    return _probe_blocked(terrain, int(x0), int(y0), offsets, t_ms)
 
 
-def _shot_impact(terrain, x0, y0, shot, radius=0.0):
+def _shot_impact(terrain, x0, y0, shot, radius=0.0, t_ms=None):
     """这条弹道首次撞地形的坐标；飞完都没撞上返回 `None`。
 
     分段和碰撞形状完全复用 `_terrain_contact()` / `ballistics.path_points()`，
@@ -6928,7 +6946,7 @@ def _shot_impact(terrain, x0, y0, shot, radius=0.0):
     points = ballistics.path_points(x0, y0, shot)
     for (ax, ay), (bx, by) in zip(points, points[1:]):
         hit_t, _safe_t = _terrain_contact(terrain, ax, ay, bx, by,
-                                          radius=radius)
+                                          radius=radius, t_ms=t_ms)
         if hit_t is not None:
             return (ax + (bx - ax) * hit_t, ay + (by - ay) * hit_t)
     return None
@@ -7271,7 +7289,8 @@ def _breakable_option(room, machine, weapon, terrain, solve, x, y):
         if shot is None or _outlives_fuse(weapon, shot):
             continue
         impact = _shot_impact(terrain, mx, my, shot,
-                              float(getattr(weapon, "size", 0.0) or 0.0))
+                              float(getattr(weapon, "size", 0.0) or 0.0),
+                              t_ms=_mover_clock(room))
         if impact is None:
             continue
         preview = botbreak.preview_damage(
@@ -7341,7 +7360,8 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
         if _outlives_fuse(weapon, shot):
             continue
         if (not BOT_DIAG_FIRE_ANYWHERE
-                and _path_blocked(terrain, mx, my, shot, weapon.size)):
+                and _path_blocked(terrain, mx, my, shot, weapon.size,
+                                  t_ms=_mover_clock(room))):
             continue
         best = Engagement(index, point, shot, span,
                           math.hypot(velocity[0], velocity[1]), radius)
@@ -7417,7 +7437,8 @@ def _mob_engagement(room, machine, weapon, terrain, solve, x, y):
         shot = solve(mx_ - gx, my_ - gy)
         if shot is None or _outlives_fuse(weapon, shot):
             continue
-        if _path_blocked(terrain, gx, gy, shot, weapon.size):
+        if _path_blocked(terrain, gx, gy, shot, weapon.size,
+                         t_ms=_mover_clock(room)):
             continue
         best = Engagement(MOB_SEAT, (mx_, my_), shot, span, 0.0,
                           MOB_HIT_RADIUS + float(weapon.size or 0.0))
@@ -7448,7 +7469,8 @@ def _smoke_engagement(room, machine, seat_index, weapon, terrain, solve, x, y):
         shot = solve(tx - mx, ty - my)
         if shot is None or _outlives_fuse(weapon, shot):
             continue
-        if _path_blocked(terrain, mx, my, shot, weapon.size):
+        if _path_blocked(terrain, mx, my, shot, weapon.size,
+                         t_ms=_mover_clock(room)):
             continue
         return Engagement(index, (tx, ty), shot, span, 0.0,
                           _hit_radius(room, index, weapon))
@@ -8096,7 +8118,7 @@ def shell_probe_offsets(radius, dx, dy):
     return tuple(offsets)
 
 
-def _probe_blocked(terrain, x, y, offsets):
+def _probe_blocked(terrain, x, y, offsets, t_ms=None):
     """这一组采样点里有没有一个落在挡子弹的地形上。
 
     ★★ **图顶上面（`y < 0`）不算实心**（§83）。`TerrainData::Get`（`0x472fe0`）
@@ -8108,12 +8130,88 @@ def _probe_blocked(terrain, x, y, offsets):
     blocks = terrain.blocks_bullet
     for ox, oy in offsets:
         yy = y + oy
-        if yy >= 0 and blocks(x + ox, yy):
+        if yy >= 0 and blocks(x + ox, yy, t_ms):
             return True
     return False
 
 
-def _terrain_contact(terrain, ax, ay, bx, by, radius=0.0):
+def _mover_contact(terrain, ax, ay, bx, by, radius, t_ms):
+    """线段 A→B 在 `t_ms` 这一刻撞上**移动平台**的 `(撞上那点的 t, 之前最后一点的 t)`。
+
+    ★ 为什么单独走一遍，而不是塞进 `_terrain_contact()` 的主循环：那个循环靠
+      `bullet_coarse()` 的粗网格整块跳过空气，而粗网格是**静态地形**烘的、
+      不含会动的东西 —— 直接混进去会一步跳过鲤鱼。这里改成先拿移动平台
+      **这一刻的外接框**把线段裁短，只在裁出来的那一小段上逐像素问掩码，
+      主循环一个字都不用改，性能也只在真的路过平台时才付。
+
+    没有移动平台、或 `t_ms` 没给，立刻返回 `(None, None)` —— 174 张图里只有
+    13 张有（共 24 条路径），其余一分钱不花。
+    """
+    movers = getattr(terrain, "movers", ())
+    if not movers or t_ms is None:
+        return (None, None)
+    dx = bx - ax
+    dy = by - ay
+    if radius and radius >= 1.0:
+        offsets = shell_probe_offsets(radius, dx, dy)
+    else:
+        offsets = ((0, 0),)
+    span = max(abs(dx), abs(dy))
+    steps = max(1, int(span // BOT_SHELL_TERRAIN_STEP))
+    best = None
+    for mover in movers:
+        cx, cy = mover.position_at(t_ms)
+        for rider in mover.riders:
+            left = math.floor(cx - rider.sw / 2.0)
+            top = math.floor(cy - rider.sh / 2.0)
+            # 采样点带着 `offsets` 一起动，框先按最大偏移放宽，别漏掉边缘那一下
+            pad = int(math.ceil(radius)) + 1 if radius else 1
+            lo, hi = _seg_box_steps(ax, ay, dx, dy, steps,
+                                    left - pad, left + rider.sw - 1 + pad,
+                                    top - pad, top + rider.sh - 1 + pad)
+            if lo is None:
+                continue
+            for i in range(max(lo, 1), min(hi, steps) + 1):
+                t = float(i) / steps
+                px = int(ax + dx * t)
+                py = int(ay + dy * t)
+                for ox, oy in offsets:
+                    if rider.cell(cx, cy, px + ox, py + oy) >= 2:
+                        if best is None or i < best[0]:
+                            best = (i, t, float(i - 1) / steps)
+                        break
+                else:
+                    continue
+                break
+    if best is None:
+        return (None, None)
+    return (best[1], best[2])
+
+
+def _seg_box_steps(ax, ay, dx, dy, steps, x0, x1, y0, y1):
+    """线段（按 `steps` 等分）落进矩形 [x0,x1]×[y0,y1] 的**步号区间**，不相交返回 (None, None)。
+
+    每一轴单独解出「第几步到第几步在这一轴的区间里」，再取交集 —— 射线是单调的，
+    所以每一轴的区间一定是连续的一段。
+    """
+    lo, hi = 0, steps
+    for a, d, c0, c1 in ((ax, dx, x0, x1), (ay, dy, y0, y1)):
+        if abs(d) < 1e-9:
+            if a < c0 or a > c1:
+                return (None, None)
+            continue
+        t0 = (c0 - a) / d
+        t1 = (c1 - a) / d
+        if t0 > t1:
+            t0, t1 = t1, t0
+        lo = max(lo, int(math.floor(t0 * steps)))
+        hi = min(hi, int(math.ceil(t1 * steps)))
+        if lo > hi:
+            return (None, None)
+    return (lo, hi)
+
+
+def _terrain_contact(terrain, ax, ay, bx, by, radius=0.0, t_ms=None):
     """线段 A→B 上第一次**撞地形**的 `(撞上那一点的 t, 撞上之前最后一点的 t)`。
 
     一路通畅返回 `(None, None)`。起点本身就撞着返回 `(0.0, 0.0)`。
@@ -8161,8 +8259,9 @@ def _terrain_contact(terrain, ax, ay, bx, by, radius=0.0):
         offsets = shell_probe_offsets(radius, dx, dy)
     else:
         offsets = ((0, 0),)
-    if _probe_blocked(terrain, int(ax), int(ay), offsets):
+    if _probe_blocked(terrain, int(ax), int(ay), offsets, t_ms):
         return (0.0, 0.0)
+    moved = _mover_contact(terrain, ax, ay, bx, by, radius, t_ms)
     span = max(abs(dx), abs(dy))
     steps = max(1, int(span // BOT_SHELL_TERRAIN_STEP))
     grid, gw, _gh = terrain.bullet_coarse()
@@ -8255,9 +8354,11 @@ def _terrain_contact(terrain, ax, ay, bx, by, radius=0.0):
             i += jump + 1
             continue
         if _probe_blocked(terrain, cx, cy, offsets):
+            if moved[0] is not None and moved[0] < t:
+                return moved
             return (t, float(i - 1) / steps)
         i += 1
-    return (None, None)
+    return moved
 
 
 def _terrain_contact_exact(terrain, ax, ay, bx, by, radius=0.0):
@@ -8814,7 +8915,8 @@ def _shell_step(room, shell, terrain, bodies):
     if mob is not None and (best_t is None or mob[0] < best_t):
         best_t = mob[0]
         best = (("mob", mob[1]), None)
-    ground_t, free_t = _terrain_contact(terrain, ax, ay, bx, by, radius)
+    ground_t, free_t = _terrain_contact(terrain, ax, ay, bx, by, radius,
+                                        t_ms=_mover_clock(room))
     if ground_t is not None and (best_t is None or ground_t < best_t):
         if _resolve_terrain_block(shell, terrain, ax, ay, bx, by,
                                   ground_t, free_t):

@@ -50,6 +50,7 @@
 和另外三个就不一样），所以顺序写死在这里，别靠字典序碰运气。
 """
 import base64
+import bisect
 import json
 import math
 import os
@@ -68,7 +69,9 @@ import zlib
 #:    填的就是它。
 #: 6：索引里多一层 `props` = `Data/map.ini` 的地图属性（现在只有
 #:    **`FallDown`** —— 这张图掉出去会不会死，§143）。
-FORMAT = 6
+#: 7：多一层 `movers` = **移动平台**（挂在 type 111 路径上的地形，X_Mod §73）。
+#:    在此之前服务端完全不知道有这种东西，bot 的手雷会从它们身上穿过去。
+FORMAT = 7
 
 #: 找不到精确名、**也没人告诉我们难度**时按这个顺序退。
 #: ⚠ 这只是最后的兜底 —— 闯关房请一律把难度传进来（见 `DIFFICULTY_SUFFIX`）。
@@ -250,6 +253,138 @@ class Breakable(object):
             self.hp, self.regen_ms)
 
 
+class Rider(object):
+    """挂在移动平台上的一块地形：形状（掩码）+ 缩放。
+
+    引擎画它的时候是「按 `|缩放|` 把精灵缩成 `sw×sh`，再以路径算出来的点为**中心**
+    摆上去」，掩码跟着一起缩 —— 所以这里也按同一口径最近邻取样。
+    """
+
+    __slots__ = ("handle", "w", "h", "sw", "sh", "mask")
+
+    def __init__(self, record):
+        self.handle = int(record.get("handle", 0))
+        self.w = int(record["w"])
+        self.h = int(record["h"])
+        self.sw = max(1, int(round(self.w * abs(float(record.get("sx", 1.0))))))
+        self.sh = max(1, int(round(self.h * abs(float(record.get("sy", 1.0))))))
+        self.mask = _unblob(record["mask"])
+
+    def cell(self, cx, cy, x, y):
+        """中心在 (cx, cy) 时，世界点 (x, y) 那一格的值；不在它身上返回 0。"""
+        left = int(math.floor(cx - self.sw / 2.0))
+        top = int(math.floor(cy - self.sh / 2.0))
+        dx = int(x) - left
+        dy = int(y) - top
+        if dx < 0 or dy < 0 or dx >= self.sw or dy >= self.sh:
+            return 0
+        u = int((dx + 0.5) * self.w / self.sw)
+        v = int((dy + 0.5) * self.h / self.sh)
+        if u >= self.w:
+            u = self.w - 1
+        if v >= self.h:
+            v = self.h - 1
+        i = v * self.w + u
+        return (self.mask[i >> 2] >> ((i & 3) * 2)) & 3
+
+
+class Mover(object):
+    """一条**移动平台**：`PathObj`（type 111）那条路径 + 挂在它上面的地形（X_Mod §73）。
+
+    ## 位置怎么算 —— 逐指令抄客户端，一步都没有自己发挥
+
+    | 客户端 | 干什么 |
+    |---|---|
+    | `MapObject::LinkPath`（`0x511d60`） | 地图载完那一遍，按 `link` 找到路径对象，记下 `t0 = 当前时刻` |
+    | `PathFollower::GetPos`（`0x549bec`） | `elapsed = now − t0`，去问路径 |
+    | `Path::Eval`（`0x548ccd`） | 下面这五步 |
+    | `MapObject::GetWorldPos`（`0x47c6bf`） | 相对模式才把偏移加回自己坐标；★ 这几个平台**都是绝对模式**，直接用路径算出来的点 |
+
+    1. 累计时间表 `cum[i] = ms[0] + … + ms[i]`，`总时长 = cum[-1]`（`0x548deb` 就这么建的）；
+    2. `loop == 0`：`t %= 总`；`loop == 1`（乒乓）：`t %= 2×总`，过半就 `t = 2×总 − t − 1`；
+    3. `i = upper_bound(cum, t)`，段内进度 `u = (t − 段起点) / ms[i]`；
+    4. `w = u ** (1 / ease)` —— 客户端 `0x5ce3a0` 就是 `pow(底, 1/指数)`，
+       原版这几条路径 `ease` 全是 1.0 ⇒ `w == u`；
+    5. 三次 Hermite（`0x5697a7`，基函数常数 3.0 / 1.0 对得上）：
+       `h00·P_i + h10·M_i + h01·P_j + h11·M_j`，`j` 越界回到 0；
+       ★ 切线只有 `kind == 1` 的点才从文件里读，其余是 0 ⇒ 退化成 **smoothstep**（两头慢中间快）。
+    6. 最后加上 `PathObj` 自己的世界坐标。
+
+    ## ⚠ 时间原点
+
+    客户端的 `t0` 是**它自己把地图载完**那一刻，协议里没有任何同步包 ——
+    也就是说严格来说每台机器的相位都差一个「载图耗时」。服务端只能用
+    **本局开打到现在**当 `t_ms`（`RoomState.started_at`），误差就是那点载图耗时；
+    鲤鱼 289 px 走 5000 ms ⇒ 差 300 ms 也只有 17 px，比弹体本身还小。
+    """
+
+    __slots__ = ("handle", "x", "y", "loop", "pts", "cum", "total", "riders")
+
+    def __init__(self, record):
+        self.handle = int(record.get("handle", 0))
+        self.x = float(record["x"])
+        self.y = float(record["y"])
+        self.loop = int(record.get("loop", 0))
+        self.pts = tuple(
+            (float(p[0]), float(p[1]), int(p[2]), float(p[3]), float(p[4]),
+             float(p[5]) if len(p) > 5 else 1.0)
+            for p in record.get("pts", ()))
+        cum, acc = [], 0
+        for p in self.pts:
+            acc += p[2]
+            cum.append(acc)
+        self.cum = tuple(cum)
+        self.total = acc
+        self.riders = tuple(Rider(r) for r in record.get("riders", ()))
+
+    def position_at(self, t_ms):
+        """`t_ms` 这一刻，挂在这条路径上的东西在世界的哪个点（见类说明）。"""
+        pts = self.pts
+        n = len(pts)
+        if n == 0:
+            return (self.x, self.y)
+        if n == 1 or self.total <= 0:
+            return (self.x + pts[0][0], self.y + pts[0][1])
+        total = self.total
+        t = int(t_ms)
+        if self.loop == 1:
+            t %= 2 * total
+            if t >= total:
+                t = 2 * total - t - 1
+        else:
+            t %= total
+        i = bisect.bisect_right(self.cum, t)
+        if i >= n:
+            i = n - 1
+        seg = pts[i][2]
+        if seg <= 0:
+            return (self.x + pts[i][0], self.y + pts[i][1])
+        u = (t - (self.cum[i] - seg)) / float(seg)
+        ease = pts[i][5]
+        w = u ** (1.0 / ease) if (ease and ease != 1.0 and u > 0.0) else u
+        j = i + 1 if i + 1 < n else 0
+        w2 = w * w
+        w3 = w2 * w
+        h00 = 2.0 * w3 - 3.0 * w2 + 1.0
+        h10 = w3 - 2.0 * w2 + w
+        h01 = -2.0 * w3 + 3.0 * w2
+        h11 = w3 - w2
+        px = h00 * pts[i][0] + h10 * pts[i][3] + h01 * pts[j][0] + h11 * pts[j][3]
+        py = h00 * pts[i][1] + h10 * pts[i][4] + h01 * pts[j][1] + h11 * pts[j][4]
+        return (self.x + px, self.y + py)
+
+    def cell_at(self, x, y, t_ms):
+        """`t_ms` 这一刻，世界点 (x, y) 落在这条路径上哪块地形的哪一格；没落上返回 0。"""
+        if not self.riders:
+            return 0
+        cx, cy = self.position_at(t_ms)
+        for rider in self.riders:
+            got = rider.cell(cx, cy, x, y)
+            if got:
+                return got
+        return 0
+
+
 class MapTerrain(object):
     """一张图的地形。**只读** —— 破坏物状态变了要换一个对象（`variant()`）。
 
@@ -265,7 +400,8 @@ class MapTerrain(object):
     __slots__ = ("name", "version", "width", "height", "_cells",
                  "_offsets", "_ys", "points", "jump_pads", "__weakref__",
                  "breakables", "alive", "_base_cells", "_base_offsets",
-                 "_base_ys", "_root", "_variants", "_coarse", "_base_coarse")
+                 "_base_ys", "_root", "_variants", "_coarse", "_base_coarse",
+                 "movers")
 
     def __init__(self, record):
         self.name = record["name"]
@@ -295,6 +431,9 @@ class MapTerrain(object):
         self.breakables = tuple(
             Breakable(i, item, self.width, self.height)
             for i, item in enumerate(record.get("breakables", ())))
+        #: ★★ **移动平台**（X_Mod §73）：位置随时间走，所以不进 `cells`，
+        #:   查的时候必须由调用方说清「哪一刻」（`is_solid` / `blocks_bullet` 的 `t_ms`）。
+        self.movers = tuple(Mover(item) for item in record.get("movers", ()))
         self._root = self
         self._variants = {}
         #: 粗网格（弹道加速）。`_base_coarse` 只存在于**根地形**上，
@@ -407,7 +546,7 @@ class MapTerrain(object):
         if got is None:
             got = object.__new__(MapTerrain)
             for field in ("name", "version", "width", "height", "points",
-                          "jump_pads", "breakables", "_base_cells",
+                          "jump_pads", "breakables", "movers", "_base_cells",
                           "_base_offsets", "_base_ys"):
                 setattr(got, field, getattr(root, field))
             got._root = root
@@ -426,13 +565,32 @@ class MapTerrain(object):
         i = y * self.width + x
         return (self._cells[i >> 2] >> ((i & 3) * 2)) & 3
 
-    def is_solid(self, x, y):
-        """挡得住**人**吗（走路 / 下落）。单向平台算挡。★ 图外算挡得住。"""
-        return self.cell(x, y) != 0
+    def is_solid(self, x, y, t_ms=None):
+        """挡得住**人**吗（走路 / 下落）。单向平台算挡。★ 图外算挡得住。
 
-    def blocks_bullet(self, x, y):
-        """挡得住**子弹**吗。★ 单向平台（值 1）**不挡**，见文件头 §29。"""
-        return self.cell(x, y) >= 2
+        `t_ms` 给了才把**移动平台**算进来（`Mover`，X_Mod §73）：它们的位置
+        随时间走，所以必须由调用方说清「哪一刻」。不给就是老行为，一格不差。
+        """
+        if self.cell(x, y) != 0:
+            return True
+        return t_ms is not None and self.mover_cell(x, y, t_ms) != 0
+
+    def blocks_bullet(self, x, y, t_ms=None):
+        """挡得住**子弹**吗。★ 单向平台（值 1）**不挡**，见文件头 §29。
+
+        `t_ms` 同 `is_solid()`。
+        """
+        if self.cell(x, y) >= 2:
+            return True
+        return t_ms is not None and self.mover_cell(x, y, t_ms) >= 2
+
+    def mover_cell(self, x, y, t_ms):
+        """`t_ms` 这一刻，(x, y) 落在哪块移动平台上；都没落上返回 0。"""
+        for mover in self.movers:
+            got = mover.cell_at(x, y, t_ms)
+            if got:
+                return got
+        return 0
 
     # -- 粗网格（弹道加速） -------------------------------------------------
 
@@ -604,7 +762,7 @@ class MapTerrain(object):
 
     # -- 弹道 ---------------------------------------------------------------
 
-    def line_blocked(self, x0, y0, x1, y1, step=4):
+    def line_blocked(self, x0, y0, x1, y1, step=4, t_ms=None):
         """(x0,y0) -> (x1,y1) 这条**弹道**中间有没有被地形挡住。
 
         用的是 `blocks_bullet`，**不是** `is_solid` —— 单向平台不挡子弹
@@ -613,6 +771,8 @@ class MapTerrain(object):
         `step` 是采样步长（像素）。默认 4：角色一步 36 左右，4 像素的
         漏检对「这一发打不打得中」不构成影响，而全像素采样在纯 Python 里
         每发要走上千次循环。★ 端点本身不算 —— 枪口和目标常常贴着地面。
+
+        `t_ms` 给了才把移动平台算进来（X_Mod §73）。
         """
         dx = x1 - x0
         dy = y1 - y0
@@ -622,7 +782,7 @@ class MapTerrain(object):
         n = int(dist // step)
         for i in range(1, n):
             t = float(i) / n
-            if self.blocks_bullet(int(x0 + dx * t), int(y0 + dy * t)):
+            if self.blocks_bullet(int(x0 + dx * t), int(y0 + dy * t), t_ms):
                 return True
         return False
 
