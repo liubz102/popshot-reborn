@@ -5703,8 +5703,10 @@ static __declspec(naked) void flush_guard_detour(void)
 /*   ★ 偷来的第二条 `cmp eax,esi` 会设标志位，而紧接着的 `je` 要用它 ⇒        */
 /*     绕道里**先报事实、再跑那两条**，`push/ret` 不动标志位。                */
 /*                                                                            */
-/*   方向键不算「动作」：和服务端 `INPUT_PEER_OPCODES` 的取舍一致（方向键在   */
-/*   心跳掩码里、`rpFire` 是鼠标，两样都排除）。                              */
+/*   ★★ 认哪些键是**白名单**，不是黑名单（用户 2026-09-21，见 §67）：        */
+/*   只有「进了图之后真的能操作角色」的那几个键算数，F5 / Esc / Enter 这种    */
+/*   菜单键一律不算 —— 连点器每局按一下 F5 开下一局，黑名单版本就被它把 60   */
+/*   秒的回溯量整段洗白（bug调查/26）。名单见 `presence_game_key()`。         */
 /* -------------------------------------------------------------------------- */
 #define PRESIN_VA          0x0040EE1Du
 #define PRESIN_SIG_LEN     22
@@ -5726,7 +5728,7 @@ static const unsigned char PRESIN_SIG[PRESIN_SIG_LEN] = {
 #define WM_KEYUP_        0x0101
 #define WM_ACTIVATEAPP_  0x001C
 
-/* 最近一次「非方向键抬起」/「鼠标键抬起」的 GetTickCount()；0 = 从来没有。
+/* 最近一次「局内游戏键抬起」/「鼠标键抬起」的 GetTickCount()；0 = 从来没有。
    ★ 声明放在**采样点**这边而不是发包那边：写它的是窗口过程的绕道（这里），
      读它的是 5 秒一次的上报（`sync_send_presence`，在下面很远的地方）。 */
 static volatile LONG g_pres_kb_tick = 0;
@@ -5741,12 +5743,54 @@ static int presence_disabled(void)
     return n > 0 && n < sizeof(buf) && buf[0] != '0';
 }
 
+/* 这个键在**局内**真的能操作角色吗（§67，用户 2026-09-21 定的名单）。
+
+   四条移动轴是从客户端自己的输入函数**逐条抄下来**的（`0x515600`~`0x51576D`，
+   每个键各两次 `call 0x429bf0` = `InputSystem::GetKeyState`，V0.2 §183）：
+
+     [char+0x2b8] 左    A / VK_LEFT  / Q
+     [char+0x2c0] 右    D / VK_RIGHT / E
+     [char+0x2bc] 上跳  W / VK_UP    / 空格
+     [char+0x2c4] 下蹲  S / VK_DOWN
+
+   ★★ **方向键和 WASDQE 是同一组轴的别名**（客户端里没有改键功能，这 11 个
+     VK 码是写死的）⇒ 要么一起算、要么一起不算。只认 WASD 会把用方向键走位
+     的真人判成挂机 —— 这正是白名单最容易踩的坑。
+     ⇒ 会话 26 之前那条「方向键不算」的黑名单到此作废（§67 / D53d）。
+
+   换枪 / 技能那几个（1 2 3 / Shift / Ctrl）是用户给的：客户端那边拿 VK 当
+   **下标**去取键位数组（`[InputSystem + 键 + 0x205]`，V0.2 §183），没有 `cmp`
+   可抄，反汇编里也就找不到它们。多认一个键的代价是**漏判**，少认一个是
+   **误判** —— 后者更贵，所以照单全收。
+
+   ⚠ 名单里**没有鼠标左键**（开火）：那是另一格证据（`g_pres_mouse_tick`），
+     故意分开的，理由见服务端 `PRESENCE_BUCKETS` 那张表。 */
+static int presence_game_key(unsigned int vk)
+{
+    switch (vk) {
+    case 'A': case VK_LEFT:  case 'Q':          /* -> 左   [char+0x2b8] */
+    case 'D': case VK_RIGHT: case 'E':          /* -> 右   [char+0x2c0] */
+    case 'W': case VK_UP:    case VK_SPACE:     /* -> 上跳 [char+0x2bc] */
+    case 'S': case VK_DOWN:                     /* -> 下蹲 [char+0x2c4] */
+    case '1': case '2': case '3':               /* 换枪 */
+    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+    case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+        return 1;
+    default:
+        /* ★ 落在这儿的两个真实例子（bug调查/26，328800963 每局各按一下）：
+             F5  —— 结算界面「开下一局」；
+             Esc —— 进图后跳过开场剧情对话。
+           两个都是**局外**的菜单键，8 小时里他就只按这两下 ⇒ 白名单之后
+           键盘那一格**一次都不会被刷新**（重放真日志：判成挂机 99.6% -> 99.9%，
+           档位里再也不出现「在玩」）。 */
+        return 0;
+    }
+}
+
 static void __stdcall presence_note_message(unsigned int msg, unsigned int wparam)
 {
     if (msg == WM_KEYUP_) {
-        /* 方向键不算 —— 它们在心跳掩码里，服务端本来也不认（§62）。 */
-        if (wparam == VK_LEFT || wparam == VK_UP
-            || wparam == VK_RIGHT || wparam == VK_DOWN)
+        if (!presence_game_key(wparam))
             return;
         /* 0 是「从来没有过」的哨兵，真撞上就挪一格 —— 49.7 天才一次。 */
         InterlockedExchange(&g_pres_kb_tick, (LONG)(GetTickCount() | 1));
@@ -5788,9 +5832,11 @@ static int try_patch_presence_input(void)
                            "在场证据采样"))
         return 0;
     InterlockedExchange(&g_presence_patched, 1);
-    bslog("PATCH   ★在场证据采样 @ %08X: 窗口消息里认键盘（方向键除外）/ 鼠标键 /"
-          "激活，配合 GetLastInputInfo + 前台判断，每 5 秒经 UDP 旁路报给服务端"
-          "（bug调查/25；只报事实，判定在服务端）", (unsigned)PRESIN_VA);
+    bslog("PATCH   ★在场证据采样 @ %08X: 窗口消息里认键盘（白名单：只认局内能"
+          "操作角色的键，F5 一类的菜单键不算）/ 鼠标键 / 激活，配合 GetLastInputInfo"
+          " + 前台判断，"
+          "每 5 秒经 UDP 旁路报给服务端（bug调查/25、26；只报事实，判定在服务端）",
+          (unsigned)PRESIN_VA);
     return 1;
 }
 
@@ -8486,8 +8532,9 @@ static void sync_send_hello(void)
 /*   报四件事，**只报事实，不下结论**（判定留在服务端，那边的阈值是用户拿真   */
 /*   日志调出来的，改阈值不该要求重发客户端）：                               */
 /*                                                                            */
-/*     kb_idle_ms     距上次**非方向键**的 WM_KEYUP。和服务端                 */
-/*                    `INPUT_PEER_OPCODES` 同一哲学（方向键、开火都不算）      */
+/*     kb_idle_ms     距上次**局内游戏键**的 WM_KEYUP（白名单，见            */
+/*                    `presence_game_key()`）。菜单键（F5 …）不算，开火也    */
+/*                    不算 —— 它是鼠标，在下一格                            */
 /*     mouse_idle_ms  距上次鼠标键 WM_*BUTTONUP。单独一类 ——                  */
 /*                    连点器产的就是它，故意只当弱证据                        */
 /*     sys_idle_ms    `GetLastInputInfo()`：**这台机器**前面有没有人。         */

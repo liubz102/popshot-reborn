@@ -329,7 +329,7 @@ def parse_hello_ack(data):
 #:
 #: | 字段 | 是什么 | 为什么它管用 |
 #: |---|---|---|
-#: | `kb_idle_ms`  | 距上次**非方向键**的 `WM_KEYUP` | 和 `INPUT_PEER_OPCODES` 同一哲学（方向键和开火都不算），单人局补上盲区 |
+#: | `kb_idle_ms`  | 距上次**局内游戏键**的 `WM_KEYUP`（白名单）| 只认「进了图真的能操作角色」的键（移动四轴 / 123 / Shift / Ctrl）；F5 这种菜单键不算——连点器每局按一下就把回溯量洗白了（§67）|
 #: | `mouse_idle_ms` | 距上次鼠标键 `WM_*BUTTONUP` | 单独一类：连点器产的就是它，**故意只当弱证据** |
 #: | `sys_idle_ms` | `GetLastInputInfo()` | 「这台机器前面有没有人」。`PostMessage` 类连点器伪造不了它 |
 #: | `foreground`  | 游戏窗口在不在前台 | 用户 2026-09-20 点的题：游戏丢后台还在打的一定不是真人在玩（原版自己也靠这个把 BGM 静音，`WM_ACTIVATEAPP` @ `0x40f17b`）|

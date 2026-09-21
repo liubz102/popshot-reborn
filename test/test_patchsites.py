@@ -492,12 +492,65 @@ class PresenceInputPatchTest(_JmpGuardSiteMixin, unittest.TestCase):
         self.assertEqual(c_define(self.src, "AFK_TIMER_VA"), call_va + 5 + rel,
                          "0x40ee3d 调的不再是 ResetIdleTimer —— 选点的依据没了")
 
-    def test_arrow_keys_are_excluded_like_the_server_does(self):
-        # 和服务端 `INPUT_PEER_OPCODES` 的取舍必须一致，否则两边判据不同源。
-        body = self.src[self.src.index("void __stdcall presence_note_message"):]
+    #: 客户端自己的移动键表在哪（`0x515600`~`0x51576D`，每个键两次
+    #: `call 0x429bf0 InputSystem::GetKeyState`）。**别手抄名单** —— 下面那条
+    #: 用例现从镜像里把 VK 码扒出来，和 `presence_game_key()` 对。
+    MOVE_KEY_TABLE = (0x00515600, 0x00515780)
+    GET_KEY_STATE_VA = 0x00429BF0
+    #: 白名单里**不在**那张表上的那几个：换枪 / 技能，用户 2026-09-21 给的。
+    #: 客户端拿 VK 当下标取键位数组（`[InputSystem+键+0x205]`，V0.2 §183），
+    #: 没有 `cmp` 可扒 ⇒ 这几个只能写死，但要在这里点名，免得偷偷长出第 N 个。
+    EXTRA_KEYS = ("'1'", "'2'", "'3'", "VK_SHIFT", "VK_LSHIFT", "VK_RSHIFT",
+                  "VK_CONTROL", "VK_LCONTROL", "VK_RCONTROL")
+
+    def _move_keys_from_the_image(self):
+        """从镜像里扒出客户端**真的**在读的那几个移动键的 VK 码。"""
+        lo, hi = self.MOVE_KEY_TABLE
+        found, i = set(), lo
+        while i < hi:
+            off = i - IMAGE_BASE
+            if self.img[off] == 0xE8:
+                rel = struct.unpack("<i", self.img[off + 1:off + 5])[0]
+                if i + 5 + rel == self.GET_KEY_STATE_VA and self.img[off - 2] == 0x6A:
+                    found.add(self.img[off - 1])      # 紧挨着的 push imm8
+            i += 1
+        return found
+
+    def test_the_whitelist_is_the_clients_own_key_table(self):
+        """★★ §67：认哪些键是**白名单**，而且名单不是手抄的。
+
+        `A/←/Q` `D/→/E` `W/↑/空格` `S/↓` 是同一组轴的**别名**（客户端没有改键
+        功能，VK 码写死在 `0x515600` 那段）—— 少认一个，用那个键走位的真人
+        就会被判成挂机。所以这里现扒现对，不留手抄的余地。
+        """
+        vks = self._move_keys_from_the_image()
+        self.assertEqual({0x41, 0x25, 0x51,      # A ← Q
+                          0x44, 0x27, 0x45,      # D → E
+                          0x57, 0x26, 0x20,      # W ↑ 空格
+                          0x53, 0x28}, vks,      # S ↓
+                         "客户端的移动键表变了 —— 白名单要跟着改")
+        body = self.src[self.src.index("static int presence_game_key"):]
         body = body[:body.index("\n}\n")]
-        for vk in ("VK_LEFT", "VK_UP", "VK_RIGHT", "VK_DOWN"):
-            self.assertIn(vk, body, "方向键 %s 没被排除" % vk)
+        named = {0x41: "'A'", 0x51: "'Q'", 0x44: "'D'", 0x45: "'E'",
+                 0x57: "'W'", 0x53: "'S'", 0x25: "VK_LEFT", 0x27: "VK_RIGHT",
+                 0x26: "VK_UP", 0x28: "VK_DOWN", 0x20: "VK_SPACE"}
+        for vk in sorted(vks):
+            self.assertIn(named[vk], body,
+                          "白名单漏了 VK 0x%02X（%s）" % (vk, named[vk]))
+        for token in self.EXTRA_KEYS:
+            self.assertIn(token, body, "白名单漏了 %s" % token)
+
+    def test_the_menu_keys_are_not_evidence(self):
+        """★ 用户 2026-09-21 点名的那一条：**F5 不算**。
+
+        它只在开局前按，连点器每局按一下就把 60 秒回溯量整段洗白
+        （bug调查/26 的一半根因）。这里钉的是「白名单里没有它」。
+        """
+        body = self.src[self.src.index("static int presence_game_key"):]
+        body = body[:body.index("\n}\n")]
+        for vk in ("VK_F5", "VK_RETURN", "VK_ESCAPE", "VK_TAB", "VK_F1"):
+            self.assertNotIn(vk, body, "%s 混进白名单了" % vk)
+        self.assertIn("default:", body, "没有兜底分支 —— 白名单变黑名单了")
 
 
 class SeatGetterPatchTest(unittest.TestCase):

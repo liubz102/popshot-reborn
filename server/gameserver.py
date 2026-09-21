@@ -6553,14 +6553,25 @@ AFK_SOLO_AFTER_S = 45.0
 #:   丢到后台（原版自己也认这件事：`WM_ACTIVATEAPP` 一失活就把 BGM 静音）。
 #: * `人不在` —— `GetLastInputInfo()` 说这台机器整机多久没人碰过。
 #:   `PostMessage` 类连点器伪造不了它。
-#: * `只有鼠标` —— 键盘从来没动过、只有鼠标键在响。连点器的典型形状；
+#: * `都没动` —— 整机有人在按，但**游戏窗口**键盘鼠标两边都没动静。
+#:   方向键 / 鼠标移动刷得动 `GetLastInputInfo`、刷不动这两格，脚本的形状。
+#: * `只有鼠标` —— 键盘没动过、只有鼠标键在响。连点器的典型形状；
 #:   和 `INPUT_PEER_OPCODES` 故意排除 `rpFire` 是同一个理由。
-#: * `在玩`   —— 键盘最近动过。
-PRESENCE_BUCKETS = ("后台", "人不在", "只有鼠标", "在玩")
+#: * `只有键盘` —— ★★ **反过来那一半**（bug调查/26）：鼠标键没响过、只有键盘
+#:   在动。**开火就是鼠标左键**（见 `INPUT_PEER_OPCODES` 上面那段），所以
+#:   「人在图里、分数在涨、却一分钟没抬过鼠标键」这件事真人身上不成立。
+#:   328800963 正是这个形状：8 小时 268 局得分 6461 次，鼠标键**一次没抬过**。
+#: * `在玩`   —— 键盘和鼠标键最近都动过。
+PRESENCE_BUCKETS = ("后台", "人不在", "都没动", "只有鼠标", "只有键盘", "在玩")
 
-#: 「像挂机」的那几档 —— 用户 2026-09-21 拍板**三档全判**（含「只有鼠标」，
-#: 他知道也接受那一档的误判风险：hook 报的键盘证据把方向键排除了、开火又是
-#: 鼠标，所以只用方向键 + 鼠标打满一分钟的真人会落进这一档）。
+#: 「像挂机」的那几档 —— 用户 2026-09-21 拍板**除了「在玩」全判**。
+#: ★ `只有键盘` / `都没动` 是当天晚上补的（bug调查/26），同一条口径。
+#:
+#: ★ 原先「只有鼠标」那一档有个已知误判面：hook 只排掉了 ←↑→↓，而
+#:   A/W/S/D/Q/E/空格 是**同一组轴的别名**（§67）—— 用方向键走位的真人键盘
+#:   证据一直是陈的，会落进这一档。改成白名单（`presence_game_key()`，
+#:   十一个移动键一个不少）之后这条误判面**没有了**：人在操作角色，
+#:   键盘那一格就是新鲜的。
 #:
 #: ★ 从 `PRESENCE_BUCKETS` **切出来**，不手抄第二份：那张表就是按「从最像挂机
 #:   到最像真人」排的，最后一个是 `在玩`。以后往中间插一档，它要么自动进判定、
@@ -6568,11 +6579,15 @@ PRESENCE_BUCKETS = ("后台", "人不在", "只有鼠标", "在玩")
 #:   （和 `web/admin.py` 的 `_idle_places()` 是同一个套路。）
 PRESENCE_AFK_BUCKETS = frozenset(PRESENCE_BUCKETS[:-1])
 
-#: 分档用的两条线（**毫秒**）。注意它们量的是「客户端**采样那一刻**已经闲了
+#: 分档用的三条线（**毫秒**）。注意它们量的是「客户端**采样那一刻**已经闲了
 #: 多久」（`GetLastInputInfo` 的回溯量），和下面 `PRESENCE_AFK_AFTER_S` 量的
 #: 「服务端**看见**这一档保持了多久」锚点不同，**不是接力、不要相加着看**。
 PRESENCE_IDLE_MS = 60_000
 PRESENCE_KB_MS = 60_000
+#: ★ 鼠标键那条**沿用键盘那条**，不另立一个数：两者是同一来源（游戏窗口的
+#: `WM_*BUTTONUP` / `WM_KEYUP`）、同一量纲（「这一格输入多久没来过」），
+#: 判据同源（D53）⇒ 不需要重新标定。
+PRESENCE_MOUSE_MS = PRESENCE_KB_MS
 
 #: 客户端多久报一发在场证据（秒）。★ 这是 `hook/bshook.c` 的 `watch_thread`
 #: 里 `ticks % 50`（`Sleep(100)`）的镜像 —— 下面两条线都是从它推出来的，
@@ -6618,20 +6633,37 @@ def presence_age_text(ms):
     return "%d 秒前" % (ms // 1000)
 
 
+def _presence_stale(ms, line):
+    """这一格输入「已经多久没来过」够不够 `line` 毫秒。
+
+    `None` = 这一格没报上来（老客户端 / 解析没解出来）⇒ **当没这条信息**，
+    不算过期 —— 和 `conn_presence_afk()` 的 `None` 一个哲学。
+    `PRESENCE_NEVER` = 本次连接从来没有过，那是最陈的一种。
+    """
+    if ms is None:
+        return False
+    return ms == udpsync.PRESENCE_NEVER or ms >= line
+
+
 def presence_bucket(conn):
     """这条连接的在场证据落在哪一档；没收到过证据回 `None`。"""
     if getattr(conn, "presence_at", None) is None:
         return None
     if not conn.presence_fg:
         return "后台"
-    sys_ms = conn.presence_sys_ms
-    if sys_ms is not None and (sys_ms == udpsync.PRESENCE_NEVER
-                               or sys_ms >= PRESENCE_IDLE_MS):
+    if _presence_stale(conn.presence_sys_ms, PRESENCE_IDLE_MS):
         return "人不在"
-    kb_ms = conn.presence_kb_ms
-    if kb_ms is not None and (kb_ms == udpsync.PRESENCE_NEVER
-                              or kb_ms >= PRESENCE_KB_MS):
+    # ★★ 键盘和鼠标**各看各的**（bug调查/26）：原先只看键盘，于是「键盘每隔
+    #   不到一分钟被按一下、鼠标键 8 小时一次没抬过」这种形状被判成「在玩」。
+    #   开火是鼠标左键，进了图还一分钟不碰鼠标键的真人是不存在的。
+    kb_stale = _presence_stale(conn.presence_kb_ms, PRESENCE_KB_MS)
+    mouse_stale = _presence_stale(conn.presence_mouse_ms, PRESENCE_MOUSE_MS)
+    if kb_stale and mouse_stale:
+        return "都没动"
+    if kb_stale:
         return "只有鼠标"
+    if mouse_stale:
+        return "只有键盘"
     return "在玩"
 
 
@@ -6644,14 +6676,19 @@ def conn_presence_afk(conn, now=None):
       老客户端 / 没有中继 / UDP 被防火墙挡 / `BSHOOK_NO_PRESENCE=1` 起的客户端
       全都走这儿。★ 「收不到」绝不能当成「他挂机」。
     * `False` —— 证据说他在玩。
-    * `True` —— 落在 `PRESENCE_AFK_BUCKETS` 里，**而且已经稳住了
-      `PRESENCE_AFK_AFTER_S`**。
+    * `True` —— 落在 `PRESENCE_AFK_BUCKETS` 里，**而且这一组已经稳住了
+      `PRESENCE_AFK_AFTER_S`**（★ 起点是「翻进这一**组**」，组内换档不重锚，
+      见 `note_presence()`）。
 
     为什么非要客户端报（§61 / §62 / D53）：**单人任务房里服务端是瞎的**。
     房里只有他一个人，客户端就不发 `0x040e`，键盘那条判据整个不存在，只剩
     「打中 / 捡到 / 得分」。328800963 开着连点器，分数每 1.5 秒涨一次 ——
     证据比真人还多，连续 18 小时显示「游戏中·任务」。这四个数正是服务端
     结构上够不着的那一维。
+
+    ⚠ **一格证据只够抓一种形状**（bug调查/26）：第一版只把键盘那一格接进
+    分档，于是「每局按一次键、鼠标键 8 小时一次没抬过」照样显示「游戏中」。
+    四格各看各的之后才盖住反过来那一半，见 `presence_bucket()`。
 
     ★★ **断流之后退回「没有证据」，不冻在最后那一档**（`PRESENCE_STALE_AFTER_S`
     那一段注释写了为什么）。这里**只读不清** —— 定时把字段清掉本身就是一次
@@ -7082,7 +7119,8 @@ class Conn:
     #   `presence_at`     = 最后一发证据到达的 `time.monotonic()`；`None` = 从
     #     没收到过（老客户端 / 没有中继 / UDP 被挡）⇒ **一律当没这条信息**，
     #     绝不能当成「他挂机」。
-    #   `presence_kb_ms`  = 距上次**非方向键** `WM_KEYUP` 的毫秒；
+    #   `presence_kb_ms`  = 距上次**局内游戏键** `WM_KEYUP` 的毫秒（白名单，
+    #     见 hook 的 `presence_game_key()`；F5 一类的菜单键不算，§67）；
     #     `udpsync.PRESENCE_NEVER` = 本次连接从来没按过。
     #   `presence_mouse_ms` / `presence_sys_ms` = 鼠标键 / 这台机器（`GetLastInputInfo`）。
     #   `presence_fg`     = 游戏窗口在不在前台（原版靠同一个消息把 BGM 静音）。
@@ -7094,11 +7132,11 @@ class Conn:
     presence_sys_ms = None
     presence_fg = None
     presence_flags = 0
-    #: 现在这一档（`presence_bucket()` 的结果）。日志去重和「这一档保持了多久」
-    #: **共用**它，不另起一套平行状态 —— 两者认的是同一个「档位翻转」事件。
+    #: 现在这一档（`presence_bucket()` 的结果）。日志去重认的就是它。
     presence_logged = None
-    #: 上面那一档是**什么时候翻上来**的（`time.monotonic()`）。
-    #: 同一档重复报**不动**它，所以丢包既不重置也不加速判定。
+    #: **「像挂机」这一组**是什么时候翻上来的（`time.monotonic()`）。
+    #: 同一档重复报**不动**它（丢包既不重置也不加速判定）；★ 组内换档
+    #: （`人不在` ↔ `只有键盘` …）**也不动它**，见 `note_presence()`。
     presence_since = None
     #: ★ 诊断（`note_human_fire`）的类级默认 —— 控制通道造的假连接也得有。
     human_fire_logged = frozenset()
@@ -11165,9 +11203,12 @@ class Conn:
 
         ★ 「档位翻转」是这一整条判据唯一的**事件**（铁律 10）：
           日志靠它去重（档位没变就一个字不写 —— 一条连接一天能收上万发，
-          按次数或时间窗去重要么刷屏要么漏掉翻转），
-          `presence_since` 也靠它锚住「这一档是什么时候开始的」。
-          两者共用同一次判断，不是两套平行状态。
+          按次数或时间窗去重要么刷屏要么漏掉翻转）。
+
+        ★★ 但**计时的起点比日志粗一档**（bug调查/26）：`presence_since` 锚的是
+          「翻进 / 翻出『像挂机』那一组」，组内换档（`人不在` ↔ `只有键盘`）
+          日志照写、起点**不动**。判据要的事件是「他回来了」，不是
+          「他走开的姿势变了」—— 按后者重锚等于每翻一次白送一轮宽限。
 
         ★★ **断流之后重新报 = 也算一次翻转**：中间那一段我们什么都不知道，
           不能拿断流之前的那个起点接着数（「收不到」证明不了「他一直挂着」）。
@@ -11189,11 +11230,22 @@ class Conn:
         bucket = presence_bucket(self)
         if bucket == self.presence_logged and not resumed:
             return
-        self.presence_logged = bucket
-        # ★★ 这两行必须排在下面那发日志**之前**：日志里的 `%` 元组是在调用
+        # ★★ **起点锚的是「翻进『像挂机』那一组」，组内换档不重锚**
+        #   （bug调查/26）。原先每次档位翻转都重锚，于是在几档「像挂机」之间
+        #   来回翻的人**每翻一次白拿 `PRESENCE_AFK_AFTER_S` 秒**：
+        #   328800963 每局按一次键，`只有键盘` → （键盘也过期）`人不在` →
+        #   下一次按键又翻回 `只有键盘`，一直没离开过「像挂机」这一组，
+        #   却因为一直在重锚而始终攒不满。
+        #   ⇒ 判据要的事件是「他回来了 / 他走开了」，不是「他走开的**姿势**变了」。
+        stayed_afk = (not resumed
+                      and self.presence_logged in PRESENCE_AFK_BUCKETS
+                      and bucket in PRESENCE_AFK_BUCKETS)
+        # ★★ 这几行必须排在下面那发日志**之前**：日志里的 `%` 元组是在调用
         #   `eventlog.debug()` 之前求值的，它一抛，排在后面的赋值一次都跑不到
         #   —— 2026-09-20 的 `self.username` 就是这么把整条遥测弄哑的。
-        self.presence_since = now
+        self.presence_logged = bucket
+        if not stayed_afk:
+            self.presence_since = now
         # ★ 走 `online_debug()` 而不是自己拼 `eventlog.debug("游戏服 #…")`：
         #   `游戏服 #N` 那个前缀只有它一处在拼（用的是 `self.seq`）。
         #   2026-09-20 那一版手抄了一遍前缀，抄出两个 `Conn` 上根本没有的

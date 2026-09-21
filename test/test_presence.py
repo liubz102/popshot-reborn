@@ -176,9 +176,34 @@ class GameServerSideTests(unittest.TestCase):
         conn.note_presence(udpsync.PRESENCE_NEVER, 100, 100, True)
         self.assertEqual("只有鼠标", self.gs.presence_bucket(conn))
 
+    def test_keyboard_only_is_recognised(self):
+        """★ bug调查/26 那一半：鼠标键从来没响过，只有键盘在动。
+
+        **开火就是鼠标左键** ⇒ 人在图里、分数在涨、却一分钟没抬过鼠标键，
+        这件事真人身上不成立。328800963 就是这个形状。
+        """
+        conn = self._conn()
+        conn.note_presence(100, udpsync.PRESENCE_NEVER, 100, True)
+        self.assertEqual("只有键盘", self.gs.presence_bucket(conn))
+
+    def test_neither_hand_moved_is_recognised(self):
+        # 整机有人在按（方向键 / 挪鼠标刷得动 GetLastInputInfo），
+        # 但游戏窗口的键盘和鼠标键两格都陈了。
+        conn = self._conn()
+        conn.note_presence(self.gs.PRESENCE_KB_MS, self.gs.PRESENCE_MOUSE_MS,
+                           100, True)
+        self.assertEqual("都没动", self.gs.presence_bucket(conn))
+
     def test_someone_actually_playing_is_recognised(self):
         conn = self._conn()
         conn.note_presence(500, 500, 500, True)
+        self.assertEqual("在玩", self.gs.presence_bucket(conn))
+
+    def test_a_missing_field_is_not_evidence_of_anything(self):
+        # 某一格没报上来（老客户端 / 没解出来）⇒ 当没这条信息，不当成「陈了」。
+        conn = self._conn()
+        conn.note_presence(100, 100, 100, True)
+        conn.presence_mouse_ms = None
         self.assertEqual("在玩", self.gs.presence_bucket(conn))
 
     def test_the_log_only_touches_attributes_a_bare_conn_has(self):
@@ -230,11 +255,13 @@ class GameServerSideTests(unittest.TestCase):
         self.assertEqual("?", self.gs.presence_age_text(None))
 
 
-#: 四档各自的一组 `(kb_ms, mouse_ms, sys_ms, foreground)`。
+#: 每一档各自的一组 `(kb_ms, mouse_ms, sys_ms, foreground)`。
 SAMPLES = {
     "后台": (0, 0, 0, False),                                # 键鼠刚动过也没用
     "人不在": (0, 0, 3_600_000, True),                       # 整机一小时没人碰
+    "都没动": (3_600_000, 3_600_000, 100, True),             # 整机有人、窗口没有
     "只有鼠标": (udpsync.PRESENCE_NEVER, 100, 100, True),    # 连点器的形状
+    "只有键盘": (100, udpsync.PRESENCE_NEVER, 100, True),    # bug调查/26 的形状
     "在玩": (500, 500, 500, True),
 }
 
@@ -310,6 +337,47 @@ class VerdictTests(unittest.TestCase):
         self._report(conn, "后台", 200.0)
         self.assertFalse(self.gs.conn_is_afk(conn, now=200.0 + hold))
         self.assertTrue(self.gs.conn_is_afk(conn, now=200.0 + hold + 0.001))
+
+    def test_changing_the_flavour_of_afk_does_not_re_arm_the_hold(self):
+        """★★ bug调查/26 的第二半：起点锚的是「翻进**这一组**」。
+
+        原先每次档位翻转都重锚 ⇒ 在几档「像挂机」之间来回翻的人每翻一次白拿
+        一轮宽限，永远攒不满。判据要的事件是「他回来了」，不是「他走开的
+        **姿势**变了」。
+        """
+        conn = self._conn()
+        hold = self.gs.PRESENCE_AFK_AFTER_S
+        self._report(conn, "只有键盘", 100.0)
+        self._report(conn, "人不在", 100.0 + hold - 1.0)     # 组内换档
+        self.assertEqual(100.0, conn.presence_since, "组内换档重锚了")
+        self.assertTrue(self.gs.conn_is_afk(conn, now=100.0 + hold + 0.001))
+
+    def test_the_bug26_shape_stays_caught_between_keystrokes(self):
+        """★★ 328800963 的真实形状（bug调查/26 的 8 小时日志）：
+
+        鼠标键**一次没抬过**，键盘每 92 秒（一局一次「开始下一局」）被按一下
+        ⇒ 键盘那一格和整机那一格轮流刷新，档位在 `只有键盘` ↔ `人不在` 之间
+        来回翻，但**一次都没回到「在玩」**。
+        修之前这种形状 8 小时里只有 15.6% 判成挂机，管理页 84% 显示「游戏中」。
+        """
+        conn = self._conn()
+        hold = self.gs.PRESENCE_AFK_AFTER_S
+        period, last_key, verdicts, seen = 92.0, 0.0, [], set()
+        for step in range(int(600 / self.gs.PRESENCE_REPORT_S)):
+            at = step * self.gs.PRESENCE_REPORT_S
+            if at - last_key >= period:
+                last_key = at                       # 「开始下一局」那一下
+            idle_ms = int((at - last_key) * 1000)
+            conn.note_presence(idle_ms, udpsync.PRESENCE_NEVER, idle_ms,
+                               True, now=at)
+            seen.add(conn.presence_logged)
+            verdicts.append((at, self.gs.conn_is_afk(conn, now=at)))
+        self.assertEqual({"只有键盘", "人不在"}, seen,
+                         "夹具自检：这一条要的就是「组内来回翻」那个形状")
+        late = [(at, v) for at, v in verdicts if at > hold]
+        self.assertTrue(all(v for _, v in late),
+                        "攒满之后又被自己的档位翻转洗白了：%s"
+                        % [at for at, v in late if not v])
 
     # ------------------------------------------------------------ 证据会过期
     def test_stale_evidence_falls_back_to_no_information(self):
