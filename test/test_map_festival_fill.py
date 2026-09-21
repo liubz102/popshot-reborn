@@ -34,7 +34,11 @@ MAPS = ("Festival00", "Festival01", "Festival02")
 FILE_TYPES = (200, 201, 202, 203, 209)
 FALLDOWN_EFFECT = "Maps/Festival/Effect/FestivalWaterDamage00.efx"
 #: 原版就是 Terrain 同名逐字节复制的 Cover 副本（`tr_x_09` 原版就不同，不在名单里）。
-COVER_COPIES = ("tr_x_08", "tr_x_10", "tr_x_12", "tr_x_13", "tr_x_14", "tr_x_15", "tr_x_16", "tr_x_17")
+#: ★ `tr_x_12/13/14/15` 也**不是**副本 —— 它们是绳上的「炮炮火枪手」圆牌（§71），另见 `MEDALLIONS`。
+COVER_COPIES = ("tr_x_08", "tr_x_10", "tr_x_16", "tr_x_17")
+
+#: 绳上五个 `HidingObj` 用的四张圆牌：同尺寸方画布，前两个位置共用 `tr_x_15`（都是「炮」）。
+MEDALLIONS = ("tr_x_12", "tr_x_13", "tr_x_14", "tr_x_15")
 
 
 def real_path(rel):
@@ -100,13 +104,36 @@ class FestivalAssetsPresent(unittest.TestCase):
         self.assertEqual(5, len(seen), sorted(seen))
 
     def test_generated_pngs_are_8bit_rgba(self):
-        for rel in ("Terrain/tr_x_28", "Terrain/tr_x_29", "Terrain/tr_x_30", "Terrain/tr_x_31", "Terrain/tr_x_32",
-                    "Terrain/tr_x_33", "Terrain/tr_x_34", "Terrain/tr_x_35", "Terrain/tr_x_37",
-                    "Layer/la_19", "Layer/la_20", "Breakable/co_07", "Breakable/co_08", "Breakable/co_12", "Breakable/co_13"):
+        rels = ["Terrain/tr_x_28", "Terrain/tr_x_29", "Terrain/tr_x_30", "Terrain/tr_x_31", "Terrain/tr_x_32",
+                "Terrain/tr_x_33", "Terrain/tr_x_34", "Terrain/tr_x_35", "Terrain/tr_x_37",
+                "Layer/la_19", "Layer/la_20", "Breakable/co_07", "Breakable/co_08", "Breakable/co_12", "Breakable/co_13"]
+        rels += ["Cover/%s" % b for b in MEDALLIONS]
+        for rel in rels:
             rp = real_path("Maps/Festival/%s.png" % rel)
             self.assertIsNotNone(rp, rel)
             w, h, depth, ctype = png_header(rp)
             self.assertEqual((8, 6), (depth, ctype), rel)
+
+    def test_medallions_are_one_square_size(self):
+        """绳上五块牌子必须同尺寸方画布 —— 原版靠对象缩放（0.4 / 0.5）分大小，不是靠贴图。"""
+        sizes = set()
+        for base in MEDALLIONS:
+            rp = real_path("Maps/Festival/Cover/%s.png" % base)
+            self.assertIsNotNone(rp, base)
+            w, h, _depth, _ctype = png_header(rp)
+            self.assertEqual(w, h, base)
+            sizes.add(w)
+        self.assertEqual(1, len(sizes), sorted(sizes))
+
+    def test_cover_medallions_are_not_terrain_copies(self):
+        """守住 2026-09-21 那次返工：这四张一旦又被当成 Terrain 副本抄回去，绳上就变回柱子和墙块。"""
+        for base in MEDALLIONS:
+            a = real_path("Maps/Festival/Cover/%s.png" % base)
+            b = real_path("Maps/Festival/Terrain/%s.png" % base)
+            self.assertIsNotNone(a, base)
+            self.assertIsNotNone(b, base)
+            with open(a, "rb") as fa, open(b, "rb") as fb:
+                self.assertNotEqual(fa.read(), fb.read(), base)
 
     def test_cover_copies_are_byte_identical_to_terrain(self):
         for base in COVER_COPIES:

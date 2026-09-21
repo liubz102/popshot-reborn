@@ -101,6 +101,14 @@ def apply_mask(img, mask, soften=1.0):
     return img
 
 
+def open_mask(mask, r=1):
+    """0/1 掩码的形态学开运算（先腐蚀再膨胀），用来抹掉孤立噪点。"""
+    im = Image.fromarray((mask.astype(np.uint8)) * 255)
+    k = 2 * r + 1
+    im = im.filter(ImageFilter.MinFilter(k)).filter(ImageFilter.MaxFilter(k))
+    return np.array(im) > 127
+
+
 def tint(img, rgb_mul, alpha_mul=1.0):
     out = img.copy()
     out[:, :, :3] *= np.array(rgb_mul, dtype=np.float32)
@@ -215,11 +223,3 @@ def deck_strip(w, deck_h, foam_h):
     over(out, foam, 0, deck_h)
     fade_bottom(out, max(1, foam_h // 2))
     return out
-
-
-def plank_lines(img, x0, x1, y0, y1, step=14, phase=0, dark=0.72, alpha=0.5):
-    """竖向木板缝（暗线），用在红漆坡道上。"""
-    for x in range(int(x0 + phase % step), int(x1), step):
-        sub = img[int(y0):int(y1), x:x + 1]
-        sub[:, :, :3] *= 1 - (1 - dark) * alpha
-    return img

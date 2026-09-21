@@ -11,13 +11,17 @@
   反变换到精灵局部坐标（以中心为原点）—— 画出来的东西和空气墙严丝合缝。
 - 有掩码的（`tr_x_32`、`co_07/08/12/13`）：`.map` 尾部掩码表里的逐像素轮廓和画布尺寸，**尺寸必须一模一样**
   （`BreakableObj` 命中判定按半尺寸换局部坐标）。
-- 无碰撞的装饰（`tr_x_34/35/37`、`la_19/20`）：保守猜测，用现有素材拼。
-- `Cover/tr_x_*`：原版就是 Terrain 同名逐字节复制。
+- 无碰撞的装饰（`tr_x_34/35/37`、`la_19/20`）：保守猜测，用现有素材拼；`tr_x_35` 的**摆位**
+  是从 11 个实例量出来的常数定死的（`TR35_PAD`），不是猜的。
+- `Cover/` 是**独立编号**，不是 Terrain 的副本（原版 `Cover/tr_x_09` 就和 `Terrain/tr_x_09` 完全不同）：
+  `Cover/tr_x_12/13/14/15` 是绳上的「炮炮火枪手」圆牌（§71）；只有 `tr_x_10/16/17` 仍按副本处理（未证实）。
 
 ## 美术怎么来
 
 全部从 `Maps/Festival/` 现有素材采样 / 缩放 / 拼贴（铁律 13：先搜再画），程序化只用在没有素材的地方
-（绳桥、船身、坡道面板）。基准色和材质函数在 `art.py`。
+（绳桥、坡道面板）。基准色和材质函数在 `art.py`。
+★ `tr_x_32`（鲤鱼）是从 `ref/festival02_carp.png` **抠**出来的，不是画的 —— 那是用户找到的原版截图，
+比任何手画都准。以后再遇到「有原版图能对」的情况，优先抠图。
 """
 from __future__ import annotations
 
@@ -27,6 +31,7 @@ import shutil
 import sys
 
 import numpy as np
+from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -38,8 +43,12 @@ ROOT = art.ROOT
 OUT_DEFAULT = os.path.join(ROOT, "logs", "map_festival_fill", "out")
 INSTALL_DIR = art.FESTIVAL
 
-#: Cover 副本：原版 `Cover/tr_x_08.png` 和 `Terrain/tr_x_08.png` 逐字节相同，缺的 7 张照抄。
-COVER_COPIES = ("tr_x_10", "tr_x_12", "tr_x_13", "tr_x_14", "tr_x_15", "tr_x_16", "tr_x_17")
+#: Cover 副本：原版 `Cover/tr_x_08.png` 和 `Terrain/tr_x_08.png` 逐字节相同，照抄。
+#: ★ `tr_x_12/13/14/15` **已经不在这张表里** —— 它们是绳上的「炮炮火枪手」圆牌，另有画法（见 RECIPES）。
+#: ⚠ 剩下这三张只是「原版 tr_x_08 是副本」推出来的**未经证实**的假设：原版 `Cover/tr_x_09.png`
+#: 就和 `Terrain/tr_x_09.png` 完全不同（前者是 logo、后者是托架灯）⇒ Cover 是独立编号，
+#: 这三张多半也不是副本。缺参考图，先保持现状（§71）。
+COVER_COPIES = ("tr_x_10", "tr_x_16", "tr_x_17")
 
 
 class Ctx:
@@ -272,56 +281,156 @@ def tr_x_33(ctx):
     return _rope(ctx, "Festival00", "tr_x_33", 320, 380, 160, 190, 9, mirrored_handle=345)
 
 
+# ---------------------------------------------------------------------------
+#  tr_x_32：吊在彩带上的红鲤鱼灯 —— 从原版截图里抠
+# ---------------------------------------------------------------------------
+
+#: 用户 2026-09-21 找到的原版清晰截图（「云之桥」里那条鱼）。抠图的唯一来源，别删。
+CARP_REF = os.path.join(HERE, "ref", "festival02_carp.png")
+
+#: 截图 → 画布的仿射：`shot_x = AX·u + BX`、`shot_y = AY·v + BY`。
+#: 网格搜「截图里的鱼形 vs `.map` 掩码」的 IoU 得到（最优 0.86）；
+#: `AX/AY = 1.093 ≈ 对象的 sx/sy = 1.1/1.0`，两条独立的量法对上了，说明配准是对的。
+CARP_FIT = (2.110, 66.0, 1.930, -241.5)
+
+#: 吊链：竖段在画布正中，到 v≈298 分成 Y 形两叉搭在鱼背上（都按上面的仿射从截图量的）。
+CARP_CHAIN_U = 124.0
+CARP_CHAIN_FORK = (124.0, 298.0)
+CARP_CHAIN_ENDS = ((92.0, 329.0), (142.0, 326.0))
+#: 竖链往上循环贴的取样段（截图只拍到 v≈125 以下）；长度 68 = 链节周期的整数倍。
+CARP_CHAIN_TILE = (176, 244)
+
+CARP_EYE = (189.0, 346.0)          # 青色的鱼眼，不红，抠图时要单独保住
+CARP_FEET = (318, 335, 170, 215)   # 截图里站在鱼背上那个角色的鞋，要擦掉重补
+
+
+def _carp_resample(shot, Hc, Wc):
+    """截图 → 画布：反向遍历截图像素做面积平均（缩小约 2 倍）。返回 (rgb, 采到没有)。"""
+    ax, bx, ay, by = CARP_FIT
+    Hs, Ws = shot.shape[:2]
+    acc = np.zeros((Hc, Wc, 3), dtype=np.float32)
+    cnt = np.zeros((Hc, Wc), dtype=np.float32)
+    sy, sx = np.mgrid[0:Hs, 0:Ws]
+    u = np.rint((sx - bx) / ax).astype(int)
+    v = np.rint((sy - by) / ay).astype(int)
+    ok = (u >= 0) & (u < Wc) & (v >= 0) & (v < Hc)
+    np.add.at(acc, (v[ok], u[ok]), shot[ok])
+    np.add.at(cnt, (v[ok], u[ok]), 1.0)
+    got = cnt > 0
+    acc[got] /= cnt[got][:, None]
+    return acc, got
+
+
+def _inpaint(rgb, keep, need, rounds=40):
+    """把 `need` 里、`keep` 外的像素用邻居的 keep 像素反复平均补上。
+
+    ★ 求和时必须先乘 keep 掩码 —— 只除以「好邻居个数」却把坏邻居的颜色也加进去，
+    结果会被放大到溢出，补出一片纯白（2026-09-21 踩过）。
+    """
+    out = rgb.copy()
+    good = keep.copy()
+    H, W = good.shape
+    for _ in range(rounds):
+        todo = need & ~good
+        if not todo.any():
+            break
+        pv = np.pad(out * good[:, :, None], ((1, 1), (1, 1), (0, 0)))
+        pg = np.pad(good.astype(np.float32), ((1, 1), (1, 1)))
+        s = sum(pv[1 + dy:1 + dy + H, 1 + dx:1 + dx + W] for dy in (-1, 0, 1) for dx in (-1, 0, 1))
+        n = sum(pg[1 + dy:1 + dy + H, 1 + dx:1 + dx + W] for dy in (-1, 0, 1) for dx in (-1, 0, 1))
+        fill = todo & (n > 0)
+        out[fill] = s[fill] / n[fill][:, None]
+        good |= fill
+    return out
+
+
+def _seg_band(Hc, Wc, p0, p1, half):
+    """到线段 p0-p1 的距离 ≤ half 的那条带。"""
+    ys, xs = np.mgrid[0:Hc, 0:Wc]
+    (x0, y0), (x1, y1) = p0, p1
+    dx, dy = x1 - x0, y1 - y0
+    t = np.clip(((xs - x0) * dx + (ys - y0) * dy) / (dx * dx + dy * dy), 0, 1)
+    return np.hypot(xs - (x0 + t * dx), ys - (y0 + t * dy)) <= half
+
+
+def _smooth_in(img, mask, box, rounds):
+    """只在掩码内、只在 box 这一块做几遍 3×3 平均（抹掉按列补出来的竖条纹）。"""
+    v0, v1, u0, u1 = box
+    sl = (slice(v0, v1), slice(u0, u1))
+    for _ in range(rounds):
+        win = img[sl].copy()
+        wm = mask[sl].astype(np.float32)[:, :, None]
+        pv = np.pad(win * wm, ((1, 1), (1, 1), (0, 0)))
+        pg = np.pad(wm, ((1, 1), (1, 1), (0, 0)))
+        h, w = win.shape[:2]
+        acc = sum(pv[1 + dy:1 + dy + h, 1 + dx:1 + dx + w] for dy in (-1, 0, 1) for dx in (-1, 0, 1))
+        num = sum(pg[1 + dy:1 + dy + h, 1 + dx:1 + dx + w] for dy in (-1, 0, 1) for dx in (-1, 0, 1))
+        img[sl] = np.where(num > 0, acc / np.maximum(num, 1e-6), win)
+    return img
+
+
 def tr_x_32(ctx):
-    """水面画舫 252×435（掩码尺寸）：船身按掩码，甲板小亭 + 灯杆 + 灯笼（灯笼落在 Glow 特效的位置，列≈167 行≈217）。"""
+    """吊在彩带上的**红鲤鱼灯** 252×435（掩码尺寸）：上面是金吊链，下面（掩码 rows 321..418）是鱼。
+
+    ★ 2026-09-21：用户先指出这是鱼不是船，又找来一张清晰的原版截图 ⇒ **直接从截图抠**，不再手画。
+    几何自洽：对象挂在 type 111 路径上（y≈735）⇒ 画布顶 = 735−217.5 = 517.3，正好是绳子那一行；
+    鱼挂在画布最下面，中间那 321 行就是链子。
+
+    透明度怎么定：
+    - **鱼身 alpha = `.map` 掩码 × 「像不像鱼」**。掩码是编辑器按列从最上到最下填出来的实心块
+      （252 列里只有 6 列有洞），所以尾巴和肚子之间那个缺口在掩码里是实的、在原版贴图里是透的 ——
+      只按掩码裁会糊上一块背景云。判据：`r − max(g, b)`（鱼身 / 金云纹 ≥96，背景亮云 ≤54），
+      外加「掩码内够暗的一律算鱼」（背景是亮云，不会暗）。青色的鱼眼两条都不满足，单独圈出来保住。
+    - 链子 alpha = 「金色 ∧ 贴着那三条线段」，这样不会把背景里的金云一起抠进来。
+    """
     m = ctx.mask("Festival02", "Maps/Festival/Terrain/tr_x_32.png") > 0
-    H, W = m.shape
-    img = art.new(W, H)
-    # 船身：红漆（只取鼓身纯红行，别把青绿反光带进来）+ 木板缝，上沿金边，底部吃水线压暗
-    hull = art.lacquer_panel(W, H, rows=(4, 74))
-    art.plank_lines(hull, 0, W, 0, H, step=18, phase=4)
-    hull[:, :, 3] = 255
-    art.apply_mask(hull, m, soften=0.8)
-    top = np.full(W, -1)
-    for u in range(W):
-        rows = np.nonzero(m[:, u])[0]
-        if len(rows):
-            top[u] = rows.min()
-    for u in range(W):
-        if top[u] < 0:
+    Hc, Wc = m.shape
+    shot = np.array(Image.open(CARP_REF).convert("RGB")).astype(np.float32)
+    rgb, got = _carp_resample(shot, Hc, Wc)
+    r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+
+    conf = np.clip((r - np.maximum(g, b) - 62.0) / 26.0, 0, 1)
+    conf = np.maximum(conf, np.clip((120.0 - rgb.max(axis=2)) / 30.0, 0, 1))
+    conf[~got] = 0
+    ys, xs = np.mgrid[0:Hc, 0:Wc]
+    conf[np.hypot(xs - CARP_EYE[0], ys - CARP_EYE[1]) <= 8.0] = 1.0
+    v0, v1, u0, u1 = CARP_FEET
+    conf[v0:v1, u0:u1] = 1.0
+
+    keep = m & (conf > 0.85)
+    keep[v0:v1, u0:u1] = False
+    body = _inpaint(rgb, keep, m)
+    # 鞋那一块：按列把下面第一行干净的鱼背色往上拉，再抹几遍。
+    # 用通用 `_inpaint` 会把鞋边缘的棕色卷进来，补出一道棕带。
+    for u in range(u0, u1):
+        col = np.nonzero(keep[v1:, u])[0]
+        if not len(col):
             continue
-        rows = np.nonzero(m[:, u])[0]
-        b = rows.max()
-        for r in range(max(top[u], b - 8), b + 1):
-            hull[r, u, :3] *= 0.55 + 0.05 * (b - r)
-        for dr, col, a in ((0, art.GOLD_LIGHT, 1.0), (1, art.GOLD, 1.0), (2, art.GOLD_DARK, 0.7)):
-            r = top[u] + dr
-            if r <= b:
-                hull[r, u, :3] = hull[r, u, :3] * (1 - a) + np.array(col, dtype=np.float32) * a
-    art.over(img, hull, 0, 0)
-    # 甲板：船身上沿再往上 4 px 的一条暗红甲板线（只在船身中段）
-    mid = [u for u in range(W) if top[u] >= 0]
-    u_lo, u_hi = min(mid) + 18, max(mid) - 40
-    # 小亭：tr_x_12 红瓦墙块缩到 96×64，坐在船身中段
-    cabin = art.resize(art.load("Terrain/tr_x_12.png"), 96, 64)
-    cab_x = 62
-    cab_y = int(np.median([top[u] for u in range(cab_x, cab_x + 96) if top[u] >= 0])) - 60
-    art.over(img, cabin, cab_x, cab_y)
-    # 灯杆：tr_x_13 柱子缩到 20×92，杆顶挂 co_06 小灯笼，灯笼中心对准 (167, 217)
-    pole = art.resize(art.load("Terrain/tr_x_13.png"), 20, 92)
-    pole_x, pole_top = 167 - 10, 235
-    art.over(img, pole, pole_x, pole_top)
-    art.hline(img, pole_top, pole_x - 14, pole_x + 34, art.GOLD_DARK, 3, 0.95)   # 横臂
-    art.vline(img, 167, pole_top - 26, pole_top, art.RED_DARK, 2, 0.9)          # 吊绳
-    lantern = art.scale(art.load("Breakable/co_06.png"), 0.55)
-    lh, lw = lantern.shape[:2]
-    art.over(img, lantern, 167 - lw // 2, 217 - lh // 2)
-    # 船头小旗：三角红旗
-    flag = art.new(26, 18)
-    for r in range(18):
-        w_ = int(26 * (1 - abs(r - 9) / 9.0))
-        flag[r, :w_, :3] = art.RED_LIGHT; flag[r, :w_, 3] = 255
-    art.over(img, flag, pole_x + 20, pole_top - 2)
+        src = body[v1 + col[0], u].copy()
+        for v in range(v0, v1):
+            if m[v, u]:
+                body[v, u] = src
+    _smooth_in(body, m, (v0 - 2, v1 + 3, u0 - 2, u1 + 3), 5)
+
+    img = art.new(Wc, Hc)
+    img[:, :, :3] = body
+    img[:, :, 3] = m.astype(np.float32) * conf * 255.0
+
+    # 吊链
+    goldish = got & (r > 130) & (g > 88) & (r - b > 55) & (g - b > 30)
+    band = _seg_band(Hc, Wc, (CARP_CHAIN_U, 0.0), CARP_CHAIN_FORK, 7.0)
+    for end in CARP_CHAIN_ENDS:
+        band |= _seg_band(Hc, Wc, CARP_CHAIN_FORK, end, 5.0)
+    chain = art.new(Wc, Hc)
+    chain[:, :, :3] = rgb
+    chain[:, :, 3] = (goldish & band).astype(np.float32) * 255.0
+    p0, p1 = CARP_CHAIN_TILE
+    tile = chain[p0:p1].copy()
+    y = p0
+    while y > 0:
+        y -= (p1 - p0)
+        chain[max(0, y):y + (p1 - p0)] = tile[max(0, y) - y:]
+    art.over(img, chain, 0, 0)
     return img
 
 
@@ -337,9 +446,17 @@ def tr_x_34(ctx):
     return img
 
 
+#: `tr_x_35` 画布右边留出的空白宽度。精灵按**中心**锚点摆，右边多留 2×`TR35_PAD` 就等于
+#: 把彩带整体往左推 `TR35_PAD` px。定成 30 的根据：11 个实例实测「右挂点 − 红瓦平台可见右沿」
+#: 一律是 +27..+33（中位 +30、σ=2），是个常数 ⇒ 原版就是按「右挂点贴平台右沿」定的位
+#: （2026-09-21 用户报「几乎所有跳跃平台上的这个都错位了」）。平台宽度 113..236 不等，
+#: 只有右端对得死，左端只能跟着走。★ 这个常数是在「主层按文件逆序画」的前提下量的（§70）。
+TR35_PAD = 30
+
+
 def tr_x_35(ctx):
-    """红瓦墙上的挂饰 160×130：一段金流苏彩带 + 两只小红灯笼。"""
-    img = art.new(160, 130)
+    """红瓦墙上的挂饰 220×130：一段金流苏彩带 + 两只小红灯笼，画在画布左侧（见 `TR35_PAD`）。"""
+    img = art.new(160 + 2 * TR35_PAD, 130)
     garland = art.resize(art.load("Terrain/tr_x_16.png"), 156, 32)
     art.over(img, garland, 2, 2)
     lantern = art.scale(art.load("Breakable/co_06.png"), 0.52)
@@ -387,6 +504,116 @@ def la_19(ctx):
 
 def la_20(ctx):
     return _far_pagoda((("Layer/la_18.png", 0.70, 10, 90), ("Layer/la_15.png", 0.45, 210, 150)))
+
+
+# ---------------------------------------------------------------------------
+#  Cover：绳上那五块「炮炮火枪手」圆牌（★ 不是 Terrain 同名件的副本）
+# ---------------------------------------------------------------------------
+
+#: `Cover/tr_x_1{5,4,3,2}.png` —— Festival02 的绳子上挂着五个 `HidingObj`，按世界 x 排是
+#: 667.9 / 737.2 / 819.3 / 903.9 / 973.6，用的贴图依次是 `tr_x_15`、`tr_x_15`、`tr_x_14`、
+#: `tr_x_13`、`tr_x_12`：**前两个是同一张** ⇒ 读作「炮 炮 火 枪 手」（用户 2026-09-21 找到原版截图佐证）。
+#: 第三块（火）的对象缩放是 0.5、其余 0.4，原版截图里它也正好大一圈 ⇒ 四张画布同尺寸。
+#: 屏上直径实测约 64 px（0.4 缩放）⇒ 画布 160×160。
+MEDALLION_SIZE = 160
+
+#: 圆牌配色，从原版截图上采的（火那块，按到中心的距离分环取均值）。
+MED_DISC_HI = (245.0, 136.0, 152.0)
+MED_DISC_LO = (186.0, 58.0, 72.0)
+MED_RING_HI = (252.0, 198.0, 140.0)
+MED_RING_LO = (196.0, 104.0, 58.0)
+MED_GLYPH = (56.0, 6.0, 10.0)
+
+
+def _logo_glyphs():
+    """把 `Terrain/tr_x_08.png`（617×195 的「炮炮火枪手」logo）切成 5 个字芯掩码。
+
+    字芯 = 那圈粉色描边**里面**的暗红填充（不含描边和外发光），判据是「够不透明 + 够暗 + 够红」。
+    五个字在列方向天然分开（各约 98 px 宽），按列直接切。铁律 13：字不自己造，从原版 logo 抠。
+    """
+    a = art.load("Terrain/tr_x_08.png")
+    r, g, b, al = a[:, :, 0], a[:, :, 1], a[:, :, 2], a[:, :, 3]
+    core = (al > 150) & (r < 150) & (r > g + 18) & (r > b + 10)
+    core = art.open_mask(core, 2)        # logo 底边有几粒噪点，开运算抹掉
+    inside = core.sum(axis=0) > 1
+    runs, start = [], None
+    for i, v in enumerate(inside):
+        if v and start is None:
+            start = i
+        elif (not v) and start is not None:
+            runs.append((start, i - 1))
+            start = None
+    if start is not None:
+        runs.append((start, len(inside) - 1))
+    runs = [(x0, x1) for x0, x1 in runs if x1 - x0 >= 12]
+    if len(runs) != 5:
+        raise RuntimeError("tr_x_08 应该切出 5 个字，切出了 %d 个：%s" % (len(runs), runs))
+    out = []
+    for x0, x1 in runs:
+        sub = core[:, x0:x1 + 1]
+        rows = np.nonzero(sub.any(axis=1))[0]
+        out.append(sub[rows.min():rows.max() + 1])
+    return out
+
+
+def _medallion(glyph):
+    """一块圆牌 160×160：暖金圈 + 中心亮的粉红盘面 + 暗红字。"""
+    S = MEDALLION_SIZE
+    c = (S - 1) / 2.0
+    r_in, r_out = 63.0, 79.0      # 外径 158 ⇒ 0.4 缩放后屏上 63 px，和原版截图量到的 64 对得上
+    ys, xs = np.mgrid[0:S, 0:S]
+    d = np.sqrt((xs - c) ** 2 + (ys - c) ** 2)
+    img = art.new(S, S)
+    # 盘面：中心亮外缘深，再往左上压一点高光
+    t = np.clip(d / r_in, 0, 1)[:, :, None]
+    img[:, :, :3] = np.array(MED_DISC_HI) * (1 - t) + np.array(MED_DISC_LO) * t
+    lit = np.clip(1.0 + 0.16 * ((c - xs) + (c - ys)) / r_in, 0.86, 1.14)
+    img[:, :, :3] = np.clip(img[:, :, :3] * lit[:, :, None], 0, 255)
+    # 金圈：内亮外暗的一道斜面
+    k = np.clip((d - r_in) / (r_out - r_in), 0, 1)[:, :, None]
+    gold = np.array(MED_RING_HI) * (1 - k) + np.array(MED_RING_LO) * k
+    img[:, :, :3] = np.where(((d >= r_in) & (d <= r_out))[:, :, None], gold, img[:, :, :3])
+    img[:, :, 3] = np.clip(r_out + 0.5 - d, 0, 1) * 255
+    # 字：按 logo 原始字宽等比缩（98 -> 96），各自按外接框居中
+    gh, gw = glyph.shape
+    k2 = 88.0 / 98.0
+    tw, th = max(1, int(round(gw * k2))), max(1, int(round(gh * k2)))
+    stamp = art.new(gw, gh)
+    stamp[:, :, :3] = MED_GLYPH
+    stamp[:, :, 3] = glyph.astype(np.float32) * 255.0
+    stamp = art.resize(stamp, tw, th)
+    stamp[:, :, :3] = MED_GLYPH                      # 缩放会把颜色和透明边混在一起，重新压回字色
+    art.over(img, stamp, int(round(c - tw / 2.0)), int(round(c - th / 2.0)))
+    return img
+
+
+_GLYPHS = []
+
+
+def _glyph(i):
+    if not _GLYPHS:
+        _GLYPHS.extend(_logo_glyphs())
+    return _GLYPHS[i]
+
+
+def cover_tr_x_15(ctx):
+    """绳上第 1、2 块圆牌（同一张贴图用两次）：**炮**。"""
+    return _medallion(_glyph(0))
+
+
+def cover_tr_x_14(ctx):
+    """绳上第 3 块圆牌（对象缩放 0.5，比别的大一圈）：**火**。"""
+    return _medallion(_glyph(2))
+
+
+def cover_tr_x_13(ctx):
+    """绳上第 4 块圆牌：**枪**。"""
+    return _medallion(_glyph(3))
+
+
+def cover_tr_x_12(ctx):
+    """绳上第 5 块圆牌：**手**。"""
+    return _medallion(_glyph(4))
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +707,8 @@ RECIPES = {
     "Terrain/tr_x_34.png": tr_x_34, "Terrain/tr_x_35.png": tr_x_35, "Terrain/tr_x_37.png": tr_x_37,
     "Layer/la_19.png": la_19, "Layer/la_20.png": la_20,
     "Breakable/co_07.png": co_07, "Breakable/co_08.png": co_08, "Breakable/co_12.png": co_12, "Breakable/co_13.png": co_13,
+    "Cover/tr_x_12.png": cover_tr_x_12, "Cover/tr_x_13.png": cover_tr_x_13,
+    "Cover/tr_x_14.png": cover_tr_x_14, "Cover/tr_x_15.png": cover_tr_x_15,
 }
 
 

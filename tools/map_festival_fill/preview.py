@@ -11,8 +11,8 @@
 
 ## 只是示意，不是引擎渲染
 
-- 绘制顺序按「背景层 → 主层（**按句柄升序**）→ 前景层」合成；主层里谁盖谁引擎怎么排离线定不了
-  （见 FINDINGS），实机第一次看图时核对。
+- 绘制顺序按「背景层 → 主层 → 前景层」合成；★ 主层 / 前景层里**谁盖谁 = `.map` 里的文件逆序**
+  （末尾那条最先画、最靠后），不是句柄升序（FINDINGS §70，2026-09-21 拿用户截图配准量出来的）。
 - 背景视差层（cat4~7）按原坐标直接贴（引擎有视差缩放，这里没有），出界的跳过。
 - 特效只画一个按首层颜色 / 尺寸的柔光点当位置标记（仅主层 / 前景层的，它们是世界坐标），
   背景层的特效坐标是层内坐标，不画。动态效果以实机为准。
@@ -60,10 +60,13 @@ def _bg(w, h):
 
 
 def _load_sprite(rel, src_dir, allow_new):
-    rp = mapscan.real_path(rel)
-    if rp is None and allow_new:
-        cand = os.path.join(src_dir, rel.replace("Maps/Festival/", "").replace("/", os.sep))
-        rp = cand if os.path.isfile(cand) else None
+    """after 图**优先用 `src_dir` 里那份**，before 图只认盘上装好的。
+
+    ★ 第一版是「盘上没有才去 src_dir 找」—— 一旦 `build.py --install` 装过一次，
+    after 就永远和 before 一样了，改了美术也看不出来（2026-09-21 踩过）。
+    """
+    cand = os.path.join(src_dir, rel.replace("Maps/Festival/", "").replace("/", os.sep))
+    rp = cand if (allow_new and os.path.isfile(cand)) else mapscan.real_path(rel)
     if rp is None:
         return None
     return np.array(Image.open(rp).convert("RGBA")).astype(np.float32)
@@ -106,10 +109,9 @@ def compose(name, src_dir, allow_new):
     objs = info["objects"]
     order = [o for o in objs if o["cat"] in (4, 5, 6, 7) and o["type"] == mapscan.LAYER]
     order.sort(key=lambda o: (o["cat"], o["handle"]))
-    main = [o for o in objs if o["cat"] == 8 and o["type"] in (mapscan.TERRAIN, mapscan.BREAKABLE)]
-    main.sort(key=lambda o: o["handle"])
-    front = [o for o in objs if o["cat"] == 10 and o["type"] == mapscan.HIDING]
-    front.sort(key=lambda o: o["handle"])
+    # ★ 主层 / 前景层按**文件逆序**画（§70）：`.map` 里靠前的对象在最上面。
+    main = [o for o in objs if o["cat"] == 8 and o["type"] in (mapscan.TERRAIN, mapscan.BREAKABLE)][::-1]
+    front = [o for o in objs if o["cat"] == 10 and o["type"] == mapscan.HIDING][::-1]
     missing_marks = []
     for o in order + main + front:
         spr = _load_sprite(o["path"], src_dir, allow_new)
