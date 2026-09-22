@@ -1293,6 +1293,35 @@ static void install_pack_redirect(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* 主模块的地址范围 —— 算一次，谁先要谁触发（幂等）                            */
+/*                                                                            */
+/* 原来只在 install_hooks（武装线程第一轮）里算。但 adapters_guard.h 那个护栏  */
+/* 装在 DllMain 里、要靠这个范围认「这次调用是不是游戏自己发的」，所以得更早    */
+/* 就有值 —— 提成一个小函数，两处都调。                                        */
+/* -------------------------------------------------------------------------- */
+static void compute_main_module_range(void)
+{
+    HMODULE self;
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS *nt;
+
+    if (g_mod_lo) return;
+    self = GetModuleHandleA(NULL);
+    if (!self) return;
+    dos = (IMAGE_DOS_HEADER *)self;
+    nt = (IMAGE_NT_HEADERS *)((BYTE *)self + dos->e_lfanew);
+    g_mod_lo = (UINT_PTR)self;
+    g_mod_hi = g_mod_lo + nt->OptionalHeader.SizeOfImage;
+    bslog("HOOK    主模块范围 %08X..%08X (SizeOfImage=%08X)",
+          (unsigned)g_mod_lo, (unsigned)g_mod_hi,
+          (unsigned)nt->OptionalHeader.SizeOfImage);
+}
+
+/* 启动期闪退护栏（bug调查/27）。放在这里是因为它依赖上面的 compute_… 和
+   g_mod_lo/g_mod_hi，而装钩子的时机要和 install_pack_redirect 一样早。 */
+#include "adapters_guard.h"
+
+/* -------------------------------------------------------------------------- */
 /* 注册链接的点击：**客户端自己根本处理不了**，我们接管                        */
 /*                                                                            */
 /* 实测（V0.2 里程碑 H）：id=1010 那条 Static **没有 SS_NOTIFY** ——           */
@@ -1557,20 +1586,13 @@ static void install_ws2_hooks(void)
 static void install_hooks(void)
 {
     HMODULE u32;
-    HMODULE self;
-    IMAGE_DOS_HEADER *dos;
-    IMAGE_NT_HEADERS *nt;
 
     if (InterlockedExchange(&g_hooks_installed, 1)) return;
 
-    /* 主模块范围（用于栈回溯筛选） */
-    self = GetModuleHandleA(NULL);
-    dos = (IMAGE_DOS_HEADER *)self;
-    nt = (IMAGE_NT_HEADERS *)((BYTE *)self + dos->e_lfanew);
-    g_mod_lo = (UINT_PTR)self;
-    g_mod_hi = g_mod_lo + nt->OptionalHeader.SizeOfImage;
-    bslog("HOOK    主模块范围 %08X..%08X (SizeOfImage=%08X)",
-          (unsigned)g_mod_lo, (unsigned)g_mod_hi, (unsigned)nt->OptionalHeader.SizeOfImage);
+    compute_main_module_range();   /* 一般 DllMain 里就算好了；幂等 */
+
+    /* DllMain 那一轮 IPHLPAPI 万一还没加载，这里补装（幂等）。 */
+    install_iphlpapi_hook();
 
     u32 = GetModuleHandleA("user32.dll");
     if (!u32) { bslog("HOOK    user32 尚未加载, 等下一轮"); g_hooks_installed = 0; return; }
@@ -10844,6 +10866,14 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
            LoadLibrary 的 APC 上，游戏一行代码都没跑，挂载 Pack\*.pkn 的那一段
            （应用初始化极早期）一定在钩子之后。见「资源目录重定向」一段。 */
         install_pack_redirect();
+
+        /* ★ 同理，GetAdaptersInfo 的护栏也必须在游戏跑起来之前装上：客户端收集
+           本机 IP 是在加载页「网络初始化中」那一步，而它**不看返回值**——
+           网卡多于 10 块时会去遍历未初始化的栈（bug调查/27）。
+           IPHLPAPI 是 BigShot.exe 的静态导入，这一刻通常已经在了；万一不在，
+           install_hooks 里还会再试一次。 */
+        compute_main_module_range();
+        install_iphlpapi_hook();
 
         ready_event = open_loader_event(POPSHOT_BSHOOK_READY_ENV);
         if (!ready_event) {
