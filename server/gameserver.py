@@ -7138,6 +7138,12 @@ class Conn:
     #: 同一档重复报**不动**它（丢包既不重置也不加速判定）；★ 组内换档
     #: （`人不在` ↔ `只有键盘` …）**也不动它**，见 `note_presence()`。
     presence_since = None
+    #: ★ 移动平台相位（X_Mod §74 / D55）：`{路径句柄: (收到时刻, 载图后毫秒, t_off)}`，
+    #:   `note_mover_phase()` 存、`bot._mover_clock()` 读。`None` = 这一局还没报过
+    #:   （老客户端 / 没中继 / UDP 被挡）⇒ bot 退回「开局估计」。发出 `0x0400`
+    #:   （这一局开始载图）时清空 —— hook 是载图**收尾**才报，所以清在它前面。
+    mover_phase = None
+    mover_phase_at = None
     #: ★ 诊断（`note_human_fire`）的类级默认 —— 控制通道造的假连接也得有。
     human_fire_logged = frozenset()
     #: ★ 这条连接**本图打出去、还没配上爆炸**的几发 `rpFire`（V0.3 §92）。
@@ -7481,6 +7487,11 @@ class Conn:
         opcode = int.from_bytes(plain[8:10], "little")
         kind = EPOCH_ADVANCING_OPS.get(opcode)
         if kind is not None:
+            if kind == "battle":
+                # ★ `0x0400` = 这一局开始载图：上一局的移动平台相位作废（X_Mod §74 /
+                #   D55）。hook 在载图**收尾**才报新的，所以清在这儿不会把新的清掉。
+                self.mover_phase = None
+                self.mover_phase_at = None
             relayserver.epoch_state(self).advance(self.room_generation(kind))
             return
         if opcode == EPOCH_ASSIGNING_OP and len(plain) >= 12:
@@ -11257,6 +11268,46 @@ class Conn:
             % (self.account_name or "?", bucket,
                presence_age_text(kb_ms), presence_age_text(mouse_ms),
                presence_age_text(sys_ms), "在" if self.presence_fg else "**不在**"))
+
+    def note_mover_phase(self, game_now, wall_now, entries, now=None):
+        """移动平台相位到了（`udpsync.MSG_MOVER_PHASE`，X_Mod §74）。
+
+        每条 `(link, t0, t_off)`：`link` = 路径对象的句柄（= `mapdata.Mover.handle`），
+        `t0` = 客户端 `MapObject::LinkPath` 那一刻的 `Timer()`，`game_now` = 发包那一刻的
+        `Timer()`。存下来的是「载图后毫秒」= `game_now − t0`（32 位回绕后按有符号读 ——
+        客户端 `Path::Eval` 也是有符号取模）和收到的时刻，`bot._mover_clock()` 用
+        「载图后毫秒 + 从收到到现在」推算此刻的相位。**只存事实**，谁的相位算数在
+        bot 那边（D55）。
+
+        ★ 日志按「这一局第一次」打一行（状态翻转 = 从 `None` 变成有），带上
+          `game_now − wall_now`：客户端的 `Timer()` 走的是 `GameContext+0xe0`，和墙钟
+          差多少只有实机知道（§74 要的就是这个数）。之后每秒一发全部静默。
+        ★ `now` 只给测试注入用，和 `note_presence()` 同一套约定。
+          ⚠ `udpsync._on_mover_phase` 按位置传前 3 个参数，别往前面插形参。
+        """
+        if not entries:
+            return
+        now = time.monotonic() if now is None else now
+        phase = {}
+        for link, t0, t_off in entries:
+            since = (int(game_now) - int(t0)) & 0xFFFFFFFF
+            if since >= 0x80000000:
+                since -= 0x100000000
+            phase[int(link)] = (now, since, int(t_off))
+        first = self.mover_phase is None
+        self.mover_phase = phase
+        self.mover_phase_at = now
+        if not first:
+            return
+        drift = (int(game_now) - int(wall_now)) & 0xFFFFFFFF
+        if drift >= 0x80000000:
+            drift -= 0x100000000
+        self.online_debug(
+            "移动平台相位 账号=%r -> %s（游戏时钟 − 墙钟 = %d ms）"
+            % (self.account_name or "?",
+               "；".join("路径 %d 载图后 %d ms（偏移 %d）" % (link, got[1], got[2])
+                        for link, got in sorted(phase.items())),
+               drift))
 
     def feed_peer_udp(self, index, payload):
         """UDP 那条路的入口 —— `udpsync` 收到位置数据后调它。

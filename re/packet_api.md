@@ -4412,8 +4412,8 @@ if (3 <= 系列 <= 5 && 索引 < 50)  索引 %= 10      ; D/R/F 归一化成槽�
 
 ```text
 +0  4  magic  b"PSU\x01"     最后一字节是版本号，改格式就 +1
-+4  1  类型    HELLO / HELLO_ACK / DATA / PING / PONG
-+5  1  份数    DATA 时 = 后面跟几组（含当前这一份）
++4  1  类型    HELLO(1) / HELLO_ACK(2) / DATA(3) / PING(4) / PONG(5) / PRESENCE(6) / MOVER_PHASE(7)
++5  1  份数    DATA / MOVER_PHASE 时 = 后面跟几组（含当前这一份）
 +6  2  保留    0
 ```
 
@@ -4423,6 +4423,8 @@ if (3 <= 系列 <= 5 && 索引 < 50)  索引 %= 10      ; D/R/F 归一化成槽�
 | `HELLO_ACK` | `u8 结果码 + u16 说明长度 + 说明(UTF-8)` |
 | `DATA` | 份数 × (`u32 索引 + u16 长度 + 整个 UdpPacket`)，**索引升序** |
 | `PING` / `PONG` | `u32 序号`（保活撑住 NAT 映射，顺带量 RTT）|
+| `PRESENCE`（6）| `u32 键盘空闲 / u32 鼠标空闲 / u32 系统空闲 / u8 前台 / u8 标志 / u16 保留`，空闲 `0xFFFFFFFF` = 本次连接从来没有过。在场证据（X_Mod §62 / D53）：bshook 每 5 秒 → 中继**原样转** → 游戏服 `Conn.note_presence()`，判定在游戏服 |
+| `MOVER_PHASE`（7）| `u32 game_now`（`[GameContext+0xe0]`，= 战斗态的 `Timer()`）`/ u32 wall_now`（`GetTickCount`），然后「份数」条 `i32 link / u32 t0 / i32 t_off`。移动平台相位（X_Mod §74 / D55）：bshook 在 `MapObject::LinkPath` 收尾 `0x511d97` 记表，记表后立刻、之后每秒一发 → 中继**原样转** → `Conn.note_mover_phase()` 存 `game_now − t0`；老服务端 / 老中继不认识就丢 |
 
 **铁律**（`server/udpsync.py` 顶部有完整论证）：
 

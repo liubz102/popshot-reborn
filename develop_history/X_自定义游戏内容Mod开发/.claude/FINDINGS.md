@@ -1598,13 +1598,34 @@ F02 路径 296 载 `tr_x_32`（±169/+120，每程 5000 ms）。
 `i32 loop`、`i32 count`，每点 `i32 kind, f32 x, f32 y, i32 ms`，**`kind==1` 才有** `f32 tx, f32 ty`，
 **地图版本 ≥ 18 才有** `f32 ease`。⇒ 原版 24 条路径切线全是 0、ease 全是 1 ⇒ 实际就是 **smoothstep**。
 
-★★ **相位原点只能逼近**：`t0` 是**各客户端自己把地图载完**那一刻，协议里没有任何同步包 ⇒
-严格说每台机器差一个「自己的载图耗时」。服务端拿**开局**（`RoomState.started_at`）当原点，
-误差就是那点载图耗时（鲤鱼 289 px / 5000 ms ⇒ 差 300 ms 只有 17 px，比弹体还小）。
+★★ ~~**相位原点只能逼近**~~ —— **改了，见 §74 / D55**：`t0` 走的是 `GameContext+0xe0` 不是墙钟，
+服务端猜不出来；现在由 `bshook` 在 `0x511d97` 记下 `t0`、每秒报过来，**开局**（`RoomQuest.started_at`）
+只剩兜底。⚠ 会话 29 那版写成了 `room.started_at`（字段在 `room.quest` 上），整套判定当时**没启用过**。
 
 **服务端这边**：`tools/mapdata.py` 产物加了 `movers`（FORMAT 6→7，全库 24 条 / 13 张图）；
 `server/mapdata.py` 加 `Mover` / `Rider`，`is_solid` / `blocks_bullet` / `line_blocked` 多一个
 **可选** `t_ms`（不给就是一格不差的老行为）；`bot.py` 的 `_mover_contact()` 单独走一遍 ——
 **不塞进 `_terrain_contact()` 的主循环**，因为那个循环靠 `bullet_coarse()` 的粗网格整块跳空气，
 而粗网格是静态地形烘的，混进去会一步跳过鱼。守卫测试 `test/test_mappath.py`。
+
+## §74 ★★★★★ 会话 29 的移动平台判定**从未启用**；`t0` 的真身；`.map` 每个对象自带 `t_off` / `rel`（✅ 逐指令 + 全库扫描）
+
+**① 死代码**：`bot._mover_clock(room)` 写的是 `getattr(room, "started_at")`，字段却在 `room.quest`
+（`gameserver.RoomQuest`）上，`lobby.Room` 没有 ⇒ 永远 `None` ⇒ `is_solid / blocks_bullet / _mover_contact`
+全走老路。用户 2026-09-22 报「手雷照样穿过鲤鱼」= 其实**每一发**都穿。`test_mappath` 只测了 `Mover`，
+没测这条时钟；现在 `test_moverphase.RegressionTests` 拿真 `Room + RoomQuest` 钉着。
+
+**② `t0` 是什么时钟**：`MapObject::LinkPath`（`0x511d60`）在 `World::LoadMapData`（`0x47429e`）收尾那一遍里跑，
+`0x511d97: mov [esi+0x90], eax` 存 `t0 = Timer()`；`Timer()` = `0x40a01e`：`GameContext = [[0x72e2b4]+8]` 非空时返回
+`[GameContext+0xe0]`，否则走 `0x5d72b4`（`[0x6d8a18]` 那个带**暂停位** `+8` 的计时器对象）。
+`PathFollower::GetPos`（`0x549bec`）：`elapsed = Timer() + [obj+0x94] − t0`；相对模式（`[obj+0x98]` 非零）再算一次
+`Eval(0)` 取差，`GetWorldPos`（`0x47c6bf`）把自身坐标 `[obj+0x34/0x38]` 加回去。`Path::Eval` 的取模是 `cdq / idiv`
+（`0x548d1a`）= **有符号**（`mapdata._cmod`）。⇒ 服务端猜不出这个相位：不是墙钟、没有同步包、多人各差一个载图耗时
+⇒ 让 hook 在 `0x511d97` 记 `(link, t0, t_off)`、每秒报 `[GameContext+0xe0]`（D55）。「游戏时钟 − 墙钟」差多少
+实机才知道 —— `Conn.note_mover_phase()` 每局第一发把它打进 `online.log`，⏳ 等实机回填。
+
+**③ v17 组三个 i32**（`MapObj::Deserialize` `0x511dc1..0x511de2`）= `link`（`+0xfc`）/ `t_off`（`+0x94`）/
+`rel`（`+0x98`，只存低字节）。`tools/mapdata.py` 原来只留 `link`。全库 32 个挂路径对象：`t_off` 只有 `Untitled`
+一个 5000，`rel` 只有 `Quest_level6` 一个 1，庆典三张全是 0/0。产物 FORMAT 7→8，rider 多 `x / y / t_off / rel`，
+`Mover.rider_center()` 按 rider 算（相对模式的基线是 `Eval(0)`，不是 `Eval(t_off)`）。
 

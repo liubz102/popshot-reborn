@@ -369,6 +369,55 @@ def parse_presence(data):
     return kb, mouse, sysidle, bool(fg), flags
 
 
+#: ★ 移动平台相位（X_Mod §74 / D55）—— 客户端报「**它自己**的移动平台走到哪了」。
+#:
+#: 出处：bot 的手雷穿过「云桥」的鲤鱼。移动平台的位置是每台客户端自己按
+#: `Timer() + t_off − t0` 算的（`PathFollower::GetPos` `0x549bec`），`t0` 是它把地图
+#: 载完那一刻（`MapObject::LinkPath` 收尾 `0x511d97`），协议里没有任何同步包；
+#: 多人房里每台机器各差一个载图耗时，而且 `Timer()` 走的是 `GameContext+0xe0`，
+#: 不是墙钟。⇒ 让 `bshook` 站在事实旁边把事实报过来：每个挂在路径上的对象一条
+#: `(link, t0, t_off)`，外加发包那一刻的 `Timer()`（`game_now`）和 `GetTickCount()`
+#: （`wall_now`，只给日志对照「游戏时钟 vs 墙钟」）。
+#: 相位 = `game_now − t0`（**不含** `t_off`，那一格由 `mapdata.Mover.rider_center()` 加）。
+#:
+#: ★★ 和在场证据一样：**只运事实，不下结论**。谁的相位算数在 `bot._mover_clock()`。
+MSG_MOVER_PHASE = 7
+
+#: 载荷：`u32 game_now / u32 wall_now`，然后头里 `count` 条 `i32 link / u32 t0 / i32 t_off`。
+MOVER_HEAD = struct.Struct("<II")
+MOVER_ENTRY = struct.Struct("<iIi")
+#: 一发最多几条。`.map` 里挂路径的对象最多 6 个（Festival01），32 是 hook 那张表的上限。
+MOVER_MAX_ENTRIES = 32
+
+
+def build_mover_phase(game_now, wall_now, entries):
+    items = list(entries)[:MOVER_MAX_ENTRIES]
+    body = b"".join(MOVER_ENTRY.pack(int(link), int(t0) & 0xFFFFFFFF, int(t_off))
+                    for link, t0, t_off in items)
+    return (build_header(MSG_MOVER_PHASE, len(items))
+            + MOVER_HEAD.pack(int(game_now) & 0xFFFFFFFF, int(wall_now) & 0xFFFFFFFF)
+            + body)
+
+
+def parse_mover_phase(data):
+    """-> `(game_now, wall_now, [(link, t0, t_off), …])`。
+
+    ★ 比说好的长照收（以后加字段老服务端不丢包），短了就是坏包，拒 —— 同 `parse_presence`。
+    """
+    kind, count = parse_header(data)
+    if kind != MSG_MOVER_PHASE:
+        raise ProtocolError(f"not a MOVER_PHASE ({kind})")
+    if len(data) < HEADER_SIZE + MOVER_HEAD.size + count * MOVER_ENTRY.size:
+        raise ProtocolError("MOVER_PHASE truncated")
+    game_now, wall_now = MOVER_HEAD.unpack_from(data, HEADER_SIZE)
+    pos = HEADER_SIZE + MOVER_HEAD.size
+    entries = []
+    for _ in range(count):
+        entries.append(MOVER_ENTRY.unpack_from(data, pos))
+        pos += MOVER_ENTRY.size
+    return game_now, wall_now, entries
+
+
 def build_ping(kind, seq):
     return build_header(kind) + struct.pack("<I", seq & 0xFFFFFFFF)
 
@@ -1006,6 +1055,30 @@ class UdpSyncServer:
         except Exception as error:             # noqa: BLE001 —— 不许带崩收包循环
             self.log(f"!! 喂在场证据抛了 {error!r}")
 
+    def _on_mover_phase(self, data, addr, now):
+        """移动平台相位（`MSG_MOVER_PHASE`，X_Mod §74）—— 和 `_on_presence` 同一套：
+        `HELLO` 之前一律丢，认得出就鸭子类型地喂给 `Conn.note_mover_phase()`，
+        **这里不判定**（谁的相位算数在 `bot._mover_clock()`）。
+        """
+        with self._lock:
+            endpoint = self._by_addr.get(addr)
+            if endpoint is not None:
+                endpoint.last_seen = now
+        if endpoint is None:
+            self.unknown_in += 1
+            return
+        try:
+            game_now, wall_now, entries = parse_mover_phase(data)
+        except ProtocolError:
+            return
+        note = getattr(endpoint.game_conn, "note_mover_phase", None)
+        if note is None:
+            return          # 老服务端 / 单测里的假连接：当没收到
+        try:
+            note(game_now, wall_now, entries)
+        except Exception as error:             # noqa: BLE001 —— 不许带崩收包循环
+            self.log(f"!! 喂移动平台相位抛了 {error!r}")
+
     def _reply(self, data, addr):
         if self.sock is None:
             return
@@ -1028,6 +1101,8 @@ class UdpSyncServer:
             self._on_hello(data, addr, now)
         elif kind == MSG_PRESENCE:
             self._on_presence(data, addr, now)
+        elif kind == MSG_MOVER_PHASE:
+            self._on_mover_phase(data, addr, now)
         elif kind == MSG_PING:
             with self._lock:
                 endpoint = self._by_addr.get(addr)

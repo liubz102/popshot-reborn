@@ -6858,22 +6858,52 @@ def _reportable_speed(before, body, air_stepped=True):
     return vx, vy
 
 
-def _mover_clock(room):
-    """本局开打到现在多少毫秒 —— **移动平台的相位**（X_Mod §73）。拿不到返回 `None`。
+def _mover_clock(room, terrain):
+    """**移动平台的相位**：客户端 `LinkPath` 之后过了多少毫秒（X_Mod §73 / §74）。拿不到返回 `None`。
 
     ★ 客户端的相位原点是「**它自己把地图载完**那一刻」：`MapObject::LinkPath`
-      （`0x511d60`）在载图收尾那一遍里对每个对象记下 `t0 = 当前时刻`，之后
-      `PathFollower::GetPos`（`0x549bec`）一律算 `now − t0`。协议里**没有**
-      任何同步移动平台的包（`packet_api.md` 查遍了），所以严格说每台机器的
-      相位都差一个「它自己的载图耗时」。
-    ⇒ 服务端能拿到的、和客户端同一个事件的最近的锚点就是**开局**。误差 = 载图耗时：
-      鲤鱼 289 px 走 5000 ms，差 300 ms 也只有 17 px，比弹体本身还小。
-    ⇒ 返回 `None` 时全套判定退回「不知道有移动平台」的老行为，一格不差。
+      （`0x511d60`）在 `World::LoadMapData` 收尾那一遍里对每个对象记下 `t0 = Timer()`，
+      之后 `PathFollower::GetPos`（`0x549bec`）一律算 `Timer() + t_off − t0`。协议里
+      **没有**任何同步移动平台的包，`Timer()` 走的又是 `GameContext+0xe0` 而不是墙钟，
+      多人房里每台机器还各差一个「它自己的载图耗时」。
+
+    取值顺序（D55，用户 2026-09-22 拍板**按房主**）：
+
+    1. **房主报的**（`room.host_seat`）—— `bshook` 在 LinkPath 收尾的站点（`0x511d97`）
+       记下 `t0`，每秒经 UDP 旁路报 `Timer() − t0`（`Conn.note_mover_phase`）。
+       鱼在房主屏幕上在哪，判定就按哪算。房主掉线时**复用大厅那套转移逻辑**
+       （`lobby.leave`：转给还在的最小座位号、跳过 bot），这里每次现读 `host_seat`，
+       不自己记人，所以换了房主下一格就跟着换。
+    2. **开局估计**：`room.quest.started_at`（房主没报：老客户端 / 没中继 / UDP 被挡）。
+       误差 = 客户端 LinkPath → 报 `0x0403` → 服务端收齐建 `RoomQuest` 这一段。
+    3. 都没有 → `None`，全套判定退回「不知道有移动平台」的老行为，一格不差。
+
+    ★★ 会话 29 那版写的是 `getattr(room, "started_at")`，而字段在 **`room.quest`** 上
+      ⇒ 永远 `None`，整套判定从来没启用过（用户 2026-09-22 报「手雷照样穿过鲤鱼」，§74）。
+      `test_moverphase.py` 现在钉着「有 quest 就必须返回整数」。
+    ★ `t_off`（每块地形自己的相位偏移）**不在这里加**，`Mover.rider_center()` 自己加。
+    ★ 这张图没有移动平台就直接 `None` —— 相位对它没有意义，也省得每颗弹每格都去翻座位。
     """
-    started = getattr(room, "started_at", None)
+    movers = getattr(terrain, "movers", None)
+    if not movers:
+        return None
+    now = _now()
+    seats = getattr(room, "seats", None) or ()
+    host = getattr(room, "host_seat", None)
+    seat = seats[host] if (host is not None and 0 <= host < len(seats)) else None
+    # bot 的 `BotConn` 没有这一格；老客户端 / 没中继的真人是 `None`。
+    phase = getattr(getattr(seat, "conn", None), "mover_phase", None)
+    if phase:
+        for mover in movers:
+            got = phase.get(mover.handle)
+            if got is not None:
+                # 同一遍 LinkPath 里所有对象的 `t0` 是同一帧的 `Timer()`，
+                # 所以对上任何一条路径就等于对上了整张图。
+                return int(got[1] + (now - got[0]) * 1000.0)
+    started = getattr(getattr(room, "quest", None), "started_at", None)
     if started is None:
         return None
-    return int((_now() - started) * 1000.0)
+    return int((now - started) * 1000.0)
 
 
 def _path_blocked(terrain, x0, y0, shot, radius=0.0, t_ms=None):
@@ -7290,7 +7320,7 @@ def _breakable_option(room, machine, weapon, terrain, solve, x, y):
             continue
         impact = _shot_impact(terrain, mx, my, shot,
                               float(getattr(weapon, "size", 0.0) or 0.0),
-                              t_ms=_mover_clock(room))
+                              t_ms=_mover_clock(room, terrain))
         if impact is None:
             continue
         preview = botbreak.preview_damage(
@@ -7361,7 +7391,7 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
             continue
         if (not BOT_DIAG_FIRE_ANYWHERE
                 and _path_blocked(terrain, mx, my, shot, weapon.size,
-                                  t_ms=_mover_clock(room))):
+                                  t_ms=_mover_clock(room, terrain))):
             continue
         best = Engagement(index, point, shot, span,
                           math.hypot(velocity[0], velocity[1]), radius)
@@ -7438,7 +7468,7 @@ def _mob_engagement(room, machine, weapon, terrain, solve, x, y):
         if shot is None or _outlives_fuse(weapon, shot):
             continue
         if _path_blocked(terrain, gx, gy, shot, weapon.size,
-                         t_ms=_mover_clock(room)):
+                         t_ms=_mover_clock(room, terrain)):
             continue
         best = Engagement(MOB_SEAT, (mx_, my_), shot, span, 0.0,
                           MOB_HIT_RADIUS + float(weapon.size or 0.0))
@@ -7470,7 +7500,7 @@ def _smoke_engagement(room, machine, seat_index, weapon, terrain, solve, x, y):
         if shot is None or _outlives_fuse(weapon, shot):
             continue
         if _path_blocked(terrain, mx, my, shot, weapon.size,
-                         t_ms=_mover_clock(room)):
+                         t_ms=_mover_clock(room, terrain)):
             continue
         return Engagement(index, (tx, ty), shot, span, 0.0,
                           _hit_radius(room, index, weapon))
@@ -8160,8 +8190,9 @@ def _mover_contact(terrain, ax, ay, bx, by, radius, t_ms):
     steps = max(1, int(span // BOT_SHELL_TERRAIN_STEP))
     best = None
     for mover in movers:
-        cx, cy = mover.position_at(t_ms)
         for rider in mover.riders:
+            # ★ 中心按 rider 算（各自的 `t_off` / 相对模式，§74），不是路径点。
+            cx, cy = mover.rider_center(rider, t_ms)
             left = math.floor(cx - rider.sw / 2.0)
             top = math.floor(cy - rider.sh / 2.0)
             # 采样点带着 `offsets` 一起动，框先按最大偏移放宽，别漏掉边缘那一下
@@ -8916,7 +8947,7 @@ def _shell_step(room, shell, terrain, bodies):
         best_t = mob[0]
         best = (("mob", mob[1]), None)
     ground_t, free_t = _terrain_contact(terrain, ax, ay, bx, by, radius,
-                                        t_ms=_mover_clock(room))
+                                        t_ms=_mover_clock(room, terrain))
     if ground_t is not None and (best_t is None or ground_t < best_t):
         if _resolve_terrain_block(shell, terrain, ax, ay, bx, by,
                                   ground_t, free_t):
@@ -9798,9 +9829,9 @@ def _split_shell(room, machine, shell, point, victim_seat, tick):
         _emit(machine, packet)
         max_ticks = _shell_max_ticks(terrain, shot, slice_weapon)
         for offset in range(slice_weapon.shots):
+            # ★ 碎片的时钟原点就是**母弹炸开的这一格**（D106）：
+            #   收方也是在处理这一发 `rpFire` 的那一帧才建它们的。
             machine.pending_shots.append(
-                # ★ 碎片的时钟原点就是**母弹炸开的这一格**（D106）：
-                #   收方也是在处理这一发 `rpFire` 的那一帧才建它们的。
                 Shell(handle + offset, fire_seq, slice_weapon,
                       botsync.FIRE_GROUP_EVERYONE, point[0], point[1],
                       shot, _tick_moment(shell, tick), max_ticks,

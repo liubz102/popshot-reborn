@@ -649,5 +649,38 @@ class SeatGetterPatchTest(unittest.TestCase):
                              "%08X 调完没有 test al,al" % caller)
 
 
+class MoverLinkPatchTest(_JmpGuardSiteMixin, unittest.TestCase):
+    """X_Mod §74 —— `MapObject::LinkPath` 收尾那条 `mov [esi+0x90], eax`（存 t0）。
+
+    `bshook` 在这儿记下每个挂在路径上的对象的 (link, t0, t_off)，经 UDP 旁路报给
+    服务端，服务端的移动平台判定按客户端**实际的**相位走。
+    """
+
+    PREFIX = "MOVERLK"
+    INSTALLER = "try_patch_mover_link"
+
+    @classmethod
+    def setUpClass(cls):
+        super(MoverLinkPatchTest, cls).setUpClass()
+        cls.resume_to = c_define(cls.src, "MOVERLK_RESUME_TO")
+
+    def test_the_resume_target_is_the_epilogue(self):
+        # 偷走的正好是那条 6 字节的 mov，落点就是 pop edi / pop esi / ret
+        self.assertEqual(self.va + self.stolen, self.resume_to)
+        self.assertEqual(b"\x5f\x5e\xc3", read_va(self.img, self.resume_to, 3))
+
+    def test_the_site_sits_right_after_the_timer_call(self):
+        # 前一条是 `call 0x40a01e`（Timer()）—— 站点上 eax 就是刚取的 t0
+        self.assertEqual(b"\xe8", read_va(self.img, self.va - 5, 1))
+        rel = struct.unpack("<i", read_va(self.img, self.va - 4, 4))[0]
+        self.assertEqual(0x0040A01E, self.va + rel)
+
+    def test_the_site_is_inside_link_path(self):
+        # 函数头 `push esi / mov esi,ecx / mov eax,[esi+0xfc] / test eax,eax / je`：
+        # 只有 [this+0xfc]（挂在哪个对象上）非零的对象才走到站点
+        head = read_va(self.img, 0x00511D60, 13)
+        self.assertEqual(b"\x56\x8b\xf1\x8b\x86\xfc\x00\x00\x00\x85\xc0\x74\x31", head)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -31,11 +31,14 @@ def _mask_blob(width, height, value=2):
     return base64.b64encode(zlib.compress(bytes(raw), 9)).decode("ascii")
 
 
-def _mover(pts, loop=0, x=100.0, y=200.0, rider=(20, 10), scale=(1.0, 1.0)):
+def _mover(pts, loop=0, x=100.0, y=200.0, rider=(20, 10), scale=(1.0, 1.0),
+           t_off=0, rel=0, rider_xy=(0.0, 0.0)):
     return mapdata.Mover({
         "handle": 1, "x": x, "y": y, "loop": loop, "pts": pts,
         "riders": [{"handle": 2, "w": rider[0], "h": rider[1],
                     "sx": scale[0], "sy": scale[1],
+                    "x": rider_xy[0], "y": rider_xy[1],
+                    "t_off": t_off, "rel": rel,
                     "mask": _mask_blob(rider[0], rider[1])}],
     })
 
@@ -118,6 +121,53 @@ class MoverCollision(unittest.TestCase):
         self.assertEqual(0, small.cell_at(50 + 18, 200, 0))
 
 
+class RiderPhase(unittest.TestCase):
+    """每块地形自己的相位偏移 / 相对模式（§74）—— `Mover.rider_center()`。
+
+    钉的是 `PathFollower::GetPos`（`0x549bec`）和 `GetWorldPos`（`0x47c6bf`）：
+    `elapsed = Timer() + t_off − t0`；相对模式 = 自身坐标 + (Eval(elapsed) − Eval(0))。
+    """
+
+    def test_t_off_shifts_the_phase(self):
+        """偏移 1000 ms 的 rider 在 t=0 时已经走到路径 t=1000 的位置。"""
+        mv = _mover(TWO_POINT, t_off=1000)
+        rider = mv.riders[0]
+        self.assertEqual(mv.position_at(1000), mv.rider_center(rider, 0))
+        self.assertEqual(mv.position_at(3500), mv.rider_center(rider, 2500))
+        plain = _mover(TWO_POINT)
+        self.assertEqual(plain.position_at(2500),
+                         plain.rider_center(plain.riders[0], 2500))
+
+    def test_relative_mode_adds_the_displacement_to_its_own_position(self):
+        """相对模式的基线是 `Eval(0)`，**不是** `Eval(t_off)`（客户端相对分支先算一次 t=0）。"""
+        mv = _mover(TWO_POINT, rel=1, rider_xy=(500.0, 600.0))
+        rider = mv.riders[0]
+        self.assertEqual((500.0, 600.0), mv.rider_center(rider, 0))
+        # smoothstep 中点正好走了一半：位移 +50，加在自身坐标上，不是路径点 (100, 200)
+        self.assertEqual((550.0, 600.0), mv.rider_center(rider, 2000))
+        shifted = _mover(TWO_POINT, rel=1, rider_xy=(500.0, 600.0), t_off=2000)
+        self.assertEqual((550.0, 600.0), shifted.rider_center(shifted.riders[0], 0))
+
+    def test_cell_at_follows_the_rider_center(self):
+        mv = _mover(TWO_POINT, rel=1, rider_xy=(500.0, 600.0))
+        self.assertEqual(2, mv.cell_at(500, 600, 0))
+        self.assertEqual(0, mv.cell_at(550, 600, 0))
+        self.assertEqual(2, mv.cell_at(550, 600, 2000))
+        # 路径点本身在相对模式下**没有**地形
+        self.assertEqual(0, mv.cell_at(100, 200, 0))
+
+    def test_negative_time_takes_the_c_modulo(self):
+        """客户端 `Path::Eval` 取模是 `cdq/idiv`（`0x548d1a`）：t<0 余数为负，从第 0 段往前外推。"""
+        self.assertEqual(-3, mapdata._cmod(-3, 10))
+        self.assertEqual(-3, mapdata._cmod(-13, 10))
+        self.assertEqual(7, mapdata._cmod(17, 10))
+        mv = _mover(TWO_POINT)
+        self.assertEqual(mv.position_at(0), mv.position_at(-8000))
+        # u = −1 的 Hermite 外推：h00=−4, h01=5 ⇒ x = 100 + (−4·−50 + 5·50) = 550。
+        # Python 的 `%` 会把 −4000 变成 4000 ⇒ 落在 P1 = 150，那就和客户端不一样了。
+        self.assertAlmostEqual(550.0, mv.position_at(-4000)[0], places=6)
+
+
 class RealMaps(unittest.TestCase):
     """拿真产物核一遍 —— 提取器和服务端两边的口径要对上。"""
 
@@ -156,6 +206,36 @@ class RealMaps(unittest.TestCase):
         self.assertTrue(self.terrain.is_solid(x, y, 0))
         # 半个周期之后鱼飘到另一头，同一点就空了
         self.assertFalse(self.terrain.blocks_bullet(x, y, 5000))
+
+    def test_the_carp_is_absolute_with_no_offset(self):
+        """庆典三张的挂路径对象 `t_off` / `rel` 全是 0（§74 的全库扫描）。"""
+        self.assertEqual(8, mapdata.FORMAT)
+        rider = self.terrain.movers[0].riders[0]
+        self.assertEqual((0, 0), (rider.t_off, rider.rel))
+        self.assertEqual(self.terrain.movers[0].position_at(0),
+                         self.terrain.movers[0].rider_center(rider, 0))
+
+    def test_quest_level6_rides_in_relative_mode(self):
+        """全库唯一一个 `rel=1`：t=0 时就在自身坐标 (587, 1203) 上，不在路径点上。"""
+        terrain = mapdata.load("Quest_level6")
+        if terrain is None:
+            self.skipTest("没有 Quest_level6 的地形产物")
+        riders = [(mv, r) for mv in terrain.movers for r in mv.riders]
+        self.assertEqual(1, len(riders))
+        mv, rider = riders[0]
+        self.assertEqual(1, rider.rel)
+        self.assertEqual((587.0, 1203.0), mv.rider_center(rider, 0))
+
+    def test_untitled_carries_a_5000ms_offset(self):
+        """全库唯一一个 `t_off≠0`：`Untitled` 那块在 t=0 时已经走到路径 t=5000 的位置。"""
+        terrain = mapdata.load("Untitled")
+        if terrain is None:
+            self.skipTest("没有 Untitled 的地形产物")
+        riders = [(mv, r) for mv in terrain.movers for r in mv.riders]
+        self.assertEqual(1, len(riders))
+        mv, rider = riders[0]
+        self.assertEqual((5000, 0), (rider.t_off, rider.rel))
+        self.assertEqual(mv.position_at(5000), mv.rider_center(rider, 0))
 
     def test_every_map_with_movers_parses(self):
         """全库 24 条路径都要能算出位置，不能有除零 / 越界。"""

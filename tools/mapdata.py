@@ -83,7 +83,11 @@ DIR_TYPE = {"TERRAIN": 200, "LAYER": 202, "COVER": 201,
 #: 7：加了 `movers` = **移动平台**（挂在 type 111 `PathObj` 上的地形，X_Mod §73）。
 #:    在此之前服务端完全不知道它们存在 —— bot 的手雷会从「云之桥」那条鲤鱼身上
 #:    穿过去炸在地面（用户 2026-09-22 报）。
-FORMAT = 7
+#: 8：`movers[].riders[]` 多了 `x` / `y`（对象自身坐标）、`t_off`（`.map` v17 组第 2 个
+#:    i32 = `[obj+0x94]`，相位偏移毫秒）、`rel`（第 3 个 = `[obj+0x98]`，相对模式）。
+#:    客户端 `PathFollower::GetPos` 算的是 `Timer() + t_off − t0`，相对模式还要加回
+#:    自身坐标（X_Mod §74）；7 那一版把后两个字段丢了，`Quest_level6` 那块算错。
+FORMAT = 8
 
 #: ★★★ **可破坏物**（`Maps/*/Breakable/*.png`，客户端类 `BreakableObj`）。
 #: 全 174 张图里共 677 个，分布在 67 张图上。
@@ -182,10 +186,18 @@ def _read_obj_blob(blob, ver):
     r = Reader(blob)
     obj = {}
     if ver >= 17:
-        # ★ 第一个 i32 = **挂在哪个对象上**（`[this+0xfc]`）。`MapObject::LinkPath`
-        #   （`0x511d60`）拿它去 World 里找那个对象，把它的 `IPath` 子对象
-        #   （偏移 +0x9c）交给自己的 `PathFollower` —— 这就是**移动平台**（§73）。
-        obj["link"] = r.i32(); r.i32(); r.i32()
+        # ★ v17 组三个 i32（`MapObj::Deserialize` 0x511dc1..0x511de2）：
+        #   [0] **挂在哪个对象上**（`[this+0xfc]`）—— `MapObject::LinkPath`（`0x511d60`）
+        #       拿它去 World 里找那个对象，把它的 `IPath` 子对象（偏移 +0x9c）交给
+        #       自己的 `PathFollower` —— 这就是**移动平台**（§73）；
+        #   [1] **相位偏移**毫秒（`[this+0x94]`）—— `PathFollower::GetPos`（`0x549bec`）
+        #       算 `elapsed = Timer() + 它 − t0`；
+        #   [2] **相对模式**（`[this+0x98]`，客户端只存低字节）—— 非零时位置 =
+        #       自身坐标 + (Eval(elapsed) − Eval(0))，见 `GetWorldPos`（`0x47c6bf`）。
+        #   FORMAT 7 只留了 [0]，后两个被丢掉（X_Mod §74）。
+        obj["link"] = r.i32()
+        obj["t_off"] = r.i32()
+        obj["rel"] = r.i32() & 0xFF
     if ver >= 12:
         obj["x"] = r.f32()
         obj["y"] = r.f32()
@@ -423,6 +435,12 @@ def collect_movers(objects, masks, ver):
             ("h", mask["height"]),
             ("sx", round(float(obj.get("sx", 1.0)), 4)),
             ("sy", round(float(obj.get("sy", 1.0)), 4)),
+            # ★ 自身坐标只在**相对模式**下参与（`GetWorldPos` 加回去）；
+            #   `t_off` / `rel` 见 `_read_obj_blob` 的说明（§74）。
+            ("x", round(float(obj.get("x", 0.0)), 3)),
+            ("y", round(float(obj.get("y", 0.0)), 3)),
+            ("t_off", int(obj.get("t_off") or 0)),
+            ("rel", int(obj.get("rel") or 0)),
             ("mask", _blob(mask["cells"])),
         )))
     out = []

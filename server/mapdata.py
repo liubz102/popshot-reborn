@@ -71,7 +71,9 @@ import zlib
 #:    **`FallDown`** —— 这张图掉出去会不会死，§143）。
 #: 7：多一层 `movers` = **移动平台**（挂在 type 111 路径上的地形，X_Mod §73）。
 #:    在此之前服务端完全不知道有这种东西，bot 的手雷会从它们身上穿过去。
-FORMAT = 7
+#: 8：`movers[].riders[]` 多了 `x` / `y` / `t_off` / `rel`（自身坐标 / 相位偏移 /
+#:    相对模式，X_Mod §74）—— 位置改成**按 rider** 算（`Mover.rider_center()`）。
+FORMAT = 8
 
 #: 找不到精确名、**也没人告诉我们难度**时按这个顺序退。
 #: ⚠ 这只是最后的兜底 —— 闯关房请一律把难度传进来（见 `DIFFICULTY_SUFFIX`）。
@@ -254,13 +256,17 @@ class Breakable(object):
 
 
 class Rider(object):
-    """挂在移动平台上的一块地形：形状（掩码）+ 缩放。
+    """挂在移动平台上的一块地形：形状（掩码）+ 缩放 + 它自己的相位偏移 / 模式。
 
-    引擎画它的时候是「按 `|缩放|` 把精灵缩成 `sw×sh`，再以路径算出来的点为**中心**
-    摆上去」，掩码跟着一起缩 —— 所以这里也按同一口径最近邻取样。
+    引擎画它的时候是「按 `|缩放|` 把精灵缩成 `sw×sh`，再以 `Mover.rider_center()`
+    算出来的点为**中心**摆上去」，掩码跟着一起缩 —— 所以这里也按同一口径最近邻取样。
+
+    `t_off` / `rel` / `x` / `y` 是 `.map` 里每个对象自己带的（v17 组，X_Mod §74）：
+    客户端 `PathFollower::GetPos`（`0x549bec`）算 `elapsed = Timer() + t_off − t0`，
+    相对模式（`rel` 非零）再由 `GetWorldPos`（`0x47c6bf`）把自身坐标加回去。
     """
 
-    __slots__ = ("handle", "w", "h", "sw", "sh", "mask")
+    __slots__ = ("handle", "w", "h", "sw", "sh", "mask", "x", "y", "t_off", "rel")
 
     def __init__(self, record):
         self.handle = int(record.get("handle", 0))
@@ -269,6 +275,10 @@ class Rider(object):
         self.sw = max(1, int(round(self.w * abs(float(record.get("sx", 1.0))))))
         self.sh = max(1, int(round(self.h * abs(float(record.get("sy", 1.0))))))
         self.mask = _unblob(record["mask"])
+        self.x = float(record.get("x", 0.0) or 0.0)
+        self.y = float(record.get("y", 0.0) or 0.0)
+        self.t_off = int(record.get("t_off", 0) or 0)
+        self.rel = int(record.get("rel", 0) or 0)
 
     def cell(self, cx, cy, x, y):
         """中心在 (cx, cy) 时，世界点 (x, y) 那一格的值；不在它身上返回 0。"""
@@ -288,6 +298,12 @@ class Rider(object):
         return (self.mask[i >> 2] >> ((i & 3) * 2)) & 3
 
 
+def _cmod(a, b):
+    """C 的 `%`（`cdq / idiv`）：余数跟被除数同号。`b` 必须为正。"""
+    r = abs(int(a)) % b
+    return -r if a < 0 else r
+
+
 class Mover(object):
     """一条**移动平台**：`PathObj`（type 111）那条路径 + 挂在它上面的地形（X_Mod §73）。
 
@@ -302,6 +318,8 @@ class Mover(object):
 
     1. 累计时间表 `cum[i] = ms[0] + … + ms[i]`，`总时长 = cum[-1]`（`0x548deb` 就这么建的）；
     2. `loop == 0`：`t %= 总`；`loop == 1`（乒乓）：`t %= 2×总`，过半就 `t = 2×总 − t − 1`；
+       ★ 取模是 `cdq / idiv`（`0x548d1a`）= **C 的有符号取模**，`t` 为负时余数也为负
+       （`_cmod()`），不是 Python 那种恒非负的 `%`；
     3. `i = upper_bound(cum, t)`，段内进度 `u = (t − 段起点) / ms[i]`；
     4. `w = u ** (1 / ease)` —— 客户端 `0x5ce3a0` 就是 `pow(底, 1/指数)`，
        原版这几条路径 `ease` 全是 1.0 ⇒ `w == u`；
@@ -310,12 +328,15 @@ class Mover(object):
        ★ 切线只有 `kind == 1` 的点才从文件里读，其余是 0 ⇒ 退化成 **smoothstep**（两头慢中间快）。
     6. 最后加上 `PathObj` 自己的世界坐标。
 
-    ## ⚠ 时间原点
+    ## ⚠ 时间原点（X_Mod §74 / D55）
 
-    客户端的 `t0` 是**它自己把地图载完**那一刻，协议里没有任何同步包 ——
-    也就是说严格来说每台机器的相位都差一个「载图耗时」。服务端只能用
-    **本局开打到现在**当 `t_ms`（`RoomState.started_at`），误差就是那点载图耗时；
-    鲤鱼 289 px 走 5000 ms ⇒ 差 300 ms 也只有 17 px，比弹体本身还小。
+    客户端的 `t0` 是**它自己把地图载完**那一刻（`MapObject::LinkPath` 收尾 `0x511d97`），
+    用的时钟是 `GameContext+0xe0`（不是墙钟），协议里没有任何同步包 —— 每台机器的
+    相位各差一个「载图耗时」。所以 `t_ms` 的口径定为「**客户端 LinkPath 之后过了多少
+    毫秒**」，由谁给：① `bshook` 在那个站点记下 `t0`、每秒报 `Timer() − t0`
+    （`Conn.note_mover_phase()`）；② 报不上来时 `bot._mover_clock()` 退回
+    `RoomQuest.started_at`（开局估计）。每块地形自己的 `t_off` **不在 `t_ms` 里**，
+    `rider_center()` 自己加。
     """
 
     __slots__ = ("handle", "x", "y", "loop", "pts", "cum", "total", "riders")
@@ -348,11 +369,11 @@ class Mover(object):
         total = self.total
         t = int(t_ms)
         if self.loop == 1:
-            t %= 2 * total
+            t = _cmod(t, 2 * total)
             if t >= total:
                 t = 2 * total - t - 1
         else:
-            t %= total
+            t = _cmod(t, total)
         i = bisect.bisect_right(self.cum, t)
         if i >= n:
             i = n - 1
@@ -373,12 +394,25 @@ class Mover(object):
         py = h00 * pts[i][1] + h10 * pts[i][4] + h01 * pts[j][1] + h11 * pts[j][4]
         return (self.x + px, self.y + py)
 
+    def rider_center(self, rider, t_ms):
+        """`t_ms`（LinkPath 之后的毫秒，**不含**偏移）这一刻，`rider` 的中心在世界的哪个点。
+
+        逐指令抄客户端（X_Mod §74）：`PathFollower::GetPos`（`0x549bec`）算
+        `elapsed = Timer() + t_off − t0`；绝对模式直接 `Eval(elapsed)`；相对模式
+        （`[obj+0x98]` 非零）= `Eval(elapsed) − Eval(0)`，再由 `GetWorldPos`（`0x47c6bf`）
+        加回自身坐标 `[obj+0x34/0x38]`。★ 相对模式的基线是 `Eval(0)`，不是 `Eval(t_off)`。
+        """
+        t = int(t_ms) + rider.t_off
+        if not rider.rel:
+            return self.position_at(t)
+        px, py = self.position_at(t)
+        bx, by = self.position_at(0)
+        return (rider.x + px - bx, rider.y + py - by)
+
     def cell_at(self, x, y, t_ms):
         """`t_ms` 这一刻，世界点 (x, y) 落在这条路径上哪块地形的哪一格；没落上返回 0。"""
-        if not self.riders:
-            return 0
-        cx, cy = self.position_at(t_ms)
         for rider in self.riders:
+            cx, cy = self.rider_center(rider, t_ms)
             got = rider.cell(cx, cy, x, y)
             if got:
                 return got

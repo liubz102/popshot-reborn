@@ -2,11 +2,27 @@
 
 **只保留当前状态，全文 ≤ 150 行。** 做完的事从「正在做」挪走，不留历史；流水账进 `sessions/`。
 
-最后更新：2026-09-21（会话 29）
+最后更新：2026-09-22（会话 30）
 
 ---
 
 ## 现在在哪
+
+**★★ 会话 30（2026-09-22，`sessions/2026-09-22-01.md`）：X13 · bot 手雷仍穿过云桥鲤鱼 —— 查清 + 修完（§74 / D55）。
+两套运行时全量 **4301 条绿**（4259 → +42）。⏳ 还差：关客户端后 `hook\build.bat` 重编 dll、`stop.bat` + `start.bat`。**
+
+1. **会话 29 那套判定是死代码**：`_mover_clock(room)` 找的是 `room.started_at`，字段在 `room.quest` 上
+   ⇒ 永远 `None`，鲤鱼碰撞一次都没生效过（「经常穿过」其实是每发都穿）。改成 `_mover_clock(room, terrain)`
+   按**房主**报的相位取、没报退回开局估计（D55，用户拍板），`test_moverphase.RegressionTests` 拿真 `Room + RoomQuest` 钉着。
+2. **相位改由 hook 报**：`bshook.c` 在 `MapObject::LinkPath` 收尾 `0x511d97` 记 `(link, t0, t_off)`，记表后立刻、
+   之后每秒经 UDP 旁路发 `MSG_MOVER_PHASE`（kind 7）；`relay.py` 原样转；`Conn.note_mover_phase()` 存、发 `0x0400` 清。
+   相位一律按**房主**报的（`room.host_seat` 每次现读，房主掉线随 `lobby.leave` 的转移逻辑换人），房主没报退回
+   `quest.started_at`。逃生门 `BSHOOK_NO_MOVER_PHASE=1`。
+3. **提取器补了 `t_off` / `rel`**（`.map` v17 组后两个 i32，原来丢了）：产物 FORMAT 7→8 全部重生成，
+   `Mover.rider_center()` 按 rider 算（`Untitled` 偏移 5000、`Quest_level6` 相对模式）；`Path::Eval` 取模改成有符号（`_cmod`）。
+- ★ `bshook.c` 变了但 **dll 还没重编**（客户端开着，LNK1104）；已做只编译不链接的校验（`cl /c` exit 0）。
+- ★★ **产物已经是 FORMAT 8，而跑着的服务端还是 FORMAT 7 的代码** ⇒ 它现在对**新载入**的地图读不到地形
+  （`index.json` 格式对不上就当没数据）—— 尽快 `stop.bat` + `start.bat`。
 
 **★★ 会话 29（2026-09-21，`sessions/2026-09-21-04.md`）：用户复看 V83 + 找来原版截图，返工三处。
 **已 `--install` 进 `Pack_develop`，守卫测试两套运行时绿；⏳ 还差 `stop.bat` + 重打 `Maps~Festival.pkn`**
@@ -228,7 +244,15 @@ X5 的 V39~V41、X4 的 V36~V38、X1 / X2 的 V15~V25 仍在等（多数是**观
 | V84 | 看 `logs/map_festival_fill/preview/X_*.png` | 灯笼串右挂点落在红瓦平台右沿；绳上五块牌读作「炮炮火枪手」；鲤鱼是从原版截图抠的 | ✅ 灯笼串 / 圆牌用户 2026-09-21 已实机看过（自己重打过一次卷） |
 | V85 | 你说一声「可以停游戏」，agent 跑 `stop.bat` + `build-pack.bat`（这次 `Maps~Festival.pkn` **和** `Data~.pkn` 都要重打，改了 `Chinese.ini`），再跑两套运行时全量 | 全绿 | ⏳ **等你点头**（都已进 `Pack_develop`，卷还没重打 ⇒ 游戏里还是旧的） |
 | V86 | V85 之后进游戏看 | 「选择地图」里读作 节日庆典 / 开幕 · 云桥 · 烟火晚会；云桥里的鲤鱼 | ⏳ 等 V85 |
-| V87 | ★ 若要补服务端的移动平台（§72）：先实机测相位 —— 记下进图时刻，再看鱼在路径的哪一端 | 能推出客户端动画的时间原点 | ⏳ **等你定要不要做** |
+| V87 | ~~先实机测相位~~ → 会话 30 改成 hook 直接报（§74 / D55），不用人测 | —— | ✅ 用别的办法解掉了 |
+
+**X13 · bot 认识移动平台（会话 30）—— ★ `bshook.dll` 和服务端都换了：关客户端 → `hook\build.bat` → `stop.bat` → `start-debug.bat`**：
+
+| # | 怎么做 | 期望看到 | 状态 |
+|---|---|---|---|
+| V88 | 起客户端看 `logs/bshook_*.log`；进「云桥」 | 一行「★移动平台相位 @ 00511D97」；进图后一行「MOVER 报 1 条相位（link=296 载图后 … ms …）」 | ⏳ **等你关客户端** |
+| V89 | 云桥 + bot 打一局：站到鱼背上 / 让 bot 往鱼上扔手雷 | 手雷**炸在鱼身上**（不再穿过去炸地面），站鱼背上会被炸到；`logs/online.log`（`--verbose`）有「移动平台相位 账号=… 路径 296 载图后 N ms（游戏时钟 − 墙钟 = D ms）」 | ⏳ **只能你来** |
+| V90 | 对照：`BSHOOK_NO_MOVER_PHASE=1` 起客户端再打一局 | 日志里没有 MOVER 行，服务端退回开局估计；命中率明显差于 V89 就是 hook 在起作用。把 V89 里那个 D 值告诉我，回填 §74 | ⏳ 可选 |
 
 ★ 落水溅水（`FestivalWaterDamage00`）agent 只核到「掉下去会死」，溅水那一瞬没截到；F02 底部水波只在屏幕最底边一条，也要你看。
 ★ 改任何一张：改 `build.py` / `effects.py` → `build.py --install` → `stop.bat` → `tools\build-pack.bat`（只重打这一卷）。
