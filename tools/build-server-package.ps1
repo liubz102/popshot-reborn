@@ -251,6 +251,14 @@ try {
                   -Target (Join-Path $OutputDirectory 'tools\serverctl.sh') -Kind 'unix'
     Copy-TextFile -Source (Join-Path $Template 'server.config') `
                   -Target (Join-Path $OutputDirectory 'config\server.config') -Kind 'unix'
+    # update.config：下发给玩家更新器的「更新源」（manifest 地址 + 下载加速代理）。
+    # 更新器跑升级前会来取一份（GET /api/update-config），所以**服务端包必须带它**
+    # —— 没有它这台服务器就不下发更新源，玩家只能用自己包里那份老的。
+    # ★ 源是仓库根那一份，和客户端包**同一个文件**（用户 2026-09-22 拍板）：
+    #   内容上两边要的东西一模一样，分成两份模板迟早漂移成两套代理列表。
+    #   server.config 分两份是因为客户端侧和服务端侧的键根本不同，这里不是。
+    Copy-TextFile -Source (Join-Path $Root 'config\update.config') `
+                  -Target (Join-Path $OutputDirectory 'config\update.config') -Kind 'unix'
     Copy-TextFile -Source (Join-Path $Template 'README.md') `
                   -Target (Join-Path $OutputDirectory 'README.md') -Kind 'unix'
     # ★ 把这一版 hook 的 SHA-256 记进 server\manifest-hook.json（D85）——
@@ -357,7 +365,8 @@ SHA-256   $sha
             '详见 README.md。'
         )
     foreach ($must in @('BUILD.ver', 'config\server.config',
-                        'config\server-ClientFilter.config')) {
+                        'config\server-ClientFilter.config',
+                        'config\update.config')) {
         if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory $must) -PathType Leaf)) {
             throw "自检失败：$must 没写进包根"
         }

@@ -58,15 +58,19 @@ class GeneratedHeaderTests(unittest.TestCase):
         self.assertEqual(found, want)
 
     def test_updater_header_matches_config_py(self):
-        """★ `updater/src/ports.h`（更新器探针用的游戏服端口）也要一致。
+        """★ `updater/src/ports.h`（更新器用的两个端口）也要一致。
 
-        更新器只需要 GAME_PORT 一个号，但一样只认 server/config.py 这个源
-        （分叉 = 探针连错端口 = 自动更新整条链失灵）。
+        更新器只需要两个号，但一样只认 server/config.py 这个源：
+          GAME_PORT             版本探针（分叉 = 探针连错端口 = 自动更新失灵）
+          DEFAULT_REGISTER_PORT 向服务器要 update.config 的 HTTP 端口的缺省值
+                                （分叉 = 问不到更新源 = 悄悄退回本地那份）
         """
         text = repo_file(UPDATER_HEADER)
         found = dict(re.findall(r"#define\s+POPSHOT_(\w+)\s+(\d+)", text))
-        self.assertEqual(found,
-                         {"GAME_PORT": str(server_config.GAME_PORT)})
+        self.assertEqual(found, {
+            "GAME_PORT": str(server_config.GAME_PORT),
+            "DEFAULT_REGISTER_PORT": str(server_config.DEFAULT_REGISTER_PORT),
+        })
 
     def test_the_generator_reports_it_is_up_to_date(self):
         """生成器自己的 `--check` 也要说「最新」（它是 build.bat 的守门人）。"""

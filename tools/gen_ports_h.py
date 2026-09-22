@@ -88,26 +88,36 @@ def render():
     return "\n".join(lines)
 
 
+#: `updater/src/ports.h` 里要出现的号。更新器用两个：
+#:   GAME_PORT             —— 版本探针（重演一次握手，问「该升到哪版」）
+#:   DEFAULT_REGISTER_PORT —— 向服务器要 `config/update.config` 的 HTTP 端口
+#:                            的**缺省值**（server.config 的 server_register_port
+#:                            填了就用填的，这里只是那一行缺失时的兜底）
+UPDATER_PORT_KEYS = ("GAME_PORT", "DEFAULT_REGISTER_PORT")
+
+
 def render_updater():
-    """updater\\src\\ports.h —— 更新器探针只连游戏服，只发 GAME_PORT。"""
+    """updater\\src\\ports.h —— 更新器只需要 UPDATER_PORT_KEYS 这几个号。"""
     table = server_config.port_table()
-    port = table["GAME_PORT"]
-    note = NOTES.get("GAME_PORT", "")
-    return "\n".join([
+    width = max(len(name) for name in UPDATER_PORT_KEYS)
+    lines = [
         "/* ========================================================================",
         " *  ports.h —— 更新器用的端口（自动生成，不要手改）。",
         " *",
         " *  源头是 server/config.py，生成器是 tools/gen_ports_h.py。",
-        " *  更新器探针只需要游戏服端口；分叉会被 test/test_ports.py 抓住。",
+        " *  更新器只需要这几个号；分叉会被 test/test_ports.py 抓住。",
         " * ====================================================================== */",
         "#ifndef POPSHOT_UPDATER_PORTS_H",
         "#define POPSHOT_UPDATER_PORTS_H",
         "",
-        f"#define POPSHOT_GAME_PORT    {port}   /* {note} */",
-        "",
-        "#endif /* POPSHOT_UPDATER_PORTS_H */",
-        "",
-    ])
+    ]
+    for name in UPDATER_PORT_KEYS:
+        pad = " " * (width - len(name))
+        note = NOTES.get(name, "")
+        lines.append(f"#define POPSHOT_{name}{pad}  {table[name]}"
+                     + (f"   /* {note} */" if note else ""))
+    lines += ["", "#endif /* POPSHOT_UPDATER_PORTS_H */", ""]
+    return "\n".join(lines)
 
 
 def write_if_changed(path, want, banner, tag="ports"):

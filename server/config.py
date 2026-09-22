@@ -227,6 +227,14 @@ CONFIG_FILENAME = "server.config"
 #: 包根下集中放配置文件的子目录名。
 CONFIG_DIR = "config"
 
+#: 自动更新的「更新源」文件名（manifest 地址 + 下载加速代理列表）。
+#:
+#: ★ 服务端自己**不读**它 —— 它是**下发给客户端**的：更新器跑升级之前会来
+#: 取一份（``GET /api/update-config``，收包那头在 ``web/server.py``），
+#: 拿里面的 ``manifest_url`` 和代理列表决定从哪下游戏包。
+#: 开服的人改完这个文件，**不用重启服务端**，所有玩家下一次更新立刻生效。
+UPDATE_CONFIG_FILENAME = "update.config"
+
 #: ★ `server_address` 的默认值是一个**局域网示例地址**，不是 `127.0.0.1`。
 #: 填 `127.0.0.1` 的话「远程服务器」和「本机服务器」连的是同一台机器，
 #: 这个选项就等于没有 —— 玩家看到 `192.168.1.100` 才知道这里该填别人的地址。
@@ -337,6 +345,12 @@ def config_path(root: str | None = None) -> str:
     """``server.config`` 的完整路径（包根的 ``config`` 子目录下）。"""
     return os.path.join(os.path.abspath(root or PACKAGE_ROOT),
                         CONFIG_DIR, CONFIG_FILENAME)
+
+
+def update_config_path(root: str | None = None) -> str:
+    """``update.config`` 的完整路径（同上，写法照 ``versioning.client_filter_path``）。"""
+    return os.path.join(os.path.abspath(root or PACKAGE_ROOT),
+                        CONFIG_DIR, UPDATE_CONFIG_FILENAME)
 
 
 def _clean_port(value, key, warnings):

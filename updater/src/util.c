@@ -126,6 +126,77 @@ int wide_to_utf8(const wchar_t *src, char *dst, size_t cap)
     return n > 0 ? n - 1 : -1;
 }
 
+int utf8_to_wide(const char *src, size_t srclen, wchar_t *dst, size_t cap)
+{
+    int n;
+    size_t fit = srclen;
+
+    if (cap == 0) return -1;
+    /* UTF-8 BOM 吃掉（服务器那头原样回文件字节，文件可能带 BOM）。 */
+    if (srclen >= 3 && (unsigned char)src[0] == 0xEF &&
+        (unsigned char)src[1] == 0xBB && (unsigned char)src[2] == 0xBF) {
+        src += 3;
+        fit = srclen - 3;
+    }
+    n = MultiByteToWideChar(CP_UTF8, 0, src, (int)fit, dst, (int)(cap - 1));
+    if (n <= 0) {
+        /* ★ 输出缓冲放不下时 MultiByteToWideChar 返回 **0**，不是负数
+           —— 一律当成失败的话整份内容就悄悄没了（config.c 那边为这个
+           栽过一次：server.config 一长，server_address 就读不出来）。
+           UTF-8 里一个宽字符最少占 1 字节 ⇒ 截到 cap-1 字节一定放得下；
+           截断点要退回一个 UTF-8 起始字节上，别把一个汉字切两半。 */
+        if (fit > cap - 1) fit = cap - 1;
+        while (fit > 0 && ((unsigned char)src[fit] & 0xC0) == 0x80) fit--;
+        n = MultiByteToWideChar(CP_UTF8, 0, src, (int)fit, dst, (int)(cap - 1));
+    }
+    if (n <= 0) return -1;
+    dst[n] = 0;
+    return n;
+}
+
+void manifest_repo_label(const wchar_t *url, wchar_t *out, size_t cap)
+{
+    const wchar_t *p = url ? url : L"";
+    const wchar_t *scheme;
+    size_t n = 0, keep;
+    int slashes = 0;
+    int max_slashes = 2;          /* 域名 + 两段路径 = 停在第 3 个 / */
+
+    if (cap == 0) return;
+    out[0] = 0;
+    /* 去掉 scheme 和 www.，只留「域名 + 前两段路径」；域名正好是 github.com
+       时连它一起去掉，只剩 owner/repo：
+         https://github.com/liubz102/popshot-reborn/releases/latest/download/manifest.json
+           -> liubz102/popshot-reborn
+         https://oss.example.com/pkg/manifest.json
+           -> oss.example.com/pkg/manifest.json
+       ★ 为什么 github.com 特殊：状态行只有两行 455px，下载那一行还要塞
+         代理地址，省下这 11 个字符是实打实的余量；而**别的**域名必须留着
+         —— 不然玩家看不出这包到底是不是从 GitHub 下的。
+         判据是「整段域名就等于 github.com」，`github.com.evil.tld` 不匹配。
+       ★ 这一行纯给人看（界面上的「仓库：」），不参与任何判断：
+         认不出的地址原样截断就行，绝不能因为它出错。 */
+    scheme = wcsstr(p, L"://");
+    if (scheme) p = scheme + 3;
+    if (_wcsnicmp(p, L"www.", 4) == 0) p += 4;
+    if (_wcsnicmp(p, L"github.com/", 11) == 0) {
+        p += 11;
+        max_slashes = 1;          /* 域名没了，owner/repo 两段 = 停在第 2 个 / */
+    }
+    while (p[n] && !(p[n] == L'/' && ++slashes > max_slashes)) n++;
+    /* 太长就截断加省略号（最长的也就 GitHub 那种 owner/repo，够用）。 */
+    keep = cap - 1;
+    if (keep > 40) keep = 40;
+    if (n <= keep) {
+        wcsncpy(out, p, n);
+        out[n] = 0;
+    } else {
+        wcsncpy(out, p, keep - 1);
+        out[keep - 1] = 0x2026;          /* … */
+        out[keep] = 0;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /*  路径                                                                */
 /* ------------------------------------------------------------------ */

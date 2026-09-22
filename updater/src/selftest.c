@@ -358,6 +358,116 @@ static void proxylist_tests(void)
     }
 }
 
+/* ---- 更新源解析（config\update.config 的 manifest_url + 代理） ----------
+   ★ 这一组盯住的是「服务端下发更新源」那次改动的两条命根子：
+     ① manifest_url 认得出、且**不会被当成代理**；
+     ② 老格式（只有代理、没有键）解析结果一个字都不变 —— 不然发出去的
+        新客户端会把老服务器上那份 update.config 解析歪。 */
+
+static void update_config_tests(void)
+{
+    UpdateConfig uc;
+
+    /* ① 基本形：键 + 代理混排，注释和空行照旧不计 skipped。 */
+    {
+        static const wchar_t *text =
+            L"\xFEFF" L"# 更新源\r\n"
+            L"manifest_url = https://example.test/m.json\r\n"
+            L"\r\n"
+            L"https://p1.test\n"
+            L"https://p2.test/\n";
+        int n = cfg_parse_update_config(text, &uc);
+        check(n == 2 && uc.proxies.count == 2, "update.config: 2 proxies");
+        check(wcscmp(uc.manifest_url, L"https://example.test/m.json") == 0,
+              "update.config: manifest_url parsed");
+        check(uc.proxies.skipped == 0,
+              "update.config: a recognised key is NOT counted as ignored");
+        check(wcscmp(uc.proxies.url[0], L"https://p1.test") == 0,
+              "update.config: proxies still parsed alongside the key");
+    }
+    /* ② 空格 / 大小写宽容；值里的 = 不切断。 */
+    {
+        check(cfg_parse_update_config(L"MANIFEST_URL=https://a.test/m.json?x=1\n",
+                                      &uc) == 0 &&
+              wcscmp(uc.manifest_url, L"https://a.test/m.json?x=1") == 0,
+              "update.config: key case-insensitive, no spaces, '=' kept in value");
+        check(cfg_parse_update_config(L"  manifest_url   =   https://b.test/m  \n",
+                                      &uc) == 0 &&
+              wcscmp(uc.manifest_url, L"https://b.test/m") == 0,
+              "update.config: spaces around '=' and at line ends are trimmed");
+    }
+    /* ③ 缺键 / 空值 -> 空串，调用方退回内置地址。 */
+    {
+        check(cfg_parse_update_config(L"https://p.test\n", &uc) == 1 &&
+              uc.manifest_url[0] == 0,
+              "update.config: no key -> empty manifest_url");
+        check(cfg_parse_update_config(L"manifest_url =\n", &uc) == 0 &&
+              uc.manifest_url[0] == 0,
+              "update.config: empty value -> empty manifest_url");
+    }
+    /* ④ 认不出的键照老规矩计 skipped；★ 带 = 的代理地址不能被误判成键。 */
+    {
+        check(cfg_parse_update_config(L"whatever = 1\n", &uc) == 0 &&
+              uc.proxies.skipped == 1,
+              "update.config: unknown key still counted as ignored");
+        check(cfg_parse_update_config(L"https://p.test/x?a=b\n", &uc) == 1 &&
+              wcscmp(uc.proxies.url[0], L"https://p.test/x?a=b") == 0,
+              "update.config: a proxy URL containing '=' stays a proxy");
+    }
+    /* ⑤ ★ 老格式不回归：和 proxylist_tests 用同一份夹具，结果必须一致。 */
+    {
+        ProxyList pl;
+        static const wchar_t *legacy =
+            L"\xFEFF" L"# 注释行\r\n"
+            L"https://cdn.gh-proxy.com/\r\n"
+            L"  https://gh-proxy.com  \r\n"
+            L"; 分号也是注释\n"
+            L"\n"
+            L"ftp://nope.example\n"
+            L"not a url\n"
+            L"https://GH-PROXY.com\n"
+            L"http://127.0.0.1:8123/fast\n"
+            L"https://has space.com/x\n";
+        cfg_parse_update_config(legacy, &uc);
+        cfg_parse_proxy_list(legacy, &pl);
+        check(uc.proxies.count == 3 && uc.proxies.skipped == 4 &&
+              uc.manifest_url[0] == 0,
+              "update.config: legacy proxy-only file parses exactly as before");
+        check(pl.count == uc.proxies.count && pl.skipped == uc.proxies.skipped,
+              "cfg_parse_proxy_list stays a thin wrapper over the new parser");
+    }
+    /* ⑥ 界面上那个「仓库：」简写。 */
+    {
+        wchar_t label[64];
+        manifest_repo_label(
+            L"https://github.com/liubz102/popshot-reborn/releases/latest/"
+            L"download/manifest.json", label, 64);
+        check(wcscmp(label, L"liubz102/popshot-reborn") == 0,
+              "repo label: github.com dropped, owner/repo kept");
+        manifest_repo_label(L"https://oss.example.test/pkg/manifest.json",
+                            label, 64);
+        check(wcscmp(label, L"oss.example.test/pkg/manifest.json") == 0,
+              "repo label: a non-GitHub host is kept (must stay visible)");
+        manifest_repo_label(L"https://github.com.evil.tld/a/b/c", label, 64);
+        check(wcscmp(label, L"github.com.evil.tld/a/b") == 0,
+              "repo label: a look-alike host is NOT mistaken for github.com");
+        manifest_repo_label(L"http://www.example.test/m.json", label, 64);
+        check(wcscmp(label, L"example.test/m.json") == 0,
+              "repo label: scheme and www. stripped");
+        manifest_repo_label(L"http://127.0.0.1:8126/api/update-config",
+                            label, 64);
+        check(wcscmp(label, L"127.0.0.1:8126/api/update-config") == 0,
+              "repo label: bare host:port kept");
+        manifest_repo_label(L"", label, 64);
+        check(label[0] == 0, "repo label: empty in, empty out");
+        manifest_repo_label(
+            L"https://a-very-long-host-name.example.test/owner/repository-name/"
+            L"releases/latest/download/manifest.json", label, 64);
+        check(wcslen(label) == 40 && label[39] == 0x2026,
+              "repo label: truncated to 40 chars with an ellipsis");
+    }
+}
+
 /* ---- 选源编排（speedtest.c），假测速函数：elapsed 固定 1000ms，
         bytes 就是 B/s；每个来源被测几次、第几次调用报取消都可控 ---------- */
 
@@ -806,6 +916,7 @@ int selftest_run(int preview)
     hash_tests();
     util_tests();
     proxylist_tests();
+    update_config_tests();
     speedtest_tests();
     peak_tests();
     fallback_tests();

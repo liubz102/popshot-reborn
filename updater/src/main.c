@@ -3,11 +3,18 @@
 
    玩家看到的样子（原版 BsPatcherChn/NGM 的交互）：
      客户端被版本门禁拒绝 -> 拉起 game_patched\BsPatcherChn.exe（本程序）->
-     原版风格更新窗口（双进度条「目前/全部」）自动跑：检查（manifest 直连
-     5 秒没取到就随机换 config\update.config 里的代理取）-> 测速选源
-     （GitHub 直连 vs 同一份代理列表，speedtest.c）-> 下载 ->
+     原版风格更新窗口（双进度条「目前/全部」）自动跑：问服务器要更新源 ->
+     检查（manifest 直连 5 秒没取到就随机换代理取）-> 测速选源
+     （直连 vs 同一份代理列表，speedtest.c）-> 下载 ->
      停本机服务端 -> 覆盖 -> 「更新完成，请重新启动游戏」。用户拍板：
      完成后只提示手动重启（start.bat / start-debug.bat），不自动拉起。
+
+   ★ 更新源（manifest 地址 + 代理列表）以**服务器上那份**为准：
+     开工先读本机 config\update.config（引导 + 兜底），再向
+     http://<server_address>:<server_register_port>/api/update-config 要一份；
+     要到了就用服务器那份。于是开服的人改完服务器上那个文件，所有玩家
+     下一次更新立刻生效，不用先更新一版客户端。要不到（服务器没开 / 端口
+     不通 / 服务端太老没这个接口）就安静地退回本机那份，不打断更新。
 
    命令行：
      （客户端升级分支带的原版 NGM参数 全忽略，只认）
@@ -15,7 +22,10 @@
      --elevated        （内部）本次已是管理员
      --zip <path>      （内部）复用已下载的更新包（提权重跑不重复下载）
      --target-version  （内部）跳过探针直接指定目标
-     --manifest-url <url>  （测试）覆盖 manifest 地址
+     --manifest-url <url>  （测试）覆盖 manifest 地址。★ 给了它就**整个跳过
+                       「问服务器要更新源」那一步**，代理列表也只用本机那份
+                       —— e2e 夹具的沙箱里 server_address = 127.0.0.1，不跳过
+                       会撞上开发机上真在跑的服务端，把夹具的测试代理顶掉。
      --ui-mode 1|2|3   （测试）强制渲染链某一档
      --noui            无界面跑（自动化测试；等价 POPSHOT_UPDATER_NOUI=1）
      --selftest        回归自检（构建闸门）
@@ -47,12 +57,18 @@
 static const char UPDATER_TAG[] =
     "POPSHOT-UPDATER/3 (all-in-one: NGM-style UI + full update; updater\\src)";
 
-/* 地址硬编码（发版人交代：不新增配置文件）。与 tools\update-manifest.json
-   里的 repo 一致；手动下载兜底页给玩家看。 */
+/* 编译期内置的 manifest 地址 —— 现在只是**最后一层兜底**：服务器上那份
+   config\update.config 的 manifest_url 优先，其次本机那份，都没有才用它。
+   与 tools\update-manifest.json 里的 repo 一致。
+   RELEASES_PAGE 是手动下载兜底页给玩家看的地址，用户拍板：**永远写死这个**，
+   不跟随服务器配置（和登录界面那段反倒卖公告一个口径）。 */
 static const wchar_t MANIFEST_URL[] =
     L"https://github.com/liubz102/popshot-reborn/releases/latest/download/manifest.json";
 static const wchar_t RELEASES_PAGE[] =
     L"https://github.com/liubz102/popshot-reborn/releases";
+
+/* 服务器上那份更新源的取件路径（收包那一头在 server\web\server.py）。 */
+static const wchar_t UPDATE_CONFIG_PATH[] = L"/api/update-config";
 
 typedef struct Args {
     DWORD procid;
@@ -69,7 +85,10 @@ typedef struct Ctx {
     Args args;
     Ver local;
     int local_valid;
-    ProxyList proxies;            /* config\update.config，worker 开头读一次 */
+    ProxyList proxies;            /* 生效的代理列表（服务器那份优先） */
+    wchar_t manifest_url[MANIFEST_URL_CAP];  /* 生效的 manifest 地址 */
+    wchar_t repo_label[64];       /* 界面上「仓库：」那一行（manifest 的简写） */
+    int source_is_server;         /* 1 = 上面这几项来自服务器，0 = 本机兜底 */
 } Ctx;
 
 static Ctx g_ctx;
@@ -128,6 +147,96 @@ static int elevate_and_rerun(const wchar_t *zip, const wchar_t *target_version)
 }
 
 /* ------------------------------------------------------------------ */
+/*  更新源：manifest 地址 + 代理列表，以【服务器上那份】为准               */
+/* ------------------------------------------------------------------ */
+
+/* 向服务器要一份 config\update.config。成功返回 1 并填好 out。
+   窗口沿用 MANIFEST_ATTEMPT_MS（5 秒）—— 同一类东西（HTTP 小文件），
+   一个常量管两处，别再多一个可调的数。连不上就是连不上，这里等不到
+   任何「服务器起来了」的事件，属于铁律 10 写明的那种例外。 */
+static int fetch_remote_update_config(const wchar_t *host, int port,
+                                      UpdateConfig *out,
+                                      wchar_t *err, size_t err_cap)
+{
+    static char raw[65536];       /* 只在 worker 线程里用，且只用一次 */
+    static wchar_t text[16384];
+    wchar_t url[512];
+    size_t len = 0;
+    int ipv6 = wcschr(host, L':') != NULL;
+
+    /* IPv6 字面量拼进 URL 要补方括号（server\config.py 的 http_host 同款）。 */
+    _snwprintf(url, 512, ipv6 ? L"http://[%ls]:%d%ls" : L"http://%ls:%d%ls",
+               host, port, UPDATE_CONFIG_PATH);
+    url[511] = 0;
+    log_line("update source: asking %ls", url);
+    if (!net_get_memory(url, raw, sizeof(raw), &len, MANIFEST_ATTEMPT_MS,
+                        ui_cancel_requested, err, err_cap)) {
+        if (wide_ieq(err, L"expired"))
+            _snwprintf(err, err_cap, L"%d 秒内没回话",
+                       MANIFEST_ATTEMPT_MS / 1000);
+        err[err_cap - 1] = 0;
+        return 0;
+    }
+    if (utf8_to_wide(raw, len, text, 16384) < 0) {
+        _snwprintf(err, err_cap, L"内容认不出（不是 UTF-8 文本）");
+        return 0;
+    }
+    cfg_parse_update_config(text, out);
+    return 1;
+}
+
+/* 定下这一趟用哪份更新源，填 g_ctx 的 proxies / manifest_url / repo_label。
+   顺序：服务器那份 > 本机 config\update.config > 编译期内置地址。 */
+static void resolve_update_source(void)
+{
+    UpdateConfig local, remote;
+    wchar_t host[256];
+    wchar_t err[256];
+    int port;
+
+    cfg_update_config(g_ctx.root, &local);
+    log_line("local update.config: %d proxies usable, %d lines ignored, "
+             "manifest_url=%ls", local.proxies.count, local.proxies.skipped,
+             local.manifest_url[0] ? local.manifest_url : L"(none)");
+    g_ctx.proxies = local.proxies;
+    wcscpy(g_ctx.manifest_url, local.manifest_url);
+    g_ctx.source_is_server = 0;
+
+    /* --manifest-url 是 e2e 夹具的直通参数：给了它就完全不碰服务器。 */
+    if (g_ctx.args.manifest_url[0]) {
+        wcsncpy(g_ctx.manifest_url, g_ctx.args.manifest_url,
+                MANIFEST_URL_CAP - 1);
+        g_ctx.manifest_url[MANIFEST_URL_CAP - 1] = 0;
+        log_line("update source: --manifest-url given, server not asked");
+    } else {
+        cfg_server_address(g_ctx.root, host, 256);
+        port = cfg_server_register_port(g_ctx.root);
+        ui_status(L"正在向服务器询问更新源……");
+        if (fetch_remote_update_config(host, port, &remote, err, 256)) {
+            g_ctx.proxies = remote.proxies;
+            wcscpy(g_ctx.manifest_url, remote.manifest_url);
+            g_ctx.source_is_server = 1;
+            log_line("update source: from server, %d proxies usable, "
+                     "%d lines ignored, manifest_url=%ls",
+                     remote.proxies.count, remote.proxies.skipped,
+                     remote.manifest_url[0] ? remote.manifest_url : L"(none)");
+        } else {
+            /* ★ 不算失败：服务器没开、端口不通、服务端还是没这个接口的
+               老版本，都走到这儿。安静退回本机那份，更新照跑。 */
+            log_line("update source: server unavailable (%ls), using local",
+                     err);
+        }
+    }
+    if (!g_ctx.manifest_url[0]) {
+        wcscpy(g_ctx.manifest_url, MANIFEST_URL);
+        log_line("update source: no manifest_url anywhere, using built-in");
+    }
+    manifest_repo_label(g_ctx.manifest_url, g_ctx.repo_label, 64);
+    log_line("update source: manifest %ls (repo %ls, %d proxies)",
+             g_ctx.manifest_url, g_ctx.repo_label, g_ctx.proxies.count);
+}
+
+/* ------------------------------------------------------------------ */
 /*  manifest 取用与目标选择（update_client.py fetch/pick 的移植）          */
 /* ------------------------------------------------------------------ */
 
@@ -160,20 +269,21 @@ static void manifest_notify(void *user, int attempt, int total, int index)
     wchar_t text[400];
     (void)user;
     if (index < 0) {
-        ui_status(L"正在获取更新清单……");
+        _snwprintf(text, 400, L"正在获取更新清单……仓库：%ls", g_ctx.repo_label);
+        text[399] = 0;
+        ui_status(text);
         return;
     }
     _snwprintf(text, 400,
-               L"正在获取更新清单……直连 GitHub 没取到，正在尝试第 %d/%d 个代理：%ls",
-               attempt - 1, total, g_ctx.proxies.url[index]);
+               L"正在获取更新清单（仓库：%ls）……直连没取到，正在尝试第 %d/%d 个代理：%ls",
+               g_ctx.repo_label, attempt - 1, total, g_ctx.proxies.url[index]);
     text[399] = 0;
     ui_status(text);
 }
 
 static int fetch_manifest(Manifest *m, wchar_t *err, size_t err_cap)
 {
-    const wchar_t *url = g_ctx.args.manifest_url[0]
-                             ? g_ctx.args.manifest_url : MANIFEST_URL;
+    const wchar_t *url = g_ctx.manifest_url;   /* resolve_update_source 定的 */
     static char buf[262144];
     ManifestFetch mf;
     wchar_t net_err[256];
@@ -190,17 +300,23 @@ static int fetch_manifest(Manifest *m, wchar_t *err, size_t err_cap)
             _snwprintf(err, err_cap, L"cancelled");
             return 0;
         }
+        /* ★ 失败详情里带**完整**的 manifest 地址（不是界面上那个简写）：
+           改成服务端下发之后，「取不到清单」最常见的原因就是开服的人把
+           update.config 里的地址写错了，不给全址没法排查。 */
         if (attempts > 1)
             _snwprintf(err, err_cap,
-                       L"取不到更新清单：GitHub 直连和 %d 个代理都没取到"
-                       L"（最后一次：%ls）", attempts - 1, net_err);
+                       L"取不到更新清单：直连和 %d 个代理都没取到"
+                       L"（最后一次：%ls）。清单地址：%ls",
+                       attempts - 1, net_err, url);
         else
-            _snwprintf(err, err_cap, L"取不到更新清单（%ls）", net_err);
+            _snwprintf(err, err_cap, L"取不到更新清单（%ls）。清单地址：%ls",
+                       net_err, url);
         err[err_cap - 1] = 0;
         return 0;
     }
     if (!manifest_parse(buf, m)) {
-        _snwprintf(err, err_cap, L"更新清单内容认不出");
+        _snwprintf(err, err_cap, L"更新清单内容认不出。清单地址：%ls", url);
+        err[err_cap - 1] = 0;
         return 0;
     }
     return 1;
@@ -430,10 +546,12 @@ static int fetch_zip_cached(const ReleaseEntry *e, wchar_t *zip_out,
         else
             wcscpy(size_text, L"400");
         /* 状态行两行 455px（模板 CurrentTxt 覆盖样式，break-all）：最长的
-           代理地址也放得下。用户要求直连也要写「代理地址：直连Github」。 */
+           代理地址也放得下。用户要求直连也要写「代理地址：直连Github」，
+           并且要看得出这一包是从哪个仓库下的（仓库简写，全址在日志里）。
+           ★ 两行是硬上限，加字之前先 --preview 截图看有没有被截掉。 */
         _snwprintf(text, 400,
-                   L"正在下载客户端包（约 %ls MB），网络不通或太慢时可从QQ群文件手动下载。"
-                   L"代理地址：%ls", size_text, label);
+                   L"正在下载客户端包（约 %ls MB），太慢可从QQ群手动下载。"
+                   L"仓库：%ls 代理地址：%ls", size_text, g_ctx.repo_label, label);
         text[399] = 0;
         ui_status(text);
     }
@@ -501,10 +619,9 @@ static DWORD WINAPI worker_main(LPVOID param)
         wchar_t hook_dll[MAX_PATH * 2];
         int need_update = 0;
 
-        /* --- 代理列表：manifest 兜底和下载测速共用这一份 ---------------- */
-        cfg_proxy_list(g_ctx.root, &g_ctx.proxies);
-        log_line("proxy list: %d usable, %d lines ignored",
-                 g_ctx.proxies.count, g_ctx.proxies.skipped);
+        /* --- 更新源：manifest 地址 + 代理列表，服务器那份优先 ----------
+           代理列表 manifest 兜底和下载测速共用这一份。 */
+        resolve_update_source();
 
         /* --- 探针：问服务器「该升到哪版」 ---------------------------- */
         ui_status(L"正在探测服务器，确认需要的版本……");
@@ -898,9 +1015,15 @@ static int check_proxies_run(void)
     log_init(root, "start (--check-proxies)");
     ui_init(root, 0, 1);                    /* 无界面 */
 
-    cfg_proxy_list(root, &g_ctx.proxies);
+    /* ★ 走和真更新同一条取源路径（服务器那份优先）—— 体检要体检的是
+       「真正会被用到的那份代理列表」，不是本机那份。 */
+    resolve_update_source();
     check_say(L"=== 代理体检 ===\n");
-    check_say(L"config\\update.config：%d 个可用，%d 行被忽略\n",
+    check_say(L"更新源：%ls\n",
+              g_ctx.source_is_server ? L"来自服务器（/api/update-config）"
+                                     : L"本机 config\\update.config");
+    check_say(L"清单地址：%ls\n", g_ctx.manifest_url);
+    check_say(L"代理：%d 个可用，%d 行被忽略\n",
               g_ctx.proxies.count, g_ctx.proxies.skipped);
 
     if (!fetch_manifest(&m, err, 512)) {

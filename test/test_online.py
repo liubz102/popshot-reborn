@@ -774,8 +774,13 @@ class RegisterWebTests(unittest.TestCase):
         # ★ 这一组用例要连着注册好几个账号，而它们全部来自 127.0.0.1 ——
         #   冷却开着的话第二个用例起就会被自己的限流挡住。限流本身由下面
         #   `RegisterCooldownTests` 单独验，这里 0 = 关掉。
+        # 更新源下发（`/api/update-config`）指向一份临时文件，别碰仓库根那份。
+        cls.update_cfg = os.path.join(cls.tmp.name, "update.config")
+        with open(cls.update_cfg, "w", encoding="utf-8", newline="\n") as fp:
+            fp.write("manifest_url = https://example.test/m.json\n")
         cls.httpd = web_server.make_server(0, cls.accounts, "127.0.0.1",
-                                           cooldown=0)
+                                           cooldown=0,
+                                           update_config_path=cls.update_cfg)
         cls.port = cls.httpd.server_address[1]
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
@@ -841,6 +846,68 @@ class RegisterWebTests(unittest.TestCase):
             html = response.read().decode("utf-8")
         self.assertNotIn("<script>alert(1)</script>", html)
         self.assertIn("&lt;script&gt;", html)
+
+    # -- 更新源下发（`/api/update-config`，取包那头是更新器）-----------------
+    def update_config_write(self, text):
+        with open(self.update_cfg, "w", encoding="utf-8", newline="\n") as fp:
+            fp.write(text)
+
+    def update_config_get(self):
+        with urllib.request.urlopen(self.url("/api/update-config"),
+                                    timeout=10) as response:
+            return (response.status, response.headers,
+                    response.read().decode("utf-8"))
+
+    def test_update_config_is_served_verbatim(self):
+        """更新器靠它拿 manifest 地址和代理列表 ⇒ 必须**原样**发，不解析不改写。"""
+        self.addCleanup(self.update_config_write, "")
+        text = ("# 更新源\nmanifest_url = https://example.test/m.json\n"
+                "https://p1.test\n")
+        self.update_config_write(text)
+        status, headers, body = self.update_config_get()
+        self.assertEqual(status, 200)
+        self.assertEqual(body, text)
+        self.assertIn("text/plain", headers.get("Content-Type"))
+
+    def test_update_config_changes_take_effect_without_a_restart(self):
+        """★ 这条就是这个接口存在的**全部意义**。
+
+        开服的人改完服务器上那份 `config/update.config`，下一个请求就是新内容
+        —— 不重启服务端、不等任何缓存过期。改动前换仓库 / 换代理要等玩家
+        先更新一版客户端才生效，正是这条要根治的毛病。
+        """
+        self.addCleanup(self.update_config_write, "")
+        self.update_config_write("manifest_url = https://old.test/m.json\n")
+        self.assertIn("old.test", self.update_config_get()[2])
+        self.update_config_write("manifest_url = https://new.test/m.json\n")
+        body = self.update_config_get()[2]
+        self.assertIn("new.test", body)
+        self.assertNotIn("old.test", body)
+
+    def test_update_config_is_never_cached_in_between(self):
+        """挂在 frp / nginx 后面时，中间人不许把旧内容缓住（同上一条）。"""
+        self.assertEqual(self.update_config_get()[1].get("Cache-Control"),
+                         "no-store")
+
+    def test_update_config_missing_is_a_plain_404(self):
+        """没有这个文件 = 这台服务器不下发更新源。
+
+        更新器会安静地退回玩家本机那份、更新照跑，所以 404 是**正常结局**：
+        不能是 500，更不能把注册页整个带崩。
+        """
+        os.remove(self.update_cfg)
+        self.addCleanup(self.update_config_write, "")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.update_config_get()
+        self.assertEqual(caught.exception.code, 404)
+
+    def test_update_config_too_big_is_refused(self):
+        """手滑放了个大文件进来，不能让它把服务端的内存吃掉。"""
+        self.addCleanup(self.update_config_write, "")
+        self.update_config_write("#" + "x" * web_server.UPDATE_CONFIG_MAX_BYTES)
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.update_config_get()
+        self.assertEqual(caught.exception.code, 500)
 
     def test_register_then_duplicate(self):
         first = self.post("/api/register",
