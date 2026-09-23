@@ -7138,10 +7138,12 @@ class Conn:
     #: 同一档重复报**不动**它（丢包既不重置也不加速判定）；★ 组内换档
     #: （`人不在` ↔ `只有键盘` …）**也不动它**，见 `note_presence()`。
     presence_since = None
-    #: ★ 移动平台相位（X_Mod §74 / D55）：`{路径句柄: (收到时刻, 载图后毫秒, t_off)}`，
+    #: ★ 移动平台相位（X_Mod §74 / §78 / D55）：`{路径句柄: (收到时刻, 起点后毫秒, t_off, t0)}`，
     #:   `note_mover_phase()` 存、`bot._mover_clock()` 读。`None` = 这一局还没报过
-    #:   （老客户端 / 没中继 / UDP 被挡）⇒ bot 退回「开局估计」。发出 `0x0400`
+    #:   （没中继 / UDP 被挡）⇒ bot 退回「开局估计」。发出 `0x0400`
     #:   （这一局开始载图）时清空 —— hook 是载图**收尾**才报，所以清在它前面。
+    #:   `t0` 是客户端那一格起点本身，只拿来判「起点换了没有」（开打时 StartGame
+    #:   会整体重取一遍，§78）。
     mover_phase = None
     mover_phase_at = None
     #: ★ 诊断（`note_human_fire`）的类级默认 —— 控制通道造的假连接也得有。
@@ -11270,18 +11272,23 @@ class Conn:
                presence_age_text(sys_ms), "在" if self.presence_fg else "**不在**"))
 
     def note_mover_phase(self, game_now, wall_now, entries, now=None):
-        """移动平台相位到了（`udpsync.MSG_MOVER_PHASE`，X_Mod §74）。
+        """移动平台相位到了（`udpsync.MSG_MOVER_PHASE`，X_Mod §74 / §78）。
 
         每条 `(link, t0, t_off)`：`link` = 路径对象的句柄（= `mapdata.Mover.handle`），
-        `t0` = 客户端 `MapObject::LinkPath` 那一刻的 `Timer()`，`game_now` = 发包那一刻的
-        `Timer()`。存下来的是「载图后毫秒」= `game_now − t0`（32 位回绕后按有符号读 ——
-        客户端 `Path::Eval` 也是有符号取模）和收到的时刻，`bot._mover_clock()` 用
-        「载图后毫秒 + 从收到到现在」推算此刻的相位。**只存事实**，谁的相位算数在
-        bot 那边（D55）。
+        `t0` = 客户端这一刻那个对象的起点（`[obj+0x90]`，hook 发包时现读），`game_now` =
+        发包那一刻的 `Timer()`。存下来的是「起点后毫秒」= `game_now − t0`（32 位回绕后
+        按有符号读 —— 客户端 `Path::Eval` 也是有符号取模）和收到的时刻，
+        `bot._mover_clock()` 用「起点后毫秒 + 从收到到现在」推算此刻的相位。
+        **只存事实**，谁的相位算数在 bot 那边（D55）。
 
-        ★ 日志按「这一局第一次」打一行（状态翻转 = 从 `None` 变成有），带上
-          `game_now − wall_now`：客户端的 `Timer()` 走的是 `GameContext+0xe0`，和墙钟
-          差多少只有实机知道（§74 要的就是这个数）。之后每秒一发全部静默。
+        ★ 起点会变：载图时 `LinkPath` 取一次，开打时 `GameContext::StartGame` 把所有
+          移动平台**整体重取**一次（§78）—— 战斗里算数的是后一个。hook 每一发都现读，
+          所以直接用最新那一发就是对的，这里不用分辨是哪一个。
+        ★ 日志按**起点翻转**打：这一局第一发（从 `None` 变成有）、以及之后任何一条路径的
+          `t0` 变了（开打重取）各一行，带上 `game_now − wall_now`（客户端 `Timer()` 和墙钟
+          差多少，§74 要的数）。之后每秒一发、起点没变的全部静默。
+          ⚠ 会话 33 只打「这一局第一发」—— 那一发是**载图时**的起点，开打后被重取了也
+          看不出来，§78 就是被它误导的。
         ★ `now` 只给测试注入用，和 `note_presence()` 同一套约定。
           ⚠ `udpsync._on_mover_phase` 按位置传前 3 个参数，别往前面插形参。
         """
@@ -11293,19 +11300,22 @@ class Conn:
             since = (int(game_now) - int(t0)) & 0xFFFFFFFF
             if since >= 0x80000000:
                 since -= 0x100000000
-            phase[int(link)] = (now, since, int(t_off))
-        first = self.mover_phase is None
+            phase[int(link)] = (now, since, int(t_off), int(t0) & 0xFFFFFFFF)
+        old = self.mover_phase
         self.mover_phase = phase
         self.mover_phase_at = now
-        if not first:
+        if old is not None and all(link in old and old[link][3] == got[3]
+                                   for link, got in phase.items()):
             return
         drift = (int(game_now) - int(wall_now)) & 0xFFFFFFFF
         if drift >= 0x80000000:
             drift -= 0x100000000
         self.online_debug(
-            "移动平台相位 账号=%r -> %s（游戏时钟 − 墙钟 = %d ms）"
+            "移动平台相位 账号=%r -> %s%s（游戏时钟 − 墙钟 = %d ms）"
             % (self.account_name or "?",
-               "；".join("路径 %d 载图后 %d ms（偏移 %d）" % (link, got[1], got[2])
+               "起点变了：" if old is not None else "",
+               "；".join("路径 %d 起点后 %d ms（t0=%d，偏移 %d）"
+                        % (link, got[1], got[3], got[2])
                         for link, got in sorted(phase.items())),
                drift))
 

@@ -682,5 +682,78 @@ class MoverLinkPatchTest(_JmpGuardSiteMixin, unittest.TestCase):
         self.assertEqual(b"\x56\x8b\xf1\x8b\x86\xfc\x00\x00\x00\x85\xc0\x74\x31", head)
 
 
+class MoverStartPatchTest(_JmpGuardSiteMixin, unittest.TestCase):
+    """X_Mod §78 —— 开打时 `GameContext::StartGame` 把所有移动平台的起点 t0 重取一遍。
+
+    `0x476435`（World 的方法）遍历所有对象，`[obj+0x8c]`（follower 挂着的路径）非空就
+    `call Timer(); mov [esi+0x90], eax`。战斗里鲤鱼按**这个**起点走；会话 30 只挂了
+    LinkPath 那一处，报上去的起点早了整整一段加载等待（2026-09-23 实测 8.46 s / 6.16 s）。
+    """
+
+    PREFIX = "MOVERST"
+    INSTALLER = "try_patch_mover_link"
+
+    @classmethod
+    def setUpClass(cls):
+        super(MoverStartPatchTest, cls).setUpClass()
+        cls.resume_to = c_define(cls.src, "MOVERST_RESUME_TO")
+
+    def test_the_resume_target_is_the_next_instruction(self):
+        # 偷走的正好是那条 6 字节的 mov，落点是 `lea eax, [ebp-8]`（取下一个对象）
+        self.assertEqual(self.va + self.stolen, self.resume_to)
+        self.assertEqual(b"\x8d\x45\xf8", read_va(self.img, self.resume_to, 3))
+
+    def test_the_site_sits_right_after_the_timer_call(self):
+        self.assertEqual(b"\xe8", read_va(self.img, self.va - 5, 1))
+        rel = struct.unpack("<i", read_va(self.img, self.va - 4, 4))[0]
+        self.assertEqual(0x0040A01E, self.va + rel)
+
+    def test_only_objects_that_follow_a_path_are_rebased(self):
+        # `cmp dword [esi+0x8c], 0 / je +0x0b` —— 跳过站点，正好落在我们的 resume 上
+        self.assertEqual(b"\x83\xbe\x8c\x00\x00\x00\x00\x74\x0b",
+                         read_va(self.img, 0x00476455, 9))
+        self.assertEqual(self.resume_to, 0x0047645E + 0x0B)
+
+    def test_start_game_is_the_one_who_calls_it(self):
+        # GameContext 虚表 +0xc = 0x491244；它末尾 `mov ecx,[World] / call 0x476435`
+        self.assertEqual(0x00491244,
+                         struct.unpack("<I", read_va(self.img, 0x00670B4C + 0xC, 4))[0])
+        self.assertEqual(b"\x8b\x0d\xd4\xe2\x72\x00", read_va(self.img, 0x00491382, 6))
+        self.assertEqual(b"\xe8", read_va(self.img, 0x00491388, 1))
+        rel = struct.unpack("<i", read_va(self.img, 0x00491389, 4))[0]
+        self.assertEqual(0x00476435, 0x0049138D + rel)
+
+    def test_every_game_mode_reaches_the_base_start_game(self):
+        # 23 个 GameContext 子类的 +0xc 要么就是 0x491244，要么是这三个覆盖之一，
+        # 而这三个都 call 0x491244 ⇒ 每种模式开打都会重取起点。
+        for site in (0x004990A6, 0x0049C3EB, 0x004A3CD9):
+            self.assertEqual(b"\xe8", read_va(self.img, site, 1))
+            rel = struct.unpack("<i", read_va(self.img, site + 1, 4))[0]
+            self.assertEqual(0x00491244, site + 5 + rel,
+                             "%08X 不再调 StartGame 的基类" % site)
+
+
+class MoverOriginWritersTest(unittest.TestCase):
+    """X_Mod §78 —— 起点 t0 的写入点**就这两处**，bshook 挂的 ① ② 一个不漏。
+
+    判据：全镜像「`call Timer()`（0x40a01e）紧跟 `mov [r32+0x90], eax`」。
+    （`PathFollower::SetPath` 0x549bd6 另写一次 `[follower+8]`，但它只在 LinkPath 里被调、
+    紧接着就被 ① 覆盖。hook 发包时现读对象，就算以后冒出第三处也照样报对。）
+    """
+
+    def test_the_two_hooked_sites_are_all_there_is(self):
+        for path in (BSHOOK, IMG):
+            if not os.path.isfile(path):
+                self.skipTest("不在源码仓库里（缺 %s）" % path)
+        img = load_image()
+        src = c_source()
+        found = set()
+        for m in re.finditer(br"\xe8(....)\x89[\x80-\x87]\x90\x00\x00\x00", img, re.S):
+            call_va = IMAGE_BASE + m.start()
+            if call_va + 5 + struct.unpack("<i", m.group(1))[0] == 0x0040A01E:
+                found.add(call_va + 5)
+        self.assertEqual({c_define(src, "MOVERLK_VA"), c_define(src, "MOVERST_VA")}, found)
+
+
 if __name__ == "__main__":
     unittest.main()

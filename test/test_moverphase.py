@@ -155,11 +155,11 @@ class GameServerSideTests(unittest.TestCase):
         self.assertIsNone(conn.mover_phase)
         self.assertIsNone(conn.mover_phase_at)
 
-    def test_it_stores_ms_since_link_per_path(self):
+    def test_it_stores_ms_since_the_origin_per_path(self):
         conn = self._conn()
         conn.note_mover_phase(10000, 99999, [(296, 4000, 0), (131, 4000, 250)],
                               now=50.0)
-        self.assertEqual({296: (50.0, 6000, 0), 131: (50.0, 6000, 250)},
+        self.assertEqual({296: (50.0, 6000, 0, 4000), 131: (50.0, 6000, 250, 4000)},
                          conn.mover_phase)
         self.assertEqual(50.0, conn.mover_phase_at)
 
@@ -179,16 +179,42 @@ class GameServerSideTests(unittest.TestCase):
         self.assertIsNone(conn.mover_phase)
         self.assertEqual([], conn.logged)
 
-    def test_it_logs_once_per_game_not_once_per_second(self):
+    def test_it_logs_once_per_origin_not_once_per_second(self):
         conn = self._conn()
         conn.note_mover_phase(10000, 9000, [(296, 4000, 0)], now=1.0)
         conn.note_mover_phase(11000, 10000, [(296, 4000, 0)], now=2.0)
         conn.note_mover_phase(12000, 11000, [(296, 4000, 0)], now=3.0)
         self.assertEqual(1, len(conn.logged))
-        self.assertIn("路径 296 载图后 6000 ms", conn.logged[0])
+        self.assertIn("路径 296 起点后 6000 ms（t0=4000，偏移 0）", conn.logged[0])
         self.assertIn("游戏时钟 − 墙钟 = 1000 ms", conn.logged[0])
         # 最新那一发照样存了
-        self.assertEqual((3.0, 8000, 0), conn.mover_phase[296])
+        self.assertEqual((3.0, 8000, 0, 4000), conn.mover_phase[296])
+
+    def test_the_start_of_the_battle_rebasing_the_origin_is_logged_and_used(self):
+        """★ X_Mod §78：开打时 `GameContext::StartGame` 把起点整体重取一遍。
+
+        2026-09-23 18:50 那局：载图时报「起点后 5 ms」（t0=121412）之后，服务端一整局都
+        拿它外推，而客户端的鱼是从开打（8.46 s 后）才算起的。现在 hook 每一发现读 t0，
+        重取之后的那一发要**被采用**，而且日志要再打一行 —— 会话 33 只打「这一局第一发」，
+        起点被重取了在日志里看不出来。
+        """
+        conn = self._conn()
+        conn.note_mover_phase(121417, 0, [(296, 121412, 0), (298, 121413, 0)], now=1.0)
+        conn.note_mover_phase(129900, 0, [(296, 129880, 0), (298, 129880, 0)], now=9.5)
+        conn.note_mover_phase(130900, 0, [(296, 129880, 0), (298, 129880, 0)], now=10.5)
+        self.assertEqual(2, len(conn.logged))
+        self.assertNotIn("起点变了", conn.logged[0])
+        self.assertIn("起点变了", conn.logged[1])
+        self.assertIn("路径 296 起点后 20 ms（t0=129880", conn.logged[1])
+        self.assertEqual((10.5, 1020, 0, 129880), conn.mover_phase[296])
+
+    def test_a_path_that_was_not_there_before_counts_as_a_new_origin(self):
+        # 闯关中途换图：新图的路径句柄上一发里没有 —— 也是起点变了
+        conn = self._conn()
+        conn.note_mover_phase(1000, 0, [(296, 900, 0)], now=1.0)
+        conn.note_mover_phase(9000, 0, [(131, 8000, 0)], now=9.0)
+        self.assertEqual(2, len(conn.logged))
+        self.assertIn("路径 131", conn.logged[1])
 
     def test_preparing_the_next_game_forgets_the_old_phase(self):
         """发出 `0x0400`（切 stage 6 开始载图）= 上一局的相位作废；下一局第一发重新打日志。"""
@@ -306,6 +332,23 @@ class RegressionTests(unittest.TestCase):
         got = self.bot._mover_clock(room, self.terrain)
         self.assertIsInstance(got, int)
         self.assertGreaterEqual(got, 0)
+
+    def test_the_hosts_rebased_origin_drives_the_carp(self):
+        """★ §78 端到端：真 `Conn` 先后收两发（载图时 / 开打重取后），坐在真 `Room` 的房主座位上，
+        `_mover_clock` 要按**开打重取后**那一发算。按载图那一发外推会早一整段加载等待
+        （18:50 那局：t0 从 121412 重取成 129880，差 8.47 s）。"""
+        room = self.lobby.Room(0, None)
+        conn = self.gs.Conn.__new__(self.gs.Conn)
+        conn.account_name = "host"
+        conn.online_debug = lambda text: None
+        room.seats[0] = self.lobby.Seat(conn, "host")
+        room.host_seat = 0
+        room.quest = self.gs.RoomQuest()
+        conn.note_mover_phase(121417, 0, [(296, 121412, 0)], now=91.5)     # 载图时
+        conn.note_mover_phase(129900, 0, [(296, 129880, 0)], now=99.875)   # 开打重取后
+        with self.bot._tick_clock(100.0):
+            # 起点后 20 ms + 收到之后 125 ms；按载图那一发会是 5 + 8500 = 8505
+            self.assertEqual(145, self.bot._mover_clock(room, self.terrain))
 
     def test_the_carp_actually_stops_a_shell_when_a_clock_is_given(self):
         """竖着穿过 t=0 时鲤鱼身子那一片（画布 rows 321..418）：给时钟撞得上，不给撞不上。"""
@@ -433,6 +476,46 @@ class BounceOffMoverTests(unittest.TestCase):
         self.assertEqual((906.0, 829.0), (shell.x, shell.y))
         self.assertAlmostEqual(7.68, shell.vx, places=2)
         self.assertAlmostEqual(-15.14, shell.vy, places=2)
+
+
+class HookSourceTests(unittest.TestCase):
+    """`hook/bshook.c` 那一侧（X_Mod §78）：周期那一发必须能把起点纠正回来。
+
+    会话 30 的两个毛病，任何一个都让「后续同步」形同虚设：
+    ① 每秒那一发报的是**记表时抄下的** t0 —— 开打时 StartGame 重取了起点也照报旧的；
+    ② 发包前要求「当前 Stage 和记表时是同一个」—— stage 6（LoadingStage）→ 7（GameStage）
+       本来就是两个对象，一开打整局的同步包都被拦了。
+    """
+
+    BSHOOK = os.path.join(ROOT, "hook", "bshook.c")
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.isfile(cls.BSHOOK):
+            raise unittest.SkipTest("不在源码仓库里（缺 hook/bshook.c）")
+        with open(cls.BSHOOK, encoding="utf-8") as fp:
+            cls.src = fp.read()
+        body = cls.src[cls.src.index("static void sync_send_mover_phase(void)"):]
+        cls.send_body = body[:body.index("\n}\n")]
+
+    def test_every_report_reads_the_origin_off_the_object(self):
+        self.assertIn("MOVER_OBJ_T0_OFF", self.send_body,
+                      "发包时没有从对象身上现读 t0 —— 起点变了周期同步也纠正不了")
+
+    def test_a_new_stage_does_not_silence_the_reports(self):
+        import re
+        self.assertNotIn("g_mover_gc", self.src)
+        self.assertEqual([], re.findall(r"\bstage\s*[!=]=", self.send_body),
+                         "发包门槛又拿当前 Stage 去比了 —— 换 stage 就是换对象")
+
+    def test_both_origin_writers_feed_the_same_table(self):
+        # ① 载图 LinkPath、② 开打重取：同一个记表函数，只差站点号
+        for detour, site in (("mover_link_detour", "MOVER_SITE_LINK"),
+                             ("mover_start_detour", "MOVER_SITE_START")):
+            body = self.src[self.src.index("static __declspec(naked) void %s(void)" % detour):]
+            body = body[:body.index("\n}\n")]
+            self.assertIn("push %s" % site, body)
+            self.assertIn("call mover_note_link", body)
 
 
 if __name__ == "__main__":

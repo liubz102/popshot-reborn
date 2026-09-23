@@ -381,15 +381,15 @@ def parse_presence(data):
     return kb, mouse, sysidle, bool(fg), flags
 
 
-#: ★ 移动平台相位（X_Mod §74 / D55）—— 客户端报「**它自己**的移动平台走到哪了」。
+#: ★ 移动平台相位（X_Mod §74 / §78 / D55）—— 客户端报「**它自己**的移动平台走到哪了」。
 #:
 #: 出处：bot 的手雷穿过「云桥」的鲤鱼。移动平台的位置是每台客户端自己按
-#: `Timer() + t_off − t0` 算的（`PathFollower::GetPos` `0x549bec`），`t0` 是它把地图
-#: 载完那一刻（`MapObject::LinkPath` 收尾 `0x511d97`），协议里没有任何同步包；
-#: 多人房里每台机器各差一个载图耗时，而且 `Timer()` 走的是 `GameContext+0xe0`，
-#: 不是墙钟。⇒ 让 `bshook` 站在事实旁边把事实报过来：每个挂在路径上的对象一条
-#: `(link, t0, t_off)`，外加发包那一刻的 `Timer()`（`game_now`）和 `GetTickCount()`
-#: （`wall_now`，只给日志对照「游戏时钟 vs 墙钟」）。
+#: `Timer() + t_off − t0` 算的（`PathFollower::GetPos` `0x549bec`），协议里没有任何同步包；
+#: `t0` 载图时（`LinkPath` `0x511d97`）取一次、**开打时**（`GameContext::StartGame` →
+#: `0x476463`）整体重取一次（§78），`Timer()` 是当前 Stage 的 `+0xe0`（每帧的 now）。
+#: ⇒ 让 `bshook` 站在事实旁边把事实报过来：每个挂在路径上的对象一条 `(link, t0, t_off)`
+#: —— **发包那一刻从对象身上现读的** —— 外加发包那一刻的 `Timer()`（`game_now`）和
+#: `GetTickCount()`（`wall_now`，只给日志对照「游戏时钟 vs 墙钟」）。
 #: 相位 = `game_now − t0`（**不含** `t_off`，那一格由 `mapdata.Mover.rider_center()` 加）。
 #:
 #: ★★ 和在场证据一样：**只运事实，不下结论**。谁的相位算数在 `bot._mover_clock()`。

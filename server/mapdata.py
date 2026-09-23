@@ -328,15 +328,15 @@ class Mover(object):
        ★ 切线只有 `kind == 1` 的点才从文件里读，其余是 0 ⇒ 退化成 **smoothstep**（两头慢中间快）。
     6. 最后加上 `PathObj` 自己的世界坐标。
 
-    ## ⚠ 时间原点（X_Mod §74 / D55）
+    ## ⚠ 时间原点（X_Mod §74 / §78 / D55）
 
-    客户端的 `t0` 是**它自己把地图载完**那一刻（`MapObject::LinkPath` 收尾 `0x511d97`），
-    用的时钟是 `GameContext+0xe0`（不是墙钟），协议里没有任何同步包 —— 每台机器的
-    相位各差一个「载图耗时」。所以 `t_ms` 的口径定为「**客户端 LinkPath 之后过了多少
-    毫秒**」，由谁给：① `bshook` 在那个站点记下 `t0`、每秒报 `Timer() − t0`
-    （`Conn.note_mover_phase()`）；② 报不上来时 `bot._mover_clock()` 退回
-    `RoomQuest.started_at`（开局估计）。每块地形自己的 `t_off` **不在 `t_ms` 里**，
-    `rider_center()` 自己加。
+    客户端的 `t0` 写两次：载图时 `MapObject::LinkPath`（`0x511d97`）一次，**开打时**
+    `GameContext::StartGame` 把所有移动平台整体重取一次（`0x476463`）—— 战斗里算数的是
+    后一个（§78）。时钟是当前 Stage 的 `+0xe0`（每帧的 now），协议里没有任何同步包。
+    所以 `t_ms` 的口径定为「**客户端这一刻的 `Timer() − t0`**」，由谁给：① `bshook` 每秒
+    现读对象的 `t0` 报 `Timer() − t0`（`Conn.note_mover_phase()`）；② 报不上来时
+    `bot._mover_clock()` 退回 `RoomQuest.started_at`（= 广播 `0x0402` 那一刻 ≈ 客户端重取
+    起点那一刻）。每块地形自己的 `t_off` **不在 `t_ms` 里**，`rider_center()` 自己加。
     """
 
     __slots__ = ("handle", "x", "y", "loop", "pts", "cum", "total", "riders")

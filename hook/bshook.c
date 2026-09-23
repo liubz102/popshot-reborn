@@ -5745,26 +5745,43 @@ static int try_patch_presence_input(void)
 }
 
 /* -------------------------------------------------------------------------- */
-/* ★ 移动平台相位（X_Mod §74 / D55）：把「鲤鱼在**我**屏幕上走到哪了」报给服务端   */
+/* ★ 移动平台相位（X_Mod §74 / §78 / D55 / D59）：把「鲤鱼在**我**屏幕上走到哪了」报给服务端 */
 /*                                                                            */
 /*   出处：bot 往「云桥」的鲤鱼上扔手雷，穿过去炸在地面。移动平台的位置是每台   */
 /*   客户端自己算的（`PathFollower::GetPos` 0x549bec）：                        */
-/*       elapsed = Timer() + [obj+0x94] − t0                                   */
-/*   `t0` 是 `MapObject::LinkPath`（0x511d60）在 `World::LoadMapData` 收尾那一遍  */
-/*   里记的「我把地图载完那一刻」，协议里没有任何同步包；`Timer()`（0x40a01e）   */
-/*   战斗态走 `[GameContext+0xe0]`，不是墙钟。服务端只能猜「开局」，多人房里     */
-/*   每台机器还各差一个载图耗时 —— 猜不准，就让站在事实旁边的 hook 报事实。      */
+/*       elapsed = Timer() + [obj+0x94] − t0          （t0 在 [obj+0x90]）      */
+/*   协议里没有任何同步包 —— 服务端猜不准，就让站在事实旁边的 hook 报事实。      */
 /*                                                                            */
-/*   站点：LinkPath 收尾的 `0x511d97  mov [esi+0x90], eax`（esi = MapObject，    */
-/*   eax = 刚取的 t0），后面就是 `pop edi / pop esi / ret`。只有 `[this+0xfc]`   */
-/*   （挂在哪个对象上）非零的对象才走到这儿。绕道里先照做那条 mov，再把         */
-/*   (this, t0) 交给 C 记表。**不在游戏线程发包**：一张图会连着进来好几个对象，  */
-/*   记个脏标记，watch_thread 下一轮（≤100 ms）发，之后每秒一发对齐时钟漂移。    */
+/*   ★★ `t0` 有**两个**写入点（§78；全镜像「`call Timer()` 紧跟                */
+/*      `mov [r32+0x90], eax`」就这两处，`test_patchsites` 钉着）：            */
+/*     ① `MapObject::LinkPath`（0x511d60）收尾 `0x511d97` —— 载图那一遍；      */
+/*     ② `GameContext::StartGame`（虚表 +0xc = 0x491244，23 个子类全都走到基类）*/
+/*        末尾 `0x491388` 调 `0x476435`：把 World 里**所有**挂着路径的对象的     */
+/*        t0 **重取成「现在」**（`0x476463`）—— 开打那一刻。                    */
+/*     ⇒ 战斗里鲤鱼的相位是「开打后多少毫秒」，不是「载图后」。会话 30 只挂了 ①，*/
+/*        报上去的起点早了整整一段加载等待（2026-09-23 两局实测 8.46 s / 6.16 s，*/
+/*        鱼一个来回 10 s ⇒ 服务端的鱼基本是随机位置，「大部分错、偶尔对」）。   */
+/*                                                                            */
+/*   ★★ `Timer()`（0x40a01e）= `[当前 Stage + 0xe0]`：Desktop 单例 `[0x72e2b4]`*/
+/*      的 +8 是**当前 Stage**，`Stage::Tick`（0x42b548）每帧把 now 存进 +0xe0；*/
+/*      没有 Stage（换 stage 的空档）时走全局计时器 `[0x6d8a18]`。会话 30 把它   */
+/*      认成了 GameContext —— 不是：stage 6（LoadingStage）和 stage 7（GameStage）*/
+/*      是两个各自 new 出来的对象，当年拿「和记表时是同一个」当发包门槛，一开打  */
+/*      就把之后**所有**的同步包都拦了（§78）。                                  */
+/*                                                                            */
+/*   站点：两处都是 `mov [esi+0x90], eax`（esi = MapObject，eax = 刚取的 t0），  */
+/*   绕道里先照做那条 mov，再把 (this, t0, 哪个站点) 交给 C 记表、置脏。         */
+/*   **不在游戏线程发包**：一张图会连着进来好几个对象；watch_thread 下一轮       */
+/*   （≤100 ms）发，之后每秒一发对齐时钟漂移（采样率，不是判据）。              */
+/*                                                                            */
+/*   ★★ 每一发都从对象身上**现读** t0 / t_off（核对虚表 + link 确认还是那个对象）*/
+/*      —— 站点只管「记下是哪个对象」和「立刻发一发」。哪天冒出第三个改起点的   */
+/*      地方，下一发照样是对的：周期同步本身就能把起点纠正回来。               */
 /*                                                                            */
 /*   报的是事实不是结论：每条 `i32 link / u32 t0 / i32 t_off`，外加发包那一刻的  */
-/*   `[GameContext+0xe0]`（和 Timer() 战斗态同一格）和 GetTickCount()。          */
-/*   谁的相位算数、误差多大，都在服务端（`bot._mover_clock` / `note_mover_phase`）。*/
-/*   ★ 绕道 `push/ret` 回去；后面三条是 pop/pop/ret，不吃标志位。               */
+/*   `[当前 Stage + 0xe0]`（= 此刻的 Timer()）和 GetTickCount()。               */
+/*   谁的相位算数、哪一发作废，都在服务端（`bot._mover_clock` / `note_mover_phase`）。*/
+/*   ★ 绕道 `push/ret` 回去；两个落点后面都不读标志位（pop/pop/ret；lea/call）。 */
 /* -------------------------------------------------------------------------- */
 #define MOVERLK_VA          0x00511D97u
 #define MOVERLK_SIG_LEN     9
@@ -5778,33 +5795,54 @@ static const unsigned char MOVERLK_SIG[MOVERLK_SIG_LEN] = {
     0xC3                                  /* ret                               */
 };
 
-/* 几个全局：World 单例 `[0x72e2d4]`（LinkPath 自己就是从它里面按句柄找对象）；
-   GameContext = `[[0x72e2b4]+8]`（0x409f0e），它的 +0xe0 就是战斗态的 `Timer()`。 */
-#define MOVER_WORLD_PTR_VA   0x0072E2D4u
-#define MOVER_APP_PTR_VA     0x0072E2B4u
-#define MOVER_GC_OFFSET      8
-#define MOVER_GC_TIMER_OFF   0xE0
+/* ② 开打重取（§78）：`0x476435` 是 World 的方法，遍历 `[World+0xb4]` 里的每个对象，
+   `[obj+0x8c]`（follower 挂着的路径）非空就把 t0 重取一遍：
+       0x47645e  e8 bb 3b f9 ff     call 0x40a01e         ; Timer()
+       0x476463  89 86 90 00 00 00  mov [esi+0x90], eax   ; ★ 站点
+       0x476469  8d 45 f8           lea eax, [ebp-8]      ; 落点（取下一个对象）
+   唯一的调用者是 `GameContext::StartGame` 末尾的 `0x491388`。 */
+#define MOVERST_VA          0x00476463u
+#define MOVERST_SIG_LEN     9
+#define MOVERST_STOLEN      6
+#define MOVERST_RESUME_TO   0x00476469
+
+static const unsigned char MOVERST_SIG[MOVERST_SIG_LEN] = {
+    0x89, 0x86, 0x90, 0x00, 0x00, 0x00,   /* mov [esi+0x90], eax   ┐ 偷 6 字节 */
+    0x8D, 0x45, 0xF8                      /* lea eax, [ebp-8]      ┘ 落点      */
+};
+
+/* Desktop 单例 `[0x72e2b4]`（vft 0x662ae0）+8 = 当前 Stage，它的 +0xe0 = 此刻的 Timer()。 */
+#define MOVER_DESKTOP_PTR_VA 0x0072E2B4u
+#define MOVER_STAGE_OFFSET   8
+#define MOVER_STAGE_NOW_OFF  0xE0
+#define MOVER_OBJ_T0_OFF     0x90
 #define MOVER_OBJ_TOFF_OFF   0x94
 #define MOVER_OBJ_REL_OFF    0x98
 #define MOVER_OBJ_LINK_OFF   0xFC
 #define MOVER_MAX            32
 
+#define MOVER_SITE_LINK      1              /* ① 载图 */
+#define MOVER_SITE_START     2              /* ② 开打重取 */
+
 struct mover_link {
-    int link;            /* 挂在哪个对象上（= 服务端 `mapdata.Mover.handle`） */
-    unsigned int t0;     /* LinkPath 那一刻的 Timer() */
-    int t_off;           /* `[obj+0x94]`，相位偏移毫秒 */
-    unsigned char rel;   /* `[obj+0x98]`，相对模式（只给日志） */
+    int link;             /* 挂在哪个对象上（= 服务端 `mapdata.Mover.handle`） */
+    unsigned char *obj;   /* 那个 MapObject —— 发包时从它身上现读 t0 / t_off */
+    void *vft;            /* 记表时 obj 的虚表：发包前核对「还是不是那个对象」 */
+    unsigned int t0;      /* 最近一次站点事件记下的 t0（只给日志对照，发包读现值） */
+    int t_off;            /* `[obj+0x94]`，相位偏移毫秒 */
+    unsigned char rel;    /* `[obj+0x98]`，相对模式（只给日志） */
+    unsigned char site;   /* 最近一次是哪个站点记的（MOVER_SITE_*） */
+    unsigned char sent;   /* 发过没有 —— 「报 N 条」那一行按起点翻转去重 */
+    unsigned int sent_t0; /* 上一发报出去的 t0 */
 };
 
 static struct mover_link g_mover[MOVER_MAX];
 static LONG g_mover_count = 0;                 /* 锁内读写 */
 static volatile LONG g_mover_dirty = 0;
-static void *g_mover_world = NULL;             /* 记表时的 World；换了就整张清 */
-static void *g_mover_gc = NULL;                /* 记表时的 GameContext；NULL = 载图时还没有 */
 static CRITICAL_SECTION g_mover_lock;
 static volatile LONG g_mover_lock_ready = 0;
-static volatile LONG g_mover_patched = 0;
-static void *g_mover_logged_world = NULL;      /* 「已报」那一行按 World 翻转去重 */
+static volatile LONG g_mover_patched = 0;      /* ① 装上了（发包的前提） */
+static volatile LONG g_mover_start_patched = 0; /* ② 装上了 */
 
 static int mover_phase_disabled(void)
 {
@@ -5813,47 +5851,44 @@ static int mover_phase_disabled(void)
     return n > 0 && n < sizeof(buf) && buf[0] != '0';
 }
 
-/* 此刻的 GameContext；没有 / 读不到就 NULL。★ 每一步都 IsBadReadPtr 守着 ——
-   发包那边跑在 watch_thread 上，战斗结束时这个对象会被游戏线程释放。 */
-static unsigned char *mover_game_context(void)
+/* 此刻的 Stage（Desktop+8）；没有 / 读不到就 NULL。★ 每一步都 IsBadReadPtr 守着 ——
+   发包那边跑在 watch_thread 上，换 stage 时旧的那个会被游戏线程释放。 */
+static unsigned char *mover_current_stage(void)
 {
-    unsigned char *app, *gc;
-    if (IsBadReadPtr((const void *)MOVER_APP_PTR_VA, 4)) return NULL;
-    app = *(unsigned char **)MOVER_APP_PTR_VA;
-    if (!app || IsBadReadPtr(app + MOVER_GC_OFFSET, 4)) return NULL;
-    gc = *(unsigned char **)(app + MOVER_GC_OFFSET);
-    if (!gc || IsBadReadPtr(gc + MOVER_GC_TIMER_OFF, 4)) return NULL;
-    return gc;
+    unsigned char *desktop, *stage;
+    if (IsBadReadPtr((const void *)MOVER_DESKTOP_PTR_VA, 4)) return NULL;
+    desktop = *(unsigned char **)MOVER_DESKTOP_PTR_VA;
+    if (!desktop || IsBadReadPtr(desktop + MOVER_STAGE_OFFSET, 4)) return NULL;
+    stage = *(unsigned char **)(desktop + MOVER_STAGE_OFFSET);
+    if (!stage || IsBadReadPtr(stage + MOVER_STAGE_NOW_OFF, 4)) return NULL;
+    return stage;
 }
 
-/* 游戏线程，LinkPath 收尾。`self` = MapObject，`t0` = 它刚存进 [self+0x90] 的那个数。 */
-static void __stdcall mover_note_link(unsigned char *self, unsigned int t0)
+/* 游戏线程，两个站点共用。`self` = MapObject，`t0` = 它刚存进 [self+0x90] 的那个数。
+   表按 link 做键：同一条路径上的几个对象是同一遍取的 t0，服务端每条路径也只要一个数；
+   换图后新图的 LinkPath 按 link 覆盖掉旧条目，旧图独有的条目在发包时核对不过就摘掉。 */
+static void __stdcall mover_note_link(unsigned char *self, unsigned int t0, int site)
 {
-    int link, t_off, i, n;
+    int link, t_off, i, n, had;
+    unsigned int old_t0;
     unsigned char rel;
-    void *world, *gc;
+    void *vft;
 
     if (!InterlockedCompareExchange(&g_mover_lock_ready, 0, 0)) return;
     if (IsBadReadPtr(self, MOVER_OBJ_LINK_OFF + 4)) return;
     link = *(int *)(self + MOVER_OBJ_LINK_OFF);
     if (!link) return;
+    vft = *(void **)self;
     t_off = *(int *)(self + MOVER_OBJ_TOFF_OFF);
     rel = *(unsigned char *)(self + MOVER_OBJ_REL_OFF);
-    world = IsBadReadPtr((const void *)MOVER_WORLD_PTR_VA, 4)
-            ? NULL : *(void **)MOVER_WORLD_PTR_VA;
-    gc = mover_game_context();
 
     EnterCriticalSection(&g_mover_lock);
-    if (world != g_mover_world) {
-        /* 换了一个 World = 换了一张图：上一张的表整个作废 */
-        g_mover_world = world;
-        g_mover_count = 0;
-    }
-    g_mover_gc = gc;
     n = g_mover_count;
     for (i = 0; i < n; i++)
         if (g_mover[i].link == link) break;
-    if (i == n) {
+    had = (i < n);
+    old_t0 = had ? g_mover[i].t0 : 0;
+    if (!had) {
         if (n >= MOVER_MAX) {
             LeaveCriticalSection(&g_mover_lock);
             bslog("MOVER   !! 挂在路径上的对象超过 %d 个，link=%d 没记"
@@ -5861,15 +5896,26 @@ static void __stdcall mover_note_link(unsigned char *self, unsigned int t0)
             return;
         }
         g_mover_count = n + 1;
+        g_mover[i].sent = 0;
     }
     g_mover[i].link = link;
+    g_mover[i].obj = self;
+    g_mover[i].vft = vft;
     g_mover[i].t0 = t0;
     g_mover[i].t_off = t_off;
     g_mover[i].rel = rel;
+    g_mover[i].site = (unsigned char)site;
     InterlockedExchange(&g_mover_dirty, 1);
     LeaveCriticalSection(&g_mover_lock);
-    bsvlog("MOVER   LinkPath: link=%d t0=%u t_off=%d rel=%u gc=%p",
-           link, t0, t_off, (unsigned)rel, gc);
+    if (site == MOVER_SITE_START && had)
+        bsvlog("MOVER   开打重取起点: link=%d t0=%u（原来 %u，挪了 %d ms）t_off=%d obj=%p",
+               link, t0, old_t0, (int)(t0 - old_t0), t_off, self);
+    else if (site == MOVER_SITE_START)
+        bsvlog("MOVER   开打重取起点: link=%d t0=%u（表里原先没有它）t_off=%d obj=%p",
+               link, t0, t_off, self);
+    else
+        bsvlog("MOVER   LinkPath: link=%d t0=%u t_off=%d rel=%u obj=%p stage=%p",
+               link, t0, t_off, (unsigned)rel, self, mover_current_stage());
 }
 
 static __declspec(naked) void mover_link_detour(void)
@@ -5877,6 +5923,7 @@ static __declspec(naked) void mover_link_detour(void)
     __asm {
         mov  dword ptr [esi + 0x90], eax    /* 被偷走的那条，原样跑 */
         pushad
+        push MOVER_SITE_LINK                /* site */
         push eax                            /* t0 */
         push esi                            /* this */
         call mover_note_link
@@ -5886,20 +5933,46 @@ static __declspec(naked) void mover_link_detour(void)
     }
 }
 
+static __declspec(naked) void mover_start_detour(void)
+{
+    __asm {
+        mov  dword ptr [esi + 0x90], eax    /* 被偷走的那条，原样跑 */
+        pushad
+        push MOVER_SITE_START               /* site */
+        push eax                            /* t0 */
+        push esi                            /* this */
+        call mover_note_link
+        popad
+        push MOVERST_RESUME_TO
+        ret
+    }
+}
+
+/* 两处一起装：① 是发包的前提（表从它来）；② 装不上时周期那一发照样现读到开打后的
+   起点，只是晚到 ≤1 秒 —— 所以 ② 失败只打一行 `!!`，不拖 ①。 */
 static int try_patch_mover_link(void)
 {
-    if (g_mover_patched) return 1;
     if (!InterlockedCompareExchange(&g_mover_lock_ready, 0, 0)) {
         InitializeCriticalSection(&g_mover_lock);
         InterlockedExchange(&g_mover_lock_ready, 1);
     }
-    if (!install_jmp_guard(MOVERLK_VA, MOVERLK_SIG, MOVERLK_SIG_LEN,
-                           MOVERLK_STOLEN, mover_link_detour, "移动平台相位"))
-        return 0;
-    InterlockedExchange(&g_mover_patched, 1);
-    bslog("PATCH   ★移动平台相位 @ %08X: MapObject::LinkPath 收尾记下每个挂在路径上的"
-          "对象的 (link, t0, t_off)，经 UDP 旁路每秒报给服务端（X_Mod §74；只报事实，"
-          "谁的相位算数在服务端）", (unsigned)MOVERLK_VA);
+    if (!g_mover_patched) {
+        if (!install_jmp_guard(MOVERLK_VA, MOVERLK_SIG, MOVERLK_SIG_LEN,
+                               MOVERLK_STOLEN, mover_link_detour, "移动平台相位"))
+            return 0;
+        InterlockedExchange(&g_mover_patched, 1);
+        bslog("PATCH   ★移动平台相位 ① @ %08X: MapObject::LinkPath 收尾记下每个挂在路径上的"
+              "对象，经 UDP 旁路每秒报它**此刻**的 (link, t0, t_off)（X_Mod §74 / §78；"
+              "只报事实，谁的相位算数在服务端）", (unsigned)MOVERLK_VA);
+    }
+    if (!g_mover_start_patched) {
+        if (!install_jmp_guard(MOVERST_VA, MOVERST_SIG, MOVERST_SIG_LEN,
+                               MOVERST_STOLEN, mover_start_detour, "移动平台开打重取"))
+            return 0;
+        InterlockedExchange(&g_mover_start_patched, 1);
+        bslog("PATCH   ★移动平台相位 ② @ %08X: GameContext::StartGame 开打时把所有移动平台的"
+              "起点重取成「现在」—— 记下来立刻报（X_Mod §78）", (unsigned)MOVERST_VA);
+    }
     return 1;
 }
 
@@ -8710,54 +8783,71 @@ static void sync_send_presence(void)
     sync_send_raw(buf, n);
 }
 
-/* 移动平台相位（X_Mod §74）：表非空时每秒一发（记表后脏了立刻发）。
-   载荷：u32 game_now（`[GameContext+0xe0]`，= 战斗态的 Timer()）/ u32 wall_now
+/* 移动平台相位（X_Mod §74 / §78）：表非空时每秒一发（站点一触发就置脏，下一轮立刻发）。
+   载荷：u32 game_now（`[当前 Stage + 0xe0]`，= 此刻的 Timer()）/ u32 wall_now
    （GetTickCount）/ 头里 count 条 { i32 link, u32 t0, i32 t_off }。
-   ★ 跑在 watch_thread 上，读的是游戏内存：GameContext 没了（战斗结束 / 还没开始）
-     或和记表那会儿的不是同一个（换了一局、表还是上一局的）就不发 —— 那时本来也
-     没什么可报。记表时 GameContext 还没建（NULL）的话，第一次发时认下当时那个。 */
+   ★★ t0 / t_off 是**这一刻从对象身上现读的**，不是记表时抄下的 —— 开打时 StartGame
+     会把起点整体重取一遍（§78），周期这一发就得跟着变，否则同步只能对齐时钟漂移、
+     纠正不了起点。现读前核对对象还在（虚表 + link 没变）；核对不过的条目（换图 /
+     散局后旧图的对象）当场摘掉。
+   ★ 跑在 watch_thread 上，读的是游戏内存。没有当前 Stage（换 stage 的空档，Timer()
+     这时走全局计时器）就这一轮不发，下一轮再看。**不**再要求「和记表时是同一个
+     Stage」：stage 6（LoadingStage）→ 7（GameStage）本来就换对象，那道门在会话 30
+     一开打就把整局的同步包全拦了（§78）。 */
 static void sync_send_mover_phase(void)
 {
     unsigned char buf[8 + 8 + MOVER_MAX * 12];
-    struct mover_link items[MOVER_MAX];
-    int n, i, len;
+    int links[MOVER_MAX], toffs[MOVER_MAX];
+    unsigned int t0s[MOVER_MAX];
+    int n = 0, kept = 0, changed = 0, i, len;
+    unsigned char first_site = 0;
     unsigned int game_now, wall_now;
-    unsigned char *gc;
-    void *world;
+    unsigned char *stage;
 
     if (!InterlockedCompareExchange(&g_mover_patched, 0, 0)) return;
     if (!g_sync_ticket[0]) return;
     if (!InterlockedCompareExchange(&g_sync_ready, 0, 0)) return;
-    gc = mover_game_context();
-    if (!gc) return;
+    stage = mover_current_stage();
+    if (!stage) return;
     EnterCriticalSection(&g_mover_lock);
-    n = g_mover_count;
-    if (n > MOVER_MAX) n = MOVER_MAX;
-    if (g_mover_gc == NULL) g_mover_gc = gc;
-    if ((void *)gc != g_mover_gc) n = 0;
-    memcpy(items, g_mover, sizeof(struct mover_link) * (size_t)(n > 0 ? n : 0));
-    world = g_mover_world;
+    for (i = 0; i < g_mover_count && i < MOVER_MAX; i++) {
+        struct mover_link m = g_mover[i];
+        if (IsBadReadPtr(m.obj, MOVER_OBJ_LINK_OFF + 4)
+            || *(void **)m.obj != m.vft
+            || *(int *)(m.obj + MOVER_OBJ_LINK_OFF) != m.link)
+            continue;                                   /* 对象没了：这一条摘掉 */
+        links[n] = m.link;
+        t0s[n] = *(unsigned int *)(m.obj + MOVER_OBJ_T0_OFF);
+        toffs[n] = *(int *)(m.obj + MOVER_OBJ_TOFF_OFF);
+        if (!m.sent || m.sent_t0 != t0s[n]) changed = 1;
+        if (n == 0) first_site = m.site;
+        m.sent = 1;
+        m.sent_t0 = t0s[n];
+        g_mover[kept++] = m;
+        n++;
+    }
+    g_mover_count = kept;
     InterlockedExchange(&g_mover_dirty, 0);
     LeaveCriticalSection(&g_mover_lock);
     if (n <= 0) return;
-    game_now = *(unsigned int *)(gc + MOVER_GC_TIMER_OFF);
+    game_now = *(unsigned int *)(stage + MOVER_STAGE_NOW_OFF);
     wall_now = GetTickCount();
     len = sync_put_header(buf, SYNC_MSG_MOVER_PHASE, n);
     memcpy(buf + len, &game_now, 4); len += 4;
     memcpy(buf + len, &wall_now, 4); len += 4;
     for (i = 0; i < n; i++) {
-        memcpy(buf + len, &items[i].link, 4);  len += 4;
-        memcpy(buf + len, &items[i].t0, 4);    len += 4;
-        memcpy(buf + len, &items[i].t_off, 4); len += 4;
+        memcpy(buf + len, &links[i], 4); len += 4;
+        memcpy(buf + len, &t0s[i], 4);   len += 4;
+        memcpy(buf + len, &toffs[i], 4); len += 4;
     }
     sync_send_raw(buf, len);
-    /* 日志按 World 翻转去重：一张图一行。 */
-    if (world != g_mover_logged_world) {
-        g_mover_logged_world = world;
-        bslog("MOVER   报 %d 条相位（link=%d 载图后 %u ms，偏移 %d；游戏时钟 %u / 墙钟 %u）",
-              n, items[0].link, game_now - items[0].t0, items[0].t_off,
-              game_now, wall_now);
-    }
+    /* 日志按**起点翻转**去重：载图一次、开打重取一次，之后每秒那一发静默。 */
+    if (changed)
+        bslog("MOVER   报 %d 条相位（link=%d 起点 t0=%u，最近一次由%s记下；此刻相位 %d ms，"
+              "偏移 %d；游戏时钟 %u / 墙钟 %u）",
+              n, links[0], t0s[0],
+              first_site == MOVER_SITE_START ? "「开打重取」" : "「载图 LinkPath」",
+              (int)(game_now - t0s[0]), toffs[0], game_now, wall_now);
 }
 
 /* 从 `0x0100 gcpReqLogin` 的载荷里取票据（首字段 wstring：u16 字符数 +
@@ -10485,19 +10575,22 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x40EE1D 特征对不上）—— 服务端收不到键盘/前台那几条证据");
     }
 
-    /* 移动平台相位（X_Mod §74 / D55）。站点在解壳后就绪的代码里；LinkPath 要进图
-       才跑，远晚于这里。装不上只是「服务端对移动平台退回开局估计」，不影响任何
-       玩法 ⇒ 单给一个 BSHOOK_NO_MOVER_PHASE=1。 */
+    /* 移动平台相位（X_Mod §74 / §78 / D55）。两个站点都在解壳后就绪的代码里；LinkPath
+       要进图才跑、StartGame 要开打才跑，都远晚于这里。装不上只是「服务端对移动平台
+       退回开局估计」，不影响任何玩法 ⇒ 单给一个 BSHOOK_NO_MOVER_PHASE=1。 */
     if (mover_phase_disabled()) {
         bslog("PATCH   BSHOOK_NO_MOVER_PHASE 已设，不报移动平台相位（服务端退回开局估计）");
     } else {
-        for (ticks = 0; !g_stop && !g_mover_patched && ticks < 2000; ticks++) {
+        for (ticks = 0; !g_stop && ticks < 2000; ticks++) {
             if (try_patch_mover_link()) break;
             Sleep(2);
         }
         if (!g_mover_patched)
-            bslog("PATCH   !! 超时未能 patch 移动平台相位（0x511D97 特征对不上）"
+            bslog("PATCH   !! 超时未能 patch 移动平台相位 ①（0x511D97 特征对不上）"
                   "—— 服务端对移动平台退回开局估计");
+        else if (!g_mover_start_patched)
+            bslog("PATCH   !! 超时未能 patch 移动平台相位 ②（0x476463 特征对不上）"
+                  "—— 开打后的起点要等下一发周期同步（≤1 秒）才报上去");
     }
 
     /* NEXON 信使（§85 / D83）：默认**整个拆掉** —— 四格 IAT 全换成自己的桩，
