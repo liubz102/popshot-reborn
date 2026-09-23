@@ -16,6 +16,10 @@ BigShot.exe --(IPv4)--> 127.0.0.1:27808 ┘   getaddrinfo 解析  └─> <serve
 代理建立；没有设置时仍由 `socket.create_connection` 直接连接。`bshook` 选择
 「本机服务器」时根本不会连到上面三个本地中继端口，所以本机模式天然不受代理影响。
 
+★ **位置数据的 UDP 旁路（`UdpSyncRelay`）两种模式都走这里**（X_Mod D58，用户 2026-09-23）：
+`bshook` 在 HELLO 里说这一轮选的是哪边，本机就转给 `127.0.0.1:27799/udp`、远程就转给
+`server_address` —— 只差上游地址，其余同一份代码，本机测到的就是线上跑的。
+
 **为什么非有它不可**（决策 D065）：客户端是 2007 年的 32 位程序，
 `connect` 的参数是 `sockaddr_in`（**纯 IPv4**），`bshook` 只能把目标改写成另一个
 IPv4 地址。需求要求 `server.config` 支持 IPv4 / IPv6 / **域名**三种写法 ——
@@ -60,6 +64,10 @@ for _stream in (sys.stdout, sys.stderr):
 #: 中继只服务本机的客户端，所以**只绑 127.0.0.1**。
 #: （服务端那三个口才需要对外开，见 D063。）
 LISTEN_HOST = "127.0.0.1"
+
+#: 玩家在登录框里选「**本机服务器**」时，位置数据 UDP 旁路的上游（X_Mod D58）：
+#: 本机服务端，端口和远程一样是 `UDP_SYNC_PORT`。**本机和远程只差这一个地址。**
+LOCAL_SERVER_HOST = "127.0.0.1"
 
 #: 本地端口 -> 远端端口。见 `server/config.py` 的常量说明。
 #:
@@ -435,12 +443,11 @@ def start_udp_sync(target_host, proxy=None, enabled=True, redundancy=2):
     if not enabled:
         log("位置UDP  已关闭（server.config 的 udp_sync = 0）；位置数据走 TCP")
         return None
-    if proxy is not None:
-        # SOCKS5 的 UDP ASSOCIATE 要另开通道且未必被代理支持，HTTP CONNECT
-        # 根本转不了 UDP。做半套不如不做 —— 走代理就保持今天的行为。
-        log("位置UDP  已启用代理，位置数据回退 TCP（代理转不了 UDP）")
-        return None
-    relay = UdpSyncRelay(target_host, redundancy=redundancy)
+    # ★ 代理开着时**只关「远程」那条上游**（X_Mod D58）：SOCKS5 的 UDP ASSOCIATE 要另开
+    #   通道且未必被代理支持，HTTP CONNECT 根本转不了 UDP —— 远程模式保持 TCP。
+    #   「本机服务器」那条是环回，和代理无关，照常走（以前这里整条不起，本机模式跟着没了）。
+    relay = UdpSyncRelay(target_host, redundancy=redundancy,
+                         proxied=proxy is not None)
     return relay if relay.start() else None
 
 
@@ -481,34 +488,59 @@ class UdpSyncRelay:
     """位置数据的本机 UDP 中继（`server/udpsync.py` 是它的对端）。
 
     ```text
-    BigShot.exe --(bshook 镜像)--> 127.0.0.1:27809/udp ─┐
-                                                        ├─ 本类 ─> <server>:27799/udp
-    BigShot.exe:7788/udp <--(下行注入，阶段 2)-----------┘
+                                                         ┌─ 选「远程服务器」─> <server_address>:27799/udp
+    BigShot.exe --(bshook 镜像)--> 127.0.0.1:27809/udp ─┤
+                                                本类 ───┤
+    BigShot.exe:27807/udp <--(下行注入)-----------------┘─ 选「本机服务器」─> 127.0.0.1:27799/udp
     ```
 
     ★ **它不是「把 TCP 换成 UDP」，是在 TCP 之外多走一份。** 客户端那份
     `0x040e` 照发不误，所以这条 UDP 通道**整条不通也没有任何后果** ——
     服务端按索引去重，UDP 没到就用 TCP 那份。
 
-    ★ **代理开着时整条通道禁用**：SOCKS5 的 UDP ASSOCIATE 要另开一条通道、
+    ★★ **本机 / 远程只差上游这一个地址**（X_Mod D58，用户 2026-09-23）。`bshook` 两种模式
+    都往同一个口发，这一轮往哪转由 HELLO 里的 `HELLO_FLAG_LOCAL_SERVER` 说了算；冗余捎带、
+    下行注入、HELLO 重试 / 保活全是同一份代码 —— 本机测到的就是线上跑的。
+    两条上游**各用各的 socket**（`_upstreams`）：换了路由之后，上一条上游迟到的回包落在
+    它自己那条 socket 上，`_pump_remote` 直接不认，不用去比对来源地址（远程服务器在
+    NAT / 负载均衡后面时，回包的来源地址未必就是我们发去的那个）。
+
+    ★ **代理开着时只关「远程」那条**：SOCKS5 的 UDP ASSOCIATE 要另开一条通道、
     还得代理服务器支持，HTTP CONNECT 根本转不了 UDP。与其做半套不如不做 ——
-    走代理的玩家保持今天的行为。
+    走代理的玩家远程模式保持 TCP。「本机」那条是环回，和代理无关，照常走。
     """
 
     def __init__(self, target_host, target_port=None, local_port=None,
-                 redundancy=2):
+                 redundancy=2, proxied=False, local_target=None):
         self.target_host = target_host
         self.target_port = target_port or server_config.UDP_SYNC_PORT
         self.local_port = local_port or server_config.RELAY_UDP_SYNC_PORT
+        #: 选「本机服务器」时的上游 `(host, port)`。参数只给测试留的口 —— 真的
+        #: 27799 在测试机上多半正被本机服务端占着。
+        self.local_target = tuple(local_target or (LOCAL_SERVER_HOST,
+                                                   server_config.UDP_SYNC_PORT))
+        #: 远程那条要走代理 ⇒ 转不了 UDP，那条上游不开（本机那条不受影响）。
+        self.proxied = bool(proxied)
         self.redundancy = max(0, int(redundancy))
         #: 游戏那个「收位置数据的 UDP 口」bind 成功了没有。
         #: ★ 这个值**不是我们判的，是 `bshook` 告诉我们的** —— 它在游戏进程里
         #: 钩住 `bind`，亲眼看着那一次 bind 返回 0 才置位。所以它是权威的，
         #: 不存在「口被别的程序占着而我们以为是游戏」那种假阳性。
         self.downlink = False
+        #: ★ 这一轮登录选的是不是「本机服务器」—— **`bshook` 在 HELLO 里说的**
+        #:   （`HELLO_FLAG_LOCAL_SERVER`，X_Mod D58），不是我们猜的。还没收到过 HELLO
+        #:   时按远程算，和加这一位之前一个字节不差。
+        self.route_local = False
         self.local = None
-        self.remote = None
-        self.remote_addr = None
+        #: 这一轮的上游 `(socket, 地址)`；`None` = 这一轮不转（远程走代理 / 解析不了 /
+        #: 没 `start()` 过）。★ 两格放在**一个**元组里一起换，别的线程读到的永远是
+        #: 同一条路由的一对，不会拿新 socket 往旧地址发。
+        self._up = None
+        #: `route_local -> (socket, 地址)`：每条路由第一次用到时才建，之后一直留着。
+        self._upstreams = {}
+        #: 「这一轮的上游」上次打日志时是哪条 —— 按状态翻转说话（铁律 10）。
+        self._route_said = None
+        self._started = False
         self.hook_addr = None
         self.ticket = ""
         self.acked = False
@@ -547,24 +579,85 @@ class UdpSyncRelay:
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
-    # -- 建 socket ----------------------------------------------------------
-    def _resolve(self):
-        infos = socket.getaddrinfo(self.target_host, self.target_port,
-                                   type=socket.SOCK_DGRAM)
-        family, _, _, _, sockaddr = infos[0]
-        return family, sockaddr
+    # -- 上游：这一轮往哪转 -------------------------------------------------
+    @property
+    def remote(self):
+        """这一轮上游的 socket；`None` = 这一轮不转。"""
+        up = self._up
+        return None if up is None else up[0]
 
-    def start(self):
-        """建好两条 socket 并把收发线程拉起来。失败时返回 `False`（不抛）。"""
+    @property
+    def remote_addr(self):
+        up = self._up
+        return None if up is None else up[1]
+
+    def _route_name(self, local=None):
+        return "本机服务器" if (self.route_local if local is None else local) \
+            else "远程服务器"
+
+    def _open_upstream(self, local):
+        """建一条上游：`(socket, 地址)`；开不出来返回 `None`（这一轮不转，TCP 照常）。"""
+        if local:
+            host, port = self.local_target
+        elif self.proxied:
+            return None                     # 代理转不了 UDP，start() 里已经说过了
+        else:
+            host, port = self.target_host, self.target_port
         try:
-            family, self.remote_addr = self._resolve()
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
+            family, _, _, _, sockaddr = infos[0]
         except OSError as error:
-            log(f"位置UDP  ✗ 解析不了 {self.target_host}: {error}；"
-                f"位置数据继续走 TCP")
-            return False
+            log(f"位置UDP  ✗ 解析不了 {server_config.http_host(host)}: {error}；"
+                f"选「{self._route_name(local)}」时位置数据继续走 TCP")
+            return None
         try:
-            self.remote = socket.socket(family, socket.SOCK_DGRAM)
-            self.remote.settimeout(0.5)
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+            sock.settimeout(0.5)
+        except OSError as error:
+            log(f"位置UDP  ✗ 建不了到 {server_config.http_host(host)} 的 UDP socket"
+                f"（{error}）；选「{self._route_name(local)}」时位置数据继续走 TCP")
+            return None
+        threading.Thread(target=self._pump_remote, args=(sock,), daemon=True,
+                         name="udpsync-remote-local" if local
+                         else "udpsync-remote").start()
+        return (sock, sockaddr)
+
+    def _use_route(self, local, quiet=False):
+        """这一轮登录往哪转（X_Mod D58）。由 HELLO 里的那一位决定，`start()` 先按远程备好。
+
+        每条路由的 socket 第一次用到才建，之后留着复用；没 `start()` 过（单测直接喂报文）
+        只记路由、不开 socket。上游换了才打一行 —— 按状态翻转说话。
+        """
+        self.route_local = bool(local)
+        if not self._started:
+            return
+        up = self._upstreams.get(self.route_local)
+        if up is None:
+            up = self._open_upstream(self.route_local)
+            if up is not None:
+                self._upstreams[self.route_local] = up
+        self._up = up
+        said = (self.route_local, None if up is None else up[1])
+        if said != self._route_said:
+            self._route_said = said
+            if quiet:
+                pass                        # start() 那一行已经把两条路由说全了
+            elif up is not None:
+                log(f"位置UDP  这一轮登录选的是「{self._route_name()}」→ 上游 "
+                    f"{server_config.http_host(up[1][0])}:{up[1][1]}/udp")
+            elif self.proxied and not self.route_local:
+                log("位置UDP  这一轮登录选的是「远程服务器」，走代理 —— "
+                    "位置数据回退 TCP（代理转不了 UDP）")
+
+    # -- 建 socket ----------------------------------------------------------
+    def start(self):
+        """建好本机那条 socket 并把收发线程拉起来。失败时返回 `False`（不抛）。
+
+        ★ 上游 socket 按路由各建一条（`_use_route`）。这里先按远程备好 —— 和以前一样
+          一启动就解析 `server_address`、解析不了当场说一声；但**解析不了不再让整条
+          旁路起不来**：选「本机服务器」那条用不着它。
+        """
+        try:
             self.local = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.local.bind((LISTEN_HOST, self.local_port))
             self.local.settimeout(0.5)
@@ -573,18 +666,23 @@ class UdpSyncRelay:
                 f"（{error}）；位置数据继续走 TCP")
             self.close()
             return False
+        self._started = True
         for target, name in ((self._pump_local, "udpsync-local"),
-                             (self._pump_remote, "udpsync-remote"),
                              (self._pump_timer, "udpsync-timer")):
             threading.Thread(target=target, daemon=True, name=name).start()
-        log(f"位置UDP  {LISTEN_HOST}:{self.local_port}/udp → "
-            f"{server_config.http_host(self.target_host)}:{self.target_port}/udp"
+        remote = ("已启用代理，位置数据回退 TCP（代理转不了 UDP）" if self.proxied
+                  else f"{server_config.http_host(self.target_host)}:"
+                       f"{self.target_port}/udp")
+        log(f"位置UDP  {LISTEN_HOST}:{self.local_port}/udp → 选「远程服务器」时 {remote}；"
+            f"选「本机服务器」时 {self.local_target[0]}:{self.local_target[1]}/udp"
             f"（冗余 {self.redundancy} 份；只走位置数据，其余照旧 TCP）")
+        self._use_route(False, quiet=True)
         return True
 
     def close(self):
         self._stop.set()
-        for sock in (self.local, self.remote):
+        socks = [self.local] + [up[0] for up in self._upstreams.values()]
+        for sock in socks:
             try:
                 if sock is not None:
                     sock.close()
@@ -617,17 +715,21 @@ class UdpSyncRelay:
             # `bshook` 发来的 HELLO 有两种时机：
             #   * 登录（发出 `0x0100`）—— 票据换了、索引从头数；
             #   * 游戏成功 bind 了收位置数据的 UDP 口 —— 标志位置起来。
-            # 两种都原样把票据 + 标志位转告服务端。
+            # 两种都把票据 + 下行位转告服务端。★ 「本机服务器」那一位**不转**
+            # （`_send_hello` 重新拼的包只带下行位）—— 它只决定我们往哪转（X_Mod D58）。
             try:
                 ticket, flags = udpsync.parse_hello_full(data)
             except udpsync.ProtocolError:
                 return
             downlink = bool(flags & udpsync.HELLO_FLAG_DOWNLINK)
+            local = bool(flags & udpsync.HELLO_FLAG_LOCAL_SERVER)
             with self._lock:
                 # ★ 「新的一条游戏连接」不能靠票据变没变来判 —— 断线重连时
                 #   客户端会**原样重放同一张票据**（§171）。判据是标志位从
                 #   「已绑」回到「没绑」：`bshook` 每发一次登录包就把它清一次。
-                restart = (ticket != self.ticket) or (self.downlink and not downlink)
+                #   换了服务器（本机 ↔ 远程）当然也是新的一条。
+                restart = ((ticket != self.ticket) or (self.downlink and not downlink)
+                           or (local != self.route_local))
                 self.ticket = ticket
                 if restart:
                     # 索引、水位、确认状态全部从头来 —— 服务端那边是一条新的
@@ -646,6 +748,8 @@ class UdpSyncRelay:
                     self.replies = 0
                 changed = (downlink != self.downlink)
                 self.downlink = downlink
+            # 这一轮往哪转 —— 必须在转发这发 HELLO **之前**定下来。
+            self._use_route(local)
             if changed:
                 log(f"位置UDP  下行 {'已就绪' if downlink else '未就绪'}"
                     f"（游戏的 UDP {server_config.CLIENT_UDP_PORT} "
@@ -688,10 +792,11 @@ class UdpSyncRelay:
         self._to_remote(payload)
 
     def _to_remote(self, payload):
-        if self.remote is None:
+        up = self._up                       # ★ 一次读出一对，别和换路由的线程撞上
+        if up is None:
             return
         try:
-            self.remote.sendto(payload, self.remote_addr)
+            up[0].sendto(payload, up[1])
             self.sent += 1
         except OSError:
             # 发不出去就发不出去 —— TCP 那份照常在跑，玩家察觉不到。
@@ -725,10 +830,11 @@ class UdpSyncRelay:
             pass
 
     # -- 服务器 -> 我们 -> 游戏 ---------------------------------------------
-    def _pump_remote(self):
+    def _pump_remote(self, sock):
+        """一条上游 socket 的收包循环（本机 / 远程各一条，X_Mod D58）。"""
         while not self._stop.is_set():
             try:
-                data, _ = self.remote.recvfrom(udpsync.MAX_DATAGRAM * 2)
+                data, _ = sock.recvfrom(udpsync.MAX_DATAGRAM * 2)
             except socket.timeout:
                 continue
             except OSError:
@@ -736,6 +842,11 @@ class UdpSyncRelay:
                     break
                 # Windows 上对端没监听时会以 WSAECONNRESET 的形式报到**下一次**
                 # recvfrom 上，UDP 上这完全正常，继续收。
+                continue
+            if self.remote is not sock:
+                # ★ 不是这一轮的上游 —— 玩家换了服务器（本机 ↔ 远程），这是上一条
+                #   迟到的回包（ACK / 下行）。认了它会把「上一轮的确认」当成这一轮的，
+                #   或者把上一台服务器的位置数据投进游戏。
                 continue
             self.received += 1
             self.replies += 1
@@ -820,8 +931,12 @@ class UdpSyncRelay:
                 self._to_remote(udpsync.build_ping(udpsync.MSG_PING, 0))
             if self._quiet_warning_due(now):
                 self.warned_quiet = True
-                log(f"位置UDP  ⚠ {UDP_QUIET_WARN_S:.0f} 秒没等到服务器回应 —— "
-                    f"多半是服务器没放行 UDP {self.target_port}，"
+                addr = self.remote_addr
+                where = (f"{server_config.http_host(addr[0])}:{addr[1]}"
+                         if addr else f"UDP {self.target_port}")
+                log(f"位置UDP  ⚠ {UDP_QUIET_WARN_S:.0f} 秒没等到服务器回应"
+                    f"（「{self._route_name()}」{where}）—— "
+                    f"多半是服务器没放行这个 UDP 口，"
                     f"或者服务端是旧版。**位置数据继续走 TCP，游戏一切正常**")
 
     def _quiet_warning_due(self, now):
@@ -836,13 +951,17 @@ class UdpSyncRelay:
            路是通的、只是票据不对，那是 `_on_remote_datagram` 里那条日志的事，
            不该说成「没等到回应」。★ 判据用的是 `replies`（每条游戏连接清零）
            而不是 `received`（整个进程的累计值）。
+        4. **这一轮真有上游在发**（X_Mod D58）：选「远程服务器」又走代理时这条上游
+           根本不开，HELLO 一发都没出去，谈不上「服务器没回应」—— 那种情况
+           `_use_route` 已经明说过「回退 TCP」了。
 
         抽成一个纯判据是为了能单测 —— `_pump_timer` 是个死循环。
         """
         return (not self.warned_quiet and bool(self.ticket) and not self.acked
                 and bool(self.first_hello_at)
                 and now - self.first_hello_at > UDP_QUIET_WARN_S
-                and self.replies == 0)
+                and self.replies == 0
+                and not (self._started and self._up is None))
 
 
 def main():

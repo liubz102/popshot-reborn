@@ -128,7 +128,9 @@ start.bat
        │                                     127.0.0.1:47621 → <server_address>:47611
        │                                     127.0.0.1:27809 → <server_address>:27799
        │                                     127.0.0.1:27809/udp → <server_address>:27799/udp
-       │                                       （位置数据；bshook 镜像进来，收到的投回 27807）
+       │                                       （位置数据 / 在场证据 / 移动平台相位；bshook 发进来，
+       │                                         收到的投回 27807。选「本机服务器」时同一条路，
+       │                                         只是转给 127.0.0.1:27799/udp）
        └─ hook/bin/bsloader.exe
             └─ game_patched/BigShot.exe
                  └─ 注入 hook/bin/bshook.dll
@@ -137,6 +139,7 @@ start.bat
                       │  连本机服务端还是连中继
                       ├─ 把「注册成为世纪天成用户」换成我们自己的注册页
                       ├─ 把战斗中的位置数据额外镜像一份到本机中继的 UDP 口
+                      │  （本机 / 远程两种模式都开）
                       ├─ 把客户端对 Pack\*.pkn 的打开改到 Pack_publish\
                       │  （tools\build-pack.bat 打出来的资源卷，格式和原版一致）
                       └─ 可选记录解密后的协议数据

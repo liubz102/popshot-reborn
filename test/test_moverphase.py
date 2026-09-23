@@ -12,6 +12,7 @@
 
 ★ 纯标准库 + 服务端模块，两套运行时都跑。
 """
+import math
 import os
 import sys
 import types
@@ -324,6 +325,114 @@ class RegressionTests(unittest.TestCase):
         self.assertLess(before, hit)
         # 半个周期后鱼飘到另一头（x≈982），同一条线就空了
         self.assertEqual((None, None), contact(self.terrain, x, y0, x, y1, 0.0, t_ms=5000))
+
+
+class BounceOffMoverTests(unittest.TestCase):
+    """★ X_Mod §77：手雷撞上鲤鱼之后**往哪弹**，也得把鲤鱼算进去。
+
+    用户 2026-09-23：「苹果雷在鱼上反弹跳起来，跳起来后模型突然消失，然后在鱼背上出现
+    炸裂动画」。服务端判「撞上」带了时钟，量「朝向」的三个函数（`_block_facing` /
+    `_terrain_facing` / `_nearest_solid`）却只查静态地形 ⇒ 鱼背上一格实心都采不到 ⇒
+    速度只减半、方向不动 ⇒ 下一格又扎回鱼身 …… 服务端那颗贴在撞点上等到引信烧完，
+    而客户端那颗早弹上天了（客户端 `0x473969` 是连地图对象一起算的）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import ballistics
+        import bot
+        import mapdata
+        import weapondata
+        cls.ballistics, cls.bot, cls.mapdata = ballistics, bot, mapdata
+        cls.weapon = weapondata.get(1000020)          # 泰尔 2 号：苹果雷（AppleGrenade）
+
+    def setUp(self):
+        if self.weapon is None:
+            self.skipTest("武器表里没有 1000020")
+        self.clock = 0
+        real = self.bot._mover_clock
+        self.bot._mover_clock = lambda room, terrain: self.clock
+        self.addCleanup(setattr, self.bot, "_mover_clock", real)
+
+    @staticmethod
+    def _blob(raw):
+        import base64
+        import zlib
+        return base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
+
+    def _flat_mover_terrain(self):
+        """400×400 的空图，(200, 300) 上停着一块 100×20 的实心移动平台（路径只有一个点）。"""
+        import struct
+        width = height = 400
+        mask = bytearray((100 * 20 + 3) // 4)
+        for i in range(100 * 20):
+            mask[i >> 2] |= 2 << ((i & 3) * 2)
+        return self.mapdata.MapTerrain({
+            "format": self.mapdata.FORMAT, "name": "Tiny", "version": 18,
+            "width": width, "height": height,
+            "cells": self._blob(bytes((width * height + 3) // 4)),
+            "ground_counts": self._blob(struct.pack("<%dH" % width, *([0] * width))),
+            "ground_ys": self._blob(b""),
+            "movers": [{"handle": 1, "x": 0.0, "y": 0.0, "loop": 0,
+                        "pts": [[200.0, 300.0, 1000, 0.0, 0.0, 1.0]],
+                        "riders": [{"handle": 2, "w": 100, "h": 20, "sx": 1.0, "sy": 1.0,
+                                    "x": 0.0, "y": 0.0, "t_off": 0, "rel": 0,
+                                    "mask": self._blob(bytes(mask))}]}],
+        })
+
+    def _shell(self, angle, power, x0, y0, speed=None):
+        b = self.ballistics
+        if speed is None:
+            speed = b.speed_for_power(self.weapon, power)
+        shot = b.Shot(angle, power, speed, 0.0, b.gravity_per_tick(self.weapon))
+        return self.bot.Shell(1, 0, self.weapon, 2, x0, y0, shot, 0.0, 45)
+
+    def test_a_grenade_dropping_onto_a_mover_bounces_up(self):
+        terrain = self._flat_mover_terrain()
+        self.assertEqual(0, terrain.cell(200, 295))                # 静态地形里什么都没有
+        self.assertTrue(terrain.blocks_bullet(200, 295, 0))       # 带上时钟才有平台
+        shell = self._shell(math.pi / 2, 0.0, 200.0, 200.0, speed=10.0)
+        for _ in range(20):
+            self.assertIsNone(self.bot._shell_step(None, shell, terrain, []))
+            if shell.bounced:
+                break
+        self.assertTrue(shell.bounced, "一直没撞上平台")
+        self.assertLess(shell.vy, 0.0, "撞上平台之后还在往下走 —— 朝向又没把平台算进去")
+        self.assertLess(shell.y, 290.0)                            # 停在平台上沿之上
+        # 下一格真的离开了，而不是贴在撞点上
+        y = shell.y
+        self.assertIsNone(self.bot._shell_step(None, shell, terrain, []))
+        self.assertLess(shell.y, y)
+
+    def test_the_facing_vote_counts_the_mover_only_with_a_clock(self):
+        terrain = self._flat_mover_terrain()
+        self.assertIsNone(self.bot._terrain_facing(terrain, 200, 291))
+        sx, sy = self.bot._terrain_facing(terrain, 200, 291, 0)
+        self.assertEqual(0.0, sx)
+        self.assertGreater(sy, 0.0)                                # 指向实心那一侧 = 下面
+
+    def test_the_20260923_carp_bounce_matches_the_client_log(self):
+        """句柄 200084（2026-09-23 云桥，`rpFire` 原字节：角度 -0.25969645380973816、力度 42）。
+
+        鲤鱼放在**客户端那一刻看到的相位**上（开局后 41728 ms 出膛第一格、每格 +32，拿客户端逐帧
+        日志离线拟合出来的），撞鱼那一格的落点和弹开速度要和客户端 `PROJ.` 第 34 帧一致：
+        (906.00, 829.00)、(7.68, -15.14)。修之前这里算出来的是 (11.02, 12.91) —— 还朝下，
+        于是贴在鱼背上等引信。
+        ⚠ 服务端那一局自己的时钟（本机模式没有相位上报，按开局估计）比这个晚 32 ms：
+          鲤鱼位置取整到像素，差这么一点撞点就挪一格、弹出去的角度就不一样（§77）。
+          这条用例钉的是「朝向算对了」，相位准不准是另一件事。
+        """
+        terrain = self.mapdata.load("Festival02")
+        if terrain is None:
+            self.skipTest("没有 Festival02 的地形产物")
+        shell = self._shell(-0.25969645380973816, 42.0, 199.0, 507.0)
+        while not shell.bounced and shell.ticks < 45:
+            self.clock = 41728 + 32 * shell.ticks
+            self.assertIsNone(self.bot._shell_step(None, shell, terrain, []))
+        self.assertEqual(33, shell.ticks)
+        self.assertEqual((906.0, 829.0), (shell.x, shell.y))
+        self.assertAlmostEqual(7.68, shell.vx, places=2)
+        self.assertAlmostEqual(-15.14, shell.vy, places=2)
 
 
 if __name__ == "__main__":

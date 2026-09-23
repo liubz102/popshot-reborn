@@ -8447,6 +8447,14 @@ static int try_hook_snow(void);
 /* 每发心跳盖一个递增索引，服务端拿它和自己数的 TCP 发数对齐去重。            */
 /* **两边的起点都是「这条游戏连接的登录包」** —— 我们在看到 `0x0100`          */
 /* gcpReqLogin 时归零，服务端那边是一个新的 `Conn`，计数器同样从 0 起。        */
+/*                                                                            */
+/* ## 本机服务器 / 远程服务器**一个样**（X_Mod D58，用户 2026-09-23）          */
+/*                                                                            */
+/* 原来只在「远程服务器」下开（理由是本机走环回没有丢包）。可这条旁路早就不只  */
+/* 搬位置了 —— 在场证据、移动平台相位都靠它，本机测试等于这几样全没有，测出来 */
+/* 的也不是线上的样子。现在两种模式**完全同一条路**：都发到本机中继的同一个口， */
+/* 唯一的差别是 HELLO 里多一位 `SYNC_FLAG_LOCAL_SERVER`，中继据此把上游定成    */
+/* `127.0.0.1` 还是 `server.config` 的地址。其余一个字节都不分叉。             */
 /* -------------------------------------------------------------------------- */
 #define SYNC_MAGIC0 'P'
 #define SYNC_MAGIC1 'S'
@@ -8466,6 +8474,10 @@ static int try_hook_snow(void);
 /* HELLO 的标志位：「游戏这边收位置数据的 UDP 口已经 bind 成功，可以往这儿投」。
    和 `server/udpsync.py` 的 `HELLO_FLAG_DOWNLINK` 是同一位。 */
 #define SYNC_FLAG_DOWNLINK 0x01
+/* HELLO 的标志位：「这一轮登录选的是本机服务器」（X_Mod D58）。和 `server/udpsync.py`
+   的 `HELLO_FLAG_LOCAL_SERVER` 是同一位。**只给本机中继看**：它拿这一位决定这条旁路
+   的上游是 `127.0.0.1` 还是 `server.config` 的地址，转给服务端时不带它。 */
+#define SYNC_FLAG_LOCAL_SERVER 0x02
 /* 帧头 10 字节（RawPacket）：+0 魔数 0xff，+8 u16 opcode。§156。 */
 #define FRAME_HEADER 10
 /* UdpPacket 头 12 字节，内层 opcode 在 +10。§151。 */
@@ -8563,9 +8575,12 @@ static int sync_put_header(unsigned char *buf, int kind, int count)
     return 8;
 }
 
-/* 发一发 `HELLO`：票据 + 标志位。标志位现在只有一位 —— 「游戏那个收位置
-   数据的 UDP 口已经 bind 成功」。中继把它原样转告服务端，服务端据此决定
-   要不要给这个玩家发下行 UDP。 */
+/* 发一发 `HELLO`：票据 + 标志位。标志位两位：
+     `SYNC_FLAG_DOWNLINK`     「游戏那个收位置数据的 UDP 口已经 bind 成功」—— 中继转告
+                              服务端，服务端据此决定要不要给这个玩家发下行 UDP；
+     `SYNC_FLAG_LOCAL_SERVER` 「这一轮登录选的是本机服务器」—— 只给中继看，它据此选上游
+                              （X_Mod D58）。模式在点「开始」时就锁定了（`lock_online_mode`），
+                              登录包 / bind 成功这两个发 HELLO 的时刻都在那之后。 */
 static void sync_send_hello(void)
 {
     unsigned char buf[8 + 2 + 128 + 1];
@@ -8579,7 +8594,8 @@ static void sync_send_hello(void)
     memcpy(buf + n, g_sync_ticket, (size_t)chars);
     n += chars;
     buf[n++] = (unsigned char)(
-        InterlockedCompareExchange(&g_sync_udp_bound, 0, 0) ? SYNC_FLAG_DOWNLINK : 0);
+        (InterlockedCompareExchange(&g_sync_udp_bound, 0, 0) ? SYNC_FLAG_DOWNLINK : 0)
+        | (popshot_online_mode() ? 0 : SYNC_FLAG_LOCAL_SERVER));
     sync_send_raw(buf, n);
 }
 
@@ -8771,8 +8787,9 @@ static void sync_on_login(const unsigned char *payload, int len)
        重连时客户端会**原样重放同一张票据**（§171），所以不能靠票据变没变来判。 */
     InterlockedExchange(&g_sync_udp_bound, 0);
     sync_send_hello();
-    bslog("SYNC    登录包已发出，位置数据 UDP 旁路重新开始计数（票据 %.8s…）",
-          g_sync_ticket);
+    bslog("SYNC    登录包已发出，位置数据 UDP 旁路重新开始计数（票据 %.8s…；%s，"
+          "中继据此选上游）", g_sync_ticket,
+          popshot_online_mode() ? "远程服务器" : "本机服务器");
 }
 
 /* 游戏成功 bind 了收位置数据的那个 UDP 口 —— 告诉本机中继可以往这儿投了。
@@ -8822,9 +8839,10 @@ static void sync_on_plain_frame(const unsigned char *frame, int len)
     const unsigned char *udp;
     int udplen;
 
-    /* 只在「远程服务器」模式下做。本机 / 局域网走的是环回或局域网，
-       没有跨境那种丢包，多发一份纯属浪费。 */
-    if (!popshot_online_mode()) return;
+    /* ★ 本机 / 远程**都做**（X_Mod D58）。这里原来有一道「只在远程服务器模式下做」
+       的门，理由是本机走环回没有丢包、多发一份纯属浪费 —— 可这条旁路现在还捎着
+       在场证据和移动平台相位，本机模式一关就全没了，本机测出来的也不是线上的样子。
+       两种模式的差别只剩 HELLO 里那一位，由中继去选上游。 */
     if (len < FRAME_HEADER + 2 || frame[0] != 0xff) return;
     opcode = (unsigned)(frame[8] | (frame[9] << 8));
     if (opcode == OP_REQ_LOGIN) {

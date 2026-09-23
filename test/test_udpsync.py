@@ -10,6 +10,7 @@
 """
 import errno
 import os
+import re
 import socket
 import sys
 import threading
@@ -1141,6 +1142,224 @@ class RelayNoticeTests(unittest.TestCase):
         self.assertEqual(0, self.relay.replies)
         self.assertTrue(self.relay._quiet_warning_due(
             now=500.0 + self.relay_module.UDP_QUIET_WARN_S + 1))
+
+
+# ----------------------------------------------------------------------------
+# 本机服务器 / 远程服务器：只差上游这一个地址（X_Mod D58）
+# ----------------------------------------------------------------------------
+class _TwoServers:
+    """两台「服务器」都是裸 UDP socket：只记收到了什么、回不回由用例决定 ——
+    这样才看得见「本机那一位有没有被转出去」「迟到的回包认没认」。"""
+
+    PROXIED = False
+
+    def setUp(self):
+        import relay                                            # noqa: PLC0415
+        self.relay_module = relay
+        self.lines = []
+        real_log = relay.log
+        relay.log = self.lines.append
+        self.addCleanup(setattr, relay, "log", real_log)
+        self.remote_srv = self._server()
+        self.local_srv = self._server()
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind(("127.0.0.1", 0))
+        local_port = probe.getsockname()[1]
+        probe.close()
+        self.relay = relay.UdpSyncRelay(
+            "127.0.0.1", target_port=self.remote_srv.getsockname()[1],
+            local_port=local_port, redundancy=2, proxied=self.PROXIED,
+            local_target=("127.0.0.1", self.local_srv.getsockname()[1]))
+        self.assertTrue(self.relay.start())
+        self.addCleanup(self.relay.close)
+        self.hook = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(self.hook.close)
+        self.relay_addr = ("127.0.0.1", local_port)
+
+    def _server(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.settimeout(5.0)
+        self.addCleanup(sock.close)
+        return sock
+
+    def hello(self, ticket, local, downlink=False):
+        """模拟 `bshook` 的 `sync_send_hello`：选本机就带 `HELLO_FLAG_LOCAL_SERVER`。"""
+        flags = ((udpsync.HELLO_FLAG_LOCAL_SERVER if local else 0)
+                 | (udpsync.HELLO_FLAG_DOWNLINK if downlink else 0))
+        self.hook.sendto(build_hello(ticket, flags), self.relay_addr)
+
+    @staticmethod
+    def nothing_arrives(server, wait=0.3):
+        """★ 「不该收到」没有事件可等，只能看一小段时间里真没来（测试专用）。"""
+        server.settimeout(wait)
+        try:
+            server.recvfrom(65536)
+        except socket.timeout:
+            return True
+        finally:
+            server.settimeout(5.0)
+        return False
+
+    def wait_for(self, predicate, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+
+class LocalServerRouteTests(_TwoServers, unittest.TestCase):
+    """★ 本机 / 远程**同一条路**（用户 2026-09-23）：`bshook` 两种模式都往同一个中继口发，
+    HELLO 里那一位决定中继往哪转；冗余 / 下行 / 重试全是同一份代码。"""
+
+    def test_a_local_login_goes_to_the_local_server(self):
+        self.hello("tkt-local", local=True)
+        data, _ = self.local_srv.recvfrom(65536)
+        self.assertEqual("tkt-local", parse_hello(data))
+        self.assertTrue(self.nothing_arrives(self.remote_srv))
+
+    def test_the_local_flag_is_not_passed_on_to_the_server(self):
+        """那一位只给中继选上游用；服务端收到的 HELLO 只带下行位。"""
+        self.hello("tkt-local", local=True, downlink=True)
+        data, _ = self.local_srv.recvfrom(65536)
+        _ticket, flags = udpsync.parse_hello_full(data)
+        self.assertEqual(udpsync.HELLO_FLAG_DOWNLINK, flags)
+
+    def test_positions_presence_and_mover_phase_ride_the_same_route(self):
+        """★ 这一轮之后的所有东西都跟着 HELLO 定下的上游走 —— 移动平台相位
+        正是这次要本机也开旁路的原因（没有它，本机测试里 bot 的手雷按开局估计算鲤鱼）。"""
+        self.hello("tkt-local", local=True)
+        self.local_srv.recvfrom(65536)                          # HELLO
+        self.hook.sendto(build_data([(0, heartbeat())]), self.relay_addr)
+        data, _ = self.local_srv.recvfrom(65536)
+        self.assertEqual(MSG_DATA, parse_header(data)[0])
+        for packet in (udpsync.build_presence(1, 2, 3, True),
+                       udpsync.build_mover_phase(1000, 2000, [(296, 500, 0)])):
+            self.hook.sendto(packet, self.relay_addr)
+            data, _ = self.local_srv.recvfrom(65536)
+            self.assertEqual(packet, data)                      # 原样转发
+        self.assertTrue(self.nothing_arrives(self.remote_srv))
+
+    def test_a_remote_login_after_a_local_one_goes_back_to_the_remote(self):
+        self.hello("tkt-local", local=True)
+        self.local_srv.recvfrom(65536)
+        self.hello("tkt-remote", local=False)
+        data, _ = self.remote_srv.recvfrom(65536)
+        self.assertEqual("tkt-remote", parse_hello(data))
+        self.assertTrue(self.nothing_arrives(self.local_srv))
+
+    def test_a_late_ack_from_the_previous_server_is_ignored(self):
+        """★ 换了服务器之后，上一台迟到的 ACK 不能被当成这一轮的确认 ——
+        认了的话中继就不再重发 HELLO，这一轮真要是丢了第一发就再也接不上。"""
+        self.hello("tkt-local", local=True)
+        _, relay_side = self.local_srv.recvfrom(65536)          # 中继「本机」那条上游
+        self.hello("tkt-remote", local=False)
+        _, remote_side = self.remote_srv.recvfrom(65536)
+        self.local_srv.sendto(build_hello_ack(ACK_OK), relay_side)
+        time.sleep(0.2)
+        self.assertFalse(self.relay.acked)
+        self.remote_srv.sendto(build_hello_ack(ACK_OK), remote_side)
+        self.assertTrue(self.wait_for(lambda: self.relay.acked))
+
+    def test_the_route_is_logged_only_when_it_changes(self):
+        """按状态翻转说话：同一边连登两次只说一次，换边再说。"""
+        for ticket in ("a", "b"):
+            self.hello(ticket, local=True)
+            self.local_srv.recvfrom(65536)
+        said = [x for x in self.lines if "这一轮登录选的是" in x]
+        self.assertEqual(1, len(said))
+        self.assertIn("本机服务器", said[0])
+        self.hello("c", local=False)
+        self.remote_srv.recvfrom(65536)
+        said = [x for x in self.lines if "这一轮登录选的是" in x]
+        self.assertEqual(2, len(said))
+        self.assertIn("远程服务器", said[1])
+
+
+class LocalServerRouteWithProxyTests(_TwoServers, unittest.TestCase):
+    """代理只关「远程」那条（代理转不了 UDP）；本机那条是环回，照常走。"""
+
+    PROXIED = True
+
+    def test_the_remote_route_stays_on_tcp(self):
+        self.hello("tkt", local=False)
+        self.assertTrue(self.nothing_arrives(self.remote_srv))
+        # 一发都没出去，谈不上「服务器没回应」—— 别拿防火墙那句话吓人
+        self.relay.first_hello_at = 100.0
+        self.assertFalse(self.relay._quiet_warning_due(
+            now=100.0 + self.relay_module.UDP_QUIET_WARN_S + 1))
+
+    def test_the_local_route_is_not_affected_by_the_proxy(self):
+        self.hello("tkt", local=True)
+        data, _ = self.local_srv.recvfrom(65536)
+        self.assertEqual("tkt", parse_hello(data))
+
+    def test_start_udp_sync_no_longer_drops_the_whole_channel(self):
+        """以前配了代理 `start_udp_sync` 直接返回 `None` —— 本机模式跟着没了旁路。"""
+        captured = {}
+
+        class FakeRelay:
+            def __init__(self, target_host, **kwargs):
+                captured.update(kwargs)
+
+            def start(self):
+                return True
+
+        real = self.relay_module.UdpSyncRelay
+        self.relay_module.UdpSyncRelay = FakeRelay
+        try:
+            got = self.relay_module.start_udp_sync("example.com", proxy=object())
+        finally:
+            self.relay_module.UdpSyncRelay = real
+        self.assertIsNotNone(got)
+        self.assertTrue(captured["proxied"])
+
+
+class LocalServerRouteUnitTests(unittest.TestCase):
+    def test_an_unstarted_relay_only_remembers_the_route(self):
+        """没 `start()` 过（`RelayNoticeTests` 那种直接喂报文的用法）：只记路由，不开 socket。"""
+        import relay                                            # noqa: PLC0415
+        r = relay.UdpSyncRelay("127.0.0.1", target_port=1, local_port=1)
+        r._on_hook_datagram(build_hello("t", udpsync.HELLO_FLAG_LOCAL_SERVER))
+        self.assertTrue(r.route_local)
+        self.assertIsNone(r.remote)
+        self.assertEqual({}, r._upstreams)
+
+
+class HookSendsInBothModesTests(unittest.TestCase):
+    """`bshook` 那一侧：旁路不再只在远程模式下开，HELLO 说清这一轮选了哪边。"""
+
+    BSHOOK = os.path.join(os.path.dirname(HERE), "hook", "bshook.c")
+
+    def _source(self):
+        if not os.path.exists(self.BSHOOK):
+            raise unittest.SkipTest("不在源码仓库里（缺 hook/bshook.c）")
+        with open(self.BSHOOK, encoding="utf-8", errors="replace") as fp:
+            return fp.read()
+
+    def _body(self, head):
+        src = self._source()
+        start = src.index(head)
+        return src[start:src.index("\n}\n", start)]
+
+    def test_the_flag_is_the_same_bit_on_both_sides(self):
+        m = re.search(r"#define\s+SYNC_FLAG_LOCAL_SERVER\s+(0x[0-9A-Fa-f]+|\d+)",
+                      self._source())
+        self.assertIsNotNone(m, "bshook.c 里没有 SYNC_FLAG_LOCAL_SERVER")
+        self.assertEqual(udpsync.HELLO_FLAG_LOCAL_SERVER, int(m.group(1), 0))
+
+    def test_the_side_channel_is_not_gated_on_remote_mode(self):
+        """★ 原来这里有一道「只在远程服务器模式下做」的门 —— 本机测试因此既没有
+        在场证据也没有移动平台相位（用户 2026-09-23 要求两边一个样）。"""
+        body = self._body("static void sync_on_plain_frame(")
+        self.assertNotIn("popshot_online_mode", body)
+
+    def test_hello_says_which_server_was_picked(self):
+        body = self._body("static void sync_send_hello(void)")
+        self.assertIn("SYNC_FLAG_LOCAL_SERVER", body)
+        self.assertIn("popshot_online_mode()", body)
 
 
 if __name__ == "__main__":

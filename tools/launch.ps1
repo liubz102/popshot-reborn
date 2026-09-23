@@ -473,11 +473,12 @@ if ($relayPid -and $lastSignature -eq $relaySignature) {
     if ($ok) {
         Set-Content -Path $relayStamp -Value $relaySignature -Encoding ascii
         Say "[中继]   已启动（选「远程服务器」时经 127.0.0.1:$RelayAuth / $RelayGame / $RelayPeer 转发到 $remoteUrlHost）" 'Green'
-        Say "         位置数据另走 UDP：127.0.0.1:$RelayUdpSync -> ${remoteUrlHost}:$GamePort/udp" 'Green'
+        # ★ 本机 / 远程都走这一个口（X_Mod D58）：中继按登录时选的那边定上游，只差这一个地址。
+        Say "         位置数据另走 UDP：127.0.0.1:$RelayUdpSync -> 远程 ${remoteUrlHost}:$GamePort/udp（选「本机服务器」时 -> 127.0.0.1:$GamePort/udp）" 'Green'
         Say "         游戏从 UDP $ClientUdpPort 收位置数据" 'Green'
         Say '         ⚠ 服务器要放行 UDP —— 没放行会自动退回 TCP，网络不稳定时会比较卡。' 'Gray'
     } else {
-        Say '!! 中继没起来，「远程服务器」会连不上；「本机服务器」不受影响。' 'Red'
+        Say '!! 中继没起来，「远程服务器」会连不上；「本机服务器」能玩，但没有 UDP 旁路（在场证据 / 移动平台相位都报不上来）。' 'Red'
         foreach ($name in @('relay-boot.err', 'relay.err', 'relay.out')) {
             $tail = @(Get-FileTailLines (Join-Path $LogDir $name) 20)   # @() 同上
             if ($tail.Count -gt 0) {

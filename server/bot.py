@@ -8633,6 +8633,11 @@ def _shell_velocity(shell):
 #:
 #: ★ 判据是「格子非空」（`test al,al; je`），**单向平台也算**（值 1）——
 #: 所以这里用 `is_solid()` 而不是 `blocks_bullet()`。
+#:
+#: ★★ `0x473969` 的「格子」**连移动平台一起算**（X_Mod §77）：先取静态格子
+#: `0x472fe0`，再把 (x±5, y±5) 框里每个地图对象的 `vft+0x11c(x, y)`（它的掩码
+#: 在这一点的值）逐个取 **max**（`0x4738f8`）。所以投票要带上「这一刻」——
+#: `is_solid(x, y, t_ms)`。漏了它，弹体在鲤鱼背上一格实心都采不到，量不出朝向。
 TERRAIN_VOTE_WINDOW = 3
 
 #: 反弹的两个系数，都是 `0x47c7a4: fld [0x69371c]` = **0.5**（V0.3 §110）：
@@ -8642,7 +8647,7 @@ BOUNCE_RESTITUTION = 0.5
 BOUNCE_FRICTION = 0.5
 
 
-def _terrain_facing(terrain, x, y):
+def _terrain_facing(terrain, x, y, t_ms=None):
     """`(x, y)` 那一片地形**朝哪边**：原版 `0x473b36` 的 7×7 投票（§110）。
 
     返回 `(sx, sy)`，**指向实心那一侧**（不是法线，法线是它的反向）；
@@ -8651,6 +8656,8 @@ def _terrain_facing(terrain, x, y):
     选错了的信号，调用方该换一个点再问一次。
 
     ★ 图顶上面（`y < 0`）和 `_probe_blocked()` 一个口径，不算实心（§83）。
+    ★ `t_ms` = 移动平台「这一刻」的相位（`_mover_clock()`），给了才把鲤鱼这类
+      会动的地形算进票里（X_Mod §77，见 `TERRAIN_VOTE_WINDOW` 的注释）。
     """
     cx, cy = int(round(x)), int(round(y))
     sx = sy = 0.0
@@ -8660,7 +8667,7 @@ def _terrain_facing(terrain, x, y):
         if yy < 0:
             continue
         for dx in range(-n, n + 1):
-            if not terrain.is_solid(cx + dx, yy):
+            if not terrain.is_solid(cx + dx, yy, t_ms):
                 continue
             sx += dx
             sy += dy
@@ -8702,8 +8709,11 @@ def _reflect_velocity(vx, vy, facing):
 BLOCK_CELL_REACH = 14
 
 
-def _nearest_solid(terrain, x, y, reach=BLOCK_CELL_REACH):
-    """离 `(x, y)` 最近的那一格实心地形；`reach` 之内没有就返回 `None`。"""
+def _nearest_solid(terrain, x, y, reach=BLOCK_CELL_REACH, t_ms=None):
+    """离 `(x, y)` 最近的那一格实心地形；`reach` 之内没有就返回 `None`。
+
+    `t_ms` 同 `_terrain_facing()`：给了才把移动平台算进来。
+    """
     cx, cy = int(round(x)), int(round(y))
     best = None
     for oy in range(-reach, reach + 1):
@@ -8711,7 +8721,7 @@ def _nearest_solid(terrain, x, y, reach=BLOCK_CELL_REACH):
         if yy < 0:
             continue
         for ox in range(-reach, reach + 1):
-            if not terrain.is_solid(cx + ox, yy):
+            if not terrain.is_solid(cx + ox, yy, t_ms):
                 continue
             span = ox * ox + oy * oy
             if best is None or span < best[0]:
@@ -8719,7 +8729,7 @@ def _nearest_solid(terrain, x, y, reach=BLOCK_CELL_REACH):
     return None if best is None else (best[1], best[2])
 
 
-def _block_facing(shell, terrain, ax, ay, bx, by, ground_t):
+def _block_facing(shell, terrain, ax, ay, bx, by, ground_t, t_ms=None):
     """撞上的那一刻，地形朝哪边（§110）。量不出来返回 `None`。
 
     ★★ **采样点是挡住它的那一格地形，不是弹体圆心**（§110 末尾那张表）。
@@ -8745,25 +8755,34 @@ def _block_facing(shell, terrain, ax, ay, bx, by, ground_t):
     不用再拿「离接触点最近的实心格」去猜。实机对照（21 条客户端弹道）：
     句柄 200012 的末点误差 **24.16 → 0.01**、200193 **11.28 → 2.35**。
     `_nearest_solid()` 只留作兜底（采样点组和 `blocks_bullet` 口径对不上时）。
+
+    ## ★★★ `t_ms` 必须和撞判定是**同一刻**（X_Mod §77）
+
+    撞上的若是移动平台（云桥的鲤鱼），这里每一处查格子都得带 `t_ms`，否则
+    「哪个采样点撞上的」「7×7 里有几格实心」全按静态地形答 —— 鱼背上一格都
+    采不到 ⇒ `None` ⇒ `_bounce_shell()` 只把速度减半、方向不动 ⇒ 下一 tick 又
+    扎回鱼身、再减半……服务端那颗就**贴在撞点上一直等到引信烧完**，而客户端
+    那颗早弹上天了。用户 2026-09-23 报的「苹果雷在鱼上弹起来、模型突然消失、
+    鱼背上炸开」就是它：那一局 7 颗撞鱼的雷，服务端的炸点全落在撞点上。
     """
     hx = int(ax + (bx - ax) * ground_t)
     hy = int(ay + (by - ay) * ground_t)
     radius = shell.radius
     if radius and radius >= 1.0:
         for ox, oy in shell_probe_offsets(radius, bx - ax, by - ay):
-            if terrain.blocks_bullet(hx + ox, hy + oy):
-                return _terrain_facing(terrain, hx + ox, hy + oy)
-    elif terrain.blocks_bullet(hx, hy):
-        return _terrain_facing(terrain, hx, hy)
-    cell = _nearest_solid(terrain, float(hx), float(hy))
+            if terrain.blocks_bullet(hx + ox, hy + oy, t_ms):
+                return _terrain_facing(terrain, hx + ox, hy + oy, t_ms)
+    elif terrain.blocks_bullet(hx, hy, t_ms):
+        return _terrain_facing(terrain, hx, hy, t_ms)
+    cell = _nearest_solid(terrain, float(hx), float(hy), t_ms=t_ms)
     if cell is None:
-        cell = _nearest_solid(terrain, bx, by)
+        cell = _nearest_solid(terrain, bx, by, t_ms=t_ms)
     if cell is None:
         return None
-    return _terrain_facing(terrain, cell[0], cell[1])
+    return _terrain_facing(terrain, cell[0], cell[1], t_ms)
 
 
-def _bounce_shell(shell, terrain, ax, ay, bx, by, ground_t, free_t):
+def _bounce_shell(shell, terrain, ax, ay, bx, by, ground_t, free_t, t_ms=None):
     """弹体撞地形之后**弹开**（§84 / §110）：夹回撞上之前那一点，再反射。
 
     夹回去这一步不能省：贴在地形里的话下一 tick 一开头又撞上，
@@ -8779,7 +8798,7 @@ def _bounce_shell(shell, terrain, ax, ay, bx, by, ground_t, free_t):
     px = float(int(ax + (bx - ax) * free_t))
     py = float(int(ay + (by - ay) * free_t))
     vx, vy = _shell_velocity(shell)
-    facing = _block_facing(shell, terrain, ax, ay, bx, by, ground_t)
+    facing = _block_facing(shell, terrain, ax, ay, bx, by, ground_t, t_ms)
     if facing is None:
         # 一格实心都采不到（图外 / 数据缺）—— 只减半，方向不动。
         shell.vx, shell.vy = vx * BOUNCE_RESTITUTION, vy * BOUNCE_RESTITUTION
@@ -8789,18 +8808,21 @@ def _bounce_shell(shell, terrain, ax, ay, bx, by, ground_t, free_t):
     shell.bounced = True
 
 
-def _resolve_terrain_block(shell, terrain, ax, ay, bx, by, ground_t, free_t):
+def _resolve_terrain_block(shell, terrain, ax, ay, bx, by, ground_t, free_t,
+                           t_ms=None):
     """撞地形之后按档位收口（§111）。**这一发还活着**就返回 `True`。
 
     2 档（`FlamingBottle` / `TrainingGrenade`）那道门抄的是 `0x47eec1`：
     拿 `0x473b36` 的 `(sx, sy)`，`2×|sx| ≤ sy` 就当场炸，否则弹开。
     平地上 `sx ≈ 0`、`sy > 0` ⇒ 炸；撞陡壁 / 天花板才弹。
+
+    `t_ms` 必须是 `_terrain_contact()` 判出这一撞时用的**同一个**（X_Mod §77）。
     """
     mode = _blocked_mode(shell.weapon)
     if mode == BLOCKED_EXPLODE:
         return False
     if mode == BLOCKED_BOUNCE_IF_STEEP:
-        facing = _block_facing(shell, terrain, ax, ay, bx, by, ground_t)
+        facing = _block_facing(shell, terrain, ax, ay, bx, by, ground_t, t_ms)
         if facing is None or 2.0 * abs(facing[0]) <= facing[1]:
             return False
     if mode == BLOCKED_STICK:
@@ -8811,7 +8833,7 @@ def _resolve_terrain_block(shell, terrain, ax, ay, bx, by, ground_t, free_t):
         shell.vx = shell.vy = 0.0
         shell.bounced = True
         return True
-    _bounce_shell(shell, terrain, ax, ay, bx, by, ground_t, free_t)
+    _bounce_shell(shell, terrain, ax, ay, bx, by, ground_t, free_t, t_ms)
     return True
 
 
@@ -8946,11 +8968,14 @@ def _shell_step(room, shell, terrain, bodies):
     if mob is not None and (best_t is None or mob[0] < best_t):
         best_t = mob[0]
         best = (("mob", mob[1]), None)
+    # ★ 移动平台的相位**这一格只取一次**：判「撞没撞」和算「往哪弹」必须是
+    #   同一刻的鲤鱼（X_Mod §77），分开取的话两次之间鱼可能挪了一格。
+    t_ms = _mover_clock(room, terrain)
     ground_t, free_t = _terrain_contact(terrain, ax, ay, bx, by, radius,
-                                        t_ms=_mover_clock(room, terrain))
+                                        t_ms=t_ms)
     if ground_t is not None and (best_t is None or ground_t < best_t):
         if _resolve_terrain_block(shell, terrain, ax, ay, bx, by,
-                                  ground_t, free_t):
+                                  ground_t, free_t, t_ms):
             return None
         best_t = ground_t
         best = (None, None)
