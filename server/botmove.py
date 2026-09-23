@@ -235,6 +235,27 @@ def jump(body, vx=0.0):
     return body.moved(body.x, body.y, float(vx), -JUMP_SPEED, on_ground=False)
 
 
+def takeoff(body, character, direction=0, fast_run=False, crouched=False,
+            speed_scale=1.0):
+    """真人**按下跳那一帧**的收尾：只把速度置成起跳初速，这一帧不做空中位移（X_Mod §85）。
+
+    客户端的时序（2026-09-23 云桥 83 次起跳逐发核过，无一例外）：第 n 帧按跳 ⇒ 第 n + d
+    帧的心跳里只有 **d − 1** 次空中位移 —— 起跳那一帧照常走完这一步，最后才离地。
+    `step(want_jump=True)` 是「当格起跳当格就飞」，bot 自己跳用的是它，**没动**；
+    这一条只给服务端外推真人用（`bot._advance_humans`）。
+
+    踩地时是第一段跳，带这一刻的走速（§93）；腾空时是第二段跳（§124）。
+    """
+    if not body.on_ground:
+        return double_jump(body)
+    speed = walk_speed(character, fast_run, crouched, speed_scale)
+    if direction > 0:
+        return jump(body, speed)
+    if direction < 0:
+        return jump(body, -speed)
+    return jump(body)
+
+
 def drop_through(terrain, body):
     """按 ↓ 穿过脚下的**单向平台**；不能下落就原样返回。
 

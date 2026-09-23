@@ -389,7 +389,7 @@ class Rider(object):
     """
 
     __slots__ = ("handle", "w", "h", "sw", "sh", "mask", "x", "y", "t_off", "rel",
-                 "aw", "ah", "_layers", "extent")
+                 "aw", "ah", "_layers", "extent", "_col_tops")
 
     def __init__(self, record):
         self.handle = int(record.get("handle", 0))
@@ -411,6 +411,30 @@ class Rider(object):
         self._layers = None
         #: 走完一整圈能碰到的外接框（`Mover.rider_extent()` 第一次问时填）。
         self.extent = None
+        #: 局部第 lx 列的站立面（局部行号），问到哪列算哪列（`column_tops()`）。
+        self._col_tops = {}
+
+    def column_tops(self, lx):
+        """局部第 `lx` 列上「值 ≥ 1」的每一段的上沿（局部行号，自上而下）。
+
+        和 `cell()` 同一张（拉伸 + 九格取 max 之后的）第一层位图。和鱼在哪无关，
+        所以按列缓存一次就一直能用；一次只扫一列（几百次取位），不会一口气卡住房间循环。
+        """
+        got = self._col_tops.get(lx)
+        if got is None:
+            layers = self._layers
+            if layers is None:
+                layers = self._build_layers()
+            bit = 1 << lx
+            tops = []
+            above = False
+            for ly, row in enumerate(layers[0]):
+                here = bool(row & bit)
+                if here and not above:
+                    tops.append(ly)
+                above = here
+            got = self._col_tops[lx] = tuple(tops)
+        return got
 
     def _build_layers(self):
         """把「拉伸到 sw×sh（最近邻）再九格取 max」预先做成三层行位图。
@@ -861,6 +885,15 @@ class MapTerrain(object):
         self._bcells = cells
         return cells
 
+    def at(self, t_ms):
+        """这张图在 `t_ms` 那一刻的样子：静态格 + 那一刻的移动平台（`TerrainAt`，X_Mod §85）。
+
+        没有移动平台、或者不知道是哪一刻，就是它自己 —— 一格不差的老行为。
+        """
+        if t_ms is None or not self.movers:
+            return self
+        return TerrainAt(self, t_ms)
+
     def mover_cell(self, x, y, t_ms):
         """`t_ms` 这一刻，(x, y) 落在哪块移动平台上；都没落上返回 0。"""
         for mover in self.movers:
@@ -1067,6 +1100,148 @@ class MapTerrain(object):
     def __repr__(self):
         return "<MapTerrain %s v%d %dx%d>" % (
             self.name, self.version, self.width, self.height)
+
+
+class TerrainAt(object):
+    """★★ **某一刻**（`t_ms`）的地形：静态格 + 那一刻的移动平台（X_Mod §85）。
+
+    客户端角色走路 / 下落 / 撞头问的都是 `0x473969`（静态格与对象取 max，§80），鲤鱼对角色
+    来说就是**会动的地形格**。`botmove` 只认 `cell / is_solid / is_one_way / blocks_bullet /
+    surfaces / ground_below / coarse_clear / height` 这几样 —— 这里按同一口径把这一刻的鱼
+    叠上去，其余原样转给底下那张图，`botmove` 的物理一行不用改。
+
+    ★ 只给**外推真人**用（`bot._advance_humans`）。bot 自己走路 / 寻路没接它。
+    ★ 一格里的所有查询共用一个视图：鱼的中心只算一次（`Path::Eval` 不便宜），站立面按列缓存。
+    """
+
+    __slots__ = ("base", "t_ms", "_riders", "_cols")
+
+    def __init__(self, base, t_ms):
+        self.base = base
+        self.t_ms = int(t_ms)
+        riders = []
+        for mover in base.movers:
+            for rider in mover.riders:
+                cx, cy = mover.rider_center(rider, self.t_ms)
+                # 外接框多放两格：向零截断多出的一格 + 九格那一圈（同 `Mover.rider_extent`）。
+                riders.append((mover, rider, _f32(cx), _f32(cy),
+                               int(math.floor(cx - rider.aw)) - 2,
+                               int(math.ceil(cx + rider.aw)) + 2,
+                               int(math.floor(cy - rider.ah)) - 2,
+                               int(math.ceil(cy + rider.ah)) + 2))
+        self._riders = tuple(riders)
+        self._cols = {}
+
+    def __getattr__(self, name):
+        # 宽高、出生点、弹跳台、破坏物 …… 这一刻和静态那张图一样。
+        return getattr(self.base, name)
+
+    # -- 格子 ---------------------------------------------------------------
+
+    def mover_cell(self, x, y, t_ms=None):
+        """这一刻 (x, y) 那一格移动平台给的值（0..3），口径同 `Rider.cell()`。"""
+        best = 0
+        for _mover, rider, rx, ry, x0, x1, y0, y1 in self._riders:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                got = rider.cell_f32(rx, ry, x, y)
+                if got > best:
+                    best = got
+        return best
+
+    def cell(self, x, y):
+        """(x, y) 那一格：静态格与这一刻的移动平台取 max（`0x473969`）。出界返回 2。"""
+        got = self.base.cell(x, y)
+        if got >= 3:
+            return got
+        mover = self.mover_cell(x, y)
+        return mover if mover > got else got
+
+    def is_solid(self, x, y, t_ms=None):
+        return self.cell(x, y) != 0
+
+    def is_one_way(self, x, y):
+        return self.cell(x, y) == 1
+
+    def blocks_bullet(self, x, y, t_ms=None):
+        return self.base.blocks_bullet(x, y) or self.mover_cell(x, y) >= 2
+
+    def rider_under(self, x, y):
+        """这个人**站在哪块移动平台上**：`(mover, rider)`；站在静态地面 / 空中返回 `None`。
+
+        客户端每个逻辑帧 `0x50739a` 拿脚下那一格问 `0x473a4f`（返回**提供最大值的那个对象**），
+        结果写进 `[char+0x12c]`；渲染时平台只驮 `[char+0x12c]` 是自己、而且踩地的角色（`0x51ab04`）。
+        ★ 心跳里的脚 y 比实心区第一行高 1~2 px（云桥静态地面 377 发：229 发高 1、148 发高 2），
+          所以「脚下那一格」= 脚 y 往下这三行里第一格非空的；静态格不比它小就算静态的。
+        """
+        xi = int(x)
+        for yi in range(int(y), int(y) + 3):
+            static = self.base.cell(xi, yi)
+            best, best_v = None, static
+            for mover, rider, rx, ry, x0, x1, y0, y1 in self._riders:
+                if x0 <= xi <= x1 and y0 <= yi <= y1:
+                    got = rider.cell_f32(rx, ry, xi, yi)
+                    if got > best_v:
+                        best, best_v = (mover, rider), got
+            if best_v:
+                return best
+        return None
+
+    # -- 站立面 -------------------------------------------------------------
+
+    def surfaces(self, x):
+        """第 x 列自上而下的站立面：静态的和这一刻鱼身上的合在一起，「非空且上一格是空」才算。"""
+        got = self._cols.get(x)
+        if got is not None:
+            return got
+        base = self.base
+        cands = set(base.surfaces(x))
+        for _mover, rider, rx, ry, x0, x1, y0, y1 in self._riders:
+            if not x0 <= x <= x1:
+                continue
+            lx = _client_local_fast(x, rx, rider.aw)
+            if lx < 0 or lx >= rider.sw:
+                continue
+            for ly in rider.column_tops(lx):
+                # 局部第 ly 行最上面那一行世界 y（映射单调，差不出两格）。
+                y = int(math.floor(float(ry) - rider.ah + ly)) - 1
+                while _client_local_fast(y, ry, rider.ah) < ly:
+                    y += 1
+                cands.add(y)
+        cell = self.cell
+        got = tuple(sorted(y for y in cands
+                           if 0 <= y < base.height and cell(x, y) != 0
+                           and (y == 0 or cell(x, y - 1) == 0)))
+        self._cols[x] = got
+        return got
+
+    def ground_below(self, x, y):
+        for sy in self.surfaces(x):
+            if sy >= y:
+                return sy
+        return None
+
+    def ground_above(self, x, y):
+        found = None
+        for sy in self.surfaces(x):
+            if sy < y:
+                found = sy
+            else:
+                break
+        return found
+
+    def coarse_clear(self, x0, y0, x1, y1):
+        """静态那张粗网格担保得了、**而且**这一块碰不到这一刻的任何一块移动平台，才算空。"""
+        if x0 > x1:
+            x0, x1 = x1, x0
+        if y0 > y1:
+            y0, y1 = y1, y0
+        for _mover, _rider, _rx, _ry, bx0, bx1, by0, by1 in self._riders:
+            if x0 <= bx1 and bx0 <= x1 and y0 <= by1 and by0 <= y1:
+                return False
+        return self.base.coarse_clear(x0, y0, x1, y1)
+
+    def __repr__(self):
+        return "<TerrainAt %r @ %d ms>" % (self.base, self.t_ms)
 
 
 def _unblob(text):

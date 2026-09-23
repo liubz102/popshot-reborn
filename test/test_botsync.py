@@ -7517,23 +7517,30 @@ class HumanJumpExtrapolationTests(TerrainMixin, BotFireRoom):
                                        self.jump(self.alice, stage))
 
     def test_a_jump_lifts_the_body_before_the_next_heartbeat(self):
-        """★ 只发 `rpJump`、下一发心跳还在路上时，人就该已经在空中了。"""
+        """★ 只发 `rpJump`、下一发心跳还在路上时，人就该已经在空中了。
+
+        ★★ X_Mod §85：起跳那一帧**先走完这一步**、最后才离地，下一帧才开始往上 ——
+          第 n 帧按跳，第 n + d 帧的心跳里只有 d − 1 次空中位移（83 次起跳逐发核过）。
+          所以第一格只离地、不挪，第二格才升。
+        """
         before = self.stand()
         self.send_jump()
         self.advance(1)
         after = self.alice.sim_body
         self.assertFalse(after.on_ground, "收到 rpJump 就该离地")
-        self.assertLess(after.y, before.y, "而且这一格已经往上走了")
+        self.assertEqual(before.y, after.y, "起跳那一帧不做空中位移")
+        self.advance(1)
+        self.assertLess(self.alice.sim_body.y, before.y, "下一帧才往上走")
 
     def test_the_lift_is_the_original_jump_speed(self):
         """★ 初速就是语料量出来的那个 20.0（§124），不是我们编的。
 
-        第一格走的是「加过这一 tick 重力之后」的速度（`_air_tick` 先
-        `vy += g` 再挪），所以位移是 `20 − 1.2`。
+        第一次空中位移走的是「加过这一 tick 重力之后」的速度（`_air_tick` 先
+        `vy += g` 再挪），所以位移是 `20 − 1.2`（起跳那一帧不挪，见上一条）。
         """
         before = self.stand()
         self.send_jump()
-        self.advance(1)
+        self.advance(2)
         self.assertAlmostEqual(
             before.y - (botmove.JUMP_SPEED - botmove.GRAVITY),
             self.alice.sim_body.y, places=5)
@@ -7556,9 +7563,10 @@ class HumanJumpExtrapolationTests(TerrainMixin, BotFireRoom):
         """
         self.stand()
         self.send_jump()
+        self.assertEqual(1, len(self.alice.sync_jump_ticks), "夹具没造对")
         self.human_heartbeat(self.alice, 600.0, 130.0, on_ground=False,
                              velocity=(0, -19))
-        self.assertEqual(0, self.alice.sync_jump_pending)
+        self.assertEqual((), self.alice.sync_jump_ticks)
 
 
 class BotShellHitNowTests(BotFireRoom):
@@ -8247,6 +8255,26 @@ class BotShellFallsOutOfTheWorldTests(TerrainMixin, BotFireRoom):
         self.assertFalse(bot._shell_fell_out_of_the_world(
             self.room, shell, (500.0, edge - 1.0)))
 
+    def test_the_blocking_cell_decides_once_the_sweep_found_one(self):
+        """★★★ 扫掠报了「挡住它的那一格」就只认那一格（X_Mod §84）。
+
+        X_Mod D60 之后炸点是 `hit.free` = 被挡住的**前一个**整数点。直直往下掉的
+        弹体，挡住它的格子恰好是图外第一行时，炸点 + 半径只到 `图高 − 1` ——
+        按落点判就差 1 px 漏掉，多记一个句柄，之后整局打不掉血。
+        """
+        shell = self.shell_at(500.0, 100.0)
+        height = self.terrain.height
+        point = (500.0, float(height) - shell.radius - 1.0)
+        self.assertFalse(bot._shell_fell_out_of_the_world(self.room, shell, point),
+                         "没有探针格时照旧按「落点 + 半径」—— 这一点正好差 1 px")
+        shell.blocked_at = (500, height)
+        self.assertTrue(bot._shell_fell_out_of_the_world(self.room, shell, point),
+                        "挡住它的是图外那一格 = 收方已经把它删了")
+        shell.blocked_at = (500, height - 1)
+        self.assertFalse(bot._shell_fell_out_of_the_world(
+            self.room, shell, (500.0, float(height))),
+            "挡住它的格还在图里 —— 收方照常炸，照常建溅射对象")
+
     def test_a_map_without_falldown_still_explodes_normally(self):
         """★★ 判据是这张图的 `FallDown`，和角色那条（§143）同一套。
 
@@ -8301,6 +8329,120 @@ class BotShellFallsOutOfTheWorldTests(TerrainMixin, BotFireRoom):
                          "收方查不到句柄 = 静默丢弃 = 从此打不掉血（§42）")
         self.assertEqual(self.bot_conn.sync.projectiles, led.counter,
                          "服务端和收方的下一个句柄必须一格不差")
+
+
+class BotShellFallsOutAfterSweepTests(TerrainMixin, BotFireRoom):
+    """★★★★★ 2026-09-23 23:13 云桥那一局的原数据：碎片掉出图底，句柄从此错开（X_Mod §84）。
+
+    用户：「前面 bot 扔的几个雷都还正常，后面不知道从什么时候开始，bot 扔的几乎
+    所有雷都没有伤害了，直接命中我身上就消失了。」
+
+    23:13:55.700 一颗苹果雷在 (1036.16, 822.25) 炸成四片。三片落在图里的地形上；
+    第四片（角度 2.81）一路往下掉，服务端第 30 格炸在 **(754, 1361)**，挡住它的是
+    **(754, 1370)** —— 云桥图高 1370，那是图外第一行，收方把这一片静默删了。
+    旧判据看「炸点 + 半径 = 1369 < 1370」⇒ 没认出来，照记一个溅射句柄 ⇒ 下一颗
+    主雷服务端给 200054、收方给 200053，之后每一发 `rpExplode` 都查不到号。
+    """
+
+    FRAGMENT_AT = (1036.1591796875, 822.2455444335938)
+    ANGLES = (-0.767944872379303, -1.6580628156661987, -2.5307273864746094,
+              2.8099801540374756)
+
+    def setUp(self):
+        super().setUp()
+        base = mapdata.load("Festival02")
+        # 23:13:46.643「破坏物碎了: 句柄 322 @ (824, 1179)　15 秒后长回来」—— 这一刻它碎着。
+        alive = [b.index for b in base.breakables if b.handle != 322]
+        self.terrain = self.install_terrain(base.variant(alive))
+        props = mapdata.STORE.index().setdefault("props", {})
+        props[self.room.map_name] = {"fall_down": True}
+        self.addCleanup(props.pop, self.room.map_name, None)
+        # ★ 鲤鱼的相位跟着测试跑的时刻变 —— 钉成「不知道有鱼」。实机那一刻的相位下
+        #   四片一片都没碰到鱼（离线重放核过），所以这不改变任何一片的结局。
+        original = bot._mover_clock
+        bot._mover_clock = lambda room, terrain, shell=None: None
+        self.addCleanup(setattr, bot, "_mover_clock", original)
+
+    def fragment(self, angle, handle=0):
+        weapon = weapondata.get(1000500)
+        shot = ballistics.launch(weapon, angle, 10.0)
+        return bot.Shell(handle, 0, weapon, botsync.FIRE_GROUP_EVERYONE,
+                         self.FRAGMENT_AT[0], self.FRAGMENT_AT[1], shot,
+                         time.monotonic(),
+                         bot._shell_max_ticks(self.terrain, shot, weapon))
+
+    def fly(self, shell):
+        landed = None
+        while landed is None and shell.ticks < shell.max_ticks:
+            landed = bot._shell_step(self.room, shell, self.terrain, [])
+        return landed
+
+    def test_the_fourth_fragment_is_blocked_by_the_row_below_the_map(self):
+        shell = self.fragment(self.ANGLES[3])
+        landed = self.fly(shell)
+        self.assertEqual((754.0, 1361.0), landed[0], "实机服务端就炸在这一点")
+        self.assertEqual(30, shell.ticks)
+        self.assertEqual((754, self.terrain.height), shell.blocked_at)
+        self.assertTrue(bot._shell_fell_out_of_the_world(self.room, shell,
+                                                         landed[0]))
+
+    def test_the_other_three_explode_inside_the_map(self):
+        for angle in self.ANGLES[:3]:
+            shell = self.fragment(angle)
+            landed = self.fly(shell)
+            self.assertLess(shell.blocked_at[1], self.terrain.height)
+            self.assertFalse(bot._shell_fell_out_of_the_world(
+                self.room, shell, landed[0]), angle)
+
+    def test_the_receiver_and_the_server_still_agree(self):
+        """★★★★★ 端到端：四片照原样开火、飞、结算，收方账本一格都不许差。"""
+        led = ReceiverLedger(self.bot_seat)
+        weapon = weapondata.get(1000500)
+        self.clear()
+        shells = []
+        for angle in self.ANGLES:
+            packet, handle = self.bot_conn.sync.fire(
+                weapon.id, self.FRAGMENT_AT[0], self.FRAGMENT_AT[1], angle,
+                10.0, handle_step=weapon.fire_step, shots=weapon.shots,
+                group=botsync.FIRE_GROUP_EVERYONE)
+            led.feed(packet)
+            shells.append(self.fragment(angle, handle))
+        for shell in shells:
+            landed = self.fly(shell)
+            if shell.blocked_at[1] >= self.terrain.height:
+                led.live.pop(shell.handle, None)    # ★ 收方那一片已经删了
+            bot._resolve_shell(self.room, self.bot_conn, shell, landed[0],
+                               None, None, 0)
+        for frame in bot_frames(self.alice, self.bot_seat):
+            led.feed(frame)
+        self.assertEqual([], led.dropped,
+                         "收方查不到句柄 = 静默丢弃 = 从此打不掉血（§42）")
+        self.assertEqual(self.bot_conn.sync.projectiles, led.counter,
+                         "服务端和收方的下一个句柄必须一格不差")
+
+    def test_a_bouncing_grenade_is_not_bounced_off_the_row_below_the_map(self):
+        """★ 会弹的雷掉到图底也一样：不许从「图外那圈虚拟实心」上弹回来。
+
+        收方要是把它删了而服务端让它弹，之后那发 `rpExplode` 替它记的号就永久错开；
+        反过来服务端当它没了、收方却在图外弹 —— 两边都不再为它记号，账照样平。
+        """
+        weapon = weapondata.get(1000020)
+        self.assertNotEqual(bot.BLOCKED_EXPLODE, bot._blocked_mode(weapon),
+                            "夹具没造对：苹果雷撞地形是弹，不是炸")
+        shot = ballistics.launch(weapon, math.pi / 2.0, 20.0)
+        shell = bot.Shell(0, 0, weapon, 2, 754.0, 1300.0, shot,
+                          time.monotonic(),
+                          bot._shell_max_ticks(self.terrain, shot, weapon))
+        landed = self.fly(shell)
+        self.assertIsNotNone(landed, "掉出图底这一格就该到头")
+        self.assertFalse(shell.bounced, "不许在图外那一圈上弹回来")
+        self.assertGreaterEqual(shell.blocked_at[1], self.terrain.height)
+        self.clear()
+        before = self.bot_conn.sync.projectiles
+        bot._resolve_shell(self.room, self.bot_conn, shell, landed[0], None,
+                           None, 0)
+        self.assertEqual(before, self.bot_conn.sync.projectiles)
+        self.assertEqual([], bot_frames(self.alice, self.bot_seat))
 
 
 class BotGameModeDamageTests(BotFireRoom):

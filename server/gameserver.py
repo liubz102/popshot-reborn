@@ -5870,7 +5870,8 @@ def reset_sync_trails(room, why, new_match=False):
         if trail:
             trail.clear()
         conn.sync_jumped = 0
-        conn.sync_jump_pending = 0
+        conn.sync_jump_ticks = ()
+        conn.sync_trail_at = None
         # ★ 换图 / 新一局客户端会把角色重建，蹲的状态跟着归零（`0x4ffc4a`），
         #   服务端这份记账也要一起清，否则 bot 会照着上一张图的姿势起步。
         conn.sync_crouch = False
@@ -7092,7 +7093,8 @@ class Conn:
     #   测试夹具会走到这一步，正常连接在 `__init__` 里就建好了）。
     sync_trail = ()
     sync_jumped = 0
-    sync_jump_pending = 0
+    sync_jump_ticks = ()
+    sync_trail_at = None
     sync_crouch = False
     # ★ 「这条连接报过几个位置点」。bot 的帧循环拿它当**事件**（V0.3 §32）：
     #   号变了 = 这个真人报了一个新位置 = bot 该走一帧了。只增不减、不回绕
@@ -7320,12 +7322,14 @@ class Conn:
         # 上一发心跳之后收到过的 rpJump 段数（0 = 没跳）。下一发心跳把它
         # 记进轨迹点，bot 回放到那儿时就跟着跳一下。
         self.sync_jumped = 0
-        # ★★ **还没被逐格外推吃掉的那一下起跳**（V0.3 §173）：收方收到
-        #   `rpJump` 当场就让那个角色离地，服务端替 bot 判命中时用的
-        #   `bot._advance_humans()` 也得当场跟上 —— 等下一发心跳才跟，
-        #   那一段（实测中位 38 px、最大 103 px）里服务端还以为人站在地上，
-        #   于是「我跳起来躲开了，屏幕上也躲开了，却照样掉血」。
-        self.sync_jump_pending = 0
+        # ★★ **还没被逐格外推吃掉的起跳**（V0.3 §173 / X_Mod §85）：`((离最近那发心跳
+        #   第几个逻辑帧, 第几段跳), …)`。`bot._advance_humans()` 按这个帧号把起跳排到
+        #   **对的那一格**上 —— 不等下一发心跳（那一段里服务端还以为人站在地上，实测中位
+        #   差 38 px），也不能收到就跳（客户端起跳那一帧先走完这一步，早一格差 ~20 px）。
+        self.sync_jump_ticks = ()
+        # 最近那发心跳**到达**的时刻（`time.monotonic()`）。起跳离它几帧、他自己那条鱼在那一帧
+        # 的相位，都从这一刻起算（X_Mod §85）。
+        self.sync_trail_at = None
         # ★ 他现在蹲着没有。`rpCrouch`(0x000b) 只在按下 / 松开各来一发，
         #   中间的每一发心跳都照这个状态记进轨迹点（V0.3 §41）。
         self.sync_crouch = False
@@ -11127,8 +11131,11 @@ class Conn:
         self.last_action_at = time.monotonic() if now is None else now
         self.afk_carried = False
 
-    def note_sync_position(self, payload):
+    def note_sync_position(self, payload, arrived=None):
         """把这一发同步数据里的**位置**记进轨迹（V0.3 M3）。
+
+        `arrived` = 这一发到达的时刻（`time.monotonic()`，`forward_peer_data` 传进来）；
+        不给就现取。起跳离最近那发心跳几帧就拿它俩相减（X_Mod §85）。
 
         三种包各记一半：
 
@@ -11150,14 +11157,22 @@ class Conn:
         ★ 只记事实，不做判断。要不要跟、跟多远是 `bot.py` 的事。
         """
         opcode = udpsync.peer_opcode(payload)
+        now = time.monotonic() if arrived is None else arrived
         if opcode == PEER_OP_JUMP:
             if len(payload) >= udpsync.PEER_HEADER_SIZE + 2:
                 self.sync_jumped = payload[udpsync.PEER_HEADER_SIZE + 1]
-                # ★★ 同一发还要**立刻**让逐格外推那份身体离地（V0.3 §173）。
-                #   `sync_jumped` 是给「bot 回放这条轨迹」用的（下一发心跳
-                #   才消费），这一格是给「服务端此刻认为人在哪」用的 ——
-                #   两者的消费者和时机都不一样，不能合并成一个。
-                self.sync_jump_pending = self.sync_jumped or 1
+                # ★★ 同一发还要排给逐格外推那份身体（V0.3 §173）。`sync_jumped` 是给
+                #   「bot 回放这条轨迹」用的（下一发心跳才消费），这一格是给「服务端此刻
+                #   认为人在哪」用的 —— 两者的消费者和时机都不一样，不能合并成一个。
+                # ★★★ 记的是**离最近那发心跳第几个逻辑帧**（X_Mod §85）：两发从同一台机器、
+                #   同一条有序流过来，到达时刻之差就是发出时刻之差（单程延迟相减抵消），
+                #   按客户端 32 ms 的逻辑帧网格数一下就是帧号差。
+                ticks = 0
+                if self.sync_trail_at is not None:
+                    ticks = max(0, int(round((now - self.sync_trail_at)
+                                             / roomclock.TICK_S)))
+                self.sync_jump_ticks = self.sync_jump_ticks + (
+                    (ticks, self.sync_jumped or 1),)
             return
         if opcode == PEER_OP_CROUCH:
             # ★ 蹲是**状态**不是事件（和 rpJump 相反）：`rpCrouch` 只在按下 /
@@ -11195,10 +11210,11 @@ class Conn:
                                     udpsync.heartbeat_keys(payload) or 0))
         self.sync_trail_seq += 1
         self.sync_jumped = 0
-        # ★★ 这一发心跳里的坐标 / 速度**已经带着那一跳**了（他是先发
-        #   `rpJump` 再发心跳的，同一条有序流）—— 外推那份马上就要被硬置
-        #   成它，欠着的那一下到此为止，再补一次就变成跳两下（§173）。
-        self.sync_jump_pending = 0
+        self.sync_trail_at = now
+        # ★★ 这一发心跳里的坐标 / 速度**已经带着那一跳**了（排序闸门保证先于它发出的
+        #   `rpJump` 先到）—— 外推那份马上就要被硬置成它，欠着的到此为止，
+        #   再补一次就变成跳两下（§173）。
+        self.sync_jump_ticks = ()
 
     def sync_peer_epoch(self, payload):
         """局号一变就把排序闸门里的**事件计数**归零（`udpsync` 铁律 3）。
@@ -11403,11 +11419,11 @@ class Conn:
         self.note_player_input(payload, arrived)
         room = self.lobby_room()
         if room is None:
-            self.note_sync_position(payload)
+            self.note_sync_position(payload, arrived)
             self.note_human_fire(payload)
         else:
             with room.sim_lock:
-                self.note_sync_position(payload)
+                self.note_sync_position(payload, arrived)
                 self.note_human_fire(payload)
                 # ★ 本局战绩（称号卡片，V0.3商店）。★ 和下面那发钩子同一个
                 #   道理：**统计坏了不该拖垮同步**，所以整段吞异常。

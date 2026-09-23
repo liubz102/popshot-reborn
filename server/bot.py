@@ -3306,7 +3306,17 @@ def _advance_humans(room, terrain):
 
     ★ 拿不到地形就什么都不做：那时 `_seat_body()` 退回轨迹最后那一点，
       和 D106 之前一样。
+
+    ## 第 k 格 = 他那台客户端「心跳那一帧之后的第 k − 1 帧」（X_Mod §85）
+
+    硬置那一格（k = 0）是心跳那一帧开头的样子；之后每一格照客户端一帧的顺序走：
+    ① 按那一帧**他自己那条鱼**的位置走一步（`terrain.at()`：鱼对角色就是会动的地形格，
+    站、走、落、撞头全算上）；② 这一帧按过跳的话**走完才离地**（`botmove.takeoff`）；
+    ③ 渲染时平台把这一帧的位移加给站在它上面、还踩着地的人（`0x51ab04`）。
+    以前外推只认静态地形：站鱼背不动被当成原地不动（中位差 7 px）、落到鱼背上穿过去接着掉
+    （中位 26、最大 114 px）、起跳早一格（~20 px）—— 本机也「客户端撞到你、服务端判没中」。
     """
+    step_ms = botmove.TICK_MS
     for index, seat in enumerate(room.seats):
         if seat is None or getattr(seat, "is_bot", False):
             continue
@@ -3326,26 +3336,47 @@ def _advance_humans(room, terrain):
                 point[0], point[1], vx=point[4], vy=point[5],
                 on_ground=bool(point[3]))
             conn.sim_body_mark = mark
+            conn.sim_step = 0
             continue
         if terrain is None:
             continue
         who = chrprops.get(seat.character_id)
         keys = point[8] if len(point) > 8 else 0
-        # ★★★ 起跳是**事件**，不是心跳里的一格状态（§173）。收方收到
-        #   `rpJump` 当场就让那个角色离地（`rpJump` 存在的全部理由就是
-        #   这个：不发的话远端的跳只能等下一发心跳把坐标拽上去）。
-        #   以前这里只认心跳 ⇒ 从「他按下跳」到「下一发心跳到达」这一段，
-        #   服务端手上那份身体还站在地上：实测中位差 **38 px**、最大 103 px
-        #   （2026-09-02 那局，53 次起跳）—— 正好是「我跳起来躲开了却
-        #   照样被打中」的那一窗口。
-        want_jump = bool(getattr(conn, "sync_jump_pending", 0))
-        if want_jump:
-            conn.sync_jump_pending = 0
-        conn.sim_body = botmove.tick(
-            terrain, body, who,
-            direction=_human_direction(keys),
-            fast_run=bool(point[6]), crouched=bool(point[7]),
-            want_jump=want_jump)
+        direction = _human_direction(keys)
+        fast_run, crouched = bool(point[6]), bool(point[7])
+        step = getattr(conn, "sim_step", 0) + 1
+        conn.sim_step = step
+        # ① 这一步撞的是那一帧的鱼。
+        base_ms = _human_mover_phase(room, terrain, conn)
+        view = (terrain if base_ms is None
+                else terrain.at(base_ms + step_ms * (step - 1)))
+        moving = view is not terrain
+        riding = (view.rider_under(body.x, body.y)
+                  if moving and body.on_ground else None)
+        airborne = not body.on_ground
+        body = botmove.tick(view, body, who, direction=direction,
+                            fast_run=fast_run, crouched=crouched)
+        if moving and airborne and body.on_ground:
+            riding = view.rider_under(body.x, body.y)     # 落地那一下也认一次（`0x50f1f8`）
+        # ② ★★★ 起跳是**事件**（§173）：`rpJump` 记着离心跳第几帧，排到那一帧上，
+        #   而且那一帧先走完这一步再离地（83 次起跳核过，X_Mod §85）。
+        #   晚到的（远程抖动）就在这一格补上，不丢。
+        jumps = getattr(conn, "sync_jump_ticks", ())
+        if jumps:
+            due = [stage for ticks, stage in jumps if ticks + 1 <= step]
+            if due:
+                conn.sync_jump_ticks = tuple(
+                    item for item in jumps if item[0] + 1 > step)
+                for _stage in due:
+                    body = botmove.takeoff(body, who, direction, fast_run,
+                                           crouched)
+        # ③ 平台驮人：只驮站在它上面、这一帧末还踩着地的（起跳那一帧已经离地，不驮）。
+        if riding is not None and body.on_ground:
+            mover, rider = riding
+            ax, ay = mover.rider_center(rider, view.t_ms)
+            bx, by = mover.rider_center(rider, view.t_ms + step_ms)
+            body = body.moved(body.x + (bx - ax), body.y + (by - ay))
+        conn.sim_body = body
 
 
 def _seat_on_ground(room, seat_index):
@@ -6858,8 +6889,10 @@ def _reportable_speed(before, body, air_stepped=True):
     return vx, vy
 
 
-def _mover_clock(room, terrain, shell=None):
+def _mover_clock(room, terrain, shell=None, at=None):
     """**移动平台的相位**：客户端这张图的移动平台起点之后过了多少毫秒（X_Mod §73 / §74 / §78）。拿不到返回 `None`。
+
+    `at` = 按哪个时刻（`time.monotonic()` 口径）算，不给就是「这一格」（`_now()`）。
 
     ★ 客户端 `PathFollower::GetPos`（`0x549bec`）一律算 `Timer() + t_off − t0`，`t0` 在
       `[obj+0x90]`，**写两次**（§78）：载图时 `MapObject::LinkPath`（`0x511d97`）一次；
@@ -6900,7 +6933,7 @@ def _mover_clock(room, terrain, shell=None):
     movers = getattr(terrain, "movers", None)
     if not movers:
         return None
-    now = _now()
+    now = _now() if at is None else at
     seats = getattr(room, "seats", None) or ()
     host = getattr(room, "host_seat", None)
     seat = seats[host] if (host is not None and 0 <= host < len(seats)) else None
@@ -6922,6 +6955,27 @@ def _mover_clock(room, terrain, shell=None):
     if started is None:
         return None
     return int((now - started) * 1000.0)
+
+
+def _human_mover_phase(room, terrain, conn):
+    """这个真人**最近那发心跳那一帧**，他自己客户端上的移动平台在哪个相位（X_Mod §85）。
+
+    每台客户端的鱼按它自己的时钟摆（`t0` 是它自己开打那一刻，§78），人站在**他自己那条**
+    鱼上 —— 所以先用他自己报的相位（`Conn.mover_phase`）；他没报过才退回全房间那一份
+    （`_mover_clock`：房主报的 / 开局估计）。时刻取心跳**到达**那一刻：相位报告和心跳走的是
+    同一台机器，单程延迟两边一样，相减抵消。拿不到返回 `None`（外推就不认移动平台，同老行为）。
+    """
+    movers = getattr(terrain, "movers", None)
+    at = getattr(conn, "sync_trail_at", None)
+    if not movers or at is None:
+        return None
+    phase = getattr(conn, "mover_phase", None)
+    if phase:
+        for mover in movers:
+            got = phase.get(mover.handle)
+            if got is not None:
+                return int(got[1] + (at - got[0]) * 1000.0)
+    return _mover_clock(room, terrain, at=at)
 
 
 def _shell_tick_phase(conn, phase, movers, shell):
@@ -8029,7 +8083,7 @@ class Shell(object):
                  "shot", "born", "born_tick", "ticks", "x", "y",
                  "max_ticks",
                  "vx", "vy", "locked", "bounced",
-                 "damage_ratio", "size_ratio")
+                 "damage_ratio", "size_ratio", "blocked_at")
 
     def __init__(self, handle, fire_seq, weapon, group, x0, y0, shot, born,
                  max_ticks, born_tick=0):
@@ -8070,6 +8124,10 @@ class Shell(object):
         #:   不跟着状态到期变 —— 这一颗已经飞出去了。
         self.damage_ratio = 1.0
         self.size_ratio = 1.0
+        #: ★★ 最后一格**把它挡住的那个探针格** `(x, y)`（客户端 `0x50e759` 的
+        #:   `hit.cell`，X_Mod §79）；这一格没撞地形就是 `None`。V0.3 §161「掉出
+        #:   下边界」的判据就是这一格在不在图外（`_shell_fell_out_of_the_world`）。
+        self.blocked_at = None
 
     @property
     def radius(self):
@@ -9052,6 +9110,7 @@ def _shell_step(room, shell, terrain, bodies):
     那一路也返回 `None`。
     """
     ax, ay = shell.x, shell.y
+    shell.blocked_at = None
     if shell.weapon.homing_angle:
         bx, by = _homing_step(room, shell, bodies)
     elif shell.bounced:
@@ -9091,10 +9150,17 @@ def _shell_step(room, shell, terrain, bodies):
     probe = _BulletProbe(terrain, t_ms) if terrain is not None else None
     hit = _client_sweep(terrain, ax, ay, bx, by, radius, t_ms, probe)
     if hit is not None and (best_t is None or hit.t < best_t):
-        if _resolve_terrain_hit(shell, hit, probe):
-            return None
         # 客户端 `0x47eda1` 先把位置放到 `free` 再调爆炸 ⇒ 炸点就是 `free`（整数）。
         point = (float(hit.free_x), float(hit.free_y))
+        shell.blocked_at = (hit.cell_x, hit.cell_y)
+        # ★★★ 挡住它的是**图底之外**那一格（`FallDown` 图）= 收方把它静默删掉了
+        #   （V0.3 §161）：不弹、不炸，交给 `_resolve_shell()` 一个句柄都不记。
+        #   先问这一句再谈反弹 —— 会弹的雷在这儿「弹回来」的话，收方那颗已经没了，
+        #   之后那发 `rpExplode` 替它记的号就是永久错开（X_Mod §84）。
+        if not _shell_fell_out_of_the_world(room, shell, point):
+            if _resolve_terrain_hit(shell, hit, probe):
+                shell.blocked_at = None
+                return None
         shell.x, shell.y = point
         return (point, None, None)
     shell.x, shell.y = bx, by
@@ -9291,10 +9357,15 @@ def _shell_fell_out_of_the_world(room, shell, point):
     ★★★ 判据和角色那条（`_fell_out_of_the_world` / §143）同一套：
     这张图的 `map.ini` 有 `FallDown`，而**拦住它的那个采样点**已经在图外。
 
-    ★ 为什么要把碰撞半径加回去：`_terrain_contact()` 是拿弹体外缘的探针
-      去问地形的（`shell_probe_offsets`，往下飞时偏移就是 `+radius`），
-      所以「探针出界」这件事在落点上写着的是 `y + radius >= 图高`。
-      直接拿 `y` 比会漏掉一切带半径的弹体（半径 8 的能差 8 个像素）。
+    ★★★ 首选**那个探针格本身**（`shell.blocked_at`，客户端扫掠 `0x50e759` 的
+      `hit.cell`）：`blocked_at[1] >= 图高` 就是这一条判据的原话。
+      ⚠ X_Mod D60 之后炸点是 `hit.free` = 被挡住的**前一个**整数点，比「探针贴上
+      的那一点」少走一步 ⇒ 下面那条 `y + radius >= 图高` 在直直往下掉的弹体上
+      **恰好差 1 px**（2026-09-23 23:13 云桥：碎片炸点 (754, 1361)，1361 + 8 = 1369，
+      挡住它的格是 (754, 1370)）—— 漏判一次就多记一个句柄，之后整局打不掉血（X_Mod §84）。
+    ★ 没有探针格时（引信到点 / 飞到头、单测直接给落点）才退回落点：
+      老的 `_terrain_contact()` 是拿弹体外缘的探针去问地形的（往下飞时偏移就是
+      `+radius`），所以「探针出界」在落点上写着的是 `y + radius >= 图高`。
 
     ## 为什么要单独认出这一种
 
@@ -9327,6 +9398,9 @@ def _shell_fell_out_of_the_world(room, shell, point):
     terrain = _terrain(room)
     if terrain is None:
         return False
+    blocked = getattr(shell, "blocked_at", None)
+    if blocked is not None:
+        return blocked[1] >= terrain.height
     radius = float(getattr(shell, "radius", 0.0) or 0.0)
     return float(point[1]) + radius >= float(terrain.height)
 
