@@ -5934,6 +5934,11 @@ def _relay_fallback(member, udp_packet):
 # ---------------------------------------------------------------------------
 # ★★★★★ 房间的 32 ms 战斗循环（V0.3 D106 —— **废止 D17**）
 # ---------------------------------------------------------------------------
+#: 逻辑帧时钟（D60）每条连接最多留几帧 / 几颗弹的出膛记录。**只是内存上界**，不是时序阈值：
+#: 一颗弹最多推 `bot.BOT_SHELL_TICK_CEILING`（20 s = 625）格，1024 帧够它活到底；
+#: 出膛表按到达顺序挤掉最老的，同时在飞的弹不会有这么多。
+TICK_CLOCK_KEEP = 1024
+
 #: 一发 bot 心跳隔几个物理 tick。`4 × 32 ms = 128 ms`，就是真人客户端自己那个
 #: 节奏（语料 ~8 Hz）。
 #:
@@ -7146,6 +7151,13 @@ class Conn:
     #:   会整体重取一遍，§78）。
     mover_phase = None
     mover_phase_at = None
+    #: ★ 逻辑帧时钟（X_Mod §81 / D60）：`tick_clock` = `{帧号: 该帧 Timer()}`（按到达顺序，
+    #:   只留最近 `TICK_CLOCK_KEEP` 帧），`tick_latest` = 帧号最大的那一条 `(帧号, Timer)`，
+    #:   `shell_birth` = `{弹体句柄: 出膛帧号}`（只留最近 `TICK_CLOCK_KEEP` 颗）。
+    #:   `note_tick_clock()` 存、`bot._mover_clock()` 读；和 `mover_phase` 一起在 `0x0400` 清。
+    tick_clock = None
+    tick_latest = None
+    shell_birth = None
     #: ★ 诊断（`note_human_fire`）的类级默认 —— 控制通道造的假连接也得有。
     human_fire_logged = frozenset()
     #: ★ 这条连接**本图打出去、还没配上爆炸**的几发 `rpFire`（V0.3 §92）。
@@ -7494,6 +7506,10 @@ class Conn:
                 #   D55）。hook 在载图**收尾**才报新的，所以清在这儿不会把新的清掉。
                 self.mover_phase = None
                 self.mover_phase_at = None
+                # 逻辑帧时钟同理（D60）：帧号是每个 Stage 从 0 数的，上一局的一条都不能留。
+                self.tick_clock = None
+                self.tick_latest = None
+                self.shell_birth = None
             relayserver.epoch_state(self).advance(self.room_generation(kind))
             return
         if opcode == EPOCH_ASSIGNING_OP and len(plain) >= 12:
@@ -11318,6 +11334,34 @@ class Conn:
                         % (link, got[1], got[3], got[2])
                         for link, got in sorted(phase.items())),
                drift))
+
+    def note_tick_clock(self, tick, timer, births=(), now=None):
+        """逻辑帧时钟到了（`udpsync.MSG_TICK_CLOCK`，X_Mod §81 / D60）。**只存事实**。
+
+        `tick` = 客户端这一帧的帧号（`[Stage+0xd4]`），`timer` = 这一帧的 `Timer()`
+        （`[Stage+0xe0]`，移动平台这一帧的碰撞位置就是按它算的），`births` = 这一帧里
+        新建的远端弹体句柄（bot 开的枪、别人开的枪都在里面，bot 那边按自己的句柄去查）。
+        ★ UDP 可能乱序：`tick_latest` 只往前走，晚到的旧帧照样记进表里（查到就是准的）。
+        ★ `now` 只给测试注入用，和 `note_mover_phase()` 同一套约定。
+        """
+        tick = int(tick) & 0xFFFFFFFF
+        timer = int(timer) & 0xFFFFFFFF
+        clock = self.tick_clock
+        if clock is None:
+            clock = self.tick_clock = collections.OrderedDict()
+        clock[tick] = timer
+        while len(clock) > TICK_CLOCK_KEEP:
+            clock.popitem(last=False)
+        if self.tick_latest is None or tick >= self.tick_latest[0]:
+            self.tick_latest = (tick, timer)
+        if births:
+            table = self.shell_birth
+            if table is None:
+                table = self.shell_birth = collections.OrderedDict()
+            for handle in births:
+                table[int(handle)] = tick
+            while len(table) > TICK_CLOCK_KEEP:
+                table.popitem(last=False)
 
     def feed_peer_udp(self, index, payload):
         """UDP 那条路的入口 —— `udpsync` 收到位置数据后调它。

@@ -4413,8 +4413,8 @@ if (3 <= 系列 <= 5 && 索引 < 50)  索引 %= 10      ; D/R/F 归一化成槽�
 
 ```text
 +0  4  magic  b"PSU\x01"     最后一字节是版本号，改格式就 +1
-+4  1  类型    HELLO(1) / HELLO_ACK(2) / DATA(3) / PING(4) / PONG(5) / PRESENCE(6) / MOVER_PHASE(7)
-+5  1  份数    DATA / MOVER_PHASE 时 = 后面跟几组（含当前这一份）
++4  1  类型    HELLO(1) / HELLO_ACK(2) / DATA(3) / PING(4) / PONG(5) / PRESENCE(6) / MOVER_PHASE(7) / TICK_CLOCK(8)
++5  1  份数    DATA / MOVER_PHASE / TICK_CLOCK 时 = 后面跟几组（含当前这一份）
 +6  2  保留    0
 ```
 
@@ -4426,6 +4426,7 @@ if (3 <= 系列 <= 5 && 索引 < 50)  索引 %= 10      ; D/R/F 归一化成槽�
 | `PING` / `PONG` | `u32 序号`（保活撑住 NAT 映射，顺带量 RTT）|
 | `PRESENCE`（6）| `u32 键盘空闲 / u32 鼠标空闲 / u32 系统空闲 / u8 前台 / u8 标志 / u16 保留`，空闲 `0xFFFFFFFF` = 本次连接从来没有过。在场证据（X_Mod §62 / D53）：bshook 每 5 秒 → 中继**原样转** → 游戏服 `Conn.note_presence()`，判定在游戏服 |
 | `MOVER_PHASE`（7）| `u32 game_now`（`[当前 Stage + 0xe0]`，= 此刻的 `Timer()`；Desktop `[0x72e2b4]` +8 = 当前 Stage，§78）`/ u32 wall_now`（`GetTickCount`），然后「份数」条 `i32 link / u32 t0 / i32 t_off`。移动平台相位（X_Mod §74 / §78 / D55 / D59）：bshook 在两个写 `t0` 的站点记表并置脏 —— `MapObject::LinkPath` 收尾 `0x511d97`（载图）、`GameContext::StartGame` → `0x476463`（**开打时整体重取**，战斗里算数的是这个）—— 之后每秒一发；★ `t0` / `t_off` 是**发包那一刻从对象身上现读的**。→ 中继**原样转** → `Conn.note_mover_phase()` 存 `game_now − t0`（起点翻转才打日志）；老服务端 / 老中继不认识就丢 |
+| `TICK_CLOCK`（8）| `u32 帧号`（`[当前 Stage + 0xd4]`，`Stage::Update` 0x42b4c3 每个 32 ms 逻辑帧 +1）`/ u32 Timer`（`[当前 Stage + 0xe0]`，这一逻辑帧里移动平台就按它摆），然后「份数」个 `i32 弹体句柄` = **这一帧**在网络泵里建出来的远端弹体（`ProjectileMgr::Add`，自己开的枪 / 句柄 < 100000 不报）。逻辑帧时钟（✅ 静态 / 🤔 实机待验，X_Mod §81 / D60）：bshook 在 `GameContext` 逻辑帧入口 `0x4904cc`（vft+0x80）**每帧一发，只在这张图有移动平台时**；→ 中继**原样转** → `Conn.note_tick_clock()` 存「帧号 → Timer」和「句柄 → 出膛帧」→ `bot._mover_clock(room, terrain, shell)` 第 k 格取「出膛帧 + k − 1」那一帧的 Timer − t0（没报到就按最近一帧 + 32·Δ 外推）。`0x0400` 时清空。老服务端 / 老中继不认识就丢 |
 
 **铁律**（`server/udpsync.py` 顶部有完整论证）：
 

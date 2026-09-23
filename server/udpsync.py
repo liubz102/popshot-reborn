@@ -430,6 +430,50 @@ def parse_mover_phase(data):
     return game_now, wall_now, entries
 
 
+#: ★ 逻辑帧时钟（X_Mod §81 / D60）—— 客户端报「**这个逻辑帧**的帧号、帧里的 `Timer()`、
+#:   这一帧新建了哪几颗远端弹体」。
+#:
+#: 出处：鲤鱼上的反弹差 1 px 就弹向全变，而服务端按「每秒一发的相位 + 墙钟外推」算出来的鱼
+#: 比房主客户端平均早 12 ms、σ 7 ms（§81）。客户端逻辑是固定 32 ms 的网格（`Stage::Update`
+#: `0x42b4c3`，`[Stage+0xd4]` 帧号），移动平台的碰撞位置只在渲染时按 `Timer()`（`[Stage+0xe0]`）
+#: 刷新 ⇒ 逻辑帧 m 里撞到的鱼 = `Timer_m − t0`。收到的 `rpFire` 在某个逻辑帧里建弹体并**当帧**
+#: 推第 1 格 ⇒ 第 k 格 = 出膛帧 + k − 1。两件都是 hook 站在旁边看得到的事实（`GameContext`
+#: 逻辑帧入口 `0x4904cc` 发，这一帧的出膛已经在网络泵里登记过了）。
+#:
+#: 载荷：`u32 帧号 / u32 Timer`，然后头里 `count` 个 `i32 弹体句柄`（这一帧出膛的远端弹体）。
+#: ★ 只在「这张图有移动平台」时发（hook 的 MOVER 表非空）—— 别的图一发都没有。
+#: ★★ 和 `MSG_MOVER_PHASE` 一样**只运事实**：谁的时钟算数、没报到时怎么外推都在服务端。
+MSG_TICK_CLOCK = 8
+
+TICK_HEAD = struct.Struct("<II")
+TICK_BIRTH = struct.Struct("<i")
+#: 一帧最多带几颗出膛（hook 那张小表的上限；分裂弹一次 4 片，再多也不会同帧超过它）。
+TICK_MAX_BIRTHS = 32
+
+
+def build_tick_clock(tick, timer, births=()):
+    items = list(births)[:TICK_MAX_BIRTHS]
+    return (build_header(MSG_TICK_CLOCK, len(items))
+            + TICK_HEAD.pack(int(tick) & 0xFFFFFFFF, int(timer) & 0xFFFFFFFF)
+            + b"".join(TICK_BIRTH.pack(int(h)) for h in items))
+
+
+def parse_tick_clock(data):
+    """-> `(帧号, Timer, [出膛的弹体句柄, …])`。比说好的长照收，短了拒（同 `parse_mover_phase`）。"""
+    kind, count = parse_header(data)
+    if kind != MSG_TICK_CLOCK:
+        raise ProtocolError(f"not a TICK_CLOCK ({kind})")
+    if len(data) < HEADER_SIZE + TICK_HEAD.size + count * TICK_BIRTH.size:
+        raise ProtocolError("TICK_CLOCK truncated")
+    tick, timer = TICK_HEAD.unpack_from(data, HEADER_SIZE)
+    pos = HEADER_SIZE + TICK_HEAD.size
+    births = []
+    for _ in range(count):
+        births.append(TICK_BIRTH.unpack_from(data, pos)[0])
+        pos += TICK_BIRTH.size
+    return tick, timer, births
+
+
 def build_ping(kind, seq):
     return build_header(kind) + struct.pack("<I", seq & 0xFFFFFFFF)
 
@@ -1091,6 +1135,29 @@ class UdpSyncServer:
         except Exception as error:             # noqa: BLE001 —— 不许带崩收包循环
             self.log(f"!! 喂移动平台相位抛了 {error!r}")
 
+    def _on_tick_clock(self, data, addr, now):
+        """逻辑帧时钟（`MSG_TICK_CLOCK`，X_Mod §81 / D60）—— 同 `_on_mover_phase`：
+        `HELLO` 之前一律丢，认得出就喂给 `Conn.note_tick_clock()`，这里不判定。
+        """
+        with self._lock:
+            endpoint = self._by_addr.get(addr)
+            if endpoint is not None:
+                endpoint.last_seen = now
+        if endpoint is None:
+            self.unknown_in += 1
+            return
+        try:
+            tick, timer, births = parse_tick_clock(data)
+        except ProtocolError:
+            return
+        note = getattr(endpoint.game_conn, "note_tick_clock", None)
+        if note is None:
+            return
+        try:
+            note(tick, timer, births)
+        except Exception as error:             # noqa: BLE001 —— 不许带崩收包循环
+            self.log(f"!! 喂逻辑帧时钟抛了 {error!r}")
+
     def _reply(self, data, addr):
         if self.sock is None:
             return
@@ -1115,6 +1182,8 @@ class UdpSyncServer:
             self._on_presence(data, addr, now)
         elif kind == MSG_MOVER_PHASE:
             self._on_mover_phase(data, addr, now)
+        elif kind == MSG_TICK_CLOCK:
+            self._on_tick_clock(data, addr, now)
         elif kind == MSG_PING:
             with self._lock:
                 endpoint = self._by_addr.get(addr)

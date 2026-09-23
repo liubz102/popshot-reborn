@@ -5811,10 +5811,12 @@ static const unsigned char MOVERST_SIG[MOVERST_SIG_LEN] = {
     0x8D, 0x45, 0xF8                      /* lea eax, [ebp-8]      ┘ 落点      */
 };
 
-/* Desktop 单例 `[0x72e2b4]`（vft 0x662ae0）+8 = 当前 Stage，它的 +0xe0 = 此刻的 Timer()。 */
+/* Desktop 单例 `[0x72e2b4]`（vft 0x662ae0）+8 = 当前 Stage，它的 +0xe0 = 此刻的 Timer()。
+   +0xd4 = 已经跑了几个逻辑帧（`Stage::Update` `0x42b4f9` 每帧 +1，X_Mod §81）。 */
 #define MOVER_DESKTOP_PTR_VA 0x0072E2B4u
 #define MOVER_STAGE_OFFSET   8
 #define MOVER_STAGE_NOW_OFF  0xE0
+#define MOVER_STAGE_TICK_OFF 0xD4
 #define MOVER_OBJ_T0_OFF     0x90
 #define MOVER_OBJ_TOFF_OFF   0x94
 #define MOVER_OBJ_REL_OFF    0x98
@@ -7320,6 +7322,11 @@ static void *g_proj_add_tramp  = NULL;
 static void *g_proj_tick_tramp = NULL;
 static void *g_proj_fire_tramp = NULL;
 static volatile LONG g_proj_diag_patched = 0;
+/* ★ `ProjectileMgr::Add` 那个钩子现在有两个用户（X_Mod D60）：逻辑帧时钟要在这里登记
+   「这一帧出膛了哪些远端弹体」（常开），弹体诊断要打 `PROJ+` 快照（跟日志级别）。
+   钩子只装一个，诊断那一半由这个开关决定做不做。 */
+static volatile LONG g_proj_diag_on = 0;
+static void tick_note_birth(unsigned char *p);
 
 /* ★★ 默认值是**跟着日志级别走**，不是「没设 = 开」（用户 2026-09-01 的卡顿）。
  *
@@ -7489,9 +7496,18 @@ static void proj_track_add(void *proj, int handle)
 static void __cdecl proj_tick_log(void *proj)
 {
     unsigned char *p = (unsigned char *)proj;
+    unsigned char *stage;
+    unsigned int logic_tick = 0, timer = 0;
     int i;
 
     if (!p || IsBadReadPtr(p, 0x340)) return;
+    /* ★ 这一格在客户端第几个逻辑帧、帧里的 Timer()（移动平台这一帧就按它摆，X_Mod §81）：
+       离线重放拿它逐格对拍鲤鱼的相位，不用再从日志时间戳去猜。 */
+    stage = mover_current_stage();
+    if (stage && !IsBadReadPtr(stage + MOVER_STAGE_TICK_OFF, 4)) {
+        logic_tick = *(unsigned int *)(stage + MOVER_STAGE_TICK_OFF);
+        timer = *(unsigned int *)(stage + MOVER_STAGE_NOW_OFF);
+    }
     for (i = 0; i < PROJ_TRACK_N; i++) {
         if (g_proj_track[i].obj != proj) continue;
         /* 地址被复用了：接着往后扫，**别 return** —— 上面 proj_track_add 已经
@@ -7505,12 +7521,13 @@ static void __cdecl proj_tick_log(void *proj)
            查「炸完不消失」要看的正是「它到底还在不在倒计时」。 */
         bsvlog("PROJ.   弹体 %08X 句柄 %d owner %d 第%d帧 位置(+34,38)"
                " (%.2f, %.2f) 渲染(+2c,30) (%.2f, %.2f) 速度 (%.2f, %.2f)"
-               " 状态 %d 寿命(+31c) %d 碰撞型(+32c) %d 追踪目标(+328) %d 线 %08X",
+               " 状态 %d 寿命(+31c) %d 碰撞型(+32c) %d 追踪目标(+328) %d 线 %08X"
+               " 逻辑帧 %u Timer %u",
                (unsigned)(UINT_PTR)p, g_proj_track[i].handle,
                proj_owner_of(g_proj_track[i].handle), g_proj_track[i].ticks,
                PF(0x34), PF(0x38), PF(0x2C), PF(0x30),
                PF(0x120), PF(0x124), PI(0x54), PI(0x31C), PI(0x32C), PI(0x328),
-               PU(0x30C));
+               PU(0x30C), logic_tick, timer);
         /* ★ 弹道线 / 拖尾**每帧的内容**：光看「指针非 0」证明不了它被画了
            —— 要看它有没有跟着弹体动。真人和 bot 并排比这几行就够了。 */
         if (PU(0x30C))
@@ -7525,6 +7542,14 @@ static void __cdecl proj_tick_log(void *proj)
 #undef PI
 #undef PU
 
+/* Add 的两个用户：逻辑帧时钟登记出膛（常开，D60）+ 弹体诊断快照（跟日志级别）。 */
+static void __cdecl proj_add_hook(void *proj)
+{
+    tick_note_birth((unsigned char *)proj);
+    if (InterlockedCompareExchange(&g_proj_diag_on, 0, 0))
+        proj_add_log(proj);
+}
+
 /* Add 是 __thiscall(ecx=mgr, [esp+4]=proj)：
    进 detour 时 [esp]=返回地址、[esp+4]=proj；
    pushad(32) + pushfd(4) 之后就是 [esp+0x28]。 */
@@ -7534,12 +7559,26 @@ static __declspec(naked) void proj_add_detour(void)
         pushad
         pushfd
         push dword ptr [esp + 0x28]
-        call proj_add_log
+        call proj_add_hook
         add  esp, 4
         popfd
         popad
         jmp  dword ptr [g_proj_add_tramp]
     }
+}
+
+/* Add 钩子只装一次，谁先要谁装（逻辑帧时钟 / 弹体诊断）。 */
+static int ensure_proj_add_hook(void)
+{
+    unsigned char *a = (unsigned char *)PROJ_ADD_VA;
+
+    if (g_proj_add_tramp != NULL) return 1;
+    if (IsBadReadPtr(a, sizeof(PROJ_ADD_SIG))) return 0;
+    if (memcmp(a, PROJ_ADD_SIG, sizeof(PROJ_ADD_SIG)) != 0)
+        return 0;                          /* 还没解壳到这里，或不是这个版本 */
+    g_proj_add_tramp = install_inline_hook((void *)PROJ_ADD_VA, proj_add_detour,
+                                           "弹体登记");
+    return g_proj_add_tramp != NULL;
 }
 
 /* 每帧 tick 是 __thiscall(ecx=弹体)，没有栈参数。pushad 不动寄存器，
@@ -7752,14 +7791,7 @@ static int try_patch_proj_diag(void)
     if (g_proj_diag_patched) return 1;
     if (IsBadReadPtr(a, sizeof(PROJ_ADD_SIG))
         || IsBadReadPtr(t, sizeof(PROJ_TICK_SIG))) return 0;
-    if (g_proj_add_tramp == NULL) {
-        if (memcmp(a, PROJ_ADD_SIG, sizeof(PROJ_ADD_SIG)) != 0)
-            return 0;                      /* 还没解壳到这里，或不是这个版本 */
-        g_proj_add_tramp = install_inline_hook((void *)PROJ_ADD_VA,
-                                               proj_add_detour,
-                                               "弹体登记诊断");
-        if (!g_proj_add_tramp) return 0;
-    }
+    if (!ensure_proj_add_hook()) return 0;
     if (g_proj_tick_tramp == NULL) {
         if (memcmp(t, PROJ_TICK_SIG, sizeof(PROJ_TICK_SIG)) != 0)
             return 0;
@@ -7779,6 +7811,7 @@ static int try_patch_proj_diag(void)
         if (!g_proj_fire_tramp) return 0;
     }
     InterlockedExchange(&g_proj_diag_patched, 1);
+    InterlockedExchange(&g_proj_diag_on, 1);
     /* ★ 这句以前写的是「按整数位置翻转打轨迹」—— 早就改成每 tick 都打了，
        文字没跟上。查弹体问题的人照着它去读日志会判错（「没有新行」被当成
        「弹体不动」，其实那一版是「弹体没了」），所以订正。 */
@@ -8541,6 +8574,9 @@ static int try_hook_snow(void);
 /* ★ 移动平台相位（X_Mod §74）。和 `server/udpsync.py` 的 `MSG_MOVER_PHASE` 同一号；
    老服务端 / 老中继不认识它，安静丢掉（服务端退回开局估计）。 */
 #define SYNC_MSG_MOVER_PHASE 7
+/* ★ 逻辑帧时钟（X_Mod §81 / D60）。和 `server/udpsync.py` 的 `MSG_TICK_CLOCK` 同一号；
+   老服务端 / 老中继不认识它，安静丢掉（服务端退回每秒一发的相位外推）。 */
+#define SYNC_MSG_TICK_CLOCK 8
 /* 「本次连接从来没有过」。★ 必须和「刚刚有过（0 毫秒）」分得开：
    一个是最强的挂机证据，一个是最强的反证。 */
 #define PRESENCE_NEVER 0xFFFFFFFFu
@@ -8848,6 +8884,132 @@ static void sync_send_mover_phase(void)
               n, links[0], t0s[0],
               first_site == MOVER_SITE_START ? "「开打重取」" : "「载图 LinkPath」",
               (int)(game_now - t0s[0]), toffs[0], game_now, wall_now);
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★★ 逻辑帧时钟（X_Mod §81 / D60）                                            */
+/*                                                                            */
+/*   鲤鱼背上的反弹差 1 px 就弹向全变，而服务端按「每秒一发的相位 + 墙钟外推」  */
+/*   算出来的鱼，比这台客户端推弹体那一格**实际撞到**的鱼平均早 12 ms、σ 7 ms。 */
+/*   那一格撞到的是什么，是两件站在旁边就看得到的事实：                        */
+/*     ① 逻辑是固定 32 ms 的网格（`Stage::Update` 0x42b4c3），`[Stage+0xd4]`   */
+/*        是帧号；移动平台的碰撞位置只在**渲染**时按 `Timer()`（`[Stage+0xe0]`）*/
+/*        刷新 ⇒ 逻辑帧里读到的 Timer 就是这一帧撞到的鱼的时刻；               */
+/*     ② 收到的 rpFire 在网络泵里建弹体（`ProjectileMgr::Add`），**同一帧**里    */
+/*        推第 1 格（`PROJ+` 和第 1 帧同一毫秒）。                              */
+/*   ⇒ `GameContext` 逻辑帧入口（vft+0x80 = 0x4904cc，各模式的子类都 call 它，   */
+/*     这时这一帧的网络泵已经跑完）每帧发一发：帧号 + Timer + 这一帧出膛的远端  */
+/*     弹体句柄。服务端第 k 格按「出膛帧 + k − 1」那一帧的 Timer 算鱼。         */
+/*                                                                            */
+/*   ★ 只在这张图有移动平台时发（MOVER 表非空）—— 别的图一发都没有。           */
+/*   ★ **在游戏线程当场发**（一帧一发，非阻塞 UDP）：D55 否掉「游戏线程发包」是  */
+/*     因为载图时一帧里连着来好几个对象；这里一帧恰好一发，而且晚发就没意义 ——  */
+/*     服务端推同一格和客户端几乎同时，watch_thread 那 100 ms 等不起（D60）。    */
+/*   ★ 出膛表只在游戏线程读写（Add 与逻辑帧入口是同一条线程），不用锁。         */
+/* -------------------------------------------------------------------------- */
+#define TICKCLK_VA        0x004904CCu     /* GameContext::LogicTick（vft+0x80）入口 */
+/*   0x4904cc  b8 64 45 63 00   mov eax, 0x634564   ← 正好 5 字节（和 Add 同一个形状） */
+static const unsigned char TICKCLK_SIG[5] = { 0xB8, 0x64, 0x45, 0x63, 0x00 };
+#define TICK_BIRTH_MAX    32
+
+static void *g_tickclk_tramp = NULL;
+static volatile LONG g_tickclk_patched = 0;
+static int g_tick_births[TICK_BIRTH_MAX];
+static int g_tick_birth_n = 0;
+static int g_tick_birth_dropped = 0;
+static unsigned int g_tickclk_last = 0;   /* 日志按「开始上报」翻转：帧号倒退 = 新的一局 */
+static int g_tickclk_on = 0;
+
+/* ProjectileMgr::Add 里调（游戏线程）：远端弹体登记进「这一帧出膛」表。
+   自己开的枪不报（服务端不模拟它）；怪 / 中立（句柄 < 100000）不报。 */
+static void tick_note_birth(unsigned char *p)
+{
+    int handle, me;
+
+    if (!InterlockedCompareExchange(&g_tickclk_patched, 0, 0)) return;
+    if (InterlockedCompareExchange(&g_mover_count, 0, 0) <= 0) return;
+    if (!p || IsBadReadPtr(p, 0x340)) return;
+    if (!proj_is_bullet(p)) return;         /* 角色 / 地图物件也走 Add */
+    handle = *(int *)(p + 0xD0);
+    if (handle < 100000) return;
+    me = proj_my_seat();
+    if (me >= 0 && proj_owner_of(handle) == 10 + me) return;
+    if (g_tick_birth_n < TICK_BIRTH_MAX)
+        g_tick_births[g_tick_birth_n++] = handle;
+    else
+        g_tick_birth_dropped++;
+}
+
+/* GameContext 逻辑帧入口（游戏线程）：这一帧的帧号 / Timer / 出膛表发出去。 */
+static void __cdecl tick_clock_on_logic(void)
+{
+    unsigned char buf[8 + 8 + TICK_BIRTH_MAX * 4];
+    unsigned char *stage;
+    unsigned int tick, timer;
+    int n = g_tick_birth_n, len, i;
+
+    g_tick_birth_n = 0;                     /* 这一帧的出膛只属于这一帧，发不出去也不留 */
+    if (InterlockedCompareExchange(&g_mover_count, 0, 0) <= 0) return;
+    if (!g_sync_ticket[0]) return;
+    if (!InterlockedCompareExchange(&g_sync_ready, 0, 0)) return;
+    stage = mover_current_stage();
+    if (!stage || IsBadReadPtr(stage + MOVER_STAGE_TICK_OFF, 4)) return;
+    tick = *(unsigned int *)(stage + MOVER_STAGE_TICK_OFF);
+    timer = *(unsigned int *)(stage + MOVER_STAGE_NOW_OFF);
+    len = sync_put_header(buf, SYNC_MSG_TICK_CLOCK, n);
+    memcpy(buf + len, &tick, 4);  len += 4;
+    memcpy(buf + len, &timer, 4); len += 4;
+    for (i = 0; i < n; i++) {
+        memcpy(buf + len, &g_tick_births[i], 4);
+        len += 4;
+    }
+    sync_send_raw(buf, len);
+    /* 日志按状态翻转：这一局第一次发（或帧号倒退 = 换了一局）打一行，之后静默。 */
+    if (!g_tickclk_on || tick < g_tickclk_last) {
+        g_tickclk_on = 1;
+        bslog("MOVER   逻辑帧时钟开始上报：帧 %u / Timer %u（每个逻辑帧一发，带这一帧出膛的"
+              "远端弹体，X_Mod D60）", tick, timer);
+    }
+    g_tickclk_last = tick;
+    if (n)
+        bsvlog("MOVER   逻辑帧 %u（Timer %u）出膛 %d 颗远端弹体，首个句柄 %d",
+               tick, timer, n, g_tick_births[0]);
+    if (g_tick_birth_dropped) {
+        bslog("MOVER   !! 一帧里出膛超过 %d 颗，%d 颗没登记（服务端对它们退回每秒相位外推）",
+              TICK_BIRTH_MAX, g_tick_birth_dropped);
+        g_tick_birth_dropped = 0;
+    }
+}
+
+static __declspec(naked) void tickclk_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        call tick_clock_on_logic
+        popfd
+        popad
+        jmp  dword ptr [g_tickclk_tramp]
+    }
+}
+
+/* 逻辑帧入口 + Add 两个钩子一起装（Add 可能已经被弹体诊断装过，共用）。 */
+static int try_patch_tick_clock(void)
+{
+    unsigned char *t = (unsigned char *)TICKCLK_VA;
+
+    if (g_tickclk_patched) return 1;
+    if (!ensure_proj_add_hook()) return 0;
+    if (IsBadReadPtr(t, sizeof(TICKCLK_SIG))
+        || memcmp(t, TICKCLK_SIG, sizeof(TICKCLK_SIG)) != 0)
+        return 0;
+    g_tickclk_tramp = install_inline_hook((void *)TICKCLK_VA, tickclk_detour, "逻辑帧时钟");
+    if (!g_tickclk_tramp) return 0;
+    InterlockedExchange(&g_tickclk_patched, 1);
+    bslog("PATCH   ★逻辑帧时钟 @ %08X（GameContext 逻辑帧入口）+ 出膛登记 @ %08X"
+          "（ProjectileMgr::Add）：有移动平台的图每个逻辑帧报「帧号 / Timer / 这一帧出膛的"
+          "远端弹体」（X_Mod §81 / D60）", (unsigned)TICKCLK_VA, (unsigned)PROJ_ADD_VA);
+    return 1;
 }
 
 /* 从 `0x0100 gcpReqLogin` 的载荷里取票据（首字段 wstring：u16 字符数 +
@@ -10591,6 +10753,14 @@ static DWORD WINAPI patch_thread(LPVOID param)
         else if (!g_mover_start_patched)
             bslog("PATCH   !! 超时未能 patch 移动平台相位 ②（0x476463 特征对不上）"
                   "—— 开打后的起点要等下一发周期同步（≤1 秒）才报上去");
+        /* ★ 逻辑帧时钟（D60）：两个目标函数都在战斗里才第一次跑，远晚于解壳窗口。 */
+        for (ticks = 0; !g_stop && ticks < 2000; ticks++) {
+            if (try_patch_tick_clock()) break;
+            Sleep(2);
+        }
+        if (!g_tickclk_patched)
+            bslog("PATCH   !! 超时未能装逻辑帧时钟（0x4904CC / 0x473E7C 特征对不上）"
+                  "—— 服务端对移动平台退回每秒相位外推");
     }
 
     /* NEXON 信使（§85 / D83）：默认**整个拆掉** —— 四格 IAT 全换成自己的桩，

@@ -394,7 +394,7 @@ class BounceOffMoverTests(unittest.TestCase):
             self.skipTest("武器表里没有 1000020")
         self.clock = 0
         real = self.bot._mover_clock
-        self.bot._mover_clock = lambda room, terrain: self.clock
+        self.bot._mover_clock = lambda room, terrain, shell=None: self.clock
         self.addCleanup(setattr, self.bot, "_mover_clock", real)
 
     @staticmethod
@@ -449,10 +449,11 @@ class BounceOffMoverTests(unittest.TestCase):
 
     def test_the_facing_vote_counts_the_mover_only_with_a_clock(self):
         terrain = self._flat_mover_terrain()
-        self.assertIsNone(self.bot._terrain_facing(terrain, 200, 291))
-        sx, sy = self.bot._terrain_facing(terrain, 200, 291, 0)
-        self.assertEqual(0.0, sx)
-        self.assertGreater(sy, 0.0)                                # 指向实心那一侧 = 下面
+        vote = self.bot._terrain_vote
+        self.assertEqual((0, 0), vote(self.bot._BulletProbe(terrain, None), 200, 291))
+        sx, sy = vote(self.bot._BulletProbe(terrain, 0), 200, 291)
+        self.assertEqual(0, sx)
+        self.assertGreater(sy, 0)                                  # 指向实心那一侧 = 下面
 
     def test_the_20260923_carp_bounce_matches_the_client_log(self):
         """句柄 200084（2026-09-23 云桥，`rpFire` 原字节：角度 -0.25969645380973816、力度 42）。

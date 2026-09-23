@@ -87,7 +87,10 @@ DIR_TYPE = {"TERRAIN": 200, "LAYER": 202, "COVER": 201,
 #:    i32 = `[obj+0x94]`，相位偏移毫秒）、`rel`（第 3 个 = `[obj+0x98]`，相对模式）。
 #:    客户端 `PathFollower::GetPos` 算的是 `Timer() + t_off − t0`，相对模式还要加回
 #:    自身坐标（X_Mod §74）；7 那一版把后两个字段丢了，`Quest_level6` 那块算错。
-FORMAT = 8
+#: 9：`breakables[]` 多了 `fx` / `fy` = `.map` 里的原始 f32 坐标（`x` / `y` 仍是四舍五入的
+#:    整数，角色那一路照旧用它）。客户端对象查询 `0x51a935` 是拿 f32 坐标截断映射的，
+#:    四舍五入会差出 1 px —— 弹体那一路按原始坐标合成（X_Mod §80）。
+FORMAT = 9
 
 #: ★★★ **可破坏物**（`Maps/*/Breakable/*.png`，客户端类 `BreakableObj`）。
 #: 全 174 张图里共 677 个，分布在 67 张图上。
@@ -363,6 +366,10 @@ def collect_breakables(width, height, objects, masks):
             ("handle", int(obj.get("handle", 0))),
             ("x", int(round(obj["x"]))),
             ("y", int(round(obj["y"]))),
+            # ★ 原始 f32（`struct` 读出来已经是 f32 精确值，repr 不丢位）：
+            #   弹体那一路按它截断映射（X_Mod §80）。
+            ("fx", float(obj["x"])),
+            ("fy", float(obj["y"])),
             ("w", mask["width"]),
             ("h", mask["height"]),
             ("hp", int(hp)),

@@ -756,10 +756,11 @@ class UdpSyncRelay:
                     f"{'已 bind' if downlink else '还没 bind'}）")
             self._send_hello()
             return
-        if kind in (udpsync.MSG_PRESENCE, udpsync.MSG_MOVER_PHASE):
-            # ★ 在场证据（bug调查/25）和移动平台相位（X_Mod §74）：中继**原样转发，
-            #   一个字节不看**。前者是「键盘 / 鼠标 / 这台机器多久没动过、游戏在不在
-            #   前台」，后者是「挂在路径上的地形各自的 t0 / 偏移 + 客户端此刻的时钟」，
+        if kind in (udpsync.MSG_PRESENCE, udpsync.MSG_MOVER_PHASE,
+                    udpsync.MSG_TICK_CLOCK):
+            # ★ 在场证据（bug调查/25）、移动平台相位（X_Mod §74）、逻辑帧时钟（§81 / D60）：
+            #   中继**原样转发，一个字节不看**。前者是「键盘 / 鼠标 / 这台机器多久没动过、
+            #   游戏在不在前台」，后两个是「挂在路径上的地形各自的 t0 / 偏移 + 客户端的时钟」，
             #   判定都在游戏服那边 —— 那边的阈值 / 取值顺序改了不该要求重发客户端，
             #   更不该要求重发中继。
             #   ★ 老服务端不认识这两个 kind，会在 `UdpHub._handle` 里安静丢掉

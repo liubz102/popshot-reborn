@@ -209,7 +209,7 @@ class RealMaps(unittest.TestCase):
 
     def test_the_carp_is_absolute_with_no_offset(self):
         """庆典三张的挂路径对象 `t_off` / `rel` 全是 0（§74 的全库扫描）。"""
-        self.assertEqual(8, mapdata.FORMAT)
+        self.assertEqual(9, mapdata.FORMAT)
         rider = self.terrain.movers[0].riders[0]
         self.assertEqual((0, 0), (rider.t_off, rider.rel))
         self.assertEqual(self.terrain.movers[0].position_at(0),
