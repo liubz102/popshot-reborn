@@ -1,7 +1,7 @@
 {
  "format": 1,
  "packer": {"fill": 0, "key_prefix": "Pack/", "policy": "original-ext-v1", "sep": "~", "volume_cap": 16777216, "zlib_level": 9},
- "tree_hash": "afe5d8b88f77a4b54a2beaed7a919964dc5827fa9af256cbecc376bcb58c538f",
+ "tree_hash": "a63092f0187ebf8d30533e57cc59377ab74cf6bc99b6cf61f0808d99de83b4b4",
  "volumes": {
   "Data~.pkn": {"group": "Data", "sha256": "bc8be7a7a23a14c4c160a74ae6c10571042d14a1e95c533eab4c6cde27c7a749", "size": 550912, "source": "Data", "members": [
    ["Chinese.ini", 114246, "a83ba2b81e8bff212613509e99f9bb808579dfff3b815788ee27cc971d993c1e"],
@@ -43,7 +43,7 @@
    ["weapon-censorship.ini", 95855, "7bbd0ddaf5ebaaadb8db91e32973a1efeb88a9f7238e2f35b020fa4c560dc4de"],
    ["weapon.ini", 246653, "1de03aa627751530b69b00620ab1634f3bd1bedce049ac8608ecb0d640f3b17f"]
   ]},
-  "Data~Quest.pkn": {"group": "Data", "sha256": "e11b0a99785ddf960a0dcbd2c131150f9de0ab5df410dff5a5bcac3ccf93b837", "size": 1083392, "source": "Data/Quest", "members": [
+  "Data~Quest.pkn": {"group": "Data", "sha256": "42af5392051602fdf84432392d4e9e0229376aa3ee69306137e6a0c9e2eb281c", "size": 1083392, "source": "Data/Quest", "members": [
    ["Quest/ChrProps-international.ini", 54, "9c6cbc470c405f715ca4c0eaad777635310c7715391a2723f001fb0713b9ec46"],
    ["Quest/ChrProps.ini", 854, "5e839585bf0f159e42f3d000bdbde00fad8d8ebf39ecb6e30516c1ffb6ced227"],
    ["Quest/LevelQuest/lvl01Clear.txt", 1898, "9d2004c70e2cdaf1c62e46fca3bfd65ec2f5947142f7c52ecc0c54b30b02eb6b"],
@@ -342,7 +342,7 @@
    ["Quest/QuestWarn.uni", 748, "05f49f79a826c01a4440c7f11082d75bedbe7af6c0710c7aa1a56d11bda902c0"],
    ["Quest/TestQuest00/Master.ini", 6496, "d535e0ff4acf22a7000c186f0126ee69b3611d86c33a48daa99b7038d1ae0a20"],
    ["Quest/TestQuest00/Mob.ini", 521, "097a17a676cf2c70b91815be6bea960ef080167636690587c493e58d3e5fe06d"],
-   ["Quest/weapon-international.ini", 12721, "2a50a79adf4b433230ef68a3f8d597b6ee1e0c0786e9503bfde9275f0600c9bf"],
+   ["Quest/weapon-international.ini", 12841, "80027719a65ff51d204b1a9055ea1a9ee034ac8cf53945ef9e62258b6eccf603"],
    ["Quest/weapon.ini", 11535, "ecf3fbe3639930b7d68fc940f06c629353fe56fe0806144abe5ee3e56e8d0162"]
   ]},
   "Data~Training.pkn": {"group": "Data", "sha256": "cbefd39bcb645cc0923061a1c588f1be500404cd5123331e5494bc0a8e4b0835", "size": 37888, "source": "Data/Training", "members": [
