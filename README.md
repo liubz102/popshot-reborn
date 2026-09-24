@@ -128,7 +128,9 @@ start.bat
        │                                     127.0.0.1:47621 → <server_address>:47611
        │                                     127.0.0.1:27809 → <server_address>:27799
        │                                     127.0.0.1:27809/udp → <server_address>:27799/udp
-       │                                       （位置数据；bshook 镜像进来，收到的投回 27807）
+       │                                       （位置数据 / 在场证据 / 移动平台相位；bshook 发进来，
+       │                                         收到的投回 27807。选「本机服务器」时同一条路，
+       │                                         只是转给 127.0.0.1:27799/udp）
        └─ hook/bin/bsloader.exe
             └─ game_patched/BigShot.exe
                  └─ 注入 hook/bin/bshook.dll
@@ -137,6 +139,7 @@ start.bat
                       │  连本机服务端还是连中继
                       ├─ 把「注册成为世纪天成用户」换成我们自己的注册页
                       ├─ 把战斗中的位置数据额外镜像一份到本机中继的 UDP 口
+                      │  （本机 / 远程两种模式都开）
                       ├─ 把客户端对 Pack\*.pkn 的打开改到 Pack_publish\
                       │  （tools\build-pack.bat 打出来的资源卷，格式和原版一致）
                       └─ 可选记录解密后的协议数据
@@ -589,22 +592,31 @@ python tools/gs_ctl.py help
   所以「清单里没有」只可能是手改出来的版本号）。
   清单缺失 / 读坏 / **连服务端自己的版本都不在清单里**时，整项校验自动关掉
   （fail-open：宁可放行，不可把所有人锁在门外）。
-- **自动更新**：客户端收到拒绝帧后会拉起原版的 `game_patcher\BsPatcherChn.exe`
+- **自动更新**：客户端收到拒绝帧后会拉起原版的 `game_patched\BsPatcherChn.exe`
   走升级分支 —— 这个 exe 已被替换成自研更新器（`updater\src\`，独立 C 工程，
   原版 NGM 链整条废弃）。更新器界面复刻原版 BsPatcherChn.exe。
+  - 0. **先问服务器要「更新源」**：`GET http://<server_address>:<server_register_port>/api/update-config`
+   （地址取自 `config/server.config`），拿回服务器上那份 `config/update.config`，
+   里面写着 **manifest 地址**（= 从哪个仓库下游戏包）和**下载加速代理列表**。
+   ★ **开服的人改完服务器上那个文件，不用重启服务端，所有玩家下一次更新立刻生效**
+   —— 换仓库、换代理都不用再发一版客户端。问不到（服务器没开 / 端口不通 /
+   服务端是没有这个接口的老版本）就安静退回玩家本机那份 `config/update.config`，
+   两份都没写 `manifest_url` 才用更新器内置的默认地址。
   - 1. 探测游戏服（`config/server.config` 的地址，27799）：重演一次握手，从拒绝文案里
    解析「服务器要求的版本」（= 服务器自身版本，保证客户端与服务器同批次，
    不是门禁的最低版本）。
-  - 2. 从 GitHub Release 取 `manifest.json`（`releases/latest/download/manifest.json`
-   固定地址，含全部历史版本的 sha256/大小/下载地址），WinHTTP 下载全量 zip
-   边下边校验（若找不到「服务器要求的版本」则下载最新版本）。
-  -  **下载前先测速选源**：先单独测 GitHub 直连 10 秒，速度超过 1 MB/s 就直连；
-   否则把 `config/update.config` 里的代理每 5 个一组并行测速（每个 10 秒），一组里
+  - 2. 从第 0 步定下的地址取 `manifest.json`（默认是本仓库的
+   `releases/latest/download/manifest.json`，含全部历史版本的 sha256/大小/下载地址），
+   WinHTTP 下载全量 zip 边下边校验（若找不到「服务器要求的版本」则下载最新版本）。
+   包的下载地址直接来自 manifest，所以换了仓库连包地址一起换。
+  -  **下载前先测速选源**：先单独测直连 10 秒，速度超过 1 MB/s 就直连；
+   否则把代理每 5 个一组并行测速（每个 10 秒），一组里
    有达标的就选组内最快的，全部不达标就用所有来源里相对最快的。「速度」按峰值秒速算，不是平均。
-   选中的代理直接拼在 GitHub 网址前面（`https://gh-proxy.com/https://github.com/…`），界面底部
-   显示「代理地址：直连Github」或代理网址。代理列表可以手动增删；文件不存在或
-   为空时只用直连。第 2 步的 `manifest.json` 也用这份列表兜底但不测速：直连 5 秒
-   没取到就随机挑一个代理试，5 秒不成再随机换一个，全都不成才提示手动下载。
+   选中的代理直接拼在原地址前面（`https://gh-proxy.com/https://github.com/…`），界面底部
+   显示「仓库：<仓库简写>」和「代理地址：直连Github」或代理网址。代理列表可以手动增删；
+   一个地址都没有时只用直连。第 2 步的 `manifest.json` 也用这份列表兜底但不测速：直连 5 秒
+   没取到就随机挑一个代理试，5 秒不成再随机换一个，全都不成才提示手动下载
+   （手动下载页给的永远是本项目的官方 Release 地址，不跟随服务器配置）。
   - 3. 等游戏进程退出，自动停掉本机服务端/中继（按「exe 路径 = 本包 runtime」
    精确匹配，解除文件占用），解压覆盖（`config/server.config`、`UserConfig.ini`、账号、
    日志等玩家数据**永不覆盖**）。

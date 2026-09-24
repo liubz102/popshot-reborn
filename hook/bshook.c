@@ -247,17 +247,87 @@ static void bslog_shutdown(void)
     if (g_log != INVALID_HANDLE_VALUE) FlushFileBuffers(g_log);
 }
 
+/* 本机此刻的 UTC 偏移，**单位是分钟**（§59 / D52）。
+ *
+ *   为什么写时区：这份日志是**玩家机器**上的，而崩溃包的打包戳来自开发机
+ *   （UTC+9）、服务端日志来自云主机（UTC+8）—— 三台机器三个时区，
+ *   2026-09-20 就因为没写时区把因果比反过（bug调查/25）。
+ *
+ *   ★★ **算一次，之后一直沿用**（用户 2026-09-20 第二轮拍板）。第一版每行都
+ *   算一遍 `GetSystemTime` + 两次 `SystemTimeToFileTime` + 一次 64 位除法 +
+ *   **一个额外的 `_snprintf`**；开 `BSHOOK_PROJ_DIAG` 时每帧每弹体一行，纯属白烧。
+ *   第二版改成了「按第几分钟失效」，为的是跨夏令时切换时后缀还能跟着变；
+ *   用户当场否掉了这个理由 —— **玩家全在中国（UTC+8，不用夏令时）**，
+ *   为一个本项目里不存在的场景留一条每行都要走的判断没有意义。
+ *
+ *   ⇒ 现在是惰性一次性：第一行日志算出来，之后每行只剩**一次整数测试**。
+ *     代价写明白：客户端一开十几个小时（bug调查/25 那台跑了 17.7 小时），
+ *     中途真换了系统时区的话后缀会停在旧值。本项目接受它，
+ *     `server/tzstamp.py` 和更新器是同一套取舍。
+ *
+ *   ★ 为什么不在 `open_log()` 里显式初始化：`bslog_emit()` 手里已经有一份
+ *     `GetLocalTime()` 的结果可以直接复用，而且环形缓冲在 `open_log()`
+ *     之前就能收到行 —— 惰性一次性没有初始化顺序问题。
+ *
+ *   ★ 返回分钟而不是字符串：调用方把它折进**已有的**那一发 `_snprintf`，
+ *     省掉第二个 `_snprintf`（那才是第一版真正贵的地方）。
+ *
+ *   ★ 多线程：两条线程同时算出的是同一个值，撞了也无害；**先写值、后写旗**，
+ *     最坏情况是某一行用了 0（还没算出来那一瞬）。两个都是对齐的 LONG，
+ *     读写天然原子。
+ *
+ *   算法：本地时刻减 UTC 时刻，不读注册表 —— 启动那一刻的夏令时自动就对。
+ */
+static volatile LONG g_zone_minutes = 0;
+static volatile LONG g_zone_ready = 0;       /* 0 = 还没算过 */
+
+static LONG bslog_zone_minutes(const SYSTEMTIME *lt)
+{
+    SYSTEMTIME ut;
+    FILETIME lf, uf;
+    LONGLONG diff, half;
+    LONG mins;
+
+    if (g_zone_ready) return g_zone_minutes;           /* ★ 热路径就这一句 */
+
+    GetSystemTime(&ut);
+    if (!SystemTimeToFileTime(lt, &lf) || !SystemTimeToFileTime(&ut, &uf))
+        return g_zone_minutes;              /* 算不出就先不落定，下一行再试 */
+    diff = (((LONGLONG)lf.dwHighDateTime << 32) | lf.dwLowDateTime)
+         - (((LONGLONG)uf.dwHighDateTime << 32) | uf.dwLowDateTime);
+    /* 100ns -> 分钟。两次取时刻之间差几毫秒，所以就近取整。 */
+    half = diff >= 0 ? 300000000LL : -300000000LL;
+    mins = (LONG)((diff + half) / 600000000LL);
+    g_zone_minutes = mins;
+    g_zone_ready = 1;                                   /* 先值后旗 */
+    return mins;
+}
+
 static void bslog_emit(int detail, const char *fmt, va_list ap)
 {
     char line[8192];
     unsigned char hdr[BSLOG_HDR];
     SYSTEMTIME st;
+    LONG zone, zh, zm;
+    char zsign;
     int n;
     int wake = 0;
 
     GetLocalTime(&st);
-    n = _snprintf(line, sizeof(line) - 4, "[%02u:%02u:%02u.%03u] ",
-                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    zone = bslog_zone_minutes(&st);
+    zsign = zone < 0 ? '-' : '+';
+    if (zone < 0) zone = -zone;
+    zh = zone / 60;
+    zm = zone % 60;
+    /* 两个变体而不是先拼一个 "UTC+8" 字符串：省掉整整一个 `_snprintf`。
+       半小时时区（印度 +5:30、尼泊尔 +5:45）走下面那支。 */
+    if (zm)
+        n = _snprintf(line, sizeof(line) - 4, "[%02u:%02u:%02u.%03u UTC%c%ld:%02ld] ",
+                      st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                      zsign, zh, zm);
+    else
+        n = _snprintf(line, sizeof(line) - 4, "[%02u:%02u:%02u.%03u UTC%c%ld] ",
+                      st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, zsign, zh);
     if (n < 0) n = 0;
 
     {
@@ -320,125 +390,7 @@ static const char *w2u8(const wchar_t *ws, char *out, int outsz)
     return out;
 }
 
-/* -------------------------------------------------------------------------- */
-/* 极简 x86 长度反汇编器 —— 只为算出内联 hook 要偷几个字节（>=5）             */
-/* 覆盖常见函数序言指令；遇到不认识的 opcode 返回 0（放弃 hook，安全）        */
-/* -------------------------------------------------------------------------- */
-static int insn_len(const unsigned char *p)
-{
-    unsigned char op = p[0];
-    /* 前缀 */
-    if (op == 0x66 || op == 0x67 || op == 0xF2 || op == 0xF3) return 1 + insn_len(p + 1);
-    switch (op) {
-    case 0x50: case 0x51: case 0x52: case 0x53:      /* push r32 */
-    case 0x54: case 0x55: case 0x56: case 0x57:
-    case 0x58: case 0x59: case 0x5A: case 0x5B:      /* pop r32  */
-    case 0x5C: case 0x5D: case 0x5E: case 0x5F:
-    case 0x90: case 0xC3: case 0xC9:                 /* nop/ret/leave */
-        return 1;
-    case 0x6A:                                       /* push imm8 */
-        return 2;
-    case 0x68:                                       /* push imm32 */
-        return 5;
-    case 0xB8: case 0xB9: case 0xBA: case 0xBB:      /* mov r32, imm32 */
-    case 0xBC: case 0xBD: case 0xBE: case 0xBF:
-        return 5;
-    case 0xE9: case 0xE8:                            /* jmp/call rel32 */
-        return 5;
-    case 0xEB:                                       /* jmp rel8 */
-        return 2;
-    case 0x8B: case 0x89:                            /* mov r/m32,r32 / mov r32,r/m32 */
-    case 0x33: case 0x85:                            /* xor r/m32,r32 / test r/m32,r32 */
-    {
-        unsigned char modrm = p[1];
-        unsigned char mod = modrm >> 6, rm = modrm & 7;
-        int len = 2;
-        if (mod != 3 && rm == 4) len += 1;           /* SIB */
-        if (mod == 1) len += 1;                       /* disp8 */
-        else if (mod == 2) len += 4;                  /* disp32 */
-        else if (mod == 0 && rm == 5) len += 4;       /* disp32 (no base) */
-        else if (mod == 0 && rm == 4 && (p[2] & 7) == 5) len += 4; /* SIB base=5 */
-        return len;
-    }
-    case 0x83:                                       /* grp1 r/m32, imm8 (sub/add esp,..) */
-    {
-        unsigned char modrm = p[1];
-        unsigned char mod = modrm >> 6, rm = modrm & 7;
-        int len = 2;
-        if (mod != 3 && rm == 4) len += 1;
-        if (mod == 1) len += 1;
-        else if (mod == 2) len += 4;
-        else if (mod == 0 && rm == 5) len += 4;
-        return len + 1;                               /* + imm8 */
-    }
-    case 0x81:                                       /* grp1 r/m32, imm32 */
-    {
-        unsigned char modrm = p[1];
-        unsigned char mod = modrm >> 6, rm = modrm & 7;
-        int len = 2;
-        if (mod != 3 && rm == 4) len += 1;
-        if (mod == 1) len += 1;
-        else if (mod == 2) len += 4;
-        else if (mod == 0 && rm == 5) len += 4;
-        return len + 4;                               /* + imm32 */
-    }
-    case 0xFF:                                        /* grp5 (push/call/jmp r/m) */
-    {
-        unsigned char modrm = p[1];
-        unsigned char mod = modrm >> 6, rm = modrm & 7;
-        int len = 2;
-        if (mod != 3 && rm == 4) len += 1;
-        if (mod == 1) len += 1;
-        else if (mod == 2) len += 4;
-        else if (mod == 0 && rm == 5) len += 4;
-        return len;
-    }
-    }
-    return 0; /* 不认识 */
-}
-
-/* -------------------------------------------------------------------------- */
-/* 通用内联 hook：在 target 头部写 E9 跳到 detour，返回可调用原函数的蹦床      */
-/* 偷够 >=5 字节（按指令边界），蹦床 = [偷到的字节][E9 跳回 target+n]          */
-/* -------------------------------------------------------------------------- */
-static void *install_inline_hook(void *target, void *detour, const char *name)
-{
-    unsigned char *t = (unsigned char *)target;
-    unsigned char *tramp;
-    DWORD oldp;
-    int stolen = 0, guard = 0;
-
-    if (!t) { bslog("HOOK    %s: target=NULL, 跳过", name); return NULL; }
-
-    bslog("HOOK    %s @ %08X 序言: %02x %02x %02x %02x %02x %02x %02x %02x",
-          name, (unsigned)(UINT_PTR)t,
-          t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
-
-    while (stolen < 5 && guard++ < 8) {
-        int l = insn_len(t + stolen);
-        if (l <= 0) { bslog("HOOK    %s: 未知 opcode %02x @ +%d, 放弃", name, t[stolen], stolen); return NULL; }
-        stolen += l;
-    }
-    if (stolen < 5) { bslog("HOOK    %s: 偷不够 5 字节, 放弃", name); return NULL; }
-
-    tramp = (unsigned char *)VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!tramp) { bslog("HOOK    %s: VirtualAlloc 失败", name); return NULL; }
-    memcpy(tramp, t, stolen);
-    tramp[stolen] = 0xE9;
-    *(DWORD *)(tramp + stolen + 1) = (DWORD)((UINT_PTR)(t + stolen) - (UINT_PTR)(tramp + stolen + 5));
-
-    if (!VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &oldp)) {
-        bslog("HOOK    %s: VirtualProtect 失败", name); return NULL;
-    }
-    t[0] = 0xE9;
-    *(DWORD *)(t + 1) = (DWORD)((UINT_PTR)detour - (UINT_PTR)(t + 5));
-    VirtualProtect(t, 5, oldp, &oldp);
-    FlushInstructionCache(GetCurrentProcess(), t, 5);
-
-    bslog("HOOK    %s: 安装成功, 偷了 %d 字节, 蹦床 @ %08X",
-          name, stolen, (unsigned)(UINT_PTR)tramp);
-    return tramp;
-}
+#include "insn_reloc.h"   /* insn_len / reloc_insn / install_inline_hook */
 
 #include "bot_motion.inc"
 
@@ -1341,6 +1293,35 @@ static void install_pack_redirect(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* 主模块的地址范围 —— 算一次，谁先要谁触发（幂等）                            */
+/*                                                                            */
+/* 原来只在 install_hooks（武装线程第一轮）里算。但 adapters_guard.h 那个护栏  */
+/* 装在 DllMain 里、要靠这个范围认「这次调用是不是游戏自己发的」，所以得更早    */
+/* 就有值 —— 提成一个小函数，两处都调。                                        */
+/* -------------------------------------------------------------------------- */
+static void compute_main_module_range(void)
+{
+    HMODULE self;
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS *nt;
+
+    if (g_mod_lo) return;
+    self = GetModuleHandleA(NULL);
+    if (!self) return;
+    dos = (IMAGE_DOS_HEADER *)self;
+    nt = (IMAGE_NT_HEADERS *)((BYTE *)self + dos->e_lfanew);
+    g_mod_lo = (UINT_PTR)self;
+    g_mod_hi = g_mod_lo + nt->OptionalHeader.SizeOfImage;
+    bslog("HOOK    主模块范围 %08X..%08X (SizeOfImage=%08X)",
+          (unsigned)g_mod_lo, (unsigned)g_mod_hi,
+          (unsigned)nt->OptionalHeader.SizeOfImage);
+}
+
+/* 启动期闪退护栏（bug调查/27）。放在这里是因为它依赖上面的 compute_… 和
+   g_mod_lo/g_mod_hi，而装钩子的时机要和 install_pack_redirect 一样早。 */
+#include "adapters_guard.h"
+
+/* -------------------------------------------------------------------------- */
 /* 注册链接的点击：**客户端自己根本处理不了**，我们接管                        */
 /*                                                                            */
 /* 实测（V0.2 里程碑 H）：id=1010 那条 Static **没有 SS_NOTIFY** ——           */
@@ -1605,20 +1586,13 @@ static void install_ws2_hooks(void)
 static void install_hooks(void)
 {
     HMODULE u32;
-    HMODULE self;
-    IMAGE_DOS_HEADER *dos;
-    IMAGE_NT_HEADERS *nt;
 
     if (InterlockedExchange(&g_hooks_installed, 1)) return;
 
-    /* 主模块范围（用于栈回溯筛选） */
-    self = GetModuleHandleA(NULL);
-    dos = (IMAGE_DOS_HEADER *)self;
-    nt = (IMAGE_NT_HEADERS *)((BYTE *)self + dos->e_lfanew);
-    g_mod_lo = (UINT_PTR)self;
-    g_mod_hi = g_mod_lo + nt->OptionalHeader.SizeOfImage;
-    bslog("HOOK    主模块范围 %08X..%08X (SizeOfImage=%08X)",
-          (unsigned)g_mod_lo, (unsigned)g_mod_hi, (unsigned)nt->OptionalHeader.SizeOfImage);
+    compute_main_module_range();   /* 一般 DllMain 里就算好了；幂等 */
+
+    /* DllMain 那一轮 IPHLPAPI 万一还没加载，这里补装（幂等）。 */
+    install_iphlpapi_hook();
 
     u32 = GetModuleHandleA("user32.dll");
     if (!u32) { bslog("HOOK    user32 尚未加载, 等下一轮"); g_hooks_installed = 0; return; }
@@ -2856,6 +2830,9 @@ static int try_patch_reflect_visual(void)
 /*                                                                            */
 /*   指针为 NULL 时跳到 0x5bf73f（Unlock **之后**）：压根没锁上，就不该解锁。  */
 /*   代价是这一次索引缓冲没填好 —— 但原版在这条路上是直接崩，没得比。         */
+/*                                                                            */
+/*   ★ **同一个病在镜像里有第二处站点**：静态 D3DX9 的 `ID3DXSprite::Begin`   */
+/*     `0x61186a`（bug调查/25 崩过一份）。补在 `try_patch_crash25_guards()`。 */
 /* -------------------------------------------------------------------------- */
 #define D3D_IB_SIG_VA      0x005BF6C7u
 #define D3D_IB_PATCH_OFF   9                  /* 站点 = 0x005BF6D0 */
@@ -5221,6 +5198,841 @@ static int try_patch_crash18_guards(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* bug调查/25 的两处线上闪退 —— 两条都是**已修过的病的第二处站点**            */
+/*                                                                            */
+/* --- A. 精灵批的索引缓冲：`Lock()` 又一处不查返回值（§57 / D49）----------- */
+/*                                                                            */
+/*   §35 / D25 补的是渲染器自己那套四边形批（`0x5bf6cd`）。V0.4.1 线上又崩了  */
+/*   一份，崩点 `0x611875`，在**静态链进来的 D3DX9** 的 `ID3DXSprite::Begin`  */
+/*   里（函数头 `0x6117f5`，`mov edi,edi` 热补丁头 + 失败返回                 */
+/*   `D3DERR_INVALIDCALL` 0x8876086c 两个特征一起认出来的）：                 */
+/*                                                                            */
+/*     00611839  jne 0x6118c4        索引缓冲已经有了就整段跳过（懒创建）     */
+/*     0061184b  call [ecx+0x6c]     CreateIndexBuffer(0xc000, WRITEONLY,     */
+/*                                   INDEX16, [esi+0x44])  ← HRESULT 查了     */
+/*     0061186a  call [ecx+0x2c]     IDirect3DIndexBuffer9::Lock  ← **没查**  */
+/*     00611872  mov edx,[ebp+8]     取 Lock 填的指针（填充循环的头）         */
+/*     00611875  mov [eax+edx-6],cx  ★ 指针是 NULL 就崩在这                  */
+/*                                                                            */
+/*   线上那份（concon 2026-09-20 19:29:37）：minidump 的异常参数是 `(1, 0)`   */
+/*   = **往地址 0 写**，EAX=6 / EDX=0 / ECX=0 = 循环第一圈，逐字对得上。      */
+/*   崩前 4 秒进程里被塞进一堆 shell / GDI+ / WPS 外壳 DLL，崩后 QQ 拼音自己  */
+/*   的 `QQPYBugReport.exe` 被拉起来 —— 和 §35 那份是同一台机器、同一种       */
+/*   外部干扰。                                                               */
+/*                                                                            */
+/*   ★ 收尾和 §35 **不一样**：这里不能只是「不填就走」。索引缓冲是懒创建的，  */
+/*   一旦 `[esi+0x14]` 非空，以后每次 `Begin` 都整段跳过 ⇒ 没填好就是一整局   */
+/*   拿**没初始化的索引**画三角形。所以判到指针为空就                         */
+/*   **Release 掉刚建的缓冲、把槽清零、走 Begin 自己的失败出口 0x611f3b**，   */
+/*   下一帧从头重来。这个收尾状态和「CreateIndexBuffer 失败」那条路           */
+/*   （`0x611858 jl 0x611f3b`，`[esi+0x14]` 同样是 0、`begun` 标志同样没置）  */
+/*   逐字节相同 —— 是 D3DX 自己就会产生、调用方（`0x5bdff8 test eax,eax /    */
+/*   jge`）本来就在处理的状态，不是我们新造的。                               */
+/*                                                                            */
+/*   站点只有 **5 个字节**可用：`0x611872` 是循环的回跳目标，多啃一个字节回跳 */
+/*   就落进指令中间。`push 6 / xor ecx,ecx / pop eax` 正好 5 字节 = E9 rel32，*/
+/*   连代码洞都不用开。                                                       */
+/*                                                                            */
+/* --- B. LoadingStage 析构时 LobbyStage 已经没了（§58 / D50）--------------- */
+/*                                                                            */
+/*   和 bug调查/18 §81-A **同一个病**：拆除顺序 —— `LobbyStage::~LobbyStage`  */
+/*   （`0x40545B`）先把全局 `[0x72e29c]` 清 0，别人还握着它往下用。§81-A 补的 */
+/*   是胜负条件的析构，这一份补的是 `LoadingStage::~LoadingStage`             */
+/*   （`0x46fd1c`，vftable `0x66b2b4`）：                                      */
+/*                                                                            */
+/*     0046fd7a  call 0x46fdf3                 「在六个座位里找第一个非空的」 */
+/*     0046fdf4  call 0x409f39                 先试另一条路，非空就直接返回   */
+/*     0046fe01  mov edi,[0x72e29c]            ★ 取 LobbyStage —— **不判空** */
+/*     0046fe0d  call 0x4045f9(this=edi, 0..5) 座位取值器                     */
+/*     004045f9  test eax,eax / cmp eax,6      只查了**下标**，没查 this      */
+/*     00404605  movzx eax,[eax+ecx+0x40]      ★ this==0 → 读 0x40 → 崩     */
+/*                                                                            */
+/*   线上那份（328800963 2026-09-20 14:31:15）：EAX=0（座位 0）、ECX=0        */
+/*   （this）、EBP=0019FD50 正是 `LoadingStage::~LoadingStage` 的帧，          */
+/*   一个寄存器都不用猜。客户端日志里同一秒还有一行                           */
+/*   「★WS2 connect -> 27799」—— **掉线重连把大厅拆了、加载画面还在析构**     */
+/*   就是那个时序。                                                           */
+/*                                                                            */
+/*   补法：偷 `0x46fe01` 那 8 个字节（`mov edi,[全局]` + `xor esi,esi`），    */
+/*   LobbyStage 已经没了就整段跳到 `0x46fe27` 的收尾。走到这里 ebx 必然是 0   */
+/*   （`0x46fdfd` 的 `jne` 没跳成才轮得到），所以函数返回 0 =「没找到」——      */
+/*   调用方 `0x46fd7f test eax,eax / je` 本来就有这条分支。                   */
+/*   **没有大厅就没有座位，找不到才是对的**，这不是兜底。                     */
+/* -------------------------------------------------------------------------- */
+
+/* --- A --- */
+#define SPRITE_IB_VA         0x0061186Du   /* 站点 = Lock 之后被偷走的那三条 */
+#define SPRITE_IB_SIG_LEN    24
+#define SPRITE_IB_STOLEN     5
+#define SPRITE_IB_RESUME_TO  0x00611872    /* 指针有效 → 填充循环的头        */
+#define SPRITE_IB_BAIL_TO    0x00611F3B    /* 指针为空 → Begin 的失败出口    */
+#define SPRITE_IB_SLOT       0x14          /* ID3DXSprite 的索引缓冲槽       */
+#define SPRITE_IB_HRESULT    0x8876086C    /* D3DERR_INVALIDCALL             */
+
+static const unsigned char SPRITE_IB_SIG[SPRITE_IB_SIG_LEN] = {
+    0x6A, 0x06,                     /* push 6              ┐                 */
+    0x33, 0xC9,                     /* xor  ecx,ecx        ├ 偷走这 5 字节   */
+    0x58,                           /* pop  eax            ┘                 */
+    0x8B, 0x55, 0x08,               /* mov  edx,[ebp+8]      填充循环的头     */
+    0x66, 0x89, 0x4C, 0x10, 0xFA,   /* mov  [eax+edx-6],cx ★ 线上崩的就是这  */
+    0x8B, 0x7D, 0x08,               /* mov  edi,[ebp+8]                      */
+    0x8D, 0x51, 0x01,               /* lea  edx,[ecx+1]                      */
+    0x66, 0x89, 0x54, 0x38, 0xFC    /* mov  [eax+edi-4],dx                   */
+};
+
+static volatile LONG g_sprite_ib_failing = 0;   /* 状态：上一次建缓冲没锁上  */
+static volatile LONG g_sprite_ib_hits    = 0;
+
+/* 锁不上会**每次重建都再来一遍**，所以按状态翻转去重（说过了就闭嘴，
+   直到真的锁上过一次）—— 不按次数、不按时间窗（铁律 10）。 */
+static void __stdcall sprite_ib_note(void)
+{
+    LONG n = InterlockedIncrement(&g_sprite_ib_hits);
+    if (InterlockedExchange(&g_sprite_ib_failing, 1)) return;
+    bslog("★精灵批 索引缓冲 Lock() 没给出指针（累计第 %ld 次）—— 把刚建的缓冲"
+          "丢掉、让 Begin 走失败出口，下一帧重建重填（不跳就是 bug调查/25 那个"
+          "0x611875 闪退）；锁上之前不再重复报", (long)n);
+}
+
+static void __stdcall sprite_ib_ok(void)
+{
+    if (!InterlockedExchange(&g_sprite_ib_failing, 0)) return;   /* 本来就好着 */
+    bslog("★精灵批 索引缓冲这次锁上了，恢复正常（之前累计失败 %ld 次）",
+          (long)g_sprite_ib_hits);
+}
+
+static __declspec(naked) void sprite_ib_guard_detour(void)
+{
+    __asm {
+        cmp  dword ptr [ebp + 8], 0         /* Lock 填进来的指针 */
+        jz   spr_bail
+        pushad
+        call sprite_ib_ok
+        popad
+        push 6                              /* 被偷走的三条，原样先跑 */
+        xor  ecx, ecx
+        pop  eax
+        push SPRITE_IB_RESUME_TO
+        ret
+    spr_bail:
+        pushad
+        call sprite_ib_note
+        popad
+        mov  eax, dword ptr [esi + SPRITE_IB_SLOT]   /* 刚建好的索引缓冲 */
+        test eax, eax
+        jz   spr_zero
+        mov  ecx, dword ptr [eax]
+        push eax
+        call dword ptr [ecx + 8]            /* IUnknown::Release */
+    spr_zero:
+        mov  dword ptr [esi + SPRITE_IB_SLOT], 0     /* 下一帧重建重填 */
+        mov  eax, SPRITE_IB_HRESULT
+        push SPRITE_IB_BAIL_TO
+        ret
+    }
+}
+
+/* --- B --- */
+#define LDSTAGE_VA          0x0046FE01u
+#define LDSTAGE_SIG_LEN     26
+#define LDSTAGE_STOLEN      8
+#define LDSTAGE_RESUME_TO   0x0046FE09    /* 六座位循环的头                  */
+#define LDSTAGE_SKIP_TO     0x0046FE27    /* pop edi/esi ; mov eax,ebx ; …   */
+
+static const unsigned char LDSTAGE_SIG[LDSTAGE_SIG_LEN] = {
+    0x8B, 0x3D, 0x9C, 0xE2, 0x72, 0x00,   /* mov  edi,[0x72e29c]  ┐ 偷 8 字节 */
+    0x33, 0xF6,                           /* xor  esi,esi         ┘           */
+    0x8B, 0xC6,                           /* mov  eax,esi           座位下标  */
+    0x8B, 0xCF,                           /* mov  ecx,edi           this      */
+    0xE8, 0xE7, 0x47, 0xF9, 0xFF,         /* call 0x4045f9          座位取值器*/
+    0x84, 0xC0,                           /* test al,al                       */
+    0x74, 0x0B,                           /* je   0x46fe21                    */
+    0xE8, 0xDB, 0x51, 0xF9, 0xFF          /* call 0x404ff6                    */
+};
+
+static volatile LONG g_ldstage_hits = 0;
+
+static void __stdcall ldstage_note(void)
+{
+    LONG n = InterlockedIncrement(&g_ldstage_hits);
+    bslog("★拆除   加载画面析构时 LobbyStage 已经没了 —— 六个座位整段跳过，"
+          "按「没找到」返回（第 %ld 次；不跳就是 bug调查/25 那个 0x404605 闪退，"
+          "和 §81-A 同一个拆除顺序病）", (long)n);
+}
+
+static __declspec(naked) void ldstage_guard_detour(void)
+{
+    __asm {
+        mov  edi, LOBBY_STAGE_GLOBAL        /* 被偷走的两条，原样先跑 */
+        mov  edi, dword ptr [edi]
+        xor  esi, esi
+        test edi, edi
+        jz   lds_skip
+        push LDSTAGE_RESUME_TO
+        ret
+    lds_skip:
+        pushad
+        call ldstage_note
+        popad
+        push LDSTAGE_SKIP_TO                /* ebx 到这里必然是 0 = 返回「没找到」*/
+        ret
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* C / D / E —— 用户 2026-09-20 要求「整体查一遍还有没有改漏的」，扫出来的     */
+/*              同族站点（§60 / D51）。前两条是 A / B 的**通用化**。          */
+/*                                                                            */
+/* --- C. 两个座位取值器：把「只查下标」改成「先查 this，再无符号查下标」---- */
+/*                                                                            */
+/*   `0x4045f9(this=ecx, idx=eax)` 有 **97 个调用点**，只有 3 处先判空 ——      */
+/*   B 那样一个个补调用方是打地鼠。原以为取值器里塞不下判据（D50），          */
+/*   **那个前提是错的**：`jl`(负数) + `jge`(≥6) 两条检查，用**无符号 `jae`**  */
+/*   一条就够（负数当无符号看必然 ≥ 6）⇒ 省出来的两个字节正好够 `test ecx,ecx`*/
+/*   ⇒ **原地改 3 个字节，长度一字不差，一次盖住 97 个调用点**：              */
+/*                                                                            */
+/*     004045f9  85 C0 -> 85 C9   test eax,eax  ->  test ecx,ecx   （查 this） */
+/*     004045fb  7C 0E -> 74 0E   jl  0x40460b  ->  jz  0x40460b               */
+/*     00404600  7D 09 -> 73 09   jge 0x40460b  ->  jae 0x40460b （无符号）    */
+/*                                                                            */
+/*   对**所有合法输入逐位等价**：idx∈[0,5] 照旧取值；idx≥6 或负数照旧返回 0； */
+/*   多出来的只有「this 为空也返回 0」。而三个二级取值器                      */
+/*   （`0x40460e` 名字 / `0x40462c` 状态 / `0x404d9e` 指针）都是**先调它、     */
+/*   `test al,al` 为假就走空分支** ⇒ **它们自动一起被保护了**。               */
+/*                                                                            */
+/*   `0x404d42(idx=ecx, base=edx)` 是同一张表的另一个取值器（§81-A 里胜负条件 */
+/*   析构走的就是它），同样的 3 字节改法，`test edx,edx` 查 base。它本来就是  */
+/*   「座位无效就返回 0」的契约，补完只是让 base 为空时也遵守这个契约。       */
+/*                                                                            */
+/*   ★ 三个字节**分三次写**，顺序挑过：先 `test`、再 `jae`、最后 `jz`。       */
+/*     每一个中间态都不比原版弱（用户态指针恒 < 0x80000000 ⇒ 改成 `test ecx`  */
+/*     之后那条 `jl` 只是永不成立，下标上界仍由 `jge` 守着）。                */
+/*                                                                            */
+/* --- D. `0x5c5dd8`：LockRect 之后无条件往 pBits 写一个 dword --------------- */
+/*                                                                            */
+/*     005c5dd5  call [ecx+0x4c]   Texture::LockRect(0, &[ebp-0x20], 0, 0)     */
+/*     005c5dd8  mov eax,[ebp-0x1c]   pBits                ★ HRESULT 一眼没看 */
+/*     005c5ddb  mov ecx,[ebp+8]                                              */
+/*     005c5dde  mov [eax],ecx        ★ 写进去                               */
+/*     005c5de6  call [eax+0x50]      UnlockRect                              */
+/*                                                                            */
+/*   ⚠ 比崩还糟：`D3DLOCKED_RECT` 是**没初始化的栈变量**，LockRect 失败时      */
+/*   `pBits` 是栈垃圾 ⇒ 往一个随机地址写 4 字节，**静默破坏内存**。           */
+/*   补法：查 HRESULT，顺带查 pBits 非空，任一不过就不写（Unlock 照旧调，     */
+/*   对没锁上的纹理调 Unlock 只是返回个错误码，无害）。                       */
+/*                                                                            */
+/* --- E. `0x61270a`：`ID3DXSprite::Flush` 的 Lock —— 和 §35 同形 ----------- */
+/*                                                                            */
+/*     00612707  call [ecx+0x2c]   Lock(&[ebp-0x14], DISCARD)  ★ HRESULT 丢弃 */
+/*     0061270a  mov eax,[ebx+0x1c]                    （eax 当场被冲掉）      */
+/*     00612733  mov ecx,[ebp-0x14]                     取指针                */
+/*     0061274e  rep movsd (0x18 dwords)                ★ 往里灌 96 字节      */
+/*                                                                            */
+/*   这是**每帧都跑**的 2D 主路径。`DISCARD` 锁很难失败，但一旦失败就是        */
+/*   `rep movsd` 打进栈垃圾指针 —— 和 §35 一个形状，只是更热。                */
+/*                                                                            */
+/*   ★ 补法故意**不**用「判空跳过」：`[ebp-0x14]` 没初始化过，失败时是栈垃圾  */
+/*   而不是 NULL，判空根本不会触发。改成 **Lock 失败就把指针改指向一块        */
+/*   VirtualAlloc 的废纸篓**，循环照跑、字节全落进废纸篓。这样只要一处补丁、  */
+/*   不需要和第二处配对，也不会有「装了一半更危险」的窗口。                   */
+/*   废纸篓 1 MB 足够：循环上界 `cmp eax,0x4000 / jae` 钉死了顶点数 < 0x4000， */
+/*   偏移最大 `0x4000*3*8 + 0x60` = 0x60060。分配不到就整个不装，退回原版。   */
+/* -------------------------------------------------------------------------- */
+
+/* --- C --- */
+#define SEATGET_VA        0x004045F9u       /* IsSeatUsed(this=ecx, idx=eax)  */
+#define SEATGET_SIG_LEN   21
+#define SEATPTR_VA        0x00404D42u       /* SeatPtr(idx=ecx, base=edx)     */
+#define SEATPTR_SIG_LEN   30
+
+static const unsigned char SEATGET_SIG[SEATGET_SIG_LEN] = {
+    0x85,0xC0,             /* test eax,eax          -> test ecx,ecx  */
+    0x7C,0x0E,             /* jl  0x40460b          -> jz            */
+    0x83,0xF8,0x06,        /* cmp eax,6                              */
+    0x7D,0x09,             /* jge 0x40460b          -> jae           */
+    0x6B,0xC0,0x3C,        /* imul eax,eax,0x3c                      */
+    0x0F,0xB6,0x44,0x08,0x40,  /* movzx eax,[eax+ecx+0x40]  ← 崩在这 */
+    0xC3,
+    0x33,0xC0,             /* xor eax,eax（返回 0 的出口）           */
+    0xC3
+};
+static const unsigned char SEATPTR_SIG[SEATPTR_SIG_LEN] = {
+    0x85,0xC9,             /* test ecx,ecx          -> test edx,edx  */
+    0x7C,0x0A,             /* jl  0x404d50          -> jz            */
+    0x83,0xF9,0x06,        /* cmp ecx,6                              */
+    0x7D,0x05,             /* jge 0x404d50          -> jae           */
+    0x33,0xC0,0x40,        /* xor eax,eax / inc eax                  */
+    0xEB,0x02,
+    0x33,0xC0,
+    0x6B,0xC9,0x3C,        /* imul ecx,ecx,0x3c                      */
+    0xF6,0xD8,             /* neg al                                 */
+    0x8D,0x4C,0x11,0x40,   /* lea ecx,[ecx+edx+0x40]   ← base = edx  */
+    0x1B,0xC0,             /* sbb eax,eax                            */
+    0x23,0xC1,             /* and eax,ecx                            */
+    0xC3                   /* ret  —— 收在这，特征串才是完整一个函数 */
+};
+
+/* --- D --- */
+#define TEXWR_VA          0x005C5DD8u
+#define TEXWR_SIG_LEN     26
+#define TEXWR_STOLEN      8
+#define TEXWR_RESUME_TO   0x005C5DE0
+#define TEXWR_PBITS       0x1C            /* [ebp-0x1c] = D3DLOCKED_RECT.pBits */
+
+static const unsigned char TEXWR_SIG[TEXWR_SIG_LEN] = {
+    0x8B,0x45,0xE4,        /* mov eax,[ebp-0x1c]   pBits   ┐ 偷这 8 字节 */
+    0x8B,0x4D,0x08,        /* mov ecx,[ebp+8]              │             */
+    0x89,0x08,             /* mov [eax],ecx                ┘ ★ 无条件写  */
+    0x8B,0x3F,             /* mov edi,[edi]                  ← 落点      */
+    0x8B,0x07,
+    0x53,0x57,
+    0xFF,0x50,0x50,        /* call [eax+0x50]  UnlockRect                */
+    0x8B,0x4D,0xEC,
+    0x56,
+    0xE8,0xB2,0xFE,0xFF,0xFF
+};
+
+/* --- E --- */
+#define FLUSH_VA          0x0061270Au
+#define FLUSH_SIG_LEN     24
+#define FLUSH_STOLEN      6
+#define FLUSH_RESUME_TO   0x00612710
+#define FLUSH_PTR         0x14            /* [ebp-0x14] = Lock 给的顶点指针 */
+#define FLUSH_SCRATCH_SZ  0x100000        /* 1 MB 废纸篓，见上面的上界推导  */
+
+static const unsigned char FLUSH_SIG[FLUSH_SIG_LEN] = {
+    0x8B,0x43,0x1C,        /* mov eax,[ebx+0x1c]   ┐ 偷这 6 字节 */
+    0x89,0x45,0xF4,        /* mov [ebp-0xc],eax    ┘             */
+    0x8B,0x43,0x20,        /* mov eax,[ebx+0x20]     ← 落点      */
+    0x89,0x45,0xF0,
+    0x8B,0x45,0xFC,
+    0xEB,0x54,             /* jmp 0x61276f                       */
+    0x8B,0x83,0xB8,0x00,0x00,0x00,
+    0x8B
+};
+
+static volatile LONG g_texwr_failing = 0, g_texwr_hits = 0;
+static volatile LONG g_flush_failing = 0, g_flush_hits = 0;
+static unsigned char *g_flush_scratch = NULL;
+
+/* 只核对特征串里**我们不改**的那一截（从 from 起）—— 改过之后还能再核一遍。 */
+static int sig_tail_ok(unsigned int va, const unsigned char *sig, int len, int from)
+{
+    const unsigned char *p = (const unsigned char *)va;
+    if (IsBadReadPtr(p, len)) return 0;
+    return memcmp(p + from, sig + from, (size_t)(len - from)) == 0;
+}
+
+static void __stdcall texwr_note(void)
+{
+    LONG n = InterlockedIncrement(&g_texwr_hits);
+    if (InterlockedExchange(&g_texwr_failing, 1)) return;   /* 状态没翻，别重复说 */
+    bslog("★纹理   LockRect 没给出像素指针（累计第 %ld 次）—— 这一次不写。"
+          "原版会拿没初始化的栈变量当指针写 4 字节（bug调查/25 审计，§60-D）"
+          "；锁上之前不再重复报", (long)n);
+}
+
+static void __stdcall flush_note(void)
+{
+    LONG n = InterlockedIncrement(&g_flush_hits);
+    if (InterlockedExchange(&g_flush_failing, 1)) return;
+    bslog("★精灵批 Flush 的顶点缓冲 Lock 失败（累计第 %ld 次）—— 这一帧的顶点"
+          "灌进废纸篓 %08X，画面会花一帧但不崩（原版是 rep movsd 打进栈垃圾"
+          "指针，§60-E）；锁上之前不再重复报",
+          (long)n, (unsigned)(UINT_PTR)g_flush_scratch);
+}
+
+static __declspec(naked) void texwr_guard_detour(void)
+{
+    __asm {
+        test eax, eax                          /* LockRect 的 HRESULT */
+        js   txw_fail
+        mov  eax, dword ptr [ebp - TEXWR_PBITS]
+        test eax, eax                          /* pBits 也顺带查一下 */
+        jz   txw_fail
+        mov  dword ptr [g_texwr_failing], 0    /* 好了，状态翻回去 */
+        mov  ecx, dword ptr [ebp + 8]
+        mov  dword ptr [eax], ecx              /* 被偷走的那一句写入 */
+        push TEXWR_RESUME_TO
+        ret
+    txw_fail:
+        pushad
+        call texwr_note
+        popad
+        push TEXWR_RESUME_TO
+        ret
+    }
+}
+
+static __declspec(naked) void flush_guard_detour(void)
+{
+    __asm {
+        test eax, eax                          /* Lock 的 HRESULT */
+        jns  flu_ok
+        pushad
+        call flush_note
+        popad
+        mov  eax, dword ptr [g_flush_scratch]
+        mov  dword ptr [ebp - FLUSH_PTR], eax  /* 顶点改灌废纸篓 */
+        jmp  flu_go
+    flu_ok:
+        mov  dword ptr [g_flush_failing], 0
+    flu_go:
+        mov  eax, dword ptr [ebx + 0x1C]       /* 被偷走的两条 */
+        mov  dword ptr [ebp - 0x0C], eax
+        push FLUSH_RESUME_TO
+        ret
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* 在场证据的采样点 —— 窗口过程 `0x40ee1d`（§62 / D53）                       */
+/*                                                                            */
+/*   为什么是这儿：原版自己的 90 秒挂机踢出就在这条路上重置计时器             */
+/*   （`0x40ee3d call LobbyStage::ResetIdleTimer`），也就是说**原版认的       */
+/*   「玩家有动作」就是这四个消息**。我们站在它前面一格，把同样的事实抄走。   */
+/*                                                                            */
+/*     0040edf9  mov esi,0x202            WM_LBUTTONUP                        */
+/*     0040ee01  mov edi,0x208            WM_MBUTTONUP                        */
+/*     0040ee06  mov ebx,0x205            WM_RBUTTONUP                        */
+/*     0040ee1d  mov eax,[ebp+0xc]        ← uMsg      ┐ 偷这 5 字节           */
+/*     0040ee20  cmp eax,esi                          ┘                       */
+/*     0040ee2c  cmp eax,0x101            WM_KEYUP                            */
+/*     0040ee3d  call 0x4082ae            ResetIdleTimer                      */
+/*                                                                            */
+/*   ★ **每一条消息都会经过 `0x40ee1d`**：它既是 `0x40ee15 jne` 的落点，      */
+/*     也是 `0x40ee17` 的直落点，而认 `WM_ACTIVATEAPP` 的那张 switch          */
+/*     （`0x40ef58`）还在它**后面**。所以一个跳板就够看全键盘 / 鼠标 / 激活。 */
+/*   ★ `0x40ee1d` 是 `jne` 的目标，跳板的 `E9` 正好当那个落点，没问题。       */
+/*   ★ 偷来的第二条 `cmp eax,esi` 会设标志位，而紧接着的 `je` 要用它 ⇒        */
+/*     绕道里**先报事实、再跑那两条**，`push/ret` 不动标志位。                */
+/*                                                                            */
+/*   ★★ 认哪些键是**白名单**，不是黑名单（用户 2026-09-21，见 §67）：        */
+/*   只有「进了图之后真的能操作角色」的那几个键算数，F5 / Esc / Enter 这种    */
+/*   菜单键一律不算 —— 连点器每局按一下 F5 开下一局，黑名单版本就被它把 60   */
+/*   秒的回溯量整段洗白（bug调查/26）。名单见 `presence_game_key()`。         */
+/* -------------------------------------------------------------------------- */
+#define PRESIN_VA          0x0040EE1Du
+#define PRESIN_SIG_LEN     22
+#define PRESIN_STOLEN      5
+#define PRESIN_RESUME_TO   0x0040EE22
+
+static const unsigned char PRESIN_SIG[PRESIN_SIG_LEN] = {
+    0x8B, 0x45, 0x0C,              /* mov eax,[ebp+0xc]   uMsg  ┐ 偷 5 字节 */
+    0x3B, 0xC6,                    /* cmp eax,esi  (0x202)      ┘           */
+    0x74, 0x0F,                    /* je  0x40ee33              ← 落点      */
+    0x3B, 0xC7,                    /* cmp eax,edi  (0x208)                  */
+    0x74, 0x0B,                    /* je  0x40ee33                          */
+    0x3B, 0xC3,                    /* cmp eax,ebx  (0x205)                  */
+    0x74, 0x07,                    /* je  0x40ee33                          */
+    0x3D, 0x01, 0x01, 0x00, 0x00,  /* cmp eax,0x101   WM_KEYUP              */
+    0x75, 0x0F                     /* jne 0x40ee42                          */
+};
+
+#define WM_KEYUP_        0x0101
+#define WM_ACTIVATEAPP_  0x001C
+
+/* 最近一次「局内游戏键抬起」/「鼠标键抬起」的 GetTickCount()；0 = 从来没有。
+   ★ 声明放在**采样点**这边而不是发包那边：写它的是窗口过程的绕道（这里），
+     读它的是 5 秒一次的上报（`sync_send_presence`，在下面很远的地方）。 */
+static volatile LONG g_pres_kb_tick = 0;
+static volatile LONG g_pres_mouse_tick = 0;
+/* 上一次报出去的前台状态，用来按**状态翻转**去重日志。 */
+static volatile LONG g_pres_fg_last = -1;
+
+static int presence_disabled(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_NO_PRESENCE", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+/* 这个键在**局内**真的能操作角色吗（§67，用户 2026-09-21 定的名单）。
+
+   四条移动轴是从客户端自己的输入函数**逐条抄下来**的（`0x515600`~`0x51576D`，
+   每个键各两次 `call 0x429bf0` = `InputSystem::GetKeyState`，V0.2 §183）：
+
+     [char+0x2b8] 左    A / VK_LEFT  / Q
+     [char+0x2c0] 右    D / VK_RIGHT / E
+     [char+0x2bc] 上跳  W / VK_UP    / 空格
+     [char+0x2c4] 下蹲  S / VK_DOWN
+
+   ★★ **方向键和 WASDQE 是同一组轴的别名**（客户端里没有改键功能，这 11 个
+     VK 码是写死的）⇒ 要么一起算、要么一起不算。只认 WASD 会把用方向键走位
+     的真人判成挂机 —— 这正是白名单最容易踩的坑。
+     ⇒ 会话 26 之前那条「方向键不算」的黑名单到此作废（§67 / D53d）。
+
+   换枪 / 技能那几个（1 2 3 / Shift / Ctrl）是用户给的：客户端那边拿 VK 当
+   **下标**去取键位数组（`[InputSystem + 键 + 0x205]`，V0.2 §183），没有 `cmp`
+   可抄，反汇编里也就找不到它们。多认一个键的代价是**漏判**，少认一个是
+   **误判** —— 后者更贵，所以照单全收。
+
+   ⚠ 名单里**没有鼠标左键**（开火）：那是另一格证据（`g_pres_mouse_tick`），
+     故意分开的，理由见服务端 `PRESENCE_BUCKETS` 那张表。 */
+static int presence_game_key(unsigned int vk)
+{
+    switch (vk) {
+    case 'A': case VK_LEFT:  case 'Q':          /* -> 左   [char+0x2b8] */
+    case 'D': case VK_RIGHT: case 'E':          /* -> 右   [char+0x2c0] */
+    case 'W': case VK_UP:    case VK_SPACE:     /* -> 上跳 [char+0x2bc] */
+    case 'S': case VK_DOWN:                     /* -> 下蹲 [char+0x2c4] */
+    case '1': case '2': case '3':               /* 换枪 */
+    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+    case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+        return 1;
+    default:
+        /* ★ 落在这儿的两个真实例子（bug调查/26，328800963 每局各按一下）：
+             F5  —— 结算界面「开下一局」；
+             Esc —— 进图后跳过开场剧情对话。
+           两个都是**局外**的菜单键，8 小时里他就只按这两下 ⇒ 白名单之后
+           键盘那一格**一次都不会被刷新**（重放真日志：判成挂机 99.6% -> 99.9%，
+           档位里再也不出现「在玩」）。 */
+        return 0;
+    }
+}
+
+static void __stdcall presence_note_message(unsigned int msg, unsigned int wparam)
+{
+    if (msg == WM_KEYUP_) {
+        if (!presence_game_key(wparam))
+            return;
+        /* 0 是「从来没有过」的哨兵，真撞上就挪一格 —— 49.7 天才一次。 */
+        InterlockedExchange(&g_pres_kb_tick, (LONG)(GetTickCount() | 1));
+        return;
+    }
+    if (msg == 0x0202 || msg == 0x0205 || msg == 0x0208) {   /* L/R/M BUTTONUP */
+        InterlockedExchange(&g_pres_mouse_tick, (LONG)(GetTickCount() | 1));
+        return;
+    }
+    /* `WM_ACTIVATEAPP` 只是顺手记一行 —— 前台状态本身由
+       `presence_foreground()` 现问，不靠这条消息维护（避免「钩子装上之前
+       窗口已经失活了」那个初值问题）。 */
+    if (msg == WM_ACTIVATEAPP_)
+        bsvlog("PRES    WM_ACTIVATEAPP wParam=%u（原版靠它把 BGM 静音）", wparam);
+}
+
+static __declspec(naked) void presence_input_detour(void)
+{
+    __asm {
+        pushad
+        push dword ptr [ebp + 0x10]         /* wParam */
+        push dword ptr [ebp + 0x0C]         /* uMsg   */
+        call presence_note_message
+        popad
+        mov  eax, dword ptr [ebp + 0x0C]    /* 被偷走的两条，原样跑 */
+        cmp  eax, esi
+        push PRESIN_RESUME_TO               /* push/ret 不动标志位 */
+        ret
+    }
+}
+
+static volatile LONG g_presence_patched = 0;
+
+static int try_patch_presence_input(void)
+{
+    if (g_presence_patched) return 1;
+    if (!install_jmp_guard(PRESIN_VA, PRESIN_SIG, PRESIN_SIG_LEN,
+                           PRESIN_STOLEN, presence_input_detour,
+                           "在场证据采样"))
+        return 0;
+    InterlockedExchange(&g_presence_patched, 1);
+    bslog("PATCH   ★在场证据采样 @ %08X: 窗口消息里认键盘（白名单：只认局内能"
+          "操作角色的键，F5 一类的菜单键不算）/ 鼠标键 / 激活，配合 GetLastInputInfo"
+          " + 前台判断，"
+          "每 5 秒经 UDP 旁路报给服务端（bug调查/25、26；只报事实，判定在服务端）",
+          (unsigned)PRESIN_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★ 移动平台相位（X_Mod §74 / §78 / D55 / D59）：把「鲤鱼在**我**屏幕上走到哪了」报给服务端 */
+/*                                                                            */
+/*   出处：bot 往「云桥」的鲤鱼上扔手雷，穿过去炸在地面。移动平台的位置是每台   */
+/*   客户端自己算的（`PathFollower::GetPos` 0x549bec）：                        */
+/*       elapsed = Timer() + [obj+0x94] − t0          （t0 在 [obj+0x90]）      */
+/*   协议里没有任何同步包 —— 服务端猜不准，就让站在事实旁边的 hook 报事实。      */
+/*                                                                            */
+/*   ★★ `t0` 有**两个**写入点（§78；全镜像「`call Timer()` 紧跟                */
+/*      `mov [r32+0x90], eax`」就这两处，`test_patchsites` 钉着）：            */
+/*     ① `MapObject::LinkPath`（0x511d60）收尾 `0x511d97` —— 载图那一遍；      */
+/*     ② `GameContext::StartGame`（虚表 +0xc = 0x491244，23 个子类全都走到基类）*/
+/*        末尾 `0x491388` 调 `0x476435`：把 World 里**所有**挂着路径的对象的     */
+/*        t0 **重取成「现在」**（`0x476463`）—— 开打那一刻。                    */
+/*     ⇒ 战斗里鲤鱼的相位是「开打后多少毫秒」，不是「载图后」。会话 30 只挂了 ①，*/
+/*        报上去的起点早了整整一段加载等待（2026-09-23 两局实测 8.46 s / 6.16 s，*/
+/*        鱼一个来回 10 s ⇒ 服务端的鱼基本是随机位置，「大部分错、偶尔对」）。   */
+/*                                                                            */
+/*   ★★ `Timer()`（0x40a01e）= `[当前 Stage + 0xe0]`：Desktop 单例 `[0x72e2b4]`*/
+/*      的 +8 是**当前 Stage**，`Stage::Tick`（0x42b548）每帧把 now 存进 +0xe0；*/
+/*      没有 Stage（换 stage 的空档）时走全局计时器 `[0x6d8a18]`。会话 30 把它   */
+/*      认成了 GameContext —— 不是：stage 6（LoadingStage）和 stage 7（GameStage）*/
+/*      是两个各自 new 出来的对象，当年拿「和记表时是同一个」当发包门槛，一开打  */
+/*      就把之后**所有**的同步包都拦了（§78）。                                  */
+/*                                                                            */
+/*   站点：两处都是 `mov [esi+0x90], eax`（esi = MapObject，eax = 刚取的 t0），  */
+/*   绕道里先照做那条 mov，再把 (this, t0, 哪个站点) 交给 C 记表、置脏。         */
+/*   **不在游戏线程发包**：一张图会连着进来好几个对象；watch_thread 下一轮       */
+/*   （≤100 ms）发，之后每秒一发对齐时钟漂移（采样率，不是判据）。              */
+/*                                                                            */
+/*   ★★ 每一发都从对象身上**现读** t0 / t_off（核对虚表 + link 确认还是那个对象）*/
+/*      —— 站点只管「记下是哪个对象」和「立刻发一发」。哪天冒出第三个改起点的   */
+/*      地方，下一发照样是对的：周期同步本身就能把起点纠正回来。               */
+/*                                                                            */
+/*   报的是事实不是结论：每条 `i32 link / u32 t0 / i32 t_off`，外加发包那一刻的  */
+/*   `[当前 Stage + 0xe0]`（= 此刻的 Timer()）和 GetTickCount()。               */
+/*   谁的相位算数、哪一发作废，都在服务端（`bot._mover_clock` / `note_mover_phase`）。*/
+/*   ★ 绕道 `push/ret` 回去；两个落点后面都不读标志位（pop/pop/ret；lea/call）。 */
+/* -------------------------------------------------------------------------- */
+#define MOVERLK_VA          0x00511D97u
+#define MOVERLK_SIG_LEN     9
+#define MOVERLK_STOLEN      6
+#define MOVERLK_RESUME_TO   0x00511D9D
+
+static const unsigned char MOVERLK_SIG[MOVERLK_SIG_LEN] = {
+    0x89, 0x86, 0x90, 0x00, 0x00, 0x00,   /* mov [esi+0x90], eax   ┐ 偷 6 字节 */
+    0x5F,                                 /* pop edi               │ 落点      */
+    0x5E,                                 /* pop esi                           */
+    0xC3                                  /* ret                               */
+};
+
+/* ② 开打重取（§78）：`0x476435` 是 World 的方法，遍历 `[World+0xb4]` 里的每个对象，
+   `[obj+0x8c]`（follower 挂着的路径）非空就把 t0 重取一遍：
+       0x47645e  e8 bb 3b f9 ff     call 0x40a01e         ; Timer()
+       0x476463  89 86 90 00 00 00  mov [esi+0x90], eax   ; ★ 站点
+       0x476469  8d 45 f8           lea eax, [ebp-8]      ; 落点（取下一个对象）
+   唯一的调用者是 `GameContext::StartGame` 末尾的 `0x491388`。 */
+#define MOVERST_VA          0x00476463u
+#define MOVERST_SIG_LEN     9
+#define MOVERST_STOLEN      6
+#define MOVERST_RESUME_TO   0x00476469
+
+static const unsigned char MOVERST_SIG[MOVERST_SIG_LEN] = {
+    0x89, 0x86, 0x90, 0x00, 0x00, 0x00,   /* mov [esi+0x90], eax   ┐ 偷 6 字节 */
+    0x8D, 0x45, 0xF8                      /* lea eax, [ebp-8]      ┘ 落点      */
+};
+
+/* Desktop 单例 `[0x72e2b4]`（vft 0x662ae0）+8 = 当前 Stage，它的 +0xe0 = 此刻的 Timer()。
+   +0xd4 = 已经跑了几个逻辑帧（`Stage::Update` `0x42b4f9` 每帧 +1，X_Mod §81）。 */
+#define MOVER_DESKTOP_PTR_VA 0x0072E2B4u
+#define MOVER_STAGE_OFFSET   8
+#define MOVER_STAGE_NOW_OFF  0xE0
+#define MOVER_STAGE_TICK_OFF 0xD4
+#define MOVER_OBJ_T0_OFF     0x90
+#define MOVER_OBJ_TOFF_OFF   0x94
+#define MOVER_OBJ_REL_OFF    0x98
+#define MOVER_OBJ_LINK_OFF   0xFC
+#define MOVER_MAX            32
+
+#define MOVER_SITE_LINK      1              /* ① 载图 */
+#define MOVER_SITE_START     2              /* ② 开打重取 */
+
+struct mover_link {
+    int link;             /* 挂在哪个对象上（= 服务端 `mapdata.Mover.handle`） */
+    unsigned char *obj;   /* 那个 MapObject —— 发包时从它身上现读 t0 / t_off */
+    void *vft;            /* 记表时 obj 的虚表：发包前核对「还是不是那个对象」 */
+    unsigned int t0;      /* 最近一次站点事件记下的 t0（只给日志对照，发包读现值） */
+    int t_off;            /* `[obj+0x94]`，相位偏移毫秒 */
+    unsigned char rel;    /* `[obj+0x98]`，相对模式（只给日志） */
+    unsigned char site;   /* 最近一次是哪个站点记的（MOVER_SITE_*） */
+    unsigned char sent;   /* 发过没有 —— 「报 N 条」那一行按起点翻转去重 */
+    unsigned int sent_t0; /* 上一发报出去的 t0 */
+};
+
+static struct mover_link g_mover[MOVER_MAX];
+static LONG g_mover_count = 0;                 /* 锁内读写 */
+static volatile LONG g_mover_dirty = 0;
+static CRITICAL_SECTION g_mover_lock;
+static volatile LONG g_mover_lock_ready = 0;
+static volatile LONG g_mover_patched = 0;      /* ① 装上了（发包的前提） */
+static volatile LONG g_mover_start_patched = 0; /* ② 装上了 */
+
+static int mover_phase_disabled(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_NO_MOVER_PHASE", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+/* 此刻的 Stage（Desktop+8）；没有 / 读不到就 NULL。★ 每一步都 IsBadReadPtr 守着 ——
+   发包那边跑在 watch_thread 上，换 stage 时旧的那个会被游戏线程释放。 */
+static unsigned char *mover_current_stage(void)
+{
+    unsigned char *desktop, *stage;
+    if (IsBadReadPtr((const void *)MOVER_DESKTOP_PTR_VA, 4)) return NULL;
+    desktop = *(unsigned char **)MOVER_DESKTOP_PTR_VA;
+    if (!desktop || IsBadReadPtr(desktop + MOVER_STAGE_OFFSET, 4)) return NULL;
+    stage = *(unsigned char **)(desktop + MOVER_STAGE_OFFSET);
+    if (!stage || IsBadReadPtr(stage + MOVER_STAGE_NOW_OFF, 4)) return NULL;
+    return stage;
+}
+
+/* 游戏线程，两个站点共用。`self` = MapObject，`t0` = 它刚存进 [self+0x90] 的那个数。
+   表按 link 做键：同一条路径上的几个对象是同一遍取的 t0，服务端每条路径也只要一个数；
+   换图后新图的 LinkPath 按 link 覆盖掉旧条目，旧图独有的条目在发包时核对不过就摘掉。 */
+static void __stdcall mover_note_link(unsigned char *self, unsigned int t0, int site)
+{
+    int link, t_off, i, n, had;
+    unsigned int old_t0;
+    unsigned char rel;
+    void *vft;
+
+    if (!InterlockedCompareExchange(&g_mover_lock_ready, 0, 0)) return;
+    if (IsBadReadPtr(self, MOVER_OBJ_LINK_OFF + 4)) return;
+    link = *(int *)(self + MOVER_OBJ_LINK_OFF);
+    if (!link) return;
+    vft = *(void **)self;
+    t_off = *(int *)(self + MOVER_OBJ_TOFF_OFF);
+    rel = *(unsigned char *)(self + MOVER_OBJ_REL_OFF);
+
+    EnterCriticalSection(&g_mover_lock);
+    n = g_mover_count;
+    for (i = 0; i < n; i++)
+        if (g_mover[i].link == link) break;
+    had = (i < n);
+    old_t0 = had ? g_mover[i].t0 : 0;
+    if (!had) {
+        if (n >= MOVER_MAX) {
+            LeaveCriticalSection(&g_mover_lock);
+            bslog("MOVER   !! 挂在路径上的对象超过 %d 个，link=%d 没记"
+                  "（服务端对它退回开局估计）", MOVER_MAX, link);
+            return;
+        }
+        g_mover_count = n + 1;
+        g_mover[i].sent = 0;
+    }
+    g_mover[i].link = link;
+    g_mover[i].obj = self;
+    g_mover[i].vft = vft;
+    g_mover[i].t0 = t0;
+    g_mover[i].t_off = t_off;
+    g_mover[i].rel = rel;
+    g_mover[i].site = (unsigned char)site;
+    InterlockedExchange(&g_mover_dirty, 1);
+    LeaveCriticalSection(&g_mover_lock);
+    if (site == MOVER_SITE_START && had)
+        bsvlog("MOVER   开打重取起点: link=%d t0=%u（原来 %u，挪了 %d ms）t_off=%d obj=%p",
+               link, t0, old_t0, (int)(t0 - old_t0), t_off, self);
+    else if (site == MOVER_SITE_START)
+        bsvlog("MOVER   开打重取起点: link=%d t0=%u（表里原先没有它）t_off=%d obj=%p",
+               link, t0, t_off, self);
+    else
+        bsvlog("MOVER   LinkPath: link=%d t0=%u t_off=%d rel=%u obj=%p stage=%p",
+               link, t0, t_off, (unsigned)rel, self, mover_current_stage());
+}
+
+static __declspec(naked) void mover_link_detour(void)
+{
+    __asm {
+        mov  dword ptr [esi + 0x90], eax    /* 被偷走的那条，原样跑 */
+        pushad
+        push MOVER_SITE_LINK                /* site */
+        push eax                            /* t0 */
+        push esi                            /* this */
+        call mover_note_link
+        popad
+        push MOVERLK_RESUME_TO              /* push/ret 不动标志位 */
+        ret
+    }
+}
+
+static __declspec(naked) void mover_start_detour(void)
+{
+    __asm {
+        mov  dword ptr [esi + 0x90], eax    /* 被偷走的那条，原样跑 */
+        pushad
+        push MOVER_SITE_START               /* site */
+        push eax                            /* t0 */
+        push esi                            /* this */
+        call mover_note_link
+        popad
+        push MOVERST_RESUME_TO
+        ret
+    }
+}
+
+/* 两处一起装：① 是发包的前提（表从它来）；② 装不上时周期那一发照样现读到开打后的
+   起点，只是晚到 ≤1 秒 —— 所以 ② 失败只打一行 `!!`，不拖 ①。 */
+static int try_patch_mover_link(void)
+{
+    if (!InterlockedCompareExchange(&g_mover_lock_ready, 0, 0)) {
+        InitializeCriticalSection(&g_mover_lock);
+        InterlockedExchange(&g_mover_lock_ready, 1);
+    }
+    if (!g_mover_patched) {
+        if (!install_jmp_guard(MOVERLK_VA, MOVERLK_SIG, MOVERLK_SIG_LEN,
+                               MOVERLK_STOLEN, mover_link_detour, "移动平台相位"))
+            return 0;
+        InterlockedExchange(&g_mover_patched, 1);
+        bslog("PATCH   ★移动平台相位 ① @ %08X: MapObject::LinkPath 收尾记下每个挂在路径上的"
+              "对象，经 UDP 旁路每秒报它**此刻**的 (link, t0, t_off)（X_Mod §74 / §78；"
+              "只报事实，谁的相位算数在服务端）", (unsigned)MOVERLK_VA);
+    }
+    if (!g_mover_start_patched) {
+        if (!install_jmp_guard(MOVERST_VA, MOVERST_SIG, MOVERST_SIG_LEN,
+                               MOVERST_STOLEN, mover_start_detour, "移动平台开打重取"))
+            return 0;
+        InterlockedExchange(&g_mover_start_patched, 1);
+        bslog("PATCH   ★移动平台相位 ② @ %08X: GameContext::StartGame 开打时把所有移动平台的"
+              "起点重取成「现在」—— 记下来立刻报（X_Mod §78）", (unsigned)MOVERST_VA);
+    }
+    return 1;
+}
+
+static volatile LONG g_crash25_guards_patched = 0;
+
+static int try_patch_crash25_guards(void)
+{
+    int a, b, c1, c2, d, e;
+
+    if (g_crash25_guards_patched) return 1;
+
+    if (!g_flush_scratch)
+        g_flush_scratch = (unsigned char *)VirtualAlloc(
+            NULL, FLUSH_SCRATCH_SZ, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    a = install_jmp_guard(SPRITE_IB_VA, SPRITE_IB_SIG, SPRITE_IB_SIG_LEN,
+                          SPRITE_IB_STOLEN, sprite_ib_guard_detour,
+                          "精灵批索引缓冲 Lock 判空");
+    b = install_jmp_guard(LDSTAGE_VA, LDSTAGE_SIG, LDSTAGE_SIG_LEN,
+                          LDSTAGE_STOLEN, ldstage_guard_detour,
+                          "加载画面析构判 LobbyStage");
+    /* C：两处取值器，各 3 个字节，顺序见上。
+       站点核对只比**不动的那一截**（偏移 9 往后）—— 前 9 个字节里有我们要改的
+       三处，拿整串 memcmp 的话打完就再也对不上了（`poke_imm8` 自己是幂等的）。*/
+    c1 = sig_tail_ok(SEATGET_VA, SEATGET_SIG, SEATGET_SIG_LEN, 9)
+       && poke_imm8(SEATGET_VA + 1, 0xC0, 0xC9, "座位取值器 test this")
+       && poke_imm8(SEATGET_VA + 7, 0x7D, 0x73, "座位取值器 下标改无符号")
+       && poke_imm8(SEATGET_VA + 2, 0x7C, 0x74, "座位取值器 this 为空返回 0");
+    c2 = sig_tail_ok(SEATPTR_VA, SEATPTR_SIG, SEATPTR_SIG_LEN, 9)
+       && poke_imm8(SEATPTR_VA + 1, 0xC9, 0xD2, "座位指针取值器 test base")
+       && poke_imm8(SEATPTR_VA + 7, 0x7D, 0x73, "座位指针取值器 下标改无符号")
+       && poke_imm8(SEATPTR_VA + 2, 0x7C, 0x74, "座位指针取值器 base 为空返回 0");
+    d = install_jmp_guard(TEXWR_VA, TEXWR_SIG, TEXWR_SIG_LEN,
+                          TEXWR_STOLEN, texwr_guard_detour,
+                          "LockRect 失败不写 pBits");
+    /* 废纸篓没分配到就整个不装 —— 绕道里那条 mov 会把 NULL 写进去，更糟。 */
+    e = g_flush_scratch
+        ? install_jmp_guard(FLUSH_VA, FLUSH_SIG, FLUSH_SIG_LEN,
+                            FLUSH_STOLEN, flush_guard_detour,
+                            "Flush 顶点缓冲 Lock 判据")
+        : 0;
+
+    if (!(a && b && c1 && c2 && d && e)) return 0;
+    InterlockedExchange(&g_crash25_guards_patched, 1);
+    bslog("PATCH   ★散崩守护 x6（bug调查/25）: 精灵批索引缓冲 Lock 判空 @ %08X"
+          " / 加载画面析构判 LobbyStage @ %08X"
+          " / 座位取值器判 this @ %08X（一次盖住 97 个调用点）"
+          " / 座位指针取值器判 base @ %08X"
+          " / LockRect 失败不写 pBits @ %08X"
+          " / Flush 顶点 Lock 失败灌废纸篓 @ %08X（%08X，1 MB）",
+          (unsigned)SPRITE_IB_VA, (unsigned)LDSTAGE_VA,
+          (unsigned)SEATGET_VA, (unsigned)SEATPTR_VA,
+          (unsigned)TEXWR_VA, (unsigned)FLUSH_VA,
+          (unsigned)(UINT_PTR)g_flush_scratch);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* ★★★★★ 根治 §68：让 `nmconew.dll` 自己那两个崩溃点**走它原版就有的失败出口** */
 /*         （V0.3 §82，bug调查/18；2026-09-11）                                */
 /*                                                                            */
@@ -6510,6 +7322,11 @@ static void *g_proj_add_tramp  = NULL;
 static void *g_proj_tick_tramp = NULL;
 static void *g_proj_fire_tramp = NULL;
 static volatile LONG g_proj_diag_patched = 0;
+/* ★ `ProjectileMgr::Add` 那个钩子现在有两个用户（X_Mod D60）：逻辑帧时钟要在这里登记
+   「这一帧出膛了哪些远端弹体」（常开），弹体诊断要打 `PROJ+` 快照（跟日志级别）。
+   钩子只装一个，诊断那一半由这个开关决定做不做。 */
+static volatile LONG g_proj_diag_on = 0;
+static void tick_note_birth(unsigned char *p);
 
 /* ★★ 默认值是**跟着日志级别走**，不是「没设 = 开」（用户 2026-09-01 的卡顿）。
  *
@@ -6679,9 +7496,18 @@ static void proj_track_add(void *proj, int handle)
 static void __cdecl proj_tick_log(void *proj)
 {
     unsigned char *p = (unsigned char *)proj;
+    unsigned char *stage;
+    unsigned int logic_tick = 0, timer = 0;
     int i;
 
     if (!p || IsBadReadPtr(p, 0x340)) return;
+    /* ★ 这一格在客户端第几个逻辑帧、帧里的 Timer()（移动平台这一帧就按它摆，X_Mod §81）：
+       离线重放拿它逐格对拍鲤鱼的相位，不用再从日志时间戳去猜。 */
+    stage = mover_current_stage();
+    if (stage && !IsBadReadPtr(stage + MOVER_STAGE_TICK_OFF, 4)) {
+        logic_tick = *(unsigned int *)(stage + MOVER_STAGE_TICK_OFF);
+        timer = *(unsigned int *)(stage + MOVER_STAGE_NOW_OFF);
+    }
     for (i = 0; i < PROJ_TRACK_N; i++) {
         if (g_proj_track[i].obj != proj) continue;
         /* 地址被复用了：接着往后扫，**别 return** —— 上面 proj_track_add 已经
@@ -6695,12 +7521,13 @@ static void __cdecl proj_tick_log(void *proj)
            查「炸完不消失」要看的正是「它到底还在不在倒计时」。 */
         bsvlog("PROJ.   弹体 %08X 句柄 %d owner %d 第%d帧 位置(+34,38)"
                " (%.2f, %.2f) 渲染(+2c,30) (%.2f, %.2f) 速度 (%.2f, %.2f)"
-               " 状态 %d 寿命(+31c) %d 碰撞型(+32c) %d 追踪目标(+328) %d 线 %08X",
+               " 状态 %d 寿命(+31c) %d 碰撞型(+32c) %d 追踪目标(+328) %d 线 %08X"
+               " 逻辑帧 %u Timer %u",
                (unsigned)(UINT_PTR)p, g_proj_track[i].handle,
                proj_owner_of(g_proj_track[i].handle), g_proj_track[i].ticks,
                PF(0x34), PF(0x38), PF(0x2C), PF(0x30),
                PF(0x120), PF(0x124), PI(0x54), PI(0x31C), PI(0x32C), PI(0x328),
-               PU(0x30C));
+               PU(0x30C), logic_tick, timer);
         /* ★ 弹道线 / 拖尾**每帧的内容**：光看「指针非 0」证明不了它被画了
            —— 要看它有没有跟着弹体动。真人和 bot 并排比这几行就够了。 */
         if (PU(0x30C))
@@ -6715,6 +7542,14 @@ static void __cdecl proj_tick_log(void *proj)
 #undef PI
 #undef PU
 
+/* Add 的两个用户：逻辑帧时钟登记出膛（常开，D60）+ 弹体诊断快照（跟日志级别）。 */
+static void __cdecl proj_add_hook(void *proj)
+{
+    tick_note_birth((unsigned char *)proj);
+    if (InterlockedCompareExchange(&g_proj_diag_on, 0, 0))
+        proj_add_log(proj);
+}
+
 /* Add 是 __thiscall(ecx=mgr, [esp+4]=proj)：
    进 detour 时 [esp]=返回地址、[esp+4]=proj；
    pushad(32) + pushfd(4) 之后就是 [esp+0x28]。 */
@@ -6724,12 +7559,26 @@ static __declspec(naked) void proj_add_detour(void)
         pushad
         pushfd
         push dword ptr [esp + 0x28]
-        call proj_add_log
+        call proj_add_hook
         add  esp, 4
         popfd
         popad
         jmp  dword ptr [g_proj_add_tramp]
     }
+}
+
+/* Add 钩子只装一次，谁先要谁装（逻辑帧时钟 / 弹体诊断）。 */
+static int ensure_proj_add_hook(void)
+{
+    unsigned char *a = (unsigned char *)PROJ_ADD_VA;
+
+    if (g_proj_add_tramp != NULL) return 1;
+    if (IsBadReadPtr(a, sizeof(PROJ_ADD_SIG))) return 0;
+    if (memcmp(a, PROJ_ADD_SIG, sizeof(PROJ_ADD_SIG)) != 0)
+        return 0;                          /* 还没解壳到这里，或不是这个版本 */
+    g_proj_add_tramp = install_inline_hook((void *)PROJ_ADD_VA, proj_add_detour,
+                                           "弹体登记");
+    return g_proj_add_tramp != NULL;
 }
 
 /* 每帧 tick 是 __thiscall(ecx=弹体)，没有栈参数。pushad 不动寄存器，
@@ -6942,14 +7791,7 @@ static int try_patch_proj_diag(void)
     if (g_proj_diag_patched) return 1;
     if (IsBadReadPtr(a, sizeof(PROJ_ADD_SIG))
         || IsBadReadPtr(t, sizeof(PROJ_TICK_SIG))) return 0;
-    if (g_proj_add_tramp == NULL) {
-        if (memcmp(a, PROJ_ADD_SIG, sizeof(PROJ_ADD_SIG)) != 0)
-            return 0;                      /* 还没解壳到这里，或不是这个版本 */
-        g_proj_add_tramp = install_inline_hook((void *)PROJ_ADD_VA,
-                                               proj_add_detour,
-                                               "弹体登记诊断");
-        if (!g_proj_add_tramp) return 0;
-    }
+    if (!ensure_proj_add_hook()) return 0;
     if (g_proj_tick_tramp == NULL) {
         if (memcmp(t, PROJ_TICK_SIG, sizeof(PROJ_TICK_SIG)) != 0)
             return 0;
@@ -6969,6 +7811,7 @@ static int try_patch_proj_diag(void)
         if (!g_proj_fire_tramp) return 0;
     }
     InterlockedExchange(&g_proj_diag_patched, 1);
+    InterlockedExchange(&g_proj_diag_on, 1);
     /* ★ 这句以前写的是「按整数位置翻转打轨迹」—— 早就改成每 tick 都打了，
        文字没跟上。查弹体问题的人照着它去读日志会判错（「没有新行」被当成
        「弹体不动」，其实那一版是「弹体没了」），所以订正。 */
@@ -7710,6 +8553,14 @@ static int try_hook_snow(void);
 /* 每发心跳盖一个递增索引，服务端拿它和自己数的 TCP 发数对齐去重。            */
 /* **两边的起点都是「这条游戏连接的登录包」** —— 我们在看到 `0x0100`          */
 /* gcpReqLogin 时归零，服务端那边是一个新的 `Conn`，计数器同样从 0 起。        */
+/*                                                                            */
+/* ## 本机服务器 / 远程服务器**一个样**（X_Mod D58，用户 2026-09-23）          */
+/*                                                                            */
+/* 原来只在「远程服务器」下开（理由是本机走环回没有丢包）。可这条旁路早就不只  */
+/* 搬位置了 —— 在场证据、移动平台相位都靠它，本机测试等于这几样全没有，测出来 */
+/* 的也不是线上的样子。现在两种模式**完全同一条路**：都发到本机中继的同一个口， */
+/* 唯一的差别是 HELLO 里多一位 `SYNC_FLAG_LOCAL_SERVER`，中继据此把上游定成    */
+/* `127.0.0.1` 还是 `server.config` 的地址。其余一个字节都不分叉。             */
 /* -------------------------------------------------------------------------- */
 #define SYNC_MAGIC0 'P'
 #define SYNC_MAGIC1 'S'
@@ -7717,9 +8568,25 @@ static int try_hook_snow(void);
 #define SYNC_VERSION 1
 #define SYNC_MSG_HELLO 1
 #define SYNC_MSG_DATA  3
+/* ★ 在场证据（bug调查/25 / §62）。和 `server/udpsync.py` 的 `MSG_PRESENCE`
+   是同一号；老服务端不认识它，会安静丢掉（退回今天的行为）。 */
+#define SYNC_MSG_PRESENCE 6
+/* ★ 移动平台相位（X_Mod §74）。和 `server/udpsync.py` 的 `MSG_MOVER_PHASE` 同一号；
+   老服务端 / 老中继不认识它，安静丢掉（服务端退回开局估计）。 */
+#define SYNC_MSG_MOVER_PHASE 7
+/* ★ 逻辑帧时钟（X_Mod §81 / D60）。和 `server/udpsync.py` 的 `MSG_TICK_CLOCK` 同一号；
+   老服务端 / 老中继不认识它，安静丢掉（服务端退回每秒一发的相位外推）。 */
+#define SYNC_MSG_TICK_CLOCK 8
+/* 「本次连接从来没有过」。★ 必须和「刚刚有过（0 毫秒）」分得开：
+   一个是最强的挂机证据，一个是最强的反证。 */
+#define PRESENCE_NEVER 0xFFFFFFFFu
 /* HELLO 的标志位：「游戏这边收位置数据的 UDP 口已经 bind 成功，可以往这儿投」。
    和 `server/udpsync.py` 的 `HELLO_FLAG_DOWNLINK` 是同一位。 */
 #define SYNC_FLAG_DOWNLINK 0x01
+/* HELLO 的标志位：「这一轮登录选的是本机服务器」（X_Mod D58）。和 `server/udpsync.py`
+   的 `HELLO_FLAG_LOCAL_SERVER` 是同一位。**只给本机中继看**：它拿这一位决定这条旁路
+   的上游是 `127.0.0.1` 还是 `server.config` 的地址，转给服务端时不带它。 */
+#define SYNC_FLAG_LOCAL_SERVER 0x02
 /* 帧头 10 字节（RawPacket）：+0 魔数 0xff，+8 u16 opcode。§156。 */
 #define FRAME_HEADER 10
 /* UdpPacket 头 12 字节，内层 opcode 在 +10。§151。 */
@@ -7817,9 +8684,12 @@ static int sync_put_header(unsigned char *buf, int kind, int count)
     return 8;
 }
 
-/* 发一发 `HELLO`：票据 + 标志位。标志位现在只有一位 —— 「游戏那个收位置
-   数据的 UDP 口已经 bind 成功」。中继把它原样转告服务端，服务端据此决定
-   要不要给这个玩家发下行 UDP。 */
+/* 发一发 `HELLO`：票据 + 标志位。标志位两位：
+     `SYNC_FLAG_DOWNLINK`     「游戏那个收位置数据的 UDP 口已经 bind 成功」—— 中继转告
+                              服务端，服务端据此决定要不要给这个玩家发下行 UDP；
+     `SYNC_FLAG_LOCAL_SERVER` 「这一轮登录选的是本机服务器」—— 只给中继看，它据此选上游
+                              （X_Mod D58）。模式在点「开始」时就锁定了（`lock_online_mode`），
+                              登录包 / bind 成功这两个发 HELLO 的时刻都在那之后。 */
 static void sync_send_hello(void)
 {
     unsigned char buf[8 + 2 + 128 + 1];
@@ -7833,8 +8703,313 @@ static void sync_send_hello(void)
     memcpy(buf + n, g_sync_ticket, (size_t)chars);
     n += chars;
     buf[n++] = (unsigned char)(
-        InterlockedCompareExchange(&g_sync_udp_bound, 0, 0) ? SYNC_FLAG_DOWNLINK : 0);
+        (InterlockedCompareExchange(&g_sync_udp_bound, 0, 0) ? SYNC_FLAG_DOWNLINK : 0)
+        | (popshot_online_mode() ? 0 : SYNC_FLAG_LOCAL_SERVER));
     sync_send_raw(buf, n);
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★★ 在场证据 —— 把服务端**结构上看不见**的四件事报过去（§62 / D53）        */
+/*                                                                            */
+/*   出处 bug调查/25：328800963 连续 14 小时显示「游戏中·任务」。查下来不是   */
+/*   判据写错了，是**单人任务房里服务端是瞎的** —— 房里只有他一个人，客户端   */
+/*   就不发 `0x040e`，挂机判定的「键盘」那条整个不存在，只剩「打中 / 捡到 /   */
+/*   得分」；而他开着连点器，分数每 1.5 秒涨一次，证据比真人还多。            */
+/*                                                                            */
+/*   我们自己的注释早就把话说死了（「房间挂机踢出」那一段）：原版这个判定     */
+/*   「没有任何一条是收包触发的，**服务端够不着，只能改客户端**」。           */
+/*   hook 正好站在够得着的那一边。                                            */
+/*                                                                            */
+/*   报四件事，**只报事实，不下结论**（判定留在服务端，那边的阈值是用户拿真   */
+/*   日志调出来的，改阈值不该要求重发客户端）：                               */
+/*                                                                            */
+/*     kb_idle_ms     距上次**局内游戏键**的 WM_KEYUP（白名单，见            */
+/*                    `presence_game_key()`）。菜单键（F5 …）不算，开火也    */
+/*                    不算 —— 它是鼠标，在下一格                            */
+/*     mouse_idle_ms  距上次鼠标键 WM_*BUTTONUP。单独一类 ——                  */
+/*                    连点器产的就是它，故意只当弱证据                        */
+/*     sys_idle_ms    `GetLastInputInfo()`：**这台机器**前面有没有人。         */
+/*                    PostMessage 类连点器伪造不了它                          */
+/*     foreground     游戏窗口在不在前台（用户 2026-09-20 点的题：真人玩游戏  */
+/*                    不会把窗口丢后台。原版自己也认这件事 —— `WM_ACTIVATEAPP`*/
+/*                    一失活就把 BGM 静音，`0x40f17b` 把它存进 `[窗口对象+7]`）*/
+/*                                                                            */
+/*   ★ 前台用 `GetForegroundWindow()` 现问、不缓存：缓存就要处理「钩子装上   */
+/*     之前窗口已经失活了」这个初值问题，而现问一次比后面那次 sendto 便宜。   */
+/*   ★ 走的是**已有的**位置数据 UDP 旁路（多一个 kind），不碰游戏那条加密    */
+/*     TCP —— 那条流是有状态的，往里插包会把密钥流冲掉。                      */
+/* -------------------------------------------------------------------------- */
+
+typedef BOOL (WINAPI *get_last_input_t)(PLASTINPUTINFO);
+static get_last_input_t s_get_last_input = NULL;
+
+/* `tick` 到现在过了多久；`tick == 0`（从来没有过）回 PRESENCE_NEVER。
+   ★ GetTickCount 49.7 天回绕：用无符号相减，回绕天然是对的。 */
+static unsigned int presence_age(LONG tick)
+{
+    DWORD now;
+    if (tick == 0) return PRESENCE_NEVER;
+    now = GetTickCount();
+    return (unsigned int)(now - (DWORD)tick);
+}
+
+/* 这台机器整机多久没人碰过。取不到（老系统 / API 缺失）回 PRESENCE_NEVER 是
+   **错的**（那会被当成最强的挂机证据）—— 取不到就说「刚刚有过」，宁可漏判。 */
+static unsigned int presence_system_idle(void)
+{
+    LASTINPUTINFO lii;
+    if (!s_get_last_input) {
+        HMODULE u32 = GetModuleHandleA("user32.dll");
+        if (u32) s_get_last_input =
+            (get_last_input_t)GetProcAddress(u32, "GetLastInputInfo");
+        if (!s_get_last_input) return 0;
+    }
+    lii.cbSize = sizeof(lii);
+    lii.dwTime = 0;
+    if (!s_get_last_input(&lii)) return 0;
+    return (unsigned int)(GetTickCount() - lii.dwTime);
+}
+
+/* 游戏窗口在不在前台。★ 按**进程**比，不按 HWND：全屏 / 窗口 / 子窗口
+   各有各的 HWND，比进程号一次到位，也不用记谁是主窗口。 */
+static int presence_foreground(void)
+{
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (!fg) return 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+static void sync_send_presence(void)
+{
+    unsigned char buf[8 + 12 + 4];
+    int n;
+    unsigned int kb, mouse, sysidle;
+    int fg;
+
+    kb = presence_age(InterlockedCompareExchange(&g_pres_kb_tick, 0, 0));
+    mouse = presence_age(InterlockedCompareExchange(&g_pres_mouse_tick, 0, 0));
+    sysidle = presence_system_idle();
+    fg = presence_foreground();
+
+    /* 日志按**状态翻转**去重（铁律 10）：前台/后台变了才写一行。
+       一局能采上千次，按次数或时间窗去重要么刷屏要么漏掉翻转。
+       ★ 放在发包**之前**、也不受「登录了没有」影响：登录前采样器就该能自证
+         活着，否则装没装上只能靠猜。 */
+    if (InterlockedExchange(&g_pres_fg_last, fg) != fg)
+        bslog("PRES    游戏窗口%s前台（键盘 %u ms / 鼠标 %u ms / 这台机器 %u ms 没动过）",
+              fg ? "回到" : "**离开**", kb, mouse, sysidle);
+
+    /* 票据还没有 = 这条游戏连接还没登录，服务端认不出我们，白发。 */
+    if (!g_sync_ticket[0]) return;
+    /* ★ 这里**不调 `sync_open()`** —— 它不是线程安全的（判完 ready 才建
+       socket），而我们跑在 watch_thread 上，和游戏网络线程抢着建会漏一个
+       socket、还会把 `g_sync_sock` 覆盖掉。旁路是登录那一发开的，有票据
+       就一定已经开好了；真没开就这一发不发，下一轮再看。 */
+    if (!InterlockedCompareExchange(&g_sync_ready, 0, 0)) return;
+
+    n = sync_put_header(buf, SYNC_MSG_PRESENCE, 0);
+    memcpy(buf + n, &kb, 4);      n += 4;
+    memcpy(buf + n, &mouse, 4);   n += 4;
+    memcpy(buf + n, &sysidle, 4); n += 4;
+    buf[n++] = (unsigned char)(fg ? 1 : 0);
+    buf[n++] = 0;                 /* flags：留给以后，别复用 */
+    buf[n++] = 0; buf[n++] = 0;   /* 保留 u16 */
+    sync_send_raw(buf, n);
+}
+
+/* 移动平台相位（X_Mod §74 / §78）：表非空时每秒一发（站点一触发就置脏，下一轮立刻发）。
+   载荷：u32 game_now（`[当前 Stage + 0xe0]`，= 此刻的 Timer()）/ u32 wall_now
+   （GetTickCount）/ 头里 count 条 { i32 link, u32 t0, i32 t_off }。
+   ★★ t0 / t_off 是**这一刻从对象身上现读的**，不是记表时抄下的 —— 开打时 StartGame
+     会把起点整体重取一遍（§78），周期这一发就得跟着变，否则同步只能对齐时钟漂移、
+     纠正不了起点。现读前核对对象还在（虚表 + link 没变）；核对不过的条目（换图 /
+     散局后旧图的对象）当场摘掉。
+   ★ 跑在 watch_thread 上，读的是游戏内存。没有当前 Stage（换 stage 的空档，Timer()
+     这时走全局计时器）就这一轮不发，下一轮再看。**不**再要求「和记表时是同一个
+     Stage」：stage 6（LoadingStage）→ 7（GameStage）本来就换对象，那道门在会话 30
+     一开打就把整局的同步包全拦了（§78）。 */
+static void sync_send_mover_phase(void)
+{
+    unsigned char buf[8 + 8 + MOVER_MAX * 12];
+    int links[MOVER_MAX], toffs[MOVER_MAX];
+    unsigned int t0s[MOVER_MAX];
+    int n = 0, kept = 0, changed = 0, i, len;
+    unsigned char first_site = 0;
+    unsigned int game_now, wall_now;
+    unsigned char *stage;
+
+    if (!InterlockedCompareExchange(&g_mover_patched, 0, 0)) return;
+    if (!g_sync_ticket[0]) return;
+    if (!InterlockedCompareExchange(&g_sync_ready, 0, 0)) return;
+    stage = mover_current_stage();
+    if (!stage) return;
+    EnterCriticalSection(&g_mover_lock);
+    for (i = 0; i < g_mover_count && i < MOVER_MAX; i++) {
+        struct mover_link m = g_mover[i];
+        if (IsBadReadPtr(m.obj, MOVER_OBJ_LINK_OFF + 4)
+            || *(void **)m.obj != m.vft
+            || *(int *)(m.obj + MOVER_OBJ_LINK_OFF) != m.link)
+            continue;                                   /* 对象没了：这一条摘掉 */
+        links[n] = m.link;
+        t0s[n] = *(unsigned int *)(m.obj + MOVER_OBJ_T0_OFF);
+        toffs[n] = *(int *)(m.obj + MOVER_OBJ_TOFF_OFF);
+        if (!m.sent || m.sent_t0 != t0s[n]) changed = 1;
+        if (n == 0) first_site = m.site;
+        m.sent = 1;
+        m.sent_t0 = t0s[n];
+        g_mover[kept++] = m;
+        n++;
+    }
+    g_mover_count = kept;
+    InterlockedExchange(&g_mover_dirty, 0);
+    LeaveCriticalSection(&g_mover_lock);
+    if (n <= 0) return;
+    game_now = *(unsigned int *)(stage + MOVER_STAGE_NOW_OFF);
+    wall_now = GetTickCount();
+    len = sync_put_header(buf, SYNC_MSG_MOVER_PHASE, n);
+    memcpy(buf + len, &game_now, 4); len += 4;
+    memcpy(buf + len, &wall_now, 4); len += 4;
+    for (i = 0; i < n; i++) {
+        memcpy(buf + len, &links[i], 4); len += 4;
+        memcpy(buf + len, &t0s[i], 4);   len += 4;
+        memcpy(buf + len, &toffs[i], 4); len += 4;
+    }
+    sync_send_raw(buf, len);
+    /* 日志按**起点翻转**去重：载图一次、开打重取一次，之后每秒那一发静默。 */
+    if (changed)
+        bslog("MOVER   报 %d 条相位（link=%d 起点 t0=%u，最近一次由%s记下；此刻相位 %d ms，"
+              "偏移 %d；游戏时钟 %u / 墙钟 %u）",
+              n, links[0], t0s[0],
+              first_site == MOVER_SITE_START ? "「开打重取」" : "「载图 LinkPath」",
+              (int)(game_now - t0s[0]), toffs[0], game_now, wall_now);
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★★ 逻辑帧时钟（X_Mod §81 / D60）                                            */
+/*                                                                            */
+/*   鲤鱼背上的反弹差 1 px 就弹向全变，而服务端按「每秒一发的相位 + 墙钟外推」  */
+/*   算出来的鱼，比这台客户端推弹体那一格**实际撞到**的鱼平均早 12 ms、σ 7 ms。 */
+/*   那一格撞到的是什么，是两件站在旁边就看得到的事实：                        */
+/*     ① 逻辑是固定 32 ms 的网格（`Stage::Update` 0x42b4c3），`[Stage+0xd4]`   */
+/*        是帧号；移动平台的碰撞位置只在**渲染**时按 `Timer()`（`[Stage+0xe0]`）*/
+/*        刷新 ⇒ 逻辑帧里读到的 Timer 就是这一帧撞到的鱼的时刻；               */
+/*     ② 收到的 rpFire 在网络泵里建弹体（`ProjectileMgr::Add`），**同一帧**里    */
+/*        推第 1 格（`PROJ+` 和第 1 帧同一毫秒）。                              */
+/*   ⇒ `GameContext` 逻辑帧入口（vft+0x80 = 0x4904cc，各模式的子类都 call 它，   */
+/*     这时这一帧的网络泵已经跑完）每帧发一发：帧号 + Timer + 这一帧出膛的远端  */
+/*     弹体句柄。服务端第 k 格按「出膛帧 + k − 1」那一帧的 Timer 算鱼。         */
+/*                                                                            */
+/*   ★ 只在这张图有移动平台时发（MOVER 表非空）—— 别的图一发都没有。           */
+/*   ★ **在游戏线程当场发**（一帧一发，非阻塞 UDP）：D55 否掉「游戏线程发包」是  */
+/*     因为载图时一帧里连着来好几个对象；这里一帧恰好一发，而且晚发就没意义 ——  */
+/*     服务端推同一格和客户端几乎同时，watch_thread 那 100 ms 等不起（D60）。    */
+/*   ★ 出膛表只在游戏线程读写（Add 与逻辑帧入口是同一条线程），不用锁。         */
+/* -------------------------------------------------------------------------- */
+#define TICKCLK_VA        0x004904CCu     /* GameContext::LogicTick（vft+0x80）入口 */
+/*   0x4904cc  b8 64 45 63 00   mov eax, 0x634564   ← 正好 5 字节（和 Add 同一个形状） */
+static const unsigned char TICKCLK_SIG[5] = { 0xB8, 0x64, 0x45, 0x63, 0x00 };
+#define TICK_BIRTH_MAX    32
+
+static void *g_tickclk_tramp = NULL;
+static volatile LONG g_tickclk_patched = 0;
+static int g_tick_births[TICK_BIRTH_MAX];
+static int g_tick_birth_n = 0;
+static int g_tick_birth_dropped = 0;
+static unsigned int g_tickclk_last = 0;   /* 日志按「开始上报」翻转：帧号倒退 = 新的一局 */
+static int g_tickclk_on = 0;
+
+/* ProjectileMgr::Add 里调（游戏线程）：远端弹体登记进「这一帧出膛」表。
+   自己开的枪不报（服务端不模拟它）；怪 / 中立（句柄 < 100000）不报。 */
+static void tick_note_birth(unsigned char *p)
+{
+    int handle, me;
+
+    if (!InterlockedCompareExchange(&g_tickclk_patched, 0, 0)) return;
+    if (InterlockedCompareExchange(&g_mover_count, 0, 0) <= 0) return;
+    if (!p || IsBadReadPtr(p, 0x340)) return;
+    if (!proj_is_bullet(p)) return;         /* 角色 / 地图物件也走 Add */
+    handle = *(int *)(p + 0xD0);
+    if (handle < 100000) return;
+    me = proj_my_seat();
+    if (me >= 0 && proj_owner_of(handle) == 10 + me) return;
+    if (g_tick_birth_n < TICK_BIRTH_MAX)
+        g_tick_births[g_tick_birth_n++] = handle;
+    else
+        g_tick_birth_dropped++;
+}
+
+/* GameContext 逻辑帧入口（游戏线程）：这一帧的帧号 / Timer / 出膛表发出去。 */
+static void __cdecl tick_clock_on_logic(void)
+{
+    unsigned char buf[8 + 8 + TICK_BIRTH_MAX * 4];
+    unsigned char *stage;
+    unsigned int tick, timer;
+    int n = g_tick_birth_n, len, i;
+
+    g_tick_birth_n = 0;                     /* 这一帧的出膛只属于这一帧，发不出去也不留 */
+    if (InterlockedCompareExchange(&g_mover_count, 0, 0) <= 0) return;
+    if (!g_sync_ticket[0]) return;
+    if (!InterlockedCompareExchange(&g_sync_ready, 0, 0)) return;
+    stage = mover_current_stage();
+    if (!stage || IsBadReadPtr(stage + MOVER_STAGE_TICK_OFF, 4)) return;
+    tick = *(unsigned int *)(stage + MOVER_STAGE_TICK_OFF);
+    timer = *(unsigned int *)(stage + MOVER_STAGE_NOW_OFF);
+    len = sync_put_header(buf, SYNC_MSG_TICK_CLOCK, n);
+    memcpy(buf + len, &tick, 4);  len += 4;
+    memcpy(buf + len, &timer, 4); len += 4;
+    for (i = 0; i < n; i++) {
+        memcpy(buf + len, &g_tick_births[i], 4);
+        len += 4;
+    }
+    sync_send_raw(buf, len);
+    /* 日志按状态翻转：这一局第一次发（或帧号倒退 = 换了一局）打一行，之后静默。 */
+    if (!g_tickclk_on || tick < g_tickclk_last) {
+        g_tickclk_on = 1;
+        bslog("MOVER   逻辑帧时钟开始上报：帧 %u / Timer %u（每个逻辑帧一发，带这一帧出膛的"
+              "远端弹体，X_Mod D60）", tick, timer);
+    }
+    g_tickclk_last = tick;
+    if (n)
+        bsvlog("MOVER   逻辑帧 %u（Timer %u）出膛 %d 颗远端弹体，首个句柄 %d",
+               tick, timer, n, g_tick_births[0]);
+    if (g_tick_birth_dropped) {
+        bslog("MOVER   !! 一帧里出膛超过 %d 颗，%d 颗没登记（服务端对它们退回每秒相位外推）",
+              TICK_BIRTH_MAX, g_tick_birth_dropped);
+        g_tick_birth_dropped = 0;
+    }
+}
+
+static __declspec(naked) void tickclk_detour(void)
+{
+    __asm {
+        pushad
+        pushfd
+        call tick_clock_on_logic
+        popfd
+        popad
+        jmp  dword ptr [g_tickclk_tramp]
+    }
+}
+
+/* 逻辑帧入口 + Add 两个钩子一起装（Add 可能已经被弹体诊断装过，共用）。 */
+static int try_patch_tick_clock(void)
+{
+    unsigned char *t = (unsigned char *)TICKCLK_VA;
+
+    if (g_tickclk_patched) return 1;
+    if (!ensure_proj_add_hook()) return 0;
+    if (IsBadReadPtr(t, sizeof(TICKCLK_SIG))
+        || memcmp(t, TICKCLK_SIG, sizeof(TICKCLK_SIG)) != 0)
+        return 0;
+    g_tickclk_tramp = install_inline_hook((void *)TICKCLK_VA, tickclk_detour, "逻辑帧时钟");
+    if (!g_tickclk_tramp) return 0;
+    InterlockedExchange(&g_tickclk_patched, 1);
+    bslog("PATCH   ★逻辑帧时钟 @ %08X（GameContext 逻辑帧入口）+ 出膛登记 @ %08X"
+          "（ProjectileMgr::Add）：有移动平台的图每个逻辑帧报「帧号 / Timer / 这一帧出膛的"
+          "远端弹体」（X_Mod §81 / D60）", (unsigned)TICKCLK_VA, (unsigned)PROJ_ADD_VA);
+    return 1;
 }
 
 /* 从 `0x0100 gcpReqLogin` 的载荷里取票据（首字段 wstring：u16 字符数 +
@@ -7864,8 +9039,9 @@ static void sync_on_login(const unsigned char *payload, int len)
        重连时客户端会**原样重放同一张票据**（§171），所以不能靠票据变没变来判。 */
     InterlockedExchange(&g_sync_udp_bound, 0);
     sync_send_hello();
-    bslog("SYNC    登录包已发出，位置数据 UDP 旁路重新开始计数（票据 %.8s…）",
-          g_sync_ticket);
+    bslog("SYNC    登录包已发出，位置数据 UDP 旁路重新开始计数（票据 %.8s…；%s，"
+          "中继据此选上游）", g_sync_ticket,
+          popshot_online_mode() ? "远程服务器" : "本机服务器");
 }
 
 /* 游戏成功 bind 了收位置数据的那个 UDP 口 —— 告诉本机中继可以往这儿投了。
@@ -7915,9 +9091,10 @@ static void sync_on_plain_frame(const unsigned char *frame, int len)
     const unsigned char *udp;
     int udplen;
 
-    /* 只在「远程服务器」模式下做。本机 / 局域网走的是环回或局域网，
-       没有跨境那种丢包，多发一份纯属浪费。 */
-    if (!popshot_online_mode()) return;
+    /* ★ 本机 / 远程**都做**（X_Mod D58）。这里原来有一道「只在远程服务器模式下做」
+       的门，理由是本机走环回没有丢包、多发一份纯属浪费 —— 可这条旁路现在还捎着
+       在场证据和移动平台相位，本机模式一关就全没了，本机测出来的也不是线上的样子。
+       两种模式的差别只剩 HELLO 里那一位，由中继去选上游。 */
     if (len < FRAME_HEADER + 2 || frame[0] != 0xff) return;
     opcode = (unsigned)(frame[8] | (frame[9] << 8));
     if (opcode == OP_REQ_LOGIN) {
@@ -9528,6 +10705,64 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x55C260 / 0x5D9E02 / 0x5D9E0D / 0x438BD3 特征对不上）");
     }
 
+    /* bug调查/25（§57 / §58）：两处都是已修过的病的**第二处站点** —— 精灵批
+       的索引缓冲 Lock 不查返回值（§35 那条的孪生站点）、加载画面析构时
+       LobbyStage 已经没了（§81-A 那条的孪生站点）。
+       和上面那几批共用 BSHOOK_KEEP_RPT_CRASHES 开关。 */
+    if (rpt_crashes_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_RPT_CRASHES 已设，bug调查/25 那两处散崩守护也不装");
+    } else {
+        for (ticks = 0; !g_stop && !g_crash25_guards_patched && ticks < 2000; ticks++) {
+            if (try_patch_crash25_guards()) break;
+            Sleep(2);
+        }
+        if (!g_crash25_guards_patched)
+            bslog("PATCH   !! 超时未能 patch bug调查/25 的散崩守护"
+                  "（0x61186D / 0x46FE01 特征对不上）");
+    }
+
+    /* 在场证据的采样点（§62 / D53）。不赶时机 —— 窗口过程要等窗口建起来，
+       远晚于解壳窗口。装不上只是「服务端少一条证据」，不影响任何玩法，
+       所以和别的守护共用逃生门也没必要，单给一个 BSHOOK_NO_PRESENCE=1。 */
+    if (presence_disabled()) {
+        bslog("PATCH   BSHOOK_NO_PRESENCE 已设，不采集在场证据（挂机判定退回"
+              "只看服务端那几条）");
+    } else {
+        for (ticks = 0; !g_stop && !g_presence_patched && ticks < 2000; ticks++) {
+            if (try_patch_presence_input()) break;
+            Sleep(2);
+        }
+        if (!g_presence_patched)
+            bslog("PATCH   !! 超时未能 patch 在场证据采样"
+                  "（0x40EE1D 特征对不上）—— 服务端收不到键盘/前台那几条证据");
+    }
+
+    /* 移动平台相位（X_Mod §74 / §78 / D55）。两个站点都在解壳后就绪的代码里；LinkPath
+       要进图才跑、StartGame 要开打才跑，都远晚于这里。装不上只是「服务端对移动平台
+       退回开局估计」，不影响任何玩法 ⇒ 单给一个 BSHOOK_NO_MOVER_PHASE=1。 */
+    if (mover_phase_disabled()) {
+        bslog("PATCH   BSHOOK_NO_MOVER_PHASE 已设，不报移动平台相位（服务端退回开局估计）");
+    } else {
+        for (ticks = 0; !g_stop && ticks < 2000; ticks++) {
+            if (try_patch_mover_link()) break;
+            Sleep(2);
+        }
+        if (!g_mover_patched)
+            bslog("PATCH   !! 超时未能 patch 移动平台相位 ①（0x511D97 特征对不上）"
+                  "—— 服务端对移动平台退回开局估计");
+        else if (!g_mover_start_patched)
+            bslog("PATCH   !! 超时未能 patch 移动平台相位 ②（0x476463 特征对不上）"
+                  "—— 开打后的起点要等下一发周期同步（≤1 秒）才报上去");
+        /* ★ 逻辑帧时钟（D60）：两个目标函数都在战斗里才第一次跑，远晚于解壳窗口。 */
+        for (ticks = 0; !g_stop && ticks < 2000; ticks++) {
+            if (try_patch_tick_clock()) break;
+            Sleep(2);
+        }
+        if (!g_tickclk_patched)
+            bslog("PATCH   !! 超时未能装逻辑帧时钟（0x4904CC / 0x473E7C 特征对不上）"
+                  "—— 服务端对移动平台退回每秒相位外推");
+    }
+
     /* NEXON 信使（§85 / D83）：默认**整个拆掉** —— 四格 IAT 全换成自己的桩，
        登录那一发我们自己连认证服。nmcogame 一次都不被调用 ⇒ nmconew.dll
        不加载 ⇒ NMService.exe 不起（铁律 5 到这里才真的落地）。
@@ -9778,7 +11013,20 @@ static DWORD WINAPI watch_thread(LPVOID param)
         poll_login_dialog();   /* V0.2：分区单选钮 + 注册链接（里程碑 H）*/
         poll_unpack();
         Sleep(100);
-        if (++ticks % 300 == 0) {
+        ++ticks;
+        /* ★ 在场证据（§62 / D53）：每 5 秒报一发。
+           这是**遥测采样**，不是判据 —— 判据（20 / 45 秒那两条线）在服务端，
+           5 秒只决定服务端看到的分辨率。铁律 10 管的是判据里的阈值，
+           不是「隔多久抄一次表」。前台一翻转会由 sync_send_presence 自己
+           打日志，所以这里不需要再加一条「变了就立刻发」的快路。 */
+        if (g_presence_patched && ticks % 50 == 0)
+            sync_send_presence();
+        /* ★ 移动平台相位（X_Mod §74）：记表后立刻（脏标记）发一发，之后每秒一发
+           对齐时钟漂移 —— 同样是采样率不是判据。表空 / 没在战斗里时它自己什么都不发。 */
+        if (g_mover_patched
+            && (InterlockedCompareExchange(&g_mover_dirty, 0, 0) || ticks % 10 == 0))
+            sync_send_mover_phase();
+        if (ticks % 300 == 0) {
             SIZE_T commit = 0, reserve = 0, largest = 0;
             vm_snapshot(&commit, &reserve, &largest);
             bslog("--- still alive (%d s)；地址空间 已提交 %u MB / 已保留 %u MB"
@@ -9899,6 +11147,14 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
            LoadLibrary 的 APC 上，游戏一行代码都没跑，挂载 Pack\*.pkn 的那一段
            （应用初始化极早期）一定在钩子之后。见「资源目录重定向」一段。 */
         install_pack_redirect();
+
+        /* ★ 同理，GetAdaptersInfo 的护栏也必须在游戏跑起来之前装上：客户端收集
+           本机 IP 是在加载页「网络初始化中」那一步，而它**不看返回值**——
+           网卡多于 10 块时会去遍历未初始化的栈（bug调查/27）。
+           IPHLPAPI 是 BigShot.exe 的静态导入，这一刻通常已经在了；万一不在，
+           install_hooks 里还会再试一次。 */
+        compute_main_module_range();
+        install_iphlpapi_hook();
 
         ready_event = open_loader_event(POPSHOT_BSHOOK_READY_ENV);
         if (!ready_event) {

@@ -166,10 +166,13 @@ try {
         }
     }
 
-    # update.config：自动更新的下载加速代理列表（更新器 BsPatcherChn.exe 读包根
-    # config\update.config，先测速再选直连还是代理）。进 git、进包；玩家能手改，
-    # 但**不在**更新器的保护清单里 —— 代理站点常换，新版本带来的新列表比留住
-    # 玩家的手改更值（V0.3 D152）。仓库里没有就是 checkout 坏了，直接 throw。
+    # update.config：自动更新的「更新源」—— manifest 地址（从哪个仓库下游戏包）
+    # + 下载加速代理列表。★ 真正说了算的是**服务器上那一份**：更新器跑升级前
+    # 会去 GET /api/update-config 要一份，客户端包里这一份只是引导和兜底
+    # （问不到服务器时才用）。所以它**照旧不在**更新器的保护清单里 ——
+    # 代理站点常换，新版本带来的新列表比留住玩家的手改更值（V0.3bot D152）。
+    # 服务端包拿的是**同一个源文件**（build-server-package.ps1 里那句）。
+    # 仓库里没有就是 checkout 坏了，直接 throw。
     Copy-TextFile -Source (Join-Path $Root 'config\update.config') `
                   -Target (Join-Path $OutputDirectory 'config\update.config') -Kind 'unix'
 

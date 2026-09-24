@@ -13,6 +13,7 @@ logs/conn_<seq>_<port>.bin（原始）与 .txt（带时间戳 hexdump）。**只
 配合 bshook.dll 的 connect 重定向（目标改写成 127.0.0.1，端口不变）使用。
 """
 import sys, socket, threading, time, os, datetime
+import tzstamp
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGDIR = os.path.join(ROOT, "logs")
@@ -40,7 +41,7 @@ def hexdump(b, base=0):
 def handle(conn, addr, port):
     seq = next_seq()
     peer = f"{addr[0]}:{addr[1]}"
-    stamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    stamp = tzstamp.stamp(fmt="%H:%M:%S", millis=True)
     binpath = os.path.join(LOGDIR, f"conn_{seq:03d}_{port}.bin")
     txtpath = os.path.join(LOGDIR, f"conn_{seq:03d}_{port}.txt")
     print(f"[{stamp}] +++ conn#{seq} 端口{port} <- {peer}")
@@ -55,7 +56,7 @@ def handle(conn, addr, port):
                 if not data:
                     break
                 fb.write(data); fb.flush()
-                t = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                t = tzstamp.stamp(fmt="%H:%M:%S", millis=True)
                 dump = hexdump(data, total)
                 ft.write(f"\n[{t}] recv {len(data)} bytes @off {total}:\n{dump}\n"); ft.flush()
                 print(f"[{t}] conn#{seq} recv {len(data)} bytes:\n{dump}")

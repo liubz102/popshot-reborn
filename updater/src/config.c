@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "config.h"
+#include "ports.h"
 
 /* 读整个文件成宽文本（UTF-8/UTF-16 按 BOM 认，gb 兜底）。最多读 raw_cap
    字节（多的截掉）。返回长度或 -1。 */
@@ -80,7 +81,14 @@ static int read_text_file(const wchar_t *path, wchar_t *out, size_t cap)
     return read_text_file_n(path, out, cap, 65536);
 }
 
-int cfg_server_address(const wchar_t *root, wchar_t *out, size_t cap)
+/* server.config 的 key = value 扫描：# / ; 注释、BOM、CR、键名大小写不敏感，
+   同一个键出现多次以**最后一次**为准（沿用改动前的行为）。
+   找到返回 1 并把值（已去首尾空白）写进 out；没有这一行返回 0。
+
+   ★ 一次只找一个键 —— 调用方要读两个键就读两遍文件。这个文件十来 KB，
+   更新器一辈子只读这两下；换成「一趟扫多键」要多一个状态机，不值当。 */
+static int read_server_key(const wchar_t *root, const wchar_t *want,
+                           wchar_t *out, size_t cap)
 {
     wchar_t path[MAX_PATH * 2];
     static wchar_t text[32768];
@@ -88,8 +96,7 @@ int cfg_server_address(const wchar_t *root, wchar_t *out, size_t cap)
     int found = 0;
 
     path_join(path, MAX_PATH * 2, root, L"config/server.config");
-    wcscpy(out, L"192.168.1.100");                       /* config.py 同款默认 */
-    if (read_text_file(path, text, 32768) < 0) return 1;  /* 没有文件用默认 */
+    if (read_text_file(path, text, 32768) < 0) return 0;  /* 没有文件 */
 
     line = text;
     while (line && *line) {
@@ -115,24 +122,52 @@ int cfg_server_address(const wchar_t *root, wchar_t *out, size_t cap)
             while (n && (val[n - 1] == L'\r' || val[n - 1] == L' ' ||
                          val[n - 1] == L'\t')) val[--n] = 0;
         }
-        if (wide_ieq(key, L"server_address") && *val) {
-            /* [IPv6] 去括号（launch.ps1 同款）。 */
-            if (*val == L'[') {
-                wchar_t *close = wcsrchr(val, L']');
-                if (close) {
-                    *close = 0;
-                    val++;
-                    while (*val == L' ') val++;
-                }
-            }
+        if (wide_ieq(key, want) && *val) {
             wcsncpy(out, val, cap - 1);
             out[cap - 1] = 0;
             found = 1;
         }
         line = next;
     }
+    return found;
+}
+
+int cfg_server_address(const wchar_t *root, wchar_t *out, size_t cap)
+{
+    wchar_t val[256];
+    wchar_t *p = val;
+
+    wcscpy(out, L"192.168.1.100");                       /* config.py 同款默认 */
+    if (!read_server_key(root, L"server_address", val, 256)) return 1;
+    /* [IPv6] 去括号（launch.ps1 同款）。 */
+    if (*p == L'[') {
+        wchar_t *close = wcsrchr(p, L']');
+        if (close) {
+            *close = 0;
+            p++;
+            while (*p == L' ') p++;
+        }
+    }
+    if (*p) {
+        wcsncpy(out, p, cap - 1);
+        out[cap - 1] = 0;
+    }
     return 1;
-    (void)found;
+}
+
+int cfg_server_register_port(const wchar_t *root)
+{
+    wchar_t val[64];
+    int port;
+
+    /* ★ 认不出一律回缺省，绝不返回 0 或负数：这一项只决定「问不问得到
+       服务器上的 update.config」，问不到会自己退回本地那份（fail-open，
+       和 server.config 整体的哲学一致）。 */
+    if (!read_server_key(root, L"server_register_port", val, 64))
+        return POPSHOT_DEFAULT_REGISTER_PORT;
+    port = _wtoi(val);
+    if (port <= 0 || port > 65535) return POPSHOT_DEFAULT_REGISTER_PORT;
+    return port;
 }
 
 int cfg_local_version(const wchar_t *root, Ver *out)
@@ -182,10 +217,74 @@ int cfg_root_writable(const wchar_t *root)
 }
 
 /* ------------------------------------------------------------------ */
-/*  config\update.config —— 下载加速代理列表                             */
+/*  config\update.config —— 更新源（manifest 地址 + 下载加速代理列表）    */
 /* ------------------------------------------------------------------ */
 
-int cfg_parse_proxy_list(const wchar_t *text, ProxyList *out)
+/* 一行 `key = value`。返回 1 = 这一行确实是 key=value 形式（认不认得这个键
+   另说：认得就存下，不认得按老规矩计进 skipped）。
+
+   ★ 这一判定必须排在下面 take_proxy 的 http:// 判定**之前**。反过来的话
+   `manifest_url = https://…` 会因为「中间有空白」被当成一行认不出的代理
+   —— 那正是**老更新器**的行为，也正是新格式对老版本安全的原因：老版本
+   只会把这一行丢进 skipped，绝不会把它当成一个代理地址去用。 */
+static int take_key_value(const wchar_t *line, UpdateConfig *out)
+{
+    const wchar_t *eq = wcschr(line, L'=');
+    const wchar_t *kend, *val;
+    wchar_t key[64];
+    size_t klen, i;
+
+    if (!eq || eq == line) return 0;
+    kend = eq;
+    while (kend > line && (kend[-1] == L' ' || kend[-1] == L'\t')) kend--;
+    klen = (size_t)(kend - line);
+    if (klen == 0 || klen >= sizeof(key) / sizeof(key[0])) return 0;
+    /* 键名里不许有空白，也不许有 : 或 / —— 那些是地址的长相。不挡的话
+       `http://host/a=b` 这种带 = 的代理地址会被误判成一行配置。 */
+    for (i = 0; i < klen; i++) {
+        wchar_t c = line[i];
+        if (c == L' ' || c == L'\t' || c == L':' || c == L'/') return 0;
+    }
+    memcpy(key, line, klen * sizeof(wchar_t));
+    key[klen] = 0;
+
+    val = eq + 1;
+    while (*val == L' ' || *val == L'\t') val++;
+    if (wide_ieq(key, L"manifest_url")) {
+        wcsncpy(out->manifest_url, val, MANIFEST_URL_CAP - 1);
+        out->manifest_url[MANIFEST_URL_CAP - 1] = 0;
+    } else {
+        out->proxies.skipped++;          /* 认不出的键，和从前一样只是忽略 */
+    }
+    return 1;
+}
+
+/* 一行代理地址。规则和改动前逐条一致（selftest 的 proxylist_tests 钉着）。 */
+static void take_proxy(const wchar_t *s, size_t len, ProxyList *out)
+{
+    wchar_t url[PROXY_URL_CAP];
+    int i, dup = 0;
+
+    /* 只认 http(s):// 开头、长度合理、中间没有空白的一行。 */
+    if (len >= PROXY_URL_CAP ||
+        !((len > 7 && _wcsnicmp(s, L"http://", 7) == 0) ||
+          (len > 8 && _wcsnicmp(s, L"https://", 8) == 0))) {
+        out->skipped++;
+        return;
+    }
+    for (i = 0; i < (int)len; i++)
+        if (s[i] == L' ' || s[i] == L'\t') break;
+    if (i < (int)len) { out->skipped++; return; }
+    wcsncpy(url, s, len);
+    url[len] = 0;
+    while (len > 8 && url[len - 1] == L'/') url[--len] = 0;   /* 末尾 / */
+    for (i = 0; i < out->count; i++)
+        if (wide_ieq(out->url[i], url)) { dup = 1; break; }
+    if (dup || out->count >= PROXY_MAX) { out->skipped++; return; }
+    wcscpy(out->url[out->count++], url);
+}
+
+int cfg_parse_update_config(const wchar_t *text, UpdateConfig *out)
 {
     const wchar_t *p = text;
 
@@ -194,9 +293,8 @@ int cfg_parse_proxy_list(const wchar_t *text, ProxyList *out)
         const wchar_t *eol = wcschr(p, L'\n');
         const wchar_t *end = eol ? eol : p + wcslen(p);
         const wchar_t *s = p;
+        wchar_t line[MANIFEST_URL_CAP + 128];
         size_t len;
-        wchar_t url[PROXY_URL_CAP];
-        int i, dup = 0;
 
         p = eol ? eol + 1 : NULL;
         /* 去首尾空白（含 BOM、CR）。 */
@@ -206,28 +304,19 @@ int cfg_parse_proxy_list(const wchar_t *text, ProxyList *out)
                            end[-1] == L'\r')) end--;
         if (s == end || *s == L'#' || *s == L';') continue;
         len = (size_t)(end - s);
-        /* 只认 http(s):// 开头、长度合理、中间没有空白的一行。 */
-        if (len >= PROXY_URL_CAP ||
-            !((len > 7 && _wcsnicmp(s, L"http://", 7) == 0) ||
-              (len > 8 && _wcsnicmp(s, L"https://", 8) == 0))) {
-            out->skipped++;
+        if (len >= sizeof(line) / sizeof(line[0])) {
+            out->proxies.skipped++;      /* 长得离谱的一行，不看了 */
             continue;
         }
-        for (i = 0; i < (int)len; i++)
-            if (s[i] == L' ' || s[i] == L'\t') break;
-        if (i < (int)len) { out->skipped++; continue; }
-        wcsncpy(url, s, len);
-        url[len] = 0;
-        while (len > 8 && url[len - 1] == L'/') url[--len] = 0;   /* 末尾 / */
-        for (i = 0; i < out->count; i++)
-            if (wide_ieq(out->url[i], url)) { dup = 1; break; }
-        if (dup || out->count >= PROXY_MAX) { out->skipped++; continue; }
-        wcscpy(out->url[out->count++], url);
+        memcpy(line, s, len * sizeof(wchar_t));
+        line[len] = 0;
+        if (take_key_value(line, out)) continue;
+        take_proxy(line, len, &out->proxies);
     }
-    return out->count;
+    return out->proxies.count;
 }
 
-int cfg_proxy_list(const wchar_t *root, ProxyList *out)
+int cfg_update_config(const wchar_t *root, UpdateConfig *out)
 {
     wchar_t path[MAX_PATH * 2];
     static wchar_t text[16384];          /* 只在 worker 线程里用，且只用一次 */
@@ -235,7 +324,23 @@ int cfg_proxy_list(const wchar_t *root, ProxyList *out)
     memset(out, 0, sizeof(*out));
     path_join(path, MAX_PATH * 2, root, L"config/update.config");
     if (read_text_file_n(path, text, 16384, 65536) < 0)
-        return 0;                        /* 没有文件 = 只用直连 */
-    cfg_parse_proxy_list(text, out);
+        return 0;                        /* 没有文件 = 只用直连 + 内置地址 */
+    cfg_parse_update_config(text, out);
     return 1;
+}
+
+int cfg_parse_proxy_list(const wchar_t *text, ProxyList *out)
+{
+    UpdateConfig uc;
+    cfg_parse_update_config(text, &uc);
+    *out = uc.proxies;
+    return out->count;
+}
+
+int cfg_proxy_list(const wchar_t *root, ProxyList *out)
+{
+    UpdateConfig uc;
+    int got = cfg_update_config(root, &uc);
+    *out = uc.proxies;
+    return got;
 }

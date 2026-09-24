@@ -72,6 +72,7 @@ import eventlog
 import logcleanup
 import lobby as lobby_module
 import mapdata
+import tzstamp
 # ★ `SESSION_STATUS_WAITING` 不从 lobby 导入：本模块下面有一份带完整考据的
 #   同名常量（V0.1 §102），两处值必须一样，import 进来只会让人以为它只有一处定义。
 from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
@@ -5731,16 +5732,19 @@ NOISY_OPCODES = {
 
 
 def ts():
-    """日志行的时间戳。**带完整日期**（用户 2026-09-14）。
+    """日志行的时间戳。**带完整日期 + 时区**（用户 2026-09-14 / 2026-09-20）。
 
     以前只有 `HH:MM:SS.mmm`：玩家把几行日志贴回来、或者事后翻归档，
     都判断不出是哪一天的。`server.out` 现在按天切分（`daylog.py`），文件名
     已经带日期了，但**单独一行被复制出去时文件名就跟不过去** —— 排查问题时
     贴的恰恰就是单独几行，所以日期得写进行里。
+    ★ 后面那个 `UTC+8` 是 2026-09-20 加的：崩溃包来自玩家机器、打包戳来自
+    开发机、这份日志来自服务器，三台机器三个时区，不写出来就会比反
+    （bug调查/25，`server/tzstamp.py` 的文件头记了那次踩坑）。
     `authserver` / `relay` / `eventlog` 的 `ts()` 必须和这里一模一样，
     不然几份日志按时间对不上。
     """
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    return tzstamp.stamp(millis=True)
 
 
 def hexdump(b, maxlen=512):
@@ -5866,7 +5870,8 @@ def reset_sync_trails(room, why, new_match=False):
         if trail:
             trail.clear()
         conn.sync_jumped = 0
-        conn.sync_jump_pending = 0
+        conn.sync_jump_ticks = ()
+        conn.sync_trail_at = None
         # ★ 换图 / 新一局客户端会把角色重建，蹲的状态跟着归零（`0x4ffc4a`），
         #   服务端这份记账也要一起清，否则 bot 会照着上一张图的姿势起步。
         conn.sync_crouch = False
@@ -5888,6 +5893,15 @@ def reset_sync_trails(room, why, new_match=False):
         if new_match:
             conn.dead_since = None
             conn.afk_when_down = False
+        # ★★ **在场证据那几格一个都不清**（`presence_*`，2026-09-21）：
+        #   上面两条钟要清，是因为它们的证据（`0x040e`、打中 / 捡到）本来就
+        #   **只在一张图之内有意义**；而在场证据说的是「这个人在不在机器前」，
+        #   跟换不换图、开不开新局毫无关系 —— 人没走开，换张图他也还是没走开。
+        #   清了就是 D53 说的「削弱」：挂机号每 106 秒一局（§61），每局重新攒
+        #   一遍 `PRESENCE_AFK_AFTER_S`，正好把第五轮 `afk_carried` 专门治的
+        #   那种「管理页上一局一局地闪」又造回来。
+        #   反过来「他回来了」照样是**事件驱动**的：他一动键盘，下一发上报就把
+        #   档位翻成「在玩」，`presence_since` 当场重锚，判定立刻撤销。
         # ★ 开火记录跟着清（§92）：上一张图的弹道配不上这一张图的爆点，
         #   留着只会让击退方向偶尔配错一发。
         shots = getattr(conn, "peer_shots", None)
@@ -5921,6 +5935,11 @@ def _relay_fallback(member, udp_packet):
 # ---------------------------------------------------------------------------
 # ★★★★★ 房间的 32 ms 战斗循环（V0.3 D106 —— **废止 D17**）
 # ---------------------------------------------------------------------------
+#: 逻辑帧时钟（D60）每条连接最多留几帧 / 几颗弹的出膛记录。**只是内存上界**，不是时序阈值：
+#: 一颗弹最多推 `bot.BOT_SHELL_TICK_CEILING`（20 s = 625）格，1024 帧够它活到底；
+#: 出膛表按到达顺序挤掉最老的，同时在飞的弹不会有这么多。
+TICK_CLOCK_KEEP = 1024
+
 #: 一发 bot 心跳隔几个物理 tick。`4 × 32 ms = 128 ms`，就是真人客户端自己那个
 #: 节奏（语料 ~8 Hz）。
 #:
@@ -6531,6 +6550,173 @@ AFK_AFTER_S = 20.0
 AFK_SOLO_AFTER_S = 45.0
 
 
+#: ★ 在场证据分档（bug调查/25）。★★ **2026-09-21 起这几档真的参与判定了**
+#: （用户拍板的三步走的第 3 步，见 `conn_presence_afk()`）。
+#:
+#: 排序是**从最像挂机到最像真人**，第一个成立的就是它的档：
+#:
+#: * `后台`   —— 游戏窗口压根不在前台。用户 2026-09-20：真人玩游戏不会把窗口
+#:   丢到后台（原版自己也认这件事：`WM_ACTIVATEAPP` 一失活就把 BGM 静音）。
+#: * `人不在` —— `GetLastInputInfo()` 说这台机器整机多久没人碰过。
+#:   `PostMessage` 类连点器伪造不了它。
+#: * `都没动` —— 整机有人在按，但**游戏窗口**键盘鼠标两边都没动静。
+#:   方向键 / 鼠标移动刷得动 `GetLastInputInfo`、刷不动这两格，脚本的形状。
+#: * `只有鼠标` —— 键盘没动过、只有鼠标键在响。连点器的典型形状；
+#:   和 `INPUT_PEER_OPCODES` 故意排除 `rpFire` 是同一个理由。
+#: * `只有键盘` —— ★★ **反过来那一半**（bug调查/26）：鼠标键没响过、只有键盘
+#:   在动。**开火就是鼠标左键**（见 `INPUT_PEER_OPCODES` 上面那段），所以
+#:   「人在图里、分数在涨、却一分钟没抬过鼠标键」这件事真人身上不成立。
+#:   328800963 正是这个形状：8 小时 268 局得分 6461 次，鼠标键**一次没抬过**。
+#: * `在玩`   —— 键盘和鼠标键最近都动过。
+PRESENCE_BUCKETS = ("后台", "人不在", "都没动", "只有鼠标", "只有键盘", "在玩")
+
+#: 「像挂机」的那几档 —— 用户 2026-09-21 拍板**除了「在玩」全判**。
+#: ★ `只有键盘` / `都没动` 是当天晚上补的（bug调查/26），同一条口径。
+#:
+#: ★ 原先「只有鼠标」那一档有个已知误判面：hook 只排掉了 ←↑→↓，而
+#:   A/W/S/D/Q/E/空格 是**同一组轴的别名**（§67）—— 用方向键走位的真人键盘
+#:   证据一直是陈的，会落进这一档。改成白名单（`presence_game_key()`，
+#:   十一个移动键一个不少）之后这条误判面**没有了**：人在操作角色，
+#:   键盘那一格就是新鲜的。
+#:
+#: ★ 从 `PRESENCE_BUCKETS` **切出来**，不手抄第二份：那张表就是按「从最像挂机
+#:   到最像真人」排的，最后一个是 `在玩`。以后往中间插一档，它要么自动进判定、
+#:   要么得有人明确把它挪到 `在玩` 后面去 —— 不会出现「新加了一档谁都不认」。
+#:   （和 `web/admin.py` 的 `_idle_places()` 是同一个套路。）
+PRESENCE_AFK_BUCKETS = frozenset(PRESENCE_BUCKETS[:-1])
+
+#: 分档用的三条线（**毫秒**）。注意它们量的是「客户端**采样那一刻**已经闲了
+#: 多久」（`GetLastInputInfo` 的回溯量），和下面 `PRESENCE_AFK_AFTER_S` 量的
+#: 「服务端**看见**这一档保持了多久」锚点不同，**不是接力、不要相加着看**。
+PRESENCE_IDLE_MS = 60_000
+PRESENCE_KB_MS = 60_000
+#: ★ 鼠标键那条**沿用键盘那条**，不另立一个数：两者是同一来源（游戏窗口的
+#: `WM_*BUTTONUP` / `WM_KEYUP`）、同一量纲（「这一格输入多久没来过」），
+#: 判据同源（D53）⇒ 不需要重新标定。
+PRESENCE_MOUSE_MS = PRESENCE_KB_MS
+
+#: 客户端多久报一发在场证据（秒）。★ 这是 `hook/bshook.c` 的 `watch_thread`
+#: 里 `ticks % 50`（`Sleep(100)`）的镜像 —— 下面两条线都是从它推出来的，
+#: 不是从某台机器上量出来的观测值。改了那边这里要跟着改。
+PRESENCE_REPORT_S = 5.0
+
+#: 档位落在「像挂机」那几档上，**连续保持多久**才真的判成挂机（秒）。
+#:
+#: ★ 直接沿用 `AFK_AFTER_S` 那条线，不另立一个数：「20 秒里一个键盘事件都没有
+#:   = 挂机」是用户 2026-09-14 一天里调了三次定下来的，「20 秒里窗口一直不在
+#:   前台 = 挂机」是同一量纲、同一语义 ⇒ **不用重新标定**（D53 的「判据同源」）。
+#:
+#: ★ 真正只靠这条线的是 `后台` —— `foreground` 是个布尔，翻转是瞬时的，
+#:   不防抖的话「切出去看一眼消息再切回来」就会在管理页上闪一下。
+#:   `人不在` / `只有鼠标` 两档自己已经带了 60 秒的回溯量（见上面那两条）。
+#:
+#: ★ 这是铁律 10 那条例外的**更干净的形态**：起点是「档位翻转」这个**事件**
+#:   （`presence_since`），撤销也是「翻回 `在玩`」这个事件 —— 下一发上报一到
+#:   当场生效，不等任何定时器。只有「这一档还在持续」本身没有事件可等。
+#:   同一档重复报**不动**那个时间戳，所以丢包既不重置也不加速。
+PRESENCE_AFK_AFTER_S = AFK_AFTER_S
+
+#: 最后一发证据多旧就当**没有证据**（秒）= 连丢 6 发。
+#:
+#: ★★ 铁律 10 的例外，理由写清楚：**UDP 没有 FIN**。客户端被杀、hook 没装上、
+#:   `BSHOOK_NO_PRESENCE=1`、防火墙把旁路拦了，全都是静默的 —— 「这条流停了」
+#:   物理上没有对应事件，只能靠「该来的那几发没来」推。数字从协议自己的周期
+#:   （`PRESENCE_REPORT_S`）推，容忍连丢 6 发；同一条论证在
+#:   `udpsync.DEAD_AFTER_S` 上已经用过一次（那条是 8 Hz 心跳流，周期差一个量级）。
+#:
+#: ★ 过期一律退回「**没有证据**」，不是冻结在最后那一档：「收不到」证明不了
+#:   「他在挂机」—— 和「从没收到过」必须一个待遇，否则会出现「老客户端（从不报）
+#:   比新客户端（断流 30 秒）待遇还好」这种说不通的规矩。
+PRESENCE_STALE_AFTER_S = PRESENCE_REPORT_S * 6
+
+
+def presence_age_text(ms):
+    """`123456 -> "123 秒前"`，`PRESENCE_NEVER -> "从没有过"`，`None -> "?"`。"""
+    if ms is None:
+        return "?"
+    if ms == udpsync.PRESENCE_NEVER:
+        return "从没有过"
+    return "%d 秒前" % (ms // 1000)
+
+
+def _presence_stale(ms, line):
+    """这一格输入「已经多久没来过」够不够 `line` 毫秒。
+
+    `None` = 这一格没报上来（老客户端 / 解析没解出来）⇒ **当没这条信息**，
+    不算过期 —— 和 `conn_presence_afk()` 的 `None` 一个哲学。
+    `PRESENCE_NEVER` = 本次连接从来没有过，那是最陈的一种。
+    """
+    if ms is None:
+        return False
+    return ms == udpsync.PRESENCE_NEVER or ms >= line
+
+
+def presence_bucket(conn):
+    """这条连接的在场证据落在哪一档；没收到过证据回 `None`。"""
+    if getattr(conn, "presence_at", None) is None:
+        return None
+    if not conn.presence_fg:
+        return "后台"
+    if _presence_stale(conn.presence_sys_ms, PRESENCE_IDLE_MS):
+        return "人不在"
+    # ★★ 键盘和鼠标**各看各的**（bug调查/26）：原先只看键盘，于是「键盘每隔
+    #   不到一分钟被按一下、鼠标键 8 小时一次没抬过」这种形状被判成「在玩」。
+    #   开火是鼠标左键，进了图还一分钟不碰鼠标键的真人是不存在的。
+    kb_stale = _presence_stale(conn.presence_kb_ms, PRESENCE_KB_MS)
+    mouse_stale = _presence_stale(conn.presence_mouse_ms, PRESENCE_MOUSE_MS)
+    if kb_stale and mouse_stale:
+        return "都没动"
+    if kb_stale:
+        return "只有鼠标"
+    if mouse_stale:
+        return "只有键盘"
+    return "在玩"
+
+
+def conn_presence_afk(conn, now=None):
+    """**客户端**报上来的在场证据说他在不在挂机。
+
+    三态，`None` 最要紧：
+
+    * `None` —— **没有可用的证据**，这条判据整个不参与，退回服务端那两条钟。
+      老客户端 / 没有中继 / UDP 被防火墙挡 / `BSHOOK_NO_PRESENCE=1` 起的客户端
+      全都走这儿。★ 「收不到」绝不能当成「他挂机」。
+    * `False` —— 证据说他在玩。
+    * `True` —— 落在 `PRESENCE_AFK_BUCKETS` 里，**而且这一组已经稳住了
+      `PRESENCE_AFK_AFTER_S`**（★ 起点是「翻进这一**组**」，组内换档不重锚，
+      见 `note_presence()`）。
+
+    为什么非要客户端报（§61 / §62 / D53）：**单人任务房里服务端是瞎的**。
+    房里只有他一个人，客户端就不发 `0x040e`，键盘那条判据整个不存在，只剩
+    「打中 / 捡到 / 得分」。328800963 开着连点器，分数每 1.5 秒涨一次 ——
+    证据比真人还多，连续 18 小时显示「游戏中·任务」。这四个数正是服务端
+    结构上够不着的那一维。
+
+    ⚠ **一格证据只够抓一种形状**（bug调查/26）：第一版只把键盘那一格接进
+    分档，于是「每局按一次键、鼠标键 8 小时一次没抬过」照样显示「游戏中」。
+    四格各看各的之后才盖住反过来那一半，见 `presence_bucket()`。
+
+    ★★ **断流之后退回「没有证据」，不冻在最后那一档**（`PRESENCE_STALE_AFTER_S`
+    那一段注释写了为什么）。这里**只读不清** —— 定时把字段清掉本身就是一次
+    定时器驱动的状态变更（铁律 10），而且流恢复之后还会让同一档重新刷一行日志。
+    """
+    at = getattr(conn, "presence_at", None)
+    if at is None:
+        return None                 # 从没收到过 ⇒ 当没这条信息
+    now = time.monotonic() if now is None else now
+    if (now - at) > PRESENCE_STALE_AFTER_S:
+        return None                 # 断流 ⇒ 和「从没收到过」一个待遇
+    bucket = getattr(conn, "presence_logged", None)
+    if bucket is None:
+        return None                 # 兜底：存了证据却没分出档
+    if bucket not in PRESENCE_AFK_BUCKETS:
+        return False
+    since = getattr(conn, "presence_since", None)
+    if since is None:
+        return False                # 刚翻上来还没锚住，当没稳住
+    return (now - since) > PRESENCE_AFK_AFTER_S
+
+
 def conn_afk_clock_expired(conn, now=None):
     """光看**钟**到没到期，不管他是不是躺着。
 
@@ -6585,10 +6771,28 @@ def conn_is_afk(conn, now=None):
 
     ★ bot 永远判不出挂机：它的同步包是服务端自己合成的，不走
     `note_player_input()` 那条路，`last_input_at` 一直是 `None`。
+    （在场证据那条同理：bot 不走 UDP 旁路，`presence_at` 恒为 `None`。）
+
+    ## ★★ 客户端在场证据这一条（2026-09-21 接上，§62 / D53）
+
+    `conn_presence_afk()` 说挂机就是挂机 —— 它看的是**服务端结构上看不见**的
+    那一维（窗口在不在前台 / 这台机器前面有没有人 / 键盘动过没有），
+    正是单人任务房里唯一还剩的证据。
+
+    **但它只补不削**：presence 回 `False`（「在玩」）时**不会**把下面两条钟
+    已经判出来的挂机洗白。理由是那两条钟问的是「他在玩**这一局**吗」，
+    而 presence 只能证明「他人在机器前按过键」—— 拿后者推翻前者，就是 D53
+    明确否掉的「削弱服务端那条」。所以这里只有 `is True` 一支。
+
+    ★ 顺序：排在 `dead_since` / `afk_carried` **后面**。躺着那一段整个判定是
+      冻住的（第四 / 第六轮定的），presence 不能把它捅开 —— 死人按不了键，
+      但他人**可能**还好好地坐在前台看着。
     """
     if getattr(conn, "dead_since", None) is not None:
         return bool(getattr(conn, "afk_when_down", False))
     if getattr(conn, "afk_carried", False):
+        return True
+    if conn_presence_afk(conn, now) is True:
         return True
     return conn_afk_clock_expired(conn, now)
 
@@ -6665,6 +6869,9 @@ def note_seat_respawned(room, seat, now=None):
     if dead_since is None or conn.last_input_at is None:
         return
     now = time.monotonic() if now is None else now
+    # ★ 只拨游戏内那条钟。**`presence_since` 不拨**（2026-09-21）：要拨是因为
+    #   「他按没按键」这件事躺着的时候被游戏暂停了；而「人在不在机器前」躺着
+    #   的时候并没有暂停 —— 他该走开还是走开了。拨了就是重复补偿。
     conn.last_input_at += max(0.0, now - dead_since)
 
 
@@ -6851,6 +7058,16 @@ class Conn:
     #   这两个标志必须在类上也有一份默认，否则新代码一碰就 AttributeError。
     send_broken = False
     last_relay_reissue_at = 0.0
+    # ★ 账号名和连接号同理 —— **这两格是拿真事故换来的**（2026-09-21）：
+    #   `note_presence()` 的日志自己手抄了一遍 `online_debug()` 的前缀，抄出
+    #   `self.cid`（`Conn` 上压根没有这个名字）和 `self.username`（应该是
+    #   `account_name`）。`%` 元组在 `eventlog.debug()` **之前**求值，于是每次
+    #   档位翻转都抛一次 AttributeError，被 `udpsync._on_presence` 的
+    #   `except Exception` 吞掉 —— 「在场证据」那行日志一行都没写出来过。
+    #   单测查不出来，是因为夹具手写了 `conn.cid` / `conn.username`。
+    #   有了这两格，「日志引用了一个裸 `Conn` 没有的属性」在单测里就藏不住了。
+    account_name = None
+    seq = None
     # 版本门禁的两个状态同理（见 __init__ 里的说明）。
     client_version = None
     version_rejected = False
@@ -6876,7 +7093,8 @@ class Conn:
     #   测试夹具会走到这一步，正常连接在 `__init__` 里就建好了）。
     sync_trail = ()
     sync_jumped = 0
-    sync_jump_pending = 0
+    sync_jump_ticks = ()
+    sync_trail_at = None
     sync_crouch = False
     # ★ 「这条连接报过几个位置点」。bot 的帧循环拿它当**事件**（V0.3 §32）：
     #   号变了 = 这个真人报了一个新位置 = bot 该走一帧了。只增不减、不回绕
@@ -6902,6 +7120,46 @@ class Conn:
     dead_since = None
     afk_when_down = False
     afk_carried = False
+    # ★★ 在场证据（bug调查/25，用户 2026-09-20）。客户端 `bshook` 每 5 秒经
+    #   UDP 旁路报一发，内容见 `udpsync.MSG_PRESENCE`。**服务端结构上看不到
+    #   这四件事** —— 单人局连 `0x040e` 都没有，键盘那条判据整个不存在。
+    #   `presence_at`     = 最后一发证据到达的 `time.monotonic()`；`None` = 从
+    #     没收到过（老客户端 / 没有中继 / UDP 被挡）⇒ **一律当没这条信息**，
+    #     绝不能当成「他挂机」。
+    #   `presence_kb_ms`  = 距上次**局内游戏键** `WM_KEYUP` 的毫秒（白名单，
+    #     见 hook 的 `presence_game_key()`；F5 一类的菜单键不算，§67）；
+    #     `udpsync.PRESENCE_NEVER` = 本次连接从来没按过。
+    #   `presence_mouse_ms` / `presence_sys_ms` = 鼠标键 / 这台机器（`GetLastInputInfo`）。
+    #   `presence_fg`     = 游戏窗口在不在前台（原版靠同一个消息把 BGM 静音）。
+    #   ★★ 2026-09-21 起这几格**真的参与判定**（`conn_presence_afk()`），
+    #     不再是「只记不判」。
+    presence_at = None
+    presence_kb_ms = None
+    presence_mouse_ms = None
+    presence_sys_ms = None
+    presence_fg = None
+    presence_flags = 0
+    #: 现在这一档（`presence_bucket()` 的结果）。日志去重认的就是它。
+    presence_logged = None
+    #: **「像挂机」这一组**是什么时候翻上来的（`time.monotonic()`）。
+    #: 同一档重复报**不动**它（丢包既不重置也不加速判定）；★ 组内换档
+    #: （`人不在` ↔ `只有键盘` …）**也不动它**，见 `note_presence()`。
+    presence_since = None
+    #: ★ 移动平台相位（X_Mod §74 / §78 / D55）：`{路径句柄: (收到时刻, 起点后毫秒, t_off, t0)}`，
+    #:   `note_mover_phase()` 存、`bot._mover_clock()` 读。`None` = 这一局还没报过
+    #:   （没中继 / UDP 被挡）⇒ bot 退回「开局估计」。发出 `0x0400`
+    #:   （这一局开始载图）时清空 —— hook 是载图**收尾**才报，所以清在它前面。
+    #:   `t0` 是客户端那一格起点本身，只拿来判「起点换了没有」（开打时 StartGame
+    #:   会整体重取一遍，§78）。
+    mover_phase = None
+    mover_phase_at = None
+    #: ★ 逻辑帧时钟（X_Mod §81 / D60）：`tick_clock` = `{帧号: 该帧 Timer()}`（按到达顺序，
+    #:   只留最近 `TICK_CLOCK_KEEP` 帧），`tick_latest` = 帧号最大的那一条 `(帧号, Timer)`，
+    #:   `shell_birth` = `{弹体句柄: 出膛帧号}`（只留最近 `TICK_CLOCK_KEEP` 颗）。
+    #:   `note_tick_clock()` 存、`bot._mover_clock()` 读；和 `mover_phase` 一起在 `0x0400` 清。
+    tick_clock = None
+    tick_latest = None
+    shell_birth = None
     #: ★ 诊断（`note_human_fire`）的类级默认 —— 控制通道造的假连接也得有。
     human_fire_logged = frozenset()
     #: ★ 这条连接**本图打出去、还没配上爆炸**的几发 `rpFire`（V0.3 §92）。
@@ -7064,12 +7322,14 @@ class Conn:
         # 上一发心跳之后收到过的 rpJump 段数（0 = 没跳）。下一发心跳把它
         # 记进轨迹点，bot 回放到那儿时就跟着跳一下。
         self.sync_jumped = 0
-        # ★★ **还没被逐格外推吃掉的那一下起跳**（V0.3 §173）：收方收到
-        #   `rpJump` 当场就让那个角色离地，服务端替 bot 判命中时用的
-        #   `bot._advance_humans()` 也得当场跟上 —— 等下一发心跳才跟，
-        #   那一段（实测中位 38 px、最大 103 px）里服务端还以为人站在地上，
-        #   于是「我跳起来躲开了，屏幕上也躲开了，却照样掉血」。
-        self.sync_jump_pending = 0
+        # ★★ **还没被逐格外推吃掉的起跳**（V0.3 §173 / X_Mod §85）：`((离最近那发心跳
+        #   第几个逻辑帧, 第几段跳), …)`。`bot._advance_humans()` 按这个帧号把起跳排到
+        #   **对的那一格**上 —— 不等下一发心跳（那一段里服务端还以为人站在地上，实测中位
+        #   差 38 px），也不能收到就跳（客户端起跳那一帧先走完这一步，早一格差 ~20 px）。
+        self.sync_jump_ticks = ()
+        # 最近那发心跳**到达**的时刻（`time.monotonic()`）。起跳离它几帧、他自己那条鱼在那一帧
+        # 的相位，都从这一刻起算（X_Mod §85）。
+        self.sync_trail_at = None
         # ★ 他现在蹲着没有。`rpCrouch`(0x000b) 只在按下 / 松开各来一发，
         #   中间的每一发心跳都照这个状态记进轨迹点（V0.3 §41）。
         self.sync_crouch = False
@@ -7245,6 +7505,15 @@ class Conn:
         opcode = int.from_bytes(plain[8:10], "little")
         kind = EPOCH_ADVANCING_OPS.get(opcode)
         if kind is not None:
+            if kind == "battle":
+                # ★ `0x0400` = 这一局开始载图：上一局的移动平台相位作废（X_Mod §74 /
+                #   D55）。hook 在载图**收尾**才报新的，所以清在这儿不会把新的清掉。
+                self.mover_phase = None
+                self.mover_phase_at = None
+                # 逻辑帧时钟同理（D60）：帧号是每个 Stage 从 0 数的，上一局的一条都不能留。
+                self.tick_clock = None
+                self.tick_latest = None
+                self.shell_birth = None
             relayserver.epoch_state(self).advance(self.room_generation(kind))
             return
         if opcode == EPOCH_ASSIGNING_OP and len(plain) >= 12:
@@ -10862,8 +11131,11 @@ class Conn:
         self.last_action_at = time.monotonic() if now is None else now
         self.afk_carried = False
 
-    def note_sync_position(self, payload):
+    def note_sync_position(self, payload, arrived=None):
         """把这一发同步数据里的**位置**记进轨迹（V0.3 M3）。
+
+        `arrived` = 这一发到达的时刻（`time.monotonic()`，`forward_peer_data` 传进来）；
+        不给就现取。起跳离最近那发心跳几帧就拿它俩相减（X_Mod §85）。
 
         三种包各记一半：
 
@@ -10885,14 +11157,22 @@ class Conn:
         ★ 只记事实，不做判断。要不要跟、跟多远是 `bot.py` 的事。
         """
         opcode = udpsync.peer_opcode(payload)
+        now = time.monotonic() if arrived is None else arrived
         if opcode == PEER_OP_JUMP:
             if len(payload) >= udpsync.PEER_HEADER_SIZE + 2:
                 self.sync_jumped = payload[udpsync.PEER_HEADER_SIZE + 1]
-                # ★★ 同一发还要**立刻**让逐格外推那份身体离地（V0.3 §173）。
-                #   `sync_jumped` 是给「bot 回放这条轨迹」用的（下一发心跳
-                #   才消费），这一格是给「服务端此刻认为人在哪」用的 ——
-                #   两者的消费者和时机都不一样，不能合并成一个。
-                self.sync_jump_pending = self.sync_jumped or 1
+                # ★★ 同一发还要排给逐格外推那份身体（V0.3 §173）。`sync_jumped` 是给
+                #   「bot 回放这条轨迹」用的（下一发心跳才消费），这一格是给「服务端此刻
+                #   认为人在哪」用的 —— 两者的消费者和时机都不一样，不能合并成一个。
+                # ★★★ 记的是**离最近那发心跳第几个逻辑帧**（X_Mod §85）：两发从同一台机器、
+                #   同一条有序流过来，到达时刻之差就是发出时刻之差（单程延迟相减抵消），
+                #   按客户端 32 ms 的逻辑帧网格数一下就是帧号差。
+                ticks = 0
+                if self.sync_trail_at is not None:
+                    ticks = max(0, int(round((now - self.sync_trail_at)
+                                             / roomclock.TICK_S)))
+                self.sync_jump_ticks = self.sync_jump_ticks + (
+                    (ticks, self.sync_jumped or 1),)
             return
         if opcode == PEER_OP_CROUCH:
             # ★ 蹲是**状态**不是事件（和 rpJump 相反）：`rpCrouch` 只在按下 /
@@ -10930,10 +11210,11 @@ class Conn:
                                     udpsync.heartbeat_keys(payload) or 0))
         self.sync_trail_seq += 1
         self.sync_jumped = 0
-        # ★★ 这一发心跳里的坐标 / 速度**已经带着那一跳**了（他是先发
-        #   `rpJump` 再发心跳的，同一条有序流）—— 外推那份马上就要被硬置
-        #   成它，欠着的那一下到此为止，再补一次就变成跳两下（§173）。
-        self.sync_jump_pending = 0
+        self.sync_trail_at = now
+        # ★★ 这一发心跳里的坐标 / 速度**已经带着那一跳**了（排序闸门保证先于它发出的
+        #   `rpJump` 先到）—— 外推那份马上就要被硬置成它，欠着的到此为止，
+        #   再补一次就变成跳两下（§173）。
+        self.sync_jump_ticks = ()
 
     def sync_peer_epoch(self, payload):
         """局号一变就把排序闸门里的**事件计数**归零（`udpsync` 铁律 3）。
@@ -10952,6 +11233,151 @@ class Conn:
         if game_id != self.peer_order_epoch:
             self.peer_order_epoch = game_id
             self.peer_order.new_epoch()
+
+    def note_presence(self, kb_ms, mouse_ms, sys_ms, foreground, flags=0,
+                      now=None):
+        """在场证据到了（`udpsync.MSG_PRESENCE`，bug调查/25）。
+
+        为什么非要客户端报：**单人任务房里服务端是瞎的**。房里只有他一个人，
+        客户端就不发 `0x040e`，键盘那条判据整个不存在，只剩「打中 / 捡到 /
+        得分」。328800963 开着连点器，分数每 1.5 秒涨一次 —— 证据比真人还多，
+        连续 18 小时显示「游戏中·任务」。这四个数正是服务端够不着的那部分。
+
+        判定本身在 `conn_presence_afk()`（2026-09-21 接上）。这里只负责
+        **存下来 + 认出档位翻转**。
+
+        ★ 「档位翻转」是这一整条判据唯一的**事件**（铁律 10）：
+          日志靠它去重（档位没变就一个字不写 —— 一条连接一天能收上万发，
+          按次数或时间窗去重要么刷屏要么漏掉翻转）。
+
+        ★★ 但**计时的起点比日志粗一档**（bug调查/26）：`presence_since` 锚的是
+          「翻进 / 翻出『像挂机』那一组」，组内换档（`人不在` ↔ `只有键盘`）
+          日志照写、起点**不动**。判据要的事件是「他回来了」，不是
+          「他走开的姿势变了」—— 按后者重锚等于每翻一次白送一轮宽限。
+
+        ★★ **断流之后重新报 = 也算一次翻转**：中间那一段我们什么都不知道，
+          不能拿断流之前的那个起点接着数（「收不到」证明不了「他一直挂着」）。
+          所以恢复之后重新攒 `PRESENCE_AFK_AFTER_S`，和「刚连上来」一个待遇。
+
+        ★ `now` 只给测试注入用；生产路径不传，取 `time.monotonic()`。
+          和 `note_player_action()` / `note_seat_died()` 同一套约定。
+          ⚠ `udpsync._on_presence` 按位置传前 5 个参数，别往前面插形参。
+        """
+        now = time.monotonic() if now is None else now
+        was_at = self.presence_at
+        self.presence_at = now
+        self.presence_kb_ms = kb_ms
+        self.presence_mouse_ms = mouse_ms
+        self.presence_sys_ms = sys_ms
+        self.presence_fg = bool(foreground)
+        self.presence_flags = flags
+        resumed = was_at is None or (now - was_at) > PRESENCE_STALE_AFTER_S
+        bucket = presence_bucket(self)
+        if bucket == self.presence_logged and not resumed:
+            return
+        # ★★ **起点锚的是「翻进『像挂机』那一组」，组内换档不重锚**
+        #   （bug调查/26）。原先每次档位翻转都重锚，于是在几档「像挂机」之间
+        #   来回翻的人**每翻一次白拿 `PRESENCE_AFK_AFTER_S` 秒**：
+        #   328800963 每局按一次键，`只有键盘` → （键盘也过期）`人不在` →
+        #   下一次按键又翻回 `只有键盘`，一直没离开过「像挂机」这一组，
+        #   却因为一直在重锚而始终攒不满。
+        #   ⇒ 判据要的事件是「他回来了 / 他走开了」，不是「他走开的**姿势**变了」。
+        stayed_afk = (not resumed
+                      and self.presence_logged in PRESENCE_AFK_BUCKETS
+                      and bucket in PRESENCE_AFK_BUCKETS)
+        # ★★ 这几行必须排在下面那发日志**之前**：日志里的 `%` 元组是在调用
+        #   `eventlog.debug()` 之前求值的，它一抛，排在后面的赋值一次都跑不到
+        #   —— 2026-09-20 的 `self.username` 就是这么把整条遥测弄哑的。
+        self.presence_logged = bucket
+        if not stayed_afk:
+            self.presence_since = now
+        # ★ 走 `online_debug()` 而不是自己拼 `eventlog.debug("游戏服 #…")`：
+        #   `游戏服 #N` 那个前缀只有它一处在拼（用的是 `self.seq`）。
+        #   2026-09-20 那一版手抄了一遍前缀，抄出两个 `Conn` 上根本没有的
+        #   属性（`self.cid` / `self.username`），整条遥测因此哑了。
+        #   档次也正好对：频率由定时器决定的归 `online_debug`（D112）。
+        self.online_debug(
+            "在场证据 账号=%r -> %s（键盘 %s / 鼠标 %s / 这台机器 %s"
+            "；窗口%s前台）"
+            % (self.account_name or "?", bucket,
+               presence_age_text(kb_ms), presence_age_text(mouse_ms),
+               presence_age_text(sys_ms), "在" if self.presence_fg else "**不在**"))
+
+    def note_mover_phase(self, game_now, wall_now, entries, now=None):
+        """移动平台相位到了（`udpsync.MSG_MOVER_PHASE`，X_Mod §74 / §78）。
+
+        每条 `(link, t0, t_off)`：`link` = 路径对象的句柄（= `mapdata.Mover.handle`），
+        `t0` = 客户端这一刻那个对象的起点（`[obj+0x90]`，hook 发包时现读），`game_now` =
+        发包那一刻的 `Timer()`。存下来的是「起点后毫秒」= `game_now − t0`（32 位回绕后
+        按有符号读 —— 客户端 `Path::Eval` 也是有符号取模）和收到的时刻，
+        `bot._mover_clock()` 用「起点后毫秒 + 从收到到现在」推算此刻的相位。
+        **只存事实**，谁的相位算数在 bot 那边（D55）。
+
+        ★ 起点会变：载图时 `LinkPath` 取一次，开打时 `GameContext::StartGame` 把所有
+          移动平台**整体重取**一次（§78）—— 战斗里算数的是后一个。hook 每一发都现读，
+          所以直接用最新那一发就是对的，这里不用分辨是哪一个。
+        ★ 日志按**起点翻转**打：这一局第一发（从 `None` 变成有）、以及之后任何一条路径的
+          `t0` 变了（开打重取）各一行，带上 `game_now − wall_now`（客户端 `Timer()` 和墙钟
+          差多少，§74 要的数）。之后每秒一发、起点没变的全部静默。
+          ⚠ 会话 33 只打「这一局第一发」—— 那一发是**载图时**的起点，开打后被重取了也
+          看不出来，§78 就是被它误导的。
+        ★ `now` 只给测试注入用，和 `note_presence()` 同一套约定。
+          ⚠ `udpsync._on_mover_phase` 按位置传前 3 个参数，别往前面插形参。
+        """
+        if not entries:
+            return
+        now = time.monotonic() if now is None else now
+        phase = {}
+        for link, t0, t_off in entries:
+            since = (int(game_now) - int(t0)) & 0xFFFFFFFF
+            if since >= 0x80000000:
+                since -= 0x100000000
+            phase[int(link)] = (now, since, int(t_off), int(t0) & 0xFFFFFFFF)
+        old = self.mover_phase
+        self.mover_phase = phase
+        self.mover_phase_at = now
+        if old is not None and all(link in old and old[link][3] == got[3]
+                                   for link, got in phase.items()):
+            return
+        drift = (int(game_now) - int(wall_now)) & 0xFFFFFFFF
+        if drift >= 0x80000000:
+            drift -= 0x100000000
+        self.online_debug(
+            "移动平台相位 账号=%r -> %s%s（游戏时钟 − 墙钟 = %d ms）"
+            % (self.account_name or "?",
+               "起点变了：" if old is not None else "",
+               "；".join("路径 %d 起点后 %d ms（t0=%d，偏移 %d）"
+                        % (link, got[1], got[3], got[2])
+                        for link, got in sorted(phase.items())),
+               drift))
+
+    def note_tick_clock(self, tick, timer, births=(), now=None):
+        """逻辑帧时钟到了（`udpsync.MSG_TICK_CLOCK`，X_Mod §81 / D60）。**只存事实**。
+
+        `tick` = 客户端这一帧的帧号（`[Stage+0xd4]`），`timer` = 这一帧的 `Timer()`
+        （`[Stage+0xe0]`，移动平台这一帧的碰撞位置就是按它算的），`births` = 这一帧里
+        新建的远端弹体句柄（bot 开的枪、别人开的枪都在里面，bot 那边按自己的句柄去查）。
+        ★ UDP 可能乱序：`tick_latest` 只往前走，晚到的旧帧照样记进表里（查到就是准的）。
+        ★ `now` 只给测试注入用，和 `note_mover_phase()` 同一套约定。
+        """
+        tick = int(tick) & 0xFFFFFFFF
+        timer = int(timer) & 0xFFFFFFFF
+        clock = self.tick_clock
+        if clock is None:
+            clock = self.tick_clock = collections.OrderedDict()
+        clock[tick] = timer
+        while len(clock) > TICK_CLOCK_KEEP:
+            clock.popitem(last=False)
+        if self.tick_latest is None or tick >= self.tick_latest[0]:
+            self.tick_latest = (tick, timer)
+        if births:
+            table = self.shell_birth
+            if table is None:
+                table = self.shell_birth = collections.OrderedDict()
+            for handle in births:
+                table[int(handle)] = tick
+            while len(table) > TICK_CLOCK_KEEP:
+                table.popitem(last=False)
 
     def feed_peer_udp(self, index, payload):
         """UDP 那条路的入口 —— `udpsync` 收到位置数据后调它。
@@ -10993,11 +11419,11 @@ class Conn:
         self.note_player_input(payload, arrived)
         room = self.lobby_room()
         if room is None:
-            self.note_sync_position(payload)
+            self.note_sync_position(payload, arrived)
             self.note_human_fire(payload)
         else:
             with room.sim_lock:
-                self.note_sync_position(payload)
+                self.note_sync_position(payload, arrived)
                 self.note_human_fire(payload)
                 # ★ 本局战绩（称号卡片，V0.3商店）。★ 和下面那发钩子同一个
                 #   道理：**统计坏了不该拖垮同步**，所以整段吞异常。

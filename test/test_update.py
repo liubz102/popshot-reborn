@@ -183,5 +183,63 @@ class ManifestMergeTests(unittest.TestCase):
                  "/releases/download/V0.2.7/PopShot-portable-win64_V0-2-7.zip")
 
 
+class ShippedUpdateConfigTests(unittest.TestCase):
+    """仓库里那份 `config/update.config` —— 两个包都拿它当默认更新源。
+
+    它现在是**发布出去的默认值**：客户端包里那份是玩家的兜底，服务端包里
+    那份是开服的人拿来改的起点。写错 / 忘了跟着 `REPO_URL` 改，症状是
+    「所有新玩家都从旧仓库下包」，而且没有任何报错。
+    """
+
+    PATH = os.path.join(os.path.dirname(HERE), "config", "update.config")
+
+    def read(self):
+        if not os.path.exists(self.PATH):
+            self.skipTest("不在源码仓库里")
+        with open(self.PATH, encoding="utf-8") as fp:
+            return fp.read()
+
+    def manifest_url(self):
+        for line in self.read().splitlines():
+            line = line.strip()
+            if line.startswith("#") or line.startswith(";") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip().lower() == "manifest_url":
+                return value.strip()
+        return None
+
+    def test_it_ships_a_manifest_url_pointing_at_our_repo(self):
+        url = self.manifest_url()
+        self.assertIsNotNone(url, "config/update.config 里没有 manifest_url")
+        self.assertTrue(url.startswith(update_manifest.REPO_URL + "/"),
+                        f"manifest_url 和 update_manifest.REPO_URL 分叉了：{url}")
+        self.assertTrue(url.endswith("/manifest.json"), url)
+
+    def test_the_manifest_url_line_is_invisible_to_an_old_updater(self):
+        """★ 老更新器（V0.4.2 及更早）只会把这一行丢进「认不出的行」。
+
+        它的解析器只收「`http://`/`https://` 开头、中间无空白」的行，
+        `manifest_url = https://…` 中间有空格 ⇒ 被忽略，**不会被当成一个
+        代理地址去用**。新格式对老客户端安全，全靠这一条 —— 所以这一行
+        永远不能写成 `manifest_url=https://…`（没空格）那种紧凑形式。
+        """
+        for line in self.read().splitlines():
+            stripped = line.strip()
+            if stripped.lower().startswith("manifest_url"):
+                self.assertRegex(stripped, r"^manifest_url\s+=\s+\S",
+                                 "manifest_url 这一行 = 两边必须留空格，"
+                                 "否则老更新器会把它当成代理地址")
+
+    def test_every_proxy_line_is_a_bare_url(self):
+        for line in self.read().splitlines():
+            stripped = line.strip()
+            if (not stripped or stripped.startswith("#")
+                    or stripped.startswith(";") or "=" in stripped):
+                continue
+            self.assertRegex(stripped, r"^https?://\S+$",
+                             f"既不是注释也不是配置行，却不像代理地址：{stripped!r}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

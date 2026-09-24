@@ -5332,3 +5332,31 @@ GBK `D3 CE`（「游」）→ `ÓÎ`，就是那种乱码的指纹。
 （写文件的就是这台机器的 ANSI 页；非 Windows 退回 `gbk`）`errors="replace"` 解。正文和
 rpt 比对（`logged_at_raw`）仍用 latin-1 那份。★ 这段在**客户端包**里跑，要重打客户端包才生效；
 已收到的旧包里那串按同样路数就能还原。
+
+## §130 ★★ 更新源改成服务端下发：所需的三样东西本来就都有（✅实测，2026-09-22）
+
+**结论**：把「从哪个仓库下游戏包 + 用哪些代理」从客户端挪到服务端，一行协议都不用加。
+
+* 更新器**早就知道服务器地址**：`cfg_server_address()`（`updater/src/config.c`）读包根
+  `config/server.config`，探针一直在用它连 27799。端口只差 `server_register_port`，
+  同一个文件里就有，照抄十几行。
+* 27810 **早就全网可达**（`[::]` 双栈），而且**客户端主动打它已有先例** ——
+  崩溃包上传 `POST /api/crash-report`（`server/crashwatch.py` → `web/server.py`）。
+* manifest 里的游戏包地址**本来就是完整 URL**（`ReleaseEntry.url`），换了仓库连包地址
+  一起换，这一块零改动。
+* HTTP 客户端也是现成的：`net_get_memory()`（WinHTTP，带超时窗口和取消探针）。
+
+**★ 新格式对老更新器安全**（这是敢在同一个文件里加键的全部依据）：老解析器只收
+「`http://`/`https://` 开头、中间无空白」的行，`manifest_url = https://…` 中间有空格 ⇒
+被计进 `skipped` 丢掉，**绝不会被当成一个代理地址去用**。所以新 `update.config`
+发给老客户端不会坏。★ 反过来说这一行**永远不能写成紧凑形式** `manifest_url=https://…`
+—— 那样老更新器会拿它当代理。`test_update.ShippedUpdateConfigTests` 钉住了这一条。
+
+**顺带查明的两件事**：
+
+1. `proxy-e2e` 场景 C 的「直连 manifest 5 秒到点」判据**早就静默失效**：日志时间戳
+   加时区之后变成 `[2026-09-22 12:20:30 UTC+9]`，夹具里 `re.match(r"…(\d+):(\d+):(\d+)\]")`
+   那个写死的 `\]` 再也匹配不上，`stamp()` 一直回 `None`。已去掉 `\]`。
+2. 仓库里的 `hook/bin/bshook.dll` 和 `hook/bshook.c` **对不上**：提交 `c433c4a2` 给
+   `.c` 加了 232 行没重编 DLL（`efe67e4f…` 235520 字节 vs 按源码重编的 `4ded6933…`
+   237056 字节）。打包脚本一跑就会自动纠正它（D87）。

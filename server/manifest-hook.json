@@ -3,6 +3,16 @@
   "note": "每个版本的 hook/bin/bshook.dll 的 SHA-256。服务端用它校验客户端上报的完整性校验位：对不上、没带、或表里根本没有这个版本，一律强制更新（见 server/versioning.py 的 verify_client_hook）。由 tools/gen_hook_manifest.py 维护（hook/build.bat 和打包脚本都会自动跑），不要手改。",
   "hooks": [
     {
+      "version": "V0.4.3",
+      "date": "2026-09-23",
+      "sha256": "f804eb3a41ade25745bee2c707c6ba6de81fe725029507dab4be049bf80951bc"
+    },
+    {
+      "version": "V0.4.2",
+      "date": "2026-09-21",
+      "sha256": "a0ce7b5c570176477525082591798fe714bb2998354560514773b1771a04d9af"
+    },
+    {
       "version": "V0.4.1",
       "date": "2026-09-20",
       "sha256": "bc26efc5d5100b4770f2c79edde4e611f93c4a516d15170d564e361516a16cd1"

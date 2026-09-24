@@ -58,6 +58,7 @@ import time
 import zipfile
 
 from databackup import format_size, format_time
+import tzstamp
 
 #: 「最近多少小时」（用户 2026-09-17 定的 12）。前端的标签从 overview 里现取，别两头写死。
 RECENT_HOURS = 12
@@ -381,7 +382,10 @@ def manifest_text(plan, written, skipped, meta):
         for arcname, why in skipped:
             lines.append("  %s —— %s" % (arcname, why))
     lines.append("")
-    lines.append("--- 文件清单（zip 内路径 / 原始字节 / 最后修改时间）---")
+    # ★ 逐行的时间不重复写时区（太吵），在表头说一次 —— 它们和「打包时刻」
+    #   同一台机器、同一个时区。（bug调查/25：三台机器三个时区，比反过一次。）
+    lines.append("--- 文件清单（zip 内路径 / 原始字节 / 最后修改时间，均为 %s）---"
+                 % tzstamp.utc_offset_text(plan.now))
     for arcname, size, when in written:
         lines.append("%s\t%d\t%04d-%02d-%02d %02d:%02d:%02d" % ((arcname, size) + tuple(when)))
     lines.append("")

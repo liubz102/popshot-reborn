@@ -266,6 +266,18 @@ def parse_header(data):
 #: 所以「服务端能不能发下行 UDP」是**对方说了算**，不是我们猜的。
 HELLO_FLAG_DOWNLINK = 0x01
 
+#: `HELLO` 的标志位：这一轮登录玩家在登录框里选的是「**本机服务器**」（X_Mod D58）。
+#:
+#: ★ **只在 `bshook` → 本机中继这一跳上有意义**：中继据此把这条旁路的上游定成
+#:   `127.0.0.1:UDP_SYNC_PORT`（不带就是 `server.config` 的 `server_address`）。
+#:   本机和远程**只差这一个上游地址**，冗余捎带 / 下行注入 / HELLO 重试全是同一份代码
+#:   （用户 2026-09-23：本机测试要能反映线上的真实情况，两套逻辑以后改一处漏一处）。
+#: ★ 中继转给服务端的 `HELLO` **不带这一位**（它是 `build_hello(票据, 下行位)` 重新拼的），
+#:   服务端从头到尾不知道、也不需要知道玩家选的是哪边。
+#: ★ 它跟着 `HELLO` 走，而 `HELLO` 是每轮登录旁路上的**第一发**（票据就在里面，没有它
+#:   后面的数据报中继也认不出是谁的）⇒ 中继收到它的时候就知道这一轮往哪转，没有竞态。
+HELLO_FLAG_LOCAL_SERVER = 0x02
+
 
 def build_hello(ticket, flags=0):
     body = str(ticket or "").encode("utf-8")
@@ -315,6 +327,151 @@ def parse_hello_ack(data):
     result, size = struct.unpack_from("<BH", data, HEADER_SIZE)
     note = data[HEADER_SIZE + 3:HEADER_SIZE + 3 + size].decode("utf-8", "replace")
     return result, note
+
+
+#: ★★ 在场证据（bug调查/25 之后加的，用户 2026-09-20）。
+#:
+#: **单人任务房里服务端是瞎的**：没有第二个人，客户端就不发 `0x040e`，
+#: 于是挂机判定的「键盘」那条判据整个不存在，只剩「打中 / 捡到 / 得分」。
+#: 而 328800963 那个号开着连点器，分数每 1.5 秒涨一次 —— 证据比真人还多，
+#: 连续 14 小时显示「游戏中·任务」。
+#:
+#: 结论不是「把得分这条证据削弱」，而是**把服务端看不见的那几件事搬过来**。
+#: 这四件事 `bshook` 站在客户端里全看得见，而服务端**结构上**看不见：
+#:
+#: | 字段 | 是什么 | 为什么它管用 |
+#: |---|---|---|
+#: | `kb_idle_ms`  | 距上次**局内游戏键**的 `WM_KEYUP`（白名单）| 只认「进了图真的能操作角色」的键（移动四轴 / 123 / Shift / Ctrl）；F5 这种菜单键不算——连点器每局按一下就把回溯量洗白了（§67）|
+#: | `mouse_idle_ms` | 距上次鼠标键 `WM_*BUTTONUP` | 单独一类：连点器产的就是它，**故意只当弱证据** |
+#: | `sys_idle_ms` | `GetLastInputInfo()` | 「这台机器前面有没有人」。`PostMessage` 类连点器伪造不了它 |
+#: | `foreground`  | 游戏窗口在不在前台 | 用户 2026-09-20 点的题：游戏丢后台还在打的一定不是真人在玩（原版自己也靠这个把 BGM 静音，`WM_ACTIVATEAPP` @ `0x40f17b`）|
+#:
+#: ★★ **这一发只运证据，不下结论**。判定留在 `gameserver`：那边的阈值是用户
+#: 拿真日志调出来的（§111），改阈值不该要求重发客户端。
+MSG_PRESENCE = 6
+
+#: `u32 键盘空闲 / u32 鼠标空闲 / u32 系统空闲 / u8 前台 / u8 标志 / u16 保留`。
+#: 空闲毫秒 `0xFFFFFFFF` = **本次连接从来没有过**（不是「刚刚有」）。
+PRESENCE = struct.Struct("<IIIBBH")
+#: 「从来没有过」。★ 和「0 毫秒」必须分得开 —— 一个是最强的挂机证据，
+#: 一个是最强的反证，混在一起这个功能就废了。
+PRESENCE_NEVER = 0xFFFFFFFF
+#: `flags` 的位。现在只用一个，其余留给以后（别复用，老服务端会解错）。
+PRESENCE_FLAG_MINIMIZED = 0x01
+
+
+def build_presence(kb_idle_ms, mouse_idle_ms, sys_idle_ms, foreground, flags=0):
+    return build_header(MSG_PRESENCE) + PRESENCE.pack(
+        kb_idle_ms & 0xFFFFFFFF, mouse_idle_ms & 0xFFFFFFFF,
+        sys_idle_ms & 0xFFFFFFFF, 1 if foreground else 0, flags & 0xFF, 0)
+
+
+def parse_presence(data):
+    """-> `(kb_idle_ms, mouse_idle_ms, sys_idle_ms, foreground, flags)`。
+
+    ★ 比结构体长的包**照收**（只解前面这些格）：以后加字段时老服务端不会
+      因为「长度对不上」把新客户端整个丢掉。反过来短了就是坏包，拒。
+    """
+    kind, _ = parse_header(data)
+    if kind != MSG_PRESENCE:
+        raise ProtocolError(f"not a PRESENCE ({kind})")
+    if len(data) < HEADER_SIZE + PRESENCE.size:
+        raise ProtocolError("PRESENCE truncated")
+    kb, mouse, sysidle, fg, flags, _pad = PRESENCE.unpack_from(data, HEADER_SIZE)
+    return kb, mouse, sysidle, bool(fg), flags
+
+
+#: ★ 移动平台相位（X_Mod §74 / §78 / D55）—— 客户端报「**它自己**的移动平台走到哪了」。
+#:
+#: 出处：bot 的手雷穿过「云桥」的鲤鱼。移动平台的位置是每台客户端自己按
+#: `Timer() + t_off − t0` 算的（`PathFollower::GetPos` `0x549bec`），协议里没有任何同步包；
+#: `t0` 载图时（`LinkPath` `0x511d97`）取一次、**开打时**（`GameContext::StartGame` →
+#: `0x476463`）整体重取一次（§78），`Timer()` 是当前 Stage 的 `+0xe0`（每帧的 now）。
+#: ⇒ 让 `bshook` 站在事实旁边把事实报过来：每个挂在路径上的对象一条 `(link, t0, t_off)`
+#: —— **发包那一刻从对象身上现读的** —— 外加发包那一刻的 `Timer()`（`game_now`）和
+#: `GetTickCount()`（`wall_now`，只给日志对照「游戏时钟 vs 墙钟」）。
+#: 相位 = `game_now − t0`（**不含** `t_off`，那一格由 `mapdata.Mover.rider_center()` 加）。
+#:
+#: ★★ 和在场证据一样：**只运事实，不下结论**。谁的相位算数在 `bot._mover_clock()`。
+MSG_MOVER_PHASE = 7
+
+#: 载荷：`u32 game_now / u32 wall_now`，然后头里 `count` 条 `i32 link / u32 t0 / i32 t_off`。
+MOVER_HEAD = struct.Struct("<II")
+MOVER_ENTRY = struct.Struct("<iIi")
+#: 一发最多几条。`.map` 里挂路径的对象最多 6 个（Festival01），32 是 hook 那张表的上限。
+MOVER_MAX_ENTRIES = 32
+
+
+def build_mover_phase(game_now, wall_now, entries):
+    items = list(entries)[:MOVER_MAX_ENTRIES]
+    body = b"".join(MOVER_ENTRY.pack(int(link), int(t0) & 0xFFFFFFFF, int(t_off))
+                    for link, t0, t_off in items)
+    return (build_header(MSG_MOVER_PHASE, len(items))
+            + MOVER_HEAD.pack(int(game_now) & 0xFFFFFFFF, int(wall_now) & 0xFFFFFFFF)
+            + body)
+
+
+def parse_mover_phase(data):
+    """-> `(game_now, wall_now, [(link, t0, t_off), …])`。
+
+    ★ 比说好的长照收（以后加字段老服务端不丢包），短了就是坏包，拒 —— 同 `parse_presence`。
+    """
+    kind, count = parse_header(data)
+    if kind != MSG_MOVER_PHASE:
+        raise ProtocolError(f"not a MOVER_PHASE ({kind})")
+    if len(data) < HEADER_SIZE + MOVER_HEAD.size + count * MOVER_ENTRY.size:
+        raise ProtocolError("MOVER_PHASE truncated")
+    game_now, wall_now = MOVER_HEAD.unpack_from(data, HEADER_SIZE)
+    pos = HEADER_SIZE + MOVER_HEAD.size
+    entries = []
+    for _ in range(count):
+        entries.append(MOVER_ENTRY.unpack_from(data, pos))
+        pos += MOVER_ENTRY.size
+    return game_now, wall_now, entries
+
+
+#: ★ 逻辑帧时钟（X_Mod §81 / D60）—— 客户端报「**这个逻辑帧**的帧号、帧里的 `Timer()`、
+#:   这一帧新建了哪几颗远端弹体」。
+#:
+#: 出处：鲤鱼上的反弹差 1 px 就弹向全变，而服务端按「每秒一发的相位 + 墙钟外推」算出来的鱼
+#: 比房主客户端平均早 12 ms、σ 7 ms（§81）。客户端逻辑是固定 32 ms 的网格（`Stage::Update`
+#: `0x42b4c3`，`[Stage+0xd4]` 帧号），移动平台的碰撞位置只在渲染时按 `Timer()`（`[Stage+0xe0]`）
+#: 刷新 ⇒ 逻辑帧 m 里撞到的鱼 = `Timer_m − t0`。收到的 `rpFire` 在某个逻辑帧里建弹体并**当帧**
+#: 推第 1 格 ⇒ 第 k 格 = 出膛帧 + k − 1。两件都是 hook 站在旁边看得到的事实（`GameContext`
+#: 逻辑帧入口 `0x4904cc` 发，这一帧的出膛已经在网络泵里登记过了）。
+#:
+#: 载荷：`u32 帧号 / u32 Timer`，然后头里 `count` 个 `i32 弹体句柄`（这一帧出膛的远端弹体）。
+#: ★ 只在「这张图有移动平台」时发（hook 的 MOVER 表非空）—— 别的图一发都没有。
+#: ★★ 和 `MSG_MOVER_PHASE` 一样**只运事实**：谁的时钟算数、没报到时怎么外推都在服务端。
+MSG_TICK_CLOCK = 8
+
+TICK_HEAD = struct.Struct("<II")
+TICK_BIRTH = struct.Struct("<i")
+#: 一帧最多带几颗出膛（hook 那张小表的上限；分裂弹一次 4 片，再多也不会同帧超过它）。
+TICK_MAX_BIRTHS = 32
+
+
+def build_tick_clock(tick, timer, births=()):
+    items = list(births)[:TICK_MAX_BIRTHS]
+    return (build_header(MSG_TICK_CLOCK, len(items))
+            + TICK_HEAD.pack(int(tick) & 0xFFFFFFFF, int(timer) & 0xFFFFFFFF)
+            + b"".join(TICK_BIRTH.pack(int(h)) for h in items))
+
+
+def parse_tick_clock(data):
+    """-> `(帧号, Timer, [出膛的弹体句柄, …])`。比说好的长照收，短了拒（同 `parse_mover_phase`）。"""
+    kind, count = parse_header(data)
+    if kind != MSG_TICK_CLOCK:
+        raise ProtocolError(f"not a TICK_CLOCK ({kind})")
+    if len(data) < HEADER_SIZE + TICK_HEAD.size + count * TICK_BIRTH.size:
+        raise ProtocolError("TICK_CLOCK truncated")
+    tick, timer = TICK_HEAD.unpack_from(data, HEADER_SIZE)
+    pos = HEADER_SIZE + TICK_HEAD.size
+    births = []
+    for _ in range(count):
+        births.append(TICK_BIRTH.unpack_from(data, pos)[0])
+        pos += TICK_BIRTH.size
+    return tick, timer, births
 
 
 def build_ping(kind, seq):
@@ -929,6 +1086,78 @@ class UdpSyncServer:
             except Exception as error:         # noqa: BLE001 —— 单份坏了不许带崩整条
                 self.log(f"!! 喂 UDP 心跳抛了 {error!r}")
 
+    def _on_presence(self, data, addr, now):
+        """在场证据（`MSG_PRESENCE`）—— 原样转交给那条游戏连接，**这里不判定**。
+
+        和 `_on_data` 同一套：`HELLO` 之前一律丢（认不出是谁），认得出就
+        鸭子类型地喂给 `Conn.note_presence()`。判定在 `gameserver` 那边。
+        """
+        with self._lock:
+            endpoint = self._by_addr.get(addr)
+            if endpoint is not None:
+                endpoint.last_seen = now
+        if endpoint is None:
+            self.unknown_in += 1
+            return
+        try:
+            kb, mouse, sysidle, fg, flags = parse_presence(data)
+        except ProtocolError:
+            return
+        note = getattr(endpoint.game_conn, "note_presence", None)
+        if note is None:
+            return          # 老服务端 / 单测里的假连接：当没收到
+        try:
+            note(kb, mouse, sysidle, fg, flags)
+        except Exception as error:             # noqa: BLE001 —— 不许带崩收包循环
+            self.log(f"!! 喂在场证据抛了 {error!r}")
+
+    def _on_mover_phase(self, data, addr, now):
+        """移动平台相位（`MSG_MOVER_PHASE`，X_Mod §74）—— 和 `_on_presence` 同一套：
+        `HELLO` 之前一律丢，认得出就鸭子类型地喂给 `Conn.note_mover_phase()`，
+        **这里不判定**（谁的相位算数在 `bot._mover_clock()`）。
+        """
+        with self._lock:
+            endpoint = self._by_addr.get(addr)
+            if endpoint is not None:
+                endpoint.last_seen = now
+        if endpoint is None:
+            self.unknown_in += 1
+            return
+        try:
+            game_now, wall_now, entries = parse_mover_phase(data)
+        except ProtocolError:
+            return
+        note = getattr(endpoint.game_conn, "note_mover_phase", None)
+        if note is None:
+            return          # 老服务端 / 单测里的假连接：当没收到
+        try:
+            note(game_now, wall_now, entries)
+        except Exception as error:             # noqa: BLE001 —— 不许带崩收包循环
+            self.log(f"!! 喂移动平台相位抛了 {error!r}")
+
+    def _on_tick_clock(self, data, addr, now):
+        """逻辑帧时钟（`MSG_TICK_CLOCK`，X_Mod §81 / D60）—— 同 `_on_mover_phase`：
+        `HELLO` 之前一律丢，认得出就喂给 `Conn.note_tick_clock()`，这里不判定。
+        """
+        with self._lock:
+            endpoint = self._by_addr.get(addr)
+            if endpoint is not None:
+                endpoint.last_seen = now
+        if endpoint is None:
+            self.unknown_in += 1
+            return
+        try:
+            tick, timer, births = parse_tick_clock(data)
+        except ProtocolError:
+            return
+        note = getattr(endpoint.game_conn, "note_tick_clock", None)
+        if note is None:
+            return
+        try:
+            note(tick, timer, births)
+        except Exception as error:             # noqa: BLE001 —— 不许带崩收包循环
+            self.log(f"!! 喂逻辑帧时钟抛了 {error!r}")
+
     def _reply(self, data, addr):
         if self.sock is None:
             return
@@ -949,6 +1178,12 @@ class UdpSyncServer:
             self._on_data(data, addr, now)
         elif kind == MSG_HELLO:
             self._on_hello(data, addr, now)
+        elif kind == MSG_PRESENCE:
+            self._on_presence(data, addr, now)
+        elif kind == MSG_MOVER_PHASE:
+            self._on_mover_phase(data, addr, now)
+        elif kind == MSG_TICK_CLOCK:
+            self._on_tick_clock(data, addr, now)
         elif kind == MSG_PING:
             with self._lock:
                 endpoint = self._by_addr.get(addr)

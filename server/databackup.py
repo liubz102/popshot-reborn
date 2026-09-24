@@ -68,6 +68,7 @@ import gifthistory
 import logcleanup
 import questrecord
 import shopcfg
+import tzstamp
 
 BACKUP_DIRNAME = "backups"
 MANIFEST_NAME = "manifest.json"
@@ -219,8 +220,9 @@ def format_size(size):
 
 
 def format_time(epoch, seconds=True):
+    """给人看的时刻，**带时区**（服务器可能和看日志的人不在一个时区）。"""
     pattern = "%Y-%m-%d %H:%M:%S" if seconds else "%Y-%m-%d %H:%M"
-    return time.strftime(pattern, time.localtime(epoch))
+    return tzstamp.stamp(epoch, pattern)
 
 
 def write_bytes_atomic(path, data):

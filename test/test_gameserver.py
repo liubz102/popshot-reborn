@@ -4172,6 +4172,68 @@ class AfkTests(unittest.TestCase):
         gameserver.reset_sync_trails(room, "换图")
         self.assertGreater(conn.last_action_at, 1.0)
 
+    # ------------------------- 客户端在场证据（2026-09-21 接上，§62 / D53）
+    def presence_afk(self, conn, at=100.0):
+        """让这条连接报一发「窗口丢后台」，返回「刚好判成挂机」的那个时刻。"""
+        conn.note_presence(0, 0, 0, False, now=at)
+        return at + gameserver.PRESENCE_AFK_AFTER_S + 0.001
+
+    def test_presence_catches_the_solo_clicker_the_clocks_cannot(self):
+        """★ §61 那个号：单人局 `last_input_at` 永远 `None`，而连点器每 1.5 秒
+        刷一次 `last_action_at` ⇒ 两条钟都碰不到。在场证据是唯一还剩的一维。"""
+        _room, conn = self.playing_room()
+        conn.last_action_at = 1000.0            # 连点器刚刚又「得分」了
+        self.assertIsNone(conn.last_input_at)
+        self.assertFalse(gameserver.conn_afk_clock_expired(conn, now=1000.0))
+        judged = self.presence_afk(conn, at=1000.0)
+        self.assertTrue(gameserver.conn_is_afk(conn, now=judged))
+        self.assertEqual(gameserver.PLACE_AFK_QUEST,
+                         gameserver.conn_place(conn))
+
+    def test_a_new_match_does_not_reset_the_presence_clock(self):
+        """★ 在场证据说的是「这个人在不在机器前」，和「这一局」无关 ⇒
+        开局 / 换图**都不清**。清了的话挂机号每 106 秒一局，每局重新攒一遍，
+        管理页上又变回一局一局地闪（第五轮 `afk_carried` 专治的那个病）。"""
+        room, conn = self.playing_room()
+        judged = self.presence_afk(conn, at=100.0)
+        since = conn.presence_since
+        gameserver.reset_sync_trails(room, "新一局开始", new_match=True)
+        gameserver.reset_sync_trails(room, "换图")
+        self.assertEqual(since, conn.presence_since)
+        self.assertEqual("后台", conn.presence_logged)
+        self.assertTrue(gameserver.conn_is_afk(conn, now=judged))
+
+    def test_a_respawn_does_not_rewind_the_presence_clock(self):
+        """★ `last_input_at` 要往前拨，是因为「他按没按键」躺着时被游戏暂停了；
+        「人在不在机器前」躺着时并没有暂停 —— 拨了就是重复补偿。"""
+        room, conn = self.playing_room()
+        self.presence_afk(conn, at=100.0)
+        since = conn.presence_since
+        conn.dead_since = 110.0
+        gameserver.note_seat_respawned(room, 0, now=300.0)
+        self.assertEqual(since, conn.presence_since)
+
+    def test_the_freeze_snapshot_and_the_carry_both_see_presence(self):
+        """★ `conn_is_afk()` 的另外两个调用点白拿到这条判据：倒下那一刻定格
+        （`afk_when_down`）、结算时带进下一局（`afk_carried`）。
+
+        ⚠ 这条只能锚在**真的 `time.monotonic()`** 上：`note_seat_settled()`
+        没有 `now` 形参（它是结算路径上顺手调的），拿假时刻报证据的话会被
+        `PRESENCE_STALE_AFTER_S` 当成断流。报在「刚好判成挂机、又还没过期」
+        那个窗口里。
+        """
+        room, conn = self.playing_room()
+        held = gameserver.PRESENCE_AFK_AFTER_S + 5.0
+        self.assertLess(held, gameserver.PRESENCE_STALE_AFTER_S)
+        at = time.monotonic() - held
+        self.presence_afk(conn, at=at)
+        self.assertTrue(gameserver.conn_is_afk(conn))
+        gameserver.note_seat_died(room, 0)
+        self.assertTrue(conn.afk_when_down)
+        conn.dead_since = None
+        gameserver.note_seat_settled(room)
+        self.assertTrue(conn.afk_carried)
+
     # ------------------------------------------ 跨局继承（第五轮，用户点的题）
     def test_a_carried_afk_flag_makes_the_next_match_start_afk(self):
         """★ 挂机的人是**连续**挂的：上一局结算时就在挂机 ⇒ 下一局一上来

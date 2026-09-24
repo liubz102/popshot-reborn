@@ -85,6 +85,14 @@ MAX_BODY_BYTES = 1 << 20
 #: 崩溃包上传的路径。★ 在 `do_POST()` 的**最前面**拦，比 `_read_body()` 还早。
 CRASH_UPLOAD_PATH = "/api/crash-report"
 
+#: 「更新源」下发路径。取包那一头是更新器 `updater/src/main.c` 的
+#: `UPDATE_CONFIG_PATH`（两边改一个必须改另一个）。
+UPDATE_CONFIG_PATH = "/api/update-config"
+
+#: 下发的 `update.config` 最大多少字节。真货两 KB 出头；给 64 KB 足够，
+#: 又不至于让一个手滑放进去的大文件把内存吃掉（同 `MAX_BODY_BYTES` 的调子）。
+UPDATE_CONFIG_MAX_BYTES = 64 * 1024
+
 #: 流式收包时一次读多少。64 KiB：小到不会让一个请求占住大块内存，
 #: 大到不至于把 10 MB 的包拆成几十万次系统调用。
 CRASH_CHUNK_BYTES = 64 * 1024
@@ -279,6 +287,10 @@ class Handler(admin.AdminRoutes, http.server.BaseHTTPRequestHandler):
     #: `None` = 这个进程不是 app.py 起的（单跑注册页 / 测试），那两个接口回「没有启动」。
     log_packer = None
 
+    #: 下发给更新器的 `config/update.config` 的路径。这里存的**只是路径**，
+    #: 内容每次请求现读 —— 改完文件立刻生效，不用重启（见 `_api_update_config`）。
+    update_config_path: str = server_config.update_config_path()
+
     # ------------------------------------------------------------ 客户端身份
     def client_ip(self):
         """这次请求真正的客户端 IP（挂在 frp / nginx 后面也对）。
@@ -375,6 +387,9 @@ class Handler(admin.AdminRoutes, http.server.BaseHTTPRequestHandler):
         if path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
             return
+        if path == UPDATE_CONFIG_PATH:
+            self._api_update_config()
+            return
         # 管理页（V0.3商店 M8）和注册页**共用这一个端口**。它自己认得
         # `/admin` 开头的全部路径（认不出的也回 404），所以放在兜底之前。
         try:
@@ -432,6 +447,46 @@ class Handler(admin.AdminRoutes, http.server.BaseHTTPRequestHandler):
             self._reply(False, "服务器内部错误，请看服务端日志", status=500)
 
     # -------------------------------------------------------------- 接口
+    def _api_update_config(self):
+        r"""`GET /api/update-config` —— 把包根 `config/update.config` 原样发出去。
+
+        更新器（`game_patched\BsPatcherChn.exe`）跑升级之前来取这一份，从里面
+        拿 `manifest_url`（从哪个仓库下游戏包）和下载加速代理列表。
+
+        ★★ **每次请求现读文件，不缓存。** 开服的人改完 `config/update.config`，
+        下一个请求就是新内容，**不用重启服务端** —— 这就是这个接口存在的
+        全部意义。（`versioning.load_client_filter()` 那套 mtime 缓存是给
+        「每条连接都要查一遍」准备的；这里一个玩家一次更新才读一次，加缓存
+        只会多出一处可能漏失效的地方。）`_send()` 本来就带
+        `Cache-Control: no-store`，挂在 frp / nginx 后面也不会被缓住。
+
+        **不鉴权**：里面只有公开的下载地址和公开的代理站点，和注册页上公开
+        服务器自身版本号是同一档。
+        """
+        path = self.update_config_path
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            # 没有这个文件 = 这台服务器不下发更新源。更新器会安静地退回玩家
+            # 本机那份，更新照跑 —— 所以 404 是个正常结局，不是故障。
+            self._send(404, "没有 update.config", "text/plain; charset=utf-8")
+            return
+        if size > UPDATE_CONFIG_MAX_BYTES:
+            self.log_message("update.config 有 %d 字节，超过上限，没有下发", size)
+            self._send(500, "服务器上的 update.config 太大了，请检查它",
+                       "text/plain; charset=utf-8")
+            return
+        try:
+            with open(path, "rb") as fp:
+                body = fp.read(UPDATE_CONFIG_MAX_BYTES)
+        except OSError as error:
+            self.log_message("读不了 update.config: %r", error)
+            self._send(500, "读不了 update.config，请看服务端日志",
+                       "text/plain; charset=utf-8")
+            return
+        # 原样发字节，不解析不改写：格式由更新器那头认（BOM 它自己会吃掉）。
+        self._send(200, body, "text/plain; charset=utf-8")
+
     def _api_register(self, data):
         # ★ 频率限制放在**最前面**：被限住的 IP 连「这个用户名存不存在」
         #   都不该问得出来，否则限流就成了一个免费的账号枚举接口。
@@ -727,7 +782,7 @@ def make_server(port, accounts, host="::",
                 crash_max_mb=server_config.DEFAULT_CRASH_MAX_UPLOAD_MB,
                 crash_cooldown=(
                     server_config.DEFAULT_CRASH_UPLOAD_COOLDOWN_SECONDS),
-                log_packer=None):
+                log_packer=None, update_config_path=None):
     """建好 HTTP 服务器但不开始服务，方便测试拿到真实端口。
 
     `cooldown` = 注册冷却秒数（`server.config` 的 `register_cooldown_seconds`）。
@@ -738,6 +793,9 @@ def make_server(port, accounts, host="::",
     （同上：漏传参数时应当**不收**，而不是默默往磁盘上写）。
     `log_packer` = `logpack.LogPacker`（同一页的「下载日志」）；不传时那两个接口
     回「日志下载没有启动」（同上：不该让一台只跑注册页的进程把 `logs/` 发出去）。
+    `update_config_path` = 下发给更新器的 `config/update.config` 的路径；
+    不传就是包根那一份。★ 这里给的**只是路径**，内容每次请求现读 ——
+    改完文件立刻生效，不用重启（测试靠它指向临时文件）。
     """
     handler = type("BoundHandler", (Handler,),
                    {"accounts": accounts,
@@ -750,7 +808,10 @@ def make_server(port, accounts, host="::",
                     "crash_store": crash,
                     "crash_limiter": RegisterRateLimiter(crash_cooldown),
                     "crash_max_bytes": max(0, int(crash_max_mb)) * 1048576,
-                    "log_packer": log_packer})
+                    "log_packer": log_packer,
+                    "update_config_path": (
+                        update_config_path
+                        or server_config.update_config_path())})
     return _PreboundHTTPServer(create_listener(host, port), handler)
 
 
@@ -760,11 +821,12 @@ def serve(port, accounts, host="::", ready=None,
           crash_max_mb=server_config.DEFAULT_CRASH_MAX_UPLOAD_MB,
           crash_cooldown=(
               server_config.DEFAULT_CRASH_UPLOAD_COOLDOWN_SECONDS),
-          log_packer=None):
+          log_packer=None, update_config_path=None):
     """阻塞地提供注册页服务。`app.py` 会把它丢进一个线程。"""
     httpd = make_server(port, accounts, host, cooldown, backup=backup,
                         crash=crash, crash_max_mb=crash_max_mb,
-                        crash_cooldown=crash_cooldown, log_packer=log_packer)
+                        crash_cooldown=crash_cooldown, log_packer=log_packer,
+                        update_config_path=update_config_path)
     if ready is not None:
         ready.set()
     httpd.serve_forever()

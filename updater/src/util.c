@@ -126,6 +126,77 @@ int wide_to_utf8(const wchar_t *src, char *dst, size_t cap)
     return n > 0 ? n - 1 : -1;
 }
 
+int utf8_to_wide(const char *src, size_t srclen, wchar_t *dst, size_t cap)
+{
+    int n;
+    size_t fit = srclen;
+
+    if (cap == 0) return -1;
+    /* UTF-8 BOM 吃掉（服务器那头原样回文件字节，文件可能带 BOM）。 */
+    if (srclen >= 3 && (unsigned char)src[0] == 0xEF &&
+        (unsigned char)src[1] == 0xBB && (unsigned char)src[2] == 0xBF) {
+        src += 3;
+        fit = srclen - 3;
+    }
+    n = MultiByteToWideChar(CP_UTF8, 0, src, (int)fit, dst, (int)(cap - 1));
+    if (n <= 0) {
+        /* ★ 输出缓冲放不下时 MultiByteToWideChar 返回 **0**，不是负数
+           —— 一律当成失败的话整份内容就悄悄没了（config.c 那边为这个
+           栽过一次：server.config 一长，server_address 就读不出来）。
+           UTF-8 里一个宽字符最少占 1 字节 ⇒ 截到 cap-1 字节一定放得下；
+           截断点要退回一个 UTF-8 起始字节上，别把一个汉字切两半。 */
+        if (fit > cap - 1) fit = cap - 1;
+        while (fit > 0 && ((unsigned char)src[fit] & 0xC0) == 0x80) fit--;
+        n = MultiByteToWideChar(CP_UTF8, 0, src, (int)fit, dst, (int)(cap - 1));
+    }
+    if (n <= 0) return -1;
+    dst[n] = 0;
+    return n;
+}
+
+void manifest_repo_label(const wchar_t *url, wchar_t *out, size_t cap)
+{
+    const wchar_t *p = url ? url : L"";
+    const wchar_t *scheme;
+    size_t n = 0, keep;
+    int slashes = 0;
+    int max_slashes = 2;          /* 域名 + 两段路径 = 停在第 3 个 / */
+
+    if (cap == 0) return;
+    out[0] = 0;
+    /* 去掉 scheme 和 www.，只留「域名 + 前两段路径」；域名正好是 github.com
+       时连它一起去掉，只剩 owner/repo：
+         https://github.com/liubz102/popshot-reborn/releases/latest/download/manifest.json
+           -> liubz102/popshot-reborn
+         https://oss.example.com/pkg/manifest.json
+           -> oss.example.com/pkg/manifest.json
+       ★ 为什么 github.com 特殊：状态行只有两行 455px，下载那一行还要塞
+         代理地址，省下这 11 个字符是实打实的余量；而**别的**域名必须留着
+         —— 不然玩家看不出这包到底是不是从 GitHub 下的。
+         判据是「整段域名就等于 github.com」，`github.com.evil.tld` 不匹配。
+       ★ 这一行纯给人看（界面上的「仓库：」），不参与任何判断：
+         认不出的地址原样截断就行，绝不能因为它出错。 */
+    scheme = wcsstr(p, L"://");
+    if (scheme) p = scheme + 3;
+    if (_wcsnicmp(p, L"www.", 4) == 0) p += 4;
+    if (_wcsnicmp(p, L"github.com/", 11) == 0) {
+        p += 11;
+        max_slashes = 1;          /* 域名没了，owner/repo 两段 = 停在第 2 个 / */
+    }
+    while (p[n] && !(p[n] == L'/' && ++slashes > max_slashes)) n++;
+    /* 太长就截断加省略号（最长的也就 GitHub 那种 owner/repo，够用）。 */
+    keep = cap - 1;
+    if (keep > 40) keep = 40;
+    if (n <= keep) {
+        wcsncpy(out, p, n);
+        out[n] = 0;
+    } else {
+        wcsncpy(out, p, keep - 1);
+        out[keep - 1] = 0x2026;          /* … */
+        out[keep] = 0;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /*  路径                                                                */
 /* ------------------------------------------------------------------ */
@@ -287,11 +358,59 @@ void mib_to_wide(unsigned long long bytes, wchar_t *out, size_t cap)
     out[cap - 1] = 0;
 }
 
+/* 本机的 UTC 偏移（`UTC+8` / `UTC-3` / `UTC+5:30`）。
+   本地时刻减 UTC 时刻现算，不读注册表 —— 启动那一刻的夏令时自动就对。
+   和 `hook/bshook.c` 的 `bslog_zone_minutes()`、`server/tzstamp.py` 同一套写法。
+
+   ★★ **偏移只算一次，之后一直沿用**（用户 2026-09-20 第二轮拍板，三侧统一）。
+     玩家全在中国（UTC+8，不用夏令时），为「更新器跑着的时候跨过夏令时切换」
+     这个本项目里不存在的场景每行现算一遍不值当。
+     ★ 落定的是**分钟数**不是字符串：调用方各自拿自己的 `cap` 去拼，
+       省一份静态缓冲区，也不用担心谁把它写坏。
+     ★ 多线程：两条线程算出的是同一个值，撞了也无害；**先写值、后写旗**。 */
+static long g_zone_mins = 0;
+static int  g_zone_ready = 0;        /* 0 = 还没算过 */
+
+void utc_offset_text(wchar_t *out, size_t cap)
+{
+    SYSTEMTIME lt, ut;
+    FILETIME lf, uf;
+    long long diff, half;
+    long mins, hh, mm;
+    wchar_t sign;
+
+    if (cap) out[0] = 0;
+    if (!g_zone_ready) {
+        GetLocalTime(&lt);
+        GetSystemTime(&ut);
+        if (!SystemTimeToFileTime(&lt, &lf) || !SystemTimeToFileTime(&ut, &uf))
+            return;                     /* 算不出就先不落定，下一次再试 */
+        diff = (((long long)lf.dwHighDateTime << 32) | lf.dwLowDateTime)
+             - (((long long)uf.dwHighDateTime << 32) | uf.dwLowDateTime);
+        half = diff >= 0 ? 300000000LL : -300000000LL;  /* 100ns -> 分钟，就近 */
+        g_zone_mins = (long)((diff + half) / 600000000LL);
+        g_zone_ready = 1;                               /* 先值后旗 */
+    }
+    mins = g_zone_mins;
+    sign = mins < 0 ? L'-' : L'+';
+    if (mins < 0) mins = -mins;
+    hh = mins / 60;
+    mm = mins % 60;
+    if (mm) _snwprintf(out, cap, L"UTC%c%ld:%02ld", sign, hh, mm);
+    else    _snwprintf(out, cap, L"UTC%c%ld", sign, hh);
+    out[cap - 1] = 0;
+}
+
+/* ★ 后面那个 `UTC+8` 是 2026-09-20 加的：更新器的日志会和玩家机器上的崩溃包、
+   开发机上的打包戳摆在一起看，三台机器三个时区，不写出来会比反
+   （bug调查/25，`server/tzstamp.py` 的文件头记了那次踩坑）。 */
 void now_stamp(wchar_t *out, size_t cap)
 {
     SYSTEMTIME t;
+    wchar_t zone[16];
     GetLocalTime(&t);
-    _snwprintf(out, cap, L"%04u-%02u-%02u %02u:%02u:%02u",
-               t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    utc_offset_text(zone, 16);
+    _snwprintf(out, cap, L"%04u-%02u-%02u %02u:%02u:%02u %s",
+               t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, zone);
     out[cap - 1] = 0;
 }

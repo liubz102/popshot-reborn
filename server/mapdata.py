@@ -50,6 +50,7 @@
 和另外三个就不一样），所以顺序写死在这里，别靠字典序碰运气。
 """
 import base64
+import bisect
 import json
 import math
 import os
@@ -68,7 +69,14 @@ import zlib
 #:    填的就是它。
 #: 6：索引里多一层 `props` = `Data/map.ini` 的地图属性（现在只有
 #:    **`FallDown`** —— 这张图掉出去会不会死，§143）。
-FORMAT = 6
+#: 7：多一层 `movers` = **移动平台**（挂在 type 111 路径上的地形，X_Mod §73）。
+#:    在此之前服务端完全不知道有这种东西，bot 的手雷会从它们身上穿过去。
+#: 8：`movers[].riders[]` 多了 `x` / `y` / `t_off` / `rel`（自身坐标 / 相位偏移 /
+#:    相对模式，X_Mod §74）—— 位置改成**按 rider** 算（`Mover.rider_center()`）。
+#: 9：破坏物多 `fx` / `fy` = `.map` 里的**原始 f32 坐标**（`x` / `y` 是四舍五入过的）。
+#:    弹体那一路按客户端 `0x51a935` 的口径另合成一张格子（`Breakable.bullet_rows`，
+#:    X_Mod §80）—— 四舍五入的坐标会让破坏物差出 1 px。
+FORMAT = 9
 
 #: 找不到精确名、**也没人告诉我们难度**时按这个顺序退。
 #: ⚠ 这只是最后的兜底 —— 闯关房请一律把难度传进来（见 `DIFFICULTY_SUFFIX`）。
@@ -128,6 +136,115 @@ COARSE_SHIFT = 4
 COARSE = 1 << COARSE_SHIFT
 
 
+def f32(value):
+    """按 C 的 `float` 存一遍 —— 客户端的坐标、半尺寸都是 f32（X_Mod §80）。"""
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+_f32 = f32
+
+#: `_client_local_fast` 在离整数多近时退回逐位的 f32 路径。**精度界，不是时序阈值**：
+#: 局部坐标 |s| < 8192 时 f32 的半个 ulp ≤ 2⁻¹¹ ≈ 4.9e-4 —— 只有离整数比它还近，
+#: 「先存成 f32 再截断」才可能和「直接截断」差一格；留一倍余量。
+_F32_EDGE = 1e-3
+
+
+def _client_local(world, origin, half):
+    """客户端 `0x51a935` 把世界坐标换成对象局部坐标的那一句（X_Mod §80）：
+
+        fild 世界 ; fsub 位置 ; fstp f32   → f32(世界 − 位置)
+        fadd 半尺寸×缩放       ; fstp f32   → f32(… + 半尺寸)
+        call _ftol                          → **向零截断**
+
+    ★ 向零截断 ⇒ 落在 (−1, 0) 的也算第 0 格（比矩形左 / 上边多出一格）。
+    """
+    return int(_f32(_f32(world - origin) + half))
+
+
+def _client_local_fast(world, origin32, half):
+    """同 `_client_local()`，`origin32` 已经是 f32。热路径用（弹体每一步都问鲤鱼）。
+
+    整数 − f32 坐标在这些量级里本来就是精确的（f32 只有 24 位尾数），再加半尺寸在
+    double 里也精确 ⇒ 只剩最后那一次「存成 f32」可能把 n − ε 进位成 n。只在离整数
+    比 `_F32_EDGE` 还近时才真的走一遍 f32，其余直接截断 —— 结果逐位相同。
+    """
+    s = (world - origin32) + half
+    frac = s - math.floor(s)
+    if frac < _F32_EDGE or frac > 1.0 - _F32_EDGE:
+        return int(_f32(_f32(world - origin32) + half))
+    return int(s)
+
+
+def _client_footprint(bits_by_row, width, height, fx, fy):
+    """一件对象在**客户端格子查询**里的形状：`{世界 y: [世界 x, …]}`（X_Mod §80）。
+
+    `0x51a935`：局部坐标越出掩码矩形 → 0；否则取 (局部 ±1) 九格的**最大值**，
+    九格里每一格单独夹在矩形内（`0x51a9e9` 起的两层循环）。`bits_by_row[v]`
+    的第 u 位 = 掩码 (u, v) 非 0。缩放恒为 1（677 件破坏物全是，§136 V0.3bot）。
+    """
+    full = (1 << width) - 1
+    horiz = [(b | (b << 1) | (b >> 1)) & full for b in bits_by_row]
+    grown = []
+    for v in range(height):
+        g = horiz[v]
+        if v:
+            g |= horiz[v - 1]
+        if v + 1 < height:
+            g |= horiz[v + 1]
+        grown.append(g)
+    rx, ry = _f32(fx), _f32(fy)
+    hw, hh = width * 0.5, height * 0.5
+    x_lo = int(math.floor(rx - hw)) - 2
+    y_lo = int(math.floor(ry - hh)) - 2
+    cols = []
+    for X in range(x_lo, x_lo + width + 5):
+        u = _client_local(X, rx, hw)
+        if 0 <= u < width:
+            cols.append((X, u))
+    out = {}
+    for Y in range(y_lo, y_lo + height + 5):
+        v = _client_local(Y, ry, hh)
+        if not 0 <= v < height:
+            continue
+        g = grown[v]
+        if not g:
+            continue
+        xs = [X for X, u in cols if (g >> u) & 1]
+        if xs:
+            out[Y] = xs
+    return out
+
+
+def _pack_rows(filled_by_y, map_width, map_height):
+    """`{世界 y: [世界 x, …]}` → `(rows, col0, col1, row0, row1)`。
+
+    `rows` 每行 `(起字节, 止字节, 或运算位图)`，值一律写 `BREAKABLE_CELL`；
+    出界的格子丢掉。列 / 行范围是**实际有格子**的外接框（粗网格按它标脏）。
+    """
+    rows = []
+    col0, col1 = map_width, -1
+    row0, row1 = map_height, -1
+    for ty in sorted(filled_by_y):
+        if ty < 0 or ty >= map_height:
+            continue
+        filled = [tx for tx in filled_by_y[ty] if 0 <= tx < map_width]
+        if not filled:
+            continue
+        lo, hi = filled[0], filled[-1]
+        col0 = min(col0, lo)
+        col1 = max(col1, hi)
+        row0 = min(row0, ty)
+        row1 = max(row1, ty)
+        first = (ty * map_width + lo) >> 2
+        last = ((ty * map_width + hi) >> 2) + 1
+        pattern = bytearray(last - first)
+        for tx in filled:
+            i = ty * map_width + tx
+            pattern[(i >> 2) - first] |= BREAKABLE_CELL << ((i & 3) * 2)
+        rows.append((first, last, int.from_bytes(bytes(pattern), "big")))
+    return tuple(rows), col0, col1, row0, row1
+
+
 class Breakable(object):
     """一件**可破坏物**（冰块 / 木箱）—— 形状、血量、碎了多久长回来。
 
@@ -141,11 +258,24 @@ class Breakable(object):
     `rows` 是**预先算好的贴图行**：`(起字节, 止字节, 或运算位图)`。
     合成一份地形 = 从不含破坏物的原网格出发，把还活着的这几件 **OR** 上去
     —— 一行一次大整数运算，走 C 层，不逐格循环。
+
+    ## ★★ 两份形状：角色那一份 `rows`、弹体那一份 `bullet_rows`（X_Mod §80）
+
+    客户端问格子（`0x473969`）时，破坏物走的是对象自己的查询 `0x51a935`：
+    `局部 = ftol(f32(世界 − 位置) + 半尺寸)`，越出掩码矩形就是 0，否则取
+    **(局部 ±1) 九格的最大值**。位置是 `.map` 里的 f32（Festival02 那块
+    `(821.73, 652.22)`），而 `x` / `y` 是四舍五入过的整数 ⇒ `rows` 纵向差 1 px、
+    也没有九格那一圈。弹体扫掠按 `rows` 算会在破坏物边上早撞 / 晚撞一格、
+    7×7 投票也跟着偏（实机逐帧：200002 的弹回速度 (−10.12, 9.22) 对 (−13.01, 4.25)，
+    碎片 200130 擦着那一圈被客户端撞掉、服务端飞出 540 px 才炸）。
+    ⇒ 弹体那一路（`MapTerrain.blocks_bullet` / `bullet_solid`）用 `bullet_rows`。
+    角色走路的那一路本次**没动**（同一个查询也管角色，要改另说）。
     """
 
     __slots__ = ("index", "handle", "x", "y", "left", "top", "width",
                  "height", "hp", "regen_ms", "rows", "mask",
-                 "col0", "col1", "row0", "row1")
+                 "col0", "col1", "row0", "row1",
+                 "bullet_rows", "bcol0", "bcol1", "brow0", "brow1")
 
     def __init__(self, index, record, map_width, map_height):
         self.index = index
@@ -165,39 +295,30 @@ class Breakable(object):
         #: 形状本身留着：命中判定要**逐格**问「这一点在不在它身上」
         #: （客户端 `BreakableObj::HitTest` = `0x4fa7b5`）。2 bit/格。
         self.mask = mask
-        rows = []
-        col0, col1 = map_width, -1
-        row0, row1 = map_height, -1
+        w = self.width
+        filled_by_y = {}
+        bits_by_row = []
         for my in range(self.height):
-            ty = self.top + my
-            if ty < 0 or ty >= map_height:
-                continue
-            base = my * self.width
+            base = my * w
+            bits = 0
             filled = []
-            for mx in range(self.width):
-                tx = self.left + mx
-                if tx < 0 or tx >= map_width:
-                    continue
+            for mx in range(w):
                 i = base + mx
                 if (mask[i >> 2] >> ((i & 3) * 2)) & 3:
-                    filled.append(tx)
-            if not filled:
-                continue
-            lo, hi = filled[0], filled[-1]
-            col0 = min(col0, lo)
-            col1 = max(col1, hi)
-            row0 = min(row0, ty)
-            row1 = max(row1, ty)
-            first = (ty * map_width + lo) >> 2
-            last = ((ty * map_width + hi) >> 2) + 1
-            pattern = bytearray(last - first)
-            for tx in filled:
-                i = ty * map_width + tx
-                pattern[(i >> 2) - first] |= BREAKABLE_CELL << ((i & 3) * 2)
-            rows.append((first, last, int.from_bytes(bytes(pattern), "big")))
-        self.rows = tuple(rows)
-        self.col0, self.col1 = col0, col1
-        self.row0, self.row1 = row0, row1
+                    bits |= 1 << mx
+                    filled.append(self.left + mx)
+            bits_by_row.append(bits)
+            if filled:
+                filled_by_y[self.top + my] = filled
+        (self.rows, self.col0, self.col1,
+         self.row0, self.row1) = _pack_rows(filled_by_y, map_width, map_height)
+        # 手写的测试记录没有 fx / fy：按整数坐标算（此时两份形状只差九格那一圈）。
+        fx = float(record.get("fx", self.x))
+        fy = float(record.get("fy", self.y))
+        (self.bullet_rows, self.bcol0, self.bcol1,
+         self.brow0, self.brow1) = _pack_rows(
+             _client_footprint(bits_by_row, w, self.height, fx, fy),
+             map_width, map_height)
 
     def covers(self, x, y):
         """(x, y) 在这件东西的**外接矩形**里吗。"""
@@ -250,6 +371,283 @@ class Breakable(object):
             self.hp, self.regen_ms)
 
 
+class Rider(object):
+    """挂在移动平台上的一块地形：形状（掩码）+ 缩放 + 它自己的相位偏移 / 模式。
+
+    引擎画它的时候是「按 `|缩放|` 把精灵缩成 `sw×sh`，再以 `Mover.rider_center()`
+    算出来的点为**中心**摆上去」，掩码跟着一起缩 —— 所以这里也按同一口径最近邻取样。
+
+    ★★ 取格子的口径是客户端对象查询 `0x51a935`（X_Mod §80 / §81）：
+    `局部 = ftol(f32(世界 − 中心) + 半宽×缩放)`（向零截断），越出 `sw×sh` → 0，
+    否则取 (局部 ±1) **九格的最大值**。原来的「floor 定左上角、不取九格」在
+    62 次真反弹上逐位复现 42 次，这个口径 44 次；静态读法（掩码不缩放）只有
+    6~14 次 —— **缩放件的掩码是在哪一步被拉伸的没逆到**，拉伸这一半是实测定的。
+
+    `t_off` / `rel` / `x` / `y` 是 `.map` 里每个对象自己带的（v17 组，X_Mod §74）：
+    客户端 `PathFollower::GetPos`（`0x549bec`）算 `elapsed = Timer() + t_off − t0`，
+    相对模式（`rel` 非零）再由 `GetWorldPos`（`0x47c6bf`）把自身坐标加回去。
+    """
+
+    __slots__ = ("handle", "w", "h", "sw", "sh", "mask", "x", "y", "t_off", "rel",
+                 "aw", "ah", "_layers", "extent", "_col_tops")
+
+    def __init__(self, record):
+        self.handle = int(record.get("handle", 0))
+        self.w = int(record["w"])
+        self.h = int(record["h"])
+        sx = abs(float(record.get("sx", 1.0)))
+        sy = abs(float(record.get("sy", 1.0)))
+        self.sw = max(1, int(round(self.w * sx)))
+        self.sh = max(1, int(round(self.h * sy)))
+        #: 半尺寸 × 缩放：`0x51a95a` `fld 半宽 ; fmul [esi+0x48]`（乘积留在 x87 里不落 f32）。
+        self.aw = _f32(self.w * 0.5) * _f32(sx)
+        self.ah = _f32(self.h * 0.5) * _f32(sy)
+        self.mask = _unblob(record["mask"])
+        self.x = float(record.get("x", 0.0) or 0.0)
+        self.y = float(record.get("y", 0.0) or 0.0)
+        self.t_off = int(record.get("t_off", 0) or 0)
+        self.rel = int(record.get("rel", 0) or 0)
+        #: 拉伸 + 九格取 max 之后的三层行位图（值 ≥1 / ≥2 / ≥3），第一次查格子时建。
+        self._layers = None
+        #: 走完一整圈能碰到的外接框（`Mover.rider_extent()` 第一次问时填）。
+        self.extent = None
+        #: 局部第 lx 列的站立面（局部行号），问到哪列算哪列（`column_tops()`）。
+        self._col_tops = {}
+
+    def column_tops(self, lx):
+        """局部第 `lx` 列上「值 ≥ 1」的每一段的上沿（局部行号，自上而下）。
+
+        和 `cell()` 同一张（拉伸 + 九格取 max 之后的）第一层位图。和鱼在哪无关，
+        所以按列缓存一次就一直能用；一次只扫一列（几百次取位），不会一口气卡住房间循环。
+        """
+        got = self._col_tops.get(lx)
+        if got is None:
+            layers = self._layers
+            if layers is None:
+                layers = self._build_layers()
+            bit = 1 << lx
+            tops = []
+            above = False
+            for ly, row in enumerate(layers[0]):
+                here = bool(row & bit)
+                if here and not above:
+                    tops.append(ly)
+                above = here
+            got = self._col_tops[lx] = tuple(tops)
+        return got
+
+    def _build_layers(self):
+        """把「拉伸到 sw×sh（最近邻）再九格取 max」预先做成三层行位图。
+
+        九格的最大值 ≥ k ⟺ 九格里有一格 ≥ k ⇒ 每层单独膨胀一圈（行内左右移位、
+        上下三行相或），膨胀自然夹在矩形里。一块鲤鱼 277×435，建一次几十毫秒，
+        之后每次查格子只剩两次截断 + 三次取位（弹体每一步都要问它几十次）。
+        """
+        w, h, sw, sh, mask = self.w, self.h, self.sw, self.sh, self.mask
+        ucol = [min(int((lx + 0.5) * w / sw), w - 1) for lx in range(sw)]
+        vrow = [min(int((ly + 0.5) * h / sh), h - 1) for ly in range(sh)]
+        raw = ([], [], [])
+        for ly in range(sh):
+            base = vrow[ly] * w
+            b1 = b2 = b3 = 0
+            for lx in range(sw):
+                i = base + ucol[lx]
+                v = (mask[i >> 2] >> ((i & 3) * 2)) & 3
+                if v:
+                    bit = 1 << lx
+                    b1 |= bit
+                    if v >= 2:
+                        b2 |= bit
+                        if v == 3:
+                            b3 |= bit
+            raw[0].append(b1)
+            raw[1].append(b2)
+            raw[2].append(b3)
+        full = (1 << sw) - 1
+        layers = []
+        for rows in raw:
+            horiz = [(b | (b << 1) | (b >> 1)) & full for b in rows]
+            grown = []
+            for ly in range(sh):
+                g = horiz[ly]
+                if ly:
+                    g |= horiz[ly - 1]
+                if ly + 1 < sh:
+                    g |= horiz[ly + 1]
+                grown.append(g)
+            layers.append(tuple(grown))
+        self._layers = tuple(layers)
+        return self._layers
+
+    def cell(self, cx, cy, x, y):
+        """中心在 (cx, cy) 时，世界点 (x, y) 那一格的值；不在它身上返回 0（口径见类说明）。"""
+        return self.cell_f32(_f32(cx), _f32(cy), x, y)
+
+    def cell_f32(self, rx, ry, x, y):
+        """同 `cell()`，中心已经按 f32 存过（`rx` / `ry`）—— 弹体一格里中心不变，只算一次。"""
+        lx = _client_local_fast(int(x), rx, self.aw)
+        ly = _client_local_fast(int(y), ry, self.ah)
+        if lx < 0 or ly < 0 or lx >= self.sw or ly >= self.sh:
+            return 0
+        layers = self._layers
+        if layers is None:
+            layers = self._build_layers()
+        if not (layers[0][ly] >> lx) & 1:
+            return 0
+        if not (layers[1][ly] >> lx) & 1:
+            return 1
+        return 3 if (layers[2][ly] >> lx) & 1 else 2
+
+
+def _cmod(a, b):
+    """C 的 `%`（`cdq / idiv`）：余数跟被除数同号。`b` 必须为正。"""
+    r = abs(int(a)) % b
+    return -r if a < 0 else r
+
+
+class Mover(object):
+    """一条**移动平台**：`PathObj`（type 111）那条路径 + 挂在它上面的地形（X_Mod §73）。
+
+    ## 位置怎么算 —— 逐指令抄客户端，一步都没有自己发挥
+
+    | 客户端 | 干什么 |
+    |---|---|
+    | `MapObject::LinkPath`（`0x511d60`） | 地图载完那一遍，按 `link` 找到路径对象，记下 `t0 = 当前时刻` |
+    | `PathFollower::GetPos`（`0x549bec`） | `elapsed = now − t0`，去问路径 |
+    | `Path::Eval`（`0x548ccd`） | 下面这五步 |
+    | `MapObject::GetWorldPos`（`0x47c6bf`） | 相对模式才把偏移加回自己坐标；★ 这几个平台**都是绝对模式**，直接用路径算出来的点 |
+
+    1. 累计时间表 `cum[i] = ms[0] + … + ms[i]`，`总时长 = cum[-1]`（`0x548deb` 就这么建的）；
+    2. `loop == 0`：`t %= 总`；`loop == 1`（乒乓）：`t %= 2×总`，过半就 `t = 2×总 − t − 1`；
+       ★ 取模是 `cdq / idiv`（`0x548d1a`）= **C 的有符号取模**，`t` 为负时余数也为负
+       （`_cmod()`），不是 Python 那种恒非负的 `%`；
+    3. `i = upper_bound(cum, t)`，段内进度 `u = (t − 段起点) / ms[i]`；
+    4. `w = u ** (1 / ease)` —— 客户端 `0x5ce3a0` 就是 `pow(底, 1/指数)`，
+       原版这几条路径 `ease` 全是 1.0 ⇒ `w == u`；
+    5. 三次 Hermite（`0x5697a7`，基函数常数 3.0 / 1.0 对得上）：
+       `h00·P_i + h10·M_i + h01·P_j + h11·M_j`，`j` 越界回到 0；
+       ★ 切线只有 `kind == 1` 的点才从文件里读，其余是 0 ⇒ 退化成 **smoothstep**（两头慢中间快）。
+    6. 最后加上 `PathObj` 自己的世界坐标。
+
+    ## ⚠ 时间原点（X_Mod §74 / §78 / D55）
+
+    客户端的 `t0` 写两次：载图时 `MapObject::LinkPath`（`0x511d97`）一次，**开打时**
+    `GameContext::StartGame` 把所有移动平台整体重取一次（`0x476463`）—— 战斗里算数的是
+    后一个（§78）。时钟是当前 Stage 的 `+0xe0`（每帧的 now），协议里没有任何同步包。
+    所以 `t_ms` 的口径定为「**客户端这一刻的 `Timer() − t0`**」，由谁给：① `bshook` 每秒
+    现读对象的 `t0` 报 `Timer() − t0`（`Conn.note_mover_phase()`）；② 报不上来时
+    `bot._mover_clock()` 退回 `RoomQuest.started_at`（= 广播 `0x0402` 那一刻 ≈ 客户端重取
+    起点那一刻）。每块地形自己的 `t_off` **不在 `t_ms` 里**，`rider_center()` 自己加。
+    """
+
+    __slots__ = ("handle", "x", "y", "loop", "pts", "cum", "total", "riders")
+
+    def __init__(self, record):
+        self.handle = int(record.get("handle", 0))
+        self.x = float(record["x"])
+        self.y = float(record["y"])
+        self.loop = int(record.get("loop", 0))
+        self.pts = tuple(
+            (float(p[0]), float(p[1]), int(p[2]), float(p[3]), float(p[4]),
+             float(p[5]) if len(p) > 5 else 1.0)
+            for p in record.get("pts", ()))
+        cum, acc = [], 0
+        for p in self.pts:
+            acc += p[2]
+            cum.append(acc)
+        self.cum = tuple(cum)
+        self.total = acc
+        self.riders = tuple(Rider(r) for r in record.get("riders", ()))
+
+    def position_at(self, t_ms):
+        """`t_ms` 这一刻，挂在这条路径上的东西在世界的哪个点（见类说明）。"""
+        pts = self.pts
+        n = len(pts)
+        if n == 0:
+            return (self.x, self.y)
+        if n == 1 or self.total <= 0:
+            return (self.x + pts[0][0], self.y + pts[0][1])
+        total = self.total
+        t = int(t_ms)
+        if self.loop == 1:
+            t = _cmod(t, 2 * total)
+            if t >= total:
+                t = 2 * total - t - 1
+        else:
+            t = _cmod(t, total)
+        i = bisect.bisect_right(self.cum, t)
+        if i >= n:
+            i = n - 1
+        seg = pts[i][2]
+        if seg <= 0:
+            return (self.x + pts[i][0], self.y + pts[i][1])
+        u = (t - (self.cum[i] - seg)) / float(seg)
+        ease = pts[i][5]
+        w = u ** (1.0 / ease) if (ease and ease != 1.0 and u > 0.0) else u
+        j = i + 1 if i + 1 < n else 0
+        w2 = w * w
+        w3 = w2 * w
+        h00 = 2.0 * w3 - 3.0 * w2 + 1.0
+        h10 = w3 - 2.0 * w2 + w
+        h01 = -2.0 * w3 + 3.0 * w2
+        h11 = w3 - w2
+        px = h00 * pts[i][0] + h10 * pts[i][3] + h01 * pts[j][0] + h11 * pts[j][3]
+        py = h00 * pts[i][1] + h10 * pts[i][4] + h01 * pts[j][1] + h11 * pts[j][4]
+        return (self.x + px, self.y + py)
+
+    def rider_center(self, rider, t_ms):
+        """`t_ms`（LinkPath 之后的毫秒，**不含**偏移）这一刻，`rider` 的中心在世界的哪个点。
+
+        逐指令抄客户端（X_Mod §74）：`PathFollower::GetPos`（`0x549bec`）算
+        `elapsed = Timer() + t_off − t0`；绝对模式直接 `Eval(elapsed)`；相对模式
+        （`[obj+0x98]` 非零）= `Eval(elapsed) − Eval(0)`，再由 `GetWorldPos`（`0x47c6bf`）
+        加回自身坐标 `[obj+0x34/0x38]`。★ 相对模式的基线是 `Eval(0)`，不是 `Eval(t_off)`。
+        """
+        t = int(t_ms) + rider.t_off
+        if not rider.rel:
+            return self.position_at(t)
+        px, py = self.position_at(t)
+        bx, by = self.position_at(0)
+        return (rider.x + px - bx, rider.y + py - by)
+
+    def cell_at(self, x, y, t_ms):
+        """`t_ms` 这一刻，世界点 (x, y) 落在这条路径上哪块地形的哪一格；没落上返回 0。"""
+        for rider in self.riders:
+            cx, cy = self.rider_center(rider, t_ms)
+            got = rider.cell(cx, cy, x, y)
+            if got:
+                return got
+        return 0
+
+    def rider_extent(self, rider):
+        """`rider` 走完一整圈能碰到的格子的外接框 `(x0, x1, y0, y1)`（闭区间，第一次问时算）。
+
+        弹体每一步都要问「这一点碰不碰得到移动平台」—— 离路径十万八千里的点连路径都不用
+        算（`Path::Eval` 不便宜）。按 4 ms 一个采样点走完一个周期，框再放宽「两个采样点之间
+        最多挪多远」+ 两格（向零截断多出的一格 + 九格那一圈）+ 半尺寸。
+        """
+        got = rider.extent
+        if got is not None:
+            return got
+        period = self.total * (2 if self.loop == 1 else 1)
+        step = 4
+        xs, ys = [], []
+        last = None
+        drift = 0.0
+        for t in range(0, max(period, 1) + step, step):
+            cx, cy = self.rider_center(rider, t - rider.t_off)
+            xs.append(cx)
+            ys.append(cy)
+            if last is not None:
+                drift = max(drift, abs(cx - last[0]), abs(cy - last[1]))
+            last = (cx, cy)
+        pad_x = rider.aw + 2 + drift + 1
+        pad_y = rider.ah + 2 + drift + 1
+        got = (min(xs) - pad_x, max(xs) + pad_x, min(ys) - pad_y, max(ys) + pad_y)
+        rider.extent = got
+        return got
+
+
 class MapTerrain(object):
     """一张图的地形。**只读** —— 破坏物状态变了要换一个对象（`variant()`）。
 
@@ -265,7 +663,8 @@ class MapTerrain(object):
     __slots__ = ("name", "version", "width", "height", "_cells",
                  "_offsets", "_ys", "points", "jump_pads", "__weakref__",
                  "breakables", "alive", "_base_cells", "_base_offsets",
-                 "_base_ys", "_root", "_variants", "_coarse", "_base_coarse")
+                 "_base_ys", "_root", "_variants", "_coarse", "_base_coarse",
+                 "movers", "_bcells")
 
     def __init__(self, record):
         self.name = record["name"]
@@ -295,6 +694,9 @@ class MapTerrain(object):
         self.breakables = tuple(
             Breakable(i, item, self.width, self.height)
             for i, item in enumerate(record.get("breakables", ())))
+        #: ★★ **移动平台**（X_Mod §73）：位置随时间走，所以不进 `cells`，
+        #:   查的时候必须由调用方说清「哪一刻」（`is_solid` / `blocks_bullet` 的 `t_ms`）。
+        self.movers = tuple(Mover(item) for item in record.get("movers", ()))
         self._root = self
         self._variants = {}
         #: 粗网格（弹道加速）。`_base_coarse` 只存在于**根地形**上，
@@ -310,6 +712,8 @@ class MapTerrain(object):
         self.alive = alive
         # ★ `_cells` 要重建，挂在它上面的粗网格跟着作废（懒重建）。
         self._coarse = None
+        # 弹体那一份（`bullet_rows`，X_Mod §80）也懒建：只有弹体会问它。
+        self._bcells = None
         items = [b for b in self.breakables if b.index in alive]
         if not items:
             self._cells = self._base_cells
@@ -407,7 +811,7 @@ class MapTerrain(object):
         if got is None:
             got = object.__new__(MapTerrain)
             for field in ("name", "version", "width", "height", "points",
-                          "jump_pads", "breakables", "_base_cells",
+                          "jump_pads", "breakables", "movers", "_base_cells",
                           "_base_offsets", "_base_ys"):
                 setattr(got, field, getattr(root, field))
             got._root = root
@@ -426,13 +830,77 @@ class MapTerrain(object):
         i = y * self.width + x
         return (self._cells[i >> 2] >> ((i & 3) * 2)) & 3
 
-    def is_solid(self, x, y):
-        """挡得住**人**吗（走路 / 下落）。单向平台算挡。★ 图外算挡得住。"""
-        return self.cell(x, y) != 0
+    def is_solid(self, x, y, t_ms=None):
+        """挡得住**人**吗（走路 / 下落）。单向平台算挡。★ 图外算挡得住。
 
-    def blocks_bullet(self, x, y):
-        """挡得住**子弹**吗。★ 单向平台（值 1）**不挡**，见文件头 §29。"""
-        return self.cell(x, y) >= 2
+        `t_ms` 给了才把**移动平台**算进来（`Mover`，X_Mod §73）：它们的位置
+        随时间走，所以必须由调用方说清「哪一刻」。不给就是老行为，一格不差。
+        """
+        if self.cell(x, y) != 0:
+            return True
+        return t_ms is not None and self.mover_cell(x, y, t_ms) != 0
+
+    def blocks_bullet(self, x, y, t_ms=None):
+        """挡得住**子弹**吗。★ 单向平台（值 1）**不挡**，见文件头 §29。
+
+        `t_ms` 同 `is_solid()`。
+        ★ 破坏物按**弹体那一份**形状算（`Breakable.bullet_rows`，X_Mod §80）。
+        """
+        if self.bullet_cell(x, y) >= 2:
+            return True
+        return t_ms is not None and self.mover_cell(x, y, t_ms) >= 2
+
+    def bullet_solid(self, x, y, t_ms=None):
+        """弹体量地形朝向（7×7 投票，`0x473b36`）时这一格算不算「有东西」。
+
+        判据是**格子非 0**（单向平台也算），格子取客户端 `0x473969` 的口径：
+        静态格与对象（破坏物按弹体那一份、移动平台）取 max（X_Mod §79 / §80）。
+        """
+        if self.bullet_cell(x, y) != 0:
+            return True
+        return t_ms is not None and self.mover_cell(x, y, t_ms) != 0
+
+    def bullet_cell(self, x, y):
+        """弹体那一路看到的静态格（含破坏物的**弹体形状**）。出界返回 2。"""
+        if x < 0 or y < 0 or x >= self.width or y >= self.height:
+            return OUT_OF_BOUNDS
+        cells = self._bcells
+        if cells is None:
+            cells = self._bullet_cells()
+        i = y * self.width + x
+        return (cells[i >> 2] >> ((i & 3) * 2)) & 3
+
+    def _bullet_cells(self):
+        """合成弹体那一份格子（懒建、按 variant 各一份；没有活着的破坏物就是原网格）。"""
+        items = [b for b in self.breakables if b.index in self.alive]
+        if not items:
+            cells = self._base_cells
+        else:
+            buf = bytearray(self._base_cells)
+            for item in items:
+                for first, last, pattern in item.bullet_rows:
+                    chunk = int.from_bytes(buf[first:last], "big") | pattern
+                    buf[first:last] = chunk.to_bytes(last - first, "big")
+            cells = bytes(buf)
+        self._bcells = cells
+        return cells
+
+    def at(self, t_ms):
+        """这张图在 `t_ms` 那一刻的样子：静态格 + 那一刻的移动平台（`TerrainAt`，X_Mod §85）。
+
+        没有移动平台、或者不知道是哪一刻，就是它自己 —— 一格不差的老行为。
+        """
+        if t_ms is None or not self.movers:
+            return self
+        return TerrainAt(self, t_ms)
+
+    def mover_cell(self, x, y, t_ms):
+        """`t_ms` 这一刻，(x, y) 落在哪块移动平台上；都没落上返回 0。"""
+        for mover in self.movers:
+            got = mover.cell_at(x, y, t_ms)
+            if got:
+                return got
+        return 0
 
     # -- 粗网格（弹道加速） -------------------------------------------------
 
@@ -497,17 +965,18 @@ class MapTerrain(object):
             return got
         base, gw, gh = self._base_coarse_grid()
         alive = self.alive
+        # ★ 按**弹体那一份**形状的外接框标（比角色那份大一圈，X_Mod §80）。
         items = [b for b in self.breakables
-                 if b.index in alive and b.col1 >= 0]
+                 if b.index in alive and b.bcol1 >= 0]
         if not items:
             got = (base, gw, gh)
         else:
             grid = bytearray(base)
             for item in items:
-                bx0 = max(0, item.col0) >> COARSE_SHIFT
-                bx1 = min(self.width - 1, item.col1) >> COARSE_SHIFT
-                by0 = max(0, item.row0) >> COARSE_SHIFT
-                by1 = min(self.height - 1, item.row1) >> COARSE_SHIFT
+                bx0 = max(0, item.bcol0) >> COARSE_SHIFT
+                bx1 = min(self.width - 1, item.bcol1) >> COARSE_SHIFT
+                by0 = max(0, item.brow0) >> COARSE_SHIFT
+                by1 = min(self.height - 1, item.brow1) >> COARSE_SHIFT
                 for by in range(by0, by1 + 1):
                     row = by * gw
                     grid[row + bx0:row + bx1 + 1] = b"\x01" * (bx1 - bx0 + 1)
@@ -604,7 +1073,7 @@ class MapTerrain(object):
 
     # -- 弹道 ---------------------------------------------------------------
 
-    def line_blocked(self, x0, y0, x1, y1, step=4):
+    def line_blocked(self, x0, y0, x1, y1, step=4, t_ms=None):
         """(x0,y0) -> (x1,y1) 这条**弹道**中间有没有被地形挡住。
 
         用的是 `blocks_bullet`，**不是** `is_solid` —— 单向平台不挡子弹
@@ -613,6 +1082,8 @@ class MapTerrain(object):
         `step` 是采样步长（像素）。默认 4：角色一步 36 左右，4 像素的
         漏检对「这一发打不打得中」不构成影响，而全像素采样在纯 Python 里
         每发要走上千次循环。★ 端点本身不算 —— 枪口和目标常常贴着地面。
+
+        `t_ms` 给了才把移动平台算进来（X_Mod §73）。
         """
         dx = x1 - x0
         dy = y1 - y0
@@ -622,13 +1093,155 @@ class MapTerrain(object):
         n = int(dist // step)
         for i in range(1, n):
             t = float(i) / n
-            if self.blocks_bullet(int(x0 + dx * t), int(y0 + dy * t)):
+            if self.blocks_bullet(int(x0 + dx * t), int(y0 + dy * t), t_ms):
                 return True
         return False
 
     def __repr__(self):
         return "<MapTerrain %s v%d %dx%d>" % (
             self.name, self.version, self.width, self.height)
+
+
+class TerrainAt(object):
+    """★★ **某一刻**（`t_ms`）的地形：静态格 + 那一刻的移动平台（X_Mod §85）。
+
+    客户端角色走路 / 下落 / 撞头问的都是 `0x473969`（静态格与对象取 max，§80），鲤鱼对角色
+    来说就是**会动的地形格**。`botmove` 只认 `cell / is_solid / is_one_way / blocks_bullet /
+    surfaces / ground_below / coarse_clear / height` 这几样 —— 这里按同一口径把这一刻的鱼
+    叠上去，其余原样转给底下那张图，`botmove` 的物理一行不用改。
+
+    ★ 只给**外推真人**用（`bot._advance_humans`）。bot 自己走路 / 寻路没接它。
+    ★ 一格里的所有查询共用一个视图：鱼的中心只算一次（`Path::Eval` 不便宜），站立面按列缓存。
+    """
+
+    __slots__ = ("base", "t_ms", "_riders", "_cols")
+
+    def __init__(self, base, t_ms):
+        self.base = base
+        self.t_ms = int(t_ms)
+        riders = []
+        for mover in base.movers:
+            for rider in mover.riders:
+                cx, cy = mover.rider_center(rider, self.t_ms)
+                # 外接框多放两格：向零截断多出的一格 + 九格那一圈（同 `Mover.rider_extent`）。
+                riders.append((mover, rider, _f32(cx), _f32(cy),
+                               int(math.floor(cx - rider.aw)) - 2,
+                               int(math.ceil(cx + rider.aw)) + 2,
+                               int(math.floor(cy - rider.ah)) - 2,
+                               int(math.ceil(cy + rider.ah)) + 2))
+        self._riders = tuple(riders)
+        self._cols = {}
+
+    def __getattr__(self, name):
+        # 宽高、出生点、弹跳台、破坏物 …… 这一刻和静态那张图一样。
+        return getattr(self.base, name)
+
+    # -- 格子 ---------------------------------------------------------------
+
+    def mover_cell(self, x, y, t_ms=None):
+        """这一刻 (x, y) 那一格移动平台给的值（0..3），口径同 `Rider.cell()`。"""
+        best = 0
+        for _mover, rider, rx, ry, x0, x1, y0, y1 in self._riders:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                got = rider.cell_f32(rx, ry, x, y)
+                if got > best:
+                    best = got
+        return best
+
+    def cell(self, x, y):
+        """(x, y) 那一格：静态格与这一刻的移动平台取 max（`0x473969`）。出界返回 2。"""
+        got = self.base.cell(x, y)
+        if got >= 3:
+            return got
+        mover = self.mover_cell(x, y)
+        return mover if mover > got else got
+
+    def is_solid(self, x, y, t_ms=None):
+        return self.cell(x, y) != 0
+
+    def is_one_way(self, x, y):
+        return self.cell(x, y) == 1
+
+    def blocks_bullet(self, x, y, t_ms=None):
+        return self.base.blocks_bullet(x, y) or self.mover_cell(x, y) >= 2
+
+    def rider_under(self, x, y):
+        """这个人**站在哪块移动平台上**：`(mover, rider)`；站在静态地面 / 空中返回 `None`。
+
+        客户端每个逻辑帧 `0x50739a` 拿脚下那一格问 `0x473a4f`（返回**提供最大值的那个对象**），
+        结果写进 `[char+0x12c]`；渲染时平台只驮 `[char+0x12c]` 是自己、而且踩地的角色（`0x51ab04`）。
+        ★ 心跳里的脚 y 比实心区第一行高 1~2 px（云桥静态地面 377 发：229 发高 1、148 发高 2），
+          所以「脚下那一格」= 脚 y 往下这三行里第一格非空的；静态格不比它小就算静态的。
+        """
+        xi = int(x)
+        for yi in range(int(y), int(y) + 3):
+            static = self.base.cell(xi, yi)
+            best, best_v = None, static
+            for mover, rider, rx, ry, x0, x1, y0, y1 in self._riders:
+                if x0 <= xi <= x1 and y0 <= yi <= y1:
+                    got = rider.cell_f32(rx, ry, xi, yi)
+                    if got > best_v:
+                        best, best_v = (mover, rider), got
+            if best_v:
+                return best
+        return None
+
+    # -- 站立面 -------------------------------------------------------------
+
+    def surfaces(self, x):
+        """第 x 列自上而下的站立面：静态的和这一刻鱼身上的合在一起，「非空且上一格是空」才算。"""
+        got = self._cols.get(x)
+        if got is not None:
+            return got
+        base = self.base
+        cands = set(base.surfaces(x))
+        for _mover, rider, rx, ry, x0, x1, y0, y1 in self._riders:
+            if not x0 <= x <= x1:
+                continue
+            lx = _client_local_fast(x, rx, rider.aw)
+            if lx < 0 or lx >= rider.sw:
+                continue
+            for ly in rider.column_tops(lx):
+                # 局部第 ly 行最上面那一行世界 y（映射单调，差不出两格）。
+                y = int(math.floor(float(ry) - rider.ah + ly)) - 1
+                while _client_local_fast(y, ry, rider.ah) < ly:
+                    y += 1
+                cands.add(y)
+        cell = self.cell
+        got = tuple(sorted(y for y in cands
+                           if 0 <= y < base.height and cell(x, y) != 0
+                           and (y == 0 or cell(x, y - 1) == 0)))
+        self._cols[x] = got
+        return got
+
+    def ground_below(self, x, y):
+        for sy in self.surfaces(x):
+            if sy >= y:
+                return sy
+        return None
+
+    def ground_above(self, x, y):
+        found = None
+        for sy in self.surfaces(x):
+            if sy < y:
+                found = sy
+            else:
+                break
+        return found
+
+    def coarse_clear(self, x0, y0, x1, y1):
+        """静态那张粗网格担保得了、**而且**这一块碰不到这一刻的任何一块移动平台，才算空。"""
+        if x0 > x1:
+            x0, x1 = x1, x0
+        if y0 > y1:
+            y0, y1 = y1, y0
+        for _mover, _rider, _rx, _ry, bx0, bx1, by0, by1 in self._riders:
+            if x0 <= bx1 and bx0 <= x1 and y0 <= by1 and by0 <= y1:
+                return False
+        return self.base.coarse_clear(x0, y0, x1, y1)
+
+    def __repr__(self):
+        return "<TerrainAt %r @ %d ms>" % (self.base, self.t_ms)
 
 
 def _unblob(text):

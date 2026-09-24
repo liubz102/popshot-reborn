@@ -30,6 +30,21 @@ int  gbk_to_wide(const char *src, size_t srclen, wchar_t *dst, size_t cap);
 int  wide_to_gbk(const wchar_t *src, size_t srclen, char *dst, size_t cap);
 /* 宽字符 -> UTF-8（写日志用），带 NUL 结尾。 */
 int  wide_to_utf8(const wchar_t *src, char *dst, size_t cap);
+/* UTF-8 字节 -> 宽字符（服务器回来的 update.config）。自动吃掉 BOM；
+   cap 不够时截到放得下为止（退回 UTF-8 起始字节，不切半个汉字）。
+   返回宽字符数，失败 -1。 */
+int  utf8_to_wide(const char *src, size_t srclen, wchar_t *dst, size_t cap);
+
+/* ---- 更新源的显示名 ------------------------------------------------------ */
+
+/* manifest 地址 -> 界面上「仓库：」那一行用的简写（最长 40 字符，超了截断
+   加「…」）。去掉 scheme 和 www.，保留域名 + 前两段路径；域名正好是
+   github.com 时连它一起去掉：
+     https://github.com/liubz102/popshot-reborn/releases/latest/download/manifest.json
+       -> liubz102/popshot-reborn
+     https://oss.example.com/pkg/manifest.json   -> oss.example.com/pkg/manifest.json
+   ★ 纯展示，不参与任何判断 —— 认不出的地址原样截断即可。 */
+void manifest_repo_label(const wchar_t *url, wchar_t *out, size_t cap);
 
 /* ---- 路径 ---------------------------------------------------------------- */
 
@@ -59,7 +74,9 @@ int  base64_encode(const unsigned char *src, size_t len, char *dst, size_t cap);
 void u64_to_wide(unsigned long long v, wchar_t *out, size_t cap);
 /* 字节数 -> MiB 一位小数的宽串（"123.4"），界面/日志的速度、大小都用它。 */
 void mib_to_wide(unsigned long long bytes, wchar_t *out, size_t cap);
-/* 时间格式 "YYYY-MM-DD HH:MM:SS"。 */
+/* 本机此刻的 UTC 偏移："UTC+8" / "UTC-3" / "UTC+5:30"。 */
+void utc_offset_text(wchar_t *out, size_t cap);
+/* 时间格式 "YYYY-MM-DD HH:MM:SS UTC+8"（★ 带时区，bug调查/25）。 */
 void now_stamp(wchar_t *out, size_t cap);
 
 #endif /* UPDATER_UTIL_H */

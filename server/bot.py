@@ -3306,7 +3306,17 @@ def _advance_humans(room, terrain):
 
     ★ 拿不到地形就什么都不做：那时 `_seat_body()` 退回轨迹最后那一点，
       和 D106 之前一样。
+
+    ## 第 k 格 = 他那台客户端「心跳那一帧之后的第 k − 1 帧」（X_Mod §85）
+
+    硬置那一格（k = 0）是心跳那一帧开头的样子；之后每一格照客户端一帧的顺序走：
+    ① 按那一帧**他自己那条鱼**的位置走一步（`terrain.at()`：鱼对角色就是会动的地形格，
+    站、走、落、撞头全算上）；② 这一帧按过跳的话**走完才离地**（`botmove.takeoff`）；
+    ③ 渲染时平台把这一帧的位移加给站在它上面、还踩着地的人（`0x51ab04`）。
+    以前外推只认静态地形：站鱼背不动被当成原地不动（中位差 7 px）、落到鱼背上穿过去接着掉
+    （中位 26、最大 114 px）、起跳早一格（~20 px）—— 本机也「客户端撞到你、服务端判没中」。
     """
+    step_ms = botmove.TICK_MS
     for index, seat in enumerate(room.seats):
         if seat is None or getattr(seat, "is_bot", False):
             continue
@@ -3326,26 +3336,66 @@ def _advance_humans(room, terrain):
                 point[0], point[1], vx=point[4], vy=point[5],
                 on_ground=bool(point[3]))
             conn.sim_body_mark = mark
+            conn.sim_step = 0
+            # 心跳正好落在「刚起跳、还没动」那一格：客户端报「腾空、vy 正好是起跳初速、位置没动」，
+            # 上一发还踩地（重力一加就不是整 −20 了）⇒ 下一格照客户端走起跳那一步（X_Mod §87）。
+            previous = trail[-2] if len(trail) > 1 else None
+            conn.sim_launch = bool(
+                not point[3] and point[5] == -botmove.JUMP_SPEED
+                and previous is not None and previous[3])
             continue
         if terrain is None:
             continue
         who = chrprops.get(seat.character_id)
         keys = point[8] if len(point) > 8 else 0
-        # ★★★ 起跳是**事件**，不是心跳里的一格状态（§173）。收方收到
-        #   `rpJump` 当场就让那个角色离地（`rpJump` 存在的全部理由就是
-        #   这个：不发的话远端的跳只能等下一发心跳把坐标拽上去）。
-        #   以前这里只认心跳 ⇒ 从「他按下跳」到「下一发心跳到达」这一段，
-        #   服务端手上那份身体还站在地上：实测中位差 **38 px**、最大 103 px
-        #   （2026-09-02 那局，53 次起跳）—— 正好是「我跳起来躲开了却
-        #   照样被打中」的那一窗口。
-        want_jump = bool(getattr(conn, "sync_jump_pending", 0))
-        if want_jump:
-            conn.sync_jump_pending = 0
-        conn.sim_body = botmove.tick(
-            terrain, body, who,
-            direction=_human_direction(keys),
-            fast_run=bool(point[6]), crouched=bool(point[7]),
-            want_jump=want_jump)
+        direction = _human_direction(keys)
+        fast_run, crouched = bool(point[6]), bool(point[7])
+        step = getattr(conn, "sim_step", 0) + 1
+        conn.sim_step = step
+        # ① 这一步撞的是那一帧的鱼。
+        base_ms = _human_mover_phase(room, terrain, conn)
+        view = (terrain if base_ms is None
+                else terrain.at(base_ms + step_ms * (step - 1)))
+        moving = view is not terrain
+        riding = (view.rider_under(body.x, body.y)
+                  if moving and body.on_ground else None)
+        airborne = not body.on_ground
+        # ★★ 腾空用**客户端那套**物理（X_Mod §87 / D63）：撞上了这一格不动、只改速度，
+        #   落地 / 反弹照抄 `0x50efd2`；起跳后那一格只按速度挪（不加重力、不扫掠）。
+        #   踩地走路仍是 `botmove.tick`（走路那一段客户端没逆，`0x50d9a7`）。
+        launching = getattr(conn, "sim_launch", False)
+        conn.sim_launch = False
+        if launching:
+            body = botmove.client_launch_tick(view, body)
+        elif airborne:
+            body = botmove.client_air_tick(view, body, who, crouched)
+        else:
+            body = botmove.tick(view, body, who, direction=direction,
+                                fast_run=fast_run, crouched=crouched)
+        if moving and airborne and body.on_ground:
+            riding = view.rider_under(body.x, body.y)     # 落地那一下也认一次（`0x50f1f8`）
+        # ② ★★★ 起跳是**事件**（§173）：`rpJump` 记着离心跳第几帧，排到那一帧上，
+        #   而且那一帧先走完这一步再离地（83 次起跳核过，X_Mod §85）。
+        #   晚到的（远程抖动）就在这一格补上，不丢。
+        jumps = getattr(conn, "sync_jump_ticks", ())
+        if jumps:
+            due = [stage for ticks, stage in jumps if ticks + 1 <= step]
+            if due:
+                conn.sync_jump_ticks = tuple(
+                    item for item in jumps if item[0] + 1 > step)
+                for _stage in due:
+                    grounded = body.on_ground
+                    body = botmove.takeoff(body, who, direction, fast_run,
+                                           crouched)
+                    if grounded and not body.on_ground:
+                        conn.sim_launch = True      # 下一格走 `client_launch_tick`
+        # ③ 平台驮人：只驮站在它上面、这一帧末还踩着地的（起跳那一帧已经离地，不驮）。
+        if riding is not None and body.on_ground:
+            mover, rider = riding
+            ax, ay = mover.rider_center(rider, view.t_ms)
+            bx, by = mover.rider_center(rider, view.t_ms + step_ms)
+            body = body.moved(body.x + (bx - ax), body.y + (by - ay))
+        conn.sim_body = body
 
 
 def _seat_on_ground(room, seat_index):
@@ -6858,7 +6908,138 @@ def _reportable_speed(before, body, air_stepped=True):
     return vx, vy
 
 
-def _path_blocked(terrain, x0, y0, shot, radius=0.0):
+def _mover_clock(room, terrain, shell=None, at=None):
+    """**移动平台的相位**：客户端这张图的移动平台起点之后过了多少毫秒（X_Mod §73 / §74 / §78）。拿不到返回 `None`。
+
+    `at` = 按哪个时刻（`time.monotonic()` 口径）算，不给就是「这一格」（`_now()`）。
+
+    ★ 客户端 `PathFollower::GetPos`（`0x549bec`）一律算 `Timer() + t_off − t0`，`t0` 在
+      `[obj+0x90]`，**写两次**（§78）：载图时 `MapObject::LinkPath`（`0x511d97`）一次；
+      **开打时** `GameContext::StartGame`（`0x491244`，所有模式都走）调 `0x476435` 把
+      所有移动平台**整体重取**一次（`0x476463`）⇒ 战斗里的相位 = 「这台客户端开打后
+      多少毫秒」。协议里**没有**任何同步移动平台的包，`Timer()` 走的是当前 Stage 的
+      `+0xe0`（每帧的 now），多人房里每台机器还各差一个「它自己收到 `0x0402` 的时刻」。
+
+    取值顺序（D55，用户 2026-09-22 拍板**按房主**）：
+
+    0. ★★ **这颗弹在房主那台客户端上是哪个逻辑帧出膛的**（`shell` 给了、房主报过，D60）：
+       客户端逻辑帧是固定 32 ms 的网格，移动平台的碰撞位置只在渲染时按 `Timer()` 刷新，
+       逻辑帧里撞到的鱼 = 该帧的 `[Stage+0xe0] − t0`（X_Mod §81）。hook 每个逻辑帧报
+       `(帧号, 该帧 Timer)`，并报「这一帧建了哪些远端弹体」⇒ 第 k 格 = 出膛帧 + k − 1 那一帧
+       的 Timer，**逐帧照抄**；那一帧还没报到就按最近一帧 + 32·Δ 外推（`Conn.tick_timer`）。
+       旧的 1 算出来的比这个平均早 12 ms、σ 7 ms（两局 29 次真反弹，§81）—— 鲤鱼上一格 1 px
+       的窗口只有 ±6 ms，那点差就够弹向全变。
+    1. **房主报的**（`room.host_seat`）—— `bshook` 在两个写 `t0` 的站点置脏、每秒一发，
+       每一发都从对象身上现读 `t0`，报 `Timer() − t0`（`Conn.note_mover_phase`）；开打
+       重取后 ≤100 ms 就报上来新的起点。鱼在房主屏幕上在哪，判定就按哪算。房主掉线时
+       **复用大厅那套转移逻辑**（`lobby.leave`：转给还在的最小座位号、跳过 bot），这里
+       每次现读 `host_seat`，不自己记人，所以换了房主下一格就跟着换。
+    2. **开局估计**：`room.quest.started_at`（房主没报：没中继 / UDP 被挡）。它就是
+       服务端广播 `0x0402` 那一刻，而客户端正是收到 `0x0402` 进 stage 7 时重取起点 ⇒
+       误差只有「投递 + 客户端建 GameStage 那一帧」（2026-09-23 两局离线拟合 40~70 ms）。
+    3. 都没有 → `None`，全套判定退回「不知道有移动平台」的老行为，一格不差。
+
+    ★★ 会话 30~33 报的是**载图时**的起点，开打重取后 hook 又被一道「Stage 必须没换」
+      的门拦住不再发 ⇒ 服务端一整局都按载图时刻算，比客户端早一整段加载等待
+      （2026-09-23 实测 8.46 s / 6.16 s），鲤鱼上的雷「大部分错位、偶尔对」（§78）。
+
+    ★★ 会话 29 那版写的是 `getattr(room, "started_at")`，而字段在 **`room.quest`** 上
+      ⇒ 永远 `None`，整套判定从来没启用过（用户 2026-09-22 报「手雷照样穿过鲤鱼」，§74）。
+      `test_moverphase.py` 现在钉着「有 quest 就必须返回整数」。
+    ★ `t_off`（每块地形自己的相位偏移）**不在这里加**，`Mover.rider_center()` 自己加。
+    ★ 这张图没有移动平台就直接 `None` —— 相位对它没有意义，也省得每颗弹每格都去翻座位。
+    """
+    movers = getattr(terrain, "movers", None)
+    if not movers:
+        return None
+    now = _now() if at is None else at
+    seats = getattr(room, "seats", None) or ()
+    host = getattr(room, "host_seat", None)
+    seat = seats[host] if (host is not None and 0 <= host < len(seats)) else None
+    # bot 的 `BotConn` 没有这一格；老客户端 / 没中继的真人是 `None`。
+    conn = getattr(seat, "conn", None)
+    phase = getattr(conn, "mover_phase", None)
+    if phase:
+        if shell is not None:
+            got = _shell_tick_phase(conn, phase, movers, shell)
+            if got is not None:
+                return got
+        for mover in movers:
+            got = phase.get(mover.handle)
+            if got is not None:
+                # 同一遍 LinkPath 里所有对象的 `t0` 是同一帧的 `Timer()`，
+                # 所以对上任何一条路径就等于对上了整张图。
+                return int(got[1] + (now - got[0]) * 1000.0)
+    started = getattr(getattr(room, "quest", None), "started_at", None)
+    if started is None:
+        return None
+    return int((now - started) * 1000.0)
+
+
+def _human_mover_phase(room, terrain, conn):
+    """这个真人**最近那发心跳那一帧**，他自己客户端上的移动平台在哪个相位（X_Mod §85）。
+
+    每台客户端的鱼按它自己的时钟摆（`t0` 是它自己开打那一刻，§78），人站在**他自己那条**
+    鱼上 —— 所以先用他自己报的相位（`Conn.mover_phase`）；他没报过才退回全房间那一份
+    （`_mover_clock`：房主报的 / 开局估计）。时刻取心跳**到达**那一刻：相位报告和心跳走的是
+    同一台机器，单程延迟两边一样，相减抵消。拿不到返回 `None`（外推就不认移动平台，同老行为）。
+    """
+    movers = getattr(terrain, "movers", None)
+    at = getattr(conn, "sync_trail_at", None)
+    if not movers or at is None:
+        return None
+    phase = getattr(conn, "mover_phase", None)
+    if phase:
+        for mover in movers:
+            got = phase.get(mover.handle)
+            if got is not None:
+                return int(got[1] + (at - got[0]) * 1000.0)
+    return _mover_clock(room, terrain, at=at)
+
+
+def _shell_tick_phase(conn, phase, movers, shell):
+    """这颗弹第 `shell.ticks` 格在房主客户端上撞到的鱼是哪个相位（D60）；不知道返回 `None`。
+
+    房主报过这颗弹的出膛帧 `m1`（`Conn.shell_birth`），第 k 格就是客户端第 `m1 + k − 1`
+    个逻辑帧 —— 那一帧的 `Timer()` 减去起点 `t0`（`mover_phase` 第 4 格，同一台机器的
+    同一个时钟）。两个都是 u32，差按有符号读（客户端 `Path::Eval` 也是有符号取模）。
+    """
+    births = getattr(conn, "shell_birth", None)
+    birth = births.get(shell.handle) if births else None
+    if birth is None:
+        return None
+    timer = _tick_timer(conn, birth + shell.ticks - 1)
+    if timer is None:
+        return None
+    for mover in movers:
+        got = phase.get(mover.handle)
+        if got is not None:
+            since = (int(timer) - int(got[3])) & 0xFFFFFFFF
+            return since - 0x100000000 if since >= 0x80000000 else since
+    return None
+
+
+def _tick_timer(conn, tick):
+    """房主客户端第 `tick` 个逻辑帧的 `Timer()`（D60）；一帧都没报过返回 `None`。
+
+    报到了就照抄。那一帧还没报到（远程多半如此：客户端推这一格和服务端推这一格几乎
+    同时，包还在路上）就从**最近报到的那一帧**按逻辑帧步长外推 —— 客户端逻辑帧是
+    固定 32 ms 的网格（`Stage::Update` 里 `idiv [0x6dc528]`，§81），不是估计值。
+    """
+    clock = getattr(conn, "tick_clock", None)
+    if not clock:
+        return None
+    got = clock.get(tick)
+    if got is not None:
+        return got
+    latest = getattr(conn, "tick_latest", None)
+    if latest is None:
+        return None
+    ref_tick, ref_timer = latest
+    return (int(ref_timer) + int(ballistics.TICK_MS) * (tick - ref_tick)) & 0xFFFFFFFF
+
+
+def _path_blocked(terrain, x0, y0, shot, radius=0.0, t_ms=None):
     """这条弹道中途会不会撞上地形。
 
     ★ 用 `blocks_bullet()` 那一路（`mapdata.line_blocked`），**不是**
@@ -6893,16 +7074,16 @@ def _path_blocked(terrain, x0, y0, shot, radius=0.0):
     """
     if terrain is None:
         return False
-    if _muzzle_blocked(terrain, x0, y0, shot, radius):
+    if _muzzle_blocked(terrain, x0, y0, shot, radius, t_ms):
         return True
     points = ballistics.path_points(x0, y0, shot)
     for (ax, ay), (bx, by) in zip(points, points[1:]):
-        if terrain.line_blocked(ax, ay, bx, by, step=BOT_LINE_STEP):
+        if terrain.line_blocked(ax, ay, bx, by, step=BOT_LINE_STEP, t_ms=t_ms):
             return True
     return False
 
 
-def _muzzle_blocked(terrain, x0, y0, shot, radius=0.0):
+def _muzzle_blocked(terrain, x0, y0, shot, radius=0.0, t_ms=None):
     """仅查弹体能否出膛，和 `_terrain_contact()` 共用采样点（§116）。
 
     失误弹可以途中撞地，但仍不能从埋进地形的枪口发射（§76）。
@@ -6914,10 +7095,10 @@ def _muzzle_blocked(terrain, x0, y0, shot, radius=0.0):
                                       math.sin(shot.angle))
     else:
         offsets = ((0, 0),)
-    return _probe_blocked(terrain, int(x0), int(y0), offsets)
+    return _probe_blocked(terrain, int(x0), int(y0), offsets, t_ms)
 
 
-def _shot_impact(terrain, x0, y0, shot, radius=0.0):
+def _shot_impact(terrain, x0, y0, shot, radius=0.0, t_ms=None):
     """这条弹道首次撞地形的坐标；飞完都没撞上返回 `None`。
 
     分段和碰撞形状完全复用 `_terrain_contact()` / `ballistics.path_points()`，
@@ -6928,7 +7109,7 @@ def _shot_impact(terrain, x0, y0, shot, radius=0.0):
     points = ballistics.path_points(x0, y0, shot)
     for (ax, ay), (bx, by) in zip(points, points[1:]):
         hit_t, _safe_t = _terrain_contact(terrain, ax, ay, bx, by,
-                                          radius=radius)
+                                          radius=radius, t_ms=t_ms)
         if hit_t is not None:
             return (ax + (bx - ax) * hit_t, ay + (by - ay) * hit_t)
     return None
@@ -7271,7 +7452,8 @@ def _breakable_option(room, machine, weapon, terrain, solve, x, y):
         if shot is None or _outlives_fuse(weapon, shot):
             continue
         impact = _shot_impact(terrain, mx, my, shot,
-                              float(getattr(weapon, "size", 0.0) or 0.0))
+                              float(getattr(weapon, "size", 0.0) or 0.0),
+                              t_ms=_mover_clock(room, terrain))
         if impact is None:
             continue
         preview = botbreak.preview_damage(
@@ -7341,7 +7523,8 @@ def _engagement(room, machine, seat_index, weapon, miss=None):
         if _outlives_fuse(weapon, shot):
             continue
         if (not BOT_DIAG_FIRE_ANYWHERE
-                and _path_blocked(terrain, mx, my, shot, weapon.size)):
+                and _path_blocked(terrain, mx, my, shot, weapon.size,
+                                  t_ms=_mover_clock(room, terrain))):
             continue
         best = Engagement(index, point, shot, span,
                           math.hypot(velocity[0], velocity[1]), radius)
@@ -7417,7 +7600,8 @@ def _mob_engagement(room, machine, weapon, terrain, solve, x, y):
         shot = solve(mx_ - gx, my_ - gy)
         if shot is None or _outlives_fuse(weapon, shot):
             continue
-        if _path_blocked(terrain, gx, gy, shot, weapon.size):
+        if _path_blocked(terrain, gx, gy, shot, weapon.size,
+                         t_ms=_mover_clock(room, terrain)):
             continue
         best = Engagement(MOB_SEAT, (mx_, my_), shot, span, 0.0,
                           MOB_HIT_RADIUS + float(weapon.size or 0.0))
@@ -7448,7 +7632,8 @@ def _smoke_engagement(room, machine, seat_index, weapon, terrain, solve, x, y):
         shot = solve(tx - mx, ty - my)
         if shot is None or _outlives_fuse(weapon, shot):
             continue
-        if _path_blocked(terrain, mx, my, shot, weapon.size):
+        if _path_blocked(terrain, mx, my, shot, weapon.size,
+                         t_ms=_mover_clock(room, terrain)):
             continue
         return Engagement(index, (tx, ty), shot, span, 0.0,
                           _hit_radius(room, index, weapon))
@@ -7917,7 +8102,7 @@ class Shell(object):
                  "shot", "born", "born_tick", "ticks", "x", "y",
                  "max_ticks",
                  "vx", "vy", "locked", "bounced",
-                 "damage_ratio", "size_ratio")
+                 "damage_ratio", "size_ratio", "blocked_at")
 
     def __init__(self, handle, fire_seq, weapon, group, x0, y0, shot, born,
                  max_ticks, born_tick=0):
@@ -7958,6 +8143,10 @@ class Shell(object):
         #:   不跟着状态到期变 —— 这一颗已经飞出去了。
         self.damage_ratio = 1.0
         self.size_ratio = 1.0
+        #: ★★ 最后一格**把它挡住的那个探针格** `(x, y)`（客户端 `0x50e759` 的
+        #:   `hit.cell`，X_Mod §79）；这一格没撞地形就是 `None`。V0.3 §161「掉出
+        #:   下边界」的判据就是这一格在不在图外（`_shell_fell_out_of_the_world`）。
+        self.blocked_at = None
 
     @property
     def radius(self):
@@ -8052,6 +8241,47 @@ def _segment_circle_t(ax, ay, bx, by, cx, cy, radius):
     return t if 0.0 <= t <= 1.0 else None
 
 
+def _body_air_velocity(room, seat_index):
+    """这个座位的人**这一格自己会挪多少**：`(vx, vy)`；踩在地上 / 不知道就是 `(0, 0)`（X_Mod §86）。
+
+    客户端判「弹体撞人」（`0x50bd67`）是**两边一起动**的相对扫掠：弹体按它的速度、人按他
+    自己的 `[角色+0x120]` 各走一格。踩地的人那一格恒 0（走路不走速度，§35），所以只有腾空的
+    人才有这一项 —— 真人取逐格外推那份（`sim_body`），bot 取它自己的物理状态。
+    """
+    if not isinstance(seat_index, int):
+        return (0.0, 0.0)                   # 怪（`("mob", 句柄)`）没有这一格
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    conn = None if seat is None else seat.conn
+    if conn is None:
+        return (0.0, 0.0)
+    body = getattr(conn, "body" if getattr(seat, "is_bot", False) else "sim_body",
+                   None)
+    if body is None or body.on_ground:
+        return (0.0, 0.0)
+    return (body.vx, body.vy)
+
+
+def _character_hit(character, px, py, crouched, vx, vy, ax, ay, bx, by,
+                   radius, pass_flags):
+    """弹体这一格 `A→B` 撞没撞到这个人：`(t, 部位)`；没撞到返回 `None`（X_Mod §86）。
+
+    照抄客户端 `0x50f410` → `0x50bd67`：
+    * 圆**按腿 → 身 → 头的顺序**试，第一个扫到的就算（不是比谁的 t 更早）；
+    * 武器的 `PassObjCollBlockFlags` 和圆的掩码相交就直接穿过去（`-03` 那族打不到腿）；
+    * 相对扫掠：人这一格也按他自己的速度走（`vx, vy`）—— 在人的参照系里看，弹体走的是
+      `A → B − (vx, vy)` 这一段，和不动的圆求第一次接触（起点就重叠算 0）。
+    """
+    rel_bx = bx - vx
+    rel_by = by - vy
+    for cx, cy, r, region, flags in character.hit_shapes(px, py, crouched):
+        if flags & pass_flags:
+            continue
+        t = _segment_circle_t(ax, ay, rel_bx, rel_by, cx, cy, r + radius)
+        if t is not None:
+            return t, region
+    return None
+
+
 def shell_probe_offsets(radius, dx, dy):
     """收方拿**哪几个点**去查地形（V0.3 §116）。返回整数格偏移的元组。
 
@@ -8096,7 +8326,7 @@ def shell_probe_offsets(radius, dx, dy):
     return tuple(offsets)
 
 
-def _probe_blocked(terrain, x, y, offsets):
+def _probe_blocked(terrain, x, y, offsets, t_ms=None):
     """这一组采样点里有没有一个落在挡子弹的地形上。
 
     ★★ **图顶上面（`y < 0`）不算实心**（§83）。`TerrainData::Get`（`0x472fe0`）
@@ -8108,12 +8338,89 @@ def _probe_blocked(terrain, x, y, offsets):
     blocks = terrain.blocks_bullet
     for ox, oy in offsets:
         yy = y + oy
-        if yy >= 0 and blocks(x + ox, yy):
+        if yy >= 0 and blocks(x + ox, yy, t_ms):
             return True
     return False
 
 
-def _terrain_contact(terrain, ax, ay, bx, by, radius=0.0):
+def _mover_contact(terrain, ax, ay, bx, by, radius, t_ms):
+    """线段 A→B 在 `t_ms` 这一刻撞上**移动平台**的 `(撞上那点的 t, 之前最后一点的 t)`。
+
+    ★ 为什么单独走一遍，而不是塞进 `_terrain_contact()` 的主循环：那个循环靠
+      `bullet_coarse()` 的粗网格整块跳过空气，而粗网格是**静态地形**烘的、
+      不含会动的东西 —— 直接混进去会一步跳过鲤鱼。这里改成先拿移动平台
+      **这一刻的外接框**把线段裁短，只在裁出来的那一小段上逐像素问掩码，
+      主循环一个字都不用改，性能也只在真的路过平台时才付。
+
+    没有移动平台、或 `t_ms` 没给，立刻返回 `(None, None)` —— 174 张图里只有
+    13 张有（共 24 条路径），其余一分钱不花。
+    """
+    movers = getattr(terrain, "movers", ())
+    if not movers or t_ms is None:
+        return (None, None)
+    dx = bx - ax
+    dy = by - ay
+    if radius and radius >= 1.0:
+        offsets = shell_probe_offsets(radius, dx, dy)
+    else:
+        offsets = ((0, 0),)
+    span = max(abs(dx), abs(dy))
+    steps = max(1, int(span // BOT_SHELL_TERRAIN_STEP))
+    best = None
+    for mover in movers:
+        for rider in mover.riders:
+            # ★ 中心按 rider 算（各自的 `t_off` / 相对模式，§74），不是路径点。
+            cx, cy = mover.rider_center(rider, t_ms)
+            left = math.floor(cx - rider.sw / 2.0)
+            top = math.floor(cy - rider.sh / 2.0)
+            # 采样点带着 `offsets` 一起动，框先按最大偏移放宽，别漏掉边缘那一下
+            pad = int(math.ceil(radius)) + 1 if radius else 1
+            lo, hi = _seg_box_steps(ax, ay, dx, dy, steps,
+                                    left - pad, left + rider.sw - 1 + pad,
+                                    top - pad, top + rider.sh - 1 + pad)
+            if lo is None:
+                continue
+            for i in range(max(lo, 1), min(hi, steps) + 1):
+                t = float(i) / steps
+                px = int(ax + dx * t)
+                py = int(ay + dy * t)
+                for ox, oy in offsets:
+                    if rider.cell(cx, cy, px + ox, py + oy) >= 2:
+                        if best is None or i < best[0]:
+                            best = (i, t, float(i - 1) / steps)
+                        break
+                else:
+                    continue
+                break
+    if best is None:
+        return (None, None)
+    return (best[1], best[2])
+
+
+def _seg_box_steps(ax, ay, dx, dy, steps, x0, x1, y0, y1):
+    """线段（按 `steps` 等分）落进矩形 [x0,x1]×[y0,y1] 的**步号区间**，不相交返回 (None, None)。
+
+    每一轴单独解出「第几步到第几步在这一轴的区间里」，再取交集 —— 射线是单调的，
+    所以每一轴的区间一定是连续的一段。
+    """
+    lo, hi = 0, steps
+    for a, d, c0, c1 in ((ax, dx, x0, x1), (ay, dy, y0, y1)):
+        if abs(d) < 1e-9:
+            if a < c0 or a > c1:
+                return (None, None)
+            continue
+        t0 = (c0 - a) / d
+        t1 = (c1 - a) / d
+        if t0 > t1:
+            t0, t1 = t1, t0
+        lo = max(lo, int(math.floor(t0 * steps)))
+        hi = min(hi, int(math.ceil(t1 * steps)))
+        if lo > hi:
+            return (None, None)
+    return (lo, hi)
+
+
+def _terrain_contact(terrain, ax, ay, bx, by, radius=0.0, t_ms=None):
     """线段 A→B 上第一次**撞地形**的 `(撞上那一点的 t, 撞上之前最后一点的 t)`。
 
     一路通畅返回 `(None, None)`。起点本身就撞着返回 `(0.0, 0.0)`。
@@ -8161,8 +8468,9 @@ def _terrain_contact(terrain, ax, ay, bx, by, radius=0.0):
         offsets = shell_probe_offsets(radius, dx, dy)
     else:
         offsets = ((0, 0),)
-    if _probe_blocked(terrain, int(ax), int(ay), offsets):
+    if _probe_blocked(terrain, int(ax), int(ay), offsets, t_ms):
         return (0.0, 0.0)
+    moved = _mover_contact(terrain, ax, ay, bx, by, radius, t_ms)
     span = max(abs(dx), abs(dy))
     steps = max(1, int(span // BOT_SHELL_TERRAIN_STEP))
     grid, gw, _gh = terrain.bullet_coarse()
@@ -8255,9 +8563,11 @@ def _terrain_contact(terrain, ax, ay, bx, by, radius=0.0):
             i += jump + 1
             continue
         if _probe_blocked(terrain, cx, cy, offsets):
+            if moved[0] is not None and moved[0] < t:
+                return moved
             return (t, float(i - 1) / steps)
         i += 1
-    return (None, None)
+    return moved
 
 
 def _terrain_contact_exact(terrain, ax, ay, bx, by, radius=0.0):
@@ -8466,7 +8776,7 @@ def _bounces_off_terrain(weapon):
 
     「弹开」「钉住」「接着飞」都算 —— 判据是「这一发**没结束**」。
     2 档（火焰弹那种「看角度」）在这里算 True，真正炸不炸由
-    `_resolve_terrain_block()` 拿到法线之后再定。
+    `_resolve_terrain_hit()` 拿到法线之后再定。
     """
     return _blocked_mode(weapon) != BLOCKED_EXPLODE
 
@@ -8499,8 +8809,12 @@ def _shell_velocity(shell):
 #: 得到的是一个**指向实心那一侧**的矢量（没有归一化，也没有按距离加权 ——
 #: 会话 25 那版「每格投一票单位矢量」猜错的正是这两点）。
 #:
-#: ★ 判据是「格子非空」（`test al,al; je`），**单向平台也算**（值 1）——
-#: 所以这里用 `is_solid()` 而不是 `blocks_bullet()`。
+#: ★ 判据是「格子非空」（`test al,al; je`），**单向平台也算**（值 1）。
+#:
+#: ★★ `0x473969` 的「格子」**连地图对象一起算**（X_Mod §77 / §80）：先取静态格子
+#: `0x472fe0`，再把 (x±5, y±5) 框里每个地图对象的 `vft+0x11c(x, y)`（破坏物 /
+#: 移动平台的掩码，`0x51a935` 那个九格取 max 的口径）逐个取 **max**（`0x4738f8`）。
+#: 所以投票和扫掠问的是**同一个**格子：`_BulletProbe.value()`。
 TERRAIN_VOTE_WINDOW = 3
 
 #: 反弹的两个系数，都是 `0x47c7a4: fld [0x69371c]` = **0.5**（V0.3 §110）：
@@ -8510,31 +8824,94 @@ BOUNCE_RESTITUTION = 0.5
 BOUNCE_FRICTION = 0.5
 
 
-def _terrain_facing(terrain, x, y):
+class _BulletProbe(object):
+    """弹体这一格要问的「格子」：客户端 `0x473969` 的口径（X_Mod §79 / §80）。
+
+    静态格（破坏物按**弹体那一份**形状，`MapTerrain.bullet_cell`）和这一刻的
+    移动平台取 **max**。移动平台的中心每一格只算一次（`Path::Eval` 不便宜，
+    扫掠一格要问几十个点）。
+
+    ★ 图顶上面（`y < 0`）一律当空（V0.3 §83 实测：弹体飞出图顶又落回来）。
+    """
+
+    __slots__ = ("terrain", "t_ms", "pairs", "_riders")
+
+    def __init__(self, terrain, t_ms):
+        self.terrain = terrain
+        self.t_ms = t_ms
+        pairs = []
+        if t_ms is not None:
+            for mover in getattr(terrain, "movers", ()):
+                for rider in mover.riders:
+                    pairs.append((mover, rider, mover.rider_extent(rider)))
+        #: 这张图上每块移动平台和它**走完一整圈**的外接框 —— 框外的点连路径都不用算。
+        self.pairs = tuple(pairs)
+        self._riders = None
+
+    def _rider_list(self):
+        """这一刻每块移动平台的 (rider, f32 中心 x, y, 外接框)。第一次真的要用时才算路径。"""
+        riders = self._riders
+        if riders is None:
+            out = []
+            for mover, rider, _extent in self.pairs:
+                cx, cy = mover.rider_center(rider, self.t_ms)
+                # 外接框放宽两格：向零截断多出的那一格 + 九格取 max 的那一圈
+                out.append((rider, mapdata.f32(cx), mapdata.f32(cy),
+                            cx - rider.aw - 2, cx + rider.aw + 2,
+                            cy - rider.ah - 2, cy + rider.ah + 2))
+            riders = self._riders = tuple(out)
+        return riders
+
+    def _near_path(self, x0, y0, x1, y1):
+        for _mover, _rider, (ex0, ex1, ey0, ey1) in self.pairs:
+            if x1 >= ex0 and x0 <= ex1 and y1 >= ey0 and y0 <= ey1:
+                return True
+        return False
+
+    def value(self, x, y):
+        if y < 0:
+            return 0
+        got = self.terrain.bullet_cell(x, y)
+        if got >= 2 or not self.pairs or not self._near_path(x, y, x, y):
+            return got
+        for rider, rx, ry, x0, x1, y0, y1 in self._rider_list():
+            if x < x0 or x > x1 or y < y0 or y > y1:
+                continue
+            v = rider.cell_f32(rx, ry, x, y)
+            if v > got:
+                got = v
+        return got
+
+    def blocked(self, x, y):
+        """挡不挡弹体：值 2 / 3。单向平台（1）对弹体一律不挡（`vft+0x100` 恒假，V0.3 §29）。"""
+        return self.value(x, y) >= 2
+
+    def riders_touch(self, x0, y0, x1, y1):
+        """`[x0,x1]×[y0,y1]` 碰不碰得到某块移动平台（按它这一刻的外接框）。"""
+        if not self.pairs or not self._near_path(x0, y0, x1, y1):
+            return False
+        for _rider, _rx, _ry, bx0, bx1, by0, by1 in self._rider_list():
+            if x1 >= bx0 and x0 <= bx1 and y1 >= by0 and y0 <= by1:
+                return True
+        return False
+
+
+def _terrain_vote(probe, x, y):
     """`(x, y)` 那一片地形**朝哪边**：原版 `0x473b36` 的 7×7 投票（§110）。
 
-    返回 `(sx, sy)`，**指向实心那一侧**（不是法线，法线是它的反向）；
-    量不出朝向就返回 `None` —— 两种情况：一格实心的都没有（悬在空中），
-    或者**整片都是实心**（采样点埋进地形里，49 票正负对消）。后者是采样点
-    选错了的信号，调用方该换一个点再问一次。
-
-    ★ 图顶上面（`y < 0`）和 `_probe_blocked()` 一个口径，不算实心（§83）。
+    返回 `(sx, sy)`，**指向实心那一侧**（不是法线，法线是它的反向）。
+    ★ 一票都没有 / 正负对消时就是 `(0, 0)` —— 客户端照样拿去算
+      `atan2(0, 0) = 0`，按「平地」反射（`vy` 取反），**不是**「方向不动」。
     """
-    cx, cy = int(round(x)), int(round(y))
-    sx = sy = 0.0
+    sx = sy = 0
     n = TERRAIN_VOTE_WINDOW
     for dy in range(-n, n + 1):
-        yy = cy + dy
-        if yy < 0:
-            continue
+        yy = y + dy
         for dx in range(-n, n + 1):
-            if not terrain.is_solid(cx + dx, yy):
-                continue
-            sx += dx
-            sy += dy
-    if abs(sx) < 1e-6 and abs(sy) < 1e-6:
-        return None
-    return (sx, sy)
+            if probe.value(x + dx, yy) != 0:
+                sx += dx
+                sy += dy
+    return sx, sy
 
 
 def _reflect_velocity(vx, vy, facing):
@@ -8563,123 +8940,134 @@ def _reflect_velocity(vx, vy, facing):
     return (c * u + s * w, -s * u + c * w)
 
 
-#: 找「挡住这一发的那一格」时最远往外看多少格。
-#:
-#: 圆心停在离面一个 `Size` 的地方（§83，抛射弹 8、直射弹 4），
-#: 再宽一点兜住采样和取整的零头就够。
-BLOCK_CELL_REACH = 14
+#: 客户端弹体一格扫掠的结果（`0x50e759` 的「命中结构」，X_Mod §79）：
+#:   `t`      撞上那一步在主轴上的参数 `i / Δ主`（起点就撞是 0）
+#:   `free`   第 i−1 步的**线点**（整数，不带探针偏移）—— 反弹 / 钉住 / 爆炸都落在这里
+#:   `cell`   被挡住的那个探针格（整数）—— 7×7 投票以它为中心
+SweepHit = collections.namedtuple("SweepHit", "t free_x free_y cell_x cell_y")
 
 
-def _nearest_solid(terrain, x, y, reach=BLOCK_CELL_REACH):
-    """离 `(x, y)` 最近的那一格实心地形；`reach` 之内没有就返回 `None`。"""
-    cx, cy = int(round(x)), int(round(y))
-    best = None
-    for oy in range(-reach, reach + 1):
-        yy = cy + oy
-        if yy < 0:
-            continue
-        for ox in range(-reach, reach + 1):
-            if not terrain.is_solid(cx + ox, yy):
-                continue
-            span = ox * ox + oy * oy
-            if best is None or span < best[0]:
-                best = (span, cx + ox, yy)
-    return None if best is None else (best[1], best[2])
+def _cdiv(a, b):
+    """C 的整数除法（`cdq / idiv`）：**向零截断**。`b` 不为 0。"""
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b > 0) else -q
 
 
-def _block_facing(shell, terrain, ax, ay, bx, by, ground_t):
-    """撞上的那一刻，地形朝哪边（§110）。量不出来返回 `None`。
+def _client_sweep(terrain, ax, ay, bx, by, radius, t_ms=None, probe=None):
+    """弹体这一格 A→B 撞不撞地形：客户端 `BulletObj` 的 `0x50e759` **逐指令移植**（X_Mod §79）。
 
-    ★★ **采样点是挡住它的那一格地形，不是弹体圆心**（§110 末尾那张表）。
-    原版 `0x50effb` 把命中结构的 `+4/+8` 先 `0x5f895c` 取整再交给
-    `0x473b36` —— 那两格装的就是**格子坐标**。拿圆心去投票不行：
-    `_terrain_contact()` 停下的地方离面还有一个 `Size`（§83），
-    7×7 窗口根本够不着（55 次实测里 14 次一格实心都采不到）；
-    拿这一步的**终点**也不行 —— 那个点常常整片埋在地形里，49 票正负对消。
+    撞上返回 `SweepHit`，一路通畅返回 `None`。
 
-    Iceria_b 那 55 次真实反弹（客户端逐帧日志）上，三种采样点的出射方向误差：
+    ## 为什么不再用 `_terrain_contact()` 的浮点插值
 
-    | 采样点 | 中位 | p75 | p90 | 量不出 |
-    |---|---|---|---|---|
-    | 圆心（n=3）| —— | —— | —— | **55/55** |
-    | 圆心 + `Size`·v̂（n=3）| 9.5° | 19.9° | 49.9° | 14 |
-    | **挡住它的那一格（n=3）** | **1.2°** | **5.4°** | **9.5°** | **0** |
+    客户端是**整数 DDA**：端点先各自 `ftol`，主轴逐整数步走，副轴 `(Δ副·i)/Δ主`
+    按 C 截断除法取整。浮点插值每一步的副轴坐标和它差 0~1 px —— 平地上看不出来，
+    落在曲面（鲤鱼的弯背、破坏物的圆角）上就是撞点 / 弹回点差 1 px、7×7 投票换一组、
+    弹出去的方向差十几度，几格之后就是几十上百像素（V0.3bot §116 末段留下的那个
+    「接触格差 1 格」残差，2026-09-23 那两局 62 次真反弹：浮点版逐位复现 23 次，这版 42 次）。
 
-    而且窗口大小在 n=3 取到最好（n=2 → 3.1°，n=4 → 2.4°，n=6 → 4.4°）——
-    和 `0x473b36` 里那两句 `cmp …, 3; jle` **独立地对上了**。
+    ## 逐条对应
 
-    ★★ **收口（V0.3 §116）**：现在拿得到**真正被挡住的那个采样点**了 ——
-    采样点组是 `shell_probe_offsets()` 那两个，逐个查一下就知道是哪个撞上的，
-    不用再拿「离接触点最近的实心格」去猜。实机对照（21 条客户端弹道）：
-    句柄 200012 的末点误差 **24.16 → 0.01**、200193 **11.28 → 2.35**。
-    `_nearest_solid()` 只留作兜底（采样点组和 `blocks_bullet` 口径对不上时）。
+    * `|v| == 0` → 不扫（`0x50e798`）。
+    * 起点 `(ftol(x), ftol(y))`，`Δx = ftol(x+vx) − ftol(x)`（y 同）。
+    * 探针 `off[0] = (0, ftol(r))`、`off[1] = ftol(r·v̂)`（`shell_probe_offsets()`），同一步里按这个顺序问。
+    * ★ **起点：探针全部被挡才算「起点就撞」**（`0x50eabf`：`计数 == 探针数`），
+      此时 `t = 0`、`free = 起点`、`cell = 起点 + off[0]`；否则起点**不算**，直接从第 1 步扫。
+      旧版是「任一探针挡住就当场撞」—— 贴着地面 / 鱼背滚的雷两边在这一步就分叉。
+    * `|Δx| > |Δy|`：x 主轴，`i = ±1 … Δx`；否则 y 主轴。两轴都是 0 时 **Δy 当 1**（`0x50eda8`，看脚下一格）。
+    * 最后一步的副轴取**精确终点**（`0x50eba9` / `0x50ee03` 那两句）。
+    * 撞上：`cell` = 这个探针格，`free` = 第 i−1 步的线点（同一公式），`t = i / Δ主`。
+
+    ★ 单向平台对弹体一律不挡、图顶上面当空 —— 见 `_BulletProbe`。
+    ★ `probe` 给了就直接用（`_shell_step` 要拿同一个去投票）；不给就按 `t_ms` 现建。
     """
-    hx = int(ax + (bx - ax) * ground_t)
-    hy = int(ay + (by - ay) * ground_t)
-    radius = shell.radius
-    if radius and radius >= 1.0:
-        for ox, oy in shell_probe_offsets(radius, bx - ax, by - ay):
-            if terrain.blocks_bullet(hx + ox, hy + oy):
-                return _terrain_facing(terrain, hx + ox, hy + oy)
-    elif terrain.blocks_bullet(hx, hy):
-        return _terrain_facing(terrain, hx, hy)
-    cell = _nearest_solid(terrain, float(hx), float(hy))
-    if cell is None:
-        cell = _nearest_solid(terrain, bx, by)
-    if cell is None:
+    if terrain is None:
         return None
-    return _terrain_facing(terrain, cell[0], cell[1])
-
-
-def _bounce_shell(shell, terrain, ax, ay, bx, by, ground_t, free_t):
-    """弹体撞地形之后**弹开**（§84 / §110）：夹回撞上之前那一点，再反射。
-
-    夹回去这一步不能省：贴在地形里的话下一 tick 一开头又撞上，
-    速度一路对折，弹体原地卡死（§76 里客户端那个「速度每帧对折、
-    位置一动不动」就是这个样子）。
-
-    ★★ **夹回去的那一点要取整**（V0.3 §116）：收方的扫掠是**逐整数格**走的
-    （`0x50ea43` 的 `linePoint + offset`），挡住之后位置就是**最后一个通的
-    那一格的整数坐标** —— 客户端逐帧日志里每一次反弹的落点都是整数
-    （`(123, 835)` / `(277, 861)` / `(1245, 887)` …），一次例外都没有。
-    留着小数会让下一 tick 的采样线整体偏半格，几十帧之后累出几十个单位。
-    """
-    px = float(int(ax + (bx - ax) * free_t))
-    py = float(int(ay + (by - ay) * free_t))
-    vx, vy = _shell_velocity(shell)
-    facing = _block_facing(shell, terrain, ax, ay, bx, by, ground_t)
-    if facing is None:
-        # 一格实心都采不到（图外 / 数据缺）—— 只减半，方向不动。
-        shell.vx, shell.vy = vx * BOUNCE_RESTITUTION, vy * BOUNCE_RESTITUTION
+    vx = bx - ax
+    vy = by - ay
+    if vx == 0.0 and vy == 0.0:
+        return None
+    if probe is None:
+        probe = _BulletProbe(terrain, t_ms)
+    x0, y0 = int(ax), int(ay)
+    dx = int(bx) - x0
+    dy = int(by) - y0
+    if dx == 0 and dy == 0:
+        dy = 1                          # `0x50eda8`：两轴都没挪满一格 ⇒ 看脚下那一格
+    if radius and radius >= 1.0:
+        offsets = shell_probe_offsets(radius, vx, vy)
     else:
-        shell.vx, shell.vy = _reflect_velocity(vx, vy, facing)
-    shell.x, shell.y = px, py
-    shell.bounced = True
+        offsets = ((0, 0),)
+    # 快速路径：整段扫过的外接框里**保证**没有挡弹体的静态格、也碰不到移动平台 ⇒ 不撞
+    # （起点那一格也在框里，所以连「起点就撞」都不用问）。探针点都在「起点 + 偏移」与
+    # 「终点 + 偏移」围成的框里：DDA 两轴都是单调的。
+    ox_lo = ox_hi = oy_lo = oy_hi = 0
+    for ox, oy in offsets:
+        if ox < ox_lo:
+            ox_lo = ox
+        elif ox > ox_hi:
+            ox_hi = ox
+        if oy < oy_lo:
+            oy_lo = oy
+        elif oy > oy_hi:
+            oy_hi = oy
+    if dx >= 0:
+        lox, hix = x0 + ox_lo, x0 + dx + ox_hi
+    else:
+        lox, hix = x0 + dx + ox_lo, x0 + ox_hi
+    if dy >= 0:
+        loy, hiy = y0 + oy_lo, y0 + dy + oy_hi
+    else:
+        loy, hiy = y0 + dy + oy_lo, y0 + oy_hi
+    if loy >= 0 and terrain.coarse_clear(lox, loy, hix, hiy) \
+            and not probe.riders_touch(lox, loy, hix, hiy):
+        return None
+    blocked = probe.blocked
+    if all(blocked(x0 + ox, y0 + oy) for ox, oy in offsets):
+        return SweepHit(0.0, x0, y0, x0 + offsets[0][0], y0 + offsets[0][1])
+    if abs(dx) > abs(dy):
+        step = 1 if dx > 0 else -1
+        for i in range(step, dx + step, step):
+            q = dy if i == dx else _cdiv(dy * i, dx)
+            for ox, oy in offsets:
+                px = x0 + ox + i
+                py = y0 + oy + q
+                if blocked(px, py):
+                    j = i - step
+                    return SweepHit(float(i) / dx, x0 + j, y0 + _cdiv(j * dy, dx), px, py)
+        return None
+    step = 1 if dy > 0 else -1
+    for i in range(step, dy + step, step):
+        q = dx if i == dy else _cdiv(dx * i, dy)
+        for ox, oy in offsets:
+            px = x0 + ox + q
+            py = y0 + oy + i
+            if blocked(px, py):
+                j = i - step
+                return SweepHit(float(i) / dy, x0 + _cdiv(j * dx, dy), y0 + j, px, py)
+    return None
 
 
-def _resolve_terrain_block(shell, terrain, ax, ay, bx, by, ground_t, free_t):
+def _resolve_terrain_hit(shell, hit, probe):
     """撞地形之后按档位收口（§111）。**这一发还活着**就返回 `True`。
 
-    2 档（`FlamingBottle` / `TrainingGrenade`）那道门抄的是 `0x47eec1`：
-    拿 `0x473b36` 的 `(sx, sy)`，`2×|sx| ≤ sy` 就当场炸，否则弹开。
-    平地上 `sx ≈ 0`、`sy > 0` ⇒ 炸；撞陡壁 / 天花板才弹。
+    客户端 `0x47eda1`：先在 `hit.cell` 上做 7×7 投票，再把位置放到 `hit.free`，
+    然后按档位（`vft+0x160`）分流 —— 0 炸（就炸在 `free`，调用方收尾）、1 弹、
+    2 看角度（`2·|sx| ≤ sy` 就炸，`0x47eec1`）、3 钉住（速度清零，`0x47ee6d`）。
     """
     mode = _blocked_mode(shell.weapon)
     if mode == BLOCKED_EXPLODE:
         return False
-    if mode == BLOCKED_BOUNCE_IF_STEEP:
-        facing = _block_facing(shell, terrain, ax, ay, bx, by, ground_t)
-        if facing is None or 2.0 * abs(facing[0]) <= facing[1]:
-            return False
+    sx, sy = _terrain_vote(probe, hit.cell_x, hit.cell_y)
+    if mode == BLOCKED_BOUNCE_IF_STEEP and 2 * abs(sx) <= sy:
+        return False
+    vx, vy = _shell_velocity(shell)
+    shell.x, shell.y = float(hit.free_x), float(hit.free_y)
+    shell.bounced = True
     if mode == BLOCKED_STICK:
-        # `0x47ee6d`：速度清零、位置夹回接触点。下一 tick 重力又把它按回
-        # 地形里，再清一次 —— 效果就是钉在那儿等引信 / 寿命。
-        shell.x = ax + (bx - ax) * free_t
-        shell.y = ay + (by - ay) * free_t
         shell.vx = shell.vy = 0.0
-        shell.bounced = True
         return True
-    _bounce_shell(shell, terrain, ax, ay, bx, by, ground_t, free_t)
+    shell.vx, shell.vy = _reflect_velocity(vx, vy, (sx, sy))
     return True
 
 
@@ -8782,6 +9170,7 @@ def _shell_step(room, shell, terrain, bodies):
     那一路也返回 `None`。
     """
     ax, ay = shell.x, shell.y
+    shell.blocked_at = None
     if shell.weapon.homing_angle:
         bx, by = _homing_step(room, shell, bodies)
     elif shell.bounced:
@@ -8800,27 +9189,43 @@ def _shell_step(room, shell, terrain, bodies):
     best_t = None
     best = None
     radius = shell.radius
+    pass_flags = shell.weapon.pass_coll_flags
     for seat_index, px, py, crouched, character_id in bodies:
-        character = chrprops.get(character_id)
-        for cx, cy, r, region in character.circles(px, py, crouched):
-            t = _segment_circle_t(ax, ay, bx, by, cx, cy, r + radius)
-            if t is None or (best_t is not None and t >= best_t):
-                continue
-            best_t = t
-            best = (seat_index, region)
+        # ★ 形状顺序、武器掩码、两边一起动 —— 全照客户端（`_character_hit`，X_Mod §86）。
+        vx, vy = (_body_air_velocity(room, seat_index) if room is not None
+                  else (0.0, 0.0))
+        got = _character_hit(chrprops.get(character_id), px, py, crouched,
+                             vx, vy, ax, ay, bx, by, radius, pass_flags)
+        if got is None or (best_t is not None and got[0] >= best_t):
+            continue
+        best_t = got[0]
+        best = (seat_index, got[1])
     # ★★ 闯关房：也要撞得到怪（M5-G）。排在地形前面 —— 怪站在地上，
     #    先撞怪再撞地才是对的。
     mob = _mob_contact(room, shell, ax, ay, bx, by)
     if mob is not None and (best_t is None or mob[0] < best_t):
         best_t = mob[0]
         best = (("mob", mob[1]), None)
-    ground_t, free_t = _terrain_contact(terrain, ax, ay, bx, by, radius)
-    if ground_t is not None and (best_t is None or ground_t < best_t):
-        if _resolve_terrain_block(shell, terrain, ax, ay, bx, by,
-                                  ground_t, free_t):
-            return None
-        best_t = ground_t
-        best = (None, None)
+    # ★ 移动平台的相位**这一格只取一次**：判「撞没撞」和算「往哪弹」必须是
+    #   同一刻的鲤鱼（X_Mod §77），分开取的话两次之间鱼可能挪了一格。
+    #   ★ 带上这颗弹：房主报过它在哪个逻辑帧出膛，就按那一帧起算（X_Mod §81 / D60）。
+    t_ms = _mover_clock(room, terrain, shell)
+    probe = _BulletProbe(terrain, t_ms) if terrain is not None else None
+    hit = _client_sweep(terrain, ax, ay, bx, by, radius, t_ms, probe)
+    if hit is not None and (best_t is None or hit.t < best_t):
+        # 客户端 `0x47eda1` 先把位置放到 `free` 再调爆炸 ⇒ 炸点就是 `free`（整数）。
+        point = (float(hit.free_x), float(hit.free_y))
+        shell.blocked_at = (hit.cell_x, hit.cell_y)
+        # ★★★ 挡住它的是**图底之外**那一格（`FallDown` 图）= 收方把它静默删掉了
+        #   （V0.3 §161）：不弹、不炸，交给 `_resolve_shell()` 一个句柄都不记。
+        #   先问这一句再谈反弹 —— 会弹的雷在这儿「弹回来」的话，收方那颗已经没了，
+        #   之后那发 `rpExplode` 替它记的号就是永久错开（X_Mod §84）。
+        if not _shell_fell_out_of_the_world(room, shell, point):
+            if _resolve_terrain_hit(shell, hit, probe):
+                shell.blocked_at = None
+                return None
+        shell.x, shell.y = point
+        return (point, None, None)
     shell.x, shell.y = bx, by
     if best is None:
         _jump_pad_shell(shell, terrain)
@@ -9015,10 +9420,15 @@ def _shell_fell_out_of_the_world(room, shell, point):
     ★★★ 判据和角色那条（`_fell_out_of_the_world` / §143）同一套：
     这张图的 `map.ini` 有 `FallDown`，而**拦住它的那个采样点**已经在图外。
 
-    ★ 为什么要把碰撞半径加回去：`_terrain_contact()` 是拿弹体外缘的探针
-      去问地形的（`shell_probe_offsets`，往下飞时偏移就是 `+radius`），
-      所以「探针出界」这件事在落点上写着的是 `y + radius >= 图高`。
-      直接拿 `y` 比会漏掉一切带半径的弹体（半径 8 的能差 8 个像素）。
+    ★★★ 首选**那个探针格本身**（`shell.blocked_at`，客户端扫掠 `0x50e759` 的
+      `hit.cell`）：`blocked_at[1] >= 图高` 就是这一条判据的原话。
+      ⚠ X_Mod D60 之后炸点是 `hit.free` = 被挡住的**前一个**整数点，比「探针贴上
+      的那一点」少走一步 ⇒ 下面那条 `y + radius >= 图高` 在直直往下掉的弹体上
+      **恰好差 1 px**（2026-09-23 23:13 云桥：碎片炸点 (754, 1361)，1361 + 8 = 1369，
+      挡住它的格是 (754, 1370)）—— 漏判一次就多记一个句柄，之后整局打不掉血（X_Mod §84）。
+    ★ 没有探针格时（引信到点 / 飞到头、单测直接给落点）才退回落点：
+      老的 `_terrain_contact()` 是拿弹体外缘的探针去问地形的（往下飞时偏移就是
+      `+radius`），所以「探针出界」在落点上写着的是 `y + radius >= 图高`。
 
     ## 为什么要单独认出这一种
 
@@ -9051,6 +9461,9 @@ def _shell_fell_out_of_the_world(room, shell, point):
     terrain = _terrain(room)
     if terrain is None:
         return False
+    blocked = getattr(shell, "blocked_at", None)
+    if blocked is not None:
+        return blocked[1] >= terrain.height
     radius = float(getattr(shell, "radius", 0.0) or 0.0)
     return float(point[1]) + radius >= float(terrain.height)
 
@@ -9696,9 +10109,9 @@ def _split_shell(room, machine, shell, point, victim_seat, tick):
         _emit(machine, packet)
         max_ticks = _shell_max_ticks(terrain, shot, slice_weapon)
         for offset in range(slice_weapon.shots):
+            # ★ 碎片的时钟原点就是**母弹炸开的这一格**（D106）：
+            #   收方也是在处理这一发 `rpFire` 的那一帧才建它们的。
             machine.pending_shots.append(
-                # ★ 碎片的时钟原点就是**母弹炸开的这一格**（D106）：
-                #   收方也是在处理这一发 `rpFire` 的那一帧才建它们的。
                 Shell(handle + offset, fire_seq, slice_weapon,
                       botsync.FIRE_GROUP_EVERYONE, point[0], point[1],
                       shot, _tick_moment(shell, tick), max_ticks,

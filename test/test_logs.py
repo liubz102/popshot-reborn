@@ -339,14 +339,21 @@ class OnlineLogRotationTests(unittest.TestCase):
 
 
 class LogTimestampTests(unittest.TestCase):
-    """日志行的时间戳**必须带日期**（用户 2026-09-14）。
+    """日志行的时间戳**必须带日期 + 时区**（用户 2026-09-14 / 2026-09-20）。
 
-    以前只有 `HH:MM:SS.mmm`，玩家贴回来几行、或者事后翻归档都判断不出是
-    哪一天的。四份 `ts()` 必须**长得一模一样**，否则 `server.out` 和
-    `online.log` / 逐连接抓包的行按时间对不上。
+    * 日期：以前只有 `HH:MM:SS.mmm`，玩家贴回来几行、或者事后翻归档都判断
+      不出是哪一天的；
+    * 时区：崩溃包来自玩家机器、打包戳来自开发机、日志来自服务器，三台机器
+      三个时区，不写出来就会比反（bug调查/25，见 `server/tzstamp.py` 文件头）。
+
+    四份 `ts()` 必须**长得一模一样**，否则 `server.out` 和 `online.log` /
+    逐连接抓包的行按时间对不上。
     """
 
-    def test_all_four_timestamps_carry_a_full_date(self):
+    #: `2026-09-20 22:07:29.715 UTC+9`（半小时时区写成 `UTC+5:30`）
+    TS_RE = r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} UTC[+-]\d+(:\d\d)?$"
+
+    def test_all_four_timestamps_carry_a_full_date_and_a_zone(self):
         # 在函数里 import：test_logs 本来很轻，不值得为这一条把 gameserver
         # 拖进模块导入。
         import authserver
@@ -355,7 +362,16 @@ class LogTimestampTests(unittest.TestCase):
         for name, fn in (("gameserver", gameserver.ts), ("authserver", authserver.ts),
                          ("eventlog", eventlog.ts), ("relay", relay.ts)):
             with self.subTest(name):
-                self.assertRegex(fn(), r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}$")
+                self.assertRegex(fn(), self.TS_RE)
+
+    def test_the_four_agree_on_the_zone_suffix(self):
+        # 四份日志会被并排读，后缀不一致等于没写。
+        import authserver
+        import gameserver
+        import relay
+        zones = {fn().rsplit(" ", 1)[1] for fn in
+                 (gameserver.ts, authserver.ts, eventlog.ts, relay.ts)}
+        self.assertEqual(1, len(zones), "四份 ts() 的时区后缀不一致：%s" % zones)
 
 
 class DayLogNameTests(unittest.TestCase):

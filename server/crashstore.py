@@ -44,6 +44,7 @@ import time
 
 #: 落位 / 待删改名那两句 `os.rename` 的重试外壳（见 `atomicfile.py` 文件头）。
 import atomicfile
+import tzstamp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -146,8 +147,9 @@ def pick_name(directory, crash_id):
 
 
 def format_time(epoch=None):
-    epoch = time.time() if epoch is None else epoch
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+    """收件时刻。**带时区** —— 这份 `receipt.json` 会和玩家机器上的崩溃时刻、
+    开发机上的打包戳摆在一起看，三台机器三个时区（bug调查/25）。"""
+    return tzstamp.stamp(epoch)
 
 
 class Store:

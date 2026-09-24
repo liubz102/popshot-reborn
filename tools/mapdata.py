@@ -80,7 +80,17 @@ DIR_TYPE = {"TERRAIN": 200, "LAYER": 202, "COVER": 201,
 #: 6：`index.json` 多一层 `props` = **`Data/map.ini` 的地图属性**，现在只有
 #:    **`FallDown`**（这张图掉出下边界会不会死，V0.3 §143）。它不在 `.map`
 #:    里，所以按**带玩法后缀的完整地图串**索引，和按文件名的 `maps` 分开。
-FORMAT = 6
+#: 7：加了 `movers` = **移动平台**（挂在 type 111 `PathObj` 上的地形，X_Mod §73）。
+#:    在此之前服务端完全不知道它们存在 —— bot 的手雷会从「云之桥」那条鲤鱼身上
+#:    穿过去炸在地面（用户 2026-09-22 报）。
+#: 8：`movers[].riders[]` 多了 `x` / `y`（对象自身坐标）、`t_off`（`.map` v17 组第 2 个
+#:    i32 = `[obj+0x94]`，相位偏移毫秒）、`rel`（第 3 个 = `[obj+0x98]`，相对模式）。
+#:    客户端 `PathFollower::GetPos` 算的是 `Timer() + t_off − t0`，相对模式还要加回
+#:    自身坐标（X_Mod §74）；7 那一版把后两个字段丢了，`Quest_level6` 那块算错。
+#: 9：`breakables[]` 多了 `fx` / `fy` = `.map` 里的原始 f32 坐标（`x` / `y` 仍是四舍五入的
+#:    整数，角色那一路照旧用它）。客户端对象查询 `0x51a935` 是拿 f32 坐标截断映射的，
+#:    四舍五入会差出 1 px —— 弹体那一路按原始坐标合成（X_Mod §80）。
+FORMAT = 9
 
 #: ★★★ **可破坏物**（`Maps/*/Breakable/*.png`，客户端类 `BreakableObj`）。
 #: 全 174 张图里共 677 个，分布在 67 张图上。
@@ -179,11 +189,23 @@ def _read_obj_blob(blob, ver):
     r = Reader(blob)
     obj = {}
     if ver >= 17:
-        r.i32(); r.i32(); r.i32()
+        # ★ v17 组三个 i32（`MapObj::Deserialize` 0x511dc1..0x511de2）：
+        #   [0] **挂在哪个对象上**（`[this+0xfc]`）—— `MapObject::LinkPath`（`0x511d60`）
+        #       拿它去 World 里找那个对象，把它的 `IPath` 子对象（偏移 +0x9c）交给
+        #       自己的 `PathFollower` —— 这就是**移动平台**（§73）；
+        #   [1] **相位偏移**毫秒（`[this+0x94]`）—— `PathFollower::GetPos`（`0x549bec`）
+        #       算 `elapsed = Timer() + 它 − t0`；
+        #   [2] **相对模式**（`[this+0x98]`，客户端只存低字节）—— 非零时位置 =
+        #       自身坐标 + (Eval(elapsed) − Eval(0))，见 `GetWorldPos`（`0x47c6bf`）。
+        #   FORMAT 7 只留了 [0]，后两个被丢掉（X_Mod §74）。
+        obj["link"] = r.i32()
+        obj["t_off"] = r.i32()
+        obj["rel"] = r.i32() & 0xFF
     if ver >= 12:
         obj["x"] = r.f32()
         obj["y"] = r.f32()
-        r.f32(); r.f32()          # 缩放（负数 = 镜像）
+        obj["sx"] = r.f32()       # 缩放（负数 = 镜像）
+        obj["sy"] = r.f32()
         r.f32(); r.f32(); r.f32()  # 后两个没用上，最后一个是弧度旋转
         r.wstr()                   # 名字
         path = r.wstr()
@@ -344,11 +366,103 @@ def collect_breakables(width, height, objects, masks):
             ("handle", int(obj.get("handle", 0))),
             ("x", int(round(obj["x"]))),
             ("y", int(round(obj["y"]))),
+            # ★ 原始 f32（`struct` 读出来已经是 f32 精确值，repr 不丢位）：
+            #   弹体那一路按它截断映射（X_Mod §80）。
+            ("fx", float(obj["x"])),
+            ("fy", float(obj["y"])),
             ("w", mask["width"]),
             ("h", mask["height"]),
             ("hp", int(hp)),
             ("regen", int(regen)),
             ("mask", _blob(mask["cells"])),
+        )))
+    return out
+
+
+#: ★★★ **移动平台**：`PathObj`（type 111）本身不画东西，它是一条**路径**；
+#: 真正会动的是那些 `link == 这条路径的句柄` 的地形对象（`MapObject::LinkPath`，
+#: `0x511d60`）。形状同样躺在尾部掩码表里（X_Mod §68 / §73）。
+PATH_TYPE = 111
+
+
+def _read_path_points(tail, ver):
+    """解 `PathObj` 的 tail —— `Path::Deserialize`（`0x54971a`）+ `PathPoint::Deserialize`（`0x548b81`）。
+
+        i32 loop            0 = 走到头接回起点循环；1 = 乒乓（来回）
+        i32 count
+        每个点：
+            i32 kind        ★ ==1 才带切线，否则切线是 0
+            f32 x, f32 y    相对 `PathObj` 自身坐标的偏移
+            i32 ms          **这一段**（本点 -> 下一点）的时长
+            f32 tx, f32 ty  仅 kind==1
+            f32 ease        仅地图版本 >= 18（`cmp word [eax+0x2c], 0x12`）
+    """
+    r = Reader(tail)
+    loop = r.i32()
+    count = r.i32()
+    pts = []
+    for _ in range(count):
+        kind = r.i32()
+        px, py = r.f32(), r.f32()
+        ms = r.i32()
+        tx = ty = 0.0
+        if kind == 1:
+            tx, ty = r.f32(), r.f32()
+        ease = r.f32() if ver >= 18 else 1.0
+        pts.append([round(px, 3), round(py, 3), int(ms),
+                    round(tx, 3), round(ty, 3), round(ease, 4)])
+    if r.left():
+        raise MapFormatError("PathObj 的 tail 还剩 %d 字节没解释" % r.left())
+    return loop, pts
+
+
+def collect_movers(objects, masks, ver):
+    """把**移动平台**抽成单独一层（X_Mod §73），返回可进 JSON 的列表。
+
+    一条路径一件，`riders` 是挂在它上面的地形（形状取自尾部掩码表）。
+    走到哪按 `Path::Eval`（`0x548ccd`）算，服务端那份实现在 `server/mapdata.py`。
+
+    ⚠ 只收**有掩码**的 rider：没有掩码就不知道它挡在哪儿，收了也没用。
+    """
+    by_handle = {}
+    for obj in objects:
+        if obj.get("type") == PATH_TYPE and "x" in obj:
+            by_handle[int(obj.get("handle", 0))] = obj
+    riders = {}
+    for obj in objects:
+        link = int(obj.get("link") or 0)
+        if not link or link not in by_handle:
+            continue
+        mask = masks.get((obj.get("path") or "").replace("//", "/"))
+        if mask is None:
+            continue
+        riders.setdefault(link, []).append(collections.OrderedDict((
+            ("handle", int(obj.get("handle", 0))),
+            ("w", mask["width"]),
+            ("h", mask["height"]),
+            ("sx", round(float(obj.get("sx", 1.0)), 4)),
+            ("sy", round(float(obj.get("sy", 1.0)), 4)),
+            # ★ 自身坐标只在**相对模式**下参与（`GetWorldPos` 加回去）；
+            #   `t_off` / `rel` 见 `_read_obj_blob` 的说明（§74）。
+            ("x", round(float(obj.get("x", 0.0)), 3)),
+            ("y", round(float(obj.get("y", 0.0)), 3)),
+            ("t_off", int(obj.get("t_off") or 0)),
+            ("rel", int(obj.get("rel") or 0)),
+            ("mask", _blob(mask["cells"])),
+        )))
+    out = []
+    for handle in sorted(riders):
+        path = by_handle[handle]
+        loop, pts = _read_path_points(path.get("tail") or b"", ver)
+        if len(pts) < 1:
+            continue
+        out.append(collections.OrderedDict((
+            ("handle", handle),
+            ("x", round(float(path["x"]), 3)),
+            ("y", round(float(path["y"]), 3)),
+            ("loop", int(loop)),
+            ("pts", pts),
+            ("riders", riders[handle]),
         )))
     return out
 
@@ -400,6 +514,7 @@ def build_record(name, ver, width, height, objects, terrain, masks=None):
     packed = terrain["cells"]
     counts, ys = extract_ground(cells, width, height)
     breakables = collect_breakables(width, height, objects, masks or {})
+    movers = collect_movers(objects, masks or {}, ver)
     if height > 0xFFFF or (counts and max(counts) > 0xFFFF):
         raise MapFormatError("%s 的站立面超出 uint16 能表达的范围" % name)
     points = collections.OrderedDict()
@@ -434,6 +549,8 @@ def build_record(name, ver, width, height, objects, terrain, masks=None):
         ("jump", pads),
         # ★★★ 可破坏物（V0.3 §138）：打碎了就放行、过一阵原样长回来。
         ("breakables", breakables),
+        # ★★★ 移动平台（X_Mod §73）：挂在 type 111 路径上的地形，位置随时间走。
+        ("movers", movers),
     ))
 
 

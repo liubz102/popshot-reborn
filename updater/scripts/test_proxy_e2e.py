@@ -22,6 +22,10 @@ manifest 兜底仍是 5 秒（MANIFEST_ATTEMPT_MS）。改了宏记得改这里�
        日志 best-effort，包照样装上。
 场景 C：manifest 的代理兜底 —— 直连的 /manifest-c.json 有头没身挂住，更新器 5 秒
        到点换代理（[死, 快] 随机顺序）取到 → 目标 V0.2.203；zip 走 /quick/ 全速直连。
+场景 D：★ 更新源由**服务器**下发。本机 update.config 写着错的清单地址 + 死代理，
+       假服务器在 /api/update-config 上给出正确地址 + 快代理（不传 --manifest-url）
+       → 装上 V0.2.204、下载走服务器给的代理、本机那个错地址一次都没被请求。
+场景 E：问不到服务器（端口没人监听）→ 安静退回本机 update.config，更新照跑。
 
 跑法（先 updater\\build.bat）：
     runtime\\python\\python.exe updater\\scripts\\test_proxy_e2e.py
@@ -57,6 +61,9 @@ REQ_LOCK = threading.Lock()
 ZIPS = {}                        # name -> bytes
 MANIFESTS = {}                   # name -> json bytes
 
+#: 场景 D：假「服务器」在 /api/update-config 上下发的那份更新源。
+SERVED_UPDATE_CONFIG = ""
+
 
 def die(msg):
     print("!! PROXY-E2E FAIL:", msg)
@@ -88,7 +95,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.path
         with REQ_LOCK:
             REQUESTS.append(path)
-        m = re.search(r"(manifest-[abc]\.json)$", path)
+        if path == "/api/update-config":
+            # 场景 D：这台「服务器」下发的更新源。收件那头是更新器的
+            # resolve_update_source()（server\web\server.py 是真货，这里是夹具）。
+            body = SERVED_UPDATE_CONFIG.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        m = re.search(r"(manifest-[abcd]\.json)$", path)
         if m:
             name = m.group(1)
             if name == "manifest-c.json" and path == "/" + name:
@@ -109,7 +126,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        m = re.search(r"(update-[abc]\.zip)$", path)
+        m = re.search(r"(update-[abcd]\.zip)$", path)
         if not m:
             self.send_error(404)
             return
@@ -178,7 +195,11 @@ def log_seconds_between(log, first_marker, second_marker):
     def stamp(marker):
         for line in log.splitlines():
             if marker in line:
-                m = re.match(r"\[(\d+)-(\d+)-(\d+) (\d+):(\d+):(\d+)\]", line)
+                # ★ 秒后面**不要**再匹配 `]`：日志时间戳现在带时区
+                # （`[2026-09-22 12:20:30 UTC+9]`，见「所有 log 标记时区」那次
+                # 改动）。原来写死的 `\]` 从那以后一个都匹配不上，`stamp()`
+                # 一直回 None —— 场景 C 的「5 秒到点」这条判据就此静默失效。
+                m = re.match(r"\[(\d+)-(\d+)-(\d+) (\d+):(\d+):(\d+)", line)
                 if m:
                     h, mi, s = int(m.group(4)), int(m.group(5)), int(m.group(6))
                     return h * 3600 + mi * 60 + s
@@ -189,7 +210,13 @@ def log_seconds_between(log, first_marker, second_marker):
     return (b - a) % 86400
 
 
-def build_sandbox(tmp, tag, proxies):
+def build_sandbox(tmp, tag, proxies, manifest_url=None, register_port=None):
+    """一个假包根。
+
+    `manifest_url` / `register_port` 只有场景 D 用得上：前者往本机
+    `update.config` 里写一个**故意是错的**清单地址（证明服务器那份压过它），
+    后者告诉更新器去哪个端口要更新源。
+    """
     sandbox = os.path.join(tmp, "sandbox-" + tag)
     os.makedirs(os.path.join(sandbox, "game_patched"))
     os.makedirs(os.path.join(sandbox, "config"))
@@ -198,9 +225,13 @@ def build_sandbox(tmp, tag, proxies):
     with open(os.path.join(sandbox, "config", "server.config"), "w",
               encoding="utf-8") as f:
         f.write("server_address = 127.0.0.1\n")
+        if register_port:
+            f.write("server_register_port = %d\n" % register_port)
     with open(os.path.join(sandbox, "config", "update.config"), "w",
               encoding="utf-8") as f:
         f.write("# 测试用代理列表\n")
+        if manifest_url:
+            f.write("manifest_url = %s\n" % manifest_url)
         for p in proxies:
             f.write(p + "\n")
     with open(os.path.join(sandbox, "game_patched", "test.txt"), "w") as f:
@@ -218,12 +249,16 @@ def clear_cache(version):
 
 
 def run_updater(sandbox, manifest):
+    """`manifest=None` = **不传** `--manifest-url`，让更新器自己去问服务器
+    要更新源（场景 D）。传了就是老路：跳过问服务器那一步，直连用这个地址。"""
     env = dict(os.environ)
     env["POPSHOT_UPDATER_NOUI"] = "1"
     exe = os.path.join(sandbox, "game_patched", "BsPatcherChn.exe")
+    argv = [exe]
+    if manifest:
+        argv += ["--manifest-url", "%s/%s" % (BASE, manifest)]
     t0 = time.time()
-    proc = subprocess.run([exe, "--manifest-url", "%s/%s" % (BASE, manifest)],
-                          env=env, capture_output=True, timeout=300)
+    proc = subprocess.run(argv, env=env, capture_output=True, timeout=300)
     dt = time.time() - t0
     log_path = os.path.join(sandbox, "logs", "updater.log")
     log = open(log_path, encoding="utf-8", errors="replace").read() \
@@ -250,8 +285,10 @@ def scenario_a(tmp):
     rc, dt, log = run_updater(sandbox, "manifest-a.json")
     print("A: exit=%d %.1fs" % (rc, dt))
     need(rc == 0, "A: 更新器退出码 %d" % rc, log)
-    need("proxy list: %d usable, 0 lines ignored" % (GROUP + 1) in log,
-         "A: 代理列表没读对", log)
+    need("local update.config: %d proxies usable, 0 lines ignored"
+         % (GROUP + 1) in log, "A: 代理列表没读对", log)
+    need("--manifest-url given, server not asked" in log,
+         "A: 传了 --manifest-url 却还是去问了服务器", log)
     need("speedtest pick: proxy[3] %s/fast (" % BASE in log and
          "qualified)" in log, "A: 没选中「快」代理", log)
     need("download %s/fast/%s/update-a.zip" % (BASE, BASE) in log,
@@ -319,7 +356,8 @@ def scenario_c(tmp):
     need("manifest proxy[1] %s/fast: ok" % BASE in log,
          "C: 没通过「快」代理取到 manifest", log)
     need("target V0.2.203" in log, "C: 目标版本不对（manifest 内容没用上）", log)
-    gap = log_seconds_between(log, "proxy list:", "manifest direct: failed")
+    gap = log_seconds_between(log, "local update.config:",
+                              "manifest direct: failed")
     need(gap is not None and 4 <= gap <= 7,
          "C: 直连 manifest 该在 ~5 秒到点（实际 %r 秒）" % gap, log)
     need("正在尝试第 " in log and "个代理：" in log,
@@ -333,16 +371,88 @@ def scenario_c(tmp):
     print("C: PASS (manifest via proxy fallback after 5 s direct timeout)")
 
 
+def scenario_d(tmp):
+    """★ 更新源由**服务器**下发：manifest 地址和代理列表都以它为准。
+
+    本机 `config\\update.config` 里故意写着**错的**清单地址和一个**死**代理；
+    假服务器在 `/api/update-config` 上给出正确的清单地址和一个快代理。
+    更新器必须用服务器那份 —— 判据是：本机那个错地址服务器**一次都没被请求过**，
+    包按 manifest-d 装上了，而且下载走的是服务器给的那个代理。
+    """
+    global SERVED_UPDATE_CONFIG
+    with REQ_LOCK:
+        REQUESTS.clear()
+    SERVED_UPDATE_CONFIG = (
+        "# 服务器下发的更新源\n"
+        "manifest_url = %s/manifest-d.json\n"
+        "%s/fast\n" % (BASE, BASE))
+    sandbox = build_sandbox(
+        tmp, "d", ["http://127.0.0.1:1"],        # 本机：一个死代理
+        manifest_url="%s/manifest-WRONG.json" % BASE,   # 本机：错的清单地址
+        register_port=PORT)
+    clear_cache("0.2.204")
+    rc, dt, log = run_updater(sandbox, None)     # ★ 不传 --manifest-url
+    print("D: exit=%d %.1fs" % (rc, dt))
+    need(rc == 0, "D: 更新器退出码 %d" % rc, log)
+    need("update source: asking %s/api/update-config" % BASE in log,
+         "D: 更新器没去问服务器要更新源", log)
+    need("update source: from server, 1 proxies usable" in log,
+         "D: 没用上服务器下发的那份（代理列表）", log)
+    need("manifest %s/manifest-d.json" % BASE in log,
+         "D: 清单地址不是服务器给的那个", log)
+    need("target V0.2.204" in log, "D: 目标版本不对（用错了 manifest）", log)
+    need("download %s/fast/%s/update-d.zip" % (BASE, BASE) in log,
+         "D: 下载没走服务器下发的那个代理", log)
+    need("仓库：127.0.0.1:%d/manifest-d.json" % PORT in log,
+         "D: 界面状态行没写清仓库地址", log)
+    with REQ_LOCK:
+        reqs = list(REQUESTS)
+    need(not any("manifest-WRONG" in p for p in reqs),
+         "D: 本机那个错地址被用了：%r" % reqs, log)
+    need(any(p == "/api/update-config" for p in reqs),
+         "D: 服务器没收到取更新源的请求：%r" % reqs, log)
+    ver = open(os.path.join(sandbox, "BUILD.ver"), encoding="utf-8").read()
+    need("0.2.204" in ver, "D: BUILD.ver 没更新：%r" % ver, log)
+    print("D: PASS (manifest url + proxies both came from the server)")
+
+
+def scenario_e(tmp):
+    """服务器问不到时安静退回本机那份 —— 老服务端 / 服务器没开都走这条。
+
+    `server_register_port` 指到一个没人监听的端口，更新器该在日志里记一句
+    「server unavailable」然后照常用本机的 `update.config` 把包装上。
+    """
+    with REQ_LOCK:
+        REQUESTS.clear()
+    sandbox = build_sandbox(
+        tmp, "e", [BASE + "/fast"],
+        manifest_url="%s/manifest-d.json" % BASE,
+        register_port=1)                         # 没人监听
+    clear_cache("0.2.204")
+    rc, dt, log = run_updater(sandbox, None)
+    print("E: exit=%d %.1fs" % (rc, dt))
+    need(rc == 0, "E: 更新器退出码 %d" % rc, log)
+    need("update source: server unavailable" in log and "using local" in log,
+         "E: 没记下「问不到服务器，退回本机」", log)
+    need("manifest %s/manifest-d.json" % BASE in log,
+         "E: 没用本机 update.config 里的清单地址", log)
+    ver = open(os.path.join(sandbox, "BUILD.ver"), encoding="utf-8").read()
+    need("0.2.204" in ver, "E: BUILD.ver 没更新：%r" % ver, log)
+    print("E: PASS (server unreachable -> local update.config, update still ran)")
+
+
 def main():
     if not os.path.exists(EXE):
         die("找不到 %s（先跑 updater\\build.bat）" % EXE)
     ZIPS["update-a.zip"] = make_zip("0.2.201", 4 * 1024 * 1024)
     ZIPS["update-b.zip"] = make_zip("0.2.202", 1 * 1024 * 1024)
     ZIPS["update-c.zip"] = make_zip("0.2.203", 1 * 1024 * 1024)
+    ZIPS["update-d.zip"] = make_zip("0.2.204", 1 * 1024 * 1024)
     MANIFESTS["manifest-a.json"] = make_manifest("0.2.201", "update-a.zip")
     MANIFESTS["manifest-b.json"] = make_manifest("0.2.202", "update-b.zip")
     MANIFESTS["manifest-c.json"] = make_manifest("0.2.203", "update-c.zip",
                                                  prefix="/quick")
+    MANIFESTS["manifest-d.json"] = make_manifest("0.2.204", "update-d.zip")
 
     httpd = QuietServer(("127.0.0.1", PORT), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -366,6 +476,8 @@ def main():
         scenario_a(tmp)
         scenario_b(tmp)
         scenario_c(tmp)
+        scenario_d(tmp)
+        scenario_e(tmp)
     finally:
         httpd.shutdown()
         if gate:

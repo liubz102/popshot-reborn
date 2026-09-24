@@ -50,8 +50,25 @@ $script:JunkNames = @('__pycache__', '.pytest_cache', '.mypy_cache')
 
 function New-BuildId {
     <# 打包批次号。客户端包和服务端包在同一次构建里拿到**同一个** id，
-       用来在事后核对「这两个包是不是配对的」（D079：必须成对发）。 #>
+       用来在事后核对「这两个包是不是配对的」（D079：必须成对发）。
+
+       ★ 这里**故意不带时区**：它是拿来逐字比对的键，多一截就对不上了。
+         它是**打包机本地时间**，那个时区写在同一份 BUILD.ver 的 `time` /
+         `timeZone` 里（bug调查/25：拿 UTC+9 的 buildId 去比 UTC+8 的崩溃
+         时刻，把因果关系比反过）。 #>
     return (Get-Date -Format 'yyyyMMdd-HHmmss')
+}
+
+function Get-UtcOffsetText {
+    <# 本机此刻的 UTC 偏移，写成 `UTC+8` / `UTC-3` / `UTC+5:30`。
+       和 `server/tzstamp.py`、`hook/bshook.c` 的 `bslog_zone()` 同一套写法：
+       **现算**，跟着夏令时走，半小时时区也写得出来。 #>
+    $off = [System.TimeZoneInfo]::Local.GetUtcOffset([DateTime]::Now)
+    $sign = if ($off.Ticks -lt 0) { '-' } else { '+' }
+    $h = [Math]::Abs($off.Hours)
+    $m = [Math]::Abs($off.Minutes)
+    if ($m -eq 0) { return "UTC$sign$h" }
+    return ("UTC{0}{1}:{2:00}" -f $sign, $h, $m)
 }
 
 # ---------------------------------------------------------------------------
@@ -1270,7 +1287,9 @@ function Write-BuildVer {
         versionWire    = $Version.Wire
         kind           = $Kind
         buildId        = $BuildId
-        time           = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        time           = ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' ' + (Get-UtcOffsetText))
+        # ★ `buildId` 不带时区（它是逐字比对的键），它用的就是这个时区。
+        timeZone       = (Get-UtcOffsetText)
         machine        = $env:COMPUTERNAME
         serverCodeHash = Get-ServerCodeHash $PackageRoot
     }
