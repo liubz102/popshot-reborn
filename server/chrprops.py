@@ -72,6 +72,10 @@ REGION_LEGS = "legs"
 REGION_BODY = "body"
 REGION_HEAD = "head"
 
+#: 每个碰撞圆的掩码（`CircleCollBlock +0xc`）：角色构造 `0x4fb01d` 给第 0 个（腿）`or 4`、
+#: 第 2 个（头）`or 2`。武器的 `PassObjCollBlockFlags` 和它相交，弹体就从这个圆穿过去（X_Mod §86）。
+SHAPE_FLAGS = {REGION_LEGS: 4, REGION_BODY: 0, REGION_HEAD: 2}
+
 #: 表里查不到这个角色时用的尺寸 —— 取角色 0（타이，基础角色）的那一组。
 #: ★ 宁可用一组**真实存在过的**尺寸，也不要用 0（那样谁都打不中）
 #: 或者一个大圆（那样谁都躲不开）。
@@ -294,6 +298,22 @@ class Character(object):
             (x, body_y, body, REGION_BODY),
             (x, legs_y, legs, REGION_LEGS),
         ]
+
+    def hit_shapes(self, x, y, crouched=False):
+        """弹体撞人时客户端**逐个去试**的那几个圆：`[(圆心x, 圆心y, 半径, 部位, 掩码), …]`（X_Mod §86）。
+
+        和 `circles()` 是同三个圆（`0x4fc230` 就是从脚底往上依次相切摆的），差两处：
+        ① **顺序是腿 → 身 → 头**：`[角色+0x140]` 里第 0 个是 `MapObject` 自带的那个
+        （当腿），角色构造时再推身、头（`0x4fafda`）；`0x50f410` 按这个顺序试、**第一个
+        扫到的就算**，不比谁更早。② 每个圆带掩码：腿 4、头 2（`0x4fb01d`），武器的
+        `PassObjCollBlockFlags` 和它相交就穿过去。
+        ★ 第 4 个圆（身前 2.2·r身、半径 2·r身，只在 `[角色+0x5ac]` 那个计时器走着时才有）
+          服务端拿不到那个状态，没列。
+        """
+        out = []
+        for cx, cy, r, region in reversed(self.circles(x, y, crouched)):
+            out.append((cx, cy, r, region, SHAPE_FLAGS[region]))
+        return out
 
     def center(self, x, y, crouched=False):
         """身体那个圆的圆心 —— **瞄这里**。

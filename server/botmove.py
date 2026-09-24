@@ -682,6 +682,200 @@ def _air_tick(terrain, body, character=None):
     return body.moved(nx, ny, vx, vy, on_ground=False)
 
 
+# ---------------------------------------------------------------------------
+# ★★★ 客户端角色的腾空物理，逐指令照抄（X_Mod §87）—— 只给服务端外推**真人**用
+# ---------------------------------------------------------------------------
+#
+# 上面那套（`_air_tick`：撞墙「这一格横向不动、速度留着」、撞顶「停在撞之前、v.y 截 0」、
+# 掉在坡上「蹭上去就算落地」）是 V0.3 为 **bot 自己**对着实机日志一轮轮收口的，和客户端的
+# 算法不是一回事。客户端（`Character` vf+0x70 = `0x50d58a` → `0x50e759` → vf+0xa8 = `0x502df4`）：
+# 探针 = 脚底 + 腿 / 身 / 头各自沿速度方向的前沿点，整数 DDA；撞上了**这一格位置不动**，
+# 只改速度（落地、或按 7×7 投票的法线反弹）。外推真人要的是「他自己那台客户端上他在哪」，
+# 所以这一路照抄客户端；bot 自己走路不动（寻路 / 躲避 / 预演都建在上面那套上，X_Mod D63）。
+
+#: 腾空撞上东西时，速度（模）不超过它才算落地：`Character` vft+0xa4 = `0x4febe0`（常态 35）。
+CLIENT_LAND_SPEED = 35.0
+
+#: 撞上后的反射（`0x50f240`，弹体用的也是这个函数）：切向留 1 − 0.5（vft+0x98），
+#: 法向 × −0.2（vft+0x94）。
+CLIENT_BOUNCE_FRICTION = 0.5
+CLIENT_BOUNCE_RESTITUTION = 0.2
+
+#: `Character` 自己的撞后响应 vf+0xa8 = `0x502df4`：基类那段（`0x50efd2`）之后再
+#: `vx *= [0x6937e4]`。
+CLIENT_BOUNCE_KEEP_VX = 0.3
+
+#: 反射前量朝向的 7×7 投票（`0x473b36`，§110）。
+CLIENT_VOTE_WINDOW = 3
+
+
+def _cdiv(a, b):
+    """C 的整数除法（`cdq / idiv`）：**向零截断**。`b` 不为 0。"""
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b > 0) else -q
+
+
+def _client_cell(terrain, x, y):
+    """角色这一路问的格子（`0x473969`，`TerrainAt.cell` 已经把这一刻的移动平台叠上）。
+
+    ★ 图顶上面当空（V0.3 §83 / §192：真人自己的角色头能伸出图顶）；`MapTerrain.cell()`
+      对 `y < 0` 返回 2，这里要先拦下。左右 / 底下出界照旧是 2。
+    """
+    return 0 if y < 0 else terrain.cell(x, y)
+
+
+def client_probes(character, vx, vy, crouched=False):
+    """腾空扫掠的探针表 `((dx, dy, 单向平台挡不挡), …)`，相对脚点（`0x50e759` 开头那一段）。
+
+    * 探针 0 = 脚底（`vft+0x104` = `(0, 0)`）。单向平台**只挡它**：位集 `0x737ebc` 里它那一位
+      写死 1，每个圆那一位取自掩码 `+0xc` 的最低位 —— 腿 4 / 身 0 / 头 2 全是 0；
+    * 之后按形状表的顺序（腿 → 身 → 头，`chrprops.Character.hit_shapes()`）各取一个前沿点
+      `ftol(圆心 + r·v̂)`。同一步里按这个顺序问。
+
+    `(vx, vy)` 不能是零向量（调用方先拦，`0x50e798` 也是先判 |v| == 0 就不扫）。
+    """
+    speed = math.hypot(vx, vy)
+    ux, uy = vx / speed, vy / speed
+    shapes = getattr(character, "hit_shapes", None)
+    if shapes is not None:
+        table = [(cx, cy, r, flags)
+                 for cx, cy, r, _region, flags in shapes(0.0, 0.0, crouched)]
+    else:
+        # 只给了尺寸的假角色（单测）：同一种摆法（从脚底往上依次相切），掩码同上。
+        legs, body, head = _shape_sizes(character)
+        table = [(0.0, -legs, legs, 4),
+                 (0.0, -2.0 * legs - body, body, 0),
+                 (0.0, -2.0 * (legs + body) - head, head, 2)]
+    probes = [(0, 0, True)]
+    for cx, cy, r, flags in table:
+        probes.append((int(cx + r * ux), int(cy + r * uy), bool(flags & 1)))
+    return tuple(probes)
+
+
+def _client_sweep(terrain, x, y, vx, vy, probes):
+    """角色腾空一格的扫掠：`0x50e759`（整数 DDA，弹体用的也是它，X_Mod §79），探针是 `client_probes()`。
+
+    撞上返回 `(空点x, 空点y, 挡住的格x, 格y)`：空点 = 第 i−1 步的线点（不带探针偏移）；
+    **起点**的探针全被挡住才算起点就撞（空点 = 起点、格 = 起点 + 探针 0）。一路通畅返回 `None`。
+
+    挡得住 = 格值 2 / 3；格值 1（单向平台）只在**往下走**时挡「挡得住它」的探针
+    （起点那一问看 Δy ≥ 0，逐步那一问看 Δy > 0 —— `0x50ea8f` / `0x50ebec` 各一句）。
+    """
+    x0, y0 = int(x), int(y)
+    dx = int(x + vx) - x0
+    dy = int(y + vy) - y0
+
+    def blocked(px, py, oneway, down):
+        c = _client_cell(terrain, px, py)
+        return c >= 2 or (c == 1 and oneway and down)
+
+    if all(blocked(x0 + ox, y0 + oy, ow, dy >= 0) for ox, oy, ow in probes):
+        return (x0, y0, x0 + probes[0][0], y0 + probes[0][1])
+    if dx == 0 and dy == 0:
+        dy = 1                          # `0x50eda8`：两轴都没挪满一格 ⇒ 看脚下那一格
+    down = dy > 0
+    if abs(dx) > abs(dy):
+        step = 1 if dx > 0 else -1
+        for i in range(step, dx + step, step):
+            q = dy if i == dx else _cdiv(dy * i, dx)
+            for ox, oy, ow in probes:
+                px, py = x0 + ox + i, y0 + oy + q
+                if blocked(px, py, ow, down):
+                    j = i - step
+                    return (x0 + j, y0 + _cdiv(j * dy, dx), px, py)
+        return None
+    step = 1 if dy > 0 else -1
+    for i in range(step, dy + step, step):
+        q = dx if i == dy else _cdiv(dx * i, dy)
+        for ox, oy, ow in probes:
+            px, py = x0 + ox + q, y0 + oy + i
+            if blocked(px, py, ow, down):
+                j = i - step
+                return (x0 + _cdiv(j * dx, dy), y0 + j, px, py)
+    return None
+
+
+def _client_vote(terrain, x, y):
+    """`(x, y)` 周围 7×7 里非空格的偏移之和（`0x473b36`），**指向实心那一侧**。"""
+    sx = sy = 0
+    n = CLIENT_VOTE_WINDOW
+    for ddy in range(-n, n + 1):
+        for ddx in range(-n, n + 1):
+            if _client_cell(terrain, x + ddx, y + ddy) != 0:
+                sx += ddx
+                sy += ddy
+    return sx, sy
+
+
+def _client_reflect(vx, vy, facing):
+    """按朝向反射一次（`0x50f240`，同 `bot._reflect_velocity`，只是弹性换成角色的 0.2）。"""
+    theta = math.atan2(facing[0], facing[1])
+    c, s = math.cos(theta), math.sin(theta)
+    u = (c * vx - s * vy) * (1.0 - CLIENT_BOUNCE_FRICTION)
+    w = (s * vx + c * vy) * -CLIENT_BOUNCE_RESTITUTION
+    return (c * u + s * w, -s * u + c * w)
+
+
+def _client_ground_below(terrain, x, y):
+    """落地那一问（`0x50efd2` 的循环体）：脚 `(x, y)` 能不能踩住。
+
+    脚下 `(x, y+1)` 是 2 / 3 ⇒ 能；是 1（单向平台）而**脚这一格不是 1** ⇒ 能（人在单向平台
+    里面往下掉的时候不会被它自己接住）。
+    """
+    ix, iy = int(x), int(y)
+    below = _client_cell(terrain, ix, iy + 1)
+    if below >= 2:
+        return True
+    return below == 1 and _client_cell(terrain, ix, iy) != 1
+
+
+def client_air_tick(terrain, body, character, crouched=False):
+    """腾空一格（X_Mod §87）：客户端 `0x50d58a`，撞上了再走 `Character` 的 vf+0xa8。
+
+    1. `vy += 1.2`（空气阻力 vft+0xa0 = 0，`v *= 1 − 0`）；
+    2. 扫掠（`_client_sweep`）；一路通畅 ⇒ 位置 += v；
+    3. 撞上了（`0x502df4` → `0x50efd2`）：**这一格位置不动**，只看速度 ——
+       * `ftol(vy) ≥ 0` 且 `|v| ≤ 35` ⇒ **落地**：从原位往下逐格问 `_client_ground_below`
+         （最多 `max(5, ftol(vy))` 格），踩得住就放到扫掠的**空点**、踩地；问满了还没踩住就停在
+         往下挪到的那一格、仍腾空。两种情况速度都清零。
+         ★ 和哪个探针撞上无关：`0x50efd2` 看的 `[hit+0x20]` 对地形恒为 −1（`0x50d404` 初始化，
+           扫掠只写 `+0x1c`）—— 头 / 身撞墙的时候只要在往下掉，也是这一支（人贴着墙往下出溜）；
+       * 否则**反弹**：挡住的那一格上 7×7 投票定朝向，按 `_client_reflect` 反射，再 `vx *= 0.3`。
+    """
+    vx = body.vx
+    vy = body.vy + GRAVITY
+    if vx == 0.0 and vy == 0.0:
+        return body.moved(body.x, body.y, 0.0, 0.0, on_ground=False)
+    hit = _client_sweep(terrain, body.x, body.y, vx, vy,
+                        client_probes(character, vx, vy, crouched))
+    if hit is None:
+        return body.moved(body.x + vx, body.y + vy, vx, vy, on_ground=False)
+    free_x, free_y, cell_x, cell_y = hit
+    if int(vy) >= 0 and math.hypot(vx, vy) <= CLIENT_LAND_SPEED:
+        y = body.y
+        for _ in range(max(5, int(vy))):
+            if _client_ground_below(terrain, body.x, y):
+                return body.moved(float(free_x), float(free_y))      # 踩地，速度清零
+            y += 1.0
+        return body.moved(body.x, y, 0.0, 0.0, on_ground=False)
+    nvx, nvy = _client_reflect(vx, vy, _client_vote(terrain, cell_x, cell_y))
+    return body.moved(body.x, body.y, nvx * CLIENT_BOUNCE_KEEP_VX, nvy,
+                      on_ground=False)
+
+
+def client_launch_tick(terrain, body):
+    """起跳之后那一格（X_Mod §87）：位置 += v，**不加重力、不扫掠**，再看脚下那一格。
+
+    实测（2026-09-23 云桥 83 次起跳 + 26 发正好落在「刚起跳还没动」那一格的心跳）：
+    起跳后第 1 格位移正好是初速（−20），之后才是 −18.8、−17.6 …；对上客户端 `0x50d404`
+    踩地分支「vy < 0 ⇒ 位置 += v」那一支。脚下（`(x, y+1)`）还是非空就算没离地（速度清零）。
+    """
+    nx, ny = body.x + body.vx, body.y + body.vy
+    if _client_cell(terrain, int(nx), int(ny) + 1) == 0:
+        return body.moved(nx, ny, body.vx, body.vy, on_ground=False)
+    return body.moved(nx, ny)
+
+
 def step(terrain, body, character, direction=0, fast_run=False,
          crouched=False, want_jump=False, want_drop=False, speed_scale=1.0):
     """走一个 tick，返回 `(新 Body, 这一格跑没跑过空中积分)`。

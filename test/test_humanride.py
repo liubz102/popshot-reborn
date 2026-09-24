@@ -190,14 +190,18 @@ class HumanRideTests(unittest.TestCase):
         self.assertGreater(body.x, 140.0 + 5.0, "夹具没造对：平台得真的在动")
 
     def test_without_the_platform_phase_it_is_the_old_static_world(self):
-        """拿不到相位（没报过、房间也没开局时刻）就不认平台 —— 和改之前一样。"""
+        """拿不到相位（没报过、房间也没开局时刻）就不认平台 —— 穿过它掉到地面上。
+
+        ★ 落在扫掠的**空点**上：实心第一行的上面一格（客户端 `0x50efd2`，X_Mod §87）。
+        """
         self.conn.mover_phase = None
         self.beat(140, self.top - 40, at=0.0, on_ground=False,
                   velocity=(0, 5))
         self.advance()
         for _ in range(40):
             body = self.advance()
-        self.assertEqual(float(FLOOR), body.y, "一路掉到地面上")
+        self.assertTrue(body.on_ground)
+        self.assertEqual(float(FLOOR - 1), body.y, "一路掉到地面上")
 
     def test_falling_onto_the_platform_lands_on_it_and_rides(self):
         self.beat(140, self.top - 40, at=0.0, on_ground=False,
@@ -215,7 +219,10 @@ class HumanRideTests(unittest.TestCase):
         self.assertAlmostEqual(x0 + moved, body.x, places=6, msg="落上去就跟着走")
 
     def test_a_jump_right_after_the_heartbeat(self):
-        """★★★ 起跳那一帧先走完这一步才离地：第 1 格离地不挪，第 2 格才往上。"""
+        """★★★ 起跳那一帧先走完这一步才离地：第 1 格离地不挪，第 2 格才往上。
+
+        ★ 第 2 格是「起跳后那一格」：只按速度挪、不加重力 —— 正好升 20（X_Mod §87）。
+        """
         self.beat(350, FLOOR - 1, at=10.0)
         self.jump(at=10.001)
         self.assertEqual(((0, 1),), self.conn.sync_jump_ticks)
@@ -224,6 +231,33 @@ class HumanRideTests(unittest.TestCase):
         self.assertFalse(body.on_ground)
         self.assertEqual(before.y, body.y)
         self.assertEqual(-botmove.JUMP_SPEED, body.vy)
+        body = self.advance()
+        self.assertAlmostEqual(before.y - botmove.JUMP_SPEED, body.y, places=6)
+        self.assertEqual(-botmove.JUMP_SPEED, body.vy)
+        body = self.advance()
+        self.assertAlmostEqual(
+            before.y - botmove.JUMP_SPEED - (botmove.JUMP_SPEED - botmove.GRAVITY),
+            body.y, places=6)
+
+    def test_a_heartbeat_right_at_the_takeoff_still_lifts_by_the_full_speed(self):
+        """★★ 心跳正好落在「刚起跳、还没动」那一格（腾空、vy = −20、上一发还踩地）：
+        硬置之后下一格照样按起跳那一步走 —— 2026-09-23 / 24 两次运行 72 个这样的区间，
+        这么走 71 个更准（X_Mod §87）。"""
+        self.beat(350, FLOOR - 1, at=10.0)
+        self.beat(350, FLOOR - 1, at=10.1, on_ground=False,
+                  velocity=(0, -int(botmove.JUMP_SPEED)))
+        before = self.advance()                # 硬置
+        self.assertTrue(self.conn.sim_launch)
+        body = self.advance()
+        self.assertAlmostEqual(before.y - botmove.JUMP_SPEED, body.y, places=6)
+
+    def test_an_airborne_heartbeat_is_not_a_takeoff(self):
+        """同样是 vy = −20，上一发已经在空中（二段跳减到这儿 / 被弹起来）就是普通的腾空。"""
+        self.beat(350, 200, at=10.0, on_ground=False, velocity=(0, -24))
+        self.beat(350, 180, at=10.1, on_ground=False,
+                  velocity=(0, -int(botmove.JUMP_SPEED)))
+        before = self.advance()
+        self.assertFalse(self.conn.sim_launch)
         body = self.advance()
         self.assertAlmostEqual(before.y - (botmove.JUMP_SPEED - botmove.GRAVITY),
                                body.y, places=6)

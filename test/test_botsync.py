@@ -7535,25 +7535,30 @@ class HumanJumpExtrapolationTests(TerrainMixin, BotFireRoom):
     def test_the_lift_is_the_original_jump_speed(self):
         """★ 初速就是语料量出来的那个 20.0（§124），不是我们编的。
 
-        第一次空中位移走的是「加过这一 tick 重力之后」的速度（`_air_tick` 先
-        `vy += g` 再挪），所以位移是 `20 − 1.2`（起跳那一帧不挪，见上一条）。
+        ★ X_Mod §87：起跳后那一格客户端只按速度挪、**不加重力**（`0x50d404` 踩地分支
+          「vy < 0 ⇒ 位置 += v」），所以第一次空中位移正好是 20；之后才每格减 1.2。
         """
         before = self.stand()
         self.send_jump()
         self.advance(2)
+        self.assertAlmostEqual(before.y - botmove.JUMP_SPEED,
+                               self.alice.sim_body.y, places=5)
+        self.advance(1)
         self.assertAlmostEqual(
-            before.y - (botmove.JUMP_SPEED - botmove.GRAVITY),
+            before.y - botmove.JUMP_SPEED
+            - (botmove.JUMP_SPEED - botmove.GRAVITY),
             self.alice.sim_body.y, places=5)
 
     def test_one_rpjump_only_lifts_once(self):
         """★ 这一下是**事件**，吃掉就没了 —— 不许每一格都再跳一次。"""
         self.stand()
         self.send_jump()
-        self.advance(1)
+        self.advance(2)                 # 离地 + 起跳后那一格（只挪、速度不变）
         rising = self.alice.sim_body.vy
+        self.assertEqual(-botmove.JUMP_SPEED, rising)
         self.advance(1)
         self.assertGreater(self.alice.sim_body.vy, rising,
-                           "第二格该只剩重力，不该被重新置成起跳初速")
+                           "再下一格该只剩重力，不该被重新置成起跳初速")
 
     def test_a_heartbeat_after_the_jump_consumes_it(self):
         """★★ 心跳里的坐标 / 速度**已经带着那一跳**（同一条有序流，先跳后报）。

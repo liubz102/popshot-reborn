@@ -57,7 +57,8 @@ import os
 #:   （武器附带状态，X_Mod §31）和 `totem_*` 六格（回血图腾，X_Mod §32）。
 #:   两组都只有爱琳的武器有。`Weapon.__getattr__` 直接透传产物字典，
 #:   所以这边**除了这个版本号什么都不用改**。
-FORMAT = 13
+#: ★ 14（X_Mod §86）：新增 `pass_coll_flags`（`PassObjCollBlockFlags`：撞角色时穿过哪些碰撞圆）。
+FORMAT = 14
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "bot_weapons.json")
@@ -114,6 +115,15 @@ class Weapon(object):
         if region == "legs":
             return self.legs_damage
         return self.damage
+
+    @property
+    def pass_coll_flags(self):
+        """撞角色时**穿过**哪些碰撞圆（`PassObjCollBlockFlags`，武器定义 `+0x20`，X_Mod §86）。
+
+        客户端 `0x50f410` 对目标身上的每个碰撞圆先 `test [shape+0xc], mask`，相交就跳过。
+        腿那个圆带位 4、头那个圆带位 2（`chrprops.SHAPE_FLAGS`）；没填就是 0 = 谁都挡。
+        """
+        return int(self.raw.get("pass_coll_flags") or 0)
 
     @property
     def size(self):

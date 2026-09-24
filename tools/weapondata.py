@@ -80,7 +80,11 @@ ROOT = os.path.dirname(HERE)
 #:   （`Attribute` / `AttributeTime`，全表只有爱琳 2 号的碎片有）和
 #:   **图腾**那六格（`Totem*`，全表只有爱琳 3 号有）。两条都是原版做好了、
 #:   服务端从来没读过的机制 —— bot 挨打不减速、bot 不会去蹭回血图腾都是它。
-FORMAT = 13
+#: ★ 14（X_Mod §86）：新增 **`pass_coll_flags`** = `PassObjCollBlockFlags`（武器定义 `+0x20`）。
+#:   弹体撞角色时，角色身上**掩码和它相交**的碰撞圆直接穿过去（`0x50f410` 的
+#:   `test [shape+0xc], mask`）。腿那个圆带位 4、头那个圆带位 2（`0x4fb01d`）；
+#:   全表 21 节 `-03` 武器填了 4 ⇒ 它们**打不到腿**。服务端以前三个圆全算。
+FORMAT = 14
 
 #: 节名 `chNNN-MM…`：NNN = 角色 id，MM = 武器序号。
 #: ★ 后面还可能跟 `SE` / `D1` / `R1` / `F1` / `a` / `Classic` 之类的后缀 ——
@@ -137,6 +141,8 @@ _FIELDS = (
     ("LockonRange",     "lockon_range",    float),
     ("LockonPrecision", "lockon_precision", float),
     ("Size",            "size",            float),
+    # ★ `PassObjCollBlockFlags`：撞角色时穿过哪些碰撞圆（武器定义 `+0x20`，X_Mod §86）。
+    ("PassObjCollBlockFlags", "pass_coll_flags", int),
     # ★ `SliceTime`：**引信**（毫秒）。分裂类弹体（`AppleGrenade` /
     #   `SeedBomb` / `SliceBullet`）的 Tick 里有一个从 `SliceTime / 32`
     #   倒数的计数器，数到 0 就**在每一台机器上自爆**（§72）。

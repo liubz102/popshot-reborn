@@ -3337,6 +3337,12 @@ def _advance_humans(room, terrain):
                 on_ground=bool(point[3]))
             conn.sim_body_mark = mark
             conn.sim_step = 0
+            # 心跳正好落在「刚起跳、还没动」那一格：客户端报「腾空、vy 正好是起跳初速、位置没动」，
+            # 上一发还踩地（重力一加就不是整 −20 了）⇒ 下一格照客户端走起跳那一步（X_Mod §87）。
+            previous = trail[-2] if len(trail) > 1 else None
+            conn.sim_launch = bool(
+                not point[3] and point[5] == -botmove.JUMP_SPEED
+                and previous is not None and previous[3])
             continue
         if terrain is None:
             continue
@@ -3354,8 +3360,18 @@ def _advance_humans(room, terrain):
         riding = (view.rider_under(body.x, body.y)
                   if moving and body.on_ground else None)
         airborne = not body.on_ground
-        body = botmove.tick(view, body, who, direction=direction,
-                            fast_run=fast_run, crouched=crouched)
+        # ★★ 腾空用**客户端那套**物理（X_Mod §87 / D63）：撞上了这一格不动、只改速度，
+        #   落地 / 反弹照抄 `0x50efd2`；起跳后那一格只按速度挪（不加重力、不扫掠）。
+        #   踩地走路仍是 `botmove.tick`（走路那一段客户端没逆，`0x50d9a7`）。
+        launching = getattr(conn, "sim_launch", False)
+        conn.sim_launch = False
+        if launching:
+            body = botmove.client_launch_tick(view, body)
+        elif airborne:
+            body = botmove.client_air_tick(view, body, who, crouched)
+        else:
+            body = botmove.tick(view, body, who, direction=direction,
+                                fast_run=fast_run, crouched=crouched)
         if moving and airborne and body.on_ground:
             riding = view.rider_under(body.x, body.y)     # 落地那一下也认一次（`0x50f1f8`）
         # ② ★★★ 起跳是**事件**（§173）：`rpJump` 记着离心跳第几帧，排到那一帧上，
@@ -3368,8 +3384,11 @@ def _advance_humans(room, terrain):
                 conn.sync_jump_ticks = tuple(
                     item for item in jumps if item[0] + 1 > step)
                 for _stage in due:
+                    grounded = body.on_ground
                     body = botmove.takeoff(body, who, direction, fast_run,
                                            crouched)
+                    if grounded and not body.on_ground:
+                        conn.sim_launch = True      # 下一格走 `client_launch_tick`
         # ③ 平台驮人：只驮站在它上面、这一帧末还踩着地的（起跳那一帧已经离地，不驮）。
         if riding is not None and body.on_ground:
             mover, rider = riding
@@ -8222,6 +8241,47 @@ def _segment_circle_t(ax, ay, bx, by, cx, cy, radius):
     return t if 0.0 <= t <= 1.0 else None
 
 
+def _body_air_velocity(room, seat_index):
+    """这个座位的人**这一格自己会挪多少**：`(vx, vy)`；踩在地上 / 不知道就是 `(0, 0)`（X_Mod §86）。
+
+    客户端判「弹体撞人」（`0x50bd67`）是**两边一起动**的相对扫掠：弹体按它的速度、人按他
+    自己的 `[角色+0x120]` 各走一格。踩地的人那一格恒 0（走路不走速度，§35），所以只有腾空的
+    人才有这一项 —— 真人取逐格外推那份（`sim_body`），bot 取它自己的物理状态。
+    """
+    if not isinstance(seat_index, int):
+        return (0.0, 0.0)                   # 怪（`("mob", 句柄)`）没有这一格
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    conn = None if seat is None else seat.conn
+    if conn is None:
+        return (0.0, 0.0)
+    body = getattr(conn, "body" if getattr(seat, "is_bot", False) else "sim_body",
+                   None)
+    if body is None or body.on_ground:
+        return (0.0, 0.0)
+    return (body.vx, body.vy)
+
+
+def _character_hit(character, px, py, crouched, vx, vy, ax, ay, bx, by,
+                   radius, pass_flags):
+    """弹体这一格 `A→B` 撞没撞到这个人：`(t, 部位)`；没撞到返回 `None`（X_Mod §86）。
+
+    照抄客户端 `0x50f410` → `0x50bd67`：
+    * 圆**按腿 → 身 → 头的顺序**试，第一个扫到的就算（不是比谁的 t 更早）；
+    * 武器的 `PassObjCollBlockFlags` 和圆的掩码相交就直接穿过去（`-03` 那族打不到腿）；
+    * 相对扫掠：人这一格也按他自己的速度走（`vx, vy`）—— 在人的参照系里看，弹体走的是
+      `A → B − (vx, vy)` 这一段，和不动的圆求第一次接触（起点就重叠算 0）。
+    """
+    rel_bx = bx - vx
+    rel_by = by - vy
+    for cx, cy, r, region, flags in character.hit_shapes(px, py, crouched):
+        if flags & pass_flags:
+            continue
+        t = _segment_circle_t(ax, ay, rel_bx, rel_by, cx, cy, r + radius)
+        if t is not None:
+            return t, region
+    return None
+
+
 def shell_probe_offsets(radius, dx, dy):
     """收方拿**哪几个点**去查地形（V0.3 §116）。返回整数格偏移的元组。
 
@@ -9129,14 +9189,17 @@ def _shell_step(room, shell, terrain, bodies):
     best_t = None
     best = None
     radius = shell.radius
+    pass_flags = shell.weapon.pass_coll_flags
     for seat_index, px, py, crouched, character_id in bodies:
-        character = chrprops.get(character_id)
-        for cx, cy, r, region in character.circles(px, py, crouched):
-            t = _segment_circle_t(ax, ay, bx, by, cx, cy, r + radius)
-            if t is None or (best_t is not None and t >= best_t):
-                continue
-            best_t = t
-            best = (seat_index, region)
+        # ★ 形状顺序、武器掩码、两边一起动 —— 全照客户端（`_character_hit`，X_Mod §86）。
+        vx, vy = (_body_air_velocity(room, seat_index) if room is not None
+                  else (0.0, 0.0))
+        got = _character_hit(chrprops.get(character_id), px, py, crouched,
+                             vx, vy, ax, ay, bx, by, radius, pass_flags)
+        if got is None or (best_t is not None and got[0] >= best_t):
+            continue
+        best_t = got[0]
+        best = (seat_index, got[1])
     # ★★ 闯关房：也要撞得到怪（M5-G）。排在地形前面 —— 怪站在地上，
     #    先撞怪再撞地才是对的。
     mob = _mob_contact(room, shell, ax, ay, bx, by)
