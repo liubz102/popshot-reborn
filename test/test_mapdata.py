@@ -426,8 +426,8 @@ class RealDataTests(unittest.TestCase):
     def test_coarse_clear_never_lies(self):
         """★★★ `coarse_clear()` 说「空的」就必须真是空的（V0.3 §169）。
 
-        `botmove._ceiling_between()` 拿它跳过绝大多数上升 tick 的逐格扫
-        —— 它**多**说一次「空」，bot 就会穿一次天花板。反过来说
+        弹体扫掠拿它跳过绝大多数空中那一段的逐格扫（角色扫掠用的是同一套的「非空」版
+        `coarse_empty`）—— 它**多**说一次「空」，就会穿一次地形。反过来说
         「不敢打包票」永远安全（退回逐格扫）。
 
         随机撒一批「一个 tick 走得到」那么大的小方框，逐格核对。
@@ -506,7 +506,10 @@ class BreakableTerrainTests(unittest.TestCase):
         self.assertTrue(self.t.blocks_bullet(3, 3))
         self.assertFalse(self.t.is_one_way(3, 3))
         # 冰顶上站得住；冰没盖到的地方还是原来那根白线。
-        self.assertEqual(2, self.t.surfaces(3)[0])
+        # ★ 客户端那份形状（X_Mod §105）：半高 1.5 ⇒ Y=1 的局部是 ftol(−0.5) = 0，**向零截断**
+        #   多出上面一行 —— 冰顶在 1 不是 2。
+        self.assertEqual(3, self.t.cell(3, 1))
+        self.assertEqual(1, self.t.surfaces(3)[0])
         self.assertEqual(3, self.t.surfaces(0)[0])
 
     def test_broken_it_reveals_the_one_way_platform(self):

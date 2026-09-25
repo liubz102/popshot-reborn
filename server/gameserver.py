@@ -381,7 +381,7 @@ OP_USE_ITEM = 0x040c          # 两个方向同号：客户端「我要用第 N 
 # 为什么用户只在「三重射击 / 毒药 / 致命射击」上看得见这个 bug：
 # 这三件的 `Status.ini` 记录**没有 `Time`、只有 `Magazine=3`**（§201），
 # 于是 `UseItemEffect` 给的 duration 是 **-1（无限）**，真正的结束条件是
-# 「本机玩家打完 3 发」—— 只有他自己那台机器数得出来。有 `Time` 的那些
+# 「本机玩家打空 3 匣」（X_Mod §95）—— 只有他自己那台机器数得出来。有 `Time` 的那些
 # （护盾 8 秒、加速 8 秒、隐身 10 秒…）每台机器各自倒计时，所以看起来正常。
 OP_REMOVE_CHAR_ATTR = 0x040d  # 两个方向同号：客户端「我这个效果结束了」/ 服务端「某座位的效果结束了」
 
@@ -2887,6 +2887,13 @@ HP_CHARGE_AMOUNT = 10
 #: * 再中一次**只把到期时刻续满 8 秒**，跳的节奏不重排（`0x401bd6`）。
 POISON_ITEM_ID = 10500
 POISON_MAGAZINE_ATTR = 10
+
+#: 三重射击的属性号（`Item.ini [TripleShot] CharAttr=6`）：开火时弹数 ×3（`0x515365`，X_Mod §98 / §101）。
+TRIPLE_SHOT_ATTR = 6
+
+#: 缩小道具（`Item.ini [SizeDown] ItemId=10304 CharAttr=4`，`Status.ini [4] Time=8.0`，X_Mod §101）。
+SIZE_DOWN_ITEM_ID = 10304
+SIZE_DOWN_SECONDS = 8.0
 POISON_SECONDS = 250 * 32 / 1000.0
 POISON_INTERVAL = (1500 // 32 + 1) * 32 / 1000.0
 POISON_DAMAGE = 5
@@ -2917,6 +2924,13 @@ HUD_JAM_SECONDS = 8.0
 #:     SpeedRatio=0.3
 SLOWED_SECONDS = 4.0
 SLOWED_SPEED_RATIO = 0.3
+
+#: ★ 加速道具（`Item.ini [SpeedUp] ItemId=10301 CharAttr=2`）→ `Status.ini` 第 **2** 条：
+#: `Time=8.0`、`SpeedRatio=2.0`。走速倍率 `Character vft+0x124`（`0x4fec46`）的头一句：
+#: 有属性 2 ⇒ 倍率**直接取** 2.0（不是乘），之后有属性 14 再 ×0.3（X_Mod §97）。
+HASTE_ITEM_ID = 10301
+HASTE_SECONDS = 8.0
+HASTE_SPEED_RATIO = 2.0
 
 #: 胶水那一摊的**碰撞半径**（V0.3 §108）。
 #:
@@ -2987,25 +3001,28 @@ BULLET_ATTRIBUTE_CHAR_ATTR = {1: 11, 2: 12, 3: 13, 4: 14}
 #: 12 冰冻那一条没有 `SpeedRatio`，它是整个「动不了」（见 `bot._speed_scale`）。
 CHAR_ATTR_SPEED_RATIO = {14: SLOWED_SPEED_RATIO}
 
-#: ★★★ **按「打几发」算的那三条状态**（V0.3 §117，接 §200 / §201）。
+#: ★★★ **按「打空几匣」算的那三条状态**（V0.3 §117，接 §200 / §201；X_Mod §95 订正）。
 #:
 #: `Status.ini` 里绝大多数状态有 `Time`，客户端各自倒计时、自己撤掉。
 #: 这三条**只有 `Magazine`、没有 `Time`** —— `UseItemEffect` 给的时长是
-#: **−1（无限）**，真正的结束条件是「**开了 Magazine 发**」，而且只有
-#: **持有者那台机器**数得出来，数完发一发 `0x040d` 告诉别人（§200）。
+#: **−1（无限）**，真正的结束条件是「**打空 Magazine 个弹匣**」（`0x509feb` 只在
+#: 开火后弹匣打空、开始换弹那一下各减 1），而且只有**持有者那台机器**数得出来，
+#: 数完发一发 `0x040d` 告诉别人（§200）。⚠ 会话 38 以前这里写的是「开 Magazine 发」——
+#: 一匣 1 发的武器两者一样，左轮 6 发一匣就是 18 发对 3 发。
 #:
 #: ⇒ bot 没有本机 ⇒ **没有一台会替它数** ⇒ 效果永远不结束
 #: （用户 2026-08-29：「bot 的苹果弹一直是加强状态，不恢复正常」）。
-#: 服务端必须替它数，数完补那一发 `0x040d`。
+#: 服务端必须替它数（`bot._magazine_emptied`），数完补那一发 `0x040d`。
 #:
-#: 表：`物件 id -> (属性号, 弹数, 伤害倍率, 弹体大小倍率)`。
+#: 表：`物件 id -> (属性号, 匣数, 伤害倍率, 弹体大小倍率)`。
 #: 属性号来自 `Item.ini` 的 `CharAttr`，后三个来自 `Status.ini` 同号那一节：
 #:
 #:     [6]  트리플 샷  Magazine=3
 #:     [7]  파워 샷    Magazine=3  DamageRatio=2.0  SizeRatio=2.0
 #:     [10] 포이즌     Magazine=3  OneMagazine=1
 #:
-#: ⚠ `OneMagazine` 是毒弹独有的一格，含义还没逆出来，先当它不影响发数。
+#: ⚠ `OneMagazine` 是死代码：`0x508e28` 拿**属性号**去比 0x2904（= 10500，毒弹的
+#: **道具号**），永远不成立 —— 本来想做的大概是「每发都算打空一匣」（X_Mod §93）。
 MAGAZINE_STATUS = {
     10306: (6, 3, 1.0, 1.0),      # TripleShot 三重射击
     10307: (7, 3, 2.0, 2.0),      # PowerShot 强力射击（★ 用户报的就是它）
@@ -4153,6 +4170,18 @@ PEER_OP_JUMP = 0x0006
 #: V0.3 §41）。蹲**不在心跳里**，只有这一发**事件包**说得着 —— 所以服务端
 #: 得自己把它记成状态，bot 回放到那一段时再补一发。组包在 `botsync.py`。
 PEER_OP_CROUCH = 0x000B
+
+#: 内层 `0x0016`：发动一招**近身格斗招式**（原名未知；收方 `0x493581` → `0x50a674`
+#: 造一个 `NewMutuSkill`，招式在 `NewMutu.ini`）。只有本机输入处理（`0x4958eb` 那一带）发。
+#: ★ `0x50a674` 进门就把格挡开关 `[char+0x2b6]` 清 0 —— 不发 `rpGuard`、也不动过渡
+#: 计时器 ⇒ 服务端记的那份格挡跟着清（`Conn.note_sync_position`，X_Mod §95）。
+PEER_OP_MUTU_SKILL = 0x0016
+
+#: ★★ 格挡开 / 关的**过渡**（X_Mod §95）：收方 `SetGuard`（`0x502dae`）换开关时顺手
+#: 起一个 **3 个逻辑帧**的计时器（`0x502de0 push 3`，计的是 `[Stage+0xd4]` 帧号），
+#: 已经在跑就不重起；射手判「在挡」（`0x50a0ea`）看的是「开关 XOR 计时器在跑」
+#: ⇒ 按下 / 松开都要过 3 格才算数。原版数据，不是我们挑的定时器（同 `POISON_INTERVAL`）。
+GUARD_SWITCH_S = 3 * roomclock.TICK_S
 
 #: ★ 诊断用（`note_human_fire`）：真人的 `rpFire` / `rpExplode`。
 #: 组包在 `botsync.py`（`OP_FIRE` / `OP_EXPLODE`），这里只为了把**真人此时
@@ -5944,6 +5973,16 @@ def reset_sync_trails(room, why, new_match=False):
         if new_match:
             conn.dead_since = None
             conn.afk_when_down = False
+        # ★ 格挡开关**只在新一局清**（X_Mod §95）：角色重建时 Init 写 0（`0x4fb6d7`），
+        #   他还按着键的话他那台会再发一发「开」。闯关换图不走 Init（§94），开关跟着人
+        #   带过去，他那台看自己也还是「开」、不会再发 —— 这边清了就再也对不上。
+        #   过渡计时器两种都当过期（加载那几秒怎么走没逆，同 D65）。
+        if new_match:
+            conn.sync_guard = False
+            # 加速 / 减速 / 冰冻：新一局角色重建，属性表是空的（X_Mod §97）。
+            conn.hasted_until = conn.slowed_until = conn.frozen_until = None
+            conn.shrunk_until = conn.jab_until = None
+        conn.sync_guard_switch_at = None
         # ★★ **在场证据那几格一个都不清**（`presence_*`，2026-09-21）：
         #   上面两条钟要清，是因为它们的证据（`0x040e`、打中 / 捡到）本来就
         #   **只在一张图之内有意义**；而在场证据说的是「这个人在不在机器前」，
@@ -6004,11 +6043,11 @@ HEARTBEAT_TICKS = 4
 #:
 #: 踩地那一路收方是按方向键**自己走**的，走速两边一样，4 格一发 + 按键翻转
 #: 当格补锚（D149）就够。腾空那一路收方拿包里的速度**逐帧积分、再用自己的
-#: 三圆地形扫掠去挡**（`Character` 主虚表 vf+0x70 = `0x50d58a` → `0x50e759`，
-#: 形状表 `[char+0x140..0x144]`），而服务端 `botmove._air_tick` 是脚下一个点。
-#: 冰洞顶、悬崖下沿这种「脚过得去、头过不去」的地方，收方那份被挡住、服务端
-#: 这份飞过去，两发心跳之间最多差 4 格，再按 0.6ⁿ 慢慢滑回来 —— 实机 849 发
-#: 开火两端对齐：空中滞后 p90 32 px、p99 71 px，装了 BSM1 前后一样。
+#: 三圆地形扫掠去挡**（`Character` 主虚表 vf+0x70 = `0x50d58a` → `0x50e759`）。
+#: X_Mod §105 起服务端跑的是同一套物理，可**空中操控**（`[+0x4c4]`）只有本人那台有：
+#: bot 按住方向键时 vx 逐格往上攒，收方那份远端角色的 vx 却定在包里那个数上 ——
+#: 两发之间攒几格就差几格的操控量（V0.3 时期是脚点模型 vs 三圆扫掠，实机空中滞后
+#: p90 32 px、p99 71 px）。
 #: ⇒ 腾空每格报一发：收方自己积分的只剩 1 格，分歧最多一格的量、下一格就被
 #: 拉回。代价是腾空段心跳 ×4（bot 约 2/3 时间腾空，每个 bot 每秒 ~8 份 → ~24 份）。
 #: ⚠ 这**不是**锚：分歧发生在收方那台机器上，服务端没有事件可等，只能按节拍报；
@@ -7147,6 +7186,19 @@ class Conn:
     sync_jump_ticks = ()
     sync_trail_at = None
     sync_crouch = False
+    sync_guard = False
+    sync_guard_switch_at = None
+    # ★ 会改走速的三个状态「到什么时候」（`time.monotonic()`，`None` = 没有）：加速（属性 2）、
+    #   减速（14）、冰冻（12）。bot 的也是这三格（`BotConn` 自己也会写）；真人的只给服务端
+    #   外推他的位置用（X_Mod §97）。
+    hasted_until = None
+    slowed_until = None
+    frozen_until = None
+    # ★ 缩小道具（属性 4）到什么时候：碰撞圆 ×0.6（X_Mod §101）；出拳（`0x0008`）那一段第 4 个圆
+    #   到什么时候、朝哪边（`jab_dir`）。bot 的同名三格在 `BotConn` 上。
+    shrunk_until = None
+    jab_until = None
+    jab_dir = 0
     # ★ 「这条连接报过几个位置点」。bot 的帧循环拿它当**事件**（V0.3 §32）：
     #   号变了 = 这个真人报了一个新位置 = bot 该走一帧了。只增不减、不回绕
     #   （Python 的 int 没有上限），换图 / 新一局都**不清** —— bot 那边存的
@@ -7384,6 +7436,18 @@ class Conn:
         # ★ 他现在蹲着没有。`rpCrouch`(0x000b) 只在按下 / 松开各来一发，
         #   中间的每一发心跳都照这个状态记进轨迹点（V0.3 §41）。
         self.sync_crouch = False
+        # ★ 他的格挡开关（`[char+0x2b6]`）和开关过渡计时器起跑的时刻（X_Mod §95）。
+        #   和蹲一样只有事件包说得着（`rpGuard` 0x0018）；bot 替它当射手时判「在挡」
+        #   要用（`guarding()`）。
+        self.sync_guard = False
+        self.sync_guard_switch_at = None
+        # ★ 加速 / 减速 / 冰冻到什么时候（见类级默认值，X_Mod §97）。
+        self.hasted_until = None
+        self.slowed_until = None
+        self.frozen_until = None
+        self.shrunk_until = None
+        self.jab_until = None
+        self.jab_dir = 0
         # 记了几个位置点（bot 的帧事件）。见类级默认值。
         self.sync_trail_seq = 0
         # ★ 诊断（`note_human_fire`）：本图已经打过日志的内层 opcode。
@@ -9658,6 +9722,19 @@ class Conn:
         | 烟雾 10401 | 同上，云在使用者脚下（D67）|
         """
         item_id = int(item_id)
+        # ★★ 加速（X_Mod §97）：每台机器都给他挂属性 2，走速倍率变 2.0（`0x4fec46`）。
+        #    bot 的走位是服务端算的、真人的位置服务端要外推 —— 两边都得知道他在加速，
+        #    不然 bot 被每发心跳往回拽、外推的真人落在后面。
+        if item_id == HASTE_ITEM_ID:
+            self.hasted_until = time.monotonic() + HASTE_SECONDS
+            self.log(f"   加速 座位 {seat_id} {HASTE_SECONDS:g} 秒（走速 ×{HASTE_SPEED_RATIO:g}）")
+            return
+        # ★★ 缩小（X_Mod §101）：每台机器给他挂属性 4，碰撞圆（腿 / 身 / 头 / 蹲）×0.6、从脚底往上
+        #    重摆（`0x4fc399`）—— 撞子弹、腾空扫掠都跟着缩。bot 替人判命中、外推真人、自己走都要知道。
+        if item_id == SIZE_DOWN_ITEM_ID:
+            self.shrunk_until = time.monotonic() + SIZE_DOWN_SECONDS
+            self.log(f"   缩小 座位 {seat_id} {SIZE_DOWN_SECONDS:g} 秒（碰撞圆 ×0.6）")
+            return
         # ★★ 护盾（X_Mod §92）：收方 `OnHit` 见属性 1 整发不扣血，
         #    服务端的血量台账跟着免伤 8 秒（bot 用的也走这里）。
         if item_id == SHIELD_ITEM_ID:
@@ -11262,6 +11339,16 @@ class Conn:
             if len(payload) >= udpsync.PEER_HEADER_SIZE + 2:
                 self.sync_crouch = bool(payload[udpsync.PEER_HEADER_SIZE + 1])
             return
+        if opcode == PEER_OP_GUARD:
+            # ★ 格挡同蹲，是**状态**（X_Mod §95）：他那台在「踩地 + 按着键 + 没被打破」
+            #   变了的时候才发（`0x4958eb`），体力耗尽由他那台发一发「关」（`0x507102`）。
+            if len(payload) >= udpsync.PEER_HEADER_SIZE + 2:
+                self.note_guard(bool(payload[udpsync.PEER_HEADER_SIZE + 1]), now)
+            return
+        if opcode == PEER_OP_MUTU_SKILL:
+            # 出招清格挡开关（`0x50a674`），计时器不动 —— 和 `note_guard` 不是一回事。
+            self.sync_guard = False
+            return
         if opcode == PEER_OP_LOAD_PROGRESS:
             # 加载进度不带坐标，但它现在还是一个关键**事件**：
             # 能从**这台**客户端发出来，就证明它的 LoadingStage 的座位和
@@ -11297,6 +11384,34 @@ class Conn:
         #   `rpJump` 先到）—— 外推那份马上就要被硬置成它，欠着的到此为止，
         #   再补一次就变成跳两下（§173）。
         self.sync_jump_ticks = ()
+
+    def note_guard(self, on, now):
+        """收到他的 `rpGuard`：照收方 `SetGuard`（`0x502dae`）记一份（X_Mod §95）。
+
+        开关照包里写；过渡计时器**没在跑才起**（`0x502dd7` 先问 `0x5d5eb0`）。
+        3 格之内连翻两次，第二次不重起 —— 于是剩下那几格里「开关 XOR 在跑」是反的，
+        原版就这样。
+        """
+        self.sync_guard = bool(on)
+        if not self.guard_switching(now):
+            self.sync_guard_switch_at = now
+
+    def guard_switching(self, now):
+        """格挡开关的过渡计时器此刻还在跑吗（`0x5d5eb0`，3 个逻辑帧）。"""
+        at = self.sync_guard_switch_at
+        return at is not None and now - at < GUARD_SWITCH_S
+
+    def guarding(self, now):
+        """别人那台（射手）此刻判他**在挡**吗 —— `0x50a0ea` 的三道门（X_Mod §95）。
+
+        ① `[+0x2b7]`（体力耗尽、打破了）只在**他自己那台**置位（`0x5070fb` 前面是 `IsMine`），
+           别的机器上恒 0，他那台会另发一发「关」—— 这里不用管；
+        ② 蹲着（`[+0x2b5]`，`rpCrouch`）不算在挡；
+        ③ 开关 XOR 过渡计时器在跑。
+        """
+        if self.sync_crouch:
+            return False
+        return bool(self.sync_guard) != self.guard_switching(now)
 
     def sync_peer_epoch(self, payload):
         """局号一变就把排序闸门里的**事件计数**归零（`udpsync` 铁律 3）。

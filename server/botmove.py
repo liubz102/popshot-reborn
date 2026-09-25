@@ -1,145 +1,246 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""botmove.py —— **角色自己走路**的服务端复现（V0.3 M5）。
+"""botmove.py —— **角色走路 / 起跳 / 腾空**的服务端复现（V0.3 M5；X_Mod §102 / §104 / §105 起逐指令照抄客户端）。
 
-`ballistics.py` 是子弹的运动，这个文件是**人**的运动：给一个落脚点、一个
-方向键，算出下一 tick 他站在哪、有没有踩空、跳起来能到多高。
+`ballistics.py` 是子弹的运动，这个文件是**人**的运动。三处用的是**同一套**，都是「本人那台客户端」
+（`MyCharacter`）一个逻辑帧的样子：bot 自己走（服务端就是它的本机）、外推真人（服务端替他自己那台算，
+`bot._advance_humans`）、可达图（`botnav` 拿它逐格模拟建边）。
 
-## 为什么需要它
+## 一帧的顺序（X_Mod §105）
 
-在这之前 bot 的位置全靠 `bot.trail_point()` **回放真人的轨迹**（D16）——
-真人走过的点一定是合法地面，一行地形代码都不用写。代价是它**没有自己的
-走位**：真人站着不动时轨迹推不进，bot 就一路挪到人身上（§52 实测 20 个
-单位）。要让 bot 自己决定站哪，就得自己会走路。
+    ① `[+0x518]`（按 ↓ 穿白线的计数）> 0 就减 1（`0x4fe329`）；还 > 0 时白线不挡（`vft+0x100` 为假）
+    ② 踩地（`[+0x128]`）才走路：dist = S × 方向 × 装备走速 × 冲刺 1.5 × 蹲 ⅓ → `0x50d9a7`
+       （余量 `[+0x130]` 累加、跨帧保留，1 px 一列推进：上坎 ≤ 20、下坎 ≤ 10，每步花 √(1+dy²)）
+    ③ 物理：vx += 空中操控 → `0x50d404`（踩地：vy < 0 按 v 挪一次、否则 v 清零；脚下空 ⇒ 离地、
+       同一帧再腾空一步）→ vx −= 操控
+    ④ 弹跳台（`JumpingObj::Tick`，排在角色之后）：踩地、←/→/↓ 都没按 ⇒ 写 v、**不清踩地位**
+    ⑤ 本人输入 `0x51558f`：踩地操控清 0；腾空按左 / 右 ⇒ 操控 ±步长；按着 ↓ ⇒ `[+0x518] = 8`
+    ⑥ `rpJump` 回环执行（起跳 `0x501d57`）：vy = −√(2g·h)、vx = ±¼S、当场离地
 
-## 尺度常量的出处（§71）
+S = `vft+0x128` = 状态倍率 × ChrSpeed（不含冲刺 / 蹲 / 装备）。
 
-| 量 | 值 | 出处 |
-|---|---|---|
-| 逻辑步长 | **32 ms** | 和弹道同一套（§47 的 `ballistics.TICK_MS`）|
-| 一发心跳 | **4 个 tick** | 语料：腾空段的 `dx` 恒等于 `4 × vx` |
-| 走路速度 | **`ChrSpeed` 单位 / tick**（6.0~8.0）| `0x50766a`：`速度 × 方向 × 倍率` |
-| 冲刺跑 | **× 1.5** | `GameProps.ini` 的 `FastRunRate`（`0x507567` 读它）|
-| 蹲着走 | **× 1/3** | `0x507607` 乘 `[0x69387c]` = 0.3333 |
-| 空中水平 | ★ **方向键管不着**：一直是起跳那一刻的走速 | `0x5073a6`（腾空整段跳过读键）+ 语料，§93 |
-| 重力 | **1.2 单位 / tick²** | `[0x693784]`，`0x40a04f` 返回它 —— **和子弹是同一个数** |
-| 起跳初速 | **20 单位 / tick**（向上）| 语料 33971 段：起跳后第一发心跳 `vy` 中位 **−19**（p10 −20 / p90 −17）|
-| 爬得动的坡 | `|dy/dx| ≤ **2**` | 语料 88875 发上坡心跳的 **p99** |
+## 坐标
 
-⚠ 起跳初速是**语料量的**，不是从代码里读出来的（那一句还没找到）。
-两条交叉验证都对得上：顶点高 `v²/2g = 20²/2.4 = 167`，语料量到的中位
-是 **170**；而 `1.2` 这个重力是代码里的常量，不是拟合出来的。
-
-## 坐标系
-
-**y 往下为正**（和 `mapdata` / 心跳一致）：跳起来 y 变小，落下 y 变大。
-`Body` 记的 `(x, y)` 是**落脚点**，和心跳 body `+7..10` 是同一个点。
+**y 往下为正**（和 `mapdata` / 心跳一致）。`Body.(x, y)` 是**脚**，客户端把它放在实心第一行的
+**上面一行**（走路 `0x50da83`、落地 `0x50f1d2`；1682 发静态地面心跳全是这样）—— V0.3 那套放在
+站立面那一行上，差 1 px。主线程 x87 是 24 位精度（D3D 没带 `FPU_PRESERVE`）⇒ 每一步按 f32 舍入。
 
 ## 只用标准库；CPython 3.8 也要能跑（Win7 运行时）
 """
 from __future__ import annotations
 
 import math
+import struct
 
 import ballistics
+import mapdata
 
 #: 逻辑步长（毫秒）—— 人和子弹用的是同一套（§47）。
 TICK_MS = ballistics.TICK_MS
 TICKS_PER_SECOND = ballistics.TICKS_PER_SECOND
 
-#: 重力，单位 / tick²。`[0x693784] = 1.2`，`0x40a04f` 把它乘上
-#: `[MyChar+0x344]`（恒 1.0）返回 —— 子弹的 `1.2 × GravityFactor` 用的
-#: 也是这一句，所以人和子弹**共用同一个重力**。
+
+_F32 = struct.Struct("<f")
+_F32_PACK = _F32.pack
+_F32_UNPACK = _F32.unpack
+
+
+def _f32(value):
+    """按 f32 存一次（主线程 x87 是 24 位精度，D3D 没带 FPU_PRESERVE —— 每一步都这么舍入）。
+
+    ★ 热路径（可达图预热每帧几十次）：绑定好的 `Struct` 方法，线程安全（预热线程和房间线程都在用）。
+    """
+    return _F32_UNPACK(_F32_PACK(value))[0]
+
+
+#: 重力，单位 / tick²。`[0x693784] = 1.2f`，`0x40a04f` 乘上 stage 的重力系数（恒 1.0）返回 ——
+#: 子弹的 `1.2 × GravityFactor` 用的也是这一句，人和子弹共用同一个重力。
 GRAVITY = 1.2
+G32 = _f32(GRAVITY)
 
-#: 起跳初速（单位 / tick，向上）。★ 语料量的，见文件头那张表。
-JUMP_SPEED = 20.0
+#: ★★★ 起跳高度（X_Mod §102）：一段 `0x501d71` 180、二段 `0x501d7a` 240。
+JUMP_HEIGHT = 180.0
+DOUBLE_JUMP_HEIGHT = 240.0
 
-#: ★★ **第二段跳**的初速（单位 / tick，向上）。同样是语料量的（V0.3 §124）：
-#: 380 份上行流里 `rpJump` 的 `+1` 段号分成两拨，各取「起跳后第一发心跳的
-#: `vy`」——
-#:
-#:     第 1 段  n=37147   峰值 **−20**（9712 发），后面 19 / 18 / 17 是采样滞后
-#:     第 2 段  n=20988   峰值 **−24**（5445 发），后面 22 / 21 / 20 同理
-#:
-#: 分布只有四个桶、而且每桶都上千发 ⇒ 它是**常量**，而且第二段跳是**把
-#: `v.y` 重新置成这个数**（不是在当前速度上叠加 —— 叠加的话分布会散开）。
-DOUBLE_JUMP_SPEED = 24.0
 
-#: 按着右键冲刺跑：`GameProps.ini` 的 `FastRunRate`。
+def launch_speed(stage=1):
+    """起跳初速的大小：`f32(√(2·g·h))`（`0x501ee1`：`g×h` 存 f32 → `fadd st0,st0` → sqrt → f32）。"""
+    height = DOUBLE_JUMP_HEIGHT if stage == 2 else JUMP_HEIGHT
+    return _f32(math.sqrt(2.0 * _f32(G32 * height)))
+
+
+#: 一段跳初速（向上）= **20.784611**。V0.3 语料量到的「−20」是心跳**截断**的结果（`0x5040f1`），
+#: 「起跳后第一格不加重力、位移正好 −20」同样是 y 截断的假象（X_Mod §102 订正 §87）。
+JUMP_SPEED = launch_speed(1)
+
+#: ★★ **第二段跳**的初速 = √(2·1.2·240) = **24.0**。第二段是把 `v.y` **重新置成**这个数（不是叠加）。
+DOUBLE_JUMP_SPEED = launch_speed(2)
+
+#: ★★ 起跳那一刻的水平速度 = ±¼ × S（`0x501e81` −0.25 / `0x501e9f` +0.25）；
+#: 侧边那一格（x±1, y）是 2/3、或者没按左右键 ⇒ 0。**两段都重算**。
+JUMP_VX_RATIO = 0.25
+
+#: ★★ **空中操控**（`[+0x4c4]`，只有本人那台的输入处理 `0x51558f` 有）：腾空、没上锁 `[+0x5d5]`、
+#: 侧格是 0/1 时按住左 / 右，每帧 ∓/± 步长；步长从 2.0 起每用一次减 0.02、最低 0.2
+#: （`0x515ee1` / `0x515ef8`）；两键都没按 ⇒ 步长回 2.0、解锁（`0x515f67` / `0x515f6e`）；钳到 ±S。
+AIR_CONTROL_STEP = 2.0
+AIR_CONTROL_STEP_DECAY = _f32(0.02)       # [0x693908]
+AIR_CONTROL_STEP_MIN = _f32(0.2)          # [0x693748]
+
+#: ★★ 上升计时器 `[+0x4f4]` 还在跑时撞上**任何东西**：`vx_eff × 0.75`、`vy = 0`、停表，
+#: 不落地不反弹不上锁（`0x502f42`：`0x5d5eb0` 在跑 ⇒ `[0x6938c8]`，再 `0x5d5e54` 停表）。
+RISE_BUMP_KEEP_VX = 0.75
+
+
+def rise_ticks(speed):
+    """起跳后有几帧在上升计时器里（`0x501f0d`：时长 `ftol(|v0 / g|)` 个逻辑帧）。
+
+    计时器在起跳那一帧（输入处理里）起跑、`elapsed < 时长` 算在跑 ⇒ 之后第 1 ~ 时长−1 帧在计时器里。
+    除法在 24 位精度下做：一段 17.32 → 17、二段 `24/1.2f` 舍成 20.0 → 20。
+    """
+    return max(0, int(abs(_f32(speed / G32))) - 1)
+
+
+#: 按着右键冲刺跑：`GameProps.ini` 的 `FastRunRate`（`0x507567` 读它；体力不够那一帧就不乘，
+#: 还把冲刺位清掉 —— 体力那一本账在 `bot._regen_stamina`）。
 FAST_RUN_RATE = 1.5
 
-#: 蹲着走：`0x507607` 乘的那个常量。
-CROUCH_FACTOR = 1.0 / 3.0
+#: 蹲着走：`0x507607` 乘 `[0x69387c]` = 0.33333334f。
+CROUCH_FACTOR = _f32(1.0 / 3.0)
 
-#: 走路能爬的最陡坡（`|dy / dx|`）。语料 88875 发上坡心跳的 p99 = 2.0
-#: （中位 0.23、p90 0.85）——**这是真人走得动的坡**，不是我挑的数。
+#: 装备走速（`GetEquipBonus` 第 4 格，百分比）：`(x + 100) × [0x693724]`（`0x5074f9`）。
+EQUIP_PERCENT = _f32(0.01)
+
+#: 走路一列最多往上爬 / 往下落几格（`vft+0x108` = `0x501b7c` / `vft+0x10c` = `0x501b92`）；
+#: 冲刺攻击的计时器 `[+0x5c0]` 在跑时换成后两个。
+WALK_UP_MAX = 20
+WALK_DOWN_MAX = 10
+DASH_UP_MAX = 10
+DASH_DOWN_MAX = 0
+
+#: 走出崖边那一步踩地时顺手写的 `vy = 8g`（`0x50dac9`）—— 紧接着 `0x50d404` 见「踩地且 vy ≥ 0」
+#: 就清零，所以只会顶掉弹跳台刚写、还没挪的那一份速度。
+WALK_OFF_VY = _f32(8.0 * G32)
+
+#: 按着 ↓ 每帧把 `[+0x518]` 置成这个数（`0x516207`），角色那一格先减 1 ⇒ 松开后还有 7 帧白线不挡。
+DROP_HOLD_FRAMES = 8
+
+#: 只给**启发式**用的「一步能爬多陡」（`bot` 挑站位、`botnav` 的依赖区）；物理本身是逐列的
+#: `WALK_UP_MAX` / `WALK_DOWN_MAX`。语料 88875 发上坡心跳的 p99 = 2.0。
 CLIMB_SLOPE = 2.0
 
-#: 一发心跳等于几个 tick。语料：腾空段相邻两发的 `dx` 恒等于 `4 × vx`。
-#: ★ 只在「没有真实时间可依据」的地方当兜底用（`bot.py` 按流逝时间算）。
+#: 一发心跳等于几个 tick。★ 只在「没有真实时间可依据」的地方当兜底用。
 TICKS_PER_BEAT = 4
 
-#: ★★★ **弹跳台**的作用半径（V0.3 §99）。
-#:
-#: `JumpingObj` 构造函数 `0x510ade` 把碰撞形状的半径写成 **20.0**
-#: （`[obj+0x13c]` 的 `+0x18`），判定是它和**角色的碰撞圆**相交
-#: （`0x50f410`，和子弹撞人是同一个函数）。角色最下面那个圆（腿）半径 12，
-#: 所以水平方向大约 32 个单位以内会被弹 —— 实机 12 次弹飞的水平距离
-#: 全部 ≤ 29.7，最近的一次「没被弹」是 51.5，和这个口径对得上。
+#: ★★★ **弹跳台**的作用半径（V0.3 §99）：`JumpingObj` 构造 `0x510ade` 写的 20.0，
+#: 判定是它和**角色的碰撞圆**静态相交（`0x50f410`，和子弹撞人同一个函数）。
 JUMP_PAD_RADIUS = 20.0
 
-#: ★ 台子给的目标点还要再减这一项：`0x510e75` 把**角色重力**乘上它。
-JUMP_PAD_GRAVITY_BIAS = 0.25
+#: ★ 台子给的目标点还要再减这一项 × `[char+0x3c4]`（= 2·ChrSizeLegs + ChrSizeBody，`0x4fc49a`）：
+#: `0x510e68 … fmul 0.25 … fsubp`（X_Mod §104）。以前当成「× 重力」减 0.3 是读错了。
+JUMP_PAD_HEIGHT_BIAS = 0.25
+
+#: ★★ 按着这几个键台子**不弹**（`0x510dd3` ← / `0x510de0` → / `0x510ded` ↓，X_Mod §104）；↑ 不拦。
+#: 值是心跳按键掩码那几位（`botsync.KEY_LEFT` / `KEY_RIGHT` / `KEY_DOWN`）。
+PAD_BLOCK_LEFT = 0x01
+PAD_BLOCK_RIGHT = 0x04
+PAD_BLOCK_DOWN = 0x08
+PAD_BLOCK_KEYS = PAD_BLOCK_LEFT | PAD_BLOCK_RIGHT | PAD_BLOCK_DOWN
+
+#: 腾空撞上东西时，速度（模）不超过它才算落地：`Character` vft+0xa4 = `0x4febe0`（常态 35）。
+CLIENT_LAND_SPEED = 35.0
+
+#: 撞上后的反射（`0x50f240`，弹体用的也是这个函数）：切向留 1 − 0.5（vft+0x98），法向 × −0.2（vft+0x94）。
+CLIENT_BOUNCE_FRICTION = 0.5
+CLIENT_BOUNCE_RESTITUTION = 0.2
+
+#: `Character` 撞后响应 vf+0xa8 = `0x502df4`：计时器不在跑那一支，`0x50efd2` 之后再
+#: `vx *= [0x6937e4]`（0.3f）、`[+0x5d5] = 1`（上锁）、`0x4face2`（操控复位）。
+CLIENT_BOUNCE_KEEP_VX = _f32(0.3)
+
+#: 反射前量朝向的 7×7 投票（`0x473b36`，§110）。
+CLIENT_VOTE_WINDOW = 3
 
 
 class Body(object):
-    """一个角色此刻的运动状态。**不可变**：每个 tick 返回一个新的。
+    """一个角色此刻的运动状态（本人那台客户端上的）。**不可变**：每一帧返回一个新的。
 
-    `on_ground` 为真时 `vx / vy` 恒为 0 —— 和心跳的口径一致（§35：
-    踩在地上时真人报的速度就是 0，是收方自己按按键把他走过去的）。
+    * `vx / vy`：`[+0x120 / +0x124]`，**不含**空中操控；踩地时恒 0（台子刚弹的那一格除外，见 `pad`）；
+    * `ctl` / `ctl_step` / `ctl_lock`：空中操控量 `[+0x4c4]`、步长 `[+0x4c0]`、锁 `[+0x5d5]`。
+      物理里水平速度用 `vx + ctl`，心跳报 `trunc(vx + ctl)`（`reported_vx`）。
+      锁缺省：踩地的身体当作「刚落过地」= 上锁（每次落地 `0x502f93` 都置 1，只有起跳 / 腾空时松开
+      左右键才解开）；腾空的身体缺省不锁（Init `0x4fb6f2` 清 0）；
+    * `rise`：起跳后还有几帧在上升计时器里（`[+0x4f4]`）；
+    * `pad`：弹跳台刚写了速度、**踩地位还没清**（`0x510e91` 不写 `[+0x128]`）—— 下一帧先按踩地分支
+      挪一次、再腾空（「走两步」）。这时 `on_ground` 记成假，但心跳那一位要报真（`reported_on_ground`）；
+    * `rest`：走路余量 `[+0x130]`（跨帧保留，撞墙清零）；
+    * `drop`：按 ↓ 穿白线的计数 `[+0x518]`；
+    * `air_jumped`：这一段腾空里第二段跳用掉了没有（`rpJump` 的段号只有 1 / 2）。
     """
 
-    __slots__ = ("x", "y", "vx", "vy", "on_ground", "air_jumped")
+    __slots__ = ("x", "y", "vx", "vy", "on_ground", "air_jumped",
+                 "ctl", "ctl_step", "ctl_lock", "rise", "pad", "rest", "drop")
 
     def __init__(self, x, y, vx=0.0, vy=0.0, on_ground=True,
-                 air_jumped=False):
+                 air_jumped=False, ctl=0.0, ctl_step=AIR_CONTROL_STEP,
+                 ctl_lock=None, rise=0, pad=False, rest=0.0, drop=0):
         self.x = float(x)
         self.y = float(y)
+        self.on_ground = bool(on_ground)
         self.vx = 0.0 if on_ground else float(vx)
         self.vy = 0.0 if on_ground else float(vy)
-        self.on_ground = bool(on_ground)
-        #: ★ 这一段腾空里**第二段跳用掉了没有**。落地自动清 —— `rpJump` 的
-        #:   段号只有 1 和 2（§23），所以一次腾空只能再跳一下。
         self.air_jumped = False if on_ground else bool(air_jumped)
+        self.ctl = 0.0 if on_ground else float(ctl)
+        self.ctl_step = float(ctl_step)
+        self.ctl_lock = self.on_ground if ctl_lock is None else bool(ctl_lock)
+        self.rise = 0 if on_ground else int(rise)
+        self.pad = False if on_ground else bool(pad)
+        self.rest = float(rest)
+        self.drop = int(drop)
 
-    def moved(self, x, y, vx=0.0, vy=0.0, on_ground=True, air_jumped=None):
-        """派生一个新状态。`air_jumped` 不给就**沿用自己的**。"""
+    def moved(self, x, y, vx=0.0, vy=0.0, on_ground=True, air_jumped=None,
+              **extra):
+        """派生一个新状态。`air_jumped` 和那几格本人状态不给就**沿用自己的**（`pad` 恒不沿用）。"""
         return Body(x, y, vx, vy, on_ground,
-                    self.air_jumped if air_jumped is None else air_jumped)
+                    self.air_jumped if air_jumped is None else air_jumped,
+                    ctl=extra.get("ctl", self.ctl),
+                    ctl_step=extra.get("ctl_step", self.ctl_step),
+                    ctl_lock=extra.get("ctl_lock", self.ctl_lock),
+                    rise=extra.get("rise", self.rise),
+                    pad=extra.get("pad", False),
+                    rest=extra.get("rest", self.rest),
+                    drop=extra.get("drop", self.drop))
+
+    @property
+    def reported_on_ground(self):
+        """心跳位域 bit2 该报什么（`[+0x128]`）：台子刚弹、还没挪的那一格报**踩地**（X_Mod §104）。"""
+        return self.on_ground or self.pad
+
+    @property
+    def reported_vx(self):
+        """心跳里的 vx 那一格之前的值：`[+0x4c4] + [+0x120]`（`0x5040dc`，发包时再截断）。"""
+        return _f32(self.vx + self.ctl)
+
+    def _key(self):
+        return (self.x, self.y, self.vx, self.vy, self.on_ground,
+                self.air_jumped, self.ctl, self.ctl_step, self.ctl_lock,
+                self.rise, self.pad, self.rest, self.drop)
 
     def __eq__(self, other):
-        return (isinstance(other, Body)
-                and (self.x, self.y, self.vx, self.vy, self.on_ground,
-                     self.air_jumped)
-                == (other.x, other.y, other.vx, other.vy, other.on_ground,
-                    other.air_jumped))
+        return isinstance(other, Body) and self._key() == other._key()
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
 
     def __repr__(self):
-        return ("<Body (%.1f, %.1f) v=(%.1f, %.1f) %s>"
-                % (self.x, self.y, self.vx, self.vy,
-                   "地上" if self.on_ground else "空中"))
+        return ("<Body (%.1f, %.1f) v=(%.1f, %.1f) %s%s>"
+                % (self.x, self.y, self.vx + self.ctl, self.vy,
+                   "地上" if self.on_ground else "空中",
+                   " 台" if self.pad else ""))
 
 
 def walk_speed(character, fast_run=False, crouched=False, scale=1.0):
-    """一个 tick 走多远（世界单位）。
-
-    `ChrSpeed × 倍率`，倍率来自那两个开关（都是原版常量，见文件头）。
-
-    ★ `scale` 是**状态效果**那一档（`Status.ini` 的 `SpeedRatio`）：
-    减速胶水踩上去是 0.3、加速道具是 2.0。原版是 `UseItemEffect` 把它加进
-    角色的属性表，走路那一句再乘上去；服务端这边只能自己乘（V0.3 §101）。
-    """
+    """一帧**大约**走多远（启发式用：寻路代价、挑站位）。真走路是 `walk_distance` + 逐列推进。"""
     speed = float(getattr(character, "speed", 7.0) or 7.0)
     if fast_run:
         speed *= FAST_RUN_RATE
@@ -148,140 +249,29 @@ def walk_speed(character, fast_run=False, crouched=False, scale=1.0):
     return speed * float(scale)
 
 
+def control_speed(character, scale=1.0):
+    """S = `vft+0x128` = 状态倍率 × ChrSpeed（**不含**冲刺 / 蹲 / 装备）：起跳 vx、空中操控的上限、走路的底数。"""
+    return _f32(float(getattr(character, "speed", 7.0) or 7.0) * float(scale))
+
+
+def walk_distance(character, direction, fast_run=False, crouched=False,
+                  scale=1.0, bonus=0):
+    """这一帧交给 `0x50d9a7` 的路程（`0x5074ef` ~ `0x507676`）。
+
+        倍率 = (装备走速 + 100) × 0.01 ；冲刺 × FastRunRate ；蹲 × ⅓
+        dist = f32(f32(S × 方向) × 倍率)
+    """
+    mult = _f32((int(bonus) + 100) * EQUIP_PERCENT)
+    if fast_run:
+        mult = _f32(mult * FAST_RUN_RATE)
+    if crouched:
+        mult = _f32(mult * CROUCH_FACTOR)
+    return _f32(_f32(control_speed(character, scale) * direction) * mult)
+
+
 def jump_apex():
-    """一次跳最高能上升多少（`v² / 2g`）。语料量到的中位是 170。"""
+    """一次跳最高能上升多少（`v² / 2g`）= 起跳高度 180（`0x501d71`）。"""
     return JUMP_SPEED * JUMP_SPEED / (2.0 * GRAVITY)
-
-
-def jump_pad_launch(terrain, body, character):
-    """踩在弹跳台上就把人弹出去（V0.3 §99）；没踩着返回 `None`。
-
-    ## 原版怎么做的（`JumpingObj::Tick`，`0x510d05`）
-
-    台子**自己**每帧扫一遍场上的角色，对每一个：
-
-        cmp byte [char+0x128], 0 ; je 跳过      ← ★ 必须**踩在地上**
-        call 0x50f410（台子 vs 角色的碰撞圆）    ← 半径 20 vs 角色那三个圆
-        tx = 台dx + (台x − 人x)                 ← 0x510e5e
-        ty = 台dy + (台y − 人y) − 0.25×角色重力  ← 0x510e68
-        (vx, vy) = 0x5111ca(tx, ty)             ← 解抛物线
-        [char+0x120] = vx ; [char+0x124] = vy
-        [台+0x2a4] = 20                          ← 只是压缩动画的计时
-
-    `0x5111ca` 就三行：
-
-        vy = −sqrt(2 × g × |ty|)     ← 升到 |ty| 那么高要多大初速
-        t  = |vy| / g                ← 到顶点要几个 tick
-        vx = tx / t                  ← 这段时间正好横移 tx
-
-    **没有冷却**：弹完角色就离地，下一帧 `[char+0x128]` 已经是 0，
-    自然不会连着弹第二下。
-
-    ## 台子那两个数是**落点偏移**，不是速度
-
-    `Iceria_b` 的两个台子分别是 `(41, −416)` 和 `(−24, −395)`。
-    实机验：真人站在 `(1742, 904)`、台子 `(1743, 895)` ⇒
-    `ty = −395 − 9 − 0.3 = −404.3` ⇒ `vy = −31.15`，
-    心跳里报出来的正是 **−31**；`vx = −23 / 25.96 = −0.89`，报的是 **0**。
-    另一个台子同样对得上（预测 −31.9 / 实测 −29，差的是采样滞后的 2 个 tick）。
-    """
-    if terrain is None or not body.on_ground:
-        return None
-    pads = getattr(terrain, "jump_pads", ())
-    if not pads:
-        return None
-    # ★ 角色那三个圆里最下面那个（腿）是唯一够得着台子的 —— 台子贴着地面。
-    #   （和 `walk_speed()` 一样对「只给了走速的假角色」留一条兜底。）
-    legs = float(getattr(character, "size_legs", 12.0) or 12.0)
-    for px, py, dx, dy in pads:
-        span = math.hypot(px - body.x, py - (body.y - legs))
-        if span > JUMP_PAD_RADIUS + legs:
-            continue
-        tx = dx + (px - body.x)
-        ty = dy + (py - body.y) - JUMP_PAD_GRAVITY_BIAS * GRAVITY
-        if ty >= 0.0:
-            continue                  # 台子往下弹？原版没有这种数据，跳过
-        vy = -math.sqrt(2.0 * GRAVITY * abs(ty))
-        ticks = abs(vy) / GRAVITY
-        vx = tx / ticks if ticks else 0.0
-        return body.moved(body.x, body.y, vx, vy, on_ground=False)
-    return None
-
-
-def double_jump(body):
-    """★★ **第二段跳**：腾空中再按一次跳（§124）。不能跳就原样返回。
-
-    * 只在**腾空**时有效（踩着地的那一下是第一段，走 `jump()`）；
-    * 一段腾空只能用一次（`rpJump` 的段号只有 1 / 2）；
-    * 把 `v.y` **重新置成** `DOUBLE_JUMP_SPEED`（语料实证是「置」不是「叠」），
-      水平速度一点不动 —— 腾空里方向键管不着水平速度（§93）。
-    """
-    if body.on_ground or body.air_jumped:
-        return body
-    return body.moved(body.x, body.y, body.vx, -DOUBLE_JUMP_SPEED,
-                      on_ground=False, air_jumped=True)
-
-
-def jump(body, vx=0.0):
-    """起跳：把垂直速度置成初速，人离地。已经在空中就原样返回。
-
-    ★★ `vx` = **起跳那一刻的水平走速**（`走速 × 方向 × 倍率`）。腾空之后
-    方向键就管不着水平速度了（§93），所以这一刻带上去多少，整段弧线就是
-    多少 —— 站着起跳的人是**竖直**上下的，语料里那 11256 发「腾空 + 按着
-    方向键但 `vx` 恒 0」就是他们。
-    """
-    if not body.on_ground:
-        return body
-    return body.moved(body.x, body.y, float(vx), -JUMP_SPEED, on_ground=False)
-
-
-def takeoff(body, character, direction=0, fast_run=False, crouched=False,
-            speed_scale=1.0):
-    """真人**按下跳那一帧**的收尾：只把速度置成起跳初速，这一帧不做空中位移（X_Mod §85）。
-
-    客户端的时序（2026-09-23 云桥 83 次起跳逐发核过，无一例外）：第 n 帧按跳 ⇒ 第 n + d
-    帧的心跳里只有 **d − 1** 次空中位移 —— 起跳那一帧照常走完这一步，最后才离地。
-    `step(want_jump=True)` 是「当格起跳当格就飞」，bot 自己跳用的是它，**没动**；
-    这一条只给服务端外推真人用（`bot._advance_humans`）。
-
-    踩地时是第一段跳，带这一刻的走速（§93）；腾空时是第二段跳（§124）。
-    """
-    if not body.on_ground:
-        return double_jump(body)
-    speed = walk_speed(character, fast_run, crouched, speed_scale)
-    if direction > 0:
-        return jump(body, speed)
-    if direction < 0:
-        return jump(body, -speed)
-    return jump(body)
-
-
-def drop_through(terrain, body):
-    """按 ↓ 穿过脚下的**单向平台**；不能下落就原样返回。
-
-    原版行为已经由实机确认（§29），但“关掉单向碰撞一帧”的内部标志尚未逆到。
-    服务端没有那个角色对象可写，所以这里做它在物理上的等价操作：把脚移到
-    当前连续值-1 带的下沿之后，再让普通重力/落地链继续算。没有向下初速；
-    下一次 `_air_tick()` 会照常加 `GRAVITY`。
-
-    ★ 只认**脚下这一格就是 1**。实心地面按 ↓ 不能穿，站在空气里也不能。
-    """
-    if terrain is None or not body.on_ground:
-        return body
-    x = int(body.x)
-    y = int(body.y)
-    if not terrain.is_one_way(x, y):
-        return body
-    # 白线通常一像素厚，但按连续带扫描，不把产物形状假定成固定厚度。
-    below = y
-    while below < terrain.height and terrain.is_one_way(x, below):
-        below += 1
-    # ★★ 穿出去的那一格必须是**空的**（V0.3 §136）。白线底下紧贴着实心
-    #    （最常见的是**冰块**罩着一根白线）的时候，原版按 ↓ 是纹丝不动的
-    #    —— 不查这一句的话人会一头钻进地形里面。
-    if terrain.is_solid(x, below):
-        return body
-    return body.moved(body.x, float(below), 0.0, 0.0, on_ground=False)
 
 
 # ---------------------------------------------------------------------------
@@ -292,18 +282,20 @@ def _solid(terrain, x, y):
     return terrain.is_solid(int(x), int(y))
 
 
-def _blocks_up(terrain, x, y):
-    """往上撞得住吗 —— **单向平台不算**（§29：往上跳能穿过去）。
+def _client_cell(terrain, x, y):
+    """角色这一路问的格子（`0x473969`：静态格、破坏物、这一刻的移动平台取 max）。
 
-    `blocks_bullet` 恰好就是「格值 ≥ 2」这个谓词，两处口径一致。
+    ★ 出界**四面都是 2**（`0x472fe0`：x < 0 / y < 0 / x ≥ 宽 / y ≥ 高 一律 `mov al, 2`，X_Mod §105）。
+      V0.3 §192 的「图顶不挡头」是把弹体的实测（V0.3 §83）挪过来的：真人脚到过 y = 38、头伸出图顶，
+      是**走路**只问脚那一列、不问头；腾空扫掠头一碰到 y < 0 就被挡（远端那份脚 y = 72.9 就顶住了）。
     """
-    return terrain.blocks_bullet(int(x), int(y))
+    return terrain.cell(x, y)
 
 
 def surface_near(terrain, x, y, reach):
-    """第 `x` 列上，脚从 `y` 出发**够得着**的站立面；没有返回 `None`。
+    """第 `x` 列上离 `y` 最近、上下各 `reach` 以内的站立面（实心第一行）；没有返回 `None`。
 
-    上下各看 `reach`，取最接近 `y` 的那个 —— 上坡下坡走的都是这一条路。
+    ★ 这是**启发式**（挑站位、火墙铺火），不是走路 —— 走路是 `_client_walk` 逐列推进。
     """
     best = None
     for sy in terrain.surfaces(int(x)):
@@ -316,439 +308,141 @@ def surface_near(terrain, x, y, reach):
     return best
 
 
-def _walk_tick(terrain, body, character, direction, fast_run, crouched,
-               scale=1.0):
-    """踩在地上走一个 tick。"""
-    if not direction:
-        return body
-    speed = walk_speed(character, fast_run, crouched, scale)
-    nx = body.x + (speed if direction > 0 else -speed)
-    reach = speed * CLIMB_SLOPE
-    sy = surface_near(terrain, nx, body.y, reach)
-    if sy is not None:
-        return body.moved(nx, sy)
-    if _solid(terrain, nx, body.y - 1):
-        # 前面是墙（够不着的高台、图外）—— 真人也是走不过去的，原地不动。
-        #
-        # ★★★ 但要先问一句：这一步**跨过去的那几列**里，有没有先来一道
-        #   崖边（V0.3 §177）。收方是一格一格推进的（`0x50d9a7` /
-        #   `0x50e4e9`，§169 里引的就是这几处），走到崖边人就掉下去了，
-        #   根本走不到后面那面墙上。只问落点的话会得出「原地不动」——
-        #   `Iceria03` 那个 1 像素夹层就是靠这一条把 bot 锁死 45.8 秒的：
-        #   脚下那块 1 像素的冰檐左边紧接着就是空的，可一整步（8 像素）
-        #   跨过去正好落在冰体里面，判据说「墙」，于是永远挪不动。
-        ledge = _ledge_within_step(terrain, body, nx, reach)
-        if ledge is None:
-            return body
-        return body.moved(ledge, body.y,
-                          (speed if direction > 0 else -speed), 0.0,
-                          on_ground=False)
-    # ★ 走出崖边：人离地、水平速度保持这一步的走速，垂直速度从 0 开始
-    #   （原版就是这样掉下去的，不是「不许走过去」）。
-    return body.moved(nx, body.y, nx - body.x, 0.0, on_ground=False)
+# ---------------------------------------------------------------------------
+# 走路（`0x50d9a7`）
+# ---------------------------------------------------------------------------
+#: 一步 `(±1, dy)` 花掉的路程 `f32(√(1 + dy²))`（`0x50db84` / `0x50dd9a`）。
+_WALK_COST = dict((dy, _f32(math.sqrt(1.0 + dy * dy)))
+                  for dy in range(-max(WALK_UP_MAX, DASH_UP_MAX),
+                                  max(WALK_DOWN_MAX, DASH_DOWN_MAX) + 1))
 
 
-def _ledge_within_step(terrain, body, nx, reach):
-    """这一步跨过的那几列里，第一处**脚下没路**的列；一路有路返回 `None`。
+def _client_walk(terrain, x, y, rest, dist, up=WALK_UP_MAX, down=WALK_DOWN_MAX):
+    """`0x50d9a7(dist)`：余量 += dist，1 px 一列推进；返回 `(x, y, 余量, 走没走出崖边)`。
 
-    ★ 只在「落点撞墙」那一支上问 —— 那一支今天的结果是**原地不动**，
-      所以这里只可能把「不动」变成「掉下去」，一步走得动的都不碰。
-      实测 8 张真图：受影响的走位占 0.4%（`Iceria03`）~0.0%，
-      而且**全部**来自今天那 0.5%~10.2% 的「撞墙 = 不动」。
-
-    先撞上墙（这一列脚下是实心、又够不着站立面）就返回 `None`：墙在崖边
-    前面时人是真的走不过去。
+    * 余量 ≤ −1 往左、≥ 1 往右；下一列**脚那一行**是空的 ⇒ 往下找 1..`down` 第一格非空 i ⇒ 这一步
+      `(±1, i−1)`，找不到 ⇒ `(±1, 0)`（走出崖边，悬空那几列照样水平走完）；
+    * 不是空的（白线也算挡）⇒ 往上找 1..`up` 第一格空 i ⇒ `(±1, −i)`；找不到 = 撞墙：**余量清零**、停；
+    * 每步花 √(1+dy²)；这一步会把余量越过 0 ⇒ 这一步不走、余量不变、停（所以陡坡走得慢，
+      20 px 的坎要攒够余量才迈得上去）。
     """
-    step = 1 if nx > body.x else -1
-    span = abs(nx - body.x)
-    col = int(body.x)
-    while abs(col + step - body.x) <= span:
-        col += step
-        if surface_near(terrain, col, body.y, reach) is not None:
-            continue                   # 这一列还站得住，接着往前
-        if _solid(terrain, col, body.y - 1):
-            return None                # 先撞上墙 —— 走不到崖边
-        return float(col)
-    return None
-
-
-def _is_ledge(terrain, x, y):
-    """`(x, y)` 这个实心点是不是某个**站立面本身**（台阶的上沿）。
-
-    ★★ 拿它把「头顶的板」和「台阶的边」分开（§95）。
-
-    腾空往上走时，脚**掠过一个站立面**说明人正翻过一个坎的边缘 ——
-    站立面按定义上面就是空气，那不是天花板。真正的天花板（板的**下沿**）
-    不是站立面：板顶那个站立面在更上面，脚够不着。
-
-    实机代价：用户 2026-08-28 那张图里 bot 站在 `(581, 651)`，左边一列的
-    地面是 **646**（高 5 个像素）。旧代码把「脚升到 646.5」当成撞天花板，
-    于是 `v.y` 当场清零、人卡在原地不动 —— 一次强度 15 的击退**位移 0**。
-    """
-    return int(y) in terrain.surfaces(int(x))
-
-
-def _ceiling_between(terrain, x0, y0, x1, y1):
-    """(x0, y0) -> (x1, y1) 这一段**往上**的路上撞没撞到天花板。
-
-    撞上了返回「撞之前最后一个安全点」`(x, y)`；一路畅通返回 `None`。
-
-    ## ★★★ 为什么不能只判落点（V0.3 §169）
-
-    一个 tick 最多往上走 **24 个单位**（二段跳初速），而天花板可以只有
-    几个像素厚。只问落点那一格的话，脚从板底下**穿过去**、落点又正好在板
-    上面的空气里 —— 判据说「没撞」，人就这么钻过去了。
-
-    收方是**逐像素**推进的：`0x50e40a` 把 `(dx, dy)` 归一化成单位向量，
-    一格一格加上去，每加一格问一次 `0x473969`（就是 `mapdata.cell()`，
-    返回 0 空 / 1 白线 / 2+ 实心），**头一格挡住就整个停下**；
-    `0x50d9a7`（走路的爬坎/下坎）和 `0x50e4e9` 也都是一格一格扫的。
-    ⇒ 这里照着扫：沿线段逐**整数行**采样，x 按线段线性插值
-    （单位向量步进的就是这条线），第一处挡得住的格子之前那一格就是终点。
-
-    ⚠ 不是把整条 `_air_tick` 换成客户端那套：横向那一段（撞墙 / 蹭上坎）
-      是 §95 用实机日志两轮收口的，这一发只补**往上**这一条。
-
-    ★ 采样点从 `int(y0) - 1` 起 —— `y0` 那一格是人**已经在**的地方
-      （起跳那一刻脚下就是实心的站立面），再问一遍必然自己挡自己。
-
-    ## ★★★ 「人已经嵌在地形里」不算撞天花板
-
-    脚下那一格实心、**而且不是站立面** = 这个人陷在地形里了（斜坡上按
-    整数坐标摆位置、复活点埋在坡里都会这样）。这时候头顶那一片实心是
-    **他自己陷进去的那一块**，不是板 —— 把它当天花板的话人**永远**跳不
-    出来（`Quest02_1` 的岩浆坑左沿就是这样：地面在 444、身体在 453，
-    一跳被 452 挡住，原地不动，下一帧接着跳，一辈子过不了那个坑）。
-    ⇒ 先跳过「一路连着的实心」，从**第一格空气**起才开始认天花板。
-    只判落点的旧代码天然就是这个行为（落点在空气里 ⇒ 放行），这里是把它
-    保住，不是新加的宽容。
-
-    ★ 站在正经站立面上的人不受这一条影响：站立面按定义**上面就是空气**，
-      第一格采样必然是空的。
-    """
-    span = y0 - y1
-    if span <= 0:
-        return None
-    top = int(y1)
-    first = int(y0) - 1
-    if first < top:
-        return None                 # 这一 tick 连一整格都没升出去
-    # ★ 绝大多数上升 tick 头顶是开阔的。粗网格（`bullet_coarse`，谓词就是
-    #   `blocks_bullet`）一次几个字节就能证明「这一小段整个是空的」——
-    #   证不了才逐格扫。不做这一步的话整张图泛洪要慢一倍（实测 1034 -> 2334 ms）。
-    clear = getattr(terrain, "coarse_clear", None)
-    if clear is not None and clear(x0, top, x1, first):
-        return None
-    # 「人已经嵌在地形里」—— 见上面那一段。
-    digging = (_blocks_up(terrain, x0, y0)
-               and not _is_ledge(terrain, x0, y0))
-    prev_x, prev_y = x0, y0
-    dx = x1 - x0
-    for row in range(first, top - 1, -1):
-        ratio = (y0 - row) / span
-        if ratio > 1.0:
-            ratio = 1.0
-        col = x0 + dx * ratio
-        if not _blocks_up(terrain, col, row):
-            digging = False             # 出土了，从这里起才认天花板
-        elif digging:
-            continue                    # 还在自己陷进去的那一块里
-        elif not _is_ledge(terrain, col, row):
-            return prev_x, prev_y
-        prev_x, prev_y = col, float(row)
-    return None
-
-
-def _body_probes(character, ux, uy):
-    """收方扫掠用的那组探测点（V0.3 §191 / §192）—— **头圆和身圆**各取
-    「圆心 + 单位方向 × 半径」，相对脚点的偏移，**整数截断**（照抄 `0x50e759`：
-    每个形状 `+0x10/+0x14` 是圆心偏移、`+0x18` 是半径，方向向量是归一化的
-    `(vx, vy)`；圆心高度照抄 `chrprops.Character.circles()`）。
-
-    腿那个圆**不在这里**：脚点那套老逻辑（撞墙 / 蹭坎 / 落地 / `_ceiling_between`）
-    管的就是它，两处都管会让落地那一格被扫掠抢先「挡住」而永远落不下去。
-    """
-    legs, body_r, head_r = _shape_sizes(character)
-    body_cy = -2.0 * legs - body_r
-    head_cy = body_cy - body_r - head_r
-    return ((int(ux * head_r), int(head_cy + uy * head_r)),
-            (int(ux * body_r), int(body_cy + uy * body_r)))
-
-
-def _shape_sizes(character):
-    """`(腿, 身, 头)` 三个半径，带缺省（同 `fits()`）。
-
-    ★ 记在角色对象上：预热一张可达图要问几十万次，三次 `getattr` 带缺省
-      在那条热路径上占了扫掠本身三成的时间。角色对象不让挂属性（`__slots__`）
-      就每次算，行为一样。
-    """
-    cached = getattr(character, "_botmove_shape", None)
-    if cached is None:
-        cached = (float(getattr(character, "size_legs", 12.0) or 12.0),
-                  float(getattr(character, "size_body", 13.0) or 13.0),
-                  float(getattr(character, "size_head", 10.0) or 10.0))
-        try:
-            character._botmove_shape = cached
-        except (AttributeError, TypeError):
-            pass
-    return cached
-
-
-def _shape_hit(terrain, character, x0, y0, x1, y1, escape=False):
-    """脚点从 `(x0, y0)` 挪到 `(x1, y1)`，头圆 / 身圆的前沿点撞没撞上实心。
-
-    返回 `None`（一路畅通）或「撞之前最后一个安全脚点」`(x, y)`。
-
-    ## 为什么要有它（V0.3 §191 / §192）
-
-    这个文件其余部分把角色当**脚下一个点**；真客户端腾空推位置是
-    `Character` vf+0x70 = `0x50d58a` → `0x50e759`：沿速度方向逐格走，每格拿
-    三个碰撞圆沿运动方向的前沿点去问 `0x473969`，头一格挡住就整个停下、把速度
-    收掉。冰洞顶、悬崖下沿、图顶这种「脚过得去、头过不去」的地方，服务端这份
-    飞过去、收方那份被顶住 —— 实机三局 4%~21% 的腾空心跳头 / 身嵌在实心里，
-    一段最长 20~28 格，那段时间收方逐帧跳变是平时的 2~4 倍，画面上就是
-    「头嵌进障碍物、一卡一卡、掉出来才好」（用户 2026-09-07）。
-
-    ## 口径
-
-    * 挡得住的是 `cell >= 2`（实心 + 左右图外；`mapdata.cell()` 出界返回 2）。
-      单向平台（1）**不挡**头 / 身：它只挡往下落的脚（老逻辑的 `ground_below`）。
-    * ★ **图顶不挡头**。收方那份远端角色到不了头顶出图（实机 `CHAR.` 行：
-      `Iceria02` 脚 y=72.9 往上一格就被顶住），可真人**自己**的角色在语料里
-      脚 y 到过 38（头顶伸出图顶 32 px）—— 本机物理和远端复现在图顶上本来就
-      不一样，bot 照真人自己那套（铁律 11）；远端那一下顶住是原版对真人一样有
-      的显示误差。`Quest02_1` 第二个岩浆坑走速二段跳就靠这段「顶上的弧线」，
-      挡了就过不去。
-    * 逐整数格推进（`n = max(|dx|, |dy|)` 步），坐标整数截断，同 `0x50e759`。
-    * `escape=True` 且**往下走**时，出发时就嵌在实心里的探测点从出土起才认
-      （同 `_ceiling_between` 的「人已经陷在地形里」）：头嵌在顶里的人要能掉
-      出来。**往上 / 横着走不豁免**：头已经在顶里还往上顶、往旁边挪，收方那份
-      是不会动的（实机 `CHAR.` 行：位置原地不动、速度收掉、等重力带出来）。
-    * 大多数腾空 tick 头顶是开阔的：先拿粗网格证明整块空，证不了才逐格。
-    """
-    dx = x1 - x0
-    dy = y1 - y0
-    steps = int(math.ceil(max(abs(dx), abs(dy))))
-    if steps <= 0:
-        return None
-    norm = math.hypot(dx, dy)
-    probes = _body_probes(character, dx / norm, dy / norm)
-    ix0, iy0 = int(x0), int(y0)
-    ix1, iy1 = int(x1), int(y1)
-    (hx, hy), (bx, by) = probes
-    clear = getattr(terrain, "coarse_clear", None)
-    if clear is not None and clear(min(ix0, ix1) + min(hx, bx),
-                                   min(iy0, iy1) + min(hy, by),
-                                   max(ix0, ix1) + max(hx, bx),
-                                   max(iy0, iy1) + max(hy, by)):
-        return None
-    # ★ 热路径（预热一张图要跑几十万个 tick）：两个探测点手工展开，不套循环 /
-    #   闭包 —— 实测比通用写法快一成；`y < 0` 是图顶，不挡（见上）。
+    f32 = _f32
     cell = terrain.cell
-    dig_h = escape and dy > 0 and iy0 + hy >= 0 and cell(ix0 + hx, iy0 + hy) >= 2
-    dig_b = escape and dy > 0 and iy0 + by >= 0 and cell(ix0 + bx, iy0 + by) >= 2
-    prev = (x0, y0)
-    for s in range(1, steps + 1):
-        px = x0 + dx * s / steps
-        py = y0 + dy * s / steps
-        ipx, ipy = int(px), int(py)
-        y = ipy + hy
-        if y < 0 or cell(ipx + hx, y) < 2:
-            dig_h = False
-        elif not dig_h:
-            return prev
-        y = ipy + by
-        if y < 0 or cell(ipx + bx, y) < 2:
-            dig_b = False
-        elif not dig_b:
-            return prev
-        prev = (px, py)
-    return None
-
-
-def _air_tick(terrain, body, character=None):
-    """腾空走一个 tick：先加重力，再走，撞上什么就停什么。
-
-    ★★★★★ 传了 `character` 才带**头圆 / 身圆**的扫掠（`_shape_hit`，V0.3 §192）；
-    不传就是老的脚点模型（只给不知道角色是谁的兜底调用）。
-
-    ★★★ **方向键在这里一点用都没有**（§93）。原来这儿按 §71 抄了一句
-    「按方向键 -> 水平速度 = 走速 × 1.5」，出处是 `0x507473` —— 可那一段
-    整个挂在 `0x493d00()` 为真的分支下面（`0x5073f5` / `0x507615` 各一道
-    门），正常对局里它是假的。真正的分支在 `0x5073a6`：**腾空 ⇒ 直接跳到
-    `0x50767e`**，读键、算走路方向、按走速挪那三件事整段跳过。
-
-    代价是实打实的：击退把 `vx` 设成 `+12` 之后，下一帧这句就按「朝着敌人」
-    把它改写成 `−11`，bot 于是**朝开枪的人飘过去**（模拟：位移 −157 而不是
-    +172）。用户 2026-08-28 报的「打 bot 它不会被击退，只是原地跳一下」
-    就是这个。
-    """
-    vx = body.vx
-    vy = body.vy + GRAVITY
-    nx = body.x + vx
-    ny = body.y + vy
-    #: 「这一 tick 是**蹭上了一个坎**」——蹭上坎会把脚抬到坎顶（比自然落点
-    #:  还高），那一段是**贴着地形爬**的，不能再拿它当往上飞的路去扫天花板。
-    climbed = False
-    if vx and _solid(terrain, nx, ny - 1):
-        # ★★★★ 目标点在地形里。先问一句：这一列上**够不够得着一个站立面**？
-        #
-        # 够得着 = 那只是个**坎**，不是墙 —— 蹭上去、接着飞。判据和走路
-        # 完全同一条（`CLIMB_SLOPE`，`_walk_tick` 用的就是它）：走路一步迈得
-        # 上去的坎，被顶飞时更不该被它挡住。
-        #
-        # ⚠ 这一条是**分两轮**才补齐的（§95），两轮的实机现象不一样：
-        #
-        # 1. 第一轮（用户 2026-08-28）：采样点原来用的是**出发时**的脚下
-        #    高度 `body.y - 1`，而人正在往上升 ⇒ 4~5 像素的坎就算「墙」；
-        #    而且撞上就把 `vx` **永久清零**，整段飞行再也没有水平速度。
-        #    改成采样**落点**高度 `ny - 1`、并且**不清零速度**（撞上只是
-        #    这一 tick 不挪，升过去下一 tick 接着走）。
-        # 2. 第二轮（用户 2026-08-29，同一张图同一个位置）：**弱击退还是
-        #    卡住**。`Forest_b` 那一带是缓上坡 `654→653→651→650→647→645`，
-        #    而强度 8 的击退抬升顶点只有 **1.8~3.3 个像素**，够不着前面那个
-        #    4 像素的坎 —— 它自己**永远**升不过去。强度 15 那一发抬升 28，
-        #    所以只有弱击退才卡。⇒ 必须像走路一样**蹭上去**。
-        # ★ 锚在**出发时**的脚下高度（和 `_walk_tick` 完全一样）：
-        #   这样「贴着崖壁往下掉」不会被上面很远的崖顶勾上去。
-        step = surface_near(terrain, nx, body.y, abs(vx) * CLIMB_SLOPE)
-        if step is not None and step < ny:
-            # ★★★★★ **掉着掉着蹭上坡 = 落地**，不是接着飞（V0.3 §181）。
-            #
-            #   「蹭上坎」这一支是 §95 给**往上飞**的人补的（弱击退顶着缓坡
-            #   往上走）。可它没分上下：一个正在**下落**的人从斜坡上方掠过时
-            #   同样命中这里，于是脚被抬到坡面上、`on_ground` 却还是 0、
-            #   `v.y` 接着按重力空转 —— 人**贴着地面滑行**，报出去的下落速度
-            #   一路涨到 40 开外。
-            #
-            #   收方对腾空角色是拿包里的速度**逐帧积分推位置**的
-            #   （`packet_api §5.6`），于是它把角色按 40/tick 往地底下拽，
-            #   一发心跳（4 帧）拽出 170 像素，下一发再拽回来 ——
-            #   **每 128 ms 一次的大幅上下抽动**，就是用户 2026-09-04 报的
-            #   「在空中还是会有卡顿和瞬移感，尤其在空中很明显」。
-            #
-            #   `Forest02` (569,597) 那条弧线实测：从 tick 28 起滑了 20 多个
-            #   tick，`v.y` 从 16 一路涨到 41，收方偏差峰值 **178 像素**。
-            #
-            #   ★ 落地判据本来只问 `ground_below(nx, 出发时的 y)` —— 它是
-            #     **往下**找的，而这里地面是**升上来迎着人**，所以永远问不到。
-            #     `surface_near()` 已经把那个面找出来了，falling 时它就是落点。
-            #   ★ 往上飞（`v.y <= 0`）那一支一个字没动，§95 照旧。
-            if vy > 0:
-                return body.moved(nx, float(step))      # 落地
-            ny = float(step)            # 蹭上坎：脚抬到坎顶，**仍然腾空**
-            climbed = True
+    costs = _WALK_COST
+    rest = f32(rest + dist)
+    off = False
+    while True:
+        if rest <= -1.0:
+            sx = -1
+        elif rest >= 1.0:
+            sx = 1
         else:
-            # 真的够不着 = 墙。这一 tick 横向过不去，**速度留着**：
-            # 踩地时 `Body` 会把速度归零（§35），落地那一下自然收尾。
-            nx = body.x
-    if vy > 0:
-        landing = terrain.ground_below(int(nx), int(body.y))
-        if landing is not None and landing <= ny:
-            return body.moved(nx, landing)          # 落地
-        if landing is None and ny >= terrain.height:
-            # 掉出图外（陷阱）—— 停在图底，别让坐标一路跑到无穷。
-            # ★ 死不死由客户端上报（`0x0409`），服务端不替它判。
-            return body.moved(nx, terrain.height - 1, vx, vy, on_ground=False)
-    elif vy < 0 and not climbed:
-        # ★ 撞天花板：**整条上升路线**都要扫，不能只问落点（§169）。
-        #   收方一格一格推进，头一格挡住就停 —— 停在挡住之前那一点，
-        #   横向也跟着停（两个轴是一起推进的，不是各走各的）。
-        hit = _ceiling_between(terrain, body.x, body.y, nx, ny)
-        if hit is not None:
-            nx, ny, vy = hit[0], hit[1], 0.0
-    # ★★★★★ 头圆 / 身圆的扫掠（V0.3 §191 / §192）—— 脚点那套算完之后，再问
-    #   「收方那份的头和身子过得去吗」。蹭上坎那一格不扫：脚是贴着地形抬上去的
-    #   （§95 两轮实机收口的），收方那份差一格就被逐格心跳拉回来了。
-    if character is not None and not climbed:
-        hit = _shape_hit(terrain, character, body.x, body.y, nx, ny)
-        if hit is not None:
-            # 和脚点撞墙那一支同一种响应（§95）：只是这一 tick 横向过不去，
-            # 竖直照走、速度留着 —— 先问一句是不是「墙在旁边」。竖直这一问带
-            # `escape`：头已经嵌在顶里的人，往下这一段要放它出来。
-            if nx != body.x and _shape_hit(terrain, character, body.x, body.y,
-                                           body.x, ny, escape=True) is None:
-                if vy > 0:
-                    # 横向钉住之后落点换了一列：这一列的地面照旧要认。
-                    landing = terrain.ground_below(int(body.x), int(body.y))
-                    if landing is not None and landing <= ny:
-                        return body.moved(body.x, landing)
-                return body.moved(body.x, ny, vx, vy, on_ground=False)
-            # 顶在头上：停在撞之前那一点，v.y 截成 0（同 `_ceiling_between`）；
-            # 收方 `CHAR.` 行实测就是「位置不动、v.y 归零」。往下走被挡只可能是
-            # 出发时就嵌着（豁免了还挡 = 两个圆都嵌着），停一格等重力把它带出来。
-            return body.moved(hit[0], hit[1], vx,
-                              0.0 if vy < 0 else vy, on_ground=False)
-    return body.moved(nx, ny, vx, vy, on_ground=False)
+            return x, y, rest, off
+        fx, fy = int(x), int(y)
+        col = fx + sx
+        if cell(col, fy) == 0:
+            i = 1
+            while i <= down and cell(col, fy + i) == 0:
+                i += 1
+            if i <= down:
+                dy = i - 1
+            else:
+                dy = 0
+                off = True
+        else:
+            i = 1
+            while i <= up and cell(col, fy - i) != 0:
+                i += 1
+            if i > up:
+                return x, y, 0.0, off              # 撞墙（`0x50db3a` / `0x50dd47`）
+            dy = -i
+        cost = costs[dy]
+        if sx < 0:
+            new = f32(rest + cost)
+            if new > 0.0:
+                return x, y, rest, off             # 越过 0：这一步不走（`0x50dbc0`）
+        else:
+            new = f32(rest - cost)
+            if new < 0.0:
+                return x, y, rest, off             # `0x50ddd0`
+        x = f32(x + sx)
+        y = f32(y + dy)
+        rest = new
+
+
+def walk_by(terrain, body, dist, up=WALK_UP_MAX, down=WALK_DOWN_MAX):
+    """让 `0x50d9a7` 走一段**不是按键走出来的**路程（挨打乙档滑 `push.x × 3`、被抓住拖着走）。
+
+    余量是同一格 `[+0x130]`，踩没踩地不在这里改（下一帧的物理自己看脚下）。
+    """
+    if terrain is None or not dist:
+        return body
+    x, y, rest, _off = _client_walk(terrain, body.x, body.y, body.rest, dist,
+                                    up, down)
+    return body.moved(x, y, body.vx, body.vy, on_ground=body.on_ground,
+                      rest=rest, pad=body.pad)
 
 
 # ---------------------------------------------------------------------------
-# ★★★ 客户端角色的腾空物理，逐指令照抄（X_Mod §87）—— 只给服务端外推**真人**用
+# 腾空（`Character` vf+0x70 = `0x50d58a` → `0x50e759`；撞上了 vf+0xa8 = `0x502df4`）
 # ---------------------------------------------------------------------------
-#
-# 上面那套（`_air_tick`：撞墙「这一格横向不动、速度留着」、撞顶「停在撞之前、v.y 截 0」、
-# 掉在坡上「蹭上去就算落地」）是 V0.3 为 **bot 自己**对着实机日志一轮轮收口的，和客户端的
-# 算法不是一回事。客户端（`Character` vf+0x70 = `0x50d58a` → `0x50e759` → vf+0xa8 = `0x502df4`）：
-# 探针 = 脚底 + 腿 / 身 / 头各自沿速度方向的前沿点，整数 DDA；撞上了**这一格位置不动**，
-# 只改速度（落地、或按 7×7 投票的法线反弹）。外推真人要的是「他自己那台客户端上他在哪」，
-# 所以这一路照抄客户端；bot 自己走路不动（寻路 / 躲避 / 预演都建在上面那套上，X_Mod D63）。
-
-#: 腾空撞上东西时，速度（模）不超过它才算落地：`Character` vft+0xa4 = `0x4febe0`（常态 35）。
-CLIENT_LAND_SPEED = 35.0
-
-#: 撞上后的反射（`0x50f240`，弹体用的也是这个函数）：切向留 1 − 0.5（vft+0x98），
-#: 法向 × −0.2（vft+0x94）。
-CLIENT_BOUNCE_FRICTION = 0.5
-CLIENT_BOUNCE_RESTITUTION = 0.2
-
-#: `Character` 自己的撞后响应 vf+0xa8 = `0x502df4`：基类那段（`0x50efd2`）之后再
-#: `vx *= [0x6937e4]`。
-CLIENT_BOUNCE_KEEP_VX = 0.3
-
-#: 反射前量朝向的 7×7 投票（`0x473b36`，§110）。
-CLIENT_VOTE_WINDOW = 3
-
-
 def _cdiv(a, b):
     """C 的整数除法（`cdq / idiv`）：**向零截断**。`b` 不为 0。"""
     q = abs(a) // abs(b)
     return q if (a >= 0) == (b > 0) else -q
 
 
-def _client_cell(terrain, x, y):
-    """角色这一路问的格子（`0x473969`，`TerrainAt.cell` 已经把这一刻的移动平台叠上）。
-
-    ★ 图顶上面当空（V0.3 §83 / §192：真人自己的角色头能伸出图顶）；`MapTerrain.cell()`
-      对 `y < 0` 返回 2，这里要先拦下。左右 / 底下出界照旧是 2。
-    """
-    return 0 if y < 0 else terrain.cell(x, y)
+#: `id(角色) -> (角色, {蹲没蹲: 形状表})`。chrprops 的角色对象有 `__slots__`、挂不上属性，
+#: 按对象身份缓存（值里留着对象本身，id 不会被复用）。
+_SHAPE_CACHE = {}
 
 
-def client_probes(character, vx, vy, crouched=False):
+def _shape_table(character, crouched):
+    """形状表 `[(圆心dx, 圆心dy, 半径, 掩码), …]`，相对脚点，按客户端的顺序（腿 → 身 → 头）。"""
+    entry = _SHAPE_CACHE.get(id(character))
+    if entry is None or entry[0] is not character:
+        entry = (character, {})
+        _SHAPE_CACHE[id(character)] = entry
+    table = entry[1].get(crouched)
+    if table is None:
+        shapes = getattr(character, "hit_shapes", None)
+        if shapes is not None:
+            table = tuple((cx, cy, r, flags)
+                          for cx, cy, r, _region, flags in shapes(0.0, 0.0, crouched))
+        else:
+            # 只给了尺寸的假角色（单测）：同一种摆法（从脚底往上依次相切），掩码同上。
+            legs, body, head = _shape_sizes(character)
+            table = ((0.0, -legs, legs, 4),
+                     (0.0, -2.0 * legs - body, body, 0),
+                     (0.0, -2.0 * (legs + body) - head, head, 2))
+        entry[1][crouched] = table
+    return table
+
+
+def _shape_sizes(character):
+    """`(腿, 身, 头)` 三个半径，带缺省（同 `fits()`）。"""
+    return (float(getattr(character, "size_legs", 12.0) or 12.0),
+            float(getattr(character, "size_body", 13.0) or 13.0),
+            float(getattr(character, "size_head", 10.0) or 10.0))
+
+
+def client_probes(character, vx, vy, crouched=False, holds=True):
     """腾空扫掠的探针表 `((dx, dy, 单向平台挡不挡), …)`，相对脚点（`0x50e759` 开头那一段）。
 
     * 探针 0 = 脚底（`vft+0x104` = `(0, 0)`）。单向平台**只挡它**：位集 `0x737ebc` 里它那一位
       写死 1，每个圆那一位取自掩码 `+0xc` 的最低位 —— 腿 4 / 身 0 / 头 2 全是 0；
-    * 之后按形状表的顺序（腿 → 身 → 头，`chrprops.Character.hit_shapes()`）各取一个前沿点
-      `ftol(圆心 + r·v̂)`。同一步里按这个顺序问。
+    * 之后按形状表的顺序（腿 → 身 → 头）各取一个前沿点 `ftol(圆心 + r·v̂)`；
+    * `holds=False`（按 ↓ 穿白线那几帧，`vft+0x100` 为假）⇒ 谁都不认白线。
 
     `(vx, vy)` 不能是零向量（调用方先拦，`0x50e798` 也是先判 |v| == 0 就不扫）。
     """
     speed = math.hypot(vx, vy)
     ux, uy = vx / speed, vy / speed
-    shapes = getattr(character, "hit_shapes", None)
-    if shapes is not None:
-        table = [(cx, cy, r, flags)
-                 for cx, cy, r, _region, flags in shapes(0.0, 0.0, crouched)]
-    else:
-        # 只给了尺寸的假角色（单测）：同一种摆法（从脚底往上依次相切），掩码同上。
-        legs, body, head = _shape_sizes(character)
-        table = [(0.0, -legs, legs, 4),
-                 (0.0, -2.0 * legs - body, body, 0),
-                 (0.0, -2.0 * (legs + body) - head, head, 2)]
-    probes = [(0, 0, True)]
-    for cx, cy, r, flags in table:
-        probes.append((int(cx + r * ux), int(cy + r * uy), bool(flags & 1)))
+    holds = bool(holds)
+    probes = [(0, 0, holds)]
+    for cx, cy, r, flags in _shape_table(character, crouched):
+        probes.append((int(cx + r * ux), int(cy + r * uy),
+                       holds and bool(flags & 1)))
     return tuple(probes)
 
 
@@ -760,38 +454,61 @@ def _client_sweep(terrain, x, y, vx, vy, probes):
 
     挡得住 = 格值 2 / 3；格值 1（单向平台）只在**往下走**时挡「挡得住它」的探针
     （起点那一问看 Δy ≥ 0，逐步那一问看 Δy > 0 —— `0x50ea8f` / `0x50ebec` 各一句）。
+
+    ★ 快速路径：整段（所有探针的起终点外接框）在粗网格上保证**连一格非空都没有**
+      （`coarse_empty`，单向平台也算）⇒ 谁都撞不上，直接返回 —— 结果和逐格扫完全一样。
     """
     x0, y0 = int(x), int(y)
     dx = int(x + vx) - x0
     dy = int(y + vy) - y0
+    ddy = dy if (dx or dy) else 1
+    empty = getattr(terrain, "coarse_empty", None)
+    if empty is not None:
+        lo_x = hi_x = probes[0][0]
+        lo_y = hi_y = probes[0][1]
+        for ox, oy, _ow in probes:
+            if ox < lo_x:
+                lo_x = ox
+            elif ox > hi_x:
+                hi_x = ox
+            if oy < lo_y:
+                lo_y = oy
+            elif oy > hi_y:
+                hi_y = oy
+        if empty(x0 + min(0, dx) + lo_x, y0 + min(0, ddy) + lo_y,
+                 x0 + max(0, dx) + hi_x, y0 + max(0, ddy) + hi_y):
+            return None
 
-    def blocked(px, py, oneway, down):
-        c = _client_cell(terrain, px, py)
-        return c >= 2 or (c == 1 and oneway and down)
-
-    if all(blocked(x0 + ox, y0 + oy, ow, dy >= 0) for ox, oy, ow in probes):
+    cell = terrain.cell
+    down = dy >= 0
+    for ox, oy, ow in probes:
+        c = cell(x0 + ox, y0 + oy)
+        if not (c >= 2 or (c == 1 and ow and down)):
+            break
+    else:
         return (x0, y0, x0 + probes[0][0], y0 + probes[0][1])
-    if dx == 0 and dy == 0:
-        dy = 1                          # `0x50eda8`：两轴都没挪满一格 ⇒ 看脚下那一格
+    dy = ddy                            # `0x50eda8`：两轴都没挪满一格 ⇒ 看脚下那一格
     down = dy > 0
     if abs(dx) > abs(dy):
         step = 1 if dx > 0 else -1
         for i in range(step, dx + step, step):
             q = dy if i == dx else _cdiv(dy * i, dx)
+            bx, by = x0 + i, y0 + q
             for ox, oy, ow in probes:
-                px, py = x0 + ox + i, y0 + oy + q
-                if blocked(px, py, ow, down):
+                c = cell(bx + ox, by + oy)
+                if c >= 2 or (c == 1 and ow and down):
                     j = i - step
-                    return (x0 + j, y0 + _cdiv(j * dy, dx), px, py)
+                    return (x0 + j, y0 + _cdiv(j * dy, dx), bx + ox, by + oy)
         return None
     step = 1 if dy > 0 else -1
     for i in range(step, dy + step, step):
         q = dx if i == dy else _cdiv(dx * i, dy)
+        bx, by = x0 + q, y0 + i
         for ox, oy, ow in probes:
-            px, py = x0 + ox + q, y0 + oy + i
-            if blocked(px, py, ow, down):
+            c = cell(bx + ox, by + oy)
+            if c >= 2 or (c == 1 and ow and down):
                 j = i - step
-                return (x0 + _cdiv(j * dx, dy), y0 + j, px, py)
+                return (x0 + _cdiv(j * dx, dy), y0 + j, bx + ox, by + oy)
     return None
 
 
@@ -799,9 +516,10 @@ def _client_vote(terrain, x, y):
     """`(x, y)` 周围 7×7 里非空格的偏移之和（`0x473b36`），**指向实心那一侧**。"""
     sx = sy = 0
     n = CLIENT_VOTE_WINDOW
+    cell = terrain.cell
     for ddy in range(-n, n + 1):
         for ddx in range(-n, n + 1):
-            if _client_cell(terrain, x + ddx, y + ddy) != 0:
+            if cell(x + ddx, y + ddy) != 0:
                 sx += ddx
                 sy += ddy
     return sx, sy
@@ -816,142 +534,365 @@ def _client_reflect(vx, vy, facing):
     return (c * u + s * w, -s * u + c * w)
 
 
-def _client_ground_below(terrain, x, y):
+def _client_ground_below(terrain, x, y, holds=True):
     """落地那一问（`0x50efd2` 的循环体）：脚 `(x, y)` 能不能踩住。
 
-    脚下 `(x, y+1)` 是 2 / 3 ⇒ 能；是 1（单向平台）而**脚这一格不是 1** ⇒ 能（人在单向平台
-    里面往下掉的时候不会被它自己接住）。
+    脚下 `(x, y+1)` 是 2 / 3 ⇒ 能；是 1（单向平台）⇒ 要白线挡人（`vft+0x100`，没在按 ↓ 穿）
+    **而且**脚这一格不是 1（人在单向平台里面往下掉的时候不会被它自己接住）。
     """
     ix, iy = int(x), int(y)
     below = _client_cell(terrain, ix, iy + 1)
     if below >= 2:
         return True
-    return below == 1 and _client_cell(terrain, ix, iy) != 1
+    return holds and below == 1 and _client_cell(terrain, ix, iy) != 1
 
 
-def client_air_tick(terrain, body, character, crouched=False):
-    """腾空一格（X_Mod §87）：客户端 `0x50d58a`，撞上了再走 `Character` 的 vf+0xa8。
+#: `_client_air` 的结局。
+FLEW, BUMPED, LANDED, STOPPED, BOUNCED = "flew", "bumped", "landed", "stopped", "bounced"
 
-    1. `vy += 1.2`（空气阻力 vft+0xa0 = 0，`v *= 1 − 0`）；
-    2. 扫掠（`_client_sweep`）；一路通畅 ⇒ 位置 += v；
-    3. 撞上了（`0x502df4` → `0x50efd2`）：**这一格位置不动**，只看速度 ——
-       * `ftol(vy) ≥ 0` 且 `|v| ≤ 35` ⇒ **落地**：从原位往下逐格问 `_client_ground_below`
-         （最多 `max(5, ftol(vy))` 格），踩得住就放到扫掠的**空点**、踩地；问满了还没踩住就停在
-         往下挪到的那一格、仍腾空。两种情况速度都清零。
-         ★ 和哪个探针撞上无关：`0x50efd2` 看的 `[hit+0x20]` 对地形恒为 −1（`0x50d404` 初始化，
-           扫掠只写 `+0x1c`）—— 头 / 身撞墙的时候只要在往下掉，也是这一支（人贴着墙往下出溜）；
-       * 否则**反弹**：挡住的那一格上 7×7 投票定朝向，按 `_client_reflect` 反射，再 `vx *= 0.3`。
+
+def _client_air(terrain, x, y, vx, vy, character, crouched=False, holds=True,
+                rising=False):
+    """腾空一步（`0x50d58a`）：`vx` 是**含操控**的那份。返回 `(x, y, vx, vy, 结局)`。
+
+    1. `vy += 1.2`（空气阻力 vft+0xa0 = 0）；扫掠；一路通畅 ⇒ 位置 += v；
+    2. 撞上了（`0x502df4`），**这一步位置不动**、只改速度：
+       * 上升计时器在跑（`rising`）⇒ `vx × 0.75`、`vy = 0`（`BUMPED`，调用方停表）；
+       * 否则 `0x50efd2`：`ftol(vy) ≥ 0` 且 |v| ≤ 35 ⇒ 从原位往下逐格问 `_client_ground_below`（最多
+         `max(5, ftol(vy))` 格），踩得住就放到扫掠的**空点**、踩地（`LANDED`）；问满了就停在往下挪到的
+         那一格、仍腾空（`STOPPED`）；两种速度都清零。和哪个探针撞上无关（`[hit+0x20]` 对地形恒 −1）。
+         否则按挡住那一格的 7×7 投票反射（`BOUNCED`）。这三种调用方还要 `vx × 0.3`、上锁、操控复位。
     """
-    vx = body.vx
-    vy = body.vy + GRAVITY
+    vy = _f32(vy + G32)
     if vx == 0.0 and vy == 0.0:
-        return body.moved(body.x, body.y, 0.0, 0.0, on_ground=False)
-    hit = _client_sweep(terrain, body.x, body.y, vx, vy,
-                        client_probes(character, vx, vy, crouched))
+        return x, y, vx, vy, FLEW
+    hit = _client_sweep(terrain, x, y, vx, vy,
+                        client_probes(character, vx, vy, crouched, holds))
     if hit is None:
-        return body.moved(body.x + vx, body.y + vy, vx, vy, on_ground=False)
+        return _f32(x + vx), _f32(y + vy), vx, vy, FLEW
+    if rising:
+        return x, y, _f32(vx * RISE_BUMP_KEEP_VX), 0.0, BUMPED
     free_x, free_y, cell_x, cell_y = hit
     if int(vy) >= 0 and math.hypot(vx, vy) <= CLIENT_LAND_SPEED:
-        y = body.y
+        yy = y
         for _ in range(max(5, int(vy))):
-            if _client_ground_below(terrain, body.x, y):
-                return body.moved(float(free_x), float(free_y))      # 踩地，速度清零
-            y += 1.0
-        return body.moved(body.x, y, 0.0, 0.0, on_ground=False)
+            if _client_ground_below(terrain, x, yy, holds):
+                return float(free_x), float(free_y), 0.0, 0.0, LANDED
+            yy += 1.0
+        return x, yy, 0.0, 0.0, STOPPED
     nvx, nvy = _client_reflect(vx, vy, _client_vote(terrain, cell_x, cell_y))
-    return body.moved(body.x, body.y, nvx * CLIENT_BOUNCE_KEEP_VX, nvy,
-                      on_ground=False)
+    return x, y, _f32(nvx), _f32(nvy), BOUNCED
 
 
-def client_launch_tick(terrain, body):
-    """起跳之后那一格（X_Mod §87）：位置 += v，**不加重力、不扫掠**，再看脚下那一格。
+def client_air_tick(terrain, body, character, crouched=False, holds=True):
+    """只跑**腾空物理**那一步（不走路、不看台子、不读键），给外推 / 单测对照用。
 
-    实测（2026-09-23 云桥 83 次起跳 + 26 发正好落在「刚起跳还没动」那一格的心跳）：
-    起跳后第 1 格位移正好是初速（−20），之后才是 −18.8、−17.6 …；对上客户端 `0x50d404`
-    踩地分支「vy < 0 ⇒ 位置 += v」那一支。脚下（`(x, y+1)`）还是非空就算没离地（速度清零）。
+    和 `step()` 里的第 ③ 步同一段：`vx + 操控` 进去、撞后响应（停表 / `× 0.3` + 上锁 + 操控复位）、
+    再减回操控。
     """
-    nx, ny = body.x + body.vx, body.y + body.vy
-    if _client_cell(terrain, int(nx), int(ny) + 1) == 0:
-        return body.moved(nx, ny, body.vx, body.vy, on_ground=False)
-    return body.moved(nx, ny)
+    running = body.rise > 0
+    rise = body.rise - 1 if running else 0
+    ctl, cstep, lock = body.ctl, body.ctl_step, body.ctl_lock
+    x, y, vxe, vy, outcome = _client_air(terrain, body.x, body.y,
+                                         _f32(body.vx + ctl), body.vy,
+                                         character, crouched, holds, running)
+    if outcome == BUMPED:
+        rise = 0
+    elif outcome != FLEW:
+        vxe = _f32(vxe * CLIENT_BOUNCE_KEEP_VX)
+        ctl, cstep, lock = 0.0, AIR_CONTROL_STEP, True
+    return body.moved(x, y, _f32(vxe - ctl), vy, on_ground=outcome == LANDED,
+                      ctl=ctl, ctl_step=cstep, ctl_lock=lock, rise=rise)
+
+
+# ---------------------------------------------------------------------------
+# 起跳 / 弹跳台 / 空中操控
+# ---------------------------------------------------------------------------
+def pad_velocity(pad, x, y, character):
+    """弹跳台写给角色的速度 `(vx, vy)`；台子往下弹（原版没有这种数据）返回 `None`（X_Mod §104）。
+
+        tx = 台dx + (台x − 人x)                                      ← 0x510e5e
+        ty = 台dy + (台y − 人y) − 0.25 × (2·ChrSizeLegs + ChrSizeBody) ← 0x510e68（`[char+0x3c4]`）
+        vy = −√(2·g·|ty|) ; t = |vy| / g ; vx = tx / t             ← 0x5111ca
+    """
+    px, py, dx, dy = pad
+    legs = float(getattr(character, "size_legs", 12.0) or 12.0)
+    trunk = float(getattr(character, "size_body", 13.0) or 13.0)
+    tx = _f32(dx + (px - x))
+    ty = _f32(_f32(dy + (py - y)) - _f32(JUMP_PAD_HEIGHT_BIAS * (2.0 * legs + trunk)))
+    if ty >= 0.0:
+        return None
+    vy = -_f32(math.sqrt(_f32(2.0 * _f32(G32 * abs(ty)))))
+    ticks = _f32(abs(vy) / G32)
+    vx = _f32(tx / ticks) if ticks else 0.0
+    return vx, vy
+
+
+def _pad_hit(terrain, x, y, character, crouched=False):
+    """脚在 `(x, y)` 时哪块弹跳台够得着、给多少速度：`(vx, vy)`；没有返回 `None`。
+
+    判据 `0x50f410(mask 0)`：台圆（偏移 0、半径 20）× 角色每个碰撞圆，距离 ≤ r1 + r2 就中。
+    """
+    pads = getattr(terrain, "jump_pads", ())
+    if not pads:
+        return None
+    circles_of = getattr(character, "circles", None)
+    if circles_of is not None:
+        circles = [(cx, cy, r) for cx, cy, r, _region
+                   in circles_of(x, y, crouched)]
+    else:
+        # 只给了尺寸的假角色（单测）：腿那一个圆就够 —— 台子贴着地面。
+        legs = float(getattr(character, "size_legs", 12.0) or 12.0)
+        circles = [(x, y - legs, legs)]
+    for pad in pads:
+        px, py = pad[0], pad[1]
+        if not any(math.hypot(px - cx, py - cy) <= JUMP_PAD_RADIUS + r
+                   for cx, cy, r in circles):
+            continue
+        got = pad_velocity(pad, x, y, character)
+        if got is not None:
+            return got
+    return None
+
+
+def jump_pad_launch(terrain, body, character, keys=0, crouched=False):
+    """踩在弹跳台上、**没按 ←/→/↓** 就被台子写上速度（V0.3 §99 / X_Mod §104）；没弹返回 `None`。
+
+    `JumpingObj::Tick`（`0x510d05`，排在角色那一格**之后**）：本机角色、不是球形态、←/→/↓ 都没按、
+    踩地 ⇒ `[char+0x120/+0x124] = pad_velocity(…)`、`0x4face2` 清空中操控、**不写 `[+0x128]`**。
+    ⇒ 返回的 `Body` 带 `pad=True`（下一帧「走两步」，见 `step()`）。
+    """
+    if terrain is None or not (body.on_ground or body.pad):
+        return None
+    if keys & PAD_BLOCK_KEYS:
+        return None
+    got = _pad_hit(terrain, body.x, body.y, character, crouched)
+    if got is None:
+        return None
+    return body.moved(body.x, body.y, got[0], got[1], on_ground=False,
+                      pad=True, ctl=0.0, ctl_step=AIR_CONTROL_STEP)
+
+
+def _launch(body, stage, vx):
+    """`0x501d57` 的后半段：vy 置成第 `stage` 段初速、当场离地、操控复位解锁、上升计时器起跑。"""
+    speed = DOUBLE_JUMP_SPEED if stage == 2 else JUMP_SPEED
+    return body.moved(body.x, body.y, float(vx), -speed, on_ground=False,
+                      air_jumped=(stage == 2), ctl=0.0,
+                      ctl_step=AIR_CONTROL_STEP, ctl_lock=False,
+                      rise=rise_ticks(speed))
+
+
+def jump(body, vx=0.0):
+    """一段跳的低层原语（`vx` 由调用方给）。已经在空中就原样返回。带按键口径的是 `takeoff`。"""
+    if not (body.on_ground or body.pad):
+        return body
+    return _launch(body, 1, vx)
+
+
+def double_jump(body, vx=None):
+    """★★ **第二段跳**的低层原语：`v.y` 重新置成 24（§124）。`vx` 不给就沿用。不能跳就原样返回。"""
+    if body.on_ground or body.pad or body.air_jumped:
+        return body
+    return _launch(body, 2, body.reported_vx if vx is None else vx)
+
+
+def takeoff(terrain, body, character, direction=0, speed_scale=1.0, stage=None):
+    """按下跳 = 客户端 `0x501d57`（本人按键和收方执行 `rpJump` 是同一个函数，X_Mod §102）。
+
+    * `stage` 不给就按状态定：踩地（或台子刚弹、踩地位还没清）⇒ 一段；腾空且二段没用过 ⇒ 二段；
+      否则原样返回。外推真人时照 `rpJump` 包里的段号给；
+    * `vx = ±¼·S`，没按左右键或侧边那一格（x±1, y）是 2/3 ⇒ 0（`0x501e81` / `0x501e9f` / `0x501ecc`）。
+    """
+    grounded = body.on_ground or body.pad
+    if stage is None:
+        if grounded:
+            stage = 1
+        elif not body.air_jumped:
+            stage = 2
+        else:
+            return body
+    vx = 0.0
+    if direction:
+        side = (_client_cell(terrain, int(body.x) + direction, int(body.y))
+                if terrain is not None else 0)
+        if side < 2:
+            vx = _f32(control_speed(character, speed_scale) * JUMP_VX_RATIO)
+            if direction < 0:
+                vx = -vx
+    return _launch(body, stage, vx)
+
+
+# ---------------------------------------------------------------------------
+# 一帧
+# ---------------------------------------------------------------------------
+class Frame(object):
+    """`frame()` 的结果：这一帧之后的身体，外加这一帧**发生了什么**（给上报 / 运动锚用的事实）。
+
+    * `aired`：跑没跑过腾空那一步；
+    * `jumped`：这一帧末起跳了第几段（0 = 没跳）—— `rpJump` 的段号；
+    * `outcome`：腾空那一步的结局（`FLEW` / `BUMPED` / `LANDED` / `STOPPED` / `BOUNCED`，没腾空是 `None`）；
+    * `padded`：弹跳台这一帧写了速度。
+    """
+
+    __slots__ = ("body", "aired", "jumped", "outcome", "padded")
+
+    def __init__(self, body, aired=False, jumped=0, outcome=None, padded=False):
+        self.body = body
+        self.aired = aired
+        self.jumped = jumped
+        self.outcome = outcome
+        self.padded = padded
+
+
+def frame(terrain, body, character, direction=0, fast_run=False,
+          crouched=False, want_jump=False, want_drop=False, speed_scale=1.0,
+          keys=None, frozen=False, walk_bonus=0, dashing=False, jump_stage=None,
+          supported=None):
+    """本人那台客户端的**一个逻辑帧**（32 ms），返回 `Frame`。
+
+    * `direction`：−1 左 / 0 / +1 右（两键都按时**左键优先**，`0x5073c2`，调用方先定好）；
+    * `want_jump`：这一帧末执行一次起跳（`rpJump` 回环排在输入之后）；`jump_stage` 是包里的段号；
+    * `want_drop`：按着 ↓（`[+0x518] = 8`，下一帧起白线不挡）；
+    * `keys`：心跳按键掩码，只给弹跳台那道门用；不给就按 `direction` / `want_drop` 拼；
+    * `frozen`：冻住（属性 0xc，`0x515639` 跳过整段读键）—— 不走、不跳、不按 ↓、空中操控原样；
+    * `walk_bonus`：装备走速（百分比）；`dashing`：冲刺攻击计时器在跑（走路上下限换成 10 / 0）；
+    * `supported(x, y, walked)`：踩地的人**脚下问出来是空的**（又没在按 ↓ 穿白线）时再问一句「他自己
+      那台上他还踩着吗」—— 只给外推真人用（服务端的鱼相位 / 地形和他那台差一点，见
+      `bot._advance_humans`）；`walked` = 这一帧走路挪没挪 x。
+    """
+    if terrain is None:
+        return Frame(body)
+    if frozen:
+        direction, want_jump, want_drop, keys = 0, False, False, 0
+    x, y, vx, vy = body.x, body.y, body.vx, body.vy
+    grounded = body.on_ground or body.pad
+    pad = body.pad
+    if want_jump and jump_stage is None:
+        # ★ 段号是**按下那一刻**定的、写进 `rpJump` 包（`0x501d57` 照包里的段号执行）：按下在上一帧末，
+        #   执行在这一帧末 ⇒ 看这一帧**开头**的状态。这一帧先走路走出了崖边也还是一段（h = 180）。
+        if grounded:
+            jump_stage = 1
+        elif not body.air_jumped:
+            jump_stage = 2
+        else:
+            want_jump = False
+    ctl, cstep, lock = body.ctl, body.ctl_step, body.ctl_lock
+    running = body.rise > 0
+    rise = body.rise - 1 if running else 0
+    rest, drop = body.rest, body.drop
+    air_jumped = body.air_jumped
+    # ① `0x4fe329`
+    if drop > 0:
+        drop -= 1
+    holds = drop <= 0
+    # ② 走路（`0x506fed`：踩地才走）
+    if grounded and (direction or rest <= -1.0 or rest >= 1.0):
+        dist = (walk_distance(character, direction, fast_run, crouched,
+                              speed_scale, walk_bonus) if direction else 0.0)
+        up, down = ((DASH_UP_MAX, DASH_DOWN_MAX) if dashing
+                    else (WALK_UP_MAX, WALK_DOWN_MAX))
+        x, y, rest, off = _client_walk(terrain, x, y, rest, dist, up, down)
+        if off:
+            vy = WALK_OFF_VY
+    # ③ 物理（`0x507685` ~ `0x50778d`）
+    vxe = _f32(vx + ctl)
+    aired = False
+    outcome = None
+    padded = False
+    if grounded:
+        if vy < 0.0:
+            # 台子写的速度：踩地分支直接挪一次（`0x50d44b`，不加重力、不扫掠）。
+            x = _f32(x + vxe)
+            y = _f32(y + vy)
+        else:
+            vxe = vy = 0.0              # `0x50d42d`
+            pad = False
+        below = terrain.cell(int(x), int(y) + 1)
+        if ((below == 0 or (below == 1 and not holds))
+                and not (supported is not None and holds and not pad
+                         and supported(x, y, x != body.x))):
+            grounded = False            # `0x50d4d0`，落进腾空分支再走一步
+            pad = False
+    if not grounded:
+        aired = True
+        x, y, vxe, vy, outcome = _client_air(terrain, x, y, vxe, vy, character,
+                                             crouched, holds, running)
+        if outcome == BUMPED:
+            rise = 0
+        elif outcome != FLEW:
+            vxe = _f32(vxe * CLIENT_BOUNCE_KEEP_VX)
+            ctl, cstep, lock = 0.0, AIR_CONTROL_STEP, True
+            grounded = outcome == LANDED
+    vx = _f32(vxe - ctl)
+    # ④ 弹跳台（排在角色之后）
+    if keys is None:
+        keys = ((PAD_BLOCK_LEFT if direction < 0 else 0)
+                | (PAD_BLOCK_RIGHT if direction > 0 else 0)
+                | (PAD_BLOCK_DOWN if want_drop else 0))
+    if grounded and not keys & PAD_BLOCK_KEYS:
+        got = _pad_hit(terrain, x, y, character, crouched)
+        if got is not None:
+            vx, vy = got
+            pad = padded = True
+            ctl, cstep = 0.0, AIR_CONTROL_STEP
+    # ⑤ 本人输入（`0x51558f`）
+    if not frozen:
+        if grounded:
+            ctl = 0.0
+        else:
+            if direction:
+                if not lock and terrain.cell(int(x) + direction,
+                                             int(y)) in (0, 1):
+                    ctl = _f32(ctl + (cstep if direction > 0 else -cstep))
+                    cstep = max(AIR_CONTROL_STEP_MIN,
+                                _f32(cstep - AIR_CONTROL_STEP_DECAY))
+            else:
+                cstep, lock = AIR_CONTROL_STEP, False
+            if ctl:
+                limit = control_speed(character, speed_scale)   # 钳到 ±S（`0x51605d`）
+                if ctl < -limit:
+                    ctl = -limit
+                elif ctl > limit:
+                    ctl = limit
+        if want_drop:
+            drop = DROP_HOLD_FRAMES
+    current = Body(x, y, vx, vy, on_ground=grounded and not pad,
+                   air_jumped=air_jumped, ctl=ctl, ctl_step=cstep,
+                   ctl_lock=lock, rise=rise, pad=grounded and pad,
+                   rest=rest, drop=drop)
+    # ⑥ `rpJump`
+    jumped = 0
+    if want_jump:
+        launched = takeoff(terrain, current, character, direction, speed_scale,
+                           stage=jump_stage)
+        if launched is not current:
+            jumped = 2 if launched.air_jumped else 1
+            current = launched
+    return Frame(current, aired, jumped, outcome, padded)
 
 
 def step(terrain, body, character, direction=0, fast_run=False,
-         crouched=False, want_jump=False, want_drop=False, speed_scale=1.0):
-    """走一个 tick，返回 `(新 Body, 这一格跑没跑过空中积分)`。
-
-    参数和 :func:`tick` 完全一样 —— `tick()` 就是它丢掉第二个返回值的简写。
-
-    ## ★★★★★ 第二个返回值是什么、给谁用的（V0.3 §185）
-
-    它回答的是**唯一**一个问题：**「某一轴位置没动」这件事，是不是地形钉住的
-    证据？**
-
-    只有 :func:`_air_tick` 会钉住某一轴（撞墙那一支 `nx = body.x`、撞顶那一支
-    把 `v.y` 截成 0）。它跑过 ⇒ `True`：位置真按空中速度推过了，推完还没动就是
-    地形挡的。它没跑 ⇒ `False`：
-
-    * **弹跳台**（`jump_pad_launch`）—— 原版 `JumpingObj::Tick` 是**本格末尾写
-      速度、下一格才按速度挪位置**，所以「刚离地、位置没变、`vy≈−31`」是完全
-      合法的一格。这时候位置没动**不能**当成撞墙；
-    * 踩在地上走（含走出崖边）—— 那一步的位移来自走速，不是空中积分；
-    * 没有地形（`terrain is None`）—— 什么都没算。
-
-    `bot._reportable_speed()` 拿它分流：`False` 时速度原样报，`True` 时才套
-    §181 那条「被钉住的那一轴报 0」。**判据由算物理的这一方说出来**，不让上层
-    按 `before.on_ground` 之类的代理去猜 —— 那个代理在「贴着墙从地面起跳」
-    这一格上是错的（`jump()` 之后 `_air_tick` 照跑，x 会被墙钉住）。
-    """
-    if terrain is None:
-        return body, False
-    if not body.on_ground and want_jump:
-        # ★ 腾空中按跳 = 第二段跳（§124）。用掉了就什么都不做。
-        body = double_jump(body)
-    elif body.on_ground and want_drop:
-        body = drop_through(terrain, body)
-    elif body.on_ground and want_jump:
-        # ★ 起跳带走**这一刻的走速**：腾空之后就再也改不了了（§93）。
-        speed = walk_speed(character, fast_run, crouched, speed_scale)
-        if direction > 0:
-            body = jump(body, speed)
-        elif direction < 0:
-            body = jump(body, -speed)
-        else:
-            body = jump(body)               # 站着起跳 —— 竖直上下
-    if body.on_ground:
-        body = _walk_tick(terrain, body, character, direction,
-                          fast_run, crouched, speed_scale)
-        # ★★★ 弹跳台（§99）：台子每帧扫一遍**踩在地上**的角色，够得着就把人
-        #   弹出去。排在走路**之后** —— 实机那一发心跳里人是「又走了一步、
-        #   同时被弹起来」的（`(1742,904) -> (1721,905) v=(0,−31)`）。
-        launched = jump_pad_launch(terrain, body, character)
-        if launched is None:
-            return body, False
-        return launched, False
-    return _air_tick(terrain, body, character), True
+         crouched=False, want_jump=False, want_drop=False, speed_scale=1.0,
+         **extra):
+    """`frame()` 的简写：返回 `(新 Body, 这一帧跑没跑过腾空那一步)`。"""
+    got = frame(terrain, body, character, direction=direction,
+                fast_run=fast_run, crouched=crouched, want_jump=want_jump,
+                want_drop=want_drop, speed_scale=speed_scale, **extra)
+    return got.body, got.aired
 
 
 def tick(terrain, body, character, direction=0, fast_run=False,
-         crouched=False, want_jump=False, want_drop=False, speed_scale=1.0):
-    """走一个 tick（32 ms），返回**新的** `Body`。
-
-    `direction`：−1 左 / 0 不按 / +1 右，就是心跳里那个方向键掩码（§39）。
-    ★ 它**只在踩着地的时候有意义**（§93）—— 腾空那一段收方根本不读键。
-    `want_jump`：这一 tick 要不要起跳（只在踩着地时有效）。
-    `want_drop`：这一 tick 要不要按 ↓ 穿过脚下单向平台；和跳同时给时下落优先。
-
-    ★ 这是 :func:`step` 只取新 `Body` 的简写。要**报心跳**的地方用 `step()`
-      —— 它多告诉你「位置这一格积分了没有」（§185）；寻路 / 预演那些只关心
-      落点的地方用这个就行。
-    """
-    return step(terrain, body, character, direction=direction,
-                fast_run=fast_run, crouched=crouched, want_jump=want_jump,
-                want_drop=want_drop, speed_scale=speed_scale)[0]
+         crouched=False, want_jump=False, want_drop=False, speed_scale=1.0,
+         **extra):
+    """走一帧（32 ms），返回**新的** `Body`。"""
+    return frame(terrain, body, character, direction=direction,
+                 fast_run=fast_run, crouched=crouched, want_jump=want_jump,
+                 want_drop=want_drop, speed_scale=speed_scale, **extra).body
 
 
 def advance(terrain, body, character, ticks, direction=0, fast_run=False,
             crouched=False, want_jump=False, want_drop=False, speed_scale=1.0):
-    """连走 `ticks` 个 tick。起跳/下落只在第一个 tick 上生效。"""
+    """连走 `ticks` 帧。起跳 / 按 ↓ 只在第一帧上按，方向键一直按着。"""
     for i in range(max(0, int(ticks))):
         body = tick(terrain, body, character, direction=direction,
                     fast_run=fast_run, crouched=crouched,
@@ -967,21 +908,9 @@ def ticks_for(seconds):
 
 
 def fall_ticks(terrain):
-    """从图顶自由落到图底要几个 tick —— 「掉不到底」的**几何上界**。
+    """从图顶自由落到图底要几个 tick —— 「掉不到底」的**几何上界**（`h = ½ g t²`，再多给两个）。
 
-    `h = ½ g t²  ⇒  t = √(2h/g)`，再多给两个 tick 兜底。
-
-    ★★ 会话 41 补的。以前这几个「会不会掉下去」的判据统一用
-    `TICKS_PER_BEAT * 8 = 32` 个 tick —— 那只够落 **614** 个单位。
-    `Megatron01` 高 2048、`Megatron00` 高 2048，从上层往下掉一趟远不止 614
-    ⇒ `drop_below()` 返回 `None`，`bot._walk_to()` 把它当成**无底洞**，
-    于是「站在高处的 bot 死活不肯往下走」——用户 2026-08-30 报的
-    「只能看到一个 bot，另外两个像是在图外」和闯关那条「总有 bot 待在最左边
-    不往前走」都有它的份。
-
-    ★ 这是**地图有多高**这个几何事实，不是「等多久算超时」那类阈值
-    （和 `BOT_SHELL_MAX_TRAVEL` 取图的对角线是同一个道理）。
-    没有地形时退回老值，行为一个字节不变。
+    ★ 这是**地图有多高**这个几何事实，不是「等多久算超时」那类阈值。没有地形时退回老值。
     """
     height = getattr(terrain, "height", None)
     if not height:
@@ -989,8 +918,20 @@ def fall_ticks(terrain):
     return int(math.sqrt(2.0 * float(height) / GRAVITY)) + 2
 
 
+def out_of_world(terrain, body):
+    """人**落在图底那一圈出界实心上**了：`CheckFallDown` 的几何那一半（`0x50d520`：脚 y + 5 ≥ 图高）。
+
+    客户端出界四面都是 2（`0x472fe0`），掉进坑的人会被图底接住、踩在最后一行上 —— 有 `FallDown`
+    的图这一下就判死（`bot._fell_out_of_the_world`），没有的图也是个回不来的地方。规划 / 前瞻里
+    「落在这儿」一律算**没落住**（旧模型干脆让图底接不住人，口径一样）。
+    """
+    height = getattr(terrain, "height", None)
+    return (height is not None
+            and body.y + mapdata.FALL_DOWN_MARGIN >= float(height))
+
+
 def settle(terrain, body, character, ticks=None):
-    """让人落到地上（新出生 / 刚接管位置时用）。落不到就原样返回。"""
+    """让人落到地上（新出生 / 刚接管位置时用）。落不到就原样返回最后那一格。"""
     if ticks is None:
         ticks = fall_ticks(terrain)
     for _ in range(max(0, int(ticks))):
@@ -1002,12 +943,26 @@ def settle(terrain, body, character, ticks=None):
 
 def blocked(terrain, body, character, direction, fast_run=False,
             crouched=False, speed_scale=1.0):
-    """朝 `direction` 走一步会不会**撞在墙上**（原地不动）。"""
-    if not direction or not body.on_ground:
+    """朝 `direction` 按住走会不会**撞在墙上**（一步都挪不动）。
+
+    客户端走路的余量跨帧攒（`_client_walk`）：高坎前头几帧原地不动、攒够了才一步迈上去，所以不能只看
+    一帧 —— 一直按着走，直到挪动了（不是墙）或者余量被清零（`0x50db3a`：真撞墙）。每帧都攒进
+    正的路程，最高的坎 √(1+20²) 攒得满，这个循环一定会停。
+    """
+    if not direction or not body.on_ground or terrain is None:
         return False
-    return tick(terrain, body, character, direction=direction,
-                fast_run=fast_run, crouched=crouched,
-                speed_scale=speed_scale).x == body.x
+    if not walk_distance(character, direction, fast_run, crouched, speed_scale):
+        return False
+    current = body
+    while True:
+        nxt = tick(terrain, current, character, direction=direction,
+                   fast_run=fast_run, crouched=crouched,
+                   speed_scale=speed_scale)
+        if nxt.x != body.x or not nxt.on_ground:
+            return False
+        if nxt.rest == 0.0:
+            return True
+        current = nxt
 
 
 def leaves_ground(terrain, body, character, direction, fast_run=False,
@@ -1022,14 +977,9 @@ def leaves_ground(terrain, body, character, direction, fast_run=False,
 
 def jump_lands(terrain, body, character, direction, fast_run=False,
                crouched=False, ticks=None, speed_scale=1.0):
-    """原地起跳、空中一路按着 `direction`，**落在哪**；落不到返回 `None`。
+    """原地起跳、空中一路按着 `direction`（空中操控），**落在哪**；落不到返回 `None`。
 
-    这就是「跳跃弧线」：要不要跳过这个坑、够不够得着那个台子，
-    问它就行 —— 弧线是真跑出来的，不是拿公式估的。
-
-    ★ `speed_scale` 要和真起跳那一刻的一致（V0.3 §151）：起跳带走的是**这一刻
-      的走速**（§93），被冻住（0.0）/ 踩了减速胶水（0.3）时不传的话，
-      预测出来的是一条满速弧线，而真跑出来的是原地竖直跳。
+    ★ `speed_scale` 要和真起跳那一刻的一致（V0.3 §151）：起跳的 ¼S 和操控上限都乘它。
     """
     if ticks is None:
         # 起跳先上去、再落到图底：升段 `v/g` 个 tick，落段见 `fall_ticks()`。
@@ -1039,41 +989,32 @@ def jump_lands(terrain, body, character, direction, fast_run=False,
                 speed_scale=speed_scale)
     for _ in range(max(0, int(ticks))):
         if body.on_ground:
-            return body
+            return None if out_of_world(terrain, body) else body
         body = tick(terrain, body, character, direction=direction,
                     fast_run=fast_run, crouched=crouched,
                     speed_scale=speed_scale)
-    return body if body.on_ground else None
+    return body if body.on_ground and not out_of_world(terrain, body) else None
 
 
 def at_apex(body):
     """这一 tick 是不是**这段腾空的顶点** —— 第二段跳该按下去的那一刻。
 
-    ★ 判据是「已经不再上升了」这个**物理事实**（`v.y >= 0`，y 向下为正），
-    不是「起跳后第 N 个 tick」这种阈值（铁律 10）。
-
-    ★★ 规划（`botnav._double_jump_edge`）、执行（`bot._route_intent`）和
-    兜底（`bot._walk_to` 跨坑那一条）**必须用同一句** —— 三边不一致的话
-    规划出来的落点和真跑出来的对不上。所以它住在这里，另外两处都来问它。
+    ★ 判据是「已经不再上升了」这个**物理事实**（`v.y >= 0`，y 向下为正），不是「起跳后第 N 个
+    tick」这种阈值（铁律 10）。规划（`botnav`）、执行（`bot._route_intent`）和兜底（`bot._walk_to`）
+    **必须用同一句**，所以它住在这里。
     """
-    return (body is not None and not body.on_ground
+    return (body is not None and not body.on_ground and not body.pad
             and not body.air_jumped and body.vy >= 0.0)
 
 
 def double_jump_lands(terrain, body, character, direction, fast_run=False,
                       crouched=False, ticks=None, speed_scale=1.0):
-    """★★ 起跳 + **在顶点再按一次**，落在哪；落不到返回 `None`（§124）。
+    """★★ 起跳 + **在顶点再按一次**、一路按着 `direction`，落在哪；落不到返回 `None`（§124）。
 
-    和 `jump_lands()` 是一对：那个问「一段跳够不够」，这个问「两段够不够」。
-    坑宽到一段跳过不去、两段跳过得去时，缺了它 bot 只会一遍遍地一段跳
-    掉进坑里 —— 用户 2026-08-30：「经过岩浆时，bot 似乎不会用二段跳来跳到
-    对面平台，只会用一段跳，然后反复掉进岩浆。」
-
-    ★ 没跳成第二段（比如起跳那一下就落回地面）一律返回 `None`：调用方拿它
-      当「二段跳能不能过去」的答案，跳不成就不算数。
+    ★ 第二段也按键重算 vx（¼S），所以方向键要一直按着 —— 松开的话第二段是竖直跳。
+    ★ 没跳成第二段（比如起跳那一下就落回地面）一律返回 `None`。
     """
     if ticks is None:
-        # 两段的升段各 `v/g` 个 tick，再加从图顶落到图底那一趟。
         ticks = (fall_ticks(terrain)
                  + int((JUMP_SPEED + DOUBLE_JUMP_SPEED) / GRAVITY) + 2)
     current = tick(terrain, body, character, direction=direction,
@@ -1088,51 +1029,36 @@ def double_jump_lands(terrain, body, character, direction, fast_run=False,
         want = not jumped and at_apex(current)
         if want:
             jumped = True
-        current = tick(terrain, current, character, want_jump=want)
-    if not current.on_ground or not jumped:
+        current = tick(terrain, current, character, direction=direction,
+                       crouched=crouched, want_jump=want,
+                       speed_scale=speed_scale)
+    if not current.on_ground or not jumped or out_of_world(terrain, current):
         return None
     return current
 
 
 def drop_below(terrain, body, character, direction, fast_run=False,
                crouched=False, ticks=None, speed_scale=1.0):
-    """走出崖边之后会掉多深（掉不到底返回 `None`）。
+    """走出崖边之后会掉多深（掉不到底返回 `None`；没踩空返回 0）。
 
-    给决策层用：真人不会主动跳进无底洞，但**从一米高的台阶走下去**
-    再正常不过 —— 判据是「掉多深」，不是「许不许离地」。
-
-    ⚠ 它只看**下一步**。「这份意图握着的这几格里会不会踩进无底洞」要问
-    `bottomless_ahead()`，别拿这个凑（V0.3 §151）。
+    ⚠ 它只看**下一步**。「这份意图握着的这几格里会不会踩进无底洞」要问 `bottomless_ahead()`。
     """
-    step = tick(terrain, body, character, direction=direction,
-                fast_run=fast_run, crouched=crouched, speed_scale=speed_scale)
-    if step.on_ground:
+    nxt = tick(terrain, body, character, direction=direction,
+               fast_run=fast_run, crouched=crouched, speed_scale=speed_scale)
+    if nxt.on_ground:
         return 0.0
-    landed = settle(terrain, step, character, ticks)
-    if not landed.on_ground:
+    landed = settle(terrain, nxt, character, ticks)
+    if not landed.on_ground or out_of_world(terrain, landed):
         return None
     return landed.y - body.y
 
 
 def bottomless_ahead(terrain, body, character, direction, fast_run=False,
                      crouched=False, speed_scale=1.0, ticks=1):
-    """接下来这 `ticks` 格照这个方向走，**会不会踩进掉不到底的坑**。
+    """接下来这 `ticks` 格照这个方向走，**会不会踩进掉不到底的坑**（V0.3 §151）。
 
-    ## ★★★ 为什么要看不止一格（V0.3 §151）
-
-    `drop_below()` 只推**一格**，而崖边那个「下一步就踩空」的窗口在真图上
-    只有**一个走步宽**（`Quest02_1#Normal` 实测 8~11 像素）。意图不是每格
-    重算的 —— 它由 `bot._decide()` 产出、要**握着用 `BOT_DECISION_TICKS`
-    格**。于是约一半的接近位置整个跳过这个窗口：bot 一步走出崖边，等下一次
-    决策时人已经腾空往坑里掉了，一次跳都没按。实测掉坑率 **50%**；把前瞻
-    改成「这份意图要用几格」之后是 **0.1%**。
-
-    ★ 这**不是**「跳过头 N 格」那类阈值（铁律 10）：`ticks` 就是这份意图的
-      寿命，调用方拿自己的决策周期传进来。判据仍然是「照这么走会不会掉进
-      无底洞」这个物理事实，只是把它放在**整段区间**上问，而不是只问第一格。
-
-    ★ 决策频率一个字没改 —— §146 里用户明确否掉过「即将踩空就地重问」。
-      改的是**看多远**，不是**多久看一次**。
+    `ticks` 就是这份意图的寿命（调用方拿自己的决策周期传进来），判据仍是「照这么走会不会掉进
+    无底洞」这个物理事实，只是放在整段区间上问。
     """
     if not direction:
         return False
@@ -1140,39 +1066,23 @@ def bottomless_ahead(terrain, body, character, direction, fast_run=False,
     for _ in range(max(1, int(ticks))):
         if not current.on_ground:
             break
-        step = tick(terrain, current, character, direction=direction,
-                    fast_run=fast_run, crouched=crouched,
-                    speed_scale=speed_scale)
-        if not step.on_ground:
-            return not settle(terrain, step, character).on_ground
-        if step.x == current.x:
+        nxt = tick(terrain, current, character, direction=direction,
+                   fast_run=fast_run, crouched=crouched,
+                   speed_scale=speed_scale)
+        if not nxt.on_ground:
+            landed = settle(terrain, nxt, character)
+            return not landed.on_ground or out_of_world(terrain, landed)
+        if nxt.x == current.x and nxt.rest == 0.0:
             return False               # 撞墙了，再往后推也是原地
-        current = step
+        current = nxt
     return False
 
 
 def fits(terrain, x, y, character, crouched=False):
     """脚站在 `(x, y)` 时，**角色的碰撞体塞得进去吗**（V0.3 §152）。
 
-    ## ★★★ 为什么需要它
-
-    这个文件其余部分把角色当**一个点**（`_solid()` 只问一个像素），于是
-    一条 1 像素宽的裂缝在模型里是完全合法的通路，`botnav` 用同一套物理建边
-    ⇒ 裂缝里的点成了合法 A\\* 节点，A\\* 会**主动**把 bot 送进去。
-    而真客户端用的是 `ChrProps.ini` 的三个碰撞圆（最宽 26 像素），人卡在
-    缝口出不来 —— 用户 2026-09-01 报的 `Iceria03` (1174, 864) 就是它，
-    两个 bot 先后卡在同一个像素上，一个 59 秒一个 13 秒。
-
-    ★ 判据是「碰撞体塞不进去」这个**几何事实**，不是人工维护的坑位黑名单
-      （铁律 10 / 铁律 11）。实测 6 张图：净空 < 24 的落脚点只占 0.3%~6%，
-      而且几乎全部 < 12 —— 要么开阔要么发丝缝，中间没有灰区。
-
-    圆心高度照抄 `chrprops.Character.circles()`（腿 / 身自下而上）。
-
-    ⚠ **只查腿圆和身圆，不查头圆**：卡死人的缝全是「窄」不是「矮」，而
-    低矮的通道（`CamelCulvert` 那种下水道）在原版里是走得过去的。原版的
-    地形碰撞本身是什么形状我们没逆出来，所以只用「水平放不下最宽的那一圈」
-    这条**看得见的事实**，不往上加推测。
+    可达图里一条 1 像素宽的裂缝不能当落脚点：客户端用的是三个碰撞圆（最宽 26 像素），人卡在缝口
+    出不来。只查腿圆和身圆的**水平净空**（卡死人的缝全是「窄」不是「矮」）。
     """
     if terrain is None:
         return True
@@ -1186,14 +1096,7 @@ def fits(terrain, x, y, character, crouched=False):
 
 
 def _clearance_ok(terrain, x, y, radius):
-    """`(x, y)` 这一行上，左右加起来有没有 `2 × radius` 的净空。
-
-    只量**水平**方向：竖直方向由站立面本身保证（`surfaces()` 给的就是
-    站得住的地方）。
-    ★ 一侧的富余可以补另一侧的不足 —— **贴着墙站是合法的**，只要整条空隙
-      放得下这一圈。所以两边各最多看 `2 × radius`，够了就提前收工。
-    ★ 圆心那一格是实心时直接判塞不进去（人已经嵌在地形里了）。
-    """
+    """`(x, y)` 这一行上，左右加起来有没有 `2 × radius` 的净空（一侧的富余可以补另一侧）。"""
     iy = int(y)
     if iy < 0:
         return True                    # 伸到图外：图外不是墙，照原版

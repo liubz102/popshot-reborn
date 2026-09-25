@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""`botnav.py` 的纯物理可达图 / A* 测试。"""
+"""`botnav.py` 的纯物理可达图 / A* 测试。
+
+★ 客户端的脚在实心第一行的上面一行；图顶是实心、头在脚上 70（X_Mod §105）——
+  合成图的地面都放得够深，跳起来才不会先顶到图顶。
+"""
 import os
 import sys
 import unittest
@@ -36,22 +40,22 @@ class NeighborTests(unittest.TestCase):
 
     def test_drop_is_an_explicit_edge_only_on_one_way_ground(self):
         rows = []
-        for y in range(160):
-            if y == 60:
+        for y in range(360):
+            if y == 260:
                 rows.append("1" * 240)
-            elif y >= 130:
+            elif y >= 330:
                 rows.append("2" * 240)
             else:
                 rows.append("0" * 240)
         terrain = terrain_from(rows)
-        edges = botnav.neighbors(terrain, botmove.Body(100.0, 60.0), self.who)
+        edges = botnav.neighbors(terrain, botmove.Body(100.0, 259.0), self.who)
         drops = [(body, step) for body, step in edges
                  if step.action == botnav.ACTION_DROP]
         self.assertEqual(1, len(drops))
-        self.assertAlmostEqual(130.0, drops[0][0].y)
+        self.assertAlmostEqual(329.0, drops[0][0].y)
 
         solid_edges = botnav.neighbors(
-            terrain, botmove.Body(100.0, 130.0), self.who)
+            terrain, botmove.Body(100.0, 329.0), self.who)
         self.assertFalse(any(step.action == botnav.ACTION_DROP
                              for _body, step in solid_edges))
 
@@ -87,41 +91,41 @@ class AStarTests(unittest.TestCase):
         self.assertLessEqual(abs(path[-1].y - 80.0), botnav.GOAL_Y)
 
     def test_it_jumps_across_a_bottomless_gap(self):
-        heights = [180] * 150 + [None] * 80 + [180] * 250
-        terrain = terrain_from(solid_heights(heights, 220))
-        path = botnav.plan(terrain, botmove.Body(100.0, 180.0), self.who,
-                           (320.0, 180.0))
+        heights = [380] * 150 + [None] * 80 + [380] * 250
+        terrain = terrain_from(solid_heights(heights, 420))
+        path = botnav.plan(terrain, botmove.Body(100.0, 379.0), self.who,
+                           (320.0, 379.0))
         self.assertTrue(path)
         self.assertTrue(any(step.action == botnav.ACTION_JUMP for step in path))
         self.assertGreater(path[-1].x, 230.0)
 
     def test_it_uses_drop_to_reach_the_floor_below_a_wire(self):
         rows = []
-        for y in range(170):
-            if y == 60:
+        for y in range(370):
+            if y == 260:
                 rows.append("1" * 260)
-            elif y >= 140:
+            elif y >= 340:
                 rows.append("2" * 260)
             else:
                 rows.append("0" * 260)
         terrain = terrain_from(rows)
-        path = botnav.plan(terrain, botmove.Body(120.0, 60.0), self.who,
-                           (120.0, 140.0))
+        path = botnav.plan(terrain, botmove.Body(120.0, 259.0), self.who,
+                           (120.0, 339.0))
         self.assertTrue(path)
         self.assertEqual(botnav.ACTION_DROP, path[0].action)
-        self.assertAlmostEqual(140.0, path[-1].y)
+        self.assertAlmostEqual(339.0, path[-1].y)
 
     def test_a_double_jump_climbs_what_one_jump_cannot(self):
-        # 240 高的整面墙**超过**一段跳的顶点（20²/2.4 = 167），
+        # 240 高的整面墙**超过**一段跳的顶点（≈170），
         # 但两段跳（顶点再置一次 v.y = 24）够得着 —— 原版真人就是这么上去的。
-        heights = [260] * 150 + [20] * 250
-        terrain = terrain_from(solid_heights(heights, 280))
-        path = botnav.plan(terrain, botmove.Body(100.0, 260.0), self.who,
-                           (260.0, 20.0))
+        heights = [460] * 150 + [220] * 250
+        terrain = terrain_from(solid_heights(heights, 480))
+        path = botnav.plan(terrain, botmove.Body(100.0, 459.0), self.who,
+                           (260.0, 219.0))
         self.assertTrue(path, "两段跳够得着 240 的高台")
         self.assertTrue(any(step.action == botnav.ACTION_DOUBLE_JUMP
                             for step in path))
-        self.assertLessEqual(abs(path[-1].y - 20.0), botnav.GOAL_Y)
+        self.assertLessEqual(abs(path[-1].y - 219.0), botnav.GOAL_Y)
 
     def test_an_unreachable_goal_still_walks_as_close_as_it_can(self):
         """★ 够不着的目标不再空手而归 —— 走到能走到的最近处（会话 41）。
@@ -207,42 +211,46 @@ class JumpPadRouteTests(unittest.TestCase):
     def setUp(self):
         self.who = Dummy(7.0)
 
-    def terrain(self, pad_dy=-590.0, pad_dx=250.0, ledge_top=100):
-        """低处一片地（y=650）+ 高处一片台面（x≥500, y=ledge_top）+ 一个台子。
+    def terrain(self, pad_dy=-590.0, pad_dx=250.0, ledge_top=300):
+        """低处一片地（y=850）+ 高处一片台面（x≥500, y=ledge_top）+ 一个台子。
 
-        台面比地面高 550 —— **一段跳 167、两段跳 407 都够不着**，
+        台面比地面高 550 —— **一段跳 ≈170、两段跳 ≈400 都够不着**，
         只有走上弹跳台才上得去。
         """
         rows = []
-        for y in range(700):
+        for y in range(900):
             rows.append("".join(
-                "2" if (y >= 650 or (500 <= x < 880 and y >= ledge_top))
+                "2" if (y >= 850 or (500 <= x < 880 and y >= ledge_top))
                 else "0" for x in range(900)))
-        return terrain_from(rows, jump=[(200.0, 650.0, pad_dx, pad_dy)])
+        return terrain_from(rows, jump=[(200.0, 850.0, pad_dx, pad_dy)])
 
     def test_the_pad_is_the_only_way_up_and_a_star_takes_it(self):
         terrain = self.terrain()
-        start = botmove.settle(terrain, botmove.Body(120.0, 650.0), self.who)
+        start = botmove.settle(terrain, botmove.Body(120.0, 800.0,
+                                                     on_ground=False),
+                               self.who)
         # 先确认「不用台子」真的上不去。
-        without = botnav.plan(terrain, start, self.who, (700.0, 100.0))
+        without = botnav.plan(terrain, start, self.who, (700.0, 299.0))
         self.assertTrue(without, "best-effort 至少该给一条路")
-        path = botnav.plan(terrain, start, self.who, (700.0, 100.0))
+        path = botnav.plan(terrain, start, self.who, (700.0, 299.0))
         self.assertTrue(path)
-        self.assertAlmostEqual(100.0, path[-1].y, delta=botnav.GOAL_Y,
+        self.assertAlmostEqual(299.0, path[-1].y, delta=botnav.GOAL_Y,
                                msg="该真的站上高台，实际落在 y=%.0f"
                                    % path[-1].y)
 
     def test_without_the_pad_the_ledge_is_unreachable(self):
         """★ 对照组：把台子拿掉，同一张图就上不去了 —— 证明上面那条走的是台子。"""
         rows = []
-        for y in range(700):
+        for y in range(900):
             rows.append("".join(
-                "2" if (y >= 650 or (500 <= x < 880 and y >= 100))
+                "2" if (y >= 850 or (500 <= x < 880 and y >= 300))
                 else "0" for x in range(900)))
         terrain = terrain_from(rows)          # 没有 jump pads
-        start = botmove.settle(terrain, botmove.Body(120.0, 650.0), self.who)
-        path = botnav.plan(terrain, start, self.who, (700.0, 100.0))
-        self.assertTrue(all(step.y > 200.0 for step in path),
+        start = botmove.settle(terrain, botmove.Body(120.0, 800.0,
+                                                     on_ground=False),
+                               self.who)
+        path = botnav.plan(terrain, start, self.who, (700.0, 299.0))
+        self.assertTrue(all(step.y > 400.0 for step in path),
                         "没有台子就不该出现落在高台上的边")
 
     def test_a_pad_edge_can_carry_a_second_jump(self):
@@ -276,17 +284,15 @@ class JumpPadRouteTests(unittest.TestCase):
                                msg="补一段跳该翻上白线，实际落在 y=%.0f" % boosted)
 
     def test_the_first_tick_of_a_pad_edge_never_presses_jump(self):
-        """★ 按了跳人就先离地，台子那一句根本轮不到 —— 台子白站。"""
+        """★ 按了跳 = 普通起跳（帧末执行、覆盖台子写的速度）—— 台子白站。"""
         terrain = self.terrain()
-        onpad = botmove.settle(terrain, botmove.Body(200.0, 650.0), self.who)
+        onpad = botmove.Body(200.0, 849.0)     # 站在台子上（落下来那一帧台子就弹了，所以直接摆）
         launched = botmove.tick(terrain, onpad, self.who)
-        self.assertFalse(launched.on_ground, "什么都不按才会被台子弹出去")
+        self.assertTrue(launched.pad, "什么都不按才会被台子弹出去")
         self.assertLess(launched.vy, -botmove.JUMP_SPEED,
                         "台子的初速要比普通起跳快得多")
-        # 按了跳 = 普通起跳（重力已经加过一次），与台子无关。
         jumped = botmove.tick(terrain, onpad, self.who, want_jump=True)
-        self.assertAlmostEqual(-botmove.JUMP_SPEED + botmove.GRAVITY,
-                               jumped.vy, places=3)
+        self.assertEqual(-botmove.JUMP_SPEED, jumped.vy)
 
 
 class PlannerTests(unittest.TestCase):
@@ -395,7 +401,7 @@ class NarrowSlotEdgeTests(unittest.TestCase):
 
     def slot_map(self, gap):
         """左边一片开阔地，右边一条 `gap` 像素宽的深缝（缝底有地面）。"""
-        width, height, floor, lip = 400, 200, 150, 60
+        width, height, floor, lip = 400, 400, 350, 260
         rows = []
         for y in range(height):
             if y >= floor:
@@ -410,7 +416,7 @@ class NarrowSlotEdgeTests(unittest.TestCase):
         return terrain_from(rows)
 
     def landing_xs(self, terrain, start_x=100.0):
-        body = botmove.Body(start_x, 150.0, on_ground=True)
+        body = botmove.Body(start_x, 349.0, on_ground=True)
         return [int(nb.x) for nb, _step in
                 botnav.neighbors(terrain, body, self.who)]
 

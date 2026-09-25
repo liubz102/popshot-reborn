@@ -126,7 +126,7 @@ class SweepSemanticsTests(unittest.TestCase):
 
 
 class BreakableBulletShapeTests(unittest.TestCase):
-    """破坏物给弹体的那一份形状（`Breakable.bullet_rows`，X_Mod §80）。"""
+    """破坏物的客户端形状（`Breakable.bullet_rows`，X_Mod §80）—— §105 起角色和弹体共用这一份。"""
 
     @staticmethod
     def _square(fx, fy, w=6, h=4):
@@ -146,16 +146,16 @@ class BreakableBulletShapeTests(unittest.TestCase):
             self.assertEqual(want, terrain.bullet_cell(x, y), (x, y))
 
     def test_the_client_truncates_the_raw_float_position(self):
-        """f32 坐标 (20.3, 20.4)，四舍五入是 (20, 20)：角色那份 x 17..22、y 18..21。
+        """f32 坐标 (20.3, 20.4)，四舍五入是 (20, 20)（旧的 `rows` 那份：x 17..22、y 18..21）。
 
         客户端 `局部 = ftol(f32(X − 20.3) + 3)`：X=17 → −0.3 → **向零截断成 0**，X=18 → 0.7 → 0，
-        … X=23 → 5.7 → 5（还在 6 列之内）⇒ 弹体那份 x 17..23，右边多一列；y 同理下边多一行。
+        … X=23 → 5.7 → 5（还在 6 列之内）⇒ x 17..23，右边多一列；y 同理下边多一行。
+        角色（`cell`）和弹体（`bullet_cell`）问的是同一个 `0x473969`（X_Mod §105）。
         """
         terrain = _terrain(64, 64, breakables=[self._square(20.3, 20.4)])
-        self.assertEqual(0, terrain.cell(23, 19))            # 角色那份（四舍五入）
-        self.assertEqual(3, terrain.bullet_cell(23, 19))     # 弹体那份：多出来的那一列
-        self.assertEqual(0, terrain.cell(20, 22))
-        self.assertEqual(3, terrain.bullet_cell(20, 22))     # 多出来的那一行
+        for probe in (terrain.cell, terrain.bullet_cell):
+            self.assertEqual(3, probe(23, 19))              # 多出来的那一列
+            self.assertEqual(3, probe(20, 22))              # 多出来的那一行
         self.assertEqual(0, terrain.bullet_cell(24, 19))
         self.assertEqual(0, terrain.bullet_cell(16, 19))     # −1.3 → −1，越界
 
@@ -163,8 +163,9 @@ class BreakableBulletShapeTests(unittest.TestCase):
         # 放到 x 从 26 起：角色那份止于 31（粗网格第 1 块），弹体那份多出的 x=32 落进第 2 块 ——
         # 粗网格按角色那份标脏的话，第 2 块会被当成「保证是空的」一步跳过去。
         terrain = _terrain(64, 64, breakables=[self._square(29.3, 20.4)])
-        self.assertEqual(0, terrain.cell(32, 19))
+        self.assertEqual(3, terrain.cell(32, 19))
         self.assertTrue(terrain.blocks_bullet(32, 19))
+        self.assertFalse(terrain.coarse_empty(32, 18, 40, 20))
         self.assertFalse(terrain.coarse_clear(32, 18, 40, 20))
         # 碎了就一起放行
         broken = terrain.variant(())
@@ -179,18 +180,13 @@ class BreakableBulletShapeTests(unittest.TestCase):
         b = terrain.breakables[0]
         self.assertEqual((821.7313232421875, 652.22021484375),
                          (terrain_raw(b)))
-        only_char = only_bullet = 0
+        differ = 0
         for y in range(b.top - 3, b.top + b.height + 3):
             for x in range(b.left - 3, b.left + b.width + 3):
-                c = terrain.cell(x, y) == 3
-                u = terrain.bullet_cell(x, y) == 3
-                only_char += c and not u
-                only_bullet += u and not c
-        self.assertEqual(0, only_char)
-        self.assertGreater(only_bullet, 0)
-        # 左边那一圈里的一格（重放里 200002 就是贴着它弹回去的那一侧）
-        self.assertEqual(0, terrain.cell(802, 602))
-        self.assertEqual(3, terrain.bullet_cell(802, 602))
+                differ += terrain.cell(x, y) != terrain.bullet_cell(x, y)
+        self.assertEqual(0, differ, "角色和弹体是同一份格子（X_Mod §105）")
+        # 左边那一圈里的一格（重放里 200002 就是贴着它弹回去的那一侧）：旧的四舍五入形状里是空的。
+        self.assertEqual(3, terrain.cell(802, 602))
 
 
 def terrain_raw(breakable):

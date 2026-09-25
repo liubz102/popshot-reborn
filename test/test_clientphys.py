@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""客户端角色的腾空物理（X_Mod §87）：`botmove.client_air_tick` / `client_launch_tick` / `client_probes`。
+"""客户端角色的腾空物理（X_Mod §87 / §105）：`botmove.client_air_tick` / `client_probes`。
 
-只给服务端外推**真人**用（`bot._advance_humans`）；bot 自己走路仍是 `_air_tick` 那套（X_Mod D63）。
+bot 自己走、外推真人、可达图用的都是它（`botmove.frame` 的第 ③ 步）。
 钉的是逐指令逆出来的几件事（`0x50d58a` → `0x50e759` → `Character` vf+0xa8 = `0x502df4` → `0x50efd2`）：
 
 1. 探针 = 脚底 + 腿 / 身 / 头各自沿速度方向的前沿点；单向平台只挡脚底、只在往下走时挡；
 2. 撞上了**这一格位置不动**，只改速度：往下走且 |v| ≤ 35 ⇒ 落地（落在扫掠的**空点**上，
    往下找不到地就只往下出溜几格）—— 和哪个探针撞上无关；否则按 7×7 投票反射
-   （切向 ×0.5、法向 ×−0.2），再 `vx *= 0.3`；
-3. 起跳后那一格只按速度挪，不加重力、不扫掠。
+   （切向 ×0.5、法向 ×−0.2），再 `vx *= 0.3`；上升计时器在跑时另一支（`test_botmove`）；
+3. 出界四面都是实心（`0x472fe0`），图顶也挡。
 
+★ 「起跳后那一格只按速度挪、不加重力」是截断的假象（§102），那一支属于弹跳台（`test_botmove`）。
 ★ 纯标准库，两套运行时都跑。
 """
 import os
@@ -23,6 +24,8 @@ sys.path.insert(0, os.path.join(ROOT, "server"))
 sys.path.insert(0, HERE)
 
 import botmove  # noqa: E402
+
+f32 = botmove._f32
 import chrprops  # noqa: E402
 import mapdata  # noqa: E402
 from test_mapdata import make_record  # noqa: E402
@@ -77,8 +80,9 @@ class AirTickTests(unittest.TestCase):
 
     def test_free_flight_adds_gravity_then_moves(self):
         body = botmove.client_air_tick(terrain(), air(100, 100, 3, -10), WHO)
-        self.assertEqual((103.0, 91.2), (body.x, round(body.y, 6)))
-        self.assertAlmostEqual(-8.8, body.vy)
+        vy = f32(-10 + botmove.G32)
+        self.assertEqual((103.0, f32(100 + vy)), (body.x, body.y))
+        self.assertEqual(vy, body.vy)
         self.assertFalse(body.on_ground)
 
     def test_landing_puts_the_feet_on_the_free_point_above_the_floor(self):
@@ -99,8 +103,8 @@ class AirTickTests(unittest.TestCase):
         body = botmove.client_air_tick(terrain(), air(100, 120, 4, 40), WHO)
         self.assertEqual((100.0, 120.0), (body.x, body.y), "撞上的那一格位置不动")
         self.assertFalse(body.on_ground)
-        self.assertAlmostEqual(-0.2 * 41.2, body.vy)
-        self.assertAlmostEqual(4 * 0.5 * 0.3, body.vx)
+        self.assertAlmostEqual(-0.2 * 41.2, body.vy, places=5)
+        self.assertAlmostEqual(4 * 0.5 * 0.3, body.vx, places=5)
 
     def test_the_head_hits_the_ceiling_and_the_body_stays_put(self):
         """★★ 往上撞顶：这一格**不挪**（不是挪到贴着顶），速度掉头成 0.2 倍往下。
@@ -109,8 +113,8 @@ class AirTickTests(unittest.TestCase):
         body = botmove.client_air_tick(terrain(ceiling=20), air(100, 100, 6, -15),
                                        WHO)
         self.assertEqual((100.0, 100.0), (body.x, body.y))
-        self.assertAlmostEqual(0.2 * 13.8, body.vy)
-        self.assertAlmostEqual(6 * 0.5 * 0.3, body.vx)
+        self.assertAlmostEqual(0.2 * 13.8, body.vy, places=5)
+        self.assertAlmostEqual(6 * 0.5 * 0.3, body.vx, places=5)
 
     def test_brushing_a_wall_on_the_way_down_slides_down_a_few_pixels(self):
         """★ 往下走、速度不大时撞墙也走「落地」那一支（`[hit+0x20]` 对地形恒 −1）：
@@ -135,29 +139,14 @@ class AirTickTests(unittest.TestCase):
         """脚底这一格从 129 扫到 116，中途穿过 y=120 那条单向平台：往上走不挡。"""
         body = botmove.client_air_tick(terrain(one_way=(120, 50, 150)),
                                        air(100, 130, 0, -15), WHO)
-        self.assertAlmostEqual(116.2, body.y)
+        self.assertEqual(f32(130 + f32(-15 + botmove.G32)), body.y)
         self.assertFalse(body.on_ground)
 
-    def test_above_the_top_of_the_map_is_open(self):
-        """图顶上面当空：头伸出图顶照样往上走（V0.3 §192）。"""
+    def test_the_top_of_the_map_blocks_the_head(self):
+        """★ 出界四面都是 2（`0x472fe0`）：头到了 y < 0 就撞上 —— 这一格不挪、往下反弹（X_Mod §105）。"""
         body = botmove.client_air_tick(terrain(), air(100, 60, 0, -15), WHO)
-        self.assertAlmostEqual(46.2, body.y)
-
-
-class LaunchTickTests(unittest.TestCase):
-
-    def test_the_first_step_after_takeoff_is_the_full_speed(self):
-        body = botmove.client_launch_tick(terrain(), air(100, FLOOR - 1, 3, -20))
-        self.assertEqual((103.0, FLOOR - 21.0), (body.x, body.y))
-        self.assertEqual((3.0, -20.0), (body.vx, body.vy), "不加重力")
-        self.assertFalse(body.on_ground)
-
-    def test_something_under_the_feet_right_after_the_step_keeps_him_on_it(self):
-        """挪完脚下 (x, y+1) 还有东西（这里是一条单向平台）⇒ 还算踩地（`0x50d404`）。"""
-        body = botmove.client_launch_tick(terrain(one_way=(130, 50, 150)),
-                                          air(100, FLOOR - 1, 0, -20))
-        self.assertEqual(float(FLOOR - 21), body.y)
-        self.assertTrue(body.on_ground)
+        self.assertEqual(60.0, body.y)
+        self.assertGreater(body.vy, 0.0)
 
 
 if __name__ == "__main__":

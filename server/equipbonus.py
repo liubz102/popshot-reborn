@@ -40,6 +40,8 @@ import shopdata
 #: `shop_items.json` 里加成的键（`bonus_index` 那张表，idx 2 / 5）。
 DEFENSE = "defense"
 HP = "hp"
+#: idx 4 `MoveSpd`：走路路程 × (100 + x) × 0.01（`0x5074ef`，外推真人走路用，X_Mod §105）。
+MOVE_SPEED = "movespd"
 
 #: 通用桶：`itemId < 1e6` 的物品（称号、宠物）加进每一个角色的桶。
 COMMON_BUCKET = -1

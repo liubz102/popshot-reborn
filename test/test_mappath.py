@@ -182,8 +182,20 @@ class RealMaps(unittest.TestCase):
         self.assertEqual(10000, mv.total)
         self.assertEqual(1, len(mv.riders))
         self.assertEqual((252, 435), (mv.riders[0].w, mv.riders[0].h))
-        #: 掩码 252 宽 × 缩放 1.1 = 277
-        self.assertEqual(277, mv.riders[0].sw)
+        #: 掩码 252 宽 × 缩放 1.1：客户端载图重采样成 **276** 宽（X_Mod §100：
+        #: 锚点 ftol(−126) → 四边 ftol(f32(边 × 1.1)) = −138 / 138），不是四舍五入的 277。
+        self.assertEqual(276, mv.riders[0].sw)
+        self.assertEqual(435, mv.riders[0].sh)
+
+    def test_the_resample_matches_the_client_column_map(self):
+        """★ 源列 = ftol(f32(f32((i − 138) / 1.1f) + 126))（`0x47be65`）：左半边第 6、17、28 … 列
+        落在 u 而不是四舍五入的 u − 1；最右那一列源格 251 永远取不到。"""
+        rider = self.terrain.movers[0].riders[0]
+        f32 = mapdata.f32
+        for i in range(rider.sw):
+            want = int(f32(f32((i - 138) / f32(1.1)) + 126))
+            self.assertEqual(want if 0 <= want < 252 else -1, rider._ucol[i], i)
+        self.assertNotIn(251, rider._ucol)
 
     def test_carp_swings_between_the_two_path_ends(self):
         """§68 量到的是 x 693 ↔ 982、y≈735。"""

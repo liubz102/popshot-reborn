@@ -58,6 +58,7 @@ ini 只给了三个**半径**，没给圆心。这里用的模型是
 import json
 import math
 import os
+import struct
 
 #: 认得的产物格式版本。对不上就当没有数据 —— 退回下面那组默认尺寸，
 #: 而不是按错的布局解出一堆乱七八糟的圆。
@@ -90,6 +91,23 @@ DEFAULT_SIZES = {
     "sp": 100,
     "speed": 7.0,
 }
+
+
+#: ★★ 闯关模式里**所有角色**一律用这组半径（X_Mod §101）：`0x4fc230` 摆圆时先问 GameContext
+#: vft+0x20（只有 Quest / Quest01~07 / PromotionQuest 返回 1，`0x46f801`），真就套这组覆盖
+#: （`0x4fc375` ~ `0x4fc38a`）。
+QUEST_SIZES = {"size_legs": 12.0, "size_body": 13.0, "size_head": 10.0,
+               "size_legs_crouch": 7.0}
+
+#: ★★ 缩小道具（属性 4，`Item.ini [SizeDown]` 10304、`Status.ini [4] Time=8`）：四个半径都 ×
+#: `[0x6937c4]` = 0.6f，**写死**、不读 `SizeRatio`（`0x4fc399` / `0x4fc3a2`），排在闯关覆盖之后。
+SHRINK_RATIO = struct.unpack("<f", struct.pack("<f", 0.6))[0]
+
+#: ★★ 出拳（`Character::Jab` `0x502394`）期间的**第 4 个圆**（`[char+0x5ac]` 计时器在跑，X_Mod §101）：
+#: 圆心 x = 朝向 × 2.2f × r身（`[0x693a8c]`）、y = −4 × r身（`[0x693a90]`，蹲着再 + 2(r腿 − r蹲)），
+#: 半径 = 2 × r身；掩码 0（打中算身体）。不出拳时这个圆半径 0、圆心 (0, 0)。
+JAB_REACH = struct.unpack("<f", struct.pack("<f", 2.2))[0]
+JAB_HEIGHT = -4.0
 
 
 #: `GameProps.ini` 的体力常量，产物里没有时用的默认值（就是原版那几个数）。
@@ -316,13 +334,46 @@ class Character(object):
         （当腿），角色构造时再推身、头（`0x4fafda`）；`0x50f410` 按这个顺序试、**第一个
         扫到的就算**，不比谁更早。② 每个圆带掩码：腿 4、头 2（`0x4fb01d`），武器的
         `PassObjCollBlockFlags` 和它相交就穿过去。
-        ★ 第 4 个圆（身前 2.2·r身、半径 2·r身，只在 `[角色+0x5ac]` 那个计时器走着时才有）
-          服务端拿不到那个状态，没列。
+        ★ 第 4 个圆（出拳那一段，`shaped(jab_dir=±1)`）排在最后，掩码 0、算身体（X_Mod §101）。
         """
         out = []
         for cx, cy, r, region in reversed(self.circles(x, y, crouched)):
             out.append((cx, cy, r, region, SHAPE_FLAGS[region]))
+        jab = getattr(self, "jab_dir", 0)
+        if jab:
+            body = self.size_body
+            dy = JAB_HEIGHT * body
+            if crouched:
+                dy += 2.0 * (self.size_legs - self.size_legs_crouch)
+            out.append((x + jab * JAB_REACH * body, y + dy, 2.0 * body,
+                        REGION_BODY, 0))
         return out
+
+    def shaped(self, quest=False, shrunk=False, jab_dir=0):
+        """这个角色在**某一刻**的形状（`0x4fc230` 摆圆那一段，X_Mod §101）：闯关统一尺寸 → 缩小 ×0.6 → 出拳的第 4 个圆。
+
+        三样都不沾就是自己。结果按参数缓存（形状只有这几种组合）。
+        """
+        quest, shrunk, jab_dir = bool(quest), bool(shrunk), int(jab_dir)
+        if not (quest or shrunk or jab_dir):
+            return self
+        key = (id(self), quest, shrunk, jab_dir)
+        got = _SHAPED.get(key)
+        if got is not None and got[0] is self:
+            return got[1]
+        raw = dict(self.raw)
+        if quest:
+            raw.update(QUEST_SIZES)
+        if shrunk:
+            for name in QUEST_SIZES:
+                value = raw.get(name)
+                if value is None:
+                    value = DEFAULT_SIZES[name]
+                raw[name] = struct.unpack(
+                    "<f", struct.pack("<f", float(value) * SHRINK_RATIO))[0]
+        variant = ShapedCharacter(raw, jab_dir)
+        _SHAPED[key] = (self, variant)
+        return variant
 
     def center(self, x, y, crouched=False):
         """身体那个圆的圆心 —— **瞄这里**。
@@ -351,6 +402,20 @@ class Character(object):
         return ("<Character %d hp=%d 头%.0f 身%.0f 腿%.0f>"
                 % (self.id, self.hp, self.size_head, self.size_body,
                    self.size_legs))
+
+
+class ShapedCharacter(Character):
+    """`Character.shaped()` 的结果：尺寸换过的同一个角色，外加出拳朝向（0 = 没在出拳）。"""
+
+    __slots__ = ("jab_dir",)
+
+    def __init__(self, raw, jab_dir=0):
+        Character.__init__(self, raw)
+        self.jab_dir = int(jab_dir)
+
+
+#: `(id(角色), 闯关, 缩小, 出拳朝向) -> (角色, 变体)`（值里留着原对象，id 不会被复用）。
+_SHAPED = {}
 
 
 class _Store(object):
@@ -409,7 +474,14 @@ STORE = _Store()
 
 
 def get(character_id):
-    """按角色 id 取属性；查不到返回默认尺寸那一份。"""
+    """按角色 id 取属性；查不到返回默认尺寸那一份。
+
+    ★ 也收 `(角色 id, 闯关, 缩小, 出拳朝向)` 这种**形状键**（`bot._battle_bodies` 给的），
+      返回换好形状的那一份（`Character.shaped`，X_Mod §101）。
+    """
+    if isinstance(character_id, tuple):
+        cid, quest, shrunk, jab_dir = character_id
+        return STORE.get(cid).shaped(quest, shrunk, jab_dir)
     return STORE.get(character_id)
 
 

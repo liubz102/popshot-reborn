@@ -1078,11 +1078,40 @@ class BotWeaponAttributeTests(BotBattleRoom):
         self.assertAlmostEqual(2.1, self.bot_conn.slowed_until - before,
                                delta=0.5)
 
+    def test_a_human_victim_is_slowed_too(self):
+        """★ X_Mod §97：被打的是真人也挂 —— 他自己那台按自己的碰撞挂上了，服务端外推他
+        走路要跟着慢（以前只认 bot 受害者）。"""
+        bob_seat = self.room.seat_index_of(self.bob)
+        bot.note_peer_hit(self.room, self.alice,
+                          explode_payload(botsync.character_handle(bob_seat)))
+        self.assertIsNotNone(self.bob.slowed_until)
+        # 倍率按 f32 算（主线程 24 位精度，X_Mod §105）。
+        self.assertEqual(botmove._f32(gameserver.SLOWED_SPEED_RATIO),
+                         bot._speed_scale(self.bob, bot._now()))
+
+    def matched(self, ammo):
+        """把「按爆点配回的那一发 rpFire」钉成 `ammo` 那一节。"""
+        shot = unittest.mock.Mock(weapon=weapondata.get(ammo), poisoned=False)
+        return unittest.mock.patch.object(bot, "_match_peer_shot",
+                                          return_value=(shot, 0.0, 0.0))
+
+    def test_a_matched_mother_bomb_does_not_slow(self):
+        """★ 配得上 rpFire 就按那一发自己的武器判：母弹 `[ch03-02]` 砸中人不挂，
+        只有蝴蝶 `[ch03-02a]` 挂（以前手上拿母弹就一律算减速）。"""
+        with self.matched(IRENE_BOMB):
+            bot.note_peer_hit(self.room, self.alice,
+                              explode_payload(self.bot_handle))
+        self.assertIsNone(self.bot_conn.slowed_until)
+        with self.matched(IRENE_SPLINTER):
+            bot.note_peer_hit(self.room, self.alice,
+                              explode_payload(self.bot_handle))
+        self.assertIsNotNone(self.bot_conn.slowed_until)
+
     def test_the_slow_actually_reaches_the_walk_speed(self):
         bot.note_peer_hit(self.room, self.alice,
                           explode_payload(self.bot_handle))
         now = bot._now()
-        self.assertEqual(gameserver.SLOWED_SPEED_RATIO,
+        self.assertEqual(botmove._f32(gameserver.SLOWED_SPEED_RATIO),
                          bot._speed_scale(self.bot_conn, now))
         # 到点自己恢复，不靠谁来撤。
         self.assertEqual(1.0, bot._speed_scale(self.bot_conn, now + 9.0))
@@ -1111,15 +1140,16 @@ class BotWeaponAttributeTests(BotBattleRoom):
                           explode_payload(self.bot_handle))
         self.assertIsNone(self.bot_conn.slowed_until)
 
-    def test_a_splash_hit_slows_too(self):
-        """溅射那一路（`rpSplashDamaged`）和直接命中同一个口径。"""
+    def test_a_splash_hit_does_not_slow(self):
+        """★ 溅射（`rpSplashDamaged`）挂不上武器状态（X_Mod §97）：溅射对象由 `0x491702`
+        只拿数值建出来，不带弹体的键表 —— 和毒一样只有直接命中才挂（§93）。"""
         body = struct.pack("<iifBff", 1, self.bot_handle, 10.0, 0, 1.0, 1.0)
         body += struct.pack("<ff", 0.0, 0.0)                   # +21 命中点
         body += b"\x00" * (botsync.SPLASH_BODY_SIZE - len(body))
         bot.note_peer_hit(self.room, self.alice,
                           udp_packet(inner=botsync.OP_SPLASH_DAMAGED,
                                      body=body))
-        self.assertIsNotNone(self.bot_conn.slowed_until)
+        self.assertIsNone(self.bot_conn.slowed_until)
 
     def test_the_slow_is_extended_never_shortened(self):
         """连着挨两发：留下的是**更远**的那个到期时刻，不是最后一发那个。"""

@@ -60,7 +60,7 @@ tick」这种阈值（铁律 10）：顶点是这段弧线上「再跳一次能�
 —— 那一下把每条连接的发送线程饿住，用户看到的就是「积压几秒的包一起爆发」
 （§163 / D125）。可变体和母地形的差别**只在那一件罐子附近**。
 
-⇒ 一个落脚点固定跑 **17 次尝试**（`_ATTEMPTS`），每次尝试记下自己摸过的
+⇒ 一个落脚点固定跑 **11 次尝试**（`_ATTEMPTS`），每次尝试记下自己摸过的
 那一片（`_Trace`）；变体建这一格时逐条问「这一片被碎掉的那几件碰到了没有」，
 没碰到就把母地形那条边整条搬过来。实测碎一件之后整图泛洪
 **1576 -> 198 ms**（`Esperan03`）、**1617 -> 51 ms**（`Iceria02`）。
@@ -170,7 +170,7 @@ def _block(value):
 
 
 class _Trace(object):
-    """一次尝试**摸过的那一片地形**：所有身体位置的外接矩形 + 最大 |vx|。
+    """一次尝试**摸过的那一片地形**：所有身体位置的外接矩形 + 见过的最大速度分量。
 
     ★★★ 它是**增量边缓存**的判据（V0.3 §170）：一条边只可能被它自己走过的
       那一片影响，那一片没变，这条边就一个字都不用重算。
@@ -194,9 +194,12 @@ class _Trace(object):
             self.y0 = y
         elif y > self.y1:
             self.y1 = y
-        v = body.vx
-        if v < 0.0:
-            v = -v
+        # ★ 撞上东西那一帧位置不动，可扫掠已经朝速度方向探出去一整步（`_client_sweep`）——
+        #   那一段不在「记下来的身体位置」里，按见过的最大速度分量补上（X_Mod §105）。
+        v = abs(body.reported_vx)
+        w = abs(body.vy)
+        if w > v:
+            v = w
         if v > self.vmax:
             self.vmax = v
 
@@ -205,45 +208,52 @@ class _Trace(object):
 
         返回的是 **16 像素一格的格号** `(x0, x1, y0, y1)`（`_BOX`）——
         一律**朝外**取整，所以只会多算不会少算，多算的后果只是「多重跑一条
-        边」。存格号而不是浮点：一个落脚点 17 次尝试，存浮点元组要 4 KB，
+        边」。存格号而不是浮点：一个落脚点 11 次尝试，存浮点元组要 3 KB，
         存 4 个 `int` 只要 300 字节，而一张真图 1200 个落脚点 × 每个角色
         尺度一份（`Esperan03` 实测 9.4 -> 5.9 MB）。
 
-        `botmove` 问地形的地方，探针最远伸出多少，全是**角色自己的尺寸**
-        （不是拍出来的常量）：
+        `botmove` 问地形的地方都在身体附近（X_Mod §105 起全是客户端那套逐格问法），
+        伸出多远全是**角色自己的尺寸**或客户端的常量：
 
         * `fits()` 的 `_clearance_ok` 左右各扫 `2 × 半径`，身圆那一行在脚
           上方 `2 × 腿半径 + 身半径`；
-        * `surface_near()` 的 reach 是 `速度 × CLIMB_SLOPE` —— 走路那一步
-          用走速，腾空那一步用 `|vx|`（弹跳台能给出比走速大的 `vx`，
-          所以这里取「实际见过的最大值」和冲刺走速里大的那个）；
-        * ★ `_shape_hit()` 的头圆前沿在脚上方 `2 腿 + 2 身 + 2 头`（V0.3 §192）
-          —— 头顶上那 70 像素里的破坏物碎没碎，决定这条弧线撞不撞头。
-
-        ★ 列方向必须放够：`surfaces(x)` / `ground_below(x, y)` 问的是**整列**，
-          只要那一列没变，这一列上的每一问答案都一样。
+        * 腾空扫掠的探针是各圆沿速度方向的前沿点，头圆在脚上方 `2 腿 + 2 身 + 2 头`；
+          撞上后 7×7 投票再往外 3 格；落地那一问从原位往下最多 `max(5, ftol vy)` 格；
+        * 走路逐列推进，每列往上找 ≤ 20 格、往下找 ≤ 10 格；
+        * 撞上的那一帧位置不动，扫掠却已经朝速度方向探出去一步：四面都再加「见过的最大速度分量
+          + 一格重力 + 一格空中操控步长」（下一帧的速度最多比这一帧大这么多）。
         """
         legs = float(getattr(character, "size_legs", 12.0) or 12.0)
         body_r = float(getattr(character, "size_body", 13.0) or 13.0)
         head_r = float(getattr(character, "size_head", 10.0) or 10.0)
-        speed = botmove.walk_speed(character, True)
-        margin = max(2.0 * legs, 2.0 * body_r, 2.0 * legs + body_r,
-                     max(self.vmax, speed) * botmove.CLIMB_SLOPE) + 1.0
-        # ★ 头圆只往**上**伸：探测点全在脚上方，往下 / 两侧照旧 —— 依赖区放大
-        #   一圈就多重算一批边（`test_it_really_reuses…` 钉着复用率）。
-        up = max(margin, 2.0 * legs + 2.0 * body_r + 2.0 * head_r + 1.0)
+        vote = botmove.CLIENT_VOTE_WINDOW
+        reach = (self.vmax + botmove.GRAVITY + botmove.AIR_CONTROL_STEP
+                 + vote + 2.0)
+        # 横向：`fits()` 左右各扫 2×半径；探针前沿 ≤ 半径；走路看下一列；扫掠探出去一步。
+        margin = max(2.0 * legs, 2.0 * body_r, 2.0 * legs + body_r) + reach
+        # 往上：头圆前沿在脚上方 2 腿 + 2 身 + 2 头；走路一列往上找 ≤ 20 格。
+        up = (max(2.0 * legs + 2.0 * body_r + 2.0 * head_r,
+                  botmove.WALK_UP_MAX + 1.0) + reach)
+        # 往下：落地那一问从原位往下 ≤ max(5, ftol vy) 格（能落地的 |v| ≤ 35）；走路往下找 ≤ 10 格。
+        down = (max(botmove.CLIENT_LAND_SPEED, botmove.WALK_DOWN_MAX + 1.0)
+                + reach)
         return (_block(self.x0 - margin), _block(self.x1 + margin),
-                _block(self.y0 - up), _block(self.y1 + margin))
+                _block(self.y0 - up), _block(self.y1 + down))
 
 
-def _finish_air(terrain, body, character, trace, ticks=AIR_TICKS):
-    """把腾空状态推到落地，返回 ``(Body, 用掉的 tick)``；落不到返回 None。"""
+def _finish_air(terrain, body, character, trace, ticks=AIR_TICKS, direction=0):
+    """把腾空状态推到落地，返回 ``(Body, 用掉的 tick)``；落不到返回 None。
+
+    `direction` = 空中一直按着的方向键（本人那台的空中操控，X_Mod §102）。
+    """
     used = 0
     while not body.on_ground and used < ticks:
-        body = botmove.tick(terrain, body, character)
+        body = botmove.tick(terrain, body, character, direction=direction)
         trace.see(body)
         used += 1
-    return (body, used) if body.on_ground else None
+    if not body.on_ground or botmove.out_of_world(terrain, body):
+        return None                     # 图底那一圈出界实心接住的不算落地（`CheckFallDown`）
+    return body, used
 
 
 def _walk_edge(terrain, body, character, trace, direction):
@@ -269,12 +279,14 @@ def _walk_edge(terrain, body, character, trace, direction):
 
 
 def _jump_edge(terrain, body, character, trace, direction, fast_run):
+    """起跳、空中一路按着 `direction`（起跳只给 ¼ 走速，水平速度靠空中操控攒起来，X_Mod §102）。"""
     current = botmove.tick(terrain, body, character, direction=direction,
                            fast_run=fast_run, want_jump=True)
     trace.see(current)
     if current.on_ground:
         return None
-    landed = _finish_air(terrain, current, character, trace)
+    landed = _finish_air(terrain, current, character, trace,
+                         direction=direction)
     if landed is None:
         return None
     current, used = landed
@@ -313,11 +325,14 @@ def _double_jump_edge(terrain, body, character, trace, direction, fast_run):
         want = not jumped and at_apex(current)
         if want:
             jumped = True
-        current = botmove.tick(terrain, current, character, want_jump=want)
+        # ★ 方向键一直按着：第二段也按键重算 vx（¼S），松开就是竖直的第二段（X_Mod §102）。
+        current = botmove.tick(terrain, current, character,
+                               direction=direction, want_jump=want)
         trace.see(current)
         used += 1
-    if not current.on_ground or not jumped:
-        return None                        # 没落地 / 压根没跳成第二段
+    if (not current.on_ground or not jumped
+            or botmove.out_of_world(terrain, current)):
+        return None                        # 没落地 / 压根没跳成第二段 / 掉出世界
     if _state_key(current) == _state_key(body):
         return None
     return current, Step(ACTION_DOUBLE_JUMP, current.x, current.y,
@@ -325,7 +340,10 @@ def _double_jump_edge(terrain, body, character, trace, direction, fast_run):
 
 
 def _drop_edge(terrain, body, character, trace):
+    """按一下 ↓：这一帧末 `[+0x518] = 8`，**下一帧**起脚下的白线不挡（X_Mod §105）。"""
     current = botmove.tick(terrain, body, character, want_drop=True)
+    trace.see(current)
+    current = botmove.tick(terrain, current, character)
     trace.see(current)
     if current.on_ground:
         return None
@@ -336,7 +354,7 @@ def _drop_edge(terrain, body, character, trace):
     if current.y <= body.y or _state_key(current) == _state_key(body):
         return None
     return current, Step(ACTION_DROP, current.x, current.y,
-                         0, False, float(used + 1))
+                         0, False, float(used + 2))
 
 
 def _pad_edge(terrain, body, character, trace, double=False):
@@ -363,7 +381,8 @@ def _pad_edge(terrain, body, character, trace, double=False):
         current = botmove.tick(terrain, current, character, want_jump=want)
         trace.see(current)
         used += 1
-    if not current.on_ground or (double and not jumped):
+    if (not current.on_ground or (double and not jumped)
+            or botmove.out_of_world(terrain, current)):
         return None
     if _state_key(current) == _state_key(body):
         return None
@@ -398,12 +417,13 @@ def _attempt_plan():
     """
     plan = [(_walk_edge, (-1,)), (_walk_edge, (1,))]
     # 竖直跳能从下方穿过白线并落在其上；左右两档再覆盖高台/坑。
-    for fast_run in (False, True):
-        for direction in (-1, 0, 1):
-            plan.append((_jump_edge, (direction, fast_run)))
-            # ★ 同一组方向再来一条**二段跳**边：一段跳顶点 167，两段能到
-            #   400 上下，很多高台只有它上得去。
-            plan.append((_double_jump_edge, (direction, fast_run)))
+    # ★ 没有「冲刺起跳」那一组了（X_Mod §105）：客户端起跳的 vx 只看 ¼S、腾空的水平速度靠空中操控
+    #   攒，冲刺只多走起跳那一帧的半步 —— 和普通起跳几乎是同一条弧线，白算一遍。
+    for direction in (-1, 0, 1):
+        plan.append((_jump_edge, (direction, False)))
+        # ★ 同一组方向再来一条**二段跳**边：一段跳顶点 180，两段能到
+        #   420 上下，很多高台只有它上得去。
+        plan.append((_double_jump_edge, (direction, False)))
     plan.append((_drop_edge, ()))
     # ★★ 弹跳台两条：光弹上去、以及**弹上去之后在顶点再补一段跳**。
     #    后者是「主动用跳高台上高处」真正缺的那一条（用户 2026-08-30）。
@@ -449,8 +469,11 @@ def _run_attempts(terrain, body, character, base=None, rects=()):
         edge = build(terrain, body, character, trace, *args)
         # ★ 落点塞不进去的边不进图（§152），判在这里而不是最后统一过一遍
         #   —— 这样「这一次尝试的答案」是自足的，继承时整条搬走就行。
-        if edge is not None and not botmove.fits(terrain, edge[0].x,
-                                                 edge[0].y, character):
+        # ★ 落在图底那一圈出界实心上 = 掉出世界（`botmove.out_of_world`）：走路那条边在它
+        #   那几格里就可能已经掉下去、落了地，所以在这里对所有边统一判。
+        if edge is not None and (
+                botmove.out_of_world(terrain, edge[0])
+                or not botmove.fits(terrain, edge[0].x, edge[0].y, character)):
             edge = None
         boxes.extend(trace.box(character))
         edges.append(edge)
@@ -511,10 +534,10 @@ def _changed_rects(source, terrain):
     diff = mine ^ theirs
     if not diff:
         return ()
-    return tuple((_block(item.col0 - 1.0), _block(item.col1 + 1.0),
-                  _block(item.row0 - 1.0), _block(item.row1 + 1.0))
+    return tuple((_block(item.bcol0 - 1.0), _block(item.bcol1 + 1.0),
+                  _block(item.brow0 - 1.0), _block(item.brow1 + 1.0))
                  for item in terrain.breakables
-                 if item.index in diff and item.col1 >= 0)
+                 if item.index in diff and item.bcol1 >= 0)
 
 
 #: 「破坏物全碎」那一份变体的存活集合。开局预热的就是它和母地形两张
@@ -732,10 +755,13 @@ def _commands_for_step(terrain, body, character, step):
             push()
         return out
 
+    direction = 0
     if step.action in (ACTION_JUMP, ACTION_DOUBLE_JUMP):
-        push(direction=step.direction, fast_run=step.fast_run, want_jump=True)
+        direction = step.direction
+        push(direction=direction, fast_run=step.fast_run, want_jump=True)
     elif step.action == ACTION_DROP:
         push(want_drop=True)
+        push()                              # 按下的下一帧白线才不挡
     elif step.action == ACTION_PAD:
         push()                              # 先让脚下的台子把人弹起
     else:
@@ -746,7 +772,7 @@ def _commands_for_step(terrain, body, character, step):
         again = bool(step.double and not jumped and at_apex(current))
         if again:
             jumped = True
-        push(want_jump=again)
+        push(direction=direction, want_jump=again)
     return out
 
 

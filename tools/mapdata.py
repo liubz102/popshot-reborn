@@ -440,12 +440,16 @@ def collect_movers(objects, masks, ver):
             ("handle", int(obj.get("handle", 0))),
             ("w", mask["width"]),
             ("h", mask["height"]),
-            ("sx", round(float(obj.get("sx", 1.0)), 4)),
-            ("sy", round(float(obj.get("sy", 1.0)), 4)),
+            # ★★ 缩放和自身坐标都存 `.map` 里的**原始 f32**（X_Mod §100）：客户端载图重采样
+            #   就拿这几个 f32 算格子（`0x51aa2d`）。以前四舍五入到 4 / 3 位小数，
+            #   `Quest02_2#Extreme` 的 sy 0.69999993 变成 0.7 就差出 10 格、`Untitled*` 差 4~192 格。
+            #   f32 转成 Python float 是精确的，JSON 原样存、读回来一位不差。
+            ("sx", float(obj.get("sx", 1.0))),
+            ("sy", float(obj.get("sy", 1.0))),
             # ★ 自身坐标只在**相对模式**下参与（`GetWorldPos` 加回去）；
             #   `t_off` / `rel` 见 `_read_obj_blob` 的说明（§74）。
-            ("x", round(float(obj.get("x", 0.0)), 3)),
-            ("y", round(float(obj.get("y", 0.0)), 3)),
+            ("x", float(obj.get("x", 0.0))),
+            ("y", float(obj.get("y", 0.0))),
             ("t_off", int(obj.get("t_off") or 0)),
             ("rel", int(obj.get("rel") or 0)),
             ("mask", _blob(mask["cells"])),

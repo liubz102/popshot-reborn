@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import copy
 import math
 import os
 import random
@@ -455,10 +456,6 @@ class BotConn(gameserver.Conn):
         self.motion_identity = botmotion.new_identity()
         self.motion_revision = 0
         self.motion_constraint = None
-        #: 上一格有没有被地形钉住某一轴。撞墙时模拟故意保留 `vx`（§95），
-        #: 但线上速度要报 0（§181）；只在「进入/离开钉住」时补锚，避免贴墙
-        #: 的每一格都多发一份心跳。
-        self.motion_blocked_axes = (False, False)
         #: 上一发**踩地**心跳报出去的 `(方向键, 冲刺位)`。收方拿这两样替 bot
         #: 走接下来那一段（`0x507660`），所以它们一翻转就是收方复现不出来的
         #: 运动突变，当格补锚（V0.3 §190 / D149）。腾空时记 `None`（腾空收方
@@ -576,6 +573,9 @@ class BotConn(gameserver.Conn):
         #:   用户 2026-08-28 报「有时候有击退，有时候没有」——
         #:   这本账就是为了让日志把「哪一类没动、为什么」一次讲清楚。
         self.knock_logged = set()
+        #: ★ 打中时这几个座位**正在挡**（X_Mod §95）—— 按状态翻转去重：一段格挡只在
+        #:   头一发打一行，挨到一发没挡的才把座位拿掉（下一段再打）。
+        self.guard_logged = set()
         #: 这一图的「分裂弹炸成几片」日志打过了吗（同上，§81）。
         self.split_logged = False
         #: ★ 分裂弹撒碎片时的随机数（`0x47c9b7` 那一发 `rand() % n`）。
@@ -691,8 +691,8 @@ class BotConn(gameserver.Conn):
         #:   `None` = 这把枪不限时。原版的 `ForceTime`（`+0x94` -> `[+0x38]`
         #:   = 拿到手的时刻 + 它）。火焰喷射器 15 秒、水炮 10 秒。
         self.item_weapon_until = None
-        #: ★★★ **按「还能打几发」算的状态**：`{属性号: 剩余发数}`
-        #:   （`gameserver.MAGAZINE_STATUS`，V0.3 §117）。
+        #: ★★★ **按「还能打空几匣」算的状态**：`{属性号: 剩余匣数}`
+        #:   （`gameserver.MAGAZINE_STATUS`，V0.3 §117 / X_Mod §95）。
         #:   强力射击 / 三重射击 / 毒弹这三条在 `Status.ini` 里**只有
         #:   `Magazine`、没有 `Time`**，客户端不会自己撤 —— 得服务端数完
         #:   补一发 `0x040d`。空 = 身上没有这一类状态。
@@ -702,6 +702,12 @@ class BotConn(gameserver.Conn):
         self.slowed_until = None
         #: ★ 被冰冻**到什么时候**；`None` = 没被冻（V0.3 §106）。
         self.frozen_until = None
+        #: ★ 吃了加速道具**加速到什么时候**；`None` = 没加速（X_Mod §97）。
+        self.hasted_until = None
+        #: ★ 吃了缩小道具**缩到什么时候**（碰撞圆 ×0.6，X_Mod §101）；bot 不出拳，`jab_*` 恒空。
+        self.shrunk_until = None
+        self.jab_until = None
+        self.jab_dir = 0
         #: ★★ **地上还在烧的火墙**（`FireWall`，§78）。收方只把火画出来，
         #:   算谁被烧的还是「射手那台机器」—— bot 没有本机，所以归这边。
         self.fires = []
@@ -792,7 +798,6 @@ class BotConn(gameserver.Conn):
         self.motion_anchor_pending = False
         self.motion_identity = botmotion.new_identity()
         self.motion_constraint = None
-        self.motion_blocked_axes = (False, False)
         self.walk_reported = None
         self.trail_mark = None
         self.trail_heading = 0
@@ -806,10 +811,12 @@ class BotConn(gameserver.Conn):
         self.pending_shots = []
         # ★ 捡来的枪跟着清：新一局 / 换图之后地上那件东西已经不存在了。
         self.drop_item_weapon()
-        # ★ 按发数算的状态跟着清：客户端重建角色时属性表也整个没了。
+        # ★ 按匣数算的状态跟着清：客户端重建角色时属性表也整个没了。
         self.magazine_attrs = {}
         self.slowed_until = None
         self.frozen_until = None
+        self.hasted_until = None
+        self.shrunk_until = None
         # ★ 火墙跟着清：收方的弹体表这一刻整个复位，上一张图那几团火
         #   在那边已经不存在了（同 `pending_shots`）。
         self.fires = []
@@ -824,6 +831,7 @@ class BotConn(gameserver.Conn):
         self.fire_logged = set()
         self.explode_logged = set()
         self.knock_logged = set()
+        self.guard_logged = set()
         self.split_logged = False
         # ★ 体力和近身动作跟着一起清：换图 / 新一局客户端把角色重建，
         #   `[char+0x2b5]` 那一套状态全归零（同 `crouched` 的道理，§41），
@@ -2264,7 +2272,9 @@ def _direct_hit_damage(room, machine, weapon, region, victim_seat,
        的尾巴）；
     4. ★ **只有模式 3**：目标离得比一个视口宽（1024）还远 ×0.75、
        目标**踩在地上** ×0.75 —— 各自朝零截断，两条都成立就乘两次
-       （`0x47e618`，排在 `0x4806bf` 后面）。
+       （`0x47e618`，排在 `0x4806bf` 后面）；
+    5. ★ 受害者**在格挡**就置 `0x80`（`0x47ec9a`，X_Mod §95）—— 只动 flags，
+       伤害不变，收方自己按格挡扣。
 
     ⚠ 距离量的是**两个角色原点之间**（`vft+8` = `GetPos`，也就是脚下那点），
     不是爆点到目标。踩没踩地读的是 `[char+0x128]`，服务端这边就是心跳
@@ -2273,19 +2283,18 @@ def _direct_hit_damage(room, machine, weapon, region, victim_seat,
     # ★ 强力射击的 `DamageRatio`（§117）—— 原版也是在射手这边算完才塞进包的。
     damage = int(weapon.damage_for(region) * damage_ratio) * _damage_scale(room)
     damage, flags = _victim_side(room, machine, victim_seat, damage, "直接命中")
-    if _pvp_game_mode(room) not in BOT_LONG_SHOT_MODES:
-        return damage, flags
-    shooter = machine.battle_pos
-    victim = _seat_body(room, victim_seat)
-    if shooter is not None and victim is not None:
-        span = math.hypot(victim[0] - shooter[0], victim[1] - shooter[1])
-        if span > BOT_LONG_SHOT_RANGE:
+    if _pvp_game_mode(room) in BOT_LONG_SHOT_MODES:
+        shooter = machine.battle_pos
+        victim = _seat_body(room, victim_seat)
+        if shooter is not None and victim is not None:
+            span = math.hypot(victim[0] - shooter[0], victim[1] - shooter[1])
+            if span > BOT_LONG_SHOT_RANGE:
+                damage = int(damage * BOT_DAMAGE_PENALTY)
+                flags |= EXPLODE_FLAG_FAR
+        if _seat_on_ground(room, victim_seat):
             damage = int(damage * BOT_DAMAGE_PENALTY)
-            flags |= EXPLODE_FLAG_FAR
-    if _seat_on_ground(room, victim_seat):
-        damage = int(damage * BOT_DAMAGE_PENALTY)
-        flags |= EXPLODE_FLAG_GROUNDED
-    return damage, flags
+            flags |= EXPLODE_FLAG_GROUNDED
+    return damage, flags | _guard_flag(room, machine, victim_seat, "直接命中")
 
 
 # ---------------------------------------------------------------------------
@@ -2880,8 +2889,16 @@ def _note_motion_event(room, conn, opcode, body, sequence):
         name = ("dash" if opcode == botsync.OP_DASH else "jab") + str(index)
         move = who.move(name)
         if move is not None and move.get("total_frame", 0) > 0:
-            conn.motion_action = (gen, _now() + move["total_frame"] * BOT_DASH_FRAME_MS / 1000.0,
+            frames = int(move["total_frame"])
+            if opcode != botsync.OP_DASH:
+                # ★ 出拳的计时器是 ⌊TotalFrame × 0.625⌋ 帧（`0x502414` … `fmul [0x693b08]`），
+                #   冲刺才是整 TotalFrame 帧（`0x502171`，X_Mod §101）。这一段他身前多一个圆。
+                frames = int(frames * JAB_FRAME_RATIO)
+                conn.jab_until = _now() + frames * BOT_DASH_FRAME_MS / 1000.0
+                conn.jab_dir = direction
+            conn.motion_action = (gen, _now() + frames * BOT_DASH_FRAME_MS / 1000.0,
                                   direction)
+            conn.motion_kind = "dash" if opcode == botsync.OP_DASH else "jab"
             conn.motion_facing = (gen, direction)
         return
     if len(body) != 8:
@@ -2936,21 +2953,9 @@ def _apply_motion_constraint(room, machine, terrain, now):
     span = nx - body.x
     if not span or terrain is None:
         return
-    # The original calls the same horizontal terrain routine as walking.
-    # Sweep using that solver instead of teleporting through an intervening wall.
-    current = body
-    direction = 1 if span > 0 else -1
-    remaining = abs(span)
-    who = _character_of(machine)
-    while remaining > 0:
-        distance = min(remaining, botmove.walk_speed(who))
-        moved = botmove._walk_tick(terrain, botmove.Body(current.x, current.y), who,
-                                   direction, False, False, distance / who.speed)
-        if moved.x == current.x:
-            break
-        current = current.moved(moved.x, moved.y, body.vx, body.vy,
-                                on_ground=body.on_ground)
-        remaining -= distance
+    # The original calls the same horizontal terrain routine as walking
+    # (`0x50d9a7`, X_Mod §105): one call with the whole span, same walk remainder.
+    current = botmove.walk_by(terrain, body, span)
     if current != body:
         machine.body = current
         machine.motion_anchor_pending = True
@@ -3051,7 +3056,8 @@ def note_peer_hit(room, conn, payload):
         # ★★ 武器自带的状态排在**击退之前**（X_Mod §31）：下面那条
         #    「配不上 rpFire 就不给击退」的早退会把这一段整个跳过，
         #    而碎片（蝴蝶）的爆点本来就配不上母弹的射线。
-        _take_weapon_attribute(room, conn, botsync.handle_seat(target))
+        _take_weapon_attribute(room, conn, botsync.handle_seat(target),
+                               point=(bx, by))
         velocity = _peer_shot_velocity(conn, bx, by)
         if velocity is None:
             # ★ 诊断：配不上开火记录 = **这一发不给击退**（§92 的取舍）。
@@ -3081,7 +3087,7 @@ def note_peer_hit(room, conn, payload):
             note_mob_hit(room, target, hit_x, hit_y, create=True)
         _note_damage(room, botsync.handle_seat(target),
                      _landed_damage(damage, flags))
-        _take_weapon_attribute(room, conn, botsync.handle_seat(target))
+        # ★ 溅射 / 火 / 近身挂不上武器状态（X_Mod §97：溅射对象不带弹体的键表）。
     seat_index = botsync.handle_seat(target)
     if seat_index is None:
         return
@@ -3116,10 +3122,12 @@ def _weapon_attribute(weapon):
     return None
 
 
-def _take_weapon_attribute(room, conn, seat_index, now=None):
-    """真人这一发打中 bot，**武器自带的状态**要服务端自己记一份（X_Mod §31）。
+def _take_weapon_attribute(room, conn, seat_index, now=None, point=None):
+    """真人这一发**直接命中**了人，**武器自带的状态**要服务端自己记一份（X_Mod §31 / §97）。
 
-    挂上了返回 `True`。
+    挂上了返回 `True`。被打的是 bot：压它的走速；是真人：记进服务端外推他用的那一格
+    （他自己那台按自己的碰撞也挂上了，§93 同一个机制）。★ **只认直接命中**：溅射对象由
+    `0x491702` 只拿数值建出来，不带弹体的键表，挂不上状态（X_Mod §97）。
 
     ## 为什么非做不可，以及**为什么不像胶水那样广播**
 
@@ -3144,24 +3152,63 @@ def _take_weapon_attribute(room, conn, seat_index, now=None):
 
     * 母弹 `[ch03-02]` 直接命中也会被算成减速 —— 原版只有碎片会；
     * 蝴蝶还在空中时玩家换了枪，这一发漏掉。
+
+    ★ X_Mod §97：给了爆点 `point` 就先**按爆点配回那一发 `rpFire`**（`_match_peer_shot`，毒弹同一套）
+    —— 蝴蝶是射手单独重发的 `rpFire`，配上了就知道是不是它，上面两条偏差都没了。
+    配不上（弹过地的）才退回「他手上拿的是哪把」。
+    """
+    weapon = getattr(conn, "peer_weapon", None)
+    found = None
+    matched = None if point is None else _match_peer_shot(conn, point[0], point[1])
+    if matched is not None:
+        weapon = matched[0].weapon
+        found = _shell_attribute(weapon)
+    else:
+        found = _weapon_attribute(weapon)
+    if found is None:
+        return False
+    return _apply_weapon_attribute(room, seat_index, found, now, weapon)
+
+
+def _shell_attribute(weapon):
+    """bot 自己这颗弹体带不带武器状态：`(角色属性号, 秒数)` 或 `None`（X_Mod §97）。
+
+    和 `_weapon_attribute` 的区别：bot 的弹体是哪一节**服务端自己知道**（碎片就是碎片那一节），
+    不用顺着 `SliceId` 往下猜 —— 母弹 `[ch03-02]` 直接砸中人不挂，只有蝴蝶 `[ch03-02a]` 挂。
+    """
+    if weapon is None:
+        return None
+    key = weapon.get("attribute")
+    millis = weapon.get("attribute_ms")
+    if not key or not millis:
+        return None
+    attr = gameserver.BULLET_ATTRIBUTE_CHAR_ATTR.get(int(key))
+    if attr is None:
+        return None
+    return (attr, float(millis) / 1000.0)
+
+
+def _apply_weapon_attribute(room, seat_index, found, now=None, weapon=None):
+    """把 `found = (属性号, 秒数)` 挂到 `seat_index` 身上（服务端这一份）。挂上了返回 `True`。
+
+    会改走速的只有 14 减速（`CHAR_ATTR_SPEED_RATIO`）；时长取武器的 `AttributeTime`，覆盖
+    `Status.ini` 那一条的 `Time`（`0x508e1f`）。**不发包**：每台客户端按自己的碰撞已经挂上了。
     """
     seat = (room.seats[seat_index]
-            if seat_index is not None and 0 <= seat_index < len(room.seats)
+            if isinstance(seat_index, int) and 0 <= seat_index < len(room.seats)
             else None)
     machine = None if seat is None else seat.conn
-    if not isinstance(machine, BotConn):
-        return False
-    found = _weapon_attribute(getattr(conn, "peer_weapon", None))
-    if found is None:
+    if machine is None:
         return False
     attr, seconds = found
     ratio = gameserver.CHAR_ATTR_SPEED_RATIO.get(attr)
     if ratio is None:
         # 会改走速的只有 14 减速；别的属性（中毒 / 冰冻 / 幽灵）今天**没有
         # 任何一把武器带**，真出现了先留一行日志，别假装处理过。
-        machine.log(f"   ⚠ 被带属性 {attr} "
-                    f"（{gameserver.CHAR_ATTR_NAMES.get(attr, '?')}）的武器打中，"
-                    f"服务端这边还没有这个状态的模型，只当没有")
+        if isinstance(machine, BotConn):
+            machine.log(f"   ⚠ 被带属性 {attr} "
+                        f"（{gameserver.CHAR_ATTR_NAMES.get(attr, '?')}）的武器打中，"
+                        f"服务端这边还没有这个状态的模型，只当没有")
         return False
     when = _now() if now is None else now
     until = when + seconds
@@ -3169,9 +3216,8 @@ def _take_weapon_attribute(room, conn, seat_index, now=None):
     if was is not None and was >= until:
         return True                       # 已经慢着，而且慢得更久
     machine.slowed_until = until
-    if was is None or was <= when:
+    if isinstance(machine, BotConn) and (was is None or was <= when):
         # ★ 按**状态翻转**打日志（铁律 10）：慢着的时候被再打一发只是续期。
-        weapon = getattr(conn, "peer_weapon", None)
         machine.log(f"   被带属性的武器打中"
                     f"（{'?' if weapon is None else weapon.get('section', '?')}）："
                     f"{gameserver.CHAR_ATTR_NAMES.get(attr, attr)} "
@@ -3302,8 +3348,9 @@ def _knock_back_seat(room, seat_index, damage, push, source="?"):
         #   「在空中的抛物线轨迹上不停的前后闪」就是每挨一枪多出来的那一脚。
         #   ★ 本来在地上被顶飞的那一批不受影响：`Body.__init__` 对
         #     `on_ground=True` 的身体强制 `air_jumped=False`，带过来还是 False。
-        changed = botmove.Body(body.x, body.y, vx, vy, on_ground=False,
-                               air_jumped=body.air_jumped)
+        # ★ 本人那几格状态（空中操控、上升计时器、走路余量……）原样带着：击退只加
+        #   `[+0x120]`（不含操控那一份）、清踩地位（X_Mod §105）。
+        changed = body.moved(body.x, body.y, vx, vy, on_ground=False)
         machine.body = changed
         if changed != body:
             # ★ 受击是离散速度变化。`rpExplode` 的直接命中包里没有 push，
@@ -3311,7 +3358,6 @@ def _knock_back_seat(room, seat_index, damage, push, source="?"):
             # 下一发固定节拍心跳也会把轨迹来回拉。让受害者的下一格立即把
             # 服务端权威运动状态锚回去（§185）。
             machine.motion_anchor_pending = True
-            machine.motion_blocked_axes = (False, False)
         # ★ 日志里把「push 到底给没给」写清楚 —— 伤害正好 10 的那一发
         #   原版只夹 `v.y`、一点 push 都不给（`0x50f864` 的 `jle`），
         #   不标出来的话日志上写着 push 却看不见位移，下次又要查一轮。
@@ -3319,26 +3365,18 @@ def _knock_back_seat(room, seat_index, damage, push, source="?"):
                        "甲档" if damage > KNOCKBACK_MIN_DAMAGE
                        else "甲档·只夹v.y不给push")
         return
-    # 乙档 · 在地上：横向滑一段，**不离地**。和火团往外铺是同一个例程
-    #   （`0x50d9a7`），所以这里也用同一个模型：那一列上够得着的站立面。
+    # 乙档 · 在地上：横向滑一段，**不离地**。就是走路那个例程 `0x50d9a7(push.x × 3)`，
+    #   用同一格走路余量；踩没踩空下一帧的物理自己看（X_Mod §105）。
     terrain = _terrain(room)
     if terrain is None:
         return
-    span = push[0] * KNOCKBACK_SLIDE
-    x = body.x + span
-    # 够得着的坡度和走路同一条（`botmove.CLIMB_SLOPE`）—— 收方那边这一段
-    # 走的就是走路那个例程。
-    surface = botmove.surface_near(terrain, x, body.y,
-                                   abs(span) * botmove.CLIMB_SLOPE)
-    if surface is None:
+    machine.body = botmove.walk_by(terrain, body, push[0] * KNOCKBACK_SLIDE)
+    if machine.body.x == body.x:
         _log_knockback(room, machine, source, damage, push, body,
                        "乙档", note="滑不过去（那一列没有够得着的站立面）")
         return
-    machine.body = botmove.Body(x, float(surface), on_ground=True)
-    if machine.body != body:
-        # 乙档是在地面上瞬时滑 `push.x * 3`，同样不是普通方向键步进。
-        machine.motion_anchor_pending = True
-        machine.motion_blocked_axes = (False, False)
+    # 乙档是在地面上瞬时滑 `push.x * 3`，同样不是普通方向键步进。
+    machine.motion_anchor_pending = True
     _log_knockback(room, machine, source, damage, push, body, "乙档")
 
 
@@ -3443,48 +3481,113 @@ def _seat_body(room, seat_index):
     if not trail:
         return None
     point = trail[-1]
-    crouched = bool(point[7]) if len(point) > 7 else False
+    # ★ 蹲取**此刻**的（X_Mod §97）：别的机器收到 `rpCrouch` 当场就换姿势，不等下一发心跳；
+    #   死了、离了地各机也自己清（`sync_crouch` 那边跟着清）。轨迹点里那一格是心跳那一刻的。
+    crouched = bool(getattr(conn, "sync_crouch", False))
     if body is not None:
         return (body.x, body.y, crouched)
     return (point[0], point[1], crouched)
 
 
 def _human_direction(keys):
-    """按键掩码 -> 走路方向（`+1` 右 / `-1` 左 / `0` 站着），同 §39 的口径。"""
-    right = bool(keys & botsync.KEY_RIGHT)
-    left = bool(keys & botsync.KEY_LEFT)
-    if right == left:
-        return 0                        # 都没按 / 都按着 = 不走
-    return 1 if right else -1
+    """按键掩码 -> 走路方向（`+1` 右 / `-1` 左 / `0` 站着）。
+
+    ★ 两个都按着 = **左**（`0x5073c2` 先判左键；起跳、空中操控同样左键优先，X_Mod §105）。
+    """
+    if keys & botsync.KEY_LEFT:
+        return -1
+    return 1 if keys & botsync.KEY_RIGHT else 0
+
+
+def _hard_set_human(conn, point, before, who, terrain, scale):
+    """心跳一到就**硬置**成它说的样子（X_Mod §105，和收方 `0x504215` 同一个道理）。
+
+    心跳里的速度是**截断过的整数**（`0x5040dc` / `0x5040f1`），而且 vx 报的是 `[+0x120] + [+0x4c4]`
+    （底速 + 空中操控）的和；他那台上还有几格不上线的状态（操控量 / 步长 / 锁、上升计时器、走路余量、
+    ↓ 计数）。⇒ 位置 / 速度能和上一份外推对上（截断后等于心跳里的数）就沿用外推的精确值，对不上
+    才换成心跳的整数；不上线的那几格从上一份外推带过来。三种心跳能按原版公式直接还原：
+
+    * **踩地 + vy < 0** = 弹跳台刚写了速度、还没挪（X_Mod §104）⇒ 下一帧「走两步」；台子几何算出来的
+      速度截断后对得上就用精确值；
+    * **踩地** ⇒ 速度、操控清零（踩地每帧清）；
+    * 带着 `rpJump`、vy 正好是 trunc(起跳初速) ⇒ 起跳那一帧末发的：初速、¼S、计时器都是已知的。
+    """
+    x, y, jumped = float(point[0]), float(point[1]), int(point[2] or 0)
+    on_ground, vx, vy = bool(point[3]), float(point[4]), float(point[5])
+    keys = point[8] if len(point) > 8 else 0
+    pad = on_ground and vy < 0.0
+    extra = {}
+    if before is not None:
+        extra = dict(rest=before.rest, ctl_lock=before.ctl_lock,
+                     ctl_step=before.ctl_step, rise=before.rise)
+        if int(before.x) == int(x):
+            x = before.x
+        if (int(before.y) == int(y)
+                and before.reported_on_ground == on_ground):
+            y = before.y
+        if not on_ground and not before.reported_on_ground:
+            ctl = before.ctl
+            if int(before.vy) == int(vy):
+                vy = before.vy
+            speed = botmove.control_speed(who, scale)
+            sgn = 1.0 if vx > 0 else (-1.0 if vx < 0 else 0.0)
+            if int(before.vx + before.ctl + 1e-4 * sgn) == int(vx):
+                vx = before.vx
+            else:
+                # 腾空时底速只在起跳 / 撞上时变，逐帧变的是操控量：沿用外推的底速、由心跳报的和反推
+                # 操控量；反推出界（撞过 / 挨炸）才整个换成心跳的值。
+                want = vx + 0.5 * sgn
+                d = _human_direction(keys)
+                if (-speed - 1.0 <= want - before.vx <= speed + 1.0
+                        and not before.ctl_lock):
+                    ctl = max(-speed, min(speed, want - before.vx))
+                    vx = before.vx
+                elif d and not before.ctl_lock:
+                    ctl = d * speed
+                    vx = want - ctl
+                else:
+                    vx, ctl = want, 0.0
+            extra["ctl"] = ctl
+    extra["drop"] = botmove.DROP_HOLD_FRAMES if keys & botsync.KEY_DOWN else 0
+    if pad:
+        extra.update(ctl=0.0, ctl_step=botmove.AIR_CONTROL_STEP)
+        got = botmove.jump_pad_launch(terrain, botmove.Body(x, y), who)
+        if got is not None and int(got.vy) == int(vy):
+            vx, vy = got.vx, got.vy
+    elif not on_ground and jumped and int(vy) == -int(botmove.launch_speed(jumped)):
+        speed = botmove.control_speed(who, scale)
+        extra.update(ctl=0.0, ctl_step=botmove.AIR_CONTROL_STEP, ctl_lock=False,
+                     rise=botmove.rise_ticks(botmove.launch_speed(jumped)))
+        vy = -botmove.launch_speed(jumped)
+        quarter = botmove._f32(speed * botmove.JUMP_VX_RATIO)
+        if vx and int(quarter) == abs(int(vx)) and (
+                before is None or int(before.vx) != int(vx)):
+            vx = quarter if vx > 0 else -quarter
+    return botmove.Body(x, y, vx, vy, on_ground=on_ground and not pad,
+                        air_jumped=bool(jumped == 2 and not on_ground),
+                        pad=pad, **extra)
 
 
 def _advance_humans(room, terrain):
-    """把每个**真人**座位的身体往前推一格（D106）。
+    """把每个**真人**座位的身体往前推一格（D106）—— 推的是**他自己那台客户端上的他**（X_Mod §105）。
 
     ## 为什么要推
 
-    收方对远端角色就是这么干的：`0x507660` 拿心跳里的**按键掩码**替它走，
-    心跳只是每 128 ms 纠一次偏（§39）。服务端替 bot 判命中时用的「人在哪」
-    必须是同一个口径 —— 拿 128 ms 前那一发心跳的坐标去撞此刻的弹体，
-    跳起来 / 被顶飞的那几发根本判不准。
+    判命中要的是「他在他自己那台上在哪」（客户端撞到你、服务端也得撞到）。心跳 8 Hz 一发，中间那几格
+    只能自己推。用的全是**已经收到**的事实（最后一发心跳的位置 / 速度 / 按键、排到的 `rpJump`），
+    不是预测未来（铁律 10），下一发心跳一到就**硬置**回去，误差不累积。拿不到地形就不推。
 
-    旧 §96 是**事后插值**（拿这一帧和上一帧插出中间那几 tick）。它算得准，
-    但要**等下一发心跳到了**才算得出来 —— 而 `rpExplode` 迟到一格就被收方
-    静默丢弃、句柄账从此永久错开（§147）。所以 D106 换成逐格外推：
-    用的全是**已经收到**的事实（最后一发心跳的位置 / 速度 / 按键），
-    不是预测未来（铁律 10），而且下一发心跳一到就**硬置**回去，误差不累积。
+    ## 每一格 = 他那台的一个逻辑帧（`botmove.frame`，和 bot 自己走、可达图同一套）
 
-    ★ 拿不到地形就什么都不做：那时 `_seat_body()` 退回轨迹最后那一点，
-      和 D106 之前一样。
+    走路（1 px 一列、余量跨帧）→ 物理（空中操控 + 上升计时器 + 撞后响应）→ 弹跳台（←/→/↓ 都没按才弹）
+    → 空中操控 / ↓ → 排到这一帧的 `rpJump`（照包里的段号）→ 平台驮人。
+    ① 鱼对角色就是会动的地形格：那一帧**他自己那条鱼**的位置（`terrain.at()`，X_Mod §85）；
+    ② 他按着的键就是心跳里的键（冻住的那几帧他那台整段不读键）；
+    ③ 装备走速照 `GetEquipBonus(座位, 4)` 算（`0x5074ef`，bot 什么都不穿）。
 
-    ## 第 k 格 = 他那台客户端「心跳那一帧之后的第 k − 1 帧」（X_Mod §85）
-
-    硬置那一格（k = 0）是心跳那一帧开头的样子；之后每一格照客户端一帧的顺序走：
-    ① 按那一帧**他自己那条鱼**的位置走一步（`terrain.at()`：鱼对角色就是会动的地形格，
-    站、走、落、撞头全算上）；② 这一帧按过跳的话**走完才离地**（`botmove.takeoff`）；
-    ③ 渲染时平台把这一帧的位移加给站在它上面、还踩着地的人（`0x51ab04`）。
-    以前外推只认静态地形：站鱼背不动被当成原地不动（中位差 7 px）、落到鱼背上穿过去接着掉
-    （中位 26、最大 114 px）、起跳早一格（~20 px）—— 本机也「客户端撞到你、服务端判没中」。
+    ★ 服务端的地形 / 鱼相位和他那台差一点时，外推会把一个站着的人「踩空」。他自己那台说了踩地
+      （心跳 bit2），所以：**这一帧没走动**、或者脚下还有鱼，就信他（`supported`）；走动了而脚下
+      真空了才让他掉 —— 走出崖边就是这样。（子代理 B 两份日志重放：不信他 >10 px 353 → 630。）
     """
     step_ms = botmove.TICK_MS
     for index, seat in enumerate(room.seats):
@@ -3499,73 +3602,78 @@ def _advance_humans(room, terrain):
         point = trail[-1]
         mark = getattr(conn, "sync_trail_seq", 0)
         body = getattr(conn, "sim_body", None)
+        now = _now()
+        # ★ 他此刻的形状（闯关统一尺寸 / 缩小 / 出拳的第 4 个圆，X_Mod §101）—— 腾空扫掠的探针读它。
+        who = chrprops.get(_seat_shape(room, index, now))
+        scale = _speed_scale(conn, now)
+        frozen = scale == 0.0
         if body is None or getattr(conn, "sim_body_mark", None) != mark:
-            # ★ **硬置**：这一发心跳说的位置 / 速度 / 踩没踩地就是事实，
-            #   外推出来的那点误差到此为止（和收方 `0x504215` 同一个道理）。
-            conn.sim_body = botmove.Body(
-                point[0], point[1], vx=point[4], vy=point[5],
-                on_ground=bool(point[3]))
+            conn.sim_body = _hard_set_human(conn, point, body, who, terrain,
+                                            1.0 if frozen else scale)
             conn.sim_body_mark = mark
             conn.sim_step = 0
-            # 心跳正好落在「刚起跳、还没动」那一格：客户端报「腾空、vy 正好是起跳初速、位置没动」，
-            # 上一发还踩地（重力一加就不是整 −20 了）⇒ 下一格照客户端走起跳那一步（X_Mod §87）。
-            previous = trail[-2] if len(trail) > 1 else None
-            conn.sim_launch = bool(
-                not point[3] and point[5] == -botmove.JUMP_SPEED
-                and previous is not None and previous[3])
+            conn.sim_walk_bonus = _seat_bonus(room, index,
+                                              equipbonus.MOVE_SPEED)
+            if not point[3]:
+                # ★ 心跳说他腾空 ⇒ 各机下一帧的角色更新就把蹲清了（`0x4fe23c`：不踩地且
+                #   蹲着 ⇒ `SetCrouch(0)`，不发包，X_Mod §97）。
+                conn.sync_crouch = False
             continue
         if terrain is None:
             continue
-        who = chrprops.get(seat.character_id)
         keys = point[8] if len(point) > 8 else 0
         direction = _human_direction(keys)
-        fast_run, crouched = bool(point[6]), bool(point[7])
+        fast_run = bool(point[6])
+        # ★ 蹲取此刻的（`rpCrouch` 一到就算，离地 / 死了清，X_Mod §97）。
+        crouched = bool(getattr(conn, "sync_crouch", False))
         step = getattr(conn, "sim_step", 0) + 1
         conn.sim_step = step
-        # ① 这一步撞的是那一帧的鱼。
         base_ms = _human_mover_phase(room, terrain, conn)
         view = (terrain if base_ms is None
                 else terrain.at(base_ms + step_ms * (step - 1)))
         moving = view is not terrain
         riding = (view.rider_under(body.x, body.y)
-                  if moving and body.on_ground else None)
-        airborne = not body.on_ground
-        # ★★ 腾空用**客户端那套**物理（X_Mod §87 / D63）：撞上了这一格不动、只改速度，
-        #   落地 / 反弹照抄 `0x50efd2`；起跳后那一格只按速度挪（不加重力、不扫掠）。
-        #   踩地走路仍是 `botmove.tick`（走路那一段客户端没逆，`0x50d9a7`）。
-        launching = getattr(conn, "sim_launch", False)
-        conn.sim_launch = False
-        if launching:
-            body = botmove.client_launch_tick(view, body)
-        elif airborne:
-            body = botmove.client_air_tick(view, body, who, crouched)
-        else:
-            body = botmove.tick(view, body, who, direction=direction,
-                                fast_run=fast_run, crouched=crouched)
-        if moving and airborne and body.on_ground:
-            riding = view.rider_under(body.x, body.y)     # 落地那一下也认一次（`0x50f1f8`）
-        # ② ★★★ 起跳是**事件**（§173）：`rpJump` 记着离心跳第几帧，排到那一帧上，
-        #   而且那一帧先走完这一步再离地（83 次起跳核过，X_Mod §85）。
-        #   晚到的（远程抖动）就在这一格补上，不丢。
+                  if moving and body.reported_on_ground else None)
+        airborne = not body.reported_on_ground
+
+        def supported(x, y, walked, view=view, moving=moving):
+            return not walked or (moving and view.rider_under(x, y) is not None)
+
+        # ★★★ 起跳是**事件**（§173）：`rpJump` 记着离心跳第几帧，排到那一帧上（X_Mod §85），
+        #   那一帧先走完再离地。晚到的（远程抖动）就在这一格补上，不丢。
         jumps = getattr(conn, "sync_jump_ticks", ())
+        due = []
         if jumps:
             due = [stage for ticks, stage in jumps if ticks + 1 <= step]
             if due:
                 conn.sync_jump_ticks = tuple(
                     item for item in jumps if item[0] + 1 > step)
-                for _stage in due:
-                    grounded = body.on_ground
-                    body = botmove.takeoff(body, who, direction, fast_run,
-                                           crouched)
-                    if grounded and not body.on_ground:
-                        conn.sim_launch = True      # 下一格走 `client_launch_tick`
+        result = botmove.frame(
+            view, body, who, direction=direction, fast_run=fast_run,
+            crouched=crouched, want_jump=bool(due),
+            jump_stage=due[0] if due else None,
+            want_drop=bool(keys & botsync.KEY_DOWN), keys=keys, frozen=frozen,
+            speed_scale=1.0 if frozen else scale,
+            walk_bonus=getattr(conn, "sim_walk_bonus", 0), supported=supported)
+        body = result.body
+        for stage in due[1:]:
+            body = botmove.takeoff(view, body, who, direction, scale,
+                                   stage=stage)
+        if moving and airborne and body.reported_on_ground:
+            riding = view.rider_under(body.x, body.y)     # 落地那一下也认一次（`0x50f1f8`）
         # ③ 平台驮人：只驮站在它上面、这一帧末还踩着地的（起跳那一帧已经离地，不驮）。
-        if riding is not None and body.on_ground:
+        if riding is not None and body.reported_on_ground:
             mover, rider = riding
             ax, ay = mover.rider_center(rider, view.t_ms)
             bx, by = mover.rider_center(rider, view.t_ms + step_ms)
-            body = body.moved(body.x + (bx - ax), body.y + (by - ay))
+            body = body.moved(body.x + (bx - ax), body.y + (by - ay), body.vx,
+                              body.vy, on_ground=body.on_ground, pad=body.pad)
         conn.sim_body = body
+        if not body.reported_on_ground:
+            conn.sync_crouch = False          # 离地各机自己清蹲（`0x4fe23c`，X_Mod §97）
+        # ★ 踩进减速胶水：胶水只对「踩上去那台机器的本机角色」生效（V0.3 §105）——
+        #   外推的是他自己那台上的他，所以服务端替他那台判一次（X_Mod §97）。
+        _human_on_slow_mine(room, conn, body, who, crouched, now)
 
 
 def _seat_on_ground(room, seat_index):
@@ -3590,9 +3698,38 @@ def _seat_on_ground(room, seat_index):
         return None
     body = getattr(conn, "sim_body", None)
     if body is not None:
-        return bool(body.on_ground)
+        return bool(body.reported_on_ground)     # 台子刚弹那一帧 `[+0x128]` 还是 1
     point = trail[-1]
     return bool(point[3]) if len(point) > 3 else None
+
+
+def _guard_flag(room, machine, seat_index, source):
+    """射手那台判受害者**在挡**就返回 `EXPLODE_FLAG_GUARD`，否则 0（X_Mod §95）。
+
+    原版在 `0x47ec9a`（直接命中）/ `0x480f02`（近身这一类）置位，排在伤害全部算完
+    之后：伤害源 `vft+0x124` 为真（弹体、`DashDamage`；溅射、火墙是假 —— 那两路
+    不调这里）、受害者是角色、`0x50a0ea` 说在挡。包里的伤害**不变**，收方 `OnHit`
+    见了 `0x80` 才扣 `int(0.25 × 伤害 + 1)`。
+
+    bot 从不发 `rpGuard` ⇒ 只有真人会挡；真人的状态在 `Conn.guarding()`。
+    以前这里整段没有 ⇒ 真人的格挡对 bot 一发都不管用（X_Mod §92 末段）。
+    """
+    if not isinstance(seat_index, int) or not 0 <= seat_index < len(room.seats):
+        return 0
+    seat = room.seats[seat_index]
+    if seat is None or getattr(seat, "is_bot", False):
+        return 0
+    guarding = getattr(seat.conn, "guarding", None)
+    logged = machine.guard_logged
+    if guarding is None or not guarding(_now()):
+        logged.discard(seat_index)
+        return 0
+    if seat_index not in logged:
+        logged.add(seat_index)
+        machine.log(f"   受害者在格挡（{source}）：座位{seat_index} 带 0x80，收方扣 "
+                    f"{chrprops.game().guard_damage_rate:g}×伤害+1；这段格挡里之后"
+                    f"挨的不再逐发打（X_Mod §95）")
+    return EXPLODE_FLAG_GUARD
 
 
 # ---------------------------------------------------------------------------
@@ -3662,15 +3799,40 @@ def _advance_poison(room, ledger):
         _note_damage(room, seat, gameserver.POISON_DAMAGE, at=at)
 
 
+def _status_keys_apply(machine):
+    """收方给这个射手的 `rpFire` 挂状态键吗（`0x4921f4` / `0x492203`，X_Mod §101）。
+
+    两道门看的都是射手**当前拿着的那把**（`[char+0x578]`，由 `rpChangeWeapon` 写，bot 这边是
+    `declared_weapon`），不是这一发弹体自己的武器：`0x50a195` = 那把的 `+0x9c`「捡来的临时枪」
+    （`ForceTime` / `ForceCount` > 0，`0x489a2b`）、`0x50a1be` = 那把的 `TotemId`。
+    ★ 以前读成「这一发的武器带 `AutoFireCount` / `TotemId`」—— 拿着核弹打的也放大、分裂弹的
+      碎片按碎片自己的武器判，都不对。本机开火那一侧的三连射门（`0x515365`）同一套。
+    """
+    held_id = getattr(machine, "declared_weapon", None)
+    held = None if held_id is None else weapondata.get(held_id)
+    return not (held is not None
+                and (held.is_temporary or held.get("totem_id")))
+
+
 def _bullets_poisoned(machine, weapon):
     """bot 这一发打出去的子弹带不带毒（X_Mod §93）。
 
     收方处理 `rpFire` 时按**它自己那份**射手的属性 10 给每一颗挂毒（`0x492210`），
-    唯独武器带 `TotemId`（`0x50a1be`）或 `AutoFireCount`（`0x50a195`）的不挂 ——
-    后者全表只有训练 / 特殊枪有，产物里没这一格，按没有算。
+    射手手上是临时枪 / 图腾枪的不挂（`_status_keys_apply`）。
     """
     return (gameserver.POISON_MAGAZINE_ATTR in machine.magazine_attrs
-            and not weapon.get("totem_id"))
+            and _status_keys_apply(machine))
+
+
+def _triple_rounds(machine):
+    """这一发 `rpFire` 打几轮：三重射击 ⇒ 3（`0x515365 lea esi,[esi+esi*2]`，弹数 = SpreadFrags × 3），否则 1。
+
+    本机开火那一侧的门和收方一样：手上是临时枪 / 图腾枪就不 ×3（X_Mod §101）。
+    """
+    if (gameserver.TRIPLE_SHOT_ATTR in machine.magazine_attrs
+            and _status_keys_apply(machine)):
+        return TRIPLE_SHOT_ROUNDS
+    return 1
 
 
 def _clear_seat_statuses(room, seat_index):
@@ -3678,7 +3840,7 @@ def _clear_seat_statuses(room, seat_index):
 
     客户端两处都是整张属性表清掉、**不发 `0x040d`**：`Die` `0x4ffd1c`、
     `Respawn` `0x503094`（清 0..20 再挂状态 0）。服务端替它记的那几份跟着清：
-    中毒、护盾、反射、回复剂、毒弹弹匣；bot 的按发数状态（强力 / 三连 / 毒弹）
+    中毒、护盾、反射、回复剂、毒弹弹匣；bot 的按匣数算的状态（强力 / 三连 / 毒弹）
     也清掉 —— 不清的话 bot 复活后还是两倍伤害、两倍弹体，别人屏幕上却是普通弹。
     """
     ledger = _health(room)
@@ -3691,8 +3853,12 @@ def _clear_seat_statuses(room, seat_index):
         getattr(quest, "poison_magazine", set()).discard(seat_index)
     seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
     machine = None if seat is None else seat.conn
+    if machine is not None:
+        # 加速 / 减速 / 冰冻也在那张属性表里（X_Mod §97）。
+        machine.hasted_until = machine.slowed_until = machine.frozen_until = None
+        machine.shrunk_until = machine.jab_until = None
     if isinstance(machine, BotConn) and machine.magazine_attrs:
-        machine.log(f"   死了：身上的按发数状态 {sorted(machine.magazine_attrs)}"
+        machine.log(f"   死了：身上的按匣数算的状态 {sorted(machine.magazine_attrs)}"
                     f" 跟着清掉（客户端 `Die` 整表清，X_Mod §93）")
         machine.magazine_attrs = {}
 
@@ -3780,6 +3946,12 @@ def _refresh_health(room):
         if lying and not ledger.lying.get(index, False):
             # ★ 刚倒下：`Character::Die` 把属性表整个清掉（X_Mod §93）。
             _clear_seat_statuses(room, index)
+            # ★ `Die`（`0x4ffc4a` / `0x4ffc50`）把蹲和格挡开关一起清 0，各机自己清、
+            #   不发包；格挡的过渡计时器不动（X_Mod §95 / §97）。复活后他还按着键，
+            #   他那台会再发一发。★ 只在倒下这一下清，复活那一下不清：那一发可能先到。
+            if not getattr(seat, "is_bot", False) and seat.conn is not None:
+                seat.conn.sync_guard = False
+                seat.conn.sync_crouch = False
         if ledger.note_lying(index, lying):
             # ★ `Character::Respawn`：满血（`0x503063`）+ 属性表清空 +
             #   状态 0 锁 2 秒（X_Mod §92 / §93）；夺分里被敌人打死的再挂
@@ -4166,14 +4338,15 @@ def _use_held_item(room, machine, seat_index):
     #    一份 —— 真人用的时候走的是 `on_use_item`，bot 走的是这里，
     #    漏掉的话 bot 放的烟雾罩不住别的 bot、放的糊屏也不影响谁（§121）。
     machine.note_area_item(item_id, seat_index, quest)
-    # ★★★ 按发数算的那三条状态：服务端得**自己开始数**（§117）。
+    # ★★★ 按匣数算的那三条状态：服务端得**自己开始数**（§117 / X_Mod §95）。
     #     有 `Time` 的客户端会自己撤，只有这三条要人补 `0x040d`。
     entry = gameserver.MAGAZINE_STATUS.get(item_id)
     if entry is not None:
-        attr_id, rounds = entry[0], entry[1]
-        machine.magazine_attrs[attr_id] = rounds
+        attr_id, magazines = entry[0], entry[1]
+        machine.magazine_attrs[attr_id] = magazines
         machine.log(f"   状态 {gameserver.CHAR_ATTR_NAMES.get(attr_id, attr_id)}"
-                    f"（属性 {attr_id}）挂上了，还能打 {rounds} 发")
+                    f"（属性 {attr_id}）挂上了，打空 {magazines} 匣为止"
+                    f"（手上这匣还剩 {machine.rounds_left or '满'} 发）")
     return True
 
 
@@ -4207,7 +4380,7 @@ def _item_slot_to_use(room, seat_index, held):
 
 
 def _magazine_ratios(machine):
-    """身上那些按发数算的状态叠出来的 `(伤害倍率, 弹体大小倍率)`（§117）。
+    """身上那些按匣数算的状态叠出来的 `(伤害倍率, 弹体大小倍率)`（§117）。
 
     强力射击是 `DamageRatio=2.0` / `SizeRatio=2.0`，另外两条都是 1。
     ★ **`SizeRatio` 非做不可**：每台客户端都会把 bot 那颗弹体照着放大，
@@ -4224,11 +4397,37 @@ def _magazine_ratios(machine):
     return (damage, size)
 
 
-def _spend_magazine_shots(room, machine, seat_index):
-    """开了一发 —— 身上那些按发数算的状态各减一，数完的**撤掉**（§117）。
+def _projectile_ratios(machine, weapon):
+    """这一颗弹体吃射手身上的强力射击吗：`(伤害倍率, 弹体大小倍率)`（§117 / X_Mod §98）。
+
+    收方处理每一发 `rpFire` 时按**它那份**射手属性给每颗弹体挂键（`0x492210` 起）：属性 7 ⇒ 键 5
+    （命中时 ×`DamageRatio`）+ `0x41842a(弹体, SizeRatio)` 放大。射手手上是临时枪 / 图腾枪的整段
+    跳过（`_status_keys_apply`）—— 和毒弹那条（`_bullets_poisoned`）同一道门。
+    **不分是不是碎片**：分裂弹的碎片是射手重发的 `rpFire`，照样挂（碎片的 `rpFire` 数量恒 1，
+    `0x47ca15 push 1` —— 碎片不吃三连射）。
+    """
+    if not _status_keys_apply(machine):
+        return (1.0, 1.0)
+    return _magazine_ratios(machine)
+
+
+def _holding_item_weapon(machine, weapon):
+    """这一发是不是用**捡来的那把枪**打的（持枪器 `[+0x2c] > 0` 那种状态，V0.3 §115）。"""
+    held = machine.item_weapon
+    return held is not None and weapon is not None and weapon.id == held.id
+
+
+def _magazine_emptied(room, machine, seat_index):
+    """打空了一匣 —— 身上那些按匣数算的状态各减一，数完的**撤掉**（§117 / X_Mod §95）。
 
     原版是持有者那台机器数的：`Status.ini` 只写了 `Magazine`、没有 `Time`，
-    `UseItemEffect` 给的时长是 −1，属性表每帧扫过去时靠这个计数收尾，
+    `UseItemEffect` 给的时长是 −1。★ 减的地方只有一处 —— `0x509feb`（属性 6 / 7 / 10
+    各减 1），由 `MyCharacter` 开火后的 `0x517383(…, 1)` 在 **`0x48bac2` 返回 0**
+    （弹匣打空、开始换弹）那一下调；`Magazine=3` 因此是**打空 3 匣**，不是 3 发
+    （会话 38 以前按发数，一匣 1 发的枪碰巧一样，左轮 6 发一匣就差出 15 发）。
+    这些**不**减：捡来的那把枪（`0x48bac2` 在 `[+0x2c] > 0` 时恒返回 1）、
+    `ExcludeStatusItemMagazine=1` 的武器（`[记录+0x21c]`；全表只有 `[ch110-03a]`，
+    是碎片、bot 不会直接开它，所以没读进武器表）。
     收尾的那一下顺手发一发 `0x040d`（`Character::RemoveAttrEffect` 里
     `if ([char+0x2ac] == 我的座位)` 那一句，§200）。
 
@@ -4244,7 +4443,7 @@ def _spend_magazine_shots(room, machine, seat_index):
             continue
         del machine.magazine_attrs[attr_id]
         name = gameserver.CHAR_ATTR_NAMES.get(attr_id, attr_id)
-        machine.log(f"   状态 {name}（属性 {attr_id}）打完了，撤掉")
+        machine.log(f"   状态 {name}（属性 {attr_id}）打空了最后一匣，撤掉")
         try:
             machine.battle_broadcast(
                 gameserver.build_game(
@@ -4330,28 +4529,49 @@ def _step_on_slow_mine(room, machine, seat_index, now):
     body = machine.body
     if quest is None or body is None:
         return False
+    mine = _touched_slow_mine(quest, chrprops.get(machine.character_id),
+                              body, machine.crouched, now)
+    if mine is None:
+        return False
+    was = machine.slowed_until
+    machine.slowed_until = now + gameserver.SLOWED_SECONDS
+    if was is None or was <= now:
+        machine.log(
+            f"   踩进减速胶水 @ ({mine[0]:.0f}, {mine[1]:.0f})：走速 × "
+            f"{gameserver.SLOWED_SPEED_RATIO}，"
+            f"{gameserver.SLOWED_SECONDS:g} 秒")
+        _broadcast_status(room, machine, seat_index,
+                          gameserver.STATUS_ITEM_SLOWED, "踩到胶水")
+    return True
+
+
+def _touched_slow_mine(quest, character, body, crouched, now):
+    """这个身体此刻碰到的那一摊（已布好、没过期）减速胶水；没碰到返回 `None`。"""
     mines = _live_slow_mines(quest, now)
     if not mines:
-        return False
-    character = chrprops.get(machine.character_id)
-    circles = character.circles(body.x, body.y, machine.crouched)
+        return None
+    circles = character.circles(body.x, body.y, crouched)
     reach = gameserver.SLOW_MINE_RADIUS
     for mine in mines:
         mx, my = mine[0], mine[1]
-        if not any(math.hypot(mx - cx, my - cy) <= r + reach
-                   for cx, cy, r, _region in circles):
-            continue
-        was = machine.slowed_until
-        machine.slowed_until = now + gameserver.SLOWED_SECONDS
-        if was is None or was <= now:
-            machine.log(
-                f"   踩进减速胶水 @ ({mx:.0f}, {my:.0f})：走速 × "
-                f"{gameserver.SLOWED_SPEED_RATIO}，"
-                f"{gameserver.SLOWED_SECONDS:g} 秒")
-            _broadcast_status(room, machine, seat_index,
-                              gameserver.STATUS_ITEM_SLOWED, "踩到胶水")
-        return True
-    return False
+        if any(math.hypot(mx - cx, my - cy) <= r + reach
+               for cx, cy, r, _region in circles):
+            return mine
+    return None
+
+
+def _human_on_slow_mine(room, conn, body, character, crouched, now):
+    """真人外推出来的身体碰到胶水 ⇒ 他自己那台给他挂减速 4 秒（X_Mod §97）。
+
+    只记服务端外推用的那一格（`conn.slowed_until`），**不发包**：他那台自己挂、别的机器
+    靠他的心跳看他走得慢，和 bot 那条（没有本机、必须补广播）正好相反。
+    """
+    quest = None if room is None else room.quest
+    if quest is None or _touched_slow_mine(quest, character, body, crouched,
+                                           now) is None:
+        return False
+    conn.slowed_until = now + gameserver.SLOWED_SECONDS
+    return True
 
 
 #: ★ `TotemValueMaxModeRatio` 只在这个游戏模式里生效（`0x488631 cmp eax, 3`
@@ -4506,47 +4726,55 @@ def _heal_humans_in_totems(room):
             _heal_in_totems(room, index, body[0], body[1], now)
 
 
-def _take_freeze(room, machine, seat_index, now):
-    """别人放的冰冻把 bot 冻住（V0.3 §106）。冻上了返回 `True`。
+def _settle_freeze_bursts(room, now):
+    """别人放的冰冻把圈里的人冻住（V0.3 §106 / X_Mod §97）。每一发**按房间结算一次**。
 
-    原版的判据整条都在 `UseItemEffect` 的 10310 分支（`0x5087b6`）里：
+    原版的判据整条都在 `UseItemEffect` 的 10310 分支（`0x5087b6`）里，每台机器对**场上每个角色**
+    各判一遍：
 
         不是自己（0x5087d1）
-        [char+0x2b4] == 0（0x5087d9）
+        [char+0x2b4] == 0（0x5087d9，没躺着）
         **队伍号不同**（[vft+0x144]，0x5087e6）
         dist < Range（0x50884a；Range 来自 `Item.ini` 的 `[Freezer] Range=300`）
 
     冻多久看 `Status.ini` 第 12 条：`Time=2.0`。
 
-    ★ 每一发冰冻只结算一次：结算完就把它从 `freeze_bursts` 里摘掉
-    （那张表是**给 bot 用的待办**，不是场上的对象）。
+    ★ 以前这一段挂在**每个 bot 自己**那一格里，第一个 bot 判完就把整张 `freeze_bursts` 摘光了
+    ⇒ 房里有两个以上 bot 时后面的永远冻不住（客户端上它们是被冻住的）。现在房间每格结算一次、
+    对每个座位都判：bot 照旧压走速 + 广播 10601（不广播别人屏幕上照跑）；真人只记服务端外推
+    用的那一格（他自己那台本来就冻住了他，心跳里的按键会变成 0）。
     """
-    quest = room.quest
-    body = machine.body
-    if quest is None or body is None or not getattr(quest, "freeze_bursts", None):
-        return False
-    my_seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
-    caught = False
-    for burst in list(quest.freeze_bursts):
+    quest = None if room is None else room.quest
+    bursts = getattr(quest, "freeze_bursts", None)
+    if not bursts:
+        return []
+    caught = []
+    teams = room.team_layout() == lobby_module.TEAM_LAYOUT_TEAMS
+    for burst in list(bursts):
+        bursts.remove(burst)
         bx, by, owner, _when = burst
-        quest.freeze_bursts.remove(burst)
-        if owner == seat_index:
-            continue                                  # 不冻自己
-        other = (room.seats[owner]
-                 if 0 <= owner < len(room.seats) else None)
-        if (my_seat is not None and other is not None
-                and my_seat.team == other.team
-                and room.team_layout() == lobby_module.TEAM_LAYOUT_TEAMS):
-            continue                                  # 队伍号相同不冻
-        if math.hypot(bx - body.x, by - body.y) >= gameserver.FREEZER_RANGE:
-            continue
-        machine.frozen_until = now + gameserver.FROZEN_SECONDS
-        machine.log(f"   被冻住 @ ({bx:.0f}, {by:.0f})："
-                    f"{gameserver.FROZEN_SECONDS:g} 秒不能动")
-        # ★ 和胶水同一条路（§109）：不广播的话别人屏幕上 bot 照跑不误。
-        _broadcast_status(room, machine, seat_index,
-                          gameserver.STATUS_ITEM_FREEZED, "被冰冻")
-        caught = True
+        user = room.seats[owner] if 0 <= owner < len(room.seats) else None
+        for index, seat in enumerate(room.seats):
+            if seat is None or seat.conn is None or index == owner:
+                continue                              # 不冻自己
+            if teams and user is not None and seat.team == user.team:
+                continue                              # 队伍号相同不冻
+            if _lying_dead(room, index):
+                continue                              # `[char+0x2b4]` 躺着的不冻
+            body = _seat_body(room, index)
+            if body is None:
+                continue
+            if math.hypot(bx - body[0], by - body[1]) >= gameserver.FREEZER_RANGE:
+                continue
+            conn = seat.conn
+            conn.frozen_until = now + gameserver.FROZEN_SECONDS
+            caught.append(index)
+            if isinstance(conn, BotConn):
+                conn.log(f"   被冻住 @ ({bx:.0f}, {by:.0f})："
+                         f"{gameserver.FROZEN_SECONDS:g} 秒不能动")
+                # ★ 和胶水同一条路（§109）：不广播的话别人屏幕上 bot 照跑不误。
+                _broadcast_status(room, conn, index,
+                                  gameserver.STATUS_ITEM_FREEZED, "被冰冻")
     return caught
 
 
@@ -4747,23 +4975,42 @@ def _totem_goal(room, machine, seat_index):
 
 
 def _speed_scale(machine, now):
-    """bot 这一帧的走速倍率（`Status.ini` 的 `SpeedRatio`）。
+    """这个角色这一帧的走速倍率 —— bot 自己走、服务端外推真人都用它（X_Mod §97）。
 
-    冻住的时候是 **0** —— `Freezed` 那一条没有 `SpeedRatio`，它是整个
-    「动不了」（`Status.ini` 第 12 条只有 `Time=2.0`）。
+    照抄客户端 `Character vft+0x124`（`0x4fec46`）：
+
+        r = 1.0
+        有属性 2（加速）  ⇒ r = Status[2].SpeedRatio = 2.0     ← ★ 赋值，不是乘
+        有属性 14（减速） ⇒ r *= Status[14].SpeedRatio = 0.3
+
+    冻住的时候是 **0** —— `Freezed` 那一条没有 `SpeedRatio`，它是本机那台把读方向键整段跳过
+    （`0x515639` → `0x5157bb`），人自然走不动也起不了跳。
+
+    到期的那一格顺手清掉（和原版到点撤属性同一个意思）。`machine` 可以是 `BotConn`，
+    也可以是真人的 `Conn`（三格在两边同名）。
+    ★ 按 f32 算（主线程 24 位精度，X_Mod §105）：加速又减速是 `f32(2.0 × 0.3f)` = 0.6000000238，
+      不是 0.6 —— 走路逐列推进，差这一点 10 格就差出一列。
     """
-    frozen = machine.frozen_until
+    frozen = getattr(machine, "frozen_until", None)
     if frozen is not None:
         if now < frozen:
             return 0.0
         machine.frozen_until = None
-    until = machine.slowed_until
-    if until is None:
-        return 1.0
-    if now >= until:
-        machine.slowed_until = None
-        return 1.0
-    return gameserver.SLOWED_SPEED_RATIO
+    ratio = 1.0
+    hasted = getattr(machine, "hasted_until", None)
+    if hasted is not None:
+        if now < hasted:
+            ratio = botmove._f32(gameserver.HASTE_SPEED_RATIO)
+        else:
+            machine.hasted_until = None
+    until = getattr(machine, "slowed_until", None)
+    if until is not None:
+        if now < until:
+            ratio = botmove._f32(ratio
+                                 * botmove._f32(gameserver.SLOWED_SPEED_RATIO))
+        else:
+            machine.slowed_until = None
+    return ratio
 
 
 def _battle_bodies(room, shooter_seat, group=None, include_self=False):
@@ -4806,8 +5053,55 @@ def _battle_bodies(room, shooter_seat, group=None, include_self=False):
         body = _seat_body(room, index)
         if body is None:
             continue
-        out.append((index, body[0], body[1], body[2], seat.character_id))
+        out.append((index, body[0], body[1], body[2], _seat_shape(room, index)))
     return out
+
+
+def _seat_shape(room, index, now=None):
+    """这个座位此刻的**形状键**（给 `chrprops.get()`，X_Mod §101）：什么都不沾就是角色 id；
+    否则 `(角色 id, 闯关统一尺寸, 缩小 ×0.6, 出拳朝向)`。
+
+    客户端 `0x4fc230` 摆圆时依次套：闯关模式（GameContext vft+0x20）的统一尺寸 → 属性 4 的 ×0.6 →
+    出拳计时器在跑时的第 4 个圆。撞子弹（`0x50f410`）、腾空扫掠（`0x50e759`）读的都是这张形状表。
+    """
+    seat = room.seats[index] if 0 <= index < len(room.seats) else None
+    if seat is None:
+        return 0
+    conn = seat.conn
+    now = _now() if now is None else now
+    quest = (getattr(room, "session_type", None)
+             == gameserver.SESSION_TYPE_QUEST)
+    until = getattr(conn, "shrunk_until", None)
+    shrunk = until is not None and now < until
+    until = getattr(conn, "jab_until", None)
+    jab = (int(getattr(conn, "jab_dir", 0) or 0)
+           if until is not None and now < until else 0)
+    if not (quest or shrunk or jab):
+        return seat.character_id
+    return (seat.character_id, quest, shrunk, jab)
+
+
+def _in_melee_motion(room, seat_index, now=None):
+    """这个座位正在**出拳 / 冲刺攻击**吗 —— 那一段火墙烧不到他（`0x4ff21a`，X_Mod §101）。
+
+    `0x4ff21a` 对 StaticDamage 类（火墙 / 激光 / 挥砍）：出拳计时器在跑 ⇒「不碰撞」；冲刺计时器在跑
+    且对象 `[+0x304]` = 1（火墙 `0x4825ac push 1`）⇒ 也不碰撞。bot 自己的冲刺看 `dash_swing`，
+    真人看他发的 `0x0008` / 冲刺包记下的那一段。
+    """
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    conn = None if seat is None else seat.conn
+    if conn is None:
+        return False
+    now = _now() if now is None else now
+    if getattr(conn, "dash_swing", None) is not None:
+        return True
+    until = getattr(conn, "jab_until", None)
+    if until is not None and now < until:
+        return True
+    action = getattr(conn, "motion_action", None)
+    gen = relayserver.epoch_state(conn).gen if action is not None else None
+    return (action is not None and action[0] == gen and now < action[1]
+            and getattr(conn, "motion_kind", None) == "dash")
 
 
 def _hostile_targets(room, seat_index):
@@ -4898,7 +5192,16 @@ BOT_DECISION_TICKS = max(1, int(round(botmove.TICKS_PER_SECOND
 
 
 def _character_of(machine):
-    return chrprops.get(machine.character_id)
+    """这个 bot 的角色（规划 / 物理用）：闯关模式里是统一尺寸那一份（`chrprops.QUEST_SIZES`，X_Mod §101）。
+
+    缩小道具只管 8 秒，规划不跟着换（按原尺寸算只会更保守）；物理和判命中另外按此刻的形状取
+    （`_seat_shape`）。
+    """
+    lookup = getattr(machine, "lobby_room", None)
+    room = lookup() if lookup is not None else None
+    quest = (getattr(room, "session_type", None)
+             == gameserver.SESSION_TYPE_QUEST)
+    return chrprops.get(machine.character_id).shaped(quest=quest)
 
 
 # ---------------------------------------------------------------------------
@@ -6607,12 +6910,20 @@ def _landing_ok(terrain, landing, who):
 
 def _walks_into_a_crack(terrain, body, who, direction, fast_run, crouched,
                         scale):
-    """照这个方向走一步，会不会踩进一条**塞不进去**的缝（V0.3 §152）。"""
+    """照这个方向走一步，会不会踩进 / 掉进一条**塞不进去**的缝（V0.3 §152）。
+
+    ★ 客户端走路逐列推进（X_Mod §105）：窄缝上方那几列照样水平走过去，这一帧停在缝上方就
+      踩空、竖直掉进去（上次落地上了锁、没有空中操控）⇒ 踩空了就推到落地再问塞不塞得下。
+    """
     step = botmove.tick(terrain, body, who, direction=direction,
                         fast_run=fast_run, crouched=crouched,
                         speed_scale=scale)
-    if not step.on_ground or step.x == body.x:
-        return False                   # 踩空/撞墙自有上面那两条判据管
+    if step.on_ground and step.x == body.x:
+        return False                   # 撞墙自有 `blocked` 那条判据管
+    if not step.on_ground:
+        step = botmove.settle(terrain, step, who)
+        if not step.on_ground or botmove.out_of_world(terrain, step):
+            return False               # 掉进无底洞归 `bottomless_ahead` 管
     return not botmove.fits(terrain, step.x, step.y, who)
 
 
@@ -7097,7 +7408,6 @@ def _leash_warp(room, machine, seat_index, terrain, spot, behind, why):
         #   收方要等到下一发固定节拍心跳（最多 128 ms）才知道人换地方了，
         #   在那之前还照着旧速度往老位置外推。和受击同一类事实。
         machine.motion_anchor_pending = True
-        machine.motion_blocked_axes = (False, False)
         _clear_navigation(machine)
         machine.leash_mark = _quest_forward(terrain) * body.x
         # 「他跑了多远」从落点重新起算：瞬移完还在掉队的话，得再给他
@@ -7189,7 +7499,8 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
     machine.press_dir = 0
     if terrain is None:
         return None
-    who = _character_of(machine)
+    # ★ 此刻的形状（闯关统一尺寸 / 缩小 ×0.6，X_Mod §101）：腾空扫掠的探针、弹跳台的偏置读它。
+    who = chrprops.get(_seat_shape(room, seat_index, now))
     if machine.body is None:
         # ★★★ 第一格的锚是**这个座位该用的地图出生点**（§91）——
         #   和真人走同一套分配规则，所以客户端自己算出来的位置和这边一致，
@@ -7232,139 +7543,55 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
     if (not before.on_ground and machine.nav_double_jump
             and botmove.at_apex(before)):
         want_jump = True
-    # ★ 用 `step()` 而不是 `tick()`：报心跳要多知道一件事 —— 这一格到底跑没跑
-    #   过空中积分（`air_stepped`）。见 `_reportable_speed()`（§185）。
-    machine.body, air_stepped = botmove.step(
+    # ★★ 本人那台的一帧（X_Mod §105）：走路 → 物理 → 弹跳台 → 空中操控 / ↓ → 起跳。
+    #   冻住（`_speed_scale` 给 0）= 那台整段不读键（`0x515639`）：不走、不跳、空中操控原样。
+    frozen = speed_scale == 0.0
+    result = botmove.frame(
         terrain, before, who, direction=direction, fast_run=fast_run,
         crouched=crouched, want_jump=want_jump, want_drop=want_drop,
-        speed_scale=speed_scale)
+        speed_scale=1.0 if frozen else speed_scale, frozen=frozen)
+    machine.body = result.body
     _apply_motion_constraint(room, machine, terrain, now)
-    left_ground = before.on_ground and not machine.body.on_ground
+    left_ground = (before.reported_on_ground
+                   and not machine.body.reported_on_ground)
     if machine.nav_path and left_ground:
         machine.nav_started = True
-    jumped = 0
-    if want_jump:
-        if left_ground:
-            jumped = 1
-        elif machine.body.air_jumped and not before.air_jumped:
-            # ★ 第二段跳（§124）—— `rpJump` 的段号要报 2，不是 1。
-            jumped = 2
-            # ★★★ **欠的这一跳还完了，旗子当场作废**（V0.3 §179）。
-            #   它原来只在落地那一格清（`_walk_to()` / `_clear_navigation()`），
-            #   于是「这一段还欠不欠第二跳」这件事实际上是由**两个**变量
-            #   共同表达的：`nav_double_jump` 和 `body.air_jumped`。
-            #   任何一处把 `air_jumped` 弄丢（§179 那个击退重建就是），
-            #   还举着的旗子立刻又按一次 —— 一段腾空里连跳 5 次。
-            #   ⇒ 谁还清谁作废，别让不变式跨两个变量。
-            machine.nav_double_jump = False
+    jumped = result.jumped
+    if jumped == 2:
+        # ★★★ **欠的这一跳还完了，旗子当场作废**（V0.3 §179）：「这一段还欠不欠第二跳」
+        #   只许由一个变量表达，谁还清谁作废。
+        machine.nav_double_jump = False
+    if want_jump and not machine.body.reported_on_ground \
+            and machine.intent is not None:
         # ★★ 跳的意图**用掉就作废**：不清的话下一格还举着 `want_jump=True`，
         #    而腾空中按跳 = 第二段跳（§124），白白多跳一段。
-        if not machine.body.on_ground and machine.intent is not None:
-            machine.intent = (direction, False, want_drop, fast_run)
+        machine.intent = (direction, False, want_drop, fast_run)
     body = machine.body
-    # ★ 顺序不能反：先算**报出去的**那对速度，再拿它去记运动锚 —— 锚的
-    #   「这一轴被钉住了」必须和线上真正报出去的东西是同一件事（§185）。
-    vx, vy = _reportable_speed(before, body, air_stepped)
-    _note_motion_transition(machine, before, body, (vx, vy), jumped)
-    return (body.x, body.y, jumped, body.on_ground, vx, vy,
-            bool(fast_run), crouched)
+    _note_motion_transition(machine, before, result)
+    # ★★ 心跳报的就是本人那台发的那几格（X_Mod §102 / §104）：vx = `[+0x4c4] + [+0x120]`、
+    #   vy = `[+0x124]`（组包时截断），地面位 = `[+0x128]`（台子刚弹、还没挪的那一帧报踩地 +
+    #   vy < 0）。V0.3 §181 那条「被地形钉住的一轴报 0」是给旧的脚点模型打的补丁 —— 客户端
+    #   撞上了本来就只改速度、位置不动，速度就是实话。
+    return (body.x, body.y, jumped, body.reported_on_ground, body.reported_vx,
+            body.vy, bool(fast_run), crouched)
 
 
-def _note_motion_transition(machine, before, body, reported, jumped=0):
+def _note_motion_transition(machine, before, result):
     """记下收方不能仅靠上一份速度连续外推出来的运动状态（§185）。
 
-    自由飞行严格是 ``vy += GRAVITY; pos += velocity``，不需要额外发包。
-    这里只认离散的**状态事实**，没有距离或时间阈值：
-
-    * 一/二段跳、踩空、弹跳台、落地会翻转跳段或 ``on_ground``；
-    * 撞顶把本应继续上升的 ``vy`` 截成 0；
-    * 撞墙时模拟保留速度、位置却被钉住，线上速度由
-      :func:`_reportable_speed` 报 0。进入和离开这种状态各锚一次。
-
-    ★★ ``reported`` 是这一格**真正报出去的**那对速度。「这一轴被钉住了」
-    就定义成 **报出去的和模拟里的不一样** —— 而不是在这儿另拿一套几何判据
-    重算一遍。两处各判各的时出过错：贴着墙起跳那一格，`_reportable_speed()`
-    因为速度是本格新生的而原样报，这里却按「位置没动」记成钉住，于是下一格
-    真的报 0 时反而看不到翻转、不补锚。**判据只许有一份。**
+    自由飞行严格是 ``vy += GRAVITY; pos += velocity``，不需要额外发包。这里只认 `botmove.frame()`
+    说出来的离散**状态事实**，没有距离或时间阈值：起跳、地面位翻转（踩空 / 落地 / 台子弹起）、
+    腾空那一步撞上了东西（上升期撞顶 / 反弹 / 没踩住）。
 
     受击发生在别的 bot 推进弹体时，已经早于这里改掉 ``machine.body``，
     因此由 :func:`_knock_back_seat` 直接置同一面旗。
     """
-    airborne = not body.on_ground
-    reported_vx, reported_vy = reported
-    blocked_axes = (reported_vx != body.vx, reported_vy != body.vy)
-    blocked_changed = blocked_axes != machine.motion_blocked_axes
-
-    expected_vy = before.vy + botmove.GRAVITY
-    expected_x = before.x + before.vx
-    expected_y = before.y + expected_vy
-    hit_ceiling = (not before.on_ground and airborne and before.vy < 0.0
-                   and body.vy == 0.0
-                   and (expected_vy != 0.0
-                        or body.x != expected_x or body.y != expected_y))
-
-    if (jumped or before.on_ground != body.on_ground
-            or hit_ceiling or blocked_changed):
+    body = result.body
+    if (result.jumped or result.padded
+            or before.reported_on_ground != body.reported_on_ground
+            or result.outcome in (botmove.BUMPED, botmove.BOUNCED,
+                                  botmove.STOPPED)):
         machine.motion_anchor_pending = True
-    machine.motion_blocked_axes = blocked_axes
-
-
-def _reportable_speed(before, body, air_stepped=True):
-    """报进心跳的那对速度 —— **被地形挡住的那一轴要报 0**（V0.3 §181）。
-
-    `air_stepped` 是 `botmove.step()` 的第二个返回值：**这一格跑没跑过空中
-    积分**。它是「位置没动 ⇒ 被地形钉住」这条推理的**前提**，见下面第三节。
-
-    ## 为什么不能直接报 `body.vx / body.vy`
-
-    收方对**腾空**角色是拿包里这两格**逐帧积分推位置**的
-    （`0x5073a6` 腾空 → `0x50767e` 累速度 → `0x507773` → `0x50d404` 推位置；
-    `packet_api §5.6` 的原话：「腾空那一段的水平位移**完全由它决定**，
-    方向键插不上手」）。所以「**位置钉住 + 速度非 0**」这一对是收方**没法
-    复现**的状态：它会照着速度把角色一路推出去（一发心跳 4 帧 ≈ 最多 48 px），
-    下一发心跳再把它拽回来 —— **每 128 ms 一次的锯齿**。
-
-    而服务端腾空撞墙那一支恰恰产出这一对（`botmove._air_tick`）：
-
-        # 真的够不着 = 墙。这一 tick 横向过不去，**速度留着**
-        nx = body.x        ← 位置钉住，vx 却原样带进 Body
-
-    实机（2026-09-04 22:43 那一局，`Iceria00`）最干净的现场是图左边界：
-    座位 4 连着 5 发心跳报 `x=0 v=(-9, …)` —— 位置一动不动、速度一直说往左。
-
-    ## 同一局同一把尺子（腾空段里「位置钉住却报着速度」的发数占比）
-
-        真人座位 0   2.4%          ← 真客户端的位置和速度出自同一个积分器，
-        bot 1~5      3.9% ~ 17.3%     撞墙时碰撞响应会把那一轴收掉
-
-    ## 为什么只改**报**的这一份，不改模拟
-
-    `_air_tick` 留着 `vx` 是 §95 用实机日志两轮收口的：撞上只是这一 tick
-    不挪，**升过去下一 tick 接着走** —— 贴着墙往上飞、翻过高处那个沿的
-    弧线全靠它，而 `botnav` 的可达图就是拿这套物理建的边。
-    ⇒ 模拟一个字不动，只让**包**说实话。判据是几何事实（这一 tick 那一轴
-    的位移到底是不是 0），不是阈值。
-    """
-    if body.on_ground:
-        return body.vx, body.vy         # §35：踩地时本来就恒 0
-    if not air_stepped:
-        # ★★★★★ **这一格根本没按空中速度挪过位置，位置没动当然不是被钉住**
-        #   （§185）。
-        #
-        # 弹跳台在一格的末尾把速度写进角色，位置要到下一格才开始挪 ——
-        # 原版 `JumpingObj::Tick` 就是这个顺序，`botmove.tick()` 那一支也
-        # 直接 return、**不进 `_air_tick`**。旧判据只看 ``body.y == before.y``，
-        # 会把台子刚写进去的 −31 清成 0 发上网；最新 5 局里这种心跳之后的
-        # 下一发直接跨 130~157 px、速度才跳到 −30，正是用户看到的「卡住
-        # 然后瞬移」。
-        #
-        # ⚠ 判据是 `botmove.step()` 报回来的**这一格算了什么**，不是
-        #   `before.on_ground`。后者在「贴着墙从地面起跳」那一格上是错的：
-        #   `jump()` 之后 `_air_tick` 照跑，x 会被墙钉住，那时候必须报 0。
-        return body.vx, body.vy
-    vx = 0.0 if (body.vx and body.x == before.x) else body.vx
-    vy = 0.0 if (body.vy and body.y == before.y) else body.vy
-    return vx, vy
 
 
 def _mover_clock(room, terrain, shell=None, at=None):
@@ -8406,9 +8633,12 @@ def _switch_weapon_clock(machine, previous_id, weapon, now):
     #   两者**取和**而不是取大 —— 原版那三张表是各自独立倒数的，
     #   `LoadingTime` 那一张刚被重新上满，`CoolingTime` 那一张接着走完，
     #   要等到**两张都归零**才开得出枪。
+    #   ★ 三张表**并行**倒数（X_Mod §101）：`0x48bcaa` 只是把 `LoadingTime` 那一张**覆盖**成满的，
+    #     另外两张接着倒 ⇒ 开得出枪的时刻是三者里最晚的那个 = max，不是相加。
+    #     没写 `LoadingTime` 的枪缺省 200（`0x4892f8`），不是 0。
     resume = float(machine.weapon_cd.pop(weapon.id, 0.0) or 0.0)
-    loading = float(weapon.loading_ms or 0) / 1000.0
-    machine.next_fire_at = now + resume + loading
+    loading = _timer_ms(weapon.loading_ms) / 1000.0
+    machine.next_fire_at = now + max(resume, loading)
     # ★ 弹匣也是**跟着枪走**的：切走时剩几发，切回来还是几发。
     machine.rounds_left = machine.weapon_rounds.pop(weapon.id, None)
 
@@ -8484,6 +8714,23 @@ def _may_fire(machine, weapon):
     return not (weapon.splash_range and machine.pending_shots)
 
 
+#: 没写 `LoadingTime` / `CoolingTime` / `ReloadTime` 的枪按 200 ms（读表 `0x40b8c2` 拿 ebx 当缺省：
+#: `0x4892f8 mov ebx, 0xc8` 给前两个、`0x489396` 给 `ReloadTime`，X_Mod §101）。
+TIMER_DEFAULT_MS = 200
+
+#: 三重射击一发打几轮（`0x515365`：`SpreadFrags × 3`）。
+TRIPLE_SHOT_ROUNDS = 3
+
+#: 三重射击每一轮的角度偏移（`[0x693bbc]` = π/64）：收方外层从第 3 轮数到第 1 轮，第 3 轮 +π/64、
+#: 第 2 轮 −π/64、第 1 轮不偏（`0x491fc5` ~ `0x491fec`）。
+TRIPLE_SHOT_STEP = math.pi / 64.0
+
+
+def _timer_ms(value):
+    """武器的一张倒计时（毫秒）；没写就是缺省 200（`TIMER_DEFAULT_MS`）。"""
+    return TIMER_DEFAULT_MS if value is None else int(value)
+
+
 def _reload_after_shot(machine, weapon, now):
     """打完这一发之后，下一发**最早**什么时候能打。全部取自 `weapon.ini`。
 
@@ -8497,24 +8744,29 @@ def _reload_after_shot(machine, weapon, now):
     原版是「两发 + 1.2 秒」= 1.4 秒 2 发，只看冷却就是 1.4 秒 **7 发**，
     而它还是三连散弹（一发 3 颗 × 3 伤）⇒ 秒人。
 
-    ★ 没有 `MagazineCount` 的武器（榴弹 / 火箭那一类，打一发装一次）
-    走 `fire_interval_ms`（= `CoolingTime` 或 `ReloadTime`），和原来一样。
+    ★★ 三张倒计时表**并行**递减（X_Mod §101，`0x5163fe` 每帧各减 32 ms）：`CoolingTime` 每发都在
+    开火**前**上（`0x51654e`），`ReloadTime` 只在打空那一发上（`0x5173ce`）⇒ 打空之后等的是
+    **max(Cooling, Reload)**，不是相加；没写的缺省 200（`0x4892f8` / `0x489396`），
+    `MagazineCount` 缺省 1（`0x489360`，打一发装一次）。
+    ★ **捡来的临时枪**（`0x48bade`：`[+0x2c] > 0` 只减 `[+0x34]`、恒返回 1）不进弹匣、不上
+      `ReloadTime`，只受 `CoolingTime` 限制。
 
     ★ 这几个数**全是原版数据**，不是我拿一台机器观测出来的阈值 ——
     铁律 10 禁的是后者（D29 的口径）。
     """
-    magazine = weapon.magazine
-    if not magazine:
+    cooling = _timer_ms(weapon.cooling_ms)
+    if _holding_item_weapon(machine, weapon):
         machine.rounds_left = None
-        return now + weapon.fire_interval_ms / 1000.0
+        return now + cooling / 1000.0
+    magazine = weapon.magazine or 1
     left = magazine if machine.rounds_left is None else machine.rounds_left
     left -= 1
     if left <= 0:
         # 打空了：停下来换弹匣，回来就是满的。
         machine.rounds_left = None
-        return now + (weapon.reload_ms or weapon.fire_interval_ms) / 1000.0
+        return now + max(cooling, _timer_ms(weapon.reload_ms)) / 1000.0
     machine.rounds_left = left
-    return now + (weapon.cooling_ms or weapon.fire_interval_ms) / 1000.0
+    return now + cooling / 1000.0
 
 
 # ---------------------------------------------------------------------------
@@ -8602,7 +8854,7 @@ class Shell(object):
         #: ★★ **已经在地上弹过了**（带引信的武器，§84）。弹过之后弹道
         #:   不再是闭式解，改走 `vx/vy` 逐 tick 积分那一路。
         self.bounced = False
-        #: ★★ 开火那一刻射手身上那些**按发数算的状态**给的倍率（§117）。
+        #: ★★ 开火那一刻射手身上那些**按匣数算的状态**给的倍率（§117）。
         #:   强力射击是伤害 ×2、弹体大小 ×2。在**开火那一刻**定死，
         #:   不跟着状态到期变 —— 这一颗已经飞出去了。
         self.damage_ratio = 1.0
@@ -9999,11 +10251,17 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region, tick):
     #   （`0x49285c` 读 `[proj+0x120]`，§92）。所以只有「被打的是另一个
     #   bot」时服务端才要自己补一份 —— 真人那份归他自己那台机器。
     if hit:
-        _note_damage(room, victim_seat, damage)     # ★ 血量台账（M5-C）
+        # ★ 血量台账（M5-C）记收方真正扣的（带了格挡 `0x80` 就不是包里那个数，X_Mod §95）。
+        _note_damage(room, victim_seat, _landed_damage(damage, flags))
         if shell.poisoned:
             # ★ 带毒的弹直接命中 ⇒ 挂毒（`BulletObj::HitObject` `0x47f096`，
             #   X_Mod §93）。溅射 / 火墙从来不带毒，只有这一路。
             _poison_seat(room, victim_seat, "bot 的毒弹")
+        # ★ 武器自带的状态（蝴蝶减速）同一条路：直接命中才挂，每台机器按自己的碰撞挂
+        #   ⇒ 被打的 bot 服务端要压走速、被打的真人服务端外推要跟着慢（X_Mod §97）。
+        found = _shell_attribute(shell.weapon)
+        if found is not None:
+            _apply_weapon_attribute(room, victim_seat, found, None, shell.weapon)
         vx, vy = _shell_velocity(shell)
         _knock_back_seat(room, victim_seat, damage,
                          knockback_vector(vx, vy, damage),
@@ -10333,6 +10591,9 @@ def _advance_fires(room, machine, now):
                 last = machine.burnt.get(seat_index)
                 if last is not None and tick - last < BOT_FIRE_REBURN_TICKS:
                     continue
+                if (isinstance(seat_index, int)
+                        and _in_melee_motion(room, seat_index)):
+                    continue                # 出拳 / 冲刺那一段火墙烧不到（`0x4ff21a`）
                 character = (None if character_id is None
                              else chrprops.get(character_id))
                 lit = _fire_touch(character, px, py, crouched, wall.flames,
@@ -10482,8 +10743,8 @@ def _slice_angles(weapon, slice_weapon, roll):
     return out
 
 
-def _spread_offsets(weapon, count, roll_unit):
-    """一发 `rpFire` 造出来的 `count` 颗弹体各自的**角度偏移**（弧度，§173）。
+def _spread_offsets(weapon, rounds, roll_unit):
+    """一发 `rpFire` 造出来的每一颗弹体各自的**角度偏移**（弧度，§173）—— `rounds × SpreadFrags` 颗。
 
     ## 这一段以前整个漏了
 
@@ -10520,19 +10781,35 @@ def _spread_offsets(weapon, count, roll_unit):
     一样散开，而不是比谁都准。
 
     `roll_unit()` = `rand[0,1)`，做成参数是为了单测钉住它。
+
+    ## ★★ 三重射击（X_Mod §101）
+
+    `rounds` = 这一发打几轮（`_triple_rounds`）。收方外层从第 `rounds` 轮数到第 1 轮
+    （`0x492341` / `0x492374`），内层每轮 `SpreadFrags` 颗；每颗先重置成包里的角度，第 3 轮
+    +π/64、第 2 轮 −π/64、第 1 轮不偏，再叠自己的散布 —— 均匀扇形的序号是**本轮内**的。
+    句柄按「轮优先」连号（`0x49231e` 在内层循环里注册），这里的顺序就是句柄顺序。
     """
-    count = max(0, int(count))
+    rounds = max(0, int(rounds))
+    frags = max(1, int(getattr(weapon, "shots", 1) or 1))
     span = float(getattr(weapon, "spread_angle", 0.0) or 0.0)
-    if not span or not count:
-        return [0.0] * count
-    if getattr(weapon, "spread_random", False):
-        return [math.radians((roll_unit() - 0.5) * span) for _ in range(count)]
-    if count < 2:
-        # 收方那条是 `fidiv (SpreadFrags − 1)` —— n == 1 会除以 0。
-        # 现有武器表里 `SpreadRandom=0` 的三把全是 n == 2，走不到这儿。
-        return [0.0] * count
-    return [math.radians((float(index) / (count - 1) - 0.5) * span)
-            for index in range(count)]
+    random_spread = getattr(weapon, "spread_random", False)
+    out = []
+    for left in range(rounds, 0, -1):
+        base = (TRIPLE_SHOT_STEP if left == 3
+                else (-TRIPLE_SHOT_STEP if left == 2 else 0.0))
+        for index in range(frags):
+            if not span:
+                degrees = 0.0
+            elif random_spread:
+                degrees = (roll_unit() - 0.5) * span
+            elif frags < 2:
+                # 收方那条是 `fidiv (SpreadFrags − 1)` —— n == 1 会除以 0。
+                # 现有武器表里 `SpreadRandom=0` 的三把全是 n == 2，走不到这儿。
+                degrees = 0.0
+            else:
+                degrees = (float(index) / (frags - 1) - 0.5) * span
+            out.append(base + math.radians(degrees))
+    return out
 
 
 def _spread_shot(shot, offset):
@@ -10598,6 +10875,9 @@ def _split_shell(room, machine, shell, point, victim_seat, tick):
         # ★ 碎片也是一发 `rpFire`：收方照样按**此刻**射手身上有没有毒弹
         #   给它挂毒（X_Mod §93）；它是 `Type=Splinter`，不消耗毒弹那一格。
         poisoned = _bullets_poisoned(machine, slice_weapon)
+        # ★ 强力射击同理（`0x492248` 不分类型，X_Mod §98）：碎片也 ×2 伤害、×2 大小 ——
+        #   以前碎片恒 1.0，别人屏幕上是放大的碎片，服务端按原大小判地形 / 判命中。
+        damage_ratio, size_ratio = _projectile_ratios(machine, slice_weapon)
         for offset in range(slice_weapon.shots):
             # ★ 碎片的时钟原点就是**母弹炸开的这一格**（D106）：
             #   收方也是在处理这一发 `rpFire` 的那一帧才建它们的。
@@ -10606,6 +10886,8 @@ def _split_shell(room, machine, shell, point, victim_seat, tick):
                           shot, _tick_moment(shell, tick), max_ticks,
                           born_tick=tick)
             piece.poisoned = poisoned
+            piece.damage_ratio = damage_ratio
+            piece.size_ratio = size_ratio
             machine.pending_shots.append(piece)
         fire_seq = machine.sync.events
     if not machine.split_logged:
@@ -10711,6 +10993,52 @@ def _advance_shells(room, machine, tick):
     machine.pending_shots = still + machine.pending_shots
 
 
+def _preempt_self_destructs(room, machine, tick):
+    """★★ 下一格会**本地自灭**的弹体，这一格就把 `rpExplode` 发掉（X_Mod §84 / §99）。
+
+    收方对远端弹体「撞地形 / 引信到点 / 飞满」是**自己灭的**，一帧之后就从表里删掉；服务端那发
+    `rpExplode` 晚到就被 `0x492750` 静默丢弃，句柄从此整局错开（§84 那一局就是这么「后面全没伤害」）。
+    而服务端的弹体比收方那份慢一步：收方收到 `rpFire` **当帧**就推第 1 格（§81），服务端下一格才推
+    ⇒ 服务端的包总比收方那份撞上晚 `32 − δ` ms（δ = 两边 32 ms 格网的相位差，每局随机），
+    只剩 δ 那点余量。提前一格发：余量变成 `32 + δ`。
+    ★ 只提前**本地自灭**的那几种。下一格撞人 / 撞怪的照旧等到那一格 —— 撞到人的远端弹体收方
+      是停着等包的（§84），没有竞速；而下一格人往哪走这一格还不知道，提前发就是替他判了。
+    ★ 预演拿的是这颗弹体的**拷贝**（`_shell_step` 只改弹体自己的字段），不预演就什么都不动。
+      提前炸出来的碎片 / 火墙照「发包那一格」起算（`_resolve_shell` 的 `tick`），和收方收到包时
+      才建它们是同一个口径；新生的碎片接着预演，下一格就自灭的也一样提前。
+    """
+    if not machine.pending_shots:
+        return
+    terrain = _terrain(room)
+    bodies_cache = {}
+    checked = set()
+    while True:
+        todo = [s for s in machine.pending_shots if id(s) not in checked]
+        if not todo:
+            return
+        for shell in todo:
+            checked.add(id(shell))
+            if (shell.fire_seq >= machine.sync.events
+                    or shell.ticks >= shell.max_ticks):
+                continue                    # 上一代的 / 已经飞满（`_advance_shells` 收尾）
+            bodies = bodies_cache.get(shell.group)
+            if bodies is None:
+                bodies = _battle_bodies(
+                    room, machine.my_seat, shell.group,
+                    include_self=(shell.group == botsync.FIRE_GROUP_EVERYONE))
+                bodies_cache[shell.group] = bodies
+            probe = copy.copy(shell)
+            landed = _shell_step(room, probe, terrain, bodies)
+            if landed is None:
+                if probe.ticks < probe.max_ticks:
+                    continue                # 下一格还在飞
+                landed = ((probe.x, probe.y), None, None)   # 下一格飞满 = 自灭
+            if landed[1] is not None:
+                continue                    # 下一格撞人 / 撞怪：收方停着等包
+            machine.pending_shots.remove(shell)
+            _resolve_shell(room, machine, probe, landed[0], None, None, tick)
+
+
 # ---------------------------------------------------------------------------
 # ★★ 近身冲刺攻击（§64）—— 真人双击左右方向键的那一下
 # ---------------------------------------------------------------------------
@@ -10726,6 +11054,9 @@ BOT_DASH_INDEX = 0
 #: ★ 它只影响**这一下打多久 / 什么时候判伤害**，不影响任何包的字节 ——
 #: 差一点点的后果是「近身这下的节奏偏快偏慢」，不是静默故障。
 BOT_DASH_FRAME_MS = ballistics.TICK_MS
+
+#: 出拳计时器 `[+0x5ac]` 的长度 = ⌊Jab TotalFrame × 0.625⌋ 帧（`[0x693b08]`，X_Mod §101）。
+JAB_FRAME_RATIO = 0.625
 
 
 class DashSwing(object):
@@ -10850,6 +11181,8 @@ def _advance_dash(room, machine, now):
                 #   DashAttack 加成是射手一侧的（`0x481e40`），bot 是白板号。
                 damage, dash_flags = _victim_side(room, machine, seat_index,
                                                   damage, "近身")
+                # ★ `DashDamage` 的 `vft+0x124` 是真 ⇒ 挡得住（`0x480f02`，X_Mod §95）。
+                dash_flags |= _guard_flag(room, machine, seat_index, "近身")
             _emit(machine, machine.sync.event(
                 botsync.OP_SPLASH_DAMAGED,
                 botsync.splash_body(
@@ -10861,7 +11194,8 @@ def _advance_dash(room, machine, now):
                     y + offset[1],
                     push_x=push[0], push_y=push[1], flags=dash_flags)))
             if mob_handle is None:
-                _note_damage(room, seat_index, damage)   # ★ 血量台账（M5-C）
+                # ★ 血量台账（M5-C），格挡同直接命中（X_Mod §95）。
+                _note_damage(room, seat_index, _landed_damage(damage, dash_flags))
                 _knock_back_seat(room, seat_index, damage, push,
                                  source="bot 近身")
                 who = f"座位{seat_index} 的{region}"
@@ -11018,11 +11352,16 @@ def _try_fire(room, machine, seat_index, weapon, target, now, tick):
     #     不再需要单独打补丁（用户 2026-08-27 踩过的那条路）。
     # ★★ 这一颗的倍率在**开火那一刻**定死（§117）：状态可能在它飞到一半
     #    时打完撤掉，可这一颗已经是放大过的了。
-    damage_ratio, size_ratio = _magazine_ratios(machine)
-    # ★ 带不带毒同样在开火那一刻定（X_Mod §93），下面 `_spend_magazine_shots`
+    damage_ratio, size_ratio = _projectile_ratios(machine, weapon)
+    # ★ 带不带毒同样在开火那一刻定（X_Mod §93），下面 `_magazine_emptied`
     #   可能就把毒弹这一格撤掉了。
     poisoned = _bullets_poisoned(machine, weapon)
-    step = weapon.fire_step
+    # ★★ 三重射击 = 这一发的弹数 ×3（`0x515365`，X_Mod §101）：`rpFire +22` 填 `SpreadFrags × 3`，
+    #   收方按 `数量 / SpreadFrags` 轮造弹、每轮一个角度偏移。以前服务端按原弹数发 ——
+    #   bot 捡到三重射击等于白捡。弹匣照旧一发 `rpFire` 记一次账。
+    rounds = _triple_rounds(machine)
+    shots = weapon.shots * rounds
+    step = weapon.fire_step * rounds
     # ★★★ 碰撞排除组（§63）：**填错就是「明明躲开了还掉血」**。
     #   收方把它写进弹体的 `[proj+0x15c]`，和角色的一比，相同就整个跳过
     #   碰撞 —— 以前这一格被当成「武器槽」写死成 1，于是个人战里座位 0
@@ -11039,7 +11378,7 @@ def _try_fire(room, machine, seat_index, weapon, target, now, tick):
             source_seat = target_seat
     packet, handle = machine.sync.fire(
         weapon.id, muzzle_x, muzzle_y, shot.angle, shot.power,
-        handle_step=step, shots=weapon.shots, source_seat=source_seat,
+        handle_step=step, shots=shots, source_seat=source_seat,
         group=group)
     if source_seat is not None:
         machine.log(f"   ◆诊断 这一发用**座位 {source_seat}（真人）**的 owner 发出去")
@@ -11066,16 +11405,13 @@ def _try_fire(room, machine, seat_index, weapon, target, now, tick):
     #   创建弹体的前一步 `0x5151dd`）。到 0 之后由 `_expire_item_weapon()`
     #   下一帧换回自己那把 —— 和原版一样，是「刷新武器」时才结算。
     _spend_item_weapon_shot(machine)
-    # ★★ 强力射击 / 三重射击 / 毒弹这三条状态同样按**发**消耗（§117）。
-    #    打完就地撤掉并广播 `0x040d` —— 不发的话别人屏幕上永远不结束。
-    _spend_magazine_shots(room, machine, seat_index)
     terrain = _terrain(room)
     max_ticks = _shell_max_ticks(terrain, shot, weapon)
     # ★★★ 散射武器每一颗**各走各的角度**（§173）：包里只有一个角度，
     #   拨开每一颗是收方的活（`0x491ffb`）。以前这里 `shots` 颗共用一条
     #   弹道 ⇒ 屏幕上散开的三发在服务端叠成一发，「擦身而过却三发全中」。
-    spread = _spread_offsets(weapon, weapon.shots, machine.roll_unit)
-    for offset in range(weapon.shots):
+    spread = _spread_offsets(weapon, rounds, machine.roll_unit)
+    for offset in range(shots):
         pellet = _spread_shot(shot, spread[offset])
         pellet_ticks = (max_ticks if pellet is shot
                         else _shell_max_ticks(terrain, pellet, weapon))
@@ -11090,6 +11426,12 @@ def _try_fire(room, machine, seat_index, weapon, target, now, tick):
         shell.poisoned = poisoned
         machine.pending_shots.append(shell)
     machine.next_fire_at = _reload_after_shot(machine, weapon, now)
+    # ★★ 强力射击 / 三重射击 / 毒弹按**打空几匣**消耗（X_Mod §95，订正 §117 的「按发」）：
+    #    `_reload_after_shot` 把 `rounds_left` 清成 `None` ⟺ 这一发打空了弹匣、开始换弹
+    #    ⟺ 客户端 `0x48bac2` 返回 0、`0x517383` 走进 `0x509feb` 那一下。
+    #    排在弹体造完之后（`0x4923a5` 也是），这一匣的最后一发照样是加强的。
+    if machine.rounds_left is None and not _holding_item_weapon(machine, weapon):
+        _magazine_emptied(room, machine, seat_index)
     # ★★ 这一发的瞄准失误用掉了 —— 下一发重掷（M5-D）。判据是「打了一枪」
     #    这个事件，不是「过了多久」（铁律 10）。
     _reroll_aim_miss(machine)
@@ -11294,7 +11636,7 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         # ★ 捡来的枪也丢掉：真人死了重生就换回自己那把（§223 的 `GiveWeapon`
         #   是「换成这把」，重生时 `Character::Reset` 把武器恢复成角色本来的）。
         machine.drop_item_weapon()
-        # ★ 按发数算的状态也清：死一次属性表就空了（`Character::Reset`），
+        # ★ 按匣数算的状态也清：死一次属性表就空了（`Character::Reset`），
         #   每台客户端自己会拆掉，这边不用补 `0x040d`。
         machine.magazine_attrs = {}
         # ★ 减速 / 冰冻也一样：死一次身上的状态就清了（`Character::Reset`）。
@@ -11313,7 +11655,6 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         # 死亡广播已经让收方拆掉这个角色；死前尚未发出的运动锚没有对象可锚，
         # 不能带到五秒后的重生。
         machine.motion_anchor_pending = False
-        machine.motion_blocked_axes = (False, False)
         current = machine.weapon
         machine.next_fire_at = now + (
             0.0 if current is None else float(current.loading_ms or 0) / 1000.0)
@@ -11332,7 +11673,6 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
     # ★ 别人的道具：减速胶水踩上去要真的慢（§101/§105）、
     #   冰冻圈里要真的动不了（§106）。
     _step_on_slow_mine(room, machine, seat_index, now)
-    _take_freeze(room, machine, seat_index, now)
     # ★ 队友放的回血图腾（X_Mod §32）：站在圈里就回血。和上面两条同一档
     #   ——「此刻站在哪」是位置决定的事实，逐格问一次；场上没有图腾时
     #   `quest.totems` 恒空，等于没开销。
@@ -11522,12 +11862,13 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         else:
             beat = True
 
-    # ★ 起跳**按状态翻转去重**：只有「这一格真的往前挪了」才补 `rpJump`
-    #   （铁律 10 说的那种去重口径）。`rpJump` 是**事件包**，每发都要吃掉
-    #   一个可靠序号，动画上还会抽。
+    # ★ 起跳**按事实发**：自己走位时 `jumped` 就是 `botmove.frame()` 说的「这一帧末起跳了第几段」
+    #   —— 客户端起跳排在帧末（X_Mod §105），起跳那一帧位置本来就不因起跳而动，不能拿「挪没挪」当判据。
+    #   回放真人轨迹（`from_trail`）那条老路里同一个轨迹点会重放几格，照旧按「这一格真的往前挪了」
+    #   去重（铁律 10 说的那种口径）。`rpJump` 是**事件包**，每发都要吃掉一个可靠序号，动画上还会抽。
     moved = previous is not None and (x, y) != previous
     try:
-        if jumped and moved:
+        if jumped and (moved or not from_trail):
             # ★ 事件包（内层 < 0x4000）：序号必须严格连续，所以它和心跳里的
             #   N 是同一本账，全在 `BotSyncStream` 里记（D5）。
             #   ★★ 在**起跳的那一格**就发，不等下一发心跳 —— 原版射手也是
@@ -11874,6 +12215,12 @@ def _tick_room_locked(room, tick, now, behind=0):
     except Exception as error:          # noqa: BLE001 —— 见 docstring
         asynclog.emit(f"[{gameserver.ts()}] [bot] ⚠ 外推真人位置出错，已跳过: "
                       f"{error!r}")
+    # ★ 冰冻圈按房间结算一次（X_Mod §97）：排在真人推完之后、bot 走之前 —— 圈里有谁
+    #   看的是这一格大家站在哪。
+    try:
+        _settle_freeze_bursts(room, now)
+    except Exception as error:          # noqa: BLE001 —— 见 docstring
+        asynclog.emit(f"[{gameserver.ts()}] [bot] ⚠ 结算冰冻出错，已跳过: {error!r}")
     for index in room.bot_seats():
         seat = room.seats[index]
         machine = None if seat is None else seat.conn
@@ -11885,6 +12232,8 @@ def _tick_room_locked(room, tick, now, behind=0):
         machine.room_id = getattr(room, "room_id", None)
         try:
             _tick_bot(room, machine, index, tick, now, behind)
+            # ★ 这一格开的枪、刚炸出来的碎片也算上：下一格就自灭的这一格先发（X_Mod §99）。
+            _preempt_self_destructs(room, machine, tick)
         except Exception as error:          # noqa: BLE001 —— 见 docstring
             # ★ 连 `sync` 本身都坏了的场合（单测里就是这么造的）也要接住 ——
             #   这一层的全部意义就是「一个 bot 坏掉不许连累别人」。

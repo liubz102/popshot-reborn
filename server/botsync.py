@@ -588,15 +588,14 @@ def character_state(x, y, vx=0, vy=0, facing=FACING_RIGHT, on_ground=True,
 
     ## ★★★ `on_ground` 和速度两格：调用方**必须一起给对**（§35）
 
-    `on_ground=True`（踩在地上）时速度**就该是 0**，哪怕角色正在走 ——
-    真人的包就是这样（20341 发「位置在变、bit2=1、速度 0」）。
-    地上走却填非 0 速度，收方会拿那个速度自己往前推算，和下一发心跳里的
-    坐标一打架就是「走一步、停一下」的抽搐，而且**不播走路动画**
-    （用户 2026-08-26 第二轮实机报的症状）。
-
-    所以这里不再替调用方猜：**踩地时速度被强制归零**，并在两者明显矛盾时
-    以 `on_ground` 为准 —— 谁在地上谁腾空，是回放真人轨迹时抄来的事实
-    （`bot.trail_point`），不该由这一层反推。
+    `on_ground=True`（踩在地上）时速度**一般是 0**，哪怕角色正在走 —— 客户端
+    踩地时每帧把速度清零（`0x50d42d`），真人的包就是这样（20341 发「位置在变、
+    bit2=1、速度 0」）。地上走却填非 0 速度，收方会拿那个速度自己往前推算，
+    和下一发心跳里的坐标一打架就是「走一步、停一下」的抽搐。
+    ★ 唯一的例外是**弹跳台刚写速度、踩地位还没清**的那一帧：本人那台报的就是
+      「踩地 + vy < 0」（X_Mod §104），收方照包覆盖速度、下一帧按踩地分支挪 ——
+      所以这一层**不再强制归零**，照调用方给的原样打包（`botmove.Body` 踩地时
+      速度本来就是 0，台子那一帧由 `reported_on_ground` 报踩地）。
 
     `cursor` 传 `None` = 按 `facing` 在正前方自己摆一个（`aim_point`），
     朝向位和角度都跟着它算（`aim_state`），三个字段因此永远自洽。
@@ -605,8 +604,7 @@ def character_state(x, y, vx=0, vy=0, facing=FACING_RIGHT, on_ground=True,
         cursor = aim_point(x, y, facing)
     facing, angle_deg, cursor = aim_state(x, y, cursor, facing)
     on_ground = bool(on_ground)
-    packed_vx, packed_vy = ((0, 0) if on_ground
-                            else (clamp_i16(vx), clamp_i16(vy)))
+    packed_vx, packed_vy = clamp_i16(vx), clamp_i16(vy)
     field = int(facing) & 0x03
     if on_ground:
         field |= HEARTBEAT_BIT_ONGROUND
