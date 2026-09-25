@@ -2090,18 +2090,20 @@ BOT_DOUBLE_DAMAGE_MODES = (3, 5)
 
 
 def _pvp_game_mode(room):
-    """这一局的游戏模式号（房间描述符 `arguments[1]`）；读不出来返回 `None`。
+    """这一局的游戏模式号 = 客户端的 `session:GetPvpMode()`（`0x409e0a`）；读不出来返回 `None`。
 
-    ★ 读不出来一律当「不翻倍」——闯关房的 `arguments` 不是这套含义，
-    宁可少乘也不要凭空给怪加一倍伤害。
+    描述符类型 1（对战）返回 `arguments[1]`、类型 5 返回 5，**其余一律 −1**。
+    ★★ 以前这里不看类型、直接拿 `arguments[1]`（X_Mod §94 订正）：闯关房的
+      `arguments` 是 `(关卡, 难度)`，**困难**正好是 3 ⇒ 被当成夺分，bot 打怪的
+      溅射 / 火墙 / 近身翻倍、回血图腾 ×1.35 —— 原版在闯关里一条都不会发生。
     """
     arguments = getattr(room, "arguments", None) or ()
-    if len(arguments) <= 1:
-        return None
+    session_type = getattr(room, "session_type", equipbonus.SESSION_TYPE_NORMAL)
     try:
-        return int(arguments[1])
+        mode = equipbonus.pvp_mode(session_type, arguments)
     except (TypeError, ValueError):
         return None
+    return None if mode < 0 else mode
 
 
 def _damage_scale(room):
@@ -2183,6 +2185,32 @@ EXPLODE_FLAG_LUCKY = 0x100
 
 #: `0x693724` = 0.01f —— 按 f32 存的那个数，不是十进制的 0.01。
 _PERCENT_F32 = mapdata.f32(0.01)
+
+#: `rpExplode +20` / `rpSplashDamaged +29` 的「射手那台判你在格挡」（X_Mod §92）。
+#: 射手在 `0x47ec9a`（直接命中）/ `0x480f02`（近身这一类）置上它，条件是伤害源
+#: 挡得住（`vft+0x124`：弹体、近身是 1，溅射、火墙是 0）且受害者 `0x50a0ea` 在挡。
+EXPLODE_FLAG_GUARD = 0x80
+
+
+def _landed_damage(damage, flags):
+    """收方 `Character::OnHit` 真正扣进血里的是多少（X_Mod §92）。
+
+    ① 先**朝零截断**：分发器 `0x491930` / `0x4919b8` 拿 `_ftol2` 把包里的 f32
+       变成整数；
+    ② flags 带 `0x80`（格挡）走 `0x4ff4ac` 那一支：`int(GuardDamageRate × 伤害 + 1)`
+       （`0x4ff4f8 fimul` + `fadd 1.0` + `_ftol2`；0.25 是精确的 f32，没有舍入问题）。
+       ⚠ 那一支前面还有一道「正面挨打」的门（`0x4ff493`：`[角色+0x2d4] × 击退.x < 0`），
+       而 `[角色+0x2d4]` 只在角色 Init 时随机一次（`0x4fb660`，±1）、之后没人再写 ——
+       每台客户端各随各的，服务端无从知道。按「挡住了」记：少扣的那一边，
+       台账宁可把人记得血多一点，也不要把活人记残。
+    """
+    value = float(damage)
+    if not math.isfinite(value):
+        return 0
+    hurt = int(value)
+    if flags & EXPLODE_FLAG_GUARD:
+        hurt = int(chrprops.game().guard_damage_rate * hurt + 1.0)
+    return hurt
 
 
 def _victim_side(room, machine, seat_index, damage, source):
@@ -2611,11 +2639,12 @@ class PeerShot(object):
     误差就是一个网络单程，而 bot 本来就允许判断错（`dodge_error`）。
     """
 
-    __slots__ = ("weapon", "x", "y", "shot", "at", "serial", "source")
+    __slots__ = ("weapon", "x", "y", "shot", "at", "serial", "source",
+                 "poisoned")
 
     _next_serial = 0
 
-    def __init__(self, weapon, x, y, shot, at=0.0, source=0):
+    def __init__(self, weapon, x, y, shot, at=0.0, source=0, poisoned=False):
         self.weapon = weapon
         self.x = float(x)
         self.y = float(y)
@@ -2624,6 +2653,9 @@ class PeerShot(object):
         #: `rpFire body+0`：`10 + 座位号` 是玩家，**20 / 30 是怪**（§23）。
         #:   闯关里怪的子弹是**队友那台机器**替它发的，躲不躲它不能按队伍判。
         self.source = int(source)
+        #: ★ 这一发带毒（X_Mod §93）：出膛那一刻他身上挂着毒弹。收方就是在
+        #:   处理 `rpFire` 时按射手的属性 10 给每一颗挂毒的（`0x492210`）。
+        self.poisoned = bool(poisoned)
         PeerShot._next_serial += 1
         #: 认「同一发」用的号 —— 闪避掷骰子按它去重。
         self.serial = PeerShot._next_serial
@@ -2684,9 +2716,12 @@ def note_peer_fire(conn, body, room=None):
     if not isinstance(shots, collections.deque):
         shots = conn.peer_shots = collections.deque(
             maxlen=BOT_PEER_SHOT_KEEP)
+    poisoned = (source not in MOB_FIRE_SOURCES
+                and _peer_poison_on(room, conn)
+                and not weapon.get("totem_id"))
     shots.append(PeerShot(weapon, fx, fy,
                           ballistics.launch(weapon, angle, power),
-                          at=_now(), source=source))
+                          at=_now(), source=source, poisoned=poisoned))
     if source in MOB_FIRE_SOURCES:
         # ★ 怪开的枪：**不要**把这把枪记成「这个真人现在用的枪」——
         #   那会让 M5-C 的战力对比按怪的枪算。
@@ -2695,6 +2730,52 @@ def note_peer_fire(conn, body, room=None):
     # ★ 顺手记住「他现在用的是哪把枪」（M5-C 的战力对比要用）。
     #   `rpChangeWeapon` 也会写这一格，见 `note_peer_hit()`。
     conn.peer_weapon = weapon
+
+
+#: 内层 `0x001a`：「给这个座位挂一条属性」（X_Mod §94）。收侧 `0x491d07` →
+#: `0x494081` 只认属性 0x14；全镜像唯一的发送点在 `Character::Die`
+#: （`0x5019c4`~`0x501a28`）：闯关里别人死了、自己活着、戴着 `560013
+#: [퀘스트의 달인]`、`rand(100) < 25` ⇒ `SendToAll(我的座位, 0x14, 1)`。
+PEER_OP_ADD_ATTR = 0x001A
+_ADD_ATTR = struct.Struct("<bii")        # 座位 / 属性号 / 1
+
+#: 状态 0x14 = `Status.ini [20] 퀘스트 달인`：8 秒整发不扣血（外加子弹 ×2，
+#: 那是射手那台算好的）。
+QUEST_MASTER_ATTR = 0x14
+QUEST_MASTER_S = 250 * 0.032
+
+
+def _note_peer_add_attr(room, body):
+    """真人发来的 `0x001a`：闯关达人那 8 秒免伤记进台账（X_Mod §94）。"""
+    if len(body) < _ADD_ATTR.size:
+        return
+    seat, attr, _value = _ADD_ATTR.unpack_from(body, 0)
+    ledger = _health(room)
+    if (attr == QUEST_MASTER_ATTR and ledger is not None
+            and 0 <= seat < len(room.seats)):
+        ledger.grant_immunity(seat, _now() + QUEST_MASTER_S,
+                              state=QUEST_MASTER_ATTR)
+
+
+def _peer_poison_on(room, conn):
+    """这个真人此刻身上挂没挂着毒弹（`quest.poison_magazine`，X_Mod §93）。"""
+    quest = None if room is None else room.quest
+    seat = getattr(conn, "my_seat", None)
+    return (quest is not None and seat is not None
+            and int(seat) in getattr(quest, "poison_magazine", ()))
+
+
+def _peer_hit_poisoned(room, conn, bx, by):
+    """真人这一发直接命中带不带毒（X_Mod §93）。
+
+    按爆点配回那一发 `rpFire`，看它出膛时带没带（最后一匣打完那一刻他那台
+    就发 `0x040d` 了，可那一匣的子弹还在飞 —— 只看「此刻」会漏掉最后一匣）。
+    配不上（弹过地 / 追踪弹）才退回「此刻身上有没有」。
+    """
+    matched = _match_peer_shot(conn, bx, by)
+    if matched is not None:
+        return matched[0].poisoned
+    return _peer_poison_on(room, conn)
 
 
 def _peer_shot_velocity(conn, bx, by):
@@ -2879,8 +2960,9 @@ def note_peer_hit(room, conn, payload):
     """真人发来的一发同步包 —— 打到 bot 身上就替它挨这一下击退（§92）。
 
     挂在 `gameserver.BOT_PEER_HIT` 上，`forward_peer_data()` 每发都问一次。
-    **只管击退**：伤害是收方自己扣的（`rpExplode +24` / `rpSplashDamaged +8`
-    原样进 `Character::OnHit`，§42），服务端不重算，bot 的血也不在这边记。
+    伤害是收方自己扣的（`rpExplode +24` / `rpSplashDamaged +8` 原样进
+    `Character::OnHit`，§42），服务端不重算；**血量台账**照收方真正扣掉的
+    那个数记一份（`_landed_damage`：截断 + 格挡，免伤中的不记，X_Mod §92）。
 
     两条路各取各的来向：
 
@@ -2895,6 +2977,9 @@ def note_peer_hit(room, conn, payload):
         if udpsync.heartbeat_motion(payload) is not None:
             facing = ((struct.unpack_from('<I', payload, 31)[0] & 3) ^ 2) - 2
             conn.motion_facing = (relayserver.epoch_state(conn).gen, facing)
+        return
+    if opcode == PEER_OP_ADD_ATTR:
+        _note_peer_add_attr(room, payload[udpsync.PEER_HEADER_SIZE:])
         return
     if opcode in (botsync.OP_DASH, 0x0008, 0x0017):
         _note_motion_event(room, conn, opcode, payload[udpsync.PEER_HEADER_SIZE:],
@@ -2932,7 +3017,7 @@ def note_peer_hit(room, conn, payload):
     if opcode == botsync.OP_EXPLODE:
         if len(body) < botsync.EXPLODE_BODY_SIZE:
             return
-        _handle, target, bx, by, _kind, _flags, damage = struct.unpack_from(
+        _handle, target, bx, by, _kind, flags, damage = struct.unpack_from(
             "<iiffiif", body, 0)
         if target <= 0 or damage <= 0:
             return
@@ -2956,7 +3041,13 @@ def note_peer_hit(room, conn, payload):
             #   位置采样（§125）。`create=True`：boss 从不广播坐标，直接命中
             #   是它唯一的位置来源（§141）。
             note_mob_hit(room, target, bx, by, create=True)
-        _note_damage(room, botsync.handle_seat(target), damage)
+        # ★ 记账记的是**收方真正扣掉的**：截断 + 格挡（X_Mod §92）。
+        _note_damage(room, botsync.handle_seat(target),
+                     _landed_damage(damage, flags))
+        # ★ 毒弹直接命中角色 ⇒ 挂毒（X_Mod §93）。溅射那一路从来不带毒。
+        if (botsync.handle_seat(target) is not None
+                and _peer_hit_poisoned(room, conn, bx, by)):
+            _poison_seat(room, botsync.handle_seat(target), "真人的毒弹")
         # ★★ 武器自带的状态排在**击退之前**（X_Mod §31）：下面那条
         #    「配不上 rpFire 就不给击退」的早退会把这一段整个跳过，
         #    而碎片（蝴蝶）的爆点本来就配不上母弹的射线。
@@ -2974,6 +3065,8 @@ def note_peer_hit(room, conn, payload):
             return
         _source, target, damage, _z, push_x, push_y = struct.unpack_from(
             "<iifBff", body, 0)
+        # ★ `+29` 是 flags（X_Mod §92），格挡的 0x80 就在这里。
+        flags = struct.unpack_from("<i", body, 29)[0]
         if target <= 0 or damage <= 0:
             return
         source = "真人溅射/火/近身"
@@ -2986,7 +3079,8 @@ def note_peer_hit(room, conn, payload):
             if _note_peer_breakable(room, target, damage):
                 return
             note_mob_hit(room, target, hit_x, hit_y, create=True)
-        _note_damage(room, botsync.handle_seat(target), damage)
+        _note_damage(room, botsync.handle_seat(target),
+                     _landed_damage(damage, flags))
         _take_weapon_attribute(room, conn, botsync.handle_seat(target))
     seat_index = botsync.handle_seat(target)
     if seat_index is None:
@@ -3521,11 +3615,107 @@ def _health(room):
     return ledger
 
 
-def _note_damage(room, seat_index, amount):
-    """记一发打在某个座位身上的伤害（谁打的都记）。"""
+def _note_damage(room, seat_index, amount, at=None):
+    """记一发打在某个座位身上的伤害（谁打的都记）。记上了返回 `True`。
+
+    ★ 免伤中的座位**不记**（X_Mod §92）：客户端 `Character::OnHit` 进门就查
+      几道状态，命中就整发不扣血 —— 服务端的账不跟着跳过，就会和每台客户端
+      对不上（bot 眼里「开着盾 / 刚复活的人」越打越残）。
+    `at` = 这一下发生的时刻（毒的一跳用它），缺省是此刻。
+    """
     ledger = _health(room)
-    if ledger is not None and seat_index is not None and 0 <= seat_index:
-        ledger.note_damage(seat_index, amount)
+    if ledger is None or seat_index is None or seat_index < 0:
+        return False
+    if _immune(room, seat_index, _now() if at is None else at):
+        return False
+    return ledger.note_damage(seat_index, amount)
+
+
+def _poison_seat(room, seat_index, source):
+    """毒弹直接命中了 `seat_index`：让它中毒（或者续满 8 秒，X_Mod §93）。
+
+    ★ 免伤不挡**挂毒**，只挡每一跳（`OnHit` 那几道门），所以这里不问 `_immune`。
+    ★ 躺着的不挂：`Die` 已经把属性表清空，复活时 `Respawn` 又清一次。
+    """
+    ledger = _health(room)
+    if (ledger is None or not isinstance(seat_index, int)
+            or not 0 <= seat_index < len(room.seats)
+            or _lying_dead(room, seat_index)):
+        return
+    fresh = not ledger.poisoned(seat_index)
+    ledger.poison(seat_index, _now(), gameserver.POISON_SECONDS)
+    if fresh:
+        asynclog.emit(f"[{gameserver.ts()}] [bot] 座位{seat_index} 中毒"
+                      f"（{source}，{gameserver.POISON_SECONDS:g} 秒里每 "
+                      f"{gameserver.POISON_INTERVAL:g} 秒 {gameserver.POISON_DAMAGE} 点，X_Mod §93）")
+
+
+def _advance_poison(room, ledger):
+    """把到点的毒按客户端的节奏扣进台账（X_Mod §93）。
+
+    ★ 每一跳走的是 `OnHit`（`0x509d64`），所以免伤中的那一跳**白跳**（不补），
+      `_note_damage` 按那一跳的时刻问 `_immune`。
+    ★ 这里的「每 1.504 秒一跳」是原版数据（`Status.ini [11] Interval=1.5` 换成
+      32 ms 格子），不是我们挑的定时器 —— 和 `_advance_hp_charges()` 同一档。
+    """
+    for seat, at in ledger.due_poison_ticks(_now(), gameserver.POISON_INTERVAL):
+        _note_damage(room, seat, gameserver.POISON_DAMAGE, at=at)
+
+
+def _bullets_poisoned(machine, weapon):
+    """bot 这一发打出去的子弹带不带毒（X_Mod §93）。
+
+    收方处理 `rpFire` 时按**它自己那份**射手的属性 10 给每一颗挂毒（`0x492210`），
+    唯独武器带 `TotemId`（`0x50a1be`）或 `AutoFireCount`（`0x50a195`）的不挂 ——
+    后者全表只有训练 / 特殊枪有，产物里没这一格，按没有算。
+    """
+    return (gameserver.POISON_MAGAZINE_ATTR in machine.magazine_attrs
+            and not weapon.get("totem_id"))
+
+
+def _clear_seat_statuses(room, seat_index):
+    """这个座位身上的状态**全没了**（死了 `Die` / 复活 `Respawn`，X_Mod §93）。
+
+    客户端两处都是整张属性表清掉、**不发 `0x040d`**：`Die` `0x4ffd1c`、
+    `Respawn` `0x503094`（清 0..20 再挂状态 0）。服务端替它记的那几份跟着清：
+    中毒、护盾、反射、回复剂、毒弹弹匣；bot 的按发数状态（强力 / 三连 / 毒弹）
+    也清掉 —— 不清的话 bot 复活后还是两倍伤害、两倍弹体，别人屏幕上却是普通弹。
+    """
+    ledger = _health(room)
+    if ledger is not None:
+        ledger.drop_statuses(seat_index)
+    quest = None if room is None else room.quest
+    if quest is not None:
+        for table in ("shield_until", "reflect_until", "hp_charges"):
+            getattr(quest, table, {}).pop(seat_index, None)
+        getattr(quest, "poison_magazine", set()).discard(seat_index)
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    machine = None if seat is None else seat.conn
+    if isinstance(machine, BotConn) and machine.magazine_attrs:
+        machine.log(f"   死了：身上的按发数状态 {sorted(machine.magazine_attrs)}"
+                    f" 跟着清掉（客户端 `Die` 整表清，X_Mod §93）")
+        machine.magazine_attrs = {}
+
+
+def _immune(room, seat_index, now):
+    """这个座位此刻挨打会不会**整发不扣血**（`Character::OnHit` 进门那几道门）。
+
+    | 门 | 来源 | 服务端怎么知道 |
+    |---|---|---|
+    | 状态 0（1.984 秒）| 每次复活（`Respawn` `0x5030b9`）| `_refresh_health` 的「躺 -> 站」翻转 |
+    | 状态 0x10（6.976 秒）| 夺分里被敌人打死后复活（`0x50311f`）| 同上 + `quest.last_killer`（`_rage_revival`）|
+    | 状态 0x14（8 秒）| 闯关达人称号 25% 掷中（内层 `0x001a`）| `note_peer_hit` |
+    | 属性 1 护盾（8 秒）| 道具 10300 | `quest.shield_until`（`note_area_item`）|
+
+    ★ **进图不挂**（X_Mod §94 订正 §92 / V0.3bot §74）：`Respawn` 只从 `0x0419`
+      进来，开局 / 换图都不走它；Init（`0x4fb6f9`）反而是把 0 / 0x10 / 0x14 撤掉。
+    """
+    ledger = _health(room)
+    if ledger is not None and ledger.immune_at(seat_index, now):
+        return True
+    quest = None if room is None else room.quest
+    shields = getattr(quest, "shield_until", None)
+    return bool(shields) and now < shields.get(seat_index, float("-inf"))
 
 
 def _seat_gear(room, seat_index):
@@ -3586,30 +3776,158 @@ def _refresh_health(room):
     for index, seat in enumerate(room.seats):
         if seat is None:
             continue
-        if ledger.note_lying(index, _lying_dead(room, index)):
+        lying = _lying_dead(room, index)
+        if lying and not ledger.lying.get(index, False):
+            # ★ 刚倒下：`Character::Die` 把属性表整个清掉（X_Mod §93）。
+            _clear_seat_statuses(room, index)
+        if ledger.note_lying(index, lying):
+            # ★ `Character::Respawn`：满血（`0x503063`）+ 属性表清空 +
+            #   状态 0 锁 2 秒（X_Mod §92 / §93）；夺分里被敌人打死的再挂
+            #   状态 0x10「분노부활」7 秒（§94）。
             ledger.reset(index)
+            _clear_seat_statuses(room, index)
+            now = _now()
+            ledger.grant_immunity(index, now + SPAWN_IMMUNE_S, state=0)
+            if _rage_revival(room, index):
+                ledger.grant_immunity(index, now + RAGE_REVIVAL_S, state=0x10)
+    _drain_heal_events(room, ledger)
     _advance_hp_charges(room, ledger)
+    _advance_poison(room, ledger)
     _heal_humans_in_totems(room)
 
 
-def _advance_hp_charges(room, ledger):
-    """把 HP 回复剂那 8 跳按原版节奏加进台账（`Status.ini[8]`，§122）。
+def _rage_revival(room, seat_index):
+    """这次复活挂不挂状态 0x10「분노부활」（7 秒整发不扣血，X_Mod §94）。
 
-    ★ 这里的「每 1 秒一跳」**是原版数据**（`Interval=1.0`），不是我们挑的
-    定时器 —— 铁律 10 禁的是拿观测值当阈值，照抄原版节奏不在此列。
+    照 `Respawn` `0x5030c7`~`0x503103`，四条全成立才挂：
+    夺分（`0x409e0a == 3`）、凶手那一格（`[char+0x158]` = `0x0408` 的凶手）有人、
+    凶手和自己**碰撞组不同**（个人战是座位 + 1，组队战是队伍号）、上一次死不是
+    自杀（`[char+0x724]`，只在凶手 == 自己那一支置位）。
+    """
+    if _pvp_game_mode(room) != RAGE_REVIVAL_MODE:
+        return False
+    quest = None if room is None else room.quest
+    killer = getattr(quest, "last_killer", {}).get(seat_index)
+    if killer is None or killer == seat_index:
+        return False
+    if not 0 <= killer < len(room.seats) or room.seats[killer] is None:
+        return False
+    return _seat_group(room, killer) != _seat_group(room, seat_index)
+
+
+#: `Respawn` 挂状态 0x10 的那个模式号（`0x5030cc cmp eax, 3`）—— 夺分。
+RAGE_REVIVAL_MODE = 3
+
+#: 状态 0x10 挂多久：`7000 / 32` = 218 格（`0x503110`）。
+RAGE_REVIVAL_S = (7000 // 32) * 0.032
+
+
+def _advance_hp_charges(room, ledger):
+    """回复剂（`Status.ini [8]`）按客户端的节奏一滴一滴加进台账（X_Mod §94）。
+
+    客户端 `0x509dd7`~`0x509e94`，**每一格**（32 ms）跑一次：
+
+        装：属性 8 还在、`[c+0x690] < now` ⇒ 这一轮 10 滴、`[c+0x690] = now + 31 格`
+        滴：还有剩的 ⇒ HP +1（夺分再 +1）；超过满血就夹到满血并**把这一轮剩下的作废**
+
+    ⇒ 用了**当场**就开始回（以前按「1 秒后第一跳」算，晚了一秒），32 格一轮、
+      8 轮 = 80 点，**夺分是 160 点**（以前一律 80）。
+    ★ 一滴 = 一格，所以这个函数必须**每格恰好调一次**（`_refresh_health` 就是）。
+    ★ 「每 32 格一轮」是原版数据（`Interval=1.0` 换成格子），不是我们挑的定时器。
     """
     charges = getattr(room.quest, "hp_charges", None)
-    if not charges:
+    if charges is None:
         return
     now = _now()
-    for seat in list(charges):
-        entry = charges[seat]
-        while entry[1] > 0 and now >= entry[0]:
-            ledger.note_heal(seat, gameserver.HP_CHARGE_AMOUNT)
-            entry[0] += gameserver.HP_CHARGE_INTERVAL
-            entry[1] -= 1
-        if entry[1] <= 0:
-            charges.pop(seat, None)
+    per_drip = 2 if _pvp_game_mode(room) == HP_CHARGE_DOUBLE_MODE else 1
+    for seat in set(charges) | set(ledger.charge_drips):
+        until = charges.get(seat)
+        if until is not None and now > until:
+            charges.pop(seat, None)               # 属性 8 到期（`0x401c2f`）
+            until = None
+        if until is not None and ledger.charge_next.get(seat, float("-inf")) < now:
+            ledger.charge_drips[seat] = HP_CHARGE_DRIPS
+            # ★ 多给半格：`now + 31` 格那一刻不能被当成「已经过了」（浮点），
+            #   第 32 格才装下一轮 —— 和客户端的严格小于同一个结果。
+            ledger.charge_next[seat] = now + (HP_CHARGE_PERIOD_TICKS - 0.5) * 0.032
+        left = ledger.charge_drips.get(seat, 0)
+        if left <= 0 or _lying_dead(room, seat):
+            continue
+        if per_drip > ledger.taken_by(seat):
+            ledger.note_heal(seat, per_drip)      # 夹到满血
+            ledger.charge_drips[seat] = 0         # 这一轮剩下的作废（`0x509e7e`）
+        else:
+            ledger.note_heal(seat, per_drip)
+            ledger.charge_drips[seat] = left - 1
+
+
+#: 回复剂一轮几滴（`[c+0x6e0] = 10`，就是 `Status.ini [8] Hp=10`）。
+HP_CHARGE_DRIPS = 10
+
+#: 几格装一轮：`[c+0x690] = now + 1000/32`，严格小于 ⇒ 第 32 格。
+HP_CHARGE_PERIOD_TICKS = 1000 // 32 + 1
+
+#: 夺分里每滴多回一点（`0x509e5c` 那道模式判断）。
+HP_CHARGE_DOUBLE_MODE = 3
+
+
+def _heart_heal_amount(room):
+    """捡到地上那颗「心」回多少（X_Mod §94）。
+
+    构造函数 `0x5227d6` 恒给 15（工厂那几处都传 0）；捡的时候夺分 / 描述符类型 5
+    再 `× 2.67` 取整 = 40（`0x52299a`~`0x5229c7`）。
+    """
+    session_type = getattr(room, "session_type", equipbonus.SESSION_TYPE_NORMAL)
+    if (_pvp_game_mode(room) == HP_CHARGE_DOUBLE_MODE
+            or session_type == equipbonus.SESSION_TYPE_LADDER):
+        return int(HEART_HEAL * mapdata.f32(2.67))
+    return HEART_HEAL
+
+
+#: 心的回血量（`0x5228f9`，`arg4 > 0 ? arg4 : 15`）。
+HEART_HEAL = 15
+
+
+def _drain_heal_events(room, ledger):
+    """把 `gameserver` 记下的回血事件扣进台账（X_Mod §94）。
+
+    | 事件 | 客户端 | 这里 |
+    |---|---|---|
+    | 捡心（`claim_item`）| 捡的人回 15（夺分 40），夹满血 | 同 |
+    | `0x040a` 10316 HeartBoostHpUp | 目标回 `量` 一次（满血就不回）| 同 |
+    | `0x040a` 10315 하트（[红心达人]）| 目标每有一个「活着、同组、不是发起人」的角色就回一次 `量` | 同 |
+
+    ★ 后两件还有个副作用：它们落进 `UseItemEffect` 的通用分支、`CharAttr` 是 0 ⇒
+      `Add(状态 0, 0 格)` = **把目标的复活免伤撤掉**（`0x508db6`）。
+    ★ 躺着的不回（`SetHp` 在死了时存 0，`0x4fed0c`）。
+    """
+    quest = None if room is None else room.quest
+    events = getattr(quest, "heal_events", None)
+    while events:
+        try:
+            kind, seat, amount, initiator = events.popleft()
+        except IndexError:
+            break
+        if not 0 <= seat < len(room.seats) or room.seats[seat] is None:
+            continue
+        if kind == "heart":
+            if not _lying_dead(room, seat):
+                ledger.note_heal(seat, _heart_heal_amount(room))
+            continue
+        ledger.revoke_immunity(seat, 0)
+        if _lying_dead(room, seat):
+            continue
+        if kind == gameserver.HEART_BOOST_ITEM_ID:
+            ledger.note_heal(seat, amount)
+        elif (kind == gameserver.TITLE_HEART_ITEM_ID and amount
+              and 0 <= initiator < len(room.seats)
+              and room.seats[initiator] is not None):
+            group = _seat_group(room, seat)
+            for other, taken in enumerate(room.seats):
+                if (taken is not None and other != initiator
+                        and not _lying_dead(room, other)
+                        and _seat_group(room, other) == group):
+                    ledger.note_heal(seat, amount)
 
 
 def _seat_velocity(room, seat_index):
@@ -7360,6 +7678,11 @@ def _aim_point(room, seat_index, x, y, crouched):
 #: 不是定时器。
 BOT_ACTION_LOCK_S = 2.0
 
+#: 同一道「状态 0」锁的另一半：**不扣血**（X_Mod §92）—— `OnHit` 进门第一道
+#: 就是 `0x4ff2ab push 0 ; call 0x401c0c`。服务端的血量台账跟着免伤（`_immune`）。
+#: 按格子算：`2000 / 32` = 62 格 = 1.984 秒（`0x5030a6`）。
+SPAWN_IMMUNE_S = (2000 // 32) * 0.032
+
 
 def _note_action_lock(room, machine, seat_index, now):
     """维护「现在能不能动手」这道锁 —— 按**状态翻转**上锁（§74）。
@@ -8243,7 +8566,7 @@ class Shell(object):
                  "shot", "born", "born_tick", "ticks", "x", "y",
                  "max_ticks",
                  "vx", "vy", "locked", "bounced",
-                 "damage_ratio", "size_ratio", "blocked_at")
+                 "damage_ratio", "size_ratio", "blocked_at", "poisoned")
 
     def __init__(self, handle, fire_seq, weapon, group, x0, y0, shot, born,
                  max_ticks, born_tick=0):
@@ -8284,6 +8607,9 @@ class Shell(object):
         #:   不跟着状态到期变 —— 这一颗已经飞出去了。
         self.damage_ratio = 1.0
         self.size_ratio = 1.0
+        #: ★ 带毒（X_Mod §93）：开火那一刻射手身上挂着毒弹。收方各自在自己那份
+        #:   射手属性上判（`0x492210`），直接命中就给被打的人挂毒。
+        self.poisoned = False
         #: ★★ 最后一格**把它挡住的那个探针格** `(x, y)`（客户端 `0x50e759` 的
         #:   `hit.cell`，X_Mod §79）；这一格没撞地形就是 `None`。V0.3 §161「掉出
         #:   下边界」的判据就是这一格在不在图外（`_shell_fell_out_of_the_world`）。
@@ -9674,6 +10000,10 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region, tick):
     #   bot」时服务端才要自己补一份 —— 真人那份归他自己那台机器。
     if hit:
         _note_damage(room, victim_seat, damage)     # ★ 血量台账（M5-C）
+        if shell.poisoned:
+            # ★ 带毒的弹直接命中 ⇒ 挂毒（`BulletObj::HitObject` `0x47f096`，
+            #   X_Mod §93）。溅射 / 火墙从来不带毒，只有这一路。
+            _poison_seat(room, victim_seat, "bot 的毒弹")
         vx, vy = _shell_velocity(shell)
         _knock_back_seat(room, victim_seat, damage,
                          knockback_vector(vx, vy, damage),
@@ -9695,20 +10025,21 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region, tick):
         #   而真人扔的同一颗手雷会把人顶飞 —— 用户 2026-08-28 报的就是这个。
         splashed_mob = (seat_index[1] if isinstance(seat_index, tuple)
                         else None)
+        splash_flags = 0
         if splashed_mob is None:
             # ★ 受害者一侧（X_Mod §91）：`SplashDamage` 的 `[vft+0x128]` 就是
-            #   `0x4806bf`，衰减、×2 之后同一个函数的尾巴。`rpSplashDamaged`
-            #   没有 flags 那一格（`+12` 恒 0，`vft+0x138` 是 `xor eax,eax`），
-            #   所以收方不画字，只是这一下伤害变了。
-            splash, _flags = _victim_side(room, machine, seat_index, splash,
-                                          "溅射")
+            #   `0x4806bf`，衰减、×2 之后同一个函数的尾巴。flags 进 `+29`
+            #   （X_Mod §92：收方拿它当 OnHit 的 flags、画「DEFENSE!」/「LUCKY!」）。
+            splash, splash_flags = _victim_side(room, machine, seat_index,
+                                                splash, "溅射")
         _emit(machine, machine.sync.event(
             botsync.OP_SPLASH_DAMAGED,
             botsync.splash_body(shell.handle,
                                 splashed_mob if splashed_mob is not None
                                 else botsync.character_handle(seat_index),
                                 splash, where[0], where[1],
-                                push_x=push[0], push_y=push[1])))
+                                push_x=push[0], push_y=push[1],
+                                flags=splash_flags)))
         if splashed_mob is not None:
             # 怪没有血量台账，击退也归控制者那台算 —— 这边只记分（§130）。
             _score_quest_damage(room, machine, splash)
@@ -10014,12 +10345,12 @@ def _advance_fires(room, machine, now):
                              else None)
                 who = (f"怪 {burnt_mob}" if burnt_mob is not None
                        else f"座位{seat_index}")
-                hurt = damage
+                hurt, burn_flags = damage, 0
                 if burnt_mob is None:
                     # ★ 受害者一侧（X_Mod §91）：`Flame` 的 `[vft+0x128]` 也是
                     #   `0x4806bf`。每个人各算各的，所以放在人头这一层。
-                    hurt, _flags = _victim_side(room, machine, seat_index,
-                                                damage, "地面燃烧")
+                    hurt, burn_flags = _victim_side(room, machine, seat_index,
+                                                    damage, "地面燃烧")
                 machine.log(f"   火烧: {who} 在 "
                             f"({lit.x:.0f}, {lit.y:.0f}) 挨了 {hurt} 点"
                             f"（第 {local} tick，火团句柄 {lit.handle}，§78/§85）")
@@ -10032,7 +10363,8 @@ def _advance_fires(room, machine, now):
                                             seat_index),
                                         hurt, lit.x, lit.y,
                                         push_x=FIRE_KNOCKBACK[0],
-                                        push_y=FIRE_KNOCKBACK[1])))
+                                        push_y=FIRE_KNOCKBACK[1],
+                                        flags=burn_flags)))
                 if burnt_mob is not None:
                     _score_quest_damage(room, machine, hurt)
                     continue
@@ -10263,14 +10595,18 @@ def _split_shell(room, machine, shell, point, victim_seat, tick):
             group=botsync.FIRE_GROUP_EVERYONE)
         _emit(machine, packet)
         max_ticks = _shell_max_ticks(terrain, shot, slice_weapon)
+        # ★ 碎片也是一发 `rpFire`：收方照样按**此刻**射手身上有没有毒弹
+        #   给它挂毒（X_Mod §93）；它是 `Type=Splinter`，不消耗毒弹那一格。
+        poisoned = _bullets_poisoned(machine, slice_weapon)
         for offset in range(slice_weapon.shots):
             # ★ 碎片的时钟原点就是**母弹炸开的这一格**（D106）：
             #   收方也是在处理这一发 `rpFire` 的那一帧才建它们的。
-            machine.pending_shots.append(
-                Shell(handle + offset, fire_seq, slice_weapon,
-                      botsync.FIRE_GROUP_EVERYONE, point[0], point[1],
-                      shot, _tick_moment(shell, tick), max_ticks,
-                      born_tick=tick))
+            piece = Shell(handle + offset, fire_seq, slice_weapon,
+                          botsync.FIRE_GROUP_EVERYONE, point[0], point[1],
+                          shot, _tick_moment(shell, tick), max_ticks,
+                          born_tick=tick)
+            piece.poisoned = poisoned
+            machine.pending_shots.append(piece)
         fire_seq = machine.sync.events
     if not machine.split_logged:
         machine.split_logged = True
@@ -10508,11 +10844,12 @@ def _advance_dash(room, machine, now):
             push = (DASH_KNOCKBACK[0] * facing, DASH_KNOCKBACK[1])
             mob_handle = (seat_index[1] if isinstance(seat_index, tuple)
                           else None)
+            dash_flags = 0
             if mob_handle is None:
                 # ★ 受害者一侧（X_Mod §91）：`0x4806bf` 的尾巴。它后面那条
                 #   DashAttack 加成是射手一侧的（`0x481e40`），bot 是白板号。
-                damage, _flags = _victim_side(room, machine, seat_index,
-                                              damage, "近身")
+                damage, dash_flags = _victim_side(room, machine, seat_index,
+                                                  damage, "近身")
             _emit(machine, machine.sync.event(
                 botsync.OP_SPLASH_DAMAGED,
                 botsync.splash_body(
@@ -10522,7 +10859,7 @@ def _advance_dash(room, machine, now):
                     damage,
                     x + offset[0] * facing,
                     y + offset[1],
-                    push_x=push[0], push_y=push[1])))
+                    push_x=push[0], push_y=push[1], flags=dash_flags)))
             if mob_handle is None:
                 _note_damage(room, seat_index, damage)   # ★ 血量台账（M5-C）
                 _knock_back_seat(room, seat_index, damage, push,
@@ -10682,6 +11019,9 @@ def _try_fire(room, machine, seat_index, weapon, target, now, tick):
     # ★★ 这一颗的倍率在**开火那一刻**定死（§117）：状态可能在它飞到一半
     #    时打完撤掉，可这一颗已经是放大过的了。
     damage_ratio, size_ratio = _magazine_ratios(machine)
+    # ★ 带不带毒同样在开火那一刻定（X_Mod §93），下面 `_spend_magazine_shots`
+    #   可能就把毒弹这一格撤掉了。
+    poisoned = _bullets_poisoned(machine, weapon)
     step = weapon.fire_step
     # ★★★ 碰撞排除组（§63）：**填错就是「明明躲开了还掉血」**。
     #   收方把它写进弹体的 `[proj+0x15c]`，和角色的一比，相同就整个跳过
@@ -10747,6 +11087,7 @@ def _try_fire(room, machine, seat_index, weapon, target, now, tick):
                       born_tick=tick)
         shell.damage_ratio = damage_ratio
         shell.size_ratio = size_ratio
+        shell.poisoned = poisoned
         machine.pending_shots.append(shell)
     machine.next_fire_at = _reload_after_shot(machine, weapon, now)
     # ★★ 这一发的瞄准失误用掉了 —— 下一发重掷（M5-D）。判据是「打了一枪」
@@ -11290,11 +11631,17 @@ def report_bots_loaded(room, why, confirmed=False, who=None):
     `0x4005` 是可丢的立即包，重画同一个 100 既不吃事件序号，
     也不改收包队列。
     """
-    # ★★ 血量台账整本清空（M5-C）：`0x0400` / `0x0417` 广播那一刻，
-    #    每台客户端都把角色重建成满血 —— 和 `reset_battle_frame()` 同一个事件。
+    # ★★ 血量台账**不清**（X_Mod §94 订正 M5-C）：闯关换图时客户端把同一批角色
+    #    对象摘下来再挂回去（`0x47900a`），HP、死没死都带过去；新一局则是
+    #    `0x0402` 那一刻 `room.quest` 整个换新，账本来就是新的。
+    #    只把**状态**当作过期：加载那几秒客户端的属性要么到点、要么停着，服务端
+    #    这边的计时却一直在走，留着只会在加载完那一格补跳一堆 —— 和
+    #    `begin_map_change` 清反射 / 回复剂同一个取舍。
     ledger = _health(room)
-    if ledger is not None:
-        ledger.clear()
+    if ledger is not None and not confirmed:
+        for index, seat in enumerate(room.seats):
+            if seat is not None:
+                ledger.drop_statuses(index)
     for index in room.bot_seats():
         seat = room.seats[index]
         machine = None if seat is None else seat.conn

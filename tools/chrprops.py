@@ -51,7 +51,8 @@ ROOT = os.path.dirname(HERE)
 
 #: 产物格式版本。加/改字段时 +1，加载器拿它判「这份产物是不是我认识的」。
 #: ★ 2（会话 19）：加了 `game` 段（`GameProps.ini` 的体力常量）。
-FORMAT = 2
+#: ★ 3（X_Mod 会话 38）：`game` 段加 `guard_damage_rate`（格挡着挨打扣几成，§92）。
+FORMAT = 3
 
 #: `GameProps.ini` 里和**体力**有关的常量 —— 冲刺攻击要花体力，
 #: 而「花多少、回多快」这两个数原版都写在那儿，一个都不用自己编。
@@ -61,6 +62,7 @@ _GAME_FIELDS = (
     ("FastRunSpCost",  "fast_run_sp_cost",  float),   # 冲刺跑每 tick 花多少
     ("GuardSpCost",    "guard_sp_cost",     float),
     ("AssultSpCost",   "assault_sp_cost",   float),
+    ("GuardDamageRate", "guard_damage_rate", float),  # `int(这个 × 伤害 + 1)`，X_Mod §92
 )
 
 #: 节名就是 0..16 的序号，**不是角色 id** —— 角色 id 在 `ChrIndex` 里

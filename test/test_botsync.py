@@ -8846,6 +8846,22 @@ class BotVictimSideTests(VictimSideMixin, BotFireRoom):
         self.assertEqual(10.0, ledger.remaining(
             self.alice_seat, bot._seat_max_hp(self.room, self.alice_seat)))
 
+    def test_a_poisoned_shell_poisons_on_a_direct_hit(self):
+        """bot 挂着毒弹打出去的弹，直接命中 ⇒ 被打的人中毒（X_Mod §93）。"""
+        self.bot_conn.magazine_attrs = {gameserver.POISON_MAGAZINE_ATTR: 3}
+        shell = self.shell_at(100.0, 80.0)
+        shell.poisoned = bot._bullets_poisoned(self.bot_conn, shell.weapon)
+        self.assertTrue(shell.poisoned)
+        bot._resolve_shell(self.room, self.bot_conn, shell, (100.0, 80.0),
+                           self.alice_seat, "body", 0)
+        self.assertTrue(bot._health(self.room).poisoned(self.alice_seat))
+
+    def test_the_totem_launcher_never_carries_poison(self):
+        """带 `TotemId` 的武器收方不给挂毒（`0x50a1be`）。"""
+        self.bot_conn.magazine_attrs = {gameserver.POISON_MAGAZINE_ATTR: 3}
+        self.assertFalse(bot._bullets_poisoned(self.bot_conn,
+                                               weapondata.get(1003030)))
+
     def test_a_splash_can_be_lucky_too(self):
         """溅射包没有 flags 那一格，只是伤害变成 0（`SplashDamage [vft+0x128]` = `0x4806bf`）。"""
         self.wear(self.alice, bot.LUCKY_SURVIVOR_ID)
@@ -8860,6 +8876,9 @@ class BotVictimSideTests(VictimSideMixin, BotFireRoom):
                 == botsync.character_handle(self.alice_seat)]
         self.assertEqual(1, len(mine), "她在溅射范围里")
         self.assertEqual(0.0, struct.unpack_from("<f", body_of(mine[0]), 8)[0])
+        # ★ flags 进 `+29`（X_Mod §92）：收方拿它画「LUCKY!」。
+        self.assertTrue(struct.unpack_from("<i", body_of(mine[0]), 29)[0]
+                        & bot.EXPLODE_FLAG_LUCKY)
 
     def test_a_burn_can_be_lucky_too(self):
         """地面燃烧：`Flame [vft+0x128]` 也是 `0x4806bf`。夹具写法见
@@ -8997,11 +9016,22 @@ class BotHealthLedgerTests(HumanShotRoom):
             600.0, 150.0, push_x=1.0, push_y=-1.0))
         self.assertEqual(25.0, self.ledger().taken_by(self.alice_seat))
 
-    def test_a_new_round_wipes_the_whole_book(self):
+    def test_a_map_change_keeps_the_book(self):
+        """★ X_Mod §94（推翻 M5-C 的「换图清零」）：闯关换图时客户端把同一批角色
+        对象摘下来再挂回去（`0x47900a`），HP 带过去 —— 台账跟着不清。"""
         self.splash(30, (12.0, -9.0))
+        taken = self.ledger().taken_by(self.bot_seat)
+        self.assertGreater(taken, 0)
         for index in self.room.bot_seats():
             self.room.seats[index].conn.load_progress = 0
-        bot.report_bots_loaded(self.room, "单测：新一局")
+        bot.report_bots_loaded(self.room, "单测：换图")
+        self.assertEqual(taken, self.ledger().taken_by(self.bot_seat))
+
+    def test_a_new_round_starts_a_new_book(self):
+        """新一局 = `0x0402` 那一刻 `room.quest` 整个换新 —— 账挂在它上面，跟着是新的。"""
+        self.splash(30, (12.0, -9.0))
+        self.room.quest = gameserver.new_room_quest(
+            self.room, [i for i, s in enumerate(self.room.seats) if s is not None])
         self.assertEqual({}, self.ledger().taken)
 class BotDodgeTests(HumanShotRoom):
     """★★ M5-E：真人朝 bot 打一发，它得**真的躲开**。
@@ -9253,17 +9283,49 @@ class BotItemUseTests(HumanShotRoom):
                                            self.bot_seat))
 
     def test_the_medkit_really_heals_the_ledger(self):
-        """★ `Status.ini[8]`：8 秒 × 每秒 10 点。台账不跟着回，
-        「谁先倒」就会一直按残血算（§122）。"""
+        """★ `Status.ini[8]`（X_Mod §94）：用了**当场**开始，32 格装一轮 10 滴、
+        一格一滴 +1（夺分 +2）。台账不跟着回，「谁先倒」就会一直按残血算（§122）。"""
         book = bot._health(self.room)
-        book.note_damage(self.bot_seat, 50)
+        book.note_damage(self.bot_seat, 90)
         self.hold(gameserver.HP_CHARGE_ITEM_ID)
         bot._use_held_item(self.room, self.bot_conn, self.bot_seat)
-        charge = self.room.quest.hp_charges[self.bot_seat]
-        self.assertEqual(8, charge[1])
-        charge[0] = time.monotonic() - 0.001      # 把第一跳拨到过去
-        bot._refresh_health(self.room)
-        self.assertEqual(40.0, book.taken_by(self.bot_seat))
+        drip = 2 if bot._pvp_game_mode(self.room) == 3 else 1
+        t0 = time.monotonic()
+
+        def tick(k):
+            with bot._tick_clock(t0 + k * 0.032):
+                bot._refresh_health(self.room)
+
+        for k in range(10):
+            tick(k)
+        self.assertEqual(90 - 10 * drip, book.taken_by(self.bot_seat),
+                         "第一轮当场就滴完了")
+        for k in range(10, 32):
+            tick(k)
+        self.assertEqual(90 - 10 * drip, book.taken_by(self.bot_seat),
+                         "第 32 格才装下一轮")
+        for k in range(32, 42):
+            tick(k)
+        self.assertEqual(90 - 20 * drip, book.taken_by(self.bot_seat))
+
+    def test_the_medkit_stops_a_round_at_full_health(self):
+        """滴到满血那一滴把这一轮剩下的作废（`0x509e7e`）——之后再挨打也不接着滴。"""
+        book = bot._health(self.room)
+        book.note_damage(self.bot_seat, 1)
+        self.hold(gameserver.HP_CHARGE_ITEM_ID)
+        bot._use_held_item(self.room, self.bot_conn, self.bot_seat)
+        t0 = time.monotonic()
+        # 差 1 滴：+1 的模式第 0 格正好滴满、第 1 格溢出；+2 的模式第 0 格就溢出。
+        # 两种都在「溢出」那一滴作废整轮（客户端是 `hp > MaxHp`，正好满不算）。
+        for k in range(2):
+            with bot._tick_clock(t0 + k * 0.032):
+                bot._refresh_health(self.room)
+        self.assertEqual(0, book.taken_by(self.bot_seat))
+        book.note_damage(self.bot_seat, 10)
+        for k in range(2, 20):
+            with bot._tick_clock(t0 + k * 0.032):
+                bot._refresh_health(self.room)
+        self.assertEqual(10, book.taken_by(self.bot_seat), "这一轮已经作废")
 
     def test_a_bots_smoke_is_registered_too(self):
         """★ 以前 bot 放的烟 / 冰冻 / 糊屏**一件都没登记过**（读的是

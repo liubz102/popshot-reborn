@@ -776,31 +776,36 @@ SPLASH_BODY_SIZE = _SPLASH.size
 
 
 def splash_body(source_handle, target_handle, damage, x, y,
-                push_x=0.0, push_y=0.0):
+                push_x=0.0, push_y=0.0, flags=0):
     """`0x0004 rpSplashDamaged`（33 字节）：**这个爆炸溅到了那个人**（§67）。
 
     ```
     +0   i32  伤害源的句柄（弹体 / 溅射对象 / 冲刺伤害对象）
     +4   i32  ★ 受害者的**角色句柄**（`character_handle()`）
     +8   f32  ★ 伤害值
-    +12  u8   语料 13160 发**恒 0**
+    +12  u8   伤害类 `vft+0x138` 的返回值 —— 全部是 `xor eax,eax` ⇒ 恒 0
     +13  f32  击退向量 X（±15 / ±4 那一类）
     +17  f32  击退向量 Y（观测多为负 = 往上顶）
     +21  f32  受击点 X
     +25  f32  受击点 Y
-    +29  i32  语料 13160 发**恒 0**
+    +29  i32  ★ flags —— 和 `rpExplode +20` 同一个字（X_Mod §92）
     ```
 
     出处：组包点 `0x492b83`（§23 已经量出长度 33 和字段宽度），字段含义是
     从 13160 发真人语料反推的 —— `+4` 全部是 `座位×100000+100001` 那一族
     角色句柄，`+8` 落在 0~23 的整数伤害上，`+21/+25` 是地图坐标。
+    `+29` 是逐指令看出来的：`0x480f0f push [ebp-8]`（`0x4806bf` 一路 `or` 出来
+    的 flags）是 `0x492b63` 的第 5 个参数，`0x492bf6` 把它写在最后。收方
+    `0x492cc6` 把它原样当 `Character::OnHit` 的 flags（`0x80` 格挡就看它），
+    `0x492c96` 还交给伤害源的 `vft+0x12c` 画「DEFENSE!」/「LUCKY!」。
+    语料里恒 0 只是那时候没人穿防御装备、没人格挡着挨近身。
 
     ⚠ 这一发**不吃弹体句柄**（它不创建对象，只是报「谁被溅到了」），
     但它是事件包，照样吃一个事件序号。
     """
     return _SPLASH.pack(int(source_handle), int(target_handle), float(damage),
                         0, float(push_x), float(push_y),
-                        float(x), float(y), 0)
+                        float(x), float(y), int(flags))
 
 
 _SET_ON_FIRE = struct.Struct("<BBffi")

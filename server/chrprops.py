@@ -62,7 +62,8 @@ import os
 #: 认得的产物格式版本。对不上就当没有数据 —— 退回下面那组默认尺寸，
 #: 而不是按错的布局解出一堆乱七八糟的圆。
 #: ★ 2（会话 19）：加了 `game` 段（`GameProps.ini` 的体力常量）。
-FORMAT = 2
+#: ★ 3（X_Mod 会话 38）：`game` 段多了 `guard_damage_rate`（§92）。
+FORMAT = 3
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "bot_chrprops.json")
@@ -98,11 +99,14 @@ DEFAULT_GAME = {
     "fast_run_sp_cost": 1.5,      # 冲刺跑每 tick 花多少
     "guard_sp_cost": 0.5,
     "assault_sp_cost": 40.0,
+    # 格挡着正面挨打只扣 `int(这个 × 伤害 + 1)`（`0x4ff4dd`，X_Mod §92）；
+    # exe 里的缺省值 `0x6937ac` 也是 0.25。
+    "guard_damage_rate": 0.25,
 }
 
 
 class GameProps(object):
-    """`GameProps.ini` 里和体力有关的几个数。"""
+    """`GameProps.ini` 里和体力、格挡有关的几个数。"""
 
     __slots__ = ("raw",)
 
@@ -126,6 +130,11 @@ class GameProps(object):
     def fast_run_sp_cost(self):
         """按着右键冲刺跑时，每个 tick 花多少体力。"""
         return self._num("fast_run_sp_cost")
+
+    @property
+    def guard_damage_rate(self):
+        """格挡着挨打时伤害乘多少（`GuardDamageRate`，X_Mod §92）。"""
+        return self._num("guard_damage_rate")
 
 
 class Move(object):

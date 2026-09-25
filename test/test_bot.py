@@ -1320,6 +1320,267 @@ class BotHealTotemTests(BotBattleRoom):
         self.assertEqual("去回血图腾", self.machine.diag_src[0])
 
 
+def splash_payload(target_handle, damage=12.0, flags=0):
+    """一发真人打过来的 `0x0004 rpSplashDamaged`（33 字节，`+29` = flags）。"""
+    return udp_packet(inner=botsync.OP_SPLASH_DAMAGED,
+                      body=botsync.splash_body(7, target_handle, damage,
+                                               10.0, 20.0, flags=flags))
+
+
+class BotLedgerSyncTests(BotBattleRoom):
+    """★★ 服务端的血量台账要和**收方真正扣掉的**对上（X_Mod §92）。
+
+    台账错了的后果：bot 以为某人残血 / 满血而进退判反，[幸运幸存者] 那道
+    「剩余 HP < 15」掷错。收方 `Character::OnHit` 那几条规矩逐条钉在这儿。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.ledger = bot._health(self.room)
+        # 开局那 2 秒免伤（tick 0 挂的）不是这一组要验的，先摘掉。
+        self.ledger.immune.clear()
+
+    def taken(self):
+        return self.ledger.taken_by(self.bot_seat)
+
+    # --- 截断 / 格挡 ---------------------------------------------------------
+    def test_the_damage_is_truncated_like_the_client(self):
+        """分发器拿 `_ftol2` 把 f32 截成整数再扣（`0x491930`）。"""
+        bot.note_peer_hit(self.room, self.alice,
+                          explode_payload(self.bot_handle, damage=12.9))
+        self.assertEqual(12, self.taken())
+
+    def test_a_guarded_hit_lands_a_quarter_plus_one(self):
+        """flags 带 0x80 ⇒ `int(GuardDamageRate × 伤害 + 1)`（`0x4ff4dd`）。"""
+        body = struct.pack("<iiffiif", 1, self.bot_handle, 10.0, 20.0, 0,
+                           bot.EXPLODE_FLAG_GUARD, 20.0)
+        bot.note_peer_hit(self.room, self.alice,
+                          udp_packet(inner=botsync.OP_EXPLODE, body=body))
+        self.assertEqual(int(0.25 * 20 + 1), self.taken())
+
+    def test_the_splash_flags_live_at_29(self):
+        """`rpSplashDamaged` 的 flags 在 `+29`（`0x492bf6`），格挡的近身也看它。"""
+        bot.note_peer_hit(self.room, self.alice,
+                          splash_payload(self.bot_handle, damage=7.0,
+                                         flags=bot.EXPLODE_FLAG_GUARD))
+        self.assertEqual(int(0.25 * 7 + 1), self.taken())
+        self.assertEqual(bot.EXPLODE_FLAG_GUARD, struct.unpack_from(
+            "<i", botsync.splash_body(1, 2, 3.0, 0.0, 0.0,
+                                      flags=bot.EXPLODE_FLAG_GUARD), 29)[0])
+
+    # --- 免伤：`OnHit` 进门那几道门 ------------------------------------------
+    def test_a_shielded_seat_takes_nothing(self):
+        """属性 1 护盾：收方只放 Shield00.efx、一滴血不扣。"""
+        now = time.monotonic()
+        self.room.quest.shield_until[self.bot_seat] = now + 8.0
+        bot.note_peer_hit(self.room, self.alice, explode_payload(self.bot_handle))
+        self.assertEqual(0, self.taken())
+        self.room.quest.shield_until[self.bot_seat] = now - 0.1
+        bot.note_peer_hit(self.room, self.alice, explode_payload(self.bot_handle))
+        self.assertEqual(12, self.taken())
+
+    def test_using_a_shield_is_recorded(self):
+        self.bot_conn.note_area_item(gameserver.SHIELD_ITEM_ID, self.bot_seat,
+                                     self.room.quest)
+        self.assertGreater(self.room.quest.shield_until[self.bot_seat],
+                           time.monotonic() + 7.0)
+
+    def test_the_two_seconds_after_a_respawn(self):
+        """「躺 -> 站」那一下 = `Character::Respawn`：满血 + 状态 0 锁 2 秒。"""
+        quest = self.room.quest
+        quest.respawn_due[self.bot_seat] = (time.monotonic() + 5.0, (0, 0))
+        bot._refresh_health(self.room)                 # 记下「躺着」
+        self.ledger.note_damage(self.bot_seat, 30)
+        del quest.respawn_due[self.bot_seat]
+        bot._refresh_health(self.room)                 # 站起来了
+        self.assertEqual(0, self.taken(), "复活满血")
+        bot.note_peer_hit(self.room, self.alice, explode_payload(self.bot_handle))
+        self.assertEqual(0, self.taken(), "这 2 秒打不掉血")
+        self.assertFalse(bot._immune(self.room, self.bot_seat,
+                                     time.monotonic() + bot.SPAWN_IMMUNE_S))
+
+    def respawn(self, seat, killer):
+        """走一遍「被 `killer` 打死 -> 复活」：死亡广播记凶手、闩上、撤闩。"""
+        quest = self.room.quest
+        quest.last_killer[seat] = killer
+        quest.respawn_due[seat] = (time.monotonic() + 5.0, (0, 0))
+        bot._refresh_health(self.room)
+        del quest.respawn_due[seat]
+        bot._refresh_health(self.room)
+
+    def deathmatch(self):
+        self.room.session_type = 1
+        self.room.arguments = (0, 3, 0)            # 个人战 / 夺分
+        for seat in self.room.seats:               # 个人战没有队伍：碰撞组 = 座位 + 1
+            if seat is not None:
+                seat.team = 0
+
+    def test_killed_by_an_enemy_in_deathmatch_buys_seven_seconds(self):
+        """★ 状态 0x10「분노부활」（`Respawn` `0x50311f`）：夺分、凶手是别组的人、
+        不是自杀 ⇒ 复活后 7 秒（218 格）整发不扣血。"""
+        self.deathmatch()
+        now = time.monotonic()
+        self.respawn(self.bot_seat, killer=0)
+        self.assertTrue(bot._immune(self.room, self.bot_seat, now + 6.5))
+        self.assertFalse(bot._immune(self.room, self.bot_seat, now + 7.2))
+
+    def test_no_rage_for_a_suicide_or_outside_deathmatch(self):
+        self.deathmatch()
+        now = time.monotonic()
+        self.respawn(self.bot_seat, killer=self.bot_seat)    # 自杀
+        self.assertFalse(bot._immune(self.room, self.bot_seat, now + 3.0))
+        self.room.arguments = (0, 0, 0)                      # 生存
+        self.respawn(self.bot_seat, killer=0)
+        self.assertFalse(bot._immune(self.room, self.bot_seat, now + 3.0))
+
+    def test_entering_the_stage_is_not_a_respawn(self):
+        """★ 订正：开局 / 换图**不跑** `Respawn`（只从 `0x0419` 进来），Init 反而把状态 0 撤掉
+        ⇒ 进图那一刻没有免伤（X_Mod §94）。"""
+        bot._refresh_health(self.room)
+        for seat in (0, 1, self.bot_seat):
+            self.assertFalse(bot._immune(self.room, seat, time.monotonic()), seat)
+
+    # --- 回血事件（X_Mod §94）------------------------------------------------
+    def test_picking_up_a_heart_heals_fifteen(self):
+        """心的回血量是写死的 15（`0x5228f9`）；闯关里就是 15。"""
+        self.ledger.note_damage(self.bot_seat, 40)
+        self.room.quest.heal_events.append(("heart", self.bot_seat, 0, -1))
+        bot._refresh_health(self.room)
+        self.assertEqual(25, self.taken())
+
+    def test_a_heart_in_deathmatch_heals_forty(self):
+        """夺分里捡心 `15 × 2.67` 取整 = 40（`0x52299a`）。"""
+        self.deathmatch()
+        self.assertEqual(40, bot._heart_heal_amount(self.room))
+
+    def test_the_heartboost_heal_and_its_side_effect(self):
+        """10316：回 `量` 一次；顺带把目标的复活免伤撤掉（`Add(状态 0, 0 格)`）。"""
+        self.ledger.note_damage(self.bot_seat, 20)
+        self.ledger.grant_immunity(self.bot_seat, time.monotonic() + 2.0, state=0)
+        self.room.quest.heal_events.append(
+            (gameserver.HEART_BOOST_ITEM_ID, self.bot_seat, 5, 0))
+        bot._refresh_health(self.room)
+        self.assertEqual(15, self.taken())
+        self.assertFalse(bot._immune(self.room, self.bot_seat, time.monotonic()))
+
+    def test_the_title_heart_heals_once_per_other_live_teammate(self):
+        """10315：目标每有一个「活着、同组、不是发起人」的角色就回一次 `量`
+        （`0x508a52`~`0x508b94`，原版就是这么写的）。闯关里大家同组。"""
+        self.ledger.note_damage(self.bot_seat, 40)
+        groups = {bot._seat_group(self.room, s) for s in (0, 1, self.bot_seat)}
+        self.assertEqual(1, len(groups), "这一组要大家同组")
+        self.room.quest.heal_events.append(
+            (gameserver.TITLE_HEART_ITEM_ID, self.bot_seat, 5, 0))
+        bot._refresh_health(self.room)
+        # 除了发起人 0 号，活着的同组还有 1 号和 bot 自己 ⇒ 回两次。
+        self.assertEqual(40 - 2 * 5, self.taken())
+
+    def test_the_heart_effects_are_queued_by_the_relay(self):
+        """`0x040b` → 广播 `0x040a` 的同时往回血事件里排一条。"""
+        payload = struct.pack("<iiii", self.bot_seat, self.alice.my_seat,
+                              gameserver.HEART_BOOST_ITEM_ID, 5)
+        gameserver.Conn.on_game_packet(self.alice, 0x040b, payload)
+        self.assertEqual(
+            [(gameserver.HEART_BOOST_ITEM_ID, self.bot_seat, 5,
+              self.alice.my_seat)],
+            list(self.room.quest.heal_events))
+
+    def test_the_quest_master_buys_eight_seconds(self):
+        """内层 `0x001a`（属性 0x14）= 闯关达人那 8 秒免伤。"""
+        now = time.monotonic()
+        body = struct.pack("<bii", 1, bot.QUEST_MASTER_ATTR, 1)
+        bot.note_peer_hit(self.room, self.bob,
+                          udp_packet(inner=bot.PEER_OP_ADD_ATTR, body=body))
+        self.assertTrue(bot._immune(self.room, 1, now + 7.5))
+        self.assertFalse(bot._immune(self.room, 1, now + 8.5))
+
+    # --- 中毒（X_Mod §93）---------------------------------------------------
+    def advance_poison_to(self, when):
+        with bot._tick_clock(when):
+            bot._advance_poison(self.room, self.ledger)
+
+    def test_a_poison_is_six_ticks_of_five(self):
+        """8 秒 = 250 格，每 47 格一跳：第 0/47/94/141/188/235 格 ⇒ 6 跳 30 点。"""
+        t0 = time.monotonic() + 100.0
+        with bot._tick_clock(t0):
+            bot._poison_seat(self.room, self.bot_seat, "单测")
+        self.advance_poison_to(t0)
+        self.assertEqual(5, self.taken(), "中毒那一刻就跳第一下")
+        self.advance_poison_to(t0 + 20.0)
+        self.assertEqual(30, self.taken())
+        self.assertFalse(self.ledger.poisoned(self.bot_seat), "8 秒后毒解了")
+
+    def test_a_blocked_tick_is_lost_not_delayed(self):
+        """每一跳走 `OnHit`：护盾挡住的那一跳白跳，下一跳照原节奏（`[0x68c]` 照推）。"""
+        t0 = time.monotonic() + 100.0
+        interval = gameserver.POISON_INTERVAL
+        with bot._tick_clock(t0):
+            bot._poison_seat(self.room, self.bot_seat, "单测")
+        self.advance_poison_to(t0)
+        self.room.quest.shield_until[self.bot_seat] = t0 + interval + 0.5
+        self.advance_poison_to(t0 + interval + 0.01)        # 第 2 跳被盾吃掉
+        self.assertEqual(5, self.taken())
+        self.advance_poison_to(t0 + 2 * interval + 0.01)    # 第 3 跳照常
+        self.assertEqual(10, self.taken())
+
+    def test_poisoning_again_only_refreshes_the_expiry(self):
+        """再中一次：到期续满 8 秒，节奏不重排（`0x401bd6`）。"""
+        t0 = time.monotonic() + 100.0
+        interval = gameserver.POISON_INTERVAL
+        with bot._tick_clock(t0):
+            bot._poison_seat(self.room, self.bot_seat, "单测")
+        self.advance_poison_to(t0 + 3.0)                    # 第 0、1 跳
+        with bot._tick_clock(t0 + 3.0):
+            bot._poison_seat(self.room, self.bot_seat, "单测")
+        self.advance_poison_to(t0 + 30.0)
+        ticks = int((3.0 + gameserver.POISON_SECONDS) // interval) + 1
+        self.assertEqual(5 * ticks, self.taken())
+
+    def test_a_poison_shot_from_a_human_poisons_the_bot(self):
+        """真人挂着毒弹（`0x040c` 用了 10500）直接命中 bot ⇒ bot 中毒。"""
+        self.alice.note_area_item(gameserver.POISON_ITEM_ID, self.alice.my_seat,
+                                  self.room.quest)
+        self.assertIn(self.alice.my_seat, self.room.quest.poison_magazine)
+        bot.note_peer_hit(self.room, self.alice, explode_payload(self.bot_handle))
+        self.assertTrue(self.ledger.poisoned(self.bot_seat))
+
+    def test_the_magazine_ends_with_his_0x040d(self):
+        """弹匣打完是他自己那台数的，发 `0x040d(座位, 10)` 来说（§200）。"""
+        self.room.quest.poison_magazine.add(self.alice.my_seat)
+        gameserver.Conn.on_game_packet(
+            self.alice, gameserver.OP_REMOVE_CHAR_ATTR,
+            struct.pack("<ii", self.alice.my_seat,
+                        gameserver.POISON_MAGAZINE_ATTR))
+        self.assertNotIn(self.alice.my_seat, self.room.quest.poison_magazine)
+        bot.note_peer_hit(self.room, self.alice, explode_payload(self.bot_handle))
+        self.assertFalse(self.ledger.poisoned(self.bot_seat))
+
+    def test_a_splash_never_poisons(self):
+        self.room.quest.poison_magazine.add(self.alice.my_seat)
+        bot.note_peer_hit(self.room, self.alice, splash_payload(self.bot_handle))
+        self.assertFalse(self.ledger.poisoned(self.bot_seat))
+
+    def test_dying_wipes_every_status(self):
+        """`Character::Die` 整张属性表清掉、不发 `0x040d`（X_Mod §93）。"""
+        quest = self.room.quest
+        seat = self.bot_seat
+        far = time.monotonic() + 60.0
+        quest.shield_until[seat] = far
+        quest.reflect_until[seat] = far
+        quest.hp_charges[seat] = far
+        self.ledger.poison(seat, time.monotonic(), 8.0)
+        self.bot_conn.magazine_attrs = {gameserver.POISON_MAGAZINE_ATTR: 3}
+        bot._refresh_health(self.room)
+        quest.respawn_due[seat] = (far, (0, 0))           # 死了
+        bot._refresh_health(self.room)
+        self.assertNotIn(seat, quest.shield_until)
+        self.assertNotIn(seat, quest.reflect_until)
+        self.assertNotIn(seat, quest.hp_charges)
+        self.assertFalse(self.ledger.poisoned(seat))
+        self.assertEqual({}, self.bot_conn.magazine_attrs,
+                         "bot 复活后不该还是强力 / 毒弹")
+
+
 class BotMidGameLeaveTests(BotBattleRoom):
     """游戏中有人掉线 —— 房主迁移、控制权、房间解散三条都要跟着走。"""
 

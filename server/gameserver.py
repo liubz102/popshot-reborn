@@ -2831,6 +2831,17 @@ TEAM_REFLECT_ITEM_ID = 10314
 #: 撑多久 —— `Status.ini` 第 **3** 条（`[Reflect]` 的 `CharAttr` 就是 3）：`Time=8.0`。
 REFLECT_SECONDS = 8.0
 
+#: ★★ **护盾**（`Item.ini` `[Shield] ItemId=10300 CharAttr=1`）。X_Mod §92。
+#:
+#: 收方 `Character::OnHit` 进门查属性 1（`0x4ff3ee push 1 ; call 0x401c0c`）：
+#: 有就只放 `Item/Shield/Efx/Shield00.efx`，**一滴血都不扣**。每台机器都按
+#: `0x040a` 给它挂上 8 秒，所以别人屏幕上它也是满的 —— 服务端的血量台账
+#: 不跟着免伤的话，bot 眼里「开着盾的人」越打越残。
+SHIELD_ITEM_ID = 10300
+
+#: 撑多久 —— `Status.ini` 第 **1** 条（`[Shield]` 的 `CharAttr` 就是 1）：`Time=8.0`。
+SHIELD_SECONDS = 8.0
+
 #: 护盾那个圆有多大（`0x47f0f0` 的 `0x42480000` = 50.0f）。
 REFLECT_RADIUS = 50.0
 
@@ -2853,14 +2864,32 @@ SMOKE_SECONDS = 8.0
 #:     Interval=1.0
 #:     Hp=10
 #:
-#: ⇒ **8 秒里每秒回 10 点，一共 80 点**。血量是每台机器各算各的（§122），
-#: 服务端记那份台账时得跟着回 —— 不跟的话 bot 眼里「刚喝完药的人」还是残血，
-#: 逼近 / 拉开会判反。
+#: ⇒ 8 秒（250 格）里**每 32 格装一轮 10 滴、一格一滴 +1**（夺分一滴 +2），
+#: 用了当场就开始（X_Mod §94，`0x509dd7`）：一共 8 轮 **80 点，夺分 160 点**。
+#: 血量是每台机器各算各的（§122），服务端记那份台账时得跟着回 —— 不跟的话
+#: bot 眼里「刚喝完药的人」还是残血，逼近 / 拉开会判反。
 HP_CHARGE_ITEM_ID = 10308
 TEAM_HP_CHARGE_ITEM_ID = 10313
-HP_CHARGE_SECONDS = 8.0
-HP_CHARGE_INTERVAL = 1.0
+HP_CHARGE_SECONDS = 250 * 32 / 1000.0
 HP_CHARGE_AMOUNT = 10
+
+#: ★★ **毒弹**（`Item.ini` `[BulletPoison] ItemId=10500 CharAttr=10`）→ 打中的人**中毒**
+#: （`Status.ini [11]`：`Time=8.0 Interval=1.5 Damage=5`）。X_Mod §93。
+#:
+#: 每台机器都是**自己判撞上了**就给受害者挂毒（`BulletObj::HitObject` `0x47f096`，
+#: 没有「是不是我的弹」那道门），之后每一跳各机本地扣血（`0x509d64` → `OnHit`），
+#: **一个包都不发** ⇒ 服务端的血量台账不跟着扣，bot 眼里中了毒的人永远不掉血。
+#:
+#: * 一跳间隔：`1500 / 32` = 46 格，再加上 `[char+0x68c] < now` 那道严格小于 ⇒
+#:   **47 格 = 1.504 秒**；
+#: * 持续 8000 / 32 = 250 格 ⇒ 第 0/47/94/141/188/235 格各一跳 = **6 跳 30 点**
+#:   （V0.3bot §113 写的 5 跳是错的）；
+#: * 再中一次**只把到期时刻续满 8 秒**，跳的节奏不重排（`0x401bd6`）。
+POISON_ITEM_ID = 10500
+POISON_MAGAZINE_ATTR = 10
+POISON_SECONDS = 250 * 32 / 1000.0
+POISON_INTERVAL = (1500 // 32 + 1) * 32 / 1000.0
+POISON_DAMAGE = 5
 
 #: ★ 干扰道具（`Item.ini` 的 `[HudDevil]`，糊屏）。
 HUD_JAM_ITEM_ID = 10311
@@ -3376,6 +3405,8 @@ HEART_EFFECT_ITEM_IDS = frozenset({
     10315,      # 하트 —— `[红心达人] 560006` 给全队回的那一份
     10316,      # HeartBoostHpUp —— `EquipBonus` 的 `HeartBoost`（青鸟 220001）
 })
+TITLE_HEART_ITEM_ID = 10315
+HEART_BOOST_ITEM_ID = 10316
 
 #: `10315` 那一份的量**写死在 exe 里**：`0x522a45` 给 5，
 #: `0x522a4e` 在（游戏类型 == 3 或 `[session+0x1c] == 5`）时给 10（§53⑤）。
@@ -4478,8 +4509,8 @@ class RoomQuest:
         #: ★ 被**糊屏**（10311）罩住的座位撑到什么时候（`{座位: 时刻}`，§121）。
         #:   只有 bot 读它 —— 真人那张鬼脸是他自己客户端画的。
         self.hud_jam_until = {}
-        #: ★ 正在**回血**的座位：`{座位: [下一跳的时刻, 还剩几跳]}`（§122）。
-        #:   `Status.ini[8]` 是 8 秒 × 每秒 10 点；这里按同一个节奏往台账里加。
+        #: ★ 正在**回血**的座位：`{座位: 属性 8 挂到哪一刻}`（§122 / X_Mod §94）。
+        #:   一滴一滴怎么回是 `bot._advance_hp_charges` 照客户端的节奏算的。
         self.hp_charges = {}
         #: ★★★ **场上还活着的怪**：`{世界句柄: [x, y, 状态, 追谁的座位]}`
         #:   （§125）。位置是**控制者广播的**（`rpAiMsg` 的 `setState`），
@@ -4509,6 +4540,22 @@ class RoomQuest:
         #: 会被**弹开**而不是炸掉（`0x47f09c` 那道 `HasAttr(3)` 门），
         #: 而 bot 的弹体是服务端算的 ⇒ 这边不记就照旧炸在人身上。
         self.reflect_until = {}
+        #: ★★ 每个座位的**护盾**撑到什么时候（`{座位: 时刻}`，X_Mod §92）。
+        #: 收方 `OnHit` 见属性 1 就整发不扣血 ⇒ 血量台账要跟着免伤。
+        self.shield_until = {}
+        #: ★★ 哪些**真人**座位身上挂着毒弹（属性 10，X_Mod §93）。开始 = 他的 `0x040c`
+        #: 用了 10500，结束 = 他自己那台发来的 `0x040d(座位, 10)`（弹匣数只有他那台
+        #: 数得出来）、或者他死了（`Die` 把属性表整个清掉，不发 `0x040d`）。
+        #: bot 的那一份在 `BotConn.magazine_attrs` 里。
+        self.poison_magazine = set()
+        #: ★★ 要扣进 bot 那本血量台账的**回血事件**（X_Mod §94）：
+        #: `("heart", 座位, 0, -1)`（捡到心）/ `(10315 或 10316, 目标, 量, 发起人)`
+        #: （转成 `0x040a` 的那两件）。网络线程往里放，房间那条 32 ms 线程取
+        #: （`bot._drain_heal_events`）—— 回多少要看房间里谁活着，得在那边算。
+        self.heal_events = collections.deque()
+        #: ★ 每个座位**上一次是被谁打死的**（`0x0408` 的凶手那一格 = `[char+0x158]`）。
+        #: 复活时夺分那 7 秒免伤看它（`bot._rage_revival`，X_Mod §94）。
+        self.last_killer = {}
         #: 本局下发过的每一件 `0x0404` 的「句柄 -> 物件 id」（服务端刷的和
         #: 客户端掉的都记）。★ 拾取放行时**只有靠它才知道捡到的是什么** ——
         #: `0x0407` 只带句柄，而要不要补一发 `0x040b` 完全取决于物件类型（§194）。
@@ -4796,6 +4843,8 @@ class RoomQuest:
         #   这里是全服务端唯一知道「这一件归谁」的地方。
         if item_id == HEART_ITEM_ID:
             self.add_heart(seat_id)
+            # ★ 捡的人回血（每台客户端收到 `0x0405` 都这么算，X_Mod §94）。
+            self.heal_events.append(("heart", int(seat_id), 0, -1))
         return True
 
     def add_coins(self, seat_id, amount):
@@ -5438,6 +5487,8 @@ class RoomQuest:
         self.items_at.clear()
         self.items_born.clear()
         self.reflect_until.clear()
+        self.shield_until.clear()
+        self.poison_magazine.clear()
         del self.slow_mines[:]
         del self.freeze_bursts[:]
         del self.smokes[:]
@@ -9014,6 +9065,9 @@ class Conn:
                  f" —— 客户端收到才会调 Character::Die()，心形也靠它减")
         self.battle_broadcast(build_game(OP_BROADCAST_DEATH, reply),
                               reason="：死亡广播")
+        # ★ 记下凶手：夺分里被敌人打死的，复活时多 7 秒免伤（X_Mod §94）。
+        if 0 <= seat < ROOM_SEAT_COUNT:
+            quest.last_killer[seat] = info["arg"]
         # ★ 他躺下了 ⇒ 挂机判定这一段不管他（用户 2026-09-14）：死人按不了键。
         note_seat_died(self.lobby_room(), seat)
         # ★ 上闩等他自己的 0x0413；到点没等到就由 `check_respawn_watchdog()`
@@ -9604,6 +9658,19 @@ class Conn:
         | 烟雾 10401 | 同上，云在使用者脚下（D67）|
         """
         item_id = int(item_id)
+        # ★★ 护盾（X_Mod §92）：收方 `OnHit` 见属性 1 整发不扣血，
+        #    服务端的血量台账跟着免伤 8 秒（bot 用的也走这里）。
+        if item_id == SHIELD_ITEM_ID:
+            quest.shield_until[int(seat_id)] = time.monotonic() + SHIELD_SECONDS
+            self.log(f"   护盾 座位 {seat_id} 撑 {SHIELD_SECONDS:g} 秒"
+                     f"（这段时间挨打不掉血，X_Mod §92）")
+            return
+        # ★★ 毒弹（X_Mod §93）：他这之后打出去的子弹，直接命中就让人中毒。
+        #    bot 的弹匣另记在 `magazine_attrs`（`_use_held_item`），这里只记真人。
+        if item_id == POISON_ITEM_ID and not self.is_bot_seat(seat_id):
+            quest.poison_magazine.add(int(seat_id))
+            self.log(f"   毒弹 座位 {seat_id} 挂上了（直接命中会让人中毒，X_Mod §93）")
+            return
         # ★★★ 反射护盾（§119）：和位置无关，记的是「谁、到什么时候」。
         #     bot 的弹体撞上有护盾的人要**弹开**，不是炸掉。
         if item_id in (REFLECT_ITEM_ID, TEAM_REFLECT_ITEM_ID):
@@ -9644,12 +9711,13 @@ class Conn:
                     seats = [i for i, s in enumerate(room.seats)
                              if s is not None and s.conn is not None
                              and s.team == mine]
-            doses = int(HP_CHARGE_SECONDS / HP_CHARGE_INTERVAL)
-            first = time.monotonic() + HP_CHARGE_INTERVAL
+            # ★ 记的是「属性 8 挂到什么时候」；怎么一滴滴回由 bot 那本台账
+            #   照客户端的节奏算（`bot._advance_hp_charges`，X_Mod §94）。
+            until = time.monotonic() + HP_CHARGE_SECONDS
             for seat in seats:
-                quest.hp_charges[seat] = [first, doses]
-            self.log(f"   HP 回复剂 座位 {seats}：{doses} 跳 × "
-                     f"{HP_CHARGE_AMOUNT} 点（Status.ini[8]）")
+                quest.hp_charges[seat] = until
+            self.log(f"   HP 回复剂 座位 {seats}：{HP_CHARGE_SECONDS:g} 秒里"
+                     f"每轮 {HP_CHARGE_AMOUNT} 点（夺分翻倍，Status.ini[8]）")
             return
         # ★★ 糊屏（10311）：和位置无关 —— 原版那道距离门用的是
         #    `Range=-1`，谁都罩不到（§121）。我们按用户的要求让它罩住
@@ -9722,6 +9790,13 @@ class Conn:
         if reported_seat != seat_id:
             self.log(f"   ⚠ 0x040d 报的是座位 {reported_seat}，"
                      f"但这条连接坐的是 {seat_id}；按 {seat_id} 转发")
+        # ★★ 毒弹的弹匣打完了（X_Mod §93）：他之后的子弹不再带毒。
+        #    `room.quest` 直接读、不走 `quest_state()` —— 那个懒惰分支会在
+        #    两局之间把 quest 凭空建回来（`on_use_item` 那段注释）。
+        room = self.lobby_room()
+        quest = None if room is None else room.quest
+        if attr_id == POISON_MAGAZINE_ATTR and quest is not None:
+            quest.poison_magazine.discard(int(seat_id))
         name = CHAR_ATTR_NAMES.get(attr_id, "未知属性")
         sent = self.battle_broadcast(
             build_game(OP_REMOVE_CHAR_ATTR,
@@ -9779,6 +9854,13 @@ class Conn:
             build_game(OP_ITEM_EFFECT,
                        build_item_effect(target_seat, item_id,
                                          arg2=amount, arg3=seat_id)))
+        # ★ 每台客户端收到这一发都会给目标回血，bot 那本血量台账跟着回（X_Mod §94）。
+        #   `room.quest` 直接读，理由同 `on_remove_char_attr`。
+        room = self.lobby_room()
+        quest = None if room is None else room.quest
+        if quest is not None:
+            quest.heal_events.append((item_id, int(target_seat), int(amount),
+                                      int(seat_id)))
         self.hearts_relayed += 1
         if self.hearts_relayed == 1 or VERBOSE:
             self.log(f"★ 座位 {seat_id} 让座位 {target_seat} 回 {amount} 点血"

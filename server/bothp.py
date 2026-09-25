@@ -21,17 +21,24 @@
 这正是真人也有的偏差：别人血条读数本来就可能和他自己看到的不一样。
 判「该逼近还是该拉远」用它足够；**谁死没死仍然只认本人上报**，一个字都不改。
 
+★★ 记的是收方 `Character::OnHit` **真正扣掉的**（X_Mod §92 / §93）：截断、格挡、
+免伤窗口、中毒、回复剂按原版节奏滴、心和图腾的回血。规则都在 `bot.py`
+（它手上有时刻和房间），这里只放账本身。
+
 ## 谁把它清零
 
 * **重生**：`respawn_due` 从有到无那一下（`bot._lying_dead()` 的翻转）；
-* **新一局 / 换图**：`0x0400` / `0x0417` 广播那一刻（和 `report_bots_loaded`
-  同一个事件，D4）。
+* **新一局**：`0x0402` 那一刻 `room.quest` 整个换新，账跟着是一本新的。
+* ★ **换图不清**（X_Mod §94）：闯关换图时客户端把同一批角色对象摘下来再挂回去，
+  HP、状态、死没死全部带过去 —— 以前这里在 `0x0417` 那一刻清零，是错的。
 
-两处都是**事件**，不是定时器（铁律 10）。
+都是**事件**，不是定时器（铁律 10）。
 
 只用标准库；发布运行时是 CPython 3.8。
 """
 from __future__ import annotations
+
+import math
 
 
 class Ledger(object):
@@ -41,33 +48,125 @@ class Ledger(object):
     `hp`），换角色时不用回来改这本账。
     """
 
-    __slots__ = ("taken", "lying")
+    __slots__ = ("taken", "lying", "immune", "poison_until", "poison_next",
+                 "charge_next", "charge_drips")
 
     def __init__(self):
         #: 座位 -> 已经吃进去的净伤害（治疗会把它减回去，下限 0）。
         self.taken = {}
         #: 座位 -> 上一次看到的「躺着没有」，用来认出重生那一下翻转。
         self.lying = {}
+        #: 座位 -> {状态号: 到哪一刻}（`time.monotonic()` 口径）。客户端
+        #: `Character::OnHit` 进门那几道状态门（X_Mod §92）：0 复活 2 秒、
+        #: 0x10 夺分被打死复活 7 秒、0x14 闯关达人 8 秒。**按状态分开记**，
+        #: 因为有东西只撤其中一道（捡心会把状态 0 撤掉，§94）。
+        self.immune = {}
+        #: 座位 -> 中毒到哪一刻（X_Mod §93）。没中毒就不在表里。
+        self.poison_until = {}
+        #: 座位 -> 下一跳毒什么时候到期（客户端的 `[char+0x68c]`）。★ 毒解了它也
+        #: 留着：客户端那一格只有跳过之后才改，下一次中毒的第一跳要等它。
+        self.poison_next = {}
+        #: 座位 -> 回复剂下一轮什么时候装（客户端 `[char+0x690]`，X_Mod §94）。
+        #: 和 `poison_next` 同一个道理：药效没了它也留着。
+        self.charge_next = {}
+        #: 座位 -> 这一轮还剩几滴（客户端 `[char+0x6e0]`）。
+        self.charge_drips = {}
 
     def clear(self):
-        """整本账清空（新一局 / 换图）。"""
+        """整本账清空。"""
         self.taken.clear()
         self.lying.clear()
+        self.immune.clear()
+        self.poison_until.clear()
+        self.poison_next.clear()
+        self.charge_next.clear()
+        self.charge_drips.clear()
 
     def reset(self, seat):
-        """这个座位回满血（重生）。"""
+        """这个座位回满血（重生）。免伤由调用方按事件另给（`grant_immunity`）。"""
         self.taken.pop(int(seat), None)
 
+    def drop_statuses(self, seat):
+        """属性表整个清掉（`Die` / `Respawn`）：毒解、免伤门全撤、回复剂这一轮作废。
+
+        ★ `poison_next` / `charge_next` 不动：那两格在客户端是角色身上的普通字段，
+        只有 Init 清零（§93 / §94）。
+        """
+        key = int(seat)
+        self.poison_until.pop(key, None)
+        self.immune.pop(key, None)
+        self.charge_drips.pop(key, None)
+
+    def poison(self, seat, now, duration):
+        """这个座位中毒（或者再中一次）：到期时刻续成 `now + duration`。
+
+        ★ 跳的节奏不重排（`0x401bd6` 只改到期时刻）：下一跳已经排在将来的
+        就等它；排在过去的（从没中过毒 / 上次毒早解了）就是**马上跳一下**。
+        """
+        key = int(seat)
+        self.poison_until[key] = now + duration
+        if self.poison_next.get(key, float("-inf")) < now:
+            self.poison_next[key] = now
+
+    def cure(self, seat):
+        """毒解了（死了 / 复活：客户端 `Die` / `Respawn` 把属性表整个清掉）。"""
+        self.poison_until.pop(int(seat), None)
+
+    def poisoned(self, seat):
+        return int(seat) in self.poison_until
+
+    def due_poison_ticks(self, now, interval):
+        """到 `now` 为止该跳的毒：`[(座位, 这一跳的时刻), …]`，按时间排好。
+
+        照客户端 `0x509cea` 那道门：还在中毒（到期时刻没过）且下一跳到了才跳，
+        跳完下一跳往后推 `interval`；过了到期时刻就解毒。
+        """
+        ticks = []
+        for key in list(self.poison_until):
+            until = self.poison_until[key]
+            due = self.poison_next.get(key, now)
+            while due <= now and due <= until:
+                ticks.append((key, due))
+                due += interval
+            self.poison_next[key] = due
+            if due > until and until <= now:
+                del self.poison_until[key]
+        ticks.sort(key=lambda pair: pair[1])
+        return ticks
+
+    def grant_immunity(self, seat, until, state=0):
+        """这个座位的状态 `state` 挂到 `until`（再挂一次就是覆盖，`0x401bd6`）。"""
+        self.immune.setdefault(int(seat), {})[int(state)] = until
+
+    def revoke_immunity(self, seat, state):
+        """撤掉一道免伤门（`Add(状态, 0 格)` 就是撤，§94）。"""
+        gates = self.immune.get(int(seat))
+        if gates:
+            gates.pop(int(state), None)
+
+    def immune_at(self, seat, now):
+        gates = self.immune.get(int(seat))
+        return bool(gates) and any(now < until for until in gates.values())
+
     def note_damage(self, seat, amount):
-        """记一发伤害。`amount` <= 0 一律忽略。"""
+        """记一发伤害，返回记上了没有。
+
+        ★ 先**朝零截断**：客户端收包时 `0x5f895c`（`_ftol2`）就是这么把
+        `rpExplode +24` / `rpSplashDamaged +8` 变成整数再扣的（X_Mod §92）。
+        截完 <= 0、或者根本不是个有限数（坏包）都不记。
+        """
         value = float(amount)
+        if not math.isfinite(value):
+            return False
+        value = float(int(value))
         if value <= 0.0:
-            return
+            return False
         key = int(seat)
         self.taken[key] = self.taken.get(key, 0.0) + value
+        return True
 
     def note_heal(self, seat, amount):
-        """记一次治疗（`Status.ini[8]` 每秒 10 点那一类）。下限是满血。"""
+        """记一次治疗（回复剂的一滴、心、图腾那一类）。下限是满血。"""
         value = float(amount)
         if value <= 0.0:
             return
