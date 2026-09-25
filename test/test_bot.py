@@ -1234,6 +1234,29 @@ class BotHealTotemTests(BotBattleRoom):
                                      now + step * 0.9)
         self.assertEqual(1.0, bot._seat_health(self.room, self.bot_seat))
 
+    def test_a_human_standing_in_it_heals_on_the_ledger_too(self):
+        """★ X_Mod §91：每台客户端对圈里的**每个**角色都各自回血，真人也一样。
+
+        以前台账只替 bot 记，真人站进去一点不涨 ——[幸运幸存者] 那道
+        「剩余 HP < 15」会把回满了的人也当成残血。
+        """
+        seat = self.room.seat_index_of(self.alice)
+        self.alice.sim_body = None
+        self.alice.sync_trail.append((560.0, 100.0))    # 距离 60 < 半径 200
+        self.ledger.note_damage(seat, 50)
+        self.place(500.0, 100.0, group=bot._seat_group(self.room, seat))
+        bot._refresh_health(self.room)
+        self.assertEqual(47, self.ledger.taken_by(seat))
+
+    def test_the_room_pass_leaves_the_bots_to_their_own_tick(self):
+        """bot 那一份在 `_tick_bot()` 里记（`_stand_in_heal_totem`），房间那一遍
+        跳过它 —— 两边都记就是一跳回两次。"""
+        self.hurt(0.5)
+        taken = self.ledger.taken_by(self.bot_seat)
+        self.place(560.0, 100.0)
+        bot._refresh_health(self.room)
+        self.assertEqual(taken, self.ledger.taken_by(self.bot_seat))
+
     # --- 走位 ------------------------------------------------------------
     def test_full_health_does_not_go_for_it(self):
         self.place(600.0, 100.0)

@@ -56,7 +56,8 @@ import threading
 import time
 import weakref
 
-from account_store import BASE_CHARACTER_IDS, PREMIUM_CHARACTER_IDS
+from account_store import (BASE_CHARACTER_IDS, PREMIUM_CHARACTER_IDS,
+                           equipped_items)
 import asynclog
 import ballistics
 import botaim
@@ -70,6 +71,7 @@ import botplan
 import botsync
 import botthreat
 import chrprops
+import equipbonus
 import gameserver
 import lobby as lobby_module
 import mapdata
@@ -2153,17 +2155,88 @@ BOT_LONG_SHOT_RANGE = 1024.0
 #: 那两条各自乘多少（`0x6938c8`）。
 BOT_DAMAGE_PENALTY = 0.75
 
+#: `rpExplode +20` 里那两条 ×0.75 各自的位（`0x47e6e1` 离得远 / `0x47e700` 踩地）。
+EXPLODE_FLAG_FAR = 0x08
+EXPLODE_FLAG_GROUNDED = 0x04
+
+#: ★★★ **受害者一侧**的两条（X_Mod §91）—— 也在射手那台的 `0x4806bf` 里，排在
+#: 模式 ×2 和射手的攻击加成**之后**、直接命中那两条 ×0.75 **之前**：
+#:
+#:     004808e3  受害者 vft+0x48 == 0x190          ; 是角色（怪、Boss 不算）
+#:     00480901  x = GetEquipBonus(受害者, 2)       ; Defense，x > 0 才往下
+#:     00480928  fcomp [0x6938cc]                   ; ★ 15%
+#:     00480938  or [ebp-4], 1                      ; flags 0x01，收方画「DEFENSE!」
+#:     0048094f  伤害 = ftol((100 − x) × 伤害 × 0.01f)
+#:     0048095d  受害者当前 HP < 15 ; 0048096c HP < 伤害   ; 两道门（X_Mod §90）
+#:     00480995  fcomp [0x69371c]                   ; ★ 50%
+#:     004809a9  受害者称号 == 560004 → 004809b0 flags 0x100（「LUCKY!」）、伤害 = 0
+#:
+#: 射手一侧那几条（攻击 / 队伤 / 自伤加成、[手下留情]）服务端一直不做：bot 是
+#: 白板号，本来就是空的。受害者一侧以前也跟着漏了 ⇒ 被 bot 打的时候，真人的
+#: 防御装备和 [幸运幸存者] 都不生效（用户 2026-09-25 要求补上）。
+VICTIM_DEFENSE_CHANCE = 0.15            # `0x6938cc`
+LUCKY_SURVIVOR_ID = 560004              # `0x88b84`
+LUCKY_SURVIVOR_HP = 15                  # `0x480963 cmp eax, 0xf`
+LUCKY_SURVIVOR_CHANCE = 0.5             # `0x69371c`
+EXPLODE_FLAG_DEFENSE = 0x01
+EXPLODE_FLAG_LUCKY = 0x100
+
+#: `0x693724` = 0.01f —— 按 f32 存的那个数，不是十进制的 0.01。
+_PERCENT_F32 = mapdata.f32(0.01)
+
+
+def _victim_side(room, machine, seat_index, damage, source):
+    """受害者一侧的防御 15% + [幸运幸存者]：返回 `(伤害, flags)`（X_Mod §91）。
+
+    `seat_index` 不是角色座位（怪的 `("mob", 句柄)` / `None`）就原样返回 ——
+    `0x4808e6` 那道 `vft+0x48 == 0x190` 的门。骰子用 `machine.roll_unit`
+    （`[0,1)`，和收方 `0x5d8c9c` 同一种）。`source` 只进日志。
+
+    ★ 防御那一步按 **f32** 截断：这段 `fimul` / `fmul 0.01f` 跑在 D3D9 设的
+      单精度 FPU 模式下（`CreateDevice` 的 behavior 是 `0x44`，没有
+      `D3DCREATE_FPU_PRESERVE`，见 bshook 日志）。`95 × 20 × 0.01f` 在那儿是
+      19.0 → 19，按双精度算是 18.99999… → 18。
+    ★ 「剩余 HP」读服务端的血量台账（`bothp`）。射手那台本来也只是估计
+      （§42：各机按包扣血），和原版同一个口径。
+    """
+    if not isinstance(seat_index, int) or not 0 <= seat_index < len(room.seats):
+        return damage, 0
+    flags = 0
+    defense = _seat_bonus(room, seat_index, equipbonus.DEFENSE)
+    if defense > 0 and machine.roll_unit() < VICTIM_DEFENSE_CHANCE:
+        before = damage
+        damage = int(mapdata.f32((100 - defense) * damage * _PERCENT_F32))
+        flags |= EXPLODE_FLAG_DEFENSE
+        machine.log(f"   受害者一侧（{source}）：座位{seat_index} 防御 +{defense} "
+                    f"触发，伤害 {before} -> {damage}（X_Mod §91）")
+    if LUCKY_SURVIVOR_ID not in _seat_gear(room, seat_index):
+        return damage, flags
+    ledger = _health(room)
+    if ledger is None:
+        return damage, flags
+    left = ledger.remaining(seat_index, _seat_max_hp(room, seat_index))
+    if left < LUCKY_SURVIVOR_HP and left < damage \
+            and machine.roll_unit() < LUCKY_SURVIVOR_CHANCE:
+        machine.log(f"   受害者一侧（{source}）：座位{seat_index} [幸运幸存者] "
+                    f"免伤 —— 剩 {left:g} 血、这一下 {damage}，清零（X_Mod §91）")
+        flags |= EXPLODE_FLAG_LUCKY
+        damage = 0
+    return damage, flags
+
 
 def _direct_hit_damage(room, machine, weapon, region, victim_seat,
                        damage_ratio=1.0):
-    """**直接命中**要填进 `rpExplode +24` 的伤害（§87 + §89）。
+    """**直接命中**要填进 `rpExplode` 的 `(伤害 +24, flags +20)`（§87 + §89 + X_Mod §91）。
 
-    三步，顺序和 `0x47ec5b` 那条链一模一样：
+    四步，顺序和 `0x47ec5b` 那条链一模一样：
 
     1. 按部位取档（`Damage` / `HeadDamage` / `LegsDamage`）；
     2. 夺分 / 模式 5 **×2**（`0x4806f1` 的 `shl`）；
-    3. ★ **只有模式 3**：目标离得比一个视口宽（1024）还远 ×0.75、
-       目标**踩在地上** ×0.75 —— 各自朝零截断，两条都成立就乘两次。
+    3. ★ **受害者一侧**：防御 15% + [幸运幸存者]（`_victim_side`，同一个 `0x4806bf`
+       的尾巴）；
+    4. ★ **只有模式 3**：目标离得比一个视口宽（1024）还远 ×0.75、
+       目标**踩在地上** ×0.75 —— 各自朝零截断，两条都成立就乘两次
+       （`0x47e618`，排在 `0x4806bf` 后面）。
 
     ⚠ 距离量的是**两个角色原点之间**（`vft+8` = `GetPos`，也就是脚下那点），
     不是爆点到目标。踩没踩地读的是 `[char+0x128]`，服务端这边就是心跳
@@ -2171,17 +2244,20 @@ def _direct_hit_damage(room, machine, weapon, region, victim_seat,
     """
     # ★ 强力射击的 `DamageRatio`（§117）—— 原版也是在射手这边算完才塞进包的。
     damage = int(weapon.damage_for(region) * damage_ratio) * _damage_scale(room)
+    damage, flags = _victim_side(room, machine, victim_seat, damage, "直接命中")
     if _pvp_game_mode(room) not in BOT_LONG_SHOT_MODES:
-        return damage
+        return damage, flags
     shooter = machine.battle_pos
     victim = _seat_body(room, victim_seat)
     if shooter is not None and victim is not None:
         span = math.hypot(victim[0] - shooter[0], victim[1] - shooter[1])
         if span > BOT_LONG_SHOT_RANGE:
             damage = int(damage * BOT_DAMAGE_PENALTY)
+            flags |= EXPLODE_FLAG_FAR
     if _seat_on_ground(room, victim_seat):
         damage = int(damage * BOT_DAMAGE_PENALTY)
-    return damage
+        flags |= EXPLODE_FLAG_GROUNDED
+    return damage, flags
 
 
 # ---------------------------------------------------------------------------
@@ -3452,10 +3528,41 @@ def _note_damage(room, seat_index, amount):
         ledger.note_damage(seat_index, amount)
 
 
-def _seat_max_hp(room, seat_index):
-    """这个座位的满血值（角色属性，`ChrProps.ini` 的 `Hp`）。"""
+def _seat_gear(room, seat_index):
+    """这个座位身上穿的 itemId —— 就是 `0x030b` 发下去的那一份；bot / 空座位是 `()`。
+
+    ★ bot 的 `0x030b` 恒空（V0.3商店 §63）⇒ 每台客户端上它一件加成都没有。
+    """
     seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
-    return chrprops.get(0 if seat is None else seat.character_id).hp
+    if seat is None or seat.is_bot or seat.conn is None:
+        return ()
+    return tuple(equipped_items(getattr(seat.conn, "account", None)))
+
+
+def _seat_bonus(room, seat_index, key):
+    """`GetEquipBonus(座位, key)` 的服务端复刻（`equipbonus`，X_Mod §91）。"""
+    gear = _seat_gear(room, seat_index)
+    if not gear:
+        return 0
+    character_id = room.seats[seat_index].character_id
+    return equipbonus.seat_bonus(
+        gear, character_id, key,
+        session_type=getattr(room, "session_type", equipbonus.SESSION_TYPE_NORMAL),
+        arguments=getattr(room, "arguments", ()) or (),
+        own_max_hp=chrprops.get(character_id).hp)
+
+
+def _seat_max_hp(room, seat_index):
+    """这个座位的满血值：角色属性（`ChrProps.ini` 的 `ChrHp`）+ 装备的 `Hp` 加成。
+
+    ★ 客户端就是这么算的：`0x50a09e` `MaxHp = 基础 + GetEquipBonus(座位, Hp)`，
+      加法、没有概率门（V0.3商店 §16：五件铠甲 +29 ⇒ 129）。以前这里只取基础值，
+      穿铠甲的真人在台账上永远少那几十点血 ——[幸运幸存者]「剩余 HP < 15」
+      那道门读的正是它（X_Mod §91）。bot 什么都不穿，不受影响。
+    """
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    base = chrprops.get(0 if seat is None else seat.character_id).hp
+    return base + _seat_bonus(room, seat_index, equipbonus.HP)
 
 
 def _seat_health(room, seat_index):
@@ -3467,7 +3574,8 @@ def _seat_health(room, seat_index):
 
 
 def _refresh_health(room):
-    """每帧一次：认出「躺着 -> 站起来」的翻转，把那个座位的账清零。
+    """每帧一次：认出「躺着 -> 站起来」的翻转，把那个座位的账清零；
+    顺带记 HP 回复剂的那几跳、真人站在回血图腾里回的血。
 
     ★ 判据是**状态翻转**（铁律 10），不是「死后 5 秒」那种定时器 ——
     重生的真实时刻由 `respawn_due` 说了算，看门狗撤闩那一下就是它。
@@ -3481,6 +3589,7 @@ def _refresh_health(room):
         if ledger.note_lying(index, _lying_dead(room, index)):
             ledger.reset(index)
     _advance_hp_charges(room, ledger)
+    _heal_humans_in_totems(room)
 
 
 def _advance_hp_charges(room, ledger):
@@ -4021,16 +4130,32 @@ def _stand_in_heal_totem(room, machine, seat_index, now):
     ★ 这不是我们挑的定时器（铁律 10）：`Interval` 照抄原版节奏，
       和 `_advance_hp_charges()` 抄 `Status.ini[8] Interval=1.0` 是同一档。
     """
-    quest = room.quest
     body = machine.body
-    ledger = _health(room)
-    if quest is None or body is None or ledger is None:
+    if body is None:
         return False
-    healed = False
+    healed = _heal_in_totems(room, seat_index, body.x, body.y, now)
+    for totem, amount in healed:
+        machine.log(f"   站在回血图腾里 @ ({totem[0]:.0f}, {totem[1]:.0f})："
+                    f"回 {amount} 点，现在 "
+                    f"{_seat_health(room, seat_index) * 100:.0f}%")
+    return bool(healed)
+
+
+def _heal_in_totems(room, seat_index, x, y, now):
+    """站在 `(x, y)` 的这个座位此刻从回血图腾里回的血：`[(图腾, 量), …]`，已记进台账。
+
+    判据、节奏、数值见 `_stand_in_heal_totem()`。每台客户端对圈里的**每个**
+    角色都各自回（`0x488364` 起那一段不分本机 / 远端）⇒ 真人和 bot 走同一段。
+    """
+    quest = None if room is None else room.quest
+    ledger = _health(room)
+    if quest is None or ledger is None:
+        return []
+    healed = []
     for totem, spec in _live_totems(quest, now):
         if not _totem_heals(room, seat_index, totem, spec):
             continue
-        if math.hypot(totem[0] - body.x, totem[1] - body.y) > spec["totem_range"]:
+        if math.hypot(totem[0] - x, totem[1] - y) > spec["totem_range"]:
             continue
         last = totem[6].get(seat_index)
         if last is not None and now - last < spec["totem_interval_ms"] / 1000.0:
@@ -4040,11 +4165,27 @@ def _stand_in_heal_totem(room, machine, seat_index, now):
             amount = int(amount * spec["totem_mode_ratio"])
         totem[6][seat_index] = now
         ledger.note_heal(seat_index, amount)
-        machine.log(f"   站在回血图腾里 @ ({totem[0]:.0f}, {totem[1]:.0f})："
-                    f"回 {amount} 点，现在 "
-                    f"{_seat_health(room, seat_index) * 100:.0f}%")
-        healed = True
+        healed.append((totem, amount))
     return healed
+
+
+def _heal_humans_in_totems(room):
+    """真人站在回血图腾里，服务端的台账也跟着回（X_Mod §91）。
+
+    ★ 别人屏幕上他本来就在回血（`_heal_in_totems()` 那条理由）。以前这本账只替
+      bot 记，真人站进去台账上一点不涨 ——[幸运幸存者] 那道「剩余 HP < 15」就会
+      把回满了的人也当成残血。bot 那一份在 `_tick_bot()` 里记，这里跳过免得记两遍。
+    """
+    quest = room.quest
+    if quest is None or not getattr(quest, "totems", None):
+        return
+    now = _now()
+    for index, seat in enumerate(room.seats):
+        if seat is None or seat.is_bot or _lying_dead(room, index):
+            continue
+        body = _seat_body(room, index)
+        if body is not None:
+            _heal_in_totems(room, index, body[0], body[1], now)
 
 
 def _take_freeze(room, machine, seat_index, now):
@@ -9497,12 +9638,13 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region, tick):
     if mob_handle is not None:
         victim_seat = None
     hit = victim_seat is not None
-    # ★★ 夺分模式伤害翻倍（§87）+ 夺分独有的两条 ×0.75（§89）——
-    #   原版是射手那台机器在把数字塞进包之前做的
-    #   （`0x4806f1: shl` / `0x47e6df` / `0x47e6fe`）。
-    damage = (_direct_hit_damage(room, machine, weapon, region, victim_seat,
-                                 shell.damage_ratio)
-              if hit else 0)
+    # ★★ 夺分模式伤害翻倍（§87）+ 受害者一侧的防御 / [幸运幸存者]（X_Mod §91）
+    #   + 夺分独有的两条 ×0.75（§89）—— 原版是射手那台机器在把数字塞进包之前
+    #   做的（`0x4806f1: shl` / `0x480938` / `0x4809b4` / `0x47e6df` / `0x47e6fe`）。
+    #   `flags` 进 `+20`：收方拿它画「DEFENSE!」/「LUCKY!」（`0x4809c1`）。
+    damage, flags = (_direct_hit_damage(room, machine, weapon, region,
+                                        victim_seat, shell.damage_ratio)
+                     if hit else (0, 0))
     if mob_handle is not None:
         damage = int(weapon.damage_for("body") * shell.damage_ratio)
         # ★ 闯关分数（§130）：打在怪身上的伤害就是分。
@@ -9516,7 +9658,7 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region, tick):
         point[0], point[1],
         hit_kind=(botsync.HIT_CHARACTER
                   if (hit or mob_handle is not None) else botsync.HIT_NONE),
-        damage=damage, spawns=weapon.explode_step)
+        damage=damage, spawns=weapon.explode_step, flags=flags)
     # ★ 诊断：命中 / 落空**各打一行**（按状态翻转去重，铁律 10）。M3b 收口后删。
     if (hit, mob_handle is not None) not in machine.explode_logged:
         machine.explode_logged.add((hit, mob_handle is not None))
@@ -9553,6 +9695,13 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region, tick):
         #   而真人扔的同一颗手雷会把人顶飞 —— 用户 2026-08-28 报的就是这个。
         splashed_mob = (seat_index[1] if isinstance(seat_index, tuple)
                         else None)
+        if splashed_mob is None:
+            # ★ 受害者一侧（X_Mod §91）：`SplashDamage` 的 `[vft+0x128]` 就是
+            #   `0x4806bf`，衰减、×2 之后同一个函数的尾巴。`rpSplashDamaged`
+            #   没有 flags 那一格（`+12` 恒 0，`vft+0x138` 是 `xor eax,eax`），
+            #   所以收方不画字，只是这一下伤害变了。
+            splash, _flags = _victim_side(room, machine, seat_index, splash,
+                                          "溅射")
         _emit(machine, machine.sync.event(
             botsync.OP_SPLASH_DAMAGED,
             botsync.splash_body(shell.handle,
@@ -9865,8 +10014,14 @@ def _advance_fires(room, machine, now):
                              else None)
                 who = (f"怪 {burnt_mob}" if burnt_mob is not None
                        else f"座位{seat_index}")
+                hurt = damage
+                if burnt_mob is None:
+                    # ★ 受害者一侧（X_Mod §91）：`Flame` 的 `[vft+0x128]` 也是
+                    #   `0x4806bf`。每个人各算各的，所以放在人头这一层。
+                    hurt, _flags = _victim_side(room, machine, seat_index,
+                                                damage, "地面燃烧")
                 machine.log(f"   火烧: {who} 在 "
-                            f"({lit.x:.0f}, {lit.y:.0f}) 挨了 {damage} 点"
+                            f"({lit.x:.0f}, {lit.y:.0f}) 挨了 {hurt} 点"
                             f"（第 {local} tick，火团句柄 {lit.handle}，§78/§85）")
                 # ★ 火的击退是**常量** `(0, −8)`（§92，语料 1164 发无例外）。
                 _emit(machine, machine.sync.event(
@@ -9875,14 +10030,14 @@ def _advance_fires(room, machine, now):
                                         burnt_mob if burnt_mob is not None
                                         else botsync.character_handle(
                                             seat_index),
-                                        damage, lit.x, lit.y,
+                                        hurt, lit.x, lit.y,
                                         push_x=FIRE_KNOCKBACK[0],
                                         push_y=FIRE_KNOCKBACK[1])))
                 if burnt_mob is not None:
-                    _score_quest_damage(room, machine, damage)
+                    _score_quest_damage(room, machine, hurt)
                     continue
-                _note_damage(room, seat_index, damage)   # ★ 血量台账（M5-C）
-                _knock_back_seat(room, seat_index, damage, FIRE_KNOCKBACK,
+                _note_damage(room, seat_index, hurt)     # ★ 血量台账（M5-C）
+                _knock_back_seat(room, seat_index, hurt, FIRE_KNOCKBACK,
                                  source="地面燃烧")
     # ★ 两条都算烧完了：推到头了，或者**这一刻它本来就该灭了**
     #   （服务端卡了一下、`BOT_FIRE_CATCHUP_TICKS` 那道闸没让它补完）。
@@ -10353,6 +10508,11 @@ def _advance_dash(room, machine, now):
             push = (DASH_KNOCKBACK[0] * facing, DASH_KNOCKBACK[1])
             mob_handle = (seat_index[1] if isinstance(seat_index, tuple)
                           else None)
+            if mob_handle is None:
+                # ★ 受害者一侧（X_Mod §91）：`0x4806bf` 的尾巴。它后面那条
+                #   DashAttack 加成是射手一侧的（`0x481e40`），bot 是白板号。
+                damage, _flags = _victim_side(room, machine, seat_index,
+                                              damage, "近身")
             _emit(machine, machine.sync.event(
                 botsync.OP_SPLASH_DAMAGED,
                 botsync.splash_body(

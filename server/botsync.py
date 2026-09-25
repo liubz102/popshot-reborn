@@ -1067,7 +1067,7 @@ class BotSyncStream:
             return packet, handle
 
     def explode(self, handle, target_handle, x, y, hit_kind, damage,
-                spawns):
+                spawns, flags=0):
         """一发 `rpExplode`，**同时把爆炸对象的句柄记账推进 `spawns` 个**。
 
         ★★★ `spawns` = `weapon.explode_step`（带溅射的 1、不带的 0，§86）。
@@ -1075,12 +1075,15 @@ class BotSyncStream:
         计数器** —— 少记一个，之后每一发 `rpExplode` 都对不上号、被静默
         丢弃（§42），一局之内不自愈。
 
+        `flags` 是 `+20`（`bot._direct_hit_damage()` 一路 `or` 出来的，
+        收方拿它画「DEFENSE!」/「LUCKY!」，X_Mod §91）。
+
         和 `fire()` 同一个理由：组包和记账**必须在一次加锁里做完**。
         """
         with self._lock:
             packet = self.event(OP_EXPLODE, explode_body(
                 handle, target_handle, x, y,
-                hit_kind=hit_kind, damage=damage))
+                hit_kind=hit_kind, flags=flags, damage=damage))
             self.projectiles += int(spawns)
             return packet
 

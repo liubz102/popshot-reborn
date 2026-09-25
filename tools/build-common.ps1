@@ -421,6 +421,7 @@ function Get-ServerSourceFile([string]$Root) {
                         'botmove.py', 'botnav.py', 'mapdata.py', 'weapondata.py',
                         'ballistics.py', 'chrprops.py',
                         'bothp.py', 'botarms.py', 'botaim.py', 'botthreat.py',
+                        'equipbonus.py',
                         'shop.py', 'shopcfg.py', 'shopdata.py', 'shopdefaults.py', 'databackup.py', 'logpack.py',
                         'cards.py', 'sellprice.py', 'gifthistory.py',
                         'crashstore.py', 'crashwatch.py')) {

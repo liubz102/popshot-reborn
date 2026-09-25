@@ -8592,10 +8592,14 @@ class BotDeathmatchPenaltyTests(BotFireRoom):
     `flags 4 伤害 30`（= 20 × 2 × 0.75），bot 打他是 40 —— 差的就是这一条。
     """
 
-    def penalty_damage(self, region="body"):
+    def penalty_hit(self, region="body"):
+        """`(伤害, flags)` —— `_direct_hit_damage()` 连 `rpExplode +20` 一起给。"""
         weapon = weapondata.get(1000020)
         return bot._direct_hit_damage(self.room, self.bot_conn, weapon,
                                       region, self.alice_seat)
+
+    def penalty_damage(self, region="body"):
+        return self.penalty_hit(region)[0]
 
     def setUp(self):
         super().setUp()
@@ -8640,6 +8644,14 @@ class BotDeathmatchPenaltyTests(BotFireRoom):
         self.alice.sync_trail.clear()
         self.assertEqual(20 * 2, self.penalty_damage())
 
+    def test_each_penalty_sets_its_own_flag(self):
+        """两条 ×0.75 各自 `or` 进 `rpExplode +20`（`0x47e6e1` 远 = 8、`0x47e700` 踩地 = 4）。"""
+        self.assertEqual(bot.EXPLODE_FLAG_GROUNDED, self.penalty_hit()[1])
+        self.bot_conn.battle_pos = (100.0 + bot.BOT_LONG_SHOT_RANGE + 1.0,
+                                    100.0)
+        self.assertEqual(bot.EXPLODE_FLAG_GROUNDED | bot.EXPLODE_FLAG_FAR,
+                         self.penalty_hit()[1])
+
     def test_the_splash_has_no_such_penalty(self):
         """★ 溅射走 `0x4806bf`，**不经过** `0x47e618` —— 一条都不减。"""
         weapon = weapondata.get(1000020)
@@ -8650,6 +8662,256 @@ class BotDeathmatchPenaltyTests(BotFireRoom):
         hits = bot._splash_targets(self.room, shell, (0.0, -37.0), None, bodies)
         self.assertEqual(1, len(hits))
         self.assertEqual(int(weapon.splash_damage) * 2, hits[0][1])
+
+
+def never_roll():
+    raise AssertionError("这一下不该掷骰子")
+
+
+class VictimSideMixin(object):
+    """受害者一侧那两条要用的小工具（X_Mod §91）：穿装备、压血、钉骰子。"""
+
+    def wear(self, conn, *item_ids):
+        """让 `conn` 穿上 `item_ids`（存档里有、身上穿着，`equipped_items` 认）。"""
+        conn.account["inventory"] = {str(i): 1 for i in item_ids}
+        conn.account["equipped"] = list(item_ids)
+
+    def leave_hp(self, seat, hp):
+        """把台账上这个座位打到只剩 `hp`（满血按 `_seat_max_hp`，含装备）。"""
+        ledger = bot._health(self.room)
+        ledger.reset(seat)
+        ledger.note_damage(seat, bot._seat_max_hp(self.room, seat) - hp)
+
+    def side(self, damage, seat=None):
+        return bot._victim_side(self.room, self.bot_conn,
+                                self.alice_seat if seat is None else seat,
+                                damage, "单测")
+
+
+class BotVictimSideTests(VictimSideMixin, BotFireRoom):
+    """★★★ bot 打真人时，**受害者**身上的防御 15% 和 [幸运幸存者]（X_Mod §91）。
+
+    两条都在射手那台的 `0x4806bf` 尾巴上（`0x480901` 起）。bot 没有本机，
+    射手就是服务端 —— 以前服务端只做了射手一侧（bot 是白板号，那半本来就空），
+    受害者一侧整段漏了：被 bot 打的时候防御装备和 [幸运幸存者] 都不生效。
+    """
+
+    DEFENSE_5 = 1010016          # 泰尔的上衣，Defense 5
+    HP_8 = 1010037               # 泰尔的上衣，Hp 8（没有防御）
+
+    def setUp(self):
+        super().setUp()
+        self.alice_seat = self.room.seat_index_of(self.alice)
+        self.assertEqual(0, self.room.seats[self.alice_seat].character_id,
+                         "下面挑的铠甲都是泰尔的")
+        self.walk(self.alice, [(100.0, 100.0)])
+        self.bot_conn.battle_pos = (100.0, 100.0)
+
+    # --- 防御 ------------------------------------------------------------
+    def test_defense_cuts_the_damage_fifteen_percent_of_the_time(self):
+        self.wear(self.alice, self.DEFENSE_5)
+        self.bot_conn.roll_unit = lambda: 0.0
+        self.assertEqual((19, bot.EXPLODE_FLAG_DEFENSE), self.side(20))
+        self.bot_conn.roll_unit = lambda: 0.15         # 门是严格的 `<`
+        self.assertEqual((20, 0), self.side(20))
+
+    def test_the_cut_truncates_as_single_precision(self):
+        """★ `95 × 20 × 0.01f`：D3D9 的单精度 FPU 下是 19.0，双精度是 18.99999…
+
+        写成 `int(20 * 95 / 100)` 碰巧也是 19，所以挑一个两边真不一样的：
+        夺分 ×2 后 40 → `95 × 40 × 0.01f` = 38（双精度会得 37）。
+        """
+        self.wear(self.alice, self.DEFENSE_5)
+        self.bot_conn.roll_unit = lambda: 0.0
+        self.assertEqual(37, int(95 * 40 * 0.009999999776482582),
+                         "双精度确实会少一点")
+        self.assertEqual(38, self.side(40)[0])
+
+    def test_no_defense_means_no_roll_at_all(self):
+        self.bot_conn.roll_unit = never_roll
+        self.assertEqual((20, 0), self.side(20))
+
+    def test_gear_for_another_character_does_not_count(self):
+        """bob 是卡希尔：泰尔的上衣穿在身上也不算（分桶，V0.3商店 §1）。"""
+        self.wear(self.bob, self.DEFENSE_5)
+        self.bot_conn.roll_unit = never_roll
+        bob_seat = self.room.seat_index_of(self.bob)
+        self.assertEqual((20, 0), self.side(20, seat=bob_seat))
+
+    # --- [幸运幸存者] ------------------------------------------------------
+    def test_lucky_only_on_a_lethal_hit_at_low_hp(self):
+        self.wear(self.alice, bot.LUCKY_SURVIVOR_ID)
+        self.bot_conn.roll_unit = lambda: 0.0
+        self.leave_hp(self.alice_seat, 10)
+        self.assertEqual((0, bot.EXPLODE_FLAG_LUCKY), self.side(12))
+
+    def test_a_hit_that_leaves_one_hp_is_not_protected(self):
+        """不致命就不掷：残血也照扣。"""
+        self.wear(self.alice, bot.LUCKY_SURVIVOR_ID)
+        self.bot_conn.roll_unit = never_roll
+        self.leave_hp(self.alice_seat, 10)
+        self.assertEqual((9, 0), self.side(9))
+
+    def test_exactly_lethal_is_not_protected(self):
+        """★ 原版怪癖：门是 `HP < 伤害`，而扣血是 `HP ≤ 0` 就死（X_Mod §90）。"""
+        self.wear(self.alice, bot.LUCKY_SURVIVOR_ID)
+        self.bot_conn.roll_unit = never_roll
+        self.leave_hp(self.alice_seat, 10)
+        self.assertEqual((10, 0), self.side(10))
+
+    def test_fifteen_hp_or_more_is_not_protected(self):
+        self.wear(self.alice, bot.LUCKY_SURVIVOR_ID)
+        self.bot_conn.roll_unit = never_roll
+        self.leave_hp(self.alice_seat, 15)
+        self.assertEqual((40, 0), self.side(40))
+
+    def test_it_is_a_coin_flip(self):
+        self.wear(self.alice, bot.LUCKY_SURVIVOR_ID)
+        self.leave_hp(self.alice_seat, 10)
+        self.bot_conn.roll_unit = lambda: 0.5          # 门是严格的 `<`
+        self.assertEqual((12, 0), self.side(12))
+
+    def test_without_the_title_nothing_happens(self):
+        self.bot_conn.roll_unit = never_roll
+        self.leave_hp(self.alice_seat, 10)
+        self.assertEqual((12, 0), self.side(12))
+
+    def test_defense_is_applied_before_the_lucky_gate(self):
+        """顺序照 `0x4806bf`：先防御、再拿**折过的**伤害去比 HP。
+
+        剩 10 血挨 11：防御 5 折成 `int(f32(95 × 11 × 0.01f))` = 10，
+        10 不大于 10 ⇒ 不再致命，[幸运幸存者] 那道门不开。
+        """
+        self.wear(self.alice, self.DEFENSE_5, bot.LUCKY_SURVIVOR_ID)
+        self.bot_conn.roll_unit = lambda: 0.0
+        self.leave_hp(self.alice_seat, 10)
+        self.assertEqual((10, bot.EXPLODE_FLAG_DEFENSE), self.side(11))
+
+    def test_gear_hp_counts_toward_the_remaining_hp(self):
+        """★ 满血含装备的 `Hp` 加成（`0x50a09e`）—— 不算的话穿铠甲的人在台账上
+        永远少那几点血，没残血也会被当成残血。"""
+        base = chrprops.get(0).hp
+        self.wear(self.alice, self.HP_8, bot.LUCKY_SURVIVOR_ID)
+        self.assertEqual(base + 8, bot._seat_max_hp(self.room, self.alice_seat))
+        ledger = bot._health(self.room)
+        ledger.reset(self.alice_seat)
+        ledger.note_damage(self.alice_seat, base - 10)    # 只看基础值会以为剩 10
+        self.bot_conn.roll_unit = never_roll               # 实际剩 18
+        self.assertEqual((20, 0), self.side(20))
+
+    # --- 谁不受影响 --------------------------------------------------------
+    def test_monsters_and_bots_are_untouched(self):
+        self.bot_conn.roll_unit = never_roll
+        self.assertEqual((20, 0), self.side(20, seat=("mob", 1100275)))
+        self.assertEqual((20, 0), self.side(20, seat=self.bot_seat))
+
+    # --- 接到三条伤害路上 --------------------------------------------------
+    def test_a_direct_hit_carries_the_lucky_flag(self):
+        """★ `rpExplode +20` 带上 `0x100`，收方画「LUCKY!」（`0x4809c1`）。"""
+        self.wear(self.alice, bot.LUCKY_SURVIVOR_ID)
+        self.bot_conn.roll_unit = lambda: 0.0
+        self.leave_hp(self.alice_seat, 10)
+        weapon = weapondata.get(1000020)
+        damage, flags = bot._direct_hit_damage(self.room, self.bot_conn, weapon,
+                                               "body", self.alice_seat)
+        self.assertEqual(0, damage)
+        self.assertTrue(flags & bot.EXPLODE_FLAG_LUCKY)
+
+    def shell_at(self, x, y, ammo=1000020):
+        weapon = weapondata.get(ammo)
+        shell = bot.Shell(handle=botsync.projectile_handle(self.bot_seat, 0),
+                          fire_seq=0, weapon=weapon,
+                          group=bot._seat_group(self.room, self.bot_seat),
+                          x0=x, y0=y,
+                          shot=ballistics.launch(weapon, 0.0, 30.0),
+                          born=time.monotonic(), max_ticks=200)
+        shell.x, shell.y = x, y
+        return shell
+
+    def test_the_explode_packet_says_lucky(self):
+        self.wear(self.alice, bot.LUCKY_SURVIVOR_ID)
+        self.bot_conn.roll_unit = lambda: 0.0
+        self.leave_hp(self.alice_seat, 10)
+        self.clear()
+        bot._resolve_shell(self.room, self.bot_conn, self.shell_at(100.0, 80.0),
+                           (100.0, 80.0), self.alice_seat, "body", 0)
+        booms = explode_frames(self.bob, self.bot_seat)
+        self.assertEqual(1, len(booms))
+        flags = struct.unpack_from("<i", body_of(booms[0]), 20)[0]
+        damage = struct.unpack_from("<f", body_of(booms[0]), 24)[0]
+        self.assertTrue(flags & bot.EXPLODE_FLAG_LUCKY)
+        self.assertEqual(0.0, damage)
+        # 清零的那一下不进台账：剩下的血还是 10。
+        ledger = bot._health(self.room)
+        self.assertEqual(10.0, ledger.remaining(
+            self.alice_seat, bot._seat_max_hp(self.room, self.alice_seat)))
+
+    def test_a_splash_can_be_lucky_too(self):
+        """溅射包没有 flags 那一格，只是伤害变成 0（`SplashDamage [vft+0x128]` = `0x4806bf`）。"""
+        self.wear(self.alice, bot.LUCKY_SURVIVOR_ID)
+        self.bot_conn.roll_unit = lambda: 0.0
+        self.leave_hp(self.alice_seat, 1)
+        self.clear()
+        point = (130.0, 60.0)                          # 没砸中，炸在她旁边
+        bot._resolve_shell(self.room, self.bot_conn, self.shell_at(*point),
+                           point, None, None, 0)
+        mine = [f for f in splash_frames(self.bob, self.bot_seat)
+                if struct.unpack_from("<i", body_of(f), 4)[0]
+                == botsync.character_handle(self.alice_seat)]
+        self.assertEqual(1, len(mine), "她在溅射范围里")
+        self.assertEqual(0.0, struct.unpack_from("<f", body_of(mine[0]), 8)[0])
+
+    def test_a_burn_can_be_lucky_too(self):
+        """地面燃烧：`Flame [vft+0x128]` 也是 `0x4806bf`。夹具写法见
+        `test_the_fire_wall_doubles_in_deathmatch`（墙和账本装好立刻量）。"""
+        flame = weapondata.get(1001500)
+        self.wear(self.alice, bot.LUCKY_SURVIVOR_ID)
+        self.bot_conn.roll_unit = lambda: 0.0
+        self.walk(self.alice, [(400, 100)])
+        spot = self.alice.sync_trail[-1][:2]
+        life = bot._fire_wall_ticks(flame)
+        wall = bot.FireWall(
+            botsync.projectile_handle(self.bot_seat, 0), flame,
+            [bot.Flame(botsync.projectile_handle(self.bot_seat, 0),
+                       float(spot[0]), float(spot[1]), 0, life)],
+            time.monotonic(), life)
+        wall.born_tick -= bot.BOT_FIRE_REBURN_TICKS
+        self.leave_hp(self.alice_seat, 1)
+        self.bot_conn.fires = [wall]
+        self.bot_conn.burnt = {}
+        self.clear()
+        self.walk(self.alice, [tuple(spot)])
+        burns = [f for f in bot_frames(self.alice, self.bot_seat)
+                 if header(f)["opcode"] == botsync.OP_SPLASH_DAMAGED
+                 and struct.unpack_from("<i", body_of(f), 4)[0]
+                 == botsync.character_handle(self.alice_seat)]
+        self.assertTrue(burns, "该烧到她")
+        self.assertEqual(0.0, struct.unpack_from("<f", body_of(burns[0]), 8)[0])
+
+
+class BotVictimSideDashTests(VictimSideMixin, BotFireRoom):
+    """近身那一下也吃受害者一侧（`0x481dfd` 进门第一件事就是 `call 0x4806bf`）。"""
+
+    melee = True
+
+    def test_a_lucky_dash_does_no_damage(self):
+        self.alice_seat = self.room.seat_index_of(self.alice)
+        self.wear(self.alice, bot.LUCKY_SURVIVOR_ID)
+        self.bot_conn.roll_unit = lambda: 0.0
+        self.leave_hp(self.alice_seat, 1)
+        self.approach()
+        self.assertTrue(dash_frames(self.alice, self.bot_seat))
+        self.clear()
+        handles = set()
+        for _ in range(60):
+            swing = self.bot_conn.dash_swing
+            if swing is not None:
+                handles.add(swing.handle)
+            self.advance(1)
+        hits = [f for f in splash_frames(self.alice, self.bot_seat)
+                if struct.unpack_from("<i", body_of(f), 0)[0] in handles]
+        self.assertTrue(hits, "贴着打这一下该打中")
+        self.assertEqual(0.0, struct.unpack_from("<f", body_of(hits[0]), 8)[0])
 
 
 class BotSplashFalloffTests(BotFireRoom):
