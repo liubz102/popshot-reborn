@@ -2292,3 +2292,20 @@ D60 把炸点改成 `hit.free`（被挡住的**前一个**整数点），比旧�
 - **解收包**：`Simple::Decrypt#` 下面的「入」是密文。同一 `this` 的 `len` 从连接起累加，
   `simple.SimpleCipher.server_to_client()` 先空转 `total % 1176` 字节（49 × 24 的周期）再解；帧头 `ff 00 LL LL ×4 OP OP`。
   每块只记前 256 字节（`SNOW_MAX_LOG_BYTES`）。发包不用解：`Simple::Encrypt#` 下面的「入」就是明文。
+
+## §108 ★★★★ 本机 SOCKS5 代理（`127.0.0.1:10808`）支持 UDP ASSOCIATE；代理下没有 UDP 只因为中继从没发过（✅ 2026-09-26 实测）
+
+- 握手 `05 01 00` → `05 00`；`05 03 00 01 0.0.0.0:0` → `05 00 00 01 BND=127.0.0.1:10808`（和 TCP **同一个口**）。
+  经它发的 UDP 数据报 IPv4 ATYP 和域名 ATYP 都有回包（`1.1.1.1:53` 的 DNS 应答原样回来，头 `00 00 00 01 …`）；
+  `relay._Socks5UdpUpstream` 对着真代理一来一回 ✅。
+- `relay.py` 以前 `proxied` 时**直接不开远程 UDP 上游**（V0.2 D099 留的空白、D58 沿用），代理面板自然看不到 UDP。
+  ⇒ 发给这个玩家的**所有**心跳（真人的、bot 的）都落回 TCP 中继 —— bot 的路本来就和真人同一条
+  （`relayserver.deliver()` 1208~1216 行没有 bot 分支，`test_a_bot_uses_the_very_same_route_rule_as_a_human` 钉着），
+  病根在**收方没开 UDP**，服务端一字不用改。
+- ★ 经这个代理发往 `127.0.0.1` / 私网地址的 UDP **没有回包**：它把一切都送到远端出口，环回在远端指的是远端自己。
+  拿真代理做冒烟只能用公网目标；要让本机 / 局域网服务端也走代理路径，得在代理侧配「私网直连」的路由规则。
+- ★ 关联死了（控制连接断）之后重建，服务端见到**新来源地址**会新建 `Endpoint`、下行索引从 0 起（`udpsync._on_hello` 1038~1052 行），
+  中继的 `downlink_high_water` 不清就把之后几分钟的下行全丢在闸门上（`test_a_dropped_association_is_rebuilt_by_the_hello_retry` 钉着）。
+  今天 NAT 重绑也是同一个坑（服务端换 Endpoint、中继闸门不清），只是没人碰到过。
+- 已知局限（不修）：代理**面向服务端**那一侧的 UDP 源口若空闲换口，服务端把它当陌生来源丢（`_on_data` 1066 行）而中继仍 `acked`
+  ⇒ UDP 静悄悄停、TCP 接管，和 NAT 重绑一样；10 秒一发的保活 PING 撑住大多数代理的出站会话。要识别得改 `udpsync.py`。

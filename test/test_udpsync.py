@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER = os.path.join(os.path.dirname(HERE), "server")   # 被测代码在隔壁
@@ -1151,7 +1152,13 @@ class _TwoServers:
     """两台「服务器」都是裸 UDP socket：只记收到了什么、回不回由用例决定 ——
     这样才看得见「本机那一位有没有被转出去」「迟到的回包认没认」。"""
 
-    PROXIED = False
+    #: 远程那台在 `server.config` 里写的地址（经代理的用例会写成域名，让代理去解）。
+    TARGET_HOST = "127.0.0.1"
+
+    def make_proxy(self):
+        """远程那条上游经哪个代理（`ProxySettings | None`）。在建 relay 之前调 ——
+        假代理要 `addCleanup`、要现分配端口，放不进类属性。"""
+        return None
 
     def setUp(self):
         import relay                                            # noqa: PLC0415
@@ -1167,8 +1174,8 @@ class _TwoServers:
         local_port = probe.getsockname()[1]
         probe.close()
         self.relay = relay.UdpSyncRelay(
-            "127.0.0.1", target_port=self.remote_srv.getsockname()[1],
-            local_port=local_port, redundancy=2, proxied=self.PROXIED,
+            self.TARGET_HOST, target_port=self.remote_srv.getsockname()[1],
+            local_port=local_port, redundancy=2, proxy=self.make_proxy(),
             local_target=("127.0.0.1", self.local_srv.getsockname()[1]))
         self.assertTrue(self.relay.start())
         self.addCleanup(self.relay.close)
@@ -1278,10 +1285,12 @@ class LocalServerRouteTests(_TwoServers, unittest.TestCase):
         self.assertIn("远程服务器", said[1])
 
 
-class LocalServerRouteWithProxyTests(_TwoServers, unittest.TestCase):
-    """代理只关「远程」那条（代理转不了 UDP）；本机那条是环回，照常走。"""
+class HttpProxyRouteTests(_TwoServers, unittest.TestCase):
+    """HTTP CONNECT 代理转不了 UDP ⇒ 只关「远程」那条；本机那条是环回，照常走。
+    （SOCKS5 代理走 UDP ASSOCIATE，见下面 `Socks5UdpRouteTests`，X_Mod D71。）"""
 
-    PROXIED = True
+    def make_proxy(self):
+        return self.relay_module.ProxySettings("http", "127.0.0.1", 1)
 
     def test_the_remote_route_stays_on_tcp(self):
         self.hello("tkt", local=False)
@@ -1290,6 +1299,11 @@ class LocalServerRouteWithProxyTests(_TwoServers, unittest.TestCase):
         self.relay.first_hello_at = 100.0
         self.assertFalse(self.relay._quiet_warning_due(
             now=100.0 + self.relay_module.UDP_QUIET_WARN_S + 1))
+        # 原因说了一次（start() 时），之后每一发 HELLO 都不再重复
+        self.hello("tkt2", local=False)
+        self.assertTrue(self.nothing_arrives(self.remote_srv))
+        said = [x for x in self.lines if "✗ HTTP CONNECT 代理转不了 UDP" in x]
+        self.assertEqual(1, len(said))
 
     def test_the_local_route_is_not_affected_by_the_proxy(self):
         self.hello("tkt", local=True)
@@ -1307,14 +1321,248 @@ class LocalServerRouteWithProxyTests(_TwoServers, unittest.TestCase):
             def start(self):
                 return True
 
+        proxy = self.relay_module.ProxySettings("socks5", "127.0.0.1", 1080)
         real = self.relay_module.UdpSyncRelay
         self.relay_module.UdpSyncRelay = FakeRelay
         try:
-            got = self.relay_module.start_udp_sync("example.com", proxy=object())
+            got = self.relay_module.start_udp_sync("example.com", proxy=proxy)
         finally:
             self.relay_module.UdpSyncRelay = real
         self.assertIsNotNone(got)
-        self.assertTrue(captured["proxied"])
+        self.assertIs(proxy, captured["proxy"])
+
+
+# ----------------------------------------------------------------------------
+# ★ SOCKS5 代理：远程那条经 UDP ASSOCIATE 照走 UDP（X_Mod D71，用户 2026-09-26）
+# ----------------------------------------------------------------------------
+from test_proxy import FakeProxyMixin, wait_for                 # noqa: E402
+
+
+class _Socks5Route(FakeProxyMixin, _TwoServers):
+    """`_TwoServers` + 一个真的中转 UDP 的假 SOCKS5 代理（`test_proxy.FakeProxyMixin`）。
+    `remote_srv` 看到的来源是代理的中转口。"""
+
+    RESOLVE = {"game.popshot.example": "127.0.0.1"}
+    PROXY_KW = dict(udp=True, accept_many=True)
+
+    def make_proxy(self):
+        self.proxy, self.state, _ = self.start_socks5(resolve=self.RESOLVE, **self.PROXY_KW)
+        return self.proxy
+
+    def remote_hello(self, ticket="tkt", ack=True):
+        """一发远程 HELLO，回 `(远程服务器看到的来源, HELLO 数据报)`；`ack` 时顺手确认。"""
+        self.hello(ticket, local=False)
+        data, proxy_side = self.remote_srv.recvfrom(65536)
+        self.assertEqual(ticket, parse_hello(data))
+        if ack:
+            self.remote_srv.sendto(build_hello_ack(ACK_OK), proxy_side)
+            self.assertTrue(self.wait_for(lambda: self.relay.acked))
+        return proxy_side, data
+
+    def test_the_local_route_does_not_go_through_the_proxy(self):
+        self.hello("tkt", local=True)
+        data, _ = self.local_srv.recvfrom(65536)
+        self.assertEqual("tkt", parse_hello(data))
+        self.assertEqual([], self.state.get("udp_targets", []))
+
+
+class Socks5UdpRouteTests(_Socks5Route, unittest.TestCase):
+    """配了 SOCKS5 代理：远程 HELLO / DATA 经代理到服务端，回包经代理注入；本机那条不经代理。"""
+
+    def test_a_remote_login_goes_through_the_proxy_both_ways(self):
+        remote_port = self.remote_srv.getsockname()[1]
+        proxy_side, _ = self.remote_hello()
+        self.assertEqual(self.state["relay_addr"], proxy_side)        # 来源是代理的中转口
+        self.assertEqual([(1, "127.0.0.1", remote_port)], self.state["udp_targets"])
+        # 上行 DATA 经代理到服务端
+        self.hook.sendto(build_data([(0, heartbeat())]), self.relay_addr)
+        data, _ = self.remote_srv.recvfrom(65536)
+        self.assertEqual(MSG_DATA, parse_header(data)[0])
+        # 下行 DATA 经代理回来、拆掉头之后注入
+        injected = []
+        self.relay._inject = injected.append
+        self.remote_srv.sendto(build_data([(0, heartbeat(5))]), proxy_side)
+        self.assertTrue(self.wait_for(lambda: len(injected) == 1))
+        self.assertEqual(5, heartbeat_next_event_seq(injected[0]))
+        self.assertTrue(self.nothing_arrives(self.local_srv))
+        self.assertNotIn("error", self.state)
+        # 日志：start() 的横幅就把「远程经代理」说全了（所以第一次远程登录不再重复），
+        # 切到本机再切回远程时那一行要带上代理。
+        banner = [x for x in self.lines if "选「远程服务器」时" in x]
+        self.assertEqual(1, len(banner))
+        self.assertIn(self.proxy.route, banner[0])
+        self.assertIn("UDP ASSOCIATE", banner[0])
+        self.hello("tkt-local", local=True)
+        self.local_srv.recvfrom(65536)
+        self.hello("tkt-again", local=False)
+        self.remote_srv.recvfrom(65536)
+        said = [x for x in self.lines if "这一轮登录选的是「远程服务器」" in x]
+        self.assertEqual(1, len(said))
+        self.assertIn(self.proxy.route, said[0])
+        self.assertIn(f"UDP 中转口 {proxy_side[0]}:{proxy_side[1]}", said[0])
+
+    def test_a_dropped_association_is_rebuilt_by_the_hello_retry(self):
+        """★ 代理撤掉关联（控制连接断）是一个事件：这一轮的上游撤掉、`acked` 清掉，
+        现成的 HELLO 重发把它重建起来；**下行闸门必须清** —— 服务端见到新来源会新建
+        `Endpoint`、索引从 0 起，不清就把之后的下行全丢掉。"""
+        proxy_side, _ = self.remote_hello()
+        injected = []
+        self.relay._inject = injected.append
+        self.remote_srv.sendto(build_data([(0, heartbeat()), (1, heartbeat())]), proxy_side)
+        self.assertTrue(self.wait_for(lambda: len(injected) == 2))
+        self.assertEqual(1, self.relay.downlink_high_water)
+
+        self.state["kill_control"]()                       # 代理撤掉关联
+        self.assertTrue(self.wait_for(lambda: self.relay.remote is None))
+        self.assertFalse(self.relay.acked)
+        self.assertEqual(-1, self.relay.downlink_high_water)
+        self.assertEqual(0, self.relay.replies)
+        # 那一行日志是事件处理的最后一步，等它落下来
+        self.assertTrue(self.wait_for(
+            lambda: len([x for x in self.lines if "关掉了 UDP 通道" in x]) == 1))
+
+        self.relay._retry_hello()                          # HELLO 重发那一支
+        self.assertIsNotNone(self.relay.remote)
+        self.assertEqual(2, self.state["associations"])
+        data, proxy_side2 = self.remote_srv.recvfrom(65536)
+        self.assertEqual("tkt", parse_hello(data))
+        self.assertNotEqual(proxy_side, proxy_side2)       # 新关联 = 新的中转口
+        self.remote_srv.sendto(build_hello_ack(ACK_OK), proxy_side2)
+        self.assertTrue(self.wait_for(lambda: self.relay.acked))
+        # 服务端那边是一条新的流、索引从 0 起 —— 闸门清过了才收得下
+        self.remote_srv.sendto(build_data([(0, heartbeat(9))]), proxy_side2)
+        self.assertTrue(self.wait_for(lambda: len(injected) == 3))
+        self.assertEqual(9, heartbeat_next_event_seq(injected[2]))
+        self.assertNotIn("error", self.state)
+
+    def test_a_dead_association_on_the_other_route_does_not_touch_this_one(self):
+        """路由已经切到本机时代理才撤关联：本机这一轮的确认一个都不能动、也不打「回退 TCP」。"""
+        self.remote_hello()
+        self.hello("tkt-local", local=True)
+        _, local_side = self.local_srv.recvfrom(65536)
+        self.local_srv.sendto(build_hello_ack(ACK_OK), local_side)
+        self.assertTrue(self.wait_for(lambda: self.relay.acked))
+        self.state["kill_control"]()
+        self.assertTrue(self.wait_for(lambda: False not in self.relay._upstreams, timeout=5))
+        self.assertTrue(self.relay.acked)
+        self.assertIsNotNone(self.relay.remote)
+        self.assertEqual([], [x for x in self.lines if "关掉了 UDP 通道" in x])
+
+
+class Socks5DomainTargetRouteTests(_Socks5Route, unittest.TestCase):
+    """`server_address` 是域名：写进每发数据报的头里交给代理解，本机一次都不解析它。"""
+
+    TARGET_HOST = "game.popshot.example"
+
+    def setUp(self):
+        patcher = mock.patch("socket.getaddrinfo", wraps=socket.getaddrinfo)
+        self.getaddrinfo = patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
+
+    def test_the_domain_rides_in_the_header_and_is_never_resolved_here(self):
+        remote_port = self.remote_srv.getsockname()[1]
+        proxy_side, _ = self.remote_hello()
+        self.assertEqual([(3, "game.popshot.example", remote_port)], self.state["udp_targets"])
+        looked_up = [call.args[0] for call in self.getaddrinfo.call_args_list]
+        self.assertNotIn("game.popshot.example", looked_up)
+        injected = []
+        self.relay._inject = injected.append
+        self.remote_srv.sendto(build_data([(0, heartbeat(5))]), proxy_side)
+        self.assertTrue(self.wait_for(lambda: len(injected) == 1))
+        self.assertNotIn("error", self.state)
+
+
+class Socks5RefusingUdpRouteTests(_Socks5Route, unittest.TestCase):
+    """代理接 TCP 却不支持 UDP ASSOCIATE（状态 7）：远程回退 TCP、只说一次、本机不受影响。
+    ★ 绝不拿直连 UDP 兜底 —— 配了代理就不许有任何直连动作。"""
+
+    PROXY_KW = dict(udp=False, accept_many=True)
+
+    def test_the_remote_route_falls_back_to_tcp_and_says_so_once(self):
+        self.assertIsNone(self.relay.remote)               # start() 时就试过、没建起来
+        self.hello("tkt", local=False)
+        self.assertTrue(self.nothing_arrives(self.remote_srv))
+        self.hello("tkt2", local=False)                    # 每一发 HELLO 都会再试
+        self.assertTrue(self.nothing_arrives(self.remote_srv))
+        self.assertGreaterEqual(self.state["connections"], 2)
+        said = [x for x in self.lines if "建不了 UDP 通道" in x]
+        self.assertEqual(1, len(said))                     # 说一次，直到建起来一次为止
+        self.assertIn("UDP ASSOCIATE", said[0])
+        self.relay.first_hello_at = 100.0
+        self.assertFalse(self.relay._quiet_warning_due(
+            now=100.0 + self.relay_module.UDP_QUIET_WARN_S + 1))
+
+
+class Socks5UnspecifiedBindRouteTests(Socks5UdpRouteTests):
+    """应答 `BND.ADDR = 0.0.0.0` 的代理：数据报发到「连代理用的那个地址」。父类用例全部重跑一遍。"""
+
+    PROXY_KW = dict(udp=True, accept_many=True, bnd_zero=True)
+
+
+# ----------------------------------------------------------------------------
+# ★ 用户 2026-09-26 的第二条要求：bot 的位置发给走代理的真人时也要走 UDP
+# ----------------------------------------------------------------------------
+class ProxiedBotDownlinkTests(FakeProxyMixin, unittest.TestCase):
+    """服务端对 bot 和真人本来就一视同仁（`DeliverRoutingTests.test_a_bot_uses_the_very_same_route_rule_as_a_human`）；
+    以前经代理的玩家收不到 UDP，只因为**他那一头**的中继没开远程上游、服务端从没收到过他的
+    HELLO。这里把整条链真的跑一遍：假 bot -> `RelayServer.deliver` -> `UdpSyncServer`
+    -> 假 SOCKS5 代理 -> `UdpSyncRelay` -> 注入。"""
+
+    def setUp(self):
+        import relay                                            # noqa: PLC0415
+        import relayserver                                      # noqa: PLC0415
+        self.player = FakeGameConn("player")                    # 走代理的真人
+        self.bot = FakeGameConn("bot")
+        self.bot.is_bot_conn = lambda: True
+        self.udp = UdpSyncServer(
+            conn_for_ticket=lambda t: self.player if t == "good" else None)
+        self.udp.port = 0
+        ready = threading.Event()
+        threading.Thread(target=self.udp.serve, args=("127.0.0.1", ready),
+                         daemon=True).start()
+        self.addCleanup(self.udp.stop)
+        self.assertTrue(ready.wait(timeout=5))
+        server_port = self.udp.sock.getsockname()[1]
+
+        self.proxy, self.state, _ = self.start_socks5(udp=True, accept_many=True)
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind(("127.0.0.1", 0))
+        local_port = probe.getsockname()[1]
+        probe.close()
+        self.relay = relay.UdpSyncRelay("127.0.0.1", target_port=server_port,
+                                        local_port=local_port, redundancy=2,
+                                        proxy=self.proxy)
+        self.assertTrue(self.relay.start())
+        self.addCleanup(self.relay.close)
+        self.injected = []
+        self.relay._inject = self.injected.append
+        hook = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(hook.close)
+        hook.sendto(build_hello("good", udpsync.HELLO_FLAG_DOWNLINK),
+                    ("127.0.0.1", local_port))
+        self.assertTrue(wait_for(lambda: self.relay.acked))
+        self.assertTrue(self.udp.ready_for(self.player))
+
+        self.fallback = []
+        self.server = relayserver.RelayServer(
+            members_of=lambda conn: [self.player] if conn is self.bot else [self.bot],
+            fallback=lambda member, pkt: self.fallback.append((member, pkt)),
+            udp_sender=self.udp, logger=lambda _msg: None)
+        gen = relayserver.next_generation()
+        for conn in (self.player, self.bot):
+            relayserver.epoch_state(conn).assign(0, gen)
+
+    def test_bot_heartbeats_reach_the_proxied_player_over_udp(self):
+        self.server.deliver(self.bot, heartbeat(0))            # 本代第一发 = 种子 -> TCP
+        self.assertEqual([self.player], [m for m, _ in self.fallback])
+        self.assertEqual(0, self.server.delivered_udp)
+        self.server.deliver(self.bot, heartbeat(0))            # 之后整代走 UDP
+        self.assertEqual(1, self.server.delivered_udp)
+        self.assertTrue(wait_for(lambda: len(self.injected) == 1))
+        self.assertTrue(is_heartbeat(self.injected[0]))
+        self.assertEqual([self.player], [m for m, _ in self.fallback])   # 没有双发
+        self.assertNotIn("error", self.state)
 
 
 class LocalServerRouteUnitTests(unittest.TestCase):
