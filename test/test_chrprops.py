@@ -178,7 +178,15 @@ class MoveTests(unittest.TestCase):
         self.assertEqual(30.0, chrprops.Move(raw).radius)
 
     def test_only_the_damage_frames_count(self):
-        self.assertEqual([6, 7, 8, 9, 10, 11], list(self.move.frames()))
+        """`CastEndFrame` ≤ 帧 < `DamageEndFrame`：客户端 `0x481bba jge`，上界不含（X_Mod §111）。"""
+        self.assertEqual([6, 7, 8, 9, 10], list(self.move.frames()))
+
+    def test_the_last_damage_frame_completes_the_sweep(self):
+        """扫角的分母是 `DamageEndFrame − 1` ⇒ 最后一个伤害帧正好扫满 `MaxDegree`（`StartDegree + Max`）。"""
+        last = list(self.move.frames())[-1]
+        x, y = self.move.offset(last)        # 270 + 180 = 450° ⇒ cos=0、sin=1
+        self.assertAlmostEqual(20.0, x, places=3)
+        self.assertAlmostEqual(-40.0, y, places=3)
 
     def test_the_reach_is_a_melee_range(self):
         reach = self.move.reach()

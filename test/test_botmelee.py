@@ -191,6 +191,154 @@ class HitBreaksBotDashTests(MeleeRoom):
         self.assertIs(swing, self.bot_conn.dash_swing)
 
 
+class BotDashFrameWindowTests(MeleeRoom):
+    """bot 的冲刺只在 `CastEndFrame` ≤ 帧 < `DamageEndFrame` 判中（`0x481bba jge`，上界不含，X_Mod §111）。
+
+    以前含上界、多判一帧：11:29:59 和 21:40:16 都是第 11 帧（`Dash00` DamageEnd = 11）打中的。
+    """
+
+    def test_the_damage_end_frame_itself_is_never_checked(self):
+        move = chrprops.get(self.bot_conn.character_id).dash(bot.BOT_DASH_INDEX)
+        asked = []
+        original = bot._dash_hits
+
+        def spy(room, swing, x, y, frame, bodies):
+            asked.append(frame)
+            return None
+
+        bot._dash_hits = spy
+        self.addCleanup(setattr, bot, "_dash_hits", original)
+        self.bot_conn.battle_pos = (100.0, 100.0)
+        now = self.now()
+        # 早就冲完了：这一格一口气把整段伤害帧补判完（追赶那一路）。
+        self.bot_conn.dash_swing = bot.DashSwing(
+            botsync.projectile_handle(self.bot_seat, 0), now - 10.0, 1, move,
+            self.bot_conn.character_id)
+        bot._advance_dash(self.room, self.bot_conn, now)
+        self.assertEqual(list(range(move.cast_end, move.damage_end)), asked)
+        self.assertIsNone(self.bot_conn.dash_swing, "整套动作早过完了")
+
+
+class BotDashGapTests(MeleeRoom):
+    """上一下结束（打完或被打断）后隔 `BOT_DASH_GAP_S`（0.3 秒）才能出下一下 —— 用户 2026-09-26 定的，原版没有。"""
+
+    def ready_next_to_alice(self):
+        """冲过一下、人还贴着：把那一下收掉、体力补满，只剩「隔多久」这一道门。"""
+        self.walk_until_dash()
+        self.bot_conn.dash_swing = None
+        self.bot_conn.stamina = chrprops.game().sp_max
+        self.bot_conn.stamina_at = self.now()
+
+    def try_dash(self, at):
+        return bot._try_dash(self.room, self.bot_conn, self.bot_seat, at, True)
+
+    def test_it_waits_three_tenths_after_the_last_one_ended(self):
+        self.ready_next_to_alice()
+        ended = self.now()
+        self.bot_conn.dash_ended_at = ended
+        self.assertFalse(self.try_dash(ended + bot.BOT_DASH_GAP_S - 0.01),
+                         "上一下刚收 0.29 秒，不该再冲")
+        self.assertIsNone(self.bot_conn.dash_swing)
+        self.assertTrue(self.try_dash(ended + bot.BOT_DASH_GAP_S + 0.01),
+                        "隔够 0.3 秒、够得着、体力够，就该冲")
+
+    def test_the_first_dash_is_not_held_back(self):
+        self.ready_next_to_alice()
+        self.bot_conn.dash_ended_at = None
+        self.assertTrue(self.try_dash(self.now()))
+
+    def test_a_natural_end_is_stamped_at_its_total_frame(self):
+        move = chrprops.get(self.bot_conn.character_id).dash(bot.BOT_DASH_INDEX)
+        self.bot_conn.battle_pos = (100.0, 100.0)
+        born = self.now() - 10.0
+        self.bot_conn.dash_swing = bot.DashSwing(
+            botsync.projectile_handle(self.bot_seat, 0), born, 1, move,
+            self.bot_conn.character_id)
+        bot._advance_dash(self.room, self.bot_conn, self.now())
+        self.assertIsNone(self.bot_conn.dash_swing)
+        self.assertAlmostEqual(born + move.total_frame * bot.BOT_DASH_FRAME_MS / 1000.0,
+                               self.bot_conn.dash_ended_at, places=6)
+
+    def test_a_cut_dash_counts_from_the_cut(self):
+        swing = self.walk_until_dash()
+        cut = self.now()
+        bot._cancel_melee(self.room, self.bot_seat, cut, "test")
+        self.assertIsNone(self.bot_conn.dash_swing)
+        self.assertEqual(cut, self.bot_conn.dash_ended_at)
+        self.assertIsNot(swing, self.bot_conn.dash_swing)
+
+
+class BotStaminaTests(MeleeRoom):
+    """体力（`GameProps.ini`）：快跑每格 −1.5、平时每格 +0.25，**冲刺那一段不回也不扣**（X_Mod §112）。
+
+    用户 2026-09-26：「bot 有时甚至可以连续 3 发」「bot 加速跑时是否真的扣了体力」。
+    """
+
+    TICK = 1.0 / 31.25          # 一格 32 ms（`ballistics.TICKS_PER_SECOND`）
+
+    def setUp(self):
+        super().setUp()
+        self.props = chrprops.game()
+        self.move = chrprops.get(self.bot_conn.character_id).dash(bot.BOT_DASH_INDEX)
+        self.t = self.now()
+        self.bot_conn.dash_swing = None
+
+    def fill(self, value):
+        self.bot_conn.stamina = float(value)
+        self.bot_conn.stamina_at = self.t
+
+    def step(self, ticks=1, **keys):
+        for _ in range(ticks):
+            self.t += self.TICK
+            bot._regen_stamina(self.bot_conn, self.t, **keys)
+        return self.bot_conn.stamina
+
+    def test_fast_running_really_costs_stamina(self):
+        self.fill(80.0)
+        self.step(10, fast_run=True)
+        net = self.props.sp_charging - self.props.fast_run_sp_cost     # −1.25
+        self.assertAlmostEqual(80.0 + 10 * net, self.bot_conn.stamina, places=3)
+
+    def test_nothing_comes_back_during_a_dash(self):
+        """`ProcessMove` 在 `ProcessDash` 返回真时整段跳过（`0x507116`）：回复和快跑扣减都不走。"""
+        self.fill(70.0)
+        self.bot_conn.dash_swing = bot.DashSwing(
+            botsync.projectile_handle(self.bot_seat, 0), self.t, 1, self.move,
+            self.bot_conn.character_id)
+        self.step(self.move.total_frame)
+        self.assertAlmostEqual(70.0, self.bot_conn.stamina, places=3)
+        self.step(self.move.total_frame, fast_run=True)
+        self.assertAlmostEqual(70.0, self.bot_conn.stamina, places=3, msg="冲刺中快跑位也不扣")
+        self.bot_conn.dash_swing = None
+        self.step(8)
+        self.assertAlmostEqual(70.0 + 8 * self.props.sp_charging,
+                               self.bot_conn.stamina, places=3)
+
+    def test_back_to_back_dashes_from_full_stamina(self):
+        """满体力、一下接一下地冲：第 0 式（30）最多 3 下，第 4 下得等回够 —— 原版没装突击技的真人也一样。"""
+        self.fill(self.props.sp_max)
+        dashes = 0
+        waited = 0
+        while dashes < 4 and waited < 400:
+            if self.bot_conn.stamina >= self.move.sp_cost:
+                self.bot_conn.stamina -= self.move.sp_cost
+                dashes += 1
+                self.bot_conn.dash_swing = bot.DashSwing(
+                    botsync.projectile_handle(self.bot_seat, dashes), self.t, 1,
+                    self.move, self.bot_conn.character_id)
+                self.step(self.move.total_frame)          # 这一下打完之前不回
+                self.bot_conn.dash_swing = None
+                self.step(1)
+                if dashes == 3:
+                    third_done = waited
+            else:
+                self.step(1)
+                waited += 1
+        self.assertEqual(4, dashes, "前提：等够了第 4 下总能出来")
+        self.assertGreaterEqual((waited - third_done) * self.TICK, 2.0,
+                                "三下之后要等两秒多才够第 4 下（以前冲刺中白回 6.25，几格就够）")
+
+
 class BotDashPriorityTests(MeleeRoom):
     """bot 的伤害段碰到人：比优先级（`0x503fde`），打中了就把对方的招停掉（`0x481cc4`）。"""
 

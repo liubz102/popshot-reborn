@@ -671,6 +671,9 @@ class BotConn(gameserver.Conn):
         self.stamina_at = 0.0
         #: 正在进行的那一下近身攻击（`DashSwing`）；`None` = 没在冲。
         self.dash_swing = None
+        #: 上一下近身攻击**结束**的时刻（打完或被打断）；`None` = 这张图上还没冲过。
+        #: 下一下至少隔 `BOT_DASH_GAP_S` 才能出（用户 2026-09-26 定的，见那个常量）。
+        self.dash_ended_at = None
         #: 让这个 bot 用近身攻击吗（`/dash` 开关，默认开）。
         #: ★ 留这个开关是因为 `rpDash` 会**吃掉一个弹体句柄**（§64）——
         #:   万一某个角色不是吃 1 个，表现会是「子弹照飞、一滴血不掉」。
@@ -842,6 +845,7 @@ class BotConn(gameserver.Conn):
         self.stamina = None
         self.stamina_at = 0.0
         self.dash_swing = None
+        self.dash_ended_at = None
         # ★★ 封锁跟着清：新一局 / 换图之后客户端把角色重新放进图里，
         #   那一刻 `Character::Respawn` 又挂一次 2000 ms 的状态 0（§74）。
         #   清成 `None` = 「还没上过锁」，`_tick_bot` 的第一帧会补上。
@@ -2361,6 +2365,15 @@ KNOCKBACK_MIN_LIFT = -10.0
 #: 乙档在地上时横向滑多远的系数（`0x50f84f: fmul [0x6937c8]` = 3.0）。
 KNOCKBACK_SLIDE = 3.0
 
+#: ★★ 重击把击退的**竖直分量翻倍**（X_Mod §111）：`Character::OnHit` 在交给 `0x50f7ca` 之前，
+#: 类型 0（直接命中 / 溅射 / 近身 / 火墙都是）、`int(伤害) ≥ 10`、没走格挡那一支时
+#: `push.y += push.y`（`0x4ff680` `fld [eax+4]` / `0x4ff683 fadd st0,st0` / `0x4ff685 fstp`）。
+#: 实测：真人被 bot 冲刺（push −10）打中后自己心跳报的 v.y 从 −20 起跳（16:50:12 / 21:39:16 静止挨打第一发就是
+#: (15, −20)，8 例全是 ×2）；bot 身上挂着约束、心跳被忽略的那一次（16:53:48）客户端逐帧也是 (15, −20)。
+#: 服务端以前没乘 ⇒ bot 被顶得只有原版一半高，锚点心跳再把每台上的它拽低（逐帧里挨打后那一格
+#: 常见 (15, −8) = 服务端的 −10 走一格重力后截断，就是心跳盖掉的）。
+HEAVY_HIT_LIFT_SCALE = 2.0
+
 
 def knockback_strength(damage):
     """这么多伤害该把人推多快（`0x481003` 那五发 `fcom`）。"""
@@ -3036,6 +3049,7 @@ def _cancel_melee(room, seat_index, now, source):
         swing = conn.dash_swing
         if swing is not None:
             conn.dash_swing = None
+            conn.dash_ended_at = now          # 下一下从这一刻起隔 `BOT_DASH_GAP_S`
             conn.log(f"   近身: 这一下被打断了（{source}）—— 句柄 {swing.handle} "
                      f"第{swing.frame_at(now)}帧起不再判中（X_Mod §111）")
         return
@@ -3463,7 +3477,8 @@ def _knock_back_seat(room, seat_index, damage, push, source="?"):
 
     甲档（`0x50f864`）：
 
-        伤害 **> 10** -> `[char+0x120] += push`
+        伤害 **> 10** -> `[char+0x120] += push`，★ 其中 push.y 已经被 `OnHit` ×2
+                         （`0x4ff683`，`HEAVY_HIT_LIFT_SCALE`，X_Mod §111；bot 从不格挡）
         伤害 <= 10    -> ★ 只有「在地上 **且** v.x == 0」才把 v.y 夹到 −10
                          （`0x50f884` 那两道门）—— 腾空那一批就此**什么都不做**
         ★ 出口无论如何都落到 `0x50f947`，把「我踩在地上」那一位清掉
@@ -3483,8 +3498,9 @@ def _knock_back_seat(room, seat_index, damage, push, source="?"):
     if damage >= KNOCKBACK_MIN_DAMAGE or not body.on_ground:
         vx, vy = body.vx, body.vy
         if damage > KNOCKBACK_MIN_DAMAGE:
+            # ★ 伤害 > 10 必然 ≥ 10 ⇒ `OnHit` 那一步 push.y ×2 一定发生过（`0x4ff683`，X_Mod §111）。
             vx += push[0]
-            vy += push[1]
+            vy += push[1] * HEAVY_HIT_LIFT_SCALE
         elif body.on_ground and body.vx == 0.0:
             # 正好 10 点：不给速度，只把 v.y 夹到 −10（`0x50f8a2`）。
             vy = min(vy, KNOCKBACK_MIN_LIFT)
@@ -11214,6 +11230,16 @@ BOT_DASH_FRAME_MS = ballistics.TICK_MS
 #: 出拳计时器 `[+0x5ac]` 的长度 = ⌊Jab TotalFrame × 0.625⌋ 帧（`[0x693b08]`，X_Mod §101）。
 JAB_FRAME_RATIO = 0.625
 
+#: ★★ 上一下近身攻击**结束**（打完或被打断）之后，至少隔多久才能出下一下（秒）。
+#:
+#: ⚠ **这不是原版规则，是用户 2026-09-26 定的**：「真人是需要双击键盘的方向键才行，不可能像 bot
+#:   一样那么快。给 bot 加个限制，两次近身攻击之间必须隔开 0.3 秒以上。」原版本机只有两道：冲刺 /
+#:   出拳计时器在跑时不读键（`0x515090`），距上次双击 > 600 ms（`0x515abc`，冲刺本身 800 ms，恒满足）；
+#:   bot 没有键盘，招一收它下一格就能再冲，于是连着三下贴在一起（21:39:24.792 / 25.624 / 26.520）。
+#: ⚠ 它是**玩法限制**（和体力一样是给 bot 自己上的），不是拿来掩盖时序竞态的阈值 —— 铁律 10 管的是后者，别当成违规删掉。
+#: 按「结束 → 下一下开始」算：按开始算的话冲刺本身就 0.8 秒，等于没加。
+BOT_DASH_GAP_S = 0.3
+
 
 class DashSwing(object):
     """一次**正在进行**的近身攻击。
@@ -11259,6 +11285,13 @@ def _regen_stamina(machine, now, crouched=False, fast_run=False):
     ★ 三个数全是原版的：每 tick 回 `SpCharging`（0.25），蹲下 **×2**
     （`0x507250`，§41），冲刺跑每 tick 花 `FastRunSpCost`（1.5）。
     没有一个是我拍脑袋的常量（铁律 10）。
+
+    ★★ **近身冲刺那一段一点都不回**（X_Mod §112）：`ProcessMove` 先调 `ProcessDash`（`0x50710f`），
+      冲刺计时器 `[+0x5c0]` 还在跑它就返回真、整段跳过（`0x507116 jne 0x50767e`）—— 回复（`0x50725d`）
+      和冲刺跑的扣减都在后面，一格都不走。以前这里照着挂钟一直回，每冲一下白得 `TotalFrame × 0.25`
+      （第 0 式 6.25 点）：21:40:23 那串 100 → 70 → 46 → 24 → 6 连冲了 4 下，按原版第 4 下时只剩约 17.5，冲不出来。
+      其余几条停回复的门（格挡、格斗招式、`[+0x504]` / `[+0x664]` 两个计时器）bot 碰不到，死了本来就不走这里；
+      冲刺这一条靠 `dash_swing`（一格一调，状态就是这一格的）。
     """
     props = _stamina_props()
     if machine.stamina is None:
@@ -11267,6 +11300,8 @@ def _regen_stamina(machine, now, crouched=False, fast_run=False):
         return machine.stamina
     ticks = max(0.0, (now - machine.stamina_at) * ballistics.TICKS_PER_SECOND)
     machine.stamina_at = now
+    if machine.dash_swing is not None:
+        return machine.stamina
     gain = props.sp_charging * (2.0 if crouched else 1.0)
     if fast_run:
         gain -= props.fast_run_sp_cost
@@ -11328,6 +11363,7 @@ def _advance_dash(room, machine, now):
         return
     if machine.battle_pos is None:
         machine.dash_swing = None
+        machine.dash_ended_at = now
         return
     frame = swing.frame_at(now)
     if not swing.hit:
@@ -11335,7 +11371,9 @@ def _advance_dash(room, machine, now):
         bodies = _melee_bodies(room, machine, machine.my_seat)
         x, y = machine.battle_pos
         first = max(swing.frames_done + 1, swing.move.cast_end)
-        for step in range(first, min(frame, swing.move.damage_end) + 1):
+        # ★ 伤害段 `CastEndFrame` ≤ 帧 < `DamageEndFrame`（`0x481bba jge`，上界不含，X_Mod §111）——
+        #   和 `Move.frames()` 同一个口径。以前含上界，比原版多判一帧。
+        for step in range(first, min(frame + 1, swing.move.damage_end)):
             swing.frames_done = step
             # ★★ 伤害段碰到人先比**招式优先级**（`0x481cb8`，X_Mod §111）：对方正在出拳的
             #   伤害段（2）比冲刺（1）高 ⇒ 这一帧碰到他也不算，下一帧再看。
@@ -11395,6 +11433,9 @@ def _advance_dash(room, machine, now):
             break
     if frame >= swing.move.total_frame:
         machine.dash_swing = None
+        # 招收完的那一刻（`TotalFrame` 帧整），不是发现它收完的这一格。
+        machine.dash_ended_at = (swing.born + swing.move.total_frame
+                                 * BOT_DASH_FRAME_MS / 1000.0)
 
 
 def _melee_bodies(room, machine, seat_index, targeting=False):
@@ -11463,7 +11504,8 @@ def _try_dash(room, machine, seat_index, now, on_ground):
     1. **踩在地上** —— 原版那一下是地面动作（`0x515b03` 那两段双击判定
        都在地面输入处理里）；
     2. **体力够** —— 花 `DashNN-SpCost`（角色 0 是 30，满体力 100）；
-    3. **上一下打完了** —— 一次只能有一个 `DashSwing`。
+    3. **上一下打完了** —— 一次只能有一个 `DashSwing`；
+    4. **而且打完（或被打断）已经过了 `BOT_DASH_GAP_S`** —— 用户 2026-09-26 定的，原版没有这条（见那个常量）。
 
     （另有一条在调用方 `_tick_bot`：被别人的近身招式推着时不出手，`_held_by_push`，X_Mod §111。）
 
@@ -11474,6 +11516,9 @@ def _try_dash(room, machine, seat_index, now, on_ground):
         return False
     if machine.holding:
         return False                       # `/hold` 是「站住别动」，那就别冲
+    if (machine.dash_ended_at is not None
+            and now - machine.dash_ended_at < BOT_DASH_GAP_S):
+        return False                       # 上一下刚收，真人还在双击（用户规则）
     move = chrprops.get(machine.character_id).dash(BOT_DASH_INDEX)
     if move is None or move.damage <= 0 or move.radius <= 0:
         return False

@@ -6522,12 +6522,24 @@ class BotTakesKnockbackTests(HumanShotRoom):
     """
 
     def test_a_human_splash_pushes_the_bot_off_the_ground(self):
+        """★ 伤害 ≥ 10 的一发，`OnHit` 先把 push.y ×2 再交给 `0x50f7ca`（`0x4ff683`，X_Mod §111）。"""
         self.assertTrue(self.bot_conn.body.on_ground)
         self.splash(20, (12.0, -9.0))
         body = self.bot_conn.body
         self.assertFalse(body.on_ground, "甲档一定离地（0x50f947）")
         self.assertAlmostEqual(12.0, body.vx, places=4)
-        self.assertAlmostEqual(-9.0, body.vy, places=4)
+        self.assertAlmostEqual(-18.0, body.vy, places=4)
+
+    def test_a_dash_hit_lifts_the_bot_twice_as_high_as_its_push(self):
+        """真人冲刺的 push 是常量 (±15, −10)（`0x481d6e`）；打中之后原版是 (15, −20)。
+
+        实测：16:53:48 bot 站在地上挨 36、身上挂着约束（心跳不写速度），客户端逐帧那一格 (15.000, −20.000)；
+        真人被 bot 冲刺打中后自己报的心跳，8 例全是从 −20 起。
+        """
+        self.splash(36, (15.0, -10.0))
+        body = self.bot_conn.body
+        self.assertAlmostEqual(15.0, body.vx, places=4)
+        self.assertAlmostEqual(-20.0, body.vy, places=4)
 
     def test_exactly_ten_damage_only_clamps_the_upward_speed(self):
         """★ `伤害 > 10` 才真给速度；正好 10 只把 `v.y` 夹到 −10（`0x50f8a2`）。"""
@@ -6569,10 +6581,11 @@ class BotTakesKnockbackTests(HumanShotRoom):
             hit_kind=botsync.HIT_CHARACTER, damage=20.0))
         body = self.bot_conn.body
         self.assertFalse(body.on_ground)
-        # 正右方直飞过来 -> 击退是「右上」，长度按伤害 20 那一档 = 15。
+        # 正右方直飞过来 -> 击退是「右上」，长度按伤害 20 那一档 = 15；
+        # 收方 `OnHit` 再把竖直那一半 ×2（`0x4ff683`，X_Mod §111）。
         self.assertGreater(body.vx, 0.0)
         self.assertLess(body.vy, 0.0)
-        self.assertAlmostEqual(15.0, math.hypot(body.vx, body.vy), places=3)
+        self.assertAlmostEqual(15.0, math.hypot(body.vx, body.vy / 2.0), places=3)
 
     def test_an_unmatched_explode_leaves_the_bot_alone(self):
         """★ 配不上开火记录就**不给击退** —— 宁可少顶一下，也不要乱甩。"""
@@ -6588,7 +6601,13 @@ class BotTakesKnockbackTests(HumanShotRoom):
         推出去。以前 `botmove._air_tick()` 会拿「朝着真人的方向键」把腾空
         的水平速度覆写成 `走速 × 1.5`（§93 证明那条是错的），于是 bot
         **朝开枪的人飘过去**，看着就是「原地跳一下」。
+
+        ★ 换一张够高的平地（X_Mod §111）：伤害 ≥ 10 的一发 push.y ×2，(12, −9) 实际给 (12, −18)，
+          顶点约 135 px —— 缺省那张合成平地总高 180、地面在 150，头会先撞上图顶
+          （图顶对角色是实心，X_Mod §105），验的就不再是「往哪边飞」了。
         """
+        self.install_terrain(synth_terrain("flat_tall", floor=400, height=440))
+        self.place_bot(600.0, 399.0)
         # ★ 挑不到目标 ⇒ `_move_intent()` 会一路朝真人按方向键 —— 这正是
         #   出问题的那一种（挑得到目标时它返回「站住」，键是 0，撞不上）。
         original = bot._fire_target
@@ -6596,7 +6615,7 @@ class BotTakesKnockbackTests(HumanShotRoom):
         self.addCleanup(setattr, bot, "_fire_target", original)
         before = self.bot_conn.body.x
         self.splash(30, (12.0, -9.0))    # 真人在左边，击退朝右
-        self.beats(4, 100.0)             # 真人站在 x=100，bot 走 4 帧
+        self.beats(4, 100.0, 399.0)      # 真人站在 x=100，bot 走 4 帧
         self.assertGreater(self.bot_conn.battle_pos[0], before + 100.0,
                            "击退该把 bot 往**远离**真人的方向甩出去")
 

@@ -168,7 +168,7 @@ class Move(object):
         posDelta.y += sin(degree) * MultiForY
 
     `posDelta` 是**相对角色中心**的偏移，`currTick` 是第几帧动画。
-    伤害只在 `CastEndFrame` ~ `DamageEndFrame` 之间生效。
+    伤害只在 `CastEndFrame` ≤ 帧 < `DamageEndFrame` 之间生效（上界不含，`frames()`）。
 
     ⚠ **半径是本工程的近似**：带 `DamagingObjBone` 的招式（角色 0 的
     `Dash00` 就是）伤害圈跟着**骨骼**走、半径写在 `DamagingObjSize`，
@@ -207,7 +207,7 @@ class Move(object):
 
     @property
     def damage_end(self):
-        """第几帧伤害结束。"""
+        """伤害段在第几帧**结束** —— 这一帧起就没有伤害了（上界不含，见 `frames()`）。"""
         return int(self._num("damage_end"))
 
     @property
@@ -224,8 +224,13 @@ class Move(object):
                 self._num("delta_y") + math.sin(radians) * self._num("multi_y"))
 
     def frames(self):
-        """有伤害的那几帧。"""
-        return range(self.cast_end, self.damage_end + 1)
+        """有伤害的那几帧：`CastEndFrame` ≤ 帧 < `DamageEndFrame`。
+
+        ★ 客户端的阶段函数 `0x481a67` 判伤害段用的是 `0x481bba jge`，上界**不含**（X_Mod §111）；
+          以前这里含上界，bot 的冲刺比原版多判一帧（11:29:59、21:40:16 都是第 11 帧打中的）。
+          伤害圈扫角的分母 `DamageEndFrame − 1`（`offset()`）也说明最后一帧伤害帧就是它。
+        """
+        return range(self.cast_end, self.damage_end)
 
     def reach(self):
         """这一招最远够得着多少（水平方向，含伤害圈半径）。"""
@@ -233,9 +238,10 @@ class Move(object):
             + self.radius
 
     def __repr__(self):
-        return ("<Move 伤害%d 体力%.0f 半径%.0f 够到%.0f 帧%d-%d/%d>"
+        # 「伤害帧」两头都含（= `frames()`），斜杠后面是整套动作的帧数。
+        return ("<Move 伤害%d 体力%.0f 半径%.0f 够到%.0f 伤害帧%d-%d/%d>"
                 % (self.damage, self.sp_cost, self.radius, self.reach(),
-                   self.cast_end, self.damage_end, self.total_frame))
+                   self.cast_end, self.damage_end - 1, self.total_frame))
 
 
 class Character(object):
