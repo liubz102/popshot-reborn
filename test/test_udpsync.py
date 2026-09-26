@@ -1079,12 +1079,15 @@ class RelayNoticeTests(unittest.TestCase):
 
     def test_a_channel_that_goes_bad_again_says_so_again(self):
         """★ 通了之后**又**被拒 = 真正的状态翻转（服务端重启、票据没了），
-        该再说一次。和「下行 已就绪 / 未就绪」是同一个套路：只在状态变了时说话。"""
+        该再说一次。和「下行 已就绪 / 未就绪」是同一个套路：只在状态变了时说话。
+        ★ X_Mod D74 起这一次说的是「这一轮登录结束了」—— 认出过的票据被拒 = 游戏连接没了，
+          通道整条收掉，之后迟到的回答一概不理（不再有「没接受」那一行）。"""
         self.hook_hello()
         self.server_says(ACK_OK)
         for _ in range(10):
             self.server_says(ACK_BAD_TICKET, "认不出票据")
-        self.assertEqual(1, len(self.refusals()))
+        self.assertEqual(1, len([x for x in self.lines if "这一轮登录结束了" in x]))
+        self.assertEqual(0, len(self.refusals()))
 
     def test_the_disabled_answer_is_reported_too(self):
         """服务端把 UDP 同步整个关了（`--no-udp-sync`）也是一次真正的拒绝。"""
@@ -1201,6 +1204,14 @@ class _TwoServers:
         flags = ((udpsync.HELLO_FLAG_LOCAL_SERVER if local else 0)
                  | (udpsync.HELLO_FLAG_DOWNLINK if downlink else 0))
         self.hook.sendto(build_hello(ticket, flags), self.relay_addr)
+
+    @staticmethod
+    def recv_hello(server):
+        """收下一发 HELLO。确认之后下行静默 1 秒中继就补一发 PING（X_Mod D73），夹在中间的跳过。"""
+        while True:
+            data, addr = server.recvfrom(65536)
+            if parse_header(data)[0] == MSG_HELLO:
+                return data, addr
 
     @staticmethod
     def nothing_arrives(server, wait=0.3):
@@ -1704,9 +1715,106 @@ class RelaySourceChangeTests(unittest.TestCase):
         self.assertEqual(3, len(injected))
 
 
+class KeepaliveTests(unittest.TestCase):
+    """保活按「**下行**静默」补（X_Mod D73 / §110）。
+
+    ★ 以前是「确认之后每 10 秒一发」—— 撑得住家用路由器（30~60 秒），撑不住 v2ray-core 4.x：
+      它的 SOCKS UDP 会话只认回包续命、4 秒查一格，房间里我们 9 Hz 只发不收，会话 8 秒一撤；
+      撤了之后还会连锁误杀后面新建的会话（`bug调查/代理验证`：每秒几条新连接、十几秒真断流）。
+    """
+
+    #: v2ray-core 4.x 的检查粒度（`transport/internet/udp/dispatcher.go`）。
+    V2RAY4_WINDOW_S = 4.0
+    #: `_pump_timer` 多久醒一次（`self._stop.wait(0.5)`）。
+    TIMER_TICK_S = 0.5
+
+    def setUp(self):
+        import relay                                            # noqa: PLC0415
+        self.relay = relay.UdpSyncRelay("127.0.0.1", target_port=1, local_port=1)
+        self.relay.acked = True
+        self.relay.last_heard_at = 100.0
+        self.relay.last_keepalive_at = 0.0
+        self.k = relay.KEEPALIVE_S
+
+    def test_nothing_is_due_before_the_channel_is_acked(self):
+        """没确认时 HELLO 每 2 秒重发、服务端每发都回 —— 不缺回包，也用不着 PING。"""
+        self.relay.acked = False
+        self.assertFalse(self.relay._keepalive_due(now=100.0 + 60.0))
+
+    def test_a_quiet_downlink_gets_a_keepalive(self):
+        self.assertFalse(self.relay._keepalive_due(now=100.0 + self.k - 0.01))
+        self.assertTrue(self.relay._keepalive_due(now=100.0 + self.k))
+
+    def test_a_flowing_downlink_needs_no_keepalive_at_all(self):
+        """战斗里别人的位置数据一直在回（8 Hz）：一发都不补。"""
+        for step in range(80):
+            now = 100.0 + step * 0.125
+            self.relay.last_heard_at = now
+            self.assertFalse(self.relay._keepalive_due(now + 0.1))
+
+    def test_uplink_alone_does_not_keep_the_proxy_session(self):
+        """★ 中间盒只看回包：我们发得再密（房间里 9 Hz 的位置心跳）也替不了保活。"""
+        sent = []
+        self.relay._to_remote = sent.append
+        for index in range(30):
+            self.relay._on_hook_datagram(build_data([(index, heartbeat())]))
+        self.assertEqual(30, len(sent))
+        self.assertEqual(100.0, self.relay.last_heard_at)
+        self.assertTrue(self.relay._keepalive_due(now=100.0 + self.k))
+
+    def test_a_lost_pong_is_not_chased_every_tick(self):
+        """PONG 丢了：下一发等满一个 `KEEPALIVE_S`，不是每半秒追一发。"""
+        self.relay.last_keepalive_at = 100.0 + self.k           # 刚补过一发，还没回
+        self.assertFalse(self.relay._keepalive_due(
+            now=100.0 + self.k + self.TIMER_TICK_S))
+        self.assertTrue(self.relay._keepalive_due(now=100.0 + 2 * self.k))
+
+    def test_one_lost_pong_still_fits_the_strictest_proxy_window(self):
+        """★ 钉住常量别往大里调：丢一发 PONG 时两发回包之间最长是「两个保活间隔 + 两次
+        定时器粒度」，再留 0.5 秒给 RTT，也得落在 v2ray 4 秒一格之内。"""
+        worst_gap = 2 * (self.k + self.TIMER_TICK_S)
+        self.assertLessEqual(worst_gap + 0.5, self.V2RAY4_WINDOW_S)
+
+
+class HeardFromTheCurrentUpstreamTests(_TwoServers, unittest.TestCase):
+    """`last_heard_at` 只算**这一轮上游**的回包 —— 上一台服务器迟到的回包不能替这一轮续命。"""
+
+    def test_a_late_reply_from_the_previous_route_does_not_count(self):
+        self.hello("tkt-local", local=True)
+        _, local_side = self.local_srv.recvfrom(65536)
+        self.hello("tkt-remote", local=False)
+        _, remote_side = self.remote_srv.recvfrom(65536)
+        self.local_srv.sendto(build_hello_ack(ACK_OK), local_side)
+        time.sleep(0.2)                     # 「不该算」没有事件可等（测试专用）
+        self.assertEqual(0.0, self.relay.last_heard_at)
+        before = time.monotonic()
+        self.remote_srv.sendto(build_hello_ack(ACK_OK), remote_side)
+        self.assertTrue(self.wait_for(lambda: self.relay.last_heard_at >= before))
+
+
+class DirectSourceChangeTests(_TwoServers, unittest.TestCase):
+    """直连（没配代理）时 NAT 换口：没有「关联」可换，照旧同一个 socket 重发 HELLO（D72）。"""
+
+    def test_a_direct_upstream_keeps_its_socket(self):
+        self.hello("tkt", local=False)
+        _, relay_side = self.remote_srv.recvfrom(65536)
+        self.remote_srv.sendto(build_hello_ack(ACK_OK), relay_side)
+        self.assertTrue(self.wait_for(lambda: self.relay.acked))
+        sock = self.relay.remote
+        self.remote_srv.sendto(build_hello_ack(udpsync.ACK_UNKNOWN_SOURCE, ""), relay_side)
+        data, relay_side2 = self.recv_hello(self.remote_srv)
+        self.assertEqual("tkt", parse_hello(data))
+        self.assertEqual(relay_side, relay_side2)
+        self.assertIs(sock, self.relay.remote)
+        said = [x for x in self.lines if "不认识这条通道现在的来源" in x]
+        self.assertEqual(1, len(said))
+        self.assertIn("已重发 HELLO", said[0])
+        self.assertNotIn("新的代理 UDP 关联", said[0])
+
+
 class ProxyExitRotationTests(FakeProxyMixin, unittest.TestCase):
-    """★ 整条链：代理面向服务端那一侧换了 UDP 源口 → 服务端回「不认识」→ 中继重发 HELLO →
-    服务端把同一条流换到新来源、下行索引接着数 → 中继的闸门照收（D72）。"""
+    """★ 整条链：代理面向服务端那一侧换了 UDP 源口 → 服务端回「不认识」→ 中继换一条新关联、
+    重发 HELLO（D73）→ 服务端把同一条流换到新来源、下行索引接着数 → 中继的闸门照收（D72）。"""
 
     def setUp(self):
         import relay                                            # noqa: PLC0415
@@ -1746,21 +1854,33 @@ class ProxyExitRotationTests(FakeProxyMixin, unittest.TestCase):
         self.assertTrue(wait_for(lambda: self.relay.acked))
         self.assertTrue(self.udp.ready_for(self.player))
 
-    def test_the_stream_survives_the_proxy_changing_its_exit_port(self):
+    def rotate_and_poke(self):
+        """代理换出口，再从游戏那头发一发上行让服务端看见新来源；等中继把那发「不认识」处理完。
+
+        ★ 等的是翻转那一行日志（换关联之后、重发 HELLO 之前打）—— 不能等 `acked`：
+          换出口那一刻中继**还是** acked，`wait_for(acked)` 当场就成立。
+        """
         first_exit = self.udp.endpoint_for(self.player).addr
         self.assertEqual(self.state["exit_addr"], first_exit)
+        self.state["rotate_exit"]()                        # 代理换了出口
+        self.assertNotEqual(first_exit, self.state["exit_addr"])
+        self.hook.sendto(build_data([(0, heartbeat())]), self.local_addr)
+        self.assertTrue(wait_for(
+            lambda: [x for x in self.lines if "不认识这条通道现在的来源" in x]))
+
+    def test_the_stream_survives_the_proxy_changing_its_exit_port(self):
         self.assertTrue(self.udp.send_to(self.player, heartbeat(1)))
         self.assertTrue(wait_for(lambda: len(self.injected) == 1))
 
-        self.state["rotate_exit"]()                        # 代理换了出口
-        self.assertNotEqual(first_exit, self.state["exit_addr"])
-        # 下一发上行从新口到服务端 → 「不认识」→ 中继重发 HELLO → 服务端把流换到新口
-        self.hook.sendto(build_data([(0, heartbeat())]), self.local_addr)
+        # 下一发上行从新口到服务端 → 「不认识」→ 中继换关联、重发 HELLO → 服务端把流换到新口
+        self.rotate_and_poke()
+        self.assertTrue(wait_for(lambda: self.relay.acked))
         self.assertTrue(wait_for(
             lambda: self.udp.endpoint_for(self.player).addr == self.state["exit_addr"]))
-        self.assertTrue(wait_for(lambda: self.relay.acked))
         self.assertGreaterEqual(self.udp.unknown_in, 1)
-        self.assertEqual(1, len([x for x in self.lines if "不认识这条通道现在的来源" in x]))
+        said = [x for x in self.lines if "不认识这条通道现在的来源" in x]
+        self.assertEqual(1, len(said))
+        self.assertIn("已换一条新的代理 UDP 关联并重发 HELLO", said[0])
         self.assertEqual(1, len([x for x in self.server_logs if "来源从" in x]))
         # 下行接着发：索引 1 从新口回来，闸门（水位 0）照收
         self.assertTrue(self.udp.ready_for(self.player))
@@ -1768,6 +1888,335 @@ class ProxyExitRotationTests(FakeProxyMixin, unittest.TestCase):
         self.assertTrue(wait_for(lambda: len(self.injected) == 2))
         self.assertEqual(2, heartbeat_next_event_seq(self.injected[1]))
         self.assertNotIn("error", self.state)
+
+    def test_the_exit_change_moves_us_to_a_fresh_association(self):
+        """★ v2ray-core 4.x 撤会话按目标地址删「表里现在那条」、不核对是不是自己那条，旧会话的
+        尾巴会连锁误杀新会话（§110）；那张表按关联各一份 —— 换一条关联就甩掉了（D73）。"""
+        old = self.relay.remote
+        old_relay_addr = self.state["relay_addr"]
+        self.rotate_and_poke()
+        self.assertTrue(wait_for(lambda: self.relay.acked))
+        self.assertEqual(2, self.state["associations"])
+        self.assertIsNot(old, self.relay.remote)
+        self.assertNotEqual(old_relay_addr, self.relay.remote_addr)
+        self.assertEqual(self.state["relay_addr"], self.relay.remote_addr)
+        self.assertIs(self.relay.remote, self.relay._upstreams[False][0])
+        self.assertEqual(-1, old.sock.fileno())              # 旧关联两个口都关了
+        self.assertEqual(-1, old.control.fileno())
+        # 换关联不是「换上游」：同一条路由、同一个代理，下一发 HELLO 不再说一遍
+        self.hook.sendto(build_hello("good", udpsync.HELLO_FLAG_DOWNLINK), self.local_addr)
+        self.assertTrue(wait_for(lambda: self.udp.ready_for(self.player)))
+        self.assertEqual([], [x for x in self.lines if "这一轮登录选的是" in x])
+        # 之后的上行都从新关联走，服务端认得出
+        unknown = self.udp.unknown_in
+        for index in range(1, 4):
+            self.hook.sendto(build_data([(index, heartbeat())]), self.local_addr)
+        self.assertTrue(wait_for(lambda: len(self.player.fed) >= 3))
+        self.assertEqual(unknown, self.udp.unknown_in)
+        self.assertNotIn("error", self.state)
+
+    def test_a_closed_relay_builds_no_new_association(self):
+        """中继已经 `close()` 了（游戏退了 / 单测收尾），迟到的「不认识」不许再去连代理、漏一条关联。"""
+        self.relay.close()
+        self.assertFalse(self.relay._renew_association())
+        self.assertEqual(1, self.state["associations"])
+
+    def test_if_no_fresh_association_can_be_built_the_old_one_carries_the_hello(self):
+        """代理这会儿建不了新关联：不丢现成的那条，HELLO 照旧经它重发（= D72 的行为），原因只说一次。"""
+        import relay                                            # noqa: PLC0415
+        # 接了就挂断的「代理」：握手读到 EOF 立刻失败（连一个没人听的口，Windows 要磨两秒才拒）
+        hangup = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(hangup.close)
+
+        def refuse():
+            try:
+                while True:
+                    conn, _ = hangup.accept()
+                    conn.close()
+            except OSError:
+                return
+
+        threading.Thread(target=refuse, daemon=True).start()
+        old = self.relay.remote
+        self.relay.proxy = relay.ProxySettings("socks5", "127.0.0.1", hangup.getsockname()[1])
+        self.rotate_and_poke()
+        self.assertTrue(wait_for(lambda: self.relay.acked))
+        self.assertTrue(wait_for(
+            lambda: self.udp.endpoint_for(self.player).addr == self.state["exit_addr"]))
+        self.assertIs(old, self.relay.remote)
+        self.assertEqual(1, self.state["associations"])
+        said = [x for x in self.lines if "不认识这条通道现在的来源" in x]
+        self.assertEqual(1, len(said))
+        self.assertIn("已重发 HELLO", said[0])
+        self.assertNotIn("新的代理 UDP 关联", said[0])
+        self.assertEqual(1, len([x for x in self.lines if "建不了 UDP 通道" in x]))
+
+
+# ----------------------------------------------------------------------------
+# ★ 通道跟着一轮登录走（X_Mod D74，用户 2026-09-26「退出游戏后，连接也应该断掉才对」）
+# ----------------------------------------------------------------------------
+class SessionEndTests(unittest.TestCase):
+    """这一轮登录结束 → 整条 UDP 通道收掉。两个入口：远程那一轮经本中继的游戏服连接一条都不剩；
+    认出过之后服务器说这张票据没有游戏连接了 / 不认了。不开 socket，直接喂报文。"""
+
+    def setUp(self):
+        import relay                                            # noqa: PLC0415
+        self.lines = []
+        real_log = relay.log
+        relay.log = self.lines.append
+        self.addCleanup(setattr, relay, "log", real_log)
+        self.relay = relay.UdpSyncRelay("127.0.0.1", target_port=1, local_port=1)
+        self.sent = []
+        self.relay._to_remote = self.sent.append
+
+    def hook_hello(self, ticket="tkt", downlink=False, local=False):
+        flags = ((udpsync.HELLO_FLAG_DOWNLINK if downlink else 0)
+                 | (udpsync.HELLO_FLAG_LOCAL_SERVER if local else 0))
+        self.relay._on_hook_datagram(build_hello(ticket, flags))
+
+    def server_says(self, result, note=""):
+        self.relay._on_remote_datagram(build_hello_ack(result, note))
+
+    def ended(self):
+        return [x for x in self.lines if "这一轮登录结束了" in x]
+
+    def assert_quiet(self):
+        """收掉之后：不保活、不重发 HELLO（`_pump_timer` 的两个判据都不成立）、不提示「没回应」。"""
+        self.assertEqual("", self.relay.ticket)
+        self.assertFalse(self.relay.acked)
+        self.assertFalse(self.relay._keepalive_due(now=time.monotonic() + 3600))
+        self.assertFalse(self.relay.ticket and not self.relay.acked)
+        self.assertFalse(self.relay._quiet_warning_due(now=time.monotonic() + 3600))
+
+    # -- 服务器的回答（本机那一轮只有这个入口）---------------------------------
+    def test_the_login_race_is_not_the_end(self):
+        """登录那一下必然先收到「还没登进来」—— 那时还没认出过，不是结束。"""
+        self.hook_hello()
+        self.server_says(ACK_NOT_LOGGED_IN, "票据还没登进游戏服")
+        self.assertEqual("tkt", self.relay.ticket)
+        self.assertEqual([], self.ended())
+
+    def test_not_logged_in_after_an_ack_ends_the_session(self):
+        self.hook_hello(downlink=True)
+        self.server_says(ACK_OK)
+        self.server_says(udpsync.ACK_UNKNOWN_SOURCE)           # 服务端把这条流忘了
+        flip = [x for x in self.lines if "不认识这条通道现在的来源" in x]
+        self.assertEqual(1, len(flip))
+        self.assertIn("或者游戏连接已经断了", flip[0])        # 这一行不再断定是换口
+        self.assertNotIn("让它认回去", flip[0])
+        self.server_says(ACK_NOT_LOGGED_IN, "票据还没登进游戏服")
+        self.assertEqual(1, len(self.ended()))
+        self.assertIn("服务器说这张票据已经没有游戏连接了", self.ended()[0])
+        self.assert_quiet()
+        self.assertFalse(self.relay.downlink)
+        self.server_says(ACK_NOT_LOGGED_IN, "票据还没登进游戏服")   # 迟到的重复回答：不再说
+        self.assertEqual(1, len(self.ended()))
+
+    def test_bad_ticket_after_an_ack_ends_the_session_too(self):
+        """被顶号 / 服务端重启：票据不认了，同样是游戏连接没了。"""
+        self.hook_hello()
+        self.server_says(ACK_OK)
+        self.server_says(ACK_BAD_TICKET, "认不出票据")
+        self.assertIn("服务器不认这张票据了", self.ended()[0])
+        self.assert_quiet()
+        self.assertEqual([], [x for x in self.lines if "没接受这条通道" in x])
+
+    def test_a_stale_ticket_that_was_never_acked_keeps_the_old_behaviour(self):
+        """从没认出过（停在登录界面的旧票据）：照旧说一次「没接受」、接着重试，不算一轮结束。"""
+        self.hook_hello()
+        self.server_says(ACK_BAD_TICKET, "认不出票据")
+        self.assertEqual("tkt", self.relay.ticket)
+        self.assertEqual([], self.ended())
+        self.assertEqual(1, len([x for x in self.lines if "没接受这条通道" in x]))
+
+    def test_a_late_answer_cannot_end_the_next_round(self):
+        """★ 断线重连用同一张票据：bshook 先发来新一轮的 HELLO，旧那一轮迟到的「没有连接」不许收掉它。"""
+        self.hook_hello(downlink=True)
+        self.server_says(ACK_OK)
+        old = self.relay._session_serial
+        self.hook_hello()                                      # 重连：同一张票据、下行位清掉 = 新一轮
+        self.assertNotEqual(old, self.relay._session_serial)
+        self.assertFalse(self.relay._end_session("迟到的", old))
+        self.server_says(ACK_NOT_LOGGED_IN, "票据还没登进游戏服")   # 新一轮还没认出过：只是时序
+        self.assertEqual("tkt", self.relay.ticket)
+        self.assertEqual([], self.ended())
+
+    # -- 远程那一轮：经本中继的游戏服连接 -------------------------------------
+    def test_the_last_game_link_closing_ends_a_remote_round(self):
+        self.relay.game_link_opened()
+        self.hook_hello()
+        self.server_says(ACK_OK)
+        self.relay.game_link_closed()
+        self.assertIn("游戏服的连接断了", self.ended()[0])
+        self.assert_quiet()
+
+    def test_a_reconnect_overlap_is_not_the_end(self):
+        """新连接比旧连接的收尾先到（`bug调查/代理验证` 17:48:44 / 17:48:49）：还剩一条，这一轮照常。"""
+        self.relay.game_link_opened()
+        self.hook_hello()
+        self.server_says(ACK_OK)
+        self.relay.game_link_opened()                          # 新连接
+        self.relay.game_link_closed()                          # 旧连接这才收尾
+        self.assertEqual([], self.ended())
+        self.assertTrue(self.relay.acked)
+        self.relay.game_link_closed()
+        self.assertEqual(1, len(self.ended()))
+
+    def test_a_local_round_does_not_listen_to_game_links(self):
+        """本机那一轮的 TCP 不经过中继；这时断掉的只可能是上一轮远程的旧连接。"""
+        self.relay.game_link_opened()
+        self.hook_hello(local=True)
+        self.server_says(ACK_OK)
+        self.relay.game_link_closed()
+        self.assertEqual([], self.ended())
+        self.assertTrue(self.relay.acked)
+
+    def test_a_link_closing_with_no_round_is_quiet(self):
+        self.relay.game_link_opened()
+        self.relay.game_link_closed()
+        self.relay.game_link_closed()                          # 多关一次也不会变成负数
+        self.assertEqual(0, self.relay._game_links)
+        self.assertEqual([], self.lines)
+
+    def test_the_next_login_starts_over(self):
+        self.relay.game_link_opened()
+        self.hook_hello("first")
+        self.server_says(ACK_OK)
+        self.relay.game_link_closed()
+        del self.sent[:]
+        self.relay.game_link_opened()
+        self.hook_hello("second")
+        self.assertEqual("second", self.relay.ticket)
+        self.assertEqual(["second"], [parse_hello(d) for d in self.sent])
+        self.server_says(ACK_OK)
+        self.assertTrue(self.relay.acked)
+        self.assertTrue(self.relay.session_acked)
+
+
+class ProxiedSessionEndTests(FakeProxyMixin, unittest.TestCase):
+    """★ 整条链：经假 SOCKS5 代理认出之后，这一轮登录结束 → 代理的 UDP 关联真的关掉，之后一个包都不再发。"""
+
+    def setUp(self):
+        import relay                                            # noqa: PLC0415
+        self.player = FakeGameConn("player")
+        self.gone = False
+        self.udp = UdpSyncServer(
+            conn_for_ticket=lambda t: None if self.gone else (self.player if t == "good" else None),
+            ticket_known=lambda t: t == "good")
+        self.udp.port = 0
+        ready = threading.Event()
+        threading.Thread(target=self.udp.serve, args=("127.0.0.1", ready),
+                         daemon=True).start()
+        self.addCleanup(self.udp.stop)
+        self.assertTrue(ready.wait(timeout=5))
+        self.proxy, self.state, _ = self.start_socks5(udp=True, accept_many=True)
+        self.lines = []
+        real_log = relay.log
+        relay.log = self.lines.append
+        self.addCleanup(setattr, relay, "log", real_log)
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind(("127.0.0.1", 0))
+        local_port = probe.getsockname()[1]
+        probe.close()
+        self.relay = relay.UdpSyncRelay("127.0.0.1", target_port=self.udp.sock.getsockname()[1],
+                                        local_port=local_port, redundancy=2, proxy=self.proxy)
+        self.assertTrue(self.relay.start())
+        self.addCleanup(self.relay.close)
+        self.relay._inject = lambda packet: None
+        self.hook = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(self.hook.close)
+        self.local_addr = ("127.0.0.1", local_port)
+        self.relay.game_link_opened()                         # 远程那一轮：游戏服连接经中继
+        self.hook.sendto(build_hello("good", udpsync.HELLO_FLAG_DOWNLINK), self.local_addr)
+        self.assertTrue(wait_for(lambda: self.relay.acked))
+        self.association = self.relay.remote
+
+    def assert_closed_down(self):
+        self.assertTrue(wait_for(lambda: [x for x in self.lines if "这一轮登录结束了" in x]))
+        self.assertIn("代理的 UDP 关联也关了", self.lines[-1])
+        self.assertIsNone(self.relay.remote)
+        self.assertEqual({}, self.relay._upstreams)
+        self.assertEqual(-1, self.association.sock.fileno())
+        self.assertEqual(-1, self.association.control.fileno())
+        # 游戏那头还在发的东西（在场证据等）也不再往外走
+        before = self.udp.datagrams_in
+        self.hook.sendto(udpsync.build_presence(1, 2, 3, True), self.local_addr)
+        self.assertFalse(wait_for(lambda: self.udp.datagrams_in != before, timeout=0.3))
+
+    def test_the_game_link_closing_closes_the_association(self):
+        self.relay.game_link_closed()                          # 退出游戏：游戏服那条 TCP 断了
+        self.assert_closed_down()
+        self.assertIn("游戏服的连接断了", self.lines[-1])
+        self.assertEqual(1, self.state["associations"])        # 没为了收尾再建一条
+        self.assertTrue(wait_for(lambda: self.state["control"].fileno() == -1))   # 代理那头也看到关了
+        self.assertNotIn("error", self.state)
+
+    def test_a_forgotten_stream_ends_the_round_through_the_servers_answer(self):
+        """本机那一轮的路子（TCP 不经过中继）：服务端忘了这条流 → 「不认识」→ 重发 HELLO →
+        「这张票据没有游戏连接了」→ 收掉。这里经代理走，所以还会先换一条关联（D73），收的时候一起关。"""
+        self.gone = True
+        self.udp.forget(self.player)
+        self.hook.sendto(build_data([(0, heartbeat())]), self.local_addr)
+        self.assertTrue(wait_for(lambda: [x for x in self.lines if "这一轮登录结束了" in x]))
+        self.assertIn("服务器说这张票据已经没有游戏连接了", self.lines[-1])
+        self.assertIn("代理的 UDP 关联也关了", self.lines[-1])
+        self.assertEqual(2, self.state["associations"])        # 翻转时换过一条（D73）
+        self.assertEqual(-1, self.association.sock.fileno())   # 旧的换关联时关了
+        self.assertIsNone(self.relay.remote)                   # 新的收尾时关了
+        self.assertEqual({}, self.relay._upstreams)
+        self.assertTrue(wait_for(lambda: self.state["control"].fileno() == -1))
+        self.assertEqual("", self.relay.ticket)
+        self.assertNotIn("error", self.state)
+
+
+class GameLinkHookTests(unittest.TestCase):
+    """`handle()` 只对连向游戏服的那一条报开 / 断（X_Mod D74）；认证服 / 中继服那两条不算。"""
+
+    class Recorder:
+        def __init__(self):
+            self.events = []
+
+        def game_link_opened(self):
+            self.events.append("opened")
+
+        def game_link_closed(self):
+            self.events.append("closed")
+
+    def run_one(self, target_is_game):
+        import relay                                            # noqa: PLC0415
+        target = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(target.close)
+        target_port = target.getsockname()[1]
+        recorder = self.Recorder()
+        patches = [mock.patch.object(relay, "GAME_LINKS", recorder),
+                   mock.patch.object(relay, "log", lambda _msg: None)]
+        if target_is_game:
+            patches.append(mock.patch.object(relay.server_config, "GAME_PORT", target_port))
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        front = socket.create_server(("127.0.0.1", 0))         # 扮演中继的本地监听口
+        self.addCleanup(front.close)
+        peer = socket.create_connection(front.getsockname(), timeout=5)   # 扮演游戏
+        self.addCleanup(peer.close)
+        client, _ = front.accept()
+        worker = threading.Thread(
+            target=relay.handle,
+            args=(client, ("127.0.0.1", 1), "127.0.0.1", target_port, "测试"), daemon=True)
+        worker.start()
+        accepted, _ = target.accept()
+        self.assertTrue(wait_for(lambda: recorder.events or not target_is_game))
+        accepted.close()                                       # 游戏服那头断了
+        peer.close()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        return recorder.events
+
+    def test_the_game_server_link_is_reported_both_ways(self):
+        self.assertEqual(["opened", "closed"], self.run_one(target_is_game=True))
+
+    def test_other_links_are_not(self):
+        self.assertEqual([], self.run_one(target_is_game=False))
 
 
 class LocalServerRouteUnitTests(unittest.TestCase):

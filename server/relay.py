@@ -103,6 +103,22 @@ CRASH_WATCHER = crashwatch.CrashWatcher(host="", port=0, connect=None,
                                         enabled=False)
 
 
+class _NoGameLinks:
+    """`GAME_LINKS` 的占位：位置 UDP 旁路没起来时，游戏服连接开了 / 断了没人要听。"""
+
+    def game_link_opened(self):
+        pass
+
+    def game_link_closed(self):
+        pass
+
+
+#: 谁要听「经本中继的游戏服 TCP 连接开了 / 断了」（X_Mod D74）。`main()` 把位置 UDP 旁路
+#: （`UdpSyncRelay`）挂上来：远程那一轮，经这里的游戏服连接一条都不剩 = 这一轮登录结束，
+#: UDP 通道跟着收掉。本机模式的 TCP 不经过中继，那边靠服务端的回答（见 `_end_session`）。
+GAME_LINKS = _NoGameLinks()
+
+
 class ProxyError(OSError):
     """代理 TCP 已连上，但协商或 CONNECT 请求失败。"""
 
@@ -466,6 +482,19 @@ def _pump(src, dst, tag, counter):
 
 def handle(client, addr, target_host, target_port, label, proxy=None,
            local_port=0):
+    # ★ 连向游戏服的那一条开了 / 断了要告诉位置 UDP 旁路（X_Mod D74）。开的时候就记（在连上游
+    #   之前）—— 这一轮的登录包一定走在它后面；断的时候在 finally 里记，连不上也算断。
+    links = GAME_LINKS if target_port == server_config.GAME_PORT else None
+    if links is not None:
+        links.game_link_opened()
+    try:
+        _handle(client, addr, target_host, target_port, label, proxy, local_port)
+    finally:
+        if links is not None:
+            links.game_link_closed()
+
+
+def _handle(client, addr, target_host, target_port, label, proxy, local_port):
     global _seq
     with _seq_lock:
         _seq += 1
@@ -570,9 +599,18 @@ def start(target_host, port_map=PORT_MAP, proxy=None):
 #: ★ 这是 UDP 上物理等不到事件的地方（铁律 10 的例外）：对端收没收到 HELLO 没有任何回执可等。
 HELLO_RETRY_S = 2.0
 
-#: 确认之后多久发一发保活（秒）。家用路由器的 UDP 映射常见 30~60 秒超时，
-#: 10 秒足够撑住；战斗中本来就有 8 Hz 的数据，保活只在大厅里真的起作用。
-KEEPALIVE_S = 10.0
+#: 确认之后，**从服务器那边多久什么都没收到**就补一发保活（秒）。
+#:
+#: ★ 这是 UDP 上物理等不到事件的地方（铁律 10 的例外）：中间盒什么时候撤掉映射，不通知任何人。
+#: ★ 按「下行静默」算、不按「距上一发保活」算，而且得短 —— 经 SOCKS5 代理时最狠的是
+#:   v2ray-core 4.x（v2rayN 3.x 自带的 4.45.2）：它的 SOCKS UDP 会话**只认回包**续命，
+#:   每 4 秒查一格，这一格里一发回包都没有就把会话撤掉（`transport/internet/udp/dispatcher.go`
+#:   的 `CancelAfterInactivity(…, 4s)`，`timer.Update()` 只在收到回包时调）—— 上行发得再密也不算。
+#:   撤掉之后下一发上行从代理的新出口出去，服务端认不出（X_Mod §110）；它撤会话还不核对是不是
+#:   自己那条，上行不断时会连锁误杀后面新建的会话（见 `_renew_association`）。
+#:   1 秒 + 定时器半秒粒度 + 一个 RTT：丢一发 PONG 也还落在 4 秒一格之内。
+#:   家用路由器 30~60 秒的 UDP 映射更不在话下；战斗里别人的位置数据一直在回，一发都不用补。
+KEEPALIVE_S = 1.0
 
 #: 收不到任何回应多久算这条路不通（秒）。到点只打一行日志 —— **不做任何降级**，
 #: 因为 TCP 那份从来没停过，UDP 不通对玩家就是「和以前一样」。
@@ -693,7 +731,12 @@ class UdpSyncRelay:
     代理撤掉关联（控制连接断了）是一个事件：`_on_upstream_dead` 把这一轮的上游撤掉、
     `acked` 清掉，现成的 HELLO 重发（`_retry_hello`）就会把它重建起来 —— 不加定时器。
     代理 / NAT 在**服务器那一侧**换了 UDP 源口是另一个事件（X_Mod D72）：我们这边看不出来，
-    由服务端回 `ACK_UNKNOWN_SOURCE` 告诉我们，`_on_remote_datagram` 收到就重发 HELLO 认回去。
+    由服务端回 `ACK_UNKNOWN_SOURCE` 告诉我们，`_on_remote_datagram` 收到就重发 HELLO 认回去；
+    经 SOCKS5 代理时先换一条全新的关联再发（X_Mod D73，`_renew_association`）。
+
+    ★ **通道跟着一轮登录走**（X_Mod D74）：这一轮登录结束 —— 远程那一轮经本中继的游戏服连接
+    一条都不剩，或者认出过之后服务器说这张票据没有游戏连接了 —— 整条收掉（`_end_session`）：
+    不再保活、不再重发 HELLO、上游 socket 和代理关联全关。下一轮登录 bshook 先发 HELLO，照常重建。
     """
 
     def __init__(self, target_host, target_port=None, local_port=None,
@@ -742,6 +785,16 @@ class UdpSyncRelay:
         self.hook_addr = None
         self.ticket = ""
         self.acked = False
+        #: ★ 这一轮登录（这张票据、这条游戏连接）被服务器认出过没有（X_Mod D74）。认出过之后
+        #:   服务器再说「这张票据没有游戏连接了 / 不认这张票据了」= 游戏连接断了（退出 / 掉线），
+        #:   不是登录时那一下的时序（那时还没认出过）。
+        self.session_acked = False
+        #: 第几轮登录。bshook 每发来新一轮的 HELLO、每收掉一轮都 +1 ——
+        #: 迟到的事件拿着旧的轮次号来收，就知道新的一轮已经开始了，不许动（`_end_session`）。
+        self._session_serial = 0
+        #: 经本中继、此刻还开着的游戏服 TCP 连接有几条（`game_link_opened / closed`）。
+        #: 只有远程模式的 TCP 经过这里；本机模式一直是 0。
+        self._game_links = 0
         #: ★ **本条游戏连接**的第一发 `HELLO` 的时刻（`0` = 还没发过）。
         #: 「这条路好像不通」的提示必须从这里起算，**不能从中继进程启动的时刻起算**
         #: —— 中继是随启动脚本先起来的，玩家点开游戏、输账号、进大厅，
@@ -750,6 +803,9 @@ class UdpSyncRelay:
         self.first_hello_at = 0.0
         self.last_hello_at = 0.0
         self.last_keepalive_at = 0.0
+        #: 最近一次从**这一轮的上游**收到任何东西的时刻。保活按它补（`_keepalive_due`）——
+        #: 会撤映射的中间盒只看有没有回包，不看我们发了多少（X_Mod §110）。
+        self.last_heard_at = 0.0
         self.warned_quiet = False
         #: 「服务器不认这条通道」这句话说过没有。**按状态翻转去重，不按次数**：
         #: 说一次，直到通了（`ACK_OK`）或者换了一条游戏连接才重新允许说。
@@ -942,6 +998,117 @@ class UdpSyncRelay:
             log(f"位置UDP  ✗ 代理关掉了 UDP 通道的控制连接（关联作废，"
                 f"{upstream.proxy.route}）；位置数据回退 TCP，下一发 HELLO 重建")
 
+    def _renew_association(self):
+        """服务端说出口换了（`ACK_UNKNOWN_SOURCE`）时，经 SOCKS5 代理的那条上游换一条全新的
+        关联（X_Mod D73）。换了返回 `True`；这一轮不是代理上游 / 建不起来 / 已经被别人撤掉了
+        返回 `False` —— 调用方照旧经原来那条重发 HELLO。
+
+        ★ 为什么不只是重发 HELLO：出口换了 = 代理撤过我们的 UDP 会话。v2ray-core 4.x（v2rayN 3.x
+          自带 4.45.2）撤会话是按**目标地址**删「表里现在那一条」、不核对是不是自己那条
+          （`transport/internet/udp/dispatcher.go` 的 `RemoveRay(dest)`）；被撤的会话随后它的
+          4 秒定时器、收包协程退场时还会各再撤一次 —— 那时表里已经是紧跟着建起来的新会话了。
+          被误杀的新会话又留下同样的尾巴，上行不断（房间里 9 Hz 的位置心跳）时这条链自己停不下来：
+          v2ray 日志里每秒几条新的 UDP 连接，我们这边一两秒换一次口、还夹着十几秒的真断流
+          （`bug调查/代理验证`，X_Mod §110）。那张表是**每条关联各一份**的（按我们的本地 UDP 口分）
+          —— 换一条关联，旧表里的尾巴就够不着我们了。别的代理没有这个毛病也无害：多一次本机握手。
+        ★ 先建新的、再换指针、最后关旧的（同 `_use_route`）；建的时候占着这条路由的 `_open_locks`，
+          和「代理撤关联 → `_retry_hello` 重建」那一支互斥。建的这段时间旧的已经被撤掉，
+          新建的这条就不要了，交给那一支。
+        ★ 闸门不动（D72 ③）：服务端那边同一条流接着发，下行索引不重来。
+        """
+        up = self._up
+        if self._stop.is_set() or up is None or not isinstance(up[0], _Socks5UdpUpstream):
+            return False
+        with self._open_locks[False]:
+            with self._route_lock:
+                if self._upstreams.get(False) is not up:
+                    return False
+            fresh = self._open_proxied_upstream()
+            if fresh is None:
+                return False                # 为什么建不起来 `_open_proxied_upstream` 已经说过
+            with self._route_lock:
+                if self._stop.is_set():
+                    stale = fresh[0]        # 建的这段时间中继被关了：`close()` 管不到这条
+                elif self._upstreams.get(False) is up:
+                    self._upstreams[False] = fresh
+                    if self._up is up:
+                        self._up = fresh
+                        # 同一条路由、同一个代理：别让下一发 HELLO 当成「换了上游」再说一遍
+                        self._route_said = (False, fresh[1])
+                    stale = up[0]
+                else:
+                    stale = fresh[0]
+        stale.close()
+        return stale is up[0]
+
+    # -- 这一轮登录结束（X_Mod D74）----------------------------------------
+    def game_link_opened(self):
+        """本中继又转发起一条游戏服 TCP 连接（`handle()` 调；只有远程模式的 TCP 经过这里）。"""
+        with self._lock:
+            self._game_links += 1
+
+    def game_link_closed(self):
+        """一条游戏服 TCP 连接断了。★ 远程那一轮、**经本中继的游戏服连接一条都不剩了** = 这一轮登录结束
+        （退出游戏 / 掉线 / 被踢）—— 这是我们自己亲眼看见的事实，用不着等保活撞上「不认识」再去问服务器，
+        也就不会为了问这一句再换一条代理关联。
+
+        ★ 按「一条都不剩」判，不按「断的是不是那一条」：断线重连时新连接可能比旧连接的收尾先到
+          （`bug调查/代理验证` 17:48:44 新连接、17:48:49 旧连接才收尾），那时还剩一条，这一轮照常；
+          不重叠的重连先收掉，新一轮的 HELLO 一到照常重建。本机那一轮不看这个（TCP 不经过这里）。
+        """
+        with self._lock:
+            self._game_links = max(0, self._game_links - 1)
+            if self._game_links or self.route_local or not self.ticket:
+                return
+            serial = self._session_serial
+        self._end_session("游戏服的连接断了", serial)
+
+    def _end_session(self, reason, serial):
+        """这一轮登录结束了：整条 UDP 通道收掉 —— 不再保活、不再重发 HELLO、上游 socket / 代理关联
+        全关（X_Mod D74，用户 2026-09-26「退出游戏后，连接也应该断掉才对」）。下一轮登录 bshook
+        一定先发 HELLO（`_on_hook_datagram` 的 restart），上游照常重建。
+
+        两个入口，都是事件：远程那一轮经本中继的游戏服连接一条都不剩（`game_link_closed`）；
+        或者认出过之后服务器说这张票据没有游戏连接了 / 不认了（`_on_remote_datagram`，本机那一轮只有它）。
+        `serial` 是调用方判定时看到的那一轮 —— 这中间 bshook 已经发来新一轮的 HELLO（重连用同一张
+        票据也算）就什么都不动：迟到的事件不许收掉新的一轮。
+        """
+        with self._lock:
+            if serial != self._session_serial or not self.ticket:
+                return False
+            self._session_serial += 1
+            idle = self._session_serial
+            self.ticket = ""
+            self.acked = False
+            self.session_acked = False
+            # 游戏那头的 UDP 口跟着这条连接没了；下一轮 bshook 会重新报「已 bind」。
+            self.downlink = False
+            self.recent.clear()
+            self.downlink_high_water = -1
+        # ★ 占着两条路由的 `_open_locks`：正在建上游的那一支（HELLO 重发 / 换关联）建完之前不收，
+        #   免得它建完又把一条新关联挂回来、没人再关。顺序和 `_use_route` 一样：建锁 → 路由锁 → 状态锁。
+        with self._open_locks[False], self._open_locks[True]:
+            with self._route_lock:
+                with self._lock:
+                    still_idle = self._session_serial == idle
+                if still_idle:
+                    dropped = [up[0] for up in self._upstreams.values()]
+                    self._upstreams.clear()
+                    self._up = None
+                    self._route_said = None
+                else:
+                    dropped = []            # 收的这段时间新一轮已经开始了，上游归它
+        for sock in dropped:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        proxied = any(isinstance(sock, _Socks5UdpUpstream) for sock in dropped)
+        log(f"位置UDP  这一轮登录结束了（{reason}）—— UDP 通道已收掉"
+            f"{'（代理的 UDP 关联也关了）' if proxied else ''}，不再保活、不再重发 HELLO；"
+            f"下次登录再建")
+        return True
+
     # -- 建 socket ----------------------------------------------------------
     def start(self):
         """建好本机那条 socket 并把收发线程拉起来。失败时返回 `False`（不抛）。
@@ -1032,6 +1199,8 @@ class UdpSyncRelay:
                 if restart:
                     # 索引、水位、确认状态全部从头来 —— 服务端那边是一条新的
                     # `Conn`，计数器同样从 0 起，两边这才对得上。
+                    self._session_serial += 1
+                    self.session_acked = False
                     self.recent.clear()
                     self.acked = False
                     self.downlink_high_water = -1
@@ -1151,6 +1320,7 @@ class UdpSyncRelay:
                 #   迟到的回包（ACK / 下行）。认了它会把「上一轮的确认」当成这一轮的，
                 #   或者把上一台服务器的位置数据投进游戏。
                 continue
+            self.last_heard_at = time.monotonic()
             self.received += 1
             self.replies += 1
             try:
@@ -1165,18 +1335,33 @@ class UdpSyncRelay:
             return
         if kind == udpsync.MSG_HELLO_ACK:
             result, note = udpsync.parse_hello_ack(data)
+            if not self.ticket:
+                return                      # 这一轮已经收掉了（`_end_session`），迟到的回答不理
             if result == udpsync.ACK_OK:
                 if not self.acked:
                     log("位置UDP  ✓ 服务器已认出这条 UDP 通道，位置数据开始走 UDP")
                 self.acked = True
+                self.session_acked = True
                 # ★ 连通之后把「被拒」的账清掉：万一之后**又**被拒了
                 #   （服务端重启、票据在服务端那边没了），那是一次真正的
                 #   状态翻转，值得再打一行 —— 和「下行 已就绪 / 未就绪」
                 #   那一对提示是同一个套路：**只在状态变了的时候说话**。
                 self.refused_logged = False
                 return
+            with self._lock:
+                serial = self._session_serial
+                was_up = self.session_acked
             was_acked = self.acked
             self.acked = False
+            if was_up and result in (udpsync.ACK_NOT_LOGGED_IN, udpsync.ACK_BAD_TICKET):
+                # ★ 这一轮认出过，服务器现在说「这张票据没有游戏连接了」/「不认这张票据了」
+                #   = 游戏连接已经断了（退出游戏 / 掉线 / 被顶号 / 服务端重启）—— 服务器给的事件，
+                #   不是登录那一下的时序（那时 `session_acked` 还是 False）。收掉整条通道（X_Mod D74）；
+                #   断线重连 bshook 一定先发新一轮的 HELLO，照常重建。
+                self._end_session("服务器说这张票据已经没有游戏连接了"
+                                  if result == udpsync.ACK_NOT_LOGGED_IN
+                                  else "服务器不认这张票据了", serial)
+                return
             if result == udpsync.ACK_NOT_LOGGED_IN:
                 # ★ **不是失败，是时序**：`bshook` 一看到 `0x0100` 就发 HELLO，
                 #   而游戏服那边还没把 `login_ticket` 写到连接上。
@@ -1186,14 +1371,21 @@ class UdpSyncRelay:
                 return
             if result == udpsync.ACK_UNKNOWN_SOURCE:
                 # ★ 服务器说「这个来源我不认识」（X_Mod D72）：代理 / NAT 在服务器那一侧换了
-                #   UDP 源口，或服务端重启过 / 把这条流忘了。我们这边 socket 没变、发得出去，
-                #   没有别的办法知道 —— 这一发就是那个事件。翻转的那一发（刚才还是 acked）
-                #   立刻重发 HELLO 认回去；之后的（HELLO 已在路上）不再逐发重发，丢了有
-                #   `HELLO_RETRY_S` 兜着。日志只在翻转时打一行，认回来时 ACK_OK 那一行自然跟上；
-                #   服务端那边同一条流接着发，下行索引不重来，闸门不用动。
+                #   UDP 源口，或服务端把这条流忘了（游戏连接断了 / 服务端重启过）。我们这边 socket
+                #   没变、发得出去，没有别的办法知道 —— 这一发就是那个事件。翻转的那一发（刚才还是
+                #   acked）立刻重发 HELLO 问一下；之后的（HELLO 已在路上）不再逐发重发，丢了有
+                #   `HELLO_RETRY_S` 兜着。★ 这一行**不下结论**（X_Mod D74）：是换口还是游戏连接断了，
+                #   看服务器怎么答 —— `ACK_OK` 那一行「✓ 已认出」，或 `_end_session` 那一行「这一轮
+                #   登录结束了」。换口时服务端那边同一条流接着发，下行索引不重来，闸门不用动。
+                # ★ 经 SOCKS5 代理时，重发之前先换一条全新的关联（X_Mod D73）—— 出口换了说明代理
+                #   撤过我们的会话，旧关联里可能还留着会误杀新会话的尾巴（`_renew_association`）。
                 if was_acked:
-                    log("位置UDP  服务器不认识这条通道现在的来源（代理 / NAT 在服务器那一侧"
-                        "换了 UDP 口）—— 已重发 HELLO 让它认回去")
+                    renewed = self._renew_association()
+                    log("位置UDP  服务器不认识这条通道现在的来源了（代理 / NAT 在服务器那一侧换了"
+                        "UDP 口，或者游戏连接已经断了）—— "
+                        + ("已换一条新的代理 UDP 关联并重发 HELLO" if renewed
+                           else "已重发 HELLO")
+                        + "，看服务器怎么答")
                     self._send_hello()
                 return
             # 真被拒了（服务端重启过 / 票据过期 / 被顶号 / UDP 同步被关掉）。
@@ -1255,7 +1447,7 @@ class UdpSyncRelay:
             now = time.monotonic()
             if self.ticket and not self.acked and now - self.last_hello_at >= HELLO_RETRY_S:
                 self._retry_hello()
-            if self.acked and now - self.last_keepalive_at >= KEEPALIVE_S:
+            if self._keepalive_due(now):
                 self.last_keepalive_at = now
                 self._to_remote(udpsync.build_ping(udpsync.MSG_PING, 0))
             if self._quiet_warning_due(now):
@@ -1269,6 +1461,19 @@ class UdpSyncRelay:
                     f"多半是服务器没放行这个 UDP 口，或者服务端是旧版"
                     f"{'，走代理时也可能是代理的出口不转 UDP' if via_proxy else ''}。"
                     f"**位置数据继续走 TCP，游戏一切正常**")
+
+    def _keepalive_due(self, now):
+        """该不该补一发保活。★ 两条**都**要成立：
+
+        1. 已确认 —— 没确认时 HELLO 每 `HELLO_RETRY_S` 重发一次，服务端每发都回，不缺回包；
+        2. 离**最近一次收到服务器的任何东西**、也离上一发保活，都够 `KEEPALIVE_S` 了。
+           前者是中间盒真正看的东西（只认回包，X_Mod §110）；后者防 PONG 丢了之后每半秒追一发。
+           战斗里别人的位置数据一直在回，这一条永远不成立 —— 一发都不补。
+
+        抽成一个纯判据是为了能单测 —— `_pump_timer` 是个死循环。
+        """
+        return (self.acked
+                and now - max(self.last_heard_at, self.last_keepalive_at) >= KEEPALIVE_S)
 
     def _quiet_warning_due(self, now):
         """「这条路好像不通」该不该提示。★ 三条**都**要成立（§225 第六节）：
@@ -1337,8 +1542,12 @@ def main():
     except RuntimeError as error:
         log(f"!! {error}")
         return 1
-    start_udp_sync(target, proxy=proxy, enabled=bool(cfg["udp_sync"]),
-                   redundancy=cfg["udp_sync_redundancy"])
+    udp_relay = start_udp_sync(target, proxy=proxy, enabled=bool(cfg["udp_sync"]),
+                               redundancy=cfg["udp_sync_redundancy"])
+    # 游戏服连接开了 / 断了要告诉它：远程那一轮一条都不剩就收掉 UDP 通道（X_Mod D74）。
+    global GAME_LINKS
+    if udp_relay is not None:
+        GAME_LINKS = udp_relay
 
     # 客户端崩溃后自动上传诊断日志（V0.3商店）。★ 出站连接复用本文件的
     # `connect_remote`，所以 SOCKS5 / HTTP CONNECT 代理自动生效 ——

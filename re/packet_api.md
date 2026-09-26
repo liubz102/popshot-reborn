@@ -4460,9 +4460,9 @@ if (3 <= 系列 <= 5 && 索引 < 50)  索引 %= 10      ; D/R/F 归一化成槽�
 | 类型 | 载荷 |
 |---|---|
 | `HELLO` | `u16 票据长度 + 票据(UTF-8) + u8 标志位`（末尾那一字节是后加的，老 bshook 没有，读不到当 0）。票据就是登录时那张，**不引入新的秘密**。标志位：`0x01 DOWNLINK` = 游戏收位置的 UDP 口已 bind（中继转告服务端，服务端据此发下行）；`0x02 LOCAL_SERVER` = 这一轮登录选的是「本机服务器」（✅ X_Mod D58）—— **只在 bshook → 中继这一跳有**，中继据此把上游定成 `127.0.0.1:27799`（不带就是 `server_address`），转给服务端的 HELLO 不带它 |
-| `HELLO_ACK` | `u8 结果码 + u16 说明长度 + 说明(UTF-8)` |
+| `HELLO_ACK` | `u8 结果码 + u16 说明长度 + 说明(UTF-8)`。结果码：`0 OK` / `1 BAD_TICKET` / `2 DISABLED` / `3 NOT_LOGGED_IN`（票据是真的、还没有游戏连接认领它 —— 登录那一下必经）/ `4 UNKNOWN_SOURCE`（回给认不出来源的非 HELLO 包，D72）。★ 中继：这一轮**认出过之后**再收到 `1` / `3` = 游戏连接已经没了（退出 / 掉线 / 被顶号），整条 UDP 通道收掉，等下一轮登录的 HELLO（X_Mod D74）|
 | `DATA` | 份数 × (`u32 索引 + u16 长度 + 整个 UdpPacket`)，**索引升序** |
-| `PING` / `PONG` | `u32 序号`（保活撑住 NAT 映射，顺带量 RTT）|
+| `PING` / `PONG` | `u32 序号`（保活撑住 NAT / 代理的 UDP 映射，顺带量 RTT）。★ 中继在「确认过、且**从服务器那边已经 1 秒什么都没收到**」时才发（`relay.KEEPALIVE_S`，X_Mod D73）：v2ray-core 4.x 的 SOCKS UDP 会话只认**回包**续命，4 秒一格里没有回包就撤（X_Mod §110）；战斗里有下行位置数据时一发不补。服务端只给认得出的来源回 PONG，认不出的回 `HELLO_ACK(ACK_UNKNOWN_SOURCE=4)`（D72）|
 | `PRESENCE`（6）| `u32 键盘空闲 / u32 鼠标空闲 / u32 系统空闲 / u8 前台 / u8 标志 / u16 保留`，空闲 `0xFFFFFFFF` = 本次连接从来没有过。在场证据（X_Mod §62 / D53）：bshook 每 5 秒 → 中继**原样转** → 游戏服 `Conn.note_presence()`，判定在游戏服 |
 | `MOVER_PHASE`（7）| `u32 game_now`（`[当前 Stage + 0xe0]`，= 此刻的 `Timer()`；Desktop `[0x72e2b4]` +8 = 当前 Stage，§78）`/ u32 wall_now`（`GetTickCount`），然后「份数」条 `i32 link / u32 t0 / i32 t_off`。移动平台相位（X_Mod §74 / §78 / D55 / D59）：bshook 在两个写 `t0` 的站点记表并置脏 —— `MapObject::LinkPath` 收尾 `0x511d97`（载图）、`GameContext::StartGame` → `0x476463`（**开打时整体重取**，战斗里算数的是这个）—— 之后每秒一发；★ `t0` / `t_off` 是**发包那一刻从对象身上现读的**。→ 中继**原样转** → `Conn.note_mover_phase()` 存 `game_now − t0`（起点翻转才打日志）；老服务端 / 老中继不认识就丢 |
 | `TICK_CLOCK`（8）| `u32 帧号`（`[当前 Stage + 0xd4]`，`Stage::Update` 0x42b4c3 每个 32 ms 逻辑帧 +1）`/ u32 Timer`（`[当前 Stage + 0xe0]`，这一逻辑帧里移动平台就按它摆），然后「份数」个 `i32 弹体句柄` = **这一帧**在网络泵里建出来的远端弹体（`ProjectileMgr::Add`，自己开的枪 / 句柄 < 100000 不报）。逻辑帧时钟（✅ 静态 / 🤔 实机待验，X_Mod §81 / D60）：bshook 在 `GameContext` 逻辑帧入口 `0x4904cc`（vft+0x80）**每帧一发，只在这张图有移动平台时**；→ 中继**原样转** → `Conn.note_tick_clock()` 存「帧号 → Timer」和「句柄 → 出膛帧」→ `bot._mover_clock(room, terrain, shell)` 第 k 格取「出膛帧 + k − 1」那一帧的 Timer − t0（没报到就按最近一帧 + 32·Δ 外推）。`0x0400` 时清空。老服务端 / 老中继不认识就丢 |
