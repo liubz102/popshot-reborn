@@ -458,6 +458,8 @@ class BotConn(gameserver.Conn):
         self.motion_constraint = None
         #: 「被座位 N 推着、不出手」那一行日志说过了没有（按状态翻转去重，`_held_by_push`）。
         self.push_hold_logged = None
+        #: 「先让他打完」锁住的那一下：`(座位, 那一发 rpDash 的记号)`（`_yield_to_melee`，X_Mod §113）。
+        self.melee_yield = None
         #: 上一发**踩地**心跳报出去的 `(方向键, 冲刺位)`。收方拿这两样替 bot
         #: 走接下来那一段（`0x507660`），所以它们一翻转就是收方复现不出来的
         #: 运动突变，当格补锚（V0.3 §190 / D149）。腾空时记 `None`（腾空收方
@@ -804,6 +806,7 @@ class BotConn(gameserver.Conn):
         self.motion_identity = botmotion.new_identity()
         self.motion_constraint = None
         self.push_hold_logged = None
+        self.melee_yield = None
         self.walk_reported = None
         self.trail_mark = None
         self.trail_heading = 0
@@ -2905,24 +2908,31 @@ def _note_motion_event(room, conn, opcode, body, sequence):
         name = ("dash" if opcode == botsync.OP_DASH else "jab") + str(index)
         move = who.move(name)
         if move is not None and move.get("total_frame", 0) > 0:
+            start = _now()
+            frame_s = BOT_DASH_FRAME_MS / 1000.0
             frames = int(move["total_frame"])
             if opcode != botsync.OP_DASH:
                 # ★ 出拳的计时器是 ⌊TotalFrame × 0.625⌋ 帧（`0x502414` … `fmul [0x693b08]`），
                 #   冲刺才是整 TotalFrame 帧（`0x502171`，X_Mod §101）。这一段他身前多一个圆。
                 frames = int(frames * JAB_FRAME_RATIO)
-                conn.jab_until = _now() + frames * BOT_DASH_FRAME_MS / 1000.0
+                conn.jab_until = start + frames * frame_s
                 conn.jab_dir = direction
                 # ★ 出拳的**伤害段**（`0x482d65`）：⌊CastEndFrame × 0.625⌋ ≤ 帧 < ⌊DamageEndFrame × 0.625⌋。
                 #   这一段他的招式优先级是 2，bot 的冲刺碰到他不算（`0x503fde`，X_Mod §111）。
                 #   只在 `jab_until` 还没到时才作数（被打断 / 死了 / 换图都清 `jab_until`）。
-                frame_s = BOT_DASH_FRAME_MS / 1000.0
                 conn.jab_strike = (
-                    _now() + int(move.get("cast_end", 0) * JAB_FRAME_RATIO) * frame_s,
-                    _now() + int(move.get("damage_end", 0) * JAB_FRAME_RATIO) * frame_s)
-            conn.motion_action = (gen, _now() + frames * BOT_DASH_FRAME_MS / 1000.0,
-                                  direction)
+                    start + int(move.get("cast_end", 0) * JAB_FRAME_RATIO) * frame_s,
+                    start + int(move.get("damage_end", 0) * JAB_FRAME_RATIO) * frame_s)
+            conn.motion_action = (gen, start + frames * frame_s, direction)
             conn.motion_kind = "dash" if opcode == botsync.OP_DASH else "jab"
             conn.motion_facing = (gen, direction)
+            # ★ 冲刺是第几帧、每帧自己挪多远（`ProcessDash`，X_Mod §113）：外推真人（`_advance_humans`）
+            #   和「这一招打不打得到 bot」（`_melee_threat`）都按它算。出拳不挪。
+            #   `motion_grid` = 这一发排在他那台逻辑帧网格上哪一帧（到达时刻，`note_sync_position` 算好的）。
+            conn.motion_start = start
+            conn.motion_move = (chrprops.Move(move) if opcode == botsync.OP_DASH
+                                else None)
+            conn.motion_grid = getattr(conn, "sync_melee_grid", None)
         return
     if len(body) != 8:
         return
@@ -2979,6 +2989,9 @@ def _held_by_push(room, machine, now):
 
     ⇒ 这是给 bot 的**行为约束**（和体力一样是 bot 自己给自己上的），不是还原某个客户端判定。
       判据就是 `0x0017` 这个事件，解除跟着 `_pushed_by`，没有新的时间阈值（铁律 10）。
+    ★ 这一段它**也不自己挪**（`_own_step`：不走、不跳、不快跑，X_Mod §113 / D79）：推是单边的
+      （`0x50e654` 只管别落到出招者身后），它自己往推的方向跑就跑出了圈 —— 22:17:01 那下真人的伤害段
+      （第 17 帧）碰不到它，用户看着打中了、它一滴血没掉。
     按状态翻转打日志：这一段推第一次拦下时说一句。
     """
     index = _pushed_by(room, machine, now)
@@ -2987,9 +3000,130 @@ def _held_by_push(room, machine, now):
         return False
     if machine.push_hold_logged != index:
         machine.push_hold_logged = index
-        machine.log(f"   近身: 被座位{index} 的近身招式推着（`0x0017`），这一段不出手"
-                    f" —— 不冲、不开枪（X_Mod §111 / D75）")
+        machine.log(f"   近身: 被座位{index} 的近身招式推着（`0x0017`），这一段不出手也不自己挪"
+                    f" —— 不冲、不开枪、不走不跳（X_Mod §111 / §113，D75 / D79）")
     return True
+
+
+def _melee_threat(room, machine, seat_index, now, terrain=None):
+    """有没有人**先出了手**、那一招接下来碰得到这个 bot：有就返回 `(他的座位号, 第几帧碰到)`（X_Mod §113 / D79）。
+
+    ## 为什么要有它
+
+    `_held_by_push` 挂在 `0x0017` 上 —— 那是他的推挤段**已经碰到** bot 之后他那台才发的。可 bot 第 0 式第 6 帧就进
+    伤害段，真人第 3 式要第 17 帧：真人冲出去、还没碰到 bot 的那一两百毫秒里 bot 只要一冲，伤害段就抢在前面，按原版
+    （同级谁先进伤害段谁赢）在他自己那台把他那一招取消。22:14:15 晚他 24 ms、22:16:56 晚他 191 ms 出手，都比服务端
+    收到 `0x0017` 早 4~5 ms —— 用户说的「我先发近身攻击却被 bot 打」。⇒ 他先出手、而且打得到，bot 就先让他。
+
+    ## 判据（全是已经发生的事实 + 原版公式，没有时间阈值）
+
+    他那一发 `rpDash` 到了（第几式、朝哪边、哪一刻，`_note_motion_event`）、这一招还没过伤害段；从他**此刻**的身体
+    （外推，`sim_body`）起，照原版每一帧怎么挪（`botmove.frame(dash_step=…)`）一帧帧推到伤害段结束，每一帧的圈
+    （`Move.offset` / 半径 —— 和 bot 自己冲刺判中同一个 `_dash_hits`）碰不碰得到 bot 此刻站的地方。
+    ★ 圈是**扫**过去的：`0x4814f2` 把伤害对象摆在他挪之前的位置、速度写成这一帧的路程，弹体管理器按速度扫
+      （§86 那一套）—— 第 3 式头一帧就挪 131 px，只看落点会从 bot 身上「跳过去」。
+    推挤段碰到也算（碰到就会被推住，之后就是他的伤害段）；`DontPush` 的招只看伤害段；伤害 0 的招（纯位移）不算。
+    只看敌人（同一碰撞组整个不碰）。出拳不在这里：`Jab00` 没写圈，它推到人会发 `0x0017`（`_held_by_push`），
+    伤害段的优先级 2 本来就压得住 bot 的冲刺（`_outranks_dash`）。
+    """
+    here = machine.battle_pos
+    if here is None:
+        return None
+    mine = [(seat_index, here[0], here[1], bool(machine.crouched),
+             _seat_shape(room, seat_index, now))]
+    group = _seat_group(room, seat_index)
+    for index, seat in enumerate(room.seats):
+        if (index == seat_index or seat is None or getattr(seat, "is_bot", False)
+                or seat.conn is None or _seat_group(room, index) == group):
+            continue
+        conn = seat.conn
+        now_at = _human_dash_now(room, index, conn, now)
+        if now_at is None:
+            continue
+        before, body, frame = now_at
+        move, action = conn.motion_move, conn.motion_action
+        first = max(0, frame if move.pushes else max(frame, move.cast_end))
+        who = chrprops.get(_seat_shape(room, index, now))
+        speed = chrprops.get(seat.character_id).speed
+        probe = DashSwing(0, conn.motion_start, action[2], move, seat.character_id)
+        for step in range(frame, move.damage_end):
+            if step > frame:
+                before = body
+                if step >= 0:
+                    dist = botmove.dash_distance(move, step, action[2], speed)
+                    if terrain is None:
+                        body = body.moved(body.x + dist, body.y, body.vx, body.vy,
+                                          on_ground=body.on_ground, pad=body.pad)
+                    else:
+                        body = botmove.frame(terrain, body, who, melee=True,
+                                             dash_step=dist).body
+            if step >= first and _dash_sweep(room, probe, (before.x, before.y),
+                                             (body.x, body.y), step, mine):
+                return index, step
+    return None
+
+
+def _human_dash_now(room, index, conn, now):
+    """这个真人**正在出、还没过伤害段**的那一下冲刺此刻在哪：`(这一帧挪之前的身体, 此刻的身体, 第几帧)`；不是就 `None`。
+
+    帧号和身体都取外推那份这一格刚走完的（`sim_dash_frame` / `sim_body`，负数 = 他那台还没开始挪）；
+    没在外推（没地形）就拿他报的位置、按到达时刻估帧号。伤害 0 的招（纯位移）、被打断的、换了局的都不算。
+    """
+    action = getattr(conn, "motion_action", None)
+    move = getattr(conn, "motion_move", None)
+    start = getattr(conn, "motion_start", None)
+    if (action is None or move is None or start is None
+            or getattr(conn, "motion_kind", None) != "dash"
+            or action[0] != relayserver.epoch_state(conn).gen
+            or not now < action[1] or move.damage <= 0):
+        return None
+    body = getattr(conn, "sim_body", None)
+    frame = getattr(conn, "sim_dash_frame", None)
+    before = getattr(conn, "sim_body_prev", None)
+    if body is None or frame is None:
+        point = _seat_body(room, index)
+        if point is None:
+            return None
+        body, before = botmove.Body(point[0], point[1]), None
+        frame = (int((now - start) * 1000.0 / BOT_DASH_FRAME_MS)
+                 - HUMAN_DASH_START_FRAMES)
+    if frame >= move.damage_end:
+        return None                               # 伤害段已经过了：剩下的是收招
+    return (body if before is None else before), body, frame
+
+
+def _yield_to_melee(room, machine, seat_index, now, terrain=None):
+    """别人先出的那一招打得到它：这一段 bot **不出手**（不冲、不开枪），先让他打完（X_Mod §113 / D79）。
+
+    和 `_held_by_push` 是同一条约束往前挪了一截：那条等推挤段碰到了才挂，这条在他冲出来、判得出「打得到」时就挂。
+    ★ 判出来一次就**锁住那一下**（`melee_yield` = 座位 + 那一发 `rpDash` 的记号），锁到它过了伤害段 / 被打断 / 换局：
+      服务端这份外推里被推的那一下还没发生（`0x0017` 在路上），他会「穿过」bot 往前冲，只看剩下几帧的话推挤段刚碰上
+      这一格就判「不碰了」、下一格 bot 又能出手 —— 原版里 bot 这时正被他推着走。锁住的开关是「那一下」这个事件，
+      解开看的是原版帧数（`DamageEndFrame`），没有新的时间阈值。换了新的一下另算、另打一行日志。
+    """
+    latch = machine.melee_yield
+    if latch is not None and _latched_dash_open(room, latch, now):
+        return True
+    threat = _melee_threat(room, machine, seat_index, now, terrain)
+    if threat is None:
+        machine.melee_yield = None
+        return False
+    index, frame = threat
+    machine.melee_yield = (index, getattr(room.seats[index].conn,
+                                          "motion_action_mark", None))
+    machine.log(f"   近身: 座位{index} 先出了近身招式、第{frame}帧起碰得到我，先让他打完"
+                f" —— 不冲、不开枪（X_Mod §113 / D79）")
+    return True
+
+
+def _latched_dash_open(room, latch, now):
+    """锁住的那一下（`_yield_to_melee`）还在：同一个人、同一发 `rpDash`、还没过伤害段。"""
+    index, mark = latch
+    seat = room.seats[index] if 0 <= index < len(room.seats) else None
+    conn = None if seat is None else seat.conn
+    if conn is None or getattr(conn, "motion_action_mark", None) != mark:
+        return False
+    return _human_dash_now(room, index, conn, now) is not None
 
 
 #: ★★ 近身招式的**优先级**（`0x503fde`，X_Mod §111）：伤害段碰到人时，受害者的这个数
@@ -3085,6 +3219,8 @@ def _hit_breaks_melee(room, seat_index, damage, flags, source, now=None):
     if isinstance(conn, BotConn) and conn.motion_constraint is not None:
         conn.motion_constraint = None
         conn.motion_anchor_pending = True
+    # 真人被 bot 的推挤段推着的话同理放开（X_Mod §115）。
+    _release_carry(room, seat_index, now)
     if int(damage) < MELEE_INTERRUPT_DAMAGE or flags & EXPLODE_FLAG_GUARD:
         return
     _cancel_melee(room, seat_index, now, source)
@@ -3786,6 +3922,10 @@ def _advance_humans(room, terrain):
                                             1.0 if frozen else scale)
             conn.sim_body_mark = mark
             conn.sim_step = 0
+            # 这一发心跳**到达**的时刻：他冲刺的帧号拿它和那一发冲刺的到达时刻比（`_human_dash_frame`）。
+            conn.sim_body_at = getattr(conn, "sync_trail_at", None)
+            conn.sim_dash_frame = _human_dash_frame(conn, 0)
+            conn.sim_body_prev = None
             conn.sim_walk_bonus = _seat_bonus(room, index,
                                               equipbonus.MOVE_SPEED)
             if not point[3]:
@@ -3802,6 +3942,10 @@ def _advance_humans(room, terrain):
         crouched = bool(getattr(conn, "sync_crouch", False))
         step = getattr(conn, "sim_step", 0) + 1
         conn.sim_step = step
+        # ★ 冲刺 / 出拳那一段不按键走路、冲刺自己挪（`ProcessDash`，X_Mod §113）。以前照心跳的键走 7 px/帧、
+        #   空中冲刺把心跳那一发 vx 118 当普通腾空速度连积 4 格 —— 约束把被他推着的 bot 推飞（22:13:57）。
+        melee, dash_step = _human_melee_step(room, index, conn, now, step)
+        conn.sim_body_prev = body              # 这一帧挪之前：他那一招的圈这一帧从这儿扫过去（`_melee_threat`）
         base_ms = _human_mover_phase(room, terrain, conn)
         view = (terrain if base_ms is None
                 else terrain.at(base_ms + step_ms * (step - 1)))
@@ -3828,7 +3972,8 @@ def _advance_humans(room, terrain):
             jump_stage=due[0] if due else None,
             want_drop=bool(keys & botsync.KEY_DOWN), keys=keys, frozen=frozen,
             speed_scale=1.0 if frozen else scale,
-            walk_bonus=getattr(conn, "sim_walk_bonus", 0), supported=supported)
+            walk_bonus=getattr(conn, "sim_walk_bonus", 0), supported=supported,
+            melee=melee, dash_step=dash_step)
         body = result.body
         for stage in due[1:]:
             body = botmove.takeoff(view, body, who, direction, scale,
@@ -3848,6 +3993,53 @@ def _advance_humans(room, terrain):
         # ★ 踩进减速胶水：胶水只对「踩上去那台机器的本机角色」生效（V0.3 §105）——
         #   外推的是他自己那台上的他，所以服务端替他那台判一次（X_Mod §97）。
         _human_on_slow_mine(room, conn, body, who, crouched, now)
+
+
+#: ★ 他那台发出 `rpDash` 的那一帧之后**第 2 帧**才挪第 0 帧（X_Mod §114）。实测：紧跟 `rpDash`（+33 ms）的那发心跳
+#: 还在原地，+63 ms 那发空中冲刺已经带着第 0 帧的 vx 118；离线重放 21:37~22:21 两局 552 个冲刺区间，外推差 > 20 px 的
+#: 按 0 / 1 / 2 / 3 帧起步分别是 132 / 95 / **35** / 89（按服务端收到的时刻算 119，不按冲刺外推 238）。
+#: 🤔 机理推断：本机那一发走回环（SendToAll 连自己），下一帧末才 `StartDash`（和 `rpJump` 回环执行同一个位置，§85），
+#: 再下一帧 `ProcessDash` 才走第 0 帧 —— 是他那台逻辑帧流水线的结构，不是拿来等事件的时间阈值（铁律 10）。
+HUMAN_DASH_START_FRAMES = 2
+
+
+def _human_dash_frame(conn, step):
+    """外推真人：从最近那发心跳（`sim_body_at`）起第 `step` 格，他的冲刺走到第几帧（从 0 数，负数 = 还没开始挪）。
+
+    心跳和那一发冲刺各自的到达时刻都在他那台的逻辑帧网格上（`note_sync_position`），差几格就是差几帧；
+    不是冲刺、或者网格没对上（没收到过心跳）返回 `None`。
+    """
+    grid = getattr(conn, "motion_grid", None)
+    at = getattr(conn, "sim_body_at", None)
+    if (grid is None or at is None
+            or getattr(conn, "motion_kind", None) != "dash"):
+        return None
+    return (step + int(round((at - grid) * 1000.0 / BOT_DASH_FRAME_MS))
+            - HUMAN_DASH_START_FRAMES)
+
+
+def _human_melee_step(room, index, conn, now, step):
+    """外推真人第 `step` 格：冲刺 / 出拳计时器在不在跑、冲刺那一支这一帧自己挪多远（`ProcessDash`，X_Mod §113）。
+
+    返回 `(melee, dash_step)`，原样喂 `botmove.frame`。冲刺的帧号见 `_human_dash_frame`（顺手记在 `sim_dash_frame`，
+    `_melee_threat` 从这一帧往后推）；被打断（`_cancel_melee` 把结束时刻收到那一刻）、换局、到 `TotalFrame` 都算停。
+    出拳不挪，计时器按到达时刻算（`jab_until`）。
+    """
+    until = getattr(conn, "jab_until", None)
+    if until is not None and now < until:
+        conn.sim_dash_frame = None
+        return True, None
+    frame = _human_dash_frame(conn, step)
+    conn.sim_dash_frame = frame
+    action = getattr(conn, "motion_action", None)
+    move = getattr(conn, "motion_move", None)
+    seat = room.seats[index]
+    if (frame is None or frame < 0 or action is None or move is None or seat is None
+            or action[0] != relayserver.epoch_state(conn).gen
+            or not now < action[1] or frame >= move.total_frame):
+        return False, None
+    return True, botmove.dash_distance(move, frame, action[2],
+                                       chrprops.get(seat.character_id).speed)
 
 
 def _seat_on_ground(room, seat_index):
@@ -7636,9 +7828,12 @@ def _decide(room, machine, seat_index, terrain, now, tick):
     return machine.intent
 
 
-def _own_step(room, machine, seat_index, terrain, now, tick):
+def _own_step(room, machine, seat_index, terrain, now, tick, pushed=False):
     """自己走**一格**（32 ms），返回和 `trail_point()` 同格式的那个八元组；
     还接管不了就返回 `None`（调用方退回回放真人轨迹）。
+
+    `pushed` = 这一格被别人的近身招式推着（`_held_by_push`）：不走、不跳、不按 ↓、不快跑、蹲不蹲也不改，
+    只让推把它挪走（X_Mod §113 / D79）。
 
     接管不了的情形只剩一种，退回 D16 那条老路：**没有地形数据**
     （这张图没提取到）—— 没有地面就没法自己走。
@@ -7691,7 +7886,19 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
     #    真人这时候也动不了。心跳照发（站着的姿势），只是不迈腿；被顶飞的话
     #    下面照样把它推出去（`direction` 在空中本来就不起作用，§93）。
     #    ★ 这一条**逐格**问：它是「到点没到点」的事实，不是 15 Hz 的决策。
-    if _may_walk(machine, now):
+    # ★★ 被别人的近身招式推着的这一段**不自己挪**（X_Mod §113 / D79）：推是单边的（`0x50e654` 只管别落到
+    #   出招者身后），它往推的方向一跑就出了圈 —— 22:17:01 那下 bot 被推上 60 ms 就转「拉开距离」按右键跑，
+    #   真人第 17 帧的伤害段碰不到它。原版被推的人输入不锁，可真人正在播受击动作、根本来不及；这是 bot 自己给
+    #   自己上的约束，和 `_held_by_push` 不出手是同一条。
+    # ★★ 它自己那一下冲刺在跑（X_Mod §115）：`ProcessDash` 返回真 ⇒ 这一格不按键走路、总闸关着（不跳、不按 ↓、
+    #   不快跑、蹲不改），身体照原版挪第 `dash_frame` 帧。第 0 帧 `_try_dash` 当场走过了；招被打断就不挪了。
+    swing = machine.dash_swing
+    dash_frame = None
+    if swing is not None and swing.lunge:
+        dash_frame = swing.frame_at(now)
+        if not 0 < dash_frame < swing.move.total_frame:
+            dash_frame = None
+    if _may_walk(machine, now) and not pushed and dash_frame is None:
         direction, want_jump, want_drop, fast_run = (
             machine.intent or (0, False, False, False))
     else:
@@ -7701,9 +7908,12 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
     #   `move_down` 是怎么传的，它就怎么传。反推位移会说谎 —— 一发心跳
     #   盖 4 格，位移反推只看得见最后那一格。
     machine.press_dir = int(direction)
-    crouched = bool(machine.dodge_crouch)
+    crouched = bool(machine.crouched if (pushed or dash_frame is not None)
+                    else machine.dodge_crouch)
     speed_scale = _speed_scale(machine, now)
     before = machine.body
+    if dash_frame is not None:
+        swing.origins[dash_frame] = (before.x, before.y)     # 这一帧的伤害圈从这儿扫（`_advance_dash`）
     # ★★★ **第二段跳在物理这一层按**（V0.3 §151），和 ↓ 的锁存同一个道理。
     #   它不是「这一格想干什么」，是**这一段飞行**起跳时就欠下的一个动作：
     #   谁规划了这一跳（A\* 的 `Step.double` / 兜底那条），谁就把旗子挂上，
@@ -7714,8 +7924,8 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
     #     ② 飞到一半命中 `_move_intent()` 的任何一条早退分支（躲子弹 /
     #        打得到就站住 / 闯关那几条）就**再也没人按了** ——
     #        一段跳掉进岩浆。旗子保住了也没用，得有人真按下去。
-    if (not before.on_ground and machine.nav_double_jump
-            and botmove.at_apex(before)):
+    if (not before.on_ground and machine.nav_double_jump and not pushed
+            and dash_frame is None and botmove.at_apex(before)):
         want_jump = True
     # ★★ 本人那台的一帧（X_Mod §105）：走路 → 物理 → 弹跳台 → 空中操控 / ↓ → 起跳。
     #   冻住（`_speed_scale` 给 0）= 那台整段不读键（`0x515639`）：不走、不跳、空中操控原样。
@@ -7723,7 +7933,9 @@ def _own_step(room, machine, seat_index, terrain, now, tick):
     result = botmove.frame(
         terrain, before, who, direction=direction, fast_run=fast_run,
         crouched=crouched, want_jump=want_jump, want_drop=want_drop,
-        speed_scale=1.0 if frozen else speed_scale, frozen=frozen)
+        speed_scale=1.0 if frozen else speed_scale, frozen=frozen,
+        melee=dash_frame is not None,
+        dash_step=None if dash_frame is None else swing.step(dash_frame))
     machine.body = result.body
     _apply_motion_constraint(room, machine, terrain, now)
     left_ground = (before.reported_on_ground
@@ -11255,9 +11467,10 @@ class DashSwing(object):
     """
 
     __slots__ = ("handle", "born", "direction", "move", "character_id",
-                 "frames_done", "hit", "outranked")
+                 "frames_done", "hit", "outranked", "lunge", "origins",
+                 "pushes_done", "carried")
 
-    def __init__(self, handle, born, direction, move, character_id):
+    def __init__(self, handle, born, direction, move, character_id, lunge=False):
         self.handle = int(handle)
         self.born = float(born)
         #: `+1` 左右：`-1` / `+1`。伤害圈的水平偏移跟着它翻。
@@ -11270,9 +11483,51 @@ class DashSwing(object):
         self.hit = False
         #: 这一下碰到过、但对方招式优先级更高而没算的座位（只给日志去重用，X_Mod §111）。
         self.outranked = set()
+        #: ★ 服务端这份身体跟着冲出去（`ProcessDash`，X_Mod §115）：第 0 帧 `_try_dash` 当场挪、第 f 帧在
+        #:   第 f 格的 `_own_step` 挪。没地形（bot 回放真人轨迹那条老路）就不挪，伤害圈照旧在原地判。
+        self.lunge = bool(lunge)
+        #: 第 f 帧**挪之前**站在哪（`{f: (x, y)}`）：那一帧的伤害圈从这儿扫过去（`0x4814f2`）。
+        self.origins = {}
+        #: 推挤段判到了第几帧（`_dash_push`）。
+        self.pushes_done = -1
+        #: 被这一下推着走的人 / 怪（`{座位号 或 ("mob", 句柄): 哪一帧贴上的}`，X_Mod §115 / D80）：
+        #:   替它发过 `0x0017` 的；这一下收招 / 被打断、那人挨打（`_release_carry`）就不推了。
+        self.carried = {}
 
     def frame_at(self, now):
-        return int((now - self.born) * 1000.0 / BOT_DASH_FRAME_MS)
+        # 房间那一格的时刻是 `t0 + k × 32 ms` 的浮点数，两格相减常差一个 ulp（3.9999… 截成 3）—— 补一点浮点噪声再截断，
+        # 不然会有一帧判两次、下一帧跳过（跟着冲那一下就是这一帧的路程挪两次 / 漏一次）。不是时间阈值。
+        return int((now - self.born) * 1000.0 / BOT_DASH_FRAME_MS + 1e-6)
+
+    def step(self, frame):
+        """第 `frame` 帧自己挪的路程（带方向；`_dash_profile` 记好的那一份）。"""
+        steps = _dash_profile(self.move, self.character_id)[0]
+        return self.direction * steps[frame] if 0 <= frame < len(steps) else 0.0
+
+
+#: `_dash_profile` 的缓存：`(角色, 招式参数) -> (每帧朝右挪多远, 粗筛够到多远)`。都是纯函数算出来的。
+_DASH_PROFILES = {}
+
+
+def _dash_profile(move, character_id):
+    """这一招每帧自己挪多远（朝右，`botmove.dash_distance`，X_Mod §113）和 `_dash_target` 粗筛用的最远够到。
+
+    按「角色 + 招式那几格参数」记一次 —— 每格都要问好几遍，`dash_distance` 一次十几个 f32 舍入，重算不划算。
+    够到 = 整段伤害段之前挪的总路程 + 圈离身子最远的水平偏移 + 半径 + `DASH_TARGET_BODY_MARGIN`（真的上界）。
+    """
+    key = (int(character_id), tuple(sorted(move.raw.items())))
+    got = _DASH_PROFILES.get(key)
+    if got is None:
+        speed = chrprops.get(character_id).speed
+        frames = max(move.total_frame, move.damage_end)
+        steps = tuple(botmove.dash_distance(move, f, 1, speed)
+                      for f in range(frames))
+        reach = (sum(abs(s) for s in steps[:move.damage_end])
+                 + max([abs(move.offset(f)[0]) for f in range(move.damage_end)]
+                       or [0.0])
+                 + move.radius + DASH_TARGET_BODY_MARGIN)
+        got = _DASH_PROFILES[key] = (steps, reach)
+    return got
 
     def __repr__(self):
         return ("<DashSwing %d 方向%+d 第%d帧%s>"
@@ -11350,6 +11605,171 @@ def _dash_hits(room, swing, x, y, frame, bodies):
     return None
 
 
+def _dash_sweep(room, swing, start, end, frame, bodies):
+    """第 `frame` 帧那个圈从出招者站在 `start` 扫到 `end`，一路上先碰到谁：`(座位号, 部位)`；没碰到 `None`。
+
+    `0x4814f2`：伤害对象摆在出招者**这一帧挪之前**的位置 + 偏移、速度写成这一帧的路程，弹体管理器按速度扫（§114）
+    —— 第 3 式头一帧 131 px，只看落点会从人身上「跳过去」。按圈的半径一段段取点（圈半径 ≥ 1），相邻两个圈互相盖住，
+    扫过的那条带子就没有缝。`start == end` 就是原地那一个圈。
+    """
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    if not (dx or dy):
+        return _dash_hits(room, swing, start[0], start[1], frame, bodies)
+    pieces = max(1, int(math.ceil(math.hypot(dx, dy)
+                                  / max(1.0, swing.move.radius))))
+    for i in range(pieces + 1):
+        t = i / float(pieces)
+        landed = _dash_hits(room, swing, start[0] + dx * t, start[1] + dy * t,
+                            frame, bodies)
+        if landed is not None:
+            return landed
+    return None
+
+
+def _dash_here(machine, swing):
+    """bot 这一下此刻站在哪：跟着冲出去的（`swing.lunge`）是服务端这份身体，不跟着冲的就是原地（`battle_pos`）。"""
+    body = machine.body
+    if swing.lunge and body is not None:
+        return (body.x, body.y)
+    return machine.battle_pos
+
+
+def _dash_course(terrain, body, who, swing):
+    """这一下冲出去的话每一帧怎么走：逐个给 `(帧, 起点, 终点, 这一帧挪完站在哪)`，到伤害段结束为止（X_Mod §115）。
+
+    起点 = 这一帧**挪之前**的位置（伤害圈从这儿扫，`0x4814f2`），终点 = 起点 + 这一帧的路程（水平扫，§114）。
+    和真冲的时候**同一套挪法**：第 0 帧当场走（`_bot_dash_first_frame`），之后每帧一整格物理（`botmove.frame`
+    `dash_step=`，`_own_step` 里那一句）。不跟着冲（`swing.lunge` 为假：没地形）就都在原地。
+    """
+    here = (body.x, body.y)
+    for frame in range(swing.move.damage_end):
+        if not swing.lunge:
+            yield frame, here, here, here
+            continue
+        step = swing.step(frame)
+        if frame == 0:
+            body = _bot_dash_first_frame(terrain, body, swing)
+        else:
+            body = botmove.frame(terrain, body, who, melee=True,
+                                 dash_step=step).body
+        after = (body.x, body.y)
+        yield frame, here, (here[0] + step, here[1]), after
+        here = after
+
+
+def _bot_dash_first_frame(terrain, body, swing):
+    """bot 冲刺的第 0 帧：发 `rpDash` 的那一格当场走完（X_Mod §115）。
+
+    收方一收到就 `StartDash`、这一帧就挪第 0 帧（V0.3bot §193：「一收到 Dash 就 +52.8 px」）；服务端这一格的
+    物理已经走过了，只补走路那一段（`0x50d9a7`，上下限 10 / 0，冲刺那一段的口径），落没落地交给下一格的物理。
+    """
+    return botmove.walk_by(terrain, body, swing.step(0), botmove.DASH_UP_MAX,
+                           botmove.DASH_DOWN_MAX)
+
+
+#: ★ 挨打之后多少帧里不接受新的推（`[+0x17c]`：`OnHit` 解约束时起的计时器，X_Mod §111）。原版数据，不是我们挑的数。
+PUSH_BLOCK_FRAMES = 10
+
+
+def _carrier_of(room, key):
+    """谁的推挤段正推着它（`key` = 座位号 或 `("mob", 句柄)`）：`(bot 连接, 那一下)`；没人推就 `None`。"""
+    for index in room.bot_seats():
+        seat = room.seats[index]
+        swing = getattr(None if seat is None else seat.conn, "dash_swing", None)
+        if swing is not None and key in swing.carried:
+            return seat.conn, swing
+    return None
+
+
+def _may_push(room, key, now):
+    """bot 的推挤段碰到它时推不推得动（`0x481d3c`：对方 `[+0x164]==0` 且 `[+0x17c]` 没在跑，X_Mod §115）。
+
+    * 真人 / 怪：没被别的 bot 推着；真人挨打后那 10 格过了（`push_block_until`，`_release_carry` 记的）；
+    * bot：不推 —— bot 的运动服务端说了算、收方 BSM1 也不给 bot 挂约束（`bm_bind_detour`），bot 推 bot 没接（D80）。
+    ★ 真人正被**别的真人**推着、刚挨了别的真人一下，服务端看不见（那是他们两台之间的事），不管。
+    """
+    if _carrier_of(room, key) is not None:
+        return False
+    if isinstance(key, tuple):
+        return True
+    seat = room.seats[key] if 0 <= key < len(room.seats) else None
+    conn = None if seat is None else seat.conn
+    if conn is None or isinstance(conn, BotConn):
+        return False
+    until = getattr(conn, "push_block_until", None)
+    return until is None or now >= until
+
+
+def _dash_push(room, machine, swing, start, end, frame, bodies, now):
+    """推挤段第 `frame` 帧的圈从 `start` 扫到 `end`：碰到的人 / 怪替 bot 发 `0x0017`、记进 `swing.carried`（X_Mod §115 / D80）。
+
+    原版出招者本机贴着就每帧重发（它自己那份常不挂约束），收方挂上一次就够 —— 服务端对每个人只发一发（可靠有序）。
+    """
+    for body in bodies:
+        key = body[0]
+        if key in swing.carried or not _may_push(room, key, now):
+            continue
+        if _dash_sweep(room, swing, start, end, frame, [body]) is None:
+            continue
+        swing.carried[key] = frame
+        victim = (key[1] if isinstance(key, tuple)
+                  else botsync.character_handle(key))
+        _emit(machine, machine.sync.event(
+            botsync.OP_CONSTRAIN,
+            botsync.constrain_body(victim,
+                                   botsync.character_handle(machine.my_seat))))
+        who = f"怪 {key[1]}" if isinstance(key, tuple) else f"座位{key}"
+        machine.log(f"   近身: 推挤段第{frame}帧贴住了{who}，替它发 `0x0017` 推着走"
+                    f"（句柄 {swing.handle}，X_Mod §115 / D80）")
+
+
+def _release_carry(room, key, now):
+    """它挨了一下：谁的推挤段推着它都放开（`OnHit` `0x4ff47c` 解约束），真人 10 格内不再接受新的推（`[+0x17c]`）。"""
+    got = _carrier_of(room, key)
+    if got is not None:
+        got[1].carried.pop(key, None)
+    if isinstance(key, tuple):
+        return
+    seat = room.seats[key] if 0 <= key < len(room.seats) else None
+    conn = None if seat is None else seat.conn
+    if conn is not None and not isinstance(conn, BotConn):
+        conn.push_block_until = (now + PUSH_BLOCK_FRAMES * BOT_DASH_FRAME_MS
+                                 / 1000.0)
+
+
+def _carry_victims(room, machine, terrain):
+    """被这个 bot 的推挤段贴住的人 / 怪，每格推到它朝向那一侧（`0x50e654` = `botmotion.constrained_x`，单边，X_Mod §115）。
+
+    真人推的是服务端外推的那份身体（他自己那台也挂着同一个约束、照它的位置推，下一发心跳报的就是被推过的）；
+    怪推的是怪物表里那一格（控制者那台也在推，下一发 `setState` 报来的位置照样盖回来）。躺下的、表里没了的放掉。
+    """
+    swing = machine.dash_swing
+    if swing is None or not swing.carried or machine.body is None:
+        return
+    owner_x = machine.body.x
+    quest = getattr(room, "quest", None)
+    mobs = getattr(quest, "mobs", None) or {}
+    for key in list(swing.carried):
+        if isinstance(key, tuple):
+            row = mobs.get(key[1])
+            if row is None:
+                swing.carried.pop(key, None)
+            else:
+                row[0] = botmotion.constrained_x(row[0], owner_x, swing.direction)
+            continue
+        seat = room.seats[key] if 0 <= key < len(room.seats) else None
+        conn = None if seat is None else seat.conn
+        if conn is None or _lying_dead(room, key):
+            swing.carried.pop(key, None)
+            continue
+        body = getattr(conn, "sim_body", None)
+        if body is None or terrain is None:
+            continue
+        span = botmotion.constrained_x(body.x, owner_x, swing.direction) - body.x
+        if span:
+            conn.sim_body = botmove.walk_by(terrain, body, span)
+
+
 def _outranks_dash(room, machine, swing, seat_index, at):
     """`seat_index` 在 `at` 那一刻的招式优先级**比冲刺高**吗 —— 高就碰到也不算（`0x481cb8 jg`，X_Mod §111）。
 
@@ -11385,23 +11805,42 @@ def _advance_dash(room, machine, now):
     if not swing.hit:
         # ★ 和 `_dash_target()` 用同一份名单（§129）：闯关房里那份只有怪。
         bodies = _melee_bodies(room, machine, machine.my_seat)
-        x, y = machine.battle_pos
+        # ★ 跟着冲出去的那一下（X_Mod §115）：这一格开头它站在第 `frame` 帧**挪之前**的地方（上一帧挪完、这一帧
+        #   `_own_step` 还没挪），伤害圈从这儿扫过这一帧的路程（`0x4814f2`，§114）；补判前几帧就用当时记下的位置。
+        here = _dash_here(machine, swing)
+        # ★★ 推挤段（帧 < `CastEndFrame`、没写 `DontPush`）碰到人：替它发 `0x0017`，把那人推着带走（`0x481d3c`，
+        #   X_Mod §115 / D80）—— 原版出招者本机发，bot 没有本机。只在跟着冲的那一下做（推是跟着它的身体走的）。
+        if swing.lunge and swing.move.pushes:
+            for step in range(swing.pushes_done + 1,
+                              min(frame + 1, swing.move.cast_end)):
+                swing.pushes_done = step
+                start = swing.origins.get(step, here)
+                _dash_push(room, machine, swing, start,
+                           (start[0] + swing.step(step), start[1]), step,
+                           bodies, now)
         first = max(swing.frames_done + 1, swing.move.cast_end)
         # ★ 伤害段 `CastEndFrame` ≤ 帧 < `DamageEndFrame`（`0x481bba jge`，上界不含，X_Mod §111）——
         #   和 `Move.frames()` 同一个口径。以前含上界，比原版多判一帧。
+        #   被它推着的人上一格已经跟到它身前了（`_carry_victims`），名单里的位置就是被推之后的。
         for step in range(first, min(frame + 1, swing.move.damage_end)):
             swing.frames_done = step
             # ★★ 伤害段碰到人先比**招式优先级**（`0x481cb8`，X_Mod §111）：对方正在出拳的
             #   伤害段（2）比冲刺（1）高 ⇒ 这一帧碰到他也不算，下一帧再看。
             at = swing.born + step * BOT_DASH_FRAME_MS / 1000.0
-            landed = _dash_hits(room, swing, x, y, step,
-                                [b for b in bodies
-                                 if not _outranks_dash(room, machine, swing,
-                                                       b[0], at)])
+            start = swing.origins.get(step, here)
+            end = ((start[0] + swing.step(step), start[1]) if swing.lunge
+                   else start)
+            landed = _dash_sweep(room, swing, start, end, step,
+                                 [b for b in bodies
+                                  if not _outranks_dash(room, machine, swing,
+                                                        b[0], at)])
             if landed is None:
                 continue
+            x, y = start
             seat_index, region = landed
             swing.hit = True
+            # ★ 挨打那一下原版就解约束（`0x4ff47c` / `0x50f954`），10 格内不再接受新的推（X_Mod §115）。
+            _release_carry(room, seat_index, now)
             offset = swing.move.offset(step)
             # ★ 近身伤害也走同一条路（§87）：`0x481dfd` 那个 `[vft+0x128]`
             #   进门第一件事就是 `call 0x4806bf`。
@@ -11485,30 +11924,63 @@ def _melee_bodies(room, machine, seat_index, targeting=False):
     return out + mobs
 
 
-def _dash_target(room, machine, seat_index, move):
-    """够得着的敌人（最近的那个）；没有返回 `None`。
+#: `_dash_target` 粗筛用的「人 / 怪身上的圈离落脚点水平最远多少」：怪一个圈半径 `MOB_HIT_RADIUS`（40），
+#: 人三个圈摞在同一条竖线上（半径 ≤ 20），出拳那一段身前多一个圈（圆心 2.2 × r身、半径 2 × r身，r身 ≤ 18 ⇒ 76）。
+#: 只是省算的上界，放宽不改结果。
+DASH_TARGET_BODY_MARGIN = 80.0
+
+
+def _dash_target(room, machine, seat_index, move, terrain=None, now=None):
+    """够得着的敌人（最近的那个）：`(座位号, 方向)`；没有返回 `None`。
 
     判据就是这一招**自己**的伤害圈：任何一个伤害帧的圈能盖住对方，
     就算够得着。够不着一步都不冲 —— 原版真人也不会对着空气双击。
+    ★ 冲出去是要挪的、推挤段碰到的人是被**推着带走**的（X_Mod §115 / D80）：第 0 式角色 0 四帧挪 126 px、伤害段在
+      第 6~10 帧 —— 圈在它**冲到的地方**；贴脸的人推挤段一碰就被推到它身前（`0x50e654`），伤害段照样打得到。
+      按真冲时同一套挪法、同一套推法推一遍（`_dash_course` + `constrained_x`）再判。
     """
     if machine.battle_pos is None:
         return None
-    x, y = machine.battle_pos
     bodies = _melee_bodies(room, machine, seat_index, targeting=True)
     if not bodies:
         return None
+    now = _now() if now is None else now
+    lunge = terrain is not None and machine.body is not None
+    body = machine.body if lunge else botmove.Body(*machine.battle_pos)
+    who = chrprops.get(_seat_shape(room, seat_index))
+    # 省算的粗筛：这一下连冲带圈最远够到的水平距离（`_dash_profile`）—— 真的上界，筛掉的人哪一帧都碰不到，不改结果。
+    reach = _dash_profile(move, machine.character_id)[1]
     best = None
     for direction in (botsync.DASH_RIGHT, botsync.DASH_LEFT):
-        probe = DashSwing(0, 0.0, direction, move, machine.character_id)
-        for frame in move.frames():
-            landed = _dash_hits(room, probe, x, y, frame, bodies)
-            if landed is None:
-                continue
-            target = [b for b in bodies if b[0] == landed[0]][0]
-            span = abs(target[1] - x)
-            if best is None or span < best[0]:
-                best = (span, landed[0], direction)
-            break
+        # 只朝人冲：人在哪一边就往哪边冲（角色 2 第 0 式那种伤害圈起手在身后（−66, −71）的，推挤段扫得到背后的人、
+        # 会把他「拽」到身前 —— 碰巧撞上照原版推，挑目标时不拿它当手段）。
+        spots = dict((b[0], b) for b in bodies
+                     if 0 <= (b[1] - body.x) * direction <= reach)
+        if not spots:
+            continue
+        probe = DashSwing(0, 0.0, direction, move, machine.character_id,
+                          lunge=lunge)
+        carried = set()
+        for frame, start, end, after in _dash_course(terrain, body, who, probe):
+            if frame < move.cast_end:
+                if lunge and move.pushes:
+                    for key, spot in spots.items():
+                        if (key not in carried and _may_push(room, key, now)
+                                and _dash_sweep(room, probe, start, end, frame,
+                                                [spot]) is not None):
+                            carried.add(key)
+            else:
+                landed = _dash_sweep(room, probe, start, end, frame,
+                                     list(spots.values()))
+                if landed is not None:
+                    span = abs(spots[landed[0]][1] - body.x)
+                    if best is None or span < best[0]:
+                        best = (span, landed[0], direction)
+                    break
+            for key in carried:
+                spot = spots[key]
+                spots[key] = (spot[0], botmotion.constrained_x(
+                    spot[1], after[0], direction)) + tuple(spot[2:])
     return None if best is None else (best[1], best[2])
 
 
@@ -11540,15 +12012,17 @@ def _try_dash(room, machine, seat_index, now, on_ground):
         return False
     if machine.stamina is None or machine.stamina < move.sp_cost:
         return False
-    target = _dash_target(room, machine, seat_index, move)
+    terrain = _terrain(room)
+    target = _dash_target(room, machine, seat_index, move, terrain, now)
     if target is None:
         return False
     target_seat, direction = target
     x, y = machine.battle_pos
     packet, handle = machine.sync.dash(direction, BOT_DASH_INDEX, x, y)
     machine.stamina -= move.sp_cost
-    machine.dash_swing = DashSwing(handle, now, direction, move,
-                                   machine.character_id)
+    swing = machine.dash_swing = DashSwing(
+        handle, now, direction, move, machine.character_id,
+        lunge=terrain is not None and machine.body is not None)
     who = (f"怪 {target_seat[1]}" if isinstance(target_seat, tuple)
            else f"座位{target_seat}")
     machine.log(f"   近身: 冲刺 朝{'右' if direction > 0 else '左'} "
@@ -11556,6 +12030,15 @@ def _try_dash(room, machine, seat_index, now, on_ground):
                 f"体力 {machine.stamina:.0f}/{_stamina_cap(machine):.0f}"
                 f" 句柄 {handle}（★ 收方也吃掉一个弹体句柄，§64）")
     _emit(machine, packet)
+    if swing.lunge:
+        # ★ 服务端这份身体跟着冲出去（X_Mod §115，补 V0.3bot §193）：以前原地不动，收方那份照动作冲出去
+        #   60~100 px 又被心跳拽回来，伤害圈也按原地判。第 0 帧收方一收到就挪，这一格当场走完；之后每格一帧
+        #   （`_own_step`）。补一发锚：挪了一大步，别等 4 格一发的节拍。
+        body = machine.body
+        swing.origins[0] = (body.x, body.y)
+        body = machine.body = _bot_dash_first_frame(terrain, body, swing)
+        machine.battle_pos = (body.x, body.y)
+        machine.motion_anchor_pending = True
     return True
 
 
@@ -11965,6 +12448,9 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
                 and (tick + seat_index) % BOT_DECISION_TICKS == 0)):
         _decide(room, machine, seat_index, terrain, now, tick)
 
+    # ★★ 被别人的近身招式推着（`0x0017`）的这一段：不出手（下面开火那段，D75）、也不自己挪（`_own_step`，
+    #   X_Mod §113 / D79）。走位之前先问一次，这一格两处用同一个答案。
+    pushed = _held_by_push(room, machine, now)
     if machine.holding and machine.battle_pos is not None:
         # ★ `/hold`：站在原地不动（用户 2026-08-26 要的测试手段）。
         #   **照常发心跳** —— 真人站着不动时也一直在发，停发反而是异常状态。
@@ -11980,8 +12466,12 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         # ★★ **自己走位**（M5 / §71）：对战房里 bot 按地形自己挪，
         #   拿不到地形时 `_own_step()` 会返回 None —— 那就退回 D16 那条老路，
         #   回放真人的轨迹。
-        point = _own_step(room, machine, seat_index, terrain, now, tick)
+        point = _own_step(room, machine, seat_index, terrain, now, tick,
+                          pushed=pushed)
         from_trail = point is None
+        if not from_trail:
+            # ★ 它的推挤段贴住的人 / 怪，推到它这一格挪完之后的身前（`0x50e654`，X_Mod §115 / D80）。
+            _carry_victims(room, machine, terrain)
         if from_trail:
             machine.move_down = False
             rank = room.bot_seats().index(seat_index) + 1
@@ -12169,7 +12659,10 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
             _diag_why_not_firing(room, machine, seat_index, weapon, target, now)
         # ★★ 被别人的近身招式推着（`0x0017`）的这一段**不出手**：冲刺、开枪都不发
         #   （X_Mod §111 / D75）—— 不然 bot 8 ms 就反手，把真人先出的那一招抢断。
-        held = acting and _held_by_push(room, machine, now)
+        #   ★ 往前挪一截（X_Mod §113 / D79）：他先冲出来、那一招接下来碰得到 bot，推挤段还没碰到时
+        #     也先让他 —— 22:16:56 那下 bot 比服务端收到 `0x0017` 早 4 ms 冲了出去。
+        held = acting and (pushed or _yield_to_melee(room, machine, seat_index,
+                                                     now, terrain))
         # ★★ **近身冲刺攻击优先于开枪**（§64）：原版这一下会占住整个角色
         #   （`TotalFrame` 那么多帧），真人也开不了枪。够得着就冲，够不着才打枪。
         dashing = (acting and not held

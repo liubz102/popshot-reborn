@@ -161,6 +161,71 @@ class FlatGroundTests(unittest.TestCase):
         self.assertEqual((33.0, 99.0), (step.x, step.y))
 
 
+class DashMoveTests(unittest.TestCase):
+    """冲刺攻击自己挪（`ProcessDash` `0x5077c6`，X_Mod §113）：A(f) = powf(f/MF, 1/γ)·MF·Move·0.5，每帧挪 ΔA × 方向 × ChrSpeed。
+
+    踩地交给 `0x50d9a7`（上下限 10 / 0），腾空改写速度（vx = 路程 × 0.9，vy × 0.8333）；这一段不按键走路、没有空中操控。
+    """
+
+    def setUp(self):
+        self.who = chrprops.get(0)
+        self.move = self.who.dash(3)            # 角色 0 第 3 式：MF 13、Move 6、γ 3.5
+        self.speed = self.who.speed             # 7
+
+    def steps(self, direction=1, count=20):
+        return [botmove.dash_distance(self.move, f, direction, self.speed)
+                for f in range(count)]
+
+    def test_the_whole_dash_is_mf_times_move_times_half_times_speed(self):
+        steps = self.steps()
+        self.assertAlmostEqual(13 * 6.0 * 0.5 * 7.0, sum(steps), places=2)
+        self.assertEqual([0.0] * 7, steps[13:], "MoveFrame 之后不挪")
+        self.assertTrue(all(a > b for a, b in zip(steps[:12], steps[1:13])),
+                        "γ > 1：前冲后收")
+
+    def test_the_first_frame_is_the_118_seen_in_the_heartbeat(self):
+        """22:13:57.984 那一发心跳：空中冲刺刚走完第 0 帧，vx 报 118 = trunc(131.19 × 0.9)。"""
+        first = self.steps()[0]
+        self.assertAlmostEqual(131.19, first, places=2)
+        self.assertEqual(118, int(f32(first * botmove.DASH_AIR_VX_RATIO)))
+
+    def test_left_is_the_mirror_image(self):
+        self.assertEqual([-s for s in self.steps()], self.steps(-1))
+
+    def test_on_the_ground_it_walks_the_step_whatever_key_is_held(self):
+        terrain = flat(width=600, floor=200, height=240)
+        body = botmove.Body(100.0, 199.0)
+        first = self.steps()[0]
+        got = botmove.frame(terrain, body, self.who, direction=-1, fast_run=True,
+                            melee=True, dash_step=first).body
+        self.assertEqual((231.0, 199.0), (got.x, got.y))
+        self.assertTrue(got.on_ground)
+        self.assertAlmostEqual(first - 131.0, got.rest, places=4)
+
+    def test_in_the_air_it_sets_the_speed_and_hovers(self):
+        """整个 `TotalFrame` 每帧 vy × 0.8333 ⇒ 稳在 1.2 / (1 − 0.8333) ≈ 7.2（22:14:33 心跳一路报 v=(0, 7)）。"""
+        terrain = flat(width=1200, floor=1100, height=1140)
+        body = botmove.Body(100.0, 300.0, 0.0, 0.0, on_ground=False)
+        got = botmove.frame(terrain, body, self.who, melee=True,
+                            dash_step=self.steps()[0]).body
+        self.assertAlmostEqual(f32(131.19 * 0.9), got.vx, places=1)
+        for f in range(1, self.move.total_frame):
+            got = botmove.frame(terrain, got, self.who, direction=1, melee=True,
+                                dash_step=botmove.dash_distance(
+                                    self.move, f, 1, self.speed)).body
+        self.assertFalse(got.on_ground)
+        self.assertEqual(0.0, got.vx, "MoveFrame 之后水平速度被写成 0")
+        self.assertEqual(0.0, got.ctl, "冲刺中总闸关着，按着键也没有空中操控")
+        self.assertAlmostEqual(7.2, got.vy, delta=0.1)
+        self.assertAlmostEqual(100.0 + 0.9 * 273.0, got.x, delta=1.0)
+
+    def test_a_jab_does_not_walk_even_with_a_key_held(self):
+        terrain = flat(width=600, floor=200, height=240)
+        body = botmove.Body(100.0, 199.0)
+        got = botmove.frame(terrain, body, self.who, direction=1, melee=True).body
+        self.assertEqual(body, got)
+
+
 class ClientWalkTests(unittest.TestCase):
     """`0x50d9a7`：1 px 一列、上坎 ≤ 20、下坎 ≤ 10、每步花 √(1+dy²)、越过 0 就不走。"""
 

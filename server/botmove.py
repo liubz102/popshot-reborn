@@ -118,6 +118,14 @@ WALK_DOWN_MAX = 10
 DASH_UP_MAX = 10
 DASH_DOWN_MAX = 0
 
+#: ★ 冲刺攻击自己的位移（`ProcessDash` `0x5077c6`，X_Mod §113）：`A(f) = powf(f/MF, 1/γ) × MF × Move × 0.5`，
+#: 这一帧的路程 = (A(f+1) − A(f)) × 方向 × `ChrSpeed`。`0.5` 是 `[0x69371c]`。
+DASH_MOVE_SCALE = _f32(0.5)
+#: 腾空时不走 `0x50d9a7`，改写速度：`[+0x120]` = 路程 × 0.9f（`[0x6938a4]`）、`[+0x124]` ×= 0.8333333f
+#: （`[0x693c3c]`，冲刺那 `TotalFrame` 帧每帧都乘 ⇒ 空中冲刺「悬停」，vy 稳在 1.2 / (1 − 0.8333) ≈ 7.2）。
+DASH_AIR_VX_RATIO = _f32(0.9)
+DASH_AIR_VY_KEEP = _f32(0.8333333134651184)
+
 #: 走出崖边那一步踩地时顺手写的 `vy = 8g`（`0x50dac9`）—— 紧接着 `0x50d404` 见「踩地且 vy ≥ 0」
 #: 就清零，所以只会顶掉弹跳台刚写、还没挪的那一份速度。
 WALK_OFF_VY = _f32(8.0 * G32)
@@ -381,6 +389,34 @@ def walk_by(terrain, body, dist, up=WALK_UP_MAX, down=WALK_DOWN_MAX):
                                     up, down)
     return body.moved(x, y, body.vx, body.vy, on_ground=body.on_ground,
                       rest=rest, pad=body.pad)
+
+
+def dash_distance(move, frame, direction, speed):
+    """冲刺攻击第 `frame` 帧（冲刺计时器 `[+0x5c0]` 的已过帧数，从 0 数）自己挪的路程（`ProcessDash` `0x5077c6`，X_Mod §113）。
+
+        A(f) = powf(f / MF, 1 / γ) × MF × Move × 0.5        （`0x5ce3a0` → `0x49da65` = (float)pow(double, double)）
+        路程 = (A(f+1) − A(f)) × 方向 × ChrSpeed             （f ≥ MF ⇒ 0）
+
+    `move` 是 `chrprops.Move`（`DashNN-MoveFrame` / `-Move` / `-MoveGamma`）；`speed` 是角色表的 `ChrSpeed`
+    （`[props+0x2c]` —— `vft+0x128` 的底数，**不乘**状态倍率、装备）。γ 越大越「前冲后收」：角色 0 第 3 式
+    （MF 13、Move 6、γ 3.5）头一帧就是 131 px，13 帧共 273 px。怎么用这个路程见 `frame(dash_step=…)`。
+    """
+    total = int(move.move_frame)
+    frame = int(frame)
+    if frame < 0 or frame >= total:
+        return 0.0
+    whole = _f32(total)
+    gamma = _f32(move.move_gamma)
+    inv = _f32(1.0 / gamma) if gamma else math.inf
+    force = _f32(move.move_force)
+
+    def at(f):
+        t = _f32(f / whole)
+        return _f32(_f32(_f32(_f32(math.pow(t, inv)) * whole) * force)
+                    * DASH_MOVE_SCALE)
+
+    return _f32(_f32(_f32(at(frame + 1) - at(frame)) * direction)
+                * _f32(speed))
 
 
 # ---------------------------------------------------------------------------
@@ -746,8 +782,8 @@ class Frame(object):
 
 def frame(terrain, body, character, direction=0, fast_run=False,
           crouched=False, want_jump=False, want_drop=False, speed_scale=1.0,
-          keys=None, frozen=False, walk_bonus=0, dashing=False, jump_stage=None,
-          supported=None):
+          keys=None, frozen=False, walk_bonus=0, jump_stage=None,
+          supported=None, melee=False, dash_step=None):
     """本人那台客户端的**一个逻辑帧**（32 ms），返回 `Frame`。
 
     * `direction`：−1 左 / 0 / +1 右（两键都按时**左键优先**，`0x5073c2`，调用方先定好）；
@@ -755,7 +791,11 @@ def frame(terrain, body, character, direction=0, fast_run=False,
     * `want_drop`：按着 ↓（`[+0x518] = 8`，下一帧起白线不挡）；
     * `keys`：心跳按键掩码，只给弹跳台那道门用；不给就按 `direction` / `want_drop` 拼；
     * `frozen`：冻住（属性 0xc，`0x515639` 跳过整段读键）—— 不走、不跳、不按 ↓、空中操控原样；
-    * `walk_bonus`：装备走速（百分比）；`dashing`：冲刺攻击计时器在跑（走路上下限换成 10 / 0）；
+    * `walk_bonus`：装备走速（百分比）；
+    * `melee`：冲刺 / 出拳计时器在跑（`ProcessDash` 返回真，X_Mod §113）—— 这一帧**不按键走路**（`0x507116`
+      跳过整段），本人输入只剩「踩地清操控」（总闸 `0x515090` 关着：没有空中操控、按不下 ↓）；
+    * `dash_step`：冲刺那一支这一帧自己挪的路程（`dash_distance()`，出拳那一支给 `None`）：踩地交给
+      `0x50d9a7`（上下限换成 10 / 0），腾空改写速度 vx = 路程 × 0.9、vy × 0.8333，之后照常物理；
     * `supported(x, y, walked)`：踩地的人**脚下问出来是空的**（又没在按 ↓ 穿白线）时再问一句「他自己
       那台上他还踩着吗」—— 只给外推真人用（服务端的鱼相位 / 地形和他那台差一点，见
       `bot._advance_humans`）；`walked` = 这一帧走路挪没挪 x。
@@ -785,13 +825,23 @@ def frame(terrain, body, character, direction=0, fast_run=False,
     if drop > 0:
         drop -= 1
     holds = drop <= 0
-    # ② 走路（`0x506fed`：踩地才走）
-    if grounded and (direction or rest <= -1.0 or rest >= 1.0):
+    # ② 走路（`0x506fed`：踩地才走）。冲刺 / 出拳计时器在跑时 `ProcessDash` 返回真 ⇒ 整段跳过（`0x507116`），
+    #    冲刺那一支自己挪（`0x5077c6`，X_Mod §113）：踩地交给 `0x50d9a7`（上下限 10 / 0，路程为 0 也调），
+    #    腾空不走路、改写速度 —— vx = 路程 × 0.9f，vy × 0.8333333f。出拳那一支不挪。
+    if melee:
+        if dash_step is not None:
+            if grounded:
+                x, y, rest, off = _client_walk(terrain, x, y, rest, dash_step,
+                                               DASH_UP_MAX, DASH_DOWN_MAX)
+                if off:
+                    vy = WALK_OFF_VY
+            else:
+                vx = _f32(dash_step * DASH_AIR_VX_RATIO)
+                vy = _f32(vy * DASH_AIR_VY_KEEP)
+    elif grounded and (direction or rest <= -1.0 or rest >= 1.0):
         dist = (walk_distance(character, direction, fast_run, crouched,
                               speed_scale, walk_bonus) if direction else 0.0)
-        up, down = ((DASH_UP_MAX, DASH_DOWN_MAX) if dashing
-                    else (WALK_UP_MAX, WALK_DOWN_MAX))
-        x, y, rest, off = _client_walk(terrain, x, y, rest, dist, up, down)
+        x, y, rest, off = _client_walk(terrain, x, y, rest, dist)
         if off:
             vy = WALK_OFF_VY
     # ③ 物理（`0x507685` ~ `0x50778d`）
@@ -835,11 +885,11 @@ def frame(terrain, body, character, direction=0, fast_run=False,
             vx, vy = got
             pad = padded = True
             ctl, cstep = 0.0, AIR_CONTROL_STEP
-    # ⑤ 本人输入（`0x51558f`）
+    # ⑤ 本人输入（`0x51558f`）。踩地清操控排在总闸 `0x515090` 前面；冲刺 / 出拳时总闸关着，后面整段不走。
     if not frozen:
         if grounded:
             ctl = 0.0
-        else:
+        elif not melee:
             if direction:
                 if not lock and terrain.cell(int(x) + direction,
                                              int(y)) in (0, 1):
@@ -854,7 +904,7 @@ def frame(terrain, body, character, direction=0, fast_run=False,
                     ctl = -limit
                 elif ctl > limit:
                     ctl = limit
-        if want_drop:
+        if want_drop and not melee:
             drop = DROP_HOLD_FRAMES
     current = Body(x, y, vx, vy, on_ground=grounded and not pad,
                    air_jumped=air_jumped, ctl=ctl, ctl_step=cstep,

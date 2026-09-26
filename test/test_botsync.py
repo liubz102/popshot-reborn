@@ -10277,6 +10277,8 @@ class BotQuestCombatTests(TerrainMixin, BotFrameRoom):
 
     def test_the_explosion_names_the_mob_handle_so_the_damage_lands(self):
         """★★ 收方按**句柄**扣血（§42）—— 填错就是「子弹飞过去不掉血」。"""
+        # 这一条验开枪：冲刺跟着冲出去 225 px 之后，280 px 外的怪也够得着（X_Mod §115），会先冲不开枪。
+        self.bot_conn.melee = False
         self.spot_mob()
         self.clear()
         self.bot_conn.next_fire_at = 0.0

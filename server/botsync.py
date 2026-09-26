@@ -107,6 +107,19 @@ OP_JUMP = 0x0006
 #: 消耗体力（`ChrProps.ini` 的 `DashNN-SpCost`），伤害由射手那台机器自己判。
 OP_DASH = 0x0007
 
+#: `0x0017` —— **近身招式推挤段贴住了人**（body 8 字节，X_Mod §111 / §115）：受约束对象句柄 + 出招者句柄。
+#: 原版只有出招者本机发（`0x481d60 → 0x4935b7`）；bot 没有本机，服务端替它发（D80）。收方每帧把受约束的
+#: 人推到出招者朝向那一侧（`0x50e654`），出招者那一招收了 / 他挨打就解。
+OP_CONSTRAIN = 0x0017
+
+_CONSTRAIN = struct.Struct("<ii")
+
+
+def constrain_body(victim_handle, owner_handle):
+    """`0x0017` 的 8 字节：`+0` 受约束对象句柄（真人 / 怪），`+4` 出招者句柄（`0x491cc6` 两发读整型）。"""
+    return _CONSTRAIN.pack(int(victim_handle), int(owner_handle))
+
+
 #: `0x000b rpCrouch` —— **蹲下 / 起立**（body 2 字节，§41）。
 #:
 #: ★ 蹲这件事**心跳里一个位都没有**：只有按下和松开那两下各发一发这个

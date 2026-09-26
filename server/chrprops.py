@@ -215,6 +215,28 @@ class Move(object):
         """整套动作一共几帧 —— 这一招占用角色多久。"""
         return int(self._num("total_frame"))
 
+    # ★ 冲刺自己挪多远（`ProcessDash` `0x5077c6`，X_Mod §113）：公式在 `botmove.dash_distance()`。
+    #   缺省是那三发取值的缺省参数：`0x50780b push 8`、`[0x693824]` = 4.0、`fld1`。
+    @property
+    def move_frame(self):
+        """前几帧在挪（`DashNN-MoveFrame`）。"""
+        return int(self._num("move_frame", 8))
+
+    @property
+    def move_force(self):
+        """挪的「力度」（`DashNN-Move`，ini 注释：不是距离）。"""
+        return self._num("move", 4.0)
+
+    @property
+    def move_gamma(self):
+        """前冲后收的程度（`DashNN-MoveGamma`，位置 ∝ (帧 / MoveFrame) 的 1/γ 次方）。"""
+        return self._num("move_gamma", 1.0)
+
+    @property
+    def pushes(self):
+        """推挤段碰到人推不推（`DashNN-DontPush` 为 0 或没写 = 推，ini 开头的注释）。"""
+        return not int(self._num("dont_push", 0))
+
     def offset(self, frame):
         """第 `frame` 帧时伤害圈相对角色的偏移 `(dx, dy)`（朝右的那一版）。"""
         span = max(1, self.damage_end - 1)

@@ -4194,6 +4194,8 @@ PEER_OP_EXPLODE = 0x0003
 PEER_OP_SPLASH_DAMAGED = 0x0004
 PEER_OP_DASH = 0x0007
 PEER_OP_GUARD = 0x0018
+#: 出拳（`0x0008`，和 `rpDash` 同一种 11 字节的包）。只在 `note_sync_position` 里给它在逻辑帧网格上定位（X_Mod §113）。
+PEER_OP_JAB = 0x0008
 
 #: ★ `note_battle_stats()` 只认这五个。**心跳（`0x4001`）占绝大部分流量**，
 #: 让它在第一句就掉头走 —— 这是整条热路径上唯一要在意的事。
@@ -5952,6 +5954,7 @@ def reset_sync_trails(room, why, new_match=False):
         conn.sync_jumped = 0
         conn.sync_jump_ticks = ()
         conn.sync_trail_at = None
+        conn.sync_melee_grid = None
         # ★ 换图 / 新一局客户端会把角色重建，蹲的状态跟着归零（`0x4ffc4a`），
         #   服务端这份记账也要一起清，否则 bot 会照着上一张图的姿势起步。
         conn.sync_crouch = False
@@ -7185,6 +7188,7 @@ class Conn:
     sync_jumped = 0
     sync_jump_ticks = ()
     sync_trail_at = None
+    sync_melee_grid = None
     sync_crouch = False
     sync_guard = False
     sync_guard_switch_at = None
@@ -7433,6 +7437,8 @@ class Conn:
         # 最近那发心跳**到达**的时刻（`time.monotonic()`）。起跳离它几帧、他自己那条鱼在那一帧
         # 的相位，都从这一刻起算（X_Mod §85）。
         self.sync_trail_at = None
+        # ★ 他最近那一发冲刺 / 出拳排在哪一帧的到达时刻（`note_sync_position`，X_Mod §113）。
+        self.sync_melee_grid = None
         # ★ 他现在蹲着没有。`rpCrouch`(0x000b) 只在按下 / 松开各来一发，
         #   中间的每一发心跳都照这个状态记进轨迹点（V0.3 §41）。
         self.sync_crouch = False
@@ -11332,6 +11338,17 @@ class Conn:
                                              / roomclock.TICK_S)))
                 self.sync_jump_ticks = self.sync_jump_ticks + (
                     (ticks, self.sync_jumped or 1),)
+            return
+        if opcode in (PEER_OP_DASH, PEER_OP_JAB):
+            # ★ 冲刺 / 出拳在他那台**逻辑帧网格**上的位置（X_Mod §113），和 rpJump 同一个道理：同一台机器、
+            #   同一条有序流，到达时刻之差就是发出时刻之差，按 32 ms 数一下就是离最近那发心跳第几帧。
+            #   记成「那一帧的到达时刻」—— bot 外推他冲刺时，和每一发心跳的到达时刻一比就知道那一发里
+            #   已经冲了几帧（`bot._human_melee_step`）。
+            if self.sync_trail_at is None:
+                self.sync_melee_grid = now
+            else:
+                self.sync_melee_grid = self.sync_trail_at + roomclock.TICK_S * int(
+                    round((now - self.sync_trail_at) / roomclock.TICK_S))
             return
         if opcode == PEER_OP_CROUCH:
             # ★ 蹲是**状态**不是事件（和 rpJump 相反）：`rpCrouch` 只在按下 /
