@@ -37,6 +37,11 @@
 ⇒ **UDP 完全不通 = 今天的行为，一行 fallback 代码都不需要。**
    被墙、NAT 掐了、服务器没放行 UDP、玩家用的是没更新的客户端 —— 全都自动落回 TCP。
 
+★ 但「来源换了口」不是不通，是**通着却认不出**（X_Mod D72）：代理 / NAT 在服务端这一侧
+换了 UDP 源口之后，对方发得出去、我们收得到、就是查不到是谁。这时回一发
+`HELLO_ACK(ACK_UNKNOWN_SOURCE)` 让它重发 HELLO；HELLO 到了就把**同一条流**的来源换成新地址，
+下行索引接着数（新建一条、索引从 0 起的话，中继那道只准前进的闸门会把之后的下行全丢掉）。
+
 ## ★★ 铁律 3：心跳里的 N 决不许越过还没转发的事件包
 
 这一条是本文件最要紧的不变式，写错了会**整局打不死人**（§216 / §217）。
@@ -158,6 +163,21 @@ ACK_NOT_LOGGED_IN = 3
 #: 老中继把它当成「不是 OK」，行为退回今天的样子；新中继连到老服务端时
 #: 收到的是 `ACK_BAD_TICKET`，也只是回到「登录时会多打一行」而已。
 #: **所以线格式的版本号（`MAGIC` 最后一字节）不用动。**
+
+#: ★ 「这个**来源**我不认识」（X_Mod D72，用户 2026-09-26）—— 回给**不是 HELLO** 的数据报
+#: （DATA / PING / 在场证据 / 相位 / 时钟）的来源地址，当它不在 `_by_addr` 里的时候。
+#:
+#: 什么时候会这样：代理 / NAT 在**服务端这一侧**换了 UDP 源口（空闲超时、出站重连）、
+#: 服务端重启过、这条流被 `_prune` 掉了。对方那边 socket 没变、发得出去、`acked` 还挂着，
+#: 在它看来一切正常 —— **不告诉它，它永远不知道 UDP 已经静悄悄停了**、下行早就退回 TCP。
+#: 回这一发就是把「你的来源变了」这个事实交给唯一能处理它的一方：中继收到就重发 HELLO，
+#: 服务端在 `_on_hello` 里把同一条流的来源换成新地址、下行索引**接着数**。
+#:
+#: 兼容：老中继把它当「被拒」—— `acked` 清掉、打一行「服务器没接受这条通道（4）」，
+#: 然后照它自己的节奏重发 HELLO，同样认回来；新中继连老服务端收不到它，退回今天的样子。
+#: 反射面：只回给带我们魔数、且**至少和回包一样长**的数据报，回包 11 字节定长不带说明
+#: —— 放大倍数 ≤ 1，比 HELLO 那一路（11 → 26 字节）还小。
+ACK_UNKNOWN_SOURCE = 4
 
 #: 一组数据的定长部分：`u32 索引 + u16 长度`。
 CHUNK_HEADER = struct.Struct("<IH")
@@ -1036,12 +1056,22 @@ class UdpSyncServer:
             self._reply(build_hello_ack(ACK_BAD_TICKET, "认不出票据"), addr)
             return
         with self._lock:
-            old = self._by_conn.get(id(game_conn))
-            if old is not None and old.addr != addr:
-                self._by_addr.pop(old.addr, None)
-            endpoint = self._by_addr.get(addr)
-            if endpoint is None or endpoint.game_conn is not game_conn:
+            endpoint = self._by_conn.get(id(game_conn))
+            if endpoint is not None and endpoint.game_conn is not game_conn:
+                endpoint = None             # `id()` 被回收后重用了（和 `endpoint_for` 同一道防线）
+            is_new = False
+            moved_from = None
+            if endpoint is None:
                 endpoint = Endpoint(game_conn, addr, now)
+                is_new = True
+            elif endpoint.addr != addr:
+                # ★ 同一条游戏连接换了来源地址（代理 / NAT 在这一侧换了 UDP 口、中继重建了
+                #   代理关联、NAT 重绑）：**沿用这条流**，只把地址换掉，下行索引接着数。
+                #   新建一条的话索引从 0 起，中继那道只准前进的闸门会把它们全丢掉，直到索引
+                #   重新爬过旧水位 —— 几分钟的位置更新全没了（X_Mod D72）。
+                moved_from = endpoint.addr
+                self._by_addr.pop(moved_from, None)
+                endpoint.addr = addr
             endpoint.last_seen = now
             # ★ 下行只在**对方自证过**之后才开。它自证的方式是去 bind 7788：
             #   绑得上 = 游戏没绑 = 投过去没人收（见 relay.py 的 downlink_probe）。
@@ -1051,12 +1081,29 @@ class UdpSyncServer:
             self._by_addr[addr] = endpoint
             self._by_conn[id(game_conn)] = endpoint
         self._reply(build_hello_ack(ACK_OK, ""), addr)
-        # ★ 只在「第一次认出来」和「下行可用性变了」时打一行。
+        # ★ 只在「第一次认出来」「下行可用性变了」「来源换了」时打一行。
         #   HELLO 是会重发的（ACK 丢了就 2 秒一发），逐发打会把日志刷爆。
-        if old is None or was_ready != endpoint.downlink_ok:
-            who = getattr(game_conn, "account_name", None) or "?"
+        who = getattr(game_conn, "account_name", None) or "?"
+        if is_new or was_ready != endpoint.downlink_ok:
             self.log(f"UDP 同步 ✓ 认出 账号={who!r} 来自 {addr[0]}:{addr[1]}"
                      f"（下行 {'开' if endpoint.downlink_ok else '关，走 TCP'}）")
+        elif moved_from is not None:
+            self.log(f"UDP 同步 账号={who!r} 的来源从 {moved_from[0]}:{moved_from[1]} 换到 "
+                     f"{addr[0]}:{addr[1]}（代理 / NAT 在这一侧换了口），同一条流接着发"
+                     f"（下行索引 {endpoint.out_index} 起）")
+
+    def _unknown(self, data, addr):
+        """认不出来源的数据报：丢掉，并回一发「这个来源我不认识」（`ACK_UNKNOWN_SOURCE`）。
+
+        还没 HELLO 过、服务端重启过、代理 / NAT 在这一侧换了 UDP 口 —— 对方那边 socket 没变、
+        `acked` 还挂着，只有我们知道「认不出」这个事实，所以得回一发让它重发 HELLO（D72）。
+        TCP 那一份从来没停过，这期间玩家什么都不会察觉。
+        ★ 只回给至少和回包一样长的数据报：回包不可能比来包长，这个口在公网上也放大不了。
+        """
+        self.unknown_in += 1
+        nack = build_hello_ack(ACK_UNKNOWN_SOURCE, "")
+        if len(data) >= len(nack):
+            self._reply(nack, addr)
 
     def _on_data(self, data, addr, now):
         with self._lock:
@@ -1064,9 +1111,7 @@ class UdpSyncServer:
             if endpoint is not None:
                 endpoint.last_seen = now
         if endpoint is None:
-            # 还没 HELLO 过（或者服务端重启过）。丢掉即可 —— TCP 那一份
-            # 从来没停过，玩家什么都不会察觉；对方保活超时后会重发 HELLO。
-            self.unknown_in += 1
+            self._unknown(data, addr)
             return
         try:
             chunks = parse_data(data)
@@ -1097,7 +1142,7 @@ class UdpSyncServer:
             if endpoint is not None:
                 endpoint.last_seen = now
         if endpoint is None:
-            self.unknown_in += 1
+            self._unknown(data, addr)
             return
         try:
             kb, mouse, sysidle, fg, flags = parse_presence(data)
@@ -1121,7 +1166,7 @@ class UdpSyncServer:
             if endpoint is not None:
                 endpoint.last_seen = now
         if endpoint is None:
-            self.unknown_in += 1
+            self._unknown(data, addr)
             return
         try:
             game_now, wall_now, entries = parse_mover_phase(data)
@@ -1144,7 +1189,7 @@ class UdpSyncServer:
             if endpoint is not None:
                 endpoint.last_seen = now
         if endpoint is None:
-            self.unknown_in += 1
+            self._unknown(data, addr)
             return
         try:
             tick, timer, births = parse_tick_clock(data)
@@ -1192,6 +1237,11 @@ class UdpSyncServer:
             try:
                 _, seq = parse_ping(data)
             except ProtocolError:
+                return
+            if endpoint is None:
+                # 保活来自一个认不出的来源：大厅里只有保活在走，这是它唯一能拿到
+                # 「你的来源变了」的机会（D72）—— 回「不认识」而不是 PONG。
+                self._unknown(data, addr)
                 return
             self._reply(build_ping(MSG_PONG, seq), addr)
 

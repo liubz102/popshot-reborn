@@ -35,9 +35,10 @@
 **查明**（§108）：不是代理不支持 —— 本机 10808 支持 UDP ASSOCIATE；是 `relay.py` 配了代理就不开远程 UDP 上游（V0.2 D099 留的空白）。
 bot 的心跳本来就和真人同一条路（`relayserver.deliver()`），收方没开 UDP 才全落 TCP，服务端一字没改。
 **做法**（D71）：`_Socks5UdpUpstream` 经 UDP ASSOCIATE 转发、长得像 UDP socket，中继其余不改；HTTP 代理仍回退 TCP；
-代理撤关联 = 事件 → HELLO 重发重建。只动 `relay.py`（客户端包）+ 两份测试 + `config.py` 注释。
-**已核**：`test_proxy` / `test_udpsync` 新增 27 条（假代理真中转 UDP：IPv4 / 域名 / 拒绝 / 撤关联重建 / BND=0 / bot 经代理下行）；
-两套运行时全量 4580 绿；真代理冒烟：DNS 经 `_Socks5UdpUpstream` 一来一回 ✅。
+代理撤关联 = 事件 → HELLO 重发重建。**来源换口**（D72，用户追加）：服务端对认不出的来源回「不认识」、同一条游戏连接换地址时
+沿用同一条流（索引接着数）；中继翻转那一发立刻重发 HELLO。改了 `relay.py`（客户端包）+ `udpsync.py`（服务端包）+ 两份测试 + `config.py` 注释。
+**已核**：`test_proxy` / `test_udpsync` 新增 34 条（假代理真中转 UDP：IPv4 / 域名 / 拒绝 / 撤关联重建 / BND=0 / bot 经代理下行 /
+代理换出口整条链自愈）；两套运行时全量绿；真代理冒烟：DNS 经 `_Socks5UdpUpstream` 一来一回 ✅。
 **待验**：实机 V125 / V126。⚠ 用户自己的 `config/server.config`（打包时原样拷进客户端包）30~32 行的代理注释还是旧的，没替用户改。
 
 ---

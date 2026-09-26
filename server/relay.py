@@ -692,6 +692,8 @@ class UdpSyncRelay:
     只有它才让远程模式保持 TCP。「本机」那条是环回，和代理无关，照常走。
     代理撤掉关联（控制连接断了）是一个事件：`_on_upstream_dead` 把这一轮的上游撤掉、
     `acked` 清掉，现成的 HELLO 重发（`_retry_hello`）就会把它重建起来 —— 不加定时器。
+    代理 / NAT 在**服务器那一侧**换了 UDP 源口是另一个事件（X_Mod D72）：我们这边看不出来，
+    由服务端回 `ACK_UNKNOWN_SOURCE` 告诉我们，`_on_remote_datagram` 收到就重发 HELLO 认回去。
     """
 
     def __init__(self, target_host, target_port=None, local_port=None,
@@ -800,7 +802,7 @@ class UdpSyncRelay:
         """一条上游怎么写进日志：直连写地址；经代理写「目标，经代理（中转口）」。"""
         if isinstance(up[0], _Socks5UdpUpstream):
             target = up[0].target
-            return (f"{server_config.http_host(target[0])}:{target[1]}/udp，经 "
+            return (f"{server_config.http_host(target[0])}:{target[1]}/udp，"
                     f"{up[0].proxy.route}（UDP 中转口 "
                     f"{server_config.http_host(up[1][0])}:{up[1][1]}）")
         return f"{server_config.http_host(up[1][0])}:{up[1][1]}/udp"
@@ -854,7 +856,7 @@ class UdpSyncRelay:
         except OSError as error:            # ProxyError 也是 OSError
             if not self._proxy_fail_said:
                 self._proxy_fail_said = True
-                log(f"位置UDP  ✗ 经 {proxy.route} 建不了 UDP 通道（{error}）；"
+                log(f"位置UDP  ✗ {proxy.route}：建不了 UDP 通道（{error}）；"
                     f"选「远程服务器」时位置数据继续走 TCP（还会随 HELLO 重试，"
                     f"建起来会再打一行）")
             return None
@@ -899,7 +901,7 @@ class UdpSyncRelay:
             log(f"位置UDP  这一轮登录选的是「{self._route_name(local)}」→ 上游 "
                 f"{self._upstream_desc(up)}")
         elif self.proxy is not None and not local:
-            log(f"位置UDP  这一轮登录选的是「远程服务器」，经 {self.proxy.route} ——"
+            log(f"位置UDP  这一轮登录选的是「远程服务器」，{self.proxy.route} ——"
                 f" 这条 UDP 通道没建起来，位置数据回退 TCP（原因见上一行 ✗）")
 
     def _on_upstream_dead(self, upstream):
@@ -937,7 +939,7 @@ class UdpSyncRelay:
                 self._up = None
         upstream.close()
         if current:
-            log(f"位置UDP  ✗ 代理关掉了 UDP 通道的控制连接（关联作废，经 "
+            log(f"位置UDP  ✗ 代理关掉了 UDP 通道的控制连接（关联作废，"
                 f"{upstream.proxy.route}）；位置数据回退 TCP，下一发 HELLO 重建")
 
     # -- 建 socket ----------------------------------------------------------
@@ -965,7 +967,7 @@ class UdpSyncRelay:
         if self.proxy is None:
             remote = shown
         elif self.proxy.kind == "socks5":
-            remote = f"经 {self.proxy.route} 转到 {shown}（UDP ASSOCIATE）"
+            remote = f"{self.proxy.route} 转到 {shown}（UDP ASSOCIATE）"
         else:
             remote = f"{self.proxy.kind_name} 代理转不了 UDP，位置数据回退 TCP"
         log(f"位置UDP  {LISTEN_HOST}:{self.local_port}/udp → 选「远程服务器」时 {remote}；"
@@ -1173,6 +1175,7 @@ class UdpSyncRelay:
                 #   那一对提示是同一个套路：**只在状态变了的时候说话**。
                 self.refused_logged = False
                 return
+            was_acked = self.acked
             self.acked = False
             if result == udpsync.ACK_NOT_LOGGED_IN:
                 # ★ **不是失败，是时序**：`bshook` 一看到 `0x0100` 就发 HELLO，
@@ -1180,6 +1183,18 @@ class UdpSyncRelay:
                 #   服务端明说了「票据是真的，只是还没登进来」，那就安静等 ——
                 #   **每一次登录都必然经过这个窗口**，报出来纯属吓人。
                 #   ★ 判据是服务端给的**事件**，不是「跳过头几发」这种次数。
+                return
+            if result == udpsync.ACK_UNKNOWN_SOURCE:
+                # ★ 服务器说「这个来源我不认识」（X_Mod D72）：代理 / NAT 在服务器那一侧换了
+                #   UDP 源口，或服务端重启过 / 把这条流忘了。我们这边 socket 没变、发得出去，
+                #   没有别的办法知道 —— 这一发就是那个事件。翻转的那一发（刚才还是 acked）
+                #   立刻重发 HELLO 认回去；之后的（HELLO 已在路上）不再逐发重发，丢了有
+                #   `HELLO_RETRY_S` 兜着。日志只在翻转时打一行，认回来时 ACK_OK 那一行自然跟上；
+                #   服务端那边同一条流接着发，下行索引不重来，闸门不用动。
+                if was_acked:
+                    log("位置UDP  服务器不认识这条通道现在的来源（代理 / NAT 在服务器那一侧"
+                        "换了 UDP 口）—— 已重发 HELLO 让它认回去")
+                    self._send_hello()
                 return
             # 真被拒了（服务端重启过 / 票据过期 / 被顶号 / UDP 同步被关掉）。
             # 只在**状态翻转**的那一次说话：票据真过期时 `HELLO_RETRY_S`

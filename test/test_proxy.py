@@ -168,17 +168,75 @@ class FakeProxyMixin:
     def _serve_udp_association(sock, state, bnd_zero, resolve):
         """一条 UDP 关联：bind 一个中转口、回 BND，然后握着控制连接直到对方（或测试）关掉。
 
-        中转规则和真代理一样（RFC 1928 §7）：第一发数据报的来源就是客户端；客户端来的拆头、
-        按头里的地址转给目标；别处来的套上「来源地址」的头回给客户端。
-        控制连接一断就关中转口（关联作废）。测试用 `state["kill_control"]()` 模拟代理撤关联。
+        中转规则和真代理一样（RFC 1928 §7）：面向客户端一个口（`relay_addr`，客户端往这儿发、
+        从这儿收），面向目标另一个口（`exit_addr`，目标看到的来源）；客户端来的拆头、按头里的
+        地址从出口转给目标；出口收到的套上「来源地址」的头回给客户端。
+        控制连接一断就关两个口（关联作废）。测试用 `state["kill_control"]()` 模拟代理撤关联，
+        用 `state["rotate_exit"]()` 模拟代理面向目标那一侧换了 UDP 源口（空闲超时 / 出站重连）。
         """
-        relay_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        relay_sock.bind(("127.0.0.1", 0))
-        relay_port = relay_sock.getsockname()[1]
+        client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client_sock.bind(("127.0.0.1", 0))
+        relay_port = client_sock.getsockname()[1]
         state["control"] = sock
         state["relay_addr"] = ("127.0.0.1", relay_port)
         state["associations"] = state.get("associations", 0) + 1
         state.setdefault("udp_targets", [])
+        client = {}                         # {"addr": 客户端的 UDP 地址}（第一发数据报定的）
+        exits = {"sock": None}
+        lock = threading.Lock()
+
+        def pump_exit(out):
+            """出口 -> 客户端。出口被换掉 / 关联撤了就结束。"""
+            while True:
+                try:
+                    data, src = out.recvfrom(65536)
+                except OSError:
+                    return
+                header = (b"\x00\x00\x00\x01" + socket.inet_aton(src[0])
+                          + struct.pack("!H", src[1]))
+                addr = client.get("addr")
+                if addr is not None:
+                    try:
+                        client_sock.sendto(header + data, addr)
+                    except OSError:
+                        return
+
+        def open_exit():
+            out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            out.bind(("127.0.0.1", 0))
+            with lock:
+                exits["sock"] = out
+            state["exit_addr"] = out.getsockname()
+            threading.Thread(target=pump_exit, args=(out,), daemon=True).start()
+            return out
+
+        def pump_client():
+            """客户端 -> 目标（经当前出口）。"""
+            while True:
+                try:
+                    data, src = client_sock.recvfrom(65536)
+                except OSError:
+                    return
+                client["addr"] = src
+                try:
+                    atyp, host, port, payload = parse_socks5_udp_header(data)
+                except AssertionError as error:
+                    state["error"] = error
+                    continue
+                state["udp_targets"].append((atyp, host, port))
+                with lock:
+                    out = exits["sock"]
+                try:
+                    out.sendto(payload, (resolve.get(host, host), port))
+                except OSError as error:
+                    state["error"] = error
+
+        def rotate_exit():
+            """代理面向目标那一侧换了 UDP 源口：旧口作废（发到旧口的全丢），新口从头来。"""
+            with lock:
+                old = exits["sock"]
+            open_exit()
+            old.close()
 
         def kill_control():
             try:
@@ -188,32 +246,9 @@ class FakeProxyMixin:
             sock.close()
 
         state["kill_control"] = kill_control
-
-        def pump():
-            client = None
-            while True:
-                try:
-                    data, src = relay_sock.recvfrom(65536)
-                except OSError:
-                    return
-                if client is None or src == client:
-                    client = src
-                    try:
-                        atyp, host, port, payload = parse_socks5_udp_header(data)
-                    except AssertionError as error:
-                        state["error"] = error
-                        continue
-                    state["udp_targets"].append((atyp, host, port))
-                    try:
-                        relay_sock.sendto(payload, (resolve.get(host, host), port))
-                    except OSError as error:
-                        state["error"] = error
-                else:
-                    header = (b"\x00\x00\x00\x01" + socket.inet_aton(src[0])
-                              + struct.pack("!H", src[1]))
-                    relay_sock.sendto(header + data, client)
-
-        threading.Thread(target=pump, daemon=True).start()
+        state["rotate_exit"] = rotate_exit
+        open_exit()
+        threading.Thread(target=pump_client, daemon=True).start()
         bnd = b"\x00\x00\x00\x00" if bnd_zero else socket.inet_aton("127.0.0.1")
         sock.sendall(bytes((5, 0, 0, 1)) + bnd + struct.pack("!H", relay_port))
         try:
@@ -222,7 +257,10 @@ class FakeProxyMixin:
         except OSError:
             pass
         finally:
-            relay_sock.close()              # 关联随控制连接一起撤掉
+            client_sock.close()             # 关联随控制连接一起撤掉
+            with lock:
+                out = exits["sock"]
+            out.close()
 
     def start_http(self, username="", password="", banner=b""):
         def handler(sock, state):

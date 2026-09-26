@@ -2307,5 +2307,8 @@ D60 把炸点改成 `hit.free`（被挡住的**前一个**整数点），比旧�
 - ★ 关联死了（控制连接断）之后重建，服务端见到**新来源地址**会新建 `Endpoint`、下行索引从 0 起（`udpsync._on_hello` 1038~1052 行），
   中继的 `downlink_high_water` 不清就把之后几分钟的下行全丢在闸门上（`test_a_dropped_association_is_rebuilt_by_the_hello_retry` 钉着）。
   今天 NAT 重绑也是同一个坑（服务端换 Endpoint、中继闸门不清），只是没人碰到过。
-- 已知局限（不修）：代理**面向服务端**那一侧的 UDP 源口若空闲换口，服务端把它当陌生来源丢（`_on_data` 1066 行）而中继仍 `acked`
-  ⇒ UDP 静悄悄停、TCP 接管，和 NAT 重绑一样；10 秒一发的保活 PING 撑住大多数代理的出站会话。要识别得改 `udpsync.py`。
+- 代理**面向服务端**那一侧的 UDP 源口若空闲换口（或 NAT 重绑）：以前服务端把它当陌生来源丢（`_on_data`）而中继仍 `acked`
+  ⇒ UDP 静悄悄停、TCP 接管，谁都不知道。★ **已修**（D72，用户同一天点的）：服务端对认不出来源的 DATA / PING / 在场 / 相位 / 时钟
+  回 `HELLO_ACK(ACK_UNKNOWN_SOURCE=4)`（11 字节定长，只回给不比它短的包）；中继翻转那一发立刻重发 HELLO；`_on_hello` 对同一条
+  游戏连接换地址**沿用同一条流**（只改 `endpoint.addr`，下行索引接着数）—— 顺带修掉了 NAT 重绑那个潜伏坑（换地址新建 Endpoint、
+  索引从 0 起、中继闸门丢几分钟）。`ProxyExitRotationTests` 用假代理换出口把整条链钉着；老中继收到码 4 当「被拒」处理，也会重发 HELLO 认回来。
