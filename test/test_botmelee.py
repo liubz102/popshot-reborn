@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import struct
 import sys
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -27,8 +28,8 @@ import botsync                                                 # noqa: E402
 import chrprops                                                # noqa: E402
 import gameserver                                              # noqa: E402
 from gameserver import OP_PEER_DATA_UP                         # noqa: E402
-from test_botsync import (BotFireRoom, body_of, dash_frames,   # noqa: E402
-                          fire_frames, splash_frames)
+from test_botsync import (BotFireRoom, HumanShotRoom, body_of,  # noqa: E402
+                          dash_frames, fire_frames, splash_frames)
 
 #: 真人的冲刺打中人时，包里的推力是常量 `(朝向 × 15, −10)`（`0x481d6e`，语料 1347 发）。
 DASH_PUSH = (15.0, -10.0)
@@ -226,7 +227,7 @@ class BotDashGapTests(MeleeRoom):
         """冲过一下、人还贴着：把那一下收掉、体力补满，只剩「隔多久」这一道门。"""
         self.walk_until_dash()
         self.bot_conn.dash_swing = None
-        self.bot_conn.stamina = chrprops.game().sp_max
+        self.bot_conn.stamina = bot._stamina_cap(self.bot_conn)
         self.bot_conn.stamina_at = self.now()
 
     def try_dash(self, at):
@@ -314,29 +315,82 @@ class BotStaminaTests(MeleeRoom):
         self.assertAlmostEqual(70.0 + 8 * self.props.sp_charging,
                                self.bot_conn.stamina, places=3)
 
-    def test_back_to_back_dashes_from_full_stamina(self):
-        """满体力、一下接一下地冲：第 0 式（30）最多 3 下，第 4 下得等回够 —— 原版没装突击技的真人也一样。"""
-        self.fill(self.props.sp_max)
-        dashes = 0
-        waited = 0
-        while dashes < 4 and waited < 400:
-            if self.bot_conn.stamina >= self.move.sp_cost:
-                self.bot_conn.stamina -= self.move.sp_cost
-                dashes += 1
-                self.bot_conn.dash_swing = bot.DashSwing(
-                    botsync.projectile_handle(self.bot_seat, dashes), self.t, 1,
-                    self.move, self.bot_conn.character_id)
-                self.step(self.move.total_frame)          # 这一下打完之前不回
-                self.bot_conn.dash_swing = None
-                self.step(1)
-                if dashes == 3:
-                    third_done = waited
-            else:
-                self.step(1)
-                waited += 1
-        self.assertEqual(4, dashes, "前提：等够了第 4 下总能出来")
-        self.assertGreaterEqual((waited - third_done) * self.TICK, 2.0,
-                                "三下之后要等两秒多才够第 4 下（以前冲刺中白回 6.25，几格就够）")
+    def chain(self, move):
+        """满体力起一下接一下地冲，直到体力不够；返回冲了几下（每下之间只隔收招后那一格）。"""
+        self.fill(bot._stamina_cap(self.bot_conn))
+        chained = 0
+        while self.bot_conn.stamina >= move.sp_cost:
+            self.bot_conn.stamina -= move.sp_cost
+            chained += 1
+            self.bot_conn.dash_swing = bot.DashSwing(
+                botsync.projectile_handle(self.bot_seat, chained), self.t, 1,
+                move, self.bot_conn.character_id)
+            self.step(move.total_frame)               # 这一下打完之前不回
+            self.bot_conn.dash_swing = None
+            self.step(1)                              # 收招后那一格
+        return chained
+
+    def test_back_to_back_dashes_regain_only_between_them(self):
+        """冲刺那几帧一点不回：连冲 n 下之后 = 上限 − n × 花费 + n × 0.25（以前每下还白回 `TotalFrame × 0.25`）。"""
+        chained = self.chain(self.move)
+        self.assertGreaterEqual(chained, 1)
+        want = (bot._stamina_cap(self.bot_conn) - chained * self.move.sp_cost
+                + chained * self.props.sp_charging)
+        self.assertAlmostEqual(want, self.bot_conn.stamina, places=3)
+
+    def test_character_zero_chains_three_then_waits(self):
+        """角色 0 第 0 式（30 / 上限 100）：100 → 70 → 40 → 10，第 4 下要等两秒多 —— 没装突击技的真人也一样。"""
+        self.bot_conn.character_id = 0
+        move = chrprops.get(0).dash(0)
+        self.assertEqual((30.0, 100.0), (move.sp_cost, bot._stamina_cap(self.bot_conn)))
+        self.assertEqual(3, self.chain(move))
+        wait = (move.sp_cost - self.bot_conn.stamina) / self.props.sp_charging * self.TICK
+        self.assertGreater(wait, 2.0)
+
+    def test_the_cap_follows_the_characters_chrsp(self):
+        """上限 = `ChrSp`（`0x50a0aa`：角色表 `+4` + 装备键 6，bot 没装备），不是 `GameProps` 的 `SpMax`。"""
+        for character, want in ((0, 100.0), (3, 110.0), (101, 90.0)):
+            self.bot_conn.character_id = character
+            self.bot_conn.stamina = None
+            bot._regen_stamina(self.bot_conn, self.t)
+            self.assertEqual(want, self.bot_conn.stamina, "角色 %d 满体力" % character)
+            self.step(40)
+            self.assertEqual(want, self.bot_conn.stamina, "角色 %d 回满不越上限" % character)
+
+    def test_standing_up_again_refills_it(self):
+        """`Respawn` 站起来就补满（`0x503080`）；以前接着死前那个数、按躺着的时长慢慢回。"""
+        self.human_heartbeat(self.alice, 100.0, 100.0)   # 有人报过位置，bot 才走得到回体力那一步
+        self.bot_conn.holding = True                     # 站住：不冲不跑，体力只剩「回」这一件事
+        self.bot_conn.stamina = 5.0
+        self.room.quest.respawn_due[self.bot_seat] = (self.now() + 60.0, (100, 100))
+        self.advance(1)
+        self.assertIsNone(self.bot_conn.stamina, "躺着这段清掉，站起来按上限补")
+        self.room.quest.respawn_due.pop(self.bot_seat)
+        self.advance(1)
+        self.assertEqual(bot._stamina_cap(self.bot_conn), self.bot_conn.stamina)
+
+
+class ImmuneKnockbackTests(HumanShotRoom):
+    """免伤 / 护盾里 `Character::OnHit` 进门就返回：不扣血、不击退、不解约束（X_Mod §112）。"""
+
+    def test_a_shielded_bot_is_not_knocked_back(self):
+        self.room.quest.shield_until = {self.bot_seat: time.monotonic() + 8.0}
+        self.splash(36, (15.0, -10.0))
+        body = self.bot_conn.body
+        self.assertTrue(body.on_ground, "护盾里不该被顶飞")
+        self.assertEqual((0.0, 0.0), (body.vx, body.vy))
+        self.room.quest.shield_until = {self.bot_seat: time.monotonic() - 1.0}
+        self.splash(36, (15.0, -10.0))
+        self.assertFalse(self.bot_conn.body.on_ground, "护盾过了照常顶飞")
+
+    def test_a_shielded_bot_stays_pushed(self):
+        self.send(botsync.OP_DASH, botsync.dash_body(self.alice_seat, 1, 0, 600.0, 150.0))
+        self.send(0x0017, struct.pack("<ii", botsync.character_handle(self.bot_seat),
+                                      botsync.character_handle(self.alice_seat)))
+        self.assertIsNotNone(self.bot_conn.motion_constraint)
+        self.room.quest.shield_until = {self.bot_seat: time.monotonic() + 8.0}
+        self.splash(36, (15.0, -10.0))
+        self.assertIsNotNone(self.bot_conn.motion_constraint, "进不了门，约束也解不掉（`0x4ff47c` 在免伤门后面）")
 
 
 class BotDashPriorityTests(MeleeRoom):

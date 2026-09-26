@@ -3489,6 +3489,11 @@ def _knock_back_seat(room, seat_index, damage, push, source="?"):
     machine = None if seat is None else seat.conn
     if not isinstance(machine, BotConn) or machine.body is None:
         return
+    # ★ 免伤 / 护盾里 `Character::OnHit` 进门就返回（状态 0 / 0x10 / 0x14 `0x4ff2ab`~`0x4ff2d0`、
+    #   护盾 `0x4ff3ee`）：击退（`0x50f7ca`）和解约束（`0x4ff47c`）都走不到（X_Mod §112）。
+    #   以前服务端照样顶飞，每台客户端上它纹丝不动 ⇒ 下一发心跳把它「凭空」拽走。
+    if _immune(room, seat_index, _now()):
+        return
     # Original OnHit releases the dependency through 0x50e636 at 0x50f954.
     if machine.motion_constraint is not None:
         machine.motion_constraint = None
@@ -11279,6 +11284,16 @@ def _stamina_props():
     return chrprops.game()
 
 
+def _stamina_cap(machine):
+    """这个 bot 的体力上限（X_Mod §112）。
+
+    客户端 `0x50a0aa` = 角色表那一项的 `+4`（`ChrProps.ini` 的 `ChrSp`）+ `GetEquipBonus(座位, 6)`，
+    和满血 `0x50a06b`（`+0` = `ChrHp` + 键 5）是同一张表。bot 没有装备（`0x030b` 恒空，V0.3商店 §63）⇒ 就是 `ChrSp`。
+    ★ 以前一律用 `GameProps.ini` 的 `SpMax`（100）：爱琳等 `ChrSp` 110 的少了 10，90 的多了 10。
+    """
+    return float(chrprops.get(machine.character_id).sp)
+
+
 def _regen_stamina(machine, now, crouched=False, fast_run=False):
     """按**真实流逝的时间**补体力（`GameProps.ini` 的 `SpCharging`）。
 
@@ -11294,8 +11309,10 @@ def _regen_stamina(machine, now, crouched=False, fast_run=False):
       冲刺这一条靠 `dash_swing`（一格一调，状态就是这一格的）。
     """
     props = _stamina_props()
+    cap = _stamina_cap(machine)
     if machine.stamina is None:
-        machine.stamina = props.sp_max
+        # 进图（`Init` `0x4fb5c6`）/ 复活（`Respawn` `0x503080`）都是直接补满到上限。
+        machine.stamina = cap
         machine.stamina_at = now
         return machine.stamina
     ticks = max(0.0, (now - machine.stamina_at) * ballistics.TICKS_PER_SECOND)
@@ -11305,8 +11322,7 @@ def _regen_stamina(machine, now, crouched=False, fast_run=False):
     gain = props.sp_charging * (2.0 if crouched else 1.0)
     if fast_run:
         gain -= props.fast_run_sp_cost
-    machine.stamina = max(0.0, min(props.sp_max,
-                                   machine.stamina + gain * ticks))
+    machine.stamina = max(0.0, min(cap, machine.stamina + gain * ticks))
     return machine.stamina
 
 
@@ -11537,7 +11553,7 @@ def _try_dash(room, machine, seat_index, now, on_ground):
            else f"座位{target_seat}")
     machine.log(f"   近身: 冲刺 朝{'右' if direction > 0 else '左'} "
                 f"目标 {who} {move!r} "
-                f"体力 {machine.stamina:.0f}/{_stamina_props().sp_max:.0f}"
+                f"体力 {machine.stamina:.0f}/{_stamina_cap(machine):.0f}"
                 f" 句柄 {handle}（★ 收方也吃掉一个弹体句柄，§64）")
     _emit(machine, packet)
     return True
@@ -11874,6 +11890,10 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         # ★ 减速 / 冰冻也一样：死一次身上的状态就清了（`Character::Reset`）。
         machine.slowed_until = None
         machine.frozen_until = None
+        # ★ 体力：`Respawn` 站起来就补满（`0x503080` `fstp [ebx+0x2a4]` = 上限，X_Mod §112）。
+        #   躺着这段清成 `None`，站起来那一格 `_regen_stamina` 按上限补满 —— 和进图那一次同一条路。
+        #   以前是接着死前那个数、再按躺着的时长慢慢回，站起来常常不满。
+        machine.stamina = None
         # ★★ 三张倒计时表跟着重上（§126）：原版 `Character::Reset`
         #   （`0x514565`）对**当前这把**枪同时上 `LoadingTime` / `ReloadTime`
         #   / `CoolingTime`，冻着的那几把整个作废。站起来那一刻要重新上膛。
