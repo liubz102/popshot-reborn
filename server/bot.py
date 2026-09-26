@@ -456,6 +456,8 @@ class BotConn(gameserver.Conn):
         self.motion_identity = botmotion.new_identity()
         self.motion_revision = 0
         self.motion_constraint = None
+        #: 「被座位 N 推着、不出手」那一行日志说过了没有（按状态翻转去重，`_held_by_push`）。
+        self.push_hold_logged = None
         #: 上一发**踩地**心跳报出去的 `(方向键, 冲刺位)`。收方拿这两样替 bot
         #: 走接下来那一段（`0x507660`），所以它们一翻转就是收方复现不出来的
         #: 运动突变，当格补锚（V0.3 §190 / D149）。腾空时记 `None`（腾空收方
@@ -798,6 +800,7 @@ class BotConn(gameserver.Conn):
         self.motion_anchor_pending = False
         self.motion_identity = botmotion.new_identity()
         self.motion_constraint = None
+        self.push_hold_logged = None
         self.walk_reported = None
         self.trail_mark = None
         self.trail_heading = 0
@@ -2896,6 +2899,13 @@ def _note_motion_event(room, conn, opcode, body, sequence):
                 frames = int(frames * JAB_FRAME_RATIO)
                 conn.jab_until = _now() + frames * BOT_DASH_FRAME_MS / 1000.0
                 conn.jab_dir = direction
+                # ★ 出拳的**伤害段**（`0x482d65`）：⌊CastEndFrame × 0.625⌋ ≤ 帧 < ⌊DamageEndFrame × 0.625⌋。
+                #   这一段他的招式优先级是 2，bot 的冲刺碰到他不算（`0x503fde`，X_Mod §111）。
+                #   只在 `jab_until` 还没到时才作数（被打断 / 死了 / 换图都清 `jab_until`）。
+                frame_s = BOT_DASH_FRAME_MS / 1000.0
+                conn.jab_strike = (
+                    _now() + int(move.get("cast_end", 0) * JAB_FRAME_RATIO) * frame_s,
+                    _now() + int(move.get("damage_end", 0) * JAB_FRAME_RATIO) * frame_s)
             conn.motion_action = (gen, _now() + frames * BOT_DASH_FRAME_MS / 1000.0,
                                   direction)
             conn.motion_kind = "dash" if opcode == botsync.OP_DASH else "jab"
@@ -2923,6 +2933,149 @@ def _note_motion_event(room, conn, opcode, body, sequence):
     target.motion_anchor_pending = True
 
 
+def _pushed_by(room, machine, now):
+    """这个 bot 此刻**被谁的近身招式推着**：推它的那个座位号；没被推 / 已经解除返回 `None`。
+
+    `0x0017` 挂上（`_note_motion_event`）；出招者那一招结束（`TotalFrame`，`0x50a63c`）/ 躺下 /
+    换了人 / 换了局号就解除（D148）。挨打那一下另外由 `_knock_back_seat` / `_hit_breaks_melee` 解
+    （`0x50f954` / `0x4ff47c`）。发现已经解除就当场清掉，并补一发锚点心跳。
+    """
+    link = machine.motion_constraint
+    if link is None:
+        return None
+    owner, gen, index = link
+    seat = room.seats[index]
+    action = getattr(owner, "motion_action", None)
+    if (seat is not None and seat.conn is owner
+            and relayserver.epoch_state(owner).gen == gen
+            and action is not None and action[0] == gen and now < action[1]
+            and not _lying_dead(room, index)):
+        return index
+    machine.motion_constraint = None
+    machine.motion_anchor_pending = True
+    return None
+
+
+def _held_by_push(room, machine, now):
+    """被别人的近身招式推着的这一段，bot **不出手**：不冲、不开枪（X_Mod §111 / D75）。
+
+    原版里被推的人本机输入并不锁（`0x515090` 不看 `[+0x164]`），但每台机器上他都在播受击动作、
+    被出招者推着走，真人来不及反手；bot 却在收到 `0x0017` 之后 8 ms 就冲回来，伤害段抢在出招者
+    前面，在出招者自己那台把他的招取消（`0x481c79`）—— 用户 2026-09-26 报的「我先打中了 bot，
+    却是 bot 打中我、它一滴血不掉」。开枪同理：贴脸一枪 ≥ 10 点照样在 `OnHit` 里打断他（`0x4ff669`）。
+
+    ⇒ 这是给 bot 的**行为约束**（和体力一样是 bot 自己给自己上的），不是还原某个客户端判定。
+      判据就是 `0x0017` 这个事件，解除跟着 `_pushed_by`，没有新的时间阈值（铁律 10）。
+    按状态翻转打日志：这一段推第一次拦下时说一句。
+    """
+    index = _pushed_by(room, machine, now)
+    if index is None:
+        machine.push_hold_logged = None
+        return False
+    if machine.push_hold_logged != index:
+        machine.push_hold_logged = index
+        machine.log(f"   近身: 被座位{index} 的近身招式推着（`0x0017`），这一段不出手"
+                    f" —— 不冲、不开枪（X_Mod §111 / D75）")
+    return True
+
+
+#: ★★ 近身招式的**优先级**（`0x503fde`，X_Mod §111）：伤害段碰到人时，受害者的这个数
+#: **比出招者大**就整个不算（不打断、不扣血，`0x481cb8 jg`）。冲刺计时器在跑 = 1，
+#: 出拳在伤害段 = 2。格斗招式（`[+0x5dc]`，`[+0x44] > 0` 时是 3）服务端不记 `0x0016`、
+#: 语料里也一发没有，没接。
+MELEE_PRIORITY_IDLE = 0
+MELEE_PRIORITY_DASH = 1
+MELEE_PRIORITY_JAB_STRIKE = 2
+
+#: ★★ 挨打**打断招式**的门槛（`Character::OnHit` `0x4ff670 cmp [ebp+0xc], 0xa`，X_Mod §111）：
+#: 类型 0（直接命中 `0x4928ea push 0`、`rpSplashDamaged +12` 恒 0 —— 溅射 / 近身 / 火墙都是）
+#: 且 `int(伤害) ≥ 10` ⇒ 受害者的出拳、冲刺、格斗招式全停。
+#: ⚠ 和击退分档的 `KNOCKBACK_MIN_DAMAGE`（`0x50f7da`）数一样，但那是另一个函数里的另一道门，别合并。
+MELEE_INTERRUPT_DAMAGE = 10
+
+
+def _melee_priority(room, seat_index, at):
+    """这个座位在 `at` 那一刻的近身招式优先级（`0x503fde` 的服务端复刻，X_Mod §111）。
+
+    bot 只会冲刺（`dash_swing`）；真人按他发的 `0x0008` / 冲刺包记下的那一段算。
+    """
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    conn = None if seat is None else seat.conn
+    if conn is None:
+        return MELEE_PRIORITY_IDLE
+    if isinstance(conn, BotConn):
+        return (MELEE_PRIORITY_DASH if conn.dash_swing is not None
+                else MELEE_PRIORITY_IDLE)
+    until = getattr(conn, "jab_until", None)
+    strike = getattr(conn, "jab_strike", None)
+    if (until is not None and at < until and strike is not None
+            and strike[0] <= at < strike[1]):
+        return MELEE_PRIORITY_JAB_STRIKE
+    action = getattr(conn, "motion_action", None)
+    if (action is not None and getattr(conn, "motion_kind", None) == "dash"
+            and action[0] == relayserver.epoch_state(conn).gen and at < action[1]):
+        return MELEE_PRIORITY_DASH
+    return MELEE_PRIORITY_IDLE
+
+
+def _cancel_melee(room, seat_index, now, source):
+    """这个座位正在出的近身招式**被打断**了（`vft+0x14c` 停冲刺 / `vft+0x150` 停出拳，X_Mod §111）。
+
+    * bot：停掉服务端这份 `DashSwing`。每台客户端上它那一下已经停了，服务端不跟着停的话，
+      后面几帧它照样判中、照样发伤害 —— 别人屏幕上 bot 的招明明被打断了，人却还在掉血。
+    * 真人：把服务端记的那一招收掉 —— 被他推着的 bot 当场放开（`0x50a63c` 不再成立）、
+      火墙免疫（`_in_melee_motion`）和出拳的第 4 个圆（`_seat_shape`）跟着没了。
+    """
+    if not isinstance(seat_index, int) or not 0 <= seat_index < len(room.seats):
+        return
+    seat = room.seats[seat_index]
+    conn = None if seat is None else seat.conn
+    if conn is None:
+        return
+    if isinstance(conn, BotConn):
+        swing = conn.dash_swing
+        if swing is not None:
+            conn.dash_swing = None
+            conn.log(f"   近身: 这一下被打断了（{source}）—— 句柄 {swing.handle} "
+                     f"第{swing.frame_at(now)}帧起不再判中（X_Mod §111）")
+        return
+    cut = False
+    action = getattr(conn, "motion_action", None)
+    if action is not None and now < action[1]:
+        conn.motion_action = (action[0], now, action[2])
+        cut = True
+    until = getattr(conn, "jab_until", None)
+    if until is not None and now < until:
+        conn.jab_until = None
+        cut = True
+    if cut:
+        asynclog.emit(f"[{gameserver.ts()}] [bot] 座位{seat_index} 的近身招式被打断"
+                      f"（{source}，X_Mod §111）")
+
+
+def _hit_breaks_melee(room, seat_index, damage, flags, source, now=None):
+    """挨了这一发，`Character::OnHit` 里和近身有关的两步（X_Mod §111）。
+
+    1. 进得了门（不在免伤 / 护盾里，`_immune`）就解约束（`0x4ff47c`，格挡也解）——
+       `_knock_back_seat` 也解，但配不上 `rpFire` 的直接命中不走它；
+    2. 没走格挡那一支（`0x80`，`0x4ff486`）且 `int(伤害) ≥ 10`（`0x4ff670`）⇒ 打断招式。
+       类型恒 0，伤害是包里那个数（收方 `_ftol2` 截断后原样进 OnHit）。
+    """
+    if not isinstance(seat_index, int) or not 0 <= seat_index < len(room.seats):
+        return
+    now = _now() if now is None else now
+    if _immune(room, seat_index, now):
+        return
+    seat = room.seats[seat_index]
+    conn = None if seat is None else seat.conn
+    if isinstance(conn, BotConn) and conn.motion_constraint is not None:
+        conn.motion_constraint = None
+        conn.motion_anchor_pending = True
+    if int(damage) < MELEE_INTERRUPT_DAMAGE or flags & EXPLODE_FLAG_GUARD:
+        return
+    _cancel_melee(room, seat_index, now, source)
+
+
 def _apply_motion_constraint(room, machine, terrain, now):
     """0x50e654's horizontal projection, using our existing terrain solver.
 
@@ -2930,20 +3083,13 @@ def _apply_motion_constraint(room, machine, terrain, now):
     facing boundary. It is not snapped to the owner's y or turned into a follower.
     Owner action completion/death/seat replacement/epoch change releases it.
     """
-    link = machine.motion_constraint
-    if link is None or machine.body is None:
+    if machine.motion_constraint is None or machine.body is None:
         return
-    owner, gen, index = link
-    seat = room.seats[index]
-    action = getattr(owner, "motion_action", None)
-    active = (seat is not None and seat.conn is owner
-              and relayserver.epoch_state(owner).gen == gen
-              and action is not None and action[0] == gen and now < action[1]
-              and not _lying_dead(room, index))
-    if not active:
-        machine.motion_constraint = None
-        machine.motion_anchor_pending = True
+    index = _pushed_by(room, machine, now)
+    if index is None:
         return
+    owner, gen, _ = machine.motion_constraint
+    action = owner.motion_action
     point = _seat_body(room, index)
     if point is None:
         return
@@ -3049,6 +3195,10 @@ def note_peer_hit(room, conn, payload):
         # ★ 记账记的是**收方真正扣掉的**：截断 + 格挡（X_Mod §92）。
         _note_damage(room, botsync.handle_seat(target),
                      _landed_damage(damage, flags))
+        # ★ 挨了 ≥ 10 的一发，被打的人手上的近身招式当场停（`0x4ff669`，X_Mod §111）——
+        #   排在下面「配不上 rpFire 就早退」之前：打断看的是包里的伤害，和击退算不算得出来无关。
+        _hit_breaks_melee(room, botsync.handle_seat(target), damage, flags,
+                          "真人直接命中")
         # ★ 毒弹直接命中角色 ⇒ 挂毒（X_Mod §93）。溅射那一路从来不带毒。
         if (botsync.handle_seat(target) is not None
                 and _peer_hit_poisoned(room, conn, bx, by)):
@@ -3087,6 +3237,9 @@ def note_peer_hit(room, conn, payload):
             note_mob_hit(room, target, hit_x, hit_y, create=True)
         _note_damage(room, botsync.handle_seat(target),
                      _landed_damage(damage, flags))
+        # ★ 真人的冲刺打中 bot（36 点那种）就是这一路：bot 那一下在每台客户端上都停了（X_Mod §111）。
+        _hit_breaks_melee(room, botsync.handle_seat(target), damage, flags,
+                          "真人溅射/火/近身")
         # ★ 溅射 / 火 / 近身挂不上武器状态（X_Mod §97：溅射对象不带弹体的键表）。
     seat_index = botsync.handle_seat(target)
     if seat_index is None:
@@ -10253,6 +10406,7 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region, tick):
     if hit:
         # ★ 血量台账（M5-C）记收方真正扣的（带了格挡 `0x80` 就不是包里那个数，X_Mod §95）。
         _note_damage(room, victim_seat, _landed_damage(damage, flags))
+        _hit_breaks_melee(room, victim_seat, damage, flags, "bot 直接命中")   # X_Mod §111
         if shell.poisoned:
             # ★ 带毒的弹直接命中 ⇒ 挂毒（`BulletObj::HitObject` `0x47f096`，
             #   X_Mod §93）。溅射 / 火墙从来不带毒，只有这一路。
@@ -10303,6 +10457,7 @@ def _resolve_shell(room, machine, shell, point, victim_seat, region, tick):
             _score_quest_damage(room, machine, splash)
             continue
         _note_damage(room, seat_index, splash)       # ★ 血量台账（M5-C）
+        _hit_breaks_melee(room, seat_index, splash, splash_flags, "bot 溅射")   # X_Mod §111
         _knock_back_seat(room, seat_index, splash, push, source="bot 溅射")
     # ★★★ **直接砸中人的那一发不铺火墙**（§79）—— 铺火那一段前面有一道
     #   `cmp dword [esp+8], 0 ; jne 出口`（`0x4829d7`），`[esp+8]` 就是
@@ -10630,6 +10785,7 @@ def _advance_fires(room, machine, now):
                     _score_quest_damage(room, machine, hurt)
                     continue
                 _note_damage(room, seat_index, hurt)     # ★ 血量台账（M5-C）
+                _hit_breaks_melee(room, seat_index, hurt, burn_flags, "地面燃烧")  # X_Mod §111
                 _knock_back_seat(room, seat_index, hurt, FIRE_KNOCKBACK,
                                  source="地面燃烧")
     # ★ 两条都算烧完了：推到头了，或者**这一刻它本来就该灭了**
@@ -11068,7 +11224,7 @@ class DashSwing(object):
     """
 
     __slots__ = ("handle", "born", "direction", "move", "character_id",
-                 "frames_done", "hit")
+                 "frames_done", "hit", "outranked")
 
     def __init__(self, handle, born, direction, move, character_id):
         self.handle = int(handle)
@@ -11081,6 +11237,8 @@ class DashSwing(object):
         self.frames_done = -1
         #: 这一下已经打中过了吗（一下只打一次）。
         self.hit = False
+        #: 这一下碰到过、但对方招式优先级更高而没算的座位（只给日志去重用，X_Mod §111）。
+        self.outranked = set()
 
     def frame_at(self, now):
         return int((now - self.born) * 1000.0 / BOT_DASH_FRAME_MS)
@@ -11141,6 +11299,24 @@ def _dash_hits(room, swing, x, y, frame, bodies):
     return None
 
 
+def _outranks_dash(room, machine, swing, seat_index, at):
+    """`seat_index` 在 `at` 那一刻的招式优先级**比冲刺高**吗 —— 高就碰到也不算（`0x481cb8 jg`，X_Mod §111）。
+
+    bot 冲刺时自己的优先级是 1（冲刺计时器在跑）。怪没有 `0x503fde` 那一套，恒不算高。
+    按「这一下 × 这个座位」只打第一次（铁律 10 的口径）。
+    """
+    if not isinstance(seat_index, int):
+        return False
+    rank = _melee_priority(room, seat_index, at)
+    if rank <= MELEE_PRIORITY_DASH:
+        return False
+    if seat_index not in swing.outranked:
+        swing.outranked.add(seat_index)
+        machine.log(f"   近身: 座位{seat_index} 正在出拳的伤害段（优先级 {rank} > "
+                    f"{MELEE_PRIORITY_DASH}），这一下碰到他不算（句柄 {swing.handle}，X_Mod §111）")
+    return True
+
+
 def _advance_dash(room, machine, now):
     """推进**正在进行**的那一下近身攻击，打中了就补一发 `rpSplashDamaged`。
 
@@ -11161,7 +11337,13 @@ def _advance_dash(room, machine, now):
         first = max(swing.frames_done + 1, swing.move.cast_end)
         for step in range(first, min(frame, swing.move.damage_end) + 1):
             swing.frames_done = step
-            landed = _dash_hits(room, swing, x, y, step, bodies)
+            # ★★ 伤害段碰到人先比**招式优先级**（`0x481cb8`，X_Mod §111）：对方正在出拳的
+            #   伤害段（2）比冲刺（1）高 ⇒ 这一帧碰到他也不算，下一帧再看。
+            at = swing.born + step * BOT_DASH_FRAME_MS / 1000.0
+            landed = _dash_hits(room, swing, x, y, step,
+                                [b for b in bodies
+                                 if not _outranks_dash(room, machine, swing,
+                                                       b[0], at)])
             if landed is None:
                 continue
             seat_index, region = landed
@@ -11177,6 +11359,9 @@ def _advance_dash(room, machine, now):
                           else None)
             dash_flags = 0
             if mob_handle is None:
+                # ★★ 伤害段碰到人：先把对方的冲刺 / 出拳停掉（`0x481cc4` / `0x481cce`），
+                #   再算伤害 —— 每台机器都这么做、不看伤害多少（X_Mod §111）。
+                _cancel_melee(room, seat_index, now, f"被座位{machine.my_seat} 的 bot 近身打中")
                 # ★ 受害者一侧（X_Mod §91）：`0x4806bf` 的尾巴。它后面那条
                 #   DashAttack 加成是射手一侧的（`0x481e40`），bot 是白板号。
                 damage, dash_flags = _victim_side(room, machine, seat_index,
@@ -11279,6 +11464,8 @@ def _try_dash(room, machine, seat_index, now, on_ground):
        都在地面输入处理里）；
     2. **体力够** —— 花 `DashNN-SpCost`（角色 0 是 30，满体力 100）；
     3. **上一下打完了** —— 一次只能有一个 `DashSwing`。
+
+    （另有一条在调用方 `_tick_bot`：被别人的近身招式推着时不出手，`_held_by_push`，X_Mod §111。）
 
     ⚠ 收方**不会**替远端角色扣体力（它只是播个动画），所以这里的体力是
     bot 自己给自己上的约束 —— 用户 2026-08-27 说的「消耗体力触发」就是它。
@@ -11915,12 +12102,15 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
             machine.down_latch = False
         if BOT_DIAG_FIRE_ANYWHERE:
             _diag_why_not_firing(room, machine, seat_index, weapon, target, now)
+        # ★★ 被别人的近身招式推着（`0x0017`）的这一段**不出手**：冲刺、开枪都不发
+        #   （X_Mod §111 / D75）—— 不然 bot 8 ms 就反手，把真人先出的那一招抢断。
+        held = acting and _held_by_push(room, machine, now)
         # ★★ **近身冲刺攻击优先于开枪**（§64）：原版这一下会占住整个角色
         #   （`TotalFrame` 那么多帧），真人也开不了枪。够得着就冲，够不着才打枪。
-        dashing = (acting
+        dashing = (acting and not held
                    and not (target is not None and target[0] == BREAKABLE_SEAT)
                    and _try_dash(room, machine, seat_index, now, on_ground))
-        if (acting and not dashing and machine.dash_swing is None
+        if (acting and not held and not dashing and machine.dash_swing is None
                 and target is not None and now >= machine.next_fire_at
                 and _may_fire(machine, weapon)):
             # ★★★ **真扣扳机的这一格重解一次弹道**（§62 / D106）：`rpFire` 里
