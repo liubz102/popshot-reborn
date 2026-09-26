@@ -22,6 +22,7 @@
 import os
 import re
 import struct
+import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -753,6 +754,116 @@ class MoverOriginWritersTest(unittest.TestCase):
             if call_va + 5 + struct.unpack("<i", m.group(1))[0] == 0x0040A01E:
                 found.add(call_va + 5)
         self.assertEqual({c_define(src, "MOVERLK_VA"), c_define(src, "MOVERST_VA")}, found)
+
+
+class ImeNativeUiPatchTest(unittest.TestCase):
+    """X14 / §106 / D70 —— 游戏不再接候选通知、不吞 WM_IME_SETCONTEXT、替输入法回答光标位置。
+
+    补丁只改 `0x40edcb` 那条 call 的 rel32；下面几条钉的是它赖以成立的事实：
+    这条 call 真是去 `ImeContext` 的消息处理、而且是唯一调用点（改一处就管住全部消息），
+    rel32 四字节对齐（运行中原子替换），原函数在 WM_IME_NOTIFY 里拦的正好是我们接走的
+    3 / 4 / 5 / 9，以及算光标位置用的控件几何偏移和 800×600 模式的 1.28 缩放。
+    """
+
+    HANDLER = 0x00428F45
+
+    @classmethod
+    def setUpClass(cls):
+        for path in (BSHOOK, IMG):
+            if not os.path.isfile(path):
+                raise unittest.SkipTest("不在源码仓库里（缺 %s），跳过" % path)
+        cls.img = load_image()
+        cls.src = c_source()
+        cls.va = c_define(cls.src, "IME_MSG_CALL_VA")
+        cls.sig = c_byte_array(cls.src, "IME_MSG_SIG")
+
+    def test_signature_matches_image(self):
+        self.assertEqual(c_define(self.src, "IME_MSG_SIG_LEN"), len(self.sig))
+        self.assertEqual(read_va(self.img, self.va, len(self.sig)), self.sig)
+
+    def test_call_goes_to_ime_handler(self):
+        rel = struct.unpack("<i", read_va(self.img, self.va + 1, 4))[0]
+        self.assertEqual(self.va + 5 + rel, self.HANDLER)
+        self.assertEqual(c_define(self.src, "IME_MSG_HANDLER_JMP"), self.HANDLER)
+
+    def test_it_is_the_only_call_site(self):
+        sites = []
+        for m in re.finditer(br"\xe8(....)", self.img, re.S):
+            call_va = IMAGE_BASE + m.start()
+            if call_va + 5 + struct.unpack("<i", m.group(1))[0] == self.HANDLER:
+                sites.append(call_va)
+        self.assertEqual([self.va], sites)
+
+    def test_rel32_is_dword_aligned(self):
+        # 运行中只换这 4 个字节，靠 InterlockedExchange 原子替换 —— 前提是对齐。
+        self.assertEqual((self.va + 1) % 4, 0)
+
+    # 原函数整段 0x428f45 ~ 0x4292a1（以 0x42929e 的 `ret 0xc` 结尾），860 字节。
+    HANDLER_END = 0x004292A1
+    HANDLER_SHA256 = "77b2d3acf13e61a83a74902bcf3f96482cc2a2fb2f42f70411316da0f8b555ab"
+
+    def test_handler_bytes_pinned(self):
+        # 「原函数照跑、然后吞掉」那条路要在 thunk 里真 call 原函数、调完接着用 esi（ImeContext）；
+        # 这段字节里一条写 esi 的指令都没有（2026-09-26 用 capstone 逐条核过，下一条有 capstone 时
+        # 会再核一遍）。测试运行时里没有 capstone，所以这里把整段字节钉死：字节不变，结论就不变。
+        import hashlib
+        code = read_va(self.img, self.HANDLER, self.HANDLER_END - self.HANDLER)
+        self.assertEqual(code[-3:], bytes.fromhex("c20c00"))                    # ret 0xc
+        self.assertEqual(hashlib.sha256(code).hexdigest(), self.HANDLER_SHA256)
+
+    def test_handler_never_writes_esi(self):
+        # 同上，逐条核：原函数一条写 esi 的指令都没有，esi 进出不变。只在装了 capstone 的开发机上跑。
+        deps = os.path.join(ROOT, "tools", "_pydeps")
+        if os.path.isdir(deps) and deps not in sys.path:
+            sys.path.insert(0, deps)
+        try:
+            import capstone
+            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        except Exception as e:      # 32 位运行时载不进 x64 的 capstone 原生库，是 OSError 不是 ImportError
+            self.skipTest("capstone 用不了（%s）" % e)
+        end = 0x42929E
+        self.assertEqual(read_va(self.img, end, 3), bytes.fromhex("c20c00"))  # ret 0xc
+        code = read_va(self.img, self.HANDLER, end + 3 - self.HANDLER)
+        writes = []
+        for insn in md.disasm(code, self.HANDLER):
+            dst = insn.op_str.split(",")[0].strip()
+            if dst == "esi" and insn.mnemonic not in ("push", "cmp", "test"):
+                writes.append("%08X %s %s" % (insn.address, insn.mnemonic, insn.op_str))
+            if insn.mnemonic in ("pushal", "popal"):
+                writes.append("%08X %s" % (insn.address, insn.mnemonic))
+        self.assertEqual([], writes)
+
+    def test_handler_takes_exactly_these_notifications(self):
+        # 0x428f50: cmp [ebp+8], WM_IME_NOTIFY；jne …；eax = wParam；
+        # sub 3 → je（CHANGE）/ dec → je（CLOSE）/ dec → je（OPEN）/ sub 4 → je（SETCANDIDATEPOS）
+        self.assertEqual(read_va(self.img, 0x428F50, 7), bytes.fromhex("817d0882020000"))
+        self.assertEqual(read_va(self.img, 0x428F60, 3), bytes.fromhex("83e803"))
+        self.assertEqual(read_va(self.img, 0x428F69, 1), b"\x48")
+        self.assertEqual(read_va(self.img, 0x428F6C, 1), b"\x48")
+        self.assertEqual(read_va(self.img, 0x428F6F, 3), bytes.fromhex("83e804"))
+        # 结尾：返回值 = (msg == WM_IME_SETCONTEXT) —— 原版就是这样吞掉它的
+        self.assertEqual(read_va(self.img, 0x429287, 7), bytes.fromhex("817d0881020000"))
+        self.assertEqual(read_va(self.img, 0x42928E, 3), bytes.fromhex("0f94c0"))
+
+    def test_ui_geometry_offsets(self):
+        # SumRect：沿 +0x28 父链累加 +0x10 / +0x14，宽高取 +0x18 / +0x1c
+        self.assertEqual(read_va(self.img, 0x42516A, 9), bytes.fromhex("037110 037914 8b4928"))
+        self.assertEqual(read_va(self.img, 0x425177, 6), bytes.fromhex("8b4a1c8b5218"))
+        # 自带框布局：[Desktop+0x10] = 聚焦的输入框，光标矩形在它 +0x110
+        self.assertEqual(read_va(self.img, 0x43019C, 8), bytes.fromhex("a1b4e272008b7010"))
+        self.assertEqual(read_va(self.img, 0x4301B4, 6), bytes.fromhex("81c610010000"))
+        self.assertEqual(c_define(self.src, "IME_UI_DESKTOP_PP"), 0x72E2B4)
+        # ImeContext 构造：[esi+4] = 主窗口（回答屏幕坐标时拿它做 ClientToScreen）
+        self.assertEqual(read_va(self.img, 0x428D02, 5), bytes.fromhex("53895e04c6"))
+
+    def test_800x600_mode_scale(self):
+        # 0x40f3ab: cmp [App+0x98], 2 → fmul qword [0x693860]（客户区 × 1.28 = 界面）
+        self.assertEqual(read_va(self.img, 0x40F3AB, 7), bytes.fromhex("83bf9800000002"))
+        self.assertEqual(read_va(self.img, 0x40F3B7, 6), bytes.fromhex("dc0d60386900"))
+        self.assertEqual(struct.unpack("<d", read_va(self.img, 0x693860, 8))[0], 1.28)
+        self.assertEqual(c_define(self.src, "IME_UI_SCALE_VA"), 0x693860)
+        self.assertEqual(c_define(self.src, "IME_UI_MODE_800X600"), 2)
+        self.assertEqual(c_define(self.src, "IME_UI_APP_PP"), 0x72E2A4)
 
 
 if __name__ == "__main__":

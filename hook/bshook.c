@@ -20,6 +20,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <imm.h>        /* 只用结构体 / 常量（IMECHARPOSITION、CANDIDATEFORM），不调 Imm* 函数 */
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -3335,6 +3336,351 @@ static int try_patch_sum_rect_guard(void)
     bslog("PATCH   ★IME 闪退修复2/2 @ %08X: 坐标换算头指针为空/野值时输出"
           "全零矩形（修复1/2 生效后 head=0 合法，原版这里会读 [0+0x1C]）",
           (unsigned)SUM_RECT_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★ 输入法一律用它自己的候选界面（X14，FINDINGS §106 / D70）                 */
+/*                                                                            */
+/*   原版 `ImeContext` 的消息处理 0x428f45 自己接候选通知、自己画那个竖排选字框 */
+/*   （UiImeCandidates，布局 0x430102），还把 WM_IME_SETCONTEXT 吞掉 —— 那是   */
+/*   照老式 IMM 输入法写的。现在的输入法都自带候选界面，游戏那个框只是重复的一份，*/
+/*   而且和它们对不上：搜狗在游戏里只发 OPEN / CHANGE、从不发 CLOSE（框清不掉）， */
+/*   选中序号还会越过它给的条数（翻到第三行框就没了）；微软拼音压根不给候选。   */
+/*                                                                            */
+/*   0x428f45 全镜像只有 0x40edcb 一个调用点（esi = ImeContext，栈上 msg /     */
+/*   &wParam / &lParam，`ret 0xc`；返回非 0 ⇒ 窗口过程直接返回 1、不进         */
+/*   DefWindowProcW）。把这个 call 改指到 ime_msg_thunk，先分流一道：          */
+/*     · IMN_OPEN / CHANGE / CLOSECANDIDATE、IMN_SETCANDIDATEPOS → 返回 0：    */
+/*       窗口过程照常交给 DefWindowProcW。游戏的词表永远是空的，自带框永不出现； */
+/*     · WM_IME_SETCONTEXT → 返回 0：不再吞（老式输入法靠它才肯显示自己的窗口），*/
+/*       但去掉 ISC_SHOWUICOMPOSITIONWINDOW —— 游戏自己在输入框里画拼音；        */
+/*     · WM_IME_REQUEST 的 QUERYCHARPOSITION / CANDIDATEWINDOW → 用此刻聚焦的   */
+/*       输入框回答光标和矩形，返回 1（= 窗口过程返回 TRUE）；                  */
+/*     · 每条消息先比一下「聚焦输入框 + 光标」，变了就用 ImmSetCompositionWindow */
+/*       / ImmSetCandidateWindow 主动写进上下文（询问只在激活时来一次，微软拼音 */
+/*       只认这两个）。原版什么都不答也不设：搜狗挤右下角、微软拼音挤左上角；    */
+/*     · WM_IME_START / ENDCOMPOSITION、不带上屏结果的 WM_IME_COMPOSITION →     */
+/*       原函数照跑（重读拼音、输入框里画），然后吞掉：不进 DefWindowProcW，系统 */
+/*       就不再替微软拼音另开一个组字窗叠在游戏那份拼音上。带上屏结果的那条照交 */
+/*       （游戏靠它变成 WM_CHAR），只去掉拼音那几位；                           */
+/*     · 其余照走原函数。                                                       */
+/* -------------------------------------------------------------------------- */
+#define IME_MSG_CALL_VA       0x0040EDCBu  /* call 0x428f45（全镜像唯一调用点） */
+#define IME_MSG_SIG_LEN       13
+static const unsigned char IME_MSG_SIG[IME_MSG_SIG_LEN] = {
+    0xE8, 0x75, 0xA1, 0x01, 0x00,       /* call 0x428f45（ImeContext 消息处理）  */
+    0x85, 0xC0,                         /* test eax, eax                        */
+    0x0F, 0x85, 0xFD, 0x04, 0x00, 0x00  /* jne 0x40f2d5（返回 1、不进默认处理）  */
+};
+/* thunk 里要用的立即数不带后缀（MSVC 内联汇编不吃 0x…u 这种写法） */
+#define IME_MSG_HANDLER_JMP   0x00428F45
+
+#define IME_UI_DESKTOP_PP     0x0072E2B4u  /* Desktop 单例；+0x10 = 此刻聚焦的输入框 */
+#define IME_UI_APP_PP         0x0072E2A4u  /* App 单例；+0x98 = 显示模式            */
+#define IME_UI_MODE_800X600   2            /* 界面照 1024×768 排，整窗缩到 800×600   */
+#define IME_UI_SCALE_VA       0x00693860u  /* double 1.28：0x40f3b7 拿它把光标换成界面坐标 */
+
+static volatile LONG g_ime_native_patched = 0;
+
+/* imm32 里要用的四个函数：游戏自己就导入了 imm32，按名字取，不往 build.bat 里加库。 */
+typedef HIMC (WINAPI *ime_get_ctx_fn)(HWND);
+typedef BOOL (WINAPI *ime_rel_ctx_fn)(HWND, HIMC);
+typedef BOOL (WINAPI *ime_set_comp_fn)(HIMC, LPCOMPOSITIONFORM);
+typedef BOOL (WINAPI *ime_set_cand_fn)(HIMC, LPCANDIDATEFORM);
+static ime_get_ctx_fn  g_imm_get_ctx;
+static ime_rel_ctx_fn  g_imm_rel_ctx;
+static ime_set_comp_fn g_imm_set_comp;
+static ime_set_cand_fn g_imm_set_cand;
+
+/* 下面这几格只在游戏 UI 线程（窗口过程里）读写，不加锁。 */
+static const void *g_ime_pos_edit;        /* 上次把位置告诉输入法时聚焦的输入框 */
+static RECT        g_ime_pos_box;         /* 上次告诉的输入框矩形（客户区） */
+static RECT        g_ime_pos_caret;       /* 上次告诉的光标矩形（客户区） */
+static int         g_ime_req_said = -1;   /* 位置询问：上次记日志时「答了 / 没答」 */
+
+static LONG ime_ui_to_client(int v, double k)
+{
+    double d = v / k;
+    return (LONG)(d >= 0.0 ? d + 0.5 : d - 0.5);
+}
+
+/* 此刻聚焦的输入框在客户区里的矩形和光标（都是客户区坐标）。没有聚焦的输入框返回 0。
+   几何全照原版：控件 +0x10/+0x14 是相对父控件（+0x28）的 x/y、+0x18/+0x1c 是宽高
+   （SumRect 0x42515E 就是沿父链这么累加的）；UiEdit +0x110 是光标矩形（相对输入框，
+   原版自带框 0x4301b4 就贴着它摆，画输入框时才更新）。显示模式 2 时界面坐标比客户区
+   大 1.28 倍（0x40f3ab 那段做的是反方向：客户区 × 1.28 = 界面），这里除回去。
+   `edit_out` 可以是 NULL。 */
+static int ime_focus_geometry(RECT *box, RECT *caret, const void **edit_out)
+{
+    const unsigned char *desk, *edit, *c, *app;
+    const int *cr;
+    int x = 0, y = 0;
+    double k = 1.0;
+
+    if (IsBadReadPtr((const void *)IME_UI_DESKTOP_PP, 4)) return 0;
+    desk = *(const unsigned char * const *)IME_UI_DESKTOP_PP;
+    if ((UINT_PTR)desk < 0x10000 || IsBadReadPtr(desk + 0x10, 4)) return 0;
+    edit = *(const unsigned char * const *)(desk + 0x10);
+    if ((UINT_PTR)edit < 0x10000 || IsBadReadPtr(edit, 0x120)) return 0;
+    for (c = edit; (UINT_PTR)c >= 0x10000; c = *(const unsigned char * const *)(c + 0x28)) {
+        if (IsBadReadPtr(c, 0x2c)) return 0;
+        x += *(const int *)(c + 0x10);
+        y += *(const int *)(c + 0x14);
+    }
+    if (!IsBadReadPtr((const void *)IME_UI_APP_PP, 4)) {
+        app = *(const unsigned char * const *)IME_UI_APP_PP;
+        if ((UINT_PTR)app >= 0x10000 && !IsBadReadPtr(app + 0x98, 4)
+            && *(const int *)(app + 0x98) == IME_UI_MODE_800X600
+            && !IsBadReadPtr((const void *)IME_UI_SCALE_VA, 8))
+            k = *(const double *)IME_UI_SCALE_VA;
+    }
+    if (!(k > 0.0)) k = 1.0;
+    cr = (const int *)(edit + 0x110);
+    box->left     = ime_ui_to_client(x, k);
+    box->top      = ime_ui_to_client(y, k);
+    box->right    = ime_ui_to_client(x + *(const int *)(edit + 0x18), k);
+    box->bottom   = ime_ui_to_client(y + *(const int *)(edit + 0x1c), k);
+    caret->left   = ime_ui_to_client(x + cr[0], k);
+    caret->top    = ime_ui_to_client(y + cr[1], k);
+    caret->right  = ime_ui_to_client(x + cr[2], k);
+    caret->bottom = ime_ui_to_client(y + cr[3], k);
+    if (edit_out) *edit_out = edit;
+    return 1;
+}
+
+static int ime_imm_ready(void)
+{
+    HMODULE m;
+
+    if (g_imm_get_ctx && g_imm_rel_ctx && g_imm_set_comp && g_imm_set_cand) return 1;
+    m = GetModuleHandleA("imm32.dll");
+    if (m == NULL) return 0;
+    g_imm_get_ctx  = (ime_get_ctx_fn)GetProcAddress(m, "ImmGetContext");
+    g_imm_rel_ctx  = (ime_rel_ctx_fn)GetProcAddress(m, "ImmReleaseContext");
+    g_imm_set_comp = (ime_set_comp_fn)GetProcAddress(m, "ImmSetCompositionWindow");
+    g_imm_set_cand = (ime_set_cand_fn)GetProcAddress(m, "ImmSetCandidateWindow");
+    return g_imm_get_ctx && g_imm_rel_ctx && g_imm_set_comp && g_imm_set_cand;
+}
+
+/* 把「聚焦输入框的光标在哪」主动写进输入法上下文（组字窗 + 候选窗的位置）。
+   ★ 为什么要主动写：输入法的位置询问（IMR_QUERYCHARPOSITION）只在窗口**激活那一刻**来一次
+     （实测：打字过程中一次都不问），那时多半还没有聚焦的输入框 —— 搜狗就退回右下角，
+     alt+tab 切回来那次答上了才挪对；微软拼音更是根本不看这个问答，只认程序用
+     ImmSetCompositionWindow / ImmSetCandidateWindow 设的位置（原版从来不设 ⇒ 左上角）。
+   ★ 什么时候写：窗口过程每来一条消息就比一下「聚焦的输入框 + 输入框矩形 + 光标矩形」，
+     **变了才写**（按状态翻转，不按次数 / 时间）。光标矩形是画输入框时更新的，打一个字之后
+     下一条消息就能看到新位置。先记下「已写的值」再调 Imm：这两个调用会同步回发
+     IMN_SETCOMPOSITIONWINDOW / IMN_SETCANDIDATEPOS，重入进来时已经是「没变」，不会绕圈。
+   ★ 焦点换了才记一行日志（光标每挪一下都记就是刷屏）。 */
+static void ime_sync_forms(const unsigned char *ctx)
+{
+    RECT box, caret;
+    const void *edit = NULL;
+    HWND hwnd;
+    HIMC himc;
+    COMPOSITIONFORM cf;
+    CANDIDATEFORM cand;
+    BOOL ok_comp, ok_cand;
+    int focus_changed;
+
+    if (!ime_focus_geometry(&box, &caret, &edit)) {
+        g_ime_pos_edit = NULL;              /* 下次聚焦时一定重写一遍 */
+        return;
+    }
+    if (edit == g_ime_pos_edit && EqualRect(&box, &g_ime_pos_box)
+        && EqualRect(&caret, &g_ime_pos_caret))
+        return;
+    focus_changed = edit != g_ime_pos_edit;
+    g_ime_pos_edit = edit;
+    g_ime_pos_box = box;
+    g_ime_pos_caret = caret;
+    if ((UINT_PTR)ctx < 0x10000 || !ime_imm_ready()) return;
+    hwnd = *(HWND const *)(ctx + 4);        /* ImeContext+4 = 游戏主窗口（构造时记的） */
+    himc = g_imm_get_ctx(hwnd);
+    if (himc == NULL) {
+        /* 这个输入框没开输入法（原版对不允许输入法的输入框会拆掉上下文）：
+           不写，等下次有上下文时按「变了」再来。 */
+        g_ime_pos_edit = NULL;
+        return;
+    }
+    memset(&cf, 0, sizeof(cf));
+    cf.dwStyle = CFS_POINT;
+    cf.ptCurrentPos.x = caret.left;
+    cf.ptCurrentPos.y = caret.top;
+    cf.rcArea = box;
+    ok_comp = g_imm_set_comp(himc, &cf);
+    memset(&cand, 0, sizeof(cand));
+    cand.dwIndex = 0;
+    cand.dwStyle = CFS_EXCLUDE;             /* 贴着光标摆、别盖住输入框 */
+    cand.ptCurrentPos.x = caret.left;
+    cand.ptCurrentPos.y = caret.top;
+    cand.rcArea = box;
+    ok_cand = g_imm_set_cand(himc, &cand);
+    g_imm_rel_ctx(hwnd, himc);
+    if (focus_changed)
+        bslog("IME     聚焦输入框 %08X：框 (%ld,%ld)-(%ld,%ld) 光标 (%ld,%ld) → "
+              "组字窗位置 %s、候选窗位置 %s", (unsigned)(UINT_PTR)edit,
+              box.left, box.top, box.right, box.bottom, caret.left, caret.top,
+              ok_comp ? "已设" : "失败", ok_cand ? "已设" : "失败");
+}
+
+/* 回答输入法的位置询问。返回 1 = 答了（窗口过程返回 TRUE）；0 = 交给 DefWindowProcW。 */
+static int ime_answer_request(const unsigned char *ctx, WPARAM req, LPARAM lp)
+{
+    RECT box, caret;
+    POINT tl, br;
+    HWND hwnd;
+    int answered;
+
+    if (req != IMR_QUERYCHARPOSITION && req != IMR_CANDIDATEWINDOW) return 0;
+    answered = lp != 0 && ime_focus_geometry(&box, &caret, NULL);
+    if (answered != g_ime_req_said) {        /* 按「答了 / 没答」翻转记一行 */
+        g_ime_req_said = answered;
+        bslog("IME     输入法问光标位置（%s）：%s",
+              req == IMR_QUERYCHARPOSITION ? "IMR_QUERYCHARPOSITION" : "IMR_CANDIDATEWINDOW",
+              answered ? "答了（聚焦输入框的光标）" : "没答（此刻没有聚焦的输入框）");
+    }
+    if (!answered) return 0;
+    if (req == IMR_CANDIDATEWINDOW) {
+        /* 客户区坐标；dwIndex 输入法已经填好。CFS_EXCLUDE：贴着光标摆、别盖住输入框。 */
+        CANDIDATEFORM *cf = (CANDIDATEFORM *)lp;
+        cf->dwStyle = CFS_EXCLUDE;
+        cf->ptCurrentPos.x = caret.left;
+        cf->ptCurrentPos.y = caret.top;
+        cf->rcArea = box;
+        return 1;
+    }
+    /* IMR_QUERYCHARPOSITION：屏幕坐标。dwCharPos 不看 —— 游戏不给输入法排组字串，
+       哪个字都答光标那一点；rcDocument 给整个输入框。 */
+    {
+        IMECHARPOSITION *cp = (IMECHARPOSITION *)lp;
+        hwnd = *(HWND const *)(ctx + 4);        /* ImeContext+4 = 游戏主窗口（构造时记的） */
+        cp->pt.x = caret.left;
+        cp->pt.y = caret.top;
+        ClientToScreen(hwnd, &cp->pt);
+        cp->cLineHeight = caret.bottom > caret.top ? (UINT)(caret.bottom - caret.top)
+                                                   : (UINT)(box.bottom - box.top);
+        tl.x = box.left;  tl.y = box.top;
+        br.x = box.right; br.y = box.bottom;
+        ClientToScreen(hwnd, &tl);
+        ClientToScreen(hwnd, &br);
+        SetRect(&cp->rcDocument, tl.x, tl.y, br.x, br.y);
+        return 1;
+    }
+}
+
+#define IME_FILTER_ORIG      (-1)   /* 照走原函数（它的返回值原样给窗口过程） */
+#define IME_FILTER_ORIG_EAT  (-2)   /* 原函数照跑，然后吞掉：窗口过程返回 1、不进 DefWindowProcW */
+#define IME_RESULT_FLAGS     (GCS_RESULTREADSTR | GCS_RESULTREADCLAUSE | GCS_RESULTSTR | GCS_RESULTCLAUSE)
+
+/* 返回 IME_FILTER_ORIG / IME_FILTER_ORIG_EAT，或者 0 / 1 = 顶替原函数的返回值
+   （0 → 窗口过程往下走、最后进 DefWindowProcW；1 → 窗口过程直接返回 1）。 */
+static int __stdcall ime_msg_filter(const unsigned char *ctx, UINT msg,
+                                    WPARAM *pw, LPARAM *pl)
+{
+    ime_sync_forms(ctx);
+    switch (msg) {
+    /* 组字三条：原函数照跑（重读拼音、输入框里画），但**别交给 DefWindowProcW** —— 交过去
+       系统就替会给拼音的输入法（微软拼音）开一个组字窗，位置写对之后它正好叠在游戏画的
+       那份拼音上（实测两层字）。自己画拼音的程序本来就该吞掉这三条。
+       ★ 唯一的例外是带上屏结果的那条：游戏靠 DefWindowProcW 把它变成 WM_IME_CHAR → WM_CHAR
+         送进输入框，所以照交，只把拼音那几位去掉（去掉之后系统没有组字可显示）。 */
+    case WM_IME_STARTCOMPOSITION:
+    case WM_IME_ENDCOMPOSITION:
+        return IME_FILTER_ORIG_EAT;
+    case WM_IME_COMPOSITION:
+        if (!((DWORD)*pl & GCS_RESULTSTR)) return IME_FILTER_ORIG_EAT;
+        *pl = (LPARAM)((DWORD)*pl & IME_RESULT_FLAGS);
+        return IME_FILTER_ORIG;
+    case WM_IME_SETCONTEXT:
+        /* 放行给 DefWindowProcW，但去掉「显示输入法自己的组字窗」：会把拼音交给程序的输入法
+           （微软拼音），游戏本来就在输入框里画一份，位置写对之后那个组字窗会叠在它上面。
+           `pl` 指的就是窗口过程自己的 lParam 那一格（0x40edc2 `lea eax,[ebp+0x14]`），
+           改了之后 0x40f2a0 交给 DefWindowProcW 的就是改过的值。 */
+        *pl = (LPARAM)((DWORD)*pl & ~(DWORD)ISC_SHOWUICOMPOSITIONWINDOW);
+        return 0;
+    case WM_IME_NOTIFY:
+        switch (*pw) {
+        case IMN_OPENCANDIDATE:
+        case IMN_CHANGECANDIDATE:
+        case IMN_CLOSECANDIDATE:
+        case IMN_SETCANDIDATEPOS:
+            return 0;
+        }
+        return IME_FILTER_ORIG;
+    case WM_IME_REQUEST:
+        return ime_answer_request(ctx, *pw, *pl);
+    }
+    return IME_FILTER_ORIG;
+}
+
+/* 0x40edcb 的 call 改指这里。入口栈：[esp] = 返回地址 0x40edd0、[esp+4] = msg、
+   [esp+8] = &wParam、[esp+0xc] = &lParam；esi = ImeContext（寄存器传参）。
+   ★ 不调原函数的那几条也要 `ret 0xc` —— 原函数自己清参数，调用方不管。
+   ★ IME_FILTER_ORIG：栈和 esi 原样不动，直接尾跳过去，由它 `ret 0xc` 回 0x40edd0。
+   ★ IME_FILTER_ORIG_EAT：把三个参数原样再压一遍、真 call 原函数（它 `ret 0xc` 回到这里），
+     然后 eax = 1 再 `ret 0xc` —— 窗口过程见非 0 直接返回 1。原函数一条指令都不写 esi
+     （test_patchsites 钉着），所以调完 esi 还是 ImeContext。
+   ★ 调用方之后还要用 ebx（msg）/ edi（App）：C 函数和原函数都按约定保；ecx / edx
+     调用方不读（原函数本来就会改它们）。 */
+static __declspec(naked) void ime_msg_thunk(void)
+{
+    __asm {
+        push dword ptr [esp + 0x0c]         /* &lParam */
+        push dword ptr [esp + 0x0c]         /* &wParam（上一条 push 已让偏移 +4） */
+        push dword ptr [esp + 0x0c]         /* msg */
+        push esi                            /* ImeContext */
+        call ime_msg_filter                 /* __stdcall，自己清 16 字节 */
+        cmp  eax, IME_FILTER_ORIG
+        je   imt_orig
+        cmp  eax, IME_FILTER_ORIG_EAT
+        je   imt_orig_eat
+        ret  0x0c
+    imt_orig:
+        mov  eax, IME_MSG_HANDLER_JMP
+        jmp  eax
+    imt_orig_eat:
+        push dword ptr [esp + 0x0c]         /* &lParam */
+        push dword ptr [esp + 0x0c]         /* &wParam */
+        push dword ptr [esp + 0x0c]         /* msg */
+        mov  eax, IME_MSG_HANDLER_JMP
+        call eax                            /* 原函数照跑，自己 ret 0xc */
+        mov  eax, 1
+        ret  0x0c
+    }
+}
+
+static int try_patch_ime_native_ui(void)
+{
+    unsigned char *p = (unsigned char *)IME_MSG_CALL_VA;
+    LONG rel = (LONG)((UINT_PTR)&ime_msg_thunk - (UINT_PTR)(p + 5));
+    DWORD oldp;
+
+    if (g_ime_native_patched) return 1;
+    if (IsBadReadPtr(p, IME_MSG_SIG_LEN)) return 0;
+    /* 幂等：已打过就是「E8 <到 thunk 的 rel32>」，后面 8 字节照旧 */
+    if (p[0] == 0xE8 && *(LONG *)(p + 1) == rel
+        && memcmp(p + 5, IME_MSG_SIG + 5, IME_MSG_SIG_LEN - 5) == 0) {
+        InterlockedExchange(&g_ime_native_patched, 1);
+        return 1;
+    }
+    if (memcmp(p, IME_MSG_SIG, IME_MSG_SIG_LEN) != 0)
+        return 0;                    /* 还没解壳到这里，或不是已确认的版本 */
+
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   输入法原生候选: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    /* 只换 rel32 这 4 个字节：它在 0x40edcc，**4 字节对齐** ⇒ 一次原子替换，
+       窗口过程此刻正好在跑这条 call 也只会看到整旧或整新（test_patchsites 钉着对齐）。 */
+    InterlockedExchange((volatile LONG *)(p + 1), rel);
+    VirtualProtect(p, 5, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    InterlockedExchange(&g_ime_native_patched, 1);
+    bslog("PATCH   ★输入法原生候选 @ %08X：游戏不再接候选通知（自带选字框不再出现）、"
+          "不再吞 WM_IME_SETCONTEXT、替输入法回答光标位置", (unsigned)IME_MSG_CALL_VA);
     return 1;
 }
 
@@ -10547,6 +10893,15 @@ static DWORD WINAPI patch_thread(LPVOID param)
             bslog("PATCH   !! 超时未能 patch IME 闪退修复"
                   "（0x4269AB / 0x42515E / 0x4301B4 特征串一直对不上）");
     }
+
+    /* 输入法用它自己的候选界面（X14 / §106 / D70）：和 IME 那组一样不赶时机，只等特征串。 */
+    for (ticks = 0; !g_stop && !g_ime_native_patched && ticks < 2000; ticks++) {
+        if (try_patch_ime_native_ui()) break;
+        Sleep(2);
+    }
+    if (!g_ime_native_patched)
+        bslog("PATCH   !! 超时未能 patch 输入法原生候选"
+              "（0x40EDCB 特征串一直对不上）—— 游戏自带的选字框照旧");
 
     /* 溅射加成提示判空（V0.3 合成与商店 §47 / D55）：穿着 IncSplashRange 装备
        （火焰蝙蝠 220003）用溅射武器打空，15% 概率整个客户端闪退。
