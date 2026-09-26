@@ -460,6 +460,8 @@ class BotConn(gameserver.Conn):
         self.push_hold_logged = None
         #: 「先让他打完」锁住的那一下：`(座位, 那一发 rpDash 的记号)`（`_yield_to_melee`，X_Mod §113）。
         self.melee_yield = None
+        #: 「我冲出去会撞进他那一招」锁住的那一下，只拦冲刺（`_yield_dash_to_melee`，X_Mod §116 / D81）。
+        self.dash_yield = None
         #: 上一发**踩地**心跳报出去的 `(方向键, 冲刺位)`。收方拿这两样替 bot
         #: 走接下来那一段（`0x507660`），所以它们一翻转就是收方复现不出来的
         #: 运动突变，当格补锚（V0.3 §190 / D149）。腾空时记 `None`（腾空收方
@@ -807,6 +809,7 @@ class BotConn(gameserver.Conn):
         self.motion_constraint = None
         self.push_hold_logged = None
         self.melee_yield = None
+        self.dash_yield = None
         self.walk_reported = None
         self.trail_mark = None
         self.trail_heading = 0
@@ -2937,11 +2940,17 @@ def _note_motion_event(room, conn, opcode, body, sequence):
     if len(body) != 8:
         return
     victim, owner = struct.unpack("<ii", body)
-    seat_index, owner_index = botsync.handle_seat(victim), botsync.handle_seat(owner)
-    if (seat_index is None or owner_index is None or seat_index == owner_index
-            or owner_index != room.seat_index_of(conn)
-            or victim != botsync.character_handle(seat_index)
+    owner_index = botsync.handle_seat(owner)
+    if (owner_index is None or owner_index != room.seat_index_of(conn)
             or owner != botsync.character_handle(owner_index)):
+        return
+    # ★★ 收方处理 `0x0017` 的第一步是把**出招者自己**身上的约束解掉（`0x49361e`：先 `0x50e636(出招者, 0)`，再挂受害者，
+    #   X_Mod §116 / D81）⇒ 他被 bot 推着的时候自己的推挤段推了别人（推 bot、推怪都一样），他那台上他就挣脱了。
+    #   服务端以前不放，bot 推他、他推 bot 两个约束同时挂着，同向时一格互相顶一次 —— 00:15:54 bot 0.7 秒被顶出去 1000 px。
+    _release_pusher(room, owner_index)
+    seat_index = botsync.handle_seat(victim)
+    if (seat_index is None or seat_index == owner_index
+            or victim != botsync.character_handle(seat_index)):
         return
     seat = room.seats[seat_index]
     target = None if seat is None else seat.conn
@@ -3005,7 +3014,7 @@ def _held_by_push(room, machine, now):
     return True
 
 
-def _melee_threat(room, machine, seat_index, now, terrain=None):
+def _melee_threat(room, machine, seat_index, now, terrain=None, course=None):
     """有没有人**先出了手**、那一招接下来碰得到这个 bot：有就返回 `(他的座位号, 第几帧碰到)`（X_Mod §113 / D79）。
 
     ## 为什么要有它
@@ -3025,21 +3034,18 @@ def _melee_threat(room, machine, seat_index, now, terrain=None):
     推挤段碰到也算（碰到就会被推住，之后就是他的伤害段）；`DontPush` 的招只看伤害段；伤害 0 的招（纯位移）不算。
     只看敌人（同一碰撞组整个不碰）。出拳不在这里：`Jab00` 没写圈，它推到人会发 `0x0017`（`_held_by_push`），
     伤害段的优先级 2 本来就压得住 bot 的冲刺（`_outranks_dash`）。
+
+    `course` 给了 = 「我这一格冲出去」那条路（`_dash_course` 走出来的每一帧，X_Mod §116 / D81）：他往后第 j 格的圈拿我
+    **第 j 帧**冲到的地方比（这一帧挪之前、挪之后两处都算），不是拿此刻站的地方比 —— 对冲的时候是我自己冲进他那一招里。
     """
     here = machine.battle_pos
     if here is None:
         return None
-    mine = [(seat_index, here[0], here[1], bool(machine.crouched),
-             _seat_shape(room, seat_index, now))]
-    group = _seat_group(room, seat_index)
-    for index, seat in enumerate(room.seats):
-        if (index == seat_index or seat is None or getattr(seat, "is_bot", False)
-                or seat.conn is None or _seat_group(room, index) == group):
-            continue
+    crouched = bool(machine.crouched)
+    shape = _seat_shape(room, seat_index, now)
+    mine = [(seat_index, here[0], here[1], crouched, shape)]
+    for index, seat, now_at in _melee_underway(room, seat_index, now):
         conn = seat.conn
-        now_at = _human_dash_now(room, index, conn, now)
-        if now_at is None:
-            continue
         before, body, frame = now_at
         move, action = conn.motion_move, conn.motion_action
         first = max(0, frame if move.pushes else max(frame, move.cast_end))
@@ -3057,10 +3063,30 @@ def _melee_threat(room, machine, seat_index, now, terrain=None):
                     else:
                         body = botmove.frame(terrain, body, who, melee=True,
                                              dash_step=dist).body
-            if step >= first and _dash_sweep(room, probe, (before.x, before.y),
-                                             (body.x, body.y), step, mine):
+            if step < first:
+                continue
+            if course is None:
+                spots = mine
+            else:
+                start, after = course[min(step - frame, len(course) - 1)]
+                spots = [(seat_index, start[0], start[1], crouched, shape),
+                         (seat_index, after[0], after[1], crouched, shape)]
+            if _dash_sweep(room, probe, (before.x, before.y), (body.x, body.y),
+                           step, spots):
                 return index, step
     return None
+
+
+def _melee_underway(room, seat_index, now):
+    """敌方真人里**正在出冲刺、还没过伤害段**的：逐个给 `(座位号, 座位, _human_dash_now 的结果)`（X_Mod §113 / §116）。"""
+    group = _seat_group(room, seat_index)
+    for index, seat in enumerate(room.seats):
+        if (index == seat_index or seat is None or getattr(seat, "is_bot", False)
+                or seat.conn is None or _seat_group(room, index) == group):
+            continue
+        now_at = _human_dash_now(room, index, seat.conn, now)
+        if now_at is not None:
+            yield index, seat, now_at
 
 
 def _human_dash_now(room, index, conn, now):
@@ -3113,6 +3139,40 @@ def _yield_to_melee(room, machine, seat_index, now, terrain=None):
                                           "motion_action_mark", None))
     machine.log(f"   近身: 座位{index} 先出了近身招式、第{frame}帧起碰得到我，先让他打完"
                 f" —— 不冲、不开枪（X_Mod §113 / D79）")
+    return True
+
+
+def _yield_dash_to_melee(room, machine, seat_index, move, direction, terrain, now):
+    """我这一下**冲出去**会撞进别人先出的那一招：这一段**不冲**（X_Mod §116 / D81）。开枪另算，看 `_yield_to_melee`。
+
+    `_yield_to_melee` 拿他那一招比的是我**此刻站的地方** —— 对冲时站着的我他够不着，可我一冲就自己冲进了他的圈：
+    00:15:19 他冲过来、bot 晚 92 ms 反冲；00:14:38 他背对 bot 冲、bot 晚 26 ms 冲他后背（他那台第 0 帧就推住了 bot）。
+    按原版同级谁先进伤害段谁赢，bot 第 6 帧早于他第 17 帧 —— 用户 2026-09-27 又报的「我先发近身攻击却被 bot 打」。
+    ⇒ 把我这一下冲的路（`_dash_course`，和真冲同一套挪法）上每一帧的站位拿去和他那一招一帧帧比，碰得到就不冲；
+      判出来一次就**锁住他那一下**到过伤害段（和 `melee_yield` 同一个道理：外推里被推的那一下还没发生，他会穿过去，
+      下一格就判「不碰了」）。开枪不动身子，照旧只看此刻站的地方。
+    """
+    latch = machine.dash_yield
+    if latch is not None and _latched_dash_open(room, latch, now):
+        return True
+    machine.dash_yield = None
+    if terrain is None or machine.body is None:
+        return False            # 不跟着冲（没地形）= 原地出招，`_yield_to_melee` 已经比过了
+    if next(_melee_underway(room, seat_index, now), None) is None:
+        return False            # 没人在出招：不用把这一下冲的路推一遍
+    probe = DashSwing(0, now, direction, move, machine.character_id, lunge=True)
+    who = chrprops.get(_seat_shape(room, seat_index, now))
+    course = [(start, after) for _, start, _, after
+              in _dash_course(terrain, machine.body, who, probe)]
+    threat = (_melee_threat(room, machine, seat_index, now, terrain,
+                            course=course) if course else None)
+    if threat is None:
+        return False
+    index, frame = threat
+    machine.dash_yield = (index, getattr(room.seats[index].conn,
+                                         "motion_action_mark", None))
+    machine.log(f"   近身: 座位{index} 先出了近身招式，我朝{'右' if direction > 0 else '左'}冲的话"
+                f"他第{frame}帧就碰得到我 —— 这一下不冲，先让他打完（X_Mod §116 / D81）")
     return True
 
 
@@ -11468,7 +11528,7 @@ class DashSwing(object):
 
     __slots__ = ("handle", "born", "direction", "move", "character_id",
                  "frames_done", "hit", "outranked", "lunge", "origins",
-                 "pushes_done", "carried")
+                 "pushes_done", "carried", "released")
 
     def __init__(self, handle, born, direction, move, character_id, lunge=False):
         self.handle = int(handle)
@@ -11493,6 +11553,9 @@ class DashSwing(object):
         #: 被这一下推着走的人 / 怪（`{座位号 或 ("mob", 句柄): 哪一帧贴上的}`，X_Mod §115 / D80）：
         #:   替它发过 `0x0017` 的；这一下收招 / 被打断、那人挨打（`_release_carry`）就不推了。
         self.carried = {}
+        #: 被推着的时候**自己反手推了人**、从这一下里挣脱的（`_release_pusher`，X_Mod §116 / D81）：这一下剩下的推挤段
+        #: 不再推他 —— 他那台贴着就每帧重发 `0x0017`（BSM1 不给 bot 挂约束），推回去就是一格一格来回拽。
+        self.released = set()
 
     def frame_at(self, now):
         # 房间那一格的时刻是 `t0 + k × 32 ms` 的浮点数，两格相减常差一个 ulp（3.9999… 截成 3）—— 补一点浮点噪声再截断，
@@ -11707,7 +11770,8 @@ def _dash_push(room, machine, swing, start, end, frame, bodies, now):
     """
     for body in bodies:
         key = body[0]
-        if key in swing.carried or not _may_push(room, key, now):
+        if (key in swing.carried or key in swing.released
+                or not _may_push(room, key, now)):
             continue
         if _dash_sweep(room, swing, start, end, frame, [body]) is None:
             continue
@@ -11721,6 +11785,11 @@ def _dash_push(room, machine, swing, start, end, frame, bodies, now):
         who = f"怪 {key[1]}" if isinstance(key, tuple) else f"座位{key}"
         machine.log(f"   近身: 推挤段第{frame}帧贴住了{who}，替它发 `0x0017` 推着走"
                     f"（句柄 {swing.handle}，X_Mod §115 / D80）")
+        # ★ 出招者自己身上的约束先解掉（`0x49361e` 第一步 `0x50e636(出招者, 0)`，X_Mod §116 / D81）：
+        #   它冲着冲着被人推住了、自己的推挤段又推上了人，每台收方都把它放开 —— 服务端这份也放。
+        if machine.motion_constraint is not None:
+            machine.motion_constraint = None
+            machine.motion_anchor_pending = True
 
 
 def _release_carry(room, key, now):
@@ -11735,6 +11804,24 @@ def _release_carry(room, key, now):
     if conn is not None and not isinstance(conn, BotConn):
         conn.push_block_until = (now + PUSH_BLOCK_FRAMES * BOT_DASH_FRAME_MS
                                  / 1000.0)
+
+
+def _release_pusher(room, key):
+    """他自己的推挤段推了人（`0x0017` 的出招者是他）：谁的推挤段正推着他都放开（X_Mod §116 / D81）。
+
+    收方 `0x49361e` 处理 `0x0017` 先 `0x50e636(出招者, 0)` 解掉出招者自己的约束、再挂受害者 —— 原版里
+    「被推着的人反手推回去」就是这样挣脱的，两个人不会同时互相挂着。
+    和挨打那一下（`_release_carry`）不同：不起 10 格不接受推的计时器（`[+0x17c]` 只有 `OnHit` 起）；
+    这一下剩下的推挤段也不再推他（`swing.released`）。
+    """
+    got = _carrier_of(room, key)
+    if got is None:
+        return
+    machine, swing = got
+    swing.carried.pop(key, None)
+    swing.released.add(key)
+    machine.log(f"   近身: 座位{key} 被我推着时自己推了人（`0x0017` 的出招者是他），"
+                f"他挣脱了，这一下不再推着他走（句柄 {swing.handle}，X_Mod §116 / D81）")
 
 
 def _carry_victims(room, machine, terrain):
@@ -11995,7 +12082,9 @@ def _try_dash(room, machine, seat_index, now, on_ground):
     3. **上一下打完了** —— 一次只能有一个 `DashSwing`；
     4. **而且打完（或被打断）已经过了 `BOT_DASH_GAP_S`** —— 用户 2026-09-26 定的，原版没有这条（见那个常量）。
 
-    （另有一条在调用方 `_tick_bot`：被别人的近身招式推着时不出手，`_held_by_push`，X_Mod §111。）
+    （另有一条在调用方 `_tick_bot`：被别人的近身招式推着时不出手，`_held_by_push`，X_Mod §111；
+    别人先出的那一招够得着此刻的我也不出手，`_yield_to_melee`，X_Mod §113。
+    这里再加一条：够得着的是我**冲出去的路上**的我，就不冲，`_yield_dash_to_melee`，X_Mod §116。）
 
     ⚠ 收方**不会**替远端角色扣体力（它只是播个动画），所以这里的体力是
     bot 自己给自己上的约束 —— 用户 2026-08-27 说的「消耗体力触发」就是它。
@@ -12012,11 +12101,17 @@ def _try_dash(room, machine, seat_index, now, on_ground):
         return False
     if machine.stamina is None or machine.stamina < move.sp_cost:
         return False
+    if machine.dash_yield is not None and _latched_dash_open(
+            room, machine.dash_yield, now):
+        return False                       # 冲出去会撞进他先出的那一招，锁着（X_Mod §116 / D81）
     terrain = _terrain(room)
     target = _dash_target(room, machine, seat_index, move, terrain, now)
     if target is None:
         return False
     target_seat, direction = target
+    if _yield_dash_to_melee(room, machine, seat_index, move, direction,
+                            terrain, now):
+        return False
     x, y = machine.battle_pos
     packet, handle = machine.sync.dash(direction, BOT_DASH_INDEX, x, y)
     machine.stamina -= move.sp_cost
@@ -12030,6 +12125,9 @@ def _try_dash(room, machine, seat_index, now, on_ground):
                 f"体力 {machine.stamina:.0f}/{_stamina_cap(machine):.0f}"
                 f" 句柄 {handle}（★ 收方也吃掉一个弹体句柄，§64）")
     _emit(machine, packet)
+    # ★ 转身朝冲的方向（X_Mod §116）：冲刺那一段心跳的朝向位就是冲的方向（`_heartbeat_facing`），收完招没有准星可跟时
+    #   也接着朝这边，别一收招又转回冲之前走的方向。
+    machine.heading = direction
     if swing.lunge:
         # ★ 服务端这份身体跟着冲出去（X_Mod §115，补 V0.3bot §193）：以前原地不动，收方那份照动作冲出去
         #   60~100 px 又被心跳拽回来，伤害圈也按原地判。第 0 帧收方一收到就挪，这一格当场走完；之后每格一帧
@@ -12040,6 +12138,22 @@ def _try_dash(room, machine, seat_index, now, on_ground):
         machine.battle_pos = (body.x, body.y)
         machine.motion_anchor_pending = True
     return True
+
+
+def _heartbeat_facing(machine, cursor):
+    """心跳的朝向位要报哪边、准星摆哪儿：`(朝向, 准星)`（准星 `None` = 摆在朝向正前方）。
+
+    ★★ 冲刺那一段**锁在冲的方向**（X_Mod §116 / D81）。真人冲刺那 `TotalFrame` 帧，他自己报的心跳朝向整段都是冲的
+      方向，收招那一刻才回到跟准星走（00:14:21 / 00:16:13 / 00:17:50 三下）。bot 以前照旧报准星那一侧 / 冲之前
+      走的方向 —— 「拉开距离」往左退、回身朝右冲（00:15:24.721）就一路报朝左。收方收心跳**无条件**把这两位写进
+      `[+0x2d0]`（`0x5042a3`），而约束 `0x50e654` 把被推的人推到出招者 `vft+0x80`（= `[+0x2d0]`，`0x4faccd`）
+      那一侧 ⇒ 被它推着的人被拽到它**身后**：那一下真人从 x=546 被拽回 429（用户说的「bot 近身攻击后我闪现回原位置」）。
+      伤害圈不受影响（`DashDamage` 的方向取 `[+0x4b4]`，`Character::Dash` `0x502145` 写的冲刺方向）。
+    """
+    swing = machine.dash_swing
+    if swing is not None:
+        return swing.direction, None
+    return machine.heading, cursor
 
 
 def _try_fire(room, machine, seat_index, weapon, target, now, tick):
@@ -12637,16 +12751,45 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         # ★★ 体力：先按这一格的姿势结算（蹲着回得快、冲刺跑要花），
         #   再决定近身那一下打不打得起。三个速率全是 `GameProps.ini` 的。
         _regen_stamina(machine, now, crouched=bool(crouch), fast_run=fast_run)
+        # ★★ 被别人的近身招式推着（`0x0017`）的这一段**不出手**：冲刺、开枪都不发
+        #   （X_Mod §111 / D75）—— 不然 bot 8 ms 就反手，把真人先出的那一招抢断。
+        #   ★ 往前挪一截（X_Mod §113 / D79）：他先冲出来、那一招接下来碰得到 bot，推挤段还没碰到时
+        #     也先让他 —— 22:16:56 那下 bot 比服务端收到 `0x0017` 早 4 ms 冲了出去。
+        held = acting and (pushed or _yield_to_melee(room, machine, seat_index,
+                                                     now, terrain))
+        # ★★ **近身冲刺攻击优先于开枪**（§64）：原版这一下会占住整个角色
+        #   （`TotalFrame` 那么多帧），真人也开不了枪。够得着就冲，够不着才打枪。
+        # ★ 排在这一格的心跳**前面**（X_Mod §116 / D81）：和 `rpJump` 一样先发事件、再发心跳 —— 冲出去这一格的心跳
+        #   就带着第 0 帧挪完的位置和冲的朝向，推挤段的第一发 `0x0017`（下一格）到收方之前，收方的它已经转过身了。
+        dashing = (acting and not held
+                   and not (target is not None and target[0] == BREAKABLE_SEAT)
+                   and _try_dash(room, machine, seat_index, now, on_ground))
+        if dashing:
+            body = machine.body
+            if body is not None:
+                x, y = body.x, body.y
+                on_ground = body.reported_on_ground
+                vx, vy = body.reported_vx, body.vy
+            # 这一格它的「输入」就是这一下冲刺：不按方向键（冲刺那一段收方也不读键走路，`0x507116`）。
+            keys = 0
+            if walk_state is not None:
+                walk_state = (0, False)
+            if behind > 0:
+                machine.beat_pending = True
+            else:
+                beat = True
         if beat:
             # ★★ 地面标志和速度**原样抄这一格算出来的**（§35），不从位移反推。
             # ★★★ 按键掩码是**走路动画的开关**（§39）：填 0 的话收方画站姿、
             #   而且不替它走，位置只被心跳一格一格地拉过去。
             # ★ 准星不传 = 摆在自己正前方（`aim_point`），朝向位和角度跟着它
             #   一起算（§36 / §37）。真人的身体朝向就是这么来的。
+            # ★★ 冲刺那一段朝向锁在冲的方向（`_heartbeat_facing`，X_Mod §116）。
+            facing, aim_at = _heartbeat_facing(machine, cursor)
             state = botsync.character_state(
                 x, y, vx=vx, vy=vy, on_ground=on_ground,
-                facing=machine.heading, keys=keys, fast_run=fast_run,
-                cursor=cursor, state_byte=_charge_value(machine, now))
+                facing=facing, keys=keys, fast_run=fast_run and not dashing,
+                cursor=aim_at, state_byte=_charge_value(machine, now))
             machine.motion_revision += 1
             _emit(machine, machine.sync.heartbeat(
                 state, motion=(machine.motion_identity, machine.motion_revision, tick)))
@@ -12657,17 +12800,6 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
             machine.down_latch = False
         if BOT_DIAG_FIRE_ANYWHERE:
             _diag_why_not_firing(room, machine, seat_index, weapon, target, now)
-        # ★★ 被别人的近身招式推着（`0x0017`）的这一段**不出手**：冲刺、开枪都不发
-        #   （X_Mod §111 / D75）—— 不然 bot 8 ms 就反手，把真人先出的那一招抢断。
-        #   ★ 往前挪一截（X_Mod §113 / D79）：他先冲出来、那一招接下来碰得到 bot，推挤段还没碰到时
-        #     也先让他 —— 22:16:56 那下 bot 比服务端收到 `0x0017` 早 4 ms 冲了出去。
-        held = acting and (pushed or _yield_to_melee(room, machine, seat_index,
-                                                     now, terrain))
-        # ★★ **近身冲刺攻击优先于开枪**（§64）：原版这一下会占住整个角色
-        #   （`TotalFrame` 那么多帧），真人也开不了枪。够得着就冲，够不着才打枪。
-        dashing = (acting and not held
-                   and not (target is not None and target[0] == BREAKABLE_SEAT)
-                   and _try_dash(room, machine, seat_index, now, on_ground))
         if (acting and not held and not dashing and machine.dash_swing is None
                 and target is not None and now >= machine.next_fire_at
                 and _may_fire(machine, weapon)):

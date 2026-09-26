@@ -11,6 +11,9 @@
 
 会话 45（X_Mod §113 / §114 / D79，用户 22:17「又是我先发却被打」「看着打中了没扣血」）：他先冲出来、那一招碰得到 bot 就先让他；
 被推着的 bot 不自己挪；外推真人冲刺照 `ProcessDash` 挪。
+
+会话 46（X_Mod §116 / D81，用户 2026-09-27「bot 近身攻击后我闪现回原位置」「又有一两次我先发却被 bot 打」）：
+冲刺那一段心跳朝向锁在冲的方向；`0x0017` 先解出招者自己的约束；bot 冲出去的路上撞得进他先出的那一招就不冲。
 """
 from __future__ import annotations
 
@@ -31,6 +34,7 @@ import botmove                                                 # noqa: E402
 import botsync                                                 # noqa: E402
 import chrprops                                                # noqa: E402
 import gameserver                                              # noqa: E402
+import udpsync                                                 # noqa: E402
 from gameserver import OP_PEER_DATA_UP                         # noqa: E402
 from test_botsync import (BotFireRoom, HumanShotRoom, TerrainMixin,  # noqa: E402
                           body_of, bot_frames, dash_frames, fire_frames, header,
@@ -921,6 +925,235 @@ class BotPushMobTests(MeleeFieldRoom):
         row = self.room.quest.mobs.get(500123)
         self.assertIsNotNone(row)
         self.assertLess(row[0], 650.0 - 50.0, "怪物表里那一格跟着被推走了")
+
+
+def beat_facing(beat):
+    """心跳位域低两位的朝向（收方 `0x5042a3` 无条件写进 `[+0x2d0]`）：+1 朝右 / −1 朝左。"""
+    flags = struct.unpack_from("<I", body_of(beat), 19)[0]
+    return ((flags & 3) ^ 2) - 2
+
+
+def beats_of(conn, seat):
+    return [f for f in bot_frames(conn, seat) if udpsync.is_heartbeat(f)]
+
+
+class BotDashFacingTests(MeleeFieldRoom):
+    """冲刺那一段心跳的朝向锁在冲的方向（X_Mod §116 / D81）。
+
+    00:15:24.721：bot「拉开距离」往左退、回身朝右冲，心跳一路报朝左。收方收心跳无条件写 `[+0x2d0]`，约束 `0x50e654`
+    按出招者朝向（`vft+0x80`）把被推的人推到那一侧 ⇒ 她从 x=546 被拽回 429 —— 「bot 近身攻击后我闪现回原位置」。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.quiet_gun()
+        # 没有准星可跟（解不出弹道时就是这样）：朝向只看 `heading`。它站着不朝她走，冲之前一直朝左。
+        original_aim, original_intent = bot._fire_target, bot._move_intent
+        bot._fire_target = lambda *args, **kwargs: None
+        bot._move_intent = lambda *args, **kwargs: (0, False, False, False)
+        self.addCleanup(setattr, bot, "_fire_target", original_aim)
+        self.addCleanup(setattr, bot, "_move_intent", original_intent)
+        self.bot_conn.heading = botsync.FACING_LEFT
+
+    def dash_right(self):
+        """alice 在 bot 右边 60 px；推到它冲出去那一格，返回那一下。"""
+        self.alice_stands(760.0)
+        self.clear()
+        for _ in range(8):
+            self.advance(1)
+            if self.bot_conn.dash_swing is not None:
+                return self.bot_conn.dash_swing
+        self.fail("前提：bot 该朝她冲出去")
+
+    def test_every_beat_of_the_dash_faces_the_way_it_dashes(self):
+        swing = self.dash_right()
+        self.assertEqual(1, swing.direction, "前提：朝右冲")
+        for _ in range(swing.move.total_frame - 1):
+            self.assertIs(swing, self.bot_conn.dash_swing, "前提：这一下还在")
+            self.advance(1)
+        beats = beats_of(self.alice, self.bot_seat)
+        self.assertGreater(len(beats), 5)
+        self.assertEqual([1] * len(beats), [beat_facing(b) for b in beats])
+
+    def test_it_faces_the_dash_even_while_aiming_the_other_way(self):
+        """准星在身后（还瞄着另一边）：冲刺那一段照样报冲的方向 —— 真人冲刺时总闸关着，准星带不动身子。"""
+        bot._fire_target = lambda *args, **kwargs: (self.alice_seat(), (500.0, 380.0), None)
+        swing = self.dash_right()
+        self.assertEqual(1, swing.direction, "前提：朝右冲")
+        self.advance(swing.move.total_frame - 2)
+        beats = beats_of(self.alice, self.bot_seat)
+        self.assertEqual([1] * len(beats), [beat_facing(b) for b in beats])
+        self.advance(4)
+        self.assertEqual(-1, beat_facing(self.last_beat()), "收了招就又跟着准星转过去")
+
+    def test_the_dash_tick_already_beats_after_the_dash(self):
+        """冲出去那一格：先 `rpDash`、再一发心跳（第 0 帧挪完的位置 + 冲的朝向），推挤段第一发 `0x0017` 到之前它已经转过身。"""
+        swing = self.dash_right()
+        frames = bot_frames(self.alice, self.bot_seat)
+        kinds = ["dash" if header(f)["opcode"] == botsync.OP_DASH
+                 else "beat" if udpsync.is_heartbeat(f) else "other" for f in frames]
+        self.assertIn("dash", kinds)
+        after = kinds[kinds.index("dash") + 1:]
+        self.assertEqual("beat", after[0] if after else None, "同一格紧跟一发心跳")
+        beat = frames[kinds.index("dash") + 1]
+        self.assertEqual(1, beat_facing(beat))
+        x = struct.unpack_from("<h", body_of(beat), 7)[0]
+        self.assertEqual(int(self.bot_conn.body.x), x, "报的是第 0 帧挪完的位置")
+        self.assertGreater(x, swing.origins[0][0])
+
+    def test_it_keeps_facing_that_way_once_the_dash_is_over(self):
+        swing = self.dash_right()
+        self.advance(swing.move.total_frame + 2)
+        self.assertIsNone(self.bot_conn.dash_swing)
+        self.assertEqual(1, beat_facing(self.last_beat()), "收完招没准星可跟：接着朝冲的方向，不转回去")
+
+    def test_the_pushed_one_ends_up_in_front_of_it(self):
+        """服务端推着她走的那一侧（`swing.direction`）和收方按心跳朝向推的那一侧是同一侧。"""
+        swing = self.dash_right()
+        self.advance(4)
+        self.assertIn(self.alice_seat(), swing.carried, "前提：推上了")
+        self.assertGreaterEqual(self.alice.sim_body.x,
+                                self.bot_conn.body.x + botmove_constraint() - 1.0)
+        self.assertEqual(1, beat_facing(self.last_beat()))
+
+
+class PushBackReleasesTests(MeleeFieldRoom):
+    """`0x0017` 先解**出招者自己**的约束（`0x49361e` → `0x50e636(出招者, 0)`，X_Mod §116 / D81）。
+
+    00:15:54：bot 冲过来推着她走，她被推着时自己也冲、推挤段推上了 bot。服务端以前两个约束一起挂着：bot 推她到它身前、
+    她推 bot 到她身前，同一个方向 —— 一格互相顶一次，bot 0.7 秒被顶出去 1000 px（她自己那台早挣脱了，停在 806）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.quiet_gun()
+
+    def carried_to_the_left(self):
+        """bot（700）朝左冲、推着她（640）走；返回那一下。"""
+        self.alice_stands(640.0)
+        for _ in range(8):
+            self.advance(1)
+            swing = self.bot_conn.dash_swing
+            if swing is not None and self.alice_seat() in swing.carried:
+                return swing
+        self.fail("前提：bot 推着她走")
+
+    def test_her_push_frees_her_from_its_push(self):
+        swing = self.carried_to_the_left()
+        self.alice_dash_at(self.alice.sim_body.x, direction=-1)
+        self.alice_pushes_bot()
+        self.assertNotIn(self.alice_seat(), swing.carried, "她反手推了人，就挣脱了")
+        self.assertIsNotNone(self.bot_conn.motion_constraint, "bot 这回被她推着")
+        self.assertIsNone(bot._carrier_of(self.room, self.alice_seat()))
+
+    def test_the_two_no_longer_shove_each_other_away(self):
+        swing = self.carried_to_the_left()
+        start = self.bot_conn.body.x
+        self.alice_dash_at(self.alice.sim_body.x, direction=-1)
+        self.alice_pushes_bot()
+        self.advance(12)
+        # 她那一招最多挪 273 px；bot 被她推着最多到她身前 35（她朝左）。互相顶的话一格就是 35 px 起步。
+        self.assertGreater(self.bot_conn.body.x, start - 273.0 - botmove_constraint() - 80.0,
+                           "bot 不该被一格一格顶出去")
+        self.assertLessEqual(self.bot_conn.body.x,
+                             self.alice.sim_body.x - botmove_constraint() + 1.0,
+                             "被推到她朝向那一侧（身前 35）")
+        self.assertIs(swing, self.bot_conn.dash_swing, "前提：它那一下还没完")
+
+    def test_it_does_not_grab_her_again_in_the_same_dash(self):
+        swing = self.carried_to_the_left()
+        self.alice_dash_at(self.alice.sim_body.x, direction=-1)
+        self.alice_pushes_bot()
+        self.advance(swing.move.cast_end + 2)
+        self.assertEqual(1, len(constrain_frames(self.alice, self.bot_seat)),
+                         "推回来就来回拽：这一下剩下的推挤段不再推她")
+        self.assertIn(self.alice_seat(), swing.released)
+
+    def test_its_own_push_frees_it(self):
+        """它冲着冲着被她推住了、自己的推挤段又推上了她：每台收方都先把它放开。"""
+        self.alice_stands(640.0)
+        self.alice_dash_at(640.0, direction=1)
+        self.alice_pushes_bot()
+        self.assertIsNotNone(self.bot_conn.motion_constraint, "前提：被她推着")
+        swing = bot.DashSwing(123, self.now(), -1, chrprops.get(
+            self.bot_conn.character_id).dash(bot.BOT_DASH_INDEX), self.bot_conn.character_id,
+            lunge=True)
+        body = (self.alice_seat(), 640.0, self.FLOOR_Y, False,
+                self.room.seats[self.alice_seat()].character_id)
+        self.alice.push_block_until = None
+        bot._dash_push(self.room, self.bot_conn, swing, (700.0, self.FLOOR_Y),
+                       (560.0, self.FLOOR_Y), 0, [body], self.now())
+        self.assertIn(self.alice_seat(), swing.carried, "前提：推上了")
+        self.assertIsNone(self.bot_conn.motion_constraint)
+
+
+class CounterDashCourseTests(MeleeFieldRoom):
+    """我冲出去的路上会撞进她先出的那一招：不冲（X_Mod §116 / D81）。开枪照旧只看此刻站的地方。
+
+    00:14:38：她背对 bot 朝左冲，bot 在她身后 38 px、晚 26 ms 冲她后背 —— 站着的 bot 她的圈擦不到（服务端判不碰），
+    可 bot 一冲就钻进了她第 0 帧那个圈（她那台第 0 帧就推住了 bot），按原版同级谁先进伤害段谁赢，bot 第 6 帧赢了。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.quiet_gun()
+
+    def her_back_dash(self, x=640.0):
+        """她在 bot 左边 60 px、朝左（背对 bot）冲出去。"""
+        self.alice_stands(x)
+        self.alice_dash_at(x, direction=-1)
+        self.clear()
+
+    def test_it_does_not_dash_into_her_move_from_behind(self):
+        self.her_back_dash()
+        self.advance(1)
+        self.assertIsNone(bot._melee_threat(self.room, self.bot_conn, self.bot_seat,
+                                            self.now(), bot._terrain(self.room)),
+                          "前提：站着的 bot 她那一招碰不到")
+        self.advance(8)
+        self.assertEqual([], dash_frames(self.alice, self.bot_seat), "冲过去就钻进她的圈了")
+        self.assertEqual((self.alice_seat(), self.alice.motion_action_mark),
+                         self.bot_conn.dash_yield, "锁住的是她那一下")
+
+    def test_it_may_still_shoot_since_standing_still_is_safe(self):
+        self.bot_conn.next_fire_at = 0.0
+        self.her_back_dash()
+        self.advance(8)
+        self.assertEqual([], dash_frames(self.alice, self.bot_seat))
+        self.assertIsNone(self.bot_conn.melee_yield, "此刻站的地方她够不着：开枪那条不拦")
+
+    def test_the_same_spot_without_her_dash_gets_a_dash(self):
+        """对照：同一个站位她没出招，bot 照冲。"""
+        self.alice_stands(640.0)
+        self.clear()
+        self.advance(8)
+        self.assertTrue(dash_frames(self.alice, self.bot_seat))
+
+    def test_it_dashes_again_once_her_damage_frames_are_over(self):
+        self.her_back_dash()
+        self.advance(4)
+        latch = self.bot_conn.dash_yield
+        self.assertIsNotNone(latch, "前提：锁上了")
+        self.assertTrue(bot._latched_dash_open(self.room, latch, self.now()))
+        while self.alice.sim_dash_frame is None or self.alice.sim_dash_frame < 19:
+            self.advance(1)
+        self.assertFalse(bot._latched_dash_open(self.room, latch, self.now()),
+                         "她过了伤害段，锁就开了")
+        self.advance(1)
+        self.assertIsNone(self.bot_conn.dash_yield, "下一次想冲时重新判、不再锁着")
+
+    def test_a_dash_far_away_does_not_hold_it_back(self):
+        """她在老远冲（冲出去也碰不到她的圈）：照常冲 —— 不是「她一出招 bot 就哑火」（D79 否掉的那条）。"""
+        self.place_bot(700.0, self.FLOOR_Y)
+        self.alice_stands(1300.0)
+        self.alice_dash_at(1300.0, direction=1)
+        self.advance(1)
+        move = chrprops.get(self.bot_conn.character_id).dash(bot.BOT_DASH_INDEX)
+        for direction in (-1, 1):
+            self.assertFalse(bot._yield_dash_to_melee(
+                self.room, self.bot_conn, self.bot_seat, move, direction,
+                bot._terrain(self.room), self.now()))
+        self.assertIsNone(self.bot_conn.dash_yield)
 
 
 if __name__ == "__main__":
