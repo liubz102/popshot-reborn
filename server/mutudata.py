@@ -5,14 +5,17 @@
 （服务端包里没有明文资源树、也不带 numpy）。这里只用标准库，CPython 3.8 也能跑。
 
 为什么要它：格斗招式打没打中**只有出招者本机判**（X_Mod §121）—— bot 没有本机，服务端得替它判，
-就得知道每招每个判定体「第 k 个逻辑帧在脚底前后多远」。坐标约定（🤔 待 B2 实机核）见产物的 `units`：
-`track` 里的 `(dx, dy)` 是**朝右时**相对脚底的 px，朝左 dx 取反。
+就得知道每招每个判定体「第 k 个逻辑帧在脚底前后多远」。坐标约定（✅ B2 实机核过，X_Mod §127）见产物的 `units`：
+`track` 里的 `(dx, dy)` 是**朝右时**相对脚底的 px（已乘模型缩放 0.85 / 卡希尔 0.75），朝左 dx 取反。
+
+★ `skills(角色)` 的下标就是 `0x0016` 里的招式号 —— 客户端 ini 哈希表的遍历顺序，**不是**文件顺序（X_Mod §127）。
 """
 import json
 import os
 
 #: 认得的产物格式版本（和 `tools/mutudata.py` 的 `FORMAT` 一起改）。
-FORMAT = 1
+#: 2：招式按客户端招式号排、轨迹乘了模型缩放（X_Mod §127）—— 1 那份的下标和坐标都是错的，不认。
+FORMAT = 2
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_mutu.json")
 
@@ -95,7 +98,7 @@ class _Store(object):
         return table
 
     def skills(self, character_id):
-        """这个角色的 10 招（文件顺序 = 招式号）；表里没有就是空列表。"""
+        """这个角色的 10 招（下标 = 客户端招式号，X_Mod §127）；表里没有就是空列表。"""
         key = str(int(character_id))
         if key not in self._cache:
             raw = self.table().get("characters", {}).get(key, ())

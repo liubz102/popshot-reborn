@@ -122,7 +122,8 @@ def constrain_body(victim_handle, owner_handle):
 
 #: `0x0016` —— **出 / 收一招格斗招式**（body 13 字节，只有格斗模式发，X_Mod §121）：
 #: `{u8 座位, i8 类型, i8 朝向, i16 招式号, f32 x, f32 y}`。类型 2 = 出招（收方先把角色硬置到 (x, y)），
-#: −1 = 收招，其它只删旧招。招式号 = 该角色在 `NewMutu.ini` 里的文件顺序（`mutudata.skills()` 的下标）。
+#: −1 = 收招，其它只删旧招。招式号 = `mutudata.skills()` 的下标 —— 客户端 ini 哈希表的遍历顺序，**不是**
+#: `NewMutu.ini` 的文件顺序（X_Mod §127 实机核过）。
 #: ★ 每发一次类型 2 吃 D+E+1 个弹体句柄（和 `rpFire` / `rpDash` 同一个座位计数器）。
 OP_MUTU_SKILL = 0x0016
 MUTU_SKILL_START = 2
@@ -145,6 +146,14 @@ def parse_mutu_skill(body):
     if len(body) < _MUTU_SKILL.size:
         return None
     return _MUTU_SKILL.unpack_from(body, 0)
+
+
+_GUARD = struct.Struct("<BB")
+
+
+def guard_body(seat, on):
+    """`0x0018 rpGuard` 的 2 字节 `{u8 座位, u8 开关}`（组包 `0x4936c6`，X_Mod §122）。"""
+    return _GUARD.pack(int(seat) & 0xFF, 1 if on else 0)
 
 
 #: `0x000b rpCrouch` —— **蹲下 / 起立**（body 2 字节，§41）。
@@ -1147,6 +1156,25 @@ class BotSyncStream:
                 self.conn.my_seat, x, y, slice_id))
             self.projectiles += step
             return packet, step
+
+    def mutu_skill(self, kind, facing, index, x, y, handles=0):
+        """一发 `0x0016`（格斗招式，X_Mod §121），**出招那一发同时把句柄记账推进 `handles`**。
+
+        返回 `(包, 这一招头一个句柄)`：判定体 i = 头一个 + i、受击体 j = 头一个 + D + j、推挤体 = 头一个 + D + E。
+        ★★ 和 `dash()` 同一个道理：收方建 `NewMutuSkill` 时给 D 个判定体 + E 个受击体 + 1 个推挤体各分一个句柄
+          （`0x4f844c` / `0x4f88a1`），和弹体**共用同一个座位计数器** —— 出招 `handles` = D + E + 1，收招（−1）是 0。
+          少记一个，之后每一发 `rpExplode` / `rpSplashDamaged` 都对不上号、被静默丢弃（§42），一局之内不自愈。
+        """
+        with self._lock:
+            handle = projectile_handle(self.conn.my_seat, self.projectiles)
+            packet = self.event(OP_MUTU_SKILL, mutu_skill_body(
+                self.conn.my_seat, kind, facing, index, x, y))
+            self.projectiles += int(handles)
+            return packet, handle
+
+    def guard(self, on):
+        """一发 `0x0018 rpGuard`（格挡开 / 关）。不吃句柄。"""
+        return self.event(OP_GUARD, guard_body(self.conn.my_seat, on))
 
     def dash(self, direction, index, x, y):
         """一发 `rpDash`（近身冲刺攻击），**同时把句柄记账推进 1**。

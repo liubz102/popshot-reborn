@@ -154,6 +154,11 @@ class GameProps(object):
         """格挡着挨打时伤害乘多少（`GuardDamageRate`，X_Mod §92）。"""
         return self._num("guard_damage_rate")
 
+    @property
+    def guard_sp_cost(self):
+        """格挡着每个 tick 花多少体力（`GuardSpCost`，`0x5070c5`，X_Mod §122）；扣完低于它就「打破」。"""
+        return self._num("guard_sp_cost")
+
 
 class Move(object):
     """一招（`DashNN` / `JabNN`）—— 冲刺攻击的全部参数（§64）。

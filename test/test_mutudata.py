@@ -139,10 +139,15 @@ class RealTableTests(unittest.TestCase):
                         self.assertTrue(d["start"] <= f <= d["end"], (cid, s["motion"], k, f))
                         self.assertLess(k, s["frames_total"])
 
+    def named(self, cid, motion):
+        """按节名（`chNN@<motion>`）找 —— 不按 `Motion` 键：`Jump-P00-K` 那一节的动作也是 `MutuJump-P00`。"""
+        return next(s for s in self.store.skills(cid) if s.name.endswith("@" + motion))
+
     def test_tai_right_jab(self):
         # 泰尔 `MutuStand-P00`：D = 0.2667 s ⇒ N = 18、计时器 266 ms、9 个逻辑帧；
         # Damager1 起止 4..8 ⇒ 引擎帧 6..14 ⇒ 第 3~7 个逻辑帧；MoveDist 10 / γ 3 / [3, 7)。
-        jab = self.store.skills(0)[0]
+        jab = self.named(0, "MutuStand-P00")
+        self.assertEqual(6, jab.index, "客户端招式号（X_Mod §127），不是文件顺序的 0")
         self.assertEqual(("MutuStand-P00", 18, 266, 9, 2, 2), (jab.motion, jab.samples, jab.timer_ms,
                                                                jab.frames_total, jab.handles, jab.kind))
         hit = jab.damagers[0]
@@ -155,9 +160,39 @@ class RealTableTests(unittest.TestCase):
         self.assertEqual(10, sum(jab.move.values()))
 
     def test_the_jab_chain_links_by_prev(self):
-        skills = self.store.skills(0)
-        self.assertEqual([-1, 0, 1, 2], [s.prev for s in skills[:4]])
-        self.assertEqual([mutudata.STAND] * 4, [s.skill_type for s in skills[:4]])
+        names = ["MutuStand-P00", "MutuStand-P01", "MutuStand-P02", "MutuStand-P03"]
+        chain = [self.named(0, n) for n in names]
+        self.assertEqual([-1] + [s.index for s in chain[:3]], [s.prev for s in chain])
+        self.assertEqual([mutudata.STAND] * 4, [s.skill_type for s in chain])
+
+    def test_the_order_is_what_the_client_sends(self):
+        """B2 探针（X_Mod §127）：记录地址 = 基址 + 招式号 × 0x50，五个角色的内存顺序逐个核过。"""
+        seen = {
+            0: ["Jump-P00-K", "Crouch-K00", "Jump-P00", "Stand-K02", "Stand-K01",
+                "Stand-P01", "Stand-P00", "Stand-P03", "Stand-P02", "Crouch-P00"],
+            1: ["Stand-K01", "Stand-K00", "Jump-P00", "Crouch-K00", "Stand-P00",
+                "Stand-P01", "Stand-P02", "Stand-P03", "Jump-P00-K", "Crouch-P00"],
+            2: ["Jump-P00-K", "Crouch-K00", "Stand-K00", "Stand-K01", "Stand-P03",
+                "Stand-P02", "Stand-P01", "Stand-P00", "Crouch-P00", "Jump-P00"],
+            3: ["Stand-P02", "Stand-P03", "Stand-P00", "Stand-P01", "Stand-K01",
+                "Stand-K00", "Crouch-K00", "Jump-P00-K", "Jump-P00", "Crouch-P00"],
+            104: ["Jump-P00", "Crouch-P00", "Stand-K00", "Stand-K01", "Stand-P03",
+                  "Stand-P02", "Stand-P01", "Stand-P00", "Jump-P00-K", "Crouch-K00"],
+        }
+        for cid, order in seen.items():
+            # 按节名比（`Jump-P00-K` 那一节的 `Motion` 也是 `MutuJump-P00`）。
+            self.assertEqual(["ch%02d@Mutu%s" % (cid, m) for m in order],
+                             [s.name for s in self.store.skills(cid)], "角色 %d" % cid)
+
+    def test_tracks_carry_the_model_scale(self):
+        """判定体 = 骨骼点 × 模型缩放（`0x5050ff`：卡希尔 0.75，其余 0.85，X_Mod §127）。"""
+        units = self.raw["units"]
+        self.assertEqual(0.85, units["model_scale"])
+        self.assertEqual({"1": 0.75}, units["model_scale_by_character"])
+        # 泰尔右直拳第 3 帧：模型里 z ≈ −31、y ≈ 47.5 ⇒ ×0.85 ≈ (26.4, −40.4)。
+        dx, dy = self.named(0, "MutuStand-P00").damagers[0].at(3, 1)
+        self.assertAlmostEqual(26.4, dx, delta=1.5)
+        self.assertAlmostEqual(-40.4, dy, delta=1.5)
 
     def test_config_comes_from_newmutuconfig(self):
         self.assertEqual({"GravityFactor": 1.5, "FirstJumpHeight": 240.0, "SecondJumpHeight": 300.0,
@@ -189,6 +224,32 @@ class ToolTests(unittest.TestCase):
 
     def test_move_curve_stops_before_the_end_frame(self):
         self.assertEqual([], self.tool.move_steps(10.0, 3.0, 3, 7, [0, 1, 2, 7, 9]))
+
+    def test_ini_hash_folds_case(self):
+        """`0x402c57` 逐码元先 `towupper`（只折 a~z）—— 大小写不同的节名进同一个桶。"""
+        self.assertEqual(self.tool.ini_hash("ch00@MutuStand-P00"), self.tool.ini_hash("CH00@mutustand-p00"))
+        self.assertNotEqual(self.tool.ini_hash("ch00@MutuStand-P00"), self.tool.ini_hash("ch00@MutuStand-P01"))
+        self.assertEqual(0, self.tool.ini_hash(""))
+
+    def test_same_bucket_puts_the_later_one_first(self):
+        """同一个桶里后插的在前（`0x5d45c6` 插链头）；桶按号从小到大走。"""
+        names = ["a%d" % i for i in range(400)]
+        order = self.tool.client_section_order(names)
+        self.assertEqual(sorted(names), sorted(order), "一个都不能丢（400 > 193 会扩容一次）")
+        small = names[:150]
+        order = self.tool.client_section_order(small)
+        size = self.tool._table_size(self.tool.INI_TABLE_HINT)
+        self.assertEqual(193, size)
+        buckets = [self.tool.ini_hash(n) % size for n in order]
+        self.assertEqual(sorted(buckets), buckets)
+        for b in set(buckets):
+            chain = [n for n in order if self.tool.ini_hash(n) % size == b]
+            self.assertEqual(sorted(chain, key=small.index, reverse=True), chain)
+
+    def test_model_scale(self):
+        self.assertEqual(0.75, self.tool.model_scale(1))
+        self.assertEqual(0.85, self.tool.model_scale(0))
+        self.assertEqual(0.85, self.tool.model_scale(104))
 
     def test_read_ini_decodes_cp949(self):
         tmp = tempfile.mkdtemp()
@@ -236,6 +297,37 @@ class ToolTests(unittest.TestCase):
     def test_check_reports_the_scale(self):
         cols = self._check(self._probe_log(1, scale=1.25))
         self.assertEqual("1.250", cols[5])
+
+    def test_check_tells_twins_apart_by_address(self):
+        """参数一模一样的两招（泰尔 K01 / K02 那种）：按「基址 + 招式号 × 0x50」认，不再都认成第一个（X_Mod §127）。"""
+        import copy
+        import io
+        table = copy.deepcopy(SYNTH)
+        twin = copy.deepcopy(table["characters"]["0"][0])
+        twin["name"], twin["index"] = "ch00@MutuStand-P00-孪生", 1
+        twin["damagers"][0]["track"] = [[3, 6, -5.0, -20.0], [4, 8, -6.0, -21.0]]
+        table["characters"]["0"].append(twin)
+        head = "MoveDist 10.000 γ 3.000 起 3 止 7 判定体 1 受击体 0"
+        lines = ["[10:00:00.000 UTC+9] MUTU=   招式表 0AB1C2D0 座位 0 " + head,
+                 "[10:00:00.000 UTC+9] MUTU=   招式表 0AB1C320 座位 0 " + head]
+        for addr, skill in (("0AB1C2D0", table["characters"]["0"][0]), ("0AB1C320", twin)):
+            for _k, f, dx, dy in skill["damagers"][0]["track"]:
+                lines.append("[10:00:00.100 UTC+9] MUTU.   座位 0 招式 0BAD0000 表 %s 帧 %d 朝 +1 脚 (300.00, 399.00)"
+                             " 判定 0:(%.2f,%.2f) 受击" % (addr, f, dx, dy))
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        log, path = os.path.join(tmp, "bshook.log"), os.path.join(tmp, "t.json")
+        with open(log, "w", encoding="utf-8") as fp:
+            fp.write("\n".join(lines) + "\n")
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(table, fp, ensure_ascii=False)
+        out = io.StringIO()
+        self.tool.check(log, path, {}, 0, out=out)
+        rows = dict((line.split()[0], line.split()) for line in out.getvalue().splitlines()
+                    if line.startswith("ch00@"))
+        self.assertEqual({"ch00@MutuStand-P00", "ch00@MutuStand-P00-孪生"}, set(rows), out.getvalue())
+        for cols in rows.values():
+            self.assertEqual(("2", "0.00"), (cols[1], cols[2]), out.getvalue())
 
     def test_a_fresh_extraction_matches_the_committed_table(self):
         if importlib.util.find_spec("numpy") is None:
