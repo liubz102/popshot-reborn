@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import struct
 import sys
 import unittest
 from unittest import mock
@@ -945,6 +946,16 @@ class BotReactionTests(BotStrikeRoom):
         self.assertFalse(opening.see(16, 1.290, lambda: 0.0), "断了一格（15 没看见）：重掷，从 16 起数")
         self.assertTrue(opening.see(17, 1.390, lambda: 0.0))
 
+    def test_waited_counts_from_the_first_sighting(self):
+        """日志「看见机会 N ms 后按」（X_Mod §131）：从这个机会头一回看见算，重掷就从重掷那一格算。"""
+        opening = botfight.Opening()
+        opening.see(10, 1.000, lambda: 0.0)
+        opening.see(12, 1.064, lambda: 0.0)                         # 断了一格：新机会
+        self.assertTrue(opening.see(13, 1.170, lambda: 0.0))
+        self.assertAlmostEqual(106.0, opening.waited_ms(1.170))
+        opening.reset()
+        self.assertIsNone(opening.waited_ms(1.2))
+
 
 class BotFacingTests(FightActRoom):
     """起手只按当前朝向出（X_Mod §129）：人在身后先转身，转身那一格不按。"""
@@ -977,6 +988,44 @@ class BotFacingTests(FightActRoom):
         (_seat, _kind, facing, _index, x, _y), = self.starts()
         self.assertEqual(-1, facing, "转过来朝他出")
         self.assertLess(x, 600.0, "先朝他按了方向键（转身走了一点）")
+
+    def test_someone_on_its_back_needs_no_turn(self):
+        """贴在背后 11 px（身子叠着，09-27 19:04:35.941 那一幕）：朝现在这边出手，推挤体先把他推到身前再打中 —— 不转身
+        （X_Mod §131）；离远了才转（上面 40 px 那两条）。"""
+        self.alice_at(589.0, ticks=1)
+        self.bot_conn.heading = 1
+        self.assertEqual(1, bot._fight_in_reach(self.room, self.bot_conn, self.bot_seat, self.now()),
+                         "当前朝向就够得着 ⇒ 「够得着·站住出招」")
+        self.ready_opening()
+        self.assertTrue(self.act())
+        self.assertEqual(1, self.bot_conn.fight_skill.facing, "照现在的朝向出")
+
+    def test_a_backswing_reaching_behind_still_turns_first(self):
+        """布洛克刺拳第一个判定帧拳头还在身后 31 px（r30）：朝前出也扫得到身后 40 px 的她 —— 那不是「贴在背上」（推挤体碰不到），
+        照样先转身，别背对着人把他打中（X_Mod §131）。"""
+        self.room.seats[self.bot_seat].character_id = 2
+        self.bot_conn.character_id = 2
+        self.alice_at(560.0, ticks=1)
+        self.bot_conn.heading = 1
+        circles = [(cx, cy, r) for cx, cy, r, _region in bot.chrprops.get(0).circles(560.0, self.FLOOR_Y, False)]
+        self.assertIsNotNone(botfight.first_hit(named(2, "MutuStand-P00"), 1, 600.0, self.FLOOR_Y, circles),
+                             "前提：朝前出也扫得到身后的她")
+        self.assertEqual(-1, bot._fight_in_reach(self.room, self.bot_conn, self.bot_seat, self.now()))
+
+    def test_it_does_not_twitch_left_and_right_on_top_of_him(self):
+        """09-27 19:04:35.951~36.207：他冲到它背后 11 px，它「先转身」那一步（决策两格 ≈ 16 px）跨过了他，下一次决策他又在身后
+        —— 朝向每 64 ms 翻一次（19:04:12 那段也是）。当前朝向够得着就不转（X_Mod §131）。"""
+        self.bot_conn.heading = -1
+        self.alice_at(611.0)
+        self.alice.sent.clear()
+        headings = [self.bot_conn.heading]
+        for _ in range(STRIKE_WAIT_TICKS + 4):
+            self.advance(1)
+            headings.append(self.bot_conn.heading)
+            if self.starts():
+                break
+        self.assertTrue(self.starts(), "照样出手")
+        self.assertEqual([], [i for i, (a, b) in enumerate(zip(headings, headings[1:])) if a != b], headings)
 
 
 class BotAirActionTests(FightActRoom):
@@ -1304,6 +1353,19 @@ class BotGuardTests(BotStrikeRoom):
         after = ledger.remaining(self.bot_seat, bot._seat_max_hp(self.room, self.bot_seat))
         self.assertEqual(int(0.25 * 20 + 1), before - after)
 
+    def test_a_guarded_hit_right_after_lowering_is_still_a_block(self):
+        """她那台判「在挡」= 开关 XOR 3 帧过渡（`0x50a0ea`）：它刚放下挡的那 3 帧里她照样带 0x80 打过来。原版它自己那台
+        （`0x4ff486`）只看这一位和「正面」，不看自己的开关 ⇒ 仍走格挡那一支（X_Mod §131；09-27 两局七下，全在放下后 19~93 ms）。"""
+        self.bot_conn.guard.set(True)
+        self.bot_conn.guard.set(False)                    # 刚放下（过渡还在跑）
+        ledger = bot._health(self.room)
+        before = ledger.remaining(self.bot_seat, bot._seat_max_hp(self.room, self.bot_seat))
+        self.hit(12.0, (-15.0, -18.0), botfight.HIT_FLY, flags=bot.EXPLODE_FLAG_GUARD)
+        self.assertIsNotNone(self.bot_conn.fight_react, "硬直 + 滑 2·push.x")
+        self.assertTrue(self.bot_conn.body.on_ground, "不打飞")
+        after = ledger.remaining(self.bot_seat, bot._seat_max_hp(self.room, self.bot_seat))
+        self.assertEqual(int(0.25 * 12 + 1), before - after)
+
     def test_striking_drops_the_guard(self):
         self.bot_conn.guard.set(True)                     # 不推格：没有威胁的话 AI 下一格就自己放下了
         self.alice.sent.clear()
@@ -1312,6 +1374,265 @@ class BotGuardTests(BotStrikeRoom):
                                    named(0, "MutuStand-P00"), -1, self.now(), "单测")
         self.assertFalse(self.bot_conn.guard.on, "收方收到 0x0016 清格挡位")
         self.assertEqual([], guard_frames(self.alice, self.bot_seat), "不另发 0x0018")
+
+
+# ===========================================================================
+# D94：被连招压着（用户 2026-09-27「只要我一直不停进攻，bot 就不还手也不逃跑」，选「看情况」）
+# ===========================================================================
+class PressureRoom(FightActRoom):
+    """alice（泰尔）站在 bot 左边 38 px 朝右连招，bot 朝左对着她。她那台判的打中 / 挡住走真的 `0x0004` 入口（模拟时钟对齐）。"""
+
+    ALICE_X = 562.0
+
+    def setUp(self):
+        super().setUp()
+        self.bot_conn.heading = -1
+        self.alice_at(self.ALICE_X, ticks=1)
+        self.alice.sent.clear()
+
+    def alice_skill(self, motion, x=None):
+        x = self.ALICE_X if x is None else x
+        self.alice_sends(botsync.OP_MUTU_SKILL, botsync.mutu_skill_body(
+            self.alice_seat, botsync.MUTU_SKILL_START, 1, skill_index(0, motion), x, self.FLOOR_Y))
+        return self.alice.mutu_skill
+
+    def alice_retracts(self):
+        self.alice_sends(botsync.OP_MUTU_SKILL, botsync.mutu_skill_body(
+            self.alice_seat, botsync.MUTU_SKILL_END, 1, 0, self.ALICE_X, self.FLOOR_Y))
+
+    def alice_hits(self, damage=3.0, kind=botfight.HIT_SLIDE, flags=0):
+        """她这一招打中 bot（她那台判的，源 = 她自己的判定体句柄）。"""
+        with self.sim_clock():
+            self.hit(damage, (15.0, -1.5 * damage), kind, flags=flags)
+
+    def unlock(self):
+        """推到挨打的锁输入 / 不能出招那 10 帧过去。"""
+        conn = self.bot_conn
+        self.assertTrue(self.until(lambda: not (conn.fight_react is not None and conn.fight_react.locked)
+                                   and conn.fight_block_left <= 0, 14), "锁输入该解了")
+
+    def set_health(self, fraction):
+        ledger = bot._health(self.room)
+        ledger.reset(self.bot_seat)
+        ledger.note_damage(self.bot_seat, bot._seat_max_hp(self.room, self.bot_seat) * (1.0 - fraction))
+
+    def jumps(self):
+        return [f for f in bot_frames(self.alice, self.bot_seat) if header(f)["opcode"] == botsync.OP_JUMP]
+
+    @contextlib.contextmanager
+    def she_hits_first(self):
+        """她下一次判定马上就到（反击抢不过）—— 只看跳开那一支。"""
+        with mock.patch.object(bot, "_his_next_contact", lambda *a: self.now()):
+            yield
+
+    def two_hits(self):
+        self.alice_skill("MutuStand-P00")
+        self.alice_hits()
+        self.unlock()
+        self.alice_skill("MutuStand-P01", x=self.bot_conn.body.x - 38.0)
+        self.alice_hits()
+        self.alice.sent.clear()
+
+
+class MutuPushTests(PressureRoom):
+    """她格斗招式的推挤体推着 bot（`0x0017`）：照原版不锁输入（§111）—— 以前冻到她那一招收完（D75 / D79 只该管冲刺）。"""
+
+    def test_her_fighting_move_pushing_it_does_not_freeze_it(self):
+        self.alice_skill("MutuStand-P00")
+        self.alice_sends(0x0017, struct.pack("<ii", botsync.character_handle(self.bot_seat),
+                                             botsync.character_handle(self.alice_seat)))
+        self.assertIsNotNone(self.bot_conn.motion_constraint, "前提：推上了（位置照样约束）")
+        with self.clock():
+            self.assertFalse(bot._held_by_push(self.room, self.bot_conn, self.now()))
+
+
+class ThreatAfterHitTests(PressureRoom):
+    """一招对一人只中一次（`CanHit` / `MarkHit`）：打中过它（挡住的也算）的那一招不再让它举挡。"""
+
+    def test_a_move_that_already_hit_it_is_no_threat(self):
+        skill = self.alice_skill("MutuStand-P00")
+        with self.clock():
+            self.assertIsNotNone(bot._mutu_threat(self.room, self.bot_conn, self.bot_seat, self.now()),
+                                 "前提：她这一记刺拳打得到它")
+        self.alice_hits(flags=bot.EXPLODE_FLAG_GUARD)
+        self.assertIn(self.bot_seat, skill.hit_seats)
+        with self.clock():
+            self.assertIsNone(bot._mutu_threat(self.room, self.bot_conn, self.bot_seat, self.now()))
+
+
+class PressureStateTests(PressureRoom):
+    """压制计数：她这一串打中（含挡住）几下；反应从挨打那一刻数；清掉全看事件。"""
+
+    def test_a_hit_counts_and_the_reaction_starts_there(self):
+        self.alice_skill("MutuStand-P00")
+        self.alice_hits()
+        pressure = self.bot_conn.fight_pressure
+        self.assertEqual((self.alice_seat, 1), (pressure.attacker, pressure.count))
+        self.assertGreaterEqual(pressure.ready_at - pressure.seen_at + 1e-9, botfight.ATTACK_REACT_MIN_S)
+        self.assertLessEqual(pressure.ready_at - pressure.seen_at, botfight.ATTACK_REACT_MAX_S + 1e-9)
+
+    def test_her_seamless_next_move_keeps_it(self):
+        self.alice_skill("MutuStand-P00")
+        self.alice_hits()
+        self.alice_skill("MutuStand-P01")
+        with self.clock():
+            self.assertIsNotNone(bot._fight_pressure(self.room, self.bot_conn, self.now()), "无缝接下一招：还压着")
+        self.alice_hits()
+        self.assertEqual(2, self.bot_conn.fight_pressure.count)
+
+    def test_retracting_ends_it(self):
+        self.alice_skill("MutuStand-P00")
+        self.alice_hits()
+        self.alice_retracts()
+        with self.clock():
+            self.assertIsNone(bot._fight_pressure(self.room, self.bot_conn, self.now()), "她收招了：这一串断了")
+
+
+class BreakFreeTests(PressureRoom):
+    """能动的那一格：抢得过她下一次判定就反击；抢不过、被连着打中两下（血少于 1/4 时一下）就朝背对她那边跳开。"""
+
+    def test_two_hits_then_it_jumps_away_from_her(self):
+        with self.she_hits_first():
+            self.two_hits()
+            self.assertTrue(self.until(lambda: self.jumps(), 16), "锁一解就跳")
+        self.assertEqual(1, self.bot_conn.heading, "背对她（她在左边）")
+        start = self.bot_conn.body.x
+        self.assertTrue(self.until(lambda: self.bot_conn.fight_escape is None, 80), "落地就完了")
+        self.assertTrue(self.bot_conn.body.on_ground)
+        self.assertGreater(self.bot_conn.body.x, start + 60.0, "跳开了一大段")
+        self.assertIsNone(self.bot_conn.fight_pressure)
+
+    def test_it_lets_go_of_the_guard_to_jump(self):
+        with self.she_hits_first():
+            self.two_hits()
+            self.bot_conn.guard.set(True)
+            self.assertTrue(self.until(lambda: self.jumps(), 16))
+        self.assertFalse(self.bot_conn.guard.on)
+        self.assertEqual(b"\x00", body_of(guard_frames(self.alice, self.bot_seat)[-1])[1:2], "起跳就是松开 L")
+
+    def test_one_hit_is_not_enough_at_full_health(self):
+        with self.she_hits_first():
+            self.alice_skill("MutuStand-P00")
+            self.alice_hits()
+            self.alice.sent.clear()
+            self.advance(20)
+        self.assertEqual([], self.jumps())
+
+    def test_at_low_health_one_hit_is_enough(self):
+        self.set_health(0.2)
+        with self.she_hits_first():
+            self.alice_skill("MutuStand-P00")
+            self.alice_hits()
+            self.alice.sent.clear()
+            self.assertTrue(self.until(lambda: self.jumps(), 16))
+
+    def test_it_counters_when_it_lands_before_her_next_hit(self):
+        with mock.patch.object(bot, "_his_next_contact", lambda *a: self.now() + 1.0):   # 她一秒内都打不到它
+            self.alice_skill("MutuStand-P00")
+            self.alice_hits()
+            self.unlock()
+            self.alice_at(self.bot_conn.body.x - 38.0)    # 她跟上来了：刺拳够得着
+            self.alice.sent.clear()
+            self.assertTrue(self.until(lambda: self.starts(), 3), "锁一解就反击（反应在挨打时就数完了）")
+        (_seat, _kind, facing, index, _x, _y), = self.starts()
+        self.assertEqual((-1, skill_index(0, "MutuStand-P00")), (facing, index), "朝她、出最快那一招")
+        self.assertIsNone(self.bot_conn.fight_pressure)
+        self.assertEqual([], self.jumps())
+
+    def test_no_counter_when_she_hits_first(self):
+        with self.she_hits_first():
+            self.alice_skill("MutuStand-P00")
+            self.alice_hits()
+            self.unlock()
+            self.alice_at(self.bot_conn.body.x - 38.0)
+            self.alice.sent.clear()
+            self.advance(8)
+        self.assertEqual([], self.starts(), "抢不过就不硬出（压着的时候也不走「够得着就起手」那一支）")
+
+    def test_no_jump_into_a_pit(self):
+        self.install_terrain(synth_terrain("fight_pit_right", floor=400, height=440, pits=((700, 1400),)))
+        with self.she_hits_first():
+            self.two_hits()
+            self.advance(16)
+        self.assertEqual([], self.jumps(), "那边落不下来就不跳，接着挡")
+        self.assertTrue(self.bot_conn.body.on_ground)
+
+    def test_no_jump_into_a_wall(self):
+        self.install_terrain(synth_terrain("fight_wall_right", floor=400, height=440, walls=((670, 1400, 100),)))
+        with self.she_hits_first():
+            self.two_hits()
+            self.alice_at(self.bot_conn.body.x - 38.0)    # 她贴着：跳也跳不出她的刺拳
+            self.advance(16)
+        self.assertEqual([], self.jumps(), "背后是墙：跳了照样挨打，不跳")
+
+    def test_a_hit_in_the_air_cancels_it(self):
+        with self.she_hits_first():
+            self.two_hits()
+            self.assertTrue(self.until(lambda: self.jumps(), 16))
+            self.advance(2)
+            self.assertIsNotNone(self.bot_conn.fight_escape, "前提：还在跳")
+            self.alice_hits(kind=botfight.HIT_FLY, damage=12.0)
+        self.assertIsNone(self.bot_conn.fight_escape)
+
+
+class HisNextContactTests(PressureRoom):
+    """`_his_next_contact`：她这一招还打得到它 ⇒ 那一帧；已经打中过 ⇒ 她这一招播完、下一招最快的判定帧。"""
+
+    def test_her_live_jab_is_a_few_frames_away(self):
+        self.alice_skill("MutuStand-P00")
+        with self.clock():
+            at = bot._his_next_contact(self.room, self.bot_conn, self.bot_seat, self.alice_seat, self.alice, self.now())
+            self.assertGreater(at, self.now())
+            self.assertLess(at, self.now() + 0.3)
+
+    def test_after_it_landed_she_needs_her_next_move(self):
+        skill = self.alice_skill("MutuStand-P00")
+        self.alice_hits()
+        with self.clock():
+            at = bot._his_next_contact(self.room, self.bot_conn, self.bot_seat, self.alice_seat, self.alice, self.now())
+        want = skill.end_time() + (botfight.HUMAN_SKILL_START_FRAMES + bot._fastest_damager_frame(0)) * botfight.FRAME_S
+        self.assertAlmostEqual(want, at)
+
+
+class PressureReplayTests(FightActRoom):
+    """09-27 21:15:15.003 那一串原样重放（布洛克 vs 108 号的 J 四连 P00→P01→P02→P03，她那台判的四下打中 / 挡住）：
+    以前 bot 整串只举挡、两串之间 300 ms 空档一动不动；现在第二下之后硬直一解就跳开或反击（D94）。"""
+
+    EVENTS = [(0, "MutuStand-P00"), (96, (5.0, 2, 0)), (479, "MutuStand-P01"), (575, (9.0, 2, 0)),
+              (1088, "MutuStand-P02"), (1375, (9.0, 2, 0x80)), (1567, "MutuStand-P03"), (1727, (15.0, 3, 0x80))]
+
+    def test_it_breaks_free_instead_of_standing_there(self):
+        self.room.seats[self.bot_seat].character_id = 2
+        self.bot_conn.character_id = 2
+        self.room.seats[self.alice_seat].character_id = 108
+        self.bot_conn.heading = -1
+        self.bot_conn.roll_unit = lambda: 0.5
+        self.alice_at(562.0, ticks=1)
+        self.alice.sent.clear()
+        t0 = self.now()
+        pending = list(self.EVENTS)
+        acted = None
+        while pending or acted is None:
+            now = self.now()
+            if now - t0 > 2.4:
+                break
+            while pending and t0 + pending[0][0] / 1000.0 <= now + 1e-9:
+                _at, ev = pending.pop(0)
+                if isinstance(ev, str):
+                    self.alice_sends(botsync.OP_MUTU_SKILL, botsync.mutu_skill_body(
+                        self.alice_seat, botsync.MUTU_SKILL_START, 1, skill_index(108, ev),
+                        self.bot_conn.body.x - 38.0, self.FLOOR_Y))
+                else:
+                    with self.sim_clock():
+                        self.hit(ev[0], (15.0, -1.5 * ev[0]), ev[1], flags=ev[2])
+            self.advance(1)
+            if acted is None and (self.jumps() or self.starts()):
+                acted = self.now() - t0
+        self.assertIsNotNone(acted, "整串打下来它得跳开或者反击一次")
+        self.assertLess(acted, 1.1, "第二下（575 ms）挨完、硬直一解就动（以前到下一串都没动）")
+
+    def jumps(self):
+        return [f for f in bot_frames(self.alice, self.bot_seat) if header(f)["opcode"] == botsync.OP_JUMP]
 
 
 if __name__ == "__main__":

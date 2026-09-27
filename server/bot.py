@@ -698,6 +698,10 @@ class BotConn(gameserver.Conn):
         self.fight_settle = None
         #: 出手反应（D91）：看见机会的那一格起随机等 100~200 ms 才起手（`botfight.Opening`）。
         self.opening = botfight.Opening()
+        #: 正被谁的格斗连招压着（`botfight.Pressure`，D94）：能动的那一格决定反击还是跳开；`None` = 没被压着。
+        self.fight_pressure = None
+        #: 正在跳开（`botfight.Escape`，D94）：`_own_step` 下一格起跳、空中按着方向，落地清掉。
+        self.fight_escape = None
         #: 上一次按键模拟时的踩地状态（着地状态一变就把空中招收掉、清「用过」）。
         self.fight_grounded = None
         #: 日志去重：上一次「够得着 / 格挡」的说法（按状态翻转打，铁律 10）。
@@ -969,6 +973,8 @@ class BotConn(gameserver.Conn):
         self.fight_logged = None
         self.fight_settle = None
         self.opening = botfight.Opening()
+        self.fight_pressure = None
+        self.fight_escape = None
 
     def __repr__(self):
         return f"<BotConn {self.nickname} 座位 {self.my_seat}>"
@@ -3113,17 +3119,27 @@ def _held_by_push(room, machine, now):
     ★ 这一段它**也不自己挪**（`_own_step`：不走、不跳、不快跑，X_Mod §113 / D79）：推是单边的
       （`0x50e654` 只管别落到出招者身后），它自己往推的方向跑就跑出了圈 —— 22:17:01 那下真人的伤害段
       （第 17 帧）碰不到它，用户看着打中了、它一滴血没掉。
-    按状态翻转打日志：这一段推第一次拦下时说一句。
+    ★★ 只管**冲刺**推的那一段（X_Mod §132 / D94）：冲刺的推挤段短（第 17 帧就进伤害段），真人确实来不及动；
+      格斗招式的推挤体**整招全程**都在（§126），他无缝连招 ⇒ bot 从头冻到尾，只剩格挡 —— 用户 2026-09-27
+      「只要我一直不停进攻，bot 就不还手也不逃跑」。原版被推的人输入本来就不锁（§111），这一段照原版：能出招、能跳开，
+      位置照样被约束（`_apply_motion_constraint`），出手 / 跳开照样要过反应时间（`Opening` / `Pressure`）。
+    按状态翻转打日志：这一段推第一次碰上时说一句。
     """
     index = _pushed_by(room, machine, now)
     if index is None:
         machine.push_hold_logged = None
         return False
-    if machine.push_hold_logged != index:
-        machine.push_hold_logged = index
-        machine.log(f"   近身: 被座位{index} 的近身招式推着（`0x0017`），这一段不出手也不自己挪"
-                    f" —— 不冲、不开枪、不走不跳（X_Mod §111 / §113，D75 / D79）")
-    return True
+    owner = room.seats[index].conn
+    mutu = getattr(owner, "motion_kind", None) == "mutu"
+    if machine.push_hold_logged != (index, mutu):
+        machine.push_hold_logged = (index, mutu)
+        if mutu:
+            machine.log(f"   格斗: 被座位{index} 的格斗招式推着（`0x0017`）—— 照原版不锁输入，能出招、能跳开"
+                        f"（X_Mod §111 / §132，D94）")
+        else:
+            machine.log(f"   近身: 被座位{index} 的近身招式推着（`0x0017`），这一段不出手也不自己挪"
+                        f" —— 不冲、不开枪、不走不跳（X_Mod §111 / §113，D75 / D79）")
+    return not mutu
 
 
 def _melee_threat(room, machine, seat_index, now, terrain=None, course=None):
@@ -3543,6 +3559,7 @@ def note_peer_hit(room, conn, payload):
         return
     body = payload[udpsync.PEER_HEADER_SIZE:]
     kind = botfight.HIT_PLAIN          # 直接命中恒 0（`0x4928ea push 0`）；溅射那一路从包里读
+    own_mutu = False                   # 他自己的格斗判定体打中的（溅射那一路才可能）
     if opcode == botsync.OP_EXPLODE:
         if len(body) < botsync.EXPLODE_BODY_SIZE:
             return
@@ -3607,8 +3624,9 @@ def note_peer_hit(room, conn, payload):
         source = ("真人格斗招式" if kind in botfight.MUTU_HIT_KINDS
                   else "真人溅射/火/近身")
         push = (push_x, push_y)
-        if (kind in botfight.MUTU_HIT_KINDS
-                and botsync.handle_owner(_source) - botsync.OWNER_SEAT_BASE == conn.my_seat):
+        own_mutu = (kind in botfight.MUTU_HIT_KINDS
+                    and botsync.handle_owner(_source) - botsync.OWNER_SEAT_BASE == conn.my_seat)
+        if own_mutu:
             _note_mutu_hitstop(conn)
         # ★ 打中的是 bot 伸出去的手脚（它那一招受击体 / 推挤体的句柄，`0x480f06` 发被碰到那个对象自己的句柄）：
         #   每台收方都转给主人的 OnHit（`0x4f9a4b`），服务端也映射回它（C3）—— 不然下面当成怪记账。
@@ -3633,6 +3651,34 @@ def note_peer_hit(room, conn, payload):
     if seat_index is None:
         return
     _knock_back_seat(room, seat_index, damage, push, source=source, kind=kind, flags=flags)
+    if own_mutu:
+        _note_fight_hit(room, conn, seat_index)
+
+
+def _note_fight_hit(room, conn, seat_index):
+    """他（真人 `conn`）这一招格斗招式打中了座位 `seat_index`（挡住的也算，X_Mod §132 / D94）。
+
+    * 记进他这一招的 `hit_seats`：一招对一人只中一次（`CanHit 0x4810fa` / `MarkHit 0x4810c8`），bot 不再为这一招举挡
+      （`_mutu_threat`）—— 以前挡住之后还照判定体扫不扫得到接着举，他收招那段空档白白举着；
+    * 被打的是格斗房里的 bot：压制计数 +1、从这一刻起掷一次反应时间（`botfight.Pressure`）；正在跳开的那一下作废。
+    免伤里挨的不算（`OnHit` 进门就返回，`_knock_back_seat` 也什么都没做）。
+    """
+    skill = getattr(conn, "mutu_skill", None)
+    if skill is not None:
+        skill.hit_seats.add(seat_index)
+    seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
+    machine = None if seat is None else seat.conn
+    if not isinstance(machine, BotConn) or not _fight_mode(room):
+        return
+    if _immune(room, seat_index, _now()):
+        return
+    machine.fight_escape = None
+    pressure = machine.fight_pressure
+    if pressure is None or pressure.attacker != conn.my_seat:
+        pressure = machine.fight_pressure = botfight.Pressure(conn.my_seat)
+    # 挨打那一刻按他那台的逻辑帧网格记（同顿帧 `_note_mutu_hitstop`，`sync_event_grid`）：和房间那一格的时钟同一个口径。
+    grid = getattr(conn, "sync_event_grid", None)
+    pressure.hit(_now() if grid is None else grid, machine.roll_unit)
 
 
 def _weapon_attribute(weapon):
@@ -3872,9 +3918,12 @@ def _knock_back_seat(room, seat_index, damage, push, source="?", kind=0, flags=0
 
     ## 格挡着挨打（C3，X_Mod §122 `0x4ff4ac`）
 
-    打它的那台判它在挡、包里带 0x80（`0x480f02`），它此刻也确实挡着 ⇒ 扣 `int(0.25 × 伤害 + 1)`（台账在调用方按 flags 记）、
+    打它的那台判它在挡、包里带 0x80（`0x480f02`）⇒ 扣 `int(0.25 × 伤害 + 1)`（台账在调用方按 flags 记）、
     硬直 10 帧锁输入（`[+0x53c]`）、滑 2·push.x、**不打断、不击退**，直接返回。「正面」那道门（`[+0x2d4]` × push.x < 0）用的是
     各机各随的陈旧朝向（§95），服务端无从知道 —— 按挡住了算（同 `_landed_damage`）。
+    ★ **不看它自己此刻的开关**（X_Mod §131）：原版 `0x4ff486` 查完 0x80 就是正面那道门，没有别的；打它的那台判「在挡」= 开关 XOR
+    3 帧过渡（`0x50a0ea`），它刚放下挡的那 3 帧里照样带 0x80。以前这里多要一条 `guard.on`，那几下服务端当挨打（转身、打飞），
+    而扣血（`_landed_damage`）和打断（`_hit_breaks_melee`）都已按 flags 当挡住了 —— 09-27 两局 7 次，全在放下后 19~93 ms。
     """
     seat = room.seats[seat_index] if 0 <= seat_index < len(room.seats) else None
     machine = None if seat is None else seat.conn
@@ -3885,13 +3934,15 @@ def _knock_back_seat(room, seat_index, damage, push, source="?", kind=0, flags=0
     #   以前服务端照样顶飞，每台客户端上它纹丝不动 ⇒ 下一发心跳把它「凭空」拽走。
     if _immune(room, seat_index, _now()):
         return
+    # 正在跳开（D94）：挨了这一下就不跳了 —— 硬直 / 滑退 / 打飞接管，能动了再重新决定。
+    machine.fight_escape = None
     # Original OnHit releases the dependency through 0x50e636 at 0x50f954.
     if machine.motion_constraint is not None:
         machine.motion_constraint = None
         machine.motion_anchor_pending = True
     body = machine.body
     damage = int(damage)
-    if flags & EXPLODE_FLAG_GUARD and machine.guard.on:
+    if flags & EXPLODE_FLAG_GUARD:
         machine.fight_react = botfight.HitReact(push[0])
         machine.fight_block_left = FIGHT_BLOCK_FRAMES
         machine.motion_anchor_pending = True
@@ -8258,10 +8309,18 @@ def _own_step(room, machine, seat_index, terrain, now, tick, pushed=False):
     guarding = machine.guard.on
     held_still = (fight_skill is not None or guarding
                   or _fight_settling(machine, botfight.RETRACT_WALK_FRAMES))
+    # ★ 正在跳开（D94）：出了招 / 冲了 / 被锁住就作废（挨打那一下 `_knock_back_seat` 已经清过）。
+    escape = machine.fight_escape
+    if escape is not None and (locked or dash_frame is not None or fight_skill is not None):
+        machine.fight_escape = escape = None
     if (_may_walk(machine, now) and not pushed and dash_frame is None and not locked
             and not held_still):
         direction, want_jump, want_drop, fast_run = (
             machine.intent or (0, False, False, False))
+        if escape is not None:
+            # 跳开：这一格起跳、空中一路按着背对他那一侧，落地为止 —— 这几格走位的意图让路。
+            direction, want_jump, want_drop, fast_run = (
+                escape.direction, not escape.jumped, False, False)
     else:
         direction, want_jump, want_drop, fast_run = 0, False, False, False
     machine.move_down = bool(want_drop)
@@ -8311,6 +8370,11 @@ def _own_step(room, machine, seat_index, terrain, now, tick, pushed=False):
         dash_step=None if dash_frame is None else swing.step(dash_frame))
     machine.body = result.body
     _apply_motion_constraint(room, machine, terrain, now)
+    if escape is not None and machine.fight_escape is escape:
+        if result.jumped:
+            escape.jumped = True
+        elif not escape.jumped or machine.body.reported_on_ground:
+            machine.fight_escape = None     # 起不了跳（顶上有东西 / 没踩着地）或者跳完落地了：这一下跳开完了
     left_ground = (before.reported_on_ground
                    and not machine.body.reported_on_ground)
     if machine.nav_path and left_ground:
@@ -12516,9 +12580,11 @@ def _try_dash(room, machine, seat_index, now, on_ground, tick=None):
     if _yield_dash_to_melee(room, machine, seat_index, move, direction,
                             terrain, now):
         return False
+    waited = None
     if fight:
         if tick is None or not machine.opening.see(tick, now, machine.roll_unit):
             return False                   # 看见了，还没反应过来（D91）
+        waited = machine.opening.waited_ms(now)
         machine.opening.reset()
     x, y = machine.battle_pos
     packet, handle = machine.sync.dash(direction, BOT_DASH_INDEX, x, y)
@@ -12531,7 +12597,8 @@ def _try_dash(room, machine, seat_index, now, on_ground, tick=None):
     machine.log(f"   近身: 冲刺 朝{'右' if direction > 0 else '左'} "
                 f"目标 {who} {move!r} "
                 f"体力 {machine.stamina:.0f}/{_stamina_cap(machine):.0f}"
-                f" 句柄 {handle}（★ 收方也吃掉一个弹体句柄，§64）")
+                f" 句柄 {handle}（★ 收方也吃掉一个弹体句柄，§64）"
+                + ("" if waited is None else f"；看见机会 {waited:.0f} ms 后按（D91）"))
     _emit(machine, packet)
     # ★ 转身朝冲的方向（X_Mod §116）：冲刺那一段心跳的朝向位就是冲的方向（`_heartbeat_facing`），收完招没有准星可跟时
     #   也接着朝这边，别一收招又转回冲之前走的方向。
@@ -12801,6 +12868,8 @@ def _fight_land(room, machine, seat_index, skill, i, victim, region, px, py, now
                             kind=move.kind)))
     skill.add_hitstop()
     if mob_handle is None:
+        # 它打中人了：这一串压制断了（D94）。
+        machine.fight_pressure = None
         _note_damage(room, key, _landed_damage(damage, flags))
         # 类型 2 / 3 不看伤害一律打断他的招（没挡住的话），类型 3 记打飞（X_Mod §122）。
         _hit_breaks_melee(room, key, damage, flags, f"被座位{seat_index} 的 bot 格斗招式打中",
@@ -12843,6 +12912,7 @@ def _mutu_threat(room, machine, seat_index, now):
 
     他的身体从外推的此刻（`sim_body`，已经按 Move 曲线挪过）起、照表往后每一帧挪、摆判定体（`botfight.first_hit`）。
     还没走到第 0 帧的（刚收到 `0x0016`）从第 0 帧算。只看敌人。
+    ★ 这一招已经打中过它（挡住的也算，`HumanSkill.hit_seats`）就不算威胁：一招对一人只中一次（X_Mod §132 / D94）。
     """
     body = machine.body
     if body is None:
@@ -12857,7 +12927,8 @@ def _mutu_threat(room, machine, seat_index, now):
         skill = getattr(conn, "mutu_skill", None)
         his = getattr(conn, "sim_body", None)
         if (skill is None or his is None or isinstance(conn, BotConn)
-                or skill.gen != relayserver.epoch_state(conn).gen):
+                or skill.gen != relayserver.epoch_state(conn).gen
+                or seat_index in skill.hit_seats):
             continue
         raw = _human_skill_raw(conn, skill, now)
         k = skill.frame(raw)
@@ -12949,12 +13020,13 @@ def _fight_settling(machine, frames):
     return machine.fight_settle is not None and machine.fight_settle < frames
 
 
-def _fight_pick(room, machine, seat_index, bodies, state, current, x, y, facing, now):
+def _fight_pick(room, machine, seat_index, bodies, state, current, x, y, facing, now, fastest=False):
     """挑这一下按哪个键：`(招式, 朝向, 第几帧打得到)`；按哪个都够不着就 `None`。
 
     真人只能选按 J 还是 K（`botfight.KEYS`），出哪一招客户端按得分定（`botfight.press`：接续招优先）。够得着 = 从 `(x, y)`、
     朝 `facing`（`None` = 朝最近那个人）出那一招，判定体碰得到某个人（`botfight.first_hit`，假设他原地不动）。
     两个键都够得着时：七成按打到得快的那个（同样快按伤害高的），三成随便按一个（`roll_unit`）—— 不然永远是那一记刺拳。
+    `fastest` = 只要打到得最快的那个（反击抢时间，D94），不掷「随便按一个」。
     """
     skills = mutudata.skills(machine.character_id)
     if not skills or not bodies:
@@ -12976,7 +13048,7 @@ def _fight_pick(room, machine, seat_index, bodies, state, current, x, y, facing,
     if not hits:
         return None
     hits.sort(key=lambda h: h[:3])
-    if len(hits) > 1 and machine.roll_unit() < FIGHT_VARIETY_CHANCE:
+    if not fastest and len(hits) > 1 and machine.roll_unit() < FIGHT_VARIETY_CHANCE:
         pick = hits[int(machine.roll_unit() * len(hits)) % len(hits)]
     else:
         pick = hits[0]
@@ -12991,7 +13063,13 @@ def _fight_in_reach(room, machine, seat_index, now):
     """站在这儿、朝敌人那一侧出手，有没有哪一招够得着（走位用：够得着就站住等出手，别贴进人里去）。
 
     返回够得着的那一侧（±1，当前朝向那一侧优先）；都够不着 `0`。那一侧不是当前朝向 ⇒ 走位先朝他按一格方向键转过身来
-    （起手只能按当前朝向出，X_Mod §129 / D91）。"""
+    （起手只能按当前朝向出，X_Mod §129 / D91）。
+
+    ★ **贴在背上的人不用转身**（X_Mod §131）：推挤体（身前 15 px、r20）此刻就碰得到他 ⇒ 朝现在这边出手，先把他推到身前再打中
+    （`first_hit` 带推挤；起手 `_fight_pick` 本来就只按当前朝向挑）。以前一律「他在哪边就朝哪边」⇒ 转身那一步（决策两格 ≈ 16 px）
+    跨过了他，下一次决策他又在身后 —— 09-27 19:04:12 / 19:04:36 两段每 64 ms 左右翻一次。
+    只认推挤体碰得到的那一圈（泰尔 / 卡希尔 / 爱琳约身后 17 px 内），不认「判定体往身后扫得到」：布洛克刺拳第一帧拳头还在身后 31 px，
+    朝前出也扫得到身后 70 px 的人 —— 那种照样先转身，别背对着人把他打中。"""
     body = machine.body
     if body is None or not _fight_mode(room):
         return 0
@@ -12999,22 +13077,169 @@ def _fight_in_reach(room, machine, seat_index, now):
     state = _fight_state(machine)
     skills = mutudata.skills(machine.character_id)
     push = botfight.push_offset(chrprops.get(_seat_shape(room, seat_index, now)), bool(machine.crouched))
+    pressable = [s for s in (botfight.press(skills, key, state, None) for key in botfight.KEYS)
+                 if s is not None]
     heading = machine.heading or 1
+
+    def reaches(side, circles):
+        return any(botfight.first_hit(s, side, body.x, body.y, circles, push=push) is not None
+                   for s in pressable)
+
+    def on_its_back(circles):
+        qx, qy = body.x + push[0] * heading, body.y + push[1]
+        return any((qx - cx) ** 2 + (qy - cy) ** 2 <= (r + push[2]) ** 2 for cx, cy, r in circles)
+
     found = 0
     for target in bodies:
-        side = 1 if target[1] > body.x else (-1 if target[1] < body.x else heading)
-        if found and side != heading:
-            continue                     # 已经有一侧够得着了，只还关心当前朝向这一侧
         circles = _target_circles(target)
-        for key in botfight.KEYS:
-            s = botfight.press(skills, key, state, None)
-            if s is not None and botfight.first_hit(s, side, body.x, body.y, circles,
-                                                     push=push) is not None:
-                if side == heading:
-                    return side
-                found = side
-                break
+        toward = 1 if target[1] > body.x else (-1 if target[1] < body.x else heading)
+        if (toward == heading or on_its_back(circles)) and reaches(heading, circles):
+            return heading
+        if not found and toward != heading and reaches(toward, circles):
+            found = toward               # 先记着；别的人要是当前朝向就够得着，还是不用转身
     return found
+
+
+def _fight_pressure(room, machine, now):
+    """它此刻还被谁的格斗连招压着（`botfight.Pressure`，D94）；他那一串已经断了 ⇒ 清掉、返回 `None`。
+
+    「断了」全看事件：他收招 / 被打断（`_note_mutu_skill` / 打断那一路把他的 `mutu_skill` 清掉）、躺下、换了人 / 换了局。
+    他无缝接下一招时 `mutu_skill` 换成下一招，压制照旧 —— 用户说的「一直不停进攻」就是这种。
+    """
+    pressure = machine.fight_pressure
+    if pressure is None:
+        return None
+    index = pressure.attacker
+    seat = room.seats[index] if 0 <= index < len(room.seats) else None
+    conn = None if seat is None else seat.conn
+    skill = getattr(conn, "mutu_skill", None)
+    if (skill is None or isinstance(conn, BotConn) or skill.gen != relayserver.epoch_state(conn).gen
+            or _lying_dead(room, index)):
+        machine.fight_pressure = None
+        return None
+    return pressure
+
+
+def _escape_hits_needed(room, seat_index):
+    """被连着打中几下就想跳开（D94）：平时 `ESCAPE_HITS`，血少于 `BOT_LOW_HEALTH` 时 `ESCAPE_HITS_LOW_HEALTH`（多跳开）。"""
+    if _seat_health(room, seat_index) < BOT_LOW_HEALTH:
+        return botfight.ESCAPE_HITS_LOW_HEALTH
+    return botfight.ESCAPE_HITS
+
+
+def _fastest_damager_frame(character_id):
+    """这个角色哪一招的判定体最早在第几个逻辑帧出来（他接下一招最快多久打得到人，D94 反击用）。"""
+    frames = [min(d.points) for s in mutudata.skills(character_id) for d in s.damagers if d.points]
+    return min(frames) if frames else 0
+
+
+def _his_next_contact(room, machine, seat_index, index, conn, now):
+    """压着我的那个真人（座位 `index`），判定体最早什么时候再碰得到我此刻站的地方（D94 反击：得赶在这之前打中他）。
+
+    * 他这一招还没打中过我、接下来的判定体扫得到我 ⇒ 那一帧（和 `_mutu_threat` 同一套推法：外推的他、带推挤）；
+    * 这一招已经打中过我（一招对一人只中一次）/ 扫不到了 ⇒ 下一招最早在这一招播完那一刻发（接招窗口里排好的，`0x49597e`），
+      下一帧第 0 帧，再过「他哪一招的判定体最早出来」那几帧 —— 不知道他排的是哪一招，按最快的算（宁可少反击，别白白撞上去）。
+    """
+    skill = conn.mutu_skill
+    body = machine.body
+    his = getattr(conn, "sim_body", None)
+    raw = _human_skill_raw(conn, skill, now)
+    k = skill.frame(raw)
+    if (seat_index not in skill.hit_seats and his is not None
+            and (k is not None or raw < botfight.HUMAN_SKILL_START_FRAMES)):
+        start = 0 if k is None else k
+        shape = _seat_shape(room, seat_index, now)
+        mine = [(cx, cy, r) for cx, cy, r, _region
+                in chrprops.get(shape).circles(body.x, body.y, bool(machine.crouched))]
+        push = botfight.push_offset(chrprops.get(_seat_shape(room, index, now)),
+                                    bool(getattr(conn, "sync_crouch", False)))
+        reach = botfight.first_hit(skill.skill, skill.facing, his.x, his.y, mine, from_k=start, push=push,
+                                   applied=k is not None and skill.advancing(raw))
+        if reach is not None:
+            lead = reach - start + (botfight.HUMAN_SKILL_START_FRAMES - raw if k is None else 0)
+            return now + lead * botfight.FRAME_S
+    after = botfight.HUMAN_SKILL_START_FRAMES + _fastest_damager_frame(room.seats[index].character_id)
+    return skill.end_time() + after * botfight.FRAME_S
+
+
+def _fight_escape_dir(room, machine, seat_index, index, conn, terrain, now):
+    """朝哪边跳开（D94）：`(方向, 落点 Body)`；跳不开 `(None, 为什么)`。
+
+    方向 = 背对他那一侧。起跳、空中一路按着这个方向（`botmove.jump_lands`，格斗物理档），落点得是实地（不掉出图），
+    而且他站在原地按哪个键起手都够不着落点 —— 不然白跳（背后是墙 / 台子边就是这样），不如接着挡。
+    """
+    body = machine.body
+    his = getattr(conn, "sim_body", None)
+    if body is None or his is None or terrain is None:
+        return None, "不知道他 / 自己在哪"
+    direction = 1 if body.x > his.x else (-1 if body.x < his.x else -(machine.heading or 1))
+    landing = botmove.jump_lands(terrain, body, _character_of(machine), direction,
+                                 speed_scale=_speed_scale(machine, now))
+    if landing is None:
+        return None, "那边落不下来（坑 / 图外）"
+    his_skills = mutudata.skills(room.seats[index].character_id)
+    push = botfight.push_offset(chrprops.get(_seat_shape(room, index, now)), False)
+    mine = [(cx, cy, r) for cx, cy, r, _region
+            in chrprops.get(_seat_shape(room, seat_index, now)).circles(landing.x, landing.y, False)]
+    side = 1 if landing.x > his.x else -1
+    for key in botfight.KEYS:
+        s = botfight.press(his_skills, key, mutudata.STAND, None)
+        if s is not None and botfight.first_hit(s, side, his.x, his.y, mine, push=push) is not None:
+            return None, f"跳到 x={landing.x:.0f} 他照样够得着（背后是墙 / 台子边）"
+    return direction, landing
+
+
+def _fight_break_free(room, machine, seat_index, now, pressure, acting, held, locked, terrain, turned):
+    """被他的连招压着、这一格能动了（D94，用户 2026-09-27 选「看情况」）：先看能不能**抢在他下一次判定之前**打中他 ——
+    能就反击；不能、而且被连着打中了 `ESCAPE_HITS` 下（血少于 1/4 时 `ESCAPE_HITS_LOW_HEALTH`）就朝背对他那边跳开；
+    都不行就照旧（格挡那一套）。反应时间已经从挨打那一刻数过了（`Pressure.ready`）。动了返回 True。
+
+    反击照真人的规矩：起手只按当前朝向、转身那一格不按、收招那一格不按、两次按键隔 `BOT_PRESS_GAP_S`、挨打后 `[+0x17c]` 那 10 帧
+    不出格斗招；跳开要踩着地、没被锁输入（`[+0x53c]`），冲刺推着的那一段照旧不动（D75）。
+    """
+    if (not acting or held or locked or machine.fight_skill is not None or machine.fight_escape is not None
+            or _fight_settling(machine, botfight.RETRACT_PRESS_FRAMES)):
+        return False
+    body = machine.body
+    index = pressure.attacker
+    conn = room.seats[index].conn
+    state = _fight_state(machine)
+    last = machine.fight_press_at
+    waited = "?" if pressure.seen_at is None else "%.0f" % ((now - pressure.seen_at) * 1000.0)
+    if (not turned and machine.fight_block_left <= 0
+            and not (state == mutudata.AIR and machine.fight_air_used)
+            and (last is None or now - last >= botfight.BOT_PRESS_GAP_S)):
+        bodies = [b for b in _melee_bodies(room, machine, seat_index, targeting=True) if b[0] == index]
+        pick = _fight_pick(room, machine, seat_index, bodies, state, None, body.x, body.y,
+                           machine.heading or 1, now, fastest=True)
+        if pick is not None:
+            chosen, facing, k = pick
+            lands = now + (k + 1) * botfight.FRAME_S
+            his = _his_next_contact(room, machine, seat_index, index, conn, now)
+            if lands < his - 1e-9:
+                machine.opening.reset()
+                machine.fight_press_at = now
+                machine.fight_pressure = None
+                _start_fight_skill(room, machine, seat_index, chosen, facing, now,
+                                   f"反击：被座位{index} 连着打中 {pressure.count} 下，挨最后那下 {waited} ms 后按；"
+                                   f"第{k}帧打到、比他下一次判定早 {(his - lands) * 1000:.0f} ms（D94）")
+                return True
+    if pressure.count < _escape_hits_needed(room, seat_index) or not body.reported_on_ground:
+        return False
+    direction, landing = _fight_escape_dir(room, machine, seat_index, index, conn, terrain, now)
+    if direction is None:
+        if pressure.noted != pressure.count:
+            pressure.noted = pressure.count
+            machine.log(f"   格斗: 被座位{index} 连着打中 {pressure.count} 下，想跳开但{landing} —— 照旧挡（D94）")
+        return False
+    if machine.guard.on:
+        _send_guard(machine, False, "跳开")       # 起跳就是松开 L（`0x4958eb` 要踩地才开，X_Mod §95）
+    _clear_navigation(machine)                     # 欠着的二段跳也作废：落点按一段跳算的
+    machine.fight_escape = botfight.Escape(direction)
+    machine.fight_pressure = None
+    machine.log(f"   格斗: 被座位{index} 连着打中 {pressure.count} 下 → 朝{'右' if direction > 0 else '左'}跳开"
+                f"（挨最后那下 {waited} ms 后起跳，落在 ({landing.x:.0f}, {landing.y:.0f})，他站那儿够不着；D94）")
+    return True
 
 
 def _fight_act(room, machine, seat_index, now, acting, held, locked, terrain, tick=0, turned=False):
@@ -13029,10 +13254,17 @@ def _fight_act(room, machine, seat_index, now, acting, held, locked, terrain, ti
       接续招（PrevSkill 对得上）优先，起手招也行（`0x495cb5`）；朝向不变（出招中不能转身）。够不着就不排，播完发收招。
       空中而且这次腾空已经用过空中动作 ⇒ 按了也发不出去（`0x495a22`），不按。连段不走反应时间。
     被推着 / 他先出的冲刺打得到我（`held`）、锁输入（`locked`）、挨击退那 10 帧（`fight_block_left`）都不按 J / K。
+    ★ 被他的连招压着（`fight_pressure`，D94）：能动的那一格先问 `_fight_break_free`（反击 / 跳开），排在格挡前面 ——
+      决定跳开就松开 L；压着的这一段不走下面「够得着就起手」那一支（打不过他下一次判定还硬出，就是撞上去挨打）。
     `tick` = 房间格号（反应时间按「一格不断地看见」认）；`turned` = 这一格走路转了身。
     """
     if not _fight_mode(room) or machine.body is None or machine.holding:
         return False                     # `/hold` 是「站住别动」：冲刺那边也不冲（`_try_dash`）
+    pressure = _fight_pressure(room, machine, now)
+    if (pressure is not None and pressure.ready(now)
+            and _fight_break_free(room, machine, seat_index, now, pressure, acting, held, locked, terrain,
+                                  turned)):
+        return True
     threat = _fight_threat(room, machine, seat_index, now, terrain)
     sent = _fight_guard(room, machine, seat_index, now, threat, locked)
     if machine.guard.on or not acting or held or locked or machine.fight_block_left > 0:
@@ -13046,6 +13278,8 @@ def _fight_act(room, machine, seat_index, now, acting, held, locked, terrain, ti
     if skill is None:
         if turned or _fight_settling(machine, botfight.RETRACT_PRESS_FRAMES):
             return sent
+        if machine.fight_pressure is not None or machine.fight_escape is not None:
+            return sent                  # 压着 / 正在跳开：出不出手归 `_fight_break_free`（D94）
         if state == mutudata.AIR and machine.fight_air_used:
             return sent
         bodies = _melee_bodies(room, machine, seat_index, targeting=True)
@@ -13055,10 +13289,12 @@ def _fight_act(room, machine, seat_index, now, acting, held, locked, terrain, ti
             return sent
         if not machine.opening.see(tick, now, machine.roll_unit):
             return sent                  # 看见了，还没反应过来（D91）
+        waited = machine.opening.waited_ms(now)
         machine.opening.reset()
         chosen, facing, k = pick
         machine.fight_press_at = now
-        _start_fight_skill(room, machine, seat_index, chosen, facing, now, f"第{k}帧够得着")
+        _start_fight_skill(room, machine, seat_index, chosen, facing, now,
+                           f"第{k}帧够得着，看见机会 {'?' if waited is None else '%.0f' % waited} ms 后按")
         return True
     if not skill.started or skill.finished or skill.queued is not None or not skill.window_open():
         return sent
@@ -13708,6 +13944,7 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         #   就带着第 0 帧挪完的位置和冲的朝向，推挤段的第一发 `0x0017`（下一格）到收方之前，收方的它已经转过身了。
         dashing = (acting and not held and not locked
                    and machine.fight_skill is None and not machine.guard.on
+                   and machine.fight_pressure is None and machine.fight_escape is None   # D94
                    and not (target is not None and target[0] == BREAKABLE_SEAT)
                    and _try_dash(room, machine, seat_index, now, on_ground, tick=tick))
         if dashing:

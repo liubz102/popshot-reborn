@@ -139,7 +139,8 @@ class HumanSkill(object):
     * `end_raw`：招式播完那一帧（之后他那台发收招、恢复走路）。收招包 / 被打断 / 换招另外 `cut`。
     """
 
-    __slots__ = ("skill", "facing", "origin", "grid", "gen", "stops", "cut", "placed", "chain_start")
+    __slots__ = ("skill", "facing", "origin", "grid", "gen", "stops", "cut", "placed", "chain_start",
+                 "hit_seats")
 
     def __init__(self, skill, facing, origin, grid, gen=None, chain_start=None):
         self.skill = skill
@@ -150,6 +151,9 @@ class HumanSkill(object):
         self.stops = set()          # 顿住的帧（raw）
         self.cut = None             # 收招 / 被打断 / 换招那一帧（raw），之后不算
         self.placed = False         # 外推时第 0 帧硬置过没有
+        #: 这一招已经打中过的座位（他那台发来的 `0x0004`，挡住的也算）—— 一招对一人只中一次（`CanHit 0x4810fa` /
+        #: `MarkHit 0x4810c8`），bot 不再为这一招举挡（X_Mod §132 / D94）。
+        self.hit_seats = set()
         #: 这一串连段第一招开始的时刻：接续招（PrevSkill 是上一招）沿用上一招的，起手招就是自己的 `grid`。
         #: bot 的格挡反应时间从这一刻算（D88）—— 他连着打，bot 反应过来一次就一直挡着，不会每招重新「看见」。
         self.chain_start = self.grid if chain_start is None else float(chain_start)
@@ -275,11 +279,13 @@ class Opening(object):
     J/K 和冲刺共用这一份 —— 各掷一个等于取两次里先到的，反应被悄悄缩短（同 D89 ④ 格挡那条）。按出去之后 `reset`。
     """
 
-    __slots__ = ("seen_tick", "ready_at")
+    __slots__ = ("seen_tick", "ready_at", "seen_at")
 
     def __init__(self):
         self.seen_tick = None
         self.ready_at = None
+        #: 这个机会头一回看见的时刻 —— 只进日志（「看见机会 N ms 后按」，实机日志上直接核反应时间，X_Mod §131）。
+        self.seen_at = None
 
     def see(self, tick, now, roll):
         """这一格看见了一个能出手的机会：新机会就掷反应时间（`roll()` ∈ [0, 1)）；反应过来了返回 True。"""
@@ -289,11 +295,68 @@ class Opening(object):
         if self.ready_at is None:
             span = ATTACK_REACT_MAX_S - ATTACK_REACT_MIN_S
             self.ready_at = now + ATTACK_REACT_MIN_S + span * roll()
+            self.seen_at = now
         return now >= self.ready_at - 1e-9
+
+    def waited_ms(self, now):
+        """从头一回看见到 `now` 过了多少毫秒（日志用）；不知道（单测直接摆好了「早就反应过来」）返回 `None`。"""
+        return None if self.seen_at is None else (now - self.seen_at) * 1000.0
 
     def reset(self):
         self.seen_tick = None
         self.ready_at = None
+        self.seen_at = None
+
+
+#: ★ 被连着打中几下就想跳开（D94，**用户 2026-09-27 会话 51 定的玩法**：「看情况」—— 能抢先打中就反击，
+#: 被连着打中两下以上就朝后跳开，血少于 1/4 时多跳开）。挡住的也算一下（被推着走、硬直，一样是被压着）。
+ESCAPE_HITS = 2
+ESCAPE_HITS_LOW_HEALTH = 1
+
+
+class Pressure(object):
+    """bot 正被谁的格斗连招压着（D94）：他这一串打中（含挡住）了几下、从最近那一下起什么时候反应得过来。
+
+    ★ 反应从**挨打那一刻**数（同 `ATTACK_REACT_*`）：挨打 / 挡住的硬直有 10 帧（`[+0x53c]`），真人在硬直里就看清了局面、
+      硬直一过手就上去 —— 从「能动」那一格才开始数的话，他两招之间那条缝（常常只有 150~300 ms）永远数不完（X_Mod §132）。
+    清掉（`None`）的时机全是事件：他这一串断了（收招 / 被打断 ⇒ 他的 `mutu_skill` 没了）、bot 打中了人、bot 跳开了、死 / 新一局。
+    """
+
+    __slots__ = ("attacker", "count", "ready_at", "seen_at", "noted")
+
+    def __init__(self, attacker):
+        self.attacker = attacker
+        self.count = 0
+        self.ready_at = None
+        self.seen_at = None
+        #: 日志去重：「想跳开但跳不开」这一下压制里说过了没有（按状态翻转，铁律 10）。
+        self.noted = None
+
+    def hit(self, now, roll):
+        """他又打中了一下（`roll()` ∈ [0, 1) 掷反应时间）。"""
+        self.count += 1
+        span = ATTACK_REACT_MAX_S - ATTACK_REACT_MIN_S
+        self.ready_at = now + ATTACK_REACT_MIN_S + span * roll()
+        self.seen_at = now
+
+    def ready(self, now):
+        return self.ready_at is not None and now >= self.ready_at - 1e-9
+
+    def __repr__(self):
+        return "<Pressure 座位%s %d 下 反应到 %s>" % (self.attacker, self.count, self.ready_at)
+
+
+class Escape(object):
+    """bot 正在朝 `direction` 跳开（D94）：下一格起跳、空中一路按着这个方向，落地就完了（`bot._own_step`）。"""
+
+    __slots__ = ("direction", "jumped")
+
+    def __init__(self, direction):
+        self.direction = 1 if direction >= 0 else -1
+        self.jumped = False
+
+    def __repr__(self):
+        return "<Escape 朝%+d %s>" % (self.direction, "已起跳" if self.jumped else "待起跳")
 
     def __repr__(self):
         return "<Opening 看见于第%s格 反应到 %s>" % (self.seen_tick, self.ready_at)
