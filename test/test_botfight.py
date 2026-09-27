@@ -122,6 +122,23 @@ class FightRoomDashTests(MeleeRoom):
         self.assertTrue(dash_frames(self.alice, self.bot_seat))
         self.assertEqual([], fire_frames(self.alice, self.bot_seat))
 
+    def test_the_dash_waits_the_reaction_too(self):
+        """格斗房里冲刺也是「出手」：看见够得着之后同样要过 100~200 ms（D91，和 J/K 起手共用一份）。"""
+        self.bot_conn.roll_unit = lambda: 0.5             # 150 ms
+        seen = None
+        for point in ((100.0, 100.0), (120.0, 100.0), (140.0, 100.0), (140.0, 100.0), (140.0, 100.0)):
+            self.human_heartbeat(self.alice, *point, ticks=0)
+            for _ in range(gameserver.HEARTBEAT_TICKS):
+                at = self.now()
+                self.advance(1)
+                if seen is None and self.bot_conn.opening.seen_tick is not None:
+                    seen = at
+                if self.bot_conn.dash_swing is not None:
+                    self.assertIsNotNone(seen, "冲之前先看见过")
+                    self.assertGreaterEqual(at - seen + 1e-6, 0.150)
+                    return
+        self.fail("走到跟前了 bot 还没冲")
+
     def test_a_weak_fight_hit_still_stops_its_dash(self):
         """类型 2 / 3 不看伤害一律打断（`0x50a6f8`）；类型 0 要 ≥ 10（`HitBreaksBotDashTests.test_a_light_hit_does_not`）。"""
         swing = self.walk_until_dash()
@@ -131,6 +148,14 @@ class FightRoomDashTests(MeleeRoom):
             botsync.character_handle(self.bot_seat), 3.0, 130.0, 60.0,
             push_x=15.0, push_y=-4.5, kind=botfight.HIT_SLIDE))
         self.assertIsNone(self.bot_conn.dash_swing)
+
+
+class NormalRoomDashTests(MeleeRoom):
+    """对照：普通房的冲刺不走出手反应（D91 只管格斗房）。"""
+
+    def test_it_dashes_without_the_opening(self):
+        self.assertIsNotNone(self.walk_until_dash())
+        self.assertIsNone(self.bot_conn.opening.seen_tick)
 
 
 class FightHitRoom(TerrainMixin, BotFireRoom):
@@ -685,6 +710,10 @@ class BotStrikeRoom(FightHitRoom):
             gameserver.Conn.on_game_packet(self.alice, gameserver.OP_PEER_DATA_UP, packet)
 
 
+#: 等 bot 起手最多推几格：看见机会之后要过 100~200 ms 的出手反应（D91，`BotStrikeRoom` 的骰子 0.99 ⇒ 199 ms ≈ 7 格），再留余量。
+STRIKE_WAIT_TICKS = 12
+
+
 class BotStrikeTests(BotStrikeRoom):
     """够得着就出招：`0x0016` 字段、句柄、第 0 帧、Move、判中发 `rpSplashDamaged`、顿帧、一人一次。"""
 
@@ -692,7 +721,8 @@ class BotStrikeTests(BotStrikeRoom):
         super().setUp()
         self.alice_at(640.0)
         self.alice.sent.clear()
-        self.assertTrue(self.until(lambda: self.bot_conn.fight_skill is not None, 5), "前提：贴脸就出招")
+        self.assertTrue(self.until(lambda: self.bot_conn.fight_skill is not None, STRIKE_WAIT_TICKS),
+                        "前提：贴脸就出招（过了反应时间）")
         self.skill = self.bot_conn.fight_skill
 
     def test_the_packet_is_a_jab_toward_him_from_where_it_stands(self):
@@ -820,7 +850,271 @@ class BotStrikeSpacingTests(BotStrikeRoom):
         self.bot_conn.stamina = 0.0
         self.alice_at(605.0)                             # 几乎重叠
         self.alice.sent.clear()
-        self.assertTrue(self.until(lambda: self.starts(), 5))
+        self.assertTrue(self.until(lambda: self.starts(), STRIKE_WAIT_TICKS))
+
+
+class FightActRoom(BotStrikeRoom):
+    """直接问一格 `_fight_act` / `_advance_fight`（不推房间循环），好把「这一格」的某一道门单拎出来看。"""
+
+    AIR_Y = 330.0
+
+    def clock(self):
+        return bot._tick_clock(self.now())
+
+    def act(self, turned=False):
+        """这一格按什么（`_fight_act`，格号 = 房间下一格）。发了包返回 True。"""
+        with self.clock():
+            return bot._fight_act(self.room, self.bot_conn, self.bot_seat, self.now(), True, False, False,
+                                  bot._terrain(self.room), tick=self.loop().done, turned=turned)
+
+    def ready_opening(self):
+        """出手反应早就过了（上一格就看见了、到点了）—— 只看别的门。"""
+        self.bot_conn.opening.seen_tick = self.loop().done - 1
+        self.bot_conn.opening.ready_at = 0.0
+
+    def advance_fight(self):
+        with self.clock():
+            bot._advance_fight(self.room, self.bot_conn, self.bot_seat, self.now())
+
+    def start(self, motion, facing=1):
+        with self.clock():
+            bot._start_fight_skill(self.room, self.bot_conn, self.bot_seat, named(0, motion), facing,
+                                   self.now(), "单测")
+        return self.bot_conn.fight_skill
+
+    def take_off(self, x=600.0):
+        """把 bot 摆到半空（往上飞一点点），`_advance_fight` 这一格就认它腾空了。"""
+        self.bot_conn.body = botmove.Body(x, self.AIR_Y, 0.0, -2.0, on_ground=False)
+        self.bot_conn.battle_pos = (x, self.AIR_Y)
+
+    def alice_in_air(self, x):
+        with self.sim_clock():
+            self.human_heartbeat(self.alice, x, self.AIR_Y, on_ground=False, ticks=0)
+
+
+class BotReactionTests(BotStrikeRoom):
+    """出手反应（D91，用户 2026-09-27 定 100~200 ms 随机）：看见机会那一格起等够才起手；机会断一格就重掷。
+    连段里排下一招不等（`BotStrikeTests.test_the_combo_goes_on_to_the_link_right_after_the_last_frame` 钉着）。"""
+
+    def press_delay(self, roll, x=640.0):
+        """骰子掷 `roll`：bot 头一回看见机会的那一格，到它按下去的那一格，隔了多少秒。"""
+        self.bot_conn.roll_unit = lambda: roll
+        self.alice_at(x)
+        self.alice.sent.clear()
+        seen = None
+        for _ in range(STRIKE_WAIT_TICKS + 4):
+            at = self.now()
+            self.advance(1)
+            if seen is None and self.bot_conn.opening.seen_tick is not None:
+                seen = at
+            if self.starts():
+                self.assertIsNotNone(seen, "按之前先看见过")
+                return at - seen
+        self.fail("一直没出手")
+
+    def test_the_fastest_reaction_is_100ms(self):
+        took = self.press_delay(0.0)
+        self.assertGreaterEqual(took + 1e-6, botfight.ATTACK_REACT_MIN_S, "反应时间之前不按")
+        self.assertLess(took, botfight.ATTACK_REACT_MIN_S + botfight.FRAME_S)
+
+    def test_the_slowest_reaction_is_200ms(self):
+        took = self.press_delay(0.999)
+        want = botfight.ATTACK_REACT_MIN_S + 0.999 * (botfight.ATTACK_REACT_MAX_S - botfight.ATTACK_REACT_MIN_S)
+        self.assertGreaterEqual(took + 1e-6, want)
+        self.assertLess(took, want + botfight.FRAME_S)
+
+    def test_losing_the_opening_rolls_again(self):
+        """机会断了（他跳开）再回来就是新机会：从回来那一格重新数满，不接着上一次剩下的那几格。"""
+        self.bot_conn.roll_unit = lambda: 0.99            # 199 ms ≈ 7 格
+        self.alice_at(640.0)
+        self.advance(4)                                   # 看见了、还没反应过来
+        self.assertIsNotNone(self.bot_conn.opening.ready_at)
+        self.assertIsNone(self.bot_conn.fight_skill)
+        self.alice_at(1100.0, ticks=2)                    # 他跳开了：这两格没有机会
+        took = self.press_delay(0.99, x=self.bot_conn.body.x + 40.0)
+        want = botfight.ATTACK_REACT_MIN_S + 0.99 * (botfight.ATTACK_REACT_MAX_S - botfight.ATTACK_REACT_MIN_S)
+        self.assertGreaterEqual(took + 1e-6, want)
+
+    def test_opening_see_is_per_consecutive_tick(self):
+        opening = botfight.Opening()
+        self.assertFalse(opening.see(10, 1.000, lambda: 0.5))       # 新机会：掷 150 ms
+        self.assertFalse(opening.see(11, 1.100, lambda: 0.0))       # 同一个机会，不重掷
+        self.assertTrue(opening.see(12, 1.150, lambda: 0.0))
+        opening.reset()
+        self.assertFalse(opening.see(14, 1.200, lambda: 0.0))
+        self.assertFalse(opening.see(16, 1.290, lambda: 0.0), "断了一格（15 没看见）：重掷，从 16 起数")
+        self.assertTrue(opening.see(17, 1.390, lambda: 0.0))
+
+
+class BotFacingTests(FightActRoom):
+    """起手只按当前朝向出（X_Mod §129）：人在身后先转身，转身那一格不按。"""
+
+    def test_it_does_not_strike_someone_behind_it(self):
+        self.alice_at(560.0, ticks=1)                     # 在它身后 40 px，刺拳本来够得着
+        self.bot_conn.heading = 1
+        self.ready_opening()
+        self.assertFalse(self.act())
+        self.assertIsNone(self.bot_conn.fight_skill, "背对着他不出手")
+        self.assertEqual(-1, bot._fight_in_reach(self.room, self.bot_conn, self.bot_seat, self.now()),
+                         "走位知道他在身后够得着 ⇒ 「够得着·先转身」")
+
+    def test_no_press_on_the_turn_tick(self):
+        """真人这一帧才转过来，按的 J 下一帧才发得出去 ⇒ bot 转身那一格不起手。"""
+        self.alice_at(640.0, ticks=1)
+        self.bot_conn.heading = 1
+        self.ready_opening()
+        self.assertFalse(self.act(turned=True))
+        self.assertIsNone(self.bot_conn.fight_skill)
+        self.assertTrue(self.act(turned=False))
+        self.assertIsNotNone(self.bot_conn.fight_skill)
+
+    def test_it_turns_then_strikes_the_other_way(self):
+        self.bot_conn.roll_unit = lambda: 0.0
+        self.bot_conn.heading = 1
+        self.alice_at(560.0)
+        self.alice.sent.clear()
+        self.assertTrue(self.until(lambda: self.starts(), STRIKE_WAIT_TICKS + 4))
+        (_seat, _kind, facing, _index, x, _y), = self.starts()
+        self.assertEqual(-1, facing, "转过来朝他出")
+        self.assertLess(x, 600.0, "先朝他按了方向键（转身走了一点）")
+
+
+class BotAirActionTests(FightActRoom):
+    """`[+0x5d4]`（X_Mod §129）：一次腾空最多一个空中动作；挨重击后落地前不出空中招；踩地每格清。"""
+
+    def test_the_window_does_not_queue_a_second_air_skill(self):
+        """09-27 17:37:52.927 / 53.438 那一幕：空中招的接招窗口里又排了一个 Jump-P00 —— 真人按了也发不出去（`0x495a22`）。"""
+        self.alice_in_air(630.0)
+        self.take_off()
+        self.advance_fight()                              # 这一格认它腾空了
+        skill = self.start("MutuJump-P00")
+        self.assertTrue(self.bot_conn.fight_air_used, "出了空中招就置 `[+0x5d4]`")
+        for _ in range(3):
+            skill.tick()
+        self.assertTrue(skill.window_open(), "前提：接招窗口开了")
+        self.bot_conn.fight_press_at = None
+        self.act()
+        self.assertIsNone(skill.queued, "这次腾空用过了：不排")
+        self.bot_conn.fight_air_used = False              # 对照：没有这一位（会话 48 的样子）就会再排一个
+        self.act()
+        self.assertIsNotNone(skill.queued)
+        self.assertEqual(mutudata.AIR, skill.queued.skill_type, "又排了一个空中招（J 是 Jump-P00、K 是 Jump-P00-K）")
+
+    def test_a_queued_air_link_is_not_sent(self):
+        self.alice_in_air(630.0)
+        self.take_off()
+        self.advance_fight()
+        skill = self.start("MutuJump-P00")
+        skill.queued = named(0, "MutuJump-P00")          # 硬塞一个（AI 不会这么按）
+        self.alice.sent.clear()
+        for _ in range(skill.skill.frames_total + 1):
+            self.advance_fight()
+        self.assertEqual([], self.starts(), "不发排好的那招")
+        self.assertEqual(1, len(mutu_frames(self.alice, self.bot_seat, botsync.MUTU_SKILL_END)), "照没排算：发收招")
+
+    def test_a_heavy_hit_blocks_air_skills_until_it_lands(self):
+        self.alice_in_air(630.0)
+        self.take_off()
+        self.advance_fight()
+        self.assertFalse(self.bot_conn.fight_air_used)
+        self.hit(3.0, (-15.0, -4.5), botfight.HIT_SLIDE)
+        self.assertTrue(self.bot_conn.fight_air_used, "挨重击置 `[+0x5d4]`（`0x4ff6ad`）")
+        self.bot_conn.fight_block_left = 0                # 只看这一位：击退那 10 帧另有门
+        self.bot_conn.fight_react = None
+        self.ready_opening()
+        self.assertFalse(self.act())
+        self.assertIsNone(self.bot_conn.fight_skill, "落地前不出空中招")
+        self.bot_conn.body = botmove.Body(600.0, self.FLOOR_Y)
+        self.advance_fight()
+        self.assertFalse(self.bot_conn.fight_air_used, "踩地那一格清")
+
+    def test_the_flag_clears_on_every_grounded_tick(self):
+        """不只是「落地那一下」—— 在地上每格都清（`0x5155d0`）：在地上挨了一下也不会留到下一跳。"""
+        self.advance(1)
+        self.assertTrue(self.bot_conn.fight_grounded)
+        self.bot_conn.fight_air_used = True
+        self.advance_fight()
+        self.assertFalse(self.bot_conn.fight_air_used)
+
+    def test_leaving_the_ground_drops_a_queued_link(self):
+        """着地状态一变清队列，不分空中地面招（`0x495bf5`）；地面招本身照走。"""
+        self.advance(1)
+        skill = self.start("MutuStand-P00")
+        skill.queued = named(0, "MutuStand-P01")
+        self.take_off(self.bot_conn.body.x)
+        self.advance_fight()
+        self.assertIs(skill, self.bot_conn.fight_skill)
+        self.assertIsNone(skill.queued)
+
+
+class BotRetractTimingTests(FightActRoom):
+    """收招之后照真人那台的帧序（X_Mod §129）：收招那一格不起手 / 不冲 / 不挡；那一格和下一格不走、不转身。"""
+
+    def retract(self):
+        skill = self.start("MutuStand-P00")
+        self.bot_conn.fight_skill = None
+        with self.clock():
+            bot._end_fight_skill(self.bot_conn, skill)
+        self.assertEqual(0, self.bot_conn.fight_settle)
+
+    def test_no_press_on_the_retract_tick(self):
+        self.alice_at(640.0, ticks=1)
+        self.retract()
+        self.bot_conn.fight_press_at = None
+        self.ready_opening()
+        self.assertFalse(self.act())
+        self.assertIsNone(self.bot_conn.fight_skill, "收招那一格：招式对象还在，按的下一帧才发")
+        self.advance_fight()
+        self.assertEqual(1, self.bot_conn.fight_settle)
+        self.ready_opening()
+        self.assertTrue(self.act(), "下一格同方向就能出")
+
+    def test_no_dash_on_the_retract_tick(self):
+        self.alice_at(640.0, ticks=1)
+        self.bot_conn.melee = True
+        self.bot_conn.stamina = 100.0
+        self.retract()
+        self.ready_opening()
+        with self.clock():
+            self.assertFalse(bot._try_dash(self.room, self.bot_conn, self.bot_seat, self.now(), True,
+                                           tick=self.loop().done))
+        self.advance_fight()
+        self.ready_opening()
+        with self.clock():
+            self.assertTrue(bot._try_dash(self.room, self.bot_conn, self.bot_seat, self.now(), True,
+                                          tick=self.loop().done))
+
+    def test_no_guard_on_the_retract_tick(self):
+        self.alice_at(700.0, ticks=1)
+        self.retract()
+        guard = self.bot_conn.guard
+        threat = (("mutu", self.alice_seat, 0.0), 0.0)
+        guard.seen, guard.react_at = threat[0], 0.0       # 早就反应过来了
+        with self.clock():
+            self.assertFalse(bot._fight_guard(self.room, self.bot_conn, self.bot_seat, self.now(), threat, False))
+        self.advance_fight()
+        with self.clock():
+            self.assertTrue(bot._fight_guard(self.room, self.bot_conn, self.bot_seat, self.now(), threat, False))
+
+    def test_it_holds_still_for_two_ticks_after_a_retract(self):
+        self.bot_conn.roll_unit = lambda: 0.0
+        self.alice_at(640.0)
+        self.assertTrue(self.until(lambda: self.bot_conn.fight_skill is not None, STRIKE_WAIT_TICKS))
+        self.bot_conn.fight_press_at = 1e18               # 不排下一招
+        self.alice_at(1100.0)                             # 他走远了：播完就收招，然后朝他走
+        xs, ended = [], None
+        for i in range(40):
+            self.advance(1)
+            xs.append(self.bot_conn.body.x)
+            if ended is None and mutu_frames(self.alice, self.bot_seat, botsync.MUTU_SKILL_END):
+                ended = i
+            if ended is not None and i >= ended + 2:
+                break
+        self.assertIsNotNone(ended, "播完发了收招")
+        n = ended
+        self.assertEqual(xs[n - 1], xs[n], "收招那一格不走")
+        self.assertEqual(xs[n], xs[n + 1], "下一格也不走（回环才删招式对象，这一帧的输入才读方向）")
+        self.assertGreater(xs[n + 2], xs[n + 1], "第 2 格走得动了")
 
 
 class BotLimbTests(BotStrikeRoom):

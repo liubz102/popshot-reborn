@@ -8,7 +8,8 @@
   **不**做 push.y ×2）。两类都转向攻击者。每台客户端都对 bot 做同样的事 —— 服务端不跟着做，下一发心跳就把它拽回去。
 * **看懂真人的招**（C2 / B2，X_Mod §126 / §127）：`HumanSkill`。
 * **bot 自己出招 / 格挡**（C3，D84 / D88）：`BotSkill`（服务端当它的本机：动画时钟、顿帧、接招窗口、判定体、句柄）、
-  `first_hit`（挑招用：这一招从这儿出够不够得着）、`GuardState`（格挡开关 + 3 帧过渡 + 打破 + 反应时间）。
+  `first_hit`（挑招用：这一招从这儿出够不够得着）、`GuardState`（格挡开关 + 3 帧过渡 + 打破 + 反应时间）、
+  `Opening`（出手反应时间，D91）；收招之后几格才能按 / 走（`RETRACT_*`，X_Mod §129）。
 
 帧口径：一格 = 收方一个逻辑帧（32 ms，D106）。客户端这几样都是**逻辑帧计时器**（`0x5d5e37` 起、按帧号比），
 所以这里按「走过了几格」数，不按挂钟。
@@ -250,6 +251,52 @@ def hit_push(damage, facing, config=None):
 #:   原版接招窗口（剩余 ≤ 300 ms 起可排）照旧；泰尔刺拳计时器才 266 ms、一出手窗口就开着，不加这条 bot 下一格就能排下一招。
 #:   同 D77 的 0.3 秒，是给 bot 自己上的约束，不是拿来掩盖时序竞态的阈值（铁律 10 管的是后者）。
 BOT_PRESS_GAP_S = 0.100
+
+#: ★ 收招之后（`0x0016` 类型 −1）真人那台的帧序（X_Mod §129）：发收招那一帧 N 招式对象还在（下一帧开头回环才删），
+#: 这一帧按的 J/K 下一帧才发；N+1 帧的输入读方向、N+2 帧才走得动 / 转得过身。bot 照这个数：
+#: 收招那一格记 0，之后每格 +1 ——
+#:   * `< RETRACT_PRESS_FRAMES`（= 收招那一格）：不起手、不冲、不举挡；
+#:   * `< RETRACT_WALK_FRAMES`（N、N+1）：不走、不转身、不跳。
+#: 换方向出手 = N+2 转身 + 「转身那一格不出手」⇒ 最早 N+3，和真人一样，不用另记。
+RETRACT_PRESS_FRAMES = 1
+RETRACT_WALK_FRAMES = 2
+
+#: ★ 出手反应时间（D91，**用户 2026-09-27 会话 49 定的玩法参数**，同 D88 的格挡反应，不是掩盖竞态的阈值）：
+#: bot 能起手（J/K 起手招，或格斗房里的冲刺）并且看得见机会的那一格起，掷一次这两个数之间的均匀随机值，机会**一格不断地**
+#: 在、到点了才按。连段里排下一招不管这条（那是提前按好的，原版窗口 + `BOT_PRESS_GAP_S` 管节奏）。
+ATTACK_REACT_MIN_S = 0.100
+ATTACK_REACT_MAX_S = 0.200
+
+
+class Opening(object):
+    """bot「看见机会 → 反应过来 → 才出手」（D91）。
+
+    按**格号**认「一直在」：上一格也看见了就是同一个机会，接着等；中间断了一格（它忙着 / 机会没了）就是新机会、重掷。
+    J/K 和冲刺共用这一份 —— 各掷一个等于取两次里先到的，反应被悄悄缩短（同 D89 ④ 格挡那条）。按出去之后 `reset`。
+    """
+
+    __slots__ = ("seen_tick", "ready_at")
+
+    def __init__(self):
+        self.seen_tick = None
+        self.ready_at = None
+
+    def see(self, tick, now, roll):
+        """这一格看见了一个能出手的机会：新机会就掷反应时间（`roll()` ∈ [0, 1)）；反应过来了返回 True。"""
+        if self.seen_tick is None or tick - self.seen_tick > 1:
+            self.ready_at = None
+        self.seen_tick = tick
+        if self.ready_at is None:
+            span = ATTACK_REACT_MAX_S - ATTACK_REACT_MIN_S
+            self.ready_at = now + ATTACK_REACT_MIN_S + span * roll()
+        return now >= self.ready_at - 1e-9
+
+    def reset(self):
+        self.seen_tick = None
+        self.ready_at = None
+
+    def __repr__(self):
+        return "<Opening 看见于第%s格 反应到 %s>" % (self.seen_tick, self.ready_at)
 
 
 class BotSkill(object):

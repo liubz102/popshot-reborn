@@ -1,9 +1,9 @@
 {
  "format": 1,
  "packer": {"fill": 0, "key_prefix": "Pack/", "policy": "original-ext-v1", "sep": "~", "volume_cap": 16777216, "zlib_level": 9},
- "tree_hash": "a63092f0187ebf8d30533e57cc59377ab74cf6bc99b6cf61f0808d99de83b4b4",
+ "tree_hash": "4159e67c13f0846fedf0c864ebc82174af7f3a5403ddd165103f48a6ade081c8",
  "volumes": {
-  "Data~.pkn": {"group": "Data", "sha256": "bc8be7a7a23a14c4c160a74ae6c10571042d14a1e95c533eab4c6cde27c7a749", "size": 550912, "source": "Data", "members": [
+  "Data~.pkn": {"group": "Data", "sha256": "e14ca8adccdb3148530e9652ea41d16a2e05bdae355870c2f309799fe0767640", "size": 550912, "source": "Data", "members": [
    ["Chinese.ini", 114246, "a83ba2b81e8bff212613509e99f9bb808579dfff3b815788ee27cc971d993c1e"],
    ["Chinese.ini.r19467", 103870, "6a20b3f802a68c72bc57d438ac42467940b8b4e8e0ddeafebc1a30d0ca2bb584"],
    ["Chinese.ini.r19470", 103892, "b4d3a37902c721e112a9f70ca0dc75dc6222ea0ba0cf4e5a6642871a9d2b3dd3"],
@@ -39,7 +39,7 @@
    ["config.ini", 629, "1e399d807ec31dcf1fc50547460e5bdcae8653b448596a2103526a304cf4157c"],
    ["default.amf", 246448, "6a006a32062543df8b728365bfbe759817ddbebb29699e5a7fd8c43d5b4109bd"],
    ["map-censorship.ini", 28668, "a4c6a3b93a71b35b7e661220b6446db4352f474e8b3769a86d17070895fbd6fb"],
-   ["map.ini", 43350, "d911bde05623a8499ca54d22a7c4d35c0ce671f99b501b258ea2cc8c39646b38"],
+   ["map.ini", 43114, "119a4a40995ba04253a9c9c9f263013f83e2cf2c19233f1390f5ececc7f61c58"],
    ["weapon-censorship.ini", 95855, "7bbd0ddaf5ebaaadb8db91e32973a1efeb88a9f7238e2f35b020fa4c560dc4de"],
    ["weapon.ini", 246653, "1de03aa627751530b69b00620ab1634f3bd1bedce049ac8608ecb0d640f3b17f"]
   ]},

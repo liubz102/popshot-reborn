@@ -1015,7 +1015,7 @@ class MutuUnlockPatchTest(unittest.TestCase):
                                  "%s 的 %08X 和格斗解锁的 %08X 重叠" % (name, va, lo))
 
     def test_the_patch_thread_gates_it_behind_the_region_unlock(self):
-        # 15 张格斗图全靠地区旁路进目录 —— 地区锁保留时这组必须跟着不打。
+        # 14 张格斗图全靠地区旁路进目录（庆典那张已从 map.ini 删掉，D90）—— 地区锁保留时这组必须跟着不打。
         body = self.src[self.src.index("格斗模式（무투전）解锁（X16 / D82）"):]
         body = body[:body.index("登录公告")]
         self.assertLess(body.index("region_lock_disabled()"), body.index("try_patch_mutu_unlock()"))

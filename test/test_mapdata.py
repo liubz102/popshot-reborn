@@ -645,3 +645,32 @@ class RedirectExtractorTests(unittest.TestCase):
              ("Megatron01", "Megatron01_ch"), ("Megatron_b", "Megatron_b_ch"),
              ("Megatron_M00", "Megatron_M00_ch")],
             list(self.tool.read_map_redirects(pack, known).items()))
+
+
+class FightMapListTests(unittest.TestCase):
+    """`map.ini` 里的格斗图（`AvailableMode=[Mutu]`，X_Mod §118）：「庆典-格斗场」Festivalm01 已删（D90，原版包就缺 `.map`、
+    进去全黑）；剩下每一张的 `.map` 都在包里 —— 别再从原版拷回一份 `map.ini` 把黑图带回来。"""
+
+    def test_fourteen_fight_maps_all_with_a_map_file(self):
+        pack = os.path.join(os.path.dirname(HERE), "game_patched", "Pack_develop")
+        ini = os.path.join(pack, "Data", "map.ini")
+        if not os.path.isfile(ini):
+            raise unittest.SkipTest("不在源码仓库里（缺明文资源树），跳过")
+        with open(ini, "rb") as fp:
+            text = fp.read().decode("utf-16")
+        sections, current = {}, None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                current = sections.setdefault(line[1:-1], {})
+            elif "=" in line and current is not None:
+                key, value = line.split("=", 1)
+                current[key.strip()] = value.strip()
+        fight = [s["MapFileName"] for s in sections.values() if "[Mutu]" in s.get("AvailableMode", "")]
+        self.assertNotIn("Festivalm01", fight)
+        self.assertNotIn("18-3", sections)
+        self.assertEqual(14, len(fight), fight)
+        known = {f[:-4] for f in os.listdir(os.path.join(pack, "Maps")) if f.lower().endswith(".map")}
+        self.assertEqual([], [m for m in fight if m not in known], "格斗图缺 .map ⇒ 进去全黑")
