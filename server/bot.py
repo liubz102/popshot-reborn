@@ -498,6 +498,10 @@ class BotConn(gameserver.Conn):
         #: ★ 正在执行的那条边要不要在顶点补一次**二段跳**
         #:   （`botnav.ACTION_DOUBLE_JUMP`）。落地 / 换边就清。
         self.nav_double_jump = False
+        #: ★★ 这一段腾空是**路线上哪条边**起的飞、空中该按哪个方向键（`Step.direction`；`None` = 不是路线起的飞）。
+        #:   和 `nav_double_jump` 同一个道理：它说的是**正在进行的这段抛物线**，不是路线 —— 半空里路线被
+        #:   「打得到·就地打」之类清掉，这段飞行照样按规划那样飞完（X_Mod §135）。离地那一格记、踩地就清（`_own_step`）。
+        self.nav_air_dir = None
         #: ★★★ 闯关**牵引绳**的记账（D99）。`leash_lagging` = 此刻算不算
         #:   「掉队了」（日志按这个状态翻转去重）；`leash_mark` = 掉队以来
         #:   自己沿前进轴走到过的**最靠前**的地方；`leash_gap` = 掉队那一刻
@@ -823,6 +827,7 @@ class BotConn(gameserver.Conn):
         botplan.forget(self)
         self.nav_planned_at = None
         self.nav_double_jump = False
+        self.nav_air_dir = None
         self.path_breakable = None
         self.path_breakable_prefix = []
         self.path_breakable_only = False
@@ -6742,14 +6747,24 @@ def _route_intent(machine, terrain, who, spot, hold_at_breakable=False):
             return (step.direction, again, False, step.fast_run)
         return None
 
+    # ★★★ 目标挪出了 A\* 的「到了」窗口 ⇒ 要换路线。但**新路线回来之前照旧路线走**（X_Mod §135）：
+    #   以前是当场整条作废，这一格（单子下一格才回来，§137）退回 `_walk_to()` 的老兜底「朝目标的 x 直着走」
+    #   —— 弹跳台在右、人在左上时它就往左走一步，新路线一到再折回来；人一直在动就一直这么来回。
+    #   在中层边上的话这一步还会直接走下去、掉回最下层。旧路线的每一条边都是物理模拟过的，照它多走一格
+    #   总比兜底直着走强。挡路物那套（`path_breakable`，安全前缀）照旧当场作废 —— 那一整套是跟着旧目标定的。
+    retarget = False
     if machine.nav_goal is not None:
         shifted = math.hypot(spot[0] - machine.nav_goal[0],
                              spot[1] - machine.nav_goal[1])
         if shifted > botnav.GOAL_X:
-            _clear_navigation(machine)
-            machine.path_breakable = None
-            machine.path_breakable_prefix = []
-            machine.path_breakable_only = False
+            if (machine.nav_path and not hold_at_breakable
+                    and machine.path_breakable is None):
+                retarget = True
+            else:
+                _clear_navigation(machine)
+                machine.path_breakable = None
+                machine.path_breakable_prefix = []
+                machine.path_breakable_only = False
 
     # 吃掉已经走到的边；动作完成是“重新落在规划落脚点”这个事实，不看时间。
     while machine.nav_path and botnav.step_reached(body, machine.nav_path[0]):
@@ -6761,9 +6776,10 @@ def _route_intent(machine, terrain, who, spot, hold_at_breakable=False):
         # 捷径的安全前缀已经走完：这里就是对挡路物开火的位置。
         # ★ 只对破障那个调用者成立，见函数抬头。
         return (0, False, False, False)
-    if not machine.nav_path:
+    choice = None
+    if retarget or not machine.nav_path:
         signature = _nav_signature(terrain, body, spot)
-        if machine.nav_failed == signature:
+        if machine.nav_failed == signature and not machine.nav_path:
             return None
         # ★★★ A\* **在后台线程上跑**（§137）：这里只做两件 O(1) 的事 ——
         #     看看上一张单子算好了没有、没有就递一张新的。
@@ -6779,7 +6795,10 @@ def _route_intent(machine, terrain, who, spot, hold_at_breakable=False):
                           else None)
                 botplan.ask(machine, terrain, body, who, spot,
                             open_terrain=opened)
-            return None
+            if not machine.nav_path:
+                return None
+            # 换目标的单子还在算（`retarget`）：下面照旧路线的这一步走。
+    if choice is not None:
         if choice.blocker is not None:
             machine.path_breakable = int(choice.blocker)
             machine.path_breakable_prefix = list(choice.prefix)
@@ -6826,9 +6845,53 @@ def _route_intent(machine, terrain, who, spot, hold_at_breakable=False):
     if step.action == botnav.ACTION_DROP:
         return (0, False, True, False)
     if step.action == botnav.ACTION_PAD:
-        # 人已经站在台上；普通 tick 会让台子自己把它弹出去（§99）。
-        return (0, False, False, False)
+        # 人站在台上、什么都不按，下一格台子就把它弹出去（§99）。
+        # ★ 踩偏了先朝台子中心挪一步（`_pad_lean`，X_Mod §135）；这一层根本踩不中台子 = 这条路从这儿走不通。
+        lean = _pad_lean(machine, terrain, body)
+        if lean is None:
+            _clear_navigation(machine, failed=_nav_signature(terrain, body, spot))
+            return None
+        return (lean, False, False, False)
     return (step.direction, False, False, False)
+
+
+def _pad_lean(machine, terrain, body):
+    """路线走到「站上弹跳台」那一步时这一格怎么按：`0` = 站住（下一格台子就弹）、`±1` = 朝台子中心挪一步、
+    `None` = 这一层踩不中任何台子（X_Mod §135）。
+
+    ★ 规划那一侧的台子边是从这一格的**代表身体**模拟出来的（`botnav.node` 按 8×4 去重），执行这一侧
+      「走到了」又允许差 ±8 px（`botnav.step_reached`）—— 而台子的作用范围只有中心左右二三十像素，
+      `Megatron01_ch` 上约四分之一的台子起点在这 ±8 px 里有一段是踩不中的。站在那儿不动，台子永远不弹。
+      真人踩偏了也是往台子中心挪一步再松手。
+    ★ 判据就是下一格的物理：用 `_own_step()` 真跑时的形状（缩小 / 出拳都算上）和蹲姿问
+      `botmove.jump_pad_launch()` —— 预测要和执行用同一组参数（V0.3 §151）。
+    """
+    shape = _live_shape(machine)
+    crouched = bool(machine.dodge_crouch)
+    if botmove.jump_pad_launch(terrain, body, shape, crouched=crouched) is not None:
+        return 0
+    pads = getattr(terrain, "jump_pads", ()) or ()
+    if not pads:
+        return None
+    pad = min(pads, key=lambda p: math.hypot(p[0] - body.x, p[1] - body.y))
+    # 挪到台子正上方都踩不中（高度对不上）就不是这一层的台子 —— 横着挪多远都没用。
+    over = botmove.Body(float(pad[0]), body.y)
+    if botmove.jump_pad_launch(terrain, over, shape, crouched=crouched) is None:
+        return None
+    return 1 if pad[0] > body.x else -1
+
+
+def _live_shape(machine):
+    """这个 bot **此刻**真跑物理的那个形状（`_own_step()` 取的同一个：闯关统一尺寸 / 缩小 ×0.6 / 出拳第 4 个圆）。
+
+    拿不到房间 / 座位就退回规划用的那一份（`_character_of`）。
+    """
+    lookup = getattr(machine, "lobby_room", None)
+    room = lookup() if lookup is not None else None
+    index = None if room is None else room.seat_index_of(machine)
+    if index is None:
+        return _character_of(machine)
+    return chrprops.get(_seat_shape(room, index))
 
 
 # ---------------------------------------------------------------------------
@@ -7232,6 +7295,25 @@ def _side_toward(body, spot):
     return 0 if abs(delta) < 1.0 else int(math.copysign(1, delta))
 
 
+def _route_leads_there(machine, spot):
+    """bot 正照着 A\\* 路线走，而且这一步是**站上弹跳台**、或者这条路线**真到得了** `spot`（X_Mod §135）。
+
+    * 弹跳台那一步：路线让它站着不动等台子弹（`_route_intent`），不管路线最后到不到得了；
+    * 到得了 = 最后一条边落在 A\\* 自己认的「到了」窗口里（`botnav.GOAL_X/GOAL_Y`，和 `plan_result` 的
+      `reached` 同一把尺）。A\\* 说「到不了、走到最近处」的那种路线不算。
+
+    `_walk_to()` 返回时 `machine.nav_path` 非空 ⇔ 这一格的动作是路线给的（没路线 / 路线作废时它都清空了）。
+    """
+    path = machine.nav_path
+    if not path:
+        return False
+    if path[0].action == botnav.ACTION_PAD:
+        return True
+    last = path[-1]
+    return (abs(last.x - spot[0]) <= botnav.GOAL_X
+            and abs(last.y - spot[1]) <= botnav.GOAL_Y)
+
+
 def _unstall(room, machine, terrain, spot, intent, target):
     """走位算不出动作时**横着挪一步去找路**（D137：「禁止站在一个地方不动」）。
 
@@ -7256,9 +7338,22 @@ def _unstall(room, machine, terrain, spot, intent, target):
     * **打得到人了**（`target`）—— 位置已经够好，不用再挪；
     * 这一侧**走不动了**（撞墙 / 前面是无底洞，`_blind_probe_intent`
       返回 `None`）。
+
+    ## ★★★ A\\* 给了**上得去的路**就不插手（X_Mod §135，`_route_leads_there`）
+
+    这一条是给「算不出动作」兜底的，而下面两种时候动作是算出来的：
+    * 路线上「站上弹跳台」那一步本来就是**站着不动**（台子只在 ←/→/↓ 都没按时才弹，X_Mod §104）——
+      以前被当成卡住、换成横着探一步，人按着方向键从台子上走开，台子永远不弹。
+      用户 2026-09-27 `Megatron01`：敌方 bot 在最下层走到台子上就掉头，一路走到墙根再折回来，
+      「只会左右晃悠，不跳上来」；
+    * 路线真到得了目标：闩着的探路方向不许再盖掉路线的方向（以前闩一上，路线说往右、这里照样往左）。
+    ⇒ 「上下层的路找到了」（上面第一条解闩事件）不只是「给得出跳 / 下落」，照着一条到得了的路线走就算。
+    ⚠ A\\* 只给得出「到不了，走到最近处」那种路线时照旧归这里管：那条路线会把人拽回最近点，
+      放它过去就成了「探一步、拽回来」原地抽（§174 那个型），D137 要的是横着一直找下去。
     """
     body = machine.body
     if (body is None or intent[1] or intent[2] or target is not None
+            or _route_leads_there(machine, spot)
             or (abs(spot[0] - body.x) <= botnav.GOAL_X
                 and abs(spot[1] - body.y) <= botnav.GOAL_Y)):
         # ★ 最后那一句是「**已经到了**」：站在目标上不动不是卡住，是到位了
@@ -7313,9 +7408,11 @@ def _blind_walk(room, machine, terrain, spot, side, fast_run):
 
     ★ 探路方向和 `_unstall()` 共用同一个闩（`machine.probe_side`，D137）：
       不闩的话每格重挑一次，目标那点横向分量会把它拽回来（§174 那个型）。
+    ★ 路线上「站上弹跳台」那一步是故意站着，不是卡住（`_route_leads_there`，X_Mod §135，理由同 `_unstall()`）。
     """
     intent = _walk_to(room, machine, terrain, spot, fast_run)
-    if intent[0] or intent[1] or intent[2]:
+    if (intent[0] or intent[1] or intent[2]
+            or _route_leads_there(machine, spot)):
         machine.probe_side = 0
         return intent
     probe = _blind_probe_intent(room, machine, terrain,
@@ -7511,7 +7608,11 @@ def _walk_to(room, machine, terrain, spot, fast_run):
         #   走的是下面那条老兜底，它起跳时把「这一段要补第二跳」记在
         #   `nav_double_jump` 上。判据和规划层同一句（`botmove.at_apex`）。
         again = machine.nav_double_jump and botmove.at_apex(body)
-        return (direction, again, False, fast_run)
+        # ★★ 路线上的边起的飞、半空里路线被清掉了（「打得到·就地打」之类）：方向键照那条边按到落地
+        #   （`nav_air_dir`，X_Mod §135）。本人那台有空中操控（X_Mod §102），改按「朝目标」会把弧线拽歪 ——
+        #   `Megatron01` 上台子刚把 bot 弹起来就被这么拽去撞中层平台的边、掉回最下层。
+        air = machine.nav_air_dir
+        return (direction if air is None else air, again, False, fast_run)
 
     # ★ 踩着地 = 上一段腾空结束，兜底那一跳的「补第二段」旗子作废。
     #   放在这里而不是落地事件上：`_route_intent` 走 A\* 路线时会**自己**
@@ -7584,7 +7685,7 @@ def _walk_to(room, machine, terrain, spot, fast_run):
             machine.nav_double_jump = True
             return (direction, True, False, fast_run)
         return (0, False, False, False)
-    if vertical and spot[1] < body.y:
+    if vertical and spot[1] < body.y and not _plan_pending(machine):
         # ★★★ **目标在上面 ≠ 现在就该跳**（§146）。这条兜底原来是无条件
         #   起跳的，而跟随点只要比自己高一点（对岸台子高 75 就够）它就在
         #   **离坑还有 150 的平地上**起跳 —— 弧线飞到对岸时早就低于台面了，
@@ -7592,6 +7693,12 @@ def _walk_to(room, machine, terrain, spot, fast_run):
         # ⇒ 先问一句「这一跳落得住吗、落了之后是不是真的更高」：落不住
         #   （掉出图外 / 掉进坑）或者白跳，就**接着走** —— 走到坎底下再蹦，
         #   走到坑边上会有 `bottomless` 那两条接手。
+        # ★★★ **A\* 的单子还在算时不凭这一条起跳**（`_plan_pending`，X_Mod §135），照常走一步等它：单子下一格
+        #   就回来（§137），可这一跳让人离地一秒多，落地时那份答案的起点已经挪远（`botplan.Ticket.matches`）
+        #   被扔掉，再递、兜底又跳 …… 路线永远装不上。实机 `Megatron01` 最下层是斜坡，「跳一下能更高」几乎
+        #   处处成立，敌方 bot 就这么在底下一路蹦、一次都没踩上弹跳台。
+        #   撞墙跳（`blocked`）、跨坑跳（`bottomless`）在上面，不动 —— 那两条是「这一步走不成」，不是「目标在上面」。
+        #   ⚠ 不是「站住等」：那样目标真到不了时每探一步就重递一张单、站一格，走一步停一步（D137 那条）。
         landing = _jump_lands(terrain, body, who, direction,
                               fast_run, crouched, scale)
         if _landing_ok(terrain, landing, who) and landing.y < body.y - 1.0:
@@ -7637,6 +7744,15 @@ def _walk_to(room, machine, terrain, spot, fast_run):
     if direction:
         machine.walk_last = direction
     return (direction, False, False, fast_run)
+
+
+def _plan_pending(machine):
+    """后台 A\\* 手上有这个 bot 一张**还没取走**的单子（`botplan.ask` 递的）—— 下一格就有答案（§137）。
+
+    `_route_intent()` 回 `None` 有两种：「A\\* 说到不了」（`nav_failed` / 单子取走了却没路）和
+    「单子刚递、还在算」。只有后者单子还挂在 `machine.nav_ticket` 上（`take_result` / `forget` 都会摘掉它）。
+    """
+    return getattr(machine, "nav_ticket", None) is not None
 
 
 def _jump_lands(terrain, body, who, direction, fast_run, crouched, scale):
@@ -8379,6 +8495,18 @@ def _own_step(room, machine, seat_index, terrain, now, tick, pushed=False):
                    and not machine.body.reported_on_ground)
     if machine.nav_path and left_ground:
         machine.nav_started = True
+    # ★★ 这一段腾空该按哪个方向键（X_Mod §135）：路线上的边起的飞就记下那条边的方向；**台子弹起来的**一律 0
+    #   （可达图里台子边就是全程不按键模拟的；站在台上开枪 / 躲闪时路线已经清了，台子照样弹 —— 那段也照 0 飞）。
+    #   踩地就清。半空里路线被清掉，`_walk_to()` 的腾空兜底照它飞完。
+    if left_ground:
+        if machine.nav_path:
+            machine.nav_air_dir = machine.nav_path[0].direction
+        elif before.pad:
+            machine.nav_air_dir = 0
+        else:
+            machine.nav_air_dir = None
+    elif machine.body.reported_on_ground:
+        machine.nav_air_dir = None
     jumped = result.jumped
     if jumped == 2:
         # ★★★ **欠的这一跳还完了，旗子当场作废**（V0.3 §179）：「这一段还欠不欠第二跳」

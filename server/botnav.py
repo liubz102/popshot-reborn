@@ -369,10 +369,16 @@ def _pad_edge(terrain, body, character, trace, double=False):
     ⚠ 起跳那一下**不能按跳**：`botmove.tick(want_jump=True)` 会走
     `jump()` 这一支，人先离地 ⇒ `jump_pad_launch()` 那一句根本轮不到，
     台子白站了。所以第一 tick 必须是「什么都不按」。
+
+    ★ 判据是「这一格**台子写了速度**」（`Body.pad`），不是「这一格离地了」（X_Mod §135）。
+      以前问的是后者，而落地那一格常常悬在实心上面一两像素（`0x50efd2` 没踩住就停在往下挪到的那格），
+      什么都不按下一格就往下掉 —— 这种「站着掉几像素」也被记成了台子边：没有弹跳台的 `Forest00`
+      上有 150 条，`Megatron01_ch` 上 298 条里只有 66 条真是台子。执行层对台子边只会「站着等台子弹」，
+      换一个没悬空的身体去执行就是站着干等。
     """
     current = botmove.tick(terrain, body, character)
     trace.see(current)
-    if current.on_ground:                 # 脚下没有能触发的台
+    if not current.pad:                   # 脚下没有能触发的台
         return None
     used = 1
     jumped = False

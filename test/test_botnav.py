@@ -311,6 +311,23 @@ class JumpPadRouteTests(unittest.TestCase):
         jumped = botmove.tick(terrain, onpad, self.who, want_jump=True)
         self.assertEqual(-botmove.JUMP_SPEED, jumped.vy)
 
+    def test_dropping_a_few_pixels_while_standing_is_not_a_pad_edge(self):
+        """★★ 台子边得是台子**真的写了速度**（`Body.pad`），光是「站着不动就离地」不算（X_Mod §135）。
+
+        落地那一格常常悬在实心上面几像素，什么都不按下一格就往下掉 —— 以前这也被记成台子边
+        （一个台子都没有的 `Forest00` 上 150 条），执行层照「站着等台子弹」去做，换个没悬空的身体就是干等。
+        """
+        terrain = terrain_from(solid_heights([850] * 900, 900))   # 一个台子都没有
+        hovering = botmove.Body(300.0, 839.0)       # 踩地位是真的，脚下却空着 10 像素
+        drifted = botmove.tick(terrain, hovering, self.who)
+        self.assertFalse(drifted.on_ground, "夹具自检：什么都不按，这一格就离地往下掉")
+        self.assertFalse(drifted.pad)
+        edges = botnav.neighbors(terrain, hovering, self.who)
+        self.assertTrue(edges, "夹具自检：别的边照样有")
+        self.assertEqual([], [step for _body, step in edges
+                              if step.action == botnav.ACTION_PAD],
+                         "没有台子就不该有台子边")
+
 
 class PlannerTests(unittest.TestCase):
     """★★★ `botplan` —— A* 挪到后台线程之后那套单子机制（§137）。"""

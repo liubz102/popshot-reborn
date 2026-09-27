@@ -11918,6 +11918,197 @@ class BotGapJumpTests(TerrainMixin, BotFrameRoom):
         self.assertEqual(0, wedged, "躲避不该把人推进塞不下的那一段")
 
 
+class BotJumpPadRouteTests(TerrainMixin, BotFireRoom):
+    """★★★★★ bot 自己**坐弹跳台**上高台找人（X_Mod §135）。
+
+    用户 2026-09-27 `Megatron01`：「我站在中间那层，敌方 3 个 bot 都在最下层，只会左右晃悠，不会跳上来。」
+    可达图里一直有台子边（V0.3 §135），坏在执行这一侧：
+    ① 路线上「站上台子」那一步是站着不动，被 `_unstall()` 当成卡住、换成横着探路 —— 按着方向键走开，台子永远不弹；
+    ② A\\* 的单子还在算的那一格，兜底「目标在上面、跳一下能更高就跳」让人离地，落地时那份答案作废，路线装不上；
+    ③ 半空里路线被清掉，兜底按「朝目标」拽歪台子的弹道；④ 站得偏了一点台子就不弹；⑤ 人一挪路线整条作废。
+    """
+
+    #: `(x, y, dx, dy)`：站在台上会被弹到 `(x + dx, y + dy)` 附近 —— 右边那块高台上。
+    PAD = (200.0, 850.0, 250.0, -590.0)
+
+    def pad_room(self):
+        """低处一片地（脚在 y=849）+ 右边一块高台（x≥500，台面上脚在 y=299）+ 一个台子 —— 台子是**唯一**上去的路。"""
+        rows = []
+        for y in range(900):
+            rows.append("".join(
+                "2" if (y >= 850 or (500 <= x < 880 and y >= 300)) else "0"
+                for x in range(900)))
+        return self.install_terrain(mapdata.MapTerrain(make_record(
+            rows, jump=[list(self.PAD)])))
+
+    def force_no_shot(self):
+        original = bot._fire_target
+        bot._fire_target = lambda *_args, **_kwargs: None
+        self.addCleanup(setattr, bot, "_fire_target", original)
+
+    def who(self):
+        return bot._live_shape(self.bot_conn)
+
+    def pad_step(self):
+        """路线上「站上台子、被弹到高台上」那一步。"""
+        return botnav.Step(botnav.ACTION_PAD, 520.0, 299.0, 0, False, 40.0)
+
+    def test_it_rides_the_pad_up_to_an_enemy_on_the_ledge(self):
+        """★★★★★ 端到端：人在高台上，bot 从低处走到台子上、站住、被弹上去。"""
+        self.pad_room()
+        self.force_no_shot()
+        self.place_bot(120.0, 849.0)
+        for _ in range(40):
+            self.beats(1, 700.0, 299.0)
+            body = self.bot_conn.body
+            if body.on_ground and body.y < 400.0:
+                break
+        else:
+            self.fail("40 发心跳还没上高台，停在 (%.0f, %.0f)"
+                      % (self.bot_conn.body.x, self.bot_conn.body.y))
+
+    def test_standing_on_the_pad_is_not_a_stall(self):
+        """★★★★ ①：路线这一步就是「站着不动」—— `_unstall()` 不许把它换成横着探路，还得把探路闩解开。"""
+        terrain = self.pad_room()
+        self.human_heartbeat(self.alice, 700.0, 299.0, ticks=0)
+        self.place_bot(200.0, 849.0)
+        self.assertIsNotNone(botmove.jump_pad_launch(terrain, self.bot_conn.body, self.who()),
+                             "夹具自检：站在这儿什么都不按，台子就弹")
+        self.bot_conn.nav_path = [self.pad_step()]
+        self.bot_conn.nav_goal = (700.0, 299.0)
+        self.bot_conn.probe_side = 1
+        intent = bot._move_intent(self.room, self.bot_conn, self.bot_seat,
+                                  terrain, None)
+        self.assertEqual((0, False, False, False), intent,
+                         "站在台上等它弹 —— 按了方向键台子就不弹了")
+        self.assertEqual(0, self.bot_conn.probe_side, "路线找到了上去的路，探路闩该解开")
+
+    def test_standing_beside_the_pad_steps_onto_it(self):
+        """★★ ④：「走到了」允许差 ±8 px，台子的作用范围却只有中心左右二三十 px —— 踩偏了先朝台子中心挪一步。"""
+        terrain = self.pad_room()
+        who = self.who()
+        edge = next(dx for dx in range(0, 200)
+                    if botmove.jump_pad_launch(terrain, botmove.Body(self.PAD[0] + dx, 849.0), who) is None)
+        self.place_bot(self.PAD[0] + edge + 2.0, 849.0)
+        self.bot_conn.nav_path = [self.pad_step()]
+        self.bot_conn.nav_goal = (700.0, 299.0)
+        intent = bot._route_intent(self.bot_conn, terrain, who, (700.0, 299.0))
+        self.assertEqual((-1, False, False, False), intent, "台子在左边：往左挪一步再松手")
+        self.place_bot(self.PAD[0], 849.0)
+        intent = bot._route_intent(self.bot_conn, terrain, who, (700.0, 299.0))
+        self.assertEqual((0, False, False, False), intent, "站到台上就松手")
+
+    def test_a_pad_launch_is_flown_hands_off_even_without_a_route(self):
+        """★★ ③：站在台上开枪 / 躲闪时路线已经清了，台子照样弹 —— 这一段也不按方向键（台子边就是这么模拟的）。"""
+        terrain = self.pad_room()
+        self.place_bot(self.PAD[0], 849.0)
+        bot._clear_navigation(self.bot_conn)
+        self.bot_conn.intent = (0, False, False, False)
+        tick = self.loop().done
+        for step in range(2):
+            bot._own_step(self.room, self.bot_conn, self.bot_seat, terrain,
+                          self.now(), tick + step)
+        self.assertFalse(self.bot_conn.body.reported_on_ground, "夹具自检：该被台子弹起来了")
+        self.assertEqual(0, self.bot_conn.nav_air_dir)
+        intent = bot._walk_to(self.room, self.bot_conn, terrain, (50.0, 849.0), False)
+        self.assertEqual(0, intent[0], "半空里按「朝目标」会把台子的弹道拽歪")
+
+    def test_a_route_edge_keeps_its_air_direction_after_the_route_is_cleared(self):
+        """★★ ③：路线上的跳起了飞，半空里路线被「打得到·就地打」之类清掉 —— 方向键照那条边按到落地。"""
+        terrain = self.pad_room()
+        self.place_bot(60.0, 849.0)
+        self.bot_conn.nav_path = [botnav.Step(botnav.ACTION_JUMP, 160.0, 849.0, 1, False, 30.0)]
+        self.bot_conn.nav_goal = (700.0, 299.0)
+        self.bot_conn.intent = (1, True, False, False)
+        bot._own_step(self.room, self.bot_conn, self.bot_seat, terrain,
+                      self.now(), self.loop().done)
+        self.assertFalse(self.bot_conn.body.reported_on_ground, "夹具自检：该起跳了")
+        self.assertEqual(1, self.bot_conn.nav_air_dir)
+        bot._clear_navigation(self.bot_conn)
+        intent = bot._walk_to(self.room, self.bot_conn, terrain, (10.0, 849.0), False)
+        self.assertEqual(1, intent[0], "目标在左边也照规划那样按右，飞完这一段")
+
+    def test_no_upward_jump_while_the_planner_has_not_answered(self):
+        """★★★ ②：单子刚递出去，兜底不凭「目标在上面」起跳（跳了落地时那份答案就作废了），照常走一步等它。"""
+        terrain = self.install_terrain(synth_terrain(
+            "pad_pending_step", floor=700, width=1600, height=800,
+            walls=((620, 1600, 640),)))       # 右前方一道 60 高的坎：走不上去、一跳就上去
+        self.place_bot(560.0, 699.0)
+        who = self.who()
+        landing = botmove.jump_lands(terrain, self.bot_conn.body, who, 1)
+        self.assertIsNotNone(landing)
+        self.assertLess(landing.y, 698.0, "夹具自检：老兜底在这儿会「跳一下更高」")
+        bot._clear_navigation(self.bot_conn)
+        self.bot_conn.frame_seq = 1
+        intent = bot._walk_to(self.room, self.bot_conn, terrain, (1000.0, 400.0), False)
+        self.assertTrue(bot._plan_pending(self.bot_conn), "夹具自检：单子该递出去了")
+        self.assertEqual((1, False), intent[:2], "单子在算：接着走，不起跳")
+        self.assertTrue(botplan.PLANNER.settle())
+        self.bot_conn.frame_seq = 2
+        bot._walk_to(self.room, self.bot_conn, terrain, (1000.0, 400.0), False)
+        self.assertTrue(self.bot_conn.nav_path, "下一格就装上路线了")
+
+    def test_a_moved_goal_keeps_the_old_route_until_the_new_one_arrives(self):
+        """★★ ⑤：目标挪出 A\\* 的「到了」窗口 —— 新路线回来之前照旧路线走，不退回「朝目标直着走」。"""
+        terrain = self.install_terrain(synth_terrain("pad_retarget"))
+        self.place_bot(200.0)
+        who = self.who()
+        old = [botnav.Step(botnav.ACTION_WALK, 256.0, 149.0, 1, False, 8.0),
+               botnav.Step(botnav.ACTION_WALK, 312.0, 149.0, 1, False, 8.0)]
+        self.bot_conn.nav_path = list(old)
+        self.bot_conn.nav_goal = (312.0, 149.0)
+        self.bot_conn.frame_seq = 1
+        intent = bot._route_intent(self.bot_conn, terrain, who, (40.0, 149.0))
+        self.assertEqual((1, False, False, False), intent, "新路线还没回来：照旧路线这一步走")
+        self.assertEqual(old, self.bot_conn.nav_path)
+        self.assertTrue(bot._plan_pending(self.bot_conn), "换目标的单子该递出去了")
+        self.assertTrue(botplan.PLANNER.settle())
+        self.bot_conn.frame_seq = 2
+        intent = bot._route_intent(self.bot_conn, terrain, who, (40.0, 149.0))
+        self.assertEqual(-1, intent[0], "新路线回来了：掉头")
+        self.assertEqual((40.0, 149.0), self.bot_conn.nav_goal)
+
+    def test_a_route_that_gets_there_releases_the_probe_latch(self):
+        """★★ 路线**到得了**目标时，闩着的探路方向不许再盖掉路线的方向。"""
+        terrain = self.install_terrain(synth_terrain("pad_latch_real"))
+        self.place_bot(200.0)
+        self.bot_conn.nav_path = [botnav.Step(botnav.ACTION_WALK, 256.0, 149.0, 1, False, 8.0),
+                                  botnav.Step(botnav.ACTION_WALK, 900.0, 149.0, 1, False, 90.0)]
+        self.bot_conn.probe_side = -1
+        intent = bot._unstall(self.room, self.bot_conn, terrain, (900.0, 149.0),
+                              (1, False, False, False), None)
+        self.assertEqual((1, False, False, False), intent)
+        self.assertEqual(0, self.bot_conn.probe_side)
+
+    def test_a_route_that_only_gets_closer_leaves_the_latch_alone(self):
+        """★ 反过来：A\\* 只给得出「到不了、走到最近处」的路线时，探路闩照旧说了算（D137）——
+        放它过去就成了「探一步、被路线拽回最近点」原地抽（§174 那个型）。"""
+        terrain = self.install_terrain(synth_terrain("pad_latch_near"))
+        self.place_bot(200.0)
+        self.bot_conn.nav_path = [botnav.Step(botnav.ACTION_WALK, 256.0, 149.0, 1, False, 8.0)]
+        self.bot_conn.probe_side = -1
+        intent = bot._unstall(self.room, self.bot_conn, terrain, (256.0, 900.0),
+                              (1, False, False, False), None)
+        self.assertEqual(-1, intent[0], "路线到不了目标：闩着的探路方向照走")
+
+    def test_it_rides_the_pad_on_the_real_megatron01_map(self):
+        """★★★★ 端到端回归：用户报的那张图（`Megatron01`，国服载 `_ch`）—— 人在中层，bot 从最下层坐右下的台子上来。"""
+        terrain = mapdata.load("Megatron01_ch")
+        if terrain is None:
+            self.skipTest("没有 Megatron01_ch 的地形产物")
+        self.install_terrain(terrain)
+        self.force_no_shot()
+        self.place_bot(1409.0, 1773.0)
+        for _ in range(40):
+            self.beats(1, 1104.0, 1253.0)
+            body = self.bot_conn.body
+            if body.on_ground and body.y < 1400.0:
+                break
+        else:
+            self.fail("40 发心跳还没上中层，停在 (%.0f, %.0f)"
+                      % (self.bot_conn.body.x, self.bot_conn.body.y))
+
+
 class BotFallDownTests(TerrainMixin, BotFrameRoom):
     """★★★ **掉出地图下边界 = 死**（§143）—— `map.ini` 的 `FallDown`。
 
