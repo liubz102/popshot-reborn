@@ -77,7 +77,10 @@ import zlib
 #:    弹体那一路按客户端 `0x51a935` 的口径另合成一张格子（`Breakable.bullet_rows`，
 #:    X_Mod §80）—— 四舍五入的坐标会让破坏物差出 1 px。
 #:    ★ X_Mod §105 起角色这一路也用它（客户端两路问的是同一个 `0x473969`），格子只剩一张。
-FORMAT = 9
+#: 10：索引里多一层 `redirects` = 国服客户端载图前的**地图名重定向**（`0x48d374` 按
+#:    `Data/Chinese.ini` 换，Megatron 系列 5 张 → `_ch` 版，X_Mod §123 / D83）。
+#:    `resolve()` 查表前先套它 —— 以前照韩版取地形，bot 站位和玩家屏幕上对不上。
+FORMAT = 10
 
 #: 找不到精确名、**也没人告诉我们难度**时按这个顺序退。
 #: ⚠ 这只是最后的兜底 —— 闯关房请一律把难度传进来（见 `DIFFICULTY_SUFFIX`）。
@@ -1358,9 +1361,9 @@ class _Store(object):
         except (IOError, OSError, ValueError):
             # 没有地形数据不该让服务端起不来：bot 照样能跟着真人的轨迹走
             # （D16），只是不会自己找路。
-            return {"maps": {}, "bases": {}, "props": {}}
+            return {"maps": {}, "bases": {}, "props": {}, "redirects": {}}
         if idx.get("format") != FORMAT:
-            return {"maps": {}, "bases": {}, "props": {}}
+            return {"maps": {}, "bases": {}, "props": {}, "redirects": {}}
         return idx
 
     def available(self):
@@ -1379,6 +1382,12 @@ class _Store(object):
         if not name:
             return None
         maps = self.index().get("maps", {})
+        # ★ 国服客户端载图前把**去掉后缀的名字**过一遍 `Chinese.ini`（`0x48d374`）——
+        #   Megatron 系列就这样换成了 `_ch` 版（X_Mod §123 / D83）。服务端跟着换，
+        #   玩家那台载的是哪张 `.map`，这里就取哪张的地形；目标没提取到就退回原名。
+        target = self.index().get("redirects", {}).get(name)
+        if target and target in maps:
+            name = target
         if name in maps:
             return name
         wanted = DIFFICULTY_SUFFIX.get(difficulty)

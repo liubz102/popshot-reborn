@@ -227,7 +227,9 @@ class _Trace(object):
         body_r = float(getattr(character, "size_body", 13.0) or 13.0)
         head_r = float(getattr(character, "size_head", 10.0) or 10.0)
         vote = botmove.CLIENT_VOTE_WINDOW
-        reach = (self.vmax + botmove.GRAVITY + botmove.AIR_CONTROL_STEP
+        # 一格重力取这一档平时的（可达图只模拟走 / 跳，不会被打飞）：普通 1.2、格斗 1.8（X_Mod §120）。
+        gravity = botmove.GRAVITY * botmove.physics_of(character).gravity_factor
+        reach = (self.vmax + gravity + botmove.AIR_CONTROL_STEP
                  + vote + 2.0)
         # 横向：`fits()` 左右各扫 2×半径；探针前沿 ≤ 半径；走路看下一列；扫掠探出去一步。
         margin = max(2.0 * legs, 2.0 * body_r, 2.0 * legs + body_r) + reach
@@ -500,10 +502,13 @@ def _scale_key(character):
     「落点塞不塞得下」用的就是腿圆和身圆，两个角色胖瘦不同、可达图就不同，
     不带进 key 的话它们会共用错的边缓存。
     其余属性（血量、招式、武器）和地形无关，缓存自然共用。
+    ★ X16 / D85 起还有**物理档**：格斗模式每帧重力 ×1.5、跳高 240 / 300（X_Mod §120），能上的平台不一样，
+      不带进 key 的话格斗房会用普通房建的边。
     """
     return (float(getattr(character, "speed", 7.0) or 7.0),
             float(getattr(character, "size_legs", 12.0) or 12.0),
-            float(getattr(character, "size_body", 13.0) or 13.0))
+            float(getattr(character, "size_body", 13.0) or 13.0),
+            bool(getattr(character, "fight", False)))
 
 
 def graph_of(terrain, character):

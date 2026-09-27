@@ -34,6 +34,7 @@ import struct
 
 import ballistics
 import mapdata
+import mutudata
 
 #: 逻辑步长（毫秒）—— 人和子弹用的是同一套（§47）。
 TICK_MS = ballistics.TICK_MS
@@ -62,11 +63,70 @@ G32 = _f32(GRAVITY)
 JUMP_HEIGHT = 180.0
 DOUBLE_JUMP_HEIGHT = 240.0
 
+#: ★★ 被重击打飞时的重力系数（X_Mod §122）：`0x4feb62~0x4feb76` 球形态 / 打飞 `[+0x514]` ⇒ 系数**直接写成**
+#: 1.5（`mov [ebp-0x10], 0x3fc00000`，覆盖不是乘）；格斗模式再换成 `NewMutuConfig.ini` 的 `DamagedFlyGravityFactor`。
+FLY_GRAVITY_FACTOR = 1.5
 
-def launch_speed(stage=1):
-    """起跳初速的大小：`f32(√(2·g·h))`（`0x501ee1`：`g×h` 存 f32 → `fadd st0,st0` → sqrt → f32）。"""
-    height = DOUBLE_JUMP_HEIGHT if stage == 2 else JUMP_HEIGHT
+
+def _launch_speed_for(height):
+    """高度 h 的起跳初速：`f32(√(2·g·h))`（`0x501ee1`：`g×h` 存 f32 → `fadd st0,st0` → sqrt → f32），g 恒为基础 g。"""
     return _f32(math.sqrt(2.0 * _f32(G32 * height)))
+
+
+class Physics(object):
+    """一档角色物理（X16 / D85）：普通 / 格斗两档，差在**每帧重力**和**跳高**（X_Mod §120）。
+
+    ★ 只有腾空每帧那一句 `vy += 1.2 × gf`（`0x50d58a`）乘系数；**起跳初速、上升计时器、弹跳台、走出崖边
+      那一下都用基础 g**（`0x40a04f`，不乘）。所以格斗一段跳初速 √(2·1.2·240) = 24.0、逐帧顶点只有 148 px
+      （普通 170）—— 别把 g 整个 ×1.5（D85 否掉的那条）。
+    * `step` / `fly_step`：平时 / 打飞（`[+0x514]`）时每帧加到 vy 上的量（`f32(1.2)` × 系数，x87 里乘完才加）；
+    * `launch`：一段 / 二段起跳初速。
+    """
+
+    __slots__ = ("name", "gravity_factor", "fly_factor", "heights", "step", "fly_step", "launch")
+
+    def __init__(self, name, gravity_factor, fly_factor, first_height, second_height):
+        self.name = name
+        self.gravity_factor = float(gravity_factor)
+        self.fly_factor = float(fly_factor)
+        self.heights = (float(first_height), float(second_height))
+        self.step = G32 * self.gravity_factor
+        self.fly_step = G32 * self.fly_factor
+        self.launch = (_launch_speed_for(self.heights[0]), _launch_speed_for(self.heights[1]))
+
+    def launch_speed(self, stage):
+        return self.launch[1] if stage == 2 else self.launch[0]
+
+    def __repr__(self):
+        return "<Physics %s g×%g 飞×%g 跳%g/%g>" % (self.name, self.gravity_factor,
+                                                   self.fly_factor, self.heights[0], self.heights[1])
+
+
+#: 普通模式：每帧重力系数 1（`step` 就是原来的 `G32`，逐位不变）。
+NORMAL_PHYSICS = Physics("普通", 1.0, FLY_GRAVITY_FACTOR, JUMP_HEIGHT, DOUBLE_JUMP_HEIGHT)
+
+#: 格斗模式（`IsMutu`）：取 `NewMutuConfig.ini`（经 `server/bot_mutu.json`），表缺了就用原版那几个数。
+FIGHT_DEFAULTS = (("GravityFactor", 1.5), ("DamagedFlyGravityFactor", 1.5),
+                  ("FirstJumpHeight", 240.0), ("SecondJumpHeight", 300.0))
+_FIGHT_PHYSICS = []
+
+
+def fight_physics():
+    if not _FIGHT_PHYSICS:
+        cfg = mutudata.config()
+        values = [float(cfg.get(key) or default) for key, default in FIGHT_DEFAULTS]
+        _FIGHT_PHYSICS.append(Physics("格斗", *values))
+    return _FIGHT_PHYSICS[0]
+
+
+def physics_of(character):
+    """这个角色这一刻按哪一档物理：`chrprops` 的格斗变体（`shaped(fight=True)`）走格斗档，其余普通档。"""
+    return fight_physics() if getattr(character, "fight", False) else NORMAL_PHYSICS
+
+
+def launch_speed(stage=1, character=None):
+    """起跳初速的大小：第 `stage` 段，跳高按角色的物理档（普通 180 / 240，格斗 240 / 300）。"""
+    return physics_of(character).launch_speed(stage)
 
 
 #: 一段跳初速（向上）= **20.784611**。V0.3 语料量到的「−20」是心跳**截断**的结果（`0x5040f1`），
@@ -183,15 +243,17 @@ class Body(object):
       挪一次、再腾空（「走两步」）。这时 `on_ground` 记成假，但心跳那一位要报真（`reported_on_ground`）；
     * `rest`：走路余量 `[+0x130]`（跨帧保留，撞墙清零）；
     * `drop`：按 ↓ 穿白线的计数 `[+0x518]`；
-    * `air_jumped`：这一段腾空里第二段跳用掉了没有（`rpJump` 的段号只有 1 / 2）。
+    * `air_jumped`：这一段腾空里第二段跳用掉了没有（`rpJump` 的段号只有 1 / 2）；
+    * `fly`：被重击打飞了（`[+0x514]`，X_Mod §122）—— 腾空每帧重力换成打飞那一档；每帧开头踩地即清、
+      腾空撞上任何东西也清（`frame()`）。踩地的身体恒假。
     """
 
     __slots__ = ("x", "y", "vx", "vy", "on_ground", "air_jumped",
-                 "ctl", "ctl_step", "ctl_lock", "rise", "pad", "rest", "drop")
+                 "ctl", "ctl_step", "ctl_lock", "rise", "pad", "rest", "drop", "fly")
 
     def __init__(self, x, y, vx=0.0, vy=0.0, on_ground=True,
                  air_jumped=False, ctl=0.0, ctl_step=AIR_CONTROL_STEP,
-                 ctl_lock=None, rise=0, pad=False, rest=0.0, drop=0):
+                 ctl_lock=None, rise=0, pad=False, rest=0.0, drop=0, fly=False):
         self.x = float(x)
         self.y = float(y)
         self.on_ground = bool(on_ground)
@@ -205,6 +267,7 @@ class Body(object):
         self.pad = False if on_ground else bool(pad)
         self.rest = float(rest)
         self.drop = int(drop)
+        self.fly = False if on_ground else bool(fly)
 
     def moved(self, x, y, vx=0.0, vy=0.0, on_ground=True, air_jumped=None,
               **extra):
@@ -217,7 +280,8 @@ class Body(object):
                     rise=extra.get("rise", self.rise),
                     pad=extra.get("pad", False),
                     rest=extra.get("rest", self.rest),
-                    drop=extra.get("drop", self.drop))
+                    drop=extra.get("drop", self.drop),
+                    fly=extra.get("fly", self.fly))
 
     @property
     def reported_on_ground(self):
@@ -232,7 +296,7 @@ class Body(object):
     def _key(self):
         return (self.x, self.y, self.vx, self.vy, self.on_ground,
                 self.air_jumped, self.ctl, self.ctl_step, self.ctl_lock,
-                self.rise, self.pad, self.rest, self.drop)
+                self.rise, self.pad, self.rest, self.drop, self.fly)
 
     def __eq__(self, other):
         return isinstance(other, Body) and self._key() == other._key()
@@ -241,10 +305,10 @@ class Body(object):
         return not self.__eq__(other)
 
     def __repr__(self):
-        return ("<Body (%.1f, %.1f) v=(%.1f, %.1f) %s%s>"
+        return ("<Body (%.1f, %.1f) v=(%.1f, %.1f) %s%s%s>"
                 % (self.x, self.y, self.vx + self.ctl, self.vy,
                    "地上" if self.on_ground else "空中",
-                   " 台" if self.pad else ""))
+                   " 台" if self.pad else "", " 飞" if self.fly else ""))
 
 
 def walk_speed(character, fast_run=False, crouched=False, scale=1.0):
@@ -277,9 +341,11 @@ def walk_distance(character, direction, fast_run=False, crouched=False,
     return _f32(_f32(control_speed(character, scale) * direction) * mult)
 
 
-def jump_apex():
-    """一次跳最高能上升多少（`v² / 2g`）= 起跳高度 180（`0x501d71`）。"""
-    return JUMP_SPEED * JUMP_SPEED / (2.0 * GRAVITY)
+def jump_apex(character=None):
+    """一次跳最高能上升多少（`v² / 2g`，g 取这一档的每帧重力）：普通 180（`0x501d71`）、格斗 160（X_Mod §120）。"""
+    phys = physics_of(character)
+    speed = phys.launch[0]
+    return speed * speed / (2.0 * GRAVITY * phys.gravity_factor)
 
 
 # ---------------------------------------------------------------------------
@@ -588,10 +654,11 @@ FLEW, BUMPED, LANDED, STOPPED, BOUNCED = "flew", "bumped", "landed", "stopped", 
 
 
 def _client_air(terrain, x, y, vx, vy, character, crouched=False, holds=True,
-                rising=False):
+                rising=False, g_step=G32):
     """腾空一步（`0x50d58a`）：`vx` 是**含操控**的那份。返回 `(x, y, vx, vy, 结局)`。
 
-    1. `vy += 1.2`（空气阻力 vft+0xa0 = 0）；扫掠；一路通畅 ⇒ 位置 += v；
+    1. `vy += g_step`（`1.2 × gf`：普通 1.2、格斗 / 打飞 1.8，见 `Physics`；空气阻力 vft+0xa0 = 0）；
+       扫掠；一路通畅 ⇒ 位置 += v；
     2. 撞上了（`0x502df4`），**这一步位置不动**、只改速度：
        * 上升计时器在跑（`rising`）⇒ `vx × 0.75`、`vy = 0`（`BUMPED`，调用方停表）；
        * 否则 `0x50efd2`：`ftol(vy) ≥ 0` 且 |v| ≤ 35 ⇒ 从原位往下逐格问 `_client_ground_below`（最多
@@ -599,7 +666,7 @@ def _client_air(terrain, x, y, vx, vy, character, crouched=False, holds=True,
          那一格、仍腾空（`STOPPED`）；两种速度都清零。和哪个探针撞上无关（`[hit+0x20]` 对地形恒 −1）。
          否则按挡住那一格的 7×7 投票反射（`BOUNCED`）。这三种调用方还要 `vx × 0.3`、上锁、操控复位。
     """
-    vy = _f32(vy + G32)
+    vy = _f32(vy + g_step)
     if vx == 0.0 and vy == 0.0:
         return x, y, vx, vy, FLEW
     hit = _client_sweep(terrain, x, y, vx, vy,
@@ -629,16 +696,20 @@ def client_air_tick(terrain, body, character, crouched=False, holds=True):
     running = body.rise > 0
     rise = body.rise - 1 if running else 0
     ctl, cstep, lock = body.ctl, body.ctl_step, body.ctl_lock
+    phys = physics_of(character)
     x, y, vxe, vy, outcome = _client_air(terrain, body.x, body.y,
                                          _f32(body.vx + ctl), body.vy,
-                                         character, crouched, holds, running)
+                                         character, crouched, holds, running,
+                                         phys.fly_step if body.fly else phys.step)
     if outcome == BUMPED:
         rise = 0
     elif outcome != FLEW:
         vxe = _f32(vxe * CLIENT_BOUNCE_KEEP_VX)
         ctl, cstep, lock = 0.0, AIR_CONTROL_STEP, True
+    # 腾空撞上任何东西都清打飞（碰撞入口 `0x502e0e`，X_Mod §122）。
     return body.moved(x, y, _f32(vxe - ctl), vy, on_ground=outcome == LANDED,
-                      ctl=ctl, ctl_step=cstep, ctl_lock=lock, rise=rise)
+                      ctl=ctl, ctl_step=cstep, ctl_lock=lock, rise=rise,
+                      fly=body.fly and outcome == FLEW)
 
 
 # ---------------------------------------------------------------------------
@@ -709,27 +780,27 @@ def jump_pad_launch(terrain, body, character, keys=0, crouched=False):
                       pad=True, ctl=0.0, ctl_step=AIR_CONTROL_STEP)
 
 
-def _launch(body, stage, vx):
-    """`0x501d57` 的后半段：vy 置成第 `stage` 段初速、当场离地、操控复位解锁、上升计时器起跑。"""
-    speed = DOUBLE_JUMP_SPEED if stage == 2 else JUMP_SPEED
+def _launch(body, stage, vx, character=None):
+    """`0x501d57` 的后半段：vy 置成第 `stage` 段初速（跳高按角色的物理档）、当场离地、操控复位解锁、上升计时器起跑。"""
+    speed = launch_speed(stage, character)
     return body.moved(body.x, body.y, float(vx), -speed, on_ground=False,
                       air_jumped=(stage == 2), ctl=0.0,
                       ctl_step=AIR_CONTROL_STEP, ctl_lock=False,
                       rise=rise_ticks(speed))
 
 
-def jump(body, vx=0.0):
+def jump(body, vx=0.0, character=None):
     """一段跳的低层原语（`vx` 由调用方给）。已经在空中就原样返回。带按键口径的是 `takeoff`。"""
     if not (body.on_ground or body.pad):
         return body
-    return _launch(body, 1, vx)
+    return _launch(body, 1, vx, character)
 
 
-def double_jump(body, vx=None):
-    """★★ **第二段跳**的低层原语：`v.y` 重新置成 24（§124）。`vx` 不给就沿用。不能跳就原样返回。"""
+def double_jump(body, vx=None, character=None):
+    """★★ **第二段跳**的低层原语：`v.y` 重新置成第二段初速（普通 24，§124）。`vx` 不给就沿用。不能跳就原样返回。"""
     if body.on_ground or body.pad or body.air_jumped:
         return body
-    return _launch(body, 2, body.reported_vx if vx is None else vx)
+    return _launch(body, 2, body.reported_vx if vx is None else vx, character)
 
 
 def takeoff(terrain, body, character, direction=0, speed_scale=1.0, stage=None):
@@ -755,7 +826,7 @@ def takeoff(terrain, body, character, direction=0, speed_scale=1.0, stage=None):
             vx = _f32(control_speed(character, speed_scale) * JUMP_VX_RATIO)
             if direction < 0:
                 vx = -vx
-    return _launch(body, stage, vx)
+    return _launch(body, stage, vx, character)
 
 
 # ---------------------------------------------------------------------------
@@ -807,6 +878,9 @@ def frame(terrain, body, character, direction=0, fast_run=False,
     x, y, vx, vy = body.x, body.y, body.vx, body.vy
     grounded = body.on_ground or body.pad
     pad = body.pad
+    # ★ 打飞（`[+0x514]`，X_Mod §122）：一帧开头**踩地就清**（`0x4fe15b` 那一串，台子刚弹、踩地位还没清也算踩地）。
+    fly = body.fly and not grounded
+    phys = physics_of(character)
     if want_jump and jump_stage is None:
         # ★ 段号是**按下那一刻**定的、写进 `rpJump` 包（`0x501d57` 照包里的段号执行）：按下在上一帧末，
         #   执行在这一帧末 ⇒ 看这一帧**开头**的状态。这一帧先走路走出了崖边也还是一段（h = 180）。
@@ -866,7 +940,10 @@ def frame(terrain, body, character, direction=0, fast_run=False,
     if not grounded:
         aired = True
         x, y, vxe, vy, outcome = _client_air(terrain, x, y, vxe, vy, character,
-                                             crouched, holds, running)
+                                             crouched, holds, running,
+                                             phys.fly_step if fly else phys.step)
+        if outcome != FLEW:
+            fly = False                 # 腾空撞上任何东西都清（碰撞入口 `0x502e0e`）
         if outcome == BUMPED:
             rise = 0
         elif outcome != FLEW:
@@ -909,7 +986,7 @@ def frame(terrain, body, character, direction=0, fast_run=False,
     current = Body(x, y, vx, vy, on_ground=grounded and not pad,
                    air_jumped=air_jumped, ctl=ctl, ctl_step=cstep,
                    ctl_lock=lock, rise=rise, pad=grounded and pad,
-                   rest=rest, drop=drop)
+                   rest=rest, drop=drop, fly=fly)
     # ⑥ `rpJump`
     jumped = 0
     if want_jump:
@@ -1032,8 +1109,8 @@ def jump_lands(terrain, body, character, direction, fast_run=False,
     ★ `speed_scale` 要和真起跳那一刻的一致（V0.3 §151）：起跳的 ¼S 和操控上限都乘它。
     """
     if ticks is None:
-        # 起跳先上去、再落到图底：升段 `v/g` 个 tick，落段见 `fall_ticks()`。
-        ticks = fall_ticks(terrain) + int(JUMP_SPEED / GRAVITY) + 2
+        # 起跳先上去、再落到图底：升段 `v/g` 个 tick，落段见 `fall_ticks()`（格斗重力更大，这两段都只会更短）。
+        ticks = fall_ticks(terrain) + int(launch_speed(1, character) / GRAVITY) + 2
     body = tick(terrain, body, character, direction=direction,
                 fast_run=fast_run, crouched=crouched, want_jump=True,
                 speed_scale=speed_scale)
@@ -1066,7 +1143,7 @@ def double_jump_lands(terrain, body, character, direction, fast_run=False,
     """
     if ticks is None:
         ticks = (fall_ticks(terrain)
-                 + int((JUMP_SPEED + DOUBLE_JUMP_SPEED) / GRAVITY) + 2)
+                 + int((launch_speed(1, character) + launch_speed(2, character)) / GRAVITY) + 2)
     current = tick(terrain, body, character, direction=direction,
                    fast_run=fast_run, crouched=crouched, want_jump=True,
                    speed_scale=speed_scale)

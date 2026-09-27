@@ -147,6 +147,41 @@ class GeometryTests(unittest.TestCase):
         self.assertIsNone(crouched, "站着是头，蹲下这一发就该从头顶上飞过去")
 
 
+class ShapedFightTests(unittest.TestCase):
+    """`shaped()` 的格斗那一维（X16 / D85）：尺寸不变、只挂 `fight`，`botmove.physics_of()` 按它挑物理档。"""
+
+    def setUp(self):
+        self.one = chrprops.Character({
+            "id": 0, "size_head": 10.0, "size_body": 13.0,
+            "size_legs": 12.0, "size_legs_crouch": 7.0,
+            "display_height": 75.0})
+
+    def test_a_plain_character_is_not_in_fight_mode(self):
+        self.assertFalse(self.one.fight)
+        self.assertIs(self.one, self.one.shaped())
+
+    def test_the_fight_variant_keeps_every_size(self):
+        fight = self.one.shaped(fight=True)
+        self.assertTrue(fight.fight)
+        self.assertEqual(0, fight.jab_dir)
+        self.assertEqual(self.one.circles(100.0, 500.0), fight.circles(100.0, 500.0))
+        self.assertIs(fight, self.one.shaped(fight=True), "按参数缓存")
+
+    def test_it_combines_with_the_other_shapes(self):
+        quest = self.one.shaped(quest=True)
+        both = self.one.shaped(quest=True, fight=True)
+        self.assertFalse(quest.fight)
+        self.assertTrue(both.fight)
+        self.assertIsNot(quest, both)
+        self.assertEqual(quest.circles(100.0, 500.0), both.circles(100.0, 500.0))
+
+    def test_get_takes_the_five_part_shape_key(self):
+        """`bot._seat_shape` 在格斗房给 `(角色 id, 闯关, 缩小, 出拳朝向, 格斗)`；四段的老键照旧能用。"""
+        self.assertTrue(chrprops.get((1, False, False, 0, True)).fight)
+        self.assertFalse(chrprops.get((1, False, True, 0)).fight)
+        self.assertFalse(chrprops.get(1).fight)
+
+
 class MoveTests(unittest.TestCase):
     """冲刺攻击的伤害圈 —— 位置公式是 `ChrProps.ini` 自己写的（§64）。"""
 

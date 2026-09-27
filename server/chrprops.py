@@ -271,6 +271,10 @@ class Character(object):
 
     __slots__ = ("raw",)
 
+    #: 这一份是不是**格斗模式**里的他（X16 / D85）：`botmove.physics_of()` 按它挑物理档
+    #: （每帧重力 ×1.5、跳高 240 / 300，X_Mod §120）。只有 `shaped(fight=True)` 的变体是真。
+    fight = False
+
     def __init__(self, raw):
         self.raw = raw or {}
 
@@ -377,15 +381,16 @@ class Character(object):
                         REGION_BODY, 0))
         return out
 
-    def shaped(self, quest=False, shrunk=False, jab_dir=0):
-        """这个角色在**某一刻**的形状（`0x4fc230` 摆圆那一段，X_Mod §101）：闯关统一尺寸 → 缩小 ×0.6 → 出拳的第 4 个圆。
+    def shaped(self, quest=False, shrunk=False, jab_dir=0, fight=False):
+        """这个角色在**某一刻**的形状（`0x4fc230` 摆圆那一段，X_Mod §101）：闯关统一尺寸 → 缩小 ×0.6 → 出拳的第 4 个圆；
+        外加 `fight`：格斗模式里的他（尺寸不变，只换物理档，X16 / D85）。
 
-        三样都不沾就是自己。结果按参数缓存（形状只有这几种组合）。
+        都不沾就是自己。结果按参数缓存（形状只有这几种组合）。
         """
-        quest, shrunk, jab_dir = bool(quest), bool(shrunk), int(jab_dir)
-        if not (quest or shrunk or jab_dir):
+        quest, shrunk, jab_dir, fight = bool(quest), bool(shrunk), int(jab_dir), bool(fight)
+        if not (quest or shrunk or jab_dir or fight):
             return self
-        key = (id(self), quest, shrunk, jab_dir)
+        key = (id(self), quest, shrunk, jab_dir, fight)
         got = _SHAPED.get(key)
         if got is not None and got[0] is self:
             return got[1]
@@ -399,7 +404,7 @@ class Character(object):
                     value = DEFAULT_SIZES[name]
                 raw[name] = struct.unpack(
                     "<f", struct.pack("<f", float(value) * SHRINK_RATIO))[0]
-        variant = ShapedCharacter(raw, jab_dir)
+        variant = ShapedCharacter(raw, jab_dir, fight)
         _SHAPED[key] = (self, variant)
         return variant
 
@@ -433,16 +438,17 @@ class Character(object):
 
 
 class ShapedCharacter(Character):
-    """`Character.shaped()` 的结果：尺寸换过的同一个角色，外加出拳朝向（0 = 没在出拳）。"""
+    """`Character.shaped()` 的结果：尺寸换过的同一个角色，外加出拳朝向（0 = 没在出拳）和格斗模式标志。"""
 
-    __slots__ = ("jab_dir",)
+    __slots__ = ("jab_dir", "fight")
 
-    def __init__(self, raw, jab_dir=0):
+    def __init__(self, raw, jab_dir=0, fight=False):
         Character.__init__(self, raw)
         self.jab_dir = int(jab_dir)
+        self.fight = bool(fight)
 
 
-#: `(id(角色), 闯关, 缩小, 出拳朝向) -> (角色, 变体)`（值里留着原对象，id 不会被复用）。
+#: `(id(角色), 闯关, 缩小, 出拳朝向, 格斗) -> (角色, 变体)`（值里留着原对象，id 不会被复用）。
 _SHAPED = {}
 
 
@@ -504,12 +510,13 @@ STORE = _Store()
 def get(character_id):
     """按角色 id 取属性；查不到返回默认尺寸那一份。
 
-    ★ 也收 `(角色 id, 闯关, 缩小, 出拳朝向)` 这种**形状键**（`bot._battle_bodies` 给的），
-      返回换好形状的那一份（`Character.shaped`，X_Mod §101）。
+    ★ 也收 `(角色 id, 闯关, 缩小, 出拳朝向[, 格斗])` 这种**形状键**（`bot._seat_shape` 给的），
+      返回换好形状的那一份（`Character.shaped`，X_Mod §101；格斗那一维是 X16 / D85 加的）。
     """
     if isinstance(character_id, tuple):
-        cid, quest, shrunk, jab_dir = character_id
-        return STORE.get(cid).shaped(quest, shrunk, jab_dir)
+        cid, quest, shrunk, jab_dir = character_id[:4]
+        fight = character_id[4] if len(character_id) > 4 else False
+        return STORE.get(cid).shaped(quest, shrunk, jab_dir, fight)
     return STORE.get(character_id)
 
 

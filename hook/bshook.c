@@ -8444,9 +8444,10 @@ static int try_patch_ime_cand_layout_guard(void)
 /*   改法：第二处（任务下拉框）把「地区序号」当成 0（韩国）来算，             */
 /*   `mov ecx,[...]` -> `xor ecx,ecx`，掩码里带 bit0 的都放行（7 / 3 / 1）。   */
 /*   第一处（目录加载）会话 39 起升级为**把掩码判定整个旁路**（NOP 掉 je，     */
-/*   见下面「全部解锁」那段）—— 掩码为 0 的条目也保留；缺文件的 Quest08 /     */
-/*   Festivalm01 靠「任何列表都选不到」兜底（任务表没有 id 8、무투전模式       */
-/*   在中国区建房下拉里被隐藏）。                                             */
+/*   见下面「全部解锁」那段）—— 掩码为 0 的条目也保留；缺文件的 Quest08 靠     */
+/*   「任何列表都选不到」兜底（任务表没有 id 8）。★ 同样缺文件的 Festivalm01   */
+/*   以前也靠「무투전 在国服建房下拉里被隐藏」兜底 —— X16 把格斗模式解锁后     */
+/*   （下面 MUTU_SITES）它**选得到了**，用户 2026-09-27 定先放出来、资源以后补。*/
 /*                                                                            */
 /*   时机：两处都要**早于**启动时的 map.ini 加载。patch 线程在 +2.5s 打，      */
 /*   那时资源加载还没开始（见 patch_thread 里 SnowCipher 那段的说明）。       */
@@ -8524,7 +8525,10 @@ static int try_patch_ime_cand_layout_guard(void)
 /*       CamelCulvert02 这些「全世界都没开放」的图（文件都在包里）进目录；      */
 /*       连带进来的还有缺文件的 Festivalm01（Mutu 限定）和 Quest08/Quest08_1   */
 /*       （QuestId=8，不在建房任务表 0x6dc52c {3,2,1,4,5,6,7} 里）——           */
-/*       两者在对战/闯关的任何列表里都选不到，只会安静地躺在目录里。            */
+/*       Quest08 在闯关的任何列表里都选不到，只会安静地躺在目录里；            */
+/*       ★ Festivalm01 在 X16 解锁格斗模式之后**选得到了**（资源待补，见        */
+/*       MUTU_SITES 那段）。★ 另：没写 OpenLocale 的缺省掩码其实是 1（只开      */
+/*       韩服，`0x40aec5`），不是 0 —— 结论不变，都要靠这里的旁路进目录。       */
 /*     · 第五处 0x4653be `je 0x4654b3`（0F 84 EF 00 00 00 -> 6×90）：不跳 =   */
 /*       加进「地图」下拉框。只把地区序号当 0 还挡掩码 0 的图，所以同样旁路。  */
 /*                                                                            */
@@ -8835,6 +8839,335 @@ static int try_patch_irene_level(void)
         return 1;
     }
     return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* 阶段5b —— 格斗模式（무투전，对战模式号 2）解锁                              */
+/*   X_Mod · X16，来龙去脉在                                                   */
+/*   `develop_history/X_自定义游戏内容Mod开发/.claude/FINDINGS.md` §118~§123、   */
+/*   `DECISIONS.md` D82。                                                     */
+/*                                                                            */
+/*   格斗模式在国服客户端里**是完整的**：模式 2 建 `GameContextSurvival`       */
+/*   （每人 3 条命、300 s），`IsMutu`（GameContext 虚表槽 5 = 模式号 == 2）     */
+/*   为真就关掉开火 / 换枪 / 瞄准、打开 J 轻击 / K 重击 / L 格挡；160 招的     */
+/*   动作 / 特效 / 音效全在。**唯一藏它的是建房下拉框里的一道地区判据**（G1）；*/
+/*   另外四处是用户要的、**超出原版**的体验：                                  */
+/*                                                                            */
+/*   G1  `0x43755e`  建房「游戏模式」下拉框的填充循环（`0x437545` 起）：       */
+/*       地区 ∈ [1,2]（日 / 中）且模式号 == 2 就 `je` 跳过 무투전。              */
+/*       je -> nop，只放模式 2；频道码 10（超级新手）那道判断不动。             */
+/*   G2a `0x4659cc` / G2b `0x4659e3` / G2c `0x465a0a`  房间设定的 ◀▶：         */
+/*       原版**所有地区**都只在生存 ↔ 夺分之间转 —— 当前是格斗就整段跳过、     */
+/*       ◀ 跳过 2、▶ 把 2 改成 3。三处改完：◀ 夺分 → 格斗 → 生存 → 夺分，       */
+/*       ▶ 生存 → 格斗 → 夺分 → 生存（仍跳过模式 1 计时）。                    */
+/*       用户 2026-09-26「房间里也能切换」。切到格斗时选图会自己换成格斗图      */
+/*       （`0x465afe` → `0x40b5d0`），道具项客户端自己清 0（`0x465be2`）。      */
+/*   G3  `0x40b273`  地图过滤 `0x40b26f`：`RequiredQuestClear` 非 0 就去查任务  */
+/*       记录。全 map.ini 只有 6 张 Boss 格斗场写了这个键 ⇒ 一律当 0，它们不用  */
+/*       通关任务（用户 2026-09-27「全部地图直接默认解锁」）。唯一调用点         */
+/*       `0x40b646`；开局校验 `0x468176` 不查它。                              */
+/*                                                                            */
+/*   ★ **依赖地区解锁**：15 张格斗图（`AvailableMode=[Mutu]`）都没写           */
+/*   OpenLocale（缺省掩码 1 = 只开韩服），全靠上面 `REGION_SITES` 第一处旁路   */
+/*   才进地图目录 ⇒ 设了 BSHOOK_KEEP_REGION_LOCK=1 时格斗房一张图都没有，      */
+/*   这组跟着不打。                                                          */
+/*                                                                            */
+/*   ⚠ 已知缺口（用户 2026-09-27 定：先放出来，资源以后补，PROGRESS 有待办）：*/
+/*   「庆典-格斗场」`[18-3] Festivalm01` 的 `.map` 原版包就没有 —— 选到它时    */
+/*   地图加载 `0x47496a` 在 `0x4749c3` 查不到文件静默跳过（空图，未实测）。      */
+/*                                                                            */
+/*   不开的：模式 4 구무투전（胜负条件工厂 `0x55e21a` 对 4 返回 NULL，一进局    */
+/*   读空指针）；格斗教程（入口弹窗 `0x43b499` 也是地区判据，但国服缺两个       */
+/*   .smf、键位图也接错，用户决定不做）；大厅「开始格斗模式」按钮。           */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_MUTU_LOCK=1 整组保留原版。                                 */
+/*   ★ 五条特征串都在 `re/BigShot_22524.img` 上验过**各自唯一**，               */
+/*   `test/test_patchsites.py` 的 `MutuUnlockPatchTest` 钉着。                 */
+/* -------------------------------------------------------------------------- */
+#define MUTU_PATCH_COUNT 5
+/* 字段含义和 REGION_SITES 一样：特征串起始 VA / 长度 / 要改的字节在串里的偏移
+   / 改几个字节 / 原始字节 / 替换字节 / 说明。 */
+static const struct {
+    unsigned int va;
+    unsigned int len;
+    unsigned int off;
+    unsigned int n;
+    const unsigned char *sig;
+    const unsigned char *fix;
+    const char *what;
+} MUTU_SITES[MUTU_PATCH_COUNT] = {
+    { 0x00437545u, 27, 25, 2,
+      (const unsigned char *)"\xA1\x20\xE3\x72\x00\x8B\x00\x85\xC0\x8B\x9E\xC8\xE5\x72"
+                             "\x00\x7E\x0A\x83\xF8\x02\x7F\x05\x83\xFB\x02\x74\x64",
+      (const unsigned char *)"\x90\x90",          /* NOP 掉 je：地区 1/2 也列出 무투전 */
+      "建房「游戏模式」下拉框：地区 1/2 不再跳过 무투전（格斗模式）" },
+    { 0x004659C0u, 19, 12, 2,
+      (const unsigned char *)"\x83\xFB\x02\x89\x45\xE0\x8A\x46\x14\x88\x45\xD4"
+                             "\x74\x75\x68\x48\xA1\x66\x00",
+      (const unsigned char *)"\x90\x90",          /* NOP 掉 je：当前是格斗也照走 ◀▶ */
+      "房间设定：当前是格斗模式时 ◀▶ 不再失效" },
+    { 0x004659DFu, 16, 4, 2,
+      (const unsigned char *)"\x4B\x83\xFB\x02\x75\x01\x4B\x83"
+                             "\xFB\x01\x75\x24\x33\xDB\xEB\x20",
+      (const unsigned char *)"\xEB\x01",          /* jne -> jmp：◀ 不再跳过 2 */
+      "房间设定 ◀：夺分 → 格斗 → 生存" },
+    { 0x00465A00u, 18, 10, 2,
+      (const unsigned char *)"\x43\x83\xFB\x01\x75\x01\x43\x83\xFB\x02\x75\x03"
+                             "\x6A\x03\x5B\x83\xFB\xFF",
+      (const unsigned char *)"\xEB\x03",          /* jne -> jmp：▶ 不再把 2 改成 3 */
+      "房间设定 ▶：生存 → 格斗 → 夺分" },
+    { 0x0040B26Fu, 18, 4, 3,
+      (const unsigned char *)"\x55\x8B\xEC\x51\x8B\x40\x30\x85\xC0\x89\x45\xFC"
+                             "\x75\x04\xB0\x01\xC9\xC3",
+      (const unsigned char *)"\x33\xC0\x90",      /* mov eax,[eax+0x30] -> xor eax,eax / nop */
+      "地图过滤 0x40b26f：RequiredQuestClear 当 0（Boss 格斗场不用通关任务）" },
+};
+static volatile LONG g_mutu_patched = 0;
+
+static int mutu_lock_kept(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_MUTU_LOCK", buf, sizeof(buf));
+    return (n > 0 && n < sizeof(buf) && buf[0] != '0');
+}
+
+/* 返回 1 表示五处全都已就位（本轮打的或之前就打过）。 */
+static int try_patch_mutu_unlock(void)
+{
+    int i, done = 0;
+
+    if (g_mutu_patched) return 1;
+    for (i = 0; i < MUTU_PATCH_COUNT; i++) {
+        unsigned char *base = (unsigned char *)MUTU_SITES[i].va;
+        unsigned char *p = base + MUTU_SITES[i].off;
+        unsigned int n = MUTU_SITES[i].n;
+        DWORD oldp;
+
+        if (IsBadReadPtr(base, MUTU_SITES[i].len)) continue;
+        if (memcmp(p, MUTU_SITES[i].fix, n) == 0) { done++; continue; }
+        if (memcmp(base, MUTU_SITES[i].sig, MUTU_SITES[i].len) != 0)
+            continue;                            /* 还没解壳到这里，继续等 */
+        if (!VirtualProtect(p, n, PAGE_EXECUTE_READWRITE, &oldp)) {
+            bslog("PATCH   格斗模式解锁(%s): VirtualProtect 失败 err=%lu",
+                  MUTU_SITES[i].what, (unsigned long)GetLastError());
+            continue;
+        }
+        memcpy(p, MUTU_SITES[i].fix, n);
+        VirtualProtect(p, n, oldp, &oldp);
+        FlushInstructionCache(GetCurrentProcess(), p, n);
+        bslog("PATCH   ★格斗模式解锁 @ %08X: %s",
+              (unsigned)(MUTU_SITES[i].va + MUTU_SITES[i].off),
+              MUTU_SITES[i].what);
+        done++;
+    }
+    if (done == MUTU_PATCH_COUNT) {
+        InterlockedExchange(&g_mutu_patched, 1);
+        return 1;
+    }
+    return 0;
+}
+
+/* ========================================================================== */
+/* ★ B2 格斗招式判定体探针（X16 / D84，临时诊断，核完连同 test 一起删）        */
+/*                                                                            */
+/*   服务端替 bot 判格斗招式打没打中，用的是 `tools/mutudata.py` 离线烘的      */
+/*   判定体骨骼轨迹（X_Mod §124）—— 换算（1 场景单位 = 1 px、朝左镜像、        */
+/*   不乘 ChrSpineScale）是推的。这个探针在招式 Update（`NewMutuSkill` 虚表     */
+/*   `0x683b14` 槽 6 = `0x4f8243`，__thiscall、无栈参、`ret`）**之后**把每个   */
+/*   判定体 / 受击体摆到哪儿打出来（相对角色脚底），`tools/mutudata.py --check` */
+/*   逐帧和表比。                                                              */
+/*                                                                            */
+/*   ★ 挂法是改虚表那一格，不做 inline hook：Update 开头是 `mov eax,imm32 /     */
+/*     call _EH_prolog`，搬 call rel32 要重定位；改一格指针省事也好撤。         */
+/*   ★ 招式对象由角色 `[+0x5dc]` 持有（`0x503fde`）；Update 之后它还是那一格才读 */
+/*     （防着 Update 里被删 / 换招）。角色指针在调用前先取。                     */
+/*   ★ 布局（都逐指令核过）：`[skill+4]` 角色、`+0x20` 招式表记录（MoveDist     */
+/*     `+0x24` / γ `+0x28` / 起止 `+0x2c` `+0x30` / 判定体、受击体定义 vector    */
+/*     `+0x38` `+0x44`，0x28 一项）、`+0x2c` 判定体对象数组、`+0x38` 受击体对象  */
+/*     数组；对象位置 `+0x34/+0x38`（`0x417bb5` 写的）；引擎帧 = `0x4f9940(角色   */
+/*     vft+0x38())`，Update 开头就这么算的。                                     */
+/*   ★ 一招一个引擎帧只打一行（顿帧那几帧帧号不动 ⇒ 不重复 —— 按状态翻转去重）。 */
+/*   BSHOOK_MUTU_DIAG=1 才装（默认关）。                                        */
+/* ========================================================================== */
+#define MUTU_SKILL_VFT          0x00683B14u
+#define MUTU_SKILL_SLOT_UPDATE  6
+#define MUTU_SKILL_UPDATE_VA    0x004F8243u
+#define MUTU_ANIM_FRAME_VA      0x004F9940u
+/* 0x4f8243  mov eax,0x632a49 / call 0x5f8b78（_EH_prolog） */
+static const unsigned char MUTU_UPDATE_SIG[] = { 0xB8, 0x49, 0x2A, 0x63, 0x00, 0xE8 };
+/* 0x4f9940  push [ecx+0x3c] / fld [ecx+0x28]（引擎帧，thiscall、无栈参） */
+static const unsigned char MUTU_ANIM_FRAME_SIG[] = { 0xFF, 0x71, 0x3C, 0xD9, 0x41, 0x28 };
+
+typedef void (__fastcall *mutu_thiscall0_fn)(void *self, void *edx_unused);
+typedef void *(__fastcall *mutu_get_anim_fn)(void *chr, void *edx_unused);
+typedef int (__fastcall *mutu_anim_frame_fn)(void *anim, void *edx_unused);
+
+static mutu_thiscall0_fn g_mutu_update_orig = NULL;
+static volatile LONG g_mutu_diag_patched = 0;
+
+#define MUTU_DIAG_RECS 96
+static UINT_PTR g_mutu_diag_recs[MUTU_DIAG_RECS];
+static int g_mutu_diag_rec_n = 0;
+#define MUTU_DIAG_LAST 8
+static UINT_PTR g_mutu_diag_last_obj[MUTU_DIAG_LAST];
+static int g_mutu_diag_last_f[MUTU_DIAG_LAST];
+static int g_mutu_diag_last_i = 0;
+
+static int mutu_diag_enabled(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_MUTU_DIAG", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return 0;            /* 没设 = 不装 */
+    return buf[0] != '0';
+}
+
+/* 这一招这个引擎帧打过没有：同一个招式对象帧号没变就是打过了。 */
+static int mutu_diag_seen(UINT_PTR obj, int f)
+{
+    int i;
+    for (i = 0; i < MUTU_DIAG_LAST; i++) {
+        if (g_mutu_diag_last_obj[i] == obj) {
+            if (g_mutu_diag_last_f[i] == f) return 1;
+            g_mutu_diag_last_f[i] = f;
+            return 0;
+        }
+    }
+    g_mutu_diag_last_obj[g_mutu_diag_last_i] = obj;
+    g_mutu_diag_last_f[g_mutu_diag_last_i] = f;
+    g_mutu_diag_last_i = (g_mutu_diag_last_i + 1) % MUTU_DIAG_LAST;
+    return 0;
+}
+
+static int mutu_diag_count(unsigned char *rec, int vec_off)
+{
+    UINT_PTR first = *(UINT_PTR *)(rec + vec_off);
+    UINT_PTR last = *(UINT_PTR *)(rec + vec_off + 4);
+    if (last < first || last - first > 0x28 * 32) return 0;
+    return (int)((last - first) / 0x28);
+}
+
+/* 每张招式表记录第一次出现时打一行：`--check` 拿这几格对回招式号。 */
+static void mutu_diag_note_record(unsigned char *rec, int seat)
+{
+    int i;
+    for (i = 0; i < g_mutu_diag_rec_n; i++)
+        if (g_mutu_diag_recs[i] == (UINT_PTR)rec) return;
+    if (g_mutu_diag_rec_n < MUTU_DIAG_RECS)
+        g_mutu_diag_recs[g_mutu_diag_rec_n++] = (UINT_PTR)rec;
+    bslog("MUTU=   招式表 %08X 座位 %d MoveDist %.3f γ %.3f 起 %d 止 %d 判定体 %d 受击体 %d",
+          (unsigned)(UINT_PTR)rec, seat, *(float *)(rec + 0x24), *(float *)(rec + 0x28),
+          *(int *)(rec + 0x2C), *(int *)(rec + 0x30),
+          mutu_diag_count(rec, 0x38), mutu_diag_count(rec, 0x44));
+}
+
+/* 往 line 后面接一段；截断就停（_snprintf 截断时返回 -1）。 */
+static int mutu_diag_append(char *line, int n, int cap, const char *fmt, ...)
+{
+    va_list ap;
+    int m;
+    if (n < 0 || n >= cap - 1) return n;
+    va_start(ap, fmt);
+    m = _vsnprintf(line + n, cap - 1 - n, fmt, ap);
+    va_end(ap);
+    return m < 0 ? cap - 1 : n + m;
+}
+
+static int mutu_diag_objects(char *line, int n, int cap, unsigned char *arr, int count,
+                             float cx, float cy)
+{
+    int i;
+    unsigned char **objs = (unsigned char **)arr;
+    if (!objs || count <= 0 || IsBadReadPtr(objs, count * 4)) return n;
+    for (i = 0; i < count; i++) {
+        unsigned char *o = objs[i];
+        if (!o || IsBadReadPtr(o, 0x3C)) continue;
+        n = mutu_diag_append(line, n, cap, " %d:(%.2f,%.2f)", i,
+                             *(float *)(o + 0x34) - cx, *(float *)(o + 0x38) - cy);
+    }
+    return n;
+}
+
+static void mutu_diag_log(unsigned char *s, unsigned char *chr)
+{
+    unsigned char *rec;
+    void **vft;
+    void *anim;
+    int f, seat, n;
+    float cx, cy;
+    char line[1024];
+
+    if (IsBadReadPtr(chr, 0x5E0)) return;
+    if (*(unsigned char **)(chr + 0x5DC) != s) return;   /* Update 里被删 / 换招了 */
+    if (IsBadReadPtr(s, 0x5C)) return;
+    rec = *(unsigned char **)(s + 0x20);
+    if (!rec || IsBadReadPtr(rec, 0x50)) return;
+    vft = *(void ***)chr;
+    if (!vft || IsBadReadPtr(vft, 0x3C + 4)) return;
+    anim = ((mutu_get_anim_fn)vft[0x38 / 4])(chr, NULL);
+    if (!anim || IsBadReadPtr(anim, 0x40)) return;
+    f = ((mutu_anim_frame_fn)MUTU_ANIM_FRAME_VA)(anim, NULL);
+    if (mutu_diag_seen((UINT_PTR)s, f)) return;
+    seat = *(int *)(chr + 0x2AC);
+    cx = *(float *)(chr + 0x34);
+    cy = *(float *)(chr + 0x38);
+    mutu_diag_note_record(rec, seat);
+    n = mutu_diag_append(line, 0, (int)sizeof(line),
+                         "MUTU.   座位 %d 招式 %08X 表 %08X 帧 %d 朝 %+d 脚 (%.2f, %.2f) 判定",
+                         seat, (unsigned)(UINT_PTR)s, (unsigned)(UINT_PTR)rec, f,
+                         *(int *)(chr + 0x2D0), cx, cy);
+    n = mutu_diag_objects(line, n, (int)sizeof(line), *(unsigned char **)(s + 0x2C),
+                          mutu_diag_count(rec, 0x38), cx, cy);
+    n = mutu_diag_append(line, n, (int)sizeof(line), " 受击");
+    n = mutu_diag_objects(line, n, (int)sizeof(line), *(unsigned char **)(s + 0x38),
+                          mutu_diag_count(rec, 0x44), cx, cy);
+    line[n < (int)sizeof(line) ? n : (int)sizeof(line) - 1] = '\0';
+    bslog("%s", line);
+}
+
+static void __fastcall mutu_update_hook(void *self, void *edx_unused)
+{
+    unsigned char *s = (unsigned char *)self;
+    unsigned char *chr = NULL;
+    if (s && !IsBadReadPtr(s, 8))
+        chr = *(unsigned char **)(s + 4);
+    g_mutu_update_orig(self, edx_unused);
+    if (chr)
+        mutu_diag_log(s, chr);
+}
+
+static int try_patch_mutu_diag(void)
+{
+    UINT_PTR *slot = (UINT_PTR *)(MUTU_SKILL_VFT + MUTU_SKILL_SLOT_UPDATE * 4);
+    DWORD oldp;
+
+    if (g_mutu_diag_patched) return 1;
+    if (IsBadReadPtr(slot, 4)) return 0;
+    if (*slot == (UINT_PTR)&mutu_update_hook) {
+        InterlockedExchange(&g_mutu_diag_patched, 1);
+        return 1;
+    }
+    if (*slot != MUTU_SKILL_UPDATE_VA) return 0;          /* 还没解壳到这一页 */
+    if (IsBadReadPtr((void *)MUTU_SKILL_UPDATE_VA, sizeof(MUTU_UPDATE_SIG))
+        || memcmp((void *)MUTU_SKILL_UPDATE_VA, MUTU_UPDATE_SIG,
+                  sizeof(MUTU_UPDATE_SIG)) != 0
+        || IsBadReadPtr((void *)MUTU_ANIM_FRAME_VA, sizeof(MUTU_ANIM_FRAME_SIG))
+        || memcmp((void *)MUTU_ANIM_FRAME_VA, MUTU_ANIM_FRAME_SIG,
+                  sizeof(MUTU_ANIM_FRAME_SIG)) != 0)
+        return 0;
+    if (!VirtualProtect(slot, 4, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   格斗招式判定体探针: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    g_mutu_update_orig = (mutu_thiscall0_fn)MUTU_SKILL_UPDATE_VA;
+    *slot = (UINT_PTR)&mutu_update_hook;
+    VirtualProtect(slot, 4, oldp, &oldp);
+    InterlockedExchange(&g_mutu_diag_patched, 1);
+    bslog("PATCH   ★格斗招式判定体探针已装（虚表 %08X 槽 %d：%08X → 探针）：招式每走一个"
+          "引擎帧打一行 MUTU.（判定体 / 受击体相对脚底的偏移），每张招式表第一次出现打一行"
+          " MUTU=；比对用 tools\\mutudata.py --check（BSHOOK_MUTU_DIAG=1 才装，B2 临时）",
+          (unsigned)MUTU_SKILL_VFT, MUTU_SKILL_SLOT_UPDATE, (unsigned)MUTU_SKILL_UPDATE_VA);
+    return 1;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -10796,6 +11129,40 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_irene_lvl_patched)
             bslog("PATCH   !! 超时未能解除爱琳 4 级门"
                   "（0x44c954 / 0x44cc07 / 0x467eb1 的特征串一直对不上）");
+    }
+
+    /* 格斗模式（무투전）解锁（X16 / D82）—— 和爱琳一样时机不急：五处都在
+       建房 / 房间设定 / 选图代码里，最早也要进大厅才第一次执行。轮询的理由
+       同上面几组（等 ASProtect 把那一页解开，没有事件可等）。
+       ★ 依赖地区解锁：地区锁保留时格斗图一张都进不了目录，这组跟着不打。 */
+    if (!region_lock_disabled()) {
+        bslog("PATCH   BSHOOK_KEEP_REGION_LOCK 已设 ⇒ 格斗图进不了地图目录，"
+              "格斗模式解锁跟着不打");
+    } else if (mutu_lock_kept()) {
+        bslog("PATCH   BSHOOK_KEEP_MUTU_LOCK 已设，保留原版：格斗模式不在建房下拉框里、"
+              "房间 ◀▶ 不含格斗、Boss 格斗场要先通关任务");
+    } else {
+        for (ticks = 0; !g_stop && !g_mutu_patched && ticks < 2000; ticks++) {
+            if (try_patch_mutu_unlock()) break;
+            Sleep(2);
+        }
+        if (!g_mutu_patched)
+            bslog("PATCH   !! 超时未能 patch 格斗模式解锁"
+                  "（0x43755e / 0x4659cc / 0x4659e3 / 0x465a0a / 0x40b273 "
+                  "的特征串一直对不上）");
+    }
+
+    /* ★ B2 格斗招式判定体探针（X16，临时）：BSHOOK_MUTU_DIAG=1 才装；轮询理由同上（等解壳）。 */
+    if (mutu_diag_enabled()) {
+        for (ticks = 0; !g_stop && !g_mutu_diag_patched && ticks < 2000; ticks++) {
+            if (try_patch_mutu_diag()) break;
+            Sleep(2);
+        }
+        if (!g_mutu_diag_patched)
+            bslog("PATCH   !! 超时未能装格斗招式判定体探针（虚表 %08X 槽 %d 一直不是 %08X，"
+                  "或 %08X / %08X 的特征串对不上）", (unsigned)MUTU_SKILL_VFT,
+                  MUTU_SKILL_SLOT_UPDATE, (unsigned)MUTU_SKILL_UPDATE_VA,
+                  (unsigned)MUTU_SKILL_UPDATE_VA, (unsigned)MUTU_ANIM_FRAME_VA);
     }
 
     /* 登录公告：**这一轮是次要的**，打不上也没关系 —— 真正的保证在

@@ -260,6 +260,35 @@ class ResolveTests(unittest.TestCase):
         self.assertIsNone(store.load("Megatron_b"))
 
 
+class ChineseRedirectTests(unittest.TestCase):
+    """X_Mod §123 / D83 —— 国服客户端载图前按 `Chinese.ini` 换图（`0x48d374`），服务端跟着换。"""
+
+    def setUp(self):
+        self.store = mapdata._Store(data_dir="__不存在的目录__")
+        self.store._index = {
+            "maps": {"Megatron_b": {}, "Megatron_b_ch": {}, "Forest00": {}, "Gone": {}},
+            "bases": {},
+            "redirects": {"Megatron_b": "Megatron_b_ch", "Gone": "Gone_ch"},
+        }
+
+    def test_the_chinese_version_wins(self):
+        self.assertEqual("Megatron_b_ch", self.store.resolve("Megatron_b"))
+
+    def test_the_mode_suffix_is_stripped_before_the_redirect(self):
+        # 客户端也是先切 `:NewPvp` 再查表的。
+        self.assertEqual("Megatron_b_ch", self.store.resolve("Megatron_b:NewPvp"))
+
+    def test_other_maps_are_untouched(self):
+        self.assertEqual("Forest00", self.store.resolve("Forest00:NewPvp"))
+
+    def test_a_redirect_to_a_map_we_did_not_extract_falls_back(self):
+        self.assertEqual("Gone", self.store.resolve("Gone"))
+
+    def test_an_index_without_redirects_still_resolves(self):
+        del self.store._index["redirects"]
+        self.assertEqual("Megatron_b", self.store.resolve("Megatron_b:NewPvp"))
+
+
 class QuestDifficultyTests(unittest.TestCase):
     """★★★ 闯关房**按难度**挑地图文件（§140 / D100）。
 
@@ -423,6 +452,17 @@ class RealDataTests(unittest.TestCase):
         if "Megatron_b" in self.names:
             self.assertIsNotNone(self.store.load("Megatron_b:NewPvp"))
 
+    def test_the_megatron_maps_load_the_chinese_version(self):
+        # ★ 国服客户端载的是 `_ch` 版（X_Mod §123）—— `_b` 那张和韩版差 18697 px、出生点不同。
+        self.assertEqual(
+            {"Megatron00m": "Megatron00m_ch", "Megatron00": "Megatron00_ch",
+             "Megatron01": "Megatron01_ch", "Megatron_b": "Megatron_b_ch",
+             "Megatron_M00": "Megatron_M00_ch"},
+            dict(self.store.index().get("redirects", {})))
+        self.assertEqual("Megatron_b_ch", self.store.resolve("Megatron_b:NewPvp"))
+        self.assertEqual("Megatron_b_ch", self.store.load("Megatron_b:NewPvp").name)
+        self.assertEqual("Megatron_M00_ch", self.store.resolve("Megatron_M00"))
+
     def test_coarse_clear_never_lies(self):
         """★★★ `coarse_clear()` 说「空的」就必须真是空的（V0.3 §169）。
 
@@ -538,3 +578,70 @@ class BreakableTerrainTests(unittest.TestCase):
         self.assertEqual((2, 2), (item.left, item.top))
         self.assertEqual(0.0, item.distance_to(3, 3))
         self.assertAlmostEqual(2.0, item.distance_to(8, 3))
+
+
+def _load_tools_mapdata():
+    """按文件路径加载 `tools/mapdata.py`（提取器）。
+
+    ★ 不能 `import mapdata`：`server/mapdata.py` 同名，谁先进 `sys.modules` 谁赢。
+    """
+    import importlib.util
+    path = os.path.join(os.path.dirname(HERE), "tools", "mapdata.py")
+    spec = importlib.util.spec_from_file_location("tools_mapdata_x16", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class RedirectExtractorTests(unittest.TestCase):
+    """提取器从 `Data/Chinese.ini` 收地图重定向（FORMAT 10，X_Mod §123 / D83）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tool = _load_tools_mapdata()
+
+    def _pack_with(self, lines):
+        import tempfile
+        pack = tempfile.mkdtemp()
+        os.makedirs(os.path.join(pack, "Data"))
+        text = "\r\n".join(lines) + "\r\n"
+        with open(os.path.join(pack, "Data", "Chinese.ini"), "wb") as fp:
+            fp.write(b"\xff\xfe" + text.encode("utf-16-le"))     # 原版就是 UTF-16LE + BOM
+        return pack
+
+    def test_only_bare_map_names_on_both_sides_count(self):
+        pack = self._pack_with([
+            "# 注释", "[Chinese]",
+            "Megatron_b:NewPvp=Megatron_b_ch:NewPvp",     # 带后缀的键：客户端查之前已经切掉，不算
+            "Megatron_b=Megatron_b_ch",
+            "#Maps/Megatron00.map=Maps/Megatron00_ch.map",
+            "Maps/ReadyRoom.map=Maps/ReadyRoomCN.map",   # 路径式，不是地图名
+            "Forest00=숲",                                # 翻译表那种，值不是地图名
+            "Nowhere=Nowhere_ch",                         # 键没提取到
+            "Megatron01=Megatron01_ch",
+        ])
+        known = {"Megatron_b", "Megatron_b_ch", "Megatron01", "Megatron01_ch", "Forest00",
+                 "Nowhere_ch"}
+        self.assertEqual([("Megatron_b", "Megatron_b_ch"), ("Megatron01", "Megatron01_ch")],
+                         list(self.tool.read_map_redirects(pack, known).items()))
+
+    def test_lines_outside_the_chinese_section_are_ignored(self):
+        pack = self._pack_with(["[Japanese]", "Megatron_b=Megatron_b_ch"])
+        self.assertEqual({}, dict(self.tool.read_map_redirects(pack, {"Megatron_b", "Megatron_b_ch"})))
+
+    def test_two_different_targets_for_one_map_stop_the_extraction(self):
+        pack = self._pack_with(["[Chinese]", "Megatron_b=Megatron_b_ch", "Megatron_b=Megatron01"])
+        with self.assertRaises(SystemExit):
+            self.tool.read_map_redirects(pack, {"Megatron_b", "Megatron_b_ch", "Megatron01"})
+
+    def test_the_real_chinese_ini_gives_the_five_megatron_maps(self):
+        pack = os.path.join(os.path.dirname(HERE), "game_patched", "Pack_develop")
+        maps_dir = os.path.join(pack, "Maps")
+        if not os.path.isdir(maps_dir):
+            raise unittest.SkipTest("不在源码仓库里（缺明文资源树），跳过")
+        known = {f[:-4] for f in os.listdir(maps_dir) if f.lower().endswith(".map")}
+        self.assertEqual(
+            [("Megatron00m", "Megatron00m_ch"), ("Megatron00", "Megatron00_ch"),
+             ("Megatron01", "Megatron01_ch"), ("Megatron_b", "Megatron_b_ch"),
+             ("Megatron_M00", "Megatron_M00_ch")],
+            list(self.tool.read_map_redirects(pack, known).items()))

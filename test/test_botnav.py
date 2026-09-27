@@ -18,7 +18,7 @@ import botmove                                                 # noqa: E402
 import botnav                                                  # noqa: E402
 import botplan                                                 # noqa: E402
 import mapdata                                                 # noqa: E402
-from test_botmove import Dummy                                 # noqa: E402
+from test_botmove import Dummy, FightDummy                     # noqa: E402
 from test_mapdata import blob, make_record, pack_cells          # noqa: E402
 
 
@@ -126,6 +126,23 @@ class AStarTests(unittest.TestCase):
         self.assertTrue(any(step.action == botnav.ACTION_DOUBLE_JUMP
                             for step in path))
         self.assertLessEqual(abs(path[-1].y - 219.0), botnav.GOAL_Y)
+
+    def test_the_fight_profile_needs_a_double_jump_for_a_160_step(self):
+        """★ 格斗档（X16 / D85，X_Mod §120）：一段跳逐帧顶点只有 148（普通 170）⇒ 160 高的台子
+        普通房一段跳就上去了，格斗房得两段 —— 可达图不带物理档的话 bot 会去跳一个上不去的台子。"""
+        heights = [460] * 150 + [300] * 250
+        terrain = terrain_from(solid_heights(heights, 480))
+        start = botmove.Body(100.0, 459.0)
+        normal = botnav.plan(terrain, start, self.who, (260.0, 299.0))
+        fight = botnav.plan(terrain, start, FightDummy(7.0), (260.0, 299.0))
+        for path in (normal, fight):
+            self.assertTrue(path)
+            self.assertLessEqual(abs(path[-1].y - 299.0), botnav.GOAL_Y)
+        actions = lambda path: set(step.action for step in path)   # noqa: E731
+        self.assertIn(botnav.ACTION_JUMP, actions(normal))
+        self.assertNotIn(botnav.ACTION_DOUBLE_JUMP, actions(normal))
+        self.assertIn(botnav.ACTION_DOUBLE_JUMP, actions(fight))
+        self.assertNotIn(botnav.ACTION_JUMP, actions(fight))
 
     def test_an_unreachable_goal_still_walks_as_close_as_it_can(self):
         """★ 够不着的目标不再空手而归 —— 走到能走到的最近处（会话 41）。
@@ -439,6 +456,13 @@ class NarrowSlotEdgeTests(unittest.TestCase):
         fat = Dummy(7.0)
         fat.size_legs, fat.size_body = 12.0, 30.0
         self.assertNotEqual(botnav._scale_key(thin), botnav._scale_key(fat))
+
+    def test_the_cache_key_tells_the_fight_profile_apart(self):
+        """★ 格斗档（X16 / D85）上得去的台子不一样 ⇒ 物理档也进 key，格斗房不用普通房建的边。"""
+        normal, fight = Dummy(7.0), FightDummy(7.0)
+        self.assertNotEqual(botnav._scale_key(normal), botnav._scale_key(fight))
+        terrain = terrain_from(solid_heights([180] * 240, 220))
+        self.assertIsNot(botnav.graph_of(terrain, normal), botnav.graph_of(terrain, fight))
 
 
 class RealTrapNodeEdgeTests(unittest.TestCase):

@@ -120,6 +120,33 @@ def constrain_body(victim_handle, owner_handle):
     return _CONSTRAIN.pack(int(victim_handle), int(owner_handle))
 
 
+#: `0x0016` —— **出 / 收一招格斗招式**（body 13 字节，只有格斗模式发，X_Mod §121）：
+#: `{u8 座位, i8 类型, i8 朝向, i16 招式号, f32 x, f32 y}`。类型 2 = 出招（收方先把角色硬置到 (x, y)），
+#: −1 = 收招，其它只删旧招。招式号 = 该角色在 `NewMutu.ini` 里的文件顺序（`mutudata.skills()` 的下标）。
+#: ★ 每发一次类型 2 吃 D+E+1 个弹体句柄（和 `rpFire` / `rpDash` 同一个座位计数器）。
+OP_MUTU_SKILL = 0x0016
+MUTU_SKILL_START = 2
+MUTU_SKILL_END = -1
+
+#: `0x0018 rpGuard` —— 格挡开 / 关（body 2 字节 `{u8 座位, u8 开关}`，X_Mod §95 / §122）。
+OP_GUARD = 0x0018
+
+_MUTU_SKILL = struct.Struct("<Bbbhff")
+
+
+def mutu_skill_body(seat, kind, facing, index, x, y):
+    """`0x0016` 的 13 字节（组包 `0x4934e7`）。"""
+    return _MUTU_SKILL.pack(int(seat), int(kind), 1 if facing >= 0 else -1, int(index),
+                            float(x), float(y))
+
+
+def parse_mutu_skill(body):
+    """`0x0016` → `(座位, 类型, 朝向, 招式号, x, y)`；长度不对返回 `None`。"""
+    if len(body) < _MUTU_SKILL.size:
+        return None
+    return _MUTU_SKILL.unpack_from(body, 0)
+
+
 #: `0x000b rpCrouch` —— **蹲下 / 起立**（body 2 字节，§41）。
 #:
 #: ★ 蹲这件事**心跳里一个位都没有**：只有按下和松开那两下各发一发这个
@@ -787,14 +814,15 @@ SPLASH_BODY_SIZE = _SPLASH.size
 
 
 def splash_body(source_handle, target_handle, damage, x, y,
-                push_x=0.0, push_y=0.0, flags=0):
+                push_x=0.0, push_y=0.0, flags=0, kind=0):
     """`0x0004 rpSplashDamaged`（33 字节）：**这个爆炸溅到了那个人**（§67）。
 
     ```
     +0   i32  伤害源的句柄（弹体 / 溅射对象 / 冲刺伤害对象）
     +4   i32  ★ 受害者的**角色句柄**（`character_handle()`）
     +8   f32  ★ 伤害值
-    +12  u8   伤害类 `vft+0x138` 的返回值 —— 全部是 `xor eax,eax` ⇒ 恒 0
+    +12  u8   伤害类 `vft+0x138` 的返回值（`kind`）—— 溅射 / 冲刺 / 火墙恒 0；
+              格斗招式的判定体是 `BounceHit ? 3 : 2`（`0x4f9c82`，X_Mod §122）
     +13  f32  击退向量 X（±15 / ±4 那一类）
     +17  f32  击退向量 Y（观测多为负 = 往上顶）
     +21  f32  受击点 X
@@ -815,7 +843,7 @@ def splash_body(source_handle, target_handle, damage, x, y,
     但它是事件包，照样吃一个事件序号。
     """
     return _SPLASH.pack(int(source_handle), int(target_handle), float(damage),
-                        0, float(push_x), float(push_y),
+                        int(kind), float(push_x), float(push_y),
                         float(x), float(y), int(flags))
 
 

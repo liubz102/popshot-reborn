@@ -419,7 +419,7 @@ function Get-ServerSourceFile([string]$Root) {
                         'eventlog.py', 'lobby.py', 'relayserver.py', 'protocol.py',
                         'simple.py', 'udpsync.py', 'bot.py', 'botsync.py',
                         'botmove.py', 'botnav.py', 'mapdata.py', 'weapondata.py',
-                        'ballistics.py', 'chrprops.py',
+                        'ballistics.py', 'chrprops.py', 'mutudata.py', 'botfight.py',
                         'bothp.py', 'botarms.py', 'botaim.py', 'botthreat.py',
                         'equipbonus.py',
                         'shop.py', 'shopcfg.py', 'shopdata.py', 'shopdefaults.py', 'databackup.py', 'logpack.py',
@@ -482,6 +482,9 @@ function Copy-ServerCode {
     # 角色属性表（V0.3 M5）：`server\chrprops.py` 读的就是它 —— 命中判定
     # 要知道「人有多大」（三个碰撞圆）。
     $copied += (Copy-ChrProps -Root $Root -PackageRoot $PackageRoot)
+    # 格斗招式表（X_Mod X16 / D84）：`server\mutudata.py` 读的就是它 —— 格斗模式里
+    # 服务端要替 bot 判招式打没打中（判定体挂在骨骼上，离线烘好了轨迹）。
+    $copied += (Copy-MutuData -Root $Root -PackageRoot $PackageRoot)
     # 商店物品表（V0.3商店 M1）：`server\shopdata.py` 读的就是它。
     $copied += (Copy-ShopData -Root $Root -PackageRoot $PackageRoot)
     # 客户端 hook 完整性清单（D85）：`server\versioning.py` 读的就是它。
@@ -581,6 +584,34 @@ function Copy-ChrProps {
     }
     Copy-One $src (Join-Path $PackageRoot 'server\bot_chrprops.json')
     return @('bot_chrprops.json')
+}
+
+function Copy-MutuData {
+    <# 把 `server\bot_mutu.json` 拷进包（**两个包都要**），并当场验收（X_Mod X16 / D84）。
+
+       ★ 缺了它 `mutudata` 返回空表、不报错 —— 格斗房里的 bot 就不会出招，
+         而「bot 为什么只挨打不还手」在实机上说不上哪儿不对。所以照 Copy-ChrProps 的风格：
+         明显不对就炸，别打出半个包。 #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$PackageRoot
+    )
+    $src = Join-Path $Root 'server\bot_mutu.json'
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+        throw "缺格斗招式表：$src 不存在。先跑 tools\update-gamedata.bat"
+    }
+    # 原版 NewMutu.ini 是 16 个角色 × 10 招。少一大截说明提取跑了一半。
+    $table = Get-Content -LiteralPath $src -Raw -Encoding UTF8 | ConvertFrom-Json
+    $chars = @($table.characters.PSObject.Properties).Count
+    if ($chars -lt 10) {
+        throw "格斗招式表只有 $chars 个角色，明显不对，中止打包"
+    }
+    $want = Get-ServerFormatVersion -Root $Root -Module 'mutudata'
+    if ($table.format -ne $want) {
+        throw "格斗招式表的 format 是 $($table.format)，server\mutudata.py 只认 $want。先跑 tools\update-gamedata.bat 重新提取"
+    }
+    Copy-One $src (Join-Path $PackageRoot 'server\bot_mutu.json')
+    return @('bot_mutu.json')
 }
 
 function Copy-ShopData {
@@ -1058,7 +1089,7 @@ function Invoke-PackBuild {
 
        ① `tools\pkn.py pack`：增量 —— 只重写明文变了的卷，一个子目录一卷，原版格式；
        ② 明文树变了（`tools\gamedata-stamp.json` 记的树哈希 ≠ 当前）就跑
-          `tools\update-gamedata.ps1` 重提服务端那五份数据（地形 / 武器 / 角色 / 物品 / 图标），
+          `tools\update-gamedata.ps1` 重提服务端那六份数据（地形 / 武器 / 角色 / 物品 / 图标 / 格斗招式），
           成功后由它自己写回戳；失败 ⇒ **卷和清单不回滚**（它们是对的），戳不更新，
           下次再跑会自动重试 —— 打包在这种状态下中止，不打「新卷 + 旧数据」的包；
        ③ 最后 `pack --check` 复核一遍，自相矛盾也中止。
@@ -1099,7 +1130,7 @@ function Invoke-PackBuild {
         $urc = $LASTEXITCODE
         $ErrorActionPreference = 'Stop'
         if ($urc -ne 0) {
-            throw ("资源卷已经更新，但服务端数据（五份产物）没提取成功（update-gamedata 退出码 $urc）。" +
+            throw ("资源卷已经更新，但服务端数据（六份产物）没提取成功（update-gamedata 退出码 $urc）。" +
                    "修好后再跑一次 tools\build-pack.bat 会自动重试提取；在那之前不要打包。")
         }
     } else {

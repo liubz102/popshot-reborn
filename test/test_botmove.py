@@ -734,6 +734,184 @@ class BodyTests(unittest.TestCase):
         self.assertEqual(body, got)
 
 
+class FightDummy(Dummy):
+    """格斗模式里的假角色：`botmove.physics_of()` 只看 `fight` 这一格（`chrprops.shaped(fight=True)` 的最小替身）。"""
+
+    fight = True
+
+
+class FightPhysicsTests(unittest.TestCase):
+    """格斗档（X_Mod §120 / D85）：每帧重力 ×1.5、跳高 240 / 300 —— **起跳初速和上升计时器仍按基础 g**。"""
+
+    def setUp(self):
+        self.t = flat(width=400, floor=300, height=340)
+        self.body = botmove.Body(100.0, 299.0)
+        self.who = FightDummy(4.0)
+
+    def test_the_per_frame_gravity_is_f32_one_point_two_times_one_and_a_half(self):
+        """`0x50d58a`：`f32(1.2) × 1.5` 在 x87 里乘完才加 = f32 `0x3FE66667`（不是 f32(1.8) 那个 1.79999995）。"""
+        self.assertEqual(1.8000000715255737, botmove.fight_physics().step)
+        self.assertEqual(f32(botmove.fight_physics().step), botmove.fight_physics().step)
+        self.assertEqual(botmove.G32, botmove.NORMAL_PHYSICS.step, "普通档逐位不变")
+
+    def test_the_launch_speeds_still_use_the_base_gravity(self):
+        """`0x501d57`：`√(2 · f32(1.2 · h))`，g 不乘 1.5 ⇒ 240 / 300 给 24.0 / 26.832815（D85 否掉的是「g 整个 ×1.5」）。"""
+        self.assertEqual((24.0, 26.832815170288086), botmove.fight_physics().launch)
+        self.assertEqual(24.0, botmove.launch_speed(1, self.who))
+        self.assertEqual(26.832815170288086, botmove.launch_speed(2, self.who))
+        self.assertEqual(botmove.JUMP_SPEED, botmove.launch_speed(1, Dummy()))
+
+    def test_the_rise_timer_still_uses_the_base_gravity(self):
+        """`0x501f0d` `ftol(|v0 / 1.2|)` = 20 / 22 ⇒ 之后 19 / 21 帧在计时器里（普通 16 / 19）。"""
+        self.assertEqual([19, 21], [botmove.rise_ticks(v) for v in botmove.fight_physics().launch])
+
+    def test_the_closed_form_apex_is_160(self):
+        self.assertAlmostEqual(160.0, botmove.jump_apex(self.who), places=3)
+        self.assertAlmostEqual(180.0, botmove.jump_apex(Dummy()), places=3)
+
+    def test_a_standing_fight_jump_is_lower_and_shorter(self):
+        """逐帧：顶点 148.2（普通 169.7）、26 帧落地（普通 34）—— 跳高写着 240，实际比普通还矮。"""
+        fight = run_air(self.t, botmove.jump(self.body, character=self.who), self.who)
+        normal = run_air(self.t, botmove.jump(self.body), Dummy(4.0))
+        self.assertAlmostEqual(148.2000427, self.body.y - fight[2], places=4)
+        self.assertEqual(26, fight[1])
+        self.assertAlmostEqual(169.7383423, self.body.y - normal[2], places=4)
+        self.assertEqual(34, normal[1])
+        self.assertTrue(fight[0].on_ground)
+        self.assertEqual(self.body.y, fight[0].y)
+
+    def test_the_takeoff_frame_and_the_double_jump(self):
+        body = botmove.tick(self.t, self.body, self.who, want_jump=True)
+        self.assertEqual((-24.0, 19), (body.vy, body.rise))
+        want = -24.0
+        for _ in range(5):
+            body = botmove.tick(self.t, body, self.who)
+            want = f32(want + 1.8000000715255737)
+        self.assertEqual(want, body.vy, "腾空每帧加的是格斗那一档")
+        again = botmove.tick(self.t, body, self.who, want_jump=True)
+        self.assertEqual((-26.832815170288086, 21), (again.vy, again.rise))
+        self.assertTrue(again.air_jumped)
+
+    def test_normal_characters_keep_the_normal_profile(self):
+        self.assertIs(botmove.NORMAL_PHYSICS, botmove.physics_of(None))
+        self.assertIs(botmove.NORMAL_PHYSICS, botmove.physics_of(Dummy()))
+        self.assertIs(botmove.NORMAL_PHYSICS, botmove.physics_of(chrprops.get(0)))
+        self.assertIs(botmove.fight_physics(), botmove.physics_of(chrprops.get(0).shaped(fight=True)))
+
+    def test_it_follows_the_extracted_config(self):
+        """`NewMutuConfig.ini` 经 `bot_mutu.json`（X_Mod §124）；表缺了就是原版那几个数。"""
+        phys = botmove.fight_physics()
+        cfg = botmove.mutudata.config()
+        if cfg:
+            self.assertEqual((cfg["GravityFactor"], cfg["DamagedFlyGravityFactor"]),
+                             (phys.gravity_factor, phys.fly_factor))
+            self.assertEqual((cfg["FirstJumpHeight"], cfg["SecondJumpHeight"]), phys.heights)
+        saved = list(botmove._FIGHT_PHYSICS)
+        self.addCleanup(botmove._FIGHT_PHYSICS.__setitem__, slice(None), saved)
+        self.addCleanup(setattr, botmove.mutudata, "config", botmove.mutudata.config)
+        botmove.mutudata.config = lambda: {}
+        del botmove._FIGHT_PHYSICS[:]
+        phys = botmove.fight_physics()
+        self.assertEqual((1.5, 1.5, (240.0, 300.0)),
+                         (phys.gravity_factor, phys.fly_factor, phys.heights))
+
+
+class FlyGravityTests(unittest.TestCase):
+    """打飞 `[+0x514]`（X_Mod §122 / D85）：挨了 `int(伤害) ≥ 10` 的一发 ⇒ 腾空每帧重力 1.2 × 1.5，
+    一帧开头踩地即清（`0x4fe15b`）、腾空撞上任何东西也清（`0x502e0e`）。普通模式也有。"""
+
+    def setUp(self):
+        self.t = flat(width=400, floor=300, height=340)
+        self.who = Dummy(4.0)
+
+    def flying(self, x=100.0, y=200.0, vx=0.0, vy=0.0, **extra):
+        return botmove.Body(x, y, vx, vy, on_ground=False, fly=True, **extra)
+
+    def test_a_flying_body_falls_with_the_heavier_gravity(self):
+        got = botmove.tick(self.t, self.flying(), self.who)
+        self.assertEqual(1.8000000715255737, got.vy)
+        self.assertTrue(got.fly)
+        plain = botmove.Body(100.0, 200.0, on_ground=False)
+        self.assertEqual(botmove.G32, botmove.tick(self.t, plain, self.who).vy)
+
+    def test_a_knocked_arc_is_lower_and_shorter(self):
+        """(12, −18)（一发 > 10 的 (12, −9)，push.y 已 ×2）：顶点 126 → 81、滞空 35 → 20 帧 ——
+        服务端以前一直按前者算，bot 被打飞的弧线偏高偏远。"""
+        body = self.flying(y=299.0, vx=12.0, vy=-18.0)
+        flew = run_air(self.t, body, self.who)
+        old = run_air(self.t, body.moved(body.x, body.y, body.vx, body.vy, on_ground=False,
+                                         fly=False), self.who)
+        self.assertAlmostEqual(81.0, body.y - flew[2], places=3)
+        self.assertEqual(20, flew[1])
+        self.assertAlmostEqual(126.0, body.y - old[2], places=3)
+        self.assertEqual(35, old[1])
+
+    def test_it_stays_on_until_the_landing(self):
+        body = self.flying(y=299.0, vx=12.0, vy=-18.0)
+        while not body.on_ground:
+            self.assertTrue(body.fly)
+            body = botmove.tick(self.t, body, self.who)
+        self.assertFalse(body.fly)
+
+    def test_a_standing_body_is_never_flying(self):
+        self.assertFalse(botmove.Body(100.0, 299.0, fly=True).fly)
+        self.assertFalse(self.flying().moved(100.0, 299.0, on_ground=True).fly)
+        self.assertTrue(self.flying().moved(101.0, 199.0, 0.0, 1.0, on_ground=False).fly,
+                        "腾空里挪一下原样带着")
+        self.assertNotEqual(self.flying(), botmove.Body(100.0, 200.0, on_ground=False))
+
+    def test_a_ceiling_bump_during_the_rise_clears_it(self):
+        """上升计时器里撞头（`BUMPED`）也是腾空碰撞入口 ⇒ 清。"""
+        rows = [("2" if (y >= 250 or y in (150, 151)) else "0") * 60 for y in range(270)]
+        t = terrain_from(rows)
+        body = botmove.jump(botmove.Body(20.0, 249.0), 4.0)
+        body = body.moved(body.x, body.y, body.vx, body.vy, on_ground=False, fly=True)
+        for _ in range(30):
+            result = botmove.frame(t, body, self.who)
+            if result.outcome == botmove.BUMPED:
+                break
+            self.assertTrue(result.body.fly)
+            body = result.body
+        self.assertEqual(botmove.BUMPED, result.outcome, "头该撞上板")
+        self.assertFalse(result.body.fly)
+        self.assertFalse(result.body.on_ground)
+
+    def test_a_bounce_clears_it(self):
+        result = botmove.frame(self.t, self.flying(y=290.0, vy=40.0), self.who, direction=1)
+        self.assertEqual(botmove.BOUNCED, result.outcome)
+        self.assertFalse(result.body.fly)
+
+    def test_a_pad_frame_clears_it_at_the_start(self):
+        """台子刚写了速度、踩地位还没清的那一帧也算踩地（`0x4fe15b`）⇒ 走两步那一帧已经是普通重力。"""
+        body = self.flying(y=299.0, vy=-10.0, pad=True)
+        got = botmove.tick(self.t, body, self.who)
+        self.assertFalse(got.fly)
+        self.assertEqual(f32(-10.0 + botmove.G32), got.vy)
+
+    def test_a_double_jump_keeps_it(self):
+        """二段跳不经过踩地也不撞东西 ⇒ 原版照样带着打飞。"""
+        body = botmove.tick(self.t, self.flying(), self.who, want_jump=True)
+        self.assertEqual(-24.0, body.vy)
+        self.assertTrue(body.fly)
+        self.assertEqual(f32(-24.0 + 1.8000000715255737), botmove.tick(self.t, body, self.who).vy)
+
+    def test_the_fight_profile_uses_its_own_factor(self):
+        """格斗模式打飞取 `DamagedFlyGravityFactor`（`0x4feb8c`，原版也是 1.5）。"""
+        got = botmove.tick(self.t, self.flying(), FightDummy(4.0))
+        self.assertEqual(botmove.fight_physics().fly_step, got.vy)
+
+    def test_client_air_tick_takes_it_too(self):
+        got = botmove.client_air_tick(self.t, self.flying(), self.who)
+        self.assertEqual((1.8000000715255737, True), (got.vy, got.fly))
+        landed = botmove.client_air_tick(self.t, self.flying(y=298.0, vy=3.0), self.who)
+        self.assertTrue(landed.on_ground)
+        self.assertFalse(landed.fly)
+        # 撞上了却没落地（|v| > 35 反弹）：还在空中，打飞照样清（`0x502e0e`）。
+        bounced = botmove.client_air_tick(self.t, self.flying(y=290.0, vy=40.0), self.who)
+        self.assertFalse(bounced.on_ground)
+        self.assertFalse(bounced.fly)
+
+
 class RealMapTests(unittest.TestCase):
     """真产物在的话再跑：在真图上走几百个 tick，人必须一直站得住。"""
 

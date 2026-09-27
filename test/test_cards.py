@@ -1391,10 +1391,13 @@ class CardTooltipTests(unittest.TestCase):
         self.assertIn(shopcfg.CARD_OP_ZH[shopcfg.CARD_OP_GE] + "7",
                       self.desc(60004))
 
-    def test_the_fight_master_title_warns_that_it_never_fires(self):
-        """⚠ `560002` 的加成要求格斗模式，而中国区客户端根本选不到那个模式
-        —— 说明里必须写明白，不然玩家攒 50 张卡换一个空壳。"""
-        self.assertIn("不会触发", self.desc(560002))
+    def test_the_fight_master_title_no_longer_claims_it_never_fires(self):
+        """`560002` 的加成要求格斗模式。国服原本选不到，说明里曾写「不会触发」；
+        X16（D82）起格斗模式解锁了 ⇒ 这句话变成假的，必须拿掉，照常写明是格斗模式的加成。"""
+        desc = self.desc(560002)
+        self.assertNotIn("不会触发", desc)
+        self.assertNotIn("选不到", desc)
+        self.assertIn("格斗模式", desc)
 
 
 if __name__ == "__main__":

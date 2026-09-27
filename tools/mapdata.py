@@ -90,7 +90,11 @@ DIR_TYPE = {"TERRAIN": 200, "LAYER": 202, "COVER": 201,
 #: 9：`breakables[]` 多了 `fx` / `fy` = `.map` 里的原始 f32 坐标（`x` / `y` 仍是四舍五入的
 #:    整数，角色那一路照旧用它）。客户端对象查询 `0x51a935` 是拿 f32 坐标截断映射的，
 #:    四舍五入会差出 1 px —— 弹体那一路按原始坐标合成（X_Mod §80）。
-FORMAT = 9
+#: 10：`index.json` 多一层 `redirects` = **国服客户端载图前的地图名重定向**（X_Mod §123 / D83）：
+#:    `0x48d374` 把去掉 `:` 后缀的房间地图名过一遍 `Data/Chinese.ini` 的 `[Chinese]` 段，
+#:    Megatron 系列 5 张就这样换成了 `_ch` 版（`_b` 那张差 18697 px、出生点也不同）——
+#:    服务端以前照韩版取地形，bot 站位和玩家屏幕上对不上。
+FORMAT = 10
 
 #: ★★★ **可破坏物**（`Maps/*/Breakable/*.png`，客户端类 `BreakableObj`）。
 #: 全 174 张图里共 677 个，分布在 67 张图上。
@@ -669,6 +673,50 @@ def read_map_props(pack):
     return props
 
 
+#: ★★ 国服客户端**载图前**的地图名重定向（X_Mod §123 / D83）。
+#:
+#: `0x48d374` 把房间地图名去掉 `:` 后缀，交给 `0x558916` 按地区翻译 —— 国服查的就是
+#: `Data/Chinese.ini` 的 `[Chinese]` 段（资源重定向和翻译表都在这一段里）。命中了就载另一张
+#: `.map`：`Megatron_b=Megatron_b_ch` 那 5 行（中方做的审查版，遮了墙上的涂鸦，地形也不一样）。
+#: 同一段里还有 `Megatron_b:NewPvp=…` 那种带后缀的行 —— 客户端查之前已经切掉后缀，用不上；
+#: `#Maps/….map=…` 那几行本来就注释掉了。
+CHINESE_INI_RELATIVE = os.path.join("Data", "Chinese.ini")
+
+
+def read_map_redirects(pack, known):
+    """从 `Data/Chinese.ini` 收「键和值都是已提取地图名」的那几行。
+
+    返回 `{原名: 国服那张的名字}`（按文件顺序）。`known` = 这一轮提取出来的地图名集合。
+    只认**不带 `:` 后缀**的键 —— 客户端就是拿去掉后缀的名字去查的；翻译表里那几千行
+    「韩文 = 中文」键不是地图名，自然筛掉。同一个键两次给出不同的值说明表坏了，直接停。
+    """
+    path = os.path.join(pack, CHINESE_INI_RELATIVE)
+    if not os.path.isfile(path):
+        raise SystemExit("找不到 %s —— 国服地图重定向提不出来" % path)
+    with open(path, "rb") as fp:
+        raw = fp.read()
+    text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode("utf-8-sig")
+    redirects = collections.OrderedDict()
+    section = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]") and "=" not in line:
+            section = line[1:-1].strip()
+            continue
+        if section != "Chinese" or "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if ":" in key or key == value or key not in known or value not in known:
+            continue
+        if redirects.get(key, value) != value:
+            raise SystemExit("Chinese.ini 里 %s 被重定向到两张不同的图：%s / %s"
+                             % (key, redirects[key], value))
+        redirects[key] = value
+    return redirects
+
+
 def develop_root():
     """明文资源树 `game_patched\\Pack_develop`（进 git，每个 worktree 都有）。
 
@@ -772,9 +820,13 @@ def main(argv=None):
     # ★ `props` 是 `Data/map.ini` 的地图属性（现在只有 `FallDown`，§143）——
     #   键是**带玩法后缀的完整地图串**，和地形那份按文件名的索引不是一套。
     props = read_map_props(pack)
+    # ★ `redirects` 是国服客户端载图前的名字重定向（FORMAT 10）—— 服务端
+    #   `mapdata.resolve()` 查表前先套它，才和玩家那台载的是同一张 `.map`。
+    redirects = read_map_redirects(pack, index)
     idx = collections.OrderedDict((
         ("format", FORMAT), ("count", len(index)),
-        ("maps", index), ("bases", bases), ("props", props)))
+        ("maps", index), ("bases", bases), ("props", props),
+        ("redirects", redirects)))
     with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8",
               newline="\n") as fp:
         json.dump(idx, fp, ensure_ascii=False, indent=1, sort_keys=False)

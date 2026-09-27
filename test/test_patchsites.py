@@ -866,5 +866,197 @@ class ImeNativeUiPatchTest(unittest.TestCase):
         self.assertEqual(c_define(self.src, "IME_UI_APP_PP"), 0x72E2A4)
 
 
+_C_STR = r'"(?:[^"\\]|\\.)*"'
+_SITE_ENTRY = re.compile(
+    r"\{\s*(0[xX][0-9A-Fa-f]+)[uU]?\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,"
+    r"\s*\(const unsigned char \*\)((?:\s*" + _C_STR + r")+)\s*,"
+    r"\s*\(const unsigned char \*\)((?:\s*" + _C_STR + r")+)\s*,"
+    r"\s*" + _C_STR + r"\s*\}", re.S)
+
+
+def c_escaped_bytes(literals):
+    """把相邻几段只含 `\\xNN` 的 C 字符串字面量拼成 bytes。
+
+    ★ C 的 `\\x` 会**贪婪地**吃掉后面所有十六进制字符（`"\\x00A"` 是一个字节），
+      所以每个转义必须正好两位 —— 不是就说明这张表在 C 里的意思和看上去的不一样。
+    """
+    out = bytearray()
+    for lit in re.findall(_C_STR, literals):
+        body, pos = lit[1:-1], 0
+        for m in re.finditer(r"\\x([0-9A-Fa-f]+)", body):
+            if m.start() != pos or len(m.group(1)) != 2:
+                raise AssertionError("字面量不是一串整齐的 \\xNN：%r" % body)
+            out.append(int(m.group(1), 16))
+            pos = m.end()
+        if pos != len(body):
+            raise AssertionError("字面量不是一串整齐的 \\xNN：%r" % body)
+    return bytes(out)
+
+
+def c_site_table(src, name):
+    """抠 `bshook.c` 里 `{ va, len, off, n, sig, fix, what }` 这种站点表。
+
+    返回 `[(va, len, off, n, sig, fix), ...]`。先去掉注释（`fix` 那一行后面都跟着一句 `/* … */`）。
+    """
+    m = re.search(r"\}\s*%s\s*\[[^\]]*\]\s*=\s*\{(.*?)\n\};" % re.escape(name), src, re.S)
+    if not m:
+        raise AssertionError("bshook.c 里找不到站点表 %s" % name)
+    body = re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)
+    return [(int(e.group(1), 16), int(e.group(2)), int(e.group(3)), int(e.group(4)),
+             c_escaped_bytes(e.group(5)), c_escaped_bytes(e.group(6)))
+            for e in _SITE_ENTRY.finditer(body)]
+
+
+class MutuUnlockPatchTest(unittest.TestCase):
+    """X16 / D82 —— 格斗模式（무투전，对战模式号 2）解锁：`MUTU_SITES` 五处（§118）。
+
+    实机看得到的只有「下拉框里有没有、◀▶ 转不转、Boss 格斗场列不列」；
+    **错一个字节**（跳进指令中间、改到旁边那道判断）实机未必看得出来 —— 离线全钉死。
+    """
+
+    #: (特征串起始 VA, 改的偏移, 原字节, 新字节)，和计划 / FINDINGS §118 逐条对。
+    EXPECTED = [
+        (0x437545, 25, "7464", "9090"),      # G1  建房下拉框：地区 1/2 跳过模式 2 的 je
+        (0x4659C0, 12, "7475", "9090"),      # G2a 当前是格斗时整段跳过 ◀▶ 的 je
+        (0x4659DF, 4, "7501", "eb01"),       # G2b ◀ 跳过 2 的 jne
+        (0x465A00, 10, "7503", "eb03"),      # G2c ▶ 把 2 改成 3 的 jne
+        (0x40B26F, 4, "8b4030", "33c090"),   # G3  RequiredQuestClear 当 0
+    ]
+    #: 别的字节补丁组 -> 它们的条数宏。拿来核「格斗解锁的特征区间没被别人改过」。
+    #: （`BONUS_TEXT_SITES` 是另一种写法 —— 特征串是定长字节数组 —— 在 `_other_ranges` 里单独读。）
+    OTHER_TABLES = {
+        "MAP_LVL_SITES": "MAP_LVL_SITE_COUNT", "PLR_LVL_SITES": "PLR_LVL_SITE_COUNT",
+        "REGION_SITES": "REGION_PATCH_COUNT", "IRENE_SITES": "IRENE_PATCH_COUNT",
+        "IRENE_LVL_SITES": "IRENE_LVL_SITE_COUNT",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        for path in (BSHOOK, IMG):
+            if not os.path.isfile(path):
+                raise unittest.SkipTest("不在源码仓库里（缺 %s），跳过" % path)
+        cls.img = load_image()
+        cls.src = c_source()
+        cls.sites = c_site_table(cls.src, "MUTU_SITES")
+
+    def test_the_table_is_exactly_the_five_sites_we_mean(self):
+        self.assertEqual(c_define(self.src, "MUTU_PATCH_COUNT"), len(self.EXPECTED))
+        got = [(va, off, sig[off:off + n].hex(), fix.hex())
+               for va, _len, off, n, sig, fix in self.sites]
+        self.assertEqual(list(self.EXPECTED), got)
+
+    def test_the_signatures_match_the_image_and_are_unique(self):
+        for va, length, _off, _n, sig, _fix in self.sites:
+            self.assertEqual(length, len(sig), "%08X 的长度字段和特征串对不上" % va)
+            self.assertEqual(read_va(self.img, va, length), sig, "%08X 的特征串和镜像对不上" % va)
+            self.assertEqual(1, self.img.count(sig), "%08X 的特征串在镜像里不唯一" % va)
+
+    def test_every_fix_is_the_same_length_and_inside_the_signature(self):
+        for va, length, off, n, sig, fix in self.sites:
+            self.assertEqual(n, len(fix), "%08X 改的字节数和替换串不一样长" % va)
+            self.assertLessEqual(off + n, length, "%08X 改到特征串外面去了" % va)
+            self.assertNotEqual(sig[off:off + n], fix, "%08X 改了等于没改" % va)
+
+    def test_g1_only_drops_the_skip_of_mode_2(self):
+        # 0x43755b cmp ebx,2 / 0x43755e je 0x4375c4 —— 落点是循环尾 add esi,0xc（下一项）。
+        self.assertEqual(read_va(self.img, 0x43755B, 3), bytes.fromhex("83fb02"))
+        rel = struct.unpack("<b", read_va(self.img, 0x43755F, 1))[0]
+        self.assertEqual(0x437560 + rel, 0x4375C4)
+        self.assertEqual(read_va(self.img, 0x4375C4, 3), bytes.fromhex("83c60c"))
+
+    def test_the_ring_jumps_keep_their_landing(self):
+        # G2b / G2c 把 jne 换成 jmp：rel8 一个字节不动 ⇒ 落点还是原来那条（只是不再看条件）。
+        swapped = 0
+        for va, _len, off, _n, sig, fix in self.sites:
+            if sig[off] == 0x75:
+                self.assertEqual(0xEB, fix[0], "%08X 的 jne 没换成 jmp" % va)
+                self.assertEqual(sig[off + 1], fix[1], "%08X 的 rel8 被动了" % va)
+                swapped += 1
+        self.assertEqual(2, swapped)
+
+    def test_g3_turns_the_quest_requirement_into_zero(self):
+        # mov eax,[eax+0x30] → xor eax,eax / nop；后面 test eax,eax / … / jne 查表 / mov al,1 ⇒ 恒走「放行」。
+        _va, _len, off, _n, sig, fix = self.sites[4]
+        self.assertEqual(bytes.fromhex("8b4030"), sig[off:off + 3])
+        self.assertEqual(bytes.fromhex("33c090"), fix)
+        self.assertEqual(bytes.fromhex("85c0"), sig[off + 3:off + 5])
+        self.assertEqual(bytes.fromhex("7504b001c9c3"), sig[-6:])
+
+    def test_g3_gate_has_a_single_caller(self):
+        # 0x40b26f 全镜像只有 0x40b646（地图过滤 0x40b5d0 里）一个直接调用点 —— 改它只影响选图列表。
+        img, hits, start = self.img, [], 0
+        while True:
+            i = img.find(b"\xe8", start)
+            if i < 0 or i + 5 > len(img):
+                break
+            if IMAGE_BASE + i + 5 + struct.unpack_from("<i", img, i + 1)[0] == 0x40B26F:
+                hits.append(IMAGE_BASE + i)
+            start = i + 1
+        self.assertEqual([0x40B646], hits)
+
+    def _other_ranges(self):
+        for name, count in self.OTHER_TABLES.items():
+            others = c_site_table(self.src, name)
+            self.assertEqual(c_define(self.src, count), len(others), "%s 没解析全" % name)
+            for va, length, _off, _n, _sig, _fix in others:
+                yield name, va, length
+        m = re.search(r"\}\s*BONUS_TEXT_SITES\s*\[[^\]]*\]\s*=\s*\{(.*?)\n\};", self.src, re.S)
+        vas = [int(v, 16) for v in
+               re.findall(r"\{\s*(0[xX][0-9A-Fa-f]+)[uU]?\s*,\s*\{", m.group(1))]
+        self.assertEqual(c_define(self.src, "BONUS_TEXT_SITE_COUNT"), len(vas))
+        for va in vas:
+            yield "BONUS_TEXT_SITES", va, c_define(self.src, "BONUS_TEXT_SIG_LEN")
+
+    def test_no_other_patch_group_touches_these_bytes(self):
+        mine = [(va, va + length) for va, length, _off, _n, _sig, _fix in self.sites]
+        for name, va, length in self._other_ranges():
+            for lo, hi in mine:
+                self.assertFalse(va < hi and lo < va + length,
+                                 "%s 的 %08X 和格斗解锁的 %08X 重叠" % (name, va, lo))
+
+    def test_the_patch_thread_gates_it_behind_the_region_unlock(self):
+        # 15 张格斗图全靠地区旁路进目录 —— 地区锁保留时这组必须跟着不打。
+        body = self.src[self.src.index("格斗模式（무투전）解锁（X16 / D82）"):]
+        body = body[:body.index("登录公告")]
+        self.assertLess(body.index("region_lock_disabled()"), body.index("try_patch_mutu_unlock()"))
+        self.assertIn("mutu_lock_kept()", body)
+
+
+class MutuDiagProbeTest(unittest.TestCase):
+    """B2 格斗招式判定体探针（X16，临时）：改的是 `NewMutuSkill` 虚表槽 6，调的是 `0x4f9940`。
+
+    地址 / 特征串写错的话探针要么装不上（日志里 `!!`），要么挂到别的函数上 —— 在这里就钉住。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = c_source()
+        cls.img = load_image()
+
+    def test_the_vtable_slot_points_at_the_update(self):
+        vft = c_define(self.src, "MUTU_SKILL_VFT")
+        slot = c_define(self.src, "MUTU_SKILL_SLOT_UPDATE")
+        update = c_define(self.src, "MUTU_SKILL_UPDATE_VA")
+        self.assertEqual(update, struct.unpack("<I", read_va(self.img, vft + slot * 4, 4))[0])
+        # 同一张虚表的槽 1 是优先级那一格（`0x4f88e6`，§121），拿它确认这真是招式的虚表。
+        self.assertEqual(0x4F88E6, struct.unpack("<I", read_va(self.img, vft + 4, 4))[0])
+
+    def test_the_signatures_match_the_image(self):
+        for va_name, sig_name in (("MUTU_SKILL_UPDATE_VA", "MUTU_UPDATE_SIG"),
+                                  ("MUTU_ANIM_FRAME_VA", "MUTU_ANIM_FRAME_SIG")):
+            sig = c_byte_array(self.src, sig_name)
+            self.assertEqual(sig, read_va(self.img, c_define(self.src, va_name), len(sig)), sig_name)
+
+    def test_the_update_takes_no_stack_arguments(self):
+        """探针用 `__fastcall(self, edx)` 转调 —— 只有「thiscall、无栈参」才对得上：函数尾是裸 `ret`（`0x4f88e5`）。"""
+        self.assertEqual(b"\xc3", read_va(self.img, 0x4F88E5, 1))
+
+    def test_it_is_off_unless_asked(self):
+        body = self.src[self.src.index("static int mutu_diag_enabled(void)"):]
+        body = body[:body.index("}")]
+        self.assertIn("return 0;", body)
+        self.assertIn('"BSHOOK_MUTU_DIAG"', body)
+
+
 if __name__ == "__main__":
     unittest.main()

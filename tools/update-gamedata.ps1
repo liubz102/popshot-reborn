@@ -1,14 +1,15 @@
 ﻿<#
     update-gamedata.ps1 —— 一键重跑**全部**原版数据的提取（D53）
 
-        [1/5] 地形数据   server\bot_mapdata\        tools\mapdata.py
-        [2/5] 武器表     server\bot_weapons.json    tools\weapondata.py
-        [3/5] 角色属性   server\bot_chrprops.json   tools\chrprops.py
-        [4/5] 物品表     server\shop_items.json     tools\shopdata.py
-        [5/5] 图标图集   server\web\itemicons.*     tools\shopicons.py
+        [1/6] 地形数据   server\bot_mapdata\        tools\mapdata.py
+        [2/6] 武器表     server\bot_weapons.json    tools\weapondata.py
+        [3/6] 角色属性   server\bot_chrprops.json   tools\chrprops.py
+        [4/6] 物品表     server\shop_items.json     tools\shopdata.py
+        [5/6] 图标图集   server\web\itemicons.*     tools\shopicons.py
+        [6/6] 格斗招式   server\bot_mutu.json       tools\mutudata.py   （要 numpy，X_Mod X16 / D84）
 
     这是**唯一**一个更新数据的脚本（以前是五个 update-*.bat，已合并进来）。
-    五份产物都进 git、都进发布包；打包时**不会**自动重跑（D53），
+    六份产物都进 git、都进发布包；打包时**不会**自动重跑（D53），
     只有改了提取器、或者换了一份原版素材，才需要手动跑一次这个。
 
     ★ 每一步都是「提取 + 立刻跑对应的测试」。哪一步不过就停下、后面的不跑
@@ -32,7 +33,7 @@
 #>
 [CmdletBinding()]
 param(
-    # 明文资源树（`tools\pkn.py unpack` 解出来的那种目录）。不给的话，五个提取器各自去
+    # 明文资源树（`tools\pkn.py unpack` 解出来的那种目录）。不给的话，六个提取器各自去
     # 仓库里的 `game_patched\Pack_develop` 找（目录名来自 server/config.py，口径它们自己一致）。
     [string]$Pack
 )
@@ -66,15 +67,27 @@ function Get-PythonWithPillow {
     return $null
 }
 
+function Get-PythonWithNumpy {
+    <# 格斗招式那一步（`tools\mutudata.py` 解骨骼动画）要 numpy。探测写法同上。 #>
+    foreach ($c in @('C:\Python314\python.exe',
+                     (Join-Path $Root 'runtime\python\python.exe'))) {
+        if (-not (Test-Path -LiteralPath $c -PathType Leaf)) { continue }
+        & $c -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('numpy') else 1)"
+        if ($LASTEXITCODE -eq 0) { return $c }
+    }
+    return $null
+}
+
 $py = Get-Python
 if (-not $py) {
     Write-Host '[x] 找不到 Python（试过 C:\Python314 和 runtime\python）' -ForegroundColor Red
     exit 1
 }
 $pyPil = Get-PythonWithPillow
+$pyNp = Get-PythonWithNumpy
 
 # --- 素材指路 ---------------------------------------------------------------
-$packArgs = @{ map = @(); wpn = @(); chr = @(); shop = @(); icon = @() }
+$packArgs = @{ map = @(); wpn = @(); chr = @(); shop = @(); icon = @(); mutu = @() }
 if ($Pack) {
     if (-not (Test-Path -LiteralPath (Join-Path $Pack 'Data\weapon.ini') -PathType Leaf)) {
         Write-Host "[x] $Pack 不像明文资源树（底下没有 Data\weapon.ini）" -ForegroundColor Red
@@ -89,26 +102,30 @@ if ($Pack) {
                        '--weapon-ini',    (Join-Path $data 'weapon.ini'),
                        '--promotion-ini', (Join-Path $data 'Promotion-chn.ini'))
     $packArgs.icon = @('--src', (Join-Path $Pack 'Images\Shop'))
+    $packArgs.mutu = @('--pack', $Pack)
     Write-Host "[*] 素材目录：$Pack" -ForegroundColor DarkGray
 }
 
-# --- 五步 -------------------------------------------------------------------
+# --- 六步 -------------------------------------------------------------------
 $steps = @(
-    [pscustomobject]@{ Label = '[1/5] 地形数据';     Out = 'server\bot_mapdata\'
+    [pscustomobject]@{ Label = '[1/6] 地形数据';     Out = 'server\bot_mapdata\'
                        Tool  = 'mapdata.py';    Args = @('--verify') + $packArgs.map
-                       Test  = 'test_mapdata';       Pil = $false },
-    [pscustomobject]@{ Label = '[2/5] 武器表';       Out = 'server\bot_weapons.json'
+                       Test  = 'test_mapdata';       Pil = $false; Np = $false },
+    [pscustomobject]@{ Label = '[2/6] 武器表';       Out = 'server\bot_weapons.json'
                        Tool  = 'weapondata.py'; Args = $packArgs.wpn
-                       Test  = 'test_weapondata';    Pil = $false },
-    [pscustomobject]@{ Label = '[3/5] 角色属性表';   Out = 'server\bot_chrprops.json'
+                       Test  = 'test_weapondata';    Pil = $false; Np = $false },
+    [pscustomobject]@{ Label = '[3/6] 角色属性表';   Out = 'server\bot_chrprops.json'
                        Tool  = 'chrprops.py';   Args = $packArgs.chr
-                       Test  = 'test_chrprops';      Pil = $false },
-    [pscustomobject]@{ Label = '[4/5] 物品表';       Out = 'server\shop_items.json'
+                       Test  = 'test_chrprops';      Pil = $false; Np = $false },
+    [pscustomobject]@{ Label = '[4/6] 物品表';       Out = 'server\shop_items.json'
                        Tool  = 'shopdata.py';   Args = $packArgs.shop
-                       Test  = 'test_shopdata';      Pil = $false },
-    [pscustomobject]@{ Label = '[5/5] 物品图标图集'; Out = 'server\web\itemicons.png'
+                       Test  = 'test_shopdata';      Pil = $false; Np = $false },
+    [pscustomobject]@{ Label = '[5/6] 物品图标图集'; Out = 'server\web\itemicons.png'
                        Tool  = 'shopicons.py';  Args = $packArgs.icon
-                       Test  = 'test_web_admin';     Pil = $true }
+                       Test  = 'test_web_admin';     Pil = $true;  Np = $false },
+    [pscustomobject]@{ Label = '[6/6] 格斗招式表';   Out = 'server\bot_mutu.json'
+                       Tool  = 'mutudata.py';   Args = $packArgs.mutu
+                       Test  = 'test_mutudata';      Pil = $false; Np = $true }
 )
 
 foreach ($s in $steps) {
@@ -126,6 +143,16 @@ foreach ($s in $steps) {
             exit 1
         }
         $exe = $pyPil
+    }
+    if ($s.Np) {
+        if (-not $pyNp) {
+            Write-Host '[x] 这一步要 numpy，但两个 Python 都没有：' -ForegroundColor Red
+            Write-Host '    C:\Python314\python.exe 和 runtime\python\python.exe' -ForegroundColor Red
+            Write-Host '    装一个：C:\Python314\python.exe -m pip install numpy' -ForegroundColor Yellow
+            Write-Host '    ★ 前面几份已经更新好了，只有格斗招式表没重提（仓库里那份还在，能用）。' -ForegroundColor Yellow
+            exit 1
+        }
+        $exe = $pyNp
     }
 
     $toolArgs = $s.Args
@@ -150,7 +177,7 @@ foreach ($s in $steps) {
     }
 }
 
-# --- 记下「这五份数据对应哪一版明文树」---------------------------------------
+# --- 记下「这六份数据对应哪一版明文树」---------------------------------------
 # tools\build-pack.ps1 用 tools\gamedata-stamp.json 判断要不要重跑本脚本（判据是
 # 明文树的哈希，不是时间戳）。只在提取的就是仓库里那棵树时才记：拿别的目录提取
 # 过的产物不该盖掉这个事实。目录名照旧只问 server/config.py。
@@ -170,13 +197,13 @@ if ($Pack -and $developDir -and (Test-Path -LiteralPath $Pack)) {
 if ($isDefaultTree) {
     & $py (Join-Path $Root 'tools\pkn.py') gamedata-stamp --write
     if ($LASTEXITCODE -ne 0) {
-        Write-Host '[x] 五份都提取好了，但 tools\gamedata-stamp.json 没写成 —— build-pack 会再跑一遍提取。' -ForegroundColor Red
+        Write-Host '[x] 六份都提取好了，但 tools\gamedata-stamp.json 没写成 —— build-pack 会再跑一遍提取。' -ForegroundColor Red
         exit 1
     }
 }
 
 Write-Host ''
-Write-Host '[ok] 五份都提取完了，测试也都过了。' -ForegroundColor Green
+Write-Host '[ok] 六份都提取完了，测试也都过了。' -ForegroundColor Green
 Write-Host '     改了哪些文件看 git status；打包时 Copy-* 会再核一遍条数和 format。'
 Write-Host ''
 Write-Host '     要单独跑某一个、或者看细节，直接调 python：' -ForegroundColor DarkGray
@@ -184,7 +211,8 @@ foreach ($hint in @('tools\mapdata.py --verify Camel00',
                     'tools\weapondata.py --dump 1002010',
                     'tools\chrprops.py --dump 2',
                     'tools\shopdata.py --dump-kind material',
-                    'tools\shopicons.py --check')) {
+                    'tools\shopicons.py --check',
+                    'tools\mutudata.py --dump 0')) {
     Write-Host ("       `"$py`" $hint") -ForegroundColor DarkGray
 }
 exit 0
