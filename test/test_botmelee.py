@@ -904,6 +904,52 @@ class BotPushTests(MeleeFieldRoom):
         self.advance(1)
         self.assertLessEqual(self.alice.sim_body.x, self.bot_conn.body.x - botmove_constraint() + 1.0)
 
+    def test_a_heartbeat_that_contradicts_the_push_lets_her_go(self):
+        """推上之后她报来的心跳落在边界里面、超出一帧能走回的距离 = 她那台没挂上这一推（X_Mod §130 / D92）：
+        服务端这份不再推她、这一下也不再推她。09-27 19:05:04：以前照推不误，她的外推一格一格被拽在 bot 身前、
+        和她自己报的差出几百 px；bot 按这个假位置排下一招再推一发，她那台这回挂上了，她被拽了 393 px。"""
+        swing = self.close_dash()
+        self.advance(2)
+        self.assertIn(self.alice_seat(), swing.carried, "前提：推上了")
+        behind = self.bot_conn.body.x + 60.0              # 它朝左冲，她报在它身后 —— 挂上了的话不可能在这儿
+        self.human_heartbeat(self.alice, behind, self.FLOOR_Y, ticks=0)
+        self.advance(1)
+        self.assertNotIn(self.alice_seat(), swing.carried)
+        self.assertIn(self.alice_seat(), swing.released, "这一下剩下的推挤段不再推她")
+        self.assertGreater(self.alice.sim_body.x, self.bot_conn.body.x, "外推跟着她报的走，不再被拽回它身前")
+
+    def test_a_heartbeat_one_step_inside_the_edge_keeps_the_carry(self):
+        """被推着的人每帧先被推到边界、再走这一帧（`0x4fe20c` 在走路之前）⇒ 报在边界里面一步之内照样算挂着。"""
+        swing = self.close_dash()
+        self.advance(2)
+        edge = int(self.bot_conn.body.x - botmove_constraint())
+        self.human_heartbeat(self.alice, edge + 5.0, self.FLOOR_Y, ticks=0)
+        self.advance(1)
+        self.assertIn(self.alice_seat(), swing.carried)
+
+    def test_without_a_new_heartbeat_the_carry_holds(self):
+        """推上之后还没来过心跳：没有证据，照推（她那台照常是挂上了的）。"""
+        swing = self.close_dash()
+        for _ in range(4):
+            self.advance(1)
+            if self.alice_seat() in swing.carried:
+                break
+        self.assertIn(self.alice_seat(), swing.carried, "前提：推上了")
+        for _ in range(2):
+            self.advance(1)
+            self.assertIn(self.alice_seat(), swing.carried)
+            self.assertLessEqual(self.alice.sim_body.x, self.bot_conn.body.x - botmove_constraint() + 1.0)
+
+    def test_the_push_block_runs_one_frame_past_the_original_ten(self):
+        """挨打后不接受推：原版 10 帧从她那台**收到**这一下之后的那一帧数起 ⇒ 服务端多数一帧（X_Mod §130）。
+        09-27 19:05:04.400 / 06.512：服务端正好第 10 格推、她那台都还拦着，没挂上。"""
+        t = self.now()
+        bot._release_carry(self.room, self.alice_seat(), t)
+        frame = bot.BOT_DASH_FRAME_MS / 1000.0
+        self.assertAlmostEqual(t + 11 * frame, self.alice.push_block_until)
+        self.assertFalse(bot._may_push(self.room, self.alice_seat(), t + 10 * frame))
+        self.assertTrue(bot._may_push(self.room, self.alice_seat(), t + 11 * frame))
+
 
 class BotPushMobTests(MeleeFieldRoom):
     """怪也推得动（`0x0017` 的受约束对象填怪的句柄，控制者那台照推，X_Mod §115）—— 2026-08-30「怪都贴脸了 bot 都不冲」那条别回来。"""

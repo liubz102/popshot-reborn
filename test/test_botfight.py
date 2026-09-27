@@ -1117,6 +1117,65 @@ class BotRetractTimingTests(FightActRoom):
         self.assertGreater(xs[n + 2], xs[n + 1], "第 2 格走得动了")
 
 
+def constrain_frames(conn, seat):
+    """bot 发出去的 `0x0017`：`[(受约束对象句柄, 出招者句柄)]`。"""
+    return [__import__("struct").unpack("<ii", body_of(f)) for f in bot_frames(conn, seat)
+            if header(f)["opcode"] == botsync.OP_CONSTRAIN]
+
+
+class BotPushDesyncTests(FightActRoom):
+    """09-27 19:05:04 用户报的「瞬移」（X_Mod §130 / D92）：卡希尔 K00 朝右出，她站在它左后方 11 px，推挤体照样碰得到 → 替它发
+    `0x0017`；她那台没挂上、她照走她的（往左跑远了）。以前服务端照推不误，每格把她的外推拽回 bot 右边 35 px；K00 一收接出 P00，
+    推挤体碰上这个假位置又推一发 —— 她那台这回挂上了，她从 584 被拽到 977。这里 bot 是泰尔（没有 K00），拿同样朝前冲的 K01 演。"""
+
+    def setUp(self):
+        super().setUp()
+        self.bot_conn.fight_press_at = 1e18             # AI 不按键：招式由用例自己出
+        self.alice_at(589.0, ticks=1)                  # bot 在 600，她在它左后方 11 px
+
+    def pushed_by_heavy(self):
+        skill = self.start("MutuStand-K01", facing=1)
+        self.assertTrue(self.until(lambda: self.alice_seat in skill.carried, 4), "前提：推挤体碰到了她")
+        return skill
+
+    def test_her_heartbeats_win_over_a_push_she_did_not_take(self):
+        skill = self.pushed_by_heavy()
+        self.alice_at(570.0, ticks=1)                  # 她那台没挂上：照往左走
+        self.assertNotIn(self.alice_seat, skill.carried)
+        self.assertIn(self.alice_seat, skill.released)
+        self.assertLess(self.alice.sim_body.x, 600.0, "外推跟着她报的走，不在 bot 右边")
+
+    def test_until_her_next_heartbeat_the_push_holds(self):
+        """推上那一刻已经到了的心跳（她还在它身后）不算证据：推上之后她那台还没来过心跳，就照原版推她到 bot 身前。"""
+        skill = self.pushed_by_heavy()
+        self.advance(2)
+        self.assertIn(self.alice_seat, skill.carried)
+        self.assertGreaterEqual(self.alice.sim_body.x,
+                                int(self.bot_conn.body.x + bot.botmotion.CONSTRAINT_DISTANCE) - 1.0)
+
+    def test_one_step_inside_the_edge_still_counts_and_more_does_not(self):
+        """她那台每帧先把她推到边界、再走这一帧（`0x4fe20c` 在走路之前）⇒ 报在边界里面一步之内照样算挂着；远了就不算。"""
+        skill = self.pushed_by_heavy()
+        edge = int(skill.carry_seen[self.alice_seat][1] + bot.botmotion.CONSTRAINT_DISTANCE)   # 推上以来最宽松的边
+        self.alice_at(edge - 5.0, ticks=1)
+        self.assertIn(self.alice_seat, skill.carried, "差 5 px：她这一帧走回来的")
+        reach = bot._human_frame_reach(self.room, self.alice_seat, self.alice, self.alice.sync_trail[-1], self.now())
+        self.alice_at(edge - reach - 2.0, ticks=1)
+        self.assertNotIn(self.alice_seat, skill.carried, "差出一步以上：她那台没挂着")
+
+    def test_the_next_skill_does_not_push_her_from_afar(self):
+        skill = self.pushed_by_heavy()
+        x = 570.0
+        while self.bot_conn.fight_skill is skill:      # 她一路往左跑，每 4 格一发心跳
+            self.alice_at(x, ticks=4)
+            x -= 30.0
+        self.alice.sent.clear()
+        self.start("MutuStand-P00", facing=1)           # 19:05:03.984 那一招
+        self.advance(6)
+        self.assertEqual([], constrain_frames(self.alice, self.bot_seat),
+                         "她在老远：不再替 bot 推她（以前这一发把她拽了 393 px）")
+
+
 class BotLimbTests(BotStrikeRoom):
     """真人打中 bot 伸出去的手脚：包里受害者是那个受击体的句柄（`0x480f06`），服务端映射回 bot（`0x4f9a4b`）。"""
 

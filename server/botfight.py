@@ -313,7 +313,7 @@ class BotSkill(object):
     """
 
     __slots__ = ("skill", "facing", "base", "air", "k", "elapsed", "stop_left",
-                 "stepped", "hit", "carried", "released", "queued")
+                 "stepped", "hit", "carried", "released", "carry_seen", "queued")
 
     def __init__(self, skill, facing, base, air=False):
         self.skill = skill
@@ -331,6 +331,8 @@ class BotSkill(object):
         #: 推挤体推着的人（`{座位号: 第几帧贴上的}`，替它发过 `0x0017` 的）/ 被推着反手推人挣脱了的（同 `DashSwing`）。
         self.carried = {}
         self.released = set()
+        #: 推上真人时他最新那发心跳的序号 + 出招者推上以来最宽松的位置（`bot._carry_confirmed`，X_Mod §130）。
+        self.carry_seen = {}
         #: 接招窗口里排好的下一招（`mutudata.Skill`）；播完那一格出它，没排就发收招。
         self.queued = None
 

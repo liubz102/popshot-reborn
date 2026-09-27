@@ -11841,7 +11841,7 @@ class DashSwing(object):
 
     __slots__ = ("handle", "born", "direction", "move", "character_id",
                  "frames_done", "hit", "outranked", "lunge", "origins",
-                 "pushes_done", "carried", "released")
+                 "pushes_done", "carried", "released", "carry_seen")
 
     def __init__(self, handle, born, direction, move, character_id, lunge=False):
         self.handle = int(handle)
@@ -11869,6 +11869,9 @@ class DashSwing(object):
         #: 被推着的时候**自己反手推了人**、从这一下里挣脱的（`_release_pusher`，X_Mod §116 / D81）：这一下剩下的推挤段
         #: 不再推他 —— 他那台贴着就每帧重发 `0x0017`（BSM1 不给 bot 挂约束），推回去就是一格一格来回拽。
         self.released = set()
+        #: 推上真人那一刻他最新那发心跳的序号、和出招者推上以来最宽松的位置（`{座位号: (序号, x)}`，`_carry_confirmed`）：
+        #: 之后他每来一发心跳就核一次他那台挂没挂上这一推（X_Mod §130 / D92）。
+        self.carry_seen = {}
 
     def frame_at(self, now):
         # 房间那一格的时刻是 `t0 + k × 32 ms` 的浮点数，两格相减常差一个 ulp（3.9999… 截成 3）—— 补一点浮点噪声再截断，
@@ -12046,7 +12049,12 @@ def _bot_dash_first_frame(terrain, body, swing):
 
 
 #: ★ 挨打之后多少帧里不接受新的推（`[+0x17c]`：`OnHit` 解约束时起的计时器，X_Mod §111）。原版数据，不是我们挑的数。
+#: （拦推的其实是同一刻写下的 `[+0x168]` = 10：击退尾巴 `0x50f954` 写、每帧 `0x50e73e` 减、非 0 时 `0x50e636` 拒挂约束，X_Mod §130。）
 PUSH_BLOCK_FRAMES = 10
+#: ★ 他那台从**收到**这一发伤害之后的那一帧才开始数这 10 帧，服务端的格子和他的帧差着不到一帧的相位、两发包的路上还有几毫秒抖动
+#: ⇒ 服务端正好在第 10 格推，常常落在他那台被拦的最后一帧里（09-27 19:05:04.400 / 06.512 两发都是「挨打后正好 320 ms」推、他那台没挂上）。
+#: 多数一帧，第一发推一定落在他那台放开之后。这一帧补的是**相位**，不是等延迟的阈值。
+PUSH_BLOCK_PHASE_FRAMES = 1
 
 
 def _carrier_of(room, key):
@@ -12095,6 +12103,7 @@ def _dash_push(room, machine, swing, start, end, frame, bodies, now):
         if _dash_sweep(room, swing, start, end, frame, [body]) is None:
             continue
         swing.carried[key] = frame
+        _note_carry(room, machine, swing, key)
         victim = (key[1] if isinstance(key, tuple)
                   else botsync.character_handle(key))
         _emit(machine, machine.sync.event(
@@ -12121,8 +12130,8 @@ def _release_carry(room, key, now):
     seat = room.seats[key] if 0 <= key < len(room.seats) else None
     conn = None if seat is None else seat.conn
     if conn is not None and not isinstance(conn, BotConn):
-        conn.push_block_until = (now + PUSH_BLOCK_FRAMES * BOT_DASH_FRAME_MS
-                                 / 1000.0)
+        conn.push_block_until = (now + (PUSH_BLOCK_FRAMES + PUSH_BLOCK_PHASE_FRAMES)
+                                 * BOT_DASH_FRAME_MS / 1000.0)
 
 
 def _release_pusher(room, key):
@@ -12143,18 +12152,75 @@ def _release_pusher(room, key):
                 f"他挣脱了，这一下不再推着他走（句柄 {swing.handle}，X_Mod §116 / D81）")
 
 
-def _carry_victims(room, machine, terrain):
+def _note_carry(room, machine, swing, key):
+    """替 bot 推上一个真人（发了 `0x0017`）：记下他此刻最新那发心跳的序号、出招者站的地方 —— 之后他来的每一发心跳都拿来核
+    「他那台挂没挂上」（`_carry_confirmed`，X_Mod §130）。怪不记（控制者那台的 `setState` 每发都盖回来，没有这个问题）。"""
+    if isinstance(key, tuple) or machine.body is None:
+        return
+    seat = room.seats[key] if 0 <= key < len(room.seats) else None
+    conn = None if seat is None else seat.conn
+    swing.carry_seen[key] = (getattr(conn, "sync_trail_seq", None), machine.body.x)
+
+
+def _human_frame_reach(room, index, conn, point, now):
+    """他一帧最多能挪多远（px）：按着冲刺跑那一帧交给走路例程的路程（`0x5074ef`，装备走速、状态倍率照算）和心跳里报的
+    腾空速度，取大的，+1 抵心跳坐标的截断。被推着的人每帧先被推到边界（`0x4fe20c`，在走路之前），这一帧再往回走也就这么多。"""
+    who = chrprops.get(_seat_shape(room, index, now))
+    walk = abs(botmove.walk_distance(who, 1, fast_run=True, scale=_speed_scale(conn, now),
+                                     bonus=getattr(conn, "sim_walk_bonus", 0) or 0))
+    return max(walk, abs(float(point[4]))) + 1.0
+
+
+def _carry_confirmed(room, machine, swing, key, conn, owner_x, now):
+    """推上之后他来的每一发心跳，核他那台挂没挂上这一推（X_Mod §130 / D92）。还挂着返回 True。
+
+    他那台挂上了的话，每帧先被推到出招者朝向那一侧 `CONSTRAINT_DISTANCE` 外（`0x50e654`，单边），报出来的位置最多再往回
+    走一帧（`_human_frame_reach`）；落在边界里面更远 ⇒ 他那台根本没挂上（被 `[+0x168]` 拒了，或别的原因）或早解了。
+    以前服务端不管，照推不误：每格把他的外推拽回 bot 身前，心跳一到硬置回去、下一格又拽回来 —— bot 按这个假位置排下一招、
+    再推一发，他那台这回挂上了，他就被从 584 拽到 977（09-27 19:05:04，用户报的「瞬移」）。
+
+    * 心跳是他那台的实话：推上之后来过的心跳才算证据；推上那一刻已经到了的（序号没变）不算，没新心跳就先照推；
+    * 出招者这一段往前挪、他那台看到的它晚一点 ⇒ 边界按推上以来**最宽松**的位置算（朝右取最小、朝左取最大）；
+    * 推上那一刻之后、他那台收到这一发之前发出的心跳也会被判成「没挂上」—— 那只是这一下不再替他推（外推照心跳走），
+      他那台真挂上了的话下一发心跳报的就是被推过的位置，不会错得离谱。
+    """
+    seen = swing.carry_seen.get(key)
+    if seen is None:
+        return True
+    mark0, lenient = seen
+    side = 1 if swing.direction >= 0 else -1
+    lenient = min(lenient, owner_x) if side > 0 else max(lenient, owner_x)
+    swing.carry_seen[key] = (mark0, lenient)
+    trail = getattr(conn, "sync_trail", None)
+    mark = getattr(conn, "sim_body_mark", None)
+    if not trail or mark == mark0:
+        return True
+    point = trail[-1]
+    boundary = int(lenient + side * botmotion.CONSTRAINT_DISTANCE)
+    gap = side * (int(point[0]) - boundary)
+    if gap >= -_human_frame_reach(room, key, conn, point, now):
+        swing.carry_seen[key] = (mark, lenient)
+        return True
+    what = "这一下冲刺" if isinstance(swing, DashSwing) else swing.skill.name
+    machine.log(f"   推挤: 座位{key} 推上之后报在 x={int(point[0])}，离边界 {boundary} 还差 {-gap} px —— 他那台没挂上这一推"
+                f"（{what}），不再推着他、这一下也不再推他（X_Mod §130 / D92）")
+    return False
+
+
+def _carry_victims(room, machine, terrain, now=None):
     """被这个 bot 的推挤段贴住的人 / 怪，每格推到它朝向那一侧（`0x50e654` = `botmotion.constrained_x`，单边，X_Mod §115）。
 
-    真人推的是服务端外推的那份身体（他自己那台也挂着同一个约束、照它的位置推，下一发心跳报的就是被推过的）；
+    真人推的是服务端外推的那份身体（他自己那台也挂着同一个约束、照它的位置推，下一发心跳报的就是被推过的）——
+    ★ 前提是他那台真挂上了：推上之后他报来的心跳和「被推着」对不上，就放掉他（`_carry_confirmed`，X_Mod §130）。
     怪推的是怪物表里那一格（控制者那台也在推，下一发 `setState` 报来的位置照样盖回来）。躺下的、表里没了的放掉。
     """
+    now = _now() if now is None else now
     for swing in (machine.dash_swing, machine.fight_skill):
         if swing is not None and swing.carried and machine.body is not None:
-            _carry_victims_of(room, machine, terrain, swing)
+            _carry_victims_of(room, machine, terrain, swing, now)
 
 
-def _carry_victims_of(room, machine, terrain, swing):
+def _carry_victims_of(room, machine, terrain, swing, now):
     """`_carry_victims` 的一下（冲刺或格斗招式）：推到出招者朝向那一侧。"""
     owner_x = machine.body.x
     quest = getattr(room, "quest", None)
@@ -12171,6 +12237,10 @@ def _carry_victims_of(room, machine, terrain, swing):
         conn = None if seat is None else seat.conn
         if conn is None or _lying_dead(room, key):
             swing.carried.pop(key, None)
+            continue
+        if not _carry_confirmed(room, machine, swing, key, conn, owner_x, now):
+            swing.carried.pop(key, None)
+            swing.released.add(key)
             continue
         body = getattr(conn, "sim_body", None)
         if body is None or terrain is None:
@@ -12690,6 +12760,7 @@ def _fight_push(room, machine, seat_index, skill, bodies, now):
         if _fight_touch(room, victim, px, py, botfight.PUSH_RADIUS, now, limbs=False) is None:
             continue
         skill.carried[key] = skill.k
+        _note_carry(room, machine, skill, key)
         handle = key[1] if isinstance(key, tuple) else botsync.character_handle(key)
         _emit(machine, machine.sync.event(
             botsync.OP_CONSTRAIN,
@@ -13447,7 +13518,7 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         from_trail = point is None
         if not from_trail:
             # ★ 它的推挤段贴住的人 / 怪，推到它这一格挪完之后的身前（`0x50e654`，X_Mod §115 / D80）。
-            _carry_victims(room, machine, terrain)
+            _carry_victims(room, machine, terrain, now)
         if from_trail:
             machine.move_down = False
             rank = room.bot_seats().index(seat_index) + 1
