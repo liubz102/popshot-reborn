@@ -1092,6 +1092,25 @@ def blocked(terrain, body, character, direction, fast_run=False,
         current = nxt
 
 
+def hold_down(terrain, body, character, crouched=False, see=None):
+    """站着**按住 ↓** 两格之后的身体：第一格末 `[+0x518] = 8`，第二格起脚下的白线不挡（X_Mod §105）。
+
+    返回的身体离地了 = 这儿穿得下去；还踩着地 = 脚下是实心（值 2）/ 白线底下紧贴着实心，按多少下都是站着。
+    ★ 两格**都按着**，因为执行那一侧就是这么按的：路线上「按 ↓」那一步的意图一握 `BOT_DECISION_TICKS` 格，
+      离地之前一直按着（`bot._route_intent`）。「按一下就松」的模型会把站在弹跳台上的那一格记成能穿 ——
+      按一下只挡住台子一格、松开那格台子照弹；执行时一直按着 ↓，台子永远不弹，人就站着（X_Mod §136）。
+    ★ 规划（`botnav._drop_edge`）和执行（`bot._drop_lean`）问的必须是同一句。
+    `see` 给了就把这两格身体都报给它（可达图记足迹用）。
+    """
+    current = body
+    for _ in range(2):
+        current = tick(terrain, current, character, crouched=crouched,
+                       want_drop=True)
+        if see is not None:
+            see(current)
+    return current
+
+
 def leaves_ground(terrain, body, character, direction, fast_run=False,
                   crouched=False, speed_scale=1.0):
     """朝 `direction` 走一步会不会**踩空**（走出崖边）。"""

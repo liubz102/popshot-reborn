@@ -380,6 +380,17 @@ class DropThroughTests(unittest.TestCase):
         self.assertTrue(body.on_ground)
         self.assertEqual(104.0, body.y)
 
+    def test_hold_down_tells_whether_this_spot_drops(self):
+        """`hold_down` 是规划（`botnav._drop_edge`）和执行（`bot._drop_lean`）共用的那一句（X_Mod §136）：
+        白线上按住第二格就离地，实心上还踩着地；两格身体都报给 `see`（可达图记足迹）。"""
+        t = self.one_way()
+        who = Dummy(4.0)
+        seen = []
+        self.assertFalse(botmove.hold_down(t, botmove.Body(20.0, 89.0), who,
+                                           see=seen.append).on_ground)
+        self.assertEqual(2, len(seen))
+        self.assertTrue(botmove.hold_down(t, botmove.Body(20.0, 104.0), who).on_ground)
+
     def test_ice_right_under_the_line_catches_the_feet(self):
         """白线底下紧贴着冰（V0.3 §136，`Iceria00` 的窟窿）：脚沉进白线那一行、踩在冰上，进不了冰。"""
         t = self.one_way(below="3")
@@ -695,6 +706,16 @@ class JumpPadTests(unittest.TestCase):
         terrain = self.pad_map([])
         self.assertIsNone(botmove.jump_pad_launch(terrain, botmove.Body(30.0, 499.0),
                                                   chrprops.get(0)))
+
+    def test_holding_down_on_it_is_not_a_drop(self):
+        """★★ 站在台上按住 ↓：台子一直被挡着，人不离地 —— 不是「穿得下去」（X_Mod §136）。
+        按一下就松的话松开那帧台子照弹，以前的 ↓ 边就是这么把台子记成「能穿」的，执行时一直按着 ↓，人就站着。"""
+        terrain = self.pad_map([[30, 499, 0.0, -300.0]])
+        who = chrprops.get(0)
+        body = botmove.Body(30.0, 499.0)
+        self.assertTrue(botmove.hold_down(terrain, body, who).on_ground)
+        pressed_once = botmove.tick(terrain, botmove.tick(terrain, body, who, want_drop=True), who)
+        self.assertTrue(pressed_once.pad, "夹具自检：按一下就松，松开那帧台子照弹")
 
 
 class BodyTests(unittest.TestCase):

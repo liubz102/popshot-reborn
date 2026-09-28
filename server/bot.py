@@ -6843,7 +6843,14 @@ def _route_intent(machine, terrain, who, spot, hold_at_breakable=False):
     if step.action in (botnav.ACTION_JUMP, botnav.ACTION_DOUBLE_JUMP):
         return (step.direction, True, False, step.fast_run)
     if step.action == botnav.ACTION_DROP:
-        return (0, False, True, False)
+        # 按住 ↓，第二格脚下的白线就不挡了（X_Mod §105）。
+        # ★ 站在实心上按 ↓ 什么都不会发生 —— 按着 ↓ 挪回白线上（`_drop_lean`，X_Mod §136）；
+        #   一条步行边以内都没有白线 = 这条路从这儿走不通。
+        lean = _drop_lean(machine, terrain, body, step)
+        if lean is None:
+            _clear_navigation(machine, failed=_nav_signature(terrain, body, spot))
+            return None
+        return (lean, False, True, False)
     if step.action == botnav.ACTION_PAD:
         # 人站在台上、什么都不按，下一格台子就把它弹出去（§99）。
         # ★ 踩偏了先朝台子中心挪一步（`_pad_lean`，X_Mod §135）；这一层根本踩不中台子 = 这条路从这儿走不通。
@@ -6879,6 +6886,49 @@ def _pad_lean(machine, terrain, body):
     if botmove.jump_pad_launch(terrain, over, shape, crouched=crouched) is None:
         return None
     return 1 if pad[0] > body.x else -1
+
+
+def _drop_lean(machine, terrain, body, step):
+    """路线走到「按 ↓ 穿白线」那一步时这一格往哪边走（↓ 一直按着）：`0` = 就地按（下一格就穿下去）、
+    `±1` = 按着 ↓ 朝最近那段白线走、`None` = 一条步行边以内都没有穿得下去的白线（X_Mod §136）。
+
+    ★ 规划那一侧的 ↓ 边是在起点那一格上模拟出来的，执行这一侧有两处会让人站到别处去按：
+      ① 单子按**递单那一刻**的位置算（`botplan.Ticket.matches` 放行一条步行边以内的挪动），算好之前兜底照常走 ——
+         用户 2026-09-28 00:44 `Forest_b`：bot 在斜白线 (848, 418) 上递的单，答案回来时已往左走了 6 格、上了实心坡
+         (820, 398)，按着 ↓ 站了 38 秒，直到他挪了位置、路线换掉才动；
+      ② 「走到了」允许差 ±8 px（`botnav.step_reached`）—— 七张图实测 18%~77% 的 ↓ 边起点左右 8 px 里有实心。
+      实心上按 ↓ 人不离地 ⇒ `nav_started` 不置、落点永远够不着，这一步就永远走不完。真人按了没掉下去也是挪回白线上再按。
+    ★ 挪的时候 ↓ **一直按着**：按着 ↓ 计数器就一直 > 0（`[+0x518]`，X_Mod §105），脚一踩上白线当格就穿 ——
+      意图要握 `BOT_DECISION_TICKS` 格，只挪不按的话窄白线会一步走过头、下一格再折回来。
+    ★ 找多远 = 一条步行边（`botnav.WALK_TICKS` 格，图自己的空间分辨率，`Ticket.matches` 放行的也是这么远）：
+      再远就不是这条路线的第一条边了，作废重算。
+    ★ 判据是物理：用 `_own_step()` 真跑的形状 / 蹲姿 / 走速逐格走，每格问 `botmove.hold_down()`（和规划同一句）；
+      走出崖边、撞墙的那一侧不找。两侧一样近时先挪向这条边落点那一侧（竖直掉下去的边，起点就在落点正上方）。
+    """
+    shape = _live_shape(machine)
+    crouched = bool(machine.dodge_crouch)
+    if not botmove.hold_down(terrain, body, shape, crouched=crouched).on_ground:
+        return 0
+    scale = _speed_scale(machine, _now())
+    if scale == 0.0:
+        scale = 1.0                 # 冻住只是这几格不读键（`_own_step`），往哪边挪照常问
+    first = 1 if step.x > body.x else -1
+    best = None
+    for direction in (first, -first):
+        current = body
+        for used in range(1, botnav.WALK_TICKS + 1):
+            if best is not None and used >= best[0]:
+                break
+            nxt = botmove.tick(terrain, current, shape, direction=direction,
+                               crouched=crouched, speed_scale=scale)
+            if not nxt.on_ground or (nxt.x == current.x and nxt.rest == 0.0):
+                break               # 走出崖边 / 撞墙
+            current = nxt
+            if not botmove.hold_down(terrain, current, shape,
+                                     crouched=crouched).on_ground:
+                best = (used, direction)
+                break
+    return None if best is None else best[1]
 
 
 def _live_shape(machine):

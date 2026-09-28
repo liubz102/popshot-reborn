@@ -12109,6 +12109,126 @@ class BotJumpPadRouteTests(TerrainMixin, BotFireRoom):
                       % (self.bot_conn.body.x, self.bot_conn.body.y))
 
 
+class BotDropRouteTests(TerrainMixin, BotFireRoom):
+    """★★★★★ 路线的「按 ↓ 穿白线」那一步，人却站在实心上（X_Mod §136）。
+
+    用户 2026-09-28 00:44 `Forest_b`：「bot 站住不动，像是卡住了，直到我动了它才动。」
+    bot 在斜白线 (848, 418) 上递的规划单，第一步是「就地按 ↓」；答案回来时兜底已经带它往左走了 6 格、
+    上了实心坡 (820, 398)（`Ticket.matches` 放行一条步行边以内的挪动）。实心上按 ↓ 什么都不发生，
+    人不离地 ⇒ 这一步永远走不完，按着 ↓ 站了 38 秒，直到他挪了位置、路线换掉。
+    「走到了」允许差 ±8 px 也会把人停在白线旁边的实心上（七张图 18%~77% 的 ↓ 边起点附近有实心）。
+    """
+
+    #: 这一步的落点：从白线上 (320, 199) 竖直掉到地上。
+    DROP = (320.0, 379.0)
+
+    def ledge_room(self):
+        """地面（脚在 y=379）+ 半空一块实心台子 x∈[100,300)、右边接一条白线 x∈[300,500)（台面上脚都在 y=199）。"""
+        rows = []
+        for y in range(420):
+            row = []
+            for x in range(700):
+                if y >= 380 or (100 <= x < 300 and 200 <= y < 240):
+                    row.append("2")
+                elif 300 <= x < 500 and y == 200:
+                    row.append("1")
+                else:
+                    row.append("0")
+            rows.append("".join(row))
+        return self.install_terrain(mapdata.MapTerrain(make_record(rows)))
+
+    def force_no_shot(self):
+        original = bot._fire_target
+        bot._fire_target = lambda *_args, **_kwargs: None
+        self.addCleanup(setattr, bot, "_fire_target", original)
+
+    def who(self):
+        return bot._live_shape(self.bot_conn)
+
+    def drop_step(self):
+        return botnav.Step(botnav.ACTION_DROP, self.DROP[0], self.DROP[1], 0, False, 20.0)
+
+    def test_on_the_line_it_presses_down_in_place(self):
+        """白线上照旧：站住按 ↓（和规划的 ↓ 边问同一句 `botmove.hold_down`）。"""
+        terrain = self.ledge_room()
+        self.place_bot(320.0, 199.0)
+        self.assertFalse(botmove.hold_down(terrain, self.bot_conn.body, self.who()).on_ground,
+                         "夹具自检：白线上按 ↓ 下一格就离地")
+        self.bot_conn.nav_path = [self.drop_step()]
+        self.bot_conn.nav_goal = (150.0, 379.0)
+        intent = bot._route_intent(self.bot_conn, terrain, self.who(), (150.0, 379.0))
+        self.assertEqual((0, False, True, False), intent)
+
+    def test_on_solid_ground_beside_the_line_it_walks_onto_it_holding_down(self):
+        """★★★ 实心上按 ↓ 没用：按着 ↓ 朝白线挪（按着计数器一直 > 0，脚一踩上白线当格就穿）。"""
+        terrain = self.ledge_room()
+        self.place_bot(290.0, 199.0)
+        self.assertTrue(botmove.hold_down(terrain, self.bot_conn.body, self.who()).on_ground,
+                        "夹具自检：实心上按 ↓ 人不离地")
+        self.bot_conn.nav_path = [self.drop_step()]
+        self.bot_conn.nav_goal = (150.0, 379.0)
+        intent = bot._route_intent(self.bot_conn, terrain, self.who(), (150.0, 379.0))
+        self.assertEqual((1, False, True, False), intent,
+                         "白线在右边：按着 ↓ 往右挪（以前是原地按 ↓，永远站着）")
+        self.assertTrue(self.bot_conn.nav_path, "路线照旧留着")
+
+    def test_no_line_within_one_walk_edge_drops_the_route(self):
+        """一条步行边以内都没有白线 = 这条路从这儿走不通：作废，同一组空间事实下不马上重递单（同 `_pad_lean`）。"""
+        terrain = self.ledge_room()
+        self.place_bot(120.0, 199.0)
+        self.bot_conn.nav_path = [self.drop_step()]
+        self.bot_conn.nav_goal = (150.0, 379.0)
+        self.assertIsNone(bot._route_intent(self.bot_conn, terrain, self.who(), (150.0, 379.0)))
+        self.assertEqual([], self.bot_conn.nav_path)
+        self.assertIsNotNone(self.bot_conn.nav_failed)
+
+    def test_it_gets_down_instead_of_standing_there(self):
+        """★★★★ 端到端：人在下面站着不动，bot 带着一条「就地按 ↓」的路线站在白线旁边的实心上 —— 几发心跳内下来。"""
+        self.ledge_room()
+        self.force_no_shot()
+        self.place_bot(290.0, 199.0)
+        self.bot_conn.nav_path = [self.drop_step()]
+        self.bot_conn.nav_goal = (150.0, 379.0)
+        for _ in range(10):
+            self.beats(1, 150.0, 379.0)
+            body = self.bot_conn.body
+            if body.on_ground and body.y > 300.0:
+                break
+        else:
+            self.fail("10 发心跳还在台子上，停在 (%.0f, %.0f)"
+                      % (self.bot_conn.body.x, self.bot_conn.body.y))
+
+    def test_the_real_forest_b_stale_drop_route(self):
+        """★★★★ 原样复现 00:44：在斜白线 (848, 418) 上递单，答案回来时人已经走上实心坡 (820, 398)。"""
+        terrain = mapdata.load("Forest_b")
+        if terrain is None:
+            self.skipTest("没有 Forest_b 的地形产物")
+        self.install_terrain(terrain)
+        self.force_no_shot()
+        spot = (478.0, 694.0)
+        self.place_bot(848.0, 418.0)
+        bot._clear_navigation(self.bot_conn)
+        self.bot_conn.frame_seq = 1
+        bot._walk_to(self.room, self.bot_conn, terrain, spot, False)
+        self.assertTrue(bot._plan_pending(self.bot_conn), "夹具自检：单子该递出去了")
+        self.assertTrue(botplan.PLANNER.settle())
+        self.place_bot(820.0, 398.0)                 # 单子在算的那几格，兜底带它往左走上了实心坡（实机 6 格）
+        self.bot_conn.frame_seq = 2
+        intent = bot._walk_to(self.room, self.bot_conn, terrain, spot, False)
+        self.assertTrue(self.bot_conn.nav_path, "夹具自检：旧起点算的那条路线该被收下")
+        self.assertEqual(botnav.ACTION_DROP, self.bot_conn.nav_path[0].action,
+                         "夹具自检：它的第一步是在 (848, 418) 就地按 ↓")
+        self.assertEqual((1, False, True, False), intent, "按着 ↓ 往右挪回白线")
+        for _ in range(10):
+            self.beats(1, spot[0], spot[1])
+            body = self.bot_conn.body
+            if body.on_ground and body.y > 500.0:
+                break
+        else:
+            self.fail("10 发心跳还在上层，停在 (%.0f, %.0f)"
+                      % (self.bot_conn.body.x, self.bot_conn.body.y))
+
+
 class BotFallDownTests(TerrainMixin, BotFrameRoom):
     """★★★ **掉出地图下边界 = 死**（§143）—— `map.ini` 的 `FallDown`。
 

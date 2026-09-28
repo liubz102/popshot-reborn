@@ -328,6 +328,27 @@ class JumpPadRouteTests(unittest.TestCase):
                               if step.action == botnav.ACTION_PAD],
                          "没有台子就不该有台子边")
 
+    def test_standing_on_a_pad_is_not_a_drop_edge(self):
+        """★★ ↓ 边照执行那样**按住** ↓ 模拟（X_Mod §136）：站在台上按住 ↓，台子一直被挡着、人不离地 ⇒ 没有 ↓ 边。
+
+        以前按一下就松，松开那帧台子照弹，台子被记成了一条 ↓ 边；执行那一侧 ↓ 是一直按着的，台子永远不弹 ——
+        路线走到这一步 bot 就按着 ↓ 站在台子上不动。台子自己那条边（什么都不按）照旧在。
+        """
+        # 一块垫高的台面（x∈[150,250)，脚在 849）上放一个往左下弹的台子，落到更低的地面（脚在 879）——
+        # 往上弹的台子落点比起点高，本来就不会被记成 ↓ 边。
+        terrain = terrain_from(["".join("2" if (y >= 880 or (150 <= x < 250 and y >= 850)) else "0"
+                                        for x in range(400)) for y in range(900)],
+                               jump=[(200.0, 850.0, -150.0, -100.0)])
+        onpad = botmove.Body(200.0, 849.0)
+        released = botmove.tick(terrain, botmove.tick(terrain, onpad, self.who, want_drop=True), self.who)
+        self.assertTrue(released.pad, "夹具自检：按一下就松，松开那帧台子照弹")
+        self.assertGreater(botmove.settle(terrain, released, self.who, ticks=200).y, onpad.y,
+                           "夹具自检：弹下去落得比起点低 —— 以前这就是一条 ↓ 边")
+        edges = botnav.neighbors(terrain, onpad, self.who)
+        actions = [step.action for _body, step in edges]
+        self.assertIn(botnav.ACTION_PAD, actions, "台子自己那条边照旧在")
+        self.assertNotIn(botnav.ACTION_DROP, actions, "台子上按住 ↓ 穿不下去")
+
 
 class PlannerTests(unittest.TestCase):
     """★★★ `botplan` —— A* 挪到后台线程之后那套单子机制（§137）。"""

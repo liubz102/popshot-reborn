@@ -342,11 +342,12 @@ def _double_jump_edge(terrain, body, character, trace, direction, fast_run):
 
 
 def _drop_edge(terrain, body, character, trace):
-    """按一下 ↓：这一帧末 `[+0x518] = 8`，**下一帧**起脚下的白线不挡（X_Mod §105）。"""
-    current = botmove.tick(terrain, body, character, want_drop=True)
-    trace.see(current)
-    current = botmove.tick(terrain, current, character)
-    trace.see(current)
+    """按住 ↓：第一帧末 `[+0x518] = 8`，**第二帧**起脚下的白线不挡（X_Mod §105）。
+
+    ★ 离地之前两帧都按着、和执行那一侧（`bot._drop_lean`）问同一句 `botmove.hold_down`（X_Mod §136）：
+      以前按一下就松，站在弹跳台上的那一格也记成了 ↓ 边（松开那帧台子照弹），执行时一直按着 ↓，台子永远不弹。
+    """
+    current = botmove.hold_down(terrain, body, character, see=trace.see)
     if current.on_ground:
         return None
     landed = _finish_air(terrain, current, character, trace)
@@ -772,7 +773,7 @@ def _commands_for_step(terrain, body, character, step):
         push(direction=direction, fast_run=step.fast_run, want_jump=True)
     elif step.action == ACTION_DROP:
         push(want_drop=True)
-        push()                              # 按下的下一帧白线才不挡
+        push(want_drop=True)                # 按住的第二帧白线才不挡（同 `_drop_edge`，X_Mod §136）
     elif step.action == ACTION_PAD:
         push()                              # 先让脚下的台子把人弹起
     else:
