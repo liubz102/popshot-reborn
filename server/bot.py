@@ -700,6 +700,11 @@ class BotConn(gameserver.Conn):
         #: ★ 收招（`0x0016` −1）之后第几格（收招那一格 = 0；走得动了就回 `None`）：真人那台收招后要等回环删招式对象、
         #: 再读一帧方向才走得动（X_Mod §129）—— `botfight.RETRACT_*`。
         self.fight_settle = None
+        #: ★ 欠一发收招（X_Mod §139 / D98）：它的招被打断（`_cancel_melee`）时原版不发收招，先收到打中、后收到出招包的
+        #: 那台客户端会一直留着这一招 ⇒ 挨打那 10 帧（`fight_block_left`）走完补一发（`_pay_fight_retract`）。
+        #: 躺着就当场补（客户端 `Die()` 不删招式对象，躺着的每一格先补、再 `clear_fight()`）；换图 / 新一局作废（角色重建）。
+        #: ★ 不放进 `clear_fight()`：那是本机这一份招式 / 格挡的状态，欠账是「别的客户端上还留着」这件事，只在补掉或角色重建时才了。
+        self.fight_retract_owed = False
         #: 出手反应（D91）：看见机会的那一格起随机等 100~200 ms 才起手（`botfight.Opening`）。
         self.opening = botfight.Opening()
         #: 正被谁的格斗连招压着（`botfight.Pressure`，D94）：能动的那一格决定反击还是跳开；`None` = 没被压着。
@@ -892,6 +897,8 @@ class BotConn(gameserver.Conn):
         # ★ 格斗招式 / 格挡同理：角色重建，招式对象、格挡位全没了，句柄计数器也从头数（`reset_projectiles`）。
         self.clear_fight()
         self.fight_handles.clear()
+        # 欠的那发收招也作废：`Init` 把招式对象那一格清了（`0x4fb7e9`），客户端上已经没有可删的（X_Mod §139）。
+        self.fight_retract_owed = False
         # ★★ 封锁跟着清：新一局 / 换图之后客户端把角色重新放进图里，
         #   那一刻 `Character::Respawn` 又挂一次 2000 ms 的状态 0（§74）。
         #   清成 `None` = 「还没上过锁」，`_tick_bot` 的第一帧会补上。
@@ -967,8 +974,9 @@ class BotConn(gameserver.Conn):
         self.item_weapon_until = None
 
     def clear_fight(self):
-        """格斗招式 / 格挡的本机状态全清（`Character::Reset`：死了、换图、新一局）。**只改状态、不发包** ——
-        那几种场合每台客户端自己就把它的招式对象和格挡位清了。句柄区间（`fight_handles`）不清：他那台可能还晚一点才判。"""
+        """格斗招式 / 格挡的本机状态全清（`Character::Reset`：死了、换图、新一局）。**只改状态、不发包**。
+        格挡位每台客户端自己会清（死了 `0x4ffc50`）；★ 招式对象死了**不清**（`Die()` / 复活都不碰 `[+0x5dc]`，X_Mod §139）——
+        被打断欠下的那发收招另记在 `fight_retract_owed`，这里不动它。句柄区间（`fight_handles`）不清：他那台可能还晚一点才判。"""
         self.fight_skill = None
         self.guard = botfight.GuardState()
         self.fight_press_at = None
@@ -3392,10 +3400,14 @@ def _cancel_melee(room, seat_index, now, source):
                      f"第{swing.frame_at(now)}帧起不再判中（X_Mod §111）")
         skill = conn.fight_skill
         if skill is not None:
-            # ★ 格斗招式同样当场删（`0x50a6f8`，**只删本地、不发收招包** —— 每台收方挨打那一下自己就把它删了，X_Mod §122）；
-            #   排好的下一招跟着没了。
+            # ★ 格斗招式同样当场删（`0x50a6f8`，X_Mod §122）；排好的下一招跟着没了。
+            # ★★ 原版这里只删本地、不发收招 ⇒ 先收到打中、后收到它出招包的那台客户端留下僵尸招式（挡住 UpdateMotion：
+            #   复活后躺着、冲刺动作循环，X_Mod §139）。和 bshook 替真人补的一样（D98）：记下欠一发收招，
+            #   挨打那 10 帧走完补（`_pay_fight_retract`）。
             conn.fight_skill = None
-            conn.log(f"   格斗: {skill.skill.name} 被打断了（{source}）—— 第{skill.k}帧起不再判中，不补收招包（X_Mod §122）")
+            conn.fight_retract_owed = True
+            conn.log(f"   格斗: {skill.skill.name} 被打断了（{source}）—— 第{skill.k}帧起不再判中；"
+                     f"挨打那 10 帧走完补发收招（X_Mod §139 / D98）")
         return
     cut = False
     action = getattr(conn, "motion_action", None)
@@ -3403,7 +3415,8 @@ def _cancel_melee(room, seat_index, now, source):
         conn.motion_action = (action[0], now, action[2])
         cut = True
     if getattr(conn, "mutu_skill", None) is not None:
-        # ★ 格斗招式同样当场删（`0x50a6f8`，只删本地、不发收招包，X_Mod §122）。
+        # ★ 格斗招式同样当场删（`0x50a6f8`，X_Mod §122）。他那台（bshook D98）挨打那 10 帧走完会补一发收招，
+        #   到时 `_note_mutu_skill` 照收招处理 —— 这边已经是 None，没事可做。
         conn.mutu_skill = None
         cut = True
     until = getattr(conn, "jab_until", None)
@@ -13022,6 +13035,24 @@ def _end_fight_skill(machine, skill):
     _emit(machine, packet)
 
 
+def _pay_fight_retract(machine, why):
+    """被打断的那一招补发收招（`0x0016` 类型 −1，招式号 0）—— 和 bshook D98 替真人补的是同一件事（X_Mod §139）。
+
+    原版招被打断时各台只删本地、不发收招（`0x50a6f8`），先收到打中、后收到它出招包的那台就一直留着这一招。
+    活着时在挨打那 10 帧走完的那一格补（`_tick_bot` 里这一格位移之后、`_fight_act` 之前 —— 同真人那台「角色更新 → 格斗管理器」
+    的顺序）：收方处理收招会先把它硬置到包里的坐标、再把动作通道倒带 —— 等那 10 帧走完，每台收方这一下的滑退 / 打飞也走完了，看不出来。
+    躺着就当场补（尸体不会再出招，`DeathA` 本来就是循环播的，倒带看不出来）。
+    ★ 不置 `fight_settle`：这时它手上已经没有招式对象（打断时就删了），真人补完这一发也照常能走能按（D98）。
+    """
+    machine.fight_retract_owed = False
+    body = machine.body
+    x, y = (body.x, body.y) if body is not None else machine.battle_pos
+    packet, _base = machine.sync.mutu_skill(botsync.MUTU_SKILL_END, machine.heading, 0, x, y)
+    machine.log(f"   格斗: 补发收招（{why}）—— 先收到打中、后收到出招包的那台客户端上留着的那一招就此删掉"
+                f"（X_Mod §139 / D98）")
+    _emit(machine, packet)
+
+
 def _advance_fight(room, machine, seat_index, now):
     """格斗招式 / 格挡的本机时钟走一格（`0x49597e` 那一段 + 招式 Update 的时钟那一半，C3）。
 
@@ -13877,7 +13908,11 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
         _advance_dash(room, machine, now)
         # ★ 格斗招式的本机时钟（C3）：这一格走到第几帧、播完了接下一招还是发收招。判中在走完这一格之后。
         if _lying_dead(room, seat_index):
-            machine.clear_fight()             # 死了招式 / 格挡跟着没了（`Character::Reset`），不发包
+            if machine.fight_retract_owed:
+                # 被打断的招还欠着收招就死了（打死它的那一下多半就是打断它的那一下）：客户端 `Die()` 不删招式对象，
+                # 收包顺序不对的那台上它会一路带过复活 ⇒ 躺着就当场补，不等那 10 帧（X_Mod §139 / D98）。
+                _pay_fight_retract(machine, "躺着")
+            machine.clear_fight()             # 本机这一份招式 / 格挡跟着没了（`Character::Reset`），不发包
         else:
             _advance_fight(room, machine, seat_index, now)
         # ★ 捡来那把枪的额度同理：「15 秒到了」是**时间**决定的事实，
@@ -14193,6 +14228,10 @@ def _tick_bot(room, machine, seat_index, tick, now, behind=0):
                                                      now, terrain))
         # ★★ 格斗模式按 L / J / K（C3，D84 / D88）：格挡、出招、接招窗口里排下一招。排在冲刺前面 —— 够得着就出招，
         #   出招 / 挡着的时候不冲（出招中总闸关着，挡着不读方向键）。发了包这一格补一发心跳（朝向要当格到）。
+        # ★ 招被打断欠下的收招（X_Mod §139 / D98）：挨打那 10 帧走完的那一格补。顺序照真人那台 —— 这一格的滑退 / 位移
+        #   走完（角色更新）之后、挑招出招（格斗管理器 `0x4958eb`）之前：坐标是这一格挪完的，收招排在新招前面。
+        if machine.fight_retract_owed and machine.fight_block_left <= 0:
+            _pay_fight_retract(machine, "挨打那 10 帧走完")
         if _fight_act(room, machine, seat_index, now, acting, held, locked, terrain,
                       tick=tick, turned=turned):
             if behind > 0:

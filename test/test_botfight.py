@@ -809,12 +809,15 @@ class BotStrikeTests(BotStrikeRoom):
                          "播完没排 ⇒ 发收招（−1）")
         self.assertIsNone(self.bot_conn.fight_skill)
 
-    def test_a_hit_on_it_cancels_the_skill_without_a_retract(self):
+    def test_a_hit_on_it_cancels_the_skill_and_owes_one_retract(self):
         self.hit(3.0, (-15.0, -4.5), botfight.HIT_SLIDE)
         self.assertIsNone(self.bot_conn.fight_skill)
-        self.advance(20)
         self.assertEqual([], mutu_frames(self.alice, self.bot_seat, botsync.MUTU_SKILL_END),
-                         "每台收方挨打那一下自己就删了招，不补收招包（`0x50a6f8`）")
+                         "打断那一下不发（原版 `0x50a6f8` 只删本地）")
+        self.advance(20)
+        # ★ 会话 56 改口径（X_Mod §139 / D98）：以前钉的是「不补收招」—— 先收到打中、后收到出招包的那台会一直留着这一招。
+        self.assertEqual(1, len(mutu_frames(self.alice, self.bot_seat, botsync.MUTU_SKILL_END)),
+                         "挨打那 10 帧走完补一发收招（`BotRetractOwedTests`）")
 
 
 class BotStrikeSpacingTests(BotStrikeRoom):
@@ -1242,6 +1245,105 @@ class BotLimbTests(BotStrikeRoom):
         self.assertIsNone(self.bot_conn.fight_skill, "打在它身上：招被打断")
         self.assertIsNotNone(self.bot_conn.fight_react, "滑退 / 锁输入")
         self.assertEqual(mobs, dict(getattr(self.room.quest, "mobs", {}) or {}), "没被当成怪记账")
+
+
+class BotRetractOwedTests(BotStrikeRoom):
+    """X_Mod §139 / D98：bot 的招被打断 —— 原版各台只删本地、不发收招，先收到打中、后收到它出招包的那台客户端会一直
+    留着这一招（复活后躺着、冲刺动作循环）。服务端替它在挨打那 10 帧走完补一发原版收招；躺着就当场补。"""
+
+    PUSH_X = 15.0                                        # alice 在左边：把它往右推 ⇒ 它转向左
+
+    def start_heavy(self):
+        heavy = named(0, "MutuStand-K01")
+        self.bot_conn.fight_press_at = 1e18              # 只看补发：它自己别再按
+        with bot._tick_clock(self.now()):
+            bot._start_fight_skill(self.room, self.bot_conn, self.bot_seat, heavy, 1, self.now(), "单测")
+        return heavy
+
+    def hit_body(self, flags=0):
+        self.alice_sends(botsync.OP_SPLASH_DAMAGED, botsync.splash_body(
+            botsync.projectile_handle(self.alice_seat, 0), botsync.character_handle(self.bot_seat),
+            3.0, 600.0, 360.0, push_x=self.PUSH_X, push_y=-4.5, flags=flags, kind=botfight.HIT_SLIDE))
+
+    def ends(self):
+        return [botsync.parse_mutu_skill(body_of(f))
+                for f in mutu_frames(self.alice, self.bot_seat, botsync.MUTU_SKILL_END)]
+
+    def test_it_pays_one_retract_on_the_tick_the_hit_block_runs_out(self):
+        self.start_heavy()
+        self.hit_body()
+        self.assertIsNone(self.bot_conn.fight_skill, "招被打断")
+        self.assertTrue(self.bot_conn.fight_retract_owed)
+        self.assertEqual([], self.ends(), "打断那一刻不发（原版也不发，要等那 10 帧）")
+        paid_at = None
+        for tick in range(1, 3 * bot.FIGHT_BLOCK_FRAMES):
+            self.advance(1)
+            if paid_at is None and self.ends():
+                paid_at = tick
+                self.assertEqual(0, self.bot_conn.fight_block_left, "补在那 10 帧走完的那一格")
+        self.assertEqual(bot.FIGHT_BLOCK_FRAMES, paid_at)
+        self.assertEqual(1, len(self.ends()), "只补一发")
+        self.assertFalse(self.bot_conn.fight_retract_owed)
+
+    def test_the_retract_is_a_plain_original_one(self):
+        self.start_heavy()
+        self.hit_body()
+        self.assertTrue(self.until(lambda: self.ends(), limit=3 * bot.FIGHT_BLOCK_FRAMES))
+        seat, kind, facing, index, x, y = self.ends()[0]
+        self.assertEqual((self.bot_seat, botsync.MUTU_SKILL_END, 0), (seat, kind, index), "类型 −1、招式号 0（同 `0x495a87`）")
+        self.assertEqual(-1, facing, "朝向照它此刻的：挨打后转向左边的攻击者")
+        body = self.bot_conn.body
+        self.assertEqual((body.x, body.y), (x, y), "坐标是补发那一格它自己的（滑退已经走完）")
+        self.assertGreater(x, 600.0 + 25, "那 10 帧的滑退走完了才发")
+        self.assertIsNone(self.bot_conn.fight_settle, "不置收招后那几格：手上早就没招了，照常能走能按")
+
+    def test_it_goes_out_before_a_new_skill_pressed_on_the_same_tick(self):
+        self.start_heavy()
+        self.hit_body()
+        jab = named(0, "MutuStand-P00")
+
+        def eager(room, machine, seat_index, now, *args, **kwargs):
+            # 一有机会就出招：锁一放开的那一格就按（比真 AI 急，专门撞「同一格」）
+            if machine is self.bot_conn and machine.fight_block_left <= 0 and machine.fight_skill is None:
+                bot._start_fight_skill(room, machine, seat_index, jab, machine.heading, now, "单测")
+                return True
+            return False
+
+        with mock.patch.object(bot, "_fight_act", eager):
+            self.assertTrue(self.until(lambda: self.starts()[1:], limit=3 * bot.FIGHT_BLOCK_FRAMES))
+        kinds = [botsync.parse_mutu_skill(body_of(f))[1] for f in mutu_frames(self.alice, self.bot_seat)]
+        # 头一个出招是 start_heavy 的那一招；之后必须先收招、再出新招 —— 反过来收方会把新招当成它删掉。
+        self.assertEqual([botsync.MUTU_SKILL_START, botsync.MUTU_SKILL_END, botsync.MUTU_SKILL_START], kinds[:3])
+
+    def test_a_lying_bot_pays_right_away(self):
+        self.start_heavy()
+        self.hit_body()
+        body = self.bot_conn.body
+        self.room.quest.arm_respawn_watchdog(self.bot_seat, (body.x, body.y), after=5.0)
+        self.assertGreater(self.bot_conn.fight_block_left, 1)
+        self.advance(1)
+        self.assertEqual(1, len(self.ends()), "躺着不等那 10 帧（`Die()` 不删客户端上的招式对象）")
+        self.assertFalse(self.bot_conn.fight_retract_owed)
+        self.advance(2 * bot.FIGHT_BLOCK_FRAMES)
+        self.assertEqual(1, len(self.ends()), "躺着的每一格不重发")
+
+    def test_no_skill_no_debt(self):
+        self.hit_body()
+        self.assertFalse(self.bot_conn.fight_retract_owed)
+        self.advance(2 * bot.FIGHT_BLOCK_FRAMES)
+        self.assertEqual([], self.ends())
+
+    def test_a_guarded_hit_does_not_break_the_skill(self):
+        self.start_heavy()
+        self.hit_body(flags=bot.EXPLODE_FLAG_GUARD)
+        self.assertIsNotNone(self.bot_conn.fight_skill, "挡住的那一下不打断（`0x4ff4ac`）")
+        self.assertFalse(self.bot_conn.fight_retract_owed)
+
+    def test_a_new_game_forgets_the_debt(self):
+        self.start_heavy()
+        self.hit_body()
+        self.bot_conn.reset_battle_frame()
+        self.assertFalse(self.bot_conn.fight_retract_owed, "换图 / 新一局角色重建，客户端上已经没有可删的")
 
 
 #: 等 bot 举挡最多推几格。单测里真人事件的网格时刻按挂钟对齐（`human_heartbeat` 不走模拟时钟），和房间的模拟时钟差几格、

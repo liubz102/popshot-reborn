@@ -1058,5 +1058,150 @@ class MutuDiagProbeTest(unittest.TestCase):
         self.assertIn('"BSHOOK_MUTU_DIAG"', body)
 
 
+def _rel32_targets(img):
+    """镜像里每一条 E8 / E9 / 0F 8x rel32 的落点（逐字节扫，数据里偶然长得像的也算进来 ——
+    只拿来断言「某个区间里**没有**落点」，多算只会更严）。"""
+    out = []
+    for i in range(len(img) - 6):
+        b = img[i]
+        if b in (0xE8, 0xE9):
+            out.append((IMAGE_BASE + i, IMAGE_BASE + i + 5 + struct.unpack_from("<i", img, i + 1)[0]))
+        elif b == 0x0F and 0x80 <= img[i + 1] <= 0x8F:
+            out.append((IMAGE_BASE + i, IMAGE_BASE + i + 6 + struct.unpack_from("<i", img, i + 2)[0]))
+    return out
+
+
+class MutuZombieRetractPatchTest(unittest.TestCase):
+    """§139 / D98 —— 格斗招式被打断后补发收招：打断 `0x50a6f8` 记账、格斗管理器 `0x4958eb` 补发。
+
+    补丁不改收方一个字节，全靠「发出去的东西和原版管理器发的收招一模一样」「发的时机排在新招之前」——
+    这两条都是离线可判定的：原版收招那几条指令、挑招看的计时器，都在镜像里钉住。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        for path in (BSHOOK, IMG):
+            if not os.path.isfile(path):
+                raise unittest.SkipTest("不在源码仓库里（缺 %s），跳过" % path)
+        cls.img = load_image()
+        cls.src = c_source()
+        cls.targets = _rel32_targets(cls.img)        # 逐字节扫一遍要几秒，三条用例共用
+        cls.sites = {}
+        for prefix in ("MUTU_BREAK", "MUTU_TICK"):
+            cls.sites[prefix] = dict(
+                va=c_define(cls.src, prefix + "_VA"),
+                stolen=c_define(cls.src, prefix + "_STOLEN"),
+                resume=c_define(cls.src, prefix + "_RESUME_TO"),
+                sig=c_byte_array(cls.src, prefix + "_SIG"),
+                sig_len=c_define(cls.src, prefix + "_SIG_LEN"))
+
+    def test_the_signatures_match_the_image_and_are_unique(self):
+        for prefix, s in self.sites.items():
+            self.assertEqual(s["sig_len"], len(s["sig"]), prefix + "_SIG_LEN 和数组长度对不上")
+            self.assertEqual(read_va(self.img, s["va"], s["sig_len"]), s["sig"],
+                             prefix + "_SIG 和镜像对不上")
+            self.assertEqual(1, self.img.count(s["sig"]), prefix + "_SIG 不唯一")
+
+    def test_the_stolen_bytes_end_on_an_instruction_boundary(self):
+        brk, tick = self.sites["MUTU_BREAK"], self.sites["MUTU_TICK"]
+        for prefix, s in self.sites.items():
+            self.assertGreaterEqual(s["stolen"], 5, prefix + "：放不下 E9 rel32")
+            self.assertEqual(s["va"] + s["stolen"], s["resume"], prefix + "：回落点不在偷走的字节后面")
+        # 打断：偷 `push esi / lea esi,[edi+0x5dc]`，落点是 `mov ecx,[esi]`（取招式对象）。
+        self.assertEqual(b"\x8b\x0e", read_va(self.img, brk["resume"], 2))
+        # 管理器：偷 `push ebp / mov ebp,esp / push ecx / push esi`，落点是 `push edi`。
+        self.assertEqual(b"\x57", read_va(self.img, tick["resume"], 1))
+
+    def test_nobody_jumps_into_the_middle_of_the_stolen_bytes(self):
+        # rel8 没扫：两处都是函数入口，函数体里的短跳（`0x50a703` / `0x50a71a` / `0x50a723`，管理器同理）
+        # 都往后跳。逐字节扫 rel8 在 `0x50a6d4` 有个假阳性 —— 那是 `0x50a6d3 ff 74 24 10`（push）的中间两个字节。
+        for prefix, s in self.sites.items():
+            inside = [(src, dst) for src, dst in self.targets if s["va"] < dst < s["va"] + s["stolen"]]
+            self.assertEqual([], inside, prefix + "：有人跳进偷走的字节中间")
+
+    def test_the_break_is_only_reached_from_onhit_and_the_walk_gate(self):
+        callers = sorted(src for src, dst in self.targets
+                         if dst == self.sites["MUTU_BREAK"]["va"] and self.img[src - IMAGE_BASE] == 0xE8)
+        # 0x4ff6a8：OnHit 活人分支挨重击；0x5074ae：走路时招式对象还在（NewMutuSkill 的 vft+8 恒真，走不到）。
+        self.assertEqual([0x4FF6A8, 0x5074AE], callers)
+
+    def test_the_manager_runs_every_fight_frame(self):
+        callers = [src for src, dst in self.targets
+                   if dst == self.sites["MUTU_TICK"]["va"] and self.img[src - IMAGE_BASE] == 0xE8]
+        self.assertEqual([0x4906F4], callers)
+        # 每帧 `0x4904cc` 里：GameContext 槽 5 IsMutu（`call [eax+0x14]`）为真才调，eax = [0x72e2e0] 管理器。
+        self.assertEqual(bytes.fromhex("ff5014 84c0 740a a1e0e27200"), read_va(self.img, 0x4906E8, 12))
+
+    def test_the_retract_is_exactly_the_managers_own(self):
+        """原版管理器发收招（`0x495a87`）：`0x4934e7(本机座位, −1, 朝向, 0)`，esi = 坐标，之后置 `[+0x5e0]`。"""
+        site = 0x495A87
+        code = read_va(self.img, site, 27)
+        self.assertEqual(bytes.fromhex("6a00 ff75dc 8bf0 6aff"), code[:9])   # push 0 / push 朝向 / esi=坐标 / push −1
+        seat_call = site + 9
+        self.assertEqual(0xE8, code[9])
+        self.assertEqual(c_define(self.src, "MUTU_MY_SEAT_VA"),
+                         seat_call + 5 + struct.unpack_from("<i", code, 10)[0])
+        self.assertEqual(0x50, code[14])                                     # push eax（座位）
+        send_call = site + 15
+        self.assertEqual(0xE8, code[15])
+        self.assertEqual(c_define(self.src, "MUTU_SEND_SKILL_VA"),
+                         send_call + 5 + struct.unpack_from("<i", code, 16)[0])
+        wait = c_define(self.src, "CHAR_OFF_WAIT_ECHO")
+        self.assertEqual(b"\xc6\x87" + struct.pack("<I", wait) + b"\x01", code[20:27])
+        # 朝向那一格：`0x495a73 mov eax,[edi+0x2d0]` 存进 [ebp-0x24]。
+        self.assertEqual(b"\x8b\x87" + struct.pack("<I", c_define(self.src, "CHAR_OFF_FACING")),
+                         read_va(self.img, 0x495A73, 6))
+        # 发包函数是 stdcall 4 个参数（`ret 0x10`）、从 esi 读坐标。
+        self.assertEqual(b"\xc2\x10\x00", read_va(self.img, 0x49357E, 3))
+        self.assertEqual(b"\xd9\x06", read_va(self.img, 0x49353C, 2))
+
+    def test_the_retract_waits_on_the_very_timer_the_picker_reads(self):
+        """挑招 `0x495bbb`：`[+0x17c]` 在跑就清队列 —— 补发等的是同一个计时器、同一个判断函数，
+        所以「它走完的第一帧」补发一定排在新招之前（补发挂在管理器入口，挑招在后面）。"""
+        timer = c_define(self.src, "CHAR_OFF_HIT_TIMER")
+        code = read_va(self.img, 0x495BBB, 11)
+        self.assertEqual(b"\x8d\x8f" + struct.pack("<I", timer), code[:6])
+        self.assertEqual(0xE8, code[6])
+        self.assertEqual(c_define(self.src, "MUTU_TIMER_RUNNING_VA"),
+                         0x495BBB + 11 + struct.unpack_from("<i", code, 7)[0])
+        # 击退尾巴 `0x50f959`：对所有类型都起这 10 帧（`push 0xa / lea ecx,[esi+0x17c] / call 0x5d5e37`）。
+        self.assertEqual(b"\x6a\x0a\x8d\x8e" + struct.pack("<I", timer), read_va(self.img, 0x50F959, 8))
+
+    def test_the_break_hook_reads_the_skill_slot_the_original_deletes(self):
+        skill = c_define(self.src, "CHAR_OFF_SKILL")
+        self.assertEqual(b"\x8d\xb7" + struct.pack("<I", skill),
+                         read_va(self.img, self.sites["MUTU_BREAK"]["va"] + 1, 6))
+
+    def test_the_detours_report_before_replaying_the_stolen_code(self):
+        for name, first, replay, resume in (
+                ("mutu_break_detour", "call mutu_break_note", "lea  esi, [edi + 0x5DC]",
+                 "push MUTU_BREAK_RESUME_TO"),
+                ("mutu_tick_detour", "call mutu_owed_retract_tick", "mov  ebp, esp",
+                 "push MUTU_TICK_RESUME_TO")):
+            body = self.src[self.src.index("void %s(void)" % name):]
+            body = body[:body.index("\n}\n")]
+            self.assertLess(body.index("pushad"), body.index(first), name)
+            self.assertLess(body.index(first), body.index("popad"), name)
+            self.assertLess(body.index("popad"), body.index(replay), name)
+            self.assertLess(body.index(replay), body.index(resume), name)
+
+    def test_no_other_patch_lands_in_these_bytes(self):
+        mine = {s["va"] for s in self.sites.values()}
+        for m in re.finditer(r"^#define\s+(\w+_VA)\s+(0[xX][0-9A-Fa-f]+)[uU]?", self.src, re.M):
+            va = int(m.group(2), 16)
+            if va in mine:
+                continue
+            for prefix, s in self.sites.items():
+                self.assertFalse(s["va"] <= va < s["va"] + s["stolen"],
+                                 "%s（%08X）落在 %s 偷走的字节里" % (m.group(1), va, prefix))
+
+    def test_the_patch_thread_installs_it_unless_kept(self):
+        body = self.src[self.src.index("static DWORD WINAPI patch_thread"):]
+        self.assertIn("try_patch_mutu_zombie()", body)
+        self.assertLess(body.index("mutu_zombie_keep_original()"), body.index("try_patch_mutu_zombie()"))
+        keep = self.src[self.src.index("static int mutu_zombie_keep_original(void)"):]
+        self.assertIn('"BSHOOK_KEEP_MUTU_ZOMBIE"', keep[:keep.index("\n}\n")])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9170,6 +9170,205 @@ static int try_patch_mutu_diag(void)
     return 1;
 }
 
+/* ========================================================================== */
+/* ★ 格斗招式被打断后补发收招（X_Mod §139 / D98）                             */
+/*                                                                            */
+/*   症状（用户 2026-09-28，两台电脑）：打死对面、又打了几下尸体，他复活后在  */
+/*   我屏幕上一直躺着；之后他一冲刺，我这边冲刺动作不停循环（他那台正常）。   */
+/*                                                                            */
+/*   根子是原版的竞态：挨重击时每台机器各自在 `0x50a6f8` 里删掉本地的招式对象 */
+/*   `[char+0x5dc]`，出招者本人**不发收招**。哪台机器要是「先处理打中、后收到 */
+/*   出招包」（攻击者本机最容易：判中在本机当场生效，他的出招包还在路上），   */
+/*   那台上的招式对象就永远等不到收招。它挡住走路代码 ⇒ UpdateMotion           */
+/*   `0x507c50` 一次都不跑，复活 / 冲刺结束时复位的通道把当前动作从头**循环**  */
+/*   （复位 = 时间归 0、模式清成 0 = 循环）。`Die()` / 复活都不删它。           */
+/*                                                                            */
+/*   「这一招断了」只有出招者本机知道 ⇒ 让它明说（铁律 10）：                 */
+/*   ① `0x50a6f8` 入口：被打断的是本机角色、招式对象在 ⇒ 记下「欠一发收招」；  */
+/*   ② 格斗管理器 `0x4958eb` 入口（每帧，排在它挑招 / 出招之前）：欠着、还是    */
+/*      这个角色这一局、挨打那 10 帧 `[+0x17c]` 走完 ⇒ 照原版 `0x495a73` 那样   */
+/*      发 `0x0016(座位, −1, [+0x2d0], 0)`（坐标取虚表 +8）、置 `[+0x5e0]` 等回环。*/
+/*      收方一行不改：照原版收招处理，有僵尸就删掉、复位通道，UpdateMotion 接手。*/
+/*   ★ 为什么等那 10 帧、不当场发：收方处理收招先把人硬置到包里的坐标、再把   */
+/*     两个通道倒带 —— 当场发会把正被打退的人拽回挨打那一点、把挨打动作重播。  */
+/*     等 `[+0x17c]` 走完，每台收方自己的那 10 帧也已走完（全经服务端转发），   */
+/*     硬置和倒带同一帧就被 UpdateMotion 盖掉；而这一帧正是他能出下一招的第一  */
+/*     帧（挑招 `0x495bbb` 看的就是它），收招一定排在新招前面。                */
+/*   ★ 死了也照发：尸体上的僵尸一样要清（用户那一局就是这种）。              */
+/*   ★ 只在游戏主线程读写 `g_mutu_owed_*`：打断在收包 → OnHit 里，管理器在每帧  */
+/*     更新里，都是主线程。                                                    */
+/*   设 BSHOOK_KEEP_MUTU_ZOMBIE=1 保留原版（被打断不补收招）。                 */
+/* ========================================================================== */
+#define MUTU_BREAK_VA         0x0050A6F8u   /* 打断：删 [edi+0x5dc]（edi = 角色，无栈参） */
+#define MUTU_BREAK_SIG_LEN    11
+#define MUTU_BREAK_STOLEN     7
+#define MUTU_BREAK_RESUME_TO  0x0050A6FF
+static const unsigned char MUTU_BREAK_SIG[MUTU_BREAK_SIG_LEN] = {
+    0x56,                               /* push esi                ┐ 偷 7 字节 */
+    0x8D, 0xB7, 0xDC, 0x05, 0x00, 0x00, /* lea  esi, [edi+0x5dc]   ┘           */
+    0x8B, 0x0E,                         /* mov  ecx, [esi]         ← 落点      */
+    0x85, 0xC9                          /* test ecx, ecx                       */
+};
+
+#define MUTU_TICK_VA          0x004958EBu   /* 格斗管理器每帧入口（eax = 管理器对象） */
+#define MUTU_TICK_SIG_LEN     20
+#define MUTU_TICK_STOLEN      5
+#define MUTU_TICK_RESUME_TO   0x004958F0
+static const unsigned char MUTU_TICK_SIG[MUTU_TICK_SIG_LEN] = {
+    0x55,                               /* push ebp                ┐           */
+    0x8B, 0xEC,                         /* mov  ebp, esp           │ 偷 5 字节 */
+    0x51,                               /* push ecx                │           */
+    0x56,                               /* push esi                ┘           */
+    0x57,                               /* push edi                ← 落点      */
+    0x8B, 0xF8,                         /* mov  edi, eax                       */
+    0xA1, 0xBC, 0xE2, 0x72, 0x00,       /* mov  eax, [0x72e2bc]                */
+    0x80, 0xB8, 0x77, 0x03, 0x00, 0x00, 0x00  /* cmp byte [eax+0x377], 0       */
+};
+
+#define MUTU_MY_CHAR_VA       0x00409F39u   /* 本机角色：无参，eax 返回（不在局里 = 0）  */
+#define MUTU_MY_SEAT_VA       0x00409F7Du   /* 本机座位：无参，eax 返回                  */
+#define MUTU_SEND_SKILL_VA    0x004934E7u   /* 发 0x0016：stdcall(座位, 类型, 朝向, 招式号)，esi = 坐标 */
+#define MUTU_TIMER_RUNNING_VA 0x005D5EB0u   /* 计时器在跑：thiscall，al 返回             */
+#define CHAR_OFF_HIT_TIMER    0x17C         /* 挨打后 10 帧（击退尾巴 0x50f961 起）      */
+#define CHAR_OFF_FACING       0x2D0         /* 朝向 ±1                                  */
+#define CHAR_OFF_SKILL        0x5DC         /* 格斗招式对象                             */
+#define CHAR_OFF_WAIT_ECHO    0x5E0         /* 发了 0x0016、等自己的回环                */
+
+typedef UINT_PTR (__cdecl *mutu_getter_fn)(void);
+/* __thiscall 借 __fastcall 调：ecx = this，edx 占位不用，栈参由被调方弹。 */
+typedef char (__fastcall *mutu_timer_running_fn)(void *timer, void *edx_unused);
+typedef float *(__fastcall *mutu_getpos_fn)(void *self, void *edx_unused, float *out);
+
+static volatile LONG g_mutu_zombie_patched = 0;
+/* 欠一发收招的本机角色（0 = 不欠）和欠下时的 GameContext —— 换了局 / 换了人就不欠了。 */
+static UINT_PTR g_mutu_owed_char = 0;
+static UINT_PTR g_mutu_owed_ctx = 0;
+
+static int mutu_zombie_keep_original(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_MUTU_ZOMBIE", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+/* `0x50a6f8` 入口（原版删招式对象之前）：断的是不是本机角色手上的招。 */
+static void __stdcall mutu_break_note(UINT_PTR ch)
+{
+    UINT_PTR skill;
+
+    if (ch == 0)
+        return;
+    skill = *(UINT_PTR *)(ch + CHAR_OFF_SKILL);
+    if (skill == 0)
+        return;                              /* 手上没有招，没什么可断 */
+    if (ch != ((mutu_getter_fn)MUTU_MY_CHAR_VA)())
+        return;                              /* 别人的招：由他那台去补 */
+    g_mutu_owed_char = ch;
+    g_mutu_owed_ctx = *(UINT_PTR *)GAME_CONTEXT_GLOBAL;
+    bslog("MUTU    本机格斗招式被打断（招式对象 %08X）—— 挨打那 10 帧走完补发收招，"
+          "免得先收到打中、后收到出招包的那台留着它（X_Mod §139）", (unsigned)skill);
+}
+
+/* 照原版管理器 `0x495a73` 发收招的样子发一发，只是时机换成「挨打那 10 帧走完」。 */
+static void mutu_send_owed_retract(UINT_PTR ch)
+{
+    float out[2];
+    float *pos;
+    int facing = *(int *)(ch + CHAR_OFF_FACING);
+    int seat = (int)((mutu_getter_fn)MUTU_MY_SEAT_VA)();
+    UINT_PTR send = MUTU_SEND_SKILL_VA;
+    mutu_getpos_fn getpos = (mutu_getpos_fn)(*(UINT_PTR **)ch)[2];   /* 虚表 +8 */
+
+    pos = getpos((void *)ch, NULL, out);     /* 挂平台时会换算，原版就这么取 */
+    __asm {
+        push esi
+        mov  esi, pos                        /* 0x4934e7 从 esi 读 (x, y) */
+        push 0                               /* 招式号：收招恒 0（同 0x495a87） */
+        push facing
+        push -1                              /* 类型 −1 = 收招 */
+        push seat
+        call send                            /* stdcall，ret 0x10 */
+        pop  esi
+    }
+    *(unsigned char *)(ch + CHAR_OFF_WAIT_ECHO) = 1;   /* 同 0x495a9b：等回环 */
+    bslog("MUTU    补发收招：座位 %d 朝 %+d (%.1f, %.1f) —— 别的机器上留着的这一招就此删掉",
+          seat, facing, pos[0], pos[1]);
+}
+
+/* 格斗管理器每帧入口：欠着的那发收招，能发了就发。 */
+static void __cdecl mutu_owed_retract_tick(void)
+{
+    UINT_PTR ch = g_mutu_owed_char;
+
+    if (ch == 0)
+        return;
+    if (ch != ((mutu_getter_fn)MUTU_MY_CHAR_VA)()
+        || *(UINT_PTR *)GAME_CONTEXT_GLOBAL != g_mutu_owed_ctx) {
+        g_mutu_owed_char = 0;                /* 换了局 / 换了人：这一发不欠了 */
+        bslog("MUTU    欠的那发收招作废：已经不是那一局 / 那个角色了");
+        return;
+    }
+    if (*(UINT_PTR *)(ch + CHAR_OFF_SKILL) != 0) {
+        /* 挑招要等 [+0x17c] 走完，走完的第一帧这里就发掉了，按说到不了。
+           真到了（新招已经出了）就不能再发 —— 收方会把新招当成它删掉。 */
+        g_mutu_owed_char = 0;
+        bslog("MUTU    !! 欠收招期间本机已经出了新招，这一发不补了");
+        return;
+    }
+    if (((mutu_timer_running_fn)MUTU_TIMER_RUNNING_VA)((void *)(ch + CHAR_OFF_HIT_TIMER), NULL))
+        return;                              /* 挨打那 10 帧还没走完 */
+    g_mutu_owed_char = 0;
+    mutu_send_owed_retract(ch);
+}
+
+static __declspec(naked) void mutu_break_detour(void)
+{
+    __asm {
+        pushad
+        push edi                            /* 被打断的角色 */
+        call mutu_break_note                /* __stdcall，自己弹参数 */
+        popad
+        push esi                            /* 被偷走的两条，原样跑 */
+        lea  esi, [edi + 0x5DC]
+        push MUTU_BREAK_RESUME_TO
+        ret
+    }
+}
+
+static __declspec(naked) void mutu_tick_detour(void)
+{
+    __asm {
+        pushad
+        call mutu_owed_retract_tick         /* 排在管理器挑招 / 出招之前 */
+        popad
+        push ebp                            /* 被偷走的四条，原样跑 */
+        mov  ebp, esp
+        push ecx
+        push esi
+        push MUTU_TICK_RESUME_TO
+        ret
+    }
+}
+
+/* 两处都得在：只装上打断那一处 = 光记账不发；只装上管理器那一处 = 什么都不欠。 */
+static int try_patch_mutu_zombie(void)
+{
+    int a, b;
+
+    if (g_mutu_zombie_patched) return 1;
+    a = install_jmp_guard(MUTU_BREAK_VA, MUTU_BREAK_SIG, MUTU_BREAK_SIG_LEN,
+                          MUTU_BREAK_STOLEN, mutu_break_detour, "格斗招式打断记账");
+    b = install_jmp_guard(MUTU_TICK_VA, MUTU_TICK_SIG, MUTU_TICK_SIG_LEN,
+                          MUTU_TICK_STOLEN, mutu_tick_detour, "格斗管理器补收招");
+    if (!a || !b) return 0;
+    InterlockedExchange(&g_mutu_zombie_patched, 1);
+    bslog("PATCH   ★格斗招式被打断后补发收招 @ %08X / %08X：本机的招被打断，挨打那 10 帧"
+          "走完补一发原版收招（0x0016 类型 -1），别的机器上先收到打中、后收到出招包"
+          "留下的那一招跟着删掉 —— 不再「复活后一直躺着 / 冲刺动作循环」（X_Mod §139 / D98）",
+          (unsigned)MUTU_BREAK_VA, (unsigned)MUTU_TICK_VA);
+    return 1;
+}
+
 /* -------------------------------------------------------------------------- */
 /* 阶段4 观测 —— SnowCipher（包加密，SNOW 2.0）                                */
 /*                                                                            */
@@ -11150,6 +11349,21 @@ static DWORD WINAPI patch_thread(LPVOID param)
             bslog("PATCH   !! 超时未能 patch 格斗模式解锁"
                   "（0x43755e / 0x4659cc / 0x4659e3 / 0x465a0a / 0x40b273 "
                   "的特征串一直对不上）");
+    }
+
+    /* 格斗招式被打断后补发收招（X_Mod §139 / D98）：两处都在格斗对局代码里，
+       最早也要进格斗局才第一次执行 —— 时机不急，只等特征串（等解壳）。 */
+    if (mutu_zombie_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_MUTU_ZOMBIE 已设，保留原版：格斗招式被打断不补收招"
+              "（别的机器上可能留着这一招 —— 复活后一直躺着 / 冲刺动作循环，X_Mod §139）");
+    } else {
+        for (ticks = 0; !g_stop && !g_mutu_zombie_patched && ticks < 2000; ticks++) {
+            if (try_patch_mutu_zombie()) break;
+            Sleep(2);
+        }
+        if (!g_mutu_zombie_patched)
+            bslog("PATCH   !! 超时未能 patch 格斗招式补收招"
+                  "（0x50A6F8 / 0x4958EB 的特征串一直对不上）");
     }
 
     /* ★ B2 格斗招式判定体探针（X16，临时）：BSHOOK_MUTU_DIAG=1 才装；轮询理由同上（等解壳）。 */
