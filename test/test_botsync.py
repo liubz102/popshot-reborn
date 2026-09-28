@@ -6257,6 +6257,21 @@ class BotBreakableShortcutTests(TerrainMixin, BotFireRoom):
         不许打 ⇒ 站着；一站着规划签名就不变 ⇒ 永远不重算。
         ⇒ 「被墙住」和「被压住」是同一类事实，吃同一条待遇：无条件开打。
         """
+        # ★ 可达图缓存挂在地形对象上（`botnav._EDGE_CACHE`），同一进程里的用例共用这张 `CamelCulvert04`：一格的
+        #   「代表身体」是谁先填的就是谁（连走路余量一起，`botnav.node`，变体还从母地形继承），而罐子围住的这一小块里
+        #   格和格之间通不通就看代表身体的余量 —— 下面「一步都走不了」这句前提会跟着前面几条用例 bot 怎么走而变
+        #   （X_Mod §137 改了墙根的走法之后它就翻了）。这条用例跑在这张图的干净缓存上，前提只由它自己的动作决定；
+        #   跑完原样放回去，排在后面的用例看到的还是它没跑时的那份。
+        saved = {terrain: botnav._EDGE_CACHE.pop(terrain)
+                 for terrain in (self.terrain, *self.terrain._variants.values())
+                 if terrain in botnav._EDGE_CACHE}
+
+        def restore():
+            for terrain in (self.terrain, *self.terrain._variants.values()):
+                botnav._EDGE_CACHE.pop(terrain, None)
+            botnav._EDGE_CACHE.update(saved)
+
+        self.addCleanup(restore)
         # ★ 先让真人站到 bot 眼前（`walk` 会推房间循环，所以必须排在
         #   摆 bot 和递单之前，否则那几格会把锁清掉）。
         self.walk(self.alice, [(1330.0, 853.0)])
@@ -12227,6 +12242,263 @@ class BotDropRouteTests(TerrainMixin, BotFireRoom):
         else:
             self.fail("10 发心跳还在上层，停在 (%.0f, %.0f)"
                       % (self.bot_conn.body.x, self.bot_conn.body.y))
+
+
+class BotOverhangCornerTests(TerrainMixin, BotFireRoom):
+    """★★★★★ 墙根悬垂底下「脱困 ↔ 朝目标走」互顶（X_Mod §137）。
+
+    用户 2026-09-28：「bot 偶尔会卡在地形突出的边缘动弹不得」（空间站地图上出现过；以前修过冰原那种，之后也偶尔遇到）。
+    `server.out` 09-28 00:38:37 `Megatron01` bot 1（角色 1）在 (365, 899) ↔ (372, 886) 之间每 64 ms 翻一次、来回 26 秒：
+    斜坡往右上走到墙根，墙往左上方悬出去 —— 客户端走路只看脚那一列，脚走得进墙角，碰撞体塞不下（`fits()` 为假）。
+    「朝目标走 +1」其实是 `_unstall` 的横着探路（D137）送进去的，它只躲墙和无底洞；脱困推出来、顺手把在算的规划单扔掉；
+    闩着的探路方向再送进去。A\\* 一直有路（先往左跳），答案一次都没被取走。格斗场 `Megatron_M00` 那根柱子 (640, 484) 同型。
+    """
+
+    def real(self, name):
+        """装上真图，并给这条用例一份**这张图的干净可达图缓存**（跑完原样放回）。
+
+        ★ 缓存挂在地形对象上，`mapdata.load` 同一进程里给的是同一个对象：一格的「代表身体」是谁先填的就是谁
+          （连走路余量一起，`botnav.node`），前面的用例填过，后面这条的路线就跟着变 —— 端到端的结果会随执行顺序变。
+        """
+        terrain = mapdata.load(name)
+        if terrain is None:
+            self.skipTest("没有 %s 的地形产物" % name)
+        family = (terrain, *terrain._variants.values())
+        saved = {t: botnav._EDGE_CACHE.pop(t) for t in family if t in botnav._EDGE_CACHE}
+
+        def restore():
+            for t in (terrain, *terrain._variants.values()):
+                botnav._EDGE_CACHE.pop(t, None)
+            botnav._EDGE_CACHE.update(saved)
+
+        self.addCleanup(restore)
+        return self.install_terrain(terrain)
+
+    def force_no_shot(self):
+        original = bot._fire_target
+        bot._fire_target = lambda *_args, **_kwargs: None
+        self.addCleanup(setattr, bot, "_fire_target", original)
+
+    def as_character(self, character_id):
+        self.room.seats[self.bot_seat].character_id = character_id
+        self.bot_conn.character_id = character_id
+        return bot._character_of(self.bot_conn)
+
+    def stand(self, terrain, x, y):
+        """把 bot 放下去站住（从脚上方一格往下落，和出生一样）。"""
+        body = botmove.settle(terrain, botmove.Body(x, y - 1.0, on_ground=False),
+                              bot._character_of(self.bot_conn))
+        self.bot_conn.battle_pos = (body.x, body.y)
+        self.bot_conn.body = body
+        return body
+
+    def sources(self):
+        """记下这个 bot 每一次决策的走位来源（`_src` 的分支名）。"""
+        seen = []
+        real = bot._src
+
+        def spy(machine, tag, intent, goal=None):
+            if machine is self.bot_conn and intent is not None:
+                seen.append(tag)
+            return real(machine, tag, intent, goal=goal)
+
+        bot._src = spy
+        self.addCleanup(setattr, bot, "_src", real)
+        return seen
+
+    def reach(self, goal, beats):
+        """真人在 `goal` 站着，bot 在 `beats` 发心跳以内走到他跟前（A\\* 的「到了」窗口）。"""
+        for _ in range(beats):
+            self.beats(1, goal[0], goal[1])
+            body = self.bot_conn.body
+            if (body.on_ground and abs(body.x - goal[0]) <= botnav.GOAL_X
+                    and abs(body.y - goal[1]) <= botnav.GOAL_Y):
+                return
+        self.fail("%d 发心跳还没走到 (%.0f, %.0f)，停在 (%.0f, %.0f)"
+                  % (beats, goal[0], goal[1], self.bot_conn.body.x, self.bot_conn.body.y))
+
+    def test_the_second_step_into_the_overhang_counts(self):
+        """★★★ 缝检查看满意图的寿命（`BOT_DECISION_TICKS` 格）：第 2 格才走进墙角的，以前只看 1 格就放过去了（09-27 23:20 那次）。"""
+        terrain = self.real("Megatron01_ch")
+        who = self.as_character(2)
+        body = self.stand(terrain, 361.0, 903.0)
+        first = botmove.tick(terrain, body, who, direction=1)
+        second = botmove.tick(terrain, first, who, direction=1)
+        self.assertTrue(botmove.fits(terrain, first.x, first.y, who), "夹具自检：第 1 格还塞得下")
+        self.assertFalse(botmove.fits(terrain, second.x, second.y, who), "夹具自检：第 2 格进了悬垂底下")
+        self.assertEqual(2, bot.BOT_DECISION_TICKS, "夹具自检：意图握两格")
+        self.assertFalse(bot._walks_into_a_crack(terrain, body, who, 1, False, False, 1.0, ticks=1),
+                         "夹具自检：只看 1 格的老判据放过去了")
+        self.assertTrue(bot._walks_into_a_crack(terrain, body, who, 1, False, False, 1.0))
+
+    def test_passing_the_foot_of_a_step_is_not_a_crack(self):
+        """台阶根部被上面的悬垂挤得塞不下，可接着往前攒两格余量就迈上去了 —— 只是路过，不挡（脱困也会让它接着走）。"""
+        terrain = self.real("Megatron01_ch")
+        who = self.as_character(1)
+        body = self.stand(terrain, 1498.0, 494.0)
+        at = botmove.advance(terrain, body, who, bot.BOT_DECISION_TICKS, direction=1)
+        self.assertFalse(botmove.fits(terrain, at.x, at.y, who), "夹具自检：下一次决策那一刻在台阶根部、塞不下")
+        self.assertTrue(bot._walks_out(terrain, at, who, 1), "夹具自检：接着往前走出得去")
+        self.assertFalse(bot._walks_into_a_crack(terrain, body, who, 1, False, False, 1.0))
+
+    def test_saving_up_for_a_tall_step_is_not_a_wall(self):
+        """★★ 高坎前原地攒余量那几格 x 不变（X_Mod §103）；撞墙是余量被清零。按「x 没变」判，台阶根部就成了死胡同、脱困往回推。"""
+        terrain = self.real("Megatron01_ch")
+        who = self.as_character(1)
+        body = self.stand(terrain, 1511.0, 490.0)
+        self.assertFalse(botmove.fits(terrain, body.x, body.y, who), "夹具自检：台阶根部塞不下")
+        nxt = botmove.tick(terrain, body, who, direction=1)
+        self.assertEqual(body.x, nxt.x, "夹具自检：第一格原地攒余量")
+        self.assertNotEqual(0.0, nxt.rest, "夹具自检：不是撞墙（撞墙余量清零）")
+        self.assertTrue(bot._walks_out(terrain, body, who, 1))
+
+    def test_the_probe_does_not_walk_into_the_corner(self):
+        """★★★★ 横着探路（D137）不许往悬垂底下的死胡同里送 —— V0.3 §152 那条 `fits()` 的第五个挂点；这一侧不行就换另一侧。"""
+        terrain = self.real("Megatron01_ch")
+        who = self.as_character(1)
+        body = self.stand(terrain, 365.0, 899.0)
+        self.assertFalse(botmove.blocked(terrain, body, who, 1), "夹具自检：往右不算撞墙（先走两格才碰到墙）")
+        self.assertTrue(bot._walks_into_a_crack(terrain, body, who, 1, False, False, 1.0),
+                        "夹具自检：往右两格进墙角、再往前是墙")
+        self.assertEqual((-1, False, False, False),
+                         bot._blind_probe_intent(self.room, self.bot_conn, terrain, 1))
+
+    def test_unsticking_carries_on_and_keeps_the_route(self):
+        """★★★ 塞不下、可接着往刚才按的方向走得出去：接着走，路线和在算的单子都留着（人只是路过，路线没错）。"""
+        terrain = self.real("Megatron01_ch")
+        who = self.as_character(1)
+        body = self.stand(terrain, 1511.0, 490.0)
+        self.assertFalse(botmove.fits(terrain, body.x, body.y, who), "夹具自检：台阶根部塞不下")
+        goal = (1700.0, 300.0)
+        route = [botnav.Step(botnav.ACTION_WALK, 1544.0, 466.0, 1, False, 8.0)]
+        self.bot_conn.nav_path = list(route)
+        self.bot_conn.nav_goal = goal
+        self.bot_conn.press_dir = 1
+        botplan.ask(self.bot_conn, terrain, body, who, goal)
+        self.addCleanup(botplan.forget, self.bot_conn)
+        self.assertTrue(bot._plan_pending(self.bot_conn), "夹具自检：单子递出去了")
+        self.assertEqual((1, False, False, False),
+                         bot._unstick_intent(self.room, self.bot_conn, terrain))
+        self.assertEqual(route, self.bot_conn.nav_path, "路线留着")
+        self.assertTrue(bot._plan_pending(self.bot_conn), "在算的单子也留着（以前每次都扔，A* 的答案永远取不到）")
+
+    def test_in_the_dead_end_it_still_backs_out_and_drops_the_route(self):
+        """往前是墙（悬垂底下的墙角）：照旧往回推、清路线 —— 这时兜底和探路也不会再往里送了。"""
+        terrain = self.real("Megatron01_ch")
+        who = self.as_character(1)
+        body = self.stand(terrain, 372.0, 886.0)
+        self.assertFalse(botmove.fits(terrain, body.x, body.y, who), "夹具自检：墙角塞不下")
+        self.assertFalse(bot._walks_out(terrain, body, who, 1), "夹具自检：再往前是墙")
+        self.bot_conn.nav_path = [botnav.Step(botnav.ACTION_WALK, 400.0, 880.0, 1, False, 8.0)]
+        self.bot_conn.nav_goal = (700.0, 1219.0)
+        self.bot_conn.press_dir = 1
+        self.assertEqual((-1, False, False, False),
+                         bot._unstick_intent(self.room, self.bot_conn, terrain))
+        self.assertEqual([], self.bot_conn.nav_path)
+
+    def test_the_0038_corner_end_to_end(self):
+        """★★★★★ 原样复现 09-28 00:38：角色 1 在 (365, 899)，他在右下 (700, 1219)。改之前 40 发心跳都在两个点之间来回。"""
+        terrain = self.real("Megatron01_ch")
+        self.force_no_shot()
+        self.as_character(1)
+        self.stand(terrain, 365.0, 899.0)
+        seen = self.sources()
+        self.reach((700.0, 1219.0), 60)
+        self.assertLessEqual(seen.count("脱困"), 1, "不该在墙角来回：%s" % seen[:12])
+
+    def test_it_walks_up_the_step_under_the_lip_end_to_end(self):
+        """★★★★ 台阶根部被悬垂挤着（`Megatron01` (1511, 490)，09-27 23:19:27 bot 1 路过过一次）：他在台阶上面，
+        bot 照样走上去 —— 以前脱困按「x 没变」把攒余量那两格当撞墙、往回推，兜底下一格又走回来，离线 30 拍一步没上去。"""
+        terrain = self.real("Megatron01_ch")
+        self.force_no_shot()
+        self.as_character(1)
+        self.stand(terrain, 1498.0, 494.0)
+        seen = self.sources()
+        self.reach((1590.0, 454.0), 20)
+        self.assertLessEqual(seen.count("脱困"), 2, "不该在台阶根部来回：%s" % seen[:12])
+
+    def test_walking_off_the_edge_counts_as_carrying_on(self):
+        """★★★ 「接着往前走」也包括走到边上掉下去、落点塞得下（路线的步行边本来就这么走，落点验法同 `botnav._walk_edge`）。
+        冰原 `Iceria03` (793, 976)：斜坡头顶一层冰檐（白线）悬出来，路线是往右走到坡边掉下去。"""
+        terrain = self.real("Iceria03")
+        who = self.as_character(1)
+        body = self.stand(terrain, 793.0, 976.0)
+        self.assertFalse(botmove.fits(terrain, body.x, body.y, who), "夹具自检：冰檐底下塞不下")
+        self.assertFalse(bot._walks_out(terrain, body, who, 1), "夹具自检：不算掉下去的话往右是死路")
+        self.assertTrue(bot._walks_out(terrain, body, who, 1, fall=True))
+        self.bot_conn.press_dir = 1
+        self.assertEqual((1, False, False, False),
+                         bot._unstick_intent(self.room, self.bot_conn, terrain))
+
+    def test_the_ice_eaves_slope_end_to_end(self):
+        """★★★★ 冰原 `Iceria03` 斜坡（772, 957）起步，他在右下 (1072, 1078)：以前坡上「脱困 −1 ↔ 路线 +1」来回，30 拍下不去。"""
+        terrain = self.real("Iceria03")
+        self.force_no_shot()
+        self.as_character(1)
+        self.stand(terrain, 772.0, 957.0)
+        seen = self.sources()
+        self.reach((1072.0, 1078.0), 40)
+        self.assertLessEqual(seen.count("脱困"), 3, "不该在坡上来回：%s" % seen[:12])
+
+    def test_one_roomy_step_on_the_way_is_not_a_way_out(self):
+        """★★ 「出去了」要连着一份意图寿命塞得下：`Desert02` (719, 698) 往右上的陡坡，路上一闪而过塞得下一格，再往前是白线
+        悬垂顶着墙。碰到第一格就算出去的话，脱困先「接着走」、到了死胡同又往回推，兜底再往前送（离线 30 拍来回）。"""
+        terrain = self.real("Desert02")
+        who = self.as_character(2)
+        body = self.stand(terrain, 719.0, 698.0)
+        at = botmove.advance(terrain, body, who, bot.BOT_DECISION_TICKS, direction=1)
+        self.assertFalse(botmove.fits(terrain, at.x, at.y, who), "夹具自检：下一次决策那一刻塞不下")
+        ahead = [botmove.advance(terrain, at, who, n, direction=1)
+                 for n in range(1, botnav.WALK_TICKS + 1)]
+        self.assertEqual(1, sum(1 for p in ahead if botmove.fits(terrain, p.x, p.y, who)),
+                         "夹具自检：往前只有一格塞得下")
+        self.assertFalse(bot._walks_out(terrain, at, who, 1, fall=True))
+        self.assertTrue(bot._walks_into_a_crack(terrain, body, who, 1, False, False, 1.0))
+
+    def test_passing_a_breakable_trench_is_not_being_pinned(self):
+        """★★★ `Desert02` 那条 V 形窄沟右壁是破坏物：沟底塞不下、拿掉破坏物就塞得下 —— 可接着往前走得出去就是路过，
+        不锁罐子、不清路线（以前每路过一次就锁上它、扔掉路线和单子，路线下一格又带它走回来）。没在走时照旧算被裹住。"""
+        terrain = self.real("Desert02")
+        who = self.as_character(2)
+        body = self.stand(terrain, 938.0, 685.0)
+        self.assertFalse(botmove.fits(terrain, body.x, body.y, who), "夹具自检：沟底塞不下")
+        self.assertTrue(botmove.fits(terrain.variant(()), body.x, body.y, who),
+                        "夹具自检：挤着它的是破坏物")
+        self.bot_conn.press_dir = 1
+        self.assertIsNone(bot._breakable_pinning_body(self.bot_conn, terrain))
+        self.bot_conn.press_dir = 0
+        self.assertIsNotNone(bot._breakable_pinning_body(self.bot_conn, terrain),
+                             "没在走：照旧算被裹住")
+
+    def test_the_desert_slope_end_to_end(self):
+        """★★★★ `Desert02` 陡坡 (719, 698)，他在右下 (1119, 1012)：以前「朝目标走 +1 ↔ 脱困 −1」在坡上来回。"""
+        terrain = self.real("Desert02")
+        self.force_no_shot()
+        self.as_character(2)
+        self.stand(terrain, 719.0, 698.0)
+        seen = self.sources()
+        self.reach((1119.0, 1012.0), 40)
+        self.assertLessEqual(seen.count("脱困"), 2, "不该在坡上来回：%s" % seen[:12])
+
+    def test_the_desert_trench_end_to_end(self):
+        """★★★★ `Desert02` 破坏物窄沟 (930, 675)，他在右上 (1330, 553)：以前沟底每路过一次就锁罐子、清路线，来回 30 拍。"""
+        terrain = self.real("Desert02")
+        self.force_no_shot()
+        self.as_character(2)
+        self.stand(terrain, 930.0, 675.0)
+        seen = self.sources()
+        self.reach((1330.0, 553.0), 40)
+        self.assertLessEqual(seen.count("脱困"), 3, "不该在沟底来回：%s" % seen[:12])
+
+    def test_the_fight_arena_pillar_end_to_end(self):
+        """★★★★ 格斗场 `Megatron_M00` 09-27 23:18：角色 2 在柱子右边 (653, 487)，他在左下 (351, 779)，改之前 7.5 秒在柱根来回。"""
+        terrain = self.real("Megatron_M00_ch")
+        self.force_no_shot()
+        self.as_character(2)
+        self.stand(terrain, 653.0, 487.0)
+        seen = self.sources()
+        self.reach((351.0, 779.0), 60)
+        self.assertLessEqual(seen.count("脱困"), 2, "不该在柱根来回：%s" % seen[:12])
 
 
 class BotFallDownTests(TerrainMixin, BotFrameRoom):

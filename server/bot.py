@@ -7080,6 +7080,10 @@ def _breakable_pinning_body(machine, terrain):
     opened = terrain.variant(())
     if opened is terrain or not botmove.fits(opened, body.x, body.y, who):
         return None                         # 拿掉破坏物照样塞不下 = 是地形
+    if _carries_on(machine, terrain, body, who):
+        # ★ 接着往刚才按的方向走得出去 = 路过，不是被裹住（X_Mod §137，和脱困问同一句）。`Desert02` 那条 V 形窄沟右壁是
+        #   破坏物：人走过沟底那一两格塞不下，以前每路过一次就锁上它、清掉路线和在算的单子，路线下一格又带它走回来。
+        return None
     # 到这儿已经证明「压住我的是破坏物」，剩下的只是挑哪一件：最近的。
     return min((item for item in terrain.breakables if item.index in alive),
                key=lambda item: item.distance_to(body.x, body.y),
@@ -7431,7 +7435,12 @@ def _blind_probe_intent(room, machine, terrain, side):
     那条路**，不是杵在原地仰头。
 
     方向先取敌人那一侧（只有符号，不含距离），那一侧撞墙 / 前面是
-    无底洞就换另一侧；两侧都不成才是真的没有合法动作。
+    无底洞 / 前面是塞不下人的死胡同就换另一侧；两侧都不成才是真的没有合法动作。
+
+    ★★★ 「塞不下人的死胡同」那一条（`_walks_into_a_crack`，X_Mod §137）：这是 V0.3 §152 那条 `fits()` 的第五个挂点
+      （前四个：A\\* 落点、兜底落点、`_walk_to` 的缝、躲避的 `_strands`，V0.3 §174）。这里一直漏着：`_walk_to` 前面是缝
+      刚回了「站住、问 A\\*」，这一步就把人横着送进墙根的悬垂底下 → 下一格脱困推回来、顺手把在算的单子扔了 → 闩着的探路
+      方向再送进去 …… 用户 2026-09-28 `Megatron01` (372, 886) 一次 26 秒；格斗场 `Megatron_M00` (640, 484) 同型。
     """
     body = machine.body
     if body is None or terrain is None or not body.on_ground:
@@ -7448,6 +7457,9 @@ def _blind_probe_intent(room, machine, terrain, side):
                                     fast_run=False, crouched=crouched,
                                     speed_scale=scale,
                                     ticks=BOT_DECISION_TICKS):
+            continue
+        if _walks_into_a_crack(terrain, body, who, direction, False,
+                               crouched, scale):
             continue
         return (direction, False, False, False)
     return None
@@ -7832,22 +7844,86 @@ def _landing_ok(terrain, landing, who):
 
 
 def _walks_into_a_crack(terrain, body, who, direction, fast_run, crouched,
-                        scale):
-    """照这个方向走一步，会不会踩进 / 掉进一条**塞不进去**的缝（V0.3 §152）。
+                        scale, ticks=BOT_DECISION_TICKS):
+    """照这个方向握着走完**这份意图**（`ticks` 格 = 走到下一次决策），会不会被搁在一个**塞不进去、接着往前走也出不去**
+    的地方（V0.3 §152）—— 下一次决策的 `_unstick_intent()` 正是在这种地方把人往回推的（X_Mod §137）。
 
+    ★ 前瞻覆盖意图的寿命（V0.3 §151 的口径，`bottomless_ahead` / 躲避的 `_strands` 同一把尺）：以前只看一格，
+      意图却要握 `BOT_DECISION_TICKS` 格 —— 第二格才踩进墙根悬垂底下的，兜底照走不误。
+    ★ 判的是**下一次决策那一刻**、用的是脱困那一句（`_walks_out`）：路上蹭过一下、那一刻已经出来了不算；那一刻还在
+      里面、可接着往前走出得去（台阶根部被悬垂挤着，攒两格余量就迈上去）也不算 —— 脱困会让它接着往前走。
+      要挡的只有**死胡同**：墙根的悬垂底下、再往前就是墙（X_Mod §137 的 `Megatron01` (372, 886)）。
     ★ 客户端走路逐列推进（X_Mod §105）：窄缝上方那几列照样水平走过去，这一帧停在缝上方就
       踩空、竖直掉进去（上次落地上了锁、没有空中操控）⇒ 踩空了就推到落地再问塞不塞得下。
     """
-    step = botmove.tick(terrain, body, who, direction=direction,
-                        fast_run=fast_run, crouched=crouched,
-                        speed_scale=scale)
-    if step.on_ground and step.x == body.x:
-        return False                   # 撞墙自有 `blocked` 那条判据管
-    if not step.on_ground:
-        step = botmove.settle(terrain, step, who)
-        if not step.on_ground or botmove.out_of_world(terrain, step):
-            return False               # 掉进无底洞归 `bottomless_ahead` 管
-    return not botmove.fits(terrain, step.x, step.y, who)
+    current = body
+    for _ in range(max(1, int(ticks))):
+        nxt = botmove.tick(terrain, current, who, direction=direction,
+                           fast_run=fast_run, crouched=crouched,
+                           speed_scale=scale)
+        if not nxt.on_ground:
+            landed = botmove.settle(terrain, nxt, who)
+            if not landed.on_ground or botmove.out_of_world(terrain, landed):
+                return False           # 掉进无底洞归 `bottomless_ahead` 管
+            return (not botmove.fits(terrain, landed.x, landed.y, who)
+                    and not _walks_out(terrain, landed, who, direction, fall=True))
+        if nxt.x == current.x and nxt.rest == 0.0:
+            break                      # 撞墙：停在这儿（一步都没挪的自有 `blocked` 那条判据管）
+        current = nxt
+    if botmove.fits(terrain, current.x, current.y, who):
+        return False
+    return not _walks_out(terrain, current, who, direction, fall=True)
+
+
+def _walks_out(terrain, body, who, direction, fall=False):
+    """人此刻塞不下（`fits()` 为假）：按住 `direction` 一直走，**一条步行边**（`botnav.WALK_TICKS` 格）之内能不能走出去。
+    `_unstick_intent()` 挑往哪边走出去用它，`_walks_into_a_crack()` 判「只是路过」也用它 —— 两边必须是同一句，
+    否则又是一边往里送、一边往外推（X_Mod §137）。
+
+    ★ 「出去」= **连着 `BOT_DECISION_TICKS` 格都塞得下**（= 一份意图的寿命：不管相位，下一次决策总有一次落在塞得下的
+      地方，由正常规则带着缝检查接手），或者塞得下的时候撞了墙 / 走满了一条边（停在那儿就是塞得下的）。只蹭过一格塞得下
+      的不算：决策两格一次，下一次决策可能正落在后面的死胡同里 —— `Desert02` (719~735, 659~698) 陡坡上一闪而过一格，
+      再往前是白线悬垂顶着墙，脱困先「接着走」、到了死胡同又往回推，兜底再往前送。
+    ★ 撞墙的判据是**余量被清零**（`0x50db3a`，和 `botmove.blocked` 同一句），不是「这一格 x 没变」：客户端走路的余量
+      跨帧攒，高坎前头几格原地不动、攒够了才一步迈上去（X_Mod §103）。台阶根部正好被上面的悬垂挤得塞不下时，按「x 没变」
+      判就成了「这边走不出去」，脱困于是往回推，路线 / 兜底下一格又走回来（`Megatron01` (1511, 490)）。
+    ★ `fall`：走出崖边、落下去落到塞得下的地方也算出去了 —— 「接着往刚才的方向走」问的是这一种：路线的步行边本来就是
+      「走到边上掉下去」（落点和可达图同一个验法：落得住、没出图、塞得下，`botnav._walk_edge`）。`Iceria03` (793, 976)
+      斜坡头顶是一层冰檐，路线往右走到坡边掉下去；不算这一种，脱困就判成死胡同往回推、路线下一格又往前走。
+      不给 `fall` 时走出崖边不算（脱困挑别的方向时，那一支是它的第三条出路：排在跳之后，落点另验）。
+    ★ 走速照脱困以前那段循环的口径（不冲刺、不蹲、倍率 1）。
+    """
+    current = body
+    streak = 0                          # 连着几格塞得下
+    for _ in range(botnav.WALK_TICKS):
+        nxt = botmove.tick(terrain, current, who, direction=direction)
+        if not nxt.on_ground:
+            if not fall:
+                return False
+            landed = botmove.settle(terrain, nxt, who)
+            return (landed.on_ground and not botmove.out_of_world(terrain, landed)
+                    and botmove.fits(terrain, landed.x, landed.y, who))
+        if nxt.x == current.x and nxt.rest == 0.0:
+            return streak > 0           # 撞墙：停在塞得下的地方就算出去了
+        current = nxt
+        if botmove.fits(terrain, current.x, current.y, who):
+            streak += 1
+            if streak >= BOT_DECISION_TICKS:
+                return True
+        else:
+            streak = 0
+    return streak > 0
+
+
+def _carries_on(machine, terrain, body, who):
+    """人此刻塞不下：**接着往刚才按的方向**（`press_dir`，上一格真按下去的键）走，出得去吗 —— 出得去就是路过（X_Mod §137）。
+
+    塞不下的地方，两条「纠正」规则（`_unstick_intent` 往外推、`_breakable_pinning_body` 锁罐子打）都拿它先问一句：
+    路过就不插手 —— 不推、不清路线、不扔在算的单子。和兜底 / 探路判「只是路过」（`_walks_into_a_crack`）是同一句
+    `_walks_out(fall=True)`，送的一方和纠正的一方口径一致，才不会一个往里送、一个往外推。
+    """
+    ahead = machine.press_dir
+    return bool(ahead) and _walks_out(terrain, body, who, ahead, fall=True)
 
 
 def _unstick_intent(room, machine, terrain):
@@ -7866,6 +7942,16 @@ def _unstick_intent(room, machine, terrain):
 
     出去的路按**真跑一遍**挑，和别处一个口径：先看走得出去吗，走不出去
     就问跳，两段都试；实在没辙就朝净空宽的那一侧跳一下，总比杵着强。
+
+    ## ★★★ 先问「接着往刚才按的方向走，出不出得去」（X_Mod §137）
+
+    走路只看脚那一列（`0x50d9a7`），塞不下的地方不一定是缝：台阶根部、斜坡上一小段悬垂底下，人照原样往前走
+    就过去了。以前一律「净空宽的那一侧优先」、先把路线和在算的单子扔掉 —— 往回推，路线 / 兜底下一格又往前走，
+    「脱困 ↔ 朝目标走」每两格翻一次；单子每次都被扔掉，A\\* 明明有路也永远用不上。用户 2026-09-28：「bot 偶尔会
+    卡在地形突出的边缘动弹不得」，`Megatron01` (372, 886) 一次 26 秒。
+    ⇒ 接着往前走得出去（走到塞得下的地方，或者走到边上掉下去、落点塞得下）就接着走，**路线和单子都留着**（人是路过，
+      路线没错）；走不出去（死胡同：再往前是墙）才往回推、清路线 —— 这时兜底 / 探路也不会再往里送了
+      （`_walks_into_a_crack` 问的是同一句 `_walks_out(fall=True)`）。
     """
     body = machine.body
     if body is None or terrain is None or not body.on_ground:
@@ -7873,18 +7959,15 @@ def _unstick_intent(room, machine, terrain):
     who = _character_of(machine)
     if botmove.fits(terrain, body.x, body.y, who):
         return None
-    # 路线是照着「点模型」算出来的，而这会儿已经证明那套模型在这儿不成立。
+    if _carries_on(machine, terrain, body, who):
+        return (machine.press_dir, False, False, False)
+    # 往前是死胡同：这条路线从这儿走不通了。
     # ★ 排在挂旗子前面：`_clear_navigation()` 踩地时会把 `nav_double_jump` 清掉。
     _clear_navigation(machine)
     for direction in _unstick_directions(terrain, body, who):
         # 走：一条边的长度（`botnav.WALK_TICKS`）之内能走到塞得下的地方吗。
-        step = body
-        for _ in range(botnav.WALK_TICKS):
-            step = botmove.tick(terrain, step, who, direction=direction)
-            if not step.on_ground or step.x == body.x:
-                break
-            if botmove.fits(terrain, step.x, step.y, who):
-                return (direction, False, False, False)
+        if _walks_out(terrain, body, who, direction):
+            return (direction, False, False, False)
     for direction in _unstick_directions(terrain, body, who):
         if _landing_ok(terrain, botmove.jump_lands(terrain, body, who,
                                                    direction), who):
@@ -7896,8 +7979,8 @@ def _unstick_intent(room, machine, terrain):
     # ★★★ 第三条出路：**走出崖边掉下去**（V0.3 §177）。
     #
     #   上面那两条都要求「挪到 / 跳到一个塞得下的落脚点」，而 1 像素夹层里
-    #   往外走一步就踩空 —— 上面那个循环把它当「踩空了，这条不算」判掉了
-    #   （`not step.on_ground` 那一句）。可**掉下去恰恰是这里唯一的出路**：
+    #   往外走一步就踩空 —— `_walks_out()` 把它当「踩空了，这条不算」判掉了
+    #   （`not nxt.on_ground` 那一句）。可**掉下去恰恰是这里唯一的出路**：
     #   `Iceria03` (1214, 859) 那块冰檐左右都是冰、头顶 1 像素就是天花板，
     #   走不动、跳不起来，只有从檐口掉下去。
     #
