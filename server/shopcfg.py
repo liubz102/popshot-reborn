@@ -2889,6 +2889,7 @@ def apply_first_run_upgrades(created, data_dir=None):
 #: 「xxx 自定义」改成「xxx 自定义1」（新的那 9 把叫「xxx 自定义2」），见
 #: `CUSTOM_WEAPON_ZH_BY_SUFFIX`。这 9 条在 `data/items.json` 里是**已经落过盘的**，
 #: 而 `backfill_defaults()` 只增不改 —— 所以必须走这张表刷一遍。
+#: 第三批（用户 2026-09-28）：`560004` 的出厂名从直译的「[幸运幸存者]」改成「[无敌幸运星]」。
 RENAMED_DEFAULT_NAMES = {
     60005: "厄运卡片",
     60007: "乌龙卡片",
@@ -2902,6 +2903,7 @@ RENAMED_DEFAULT_NAMES = {
     3920001: "重机枪 自定义",
     3920002: "榴弹发射器 自定义",
     3920003: "火箭炮 自定义",
+    560004: "[幸运幸存者]",
 }
 
 

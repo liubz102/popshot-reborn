@@ -1266,7 +1266,7 @@ class CardTooltipTests(unittest.TestCase):
         # 反过来停在红心卡片上时，红心排最前面。
         other = [l for l in self.desc(60006).split("\n")
                  if l.startswith(shopcfg.CARD_CRAFT_PREFIX)
-                 and "幸运幸存者" in l][0]
+                 and "无敌幸运星" in l][0]
         self.assertLess(other.index("红心卡片"), other.index("幸运卡片"))
 
     def test_a_card_used_by_several_titles_lists_them_all(self):
@@ -1277,7 +1277,7 @@ class CardTooltipTests(unittest.TestCase):
                 entry["materials"] = [{"id": 60004, "count": 20}]
         self.write_recipes(rows)
         text = self.desc(60004)
-        for title in ("[幸运幸存者]", "[手下留情]", "[红心达人]"):
+        for title in ("[无敌幸运星]", "[手下留情]", "[红心达人]"):
             self.assertIn(title, text, title)
         # 三个称号 = 1 行条件 + 3 行，还在第 1 段 5 行的预算里 ⇒ 不该截断。
         self.assertNotIn("另有", text)
@@ -1316,7 +1316,7 @@ class CardTooltipTests(unittest.TestCase):
         它没有效果。
         """
         effects = self.desc(60004).split(shopcfg.DESC_SEPARATOR)[1]
-        self.assertTrue(effects.startswith("[幸运幸存者]"), effects)
+        self.assertTrue(effects.startswith("[无敌幸运星]"), effects)
 
     def test_too_many_titles_get_truncated_but_still_say_so(self):
         """放不下的那些至少要说一声有 —— 不说的话玩家会以为只有这几个。"""
