@@ -2146,6 +2146,137 @@ class QuestSettlementTests(BattleRoom):
                          set(self.accounts.cleared))
 
 
+def result_values(body):
+    """`0x0309` 座位号之后的 12 个业务值。"""
+    return struct.unpack_from(f"<{gameserver.GAME_RESULT_VALUE_COUNT}i", body, 4)
+
+
+def replay_data_bar(conn, my_seat, gold, experience):
+    """照客户端的写法把他收到的包重放一遍，返回右上角数据栏的 `(金币, 总经验)`。
+
+    X_Mod §141 逐指令读出来的写法（全镜像写金币全局 `[0x72e330]` 只有这三处）：
+
+        0x0309  座位 == 我 ⇒ 金币 = 值 3、总经验 = 值 2          （`0x5523e5`）
+        0x0411  座位 == 我 ⇒ 金币 += 本局所得、总经验 = 那一格  （`0x5518bd`）
+        0x0600  金币 / 总经验 = 包里的值                         （`0x553855`）
+
+    `gold` / `experience` 是结算前他那台上的数 —— 故意给一个和存档对不上的，
+    证明最后落在哪儿跟它无关。
+    """
+    for blob in conn.sent:
+        for _, op, body in frames(blob):
+            if op == OP_REP_GAME_RESULT and result_seat(body) == my_seat:
+                # ★ 客户端读的偏移是死的（pkt+0x14 金币 / pkt+0x10 总经验 = 线序
+                #   3 / 2），照抄数字、不借服务端的常量 —— 常量写错了也要抓得到。
+                values = result_values(body)
+                gold, experience = values[3], values[2]
+            elif op == OP_END_GAME and end_game_seat(body) == my_seat:
+                values = end_game_values(body)
+                gold += values[gameserver.END_GAME_MONEY_GAINED]
+                experience = values[gameserver.END_GAME_EXPERIENCE]
+            elif op == gameserver.OP_REP_MONEY:
+                # `build_rep_money`：+0x04 未知 / +0x08 金币 / +0x0c 总经验。
+                gold, experience = struct.unpack_from("<ii", body, 4)
+    return gold, experience
+
+
+class DataBarAfterSettlementTests(BattleRoom):
+    """结算后右上角数据栏（金币 / 经验）和存档对得上（X_Mod §141 / D100）。
+
+    线上 09-29「布洛芬」：`0x0309` 的数据栏四格一直填 0，客户端**绝对赋值** ⇒
+    结算后金币只剩本局所得，全靠看完结算那发 `0x0600` 盖回去；命用完在确认框里
+    点「是」直接 `0x0203` 回大厅就一直错着（存档一个没少）。
+    """
+
+    PLAYERS = (("alice", 0), ("bob", 1))
+
+    def end(self):
+        gameserver.Conn.on_game_packet(self.alice, OP_UPDATE_QUEST_SCORE,
+                                       w_i32(40))
+        gameserver.Conn.on_game_packet(self.alice, OP_END_QUEST, b"")
+
+    def results_for(self, conn, seat):
+        """他收到的、座位号 == `seat` 的那一发 `0x0309` 的 12 个业务值。"""
+        return result_values([b for b in bodies(conn, OP_REP_GAME_RESULT)
+                              if result_seat(b) == seat][0])
+
+    def test_my_own_result_carries_the_data_bar(self):
+        self.end()
+        for name, seat in self.PLAYERS:
+            saved = self.accounts.saved[name]
+            values = self.results_for(getattr(self, name), seat)
+            self.assertEqual(saved["experience"],
+                             values[gameserver.GAME_RESULT_BAR_EXPERIENCE])
+            # 金币格 = 余额 − 本局所得：`0x0411` 紧接着还要 += 本局所得。
+            self.assertEqual(saved["money"] - values[gameserver.GAME_RESULT_MONEY],
+                             values[gameserver.GAME_RESULT_BAR_MONEY])
+            self.assertEqual(
+                gameserver.experience_bounds(saved["experience"]),
+                (values[gameserver.GAME_RESULT_BAR_LEVEL_START_EXP],
+                 values[gameserver.GAME_RESULT_BAR_NEXT_LEVEL_EXP]))
+
+    def test_the_data_bar_is_right_the_moment_the_result_arrives(self):
+        # 不等 0x0405、不等 0x0600：光凭 0x0309 + 0x0411，数据栏就已经是存档里的数。
+        self.end()
+        for name, seat in self.PLAYERS:
+            conn = getattr(self, name)
+            saved = self.accounts.saved[name]
+            self.assertNotIn(gameserver.OP_REP_MONEY, opcodes(conn))
+            self.assertEqual((saved["money"], saved["experience"]),
+                             replay_data_bar(conn, seat, gold=99999,
+                                             experience=12345))
+
+    def test_nobody_else_learns_my_balance(self):
+        # 别人那一座位的 0x0309 客户端本来就不认（座位 ≠ 我），填了只是泄露余额。
+        self.end()
+        for conn, other_seat in ((self.alice, 1), (self.bob, 0)):
+            values = self.results_for(conn, other_seat)
+            self.assertEqual([0, 0, 0, 0], [values[i] for i in (2, 3, 5, 6)])
+
+    def test_the_unknown_cells_stay_zero_in_every_copy(self):
+        # 第 4 格非 0 = 「疑似外挂，结束客户端」（`0x691d58`）—— 一份都不许有。
+        self.end()
+        for conn in (self.alice, self.bob):
+            for body in bodies(conn, OP_REP_GAME_RESULT):
+                values = result_values(body)
+                self.assertEqual([0] * 5, [values[i] for i in (0, 1, 4, 7, 8)])
+
+    def test_a_huge_balance_does_not_cost_the_room_its_settlement(self):
+        # `apply_battle` 不钳余额。金币格撑破 int32 的话 `struct.pack` 在结算
+        # 循环里抛出去，两个人都收不到结算 —— 钳住，别让一个人的存档连累全房间。
+        self.accounts.saved["alice"]["money"] = 2 ** 31 + 5
+        self.end()
+        for conn in (self.alice, self.bob):
+            self.assertEqual(2, len(bodies(conn, OP_END_GAME)))
+
+    def test_leaving_straight_from_the_result_resyncs_before_the_reply(self):
+        # 命用完的确认框点「是」：结算后直接 0x0203，没有 0x0405。
+        self.end()
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_LEAVE_SESSION, b"")
+        ops = opcodes(self.alice)
+        self.assertLess(ops.index(gameserver.OP_REP_MONEY),
+                        ops.index(OP_LEAVE_SESSION))
+        money = struct.unpack_from(
+            "<i", bodies(self.alice, gameserver.OP_REP_MONEY)[0], 4)[0]
+        self.assertEqual(self.accounts.saved["alice"]["money"], money)
+
+    def test_the_normal_way_back_resyncs_exactly_once(self):
+        # 看完结算（0x0405 → 0x0403 + 0x0600）之后再退房：退房那一下不再补。
+        self.end()
+        gameserver.Conn.on_game_packet(self.alice, gameserver.OP_LEAVE_RESULT, b"")
+        self.assertEqual(1, opcodes(self.alice).count(gameserver.OP_REP_MONEY))
+        self.clear()
+        gameserver.Conn.on_game_packet(self.alice, OP_LEAVE_SESSION, b"")
+        self.assertNotIn(gameserver.OP_REP_MONEY, opcodes(self.alice))
+
+    def test_leaving_mid_battle_does_not_resync(self):
+        # 没结算过（队友还在打、他先走了）⇒ 数据栏没被动过，不补。
+        gameserver.Conn.on_game_packet(self.alice, OP_LEAVE_SESSION, b"")
+        self.assertIn(OP_LEAVE_SESSION, opcodes(self.alice))
+        self.assertNotIn(gameserver.OP_REP_MONEY, opcodes(self.alice))
+
+
 def reward_fields(body):
     """把一发 `0x041c` 解回 `(座位, 槽类型, 物品 id, 数量)`。"""
     return struct.unpack_from("<4i", body, 0)

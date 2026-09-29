@@ -2343,9 +2343,35 @@ GAME_RESULT_EXPERIENCE = 9      # 「经验值 +N」
 GAME_RESULT_MONEY = 10          # 「金币 +N」
 GAME_RESULT_LADDER_POINT = 11   # 「竞技场分数 +N」（闯关模式没有天梯分，发 0）
 
-#: 剩下 9 个值一律 0。⚠ **别一次全填** —— `gameresult-probe` 把 12 个值填成
-#: 201..212 时客户端 20 毫秒内主动断链（§100），至今没查出是哪一格干的。
-#: 这三个是逐格验过的，其余保持 D019 的「不懂就填 0」。
+#: ★★ 右上角数据栏那四格（X_Mod §141 / D100）—— 线序 2 / 3 / 5 / 6。
+#:
+#: 处理器 `0x55210d` 在「包里座位号 == 我」（`0x5523d9 call 0x409f7d`）时把它们
+#: **绝对赋值**给数据栏的四个全局（`0x5523e5..0x552400`），和 `0x0600` 写的是同一组：
+#:
+#:     值 2 -> [0x72e33c]  总经验
+#:     值 3 -> [0x72e330]  ★ 金币
+#:     值 5 -> [0x72e340]  本级起始总经验
+#:     值 6 -> [0x72e344]  下一级所需总经验
+#:
+#: 紧接着的 `0x0411` 把经验三件套再绝对写一遍、金币 `+=` 本局所得 ⇒ 金币那格要填
+#: 「结算后余额 − 本局所得」。以前四格全填 0 ⇒ 结算后客户端金币只剩本局所得，
+#: 全靠看完结算那发 `0x0600` 盖回去；命用完在确认框里点「是」直接 `0x0203`
+#: 回大厅就一直错着 —— 玩家报的「金币被清零」（存档其实一个没少）。
+#: ★ 只给**收包人自己那个座位**那一份填（`send_end_game` 的 `own_results`）：
+#:   别人那几份客户端本来就不认，填了只是把余额白白发给同房的人。
+GAME_RESULT_BAR_EXPERIENCE = 2
+GAME_RESULT_BAR_MONEY = 3
+GAME_RESULT_BAR_LEVEL_START_EXP = 5
+GAME_RESULT_BAR_NEXT_LEVEL_EXP = 6
+
+#: 剩下 5 个值（0 / 1 / 4 / 7 / 8）一律 0（D019 的「不懂就填 0」）：
+#:
+#: ⚠⚠ **值 4 绝对不许非 0** —— 「座位 == 我」时它非 0 就弹
+#:   「해킹 프로그램 사용이 의심되어 클라이언트를 종료합니다.」（`0x691d58`，
+#:   疑似外挂、结束客户端）而且整包其余不处理。V0.1 §100 把 12 个值填成
+#:   201..212 时「20 毫秒内主动断链」多半就是它（X_Mod §141）。
+#: 值 1 非 0 = 「升级了」：客户端 `inc` 等级再弹升级提示（`0x552444`）。等级我们
+#:   一直走 `0x0600` 的绝对值，不用这一格（用的话得和 `0x0600` 那一格对账，没验过）。
 
 
 #: ═══ 一局打完给多少经验 / 金币（§227 / D148）════════════════════════════
@@ -2564,16 +2590,33 @@ def quest_materials(quest_id, difficulty, cleared, mode="quest", rng=None):
     return materials, warnings
 
 
-def build_game_result_values(experience=0, money=0, ladder_point=0):
-    """按 §116 的语义组 `gspRepGameResult` 的 12 个业务值（其余全 0）。
+def build_game_result_values(experience=0, money=0, ladder_point=0,
+                             data_bar=None):
+    """按 §116 / X_Mod §141 的语义组 `gspRepGameResult` 的 12 个业务值（其余全 0）。
 
-    三个都是**本局增量**（界面上就写成 `+%d`），不是账号总额 ——
-    和 `0x0411 gspEndGame` 那三个「绝对累计值」正好相反，别搞混。
+    `experience` / `money` / `ladder_point` 是结算界面那三行的 `+%d`，都是
+    **本局增量**，不是账号总额 —— 和 `0x0411 gspEndGame` 那三个「绝对累计值」
+    正好相反，别搞混。
+
+    `data_bar` = `(总经验, 结算后余额, 本级起始总经验, 下一级所需总经验)`，
+    **只在给收包人自己那个座位组包时传**（见 `GAME_RESULT_BAR_*`）。不传就和
+    以前逐字节相同。金币那格写的是「结算后余额 − `money`」—— 客户端紧接着拿
+    `0x0411` 的本局所得 `+=` 上去，所以 `money` 必须和 `0x0411` 的
+    `money_gained` 是同一个数（`send_end_game` 里就是同一个变量）。
+    ★ 那一格钳在 int32 里：`apply_battle` 不钳余额，一个异常大的余额不能让
+      `struct.pack` 在结算循环里抛出去 —— 那会让**全房间**都收不到结算。
     """
     values = [0] * GAME_RESULT_VALUE_COUNT
     values[GAME_RESULT_EXPERIENCE] = int(experience)
     values[GAME_RESULT_MONEY] = int(money)
     values[GAME_RESULT_LADDER_POINT] = int(ladder_point)
+    if data_bar is not None:
+        total_exp, balance, level_start_exp, next_level_exp = data_bar
+        values[GAME_RESULT_BAR_EXPERIENCE] = int(total_exp)
+        values[GAME_RESULT_BAR_MONEY] = max(
+            -2 ** 31, min(2 ** 31 - 1, int(balance) - int(money)))
+        values[GAME_RESULT_BAR_LEVEL_START_EXP] = int(level_start_exp)
+        values[GAME_RESULT_BAR_NEXT_LEVEL_EXP] = int(next_level_exp)
     return values
 
 
@@ -2624,6 +2667,9 @@ def build_rep_game_result(seat_id=0, values=None, tail=None):
     只发 `0x0411` 的话结算界面构造得出来却没有数据，于是画面上什么都不显示 ——
     §93 观察到的「`[GameContext+4]==1` 但看不见界面」就是这个原因。
 
+    ★★ 但 `0x0309` **也写数据栏**（X_Mod §141）：座位 == 我时线序 2/3/5/6
+    绝对赋值给那四个全局，而且比 `0x0411` 先到 —— 见 `GAME_RESULT_BAR_*`。
+
     反序列化 `0x54c6b4` 依次读 13 个 4 字节字段再读一个 int32 数组。**两个 bool
     字段在线上也是 4 字节**（`0x5d59de` 读 4 字节再折成 1 字节存），别写成 1 字节
     —— 但它们在**结构体里**只占 1 字节且挨在一起（`+0x24` / `+0x25`），
@@ -2633,7 +2679,14 @@ def build_rep_game_result(seat_id=0, values=None, tail=None):
 
         pkt+0x04  座位号   ← 先过 `0x4045f9` 的座位有效性检查，不合法整包丢弃
         pkt+0x0c  bool     -> [GameContext + seat + 0x164]   （值 1）
-        pkt+0x18  非 0 时走 `0x552170` 的提示分支             （值 4）
+                             座位 == 我且非 0 ⇒ `inc [0x72e338]` 等级 + 升级提示
+        pkt+0x10           座位 == 我 ⇒ [0x72e33c] = 值      （值 2 = 总经验）
+        pkt+0x14           座位 == 我 ⇒ [0x72e330] = 值      （值 3 = ★ 金币）
+        pkt+0x18  座位 == 我且非 0 ⇒ `0x552170`「疑似外挂，结束客户端」，
+                  整包其余不处理                             （值 4，永远填 0）
+        pkt+0x1c           座位 == 我 ⇒ [0x72e340] = 值      （值 5 = 本级起点）
+        pkt+0x20           座位 == 我 ⇒ [0x72e344] = 值      （值 6 = 下一级）
+        pkt+0x24  bool     -> [0x72e368]                      （值 7）
         pkt+0x25  bool     -> `0x493dd4` 的第 2 个参数        （值 8）
         pkt+0x28           -> [GameContext + seat*4 + 0x2c]  （值 9  = 经验值）
         pkt+0x2c           -> [GameContext + seat*4 + 0x5c]  （值 10 = 金币）
@@ -2646,8 +2699,9 @@ def build_rep_game_result(seat_id=0, values=None, tail=None):
     ★ **`0x0309` 只能在战斗中发**：`0x55210d` 直接解引用 GameContext，
     关卡一结束它就变 0（§93 实测），那时再发就是空指针崩溃。
 
-    12 个业务值里查明了三个（会话 18，§116，见 `build_game_result_values`）——
-    结算界面「经验值 / 金币 / 竞技场分数」三行；剩下 9 个按 D019 保持 0。
+    12 个业务值里用上了七个（见 `build_game_result_values`）：结算界面
+    「经验值 / 金币 / 竞技场分数」三行（会话 18，§116）+ 收包人自己那一份的
+    数据栏四格（X_Mod §141 / D100）；剩下 5 个按 D019 保持 0。
     **通关标签不在这 12 个里，在尾部数组里**（会话 17 查明，§112）；
     **「分数 / 生命」那一行也不在这个包里，在 `0x0411` 里**（§116）。
     """
@@ -10124,7 +10178,8 @@ class Conn:
                           f"（1=胜 / -1=负 / 0=不判）")
 
         # ---- ① 每个人先入账，并把「他那一份 0x0309 / 0x0411」备好 --------
-        results = {}     # 座位 -> 0x0309 的载荷
+        results = {}     # 座位 -> 0x0309 的载荷（发给房里别人的那份）
+        own_results = {}  # 座位 -> 发给**他本人**的那份 0x0309（多带数据栏四格，§141）
         end_games = {}   # 座位 -> (0x0411 的载荷, 日志用的数)
         rewards = {}     # 座位 -> [0x041c 的载荷…]（合成材料 + 称号卡片）
         # ★ 闯关的关卡 id / 难度：房里每个人读到的是同一份（`current_quest()`
@@ -10336,13 +10391,25 @@ class Conn:
                                             for i, n in sorted(granted.items()))))
             experience = int((conn.account or {}).get("experience", 0))
             level_start_exp, next_level_exp = experience_bounds(experience)
+            balance = player_money(conn.account)
             #   · 业务值 9/10/11 = 界面上「经验值 / 金币 / 竞技场分数」三行的 +N
-            #     （§116）。闯关模式没有天梯分，第三格发 0。其余 9 个仍按 D019 填 0
-            #     —— §100 那次「12 个值一次全填」会让客户端 20 毫秒内断链。
+            #     （§116）。闯关模式没有天梯分，第三格发 0。
             results[seat] = build_rep_game_result(
                 seat,
                 values=build_game_result_values(experience=gained_exp,
                                                 money=gained_money),
+                tail=tail)
+            #   · ★★ 发给他**本人**的那份再带上右上角数据栏四格（X_Mod §141 / D100）：
+            #     客户端在「座位 == 我」时把线序 2/3/5/6 绝对赋值给数据栏，以前全 0
+            #     ⇒ 结算后他那台金币只剩本局所得，命用完点「是」直接回大厅就一直错着。
+            #     经验三件套和下面 `0x0411` 用同一组数，金币填「余额 − 本局所得」
+            #     （`0x0411` 紧接着 += 本局所得）。别人收到的这一座位照旧是上面那份。
+            own_results[seat] = build_rep_game_result(
+                seat,
+                values=build_game_result_values(
+                    experience=gained_exp, money=gained_money,
+                    data_bar=(experience, balance,
+                              level_start_exp, next_level_exp)),
                 tail=tail)
             # ★ 破纪录播报（§127）：没破的那一局两格都是 0 ⇒ `0x0411` 和本版
             #   之前**逐字节相同**。所以 `kind == 0` 时用时那格也要发 0，
@@ -10365,7 +10432,8 @@ class Conn:
                      f"-> 本局经验+{gained_exp} "
                      f"金币+{gained_money}"
                      f"（固定 {gained_money - picked_coins} + 捡到 {picked_coins}）；"
-                     f"总经验={experience} (本级 {level_start_exp}..{next_level_exp})")
+                     f"总经验={experience} (本级 {level_start_exp}..{next_level_exp})；"
+                     f"余额={balance}")
 
         # ---- ② 再逐个连接下发 --------------------------------------------
         # ★ 不合并成一次 sendall：V0.1 单人时这两个包就是分开发的，实机验过
@@ -10383,10 +10451,13 @@ class Conn:
                     for payload in rewards[other_seat]:
                         conn.send(build_game(OP_REWARD_RECEIVED, payload))
                 # 结算界面的数据源，必须排在 0x0411 之前，且只能在 GameContext
-                # 还活着的时候发（§99）。每个在座座位一份。
+                # 还活着的时候发（§99）。每个在座座位一份；**他自己那个座位**
+                # 发带数据栏的那份（§141）。
                 for other_seat in sorted(results):
                     conn.send(build_game(OP_REP_GAME_RESULT,
-                                         results[other_seat]))
+                                         own_results[other_seat]
+                                         if other_seat == seat
+                                         else results[other_seat]))
                 # 0x0411 也是每座位一份，但**自己那份必须是第一发**
                 # （弹结算界面的是第一发，见上面的注释）。
                 for other_seat in end_game_order(seat, end_games):
@@ -11963,7 +12034,9 @@ class Conn:
         `0x0203`（客户端方向）只有一个发送点 `0x406191`，四个调用方共用：
 
         * `0x46739c` —— RoomStage 的「90 秒没动作」提示框弹完顺手发的
-        * `0x4a50f4` / `0x4a5a85` —— 房间里的退出/ESC
+        * `0x4a50f4` —— **战斗里**命用完的确认框「要结束游戏并移动至游戏大厅吗?」点确认
+        * `0x4a5a85` —— **战斗里**闯关 15 秒不往前走自动退房
+          （这两处 V0.1 §101 记成「房间里的退出/ESC」，X_Mod §141 订正）
         * `0x54be4c` —— 网络层的状态处理
 
         也就是说**「挂机踢出」和「玩家自己退房」发的是同一个空包**，
@@ -11972,7 +12045,20 @@ class Conn:
         不回的后果（会话 12 实测）：客户端留在房间里，`RoomStage::Update`
         每 90 秒重新弹一次提示框，弹出来的框一个摞一个 ——
         用户看到的就是「点确认没反应、关不掉」。
+
+        ★★ **结算后没走 `0x0405` 就退房**（X_Mod §141 / D100）：命用完时客户端弹
+        「要结束游戏并移动至游戏大厅吗?」（函数 `0x4a4fd3`，发送点即上面的 `0x4a50f4`），
+        结算到了之后才点「是」就直接发这一发 —— 看完结算那条路
+        （`leave_game_result` 补 `0x0600`）被跳过了。所以 `settled`
+        （结算包已经发给他、他还没回房间）时先补一发 `0x0600`，把金币 / 经验 /
+        **等级**一起和存档对齐（那一局升了级的话，`0x0309` 的数据栏四格管不到等级）。
+        排在 `0x0203` 回包**前面**：`0x0600` 的处理器 `0x553855` 只写全局、不碰
+        任何场景对象，先到先写 ⇒ 大厅建出来时数据栏已经是新值。TCP 本身保序，
+        不用 `send_batch`。
         """
+        if self.settled:
+            self.send_rep_money(
+                reason="（结算后没走 0x0405 就退房，数据栏在这儿和存档对齐，§141）")
         self.log("← 回 gspRepLeaveSession(result=0) —— 离开房间，客户端切回大厅")
         self.send(build_game(OP_LEAVE_SESSION, build_rep_leave_session(0)))
         # 房间没了，跟房间绑定的状态全部作废，否则下次建房会带着上一局的残留。
@@ -11987,9 +12073,11 @@ class Conn:
     def leave_game_result(self):
         """结算界面看完了：切回房间，再把玩家数据栏刷成存档里的值。
 
-        ★ **回房间后金币会变成 0**（会话 11 实测，§100）—— 经验和等级都还在，
-        唯独金币这一格被清掉。补一发 `0x0600` 就好了，顺带也让经验/等级和存档
-        重新对齐一次。
+        ★ 补一发 `0x0600` 让数据栏（金币 / 经验 / 等级）和存档再对齐一次。
+        当年（会话 11，V0.1 §100）看到的「回房间后金币变成 0」其实不是回房间
+        清的：是 `0x0309` 线序第 3 格被我们填 0、客户端绝对赋值（X_Mod §141）。
+        那一格现在填了真值（D100），这一发留着兜底 —— 等级只有它下发绝对值。
+        ⚠ 这一发**不一定来**：结算后直接 `0x0203` 退房的，由 `leave_session` 补。
 
         座位的物品清单也顺手补一发 `0x030b`（★ **每个有人的座位各一发**，
         §63 —— 别人那几格和自己那一格同样会被清）。这一发是**防御性**的：
@@ -12006,7 +12094,7 @@ class Conn:
         with self.send_batch("；回房间三连发不能被客户端的 recv 切开"):
             self.log("← 回 0x0403（结算看完 -> 切回 stage 5 房间）")
             self.send(build_game(OP_LOADING_DONE, b""))
-            self.send_rep_money(reason="（回房间后金币会被清 0，重新同步）")
+            self.send_rep_money(reason="（回房间，数据栏和存档再对齐一次）")
             self.send_room_equipped_lists(
                 reason="（回房间后清单会被重建，重新同步）")
         # 回到房间就可以再开一局，把开局状态机和本局的关卡状态复位。
