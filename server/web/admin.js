@@ -1488,7 +1488,7 @@ function renderToolbar(which) {
   if (!FILTER[which]) { FILTER[which] = emptyFilter(); }
   var filter = FILTER[which];
 
-  // ★ 「金币 / 经验获取」页没有筛选条（D72）：档位固定 30 格，一屏就画完了，
+  // ★ 「金币 / 经验获取」页没有筛选条（D72）：档位固定 32 格，一屏就画完了，
   //   搜什么、筛什么都没有意义。工具条上只留下面那个「↻ 刷新」。
   //   金币 / 经验的切换在下一行（`paintCfgTabs`），不挤在这儿。
   // ★ 称号卡片页 2026-09-13 第四轮也把筛选条清空了（用户点的题）：
@@ -3348,8 +3348,8 @@ function cardCondFix(cond, wasMetric) {
 
 /* -------------------------------------------- 金币 / 经验获取：两张表格
    用户 2026-09-10 点的题（D72）：
-     · 第一张 = 对战模式（生存 / 夺分 × 道具战）× 个人战 / 组队战，格子里
-       填输 / 赢各给多少；
+     · 第一张 = 对战模式（生存 / 夺分 × 道具战，外加没有道具战的格斗 ——
+       X_Mod D103）× 个人战 / 组队战，格子里填输 / 赢各给多少；
      · 第二张 = 闯关的 7 个关卡 × 简单 / 普通 / 困难，格子里填未通关 / 通关。
    顶上「金币 / 经验」一切换，同两张表换填另一对字段 —— 行列不变，
    人不用重新找位置。经验那一半下面多两个加成系数的输入框。
@@ -3588,11 +3588,22 @@ function renderRewards(list, entries) {
   var teams = rewardOptions("team").map(function (option) {
     return {label: option.label, key: option.value};
   });
+  // ★ 哪几行有格子照服务端的默认表（`CAT.reward_defaults`），不在这儿写死：
+  //   格斗模式没有道具战（客户端强制无道具，服务端 `lobby.item_mode_of`
+  //   同口径），默认表里就没有那两档 ⇒ 这里也不画「格斗模式道具战」那一行
+  //   —— 画出来就是一行永远填不进去的「—」（X_Mod D103）。
+  var drawn = {};
+  (CAT.reward_defaults || []).forEach(function (row) {
+    if (row.mode === "pvp") {
+      drawn[[row.pvp_mode, row.item_mode ? 1 : 0].join("|")] = true;
+    }
+  });
   var pvpRows = [];
-  // ★ 行序照用户写的：生存 / 夺分 / 生存道具战 / 夺分道具战
-  //   —— 先按「有没有道具」分两批，每批里按模式排。
+  // ★ 行序照用户写的：生存 / 夺分 / 生存道具战 / 夺分道具战，格斗（X_Mod D103）
+  //   接在夺分后面 —— 先按「有没有道具」分两批，每批里按 `PVP_MODE_ZH` 的顺序排。
   [false, true].forEach(function (itemMode) {
     rewardOptions("pvp_mode").forEach(function (mode) {
+      if (!drawn[[mode.value, itemMode ? 1 : 0].join("|")]) { return; }
       pvpRows.push({
         label: mode.label + (itemMode ? "道具战" : ""),
         entryOf: function (group) {

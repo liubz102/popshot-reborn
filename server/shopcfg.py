@@ -416,15 +416,21 @@ DIFFICULTY_ZH = {1: "简单", 2: "普通", 3: "困难"}
 #: 对战的**游戏模式号**（房间描述符 `arguments[1]`）→ 游戏里的中文名。
 #: 奖励表（D72）的行标题用它。
 #:
-#: ★ **只列玩家选得到的两种**。引擎里一共四个号
-#: （`gameserver.PVP_MODE_*`：0 生存 / 1 计时 / 2 무투전 / 3 夺分），
-#: 但中国区建房下拉框只给生存和夺分 —— 低等级号选了生存还会被客户端自己
-#: 改回夺分（`hook/bshook.c` 的 `try_patch_player_level_gate` 第 3 / 4 处）。
-#: 列上 1 / 2 只会让运营配出两行永远命中不到的数；真收到那两个号，
-#: 由 `gameserver.PVP_MODE_ROW` 归档到这两行里。
+#: ★ **只列玩家选得到的三种**。引擎里一共四个号
+#: （`gameserver.PVP_MODE_*`：0 生存 / 1 计时 / 2 무투전 / 3 夺分）。
+#: 中国区建房下拉框原版只给生存和夺分 —— 低等级号选了生存还会被客户端自己
+#: 改回夺分（`hook/bshook.c` 的 `try_patch_player_level_gate` 第 3 / 4 处）；
+#: 格斗是 X16 起 bshook 放出来的（X_Mod §118），X_Mod D103 起单独占一档。
+#: 列上 1 只会让运营配出一行永远命中不到的数；真收到这个号，
+#: 由 `gameserver.PVP_MODE_ROW` 归到夺分那一行。
 #:
-#: 中文名照 `Chinese.ini` 的官方译法：`서바이벌=生存模式` / `맥스=夺分模式`。
-PVP_MODE_ZH = {0: "生存模式", 3: "夺分模式"}
+#: ★ **顺序有用、别排序**：它就是管理页对战表从上到下的行序
+#:   （`admin.js` 的 `renderRewards` 照 SCHEMA 的 options 画），
+#:   格斗接在原来两行后面，老的两行位置不动。
+#:
+#: 中文名照 `Chinese.ini` 的官方译法：`서바이벌=生存模式` / `맥스=夺分模式` /
+#: `무투전=格斗模式`。
+PVP_MODE_ZH = {0: "生存模式", 3: "夺分模式", 2: "格斗模式"}
 
 #: 组队开关（`arguments[0]`，`lobby.NORMAL_ARGUMENT_TEAM_MODE`）→ 中文。
 TEAM_ZH = {0: "个人战", 1: "组队战"}
@@ -1689,7 +1695,7 @@ def default_drops():
 def default_rewards():
     """默认 `rewards.json` = `shopdefaults.build_rewards()`（D72）。
 
-    ★ 30 档的初值**逐个等于 2026-09-10 之前那两个硬编码公式算出来的数**
+    ★ 32 档的初值**逐个等于 2026-09-10 之前那两个硬编码公式算出来的数**
     （`test_shopdefaults` 的平价用例守着），所以这一版上线时玩家收入一分不变。
     """
     import shopdefaults
@@ -1913,12 +1919,28 @@ MAX_REWARD = 1000000
 REWARD_MODES = ("pvp", "quest", "bonus")
 
 
+def reward_key(rule):
+    """一档奖励的身份：`("pvp", 模式, 道具战, 队伍)` / `("quest", 关卡, 难度)` / `("bonus",)`。
+
+    ★ 收的是**已经规整过**的记录（`validate_rewards()` 的输出、或默认表）——
+      手写的原始 json 先过校验再来问。「同一档不许写两遍」和开服补档
+      （`backfill_rewards`）认的是同一个身份。
+    """
+    mode = rule.get("mode")
+    if mode == "pvp":
+        return ("pvp", int(rule["pvp_mode"]), bool(rule["item_mode"]),
+                int(rule["team"]))
+    if mode == "quest":
+        return ("quest", int(rule["stage"]), int(rule["difficulty"]))
+    return (mode,)
+
+
 def validate_rewards(raw):
     """`rewards.json` → `[档位…]`；有一条不对就抛 `ConfigError`（D72）。
 
     三种形状共用一个列表（`mode` 分流）：
 
-        {mode:"pvp",   pvp_mode, item_mode, team,  win_*/lose_*}   对战 8 条
+        {mode:"pvp",   pvp_mode, item_mode, team,  win_*/lose_*}   对战 10 条
         {mode:"quest", stage, difficulty,          win_*/lose_*}   闯关 21 条
         {mode:"bonus", quest_score_per_exp, pvp_exp_per_kill}      加成系数 1 条
 
@@ -1955,18 +1977,17 @@ def validate_rewards(raw):
                               _default_bonus("pvp_exp_per_kill")),
                     where + ".pvp_exp_per_kill", low=0, high=MAX_REWARD),
             }
-            key = ("bonus",)
         else:
             rule = {"mode": mode}
             if mode == "pvp":
-                # ★ 校验器**不限**游戏模式号：模式有几种是客户端的事。表里只放
-                #   生存(0) / 夺分(3)，别的号在结算时由 `PVP_MODE_ROW` 归档过来。
+                # ★ 校验器**不限**游戏模式号：模式有几种是客户端的事。表里放
+                #   生存(0) / 夺分(3) / 格斗(2)，别的号在结算时由 `PVP_MODE_ROW`
+                #   归档过来。
                 rule["pvp_mode"] = _as_int(entry.get("pvp_mode"),
                                            where + ".pvp_mode", low=0)
                 rule["item_mode"] = bool(entry.get("item_mode", False))
                 rule["team"] = _as_int(entry.get("team", 0),
                                        where + ".team", low=0, high=1)
-                key = ("pvp", rule["pvp_mode"], rule["item_mode"], rule["team"])
             else:
                 # 关卡不设上限（同 `validate_drops` 的理由）；难度上限跟着
                 # `DIFFICULTY_ZH` 走 —— 中国区选不到第 4 档。
@@ -1975,11 +1996,11 @@ def validate_rewards(raw):
                 rule["difficulty"] = _as_int(entry.get("difficulty"),
                                              where + ".difficulty",
                                              low=1, high=max(DIFFICULTY_ZH))
-                key = ("quest", rule["stage"], rule["difficulty"])
             for field in ("win_money", "lose_money", "win_exp", "lose_exp"):
                 rule[field] = _as_int(entry.get(field, 0),
                                       "%s.%s" % (where, field),
                                       low=0, high=MAX_REWARD)
+        key = reward_key(rule)
         if key in seen:
             raise ConfigError("%s：这一档奖励写了两遍（%s）" % (where, key))
         seen.add(key)
@@ -2388,7 +2409,7 @@ SCHEMA = {
     # ★ 这一页是**一张卡片一行**，17 行定死（V0.3商店）：卡片是原版物品表里
     #   就有的那 17 件，加不出新的，所以没有「添加」也没有删除 ——
     #   「这一版不给」= 把「能获得」关掉。管理页一打开照 catalog 把文件里
-    #   缺的补齐（`fillCards`，同「金币 / 经验」那 30 格的套路）。
+    #   缺的补齐（`fillCards`，同「金币 / 经验」那 32 格的套路）。
     "cards": {
         "list_key": "rules",
         #: ★ 页名是用户 2026-09-13 点的名字，和「材料掉落」成对。
@@ -2501,10 +2522,11 @@ SCHEMA = {
                          {"value": "quest", "label": "闯关"},
                          {"value": "bonus", "label": "加成系数"}]},
             # 下面六个各自只出现在一种形状的记录里 ⇒ 全是 optional。
+            # ★ 不排序：`PVP_MODE_ZH` 的顺序就是对战表的行序（生存 / 夺分 / 格斗）。
             {"key": "pvp_mode", "label": "对战模式", "type": "choice",
              "optional": True, "empty_label": "不限",
              "options": [{"value": n, "label": name}
-                         for n, name in sorted(PVP_MODE_ZH.items())]},
+                         for n, name in PVP_MODE_ZH.items()]},
             {"key": "item_mode", "label": "道具战", "type": "bool",
              "optional": True},
             {"key": "team", "label": "队伍", "type": "choice",
@@ -2544,7 +2566,11 @@ SCHEMA = {
 #: 是因为 `default_rewards()` 要 `import shopdefaults`，而那边 `import shopcfg`
 #: —— 加载阶段谁都不许调对方（模块头的「别绕成环」）。
 def reward_defaults():
-    """默认的 30 档（含 `mode:"bonus"` 那一条）。给 `/admin/api/catalog` 用。"""
+    """默认的 32 档（含 `mode:"bonus"` 那一条）。给 `/admin/api/catalog` 用。
+
+    ★ 管理页对战表**画哪几行**也照它（`renderRewards`）：格斗没有道具战那两档，
+      表上也就没有「格斗模式道具战」那一行（X_Mod D103）。
+    """
     return default_rewards()["rules"]
 
 
@@ -2821,9 +2847,7 @@ def ensure_files(data_dir=None):
 #:   好几条不同关卡 / 难度的规则），「有没有」判不出来，补齐只会补出重复。
 #: ★ `rewards.json` 也不在里面，但理由相反 —— 它的身份是个**元组**
 #:   （模式 / 对战模式 / 道具战 / 队伍 / 关卡 / 难度），这里这套「一个键」的
-#:   形状装不下。而且它根本不需要：管理页一打开就照
-#:   `SCHEMA["rewards"]` 的默认档位把缺的补齐（`admin.js` 的 `fillRewards`），
-#:   服务端这边缺档位时直接退回内置默认值（`_USE_DEFAULT`）。
+#:   形状装不下。它有自己的一份 `backfill_rewards()`（X_Mod D103，开服跑）。
 BACKFILL_KEYS = {
     #: ★ 物品库尤其要它：物品表里加进来的东西、以前漏收的类别，
     #:   都只能靠这里补 —— 「物品库列不全」正是用户 2026-09-06 报的问题。
@@ -3098,3 +3122,64 @@ def backfill_new_weapons(data_dir=None, apply=False):
     if apply and added:
         invalidate(data_dir)
     return added
+
+
+def backfill_rewards(data_dir=None, apply=False):
+    """★ 奖励表缺的档位按**内置默认值**补进 `rewards.json`（X_Mod D103）。
+
+    返回补进去的那些档位（默认表里的原样记录；`apply=False` 只算不写）。
+    文件读不了 / 校验不过抛 `ConfigError`，**一个字节都不写**（D10：可能正编辑
+    到一半）；文件不在返回空 —— 那该由 `ensure_files` 去生成。
+
+    为什么要它：格斗模式单独占了两档（个人战 / 组队战）。老服务器上的
+    `rewards.json` 是上一版生成、又经管理页保存过的，**里面没有这两档**，
+    而 `ensure_files` 对已存在的文件一律不碰（D7）。不补的话结算照样按内置
+    默认值发（`gameserver._reward_row`），但每局格斗都在日志里喊一句
+    「没有这一档」，运营在文件里也找不到它。
+
+    ## 为什么敢**每次开服都跑**（V0.3商店 D106④「幂等 ≠ 一次性」在这儿不成立）
+
+    D106④ 怕的是「运营删掉的东西开服又自己回来」。奖励表没有这种事：
+    「文件里没有这一档」和「这一档按内置默认值发」在结算那一侧**本来就是同一件
+    事**（`_reward_row` 缺档退回默认表）⇒ 补进去的数正是它此刻实际在发的数，
+    补与不补，玩家拿到的一分不差。运营也删不掉一档：管理页那张表是固定格子、
+    没有删除键，打开时 `fillRewards` 还会把缺的现补出来、保存时一起落盘。
+    ⇒ 判据就是「文件里有没有这一档」这个事实本身，补完它自己就不成立了，
+    不需要「跑过没有」的标记。
+
+    ★ **只增不改**：已有的档位一个字节都不动，运营改过的数全留着（铁律 11）；
+      **幂等** —— 补完再跑是空的。补在同一种形状的最后一条后面（格斗那两档
+      紧跟着原来的对战档），拿记事本改文件的人不用满文件找。
+    ★ 写盘那一路和别处一样：先留 `*.bak-<时刻>`、过 `validate_rewards`、
+      整段「读盘 → 合并 → 写盘」拿和管理页保存 / 数据备份**同一把写锁**。
+    """
+    path = path_of(REWARDS_FILENAME, data_dir)
+    if not os.path.exists(path):
+        return []                       # 没有就该由 `ensure_files` 去生成
+    with write_lock(REWARDS_FILENAME):
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                raw = json.load(fp)
+            have = set(reward_key(rule) for rule in validate_rewards(raw))
+        except (OSError, ValueError, ConfigError) as exc:
+            raise ConfigError("%s 读不了或不合法（%s），缺的档位没有补"
+                              % (path, exc))
+        fresh = [rule for rule in default_rewards()["rules"]
+                 if reward_key(rule) not in have]
+        if not (apply and fresh):
+            return fresh
+        rules = list(raw["rules"])
+        for rule in fresh:
+            at = len(rules)
+            for index, entry in enumerate(rules):
+                if isinstance(entry, dict) and entry.get("mode") == rule["mode"]:
+                    at = index + 1
+            rules.insert(at, rule)
+        merged = dict(raw)
+        merged["rules"] = rules
+        validate_rewards(merged)        # 宁可什么都不写，也不写一份读不了的
+        shutil.copyfile(path, "%s.bak-%s"
+                        % (path, time.strftime("%Y%m%d-%H%M%S")))
+        write_json(path, merged)
+    invalidate(data_dir)
+    return fresh

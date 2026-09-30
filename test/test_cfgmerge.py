@@ -298,6 +298,9 @@ class LabelTests(unittest.TestCase):
         self.assertIn("困难", quest)             # 难度 3
         self.assertIn("加成系数", cfgmerge.label_of(
             "rewards", (("bonus", None, None, None, None, None), 0)))
+        # 格斗那两档（X_Mod D103）：开服补档的日志也用这句话报它补了谁。
+        self.assertEqual("对战 · 格斗模式 · 个人战", cfgmerge.label_of(
+            "rewards", (("pvp", 2, 0, 0, None, None), 0)))
 
 
 class RewardKeyTests(unittest.TestCase):
@@ -305,7 +308,7 @@ class RewardKeyTests(unittest.TestCase):
     （一个人改生存、另一个人改夺分，后按保存的那个把前一个抹掉，谁也发现不了）。
     """
 
-    def test_默认表三十档的身份两两不同(self):
+    def test_默认表每一档的身份两两不同(self):
         keys = [cfgmerge.natural_key("rewards", rule)
                 for rule in shopcfg.reward_defaults()]
         self.assertEqual(len(keys), len(set(keys)))

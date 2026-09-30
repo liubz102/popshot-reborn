@@ -40,6 +40,7 @@ import authserver
 #   照样启动得起来，直到有人在房间里说第一句话才炸 —— 那时候炸的是玩家的
 #   连接。在这里显式 import 一次，把它变成**启动就炸**。
 import bot                                                     # noqa: F401
+import cfgmerge
 import config as server_config
 import crashstore
 import databackup
@@ -345,6 +346,7 @@ def _report_shop_config():
         eventlog.online(head)
     _report_first_run_upgrades(created)
     _report_new_weapons()
+    _report_reward_slots()
     _report_character_shelf()
 
 
@@ -382,6 +384,36 @@ def _report_new_weapons():
                          for entry in items[:6])
                + ("…" if len(items) > 6 else ""),
                len(shelf), shopcfg.ITEMS_FILENAME))
+    log(head)
+    eventlog.online(head)
+
+
+def _report_reward_slots():
+    """★ 奖励表缺的档位按内置默认值补进 `rewards.json` 的**日志那一半**（X_Mod D103）。
+
+    判断和写盘都在 `shopcfg.backfill_rewards()`（数据层）；这儿只负责说话，
+    和 `_report_new_weapons` 分工一样。这一版要它，是因为格斗模式单独占了
+    两档：老服务器上的 `rewards.json` 没有，`ensure_files` 又不碰已存在的文件（D7）。
+
+    ★ 失败不拦着开服：最坏是「文件里还没有那几档」—— 结算照样按内置默认值发
+      （`gameserver._reward_row`），管理页打开时也会现补出来，保存一次就落盘。
+    ★ **按状态翻转说话**：补完之后每次启动都是空结果，一行都不打。
+    """
+    try:
+        added = shopcfg.backfill_rewards(apply=True)
+    except Exception as error:              # noqa: BLE001 —— 见 docstring
+        log(f"⚠ 奖励表补档没做（{error}）；缺的档位结算时照样按内置默认值发。"
+            f"修好 {shopcfg.REWARDS_FILENAME} 后重启会再补，"
+            f"或者管理页「金币 / 经验」保存一次")
+        return
+    if not added:
+        return
+    names = "、".join(
+        cfgmerge.label_of("rewards", (cfgmerge.natural_key("rewards", rule), 0))
+        for rule in added)
+    head = (f"奖励表: 补上了 {len(added)} 档（{names}），数值是内置默认值，"
+            f"要改去管理页「金币 / 经验」；原有的一个字没动，"
+            f"原件留在 {shopcfg.REWARDS_FILENAME}.bak-* 里")
     log(head)
     eventlog.online(head)
 

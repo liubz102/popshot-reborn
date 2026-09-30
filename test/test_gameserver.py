@@ -3550,7 +3550,7 @@ class RewardLookupTests(unittest.TestCase):
     # -- 对战：模式 / 道具战 / 组队战 各查各的 --------------------------------
 
     def test_each_pvp_combination_reads_its_own_slot(self):
-        """★ 2026-09-10 之前八种组合给的钱一模一样，现在各是各的。"""
+        """★ 2026-09-10 之前八种组合给的钱一模一样，现在各是各的（格斗见下两条）。"""
         self.write(
             self.pvp(0, False, 0, win_money=1),
             self.pvp(0, False, 1, win_money=2),
@@ -3582,15 +3582,40 @@ class RewardLookupTests(unittest.TestCase):
         self.write(self.pvp(0, win_money=99, lose_money=7), self.BONUS)
         self.assertEqual(7, gameserver.pvp_reward(0, False, 0)[1])
 
-    def test_unlisted_game_modes_are_filed_by_their_victory_condition(self):
-        """★ 表里只有生存(0) / 夺分(3)。模式 2 和 0 共用生存的胜负条件 ⇒ 归生存；
-        模式 1（计时）和一切没见过的号归夺分，和 `pvp_game_mode()` 的兜底一致。"""
-        self.write(self.pvp(0, win_money=100), self.pvp(3, win_money=300),
+    def test_fight_mode_reads_its_own_slots_not_survivals(self):
+        """★ X_Mod D103：格斗（模式 2）以前借生存那一行，现在查自己那两档。"""
+        self.write(self.pvp(0, False, 0, win_money=100),
+                   self.pvp(0, False, 1, win_money=101),
+                   self.pvp(2, False, 0, win_money=200, win_exp=20),
+                   self.pvp(2, False, 1, win_money=201, win_exp=21),
                    self.BONUS)
-        for game_mode, want in ((0, 100), (2, 100), (1, 300), (3, 300),
+        self.assertEqual((20, 200, []),
+                         gameserver.pvp_reward(0, True, 2, False, False))
+        self.assertEqual((21, 201, []),
+                         gameserver.pvp_reward(0, True, 2, False, True))
+        self.assertEqual(100, gameserver.pvp_reward(0, True, 0, False, False)[1])
+
+    def test_unlisted_game_modes_fall_back_to_deathmatch(self):
+        """★ 表里有生存(0) / 夺分(3) / 格斗(2)。模式 1（计时）和一切没见过的号
+        归夺分，和 `pvp_game_mode()` 的兜底一致。"""
+        self.write(self.pvp(0, win_money=100), self.pvp(2, win_money=200),
+                   self.pvp(3, win_money=300), self.BONUS)
+        for game_mode, want in ((0, 100), (2, 200), (1, 300), (3, 300),
                                 (None, 300), (99, 300)):
             self.assertEqual(want, gameserver.pvp_reward(0, True, game_mode)[1],
                              game_mode)
+
+    def test_an_old_file_without_fight_slots_pays_the_defaults(self):
+        """★ 老服务器的 `rewards.json` 没有格斗那两档（开服补档之前 / 补档没做成）：
+        按**内置默认值**发并警告 —— 不是 0，也不是生存那一行；开服补档
+        （`shopcfg.backfill_rewards`）写进去的正是同一个数，补完不再警告（X_Mod D103）。"""
+        self.write(self.pvp(0, win_money=999), self.BONUS)
+        experience, money, warnings = gameserver.pvp_reward(0, True, 2)
+        self.assertEqual((25, 80), (experience, money))     # 默认表那一档
+        self.assertTrue(any("格斗模式" in w for w in warnings), warnings)
+        shopcfg.backfill_rewards(self.tmp.name, apply=True)
+        self.assertEqual((25, 80, []), gameserver.pvp_reward(0, True, 2))
+        self.assertEqual(999, gameserver.pvp_reward(0, True, 0)[1])
 
     # -- 缺一档 / 坏文件：退回内置默认值，**不是 0** --------------------------
 

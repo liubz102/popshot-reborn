@@ -2396,7 +2396,7 @@ GAME_RESULT_BAR_NEXT_LEVEL_EXP = 6
 #: 改完**即刻生效**。这里只剩「怎么查表」和「查不到怎么办」。
 #:
 #: ★ 一档 = 表里的一条记录：
-#:     对战 `(游戏模式, 道具战, 组队战)`  —— 8 档
+#:     对战 `(游戏模式, 道具战, 组队战)`  —— 10 档（格斗没有道具战那两档）
 #:     闯关 `(关卡, 难度)`               —— 21 档
 #:   每档写着**赢 / 输**各给多少金币和经验（闯关的「赢」= 通关）。
 
@@ -2509,7 +2509,7 @@ def pvp_reward(kills, won, game_mode=None, item_mode=False, team_mode=False):
     ★★ **哪一档由 `(游戏模式, 道具战, 组队战)` 三样决定**（D72）——
     2026-09-10 之前这三样对奖励**毫无影响**，八种组合给的钱一模一样。
     `game_mode` 是房间描述符的 `arguments[1]`（`Conn.pvp_game_mode()`），
-    经 `PVP_MODE_ROW` 归档到表里那两行。
+    经 `PVP_MODE_ROW` 归档到表里那三种模式（生存 / 夺分 / 格斗）。
 
     ★ 输了也给底薪：对战的一局可能就几分钟，一分不给会逼人挂机刷闯关。
       表里「输」那一列就是这个底薪。**平局**（尾部数组那一格是 0、谁都不判）
@@ -4110,10 +4110,11 @@ PVP_MODE_DEATHMATCH = 3
 
 #: 游戏模式号 → **奖励表里的哪一行**（`pvp_reward`，D72）。
 #:
-#: 表里只有生存(0) 和 夺分(3)：中国区建房下拉框就这两种，低等级号选了生存
-#: 还会被客户端自己改回夺分（`hook/bshook.c` 的 `try_patch_player_level_gate`
-#: 第 3 / 4 处）。剩下两个号照**引擎里的胜负条件**归档 ——
-#: 模式 2 和模式 0 共用 `SurvivalVictoryCondition`（上面那个工厂分流）⇒ 归生存；
+#: 表里有生存(0) / 夺分(3) / 格斗(2)（`shopcfg.PVP_MODE_ZH`）。格斗以前选不到，
+#: 照**引擎里的胜负条件**借生存那一行（两者共用 `SurvivalVictoryCondition`，
+#: 上面那个工厂分流）；X16 把它放出来之后，X_Mod D103 给了它自己的两档
+#: （个人战 / 组队战）。★ 格斗没有道具战那一档：`lobby.item_mode_of` 对模式 2
+#: 恒给「否」（客户端 `0x465be2` 同口径），查的永远是非道具那一行。
 #: 模式 1（计时）没有对应行，和「参数缺不全」一样归夺分，
 #: 和 `Conn.pvp_game_mode()` 的兜底一个口径。
 #:
@@ -4123,7 +4124,7 @@ PVP_MODE_DEATHMATCH = 3
 PVP_MODE_ROW = {
     PVP_MODE_SURVIVAL: PVP_MODE_SURVIVAL,
     PVP_MODE_TIME_ATTACK: PVP_MODE_DEATHMATCH,
-    PVP_MODE_FIGHT: PVP_MODE_SURVIVAL,
+    PVP_MODE_FIGHT: PVP_MODE_FIGHT,
     PVP_MODE_DEATHMATCH: PVP_MODE_DEATHMATCH,
 }
 
@@ -10260,7 +10261,7 @@ class Conn:
             #    `score`，于是结算界面三行数一模一样、而且一局能给上千经验。
             #    分数栏仍然发本局分数，经验和金币各按自己的公式算。
             #    ★ 数值来自 `rewards.json`（管理页「金币 / 经验获取」，D72）——
-            #      对战那一路把 模式 / 道具战 / 组队战 一起传进去，八种组合各查
+            #      对战那一路把 模式 / 道具战 / 组队战 一起传进去，每种组合各查
             #      各的那一档；以前它们给的钱一模一样。
             if quest_mode:
                 quest_id, difficulty = quest_info or (1, 1)

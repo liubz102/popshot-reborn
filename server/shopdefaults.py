@@ -51,6 +51,7 @@
 """
 import collections
 
+import lobby
 import shopcfg
 import shopdata
 
@@ -618,28 +619,40 @@ PVP_WIN_EXPERIENCE = 15
 PVP_BASE_MONEY = 30
 PVP_WIN_MONEY = 50
 
-#: 奖励表里列出来的对战游戏模式：**只有生存(0) 和 夺分(3)**。
+#: 奖励表里列出来的对战游戏模式：生存(0) / 夺分(3) / 格斗(2)。
 #:
-#: 中国区建房下拉框就这两种 —— 低等级号选了生存还会被客户端自己改回夺分
-#: （`hook/bshook.c` 的 `try_patch_player_level_gate` 第 3 / 4 处，
-#: `0x465338` / `0x465a2c`）。剩下两个模式号（1 计时 / 2 无투전）玩家碰不到，
-#: 真收到了由 `gameserver.PVP_MODE_ROW` 归档到这两行里，表里不占位置。
-PVP_ROW_MODES = (0, 3)
+#: 中国区建房下拉框原版只有生存和夺分 —— 低等级号选了生存还会被客户端自己
+#: 改回夺分（`hook/bshook.c` 的 `try_patch_player_level_gate` 第 3 / 4 处，
+#: `0x465338` / `0x465a2c`）。格斗(2) 是 X16 起 bshook 放出来的（X_Mod §118），
+#: X_Mod D103 起单独占一档 —— 在那之前它借生存那一行。
+#: 计时(1) 玩家仍然碰不到，真收到了由 `gameserver.PVP_MODE_ROW` 归到夺分那一行，
+#: 表里不占位置。
+PVP_ROW_MODES = (0, 3, 2)
 
 #: 道具战开关（`arguments[2]`）和 组队战开关（`arguments[0]`）。
 PVP_ROW_ITEM_MODES = (False, True)
 PVP_ROW_TEAMS = (0, 1)
 
+#: ★ 没有道具战的模式：格斗模式下客户端把道具开关强制清 0（`0x465be2`，
+#:   X_Mod §119），服务端 `lobby.item_mode_of` 同口径 ⇒ 「格斗 · 道具战」
+#:   永远命中不到，不给它配格子（配了只会让运营填一行永远不生效的数）。
+#:   个人 / 组队照常两档：服务端按 `arguments[0]` 认（`lobby.team_layout_of`
+#:   不看模式），客户端也没见到格斗模式强制组队的代码（X_Mod §144 / D103）。
+PVP_MODES_WITHOUT_ITEMS = (lobby.MODE_WITHOUT_ITEMS,)
+
 
 def build_rewards():
-    """默认 `rewards.json` —— **8 条对战 + 21 条闯关 + 1 条加成系数**。
+    """默认 `rewards.json` —— **10 条对战 + 21 条闯关 + 1 条加成系数**。
 
     ★ 初值**逐个等于 2026-09-10 之前那两个硬编码公式算出来的数**，
-    所以这一版上线时玩家的收入一分钱不变。
+    所以这一版上线时玩家的收入一分钱不变。格斗那两档（X_Mod D103）也照
+    同一个公式 —— 在那之前格斗借的是生存那一行，出厂值本来就一样。
     """
     rules = []
     for pvp_mode in PVP_ROW_MODES:
         for item_mode in PVP_ROW_ITEM_MODES:
+            if item_mode and pvp_mode in PVP_MODES_WITHOUT_ITEMS:
+                continue
             for team in PVP_ROW_TEAMS:
                 rules.append({
                     "mode": "pvp",
