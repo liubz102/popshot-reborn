@@ -408,9 +408,9 @@ class Write7zTests(_Case):
         os.utime(path, (when, when))
         return path
 
-    def pack(self, plan, **kwargs):
+    def pack(self, plan, level=sevenzip.HIGH, **kwargs):
         buf = io.BytesIO()
-        stats = self.packer.write_7z(buf, plan, **kwargs)
+        stats = self.packer.write_7z(buf, plan, level, **kwargs)
         self.assertEqual(len(buf.getvalue()), stats["size"])
         return stats, read_7z(buf.getvalue())
 
@@ -434,9 +434,33 @@ class Write7zTests(_Case):
         manifest = archive.read("MANIFEST.txt").decode("utf-8")
         self.assertIn("服务端日志（全量）", manifest)
         self.assertIn("压缩者: admin", manifest)
+        self.assertIn("压缩等级: 高（LZMA2，字典 16 MB，≈ 7-Zip「标准压缩」）", manifest)
         self.assertIn("7z 内路径", manifest)
         self.assertIn("logs/server.out\t%d\t" % len(self.TEXT), manifest)
         self.assertNotIn("跳过", manifest)
+
+    def test_the_level_decides_the_dictionary(self):
+        """弹窗选的档（D102）一路传到 7z 头里的字典码：高 16 MiB（`0x18`）、低 1 MiB（`0x10`）。"""
+        self.write_log("server.out", self.TEXT)
+        for level, prop, line in ((sevenzip.HIGH, b"\x18", "压缩等级: 高（LZMA2，字典 16 MB"),
+                                  (sevenzip.LOW, b"\x10", "压缩等级: 低（LZMA2，字典 1 MB")):
+            _stats, archive = self.pack(self.packer.plan("server"), level)
+            self.assertEqual([prop], [folder[1] for folder in archive.folders], level)
+            self.assertIn(line, archive.read("MANIFEST.txt").decode("utf-8"))
+            self.assertEqual(self.TEXT, archive.read("logs/server.out"))
+
+    def test_an_unknown_level_writes_nothing(self):
+        self.write_log("server.out", self.TEXT)
+        buf = io.BytesIO()
+        with self.assertRaises(ValueError):
+            self.packer.write_7z(buf, self.packer.plan("server"), "max")
+        self.assertEqual(b"", buf.getvalue())
+
+    def test_the_zip_manifest_has_no_level_line(self):
+        # ★ zip 那一路一个字节不变（D101）：压缩等级只是 7z 的事。
+        self.write_log("server.out", b"x")
+        text = logpack.manifest_text(self.packer.plan("server"), [], [], {})
+        self.assertNotIn("压缩等级", text)
 
     def test_the_mtime_survives(self):
         self.write_log("server.out", b"x" * 10, hours_ago=3)
@@ -493,7 +517,8 @@ class Write7zTests(_Case):
         self.assertEqual(b"", archive.read("logs/server.out"))
 
     def test_more_than_a_read_chunk_and_the_dictionary(self):
-        big = self.TEXT * 20                                    # > 3 MiB
+        # 比高档的字典（16 MiB）还长、跨几十块 READ_CHUNK（本机 ~2 秒）。
+        big = self.TEXT * (sevenzip.LEVELS[sevenzip.HIGH].dict_size // len(self.TEXT) + 2)
         self.write_log("server.out", big)
         seen = []
         stats, archive = self.pack(self.packer.plan("server"), progress=seen.append)
@@ -531,14 +556,15 @@ class Write7zTests(_Case):
         logpack.open = lambda path, mode="r": Broken(real_open(path, mode))
         self.addCleanup(delattr, logpack, "open")
         with self.assertRaises(logpack.PackAborted) as caught:
-            self.packer.write_7z(io.BytesIO(), plan)
+            self.packer.write_7z(io.BytesIO(), plan, sevenzip.HIGH)
         self.assertIn("logs/server.out", str(caught.exception))
         self.assertIn("读到一半", str(caught.exception))
 
     def test_a_full_disk_is_reported_as_our_side(self):
         self.write_log("server.out", self.TEXT)
         with self.assertRaises(logpack.PackAborted) as caught:
-            self.packer.write_7z(_FailingFile(fail_at=2), self.packer.plan("server"))
+            self.packer.write_7z(_FailingFile(fail_at=2), self.packer.plan("server"),
+                                 sevenzip.HIGH)
         self.assertIn("临时文件写不进去", str(caught.exception))
 
     def test_a_name_7z_cannot_hold_is_skipped(self):
@@ -555,7 +581,7 @@ class Write7zTests(_Case):
         sevenzip.AVAILABLE = False
         self.addCleanup(setattr, sevenzip, "AVAILABLE", real)
         with self.assertRaises(logpack.SevenZipUnavailable) as caught:
-            self.packer.write_7z(io.BytesIO(), self.packer.plan("server"))
+            self.packer.write_7z(io.BytesIO(), self.packer.plan("server"), sevenzip.HIGH)
         self.assertEqual(503, caught.exception.status)
 
     def test_the_stem_is_shared_by_zip_and_7z(self):

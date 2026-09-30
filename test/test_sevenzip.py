@@ -18,8 +18,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 import zlib
+from unittest import mock
 
 import sevenzip
 import testsupport
@@ -64,10 +66,10 @@ TEXT = "".join("[2026-09-30 10:00:%02d.%03d] [app] 服务端日志 第 %d 行\n"
 MTIME_NS = 1758000000123456700          # 100 ns 整数倍：FILETIME 存得下，往返不丢
 
 
-def build(members, solid=True, chunk=65536):
+def build(members, solid=True, chunk=65536, level=sevenzip.HIGH):
     """`members` = `[(名字, 数据, 压不压), ...]` → 7z 字节。"""
     buf = io.BytesIO()
-    writer = sevenzip.Writer(buf, solid=solid)
+    writer = sevenzip.Writer(buf, level=level, solid=solid)
     for name, data, compress in members:
         member = writer.begin(name, compress)
         for start in range(0, len(data), chunk):
@@ -140,10 +142,66 @@ class Lzma2PropTests(unittest.TestCase):
                                                    "dict_size": dict_size})
             self.assertEqual(want[0], sevenzip.lzma2_dict_prop(dict_size), dict_size)
 
-    def test_the_lzma2_coder_says_one_mebibyte(self):
+    def test_the_lzma2_coder_says_its_own_dictionary(self):
         self.assertEqual(b"\x01\x21\x21\x01\x10",
-                         sevenzip._Folder(sevenzip.LZMA2).coder_bytes())
+                         sevenzip._Folder(sevenzip.LZMA2, dict_size=1 << 20).coder_bytes())
+        self.assertEqual(b"\x01\x21\x21\x01\x18",
+                         sevenzip._Folder(sevenzip.LZMA2, dict_size=16 << 20).coder_bytes())
         self.assertEqual(b"\x01\x01\x00", sevenzip._Folder(sevenzip.COPY).coder_bytes())
+
+
+@unittest.skipIf(lzma is None, "这个 Python 没带 lzma")
+class LevelTests(unittest.TestCase):
+    """两档压缩等级（用户 2026-09-30，D102 / §143）。往返测试对档位不敏感 —— 档位被改掉
+    照样全绿 ⇒ 这里直接看交给 liblzma 的是什么、头里写的是什么、管理页小字的数对不对。"""
+
+    def spy(self, level):
+        seen = []
+        real = lzma.LZMACompressor
+
+        def record(**kwargs):
+            seen.append(kwargs)
+            return real(**kwargs)
+
+        with mock.patch.object(sevenzip.lzma, "LZMACompressor", record):
+            blob = build([("a.log", TEXT, True)], level=level)
+        return seen, read_7z(blob)
+
+    def test_each_level_hands_liblzma_what_the_table_says(self):
+        # 低 = X17 第一版的 -1 档 + 1 MiB；高 = 7-Zip「标准」-mx5（BT4 / normal / 单词 32 = preset 5）+ 16 MiB。
+        for level, preset, dict_size, prop in ((sevenzip.LOW, 1, 1 << 20, b"\x10"),
+                                              (sevenzip.HIGH, 5, 16 << 20, b"\x18")):
+            seen, archive = self.spy(level)
+            self.assertEqual([{"format": lzma.FORMAT_RAW, "filters": [
+                {"id": lzma.FILTER_LZMA2, "preset": preset, "dict_size": dict_size}]}], seen, level)
+            # ★ 头里的字典码和交给编码器的是同一个数（写小了解压端直接报数据错）。
+            self.assertEqual([prop], [folder[1] for folder in archive.folders], level)
+            self.assertEqual(TEXT, archive.read("a.log"))
+
+    def test_an_unknown_level_is_refused_before_a_byte_is_written(self):
+        buf = io.BytesIO()
+        for bad in ("max", "", None, "HIGH"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                sevenzip.Writer(buf, level=bad)
+        self.assertEqual(b"", buf.getvalue())
+
+    def test_the_memory_estimate_is_what_liblzma_really_allocates(self):
+        """管理页小字「压缩时服务器约多占 N MB」照 `Level.memory` 写（§143）—— 拿真分配量核，差 10% 以内。
+        ★ `_lzma` 走 `PyMem_RawMalloc` ⇒ tracemalloc 看得见 liblzma 的那几大块。"""
+        for level, spec in sevenzip.LEVELS.items():
+            writer = sevenzip.Writer(io.BytesIO(), level=level)
+            member = writer.begin("a.log")
+            tracemalloc.start()
+            try:
+                writer.write(member, b"x")                  # 第一块数据才建编码器
+                _now, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            writer.end(member, MTIME_NS)
+            writer.close()                                  # 编码器收尾、还内存
+            self.assertLess(abs(peak - spec.memory), spec.memory // 10,
+                            "%s 档实际分配 %.1f MB，表里写的 %.1f MB"
+                            % (level, peak / 1048576.0, spec.memory / 1048576.0))
 
 
 class NameTests(unittest.TestCase):
@@ -267,7 +325,8 @@ class RoundTripTests(unittest.TestCase):
                     ("emoji/\U0001F600.txt", b"smile", True)])
 
     def test_more_than_the_dictionary_in_odd_sized_chunks(self):
-        big = TEXT * 12                                          # > 3 MiB，字典才 1 MiB
+        # 比高档的字典（16 MiB）还长（本机 ~2 秒）。
+        big = TEXT * (sevenzip.LEVELS[sevenzip.HIGH].dict_size // len(TEXT) + 2)
         blob = build([("big.log", big, True)], chunk=100001)
         self.assertEqual(big, read_7z(blob).read("big.log"))
 
@@ -446,10 +505,10 @@ class RealSevenZipTests(unittest.TestCase):
         return subprocess.run([SEVEN_ZIP] + list(args), capture_output=True,
                               timeout=SUBPROCESS_FUSE_S)
 
-    def check(self, name, members, solid):
+    def check(self, name, members, solid, level=sevenzip.HIGH):
         path = os.path.join(self.tmp.name, name + ".7z")
         with open(path, "wb") as fp:
-            fp.write(build(members, solid))
+            fp.write(build(members, solid, level=level))
         tested = self.run_7z("t", path)
         self.assertEqual(0, tested.returncode, tested.stdout.decode("utf-8", "replace"))
         self.assertIn(b"Everything is Ok", tested.stdout)
@@ -471,15 +530,20 @@ class RealSevenZipTests(unittest.TestCase):
             ("logs/server.out", TEXT * 3, True), ("logs/server-boot.err", b"", True),
             ("logs_client_crash/张三_a1b2c3d4_20260909-013642/crash.7z", os.urandom(5000), False),
             ("MANIFEST.txt", "清单\n".encode("utf-8"), True)], solid=True)
-        self.assertIn("LZMA2:20", methods)
+        self.assertIn("LZMA2:24", methods)                  # 高档：字典 2^24 = 16 MiB
         self.assertIn("Copy", methods)
+
+    def test_a_low_level_log_archive(self):
+        methods = self.check("low", [("logs/server.out", TEXT * 3, True),
+                                     ("MANIFEST.txt", b"m", True)], solid=True, level=sevenzip.LOW)
+        self.assertEqual({"LZMA2:20"}, methods)             # 低档：字典 2^20 = 1 MiB
 
     def test_a_non_solid_crash_package(self):
         methods = self.check("crash", [
             ("Dump/LastCrashReport.txt", b"report", True), ("Dump/x.mdmp", TEXT * 2, True),
             ("logs/relay.err", b"", True), ("logs/server.out", TEXT, True),
             ("meta.json", b'{"format": 1}', True)], solid=False)
-        self.assertIn("LZMA2:20", methods)
+        self.assertIn("LZMA2:24", methods)                  # 崩溃包固定高档（D102）
 
 
 if __name__ == "__main__":

@@ -512,12 +512,14 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(fp.read(), raw)
 
     def test_the_package_is_a_non_solid_7z(self):
-        """X17：一个成员一个 folder（额度按 `tell()` 精确算、坏成员能退回），日志文件带原 mtime。"""
+        """X17：一个成员一个 folder（额度按 `tell()` 精确算、坏成员能退回），日志文件带原 mtime；
+        压缩等级固定「高」= 16 MiB 字典（用户 2026-09-30 定，D102）。"""
         out, _meta, _ = self.build()
         archive = read_package(out)
         with_data = [entry for entry in archive.entries if entry.data]
         self.assertEqual(len(with_data), len(archive.folders))
         self.assertEqual({"lzma2"}, {entry.method for entry in with_data})
+        self.assertEqual({b"\x18"}, {folder[1] for folder in archive.folders})
         relay = os.path.join(self.fx.logs, "relay.out")
         self.assertEqual(os.stat(relay).st_mtime_ns // 100,
                          archive.entry("logs/relay.out").mtime_ns // 100)

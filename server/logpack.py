@@ -51,7 +51,8 @@ Windows 上 `scandir` 的 `DirEntry.stat()` 直接用目录枚举带回来的数
 
 7z 开头 32 字节要写尾部目录的偏移 / CRC，全部压完才知道 ⇒ 做不到边压边发。由 `logshelf`
 的后台线程压进 `logs_7z/`，压完再下载；zip 那一路（上面几节）一个字没动。
-固实 LZMA2 -1 档（`sevenzip`），已经压过的（`STORED_SUFFIXES`）原样存、先写；`MANIFEST.txt` 最后。
+固实 LZMA2，压缩等级（`sevenzip.LEVELS` 高 / 低，D102）由弹窗选、调用方传进来；已经压过的
+（`STORED_SUFFIXES`）原样存、先写；`MANIFEST.txt` 最后（多记一行压缩等级）。
 
 ## 铁律：只用标准库，CPython 3.8（Win7 运行时）也要能跑
 """
@@ -87,9 +88,6 @@ STORED_SUFFIXES = (".zip", ".7z", ".gz", ".png", ".jpg", ".dll", ".exe")
 
 #: 最快的 deflate 档。
 COMPRESS_LEVEL = 1
-
-#: 7z 的 LZMA2 档：-1（实测云服 12 小时日志 zip 4.5 MB → 1.52 MB、本机 0.4 秒；-6 只再小 13%、慢 10 倍，§142）。
-LZMA_PRESET = sevenzip.DEFAULT_PRESET
 
 #: 7z 那一路一次读多少（也是进度回调的粒度）。缓冲大小，不是铁律 10 说的时序阈值。
 READ_CHUNK = 256 * 1024
@@ -353,11 +351,12 @@ class LogPacker:
                 "bytes": sum(size for _name, size, _when in written),
                 "skipped": skipped}
 
-    def write_7z(self, fp, plan, meta=None, progress=None):
+    def write_7z(self, fp, plan, level, meta=None, progress=None):
         """把 `plan` 压成 7z 写进**可 seek** 的 `fp`（X17，D101）。`fp` 由调用方开、关、改名。
 
-        固实 LZMA2（`LZMA_PRESET`）；已经压过的（`STORED_SUFFIXES`）原样存、排在前面
-        （省得在压不小的东西上白烧 CPU，§142）；`MANIFEST.txt` 最后写，清单按 `plan` 的顺序列。
+        固实 LZMA2，`level` = `sevenzip.LEVELS` 的键（弹窗里选的高 / 低，D102；不认识抛 `ValueError`）；
+        已经压过的（`STORED_SUFFIXES`）原样存、排在前面（省得在压不小的东西上白烧 CPU，§142）；
+        `MANIFEST.txt` 最后写，清单按 `plan` 的顺序列。
         `progress(已读字节)` 每读一块叫一次（`logshelf` 拿它算百分比）。
 
         返回 `{"files", "bytes", "skipped", "size"}`（`size` = 整个 7z 的字节数）。
@@ -370,7 +369,7 @@ class LogPacker:
             raise SevenZipUnavailable("这台服务器的 Python 没带 lzma 模块（自己编译时缺 liblzma），"
                                       "打不了 7z；zip 照常能用")
         meta = dict(meta or {})
-        writer = sevenzip.Writer(fp, preset=LZMA_PRESET, solid=True)
+        writer = sevenzip.Writer(fp, level=level, solid=True)
         # 已经压过的排前面（稳定排序：各自保持 plan 里的先后）。
         order = sorted(range(len(plan.entries)),
                        key=lambda index: not is_precompressed(plan.entries[index][1]))
@@ -412,7 +411,7 @@ class LogPacker:
         listed = [written[index] for index in sorted(written)]
         text = manifest_text(plan, [(name, size, time.localtime(mtime)[:6])
                                     for name, size, mtime in listed],
-                             skipped, meta, container="7z")
+                             skipped, meta, container="7z", level=level)
         member = writer.begin(MANIFEST_NAME)
         _write_member(writer, member, text.encode("utf-8"))
         writer.end(member, int(plan.now * 1e9))
@@ -470,8 +469,9 @@ def _write_member(writer, member, data):
         raise PackAborted("临时文件写不进去（%s）" % _describe(error)) from error
 
 
-def manifest_text(plan, written, skipped, meta, container="zip"):
-    """包根上那份 `MANIFEST.txt` 的内容。`container` 是 `"zip"`（边打包边下载）或 `"7z"`（后台压好）。"""
+def manifest_text(plan, written, skipped, meta, container="zip", level=None):
+    """包根上那份 `MANIFEST.txt` 的内容。`container` 是 `"zip"`（边打包边下载）或 `"7z"`（后台压好）；
+    7z 另给 `level`（`sevenzip.LEVELS` 的键），多记一行压缩等级 —— zip 那份一个字节不变。"""
     lines = [
         "炮炮火枪手 服务端 —— 日志打包清单",
         "类别: %s" % plan.label,
@@ -482,6 +482,10 @@ def manifest_text(plan, written, skipped, meta, container="zip"):
         lines.append("服务器版本: %s" % meta["version"])
     if meta.get("by"):
         lines.append("%s: %s" % ("下载者" if container == "zip" else "压缩者", meta["by"]))
+    if level is not None:
+        spec = sevenzip.LEVELS[level]
+        lines.append("压缩等级: %s（LZMA2，字典 %d MB，≈ %s）"
+                     % (spec.label, spec.dict_size >> 20, spec.like))
     total = sum(size for _name, size, _when in written)
     lines.append("文件: %d 个，原始大小共 %s" % (len(written), format_size(total)))
     if skipped:

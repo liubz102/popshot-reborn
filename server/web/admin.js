@@ -4350,6 +4350,8 @@ async function refreshBackups() {
 
    「数据管理」页工具条上「⇩ 下载日志」点开的弹窗。三块：
    · 顶上工具条：格式「zip | 7z」二选一（`.toolbar .seg`，D72b 那种连在一起的分段钮）+ 一行说明；
+     选 7z 时同一块里再一行「压缩等级 [低 | 高]」+ 小字内存估算（用户 2026-09-30，D102；默认按服务器内存），
+     两行的分段钮上下对齐（网格排版，见 admin.css `.logs-bar`）；
    · 左栏：两个目录（`logs/` / `logs_client_crash/`）各一张卡片，数字全部来自 `/admin/api/logs`；
      zip 时是米黄「下载…」（点下去服务端边打包边发，D131 原样），7z 时换成金色「压缩…」
      （按下去会在服务器上生成一个文件 —— 和备份页「立即备份」同一档，D40a / D97f）；
@@ -4373,11 +4375,21 @@ async function refreshBackups() {
 var LOGS = null;              // {data, archives, busy, polling, pollError} —— 弹窗开着时非 null
 //: 格式（X17）：页面不刷新就一直记着；服务器压不了 7z（`data.sevenzip` 假）时按 zip 算。
 var LOGS_FORMAT = "7z";
+//: 7z 的压缩等级（用户 2026-09-30，D102）：`null` = 这次进系统还没自己选过 → 跟服务端按服务器内存
+//  给的默认（`data.sevenzip_level.default`）。★ 关弹窗**不**清（用户要「关掉保持」）；
+//  进系统才清回 null —— 登录、刷新页面都走 `showLoggedIn`（用户定：刷新也算重新进系统）。
+var LOGS_LEVEL = null;
+//: 分段钮从左到右；钮上的字（「低」「高」）和内存估算都来自服务端（`sevenzip.LEVELS`）。
+var LOGS_LEVELS = ["low", "high"];
 
 var LOGS_HINT = {
   zip: "zip：点下去浏览器马上开始下载，服务器边压边传；体积比 7z 大，下载栏里看不到总大小。",
   "7z": "7z：体积约为 zip 的 1/3。先在服务器上压好（右边看进度），压好后在右边点「下载」；"
     + "要用 7-Zip 之类的工具解开（Windows 11 自带的也行）。"
+};
+var LOGS_LEVEL_HINT = {
+  low: "压得快，包大一些",
+  high: "包更小，压得慢一些"
 };
 
 async function openLogsModal() {
@@ -4415,6 +4427,30 @@ async function loadLogs() {
 /** 这次按哪个格式算：服务器压不了 7z 就只剩 zip。 */
 function logsFormat() {
   return (LOGS && LOGS.data && LOGS.data.sevenzip) ? LOGS_FORMAT : "zip";
+}
+
+/** 这次压 7z 用哪一档：这次进系统自己选过就用选的，没选过跟服务端给的默认（按服务器总内存）。
+    `data` = `/admin/api/logs` 的回包（能压 7z 时一定带 `sevenzip_level`）。 */
+function logsLevel(data) {
+  return LOGS_LEVEL || data.sevenzip_level["default"];
+}
+
+/** 「压缩」那一发的请求体：左栏那一行的 `{kind, scope, sub}` + 这次的压缩等级。 */
+function archiveRequest(what, data) {
+  return {kind: what.kind, scope: what.scope, sub: what.sub, level: logsLevel(data)};
+}
+
+/** 「压缩等级」那一行的小字：所选那一档 + 这台服务器的内存（默认档就是按它选的）。
+    ★ 数字全来自服务端（`logshelf.level_info`），这里只拼句子 —— 估算改了不用两头改。 */
+function logsLevelHint(info, level) {
+  var spec = info.levels[level];
+  var text = spec.label + "：≈ " + spec.like + "，" + LOGS_LEVEL_HINT[level]
+    + "；压缩时服务器约多占 " + spec.memory_text + " 内存。";
+  if (info.memory_text) {
+    return text + "这台服务器内存 " + info.memory_text + "，低于 " + info.low_memory_text
+      + " 时默认选「" + info.levels.low.label + "」。";
+  }
+  return text + "查不到这台服务器的内存大小，默认选「" + info.levels[info["default"]].label + "」。";
 }
 
 /** 一张卡片：标题行（名字 + 目录 + 合计）。行由 `logsRow` 往里加。 */
@@ -4460,7 +4496,7 @@ function tallyText(tally) {
   return tally.files + " 个文件 · " + tally.size_text;
 }
 
-/** 顶上的格式条：「格式 [zip | 7z]」+ 一行说明。 */
+/** 顶上的格式条：「格式 [zip | 7z]」+ 一行说明；选 7z 时同一块里再一行压缩等级（`logsLevelRow`）。 */
 function logsFormatBar(data) {
   var bar = el("div", "toolbar logs-bar");
   bar.appendChild(el("span", "logs-bar-lab", "格式"));
@@ -4484,7 +4520,30 @@ function logsFormatBar(data) {
   });
   bar.appendChild(seg);
   bar.appendChild(el("span", "hint logs-bar-hint", LOGS_HINT[logsFormat()]));
+  if (logsFormat() === "7z") { logsLevelRow(bar, data); }
   return bar;
+}
+
+/** 格式条同一块里的第二行（只在选 7z 时有）：「压缩等级 [低 | 高]」+ 一行小字（用户 2026-09-30，D102）。
+    ★ 三样直接挂在格式条上（CSS 网格三列：标签 / 分段钮 / 小字）—— 两行的分段钮才对得齐（用户要的）。 */
+function logsLevelRow(bar, data) {
+  var info = data.sevenzip_level;
+  var now = logsLevel(data);
+  bar.appendChild(el("span", "logs-bar-lab", "压缩等级"));
+  var seg = el("span", "seg");
+  LOGS_LEVELS.forEach(function (level) {
+    var spec = info.levels[level];
+    var button = el("button", "cat" + (now === level ? " on" : ""), spec.label);
+    button.title = "≈ " + spec.like + "，压缩时服务器约多占 " + spec.memory_text + " 内存";
+    button.onclick = function () {
+      if (logsLevel(data) === level) { return; }
+      LOGS_LEVEL = level;
+      renderLogs();
+    };
+    seg.appendChild(button);
+  });
+  bar.appendChild(seg);
+  bar.appendChild(el("span", "hint logs-bar-hint", logsLevelHint(info, now)));
 }
 
 function renderLogs() {
@@ -4695,7 +4754,7 @@ async function downloadLogs(what, label) {
 async function compressLogs(what, label) {
   var state = LOGS;
   if (!state) { return; }
-  var result = await api("/admin/api/logs/archives/create", what);
+  var result = await api("/admin/api/logs/archives/create", archiveRequest(what, state.data));
   if (bounced(result)) { return; }
   if (LOGS !== state) { return; }
   if (!result.ok) {
@@ -7295,6 +7354,8 @@ function paintWho() {
 function showLoggedIn(name, role, nickname) {
   ROLE = role || null;
   ME = {name: name, nickname: nickname || ""};
+  // 进系统（登录 / 刷新页面带着会话进来）：7z 压缩等级回到服务端按内存给的默认（D102）。
+  LOGS_LEVEL = null;
   paintWho();
   $("logout").classList.remove("hidden");
   $("loginView").classList.add("hidden");

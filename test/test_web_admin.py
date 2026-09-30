@@ -381,7 +381,8 @@ class AdminAuthTests(_AdminCase):
                 # 待下载 7z 包（X17）：压 / 看 / 下 / 删，门一样不能少。
                 ("/admin/api/logs/archives", None),
                 ("/admin/api/logs/archives?since=0", None),
-                ("/admin/api/logs/archives/create", {"kind": "server", "scope": "all"}),
+                ("/admin/api/logs/archives/create", {"kind": "server", "scope": "all",
+                                                     "level": "high"}),
                 ("/admin/api/logs/archives/remove", {"name": "logs_server_20260930-101530.7z"}),
                 ("/admin/api/logs/archives/download?name=logs_server_20260930-101530.7z", None),
         ):
@@ -1993,7 +1994,8 @@ class OperatorPermissionTests(_AdminCase):
                 # 待下载 7z 包（X17）：压 / 看 / 下 / 删，门一样不能少。
                 ("/admin/api/logs/archives", None),
                 ("/admin/api/logs/archives?since=0", None),
-                ("/admin/api/logs/archives/create", {"kind": "server", "scope": "all"}),
+                ("/admin/api/logs/archives/create", {"kind": "server", "scope": "all",
+                                                     "level": "high"}),
                 ("/admin/api/logs/archives/remove", {"name": "logs_server_20260930-101530.7z"}),
                 ("/admin/api/logs/archives/download?name=logs_server_20260930-101530.7z", None),
         ):
@@ -2211,7 +2213,8 @@ class PlayerReadOnlyTests(_AdminCase):
                 # 待下载 7z 包（X17）：压 / 看 / 下 / 删，门一样不能少。
                 ("/admin/api/logs/archives", None),
                 ("/admin/api/logs/archives?since=0", None),
-                ("/admin/api/logs/archives/create", {"kind": "server", "scope": "all"}),
+                ("/admin/api/logs/archives/create", {"kind": "server", "scope": "all",
+                                                     "level": "high"}),
                 ("/admin/api/logs/archives/remove", {"name": "logs_server_20260930-101530.7z"}),
                 ("/admin/api/logs/archives/download?name=logs_server_20260930-101530.7z", None),
         ):
@@ -2641,8 +2644,11 @@ class AdminArchivesApiTests(_AdminCase):
         self.addCleanup(shelf_tmp.cleanup)
         self.shelf_dir = os.path.join(shelf_tmp.name, "logs_7z")
         self.packer = logpack.LogPacker(self.logdir, self.crash_dir)
+        # 内存用假的：真机器有多少内存不该决定用例红不红（默认档按总内存，D102）。
+        self.total_memory = 4 << 30
         self.shelf = logshelf.LogShelf(self.packer, self.shelf_dir,
-                                       audit=lambda msg: web_admin.eventlog.online(msg))
+                                       audit=lambda msg: web_admin.eventlog.online(msg),
+                                       memory=lambda: self.total_memory, available=lambda: None)
         self.addCleanup(self.shelf.stop, AUDIT_FUSE_S)
         self.httpd.RequestHandlerClass.log_packer = self.packer
         self.httpd.RequestHandlerClass.log_shelf = self.shelf
@@ -2662,12 +2668,12 @@ class AdminArchivesApiTests(_AdminCase):
         opened = threading.Event()
         real = self.packer.write_7z
 
-        def gated(fp, plan, meta=None, progress=None):
+        def gated(fp, plan, level, meta=None, progress=None):
             if before is not None:
                 before(plan, progress)
             if not opened.wait(AUDIT_FUSE_S):
                 raise RuntimeError("闸门没被放行（保险丝）")
-            return real(fp, plan, meta=meta, progress=progress)
+            return real(fp, plan, level, meta=meta, progress=progress)
 
         self.packer.write_7z = gated
         self.addCleanup(opened.set)
@@ -2681,14 +2687,27 @@ class AdminArchivesApiTests(_AdminCase):
                          {key: result["archives"][key]
                           for key in ("files", "jobs", "busy", "dirname")})
 
+    def test_the_overview_carries_the_level_row(self):
+        """弹窗「压缩等级」那一行要的全在 overview 里（D102）：默认档跟着**总**内存走。"""
+        level = self.request("/admin/api/logs")[1]["sevenzip_level"]
+        self.assertEqual(("high", "4.0 GB", "800 MB"),
+                         (level["default"], level["memory_text"], level["low_memory_text"]))
+        self.assertEqual({"low": ("低", "9 MB"), "high": ("高", "186 MB")},
+                         {name: (spec["label"], spec["memory_text"])
+                          for name, spec in level["levels"].items()})
+        self.total_memory = 512 << 20
+        self.assertEqual("low", self.request("/admin/api/logs")[1]["sevenzip_level"]["default"])
+
     def test_without_a_shelf_the_page_says_so(self):
         self.httpd.RequestHandlerClass.log_shelf = None
         status, result = self.request("/admin/api/logs")
         self.assertEqual(200, status)
         self.assertIsNone(result["archives"])
         self.assertFalse(result["sevenzip"])
+        self.assertIsNone(result["sevenzip_level"])
         for path, payload in (("/admin/api/logs/archives", None),
-                              ("/admin/api/logs/archives/create", {"kind": "server"}),
+                              ("/admin/api/logs/archives/create", {"kind": "server",
+                                                                   "level": "high"}),
                               ("/admin/api/logs/archives/download?name=x.7z", None)):
             status, result = self.request(path, payload)
             self.assertFalse(result["ok"], path)
@@ -2697,10 +2716,10 @@ class AdminArchivesApiTests(_AdminCase):
     def test_compress_poll_download_remove(self):
         lines = self.capture_log()
         status, result = self.request("/admin/api/logs/archives/create",
-                                      {"kind": "server", "scope": "all"})
+                                      {"kind": "server", "scope": "all", "level": "high"})
         self.assertEqual(200, status, result)
         self.assertTrue(result["ok"])
-        self.assertIn("已加入压缩队列：服务端日志（全量）", result["message"])
+        self.assertIn("已加入压缩队列：服务端日志（全量）（压缩等级 高）", result["message"])
         archives = self.poll_until_idle(result["archives"])
         (item,) = archives["files"]
         self.assertEqual([], archives["jobs"])
@@ -2721,10 +2740,12 @@ class AdminArchivesApiTests(_AdminCase):
         self.assertEqual(["logs/server.out", "MANIFEST.txt"], archive.names)
         self.assertEqual(b"today\n" * 500, archive.read("logs/server.out"))
         self.assertIn("压缩者: admin", archive.read("MANIFEST.txt").decode("utf-8"))
+        self.assertEqual([b"\x18"], [folder[1] for folder in archive.folders])    # 高 = 16 MiB
         # 排队 / 压好 / 下载各一行（下载那行是发完才写的 ⇒ 等它，不赌线程快慢）。
         lines.wait_for(self, 3)
-        self.assertIn("排了 7z 压缩：服务端日志（全量）", lines[0])
+        self.assertIn("排了 7z 压缩（压缩等级 高）：服务端日志（全量）", lines[0])
         self.assertIn("压缩好了服务端日志（全量）", lines[1])
+        self.assertIn("（压缩等级 高）", lines[1])
         self.assertIn("下载了 7z 包 %s" % item["name"], lines[2])
 
         status, result = self.request("/admin/api/logs/archives/remove", {"name": item["name"]})
@@ -2738,21 +2759,25 @@ class AdminArchivesApiTests(_AdminCase):
             progress(plan.total_bytes // 2)
 
         gate = self.gate(before=half)
-        _status, result = self.request("/admin/api/logs/archives/create", {"kind": "server"})
+        _status, result = self.request("/admin/api/logs/archives/create",
+                                       {"kind": "server", "level": "low"})
         archives = result["archives"]
         while not (archives["jobs"] and archives["jobs"][0]["percent"] == 50):
             _status, result = self.request("/admin/api/logs/archives?since=%d"
                                            % archives["version"])
             archives = result["archives"]
         self.assertEqual("packing", archives["jobs"][0]["state"])
-        _status, again = self.request("/admin/api/logs/archives/create", {"kind": "server"})
-        self.assertIn("这一份已经在压了", again["message"])
+        # 同一份正在压时换一档再点：不另排，回话里说清楚正在压的是哪一档（D102）。
+        _status, again = self.request("/admin/api/logs/archives/create",
+                                      {"kind": "server", "level": "high"})
+        self.assertIn("这一份已经在压了：服务端日志（全量）（压缩等级 低）", again["message"])
         gate.set()
         self.assertEqual(1, len(self.poll_until_idle(archives)["files"]))
 
     def test_without_since_or_with_a_stale_version_it_answers_at_once(self):
         gate = self.gate()
-        _status, result = self.request("/admin/api/logs/archives/create", {"kind": "server"})
+        _status, result = self.request("/admin/api/logs/archives/create",
+                                       {"kind": "server", "level": "low"})
         self.assertTrue(result["archives"]["busy"])
         for query in ("", "?since=abc", "?since=-1"):
             status, result = self.request("/admin/api/logs/archives" + query)
@@ -2762,8 +2787,11 @@ class AdminArchivesApiTests(_AdminCase):
 
     def test_bad_requests_are_json_with_a_status(self):
         for path, payload, want in (
-                ("/admin/api/logs/archives/create", {"kind": "nope"}, 400),
-                ("/admin/api/logs/archives/create", {"kind": "client_crash"}, 404),
+                ("/admin/api/logs/archives/create", {"kind": "nope", "level": "low"}, 400),
+                ("/admin/api/logs/archives/create", {"kind": "client_crash", "level": "low"}, 404),
+                # 压缩等级必填（页面每次都带）；不认识的一样 400（D102）。
+                ("/admin/api/logs/archives/create", {"kind": "server"}, 400),
+                ("/admin/api/logs/archives/create", {"kind": "server", "level": "max"}, 400),
                 ("/admin/api/logs/archives/remove", {"name": "../server.out"}, 404),
                 ("/admin/api/logs/archives/remove", {"job": "j999"}, 404),
                 ("/admin/api/logs/archives/nope", {}, 404),
@@ -2773,11 +2801,12 @@ class AdminArchivesApiTests(_AdminCase):
             self.assertFalse(result["ok"], (path, payload))
 
     def test_a_failed_job_can_be_cleared(self):
-        def broken(fp, plan, meta=None, progress=None):
+        def broken(fp, plan, level, meta=None, progress=None):
             raise logpack.PackAborted("读 logs/server.out 读到一半出错：读盘出错")
 
         self.packer.write_7z = broken
-        _status, result = self.request("/admin/api/logs/archives/create", {"kind": "server"})
+        _status, result = self.request("/admin/api/logs/archives/create",
+                                       {"kind": "server", "level": "low"})
         archives = self.poll_until_idle(result["archives"])
         (job,) = archives["jobs"]
         self.assertEqual("failed", job["state"])
@@ -2832,7 +2861,8 @@ class AdminArchivesApiTests(_AdminCase):
         self.httpd.handle_error = lambda request, addr: errors.append(addr)
         self.addCleanup(setattr, self.httpd, "handle_error", real_handle_error)
         gate = self.gate()
-        _status, result = self.request("/admin/api/logs/archives/create", {"kind": "server"})
+        _status, result = self.request("/admin/api/logs/archives/create",
+                                       {"kind": "server", "level": "low"})
         archives = result["archives"]
         # 先等它停在闸门上（packing）—— 之后版本不会再变，下面那发一定是「挂着」的。
         while not (archives["jobs"] and archives["jobs"][0]["state"] == "packing"):

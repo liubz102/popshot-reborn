@@ -691,6 +691,12 @@ def main(argv=None):
         if not sevenzip.AVAILABLE:
             log("日志下载 ⚠ 这个 Python 没带 lzma 模块（自己编译时缺 liblzma），"
                 "打不了 7z，只能用 zip；换服务端包自带的运行时就有")
+        else:
+            # 弹窗「压缩等级」默认勾哪一档（D102）：云上看这一行就知道为什么默认是「低」。
+            level = log_shelf.level_info()
+            log(f"日志下载 7z 压缩等级默认「{sevenzip.LEVELS[level['default']].label}」"
+                f"（本机内存 {level['memory_text'] or '查不到'}，低于 "
+                f"{level['low_memory_text']} 默认选「低」；弹窗里随时能改）")
     else:
         log("注册页   已关闭（--no-web）")
 

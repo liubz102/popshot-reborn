@@ -29,12 +29,20 @@ zip 照旧边压边发（`logpack.write_zip`），两条路在弹窗里二选一
 
 下载 / 删除传上来的名字必须和 `logs_7z/` 里列出来的某一个**一模一样**
 （`crashstore.check_id` / `logpack.plan` 的 `sub` 同一条理由）。
+
+## 压缩等级（用户 2026-09-30，D102 / §143）
+
+弹窗里选「高 / 低」（`sevenzip.LEVELS`），每次提交都带上。默认档按这台机器的**总**内存给
+（`level_info`，低于 `LOW_MEMORY` 选低）—— 只是「进系统时勾哪个」，改不改由人。
+★ 开压前再看一次**现在可用**的内存：不够这一档的估算就直接判失败、让人换低档。不看的话，
+  Linux 默认超额分配，分配当场不报错，真用到时不够 ⇒ OOM killer 杀的多半是服务端自己（§143）。
 """
 from __future__ import annotations
 
 import os
 import re
 import stat as statmod
+import sys
 import threading
 import time
 
@@ -53,6 +61,10 @@ PART_SUFFIX = ".part"
 QUEUED = "queued"
 PACKING = "packing"
 FAILED = "failed"
+
+#: 总内存低于这个数，弹窗的压缩等级默认选「低」（用户 2026-09-30 定的产品参数 ——
+#: 只决定「默认勾哪个」，不判断任何事件的先后，不是铁律 10 说的那种阈值）。
+LOW_MEMORY = 800 << 20
 
 #: 从包名认出它是哪一类（给右栏写标签）。`logpack.plan` 造的 stem + 撞名时的 `-N`。
 _STAMP = r"\d{8}-\d{6}(?:-\d+)?"
@@ -79,6 +91,10 @@ class Busy(ShelfError):
     status = 409
 
 
+class NotEnoughMemory(ShelfError):
+    """开压前一看，现在可用的内存不够这一档的编码器。"""
+
+
 def label_of(name):
     """包名 → 给人看的标签；认不出（手放进去的）就用名字本身。"""
     for pattern, make in _LABELS:
@@ -88,12 +104,99 @@ def label_of(name):
     return name
 
 
+# -------------------------------------------------------------------- 内存
+def total_memory():
+    """这台机器的物理内存（字节）。查不到回 `None`（默认档按「不低」算）。"""
+    if sys.platform == "win32":
+        status = _memory_status()
+        return None if status is None else status.ullTotalPhys
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def available_memory():
+    """现在还能用多少内存（字节）。查不到回 `None`（开压前那一关就不拦）。
+
+    Linux = `/proc/meminfo` 的 MemAvailable（不换页还能给出去的，含可回收的缓存）；
+    Windows = 任务管理器里的「可用」，32 位进程再和自己剩下的地址空间取小。
+    """
+    if sys.platform == "win32":
+        status = _memory_status()
+        return None if status is None else min(status.ullAvailPhys, status.ullAvailVirtual)
+    try:
+        with open("/proc/meminfo", "rb") as fp:
+            for line in fp:
+                if line.startswith(b"MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _memory_status():
+    """Windows 的 `GlobalMemoryStatusEx`；调不通回 `None`。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryStatusEx(ctypes.Structure):
+        _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    status = MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(MemoryStatusEx)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+    except (AttributeError, OSError):
+        return None
+    return status
+
+
+def memory_text(size):
+    """内存大小给人看：1 GB 以下按整 MB，以上一位小数的 GB（`format_size` 没有 GB 这一档）。"""
+    if size < 1 << 30:
+        return "%d MB" % (size >> 20)
+    return "%.1f GB" % (size / float(1 << 30))
+
+
+def default_level(total):
+    """弹窗默认勾哪一档：总内存低于 `LOW_MEMORY` 选低，否则（含查不到）选高。"""
+    return sevenzip.LOW if total is not None and total < LOW_MEMORY else sevenzip.HIGH
+
+
+def level_text(level):
+    """「高」「低」—— 审计日志 / 提示里用。"""
+    return sevenzip.LEVELS[level].label
+
+
+def _retry_hint(level):
+    return "换「低」再试" if level != sevenzip.LOW else "等内存空出来再试"
+
+
+def _failure_text(error, level):
+    """压缩失败给人看的原因。`MemoryError` 的消息是空串，右栏只会剩一个英文类名 —— 换成人话。"""
+    if isinstance(error, MemoryError):
+        spec = sevenzip.LEVELS[level]
+        return "服务器内存不够（「%s」档压缩要约 %s）—— %s" % (
+            spec.label, memory_text(spec.memory), _retry_hint(level))
+    return str(error) or type(error).__name__
+
+
 class Job:
     """一次「压缩」请求。压好之后就不在这张表里了（变成 `logs_7z/` 里的一个文件）。"""
 
-    def __init__(self, job_id, plan, name, meta, who, created):
+    def __init__(self, job_id, plan, name, meta, who, created, level):
         self.id = job_id
         self.plan = plan
+        #: 压缩等级（`sevenzip.LEVELS` 的键），提交时弹窗里选的那一档。
+        self.level = level
         #: 压好之后的文件名（提交时就定了，同一秒撞名加 `-2`）。
         self.name = name
         self.meta = meta
@@ -107,13 +210,19 @@ class Job:
 
 
 class LogShelf:
-    """`logs_7z/` + 一条后台压缩线程。`audit(msg)` 写审计日志（`app.py` 传 `eventlog.online`）。"""
+    """`logs_7z/` + 一条后台压缩线程。`audit(msg)` 写审计日志（`app.py` 传 `eventlog.online`）。
 
-    def __init__(self, packer, directory, audit=None, clock=time.time):
+    `memory()` / `available()` 查总内存 / 现在可用的内存（字节，查不到 `None`），只给测试换假的。
+    """
+
+    def __init__(self, packer, directory, audit=None, clock=time.time,
+                 memory=total_memory, available=available_memory):
         self.packer = packer
         self.dir = directory
         self._audit = audit
         self._clock = clock
+        self._memory = memory
+        self._available = available
         self._cond = threading.Condition()
         #: 排队 / 压缩中 / 失败的任务，按提交顺序。
         self._jobs = []
@@ -126,16 +235,19 @@ class LogShelf:
         self._swept = False
 
     # ------------------------------------------------------------ 对外
-    def submit(self, kind, scope="", sub="", meta=None, who=""):
-        """排一个压缩任务，返回 `(Job, 是不是新排的)`。
+    def submit(self, kind, scope="", sub="", *, level, meta=None, who=""):
+        """排一个压缩任务，返回 `(Job, 是不是新排的)`。`level` = `sevenzip.LEVELS` 的键（弹窗选的）。
 
         参数不合法 / 没东西可压：`logpack.LogPackError` / `NothingToPack`（带 HTTP 状态码）；
         这个 Python 没有 lzma：`logpack.SevenZipUnavailable`（503）。
-        同一份（kind / scope / sub）已经在排队或正在压 ⇒ 不再排，把那一个还回去。
+        同一份（kind / scope / sub）已经在排队或正在压 ⇒ 不再排，把那一个还回去 ——
+        ★ 不管档：那一份压完之前再点另一档，拿到的是正在压的那个（回的消息里说是哪一档）。
         """
         if not sevenzip.AVAILABLE:
             raise logpack.SevenZipUnavailable("这台服务器的 Python 没带 lzma 模块（自己编译时缺 "
                                               "liblzma），打不了 7z；zip 照常能用")
+        if level not in sevenzip.LEVELS:
+            raise ShelfError("压缩等级只能是 %s：%r" % (" / ".join(sevenzip.LEVELS), level))
         plan = self.packer.plan(kind, scope or logpack.SCOPE_ALL, sub)     # 读盘：锁外做
         with self._cond:
             if self._stopping:
@@ -146,7 +258,7 @@ class LogShelf:
                         (plan.kind, plan.scope, plan.sub):
                     return job, False
             job = Job("j%d" % self._next_id, plan, self._unique_name(plan.stem),
-                      dict(meta or {}), who, self._clock())
+                      dict(meta or {}), who, self._clock(), level)
             self._next_id += 1
             self._jobs.append(job)
             self._bump()
@@ -161,6 +273,22 @@ class LogShelf:
         with self._cond:
             self._sweep_once()
             return self._snapshot_locked()
+
+    def level_info(self):
+        """弹窗「压缩等级」那一行要的：默认勾哪一档（按总内存）+ 两档的内存估算 + 本机内存。
+
+        文字都在这里做好（`memory_text`），页面只管拼句子、不写死数字。
+        """
+        total = self._memory()
+        return {
+            "default": default_level(total),
+            "memory": total,
+            "memory_text": "" if total is None else memory_text(total),
+            "low_memory_text": memory_text(LOW_MEMORY),
+            "levels": dict((name, {"label": spec.label, "memory": spec.memory,
+                                   "memory_text": memory_text(spec.memory), "like": spec.like})
+                           for name, spec in sevenzip.LEVELS.items()),
+        }
 
     def wait(self, since, timeout=None):
         """长轮询：`since` 就是现在的版本、而且还有活 ⇒ 等到版本变了再回。否则立刻回。
@@ -239,9 +367,10 @@ class LogShelf:
         final = os.path.join(self.dir, job.name)
         part = os.path.join(self.dir, PART_PREFIX + job.name + PART_SUFFIX)
         try:
+            self._check_memory(job.level)
             os.makedirs(self.dir, exist_ok=True)
             with open(part, "wb") as fp:
-                stats = self.packer.write_7z(fp, job.plan, meta=job.meta,
+                stats = self.packer.write_7z(fp, job.plan, job.level, meta=job.meta,
                                              progress=lambda done: self._progress(job, done))
             note = ("，跳过 %d 个（打包时已被清理或读不到）" % len(stats["skipped"])
                     if stats["skipped"] else "")
@@ -250,19 +379,33 @@ class LogShelf:
                 atomicfile.replace(part, final)
                 self._jobs.remove(job)
                 # ★ 审计也在锁里、叫醒之前写：长轮询一醒来，这一行已经在了（测试靠它）。
-                self._say("[admin] %s 压缩好了%s：%d 个文件 %s → 7z %s，用时 %.1f 秒%s"
+                self._say("[admin] %s 压缩好了%s：%d 个文件 %s → 7z %s（压缩等级 %s），用时 %.1f 秒%s"
                           % (job.who or "?", job.plan.label, stats["files"],
                              format_size(stats["bytes"]), format_size(stats["size"]),
-                             time.monotonic() - started, note))
+                             level_text(job.level), time.monotonic() - started, note))
                 self._bump()
         except Exception as error:              # noqa: BLE001 —— 后台线程，什么错都要落到任务上
             _discard(part)
-            message = str(error) or type(error).__name__
+            message = _failure_text(error, job.level)
             with self._cond:
                 job.state = FAILED
                 job.error = message
-                self._say("⚠ [admin] %s 压缩%s失败（%s）" % (job.who or "?", job.plan.label, message))
+                self._say("⚠ [admin] %s 压缩%s（压缩等级 %s）失败（%s）"
+                          % (job.who or "?", job.plan.label, level_text(job.level), message))
                 self._bump()
+
+    def _check_memory(self, level):
+        """开压前的一关：现在可用的内存不够这一档的编码器 ⇒ `NotEnoughMemory`，一个字节都不写。
+
+        ★ 判据是「可用 < 这一档实测要的」这件事本身，不留余量常数：够了也不保证压的途中别人
+          不来抢，但不够是一定会出事 —— Linux 上多半不是 `MemoryError` 而是 OOM killer 杀服务端（§143）。
+        """
+        free = self._available()
+        spec = sevenzip.LEVELS[level]
+        if free is not None and free < spec.memory:
+            raise NotEnoughMemory("服务器现在可用内存只有 %s，「%s」档压缩要约 %s —— %s"
+                                  % (memory_text(free), spec.label, memory_text(spec.memory),
+                                     _retry_hint(level)))
 
     def _progress(self, job, done):
         total = max(job.plan.total_bytes, 1)

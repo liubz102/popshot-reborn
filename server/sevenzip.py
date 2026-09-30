@@ -5,8 +5,9 @@
 两个用处：
 
 * 管理页「待下载 7z 包」（`logpack.write_7z`）—— **固实**：要压的成员共用一个 LZMA2 流；
+  压缩等级（`LEVELS` 高 / 低两档，D102）在弹窗里选；
 * 客户端崩溃包（`crashwatch`）—— **非固实**：一个成员一个 folder，每个成员 `end()` 之后
-  `tell()` 就是精确体积（「加不下就跳过」的额度靠它），读坏的成员还能 `rollback()`。
+  `tell()` 就是精确体积（「加不下就跳过」的额度靠它），读坏的成员还能 `rollback()`；固定 `HIGH`。
 
 ## 为什么自己写
 
@@ -39,6 +40,7 @@ Copy 照样能写；要 LZMA2 才报错。`app.py` 顶层就间接 import 这里
 """
 from __future__ import annotations
 
+import collections
 import struct
 import zlib
 
@@ -55,10 +57,22 @@ SIGNATURE = b"7z\xbc\xaf\x27\x1c"
 VERSION = b"\x00\x04"
 SIGNATURE_HEADER_SIZE = 32
 
-#: LZMA2 默认档：-1（hc4 快档）。实测 -6 只再小 13%、慢 10 倍、编码器 94 MB 内存（§142）。
-DEFAULT_PRESET = 1
-#: 字典 1 MiB（-1 档自己的字典；显式写出来，好算属性字节）。解压端只要这么大。
-DICT_SIZE = 1 << 20
+#: 一档压缩等级：交给 liblzma 的 `preset` + 字典（显式写出来，好算属性字节；解压端要这么大的字典），
+#: `memory` = 编码器实测占用（§143：tracemalloc / 工作集 / 提交三种口径一致，管理页小字照它写，
+#: `test_sevenzip` 拿真分配量核它），`label` / `like` 给人看。
+Level = collections.namedtuple("Level", "label preset dict_size memory like")
+
+LOW = "low"
+HIGH = "high"
+#: 两档（用户 2026-09-30 定，D102）：管理页弹窗选（默认按服务器内存，`logshelf`）；崩溃包固定 `HIGH`。
+#: 体积主要看**字典**：日志 / 内存转储里隔 1 MiB 以外的重复只有大字典看得见（§143）。
+LEVELS = {
+    #: -1 档（hc4 / fast）+ 1 MiB 字典 = X17 第一版的档。
+    LOW: Level("低", 1, 1 << 20, 9 << 20, "7-Zip「快速压缩」"),
+    #: = 7-Zip「标准压缩」（-mx5）逐项同参数：BT4 / normal / 单词大小 32 就是 liblzma 的 preset 5，
+    #: 字典换成 7-Zip 的 16 MB（preset 5 自己是 8 MiB）。日志再小 25~31%、崩溃包 13~44%，单线程慢 2~7 倍。
+    HIGH: Level("高", 5, 16 << 20, 186 << 20, "7-Zip「标准压缩」"),
+}
 
 COPY = "copy"
 LZMA2 = "lzma2"
@@ -162,38 +176,43 @@ class Member:
 
 
 class _Folder:
-    __slots__ = ("method", "packed", "unpacked", "members", "compressor")
+    __slots__ = ("method", "packed", "unpacked", "members", "compressor", "dict_size")
 
-    def __init__(self, method, compressor=None):
+    def __init__(self, method, compressor=None, dict_size=0):
         self.method = method
         self.packed = 0
         self.unpacked = 0
         #: 子流 = 落在这里的成员，按顺序。
         self.members = []
         self.compressor = compressor
+        #: LZMA2 编码器用的字典 —— 属性字节必须写**同一个数**（写小了解压端直接报数据错）。
+        self.dict_size = dict_size
 
     def coder_bytes(self):
         """这个 folder 的编码器描述：NumCoders=1，然后 flag（ID 长度 | 0x20 有属性）/ ID / 属性。"""
         if self.method == COPY:
             return b"\x01\x01\x00"
-        return b"\x01\x21\x21\x01" + bytes([lzma2_dict_prop(DICT_SIZE)])
+        return b"\x01\x21\x21\x01" + bytes([lzma2_dict_prop(self.dict_size)])
 
 
 class Writer:
     """往可 seek 的 `fp` 里写一个 7z。用法::
 
-        w = Writer(fp)                       # 固实；崩溃包用 solid=False
+        w = Writer(fp, level=HIGH)           # 固实；崩溃包用 solid=False
         m = w.begin("logs/server.out")       # compress=False = 原样存
         w.write(m, chunk) ...                # 源文件由调用方自己读
         w.end(m, st.st_mtime_ns)
         size = w.close()                     # 写目录头、回填签名头；fp 不关
 
     `fp` 从当前位置起就是这个 7z（一般是新文件的 0）。同一时刻只能有一个成员在写。
+    `level` 是 `LEVELS` 的键；不认识抛 `ValueError`（什么都还没写）。
     """
 
-    def __init__(self, fp, preset=DEFAULT_PRESET, solid=True):
+    def __init__(self, fp, level=HIGH, solid=True):
+        if level not in LEVELS:
+            raise ValueError("不认识的压缩等级：%r（只有 %s）" % (level, " / ".join(LEVELS)))
         self._fp = fp
-        self._preset = preset
+        self._level = LEVELS[level]
         self._solid = solid
         self._base = fp.tell()
         self._members = []
@@ -325,9 +344,9 @@ class Writer:
                 raise RuntimeError("这个 Python 没带 lzma 模块，压不了 LZMA2")
             compressor = lzma.LZMACompressor(
                 format=lzma.FORMAT_RAW,
-                filters=[{"id": lzma.FILTER_LZMA2, "preset": self._preset,
-                          "dict_size": DICT_SIZE}])
-        folder = _Folder(method, compressor)
+                filters=[{"id": lzma.FILTER_LZMA2, "preset": self._level.preset,
+                          "dict_size": self._level.dict_size}])
+        folder = _Folder(method, compressor, self._level.dict_size)
         self._folders.append(folder)
         self._open = folder
         return folder

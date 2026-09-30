@@ -50,9 +50,11 @@
 
 ## 包是 7z（X17，用户 2026-09-30「客户端的崩溃包也改成7z格式上传到服务器吧」）
 
-`sevenzip.Writer` **非固实**（一个成员一个 folder）、LZMA2 -1 档：每写完一个成员
+`sevenzip.Writer` **非固实**（一个成员一个 folder）：每写完一个成员
 `tell()` 就是精确体积，「加不下就跳过」的额度照旧按它算；读坏的成员 `rollback()` 掉。
-实测 45.7 MB 的 mdmp：原来的 zip（deflate-6）15.3 MB → 11.4 MB（§142）。
+压缩等级固定 `HIGH`（= 7-Zip「标准压缩」，用户 2026-09-30 定，D102）：两份玩家真崩溃包
+原来的 zip（deflate-6）12.8 / 10.6 MB → 6.6 / 6.7 MB（§143）。代价是多几秒、编码器多占 ~186 MB，
+都在游戏已经退出之后才付。
 服务端按魔数收（`crashstore.package_suffix`），已经发出去的老客户端传 zip 照收；
 本机 `logs/.crash_pending/` 里升级前攒下的 `.zip` 也照旧补传。
 """
@@ -660,7 +662,7 @@ class Collector:
         # 记打包这一刻（和原来 `zipfile.writestr` 一样）。
         now_ns = int(time.time() * 1e9)
         with open(tmp, "wb") as fp:
-            writer = sevenzip.Writer(fp, solid=False)
+            writer = sevenzip.Writer(fp, level=sevenzip.HIGH, solid=False)
             # `BigShot.rpt` 只截最后一段：整份文件是跨机器跨目录一路追加下来的
             # 历次崩溃，和这一次无关。
             # ★ 一律按 latin-1 编回**原始字节**再写进包里。这两份文本是原版

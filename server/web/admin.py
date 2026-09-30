@@ -48,7 +48,8 @@
     GET  /admin/api/logs/download?kind=client_crash[&sub=目录名]  崩溃包打成 zip      ★系统
          （两条 download 都是 chunked 流式响应，边打包边发，见 `_admin_logs_download`）
     GET  /admin/api/logs/archives[?since=版本]  「待下载 7z 包」快照；带 since = 长轮询（X17）★系统
-    POST /admin/api/logs/archives/create  {kind, scope, sub}  排一个后台 7z 压缩任务     ★系统
+    POST /admin/api/logs/archives/create  {kind, scope, sub, level}  排一个后台 7z 压缩任务
+         （level = low | high，弹窗「压缩等级」那一格，必填，D102）                       ★系统
     POST /admin/api/logs/archives/remove  {name} | {job}      删压好的包 / 清掉失败记录  ★系统
     GET  /admin/api/logs/archives/download?name=包名  下载压好的 7z（带 Content-Length） ★系统
 
@@ -2005,7 +2006,8 @@ class AdminRoutes:
 
     def _admin_logs_get(self):
         """`GET /admin/api/logs` —— 两个目录的大小 + 崩溃包清单，外加右栏「待下载 7z 包」的快照
-        （`archives`，没接 `LogShelf` 时是 null）和「这台能不能压 7z」（`sevenzip`）。★ 系统管理员专用。"""
+        （`archives`，没接 `LogShelf` 时是 null）、「这台能不能压 7z」（`sevenzip`）和
+        「压缩等级」那一行要的默认档 / 内存估算（`sevenzip_level`，D102）。★ 系统管理员专用。"""
         if self._require_system_admin() is None:
             return
         packer = self._log_packer()
@@ -2015,6 +2017,7 @@ class AdminRoutes:
         shelf = self.log_shelf
         payload["archives"] = shelf.snapshot() if shelf is not None else None
         payload["sevenzip"] = shelf is not None and sevenzip.AVAILABLE
+        payload["sevenzip_level"] = shelf.level_info() if shelf is not None else None
         payload["ok"] = True
         self._send_json(payload)
 
@@ -2065,13 +2068,16 @@ class AdminRoutes:
             if action == "create":
                 job, new = shelf.submit(
                     str(data.get("kind") or ""), str(data.get("scope") or ""),
-                    str(data.get("sub") or ""),
+                    str(data.get("sub") or ""), level=str(data.get("level") or ""),
                     meta={"version": versioning.own_version_text(), "by": name}, who=who)
+                grade = sevenzip.LEVELS[job.level].label
                 if new:
-                    eventlog.online(f"[admin] {who} 排了 7z 压缩：{job.plan.label}（{job.name}）")
-                    message = f"已加入压缩队列：{job.plan.label}"
+                    eventlog.online(f"[admin] {who} 排了 7z 压缩（压缩等级 {grade}）："
+                                    f"{job.plan.label}（{job.name}）")
+                    message = f"已加入压缩队列：{job.plan.label}（压缩等级 {grade}）"
                 else:
-                    message = f"这一份已经在压了：{job.plan.label}"
+                    # 同一份不管档（`LogShelf.submit`）：说清楚正在压的是哪一档。
+                    message = f"这一份已经在压了：{job.plan.label}（压缩等级 {grade}）"
             elif action == "remove":
                 target = str(data.get("name") or "")
                 job_id = str(data.get("job") or "")
