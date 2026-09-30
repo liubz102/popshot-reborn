@@ -40,6 +40,7 @@ import authserver
 #   照样启动得起来，直到有人在房间里说第一句话才炸 —— 那时候炸的是玩家的
 #   连接。在这里显式 import 一次，把它变成**启动就炸**。
 import bot                                                     # noqa: F401
+import cfgmerge
 import config as server_config
 import crashstore
 import databackup
@@ -48,6 +49,8 @@ import eventlog
 import gameserver
 import logcleanup
 import logpack
+import logshelf
+import sevenzip
 import shopcfg
 import udpsync
 import versioning
@@ -343,6 +346,7 @@ def _report_shop_config():
         eventlog.online(head)
     _report_first_run_upgrades(created)
     _report_new_weapons()
+    _report_reward_slots()
     _report_character_shelf()
 
 
@@ -380,6 +384,36 @@ def _report_new_weapons():
                          for entry in items[:6])
                + ("…" if len(items) > 6 else ""),
                len(shelf), shopcfg.ITEMS_FILENAME))
+    log(head)
+    eventlog.online(head)
+
+
+def _report_reward_slots():
+    """★ 奖励表缺的档位按内置默认值补进 `rewards.json` 的**日志那一半**（X_Mod D103）。
+
+    判断和写盘都在 `shopcfg.backfill_rewards()`（数据层）；这儿只负责说话，
+    和 `_report_new_weapons` 分工一样。这一版要它，是因为格斗模式单独占了
+    两档：老服务器上的 `rewards.json` 没有，`ensure_files` 又不碰已存在的文件（D7）。
+
+    ★ 失败不拦着开服：最坏是「文件里还没有那几档」—— 结算照样按内置默认值发
+      （`gameserver._reward_row`），管理页打开时也会现补出来，保存一次就落盘。
+    ★ **按状态翻转说话**：补完之后每次启动都是空结果，一行都不打。
+    """
+    try:
+        added = shopcfg.backfill_rewards(apply=True)
+    except Exception as error:              # noqa: BLE001 —— 见 docstring
+        log(f"⚠ 奖励表补档没做（{error}）；缺的档位结算时照样按内置默认值发。"
+            f"修好 {shopcfg.REWARDS_FILENAME} 后重启会再补，"
+            f"或者管理页「金币 / 经验」保存一次")
+        return
+    if not added:
+        return
+    names = "、".join(
+        cfgmerge.label_of("rewards", (cfgmerge.natural_key("rewards", rule), 0))
+        for rule in added)
+    head = (f"奖励表: 补上了 {len(added)} 档（{names}），数值是内置默认值，"
+            f"要改去管理页「金币 / 经验」；原有的一个字没动，"
+            f"原件留在 {shopcfg.REWARDS_FILENAME}.bak-* 里")
     log(head)
     eventlog.online(head)
 
@@ -656,13 +690,19 @@ def main(argv=None):
         # logs_client_crash\ 打成 zip 流式发给浏览器。打包在那条 HTTP 请求线程上做，
         # 不拿任何数据锁，zlib / 文件 IO / 发包都释放 GIL —— 不挡战斗（D131）。
         log_packer = logpack.LogPacker(logcleanup.DEFAULT_LOGDIR, crash.dir)
+        # 同一弹窗的 7z（X17，D101）：7z 做不到边压边发 ⇒ 一条后台线程压进 logs_7z\，
+        # 右栏长轮询看进度、压完再下。线程和目录都等第一次「压缩」才有（打包自检不长目录）。
+        log_shelf = logshelf.LogShelf(
+            log_packer, os.path.join(os.path.dirname(logcleanup.DEFAULT_LOGDIR),
+                                     logshelf.DIRNAME),
+            audit=lambda message: eventlog.online(message))
         _start("web", web_server.serve,
                kwargs={"port": web_port, "accounts": accounts,
                        "host": args.host, "cooldown": cooldown,
                        "backup": backup, "crash": crash,
                        "crash_max_mb": crash_max_mb,
                        "crash_cooldown": cfg["crash_upload_cooldown_seconds"],
-                       "log_packer": log_packer},
+                       "log_packer": log_packer, "log_shelf": log_shelf},
                port=web_port)
         log(f"注册页   {describe_listen(args.host, web_port)}"
             f" —— 本机打开 http://127.0.0.1:{web_port}/")
@@ -678,7 +718,17 @@ def main(argv=None):
         else:
             log("崩溃日志 不接收（crash_max_upload_mb = 0）")
         log(f"日志下载 管理页「数据管理」→「下载日志」能把 logs\\ 和 "
-            f"{crashstore.DIRNAME}\\ 打成 zip 下载（不用远程登录）")
+            f"{crashstore.DIRNAME}\\ 打成 zip（边压边下）或 7z（后台压进 "
+            f"{logshelf.DIRNAME}\\ 再下）下载（不用远程登录）")
+        if not sevenzip.AVAILABLE:
+            log("日志下载 ⚠ 这个 Python 没带 lzma 模块（自己编译时缺 liblzma），"
+                "打不了 7z，只能用 zip；换服务端包自带的运行时就有")
+        else:
+            # 弹窗「压缩等级」默认勾哪一档（D102）：云上看这一行就知道为什么默认是「低」。
+            level = log_shelf.level_info()
+            log(f"日志下载 7z 压缩等级默认「{sevenzip.LEVELS[level['default']].label}」"
+                f"（本机内存 {level['memory_text'] or '查不到'}，低于 "
+                f"{level['low_memory_text']} 默认选「低」；弹窗里随时能改）")
     else:
         log("注册页   已关闭（--no-web）")
 

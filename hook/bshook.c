@@ -20,6 +20,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <imm.h>        /* 只用结构体 / 常量（IMECHARPOSITION、CANDIDATEFORM），不调 Imm* 函数 */
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -3335,6 +3336,351 @@ static int try_patch_sum_rect_guard(void)
     bslog("PATCH   ★IME 闪退修复2/2 @ %08X: 坐标换算头指针为空/野值时输出"
           "全零矩形（修复1/2 生效后 head=0 合法，原版这里会读 [0+0x1C]）",
           (unsigned)SUM_RECT_VA);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ★ 输入法一律用它自己的候选界面（X14，FINDINGS §106 / D70）                 */
+/*                                                                            */
+/*   原版 `ImeContext` 的消息处理 0x428f45 自己接候选通知、自己画那个竖排选字框 */
+/*   （UiImeCandidates，布局 0x430102），还把 WM_IME_SETCONTEXT 吞掉 —— 那是   */
+/*   照老式 IMM 输入法写的。现在的输入法都自带候选界面，游戏那个框只是重复的一份，*/
+/*   而且和它们对不上：搜狗在游戏里只发 OPEN / CHANGE、从不发 CLOSE（框清不掉）， */
+/*   选中序号还会越过它给的条数（翻到第三行框就没了）；微软拼音压根不给候选。   */
+/*                                                                            */
+/*   0x428f45 全镜像只有 0x40edcb 一个调用点（esi = ImeContext，栈上 msg /     */
+/*   &wParam / &lParam，`ret 0xc`；返回非 0 ⇒ 窗口过程直接返回 1、不进         */
+/*   DefWindowProcW）。把这个 call 改指到 ime_msg_thunk，先分流一道：          */
+/*     · IMN_OPEN / CHANGE / CLOSECANDIDATE、IMN_SETCANDIDATEPOS → 返回 0：    */
+/*       窗口过程照常交给 DefWindowProcW。游戏的词表永远是空的，自带框永不出现； */
+/*     · WM_IME_SETCONTEXT → 返回 0：不再吞（老式输入法靠它才肯显示自己的窗口），*/
+/*       但去掉 ISC_SHOWUICOMPOSITIONWINDOW —— 游戏自己在输入框里画拼音；        */
+/*     · WM_IME_REQUEST 的 QUERYCHARPOSITION / CANDIDATEWINDOW → 用此刻聚焦的   */
+/*       输入框回答光标和矩形，返回 1（= 窗口过程返回 TRUE）；                  */
+/*     · 每条消息先比一下「聚焦输入框 + 光标」，变了就用 ImmSetCompositionWindow */
+/*       / ImmSetCandidateWindow 主动写进上下文（询问只在激活时来一次，微软拼音 */
+/*       只认这两个）。原版什么都不答也不设：搜狗挤右下角、微软拼音挤左上角；    */
+/*     · WM_IME_START / ENDCOMPOSITION、不带上屏结果的 WM_IME_COMPOSITION →     */
+/*       原函数照跑（重读拼音、输入框里画），然后吞掉：不进 DefWindowProcW，系统 */
+/*       就不再替微软拼音另开一个组字窗叠在游戏那份拼音上。带上屏结果的那条照交 */
+/*       （游戏靠它变成 WM_CHAR），只去掉拼音那几位；                           */
+/*     · 其余照走原函数。                                                       */
+/* -------------------------------------------------------------------------- */
+#define IME_MSG_CALL_VA       0x0040EDCBu  /* call 0x428f45（全镜像唯一调用点） */
+#define IME_MSG_SIG_LEN       13
+static const unsigned char IME_MSG_SIG[IME_MSG_SIG_LEN] = {
+    0xE8, 0x75, 0xA1, 0x01, 0x00,       /* call 0x428f45（ImeContext 消息处理）  */
+    0x85, 0xC0,                         /* test eax, eax                        */
+    0x0F, 0x85, 0xFD, 0x04, 0x00, 0x00  /* jne 0x40f2d5（返回 1、不进默认处理）  */
+};
+/* thunk 里要用的立即数不带后缀（MSVC 内联汇编不吃 0x…u 这种写法） */
+#define IME_MSG_HANDLER_JMP   0x00428F45
+
+#define IME_UI_DESKTOP_PP     0x0072E2B4u  /* Desktop 单例；+0x10 = 此刻聚焦的输入框 */
+#define IME_UI_APP_PP         0x0072E2A4u  /* App 单例；+0x98 = 显示模式            */
+#define IME_UI_MODE_800X600   2            /* 界面照 1024×768 排，整窗缩到 800×600   */
+#define IME_UI_SCALE_VA       0x00693860u  /* double 1.28：0x40f3b7 拿它把光标换成界面坐标 */
+
+static volatile LONG g_ime_native_patched = 0;
+
+/* imm32 里要用的四个函数：游戏自己就导入了 imm32，按名字取，不往 build.bat 里加库。 */
+typedef HIMC (WINAPI *ime_get_ctx_fn)(HWND);
+typedef BOOL (WINAPI *ime_rel_ctx_fn)(HWND, HIMC);
+typedef BOOL (WINAPI *ime_set_comp_fn)(HIMC, LPCOMPOSITIONFORM);
+typedef BOOL (WINAPI *ime_set_cand_fn)(HIMC, LPCANDIDATEFORM);
+static ime_get_ctx_fn  g_imm_get_ctx;
+static ime_rel_ctx_fn  g_imm_rel_ctx;
+static ime_set_comp_fn g_imm_set_comp;
+static ime_set_cand_fn g_imm_set_cand;
+
+/* 下面这几格只在游戏 UI 线程（窗口过程里）读写，不加锁。 */
+static const void *g_ime_pos_edit;        /* 上次把位置告诉输入法时聚焦的输入框 */
+static RECT        g_ime_pos_box;         /* 上次告诉的输入框矩形（客户区） */
+static RECT        g_ime_pos_caret;       /* 上次告诉的光标矩形（客户区） */
+static int         g_ime_req_said = -1;   /* 位置询问：上次记日志时「答了 / 没答」 */
+
+static LONG ime_ui_to_client(int v, double k)
+{
+    double d = v / k;
+    return (LONG)(d >= 0.0 ? d + 0.5 : d - 0.5);
+}
+
+/* 此刻聚焦的输入框在客户区里的矩形和光标（都是客户区坐标）。没有聚焦的输入框返回 0。
+   几何全照原版：控件 +0x10/+0x14 是相对父控件（+0x28）的 x/y、+0x18/+0x1c 是宽高
+   （SumRect 0x42515E 就是沿父链这么累加的）；UiEdit +0x110 是光标矩形（相对输入框，
+   原版自带框 0x4301b4 就贴着它摆，画输入框时才更新）。显示模式 2 时界面坐标比客户区
+   大 1.28 倍（0x40f3ab 那段做的是反方向：客户区 × 1.28 = 界面），这里除回去。
+   `edit_out` 可以是 NULL。 */
+static int ime_focus_geometry(RECT *box, RECT *caret, const void **edit_out)
+{
+    const unsigned char *desk, *edit, *c, *app;
+    const int *cr;
+    int x = 0, y = 0;
+    double k = 1.0;
+
+    if (IsBadReadPtr((const void *)IME_UI_DESKTOP_PP, 4)) return 0;
+    desk = *(const unsigned char * const *)IME_UI_DESKTOP_PP;
+    if ((UINT_PTR)desk < 0x10000 || IsBadReadPtr(desk + 0x10, 4)) return 0;
+    edit = *(const unsigned char * const *)(desk + 0x10);
+    if ((UINT_PTR)edit < 0x10000 || IsBadReadPtr(edit, 0x120)) return 0;
+    for (c = edit; (UINT_PTR)c >= 0x10000; c = *(const unsigned char * const *)(c + 0x28)) {
+        if (IsBadReadPtr(c, 0x2c)) return 0;
+        x += *(const int *)(c + 0x10);
+        y += *(const int *)(c + 0x14);
+    }
+    if (!IsBadReadPtr((const void *)IME_UI_APP_PP, 4)) {
+        app = *(const unsigned char * const *)IME_UI_APP_PP;
+        if ((UINT_PTR)app >= 0x10000 && !IsBadReadPtr(app + 0x98, 4)
+            && *(const int *)(app + 0x98) == IME_UI_MODE_800X600
+            && !IsBadReadPtr((const void *)IME_UI_SCALE_VA, 8))
+            k = *(const double *)IME_UI_SCALE_VA;
+    }
+    if (!(k > 0.0)) k = 1.0;
+    cr = (const int *)(edit + 0x110);
+    box->left     = ime_ui_to_client(x, k);
+    box->top      = ime_ui_to_client(y, k);
+    box->right    = ime_ui_to_client(x + *(const int *)(edit + 0x18), k);
+    box->bottom   = ime_ui_to_client(y + *(const int *)(edit + 0x1c), k);
+    caret->left   = ime_ui_to_client(x + cr[0], k);
+    caret->top    = ime_ui_to_client(y + cr[1], k);
+    caret->right  = ime_ui_to_client(x + cr[2], k);
+    caret->bottom = ime_ui_to_client(y + cr[3], k);
+    if (edit_out) *edit_out = edit;
+    return 1;
+}
+
+static int ime_imm_ready(void)
+{
+    HMODULE m;
+
+    if (g_imm_get_ctx && g_imm_rel_ctx && g_imm_set_comp && g_imm_set_cand) return 1;
+    m = GetModuleHandleA("imm32.dll");
+    if (m == NULL) return 0;
+    g_imm_get_ctx  = (ime_get_ctx_fn)GetProcAddress(m, "ImmGetContext");
+    g_imm_rel_ctx  = (ime_rel_ctx_fn)GetProcAddress(m, "ImmReleaseContext");
+    g_imm_set_comp = (ime_set_comp_fn)GetProcAddress(m, "ImmSetCompositionWindow");
+    g_imm_set_cand = (ime_set_cand_fn)GetProcAddress(m, "ImmSetCandidateWindow");
+    return g_imm_get_ctx && g_imm_rel_ctx && g_imm_set_comp && g_imm_set_cand;
+}
+
+/* 把「聚焦输入框的光标在哪」主动写进输入法上下文（组字窗 + 候选窗的位置）。
+   ★ 为什么要主动写：输入法的位置询问（IMR_QUERYCHARPOSITION）只在窗口**激活那一刻**来一次
+     （实测：打字过程中一次都不问），那时多半还没有聚焦的输入框 —— 搜狗就退回右下角，
+     alt+tab 切回来那次答上了才挪对；微软拼音更是根本不看这个问答，只认程序用
+     ImmSetCompositionWindow / ImmSetCandidateWindow 设的位置（原版从来不设 ⇒ 左上角）。
+   ★ 什么时候写：窗口过程每来一条消息就比一下「聚焦的输入框 + 输入框矩形 + 光标矩形」，
+     **变了才写**（按状态翻转，不按次数 / 时间）。光标矩形是画输入框时更新的，打一个字之后
+     下一条消息就能看到新位置。先记下「已写的值」再调 Imm：这两个调用会同步回发
+     IMN_SETCOMPOSITIONWINDOW / IMN_SETCANDIDATEPOS，重入进来时已经是「没变」，不会绕圈。
+   ★ 焦点换了才记一行日志（光标每挪一下都记就是刷屏）。 */
+static void ime_sync_forms(const unsigned char *ctx)
+{
+    RECT box, caret;
+    const void *edit = NULL;
+    HWND hwnd;
+    HIMC himc;
+    COMPOSITIONFORM cf;
+    CANDIDATEFORM cand;
+    BOOL ok_comp, ok_cand;
+    int focus_changed;
+
+    if (!ime_focus_geometry(&box, &caret, &edit)) {
+        g_ime_pos_edit = NULL;              /* 下次聚焦时一定重写一遍 */
+        return;
+    }
+    if (edit == g_ime_pos_edit && EqualRect(&box, &g_ime_pos_box)
+        && EqualRect(&caret, &g_ime_pos_caret))
+        return;
+    focus_changed = edit != g_ime_pos_edit;
+    g_ime_pos_edit = edit;
+    g_ime_pos_box = box;
+    g_ime_pos_caret = caret;
+    if ((UINT_PTR)ctx < 0x10000 || !ime_imm_ready()) return;
+    hwnd = *(HWND const *)(ctx + 4);        /* ImeContext+4 = 游戏主窗口（构造时记的） */
+    himc = g_imm_get_ctx(hwnd);
+    if (himc == NULL) {
+        /* 这个输入框没开输入法（原版对不允许输入法的输入框会拆掉上下文）：
+           不写，等下次有上下文时按「变了」再来。 */
+        g_ime_pos_edit = NULL;
+        return;
+    }
+    memset(&cf, 0, sizeof(cf));
+    cf.dwStyle = CFS_POINT;
+    cf.ptCurrentPos.x = caret.left;
+    cf.ptCurrentPos.y = caret.top;
+    cf.rcArea = box;
+    ok_comp = g_imm_set_comp(himc, &cf);
+    memset(&cand, 0, sizeof(cand));
+    cand.dwIndex = 0;
+    cand.dwStyle = CFS_EXCLUDE;             /* 贴着光标摆、别盖住输入框 */
+    cand.ptCurrentPos.x = caret.left;
+    cand.ptCurrentPos.y = caret.top;
+    cand.rcArea = box;
+    ok_cand = g_imm_set_cand(himc, &cand);
+    g_imm_rel_ctx(hwnd, himc);
+    if (focus_changed)
+        bslog("IME     聚焦输入框 %08X：框 (%ld,%ld)-(%ld,%ld) 光标 (%ld,%ld) → "
+              "组字窗位置 %s、候选窗位置 %s", (unsigned)(UINT_PTR)edit,
+              box.left, box.top, box.right, box.bottom, caret.left, caret.top,
+              ok_comp ? "已设" : "失败", ok_cand ? "已设" : "失败");
+}
+
+/* 回答输入法的位置询问。返回 1 = 答了（窗口过程返回 TRUE）；0 = 交给 DefWindowProcW。 */
+static int ime_answer_request(const unsigned char *ctx, WPARAM req, LPARAM lp)
+{
+    RECT box, caret;
+    POINT tl, br;
+    HWND hwnd;
+    int answered;
+
+    if (req != IMR_QUERYCHARPOSITION && req != IMR_CANDIDATEWINDOW) return 0;
+    answered = lp != 0 && ime_focus_geometry(&box, &caret, NULL);
+    if (answered != g_ime_req_said) {        /* 按「答了 / 没答」翻转记一行 */
+        g_ime_req_said = answered;
+        bslog("IME     输入法问光标位置（%s）：%s",
+              req == IMR_QUERYCHARPOSITION ? "IMR_QUERYCHARPOSITION" : "IMR_CANDIDATEWINDOW",
+              answered ? "答了（聚焦输入框的光标）" : "没答（此刻没有聚焦的输入框）");
+    }
+    if (!answered) return 0;
+    if (req == IMR_CANDIDATEWINDOW) {
+        /* 客户区坐标；dwIndex 输入法已经填好。CFS_EXCLUDE：贴着光标摆、别盖住输入框。 */
+        CANDIDATEFORM *cf = (CANDIDATEFORM *)lp;
+        cf->dwStyle = CFS_EXCLUDE;
+        cf->ptCurrentPos.x = caret.left;
+        cf->ptCurrentPos.y = caret.top;
+        cf->rcArea = box;
+        return 1;
+    }
+    /* IMR_QUERYCHARPOSITION：屏幕坐标。dwCharPos 不看 —— 游戏不给输入法排组字串，
+       哪个字都答光标那一点；rcDocument 给整个输入框。 */
+    {
+        IMECHARPOSITION *cp = (IMECHARPOSITION *)lp;
+        hwnd = *(HWND const *)(ctx + 4);        /* ImeContext+4 = 游戏主窗口（构造时记的） */
+        cp->pt.x = caret.left;
+        cp->pt.y = caret.top;
+        ClientToScreen(hwnd, &cp->pt);
+        cp->cLineHeight = caret.bottom > caret.top ? (UINT)(caret.bottom - caret.top)
+                                                   : (UINT)(box.bottom - box.top);
+        tl.x = box.left;  tl.y = box.top;
+        br.x = box.right; br.y = box.bottom;
+        ClientToScreen(hwnd, &tl);
+        ClientToScreen(hwnd, &br);
+        SetRect(&cp->rcDocument, tl.x, tl.y, br.x, br.y);
+        return 1;
+    }
+}
+
+#define IME_FILTER_ORIG      (-1)   /* 照走原函数（它的返回值原样给窗口过程） */
+#define IME_FILTER_ORIG_EAT  (-2)   /* 原函数照跑，然后吞掉：窗口过程返回 1、不进 DefWindowProcW */
+#define IME_RESULT_FLAGS     (GCS_RESULTREADSTR | GCS_RESULTREADCLAUSE | GCS_RESULTSTR | GCS_RESULTCLAUSE)
+
+/* 返回 IME_FILTER_ORIG / IME_FILTER_ORIG_EAT，或者 0 / 1 = 顶替原函数的返回值
+   （0 → 窗口过程往下走、最后进 DefWindowProcW；1 → 窗口过程直接返回 1）。 */
+static int __stdcall ime_msg_filter(const unsigned char *ctx, UINT msg,
+                                    WPARAM *pw, LPARAM *pl)
+{
+    ime_sync_forms(ctx);
+    switch (msg) {
+    /* 组字三条：原函数照跑（重读拼音、输入框里画），但**别交给 DefWindowProcW** —— 交过去
+       系统就替会给拼音的输入法（微软拼音）开一个组字窗，位置写对之后它正好叠在游戏画的
+       那份拼音上（实测两层字）。自己画拼音的程序本来就该吞掉这三条。
+       ★ 唯一的例外是带上屏结果的那条：游戏靠 DefWindowProcW 把它变成 WM_IME_CHAR → WM_CHAR
+         送进输入框，所以照交，只把拼音那几位去掉（去掉之后系统没有组字可显示）。 */
+    case WM_IME_STARTCOMPOSITION:
+    case WM_IME_ENDCOMPOSITION:
+        return IME_FILTER_ORIG_EAT;
+    case WM_IME_COMPOSITION:
+        if (!((DWORD)*pl & GCS_RESULTSTR)) return IME_FILTER_ORIG_EAT;
+        *pl = (LPARAM)((DWORD)*pl & IME_RESULT_FLAGS);
+        return IME_FILTER_ORIG;
+    case WM_IME_SETCONTEXT:
+        /* 放行给 DefWindowProcW，但去掉「显示输入法自己的组字窗」：会把拼音交给程序的输入法
+           （微软拼音），游戏本来就在输入框里画一份，位置写对之后那个组字窗会叠在它上面。
+           `pl` 指的就是窗口过程自己的 lParam 那一格（0x40edc2 `lea eax,[ebp+0x14]`），
+           改了之后 0x40f2a0 交给 DefWindowProcW 的就是改过的值。 */
+        *pl = (LPARAM)((DWORD)*pl & ~(DWORD)ISC_SHOWUICOMPOSITIONWINDOW);
+        return 0;
+    case WM_IME_NOTIFY:
+        switch (*pw) {
+        case IMN_OPENCANDIDATE:
+        case IMN_CHANGECANDIDATE:
+        case IMN_CLOSECANDIDATE:
+        case IMN_SETCANDIDATEPOS:
+            return 0;
+        }
+        return IME_FILTER_ORIG;
+    case WM_IME_REQUEST:
+        return ime_answer_request(ctx, *pw, *pl);
+    }
+    return IME_FILTER_ORIG;
+}
+
+/* 0x40edcb 的 call 改指这里。入口栈：[esp] = 返回地址 0x40edd0、[esp+4] = msg、
+   [esp+8] = &wParam、[esp+0xc] = &lParam；esi = ImeContext（寄存器传参）。
+   ★ 不调原函数的那几条也要 `ret 0xc` —— 原函数自己清参数，调用方不管。
+   ★ IME_FILTER_ORIG：栈和 esi 原样不动，直接尾跳过去，由它 `ret 0xc` 回 0x40edd0。
+   ★ IME_FILTER_ORIG_EAT：把三个参数原样再压一遍、真 call 原函数（它 `ret 0xc` 回到这里），
+     然后 eax = 1 再 `ret 0xc` —— 窗口过程见非 0 直接返回 1。原函数一条指令都不写 esi
+     （test_patchsites 钉着），所以调完 esi 还是 ImeContext。
+   ★ 调用方之后还要用 ebx（msg）/ edi（App）：C 函数和原函数都按约定保；ecx / edx
+     调用方不读（原函数本来就会改它们）。 */
+static __declspec(naked) void ime_msg_thunk(void)
+{
+    __asm {
+        push dword ptr [esp + 0x0c]         /* &lParam */
+        push dword ptr [esp + 0x0c]         /* &wParam（上一条 push 已让偏移 +4） */
+        push dword ptr [esp + 0x0c]         /* msg */
+        push esi                            /* ImeContext */
+        call ime_msg_filter                 /* __stdcall，自己清 16 字节 */
+        cmp  eax, IME_FILTER_ORIG
+        je   imt_orig
+        cmp  eax, IME_FILTER_ORIG_EAT
+        je   imt_orig_eat
+        ret  0x0c
+    imt_orig:
+        mov  eax, IME_MSG_HANDLER_JMP
+        jmp  eax
+    imt_orig_eat:
+        push dword ptr [esp + 0x0c]         /* &lParam */
+        push dword ptr [esp + 0x0c]         /* &wParam */
+        push dword ptr [esp + 0x0c]         /* msg */
+        mov  eax, IME_MSG_HANDLER_JMP
+        call eax                            /* 原函数照跑，自己 ret 0xc */
+        mov  eax, 1
+        ret  0x0c
+    }
+}
+
+static int try_patch_ime_native_ui(void)
+{
+    unsigned char *p = (unsigned char *)IME_MSG_CALL_VA;
+    LONG rel = (LONG)((UINT_PTR)&ime_msg_thunk - (UINT_PTR)(p + 5));
+    DWORD oldp;
+
+    if (g_ime_native_patched) return 1;
+    if (IsBadReadPtr(p, IME_MSG_SIG_LEN)) return 0;
+    /* 幂等：已打过就是「E8 <到 thunk 的 rel32>」，后面 8 字节照旧 */
+    if (p[0] == 0xE8 && *(LONG *)(p + 1) == rel
+        && memcmp(p + 5, IME_MSG_SIG + 5, IME_MSG_SIG_LEN - 5) == 0) {
+        InterlockedExchange(&g_ime_native_patched, 1);
+        return 1;
+    }
+    if (memcmp(p, IME_MSG_SIG, IME_MSG_SIG_LEN) != 0)
+        return 0;                    /* 还没解壳到这里，或不是已确认的版本 */
+
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   输入法原生候选: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    /* 只换 rel32 这 4 个字节：它在 0x40edcc，**4 字节对齐** ⇒ 一次原子替换，
+       窗口过程此刻正好在跑这条 call 也只会看到整旧或整新（test_patchsites 钉着对齐）。 */
+    InterlockedExchange((volatile LONG *)(p + 1), rel);
+    VirtualProtect(p, 5, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    InterlockedExchange(&g_ime_native_patched, 1);
+    bslog("PATCH   ★输入法原生候选 @ %08X：游戏不再接候选通知（自带选字框不再出现）、"
+          "不再吞 WM_IME_SETCONTEXT、替输入法回答光标位置", (unsigned)IME_MSG_CALL_VA);
     return 1;
 }
 
@@ -8098,9 +8444,11 @@ static int try_patch_ime_cand_layout_guard(void)
 /*   改法：第二处（任务下拉框）把「地区序号」当成 0（韩国）来算，             */
 /*   `mov ecx,[...]` -> `xor ecx,ecx`，掩码里带 bit0 的都放行（7 / 3 / 1）。   */
 /*   第一处（目录加载）会话 39 起升级为**把掩码判定整个旁路**（NOP 掉 je，     */
-/*   见下面「全部解锁」那段）—— 掩码为 0 的条目也保留；缺文件的 Quest08 /     */
-/*   Festivalm01 靠「任何列表都选不到」兜底（任务表没有 id 8、무투전模式       */
-/*   在中国区建房下拉里被隐藏）。                                             */
+/*   见下面「全部解锁」那段）—— 掩码为 0 的条目也保留；缺文件的 Quest08 靠     */
+/*   「任何列表都选不到」兜底（任务表没有 id 8）。★ 同样缺文件的 Festivalm01   */
+/*   以前也靠「무투전 在国服建房下拉里被隐藏」兜底 —— X16 把格斗模式解锁后     */
+/*   （下面 MUTU_SITES）它选得到了、进去全黑，用户 2026-09-27 定从 map.ini     */
+/*   删掉 `[18-3]`、以后不补（X_Mod D90），目录里已经没有它。                   */
 /*                                                                            */
 /*   时机：两处都要**早于**启动时的 map.ini 加载。patch 线程在 +2.5s 打，      */
 /*   那时资源加载还没开始（见 patch_thread 里 SnowCipher 那段的说明）。       */
@@ -8178,7 +8526,10 @@ static int try_patch_ime_cand_layout_guard(void)
 /*       CamelCulvert02 这些「全世界都没开放」的图（文件都在包里）进目录；      */
 /*       连带进来的还有缺文件的 Festivalm01（Mutu 限定）和 Quest08/Quest08_1   */
 /*       （QuestId=8，不在建房任务表 0x6dc52c {3,2,1,4,5,6,7} 里）——           */
-/*       两者在对战/闯关的任何列表里都选不到，只会安静地躺在目录里。            */
+/*       Quest08 在闯关的任何列表里都选不到，只会安静地躺在目录里；            */
+/*       ★ Festivalm01 在 X16 解锁格斗模式之后选得到了、进去全黑 ⇒ 已从         */
+/*       map.ini 删掉（X_Mod D90）。★ 另：没写 OpenLocale 的缺省掩码其实是 1（只开 */
+/*       韩服，`0x40aec5`），不是 0 —— 结论不变，都要靠这里的旁路进目录。       */
 /*     · 第五处 0x4653be `je 0x4654b3`（0F 84 EF 00 00 00 -> 6×90）：不跳 =   */
 /*       加进「地图」下拉框。只把地区序号当 0 还挡掩码 0 的图，所以同样旁路。  */
 /*                                                                            */
@@ -8489,6 +8840,533 @@ static int try_patch_irene_level(void)
         return 1;
     }
     return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* 阶段5b —— 格斗模式（무투전，对战模式号 2）解锁                              */
+/*   X_Mod · X16，来龙去脉在                                                   */
+/*   `develop_history/X_自定义游戏内容Mod开发/.claude/FINDINGS.md` §118~§123、   */
+/*   `DECISIONS.md` D82。                                                     */
+/*                                                                            */
+/*   格斗模式在国服客户端里**是完整的**：模式 2 建 `GameContextSurvival`       */
+/*   （每人 3 条命、300 s），`IsMutu`（GameContext 虚表槽 5 = 模式号 == 2）     */
+/*   为真就关掉开火 / 换枪 / 瞄准、打开 J 轻击 / K 重击 / L 格挡；160 招的     */
+/*   动作 / 特效 / 音效全在。**唯一藏它的是建房下拉框里的一道地区判据**（G1）；*/
+/*   另外四处是用户要的、**超出原版**的体验：                                  */
+/*                                                                            */
+/*   G1  `0x43755e`  建房「游戏模式」下拉框的填充循环（`0x437545` 起）：       */
+/*       地区 ∈ [1,2]（日 / 中）且模式号 == 2 就 `je` 跳过 무투전。              */
+/*       je -> nop，只放模式 2；频道码 10（超级新手）那道判断不动。             */
+/*   G2a `0x4659cc` / G2b `0x4659e3` / G2c `0x465a0a`  房间设定的 ◀▶：         */
+/*       原版**所有地区**都只在生存 ↔ 夺分之间转 —— 当前是格斗就整段跳过、     */
+/*       ◀ 跳过 2、▶ 把 2 改成 3。三处改完：◀ 夺分 → 格斗 → 生存 → 夺分，       */
+/*       ▶ 生存 → 格斗 → 夺分 → 生存（仍跳过模式 1 计时）。                    */
+/*       用户 2026-09-26「房间里也能切换」。切到格斗时选图会自己换成格斗图      */
+/*       （`0x465afe` → `0x40b5d0`），道具项客户端自己清 0（`0x465be2`）。      */
+/*   G3  `0x40b273`  地图过滤 `0x40b26f`：`RequiredQuestClear` 非 0 就去查任务  */
+/*       记录。全 map.ini 只有 6 张 Boss 格斗场写了这个键 ⇒ 一律当 0，它们不用  */
+/*       通关任务（用户 2026-09-27「全部地图直接默认解锁」）。唯一调用点         */
+/*       `0x40b646`；开局校验 `0x468176` 不查它。                              */
+/*                                                                            */
+/*   ★ **依赖地区解锁**：14 张格斗图（`AvailableMode=[Mutu]`）都没写           */
+/*   OpenLocale（缺省掩码 1 = 只开韩服），全靠上面 `REGION_SITES` 第一处旁路   */
+/*   才进地图目录 ⇒ 设了 BSHOOK_KEEP_REGION_LOCK=1 时格斗房一张图都没有，      */
+/*   这组跟着不打。                                                          */
+/*                                                                            */
+/*   原版还有第 15 张「庆典-格斗场」`[18-3] Festivalm01`，`.map` 原版包就没有， */
+/*   解锁后选到它进去全黑 ⇒ 用户 2026-09-27 定从 map.ini 删掉、不补（X_Mod D90）。*/
+/*                                                                            */
+/*   不开的：模式 4 구무투전（胜负条件工厂 `0x55e21a` 对 4 返回 NULL，一进局    */
+/*   读空指针）；格斗教程（入口弹窗 `0x43b499` 也是地区判据，但国服缺两个       */
+/*   .smf、键位图也接错，用户决定不做）；大厅「开始格斗模式」按钮。           */
+/*                                                                            */
+/*   设 BSHOOK_KEEP_MUTU_LOCK=1 整组保留原版。                                 */
+/*   ★ 五条特征串都在 `re/BigShot_22524.img` 上验过**各自唯一**，               */
+/*   `test/test_patchsites.py` 的 `MutuUnlockPatchTest` 钉着。                 */
+/* -------------------------------------------------------------------------- */
+#define MUTU_PATCH_COUNT 5
+/* 字段含义和 REGION_SITES 一样：特征串起始 VA / 长度 / 要改的字节在串里的偏移
+   / 改几个字节 / 原始字节 / 替换字节 / 说明。 */
+static const struct {
+    unsigned int va;
+    unsigned int len;
+    unsigned int off;
+    unsigned int n;
+    const unsigned char *sig;
+    const unsigned char *fix;
+    const char *what;
+} MUTU_SITES[MUTU_PATCH_COUNT] = {
+    { 0x00437545u, 27, 25, 2,
+      (const unsigned char *)"\xA1\x20\xE3\x72\x00\x8B\x00\x85\xC0\x8B\x9E\xC8\xE5\x72"
+                             "\x00\x7E\x0A\x83\xF8\x02\x7F\x05\x83\xFB\x02\x74\x64",
+      (const unsigned char *)"\x90\x90",          /* NOP 掉 je：地区 1/2 也列出 무투전 */
+      "建房「游戏模式」下拉框：地区 1/2 不再跳过 무투전（格斗模式）" },
+    { 0x004659C0u, 19, 12, 2,
+      (const unsigned char *)"\x83\xFB\x02\x89\x45\xE0\x8A\x46\x14\x88\x45\xD4"
+                             "\x74\x75\x68\x48\xA1\x66\x00",
+      (const unsigned char *)"\x90\x90",          /* NOP 掉 je：当前是格斗也照走 ◀▶ */
+      "房间设定：当前是格斗模式时 ◀▶ 不再失效" },
+    { 0x004659DFu, 16, 4, 2,
+      (const unsigned char *)"\x4B\x83\xFB\x02\x75\x01\x4B\x83"
+                             "\xFB\x01\x75\x24\x33\xDB\xEB\x20",
+      (const unsigned char *)"\xEB\x01",          /* jne -> jmp：◀ 不再跳过 2 */
+      "房间设定 ◀：夺分 → 格斗 → 生存" },
+    { 0x00465A00u, 18, 10, 2,
+      (const unsigned char *)"\x43\x83\xFB\x01\x75\x01\x43\x83\xFB\x02\x75\x03"
+                             "\x6A\x03\x5B\x83\xFB\xFF",
+      (const unsigned char *)"\xEB\x03",          /* jne -> jmp：▶ 不再把 2 改成 3 */
+      "房间设定 ▶：生存 → 格斗 → 夺分" },
+    { 0x0040B26Fu, 18, 4, 3,
+      (const unsigned char *)"\x55\x8B\xEC\x51\x8B\x40\x30\x85\xC0\x89\x45\xFC"
+                             "\x75\x04\xB0\x01\xC9\xC3",
+      (const unsigned char *)"\x33\xC0\x90",      /* mov eax,[eax+0x30] -> xor eax,eax / nop */
+      "地图过滤 0x40b26f：RequiredQuestClear 当 0（Boss 格斗场不用通关任务）" },
+};
+static volatile LONG g_mutu_patched = 0;
+
+static int mutu_lock_kept(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_MUTU_LOCK", buf, sizeof(buf));
+    return (n > 0 && n < sizeof(buf) && buf[0] != '0');
+}
+
+/* 返回 1 表示五处全都已就位（本轮打的或之前就打过）。 */
+static int try_patch_mutu_unlock(void)
+{
+    int i, done = 0;
+
+    if (g_mutu_patched) return 1;
+    for (i = 0; i < MUTU_PATCH_COUNT; i++) {
+        unsigned char *base = (unsigned char *)MUTU_SITES[i].va;
+        unsigned char *p = base + MUTU_SITES[i].off;
+        unsigned int n = MUTU_SITES[i].n;
+        DWORD oldp;
+
+        if (IsBadReadPtr(base, MUTU_SITES[i].len)) continue;
+        if (memcmp(p, MUTU_SITES[i].fix, n) == 0) { done++; continue; }
+        if (memcmp(base, MUTU_SITES[i].sig, MUTU_SITES[i].len) != 0)
+            continue;                            /* 还没解壳到这里，继续等 */
+        if (!VirtualProtect(p, n, PAGE_EXECUTE_READWRITE, &oldp)) {
+            bslog("PATCH   格斗模式解锁(%s): VirtualProtect 失败 err=%lu",
+                  MUTU_SITES[i].what, (unsigned long)GetLastError());
+            continue;
+        }
+        memcpy(p, MUTU_SITES[i].fix, n);
+        VirtualProtect(p, n, oldp, &oldp);
+        FlushInstructionCache(GetCurrentProcess(), p, n);
+        bslog("PATCH   ★格斗模式解锁 @ %08X: %s",
+              (unsigned)(MUTU_SITES[i].va + MUTU_SITES[i].off),
+              MUTU_SITES[i].what);
+        done++;
+    }
+    if (done == MUTU_PATCH_COUNT) {
+        InterlockedExchange(&g_mutu_patched, 1);
+        return 1;
+    }
+    return 0;
+}
+
+/* ========================================================================== */
+/* ★ B2 格斗招式判定体探针（X16 / D84，临时诊断，核完连同 test 一起删）        */
+/*                                                                            */
+/*   服务端替 bot 判格斗招式打没打中，用的是 `tools/mutudata.py` 离线烘的      */
+/*   判定体骨骼轨迹（X_Mod §124）—— 换算（1 场景单位 = 1 px、朝左镜像、        */
+/*   不乘 ChrSpineScale）是推的。这个探针在招式 Update（`NewMutuSkill` 虚表     */
+/*   `0x683b14` 槽 6 = `0x4f8243`，__thiscall、无栈参、`ret`）**之后**把每个   */
+/*   判定体 / 受击体摆到哪儿打出来（相对角色脚底），`tools/mutudata.py --check` */
+/*   逐帧和表比。                                                              */
+/*                                                                            */
+/*   ★ 挂法是改虚表那一格，不做 inline hook：Update 开头是 `mov eax,imm32 /     */
+/*     call _EH_prolog`，搬 call rel32 要重定位；改一格指针省事也好撤。         */
+/*   ★ 招式对象由角色 `[+0x5dc]` 持有（`0x503fde`）；Update 之后它还是那一格才读 */
+/*     （防着 Update 里被删 / 换招）。角色指针在调用前先取。                     */
+/*   ★ 布局（都逐指令核过）：`[skill+4]` 角色、`+0x20` 招式表记录（MoveDist     */
+/*     `+0x24` / γ `+0x28` / 起止 `+0x2c` `+0x30` / 判定体、受击体定义 vector    */
+/*     `+0x38` `+0x44`，0x28 一项）、`+0x2c` 判定体对象数组、`+0x38` 受击体对象  */
+/*     数组；对象位置 `+0x34/+0x38`（`0x417bb5` 写的）；引擎帧 = `0x4f9940(角色   */
+/*     vft+0x38())`，Update 开头就这么算的。                                     */
+/*   ★ 一招一个引擎帧只打一行（顿帧那几帧帧号不动 ⇒ 不重复 —— 按状态翻转去重）。 */
+/*   BSHOOK_MUTU_DIAG=1 才装（默认关）。                                        */
+/* ========================================================================== */
+#define MUTU_SKILL_VFT          0x00683B14u
+#define MUTU_SKILL_SLOT_UPDATE  6
+#define MUTU_SKILL_UPDATE_VA    0x004F8243u
+#define MUTU_ANIM_FRAME_VA      0x004F9940u
+/* 0x4f8243  mov eax,0x632a49 / call 0x5f8b78（_EH_prolog） */
+static const unsigned char MUTU_UPDATE_SIG[] = { 0xB8, 0x49, 0x2A, 0x63, 0x00, 0xE8 };
+/* 0x4f9940  push [ecx+0x3c] / fld [ecx+0x28]（引擎帧，thiscall、无栈参） */
+static const unsigned char MUTU_ANIM_FRAME_SIG[] = { 0xFF, 0x71, 0x3C, 0xD9, 0x41, 0x28 };
+
+typedef void (__fastcall *mutu_thiscall0_fn)(void *self, void *edx_unused);
+typedef void *(__fastcall *mutu_get_anim_fn)(void *chr, void *edx_unused);
+typedef int (__fastcall *mutu_anim_frame_fn)(void *anim, void *edx_unused);
+
+static mutu_thiscall0_fn g_mutu_update_orig = NULL;
+static volatile LONG g_mutu_diag_patched = 0;
+
+#define MUTU_DIAG_RECS 96
+static UINT_PTR g_mutu_diag_recs[MUTU_DIAG_RECS];
+static int g_mutu_diag_rec_n = 0;
+#define MUTU_DIAG_LAST 8
+static UINT_PTR g_mutu_diag_last_obj[MUTU_DIAG_LAST];
+static int g_mutu_diag_last_f[MUTU_DIAG_LAST];
+static int g_mutu_diag_last_i = 0;
+
+static int mutu_diag_enabled(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_MUTU_DIAG", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return 0;            /* 没设 = 不装 */
+    return buf[0] != '0';
+}
+
+/* 这一招这个引擎帧打过没有：同一个招式对象帧号没变就是打过了。 */
+static int mutu_diag_seen(UINT_PTR obj, int f)
+{
+    int i;
+    for (i = 0; i < MUTU_DIAG_LAST; i++) {
+        if (g_mutu_diag_last_obj[i] == obj) {
+            if (g_mutu_diag_last_f[i] == f) return 1;
+            g_mutu_diag_last_f[i] = f;
+            return 0;
+        }
+    }
+    g_mutu_diag_last_obj[g_mutu_diag_last_i] = obj;
+    g_mutu_diag_last_f[g_mutu_diag_last_i] = f;
+    g_mutu_diag_last_i = (g_mutu_diag_last_i + 1) % MUTU_DIAG_LAST;
+    return 0;
+}
+
+static int mutu_diag_count(unsigned char *rec, int vec_off)
+{
+    UINT_PTR first = *(UINT_PTR *)(rec + vec_off);
+    UINT_PTR last = *(UINT_PTR *)(rec + vec_off + 4);
+    if (last < first || last - first > 0x28 * 32) return 0;
+    return (int)((last - first) / 0x28);
+}
+
+/* 每张招式表记录第一次出现时打一行：`--check` 拿这几格对回招式号。 */
+static void mutu_diag_note_record(unsigned char *rec, int seat)
+{
+    int i;
+    for (i = 0; i < g_mutu_diag_rec_n; i++)
+        if (g_mutu_diag_recs[i] == (UINT_PTR)rec) return;
+    if (g_mutu_diag_rec_n < MUTU_DIAG_RECS)
+        g_mutu_diag_recs[g_mutu_diag_rec_n++] = (UINT_PTR)rec;
+    bslog("MUTU=   招式表 %08X 座位 %d MoveDist %.3f γ %.3f 起 %d 止 %d 判定体 %d 受击体 %d",
+          (unsigned)(UINT_PTR)rec, seat, *(float *)(rec + 0x24), *(float *)(rec + 0x28),
+          *(int *)(rec + 0x2C), *(int *)(rec + 0x30),
+          mutu_diag_count(rec, 0x38), mutu_diag_count(rec, 0x44));
+}
+
+/* 往 line 后面接一段；截断就停（_snprintf 截断时返回 -1）。 */
+static int mutu_diag_append(char *line, int n, int cap, const char *fmt, ...)
+{
+    va_list ap;
+    int m;
+    if (n < 0 || n >= cap - 1) return n;
+    va_start(ap, fmt);
+    m = _vsnprintf(line + n, cap - 1 - n, fmt, ap);
+    va_end(ap);
+    return m < 0 ? cap - 1 : n + m;
+}
+
+static int mutu_diag_objects(char *line, int n, int cap, unsigned char *arr, int count,
+                             float cx, float cy)
+{
+    int i;
+    unsigned char **objs = (unsigned char **)arr;
+    if (!objs || count <= 0 || IsBadReadPtr(objs, count * 4)) return n;
+    for (i = 0; i < count; i++) {
+        unsigned char *o = objs[i];
+        if (!o || IsBadReadPtr(o, 0x3C)) continue;
+        n = mutu_diag_append(line, n, cap, " %d:(%.2f,%.2f)", i,
+                             *(float *)(o + 0x34) - cx, *(float *)(o + 0x38) - cy);
+    }
+    return n;
+}
+
+static void mutu_diag_log(unsigned char *s, unsigned char *chr)
+{
+    unsigned char *rec;
+    void **vft;
+    void *anim;
+    int f, seat, n;
+    float cx, cy;
+    char line[1024];
+
+    if (IsBadReadPtr(chr, 0x5E0)) return;
+    if (*(unsigned char **)(chr + 0x5DC) != s) return;   /* Update 里被删 / 换招了 */
+    if (IsBadReadPtr(s, 0x5C)) return;
+    rec = *(unsigned char **)(s + 0x20);
+    if (!rec || IsBadReadPtr(rec, 0x50)) return;
+    vft = *(void ***)chr;
+    if (!vft || IsBadReadPtr(vft, 0x3C + 4)) return;
+    anim = ((mutu_get_anim_fn)vft[0x38 / 4])(chr, NULL);
+    if (!anim || IsBadReadPtr(anim, 0x40)) return;
+    f = ((mutu_anim_frame_fn)MUTU_ANIM_FRAME_VA)(anim, NULL);
+    if (mutu_diag_seen((UINT_PTR)s, f)) return;
+    seat = *(int *)(chr + 0x2AC);
+    cx = *(float *)(chr + 0x34);
+    cy = *(float *)(chr + 0x38);
+    mutu_diag_note_record(rec, seat);
+    n = mutu_diag_append(line, 0, (int)sizeof(line),
+                         "MUTU.   座位 %d 招式 %08X 表 %08X 帧 %d 朝 %+d 脚 (%.2f, %.2f) 判定",
+                         seat, (unsigned)(UINT_PTR)s, (unsigned)(UINT_PTR)rec, f,
+                         *(int *)(chr + 0x2D0), cx, cy);
+    n = mutu_diag_objects(line, n, (int)sizeof(line), *(unsigned char **)(s + 0x2C),
+                          mutu_diag_count(rec, 0x38), cx, cy);
+    n = mutu_diag_append(line, n, (int)sizeof(line), " 受击");
+    n = mutu_diag_objects(line, n, (int)sizeof(line), *(unsigned char **)(s + 0x38),
+                          mutu_diag_count(rec, 0x44), cx, cy);
+    line[n < (int)sizeof(line) ? n : (int)sizeof(line) - 1] = '\0';
+    bslog("%s", line);
+}
+
+static void __fastcall mutu_update_hook(void *self, void *edx_unused)
+{
+    unsigned char *s = (unsigned char *)self;
+    unsigned char *chr = NULL;
+    if (s && !IsBadReadPtr(s, 8))
+        chr = *(unsigned char **)(s + 4);
+    g_mutu_update_orig(self, edx_unused);
+    if (chr)
+        mutu_diag_log(s, chr);
+}
+
+static int try_patch_mutu_diag(void)
+{
+    UINT_PTR *slot = (UINT_PTR *)(MUTU_SKILL_VFT + MUTU_SKILL_SLOT_UPDATE * 4);
+    DWORD oldp;
+
+    if (g_mutu_diag_patched) return 1;
+    if (IsBadReadPtr(slot, 4)) return 0;
+    if (*slot == (UINT_PTR)&mutu_update_hook) {
+        InterlockedExchange(&g_mutu_diag_patched, 1);
+        return 1;
+    }
+    if (*slot != MUTU_SKILL_UPDATE_VA) return 0;          /* 还没解壳到这一页 */
+    if (IsBadReadPtr((void *)MUTU_SKILL_UPDATE_VA, sizeof(MUTU_UPDATE_SIG))
+        || memcmp((void *)MUTU_SKILL_UPDATE_VA, MUTU_UPDATE_SIG,
+                  sizeof(MUTU_UPDATE_SIG)) != 0
+        || IsBadReadPtr((void *)MUTU_ANIM_FRAME_VA, sizeof(MUTU_ANIM_FRAME_SIG))
+        || memcmp((void *)MUTU_ANIM_FRAME_VA, MUTU_ANIM_FRAME_SIG,
+                  sizeof(MUTU_ANIM_FRAME_SIG)) != 0)
+        return 0;
+    if (!VirtualProtect(slot, 4, PAGE_EXECUTE_READWRITE, &oldp)) {
+        bslog("PATCH   格斗招式判定体探针: VirtualProtect 失败 err=%lu",
+              (unsigned long)GetLastError());
+        return 0;
+    }
+    g_mutu_update_orig = (mutu_thiscall0_fn)MUTU_SKILL_UPDATE_VA;
+    *slot = (UINT_PTR)&mutu_update_hook;
+    VirtualProtect(slot, 4, oldp, &oldp);
+    InterlockedExchange(&g_mutu_diag_patched, 1);
+    bslog("PATCH   ★格斗招式判定体探针已装（虚表 %08X 槽 %d：%08X → 探针）：招式每走一个"
+          "引擎帧打一行 MUTU.（判定体 / 受击体相对脚底的偏移），每张招式表第一次出现打一行"
+          " MUTU=；比对用 tools\\mutudata.py --check（BSHOOK_MUTU_DIAG=1 才装，B2 临时）",
+          (unsigned)MUTU_SKILL_VFT, MUTU_SKILL_SLOT_UPDATE, (unsigned)MUTU_SKILL_UPDATE_VA);
+    return 1;
+}
+
+/* ========================================================================== */
+/* ★ 格斗招式被打断后补发收招（X_Mod §139 / D98）                             */
+/*                                                                            */
+/*   症状（用户 2026-09-28，两台电脑）：打死对面、又打了几下尸体，他复活后在  */
+/*   我屏幕上一直躺着；之后他一冲刺，我这边冲刺动作不停循环（他那台正常）。   */
+/*                                                                            */
+/*   根子是原版的竞态：挨重击时每台机器各自在 `0x50a6f8` 里删掉本地的招式对象 */
+/*   `[char+0x5dc]`，出招者本人**不发收招**。哪台机器要是「先处理打中、后收到 */
+/*   出招包」（攻击者本机最容易：判中在本机当场生效，他的出招包还在路上），   */
+/*   那台上的招式对象就永远等不到收招。它挡住走路代码 ⇒ UpdateMotion           */
+/*   `0x507c50` 一次都不跑，复活 / 冲刺结束时复位的通道把当前动作从头**循环**  */
+/*   （复位 = 时间归 0、模式清成 0 = 循环）。`Die()` / 复活都不删它。           */
+/*                                                                            */
+/*   「这一招断了」只有出招者本机知道 ⇒ 让它明说（铁律 10）：                 */
+/*   ① `0x50a6f8` 入口：被打断的是本机角色、招式对象在 ⇒ 记下「欠一发收招」；  */
+/*   ② 格斗管理器 `0x4958eb` 入口（每帧，排在它挑招 / 出招之前）：欠着、还是    */
+/*      这个角色这一局、挨打那 10 帧 `[+0x17c]` 走完 ⇒ 照原版 `0x495a73` 那样   */
+/*      发 `0x0016(座位, −1, [+0x2d0], 0)`（坐标取虚表 +8）、置 `[+0x5e0]` 等回环。*/
+/*      收方一行不改：照原版收招处理，有僵尸就删掉、复位通道，UpdateMotion 接手。*/
+/*   ★ 为什么等那 10 帧、不当场发：收方处理收招先把人硬置到包里的坐标、再把   */
+/*     两个通道倒带 —— 当场发会把正被打退的人拽回挨打那一点、把挨打动作重播。  */
+/*     等 `[+0x17c]` 走完，每台收方自己的那 10 帧也已走完（全经服务端转发），   */
+/*     硬置和倒带同一帧就被 UpdateMotion 盖掉；而这一帧正是他能出下一招的第一  */
+/*     帧（挑招 `0x495bbb` 看的就是它），收招一定排在新招前面。                */
+/*   ★ 死了也照发：尸体上的僵尸一样要清（用户那一局就是这种）。              */
+/*   ★ 只在游戏主线程读写 `g_mutu_owed_*`：打断在收包 → OnHit 里，管理器在每帧  */
+/*     更新里，都是主线程。                                                    */
+/*   设 BSHOOK_KEEP_MUTU_ZOMBIE=1 保留原版（被打断不补收招）。                 */
+/* ========================================================================== */
+#define MUTU_BREAK_VA         0x0050A6F8u   /* 打断：删 [edi+0x5dc]（edi = 角色，无栈参） */
+#define MUTU_BREAK_SIG_LEN    11
+#define MUTU_BREAK_STOLEN     7
+#define MUTU_BREAK_RESUME_TO  0x0050A6FF
+static const unsigned char MUTU_BREAK_SIG[MUTU_BREAK_SIG_LEN] = {
+    0x56,                               /* push esi                ┐ 偷 7 字节 */
+    0x8D, 0xB7, 0xDC, 0x05, 0x00, 0x00, /* lea  esi, [edi+0x5dc]   ┘           */
+    0x8B, 0x0E,                         /* mov  ecx, [esi]         ← 落点      */
+    0x85, 0xC9                          /* test ecx, ecx                       */
+};
+
+#define MUTU_TICK_VA          0x004958EBu   /* 格斗管理器每帧入口（eax = 管理器对象） */
+#define MUTU_TICK_SIG_LEN     20
+#define MUTU_TICK_STOLEN      5
+#define MUTU_TICK_RESUME_TO   0x004958F0
+static const unsigned char MUTU_TICK_SIG[MUTU_TICK_SIG_LEN] = {
+    0x55,                               /* push ebp                ┐           */
+    0x8B, 0xEC,                         /* mov  ebp, esp           │ 偷 5 字节 */
+    0x51,                               /* push ecx                │           */
+    0x56,                               /* push esi                ┘           */
+    0x57,                               /* push edi                ← 落点      */
+    0x8B, 0xF8,                         /* mov  edi, eax                       */
+    0xA1, 0xBC, 0xE2, 0x72, 0x00,       /* mov  eax, [0x72e2bc]                */
+    0x80, 0xB8, 0x77, 0x03, 0x00, 0x00, 0x00  /* cmp byte [eax+0x377], 0       */
+};
+
+#define MUTU_MY_CHAR_VA       0x00409F39u   /* 本机角色：无参，eax 返回（不在局里 = 0）  */
+#define MUTU_MY_SEAT_VA       0x00409F7Du   /* 本机座位：无参，eax 返回                  */
+#define MUTU_SEND_SKILL_VA    0x004934E7u   /* 发 0x0016：stdcall(座位, 类型, 朝向, 招式号)，esi = 坐标 */
+#define MUTU_TIMER_RUNNING_VA 0x005D5EB0u   /* 计时器在跑：thiscall，al 返回             */
+#define CHAR_OFF_HIT_TIMER    0x17C         /* 挨打后 10 帧（击退尾巴 0x50f961 起）      */
+#define CHAR_OFF_FACING       0x2D0         /* 朝向 ±1                                  */
+#define CHAR_OFF_SKILL        0x5DC         /* 格斗招式对象                             */
+#define CHAR_OFF_WAIT_ECHO    0x5E0         /* 发了 0x0016、等自己的回环                */
+
+typedef UINT_PTR (__cdecl *mutu_getter_fn)(void);
+/* __thiscall 借 __fastcall 调：ecx = this，edx 占位不用，栈参由被调方弹。 */
+typedef char (__fastcall *mutu_timer_running_fn)(void *timer, void *edx_unused);
+typedef float *(__fastcall *mutu_getpos_fn)(void *self, void *edx_unused, float *out);
+
+static volatile LONG g_mutu_zombie_patched = 0;
+/* 欠一发收招的本机角色（0 = 不欠）和欠下时的 GameContext —— 换了局 / 换了人就不欠了。 */
+static UINT_PTR g_mutu_owed_char = 0;
+static UINT_PTR g_mutu_owed_ctx = 0;
+
+static int mutu_zombie_keep_original(void)
+{
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_MUTU_ZOMBIE", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && buf[0] != '0';
+}
+
+/* `0x50a6f8` 入口（原版删招式对象之前）：断的是不是本机角色手上的招。 */
+static void __stdcall mutu_break_note(UINT_PTR ch)
+{
+    UINT_PTR skill;
+
+    if (ch == 0)
+        return;
+    skill = *(UINT_PTR *)(ch + CHAR_OFF_SKILL);
+    if (skill == 0)
+        return;                              /* 手上没有招，没什么可断 */
+    if (ch != ((mutu_getter_fn)MUTU_MY_CHAR_VA)())
+        return;                              /* 别人的招：由他那台去补 */
+    g_mutu_owed_char = ch;
+    g_mutu_owed_ctx = *(UINT_PTR *)GAME_CONTEXT_GLOBAL;
+    bslog("MUTU    本机格斗招式被打断（招式对象 %08X）—— 挨打那 10 帧走完补发收招，"
+          "免得先收到打中、后收到出招包的那台留着它（X_Mod §139）", (unsigned)skill);
+}
+
+/* 照原版管理器 `0x495a73` 发收招的样子发一发，只是时机换成「挨打那 10 帧走完」。 */
+static void mutu_send_owed_retract(UINT_PTR ch)
+{
+    float out[2];
+    float *pos;
+    int facing = *(int *)(ch + CHAR_OFF_FACING);
+    int seat = (int)((mutu_getter_fn)MUTU_MY_SEAT_VA)();
+    UINT_PTR send = MUTU_SEND_SKILL_VA;
+    mutu_getpos_fn getpos = (mutu_getpos_fn)(*(UINT_PTR **)ch)[2];   /* 虚表 +8 */
+
+    pos = getpos((void *)ch, NULL, out);     /* 挂平台时会换算，原版就这么取 */
+    __asm {
+        push esi
+        mov  esi, pos                        /* 0x4934e7 从 esi 读 (x, y) */
+        push 0                               /* 招式号：收招恒 0（同 0x495a87） */
+        push facing
+        push -1                              /* 类型 −1 = 收招 */
+        push seat
+        call send                            /* stdcall，ret 0x10 */
+        pop  esi
+    }
+    *(unsigned char *)(ch + CHAR_OFF_WAIT_ECHO) = 1;   /* 同 0x495a9b：等回环 */
+    bslog("MUTU    补发收招：座位 %d 朝 %+d (%.1f, %.1f) —— 别的机器上留着的这一招就此删掉",
+          seat, facing, pos[0], pos[1]);
+}
+
+/* 格斗管理器每帧入口：欠着的那发收招，能发了就发。 */
+static void __cdecl mutu_owed_retract_tick(void)
+{
+    UINT_PTR ch = g_mutu_owed_char;
+
+    if (ch == 0)
+        return;
+    if (ch != ((mutu_getter_fn)MUTU_MY_CHAR_VA)()
+        || *(UINT_PTR *)GAME_CONTEXT_GLOBAL != g_mutu_owed_ctx) {
+        g_mutu_owed_char = 0;                /* 换了局 / 换了人：这一发不欠了 */
+        bslog("MUTU    欠的那发收招作废：已经不是那一局 / 那个角色了");
+        return;
+    }
+    if (*(UINT_PTR *)(ch + CHAR_OFF_SKILL) != 0) {
+        /* 挑招要等 [+0x17c] 走完，走完的第一帧这里就发掉了，按说到不了。
+           真到了（新招已经出了）就不能再发 —— 收方会把新招当成它删掉。 */
+        g_mutu_owed_char = 0;
+        bslog("MUTU    !! 欠收招期间本机已经出了新招，这一发不补了");
+        return;
+    }
+    if (((mutu_timer_running_fn)MUTU_TIMER_RUNNING_VA)((void *)(ch + CHAR_OFF_HIT_TIMER), NULL))
+        return;                              /* 挨打那 10 帧还没走完 */
+    g_mutu_owed_char = 0;
+    mutu_send_owed_retract(ch);
+}
+
+static __declspec(naked) void mutu_break_detour(void)
+{
+    __asm {
+        pushad
+        push edi                            /* 被打断的角色 */
+        call mutu_break_note                /* __stdcall，自己弹参数 */
+        popad
+        push esi                            /* 被偷走的两条，原样跑 */
+        lea  esi, [edi + 0x5DC]
+        push MUTU_BREAK_RESUME_TO
+        ret
+    }
+}
+
+static __declspec(naked) void mutu_tick_detour(void)
+{
+    __asm {
+        pushad
+        call mutu_owed_retract_tick         /* 排在管理器挑招 / 出招之前 */
+        popad
+        push ebp                            /* 被偷走的四条，原样跑 */
+        mov  ebp, esp
+        push ecx
+        push esi
+        push MUTU_TICK_RESUME_TO
+        ret
+    }
+}
+
+/* 两处都得在：只装上打断那一处 = 光记账不发；只装上管理器那一处 = 什么都不欠。 */
+static int try_patch_mutu_zombie(void)
+{
+    int a, b;
+
+    if (g_mutu_zombie_patched) return 1;
+    a = install_jmp_guard(MUTU_BREAK_VA, MUTU_BREAK_SIG, MUTU_BREAK_SIG_LEN,
+                          MUTU_BREAK_STOLEN, mutu_break_detour, "格斗招式打断记账");
+    b = install_jmp_guard(MUTU_TICK_VA, MUTU_TICK_SIG, MUTU_TICK_SIG_LEN,
+                          MUTU_TICK_STOLEN, mutu_tick_detour, "格斗管理器补收招");
+    if (!a || !b) return 0;
+    InterlockedExchange(&g_mutu_zombie_patched, 1);
+    bslog("PATCH   ★格斗招式被打断后补发收招 @ %08X / %08X：本机的招被打断，挨打那 10 帧"
+          "走完补一发原版收招（0x0016 类型 -1），别的机器上先收到打中、后收到出招包"
+          "留下的那一招跟着删掉 —— 不再「复活后一直躺着 / 冲刺动作循环」（X_Mod §139 / D98）",
+          (unsigned)MUTU_BREAK_VA, (unsigned)MUTU_TICK_VA);
+    return 1;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -10452,6 +11330,55 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x44c954 / 0x44cc07 / 0x467eb1 的特征串一直对不上）");
     }
 
+    /* 格斗模式（무투전）解锁（X16 / D82）—— 和爱琳一样时机不急：五处都在
+       建房 / 房间设定 / 选图代码里，最早也要进大厅才第一次执行。轮询的理由
+       同上面几组（等 ASProtect 把那一页解开，没有事件可等）。
+       ★ 依赖地区解锁：地区锁保留时格斗图一张都进不了目录，这组跟着不打。 */
+    if (!region_lock_disabled()) {
+        bslog("PATCH   BSHOOK_KEEP_REGION_LOCK 已设 ⇒ 格斗图进不了地图目录，"
+              "格斗模式解锁跟着不打");
+    } else if (mutu_lock_kept()) {
+        bslog("PATCH   BSHOOK_KEEP_MUTU_LOCK 已设，保留原版：格斗模式不在建房下拉框里、"
+              "房间 ◀▶ 不含格斗、Boss 格斗场要先通关任务");
+    } else {
+        for (ticks = 0; !g_stop && !g_mutu_patched && ticks < 2000; ticks++) {
+            if (try_patch_mutu_unlock()) break;
+            Sleep(2);
+        }
+        if (!g_mutu_patched)
+            bslog("PATCH   !! 超时未能 patch 格斗模式解锁"
+                  "（0x43755e / 0x4659cc / 0x4659e3 / 0x465a0a / 0x40b273 "
+                  "的特征串一直对不上）");
+    }
+
+    /* 格斗招式被打断后补发收招（X_Mod §139 / D98）：两处都在格斗对局代码里，
+       最早也要进格斗局才第一次执行 —— 时机不急，只等特征串（等解壳）。 */
+    if (mutu_zombie_keep_original()) {
+        bslog("PATCH   BSHOOK_KEEP_MUTU_ZOMBIE 已设，保留原版：格斗招式被打断不补收招"
+              "（别的机器上可能留着这一招 —— 复活后一直躺着 / 冲刺动作循环，X_Mod §139）");
+    } else {
+        for (ticks = 0; !g_stop && !g_mutu_zombie_patched && ticks < 2000; ticks++) {
+            if (try_patch_mutu_zombie()) break;
+            Sleep(2);
+        }
+        if (!g_mutu_zombie_patched)
+            bslog("PATCH   !! 超时未能 patch 格斗招式补收招"
+                  "（0x50A6F8 / 0x4958EB 的特征串一直对不上）");
+    }
+
+    /* ★ B2 格斗招式判定体探针（X16，临时）：BSHOOK_MUTU_DIAG=1 才装；轮询理由同上（等解壳）。 */
+    if (mutu_diag_enabled()) {
+        for (ticks = 0; !g_stop && !g_mutu_diag_patched && ticks < 2000; ticks++) {
+            if (try_patch_mutu_diag()) break;
+            Sleep(2);
+        }
+        if (!g_mutu_diag_patched)
+            bslog("PATCH   !! 超时未能装格斗招式判定体探针（虚表 %08X 槽 %d 一直不是 %08X，"
+                  "或 %08X / %08X 的特征串对不上）", (unsigned)MUTU_SKILL_VFT,
+                  MUTU_SKILL_SLOT_UPDATE, (unsigned)MUTU_SKILL_UPDATE_VA,
+                  (unsigned)MUTU_SKILL_UPDATE_VA, (unsigned)MUTU_ANIM_FRAME_VA);
+    }
+
     /* 登录公告：**这一轮是次要的**，打不上也没关系 —— 真正的保证在
        `det_CreateWindowExW`（公告框控件被创建的那一刻，必然早于导航）。
        在这里顺手打一发，只是为了让 detour 那条路上少做一次事，
@@ -10547,6 +11474,15 @@ static DWORD WINAPI patch_thread(LPVOID param)
             bslog("PATCH   !! 超时未能 patch IME 闪退修复"
                   "（0x4269AB / 0x42515E / 0x4301B4 特征串一直对不上）");
     }
+
+    /* 输入法用它自己的候选界面（X14 / §106 / D70）：和 IME 那组一样不赶时机，只等特征串。 */
+    for (ticks = 0; !g_stop && !g_ime_native_patched && ticks < 2000; ticks++) {
+        if (try_patch_ime_native_ui()) break;
+        Sleep(2);
+    }
+    if (!g_ime_native_patched)
+        bslog("PATCH   !! 超时未能 patch 输入法原生候选"
+              "（0x40EDCB 特征串一直对不上）—— 游戏自带的选字框照旧");
 
     /* 溅射加成提示判空（V0.3 合成与商店 §47 / D55）：穿着 IncSplashRange 装备
        （火焰蝙蝠 220003）用溅射武器打空，15% 概率整个客户端闪退。

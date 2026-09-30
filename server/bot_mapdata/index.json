@@ -1,5 +1,5 @@
 {
- "format": 9,
+ "format": 10,
  "count": 174,
  "maps": {
   "01test": {
@@ -1320,5 +1320,12 @@
   "Quest06_stage": {
    "fall_down": true
   }
+ },
+ "redirects": {
+  "Megatron00m": "Megatron00m_ch",
+  "Megatron00": "Megatron00_ch",
+  "Megatron01": "Megatron01_ch",
+  "Megatron_b": "Megatron_b_ch",
+  "Megatron_M00": "Megatron_M00_ch"
  }
 }

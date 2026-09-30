@@ -47,6 +47,11 @@
     GET  /admin/api/logs/download?kind=server&scope=all|recent   服务端日志打成 zip   ★系统
     GET  /admin/api/logs/download?kind=client_crash[&sub=目录名]  崩溃包打成 zip      ★系统
          （两条 download 都是 chunked 流式响应，边打包边发，见 `_admin_logs_download`）
+    GET  /admin/api/logs/archives[?since=版本]  「待下载 7z 包」快照；带 since = 长轮询（X17）★系统
+    POST /admin/api/logs/archives/create  {kind, scope, sub, level}  排一个后台 7z 压缩任务
+         （level = low | high，弹窗「压缩等级」那一格，必填，D102）                       ★系统
+    POST /admin/api/logs/archives/remove  {name} | {job}      删压好的包 / 清掉失败记录  ★系统
+    GET  /admin/api/logs/archives/download?name=包名  下载压好的 7z（带 Content-Length） ★系统
 
 ## 权限分三档（`system` / `operator` 两档见 D34；`player` 见 D74）
 
@@ -171,6 +176,7 @@ import eventlog
 import gifthistory
 import logpack
 import sellprice
+import sevenzip
 import shop
 import shopcfg
 import shopdata
@@ -437,6 +443,12 @@ def render_admin():
             .replace("__USERNAME_RULE__", _escape(account_store.USERNAME_RULE_TEXT))
             .replace("__PASSWORD_RULE__", _escape(account_store.PASSWORD_RULE_TEXT))
             .replace("__CONFIG_TITLES__", _escape(config_titles_text())))
+
+
+def _ascii_filename(name):
+    """下载文件名进 HTTP 头：只留 `[A-Za-z0-9_.-]`，别的换成 `_`（头是 latin-1，引号还会把头截断）。"""
+    return "".join(ch if (ch.isascii() and (ch.isalnum() or ch in "_.-")) else "_"
+                   for ch in name) or "logs.7z"
 
 
 def _escape(text):
@@ -1338,6 +1350,12 @@ class AdminRoutes:
         if path == "/admin/api/logs/download":
             self._admin_logs_download(query)
             return True
+        if path == "/admin/api/logs/archives":
+            self._admin_archives_get(query)
+            return True
+        if path == "/admin/api/logs/archives/download":
+            self._admin_archive_download(query)
+            return True
         if path.startswith("/admin"):
             self._reply(False, "没有这个接口", status=404)
             return True
@@ -1377,6 +1395,9 @@ class AdminRoutes:
             return True
         if path.startswith("/admin/api/backups/"):
             self._admin_backup(path.rsplit("/", 1)[-1], data)
+            return True
+        if path.startswith("/admin/api/logs/archives/"):
+            self._admin_archives_post(path.rsplit("/", 1)[-1], data)
             return True
         if path.startswith("/admin"):
             self._reply(False, "没有这个接口", status=404)
@@ -1984,15 +2005,152 @@ class AdminRoutes:
         return self.log_packer
 
     def _admin_logs_get(self):
-        """`GET /admin/api/logs` —— 两个目录的大小 + 崩溃包清单。★ 系统管理员专用。"""
+        """`GET /admin/api/logs` —— 两个目录的大小 + 崩溃包清单，外加右栏「待下载 7z 包」的快照
+        （`archives`，没接 `LogShelf` 时是 null）、「这台能不能压 7z」（`sevenzip`）和
+        「压缩等级」那一行要的默认档 / 内存估算（`sevenzip_level`，D102）。★ 系统管理员专用。"""
         if self._require_system_admin() is None:
             return
         packer = self._log_packer()
         if packer is None:
             return
         payload = packer.overview()
+        shelf = self.log_shelf
+        payload["archives"] = shelf.snapshot() if shelf is not None else None
+        payload["sevenzip"] = shelf is not None and sevenzip.AVAILABLE
+        payload["sevenzip_level"] = shelf.level_info() if shelf is not None else None
         payload["ok"] = True
         self._send_json(payload)
+
+    # -------------------------------------------------- 待下载 7z 包（X17，D101）
+    def _log_shelf(self):
+        """`app.py` 注进来的 `logshelf.LogShelf`；没注入就回一句话。"""
+        if self.log_shelf is None:
+            self._reply(False, "7z 压缩没有启动（这个进程不是 app.py 起的）")
+            return None
+        return self.log_shelf
+
+    def _admin_archives_get(self, query):
+        """`GET /admin/api/logs/archives[?since=版本]` —— 右栏的快照；带 `since` 就是长轮询。★ 系统。
+
+        ★ 长轮询（铁律 10）：`since` 等于现在的版本、而且还有活 ⇒ 挂在 `LogShelf.wait()` 的
+          条件变量上，版本一变（进度走了一格 / 压完 / 失败）就回；没活立刻回。没有超时、没有
+          间隔常数 —— 请求频率由往返时延自己限住。
+        ★★ 回包那一刻对面可能已经走了（弹窗关了、页面刷新了）：写 socket 的 `OSError` 在这里
+          接住、收掉连接。漏到 `do_GET` 的兜底里的话，它会往死连接上再写一份 500，
+          traceback 进 `server.err`（V0.3商店 §128 ②）。
+        """
+        if self._require_system_admin() is None:
+            return
+        shelf = self._log_shelf()
+        if shelf is None:
+            return
+        raw = (urllib.parse.parse_qs(query or "").get("since") or [""])[0]
+        try:
+            since = int(raw)
+        except ValueError:
+            since = None
+        snapshot = shelf.snapshot() if since is None else shelf.wait(since)
+        try:
+            self._send_json({"ok": True, "archives": snapshot})
+        except OSError:
+            self.close_connection = True
+
+    def _admin_archives_post(self, action, data):
+        """`POST /admin/api/logs/archives/create|remove` —— 排压缩任务 / 删包。回新的快照。★ 系统。"""
+        name = self._require_system_admin()
+        if name is None:
+            return
+        shelf = self._log_shelf()
+        if shelf is None:
+            return
+        who = self._who(name)
+        try:
+            if action == "create":
+                job, new = shelf.submit(
+                    str(data.get("kind") or ""), str(data.get("scope") or ""),
+                    str(data.get("sub") or ""), level=str(data.get("level") or ""),
+                    meta={"version": versioning.own_version_text(), "by": name}, who=who)
+                grade = sevenzip.LEVELS[job.level].label
+                if new:
+                    eventlog.online(f"[admin] {who} 排了 7z 压缩（压缩等级 {grade}）："
+                                    f"{job.plan.label}（{job.name}）")
+                    message = f"已加入压缩队列：{job.plan.label}（压缩等级 {grade}）"
+                else:
+                    # 同一份不管档（`LogShelf.submit`）：说清楚正在压的是哪一档。
+                    message = f"这一份已经在压了：{job.plan.label}（压缩等级 {grade}）"
+            elif action == "remove":
+                target = str(data.get("name") or "")
+                job_id = str(data.get("job") or "")
+                label = shelf.remove(name=target, job=job_id)
+                if job_id:
+                    eventlog.online(f"[admin] {who} 清掉了一条压缩失败的记录（{label}）")
+                    message = f"已清掉：{label}"
+                else:
+                    eventlog.online(f"[admin] {who} 删掉了 7z 包 {target}（{label}）")
+                    message = f"已删除：{label}"
+            else:
+                self._reply(False, "没有这个接口", status=404)
+                return
+        except logpack.LogPackError as error:
+            self._reply(False, str(error), status=error.status)
+            return
+        self._send_json({"ok": True, "message": message, "archives": shelf.snapshot()})
+
+    def _admin_archive_download(self, query):
+        """`GET /admin/api/logs/archives/download?name=包名` —— 下载一个压好的 7z。★ 系统。
+
+        文件已经压好、大小已知 ⇒ 带 `Content-Length`，浏览器下载栏看得到总大小和剩余时间。
+        ★ `Accept-Ranges: none`：没做断点续传（Chrome 的并行下载也就不会拆成几段来要）。
+        ★ `end_headers()` 起的一切 `OSError` 都在这里兜住（同 `_admin_logs_download`）：
+          浏览器取消 = 对面关 socket，审计一行「中断」、收掉连接，不进 `server.err`。
+        """
+        name = self._require_system_admin()
+        if name is None:
+            return
+        shelf = self._log_shelf()
+        if shelf is None:
+            return
+        wanted = (urllib.parse.parse_qs(query or "").get("name") or [""])[0]
+        try:
+            fp, size, label = shelf.open_file(wanted)
+        except logpack.LogPackError as error:
+            self._reply(False, str(error), status=error.status)
+            return
+        who = self._who(name)
+        started = time.monotonic()
+        sent = 0
+        try:
+            with fp:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-7z-compressed")
+                self.send_header("Content-Length", str(size))
+                # 头是 latin-1：名字由 logpack 造、本来就是 ASCII；手放进去的怪名字也洗成 ASCII。
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="%s"' % _ascii_filename(wanted))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Accept-Ranges", "none")
+                self.end_headers()
+                while sent < size:
+                    chunk = fp.read(min(logpack.READ_CHUNK, size - sent))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+        except OSError as error:
+            self.close_connection = True
+            eventlog.online(f"[admin] {who} 下载 7z 包 {wanted} 中断"
+                            f"（{type(error).__name__}），已发 {databackup.format_size(sent)}"
+                            f" / 共 {databackup.format_size(size)}")
+            return
+        if sent < size:
+            # 说好了 Content-Length 却给不够（文件被截短了）：只能断开，让浏览器判失败。
+            self.close_connection = True
+            eventlog.online(f"[admin] {who} 下载 7z 包 {wanted} 没发完（文件变短了），"
+                            f"已发 {databackup.format_size(sent)} / 共 {databackup.format_size(size)}")
+            return
+        eventlog.online(f"[admin] {who} 下载了 7z 包 {wanted}（{label}，"
+                        f"{databackup.format_size(size)}），用时 {time.monotonic() - started:.1f} 秒")
 
     def _admin_logs_download(self, query):
         """`GET /admin/api/logs/download?kind=…` —— 打成 zip **边打包边发**。★ 系统管理员专用。

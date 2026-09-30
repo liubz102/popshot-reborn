@@ -107,6 +107,55 @@ OP_JUMP = 0x0006
 #: 消耗体力（`ChrProps.ini` 的 `DashNN-SpCost`），伤害由射手那台机器自己判。
 OP_DASH = 0x0007
 
+#: `0x0017` —— **近身招式推挤段贴住了人**（body 8 字节，X_Mod §111 / §115）：受约束对象句柄 + 出招者句柄。
+#: 原版只有出招者本机发（`0x481d60 → 0x4935b7`）；bot 没有本机，服务端替它发（D80）。收方每帧把受约束的
+#: 人推到出招者朝向那一侧（`0x50e654`），出招者那一招收了 / 他挨打就解。
+OP_CONSTRAIN = 0x0017
+
+_CONSTRAIN = struct.Struct("<ii")
+
+
+def constrain_body(victim_handle, owner_handle):
+    """`0x0017` 的 8 字节：`+0` 受约束对象句柄（真人 / 怪），`+4` 出招者句柄（`0x491cc6` 两发读整型）。"""
+    return _CONSTRAIN.pack(int(victim_handle), int(owner_handle))
+
+
+#: `0x0016` —— **出 / 收一招格斗招式**（body 13 字节，只有格斗模式发，X_Mod §121）：
+#: `{u8 座位, i8 类型, i8 朝向, i16 招式号, f32 x, f32 y}`。类型 2 = 出招（收方先把角色硬置到 (x, y)），
+#: −1 = 收招，其它只删旧招。招式号 = `mutudata.skills()` 的下标 —— 客户端 ini 哈希表的遍历顺序，**不是**
+#: `NewMutu.ini` 的文件顺序（X_Mod §127 实机核过）。
+#: ★ 每发一次类型 2 吃 D+E+1 个弹体句柄（和 `rpFire` / `rpDash` 同一个座位计数器）。
+OP_MUTU_SKILL = 0x0016
+MUTU_SKILL_START = 2
+MUTU_SKILL_END = -1
+
+#: `0x0018 rpGuard` —— 格挡开 / 关（body 2 字节 `{u8 座位, u8 开关}`，X_Mod §95 / §122）。
+OP_GUARD = 0x0018
+
+_MUTU_SKILL = struct.Struct("<Bbbhff")
+
+
+def mutu_skill_body(seat, kind, facing, index, x, y):
+    """`0x0016` 的 13 字节（组包 `0x4934e7`）。"""
+    return _MUTU_SKILL.pack(int(seat), int(kind), 1 if facing >= 0 else -1, int(index),
+                            float(x), float(y))
+
+
+def parse_mutu_skill(body):
+    """`0x0016` → `(座位, 类型, 朝向, 招式号, x, y)`；长度不对返回 `None`。"""
+    if len(body) < _MUTU_SKILL.size:
+        return None
+    return _MUTU_SKILL.unpack_from(body, 0)
+
+
+_GUARD = struct.Struct("<BB")
+
+
+def guard_body(seat, on):
+    """`0x0018 rpGuard` 的 2 字节 `{u8 座位, u8 开关}`（组包 `0x4936c6`，X_Mod §122）。"""
+    return _GUARD.pack(int(seat) & 0xFF, 1 if on else 0)
+
+
 #: `0x000b rpCrouch` —— **蹲下 / 起立**（body 2 字节，§41）。
 #:
 #: ★ 蹲这件事**心跳里一个位都没有**：只有按下和松开那两下各发一发这个
@@ -588,15 +637,14 @@ def character_state(x, y, vx=0, vy=0, facing=FACING_RIGHT, on_ground=True,
 
     ## ★★★ `on_ground` 和速度两格：调用方**必须一起给对**（§35）
 
-    `on_ground=True`（踩在地上）时速度**就该是 0**，哪怕角色正在走 ——
-    真人的包就是这样（20341 发「位置在变、bit2=1、速度 0」）。
-    地上走却填非 0 速度，收方会拿那个速度自己往前推算，和下一发心跳里的
-    坐标一打架就是「走一步、停一下」的抽搐，而且**不播走路动画**
-    （用户 2026-08-26 第二轮实机报的症状）。
-
-    所以这里不再替调用方猜：**踩地时速度被强制归零**，并在两者明显矛盾时
-    以 `on_ground` 为准 —— 谁在地上谁腾空，是回放真人轨迹时抄来的事实
-    （`bot.trail_point`），不该由这一层反推。
+    `on_ground=True`（踩在地上）时速度**一般是 0**，哪怕角色正在走 —— 客户端
+    踩地时每帧把速度清零（`0x50d42d`），真人的包就是这样（20341 发「位置在变、
+    bit2=1、速度 0」）。地上走却填非 0 速度，收方会拿那个速度自己往前推算，
+    和下一发心跳里的坐标一打架就是「走一步、停一下」的抽搐。
+    ★ 唯一的例外是**弹跳台刚写速度、踩地位还没清**的那一帧：本人那台报的就是
+      「踩地 + vy < 0」（X_Mod §104），收方照包覆盖速度、下一帧按踩地分支挪 ——
+      所以这一层**不再强制归零**，照调用方给的原样打包（`botmove.Body` 踩地时
+      速度本来就是 0，台子那一帧由 `reported_on_ground` 报踩地）。
 
     `cursor` 传 `None` = 按 `facing` 在正前方自己摆一个（`aim_point`），
     朝向位和角度都跟着它算（`aim_state`），三个字段因此永远自洽。
@@ -605,8 +653,7 @@ def character_state(x, y, vx=0, vy=0, facing=FACING_RIGHT, on_ground=True,
         cursor = aim_point(x, y, facing)
     facing, angle_deg, cursor = aim_state(x, y, cursor, facing)
     on_ground = bool(on_ground)
-    packed_vx, packed_vy = ((0, 0) if on_ground
-                            else (clamp_i16(vx), clamp_i16(vy)))
+    packed_vx, packed_vy = clamp_i16(vx), clamp_i16(vy)
     field = int(facing) & 0x03
     if on_ground:
         field |= HEARTBEAT_BIT_ONGROUND
@@ -776,31 +823,37 @@ SPLASH_BODY_SIZE = _SPLASH.size
 
 
 def splash_body(source_handle, target_handle, damage, x, y,
-                push_x=0.0, push_y=0.0):
+                push_x=0.0, push_y=0.0, flags=0, kind=0):
     """`0x0004 rpSplashDamaged`（33 字节）：**这个爆炸溅到了那个人**（§67）。
 
     ```
     +0   i32  伤害源的句柄（弹体 / 溅射对象 / 冲刺伤害对象）
     +4   i32  ★ 受害者的**角色句柄**（`character_handle()`）
     +8   f32  ★ 伤害值
-    +12  u8   语料 13160 发**恒 0**
+    +12  u8   伤害类 `vft+0x138` 的返回值（`kind`）—— 溅射 / 冲刺 / 火墙恒 0；
+              格斗招式的判定体是 `BounceHit ? 3 : 2`（`0x4f9c82`，X_Mod §122）
     +13  f32  击退向量 X（±15 / ±4 那一类）
     +17  f32  击退向量 Y（观测多为负 = 往上顶）
     +21  f32  受击点 X
     +25  f32  受击点 Y
-    +29  i32  语料 13160 发**恒 0**
+    +29  i32  ★ flags —— 和 `rpExplode +20` 同一个字（X_Mod §92）
     ```
 
     出处：组包点 `0x492b83`（§23 已经量出长度 33 和字段宽度），字段含义是
     从 13160 发真人语料反推的 —— `+4` 全部是 `座位×100000+100001` 那一族
     角色句柄，`+8` 落在 0~23 的整数伤害上，`+21/+25` 是地图坐标。
+    `+29` 是逐指令看出来的：`0x480f0f push [ebp-8]`（`0x4806bf` 一路 `or` 出来
+    的 flags）是 `0x492b63` 的第 5 个参数，`0x492bf6` 把它写在最后。收方
+    `0x492cc6` 把它原样当 `Character::OnHit` 的 flags（`0x80` 格挡就看它），
+    `0x492c96` 还交给伤害源的 `vft+0x12c` 画「DEFENSE!」/「LUCKY!」。
+    语料里恒 0 只是那时候没人穿防御装备、没人格挡着挨近身。
 
     ⚠ 这一发**不吃弹体句柄**（它不创建对象，只是报「谁被溅到了」），
     但它是事件包，照样吃一个事件序号。
     """
     return _SPLASH.pack(int(source_handle), int(target_handle), float(damage),
-                        0, float(push_x), float(push_y),
-                        float(x), float(y), 0)
+                        int(kind), float(push_x), float(push_y),
+                        float(x), float(y), int(flags))
 
 
 _SET_ON_FIRE = struct.Struct("<BBffi")
@@ -1067,7 +1120,7 @@ class BotSyncStream:
             return packet, handle
 
     def explode(self, handle, target_handle, x, y, hit_kind, damage,
-                spawns):
+                spawns, flags=0):
         """一发 `rpExplode`，**同时把爆炸对象的句柄记账推进 `spawns` 个**。
 
         ★★★ `spawns` = `weapon.explode_step`（带溅射的 1、不带的 0，§86）。
@@ -1075,12 +1128,15 @@ class BotSyncStream:
         计数器** —— 少记一个，之后每一发 `rpExplode` 都对不上号、被静默
         丢弃（§42），一局之内不自愈。
 
+        `flags` 是 `+20`（`bot._direct_hit_damage()` 一路 `or` 出来的，
+        收方拿它画「DEFENSE!」/「LUCKY!」，X_Mod §91）。
+
         和 `fire()` 同一个理由：组包和记账**必须在一次加锁里做完**。
         """
         with self._lock:
             packet = self.event(OP_EXPLODE, explode_body(
                 handle, target_handle, x, y,
-                hit_kind=hit_kind, damage=damage))
+                hit_kind=hit_kind, flags=flags, damage=damage))
             self.projectiles += int(spawns)
             return packet
 
@@ -1100,6 +1156,25 @@ class BotSyncStream:
                 self.conn.my_seat, x, y, slice_id))
             self.projectiles += step
             return packet, step
+
+    def mutu_skill(self, kind, facing, index, x, y, handles=0):
+        """一发 `0x0016`（格斗招式，X_Mod §121），**出招那一发同时把句柄记账推进 `handles`**。
+
+        返回 `(包, 这一招头一个句柄)`：判定体 i = 头一个 + i、受击体 j = 头一个 + D + j、推挤体 = 头一个 + D + E。
+        ★★ 和 `dash()` 同一个道理：收方建 `NewMutuSkill` 时给 D 个判定体 + E 个受击体 + 1 个推挤体各分一个句柄
+          （`0x4f844c` / `0x4f88a1`），和弹体**共用同一个座位计数器** —— 出招 `handles` = D + E + 1，收招（−1）是 0。
+          少记一个，之后每一发 `rpExplode` / `rpSplashDamaged` 都对不上号、被静默丢弃（§42），一局之内不自愈。
+        """
+        with self._lock:
+            handle = projectile_handle(self.conn.my_seat, self.projectiles)
+            packet = self.event(OP_MUTU_SKILL, mutu_skill_body(
+                self.conn.my_seat, kind, facing, index, x, y))
+            self.projectiles += int(handles)
+            return packet, handle
+
+    def guard(self, on):
+        """一发 `0x0018 rpGuard`（格挡开 / 关）。不吃句柄。"""
+        return self.event(OP_GUARD, guard_body(self.conn.my_seat, on))
 
     def dash(self, direction, index, x, y):
         """一发 `rpDash`（近身冲刺攻击），**同时把句柄记账推进 1**。

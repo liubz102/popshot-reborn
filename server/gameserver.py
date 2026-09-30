@@ -381,7 +381,7 @@ OP_USE_ITEM = 0x040c          # 两个方向同号：客户端「我要用第 N 
 # 为什么用户只在「三重射击 / 毒药 / 致命射击」上看得见这个 bug：
 # 这三件的 `Status.ini` 记录**没有 `Time`、只有 `Magazine=3`**（§201），
 # 于是 `UseItemEffect` 给的 duration 是 **-1（无限）**，真正的结束条件是
-# 「本机玩家打完 3 发」—— 只有他自己那台机器数得出来。有 `Time` 的那些
+# 「本机玩家打空 3 匣」（X_Mod §95）—— 只有他自己那台机器数得出来。有 `Time` 的那些
 # （护盾 8 秒、加速 8 秒、隐身 10 秒…）每台机器各自倒计时，所以看起来正常。
 OP_REMOVE_CHAR_ATTR = 0x040d  # 两个方向同号：客户端「我这个效果结束了」/ 服务端「某座位的效果结束了」
 
@@ -2343,9 +2343,35 @@ GAME_RESULT_EXPERIENCE = 9      # 「经验值 +N」
 GAME_RESULT_MONEY = 10          # 「金币 +N」
 GAME_RESULT_LADDER_POINT = 11   # 「竞技场分数 +N」（闯关模式没有天梯分，发 0）
 
-#: 剩下 9 个值一律 0。⚠ **别一次全填** —— `gameresult-probe` 把 12 个值填成
-#: 201..212 时客户端 20 毫秒内主动断链（§100），至今没查出是哪一格干的。
-#: 这三个是逐格验过的，其余保持 D019 的「不懂就填 0」。
+#: ★★ 右上角数据栏那四格（X_Mod §141 / D100）—— 线序 2 / 3 / 5 / 6。
+#:
+#: 处理器 `0x55210d` 在「包里座位号 == 我」（`0x5523d9 call 0x409f7d`）时把它们
+#: **绝对赋值**给数据栏的四个全局（`0x5523e5..0x552400`），和 `0x0600` 写的是同一组：
+#:
+#:     值 2 -> [0x72e33c]  总经验
+#:     值 3 -> [0x72e330]  ★ 金币
+#:     值 5 -> [0x72e340]  本级起始总经验
+#:     值 6 -> [0x72e344]  下一级所需总经验
+#:
+#: 紧接着的 `0x0411` 把经验三件套再绝对写一遍、金币 `+=` 本局所得 ⇒ 金币那格要填
+#: 「结算后余额 − 本局所得」。以前四格全填 0 ⇒ 结算后客户端金币只剩本局所得，
+#: 全靠看完结算那发 `0x0600` 盖回去；命用完在确认框里点「是」直接 `0x0203`
+#: 回大厅就一直错着 —— 玩家报的「金币被清零」（存档其实一个没少）。
+#: ★ 只给**收包人自己那个座位**那一份填（`send_end_game` 的 `own_results`）：
+#:   别人那几份客户端本来就不认，填了只是把余额白白发给同房的人。
+GAME_RESULT_BAR_EXPERIENCE = 2
+GAME_RESULT_BAR_MONEY = 3
+GAME_RESULT_BAR_LEVEL_START_EXP = 5
+GAME_RESULT_BAR_NEXT_LEVEL_EXP = 6
+
+#: 剩下 5 个值（0 / 1 / 4 / 7 / 8）一律 0（D019 的「不懂就填 0」）：
+#:
+#: ⚠⚠ **值 4 绝对不许非 0** —— 「座位 == 我」时它非 0 就弹
+#:   「해킹 프로그램 사용이 의심되어 클라이언트를 종료합니다.」（`0x691d58`，
+#:   疑似外挂、结束客户端）而且整包其余不处理。V0.1 §100 把 12 个值填成
+#:   201..212 时「20 毫秒内主动断链」多半就是它（X_Mod §141）。
+#: 值 1 非 0 = 「升级了」：客户端 `inc` 等级再弹升级提示（`0x552444`）。等级我们
+#:   一直走 `0x0600` 的绝对值，不用这一格（用的话得和 `0x0600` 那一格对账，没验过）。
 
 
 #: ═══ 一局打完给多少经验 / 金币（§227 / D148）════════════════════════════
@@ -2370,7 +2396,7 @@ GAME_RESULT_LADDER_POINT = 11   # 「竞技场分数 +N」（闯关模式没有�
 #: 改完**即刻生效**。这里只剩「怎么查表」和「查不到怎么办」。
 #:
 #: ★ 一档 = 表里的一条记录：
-#:     对战 `(游戏模式, 道具战, 组队战)`  —— 8 档
+#:     对战 `(游戏模式, 道具战, 组队战)`  —— 10 档（格斗没有道具战那两档）
 #:     闯关 `(关卡, 难度)`               —— 21 档
 #:   每档写着**赢 / 输**各给多少金币和经验（闯关的「赢」= 通关）。
 
@@ -2483,7 +2509,7 @@ def pvp_reward(kills, won, game_mode=None, item_mode=False, team_mode=False):
     ★★ **哪一档由 `(游戏模式, 道具战, 组队战)` 三样决定**（D72）——
     2026-09-10 之前这三样对奖励**毫无影响**，八种组合给的钱一模一样。
     `game_mode` 是房间描述符的 `arguments[1]`（`Conn.pvp_game_mode()`），
-    经 `PVP_MODE_ROW` 归档到表里那两行。
+    经 `PVP_MODE_ROW` 归档到表里那三种模式（生存 / 夺分 / 格斗）。
 
     ★ 输了也给底薪：对战的一局可能就几分钟，一分不给会逼人挂机刷闯关。
       表里「输」那一列就是这个底薪。**平局**（尾部数组那一格是 0、谁都不判）
@@ -2564,16 +2590,33 @@ def quest_materials(quest_id, difficulty, cleared, mode="quest", rng=None):
     return materials, warnings
 
 
-def build_game_result_values(experience=0, money=0, ladder_point=0):
-    """按 §116 的语义组 `gspRepGameResult` 的 12 个业务值（其余全 0）。
+def build_game_result_values(experience=0, money=0, ladder_point=0,
+                             data_bar=None):
+    """按 §116 / X_Mod §141 的语义组 `gspRepGameResult` 的 12 个业务值（其余全 0）。
 
-    三个都是**本局增量**（界面上就写成 `+%d`），不是账号总额 ——
-    和 `0x0411 gspEndGame` 那三个「绝对累计值」正好相反，别搞混。
+    `experience` / `money` / `ladder_point` 是结算界面那三行的 `+%d`，都是
+    **本局增量**，不是账号总额 —— 和 `0x0411 gspEndGame` 那三个「绝对累计值」
+    正好相反，别搞混。
+
+    `data_bar` = `(总经验, 结算后余额, 本级起始总经验, 下一级所需总经验)`，
+    **只在给收包人自己那个座位组包时传**（见 `GAME_RESULT_BAR_*`）。不传就和
+    以前逐字节相同。金币那格写的是「结算后余额 − `money`」—— 客户端紧接着拿
+    `0x0411` 的本局所得 `+=` 上去，所以 `money` 必须和 `0x0411` 的
+    `money_gained` 是同一个数（`send_end_game` 里就是同一个变量）。
+    ★ 那一格钳在 int32 里：`apply_battle` 不钳余额，一个异常大的余额不能让
+      `struct.pack` 在结算循环里抛出去 —— 那会让**全房间**都收不到结算。
     """
     values = [0] * GAME_RESULT_VALUE_COUNT
     values[GAME_RESULT_EXPERIENCE] = int(experience)
     values[GAME_RESULT_MONEY] = int(money)
     values[GAME_RESULT_LADDER_POINT] = int(ladder_point)
+    if data_bar is not None:
+        total_exp, balance, level_start_exp, next_level_exp = data_bar
+        values[GAME_RESULT_BAR_EXPERIENCE] = int(total_exp)
+        values[GAME_RESULT_BAR_MONEY] = max(
+            -2 ** 31, min(2 ** 31 - 1, int(balance) - int(money)))
+        values[GAME_RESULT_BAR_LEVEL_START_EXP] = int(level_start_exp)
+        values[GAME_RESULT_BAR_NEXT_LEVEL_EXP] = int(next_level_exp)
     return values
 
 
@@ -2624,6 +2667,9 @@ def build_rep_game_result(seat_id=0, values=None, tail=None):
     只发 `0x0411` 的话结算界面构造得出来却没有数据，于是画面上什么都不显示 ——
     §93 观察到的「`[GameContext+4]==1` 但看不见界面」就是这个原因。
 
+    ★★ 但 `0x0309` **也写数据栏**（X_Mod §141）：座位 == 我时线序 2/3/5/6
+    绝对赋值给那四个全局，而且比 `0x0411` 先到 —— 见 `GAME_RESULT_BAR_*`。
+
     反序列化 `0x54c6b4` 依次读 13 个 4 字节字段再读一个 int32 数组。**两个 bool
     字段在线上也是 4 字节**（`0x5d59de` 读 4 字节再折成 1 字节存），别写成 1 字节
     —— 但它们在**结构体里**只占 1 字节且挨在一起（`+0x24` / `+0x25`），
@@ -2633,7 +2679,14 @@ def build_rep_game_result(seat_id=0, values=None, tail=None):
 
         pkt+0x04  座位号   ← 先过 `0x4045f9` 的座位有效性检查，不合法整包丢弃
         pkt+0x0c  bool     -> [GameContext + seat + 0x164]   （值 1）
-        pkt+0x18  非 0 时走 `0x552170` 的提示分支             （值 4）
+                             座位 == 我且非 0 ⇒ `inc [0x72e338]` 等级 + 升级提示
+        pkt+0x10           座位 == 我 ⇒ [0x72e33c] = 值      （值 2 = 总经验）
+        pkt+0x14           座位 == 我 ⇒ [0x72e330] = 值      （值 3 = ★ 金币）
+        pkt+0x18  座位 == 我且非 0 ⇒ `0x552170`「疑似外挂，结束客户端」，
+                  整包其余不处理                             （值 4，永远填 0）
+        pkt+0x1c           座位 == 我 ⇒ [0x72e340] = 值      （值 5 = 本级起点）
+        pkt+0x20           座位 == 我 ⇒ [0x72e344] = 值      （值 6 = 下一级）
+        pkt+0x24  bool     -> [0x72e368]                      （值 7）
         pkt+0x25  bool     -> `0x493dd4` 的第 2 个参数        （值 8）
         pkt+0x28           -> [GameContext + seat*4 + 0x2c]  （值 9  = 经验值）
         pkt+0x2c           -> [GameContext + seat*4 + 0x5c]  （值 10 = 金币）
@@ -2646,8 +2699,9 @@ def build_rep_game_result(seat_id=0, values=None, tail=None):
     ★ **`0x0309` 只能在战斗中发**：`0x55210d` 直接解引用 GameContext，
     关卡一结束它就变 0（§93 实测），那时再发就是空指针崩溃。
 
-    12 个业务值里查明了三个（会话 18，§116，见 `build_game_result_values`）——
-    结算界面「经验值 / 金币 / 竞技场分数」三行；剩下 9 个按 D019 保持 0。
+    12 个业务值里用上了七个（见 `build_game_result_values`）：结算界面
+    「经验值 / 金币 / 竞技场分数」三行（会话 18，§116）+ 收包人自己那一份的
+    数据栏四格（X_Mod §141 / D100）；剩下 5 个按 D019 保持 0。
     **通关标签不在这 12 个里，在尾部数组里**（会话 17 查明，§112）；
     **「分数 / 生命」那一行也不在这个包里，在 `0x0411` 里**（§116）。
     """
@@ -2831,6 +2885,17 @@ TEAM_REFLECT_ITEM_ID = 10314
 #: 撑多久 —— `Status.ini` 第 **3** 条（`[Reflect]` 的 `CharAttr` 就是 3）：`Time=8.0`。
 REFLECT_SECONDS = 8.0
 
+#: ★★ **护盾**（`Item.ini` `[Shield] ItemId=10300 CharAttr=1`）。X_Mod §92。
+#:
+#: 收方 `Character::OnHit` 进门查属性 1（`0x4ff3ee push 1 ; call 0x401c0c`）：
+#: 有就只放 `Item/Shield/Efx/Shield00.efx`，**一滴血都不扣**。每台机器都按
+#: `0x040a` 给它挂上 8 秒，所以别人屏幕上它也是满的 —— 服务端的血量台账
+#: 不跟着免伤的话，bot 眼里「开着盾的人」越打越残。
+SHIELD_ITEM_ID = 10300
+
+#: 撑多久 —— `Status.ini` 第 **1** 条（`[Shield]` 的 `CharAttr` 就是 1）：`Time=8.0`。
+SHIELD_SECONDS = 8.0
+
 #: 护盾那个圆有多大（`0x47f0f0` 的 `0x42480000` = 50.0f）。
 REFLECT_RADIUS = 50.0
 
@@ -2853,14 +2918,39 @@ SMOKE_SECONDS = 8.0
 #:     Interval=1.0
 #:     Hp=10
 #:
-#: ⇒ **8 秒里每秒回 10 点，一共 80 点**。血量是每台机器各算各的（§122），
-#: 服务端记那份台账时得跟着回 —— 不跟的话 bot 眼里「刚喝完药的人」还是残血，
-#: 逼近 / 拉开会判反。
+#: ⇒ 8 秒（250 格）里**每 32 格装一轮 10 滴、一格一滴 +1**（夺分一滴 +2），
+#: 用了当场就开始（X_Mod §94，`0x509dd7`）：一共 8 轮 **80 点，夺分 160 点**。
+#: 血量是每台机器各算各的（§122），服务端记那份台账时得跟着回 —— 不跟的话
+#: bot 眼里「刚喝完药的人」还是残血，逼近 / 拉开会判反。
 HP_CHARGE_ITEM_ID = 10308
 TEAM_HP_CHARGE_ITEM_ID = 10313
-HP_CHARGE_SECONDS = 8.0
-HP_CHARGE_INTERVAL = 1.0
+HP_CHARGE_SECONDS = 250 * 32 / 1000.0
 HP_CHARGE_AMOUNT = 10
+
+#: ★★ **毒弹**（`Item.ini` `[BulletPoison] ItemId=10500 CharAttr=10`）→ 打中的人**中毒**
+#: （`Status.ini [11]`：`Time=8.0 Interval=1.5 Damage=5`）。X_Mod §93。
+#:
+#: 每台机器都是**自己判撞上了**就给受害者挂毒（`BulletObj::HitObject` `0x47f096`，
+#: 没有「是不是我的弹」那道门），之后每一跳各机本地扣血（`0x509d64` → `OnHit`），
+#: **一个包都不发** ⇒ 服务端的血量台账不跟着扣，bot 眼里中了毒的人永远不掉血。
+#:
+#: * 一跳间隔：`1500 / 32` = 46 格，再加上 `[char+0x68c] < now` 那道严格小于 ⇒
+#:   **47 格 = 1.504 秒**；
+#: * 持续 8000 / 32 = 250 格 ⇒ 第 0/47/94/141/188/235 格各一跳 = **6 跳 30 点**
+#:   （V0.3bot §113 写的 5 跳是错的）；
+#: * 再中一次**只把到期时刻续满 8 秒**，跳的节奏不重排（`0x401bd6`）。
+POISON_ITEM_ID = 10500
+POISON_MAGAZINE_ATTR = 10
+
+#: 三重射击的属性号（`Item.ini [TripleShot] CharAttr=6`）：开火时弹数 ×3（`0x515365`，X_Mod §98 / §101）。
+TRIPLE_SHOT_ATTR = 6
+
+#: 缩小道具（`Item.ini [SizeDown] ItemId=10304 CharAttr=4`，`Status.ini [4] Time=8.0`，X_Mod §101）。
+SIZE_DOWN_ITEM_ID = 10304
+SIZE_DOWN_SECONDS = 8.0
+POISON_SECONDS = 250 * 32 / 1000.0
+POISON_INTERVAL = (1500 // 32 + 1) * 32 / 1000.0
+POISON_DAMAGE = 5
 
 #: ★ 干扰道具（`Item.ini` 的 `[HudDevil]`，糊屏）。
 HUD_JAM_ITEM_ID = 10311
@@ -2888,6 +2978,13 @@ HUD_JAM_SECONDS = 8.0
 #:     SpeedRatio=0.3
 SLOWED_SECONDS = 4.0
 SLOWED_SPEED_RATIO = 0.3
+
+#: ★ 加速道具（`Item.ini [SpeedUp] ItemId=10301 CharAttr=2`）→ `Status.ini` 第 **2** 条：
+#: `Time=8.0`、`SpeedRatio=2.0`。走速倍率 `Character vft+0x124`（`0x4fec46`）的头一句：
+#: 有属性 2 ⇒ 倍率**直接取** 2.0（不是乘），之后有属性 14 再 ×0.3（X_Mod §97）。
+HASTE_ITEM_ID = 10301
+HASTE_SECONDS = 8.0
+HASTE_SPEED_RATIO = 2.0
 
 #: 胶水那一摊的**碰撞半径**（V0.3 §108）。
 #:
@@ -2958,25 +3055,28 @@ BULLET_ATTRIBUTE_CHAR_ATTR = {1: 11, 2: 12, 3: 13, 4: 14}
 #: 12 冰冻那一条没有 `SpeedRatio`，它是整个「动不了」（见 `bot._speed_scale`）。
 CHAR_ATTR_SPEED_RATIO = {14: SLOWED_SPEED_RATIO}
 
-#: ★★★ **按「打几发」算的那三条状态**（V0.3 §117，接 §200 / §201）。
+#: ★★★ **按「打空几匣」算的那三条状态**（V0.3 §117，接 §200 / §201；X_Mod §95 订正）。
 #:
 #: `Status.ini` 里绝大多数状态有 `Time`，客户端各自倒计时、自己撤掉。
 #: 这三条**只有 `Magazine`、没有 `Time`** —— `UseItemEffect` 给的时长是
-#: **−1（无限）**，真正的结束条件是「**开了 Magazine 发**」，而且只有
-#: **持有者那台机器**数得出来，数完发一发 `0x040d` 告诉别人（§200）。
+#: **−1（无限）**，真正的结束条件是「**打空 Magazine 个弹匣**」（`0x509feb` 只在
+#: 开火后弹匣打空、开始换弹那一下各减 1），而且只有**持有者那台机器**数得出来，
+#: 数完发一发 `0x040d` 告诉别人（§200）。⚠ 会话 38 以前这里写的是「开 Magazine 发」——
+#: 一匣 1 发的武器两者一样，左轮 6 发一匣就是 18 发对 3 发。
 #:
 #: ⇒ bot 没有本机 ⇒ **没有一台会替它数** ⇒ 效果永远不结束
 #: （用户 2026-08-29：「bot 的苹果弹一直是加强状态，不恢复正常」）。
-#: 服务端必须替它数，数完补那一发 `0x040d`。
+#: 服务端必须替它数（`bot._magazine_emptied`），数完补那一发 `0x040d`。
 #:
-#: 表：`物件 id -> (属性号, 弹数, 伤害倍率, 弹体大小倍率)`。
+#: 表：`物件 id -> (属性号, 匣数, 伤害倍率, 弹体大小倍率)`。
 #: 属性号来自 `Item.ini` 的 `CharAttr`，后三个来自 `Status.ini` 同号那一节：
 #:
 #:     [6]  트리플 샷  Magazine=3
 #:     [7]  파워 샷    Magazine=3  DamageRatio=2.0  SizeRatio=2.0
 #:     [10] 포이즌     Magazine=3  OneMagazine=1
 #:
-#: ⚠ `OneMagazine` 是毒弹独有的一格，含义还没逆出来，先当它不影响发数。
+#: ⚠ `OneMagazine` 是死代码：`0x508e28` 拿**属性号**去比 0x2904（= 10500，毒弹的
+#: **道具号**），永远不成立 —— 本来想做的大概是「每发都算打空一匣」（X_Mod §93）。
 MAGAZINE_STATUS = {
     10306: (6, 3, 1.0, 1.0),      # TripleShot 三重射击
     10307: (7, 3, 2.0, 2.0),      # PowerShot 强力射击（★ 用户报的就是它）
@@ -3376,6 +3476,8 @@ HEART_EFFECT_ITEM_IDS = frozenset({
     10315,      # 하트 —— `[红心达人] 560006` 给全队回的那一份
     10316,      # HeartBoostHpUp —— `EquipBonus` 的 `HeartBoost`（青鸟 220001）
 })
+TITLE_HEART_ITEM_ID = 10315
+HEART_BOOST_ITEM_ID = 10316
 
 #: `10315` 那一份的量**写死在 exe 里**：`0x522a45` 给 5，
 #: `0x522a4e` 在（游戏类型 == 3 或 `[session+0x1c] == 5`）时给 10（§53⑤）。
@@ -4008,10 +4110,11 @@ PVP_MODE_DEATHMATCH = 3
 
 #: 游戏模式号 → **奖励表里的哪一行**（`pvp_reward`，D72）。
 #:
-#: 表里只有生存(0) 和 夺分(3)：中国区建房下拉框就这两种，低等级号选了生存
-#: 还会被客户端自己改回夺分（`hook/bshook.c` 的 `try_patch_player_level_gate`
-#: 第 3 / 4 处）。剩下两个号照**引擎里的胜负条件**归档 ——
-#: 模式 2 和模式 0 共用 `SurvivalVictoryCondition`（上面那个工厂分流）⇒ 归生存；
+#: 表里有生存(0) / 夺分(3) / 格斗(2)（`shopcfg.PVP_MODE_ZH`）。格斗以前选不到，
+#: 照**引擎里的胜负条件**借生存那一行（两者共用 `SurvivalVictoryCondition`，
+#: 上面那个工厂分流）；X16 把它放出来之后，X_Mod D103 给了它自己的两档
+#: （个人战 / 组队战）。★ 格斗没有道具战那一档：`lobby.item_mode_of` 对模式 2
+#: 恒给「否」（客户端 `0x465be2` 同口径），查的永远是非道具那一行。
 #: 模式 1（计时）没有对应行，和「参数缺不全」一样归夺分，
 #: 和 `Conn.pvp_game_mode()` 的兜底一个口径。
 #:
@@ -4021,7 +4124,7 @@ PVP_MODE_DEATHMATCH = 3
 PVP_MODE_ROW = {
     PVP_MODE_SURVIVAL: PVP_MODE_SURVIVAL,
     PVP_MODE_TIME_ATTACK: PVP_MODE_DEATHMATCH,
-    PVP_MODE_FIGHT: PVP_MODE_SURVIVAL,
+    PVP_MODE_FIGHT: PVP_MODE_FIGHT,
     PVP_MODE_DEATHMATCH: PVP_MODE_DEATHMATCH,
 }
 
@@ -4123,6 +4226,18 @@ PEER_OP_JUMP = 0x0006
 #: 得自己把它记成状态，bot 回放到那一段时再补一发。组包在 `botsync.py`。
 PEER_OP_CROUCH = 0x000B
 
+#: 内层 `0x0016`：发动一招**近身格斗招式**（原名未知；收方 `0x493581` → `0x50a674`
+#: 造一个 `NewMutuSkill`，招式在 `NewMutu.ini`）。只有本机输入处理（`0x4958eb` 那一带）发。
+#: ★ `0x50a674` 进门就把格挡开关 `[char+0x2b6]` 清 0 —— 不发 `rpGuard`、也不动过渡
+#: 计时器 ⇒ 服务端记的那份格挡跟着清（`Conn.note_sync_position`，X_Mod §95）。
+PEER_OP_MUTU_SKILL = 0x0016
+
+#: ★★ 格挡开 / 关的**过渡**（X_Mod §95）：收方 `SetGuard`（`0x502dae`）换开关时顺手
+#: 起一个 **3 个逻辑帧**的计时器（`0x502de0 push 3`，计的是 `[Stage+0xd4]` 帧号），
+#: 已经在跑就不重起；射手判「在挡」（`0x50a0ea`）看的是「开关 XOR 计时器在跑」
+#: ⇒ 按下 / 松开都要过 3 格才算数。原版数据，不是我们挑的定时器（同 `POISON_INTERVAL`）。
+GUARD_SWITCH_S = 3 * roomclock.TICK_S
+
 #: ★ 诊断用（`note_human_fire`）：真人的 `rpFire` / `rpExplode`。
 #: 组包在 `botsync.py`（`OP_FIRE` / `OP_EXPLODE`），这里只为了把**真人此时
 #: 此地发的那一发**原样打进日志，好和 bot 的并排比（§53）。M3b 收口后删。
@@ -4134,6 +4249,8 @@ PEER_OP_EXPLODE = 0x0003
 PEER_OP_SPLASH_DAMAGED = 0x0004
 PEER_OP_DASH = 0x0007
 PEER_OP_GUARD = 0x0018
+#: 出拳（`0x0008`，和 `rpDash` 同一种 11 字节的包）。只在 `note_sync_position` 里给它在逻辑帧网格上定位（X_Mod §113）。
+PEER_OP_JAB = 0x0008
 
 #: ★ `note_battle_stats()` 只认这五个。**心跳（`0x4001`）占绝大部分流量**，
 #: 让它在第一句就掉头走 —— 这是整条热路径上唯一要在意的事。
@@ -4274,7 +4391,7 @@ BOT_RESPAWN_POINT = None
 BOT_PEER_HIT = None
 
 #: ★★ 同上，`bot.bot_limit_reason` 挂这儿：**这会儿房里的 bot 受限没有**
-#: （成就防刷，V0.3.3 / D127）。签名 `(room) -> 一句原因 | None`。
+#: （防刷，V0.3.3 D127 / X_Mod D104）。签名 `(room) -> 一句原因 | None`。
 #:
 #: ★ 为什么是钩子，而不是在结算那一段里 lazy `import bot`：`bot.py` **被
 #: import 的那一刻**就把上面这四个钩子装上了。在结算路径上 lazy import 的话，
@@ -4393,7 +4510,7 @@ def new_room_quest(room, seats, announce=False):
     if reason:
         quest.bot_limit_reason = "开局时 " + reason
         if announce:
-            room_system_chat(room, f"⚠ {reason}，本局不计成就。")
+            room_system_chat(room, f"⚠ {reason}，本局不计奖励。")
     return quest
 
 
@@ -4478,8 +4595,8 @@ class RoomQuest:
         #: ★ 被**糊屏**（10311）罩住的座位撑到什么时候（`{座位: 时刻}`，§121）。
         #:   只有 bot 读它 —— 真人那张鬼脸是他自己客户端画的。
         self.hud_jam_until = {}
-        #: ★ 正在**回血**的座位：`{座位: [下一跳的时刻, 还剩几跳]}`（§122）。
-        #:   `Status.ini[8]` 是 8 秒 × 每秒 10 点；这里按同一个节奏往台账里加。
+        #: ★ 正在**回血**的座位：`{座位: 属性 8 挂到哪一刻}`（§122 / X_Mod §94）。
+        #:   一滴一滴怎么回是 `bot._advance_hp_charges` 照客户端的节奏算的。
         self.hp_charges = {}
         #: ★★★ **场上还活着的怪**：`{世界句柄: [x, y, 状态, 追谁的座位]}`
         #:   （§125）。位置是**控制者广播的**（`rpAiMsg` 的 `setState`），
@@ -4509,6 +4626,22 @@ class RoomQuest:
         #: 会被**弹开**而不是炸掉（`0x47f09c` 那道 `HasAttr(3)` 门），
         #: 而 bot 的弹体是服务端算的 ⇒ 这边不记就照旧炸在人身上。
         self.reflect_until = {}
+        #: ★★ 每个座位的**护盾**撑到什么时候（`{座位: 时刻}`，X_Mod §92）。
+        #: 收方 `OnHit` 见属性 1 就整发不扣血 ⇒ 血量台账要跟着免伤。
+        self.shield_until = {}
+        #: ★★ 哪些**真人**座位身上挂着毒弹（属性 10，X_Mod §93）。开始 = 他的 `0x040c`
+        #: 用了 10500，结束 = 他自己那台发来的 `0x040d(座位, 10)`（弹匣数只有他那台
+        #: 数得出来）、或者他死了（`Die` 把属性表整个清掉，不发 `0x040d`）。
+        #: bot 的那一份在 `BotConn.magazine_attrs` 里。
+        self.poison_magazine = set()
+        #: ★★ 要扣进 bot 那本血量台账的**回血事件**（X_Mod §94）：
+        #: `("heart", 座位, 0, -1)`（捡到心）/ `(10315 或 10316, 目标, 量, 发起人)`
+        #: （转成 `0x040a` 的那两件）。网络线程往里放，房间那条 32 ms 线程取
+        #: （`bot._drain_heal_events`）—— 回多少要看房间里谁活着，得在那边算。
+        self.heal_events = collections.deque()
+        #: ★ 每个座位**上一次是被谁打死的**（`0x0408` 的凶手那一格 = `[char+0x158]`）。
+        #: 复活时夺分那 7 秒免伤看它（`bot._rage_revival`，X_Mod §94）。
+        self.last_killer = {}
         #: 本局下发过的每一件 `0x0404` 的「句柄 -> 物件 id」（服务端刷的和
         #: 客户端掉的都记）。★ 拾取放行时**只有靠它才知道捡到的是什么** ——
         #: `0x0407` 只带句柄，而要不要补一发 `0x040b` 完全取决于物件类型（§194）。
@@ -4589,8 +4722,9 @@ class RoomQuest:
         #: 本局已经结算过了。★ 房间级，不是连接级 —— 六个人会各发一发
         #: `0x040f gcpEndQuest`，只有第一发能触发结算。
         self.settled = False
-        #: ★★ 这一局**出现过**的 bot 限制（成就防刷，V0.3.3 / D127）。
-        #: `None` = 没出现过 ⇒ 这一局照常计成就。
+        #: ★★ 这一局**出现过**的 bot 限制（防刷，V0.3.3 D127 / X_Mod D104）。
+        #: `None` = 没出现过 ⇒ 这一局照常计奖励（经验 / 金币 / 材料 / 成就）。
+        #: 闯关房恒为 `None`：判据那一层（`bot.bot_limit_reason`）就豁免了。
         #:
         #: ★ 它是**闩**：只写第一次，之后限制解除了也不撤。口径是
         #: 「这一局里出现过没有」，不是「结算那一刻还在不在」
@@ -4796,6 +4930,8 @@ class RoomQuest:
         #   这里是全服务端唯一知道「这一件归谁」的地方。
         if item_id == HEART_ITEM_ID:
             self.add_heart(seat_id)
+            # ★ 捡的人回血（每台客户端收到 `0x0405` 都这么算，X_Mod §94）。
+            self.heal_events.append(("heart", int(seat_id), 0, -1))
         return True
 
     def add_coins(self, seat_id, amount):
@@ -5438,6 +5574,8 @@ class RoomQuest:
         self.items_at.clear()
         self.items_born.clear()
         self.reflect_until.clear()
+        self.shield_until.clear()
+        self.poison_magazine.clear()
         del self.slow_mines[:]
         del self.freeze_bursts[:]
         del self.smokes[:]
@@ -5872,9 +6010,13 @@ def reset_sync_trails(room, why, new_match=False):
         conn.sync_jumped = 0
         conn.sync_jump_ticks = ()
         conn.sync_trail_at = None
+        conn.sync_melee_grid = None
+        conn.sync_event_grid = None
+        conn.mutu_skill = None                # 格斗招式跟着角色重建没了（X_Mod §121）
         # ★ 换图 / 新一局客户端会把角色重建，蹲的状态跟着归零（`0x4ffc4a`），
         #   服务端这份记账也要一起清，否则 bot 会照着上一张图的姿势起步。
         conn.sync_crouch = False
+        conn.sim_fly_pending = False          # 打飞待生效（bot._human_knocked_flying，X_Mod §122）
         # ★ 诊断（`note_human_fire`）：换图 / 新一局重新打第一发。M3b 收口后删。
         conn.human_fire_logged = set()
         # ★ 挂机判定的钟归零（用户 2026-09-14）：新一局 / 换图之后都要重新攒
@@ -5893,6 +6035,16 @@ def reset_sync_trails(room, why, new_match=False):
         if new_match:
             conn.dead_since = None
             conn.afk_when_down = False
+        # ★ 格挡开关**只在新一局清**（X_Mod §95）：角色重建时 Init 写 0（`0x4fb6d7`），
+        #   他还按着键的话他那台会再发一发「开」。闯关换图不走 Init（§94），开关跟着人
+        #   带过去，他那台看自己也还是「开」、不会再发 —— 这边清了就再也对不上。
+        #   过渡计时器两种都当过期（加载那几秒怎么走没逆，同 D65）。
+        if new_match:
+            conn.sync_guard = False
+            # 加速 / 减速 / 冰冻：新一局角色重建，属性表是空的（X_Mod §97）。
+            conn.hasted_until = conn.slowed_until = conn.frozen_until = None
+            conn.shrunk_until = conn.jab_until = None
+        conn.sync_guard_switch_at = None
         # ★★ **在场证据那几格一个都不清**（`presence_*`，2026-09-21）：
         #   上面两条钟要清，是因为它们的证据（`0x040e`、打中 / 捡到）本来就
         #   **只在一张图之内有意义**；而在场证据说的是「这个人在不在机器前」，
@@ -5953,11 +6105,11 @@ HEARTBEAT_TICKS = 4
 #:
 #: 踩地那一路收方是按方向键**自己走**的，走速两边一样，4 格一发 + 按键翻转
 #: 当格补锚（D149）就够。腾空那一路收方拿包里的速度**逐帧积分、再用自己的
-#: 三圆地形扫掠去挡**（`Character` 主虚表 vf+0x70 = `0x50d58a` → `0x50e759`，
-#: 形状表 `[char+0x140..0x144]`），而服务端 `botmove._air_tick` 是脚下一个点。
-#: 冰洞顶、悬崖下沿这种「脚过得去、头过不去」的地方，收方那份被挡住、服务端
-#: 这份飞过去，两发心跳之间最多差 4 格，再按 0.6ⁿ 慢慢滑回来 —— 实机 849 发
-#: 开火两端对齐：空中滞后 p90 32 px、p99 71 px，装了 BSM1 前后一样。
+#: 三圆地形扫掠去挡**（`Character` 主虚表 vf+0x70 = `0x50d58a` → `0x50e759`）。
+#: X_Mod §105 起服务端跑的是同一套物理，可**空中操控**（`[+0x4c4]`）只有本人那台有：
+#: bot 按住方向键时 vx 逐格往上攒，收方那份远端角色的 vx 却定在包里那个数上 ——
+#: 两发之间攒几格就差几格的操控量（V0.3 时期是脚点模型 vs 三圆扫掠，实机空中滞后
+#: p90 32 px、p99 71 px）。
 #: ⇒ 腾空每格报一发：收方自己积分的只剩 1 格，分歧最多一格的量、下一格就被
 #: 拉回。代价是腾空段心跳 ×4（bot 约 2/3 时间腾空，每个 bot 每秒 ~8 份 → ~24 份）。
 #: ⚠ 这**不是**锚：分歧发生在收方那台机器上，服务端没有事件可等，只能按节拍报；
@@ -7095,7 +7247,23 @@ class Conn:
     sync_jumped = 0
     sync_jump_ticks = ()
     sync_trail_at = None
+    sync_melee_grid = None
+    sync_event_grid = None
+    mutu_skill = None
     sync_crouch = False
+    sync_guard = False
+    sync_guard_switch_at = None
+    # ★ 会改走速的三个状态「到什么时候」（`time.monotonic()`，`None` = 没有）：加速（属性 2）、
+    #   减速（14）、冰冻（12）。bot 的也是这三格（`BotConn` 自己也会写）；真人的只给服务端
+    #   外推他的位置用（X_Mod §97）。
+    hasted_until = None
+    slowed_until = None
+    frozen_until = None
+    # ★ 缩小道具（属性 4）到什么时候：碰撞圆 ×0.6（X_Mod §101）；出拳（`0x0008`）那一段第 4 个圆
+    #   到什么时候、朝哪边（`jab_dir`）。bot 的同名三格在 `BotConn` 上。
+    shrunk_until = None
+    jab_until = None
+    jab_dir = 0
     # ★ 「这条连接报过几个位置点」。bot 的帧循环拿它当**事件**（V0.3 §32）：
     #   号变了 = 这个真人报了一个新位置 = bot 该走一帧了。只增不减、不回绕
     #   （Python 的 int 没有上限），换图 / 新一局都**不清** —— bot 那边存的
@@ -7330,9 +7498,27 @@ class Conn:
         # 最近那发心跳**到达**的时刻（`time.monotonic()`）。起跳离它几帧、他自己那条鱼在那一帧
         # 的相位，都从这一刻起算（X_Mod §85）。
         self.sync_trail_at = None
+        # ★ 他最近那一发冲刺 / 出拳排在哪一帧的到达时刻（`note_sync_position`，X_Mod §113）。
+        self.sync_melee_grid = None
+        # ★ 同一口径，最近那一发事件包（冲刺 / 出拳 / 格斗招式 `0x0016` / 他招式打中人的 `0x0004`，X_Mod §121）。
+        self.sync_event_grid = None
+        # ★ 他正在出的那一招格斗招式（`botfight.HumanSkill`，bot.py `_note_mutu_skill` 记）。
+        self.mutu_skill = None
         # ★ 他现在蹲着没有。`rpCrouch`(0x000b) 只在按下 / 松开各来一发，
         #   中间的每一发心跳都照这个状态记进轨迹点（V0.3 §41）。
         self.sync_crouch = False
+        # ★ 他的格挡开关（`[char+0x2b6]`）和开关过渡计时器起跑的时刻（X_Mod §95）。
+        #   和蹲一样只有事件包说得着（`rpGuard` 0x0018）；bot 替它当射手时判「在挡」
+        #   要用（`guarding()`）。
+        self.sync_guard = False
+        self.sync_guard_switch_at = None
+        # ★ 加速 / 减速 / 冰冻到什么时候（见类级默认值，X_Mod §97）。
+        self.hasted_until = None
+        self.slowed_until = None
+        self.frozen_until = None
+        self.shrunk_until = None
+        self.jab_until = None
+        self.jab_dir = 0
         # 记了几个位置点（bot 的帧事件）。见类级默认值。
         self.sync_trail_seq = 0
         # ★ 诊断（`note_human_fire`）：本图已经打过日志的内层 opcode。
@@ -9014,6 +9200,9 @@ class Conn:
                  f" —— 客户端收到才会调 Character::Die()，心形也靠它减")
         self.battle_broadcast(build_game(OP_BROADCAST_DEATH, reply),
                               reason="：死亡广播")
+        # ★ 记下凶手：夺分里被敌人打死的，复活时多 7 秒免伤（X_Mod §94）。
+        if 0 <= seat < ROOM_SEAT_COUNT:
+            quest.last_killer[seat] = info["arg"]
         # ★ 他躺下了 ⇒ 挂机判定这一段不管他（用户 2026-09-14）：死人按不了键。
         note_seat_died(self.lobby_room(), seat)
         # ★ 上闩等他自己的 0x0413；到点没等到就由 `check_respawn_watchdog()`
@@ -9604,6 +9793,32 @@ class Conn:
         | 烟雾 10401 | 同上，云在使用者脚下（D67）|
         """
         item_id = int(item_id)
+        # ★★ 加速（X_Mod §97）：每台机器都给他挂属性 2，走速倍率变 2.0（`0x4fec46`）。
+        #    bot 的走位是服务端算的、真人的位置服务端要外推 —— 两边都得知道他在加速，
+        #    不然 bot 被每发心跳往回拽、外推的真人落在后面。
+        if item_id == HASTE_ITEM_ID:
+            self.hasted_until = time.monotonic() + HASTE_SECONDS
+            self.log(f"   加速 座位 {seat_id} {HASTE_SECONDS:g} 秒（走速 ×{HASTE_SPEED_RATIO:g}）")
+            return
+        # ★★ 缩小（X_Mod §101）：每台机器给他挂属性 4，碰撞圆（腿 / 身 / 头 / 蹲）×0.6、从脚底往上
+        #    重摆（`0x4fc399`）—— 撞子弹、腾空扫掠都跟着缩。bot 替人判命中、外推真人、自己走都要知道。
+        if item_id == SIZE_DOWN_ITEM_ID:
+            self.shrunk_until = time.monotonic() + SIZE_DOWN_SECONDS
+            self.log(f"   缩小 座位 {seat_id} {SIZE_DOWN_SECONDS:g} 秒（碰撞圆 ×0.6）")
+            return
+        # ★★ 护盾（X_Mod §92）：收方 `OnHit` 见属性 1 整发不扣血，
+        #    服务端的血量台账跟着免伤 8 秒（bot 用的也走这里）。
+        if item_id == SHIELD_ITEM_ID:
+            quest.shield_until[int(seat_id)] = time.monotonic() + SHIELD_SECONDS
+            self.log(f"   护盾 座位 {seat_id} 撑 {SHIELD_SECONDS:g} 秒"
+                     f"（这段时间挨打不掉血，X_Mod §92）")
+            return
+        # ★★ 毒弹（X_Mod §93）：他这之后打出去的子弹，直接命中就让人中毒。
+        #    bot 的弹匣另记在 `magazine_attrs`（`_use_held_item`），这里只记真人。
+        if item_id == POISON_ITEM_ID and not self.is_bot_seat(seat_id):
+            quest.poison_magazine.add(int(seat_id))
+            self.log(f"   毒弹 座位 {seat_id} 挂上了（直接命中会让人中毒，X_Mod §93）")
+            return
         # ★★★ 反射护盾（§119）：和位置无关，记的是「谁、到什么时候」。
         #     bot 的弹体撞上有护盾的人要**弹开**，不是炸掉。
         if item_id in (REFLECT_ITEM_ID, TEAM_REFLECT_ITEM_ID):
@@ -9644,12 +9859,13 @@ class Conn:
                     seats = [i for i, s in enumerate(room.seats)
                              if s is not None and s.conn is not None
                              and s.team == mine]
-            doses = int(HP_CHARGE_SECONDS / HP_CHARGE_INTERVAL)
-            first = time.monotonic() + HP_CHARGE_INTERVAL
+            # ★ 记的是「属性 8 挂到什么时候」；怎么一滴滴回由 bot 那本台账
+            #   照客户端的节奏算（`bot._advance_hp_charges`，X_Mod §94）。
+            until = time.monotonic() + HP_CHARGE_SECONDS
             for seat in seats:
-                quest.hp_charges[seat] = [first, doses]
-            self.log(f"   HP 回复剂 座位 {seats}：{doses} 跳 × "
-                     f"{HP_CHARGE_AMOUNT} 点（Status.ini[8]）")
+                quest.hp_charges[seat] = until
+            self.log(f"   HP 回复剂 座位 {seats}：{HP_CHARGE_SECONDS:g} 秒里"
+                     f"每轮 {HP_CHARGE_AMOUNT} 点（夺分翻倍，Status.ini[8]）")
             return
         # ★★ 糊屏（10311）：和位置无关 —— 原版那道距离门用的是
         #    `Range=-1`，谁都罩不到（§121）。我们按用户的要求让它罩住
@@ -9722,6 +9938,13 @@ class Conn:
         if reported_seat != seat_id:
             self.log(f"   ⚠ 0x040d 报的是座位 {reported_seat}，"
                      f"但这条连接坐的是 {seat_id}；按 {seat_id} 转发")
+        # ★★ 毒弹的弹匣打完了（X_Mod §93）：他之后的子弹不再带毒。
+        #    `room.quest` 直接读、不走 `quest_state()` —— 那个懒惰分支会在
+        #    两局之间把 quest 凭空建回来（`on_use_item` 那段注释）。
+        room = self.lobby_room()
+        quest = None if room is None else room.quest
+        if attr_id == POISON_MAGAZINE_ATTR and quest is not None:
+            quest.poison_magazine.discard(int(seat_id))
         name = CHAR_ATTR_NAMES.get(attr_id, "未知属性")
         sent = self.battle_broadcast(
             build_game(OP_REMOVE_CHAR_ATTR,
@@ -9779,6 +10002,13 @@ class Conn:
             build_game(OP_ITEM_EFFECT,
                        build_item_effect(target_seat, item_id,
                                          arg2=amount, arg3=seat_id)))
+        # ★ 每台客户端收到这一发都会给目标回血，bot 那本血量台账跟着回（X_Mod §94）。
+        #   `room.quest` 直接读，理由同 `on_remove_char_attr`。
+        room = self.lobby_room()
+        quest = None if room is None else room.quest
+        if quest is not None:
+            quest.heal_events.append((item_id, int(target_seat), int(amount),
+                                      int(seat_id)))
         self.hearts_relayed += 1
         if self.hearts_relayed == 1 or VERBOSE:
             self.log(f"★ 座位 {seat_id} 让座位 {target_seat} 回 {amount} 点血"
@@ -9950,7 +10180,8 @@ class Conn:
                           f"（1=胜 / -1=负 / 0=不判）")
 
         # ---- ① 每个人先入账，并把「他那一份 0x0309 / 0x0411」备好 --------
-        results = {}     # 座位 -> 0x0309 的载荷
+        results = {}     # 座位 -> 0x0309 的载荷（发给房里别人的那份）
+        own_results = {}  # 座位 -> 发给**他本人**的那份 0x0309（多带数据栏四格，§141）
         end_games = {}   # 座位 -> (0x0411 的载荷, 日志用的数)
         rewards = {}     # 座位 -> [0x041c 的载荷…]（合成材料 + 称号卡片）
         # ★ 闯关的关卡 id / 难度：房里每个人读到的是同一份（`current_quest()`
@@ -9961,22 +10192,24 @@ class Conn:
         card_rules, card_cfg_warnings = shopcfg.cards()
         for warning in card_cfg_warnings:
             self.log(f"   ⚠ cards.json: {warning}")
-        # ★★ **这一局算不算成就**（成就防刷，V0.3.3 / D127）。房间级的一句话，
-        #    所以在座位循环**之前**判一次、记一行 —— 放进循环的话 bot 座位
-        #    也会各收一份（`settlement_seats()` 把 bot 也算进来）。
+        # ★★ **这一局算不算奖励**（防刷，V0.3.3 / D127，X_Mod D104 扩到经验金币）。
+        #    房间级的一句话，所以在座位循环**之前**判一次、记一行 —— 放进循环
+        #    的话 bot 座位也会各收一份（`settlement_seats()` 把 bot 也算进来）。
         #
         #    两个来源取或：**本局的闩**（开局那一刻 / 局中敲命令时记下的）
         #    ＋ **结算这一刻的实况兜底**。后者防的是「将来有人绕开那两处
         #    改了 bot 状态」—— 判据是实况，绕不过去。
-        card_room = self.lobby_room()
-        card_block = (quest.bot_limit_reason
-                      or bot_limit_reason_now(card_room, "结算时 "))
-        if card_block:
-            self.log(f"   成就判定: 本局不计成就 —— {card_block}"
-                     f"（本局战绩不进累计、不发称号卡片；"
-                     f"经验 / 金币 / 合成材料照发）")
+        #    ★ 闯关房两个来源都恒为 None（`bot.bot_limit_reason` 第一条就豁免，
+        #      X_Mod D104）⇒ 闯关一律走「计入」那一支，日志写的原因是「闯关房」。
+        room = self.lobby_room()
+        reward_block = (quest.bot_limit_reason
+                        or bot_limit_reason_now(room, "结算时 "))
+        if reward_block:
+            self.log(f"   奖励判定: 本局不计奖励 —— {reward_block}"
+                     f"（经验 / 金币 / 合成材料 / 称号卡片全不发，"
+                     f"战绩不进累计）")
         else:
-            self.log(f"   成就判定: 本局计入成就 —— {_bot_freedom_line(card_room)}")
+            self.log(f"   奖励判定: 本局计入奖励 —— {_bot_freedom_line(room)}")
         # ---- ①a 通关用时入账 + 破纪录判定（V0.3商店 §126 / §127）----------
         #
         # 房间级的一句话，所以在座位循环**之前**做一次 —— `note_clear()` 一次
@@ -10031,9 +10264,15 @@ class Conn:
             #    `score`，于是结算界面三行数一模一样、而且一局能给上千经验。
             #    分数栏仍然发本局分数，经验和金币各按自己的公式算。
             #    ★ 数值来自 `rewards.json`（管理页「金币 / 经验获取」，D72）——
-            #      对战那一路把 模式 / 道具战 / 组队战 一起传进去，八种组合各查
+            #      对战那一路把 模式 / 道具战 / 组队战 一起传进去，每种组合各查
             #      各的那一档；以前它们给的钱一模一样。
-            if quest_mode:
+            if reward_block:
+                # ★★ 本局不计奖励（X_Mod D104）：经验 / 金币 / 材料**一样都不给**，
+                #    连奖励表都不查、材料都不掷。以前（D127）这三样照发，结果
+                #    定住 bot 照样能刷经验刷钱（用户 2026-10-01）。
+                #    ★ 下面 `0x0309` / `0x0411` 跟着发 +0，结算界面上看得见。
+                gained_exp, gained_money, reward_warnings = 0, 0, []
+            elif quest_mode:
                 quest_id, difficulty = quest_info or (1, 1)
                 gained_exp, gained_money, reward_warnings = quest_reward(
                     quest_id, difficulty, score, seat_cleared)
@@ -10046,12 +10285,17 @@ class Conn:
             #    偶尔掉的，都在 `RoomQuest.claim_item()` 那一步按座位记好了。
             #    客户端的 1 / 5 累加只用于战局内浮字，不改持久账户余额；这里才把
             #    同一面额真正写进账号，所以不会重复入账。
+            #    ★ 不计奖励那一局捡到的也不入账（用户 2026-10-01 选的「全拦」）；
+            #      数还是取出来，只为结算日志里写清「捡了多少、没给」。
             picked_coins = quest.coins_of(seat)
-            gained_money += picked_coins
+            if not reward_block:
+                gained_money += picked_coins
             # ★★ 合成材料（V0.3商店 M6）。**每个人各掷各的** —— 同一局里
             #    两个人拿到的东西可以不一样，这是原版「合成素材」的手感（D4）。
             #    对战也掉（`drops.json` 里有 `mode=pvp` 的规则）。
-            if quest_mode:
+            if reward_block:
+                dropped, drop_warnings = {}, []
+            elif quest_mode:
                 quest_id, difficulty = quest_info or (1, 1)
                 dropped, drop_warnings = quest_materials(
                     quest_id, difficulty, seat_cleared)
@@ -10069,8 +10313,8 @@ class Conn:
                 quest, seat, won=seat_won, quest_mode=quest_mode, score=score)
             conn.log("   本局战绩 座位%d: %s" % (seat, _stats_line(gained_stats)))
             before_stats = account_store.battle_stats(conn.account)
-            if card_block:
-                # ★★ 本局不计成就（D127）：**累计一格都不动** —— 只拦发卡的话，
+            if reward_block:
+                # ★★ 本局不计奖励（D127）：**累计一格都不动** —— 只拦发卡的话，
                 #    「先在受限的房间里把累计攒满、再去干净房间打一局领卡」
                 #    这条路还开着（累计类条件占了一半，D111）。
                 after_stats = before_stats
@@ -10098,12 +10342,12 @@ class Conn:
             if VERBOSE and conn.account_name:
                 conn.vlog("   累计战绩 座位%d: %s"
                           % (seat, _totals_line(after_stats)))
-            if VERBOSE and conn.account_name and card_block:
-                # ★ 不计成就时**不去跑 `cards.explain()`** —— 那是把整张规则表
+            if VERBOSE and conn.account_name and reward_block:
+                # ★ 不计奖励时**不去跑 `cards.explain()`** —— 那是把整张规则表
                 #   真算一遍再拼几十行字符串，而结论已经定了。
-                conn.vlog("   ── 称号卡片判定 座位%d：本局不计成就（%s），"
+                conn.vlog("   ── 称号卡片判定 座位%d：本局不计奖励（%s），"
                           "%d 条规则全部跳过"
-                          % (seat, card_block, len(card_rules)))
+                          % (seat, reward_block, len(card_rules)))
             elif VERBOSE and conn.account_name:
                 conn.vlog("   ── 称号卡片判定 座位%d（这一局：%s）"
                           % (seat, _match_scope_line(stat_mode, quest_info)))
@@ -10125,13 +10369,12 @@ class Conn:
                         conn.account_name,
                         experience=gained_exp, money=gained_money,
                         materials=dropped,
-                        # ★ 不计成就那一局只掐掉这两样（D127）：存档层那句
-                        #   `if stats_mode and stats_gained:` 自己接得住，
-                        #   `apply_battle` 一个字都不用改。
-                        #   ★★ 上面三个（经验 / 金币 / 材料）**一个字不动** ——
-                        #      用户拍板：受限只影响成就。
-                        stats_mode=None if card_block else stat_mode,
-                        stats_gained=None if card_block else gained_stats,
+                        # ★ 不计奖励那一局战绩和卡片这两样在这儿掐（D127）：
+                        #   存档层那句 `if stats_mode and stats_gained:` 自己
+                        #   接得住，`apply_battle` 一个字都不用改。上面三个
+                        #   （经验 / 金币 / 材料）在前面就已经是 0 / 空了（D104）。
+                        stats_mode=None if reward_block else stat_mode,
+                        stats_gained=None if reward_block else gained_stats,
                         cards=give_cards, card_bases=card_bases)
                 except KeyError:
                     skipped = []
@@ -10162,13 +10405,25 @@ class Conn:
                                             for i, n in sorted(granted.items()))))
             experience = int((conn.account or {}).get("experience", 0))
             level_start_exp, next_level_exp = experience_bounds(experience)
+            balance = player_money(conn.account)
             #   · 业务值 9/10/11 = 界面上「经验值 / 金币 / 竞技场分数」三行的 +N
-            #     （§116）。闯关模式没有天梯分，第三格发 0。其余 9 个仍按 D019 填 0
-            #     —— §100 那次「12 个值一次全填」会让客户端 20 毫秒内断链。
+            #     （§116）。闯关模式没有天梯分，第三格发 0。
             results[seat] = build_rep_game_result(
                 seat,
                 values=build_game_result_values(experience=gained_exp,
                                                 money=gained_money),
+                tail=tail)
+            #   · ★★ 发给他**本人**的那份再带上右上角数据栏四格（X_Mod §141 / D100）：
+            #     客户端在「座位 == 我」时把线序 2/3/5/6 绝对赋值给数据栏，以前全 0
+            #     ⇒ 结算后他那台金币只剩本局所得，命用完点「是」直接回大厅就一直错着。
+            #     经验三件套和下面 `0x0411` 用同一组数，金币填「余额 − 本局所得」
+            #     （`0x0411` 紧接着 += 本局所得）。别人收到的这一座位照旧是上面那份。
+            own_results[seat] = build_rep_game_result(
+                seat,
+                values=build_game_result_values(
+                    experience=gained_exp, money=gained_money,
+                    data_bar=(experience, balance,
+                              level_start_exp, next_level_exp)),
                 tail=tail)
             # ★ 破纪录播报（§127）：没破的那一局两格都是 0 ⇒ `0x0411` 和本版
             #   之前**逐字节相同**。所以 `kind == 0` 时用时那格也要发 0，
@@ -10190,8 +10445,11 @@ class Conn:
                      f"{'完成/胜' if seat_cleared else '未完成'} "
                      f"-> 本局经验+{gained_exp} "
                      f"金币+{gained_money}"
-                     f"（固定 {gained_money - picked_coins} + 捡到 {picked_coins}）；"
-                     f"总经验={experience} (本级 {level_start_exp}..{next_level_exp})")
+                     + (f"（本局不计奖励，捡到的 {picked_coins} 也不入账）；"
+                        if reward_block else
+                        f"（固定 {gained_money - picked_coins} + 捡到 {picked_coins}）；")
+                     + f"总经验={experience} (本级 {level_start_exp}..{next_level_exp})；"
+                     f"余额={balance}")
 
         # ---- ② 再逐个连接下发 --------------------------------------------
         # ★ 不合并成一次 sendall：V0.1 单人时这两个包就是分开发的，实机验过
@@ -10209,10 +10467,13 @@ class Conn:
                     for payload in rewards[other_seat]:
                         conn.send(build_game(OP_REWARD_RECEIVED, payload))
                 # 结算界面的数据源，必须排在 0x0411 之前，且只能在 GameContext
-                # 还活着的时候发（§99）。每个在座座位一份。
+                # 还活着的时候发（§99）。每个在座座位一份；**他自己那个座位**
+                # 发带数据栏的那份（§141）。
                 for other_seat in sorted(results):
                     conn.send(build_game(OP_REP_GAME_RESULT,
-                                         results[other_seat]))
+                                         own_results[other_seat]
+                                         if other_seat == seat
+                                         else results[other_seat]))
                 # 0x0411 也是每座位一份，但**自己那份必须是第一发**
                 # （弹结算界面的是第一发，见上面的注释）。
                 for other_seat in end_game_order(seat, end_games):
@@ -10223,15 +10484,15 @@ class Conn:
                 continue
             conn.settled = True
             conn.quest_success = cleared
-        # ★★ 结算界面上也说一句「这一局没算成就」（用户 2026-09-15 第三轮）。
+        # ★★ 结算界面上也说一句「这一局没算奖励」（用户 2026-09-15 第三轮）。
         #
         #    ★ 排在结算三连发**之后**：结算界面是第一发 `0x0411` 弹出来的
         #      （`0x4913fc`），先发的话这行字落在还没弹出来的界面后面。
-        #    ★ 只在不计成就时说 —— 正常结算一个字都不发（用户点名）。
+        #    ★ 只在不计奖励时说 —— 正常结算一个字都不发（用户点名）。
         #    ★ 走房间级那一个，不是 `self.room_system_chat()`：结算的发起人
         #      可能是控制通道、也可能是替全场结算的别人（D127 ⑨）。
-        if card_block:
-            room_system_chat(card_room, "⚠ 本局开启过 bot 限制，不结算成就。")
+        if reward_block:
+            room_system_chat(room, "⚠ 本局开启过 bot 限制，不结算奖励。")
         reward_count = sum(len(payloads) for payloads in rewards.values())
         self.log(f"← 已结算本局：每人各收到 {reward_count} 份"
                  f" gspRewardReceived(0x041c，合成材料) + {len(results)} 份"
@@ -10564,7 +10825,7 @@ class Conn:
             # `GameContext::StartGame` 同一个口径（§180）——
             # 客户端就是在进 stage 7 的路上建它的。
             # ★ `new_room_quest()` 顺手记下**开局这一刻** bot 受不受限，
-            #   脏局还跟房里说一行（成就防刷，D127）。
+            #   脏局还跟房里说一行（防刷，D127 / X_Mod D104）。
             room.quest = new_room_quest(
                 room, [i for i, seat in enumerate(room.seats)
                        if seat is not None], announce=True)
@@ -11174,11 +11435,38 @@ class Conn:
                 self.sync_jump_ticks = self.sync_jump_ticks + (
                     (ticks, self.sync_jumped or 1),)
             return
+        if opcode in (PEER_OP_DASH, PEER_OP_JAB, PEER_OP_MUTU_SKILL, PEER_OP_SPLASH_DAMAGED):
+            # ★ 冲刺 / 出拳在他那台**逻辑帧网格**上的位置（X_Mod §113），和 rpJump 同一个道理：同一台机器、
+            #   同一条有序流，到达时刻之差就是发出时刻之差，按 32 ms 数一下就是离最近那发心跳第几帧。
+            #   记成「那一帧的到达时刻」—— bot 外推他冲刺时，和每一发心跳的到达时刻一比就知道那一发里
+            #   已经冲了几帧（`bot._human_melee_step`）。
+            #   格斗招式 `0x0016` 和他招式打中人那发 `0x0004`（顿帧）同一个口径（`sync_event_grid`，X_Mod §121）。
+            if self.sync_trail_at is None:
+                grid = now
+            else:
+                grid = self.sync_trail_at + roomclock.TICK_S * int(
+                    round((now - self.sync_trail_at) / roomclock.TICK_S))
+            self.sync_event_grid = grid
+            if opcode in (PEER_OP_DASH, PEER_OP_JAB):
+                self.sync_melee_grid = grid
+                return
+            if opcode == PEER_OP_SPLASH_DAMAGED:
+                return
         if opcode == PEER_OP_CROUCH:
             # ★ 蹲是**状态**不是事件（和 rpJump 相反）：`rpCrouch` 只在按下 /
             #   松开那一下各来一发，中间全靠这边记着（V0.3 §41）。
             if len(payload) >= udpsync.PEER_HEADER_SIZE + 2:
                 self.sync_crouch = bool(payload[udpsync.PEER_HEADER_SIZE + 1])
+            return
+        if opcode == PEER_OP_GUARD:
+            # ★ 格挡同蹲，是**状态**（X_Mod §95）：他那台在「踩地 + 按着键 + 没被打破」
+            #   变了的时候才发（`0x4958eb`），体力耗尽由他那台发一发「关」（`0x507102`）。
+            if len(payload) >= udpsync.PEER_HEADER_SIZE + 2:
+                self.note_guard(bool(payload[udpsync.PEER_HEADER_SIZE + 1]), now)
+            return
+        if opcode == PEER_OP_MUTU_SKILL:
+            # 出招清格挡开关（`0x50a674`），计时器不动 —— 和 `note_guard` 不是一回事。
+            self.sync_guard = False
             return
         if opcode == PEER_OP_LOAD_PROGRESS:
             # 加载进度不带坐标，但它现在还是一个关键**事件**：
@@ -11215,6 +11503,34 @@ class Conn:
         #   `rpJump` 先到）—— 外推那份马上就要被硬置成它，欠着的到此为止，
         #   再补一次就变成跳两下（§173）。
         self.sync_jump_ticks = ()
+
+    def note_guard(self, on, now):
+        """收到他的 `rpGuard`：照收方 `SetGuard`（`0x502dae`）记一份（X_Mod §95）。
+
+        开关照包里写；过渡计时器**没在跑才起**（`0x502dd7` 先问 `0x5d5eb0`）。
+        3 格之内连翻两次，第二次不重起 —— 于是剩下那几格里「开关 XOR 在跑」是反的，
+        原版就这样。
+        """
+        self.sync_guard = bool(on)
+        if not self.guard_switching(now):
+            self.sync_guard_switch_at = now
+
+    def guard_switching(self, now):
+        """格挡开关的过渡计时器此刻还在跑吗（`0x5d5eb0`，3 个逻辑帧）。"""
+        at = self.sync_guard_switch_at
+        return at is not None and now - at < GUARD_SWITCH_S
+
+    def guarding(self, now):
+        """别人那台（射手）此刻判他**在挡**吗 —— `0x50a0ea` 的三道门（X_Mod §95）。
+
+        ① `[+0x2b7]`（体力耗尽、打破了）只在**他自己那台**置位（`0x5070fb` 前面是 `IsMine`），
+           别的机器上恒 0，他那台会另发一发「关」—— 这里不用管；
+        ② 蹲着（`[+0x2b5]`，`rpCrouch`）不算在挡；
+        ③ 开关 XOR 过渡计时器在跑。
+        """
+        if self.sync_crouch:
+            return False
+        return bool(self.sync_guard) != self.guard_switching(now)
 
     def sync_peer_epoch(self, payload):
         """局号一变就把排序闸门里的**事件计数**归零（`udpsync` 铁律 3）。
@@ -11734,7 +12050,9 @@ class Conn:
         `0x0203`（客户端方向）只有一个发送点 `0x406191`，四个调用方共用：
 
         * `0x46739c` —— RoomStage 的「90 秒没动作」提示框弹完顺手发的
-        * `0x4a50f4` / `0x4a5a85` —— 房间里的退出/ESC
+        * `0x4a50f4` —— **战斗里**命用完的确认框「要结束游戏并移动至游戏大厅吗?」点确认
+        * `0x4a5a85` —— **战斗里**闯关 15 秒不往前走自动退房
+          （这两处 V0.1 §101 记成「房间里的退出/ESC」，X_Mod §141 订正）
         * `0x54be4c` —— 网络层的状态处理
 
         也就是说**「挂机踢出」和「玩家自己退房」发的是同一个空包**，
@@ -11743,7 +12061,20 @@ class Conn:
         不回的后果（会话 12 实测）：客户端留在房间里，`RoomStage::Update`
         每 90 秒重新弹一次提示框，弹出来的框一个摞一个 ——
         用户看到的就是「点确认没反应、关不掉」。
+
+        ★★ **结算后没走 `0x0405` 就退房**（X_Mod §141 / D100）：命用完时客户端弹
+        「要结束游戏并移动至游戏大厅吗?」（函数 `0x4a4fd3`，发送点即上面的 `0x4a50f4`），
+        结算到了之后才点「是」就直接发这一发 —— 看完结算那条路
+        （`leave_game_result` 补 `0x0600`）被跳过了。所以 `settled`
+        （结算包已经发给他、他还没回房间）时先补一发 `0x0600`，把金币 / 经验 /
+        **等级**一起和存档对齐（那一局升了级的话，`0x0309` 的数据栏四格管不到等级）。
+        排在 `0x0203` 回包**前面**：`0x0600` 的处理器 `0x553855` 只写全局、不碰
+        任何场景对象，先到先写 ⇒ 大厅建出来时数据栏已经是新值。TCP 本身保序，
+        不用 `send_batch`。
         """
+        if self.settled:
+            self.send_rep_money(
+                reason="（结算后没走 0x0405 就退房，数据栏在这儿和存档对齐，§141）")
         self.log("← 回 gspRepLeaveSession(result=0) —— 离开房间，客户端切回大厅")
         self.send(build_game(OP_LEAVE_SESSION, build_rep_leave_session(0)))
         # 房间没了，跟房间绑定的状态全部作废，否则下次建房会带着上一局的残留。
@@ -11758,9 +12089,11 @@ class Conn:
     def leave_game_result(self):
         """结算界面看完了：切回房间，再把玩家数据栏刷成存档里的值。
 
-        ★ **回房间后金币会变成 0**（会话 11 实测，§100）—— 经验和等级都还在，
-        唯独金币这一格被清掉。补一发 `0x0600` 就好了，顺带也让经验/等级和存档
-        重新对齐一次。
+        ★ 补一发 `0x0600` 让数据栏（金币 / 经验 / 等级）和存档再对齐一次。
+        当年（会话 11，V0.1 §100）看到的「回房间后金币变成 0」其实不是回房间
+        清的：是 `0x0309` 线序第 3 格被我们填 0、客户端绝对赋值（X_Mod §141）。
+        那一格现在填了真值（D100），这一发留着兜底 —— 等级只有它下发绝对值。
+        ⚠ 这一发**不一定来**：结算后直接 `0x0203` 退房的，由 `leave_session` 补。
 
         座位的物品清单也顺手补一发 `0x030b`（★ **每个有人的座位各一发**，
         §63 —— 别人那几格和自己那一格同样会被清）。这一发是**防御性**的：
@@ -11777,7 +12110,7 @@ class Conn:
         with self.send_batch("；回房间三连发不能被客户端的 recv 切开"):
             self.log("← 回 0x0403（结算看完 -> 切回 stage 5 房间）")
             self.send(build_game(OP_LOADING_DONE, b""))
-            self.send_rep_money(reason="（回房间后金币会被清 0，重新同步）")
+            self.send_rep_money(reason="（回房间，数据栏和存档再对齐一次）")
             self.send_room_equipped_lists(
                 reason="（回房间后清单会被重建，重新同步）")
         # 回到房间就可以再开一局，把开局状态机和本局的关卡状态复位。
@@ -13162,7 +13495,7 @@ def _match_scope_line(stat_mode, quest_info):
 
 
 def _bot_freedom_line(room):
-    """「本局计入成就」那一行的**正面**理由（成就防刷，D127）。
+    """「本局计入奖励」那一行的**正面**理由（防刷，D127 / X_Mod D104）。
 
     ★ 用户 2026-09-15 点名要的：「每局 log 里需要写清楚计算或不计算的原因，
     方便日后排查」—— 所以计入的那一局也得说清是凭什么计的，
@@ -13173,6 +13506,10 @@ def _bot_freedom_line(room):
     """
     if room is None:
         return "不在房间里（单人 / 协议试探）"
+    if room.session_type == SESSION_TYPE_QUEST:
+        # ★ 排在「有没有 bot」前面（X_Mod D104）：闯关房凭的是这一条 ——
+        #   房里的 bot 这会儿就算定着，也照样计，下面那句「全程自由」就成了假话。
+        return "闯关房（bot 是队友，受不受限都照常计）"
     seats = room.bot_seats()
     if not seats:
         return "房里没有 bot"

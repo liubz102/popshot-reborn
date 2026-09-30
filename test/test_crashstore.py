@@ -25,7 +25,18 @@ import unittest
 import account_store
 import config as server_config
 import crashstore
+import sevenzip
 from web import server as web_server
+
+
+class PackageSuffixTests(unittest.TestCase):
+    """X17：收到的包存成什么扩展名，看开头的魔数。"""
+
+    def test_the_magic_decides(self):
+        self.assertEqual(".7z", crashstore.package_suffix(sevenzip.SIGNATURE + b"\x00\x04"))
+        self.assertEqual(".zip", crashstore.package_suffix(b"PK\x03\x04"))
+        self.assertEqual(".zip", crashstore.package_suffix(bytes(64)))
+        self.assertEqual(".zip", crashstore.package_suffix(b"7z"))          # 太短：认不出就照旧
 
 
 class CheckIdTests(unittest.TestCase):
@@ -337,13 +348,34 @@ class UploadEndpointTests(unittest.TestCase):
         self.assertEqual("09/09/26, 01:36:42", receipt["crash_time_text"])
 
     def test_the_zip_is_stored_byte_for_byte_and_not_unpacked(self):
-        body = os.urandom(4096)
+        body = b"\0" + os.urandom(4095)                # 不是 7z 签名开头 ⇒ 照旧 .zip
         self.post("abc_a1b2c3d4_20260909-013642", body=body)
         self.settle()
         path = os.path.join(self.dir, "abc_a1b2c3d4_20260909-013642",
                             "abc_a1b2c3d4_20260909-013642.zip")
         with open(path, "rb") as fp:
             self.assertEqual(body, fp.read())
+
+    def test_a_7z_from_a_new_client_is_stored_as_7z(self):
+        """X17：新客户端传 7z，按魔数存成 `.7z`（同样原样、不解包）。"""
+        body = sevenzip.SIGNATURE + b"\x00\x04" + os.urandom(2000)
+        status, got = self.post("abc_a1b2c3d4_20260909-013642", body=body,
+                                headers={"Content-Type": "application/x-7z-compressed"})
+        self.assertEqual(200, status, got)
+        self.settle()
+        target = os.path.join(self.dir, "abc_a1b2c3d4_20260909-013642")
+        self.assertEqual(["abc_a1b2c3d4_20260909-013642.7z", "receipt.json"],
+                         sorted(os.listdir(target)))
+        with open(os.path.join(target, "abc_a1b2c3d4_20260909-013642.7z"), "rb") as fp:
+            self.assertEqual(body, fp.read())
+
+    def test_the_bytes_decide_not_the_content_type(self):
+        # 头说 7z、内容是 zip（或者反过来）：按内容存 —— 头是客户端随口说的。
+        self.post("abc_a1b2c3d4_20260909-013642", body=b"PK\x03\x04zip",
+                  headers={"Content-Type": "application/x-7z-compressed"})
+        self.settle()
+        self.assertIn("abc_a1b2c3d4_20260909-013642.zip", os.listdir(
+            os.path.join(self.dir, "abc_a1b2c3d4_20260909-013642")))
 
     def test_malicious_ids_are_refused_and_nothing_is_created(self):
         for crash_id in CheckIdTests.BAD:

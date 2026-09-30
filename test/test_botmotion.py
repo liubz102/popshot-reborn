@@ -51,8 +51,9 @@ class MotionConstraintTests(TerrainMixin, BotFrameRoom):
         self.terrain = synth_terrain('bsm_constraint')
         self.install_terrain(self.terrain)
         self.human_heartbeat(self.alice, 300, 150, ticks=0)
-        self.bot_conn.body = botmove.Body(310.75, 150)
-        self.bot_conn.battle_pos = (310.75, 150)
+        # 客户端的脚在实心第一行（150）的上面一行（X_Mod §105）。
+        self.bot_conn.body = botmove.Body(310.75, 149)
+        self.bot_conn.battle_pos = (310.75, 149)
 
     def incoming(self, op, body, seq=1):
         packet = botsync.build_peer_packet(self.alice.my_seat, op, body,
@@ -72,7 +73,7 @@ class MotionConstraintTests(TerrainMixin, BotFrameRoom):
         action = self.alice.motion_action
         bot._apply_motion_constraint(self.room, self.bot_conn, self.terrain, action[1] - .001)
         self.assertEqual(335.75, self.bot_conn.body.x)
-        self.assertEqual(150, self.bot_conn.body.y)
+        self.assertEqual(149, self.bot_conn.body.y)
         bot._apply_motion_constraint(self.room, self.bot_conn, self.terrain, action[1])
         self.assertIsNone(self.bot_conn.motion_constraint)
 

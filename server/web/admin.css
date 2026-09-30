@@ -967,8 +967,79 @@ code {
 .backup-status { white-space: pre-line; margin: 0 0 12px; line-height: 1.7; }
 
 /* ------------------------------------ 下载日志弹窗（用户 2026-09-17，D131） */
-/* 只读弹窗，照「等级经验对应表」那一窗的壳；尺寸按内容长，别继承选择器那 640px。 */
-.modal .panel.logs-panel { width: min(680px, 100%); height: auto; max-height: 100%; }
+/* X17（2026-09-30，D101）起是两栏：左边「要打包的」、右边「待下载 7z 包」，照「发送记录」
+   （#historyModal）那一窗的写法 —— 身子不滚、两栏各自滚；格式条钉在顶上。 */
+.modal .panel.logs-panel { width: min(1100px, 100%); height: min(760px, 100%); }
+#logsModal .panel-body {
+  flex: 1 1 auto; min-height: 0; overflow: hidden;
+  display: flex; flex-direction: column;
+}
+/* 顶上的格式条：「格式 [zip | 7z]」+ 一行说明（`.seg` 只有在 `.toolbar` 里才连成一段）；
+   选 7z 时同一块里再一行「压缩等级 [低 | 高]」（D102）。
+   ★ 网格三列（标签 / 分段钮 / 小字），不用 `.toolbar` 的 flex 折行：两行的分段钮落在同一列、
+     撑成一样宽 —— 左右两边都对齐（用户 2026-09-30）。
+   ★ 标签列**固定**是最长那个标签（「压缩等级」四个字 = 4em）的宽度：按内容撑的话选 zip 时第二行
+     没了、这一列缩回「格式」两个字宽，开关跟着左右跳（用户 2026-09-30：要固定间距，不随切换变）。 */
+.logs-bar {
+  flex: 0 0 auto; margin-bottom: 12px;
+  display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 8px 10px;
+}
+.logs-bar-lab { min-width: 4em; font-size: 13px; font-weight: 700; color: var(--cocoa-soft); }
+.logs-bar-hint { margin: 0; font-size: 12px; }
+.logs-bar .seg { justify-self: stretch; }
+.logs-bar .seg button.cat { flex: 1 1 0; }
+/* 锁住的 7z（这台 Python 没有 lzma）：长得像 disabled，但 title 照样弹得出来。 */
+.toolbar .seg button.cat[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
+.logs-cols { flex: 1 1 auto; min-height: 0; display: flex; gap: 14px; }
+.logs-left {
+  flex: 1 1 auto; min-width: 0; overflow-y: auto; scrollbar-gutter: stable;
+}
+/* 左栏整体会滚，崩溃包清单就别再自己套一层滚动了。 */
+.logs-left .logs-list { max-height: none; overflow: visible; }
+.logs-left .logs-group:last-of-type { margin-bottom: 8px; }
+/* 右栏「待下载 7z 包」：一张卡片，标题行钉住、条目自己滚。 */
+.logs-shelf {
+  flex: 0 0 380px; min-width: 0; margin-bottom: 0;
+  display: flex; flex-direction: column;
+}
+.logs-shelf .logs-head { flex: 0 0 auto; }
+.logs-shelf-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
+.logs-shelf-list .list-empty { padding: 24px 14px; }
+.shelf-item { padding: 9px 12px; border-top: 1px dashed var(--line); }
+.shelf-item:first-child { border-top: 0; }
+.shelf-top { display: flex; align-items: center; gap: 8px; }
+.shelf-top .kind { margin-left: auto; }
+.shelf-label { font-weight: 600; }
+.shelf-file { font-size: 12px; color: var(--cocoa-soft); }
+.shelf-line { display: flex; align-items: center; gap: 8px; margin-top: 5px; }
+.shelf-bar { flex: 1 1 auto; }
+.shelf-line .btn-sm { white-space: nowrap; }
+.shelf-acts { margin-left: auto; display: flex; gap: 6px; }
+.shelf-error { flex: 1 1 auto; color: var(--crimson); font-size: 12px; overflow-wrap: anywhere; }
+.shelf-note { margin: 8px 12px; }
+/* 状态徽标（和备份页「类型」徽标同一身，颜色也只用现成的三个）：压缩中 = 琥珀、排队 = 棕、失败 = 绯红。 */
+.kind.packing { background: var(--amber-dark); }
+.kind.queued { background: var(--cocoa-soft); }
+.kind.failed { background: var(--crimson); }
+/* 窄屏：两栏改上下排，整个身子一起滚。 */
+@media (max-width: 860px) {
+  #logsModal .panel-body { overflow-y: auto; }
+  .logs-cols { flex-direction: column; flex: 0 0 auto; }
+  .logs-left, .logs-shelf-list { overflow: visible; }
+  .logs-shelf { flex: 0 0 auto; }
+}
+/* 手机那么窄：一行里「标签 / 数字 / 钮」挤不下 —— 数字换到标签底下，标题行允许折行。 */
+@media (max-width: 560px) {
+  /* 格式条：小字挤不进第三列 —— 各自折到自己那一行底下占满整行，分段钮照旧上下对齐。
+     ★ 列模板别改成 `auto auto`：没有 fr 列时空余宽度会平分给两个 auto 列，分段钮被拉成半屏宽。 */
+  #logsModal .logs-bar-hint { grid-column: 1 / -1; }
+  #logsModal .logs-row { grid-template-columns: minmax(0, 1fr) auto; }
+  #logsModal .logs-row > .logs-meta { grid-column: 1; grid-row: 2; white-space: normal; }
+  #logsModal .logs-row > .btn { grid-column: 2; grid-row: 1 / span 2; }
+  #logsModal .logs-head { flex-wrap: wrap; }
+  #logsModal .logs-head .logs-meta { margin-left: 0; }
+  .shelf-line { flex-wrap: wrap; }
+}
 .logs-note { margin: 0 0 12px; }
 /* 一个目录一张卡片：白底 + 分隔线色描边，和「发送记录」列表同一身。 */
 .logs-group {

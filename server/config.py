@@ -6,7 +6,7 @@
 差异只体现在「哪一边读哪几个键」上：
 
     客户端包  server_address / server_register_port  -> 选「远程服务器」时连谁、注册页在哪
-              proxy_*                                -> 远程 TCP 连接是否经代理
+              proxy_*                                -> 远程连接是否经代理（TCP；socks5 时 UDP 也经）
               local_register_port                    -> 「本机服务器」的注册页监听哪个端口
     服务端包  local_register_port                    -> 注册页监听哪个端口
 
@@ -563,9 +563,12 @@ server_register_port = 27810
 # 远程服务器代理（可选）。代理地址留空、删掉 proxy_address 这一行，或沿用没有
 # proxy_* 的旧配置文件时，都会【直接连接】，不使用代理。
 #
-# 代理只影响登录界面选择「远程服务器」后的三条游戏 TCP 连接（认证 / 游戏 /
-# 战斗中继），不影响「本机服务器」。注册链接由浏览器打开，是否走代理由浏览器或
-# 系统自己的代理设置决定。
+# 代理只影响登录界面选择「远程服务器」之后的连接，不影响「本机服务器」：
+#   * 三条游戏 TCP 连接（认证 / 游戏 / 战斗中继）—— socks5 和 http 代理都能转；
+#   * 位置数据的 UDP 通道 —— 只有 socks5 代理能转（走 UDP ASSOCIATE，代理那边要
+#     开着 UDP 转发）；http 代理转不了 UDP，位置数据会自动回退到 TCP，能玩但网络
+#     不稳定时会比较卡。
+# 注册链接由浏览器打开，是否走代理由浏览器或系统自己的代理设置决定。
 #
 # proxy_type 支持 socks5 和 http（HTTP CONNECT）；代理地址支持 IPv4 / IPv6 / 域名。
 # IPv6 地址请写成 proxy_address = 2001:db8::2 或 [2001:db8::2]。
@@ -677,7 +680,7 @@ backup_keep_days = 7
 #
 #   上传的内容：game_patched\\Dump\\ 里【这一次】的崩溃报告和内存转储、
 #               BigShot.rpt 的【最后一段】、game_patched\\Debug\\ 当天的日志、
-#               以及 logs\\ 里本次运行的日志。压缩后通常 10 MB 上下。
+#               以及 logs\\ 里本次运行的日志。打成 7z 后通常几 MB 到十几 MB。
 #   ⚠ 内存转储是游戏进程当时的内存快照，理论上可能含有你刚输入的内容
 #     （包括密码）。它只会发给你自己在上面那行 server_address 里填的服务器。
 #     不想传就把这里改成 0 —— 崩溃现场仍然会留在你自己电脑的 game_patched\\Dump\\ 里。

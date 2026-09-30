@@ -1488,7 +1488,7 @@ function renderToolbar(which) {
   if (!FILTER[which]) { FILTER[which] = emptyFilter(); }
   var filter = FILTER[which];
 
-  // ★ 「金币 / 经验获取」页没有筛选条（D72）：档位固定 30 格，一屏就画完了，
+  // ★ 「金币 / 经验获取」页没有筛选条（D72）：档位固定 32 格，一屏就画完了，
   //   搜什么、筛什么都没有意义。工具条上只留下面那个「↻ 刷新」。
   //   金币 / 经验的切换在下一行（`paintCfgTabs`），不挤在这儿。
   // ★ 称号卡片页 2026-09-13 第四轮也把筛选条清空了（用户点的题）：
@@ -3348,8 +3348,8 @@ function cardCondFix(cond, wasMetric) {
 
 /* -------------------------------------------- 金币 / 经验获取：两张表格
    用户 2026-09-10 点的题（D72）：
-     · 第一张 = 对战模式（生存 / 夺分 × 道具战）× 个人战 / 组队战，格子里
-       填输 / 赢各给多少；
+     · 第一张 = 对战模式（生存 / 夺分 × 道具战，外加没有道具战的格斗 ——
+       X_Mod D103）× 个人战 / 组队战，格子里填输 / 赢各给多少；
      · 第二张 = 闯关的 7 个关卡 × 简单 / 普通 / 困难，格子里填未通关 / 通关。
    顶上「金币 / 经验」一切换，同两张表换填另一对字段 —— 行列不变，
    人不用重新找位置。经验那一半下面多两个加成系数的输入框。
@@ -3588,11 +3588,22 @@ function renderRewards(list, entries) {
   var teams = rewardOptions("team").map(function (option) {
     return {label: option.label, key: option.value};
   });
+  // ★ 哪几行有格子照服务端的默认表（`CAT.reward_defaults`），不在这儿写死：
+  //   格斗模式没有道具战（客户端强制无道具，服务端 `lobby.item_mode_of`
+  //   同口径），默认表里就没有那两档 ⇒ 这里也不画「格斗模式道具战」那一行
+  //   —— 画出来就是一行永远填不进去的「—」（X_Mod D103）。
+  var drawn = {};
+  (CAT.reward_defaults || []).forEach(function (row) {
+    if (row.mode === "pvp") {
+      drawn[[row.pvp_mode, row.item_mode ? 1 : 0].join("|")] = true;
+    }
+  });
   var pvpRows = [];
-  // ★ 行序照用户写的：生存 / 夺分 / 生存道具战 / 夺分道具战
-  //   —— 先按「有没有道具」分两批，每批里按模式排。
+  // ★ 行序照用户写的：生存 / 夺分 / 生存道具战 / 夺分道具战，格斗（X_Mod D103）
+  //   接在夺分后面 —— 先按「有没有道具」分两批，每批里按 `PVP_MODE_ZH` 的顺序排。
   [false, true].forEach(function (itemMode) {
     rewardOptions("pvp_mode").forEach(function (mode) {
+      if (!drawn[[mode.value, itemMode ? 1 : 0].join("|")]) { return; }
       pvpRows.push({
         label: mode.label + (itemMode ? "道具战" : ""),
         entryOf: function (group) {
@@ -4346,29 +4357,54 @@ async function refreshBackups() {
 }
 
 /* ======================================================================
-   下载日志弹窗（用户 2026-09-17，D131）
+   下载日志弹窗（用户 2026-09-17，D131；X17 2026-09-30 加 7z，D101）
 
-   「数据管理」页工具条上「⇩ 下载日志」点开的**只读**弹窗：两个目录（`logs/` /
-   `logs_client_crash/`）各一张卡片，数字全部来自 `/admin/api/logs`，页面里不留
-   静态副本；下载钮点下去就是一个 `<a href download>`，zip 由服务端**边打包边发**
-   （chunked），浏览器自己的下载栏管进度。
+   「数据管理」页工具条上「⇩ 下载日志」点开的弹窗。三块：
+   · 顶上工具条：格式「zip | 7z」二选一（`.toolbar .seg`，D72b 那种连在一起的分段钮）+ 一行说明；
+     选 7z 时同一块里再一行「压缩等级 [低 | 高]」+ 小字内存估算（用户 2026-09-30，D102；默认按服务器内存），
+     两行的分段钮上下对齐（网格排版，见 admin.css `.logs-bar`）；
+   · 左栏：两个目录（`logs/` / `logs_client_crash/`）各一张卡片，数字全部来自 `/admin/api/logs`；
+     zip 时是米黄「下载…」（点下去服务端边打包边发，D131 原样），7z 时换成金色「压缩…」
+     （按下去会在服务器上生成一个文件 —— 和备份页「立即备份」同一档，D40a / D97f）；
+   · 右栏「待下载 7z 包」（用户 2026-09-30 定的字）：服务器 `logs_7z/` 里压好的（下载 / 删除）
+     + 还在排队 / 压缩中的（进度条）+ 失败的（原因 + 删除）。不管选哪个格式都显示。
 
+   ★ 进度靠**长轮询**（铁律 10）：右栏还有活、弹窗开着、没有请求在路上 ⇒ 发一发
+     `/admin/api/logs/archives?since=版本`，服务端版本一变（进度走一格 / 压完 / 失败）才回；
+     回来就重画、再看要不要接着等。没有间隔常数，也不自动重试（网络断了没有事件告诉我们「好了」）。
+   ★ 每开一次弹窗一份新的 `LOGS`：关掉之后才回来的包按「`LOGS` 还是不是它」丢掉。
    ★ 下载前先重取一次 overview（`loadLogs()`）：既把数字刷成最新的，也顺手当一次
      会话检查 —— 会话过期时 `bounced()` 会把人踢回登录页，而不是让 `<a download>`
      去下一个 401 的 JSON（Chromium 对 4xx 不落盘、只在下载栏里写「失败」，但那句
      「失败」没人看得懂）。
-   ★ 不用 `fetch → blob → createObjectURL`：整份 zip 会先进浏览器内存，几百 MB 的
+   ★ 不用 `fetch → blob → createObjectURL`：整份包会先进浏览器内存，几百 MB 的
      全量日志直接把标签页撑爆；也不用 `location.href =`，出错时会整页跳成一段 JSON。
    ★ `a.download` 留空 —— 同源时 `Content-Disposition` 里的文件名优先，两头都写等于
      埋一个「以后改名只改一半」的坑。
-   ★ 弹窗内所有下载钮都是米黄 `.btn.btn-sm`：下载是只读动作，没有「主钮」；
-     金色留给「按下去就改东西」的那一颗（D40a / D97f 的语言）。
    ====================================================================== */
 
-var LOGS = null;              // {data, busy} —— 弹窗开着时非 null
+var LOGS = null;              // {data, archives, busy, polling, pollError} —— 弹窗开着时非 null
+//: 格式（X17）：页面不刷新就一直记着；服务器压不了 7z（`data.sevenzip` 假）时按 zip 算。
+var LOGS_FORMAT = "7z";
+//: 7z 的压缩等级（用户 2026-09-30，D102）：`null` = 这次进系统还没自己选过 → 跟服务端按服务器内存
+//  给的默认（`data.sevenzip_level.default`）。★ 关弹窗**不**清（用户要「关掉保持」）；
+//  进系统才清回 null —— 登录、刷新页面都走 `showLoggedIn`（用户定：刷新也算重新进系统）。
+var LOGS_LEVEL = null;
+//: 分段钮从左到右；钮上的字（「低」「高」）和内存估算都来自服务端（`sevenzip.LEVELS`）。
+var LOGS_LEVELS = ["low", "high"];
+
+var LOGS_HINT = {
+  zip: "zip：点下去浏览器马上开始下载，服务器边压边传；体积比 7z 大，下载栏里看不到总大小。",
+  "7z": "7z：体积约为 zip 的 1/3。先在服务器上压好（右边看进度），压好后在右边点「下载」；"
+    + "要用 7-Zip 之类的工具解开（Windows 11 自带的也行）。"
+};
+var LOGS_LEVEL_HINT = {
+  low: "压得快，包大一些",
+  high: "包更小，压得慢一些"
+};
 
 async function openLogsModal() {
-  LOGS = {data: null, busy: false};
+  LOGS = {data: null, archives: null, busy: false, polling: false, pollError: false};
   var body = $("logsBody");
   body.textContent = "";
   body.appendChild(el("div", "list-empty", "读取中……"));
@@ -4382,19 +4418,50 @@ function closeLogsModal() {
   $("logsBody").textContent = "";
 }
 
-/** 重取两个目录的数字。返回「拿到了没」。 */
+/** 重取两个目录的数字 + 右栏快照。返回「拿到了没」。 */
 async function loadLogs() {
-  if (!LOGS) { return false; }
+  var state = LOGS;
+  if (!state) { return false; }
   var result = await api("/admin/api/logs");
   if (bounced(result)) { return false; }
-  if (!LOGS) { return false; }                 // 等回包期间弹窗被关了
+  if (LOGS !== state) { return false; }        // 等回包期间弹窗被关了 / 重开了
   if (!result.ok) {
     toast((result && result.message) || "读不到日志目录", false);
     return false;
   }
-  LOGS.data = result;
+  state.data = result;
   renderLogs();
+  adoptArchives(result.archives);
   return true;
+}
+
+/** 这次按哪个格式算：服务器压不了 7z 就只剩 zip。 */
+function logsFormat() {
+  return (LOGS && LOGS.data && LOGS.data.sevenzip) ? LOGS_FORMAT : "zip";
+}
+
+/** 这次压 7z 用哪一档：这次进系统自己选过就用选的，没选过跟服务端给的默认（按服务器总内存）。
+    `data` = `/admin/api/logs` 的回包（能压 7z 时一定带 `sevenzip_level`）。 */
+function logsLevel(data) {
+  return LOGS_LEVEL || data.sevenzip_level["default"];
+}
+
+/** 「压缩」那一发的请求体：左栏那一行的 `{kind, scope, sub}` + 这次的压缩等级。 */
+function archiveRequest(what, data) {
+  return {kind: what.kind, scope: what.scope, sub: what.sub, level: logsLevel(data)};
+}
+
+/** 「压缩等级」那一行的小字：所选那一档 + 这台服务器的内存（默认档就是按它选的）。
+    ★ 数字全来自服务端（`logshelf.level_info`），这里只拼句子 —— 估算改了不用两头改。 */
+function logsLevelHint(info, level) {
+  var spec = info.levels[level];
+  var text = spec.label + "：≈ " + spec.like + "，" + LOGS_LEVEL_HINT[level]
+    + "；压缩时服务器约多占 " + spec.memory_text + " 内存。";
+  if (info.memory_text) {
+    return text + "这台服务器内存 " + info.memory_text + "，低于 " + info.low_memory_text
+      + " 时默认选「" + info.levels.low.label + "」。";
+  }
+  return text + "查不到这台服务器的内存大小，默认选「" + info.levels[info["default"]].label + "」。";
 }
 
 /** 一张卡片：标题行（名字 + 目录 + 合计）。行由 `logsRow` 往里加。 */
@@ -4419,13 +4486,19 @@ function logsRow(host, label, meta, button) {
   return row;
 }
 
-function logsButton(text, files, query, label) {
-  var button = el("button", "btn btn-sm", text);
+/** 左栏一行的钮：zip 时米黄「下载…」，7z 时金色「压缩…」。`what` = `{kind, scope, sub}`。 */
+function logsAction(zipText, sevenText, files, what, label) {
+  var zip = logsFormat() === "zip";
+  var button = el("button", zip ? "btn btn-sm" : "btn btn-sm btn-primary",
+                  zip ? zipText : sevenText);
   if (!files) {
     button.disabled = true;                    // 没东西可打（服务端那头也会回 404）
-    button.title = "没有可下载的文件";
+    button.title = "没有可打包的文件";
+  } else if (zip) {
+    button.onclick = function () { downloadLogs(what, label); };
   } else {
-    button.onclick = function () { downloadLogs(query, label); };
+    button.title = "在服务器上压成 7z，右边「待下载 7z 包」里看进度，压好了再下载";
+    button.onclick = function () { compressLogs(what, label); };
   }
   return button;
 }
@@ -4434,34 +4507,85 @@ function tallyText(tally) {
   return tally.files + " 个文件 · " + tally.size_text;
 }
 
+/** 顶上的格式条：「格式 [zip | 7z]」+ 一行说明；选 7z 时同一块里再一行压缩等级（`logsLevelRow`）。 */
+function logsFormatBar(data) {
+  var bar = el("div", "toolbar logs-bar");
+  bar.appendChild(el("span", "logs-bar-lab", "格式"));
+  var seg = el("span", "seg");
+  ["zip", "7z"].forEach(function (format) {
+    var button = el("button", "cat" + (logsFormat() === format ? " on" : ""), format);
+    if (format === "7z" && !data.sevenzip) {
+      // ★ 锁住但要说得出为什么：`aria-disabled` + 不绑 onclick（同 `.btn[aria-disabled]`）。
+      button.setAttribute("aria-disabled", "true");
+      button.title = data.archives
+        ? "这台服务器的 Python 没带 lzma 模块，打不了 7z（换服务端包自带的运行时就有）"
+        : "这个进程没开 7z 压缩（不是 app.py 起的）";
+    } else {
+      button.onclick = function () {
+        if (logsFormat() === format) { return; }
+        LOGS_FORMAT = format;
+        renderLogs();
+      };
+    }
+    seg.appendChild(button);
+  });
+  bar.appendChild(seg);
+  bar.appendChild(el("span", "hint logs-bar-hint", LOGS_HINT[logsFormat()]));
+  if (logsFormat() === "7z") { logsLevelRow(bar, data); }
+  return bar;
+}
+
+/** 格式条同一块里的第二行（只在选 7z 时有）：「压缩等级 [低 | 高]」+ 一行小字（用户 2026-09-30，D102）。
+    ★ 三样直接挂在格式条上（CSS 网格三列：标签 / 分段钮 / 小字）—— 两行的分段钮才对得齐（用户要的）。 */
+function logsLevelRow(bar, data) {
+  var info = data.sevenzip_level;
+  var now = logsLevel(data);
+  bar.appendChild(el("span", "logs-bar-lab", "压缩等级"));
+  var seg = el("span", "seg");
+  LOGS_LEVELS.forEach(function (level) {
+    var spec = info.levels[level];
+    var button = el("button", "cat" + (now === level ? " on" : ""), spec.label);
+    button.title = "≈ " + spec.like + "，压缩时服务器约多占 " + spec.memory_text + " 内存";
+    button.onclick = function () {
+      if (logsLevel(data) === level) { return; }
+      LOGS_LEVEL = level;
+      renderLogs();
+    };
+    seg.appendChild(button);
+  });
+  bar.appendChild(seg);
+  bar.appendChild(el("span", "hint logs-bar-hint", logsLevelHint(info, now)));
+}
+
 function renderLogs() {
   var data = LOGS.data;
   var body = $("logsBody");
+  var oldLeft = body.querySelector(".logs-left");
+  var leftScroll = oldLeft ? oldLeft.scrollTop : 0;
   body.textContent = "";
-  body.appendChild(el("p", "hint logs-note",
-    "打成 zip 直接下载，边打包边传（下载栏里看不到总大小，传完才知道）；"
-    + "服务器上不留副本。时间都是服务器本地时间。"));
+  body.appendChild(logsFormatBar(data));
+  var cols = el("div", "logs-cols");
+  var left = el("div", "logs-left");
 
   var server = data.server;
   var hours = data.recent_hours;
-  var group = logsGroup("服务端日志", server.dirname, server.dir,
-                        tallyText(server.total));
+  var group = logsGroup("服务端日志", server.dirname, server.dir, tallyText(server.total));
   logsRow(group, "全部", tallyText(server.total),
-          logsButton("下载全量", server.total.files,
-                     "kind=server&scope=all", "服务端日志（全量）"));
+          logsAction("下载全量", "压缩全量", server.total.files,
+                     {kind: "server", scope: "all"}, "服务端日志（全量）"));
   logsRow(group, "最近 " + hours + " 小时", tallyText(server.recent),
-          logsButton("下载最近 " + hours + " 小时", server.recent.files,
-                     "kind=server&scope=recent",
+          logsAction("下载最近 " + hours + " 小时", "压缩最近 " + hours + " 小时",
+                     server.recent.files, {kind: "server", scope: "recent"},
                      "服务端日志（最近 " + hours + " 小时）"));
-  body.appendChild(group);
+  left.appendChild(group);
 
   var crash = data.crash;
   var dirs = crash.dirs || [];
   group = logsGroup("客户端崩溃包", crash.dirname, crash.dir,
                     dirs.length + " 份 · " + crash.total.size_text);
   logsRow(group, "全部（" + dirs.length + " 份）", tallyText(crash.total),
-          logsButton("下载全量", crash.total.files,
-                     "kind=client_crash", "客户端崩溃包（全部）"));
+          logsAction("下载全量", "压缩全量", crash.total.files,
+                     {kind: "client_crash"}, "客户端崩溃包（全部）"));
   var list = el("div", "logs-list");
   if (!dirs.length) {
     list.appendChild(el("div", "list-empty", "还没有收到过崩溃包"));
@@ -4469,19 +4593,156 @@ function renderLogs() {
   dirs.forEach(function (row) {
     var line = logsRow(list, row.name,
                        row.files + " 个文件 · " + row.size_text + " · " + row.mtime_text,
-                       logsButton("下载", row.files,
-                                  "kind=client_crash&sub=" + encodeURIComponent(row.name),
-                                  "崩溃包 " + row.name));
+                       logsAction("下载", "压缩", row.files,
+                                  {kind: "client_crash", sub: row.name}, "崩溃包 " + row.name));
     line.firstChild.classList.add("logs-name");
   });
   group.appendChild(list);
-  body.appendChild(group);
-  body.appendChild(el("p", "hint logs-note", "统计时刻：" + data.generated_text
-                      + "（关掉重开、或点任一下载钮都会重算一遍）"));
+  left.appendChild(group);
+  left.appendChild(el("p", "hint logs-note", "时间都是服务器本地时间。统计时刻："
+                      + data.generated_text + "（关掉重开、或点任一下载 / 压缩钮都会重算一遍）"));
+  cols.appendChild(left);
+
+  cols.appendChild(el("section", "logs-group logs-shelf"));
+  body.appendChild(cols);
+  left.scrollTop = leftScroll;
+  renderShelf();
 }
 
-/** 先重取一次（刷数字 + 会话检查），再让浏览器去下载。 */
-async function downloadLogs(query, label) {
+/* ------------------------------------------------ 右栏「待下载 7z 包」（X17） */
+
+/** 收下一份右栏快照：重画，再看要不要接着长轮询。
+    ★ 几发请求（压缩 / 删除 / 长轮询）的回包可能乱序：版本号比手上的旧就不收（同一个进程里版本只增不减；
+      服务端重启过 = `epoch` 变了，版本从 0 重数，那就照收）。 */
+function adoptArchives(archives) {
+  if (!LOGS) { return; }
+  var now = LOGS.archives;
+  if (now && archives && archives.epoch === now.epoch && archives.version < now.version) {
+    pollArchives();
+    return;
+  }
+  LOGS.archives = archives || null;
+  LOGS.pollError = false;
+  renderShelf();
+  pollArchives();
+}
+
+/** 长轮询（铁律 10，D101）：有活、弹窗开着、没有请求在路上才发；服务端版本变了才回。 */
+async function pollArchives() {
+  var state = LOGS;
+  if (!state || state.polling || !state.archives || !state.archives.busy) { return; }
+  state.polling = true;
+  var result;
+  try {
+    result = await api("/admin/api/logs/archives?since=" + state.archives.version);
+  } catch (error) {
+    // 网络断了：不自动重试（没有事件告诉我们「好了」），在右栏说一句怎么办。
+    if (LOGS === state) {
+      state.polling = false;
+      state.pollError = true;
+      renderShelf();
+    }
+    return;
+  }
+  if (LOGS !== state) { return; }              // 弹窗关了 / 重开过：这一包作废
+  state.polling = false;
+  if (bounced(result)) { return; }
+  if (!result.ok) {
+    toast((result && result.message) || "读不到压缩进度", false);
+    return;
+  }
+  adoptArchives(result.archives);
+}
+
+function renderShelf() {
+  // ★ 右栏是 renderLogs() 现造的，不挂 id（`$()` 只找页面里静态有的 id，test_web_admin 守着）。
+  var host = $("logsBody").querySelector(".logs-shelf");
+  if (!LOGS || !host) { return; }
+  var archives = LOGS.archives;
+  var old = host.querySelector(".logs-shelf-list");
+  var scroll = old ? old.scrollTop : 0;
+  host.textContent = "";
+  var head = el("div", "logs-head");
+  head.appendChild(el("b", null, "待下载 7z 包"));
+  if (archives) {
+    var code = el("code", null, archives.dirname + "/");
+    code.title = archives.dir;
+    head.appendChild(code);
+    head.appendChild(el("span", "logs-meta",
+                        archives.total.count + " 个 · " + archives.total.size_text));
+  }
+  host.appendChild(head);
+  var list = el("div", "logs-shelf-list");
+  if (!archives) {
+    list.appendChild(el("div", "list-empty", "这个进程没开 7z 压缩（不是 app.py 起的）"));
+  } else {
+    archives.jobs.forEach(function (job) { list.appendChild(shelfJob(job)); });
+    archives.files.forEach(function (file) { list.appendChild(shelfFile(file)); });
+    if (!archives.jobs.length && !archives.files.length) {
+      list.appendChild(el("div", "list-empty",
+                          "还没有压好的 7z —— 选上面的「7z」，再点左边的「压缩」。"));
+    }
+  }
+  if (LOGS.pollError) {
+    list.appendChild(el("p", "hint shelf-note",
+                        "和服务器的连接断了，进度停在上面这一格 —— 关掉弹窗再打开就能接着看。"));
+  }
+  host.appendChild(list);
+  list.scrollTop = scroll;
+}
+
+/** 还在排队 / 压缩中 / 失败的一条。压好之前**没有**下载 / 删除钮（用户 2026-09-30）。 */
+function shelfJob(job) {
+  var item = el("div", "shelf-item");
+  var top = el("div", "shelf-top");
+  top.appendChild(el("span", "shelf-label", job.label));
+  var badge = {packing: ["packing", "压缩中"], queued: ["queued", "排队中"],
+               failed: ["failed", "失败"]}[job.state] || ["queued", job.state];
+  top.appendChild(el("span", "kind " + badge[0], badge[1]));
+  item.appendChild(top);
+  item.appendChild(el("div", "logs-name shelf-file", job.name));
+  var line = el("div", "shelf-line");
+  if (job.state === "failed") {
+    line.appendChild(el("span", "shelf-error", job.error));
+    var clear = el("button", "btn btn-sm btn-danger", "删除");
+    clear.title = "清掉这条失败记录（服务器上没有留下文件）";
+    clear.onclick = function () { removeArchive({job: job.id}, job.label, null); };
+    line.appendChild(clear);
+  } else {
+    var bar = el("div", "card-prog-bar shelf-bar");
+    var fill = el("i");
+    fill.style.width = job.percent + "%";
+    bar.appendChild(fill);
+    line.appendChild(bar);
+    line.appendChild(el("span", "logs-meta", job.state === "packing"
+      ? job.percent + "% · " + job.done_text + " / " + job.total_text
+      : (job.ahead ? "前面还有 " + job.ahead + " 份" : "马上开始")));
+  }
+  item.appendChild(line);
+  return item;
+}
+
+/** 压好的一个包：大小 · 时间 + 米黄「下载」+ 红「删除」（和备份那一行同一套颜色）。 */
+function shelfFile(file) {
+  var item = el("div", "shelf-item");
+  item.appendChild(el("div", "shelf-label", file.label));
+  item.appendChild(el("div", "logs-name shelf-file", file.name));
+  var line = el("div", "shelf-line");
+  line.appendChild(el("span", "logs-meta", file.size_text + " · " + file.mtime_text));
+  var acts = el("span", "acts shelf-acts");
+  var down = el("button", "btn btn-sm", "下载");
+  down.onclick = function () { downloadArchive(file); };
+  var remove = el("button", "btn btn-sm btn-danger", "删除");
+  remove.onclick = function () { removeArchive({name: file.name}, file.label, file); };
+  acts.appendChild(down);
+  acts.appendChild(remove);
+  line.appendChild(acts);
+  item.appendChild(line);
+  return item;
+}
+
+/** zip：先重取一次（刷数字 + 会话检查），再让浏览器去下载（服务端边打包边发）。 */
+async function downloadLogs(what, label) {
   if (!LOGS || LOGS.busy) { return; }         // 连点：上一次的预检还没回来
   LOGS.busy = true;
   var fresh;
@@ -4491,13 +4752,82 @@ async function downloadLogs(query, label) {
     if (LOGS) { LOGS.busy = false; }
   }
   if (!fresh) { return; }
+  var query = "kind=" + encodeURIComponent(what.kind)
+    + (what.scope ? "&scope=" + encodeURIComponent(what.scope) : "")
+    + (what.sub ? "&sub=" + encodeURIComponent(what.sub) : "");
+  clickDownload("/admin/api/logs/download?" + query);
+  toast("已开始下载「" + label + "」（zip，边打包边传），进度在浏览器的下载栏里。", true);
+}
+
+/** 7z：排一个后台压缩任务。进度在右栏，压好了在那里下载。
+    ★ 不挡连点：同一份重复交服务端会合并（「这一份已经在压了」），换一份照排；
+      回包乱序由 `adoptArchives` 按版本号挡。 */
+async function compressLogs(what, label) {
+  var state = LOGS;
+  if (!state) { return; }
+  var result = await api("/admin/api/logs/archives/create", archiveRequest(what, state.data));
+  if (bounced(result)) { return; }
+  if (LOGS !== state) { return; }
+  if (!result.ok) {
+    toast((result && result.message) || ("压不了「" + label + "」"), false);
+    return;
+  }
+  toast(result.message + " —— 进度看右边，压好了在那里下载。", true);
+  adoptArchives(result.archives);
+}
+
+/** 下载一个压好的 7z：先重取一次（会话检查 + 确认它还在），再交给浏览器（带总大小）。 */
+async function downloadArchive(file) {
+  if (!LOGS || LOGS.busy) { return; }
+  LOGS.busy = true;
+  var fresh;
+  try {
+    fresh = await loadLogs();
+  } finally {
+    if (LOGS) { LOGS.busy = false; }
+  }
+  if (!fresh) { return; }
+  var still = LOGS.archives && LOGS.archives.files.some(function (item) {
+    return item.name === file.name;
+  });
+  if (!still) {
+    toast("「" + file.name + "」已经不在了（可能刚被删了）", false);
+    return;
+  }
+  clickDownload("/admin/api/logs/archives/download?name=" + encodeURIComponent(file.name));
+  toast("已开始下载「" + file.label + "」（" + file.size_text + "），进度在浏览器的下载栏里。", true);
+}
+
+/** 删一个压好的包（先问一句），或清掉一条失败记录（不用问：服务器上没东西）。 */
+async function removeArchive(what, label, file) {
+  if (file) {
+    var go = await ask({title: "删除 7z 包",
+      lead: "确定删除「" + label + "」？\n" + file.name + "（" + file.size_text
+        + "）删掉就找不回来了，要的话得重新压一次。",
+      ok: "删除", danger: true});
+    if (!go) { return; }
+  }
+  var state = LOGS;
+  if (!state) { return; }
+  var result = await api("/admin/api/logs/archives/remove", what);
+  if (bounced(result)) { return; }
+  if (LOGS !== state) { return; }
+  if (!result.ok) {
+    toast((result && result.message) || "删不掉", false);
+    return;
+  }
+  toast(result.message, true);
+  adoptArchives(result.archives);
+}
+
+/** 临时 `<a download>` 点一下（理由见本段开头）。 */
+function clickDownload(href) {
   var link = document.createElement("a");
-  link.href = "/admin/api/logs/download?" + query;
+  link.href = href;
   link.download = "";
   document.body.appendChild(link);
   link.click();
   link.remove();
-  toast("已开始下载「" + label + "」，进度在浏览器的下载栏里。", true);
 }
 
 /* ======================================================================
@@ -7035,6 +7365,8 @@ function paintWho() {
 function showLoggedIn(name, role, nickname) {
   ROLE = role || null;
   ME = {name: name, nickname: nickname || ""};
+  // 进系统（登录 / 刷新页面带着会话进来）：7z 压缩等级回到服务端按内存给的默认（D102）。
+  LOGS_LEVEL = null;
   paintWho();
   $("logout").classList.remove("hidden");
   $("loginView").classList.add("hidden");

@@ -105,9 +105,12 @@
 # logs_client_crash 是玩家客户端闪退后自动传上来的崩溃现场（crashstore.py）。
 # 里面是内存转储和客户端日志，一份十几 MB，而且**含玩家机器的信息**，
 # 和 logs/ 一样绝不进仓库。
+# logs_7z 是管理页「下载日志」选 7z 时后台压好的包（logshelf.py，X17）——
+# 就是上面两个目录的压缩副本，同样绝不进仓库。
 # ---------------------------------------------------------------------------
 /logs/
 /logs_client_crash/
+/logs_7z/
 /server/data/accounts.json
 /server/data/accounts.json.*.tmp
 # tickets.json：会话 12 中途试过把票据落盘，用户拍板改回纯内存（D097），

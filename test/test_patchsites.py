@@ -22,6 +22,7 @@
 import os
 import re
 import struct
+import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -753,6 +754,453 @@ class MoverOriginWritersTest(unittest.TestCase):
             if call_va + 5 + struct.unpack("<i", m.group(1))[0] == 0x0040A01E:
                 found.add(call_va + 5)
         self.assertEqual({c_define(src, "MOVERLK_VA"), c_define(src, "MOVERST_VA")}, found)
+
+
+class ImeNativeUiPatchTest(unittest.TestCase):
+    """X14 / §106 / D70 —— 游戏不再接候选通知、不吞 WM_IME_SETCONTEXT、替输入法回答光标位置。
+
+    补丁只改 `0x40edcb` 那条 call 的 rel32；下面几条钉的是它赖以成立的事实：
+    这条 call 真是去 `ImeContext` 的消息处理、而且是唯一调用点（改一处就管住全部消息），
+    rel32 四字节对齐（运行中原子替换），原函数在 WM_IME_NOTIFY 里拦的正好是我们接走的
+    3 / 4 / 5 / 9，以及算光标位置用的控件几何偏移和 800×600 模式的 1.28 缩放。
+    """
+
+    HANDLER = 0x00428F45
+
+    @classmethod
+    def setUpClass(cls):
+        for path in (BSHOOK, IMG):
+            if not os.path.isfile(path):
+                raise unittest.SkipTest("不在源码仓库里（缺 %s），跳过" % path)
+        cls.img = load_image()
+        cls.src = c_source()
+        cls.va = c_define(cls.src, "IME_MSG_CALL_VA")
+        cls.sig = c_byte_array(cls.src, "IME_MSG_SIG")
+
+    def test_signature_matches_image(self):
+        self.assertEqual(c_define(self.src, "IME_MSG_SIG_LEN"), len(self.sig))
+        self.assertEqual(read_va(self.img, self.va, len(self.sig)), self.sig)
+
+    def test_call_goes_to_ime_handler(self):
+        rel = struct.unpack("<i", read_va(self.img, self.va + 1, 4))[0]
+        self.assertEqual(self.va + 5 + rel, self.HANDLER)
+        self.assertEqual(c_define(self.src, "IME_MSG_HANDLER_JMP"), self.HANDLER)
+
+    def test_it_is_the_only_call_site(self):
+        sites = []
+        for m in re.finditer(br"\xe8(....)", self.img, re.S):
+            call_va = IMAGE_BASE + m.start()
+            if call_va + 5 + struct.unpack("<i", m.group(1))[0] == self.HANDLER:
+                sites.append(call_va)
+        self.assertEqual([self.va], sites)
+
+    def test_rel32_is_dword_aligned(self):
+        # 运行中只换这 4 个字节，靠 InterlockedExchange 原子替换 —— 前提是对齐。
+        self.assertEqual((self.va + 1) % 4, 0)
+
+    # 原函数整段 0x428f45 ~ 0x4292a1（以 0x42929e 的 `ret 0xc` 结尾），860 字节。
+    HANDLER_END = 0x004292A1
+    HANDLER_SHA256 = "77b2d3acf13e61a83a74902bcf3f96482cc2a2fb2f42f70411316da0f8b555ab"
+
+    def test_handler_bytes_pinned(self):
+        # 「原函数照跑、然后吞掉」那条路要在 thunk 里真 call 原函数、调完接着用 esi（ImeContext）；
+        # 这段字节里一条写 esi 的指令都没有（2026-09-26 用 capstone 逐条核过，下一条有 capstone 时
+        # 会再核一遍）。测试运行时里没有 capstone，所以这里把整段字节钉死：字节不变，结论就不变。
+        import hashlib
+        code = read_va(self.img, self.HANDLER, self.HANDLER_END - self.HANDLER)
+        self.assertEqual(code[-3:], bytes.fromhex("c20c00"))                    # ret 0xc
+        self.assertEqual(hashlib.sha256(code).hexdigest(), self.HANDLER_SHA256)
+
+    def test_handler_never_writes_esi(self):
+        # 同上，逐条核：原函数一条写 esi 的指令都没有，esi 进出不变。只在装了 capstone 的开发机上跑。
+        deps = os.path.join(ROOT, "tools", "_pydeps")
+        if os.path.isdir(deps) and deps not in sys.path:
+            sys.path.insert(0, deps)
+        try:
+            import capstone
+            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        except Exception as e:      # 32 位运行时载不进 x64 的 capstone 原生库，是 OSError 不是 ImportError
+            self.skipTest("capstone 用不了（%s）" % e)
+        end = 0x42929E
+        self.assertEqual(read_va(self.img, end, 3), bytes.fromhex("c20c00"))  # ret 0xc
+        code = read_va(self.img, self.HANDLER, end + 3 - self.HANDLER)
+        writes = []
+        for insn in md.disasm(code, self.HANDLER):
+            dst = insn.op_str.split(",")[0].strip()
+            if dst == "esi" and insn.mnemonic not in ("push", "cmp", "test"):
+                writes.append("%08X %s %s" % (insn.address, insn.mnemonic, insn.op_str))
+            if insn.mnemonic in ("pushal", "popal"):
+                writes.append("%08X %s" % (insn.address, insn.mnemonic))
+        self.assertEqual([], writes)
+
+    def test_handler_takes_exactly_these_notifications(self):
+        # 0x428f50: cmp [ebp+8], WM_IME_NOTIFY；jne …；eax = wParam；
+        # sub 3 → je（CHANGE）/ dec → je（CLOSE）/ dec → je（OPEN）/ sub 4 → je（SETCANDIDATEPOS）
+        self.assertEqual(read_va(self.img, 0x428F50, 7), bytes.fromhex("817d0882020000"))
+        self.assertEqual(read_va(self.img, 0x428F60, 3), bytes.fromhex("83e803"))
+        self.assertEqual(read_va(self.img, 0x428F69, 1), b"\x48")
+        self.assertEqual(read_va(self.img, 0x428F6C, 1), b"\x48")
+        self.assertEqual(read_va(self.img, 0x428F6F, 3), bytes.fromhex("83e804"))
+        # 结尾：返回值 = (msg == WM_IME_SETCONTEXT) —— 原版就是这样吞掉它的
+        self.assertEqual(read_va(self.img, 0x429287, 7), bytes.fromhex("817d0881020000"))
+        self.assertEqual(read_va(self.img, 0x42928E, 3), bytes.fromhex("0f94c0"))
+
+    def test_ui_geometry_offsets(self):
+        # SumRect：沿 +0x28 父链累加 +0x10 / +0x14，宽高取 +0x18 / +0x1c
+        self.assertEqual(read_va(self.img, 0x42516A, 9), bytes.fromhex("037110 037914 8b4928"))
+        self.assertEqual(read_va(self.img, 0x425177, 6), bytes.fromhex("8b4a1c8b5218"))
+        # 自带框布局：[Desktop+0x10] = 聚焦的输入框，光标矩形在它 +0x110
+        self.assertEqual(read_va(self.img, 0x43019C, 8), bytes.fromhex("a1b4e272008b7010"))
+        self.assertEqual(read_va(self.img, 0x4301B4, 6), bytes.fromhex("81c610010000"))
+        self.assertEqual(c_define(self.src, "IME_UI_DESKTOP_PP"), 0x72E2B4)
+        # ImeContext 构造：[esi+4] = 主窗口（回答屏幕坐标时拿它做 ClientToScreen）
+        self.assertEqual(read_va(self.img, 0x428D02, 5), bytes.fromhex("53895e04c6"))
+
+    def test_800x600_mode_scale(self):
+        # 0x40f3ab: cmp [App+0x98], 2 → fmul qword [0x693860]（客户区 × 1.28 = 界面）
+        self.assertEqual(read_va(self.img, 0x40F3AB, 7), bytes.fromhex("83bf9800000002"))
+        self.assertEqual(read_va(self.img, 0x40F3B7, 6), bytes.fromhex("dc0d60386900"))
+        self.assertEqual(struct.unpack("<d", read_va(self.img, 0x693860, 8))[0], 1.28)
+        self.assertEqual(c_define(self.src, "IME_UI_SCALE_VA"), 0x693860)
+        self.assertEqual(c_define(self.src, "IME_UI_MODE_800X600"), 2)
+        self.assertEqual(c_define(self.src, "IME_UI_APP_PP"), 0x72E2A4)
+
+
+_C_STR = r'"(?:[^"\\]|\\.)*"'
+_SITE_ENTRY = re.compile(
+    r"\{\s*(0[xX][0-9A-Fa-f]+)[uU]?\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,"
+    r"\s*\(const unsigned char \*\)((?:\s*" + _C_STR + r")+)\s*,"
+    r"\s*\(const unsigned char \*\)((?:\s*" + _C_STR + r")+)\s*,"
+    r"\s*" + _C_STR + r"\s*\}", re.S)
+
+
+def c_escaped_bytes(literals):
+    """把相邻几段只含 `\\xNN` 的 C 字符串字面量拼成 bytes。
+
+    ★ C 的 `\\x` 会**贪婪地**吃掉后面所有十六进制字符（`"\\x00A"` 是一个字节），
+      所以每个转义必须正好两位 —— 不是就说明这张表在 C 里的意思和看上去的不一样。
+    """
+    out = bytearray()
+    for lit in re.findall(_C_STR, literals):
+        body, pos = lit[1:-1], 0
+        for m in re.finditer(r"\\x([0-9A-Fa-f]+)", body):
+            if m.start() != pos or len(m.group(1)) != 2:
+                raise AssertionError("字面量不是一串整齐的 \\xNN：%r" % body)
+            out.append(int(m.group(1), 16))
+            pos = m.end()
+        if pos != len(body):
+            raise AssertionError("字面量不是一串整齐的 \\xNN：%r" % body)
+    return bytes(out)
+
+
+def c_site_table(src, name):
+    """抠 `bshook.c` 里 `{ va, len, off, n, sig, fix, what }` 这种站点表。
+
+    返回 `[(va, len, off, n, sig, fix), ...]`。先去掉注释（`fix` 那一行后面都跟着一句 `/* … */`）。
+    """
+    m = re.search(r"\}\s*%s\s*\[[^\]]*\]\s*=\s*\{(.*?)\n\};" % re.escape(name), src, re.S)
+    if not m:
+        raise AssertionError("bshook.c 里找不到站点表 %s" % name)
+    body = re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)
+    return [(int(e.group(1), 16), int(e.group(2)), int(e.group(3)), int(e.group(4)),
+             c_escaped_bytes(e.group(5)), c_escaped_bytes(e.group(6)))
+            for e in _SITE_ENTRY.finditer(body)]
+
+
+class MutuUnlockPatchTest(unittest.TestCase):
+    """X16 / D82 —— 格斗模式（무투전，对战模式号 2）解锁：`MUTU_SITES` 五处（§118）。
+
+    实机看得到的只有「下拉框里有没有、◀▶ 转不转、Boss 格斗场列不列」；
+    **错一个字节**（跳进指令中间、改到旁边那道判断）实机未必看得出来 —— 离线全钉死。
+    """
+
+    #: (特征串起始 VA, 改的偏移, 原字节, 新字节)，和计划 / FINDINGS §118 逐条对。
+    EXPECTED = [
+        (0x437545, 25, "7464", "9090"),      # G1  建房下拉框：地区 1/2 跳过模式 2 的 je
+        (0x4659C0, 12, "7475", "9090"),      # G2a 当前是格斗时整段跳过 ◀▶ 的 je
+        (0x4659DF, 4, "7501", "eb01"),       # G2b ◀ 跳过 2 的 jne
+        (0x465A00, 10, "7503", "eb03"),      # G2c ▶ 把 2 改成 3 的 jne
+        (0x40B26F, 4, "8b4030", "33c090"),   # G3  RequiredQuestClear 当 0
+    ]
+    #: 别的字节补丁组 -> 它们的条数宏。拿来核「格斗解锁的特征区间没被别人改过」。
+    #: （`BONUS_TEXT_SITES` 是另一种写法 —— 特征串是定长字节数组 —— 在 `_other_ranges` 里单独读。）
+    OTHER_TABLES = {
+        "MAP_LVL_SITES": "MAP_LVL_SITE_COUNT", "PLR_LVL_SITES": "PLR_LVL_SITE_COUNT",
+        "REGION_SITES": "REGION_PATCH_COUNT", "IRENE_SITES": "IRENE_PATCH_COUNT",
+        "IRENE_LVL_SITES": "IRENE_LVL_SITE_COUNT",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        for path in (BSHOOK, IMG):
+            if not os.path.isfile(path):
+                raise unittest.SkipTest("不在源码仓库里（缺 %s），跳过" % path)
+        cls.img = load_image()
+        cls.src = c_source()
+        cls.sites = c_site_table(cls.src, "MUTU_SITES")
+
+    def test_the_table_is_exactly_the_five_sites_we_mean(self):
+        self.assertEqual(c_define(self.src, "MUTU_PATCH_COUNT"), len(self.EXPECTED))
+        got = [(va, off, sig[off:off + n].hex(), fix.hex())
+               for va, _len, off, n, sig, fix in self.sites]
+        self.assertEqual(list(self.EXPECTED), got)
+
+    def test_the_signatures_match_the_image_and_are_unique(self):
+        for va, length, _off, _n, sig, _fix in self.sites:
+            self.assertEqual(length, len(sig), "%08X 的长度字段和特征串对不上" % va)
+            self.assertEqual(read_va(self.img, va, length), sig, "%08X 的特征串和镜像对不上" % va)
+            self.assertEqual(1, self.img.count(sig), "%08X 的特征串在镜像里不唯一" % va)
+
+    def test_every_fix_is_the_same_length_and_inside_the_signature(self):
+        for va, length, off, n, sig, fix in self.sites:
+            self.assertEqual(n, len(fix), "%08X 改的字节数和替换串不一样长" % va)
+            self.assertLessEqual(off + n, length, "%08X 改到特征串外面去了" % va)
+            self.assertNotEqual(sig[off:off + n], fix, "%08X 改了等于没改" % va)
+
+    def test_g1_only_drops_the_skip_of_mode_2(self):
+        # 0x43755b cmp ebx,2 / 0x43755e je 0x4375c4 —— 落点是循环尾 add esi,0xc（下一项）。
+        self.assertEqual(read_va(self.img, 0x43755B, 3), bytes.fromhex("83fb02"))
+        rel = struct.unpack("<b", read_va(self.img, 0x43755F, 1))[0]
+        self.assertEqual(0x437560 + rel, 0x4375C4)
+        self.assertEqual(read_va(self.img, 0x4375C4, 3), bytes.fromhex("83c60c"))
+
+    def test_the_ring_jumps_keep_their_landing(self):
+        # G2b / G2c 把 jne 换成 jmp：rel8 一个字节不动 ⇒ 落点还是原来那条（只是不再看条件）。
+        swapped = 0
+        for va, _len, off, _n, sig, fix in self.sites:
+            if sig[off] == 0x75:
+                self.assertEqual(0xEB, fix[0], "%08X 的 jne 没换成 jmp" % va)
+                self.assertEqual(sig[off + 1], fix[1], "%08X 的 rel8 被动了" % va)
+                swapped += 1
+        self.assertEqual(2, swapped)
+
+    def test_g3_turns_the_quest_requirement_into_zero(self):
+        # mov eax,[eax+0x30] → xor eax,eax / nop；后面 test eax,eax / … / jne 查表 / mov al,1 ⇒ 恒走「放行」。
+        _va, _len, off, _n, sig, fix = self.sites[4]
+        self.assertEqual(bytes.fromhex("8b4030"), sig[off:off + 3])
+        self.assertEqual(bytes.fromhex("33c090"), fix)
+        self.assertEqual(bytes.fromhex("85c0"), sig[off + 3:off + 5])
+        self.assertEqual(bytes.fromhex("7504b001c9c3"), sig[-6:])
+
+    def test_g3_gate_has_a_single_caller(self):
+        # 0x40b26f 全镜像只有 0x40b646（地图过滤 0x40b5d0 里）一个直接调用点 —— 改它只影响选图列表。
+        img, hits, start = self.img, [], 0
+        while True:
+            i = img.find(b"\xe8", start)
+            if i < 0 or i + 5 > len(img):
+                break
+            if IMAGE_BASE + i + 5 + struct.unpack_from("<i", img, i + 1)[0] == 0x40B26F:
+                hits.append(IMAGE_BASE + i)
+            start = i + 1
+        self.assertEqual([0x40B646], hits)
+
+    def _other_ranges(self):
+        for name, count in self.OTHER_TABLES.items():
+            others = c_site_table(self.src, name)
+            self.assertEqual(c_define(self.src, count), len(others), "%s 没解析全" % name)
+            for va, length, _off, _n, _sig, _fix in others:
+                yield name, va, length
+        m = re.search(r"\}\s*BONUS_TEXT_SITES\s*\[[^\]]*\]\s*=\s*\{(.*?)\n\};", self.src, re.S)
+        vas = [int(v, 16) for v in
+               re.findall(r"\{\s*(0[xX][0-9A-Fa-f]+)[uU]?\s*,\s*\{", m.group(1))]
+        self.assertEqual(c_define(self.src, "BONUS_TEXT_SITE_COUNT"), len(vas))
+        for va in vas:
+            yield "BONUS_TEXT_SITES", va, c_define(self.src, "BONUS_TEXT_SIG_LEN")
+
+    def test_no_other_patch_group_touches_these_bytes(self):
+        mine = [(va, va + length) for va, length, _off, _n, _sig, _fix in self.sites]
+        for name, va, length in self._other_ranges():
+            for lo, hi in mine:
+                self.assertFalse(va < hi and lo < va + length,
+                                 "%s 的 %08X 和格斗解锁的 %08X 重叠" % (name, va, lo))
+
+    def test_the_patch_thread_gates_it_behind_the_region_unlock(self):
+        # 14 张格斗图全靠地区旁路进目录（庆典那张已从 map.ini 删掉，D90）—— 地区锁保留时这组必须跟着不打。
+        body = self.src[self.src.index("格斗模式（무투전）解锁（X16 / D82）"):]
+        body = body[:body.index("登录公告")]
+        self.assertLess(body.index("region_lock_disabled()"), body.index("try_patch_mutu_unlock()"))
+        self.assertIn("mutu_lock_kept()", body)
+
+
+class MutuDiagProbeTest(unittest.TestCase):
+    """B2 格斗招式判定体探针（X16，临时）：改的是 `NewMutuSkill` 虚表槽 6，调的是 `0x4f9940`。
+
+    地址 / 特征串写错的话探针要么装不上（日志里 `!!`），要么挂到别的函数上 —— 在这里就钉住。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = c_source()
+        cls.img = load_image()
+
+    def test_the_vtable_slot_points_at_the_update(self):
+        vft = c_define(self.src, "MUTU_SKILL_VFT")
+        slot = c_define(self.src, "MUTU_SKILL_SLOT_UPDATE")
+        update = c_define(self.src, "MUTU_SKILL_UPDATE_VA")
+        self.assertEqual(update, struct.unpack("<I", read_va(self.img, vft + slot * 4, 4))[0])
+        # 同一张虚表的槽 1 是优先级那一格（`0x4f88e6`，§121），拿它确认这真是招式的虚表。
+        self.assertEqual(0x4F88E6, struct.unpack("<I", read_va(self.img, vft + 4, 4))[0])
+
+    def test_the_signatures_match_the_image(self):
+        for va_name, sig_name in (("MUTU_SKILL_UPDATE_VA", "MUTU_UPDATE_SIG"),
+                                  ("MUTU_ANIM_FRAME_VA", "MUTU_ANIM_FRAME_SIG")):
+            sig = c_byte_array(self.src, sig_name)
+            self.assertEqual(sig, read_va(self.img, c_define(self.src, va_name), len(sig)), sig_name)
+
+    def test_the_update_takes_no_stack_arguments(self):
+        """探针用 `__fastcall(self, edx)` 转调 —— 只有「thiscall、无栈参」才对得上：函数尾是裸 `ret`（`0x4f88e5`）。"""
+        self.assertEqual(b"\xc3", read_va(self.img, 0x4F88E5, 1))
+
+    def test_it_is_off_unless_asked(self):
+        body = self.src[self.src.index("static int mutu_diag_enabled(void)"):]
+        body = body[:body.index("}")]
+        self.assertIn("return 0;", body)
+        self.assertIn('"BSHOOK_MUTU_DIAG"', body)
+
+
+def _rel32_targets(img):
+    """镜像里每一条 E8 / E9 / 0F 8x rel32 的落点（逐字节扫，数据里偶然长得像的也算进来 ——
+    只拿来断言「某个区间里**没有**落点」，多算只会更严）。"""
+    out = []
+    for i in range(len(img) - 6):
+        b = img[i]
+        if b in (0xE8, 0xE9):
+            out.append((IMAGE_BASE + i, IMAGE_BASE + i + 5 + struct.unpack_from("<i", img, i + 1)[0]))
+        elif b == 0x0F and 0x80 <= img[i + 1] <= 0x8F:
+            out.append((IMAGE_BASE + i, IMAGE_BASE + i + 6 + struct.unpack_from("<i", img, i + 2)[0]))
+    return out
+
+
+class MutuZombieRetractPatchTest(unittest.TestCase):
+    """§139 / D98 —— 格斗招式被打断后补发收招：打断 `0x50a6f8` 记账、格斗管理器 `0x4958eb` 补发。
+
+    补丁不改收方一个字节，全靠「发出去的东西和原版管理器发的收招一模一样」「发的时机排在新招之前」——
+    这两条都是离线可判定的：原版收招那几条指令、挑招看的计时器，都在镜像里钉住。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        for path in (BSHOOK, IMG):
+            if not os.path.isfile(path):
+                raise unittest.SkipTest("不在源码仓库里（缺 %s），跳过" % path)
+        cls.img = load_image()
+        cls.src = c_source()
+        cls.targets = _rel32_targets(cls.img)        # 逐字节扫一遍要几秒，三条用例共用
+        cls.sites = {}
+        for prefix in ("MUTU_BREAK", "MUTU_TICK"):
+            cls.sites[prefix] = dict(
+                va=c_define(cls.src, prefix + "_VA"),
+                stolen=c_define(cls.src, prefix + "_STOLEN"),
+                resume=c_define(cls.src, prefix + "_RESUME_TO"),
+                sig=c_byte_array(cls.src, prefix + "_SIG"),
+                sig_len=c_define(cls.src, prefix + "_SIG_LEN"))
+
+    def test_the_signatures_match_the_image_and_are_unique(self):
+        for prefix, s in self.sites.items():
+            self.assertEqual(s["sig_len"], len(s["sig"]), prefix + "_SIG_LEN 和数组长度对不上")
+            self.assertEqual(read_va(self.img, s["va"], s["sig_len"]), s["sig"],
+                             prefix + "_SIG 和镜像对不上")
+            self.assertEqual(1, self.img.count(s["sig"]), prefix + "_SIG 不唯一")
+
+    def test_the_stolen_bytes_end_on_an_instruction_boundary(self):
+        brk, tick = self.sites["MUTU_BREAK"], self.sites["MUTU_TICK"]
+        for prefix, s in self.sites.items():
+            self.assertGreaterEqual(s["stolen"], 5, prefix + "：放不下 E9 rel32")
+            self.assertEqual(s["va"] + s["stolen"], s["resume"], prefix + "：回落点不在偷走的字节后面")
+        # 打断：偷 `push esi / lea esi,[edi+0x5dc]`，落点是 `mov ecx,[esi]`（取招式对象）。
+        self.assertEqual(b"\x8b\x0e", read_va(self.img, brk["resume"], 2))
+        # 管理器：偷 `push ebp / mov ebp,esp / push ecx / push esi`，落点是 `push edi`。
+        self.assertEqual(b"\x57", read_va(self.img, tick["resume"], 1))
+
+    def test_nobody_jumps_into_the_middle_of_the_stolen_bytes(self):
+        # rel8 没扫：两处都是函数入口，函数体里的短跳（`0x50a703` / `0x50a71a` / `0x50a723`，管理器同理）
+        # 都往后跳。逐字节扫 rel8 在 `0x50a6d4` 有个假阳性 —— 那是 `0x50a6d3 ff 74 24 10`（push）的中间两个字节。
+        for prefix, s in self.sites.items():
+            inside = [(src, dst) for src, dst in self.targets if s["va"] < dst < s["va"] + s["stolen"]]
+            self.assertEqual([], inside, prefix + "：有人跳进偷走的字节中间")
+
+    def test_the_break_is_only_reached_from_onhit_and_the_walk_gate(self):
+        callers = sorted(src for src, dst in self.targets
+                         if dst == self.sites["MUTU_BREAK"]["va"] and self.img[src - IMAGE_BASE] == 0xE8)
+        # 0x4ff6a8：OnHit 活人分支挨重击；0x5074ae：走路时招式对象还在（NewMutuSkill 的 vft+8 恒真，走不到）。
+        self.assertEqual([0x4FF6A8, 0x5074AE], callers)
+
+    def test_the_manager_runs_every_fight_frame(self):
+        callers = [src for src, dst in self.targets
+                   if dst == self.sites["MUTU_TICK"]["va"] and self.img[src - IMAGE_BASE] == 0xE8]
+        self.assertEqual([0x4906F4], callers)
+        # 每帧 `0x4904cc` 里：GameContext 槽 5 IsMutu（`call [eax+0x14]`）为真才调，eax = [0x72e2e0] 管理器。
+        self.assertEqual(bytes.fromhex("ff5014 84c0 740a a1e0e27200"), read_va(self.img, 0x4906E8, 12))
+
+    def test_the_retract_is_exactly_the_managers_own(self):
+        """原版管理器发收招（`0x495a87`）：`0x4934e7(本机座位, −1, 朝向, 0)`，esi = 坐标，之后置 `[+0x5e0]`。"""
+        site = 0x495A87
+        code = read_va(self.img, site, 27)
+        self.assertEqual(bytes.fromhex("6a00 ff75dc 8bf0 6aff"), code[:9])   # push 0 / push 朝向 / esi=坐标 / push −1
+        seat_call = site + 9
+        self.assertEqual(0xE8, code[9])
+        self.assertEqual(c_define(self.src, "MUTU_MY_SEAT_VA"),
+                         seat_call + 5 + struct.unpack_from("<i", code, 10)[0])
+        self.assertEqual(0x50, code[14])                                     # push eax（座位）
+        send_call = site + 15
+        self.assertEqual(0xE8, code[15])
+        self.assertEqual(c_define(self.src, "MUTU_SEND_SKILL_VA"),
+                         send_call + 5 + struct.unpack_from("<i", code, 16)[0])
+        wait = c_define(self.src, "CHAR_OFF_WAIT_ECHO")
+        self.assertEqual(b"\xc6\x87" + struct.pack("<I", wait) + b"\x01", code[20:27])
+        # 朝向那一格：`0x495a73 mov eax,[edi+0x2d0]` 存进 [ebp-0x24]。
+        self.assertEqual(b"\x8b\x87" + struct.pack("<I", c_define(self.src, "CHAR_OFF_FACING")),
+                         read_va(self.img, 0x495A73, 6))
+        # 发包函数是 stdcall 4 个参数（`ret 0x10`）、从 esi 读坐标。
+        self.assertEqual(b"\xc2\x10\x00", read_va(self.img, 0x49357E, 3))
+        self.assertEqual(b"\xd9\x06", read_va(self.img, 0x49353C, 2))
+
+    def test_the_retract_waits_on_the_very_timer_the_picker_reads(self):
+        """挑招 `0x495bbb`：`[+0x17c]` 在跑就清队列 —— 补发等的是同一个计时器、同一个判断函数，
+        所以「它走完的第一帧」补发一定排在新招之前（补发挂在管理器入口，挑招在后面）。"""
+        timer = c_define(self.src, "CHAR_OFF_HIT_TIMER")
+        code = read_va(self.img, 0x495BBB, 11)
+        self.assertEqual(b"\x8d\x8f" + struct.pack("<I", timer), code[:6])
+        self.assertEqual(0xE8, code[6])
+        self.assertEqual(c_define(self.src, "MUTU_TIMER_RUNNING_VA"),
+                         0x495BBB + 11 + struct.unpack_from("<i", code, 7)[0])
+        # 击退尾巴 `0x50f959`：对所有类型都起这 10 帧（`push 0xa / lea ecx,[esi+0x17c] / call 0x5d5e37`）。
+        self.assertEqual(b"\x6a\x0a\x8d\x8e" + struct.pack("<I", timer), read_va(self.img, 0x50F959, 8))
+
+    def test_the_break_hook_reads_the_skill_slot_the_original_deletes(self):
+        skill = c_define(self.src, "CHAR_OFF_SKILL")
+        self.assertEqual(b"\x8d\xb7" + struct.pack("<I", skill),
+                         read_va(self.img, self.sites["MUTU_BREAK"]["va"] + 1, 6))
+
+    def test_the_detours_report_before_replaying_the_stolen_code(self):
+        for name, first, replay, resume in (
+                ("mutu_break_detour", "call mutu_break_note", "lea  esi, [edi + 0x5DC]",
+                 "push MUTU_BREAK_RESUME_TO"),
+                ("mutu_tick_detour", "call mutu_owed_retract_tick", "mov  ebp, esp",
+                 "push MUTU_TICK_RESUME_TO")):
+            body = self.src[self.src.index("void %s(void)" % name):]
+            body = body[:body.index("\n}\n")]
+            self.assertLess(body.index("pushad"), body.index(first), name)
+            self.assertLess(body.index(first), body.index("popad"), name)
+            self.assertLess(body.index("popad"), body.index(replay), name)
+            self.assertLess(body.index(replay), body.index(resume), name)
+
+    def test_no_other_patch_lands_in_these_bytes(self):
+        mine = {s["va"] for s in self.sites.values()}
+        for m in re.finditer(r"^#define\s+(\w+_VA)\s+(0[xX][0-9A-Fa-f]+)[uU]?", self.src, re.M):
+            va = int(m.group(2), 16)
+            if va in mine:
+                continue
+            for prefix, s in self.sites.items():
+                self.assertFalse(s["va"] <= va < s["va"] + s["stolen"],
+                                 "%s（%08X）落在 %s 偷走的字节里" % (m.group(1), va, prefix))
+
+    def test_the_patch_thread_installs_it_unless_kept(self):
+        body = self.src[self.src.index("static DWORD WINAPI patch_thread"):]
+        self.assertIn("try_patch_mutu_zombie()", body)
+        self.assertLess(body.index("mutu_zombie_keep_original()"), body.index("try_patch_mutu_zombie()"))
+        keep = self.src[self.src.index("static int mutu_zombie_keep_original(void)"):]
+        self.assertIn('"BSHOOK_KEEP_MUTU_ZOMBIE"', keep[:keep.index("\n}\n")])
 
 
 if __name__ == "__main__":

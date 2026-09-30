@@ -58,11 +58,13 @@ ini 只给了三个**半径**，没给圆心。这里用的模型是
 import json
 import math
 import os
+import struct
 
 #: 认得的产物格式版本。对不上就当没有数据 —— 退回下面那组默认尺寸，
 #: 而不是按错的布局解出一堆乱七八糟的圆。
 #: ★ 2（会话 19）：加了 `game` 段（`GameProps.ini` 的体力常量）。
-FORMAT = 2
+#: ★ 3（X_Mod 会话 38）：`game` 段多了 `guard_damage_rate`（§92）。
+FORMAT = 3
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "bot_chrprops.json")
@@ -91,6 +93,23 @@ DEFAULT_SIZES = {
 }
 
 
+#: ★★ 闯关模式里**所有角色**一律用这组半径（X_Mod §101）：`0x4fc230` 摆圆时先问 GameContext
+#: vft+0x20（只有 Quest / Quest01~07 / PromotionQuest 返回 1，`0x46f801`），真就套这组覆盖
+#: （`0x4fc375` ~ `0x4fc38a`）。
+QUEST_SIZES = {"size_legs": 12.0, "size_body": 13.0, "size_head": 10.0,
+               "size_legs_crouch": 7.0}
+
+#: ★★ 缩小道具（属性 4，`Item.ini [SizeDown]` 10304、`Status.ini [4] Time=8`）：四个半径都 ×
+#: `[0x6937c4]` = 0.6f，**写死**、不读 `SizeRatio`（`0x4fc399` / `0x4fc3a2`），排在闯关覆盖之后。
+SHRINK_RATIO = struct.unpack("<f", struct.pack("<f", 0.6))[0]
+
+#: ★★ 出拳（`Character::Jab` `0x502394`）期间的**第 4 个圆**（`[char+0x5ac]` 计时器在跑，X_Mod §101）：
+#: 圆心 x = 朝向 × 2.2f × r身（`[0x693a8c]`）、y = −4 × r身（`[0x693a90]`，蹲着再 + 2(r腿 − r蹲)），
+#: 半径 = 2 × r身；掩码 0（打中算身体）。不出拳时这个圆半径 0、圆心 (0, 0)。
+JAB_REACH = struct.unpack("<f", struct.pack("<f", 2.2))[0]
+JAB_HEIGHT = -4.0
+
+
 #: `GameProps.ini` 的体力常量，产物里没有时用的默认值（就是原版那几个数）。
 DEFAULT_GAME = {
     "sp_max": 100.0,
@@ -98,11 +117,14 @@ DEFAULT_GAME = {
     "fast_run_sp_cost": 1.5,      # 冲刺跑每 tick 花多少
     "guard_sp_cost": 0.5,
     "assault_sp_cost": 40.0,
+    # 格挡着正面挨打只扣 `int(这个 × 伤害 + 1)`（`0x4ff4dd`，X_Mod §92）；
+    # exe 里的缺省值 `0x6937ac` 也是 0.25。
+    "guard_damage_rate": 0.25,
 }
 
 
 class GameProps(object):
-    """`GameProps.ini` 里和体力有关的几个数。"""
+    """`GameProps.ini` 里和体力、格挡有关的几个数。"""
 
     __slots__ = ("raw",)
 
@@ -127,6 +149,16 @@ class GameProps(object):
         """按着右键冲刺跑时，每个 tick 花多少体力。"""
         return self._num("fast_run_sp_cost")
 
+    @property
+    def guard_damage_rate(self):
+        """格挡着挨打时伤害乘多少（`GuardDamageRate`，X_Mod §92）。"""
+        return self._num("guard_damage_rate")
+
+    @property
+    def guard_sp_cost(self):
+        """格挡着每个 tick 花多少体力（`GuardSpCost`，`0x5070c5`，X_Mod §122）；扣完低于它就「打破」。"""
+        return self._num("guard_sp_cost")
+
 
 class Move(object):
     """一招（`DashNN` / `JabNN`）—— 冲刺攻击的全部参数（§64）。
@@ -141,7 +173,7 @@ class Move(object):
         posDelta.y += sin(degree) * MultiForY
 
     `posDelta` 是**相对角色中心**的偏移，`currTick` 是第几帧动画。
-    伤害只在 `CastEndFrame` ~ `DamageEndFrame` 之间生效。
+    伤害只在 `CastEndFrame` ≤ 帧 < `DamageEndFrame` 之间生效（上界不含，`frames()`）。
 
     ⚠ **半径是本工程的近似**：带 `DamagingObjBone` 的招式（角色 0 的
     `Dash00` 就是）伤害圈跟着**骨骼**走、半径写在 `DamagingObjSize`，
@@ -180,13 +212,35 @@ class Move(object):
 
     @property
     def damage_end(self):
-        """第几帧伤害结束。"""
+        """伤害段在第几帧**结束** —— 这一帧起就没有伤害了（上界不含，见 `frames()`）。"""
         return int(self._num("damage_end"))
 
     @property
     def total_frame(self):
         """整套动作一共几帧 —— 这一招占用角色多久。"""
         return int(self._num("total_frame"))
+
+    # ★ 冲刺自己挪多远（`ProcessDash` `0x5077c6`，X_Mod §113）：公式在 `botmove.dash_distance()`。
+    #   缺省是那三发取值的缺省参数：`0x50780b push 8`、`[0x693824]` = 4.0、`fld1`。
+    @property
+    def move_frame(self):
+        """前几帧在挪（`DashNN-MoveFrame`）。"""
+        return int(self._num("move_frame", 8))
+
+    @property
+    def move_force(self):
+        """挪的「力度」（`DashNN-Move`，ini 注释：不是距离）。"""
+        return self._num("move", 4.0)
+
+    @property
+    def move_gamma(self):
+        """前冲后收的程度（`DashNN-MoveGamma`，位置 ∝ (帧 / MoveFrame) 的 1/γ 次方）。"""
+        return self._num("move_gamma", 1.0)
+
+    @property
+    def pushes(self):
+        """推挤段碰到人推不推（`DashNN-DontPush` 为 0 或没写 = 推，ini 开头的注释）。"""
+        return not int(self._num("dont_push", 0))
 
     def offset(self, frame):
         """第 `frame` 帧时伤害圈相对角色的偏移 `(dx, dy)`（朝右的那一版）。"""
@@ -197,8 +251,13 @@ class Move(object):
                 self._num("delta_y") + math.sin(radians) * self._num("multi_y"))
 
     def frames(self):
-        """有伤害的那几帧。"""
-        return range(self.cast_end, self.damage_end + 1)
+        """有伤害的那几帧：`CastEndFrame` ≤ 帧 < `DamageEndFrame`。
+
+        ★ 客户端的阶段函数 `0x481a67` 判伤害段用的是 `0x481bba jge`，上界**不含**（X_Mod §111）；
+          以前这里含上界，bot 的冲刺比原版多判一帧（11:29:59、21:40:16 都是第 11 帧打中的）。
+          伤害圈扫角的分母 `DamageEndFrame − 1`（`offset()`）也说明最后一帧伤害帧就是它。
+        """
+        return range(self.cast_end, self.damage_end)
 
     def reach(self):
         """这一招最远够得着多少（水平方向，含伤害圈半径）。"""
@@ -206,15 +265,20 @@ class Move(object):
             + self.radius
 
     def __repr__(self):
-        return ("<Move 伤害%d 体力%.0f 半径%.0f 够到%.0f 帧%d-%d/%d>"
+        # 「伤害帧」两头都含（= `frames()`），斜杠后面是整套动作的帧数。
+        return ("<Move 伤害%d 体力%.0f 半径%.0f 够到%.0f 伤害帧%d-%d/%d>"
                 % (self.damage, self.sp_cost, self.radius, self.reach(),
-                   self.cast_end, self.damage_end, self.total_frame))
+                   self.cast_end, self.damage_end - 1, self.total_frame))
 
 
 class Character(object):
     """一个角色的属性。字段直接对应 `ChrProps.ini` 里的键，缺的走默认值。"""
 
     __slots__ = ("raw",)
+
+    #: 这一份是不是**格斗模式**里的他（X16 / D85）：`botmove.physics_of()` 按它挑物理档
+    #: （每帧重力 ×1.5、跳高 240 / 300，X_Mod §120）。只有 `shaped(fight=True)` 的变体是真。
+    fight = False
 
     def __init__(self, raw):
         self.raw = raw or {}
@@ -307,13 +371,47 @@ class Character(object):
         （当腿），角色构造时再推身、头（`0x4fafda`）；`0x50f410` 按这个顺序试、**第一个
         扫到的就算**，不比谁更早。② 每个圆带掩码：腿 4、头 2（`0x4fb01d`），武器的
         `PassObjCollBlockFlags` 和它相交就穿过去。
-        ★ 第 4 个圆（身前 2.2·r身、半径 2·r身，只在 `[角色+0x5ac]` 那个计时器走着时才有）
-          服务端拿不到那个状态，没列。
+        ★ 第 4 个圆（出拳那一段，`shaped(jab_dir=±1)`）排在最后，掩码 0、算身体（X_Mod §101）。
         """
         out = []
         for cx, cy, r, region in reversed(self.circles(x, y, crouched)):
             out.append((cx, cy, r, region, SHAPE_FLAGS[region]))
+        jab = getattr(self, "jab_dir", 0)
+        if jab:
+            body = self.size_body
+            dy = JAB_HEIGHT * body
+            if crouched:
+                dy += 2.0 * (self.size_legs - self.size_legs_crouch)
+            out.append((x + jab * JAB_REACH * body, y + dy, 2.0 * body,
+                        REGION_BODY, 0))
         return out
+
+    def shaped(self, quest=False, shrunk=False, jab_dir=0, fight=False):
+        """这个角色在**某一刻**的形状（`0x4fc230` 摆圆那一段，X_Mod §101）：闯关统一尺寸 → 缩小 ×0.6 → 出拳的第 4 个圆；
+        外加 `fight`：格斗模式里的他（尺寸不变，只换物理档，X16 / D85）。
+
+        都不沾就是自己。结果按参数缓存（形状只有这几种组合）。
+        """
+        quest, shrunk, jab_dir, fight = bool(quest), bool(shrunk), int(jab_dir), bool(fight)
+        if not (quest or shrunk or jab_dir or fight):
+            return self
+        key = (id(self), quest, shrunk, jab_dir, fight)
+        got = _SHAPED.get(key)
+        if got is not None and got[0] is self:
+            return got[1]
+        raw = dict(self.raw)
+        if quest:
+            raw.update(QUEST_SIZES)
+        if shrunk:
+            for name in QUEST_SIZES:
+                value = raw.get(name)
+                if value is None:
+                    value = DEFAULT_SIZES[name]
+                raw[name] = struct.unpack(
+                    "<f", struct.pack("<f", float(value) * SHRINK_RATIO))[0]
+        variant = ShapedCharacter(raw, jab_dir, fight)
+        _SHAPED[key] = (self, variant)
+        return variant
 
     def center(self, x, y, crouched=False):
         """身体那个圆的圆心 —— **瞄这里**。
@@ -342,6 +440,21 @@ class Character(object):
         return ("<Character %d hp=%d 头%.0f 身%.0f 腿%.0f>"
                 % (self.id, self.hp, self.size_head, self.size_body,
                    self.size_legs))
+
+
+class ShapedCharacter(Character):
+    """`Character.shaped()` 的结果：尺寸换过的同一个角色，外加出拳朝向（0 = 没在出拳）和格斗模式标志。"""
+
+    __slots__ = ("jab_dir", "fight")
+
+    def __init__(self, raw, jab_dir=0, fight=False):
+        Character.__init__(self, raw)
+        self.jab_dir = int(jab_dir)
+        self.fight = bool(fight)
+
+
+#: `(id(角色), 闯关, 缩小, 出拳朝向, 格斗) -> (角色, 变体)`（值里留着原对象，id 不会被复用）。
+_SHAPED = {}
 
 
 class _Store(object):
@@ -400,7 +513,15 @@ STORE = _Store()
 
 
 def get(character_id):
-    """按角色 id 取属性；查不到返回默认尺寸那一份。"""
+    """按角色 id 取属性；查不到返回默认尺寸那一份。
+
+    ★ 也收 `(角色 id, 闯关, 缩小, 出拳朝向[, 格斗])` 这种**形状键**（`bot._seat_shape` 给的），
+      返回换好形状的那一份（`Character.shaped`，X_Mod §101；格斗那一维是 X16 / D85 加的）。
+    """
+    if isinstance(character_id, tuple):
+        cid, quest, shrunk, jab_dir = character_id[:4]
+        fight = character_id[4] if len(character_id) > 4 else False
+        return STORE.get(cid).shaped(quest, shrunk, jab_dir, fight)
     return STORE.get(character_id)
 
 

@@ -13,8 +13,11 @@
 
     logs_client_crash/
         testuser1_a1b2c3d4_20260909-013642/
-            testuser1_a1b2c3d4_20260909-013642.zip   <- 原样保存，**不解压**
+            testuser1_a1b2c3d4_20260909-013642.7z    <- 原样保存，**不解压**
             receipt.json                             <- 谁、什么时候、多大、校验过没有
+
+包的扩展名看**内容开头的魔数**定（`package_suffix`）：新客户端传 7z（X17），已经发出去的
+老客户端传 zip —— 两种都收，谁也不认错谁。
 
 目录名 = ``<账号名>_<安装码>_<崩溃时刻>``，账号在前、时刻在后 ——
 按名称排序时同一个客户端的历次崩溃自然挨在一起（用户明确要的排序口径）。
@@ -44,6 +47,7 @@ import time
 
 #: 落位 / 待删改名那两句 `os.rename` 的重试外壳（见 `atomicfile.py` 文件头）。
 import atomicfile
+import sevenzip
 import tzstamp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -105,6 +109,15 @@ def check_id(crash_id):
 
 def crash_dir(root: str | None = None) -> str:
     return os.path.join(root, DIRNAME) if root else DEFAULT_CRASH_DIR
+
+
+def package_suffix(head):
+    """收到的第一块字节 → 存成什么扩展名：7z 签名开头的是 `.7z`，其余照旧 `.zip`。
+
+    ★ 看内容不看 `Content-Type`：头是客户端随口说的，魔数是包自己的。
+      不认识的内容照旧存 `.zip`（服务端从来不解包，只是原样收下）。
+    """
+    return ".7z" if bytes(head[:len(sevenzip.SIGNATURE)]) == sevenzip.SIGNATURE else ".zip"
 
 
 def _lower_names(directory):

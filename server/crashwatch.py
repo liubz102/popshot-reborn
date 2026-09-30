@@ -47,6 +47,16 @@
 
 非 Windows 平台上整个模块退化成 no-op（Linux 的服务端包里也有这个文件，
 但那边永远不会有客户端崩溃）。
+
+## 包是 7z（X17，用户 2026-09-30「客户端的崩溃包也改成7z格式上传到服务器吧」）
+
+`sevenzip.Writer` **非固实**（一个成员一个 folder）：每写完一个成员
+`tell()` 就是精确体积，「加不下就跳过」的额度照旧按它算；读坏的成员 `rollback()` 掉。
+压缩等级固定 `HIGH`（= 7-Zip「标准压缩」，用户 2026-09-30 定，D102）：两份玩家真崩溃包
+原来的 zip（deflate-6）12.8 / 10.6 MB → 6.6 / 6.7 MB（§143）。代价是多几秒、编码器多占 ~186 MB，
+都在游戏已经退出之后才付。
+服务端按魔数收（`crashstore.package_suffix`），已经发出去的老客户端传 zip 照收；
+本机 `logs/.crash_pending/` 里升级前攒下的 `.zip` 也照旧补传。
 """
 from __future__ import annotations
 
@@ -61,10 +71,10 @@ import secrets
 import sys
 import threading
 import time
-import zipfile
 
 #: 落位那几句 `os.replace` 的重试外壳（见 `atomicfile.py` 文件头）。
 import atomicfile
+import sevenzip
 import tzstamp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -76,6 +86,15 @@ DEFAULT_GAMEDIR = os.path.join(ROOT, "game_patched")
 #: 攒着等上传的压缩包放这儿。★ 点开头 ⇒ `logcleanup.is_log_name()` 永不碰它，
 #: 而 `logs/` 又在更新器的 `PROTECTED_PATHS` 里、打包时也不进 zip。
 PENDING_DIRNAME = ".crash_pending"
+
+#: 新打的包是 7z（X17）；待传队列里还可能躺着升级前攒下的 `.zip`，补传时两种都认。
+PACKAGE_SUFFIX = ".7z"
+PENDING_SUFFIXES = (".7z", ".zip")
+
+#: 裁完还超上限、就地留着不传的包：`<id>.toobig.7z`。★ 补传时**跳过**它 ——
+#: 以前 `*.zip` 的 glob 连 `.toobig.zip` 也匹配，拿 `<id>.toobig` 当 id 去传，
+#: 每次启动都白传三次、次次被服务端 400（会话 58 顺手修）。
+TOOBIG_MARK = ".toobig"
 
 #: 本机安装码存这儿（首次运行生成）。放 `logs/` 下的三个理由同上，
 #: 其中最要紧的是**打包脚本只在包里建空 `logs/`** —— 否则所有玩家
@@ -546,7 +565,7 @@ def pick_debug_log(gamedir, crash_epoch):
 
 
 class Collector:
-    """把一次崩溃的现场收集起来、压成一个 zip。
+    """把一次崩溃的现场收集起来、压成一个 7z（X17；以前是 zip）。
 
     ★ 抽成独立的类（不塞进 `CrashWatcher`）是为了让测试能拿磁盘上现成的
     那份真实崩溃直接跑「收集 → 打包」，不用起线程、不用真的崩一次。
@@ -585,9 +604,10 @@ class Collector:
 
         **必带的三样永远保留**：崩溃报告、`.mdmp`、`BigShot.rpt` 的最后一段。
         可选的（`Debug/` 和 `logs/`）按 size 从小到大加，加不下就跳过 ——
-        ★ 判据是「**未压缩**的大小超不超得过剩余预算」：deflate 最坏情况也
-        几乎不会让数据变大，所以这个保守判据永远不会超标，也不用先压一遍
-        试试看。
+        ★ 判据是「**未压缩**的大小超不超得过剩余预算」：LZMA2 最坏情况（压不动的
+        块按原样存）每 64 KiB 只多 3 个字节头，比原数据大不到 0.005%，那一点由
+        64 KiB 的余量兜住 —— 所以这个保守判据永远不会超标，也不用先压一遍试试看。
+        ★ 非固实：每个成员单独一个 folder，写完就收尾，`writer.tell()` 是精确体积。
         """
         session_start = report.mtime if session_start is None else session_start
         meta = {
@@ -638,55 +658,78 @@ class Collector:
             optional.append((path, "logs/" + os.path.basename(path)))
 
         tmp = out_path + ".part"
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED,
-                             compresslevel=6) as zf:
+        # 内存里现成的那几样（报告 / rpt 末段 / meta.json）没有文件 mtime，
+        # 记打包这一刻（和原来 `zipfile.writestr` 一样）。
+        now_ns = int(time.time() * 1e9)
+        with open(tmp, "wb") as fp:
+            writer = sevenzip.Writer(fp, level=sevenzip.HIGH, solid=False)
             # `BigShot.rpt` 只截最后一段：整份文件是跨机器跨目录一路追加下来的
             # 历次崩溃，和这一次无关。
             # ★ 一律按 latin-1 编回**原始字节**再写进包里。这两份文本是原版
             #   按 ANSI 写的，读的时候用 latin-1 就是「字节原样搬进 str」，
-            #   写的时候必须原路搬回去 —— 交给 `writestr` 去按 UTF-8 编码的话，
+            #   写的时候必须原路搬回去 —— 按 UTF-8 编码的话，
             #   包里那份和玩家机器上那份就不是同一串字节了。
-            zf.writestr("Dump/LastCrashReport.txt",
-                        report.text.encode("latin-1", "replace"))
+            writer.add_bytes("Dump/LastCrashReport.txt",
+                             report.text.encode("latin-1", "replace"), now_ns)
             tail = self._rpt_tail(report)
             if tail:
-                zf.writestr("BigShot.rpt.last.txt",
-                            tail.encode("latin-1", "replace"))
+                writer.add_bytes("BigShot.rpt.last.txt",
+                                 tail.encode("latin-1", "replace"), now_ns)
                 # ★ 拿 latin-1 原样的那份比：`tail` 也是 latin-1 读的。
                 if report.logged_at_raw and report.logged_at_raw not in tail:
                     # 对不上不算错（玩家可能手工删改过 rpt），但要说清楚 ——
                     # 说在 meta.json 里，别把话混进那份要保持原样的正文。
                     meta["rpt_mismatch"] = True
             for path, arcname in required:
-                self._add(zf, path, arcname, meta)
+                self._add(writer, path, arcname, meta)
             for path, arcname in sorted(optional,
                                         key=lambda item: _size_of(item[0])):
-                remain = self._remaining(zf)
+                remain = self._remaining(writer)
                 size = _size_of(path)
                 if remain is not None and size > remain:
                     meta["skipped"].append(
                         {"name": arcname, "why": "包太大，放不下了",
                          "bytes": size})
                     continue
-                self._add(zf, path, arcname, meta)
-            zf.writestr("meta.json",
-                        json.dumps(meta, ensure_ascii=False, indent=2,
-                                   sort_keys=True) + "\n")
+                self._add(writer, path, arcname, meta)
+            writer.add_bytes("meta.json",
+                             (json.dumps(meta, ensure_ascii=False, indent=2,
+                                         sort_keys=True) + "\n").encode("utf-8"),
+                             now_ns)
+            writer.close()
         atomicfile.replace(tmp, out_path)
         return meta
 
-    def _remaining(self, zf):
+    def _remaining(self, writer):
         """还能再塞多少字节。没设上限时回 `None`。"""
         if self.max_bytes <= 0:
             return None
-        # 留 64 KiB 给中央目录和 meta.json —— 它们在最后才写。
-        return max(0, self.max_bytes - zf.fp.tell() - 65536)
+        # 留 64 KiB 给末尾的目录头和 meta.json —— 它们在最后才写。
+        # 非固实 ⇒ `tell()` 是到上一个成员为止的精确体积。
+        return max(0, self.max_bytes - writer.tell() - 65536)
 
-    def _add(self, zf, path, arcname, meta):
+    def _add(self, writer, path, arcname, meta):
+        """把一个文件整个放进包里；打不开 / 读到一半坏了 = 记进 `skipped`，包照样完整。"""
         try:
-            zf.write(path, arcname)
+            src = open(path, "rb")
         except OSError as error:
             meta["skipped"].append({"name": arcname, "why": repr(error)})
+            return
+        with src:
+            try:
+                member = writer.begin(arcname)
+            except ValueError as error:         # 名字进不了 7z（报告里抄来的怪文件名）
+                meta["skipped"].append({"name": arcname, "why": str(error)})
+                return
+            try:
+                for chunk in iter(lambda: src.read(1 << 20), b""):
+                    writer.write(member, chunk)
+                mtime_ns = os.fstat(src.fileno()).st_mtime_ns
+            except OSError as error:
+                writer.rollback(member)         # 非固实：这个成员整个退掉
+                meta["skipped"].append({"name": arcname, "why": repr(error)})
+                return
+            writer.end(member, mtime_ns)
 
     def _rpt_tail(self, report):
         """`BigShot.rpt` 的最后一段 —— 整份文件是历次崩溃一路追加下来的。"""
@@ -709,6 +752,21 @@ def _size_of(path):
         return os.path.getsize(path)
     except OSError:
         return 0
+
+
+def pending_packages(pending_dir):
+    """待传队列里要补传的包（按名字排）：`.7z` 和升级前的 `.zip`；不含 `.toobig.*`、`.part`。"""
+    try:
+        names = os.listdir(pending_dir)
+    except OSError:
+        return []
+    out = []
+    for name in sorted(names):
+        stem, ext = os.path.splitext(name)
+        if ext.lower() not in PENDING_SUFFIXES or stem.endswith(TOOBIG_MARK):
+            continue
+        out.append(os.path.join(pending_dir, name))
+    return out
 
 
 def sha256_of(path):
@@ -741,11 +799,13 @@ def upload(path, crash_id, host, port, connect, crash_time_text="",
                 self.sock.settimeout(timeout)
 
     size = os.path.getsize(path)
+    # 新打的是 7z；升级前攒在待传队列里的老包还是 zip（服务端按魔数收，这个头只是说明）。
+    kind = "application/zip" if path.lower().endswith(".zip") else "application/x-7z-compressed"
     conn = _Conn(host, port, timeout=timeout)
     try:
         with open(path, "rb") as body:
             conn.request("POST", UPLOAD_PATH, body=body, headers={
-                "Content-Type": "application/zip",
+                "Content-Type": kind,
                 "Content-Length": str(size),
                 "X-Crash-Client": crash_id,
                 "X-Crash-Time": crash_time_text,
@@ -887,9 +947,8 @@ class CrashWatcher:
         """
         try:
             self.prune_pending()
-            for path in sorted(glob.glob(os.path.join(self.pending_dir,
-                                                      "*.zip"))):
-                crash_id = os.path.basename(path)[:-4]
+            for path in pending_packages(self.pending_dir):
+                crash_id = os.path.splitext(os.path.basename(path))[0]
                 self.log("崩溃上传 补传上次没传成功的 %s" % crash_id)
                 self.deliver(path, crash_id, "")
         except Exception as error:                  # noqa: BLE001
@@ -975,7 +1034,7 @@ class CrashWatcher:
                               log=self._log)
         crash_id = collector.crash_id(report)
         os.makedirs(self.pending_dir, exist_ok=True)
-        out = os.path.join(self.pending_dir, crash_id + ".zip")
+        out = os.path.join(self.pending_dir, crash_id + PACKAGE_SUFFIX)
         meta = collector.build(report, out, session_start=session_start,
                                pid=pid, exit_code=exit_code)
         size = os.path.getsize(out)
@@ -988,7 +1047,7 @@ class CrashWatcher:
                     else "（有 %d 项没放进去）" % len(meta["skipped"])))
         if self.max_bytes and size > self.max_bytes:
             # 裁到最后还是超 —— 传上去也只会被 413，不如就地说清楚。
-            keep = out[:-4] + ".toobig.zip"
+            keep = out[:-len(PACKAGE_SUFFIX)] + TOOBIG_MARK + PACKAGE_SUFFIX
             atomicfile.replace(out, keep)
             self.log("崩溃上传 ✗ 包 %.1f MB 超过上限 %.1f MB，没有上传；"
                      "现场留在 %s" % (size / 1048576.0,

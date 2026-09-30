@@ -969,10 +969,10 @@ class RewardDefaultsTests(unittest.TestCase):
             self.by_key[key] = rule
 
     def test_the_table_has_exactly_the_slots_the_page_draws(self):
-        # 8 档对战 + 21 档闯关 + 1 条加成系数 = 30。少一档，管理页上就少一格。
-        self.assertEqual(8 + len(shopcfg.QUEST_ZH) * len(shopcfg.DIFFICULTY_ZH) + 1,
+        # 10 档对战 + 21 档闯关 + 1 条加成系数 = 32。少一档，管理页上就少一格。
+        self.assertEqual(10 + len(shopcfg.QUEST_ZH) * len(shopcfg.DIFFICULTY_ZH) + 1,
                          len(self.rules))
-        for mode in sorted(shopcfg.PVP_MODE_ZH):
+        for mode in (0, 3):                      # 生存 / 夺分：道具战 × 队伍 四档
             for item_mode in (False, True):
                 for team in sorted(shopcfg.TEAM_ZH):
                     self.assertIn(("pvp", mode, item_mode, team), self.by_key)
@@ -980,6 +980,27 @@ class RewardDefaultsTests(unittest.TestCase):
             for difficulty in shopcfg.DIFFICULTY_ZH:
                 self.assertIn(("quest", stage, difficulty), self.by_key)
         self.assertIn(("bonus",), self.by_key)
+
+    def test_fight_mode_has_its_own_two_slots_and_no_item_mode(self):
+        """★ 格斗（模式 2）单独两档：个人战 / 组队战（X_Mod D103）。
+
+        没有道具战那两档 —— 客户端在格斗模式下把道具开关强制清 0，
+        `lobby.item_mode_of` 同口径，配了也永远命中不到。
+        """
+        self.assertEqual("格斗模式", shopcfg.PVP_MODE_ZH.get(2))
+        for team in sorted(shopcfg.TEAM_ZH):
+            self.assertIn(("pvp", 2, False, team), self.by_key)
+            self.assertNotIn(("pvp", 2, True, team), self.by_key)
+        self.assertEqual({0, 2, 3}, set(key[1] for key in self.by_key
+                                        if key[0] == "pvp"))
+
+    def test_the_page_lists_fight_after_the_two_old_modes(self):
+        """★ 管理页对战表的行序 = `PVP_MODE_ZH` 的顺序：格斗接在后面，
+        原来生存 / 夺分那两行的位置不动（`SCHEMA` 那里特意没排序）。"""
+        spec = [field for field in shopcfg.SCHEMA["rewards"]["fields"]
+                if field["key"] == "pvp_mode"][0]
+        self.assertEqual([0, 3, 2], [option["value"]
+                                     for option in spec["options"]])
 
     def test_every_quest_slot_equals_the_old_formula(self):
         for stage in shopcfg.QUEST_ZH:
@@ -1012,6 +1033,138 @@ class RewardDefaultsTests(unittest.TestCase):
                          bonus["quest_score_per_exp"])
         self.assertEqual(self.PVP_EXPERIENCE_PER_KILL,
                          bonus["pvp_exp_per_kill"])
+
+
+class RewardBackfillTests(_CfgCase):
+    """`backfill_rewards()` —— 老服务器开服时把缺的档位按默认值补进 `rewards.json`
+    （X_Mod D103）。
+
+    用户 2026-09-30：老云服上的老配置没有格斗模式的数值，
+    「如果配置文件里没有，需要追加并写入默认值」。
+    """
+
+    FIGHT = [("pvp", 2, False, 0), ("pvp", 2, False, 1)]
+
+    def setUp(self):
+        super().setUp()
+        self.path = shopcfg.path_of(shopcfg.REWARDS_FILENAME, self.dir)
+
+    @staticmethod
+    def old_rules():
+        """上一版的 `rewards.json`：默认表去掉格斗那两档，外加运营把生存模式
+        个人战的「赢 · 金币」调成了 999 —— 格斗以前借的正是这一行。"""
+        rules = []
+        for rule in shopcfg.reward_defaults():
+            if rule["mode"] == "pvp" and rule["pvp_mode"] == 2:
+                continue
+            rule = dict(rule)
+            if rule["mode"] == "pvp" and rule["pvp_mode"] == 0:
+                rule["win_money"] = 999
+            rules.append(rule)
+        return rules
+
+    def write_old(self):
+        shopcfg.write_json(self.path, {"format": shopcfg.FORMAT,
+                                       "rules": self.old_rules()})
+
+    def on_disk(self):
+        with open(self.path, "r", encoding="utf-8") as fp:
+            return json.load(fp)["rules"]
+
+    def test_an_old_file_gets_the_fight_slots_with_default_values(self):
+        self.write_old()
+        added = shopcfg.backfill_rewards(self.dir, apply=True)
+        self.assertEqual(self.FIGHT, [shopcfg.reward_key(r) for r in added])
+        defaults = dict((shopcfg.reward_key(r), r)
+                        for r in shopcfg.reward_defaults())
+        disk = dict((shopcfg.reward_key(r), r) for r in self.on_disk())
+        for key in self.FIGHT:
+            self.assertEqual(defaults[key], disk[key], key)
+        # ★ 写的是**内置默认值**，不是把生存那一行（运营调成了 999）抄过来。
+        self.assertEqual(defaults[self.FIGHT[0]]["win_money"],
+                         disk[self.FIGHT[0]]["win_money"])
+        self.assertNotEqual(999, disk[self.FIGHT[0]]["win_money"])
+
+    def test_what_the_operator_set_is_kept(self):
+        """★★ 只增不改（铁律 11）：原有的每一档连顺序带数值原样留着。"""
+        self.write_old()
+        shopcfg.backfill_rewards(self.dir, apply=True)
+        kept = [r for r in self.on_disk()
+                if shopcfg.reward_key(r) not in self.FIGHT]
+        self.assertEqual(self.old_rules(), kept)
+
+    def test_the_new_slots_follow_the_other_pvp_slots(self):
+        # 拿记事本改文件的人不用满文件找：格斗那两档紧跟着原来那 8 档对战。
+        self.write_old()
+        shopcfg.backfill_rewards(self.dir, apply=True)
+        keys = [shopcfg.reward_key(r) for r in self.on_disk()]
+        self.assertEqual(["pvp"] * 10, [key[0] for key in keys[:10]])
+        self.assertEqual(self.FIGHT, keys[8:10])
+
+    def test_the_server_reads_the_new_slots_right_away(self):
+        self.write_old()
+        before, _warnings = shopcfg.rewards(self.dir)       # 先把老的读进缓存
+        self.assertNotIn(self.FIGHT[0],
+                         [shopcfg.reward_key(r) for r in before])
+        shopcfg.backfill_rewards(self.dir, apply=True)
+        after, warnings = shopcfg.rewards(self.dir)
+        self.assertEqual([], warnings)
+        self.assertEqual(len(shopcfg.reward_defaults()), len(after))
+
+    def test_is_idempotent(self):
+        # 补完判据自己就不成立了 —— 这正是它敢每次开服都跑的前提之一。
+        self.write_old()
+        self.assertTrue(shopcfg.backfill_rewards(self.dir, apply=True))
+        raw = _read_bytes(self.path)
+        self.assertEqual([], shopcfg.backfill_rewards(self.dir, apply=True))
+        self.assertEqual(raw, _read_bytes(self.path))
+
+    def test_a_new_install_has_nothing_to_add(self):
+        shopcfg.ensure_files(self.dir)
+        raw = _read_bytes(self.path)
+        self.assertEqual([], shopcfg.backfill_rewards(self.dir, apply=True))
+        self.assertEqual(raw, _read_bytes(self.path))
+        self.assertEqual([], [n for n in os.listdir(self.dir) if ".bak-" in n])
+
+    def test_dry_run_writes_nothing(self):
+        self.write_old()
+        raw = _read_bytes(self.path)
+        added = shopcfg.backfill_rewards(self.dir)          # apply 默认 False
+        self.assertEqual(self.FIGHT, [shopcfg.reward_key(r) for r in added])
+        self.assertEqual(raw, _read_bytes(self.path))
+
+    def test_a_backup_is_left_beside_it(self):
+        self.write_old()
+        raw = _read_bytes(self.path)
+        shopcfg.backfill_rewards(self.dir, apply=True)
+        backups = [n for n in os.listdir(self.dir)
+                   if n.startswith(shopcfg.REWARDS_FILENAME + ".bak-")]
+        self.assertEqual(1, len(backups), backups)
+        self.assertEqual(raw, _read_bytes(os.path.join(self.dir, backups[0])))
+
+    def test_a_missing_file_is_left_to_ensure_files(self):
+        self.assertEqual([], shopcfg.backfill_rewards(self.dir, apply=True))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_a_broken_file_is_not_touched(self):
+        """D10：可能正编辑到一半 —— 抛出来让开服那边喊一声，一个字节都不写。"""
+        with open(self.path, "w", encoding="utf-8", newline="\n") as fp:
+            fp.write("{ 我正在编辑")
+        raw = _read_bytes(self.path)
+        with self.assertRaises(shopcfg.ConfigError):
+            shopcfg.backfill_rewards(self.dir, apply=True)
+        self.assertEqual(raw, _read_bytes(self.path))
+        self.assertEqual([], [n for n in os.listdir(self.dir) if ".bak-" in n])
+
+    def test_an_invalid_file_is_not_touched(self):
+        # 同一档写了两遍：校验不过的文件也不补，补了反而把问题盖住。
+        rules = self.old_rules()
+        rules.append(dict(rules[0]))
+        shopcfg.write_json(self.path, {"format": shopcfg.FORMAT, "rules": rules})
+        raw = _read_bytes(self.path)
+        with self.assertRaises(shopcfg.ConfigError):
+            shopcfg.backfill_rewards(self.dir, apply=True)
+        self.assertEqual(raw, _read_bytes(self.path))
 
 
 class NameTests(_CfgCase):
@@ -1124,7 +1277,9 @@ class ItemDescTests(unittest.TestCase):
         用户 2026-09-09 说称号将来要上架，所以提前查好钉住 —— 这三条要是
         被人当成「没有加成」删掉，上架当天就会重演火焰蝙蝠那件事。
         """
-        self.assertEqual("受到伤害时 50% 概率完全免疫",
+        # ★ 「剩余 HP 低于 15」「足以致命」是掷点前的两道门（X_Mod §90）——
+        #   2026-09-25 以前这句只写了「受到伤害时 50%」，玩家读成全程半伤免疫。
+        self.assertEqual("剩余 HP 低于 15 时，受到足以致命的一击有 50% 概率完全免疫",
                          shopcfg.item_desc_zh(shopdata.get(560004)))
         # ★ 「45」是**伤害点数**不是开枪次数（`0x50b404 sub eax,ecx` 扣的是
         #   翻倍后的伤害值），文案里必须写清楚，用户 2026-09-09 就问岔过一次。

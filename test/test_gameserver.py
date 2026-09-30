@@ -997,7 +997,8 @@ class LeaveSessionTests(unittest.TestCase):
     class Args:
         hold_lobby = False
 
-    def make_conn(self):
+    def make_conn(self, settled=False):
+        """`settled=True` = 结算包已经发给他、他还没走 `0x0405` 回房间。"""
         conn = gameserver.Conn.__new__(gameserver.Conn)
         conn.addr = ("::ffff:127.0.0.1", 40000)
         conn.connected_at = time.monotonic()
@@ -1016,7 +1017,7 @@ class LeaveSessionTests(unittest.TestCase):
         conn.send_lock = threading.RLock()
         conn.send_queue = None
         conn.room = {"session_type": 2}
-        conn.settled = True
+        conn.settled = settled
         conn.quest_score = 64
         conn.quest_success = True
         conn.solo_quest = gameserver.RoomQuest()
@@ -1024,14 +1025,15 @@ class LeaveSessionTests(unittest.TestCase):
         conn.items_picked = 0
         conn.my_seat = 0
         conn.start_game = StartGameHandshake()
+        # 09-29 云服「布洛芬」那一局结算后的存档（X_Mod §141）。
+        conn.account = {"experience": 1809, "money": 4396, "level": 6}
         return conn
 
     def test_leave_session_replies_success_and_clears_the_room(self):
-        conn = self.make_conn()
+        conn = self.make_conn(settled=True)
         conn.start_game.on_client_packet(OP_COUNT_GAME_READY, b"")
         gameserver.Conn.leave_session(conn)
-        self.assertEqual(1, len(conn.sent))
-        kind, opcode, payload, _ = take_frame(conn.sent[0])
+        kind, opcode, payload, _ = take_frame(conn.sent[-1])
         self.assertEqual(("game", OP_LEAVE_SESSION, w_i32(0)),
                          (kind, opcode, payload))
         # 房间没了，跟房间绑定的状态必须一起作废，否则下次建房带着残留。
@@ -1039,6 +1041,26 @@ class LeaveSessionTests(unittest.TestCase):
         self.assertFalse(conn.settled)
         self.assertEqual(0, conn.quest_score)
         self.assertEqual(StartGameHandshake().state, conn.start_game.state)
+
+    def test_a_plain_leave_sends_only_the_reply(self):
+        # 房间里退房（没结算过）：数据栏没被动过，一个多余的包都不发。
+        conn = self.make_conn()
+        gameserver.Conn.leave_session(conn)
+        self.assertEqual([OP_LEAVE_SESSION],
+                         [take_frame(f)[1] for f in conn.sent])
+
+    def test_leaving_before_the_result_screen_is_done_resyncs_the_data_bar(self):
+        # ★★ X_Mod §141 / D100：命用完的确认框点「是」= 结算后直接 0x0203，
+        #    没有 0x0405 ⇒ `leave_game_result` 那发 0x0600 不会来。
+        #    这里补，而且排在回包**前面**（大厅建出来时数据栏已经是新值）。
+        conn = self.make_conn(settled=True)
+        gameserver.Conn.leave_session(conn)
+        self.assertEqual([OP_REP_MONEY, OP_LEAVE_SESSION],
+                         [take_frame(f)[1] for f in conn.sent])
+        body = take_frame(conn.sent[0])[2]
+        self.assertEqual(build_rep_money(money=4396, experience=1809,
+                                         level_start_exp=1500,
+                                         next_level_exp=2100, level=6), body)
 
     def test_incoming_leave_session_packet_is_routed_to_the_reply(self):
         conn = self.make_conn()
@@ -2337,9 +2359,10 @@ class ResultScreenNumbersTests(unittest.TestCase):
         values = self.result_values(self.sent_with(conn, OP_REP_GAME_RESULT))
         self.assertEqual(0, values[GAME_RESULT_LADDER_POINT])
 
-    def test_a_scoreless_run_only_touches_the_three_known_slots(self):
-        # ⚠ §100：除了那三格，其余 9 个业务值**必须**保持 0，
-        #    12 个值一次全填非 0 会让客户端 20 毫秒内主动断链。
+    def test_a_scoreless_run_only_touches_the_known_slots(self):
+        # ⚠ §100：没查明的 5 格（0 / 1 / 4 / 7 / 8）**必须**保持 0 ——
+        #    尤其第 4 格，非 0 就是「疑似外挂，结束客户端」（X_Mod §141）。
+        #    自己那份另带数据栏四格（D100），见 `test_battle.DataBarAfterSettlementTests`。
         #    ★ 0 分不再等于 0 奖励：没通关也给基础奖励的 QUEST_FAILED_RATIO
         #    那一份（§227），打了半天不能一无所获。
         conn = self.make_conn(score=0)
@@ -2349,10 +2372,33 @@ class ResultScreenNumbersTests(unittest.TestCase):
         self.assertEqual(want_exp, values[GAME_RESULT_EXPERIENCE])
         self.assertEqual(want_money, values[GAME_RESULT_MONEY])
         self.assertEqual(0, values[GAME_RESULT_LADDER_POINT])
-        rest = [v for i, v in enumerate(values)
-                if i not in (GAME_RESULT_EXPERIENCE, GAME_RESULT_MONEY,
-                             GAME_RESULT_LADDER_POINT)]
-        self.assertEqual([0] * 9, rest)
+        self.assertEqual([0] * 5, [values[i] for i in (0, 1, 4, 7, 8)])
+        # 这个假连接没有账号名 ⇒ 没入账 ⇒ 余额仍是 0：金币格 + 本局所得 = 0。
+        self.assertEqual(0, values[gameserver.GAME_RESULT_BAR_MONEY]
+                         + values[GAME_RESULT_MONEY])
+
+    def test_the_data_bar_lands_on_wire_values_2_3_5_6(self):
+        # X_Mod §141：`0x5523e5..0x552400` 读的是 pkt+0x10/+0x14/+0x1c/+0x20，
+        # 反序列化 `0x54c6b4` 里就是座位号之后第 2/3/5/6 个 4 字节。
+        payload = build_rep_game_result(
+            0, values=build_game_result_values(
+                experience=7, money=30, data_bar=(1809, 4396, 1500, 2100)))
+        self.assertEqual([1809, 4366, 1500, 2100],
+                         [struct.unpack_from("<i", payload, 4 + 4 * i)[0]
+                          for i in (2, 3, 5, 6)])
+        # 不带 data_bar 就和以前逐字节相同。
+        self.assertEqual(
+            build_rep_game_result(0, values=[0] * 9 + [7, 30, 0]),
+            build_rep_game_result(0, values=build_game_result_values(
+                experience=7, money=30)))
+
+    def test_a_huge_balance_is_clamped_instead_of_raising(self):
+        # `apply_battle` 不钳余额；金币格要是撑破 int32，`struct.pack` 会在
+        # 结算循环里抛出去，整个房间都收不到结算。
+        values = build_game_result_values(money=30,
+                                          data_bar=(0, 2 ** 32, 0, 0))
+        self.assertEqual(2 ** 31 - 1, values[gameserver.GAME_RESULT_BAR_MONEY])
+        build_rep_game_result(0, values=values)   # 不许抛
 
     def test_the_clear_tail_still_rides_along(self):
         # 数值和「完成」标签在同一发包里，加了值不能把标签挤掉。
@@ -3504,7 +3550,7 @@ class RewardLookupTests(unittest.TestCase):
     # -- 对战：模式 / 道具战 / 组队战 各查各的 --------------------------------
 
     def test_each_pvp_combination_reads_its_own_slot(self):
-        """★ 2026-09-10 之前八种组合给的钱一模一样，现在各是各的。"""
+        """★ 2026-09-10 之前八种组合给的钱一模一样，现在各是各的（格斗见下两条）。"""
         self.write(
             self.pvp(0, False, 0, win_money=1),
             self.pvp(0, False, 1, win_money=2),
@@ -3536,15 +3582,40 @@ class RewardLookupTests(unittest.TestCase):
         self.write(self.pvp(0, win_money=99, lose_money=7), self.BONUS)
         self.assertEqual(7, gameserver.pvp_reward(0, False, 0)[1])
 
-    def test_unlisted_game_modes_are_filed_by_their_victory_condition(self):
-        """★ 表里只有生存(0) / 夺分(3)。模式 2 和 0 共用生存的胜负条件 ⇒ 归生存；
-        模式 1（计时）和一切没见过的号归夺分，和 `pvp_game_mode()` 的兜底一致。"""
-        self.write(self.pvp(0, win_money=100), self.pvp(3, win_money=300),
+    def test_fight_mode_reads_its_own_slots_not_survivals(self):
+        """★ X_Mod D103：格斗（模式 2）以前借生存那一行，现在查自己那两档。"""
+        self.write(self.pvp(0, False, 0, win_money=100),
+                   self.pvp(0, False, 1, win_money=101),
+                   self.pvp(2, False, 0, win_money=200, win_exp=20),
+                   self.pvp(2, False, 1, win_money=201, win_exp=21),
                    self.BONUS)
-        for game_mode, want in ((0, 100), (2, 100), (1, 300), (3, 300),
+        self.assertEqual((20, 200, []),
+                         gameserver.pvp_reward(0, True, 2, False, False))
+        self.assertEqual((21, 201, []),
+                         gameserver.pvp_reward(0, True, 2, False, True))
+        self.assertEqual(100, gameserver.pvp_reward(0, True, 0, False, False)[1])
+
+    def test_unlisted_game_modes_fall_back_to_deathmatch(self):
+        """★ 表里有生存(0) / 夺分(3) / 格斗(2)。模式 1（计时）和一切没见过的号
+        归夺分，和 `pvp_game_mode()` 的兜底一致。"""
+        self.write(self.pvp(0, win_money=100), self.pvp(2, win_money=200),
+                   self.pvp(3, win_money=300), self.BONUS)
+        for game_mode, want in ((0, 100), (2, 200), (1, 300), (3, 300),
                                 (None, 300), (99, 300)):
             self.assertEqual(want, gameserver.pvp_reward(0, True, game_mode)[1],
                              game_mode)
+
+    def test_an_old_file_without_fight_slots_pays_the_defaults(self):
+        """★ 老服务器的 `rewards.json` 没有格斗那两档（开服补档之前 / 补档没做成）：
+        按**内置默认值**发并警告 —— 不是 0，也不是生存那一行；开服补档
+        （`shopcfg.backfill_rewards`）写进去的正是同一个数，补完不再警告（X_Mod D103）。"""
+        self.write(self.pvp(0, win_money=999), self.BONUS)
+        experience, money, warnings = gameserver.pvp_reward(0, True, 2)
+        self.assertEqual((25, 80), (experience, money))     # 默认表那一档
+        self.assertTrue(any("格斗模式" in w for w in warnings), warnings)
+        shopcfg.backfill_rewards(self.tmp.name, apply=True)
+        self.assertEqual((25, 80, []), gameserver.pvp_reward(0, True, 2))
+        self.assertEqual(999, gameserver.pvp_reward(0, True, 0)[1])
 
     # -- 缺一档 / 坏文件：退回内置默认值，**不是 0** --------------------------
 

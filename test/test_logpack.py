@@ -15,6 +15,8 @@ import unittest
 import zipfile
 
 import logpack
+import sevenzip
+from testsupport import read_7z
 
 HOUR = 3600.0
 
@@ -375,6 +377,219 @@ class WriteZipTests(_Case):
         with self.assertRaises(logpack.PackAborted) as caught:
             self.packer.write_zip(_Sink(), plan)
         self.assertIn("logs/server.out", str(caught.exception))
+
+
+# ----------------------------------------------------------------- 7z（X17）
+class _FailingFile(io.BytesIO):
+    """写到第 `fail_at` 次就抛 ENOSPC（模拟临时文件那块盘满了）。"""
+
+    def __init__(self, fail_at):
+        super().__init__()
+        self.fail_at = fail_at
+        self.calls = 0
+
+    def write(self, data):
+        self.calls += 1
+        if self.calls >= self.fail_at:
+            raise OSError(28, "No space left on device")
+        return super().write(data)
+
+
+@unittest.skipUnless(sevenzip.AVAILABLE, "这个 Python 没带 lzma")
+class Write7zTests(_Case):
+    TEXT = "".join("[2026-09-30 10:00:00.%03d] [app] 服务端日志 %d\n" % (i % 1000, i)
+                   for i in range(3000)).encode("utf-8")
+
+    def write_log(self, name, data, hours_ago=0.0):
+        path = self.log(name, hours_ago=hours_ago)
+        with open(path, "wb") as fp:
+            fp.write(data)
+        when = self.now - hours_ago * HOUR
+        os.utime(path, (when, when))
+        return path
+
+    def pack(self, plan, level=sevenzip.HIGH, **kwargs):
+        buf = io.BytesIO()
+        stats = self.packer.write_7z(buf, plan, level, **kwargs)
+        self.assertEqual(len(buf.getvalue()), stats["size"])
+        return stats, read_7z(buf.getvalue())
+
+    def test_a_solid_7z_with_every_log_and_a_manifest(self):
+        self.write_log("server.out", self.TEXT)
+        self.write_log("online.log", b"online\n" * 10)
+        self.write_log("server-boot.err", b"")                  # 空文件：进包、是文件
+        stats, archive = self.pack(self.packer.plan("server"),
+                                   meta={"version": "V0.5.0", "by": "admin"})
+        self.assertEqual(3, stats["files"])
+        self.assertEqual(len(self.TEXT) + 70, stats["bytes"])
+        self.assertEqual([], stats["skipped"])
+        self.assertEqual(["logs/online.log", "logs/server-boot.err", "logs/server.out",
+                          "MANIFEST.txt"], archive.names)
+        self.assertEqual(self.TEXT, archive.read("logs/server.out"))
+        empty = archive.entry("logs/server-boot.err")
+        self.assertFalse(empty.is_dir)
+        self.assertEqual(b"", empty.data)
+        self.assertEqual(1, len(archive.folders))               # 固实：一个 LZMA2 流
+        self.assertEqual("lzma2", archive.entry("logs/server.out").method)
+        manifest = archive.read("MANIFEST.txt").decode("utf-8")
+        self.assertIn("服务端日志（全量）", manifest)
+        self.assertIn("压缩者: admin", manifest)
+        self.assertIn("压缩等级: 高（LZMA2，字典 16 MB，≈ 7-Zip「标准压缩」）", manifest)
+        self.assertIn("7z 内路径", manifest)
+        self.assertIn("logs/server.out\t%d\t" % len(self.TEXT), manifest)
+        self.assertNotIn("跳过", manifest)
+
+    def test_the_level_decides_the_dictionary(self):
+        """弹窗选的档（D102）一路传到 7z 头里的字典码：高 16 MiB（`0x18`）、低 1 MiB（`0x10`）。"""
+        self.write_log("server.out", self.TEXT)
+        for level, prop, line in ((sevenzip.HIGH, b"\x18", "压缩等级: 高（LZMA2，字典 16 MB"),
+                                  (sevenzip.LOW, b"\x10", "压缩等级: 低（LZMA2，字典 1 MB")):
+            _stats, archive = self.pack(self.packer.plan("server"), level)
+            self.assertEqual([prop], [folder[1] for folder in archive.folders], level)
+            self.assertIn(line, archive.read("MANIFEST.txt").decode("utf-8"))
+            self.assertEqual(self.TEXT, archive.read("logs/server.out"))
+
+    def test_an_unknown_level_writes_nothing(self):
+        self.write_log("server.out", self.TEXT)
+        buf = io.BytesIO()
+        with self.assertRaises(ValueError):
+            self.packer.write_7z(buf, self.packer.plan("server"), "max")
+        self.assertEqual(b"", buf.getvalue())
+
+    def test_the_zip_manifest_has_no_level_line(self):
+        # ★ zip 那一路一个字节不变（D101）：压缩等级只是 7z 的事。
+        self.write_log("server.out", b"x")
+        text = logpack.manifest_text(self.packer.plan("server"), [], [], {})
+        self.assertNotIn("压缩等级", text)
+
+    def test_the_mtime_survives(self):
+        self.write_log("server.out", b"x" * 10, hours_ago=3)
+        _stats, archive = self.pack(self.packer.plan("server"))
+        mtime = archive.entry("logs/server.out").mtime_ns / 1e9
+        self.assertAlmostEqual(self.now - 3 * HOUR, mtime, delta=2)
+
+    def test_crash_packages_are_stored_first_and_the_rest_compressed(self):
+        self.crash_dir("alice_a1b2c3d4_20260909-013642",
+                       files=(("alice_a1b2c3d4_20260909-013642.7z", 400), ("receipt.json", 40)))
+        self.crash_dir("bob_deadbeef_20260910-010203",
+                       files=(("bob_deadbeef_20260910-010203.zip", 300), ("receipt.json", 40)))
+        _stats, archive = self.pack(self.packer.plan("client_crash"))
+        base = "logs_client_crash/"
+        self.assertEqual("copy", archive.entry(
+            base + "alice_a1b2c3d4_20260909-013642/alice_a1b2c3d4_20260909-013642.7z").method)
+        self.assertEqual("copy", archive.entry(
+            base + "bob_deadbeef_20260910-010203/bob_deadbeef_20260910-010203.zip").method)
+        self.assertEqual("lzma2", archive.entry(
+            base + "bob_deadbeef_20260910-010203/receipt.json").method)
+        self.assertEqual(["copy", "lzma2"], [folder[0] for folder in archive.folders])
+        # 清单照 plan 的顺序列（不是压缩的先后）。
+        manifest = archive.read("MANIFEST.txt").decode("utf-8")
+        self.assertLess(manifest.index("alice_a1b2c3d4_20260909-013642/receipt.json"),
+                        manifest.index("bob_deadbeef_20260910-010203/bob_deadbeef"))
+
+    def test_a_file_deleted_after_the_plan_is_skipped_and_recorded(self):
+        self.write_log("server.out", b"keep")
+        gone = self.write_log("server-20260901.out", b"gone")
+        plan = self.packer.plan("server")
+        os.remove(gone)
+        stats, archive = self.pack(plan)
+        self.assertEqual(1, stats["files"])
+        self.assertEqual(["logs/server-20260901.out"], [name for name, _why in stats["skipped"]])
+        self.assertEqual(["logs/server.out", "MANIFEST.txt"], archive.names)
+        manifest = archive.read("MANIFEST.txt").decode("utf-8")
+        self.assertIn("跳过: 1 个", manifest)
+        self.assertIn("logs/server-20260901.out —— ", manifest)
+
+    def test_a_file_that_grew_after_the_plan_is_packed_whole(self):
+        path = self.write_log("server.out", b"a" * 10)
+        plan = self.packer.plan("server")
+        with open(path, "ab") as fp:
+            fp.write(b"b" * 20)
+        _stats, archive = self.pack(plan)
+        self.assertEqual(b"a" * 10 + b"b" * 20, archive.read("logs/server.out"))
+
+    def test_a_file_truncated_to_nothing_becomes_an_empty_file(self):
+        path = self.write_log("server.out", b"a" * 10)
+        plan = self.packer.plan("server")
+        open(path, "wb").close()
+        _stats, archive = self.pack(plan)
+        self.assertFalse(archive.entry("logs/server.out").is_dir)
+        self.assertEqual(b"", archive.read("logs/server.out"))
+
+    def test_more_than_a_read_chunk_and_the_dictionary(self):
+        # 比高档的字典（16 MiB）还长、跨几十块 READ_CHUNK（本机 ~2 秒）。
+        big = self.TEXT * (sevenzip.LEVELS[sevenzip.HIGH].dict_size // len(self.TEXT) + 2)
+        self.write_log("server.out", big)
+        seen = []
+        stats, archive = self.pack(self.packer.plan("server"), progress=seen.append)
+        self.assertEqual(big, archive.read("logs/server.out"))
+        self.assertEqual(len(big), seen[-1])
+        self.assertEqual(sorted(seen), seen)                    # 只增不减
+        self.assertGreater(len(seen), len(big) // logpack.READ_CHUNK)
+        self.assertLess(stats["size"], len(big) // 5)           # 日志至少压到 1/5
+
+    def test_a_read_error_mid_file_aborts_the_whole_7z(self):
+        self.write_log("server.out", self.TEXT)
+        plan = self.packer.plan("server")
+        real_open = open
+
+        class Broken:
+            def __init__(self, fp):
+                self.fp = fp
+                self.reads = 0
+
+            def read(self, size):
+                self.reads += 1
+                if self.reads > 1:
+                    raise OSError(5, "读盘出错")
+                return self.fp.read(size)
+
+            def fileno(self):
+                return self.fp.fileno()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.fp.close()
+
+        logpack.open = lambda path, mode="r": Broken(real_open(path, mode))
+        self.addCleanup(delattr, logpack, "open")
+        with self.assertRaises(logpack.PackAborted) as caught:
+            self.packer.write_7z(io.BytesIO(), plan, sevenzip.HIGH)
+        self.assertIn("logs/server.out", str(caught.exception))
+        self.assertIn("读到一半", str(caught.exception))
+
+    def test_a_full_disk_is_reported_as_our_side(self):
+        self.write_log("server.out", self.TEXT)
+        with self.assertRaises(logpack.PackAborted) as caught:
+            self.packer.write_7z(_FailingFile(fail_at=2), self.packer.plan("server"),
+                                 sevenzip.HIGH)
+        self.assertIn("临时文件写不进去", str(caught.exception))
+
+    def test_a_name_7z_cannot_hold_is_skipped(self):
+        self.write_log("server.out", b"fine")
+        plan = self.packer.plan("server")
+        plan.entries.append((plan.entries[0][0], "logs/../escape"))
+        stats, archive = self.pack(plan)
+        self.assertEqual(["logs/server.out", "MANIFEST.txt"], archive.names)
+        self.assertEqual("logs/../escape", stats["skipped"][0][0])
+
+    def test_without_lzma_it_says_so(self):
+        self.write_log("server.out", b"x")
+        real = sevenzip.AVAILABLE
+        sevenzip.AVAILABLE = False
+        self.addCleanup(setattr, sevenzip, "AVAILABLE", real)
+        with self.assertRaises(logpack.SevenZipUnavailable) as caught:
+            self.packer.write_7z(io.BytesIO(), self.packer.plan("server"), sevenzip.HIGH)
+        self.assertEqual(503, caught.exception.status)
+
+    def test_the_stem_is_shared_by_zip_and_7z(self):
+        self.write_log("server.out", b"x")
+        self.now = time.mktime((2026, 9, 17, 21, 30, 45, 0, 0, -1))
+        plan = self.packer.plan("server", "recent")
+        self.assertEqual("logs_server_12h_20260917-213045", plan.stem)
+        self.assertEqual(plan.stem + ".zip", plan.filename)
 
 
 if __name__ == "__main__":

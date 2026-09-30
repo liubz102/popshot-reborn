@@ -26,6 +26,14 @@ import zipfile
 
 import crashstore
 import crashwatch
+import sevenzip
+from testsupport import read_7z
+
+
+def read_package(path):
+    """崩溃包（X17 起是 7z）→ `testsupport.SevenZipArchive`（严格校验过的）。"""
+    with open(path, "rb") as fp:
+        return read_7z(fp.read())
 
 
 #: 一份真实的 `LastCrashReport.txt`（取自 2026-09-09 01:36:42 那次火焰蝙蝠
@@ -414,7 +422,7 @@ class CollectorTests(unittest.TestCase):
     def build(self, max_bytes=0):
         col = self.collector(max_bytes)
         report = crashwatch.read_crash_report(self.fx.game)
-        out = os.path.join(self.tmp.name, "out.zip")
+        out = os.path.join(self.tmp.name, "out.7z")
         meta = col.build(report, out, session_start=self.fx.crash_epoch - 600,
                          pid=41612, exit_code=0xC0000005)
         return out, meta, col.crash_id(report)
@@ -425,21 +433,21 @@ class CollectorTests(unittest.TestCase):
                          r"^testuser1_[0-9a-f]{8}_20260909-013642$")
         self.assertRegex(crash_id, crashstore.ID_RE)
 
-    def test_zip_contents(self):
+    def test_package_contents(self):
         out, meta, _ = self.build()
-        with zipfile.ZipFile(out) as zf:
-            names = set(zf.namelist())
-            self.assertIn("meta.json", names)
-            self.assertIn("Dump/LastCrashReport.txt", names)
-            self.assertIn("Dump/BigShotV0311N001.mdmp", names)
-            self.assertIn("BigShot.rpt.last.txt", names)
-            self.assertIn("Debug/2026-09-09.txt", names)
-            self.assertIn("logs/relay.out", names)
-            # ★ rpt 只截最后一段
-            tail = zf.read("BigShot.rpt.last.txt").decode("latin-1")
-            self.assertIn("09/09/26, 01:36:42", tail)
-            self.assertNotIn("09/06/26", tail)
-            got = json.loads(zf.read("meta.json").decode("utf-8"))
+        archive = read_package(out)
+        names = set(archive.names)
+        self.assertIn("meta.json", names)
+        self.assertIn("Dump/LastCrashReport.txt", names)
+        self.assertIn("Dump/BigShotV0311N001.mdmp", names)
+        self.assertIn("BigShot.rpt.last.txt", names)
+        self.assertIn("Debug/2026-09-09.txt", names)
+        self.assertIn("logs/relay.out", names)
+        # ★ rpt 只截最后一段
+        tail = archive.read("BigShot.rpt.last.txt").decode("latin-1")
+        self.assertIn("09/09/26, 01:36:42", tail)
+        self.assertNotIn("09/06/26", tail)
+        got = json.loads(archive.read("meta.json").decode("utf-8"))
         self.assertEqual("C0000005 ACCESS_VIOLATION", got["exception"])
         self.assertEqual(41612, got["pid"])
         self.assertEqual(0xC0000005, got["exit_code"])
@@ -457,8 +465,7 @@ class CollectorTests(unittest.TestCase):
     def test_a_missing_build_ver_says_so_instead_of_an_empty_string(self):
         os.remove(os.path.join(self.tmp.name, "BUILD.ver"))
         out, _meta, _ = self.build()
-        with zipfile.ZipFile(out) as zf:
-            got = json.loads(zf.read("meta.json").decode("utf-8"))
+        got = json.loads(read_package(out).read("meta.json").decode("utf-8"))
         self.assertIn("读不到", got["build"]["error"])
 
     def test_report_text_comes_from_memory_not_from_disk(self):
@@ -467,10 +474,9 @@ class CollectorTests(unittest.TestCase):
         col = self.collector()
         report = crashwatch.read_crash_report(self.fx.game)
         os.remove(os.path.join(self.fx.game, "Dump", "LastCrashReport.txt"))
-        out = os.path.join(self.tmp.name, "out.zip")
+        out = os.path.join(self.tmp.name, "out.7z")
         col.build(report, out)
-        with zipfile.ZipFile(out) as zf:
-            text = zf.read("Dump/LastCrashReport.txt").decode("latin-1")
+        text = read_package(out).read("Dump/LastCrashReport.txt").decode("latin-1")
         self.assertIn("09/09/26, 01:36:42", text)
 
     def test_oversize_optional_entries_are_skipped_not_truncated(self):
@@ -478,34 +484,81 @@ class CollectorTests(unittest.TestCase):
         with open(os.path.join(self.fx.logs, "bsloader.out"), "wb") as fp:
             fp.write(os.urandom(200000))        # 随机数据压不动
         out, meta, _ = self.build(max_bytes=80000)
-        with zipfile.ZipFile(out) as zf:
-            names = set(zf.namelist())
+        names = set(read_package(out).names)
         self.assertIn("Dump/LastCrashReport.txt", names)
         self.assertIn("Dump/BigShotV0311N001.mdmp", names)
         self.assertNotIn("logs/bsloader.out", names)
         self.assertTrue(any(item["name"] == "logs/bsloader.out"
                             for item in meta["skipped"]), meta["skipped"])
+        self.assertLessEqual(os.path.getsize(out), 80000)
 
     def test_missing_dump_is_recorded_instead_of_crashing(self):
         os.remove(os.path.join(self.fx.game, "Dump", "BigShotV0311N001.mdmp"))
         out, meta, _ = self.build()
         self.assertTrue(any(item["why"] == "文件不在了"
                             for item in meta["skipped"]))
-        with zipfile.ZipFile(out) as zf:
-            self.assertIn("Dump/LastCrashReport.txt", zf.namelist())
+        self.assertIn("Dump/LastCrashReport.txt", read_package(out).names)
 
-    def test_rpt_mismatch_is_flagged_in_the_zip(self):
+    def test_rpt_mismatch_is_flagged_in_the_package(self):
         with open(os.path.join(self.fx.game, "BigShot.rpt"), "wb") as fp:
             fp.write("=========   logged at 01/01/20, 00:00:00   =========\r\n"
                      "别的一次崩溃\r\n".encode("cp936"))
         out, meta, _ = self.build()
         self.assertTrue(meta.get("rpt_mismatch"))
-        with zipfile.ZipFile(out) as zf:
-            raw = zf.read("BigShot.rpt.last.txt")
+        raw = read_package(out).read("BigShot.rpt.last.txt")
         # ★ 包里那份必须和玩家机器上那份**逐字节相同** —— 正文里不掺任何
         #   我们自己的话，提醒放在 meta.json 里。
         with open(os.path.join(self.fx.game, "BigShot.rpt"), "rb") as fp:
             self.assertEqual(fp.read(), raw)
+
+    def test_the_package_is_a_non_solid_7z(self):
+        """X17：一个成员一个 folder（额度按 `tell()` 精确算、坏成员能退回），日志文件带原 mtime；
+        压缩等级固定「高」= 16 MiB 字典（用户 2026-09-30 定，D102）。"""
+        out, _meta, _ = self.build()
+        archive = read_package(out)
+        with_data = [entry for entry in archive.entries if entry.data]
+        self.assertEqual(len(with_data), len(archive.folders))
+        self.assertEqual({"lzma2"}, {entry.method for entry in with_data})
+        self.assertEqual({b"\x18"}, {folder[1] for folder in archive.folders})
+        relay = os.path.join(self.fx.logs, "relay.out")
+        self.assertEqual(os.stat(relay).st_mtime_ns // 100,
+                         archive.entry("logs/relay.out").mtime_ns // 100)
+
+    def test_a_member_that_breaks_mid_read_is_rolled_back_and_recorded(self):
+        real_open = open
+
+        class Broken:
+            def __init__(self, fp):
+                self.fp = fp
+                self.reads = 0
+
+            def read(self, size):
+                self.reads += 1
+                if self.reads > 1:
+                    raise OSError(5, "读盘出错")
+                return self.fp.read(size) or b"x"      # 第一块一定有字节进包
+
+            def fileno(self):
+                return self.fp.fileno()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.fp.close()
+
+        def opener(path, mode="r", *args, **kwargs):
+            fp = real_open(path, mode, *args, **kwargs)
+            return Broken(fp) if path.endswith("relay.out") and "b" in mode else fp
+
+        crashwatch.open = opener
+        self.addCleanup(delattr, crashwatch, "open")
+        out, meta, _ = self.build()
+        archive = read_package(out)                     # 包照样完整、校验得过
+        self.assertNotIn("logs/relay.out", archive.names)
+        self.assertIn("Dump/BigShotV0311N001.mdmp", archive.names)
+        self.assertTrue(any(item["name"] == "logs/relay.out" and "读盘出错" in item["why"]
+                            for item in meta["skipped"]), meta["skipped"])
 
 
 class _FakeServer:
@@ -587,7 +640,10 @@ class WatcherTests(unittest.TestCase):
         headers, body = server.received[0]
         self.assertEqual(crash_id, headers["x-crash-client"])
         self.assertEqual("09/09/26, 01:36:42", headers["x-crash-time"])
-        self.assertTrue(body.startswith(b"PK"))
+        # X17：传上去的是 7z（服务端按魔数认），头里也说清楚。
+        self.assertTrue(body.startswith(sevenzip.SIGNATURE))
+        self.assertEqual("application/x-7z-compressed", headers["content-type"])
+        self.assertIn("meta.json", read_7z(body).names)
         # 传成功了就不该在待传队列里留东西。
         self.assertEqual([], os.listdir(watcher.pending_dir))
 
@@ -616,7 +672,7 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(1, len(server.received))
 
     # ------------------------------------------------------------ 重试 / 补传
-    def test_retries_three_times_then_keeps_the_zip_for_next_start(self):
+    def test_retries_three_times_then_keeps_the_package_for_next_start(self):
         server = _FakeServer(fail_times=99)
         watcher = self.watcher(server)
         crash_id = watcher.handle_exit(41612, self.fx.crash_epoch - 600,
@@ -626,7 +682,7 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual([crashwatch.RETRY_DELAY_SECONDS] *
                          (crashwatch.RETRY_ATTEMPTS - 1), self.slept)
         # ★ 先落盘再上传 ⇒ 传不上去时现场还在。
-        self.assertEqual([crash_id + ".zip"], os.listdir(watcher.pending_dir))
+        self.assertEqual([crash_id + ".7z"], os.listdir(watcher.pending_dir))
         self.assertTrue(any("连续 3 次失败" in line for line in self.lines))
 
     def test_a_later_start_resends_what_is_queued(self):
@@ -658,9 +714,50 @@ class WatcherTests(unittest.TestCase):
         watcher = self.watcher(server, max_bytes=100)
         watcher.handle_exit(41612, self.fx.crash_epoch - 600, 0xC0000005)
         self.assertEqual([], server.received)
-        self.assertTrue(any(name.endswith(".toobig.zip")
+        self.assertTrue(any(name.endswith(".toobig.7z")
                             for name in os.listdir(watcher.pending_dir)))
         self.assertTrue(any("超过上限" in line for line in self.lines))
+
+    def test_an_old_zip_queued_before_the_update_is_still_resent(self):
+        """更新器保护 `logs/` ⇒ 升级前没传成功的 `.zip` 还在待传队列里，照样补传（服务端两种都收）。"""
+        watcher = self.watcher(_FakeServer())
+        os.makedirs(watcher.pending_dir)
+        crash_id = "testuser1_a1b2c3d4_20260908-000000"
+        with zipfile.ZipFile(os.path.join(watcher.pending_dir, crash_id + ".zip"), "w") as zf:
+            zf.writestr("meta.json", "{}")
+        server = _FakeServer()
+        again = self.watcher(server)
+        again._resume()
+        (headers, body), = server.received
+        self.assertEqual(crash_id, headers["x-crash-client"])
+        self.assertEqual("application/zip", headers["content-type"])
+        self.assertTrue(body.startswith(b"PK"))
+        self.assertEqual([], os.listdir(again.pending_dir))
+
+    def test_toobig_packages_are_never_resent(self):
+        """以前 `*.zip` 的 glob 连 `.toobig.zip` 也捡起来，每次启动白传三次、次次被 400。"""
+        watcher = self.watcher(_FakeServer())
+        os.makedirs(watcher.pending_dir)
+        for name in ("a_00000000_20260101-000000.toobig.7z",
+                     "b_00000000_20260101-000000.toobig.zip"):
+            with open(os.path.join(watcher.pending_dir, name), "wb") as fp:
+                fp.write(b"x")
+        server = _FakeServer()
+        self.watcher(server)._resume()
+        self.assertEqual([], server.received)
+        self.assertEqual(2, len(os.listdir(watcher.pending_dir)))
+
+    def test_pending_packages_picks_7z_and_old_zip_only(self):
+        pending = os.path.join(self.tmp.name, "pending")
+        os.makedirs(pending)
+        for name in ("b_00000000_20260102-000000.7z", "a_00000000_20260101-000000.zip",
+                     "c_00000000_20260103-000000.7z.part", "d_00000000_20260104-000000.toobig.7z",
+                     "notes.txt"):
+            open(os.path.join(pending, name), "wb").close()
+        self.assertEqual(["a_00000000_20260101-000000.zip", "b_00000000_20260102-000000.7z"],
+                         [os.path.basename(path)
+                          for path in crashwatch.pending_packages(pending)])
+        self.assertEqual([], crashwatch.pending_packages(os.path.join(pending, "nope")))
 
     # -------------------------------------------------------------- 不阻塞
     def test_note_client_returns_immediately(self):

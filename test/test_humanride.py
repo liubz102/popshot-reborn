@@ -7,8 +7,8 @@
 1. 鱼对角色就是**会动的地形格**（`0x473969` 静态格与对象取 max）—— 站、走、落、撞头都认；
 2. 渲染时平台把自己这一帧的位移加给「站在它上面、还踩着地」的人（`0x51ab04`，站在谁上面
    由每个逻辑帧 `0x50739a` 按脚下那格刷新）；
-3. 第 n 帧按跳 ⇒ 那一帧先走完这一步才离地，第 n + 1 帧才开始往上
-   （2026-09-23 云桥 83 次起跳：第 n + d 帧的心跳里只有 d − 1 次空中位移）。
+3. 第 n 帧按跳 ⇒ 那一帧先走完这一步才离地，第 n + 1 帧才开始往上（先加重力再挪，
+   初速 −20.784611，X_Mod §102）；2026-09-23 云桥 83 次起跳：第 n + d 帧的心跳里只有 d − 1 次空中位移。
 
 ★ 纯标准库，两套运行时都跑。
 """
@@ -219,10 +219,11 @@ class HumanRideTests(unittest.TestCase):
         self.assertAlmostEqual(x0 + moved, body.x, places=6, msg="落上去就跟着走")
 
     def test_a_jump_right_after_the_heartbeat(self):
-        """★★★ 起跳那一帧先走完这一步才离地：第 1 格离地不挪，第 2 格才往上。
+        """★★★ 起跳那一帧先走完这一步才离地：第 1 格离地不挪，第 2 格起先加重力再挪（X_Mod §102）。
 
-        ★ 第 2 格是「起跳后那一格」：只按速度挪、不加重力 —— 正好升 20（X_Mod §87）。
+        ★ 以前说「起跳后那一格只挪不加重力、正好升 20」是心跳 y 截断的假象（§87 订正）。
         """
+        f32 = botmove._f32
         self.beat(350, FLOOR - 1, at=10.0)
         self.jump(at=10.001)
         self.assertEqual(((0, 1),), self.conn.sync_jump_ticks)
@@ -231,36 +232,39 @@ class HumanRideTests(unittest.TestCase):
         self.assertFalse(body.on_ground)
         self.assertEqual(before.y, body.y)
         self.assertEqual(-botmove.JUMP_SPEED, body.vy)
+        vy = f32(-botmove.JUMP_SPEED + botmove.G32)
         body = self.advance()
-        self.assertAlmostEqual(before.y - botmove.JUMP_SPEED, body.y, places=6)
-        self.assertEqual(-botmove.JUMP_SPEED, body.vy)
+        self.assertEqual(f32(before.y + vy), body.y)
+        self.assertEqual(vy, body.vy)
+        y = body.y
+        vy = f32(vy + botmove.G32)
         body = self.advance()
-        self.assertAlmostEqual(
-            before.y - botmove.JUMP_SPEED - (botmove.JUMP_SPEED - botmove.GRAVITY),
-            body.y, places=6)
+        self.assertEqual(f32(y + vy), body.y)
 
-    def test_a_heartbeat_right_at_the_takeoff_still_lifts_by_the_full_speed(self):
-        """★★ 心跳正好落在「刚起跳、还没动」那一格（腾空、vy = −20、上一发还踩地）：
-        硬置之后下一格照样按起跳那一步走 —— 2026-09-23 / 24 两次运行 72 个这样的区间，
-        这么走 71 个更准（X_Mod §87）。"""
+    def test_a_heartbeat_right_at_the_takeoff_restores_the_exact_launch(self):
+        """★★ 心跳正好发在「刚起跳、还没动」那一帧：它前面那发 `rpJump`（同一条有序流先到）说了第几段，
+        心跳的 vy 正好是 trunc(初速) ⇒ 硬置成**精确的**起跳状态（初速、计时器、操控复位，X_Mod §105）。"""
         self.beat(350, FLOOR - 1, at=10.0)
+        self.jump(at=10.09)
         self.beat(350, FLOOR - 1, at=10.1, on_ground=False,
                   velocity=(0, -int(botmove.JUMP_SPEED)))
         before = self.advance()                # 硬置
-        self.assertTrue(self.conn.sim_launch)
+        self.assertEqual(-botmove.JUMP_SPEED, before.vy)
+        self.assertEqual(botmove.rise_ticks(botmove.JUMP_SPEED), before.rise)
         body = self.advance()
-        self.assertAlmostEqual(before.y - botmove.JUMP_SPEED, body.y, places=6)
+        self.assertEqual(botmove._f32(before.y + botmove._f32(
+            -botmove.JUMP_SPEED + botmove.G32)), body.y)
 
     def test_an_airborne_heartbeat_is_not_a_takeoff(self):
-        """同样是 vy = −20，上一发已经在空中（二段跳减到这儿 / 被弹起来）就是普通的腾空。"""
+        """同样是 vy = −20，没有 `rpJump`、上一发已经在空中（二段跳减到这儿 / 被弹起来）就是普通的腾空。"""
         self.beat(350, 200, at=10.0, on_ground=False, velocity=(0, -24))
         self.beat(350, 180, at=10.1, on_ground=False,
                   velocity=(0, -int(botmove.JUMP_SPEED)))
         before = self.advance()
-        self.assertFalse(self.conn.sim_launch)
+        self.assertEqual(-20.0, before.vy)
         body = self.advance()
-        self.assertAlmostEqual(before.y - (botmove.JUMP_SPEED - botmove.GRAVITY),
-                               body.y, places=6)
+        self.assertEqual(botmove._f32(before.y + botmove._f32(-20.0 + botmove.G32)),
+                         body.y)
 
     def test_a_jump_two_frames_after_the_heartbeat(self):
         """rpJump 离心跳 2 个逻辑帧 ⇒ 第 3 格离地、第 4 格才往上。"""

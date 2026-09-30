@@ -195,9 +195,12 @@ class Weapon(object):
         """★★ 散布是**随机**的还是均匀扇形（`SpreadRandom`，`0x492012`）。
 
         真 = 每颗 `(rand[0,1) − 0.5) × SpreadAngle` 度；
-        假 = 第 i 颗 `(i/(n−1) − 0.5) × SpreadAngle` 度。
+        假 = 第 i 颗（本轮内的序号）`(i/(n−1) − 0.5) × SpreadAngle` 度。
+        ★ **没写这个键 = 随机**：读表 `0x48950f mov cl, bl`（bl = 1）当缺省（X_Mod §101）——
+          `ch109-02` / `ch110-02` 没写，客户端是随机 ±SpreadAngle/2，不是扇形。
         """
-        return bool(self.raw.get("spread_random"))
+        value = self.raw.get("spread_random")
+        return True if value is None else bool(value)
 
     @property
     def fire_interval_ms(self):
