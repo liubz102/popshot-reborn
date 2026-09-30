@@ -4391,7 +4391,7 @@ BOT_RESPAWN_POINT = None
 BOT_PEER_HIT = None
 
 #: ★★ 同上，`bot.bot_limit_reason` 挂这儿：**这会儿房里的 bot 受限没有**
-#: （成就防刷，V0.3.3 / D127）。签名 `(room) -> 一句原因 | None`。
+#: （防刷，V0.3.3 D127 / X_Mod D104）。签名 `(room) -> 一句原因 | None`。
 #:
 #: ★ 为什么是钩子，而不是在结算那一段里 lazy `import bot`：`bot.py` **被
 #: import 的那一刻**就把上面这四个钩子装上了。在结算路径上 lazy import 的话，
@@ -4510,7 +4510,7 @@ def new_room_quest(room, seats, announce=False):
     if reason:
         quest.bot_limit_reason = "开局时 " + reason
         if announce:
-            room_system_chat(room, f"⚠ {reason}，本局不计成就。")
+            room_system_chat(room, f"⚠ {reason}，本局不计奖励。")
     return quest
 
 
@@ -4722,8 +4722,9 @@ class RoomQuest:
         #: 本局已经结算过了。★ 房间级，不是连接级 —— 六个人会各发一发
         #: `0x040f gcpEndQuest`，只有第一发能触发结算。
         self.settled = False
-        #: ★★ 这一局**出现过**的 bot 限制（成就防刷，V0.3.3 / D127）。
-        #: `None` = 没出现过 ⇒ 这一局照常计成就。
+        #: ★★ 这一局**出现过**的 bot 限制（防刷，V0.3.3 D127 / X_Mod D104）。
+        #: `None` = 没出现过 ⇒ 这一局照常计奖励（经验 / 金币 / 材料 / 成就）。
+        #: 闯关房恒为 `None`：判据那一层（`bot.bot_limit_reason`）就豁免了。
         #:
         #: ★ 它是**闩**：只写第一次，之后限制解除了也不撤。口径是
         #: 「这一局里出现过没有」，不是「结算那一刻还在不在」
@@ -10191,22 +10192,24 @@ class Conn:
         card_rules, card_cfg_warnings = shopcfg.cards()
         for warning in card_cfg_warnings:
             self.log(f"   ⚠ cards.json: {warning}")
-        # ★★ **这一局算不算成就**（成就防刷，V0.3.3 / D127）。房间级的一句话，
-        #    所以在座位循环**之前**判一次、记一行 —— 放进循环的话 bot 座位
-        #    也会各收一份（`settlement_seats()` 把 bot 也算进来）。
+        # ★★ **这一局算不算奖励**（防刷，V0.3.3 / D127，X_Mod D104 扩到经验金币）。
+        #    房间级的一句话，所以在座位循环**之前**判一次、记一行 —— 放进循环
+        #    的话 bot 座位也会各收一份（`settlement_seats()` 把 bot 也算进来）。
         #
         #    两个来源取或：**本局的闩**（开局那一刻 / 局中敲命令时记下的）
         #    ＋ **结算这一刻的实况兜底**。后者防的是「将来有人绕开那两处
         #    改了 bot 状态」—— 判据是实况，绕不过去。
-        card_room = self.lobby_room()
-        card_block = (quest.bot_limit_reason
-                      or bot_limit_reason_now(card_room, "结算时 "))
-        if card_block:
-            self.log(f"   成就判定: 本局不计成就 —— {card_block}"
-                     f"（本局战绩不进累计、不发称号卡片；"
-                     f"经验 / 金币 / 合成材料照发）")
+        #    ★ 闯关房两个来源都恒为 None（`bot.bot_limit_reason` 第一条就豁免，
+        #      X_Mod D104）⇒ 闯关一律走「计入」那一支，日志写的原因是「闯关房」。
+        room = self.lobby_room()
+        reward_block = (quest.bot_limit_reason
+                        or bot_limit_reason_now(room, "结算时 "))
+        if reward_block:
+            self.log(f"   奖励判定: 本局不计奖励 —— {reward_block}"
+                     f"（经验 / 金币 / 合成材料 / 称号卡片全不发，"
+                     f"战绩不进累计）")
         else:
-            self.log(f"   成就判定: 本局计入成就 —— {_bot_freedom_line(card_room)}")
+            self.log(f"   奖励判定: 本局计入奖励 —— {_bot_freedom_line(room)}")
         # ---- ①a 通关用时入账 + 破纪录判定（V0.3商店 §126 / §127）----------
         #
         # 房间级的一句话，所以在座位循环**之前**做一次 —— `note_clear()` 一次
@@ -10263,7 +10266,13 @@ class Conn:
             #    ★ 数值来自 `rewards.json`（管理页「金币 / 经验获取」，D72）——
             #      对战那一路把 模式 / 道具战 / 组队战 一起传进去，每种组合各查
             #      各的那一档；以前它们给的钱一模一样。
-            if quest_mode:
+            if reward_block:
+                # ★★ 本局不计奖励（X_Mod D104）：经验 / 金币 / 材料**一样都不给**，
+                #    连奖励表都不查、材料都不掷。以前（D127）这三样照发，结果
+                #    定住 bot 照样能刷经验刷钱（用户 2026-10-01）。
+                #    ★ 下面 `0x0309` / `0x0411` 跟着发 +0，结算界面上看得见。
+                gained_exp, gained_money, reward_warnings = 0, 0, []
+            elif quest_mode:
                 quest_id, difficulty = quest_info or (1, 1)
                 gained_exp, gained_money, reward_warnings = quest_reward(
                     quest_id, difficulty, score, seat_cleared)
@@ -10276,12 +10285,17 @@ class Conn:
             #    偶尔掉的，都在 `RoomQuest.claim_item()` 那一步按座位记好了。
             #    客户端的 1 / 5 累加只用于战局内浮字，不改持久账户余额；这里才把
             #    同一面额真正写进账号，所以不会重复入账。
+            #    ★ 不计奖励那一局捡到的也不入账（用户 2026-10-01 选的「全拦」）；
+            #      数还是取出来，只为结算日志里写清「捡了多少、没给」。
             picked_coins = quest.coins_of(seat)
-            gained_money += picked_coins
+            if not reward_block:
+                gained_money += picked_coins
             # ★★ 合成材料（V0.3商店 M6）。**每个人各掷各的** —— 同一局里
             #    两个人拿到的东西可以不一样，这是原版「合成素材」的手感（D4）。
             #    对战也掉（`drops.json` 里有 `mode=pvp` 的规则）。
-            if quest_mode:
+            if reward_block:
+                dropped, drop_warnings = {}, []
+            elif quest_mode:
                 quest_id, difficulty = quest_info or (1, 1)
                 dropped, drop_warnings = quest_materials(
                     quest_id, difficulty, seat_cleared)
@@ -10299,8 +10313,8 @@ class Conn:
                 quest, seat, won=seat_won, quest_mode=quest_mode, score=score)
             conn.log("   本局战绩 座位%d: %s" % (seat, _stats_line(gained_stats)))
             before_stats = account_store.battle_stats(conn.account)
-            if card_block:
-                # ★★ 本局不计成就（D127）：**累计一格都不动** —— 只拦发卡的话，
+            if reward_block:
+                # ★★ 本局不计奖励（D127）：**累计一格都不动** —— 只拦发卡的话，
                 #    「先在受限的房间里把累计攒满、再去干净房间打一局领卡」
                 #    这条路还开着（累计类条件占了一半，D111）。
                 after_stats = before_stats
@@ -10328,12 +10342,12 @@ class Conn:
             if VERBOSE and conn.account_name:
                 conn.vlog("   累计战绩 座位%d: %s"
                           % (seat, _totals_line(after_stats)))
-            if VERBOSE and conn.account_name and card_block:
-                # ★ 不计成就时**不去跑 `cards.explain()`** —— 那是把整张规则表
+            if VERBOSE and conn.account_name and reward_block:
+                # ★ 不计奖励时**不去跑 `cards.explain()`** —— 那是把整张规则表
                 #   真算一遍再拼几十行字符串，而结论已经定了。
-                conn.vlog("   ── 称号卡片判定 座位%d：本局不计成就（%s），"
+                conn.vlog("   ── 称号卡片判定 座位%d：本局不计奖励（%s），"
                           "%d 条规则全部跳过"
-                          % (seat, card_block, len(card_rules)))
+                          % (seat, reward_block, len(card_rules)))
             elif VERBOSE and conn.account_name:
                 conn.vlog("   ── 称号卡片判定 座位%d（这一局：%s）"
                           % (seat, _match_scope_line(stat_mode, quest_info)))
@@ -10355,13 +10369,12 @@ class Conn:
                         conn.account_name,
                         experience=gained_exp, money=gained_money,
                         materials=dropped,
-                        # ★ 不计成就那一局只掐掉这两样（D127）：存档层那句
-                        #   `if stats_mode and stats_gained:` 自己接得住，
-                        #   `apply_battle` 一个字都不用改。
-                        #   ★★ 上面三个（经验 / 金币 / 材料）**一个字不动** ——
-                        #      用户拍板：受限只影响成就。
-                        stats_mode=None if card_block else stat_mode,
-                        stats_gained=None if card_block else gained_stats,
+                        # ★ 不计奖励那一局战绩和卡片这两样在这儿掐（D127）：
+                        #   存档层那句 `if stats_mode and stats_gained:` 自己
+                        #   接得住，`apply_battle` 一个字都不用改。上面三个
+                        #   （经验 / 金币 / 材料）在前面就已经是 0 / 空了（D104）。
+                        stats_mode=None if reward_block else stat_mode,
+                        stats_gained=None if reward_block else gained_stats,
                         cards=give_cards, card_bases=card_bases)
                 except KeyError:
                     skipped = []
@@ -10432,8 +10445,10 @@ class Conn:
                      f"{'完成/胜' if seat_cleared else '未完成'} "
                      f"-> 本局经验+{gained_exp} "
                      f"金币+{gained_money}"
-                     f"（固定 {gained_money - picked_coins} + 捡到 {picked_coins}）；"
-                     f"总经验={experience} (本级 {level_start_exp}..{next_level_exp})；"
+                     + (f"（本局不计奖励，捡到的 {picked_coins} 也不入账）；"
+                        if reward_block else
+                        f"（固定 {gained_money - picked_coins} + 捡到 {picked_coins}）；")
+                     + f"总经验={experience} (本级 {level_start_exp}..{next_level_exp})；"
                      f"余额={balance}")
 
         # ---- ② 再逐个连接下发 --------------------------------------------
@@ -10469,15 +10484,15 @@ class Conn:
                 continue
             conn.settled = True
             conn.quest_success = cleared
-        # ★★ 结算界面上也说一句「这一局没算成就」（用户 2026-09-15 第三轮）。
+        # ★★ 结算界面上也说一句「这一局没算奖励」（用户 2026-09-15 第三轮）。
         #
         #    ★ 排在结算三连发**之后**：结算界面是第一发 `0x0411` 弹出来的
         #      （`0x4913fc`），先发的话这行字落在还没弹出来的界面后面。
-        #    ★ 只在不计成就时说 —— 正常结算一个字都不发（用户点名）。
+        #    ★ 只在不计奖励时说 —— 正常结算一个字都不发（用户点名）。
         #    ★ 走房间级那一个，不是 `self.room_system_chat()`：结算的发起人
         #      可能是控制通道、也可能是替全场结算的别人（D127 ⑨）。
-        if card_block:
-            room_system_chat(card_room, "⚠ 本局开启过 bot 限制，不结算成就。")
+        if reward_block:
+            room_system_chat(room, "⚠ 本局开启过 bot 限制，不结算奖励。")
         reward_count = sum(len(payloads) for payloads in rewards.values())
         self.log(f"← 已结算本局：每人各收到 {reward_count} 份"
                  f" gspRewardReceived(0x041c，合成材料) + {len(results)} 份"
@@ -10810,7 +10825,7 @@ class Conn:
             # `GameContext::StartGame` 同一个口径（§180）——
             # 客户端就是在进 stage 7 的路上建它的。
             # ★ `new_room_quest()` 顺手记下**开局这一刻** bot 受不受限，
-            #   脏局还跟房里说一行（成就防刷，D127）。
+            #   脏局还跟房里说一行（防刷，D127 / X_Mod D104）。
             room.quest = new_room_quest(
                 room, [i for i, seat in enumerate(room.seats)
                        if seat is not None], announce=True)
@@ -13480,7 +13495,7 @@ def _match_scope_line(stat_mode, quest_info):
 
 
 def _bot_freedom_line(room):
-    """「本局计入成就」那一行的**正面**理由（成就防刷，D127）。
+    """「本局计入奖励」那一行的**正面**理由（防刷，D127 / X_Mod D104）。
 
     ★ 用户 2026-09-15 点名要的：「每局 log 里需要写清楚计算或不计算的原因，
     方便日后排查」—— 所以计入的那一局也得说清是凭什么计的，
@@ -13491,6 +13506,10 @@ def _bot_freedom_line(room):
     """
     if room is None:
         return "不在房间里（单人 / 协议试探）"
+    if room.session_type == SESSION_TYPE_QUEST:
+        # ★ 排在「有没有 bot」前面（X_Mod D104）：闯关房凭的是这一条 ——
+        #   房里的 bot 这会儿就算定着，也照样计，下面那句「全程自由」就成了假话。
+        return "闯关房（bot 是队友，受不受限都照常计）"
     seats = room.bot_seats()
     if not seats:
         return "房里没有 bot"

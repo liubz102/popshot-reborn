@@ -11,7 +11,12 @@
 1. `bot.bot_limit_reason(room)` —— 「**这会儿**房里的 bot 受限没有」的实况判断；
 2. `RoomQuest.bot_limit_reason` —— 「这一局里**出现过**没有」的那个**闩**
    （开局时由 `gameserver.new_room_quest()` 填，局中由 `bot.handle_command()` 补）；
-3. 结算 —— 有闩就**不并累计、不发卡**，而经验 / 金币 / 材料**照发**。
+3. 结算 —— 有闩就**不并累计、不发卡**，经验 / 金币（含地上捡的）/ 材料
+   **也一样不给**（X_Mod D104，用户 2026-10-01 扩的范围；D127 时这三样照发）。
+
+★ **闯关房整个豁免**（X_Mod D104 第二轮）：bot 在那儿是队友，限制它对自己
+一点好处都没有 —— 第 1 层就回「不受限」，于是不上闩、不提示、什么都照发
+（`QuestRoomExemptionTests`）。
 
 ★ 另有三道**防回归**的网（`LimitTableGuardTests`）：新加一条 bot 命令不归类
 当场红、`BOT_FREEDOM_FIELDS` 的字段改名或改默认值当场红、难度表加一档当场红。
@@ -33,9 +38,11 @@ for _path in (HERE, SERVER):
 
 import bot                                                     # noqa: E402
 import gameserver                                              # noqa: E402
+import lobby                                                   # noqa: E402
 from test_room import LobbyIsolated, make_conn                 # noqa: E402
-from test_bot import chat_lines, FREE_ROOM                     # noqa: E402
+from test_bot import chat_lines, COOP_ROOM, FREE_ROOM          # noqa: E402
 from test_battle import _CardSettlementCase, opcodes           # noqa: E402
+from test_battle import bodies, end_game_values, result_values  # noqa: E402
 
 
 # ----------------------------------------------------------------------------
@@ -56,8 +63,8 @@ class BotLimitReasonTests(LobbyIsolated):
         self.host.sent.clear()
         return room
 
-    def room_with_bots(self, count=1):
-        room = self.open_room()
+    def room_with_bots(self, count=1, **params):
+        room = self.open_room(**params)
         bot.handle_command(self.host, "/a %d" % count)
         self.assertEqual(count, len(room.bot_seats()))
         return room
@@ -86,6 +93,27 @@ class BotLimitReasonTests(LobbyIsolated):
         self.assertEqual([], room.bot_seats())
         self.assertEqual(1, room.bot_difficulty)
         self.assertIsNone(bot.bot_limit_reason(room))
+
+    # -- 闯关房（X_Mod D104 第二轮）---------------------------------------
+    def test_a_quest_room_is_never_limited(self):
+        """★ 闯关房里 bot 是队友：能限的全限上、难度拉到最低，照样「不受限」。"""
+        room = self.room_with_bots(2, **COOP_ROOM)
+        room.bot_difficulty = bot.BOT_DIFFICULTY_MIN
+        for machine in self.machines(room):
+            for field, (free_value, _why) in bot.BOT_FREEDOM_FIELDS.items():
+                setattr(machine, field, _not_free(free_value))
+        self.assertIsNone(bot.bot_limit_reason(room))
+
+    def test_only_quest_rooms_are_exempt_not_every_coop_layout(self):
+        """★ 豁免认 `session_type`（和结算的 `quest_mode()` 同一个），不认
+        `team_layout()`：天梯 / 练习房在那边也算 COOP，结算却走对战那一支。"""
+        room = self.room_with_bots()
+        self.machines(room)[0].holding = True
+        for session_type in (5, 6):             # 天梯 / 练习
+            with self.subTest(session_type=session_type):
+                room.session_type = session_type
+                self.assertEqual(lobby.TEAM_LAYOUT_COOP, room.team_layout())
+                self.assertIsNotNone(bot.bot_limit_reason(room))
 
     # -- 难度 -------------------------------------------------------------
     def test_every_difficulty_tier_is_judged(self):
@@ -251,10 +279,36 @@ class _CardFairCase(_CardSettlementCase):
                 if row[0] == seat and row[1] == gameserver.REWARD_SLOT_TITLE]
 
     def verdict_line(self, conn=None):
-        """结算时那一行「成就判定: …」（**普通日志**，不是 --verbose）。"""
-        lines = [l for l in (conn or self.alice).logged if "成就判定" in l]
-        self.assertEqual(1, len(lines), "一局只该有一行成就判定：%r" % lines)
+        """结算时那一行「奖励判定: …」（**普通日志**，不是 --verbose）。"""
+        lines = [l for l in (conn or self.alice).logged if "奖励判定" in l]
+        self.assertEqual(1, len(lines), "一局只该有一行奖励判定：%r" % lines)
         return lines[0]
+
+    #: 夹具里拿来「必掉」的那件材料（黑珠子，同 `test_battle` 的 `BLACK_BEAD`）。
+    MATERIAL = 10001
+
+    def pin_the_material_drop(self):
+        """材料是随机掷的 —— 把掷骰子那一步钉成「每人必掉两颗黑珠子」。"""
+        self.addCleanup(setattr, gameserver, "quest_materials",
+                        gameserver.quest_materials)
+        gameserver.quest_materials = (
+            lambda *args, **kwargs: ({self.MATERIAL: 2}, []))
+
+    def _round_gain(self):
+        """打一局，返回这一局**多出来**的 (经验, 金币, 材料)（卡片不算）。"""
+        before = self._wallet()
+        self.guard(0, 3)
+        self.end()
+        after = self._wallet()
+        keys = set(before[2]) | set(after[2])
+        return (after[0] - before[0], after[1] - before[1],
+                {k: after[2].get(k, 0) - before[2].get(k, 0)
+                 for k in keys if int(k) != self.CARD})
+
+    def _wallet(self):
+        account = self.accounts.saved["alice"]
+        return (int(account["experience"]), int(account["money"]),
+                dict(account.get("materials") or {}))
 
 
 class RoundLatchTests(_CardFairCase):
@@ -352,7 +406,7 @@ class UserReportedSequenceTests(_CardFairCase):
         self.start_the_next_round()
         self.assertIsNone(self.quest.bot_limit_reason)
         self.end()
-        self.assertIn("本局计入成就", self.verdict_line())
+        self.assertIn("本局计入奖励", self.verdict_line())
 
     def test_the_sequence_he_actually_typed_still_blocks(self):
         """`/b 2` 不是命令 ⇒ 难度还是 1 ⇒ 判定不计成就**是对的**。"""
@@ -397,7 +451,7 @@ class UserReportedSequenceTests(_CardFairCase):
 
 
 class FairSettlementTests(_CardFairCase):
-    """结算：脏局不并累计、不发卡；经验 / 金币 / 材料照发。"""
+    """结算：脏局不并累计、不发卡，经验 / 金币 / 材料也不给（X_Mod D104）。"""
 
     def test_a_clean_round_still_ships_the_card(self):
         """★ 防「一有 bot 就全不算」的过度拦截。"""
@@ -405,7 +459,7 @@ class FairSettlementTests(_CardFairCase):
         self.end()
         self.assertEqual([(0, gameserver.REWARD_SLOT_TITLE, self.CARD, 1)],
                          self.cards_of())
-        self.assertIn("本局计入成就", self.verdict_line())
+        self.assertIn("本局计入奖励", self.verdict_line())
 
     def test_a_limited_round_ships_no_card(self):
         bot.handle_command(self.alice, "/hold")
@@ -454,9 +508,10 @@ class FairSettlementTests(_CardFairCase):
         self.assertIsNone(mine[0]["stats_mode"])
         self.assertIsNone(mine[0]["stats_gained"])
         self.assertEqual({}, mine[0]["cards"])
-        # ★ 经验 / 金币 / 材料三个参数**一个字不动** —— 这才是「只影响成就」。
-        self.assertGreater(mine[0]["experience"], 0)
-        self.assertGreater(mine[0]["money"], 0)
+        # ★ 经验 / 金币 / 材料三个参数也是 0 / 空（X_Mod D104）。
+        self.assertEqual(0, mine[0]["experience"])
+        self.assertEqual(0, mine[0]["money"])
+        self.assertEqual({}, mine[0]["materials"])
 
     def test_the_settlement_rescan_catches_a_latch_that_never_got_set(self):
         """★ 结算那一刻的**兜底扫描**：闩没上、可 bot 就在眼前定着。
@@ -471,48 +526,64 @@ class FairSettlementTests(_CardFairCase):
         self.assertEqual([], self.cards_of())
         self.assertIn("结算时", self.verdict_line())
 
-    def test_experience_and_money_are_untouched(self):
-        """★ 用户拍板：受限**只**影响成就，经验 / 金币 / 材料一分不少。
+    def test_experience_money_and_materials_are_withheld(self):
+        """★ 用户 2026-10-01 扩的范围（X_Mod D104）：受限的那一局经验 / 金币
+        （含地上捡的）/ 材料**一样都不给**。
 
-        两局对着比，看的是**增量** —— 数值本身要查 `rewards.json`，
-        写死一个数就成了「奖励表改一次这条就红」。
+        ★ 干净局对照着打一遍，证明夹具里这三样**本来是会发的** —— 否则
+        脏局那边的「全 0」可能只是夹具压根没配奖励。材料是随机掷的，
+        所以把掷骰子那一步钉成固定一份；捡金币直接记进本局。
         """
+        self.pin_the_material_drop()
+        self.quest.coins[0] = 7
         clean = self._round_gain()
+        self.assertGreater(clean[0], 0)
+        self.assertGreater(clean[1], 7)     # 固定那份 + 捡到的 7
+        self.assertEqual({str(self.MATERIAL): 2},
+                         {k: v for k, v in clean[2].items() if v})
         self.restart()
         bot.handle_command(self.alice, "/hold")
+        self.quest.coins[0] = 7
         dirty = self._round_gain()
-        self.assertEqual(clean, dirty)
-        self.assertGreater(clean[0], 0)     # 真发了东西，不是两边都 0
+        self.assertEqual((0, 0), dirty[:2])
+        self.assertEqual({}, {k: v for k, v in dirty[2].items() if v})
 
-    def _round_gain(self):
-        """打一局，返回这一局**多出来**的 (经验, 金币, 材料)（卡片不算）。"""
-        before = self._wallet()
-        self.guard(0, 3)
+    def test_the_result_screen_shows_plus_zero(self):
+        """★ 界面上的 +N 和存档同源：脏局 `0x0309` 经验 / 金币两格都是 0，
+        `0x0411` 的本局金币也是 0 —— 不能界面上报着有、存档里却没进。"""
+        self.pin_the_material_drop()
+        bot.handle_command(self.alice, "/hold")
+        self.quest.coins[0] = 7
         self.end()
-        after = self._wallet()
-        keys = set(before[2]) | set(after[2])
-        return (after[0] - before[0], after[1] - before[1],
-                {k: after[2].get(k, 0) - before[2].get(k, 0)
-                 for k in keys if int(k) != self.CARD})
-
-    def _wallet(self):
-        account = self.accounts.saved["alice"]
-        return (int(account["experience"]), int(account["money"]),
-                dict(account.get("materials") or {}))
+        for body in bodies(self.alice, gameserver.OP_REP_GAME_RESULT):
+            values = result_values(body)
+            self.assertEqual(0, values[gameserver.GAME_RESULT_EXPERIENCE])
+            self.assertEqual(0, values[gameserver.GAME_RESULT_MONEY])
+        for body in bodies(self.alice, gameserver.OP_END_GAME):
+            self.assertEqual(
+                0, end_game_values(body)[gameserver.END_GAME_MONEY_GAINED])
+        # 结算里材料栏（槽 0）一发都没有。
+        self.assertEqual([], [row for row in self.rewards(self.alice)
+                              if row[1] == gameserver.REWARD_SLOT_MATERIAL])
+        line = [l for l in self.alice.logged if "结算 座位0" in l]
+        self.assertEqual(1, len(line), line)
+        self.assertIn("本局经验+0 金币+0", line[0])
+        self.assertIn("捡到的 7 也不入账", line[0])
+        self.assertEqual(1, line[0].count("总经验="), line[0])
 
     def test_the_verdict_line_says_why_it_was_skipped(self):
         """★ 用户点名：每局 log 都要写清楚计算或不计算的**原因**。"""
         bot.handle_command(self.alice, "/hold")
         self.end()
         line = self.verdict_line()
-        self.assertIn("本局不计成就", line)
+        self.assertIn("本局不计奖励", line)
         self.assertIn("/hold", line)
-        self.assertIn("经验", line)         # 说清楚哪几样不受影响
+        self.assertIn("经验", line)         # 说清楚哪几样不发
 
     def test_the_verdict_line_says_why_it_counted(self):
         self.end()
         line = self.verdict_line()
-        self.assertIn("本局计入成就", line)
+        self.assertIn("本局计入奖励", line)
         self.assertIn("bot", line)
         self.assertIn("难度", line)
 
@@ -522,14 +593,14 @@ class FairSettlementTests(_CardFairCase):
         self.assertIn("房里没有 bot", self.verdict_line())
 
     def test_the_debug_log_skips_the_whole_rule_table(self):
-        """不计成就时**不去跑** `cards.explain()` —— 结论已经定了。"""
+        """不计奖励时**不去跑** `cards.explain()` —— 结论已经定了。"""
         self.addCleanup(setattr, gameserver, "VERBOSE", gameserver.VERBOSE)
         gameserver.VERBOSE = True
         bot.handle_command(self.alice, "/hold")
         self.guard(0, 3)
         self.end()
         text = "\n".join(self.alice.vlogged)
-        self.assertIn("本局不计成就", text)
+        self.assertIn("本局不计奖励", text)
         self.assertIn("全部跳过", text)
         self.assertNotIn("✓", text)         # 一条规则的判定都没打
 
@@ -544,7 +615,7 @@ class FairSettlementTests(_CardFairCase):
         self.bot_conn.log = caught.append
         bot.handle_command(self.alice, "/hold")
         self.end()
-        self.assertEqual([], [l for l in caught if "成就判定" in l])
+        self.assertEqual([], [l for l in caught if "奖励判定" in l])
         self.assertTrue([l for l in caught if "本局战绩" in l],
                         "夹具没接上：bot 连一行结算日志都没打")
 
@@ -553,7 +624,7 @@ class LimitNoticeTests(_CardFairCase):
     """玩家提示：第一次触发时一行 + 脏局每次开局一行（用户口径 5）。"""
 
     def notices(self, conn):
-        return [l for l in chat_lines(conn) if "本局不计成就" in l]
+        return [l for l in chat_lines(conn) if "本局不计奖励" in l]
 
     def cleared(self, conn):
         return [l for l in chat_lines(conn)
@@ -620,6 +691,9 @@ class LimitNoticeTests(_CardFairCase):
         bot.handle_command(self.alice, "/hold")
         for who in (self.alice, self.bob):
             self.assertEqual(1, len(self.cleared(who)))
+        # ★ 措辞钉住：`cleared()` 拿常量本身去找，改了常量它照样找得到 ——
+        #   四句提示里只有这一句的「奖励」（X_Mod D104）没被别的用例量到。
+        self.assertIn("下一局起计奖励", self.cleared(self.alice)[0])
 
     def test_lifting_it_during_a_round_spells_out_that_this_round_is_lost(self):
         """★ 局中解除：这一局的闩不撤 ⇒ 文案要**点明「本局不生效」**
@@ -689,10 +763,10 @@ class LimitNoticeTests(_CardFairCase):
 
 
 class SettlementNoticeTests(_CardFairCase):
-    """★ 结算界面上也说一句「这一局没算成就」（用户 2026-09-15 第三轮）。"""
+    """★ 结算界面上也说一句「这一局没算奖励」（用户 2026-09-15 第三轮）。"""
 
     def notices(self, conn):
-        return [l for l in chat_lines(conn) if "不结算成就" in l]
+        return [l for l in chat_lines(conn) if "不结算奖励" in l]
 
     def test_a_limited_round_tells_everyone_at_the_result_screen(self):
         bot.handle_command(self.alice, "/hold")
@@ -735,6 +809,84 @@ class SettlementNoticeTests(_CardFairCase):
         line = self.notices(self.alice)[0]
         self.assertLessEqual(_chat_width(line), 50,
                              "太长会折行：%r（%d 宽）" % (line, _chat_width(line)))
+
+
+# ----------------------------------------------------------------------------
+# 四、闯关房整个豁免（X_Mod D104 第二轮，用户 2026-10-01）
+# ----------------------------------------------------------------------------
+class QuestRoomExemptionTests(_CardFairCase):
+    """★ 闯关房里 bot 是队友，限制它对自己一点好处都没有 ⇒ 不上闩、不提示，
+    经验 / 金币 / 材料 / 成就照发 —— 和 bot 全程自由的那一局**一模一样**。
+
+    ★ 同一套夹具（格挡 3 次发一张卡），只把房间换成闯关、规则挂进闯关桶；
+    结算前先报通关，比的是「赢」那一列 —— 两边都是 0 的话证明不了什么。
+    """
+
+    session_type = 2
+    arguments = (3, 1)          # 关卡 3 · 难度 1
+
+    def rule(self, **kwargs):
+        return dict(super().rule(**kwargs), mode="quest")
+
+    def end(self, conn=None):
+        gameserver.Conn.on_game_packet(self.alice,
+                                       gameserver.OP_MARK_QUEST_SUCCESS,
+                                       gameserver.w_i32(1))
+        super().end(conn)
+
+    def limit_everything(self):
+        """`/hold` + `/d 1`：对战房里这两条各自都够判「不计奖励」。"""
+        bot.handle_command(self.alice, "/hold")
+        bot.handle_command(self.alice, "/d 1")
+        self.assertTrue(self.bot_conn.holding)
+        self.assertEqual(1, self.room.bot_difficulty)
+
+    def limit_chat(self, conn):
+        return [l for l in chat_lines(conn)
+                if "不计" in l or "不结算" in l or "限制已解除" in l]
+
+    def test_limiting_mid_round_neither_latches_nor_speaks(self):
+        self.limit_everything()
+        bot.handle_command(self.alice, "/hold")          # 再解开
+        self.assertIsNone(self.quest.bot_limit_reason)
+        for who in (self.alice, self.bob):
+            self.assertEqual([], self.limit_chat(who))
+
+    def test_a_new_round_with_the_limits_left_on_is_clean_and_quiet(self):
+        self.limit_everything()
+        self.clear()
+        self.restart()
+        self.assertIsNone(self.quest.bot_limit_reason)
+        self.assertEqual([], self.limit_chat(self.alice))
+
+    def test_a_limited_bot_changes_nothing_at_settlement(self):
+        """★ 自由的一局和全身受限的一局，入账**逐样相同**（卡片两局各一张）。"""
+        self.pin_the_material_drop()
+        self.quest.coins[0] = 7
+        free = self._round_gain()
+        self.assertGreater(free[0], 0)
+        self.assertGreater(free[1], 7)      # 通关那份 + 捡到的 7
+        self.assertEqual({str(self.MATERIAL): 2},
+                         {k: v for k, v in free[2].items() if v})
+        self.restart()
+        self.limit_everything()
+        self.quest.coins[0] = 7
+        self.assertEqual(free, self._round_gain())
+        self.assertEqual(
+            2, self.accounts.saved["alice"]["card_grants"][str(self.CARD)])
+
+    def test_the_verdict_line_says_it_counted_because_it_is_a_quest_room(self):
+        """用户 2026-09-15 点名：计入的那一局也要写清**凭什么**计 —— 这儿要是
+        照旧写「1 个 bot 全程自由」，bot 明明定着，日志就成了假话。"""
+        self.limit_everything()
+        self.clear()
+        self.end()
+        line = self.verdict_line()
+        self.assertIn("本局计入奖励", line)
+        self.assertIn("闯关房", line)
+        self.assertNotIn("全程自由", line)
+        self.assertEqual([], self.limit_chat(self.alice))
+
 
 def _chat_width(text):
     """聊天框里的显示宽度：中文和全角标点算 2，ASCII 算 1（§20 的口径）。"""

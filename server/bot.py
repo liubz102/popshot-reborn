@@ -177,9 +177,9 @@ BOT_DIFFICULTY_MIN = min(BOT_DIFFICULTY_PROFILES)
 BOT_DIFFICULTY_MAX = max(BOT_DIFFICULTY_PROFILES)
 
 # ---------------------------------------------------------------------------
-# ★★★ 「bot 还自不自由」—— 成就防刷的判据单源（V0.3.3，D127）
+# ★★★ 「bot 还自不自由」—— 防刷的判据单源（V0.3.3 D127 / X_Mod D104）
 # ---------------------------------------------------------------------------
-#: 计成就要求的最低难度档。1 档（瞄准失误 95%）的 bot 基本上是个靶子。
+#: 计奖励要求的最低难度档。1 档（瞄准失误 95%）的 bot 基本上是个靶子。
 #: ★ 房里**一个 bot 都没有**时这条不适用 —— 没东西可刷（用户 2026-09-15）。
 BOT_DIFFICULTY_MIN_FOR_CARDS = 2
 
@@ -188,7 +188,7 @@ BOT_DIFFICULTY_MIN_FOR_CARDS = 2
 #: ★★ 判据只有这一份。这些字段全在 `BotConn.__init__` 里，而且
 #: `reset_battle_frame()` **故意不清它们**（那是房主给的房间指令，不是
 #: 一张图之内的机器状态）—— 所以「上一局定住的 bot，这一局照样定着」。
-#: ★ 以后再加限制命令，往这里加一行就够：成就判定 / 日志 / 提示三处
+#: ★ 以后再加限制命令，往这里加一行就够：奖励判定 / 日志 / 提示三处
 #:   都只读这张表，不用再想「还有哪儿要改」。
 #:
 #: ⚠ **人话那一句要短**：它会拼进房间聊天框那一行提示，而聊天框一次只看得见
@@ -205,7 +205,7 @@ BOT_FREEDOM_FIELDS = {
 
 #: ★★ 每条命令**有没有可能**把 bot 变成靶子。这两张表合起来必须盖住整张
 #: `COMMANDS`（`test_cardfair` 钉着）—— 新加一条命令不归类**当场红**，
-#: 归类的时候自然就会想起「它要不要接进成就判定」。
+#: 归类的时候自然就会想起「它要不要接进奖励判定」。
 #:
 #: ⚠ 它**不是**运行时判据：真正说了算的永远是 `bot_limit_reason()` 扫到的
 #: 实况。所以 `/w` `/d` 整条都归在 LIMITING 里（`/w 0` `/d 3` 是同一条命令
@@ -1738,17 +1738,25 @@ MUTATING_COMMANDS = ("a", "c", "t", "r")
 
 
 # ----------------------------------------------------------------------------
-# ★★★ 成就防刷：bot 受限的那一局不计成就（V0.3.3，D127）
+# ★★★ 防刷：bot 受限的那一局不计奖励（V0.3.3 D127；X_Mod D104 起经验 / 金币 / 材料也不给、闯关房整个不管）
 # ----------------------------------------------------------------------------
 def bot_limit_reason(room):
     """房里的 bot **这会儿**受限没有。不受限返回 ``None``，受限返回一句原因。
 
-    ★ 三条判据，顺序就是下面这三段：
+    ★ 四条判据，顺序就是下面这四段：
 
-    1. **房里一个 bot 都没有 ⇒ 不受限**。没东西可刷，连难度那条都不适用
+    1. **闯关房 ⇒ 不受限**，成就也不拦（X_Mod D104，用户 2026-10-01）。
+       bot 在那儿是**队友**：限制它只会让自己更难打；玩家的伤害又只落在怪和
+       场景物上（`_battle_bodies` 那段语料：闯关局里玩家的弹无一发打到角色），
+       打不死它 —— 经验 / 金币 / 材料 / 成就哪样都刷不到。
+       开局 / 局中 / 结算三处的闩和四句提示都从这儿取结论，所以闯关房里
+       一样都不拦、一句都不说。
+       ★ 口径和结算的 `quest_mode()` 同一个（`session_type`）—— **别换成
+       `team_layout()`**：天梯 / 练习房在那边也算 COOP，结算却走对战那一支。
+    2. **房里一个 bot 都没有 ⇒ 不受限**。没东西可刷，连难度那条都不适用
        （用户 2026-09-15：「下一局如果 bot 全踢掉，也恢复正常计算成就」）。
-    2. 难度低于 `BOT_DIFFICULTY_MIN_FOR_CARDS`。难度是**房间级**的一格。
-    3. 逐个 bot 过 `BOT_FREEDOM_FIELDS`。**任何一个 bot 受限就算受限** ——
+    3. 难度低于 `BOT_DIFFICULTY_MIN_FOR_CARDS`。难度是**房间级**的一格。
+    4. 逐个 bot 过 `BOT_FREEDOM_FIELDS`。**任何一个 bot 受限就算受限** ——
        房里另外那个自由的 bot 不能替它作保。
 
     ★ 读的是**实况**，不是「谁敲过什么命令」：命令能敲反（`/hold` 是开关）、
@@ -1757,6 +1765,8 @@ def bot_limit_reason(room):
     照命令记账的话这三种都要各判一次，照实况扫就一种。
     """
     if room is None:
+        return None
+    if getattr(room, "session_type", None) == gameserver.SESSION_TYPE_QUEST:
         return None
     seats = room.bot_seats()
     if not seats:
@@ -1780,7 +1790,7 @@ def bot_limit_reason(room):
 #: ★★ 结尾分两种（用户 2026-09-15 第三轮）：**局中**解除要点明
 #: 「本局不生效」；**在房间里**解除时压根没有「本局」可言，那个括号只会
 #: 让人多想。
-BOT_LIMIT_CLEARED_NOTICE = "⚠ bot 限制已解除，下一局起计成就"
+BOT_LIMIT_CLEARED_NOTICE = "⚠ bot 限制已解除，下一局起计奖励"
 BOT_LIMIT_CLEARED_IN_ROUND = "（本局不生效）。"
 BOT_LIMIT_CLEARED_IN_ROOM = "。"
 
@@ -1826,14 +1836,14 @@ def _scan_bot_limit(conn, room, before=None, announce=True):
         reason = bot_limit_reason(room)
         note_bot_limit(room, reason, "局中 ")
         if announce and reason and not before:
-            conn.room_system_chat(f"⚠ {reason}，本局不计成就。")
+            conn.room_system_chat(f"⚠ {reason}，本局不计奖励。")
         elif announce and before and not reason:
             # ★ 受限原因**换了一种**（比如放开 /hold 但难度还是 1）时两边
             #   都非空，一句都不说 —— 状态没翻转，本来就没什么新消息。
             conn.room_system_chat(cleared_notice(room))
         return reason
     except Exception as error:             # noqa: BLE001 —— 见上
-        conn.log(f"   ⚠ 成就判定扫描出错（本局照常计成就）: {error!r}")
+        conn.log(f"   ⚠ 奖励判定扫描出错（本局照常计奖励）: {error!r}")
         return None
 
 
@@ -14619,7 +14629,7 @@ gameserver.BOT_ROOM_LOADED = report_bots_loaded
 gameserver.BOT_RESPAWN_POINT = pick_respawn_point
 #: 同上：真人打出来的每一发同步包都过一次，打到 bot 身上的替它结算击退（§92）。
 gameserver.BOT_PEER_HIT = note_peer_hit
-#: 同上：这会儿房里的 bot 受限没有（成就防刷，D127）。没装这个钩子 ⇒ 这个
+#: 同上：这会儿房里的 bot 受限没有（防刷，D127 / X_Mod D104）。没装这个钩子 ⇒ 这个
 #: 进程里根本没有 bot ⇒ 一律「不受限」，降级语义天然是对的。
 gameserver.BOT_LIMIT_REASON = bot_limit_reason
 
@@ -14651,7 +14661,7 @@ def handle_command(conn, text):
         conn.send_system_chat("游戏进行中改不了 bot，等这一局打完再说。")
         return True
 
-    # ★★ 成就防刷（D127）：**命令前后各扫一遍实况**，任一次受限就给本局上闩。
+    # ★★ 防刷（D127 / X_Mod D104）：**命令前后各扫一遍实况**，任一次受限就给本局上闩。
     #
     #    「之前」那一扫不是多余的 —— `/hold` 是个开关，「解除」那一次敲完
     #    状态是干净的。只扫之后的话，「先定住、打完再解开」会被判成干净局。
