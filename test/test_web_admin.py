@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -38,7 +39,9 @@ import gameserver                                             # noqa: E402
 import gifthistory                                           # noqa: E402
 import lobby                                                   # noqa: E402
 import logpack                                                 # noqa: E402
+import logshelf                                                # noqa: E402
 import sellprice                                               # noqa: E402
+import sevenzip                                                # noqa: E402
 import shopcfg                                                 # noqa: E402
 import shopdata                                                # noqa: E402
 import versioning                                              # noqa: E402
@@ -46,6 +49,7 @@ import weaponcfg                                               # noqa: E402
 from account_store import AccountStore                         # noqa: E402
 from web import admin as web_admin                             # noqa: E402
 from web import server as web_server                           # noqa: E402
+from testsupport import read_7z                                # noqa: E402
 
 
 #: 三份默认配置**只生成一次**，之后每个用例复制一份。
@@ -374,6 +378,12 @@ class AdminAuthTests(_AdminCase):
                 # 下载日志（2026-09-17）：整个 logs/ 会被发出去，门一样不能少。
                 ("/admin/api/logs", None),
                 ("/admin/api/logs/download?kind=server&scope=all", None),
+                # 待下载 7z 包（X17）：压 / 看 / 下 / 删，门一样不能少。
+                ("/admin/api/logs/archives", None),
+                ("/admin/api/logs/archives?since=0", None),
+                ("/admin/api/logs/archives/create", {"kind": "server", "scope": "all"}),
+                ("/admin/api/logs/archives/remove", {"name": "logs_server_20260930-101530.7z"}),
+                ("/admin/api/logs/archives/download?name=logs_server_20260930-101530.7z", None),
         ):
             status, result = self.request(path, payload)
             self.assertEqual(401, status, path)
@@ -1980,6 +1990,12 @@ class OperatorPermissionTests(_AdminCase):
                 ("/admin/api/backups/remove", {"id": "20260907-040000-auto"}),
                 ("/admin/api/logs", None),
                 ("/admin/api/logs/download?kind=server&scope=all", None),
+                # 待下载 7z 包（X17）：压 / 看 / 下 / 删，门一样不能少。
+                ("/admin/api/logs/archives", None),
+                ("/admin/api/logs/archives?since=0", None),
+                ("/admin/api/logs/archives/create", {"kind": "server", "scope": "all"}),
+                ("/admin/api/logs/archives/remove", {"name": "logs_server_20260930-101530.7z"}),
+                ("/admin/api/logs/archives/download?name=logs_server_20260930-101530.7z", None),
         ):
             status, result = self.request(path, payload)
             self.assertEqual(403, status, path)
@@ -2192,6 +2208,12 @@ class PlayerReadOnlyTests(_AdminCase):
                 ("/admin/api/backups/remove", {"id": "20260907-040000-auto"}),
                 ("/admin/api/logs", None),
                 ("/admin/api/logs/download?kind=server&scope=all", None),
+                # 待下载 7z 包（X17）：压 / 看 / 下 / 删，门一样不能少。
+                ("/admin/api/logs/archives", None),
+                ("/admin/api/logs/archives?since=0", None),
+                ("/admin/api/logs/archives/create", {"kind": "server", "scope": "all"}),
+                ("/admin/api/logs/archives/remove", {"name": "logs_server_20260930-101530.7z"}),
+                ("/admin/api/logs/archives/download?name=logs_server_20260930-101530.7z", None),
         ):
             status, result = self.request(path, payload)
             self.assertEqual(403, status, path)
@@ -2595,6 +2617,274 @@ class AdminLogsApiTests(_AdminCase):
         status, result = self.request("/admin/api/session")
         self.assertEqual(200, status)
         self.assertTrue(result["logged_in"])
+
+
+@unittest.skipUnless(sevenzip.AVAILABLE, "这个 Python 没带 lzma")
+class AdminArchivesApiTests(_AdminCase):
+    """「待下载 7z 包」（X17，D101）的 HTTP 那一层：排任务、长轮询进度、下载、删除、出错收场。
+
+    数据层（后台线程 / 版本号 / 名字校验）在 `test_logshelf`。★ 等「压完」一律走长轮询
+    （`?since=版本`）—— 服务端版本一变就回，测试里没有固定的等待秒数。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.logdir = os.path.join(self.tmp.name, "logs")
+        self.crash_dir = os.path.join(self.tmp.name, "logs_client_crash")
+        os.makedirs(self.logdir)
+        os.makedirs(self.crash_dir)
+        with open(os.path.join(self.logdir, "server.out"), "wb") as fp:
+            fp.write(b"today\n" * 500)
+        # ★ logs_7z/ 放系统临时目录、不放 self.tmp：下载线程关文件和用例收尾删目录在
+        #   Windows 上会抢（开着的文件删不掉）。
+        shelf_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(shelf_tmp.cleanup)
+        self.shelf_dir = os.path.join(shelf_tmp.name, "logs_7z")
+        self.packer = logpack.LogPacker(self.logdir, self.crash_dir)
+        self.shelf = logshelf.LogShelf(self.packer, self.shelf_dir,
+                                       audit=lambda msg: web_admin.eventlog.online(msg))
+        self.addCleanup(self.shelf.stop, AUDIT_FUSE_S)
+        self.httpd.RequestHandlerClass.log_packer = self.packer
+        self.httpd.RequestHandlerClass.log_shelf = self.shelf
+        self.assertTrue(self.login()[1]["ok"])
+
+    def poll_until_idle(self, archives):
+        """长轮询到没活为止，返回最后那份快照。每一发都是「版本变了才回」。"""
+        while archives["busy"]:
+            status, result = self.request("/admin/api/logs/archives?since=%d"
+                                          % archives["version"])
+            self.assertEqual(200, status, result)
+            archives = result["archives"]
+        return archives
+
+    def gate(self, before=None):
+        """让后台的 `write_7z` 停在闸门上（事件驱动），返回闸门。"""
+        opened = threading.Event()
+        real = self.packer.write_7z
+
+        def gated(fp, plan, meta=None, progress=None):
+            if before is not None:
+                before(plan, progress)
+            if not opened.wait(AUDIT_FUSE_S):
+                raise RuntimeError("闸门没被放行（保险丝）")
+            return real(fp, plan, meta=meta, progress=progress)
+
+        self.packer.write_7z = gated
+        self.addCleanup(opened.set)
+        return opened
+
+    def test_the_overview_carries_the_shelf(self):
+        status, result = self.request("/admin/api/logs")
+        self.assertEqual(200, status)
+        self.assertTrue(result["sevenzip"])
+        self.assertEqual({"files": [], "jobs": [], "busy": False, "dirname": "logs_7z"},
+                         {key: result["archives"][key]
+                          for key in ("files", "jobs", "busy", "dirname")})
+
+    def test_without_a_shelf_the_page_says_so(self):
+        self.httpd.RequestHandlerClass.log_shelf = None
+        status, result = self.request("/admin/api/logs")
+        self.assertEqual(200, status)
+        self.assertIsNone(result["archives"])
+        self.assertFalse(result["sevenzip"])
+        for path, payload in (("/admin/api/logs/archives", None),
+                              ("/admin/api/logs/archives/create", {"kind": "server"}),
+                              ("/admin/api/logs/archives/download?name=x.7z", None)):
+            status, result = self.request(path, payload)
+            self.assertFalse(result["ok"], path)
+            self.assertIn("没有启动", result["message"], path)
+
+    def test_compress_poll_download_remove(self):
+        lines = self.capture_log()
+        status, result = self.request("/admin/api/logs/archives/create",
+                                      {"kind": "server", "scope": "all"})
+        self.assertEqual(200, status, result)
+        self.assertTrue(result["ok"])
+        self.assertIn("已加入压缩队列：服务端日志（全量）", result["message"])
+        archives = self.poll_until_idle(result["archives"])
+        (item,) = archives["files"]
+        self.assertEqual([], archives["jobs"])
+        self.assertRegex(item["name"], r"^logs_server_\d{8}-\d{6}\.7z$")
+        self.assertEqual("服务端日志（全量）", item["label"])
+
+        status, headers, body = self.fetch("/admin/api/logs/archives/download?name="
+                                           + urllib.parse.quote(item["name"]))
+        self.assertEqual(200, status)
+        self.assertEqual("application/x-7z-compressed", headers["Content-Type"])
+        self.assertEqual(str(len(body)), headers["Content-Length"])
+        self.assertEqual(item["size"], len(body))
+        self.assertNotIn("Transfer-Encoding", headers)
+        self.assertEqual('attachment; filename="%s"' % item["name"],
+                         headers["Content-Disposition"])
+        self.assertEqual("none", headers["Accept-Ranges"])
+        archive = read_7z(body)
+        self.assertEqual(["logs/server.out", "MANIFEST.txt"], archive.names)
+        self.assertEqual(b"today\n" * 500, archive.read("logs/server.out"))
+        self.assertIn("压缩者: admin", archive.read("MANIFEST.txt").decode("utf-8"))
+        # 排队 / 压好 / 下载各一行（下载那行是发完才写的 ⇒ 等它，不赌线程快慢）。
+        lines.wait_for(self, 3)
+        self.assertIn("排了 7z 压缩：服务端日志（全量）", lines[0])
+        self.assertIn("压缩好了服务端日志（全量）", lines[1])
+        self.assertIn("下载了 7z 包 %s" % item["name"], lines[2])
+
+        status, result = self.request("/admin/api/logs/archives/remove", {"name": item["name"]})
+        self.assertEqual(200, status, result)
+        self.assertIn("已删除：服务端日志（全量）", result["message"])
+        self.assertEqual([], result["archives"]["files"])
+        self.assertEqual([], os.listdir(self.shelf_dir))
+
+    def test_the_long_poll_is_woken_by_real_progress(self):
+        def half(plan, progress):
+            progress(plan.total_bytes // 2)
+
+        gate = self.gate(before=half)
+        _status, result = self.request("/admin/api/logs/archives/create", {"kind": "server"})
+        archives = result["archives"]
+        while not (archives["jobs"] and archives["jobs"][0]["percent"] == 50):
+            _status, result = self.request("/admin/api/logs/archives?since=%d"
+                                           % archives["version"])
+            archives = result["archives"]
+        self.assertEqual("packing", archives["jobs"][0]["state"])
+        _status, again = self.request("/admin/api/logs/archives/create", {"kind": "server"})
+        self.assertIn("这一份已经在压了", again["message"])
+        gate.set()
+        self.assertEqual(1, len(self.poll_until_idle(archives)["files"]))
+
+    def test_without_since_or_with_a_stale_version_it_answers_at_once(self):
+        gate = self.gate()
+        _status, result = self.request("/admin/api/logs/archives/create", {"kind": "server"})
+        self.assertTrue(result["archives"]["busy"])
+        for query in ("", "?since=abc", "?since=-1"):
+            status, result = self.request("/admin/api/logs/archives" + query)
+            self.assertEqual(200, status, query)
+            self.assertTrue(result["archives"]["busy"], query)
+        gate.set()
+
+    def test_bad_requests_are_json_with_a_status(self):
+        for path, payload, want in (
+                ("/admin/api/logs/archives/create", {"kind": "nope"}, 400),
+                ("/admin/api/logs/archives/create", {"kind": "client_crash"}, 404),
+                ("/admin/api/logs/archives/remove", {"name": "../server.out"}, 404),
+                ("/admin/api/logs/archives/remove", {"job": "j999"}, 404),
+                ("/admin/api/logs/archives/nope", {}, 404),
+                ("/admin/api/logs/archives/download?name=..%2Fserver.out", None, 404)):
+            status, result = self.request(path, payload)
+            self.assertEqual(want, status, (path, payload))
+            self.assertFalse(result["ok"], (path, payload))
+
+    def test_a_failed_job_can_be_cleared(self):
+        def broken(fp, plan, meta=None, progress=None):
+            raise logpack.PackAborted("读 logs/server.out 读到一半出错：读盘出错")
+
+        self.packer.write_7z = broken
+        _status, result = self.request("/admin/api/logs/archives/create", {"kind": "server"})
+        archives = self.poll_until_idle(result["archives"])
+        (job,) = archives["jobs"]
+        self.assertEqual("failed", job["state"])
+        self.assertIn("读到一半", job["error"])
+        status, result = self.request("/admin/api/logs/archives/remove", {"job": job["id"]})
+        self.assertEqual(200, status, result)
+        self.assertEqual([], result["archives"]["jobs"])
+
+    def test_a_client_that_hangs_up_mid_download_is_no_error(self):
+        """浏览器取消下载：审计一行「中断」、不进 server.err、服务器照常服务。"""
+        os.makedirs(self.shelf_dir)
+        name = "logs_server_20260930-101530.7z"
+        with open(os.path.join(self.shelf_dir, name), "wb") as fp:
+            fp.write(os.urandom(40 * 1024 * 1024))   # 远大于回环两头的 socket 缓冲
+        seen = threading.Event()
+        lines = []
+
+        def sink(line):
+            lines.append(line)
+            if "中断" in line:
+                seen.set()
+
+        real_online = web_admin.eventlog.online
+        web_admin.eventlog.online = sink
+        self.addCleanup(setattr, web_admin.eventlog, "online", real_online)
+        errors = []
+        real_handle_error = self.httpd.handle_error
+        self.httpd.handle_error = lambda request, addr: errors.append(addr)
+        self.addCleanup(setattr, self.httpd, "handle_error", real_handle_error)
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        sock.sendall(("GET /admin/api/logs/archives/download?name=%s HTTP/1.1\r\n"
+                      "Host: 127.0.0.1\r\nCookie: %s=%s\r\n\r\n"
+                      % (name, web_admin.SESSION_COOKIE, self.token())).encode("ascii"))
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            self.assertTrue(chunk, "头都没收到就断了")
+            head += chunk
+        self.assertIn(b"HTTP/1.1 200", head)
+        self.assertIn(b"Content-Length: %d" % (40 * 1024 * 1024), head)
+        sock.close()                                    # 「取消下载」
+        self.assertTrue(seen.wait(AUDIT_FUSE_S), lines)
+        self.assertEqual([], errors, "handle_error 被调了 = traceback 进了 server.err")
+        self.assertIn("下载 7z 包 %s 中断" % name, lines[-1])
+        status, result = self.request("/admin/api/session")
+        self.assertEqual(200, status)
+
+    def test_a_long_poll_whose_browser_left_does_not_reach_server_err(self):
+        """弹窗关了、长轮询还挂着：进度一变它去回包，写 socket 失败要在接口里收掉。"""
+        errors = []
+        real_handle_error = self.httpd.handle_error
+        self.httpd.handle_error = lambda request, addr: errors.append(addr)
+        self.addCleanup(setattr, self.httpd, "handle_error", real_handle_error)
+        gate = self.gate()
+        _status, result = self.request("/admin/api/logs/archives/create", {"kind": "server"})
+        archives = result["archives"]
+        # 先等它停在闸门上（packing）—— 之后版本不会再变，下面那发一定是「挂着」的。
+        while not (archives["jobs"] and archives["jobs"][0]["state"] == "packing"):
+            archives = self.request("/admin/api/logs/archives?since=%d"
+                                    % archives["version"])[1]["archives"]
+        version = archives["version"]
+        # 等那一发**真的挂在 wait() 上**了再关连接（事件驱动）：RST 来得比服务端读请求还早的话，
+        # Windows 会连没读的请求一起丢掉，处理函数根本不会被调用。
+        entered = threading.Event()
+        real_wait = self.shelf.wait
+
+        def watched_wait(since, timeout=None):
+            entered.set()
+            return real_wait(since, timeout)
+
+        self.shelf.wait = watched_wait
+        # 「这条连接彻底处理完」的信号挂在 process_request_thread 上：handle_error（如果被叫）
+        # 就在它里面，信号到了该记的错一定已经记下了。挂在接口函数外面的话，兜底和
+        # handle_error 都还没跑，测试会抢先看到一个空的 errors（会话 58 改坏检查实测漏过）。
+        # ★ 包装要在**连上之前**装好：一连上服务端就 accept、起线程了。端口连上才知道，放格子里。
+        mine = {}
+        finished = threading.Event()
+        real_thread = self.httpd.process_request_thread
+
+        def watched_thread(request, client_address):
+            try:
+                real_thread(request, client_address)
+            finally:
+                if client_address[1] == mine.get("port"):
+                    finished.set()
+
+        self.httpd.process_request_thread = watched_thread
+        self.addCleanup(delattr, self.httpd, "process_request_thread")
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        mine["port"] = sock.getsockname()[1]
+        sock.sendall(("GET /admin/api/logs/archives?since=%d HTTP/1.1\r\n"
+                      "Host: 127.0.0.1\r\nCookie: %s=%s\r\n\r\n"
+                      % (version, web_admin.SESSION_COOKIE, self.token())).encode("ascii"))
+        self.assertTrue(entered.wait(AUDIT_FUSE_S), "那一发长轮询没挂上（保险丝）")
+        # ★ 用 RST 关（SO_LINGER=0）：普通 close 之后服务端第一发往往还写得进去，
+        #   那就验不到「写失败」这条路了（会话 58 改坏检查实测漏过）。
+        linger = struct.pack("HH", 1, 0) if os.name == "nt" else struct.pack("ii", 1, 0)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
+        sock.close()                                    # 弹窗关了
+        gate.set()                                      # 压完 ⇒ 版本变 ⇒ 挂着的那发去回包
+        self.assertTrue(finished.wait(AUDIT_FUSE_S), "挂着的长轮询没被压完这件事叫醒")
+        self.assertEqual([], errors, "handle_error 被调了 = traceback 进了 server.err")
+        self.poll_until_idle(self.request("/admin/api/logs/archives")[1]["archives"])
+
+    def token(self):
+        return next(cookie.value for cookie in self.jar
+                    if cookie.name == web_admin.SESSION_COOKIE)
 
 
 class AdminItemLookupTests(_AdminCase):

@@ -311,7 +311,8 @@
          列表滚」那套壳（D39）：设置条 / 手动备份条 / 换页栏钉住不动。
          ★ 只有系统管理员看得到（SYSTEM_ONLY_TABS），门在服务端。
          ★ 2026-09-17 加了「⇩ 下载日志」（弹窗在文件末尾 #logsModal，D131），
-           页名跟着改成「数据管理」；id / data-tab 里的 backup 没动。 -->
+           页名跟着改成「数据管理」；id / data-tab 里的 backup 没动。
+         ★ 2026-09-30 弹窗能选 zip / 7z，右栏「待下载 7z 包」（X17，D101）。 -->
     <section class="panel hidden fit-panel" id="backupPanel">
       <div class="panel-title">
         <h2>数据管理</h2>
@@ -336,8 +337,10 @@
             勾了会把所有玩家的进度倒回去。</li>
           <li><b>下载日志</b>把服务端的 <code>logs/</code>（第一层的全部文件，「最近
             N 小时」按文件的最后修改时间算）或玩家客户端传上来的
-            <code>logs_client_crash/</code>（每份一个子目录）打成 zip 直接下载，
-            不用远程登录服务器；边打包边传，服务器上不留副本。</li>
+            <code>logs_client_crash/</code>（每份一个子目录）打包下载，不用远程登录服务器。
+            选 <b>zip</b> 就边打包边传、服务器上不留副本；选 <b>7z</b> 体积约为 zip 的
+            1/3，先在服务器后台压好（弹窗右边看进度，放在 <code>logs_7z/</code>），
+            压好了再下载，用完记得删。</li>
         </ul>
         <div class="toolbar backup-bar">
           <label class="toggle" id="backupEnabled">
@@ -358,7 +361,7 @@
                对应表」「⚙ 卖出价格设置」同一身），金色留给旁边那颗「保存设置」
                —— 两颗钮挨着，靠色相分（D72b / D97f）。 -->
           <button class="btn btn-ref" id="logsOpenBtn"
-                  title="把 logs/ 或 logs_client_crash/ 打成 zip 下载（边打包边传，服务器上不留副本）">⇩ 下载日志</button>
+                  title="把 logs/ 或 logs_client_crash/ 打包下载：zip 边打包边传；7z 更小，先在服务器上压好再下">⇩ 下载日志</button>
         </div>
         <p class="hint backup-status" id="backupStatus"></p>
         <div class="toolbar backup-bar">
@@ -999,13 +1002,14 @@
   </div>
 </div>
 
-<!-- ============ 下载日志（用户 2026-09-17，D131） ============
-     「数据管理」页工具条上「⇩ 下载日志」点开的**只读**弹窗：服务端日志 logs/ 和
-     客户端崩溃包 logs_client_crash/ 各一张卡片，数字来自 `/admin/api/logs`，
-     内容由 admin.js 的 `renderLogs()` 打开时现画，页面里不留静态副本。
-     ★ 纯只读 ⇒ 点遮罩 / Esc / ✕ 都能关（同「等级经验对应表」那一窗）；没有
-       panel-foot —— 下载钮都在卡片里，而且一律米黄 `.btn.btn-sm`（下载是只读
-       动作，没有「主钮」）。zip 由服务端边打包边发，进度在浏览器的下载栏里。 -->
+<!-- ============ 下载日志（用户 2026-09-17，D131；X17 2026-09-30 加 7z，D101） ============
+     「数据管理」页工具条上「⇩ 下载日志」点开的弹窗：顶上「格式 zip | 7z」；左栏服务端日志
+     logs/ 和客户端崩溃包 logs_client_crash/ 各一张卡片（数字来自 `/admin/api/logs`）；
+     右栏「待下载 7z 包」（服务器 logs_7z/ 里压好的 + 正在压的进度条，长轮询实时更新）。
+     内容全由 admin.js 的 `renderLogs()` / `renderShelf()` 现画，页面里不留静态副本。
+     ★ 点遮罩 / Esc / ✕ 都能关（同「等级经验对应表」那一窗；关掉不影响服务器上正在压的）；
+       没有 panel-foot —— 钮都在卡片里：zip 下载米黄、7z 压缩金色（会在服务器上生成文件）、
+       右栏下载米黄 / 删除红色（和备份那一行同一套）。 -->
 <div class="modal hidden" id="logsModal">
   <div class="panel logs-panel">
     <div class="panel-title">

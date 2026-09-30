@@ -21,12 +21,12 @@
                                                             -> {ok, message}
     POST /api/export      {username, password}            -> {ok, message, save}
     POST /api/import      {username, password, save}      -> {ok, message}
-    POST /api/crash-report  <zip 原始字节>                -> {ok, message, saved}
+    POST /api/crash-report  <7z / zip 原始字节>           -> {ok, message, saved}
 
 ★ `/api/crash-report` 和上面那几个**完全不是一路货**：它的 body 是几 MB 到
-几十 MB 的二进制 zip，不走 `_read_body()`（那里有 1 MB 的全局上限），也不解析
-JSON。元数据放在 `X-Crash-*` 请求头里。发送那一头在 `server/crashwatch.py`，
-落地那一头在 `server/crashstore.py`。
+几十 MB 的二进制压缩包（新客户端 7z、老客户端 zip，按魔数认，X17），不走
+`_read_body()`（那里有 1 MB 的全局上限），也不解析 JSON。元数据放在 `X-Crash-*`
+请求头里。发送那一头在 `server/crashwatch.py`，落地那一头在 `server/crashstore.py`。
 
 ★ `/admin` 开头的那一组（管理页，V0.3商店 M8）在 `web/admin.py` 里，
 和这里**共用同一个端口、同一个 `Handler`**。路由清单见那个文件的开头。
@@ -286,6 +286,10 @@ class Handler(admin.AdminRoutes, http.server.BaseHTTPRequestHandler):
     #: 日志打包（`logpack.LogPacker`，管理页「数据管理」→「下载日志」）。
     #: `None` = 这个进程不是 app.py 起的（单跑注册页 / 测试），那两个接口回「没有启动」。
     log_packer = None
+
+    #: 「待下载 7z 包」（`logshelf.LogShelf`，X17）：后台压 7z、进度长轮询、下载 / 删除。
+    #: `None` 同上。
+    log_shelf = None
 
     #: 下发给更新器的 `config/update.config` 的路径。这里存的**只是路径**，
     #: 内容每次请求现读 —— 改完文件立刻生效，不用重启（见 `_api_update_config`）。
@@ -704,18 +708,27 @@ class Handler(admin.AdminRoutes, http.server.BaseHTTPRequestHandler):
 
         tmp = name = None
         written = 0
+        fp = None
         try:
             tmp, name = store.begin(crash_id)
             digest = hashlib.sha256()
-            with open(os.path.join(tmp, crash_id + ".zip"), "wb") as fp:
+            try:
                 while written < length:
                     chunk = self.rfile.read(min(CRASH_CHUNK_BYTES,
                                                 length - written))
                     if not chunk:
                         raise ConnectionError("上传中断")
+                    if fp is None:
+                        # ★ 看第一块的魔数定扩展名（X17）：新客户端传 7z，
+                        #   已经发出去的老客户端传 zip —— 两种都收。
+                        fp = open(os.path.join(
+                            tmp, crash_id + crashstore.package_suffix(chunk)), "wb")
                     fp.write(chunk)
                     digest.update(chunk)
                     written += len(chunk)
+            finally:
+                if fp is not None:
+                    fp.close()
             got_sha = digest.hexdigest()
         except crashstore.CrashUploadError as error:
             store.abandon(tmp)
@@ -782,7 +795,7 @@ def make_server(port, accounts, host="::",
                 crash_max_mb=server_config.DEFAULT_CRASH_MAX_UPLOAD_MB,
                 crash_cooldown=(
                     server_config.DEFAULT_CRASH_UPLOAD_COOLDOWN_SECONDS),
-                log_packer=None, update_config_path=None):
+                log_packer=None, update_config_path=None, log_shelf=None):
     """建好 HTTP 服务器但不开始服务，方便测试拿到真实端口。
 
     `cooldown` = 注册冷却秒数（`server.config` 的 `register_cooldown_seconds`）。
@@ -793,6 +806,7 @@ def make_server(port, accounts, host="::",
     （同上：漏传参数时应当**不收**，而不是默默往磁盘上写）。
     `log_packer` = `logpack.LogPacker`（同一页的「下载日志」）；不传时那两个接口
     回「日志下载没有启动」（同上：不该让一台只跑注册页的进程把 `logs/` 发出去）。
+    `log_shelf` = `logshelf.LogShelf`（同一弹窗右栏的「待下载 7z 包」，X17）；不传同理。
     `update_config_path` = 下发给更新器的 `config/update.config` 的路径；
     不传就是包根那一份。★ 这里给的**只是路径**，内容每次请求现读 ——
     改完文件立刻生效，不用重启（测试靠它指向临时文件）。
@@ -809,6 +823,7 @@ def make_server(port, accounts, host="::",
                     "crash_limiter": RegisterRateLimiter(crash_cooldown),
                     "crash_max_bytes": max(0, int(crash_max_mb)) * 1048576,
                     "log_packer": log_packer,
+                    "log_shelf": log_shelf,
                     "update_config_path": (
                         update_config_path
                         or server_config.update_config_path())})
@@ -821,12 +836,13 @@ def serve(port, accounts, host="::", ready=None,
           crash_max_mb=server_config.DEFAULT_CRASH_MAX_UPLOAD_MB,
           crash_cooldown=(
               server_config.DEFAULT_CRASH_UPLOAD_COOLDOWN_SECONDS),
-          log_packer=None, update_config_path=None):
+          log_packer=None, update_config_path=None, log_shelf=None):
     """阻塞地提供注册页服务。`app.py` 会把它丢进一个线程。"""
     httpd = make_server(port, accounts, host, cooldown, backup=backup,
                         crash=crash, crash_max_mb=crash_max_mb,
                         crash_cooldown=crash_cooldown, log_packer=log_packer,
-                        update_config_path=update_config_path)
+                        update_config_path=update_config_path,
+                        log_shelf=log_shelf)
     if ready is not None:
         ready.set()
     httpd.serve_forever()

@@ -28,6 +28,7 @@ runtime\python\python.exe test\run_tests.py test_shop  # 只跑某几个模块 /
 | 目录 | 谁在用 | 是什么 |
 |---|---|---|
 | `data/pkn/` | `test_pkn.py` 的 `GoldenVolumeTests` | 原版最小的加密卷 `Effects0011.pkn`（300 KB）+ 期望值 `Effects0011.expected.json` |
+| `data/sevenzip/` | `test_sevenzip.py` 的 `FixtureTests` | **真 7-Zip 19.00** 打的小包（599 字节：中文目录、空文件、属性、kDummy 对齐）+ `expected.json`。守着 `testsupport.read_7z` —— 写入器和读取器都是自己写的，没有它两边会「对得上、一起错」（X17）|
 
 ### 🔴 这里的东西看着「没人用」也别删
 

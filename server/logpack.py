@@ -47,6 +47,12 @@ Windows 上 `scandir` 的 `DirEntry.stat()` 直接用目录枚举带回来的数
 （每个成员的大小 / CRC 写在数据**后面**），所以能往 HTTP 响应体这种不能回头的流里写。
 ★ `write()` **必须返回写了多少字节**（`_Tellable` 拿它累加偏移，返回 None 直接 TypeError）。
 
+## 7z（X17，D101 / §142）：`write_7z` 往**可 seek 的文件**里写，不走 HTTP 流
+
+7z 开头 32 字节要写尾部目录的偏移 / CRC，全部压完才知道 ⇒ 做不到边压边发。由 `logshelf`
+的后台线程压进 `logs_7z/`，压完再下载；zip 那一路（上面几节）一个字没动。
+固实 LZMA2 -1 档（`sevenzip`），已经压过的（`STORED_SUFFIXES`）原样存、先写；`MANIFEST.txt` 最后。
+
 ## 铁律：只用标准库，CPython 3.8（Win7 运行时）也要能跑
 """
 from __future__ import annotations
@@ -58,6 +64,7 @@ import time
 import zipfile
 
 from databackup import format_size, format_time
+import sevenzip
 import tzstamp
 
 #: 「最近多少小时」（用户 2026-09-17 定的 12）。前端的标签从 overview 里现取，别两头写死。
@@ -81,6 +88,12 @@ STORED_SUFFIXES = (".zip", ".7z", ".gz", ".png", ".jpg", ".dll", ".exe")
 #: 最快的 deflate 档。
 COMPRESS_LEVEL = 1
 
+#: 7z 的 LZMA2 档：-1（实测云服 12 小时日志 zip 4.5 MB → 1.52 MB、本机 0.4 秒；-6 只再小 13%、慢 10 倍，§142）。
+LZMA_PRESET = sevenzip.DEFAULT_PRESET
+
+#: 7z 那一路一次读多少（也是进度回调的粒度）。缓冲大小，不是铁律 10 说的时序阈值。
+READ_CHUNK = 256 * 1024
+
 MANIFEST_NAME = "MANIFEST.txt"
 
 #: zip 文件名里的时间戳（服务器本地时间）。
@@ -99,11 +112,18 @@ class NothingToPack(LogPackError):
     status = 404
 
 
+class SevenZipUnavailable(LogPackError):
+    """这个 Python 没带 `lzma`（自己编译、缺 liblzma），压不了 7z。zip 照常能用。"""
+
+    status = 503
+
+
 class PackAborted(Exception):
     """一个成员拷到一半读不下去了（磁盘坏块这种极罕见的事）：zip 已经不完整。
 
     和「输出那头断了」（`write_zip` 原样抛出 sink 的异常）分开 —— 前者是服务器
     自己的问题，后者多半是浏览器取消了下载，审计日志里要说清楚是哪一种。
+    7z 那一路（`write_7z`）还有一种：临时文件写不进去（磁盘满）—— 消息里说清楚是哪一种。
     """
 
 
@@ -119,6 +139,8 @@ class Plan:
         self.label = label
         #: 浏览器存成什么名字。**全 ASCII** —— HTTP 头是 latin-1，放中文当场炸。
         self.filename = filename
+        #: 不带扩展名的那一截：zip 是 `stem + ".zip"`，7z 是 `stem + ".7z"`（X17）。
+        self.stem = filename[:-len(".zip")]
         self.stamp = stamp
         self.entries = entries
         #: 清单时的原始字节数之和（打包时文件还可能在长，只当参考）。
@@ -331,6 +353,78 @@ class LogPacker:
                 "bytes": sum(size for _name, size, _when in written),
                 "skipped": skipped}
 
+    def write_7z(self, fp, plan, meta=None, progress=None):
+        """把 `plan` 压成 7z 写进**可 seek** 的 `fp`（X17，D101）。`fp` 由调用方开、关、改名。
+
+        固实 LZMA2（`LZMA_PRESET`）；已经压过的（`STORED_SUFFIXES`）原样存、排在前面
+        （省得在压不小的东西上白烧 CPU，§142）；`MANIFEST.txt` 最后写，清单按 `plan` 的顺序列。
+        `progress(已读字节)` 每读一块叫一次（`logshelf` 拿它算百分比）。
+
+        返回 `{"files", "bytes", "skipped", "size"}`（`size` = 整个 7z 的字节数）。
+
+        ★ 「跳过」= 这个文件一个字节都没进包：打不开（刚被清理掉 / 权限不够）、名字进不了 7z。
+        ★ 「作废」（`PackAborted`）：读到一半出错（固实流退不回去），或者临时文件写不进去
+          （磁盘满）—— 两种在消息里分开说，审计日志要看得出是哪边的问题。
+        """
+        if not sevenzip.AVAILABLE:
+            raise SevenZipUnavailable("这台服务器的 Python 没带 lzma 模块（自己编译时缺 liblzma），"
+                                      "打不了 7z；zip 照常能用")
+        meta = dict(meta or {})
+        writer = sevenzip.Writer(fp, preset=LZMA_PRESET, solid=True)
+        # 已经压过的排前面（稳定排序：各自保持 plan 里的先后）。
+        order = sorted(range(len(plan.entries)),
+                       key=lambda index: not is_precompressed(plan.entries[index][1]))
+        written = {}            # plan 里的下标 → (7z 里的名字, 原始字节, mtime 秒)
+        skipped = []
+        done = 0
+        for index in order:
+            path, arcname = plan.entries[index]
+            try:
+                src = open(path, "rb")
+            except OSError as error:
+                skipped.append((arcname, _describe(error)))
+                continue
+            with src:
+                try:
+                    member = writer.begin(arcname, compress=not is_precompressed(arcname))
+                except ValueError as error:
+                    skipped.append((arcname, "名字进不了 7z（%s）" % error))
+                    continue
+                while True:
+                    try:
+                        chunk = src.read(READ_CHUNK)
+                    except OSError as error:
+                        raise PackAborted("读 %s 读到一半出错：%s"
+                                          % (arcname, _describe(error))) from error
+                    if not chunk:
+                        break
+                    _write_member(writer, member, chunk)
+                    done += len(chunk)
+                    if progress is not None:
+                        progress(done)
+                # ★ mtime 用**读完之后**按句柄查的：还在长的 server.out 拿到的是最后那一刻。
+                try:
+                    mtime_ns = os.fstat(src.fileno()).st_mtime_ns
+                except OSError:
+                    mtime_ns = int(plan.now * 1e9)
+                writer.end(member, mtime_ns)
+            written[index] = (arcname, member.size, mtime_ns / 1e9)
+        listed = [written[index] for index in sorted(written)]
+        text = manifest_text(plan, [(name, size, time.localtime(mtime)[:6])
+                                    for name, size, mtime in listed],
+                             skipped, meta, container="7z")
+        member = writer.begin(MANIFEST_NAME)
+        _write_member(writer, member, text.encode("utf-8"))
+        writer.end(member, int(plan.now * 1e9))
+        try:
+            size = writer.close()
+        except OSError as error:
+            raise PackAborted("临时文件写不进去（%s）" % _describe(error)) from error
+        return {"files": len(listed),
+                "bytes": sum(size for _name, size, _mtime in listed),
+                "skipped": skipped,
+                "size": size}
+
 
 # -------------------------------------------------------------------- 工具
 class _Counting:
@@ -356,15 +450,28 @@ class _Counting:
         self._sink.flush()
 
 
+def is_precompressed(name):
+    """崩溃包这种本来就是压缩包的：zip 里原样存、7z 里走 Copy folder。"""
+    return name.lower().endswith(STORED_SUFFIXES)
+
+
 def compress_type_for(name):
     """崩溃包这种本来就是压缩包的原样存，其余 deflate。"""
-    if name.lower().endswith(STORED_SUFFIXES):
+    if is_precompressed(name):
         return zipfile.ZIP_STORED
     return zipfile.ZIP_DEFLATED
 
 
-def manifest_text(plan, written, skipped, meta):
-    """zip 根上那份 `MANIFEST.txt` 的内容。"""
+def _write_member(writer, member, data):
+    """往 7z 里写一块；临时文件写不进去（磁盘满）= 这份 7z 作废，并说清楚是**这边**的问题。"""
+    try:
+        writer.write(member, data)
+    except OSError as error:
+        raise PackAborted("临时文件写不进去（%s）" % _describe(error)) from error
+
+
+def manifest_text(plan, written, skipped, meta, container="zip"):
+    """包根上那份 `MANIFEST.txt` 的内容。`container` 是 `"zip"`（边打包边下载）或 `"7z"`（后台压好）。"""
     lines = [
         "炮炮火枪手 服务端 —— 日志打包清单",
         "类别: %s" % plan.label,
@@ -374,7 +481,7 @@ def manifest_text(plan, written, skipped, meta):
     if meta.get("version"):
         lines.append("服务器版本: %s" % meta["version"])
     if meta.get("by"):
-        lines.append("下载者: %s" % meta["by"])
+        lines.append("%s: %s" % ("下载者" if container == "zip" else "压缩者", meta["by"]))
     total = sum(size for _name, size, _when in written)
     lines.append("文件: %d 个，原始大小共 %s" % (len(written), format_size(total)))
     if skipped:
@@ -384,8 +491,8 @@ def manifest_text(plan, written, skipped, meta):
     lines.append("")
     # ★ 逐行的时间不重复写时区（太吵），在表头说一次 —— 它们和「打包时刻」
     #   同一台机器、同一个时区。（bug调查/25：三台机器三个时区，比反过一次。）
-    lines.append("--- 文件清单（zip 内路径 / 原始字节 / 最后修改时间，均为 %s）---"
-                 % tzstamp.utc_offset_text(plan.now))
+    lines.append("--- 文件清单（%s 内路径 / 原始字节 / 最后修改时间，均为 %s）---"
+                 % (container, tzstamp.utc_offset_text(plan.now)))
     for arcname, size, when in written:
         lines.append("%s\t%d\t%04d-%02d-%02d %02d:%02d:%02d" % ((arcname, size) + tuple(when)))
     lines.append("")

@@ -2881,3 +2881,23 @@ D60 把炸点改成 `hit.free`（被挡住的**前一个**整数点），比旧�
 - 影响：只是客户端显示错（商店 / 合成若按客户端余额判「够不够」会被挡），存档是对的；下次正常看完结算或重登就恢复。
   那一局升了级又走这条路的话，等级显示同样停在旧值（等级只靠 `0x0600` 或线序 1 更新）。
 - ⇒ D100（会话 57 第二轮）：本人那份 `0x0309` 填数据栏四格真值 + 结算后直接退房先补 `0x0600`。
+
+## §142 ★★★★ 日志 / 崩溃包换 7z 的硬事实：LZMA2 -1 档比现在的 zip 小 3~5 倍、80 MB/s；7z 头写在最前却要尾部目录的 CRC ⇒ 做不到边压边发（✅ 实测 2026-09-30 + 🔍 7zFormat.txt / 7zOut.cpp / 7zIn.cpp / libarchive）
+
+- 体积（只在内存里压）：云服 12 小时日志（`bug调查/28`，107 个文件 30.8 MB，6 个空文件）zip deflate-1 ≈4.5 MB → LZMA2 -1 固实 **1.52 MB**（本机 0.4 秒）/ -2 1.46 / -6 1.32（4.2 秒）；
+  开发机 6 个大日志 106 MB：zip 21.5 → -1 **4.41 MB**（1.3 秒，82 MB/s；Win7 3.8 32 位 62 MB/s）/ -6 3.86（11.5 秒）。变小靠 1 MB 字典看得到 deflate 32 KB 窗口外的重复行；
+  固实与否只差 ~4%。**已压缩数据**（崩溃包里的 zip、随机数据）LZMA -1 只有 4~7 MB/s、几乎不变小 ⇒ 原样存（Copy）。
+  崩溃包（45.7 MB mdmp）：现在的 zip（deflate-6）15.3 MB → -1 11.4 MB（3.3 秒）/ -6 10.6 MB（9.4 秒）。
+- 标准库没有 7z；`lzma.FORMAT_RAW` + `FILTER_LZMA2` 的输出就是 7z LZMA2 编码器要的原始流（末尾 `00` 结束标记，空输入就是一个 `00`）。
+  两套 Windows 运行时都带 `_lzma.pyd`，Linux 的 python-build-standalone 也带；自己编译、缺 liblzma 的 python3 没有 ⇒ import 要守住（`app.py` 顶层就 import `logpack`）。
+- 开头 32 字节的 SignatureHeader 里有 NextHeaderOffset / Size / CRC ⇒ 全部压完才写得出第一个字节，只能先写进可 seek 的文件。
+- 读取器要求（写错一个就打不开）：空文件必须 kEmptyStream **加** kEmptyFile（否则两家都解成文件夹）；SubStreamsInfo 顺序 `0D → 09 → 0A → 00`（libarchive 只认这个）；
+  任一 folder 子流数 >1 时 `09` 必写；FilesInfo 每条记录的字节数必须正好用完（7-Zip 报 Headers Error）；名字 UTF-16LE、分隔符 `/`；
+  编码器字节：Copy `01 01 00`、LZMA2 `01 21 21 01 <字典码>`，1 MiB = `10`（和 `lzma._encode_filter_properties` 一致）；不写属性 / kDummy 两家都认。
+- 7-Zip 19.00 实测（会话 58）：写入器十种形状（固实 / Copy+LZMA2 混排 / 空文件在头中尾 / 只有空文件 / 中文与非 BMP 名 / 非固实 / 跨块大文件 / 空包）
+  `7z t` 全 Everything is Ok、`x` 逐字节一致、mtime 对、空文件解出来是文件；Windows 自带 bsdtar 3.5.2（libarchive，没链 liblzma）`tar -tvf` 也列得出。
+  真数据：云服 12 小时日志 106 个文件 30.76 MB → zip 4.53 MB / **7z 1.53 MB**（0.42 秒）；真崩溃包（mdmp 43.6 MB）zip 14.63 MB → **7z 10.91 MB**（2.16 秒）。
+  7-Zip 自己存路径也用 `/`，并会按数据量缩小字典（小包写的字典属性是 1 = 6 KiB）—— 读取器按属性字节解就行。
+- 测试侧踩到的（别再犯）：普通 close 之后服务端第一发往往还写得进去，要验「回包写失败」得让客户端 RST（SO_LINGER=0）；
+  RST 早于服务端读请求时 Windows 连请求一起丢 ⇒ 先等处理函数挂上再 RST；「处理完」的信号要挂在 `process_request_thread` 上
+  （`handle_error` 在它里面），而且要在**连上之前**装好（一连上就 accept、起线程）。

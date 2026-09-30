@@ -680,7 +680,7 @@ backup_keep_days = 7
 #
 #   上传的内容：game_patched\\Dump\\ 里【这一次】的崩溃报告和内存转储、
 #               BigShot.rpt 的【最后一段】、game_patched\\Debug\\ 当天的日志、
-#               以及 logs\\ 里本次运行的日志。压缩后通常 10 MB 上下。
+#               以及 logs\\ 里本次运行的日志。打成 7z 后通常几 MB 到十几 MB。
 #   ⚠ 内存转储是游戏进程当时的内存快照，理论上可能含有你刚输入的内容
 #     （包括密码）。它只会发给你自己在上面那行 server_address 里填的服务器。
 #     不想传就把这里改成 0 —— 崩溃现场仍然会留在你自己电脑的 game_patched\\Dump\\ 里。

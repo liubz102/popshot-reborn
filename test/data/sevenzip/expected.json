@@ -1,0 +1,42 @@
+{
+  "archive": "7zip19-lzma2-d1m-hc-off.7z",
+  "made_by": "7-Zip 19.00 (x64)",
+  "command": "7z a -t7z -mhc=off -m0=LZMA2:d=1m -ms=on -mtm=on -mtc=off -mta=off",
+  "entries": [
+    {
+      "name": "data.bin",
+      "dir": false,
+      "size": 4096,
+      "sha256": "c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193",
+      "mtime_ns": 1758000000000000000
+    },
+    {
+      "name": "empty.log",
+      "dir": false,
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "mtime_ns": 1758000000000000000
+    },
+    {
+      "name": "hello.txt",
+      "dir": false,
+      "size": 450,
+      "sha256": "a5ee6e5189225d70f6677af218f38394aef8edb329ffbd6f5b06146b6a338377",
+      "mtime_ns": 1758000000000000000
+    },
+    {
+      "name": "中文目录",
+      "dir": true,
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "mtime_ns": 1758000000000000000
+    },
+    {
+      "name": "中文目录/说明.txt",
+      "dir": false,
+      "size": 1160,
+      "sha256": "68676322fed986ca9245fd0eb87c2a48483249946b8bd1275442b443aaaf8f79",
+      "mtime_ns": 1758000000000000000
+    }
+  ]
+}

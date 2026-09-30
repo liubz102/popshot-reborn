@@ -48,6 +48,8 @@ import eventlog
 import gameserver
 import logcleanup
 import logpack
+import logshelf
+import sevenzip
 import shopcfg
 import udpsync
 import versioning
@@ -656,13 +658,19 @@ def main(argv=None):
         # logs_client_crash\ 打成 zip 流式发给浏览器。打包在那条 HTTP 请求线程上做，
         # 不拿任何数据锁，zlib / 文件 IO / 发包都释放 GIL —— 不挡战斗（D131）。
         log_packer = logpack.LogPacker(logcleanup.DEFAULT_LOGDIR, crash.dir)
+        # 同一弹窗的 7z（X17，D101）：7z 做不到边压边发 ⇒ 一条后台线程压进 logs_7z\，
+        # 右栏长轮询看进度、压完再下。线程和目录都等第一次「压缩」才有（打包自检不长目录）。
+        log_shelf = logshelf.LogShelf(
+            log_packer, os.path.join(os.path.dirname(logcleanup.DEFAULT_LOGDIR),
+                                     logshelf.DIRNAME),
+            audit=lambda message: eventlog.online(message))
         _start("web", web_server.serve,
                kwargs={"port": web_port, "accounts": accounts,
                        "host": args.host, "cooldown": cooldown,
                        "backup": backup, "crash": crash,
                        "crash_max_mb": crash_max_mb,
                        "crash_cooldown": cfg["crash_upload_cooldown_seconds"],
-                       "log_packer": log_packer},
+                       "log_packer": log_packer, "log_shelf": log_shelf},
                port=web_port)
         log(f"注册页   {describe_listen(args.host, web_port)}"
             f" —— 本机打开 http://127.0.0.1:{web_port}/")
@@ -678,7 +686,11 @@ def main(argv=None):
         else:
             log("崩溃日志 不接收（crash_max_upload_mb = 0）")
         log(f"日志下载 管理页「数据管理」→「下载日志」能把 logs\\ 和 "
-            f"{crashstore.DIRNAME}\\ 打成 zip 下载（不用远程登录）")
+            f"{crashstore.DIRNAME}\\ 打成 zip（边压边下）或 7z（后台压进 "
+            f"{logshelf.DIRNAME}\\ 再下）下载（不用远程登录）")
+        if not sevenzip.AVAILABLE:
+            log("日志下载 ⚠ 这个 Python 没带 lzma 模块（自己编译时缺 liblzma），"
+                "打不了 7z，只能用 zip；换服务端包自带的运行时就有")
     else:
         log("注册页   已关闭（--no-web）")
 
