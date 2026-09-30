@@ -21,6 +21,22 @@
 替代服务端恢复单机内容。目标是保留登录、大厅、房间、训练场和闯关流程；不连接原官方
 服务。
 
+
+## 实机画面
+
+| 闯关战斗 | 待机房间（隐藏地图、角色全解锁） |
+|---|---|
+| ![闯关战斗](readmeResource/battle.png) | ![待机房间（隐藏地图、角色全解锁）](readmeResource/room.png) |
+
+| 多人对战 | 合作闯关 |
+|---|---|
+| ![多人对战](readmeResource/multiplayer-battle.png) | ![合作闯关）](readmeResource/multiplayer-mission.png) |
+
+| 商店 | 合成 |
+|---|---|
+| ![商店](readmeResource/shop.png) | ![合成](readmeResource/craft.png) |
+
+
 ## 当前状态
 
 核心单机闭环已经跑通：
@@ -97,22 +113,6 @@
   - `/r` 让所有 bot 都进入 **准备** 状态。
   - `/h` 或 `/help` 查看命令说明。
 - 其他 bot 命令详见下面「房间 bot」一节
-
-
-
-## 实机画面
-
-| 闯关战斗 | 待机房间（隐藏地图、角色全解锁） |
-|---|---|
-| ![闯关战斗](readmeResource/battle.png) | ![待机房间（隐藏地图、角色全解锁）](readmeResource/room.png) |
-
-| 多人对战 | 合作闯关 |
-|---|---|
-| ![多人对战](readmeResource/multiplayer-battle.png) | ![合作闯关）](readmeResource/multiplayer-mission.png) |
-
-| 商店 | 合成 |
-|---|---|
-| ![商店](readmeResource/shop.png) | ![合成](readmeResource/craft.png) |
 
 
 ## 工作原理
