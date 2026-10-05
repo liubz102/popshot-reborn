@@ -243,6 +243,12 @@ runtime\python\python.exe test\run_tests.py test_bot   # 只跑几个模块 / �
     `commit` / `push` / `reset` / `rebase` / `merge` / `stash` 一律不做，改完停在工作区，
     把「改了哪些文件、改了什么」讲清楚，由用户自己决定怎么提交。
     只读的 `status` / `log` / `diff` / `show` 照常可以用。
+15. 🔴 **不写「退回原版行为」的开关**（用户 2026-10-06：「改了就是改了，加个开关把原版 bug
+    找回来有什么意义？这种永远用不着的开关就是垃圾代码」）。
+    `BSHOOK_KEEP_*` / `BSHOOK_NO_*` 这类、或换个名字的同类，**一个都不许加** —— 补丁无条件装，
+    「对照组 / 复现 / 万一出事能退回」都不是理由。以前 agent 擅自加的 26 个当天全删了（D106），
+    旧文档里提到它们的地方一律作废。只多打日志、不改行为的诊断开关（`*_DIAG` /
+    `BSHOOK_VERBOSE_LOG`）不在此列。`test/test_hook_switches.py` 钉着 hook 读环境变量的白名单。
 
 ---
 

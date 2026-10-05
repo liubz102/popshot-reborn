@@ -1145,7 +1145,6 @@ static void install_process_hooks(void)
 /*     开不了文件，比什么都不装更糟。                                          */
 /*   ★ 改写过的路径第 5 个字符是 '_'（Pack_publish），不满足「Pack 后面紧跟     */
 /*     分隔符」，所以 FindFirstFileW 内部再调 FindFirstFileExW 也不会二次改写。 */
-/*   ★ BSHOOK_KEEP_PACK_DIR=1 不装（A/B 对照，同 BSHOOK_KEEP_NOTICE）。         */
 /*                                                                            */
 /*   目录名来自 pack.h（tools/gen_pack_h.py 从 server/config.py 生成），别在    */
 /*   这里写字面量 —— test/test_packdirs.py 盯着。                               */
@@ -1167,13 +1166,6 @@ static FindFirstFileW_t   s_FindFirstFileW = NULL;
 static FindFirstFileExW_t s_FindFirstFileExW = NULL;
 static volatile LONG g_pack_redirect_on = 0;   /* 1 = 钩子在，Pack\*.pkn 会被改写 */
 static volatile LONG g_pack_redirects = 0;     /* 改写了多少次（含枚举那一次） */
-
-static int pack_dir_kept(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_PACK_DIR", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 /* "Pack/x.pkn" / "Pack\x.pkn" / "Pack/*.pkn"（可带 ".\" 前缀）-> "Pack_publish/…"。
    返回 1 = 改写了（新路径在 out），0 = 不关我们的事，原样放行。 */
@@ -1251,11 +1243,6 @@ static void install_pack_redirect(void)
     wchar_t cwd[MAX_PATH * 2];
     char u8[MAX_PATH * 4];
 
-    if (pack_dir_kept()) {
-        bslog("PACK    BSHOOK_KEEP_PACK_DIR 已设，不重定向，客户端读原版 "
-              POPSHOT_PACK_LEGACY_DIR "\\");
-        return;
-    }
     attr = GetFileAttributesW(POPSHOT_PACK_PUBLISH_DIR_W);
     if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
         cwd[0] = 0;
@@ -1321,6 +1308,58 @@ static void compute_main_module_range(void)
 /* 启动期闪退护栏（bug调查/27）。放在这里是因为它依赖上面的 compute_… 和
    g_mod_lo/g_mod_hi，而装钩子的时机要和 install_pack_redirect 一样早。 */
 #include "adapters_guard.h"
+
+/* -------------------------------------------------------------------------- */
+/* ★ Win 键：不让原版装那个全局低级键盘钩子（X_Mod §146 / D105）             */
+/*                                                                            */
+/*   用户 2026-10-06：游戏一开，整个系统的 Win 键就没反应（Win+空格切输入法    */
+/*   失灵），最小化游戏、在别的程序里打字也一样；游戏在前台也要放开。          */
+/*                                                                            */
+/*   原版 App 初始化 `0x40d3d7`：`UserConfig.ini` 的 `FullScreen` 是 0 时      */
+/*   （★ 这个老客户端 0 才是**真全屏**、1 是窗口，V0.1 §55）调 `0x40a461`：     */
+/*       SetWindowsHookExW(WH_KEYBOARD_LL, 0x40a521, hInst, 0)   句柄存 [0x72e2a0] */
+/*   全局钩子，只有 App 收尾（`0x40db95` 删钩子对象）才卸。钩子过程 `0x40a521`  */
+/*   吞掉 LWin / RWin / 菜单键和 Ctrl+Esc / Alt+Esc，一句都不看游戏在不在前台。 */
+/*                                                                            */
+/*   修法：钩 user32!SetWindowsHookExW，**只拒原版那一个**（WH_KEYBOARD_LL +    */
+/*   过程地址 0x40a521）回 NULL，别的钩子原样放行。原版对 NULL 早有准备：      */
+/*   句柄存 0；`0x40a461` 的返回值调用方 `0x40d3e6` 不看；收尾 `0x40a452`      */
+/*   见句柄是 0 就不卸。游戏的调用经 ASProtect 解析桩，桩写进槽里的是 user32    */
+/*   导出的真地址（dump 里 `CreateWindowExW` 那格可证），钩导出拦得住。         */
+/*   ★ 装在 DllMain：主线程这时还挂在 LoadLibrary 的 APC 上，游戏一行代码都没   */
+/*     跑 ⇒ 因果上早于 App 初始化，不靠时间（同 install_pack_redirect）。       */
+/*   ★ 不改游戏代码：那句 `push 0x40a521` 解壳后才出现，要赶在 App 初始化之前   */
+/*     打上只能和主线程抢时机。                                                 */
+/*   窗口模式原版根本不装这个钩子，这里一次都不会命中。                         */
+/* -------------------------------------------------------------------------- */
+#define WINKEY_PROC_VA  0x0040A521u   /* 原版那个低级键盘钩子过程 —— 只拒它 */
+
+typedef HHOOK (WINAPI *SetWindowsHookExW_t)(int, HOOKPROC, HINSTANCE, DWORD);
+static SetWindowsHookExW_t s_SetWindowsHookExW = NULL;
+
+static HHOOK WINAPI det_SetWindowsHookExW(int id, HOOKPROC fn, HINSTANCE mod, DWORD tid)
+{
+    if (id == WH_KEYBOARD_LL && (UINT_PTR)fn == WINKEY_PROC_VA) {
+        bslog("KBD     原版要装全局低级键盘钩子（吞 Win / 菜单键 / Ctrl+Esc / Alt+Esc）"
+              "—— 不让装，Win 键在游戏里外都照常（X_Mod §146）");
+        return NULL;
+    }
+    return s_SetWindowsHookExW(id, fn, mod, tid);
+}
+
+static void install_winkey_guard(void)
+{
+    HMODULE u32 = GetModuleHandleA("user32.dll");   /* bshook 自己静态导入了它 */
+    if (!u32) {
+        bslog("KBD     !! 取不到 user32 —— 真全屏时 Win 键会被原版吞掉");
+        return;
+    }
+    s_SetWindowsHookExW = (SetWindowsHookExW_t)install_inline_hook(
+        (void *)GetProcAddress(u32, "SetWindowsHookExW"),
+        (void *)det_SetWindowsHookExW, "user32:SetWindowsHookExW");
+    if (!s_SetWindowsHookExW)
+        bslog("KBD     !! SetWindowsHookExW 钩不上 —— 真全屏时 Win 键会被原版吞掉");
+}
 
 /* -------------------------------------------------------------------------- */
 /* 注册链接的点击：**客户端自己根本处理不了**，我们接管                        */
@@ -2166,20 +2205,11 @@ static DWORD WINAPI arm_gameguard_breakpoint_thread(LPVOID param)
 /*                                                                            */
 /*   把时长换成 0x40000000 ms（约 12.4 天）而不是直接跳过判定：机制原样保留，  */
 /*   deadline = start + 时长 也不会溢出成负数。                               */
-/*                                                                            */
-/*   设环境变量 BSHOOK_KEEP_AFK_KICK=1 可以保留原版 90 秒行为。               */
 /* -------------------------------------------------------------------------- */
 #define AFK_TIMER_VA 0x004082aeu
 static const unsigned char AFK_ORIG[5]  = { 0x68, 0x90, 0x5F, 0x01, 0x00 }; /* push 90000     */
 static const unsigned char AFK_PATCH[5] = { 0x68, 0x00, 0x00, 0x00, 0x40 }; /* push 0x40000000 */
 static volatile LONG g_afk_patched = 0;
-
-static int afk_kick_disabled(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_AFK_KICK", buf, sizeof(buf));
-    return !(n > 0 && n < sizeof(buf) && buf[0] != '0');
-}
 
 static int try_patch_afk_timer(void)
 {
@@ -2482,8 +2512,6 @@ static int try_patch_handshake_version(void)
 /*                                                                            */
 /*   `patch_thread` 里那一轮特征串轮询是**次要**的：打上了就省掉 detour 里    */
 /*   那一发，打不上也无所谓，事件来了照样补。两条路调同一个幂等函数。         */
-/*                                                                            */
-/*   设 BSHOOK_KEEP_NOTICE=1 保留原版行为（还是那个「已取消网页导航」）。     */
 /* -------------------------------------------------------------------------- */
 
 #define NOTICE_NAV_VA       0x00424089u   /* push 0x662730 */
@@ -2515,13 +2543,6 @@ typedef HWND (WINAPI *CreateWindowExW_t)(DWORD, LPCWSTR, LPCWSTR, DWORD,
                                          int, int, int, int,
                                          HWND, HMENU, HINSTANCE, LPVOID);
 static CreateWindowExW_t s_CreateWindowExW = NULL;
-
-static int notice_kept(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_NOTICE", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 /* 解混淆：`p[i] = c[i] ^ keystream[i] ^ c[i-1]`（c[-1] = IV），和
    tools/gen_notice_h.py 的 `obfuscate()` 同算法。种子和 IV 来自
@@ -2731,10 +2752,6 @@ static void install_notice_hook(HMODULE u32)
 
     if (g_notice_cwhook_done) return;
     InterlockedExchange(&g_notice_cwhook_done, 1);   /* 装一次就够，失败也不重试 */
-    if (notice_kept()) {
-        bslog("NOTICE  BSHOOK_KEEP_NOTICE 已设，不装公告钩子（登录框顶部保持原版）");
-        return;
-    }
     real = (void *)GetProcAddress(u32, "CreateWindowExW");
     if (!real) {
         bslog("NOTICE  !! 取不到 user32!CreateWindowExW，登录公告只能靠特征串轮询");
@@ -2964,8 +2981,6 @@ static int try_patch_d3d_ib_lock(void)
 /*                                                                            */
 /*   范围外：闯关建房「任务」下拉框另有自己的一道等级检查（0x4368ca）——         */
 /*   那边关卡记录的 MinLevel 在 map.ini 里全被注释掉（默认 1），本来就不拦。    */
-/*                                                                            */
-/*   设环境变量 BSHOOK_KEEP_MAP_LEVEL_LOCK=1 保留原版地图等级门槛。            */
 /* -------------------------------------------------------------------------- */
 #define MAP_LVL_SITE_COUNT 2
 static const struct {
@@ -2987,13 +3002,6 @@ static const struct {
       "开局校验 0x468176（等级不够也放行，人数上限检查保留）" },
 };
 static volatile LONG g_map_lvl_patched = 0;
-
-static int map_level_lock_kept(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_MAP_LEVEL_LOCK", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 static int try_patch_map_level_gate(void)
 {
@@ -3095,8 +3103,6 @@ static int try_patch_map_level_gate(void)
 /*     按钮循环 `0x4f58e8` 显式跳过，界面上本来就放不出来（见                  */
 /*     `account_store.PREMIUM_CHARACTER_IDS` 的注释）；`0x43b47e` 是中国区     */
 /*     本来就跳过的新手图标。                                                  */
-/*                                                                            */
-/*   设 BSHOOK_KEEP_PLAYER_LEVEL_LOCK=1 保留原版全部玩家等级门槛。            */
 /* -------------------------------------------------------------------------- */
 #define PLR_LVL_SITE_COUNT 7
 static const struct {
@@ -3138,14 +3144,6 @@ static const struct {
       "天梯标签页等级 >=6 @ 0x43b676" },
 };
 static volatile LONG g_plr_lvl_patched = 0;
-
-static int player_level_lock_kept(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_PLAYER_LEVEL_LOCK",
-                                      buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 static int try_patch_player_level_gate(void)
 {
@@ -3211,8 +3209,6 @@ static int try_patch_player_level_gate(void)
 /*   B) 0x42515E 头部 inline hook：head 为空/野值（<0x10000）时输出全零矩形    */
 /*      返回。★ 必须配 A：A 生效后 head=0 成为合法状态，而原版对 head=0       */
 /*      会走 je 0x425177 去读 [edx+0x1C] —— 0x425177 那两条根本不判空。       */
-/*                                                                            */
-/*   设 BSHOOK_KEEP_IME_CRASH=1 可保留原版行为（闪退复现/对照用）。           */
 /* -------------------------------------------------------------------------- */
 #define UI_ROOT_CACHE_CLEAR_VA  0x004269ABu  /* 控件析构时的根缓存清理        */
 #define UI_ROOT_CACHE_SIG_LEN   8
@@ -3267,16 +3263,6 @@ static __declspec(naked) void sum_rect_guard_detour(void)
 
 static volatile LONG g_ime_cache_patched  = 0;
 static volatile LONG g_ime_sumrect_patched = 0;
-
-static int ime_crash_fix_keep_original(void)
-{
-    /* BSHOOK_KEEP_IME_CRASH=1 → 保留原版（闪退复现/对照用）。
-       注意别照抄 afk/region 那两个 *_disabled() 的写法：它们的返回值
-       语义是反的（未设置返回 TRUE），抄了必翻车 —— 冒烟测试抓到过。 */
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_IME_CRASH", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 static int try_patch_ime_cache_clear(void)
 {
@@ -3709,8 +3695,6 @@ static int try_patch_ime_native_ui(void)
 /*   相对地址）换成 E9 跳 detour：edi 为空就直接走函数尾 0x47eb0e（和          */
 /*   0x47e9c2 那条 je 去的同一个出口，中间没有多压栈），否则补回两条原指令      */
 /*   跳回 0x47ea26。表现：打空的那一发不画「溅射加成」图，其余一字不改。        */
-/*                                                                            */
-/*   设 BSHOOK_KEEP_SPLASH_VISUAL_CRASH=1 保留原版行为（闪退复现 / 对照用）。  */
 /* -------------------------------------------------------------------------- */
 #define SPLASH_VISUAL_VA        0x0047EA21u
 #define SPLASH_VISUAL_SIG_LEN   17
@@ -3742,14 +3726,6 @@ static __declspec(naked) void splash_visual_guard_detour(void)
 }
 
 static volatile LONG g_splash_visual_patched = 0;
-
-static int splash_visual_crash_keep_original(void)
-{
-    /* 语义和 ime_crash_fix_keep_original() 一样：设了才是「保留原版」。 */
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_SPLASH_VISUAL_CRASH", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 static int try_patch_splash_visual_guard(void)
 {
@@ -3805,8 +3781,6 @@ static int try_patch_splash_visual_guard(void)
 /*   这几样在 0x4169e9 的栈帧里原样都在（esi 是调用方给的出参，0x4169e9 没动   */
 /*   它；ebp 还是它自己的帧），回来 `ret 4` 把 id 弹掉，栈正好平。             */
 /*   商店货架 / 浮窗（0x45bd5f 等）也走 0x4169e9，它们查的本来就命中，不受影响。 */
-/*                                                                            */
-/*   设 BSHOOK_KEEP_GIFT_ICON_MISS=1 保留原版行为（对照用）。                 */
 /* -------------------------------------------------------------------------- */
 #define ICON_LOOKUP_VA          0x004169E9u
 #define ICON_LOOKUP_MISS_VA     0x004169FFu   /* push offset L"" —— 换成 jmp */
@@ -3846,13 +3820,6 @@ static __declspec(naked) void icon_lookup_fallback_detour(void)
 }
 
 static volatile LONG g_icon_lookup_patched = 0;
-
-static int gift_icon_miss_keep_original(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_GIFT_ICON_MISS", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 static int try_patch_gift_icon_fallback(void)
 {
@@ -3919,8 +3886,6 @@ static int try_patch_gift_icon_fallback(void)
 /*   **6** 字节（E9 rel32 + 一个 NOP）、detour 里三条原指令都要补回；          */
 /*   ② 回跳点 0x481EF9；③ 无目标时的出口是 0x481FE1（= 0x481e96 那条 je 去的  */
 /*   同一个地方，中间一个 push 都没有、SEH 状态也没变）。                      */
-/*                                                                            */
-/*   设 BSHOOK_KEEP_DASH_VISUAL_CRASH=1 保留原版行为（对照用）。              */
 /* -------------------------------------------------------------------------- */
 #define DASH_VISUAL_VA        0x00481EF3u
 #define DASH_VISUAL_PATCH_LEN 6             /* E9 rel32 + NOP，凑够指令边界   */
@@ -3955,14 +3920,6 @@ static __declspec(naked) void dash_visual_guard_detour(void)
 }
 
 static volatile LONG g_dash_visual_patched = 0;
-
-static int dash_visual_crash_keep_original(void)
-{
-    /* 语义和 splash_visual_crash_keep_original() 一样：设了才是「保留原版」。 */
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_DASH_VISUAL_CRASH", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 static int try_patch_dash_visual_guard(void)
 {
@@ -4035,8 +3992,6 @@ static int try_patch_dash_visual_guard(void)
 /*   武器 / 材料 / 纯外观装备在 `EquipBonus-Chn.ini` 里都没有条目，本来就走     */
 /*   `je` 这一支。SEH 状态（`[ebp-4]`）在两条路上完全一样，vector 的构造 /      */
 /*   拷贝 / 析构一步不少。                                                    */
-/*                                                                            */
-/*   设 BSHOOK_KEEP_CLIENT_BONUS_TEXT=1 保留原版那行绿字（对照用）。          */
 /* -------------------------------------------------------------------------- */
 /*   ★★ **有两个生成器，两个都要堵**（2026-09-09 实机漏了一个）：            */
 /*                                                                            */
@@ -4076,13 +4031,6 @@ static const struct {
 };
 
 static volatile LONG g_bonus_text_patched = 0;
-
-static int client_bonus_text_keep_original(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_CLIENT_BONUS_TEXT", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 static int try_patch_hide_client_bonus_text(void)
 {
@@ -4197,8 +4145,6 @@ static int try_patch_hide_client_bonus_text(void)
 /*                                                                            */
 /*   `vf_154(4)` 的其余调用点（0x4a8a2c / 0x4a9571 / 0x4aa187 / 0x4f71bb）都是  */
 /*   别的关卡查自己的 boss 类，不经过这 20 字节。                               */
-/*                                                                            */
-/*   设 BSHOOK_KEEP_DRAKA_TRACING_RACE=1 保留原版行为（复现 / 对照用）。       */
 /* -------------------------------------------------------------------------- */
 #define DRAKA_TRACING_VA      0x004B5A04u
 #define DRAKA_TRACING_LEN     20
@@ -4222,14 +4168,6 @@ static const unsigned char DRAKA_TRACING_FIX[DRAKA_TRACING_LEN] = {
 };
 
 static volatile LONG g_draka_tracing_patched = 0;
-
-static int draka_tracing_keep_original(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_DRAKA_TRACING_RACE",
-                                      buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 static int try_patch_draka_tracing_gate(void)
 {
@@ -4513,8 +4451,6 @@ static int try_patch_draka_diag(void)
 /*      的骨架有，把 ch02 的铠甲挂到泰尔身上就全空。数据层 D31a 已经堵住        */
 /*      （角色限定只认原版），这里再兜一层：骨骼为空的记录跳过不算              */
 /*      （顶点留在原点，模型缺一块，但不崩），退出时打一行计数。               */
-/*                                                                            */
-/*   设 BSHOOK_KEEP_RPT_CRASHES=1 保留原版三处行为（复现 / 对照用）。          */
 /* -------------------------------------------------------------------------- */
 #define TUTORIAL_START_VA        0x0040F4EAu
 #define TUTORIAL_START_SIG_LEN   16
@@ -4604,13 +4540,6 @@ static __declspec(naked) void skin_bone_guard_detour(void)
 
 static volatile LONG g_rpt_guards_patched = 0;
 
-static int rpt_crashes_keep_original(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_RPT_CRASHES", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
-
 /* 三处共用：签名对上就把头 5 字节换成 E9 跳 detour，多出来的字节补 NOP。
    幂等：已经是「E9 <到我们 detour 的 rel32>」就当打过。 */
 static int install_jmp_guard(unsigned int va, const unsigned char *sig, int sig_len,
@@ -4674,8 +4603,6 @@ static int install_jmp_guard(unsigned int va, const unsigned char *sig, int sig_
 /*      0x44335f 那一发也留着当兜底（万一别的机器上接收器是连上的）。         */
 /*      两条路**不会重复开浏览器**：谁先跑，URL 都已经被换成 `file:///` 了，  */
 /*      另一条再看到时就不匹配 http(s) 了。                                   */
-/*                                                                            */
-/*   两处都跟着 BSHOOK_KEEP_NOTICE=1 一起退回原版。                           */
 /* -------------------------------------------------------------------------- */
 
 /* ① DOCHOSTUIFLAG_DIALOG */
@@ -4922,8 +4849,6 @@ static int try_patch_rpt_crash_guards(void)
 /*        `<地址> 00:<地址>`，不再是垃圾，也不会因为缓冲区没有结尾 0 而跑飞；  */
 /*     ② `AllocationBase == 0` 就直接走原版的失败出口 0x5d76c9                */
 /*        （`xor al,al ; jmp 0x5d7712` = `pop edi; pop esi; leave; ret`）。    */
-/*                                                                            */
-/*   设 BSHOOK_KEEP_RPT_CRASHES=1 一并保留原版行为（和上面三处同一个开关）。   */
 /* -------------------------------------------------------------------------- */
 #define CRASH_RPT_GUARD_VA       0x005D76B4u
 #define CRASH_RPT_GUARD_SIG_LEN  17
@@ -5006,10 +4931,6 @@ static __declspec(naked) void crash_rpt_guard_detour(void)
 /*                                                                            */
 /*   触发时按「指针值翻转」去重打一行日志（同一个野指针只报一次，换了才再报）， */
 /*   下次现场靠它就能分辨「真的踩到了」还是「另有病灶」。                      */
-/*                                                                            */
-/*   逃生门：`BSHOOK_KEEP_RPT_CRASHES=1` 连同 bug调查/17 那五处一起不装；      */
-/*   只想复现野指针、又要留着能用的崩溃报告器时用                              */
-/*   `BSHOOK_KEEP_DASH_STALE_CRASH=1`（只关掉换图那一处根因修复）。            */
 /* -------------------------------------------------------------------------- */
 #define DASHOBJ_VFTABLE          0x0066D5DC   /* DashDamage 主虚表             */
 
@@ -5251,8 +5172,7 @@ static int try_patch_crash17_guards(void)
 /*   一轮的角色（0x4790c7 刚判过非空），补完把 ecx 装回去再回 0x4790d1。       */
 /*                                                                            */
 /*   ★ §66 那三处虚表校验**保留**：它们是最后一道网（万一还有别的路子放掉      */
-/*   这个对象），而这里是根因修复。设 BSHOOK_KEEP_DASH_STALE_CRASH=1 时        */
-/*   这一处也不装（复现 / 对照用，和三处校验同一个开关）。                     */
+/*   这个对象），而这里是根因修复。                                            */
 /* -------------------------------------------------------------------------- */
 #define MAPCHG_CLEAR_VA        0x004790CBu   /* 换图：重新挂回角色的循环体      */
 #define MAPCHG_CLEAR_SIG_LEN   13
@@ -5303,15 +5223,6 @@ static __declspec(naked) void mapchg_clear_detour(void)
 }
 
 static volatile LONG g_mapchg_clear_patched = 0;
-
-/* 只关掉这一处根因修复（崩溃报告器那几处照装）—— 想在本机复现「进 boss 房
-   全场一起崩」并拿一份完整 dump 时用。 */
-static int dash_stale_keep_original(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_DASH_STALE_CRASH", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 static int try_patch_mapchange_dangling(void)
 {
@@ -5986,13 +5897,6 @@ static volatile LONG g_pres_mouse_tick = 0;
 /* 上一次报出去的前台状态，用来按**状态翻转**去重日志。 */
 static volatile LONG g_pres_fg_last = -1;
 
-static int presence_disabled(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_NO_PRESENCE", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
-
 /* 这个键在**局内**真的能操作角色吗（§67，用户 2026-09-21 定的名单）。
 
    四条移动轴是从客户端自己的输入函数**逐条抄下来**的（`0x515600`~`0x51576D`，
@@ -6191,13 +6095,6 @@ static CRITICAL_SECTION g_mover_lock;
 static volatile LONG g_mover_lock_ready = 0;
 static volatile LONG g_mover_patched = 0;      /* ① 装上了（发包的前提） */
 static volatile LONG g_mover_start_patched = 0; /* ② 装上了 */
-
-static int mover_phase_disabled(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_NO_MOVER_PHASE", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 /* 此刻的 Stage（Desktop+8）；没有 / 读不到就 NULL。★ 每一步都 IsBadReadPtr 守着 ——
    发包那边跑在 watch_thread 上，换 stage 时旧的那个会被游戏线程释放。 */
@@ -6422,8 +6319,6 @@ static int try_patch_crash25_guards(void)
 /*   `0x2C030`，§80 查明那是唯一加载点），**放行**之后拿到真实基址再打补丁。   */
 /*   两处偷的字节里**一个重定位项都没有**（对着 `.reloc` 逐项查过）           */
 /*   ⇒ 文件字节 == 内存字节，特征串可以直接从磁盘那份量出来。                  */
-/*                                                                            */
-/*   逃生门：`BSHOOK_KEEP_NM=1` 四处都不打（要复现 §68 时用）。                */
 /* -------------------------------------------------------------------------- */
 #define NMCOGAME_LOADLIBRARYA_IAT_RVA  0x0002C030u
 
@@ -6766,13 +6661,6 @@ static HMODULE WINAPI det_nmcogame_LoadLibraryA(LPCSTR name)
     return h;
 }
 
-static int nm_keep_original(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_NM", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
-
 static volatile LONG g_nm_loadhook_done = 0;
 
 static int try_guard_nexon_messenger(void)
@@ -7064,8 +6952,6 @@ static int try_patch_nm_diag(void)
 /*   其余的回一个「成功、没数据」的最小应答。                                 */
 /*   ⇒ nmcogame 一次都不被调用 ⇒ `nmconew.dll` 不加载 ⇒ `NMService.exe` 不起。 */
 /*   `nmconew.dll` 的加载钩子留着当**绊线**：真有谁去加载就挡下来并打日志。    */
-/*                                                                            */
-/*   逃生门：`BSHOOK_KEEP_NM=1` = 回到 §82/§84 那一档（信使照常跑 + 四处守护）。*/
 /* -------------------------------------------------------------------------- */
 #define NM_MAGIC_HEAD    0x001FCA34u
 #define NM_MAGIC_TAIL    0x008A119Eu
@@ -7456,7 +7342,7 @@ static int try_kill_nm(void)
     InterlockedExchange(&g_nm_killed, 1);
     bslog("PATCH   ★NEXON 信使已整个拆掉（§85）: nmcogame.dll 的四格 IAT "
           "%08X/%08X/%08X/%08X 全换成自己的桩 —— 登录那一发我们自己连认证服，"
-          "nmconew.dll 不会加载、NMService.exe 不会起（BSHOOK_KEEP_NM=1 可退回 §82）",
+          "nmconew.dll 不会加载、NMService.exe 不会起",
           NMCO_IAT_FREE, NMCO_IAT_PATCH, NMCO_IAT_LOCALE, NMCO_IAT_SLOT);
     return 1;
 }
@@ -7551,8 +7437,6 @@ static int try_kill_nm(void)
 /*   ★ 为什么挑「状态 3/4」而不是 HP ≤ 0：判据要和**命中侧**逐字一致。HP 先  */
 /*   归零、`Character::Die()` 要等服务端 0x0406 死亡广播才调，中间那几帧命中 */
 /*   侧仍然打得着 —— 那时候就不该撒手。跟着 0x417c72 走，两侧永远同进同退。  */
-/*                                                                            */
-/*   BSHOOK_KEEP_HOMING_DEAD=1 保留原版行为（对照用）。                       */
 /* ========================================================================== */
 #define HOMING_ALIVE_VA        0x0047E40Au
 #define HOMING_ALIVE_PATCH_LEN 5             /* E9 rel32，正好吃掉两条指令    */
@@ -7586,14 +7470,6 @@ static __declspec(naked) void homing_alive_detour(void)
 }
 
 static volatile LONG g_homing_alive_patched = 0;
-
-static int homing_dead_keep_original(void)
-{
-    /* 语义同 dash_visual_crash_keep_original()：设了才是「保留原版」。 */
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_HOMING_DEAD", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 static int try_patch_homing_alive(void)
 {
@@ -8497,7 +8373,6 @@ static int try_patch_ime_cand_layout_guard(void)
 /*   （`0x46631f`..`0x466362`）就此变成死代码，别的地区判定一个不动 ——       */
 /*   尤其**不碰** `0x466309` 那句「中国版难度上限 3 档」。                    */
 /*                                                                            */
-/*   设环境变量 BSHOOK_KEEP_REGION_LOCK=1 可以整组保留原版行为。              */
 /*   ── 第五处：对战房间「设定」里「地图」下拉框的地域掩码 ──                  */
 /*                                                                            */
 /*   前两处只管**地图目录**和「建房(任务)」的任务下拉框。对战房间是另一条路：    */
@@ -8570,13 +8445,6 @@ static const struct {
       "对战房间「地图」下拉框（掩码判定整个旁路 —— 全部解锁）" },
 };
 static volatile LONG g_region_patched = 0;
-
-static int region_lock_disabled(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_REGION_LOCK", buf, sizeof(buf));
-    return !(n > 0 && n < sizeof(buf) && buf[0] != '0');
-}
 
 /* 返回 1 表示 REGION_PATCH_COUNT 处全都已就位（本轮打的或之前就打过）。 */
 static int try_patch_region_lock(void)
@@ -8685,10 +8553,6 @@ static int try_patch_region_lock(void)
 /*   而商店的角色行已经不再枚举 id 3 ⇒ 这两处现在是**打了也走不到的死补丁**。 */
 /*   留着不删：零风险，而且哪天要把爱琳放回商店时它们还得在。真正起作用的      */
 /*   只剩房间面板那一处 `0x467eb1`。                                           */
-/*                                                                            */
-/*   设 BSHOOK_KEEP_IRENE_LOCK=1 保留原版（爱琳在房间 6 格和战斗换人条里都不  */
-/*   出现）—— 那是「整个角色回到原版」的总开关，八处一起不打，               */
-/*   不是 4 级门的选项。                                                       */
 /* -------------------------------------------------------------------------- */
 #define IRENE_PATCH_COUNT 5
 /* 字段含义和 REGION_SITES 一样：特征串起始 VA / 长度 / 要改的字节在串里的偏移
@@ -8762,13 +8626,6 @@ static const struct {
       "房间面板点击：等级 <4 弹提示并拒绝" },
 };
 static volatile LONG g_irene_lvl_patched = 0;
-
-static int irene_lock_kept(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_IRENE_LOCK", buf, sizeof(buf));
-    return (n > 0 && n < sizeof(buf) && buf[0] != '0');
-}
 
 /* 返回 1 表示五处全都已就位（本轮打的或之前就打过）。 */
 static int try_patch_irene_unlock(void)
@@ -8870,8 +8727,7 @@ static int try_patch_irene_level(void)
 /*                                                                            */
 /*   ★ **依赖地区解锁**：14 张格斗图（`AvailableMode=[Mutu]`）都没写           */
 /*   OpenLocale（缺省掩码 1 = 只开韩服），全靠上面 `REGION_SITES` 第一处旁路   */
-/*   才进地图目录 ⇒ 设了 BSHOOK_KEEP_REGION_LOCK=1 时格斗房一张图都没有，      */
-/*   这组跟着不打。                                                          */
+/*   才进地图目录。                                                            */
 /*                                                                            */
 /*   原版还有第 15 张「庆典-格斗场」`[18-3] Festivalm01`，`.map` 原版包就没有， */
 /*   解锁后选到它进去全黑 ⇒ 用户 2026-09-27 定从 map.ini 删掉、不补（X_Mod D90）。*/
@@ -8880,7 +8736,6 @@ static int try_patch_irene_level(void)
 /*   读空指针）；格斗教程（入口弹窗 `0x43b499` 也是地区判据，但国服缺两个       */
 /*   .smf、键位图也接错，用户决定不做）；大厅「开始格斗模式」按钮。           */
 /*                                                                            */
-/*   设 BSHOOK_KEEP_MUTU_LOCK=1 整组保留原版。                                 */
 /*   ★ 五条特征串都在 `re/BigShot_22524.img` 上验过**各自唯一**，               */
 /*   `test/test_patchsites.py` 的 `MutuUnlockPatchTest` 钉着。                 */
 /* -------------------------------------------------------------------------- */
@@ -8923,13 +8778,6 @@ static const struct {
       "地图过滤 0x40b26f：RequiredQuestClear 当 0（Boss 格斗场不用通关任务）" },
 };
 static volatile LONG g_mutu_patched = 0;
-
-static int mutu_lock_kept(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_MUTU_LOCK", buf, sizeof(buf));
-    return (n > 0 && n < sizeof(buf) && buf[0] != '0');
-}
 
 /* 返回 1 表示五处全都已就位（本轮打的或之前就打过）。 */
 static int try_patch_mutu_unlock(void)
@@ -9197,7 +9045,6 @@ static int try_patch_mutu_diag(void)
 /*   ★ 死了也照发：尸体上的僵尸一样要清（用户那一局就是这种）。              */
 /*   ★ 只在游戏主线程读写 `g_mutu_owed_*`：打断在收包 → OnHit 里，管理器在每帧  */
 /*     更新里，都是主线程。                                                    */
-/*   设 BSHOOK_KEEP_MUTU_ZOMBIE=1 保留原版（被打断不补收招）。                 */
 /* ========================================================================== */
 #define MUTU_BREAK_VA         0x0050A6F8u   /* 打断：删 [edi+0x5dc]（edi = 角色，无栈参） */
 #define MUTU_BREAK_SIG_LEN    11
@@ -9243,13 +9090,6 @@ static volatile LONG g_mutu_zombie_patched = 0;
 /* 欠一发收招的本机角色（0 = 不欠）和欠下时的 GameContext —— 换了局 / 换了人就不欠了。 */
 static UINT_PTR g_mutu_owed_char = 0;
 static UINT_PTR g_mutu_owed_ctx = 0;
-
-static int mutu_zombie_keep_original(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_MUTU_ZOMBIE", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 /* `0x50a6f8` 入口（原版删招式对象之前）：断的是不是本机角色手上的招。 */
 static void __stdcall mutu_break_note(UINT_PTR ch)
@@ -10464,8 +10304,7 @@ static int try_hook_render_init(void)
 /* 对战构造 / 启动 → PVP。这两个构造函数本身就是「这一局是闯关还是对战」的事实， */
 /* 不用服务端猜房间模式（铁律 10）。                                            */
 /*                                                                            */
-/* 逃生门：BSHOOK_KEEP_WEAPON_TABLE=1 只跳过写内存（包照样吞）；                 */
-/*         BSHOOK_WEAPON_MODE=pve|pvp 强制模式（实机核对两套表都写对时用）。     */
+/* BSHOOK_WEAPON_MODE=pve|pvp 强制模式（实机核对两套表都写对时用）。             */
 /* ========================================================================== */
 #define WTAB_OPCODE        0x0F01
 #define WTAB_FORMAT        3
@@ -10542,13 +10381,6 @@ static int g_wtab_logged_mode = -1;
 static int g_wtab_logged_written = -1;
 static unsigned g_wtab_logged_src = 0xFFFFFFFFu;   /* 去重键里也要带来源，否则两件事被合成一行 */
 
-static int wtab_keep_original(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_WEAPON_TABLE", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
-
 /* 强制模式：返回 0/1，没设返回 -1。 */
 static int wtab_forced_mode(void)
 {
@@ -10603,13 +10435,6 @@ static void wtab_apply(int mode, const char *why)
     LeaveCriticalSection(&g_wtab_cs);
     InterlockedExchange(&g_wtab_dirty, 0);
 
-    if (wtab_keep_original()) {
-        if (g_wtab_logged_serial != snap.serial) {
-            bslog("WTAB    BSHOOK_KEEP_WEAPON_TABLE 已设：收到自定义武器表 v%u 但不写内存", snap.serial);
-            g_wtab_logged_serial = snap.serial;
-        }
-        return;
-    }
     for (i = 0; i < snap.n; i++) {
         const wtab_rec_t *r = &snap.rec[i];
         const wtab_block_t *b = &r->mode[mode];
@@ -10944,9 +10769,6 @@ static int try_install_weapon_table_hooks(void)
 /*   n × { i32 **物品 id**（= `ItemInfo+4`，★不是 0x0F01 那个武器 Id）         */
 /*        · u16 字数 · 字数 × u16 UTF-16LE }                                   */
 /* 文本已经过服务端的 `desc_wire()`：段分隔是 `|`，段内换行是**字面** `\` + `n`。 */
-/*                                                                            */
-/* 逃生门：BSHOOK_KEEP_CABINET_DESC=1 —— 不装这个补丁（包照吞、照记日志），     */
-/*         仓库提示框回到「画 0x0501 发下来的那一套」，房间里也不换。          */
 /* ========================================================================== */
 /* WDESC_OPCODE 在上面 `wtab_on_frame` 之前就定义了（那儿要按它分流）。 */
 #define WDESC_FORMAT        1
@@ -10992,14 +10814,6 @@ static const wchar_t   *g_wdesc_scratch_box = g_wdesc_scratch;
 /* 日志按 (物品 id, 模式) **翻转**去重 —— 这个函数悬停时每帧都跑，
    不上闩就是刷屏（全局规范：按状态翻转去重，不按次数/时间窗）。 */
 static int              g_wdesc_said_mode = -1;
-
-static int cabinet_desc_keep_original(void)
-{
-    /* 设了才是「保留原版」（和别的 KEEP_* 同一套语义）。 */
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_CABINET_DESC", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
 
 /* 收到一帧 0x0F02：解析 + 存表。返回 1 = 吞掉（这个 opcode 只有我们认识）。 */
 static int wdesc_on_frame(const unsigned char *frame)
@@ -11215,14 +11029,6 @@ static __declspec(naked) void aim_ring_frame_thunk(void)
 
 static volatile LONG g_aim_ring_patched = 0;
 
-static int aim_ring_keep_original(void)
-{
-    /* 设了才是「保留原版」（和别的 KEEP_* 同一套语义）。 */
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_KEEP_AIM_RING", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
-
 static int try_patch_aim_ring(void)
 {
     unsigned char *p = (unsigned char *)AIM_RING_VA;
@@ -11262,22 +11068,15 @@ static int try_patch_aim_ring(void)
 static DWORD WINAPI patch_thread(LPVOID param)
 {
     int ticks = 0;
-    int notice_off;
     (void)param;
 
     /* 登录公告页在延迟之前就先解出来落盘 —— 纯粹是**提前量**：真正需要它的
        时刻（`det_CreateWindowExW`）跑在游戏 UI 线程上，那儿不适合现写文件。
        正确性不依赖这一发：`try_patch_notice_url` 发现还没生成会自己补，
        两边都在 `g_notice_cs` 里。 */
-    notice_off = notice_kept();
-    if (notice_off)
-        bslog("PATCH   BSHOOK_KEEP_NOTICE 已设，登录框顶部保留原版行为"
-              "（那条死链 -> IE 的「已取消网页导航」）");
-    else {
-        EnterCriticalSection(&g_notice_cs);
-        notice_build_url();
-        LeaveCriticalSection(&g_notice_cs);
-    }
+    EnterCriticalSection(&g_notice_cs);
+    notice_build_url();
+    LeaveCriticalSection(&g_notice_cs);
 
     /* GameGuard 已由 DR0 + VEH 在执行瞬间处理，不经过本线程，也不修改代码。
        下面仍有地区锁、挂机计时器和诊断 detour 会改游戏代码；它们必须晚于
@@ -11292,79 +11091,57 @@ static DWORD WINAPI patch_thread(LPVOID param)
        （见下面 SnowCipher 那段的说明），所以来得及 —— 但要是先去死等
        0x4082ae 那 4 秒，就可能刚好错过。挂机计时器反过来完全不急，
        它第一次被执行要等到进大厅。 */
-    if (!region_lock_disabled()) {
-        bslog("PATCH   BSHOOK_KEEP_REGION_LOCK 已设，保留原版地区差异（任务只剩 4 关）");
-    } else {
-        for (ticks = 0; !g_stop && !g_region_patched && ticks < 2000; ticks++) {
-            if (try_patch_region_lock()) break;
-            Sleep(2);
-        }
-        if (!g_region_patched)
-            bslog("PATCH   !! 超时未能 patch 地区差异"
-                  "（0x40b419 / 0x4368cf / 0x46631d / 0x4653a8 "
-                  "的特征串一直对不上）");
+    for (ticks = 0; !g_stop && !g_region_patched && ticks < 2000; ticks++) {
+        if (try_patch_region_lock()) break;
+        Sleep(2);
     }
+    if (!g_region_patched)
+        bslog("PATCH   !! 超时未能 patch 地区差异"
+              "（0x40b419 / 0x4368cf / 0x46631d / 0x4653a8 "
+              "的特征串一直对不上）");
 
     /* 爱琳（ChrIndex=3）解锁 —— **时机完全不急**：五处全在 UI 代码里，
        最早也要等玩家进大厅才第一次执行，远晚于解壳窗口。
        不像 0x40b419 那样有「必须赶在 map.ini 加载之前」的时限。 */
-    if (irene_lock_kept()) {
-        bslog("PATCH   BSHOOK_KEEP_IRENE_LOCK 已设，保留原版："
-              "爱琳(id 3)在房间 6 格和战斗换人条里都不出现");
-    } else {
-        for (ticks = 0; !g_stop && !g_irene_patched && ticks < 2000; ticks++) {
-            if (try_patch_irene_unlock()) break;
-            Sleep(2);
-        }
-        if (!g_irene_patched)
-            bslog("PATCH   !! 超时未能 patch 爱琳解锁"
-                  "（0x55853c / 0x407383 / 0x40724f / 0x407160 / "
-                  "0x4f58f4 的特征串一直对不上）");
-        /* 4 级门：★ 无条件解除，爱琳从 1 级起就能选（D2，2026-09-17 改口径）。 */
-        for (ticks = 0; !g_stop && !g_irene_lvl_patched && ticks < 2000; ticks++) {
-            if (try_patch_irene_level()) break;
-            Sleep(2);
-        }
-        if (!g_irene_lvl_patched)
-            bslog("PATCH   !! 超时未能解除爱琳 4 级门"
-                  "（0x44c954 / 0x44cc07 / 0x467eb1 的特征串一直对不上）");
+    for (ticks = 0; !g_stop && !g_irene_patched && ticks < 2000; ticks++) {
+        if (try_patch_irene_unlock()) break;
+        Sleep(2);
     }
+    if (!g_irene_patched)
+        bslog("PATCH   !! 超时未能 patch 爱琳解锁"
+              "（0x55853c / 0x407383 / 0x40724f / 0x407160 / "
+              "0x4f58f4 的特征串一直对不上）");
+    /* 4 级门：★ 无条件解除，爱琳从 1 级起就能选（D2，2026-09-17 改口径）。 */
+    for (ticks = 0; !g_stop && !g_irene_lvl_patched && ticks < 2000; ticks++) {
+        if (try_patch_irene_level()) break;
+        Sleep(2);
+    }
+    if (!g_irene_lvl_patched)
+        bslog("PATCH   !! 超时未能解除爱琳 4 级门"
+              "（0x44c954 / 0x44cc07 / 0x467eb1 的特征串一直对不上）");
 
     /* 格斗模式（무투전）解锁（X16 / D82）—— 和爱琳一样时机不急：五处都在
        建房 / 房间设定 / 选图代码里，最早也要进大厅才第一次执行。轮询的理由
        同上面几组（等 ASProtect 把那一页解开，没有事件可等）。
-       ★ 依赖地区解锁：地区锁保留时格斗图一张都进不了目录，这组跟着不打。 */
-    if (!region_lock_disabled()) {
-        bslog("PATCH   BSHOOK_KEEP_REGION_LOCK 已设 ⇒ 格斗图进不了地图目录，"
-              "格斗模式解锁跟着不打");
-    } else if (mutu_lock_kept()) {
-        bslog("PATCH   BSHOOK_KEEP_MUTU_LOCK 已设，保留原版：格斗模式不在建房下拉框里、"
-              "房间 ◀▶ 不含格斗、Boss 格斗场要先通关任务");
-    } else {
-        for (ticks = 0; !g_stop && !g_mutu_patched && ticks < 2000; ticks++) {
-            if (try_patch_mutu_unlock()) break;
-            Sleep(2);
-        }
-        if (!g_mutu_patched)
-            bslog("PATCH   !! 超时未能 patch 格斗模式解锁"
-                  "（0x43755e / 0x4659cc / 0x4659e3 / 0x465a0a / 0x40b273 "
-                  "的特征串一直对不上）");
+       ★ 格斗图要靠上面的地区解锁才进得了地图目录。 */
+    for (ticks = 0; !g_stop && !g_mutu_patched && ticks < 2000; ticks++) {
+        if (try_patch_mutu_unlock()) break;
+        Sleep(2);
     }
+    if (!g_mutu_patched)
+        bslog("PATCH   !! 超时未能 patch 格斗模式解锁"
+              "（0x43755e / 0x4659cc / 0x4659e3 / 0x465a0a / 0x40b273 "
+              "的特征串一直对不上）");
 
     /* 格斗招式被打断后补发收招（X_Mod §139 / D98）：两处都在格斗对局代码里，
        最早也要进格斗局才第一次执行 —— 时机不急，只等特征串（等解壳）。 */
-    if (mutu_zombie_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_MUTU_ZOMBIE 已设，保留原版：格斗招式被打断不补收招"
-              "（别的机器上可能留着这一招 —— 复活后一直躺着 / 冲刺动作循环，X_Mod §139）");
-    } else {
-        for (ticks = 0; !g_stop && !g_mutu_zombie_patched && ticks < 2000; ticks++) {
-            if (try_patch_mutu_zombie()) break;
-            Sleep(2);
-        }
-        if (!g_mutu_zombie_patched)
-            bslog("PATCH   !! 超时未能 patch 格斗招式补收招"
-                  "（0x50A6F8 / 0x4958EB 的特征串一直对不上）");
+    for (ticks = 0; !g_stop && !g_mutu_zombie_patched && ticks < 2000; ticks++) {
+        if (try_patch_mutu_zombie()) break;
+        Sleep(2);
     }
+    if (!g_mutu_zombie_patched)
+        bslog("PATCH   !! 超时未能 patch 格斗招式补收招"
+              "（0x50A6F8 / 0x4958EB 的特征串一直对不上）");
 
     /* ★ B2 格斗招式判定体探针（X16，临时）：BSHOOK_MUTU_DIAG=1 才装；轮询理由同上（等解壳）。 */
     if (mutu_diag_enabled()) {
@@ -11383,32 +11160,30 @@ static DWORD WINAPI patch_thread(LPVOID param)
        `det_CreateWindowExW`（公告框控件被创建的那一刻，必然早于导航）。
        在这里顺手打一发，只是为了让 detour 那条路上少做一次事，
        顺便在日志里留一行「特征串对得上」。所以**不死等**，一轮不中就走。 */
-    if (!notice_off && !try_patch_notice_url())
+    if (!try_patch_notice_url())
         bslog("PATCH   登录公告：0x424089 的特征串还没到位，"
               "等公告框控件创建时再补（det_CreateWindowExW）");
 
     /* 公告框的两处交互改造（§88）：文字可选中复制、链接点了开系统浏览器。
        这两处**不赶时机** —— `GetHostInfo` 和 `BeforeNavigate2` 都要等 IE 控件
        真的起来才第一次被调到，远晚于解壳；所以照常轮询特征串等就行。 */
-    if (!notice_off) {
-        for (ticks = 0; !g_stop && !g_notice_select_patched && ticks < 2000; ticks++) {
-            if (try_patch_notice_select()) break;
-            Sleep(2);
-        }
-        if (!g_notice_select_patched)
-            bslog("PATCH   !! 超时未能 patch 公告框文字选中"
-                  "（0x442f35 一直不是 c7 40 04 8f 00 01 00）—— 文字将不可选中");
-        for (ticks = 0; !g_stop && !g_notice_link_patched && ticks < 2000; ticks++) {
-            if (try_patch_notice_link()) break;
-            Sleep(2);
-        }
-        if (!g_notice_link_patched)
-            bslog("PATCH   !! 超时未能 patch 公告框链接"
-                  "（vftable 0x665f0c 一直不是那个 E_NOTIMPL 桩）"
-                  "—— 点链接会按原版在框内导航，把公告顶掉");
-        /* 兜底那一发：本机实测走不到，所以不值得为它死等，一轮不中就算了。 */
-        try_patch_notice_nav2();
+    for (ticks = 0; !g_stop && !g_notice_select_patched && ticks < 2000; ticks++) {
+        if (try_patch_notice_select()) break;
+        Sleep(2);
     }
+    if (!g_notice_select_patched)
+        bslog("PATCH   !! 超时未能 patch 公告框文字选中"
+              "（0x442f35 一直不是 c7 40 04 8f 00 01 00）—— 文字将不可选中");
+    for (ticks = 0; !g_stop && !g_notice_link_patched && ticks < 2000; ticks++) {
+        if (try_patch_notice_link()) break;
+        Sleep(2);
+    }
+    if (!g_notice_link_patched)
+        bslog("PATCH   !! 超时未能 patch 公告框链接"
+              "（vftable 0x665f0c 一直不是那个 E_NOTIMPL 桩）"
+              "—— 点链接会按原版在框内导航，把公告顶掉");
+    /* 兜底那一发：本机实测走不到，所以不值得为它死等，一轮不中就算了。 */
+    try_patch_notice_nav2();
 
     for (ticks = 0; !g_stop && !g_reflect_visual_patched && ticks < 2000; ticks++) {
         if (try_patch_reflect_visual()) break;
@@ -11430,50 +11205,37 @@ static DWORD WINAPI patch_thread(LPVOID param)
 
     /* 地图等级门槛（D142）：不赶时机 —— 0x40b5d0 第一次跑要到进房选图，
        远晚于 +2.5s 的解壳窗口。 */
-    if (map_level_lock_kept()) {
-        bslog("PATCH   BSHOOK_KEEP_MAP_LEVEL_LOCK 已设，保留原版地图等级门槛");
-    } else {
-        for (ticks = 0; !g_stop && !g_map_lvl_patched && ticks < 2000; ticks++) {
-            if (try_patch_map_level_gate()) break;
-            Sleep(2);
-        }
-        if (!g_map_lvl_patched)
-            bslog("PATCH   !! 超时未能 patch 地图等级门槛"
-                  "（0x40b623 的特征串一直对不上）");
+    for (ticks = 0; !g_stop && !g_map_lvl_patched && ticks < 2000; ticks++) {
+        if (try_patch_map_level_gate()) break;
+        Sleep(2);
     }
+    if (!g_map_lvl_patched)
+        bslog("PATCH   !! 超时未能 patch 地图等级门槛"
+              "（0x40b623 的特征串一直对不上）");
 
     /* 玩家等级门槛（D22）：和地图那组同一个道理，不赶时机 —— 七处判据最早
        也要等玩家点进大厅/建房对话框才执行。★ 这组**必须**打上，否则服务端
        改发真实等级之后，1~3 级号会退回原版的对战锁。 */
-    if (player_level_lock_kept()) {
-        bslog("PATCH   BSHOOK_KEEP_PLAYER_LEVEL_LOCK 已设，保留原版玩家等级门槛"
-              "（1 级号会进不了对战频道、选不了生存模式和 5/6 人房）");
-    } else {
-        for (ticks = 0; !g_stop && !g_plr_lvl_patched && ticks < 2000; ticks++) {
-            if (try_patch_player_level_gate()) break;
-            Sleep(2);
-        }
-        if (!g_plr_lvl_patched)
-            bslog("PATCH   !! 超时未能 patch 玩家等级门槛"
-                  "（0x440b05 / 0x440cd6 / 0x465338 / 0x465a2c / 0x4374c9 / "
-                  "0x54f8f2 / 0x43b676 的特征串一直对不上）");
+    for (ticks = 0; !g_stop && !g_plr_lvl_patched && ticks < 2000; ticks++) {
+        if (try_patch_player_level_gate()) break;
+        Sleep(2);
     }
+    if (!g_plr_lvl_patched)
+        bslog("PATCH   !! 超时未能 patch 玩家等级门槛"
+              "（0x440b05 / 0x440cd6 / 0x465338 / 0x465a2c / 0x4374c9 / "
+              "0x54f8f2 / 0x43b676 的特征串一直对不上）");
 
     /* IME 闪退修复（联机主崩溃，bug调查/3 + bug调查/5）：三处配套，缺一不可。
        不赶时机（解壳后随时可打），但和其它 patch 一样要等特征串出现。 */
-    if (ime_crash_fix_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_IME_CRASH 已设，保留原版 IME 闪退行为");
-    } else {
-        for (ticks = 0; !g_stop && ticks < 2000; ticks++) {
-            if (try_patch_ime_cache_clear() && try_patch_sum_rect_guard()
-                && try_patch_ime_cand_layout_guard()) break;
-            Sleep(2);
-        }
-        if (!g_ime_cache_patched || !g_ime_sumrect_patched
-            || !g_ime_cand_patched)
-            bslog("PATCH   !! 超时未能 patch IME 闪退修复"
-                  "（0x4269AB / 0x42515E / 0x4301B4 特征串一直对不上）");
+    for (ticks = 0; !g_stop && ticks < 2000; ticks++) {
+        if (try_patch_ime_cache_clear() && try_patch_sum_rect_guard()
+            && try_patch_ime_cand_layout_guard()) break;
+        Sleep(2);
     }
+    if (!g_ime_cache_patched || !g_ime_sumrect_patched
+        || !g_ime_cand_patched)
+        bslog("PATCH   !! 超时未能 patch IME 闪退修复"
+              "（0x4269AB / 0x42515E / 0x4301B4 特征串一直对不上）");
 
     /* 输入法用它自己的候选界面（X14 / §106 / D70）：和 IME 那组一样不赶时机，只等特征串。 */
     for (ticks = 0; !g_stop && !g_ime_native_patched && ticks < 2000; ticks++) {
@@ -11487,77 +11249,54 @@ static DWORD WINAPI patch_thread(LPVOID param)
     /* 溅射加成提示判空（V0.3 合成与商店 §47 / D55）：穿着 IncSplashRange 装备
        （火焰蝙蝠 220003）用溅射武器打空，15% 概率整个客户端闪退。
        和 IME 那组一样不赶时机，只等特征串出现。 */
-    if (splash_visual_crash_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_SPLASH_VISUAL_CRASH 已设，保留原版溅射加成提示"
-              "（打空会闪退）");
-    } else {
-        for (ticks = 0; !g_stop && !g_splash_visual_patched && ticks < 2000; ticks++) {
-            if (try_patch_splash_visual_guard()) break;
-            Sleep(2);
-        }
-        if (!g_splash_visual_patched)
-            bslog("PATCH   !! 超时未能 patch 溅射加成提示判空"
-                  "（0x47EA21 特征串一直对不上）");
+    for (ticks = 0; !g_stop && !g_splash_visual_patched && ticks < 2000; ticks++) {
+        if (try_patch_splash_visual_guard()) break;
+        Sleep(2);
     }
+    if (!g_splash_visual_patched)
+        bslog("PATCH   !! 超时未能 patch 溅射加成提示判空"
+              "（0x47EA21 特征串一直对不上）");
 
     /* 突击技加成提示判空（§53）：和上面那个完全同型，只是补丁点在 DashDamage
        的绘制虚表槽里。带 DashAttack 的只有已上架的 220004 迷你机械青蛙。 */
-    if (dash_visual_crash_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_DASH_VISUAL_CRASH 已设，保留原版突击技加成提示");
-    } else {
-        for (ticks = 0; !g_stop && !g_dash_visual_patched && ticks < 2000; ticks++) {
-            if (try_patch_dash_visual_guard()) break;
-            Sleep(2);
-        }
-        if (!g_dash_visual_patched)
-            bslog("PATCH   !! 超时未能 patch 突击技加成提示判空"
-                  "（0x481EF3 特征串一直对不上）");
+    for (ticks = 0; !g_stop && !g_dash_visual_patched && ticks < 2000; ticks++) {
+        if (try_patch_dash_visual_guard()) break;
+        Sleep(2);
     }
+    if (!g_dash_visual_patched)
+        bslog("PATCH   !! 超时未能 patch 突击技加成提示判空"
+              "（0x481EF3 特征串一直对不上）");
 
     /* 关掉客户端自己画的那行绿色加成文字（§59 / D65）：和服务端下发的说明文重复，
        而且原版那一行有错字（速度+d%）/ 漏翻（Team…Down）/ 溢出三个毛病。 */
-    if (client_bonus_text_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_CLIENT_BONUS_TEXT 已设，保留原版那行绿色加成文字");
-    } else {
-        for (ticks = 0; !g_stop && !g_bonus_text_patched && ticks < 2000; ticks++) {
-            if (try_patch_hide_client_bonus_text()) break;
-            Sleep(2);
-        }
-        if (!g_bonus_text_patched)
-            bslog("PATCH   !! 超时未能 patch 客户端加成绿字"
-                  "（0x41414D 特征串一直对不上）");
+    for (ticks = 0; !g_stop && !g_bonus_text_patched && ticks < 2000; ticks++) {
+        if (try_patch_hide_client_bonus_text()) break;
+        Sleep(2);
     }
+    if (!g_bonus_text_patched)
+        bslog("PATCH   !! 超时未能 patch 客户端加成绿字"
+              "（0x41414D 特征串一直对不上）");
 
     /* 礼物盒里材料没图标（V0.3商店 §75，2026-09-10 实机）：礼物槽 / 接收弹窗按 id
        查图标查的是 [Stock-] 那张表，材料只在 [Item-] 那张。查不到就退回第二张。 */
-    if (gift_icon_miss_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_GIFT_ICON_MISS 已设，保留原版礼物盒图标查表"
-              "（材料礼物画成 (FileNotFound)）");
-    } else {
-        for (ticks = 0; !g_stop && !g_icon_lookup_patched && ticks < 2000; ticks++) {
-            if (try_patch_gift_icon_fallback()) break;
-            Sleep(2);
-        }
-        if (!g_icon_lookup_patched)
-            bslog("PATCH   !! 超时未能 patch 礼物盒图标退回物品表"
-                  "（0x4169E9 特征串一直对不上）");
+    for (ticks = 0; !g_stop && !g_icon_lookup_patched && ticks < 2000; ticks++) {
+        if (try_patch_gift_icon_fallback()) break;
+        Sleep(2);
     }
+    if (!g_icon_lookup_patched)
+        bslog("PATCH   !! 超时未能 patch 礼物盒图标退回物品表"
+              "（0x4169E9 特征串一直对不上）");
 
     /* 岩浆巨龙（Quest02）弱点剧情的窗口（用户 2026-09-10 线上报的卡关）：
        原版只在 boss 正放出生动画那 3.84 秒里才肯放 Tracing，窗口一错过
        boss 从此免疫伤害。判据换成「弱点还没点出来」。 */
-    if (draka_tracing_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_DRAKA_TRACING_RACE 已设，保留原版岩浆巨龙"
-              "弱点剧情窗口（有概率永久卡关）");
-    } else {
-        for (ticks = 0; !g_stop && !g_draka_tracing_patched && ticks < 2000; ticks++) {
-            if (try_patch_draka_tracing_gate()) break;
-            Sleep(2);
-        }
-        if (!g_draka_tracing_patched)
-            bslog("PATCH   !! 超时未能 patch 岩浆巨龙弱点剧情"
-                  "（0x4B5A04 特征串一直对不上）");
+    for (ticks = 0; !g_stop && !g_draka_tracing_patched && ticks < 2000; ticks++) {
+        if (try_patch_draka_tracing_gate()) break;
+        Sleep(2);
     }
+    if (!g_draka_tracing_patched)
+        bslog("PATCH   !! 超时未能 patch 岩浆巨龙弱点剧情"
+              "（0x4B5A04 特征串一直对不上）");
 
     /* 岩浆巨龙诊断日志（会话 27）：boss 创建 / 门开 / Tracing 入队 / 弱点点出，
        一局几行、任何日志级别都记 —— 下次卡关靠它分辨病在哪、窗口被吃掉多少。 */
@@ -11585,139 +11324,101 @@ static DWORD WINAPI patch_thread(LPVOID param)
 
     /* BigShot.rpt 里三种旧闪退的守护（§48 / §49 / §50，D56）：教程弹窗时大厅为空、
        退出拆到一半又收到 WM_CLOSE、蒙皮记录没绑上骨骼。同样只等特征串出现。 */
-    if (rpt_crashes_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_RPT_CRASHES 已设，保留原版三处空指针行为");
-    } else {
-        for (ticks = 0; !g_stop && !g_rpt_guards_patched && ticks < 2000; ticks++) {
-            if (try_patch_rpt_crash_guards()) break;
-            Sleep(2);
-        }
-        if (!g_rpt_guards_patched)
-            bslog("PATCH   !! 超时未能 patch 旧闪退守护"
-                  "（0x40F4EA / 0x40EF90 / 0x5D27F1 特征串一直对不上）");
+    for (ticks = 0; !g_stop && !g_rpt_guards_patched && ticks < 2000; ticks++) {
+        if (try_patch_rpt_crash_guards()) break;
+        Sleep(2);
     }
+    if (!g_rpt_guards_patched)
+        bslog("PATCH   !! 超时未能 patch 旧闪退守护"
+              "（0x40F4EA / 0x40EF90 / 0x5D27F1 特征串一直对不上）");
 
     /* bug调查/17 那一批（§65 / §66 / §67）：崩溃报告器自己判空（拿得到现场的前提）、
-       突击技对象野指针校验、gspEndGame 没有 GameContext 时判空。
-       和上面三处共用 BSHOOK_KEEP_RPT_CRASHES 开关。 */
-    if (rpt_crashes_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_RPT_CRASHES 已设，bug调查/17 那五处守护一并不装");
-    } else {
-        for (ticks = 0; !g_stop && !g_crash17_guards_patched && ticks < 2000; ticks++) {
-            if (try_patch_crash17_guards()) break;
-            Sleep(2);
-        }
-        if (!g_crash17_guards_patched)
-            bslog("PATCH   !! 超时未能 patch bug调查/17 的崩溃守护"
-                  "（0x5D76B4 / 0x502182 / 0x50794A / 0x5079AA / 0x5518DE 特征串一直对不上）");
+       突击技对象野指针校验、gspEndGame 没有 GameContext 时判空。 */
+    for (ticks = 0; !g_stop && !g_crash17_guards_patched && ticks < 2000; ticks++) {
+        if (try_patch_crash17_guards()) break;
+        Sleep(2);
     }
+    if (!g_crash17_guards_patched)
+        bslog("PATCH   !! 超时未能 patch bug调查/17 的崩溃守护"
+              "（0x5D76B4 / 0x502182 / 0x50794A / 0x5079AA / 0x5518DE 特征串一直对不上）");
 
     /* bug调查/18（§78）：换图卸完场景后清掉 [角色+0x57C/0x580] —— §66 那个野指针
-       的根因。和上面那五处共用 BSHOOK_KEEP_DASH_STALE_CRASH / KEEP_RPT_CRASHES 开关。 */
-    if (rpt_crashes_keep_original() || dash_stale_keep_original()) {
-        bslog("PATCH   逃生门已设，不装「换图清突击技野指针」（bug调查/18）");
-    } else {
-        for (ticks = 0; !g_stop && !g_mapchg_clear_patched && ticks < 2000; ticks++) {
-            if (try_patch_mapchange_dangling()) break;
-            Sleep(2);
-        }
-        if (!g_mapchg_clear_patched)
-            bslog("PATCH   !! 超时未能 patch 换图野指针根治"
-                  "（0x4790CB 特征串一直对不上）");
+       的根因。 */
+    for (ticks = 0; !g_stop && !g_mapchg_clear_patched && ticks < 2000; ticks++) {
+        if (try_patch_mapchange_dangling()) break;
+        Sleep(2);
     }
+    if (!g_mapchg_clear_patched)
+        bslog("PATCH   !! 超时未能 patch 换图野指针根治"
+              "（0x4790CB 特征串一直对不上）");
 
     /* bug调查/18（§81）：三种「各出现一次」的散崩 —— 胜负条件析构走已释放的
-       LobbyStage / UTF-16 资源缓冲区少一个终止字节 / UI 向量 `_First` 不判空。
-       和上面那几批共用 BSHOOK_KEEP_RPT_CRASHES 开关。 */
-    if (rpt_crashes_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_RPT_CRASHES 已设，bug调查/18 那三处散崩守护也不装");
-    } else {
-        for (ticks = 0; !g_stop && !g_crash18_guards_patched && ticks < 2000; ticks++) {
-            if (try_patch_crash18_guards()) break;
-            Sleep(2);
-        }
-        if (!g_crash18_guards_patched)
-            bslog("PATCH   !! 超时未能 patch bug调查/18 的散崩守护"
-                  "（0x55C260 / 0x5D9E02 / 0x5D9E0D / 0x438BD3 特征对不上）");
+       LobbyStage / UTF-16 资源缓冲区少一个终止字节 / UI 向量 `_First` 不判空。 */
+    for (ticks = 0; !g_stop && !g_crash18_guards_patched && ticks < 2000; ticks++) {
+        if (try_patch_crash18_guards()) break;
+        Sleep(2);
     }
+    if (!g_crash18_guards_patched)
+        bslog("PATCH   !! 超时未能 patch bug调查/18 的散崩守护"
+              "（0x55C260 / 0x5D9E02 / 0x5D9E0D / 0x438BD3 特征对不上）");
 
     /* bug调查/25（§57 / §58）：两处都是已修过的病的**第二处站点** —— 精灵批
        的索引缓冲 Lock 不查返回值（§35 那条的孪生站点）、加载画面析构时
-       LobbyStage 已经没了（§81-A 那条的孪生站点）。
-       和上面那几批共用 BSHOOK_KEEP_RPT_CRASHES 开关。 */
-    if (rpt_crashes_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_RPT_CRASHES 已设，bug调查/25 那两处散崩守护也不装");
-    } else {
-        for (ticks = 0; !g_stop && !g_crash25_guards_patched && ticks < 2000; ticks++) {
-            if (try_patch_crash25_guards()) break;
-            Sleep(2);
-        }
-        if (!g_crash25_guards_patched)
-            bslog("PATCH   !! 超时未能 patch bug调查/25 的散崩守护"
-                  "（0x61186D / 0x46FE01 特征对不上）");
+       LobbyStage 已经没了（§81-A 那条的孪生站点）。 */
+    for (ticks = 0; !g_stop && !g_crash25_guards_patched && ticks < 2000; ticks++) {
+        if (try_patch_crash25_guards()) break;
+        Sleep(2);
     }
+    if (!g_crash25_guards_patched)
+        bslog("PATCH   !! 超时未能 patch bug调查/25 的散崩守护"
+              "（0x61186D / 0x46FE01 特征对不上）");
 
     /* 在场证据的采样点（§62 / D53）。不赶时机 —— 窗口过程要等窗口建起来，
-       远晚于解壳窗口。装不上只是「服务端少一条证据」，不影响任何玩法，
-       所以和别的守护共用逃生门也没必要，单给一个 BSHOOK_NO_PRESENCE=1。 */
-    if (presence_disabled()) {
-        bslog("PATCH   BSHOOK_NO_PRESENCE 已设，不采集在场证据（挂机判定退回"
-              "只看服务端那几条）");
-    } else {
-        for (ticks = 0; !g_stop && !g_presence_patched && ticks < 2000; ticks++) {
-            if (try_patch_presence_input()) break;
-            Sleep(2);
-        }
-        if (!g_presence_patched)
-            bslog("PATCH   !! 超时未能 patch 在场证据采样"
-                  "（0x40EE1D 特征对不上）—— 服务端收不到键盘/前台那几条证据");
+       远晚于解壳窗口。装不上只是「服务端少一条证据」，不影响任何玩法。 */
+    for (ticks = 0; !g_stop && !g_presence_patched && ticks < 2000; ticks++) {
+        if (try_patch_presence_input()) break;
+        Sleep(2);
     }
+    if (!g_presence_patched)
+        bslog("PATCH   !! 超时未能 patch 在场证据采样"
+              "（0x40EE1D 特征对不上）—— 服务端收不到键盘/前台那几条证据");
 
     /* 移动平台相位（X_Mod §74 / §78 / D55）。两个站点都在解壳后就绪的代码里；LinkPath
        要进图才跑、StartGame 要开打才跑，都远晚于这里。装不上只是「服务端对移动平台
-       退回开局估计」，不影响任何玩法 ⇒ 单给一个 BSHOOK_NO_MOVER_PHASE=1。 */
-    if (mover_phase_disabled()) {
-        bslog("PATCH   BSHOOK_NO_MOVER_PHASE 已设，不报移动平台相位（服务端退回开局估计）");
-    } else {
-        for (ticks = 0; !g_stop && ticks < 2000; ticks++) {
-            if (try_patch_mover_link()) break;
-            Sleep(2);
-        }
-        if (!g_mover_patched)
-            bslog("PATCH   !! 超时未能 patch 移动平台相位 ①（0x511D97 特征对不上）"
-                  "—— 服务端对移动平台退回开局估计");
-        else if (!g_mover_start_patched)
-            bslog("PATCH   !! 超时未能 patch 移动平台相位 ②（0x476463 特征对不上）"
-                  "—— 开打后的起点要等下一发周期同步（≤1 秒）才报上去");
-        /* ★ 逻辑帧时钟（D60）：两个目标函数都在战斗里才第一次跑，远晚于解壳窗口。 */
-        for (ticks = 0; !g_stop && ticks < 2000; ticks++) {
-            if (try_patch_tick_clock()) break;
-            Sleep(2);
-        }
-        if (!g_tickclk_patched)
-            bslog("PATCH   !! 超时未能装逻辑帧时钟（0x4904CC / 0x473E7C 特征对不上）"
-                  "—— 服务端对移动平台退回每秒相位外推");
+       退回开局估计」，不影响任何玩法。 */
+    for (ticks = 0; !g_stop && ticks < 2000; ticks++) {
+        if (try_patch_mover_link()) break;
+        Sleep(2);
     }
+    if (!g_mover_patched)
+        bslog("PATCH   !! 超时未能 patch 移动平台相位 ①（0x511D97 特征对不上）"
+              "—— 服务端对移动平台退回开局估计");
+    else if (!g_mover_start_patched)
+        bslog("PATCH   !! 超时未能 patch 移动平台相位 ②（0x476463 特征对不上）"
+              "—— 开打后的起点要等下一发周期同步（≤1 秒）才报上去");
+    /* ★ 逻辑帧时钟（D60）：两个目标函数都在战斗里才第一次跑，远晚于解壳窗口。 */
+    for (ticks = 0; !g_stop && ticks < 2000; ticks++) {
+        if (try_patch_tick_clock()) break;
+        Sleep(2);
+    }
+    if (!g_tickclk_patched)
+        bslog("PATCH   !! 超时未能装逻辑帧时钟（0x4904CC / 0x473E7C 特征对不上）"
+              "—— 服务端对移动平台退回每秒相位外推");
 
-    /* NEXON 信使（§85 / D83）：默认**整个拆掉** —— 四格 IAT 全换成自己的桩，
+    /* NEXON 信使（§85 / D83）：**整个拆掉** —— 四格 IAT 全换成自己的桩，
        登录那一发我们自己连认证服。nmcogame 一次都不被调用 ⇒ nmconew.dll
        不加载 ⇒ NMService.exe 不起（铁律 5 到这里才真的落地）。
-       加载钩子照样装，但这时它只剩**绊线**作用：真有谁来加载就挡下并打日志。
-
-       `BSHOOK_KEEP_NM=1` 退回 §82/§84 那一档：信使照常跑，只给它打四处崩溃守护。
+       加载钩子照样装，但这时它只剩**绊线**作用：真有谁来加载就挡下并打日志；
+       拆不掉（四格 IAT 一直没填好）时 §82/§84 那四处崩溃守护照装。
        ★ §80（不让加载）/ §83（直接回 1）两条老路都被实机推翻过，别再试；
          这一版和它们的区别是**真的把应答造出来了**（§85）。 */
-    if (nm_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_NM 已设：信使照常跑，只装 §82/§84 那四处崩溃守护");
-    } else {
-        for (ticks = 0; !g_stop && !g_nm_killed && ticks < 2000; ticks++) {
-            if (try_kill_nm()) break;
-            Sleep(2);
-        }
-        if (!g_nm_killed)
-            bslog("PATCH   !! 超时未能拆掉信使（nmcogame.dll 那四格 IAT 一直没填好）"
-                  "—— 保留原版行为，崩溃守护照装");
+    for (ticks = 0; !g_stop && !g_nm_killed && ticks < 2000; ticks++) {
+        if (try_kill_nm()) break;
+        Sleep(2);
     }
+    if (!g_nm_killed)
+        bslog("PATCH   !! 超时未能拆掉信使（nmcogame.dll 那四格 IAT 一直没填好）"
+              "—— 保留原版行为，崩溃守护照装");
     for (ticks = 0; !g_stop && !g_nm_loadhook_done && ticks < 2000; ticks++) {
         if (try_guard_nexon_messenger()) break;
         Sleep(2);
@@ -11732,18 +11433,13 @@ static DWORD WINAPI patch_thread(LPVOID param)
 
     /* ★ 追踪弹撒手死目标（§29）：功能补丁，和诊断开关无关，**一直装**。
        目标函数 `Projectile::Homing` 只在战斗里跑，远晚于解壳窗口。 */
-    if (homing_dead_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_HOMING_DEAD 已设，保留原版「追踪弹咬住死目标"
-              "不撒手」的行为（蝴蝶会绕着尸体转）");
-    } else {
-        for (ticks = 0; !g_stop && !g_homing_alive_patched && ticks < 2000; ticks++) {
-            if (try_patch_homing_alive()) break;
-            Sleep(2);
-        }
-        if (!g_homing_alive_patched)
-            bslog("PATCH   !! 超时未能 patch 追踪弹撒手死目标"
-                  "（0x47E40A 的特征串一直对不上）");
+    for (ticks = 0; !g_stop && !g_homing_alive_patched && ticks < 2000; ticks++) {
+        if (try_patch_homing_alive()) break;
+        Sleep(2);
     }
+    if (!g_homing_alive_patched)
+        bslog("PATCH   !! 超时未能 patch 追踪弹撒手死目标"
+              "（0x47E40A 的特征串一直对不上）");
 
     /* ★ 自定义武器表（X3）：功能钩子，一直装。两个站点都在解壳后就绪的代码里；
        0x0F01 要登录成功之后才会来，远晚于这里。 */
@@ -11758,33 +11454,23 @@ static DWORD WINAPI patch_thread(LPVOID param)
     /* ★ 仓库提示框说明文（X10，§52）：功能补丁。目标函数只在悬停物品格时跑，
        远晚于解壳窗口。装不上只是「房间里的仓库提示框仍画大厅那一套（任务属性）」，
        不崩、不影响别的 —— 所以超时只记一行，不重试到天荒地老。 */
-    if (cabinet_desc_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_CABINET_DESC 已设，仓库提示框保留原版行为"
-              "（画 0x0501 发下来的那一套，待机房间里也不跟着房间模式换）");
-    } else {
-        for (ticks = 0; !g_stop && !g_wdesc_patched && ticks < 2000; ticks++) {
-            if (try_patch_cabinet_desc()) break;
-            Sleep(2);
-        }
-        if (!g_wdesc_patched)
-            bslog("PATCH   !! 超时未能 patch 仓库提示框说明文"
-                  "（0x004554E7 的特征串一直对不上）—— 房间里的仓库提示框仍画大厅那一套");
+    for (ticks = 0; !g_stop && !g_wdesc_patched && ticks < 2000; ticks++) {
+        if (try_patch_cabinet_desc()) break;
+        Sleep(2);
     }
+    if (!g_wdesc_patched)
+        bslog("PATCH   !! 超时未能 patch 仓库提示框说明文"
+              "（0x004554E7 的特征串一直对不上）—— 房间里的仓库提示框仍画大厅那一套");
 
     /* ★ 准星弹格（X4，§43）：功能补丁，一直装。目标函数只在战斗里画准星时跑，
        远晚于解壳窗口。装不上只是「非 6 个原版容量的武器外圈没格子」，不影响别的。 */
-    if (aim_ring_keep_original()) {
-        bslog("PATCH   BSHOOK_KEEP_AIM_RING 已设，保留原版行为"
-              "（弹匣不是 2/3/6/10/14/18 时准星外圈是一个没有刻度的圆）");
-    } else {
-        for (ticks = 0; !g_stop && !g_aim_ring_patched && ticks < 2000; ticks++) {
-            if (try_patch_aim_ring()) break;
-            Sleep(2);
-        }
-        if (!g_aim_ring_patched)
-            bslog("PATCH   !! 超时未能 patch 准星弹格"
-                  "（0x48ca0d 的特征串一直对不上）—— 非原版容量的武器外圈仍是光滑圆环");
+    for (ticks = 0; !g_stop && !g_aim_ring_patched && ticks < 2000; ticks++) {
+        if (try_patch_aim_ring()) break;
+        Sleep(2);
     }
+    if (!g_aim_ring_patched)
+        bslog("PATCH   !! 超时未能 patch 准星弹格"
+              "（0x48ca0d 的特征串一直对不上）—— 非原版容量的武器外圈仍是光滑圆环");
 
     /* ★ M3b 诊断：弹体全字段快照（临时，查完「看不见 bot 的子弹」就删）。
        两个 hook 的目标函数都在战斗里才第一次跑，远晚于解壳窗口。 */
@@ -11830,17 +11516,13 @@ static DWORD WINAPI patch_thread(LPVOID param)
                   "（0x47f603 一直不是 55 8B EC 83 EC 18）");
     }
 
-    if (!afk_kick_disabled()) {
-        bslog("PATCH   BSHOOK_KEEP_AFK_KICK 已设，保留原版 90 秒挂机踢出");
-    } else {
-        for (ticks = 0; !g_stop && !g_afk_patched && ticks < 2000; ticks++) {
-            if (try_patch_afk_timer()) break;
-            Sleep(2);
-        }
-        if (!g_afk_patched)
-            bslog("PATCH   !! 超时未能 patch 挂机计时器"
-                  "（0x4082ae 一直不是 68 90 5F 01 00）");
+    for (ticks = 0; !g_stop && !g_afk_patched && ticks < 2000; ticks++) {
+        if (try_patch_afk_timer()) break;
+        Sleep(2);
     }
+    if (!g_afk_patched)
+        bslog("PATCH   !! 超时未能 patch 挂机计时器"
+              "（0x4082ae 一直不是 68 90 5F 01 00）");
 
     /* 握手版本号（版本管理）：不赶时机 —— OnConnect 最早也要等玩家在登录
        界面点「开始」才执行，远晚于解壳窗口；和其它 patch 一样等特征串。
@@ -12091,6 +11773,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
            install_hooks 里还会再试一次。 */
         compute_main_module_range();
         install_iphlpapi_hook();
+
+        /* ★ 同理，Win 键护栏也得赶在 App 初始化装钩子之前（X_Mod §146）。 */
+        install_winkey_guard();
 
         ready_event = open_loader_event(POPSHOT_BSHOOK_READY_ENV);
         if (!ready_event) {

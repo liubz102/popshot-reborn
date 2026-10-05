@@ -1696,7 +1696,7 @@ L: 0040F823  lea eax,[esi+0x1b0]         ; &Adapter->IpAddressList.IpAddress
 
 **★★ 本机 100% 复现过（2026-09-23）**：开发机默认 6 块网卡（所需 3840 字节，够用），
 装 5 块 Microsoft KM-TEST 环回适配器顶到 **11 块 ⇒ 所需 7040 字节 = 玩家 dump 里那个 `0x1B80`**，
-再用 `BSHOOK_NO_ADAPTERS_GUARD=1` 关掉护栏，`stop → start → drive.py login` 跑批：
+再用 `BSHOOK_NO_ADAPTERS_GUARD=1`（D106 已删）关掉护栏，`stop → start → drive.py login` 跑批：
 **护栏关 16 轮崩 6 轮（约 1/3，批次间波动极大 —— 这就是「有概率」），护栏开 8 轮 0 崩**。
 每次都是 `0040F85F` / `EAX=1` / `EDI=2` / `EBP = ESP+0x88`，只有 `ESI` 不同
 （实测 `5F657275` = "ure_"、`00390036` = UTF-16 "69" —— **栈上的字符串碎片**，
@@ -1717,7 +1717,7 @@ L: 0040F823  lea eax,[esi+0x1b0]         ; &Adapter->IpAddressList.IpAddress
 `WS2 connect`（加载页「连接至服务器中」）→ `GetAdaptersInfo` → 崩。
 那片栈就是这么被弄脏的。
 
-**对照开关**：`BSHOOK_NO_ADAPTERS_GUARD=1` ⇒ 不装护栏（D57）。不能靠「编个没护栏的 DLL」
+~~**对照开关**：`BSHOOK_NO_ADAPTERS_GUARD=1` ⇒ 不装护栏（D57）~~（D106 已删）。不能靠「编个没护栏的 DLL」
 来做对照 —— 那会改掉 `manifest-hook.json` 的 SHA，服务端直接拒绝这个客户端（D85）。
 
 **怎么重新解 dump**：`Dump\*.mdmp` 是标准 minidump（`MiniDumpWithDataSegs`），不用 WinDbg ——
@@ -2929,3 +2929,20 @@ D60 把炸点改成 `hit.free`（被挡住的**前一个**整数点），比旧�
   非 2 时 `mov byte [ctl+0x20],1`）—— 🤔 就是 V147 说的「道具项变灰」。服务端 `lobby.item_mode_of` 同口径：实机 `args=(1, 2, 1)` 那 18 次照样判「道具模式=否」。
 - 个人 / 组队：`0x465685` 那一段不碰别的控件，`lobby.team_layout_of` 也只看 `arguments[0]`。⚠ 可本机 + `bug调查` 全部日志里格斗房**建房 131 次、换房参数 116 次
   全是 `args=(1, 2, …)` 组队战**（生存 / 夺分的个人战上千次）—— 是没人切，还是别处拦着（建房框 `0x437a11` 那一路没读完），没核到底。⇒ 奖励表个人 / 组队两档都给。
+
+## §146 ★★★★ 游戏一开、整个系统的 Win 键就没了 = 原版**真全屏**时装了个**全局**低级键盘钩子，吞 Win / 菜单键 / Ctrl+Esc / Alt+Esc 却**不看前台**，退出才卸（🔍逐指令 + ✅用户出事那两次的日志 `windowed=0`）
+
+- **装**：App 初始化 `0x40d3d7 cmp [App+0x98],0 / jne` —— `+0x98` = `UserConfig.ini` 的 `FullScreen`（`0x40cfde`，读 `0x41139e`）。**为 0 才装**，
+  而这个客户端 0 才是真全屏（V0.1 §55；同一个值 `0x40d4ab sete` 传给建设备）。`0x40a461`：`[obj]==1`（NT；`0x40a43e` 是 `GetVersion` 判 9x / NT
+  的写法 `cmp eax,0x80000000`，那一格在 dump 里指向壳的桩）⇒ `0x40a4c7 SetWindowsHookExW(WH_KEYBOARD_LL=13, 0x40a521, hInst, 0)`
+  （unicows 转接槽 `[0x6e62b4]`），句柄 `[0x72e2a0]`。**卸**：只有 App 收尾（`0x40d9df` 里 `0x40db95` 删 `[App+0x50]` 那个钩子对象）`0x40dd0e → 0x40a452 → [0x6373fc] UnhookWindowsHookEx`。
+  ⇒ 最小化 / 切到别的程序，钩子照样替整个系统吃键。（`[0x6373fc]` / `[0x637414]` / `[0x6373a4]` 拿本机 SysWOW64 user32 导出表按 RVA 对上，dump 里 user32 基址 `0x75630000`。）
+- **过程 `0x40a521`**：`nCode==0` 时 ① `LLKHF_ALTDOWN` + Esc ② 左 / 右 Ctrl 按着（`0x40a0bd` → `GetAsyncKeyState` 最高位）+ Esc ③ vk ∈ `0x5B~0x5D`
+  （LWin / RWin / Apps）⇒ `return 1`；其余 `CallNextHookEx`。**没有一句问前台**（微软《Disabling Shortcut Keys in Games》的范例要加 `g_bWindowActive`，它没加）。
+- **窗口模式（`FullScreen=1`）根本不装** ⇒ 开发树（预置 1）永远复现不了；用户出事时是真全屏（bshook 日志 `CreateDevice … windowed=0`）。
+- 别的路子都排除了：Win9x 那支装的是 `WH_KEYBOARD`（`0x40a47f`，NT 走不到）；`0x44264c` 的 `WH_GETMESSAGE` 带 `GetCurrentThreadId` = 线程钩子，管不到别的程序；
+  镜像里没有 `DirectInput` / `dinput` / `RegisterHotKey` 字样。bshook 自己从不调 `SetWindowsHookEx`。
+- 修法见 D105（干脆不让它装）。拒掉之后原版不受影响：返回值直接存进句柄（`0x40a4da`，NULL 就存 0）、调用方 `0x40d3e6` 不看返回值、
+  收尾 `0x40a452` 见句柄是 0 就不卸。游戏的调用经 ASProtect 解析桩，桩往槽里写的是 user32 导出的**真地址**（dump 里 `[0x6e6260]` = user32+0x30290
+  = `CreateWindowExW`）⇒ 钩导出拦得住。本机 SysWOW64 `SetWindowsHookExW` 序言 `8b ff 55 8b ec`；scratch 夹具拿真 `insn_reloc.h` 装上：
+  0x40a521 那一个（直接调、经 `GetProcAddress` 指针调）都回 NULL，线程 `WH_GETMESSAGE`（游戏 `0x44264c` 每种模式都装）/ 别人的 LL 钩子照装照卸。

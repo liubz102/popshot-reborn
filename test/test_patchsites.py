@@ -1014,12 +1014,10 @@ class MutuUnlockPatchTest(unittest.TestCase):
                 self.assertFalse(va < hi and lo < va + length,
                                  "%s 的 %08X 和格斗解锁的 %08X 重叠" % (name, va, lo))
 
-    def test_the_patch_thread_gates_it_behind_the_region_unlock(self):
-        # 14 张格斗图全靠地区旁路进目录（庆典那张已从 map.ini 删掉，D90）—— 地区锁保留时这组必须跟着不打。
-        body = self.src[self.src.index("格斗模式（무투전）解锁（X16 / D82）"):]
-        body = body[:body.index("登录公告")]
-        self.assertLess(body.index("region_lock_disabled()"), body.index("try_patch_mutu_unlock()"))
-        self.assertIn("mutu_lock_kept()", body)
+    def test_the_patch_thread_installs_it_after_the_region_unlock(self):
+        # 14 张格斗图全靠地区旁路进目录（庆典那张已从 map.ini 删掉，D90）。两组都无条件装（D106：不留退回原版的开关）。
+        body = self.src[self.src.index("static DWORD WINAPI patch_thread"):]
+        self.assertLess(body.index("try_patch_region_lock()"), body.index("try_patch_mutu_unlock()"))
 
 
 class MutuDiagProbeTest(unittest.TestCase):
@@ -1195,12 +1193,75 @@ class MutuZombieRetractPatchTest(unittest.TestCase):
                 self.assertFalse(s["va"] <= va < s["va"] + s["stolen"],
                                  "%s（%08X）落在 %s 偷走的字节里" % (m.group(1), va, prefix))
 
-    def test_the_patch_thread_installs_it_unless_kept(self):
+    def test_the_patch_thread_installs_it(self):
         body = self.src[self.src.index("static DWORD WINAPI patch_thread"):]
         self.assertIn("try_patch_mutu_zombie()", body)
-        self.assertLess(body.index("mutu_zombie_keep_original()"), body.index("try_patch_mutu_zombie()"))
-        keep = self.src[self.src.index("static int mutu_zombie_keep_original(void)"):]
-        self.assertIn('"BSHOOK_KEEP_MUTU_ZOMBIE"', keep[:keep.index("\n}\n")])
+
+
+class WinKeyGuardTest(unittest.TestCase):
+    """§146 / D105 —— 原版真全屏时装的全局低级键盘钩子 `0x40a521` 吞 Win 键还不看前台：干脆不让它装。
+
+    bshook 在 DllMain 里钩 `user32!SetWindowsHookExW`，只拒「WH_KEYBOARD_LL + 过程 0x40a521」这一个、回 NULL。
+    这个钩子只有**真全屏**才会被装（开发树是窗口模式，平时根本走不到），
+    「是谁在什么条件下装的」「拒掉之后原版受不受影响」都只能离线钉死。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        for path in (BSHOOK, IMG):
+            if not os.path.isfile(path):
+                raise unittest.SkipTest("不在源码仓库里（缺 %s），跳过" % path)
+        cls.img = load_image()
+        cls.src = c_source()
+        cls.proc = c_define(cls.src, "WINKEY_PROC_VA")
+
+    def test_it_is_the_proc_the_original_installs_as_a_global_ll_keyboard_hook(self):
+        # 0x40a4c7：SetWindowsHookExW(WH_KEYBOARD_LL=13, 0x40a521, hMod, dwThreadId=0)，经 ASProtect 解析桩的槽 [0x6e62b4]。
+        self.assertEqual(bytes.fromhex("6a00 ff742408 6821a54000 6a0d ff15b4626e00"),
+                         read_va(self.img, 0x0040A4C7, 19))
+        self.assertEqual(0x0040A521, self.proc)
+        # 全镜像只有这一处拿它当参数。
+        self.assertEqual(1, self.img.count(b"\x68" + struct.pack("<I", self.proc)))
+
+    def test_the_original_installs_it_only_in_real_fullscreen(self):
+        # App 初始化：[App+0x98] = UserConfig.ini 的 FullScreen（0 才是真全屏，V0.1 §55），为 0 才调 0x40a461。
+        self.assertEqual(bytes.fromhex("83bf9800000000 894750 7508 ff7508 e8"),
+                         read_va(self.img, 0x0040D3D7, 16))
+        rel = struct.unpack("<i", read_va(self.img, 0x0040D3E7, 4))[0]
+        self.assertEqual(0x0040A461, 0x0040D3EB + rel)
+
+    def test_the_original_eats_the_win_and_menu_keys(self):
+        # vk ∈ [VK_LWIN 0x5B, VK_APPS 0x5D] ⇒ bl = 1 ⇒ 返回 1（吞掉）—— 这就是不让它装的理由。
+        self.assertEqual(bytes.fromhex("8b06 83f85b 7207 83f85d 7702 b301"),
+                         read_va(self.img, 0x0040A56C, 14))
+
+    def test_a_refused_install_is_harmless_to_the_original(self):
+        # ① 返回值直接存进句柄 [0x72e2a0]（NULL 就存 0）。
+        self.assertEqual(bytes.fromhex("a3a0e27200"), read_va(self.img, 0x0040A4DA, 5))
+        # ② 调用方 0x40d3e6 不看 0x40a461 的返回值：下一句就是 push [0x72e1d8]。
+        self.assertEqual(bytes.fromhex("ff35d8e17200"), read_va(self.img, 0x0040D3EB, 6))
+        # ③ 收尾 0x40a452：句柄是 0 就直接 ret，不去 UnhookWindowsHookEx。
+        self.assertEqual(bytes.fromhex("833da0e2720000 7405"), read_va(self.img, 0x0040A452, 9))
+
+    def test_the_guard_refuses_only_that_one_hook(self):
+        body = self.src[self.src.index("static HHOOK WINAPI det_SetWindowsHookExW("):]
+        body = body[:body.index("\n}\n")]
+        refuse = body[:body.index("return NULL;")]
+        self.assertIn("id == WH_KEYBOARD_LL", refuse)
+        self.assertIn("(UINT_PTR)fn == WINKEY_PROC_VA", refuse)
+        # 别人的钩子原样放行，参数一个不改。
+        self.assertIn("return s_SetWindowsHookExW(id, fn, mod, tid);", body)
+
+    def test_the_guard_is_in_place_before_any_game_code_runs(self):
+        # DllMain 跑在主线程的 LoadLibrary APC 里，游戏一行代码都没跑；补丁线程那种「等解壳」的路子赶不上 App 初始化。
+        attach = self.src[self.src.index("case DLL_PROCESS_ATTACH:"):]
+        attach = attach[:attach.index("case DLL_PROCESS_DETACH:")]
+        self.assertLess(attach.index("install_winkey_guard();"),
+                        attach.index("CreateThread(NULL, 0, patch_thread"))
+        install = self.src[self.src.index("static void install_winkey_guard(void)"):]
+        install = install[:install.index("\n}\n")]
+        self.assertIn('"SetWindowsHookExW"', install)
+        self.assertIn("install_inline_hook(", install)
 
 
 if __name__ == "__main__":

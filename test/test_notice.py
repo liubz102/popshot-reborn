@@ -166,10 +166,6 @@ class DecoderStaysInSyncTests(unittest.TestCase):
                           f"bshook.c 的 notice_decode 少了 `{expr}`，"
                           f"和 tools/gen_notice_h.py 的 _keystream 对不上")
 
-    def test_the_hook_has_an_escape_hatch(self):
-        """项目惯例：每组 patch 都要有 `BSHOOK_KEEP_*` 逃生门。"""
-        self.assertIn("BSHOOK_KEEP_NOTICE", repo_file(BSHOOK))
-
 
 class PlaintextStaysOutOfThePackagesTests(unittest.TestCase):
     """原稿和生成物都不许随包发出去 —— 发出去就等于没混淆。"""

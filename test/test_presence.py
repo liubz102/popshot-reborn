@@ -306,7 +306,7 @@ class VerdictTests(unittest.TestCase):
         self.assertFalse(self.gs.conn_is_afk(conn, now=100_000.0))
 
     def test_no_evidence_at_all_is_never_a_verdict(self):
-        """★ 老客户端 / 没中继 / UDP 被挡 / `BSHOOK_NO_PRESENCE=1` 都走这儿。
+        """★ 老客户端 / 没中继 / UDP 被挡都走这儿。
 
         「收不到」绝不能当成「他挂机」—— bot 也是靠这一条不受影响的。
         """
