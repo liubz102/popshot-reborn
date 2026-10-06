@@ -6,6 +6,7 @@
 | 测试代码 | `test/test_*.py`（外加不叫 `test_` 的共用工具 `testsupport.py`）|
 | 测试**数据**（夹具）| `test/data/<用途>/` |
 | 被测代码 | 隔壁的 `server/`（还有 `tools/`、`hook/`）|
+| C 写的原生夹具（要 MSVC，不进全量、手动跑）| `test/hook/`：`test\hook\test-fsview.bat` = `hook/fsview.h` 的画面矩形 / 坐标换算（X21，改了它就跑）；更早的几个还在 `hook/test-*.bat` |
 
 ```powershell
 runtime\python\python.exe test\run_tests.py            # 3.14，默认并行

@@ -20,6 +20,8 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#define COBJMACROS
+#include <d3d9.h>       /* 无边框全屏（X21）：只用类型 / 常量 / C 宏调接口，不链 d3d9.lib */
 #include <imm.h>        /* 只用结构体 / 常量（IMECHARPOSITION、CANDIDATEFORM），不调 Imm* 函数 */
 #include <tlhelp32.h>
 #include <stdio.h>
@@ -1361,6 +1363,549 @@ static void install_winkey_guard(void)
         bslog("KBD     !! SetWindowsHookExW 钩不上 —— 真全屏时 Win 键会被原版吞掉");
 }
 
+/* ========================================================================== */
+/* ★ 无边框全屏（X_Mod X21 / §147 / D107）                                     */
+/*                                                                            */
+/*   用户 2026-10-06：全屏下 Alt+Tab 切出去卡、切回来卡一两秒；要和现代游戏    */
+/*   一样瞬切、全屏时能开开始菜单。根因（§147）：独占全屏每次切换都把显示器    */
+/*   在 1024×768 ⇄ 桌面分辨率之间改来改去（显示器重新同步就黑 1~2 秒），D3D9   */
+/*   设备一失焦就丢，唯一的恢复路径 `0x5bf960` 还先 Sleep(500)、贴图重新读盘。 */
+/*                                                                            */
+/*   做法：**游戏仍以为自己在独占全屏**（`[App+0x98]`=0、渲染器 `[r+0x291]`=1   */
+/*   都不动 ⇒ 原版「失焦就不画、不 Present」`0x40df71` 照旧，后台设备丢失不会   */
+/*   掉进 `0x5bf960` 的重试循环），只在边界上替它换：                           */
+/*     · D3D：它要全屏时，CreateDevice（IDirect3D9 vtable，经 Direct3DCreate9   */
+/*       挂）改栈上那份拷贝、设备恢复例程 `0x5bf960` 按 `[r+0x291]` 原地改      */
+/*       `[r+8]`，都成窗口模式（刷新 0、1 个后台缓冲、SwapEffect=COPY）；Present */
+/*       包装 `0x5bfcef` 把 1024×768 的后台缓冲**双线性**放大进居中的 4:3        */
+/*       「画面矩形」（附加交换链 + StretchRect；不成就退回 Present(pDestRect)，  */
+/*       那条只有 COPY 合法）。★ 不钩设备 vtable：D3D9 录状态块时会把槽位抄回去 */
+/*       （本机实测，见下面「Present / Reset 钩在游戏自己的两个函数上」）；      */
+/*     · 窗口：盖满所在显示器、**不置顶**（任务栏自己让开，开始菜单 / Alt+Tab   */
+/*       直接盖在游戏上）；子类化窗口过程涂黑边、黑边里 / 游戏失焦时给箭头光标； */
+/*     · 鼠标：大厅类阶段（不抓鼠标）读光标 `0x40f3a5`、放开抓取时放回光标      */
+/*       `0x42972f` 这两处做「客户区 ⇄ 界面」换算 —— 正是原版 800×600 模式做     */
+/*       ×1.28 / ×0.78125 的那两处；放开抓取那句 `ClipCursor(NULL)` `0x429743`  */
+/*       在游戏前台时改成夹在画面里（用户要的「锁在画面里」）。战斗里拽回       */
+/*       (500,400) 取位移那一套跟客户区多大无关，不碰 ⇒ 瞄准手感不变。          */
+/*     · F11 / 设定 / Lua 切显示模式全走 `SetDisplayMode 0x40e33c`：它摆窗口的   */
+/*       那句 `MoveWindow`（`0x40e43a`）在全屏时换成「盖满显示器 + 取消置顶」   */
+/*       （前一句它刚把窗口设成了置顶）。                                       */
+/*                                                                            */
+/*   ★ 四个 user32 钩子按**返回地址**只认原版那一处调用（和 Win 键护栏「只拒   */
+/*     原版那一个」同一个思路）—— d3d9 / 输入法 / 我们自己调这些 API 一律原样 */
+/*     放行。返回地址 = 镜像里那句 `call [IAT]` 站点 + 6，test_patchsites 核。  */
+/*   ★ user32 四个 + d3d9!Direct3DCreate9 装在 DllMain（游戏一行没跑、别的线程 */
+/*     还没起）；游戏的 user32 / d3d9 导入槽里是导出的真地址（§146 / §147），   */
+/*     钩导出拦得住。游戏自己那两个函数要等解壳，由补丁线程和 RendererInit 钩子 */
+/*     一起装 —— 建设备在登录之后，没装上那一局就照原版（建设备时才判）。       */
+/*   ★ 状态只在游戏自己的事件上翻：建设备 / 设备恢复时 `[r+0x291]`、            */
+/*     SetDisplayMode 摆窗口、WM_DISPLAYCHANGE。不轮询、不计时，全在主线程上。  */
+/*   ★ 两组钩子没装齐就整个不换（= 原版独占全屏），日志打 `!!`。                */
+/* ========================================================================== */
+#include "fsview.h"
+
+#define FS_APP_PP           0x0072E2A4u  /* App 单例；+7 = 游戏在前台（WM_ACTIVATEAPP `0x40f188` 写）*/
+#define FS_INPUT_PP         0x0072E2BCu  /* InputSystem 单例；+0x40c = 抓着鼠标（战斗 / 加载）        */
+/* 原版那几处调用的返回地址（= `call [IAT]` 站点 + 6，站点见 FINDINGS §147） */
+#define FS_RET_CURSOR_READ  0x0040F3ABu  /* 0x40f3a5 ScreenToClient：大厅类阶段读光标 → 界面坐标      */
+#define FS_RET_CAPTURE_OFF  0x00429735u  /* 0x42972f ClientToScreen：放开抓取，虚拟光标放回屏幕       */
+#define FS_RET_UNCLIP       0x00429749u  /* 0x429743 ClipCursor(NULL)：放开抓取                       */
+#define FS_RET_MODE_MOVE    0x0040E440u  /* 0x40e43a MoveWindow：SetDisplayMode 摆窗口                */
+
+/* 下面这些只在游戏主线程上读写（建设备 / Reset / Present / 窗口过程 / 原版那几处
+   调用都在主线程），不加锁。 */
+static struct {
+    HWND     hwnd;          /* 游戏主窗口（第一次建设备时记下并子类化） */
+    WNDPROC  prev_proc;     /* 子类化之前的窗口过程 */
+    int      on;            /* 游戏要的是全屏 ⇒ 此刻给它的是无边框 */
+    int      broken;        /* 窗口模式建设备失败过：这一局照原版独占全屏，不再换 */
+    long     ui_w, ui_h;    /* 后台缓冲 = 界面坐标系（建设备时从参数里读） */
+    fsv_rect pic;           /* 画面矩形，客户区坐标（放大的目标、坐标换算） */
+    RECT     pic_screen;    /* 同一块的屏幕坐标（锁鼠标的夹框） */
+    RECT     monitor;       /* 窗口所在显示器 */
+    UINT     interval;      /* 游戏要的 PresentationInterval（放大用的交换链照抄） */
+    IDirect3DSwapChain9 *sc;   /* 盖满客户区的附加交换链：游戏那张 1024×768 双线性放大进来 */
+    long     sc_w, sc_h;
+    int      scaled;        /* 上一帧走的是 1 = 双线性放大 / 0 = 退路；-1 还没 Present 过 */
+    int      no_scale;      /* 放大那条路这台机器走不通：退路走到下一次 Reset 再试 */
+} g_fs = { NULL, NULL, 0, 0, 1024, 768, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0},
+           0, NULL, 0, 0, -1, 0 };
+
+static int g_fs_ready;      /* 四个 user32 钩子都装上了 —— 只有这时才换 */
+
+typedef void *(WINAPI *Direct3DCreate9_t)(UINT);
+typedef BOOL  (WINAPI *ScreenToClient_t)(HWND, LPPOINT);
+typedef BOOL  (WINAPI *ClientToScreen_t)(HWND, LPPOINT);
+typedef BOOL  (WINAPI *ClipCursor_t)(const RECT *);
+typedef BOOL  (WINAPI *MoveWindow_t)(HWND, int, int, int, int, BOOL);
+/* 游戏自己的两个函数（thiscall，ECX = 渲染器；__fastcall 的 EDX 是占位）：
+   Present 包装三个栈参数 `ret 0xc`，设备恢复例程没有栈参数 `ret`。 */
+typedef LONG (__fastcall *fs_game_present_t)(void *, void *, const RECT *, const RECT *, HWND);
+typedef LONG (__fastcall *fs_game_reset_t)(void *, void *);
+static Direct3DCreate9_t s_Direct3DCreate9 = NULL;
+static ScreenToClient_t  s_ScreenToClient = NULL;
+static ClientToScreen_t  s_ClientToScreen = NULL;
+static ClipCursor_t      s_ClipCursor = NULL;
+static MoveWindow_t      s_MoveWindow = NULL;
+static fs_game_present_t s_fs_game_present = NULL;
+static fs_game_reset_t   s_fs_game_reset = NULL;
+static volatile LONG     g_fs_game_hooked = 0;   /* 上面两个都钩上了 —— 和 g_fs_ready 一起才换 */
+static volatile LONG     g_fs_game_tried = 0;
+
+/* 定义在下面「阶段5 诊断」一段：给 IDirect3D9 的 vtable 挂 CreateDevice（幂等）。 */
+static int try_hook_d3d_create_device(void *d3d);
+
+/* `[[pp]+off]` 那一个字节；读不到回 -1。 */
+static int fs_game_byte(UINT_PTR pp, unsigned off)
+{
+    const unsigned char *obj;
+
+    if (IsBadReadPtr((const void *)pp, 4)) return -1;
+    obj = *(const unsigned char * const *)pp;
+    if ((UINT_PTR)obj < 0x10000 || IsBadReadPtr(obj + off, 1)) return -1;
+    return obj[off];
+}
+
+static int fs_app_active(void)      { return fs_game_byte(FS_APP_PP, 7) > 0; }
+static int fs_mouse_captured(void)  { return fs_game_byte(FS_INPUT_PP, 0x40c) > 0; }
+
+static void fs_client_to_ui(LPPOINT pt)
+{
+    long x = pt->x, y = pt->y;
+    fsv_client_to_ui(&g_fs.pic, g_fs.ui_w, g_fs.ui_h, &x, &y);
+    pt->x = x;
+    pt->y = y;
+}
+
+static void fs_ui_to_client(LPPOINT pt)
+{
+    long x = pt->x, y = pt->y;
+    fsv_ui_to_client(&g_fs.pic, g_fs.ui_w, g_fs.ui_h, &x, &y);
+    pt->x = x;
+    pt->y = y;
+}
+
+/* 界面坐标的矩形（右下是开区间）→ 客户区。输入法候选框的位置用。 */
+static void fs_ui_rect_to_client(RECT *r)
+{
+    POINT tl, br;
+    tl.x = r->left;  tl.y = r->top;
+    br.x = r->right; br.y = r->bottom;
+    fs_ui_to_client(&tl);
+    fs_ui_to_client(&br);
+    SetRect(r, tl.x, tl.y, br.x, br.y);
+}
+
+static void fs_set(int on, const char *why)
+{
+    if (g_fs.on == on) return;               /* 按状态翻转记一行 */
+    g_fs.on = on;
+    bslog("FS      无边框全屏 %s（%s）", on ? "开" : "关", why);
+}
+
+/* 按窗口此刻所在的显示器算几何。 */
+static int fs_measure(HWND hwnd)
+{
+    MONITORINFO mi;
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+
+    mi.cbSize = sizeof(mi);
+    if (!mon || !GetMonitorInfoW(mon, &mi)) return 0;
+    g_fs.monitor = mi.rcMonitor;
+    fsv_fit(mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+            g_fs.ui_w, g_fs.ui_h, &g_fs.pic);
+    /* WS_POPUP 没边框、窗口就摆在显示器左上角 ⇒ 客户区原点 = 显示器左上角。 */
+    SetRect(&g_fs.pic_screen,
+            mi.rcMonitor.left + g_fs.pic.l, mi.rcMonitor.top + g_fs.pic.t,
+            mi.rcMonitor.left + g_fs.pic.r, mi.rcMonitor.top + g_fs.pic.b);
+    return fsv_valid(&g_fs.pic);
+}
+
+/* 盖满所在显示器、取消置顶，重算画面矩形，整窗重画（黑边由 WM_ERASEBKGND 涂）。
+   启动时窗口还隐藏着：SWP_NOACTIVATE 不抢焦点、不带 SWP_SHOWWINDOW 也不会把它显示出来。 */
+static void fs_fill_monitor(HWND hwnd, const char *why)
+{
+    if (!fs_measure(hwnd)) {
+        bslog("FS      !! %s：取不到窗口所在的显示器 err=%lu，窗口没动",
+              why, (unsigned long)GetLastError());
+        return;
+    }
+    if (!SetWindowPos(hwnd, HWND_NOTOPMOST, g_fs.monitor.left, g_fs.monitor.top,
+                      g_fs.monitor.right - g_fs.monitor.left,
+                      g_fs.monitor.bottom - g_fs.monitor.top,
+                      SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED))
+        bslog("FS      !! %s：SetWindowPos 失败 err=%lu", why, (unsigned long)GetLastError());
+    RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
+    bslog("FS      %s：窗口 %08X 盖满显示器 (%ld,%ld)-(%ld,%ld)，画面 (%ld,%ld)-(%ld,%ld)",
+          why, (unsigned)(UINT_PTR)hwnd,
+          g_fs.monitor.left, g_fs.monitor.top, g_fs.monitor.right, g_fs.monitor.bottom,
+          g_fs.pic.l, g_fs.pic.t, g_fs.pic.r, g_fs.pic.b);
+}
+
+/* 游戏要独占全屏时，把那份参数改成窗口模式。
+   建设备时改的是 RendererInit 栈上那份（`[r+8]` 已经先抄好了，`0x5bfbbc`）；Reset 时改的是
+   游戏自己存的 `[r+8]`（`0x5bf960` 拿它 Reset）—— 游戏「要不要全屏」的事实是 `[r+0x291]`，
+   不看这里的 Windowed，所以原地改没有副作用（`0x5bfd43` 每次切模式都按 `[r+0x291]` 重建）。 */
+static void fs_make_windowed(D3DPRESENT_PARAMETERS *pp)
+{
+    pp->Windowed = TRUE;
+    pp->FullScreen_RefreshRateInHz = 0;            /* 窗口模式必须 0 */
+    pp->BackBufferCount = 1;                       /* COPY 只许 1 个后台缓冲 */
+    pp->SwapEffect = D3DSWAPEFFECT_COPY;           /* 退路那条 Present 带目标矩形，只有 COPY 合法 */
+    g_fs.interval = pp->PresentationInterval;
+}
+
+static HBRUSH fs_black_brush(void)
+{
+    static HBRUSH br;
+    if (!br) {
+        /* build.bat 只链 kernel32 / user32；gdi32 是 BigShot.exe 的静态导入，一定在。 */
+        typedef HGDIOBJ (WINAPI *GetStockObject_t)(int);
+        HMODULE gdi = GetModuleHandleA("gdi32.dll");
+        GetStockObject_t gso = gdi ? (GetStockObject_t)GetProcAddress(gdi, "GetStockObject") : NULL;
+        if (gso) br = (HBRUSH)gso(BLACK_BRUSH);
+    }
+    return br;
+}
+
+static void fs_paint_bars(HWND h, HDC dc)
+{
+    RECT cr;
+    fsv_rect bars[4];
+    HBRUSH br = fs_black_brush();
+    int n, i;
+
+    if (!dc || !br || !GetClientRect(h, &cr)) return;
+    n = fsv_bars(cr.right, cr.bottom, &g_fs.pic, bars);
+    for (i = 0; i < n; i++)
+        FillRect(dc, (const RECT *)&bars[i], br);       /* fsv_rect 和 RECT 同布局 */
+}
+
+static int fs_cursor_in_picture(HWND h)
+{
+    POINT pt;
+    if (!GetCursorPos(&pt) || !ScreenToClient(h, &pt)) return 1;   /* 我们自己调 ⇒ 钩子原样放行 */
+    return pt.x >= g_fs.pic.l && pt.x < g_fs.pic.r && pt.y >= g_fs.pic.t && pt.y < g_fs.pic.b;
+}
+
+static LRESULT CALLBACK fs_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (g_fs.on) {
+        switch (msg) {
+        case WM_ERASEBKGND:
+            /* 原版回 1 不画（画面那块交给 Present）；黑边那几块没人画 ⇒ 我们涂黑。 */
+            fs_paint_bars(h, (HDC)wp);
+            return 1;
+        case WM_SETCURSOR:
+            /* 原版对整个客户区一律 SetCursor(NULL)，光标靠游戏自己画在画面里。黑边里、
+               或者游戏失焦时（失焦原版不画 ⇒ 那个光标停在最后一帧）就看不见光标了 ⇒
+               这两种给系统箭头。抓着鼠标（战斗）时照原版藏。 */
+            if (LOWORD(lp) == HTCLIENT && !fs_mouse_captured()
+                && (!fs_app_active() || !fs_cursor_in_picture(h))) {
+                SetCursor(LoadCursorW(NULL, MAKEINTRESOURCEW(32512)));   /* IDC_ARROW */
+                return TRUE;
+            }
+            break;
+        case WM_DISPLAYCHANGE:
+            fs_fill_monitor(h, "桌面分辨率变了，重新贴满");
+            break;
+        }
+    }
+    return CallWindowProcW(g_fs.prev_proc, h, msg, wp, lp);
+}
+
+/* 建设备前：记下主窗口并子类化（游戏从窗口模式按 F11 切全屏时也要用）；
+   游戏要独占全屏就换成无边框，返回 1（`win` 里是换好的参数）。 */
+static int fs_before_create_device(const D3DPRESENT_PARAMETERS *pp, HWND focus,
+                                   D3DPRESENT_PARAMETERS *win)
+{
+    HWND w = pp->hDeviceWindow ? pp->hDeviceWindow : focus;
+
+    if (pp->BackBufferWidth && pp->BackBufferHeight) {
+        g_fs.ui_w = (long)pp->BackBufferWidth;
+        g_fs.ui_h = (long)pp->BackBufferHeight;
+    }
+    /* 两组钩子（user32 四个 + 游戏 Present 包装 / 设备恢复）没齐就整个不换。游戏那两个是补丁
+       线程装的（要等解壳），这里是登录之后才走到 —— 万一还没装上，这一局就照原版独占全屏。 */
+    if (!g_fs_ready || !g_fs_game_hooked || !w) {
+        if (!pp->Windowed)
+            bslog("FS      !! 钩子没齐（user32=%d 游戏=%ld）—— 这一局照原版独占全屏",
+                  g_fs_ready, (long)g_fs_game_hooked);
+        return 0;
+    }
+    if (!g_fs.hwnd) {
+        g_fs.hwnd = w;
+        g_fs.prev_proc = (WNDPROC)SetWindowLongPtrW(w, GWLP_WNDPROC, (LONG_PTR)fs_wndproc);
+        if (!g_fs.prev_proc) {
+            bslog("FS      !! 主窗口子类化失败 err=%lu —— 不换无边框，照原版独占全屏",
+                  (unsigned long)GetLastError());
+            g_fs.broken = 1;
+        }
+    }
+    if (pp->Windowed || g_fs.broken || w != g_fs.hwnd) return 0;
+    fs_set(1, "游戏按独占全屏建设备");
+    fs_fill_monitor(w, "启动即全屏");
+    *win = *pp;                                  /* 改拷贝：栈上那份原样留给游戏 */
+    fs_make_windowed(win);
+    return 1;
+}
+
+/* ---- 放大：D3D 自己的 Present(pDestRect) 是**点采样**（2026-10-06 本机实测：1 像素的竖线
+   放大后两边是纯黑），1.40625 倍下界面里 1 像素的笔画一会儿 1 像素宽、一会儿 2 像素宽，字发毛。
+   ⇒ 建一条盖满客户区的附加交换链，每帧把游戏那张 1024×768 后台缓冲 StretchRect(LINEAR)
+   进画面矩形、黑边 ColorFill，再 Present 这条链（实测 1 像素线变成两级灰的平滑过渡）。
+   哪一步不成就退回 Present(pDestRect)（所以设备那份参数仍是 COPY）。 ---- */
+static void fs_drop_swapchain(void)
+{
+    if (g_fs.sc) {
+        IDirect3DSwapChain9_Release(g_fs.sc);
+        g_fs.sc = NULL;
+    }
+}
+
+static int fs_ensure_swapchain(IDirect3DDevice9 *dev)
+{
+    RECT cr;
+    D3DPRESENT_PARAMETERS pp;
+
+    if (!GetClientRect(g_fs.hwnd, &cr) || cr.right <= 0 || cr.bottom <= 0) return 0;
+    if (g_fs.sc && g_fs.sc_w == cr.right && g_fs.sc_h == cr.bottom) return 1;
+    fs_drop_swapchain();                         /* 客户区变了（改桌面分辨率）就按新尺寸重建 */
+    ZeroMemory(&pp, sizeof(pp));
+    pp.BackBufferWidth = (UINT)cr.right;
+    pp.BackBufferHeight = (UINT)cr.bottom;
+    pp.BackBufferFormat = D3DFMT_UNKNOWN;        /* 窗口模式：跟桌面一致 */
+    pp.BackBufferCount = 1;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;       /* 每帧画面 + 黑边整张重填 */
+    pp.hDeviceWindow = g_fs.hwnd;
+    pp.Windowed = TRUE;
+    pp.PresentationInterval = g_fs.interval;     /* 和游戏要的一样（默认 = 垂直同步） */
+    if (FAILED(IDirect3DDevice9_CreateAdditionalSwapChain(dev, &pp, &g_fs.sc))) {
+        g_fs.sc = NULL;
+        return 0;
+    }
+    g_fs.sc_w = cr.right;
+    g_fs.sc_h = cr.bottom;
+    return 1;
+}
+
+/* 这一帧用双线性放大 Present；做成了返回 1、HRESULT 放进 *out。设备丢了也返回 1、
+   *out = D3DERR_DEVICELOST —— 原样交回游戏，走它自己的 Reset（那时我们会放掉交换链）。
+   这台机器上放大本身走不通才返回 0：调用方走退路，直到下一次 Reset 再试（事件，不按次数）。 */
+static int fs_present_scaled(IDirect3DDevice9 *dev, HRESULT *out)
+{
+    IDirect3DSurface9 *bb = NULL, *big = NULL;
+    fsv_rect bars[4];
+    int n, i, ok = 0;
+
+    if (g_fs.no_scale) return 0;
+    if (fs_ensure_swapchain(dev)
+        && SUCCEEDED(IDirect3DDevice9_GetBackBuffer(dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))
+        && SUCCEEDED(IDirect3DSwapChain9_GetBackBuffer(g_fs.sc, 0, D3DBACKBUFFER_TYPE_MONO, &big))) {
+        n = fsv_bars(g_fs.sc_w, g_fs.sc_h, &g_fs.pic, bars);
+        for (i = 0; i < n; i++)
+            IDirect3DDevice9_ColorFill(dev, big, (const RECT *)&bars[i], D3DCOLOR_XRGB(0, 0, 0));
+        if (SUCCEEDED(IDirect3DDevice9_StretchRect(dev, bb, NULL, big, (const RECT *)&g_fs.pic,
+                                                   D3DTEXF_LINEAR))) {
+            *out = IDirect3DSwapChain9_Present(g_fs.sc, NULL, NULL, NULL, NULL, 0);
+            ok = 1;
+        }
+    }
+    if (big) IDirect3DSurface9_Release(big);
+    if (bb) IDirect3DSurface9_Release(bb);
+    if (!ok && FAILED(IDirect3DDevice9_TestCooperativeLevel(dev))) {
+        *out = D3DERR_DEVICELOST;                /* 不是放大的问题，是设备丢了 */
+        return 1;
+    }
+    if (!ok) g_fs.no_scale = 1;
+    if (ok != g_fs.scaled) {                     /* 按状态翻转记一行 */
+        g_fs.scaled = ok;
+        bslog("FS      画面放大：%s", ok ? "附加交换链 + 双线性 StretchRect"
+                                       : "!! 附加交换链 / StretchRect 不成，退回驱动放大（点采样），"
+                                         "下一次 Reset 再试");
+    }
+    return ok;
+}
+
+/* ---- Present / Reset 钩在**游戏自己的两个函数**上，不钩设备 vtable ----
+   ★ 2026-10-06 实测（会话 65）：D3D9 设备的派发表在堆上，录状态块（BeginStateBlock /
+     EndStateBlock —— D3DX 精灵 / 字体在设备重置后会录）时会把槽位**抄回原函数**，挂在
+     槽位上的钩子当场失效（游戏里表现：F11 切全屏后第一帧放大，之后整屏横向拉伸，
+     切回窗口时的 Reset 也没进来）；槽位里放的函数本身还会随时机变（刚建完设备时 Reset
+     槽指的不是真正的 Reset）⇒ d3d9 这一层都靠不住。
+   ⇒ 钩游戏的 Present 包装 `0x5bfcef`（游戏的 Present 全经过它）和设备恢复 / 重建例程
+     `0x5bf960`（游戏的 Reset 全在它里面），补丁线程装，和 RendererInit 钩子同一页同一线程。 */
+#define FS_GAME_PRESENT_VA  0x005BFCEFu  /* Renderer::Present 包装：thiscall(src, dst, hwnd)，ret 0xc */
+#define FS_GAME_RESET_VA    0x005BF960u  /* 设备恢复 / 重建：thiscall，ret；Reset(&r+8) 在 0x5bf9cc / 0x5bfa42 */
+#define FS_PRESENT_HR_VA    0x006E9880u  /* 包装把 Present 的 HRESULT 记在这 */
+#define FS_FRAME_STAT_A_VA  0x006E9404u  /* 包装每次 Present 完清 0 的两格 */
+#define FS_FRAME_STAT_B_VA  0x006E9408u
+static const unsigned char FS_GAME_PRESENT_SIG[15] = {
+    0x55, 0x8B, 0xEC, 0x53, 0x56,           /* push ebp / mov ebp,esp / push ebx / push esi   */
+    0x8B, 0xF1, 0x33, 0xDB,                 /* mov esi,ecx / xor ebx,ebx                      */
+    0x38, 0x9E, 0x91, 0x02, 0x00, 0x00      /* cmp [esi+0x291],bl（全屏 ⇒ 两个矩形清 NULL）   */
+};
+static const unsigned char FS_GAME_RESET_SIG[13] = {
+    0x83, 0xEC, 0x20, 0x55, 0x56, 0x57,     /* sub esp,0x20 / push ebp / push esi / push edi  */
+    0x68, 0xF4, 0x01, 0x00, 0x00,           /* push 500（Sleep(500)）                         */
+    0x8B, 0xF1                              /* mov esi,ecx                                    */
+};
+
+/* 设备恢复例程：游戏要全屏（它自己的 `[r+0x291]`）就把 `[r+8]` 原地改成窗口模式再交原函数。
+   F11 / 设定切模式（`0x5bfd43` 按 `[r+0x291]` 重建参数后尾跳到这）、设备丢失后的恢复都走这。 */
+static LONG __fastcall det_fs_game_reset(void *r, void *edx_unused)
+{
+    unsigned char *rr = (unsigned char *)r;
+    (void)edx_unused;
+
+    /* 附加交换链还活着 Reset 必失败（实测 D3DERR_INVALIDCALL）—— 不管什么模式都先放掉，
+       下一帧 Present 时按需再建；放大走不通的标记也在这里清（Reset 之后再试一次）。 */
+    fs_drop_swapchain();
+    g_fs.no_scale = 0;
+    if (g_fs_ready && !g_fs.broken && g_fs.prev_proc && !IsBadReadPtr(rr, 0x292)) {
+        if (rr[0x291]) {
+            /* 窗口几何由随后 SetDisplayMode 那句 MoveWindow 摆（det_MoveWindow）。 */
+            fs_make_windowed((D3DPRESENT_PARAMETERS *)(rr + 8));
+            fs_set(1, "游戏要全屏，设备按窗口模式 Reset");
+        } else {
+            fs_set(0, "游戏切到窗口模式");
+        }
+    }
+    return s_fs_game_reset(r, NULL);
+}
+
+/* Present 包装：无边框时自己放大 Present，再照抄原包装的收尾（`0x5bfd19..0x5bfd38`：记
+   HRESULT、失败就调设备恢复例程、清那两格）；不是无边框就原样交原函数。 */
+static LONG __fastcall det_fs_game_present(void *r, void *edx_unused,
+                                           const RECT *src, const RECT *dst, HWND override_wnd)
+{
+    IDirect3DDevice9 *dev;
+    HRESULT hr;
+    (void)edx_unused;
+
+    if (!g_fs.on || src || dst || override_wnd || !g_fs.hwnd || !fsv_valid(&g_fs.pic)
+        || IsIconic(g_fs.hwnd) || IsBadReadPtr(r, 8))
+        return s_fs_game_present(r, NULL, src, dst, override_wnd);
+    dev = *(IDirect3DDevice9 * const *)((const unsigned char *)r + 4);
+    if (!fs_present_scaled(dev, &hr))            /* 退路：驱动放大（点采样） */
+        hr = IDirect3DDevice9_Present(dev, NULL, (const RECT *)&g_fs.pic, NULL, NULL);
+    *(volatile LONG *)FS_PRESENT_HR_VA = hr;
+    if (FAILED(hr))
+        hr = ((fs_game_reset_t)FS_GAME_RESET_VA)(r, NULL);   /* 经入口走，det_fs_game_reset 照样拦 */
+    *(volatile LONG *)FS_FRAME_STAT_A_VA = 0;
+    *(volatile LONG *)FS_FRAME_STAT_B_VA = 0;
+    return hr;
+}
+
+/* 补丁线程里装（要等解壳）。两个都钩上才算数；特征对不上就等下一轮。 */
+static int try_hook_borderless_game(void)
+{
+    if (g_fs_game_hooked || g_fs_game_tried) return 1;
+    if (IsBadReadPtr((const void *)FS_GAME_PRESENT_VA, sizeof(FS_GAME_PRESENT_SIG))
+        || memcmp((const void *)FS_GAME_PRESENT_VA, FS_GAME_PRESENT_SIG, sizeof(FS_GAME_PRESENT_SIG)) != 0
+        || IsBadReadPtr((const void *)FS_GAME_RESET_VA, sizeof(FS_GAME_RESET_SIG))
+        || memcmp((const void *)FS_GAME_RESET_VA, FS_GAME_RESET_SIG, sizeof(FS_GAME_RESET_SIG)) != 0)
+        return 0;                                /* 还没解壳到这里 */
+    InterlockedExchange(&g_fs_game_tried, 1);    /* 只装一次，失败也不再试 */
+    s_fs_game_reset = (fs_game_reset_t)install_inline_hook(
+        (void *)FS_GAME_RESET_VA, (void *)det_fs_game_reset, "Renderer::RecoverDevice");
+    s_fs_game_present = (fs_game_present_t)install_inline_hook(
+        (void *)FS_GAME_PRESENT_VA, (void *)det_fs_game_present, "Renderer::Present");
+    if (s_fs_game_reset && s_fs_game_present)
+        InterlockedExchange(&g_fs_game_hooked, 1);
+    else
+        bslog("FS      !! Present 包装 / 设备恢复钩子没装齐 —— 全屏照原版独占（切换会卡）");
+    return 1;
+}
+
+static void *WINAPI det_Direct3DCreate9(UINT sdk)
+{
+    void *d3d = s_Direct3DCreate9(sdk);
+    /* 游戏唯一的调用（`0x5bce75`）紧接着就是 RendererInit ⇒ CreateDevice 钩子赶在建设备之前。 */
+    if (d3d) try_hook_d3d_create_device(d3d);
+    return d3d;
+}
+
+static BOOL WINAPI det_ScreenToClient(HWND h, LPPOINT pt)
+{
+    BOOL ok = s_ScreenToClient(h, pt);
+    if ((UINT_PTR)_ReturnAddress() == FS_RET_CURSOR_READ && ok && pt && g_fs.on)
+        fs_client_to_ui(pt);                 /* 原版接着看模式 2 才 ×1.28，模式 0 原样用 */
+    return ok;
+}
+
+static BOOL WINAPI det_ClientToScreen(HWND h, LPPOINT pt)
+{
+    if ((UINT_PTR)_ReturnAddress() == FS_RET_CAPTURE_OFF && pt && g_fs.on)
+        fs_ui_to_client(pt);                 /* 虚拟光标是界面坐标，先换回客户区 */
+    return s_ClientToScreen(h, pt);
+}
+
+static BOOL WINAPI det_ClipCursor(const RECT *rc)
+{
+    /* 放开抓取那句 ClipCursor(NULL)：游戏在前台（失焦时原版先清 `[App+7]` 再放开抓取）
+       就改成夹在画面里 —— 大厅类阶段鼠标出不了画面（用户定的），切走自然放开。 */
+    if ((UINT_PTR)_ReturnAddress() == FS_RET_UNCLIP && !rc && g_fs.on
+        && g_fs.hwnd && !IsIconic(g_fs.hwnd) && fs_app_active())
+        rc = &g_fs.pic_screen;
+    return s_ClipCursor(rc);
+}
+
+static BOOL WINAPI det_MoveWindow(HWND h, int x, int y, int w, int hh, BOOL repaint)
+{
+    if ((UINT_PTR)_ReturnAddress() == FS_RET_MODE_MOVE && g_fs.on) {
+        fs_fill_monitor(h, "切到全屏（F11 / 设定）");
+        return TRUE;
+    }
+    return s_MoveWindow(h, x, y, w, hh, repaint);
+}
+
+/* d3d9 是 BigShot.exe 的静态导入，DllMain 时一般已经在；不在就等 install_hooks 那一轮
+   （和 iphlpapi 同一套，「模块在不在」是事实，不是时间）。幂等。 */
+static void install_borderless_d3d_hook(void)
+{
+    HMODULE d3d9;
+
+    if (s_Direct3DCreate9) return;
+    d3d9 = GetModuleHandleA("d3d9.dll");
+    if (!d3d9) {
+        bslog("HOOK    d3d9 尚未加载，Direct3DCreate9 钩子等下一轮");
+        return;
+    }
+    s_Direct3DCreate9 = (Direct3DCreate9_t)install_inline_hook(
+        (void *)GetProcAddress(d3d9, "Direct3DCreate9"),
+        (void *)det_Direct3DCreate9, "d3d9:Direct3DCreate9");
+    if (!s_Direct3DCreate9)
+        bslog("FS      !! Direct3DCreate9 钩不上 —— 只能靠 RendererInit 那一路挂 CreateDevice");
+}
+
+static void install_borderless_guard(void)
+{
+    HMODULE u32 = GetModuleHandleA("user32.dll");   /* bshook 自己静态导入了它 */
+
+    if (!u32) {
+        bslog("FS      !! 取不到 user32 —— 全屏照原版独占（切换会卡）");
+        return;
+    }
+    s_ScreenToClient = (ScreenToClient_t)install_inline_hook(
+        (void *)GetProcAddress(u32, "ScreenToClient"), (void *)det_ScreenToClient,
+        "user32:ScreenToClient");
+    s_ClientToScreen = (ClientToScreen_t)install_inline_hook(
+        (void *)GetProcAddress(u32, "ClientToScreen"), (void *)det_ClientToScreen,
+        "user32:ClientToScreen");
+    s_ClipCursor = (ClipCursor_t)install_inline_hook(
+        (void *)GetProcAddress(u32, "ClipCursor"), (void *)det_ClipCursor,
+        "user32:ClipCursor");
+    s_MoveWindow = (MoveWindow_t)install_inline_hook(
+        (void *)GetProcAddress(u32, "MoveWindow"), (void *)det_MoveWindow,
+        "user32:MoveWindow");
+    g_fs_ready = s_ScreenToClient && s_ClientToScreen && s_ClipCursor && s_MoveWindow;
+    if (!g_fs_ready)
+        bslog("FS      !! user32 那四个钩子没装齐 —— 全屏照原版独占（切换会卡）");
+    install_borderless_d3d_hook();
+}
+
 /* -------------------------------------------------------------------------- */
 /* 注册链接的点击：**客户端自己根本处理不了**，我们接管                        */
 /*                                                                            */
@@ -1633,6 +2178,8 @@ static void install_hooks(void)
 
     /* DllMain 那一轮 IPHLPAPI 万一还没加载，这里补装（幂等）。 */
     install_iphlpapi_hook();
+    /* d3d9 同理（无边框全屏的 Direct3DCreate9 钩子，X21）。 */
+    install_borderless_d3d_hook();
 
     u32 = GetModuleHandleA("user32.dll");
     if (!u32) { bslog("HOOK    user32 尚未加载, 等下一轮"); g_hooks_installed = 0; return; }
@@ -3431,6 +3978,11 @@ static int ime_focus_geometry(RECT *box, RECT *caret, const void **edit_out)
     caret->top    = ime_ui_to_client(y + cr[1], k);
     caret->right  = ime_ui_to_client(x + cr[2], k);
     caret->bottom = ime_ui_to_client(y + cr[3], k);
+    if (g_fs.on) {
+        /* 无边框全屏（X21）：模式 0 上面 k=1 算出来的还是界面坐标，换到客户区（画面矩形里）。 */
+        fs_ui_rect_to_client(box);
+        fs_ui_rect_to_client(caret);
+    }
     if (edit_out) *edit_out = edit;
     return 1;
 }
@@ -10182,6 +10734,9 @@ static LONG WINAPI det_d3d_create_device(void *d3d, unsigned adapter,
 {
     LONG hr;
     const DWORD *pp = (const DWORD *)present;
+    D3DPRESENT_PARAMETERS win_pp;
+    void *use = present;
+    int borderless = 0;
     if (pp && !IsBadReadPtr(pp, 14 * sizeof(DWORD))) {
         bslog("D3D     CreateDevice adapter=%u type=%u focus=%08X behavior=0x%08lX "
               "bb=%lux%lu fmt=%lu count=%lu windowed=%lu deviceWnd=%08X",
@@ -10189,9 +10744,22 @@ static LONG WINAPI det_d3d_create_device(void *d3d, unsigned adapter,
               (unsigned long)behavior, (unsigned long)pp[0],
               (unsigned long)pp[1], (unsigned long)pp[2],
               (unsigned long)pp[3], (unsigned long)pp[8], (unsigned)pp[7]);
+        /* 无边框全屏（X21）：游戏要独占全屏就换成窗口模式那份参数 */
+        borderless = fs_before_create_device((const D3DPRESENT_PARAMETERS *)present, focus, &win_pp);
+        if (borderless) use = &win_pp;
     }
     hr = s_d3d_create_device(d3d, adapter, device_type, focus, behavior,
-                             present, device_out);
+                             use, device_out);
+    if (borderless && hr < 0) {
+        /* 窗口模式建不起来（比如 16 位色后台缓冲在窗口模式下不支持）：这一局照原版
+           独占全屏，后面的 Reset 也不再换。 */
+        bslog("FS      !! 窗口模式建设备失败 HRESULT=0x%08X —— 这一局按原版独占全屏再建",
+              (unsigned)hr);
+        g_fs.broken = 1;
+        fs_set(0, "窗口模式建不起来");
+        hr = s_d3d_create_device(d3d, adapter, device_type, focus, behavior,
+                                 present, device_out);
+    }
     bslog("D3D     CreateDevice -> HRESULT=0x%08X device=%08X",
           (unsigned)hr,
           (unsigned)(UINT_PTR)(device_out && !IsBadReadPtr(device_out, sizeof(void *))
@@ -11575,6 +12143,16 @@ static DWORD WINAPI patch_thread(LPVOID param)
             bslog("SNOW    !! 未能装 SnowCipher hook（序言字节不符）");
     }
 
+    /* ★ 无边框全屏（X21）：游戏自己的 Present 包装 / 设备恢复例程（和下面 RendererInit 同一页、
+       同一条线程）。要赶在建设备（登录之后）之前装好；没装上 det_d3d_create_device 就不换，
+       这一局照原版独占全屏。 */
+    for (ticks = 0; !g_stop && !g_fs_game_tried && ticks < 200; ticks++) {
+        if (try_hook_borderless_game()) break;
+        Sleep(50);
+    }
+    if (!g_fs_game_tried)
+        bslog("FS      !! 未能装 Present 包装 / 设备恢复钩子（序言字节不符）—— 全屏照原版独占");
+
     /* 同样等到完整性校验窗口过去后再装，只记录参数和返回值，不改结果。 */
     for (ticks = 0; !g_stop && !g_render_hooked && ticks < 200; ticks++) {
         if (try_hook_render_init()) break;
@@ -11776,6 +12354,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 
         /* ★ 同理，Win 键护栏也得赶在 App 初始化装钩子之前（X_Mod §146）。 */
         install_winkey_guard();
+
+        /* ★ 无边框全屏（X21）：user32 四个调用点 + d3d9!Direct3DCreate9，同样必须
+           赶在游戏建窗口 / 建设备之前、别的线程起来之前。 */
+        install_borderless_guard();
 
         ready_event = open_loader_event(POPSHOT_BSHOOK_READY_ENV);
         if (!ready_event) {

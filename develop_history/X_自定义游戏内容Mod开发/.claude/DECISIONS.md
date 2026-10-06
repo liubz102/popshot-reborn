@@ -1898,3 +1898,19 @@ bsloader ⇄ bshook 握手的事件名。`BOT_DIAG_FIRE_ANYWHERE`（服务端取
 **钉住**：`test/test_hook_switches.py` —— hook 源码里不许出现 `BSHOOK_/POPSHOT_` + `KEEP_/NO_`，读的环境变量只许上面那几类（改坏 3/3）；
 原来 `test_notice` 里「每组 patch 都要有 `BSHOOK_KEEP_*` 逃生门」那条项目惯例**反过来了**，删掉。规矩写进 X_Mod CLAUDE.md 铁律 15 + agent 记忆。
 **否掉的**：只删这次的 WINKEY_LOCK、老的留着（用户原话「以前写的也都给我删了」）；`BSHOOK_NO_*` 当「功能开关」留着（它们关掉的都是修复 / 遥测，效果同样是退回原版）。
+
+## D107 · 全屏改无边框：**游戏仍以为自己在独占全屏**，只在边界上替它换；user32 那几个按返回地址只认原版那一处，Present / Reset 钩在游戏自己的两个函数上（§147 / §148 / §149，用户 2026-10-06「能改成和现代游戏一样的切换流畅度吗」→ 定「4:3 黑边」「大厅鼠标锁在画面里」）
+
+**选**：CreateDevice（IDirect3D9 vtable，DllMain 里钩 `Direct3DCreate9` 挂上）见 `Windowed=0` 改栈上那份拷贝；设备恢复例程 `0x5bf960` 按游戏自己的 `[r+0x291]` 原地改 `[r+8]` —— 都转窗口模式（刷新 0、count 1、COPY）；
+Present 包装 `0x5bfcef` 无边框时走盖满客户区的附加交换链 + `StretchRect(LINEAR)` 放大进 4:3 画面矩形，再照抄原包装收尾（不成退回 `Present(pDestRect)`，所以要 COPY）；这两处由补丁线程装，建设备时两组钩子齐了才换；
+窗口 WS_POPUP 盖满所在显示器、不置顶；user32 四钩：ScreenToClient `0x40f3ab`（客户区→界面）/ ClientToScreen `0x429735`（界面→客户区）/ ClipCursor `0x429749`（前台时夹画面）/ MoveWindow `0x40e440`（盖满 + 取消置顶）；
+子类窗口涂黑边、黑边里或失焦时给箭头光标；输入法位置同一套换算。换算只有 `hook/fsview.h` 一份（`test/hook/test_fsview.c` 全量往返）。
+**为什么让游戏以为还是独占**：保住原版「失焦不画不 Present」`0x40df71` ⇒ 后台设备丢失不会掉进 `0x5bf960` 的 10 秒重试 / Critical Error；F11 那条链、Present 清矩形都照原版走。
+**否掉的**：① 只改成桌面分辨率的独占全屏 —— 界面 / 视口写死 1024×768；② 原生分辨率独占 + 渲染重定向放大（用户追问「现代游戏选全屏也瞬切」）—— 现代游戏是原生分辨率 + Win10/11 全屏优化（底下就是无边框 + 独立翻转）+ DXGI 不丢资源；
+BigShot 分辨率≠桌面用不上全屏优化，硬做照样丢设备、重读贴图、开始菜单把游戏打出去；③ 独立翻转（D3D9Ex FLIPEX）—— 游戏建 MANAGED 池贴图 D3D9Ex 不许，收益 240Hz 下约 4ms；
+④ 让游戏以为是窗口模式（RendererInit / SetFullScreen 传 0，审查前那版）—— 丢掉「失焦不画」得补 TCL 守护，补丁在 patch_thread 上跟登录抢时机；⑤ 全局虚拟化坐标 API —— 战斗拽回 (500,400)、lParam 位移会被换错，d3d9 自己也调；
+⑥ `WM_WINDOWPOSCHANGING` 强拉几何 —— 最小化 / 置顶难兜，摆主窗口只有 `0x40e43a` 一处；⑦ DISCARD + pDestRect —— 文档不许（本机碰巧 S_OK），Present 一失败就进 Reset 循环；
+⑧ 只用驱动放大 —— 实测点采样，1.40625× 下 1 像素笔画忽宽忽窄；⑨ 不锁鼠标、黑边给箭头（审查建议）—— 用户选了锁；⑩ 声明 DPI 感知 —— 会缩小登录框等窗口；
+⑪ 钩 IDirect3DDevice9 的 vtable 槽位（第一版，冒烟时翻车）/ 槽位指向的 d3d9 内部函数 —— 录状态块会把槽位抄回原函数、Reset 槽指向还会变（§149），游戏函数只有 Present 包装 / 恢复例程两个入口，钩它们最稳。
+**代价**：F11 切换照旧一次 Reset（和以前一样）；全屏在后台不画（画面停在最后一帧，原版语义）；系统缩放 >100% 时再被放大一次略糊；充值浏览器（复活版用不到）边框对不齐；没有独立翻转（多一帧合成延迟）。
+**预案（没做，等 V215）**：审查提的「最小化时就来 WM_ACTIVATEAPP，战斗里抓鼠标把夹框夹在最小化矩形上」—— 若实机 Win+D 还原后鼠标卡，子类窗口在 SIZE_RESTORED 且 `[App+7]` 时按 `[Input+0x40c]` 重跑一次游戏自己的 SetMouseCapture。
