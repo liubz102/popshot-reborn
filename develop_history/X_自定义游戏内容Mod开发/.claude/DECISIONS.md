@@ -46,7 +46,7 @@ ch01 是纤细女性体型，和原画最接近；爱琳 ChrProps 点名的三�
 - **原先**（2026-09-15）是「白送 ≠ 取消等级解锁，照原版保留 4 级门，要试就设环境变量」。
   否掉它的不是技术理由，是**用户要的产品形态**：这是 Mod 分支，爱琳是送的，
   不该让新号先练到 4 级才能用。
-- ⚠ **别把它和 `BSHOOK_KEEP_IRENE_LOCK` 搞混**：后者是「整个角色回到原版」的总开关
+- ⚠ **别把它和 `BSHOOK_KEEP_IRENE_LOCK` 搞混**（那个开关 D106 已删）：后者是「整个角色回到原版」的总开关
   （九处一起不打，爱琳在三个面板里都不出现），不是 4 级门的选项，保留。
 - ⚠ 改了 `bshook.c` 就**必须 `hook\build.bat` 重编**，它会顺带刷
   `server/manifest-hook.json` 的哈希 —— 不刷的话服务端会判客户端「被篡改」强制更新。
@@ -348,7 +348,7 @@ jab / 格斗命中 / 强踢 / 冲刺两条 / 武打音）**全取同一个人** 
 中间那几帧命中侧**仍然打得着** —— 那时候就不该撒手。跟着同一个谓词走，两侧永远同进同退。
 
 **副作用**：对所有追踪弹生效（`ch01-03` / `ch102-02` 也吃到），方向一致，属于修好不是改味。
-`BSHOOK_KEEP_HOMING_DEAD=1` 可退回原版行为做对照。
+~~`BSHOOK_KEEP_HOMING_DEAD=1` 可退回原版行为做对照~~（D106 已删）。
 
 ## D19 · 全量测试的名单改成**现扫目录**，不再手写 `MODULES` 表
 
@@ -1186,7 +1186,7 @@ F02 的 `Cover/tr_x_10`（拉宽 3 倍的门框）会挡住浮箱下半截 —�
 `IpAddressList.IpAddress` 在 `+0x1B0`，因为客户端那段机器码就是按这两个数算的，
 对不上必须编译期就停，不能等运行期又崩一次。
 
-**★ 附带一个对照开关 `BSHOOK_NO_ADAPTERS_GUARD=1`**（不装护栏）。加它的唯一理由：
+**★ 附带一个对照开关 `BSHOOK_NO_ADAPTERS_GUARD=1`**（不装护栏；★ D106 已删，下面是当时的理由）。加它的唯一理由：
 验「修复前真的会崩」得能把护栏关掉，而「编一个没护栏的 DLL」会改掉
 `manifest-hook.json` 里的 SHA、让服务端拒绝这个客户端（D85）—— 环境变量能让
 **同一份二进制**跑出两种行为。2026-09-23 就是靠它做的 24 轮 A/B（§76）。
@@ -1569,8 +1569,8 @@ bot 自己冲刺服务端身体仍不动（V0.3bot §193）—— 用户随后�
 ## D82 · 格斗模式解锁 = `bshook` 新组 `MUTU_SITES` 五处；Festivalm01 照放、资源待补；称号说明去掉「不会触发」（§118 / §123，用户 2026-09-26「能不能解锁」「房间里也能切换」、2026-09-27「全部地图直接默认解锁」「地图可以先开放出来，缺失的资源以后补」）
 
 **选**：① G1 `0x43755e` `je`→`nop`（只放模式 2，频道码 10 那道不动）；② G2 `0x4659cc` / `0x4659e3` / `0x465a0a`：房间 ◀▶ 变成 生存 → 格斗 → 夺分 的环（**超出原版**，用户定）；
-③ G3 `0x40b273` `mov eax,[eax+0x30]` → `xor eax,eax / nop`：`RequiredQuestClear` 一律当 0，6 张 Boss 格斗场不用通关；④ `BSHOOK_KEEP_MUTU_LOCK=1` 整组回退，
-**`BSHOOK_KEEP_REGION_LOCK=1` 时跟着不打**（15 张格斗图全靠地区旁路进目录）；⑤ `map.ini` 一个字节不动；⑥ `560002` 说明改成「格斗模式对战时防御 +2%」。
+③ G3 `0x40b273` `mov eax,[eax+0x30]` → `xor eax,eax / nop`：`RequiredQuestClear` 一律当 0，6 张 Boss 格斗场不用通关；④ ~~`BSHOOK_KEEP_MUTU_LOCK=1` 整组回退，
+`BSHOOK_KEEP_REGION_LOCK=1` 时跟着不打~~（两个开关 D106 已删；15 张格斗图全靠地区旁路进目录）；⑤ `map.ini` 一个字节不动；⑥ `560002` 说明改成「格斗模式对战时防御 +2%」。
 **为什么**：藏法只有 G1 一处地区判据（§118）；G2 / G3 是用户要的体验；Festivalm01 用户要先放出来，补资源记在 PROGRESS 待办。
 **否掉的**：
 ① 只打 G1、照原版「只在建房时选」—— 用户选了房间里也能切。
@@ -1773,7 +1773,7 @@ V0.3 §152 起是「每加一条规则各挂一次 `fits()`」，漏一条就犯
 
 **选**：bshook 两处跳板（`try_patch_mutu_zombie`）：① 打断 `0x50a6f8` 入口：断的是本机角色手上的招 ⇒ 记「欠一发收招」（角色 + GameContext 指针）；
 ② 格斗管理器 `0x4958eb` 入口（每帧、排在挑招 / 出招之前）：欠着、还是这一局这个角色、手上没新招、`[+0x17c]` 不在跑 ⇒ 照 `0x495a73` 原样发 `0x0016(座位, −1, [+0x2d0], 0)`
-（坐标取虚表 +8）、置 `[+0x5e0]` 等回环。死了也照发。收方一行不改。`BSHOOK_KEEP_MUTU_ZOMBIE=1` 保留原版。
+（坐标取虚表 +8）、置 `[+0x5e0]` 等回环。死了也照发。收方一行不改。~~`BSHOOK_KEEP_MUTU_ZOMBIE=1` 保留原版~~（D106 已删）。
 ③ 服务端 bot 同理（用户 2026-09-29「bot也改」）：`_cancel_melee` 记 `fight_retract_owed`；`_tick_bot` 里**这一格位移之后、`_fight_act` 之前**、`fight_block_left` 走完就补
 （`_pay_fight_retract`，坐标 / 先后同真人那台「角色更新 → 格斗管理器」；放在每格开头会差一步滑退）；躺着当场补；换图 / 新一局作废；**不置 `fight_settle`**（手上早没招，真人补完照常能动 —— 不削弱 bot，D94）。
 **为什么**：「这一招断了」只有出招者本机知道；别的机器只看得到自己的收包顺序，分不出「先出招后挨打（断了）」和「挨完打才出的新招」—— 按铁律 10 让知道的一方明说。
@@ -1872,3 +1872,45 @@ CPU 不受网速限 = 单线程排队；轮询常数 = 长轮询。D131「单飞
 ⑦ 豁免只做在结算里（闩和提示照样出现，说的和做的分家；改坏验证钉着）。
 **代价**：对战房主拿 `/hold` 调试完没解除就开局，全房间真人这一局白打（开局那句提示会说）。README 没写过这条防刷规则，没加（用户没点）。
 
+## D105 · Win 键：**不让原版装**那个全局低级键盘钩子 —— DllMain 里钩 `user32!SetWindowsHookExW`，只拒「WH_KEYBOARD_LL + 过程 0x40a521」回 NULL（§146，用户 2026-10-06「帮我调查原因并修复」→「游戏在前台时也放开 Win」）
+
+**起因**：真全屏时原版装的全局 `WH_KEYBOARD_LL`（`0x40a521`）吞 Win / 菜单键 / Ctrl+Esc / Alt+Esc 还不看前台，游戏切到后台也替整个系统吃键（§146）。
+用户先要修「游戏外不能用」，看了第一版（前台才吞）后定**游戏在前台也放开** ⇒ 这个钩子根本不需要存在。
+**选**：DllMain 里 `install_winkey_guard()` 用 `install_inline_hook` 钩 user32 导出；条件只认 `id == WH_KEYBOARD_LL && fn == 0x40a521`，别的钩子原样放行。
+DllMain 跑在主线程的 LoadLibrary APC 里、游戏一行代码没跑 ⇒ 因果上早于 App 初始化，不靠时间。原版对 NULL 早有准备（§146 最后一条）。
+**否掉的**：① 第一版（会话 64 前半，没发出去）：钩子过程入口挂跳板，前台交原版、后台放行，每个 vk「按下定归属、抬起跟着走」防 Win 卡住 ——
+用户定前台也放开，整套删了（钩子留着也只剩每个按键都绕游戏主线程一圈：主线程卡住时全系统键盘跟着卡）；
+② 补游戏代码不让它装（`0x40d3e1 jne` 改 `jmp` / 改 `0x40a4cd push 0x40a521`）：解壳后才有这几个字节，得赶在 App 初始化之前打上 = 和主线程抢时机；
+③ 钩子过程改成一律放行：同 ① 的代价，钩子还在；④ 钩 IAT 槽 `[0x6e62b4]`：槽是解析桩惰性填的，同样要抢时机（§146 里 `CreateWindowExW` 那条同理）。
+**版本号**（用户定 0.5.1）：`tools/build-ver.config` + `config/server-ClientFilter.config`（历来一起抬）+ 根目录 `BUILD.ver` 的 `version` / `versionWire`
+（开发树的服务端和客户端都读它，不改则本机连自己被判「版本过旧」；其余字段是上次打包的，下次打包整份重写）。`manifest-hook.json` 由 `hook/build.bat`
+自动刷 V0.5.1；V0.5.0（`e5c2aa8d…`，09-30 已按它重发过包）不动。
+**代价**：真全屏时在游戏里按 Win 会弹开始菜单、把游戏打出独占全屏（最小化 + 设备丢失 / Reset，D3D 那几处守护在）—— 用户要的就是这个。窗口模式原版本来不装，不受影响。
+
+## D106 · bshook 里「退回原版行为」的开关**全删、以后不许再加**（用户 2026-10-06：「改了就是改了，加个开关把原版 bug 找回来有什么意义？这种永远用不着的开关就是垃圾代码，以前写的也都给我删了。并且写进你的项目记忆和管理文件」）
+
+**删了 26 个**：`BSHOOK_KEEP_` AFK_KICK / AIM_RING / CABINET_DESC / CLIENT_BONUS_TEXT / DASH_STALE_CRASH / DASH_VISUAL_CRASH / DRAKA_TRACING_RACE /
+GIFT_ICON_MISS / HOMING_DEAD / IME_CRASH / IRENE_LOCK / MAP_LEVEL_LOCK / MUTU_LOCK / MUTU_ZOMBIE / NM / NOTICE / PACK_DIR / PLAYER_LEVEL_LOCK /
+REGION_LOCK / RPT_CRASHES / SPLASH_VISUAL_CRASH / WEAPON_TABLE / WINKEY_LOCK（会话 64 自己刚加的），`BSHOOK_NO_` ADAPTERS_GUARD / MOVER_PHASE / PRESENCE。
+全部改成无条件装（原来「没设开关」那条路），行为和默认一模一样；旧文档（含 V0.1~V0.3 归档）里让人「设 X=1 退回 / 做对照」的说法一律作废。
+**留下的**（不改游戏行为，不算这一类）：诊断 `BSHOOK_*_DIAG` / `BSHOOK_VERBOSE_LOG`、实机核对用的 `BSHOOK_WEAPON_MODE`、启动脚本传配置的 `POPSHOT_*`、
+bsloader ⇄ bshook 握手的事件名。`BOT_DIAG_FIRE_ANYWHERE`（服务端取证开关）同理没动。
+**钉住**：`test/test_hook_switches.py` —— hook 源码里不许出现 `BSHOOK_/POPSHOT_` + `KEEP_/NO_`，读的环境变量只许上面那几类（改坏 3/3）；
+原来 `test_notice` 里「每组 patch 都要有 `BSHOOK_KEEP_*` 逃生门」那条项目惯例**反过来了**，删掉。规矩写进 X_Mod CLAUDE.md 铁律 15 + agent 记忆。
+**否掉的**：只删这次的 WINKEY_LOCK、老的留着（用户原话「以前写的也都给我删了」）；`BSHOOK_NO_*` 当「功能开关」留着（它们关掉的都是修复 / 遥测，效果同样是退回原版）。
+
+## D107 · 全屏改无边框：**游戏仍以为自己在独占全屏**，只在边界上替它换；user32 那几个按返回地址只认原版那一处，Present / Reset 钩在游戏自己的两个函数上（§147 / §148 / §149，用户 2026-10-06「能改成和现代游戏一样的切换流畅度吗」→ 定「4:3 黑边」「大厅鼠标锁在画面里」）
+
+**选**：CreateDevice（IDirect3D9 vtable，DllMain 里钩 `Direct3DCreate9` 挂上）见 `Windowed=0` 改栈上那份拷贝；设备恢复例程 `0x5bf960` 按游戏自己的 `[r+0x291]` 原地改 `[r+8]` —— 都转窗口模式（刷新 0、count 1、COPY）；
+Present 包装 `0x5bfcef` 无边框时走盖满客户区的附加交换链 + `StretchRect(LINEAR)` 放大进 4:3 画面矩形，再照抄原包装收尾（不成退回 `Present(pDestRect)`，所以要 COPY）；这两处由补丁线程装，建设备时两组钩子齐了才换；
+窗口 WS_POPUP 盖满所在显示器、不置顶；user32 四钩：ScreenToClient `0x40f3ab`（客户区→界面）/ ClientToScreen `0x429735`（界面→客户区）/ ClipCursor `0x429749`（前台时夹画面）/ MoveWindow `0x40e440`（盖满 + 取消置顶）；
+子类窗口涂黑边、黑边里或失焦时给箭头光标；输入法位置同一套换算。换算只有 `hook/fsview.h` 一份（`test/hook/test_fsview.c` 全量往返）。
+**为什么让游戏以为还是独占**：保住原版「失焦不画不 Present」`0x40df71` ⇒ 后台设备丢失不会掉进 `0x5bf960` 的 10 秒重试 / Critical Error；F11 那条链、Present 清矩形都照原版走。
+**否掉的**：① 只改成桌面分辨率的独占全屏 —— 界面 / 视口写死 1024×768；② 原生分辨率独占 + 渲染重定向放大（用户追问「现代游戏选全屏也瞬切」）—— 现代游戏是原生分辨率 + Win10/11 全屏优化（底下就是无边框 + 独立翻转）+ DXGI 不丢资源；
+BigShot 分辨率≠桌面用不上全屏优化，硬做照样丢设备、重读贴图、开始菜单把游戏打出去；③ 独立翻转（D3D9Ex FLIPEX）—— 游戏建 MANAGED 池贴图 D3D9Ex 不许，收益 240Hz 下约 4ms；
+④ 让游戏以为是窗口模式（RendererInit / SetFullScreen 传 0，审查前那版）—— 丢掉「失焦不画」得补 TCL 守护，补丁在 patch_thread 上跟登录抢时机；⑤ 全局虚拟化坐标 API —— 战斗拽回 (500,400)、lParam 位移会被换错，d3d9 自己也调；
+⑥ `WM_WINDOWPOSCHANGING` 强拉几何 —— 最小化 / 置顶难兜，摆主窗口只有 `0x40e43a` 一处；⑦ DISCARD + pDestRect —— 文档不许（本机碰巧 S_OK），Present 一失败就进 Reset 循环；
+⑧ 只用驱动放大 —— 实测点采样，1.40625× 下 1 像素笔画忽宽忽窄；⑨ 不锁鼠标、黑边给箭头（审查建议）—— 用户选了锁；⑩ 声明 DPI 感知 —— 会缩小登录框等窗口；
+⑪ 钩 IDirect3DDevice9 的 vtable 槽位（第一版，冒烟时翻车）/ 槽位指向的 d3d9 内部函数 —— 录状态块会把槽位抄回原函数、Reset 槽指向还会变（§149），游戏函数只有 Present 包装 / 恢复例程两个入口，钩它们最稳。
+**代价**：F11 切换照旧一次 Reset（和以前一样）；全屏在后台不画（画面停在最后一帧，原版语义）；系统缩放 >100% 时再被放大一次略糊；充值浏览器（复活版用不到）边框对不齐；没有独立翻转（多一帧合成延迟）。
+**预案（没做，等 V215）**：审查提的「最小化时就来 WM_ACTIVATEAPP，战斗里抓鼠标把夹框夹在最小化矩形上」—— 若实机 Win+D 还原后鼠标卡，子类窗口在 SIZE_RESTORED 且 `[App+7]` 时按 `[Input+0x40c]` 重跑一次游戏自己的 SetMouseCapture。

@@ -215,33 +215,11 @@ static ULONG WINAPI det_GetAdaptersInfo(ipa_info_t *buf, ULONG *size)
 /* 装钩子。幂等；IPHLPAPI 还没加载就直接回来，让下一个调用点再试              */
 /* （DllMain 一次、install_hooks 一次）——「模块在不在」是事实，不是时间。      */
 /* -------------------------------------------------------------------------- */
-/* ★ 对照开关：`BSHOOK_NO_ADAPTERS_GUARD=1` ⇒ 不装护栏，客户端恢复成原样。
-   存在的理由只有一个 —— 验「修复前真的会崩」得能把护栏关掉，而重编一个
-   没护栏的 DLL 会改掉 `manifest-hook.json` 里的 SHA、让服务端拒绝这个客户端
-   （D85）。用环境变量就不用动 DLL，同一份二进制两种行为。
-   ⚠ 打开它 + 本机网卡 ≥ 11 块 = 主动复现 bug调查/27 的闪退。 */
-static int adapters_guard_disabled(void)
-{
-    char buf[8];
-    DWORD n = GetEnvironmentVariableA("BSHOOK_NO_ADAPTERS_GUARD", buf, sizeof(buf));
-    return n > 0 && n < sizeof(buf) && buf[0] != '0';
-}
-
 static void install_iphlpapi_hook(void)
 {
     HMODULE iph;
 
     if (s_GetAdaptersInfo) return;
-
-    if (adapters_guard_disabled()) {
-        static int logged = 0;            /* 两个调用点，话只说一遍 */
-        if (!logged) {
-            logged = 1;
-            bslog("HOOK    ★BSHOOK_NO_ADAPTERS_GUARD 已设 —— 不装 GetAdaptersInfo 护栏，"
-                  "网卡 ≥ 11 块的机器会在加载页闪退（bug调查/27 的对照组）");
-        }
-        return;
-    }
 
     iph = GetModuleHandleA("IPHLPAPI.DLL");
     if (!iph) {

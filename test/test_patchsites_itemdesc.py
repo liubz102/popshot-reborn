@@ -225,8 +225,6 @@ class CabinetDescPatchTest(unittest.TestCase):
         self.assertNotEqual(base.c_define(self.src, "WTAB_OPCODE"),
                             base.c_define(self.src, "WDESC_OPCODE"))
         self.assertEqual(OTHER_SITE, base.c_define(self.src, "WDESC_SITE_OTHER"))
-        # 逃生门没被改名（实机排查时要靠它做对照组）
-        self.assertIn("BSHOOK_KEEP_CABINET_DESC", self.src)
 
 
 if __name__ == "__main__":

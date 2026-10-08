@@ -1696,7 +1696,7 @@ L: 0040F823  lea eax,[esi+0x1b0]         ; &Adapter->IpAddressList.IpAddress
 
 **★★ 本机 100% 复现过（2026-09-23）**：开发机默认 6 块网卡（所需 3840 字节，够用），
 装 5 块 Microsoft KM-TEST 环回适配器顶到 **11 块 ⇒ 所需 7040 字节 = 玩家 dump 里那个 `0x1B80`**，
-再用 `BSHOOK_NO_ADAPTERS_GUARD=1` 关掉护栏，`stop → start → drive.py login` 跑批：
+再用 `BSHOOK_NO_ADAPTERS_GUARD=1`（D106 已删）关掉护栏，`stop → start → drive.py login` 跑批：
 **护栏关 16 轮崩 6 轮（约 1/3，批次间波动极大 —— 这就是「有概率」），护栏开 8 轮 0 崩**。
 每次都是 `0040F85F` / `EAX=1` / `EDI=2` / `EBP = ESP+0x88`，只有 `ESI` 不同
 （实测 `5F657275` = "ure_"、`00390036` = UTF-16 "69" —— **栈上的字符串碎片**，
@@ -1717,7 +1717,7 @@ L: 0040F823  lea eax,[esi+0x1b0]         ; &Adapter->IpAddressList.IpAddress
 `WS2 connect`（加载页「连接至服务器中」）→ `GetAdaptersInfo` → 崩。
 那片栈就是这么被弄脏的。
 
-**对照开关**：`BSHOOK_NO_ADAPTERS_GUARD=1` ⇒ 不装护栏（D57）。不能靠「编个没护栏的 DLL」
+~~**对照开关**：`BSHOOK_NO_ADAPTERS_GUARD=1` ⇒ 不装护栏（D57）~~（D106 已删）。不能靠「编个没护栏的 DLL」
 来做对照 —— 那会改掉 `manifest-hook.json` 的 SHA，服务端直接拒绝这个客户端（D85）。
 
 **怎么重新解 dump**：`Dump\*.mdmp` 是标准 minidump（`MiniDumpWithDataSegs`），不用 WinDbg ——
@@ -2929,3 +2929,61 @@ D60 把炸点改成 `hit.free`（被挡住的**前一个**整数点），比旧�
   非 2 时 `mov byte [ctl+0x20],1`）—— 🤔 就是 V147 说的「道具项变灰」。服务端 `lobby.item_mode_of` 同口径：实机 `args=(1, 2, 1)` 那 18 次照样判「道具模式=否」。
 - 个人 / 组队：`0x465685` 那一段不碰别的控件，`lobby.team_layout_of` 也只看 `arguments[0]`。⚠ 可本机 + `bug调查` 全部日志里格斗房**建房 131 次、换房参数 116 次
   全是 `args=(1, 2, …)` 组队战**（生存 / 夺分的个人战上千次）—— 是没人切，还是别处拦着（建房框 `0x437a11` 那一路没读完），没核到底。⇒ 奖励表个人 / 组队两档都给。
+
+## §146 ★★★★ 游戏一开、整个系统的 Win 键就没了 = 原版**真全屏**时装了个**全局**低级键盘钩子，吞 Win / 菜单键 / Ctrl+Esc / Alt+Esc 却**不看前台**，退出才卸（🔍逐指令 + ✅用户出事那两次的日志 `windowed=0`）
+
+- **装**：App 初始化 `0x40d3d7 cmp [App+0x98],0 / jne` —— `+0x98` = `UserConfig.ini` 的 `FullScreen`（`0x40cfde`，读 `0x41139e`）。**为 0 才装**，
+  而这个客户端 0 才是真全屏（V0.1 §55；同一个值 `0x40d4ab sete` 传给建设备）。`0x40a461`：`[obj]==1`（NT；`0x40a43e` 是 `GetVersion` 判 9x / NT
+  的写法 `cmp eax,0x80000000`，那一格在 dump 里指向壳的桩）⇒ `0x40a4c7 SetWindowsHookExW(WH_KEYBOARD_LL=13, 0x40a521, hInst, 0)`
+  （unicows 转接槽 `[0x6e62b4]`），句柄 `[0x72e2a0]`。**卸**：只有 App 收尾（`0x40d9df` 里 `0x40db95` 删 `[App+0x50]` 那个钩子对象）`0x40dd0e → 0x40a452 → [0x6373fc] UnhookWindowsHookEx`。
+  ⇒ 最小化 / 切到别的程序，钩子照样替整个系统吃键。（`[0x6373fc]` / `[0x637414]` / `[0x6373a4]` 拿本机 SysWOW64 user32 导出表按 RVA 对上，dump 里 user32 基址 `0x75630000`。）
+- **过程 `0x40a521`**：`nCode==0` 时 ① `LLKHF_ALTDOWN` + Esc ② 左 / 右 Ctrl 按着（`0x40a0bd` → `GetAsyncKeyState` 最高位）+ Esc ③ vk ∈ `0x5B~0x5D`
+  （LWin / RWin / Apps）⇒ `return 1`；其余 `CallNextHookEx`。**没有一句问前台**（微软《Disabling Shortcut Keys in Games》的范例要加 `g_bWindowActive`，它没加）。
+- **窗口模式（`FullScreen=1`）根本不装** ⇒ 开发树（预置 1）永远复现不了；用户出事时是真全屏（bshook 日志 `CreateDevice … windowed=0`）。
+- 别的路子都排除了：Win9x 那支装的是 `WH_KEYBOARD`（`0x40a47f`，NT 走不到）；`0x44264c` 的 `WH_GETMESSAGE` 带 `GetCurrentThreadId` = 线程钩子，管不到别的程序；
+  镜像里没有 `DirectInput` / `dinput` / `RegisterHotKey` 字样。bshook 自己从不调 `SetWindowsHookEx`。
+- 修法见 D105（干脆不让它装）。拒掉之后原版不受影响：返回值直接存进句柄（`0x40a4da`，NULL 就存 0）、调用方 `0x40d3e6` 不看返回值、
+  收尾 `0x40a452` 见句柄是 0 就不卸。游戏的调用经 ASProtect 解析桩，桩往槽里写的是 user32 导出的**真地址**（dump 里 `[0x6e6260]` = user32+0x30290
+  = `CreateWindowExW`）⇒ 钩导出拦得住。本机 SysWOW64 `SetWindowsHookExW` 序言 `8b ff 55 8b ec`；scratch 夹具拿真 `insn_reloc.h` 装上：
+  0x40a521 那一个（直接调、经 `GetProcAddress` 指针调）都回 NULL，线程 `WH_GETMESSAGE`（游戏 `0x44264c` 每种模式都装）/ 别人的 LL 钩子照装照卸。
+
+## §147 ★★★★ 全屏 Alt+Tab 卡 = 独占全屏每次切换都改显示器分辨率 + 设备丢失的恢复路径先睡 0.5 秒、贴图重新读盘；显示模式三态与运行中切换链（🔍逐指令 + ✅本机 D3D9 夹具 2026-10-06）
+
+- 渲染写死 1024×768（`[App+0x44/0x48]`、视口 `0x5bfc71`）；用户显示器 1920×1080@240 ⇒ 模式 0 每次切出 / 切回都改分辨率，显示器重新同步就黑 1~2 秒。
+- 唯一的设备丢失恢复 `0x5bf960`（Present 包装失败分支 `0x5bfd2c` + `0x5bfd43` 尾跳）：`Sleep(500)` → 释放 DEFAULT 池（贴图之后**按需从资源包重读解码**）→
+  `Reset(&r+8)`；失败就 10 轮 {`Sleep(1000)` + 抽一次消息 + Reset}，累计 >3 轮弹「Critical Error」。全镜像没有 `TestCooperativeLevel`。
+- 主循环 `0x40df71`：失焦（`[App+7]`==0）**且**全屏（`[r+0x291]`）⇒ 不画不 Present（独占切走时不进上面的循环；窗口模式在后台照画）。
+- `FullScreen` = `[App+0x98]` 三态：0 独占 / 1 窗口 1024×768 / 2 窗口 800×600（界面仍 1024×768）。运行中可切：F11（WndProc `0x40eeba`）、设定（`0x41f00a`）、
+  Lua（`0x526751`）→ `SetDisplayMode 0x40e33c`（ebx=App、edx=模式）：写 `[App+0x98]` → `Renderer::SetFullScreen 0x5bfd7c`（唯一调用 `0x40e388`；值变了才
+  `0x5bfd43` 按 `[r+0x291]` 重建 PP → Reset）→ `SetWindowLongW`（模式 0 = `0x86000000` WS_POPUP）→ `SetWindowPos`（模式 0 置顶，`0x40e409`）→ `MoveWindow`（`0x40e43a`，居中）。
+  启动：`CreateMainWindow 0x40e1da` 建隐藏窗口（模式 0 就是 WS_POPUP），RendererInit 之后 `0x40d8cb` 才 ShowWindow。
+- Present 包装 `0x5bfcef`：`[r+0x291]` 时把 src / dst 清 NULL；4 个调用点本来就传 NULL ⇒ 窗口模式下 D3D 把后台缓冲拉满客户区（800×600 就是这么缩的）。
+- `Direct3DCreate9` 只有 `0x5bce75` 一处，经 `0x610a10 jmp [0x637484]`；镜像里该槽 = d3d9 导出真地址（RVA 0x64B20 对上），d3d9.dll 在 BigShot.exe 的导入表里。
+- ✅ 本机 D3D9 夹具（窗口 1600×900、按游戏那份全屏参数转成窗口模式）：COPY + `Present(pDestRect)` 成功但**驱动放大是点采样**（1 像素竖线放大后两侧纯黑）；
+  附加交换链 + `StretchRect(LINEAR)` 成功（两级灰过渡）；附加交换链活着时 Reset 回 `D3DERR_INVALIDCALL`；DISCARD + pDestRect 本机也回 S_OK（文档不许）；最小化时 Present 都 S_OK；
+  窗口模式 R5G6B5 后台缓冲 `CheckDeviceType` 本机 OK。
+
+## §148 ★★★★ 鼠标两套与全部调用点：战斗里是「拽回 (500,400) 取位移」与客户区大小无关；大厅类阶段是客户区坐标直接当界面坐标（🔍逐指令）
+
+- InputSystem = `[0x72e2bc]`：`+0x40c` 抓着鼠标、`+0x418/+0x41c` 虚拟光标（界面坐标 float）。抓不抓看阶段 `vfn+0xa0`：GameStage / LoadingStage 抓，大厅 / 房间 / 商店不抓。
+- **抓**：`SetMouseCapture 0x429645(on)` = GetClientRect + ClientToScreen×2 + `ClipCursor(客户区)`（`0x429689`）、光标拽到客户区 (500,400)；
+  WM_MOUSEMOVE 按 lParam 离 (500,400) 的位移 × 灵敏度走虚拟光标、夹在 1024×768、再拽回 ⇒ 换窗口大小不影响手感。
+- **不抓**：`GetMousePos 0x429569` → `0x40f38f` = GetCursorPos `0x40f398` + ScreenToClient `0x40f3a5`，模式 2 才 ×1.28（`0x40f3ab`）。
+  **放开抓取**（每次 WM_ACTIVATEAPP、换阶段、F11 后都跑，不查原状态）：虚拟光标 → 模式 2 ×0.78125（`0x4296fd`）→ ClientToScreen `0x42972f` → SetCursorPos → `ClipCursor(NULL)` `0x429743`。
+- 拽光标助手 `0x40f3e5`（ClientToScreen `0x40f3ff` + SetCursorPos）：抓取时传客户区 (500,400)（`0x42961f` / `0x4296c2`），不抓时 `SetMousePos` 传界面坐标
+  （只在抓取初始化的过渡、受击抖动时；原版模式 2 也没换算）。
+- 全镜像引用：GetCursorPos / ScreenToClient / MoveWindow 各一处；ClientToScreen 四处（`0x40f3ff` / `0x429667` / `0x42972f` / `0x5bd273`）；ClipCursor 两处；
+  SetWindowPos 两处（`0x442441` 是充值浏览器自己的窗口）。没有 DirectInput / ShowCursor / D3D 硬件光标；光标是画在后台缓冲里的精灵。
+- WndProc：WM_ACTIVATEAPP 先写 `[App+7]` = (wParam≠0)（`0x40f188`）再 SetMouseCapture；WM_SETCURSOR 一律 `SetCursor(NULL)`；WM_ERASEBKGND 回 1 不画；WM_SIZE / WM_DISPLAYCHANGE 不处理。
+
+## §149 ★★★★★ **别钩 IDirect3DDevice9 的 vtable**：本机 D3D9 的设备派发表在堆上，录状态块时会把槽位**抄回原函数**，钩子当场失效；槽位里放的函数还会随时机变（✅ 本机夹具 + 实机日志 2026-10-06）
+
+- 现象（会话 65 第一版）：F11 切全屏后第一帧走进了 Present 钩子，之后整屏横向拉伸（钩子没再进），切回窗口时的 Reset 也没进 ⇒ 无边框关不掉、窗口被拉成 1920×1080。
+- 夹具（scratchpad，行为 0x44 同游戏）：vtable 指针在堆上（每次不同），Reset / Present / 建附加交换链 / 释放前后指针和槽位都不变；
+  但 `BeginStateBlock` + `EndStateBlock` 之后**指针不变、槽位被写回原函数**。D3DX 精灵 / 字体在设备重置后会录状态块 ⇒ 游戏里每次 Reset 后钩子都会被冲掉。
+- 再退一层钩槽位指向的 d3d9 内部函数也不行：刚建完设备时 Reset 槽指的是另一个函数（序言不同），钩它第一次 Reset 进不来。Present 实现（RVA 0xE6120）倒是稳的，
+  且附加交换链的 Present **不会**重入它 —— 但 Reset 不稳，整层放弃。
+- ⇒ 改钩**游戏自己的两个函数**（D107）：Present 包装 `0x5bfcef`（`55 8b ec 53 56`，`ret 0xc`；收尾 `0x5bfd19..0x5bfd42` = 记 HRESULT 到 `[0x6e9880]`、失败 `call 0x5bf960`、
+  清 `[0x6e9404]` / `[0x6e9408]`）和设备恢复例程 `0x5bf960`（`83 ec 20 55 56`，thiscall 无栈参数 `ret`；两处 `Reset(dev=[esi+4], &[esi+8])` 在 `0x5bf9cc` / `0x5bfa42`）。
+  两处都只从入口进（没有跳进前 5 字节的）。实机：F11 来回、黑边纯黑、鼠标 (944,422) → 界面 (500.0, 300.0)、夹框 = 画面矩形、切回窗口夹框放开。
+- IDirect3D9 的 vtable（`CreateDevice` 槽）在 d3d9 的 .rdata 里、不受影响，照旧经 `Direct3DCreate9` 挂。

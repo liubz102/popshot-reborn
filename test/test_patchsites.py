@@ -1014,12 +1014,10 @@ class MutuUnlockPatchTest(unittest.TestCase):
                 self.assertFalse(va < hi and lo < va + length,
                                  "%s 的 %08X 和格斗解锁的 %08X 重叠" % (name, va, lo))
 
-    def test_the_patch_thread_gates_it_behind_the_region_unlock(self):
-        # 14 张格斗图全靠地区旁路进目录（庆典那张已从 map.ini 删掉，D90）—— 地区锁保留时这组必须跟着不打。
-        body = self.src[self.src.index("格斗模式（무투전）解锁（X16 / D82）"):]
-        body = body[:body.index("登录公告")]
-        self.assertLess(body.index("region_lock_disabled()"), body.index("try_patch_mutu_unlock()"))
-        self.assertIn("mutu_lock_kept()", body)
+    def test_the_patch_thread_installs_it_after_the_region_unlock(self):
+        # 14 张格斗图全靠地区旁路进目录（庆典那张已从 map.ini 删掉，D90）。两组都无条件装（D106：不留退回原版的开关）。
+        body = self.src[self.src.index("static DWORD WINAPI patch_thread"):]
+        self.assertLess(body.index("try_patch_region_lock()"), body.index("try_patch_mutu_unlock()"))
 
 
 class MutuDiagProbeTest(unittest.TestCase):
@@ -1195,12 +1193,310 @@ class MutuZombieRetractPatchTest(unittest.TestCase):
                 self.assertFalse(s["va"] <= va < s["va"] + s["stolen"],
                                  "%s（%08X）落在 %s 偷走的字节里" % (m.group(1), va, prefix))
 
-    def test_the_patch_thread_installs_it_unless_kept(self):
+    def test_the_patch_thread_installs_it(self):
         body = self.src[self.src.index("static DWORD WINAPI patch_thread"):]
         self.assertIn("try_patch_mutu_zombie()", body)
-        self.assertLess(body.index("mutu_zombie_keep_original()"), body.index("try_patch_mutu_zombie()"))
-        keep = self.src[self.src.index("static int mutu_zombie_keep_original(void)"):]
-        self.assertIn('"BSHOOK_KEEP_MUTU_ZOMBIE"', keep[:keep.index("\n}\n")])
+
+
+class WinKeyGuardTest(unittest.TestCase):
+    """§146 / D105 —— 原版真全屏时装的全局低级键盘钩子 `0x40a521` 吞 Win 键还不看前台：干脆不让它装。
+
+    bshook 在 DllMain 里钩 `user32!SetWindowsHookExW`，只拒「WH_KEYBOARD_LL + 过程 0x40a521」这一个、回 NULL。
+    这个钩子只有**真全屏**才会被装（开发树是窗口模式，平时根本走不到），
+    「是谁在什么条件下装的」「拒掉之后原版受不受影响」都只能离线钉死。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        for path in (BSHOOK, IMG):
+            if not os.path.isfile(path):
+                raise unittest.SkipTest("不在源码仓库里（缺 %s），跳过" % path)
+        cls.img = load_image()
+        cls.src = c_source()
+        cls.proc = c_define(cls.src, "WINKEY_PROC_VA")
+
+    def test_it_is_the_proc_the_original_installs_as_a_global_ll_keyboard_hook(self):
+        # 0x40a4c7：SetWindowsHookExW(WH_KEYBOARD_LL=13, 0x40a521, hMod, dwThreadId=0)，经 ASProtect 解析桩的槽 [0x6e62b4]。
+        self.assertEqual(bytes.fromhex("6a00 ff742408 6821a54000 6a0d ff15b4626e00"),
+                         read_va(self.img, 0x0040A4C7, 19))
+        self.assertEqual(0x0040A521, self.proc)
+        # 全镜像只有这一处拿它当参数。
+        self.assertEqual(1, self.img.count(b"\x68" + struct.pack("<I", self.proc)))
+
+    def test_the_original_installs_it_only_in_real_fullscreen(self):
+        # App 初始化：[App+0x98] = UserConfig.ini 的 FullScreen（0 才是真全屏，V0.1 §55），为 0 才调 0x40a461。
+        self.assertEqual(bytes.fromhex("83bf9800000000 894750 7508 ff7508 e8"),
+                         read_va(self.img, 0x0040D3D7, 16))
+        rel = struct.unpack("<i", read_va(self.img, 0x0040D3E7, 4))[0]
+        self.assertEqual(0x0040A461, 0x0040D3EB + rel)
+
+    def test_the_original_eats_the_win_and_menu_keys(self):
+        # vk ∈ [VK_LWIN 0x5B, VK_APPS 0x5D] ⇒ bl = 1 ⇒ 返回 1（吞掉）—— 这就是不让它装的理由。
+        self.assertEqual(bytes.fromhex("8b06 83f85b 7207 83f85d 7702 b301"),
+                         read_va(self.img, 0x0040A56C, 14))
+
+    def test_a_refused_install_is_harmless_to_the_original(self):
+        # ① 返回值直接存进句柄 [0x72e2a0]（NULL 就存 0）。
+        self.assertEqual(bytes.fromhex("a3a0e27200"), read_va(self.img, 0x0040A4DA, 5))
+        # ② 调用方 0x40d3e6 不看 0x40a461 的返回值：下一句就是 push [0x72e1d8]。
+        self.assertEqual(bytes.fromhex("ff35d8e17200"), read_va(self.img, 0x0040D3EB, 6))
+        # ③ 收尾 0x40a452：句柄是 0 就直接 ret，不去 UnhookWindowsHookEx。
+        self.assertEqual(bytes.fromhex("833da0e2720000 7405"), read_va(self.img, 0x0040A452, 9))
+
+    def test_the_guard_refuses_only_that_one_hook(self):
+        body = self.src[self.src.index("static HHOOK WINAPI det_SetWindowsHookExW("):]
+        body = body[:body.index("\n}\n")]
+        refuse = body[:body.index("return NULL;")]
+        self.assertIn("id == WH_KEYBOARD_LL", refuse)
+        self.assertIn("(UINT_PTR)fn == WINKEY_PROC_VA", refuse)
+        # 别人的钩子原样放行，参数一个不改。
+        self.assertIn("return s_SetWindowsHookExW(id, fn, mod, tid);", body)
+
+    def test_the_guard_is_in_place_before_any_game_code_runs(self):
+        # DllMain 跑在主线程的 LoadLibrary APC 里，游戏一行代码都没跑；补丁线程那种「等解壳」的路子赶不上 App 初始化。
+        attach = self.src[self.src.index("case DLL_PROCESS_ATTACH:"):]
+        attach = attach[:attach.index("case DLL_PROCESS_DETACH:")]
+        self.assertLess(attach.index("install_winkey_guard();"),
+                        attach.index("CreateThread(NULL, 0, patch_thread"))
+        install = self.src[self.src.index("static void install_winkey_guard(void)"):]
+        install = install[:install.index("\n}\n")]
+        self.assertIn('"SetWindowsHookExW"', install)
+        self.assertIn("install_inline_hook(", install)
+
+
+def c_function(src, signature_start):
+    """从 `signature_start` 那一行起，截到第一个顶格的 `}`（函数体结束）。"""
+    body = src[src.index(signature_start):]
+    return body[:body.index("\n}\n")]
+
+
+def slot_refs(img, slot):
+    """代码区里引用某个 IAT 槽的指令：[(VA, 头两个字节)]（`ff 15` = call [槽]，`8b 35/3d` = 先取进寄存器）。"""
+    pat = struct.pack("<I", slot)
+    lo, hi = 0x401000 - IMAGE_BASE, 0x637000 - IMAGE_BASE
+    out, i = [], lo
+    while True:
+        j = img.find(pat, i, hi)
+        if j < 0:
+            return out
+        out.append((j - 2 + IMAGE_BASE, img[j - 2:j].hex()))
+        i = j + 1
+
+
+class BorderlessFullscreenTest(unittest.TestCase):
+    """X21 / §147 / D107 —— 全屏改无边框：游戏仍以为自己在独占全屏，只在边界上替它换。
+
+    bshook 不往游戏代码里写一个字节：D3D 那边钩 `Direct3DCreate9` → CreateDevice / Reset / Present，
+    user32 那边钩四个导出、**按返回地址**只认原版那一处调用。所以这里钉的是两样：
+    ① 那四个返回地址前面确实是原版那一句 `call [IAT]`，而且同一个 API 别的调用点**故意不换**；
+    ② 方案依赖的原版事实（失焦不画、Present 包装清矩形、F11 那条链的先后、Direct3DCreate9 只有一处）。
+    实机才能看的（Alt+Tab 快不快、黑边、手感）在 PROGRESS 的 V212~。
+    """
+
+    SLOT_GET_CURSOR = 0x0063735C
+    SLOT_SCREEN_TO_CLIENT = 0x00637360
+    SLOT_CLIENT_TO_SCREEN = 0x00637364
+    SLOT_CLIP_CURSOR = 0x006373C4
+    SLOT_SET_WINDOW_POS = 0x00637398
+    SLOT_MOVE_WINDOW = 0x00637400
+    SLOT_D3D_CREATE9 = 0x00637484
+
+    @classmethod
+    def setUpClass(cls):
+        for path in (BSHOOK, IMG):
+            if not os.path.isfile(path):
+                raise unittest.SkipTest("不在源码仓库里（缺 %s），跳过" % path)
+        cls.img = load_image()
+        cls.src = c_source()
+
+    def call_slot(self, slot):
+        return b"\xff\x15" + struct.pack("<I", slot)
+
+    # ---- ① 四个返回地址 ----
+
+    def test_each_return_address_follows_the_original_call(self):
+        for name, slot, want in (("FS_RET_CURSOR_READ", self.SLOT_SCREEN_TO_CLIENT, 0x0040F3AB),
+                                 ("FS_RET_CAPTURE_OFF", self.SLOT_CLIENT_TO_SCREEN, 0x00429735),
+                                 ("FS_RET_UNCLIP", self.SLOT_CLIP_CURSOR, 0x00429749),
+                                 ("FS_RET_MODE_MOVE", self.SLOT_MOVE_WINDOW, 0x0040E440)):
+            ret = c_define(self.src, name)
+            self.assertEqual(want, ret, name)
+            self.assertEqual(self.call_slot(slot), read_va(self.img, ret - 6, 6), name)
+
+    def test_cursor_read_and_move_window_have_no_other_caller(self):
+        # 读光标：全镜像只有 0x40f38f 这一对 GetCursorPos + ScreenToClient（大厅类阶段 + 抓鼠标那一刻取初值）。
+        self.assertEqual([(0x0040F398, "ff15")], slot_refs(self.img, self.SLOT_GET_CURSOR))
+        self.assertEqual([(0x0040F3A5, "ff15")], slot_refs(self.img, self.SLOT_SCREEN_TO_CLIENT))
+        # 摆主窗口：只有 SetDisplayMode 那一句 MoveWindow。
+        self.assertEqual([(0x0040E43A, "ff15")], slot_refs(self.img, self.SLOT_MOVE_WINDOW))
+        # SetWindowPos 另一处 0x442441 摆的是充值浏览器自己的窗口，不是主窗口 —— 没钩它。
+        self.assertEqual([(0x0040E409, "ff15"), (0x00442441, "ff15")],
+                         slot_refs(self.img, self.SLOT_SET_WINDOW_POS))
+
+    def test_the_other_client_to_screen_and_clip_calls_are_deliberately_left_alone(self):
+        # ClientToScreen 四处：0x40f3ff 是拽光标助手（战斗里拽回客户区 (500,400) 也走它）、0x429667 是抓鼠标时
+        # 算夹框、0x5bd273 是窗口模式下渲染器记客户区（结果没人读）—— 都是客户区坐标，不能换。只换 0x42972f。
+        self.assertEqual([(0x0040F3FF, "ff15"), (0x00429667, "8b35"), (0x0042972F, "ff15"),
+                          (0x005BD273, "8b3d")],
+                         slot_refs(self.img, self.SLOT_CLIENT_TO_SCREEN))
+        # ClipCursor 两处：抓鼠标时夹客户区（0x429689，不碰：(500,400) 必须在夹框里）、放开抓取（0x429743，换）。
+        self.assertEqual([(0x00429689, "ff15"), (0x00429743, "ff15")],
+                         slot_refs(self.img, self.SLOT_CLIP_CURSOR))
+        # 战斗里拽回 (500,400)：push 400 / mov eax, 500 / call 拽光标助手 0x40f3e5（两处）—— 客户区坐标。
+        for site in (0x004296C2, 0x0042961F):
+            self.assertEqual(bytes.fromhex("6890010000 b8f4010000"), read_va(self.img, site, 10))
+
+    def test_the_two_sites_are_where_the_800x600_mode_converts(self):
+        # 读光标：ScreenToClient 之后紧跟「模式 2 才 ×1.28」⇒ 模式 0 原样当界面坐标用 —— 换算就补在这。
+        self.assertEqual(self.call_slot(self.SLOT_SCREEN_TO_CLIENT)
+                         + bytes.fromhex("83bf9800000002 7522"),
+                         read_va(self.img, 0x0040F3A5, 15))
+        # 放开抓取：「模式 2 才 ×0.78125」之后 ClientToScreen(主窗口) → SetCursorPos → ClipCursor(NULL)。
+        self.assertEqual(bytes.fromhex("83be9800000002 7522"), read_va(self.img, 0x004296FD, 9))
+        self.assertEqual(bytes.fromhex("8d45f8 50 ff7640") + self.call_slot(self.SLOT_CLIENT_TO_SCREEN)
+                         + bytes.fromhex("ff75fc ff75f8 ff1568736300 6a00")
+                         + self.call_slot(self.SLOT_CLIP_CURSOR),
+                         read_va(self.img, 0x00429728, 33))
+
+    # ---- ② 方案依赖的原版事实 ----
+
+    def test_the_game_keeps_its_own_fullscreen_semantics(self):
+        # Present 包装：[r+0x291]（全屏）⇒ 两个矩形清成 NULL ⇒ 目标矩形只能在设备那一层给。
+        self.assertEqual(bytes.fromhex("389e91020000 7406 895d08 895d0c"),
+                         read_va(self.img, 0x005BFCF8, 14))
+        # 主循环：失焦（[App+7]==0）且全屏 ⇒ 不画不 Present —— 设备永远是窗口模式但这条照旧，
+        # 后台设备丢失就不会掉进 0x5bf960 的 Sleep(500) + 10 轮重试。
+        self.assertEqual(bytes.fromhex("385e07 7511 a100946e00 389891020000 0f85"),
+                         read_va(self.img, 0x0040DF71, 18))
+        # 重建参数 0x5bfd43：Windowed = ![r+0x291] ⇒ F11 / 改色深后的 Reset 每次都要再换。
+        self.assertEqual(bytes.fromhex("33c0 388191020000 0f94c0 83611400 894128"),
+                         read_va(self.img, 0x005BFD43, 18))
+
+    def test_f11_sets_the_mode_before_resetting_and_moving(self):
+        # SetDisplayMode：先写 [App+0x98]，再 Renderer::SetFullScreen（→ Reset），最后才 MoveWindow ——
+        # 所以 det_MoveWindow 看 g_fs.on 时，Reset 那一步已经把它翻好了。
+        self.assertEqual(bytes.fromhex("899398000000 50 e8"), read_va(self.img, 0x0040E381, 8))
+        rel = struct.unpack("<i", read_va(self.img, 0x0040E389, 4))[0]
+        self.assertEqual(0x005BFD7C, 0x0040E38D + rel)
+        self.assertLess(0x0040E388, 0x0040E43A)
+
+    def test_activation_flag_is_written_before_the_mouse_is_released(self):
+        # WM_ACTIVATEAPP：先写 [App+7] = (wParam != 0)，再 SetMouseCapture —— det_ClipCursor 靠它分前台 / 失焦。
+        self.assertEqual(bytes.fromhex("395d10 0f95c1 3bfb 884e07"), read_va(self.img, 0x0040F180, 11))
+        rel = struct.unpack("<i", read_va(self.img, 0x0040F1BB, 4))[0]
+        self.assertEqual(0x00429645, 0x0040F1BF + rel)
+        self.assertEqual(0x0072E2A4, c_define(self.src, "FS_APP_PP"))
+        # 抓鼠标的旗 [InputSystem+0x40c]，InputSystem = [0x72e2bc]（SetMouseCapture 末尾写它）。
+        self.assertEqual(bytes.fromhex("8a450c 5f 5e 88830c040000"), read_va(self.img, 0x0042974C, 11))
+        self.assertEqual(0x0072E2BC, c_define(self.src, "FS_INPUT_PP"))
+
+    def test_direct3dcreate9_is_called_once_and_straight_to_the_export(self):
+        self.assertEqual(b"\xff\x25" + struct.pack("<I", self.SLOT_D3D_CREATE9),
+                         read_va(self.img, 0x00610A10, 6))
+        self.assertEqual([(0x00610A10, "ff25")], slot_refs(self.img, self.SLOT_D3D_CREATE9))
+        callers = [a for a, t in _rel32_targets(self.img) if t == 0x00610A10]
+        self.assertEqual([0x005BCE75], callers)
+
+    # ---- 源码不变式 ----
+
+    def test_user32_detours_filter_by_return_address(self):
+        for det, ret in (("static BOOL WINAPI det_ScreenToClient(", "FS_RET_CURSOR_READ"),
+                         ("static BOOL WINAPI det_ClientToScreen(", "FS_RET_CAPTURE_OFF"),
+                         ("static BOOL WINAPI det_ClipCursor(", "FS_RET_UNCLIP"),
+                         ("static BOOL WINAPI det_MoveWindow(", "FS_RET_MODE_MOVE")):
+            body = c_function(self.src, det)
+            self.assertIn("(UINT_PTR)_ReturnAddress() == %s" % ret, body, det)
+            self.assertIn("g_fs.on", body, det)
+
+    def test_mapping_lives_in_one_header(self):
+        self.assertIn('#include "fsview.h"', self.src)
+        self.assertIn("fsv_client_to_ui(", c_function(self.src, "static void fs_client_to_ui("))
+        self.assertIn("fsv_ui_to_client(", c_function(self.src, "static void fs_ui_to_client("))
+        self.assertIn("fs_client_to_ui(pt)", c_function(self.src, "static BOOL WINAPI det_ScreenToClient("))
+        self.assertIn("fs_ui_to_client(pt)", c_function(self.src, "static BOOL WINAPI det_ClientToScreen("))
+        # 输入法候选框的位置也走同一套。
+        ime = c_function(self.src, "static int ime_focus_geometry(")
+        self.assertIn("if (g_fs.on)", ime)
+        self.assertIn("fs_ui_rect_to_client(box)", ime)
+
+    def test_only_a_fullscreen_request_is_converted(self):
+        conv = c_function(self.src, "static void fs_make_windowed(")
+        for line in ("pp->Windowed = TRUE;", "pp->FullScreen_RefreshRateInHz = 0;",
+                     "pp->BackBufferCount = 1;", "pp->SwapEffect = D3DSWAPEFFECT_COPY;"):
+            self.assertIn(line, conv)
+        # 建设备：游戏要独占才换，改的是拷贝（栈上那份原样留给游戏）；两组钩子没齐就不换。
+        create = c_function(self.src, "static int fs_before_create_device(")
+        self.assertIn("if (pp->Windowed || g_fs.broken", create)
+        self.assertIn("if (!g_fs_ready || !g_fs_game_hooked || !w)", create)
+        self.assertLess(create.index("*win = *pp;"), create.index("fs_make_windowed(win);"))
+        # 设备恢复：看游戏自己的全屏标志 [r+0x291]，不看 [r+8] 的 Windowed（我们原地改过它）。
+        reset = c_function(self.src, "static LONG __fastcall det_fs_game_reset(")
+        self.assertIn("if (rr[0x291])", reset)
+        self.assertIn("fs_make_windowed((D3DPRESENT_PARAMETERS *)(rr + 8));", reset)
+
+    def test_reset_releases_the_scaling_swap_chain_first(self):
+        # 附加交换链活着时 Reset 必失败（实测 D3DERR_INVALIDCALL）。
+        reset = c_function(self.src, "static LONG __fastcall det_fs_game_reset(")
+        self.assertLess(reset.index("fs_drop_swapchain();"), reset.index("s_fs_game_reset("))
+
+    def test_present_and_reset_hook_the_games_own_functions_not_the_device_vtable(self):
+        # D3D9 录状态块时会把设备派发表的槽位抄回原函数（本机实测）—— vtable 钩子会被冲掉。
+        self.assertNotIn("vft[16] = (void *)", self.src)
+        self.assertNotIn("vft[17] = (void *)", self.src)
+        for sig, va in (("FS_GAME_PRESENT_SIG", "FS_GAME_PRESENT_VA"),
+                        ("FS_GAME_RESET_SIG", "FS_GAME_RESET_VA")):
+            want = c_byte_array(self.src, sig)
+            addr = c_define(self.src, va)
+            self.assertEqual(want, read_va(self.img, addr, len(want)), sig)
+            self.assertEqual(1, self.img.count(want), sig + " 不唯一")
+            # 只从入口进：没有跳进被偷的那 5 个字节中间的。
+            self.assertEqual([], [(a, t) for a, t in _rel32_targets(self.img) if addr < t < addr + 5], va)
+        self.assertEqual(0x005BFCEF, c_define(self.src, "FS_GAME_PRESENT_VA"))
+        self.assertEqual(0x005BF960, c_define(self.src, "FS_GAME_RESET_VA"))
+
+    def test_the_present_wrapper_tail_we_replicate(self):
+        # 原包装：Present 之后记 HRESULT 到 [0x6e9880]、失败就 call 0x5bf960、清 [0x6e9404] / [0x6e9408]、ret 0xc。
+        self.assertEqual(bytes.fromhex("39058098 6e00 7405 a380986e00 3bc3 7d07 8bce e82ffcffff"
+                                       "5e 891d04946e00 891d08946e00 5b 5d c20c00"),
+                         read_va(self.img, 0x005BFD19, 42))
+        self.assertEqual(0x006E9880, c_define(self.src, "FS_PRESENT_HR_VA"))
+        self.assertEqual(0x006E9404, c_define(self.src, "FS_FRAME_STAT_A_VA"))
+        self.assertEqual(0x006E9408, c_define(self.src, "FS_FRAME_STAT_B_VA"))
+        body = c_function(self.src, "static LONG __fastcall det_fs_game_present(")
+        for piece in ("*(volatile LONG *)FS_PRESENT_HR_VA = hr;",
+                      "hr = ((fs_game_reset_t)FS_GAME_RESET_VA)(r, NULL);",
+                      "*(volatile LONG *)FS_FRAME_STAT_A_VA = 0;",
+                      "*(volatile LONG *)FS_FRAME_STAT_B_VA = 0;",
+                      "return s_fs_game_present(r, NULL, src, dst, override_wnd);"):
+            self.assertIn(piece, body)
+
+    def test_the_recovery_routine_resets_with_its_own_copy_and_plain_ret(self):
+        # 两处 Reset 都是 Reset(dev=[esi+4], &[esi+8])；末尾 add esp,0x20 / ret（没有栈参数）。
+        self.assertEqual(bytes.fromhex("8b4604 8b10 8d4e08 51 50 ff5240"), read_va(self.img, 0x005BF9C2, 13))
+        self.assertEqual(bytes.fromhex("8b4604 8b10 8d4e08 51 50 ff5240"), read_va(self.img, 0x005BFA38, 13))
+        self.assertEqual(bytes.fromhex("83c420 c3"), read_va(self.img, 0x005BFAD0, 4))
+
+    def test_the_game_hooks_go_in_before_the_renderer_hook(self):
+        pt = c_function(self.src, "static DWORD WINAPI patch_thread(")
+        self.assertLess(pt.index("try_hook_borderless_game()"), pt.index("try_hook_render_init()"))
+
+    def test_the_lobby_lock_only_touches_the_release_and_only_in_the_foreground(self):
+        body = c_function(self.src, "static BOOL WINAPI det_ClipCursor(")
+        for cond in ("!rc", "fs_app_active()", "!IsIconic(g_fs.hwnd)"):
+            self.assertIn(cond, body)
+
+    def test_installed_in_dllmain_before_any_thread(self):
+        attach = self.src[self.src.index("case DLL_PROCESS_ATTACH:"):]
+        attach = attach[:attach.index("case DLL_PROCESS_DETACH:")]
+        self.assertLess(attach.index("install_borderless_guard();"),
+                        attach.index("CreateThread(NULL, 0, patch_thread"))
+        install = c_function(self.src, "static void install_borderless_guard(")
+        for api in ('"ScreenToClient"', '"ClientToScreen"', '"ClipCursor"', '"MoveWindow"'):
+            self.assertIn(api, install)
+        self.assertIn("g_fs_ready = s_ScreenToClient && s_ClientToScreen && s_ClipCursor && s_MoveWindow;",
+                      install)
+        # d3d9 那一个：DllMain 时不在就由 install_hooks 补。
+        self.assertIn("install_borderless_d3d_hook();", c_function(self.src, "static void install_hooks("))
 
 
 if __name__ == "__main__":
