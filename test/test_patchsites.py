@@ -1499,5 +1499,180 @@ class BorderlessFullscreenTest(unittest.TestCase):
         self.assertIn("install_borderless_d3d_hook();", c_function(self.src, "static void install_hooks("))
 
 
+def call_target(img, va):
+    """`va` 处那条 E8 rel32 的落点。"""
+    assert read_va(img, va, 1) == b"\xe8", "%08X 不是 call rel32" % va
+    return va + 5 + struct.unpack("<i", read_va(img, va + 1, 4))[0]
+
+
+class FullscreenStretchOptionTest(unittest.TestCase):
+    """X22 / §150 / D108 —— 设定界面「全屏」拆成「全屏(保持比例)」「全屏(拉伸)」，存 UserConfig 的 FullScreenStretch。
+
+    bshook 不往游戏代码写字节以外的东西：钩设定对话框的初始化 / 单选 / 应用三处，调游戏自己的
+    CString、挂委托、设字体 / 贴图、UserConfig 取 / 存。这里钉两样：
+    ① `FSO_SITES` 那张表里每一处的首字节和镜像一致（实施时就是靠它判「解壳了、是这个版本」）；
+    ② 方案依赖的原版事实（三个模式按钮都转同一个单选、回填只在初始化末尾、确定才应用、按钮样式那一段）。
+    界面长什么样在 `test_option_ui`；实机在 PROGRESS 的 V218~。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        for path in (BSHOOK, IMG):
+            if not os.path.isfile(path):
+                raise unittest.SkipTest("不在源码仓库里（缺 %s），跳过" % path)
+        cls.img = load_image()
+        cls.src = c_source()
+
+    def sites(self):
+        body = self.src[self.src.index("static const fso_site FSO_SITES[] = {"):]
+        body = body[:body.index("};")]
+        out = []
+        for m in re.finditer(r"\{\s*(FSO_\w+_VA),\s*(\d+),\s*\{([^}]*)\},\s*\"([^\"]+)\"\s*\}", body):
+            sig = bytes(int(v, 0) for v in re.findall(r"0[xX][0-9A-Fa-f]+", m.group(3)))
+            out.append((m.group(1), int(m.group(2)), sig, m.group(4)))
+        return out
+
+    # ---- ① 特征表 ----
+
+    def test_every_site_signature_matches_the_image(self):
+        sites = self.sites()
+        self.assertEqual(10, len(sites), "FSO_SITES 少了 / 多了")
+        for define, n, sig, name in sites:
+            self.assertEqual(n, len(sig), name + " 长度字段和字节数不一致")
+            self.assertEqual(sig, read_va(self.img, c_define(self.src, define), n), name)
+
+    def test_the_addresses(self):
+        for name, va in (("FSO_INIT_VA", 0x0041DE2F), ("FSO_RADIO_VA", 0x0041EE98), ("FSO_APPLY_VA", 0x0041EFF5),
+                         ("FSO_BIND_VA", 0x0041F091), ("FSO_FONT_VA", 0x004251A7), ("FSO_SPRITE_VA", 0x0042C879),
+                         ("FSO_CSTR_CTOR_VA", 0x00401979), ("FSO_CSTR_FREE_VA", 0x00403610),
+                         ("FSO_CFG_GET_VA", 0x00410110), ("FSO_CFG_SET_VA", 0x00411EBE),
+                         ("FSO_CFG_PP", 0x0072E1D8), ("FSO_FONT_NAME_VA", 0x006E99DC)):
+            self.assertEqual(va, c_define(self.src, name), name)
+
+    def test_the_three_hooked_entries_are_only_entered_from_the_top(self):
+        # 内联钩偷前 5 / 5 / 10 字节：不许有 rel32 跳进被偷的那几个字节中间。
+        targets = _rel32_targets(self.img)
+        for va, stolen in ((0x0041DE2F, 5), (0x0041EE98, 5), (0x0041EFF5, 10)):
+            self.assertEqual([], [(a, t) for a, t in targets if va < t < va + stolen], hex(va))
+
+    # ---- ② 原版事实 ----
+
+    def test_init_takes_fullscreen_button_into_7f4_and_binds_it_on_9c(self):
+        self.assertEqual("FullScreenBtn".encode("utf-16-le") + b"\0\0", read_va(self.img, 0x0066143C, 28))
+        self.assertEqual(bytes.fromhex("683c146600"), read_va(self.img, 0x0041DF6B, 5))
+        self.assertEqual(bytes.fromhex("8983f4070000"), read_va(self.img, 0x0041DF93, 6))   # mov [ebx+0x7f4], eax
+        # 找子控件走 vf[0x18]（ff 50 18）。
+        self.assertEqual(bytes.fromhex("ff5018"), read_va(self.img, 0x0041DF87, 3))
+        self.assertEqual(0x18, c_define(self.src, "FSO_FIND_CHILD_VF"))
+        # 绑点击：委托 {0x41ee72, dlg, ?} 挂在 btn+0x9c，经 0x41f091。
+        self.assertEqual(bytes.fromhex("c745c072ee4100"), read_va(self.img, 0x0041E5FC, 7))
+        self.assertEqual(bytes.fromhex("059c000000"), read_va(self.img, 0x0041E60B, 5))
+        self.assertEqual(0x0041F091, call_target(self.img, 0x0041E612))
+        self.assertEqual(0x9C, c_define(self.src, "FSO_BTN_CLICK"))
+
+    def test_the_button_style_we_copy(self):
+        # FullScreenBtn 那一段：粗细 0x2bc / 字号 9 / 字体名 0x6e99dc / 字色 0xff505050 → 0x4251a7；
+        # 贴图 Buttons.smf 0x3c×0x33 → 0x42c879；+0x10c=0x12；0x42cf1d(eax=8, 1)。
+        self.assertEqual(bytes.fromhex("68bc020000"), read_va(self.img, 0x0041E544, 5))
+        self.assertEqual(bytes.fromhex("6a09 68dc996e00 b8505050ff"), read_va(self.img, 0x0041E555, 12))
+        self.assertEqual(0x004251A7, call_target(self.img, 0x0041E561))
+        self.assertEqual(bytes.fromhex("68ec126600"), read_va(self.img, 0x0041E56C, 5))
+        self.assertEqual("Images/NewUI2/Buttons.smf".encode("utf-16-le"), read_va(self.img, 0x006612EC, 50))
+        self.assertEqual(bytes.fromhex("56 56 6a33 6a3c"), read_va(self.img, 0x0041E57F, 6))
+        self.assertEqual(0x0042C879, call_target(self.img, 0x0041E596))
+        self.assertEqual(bytes.fromhex("c7800c01000012000000"), read_va(self.img, 0x0041E5B1, 10))
+        self.assertEqual(bytes.fromhex("6a08 58"), read_va(self.img, 0x0041E5C1, 3))
+        # 初始化末尾给十个按钮都清 byte [btn+0x164]（FullScreenBtn 那句在 0x41ebbe）；构造时是 1（0x42c2b8），
+        # 画字 0x42c993 见 1 走另一套字样 —— 第一版漏了它，冒烟时新按钮的字又粗又糊。
+        self.assertEqual(bytes.fromhex("8b83f4070000 c680640100 0000"), read_va(self.img, 0x0041EBBE, 13))
+        self.assertEqual(bytes.fromhex("c68664010000 01"), read_va(self.img, 0x0042C2B8, 7))
+        self.assertEqual(bytes.fromhex("80bb6401000001"), read_va(self.img, 0x0042C993, 7))
+        style = c_function(self.src, "static void fso_style_button(")
+        for piece in ("push 0x2BC", "push 9", "mov  eax, 0xFF505050", "L\"Images/NewUI2/Buttons.smf\"",
+                      "0x3C, 0x33, -1, -1", "(btn + 0x10C) = 0x12", "(btn + FSO_BTN_FLAGS) |= 8",
+                      "(btn + 0x130) = -1", "(btn + 0x134) = -1", "(btn + 0xB8) = 1",
+                      "*(unsigned char *)(btn + 0x164) = 0;", "btn + FSO_BTN_CLICK"):
+            self.assertIn(piece, style)
+
+    def test_the_three_mode_buttons_all_go_through_the_radio_routine(self):
+        # 0x41ee72 全屏(0) / 0x41ee7e 窗口(1) / 0x41ee8b 800×600(2)：mov edx, ecx; call 0x41ee98; ret 4。
+        for va, head, call in ((0x0041EE72, "33c0 8bd1", 0x0041EE76), (0x0041EE7E, "33c0 40 8bd1", 0x0041EE83),
+                               (0x0041EE8B, "6a02 58 8bd1", 0x0041EE90)):
+            self.assertEqual(bytes.fromhex(head), read_va(self.img, va, len(bytes.fromhex(head))), hex(va))
+            self.assertEqual(0x0041EE98, call_target(self.img, call), hex(va))
+            self.assertEqual(bytes.fromhex("c20400"), read_va(self.img, call + 5, 3), hex(va))
+        # 单选：选中位是 eax=4 的 0x42cf1d（[btn+0xb4] 的 bit），待定模式写 [dlg+0x7f8]。
+        self.assertEqual(bytes.fromhex("6a01 6a04 58"), read_va(self.img, 0x0041EF24, 5))
+        self.assertEqual(bytes.fromhex("89b2f8070000"), read_va(self.img, 0x0041EF4C, 6))
+        self.assertEqual(bytes.fromhex("8b87b4000000"), read_va(self.img, 0x0042CF20, 6))
+        self.assertEqual(0x7F8, c_define(self.src, "FSO_DLG_MODE"))
+        self.assertEqual(0xB4, c_define(self.src, "FSO_BTN_FLAGS"))
+
+    def test_refill_runs_only_at_the_end_of_init(self):
+        # 回填 0x41ec15 只有初始化末尾 0x41ec01 一个调用点 ⇒ 我们在初始化跑完之后对齐就不会被它冲掉。
+        self.assertEqual(0x0041EC15, call_target(self.img, 0x0041EC01))
+        self.assertEqual([0x0041EC01], [a for a, t in _rel32_targets(self.img) if t == 0x0041EC15])
+        self.assertEqual(bytes.fromhex("c9 c3"), read_va(self.img, 0x0041EC13, 2))   # 初始化到这就返回
+
+    def test_both_entries_apply_only_on_ok(self):
+        # 构造 → 初始化 → 模态 0x428031 → ==2 才调 0x41ef55（→ 应用 0x41eff5）→ 析构。
+        # （这个对话框没有「取消」：冒烟实测右上角 ✕ 也返回 2、也走应用，原版就这样。）
+        for init_call, modal_call, apply_call in ((0x00419C81, 0x00419C92, 0x00419CA3),
+                                                  (0x0041B4A5, 0x0041B4B6, 0x0041B4C7)):
+            self.assertEqual(0x0041DE2F, call_target(self.img, init_call))
+            self.assertEqual(0x00428031, call_target(self.img, modal_call))
+            self.assertEqual(bytes.fromhex("83f802 750c"), read_va(self.img, modal_call + 5, 5))
+            self.assertEqual(0x0041EF55, call_target(self.img, apply_call))
+        self.assertEqual(0x0041EFF5, call_target(self.img, 0x0041EF59))
+        # 应用：UserConfig::SetFullScreen([dlg+0x7f8])，它存的键就叫 FullScreen。
+        self.assertEqual(bytes.fromhex("81c7f8070000 ff37"), read_va(self.img, 0x0041F002, 8))
+        self.assertEqual(0x004113ED, call_target(self.img, 0x0041F00A))
+        self.assertEqual(bytes.fromhex("68a4fc6500"), read_va(self.img, 0x0041140B, 5))
+        self.assertEqual("FullScreen".encode("utf-16-le") + b"\0\0", read_va(self.img, 0x0065FCA4, 22))
+
+    def test_user_config_get_returns_ebx_when_the_key_is_missing(self):
+        # 0x410110 → 0x40b8c2，找不到键走 0x40b9c0: mov eax, ebx —— 我们的取值包装先把缺省值放进 ebx。
+        self.assertEqual(0x0040B8C2, call_target(self.img, 0x00410137))
+        self.assertEqual(bytes.fromhex("8bc3"), read_va(self.img, 0x0040B9C0, 2))
+        self.assertIn("mov  ebx, def", c_function(self.src, "static int fso_cfg_get("))
+        # 存：0x411ebe → 0x412287，this 在 esi。
+        self.assertEqual(0x00412287, call_target(self.img, 0x00411EE4))
+        self.assertEqual(bytes.fromhex("8b7e1c"), read_va(self.img, 0x00412295, 3))
+        self.assertIn("mov  esi, cfg", c_function(self.src, "static void fso_cfg_set("))
+        self.assertIn('#define FSO_STRETCH_KEY    L"FullScreenStretch"', self.src)
+
+    # ---- ③ 接线 ----
+
+    def test_measure_lays_out_by_the_stretch_setting(self):
+        body = c_function(self.src, "static int fs_measure(")
+        self.assertLess(body.index("fs_load_stretch();"), body.index("fsv_layout("))
+        self.assertIn("g_fs.stretch, &g_fs.pic)", body)
+        self.assertNotIn("fsv_fit(", body)
+
+    def test_apply_saves_before_the_original_and_relayouts_after(self):
+        before = c_function(self.src, "static void __cdecl fso_apply_before(")
+        self.assertIn("*(int *)(dlg + FSO_DLG_MODE) != 0) return;", before)   # 选窗口模式不动存着的值
+        self.assertLess(before.index("fso_cfg_set("), before.index("fs_set_stretch("))
+        detour = c_function(self.src, "static __declspec(naked) void fso_apply_detour(")
+        self.assertLess(detour.index("call fso_apply_before"), detour.index("call dword ptr [s_fso_apply]"))
+        self.assertLess(detour.index("call dword ptr [s_fso_apply]"), detour.index("call fso_apply_after"))
+        self.assertIn("fs_fill_monitor(", c_function(self.src, "static void __cdecl fso_apply_after("))
+
+    def test_our_button_goes_through_the_same_radio_entry(self):
+        click = c_function(self.src, "static void __fastcall fso_stretch_clicked(")
+        self.assertIn("UINT_PTR fn = FSO_RADIO_VA;", click)
+        self.assertLess(click.index("g_fso.by_us = 1;"), click.index("call ecx"))
+        after = c_function(self.src, "static void __cdecl fso_radio_after(")
+        self.assertIn("if (mode == 0) g_fso.pending = g_fso.by_us;", after)
+
+    def test_option_hooks_go_in_before_the_borderless_game_hooks(self):
+        pt = c_function(self.src, "static DWORD WINAPI patch_thread(")
+        self.assertLess(pt.index("try_hook_fs_option()"), pt.index("try_hook_borderless_game()"))
+        install = c_function(self.src, "static int try_hook_fs_option(")
+        # 初始化最后装（它一挂上新按钮就被接管，单选 / 应用得先在）。
+        self.assertLess(install.index('"设定:单选"'), install.index('"设定:初始化"'))
+        self.assertLess(install.index('"设定:应用"'), install.index('"设定:初始化"'))
+
+
 if __name__ == "__main__":
     unittest.main()

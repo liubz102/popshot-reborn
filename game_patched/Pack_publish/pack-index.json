@@ -1,7 +1,7 @@
 {
  "format": 1,
  "packer": {"fill": 0, "key_prefix": "Pack/", "policy": "original-ext-v1", "sep": "~", "volume_cap": 16777216, "zlib_level": 9},
- "tree_hash": "c093998661d4b893e3a88c6174f47d03f001181c71a9b1a8f60dded5705f8bba",
+ "tree_hash": "54e8d83148ff47963f506a5eaf681d5f6a1492d824f1409cfc0164db4e45c30e",
  "volumes": {
   "Data~.pkn": {"group": "Data", "sha256": "82fd2ef4595c270c889f679447aeda4ea139f711ad08ae72d9dd210e527f74ee", "size": 550912, "source": "Data", "members": [
    ["Chinese.ini", 114246, "a83ba2b81e8bff212613509e99f9bb808579dfff3b815788ee27cc971d993c1e"],
@@ -386,7 +386,7 @@
    ["Tutorial/Newbie/tutorial-newbie.csv", 3185, "46bfeb197f0254e7c09e9eaf1659b5adcde7bde71cfd9420a94a5f46e3ac2e0a"],
    ["Tutorial/Newbie/tutorial-newbie.ini", 8093, "48d7c234c2c48d1ab2f729db3fe844b3df1d47c21781d2426e6741b336dcbb9b"]
   ]},
-  "Data~Ui.pkn": {"group": "Data", "sha256": "104bff27280dc6af426a7e62f8e4465de38184630b1b2a5377af7d07d5832b18", "size": 413696, "source": "Data/Ui", "members": [
+  "Data~Ui.pkn": {"group": "Data", "sha256": "95253969d9805c2d81531e4594cb566a2e2de31e5b95380c155e7ae4d91f8030", "size": 413696, "source": "Data/Ui", "members": [
    ["Ui/BuyAllItem.ui", 17004, "e05fc08b07cc30021a197c998f3e4e4e194e5e3b6bb3f7d3f398b4d4348a3996"],
    ["Ui/BuyGiftItemConfirmNewUI.ui", 12940, "724a191fcac97b1f92c2c7a9d658264994a83be54d34dbbedc4811134aea7c6c"],
    ["Ui/BuyGiftItemNewUI.ui", 23598, "598c980f448715b2cdf049b323ca62de61cb403c4df3fa9561b0dc386be1cd3c"],
@@ -410,7 +410,7 @@
    ["Ui/NickNameNewUI.ui", 7648, "b91c5eb4f3a4fbbef139d540bd4ca16d12c9166cab1bb8457cf343d5e9e3f07d"],
    ["Ui/NickNameSuggester.ui", 9842, "f806a7248236c378757baf9d5ee17d2c4f3dc8eb85fbfd43d24872eed8e1174b"],
    ["Ui/Option2-jpn.ui", 8876, "b308a33b3b34215bb3a2772e3ff6c27c7f5abea942b6fdd96c3dbf3c6e6fb6cc"],
-   ["Ui/Option2.ui", 10622, "c4cef8302cc6a60b261cc0ce4ab072c5306aa8ebb85d042e7c6f4320db50a026"],
+   ["Ui/Option2.ui", 11028, "27fbcb2d965884217623cdb8aac6691bf8f97ec3b49bce59f413a36bd54fdacb"],
    ["Ui/PromotionListUI.ui", 13074, "3452c24abf0616009da12adda97a54bfd07c06a9a49f43a2c4015545560f333f"],
    ["Ui/ReceiveGiftItemMerge.ui", 4232, "d32cfc425bafc95ecd41f2ac464f7731e5883819e5d58adf329ab0cc2a9ed9f7"],
    ["Ui/ReceiveGiftItemMerge2.ui", 4738, "56c744f2e82de071cbfcf8a57ce1ba8d565d9c7c13df172fee84d39e8bfdac26"],

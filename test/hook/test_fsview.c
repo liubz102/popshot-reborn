@@ -1,5 +1,5 @@
 /*
- * 无边框全屏的画面矩形 / 坐标换算 —— 原生夹具（X_Mod X21 / D107）。
+ * 无边框全屏的画面矩形 / 坐标换算 —— 原生夹具（X_Mod X21 / D107；拉伸 X22 / D108）。
  *
  * 由 test-fsview.bat 编译成 32 位控制台程序独立跑，不需要游戏。
  * **直接 `#include "fsview.h"`**（hook/ 下那一份），测的就是 bshook.dll 里用的换算，不是抄一份。
@@ -11,7 +11,9 @@
  *   3. 客户区 → 界面：单调；画面左上角那个像素是 0、右下角是 1023 / 767；
  *      画面外一个像素就是 -1 / 1024（真向下取整，不是向 0 截断）；
  *   4. 黑边：和画面不重叠，加起来正好铺满客户区；
- *   5. 画面矩形无效时换算原样不动（不除 0）。
+ *   5. 画面矩形无效时换算原样不动（不除 0）；
+ *   6. 拉伸（fsv_layout stretch=1）：画面 = 整个客户区、0 块黑边，2~4 照样成立；
+ *      4:3 的屏上两种模式结果完全一样（用户问的「4:3 显示器能不能填满」）。
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +38,7 @@ static const long MONITORS[][2] = {
     {1536,  864}, {1600,  900}, {1680, 1050}, {1920, 1080}, {1920, 1200},
     {2560, 1080}, {2560, 1440}, {2880, 1800}, {3440, 1440}, {3840, 2160},
     {5120, 1440}, {1080, 1920}, { 768, 1366},
+    {1280,  960}, {1400, 1050}, {1600, 1200}, {1152,  864},
 };
 
 static void check_fit(long w, long h, const fsv_rect *p)
@@ -52,6 +55,14 @@ static void check_fit(long w, long h, const fsv_rect *p)
           "%ldx%ld: 画面 %ldx%ld 不是 4:3（偏 %lld）", w, h, pw, ph, skew);
     CHECK(labs((w - p->r) - p->l) <= 1 && labs((h - p->b) - p->t) <= 1,
           "%ldx%ld: 画面 (%ld,%ld)-(%ld,%ld) 没居中", w, h, p->l, p->t, p->r, p->b);
+}
+
+static void check_stretch(long w, long h, const fsv_rect *p)
+{
+    fsv_rect bars[4];
+    CHECK(p->l == 0 && p->t == 0 && p->r == w && p->b == h,
+          "%ldx%ld: 拉伸的画面 (%ld,%ld)-(%ld,%ld) 不是整个客户区", w, h, p->l, p->t, p->r, p->b);
+    CHECK(fsv_bars(w, h, p, bars) == 0, "%ldx%ld: 拉伸时还有黑边", w, h);
 }
 
 static void check_roundtrip(long w, long h, const fsv_rect *p)
@@ -155,12 +166,21 @@ int main(void)
         long w = MONITORS[i][0], h = MONITORS[i][1];
         fsv_rect p;
         int before = g_fail;
-        fsv_fit(w, h, UI_W, UI_H, &p);
+        fsv_rect s;
+        fsv_layout(w, h, UI_W, UI_H, 0, &p);
         check_fit(w, h, &p);
         check_roundtrip(w, h, &p);
         check_bars(w, h, &p);
-        printf("  %5ldx%-5ld 画面 (%4ld,%4ld)-(%4ld,%4ld) %s\n",
-               w, h, p.l, p.t, p.r, p.b, g_fail == before ? "ok" : "FAIL");
+        fsv_layout(w, h, UI_W, UI_H, 1, &s);
+        check_stretch(w, h, &s);
+        check_roundtrip(w, h, &s);
+        check_bars(w, h, &s);
+        /* 4:3 的屏：保持比例放出来的就是整块屏 ⇒ 两种模式一模一样 */
+        if ((long long)w * UI_H == (long long)h * UI_W)
+            CHECK(p.l == s.l && p.t == s.t && p.r == s.r && p.b == s.b,
+                  "%ldx%ld: 4:3 屏上保持比例 (%ld,%ld)-(%ld,%ld) 和拉伸不一样", w, h, p.l, p.t, p.r, p.b);
+        printf("  %5ldx%-5ld 保持比例 (%4ld,%4ld)-(%4ld,%4ld)  拉伸 (0,0)-(%4ld,%4ld) %s\n",
+               w, h, p.l, p.t, p.r, p.b, s.r, s.b, g_fail == before ? "ok" : "FAIL");
     }
 
     /* 用户这台、超宽屏、5:4、刚好 4:3、比界面还小的屏 —— 钉住具体数 */
@@ -170,6 +190,19 @@ int main(void)
     check_known(1024,  768,    0,  0, 1024,  768);
     check_known(1366,  768,  171,  0, 1195,  768);
     check_known(1280,  720,  160,  0, 1120,  720);
+    check_known(1600, 1200,    0,  0, 1600, 1200);
+    /* 拉伸、用户这台：屏幕正中 → 界面正中，右下角像素 → (1023,767) */
+    {
+        fsv_rect s;
+        fsv_layout(1920, 1080, UI_W, UI_H, 1, &s);
+        x = 960; y = 540;
+        fsv_client_to_ui(&s, UI_W, UI_H, &x, &y);
+        CHECK(x == 512 && y == 384, "拉伸 1920x1080：(960,540) → (%ld,%ld)，应为 (512,384)", x, y);
+        x = 1919; y = 1079;
+        fsv_client_to_ui(&s, UI_W, UI_H, &x, &y);
+        CHECK(x == 1023 && y == 767, "拉伸 1920x1080：(1919,1079) → (%ld,%ld)，应为 (1023,767)", x, y);
+        x = 123; y = 456;
+    }
 
     /* 画面矩形无效：不动、不除 0；黑边铺满整个客户区 */
     fsv_client_to_ui(&bad, UI_W, UI_H, &x, &y);
@@ -184,6 +217,8 @@ int main(void)
     }
     fsv_fit(0, 1080, UI_W, UI_H, &bad);
     CHECK(!fsv_valid(&bad), "客户区宽 0：画面矩形应无效");
+    fsv_layout(0, 1080, UI_W, UI_H, 1, &bad);
+    CHECK(!fsv_valid(&bad), "拉伸、客户区宽 0：画面矩形应无效");
 
     printf("[fsview] %d 项检查，%d 项失败\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

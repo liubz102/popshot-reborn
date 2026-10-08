@@ -41,6 +41,7 @@ static int insn_len(const unsigned char *p)
         return 2;
     case 0x8B: case 0x89:                            /* mov r/m32,r32 / mov r32,r/m32 */
     case 0x33: case 0x85:                            /* xor r/m32,r32 / test r/m32,r32 */
+    case 0x2B:                                       /* sub r32,r/m32（设定单选 0x41ee98 的序言，X22）*/
     {
         unsigned char modrm = p[1];
         unsigned char mod = modrm >> 6, rm = modrm & 7;

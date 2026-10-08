@@ -1429,8 +1429,10 @@ static struct {
     long     sc_w, sc_h;
     int      scaled;        /* 上一帧走的是 1 = 双线性放大 / 0 = 退路；-1 还没 Present 过 */
     int      no_scale;      /* 放大那条路这台机器走不通：退路走到下一次 Reset 再试 */
+    int      stretch;       /* 全屏画面：0 = 保持比例（黑边）/ 1 = 拉伸填满（X22，UserConfig 的 FullScreenStretch） */
+    int      stretch_known; /* 上面那个已经从 UserConfig 读到（或设定里刚选过） */
 } g_fs = { NULL, NULL, 0, 0, 1024, 768, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0},
-           0, NULL, 0, 0, -1, 0 };
+           0, NULL, 0, 0, -1, 0, 0, 0 };
 
 static int g_fs_ready;      /* 四个 user32 钩子都装上了 —— 只有这时才换 */
 
@@ -1504,6 +1506,9 @@ static void fs_set(int on, const char *why)
     bslog("FS      无边框全屏 %s（%s）", on ? "开" : "关", why);
 }
 
+/* 定义在下面「全屏画面比例」一段（X22）：还没读过就从 UserConfig 读 FullScreenStretch。 */
+static void fs_load_stretch(void);
+
 /* 按窗口此刻所在的显示器算几何。 */
 static int fs_measure(HWND hwnd)
 {
@@ -1513,8 +1518,9 @@ static int fs_measure(HWND hwnd)
     mi.cbSize = sizeof(mi);
     if (!mon || !GetMonitorInfoW(mon, &mi)) return 0;
     g_fs.monitor = mi.rcMonitor;
-    fsv_fit(mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
-            g_fs.ui_w, g_fs.ui_h, &g_fs.pic);
+    fs_load_stretch();
+    fsv_layout(mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+               g_fs.ui_w, g_fs.ui_h, g_fs.stretch, &g_fs.pic);
     /* WS_POPUP 没边框、窗口就摆在显示器左上角 ⇒ 客户区原点 = 显示器左上角。 */
     SetRect(&g_fs.pic_screen,
             mi.rcMonitor.left + g_fs.pic.l, mi.rcMonitor.top + g_fs.pic.t,
@@ -1904,6 +1910,366 @@ static void install_borderless_guard(void)
     if (!g_fs_ready)
         bslog("FS      !! user32 那四个钩子没装齐 —— 全屏照原版独占（切换会卡）");
     install_borderless_d3d_hook();
+}
+
+/* ========================================================================== */
+/* ★ 全屏画面「保持比例 / 拉伸」（X_Mod X22 / §150 / D108）                     */
+/*                                                                            */
+/*   用户 2026-10-08：X21 只做了 4:3 + 黑边，有玩家更喜欢拉伸填满。设定界面     */
+/*   「窗口模式设定」那组单选按钮把「全屏」拆成「全屏(保持比例)」「全屏(拉伸)」，*/
+/*   值和原版 FullScreen 一起存 UserConfig.ini（键 FullScreenStretch，缺 = 0）。 */
+/*   画面怎么摆只差 fs_measure 里那一句 fsv_layout（拉伸 = 整个客户区）。       */
+/*                                                                            */
+/*   设定对话框（§150）：每次打开都新建、模态。初始化 0x41de2f 读             */
+/*   `Data/Ui/Option2.ui`、按名字取三个模式按钮存 +0x7e8/+0x7f0/+0x7f4、逐个配  */
+/*   样式绑点击，末尾 0x41ec01 按 UserConfig 回填选中；三个按钮的点击都转单选   */
+/*   0x41ee98(eax=模式 0/1/2, edx=对话框)，它只管自己那三个的选中位 + 写待定    */
+/*   模式 [dlg+0x7f8]；模态返回 2 才调应用 0x41eff5(eax=对话框) ——               */
+/*   UserConfig::SetFullScreen = 切显示模式 + 存 FullScreen。这个对话框没有      */
+/*   「取消」：确认和右上角 ✕ 都返回 2、都走应用（原版就这样，冒烟实测）。     */
+/*                                                                            */
+/*   我们：                                                                     */
+/*     · 资源卷里的 Option2.ui 多了 FullScreenStretchBtn（它下面整节下移 30）。  */
+/*       原版不认识它 ⇒ 初始化跑完后照 FullScreenBtn 那一套（0x41e530..0x41e612）*/
+/*       给它配样式、绑点击，再按存着的值回填；                                 */
+/*     · 钩单选：原函数跑完后把第四个按钮的选中位对齐（拉伸选中时清掉           */
+/*       FullScreenBtn 的）；它的点击 = 「我们触发」+ 走同一个单选(0)；          */
+/*     · 钩应用：选的是全屏就先 SetInt("FullScreenStretch")（游戏自己的键值表，  */
+/*       退出 / 登录时随整表写回 ini —— 直接写文件会被那次整表写回覆盖），再交   */
+/*       原函数切模式；回来后值变了且正在无边框全屏 ⇒ 重新摆一次，点确定立刻生效。*/
+/*     · 选窗口模式不动存着的值：之后按 F11 进全屏还是上次选的那种。             */
+/*   ★ 按钮找不到（资源卷是旧的）或特征对不上 ⇒ 整段不做 = 原版三个按钮、      */
+/*     全屏照保持比例。                                                         */
+/* ========================================================================== */
+#define FSO_INIT_VA        0x0041DE2Fu  /* 设定对话框初始化：thiscall(dlg)，ret */
+#define FSO_RADIO_VA       0x0041EE98u  /* 单选：eax = 模式 0/1/2、edx = 对话框，ret */
+#define FSO_APPLY_VA       0x0041EFF5u  /* 应用（模态返回 2 才调）：eax = 对话框，ret */
+#define FSO_BIND_VA        0x0041F091u  /* 给事件挂委托：stdcall(&事件, {fn, obj, ?})，ret 0x10 */
+#define FSO_FONT_VA        0x004251A7u  /* 设字体：esi = 控件、eax = 颜色，栈(&字体名, 字号, 粗细)，ret 0xc */
+#define FSO_SPRITE_VA      0x0042C879u  /* 按钮贴图：stdcall(btn, &CString, 0x3c, 0x33, -1, -1)，ret 0x18 */
+#define FSO_CSTR_CTOR_VA   0x00401979u  /* CString 构造：thiscall(&s, LPCWSTR)，ret 4 */
+#define FSO_CSTR_FREE_VA   0x00403610u  /* CString 释放：thiscall(数据 - 0x14)，ret */
+#define FSO_CFG_GET_VA     0x00410110u  /* UserConfig 取整数：stdcall(cfg, &键)，ebx = 缺省值，ret 8 */
+#define FSO_CFG_SET_VA     0x00411EBEu  /* UserConfig 存整数：esi = cfg，栈(&键, 值)，ret 8 */
+#define FSO_CFG_PP         0x0072E1D8u  /* UserConfig 单例（启动时 0x40ca25 建好、读完 ini） */
+#define FSO_FONT_NAME_VA   0x006E99DCu  /* 原版按钮那份字体名（全局 CString） */
+#define FSO_DLG_MODE       0x7F8        /* [dlg+0x7f8] 待定显示模式（单选写、应用读） */
+#define FSO_DLG_FULLBTN    0x7F4        /* [dlg+0x7f4] FullScreenBtn */
+#define FSO_BTN_FLAGS      0xB4         /* [btn+0xb4] 状态位：4 = 选中、8 = 单选样式（0x42cf1d 置 / 清） */
+#define FSO_BTN_CLICK      0x9C         /* [btn+0x9c] 点击事件（三个模式按钮都挂在这） */
+#define FSO_FIND_CHILD_VF  0x18         /* 对话框 vf[0x18]：按名字找子控件，thiscall(dlg, &CString)，ret 4 */
+#define FSO_STRETCH_KEY    L"FullScreenStretch"
+#define FSO_STRETCH_BTN    L"FullScreenStretchBtn"
+
+typedef struct { UINT_PTR va; unsigned char len; unsigned char sig[19]; const char *name; } fso_site;
+/* 每一处用到的游戏代码都先比首字节 —— 任何一处对不上就整段不装（解壳前也对不上，等下一轮）。 */
+static const fso_site FSO_SITES[] = {
+    { FSO_INIT_VA,      10, { 0xB8, 0xAF, 0xE0, 0x62, 0x00, 0xE8, 0x3F, 0xAD, 0x1D, 0x00 }, "设定初始化" },
+    { FSO_RADIO_VA,     11, { 0x56, 0x33, 0xF6, 0x2B, 0xC6, 0x57, 0x74, 0x7E, 0x48, 0x74, 0x41 }, "设定单选" },
+    { FSO_APPLY_VA,     19, { 0x83, 0xEC, 0x14, 0x56, 0x8B, 0x35, 0xD8, 0xE1, 0x72, 0x00, 0x57,
+                              0x8B, 0xF8, 0x81, 0xC7, 0xF8, 0x07, 0x00, 0x00 }, "设定应用" },
+    { FSO_BIND_VA,      13, { 0x55, 0x8B, 0xEC, 0x56, 0x57, 0x83, 0xEC, 0x0C, 0x8B, 0xFC, 0x8D, 0x75, 0x0C }, "挂委托" },
+    { FSO_FONT_VA,      10, { 0x57, 0xFF, 0x74, 0x24, 0x08, 0x8D, 0x4E, 0x40, 0x8B, 0xF8 }, "设字体" },
+    { FSO_SPRITE_VA,    13, { 0x55, 0x8B, 0xEC, 0x8B, 0x0D, 0x2C, 0x9A, 0x6E, 0x00, 0x6A, 0x00, 0x6A, 0x00 }, "按钮贴图" },
+    { FSO_CSTR_CTOR_VA, 12, { 0x8B, 0x44, 0x24, 0x04, 0x33, 0xD2, 0x66, 0x39, 0x10, 0x56, 0x8B, 0xF1 }, "CString 构造" },
+    { FSO_CSTR_FREE_VA, 13, { 0x56, 0x8B, 0xF1, 0x8D, 0x46, 0x08, 0x50, 0xFF, 0x15, 0x18, 0x73, 0x63, 0x00 }, "CString 释放" },
+    { FSO_CFG_GET_VA,   17, { 0xB8, 0x8C, 0x3D, 0x63, 0x00, 0xE8, 0x5E, 0x8A, 0x1E, 0x00, 0x51, 0x56,
+                              0x68, 0xFC, 0xDA, 0x65, 0x00 }, "UserConfig 取" },
+    { FSO_CFG_SET_VA,   16, { 0xB8, 0x8C, 0x3D, 0x63, 0x00, 0xE8, 0xB0, 0x6C, 0x1E, 0x00, 0x51, 0x68,
+                              0xFC, 0xDA, 0x65, 0x00 }, "UserConfig 存" },
+};
+
+typedef void  (__fastcall *fso_init_t)(void *dlg, void *edx_unused);
+typedef void  (__fastcall *fso_cstr_ctor_t)(void **s, void *edx_unused, const wchar_t *text);
+typedef void  (__fastcall *fso_cstr_free_t)(void *hdr, void *edx_unused);
+typedef void *(__fastcall *fso_find_child_t)(void *dlg, void *edx_unused, void **name);
+typedef void  (__stdcall *fso_sprite_t)(void *btn, void **path, int w, int h, int a, int b);
+typedef struct { void *fn; void *obj; void *extra; } fso_delegate;   /* 按值传 12 字节 */
+typedef void  (__stdcall *fso_bind_t)(void *event, fso_delegate d);
+
+static fso_init_t      s_fso_init = NULL;
+static void           *s_fso_radio = NULL;    /* 蹦床：eax / edx 传参，只能从 naked 薄壳里调 */
+static void           *s_fso_apply = NULL;    /* 同上：eax 传参 */
+static volatile LONG   g_fso_tried = 0;
+static volatile LONG   g_fso_code_ok = 0;     /* 读写 UserConfig 那两个函数核对过了（fs_load_stretch 用） */
+
+/* 这一个对话框里的状态（模态、同一时刻只有一个；只在主线程上读写）。 */
+static struct {
+    unsigned char *dlg;      /* 我们接管了第四个按钮的那个对话框；取消关掉的下次初始化覆盖 */
+    unsigned char *btn;      /* FullScreenStretchBtn */
+    int            pending;  /* 待定：全屏选的是不是拉伸（确定才存） */
+    int            by_us;    /* 这一次单选是我们的按钮触发的 */
+    int            changed;  /* 应用：这次确定改了存着的值 */
+    int            was_on;   /* 应用：点确定之前就已经是无边框全屏 */
+    int            missing;  /* 上一次初始化没找到按钮（按状态翻转记一行） */
+} g_fso;
+
+static int fso_site_ok(const fso_site *s)
+{
+    return !IsBadReadPtr((const void *)s->va, s->len) && memcmp((const void *)s->va, s->sig, s->len) == 0;
+}
+
+static int fso_all_sites_ok(void)
+{
+    size_t i;
+    for (i = 0; i < sizeof(FSO_SITES) / sizeof(FSO_SITES[0]); i++)
+        if (!fso_site_ok(&FSO_SITES[i])) return 0;
+    return 1;
+}
+
+/* 游戏的 CString：值就是一个指向字符数据的指针（数据前 0x14 字节是头，带引用计数）。 */
+static void *fso_cstr(const wchar_t *text)
+{
+    void *s = NULL;
+    ((fso_cstr_ctor_t)FSO_CSTR_CTOR_VA)(&s, NULL, text);
+    return s;
+}
+
+static void fso_cstr_free(void *s)
+{
+    if (s) ((fso_cstr_free_t)FSO_CSTR_FREE_VA)((unsigned char *)s - 0x14, NULL);
+}
+
+static void *fso_cfg(void)
+{
+    return IsBadReadPtr((const void *)FSO_CFG_PP, 4) ? NULL : *(void * volatile *)FSO_CFG_PP;
+}
+
+/* UserConfig 取整数（缺这个键就回 def）。 */
+static int fso_cfg_get(void *cfg, const wchar_t *key, int def)
+{
+    void *k = fso_cstr(key);
+    void **pk = &k;
+    UINT_PTR fn = FSO_CFG_GET_VA;
+    int v;
+
+    __asm {
+        mov  ebx, def                   /* 0x40b8c2 找不到键时回 ebx */
+        push pk
+        push cfg
+        mov  eax, fn
+        call eax
+        mov  v, eax
+    }
+    fso_cstr_free(k);
+    return v;
+}
+
+/* UserConfig 存整数：进游戏自己的键值表，退出 / 登录时随整表写回 UserConfig.ini。 */
+static void fso_cfg_set(void *cfg, const wchar_t *key, int value)
+{
+    void *k = fso_cstr(key);
+    void **pk = &k;
+    UINT_PTR fn = FSO_CFG_SET_VA;
+
+    __asm {
+        mov  esi, cfg
+        push value
+        push pk
+        mov  eax, fn
+        call eax
+    }
+    fso_cstr_free(k);
+}
+
+static void fs_set_stretch(int on, const char *why)
+{
+    on = on ? 1 : 0;
+    if (g_fs.stretch_known && g_fs.stretch == on) return;      /* 按状态翻转记一行 */
+    g_fs.stretch = on;
+    g_fs.stretch_known = 1;
+    bslog("FS      全屏画面：%s（%s）", on ? "拉伸填满" : "保持比例", why);
+}
+
+/* 建设备 / 切全屏 / 改桌面分辨率时 fs_measure 先调它。UserConfig 在 App 初始化时就读完了
+   （远早于建设备）；万一还没有就先按保持比例摆，下一次 measure 再读（看的是「表在不在」）。 */
+static void fs_load_stretch(void)
+{
+    void *cfg;
+
+    if (g_fs.stretch_known || !g_fso_code_ok) return;
+    cfg = fso_cfg();
+    if (!cfg) return;
+    fs_set_stretch(fso_cfg_get(cfg, FSO_STRETCH_KEY, 0) == 1, "UserConfig.ini 的 FullScreenStretch");
+}
+
+static int fso_checked(const unsigned char *btn)
+{
+    return (*(const DWORD *)(btn + FSO_BTN_FLAGS) & 4) != 0;
+}
+
+static void fso_set_checked(unsigned char *btn, int on)
+{
+    if (on) *(DWORD *)(btn + FSO_BTN_FLAGS) |= 4;               /* = 0x42cf1d(eax=4) */
+    else    *(DWORD *)(btn + FSO_BTN_FLAGS) &= ~(DWORD)4;
+}
+
+/* 第四个按钮的选中位按「模式 0 且选的是拉伸」对齐；那时 FullScreenBtn 让出来。 */
+static void fso_sync(unsigned char *dlg, int mode)
+{
+    unsigned char *full = *(unsigned char **)(dlg + FSO_DLG_FULLBTN);
+    int stretch_on = mode == 0 && g_fso.pending;
+
+    fso_set_checked(g_fso.btn, stretch_on);
+    if (stretch_on && full && !IsBadReadPtr(full + FSO_BTN_FLAGS, 4))
+        fso_set_checked(full, 0);
+}
+
+/* 单选原函数跑完之后（naked 薄壳 cdecl 调进来）。 */
+static void __cdecl fso_radio_after(unsigned char *dlg, int mode)
+{
+    if (!g_fso.btn || dlg != g_fso.dlg) return;
+    if (mode == 0) g_fso.pending = g_fso.by_us;     /* 点的是哪个「全屏」 */
+    fso_sync(dlg, mode);                            /* 点窗口模式：只把第四个按钮也放掉，待定值不动 */
+}
+
+static __declspec(naked) void fso_radio_detour(void)
+{
+    __asm {
+        push eax                            /* 模式 */
+        push edx                            /* 对话框 */
+        call dword ptr [s_fso_radio]        /* 原单选：eax / edx 还是原值 */
+        call fso_radio_after                /* (对话框, 模式) —— 正好是上面压的两个 */
+        add  esp, 8
+        ret
+    }
+}
+
+/* 「全屏(拉伸)」的点击：和原版三个委托同一个形状（thiscall(dlg, 参数)，ret 4）。 */
+static void __fastcall fso_stretch_clicked(void *dlg, void *edx_unused, void *arg)
+{
+    UINT_PTR fn = FSO_RADIO_VA;             /* 经入口走，单选钩照样拦（= 原版点「全屏」那条路） */
+    (void)edx_unused; (void)arg;
+    g_fso.by_us = 1;
+    __asm {
+        xor  eax, eax                       /* 模式 0 = 全屏 */
+        mov  edx, dlg
+        mov  ecx, fn
+        call ecx
+    }
+    g_fso.by_us = 0;
+}
+
+/* 照 FullScreenBtn 那一段（0x41e530..0x41e612）给新按钮配样式、挂点击。 */
+static void fso_style_button(unsigned char *dlg, unsigned char *btn)
+{
+    UINT_PTR font = FSO_FONT_VA, font_name = FSO_FONT_NAME_VA;   /* 内联汇编不吃 0x...u */
+    void *path;
+    fso_delegate d;
+
+    *(DWORD *)(btn + 0xBC) = 0;
+    *(DWORD *)(btn + 0xC0) = 0;
+    __asm {
+        push 0x2BC                          /* 粗细 700 */
+        push 9                              /* 字号 */
+        push font_name
+        mov  eax, 0xFF505050                /* 字色 */
+        mov  esi, btn
+        mov  ecx, font
+        call ecx
+    }
+    *(DWORD *)(btn + 0x54) = 0;
+    path = fso_cstr(L"Images/NewUI2/Buttons.smf");
+    ((fso_sprite_t)FSO_SPRITE_VA)(btn, &path, 0x3C, 0x33, -1, -1);
+    fso_cstr_free(path);
+    *(DWORD *)(btn + 0x10C) = 0x12;
+    *(DWORD *)(btn + FSO_BTN_FLAGS) |= 8;   /* = 0x42cf1d(eax=8, 1)：单选样式 */
+    *(LONG *)(btn + 0x130) = -1;
+    *(LONG *)(btn + 0x134) = -1;
+    *(DWORD *)(btn + 0xB8) = 1;
+    /* 初始化末尾（0x41eb73..0x41ebf7）给它认得的十个按钮都清这一字节；按钮构造时是 1，
+       画字（0x42c993）见 1 走另一套字样 —— 不清的话这一个按钮的字又粗又糊（冒烟实测）。 */
+    *(unsigned char *)(btn + 0x164) = 0;
+    d.fn = (void *)fso_stretch_clicked;
+    d.obj = dlg;
+    d.extra = NULL;                         /* 原版这一格是栈上的残值，调用时不看 */
+    ((fso_bind_t)FSO_BIND_VA)(btn + FSO_BTN_CLICK, d);
+}
+
+static void __fastcall fso_init_detour(void *dlg_v, void *edx_unused)
+{
+    unsigned char *dlg = (unsigned char *)dlg_v;
+    void *name, *cfg;
+    unsigned char *btn;
+    (void)edx_unused;
+
+    s_fso_init(dlg_v, NULL);                /* 原版：读 .ui、配三个按钮、回填选中 */
+    g_fso.dlg = NULL;
+    g_fso.btn = NULL;
+    g_fso.by_us = 0;
+    cfg = fso_cfg();
+    if (!dlg || !cfg || IsBadReadPtr(dlg + FSO_DLG_MODE, 4) || IsBadReadPtr(*(void **)dlg, FSO_FIND_CHILD_VF + 4))
+        return;
+    name = fso_cstr(FSO_STRETCH_BTN);
+    btn = (unsigned char *)((fso_find_child_t)(*(void ***)dlg)[FSO_FIND_CHILD_VF / 4])(dlg, NULL, &name);
+    fso_cstr_free(name);
+    if (!btn || IsBadReadPtr(btn + 0x130, 8)) {
+        if (!g_fso.missing)
+            bslog("FS      !! 设定界面里没有 FullScreenStretchBtn（资源卷是旧的？）—— 只有原版三个按钮");
+        g_fso.missing = 1;
+        return;
+    }
+    if (g_fso.missing) bslog("FS      设定界面的 FullScreenStretchBtn 又找到了");
+    g_fso.missing = 0;
+    fso_style_button(dlg, btn);
+    g_fso.dlg = dlg;
+    g_fso.btn = btn;
+    g_fso.pending = fso_cfg_get(cfg, FSO_STRETCH_KEY, 0) == 1;
+    fso_sync(dlg, *(int *)(dlg + FSO_DLG_MODE));
+}
+
+/* 应用前：选的是全屏 ⇒ 先存「哪种全屏」，让原函数切模式时就按新的摆。 */
+static void __cdecl fso_apply_before(unsigned char *dlg)
+{
+    void *cfg = fso_cfg();
+
+    g_fso.changed = 0;
+    g_fso.was_on = g_fs.on;
+    if (!g_fso.btn || dlg != g_fso.dlg || !cfg || *(int *)(dlg + FSO_DLG_MODE) != 0) return;
+    fso_cfg_set(cfg, FSO_STRETCH_KEY, g_fso.pending);
+    g_fso.changed = !g_fs.stretch_known || g_fs.stretch != g_fso.pending;
+    fs_set_stretch(g_fso.pending, g_fso.pending ? "设定里选了「全屏(拉伸)」" : "设定里选了「全屏(保持比例)」");
+}
+
+/* 应用后：已经在无边框全屏、只换了画面 ⇒ 原函数不切模式，我们重新摆一次（立刻生效）。 */
+static void __cdecl fso_apply_after(unsigned char *dlg)
+{
+    if (dlg != g_fso.dlg) return;
+    if (g_fso.changed && g_fso.was_on && g_fs.on && g_fs.hwnd)   /* 从窗口切过来的，切模式时已经摆过 */
+        fs_fill_monitor(g_fs.hwnd, "设定里换了全屏画面");
+    g_fso.changed = 0;
+    g_fso.dlg = NULL;                       /* 对话框马上析构 */
+    g_fso.btn = NULL;
+}
+
+static __declspec(naked) void fso_apply_detour(void)
+{
+    __asm {
+        push eax                            /* 对话框 */
+        call fso_apply_before
+        mov  eax, dword ptr [esp]           /* 还给原函数 */
+        call dword ptr [s_fso_apply]
+        call fso_apply_after                /* 参数还是栈上那个对话框 */
+        add  esp, 4
+        ret
+    }
+}
+
+/* 补丁线程里装（要等解壳）。全部对上才装三个钩子；只装一次。 */
+static int try_hook_fs_option(void)
+{
+    if (g_fso_tried) return 1;
+    if (!fso_all_sites_ok()) return 0;      /* 还没解壳到这里 */
+    InterlockedExchange(&g_fso_tried, 1);
+    InterlockedExchange(&g_fso_code_ok, 1);
+    s_fso_radio = install_inline_hook((void *)FSO_RADIO_VA, (void *)fso_radio_detour, "设定:单选");
+    s_fso_apply = install_inline_hook((void *)FSO_APPLY_VA, (void *)fso_apply_detour, "设定:应用");
+    /* 初始化最后装：它一挂上，新按钮就会被接管 —— 另两个得先在。 */
+    if (s_fso_radio && s_fso_apply)
+        s_fso_init = (fso_init_t)install_inline_hook((void *)FSO_INIT_VA, (void *)fso_init_detour, "设定:初始化");
+    if (!s_fso_init)
+        bslog("FS      !! 设定界面的钩子没装齐 —— 只有原版三个按钮（全屏照存着的那种画面）");
+    return 1;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -12142,6 +12508,15 @@ static DWORD WINAPI patch_thread(LPVOID param)
         if (!g_snow_hooked)
             bslog("SNOW    !! 未能装 SnowCipher hook（序言字节不符）");
     }
+
+    /* ★ 全屏画面「保持比例 / 拉伸」（X22）：设定界面初始化 / 单选 / 应用 + 读写 UserConfig 那几个
+       函数。排在建设备之前装：fs_measure 要靠它们核对过才去读存着的 FullScreenStretch。 */
+    for (ticks = 0; !g_stop && !g_fso_tried && ticks < 200; ticks++) {
+        if (try_hook_fs_option()) break;
+        Sleep(50);
+    }
+    if (!g_fso_tried)
+        bslog("FS      !! 设定界面那几处特征对不上 —— 没有「全屏(拉伸)」，全屏照保持比例");
 
     /* ★ 无边框全屏（X21）：游戏自己的 Present 包装 / 设备恢复例程（和下面 RendererInit 同一页、
        同一条线程）。要赶在建设备（登录之后）之前装好；没装上 det_d3d_create_device 就不换，

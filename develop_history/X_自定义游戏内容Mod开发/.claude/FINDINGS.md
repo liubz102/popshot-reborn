@@ -2987,3 +2987,21 @@ D60 把炸点改成 `hit.free`（被挡住的**前一个**整数点），比旧�
   清 `[0x6e9404]` / `[0x6e9408]`）和设备恢复例程 `0x5bf960`（`83 ec 20 55 56`，thiscall 无栈参数 `ret`；两处 `Reset(dev=[esi+4], &[esi+8])` 在 `0x5bf9cc` / `0x5bfa42`）。
   两处都只从入口进（没有跳进前 5 字节的）。实机：F11 来回、黑边纯黑、鼠标 (944,422) → 界面 (500.0, 300.0)、夹框 = 画面矩形、切回窗口夹框放开。
 - IDirect3D9 的 vtable（`CreateDevice` 槽）在 d3d9 的 .rdata 里、不受影响，照旧经 `Direct3DCreate9` 挂。
+
+## §150 ★★★★ 设定对话框 = `Option2.ui` + 按名字绑行为；模态、确定才应用；UserConfig.ini 背后是游戏自己的通用键值表（🔍逐指令 2026-10-08，X22）
+
+- **界面是数据**：`Data/Ui/Option2.ui`（UTF-16LE+BOM+CRLF XML）。加载器按标签通用建控件 ⇒ .ui 里多加的控件照常建出来、画出来，只是没人绑行为。
+  `<Text>` 查翻译表，查不到原样显示（中文直接写就行）。这套 UI 也有 `UiComboBox`（加项 `0x435cd0`、设选中 `0x42d874`(esi,ebx)、选中在 `[cb+0x5f8]`），按住才能选（V0.2 §195）。
+- **流程**（两个入口 `0x419c81` / `0x41b4a5` 一样）：构造 `0x41ddb8` → 初始化 `0x41de2f`（thiscall，`ret`）→ 模态 `0x428031(dlg, 200)` → **==2 才** `0x41ef55` →
+  应用 `0x41eff5`（eax=dlg）→ 析构。✅ 实测**没有「取消」**：底部「确认」和右上角 ✕ 都返回 2、都走应用。初始化：`vf[0x18]`（`0x402da1`，thiscall(dlg, &CString)）按名字取控件存字段
+  （`FullScreenBtn`→`+0x7f4`、`WindowedBtn`→`+0x7e8`、`WindowedTo800600Btn`→`+0x7f0`），逐个配样式绑点击，末尾 `0x41ec01` 调回填 `0x41ec15`（唯一调用点）按 UserConfig 设选中。
+- **单选**：三个模式按钮的点击委托 `0x41ee72/7e/8b`（thiscall(dlg, arg) `ret 4`）都转 `0x41ee98`（eax=模式 0/1/2、edx=dlg）：只置 / 清那三个的 `[btn+0xb4]` bit 4（`0x42cf1d`）+ 写 `[dlg+0x7f8]`。
+  应用读 `[dlg+0x7f8]` → `UserConfig::SetFullScreen` `0x4113ed` = `SetDisplayMode 0x40e33c` + 存键 `FullScreen`。
+- **按钮样式**（`FullScreenBtn` 那段 `0x41e530..0x41e612`）：`+0xbc/+0xc0=0`；`0x4251a7`(esi=btn, eax=`0xff505050`, 栈 `0x6e99dc`/9/`0x2bc`, `ret 0xc`)；`+0x54=0`；
+  `0x42c879(btn, &"Images/NewUI2/Buttons.smf", 0x3c, 0x33, -1, -1)`（`ret 0x18`）；`+0x10c=0x12`；bit 8；`+0x130/+0x134=-1`；`+0xb8=1`；委托 `{fn, dlg, 残值}` 经 `0x41f091(&btn[+0x9c], 12 字节按值)`（`ret 0x10`）。
+  `vf[0x70]`（`0x42d1e5`）只触发 `+0xa8` 事件（静音那类开关用），单选按钮没挂 ⇒ 直接改 bit 和点击时的效果一样。
+  ★ 初始化末尾 `0x41eb73..0x41ebf7` 还给十个按钮各清一次 **byte `[btn+0x164]`**（构造 `0x42c2b8` 置 1，画字 `0x42c993` 见 1 走另一套字样）—— 漏了它字又粗又糊（✅ 冒烟实测）。
+- **UserConfig** `[0x72e1d8]`：App 初始化 `0x40ca19` 起整份读进来（基类通用解析 `0x5d48c3`，键值不挑名字），退出 `0x40dae5` / 登录 `0x423f9e` 整表写回（`0x5d416d`，所以文件里按字母排）。
+  取 `0x410110`（stdcall(cfg, &CString 键)，**缺省值在 ebx**：找不到走 `0x40b9c0 mov eax, ebx`）；存 `0x411ebe`（**esi=cfg**，栈(&键, 值)，`ret 8`）。
+  ⇒ 新键进这张表就随原版一起存盘；**直接写文件没用**，退出时整表写回会覆盖。
+- 游戏 CString：值 = 字符数据指针（前 0x14 是带引用计数的头）；构造 `0x401979`（thiscall(&s, LPCWSTR) `ret 4`），释放 `0x403610`（ecx = 数据 − 0x14）。

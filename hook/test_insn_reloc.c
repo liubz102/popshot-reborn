@@ -255,6 +255,27 @@ static void case_f(void)
     }
 }
 
+/* G：`2b c6`（sub eax, esi）—— 设定界面单选 0x41ee98 的序言就是
+   `56 / 33 f6 / 2b c6`（X22）。insn_len 得认它、正好偷 5 字节、原样搬进蹦床。 */
+static void case_g(void)
+{
+    static const unsigned char prologue[8] = { 0x56, 0x33, 0xF6, 0x2B, 0xC6, 0x57, 0x74, 0x7E };
+    unsigned char *code = alloc_code();
+    unsigned char *tramp;
+
+    printf("[G] 2b c6（sub r32, r/m32）：认得、偷 5 字节、原样搬\n");
+    check_eq(insn_len(prologue + 3), 2, "2b c6 长 2 字节");
+    memcpy(code, prologue, sizeof(prologue));
+    tramp = (unsigned char *)install_inline_hook(code, (void *)det_never, "case-G");
+    check(tramp != NULL, "装上了");
+    if (tramp) {
+        check(memcmp(tramp, prologue, 5) == 0, "蹦床头 5 字节 = 原序言");
+        check(tramp[5] == 0xE9, "接着跳回原函数");
+        check((UINT_PTR)tramp + 10 + (UINT_PTR)(long)(*(long *)(tramp + 6)) == (UINT_PTR)code + 5,
+              "跳回 target+5（push edi 那条）");
+    }
+}
+
 int main(void)
 {
     printf("== 内联 hook 相对跳转重定位 回归（bug调查/27）==\n\n");
@@ -264,6 +285,7 @@ int main(void)
     case_d(); printf("\n");
     case_e(); printf("\n");
     case_f(); printf("\n");
+    case_g(); printf("\n");
 
     if (g_fails) { printf("== FAILED: %d 项不过 ==\n", g_fails); return 1; }
     printf("== ALL PASS ==\n");

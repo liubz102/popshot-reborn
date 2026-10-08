@@ -1,6 +1,6 @@
 {
-    "version":  "V0.5.1",
-    "versionWire":  5001,
+    "version":  "V0.5.2",
+    "versionWire":  5002,
     "kind":  "客户端包",
     "buildId":  "20261008-153103",
     "time":  "2026-10-08 15:31:05 UTC+9",
