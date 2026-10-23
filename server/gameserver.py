@@ -82,7 +82,8 @@ from lobby import (Lobby, Seat, SESSION_TYPE_GAME_TYPES,
                    TEAM_A, TEAM_B, TEAM_NONE, TEAM_LAYOUT_COOP,
                    TEAM_LAYOUT_FREE, TEAM_LAYOUT_TEAMS, default_team,
                    item_mode_of, team_layout_of)
-from netlisten import create_listener, describe as describe_listen, tune_stream
+from netlisten import (PEER_SILENCE_LIMIT_S, create_listener,
+                       describe as describe_listen, limit_silence, tune_stream)
 import questrecord
 import relayserver
 import roomclock
@@ -14175,6 +14176,8 @@ def serve(port, args, accounts=None, tickets=None, host="::", ready=None):
         conn, addr = s.accept()
         # 关 Nagle。`0x040f`（同步数据的回退路径）走的就是这条连接，见 D104。
         tune_stream(conn)
+        # 断网的玩家留多久两种系统一个样（不设就是 Windows 20 秒上下 / Linux 15 分钟，X_Mod D110）。
+        limit_silence(conn, PEER_SILENCE_LIMIT_S)
         threading.Thread(
             target=Conn(conn, addr, args, accounts, tickets).run,
             daemon=True).start()

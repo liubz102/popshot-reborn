@@ -38,7 +38,8 @@ from account_store import (AUTH_BAD_PASSWORD, AUTH_MESSAGES, AUTH_NO_SUCH_USER,
 import asynclog
 import logcleanup
 import eventlog
-from netlisten import create_listener, tune_stream
+from netlisten import (PEER_SILENCE_LIMIT_S, create_listener, limit_silence,
+                       tune_stream)
 from tickets import TicketStore, short as short_ticket
 import tzstamp
 
@@ -263,6 +264,8 @@ def serve(port, args, service, host="::", ready=None):
         conn, addr = s.accept()
         # 认证服的包也小、也是一问一答，关 Nagle 只会让登录更快（D104）。
         tune_stream(conn)
+        # 和游戏服同一个「断网留多久」（X_Mod D110），换系统不换玩法。
+        limit_silence(conn, PEER_SILENCE_LIMIT_S)
         threading.Thread(target=handle, args=(conn, addr, args, port, service),
                          daemon=True).start()
 

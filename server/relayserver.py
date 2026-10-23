@@ -66,7 +66,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as server_config
 import eventlog
 import udpsync
-from netlisten import create_listener, tune_stream
+from netlisten import (PEER_SILENCE_LIMIT_S, create_listener, limit_silence,
+                       tune_stream)
 from simple import SimpleCipher
 
 #: `RawPacket` 的魔数。和游戏服那层同一个字节（`0x5bb9e7` 写死的）。
@@ -1249,6 +1250,8 @@ class RelayServer:
                 raise
             # ★ 战斗数据的**主路**就是这条连接，关 Nagle 的收益全在这儿（D104）。
             tune_stream(sock)
+            # 断网的玩家留多久和游戏服那条同一个数（X_Mod D110）：这条一断原版就把人踢出房间（§158）。
+            limit_silence(sock, PEER_SILENCE_LIMIT_S)
             conn = RelayConn(self, sock, addr)
             threading.Thread(target=conn.run, daemon=True,
                              name=f"relay-{addr[0]}:{addr[1]}").start()
