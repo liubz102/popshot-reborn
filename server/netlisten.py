@@ -11,16 +11,40 @@
    也不要两个进程同时 LISTEN 同一个端口、连接被谁接走看运气
    （V0.1 会话 04 踩过这个坑）。
 
-另外还有一条给**已经连上的**流用的：`tune_stream()` —— 见它自己的说明。
+另外还有两条给**已经连上的**流用的：`tune_stream()`、`limit_silence()` —— 见它们自己的说明。
 """
 from __future__ import annotations
 
 import errno
 import socket
+import sys
 
 
 #: 「请用双栈」的写法。其它值一律按字面地址处理。
 ANY_HOSTS = ("::", "", None, "*")
+
+#: Windows 的 `TCP_MAXRT`（`ws2ipdef.h`，Vista / Win7 起都有）：秒，-1 = 永不放弃。
+#: Python 的 socket 模块没导出这个名字，只能写数。
+#: ★ 只能在 Windows 上用这个数：Linux 上 `IPPROTO_TCP` 的 5 号是 `TCP_KEEPINTVL`。
+WIN_TCP_MAXRT = 5
+
+#: Linux 的 `TCP_USER_TIMEOUT`（2.6.37 起）：毫秒，0 = 系统默认。它没有「永不」这个值，
+#: 拿 int 能表示的最大毫秒数（≈ 24.8 天）当永不。
+LINUX_TCP_USER_TIMEOUT = getattr(socket, "TCP_USER_TIMEOUT", 18)
+LINUX_NEVER_MS = 0x7FFFFFFF
+
+#: ★ 服务端这头：发给玩家的字节多久一个 ACK 都收不到，就当他掉线、放掉这条连接（秒）。
+#:
+#: 这就是「断网的玩家座位留多久」：留短了，十几秒的断网就把人踢出关卡（10-23 那位
+#: 玩家，FINDINGS §151）；留长了，真走了的人（断电、拔线，不会有 FIN / RST）会把同房间
+#: 的人卡在开局加载那一步。两种系统的重传间隔都是指数退避（Windows 0.3 秒起、Linux
+#: 0.2 秒起翻倍）：取 60 秒，断 30 秒上下的网，网恢复后的那一次重传都还落在 60 秒以内；
+#: 同房间的人最多等一分钟。
+#: ★ 玩家那头（本机中继）是**永不**放弃（`relay.connect_remote`）——「沉默的人留不留」
+#:   只由服务端定；服务端放掉之后，玩家网一恢复就收到 RST，照原版流程重连回大厅。
+#: ★ 应用层那两条照旧：发送积压超过 `GAME_SEND_DEADLINE_S` / `RELAY_SEND_DEADLINE_S`
+#:   写不出去就拆 —— 那要等系统的发送缓冲塞满才碰得到（多人对战里断网断得久）。
+PEER_SILENCE_LIMIT_S = 60
 
 
 def address_family(host):
@@ -95,6 +119,35 @@ def tune_stream(sock):
     """
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except (OSError, AttributeError, NameError):
+        pass
+    return sock
+
+
+def limit_silence(sock, seconds):
+    """定死一条**已经连上**的 TCP 流「发出去的字节多久没人确认就放弃」。返回 sock 本身。
+
+    `seconds=None` = 永不放弃：只在对面明说（FIN / RST）时才断。
+
+    ★ **为什么要自己定**（FINDINGS §151 / D109 / D110）：不定就是系统默认，而两种系统
+    差了四十多倍 —— Windows 重传 5 次就放弃（20 秒上下，玩家那两次 19~25 秒），Linux 按
+    `tcp_retries2` 要 15 分钟上下。10-23 那位玩家断网十几秒，就是被他电脑上 Windows 的这
+    二十来秒踢出了关卡。服务端会在 Windows 和 Linux 之间换，同一份代码不能因为跑在哪台
+    机器上就是两种玩法。
+
+    ★ 只管「有字节发出去了、对面不回」：两头都没东西要发的空闲连接，这个上限根本不起算，
+      和不设一样（空闲连接两种系统都不会超时，没开 keepalive）。
+    ★ 这是铁律 10 的例外 —— **物理上等不到事件**：网暂时断了和对面没了，在线路上都是
+      一片沉默，能区分两者的只有「沉默了多久」。
+    失败一律忽略（同 `tune_stream`）：这是加固，不该让正常路径炸掉。别的系统一个字不设。
+    """
+    try:
+        if sys.platform == "win32":
+            sock.setsockopt(socket.IPPROTO_TCP, WIN_TCP_MAXRT,
+                            -1 if seconds is None else int(seconds))
+        elif sys.platform.startswith("linux"):
+            sock.setsockopt(socket.IPPROTO_TCP, LINUX_TCP_USER_TIMEOUT,
+                            LINUX_NEVER_MS if seconds is None else int(seconds) * 1000)
     except (OSError, AttributeError, NameError):
         pass
     return sock

@@ -57,7 +57,7 @@ import config as server_config
 import crashwatch
 import daylog
 import udpsync
-from netlisten import create_listener, tune_stream
+from netlisten import create_listener, limit_silence, tune_stream
 import tzstamp
 
 for _stream in (sys.stdout, sys.stderr):
@@ -433,6 +433,13 @@ def connect_remote(target_host, target_port, proxy=None):
     sock = socket.create_connection(endpoint, timeout=CONNECT_TIMEOUT)
     # 关 Nagle。走代理时同样要关 —— 隧道里跑的还是那几十字节的小包（D104）。
     tune_stream(sock)
+    # ★ 网断一阵子不自己放弃（FINDINGS §151 / D109，bug调查/29）：以前 Windows 重传 20 秒上下
+    #   就把这条断掉 → `_pump` 跟着关游戏那条 → 原版弹「发生服务器障碍」、拆关卡回大厅，
+    #   而服务端那边连接一直好好的。这头**永不**放弃：中继手里没有任何事实能分清「网暂时
+    #   断了」和「服务器没了」，沉默的人留多久只由服务端定（`PEER_SILENCE_LIMIT_S`），
+    #   服务端放掉、关掉或重启过，网一通就收到 FIN / RST，照常断。
+    #   连上之后才设：建连那一段仍由 CONNECT_TIMEOUT 管（连不上要及时让客户端弹框）。
+    limit_silence(sock, None)
     if proxy is None:
         return sock
     try:
