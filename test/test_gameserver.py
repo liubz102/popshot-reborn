@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from gameserver import (
     ROOM_SEAT_COUNT,
@@ -4258,8 +4259,12 @@ class AfkTests(unittest.TestCase):
         self.assertFalse(gameserver.conn_afk_clock_expired(conn, now=1000.0))
         judged = self.presence_afk(conn, at=1000.0)
         self.assertTrue(gameserver.conn_is_afk(conn, now=judged))
-        self.assertEqual(gameserver.PLACE_AFK_QUEST,
-                         gameserver.conn_place(conn))
+        # ★ `conn_place()` 不收 `now`，里面按真的 `time.monotonic()` 判 —— 而上面的证据
+        #   是钉在 t=1000 的假钟上。不把钟拨到同一刻的话，结论取决于这台机器开机多久
+        #   （CI 上和单跑这一条时都是红的）。
+        with mock.patch.object(gameserver.time, "monotonic", return_value=judged):
+            self.assertEqual(gameserver.PLACE_AFK_QUEST,
+                             gameserver.conn_place(conn))
 
     def test_a_new_match_does_not_reset_the_presence_clock(self):
         """★ 在场证据说的是「这个人在不在机器前」，和「这一局」无关 ⇒

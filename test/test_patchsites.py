@@ -1028,6 +1028,11 @@ class MutuDiagProbeTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # 同这个文件里别的站点核对：脱壳镜像是本地产物（`re/*.img` 不进 git），
+        # CI 的干净检出里没有它。
+        for path in (BSHOOK, IMG):
+            if not os.path.isfile(path):
+                raise unittest.SkipTest("不在源码仓库里（缺 %s），跳过" % path)
         cls.src = c_source()
         cls.img = load_image()
 

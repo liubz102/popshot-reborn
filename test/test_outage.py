@@ -99,8 +99,15 @@ class LimitSilencePlatformTests(unittest.TestCase):
 @unittest.skipUnless(ON_WINDOWS, "TCP_MAXRT 是 Windows 的选项")
 class WindowsSocketTests(FakeProxyMixin, unittest.TestCase):
     def test_a_plain_socket_uses_the_system_default(self):
-        """0 = 系统默认：重传 5 次（20 秒上下）就放弃 —— 就是 10-23 出事那条路。"""
-        self.assertEqual(0, maxrt(connected_pair(self)))
+        """没设过的 socket 走系统默认：重传几次（20 秒上下）就放弃 —— 就是 10-23 出事那条路。
+
+        ★ 系统默认**读回来是几看 Windows 版本**：开发机那台 Win10 读回 0，GitHub 的
+          `windows-latest` 读回 18（PR #5 的 CI）。所以只钉「不是我们会设的那两个值」——
+          尤其不是 -1（永不放弃）。
+        """
+        value = maxrt(connected_pair(self))
+        self.assertNotEqual(-1, value)
+        self.assertNotEqual(PEER_SILENCE_LIMIT_S, value)
 
     def test_both_values_read_back(self):
         sock = connected_pair(self)

@@ -22,10 +22,17 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-for sub in ("tools", "test"):
-    path = os.path.join(ROOT, sub)
-    if path not in sys.path:
-        sys.path.insert(0, path)
+TEST = os.path.join(ROOT, "test")
+if TEST not in sys.path:
+    sys.path.insert(0, TEST)
+# ★★ `tools/` 只能挂在**最后面**（同 `test_pkn`）：它和 `server/` 有同名模块
+#    （`mapdata` / `mutudata` / `chrprops` / `shopdata` / `weapondata`），排到前面去的话，
+#    同一个 worker 进程里跑在后面的分片 `import mutudata` 会拿到**离线提取器**那一个，
+#    症状是 `test_botfight` 一片「module 'mutudata' has no attribute 'skills'」
+#    （PR #5 的 CI 就是这么红的）。这里要的只是 `aimring`，server 侧没这个名字。
+TOOLS = os.path.join(ROOT, "tools")
+if TOOLS not in sys.path:
+    sys.path.append(TOOLS)
 
 import aimring  # noqa: E402
 
