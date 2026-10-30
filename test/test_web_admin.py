@@ -40,6 +40,7 @@ import gifthistory                                           # noqa: E402
 import lobby                                                   # noqa: E402
 import logpack                                                 # noqa: E402
 import logshelf                                                # noqa: E402
+import missions                                                # noqa: E402
 import sellprice                                               # noqa: E402
 import sevenzip                                                # noqa: E402
 import shopcfg                                                 # noqa: E402
@@ -490,6 +491,62 @@ class AdminConfigTests(_AdminCase):
         status, result = self.request("/admin/api/config/nope")
         self.assertEqual(404, status)
         self.assertFalse(result["ok"])
+
+    # ------------------------------------------------ 晋级任务（X23）
+    def test_missions_are_the_ninth_config_and_ship_the_factory_105(self):
+        self.assertEqual(shopcfg.MISSIONS_FILENAME, web_admin.CONFIG_FILES["missions"])
+        raw = json.loads(self.get("missions")["text"])
+        self.assertEqual(105, len(raw["missions"]))
+
+    def test_saving_missions_pushes_the_table_to_everyone_online(self):
+        """★ 在线玩家的面板当场换成新的（不用重登）：保存 `missions.json` 后调
+        `gameserver.broadcast_missions`，回执里说推给了几个人。"""
+        import gameserver
+        calls = []
+
+        def fake_broadcast(reason="", log=None):
+            calls.append(reason)
+            return 2
+        saved = gameserver.broadcast_missions
+        gameserver.broadcast_missions = fake_broadcast
+        self.addCleanup(setattr, gameserver, "broadcast_missions", saved)
+        raw = json.loads(self.get("missions")["text"])
+        raw["missions"][0]["name"] = "改过的名字"
+        result = self.save("missions", json.dumps(raw, ensure_ascii=False))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(["（管理页保存）"], calls)
+        self.assertIn("已推给 2 位在线玩家", result["message"])
+        rules, _warnings = shopcfg.missions()
+        self.assertEqual("改过的名字", rules[0]["name"])
+        # 物品库也推（奖励那几行写着物品名），但回执不提人数。
+        result = self.save("items", self.get("items")["text"])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(2, len(calls))
+        # 别的配置不推。
+        result = self.save("shop", self.get("shop")["text"])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(2, len(calls))
+
+    def test_a_bad_mission_is_refused_and_nothing_is_pushed(self):
+        import gameserver
+        calls = []
+        saved = gameserver.broadcast_missions
+        gameserver.broadcast_missions = lambda reason="", log=None: calls.append(1) or 0
+        self.addCleanup(setattr, gameserver, "broadcast_missions", saved)
+        raw = json.loads(self.get("missions")["text"])
+        raw["missions"][0]["rewards"] = []
+        result = self.save("missions", json.dumps(raw, ensure_ascii=False))
+        self.assertFalse(result["ok"])
+        self.assertIn("missions[0]", result["message"])
+        self.assertEqual([], calls)
+
+    def test_the_catalog_carries_the_mission_words_and_limits(self):
+        catalog = self.request("/admin/api/catalog")[1]
+        self.assertEqual(missions.MISSION_PHRASES, catalog["mission_text"]["phrases"])
+        self.assertEqual(missions.MAX_REWARDS, catalog["mission_limits"]["max_rewards"])
+        self.assertEqual(missions.FIRST_NEW_ID,
+                         catalog["mission_limits"]["first_new_id"])
+        self.assertIn("missions", catalog["schema"])
 
     def test_saving_takes_effect_without_a_restart(self):
         raw = json.loads(self.get("shop")["text"])

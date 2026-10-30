@@ -96,6 +96,11 @@ CARDS_FILENAME = "cards.json"
 #: 同一档（没有配置标签页，编辑入口是物品库卡片上的「自定义属性」弹窗）。
 #: 规则和读写都在 `weaponcfg.py`，这里只登记文件名和 `_SPECS` 那一格。
 WEAPONS_FILENAME = "weapons.json"
+#: ★ **晋级任务**（X_Mod · X23）：第九份运营配置。大厅「任务」面板里的任务、
+#: 完成条件、周期（每日 / 每周 / 每月 / 仅一次）和奖励都在这一份里，
+#: 服务端按它给每个玩家生成那张任务表推给 bshook（D111）。规则全在 `missions.py`，
+#: 这里只登记文件名、`_SPECS` / `SCHEMA` 那两格。有配置标签页（管理页「晋级任务」）。
+MISSIONS_FILENAME = "missions.json"
 
 #: ★ 合成界面只有 4 个材料槽（`ComposeItemNewUI.ui` 的 `ImgBar0~3`，§7）。
 #: 配方写第 5 种材料，玩家在界面上根本看不见 —— 校验时直接拒绝。
@@ -1720,6 +1725,12 @@ def default_weapons():
     return weaponcfg.default_table()
 
 
+def default_missions():
+    """默认 `missions.json` = 原版 105 条晋级任务全部导入（X23，`shopdefaults.default_missions()`）。"""
+    import shopdefaults
+    return shopdefaults.default_missions()
+
+
 def default_cards():
     """默认 `cards.json` = `shopdefaults.default_cards()`（V0.3商店）。
 
@@ -2196,6 +2207,15 @@ def _validate_card_conditions(entry, where):
     return out
 
 
+def validate_missions(raw):
+    """`missions.json` → `[任务…]`（X23）。本体在 `missions.validate_missions`。
+
+    ★ `import` 写在函数里：`missions` 顶层 `import shopcfg`，加载阶段两边不能互相依赖。
+    """
+    import missions as missions_module
+    return missions_module.validate_missions(raw)
+
+
 def validate_cards(raw):
     """`cards.json` → `[规则…]`；有一条不对就抛 `ConfigError`。
 
@@ -2494,6 +2514,118 @@ SCHEMA = {
              ]},
         ],
     },
+    # ------------------------------------------------------------- 晋级任务
+    # ★ X23（用户 2026-10-30）。页名叫「晋级任务」—— 别叫「任务」：管理页别处
+    #   「任务」是闯关模式的旧叫法。这一页和称号卡片一样**按卡片画**、右边几颗钮
+    #   开弹窗（任务内容 / 完成条件 / 奖励），`fields` 是校验器的契约 + 下拉选项
+    #   的唯一出处（`admin.js` 的 `renderMissions` 照它画）。
+    "missions": {
+        "list_key": "missions",
+        "title": "晋级任务",
+        "unit": "条任务",
+        "help": [
+            "大厅右下角「任务」面板里的任务。**所有能做的任务同时推进**：打完一局，"
+            "每条启用的、等级够、角色对得上、本期还没完成的任务各自看这一局算不算。",
+            "面板上每个角色、对战 / 闯关各**只显示最靠前的两条**（顺序小的排前，"
+            "完成了的从面板上消失）；其余的照样在后台计数，进度和完成会在结算聊天里说。",
+            "周期：**每日** 每天凌晨 4 点重置、**每周** 每周一 4 点、**每月** 每月 1 日 4 点"
+            "（服务器本地时间）；没做完的进度到点清零。**仅一次** 做完就再也不出现。",
+            "完成后奖励**进礼物箱**（最多 3 项）。没有删除，只有停用 —— 任务编号永不复用。",
+            "「专用关卡」是原版那 21 条单机小地图，只能停用，不能新建。",
+            "改完保存即刻生效：在线玩家的面板会马上换成新的（不用重登）。",
+        ],
+        "fields": [
+            {"key": "id", "label": "编号", "type": "int", "readonly": True,
+             "help": "新建时自动编号，永不复用"},
+            {"key": "enabled", "label": "启用", "type": "bool"},
+            {"key": "period", "label": "周期", "type": "choice",
+             "options": [{"value": key, "label": label} for key, label in (
+                 ("once", "仅一次"), ("daily", "每日"), ("weekly", "每周"),
+                 ("monthly", "每月"))]},
+            {"key": "character", "label": "角色", "type": "choice",
+             "options": [{"value": -1, "label": "不限（三个页签都显示，爱琳也算）"}]
+             + [{"value": cid, "label": name}
+                for cid, name in sorted(CHARACTER_ZH.items())]},
+            {"key": "line", "label": "线", "type": "choice",
+             "options": [{"value": "pvp", "label": "对战"},
+                         {"value": "quest", "label": "闯关"}]},
+            {"key": "order", "label": "顺序", "type": "int", "min": 0,
+             "max": 1000000, "help": "小的排前。面板每条线只显示最靠前的两条"},
+            {"key": "level", "label": "等级", "type": "int", "min": 1,
+             "max": 999, "help": "最低等级。等级不够的任务面板上不显示、也不计数"},
+            {"key": "name", "label": "名字", "type": "text",
+             "help": "留空 = 按完成条件自动生成"},
+            {"key": "info", "label": "说明", "type": "text",
+             "help": "面板上名字下面那一行。留空 = 「每日任务 - 等级5」这种"},
+            {"key": "clear_text", "label": "完成条件文字", "type": "text",
+             "help": "留空 = 按完成条件自动生成"},
+            {"key": "kind", "label": "类型", "type": "choice",
+             "options": [{"value": key, "label": label} for key, label in (
+                 ("win", "对战胜利"), ("clear", "闯关通关"),
+                 ("stats", "按对局数据"), ("map", "专用关卡（只读）"))]},
+            {"key": "target", "label": "目标次数 / 数值", "type": "int",
+             "min": 1, "max": 1000000},
+            {"key": "pvp_mode", "label": "对战模式", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "options": [{"value": key, "label": PVP_MODE_ZH[key]}
+                         for key in PVP_MODE_ZH]},
+            {"key": "item_mode", "label": "道具", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "options": [{"value": 1, "label": "道具战"},
+                         {"value": 0, "label": "无道具"}]},
+            {"key": "stage", "label": "关卡", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "options": [{"value": qid, "label": "%d · %s" % (qid, name)}
+                         for qid, name in sorted(QUEST_ZH.items())]},
+            {"key": "difficulty", "label": "难度", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "options": [{"value": n, "label": "%d · %s" % (n, name)}
+                         for n, name in sorted(DIFFICULTY_ZH.items())]},
+            {"key": "harder", "label": "更高难度也算", "type": "bool",
+             "help": "不勾 = 恰好这个难度（同时推进时，「至少」会让打一次困难就"
+                     "把简单 / 普通 / 困难三条一起完成）"},
+            {"key": "map", "label": "地图", "type": "text", "readonly": True},
+            {"key": "script", "label": "脚本", "type": "text", "readonly": True},
+            {"key": "count", "label": "计数方式", "type": "choice",
+             "options": [{"value": "match", "label": "每局达成算 1 次"},
+                         {"value": "sum", "label": "累计某项数值"}]},
+            # 「每局达成」那串条件：和称号卡片同一套子字段（只许一局内）。
+            {"key": "conditions", "label": "每局达成的条件", "type": "conditions",
+             "max": MAX_CARD_CONDITIONS,
+             "help": "从上往下依次结合，没有括号。只看这一局",
+             "fields": [
+                 {"key": "join", "label": "连接", "type": "choice",
+                  "options": [{"value": key, "label": CARD_JOIN_ZH[key]}
+                              for key in CARD_JOINS]},
+                 {"key": "metric", "label": "统计指标", "type": "choice",
+                  "options": [{"value": key, "label": CARD_METRICS[key][0],
+                               "help": CARD_METRICS[key][3]}
+                              for key in card_metric_keys()
+                              if CARD_SCOPE_MATCH in (card_metric_scopes(key)
+                                                      or CARD_SCOPES)]},
+                 {"key": "weapon", "label": "武器", "type": "choice",
+                  "optional": True, "empty_label": "不限",
+                  "options": weapon_card_options()},
+                 {"key": "op", "label": "比较", "type": "choice",
+                  "options": [{"value": key, "label": CARD_OP_ZH[key]}
+                              for key in CARD_OPS]},
+                 {"key": "threshold", "label": "数值", "type": "int",
+                  "min": 0, "max": MAX_CARD_THRESHOLD},
+             ]},
+            {"key": "metric", "label": "累计哪一项", "type": "choice",
+             "options": [{"value": key, "label": CARD_METRICS[key][0]}
+                         for key in card_metric_keys()
+                         if not card_metric_is_ratio(key)
+                         and not card_metric_values(key)]},
+            {"key": "weapon", "label": "武器", "type": "choice",
+             "optional": True, "empty_label": "不限",
+             "help": "只有 击杀数 / 开枪次数 / 造成的伤害 分得到武器",
+             "options": weapon_card_options()},
+            # ★ 奖励：每项一样东西（金币 / 经验 / 物品 + 数量），最多 3 项。
+            {"key": "rewards", "label": "奖励", "type": "rewards", "max": 3,
+             "help": "最多 3 项（任务说明框和完成弹窗只有 3 行）；完成后进礼物箱"},
+        ],
+    },
     # ----------------------------------------------------------------- 奖励
     # ★ 这一页**不是**卡片列表，是两张二维表格（用户 2026-09-10 点的题）：
     #   对战 = 模式 × 个人/组队，闯关 = 关卡 × 难度，格子里填输 / 赢两个数；
@@ -2609,12 +2741,16 @@ _SPECS = {
     #   读不到 / 读坏了退回**出厂值**（= 没有任何覆盖，客户端拿到的就是资源包里
     #   爆裂 3 的数）—— 空表和出厂值在这份配置上是同一个东西。
     WEAPONS_FILENAME: (validate_weapons, default_weapons, _USE_DEFAULT),
-    # ★★ 称号卡片（V0.3商店）。**必须排在最末** —— `test_shopcfg` 和
-    #   `test_backup` 都拿 `list(_SPECS)[-1]` 当「最新加的那一份」，
-    #   插在中间会让那两条用例验错东西。
-    # ★ 读不到时给**空表**（不是内置默认值）：最坏是「这一版一张卡都不掉」，
-    #   一眼看得出不对；退回默认值反而会在运营明明关掉之后偷偷又开始发卡。
+    # ★ 称号卡片（V0.3商店）。读不到时给**空表**（不是内置默认值）：最坏是
+    #   「这一版一张卡都不掉」，一眼看得出不对；退回默认值反而会在运营明明
+    #   关掉之后偷偷又开始发卡。
     CARDS_FILENAME: (validate_cards, default_cards, []),
+    # ★★ 晋级任务（X23）。**新加的配置必须排在最末** —— `test_shopcfg` 和
+    #   `test_backup` 都拿 `list(_SPECS)[-1]` 当「最新加的那一份」（老服务器升级
+    #   只补它、回滚到升级前的备份时它「保持现状」），插在中间会让那两条用例验错东西。
+    # ★ 读不到时给**空表**：面板上没有任务、结算不推进 —— 一眼看得出不对；
+    #   退回出厂的 105 条反而会在运营停用之后偷偷又开始发奖。
+    MISSIONS_FILENAME: (validate_missions, default_missions, []),
 }
 
 #: ★ 每份配置一把**写锁**，护住「读盘 → 合并 → 写盘」这一段（D36）。
@@ -2652,7 +2788,8 @@ def all_write_locks():
 #: 写成人话（「物品库 · 商店货架 · …」），不用把标题再抄一遍。
 _WHICH_OF = {ITEMS_FILENAME: "items", SHOP_FILENAME: "shop",
              RECIPE_FILENAME: "recipe", DROPS_FILENAME: "drops",
-             REWARDS_FILENAME: "rewards", CARDS_FILENAME: "cards"}
+             REWARDS_FILENAME: "rewards", CARDS_FILENAME: "cards",
+             MISSIONS_FILENAME: "missions"}
 
 #: 没有配置标签页、因而不在 `SCHEMA` 里的那些的标题（D95 / X3）。
 _TITLE_OF = {SELL_PRICE_FILENAME: "卖出价格", WEAPONS_FILENAME: "自定义武器"}
@@ -2765,6 +2902,11 @@ def cards(data_dir=None, _reload=False):
 def weapons(data_dir=None, _reload=False):
     """自定义武器数值 + 说明文（X3，`weaponcfg`）。读不到 / 读坏了退回出厂值 = 没有覆盖。"""
     return _load(WEAPONS_FILENAME, data_dir, _reload)
+
+
+def missions(data_dir=None, _reload=False):
+    """`[晋级任务…]`（X23，`missions.validate_missions` 洗过的）。读不到就是空表 = 面板上没有任务。"""
+    return _load(MISSIONS_FILENAME, data_dir, _reload)
 
 
 def card_rule_of(card_id, data_dir=None):

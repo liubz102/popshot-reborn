@@ -164,6 +164,12 @@
 /server/data/weapons.json
 /server/data/weapons.json.*.tmp
 /server/data/cards.json.*.tmp
+# missions.json：晋级任务（管理页「晋级任务」，server/missions.py，X_Mod · X23）。
+# 第九份运营配置，和上面几份同一个待遇：出厂值 = 原版 105 条（shopdefaults.
+# default_missions）、开服由 ensure_files() 生成、数据备份回滚同一个勾选项 ——
+# 一样不进仓库。
+/server/data/missions.json
+/server/data/missions.json.*.tmp
 # 「补齐默认值」写盘前留下的那一份原件（shopcfg.backfill_defaults）。
 /server/data/*.bak-*
 # 管理页「数据备份」的备份目录（databackup.py）：每份一个子目录，里面是

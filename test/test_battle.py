@@ -135,7 +135,8 @@ class FakeAccounts:
 
     def apply_battle(self, username, *, experience=0, money=0, materials=None,
                      stats_mode=None, stats_gained=None, cards=None,
-                     card_bases=None):
+                     card_bases=None, missions=None, mission_gifts=None,
+                     gift_problems=None):
         """打完一局的全部所得（V0.3商店）。★ 真的加进去，理由同上。
 
         形状和 `AccountStore.apply_battle` 一样：
@@ -169,6 +170,25 @@ class FakeAccounts:
         for card, count in give.items():
             grants[str(card)] = grants.get(str(card), 0) + int(count)
         account["card_grants"] = grants
+        # ★ 晋级任务（X23）：完成 / 进度整格换掉，奖励一份份塞进礼物盒 ——
+        #   和 `AccountStore.apply_battle` 同一次「写盘」，结算端到端用例看的就是它。
+        if missions is not None:
+            account["missions"] = missions
+        if mission_gifts:
+            gifts = list(account.get("gifts") or [])
+            seq = int(account.get("gift_seq") or 0)
+            for specs, note in mission_gifts:
+                for spec in specs:
+                    seq += 1
+                    gifts.append({"id": seq, "item": int(spec.get("item", 0)),
+                                  "count": int(spec.get("count", 0)),
+                                  "exp": int(spec.get("exp", 0)),
+                                  "money": int(spec.get("money", 0)),
+                                  "sender": "GM", "message": note,
+                                  "sent": "2026-10-30 12:00:00",
+                                  "unread": True})
+            account["gifts"] = gifts
+            account["gift_seq"] = seq
         return dict(account), [], give
 
     def set_quest_cleared(self, username, quest_id, difficulty):

@@ -30,8 +30,11 @@ for _path in (HERE, SERVER):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 TOOLS = os.path.join(os.path.dirname(HERE), "tools")
+# ★★ 挂在**最后面**（同 `test_pkn` / `test_aimring`）：`tools/` 和 `server/` 有同名模块，
+#    排到前面去会让同一个 worker 进程里后面的分片拿到离线提取器那一个（`mutudata` 等）。
+#    这里要的 `update_manifest` 只在 `tools/` 里有。
 if TOOLS not in sys.path:
-    sys.path.insert(0, TOOLS)
+    sys.path.append(TOOLS)
 
 import gameserver                                                  # noqa: E402
 import update_manifest                                             # noqa: E402

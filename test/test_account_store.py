@@ -564,6 +564,10 @@ class AccountStoreTests(unittest.TestCase):
             # 累计条件的计数器基准（V0.3商店第三轮）：`{卡片: {统计键: 值}}`。
             # ★ **按卡片存** —— 两张卡片共用一个指标时各攒各的。
             "card_bases": {"60004": {"guards": 30}},
+            # 晋级任务（X23）：完成记录 + 本期进度，同样写规范形态。
+            "missions": {"done": {"101": {"p": "", "at": "2026-10-30 21:00:00",
+                                          "times": 1}},
+                         "progress": {"10001": {"p": "2026-10-30", "n": 2}}},
         }
         self.assertEqual(sorted(changed), sorted(NEW_ACCOUNT_DEFAULTS),
                          "存档新增字段了？这条用例要跟着补")
@@ -1694,6 +1698,75 @@ class GiftBoxTests(unittest.TestCase):
         self.assertEqual([], store.ensure_item_fields()["accounts"])
         with open(self.path, "rb") as f:
             self.assertEqual(before, f.read(), "第二遍一个字节都不写")
+
+
+class MissionBattleTests(unittest.TestCase):
+    """晋级任务（X23）在存档层的那一步：`apply_battle` 的 ⑥ —— 完成 / 进度整格换掉，
+    奖励一份份进礼物盒（发送人 GM），和这一局别的所得**同一次写盘**。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "accounts.json")
+        self.store = AccountStore(self.path)
+        self.store.register("alice", "pw")
+
+    def account(self):
+        return self.store.get_account("alice")[1]
+
+    def test_a_new_or_old_save_has_no_mission_record(self):
+        """★ 铁律 11：老存档没有这一格 = 一条都没做过，读的时候补，不改盘。"""
+        self.assertEqual({"done": {}, "progress": {}},
+                         account_store.mission_state(self.account()))
+        self.assertEqual({"done": {}, "progress": {}},
+                         account_store.mission_state({}))
+
+    def test_the_state_and_the_gifts_land_in_one_write(self):
+        state = {"done": {"7": {"p": "2026-10-30", "at": "2026-10-30 12:00:00",
+                                "times": 1}},
+                 "progress": {"8": {"p": "2026-10-30", "n": 2}}}
+        writes = []
+        real = self.store._write_unlocked
+        self.store._write_unlocked = lambda data: (writes.append(1), real(data))[1]
+        problems = []
+        self.store.apply_battle(
+            "alice", experience=10, money=20, missions=state,
+            mission_gifts=[([{"money": 100}, {"item": BRONZE_PIPE, "count": 2}],
+                            "完成晋级任务「七」的奖励")],
+            gift_problems=problems)
+        self.assertEqual([1], writes, "经验 / 金币 / 任务 / 礼物要一次写完")
+        self.assertEqual([], problems)
+        account = self.account()
+        self.assertEqual(state, account_store.mission_state(account))
+        gifts = account_store.pending_gifts(account)
+        self.assertEqual([(0, 0, 100), (BRONZE_PIPE, 2, 0)],
+                         [(g["item"], g["count"], g["money"]) for g in gifts])
+        self.assertEqual({"GM"}, set(g["sender"] for g in gifts),
+                         "★ 发送人必须是 GM：别的名字客户端会走「向朋友致谢」（D117）")
+        self.assertEqual({"完成晋级任务「七」的奖励"}, set(g["message"] for g in gifts))
+        self.assertEqual(20, account["money"])
+
+    def test_a_broken_reward_is_reported_and_skipped_alone(self):
+        problems = []
+        self.store.apply_battle(
+            "alice", money=5,
+            missions={"done": {"7": {"p": "", "at": "", "times": 1}}, "progress": {}},
+            mission_gifts=[([{"item": 999999, "count": 1}], "坏的"),
+                           ([{"exp": 30}], "好的")],
+            gift_problems=problems)
+        self.assertEqual(1, len(problems))
+        self.assertTrue(problems[0].startswith("坏的："), problems[0])
+        gifts = account_store.pending_gifts(self.account())
+        self.assertEqual([("好的", 30)], [(g["message"], g["exp"]) for g in gifts])
+        self.assertEqual(5, self.account()["money"], "这一局别的所得照常入账")
+        self.assertIn("7", account_store.mission_state(self.account())["done"])
+
+    def test_without_mission_arguments_the_record_is_untouched(self):
+        self.store.apply_battle(
+            "alice", missions={"done": {}, "progress": {"8": {"p": "x", "n": 1}}})
+        self.store.apply_battle("alice", money=1)
+        self.assertEqual({"8": {"p": "x", "n": 1}},
+                         account_store.mission_state(self.account())["progress"])
 
 
 class AdminAccountTests(unittest.TestCase):

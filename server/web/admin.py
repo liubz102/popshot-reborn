@@ -175,6 +175,7 @@ import databackup
 import eventlog
 import gifthistory
 import logpack
+import missions
 import sellprice
 import sevenzip
 import shop
@@ -263,6 +264,9 @@ CONFIG_FILES = {
     #   问题「打完一局能拿到什么」，一个管材料、一个管卡片。
     "cards": shopcfg.CARDS_FILENAME,
     "rewards": shopcfg.REWARDS_FILENAME,
+    # ★ 晋级任务（X23）排最后：它是「打完一局还能拿到什么」的另一条路，
+    #   但奖励落在礼物箱、按周期重置，和上面几页的「每局结算」不是一回事。
+    "missions": shopcfg.MISSIONS_FILENAME,
 }
 
 #: 每份配置的校验器。★ **存盘前必过这一关**，不过就不落盘（D10 的同一个道理：
@@ -274,6 +278,7 @@ CONFIG_VALIDATORS = {
     "drops": shopcfg.validate_drops,
     "cards": shopcfg.validate_cards,
     "rewards": shopcfg.validate_rewards,
+    "missions": shopcfg.validate_missions,
 }
 
 #: 配置正文上限。五份加起来现在约 50 KB，给 4 MB 足够宽裕。
@@ -1517,6 +1522,11 @@ class AdminRoutes:
                 "max_conditions": shopcfg.MAX_CARD_CONDITIONS,
                 "max_threshold": shopcfg.MAX_CARD_THRESHOLD,
             },
+            # ★★ 晋级任务（X23）：那一行中间那句话（`missionConditionText`）用到的
+            #   每一个字 + 各个下拉的选项 + 判据参数。同 `card_text` 的道理：
+            #   句子骨架两边各一份（`test_missiontext` 逐字比），**词只在服务端**。
+            "mission_text": missions.admin_text(),
+            "mission_limits": missions.admin_limits(),
             # ★ 等级曲线（D72a）：「金币 / 经验获取」的经验那一页拿它画一张
             #   **只读**参照表 —— 调「一局给多少经验」的人要看得见这些经验
             #   换算成多少级。曲线只在 `account_store` 定义一处，页面不自己算。
@@ -1727,6 +1737,16 @@ class AdminRoutes:
 
         eventlog.online(f"[admin] {self._who(name)} 保存了 {filename}")
         message = f"已保存 {filename}，即刻生效（不用重启）"
+        if which in ("missions", "items"):
+            # ★ 晋级任务（X23）：在线玩家的任务面板当场换成新的（不用重登）。
+            #   物品库也算 —— 奖励那几行写着物品名。每条连接按 crc 的闩挡掉没变的。
+            #   `import` 写在这儿：同 `_admin_weapons_post`（游戏服模块很重，管理页
+            #   单独起的测试不该为它付加载费）。
+            import gameserver
+            pushed = gameserver.broadcast_missions(reason="（管理页保存）",
+                                                   log=eventlog.online)
+            if which == "missions" and pushed:
+                message += f"；已推给 {pushed} 位在线玩家"
         if adopted:
             # ★ 自动合并**不用弹框**（用户 2026-09-06），但得说一声 ——
             #   画面上凭空多出几条改动，不说人会以为自己看花了眼。

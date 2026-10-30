@@ -76,8 +76,9 @@ class RegistrationTests(_Case):
         self.assertEqual("自定义武器", shopcfg.config_title(shopcfg.WEAPONS_FILENAME))
         self.assertIsNotNone(shopcfg.validator_of(shopcfg.WEAPONS_FILENAME))
         self.assertNotIn("weapons", shopcfg.SCHEMA)        # 没有配置标签页
-        # ★ 称号卡片必须仍然排最末（test_shopcfg / test_backup 拿它当「最新加的那份」）
-        self.assertEqual(shopcfg.CARDS_FILENAME, list(shopcfg._SPECS)[-1])
+        # ★ 最新加的那份必须排最末（test_shopcfg / test_backup 拿它当「最新加的那份」）
+        #   —— X23 起是晋级任务，自定义武器不能插到它后面去。
+        self.assertEqual(shopcfg.MISSIONS_FILENAME, list(shopcfg._SPECS)[-1])
 
     def test_first_boot_writes_an_empty_table(self):
         created = shopcfg.ensure_files(self.dir)

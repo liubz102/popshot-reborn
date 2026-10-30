@@ -1648,8 +1648,10 @@ class SchemaTests(unittest.TestCase):
 
     def test_field_types_are_ones_the_page_can_draw(self):
         # 前台认得的就这几种；写错一个字，那一格会变成空白。
+        # ★ `rewards`（X23 晋级任务的奖励格：金币 / 经验 / 物品 + 数量，最多 3 项）
+        #   只有「晋级任务」页画它（`admin.js` 的 `missionRewardSlots`）。
         known = {"item", "text", "int", "bool", "choice", "materials",
-                 "conditions"}
+                 "conditions", "rewards"}
         for which in shopcfg.SCHEMA:
             for field in shopcfg.SCHEMA[which]["fields"]:
                 self.assertIn(field["type"], known,

@@ -38,6 +38,10 @@
          对战 = 模式 × 个人/组队，闯关 = 关卡 × 难度，顶上一个「金币 / 经验」
          切换让两张表复用同一套行列。渲染器是 admin.js 的 `renderRewards`。 -->
     <button data-tab="rewards">金币 / 经验</button>
+    <!-- ★ 大厅「任务」面板里那些晋级任务（X23）。一条一行、按「线 · 角色」分组，
+         名字 / 条件 / 奖励各走一个弹窗（`#missionModal`）。没有删除只有停用 ——
+         任务编号永不复用。渲染器是 admin.js 的 `renderMissions`。 -->
+    <button data-tab="missions">晋级任务</button>
     <!-- ★ 这一页**三档身份都看得见**（用户 2026-09-12）：玩家卖自己的，
          管理员卖他那个同名游戏账号的。既不是配置页也不是系统管理员专页，
          所以 admin.js 里给它开了第三张表 `EVERYONE_TABS`。 -->
@@ -639,6 +643,32 @@
         <div class="history-list" id="historyList"></div>
       </div>
       <div class="history-right" id="historyDetail"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 晋级任务：三个设置窗共用这一个壳（X23）============
+     行右边那三颗钮（任务内容 / 完成条件 / 奖励）开的都是它，里面的格子由
+     admin.js 的 `renderMissionModal` 照 `SCHEMA.missions` 现画。顶上那句是
+     「名字 ｜ 条件」实时现算的，配得不对就转红、底下补一行说清哪儿不对，
+     而且**保存钮按不动**（同称号卡片那两个窗）。
+     ★ 有没保存的改动 ⇒ **点遮罩不关**，Esc 和 ✕ 当取消、先问一句。
+     ★ 必须排在 #picker 前面：「奖励」窗里点物品格子弹的选择器要盖在它上面。 -->
+<div class="modal hidden" id="missionModal">
+  <div class="panel mission-panel">
+    <div class="panel-title">
+      <h2 id="missionTitle">晋级任务</h2>
+      <button class="icon-btn" id="missionClose" aria-label="关闭"
+              title="取消">✕</button>
+    </div>
+    <div class="panel-body">
+      <div class="card-say-box" id="missionSay"></div>
+      <div class="card-say-why hidden" id="missionWhy"></div>
+      <div class="mission-fields" id="missionFields"></div>
+    </div>
+    <div class="panel-foot">
+      <button class="btn" id="missionCancel">取消</button>
+      <button class="btn btn-primary" id="missionSave">保存</button>
     </div>
   </div>
 </div>

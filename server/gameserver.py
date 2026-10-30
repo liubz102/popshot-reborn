@@ -44,6 +44,7 @@ import argparse
 import collections
 import contextlib
 import datetime
+import itertools
 import os
 import random
 import select
@@ -96,6 +97,9 @@ import shopcfg
 #: 了一批函数，累计战绩那两个读取器按模块名取，省得再往那张导入清单里塞。
 import account_store
 import cards
+#: ★ 晋级任务（X_Mod X23）：纯函数 —— 这一局给哪几条任务 +几、每个人那张表长什么样、
+#: `0x02e0` / `0x02e1` / `0x0F03` 怎么组包。这里只管「什么时候推」。
+import missions
 import shopdata
 from tickets import TicketStore, short as short_ticket
 import udpsync
@@ -176,6 +180,17 @@ OP_HOOK_WEAPON_TABLE = 0x0F01
 #: 仓库提示框的文字来自客户端缓存住的 `ItemInfo`（重发 `0x0501` 刷不掉，§39），
 #: 所以由 bshook 在绘制点 `0x4554e7` 按物品 id 换掉。载荷见 `weaponcfg.build_desc_frame()`。
 OP_HOOK_ITEM_DESC = 0x0F02
+#: ★★ 服务端 -> **bshook**：「晋级任务表」（X_Mod · X23）。还是我们自造的 opcode：
+#: 整张 `Promotion-chn.ini`（UTF-16LE）按 32 KiB 分片，bshook 收齐验 crc 后喂给
+#: 游戏自己的加载器 `0x55a2d9` 重建任务单例 `[0x72e954]`（D111）。
+#: 片头 / 拼装规矩见 `missions.build_table_frames()`、`hook/promo_wire.h`。
+OP_HOOK_PROMO_TABLE = missions.OP_HOOK_TABLE
+#: ★ 原版晋级任务的三个包（X23，FINDINGS §154~）。**同号两个方向**：
+#: S→C `0x02e0` = 六条链的 A / B / C（72 B，静默）；C→S `0x02e0` = 「开始」{i32 id}。
+#: S→C `0x02e1` = 进度 / 完成弹窗（24 B）；C→S `0x02e1` = 专用关卡打通 {i32 id}。
+#: S→C `0x02e2` = 拒绝（文案「时间太短」，我们不发）。
+OP_PROMO_STATUS = missions.OP_STATUS
+OP_PROMO_COMPLETE = missions.OP_COMPLETE
 #: `gspRepLogin` 的结果码 3 = 客户端 `0x54f3cf`「断开」（V0.1 §44）。
 #: 弹的框是 `Data\Chinese.ini` 里的「在无法连接的地方尝试了连接。」（§132）。
 #:
@@ -730,6 +745,10 @@ GCP_NAMES = {
     0x020b: "gcpReqMoveChannelByGameType",
     0x020d: "gcpReqUserList",
     0x020e: "gcpReqNotAcceptWhisper",
+    # 晋级任务面板（X23）。都是 RawPacket（`0x5596d1` / `0x5596f1` 各写一个 i32），
+    # 没有 gcp 类名：点「开始」带客户端 id；专用关卡打通也带客户端 id。
+    0x02e0: "rawPromotionStart",
+    0x02e1: "rawPromotionMapCleared",
     0x0302: "gcpChangeSession",
     0x0305: "gcpSendChatMsg",
     0x030b: "gcpKickOut",
@@ -6625,6 +6644,57 @@ def broadcast_hook_item_desc(reason="", log=None):
     return pushed
 
 
+#: `0x0F03` 的序号：每推一次 +1，**只给日志对账用**（bshook 那行「收到 serial=… crc=…」
+#: 和服务端这行逐行对得上）。去重靠 crc，不靠它。
+_PROMO_SERIAL = itertools.count(1)
+
+
+def broadcast_missions(reason="", log=None):
+    """把晋级任务表 + 状态推给**全部已登录**的连接（X23）。返回真推了表的连接数。
+
+    管理页保存 `missions.json`（或物品库 —— 奖励的物品名在表里）之后调它；凌晨 4 点
+    换期的那条线程也调它。每条连接各算各的表（每个人的完成状态不同），**按 crc 的闩**
+    挡掉没变的 ⇒ 在线人多也只有真变了的那几个人收包。
+    """
+    rules, warnings = shopcfg.missions()
+    if log:
+        for warning in warnings:
+            log(f"⚠ missions.json: {warning}")
+    pushed = 0
+    for conn in all_conns():
+        try:
+            if conn.sync_hook_missions(reason=reason, rules=rules):
+                pushed += 1
+        except Exception as error:  # noqa: BLE001 —— 一条连接坏了别拖累别人
+            if log:
+                log(f"⚠ 推晋级任务表给 {conn.peer()} 失败：{error}")
+    if log:
+        log(f"[missions] 晋级任务表已推给 {pushed} 条在线连接{reason}")
+    return pushed
+
+
+def start_mission_reset_thread(log=None):
+    """凌晨 4 点换期（每天 / 周一 / 每月 1 日）时给在线玩家重推一遍任务表（X23）。
+
+    ★ 铁律 10 的例外：这里等的是**日历上的边界本身**（4:00），没有任何事件可等 ——
+      换期不靠这条线程改存档（周期键读的时候现算，`missions.period_key`），它只负责
+      让**在线**的人面板上那几条到点刷新；不在线的人下次登录自然拿到新的。
+    ★ 醒早了（`sleep` 的抖动）也没关系：内容没变就被 crc 闩吃掉，下一圈再等到真边界。
+    """
+    def run():
+        while True:
+            time.sleep(logcleanup.seconds_until_daily(hour=missions.RESET_HOUR))
+            try:
+                broadcast_missions(reason="（凌晨 4 点换期）", log=log)
+            except Exception as error:  # noqa: BLE001 —— 家务线程不许死
+                if log:
+                    log(f"[missions] 4 点换期重推出错（忽略）：{error!r}")
+
+    thread = threading.Thread(target=run, daemon=True, name="mission-reset")
+    thread.start()
+    return thread
+
+
 def conn_is_playing(conn):
     """这条连接现在是不是**在打游戏**（而不是待在大厅/房间里）。
 
@@ -7240,6 +7310,17 @@ class Conn:
     #   `shop_items.json` 里的武器基值，拿 serial 当闩会漏掉「运营改了物品库」
     #   那一路，症状是「就是不更新」。
     hook_desc_key = None
+    # ★ 晋级任务（X23）四样连接级状态。类级默认是给 `Conn.__new__` 造的测试夹具的；
+    #   两个可变的（钉住表 / 待补弹窗）用 `None` 当哨兵、第一次用时现建，同下面 `sync_trail`。
+    #   · `hook_promo_crc`：上一次推给 bshook 的任务表的 crc32 —— **闩**，表没变一个字节不发；
+    #   · `promo_status_sent`：上一次发的 `0x02e0` 载荷 —— 同样是闩；
+    #   · `promo_pins`：`{(线, 页签): 任务 id}`，玩家点过「开始」的那条（这条连接活着时有效）；
+    #   · `promo_popups`：结算时完成的任务的 `0x02e1` 载荷，**回大厅要持有物时**补发
+    #     （必须在新表推下去之前：弹窗按客户端表里那条记录画奖励，新表里它已经没了）。
+    hook_promo_crc = None
+    promo_status_sent = None
+    promo_pins = None
+    promo_popups = None
     # ★ 位置轨迹同理，但它是**每条连接一份的可变对象** —— 类上放一个共享的
     #   deque 会让所有实例往同一条轨迹里写。所以类级默认放一个空元组当哨兵，
     #   `note_sync_position()` 碰到它时现建一个（只有 `Conn.__new__` 造的
@@ -8726,6 +8807,8 @@ class Conn:
         self.send_hook_weapon_table(reason="（登录后下发）")
         # ★ X10：仓库提示框的说明文同理。刚登录必然在大厅 ⇒ 现算出来就是 PVE 那套。
         self.sync_hook_item_desc(reason="（登录后下发）")
+        # ★ X23：这个玩家自己的晋级任务表（0x0F03）+ 六条链的状态（0x02e0）。
+        self.sync_hook_missions(reason="（登录后下发）")
         # 每一关的「已达成难度」。这张 map 只有服务端能填，不发就等于
         # 全部关卡只有「简单」能开局（§118）。
         self.send_quest_reached_difficulty(reason="（登录后下发）")
@@ -10193,6 +10276,9 @@ class Conn:
         card_rules, card_cfg_warnings = shopcfg.cards()
         for warning in card_cfg_warnings:
             self.log(f"   ⚠ cards.json: {warning}")
+        # ★ 晋级任务的规则表（X23）同样房间级读一次。
+        mission_rules = self.mission_rules()
+        mission_results = {}   # 座位 -> (连接, [事件], 发没发礼物)
         # ★★ **这一局算不算奖励**（防刷，V0.3.3 / D127，X_Mod D104 扩到经验金币）。
         #    房间级的一句话，所以在座位循环**之前**判一次、记一行 —— 放进循环
         #    的话 bot 座位也会各收一份（`settlement_seats()` 把 bot 也算进来）。
@@ -10359,11 +10445,34 @@ class Conn:
                         match=gained_stats, total=after_stats,
                         bases=account_store.card_bases(conn.account)):
                     conn.vlog("      " + line)
+            # ★★ 晋级任务（X23）：**所有能做的任务同时推进**（D112）—— 每条启用的、
+            #    等级够、角色对得上、本期没完成的任务各自看这一局算不算。
+            #    ★ 不计奖励那一局（X19 的 bot 受限闩）一条都不推进：任务奖励也是奖励。
+            #    ★ 等级取**这一局之前**的（入账前的存档）：这一局升上来的级不算数。
+            mission_events = []
+            mission_state_new = None
+            mission_gifts = []
+            if conn.account_name and not reward_block and mission_rules:
+                mission_state_new, mission_events = missions.settle(
+                    mission_rules, account_store.mission_state(conn.account),
+                    level=player_level(conn.account),
+                    character=quest.character_for(
+                        seat, player_character(conn.account)),
+                    line=stat_mode, won=seat_won, match=gained_stats,
+                    pvp_mode=pvp_mode, item_mode=item_mode,
+                    stage=quest_info[0] if quest_info else None,
+                    difficulty=quest_info[1] if quest_info else None)
+                if not mission_events:
+                    mission_state_new = None
+                mission_gifts = [(missions.gift_specs(event["mission"]),
+                                  missions.gift_message(event["mission"]))
+                                 for event in mission_events if event["done"]]
             granted = {}
             # ★★ 经验 / 金币 / 材料 / 战绩 / 卡片**一把锁、一次写盘**（V0.3商店）。
             #    以前这里是 `add_quest_reward` + `add_materials` 两发，
             #    合成一发之后每人每局反而少写一次盘，而且不再有
             #    「经验加了、材料没加上」那种中间态。
+            gift_problems = []
             if conn.account_name:
                 try:
                     conn.account, skipped, granted = conn.accounts.apply_battle(
@@ -10376,15 +10485,28 @@ class Conn:
                         #   （经验 / 金币 / 材料）在前面就已经是 0 / 空了（D104）。
                         stats_mode=None if reward_block else stat_mode,
                         stats_gained=None if reward_block else gained_stats,
-                        cards=give_cards, card_bases=card_bases)
+                        cards=give_cards, card_bases=card_bases,
+                        # 晋级任务的完成 / 进度 + 奖励礼物同一次写盘（X23）。
+                        # ★ 没有事件就一个键都不带：这一局任务什么都没变。
+                        **({"missions": mission_state_new,
+                            "mission_gifts": mission_gifts,
+                            "gift_problems": gift_problems}
+                           if mission_events else {}))
                 except KeyError:
                     skipped = []
+                    mission_events = []
                     conn.log(f"   存档里没有账号 {conn.account_name!r}；本局所得未入账")
                 if skipped:
                     conn.log(f"   ⚠ 掉落里有客户端不认识的 id，已跳过: {skipped}")
                     for item_id in skipped:
                         dropped.pop(item_id, None)
                         granted.pop(item_id, None)
+                for problem in gift_problems:
+                    conn.log(f"   ⚠ 晋级任务奖励发不出去：{problem}")
+                if mission_events:
+                    conn.note_mission_events(mission_events, reason="（结算）")
+                    mission_results[seat] = (conn, mission_events,
+                                             bool(mission_gifts))
             # ★ 每种材料 / 卡片**发一发就够**：`0x493f24` 是 `add [entry], count`，
             #   同一个 itemId 发两次客户端会累加（§3 约束 2）。
             #   ★ 卡片走**槽 1**（`[GameContext + 0xec + seat*20]`）——
@@ -10494,6 +10616,18 @@ class Conn:
         #      可能是控制通道、也可能是替全场结算的别人（D127 ⑨）。
         if reward_block:
             room_system_chat(room, "⚠ 本局开启过 bot 限制，不结算奖励。")
+        # ★★ 晋级任务（X23）：结算三连发之后，**只给本人**说进度 / 完成（面板上每条线
+        #    只显示两条，其余的全靠这几行），奖励进了礼物箱就推一发 `0x0507`，
+        #    再发 `0x02e0` 把面板上那条的进度对齐。完成弹窗（`0x02e1`）已经排在连接上，
+        #    回大厅要持有物时先补弹窗、再推新表（`OP_REQ_INVENTORY`）。
+        for seat, (member, events, gifted) in sorted(mission_results.items()):
+            try:
+                member.mission_chat(events)
+                if gifted:
+                    member.send_gift_arrived(reason="（晋级任务奖励）")
+                member.send_mission_status(mission_rules, reason="（结算后）")
+            except OSError as error:
+                member.log(f"   晋级任务下发失败（{error!r}），忽略")
         reward_count = sum(len(payloads) for payloads in rewards.values())
         self.log(f"← 已结算本局：每人各收到 {reward_count} 份"
                  f" gspRewardReceived(0x041c，合成材料) + {len(results)} 份"
@@ -12223,6 +12357,10 @@ class Conn:
             self.on_move_into_session(payload)
         elif opcode == OP_QUICK_JOIN_SESSION:
             self.on_quick_join_session(payload)
+        elif opcode == OP_PROMO_STATUS and self.account_name:
+            self.on_promotion_start(payload)
+        elif opcode == OP_PROMO_COMPLETE and self.account_name:
+            self.on_promotion_map_cleared(payload)
         elif opcode == OP_CHAT:
             self.on_chat(payload)
         elif opcode == 0x0201:
@@ -12557,6 +12695,13 @@ class Conn:
             self.send_rep_inventory(reason="（客户端要的）")
             # 进大厅 / 进商店都会要一次持有物 —— 顺手看一眼礼物盒有没有新东西（§75）。
             self.notify_gifts_if_new()
+            # ★ 晋级任务（X23）：结算时完成的那几条先补弹窗（按**旧表**里那条记录画奖励），
+            #   再推新表 + 状态（完成的那条从面板上消失）。没变就被闩吃掉，一个字节不发。
+            #   ★ 只在这条连接**推过表**之后才对（登录那一发是第一张表）。
+            if self.promo_popups:
+                self.flush_mission_popups(reason="（回到大厅 / 房间）")
+            if self.hook_promo_crc is not None:
+                self.sync_hook_missions(reason="（要持有物时对一遍）")
         elif opcode == OP_REQ_ITEM_INFO:
             self.on_req_item_info(payload)
         elif opcode == OP_REQ_ITEM_BUY:
@@ -12689,6 +12834,231 @@ class Conn:
                  f" 按【{weaponcfg.MODE_ZH[mode]}】{reason}")
         self.send(build_game(OP_HOOK_ITEM_DESC, payload))
         return True
+
+    # ------------------------------------------------- 晋级任务（X_Mod X23）
+    def mission_rules(self):
+        """`missions.json` 洗过的规则表（热重载；坏文件保留上一份好的）。"""
+        rules, warnings = shopcfg.missions()
+        for warning in warnings:
+            self.log(f"   ⚠ missions.json: {warning}")
+        return rules
+
+    def sync_hook_missions(self, reason="", rules=None, force_status=False):
+        """把**这个玩家自己的**任务表（`0x0F03`，分片）+ 六条链的状态（`0x02e0`）推下去。
+
+        * 表：启用的、本期没完成的任务（`missions.player_chains`）→ 客户端 ini；
+          **按 crc 的闩**（`hook_promo_crc`）—— 内容没变一个字节不发，所以这个函数
+          是幂等的，调用点宁多勿少（登录 / 回大厅 / 4 点 / 管理页保存）。
+          bshook 那边同样按 crc 跳过「没变的表」（不重建、不泄漏）。
+        * 状态：表推了就一定跟一发（bshook 重建时抄的是旧单例的 A/B/C）；
+          没推表时只在内容变了才发（`promo_status_sent`）。
+        ★ 表和状态在**同一个 `send_batch`** 里：几片表之间不会插进别的包，
+          状态也不会跑到表前面去。返回发没发表。
+        """
+        if not self.account_name:
+            return False
+        if rules is None:
+            rules = self.mission_rules()
+        now = time.time()
+        state = account_store.mission_state(self.account)
+        chains = missions.player_chains(rules, state, now=now)
+        data = missions.build_client_ini(chains)
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        heads = missions.chain_heads(chains, state,
+                                     level=player_level(self.account), now=now,
+                                     pins=self.promo_pins)
+        status = missions.build_status(heads)
+        sent_table = crc != self.hook_promo_crc
+        if not sent_table and status == self.promo_status_sent and not force_status:
+            return False
+        with self.send_batch(reason="晋级任务表"):
+            if sent_table:
+                serial = next(_PROMO_SERIAL)
+                frames = missions.build_table_frames(data, serial)
+                for frame in frames:
+                    self.send(build_game(OP_HOOK_PROMO_TABLE, frame))
+                self.hook_promo_crc = crc
+                counts = "、".join(
+                    "%s%s %d" % (shopcfg.CHARACTER_ZH.get(tab, tab),
+                                 missions.LINE_ZH[line], len(chains[(line, tab)]))
+                    for tab in missions.TABS for line in missions.LINES)
+                self.log(f"← 发 0x0F03 晋级任务表 serial={serial} {len(data)} 字节"
+                         f" {len(frames)} 片 crc={crc:08x}（{counts}）{reason}")
+            self.send(build_game(OP_PROMO_STATUS, status))
+            self.promo_status_sent = status
+            self.log("← 发 0x02e0 晋级任务状态 " + " ".join(
+                "%d/%d/%d" % head for head in heads) + reason)
+        return sent_table
+
+    def send_mission_status(self, rules=None, reason=""):
+        """只发 `0x02e0`（不推表）：结算后把面板上的进度对齐。
+
+        ★ 客户端手里还是**上一张表**（新表回大厅才推）。这一发的 B 是按新的完成状态
+        挑的 —— 完成只会让任务**离开**表，所以挑出来的 id 一定还在旧表里，对得上。
+        """
+        if not self.account_name:
+            return False
+        if rules is None:
+            rules = self.mission_rules()
+        now = time.time()
+        state = account_store.mission_state(self.account)
+        chains = missions.player_chains(rules, state, now=now)
+        heads = missions.chain_heads(chains, state,
+                                     level=player_level(self.account), now=now,
+                                     pins=self.promo_pins)
+        status = missions.build_status(heads)
+        if status == self.promo_status_sent:
+            return False
+        self.send(build_game(OP_PROMO_STATUS, status))
+        self.promo_status_sent = status
+        self.log("← 发 0x02e0 晋级任务状态 " + " ".join(
+            "%d/%d/%d" % head for head in heads) + reason)
+        return True
+
+    def pin_mission(self, line, tab, mission_id):
+        if self.promo_pins is None:
+            self.promo_pins = {}
+        self.promo_pins[(line, tab)] = mission_id
+
+    def queue_mission_popup(self, payload):
+        if self.promo_popups is None:
+            self.promo_popups = []
+        self.promo_popups.append(payload)
+
+    def flush_mission_popups(self, reason=""):
+        """把结算时攒下的完成弹窗（`0x02e1`）补发掉。**要在新表推下去之前**调。"""
+        popups = self.promo_popups or []
+        self.promo_popups = []
+        for payload in popups:
+            tab, context, done_id, current_id, progress, completed = \
+                struct.unpack("<iiiiii", payload)
+            self.log(f"← 补发 0x02e1 晋级任务完成弹窗 页签={tab} 线={context}"
+                     f" 完成={done_id} 当前={current_id}{reason}")
+            self.send(build_game(OP_PROMO_COMPLETE, payload))
+        return len(popups)
+
+    def mission_chat(self, events):
+        """结算时只给本人的系统聊天：每条推进 / 完成一行（面板上只显示两条，其余靠它）。"""
+        for event in events:
+            mission = event["mission"]
+            name = missions.display_name(mission)
+            if event["done"]:
+                text = (f"【晋级任务】「{name}」完成！奖励已放进礼物箱："
+                        f"{missions.rewards_text(mission)}")
+            else:
+                text = (f"【晋级任务】「{name}」进度 "
+                        f"{event['after']}/{int(mission.get('target', 1))}")
+            self.send_system_chat(text)
+
+    def on_promotion_start(self, payload):
+        """C→S `0x02e0`：玩家在任务面板里点了「开始」（X23）。
+
+        客户端已经本地把 B 设成选中那条了。能做 ⇒ 钉住（这一条链的 B 就是它，
+        直到做完 / 换一条），回一发 `0x02e0` 对齐；不能做（已完成 / 等级不够 /
+        已停用 / 表里根本没有）⇒ 回 `0x02e0` 纠正 + 一句聊天说明。
+        ★ 不用 `0x02e2`：它的文案是「时间太短」，说不清是怎么回事。
+        """
+        value = missions.parse_request_id(payload)
+        parsed = missions.split_client_id(value)
+        rules = self.mission_rules()
+        mission = None
+        if parsed is not None:
+            mission = next((m for m in rules if m["id"] == parsed[0]), None)
+        state = account_store.mission_state(self.account)
+        if mission is None or not missions.doable(
+                mission, level=player_level(self.account), character=parsed[1],
+                state=state):
+            self.log(f"   晋级任务「开始」{value}：这一条现在做不了 → 回 0x02e0 纠正")
+            self.send_system_chat("【晋级任务】这个任务现在做不了"
+                                  "（已完成 / 等级不够 / 已停用），已刷新任务面板。")
+            self.sync_hook_missions(reason="（「开始」被拒，纠正）", rules=rules,
+                                    force_status=True)
+            return
+        self.pin_mission(mission["line"], parsed[1], mission["id"])
+        self.log(f"   晋级任务「开始」{value} = 任务 #{mission['id']}"
+                 f"「{missions.display_name(mission)}」，钉成这一条链的当前任务")
+        self.sync_hook_missions(reason="（点了「开始」）", rules=rules,
+                                force_status=True)
+
+    def on_promotion_map_cleared(self, payload):
+        """C→S `0x02e1`：专用关卡（本机单人图）打通了（X23）。
+
+        客户端只在**B 还是这一条**时才报（`0x55b299`）。服务端要求：任务能做 + 这条连接
+        点过它的「开始」—— 否则不发奖、回 `0x02e0` + 聊天说明。通过 ⇒ 记完成、奖励进
+        礼物箱、推 `0x0507`；完成弹窗当场补（人还在打完的那张图上，回大厅才推新表）。
+        """
+        value = missions.parse_request_id(payload)
+        parsed = missions.split_client_id(value)
+        rules = self.mission_rules()
+        mission = None
+        if parsed is not None:
+            mission = next((m for m in rules if m["id"] == parsed[0]), None)
+        state = account_store.mission_state(self.account)
+        pinned = (self.promo_pins or {}).get(
+            (mission["line"], parsed[1])) if mission else None
+        ok = (mission is not None and mission.get("kind") == missions.KIND_MAP
+              and pinned == mission["id"]
+              and missions.doable(mission, level=player_level(self.account),
+                                  character=parsed[1], state=state))
+        if not ok:
+            self.log(f"   晋级任务「专用关卡打通」{value}：不认（不是专用关卡 / 没点过"
+                     f"「开始」/ 已完成 / 等级不够）→ 不发奖，回 0x02e0 纠正")
+            self.send_system_chat("【晋级任务】这次通关没有算进任务"
+                                  "（要先在任务面板里点「开始」，并且任务还没完成）。")
+            self.sync_hook_missions(reason="（专用关卡没算，纠正）", rules=rules,
+                                    force_status=True)
+            return
+        new_state, event = missions.complete_map(mission, state)
+        self.apply_mission_results(rules, new_state, [event], tab=parsed[1],
+                                   reason="（专用关卡打通）")
+        # 人还在那张图上（或刚出来），完成弹窗当场发；新表等回大厅要持有物时再推。
+        self.flush_mission_popups(reason="（专用关卡打通）")
+
+    def apply_mission_results(self, rules, new_state, events, tab=None, reason=""):
+        """结算以外那一路（专用关卡）：完成 / 进度 + 奖励一次落盘，再聊天 / `0x0507`。"""
+        gifts = [(missions.gift_specs(e["mission"]), missions.gift_message(e["mission"]))
+                 for e in events if e["done"]]
+        problems = []
+        try:
+            self.account, _skipped, _given = self.accounts.apply_battle(
+                self.account_name, missions=new_state, mission_gifts=gifts,
+                gift_problems=problems)
+        except KeyError:
+            self.log(f"   存档里没有账号 {self.account_name!r}；晋级任务没入账")
+            return
+        for problem in problems:
+            self.log(f"   ⚠ 晋级任务奖励发不出去：{problem}")
+        self.note_mission_events(events, tab=tab, reason=reason)
+        self.mission_chat(events)
+        if gifts:
+            self.send_gift_arrived(reason="（晋级任务奖励）")
+
+    def note_mission_events(self, events, tab=None, reason=""):
+        """把这一批事件记日志 + 完成的那几条排进待补弹窗（`0x02e1`）。"""
+        character = player_character(self.account)
+        for event in events:
+            mission = event["mission"]
+            target = int(mission.get("target", 1))
+            head = (f"#{mission['id']}「{missions.display_name(mission)}」"
+                    f"{missions.PERIOD_ZH.get(mission['period'], '')}")
+            if not event["done"]:
+                self.log(f"   晋级任务 {head} 进度 {event['before']} → "
+                         f"{event['after']}/{target}{reason}")
+                continue
+            self.log(f"   晋级任务 {head} 完成！奖励进礼物箱："
+                     f"{missions.rewards_text(mission)}{reason}")
+            self.online(f"晋级任务 账号={self.account_name!r} 完成 #{mission['id']}"
+                        f"「{missions.display_name(mission)}」"
+                        f"奖励 {missions.rewards_text(mission)}{reason}")
+            # 弹窗用哪个页签的客户端 id：任务定了角色就是那个；不限角色的用这局的角色
+            # （爱琳没有页签 ⇒ 泰尔页，面板打开默认也是它）。
+            want = mission.get("character", missions.CHAR_ANY)
+            page = (want if want in missions.TABS
+                    else tab if tab in missions.TABS
+                    else character if character in missions.TABS else 0)
+            self.queue_mission_popup(missions.build_complete(
+                page, mission["line"], missions.client_id(mission["id"], page),
+                0, 0, True))
 
     def on_req_item_info(self, payload):
         """客户端方向的 `0x0601` —— 「这些 id 我不认识，给我定义」（§28）。

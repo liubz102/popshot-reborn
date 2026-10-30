@@ -277,7 +277,8 @@ var CFG_SHOWN = null;
 //: 走 `#cfgPanel` 那套壳的标签页（读 / 存 / 脏标记 / 三方合并全共用）。
 //  ★ `rewards` 也在里面 —— 它画的是两张二维表格而不是卡片列表，但
 //    「读一份 json、改、保存、撞车了合并」这一整条链一个字都不用改（D72）。
-var CONFIGS = ["items", "shop", "recipe", "drops", "cards", "rewards"];
+var CONFIGS = ["items", "shop", "recipe", "drops", "cards", "rewards",
+               "missions"];
 
 /** 一共几份运营配置 / 分别叫什么。
  *
@@ -1497,7 +1498,8 @@ function renderToolbar(which) {
   if (which !== "rewards" && which !== "cards") {
     var search = document.createElement("input");
     search.type = "text";
-    search.placeholder = "搜 中文名 / 韩文名 / id";
+    search.placeholder = (which === "missions") ? "搜 任务名 / 条件 / 编号"
+                                                : "搜 中文名 / 韩文名 / id";
     search.value = filter.q;
     search.oninput = function () {
       filter.q = search.value.trim();
@@ -1508,7 +1510,15 @@ function renderToolbar(which) {
 
   // ★ 称号卡片页也不画「角色」下拉：17 张卡片一张都不限角色，
   //   那个下拉只会一选就空。
-  if (which !== "drops" && which !== "rewards" && which !== "cards") {
+  // ★ 晋级任务页也不画这三个共用下拉（角色 / 上架状态 / 来源）：它们筛的是
+  //   **物品**，任务那几个筛选在下面单列（`MISSION_FILTERS`）。
+  if (which === "missions") {
+    MISSION_FILTERS.forEach(function (spec) {
+      bar.appendChild(selectFilter(filter, spec.key, spec.all, spec.options()));
+    });
+  }
+  if (which !== "drops" && which !== "rewards" && which !== "cards"
+      && which !== "missions") {
     // ★ 角色 / 上架状态两个下拉（用户 2026-09-09，D68）：和「选择物品」弹窗、
     //   「修改仓库」弹窗**同一份选项、同一条判据**（`characterOptions` /
     //   `LISTING_FILTER_OPTIONS` / `dropdownsMatch`）。「类别」下拉（shopdata 的
@@ -1529,7 +1539,8 @@ function renderToolbar(which) {
   //   点名要它（以后会加自定义材料），而且「筛出空列表也是有用的信息」本来就是
   //   `characterOptions()` 立下的规矩。
   //   「金币 / 经验」和「称号卡片」两页不挂：它们压根没有筛选条，只有一个视图切换。
-  if (which !== "rewards" && which !== "cards") {
+  //   晋级任务页也不挂：任务不是物品。
+  if (which !== "rewards" && which !== "cards" && which !== "missions") {
     bar.appendChild(selectFilter(filter, "source", "全部物品",
                                  SOURCE_FILTER_OPTIONS));
   }
@@ -1694,6 +1705,10 @@ function emptyFilter() {
   filter.group = CARD_GROUPS[0].id;
   // 「金币 / 经验获取」页当前看的是哪一半（`REWARD_VIEWS`）。
   filter.view = REWARD_VIEWS[0].id;
+  // 晋级任务页：哪条线 / 哪种周期 / 启用还是停用（`MISSION_FILTERS`）。
+  filter.line = "";
+  filter.period = "";
+  filter.state = "";
   return filter;
 }
 
@@ -1719,7 +1734,8 @@ function dropFieldMatches(value, wanted) {
 //  （函数声明会被提升，所以写在它们前面没问题。）
 var RENDERERS = {items: renderItems, shop: renderShop,
                  recipe: renderRecipe, drops: renderDrops,
-                 cards: renderCards, rewards: renderRewards};
+                 cards: renderCards, rewards: renderRewards,
+                 missions: renderMissions};
 
 function repaintList() {
   var list = $("cfgList");
@@ -1736,6 +1752,26 @@ function repaintList() {
     paintCfgTabs(CURRENT, []);
     CFG_SHOWN = null;
     RENDERERS.rewards(list, CFG.rewards.entries);
+    lockList();
+    list.scrollTop = keep;
+    touched();
+    return;
+  }
+  // ★ 「晋级任务」页也从这儿分岔（X23）：任务不是物品，下面那套按物品算的
+  //   筛选 / 分类标签一样都用不上。它按「线 · 角色」分组、自己筛（`missionRows`）。
+  if (CURRENT === "missions") {
+    paintCfgTabs(CURRENT, []);
+    var shown = missionRows();
+    var count = CFG.missions.entries.length;
+    CFG_SHOWN = (shown.length !== count)
+      ? {which: CURRENT, shown: shown.length, total: count} : null;
+    if (!shown.length) {
+      list.appendChild(el("div", "list-empty",
+                          count ? "没有符合筛选条件的任务"
+                                : (isReadOnly() ? "这一份配置还是空的"
+                                                : "还没有任务 —— 点「添加」")));
+    }
+    RENDERERS.missions(list, shown);
     lockList();
     list.scrollTop = keep;
     touched();
@@ -1823,7 +1859,9 @@ function paintCfgTabs(which, filtered) {
   // ★ 称号卡片页也藏：17 张卡片在仓库树里全归「收集品 → 卡片」一格，
   //   画出来是「全部(17) / 收集品(17) / 卡片(17)」三个一模一样的钮
   //   —— 两行版面换零信息。分组切换在工具条上（`CARD_GROUPS`）。
-  var hide = (which === "drops" || which === "rewards" || which === "cards");
+  // ★ 晋级任务页也藏：任务不是物品，仓库那棵树对它没有意义。
+  var hide = (which === "drops" || which === "rewards" || which === "cards"
+              || which === "missions");
   bigHost.classList.toggle("hidden", hide);
   if (hide) {
     bigHost.textContent = "";
@@ -3870,6 +3908,692 @@ function paintPicker() {
   $("pickCount").textContent = hits.length + " 件";
   paintPickFoot();
   grid.scrollTop = keep;
+}
+
+/* ======================================================================
+   晋级任务（X_Mod X23，用户 2026-10-30）
+
+   大厅右下角「任务」面板里的任务。一条任务一行，按「对战 / 闯关 × 角色」
+   分组；行上直接改 启用 / 周期 / 顺序 / 等级，名字 · 条件 · 奖励各走一个
+   弹窗（和称号卡片那两个窗同一套：改的是草稿，关窗前有没保存的先问一句）。
+   ★ **没有删除只有停用**：任务编号永不复用（存档里的完成记录按编号认人）。
+   ★ 句子（`missionConditionText`）是服务端 `missions.condition_text` 的孪生，
+     词全从 `CAT.mission_text` 来，`test_missiontext` 逐字比两边。
+   ====================================================================== */
+
+function missionWords() { return CAT.mission_text || {}; }
+function missionLimits() { return CAT.mission_limits || {}; }
+
+/** `SCHEMA.missions` 里某个字段的描述（下拉选项从这儿取，不另抄一份）。 */
+function missionSpec(key) {
+  var found = null;
+  (((CAT.schema || {}).missions || {}).fields || []).forEach(function (spec) {
+    if (spec.key === key) { found = spec; }
+  });
+  return found || {key: key};
+}
+
+/** 「每局达成」那串条件的子字段（`SCHEMA.missions.conditions.fields`）。 */
+function missionCondSpec(key) {
+  var found = null;
+  (missionSpec("conditions").fields || []).forEach(function (spec) {
+    if (spec.key === key) { found = spec; }
+  });
+  return found || {key: key};
+}
+
+/** 字段描述的一份拷贝，再盖上 `extra` 里那几项（只读 / 过滤过的选项……）。
+ *  ★ 不能直接改 `missionSpec()` 给的那个 —— 它就是 `CAT.schema` 里的原件。 */
+function missionSpecWith(key, extra) {
+  var base = missionSpec(key);
+  var copy = {};
+  Object.keys(base).forEach(function (name) { copy[name] = base[name]; });
+  Object.keys(extra || {}).forEach(function (name) { copy[name] = extra[name]; });
+  return copy;
+}
+
+/** `%s` / `%d` 按顺序替换（服务端是 Python 的 `%`，词表里只用这两种）。 */
+function missionFmt(template, args) {
+  var at = 0;
+  return String(template || "").replace(/%[sd]/g, function () {
+    var value = args[at];
+    at += 1;
+    return (value === undefined || value === null) ? "" : String(value);
+  });
+}
+
+function missionStageLabel(stage) {
+  var quest = (cardWords().quests || {})[String(stage)];
+  return quest ? (stage + " · " + quest) : String(stage);
+}
+
+/** 「在什么局里」那半句（`missions.scope_text` 的孪生）。 */
+function missionScopeText(m) {
+  var words = missionWords();
+  var phrases = words.phrases || {};
+  var lines = words.lines || {};
+  if (m.kind === "map") {
+    return missionFmt(phrases.map_scope, [m.map || phrases.unknown]);
+  }
+  if (m.line === "pvp") {
+    var parts = [];
+    if (m.pvp_mode !== undefined && m.pvp_mode !== null) {
+      parts.push((words.pvp_modes || {})[String(m.pvp_mode)] || String(m.pvp_mode));
+    }
+    if (m.item_mode !== undefined && m.item_mode !== null) {
+      parts.push((words.item_modes || {})[String(m.item_mode)]
+                 || String(m.item_mode));
+    }
+    return (lines.pvp || "") + (parts.length
+      ? missionFmt(phrases.filters, [parts.join(phrases.filter_sep || "")])
+      : "");
+  }
+  var text = lines.quest || "";
+  if (m.stage !== undefined && m.stage !== null) {
+    text += missionFmt(phrases.stage, [missionStageLabel(m.stage)]);
+  }
+  if (m.difficulty !== undefined && m.difficulty !== null) {
+    text += missionFmt(phrases.difficulty, [
+      (cardWords().difficulties || {})[String(m.difficulty)] || m.difficulty,
+      m.harder ? (phrases.harder || "") : ""]);
+  }
+  return text;
+}
+
+/** **条件那句话**（`missions.condition_text` 的孪生）。 */
+function missionConditionText(m) {
+  var phrases = missionWords().phrases || {};
+  var target = Number(m.target === undefined ? 1 : m.target);
+  var head = missionScopeText(m);
+  if (m.kind === "win") { return missionFmt(phrases.win, [head, target]); }
+  if (m.kind === "clear") { return missionFmt(phrases.clear, [head, target]); }
+  if (m.kind === "map") { return missionFmt(phrases.map, [head]); }
+  if (m.count === "sum") {
+    var info = cardMetricInfo(m.metric);
+    var label = info.label || m.metric || "";
+    if (info.weapon && m.weapon !== undefined && m.weapon !== null) {
+      label = ((cardWords().weapons || {})[String(m.weapon)] || m.weapon) + label;
+    }
+    return missionFmt(phrases.sum, [head, label, target]);
+  }
+  var body = cardCondsText(m.conditions || []);
+  return missionFmt(phrases.match,
+                    [head, body || (cardWords().phrases || {}).bad || "", target]);
+}
+
+/** 面板上那一行的名字（`missions.display_name` 的孪生）。 */
+function missionDisplayName(m) {
+  var name = String(m.name || "").trim();
+  if (name) { return name; }
+  var words = missionWords();
+  return missionFmt((words.phrases || {}).name, [
+    (words.period_names || {})[m.period] || (words.phrases || {}).unknown,
+    missionConditionText(m)]);
+}
+
+/** 一项奖励是哪一种：金币 / 经验 / 物品（`MISSION_REWARD_KINDS` 的 value）。 */
+function missionRewardKind(reward) {
+  if (reward.item !== undefined) { return "item"; }
+  if (reward.exp !== undefined) { return "exp"; }
+  return "money";
+}
+
+/** 一项奖励念成一行（`missions.reward_text` 的同口径，管理页只做摘要用）。
+ *  ★ 物品统一写「[物品]」：游戏里那一行分「[材料] / [道具]」，那是服务端
+ *    照物品表现分的，这一页只要看得出发的是什么。 */
+function missionRewardText(reward) {
+  var kind = missionRewardKind(reward);
+  if (kind === "item") {
+    if (!Number(reward.item)) { return "[物品] （还没选）"; }
+    var count = Number(reward.count === undefined ? 1 : reward.count);
+    return "[物品] " + itemName(reward.item) + (count > 1 ? " ×" + count : "");
+  }
+  return (kind === "exp" ? "[经验值] +" : "[金币] +") + reward[kind];
+}
+
+/** 这条任务有没有毛病；没有就返回 `""`。
+ *
+ * ★ 服务端 `missions.validate_missions` 才说了算（保存时会拒），这一份是为了
+ *   「改一格就当场看得见哪儿不对、弹窗里的保存钮按不动」—— 同 `cardRuleProblem`。
+ *   上下限全从 `CAT.mission_limits` 拿，这儿只写提示的话。 */
+function missionProblem(m) {
+  var limits = missionLimits();
+  var max = limits.max_rewards || 3;
+  var texts = limits.text_limits || {};
+  var whole = function (value) {
+    var num = Number(value);
+    return isFinite(num) && Math.floor(num) === num;
+  };
+  var keys = Object.keys(texts);
+  for (var k = 0; k < keys.length; k += 1) {
+    var text = String(m[keys[k]] || "").trim().split(/\s+/).join(" ");
+    if (text.length > texts[keys[k]]) {
+      return "「" + (missionSpec(keys[k]).label || keys[k]) + "」太长了（最多 "
+             + texts[keys[k]] + " 个字，现在 " + text.length + "）";
+    }
+  }
+  var rewards = m.rewards || [];
+  if (!rewards.length) { return "至少要有一项奖励"; }
+  if (rewards.length > max) { return "奖励最多 " + max + " 项"; }
+  for (var i = 0; i < rewards.length; i += 1) {
+    var r = rewards[i] || {};
+    var kind = missionRewardKind(r);
+    if (kind === "item" && !Number(r.item)) {
+      return "第 " + (i + 1) + " 项奖励还没选物品";
+    }
+    var amount = (kind === "item") ? (r.count === undefined ? 1 : r.count) : r[kind];
+    if (!whole(amount) || Number(amount) < 1) {
+      return "第 " + (i + 1) + " 项奖励的数量至少是 1";
+    }
+  }
+  if (!whole(m.target) || Number(m.target) < 1) {
+    return "「" + (missionSpec("target").label || "target") + "」至少是 1";
+  }
+  if (m.kind === "stats" && m.count === "sum") {
+    if ((limits.sum_metrics || []).indexOf(m.metric) < 0) {
+      return "选一项要累计的数值";
+    }
+  } else if (m.kind === "stats") {
+    var why = cardRuleProblem({conditions: m.conditions || []});
+    if (why) { return why; }
+  }
+  return "";
+}
+
+//: 分组的先后：对战在前、闯关在后；同一条线里「不限角色」排最前，再按角色号。
+function missionGroupOf(m) {
+  var line = (m.line === "pvp") ? 0 : 1;
+  var who = Number(m.character === undefined ? -1 : m.character);
+  return line * 10 + (who + 1);
+}
+
+function missionGroupTitle(m) {
+  var words = missionWords();
+  return ((words.lines || {})[m.line] || m.line) + " · "
+         + ((words.characters || {})[String(m.character === undefined
+                                             ? -1 : m.character)]
+            || String(m.character));
+}
+
+//: 工具条上搜索框后面那三个筛选（`renderToolbar`）。线 / 周期的选项照
+//: `SCHEMA.missions` 现取 —— 和行上、弹窗里那两个下拉同一个出处。
+var MISSION_FILTERS = [
+  {key: "line", all: "全部线",
+   options: function () { return missionSpec("line").options || []; }},
+  {key: "period", all: "全部周期",
+   options: function () { return missionSpec("period").options || []; }},
+  {key: "state", all: "启用和停用",
+   options: function () {
+     return [{value: "on", label: "只看启用的"}, {value: "off", label: "只看停用的"}];
+   }}
+];
+
+/** 过筛选条的那些（搜索串 / 线 / 周期 / 状态）。**下标一律用原数组的**。 */
+function missionRows() {
+  var filter = FILTER.missions || {};
+  var q = String(filter.q || "").toLowerCase();
+  var rows = [];
+  CFG.missions.entries.forEach(function (m, index) {
+    if (!m || typeof m !== "object") { return; }
+    if (filter.line && m.line !== filter.line) { return; }
+    if (filter.period && m.period !== filter.period) { return; }
+    if (filter.state === "on" && !m.enabled) { return; }
+    if (filter.state === "off" && m.enabled) { return; }
+    // 条件那句话也搜：「神秘岛」「QuestLevel05」这种只写在条件里的词也找得到。
+    var hay = missionDisplayName(m) + " " + missionConditionText(m) + " #" + m.id;
+    if (q && hay.toLowerCase().indexOf(q) < 0) { return; }
+    rows.push({entry: m, index: index});
+  });
+  rows.sort(function (a, b) {
+    return (missionGroupOf(a.entry) - missionGroupOf(b.entry))
+           || (Number(a.entry.order || 0) - Number(b.entry.order || 0))
+           || (Number(a.entry.id) - Number(b.entry.id));
+  });
+  return rows;
+}
+
+function renderMissions(list, rows) {
+  var group = null;
+  rows.forEach(function (line) {
+    var g = missionGroupOf(line.entry);
+    if (g !== group) {
+      group = g;
+      list.appendChild(el("div", "mission-group", missionGroupTitle(line.entry)));
+    }
+    list.appendChild(missionRow(line.entry, line.index));
+  });
+}
+
+/** 一条任务一行：编号 / 启用 / 周期 / 顺序 / 等级 / 名字 + 条件那句话 + 奖励 / 三颗钮。 */
+function missionRow(m, index) {
+  var row = el("div", "rule-row mission-row" + (m.enabled ? "" : " off"));
+  row.setAttribute("data-index", index);
+  var name = el("div", "mission-name");
+  var say = el("div", "mission-say");
+  var gift = el("div", "mission-gift");
+  // 行上那三段字跟着行上的格子变（周期一改，没起名字的那条名字就跟着变）。
+  // ★ 顺序 / 等级改完**不当场重排**：一边打字一边整行跳走，光标就丢了 ——
+  //   下一次重画（存盘、切筛选）时才归位。
+  var paint = function () {
+    name.textContent = missionDisplayName(m);
+    say.textContent = missionConditionText(m);
+    var why = missionProblem(m);
+    say.classList.toggle("bad-text", !!why);
+    say.title = why;
+    gift.textContent = "奖励：" + ((m.rewards || []).map(missionRewardText)
+                                   .join("、") || "（没有）");
+  };
+  row.appendChild(el("div", "mission-id", "#" + m.id));
+  row.appendChild(fieldNode(missionSpec("enabled"), m, function () {
+    row.classList.toggle("off", !m.enabled);
+    touched();
+  }));
+  ["period", "order", "level"].forEach(function (key) {
+    row.appendChild(fieldNode(missionSpec(key), m, function () {
+      paint();
+      touched();
+    }));
+  });
+  var body = el("div", "mission-body");
+  body.appendChild(name);
+  body.appendChild(say);
+  body.appendChild(gift);
+  row.appendChild(body);
+  paint();
+  var acts = el("div", "card-acts");
+  [["任务内容", openMissionContent], ["完成条件", openMissionCond],
+   ["奖励", openMissionReward]].forEach(function (pair) {
+    var button = el("button", "btn btn-sm", pair[0]);
+    button.onclick = function () { pair[1](m); };
+    acts.appendChild(button);
+  });
+  row.appendChild(acts);
+  return row;
+}
+
+/** 「添加」：新建一条（编号 = max(10000, 现有最大) + 1，永不复用），默认停用。 */
+function addMission() {
+  var limits = missionLimits();
+  var top = Number(limits.first_new_id || 10000);
+  CFG.missions.entries.forEach(function (m) {
+    var id = Number((m || {}).id);
+    if (isFinite(id) && id > top) { top = id; }
+  });
+  var entry = {id: top + 1, enabled: false, period: "daily",
+               character: Number(limits.char_any === undefined ? -1
+                                                               : limits.char_any),
+               line: "pvp", order: 0, level: 1, kind: "win", target: 1,
+               name: "", info: "", clear_text: "",
+               rewards: [{money: 100}]};
+  CFG.missions.entries.push(entry);
+  FILTER.missions = emptyFilter();
+  renderCurrent();
+  var card = $("cfgList").querySelector(
+    '[data-index="' + (CFG.missions.entries.length - 1) + '"]');
+  if (card) { revealIfHidden(card); }
+  toast("已加入任务 #" + entry.id + "（先是停用的）—— 配好条件和奖励，"
+        + "打开「启用」再按「保存」", true);
+}
+
+/* ------------------------------------------- 三个弹窗共用的那几件事 */
+
+//: 正开着的那一窗：`{which, entry, draft, keys, title}`。
+var MISSION_EDIT = null;
+
+function missionDraft(entry) {
+  return JSON.parse(JSON.stringify(entry));
+}
+
+function missionEditDirty() {
+  if (!MISSION_EDIT) { return false; }
+  var pick = function (source) {
+    var out = {};
+    MISSION_EDIT.keys.forEach(function (key) { out[key] = source[key]; });
+    return stableJson(out);
+  };
+  return pick(MISSION_EDIT.entry) !== pick(MISSION_EDIT.draft);
+}
+
+function openMissionModal(which, entry, title, keys) {
+  MISSION_EDIT = {which: which, entry: entry, draft: missionDraft(entry),
+                  keys: keys, title: title};
+  $("missionTitle").textContent = title + "　—— #" + entry.id + " "
+                                  + missionDisplayName(entry);
+  renderMissionModal();
+  $("missionModal").classList.remove("hidden");
+}
+
+function paintMissionSay() {
+  if (!MISSION_EDIT) { return; }
+  var draft = MISSION_EDIT.draft;
+  var why = missionProblem(draft);
+  $("missionSay").textContent = missionDisplayName(draft) + "　｜　"
+                                + missionConditionText(draft);
+  $("missionSay").classList.toggle("bad-text", !!why);
+  $("missionWhy").textContent = why;
+  $("missionWhy").classList.toggle("hidden", !why);
+  $("missionSave").disabled = !!why;
+}
+
+function saveMissionEdit() {
+  if (!MISSION_EDIT || missionProblem(MISSION_EDIT.draft)) { return; }
+  var entry = MISSION_EDIT.entry;
+  var draft = MISSION_EDIT.draft;
+  MISSION_EDIT.keys.forEach(function (key) {
+    if (draft[key] === undefined) { delete entry[key]; }
+    else { entry[key] = draft[key]; }
+  });
+  MISSION_EDIT = null;
+  $("missionModal").classList.add("hidden");
+  touched();
+  repaintList();
+}
+
+async function closeMissionEdit() {
+  if (MISSION_EDIT && missionEditDirty()) {
+    var go = await ask({
+      title: "有未保存的修改",
+      lead: "「" + MISSION_EDIT.title + "」里改过的东西还没保存，关掉就丢了。",
+      ok: "关掉不保存", cancel: "回去接着改", danger: true});
+    if (!go) { return; }
+  }
+  MISSION_EDIT = null;
+  $("missionModal").classList.add("hidden");
+}
+
+function renderMissionModal() {
+  if (!MISSION_EDIT) { return; }
+  var host = $("missionFields");
+  host.textContent = "";
+  if (MISSION_EDIT.which === "content") { renderMissionContent(host); }
+  else if (MISSION_EDIT.which === "cond") { renderMissionCond(host); }
+  else { renderMissionReward(host); }
+  paintMissionSay();
+}
+
+/* -------------------------------------- 弹窗①「任务内容」：名字 / 说明 / 谁 / 哪条线 */
+
+var MISSION_CONTENT_KEYS = ["name", "info", "clear_text", "character", "line"];
+
+function openMissionContent(entry) {
+  openMissionModal("content", entry, "任务内容",
+                   MISSION_CONTENT_KEYS.concat(MISSION_COND_KEYS));
+}
+
+function renderMissionContent(host) {
+  var draft = MISSION_EDIT.draft;
+  var tip = el("p", "hint", "名字 / 说明 / 完成条件文字留空 = 按完成条件自动生成。"
+                            + "「不限角色」的任务三个角色页签里都有、共用进度，爱琳也算。");
+  host.appendChild(tip);
+  MISSION_CONTENT_KEYS.forEach(function (key) {
+    // 专用关卡只能在闯关线（服务端也拦着）⇒ 那一格只读。
+    var spec = (key === "line" && draft.kind === "map")
+      ? missionSpecWith(key, {readonly: true}) : missionSpec(key);
+    var node = fieldNode(spec, draft, paintMissionSay);
+    var control = node.querySelector ? node.querySelector("select") : null;
+    if (control && key === "line") {
+      control.addEventListener("change", function () {
+        missionFixForLine(draft);
+        renderMissionModal();
+      });
+    }
+    host.appendChild(node);
+  });
+}
+
+/* --------------------------------------------- 弹窗②「完成条件」 */
+
+var MISSION_COND_KEYS = ["kind", "target", "pvp_mode", "item_mode", "stage",
+                         "difficulty", "harder", "count", "conditions",
+                         "metric", "weapon"];
+
+function openMissionCond(entry) {
+  openMissionModal("cond", entry, "完成条件", MISSION_COND_KEYS);
+}
+
+/** 换线 / 换类型之后，把用不上的键清掉（留着的话服务端会拒，而人看不出为什么）。 */
+function missionFixForLine(draft) {
+  if (draft.kind === "map") { return; }
+  if (draft.line === "pvp") {
+    if (draft.kind === "clear") { draft.kind = "win"; }
+    ["stage", "difficulty", "harder"].forEach(function (k) { delete draft[k]; });
+  } else {
+    if (draft.kind === "win") { draft.kind = "clear"; }
+    ["pvp_mode", "item_mode"].forEach(function (k) { delete draft[k]; });
+  }
+  if (draft.kind !== "stats") {
+    ["count", "conditions", "metric", "weapon"].forEach(function (k) {
+      delete draft[k];
+    });
+  } else {
+    if (!draft.count) { draft.count = "match"; }
+    if (draft.count === "match") {
+      delete draft.metric;
+      delete draft.weapon;
+      if (!Array.isArray(draft.conditions) || !draft.conditions.length) {
+        draft.conditions = [missionNewCondition(0)];
+      }
+    } else {
+      delete draft.conditions;
+      if ((missionLimits().sum_metrics || []).indexOf(draft.metric) < 0) {
+        draft.metric = (missionLimits().sum_metrics || [])[0];
+      }
+      if (!cardMetricInfo(draft.metric).weapon) { delete draft.weapon; }
+    }
+  }
+  if (draft.difficulty === undefined) { delete draft.harder; }
+}
+
+function missionNewCondition(at) {
+  var limits = cardLimits();
+  var first = (missionCondSpec("metric").options || [])[0] || {};
+  var cond = {scope: limits.scope_match, metric: first.value,
+              op: limits.op_ge, threshold: 1};
+  if (at > 0) { cond.join = limits.join_and; }
+  cardCondFix(cond);
+  return cond;
+}
+
+function renderMissionCond(host) {
+  var draft = MISSION_EDIT.draft;
+  if (draft.kind === "map") {
+    host.appendChild(el("p", "hint", "「专用关卡」是原版的单机小地图：玩家在任务面板里"
+                                     + "点「开始」本机单人打通就算完成。地图 / 脚本只读，"
+                                     + "只能停用，不能新建。"));
+    ["map", "script", "difficulty"].forEach(function (key) {
+      host.appendChild(fieldNode(missionSpecWith(key, {readonly: true}), draft,
+                                 paintMissionSay));
+    });
+    return;
+  }
+  // 「对战胜利」只在对战线、「闯关通关」只在闯关线，「专用关卡」建不出来
+  // —— 选不到的就不给选（服务端照样拦着）。
+  var kindSpec = missionSpecWith("kind", {
+    options: (missionSpec("kind").options || []).filter(function (option) {
+      if (option.value === "map") { return false; }
+      if (draft.line === "pvp") { return option.value !== "clear"; }
+      return option.value !== "win";
+    })});
+  var redraw = function () { missionFixForLine(draft); renderMissionModal(); };
+  var kindNode = fieldNode(kindSpec, draft, paintMissionSay);
+  kindNode.querySelector("select").addEventListener("change", redraw);
+  host.appendChild(kindNode);
+  var filters = (draft.line === "pvp") ? ["pvp_mode", "item_mode"]
+                                       : ["stage", "difficulty"];
+  filters.forEach(function (key) {
+    var node = fieldNode(missionSpec(key), draft, paintMissionSay);
+    if (key === "difficulty") {
+      node.querySelector("select").addEventListener("change", redraw);
+    }
+    host.appendChild(node);
+  });
+  if (draft.line === "quest" && draft.difficulty !== undefined) {
+    host.appendChild(fieldNode(missionSpec("harder"), draft, paintMissionSay));
+  }
+  if (draft.kind === "stats") {
+    var countNode = fieldNode(missionSpec("count"), draft, paintMissionSay);
+    countNode.querySelector("select").addEventListener("change", redraw);
+    host.appendChild(countNode);
+    if (draft.count === "sum") {
+      var metricNode = fieldNode(missionSpec("metric"), draft, paintMissionSay);
+      metricNode.querySelector("select").addEventListener("change", redraw);
+      host.appendChild(metricNode);
+      if (cardMetricInfo(draft.metric).weapon) {
+        host.appendChild(fieldNode(missionSpec("weapon"), draft, paintMissionSay));
+      }
+    } else {
+      host.appendChild(missionCondRows(draft));
+    }
+  }
+  host.appendChild(fieldNode(missionSpec("target"), draft, paintMissionSay));
+}
+
+/** 「每局达成」那串条件：和称号卡片同一套行（只许一局内，所以没有「统计范围」那一格）。 */
+function missionCondRows(draft) {
+  var box = el("div", "card-cond-rows mission-cond-rows");
+  if (!Array.isArray(draft.conditions)) { draft.conditions = []; }
+  var list = draft.conditions;
+  var limits = cardLimits();
+  list.forEach(function (cond, at) {
+    cond.scope = limits.scope_match;
+    var info = cardMetricInfo(cond.metric);
+    var row = el("div", "card-cond");
+    (missionSpec("conditions").fields || []).forEach(function (spec) {
+      if (spec.key === "join") {
+        if (at === 0) { row.appendChild(el("div", "cond-gap")); return; }
+        if (cond.join === undefined) { cond.join = limits.join_and; }
+      }
+      if (spec.key === "weapon" && !info.weapon) {
+        row.appendChild(el("div", "cond-gap"));
+        return;
+      }
+      var use = spec;
+      if (spec.key === "op") { use = cardOpOptions(cond, info); }
+      if (spec.key === "threshold") {
+        row.appendChild(missionCondValue(cond, info));
+        return;
+      }
+      var was = cond.metric;
+      var node = fieldNode(use, cond, paintMissionSay);
+      var control = node.querySelector ? node.querySelector("select") : null;
+      if (control) {
+        control.addEventListener("change", function () {
+          cardCondFix(cond, was);
+          renderMissionModal();
+        });
+      }
+      row.appendChild(node);
+    });
+    var kill = el("button", "kill", "✕");
+    if (list.length <= 1) {
+      kill.setAttribute("aria-disabled", "true");
+      kill.title = "至少要留一条";
+    } else {
+      kill.title = "删掉这一条";
+      kill.onclick = function () {
+        list.splice(at, 1);
+        if (list.length) { delete list[0].join; }
+        renderMissionModal();
+      };
+    }
+    row.appendChild(kill);
+    box.appendChild(row);
+  });
+  var max = limits.max_conditions || list.length;
+  var add = el("button", "btn btn-sm", "＋ 添加条件");
+  add.disabled = list.length >= max;
+  add.onclick = function () {
+    list.push(missionNewCondition(list.length));
+    renderMissionModal();
+  };
+  var foot = el("div", "card-cond-foot");
+  foot.appendChild(add);
+  foot.appendChild(el("span", "card-cond-count", list.length + " / " + max));
+  box.appendChild(foot);
+  return box;
+}
+
+function missionCondValue(cond, info) {
+  var base = missionCondSpec("threshold");
+  var values = info.values || [];
+  if (values.length) {
+    return fieldNode({key: "threshold", label: base.label, type: "choice",
+                      options: values}, cond, paintMissionSay);
+  }
+  // ★ 下限跟着比较符走 —— 和 `cardCondValueField` 同一条规矩。
+  var spec = {};
+  Object.keys(base).forEach(function (name) { spec[name] = base[name]; });
+  var limits = cardLimits();
+  var low = (limits.op_min || {})[cond.op || limits.op_ge];
+  spec.min = (low === undefined) ? 1 : low;
+  if (info.unit) { spec.suffix = info.unit; }
+  return fieldNode(spec, cond, paintMissionSay);
+}
+
+/* ------------------------------------------------- 弹窗③「奖励」：最多 3 项 */
+
+var MISSION_REWARD_KINDS = [{value: "money", label: "金币"},
+                            {value: "exp", label: "经验"},
+                            {value: "item", label: "物品"}];
+
+function openMissionReward(entry) {
+  openMissionModal("reward", entry, "奖励", ["rewards"]);
+}
+
+function renderMissionReward(host) {
+  var draft = MISSION_EDIT.draft;
+  if (!Array.isArray(draft.rewards)) { draft.rewards = []; }
+  var list = draft.rewards;
+  var max = missionLimits().max_rewards || 3;
+  host.appendChild(el("p", "hint", "完成后每一项各成一份礼物进礼物箱（发送人 GM）。"
+                                   + "最多 " + max + " 项（任务说明框和完成弹窗只有 "
+                                   + max + " 行）；装备类固定 1 件。"));
+  list.forEach(function (reward, at) {
+    var row = el("div", "mission-reward");
+    var kind = {value: missionRewardKind(reward)};
+    var kindNode = fieldNode({key: "value", label: "第 " + (at + 1) + " 项",
+                              type: "choice", options: MISSION_REWARD_KINDS},
+                             kind, function () {
+      var fresh = {};
+      if (kind.value === "item") { fresh = {item: 0, count: 1}; }
+      else { fresh[kind.value] = 100; }
+      list[at] = fresh;
+      renderMissionModal();
+    });
+    row.appendChild(kindNode);
+    if (kind.value === "item") {
+      var slot = slotNode(reward.item, 32, true, true);
+      slot.onclick = function () {
+        openPicker({selected: reward.item, onPick: function (item) {
+          reward.item = item.id;
+          renderMissionModal();
+        }});
+      };
+      row.appendChild(slot);
+      row.appendChild(el("span", "mission-item-name",
+                         reward.item ? itemName(reward.item) : "点左边的格子选物品"));
+      row.appendChild(fieldNode({key: "count", label: "数量", type: "int", min: 1,
+                                 max: missionLimits().max_reward_amount},
+                                reward, paintMissionSay));
+    } else {
+      row.appendChild(fieldNode({key: kind.value, label: "数量", type: "int",
+                                 min: 1,
+                                 max: missionLimits().max_reward_amount},
+                                reward, paintMissionSay));
+    }
+    var kill = el("button", "kill", "✕");
+    kill.title = "删掉这一项";
+    kill.onclick = function () { list.splice(at, 1); renderMissionModal(); };
+    row.appendChild(kill);
+    host.appendChild(row);
+  });
+  var add = el("button", "btn btn-sm", "＋ 添加奖励");
+  add.disabled = list.length >= max;
+  add.onclick = function () { list.push({money: 100}); renderMissionModal(); };
+  var foot = el("div", "card-cond-foot");
+  foot.appendChild(add);
+  foot.appendChild(el("span", "card-cond-count", list.length + " / " + max));
+  host.appendChild(foot);
 }
 
 /* ======================================================================
@@ -7523,7 +8247,10 @@ function switchTab(tab) {
   // ★ `CAT` 还没到手（登录那一瞬间 `applyRoleToTabs` 可能就调进来了）就
   //   先别画：`renderCurrent()` 头一句读的就是 `CAT.schema`。目录到手之后
   //   `boot()` 会补画一次。
-  if (CAT) { renderCurrent(); }
+  // ★ 这一份配置还没读到也一样（`boot()` 是一份一份按顺序读的，登录后马上
+  //   点排在后面的标签 —— 晋级任务排最末 —— 就会撞上）：`boot()` 读完会照
+  //   `CURRENT` 补画。
+  if (CAT && CFG[tab]) { renderCurrent(); }
 }
 
 function wire() {
@@ -7817,6 +8544,8 @@ function wire() {
     if (event.key === "Escape" && SET_PW_OPEN) { closeSetPw(); return; }
     // 称号卡片那两个设置窗：改的是一份拷贝，Esc = 丢掉这次的改动。
     if (event.key === "Escape" && CARD_EDIT) { closeCardEdit(); return; }
+    // 晋级任务那三个窗同理（改的也是一份草稿）。
+    if (event.key === "Escape" && MISSION_EDIT) { closeMissionEdit(); return; }
     // 达成进度是**只读**的一眼看，关掉不丢东西 ⇒ 排在只读那几张里。
     if (event.key === "Escape" && CARD_PROG) { closeCardProgress(); return; }
     // 只读那几张排最后：它们不会盖在选择器上面。
@@ -7859,6 +8588,13 @@ function wire() {
     if (!CARD_EDIT || cardRuleProblem(CARD_EDIT.draft)) { return; }
     saveCardEdit();
   };
+
+  // 晋级任务的三个设置窗（X23）：同称号卡片那两个 —— 有没保存的改动 ⇒
+  // **只认 ✕ / 取消 / Esc，不认遮罩**。保存钮在配得不对时是灰的
+  // （`paintMissionSay`），`saveMissionEdit` 里还兜着一道。
+  $("missionClose").onclick = closeMissionEdit;
+  $("missionCancel").onclick = closeMissionEdit;
+  $("missionSave").onclick = function () { saveMissionEdit(); };
 
   $("addAdmin").onclick = async function () {
     if (!passwordsMatch("newAdminPass", "newAdminPass2")) { return; }
@@ -7951,6 +8687,8 @@ var ADD_OWNED_LABEL = {shop: "已上架", recipe: "有配方"};
  *  默认值，物品让用户当场勾。★ 落盘还是老样子 —— 这儿只往内存数组里 push，
  *  按「保存」才一次发整份 JSON。 */
 function addEntry(which) {
+  // 任务不是从物品表里挑出来的 —— 直接新建一条（`addMission`）。
+  if (which === "missions") { addMission(); return; }
   openPicker({
     kinds: (which === "drops") ? ["material"] : null,
     multi: true,
