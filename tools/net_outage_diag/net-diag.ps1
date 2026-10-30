@@ -118,51 +118,81 @@ Write-Host "[2/3] 导出最近 $Hours 小时的断网相关系统事件……"
 $since = (Get-Date).AddHours(-$Hours)
 $events = New-Object System.Collections.ArrayList
 $notes = New-Object System.Collections.ArrayList
-function Describe-EventError([string]$channel, $record) {
-    # 「这段时间一条都没有」也是走异常出来的，别把它说成读不到
-    if ($record.FullyQualifiedErrorId -match 'NoMatchingEventsFound') { return "$channel：这段时间没有记录" }
-    return "$channel：读不到（$($record.Exception.Message)）"
+
+# ★ 不用 Get-WinEvent：它一碰到「描述资源坏掉」的那一条，整个日志一条都不给
+#   （10-25 玩家那台的 System 日志就是这样，报「找不到映像文件中指定的资源类型」）。
+#   逐条读、描述读不出来的那条单独记「（描述读不出）」，别的照常。
+function Read-Channel([string]$channel, [scriptblock]$keep) {
+    $utc = $since.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    $kept = 0
+    try {
+        $query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($channel,
+            [System.Diagnostics.Eventing.Reader.PathType]::LogName,
+            "*[System[TimeCreated[@SystemTime>='$utc']]]")
+        $reader = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($query)
+    } catch {
+        [void]$notes.Add("${channel}：读不到（$($_.Exception.Message)）")
+        return
+    }
+    try {
+        while ($true) {
+            try { $record = $reader.ReadEvent() } catch {
+                # 读到坏记录就停在这儿（前面读到的照留），不在一条坏记录上原地打转
+                [void]$notes.Add("${channel}：读到一半出错，后面的没读（$($_.Exception.Message)）")
+                break
+            }
+            if ($null -eq $record) { break }
+            try {
+                if (& $keep $record) {
+                    $text = $null
+                    try { $text = $record.FormatDescription() } catch { $text = "（描述读不出）" }
+                    [void]$events.Add((New-Object PSObject -Property @{
+                        Time = $record.TimeCreated; Log = $channel; Provider = $record.ProviderName
+                        Id = $record.Id; Text = $text }))
+                    $kept++
+                }
+            } finally { $record.Dispose() }
+        }
+    } finally { $reader.Dispose() }
+    if ($kept -eq 0) { [void]$notes.Add("${channel}：这段时间没有记录") }
 }
-$channels = @(
+
+# 事件描述里夹着 Wi-Fi 名称（SSID / 配置文件名 / 网络名）和网卡物理地址，写盘前去掉
+function Hide-Private([string]$text) {
+    $text = $text -replace '(?i)\((十六进制的 SSID 值|Hex Value of SSID)[^)]*\)', ''
+    $text = $text -replace '(?i)(服务集标识符\(SSID\)|with SSID)\s*\S+', '$1 <略>'
+    $text = $text -replace '(?i)(BSSID|SSID|配置文件名称|Profile Name|名称|描述|Name|Desc)\s*[:：]\s*\S+', '$1: <略>'
+    $text = $text -replace '(?i)\b0x[0-9a-f]{12}\b', '<MAC>'
+    $text = $text -replace '(?i)\b([0-9a-f]{2}[-:]){5}[0-9a-f]{2}\b', '<MAC>'
+    return $text
+}
+
+$takeAll = { param($record) $true }
+foreach ($channel in @(
     "Microsoft-Windows-WLAN-AutoConfig/Operational",
     "Microsoft-Windows-Wired-AutoConfig/Operational",
     "Microsoft-Windows-NetworkProfile/Operational",
     "Microsoft-Windows-NCSI/Operational",
     "Microsoft-Windows-Dhcp-Client/Admin",
-    "Microsoft-Windows-TCPIP/Operational"
-)
-foreach ($channel in $channels) {
-    try {
-        foreach ($entry in @(Get-WinEvent -FilterHashtable @{ LogName = $channel; StartTime = $since } -ErrorAction Stop)) {
-            [void]$events.Add($entry)
-        }
-    } catch {
-        [void]$notes.Add((Describe-EventError $channel $_))
-    }
+    "Microsoft-Windows-TCPIP/Operational")) {
+    Read-Channel $channel $takeAll
 }
 # System 日志：网卡驱动 / 网络服务 / 电源这几类来源全留，别的来源只留「错误」「严重」
 $netProviders = '(?i)tcpip|ndis|wlan|wired|dhcp|dns|netbt|nlasvc|networkprofile|ncsi|iphlpsvc|kernel-power|power-troubleshooter|vwifi|^netw|^e1|^e2|^rt|^athw|^ath|^qcwlan|^mrvl|^bcm|^b57|^mtk|^mt7|^ixgbe|^igc|^l1c|killer|realtek|qualcomm|atheros|broadcom|mediatek'
-try {
-    foreach ($entry in @(Get-WinEvent -FilterHashtable @{ LogName = "System"; StartTime = $since } -ErrorAction Stop)) {
-        if ($entry.ProviderName -match $netProviders -or ($entry.Level -ge 1 -and $entry.Level -le 2)) {
-            [void]$events.Add($entry)
-        }
-    }
-} catch {
-    [void]$notes.Add((Describe-EventError "System" $_))
-}
+Read-Channel "System" { param($record) $record.ProviderName -match $netProviders -or ($record.Level -ge 1 -and $record.Level -le 2) }
+
 $eventFile = Open-Writer "系统事件.txt"
-$eventFile.WriteLine("从 $($since.ToString('yyyy-MM-dd HH:mm:ss')) 到现在，共 $($events.Count) 条（本机时间）")
+$eventFile.WriteLine("从 $($since.ToString('yyyy-MM-dd HH:mm:ss')) 到现在，共 $($events.Count) 条（本机时间；Wi-Fi 名称和物理地址已去掉）")
 foreach ($note in $notes) { $eventFile.WriteLine("（$note）") }
 $eventFile.WriteLine("")
-foreach ($entry in ($events | Sort-Object TimeCreated)) {
-    $message = $entry.Message
+foreach ($entry in ($events | Sort-Object Time)) {
+    $message = $entry.Text
     if (-not $message) { $message = "（无描述）" }
-    $message = ($message -replace '\s+', ' ').Trim()
+    $message = Hide-Private (($message -replace '\s+', ' ').Trim())
     if ($message.Length -gt 400) { $message = $message.Substring(0, 400) + "…" }
-    $log = ($entry.LogName -replace '^Microsoft-Windows-', '')
+    $log = ($entry.Log -replace '^Microsoft-Windows-', '')
     # 外面那层括号不能省：方法调用里 `-f a, b` 的逗号会被当成 WriteLine 的多个参数
-    $eventFile.WriteLine(("{0}  [{1}] {2} #{3}  {4}" -f (Stamp $entry.TimeCreated), $log, $entry.ProviderName, $entry.Id, $message))
+    $eventFile.WriteLine(("{0}  [{1}] {2} #{3}  {4}" -f (Stamp $entry.Time), $log, $entry.Provider, $entry.Id, $message))
 }
 $eventFile.Close()
 Write-Host "      共 $($events.Count) 条"
