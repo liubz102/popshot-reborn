@@ -10835,14 +10835,17 @@ static void __stdcall on_crypt_out(int kind, void *buf, int len)
 }
 
 static void wtab_apply_if_main_thread(void);   /* 自定义武器表（X3），定义在下面那一段 */
+static void promo_apply_if_main_thread(void);  /* 晋级任务表（X23），同上 */
 
 static void __stdcall on_crypt(int kind, void *self, void *dst, void *src, int len)
 {
     /* ★ 自定义武器表（X3）：收到表的那一刻如果不在主线程，就攒着；游戏下一次
        从主线程发包（Encrypt 是主线程的活）时补写 —— 这是一个事件，不是定时器。
-       正常路径的开销 = 读一个标志。 */
-    if (kind == 2)
+       正常路径的开销 = 读一个标志。晋级任务表（X23）同一个道理。 */
+    if (kind == 2) {
         wtab_apply_if_main_thread();
+        promo_apply_if_main_thread();
+    }
 
     /* ★ 位置数据的 UDP 旁路（见本文件「位置数据的 UDP 旁路」一段）。
        `kind == 2` 是 `SimpleCipher::Encrypt` —— **加密之前**，也是整个进程里
@@ -11444,6 +11447,9 @@ static void wtab_apply_if_main_thread(void)
    解析、存表和绘制点补丁都在下面「仓库提示框的说明文」那一整段里。 */
 #define WDESC_OPCODE        0x0F02
 static int wdesc_on_frame(const unsigned char *frame);
+/* 0x0F03「晋级任务表」（X23）也走这个入口；拼片和重建在下面「晋级任务表」那一段。 */
+#define PROMO_OPCODE        0x0F03
+static int promo_on_frame(const unsigned char *frame);
 
 /* 收到一帧 0xFF：是我们自造的 opcode 就解析 + 存表，返回 1 = 吞掉；
    其余返回 0 交给原分发。 */
@@ -11460,6 +11466,7 @@ static int __cdecl wtab_on_frame(void *pkt)
     if (frame[0] != 0xFF) return 0;
     opcode = *(const unsigned short *)(frame + 8);
     if (opcode == WDESC_OPCODE) return wdesc_on_frame(frame);   /* 仓库说明文（X10）*/
+    if (opcode == PROMO_OPCODE) return promo_on_frame(frame);   /* 晋级任务表（X23）*/
     if (opcode != WTAB_OPCODE) return 0;
 
     len = *(const unsigned short *)(frame + 2);
@@ -11902,6 +11909,298 @@ static int try_patch_cabinet_desc(void)
     bslog("PATCH   ★仓库提示框说明文 @ %08X：按物品 id 换成服务端 0x0F02 推的那一套"
           "（大厅 = 任务，待机房间 = 该房间的模式）；合成提示框 @ %08X 同签名，不打",
           (unsigned)WDESC_SITE_VA, (unsigned)WDESC_SITE_OTHER);
+    return 1;
+}
+
+/* ========================================================================== */
+/* 晋级任务表（X_Mod · X23，§154~ / D111）—— 服务端推这个玩家自己的任务表，    */
+/* 喂给游戏**自己的**加载器重建，换掉单例指针                                  */
+/*                                                                            */
+/* 大厅右下角「任务」面板读的是启动时从资源包 `Promotion-chn.ini` 建好的单例    */
+/* `[0x72e954]`（0x6c B，`0x410033` 建）。管理页要能改任务、而且每个玩家看到的  */
+/* 是**去掉本人本周期已完成的**那一张 ⇒ 服务端登录 / 回大厅 / 4 点 / 管理页保存时*/
+/* 把一整份 ini 推下来（gsp `0x0F03`，分片，格式见 `promo_wire.h`），这里：     */
+/*                                                                            */
+/*   1. 拼片、验 crc；**和上次换上的 crc 一样就跳过**（不重建、不泄漏）；       */
+/*   2. 主线程上：游戏堆 `operator new 0x5f399e`(0x6c) 一个新单例，             */
+/*      +0x04/+0x08/+0x0c（记录 vector）清零 —— 照 `0x410033` 的原样；         */
+/*      +0x1c..+0x6b（等级 + 六条链的 A/B/C）从旧单例抄过来（服务端紧跟着那发   */
+/*      `0x02e0` 会再覆盖一遍）；                                              */
+/*   3. `0x55a2d9(eax = 新单例, [esp+4] = 我们的只读流)`：建 ini 解析器存进      */
+/*      `[单例+0]`、解析、把六条链的记录塞进 +0x04 的 vector，`ret 4`，          */
+/*      eax 非 0 = 成功；                                                       */
+/*   4. 成功才写 `[0x72e954]`。**旧单例和它挂的旧 ini 故意不释放**：面板 /      */
+/*      开局场景拿的都是记录的拷贝（规划代理逐指令核过），换指针是安全的；      */
+/*      而它们是游戏 CRT 堆上的、析构路径也没逆过，不碰最稳。                   */
+/*      一次约 0.5 MB，只在表**真变了**的时候发生。                            */
+/*                                                                            */
+/* 失败（加载器回 0 = 整张表被拒、或游戏抛了 C++ 异常 0xE06D7363）：新单例泄漏、 */
+/* 旧表留用、`!!` 一行日志。只接那一种异常码（外加流的 trap 码），别的照常往外 */
+/* 抛 —— 吞掉访问违例只会让坏状态留在进程里接着跑。                           */
+/*                                                                            */
+/* 线程：`0x0F01` 实机是在**主线程**收到的（§36），这一帧走的是同一个分发；万一 */
+/* 不在主线程，就攒着等 `on_crypt` 下一次从主线程发包时换（同 `wtab_apply_if_  */
+/* main_thread` —— 一个事件，不是定时器）。                                    */
+/*                                                                            */
+/* `test_patchsites_promo` 拿脱壳镜像钉着这里写死的每一个地址和特征字节；       */
+/* `test/hook/test-promo-wire.bat` 按游戏的调法调流的虚表、核 esp 平衡。        */
+/* ========================================================================== */
+#define PROMO_TRAP_CODE       0xE0505254u   /* 我们自己的异常码（'PRT'）：流的意外虚函数被调 */
+#define PROMO_CXX_CODE        0xE06D7363u   /* MSVC 的 C++ 异常 */
+#define PROMO_STREAM_TRAP(self) RaiseException(PROMO_TRAP_CODE, EXCEPTION_NONCONTINUABLE, 0, NULL)
+#include "promo_wire.h"
+
+#define PROMO_SINGLETON_VA    0x0072e954u   /* 任务表单例的指针 */
+#define PROMO_SINGLETON_SIZE  0x6c
+#define PROMO_KEEP_FROM       0x1c          /* +0x1c..+0x6b 抄旧单例（等级 + A/B/C） */
+#define PROMO_VEC_FIRST       0x04          /* 记录 vector：first / last / end */
+#define PROMO_VEC_LAST        0x08
+#define PROMO_RECORD_SIZE     0x98
+#define PROMO_CREATE_VA       0x00410033u   /* 启动时建单例的那个函数 */
+#define PROMO_NEW_VA          0x005f399eu   /* 游戏的 operator new（cdecl，调用方清栈） */
+#define PROMO_LOAD_VA         0x0055a2d9u   /* 加载器：eax=单例、[esp+4]=流、ret 4 */
+
+/* 0x410033..0x410054：`mov eax,[0x72e954] / test / jne / push 0x6c / call 0x5f399e /
+   test / pop ecx / je / and [eax+4],0 / and [eax+8],0 / and [eax+0xc],0`
+   —— 单例多大、谁分配、哪三格要清零，全在这 33 字节里。 */
+static const unsigned char PROMO_CREATE_SIG[33] = {
+    0xa1,0x54,0xe9,0x72,0x00, 0x85,0xc0, 0x75,0x21, 0x6a,0x6c,
+    0xe8,0x5b,0x39,0x1e,0x00, 0x85,0xc0, 0x59, 0x74,0x0e,
+    0x83,0x60,0x04,0x00, 0x83,0x60,0x08,0x00, 0x83,0x60,0x0c,0x00,
+};
+/* 0x55a2d9：`push esi / push [esp+8] / mov esi,eax / call 0x55a2fa`（建解析器 + 解析） */
+static const unsigned char PROMO_LOAD_SIG[12] = {
+    0x56, 0xff,0x74,0x24,0x08, 0x8b,0xf0, 0xe8,0x15,0x00,0x00,0x00,
+};
+/* 0x5f399e：`push esi / mov esi,[esp+8]`（operator new 的序言） */
+static const unsigned char PROMO_NEW_SIG[5] = { 0x56, 0x8b,0x74,0x24,0x08 };
+
+typedef struct promo_blob {
+    unsigned char *data;
+    unsigned size, serial, crc;
+} promo_blob_t;
+
+static promo_asm         g_promo_asm;               /* 正在拼的那一份（只在收包路径上碰） */
+static void *volatile    g_promo_pending = NULL;    /* promo_blob_t*：收齐了、等主线程换上 */
+static int               g_promo_applied = 0;       /* 换上过（主线程上读写） */
+static unsigned          g_promo_applied_crc = 0;
+static int               g_promo_sites = 0;         /* 0 = 还没核；1 = 对；-1 = 不对 */
+
+/* 三处站点签名，第一次要用时现核、结果缓存（镜像不是这一版就一次都不碰游戏）。 */
+static int promo_sites_ok(void)
+{
+    if (g_promo_sites) return g_promo_sites > 0;
+    g_promo_sites = -1;
+    if (IsBadReadPtr((const void *)PROMO_CREATE_VA, sizeof(PROMO_CREATE_SIG)) ||
+        IsBadReadPtr((const void *)PROMO_LOAD_VA, sizeof(PROMO_LOAD_SIG)) ||
+        IsBadReadPtr((const void *)PROMO_NEW_VA, sizeof(PROMO_NEW_SIG)))
+        return 0;
+    if (memcmp((const void *)PROMO_CREATE_VA, PROMO_CREATE_SIG, sizeof(PROMO_CREATE_SIG)) != 0 ||
+        memcmp((const void *)PROMO_LOAD_VA, PROMO_LOAD_SIG, sizeof(PROMO_LOAD_SIG)) != 0 ||
+        memcmp((const void *)PROMO_NEW_VA, PROMO_NEW_SIG, sizeof(PROMO_NEW_SIG)) != 0)
+        return 0;
+    g_promo_sites = 1;
+    return 1;
+}
+
+/* 游戏的 operator new（cdecl）。分配失败时它自己会抛 bad_alloc —— 在外面的 __try 里。
+   ★ 参数别叫 `size`：内联汇编里 SIZE 是 MASM 的运算符。 */
+static void *promo_game_new(unsigned bytes)
+{
+    void *p = NULL;
+    __asm {
+        push bytes
+        mov eax, PROMO_NEW_VA
+        call eax
+        add esp, 4
+        mov p, eax
+    }
+    return p;
+}
+
+/* 游戏的加载器：eax = 单例，流压栈，被调方 `ret 4`。返回 eax（非 0 = 成功）。 */
+static int promo_game_load(void *singleton, promo_stream *stream)
+{
+    int ok = 0;
+    __asm {
+        push stream
+        mov eax, singleton
+        mov edx, PROMO_LOAD_VA
+        call edx
+        mov ok, eax
+    }
+    return ok;
+}
+
+static int promo_filter(DWORD code, DWORD *out)
+{
+    *out = code;
+    return (code == PROMO_CXX_CODE || code == PROMO_TRAP_CODE)
+        ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* 建新单例 + 跑加载器，套一层 SEH。返回加载器的结果；*fresh = 新单例（失败时就泄漏它），
+   *code = 接住的异常码（0 = 没出异常）。 */
+static int promo_load_guarded(void *old, promo_stream *stream, void **fresh, DWORD *code)
+{
+    void *volatile made = NULL;
+    volatile int ok = 0;
+    *code = 0;
+    __try {
+        made = promo_game_new(PROMO_SINGLETON_SIZE);
+        if (made) {
+            memset(made, 0, PROMO_KEEP_FROM);
+            memcpy((unsigned char *)made + PROMO_KEEP_FROM,
+                   (const unsigned char *)old + PROMO_KEEP_FROM,
+                   PROMO_SINGLETON_SIZE - PROMO_KEEP_FROM);
+            ok = promo_game_load(made, stream);
+        }
+    } __except (promo_filter(GetExceptionCode(), code)) {
+        ok = 0;
+    }
+    *fresh = made;
+    return ok;
+}
+
+/* 新单例里有几条记录（日志里和服务端那行「各链几条」对账）。读不动就回 -1。 */
+static int promo_record_count(const void *singleton)
+{
+    const unsigned char *first, *last;
+    if (!singleton || IsBadReadPtr(singleton, PROMO_SINGLETON_SIZE)) return -1;
+    first = *(const unsigned char *const *)((const unsigned char *)singleton + PROMO_VEC_FIRST);
+    last = *(const unsigned char *const *)((const unsigned char *)singleton + PROMO_VEC_LAST);
+    if (!first || last < first || (unsigned)(last - first) % PROMO_RECORD_SIZE) return -1;
+    return (int)((unsigned)(last - first) / PROMO_RECORD_SIZE);
+}
+
+/* 表里第一节的 `Name=` 那一行（抽样写进日志，确认换上的是服务端那一份）。 */
+static const char *promo_first_name(const promo_blob_t *blob, char *out, int outsz)
+{
+    static const wchar_t key[] = L"\nName=";
+    const wchar_t *w = (const wchar_t *)blob->data;
+    unsigned n = blob->size / 2, i, k = (unsigned)(sizeof(key) / sizeof(key[0])) - 1;
+    wchar_t name[64];
+    out[0] = 0;
+    for (i = 0; i + k <= n; i++) {
+        unsigned j = 0, m = 0;
+        while (j < k && w[i + j] == key[j]) j++;
+        if (j < k) continue;
+        for (i += k; i < n && w[i] != L'\r' && w[i] != L'\n' && m + 1 < 64; i++) name[m++] = w[i];
+        name[m] = 0;
+        return w2u8(name, out, outsz);
+    }
+    return out;
+}
+
+/* 主线程上把收齐的那一份换上。 */
+static void promo_rebuild(const promo_blob_t *blob)
+{
+    void *old, *fresh = NULL;
+    promo_stream stream;
+    DWORD code = 0;
+    int ok, records;
+    unsigned sections = promo_count_sections(blob->data, blob->size);
+    char sample[160];
+
+    if (g_promo_applied && blob->crc == g_promo_applied_crc) {
+        bslog("PROMO   晋级任务表 serial=%u crc=%08x 和现在用的一样，跳过（不重建）",
+              blob->serial, blob->crc);
+        return;
+    }
+    if (!promo_sites_ok()) {
+        bslog("PROMO   !! 站点签名不符（不是这一版客户端？）：serial=%u 这份不换，面板照旧",
+              blob->serial);
+        return;
+    }
+    old = *(void *volatile *)PROMO_SINGLETON_VA;
+    if (!old || IsBadReadPtr(old, PROMO_SINGLETON_SIZE)) {
+        bslog("PROMO   !! 任务表单例还没建（%08X）：serial=%u 这份不换",
+              (unsigned)(UINT_PTR)old, blob->serial);
+        return;
+    }
+    promo_stream_open(&stream, blob->data, blob->size);
+    ok = promo_load_guarded(old, &stream, &fresh, &code);
+    if (code) {
+        bslog("PROMO   !! 重建时接住异常 %08X（%s）：serial=%u，新单例 %08X 泄漏、旧表留用",
+              (unsigned)code, code == PROMO_TRAP_CODE ? "流的意外虚函数被调" : "游戏的 C++ 异常",
+              blob->serial, (unsigned)(UINT_PTR)fresh);
+        return;
+    }
+    if (!ok) {
+        bslog("PROMO   !! 游戏的加载器拒收这张表：serial=%u %u 节（读 %u 次 / 问 %u 次读完没），"
+              "新单例 %08X 泄漏、旧表留用",
+              blob->serial, sections, stream.reads, stream.eofs, (unsigned)(UINT_PTR)fresh);
+        return;
+    }
+    *(void *volatile *)PROMO_SINGLETON_VA = fresh;
+    g_promo_applied = 1;
+    g_promo_applied_crc = blob->crc;
+    records = promo_record_count(fresh);
+    bslog("PROMO   ★换上晋级任务表 serial=%u crc=%08x：%u 节 → %d 条记录，第一条「%s」"
+          "（旧单例 %08X 留着不释放，新 %08X）",
+          blob->serial, blob->crc, sections, records,
+          promo_first_name(blob, sample, (int)sizeof(sample)),
+          (unsigned)(UINT_PTR)old, (unsigned)(UINT_PTR)fresh);
+    if (records >= 0 && (unsigned)records != sections)
+        bslog("PROMO   ⚠ 记录数 %d 和节数 %u 对不上：有几节被加载器跳过了（缺 PromotionID？）",
+              records, sections);
+}
+
+/* 攒着的那一份在主线程上换（`on_crypt` 每次出站都问一下，正常路径就读一个指针）。 */
+static void promo_apply_if_main_thread(void)
+{
+    promo_blob_t *blob;
+    if (!g_promo_pending) return;
+    if (GetCurrentThreadId() != g_main_thread_id) return;
+    blob = (promo_blob_t *)InterlockedExchangePointer((PVOID volatile *)&g_promo_pending, NULL);
+    if (!blob) return;
+    promo_rebuild(blob);
+    free(blob->data);
+    free(blob);
+}
+
+/* 收到一帧 0x0F03：拼片；收齐了交给主线程换。返回 1 = 吞掉（这个 opcode 只有我们认识）。 */
+static int promo_on_frame(const unsigned char *frame)
+{
+    unsigned len = *(const unsigned short *)(frame + 2);
+    const unsigned char *p = frame + 10;
+    const char *why = "";
+    promo_blob_t *blob, *stale;
+    promo_head head;
+    int rc;
+
+    if (IsBadReadPtr(p, len)) {
+        bslog("PROMO   !! 0x0F03 载荷读不了（%u 字节），丢弃", len);
+        promo_asm_reset(&g_promo_asm);
+        return 1;
+    }
+    memset(&head, 0, sizeof(head));
+    promo_parse_head(p, len, &head);
+    rc = promo_asm_feed(&g_promo_asm, p, len, &why);
+    if (rc == PROMO_BAD) {
+        bslog("PROMO   !! 0x0F03 %s（serial=%u 片 %u/%u，%u 字节），整份丢弃",
+              why, head.serial, head.index, head.count, len);
+        return 1;
+    }
+    if (rc == PROMO_PART) return 1;
+    blob = (promo_blob_t *)malloc(sizeof(*blob));
+    if (!blob) {
+        bslog("PROMO   !! 0x0F03 serial=%u 内存不够，丢弃", head.serial);
+        promo_asm_reset(&g_promo_asm);
+        return 1;
+    }
+    blob->data = promo_asm_take(&g_promo_asm, &blob->size, &blob->serial, &blob->crc);
+    bslog("PROMO   收到晋级任务表 serial=%u %u 字节 %u 片 crc=%08x（线程 %lu%s）",
+          blob->serial, blob->size, head.count, blob->crc, (unsigned long)GetCurrentThreadId(),
+          GetCurrentThreadId() == g_main_thread_id ? "，主线程" : "，非主线程，等主线程换");
+    /* 还有一份没来得及换的就作废它 —— 新来的这份才是服务端现在的意思。 */
+    stale = (promo_blob_t *)InterlockedExchangePointer((PVOID volatile *)&g_promo_pending, blob);
+    if (stale) {
+        bslog("PROMO   上一份 serial=%u 还没换上就被 serial=%u 顶掉了", stale->serial, blob->serial);
+        free(stale->data);
+        free(stale);
+    }
+    promo_apply_if_main_thread();
     return 1;
 }
 

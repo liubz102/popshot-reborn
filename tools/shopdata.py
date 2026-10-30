@@ -545,7 +545,14 @@ def parse_reward(text):
 
 
 def load_promotions(path):
-    """`Promotion-chn.ini` -> 列表。**只留和奖励有关的字段**，剧情文本不要。"""
+    """`Promotion-chn.ini` -> 列表。奖励字段 + **晋级任务导入要用的**那几格。
+
+    ★ 最早（M6）只留奖励 —— 那时它只是材料掉落的基线。X_Mod X23 把原版任务
+      整批导入管理页当出厂默认（`shopdefaults.default_missions()`），所以
+      名字 / 说明 / 完成条件、链内顺序（`PromotionLevel`）、目标次数
+      （`PromotionValue`）、对战的两格子类型、专用关卡的脚本也一起留下。
+      `TextStatus` / `TextReward*` 不留：那几行服务端按奖励和周期现生成。
+    """
     out = []
     for section, fields in read_ini(path).items():
         rewards = []
@@ -561,7 +568,10 @@ def load_promotions(path):
         entry["section"] = section
         for ini_name, key in (("PromotionID", "promotion_id"),
                               ("Name", "name"),
-                              ("MapFileName", "map")):
+                              ("MapFileName", "map"),
+                              ("TextMissionInfo", "info"),
+                              ("TextClearCondition", "clear_text"),
+                              ("ScriptPath", "script")):
             value = (fields.get(ini_name) or "").strip()
             if value:
                 entry[key] = value
@@ -570,7 +580,11 @@ def load_promotions(path):
                               ("PromotionType", "type"),
                               ("PromotionGameContextType", "context_type"),
                               ("PromotionQuestStageID", "quest_stage"),
-                              ("PromotionDifficultyLevel", "difficulty")):
+                              ("PromotionDifficultyLevel", "difficulty"),
+                              ("PromotionLevel", "promotion_level"),
+                              ("PromotionValue", "value"),
+                              ("PromotionGameContextSubType", "sub_type"),
+                              ("PromotionGameContextSubType2", "sub_type2")):
             raw = fields.get(ini_name)
             if raw is None:
                 continue

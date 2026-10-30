@@ -138,6 +138,18 @@ NEW_ACCOUNT_DEFAULTS = {
     #: 发出一张卡时把基准挪到当前值，就是用户说的「计数器归零，重新一轮」。
     #: ★ 只有**带累计条件**的规则才会在这儿留下条目，纯「一局内」的不留。
     "card_bases": {},
+    #: ★★ **晋级任务**（X_Mod X23）：`{done: {任务id: {p, at, times}},
+    #: progress: {任务id: {p, n}}}`，规则在 `missions.py`。
+    #:
+    #:     {"done": {"101": {"p": "", "at": "2026-10-30 21:05:11", "times": 1},
+    #:               "10001": {"p": "2026-10-30", "at": "…", "times": 6}},
+    #:      "progress": {"10002": {"p": "2026-W44", "n": 7}}}
+    #:
+    #: `p` = 周期键（仅一次是空串、每日是日期、每周是 ISO 周、每月是年-月）：
+    #: 存的键 == 现在的键 ⇒ 本期完成过 / 进度算数；不等 ⇒ 当没做过 / 按 0 算
+    #: —— **到点清零不靠定时器改存档**，读的时候现算。
+    #: ★ **不进 `battle_stats`**：那里不认识的键会被 `ensure_item_fields()` 洗掉。
+    "missions": {"done": {}, "progress": {}},
 }
 
 #: 管理页 / 控制通道发的礼物统一用这个发送人。★ 客户端拿它判「是不是 GM 送的」：
@@ -623,6 +635,10 @@ class AccountStore:
                 # 累计战绩 + 卡片发放计数 + 计数器基准（V0.3商店）同一条路。
                 stats, grants, bases, stat_notes = normalize_battle_fields(raw)
                 notes = notes + stat_notes
+                # 晋级任务的完成 / 进度（X23）同一条路：缺了补空的、坏条目洗掉。
+                quests = mission_state(raw)
+                if "missions" not in raw:
+                    notes = notes + ["补上 missions"]
                 legacy = [key for key in LEGACY_CHARACTER_KEYS if key in raw]
                 if (raw.get("inventory") == inventory
                         and raw.get("equipped") == equipped
@@ -632,6 +648,7 @@ class AccountStore:
                         and raw.get("battle_stats") == stats
                         and raw.get("card_grants") == grants
                         and raw.get("card_bases") == bases
+                        and raw.get("missions") == quests
                         and not legacy):
                     continue
                 raw["inventory"] = inventory
@@ -642,6 +659,7 @@ class AccountStore:
                 raw["battle_stats"] = stats
                 raw["card_grants"] = grants
                 raw["card_bases"] = bases
+                raw["missions"] = quests
                 for key in legacy:
                     del raw[key]
                 changed.append({
@@ -984,6 +1002,8 @@ class AccountStore:
              account["materials"], _notes) = normalize_item_fields(account)
             # 礼物盒（D76）同理：坏条目洗掉、计数器不小于最大礼物号。
             account["gifts"], account["gift_seq"], _gift_notes = normalize_gift_fields(account)
+            # 晋级任务（X23）同理：存档里的完成 / 进度跟着走，洗成规范形态。
+            account["missions"] = mission_state(account)
             # 旧键转成角色卡之后就不再落盘。★ V0.3.2 起走导入这条路已经带不进
             # 旧键了（`parse_save` 只放 `NEW_ACCOUNT_DEFAULTS` 里的键，而 v1
             # 明文存档整个被拒），这两行留着纯属兜底；线上盘里的旧键由启动时的
@@ -1092,10 +1112,16 @@ class AccountStore:
 
     def apply_battle(self, username, *, experience=0, money=0, materials=None,
                      stats_mode=None, stats_gained=None, cards=None,
-                     card_bases=None):
+                     card_bases=None, missions=None, mission_gifts=None,
+                     gift_problems=None):
         """打完一局的**全部所得，一把锁、一次写盘**（V0.3商店 · 称号卡片）。
 
-        经验 / 金币 + 掉落材料 + 累计战绩 + 卡片，四样一起落。
+        经验 / 金币 + 掉落材料 + 累计战绩 + 卡片，四样一起落；X23 起再加
+        **晋级任务**两样：`missions` = 新的 `{done, progress}`（`missions.settle()`
+        算好的整格，`None` = 不动），`mission_gifts` = `[(specs, 留言)]`
+        —— 完成了几条任务就几组，每组的奖励各成几份礼物（发送人 `GM`，见
+        `missions.GIFT_MESSAGE`）。坏掉的那一组（物品表换代后不认识了）整组跳过、
+        一句话追加进调用方给的 `gift_problems` 列表，**不拖累这一局别的所得**。
         返回 ``(更新后的账号, 被跳过的 id 列表, 实际发出的卡片 {id: 张数})``。
 
         ★ **为什么要合成一发**：以前结算是 `add_quest_reward` + `add_materials`
@@ -1182,6 +1208,17 @@ class AccountStore:
             if bases:
                 account["card_bases"] = dict(
                     sorted(bases.items(), key=lambda kv: int(kv[0])))
+            # ---- ⑥ 晋级任务：完成 / 进度 + 奖励进礼物箱（X23）----
+            if missions is not None:
+                account["missions"] = mission_state({"missions": missions})
+            for specs, note in mission_gifts or ():
+                try:
+                    wanted = _gift_entries(specs)
+                except AccountError as error:
+                    if gift_problems is not None:
+                        gift_problems.append("%s：%s" % (note, error.message))
+                    continue
+                _put_gifts(account, wanted, GIFT_SENDER_GM, note)
             data["accounts"][username] = account
             self._write_unlocked(data)
             return copy.deepcopy(account), skipped, given
@@ -1732,51 +1769,13 @@ class AccountStore:
         装备类（`shopdata.stackable()` 为假）一律 ×1，数量那一格客户端根本不读（§28）。
         礼物号从 `gift_seq` 往上数，**永不复用**。
         """
-        wanted = []
-        for spec in specs or ():
-            spec = spec or {}
-            try:
-                item = int(spec.get("item") or 0)
-                # ★ 不写 `or 1`：`count: 0` 是一条要拒绝的坏数据，不是「没写」。
-                count = spec.get("count")
-                count = 1 if count is None else int(count)
-                exp = int(spec.get("exp") or 0)
-                money = int(spec.get("money") or 0)
-            except (TypeError, ValueError):
-                raise AccountError("invalid_gift", f"礼物条目不合法: {spec!r}") from None
-            if item:
-                if not shopdata.ownable(item):
-                    raise AccountError(
-                        "unknown_item",
-                        f"物品 {item} 不在客户端认得的物品表里，不能发给玩家")
-                if count <= 0:
-                    raise AccountError("invalid_count", f"物品 {item} 的数量必须是正数")
-                wanted.append({"item": item,
-                               "count": count if shopdata.stackable(item) else 1,
-                               "exp": 0, "money": 0})
-            elif exp > 0:
-                wanted.append({"item": 0, "count": 0, "exp": exp, "money": 0})
-            elif money > 0:
-                wanted.append({"item": 0, "count": 0, "exp": 0, "money": money})
-            else:
-                raise AccountError("invalid_gift", "一份礼物得是一件物品、一笔经验或一笔金币")
-        sent = time.strftime("%Y-%m-%d %H:%M:%S")
+        wanted = _gift_entries(specs)
         with self._lock:
             data = self._read_unlocked()
             account = self._account_unlocked(data, username)
             if not wanted:
                 return copy.deepcopy(account), []
-            gifts = pending_gifts(account)
-            seq = gift_seq(account)
-            created = []
-            for spec in wanted:
-                seq += 1
-                gift = dict(spec, id=seq, sender=str(sender or GIFT_SENDER_GM),
-                            message=str(message or ""), sent=sent, unread=True)
-                gifts.append(gift)
-                created.append(dict(gift))
-            account["gifts"] = gifts
-            account["gift_seq"] = seq
+            created = _put_gifts(account, wanted, sender, message)
             data["accounts"][username] = account
             self._write_unlocked(data)
             return copy.deepcopy(account), created
@@ -2591,6 +2590,59 @@ def gift_seq(account):
     return max(seq, max((gift["id"] for gift in _gift_records(account)), default=0))
 
 
+def _gift_entries(specs):
+    """`add_gifts` 认的那几份 → 礼物盒里的条目（还没有 id / 发送人）。**先全部校验**：
+    客户端不认识的 id、数量 / 金额不是正数都抛 `AccountError`，一份都不收。
+    装备类（`shopdata.stackable()` 为假）一律 ×1，数量那一格客户端根本不读（§28）。"""
+    wanted = []
+    for spec in specs or ():
+        spec = spec or {}
+        try:
+            item = int(spec.get("item") or 0)
+            # ★ 不写 `or 1`：`count: 0` 是一条要拒绝的坏数据，不是「没写」。
+            count = spec.get("count")
+            count = 1 if count is None else int(count)
+            exp = int(spec.get("exp") or 0)
+            money = int(spec.get("money") or 0)
+        except (TypeError, ValueError):
+            raise AccountError("invalid_gift", f"礼物条目不合法: {spec!r}") from None
+        if item:
+            if not shopdata.ownable(item):
+                raise AccountError(
+                    "unknown_item",
+                    f"物品 {item} 不在客户端认得的物品表里，不能发给玩家")
+            if count <= 0:
+                raise AccountError("invalid_count", f"物品 {item} 的数量必须是正数")
+            wanted.append({"item": item,
+                           "count": count if shopdata.stackable(item) else 1,
+                           "exp": 0, "money": 0})
+        elif exp > 0:
+            wanted.append({"item": 0, "count": 0, "exp": exp, "money": 0})
+        elif money > 0:
+            wanted.append({"item": 0, "count": 0, "exp": 0, "money": money})
+        else:
+            raise AccountError("invalid_gift", "一份礼物得是一件物品、一笔经验或一笔金币")
+    return wanted
+
+
+def _put_gifts(account, wanted, sender, message):
+    """持锁状态下把校验过的条目塞进礼物盒（就地改 `account`），返回新建的礼物。
+    礼物号从 `gift_seq` 往上数，**永不复用**。"""
+    sent = time.strftime("%Y-%m-%d %H:%M:%S")
+    gifts = pending_gifts(account)
+    seq = gift_seq(account)
+    created = []
+    for spec in wanted:
+        seq += 1
+        gift = dict(spec, id=seq, sender=str(sender or GIFT_SENDER_GM),
+                    message=str(message or ""), sent=sent, unread=True)
+        gifts.append(gift)
+        created.append(dict(gift))
+    account["gifts"] = gifts
+    account["gift_seq"] = seq
+    return created
+
+
 def normalize_gift_fields(raw):
     """把一个**原始**账号字典里的礼物盒洗成可以直接写回 JSON 的形态。
 
@@ -2712,6 +2764,17 @@ def card_bases(account):
 #: ★ `AccountStore.apply_battle()` 的形参就叫 `card_bases`（对外的名字），
 #: 在那个作用域里会把上面这个同名函数挡住 —— 留一个别名给它用。
 _read_card_bases = card_bases
+
+
+def mission_state(account):
+    """晋级任务的完成 / 进度 `{done, progress}`，**已洗干净**（X23，`missions.normalize_state`）。
+
+    ★ 老存档没有这一格 = 一条都没做过（读盘补齐，铁律 11）。
+    ★ 只洗形状，**不按规则表删**：停用的任务（没有删除）的完成记录留着，
+      重新启用之后「仅一次」的照旧算做过。
+    """
+    import missions as missions_module  # 函数内 import：missions 顶层 import shopcfg
+    return missions_module.normalize_state((account or {}).get("missions"))
 
 
 def normalize_battle_fields(raw):

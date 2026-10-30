@@ -920,6 +920,100 @@ def default_cards():
 
 
 # ---------------------------------------------------------------------------
+# 晋级任务（X_Mod X23）
+# ---------------------------------------------------------------------------
+
+#: 原版 `RewardN` 的种类 → 礼物的那一格（`tools/shopdata.REWARD_KINDS` 的中文名）。
+_PROMO_REWARD_KEY = {"money": "money", "experience": "exp"}
+
+
+def default_missions(warn=None):
+    """默认 `missions.json` = 原版 `Promotion-chn.ini` 的 105 条**全部导入**（用户 2026-10-30）。
+
+    来源是 `shop_items.json` 的 `promotions`（`tools/shopdata.load_promotions`，
+    服务端包里没有明文资源树）。逐条照搬，只改这几处（D111 / D113）：
+
+    * 周期一律「仅一次」，原版本来就是一次性的晋级任务；
+    * 等级 `% 1000`：国服表 51 条写的是 `1011~1016`，客户端按原值比 ⇒ 原版里
+      **永远不出现**（V0.3商店 M6 那条注释 + FINDINGS §155）；
+    * 难度一律「恰好」：所有任务同时推进以后，「至少」会让打一次困难就把
+      简单 / 普通 / 困难三条一起完成；
+    * 物品奖励的「天数」→ 1 件（本版发的东西一律永久）；
+    * 客户端不认得 / 进不了背包的奖励丢掉、超过 3 项的截断 —— 各记一行 `warn`
+      （原版 105 条实际一条都没触发：最多 2 项、物品全能进背包）。
+    名字 / 说明 / 完成条件保留原文；`TextStatus` / `TextReward` 由服务端现生成。
+    """
+    import missions as missions_module  # 函数内 import：missions 顶层 import shopcfg
+    say = warn or (lambda _msg: None)
+    out = []
+    for promo in shopdata.promotions():
+        try:
+            mid = int(promo.get("promotion_id"))
+        except (TypeError, ValueError):
+            say("原版任务 %s 没有 PromotionID，跳过" % promo.get("section"))
+            continue
+        context = promo.get("context_type")
+        ptype = promo.get("type")
+        line = (missions_module.LINE_PVP if context == 1
+                else missions_module.LINE_QUEST)
+        mission = {
+            "id": mid,
+            "enabled": True,
+            "period": missions_module.PERIOD_ONCE,
+            "character": int(promo.get("character_limit", 0)),
+            "line": line,
+            "order": int(promo.get("promotion_level", 0)),
+            "level": max(1, int(promo.get("level", 1)) % 1000),
+            "name": promo.get("name", ""),
+            "info": promo.get("info", ""),
+            "clear_text": promo.get("clear_text", ""),
+            "target": max(1, int(promo.get("value") or 1)),
+        }
+        if ptype == missions_module.TYPE_MAP:
+            mission["kind"] = missions_module.KIND_MAP
+            mission["map"] = promo.get("map", "")
+            mission["script"] = promo.get("script", "")
+            if promo.get("difficulty") is not None:
+                mission["difficulty"] = int(promo["difficulty"])
+        elif ptype == missions_module.TYPE_PVP:
+            mission["kind"] = missions_module.KIND_WIN
+            # 原版：-1 / 缺 = 不限；子类型 = 模式号，子类型 2 = 1 道具战 / 0 无道具。
+            for src, key in (("sub_type", "pvp_mode"), ("sub_type2", "item_mode")):
+                value = promo.get(src)
+                if value is not None and value >= 0:
+                    mission[key] = int(value)
+        else:
+            mission["kind"] = missions_module.KIND_CLEAR
+            if promo.get("quest_stage") is not None:
+                mission["stage"] = int(promo["quest_stage"])
+            if promo.get("difficulty") is not None:
+                mission["difficulty"] = int(promo["difficulty"])
+        rewards = []
+        for reward in promo.get("rewards") or ():
+            kind = reward.get("kind")
+            if kind == "item":
+                item_id = int(reward.get("item_id", 0))
+                if not shopdata.ownable(item_id):
+                    say("原版任务 %d 的奖励物品 %d 客户端不认得 / 进不了背包，丢掉"
+                        % (mid, item_id))
+                    continue
+                rewards.append({"item": item_id, "count": 1})
+            elif kind in _PROMO_REWARD_KEY and int(reward.get("amount", 0)) > 0:
+                rewards.append({_PROMO_REWARD_KEY[kind]: int(reward["amount"])})
+        if len(rewards) > missions_module.MAX_REWARDS:
+            say("原版任务 %d 有 %d 项奖励，只留前 %d 项"
+                % (mid, len(rewards), missions_module.MAX_REWARDS))
+            rewards = rewards[:missions_module.MAX_REWARDS]
+        if not rewards:
+            say("原版任务 %d 一项能发的奖励都没有，跳过" % mid)
+            continue
+        mission["rewards"] = rewards
+        out.append(mission)
+    out.sort(key=lambda m: m["id"])
+    return {"format": FORMAT, "missions": out}
+
+
+# ---------------------------------------------------------------------------
 # 卖出价格（D95，**推翻 D88**）
 # ---------------------------------------------------------------------------
 

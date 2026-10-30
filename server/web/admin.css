@@ -2063,3 +2063,72 @@ ul.help li.ro-note { color: var(--crimson); font-weight: 700; }
 /* 说明为空的那一块（条件没配 / 拿不到）写一句话，别留白。 */
 .card-prog-none { font-size: 12px; color: var(--cocoa-soft); padding: 3px 0; }
 
+/* ============ 晋级任务（X23，用户 2026-10-30）============
+   一条任务一行：编号 / 启用 / 周期 / 顺序 / 等级 / 名字 + 条件 + 奖励 / 三颗钮。
+   骨架同称号卡片那一页（列位置写死的 grid —— 一百多行上下要对得齐），
+   按「线 · 角色」分组，组头是一行小标题。 */
+.mission-group {
+  margin: 16px 0 8px; font-size: 13px; font-weight: 700;
+  color: var(--cocoa); letter-spacing: .5px;
+}
+.mission-group:first-child { margin-top: 0; }
+.mission-row {
+  display: grid;
+  grid-template-columns: 56px auto 104px 76px 76px minmax(0, 1fr) auto;
+  gap: 12px; align-items: center;
+  /* `.rule-row` 右边那 34px 是给删除按钮留的，这一页没有删除（只有停用）。 */
+  padding: 10px 12px;
+}
+/* 停用的整行淡下去，但开关自己不淡 —— 「怎么把它打开」得看得清。 */
+.mission-row.off { opacity: .55; }
+.mission-row.off .toggle { opacity: 1; }
+.mission-row > .mission-id {
+  font-size: 12px; font-weight: 700; color: var(--cocoa-soft);
+}
+/* 中间那栏吃掉剩余宽度。三段字都**不截断**：长了就折行，行自己变高。 */
+.mission-body { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.mission-name {
+  font-size: 13px; font-weight: 700; color: var(--cocoa-ink);
+  word-break: break-word;
+}
+.mission-say {
+  font-size: 12px; line-height: 1.5; color: var(--cocoa); word-break: break-word;
+}
+.mission-say.bad-text { color: var(--crimson); font-weight: 700; }
+.mission-gift { font-size: 12px; color: var(--moss-dk); word-break: break-word; }
+.mission-row > .card-acts { display: flex; gap: 8px; white-space: nowrap; }
+
+/* ---- 三个设置窗共用的壳（`#missionModal`）
+   ⚠ 盖 `.modal .panel` 的宽高必须写三个类（同 `.card-cond-panel` 那条）。 */
+.modal .panel.mission-panel { width: min(1000px, 100%); height: auto; }
+.mission-panel .panel-body {
+  display: flex; flex-direction: column; gap: 12px;
+  max-height: calc(100vh - 220px);
+}
+.mission-fields {
+  display: flex; flex-direction: column; gap: 10px;
+  overflow: auto; min-height: 0;
+}
+.mission-fields .hint { margin: 0; }
+/* ⚠ 同 `.form-panel` 那个坑：容器是竖排，`.field.wide` 的 220 会当成高度。 */
+.mission-fields > .field { flex: 0 0 auto; }
+.mission-fields > .field select,
+.mission-fields > .field input[type=text] { width: 100%; max-width: 560px; }
+/* 「每局达成」的条件行：和称号卡片同一套行，只是少了「统计范围」那一列
+   （任务只看一局内）。 */
+.mission-cond-rows .card-cond {
+  grid-template-columns: 84px 158px 168px 104px 116px;
+}
+/* 奖励一项一行：种类 / （物品格子 + 名字）/ 数量 / ✕。 */
+.mission-reward {
+  position: relative;
+  display: flex; gap: 12px; align-items: flex-end;
+  padding: 9px 38px 9px 11px;
+  background: #fff; border: 2px solid var(--line); border-radius: 9px;
+}
+.mission-reward > .kill { position: absolute; top: 8px; right: 8px; }
+.mission-item-name {
+  align-self: center; min-width: 140px;
+  font-size: 12px; font-weight: 600; color: var(--cocoa-ink);
+}
+

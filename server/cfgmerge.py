@@ -63,6 +63,10 @@ KEY_FIELDS = {
     #:   （`shopcfg.validate_cards` 拦着重复），所以它是天然主键，
     #:   和 `items` / `shop` 一样干净。
     "cards": ("card",),
+    #: ★ 晋级任务（X23）按**任务编号**认身份：新建时自动编号、没有删除只有停用
+    #:   ⇒ 编号永不复用，是天然主键。两个人同时「添加」拿到同一个新号就是
+    #:   `REASON_BOTH_ADDED`，提示框里说得清楚。
+    "missions": ("id",),
 }
 
 #: 商店 ⇄ 合成互斥时，「这条记录说的是哪件物品」看哪个字段。
@@ -338,6 +342,17 @@ def label_of(which, key, entry=None):
         rule = entry or {}
         detail = shopcfg.describe_card_rule(rule, shopcfg.item_name(nat[0]))
         return "%s　%s" % (head, detail) if detail else head
+    if which == "missions":
+        # 「任务 #10003　[对战] 每日 3 胜」—— 名字走 `missions.display_name()`，
+        # 和游戏里面板上的那一行是同一个出处。
+        import missions as missions_module   # 函数内 import：missions 顶层 import shopcfg
+        head = "任务 #%s" % nat[0]
+        if not entry:
+            return head
+        try:
+            return "%s　%s" % (head, missions_module.display_name(entry))
+        except (KeyError, TypeError, ValueError):
+            return head
     if which == "rewards":
         # 「对战 · 生存模式 · 道具战 · 组队战」/「闯关 · 关卡3 神秘岛 · 困难」
         mode, pvp_mode, item_mode, team, stage, difficulty = nat

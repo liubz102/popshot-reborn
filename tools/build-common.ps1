@@ -424,7 +424,7 @@ function Get-ServerSourceFile([string]$Root) {
                         'equipbonus.py',
                         'shop.py', 'shopcfg.py', 'shopdata.py', 'shopdefaults.py', 'databackup.py', 'logpack.py',
                         'sevenzip.py', 'logshelf.py',
-                        'cards.py', 'sellprice.py', 'gifthistory.py',
+                        'cards.py', 'sellprice.py', 'gifthistory.py', 'missions.py',
                         'crashstore.py', 'crashwatch.py')) {
         if ($files -notcontains $must) { throw "server\$must 没被选中，打包脚本的过滤规则坏了" }
     }

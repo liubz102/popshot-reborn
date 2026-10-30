@@ -50,6 +50,7 @@ import gameserver
 import logcleanup
 import logpack
 import logshelf
+import missions
 import sevenzip
 import shopcfg
 import udpsync
@@ -593,6 +594,12 @@ def main(argv=None):
             f"{logcleanup.DAILY_HOUR} 点清一次；后台线程，不挡游戏）")
     # 关掉时那句「已关闭」由 `logcleanup.start` 自己说，免得打两遍。
     logcleanup.start(days=retention, log=log)
+
+    # 晋级任务（X23）：每天凌晨 4 点换期（每日 / 每周一 / 每月 1 日）时给在线玩家重推
+    # 任务表。换期本身不靠它（周期键读的时候现算），它只管在线的人面板到点刷新。
+    gameserver.start_mission_reset_thread(log=log)
+    log(f"晋级任务 每天 {missions.RESET_HOUR} 点换期（每日 / 每周一 / 每月 1 日），"
+        "在线玩家的任务面板到点自动刷新")
 
     # 数据备份（V0.3商店，管理页「数据备份」页）：每天到点把 server/data/*.json
     # 拷一份，按保留天数清理。设置在 server.config 里，管理页改完即刻生效。
